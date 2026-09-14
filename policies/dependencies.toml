@@ -29,3 +29,36 @@ recommended_tool = "cargo-deny"
 lockfile_required = true
 review_new_direct_dependencies = true
 review_feature_expansion = true
+
+[dependency_reviews]
+note = "Six-aspect review required by [supply_chain].review_new_direct_dependencies = true. Recorded here so the review is machine-visible."
+
+[[dependency_reviews.direct]]
+consumer = "engineering/nexus-harness"
+crate = "serde_json"
+version = "1"
+default_features = false
+features = ["std"]
+architecture_layer = "engineering tooling (outside crates/ portable core; no new architecture edge)"
+feature_scope = "std feature only; no alloc/raw parsing features enabled"
+license = "MIT OR Apache-2.0 (allowlisted)"
+security = "no known advisories in allowlist; cargo-deny recommended for CI"
+portability = "pure Rust, no OS-specific API"
+supply_chain = "version pinned by Cargo.lock (lockfile_required)"
+approved = true
+approved_date = "2026-09-15"
+
+[[dependency_reviews.direct]]
+consumer = "engineering/nexus-harness"
+crate = "toml"
+version = "0.8"
+default_features = false
+features = ["parse"]
+architecture_layer = "engineering tooling (outside crates/ portable core; no new architecture edge)"
+feature_scope = "parse feature only; serde/display features not enabled"
+license = "MIT OR Apache-2.0 (allowlisted)"
+security = "no known advisories in allowlist; cargo-deny recommended for CI"
+portability = "pure Rust, no OS-specific API"
+supply_chain = "version pinned by Cargo.lock (lockfile_required)"
+approved = true
+approved_date = "2026-09-15"

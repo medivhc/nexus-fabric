@@ -123,6 +123,12 @@
 | `engineering/nexus-harness/Cargo.toml` | Rust package/workspace manifest |
 | `engineering/nexus-harness/MODULE.md` | Module Contract |
 | `engineering/nexus-harness/src/main.rs` | Minimal compile/bootstrap source |
+| `engineering/nexus-harness/src/env.rs` | Rust source (harness CLI) |
+| `engineering/nexus-harness/src/config.rs` | Rust source (harness CLI) |
+| `engineering/nexus-harness/src/gates.rs` | Rust source (harness CLI) |
+| `engineering/nexus-harness/src/scenario.rs` | Rust source (harness CLI) |
+| `engineering/nexus-harness/src/evidence.rs` | Rust source (harness CLI) |
+| `engineering/nexus-harness/src/commands.rs` | Rust source (harness CLI) |
 | `engineering/plugins/README.md` | Repository contract/documentation |
 | `engineering/plugins/plugin-contract.md` | Repository contract/documentation |
 | `fuzz/README.md` | Repository contract/documentation |
@@ -132,6 +138,8 @@
 | `policies/dependencies.toml` | Machine-readable contract/policy/scenario |
 | `policies/quality.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/README.md` | Repository contract/documentation |
+| `scenarios/engineering/harness_status_verdicts.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/harness_verify_fast_evidence.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/platform/virtual_packet_interface.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/platform/workspace_projection_fallback.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/product/internet_access_flow.toml` | Machine-readable contract/policy/scenario |
