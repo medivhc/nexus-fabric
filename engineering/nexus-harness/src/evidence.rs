@@ -188,3 +188,90 @@ pub fn latest_dir(config: &Config) -> Option<PathBuf> {
     let dir = latest.get("dir")?.as_str()?;
     Some(config.evidence_dir.join(dir))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn bindings(rev: &str) -> Bindings {
+        Bindings {
+            source_revision: rev.to_string(),
+            working_tree_digest: "wt".to_string(),
+            dirty_state: false,
+            configuration_digest: "cfg".to_string(),
+            feature_set: vec!["f".to_string()],
+            target_triple: "t".to_string(),
+            toolchain_version: "1.0".to_string(),
+            harness_schema_version: 1,
+            platform_capability_digest: "p".to_string(),
+            contract_hash: "c".to_string(),
+        }
+    }
+
+    #[test]
+    fn same_as_true_for_equal_bindings() {
+        let a = bindings("r1");
+        assert!(a.same_as(&a.to_json()));
+    }
+
+    #[test]
+    fn same_as_false_for_different_revision() {
+        assert!(!bindings("r1").same_as(&bindings("r2").to_json()));
+    }
+
+    #[test]
+    fn verify_id_deterministic() {
+        let repo = Repo::discover().expect("must run inside the nexus repository");
+        let a = bindings("r1");
+        assert_eq!(verify_id(&repo, &a), verify_id(&repo, &a));
+        assert_ne!(verify_id(&repo, &a), verify_id(&repo, &bindings("r2")));
+    }
+
+    #[test]
+    fn stale_marking_detects_binding_change() {
+        let tmp = std::env::temp_dir().join(format!("nexus-ev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let config = Config {
+            policies_dir: tmp.join("policies"),
+            scenarios_dir: tmp.join("scenarios"),
+            evidence_dir: tmp.clone(),
+            crates_dir: tmp.join("crates"),
+            engineering_dir: tmp.join("engineering"),
+            quality: json!({}),
+            portable_core: vec![],
+        };
+        let old_dir = tmp.join("verify-old");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        let write = |v: &Value| {
+            std::fs::write(
+                old_dir.join("summary.json"),
+                serde_json::to_string(v).unwrap(),
+            )
+            .unwrap()
+        };
+
+        write(
+            &json!({"schema_version": 1, "command": "verify", "verdict": "PASS",
+                      "id": "old", "bindings": bindings("old-rev").to_json()}),
+        );
+        mark_stale_others(&config, "current", &bindings("new-rev").to_json()).unwrap();
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(old_dir.join("summary.json")).unwrap())
+                .unwrap();
+        assert_eq!(v["verdict"], json!("STALE"));
+
+        write(
+            &json!({"schema_version": 1, "command": "verify", "verdict": "PASS",
+                      "id": "old", "bindings": bindings("same-rev").to_json()}),
+        );
+        mark_stale_others(&config, "current", &bindings("same-rev").to_json()).unwrap();
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(old_dir.join("summary.json")).unwrap())
+                .unwrap();
+        assert_eq!(v["verdict"], json!("PASS"));
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+}

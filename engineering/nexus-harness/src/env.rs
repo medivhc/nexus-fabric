@@ -214,3 +214,23 @@ pub fn cargo_metadata() -> Result<Value, String> {
 pub fn path_is_within(path: &Path, dir: &Path) -> bool {
     path.starts_with(dir)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn digests_deterministic_and_sha1_length() {
+        let repo = Repo::discover().expect("must run inside the nexus repository");
+        assert_eq!(repo.configuration_digest(), repo.configuration_digest());
+        assert_eq!(repo.contract_hash(), repo.contract_hash());
+        assert_eq!(repo.working_tree_digest(), repo.working_tree_digest());
+        assert_eq!(repo.hash_stdin("abc").unwrap().len(), 40);
+    }
+
+    #[test]
+    fn hash_depends_on_input() {
+        let repo = Repo::discover().expect("must run inside the nexus repository");
+        assert_ne!(repo.hash_stdin("a").unwrap(), repo.hash_stdin("b").unwrap());
+    }
+}

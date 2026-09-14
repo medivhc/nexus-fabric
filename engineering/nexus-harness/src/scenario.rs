@@ -137,7 +137,11 @@ fn evaluate(scenario: &Scenario, output: &Value) -> Result<(), String> {
 fn get_path<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
     let mut cur = v;
     for part in path.split('.') {
-        cur = cur.get(part)?;
+        cur = match cur {
+            Value::Object(o) => o.get(part)?,
+            Value::Array(a) => a.get(part.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
     }
     Some(cur)
 }
@@ -231,5 +235,70 @@ pub fn run_gate(config: &Config, gate_name: &str, subdirs: &[&str]) -> (Vec<Scen
         (results.clone(), Gate::fail(gate_name, &detail))
     } else {
         (results, Gate::ok(gate_name, &detail))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn scenario(expects: Vec<ScenarioExpect>) -> Scenario {
+        Scenario {
+            id: "t".to_string(),
+            command: None,
+            expects,
+        }
+    }
+
+    #[test]
+    fn get_path_nested_and_array() {
+        let v = json!({"a": {"b": [10, 20]}});
+        assert_eq!(get_path(&v, "a.b.1"), Some(&json!(20)));
+        assert_eq!(get_path(&v, "a.b.2"), None);
+        assert_eq!(get_path(&v, "missing"), None);
+    }
+
+    #[test]
+    fn evaluate_equals() {
+        let s = scenario(vec![ScenarioExpect {
+            path: "verdict".to_string(),
+            kind: ExpectKind::Equals(json!("PASS")),
+        }]);
+        assert!(evaluate(&s, &json!({"verdict": "PASS"})).is_ok());
+        assert!(evaluate(&s, &json!({"verdict": "FAIL"})).is_err());
+    }
+
+    #[test]
+    fn evaluate_one_of_and_non_empty() {
+        let s = scenario(vec![
+            ScenarioExpect {
+                path: "verdict".to_string(),
+                kind: ExpectKind::OneOf(vec![json!("PASS"), json!("UNKNOWN")]),
+            },
+            ScenarioExpect {
+                path: "evidence.id".to_string(),
+                kind: ExpectKind::NonEmpty,
+            },
+        ]);
+        assert!(
+            evaluate(
+                &s,
+                &json!({"verdict": "UNKNOWN", "evidence": {"id": "abc"}})
+            )
+            .is_ok()
+        );
+        assert!(evaluate(&s, &json!({"verdict": "FAIL", "evidence": {"id": "abc"}})).is_err());
+        assert!(evaluate(&s, &json!({"verdict": "PASS", "evidence": {"id": ""}})).is_err());
+        assert!(evaluate(&s, &json!({"verdict": "PASS"})).is_err());
+    }
+
+    #[test]
+    fn evaluate_numbers_compare_as_numbers() {
+        let s = scenario(vec![ScenarioExpect {
+            path: "schema_version".to_string(),
+            kind: ExpectKind::Equals(json!(1)),
+        }]);
+        assert!(evaluate(&s, &json!({"schema_version": 1})).is_ok());
     }
 }

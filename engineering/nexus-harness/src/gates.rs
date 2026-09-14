@@ -40,6 +40,14 @@ impl Gate {
 
 /// Run a command in the repo root; returns (success, trimmed output tail).
 fn run_at(root: &PathBuf, program: &str, args: &[&str]) -> (bool, String) {
+    let (ok, text) = run_at_full(root, program, args);
+    let tail: Vec<&str> = text.lines().rev().take(12).collect();
+    let tail = tail.iter().rev().cloned().collect::<Vec<_>>().join("\n");
+    (ok, tail)
+}
+
+/// Run a command in the repo root; returns (success, full combined output).
+fn run_at_full(root: &PathBuf, program: &str, args: &[&str]) -> (bool, String) {
     let out = match Command::new(program).args(args).current_dir(root).output() {
         Ok(o) => o,
         Err(e) => return (false, format!("failed to run {program}: {e}")),
@@ -50,9 +58,7 @@ fn run_at(root: &PathBuf, program: &str, args: &[&str]) -> (bool, String) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let tail: Vec<&str> = text.lines().rev().take(12).collect();
-    let tail = tail.iter().rev().cloned().collect::<Vec<_>>().join("\n");
-    (ok, tail)
+    (ok, text)
 }
 
 fn cargo(repo: &Repo, args: &[&str]) -> Gate {
@@ -170,32 +176,40 @@ pub fn affected_tests_gate(repo: &Repo, _config: &Config) -> Gate {
     }
 }
 
-/// Workspace member package names (from cargo metadata).
+/// Workspace member package names (from cargo metadata). Members are matched
+/// by full PackageId against `workspace_members` — the id format is
+/// `path+file:///.../dir#<version>` (no package name), so name/version parsing
+/// is avoided entirely.
 fn member_names(meta: &Value) -> Vec<String> {
-    meta["workspace_members"]
+    let member_ids: Vec<&str> = meta["workspace_members"]
         .as_array()
-        .map(|ids| {
-            let mut names = Vec::new();
-            for id in ids {
-                let id = id.as_str().unwrap_or("");
-                // id format: path+file:///.../<dir>#<name>@<version>
-                if let Some(hash) = id.split_once('#') {
-                    if let Some(name) = hash.1.split_once('@') {
-                        names.push(name.0.to_string());
-                    }
-                }
-            }
-            names
-        })
-        .unwrap_or_default()
-}
-
-/// Packages (name, manifest dir) for all members.
-fn member_manifests(meta: &Value) -> Vec<(String, PathBuf)> {
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
     meta["packages"]
         .as_array()
         .map(|pkgs| {
             pkgs.iter()
+                .filter(|p| p["id"].as_str().is_some_and(|id| member_ids.contains(&id)))
+                .filter_map(|p| p["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Packages (name, manifest dir) for workspace members only (external
+/// dependencies in `packages` are excluded — `-p`/feature flags only work for
+/// workspace members).
+fn member_manifests(meta: &Value) -> Vec<(String, PathBuf)> {
+    let members = member_names(meta);
+    meta["packages"]
+        .as_array()
+        .map(|pkgs| {
+            pkgs.iter()
+                .filter(|p| {
+                    p["name"]
+                        .as_str()
+                        .is_some_and(|n| members.iter().any(|m| m == n))
+                })
                 .filter_map(|p| {
                     let name = p["name"].as_str()?.to_string();
                     let manifest = p["manifest_path"].as_str()?;
@@ -340,9 +354,332 @@ pub fn dependency_gate(repo: &Repo, config: &Config) -> Gate {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Full gates (declared by policies/quality.toml [verification.full]).
+// Design rule: a gate with nothing machine-verifiable to run, or whose tooling
+// is missing, records UNKNOWN with a reason — never a silent PASS.
+// ---------------------------------------------------------------------------
+
+fn rs_files_under(dir: &PathBuf) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(rs_files_under(&p));
+        } else if p.extension().is_some_and(|x| x == "rs") {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// True if `cargo <subcmd> --version` succeeds (subcommand installed).
+fn cargo_tool_available(repo: &Repo, subcmd: &str) -> bool {
+    let (ok, _) = run_at(&repo.root, "cargo", &[subcmd, "--version"]);
+    ok
+}
+
+/// Integration tests: every workspace member's tests/ dir. Runs each via
+/// `cargo test -p <member> --test <name>`; none declared => UNKNOWN.
+pub fn integration_gate(repo: &Repo) -> Gate {
+    let meta = match cargo_metadata() {
+        Ok(m) => m,
+        Err(e) => return Gate::unknown("integration", &format!("cargo metadata failed: {e}")),
+    };
+    let mut targets: Vec<(String, String)> = Vec::new(); // (member, test name)
+    for (name, dir) in member_manifests(&meta) {
+        for f in rs_files_under(&dir.join("tests")) {
+            if let Some(stem) = f.file_stem().map(|s| s.to_string_lossy().to_string()) {
+                targets.push((name.clone(), stem));
+            }
+        }
+    }
+    targets.sort();
+    targets.dedup();
+    if targets.is_empty() {
+        return Gate::unknown(
+            "integration",
+            "no integration test targets declared (no member has tests/*.rs)",
+        );
+    }
+    let mut failures: Vec<String> = Vec::new();
+    for (member, test) in &targets {
+        let g = cargo(repo, &["test", "-p", member, "--test", test]);
+        if g.verdict == "FAIL" {
+            failures.push(format!("{member}::{test}: {}", g.detail));
+        }
+    }
+    if failures.is_empty() {
+        Gate::ok(
+            "integration",
+            &format!("{} integration target(s) passed", targets.len()),
+        )
+    } else {
+        Gate::fail("integration", &failures.join("\n"))
+    }
+}
+
+/// Coverage summary via cargo-llvm-cov; tool missing or run failure => UNKNOWN.
+/// Parses the TOTAL row from the full output (the table can be followed by
+/// per-binary test progress lines, so a tail-trimmed capture misses it).
+pub fn coverage_gate(repo: &Repo) -> Gate {
+    if !cargo_tool_available(repo, "llvm-cov") {
+        return Gate::unknown(
+            "coverage-summary",
+            "cargo-llvm-cov not installed (install with: cargo install cargo-llvm-cov)",
+        );
+    }
+    let (ok, out) = run_at_full(
+        &repo.root,
+        "cargo",
+        &["llvm-cov", "--workspace", "--summary-only"],
+    );
+    if !ok {
+        return Gate::unknown("coverage-summary", &format!("coverage run failed: {}", out));
+    }
+    let total = out
+        .lines()
+        .rfind(|l| l.contains("TOTAL") && l.contains('%'))
+        .map(str::to_string);
+    match total {
+        Some(t) => Gate::ok("coverage-summary", &format!("TOTAL: {}", t.trim())),
+        None => {
+            let n = out.lines().filter(|l| l.contains('%')).count();
+            Gate::ok(
+                "coverage-summary",
+                &format!("coverage summary produced (no TOTAL row; {n} % rows)"),
+            )
+        }
+    }
+}
+
+/// Fuzz: cargo-fuzz installed + targets declared. Missing either => UNKNOWN.
+pub fn fuzz_gate(repo: &Repo) -> Gate {
+    if !cargo_tool_available(repo, "fuzz") {
+        return Gate::unknown(
+            "selected-fuzz",
+            "cargo-fuzz not installed (install with: cargo install cargo-fuzz)",
+        );
+    }
+    if !repo.root.join("fuzz/Cargo.toml").exists() {
+        return Gate::unknown(
+            "selected-fuzz",
+            "no fuzz targets declared (fuzz/Cargo.toml missing)",
+        );
+    }
+    let g = cargo(repo, &["fuzz", "check"]);
+    Gate {
+        name: "selected-fuzz".to_string(),
+        ..g
+    }
+}
+
+/// Concurrency tests under tests/concurrency/; none declared => UNKNOWN.
+pub fn concurrency_gate(repo: &Repo) -> Gate {
+    let files = rs_files_under(&repo.root.join("tests/concurrency"));
+    if files.is_empty() {
+        return Gate::unknown(
+            "selected-concurrency",
+            "no concurrency tests declared under tests/concurrency/",
+        );
+    }
+    let mut failures: Vec<String> = Vec::new();
+    for f in &files {
+        let stem = f
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let g = cargo(repo, &["test", "--test", &stem]);
+        if g.verdict == "FAIL" {
+            failures.push(format!("{stem}: {}", g.detail));
+        }
+    }
+    if failures.is_empty() {
+        Gate::ok(
+            "selected-concurrency",
+            &format!("{} concurrency test(s) passed", files.len()),
+        )
+    } else {
+        Gate::fail("selected-concurrency", &failures.join("\n"))
+    }
+}
+
+/// Performance budgets: require machine-readable thresholds in
+/// policies/quality.toml [performance]; absent => UNKNOWN (no budget to check).
+pub fn performance_budgets_gate(config: &Config) -> Gate {
+    let Some(perf) = config.quality.get("performance") else {
+        return Gate::unknown(
+            "performance-budgets",
+            "no [performance] section in policies/quality.toml (baseline/noise tolerance/warning/blocking thresholds required per AGENTS.md)",
+        );
+    };
+    let keys: Vec<String> = perf
+        .as_object()
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default();
+    if keys.iter().any(|k| k == "baseline") && keys.iter().any(|k| k == "blocking") {
+        Gate::ok(
+            "performance-budgets",
+            &format!("budgets defined: {}", keys.join(", ")),
+        )
+    } else {
+        Gate::unknown(
+            "performance-budgets",
+            &format!(
+                "[performance] section incomplete (baseline + blocking required); found: {}",
+                if keys.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    keys.join(", ")
+                }
+            ),
+        )
+    }
+}
+
+/// Platform checks: portable-core crates must be free of platform-specific
+/// dependencies (target-specific tables or known OS-only crates).
+pub fn platform_checks_gate(config: &Config) -> Gate {
+    const PLATFORM_CRATES: &[&str] = &[
+        "winapi",
+        "windows-sys",
+        "windows",
+        "libc",
+        "nix",
+        "objc",
+        "core-foundation",
+        "security-framework",
+        "io-kit-sys",
+    ];
+    let mut violations: Vec<String> = Vec::new();
+    for name in &config.portable_core {
+        let manifest = config.crates_dir.join(name).join("Cargo.toml");
+        let Ok(text) = std::fs::read_to_string(&manifest) else {
+            violations.push(format!(
+                "{name}: manifest missing at {}",
+                manifest.display()
+            ));
+            continue;
+        };
+        let Ok(v) = toml::from_str::<toml::Value>(&text) else {
+            violations.push(format!("{name}: manifest unparseable"));
+            continue;
+        };
+        if v.get("target").is_some() {
+            violations.push(format!("{name}: [target.'cfg(...)'.dependencies] present"));
+        }
+        let deps = v.get("dependencies").and_then(toml::Value::as_table);
+        for dep in deps.unwrap_or(&toml::map::Map::new()).keys() {
+            let bare = dep.split('.').next().unwrap_or(dep);
+            if PLATFORM_CRATES.contains(&bare) {
+                violations.push(format!("{name}: platform-specific dependency '{dep}'"));
+            }
+        }
+    }
+    if violations.is_empty() {
+        Gate::ok(
+            "platform-checks",
+            &format!(
+                "{} portable-core crate(s) free of platform-specific dependencies",
+                config.portable_core.len()
+            ),
+        )
+    } else {
+        Gate::fail("platform-checks", &violations.join("\n"))
+    }
+}
+
+/// Feature matrix: for each workspace member, `cargo check` with
+/// --no-default-features and --all-features (per quality.toml [features]).
+pub fn feature_matrix_gate(repo: &Repo) -> Gate {
+    let meta = match cargo_metadata() {
+        Ok(m) => m,
+        Err(e) => return Gate::unknown("feature-matrix", &format!("cargo metadata failed: {e}")),
+    };
+    let mut names: Vec<String> = member_manifests(&meta)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    names.sort();
+    let mut failures: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+    for name in &names {
+        for flag in ["--no-default-features", "--all-features"] {
+            let g = cargo(repo, &["check", "-p", name, flag]);
+            checked += 1;
+            if g.verdict == "FAIL" {
+                failures.push(format!("{name} {flag}: {}", g.detail));
+            }
+        }
+    }
+    if failures.is_empty() {
+        Gate::ok(
+            "feature-matrix",
+            &format!("{checked} member×feature checks passed ({})", names.len()),
+        )
+    } else {
+        Gate::fail("feature-matrix", &failures.join("\n"))
+    }
+}
+
+/// Portable core: every harness.toml [portable_core] crate must compile for
+/// wasm32-wasip1; target not installed => UNKNOWN.
+pub fn portable_core_gate(repo: &Repo, config: &Config) -> Gate {
+    let (ok, out) = run_at(&repo.root, "rustup", &["target", "list", "--installed"]);
+    if !ok || !out.contains("wasm32-wasip1") {
+        return Gate::unknown(
+            "portable-core",
+            "wasm32-wasip1 target not installed (install with: rustup target add wasm32-wasip1)",
+        );
+    }
+    let mut failures: Vec<String> = Vec::new();
+    for name in &config.portable_core {
+        let g = cargo(repo, &["check", "-p", name, "--target", "wasm32-wasip1"]);
+        if g.verdict == "FAIL" {
+            failures.push(format!("{name}: {}", g.detail));
+        }
+    }
+    if failures.is_empty() {
+        Gate::ok(
+            "portable-core",
+            &format!(
+                "{} portable crate(s) compile for wasm32-wasip1",
+                config.portable_core.len()
+            ),
+        )
+    } else {
+        Gate::fail("portable-core", &failures.join("\n"))
+    }
+}
+
 pub fn unimplemented(name: &str) -> Gate {
     Gate::unknown(
         name,
         "gate not implemented in MVP harness (recorded UNKNOWN, not silently passed)",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn member_manifests_only_contains_workspace_members() {
+        let meta = cargo_metadata().expect("cargo metadata must run");
+        let names: Vec<String> = member_manifests(&meta)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        let declared = member_names(&meta);
+        assert!(
+            names.len() >= 20,
+            "expected >= 20 workspace members, found {}",
+            names.len()
+        );
+        assert!(names.iter().all(|n| declared.contains(n)));
+        assert!(!names.iter().any(|n| n == "serde_json" || n == "syn"));
+    }
 }

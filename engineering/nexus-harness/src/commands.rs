@@ -268,6 +268,7 @@ pub fn verify(sub: &str) -> Outcome {
         for name in config.declared_gates("full") {
             gates.push(match name.as_str() {
                 "workspace-tests" => gates::workspace_tests_gate(&repo),
+                "integration" => gates::integration_gate(&repo),
                 "product-scenarios" => {
                     let (sr, g) =
                         scenario_run(&config, "product-scenarios", &["product", "engineering"]);
@@ -281,6 +282,13 @@ pub fn verify(sub: &str) -> Outcome {
                 }
                 "architecture-policy" => gates::architecture_gate(&config),
                 "dependency-governance" => gates::dependency_gate(&repo, &config),
+                "coverage-summary" => gates::coverage_gate(&repo),
+                "selected-fuzz" => gates::fuzz_gate(&repo),
+                "selected-concurrency" => gates::concurrency_gate(&repo),
+                "performance-budgets" => gates::performance_budgets_gate(&config),
+                "platform-checks" => gates::platform_checks_gate(&config),
+                "feature-matrix" => gates::feature_matrix_gate(&repo),
+                "portable-core" => gates::portable_core_gate(&repo, &config),
                 other => gates::unimplemented(other),
             });
         }

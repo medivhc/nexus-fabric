@@ -12,6 +12,8 @@ pub struct Config {
     pub engineering_dir: PathBuf,
     /// policies/quality.toml (gate lists for fast/full verification).
     pub quality: Value,
+    /// harness.toml [portable_core].crates (WASI/portability gate targets).
+    pub portable_core: Vec<String>,
 }
 
 fn toml_file_to_json(path: PathBuf, what: &str) -> Result<Value, String> {
@@ -57,6 +59,16 @@ impl Config {
         let engineering_dir = repo.resolve(&get("engineering")?);
         let quality =
             toml_file_to_json(policies_dir.join("quality.toml"), "policies/quality.toml")?;
+        let portable_core = harness
+            .pointer("/portable_core/crates")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(Config {
             policies_dir,
             scenarios_dir,
@@ -64,6 +76,7 @@ impl Config {
             crates_dir,
             engineering_dir,
             quality,
+            portable_core,
         })
     }
 
