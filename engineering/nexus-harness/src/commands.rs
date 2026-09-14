@@ -62,11 +62,11 @@ pub fn status() -> Outcome {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let dir = l
-                .get("dir")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
+            let dir = if id.is_empty() {
+                String::new()
+            } else {
+                format!("verify-{id}")
+            };
             let ev = json!({"available": true, "id": id, "dir": dir, "verdict": latest_verdict});
             if !fresh {
                 (
