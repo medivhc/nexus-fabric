@@ -1,0 +1,21 @@
+[package]
+name = "nexusd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nexus-control-api = { path = "../../crates/nexus-control-api" }
+nexus-registry = { path = "../../crates/nexus-registry" }
+nexus-discovery = { path = "../../crates/nexus-discovery" }
+nexus-ingress = { path = "../../crates/nexus-ingress" }
+nexus-network = { path = "../../crates/nexus-network" }
+nexus-service = { path = "../../crates/nexus-service" }
+nexus-workspace = { path = "../../crates/nexus-workspace" }
+nexus-compute = { path = "../../crates/nexus-compute" }
+nexus-diagnostics = { path = "../../crates/nexus-diagnostics" }
+nexus-platform = { path = "../../crates/nexus-platform" }

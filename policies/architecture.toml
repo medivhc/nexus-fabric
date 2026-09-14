@@ -1,0 +1,177 @@
+schema_version = 1
+arrow_semantics = "A --> B means A depends on B"
+unlisted_internal_dependencies = "deny"
+
+[repository]
+authoritative_policy_root = "policies"
+authoritative_scenario_root = "scenarios"
+evidence_root = ".evidence"
+engineering_tools_root = "engineering"
+
+[global]
+production_depends_on_engineering = false
+network_depends_on_ingress = false
+platform_adapters_depend_on_domain_runtimes = false
+delivery_depends_on_workspace_or_compute = false
+
+[[crate]]
+name = "nexus-domain"
+allowed_internal_dependencies = []
+portable = true
+layer = "portable-core"
+
+[[crate]]
+name = "nexus-control-api"
+allowed_internal_dependencies = ["nexus-domain", "nexus-proto"]
+portable = false
+layer = "portable-core"
+
+[[crate]]
+name = "nexus-registry"
+allowed_internal_dependencies = ["nexus-domain"]
+portable = true
+layer = "portable-core"
+
+[[crate]]
+name = "nexus-discovery"
+allowed_internal_dependencies = ["nexus-domain", "nexus-registry", "nexus-platform"]
+portable = false
+layer = "portable-core"
+
+[[crate]]
+name = "nexus-connectivity"
+allowed_internal_dependencies = ["nexus-delivery", "nexus-platform"]
+portable = false
+layer = "delivery"
+
+[[crate]]
+name = "nexus-ingress"
+allowed_internal_dependencies = ["nexus-domain"]
+portable = true
+layer = "portable-core"
+
+[[crate]]
+name = "nexus-dns"
+allowed_internal_dependencies = ["nexus-domain"]
+portable = true
+layer = "portable-core"
+
+[[crate]]
+name = "nexus-policy"
+allowed_internal_dependencies = ["nexus-domain"]
+portable = true
+layer = "portable-core"
+
+[[crate]]
+name = "nexus-auth"
+allowed_internal_dependencies = ["nexus-domain"]
+portable = true
+layer = "portable-core"
+
+[[crate]]
+name = "nexus-planner"
+allowed_internal_dependencies = ["nexus-domain", "nexus-registry", "nexus-measurement"]
+portable = true
+layer = "portable-core"
+
+[[crate]]
+name = "nexus-session"
+allowed_internal_dependencies = ["nexus-domain"]
+portable = true
+layer = "portable-core"
+
+[[crate]]
+name = "nexus-measurement"
+allowed_internal_dependencies = ["nexus-domain"]
+portable = true
+layer = "portable-core"
+
+[[crate]]
+name = "nexus-delivery"
+allowed_internal_dependencies = ["nexus-domain"]
+portable = true
+layer = "delivery"
+
+[[crate]]
+name = "nexus-transport"
+allowed_internal_dependencies = ["nexus-delivery", "nexus-platform"]
+portable = false
+layer = "delivery"
+
+[[crate]]
+name = "nexus-network"
+allowed_internal_dependencies = ["nexus-domain", "nexus-policy", "nexus-planner", "nexus-session", "nexus-delivery", "nexus-dns"]
+portable = false
+layer = "domain-runtime"
+
+[[crate]]
+name = "nexus-service"
+allowed_internal_dependencies = ["nexus-domain", "nexus-session", "nexus-delivery"]
+portable = false
+layer = "domain-runtime"
+
+[[crate]]
+name = "nexus-workspace"
+allowed_internal_dependencies = ["nexus-domain", "nexus-session", "nexus-delivery", "nexus-storage"]
+portable = false
+layer = "domain-runtime"
+
+[[crate]]
+name = "nexus-compute"
+allowed_internal_dependencies = ["nexus-domain", "nexus-session", "nexus-delivery", "nexus-workspace"]
+portable = false
+layer = "domain-runtime"
+
+[[crate]]
+name = "nexus-storage"
+allowed_internal_dependencies = ["nexus-domain"]
+portable = true
+layer = "portable-core"
+
+[[crate]]
+name = "nexus-platform"
+allowed_internal_dependencies = []
+portable = false
+layer = "platform-abstraction"
+
+[[crate]]
+name = "nexus-platform-linux"
+allowed_internal_dependencies = ["nexus-platform"]
+portable = false
+layer = "platform-adapter"
+
+[[crate]]
+name = "nexus-platform-windows"
+allowed_internal_dependencies = ["nexus-platform"]
+portable = false
+layer = "platform-adapter"
+
+[[crate]]
+name = "nexus-platform-macos"
+allowed_internal_dependencies = ["nexus-platform"]
+portable = false
+layer = "platform-adapter"
+
+[[crate]]
+name = "nexus-platform-android"
+allowed_internal_dependencies = ["nexus-platform"]
+portable = false
+layer = "platform-adapter"
+
+[[crate]]
+name = "nexus-platform-ios"
+allowed_internal_dependencies = ["nexus-platform"]
+portable = false
+layer = "platform-adapter"
+
+[[crate]]
+name = "nexus-diagnostics"
+allowed_internal_dependencies = ["nexus-domain"]
+portable = false
+layer = "portable-core"
+
+[[crate]]
+name = "nexus-proto"
+allowed_internal_dependencies = []
+portable = true
+layer = "portable-core"

@@ -1,0 +1,15 @@
+[package]
+name = "nexus-workspace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nexus-domain = { path = "../nexus-domain" }
+nexus-session = { path = "../nexus-session" }
+nexus-delivery = { path = "../nexus-delivery" }
+nexus-storage = { path = "../nexus-storage" }

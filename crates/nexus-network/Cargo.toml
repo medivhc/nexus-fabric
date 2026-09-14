@@ -1,0 +1,17 @@
+[package]
+name = "nexus-network"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nexus-domain = { path = "../nexus-domain" }
+nexus-policy = { path = "../nexus-policy" }
+nexus-planner = { path = "../nexus-planner" }
+nexus-session = { path = "../nexus-session" }
+nexus-delivery = { path = "../nexus-delivery" }
+nexus-dns = { path = "../nexus-dns" }

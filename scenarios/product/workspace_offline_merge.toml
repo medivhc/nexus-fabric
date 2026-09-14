@@ -1,0 +1,28 @@
+schema_version = 1
+id = "product.workspace-offline-merge"
+title = "Workspace 多端离线提交不丢失并可三方合并"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#workspace"
+
+[given]
+base_commit = "C0"
+local_changes = ["a.txt"]
+remote_changes = ["b.txt"]
+network = "offline-then-online"
+
+[when]
+action = "commit_both_then_reconnect"
+
+[[expect]]
+field = "head_count_before_merge"
+equals = 2
+
+[[expect]]
+event = "common_ancestor_found"
+
+[[expect]]
+event = "merge_commit_created"
+
+[[expect]]
+field = "lost_successful_local_commits"
+equals = 0

@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nexus.local/schema/evidence-v1.json",
+  "title": "Nexus Verification Evidence",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "verification_id",
+    "verdict",
+    "source_revision",
+    "working_tree_digest",
+    "configuration_digest",
+    "feature_set",
+    "target_triple",
+    "toolchain_version",
+    "checks"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "verification_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "verdict": {
+      "enum": [
+        "PASS",
+        "FAIL",
+        "STALE",
+        "UNKNOWN",
+        "BLOCKED"
+      ]
+    },
+    "evidence_strength": {
+      "enum": [
+        "E0",
+        "E1",
+        "E2",
+        "E3",
+        "E4",
+        "E5"
+      ]
+    },
+    "source_revision": {
+      "type": "string"
+    },
+    "working_tree_digest": {
+      "type": "string"
+    },
+    "dirty_state": {
+      "type": "boolean"
+    },
+    "configuration_digest": {
+      "type": "string"
+    },
+    "feature_set": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "target_triple": {
+      "type": "string"
+    },
+    "toolchain_version": {
+      "type": "string"
+    },
+    "platform_capability_digest": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "contract_hash": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "status"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "PASS",
+              "FAIL",
+              "BLOCKED",
+              "UNKNOWN"
+            ]
+          },
+          "duration_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "artifact": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

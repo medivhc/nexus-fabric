@@ -1,0 +1,24 @@
+schema_version = 1
+id = "product.resource-session-lifecycle"
+title = "Resource 使用遵守 Resolve -> Plan -> Session -> Connectivity -> Execute"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#session"
+
+[given]
+resource = "service://example"
+candidate_providers = 2
+
+[when]
+action = "use_resource"
+
+[[expect]]
+event = "plan_selected"
+before = "connectivity_establishment"
+
+[[expect]]
+event = "session_created"
+before = "connectivity_establishment"
+
+[[expect]]
+field = "terminal_outcome_commit_count"
+equals = 1

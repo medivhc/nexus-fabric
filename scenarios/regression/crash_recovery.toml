@@ -1,0 +1,22 @@
+schema_version = 1
+id = "regression.crash-recovery"
+title = "强杀后冷启动先 Reconciliation 再接受新工作"
+evidence_strength = "E4"
+
+[given]
+persisted_session = "Active+Unfinished"
+process_alive = false
+dirty_workspace_journal = true
+
+[when]
+action = "cold_start"
+
+[[expect]]
+event = "reconciliation_started"
+before = "accept_new_work"
+
+[[expect]]
+event = "workspace_journal_reconciled"
+
+[[expect]]
+event = "orphan_session_classified"

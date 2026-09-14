@@ -1,0 +1,65 @@
+schema_version = 1
+
+[compiler]
+deny_warnings = true
+fmt_check = true
+clippy_all_targets = true
+
+[features]
+check_default = true
+check_no_default_features = true
+check_each_feature = true
+check_supported_combinations = true
+check_all_features_when_valid = true
+
+[portability]
+wasi_or_equivalent_check = true
+
+[verification.fast]
+gates = [
+  "format",
+  "check",
+  "clippy",
+  "architecture-delta",
+  "dependency-delta",
+  "affected-tests",
+  "selected-properties"
+]
+
+[verification.full]
+gates = [
+  "workspace-tests",
+  "integration",
+  "product-scenarios",
+  "regression",
+  "architecture-policy",
+  "dependency-governance",
+  "coverage-summary",
+  "selected-fuzz",
+  "selected-concurrency",
+  "performance-budgets",
+  "platform-checks",
+  "feature-matrix",
+  "portable-core"
+]
+
+[evidence]
+verdicts = ["PASS", "FAIL", "STALE", "UNKNOWN", "BLOCKED"]
+candidate_completion_is_pass = false
+minimum_user_visible_strength = "E4"
+stale_on_revision_change = true
+stale_on_config_change = true
+stale_on_feature_change = true
+stale_on_target_change = true
+stale_on_toolchain_change = true
+
+[concurrency]
+fire_and_forget_tasks = "deny"
+dropped_join_handle = "deny"
+worker_writes_terminal_outcome = "deny"
+exactly_one_terminal_outcome = true
+
+[rust]
+normal_business_failure_via_panic = "deny"
+unsafe_requires_safety_invariant = true
+public_api_minimization = true

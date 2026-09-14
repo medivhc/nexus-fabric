@@ -1,0 +1,19 @@
+schema_version = 1
+id = "platform.virtual-packet-interface"
+title = "平台 Packet Adapter 保持统一 Packet Semantics"
+evidence_strength = "E4"
+
+[given]
+platforms = ["linux", "windows", "macos", "android", "ios"]
+
+[when]
+action = "inject_and_receive_ip_packet"
+
+[[expect]]
+capability = "packet_ingress"
+
+[[expect]]
+capability = "packet_injection"
+
+[[expect]]
+portable_consumer = "nexus-ingress"

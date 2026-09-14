@@ -1,0 +1,152 @@
+# Nexus Product Contract
+
+## 1. 产品定义
+
+Nexus 向用户提供一个统一 Resource Fabric。用户表达“要使用什么资源”和“如何使用”，系统负责发现 Provider、规划 Provider/Placement/Path、建立 Session、激活 Connectivity、执行并持续观测。
+
+产品入口包括：
+
+```text
+Devices
+Network
+Services
+Workspaces
+Compute
+```
+
+这些是产品分类，不是互相割裂的底层系统。
+
+## 2. Network / InternetAccess
+
+Network Resource 必须支持：
+
+- 由 Virtual Packet Interface、SOCKS、HTTP 或 Native API 产生 FlowContext。
+- Policy 生成 Intent + Constraint。
+- Core Planner 选择 InternetAccess Provider、Placement、Path 与 ExecutionStrategy。
+- Session 创建后才执行 Connectivity Establishment。
+- DNS 作为 NetworkPlanExtension 管理 Exit-DNS Binding。
+- 运行时可观察 Connectivity、DNS、Session、Measurement 与 Replan。
+
+失败必须区分至少：
+
+```text
+NO_PROVIDER
+CONSTRAINT_UNSATISFIED
+CONNECTIVITY_ESTABLISHMENT_FAILED
+DNS_RESOLUTION_FAILED
+AUTHORIZATION_DENIED
+PLATFORM_CAPABILITY_UNAVAILABLE
+SESSION_FAILED
+```
+
+## 3. Service
+
+Service 是 Resource。
+
+`connect` 建立 Nexus-aware Service Session；`forward` 创建本地 listener 并把本地连接映射到 Service Session。对非 loopback 的监听必须显式授权。
+
+## 4. Workspace
+
+Workspace 是版本化、内容寻址、支持离线分叉的 Data Resource。
+
+权威模型：
+
+```text
+WorkspaceId
+Commit DAG
+Head Set
+Namespace / Manifest
+Object / Chunk CAS
+Replica Set
+```
+
+必须满足：
+
+- 离线写允许创建本地 Commit。
+- 多端并发写允许形成多个 Head。
+- 网络恢复后支持 fast-forward、three-way merge 或显式 Conflict Resolution。
+- 不得因为远端 Head 变化丢弃已经成功本地提交的数据。
+- 支持 WorkingSet、Profile、WorkspaceGraph 与 Prefetch，但这些不是权威内容。
+- 支持 Reachability GC、Storage Quota、Shallow Sync 与 Sparse Replica。
+- 无 FUSE/Mount 环境仍可通过 Native API、Materialization 或平台式 Projection 使用。
+
+## 5. Compute
+
+Compute 是 Resource。
+
+执行前固定 Workspace Commit/Snapshot，Planner 综合：
+
+```text
+Compute Capability
+Queue Delay
+Execution Estimate
+Workspace Data Locality
+WorkingSet Coverage
+Missing Bytes
+Connectivity Feasibility
+Cache Hints
+Platform Capability
+```
+
+Write-back 必须创建新 Workspace Commit，而不是修改 pinned Snapshot。
+
+## 6. Session 语义
+
+Session 使用双轨状态：
+
+```text
+LifecyclePhase:
+Allocating | Active | Draining | Disposed
+
+TerminalOutcome:
+Unfinished | Completed | Failed | Cancelled
+```
+
+Completed/Failed/Cancelled 只能提交一次；资源清理可以在 Outcome 确定后继续，最终 LifecyclePhase 到达 Disposed。
+
+## 7. 跨平台产品语义
+
+Nexus 保证 Semantic Portability，而不是强迫所有平台 API 一致。
+
+同一产品能力可以由不同 Platform Capability 实现：
+
+```text
+VirtualPacketInterface:
+Linux TUN
+Windows virtual interface
+macOS packet tunnel
+Android VPN service
+iOS packet tunnel
+
+Workspace Access:
+FUSE / filesystem projection
+file-provider-style projection
+materialized directory/data
+native API
+```
+
+平台缺少某项能力时，必须返回明确的 Capability Unsupported 或选择文档化降级路径，不能静默改变产品语义。
+
+## 8. 可观察性
+
+关键 Resource/Session 必须可被 CLI/GUI/Agent 观察。
+
+至少提供：
+
+```text
+status
+plan explain
+session watch
+connectivity status/candidates/probe/links
+dns status/resolve/providers/cache
+workspace heads/conflicts/cache
+compute jobs
+diagnose
+platform capabilities
+```
+
+## 9. 完成条件
+
+关键用户可见 Capability 原则上至少需要一条 E4 Product Scenario 或 E5 External Observation 证据。
+
+代码存在、单元测试通过、Agent 声称完成、README 标记完成，都不是最终完成判据。

@@ -1,0 +1,31 @@
+schema_version = 1
+
+[third_party]
+default_features_policy = "prefer-disabled"
+allow_unpinned_git = false
+allow_path_outside_workspace = false
+require_declared_reason_for_default_features = true
+require_architecture_layer_review = true
+require_os_transitive_dependency_review = true
+require_portability_review_for_portable_crates = true
+
+[licenses]
+policy = "allowlist"
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib"
+]
+
+[security]
+advisory_gate = "deny-known-vulnerabilities"
+recommended_tool = "cargo-deny"
+
+[supply_chain]
+lockfile_required = true
+review_new_direct_dependencies = true
+review_feature_expansion = true
