@@ -8,17 +8,46 @@ requirement = "PRODUCT.md#session"
 resource = "service://example"
 candidate_providers = 2
 
+# 可执行 E4：组合根驱动 Service 资源的完整生命周期并输出 JSON。
 [when]
-action = "use_resource"
+command = "cargo run --quiet -p nexus --example service_session_lifecycle -- --json"
+
+# 冻结期望（与初版静态契约同语义）：
+# plan_selected / session_created 必须先于 connectivity_establishment。
+[[expect]]
+field = "verdict"
+equals = "PASS"
 
 [[expect]]
-event = "plan_selected"
-before = "connectivity_establishment"
+field = "candidate_providers"
+equals = 2
 
 [[expect]]
-event = "session_created"
-before = "connectivity_establishment"
+field = "invariants.plan_before_connectivity"
+equals = true
 
+[[expect]]
+field = "invariants.session_before_connectivity"
+equals = true
+
+# TerminalOutcome 只允许 Owner 提交一次（重复提交必须被拒绝）。
 [[expect]]
 field = "terminal_outcome_commit_count"
 equals = 1
+
+[[expect]]
+field = "redundant_commit_rejected"
+equals = true
+
+[[expect]]
+field = "terminal_outcome"
+equals = "Completed"
+
+# Outcome 确定后 cleanup 仍可继续，最终 LifecyclePhase 到达 Disposed。
+[[expect]]
+field = "session.phase"
+equals = "Disposed"
+
+[[expect]]
+field = "session.outcome"
+equals = "Completed"

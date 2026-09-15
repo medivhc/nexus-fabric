@@ -10,3 +10,13 @@ workspace = true
 
 [dependencies]
 nexus-control-api = { path = "../../crates/nexus-control-api" }
+# Composition Root：仅 app 允许把各 portable-core 纵切装配到一起（crates 之间的
+# 依赖边仍由 policies/architecture.toml 约束，app 不在该约束的 crates/ 集合内）。
+nexus-domain = { path = "../../crates/nexus-domain" }
+nexus-ingress = { path = "../../crates/nexus-ingress" }
+nexus-policy = { path = "../../crates/nexus-policy" }
+nexus-registry = { path = "../../crates/nexus-registry" }
+nexus-measurement = { path = "../../crates/nexus-measurement" }
+nexus-planner = { path = "../../crates/nexus-planner" }
+nexus-session = { path = "../../crates/nexus-session" }
+serde_json = { version = "1", default-features = false, features = ["std"] }

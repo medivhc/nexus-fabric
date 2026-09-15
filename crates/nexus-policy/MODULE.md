@@ -43,7 +43,13 @@
 
 - 默认最小 surface：`private -> pub(crate) -> pub`。
 - Public API 变更必须保持结构化、可版本化并有调用方验证。
-- 本骨架只提供最小编译锚点；业务 API 在实现阶段增量添加。
+- 已实现（阶段 A）：
+  - `PolicyEngine`：动作化有序规则链（`new` / `default_network` / `default_service` / `evaluate`），首匹配即终止；
+  - `PolicyAction`：`AddConstraint`（非终态）/ `EnrichMetadata`（非终态）/ `SelectProvider`（终态）/ `Reject`（终态）；终态动作执行后规则链终止；
+  - `PolicyMatch` / `PolicyRule` / `PolicyTraceEntry` / `PolicyResult`；
+  - `PolicyDecision { intent, constraints, metadata }`：元数据由非终态 `EnrichMetadata` 累积，不进约束集；
+  - 便捷入口 `evaluate` / `evaluate_service`（等价默认引擎，保持既有调用方兼容）；
+  - `host_metadata_from_destination`（S7 sniff 补全域名的简化实现）。
 
 ## Verification
 

@@ -62,3 +62,18 @@ portability = "pure Rust, no OS-specific API"
 supply_chain = "version pinned by Cargo.lock (lockfile_required)"
 approved = true
 approved_date = "2026-09-15"
+
+[[dependency_reviews.direct]]
+consumer = "apps/nexus"
+crate = "serde_json"
+version = "1"
+default_features = false
+features = ["std"]
+architecture_layer = "composition-root app host (not a crates/ member; portable-core crates stay dependency-free)"
+feature_scope = "std feature only; used to render the E4 flow report JSON at the app boundary"
+license = "MIT OR Apache-2.0 (allowlisted); already used and reviewed for engineering/nexus-harness"
+security = "no known advisories in allowlist; cargo-deny recommended for CI"
+portability = "pure Rust, no OS-specific API; app is not on the portable-core WASI list"
+supply_chain = "already present in Cargo.lock, no lockfile change required"
+approved = true
+approved_date = "2026-09-15"

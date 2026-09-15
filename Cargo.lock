@@ -41,6 +41,14 @@ name = "nexus"
 version = "0.1.0"
 dependencies = [
  "nexus-control-api",
+ "nexus-domain",
+ "nexus-ingress",
+ "nexus-measurement",
+ "nexus-planner",
+ "nexus-policy",
+ "nexus-registry",
+ "nexus-session",
+ "serde_json",
 ]
 
 [[package]]

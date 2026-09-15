@@ -38,6 +38,38 @@ pub struct Constraint {
     pub value: String,
 }
 
+// ---------- FlowContext（Ingress 产出的中立流量上下文） ----------
+
+/// 流量来源（PRODUCT §2：由 Virtual Packet Interface、SOCKS、HTTP 或 Native API 产生）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowOrigin {
+    /// 虚拟网卡 / 包接口（平台实现位于 nexus-platform-*）。
+    VirtualPacketInterface,
+    /// SOCKS5 代理协议状态机产出。
+    Socks5,
+    /// HTTP 代理协议状态机产出。
+    Http,
+    /// 进程内 Native API 直接提交。
+    NativeApi,
+}
+
+/// 中立流量上下文。
+///
+/// 由 `nexus-ingress` 构造并提交给 SessionManager / Application Layer；
+/// 它只描述“要使用什么资源、去往何处、以什么 profile”，不含 Path/Provider 决策
+/// （Policy != Path），也不持有任何平台专有拦截句柄（Portable Core）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowContext {
+    /// 产生该流量的输入来源。
+    pub origin: FlowOrigin,
+    /// 目标资源（如 InternetAccess 对应的 Network Resource）。
+    pub resource: ResourceId,
+    /// 目标目的地（主机 / URL / 五元组的中立表达）。
+    pub destination: String,
+    /// 使用画像，供 Policy 展开为 Intent。
+    pub profile: String,
+}
+
 // ---------- Plan / PlanExtension ----------
 
 /// 类型化、版本化的领域扩展（ARCHITECTURE §5）。
@@ -377,6 +409,19 @@ mod tests {
             message: "boom".into(),
         };
         assert_eq!(err.disposition(), FailureDisposition::Escalate);
+    }
+
+    #[test]
+    fn flow_context_is_neutral_and_portable() {
+        let flow = FlowContext {
+            origin: FlowOrigin::Socks5,
+            resource: ResourceId("internet-access".into()),
+            destination: "https://example.invalid/".into(),
+            profile: "Balanced".into(),
+        };
+        assert_eq!(flow.origin, FlowOrigin::Socks5);
+        // 中立上下文不携带 Path/Provider 决策字段。
+        assert_eq!(flow.resource, ResourceId("internet-access".into()));
     }
 
     #[test]

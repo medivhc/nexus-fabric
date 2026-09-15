@@ -46,7 +46,12 @@
 
 - 默认最小 surface：`private -> pub(crate) -> pub`。
 - Public API 变更必须保持结构化、可版本化并有调用方验证。
-- 本骨架只提供最小编译锚点；业务 API 在实现阶段增量添加。
+- 已实现（阶段 A）：
+  - 两阶段求解：`filter_candidates`（硬谓词短路，被拒候选不进评分）/ `score_candidates`（归一化加权 [0, 10_000]）；
+  - `RejectReason` 结构化拒绝原因枚举（含稳定 `label()`，取代自由文本）；
+  - `PlanningSnapshot`（规划周期一致视图）；
+  - `plan_from_snapshot` / `plan`（K2→K3→确定性选优组装）；
+  - `Planned { plan, trace }` / `DecisionTrace` / `ConsideredCandidate`。
 
 ## Verification
 
