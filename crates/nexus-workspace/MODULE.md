@@ -18,6 +18,14 @@
 - 结构化 Result / Event / DTO。
 - 失败必须保留可诊断原因，不以日志文本代替错误类型。
 
+## Failures
+
+Merge/Commit 路径必须返回结构化 `WorkspaceError`，不得 panic 或以自由文本代替错误类型：
+
+- 未知提交（`UnknownCommit`）、内容对象缺失（`MissingObject`）、Manifest 损坏（`CorruptManifest`）；
+- 双端相对合并基修改同一路径且内容不同 → `MergeConflict::ConflictingPath`，要求显式冲突解决，且不得改变 Head 集；
+- 两个提交之间不存在公共祖先 → `NoCommonAncestor`。
+
 ## Allowed Dependencies
 
 - `nexus-domain`
@@ -60,6 +68,10 @@ cargo clippy -p nexus-workspace --all-targets -- -D warnings
 ```
 
 如果该模块影响产品行为，还必须映射 Integration/Scenario Evidence。
+
+本模块映射 `scenarios/product/workspace_offline_merge.toml`（E4）：由
+`crates/nexus-workspace/examples/workspace_offline_merge.rs` 驱动，经 harness 的
+`product-scenarios` gate 求值。
 
 ## Performance Budget
 
