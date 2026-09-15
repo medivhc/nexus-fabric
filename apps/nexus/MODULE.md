@@ -45,6 +45,11 @@
 - Public API 变更必须保持结构化、可版本化并有调用方验证。
 - 本骨架只提供最小编译锚点；业务 API 在实现阶段增量添加。
 
+已实现（revision f8c7113+）：
+
+- CLI 子命令解析（PRODUCT §8 全部命令：status / plan explain / session watch / connectivity / dns / workspace / compute jobs / diagnose / platform capabilities）。
+- `BootstrapControlService`（Composition Root 占位实现）：`status` 返回结构化状态；领域未就绪命令返回 `NexusError::Unsupported`（PRODUCT §7 禁止静默降级）。
+
 ## Verification
 
 最低：

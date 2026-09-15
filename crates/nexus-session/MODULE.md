@@ -46,6 +46,13 @@
 - Public API 变更必须保持结构化、可版本化并有调用方验证。
 - 本骨架只提供最小编译锚点；业务 API 在实现阶段增量添加。
 
+已实现（revision f8c7113+）：
+
+- `SessionOwner`：Owner 状态机，`commit_outcome` 为 `TerminalOutcome` 唯一写入入口（commit-once 守卫），`transition_phase` 执行合法迁移校验，`request_cancellation` 仅记录取消事件。
+- `SessionEvent`：Worker 上报事件（Started/PhaseChanged/Progress/CancellationRequested/OutcomeCommitted）。
+- `CancelToken` 与 `AbortOnDropHandle`：std 实现的协作取消原语（Portable，无 tokio 依赖）；JoinSet/Reaper 运行时接线由 domain-runtime 层完成。
+- `SessionError`：结构化会话错误，`From<SessionError> for NexusError` 转换。
+
 ## Verification
 
 最低：

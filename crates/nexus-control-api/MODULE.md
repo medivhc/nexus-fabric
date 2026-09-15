@@ -46,6 +46,12 @@
 - Public API 变更必须保持结构化、可版本化并有调用方验证。
 - 本骨架只提供最小编译锚点；业务 API 在实现阶段增量添加。
 
+已实现（revision f8c7113+）：
+
+- `ControlCommand`：PRODUCT §8 可观察性命令（status / plan explain / session watch / connectivity / dns / workspace / compute jobs / diagnose / platform capabilities）。
+- `ControlOutput` 与各 View DTO（StatusView/PlanView/SessionView/LinesView），`to_lines()` 供终端渲染。
+- `ControlService` trait：前端统一入口；重导出 `NexusError`/`ResourceId`/`SessionId` 供只依赖本 crate 的前端使用。
+
 ## Verification
 
 最低：

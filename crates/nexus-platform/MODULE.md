@@ -45,6 +45,10 @@
 - Public API 变更必须保持结构化、可版本化并有调用方验证。
 - 本骨架只提供最小编译锚点；业务 API 在实现阶段增量添加。
 
+已实现（revision f8c7113+）：
+
+- `PlatformError` 结构化平台错误：`Unavailable`（对应 PRODUCT §7 显式 Capability Unsupported）、`Io`、`NotFound`、`Invalid`；全部能力 trait 的错误从 `String` 迁移为 `PlatformError`。
+
 ## Verification
 
 最低：

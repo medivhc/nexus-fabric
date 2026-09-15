@@ -46,6 +46,12 @@
 - Public API 变更必须保持结构化、可版本化并有调用方验证。
 - 本骨架只提供最小编译锚点；业务 API 在实现阶段增量添加。
 
+已实现（revision f8c7113+）：
+
+- `PlanExtension` 类型化领域扩展：`NetworkPlanExtension` / `WorkspacePlanExtension` / `ComputePlanExtension` / `ServicePlanExtension`，各带 `version` 字段；`Plan.extension: Option<PlanExtension>`（替代原 `domain_extension_type: Option<String>`）。
+- `NexusError` 结构化失败枚举（PRODUCT §2 七类失败 + `Unsupported` / `Internal`）与 `FailureDisposition`（Retry/Fallback/Abort/Escalate）。
+- `TerminalOutcome` 改造：`Failed(NexusError)` 携带结构化错误；`Cancelled` 无 payload（原因经 Session 事件记录）。
+
 ## Verification
 
 最低：
