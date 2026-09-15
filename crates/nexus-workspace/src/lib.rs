@@ -1,10 +1,13 @@
 //! Workspace 权威模型：不可变 Commit DAG + Head Set（AGENTS §16 / PRODUCT §4）。
 //!
-//! 本切片由 `product.workspace-offline-merge` E4 场景驱动，实现：
+//! 本切片由 `product.workspace-offline-merge` 与 `regression.crash-recovery`
+//! 两个 E4 场景驱动，实现：
 //!
 //! - Commit DAG 与 Head Set：多端离线写允许产生多个 Head；
 //! - 重连后 fast-forward / AlreadyEqual / 三方合并 + 显式冲突检测；
 //! - 合并后本地提交零丢失（`lost_successful_local_commits = 0`）；
+//! - 持久状态（DAG + Heads + Journal 单对象 CAS 原子替换）与写前日志；
+//! - 冷启动 `open` 恢复 + `reconcile_journal` 幂等回放（确认/redo，不丢数据）；
 //! - Manifest 与内容对象存入 `nexus-storage` 的 `ContentStore`（CAS）。
 //!
 //! 明确不做（MODULE.md Non-Responsibilities）：不选择远端 Replica/Path
@@ -105,6 +108,39 @@ pub enum MergeConflict {
     ConflictingPath { path: String },
 }
 
+/// Head 更新动作（journal 重放时应用，与写入时保持一致）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadAction {
+    /// 替换 parent Head 为新提交（普通顺序写入）。
+    Replace(CommitId),
+    /// 新增一个 Head（离线分叉写入）。
+    Add,
+}
+
+/// 写前日志条目（journal marker）：登记一次“即将落入 DAG”的提交。
+///
+/// 顺序：`journal_pending`（marker 落盘，提交不可见）→ 应用提交 → `commit_pending`
+/// （marker 清除）。崩溃后由 `reconcile_journal` 回放：提交已在 DAG 则确认，
+/// 不在则从 marker 重放（redo），不丢失已写入数据（AGENTS.md §15）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalEntry {
+    pub commit_id: CommitId,
+    pub parents: Vec<CommitId>,
+    pub root_manifest_id: ObjectId,
+    pub head_action: HeadAction,
+}
+
+/// 日志回放报告。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JournalReconcileReport {
+    /// marker 对应提交已在 DAG：直接确认（清理 marker）。
+    pub confirmed: usize,
+    /// marker 对应提交不在 DAG：从 marker 重放完成被中断的写入。
+    pub redone: usize,
+    /// 处理的 marker 总数。
+    pub total: usize,
+}
+
 /// Workspace 结构化失败（MODULE.md：不以日志文本代替错误类型）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceError {
@@ -114,6 +150,8 @@ pub enum WorkspaceError {
     MissingObject { id: ObjectId },
     /// Manifest 无法解析。
     CorruptManifest { id: ObjectId, reason: String },
+    /// 持久状态对象无法解析或校验失败。
+    CorruptState { reason: String },
     /// 底层存储失败。
     StoreFailure { reason: String },
     /// 三方合并出现需要显式解决的冲突。
@@ -130,6 +168,7 @@ impl fmt::Display for WorkspaceError {
             Self::CorruptManifest { id, reason } => {
                 write!(f, "corrupt manifest {id}: {reason}")
             }
+            Self::CorruptState { reason } => write!(f, "corrupt durable state: {reason}"),
             Self::StoreFailure { reason } => write!(f, "store failure: {reason}"),
             Self::MergeConflict(MergeConflict::ConflictingPath { path }) => {
                 write!(f, "merge conflict on path: {path}")
@@ -230,7 +269,163 @@ pub struct MergeReport {
     pub lost_successful_local_commits: usize,
 }
 
-/// Workspace 权威状态：不可变 Commit DAG + Head Set + 内容寻址存储。
+/// 持久状态：DAG + Heads + Journal，序列化为单个 CAS 对象（原子替换）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DurableState {
+    id: WorkspaceId,
+    commits: Vec<WorkspaceCommit>,
+    heads: Vec<CommitId>,
+    journal: Vec<JournalEntry>,
+}
+
+impl DurableState {
+    const HEADER: &'static str = "nexus-workspace-state v1";
+    const HEADER_TOKEN: &'static str = "nexus-workspace-state";
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = String::new();
+        out.push_str(Self::HEADER);
+        out.push('\n');
+        out.push_str(&format!("id {}\n", self.id.0));
+        for c in &self.commits {
+            let parents = c
+                .parents
+                .iter()
+                .map(|p| p.0.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            out.push_str(&format!(
+                "commit {} {} {parents}\n",
+                c.id.0, c.root_manifest_id.0
+            ));
+        }
+        for h in &self.heads {
+            out.push_str(&format!("head {}\n", h.0));
+        }
+        for e in &self.journal {
+            let action = match &e.head_action {
+                HeadAction::Replace(p) => format!("replace:{}", p.0),
+                HeadAction::Add => "add".to_string(),
+            };
+            let parents = e
+                .parents
+                .iter()
+                .map(|p| p.0.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            out.push_str(&format!(
+                "journal {} {} {action} {parents}\n",
+                e.commit_id.0, e.root_manifest_id.0
+            ));
+        }
+        out.into_bytes()
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self, WorkspaceError> {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|e| WorkspaceError::CorruptState {
+                reason: format!("state not utf8: {e}"),
+            })?
+            .to_string();
+        let mut id = None;
+        let mut commits = Vec::new();
+        let mut heads = Vec::new();
+        let mut journal = Vec::new();
+        for line in text.lines() {
+            let mut t = line.split_whitespace();
+            match t.next() {
+                Some("id") => {
+                    let raw = t.next().ok_or_else(|| WorkspaceError::CorruptState {
+                        reason: "state line lacks id".into(),
+                    })?;
+                    id = Some(WorkspaceId(raw.to_string()));
+                }
+                Some("commit") => {
+                    let raw_id = t.next().ok_or_else(|| WorkspaceError::CorruptState {
+                        reason: "commit line lacks id".into(),
+                    })?;
+                    let raw_manifest = t.next().ok_or_else(|| WorkspaceError::CorruptState {
+                        reason: format!("commit {raw_id} lacks manifest id"),
+                    })?;
+                    let parents = t
+                        .next()
+                        .unwrap_or("")
+                        .split(',')
+                        .filter(|p| !p.is_empty())
+                        .map(|p| CommitId(p.to_string()))
+                        .collect();
+                    commits.push(WorkspaceCommit {
+                        id: CommitId(raw_id.to_string()),
+                        parents,
+                        root_manifest_id: ObjectId(raw_manifest.to_string()),
+                    });
+                }
+                Some("head") => {
+                    let raw = t.next().ok_or_else(|| WorkspaceError::CorruptState {
+                        reason: "head line lacks id".into(),
+                    })?;
+                    heads.push(CommitId(raw.to_string()));
+                }
+                Some("journal") => {
+                    let raw_id = t.next().ok_or_else(|| WorkspaceError::CorruptState {
+                        reason: "journal line lacks commit id".into(),
+                    })?;
+                    let raw_manifest = t.next().ok_or_else(|| WorkspaceError::CorruptState {
+                        reason: format!("journal {raw_id} lacks manifest id"),
+                    })?;
+                    let action = t.next().ok_or_else(|| WorkspaceError::CorruptState {
+                        reason: format!("journal {raw_id} lacks head action"),
+                    })?;
+                    let head_action = if let Some(parent) = action.strip_prefix("replace:") {
+                        HeadAction::Replace(CommitId(parent.to_string()))
+                    } else if action == "add" {
+                        HeadAction::Add
+                    } else {
+                        return Err(WorkspaceError::CorruptState {
+                            reason: format!("unknown head action {action}"),
+                        });
+                    };
+                    let parents = t
+                        .next()
+                        .unwrap_or("")
+                        .split(',')
+                        .filter(|p| !p.is_empty())
+                        .map(|p| CommitId(p.to_string()))
+                        .collect();
+                    journal.push(JournalEntry {
+                        commit_id: CommitId(raw_id.to_string()),
+                        parents,
+                        root_manifest_id: ObjectId(raw_manifest.to_string()),
+                        head_action,
+                    });
+                }
+                Some(line) if line == Self::HEADER_TOKEN => {}
+                Some(other) => {
+                    return Err(WorkspaceError::CorruptState {
+                        reason: format!("unexpected line kind {other}"),
+                    });
+                }
+                None => {}
+            }
+        }
+        let id = id.ok_or_else(|| WorkspaceError::CorruptState {
+            reason: "state lacks workspace id".into(),
+        })?;
+        if commits.is_empty() || heads.is_empty() {
+            return Err(WorkspaceError::CorruptState {
+                reason: "state has no commits or heads".into(),
+            });
+        }
+        Ok(Self {
+            id,
+            commits,
+            heads,
+            journal,
+        })
+    }
+}
+
+/// Workspace 权威状态：不可变 Commit DAG + Head Set + 内容寻址存储 + 写前日志。
 #[derive(Debug)]
 pub struct Workspace<S: ContentStore> {
     id: WorkspaceId,
@@ -238,10 +433,20 @@ pub struct Workspace<S: ContentStore> {
     heads: HeadSet,
     store: S,
     next_seq: u64,
+    /// 当前持久状态对象（DAG + Heads + Journal）。
+    state_root: ObjectId,
+    /// 写前日志（未确认的 pending 提交 marker）。
+    journal: Vec<JournalEntry>,
+}
+
+/// 从提交 id 解析序号（`C0` -> 0）；无法解析返回 `None`。
+fn seq_of(id: &CommitId) -> Option<u64> {
+    id.0.strip_prefix('C')?.parse().ok()
 }
 
 impl<S: ContentStore> Workspace<S> {
-    /// 新建 Workspace：创建空 Manifest 的 Base Commit `C0`，Head = `[C0]`。
+    /// 新建 Workspace：创建空 Manifest 的 Base Commit `C0`，Head = `[C0]`，
+    /// 并持久化初始状态。
     pub fn init(id: WorkspaceId, mut store: S) -> Result<Self, WorkspaceError> {
         let empty = Manifest::default();
         let root_manifest_id = store
@@ -258,10 +463,55 @@ impl<S: ContentStore> Workspace<S> {
             heads: HeadSet::default(),
             store,
             next_seq: 1,
+            state_root: ObjectId(String::new()),
+            journal: Vec::new(),
         };
         ws.commits.insert(base.id.clone(), base.clone());
         ws.heads.add(base.id.clone());
+        ws.persist_state()?;
         Ok(ws)
+    }
+
+    /// 冷启动：从持久状态对象恢复 Workspace（AGENTS.md §15：先加载 durable state）。
+    pub fn open(id: WorkspaceId, store: S, state_root: &ObjectId) -> Result<Self, WorkspaceError> {
+        let bytes = store
+            .get(state_root)
+            .map_err(|reason| WorkspaceError::StoreFailure { reason })?
+            .ok_or_else(|| WorkspaceError::MissingObject {
+                id: state_root.clone(),
+            })?;
+        let state = DurableState::from_bytes(&bytes)?;
+        if state.id != id {
+            return Err(WorkspaceError::CorruptState {
+                reason: format!("state id {:?} does not match {:?}", state.id, id),
+            });
+        }
+        let mut commits = HashMap::new();
+        for c in &state.commits {
+            commits.insert(c.id.clone(), c.clone());
+        }
+        let mut heads = HeadSet::default();
+        for h in &state.heads {
+            heads.add(h.clone());
+        }
+        let next_seq = state
+            .commits
+            .iter()
+            .map(|c| &c.id)
+            .chain(state.journal.iter().map(|e| &e.commit_id))
+            .filter_map(seq_of)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(1);
+        Ok(Self {
+            id,
+            commits,
+            heads,
+            store,
+            next_seq,
+            state_root: state_root.clone(),
+            journal: state.journal,
+        })
     }
 
     /// Workspace 标识。
@@ -276,17 +526,45 @@ impl<S: ContentStore> Workspace<S> {
         &self.heads
     }
 
+    /// 当前持久状态对象 id（供冷启动 `open` 恢复）。
+    #[must_use]
+    pub fn state_root(&self) -> &ObjectId {
+        &self.state_root
+    }
+
+    /// 交出底层存储（模拟进程死亡后保留持久对象的场景）。
+    #[must_use]
+    pub fn into_store(self) -> S {
+        self.store
+    }
+
     /// 按 id 读取提交（只读 DAG 查询）。
     #[must_use]
     pub fn commit(&self, id: &CommitId) -> Option<&WorkspaceCommit> {
         self.commits.get(id)
     }
 
-    /// 离线写入：在 `parent` 之上应用 `changes`，创建新的不可变提交。
-    ///
-    /// - `parent` 是当前 Head → 替换该 Head；
-    /// - 否则 → 追加新 Head（多端离线分叉，AGENTS §16）。
-    pub fn commit_changes(
+    /// 把当前内存状态（DAG + Heads + Journal）持久化为单个 CAS 对象。
+    fn persist_state(&mut self) -> Result<ObjectId, WorkspaceError> {
+        let mut commits: Vec<WorkspaceCommit> = self.commits.values().cloned().collect();
+        commits.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        let state = DurableState {
+            id: self.id.clone(),
+            commits,
+            heads: self.heads.heads.clone(),
+            journal: self.journal.clone(),
+        };
+        let oid = self
+            .store
+            .put(&state.to_bytes())
+            .map_err(|reason| WorkspaceError::StoreFailure { reason })?;
+        self.state_root = oid.clone();
+        Ok(oid)
+    }
+
+    /// 写前登记：为一次“即将落 DAG”的提交写入 journal marker（marker 落盘，
+    /// 提交尚未可见）。返回新提交 id；随后应调用 `commit_pending` 完成写入。
+    pub fn journal_pending(
         &mut self,
         parent: &CommitId,
         changes: &[Change],
@@ -308,18 +586,92 @@ impl<S: ContentStore> Workspace<S> {
             .put(&manifest.to_bytes())
             .map_err(|reason| WorkspaceError::StoreFailure { reason })?;
         let id = self.next_commit_id();
-        let commit = WorkspaceCommit {
-            id: id.clone(),
+        let head_action = if self.heads.contains(parent) {
+            HeadAction::Replace(parent.clone())
+        } else {
+            HeadAction::Add
+        };
+        self.journal.push(JournalEntry {
+            commit_id: id.clone(),
             parents: vec![parent.clone()],
             root_manifest_id,
-        };
-        self.commits.insert(id.clone(), commit);
-        if self.heads.contains(parent) {
-            self.heads.replace(parent, id.clone());
-        } else {
-            self.heads.add(id.clone());
-        }
+            head_action,
+        });
+        // 写前日志：marker 先于提交落盘。
+        self.persist_state()?;
         Ok(id)
+    }
+
+    /// 完成一次 pending 写入：把 journal 中登记的提交落入 DAG 并更新 Head，
+    /// 然后清除 marker（幂等：仅当该提交尚未提交时生效）。
+    pub fn commit_pending(&mut self, pending: &CommitId) -> Result<CommitId, WorkspaceError> {
+        let Some(idx) = self.journal.iter().position(|e| e.commit_id == *pending) else {
+            return Err(WorkspaceError::UnknownCommit {
+                id: pending.clone(),
+            });
+        };
+        let entry = self.journal.remove(idx);
+        let commit = WorkspaceCommit {
+            id: entry.commit_id.clone(),
+            parents: entry.parents.clone(),
+            root_manifest_id: entry.root_manifest_id.clone(),
+        };
+        self.commits.insert(entry.commit_id.clone(), commit);
+        match &entry.head_action {
+            HeadAction::Replace(old) => self.heads.replace(old, entry.commit_id.clone()),
+            HeadAction::Add => self.heads.add(entry.commit_id.clone()),
+        }
+        self.persist_state()?;
+        Ok(entry.commit_id)
+    }
+
+    /// 离线写入：写前登记 + 完成提交（marker 落盘 -> 落 DAG -> 清除 marker）。
+    ///
+    /// - `parent` 是当前 Head → 替换该 Head；
+    /// - 否则 → 追加新 Head（多端离线分叉，AGENTS §16）。
+    pub fn commit_changes(
+        &mut self,
+        parent: &CommitId,
+        changes: &[Change],
+    ) -> Result<CommitId, WorkspaceError> {
+        let id = self.journal_pending(parent, changes)?;
+        self.commit_pending(&id)
+    }
+
+    /// 冷启动日志回放（AGENTS.md §15）：对 journal 中每个 marker，
+    /// 提交已在 DAG → 确认；不在 → 从 marker 重放（redo）完成中断写入。
+    /// 回放后 journal 为空并持久化，幂等。
+    pub fn reconcile_journal(&mut self) -> Result<JournalReconcileReport, WorkspaceError> {
+        let entries = std::mem::take(&mut self.journal);
+        let mut confirmed = 0usize;
+        let mut redone = 0usize;
+        for entry in entries {
+            if self.commits.contains_key(&entry.commit_id) {
+                confirmed += 1;
+                continue;
+            }
+            // 提交未落 DAG：从 marker 重放，完成被中断的写入（不丢数据）。
+            let commit = WorkspaceCommit {
+                id: entry.commit_id.clone(),
+                parents: entry.parents.clone(),
+                root_manifest_id: entry.root_manifest_id.clone(),
+            };
+            self.commits.insert(entry.commit_id.clone(), commit);
+            match &entry.head_action {
+                HeadAction::Replace(old) => self.heads.replace(old, entry.commit_id.clone()),
+                HeadAction::Add => self.heads.add(entry.commit_id.clone()),
+            }
+            self.next_seq = self
+                .next_seq
+                .max(seq_of(&entry.commit_id).map(|s| s + 1).unwrap_or(1));
+            redone += 1;
+        }
+        self.persist_state()?;
+        Ok(JournalReconcileReport {
+            confirmed,
+            redone,
+            total: confirmed + redone,
+        })
     }
 
     /// 重连合并：把 `remote` 合并进 `local`。
@@ -364,6 +716,7 @@ impl<S: ContentStore> Workspace<S> {
         {
             self.heads.remove(local);
             self.heads.add(remote.clone());
+            self.persist_state()?;
             return Ok(MergeReport {
                 disposition: MergeDisposition::FastForward,
                 events: Vec::new(),
@@ -438,6 +791,7 @@ impl<S: ContentStore> Workspace<S> {
         self.heads.remove(local);
         self.heads.remove(remote);
         self.heads.add(id.clone());
+        self.persist_state()?;
         events.push(EV_MERGE_COMMIT_CREATED);
 
         let post_reachable = self.reachable_from(&self.heads.heads.clone());
@@ -611,8 +965,6 @@ mod tests {
         let c2 = ws
             .commit_changes(&c1, &[change("b.txt", b"v2")])
             .expect("c2 ok");
-        // remote 分支从 base 分叉后并不存在；此处构造：local=C1，remote=C2（C1 是 C2 祖先）。
-        // 先让 remote 独立于 local：直接把 c2 作为 remote 传入即可（local 是 remote 祖先）。
         let report = ws.merge_heads(&c1, &c2).expect("merge ok");
         assert_eq!(report.disposition, MergeDisposition::FastForward);
         assert!(report.merge_commit.is_none());
@@ -666,5 +1018,85 @@ mod tests {
                 id: CommitId("C9".into())
             }
         );
+    }
+
+    // ---------- 持久状态 / 写前日志 / 冷启动 reconcile ----------
+
+    #[test]
+    fn open_restores_durable_state_roundtrip() {
+        let mut ws = new_ws();
+        let c1 = ws
+            .commit_changes(&CommitId("C0".into()), &[change("a.txt", b"v1")])
+            .expect("commit ok");
+        let root = ws.state_root().clone();
+        let store = ws.into_store();
+
+        let mut restored =
+            Workspace::open(WorkspaceId("ws-test".into()), store, &root).expect("open ok");
+        assert_eq!(restored.heads().len(), 1);
+        assert_eq!(restored.heads().heads[0], c1);
+        // 恢复后可继续写入（next_seq 越过已恢复提交）。
+        let c2 = restored
+            .commit_changes(&c1, &[change("b.txt", b"v2")])
+            .expect("continue ok");
+        assert_eq!(c2, CommitId("C2".into()));
+    }
+
+    #[test]
+    fn journal_pending_then_commit_clears_marker() {
+        let mut ws = new_ws();
+        let pending = ws
+            .journal_pending(&CommitId("C0".into()), &[change("a.txt", b"v1")])
+            .expect("pending ok");
+        assert_eq!(pending, CommitId("C1".into()));
+        // 提交尚未可见。
+        assert!(ws.commit(&pending).is_none());
+        let committed = ws.commit_pending(&pending).expect("commit pending ok");
+        assert_eq!(committed, pending);
+        assert!(ws.commit(&pending).is_some());
+        // 日志已清空。
+        let report = ws.reconcile_journal().expect("reconcile ok");
+        assert_eq!(report.total, 0);
+    }
+
+    #[test]
+    fn reconcile_redoes_interrupted_write_from_marker() {
+        let mut ws = new_ws();
+        // 写前登记后“进程崩溃”：marker 落盘，提交未落 DAG。
+        let pending = ws
+            .journal_pending(&CommitId("C0".into()), &[change("a.txt", b"crash-a")])
+            .expect("pending ok");
+        let root = ws.state_root().clone();
+        let store = ws.into_store();
+
+        // 冷启动：从持久状态恢复，回放日志 → redo 完成中断写入，不丢数据。
+        let mut restored =
+            Workspace::open(WorkspaceId("ws-test".into()), store, &root).expect("open ok");
+        let report = restored.reconcile_journal().expect("reconcile ok");
+        assert_eq!(report.redone, 1);
+        assert_eq!(report.total, 1);
+        assert_eq!(restored.heads().len(), 1);
+        assert_eq!(restored.heads().heads[0], pending);
+        assert!(restored.commit(&pending).is_some());
+        // 幂等：再次回放无内容。
+        let report2 = restored.reconcile_journal().expect("reconcile ok 2");
+        assert_eq!(report2.total, 0);
+    }
+
+    #[test]
+    fn reconcile_confirms_already_applied_commit() {
+        let mut ws = new_ws();
+        let c1 = ws
+            .commit_changes(&CommitId("C0".into()), &[change("a.txt", b"v1")])
+            .expect("commit ok");
+        let root = ws.state_root().clone();
+        let store = ws.into_store();
+
+        let mut restored =
+            Workspace::open(WorkspaceId("ws-test".into()), store, &root).expect("open ok");
+        // 提交已落 DAG（且 marker 已确认），回放无待处理 marker。
+        let report = restored.reconcile_journal().expect("reconcile ok");
+        assert_eq!(report.total, 0);
+        assert_eq!(restored.heads().heads[0], c1);
     }
 }

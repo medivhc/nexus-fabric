@@ -308,6 +308,113 @@ impl From<SessionError> for NexusError {
     }
 }
 
+// ---------- 会话持久记录与冷启动 Reconcile ----------
+
+/// Session 持久记录：冷启动 reconcile 的最小持久状态（进程死亡后可恢复）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRecord {
+    pub session: SessionId,
+    pub phase: LifecyclePhase,
+    pub outcome: TerminalOutcome,
+}
+
+/// 会话记录存储契约（Portable；由 Composition Root 注入实现，
+/// 如内存/文件/安全存储，参见 `nexus-storage` 的 ContentStore 注入模式）。
+pub trait SessionRecordStore {
+    fn load(&self) -> Result<Vec<SessionRecord>, String>;
+    fn save(&mut self, record: &SessionRecord) -> Result<(), String>;
+}
+
+/// 冷启动会话记录 reconcile 的结构化结果。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SessionReconcileReport {
+    /// 检查的记录数。
+    pub records_checked: usize,
+    /// 分类为孤儿的会话数（进程死亡且未达终态）。
+    pub orphans_classified: usize,
+}
+
+/// 会话记录 reconcile 的结构化失败（MODULE.md：不以日志文本代替错误类型）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionReconcileError {
+    /// 底层记录存储失败。
+    Store { reason: String },
+    /// 会话状态机失败。
+    Session(SessionError),
+}
+
+impl core::fmt::Display for SessionReconcileError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Store { reason } => write!(f, "session record store failure: {reason}"),
+            Self::Session(err) => write!(f, "session reconcile failed: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for SessionReconcileError {}
+
+impl From<SessionError> for SessionReconcileError {
+    fn from(value: SessionError) -> Self {
+        Self::Session(value)
+    }
+}
+
+/// 冷启动 reconcile 会话记录（AGENTS.md §15 Crash Consistency：幂等、孤儿分类）。
+///
+/// 规则：
+/// - 已提交终态（Completed/Failed/Cancelled）→ 无需处置；
+/// - 未达终态且进程存活 → 会话可继续，不分类；
+/// - 未达终态且进程死亡 → 孤儿会话：经 `SessionOwner` 恰一次提交 `Failed`，
+///   清理到 `Disposed`，并回写记录（再次 reconcile 幂等，不会重复提交）。
+pub fn reconcile_session_records<S: SessionRecordStore>(
+    store: &mut S,
+    process_alive: bool,
+) -> Result<SessionReconcileReport, SessionReconcileError> {
+    let records = store
+        .load()
+        .map_err(|reason| SessionReconcileError::Store { reason })?;
+    let mut report = SessionReconcileReport {
+        records_checked: records.len(),
+        orphans_classified: 0,
+    };
+    for record in records {
+        let terminal = matches!(
+            &record.outcome,
+            TerminalOutcome::Completed | TerminalOutcome::Failed(_) | TerminalOutcome::Cancelled
+        );
+        if terminal || process_alive {
+            continue;
+        }
+        // 孤儿：恰一次提交 Failed，清理到 Disposed（Owner 是 Outcome 唯一写入者）。
+        let mut owner = SessionOwner::new(record.session.clone());
+        owner
+            .transition_phase(LifecyclePhase::Active)
+            .map_err(SessionReconcileError::from)?;
+        owner
+            .commit_outcome(TerminalOutcome::Failed(NexusError::Internal {
+                message: "process crashed; session orphaned during cold start".into(),
+            }))
+            .map_err(SessionReconcileError::from)?;
+        owner
+            .transition_phase(LifecyclePhase::Draining)
+            .map_err(SessionReconcileError::from)?;
+        owner
+            .transition_phase(LifecyclePhase::Disposed)
+            .map_err(SessionReconcileError::from)?;
+        let status = owner.status();
+        store
+            .save(&SessionRecord {
+                session: record.session,
+                phase: status.phase,
+                outcome: status.outcome,
+            })
+            .map_err(|reason| SessionReconcileError::Store { reason })?;
+        report.orphans_classified += 1;
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,5 +536,87 @@ mod tests {
         }
         .into();
         assert!(matches!(err, NexusError::SessionFailed { .. }));
+    }
+
+    // ---------- 会话记录冷启动 reconcile ----------
+
+    /// 测试用内存记录存储（upsert 语义）。
+    #[derive(Debug, Default)]
+    struct MemRecordStore {
+        records: Vec<SessionRecord>,
+    }
+
+    impl SessionRecordStore for MemRecordStore {
+        fn load(&self) -> Result<Vec<SessionRecord>, String> {
+            Ok(self.records.clone())
+        }
+
+        fn save(&mut self, record: &SessionRecord) -> Result<(), String> {
+            if let Some(slot) = self
+                .records
+                .iter_mut()
+                .find(|r| r.session == record.session)
+            {
+                *slot = record.clone();
+            } else {
+                self.records.push(record.clone());
+            }
+            Ok(())
+        }
+    }
+
+    fn active_unfinished(session: &str) -> SessionRecord {
+        SessionRecord {
+            session: SessionId(session.into()),
+            phase: LifecyclePhase::Active,
+            outcome: TerminalOutcome::Unfinished,
+        }
+    }
+
+    #[test]
+    fn orphan_session_classified_and_committed_once() {
+        let mut store = MemRecordStore {
+            records: vec![active_unfinished("s-orphan")],
+        };
+        let report = reconcile_session_records(&mut store, false).unwrap();
+        assert_eq!(report.records_checked, 1);
+        assert_eq!(report.orphans_classified, 1);
+
+        let rec = &store.records[0];
+        assert_eq!(rec.phase, LifecyclePhase::Disposed);
+        assert!(matches!(rec.outcome, TerminalOutcome::Failed(_)));
+
+        // 幂等：再次 reconcile 不再分类、不重复提交。
+        let report2 = reconcile_session_records(&mut store, false).unwrap();
+        assert_eq!(report2.orphans_classified, 0);
+        assert!(matches!(
+            store.records[0].outcome,
+            TerminalOutcome::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn process_alive_keeps_unfinished_session() {
+        let mut store = MemRecordStore {
+            records: vec![active_unfinished("s-alive")],
+        };
+        let report = reconcile_session_records(&mut store, true).unwrap();
+        assert_eq!(report.orphans_classified, 0);
+        assert_eq!(store.records[0].phase, LifecyclePhase::Active);
+        assert_eq!(store.records[0].outcome, TerminalOutcome::Unfinished);
+    }
+
+    #[test]
+    fn already_terminal_record_is_skipped() {
+        let mut store = MemRecordStore {
+            records: vec![SessionRecord {
+                session: SessionId("s-done".into()),
+                phase: LifecyclePhase::Disposed,
+                outcome: TerminalOutcome::Completed,
+            }],
+        };
+        let report = reconcile_session_records(&mut store, false).unwrap();
+        assert_eq!(report.orphans_classified, 0);
+        assert_eq!(store.records[0].outcome, TerminalOutcome::Completed);
     }
 }

@@ -20,9 +20,10 @@
 
 ## Failures
 
-Merge/Commit 路径必须返回结构化 `WorkspaceError`，不得 panic 或以自由文本代替错误类型：
+Merge/Commit/持久化路径必须返回结构化 `WorkspaceError`，不得 panic 或以自由文本代替错误类型：
 
 - 未知提交（`UnknownCommit`）、内容对象缺失（`MissingObject`）、Manifest 损坏（`CorruptManifest`）；
+- 持久状态对象无法解析或校验失败（`CorruptState`）、底层存储失败（`StoreFailure`）；
 - 双端相对合并基修改同一路径且内容不同 → `MergeConflict::ConflictingPath`，要求显式冲突解决，且不得改变 Head 集；
 - 两个提交之间不存在公共祖先 → `NoCommonAncestor`。
 
@@ -69,9 +70,14 @@ cargo clippy -p nexus-workspace --all-targets -- -D warnings
 
 如果该模块影响产品行为，还必须映射 Integration/Scenario Evidence。
 
-本模块映射 `scenarios/product/workspace_offline_merge.toml`（E4）：由
-`crates/nexus-workspace/examples/workspace_offline_merge.rs` 驱动，经 harness 的
-`product-scenarios` gate 求值。
+本模块映射两个 E4 场景：
+
+- `scenarios/product/workspace_offline_merge.toml`：由
+  `crates/nexus-workspace/examples/workspace_offline_merge.rs` 驱动，经 harness 的
+  `product-scenarios` gate 求值；
+- `scenarios/regression/crash_recovery.toml`：由
+  `crates/nexus-workspace/examples/crash_recovery.rs` 驱动（含 nexus-session 会话记录
+  reconcile），经 harness 的 `regression` gate 求值。
 
 ## Performance Budget
 
@@ -83,7 +89,12 @@ cargo clippy -p nexus-workspace --all-targets -- -D warnings
 
 ## Recovery Semantics
 
-任何持久状态或长期任务都必须定义 crash 后的 reconcile 行为。无持久状态的纯模块应保持可重建。
+Workspace 持久状态（DAG + Heads + Journal）序列化为单个 CAS 对象，`commit_changes`
+以写前日志执行：`journal_pending`（marker 先落盘，提交不可见）→ 提交落 DAG →
+`commit_pending`（清除 marker）。冷启动必须先 `open` 恢复 durable state，再
+`reconcile_journal` 幂等回放：提交已在 DAG 则确认（confirmed），不在则从 marker
+重放（redone），journal 清空后持久化。任何情况下不丢失已写入数据，重复
+reconcile 无副作用。孤儿会话归类见 `nexus-session` 的 `reconcile_session_records`。
 
 ## Platform Constraints
 
