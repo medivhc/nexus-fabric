@@ -40,6 +40,14 @@ pub enum SessionEvent {
     Progress { session: SessionId, detail: String },
     /// 收到协作取消请求。
     CancellationRequested { session: SessionId, reason: String },
+    /// Connectivity 链路建立成功（Worker 上报，供 connectivity watch 观测）。
+    ConnectivityEstablished { session: SessionId, locator: String },
+    /// Connectivity 链路建立失败（Worker 上报；终态由 Owner 提交）。
+    ConnectivityFailed {
+        session: SessionId,
+        locator: String,
+        reason: String,
+    },
     /// Owner 提交终态结果（commit-once 的唯一可见通道）。
     OutcomeCommitted {
         session: SessionId,
@@ -280,6 +288,43 @@ impl SessionOwner {
         }
         Ok(!already_requested)
     }
+
+    /// 记录 Connectivity 链路建立成功（Worker 上报事件；不写 Outcome）。
+    ///
+    /// 已提交终态后拒绝记录（Owner 状态不可再变）。
+    pub fn record_connectivity_established(&mut self, locator: String) -> Result<(), SessionError> {
+        if self.outcome.is_some() {
+            return Err(SessionError::AlreadyTerminated {
+                session: self.id.clone(),
+                outcome: self.outcome.clone().expect("checked some"),
+            });
+        }
+        self.events.push(SessionEvent::ConnectivityEstablished {
+            session: self.id.clone(),
+            locator,
+        });
+        Ok(())
+    }
+
+    /// 记录 Connectivity 链路建立失败（Worker 上报事件；终态由 Owner 决策提交）。
+    pub fn record_connectivity_failed(
+        &mut self,
+        locator: String,
+        reason: String,
+    ) -> Result<(), SessionError> {
+        if self.outcome.is_some() {
+            return Err(SessionError::AlreadyTerminated {
+                session: self.id.clone(),
+                outcome: self.outcome.clone().expect("checked some"),
+            });
+        }
+        self.events.push(SessionEvent::ConnectivityFailed {
+            session: self.id.clone(),
+            locator,
+            reason,
+        });
+        Ok(())
+    }
 }
 
 // ---------- 便携错误转换（供 domain-runtime 使用） ----------
@@ -508,6 +553,41 @@ mod tests {
         // 提交取消终态
         s.commit_outcome(TerminalOutcome::Cancelled).unwrap();
         assert_eq!(s.committed_outcome(), Some(TerminalOutcome::Cancelled));
+    }
+
+    #[test]
+    fn connectivity_events_recorded_without_touching_outcome() {
+        let mut s = session();
+        s.transition_phase(LifecyclePhase::Active).unwrap();
+        s.record_connectivity_established("edge-a.exit".into())
+            .unwrap();
+        s.record_connectivity_failed("relay-b.exit".into(), "authentication required".into())
+            .unwrap();
+        assert!(
+            s.committed_outcome().is_none(),
+            "worker event must not commit outcome"
+        );
+        let est = s
+            .events()
+            .iter()
+            .filter(|e| matches!(e, SessionEvent::ConnectivityEstablished { .. }))
+            .count();
+        let fail = s
+            .events()
+            .iter()
+            .filter(|e| matches!(e, SessionEvent::ConnectivityFailed { .. }))
+            .count();
+        assert_eq!(est, 1);
+        assert_eq!(fail, 1);
+        // 终态提交后拒绝再记录。
+        s.commit_outcome(TerminalOutcome::Failed(
+            NexusError::ConnectivityEstablishmentFailed {
+                provider: nexus_domain::ProviderId("p".into()),
+                reason: "boom".into(),
+            },
+        ))
+        .unwrap();
+        assert!(s.record_connectivity_established("x".into()).is_err());
     }
 
     #[test]

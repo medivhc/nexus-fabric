@@ -49,9 +49,11 @@
 已实现（revision f8c7113+）：
 
 - `SessionOwner`：Owner 状态机，`commit_outcome` 为 `TerminalOutcome` 唯一写入入口（commit-once 守卫），`transition_phase` 执行合法迁移校验，`request_cancellation` 仅记录取消事件。
-- `SessionEvent`：Worker 上报事件（Started/PhaseChanged/Progress/CancellationRequested/OutcomeCommitted）。
+- `SessionEvent`：Worker 上报事件（Started/PhaseChanged/Progress/CancellationRequested/ConnectivityEstablished/ConnectivityFailed/OutcomeCommitted）。
+- `record_connectivity_established` / `record_connectivity_failed`：Worker 上报 Connectivity 事件（不写 Outcome；已终态拒绝记录）。
 - `CancelToken` 与 `AbortOnDropHandle`：std 实现的协作取消原语（Portable，无 tokio 依赖）；JoinSet/Reaper 运行时接线由 domain-runtime 层完成。
 - `SessionError`：结构化会话错误，`From<SessionError> for NexusError` 转换。
+- `SessionRecord` / `SessionRecordStore` / `reconcile_session_records`：冷启动会话记录 reconcile（幂等、孤儿分类，AGENTS.md §15）。
 
 ## Verification
 

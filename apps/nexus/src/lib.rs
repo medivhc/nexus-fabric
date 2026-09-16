@@ -31,8 +31,10 @@ pub const EV_PLAN_SELECTED: &str = "plan_selected";
 pub const EV_SESSION_CREATED: &str = "session_created";
 /// 事件名：候选 Provider 已解析。
 pub const EV_CANDIDATES_RESOLVED: &str = "candidates_resolved";
-/// 事件名：在 Plan + Session 之后才进行 Connectivity Establishment。
+/// 事件名：Connectivity Establishment（在 Plan + Session 之后才进行）。
 pub const EV_CONNECTIVITY_ESTABLISHMENT: &str = "connectivity_establishment";
+/// 事件名：Connectivity 建连失败（Worker 上报；终态由 Owner 提交）。
+pub const EV_CONNECTIVITY_FAILED: &str = "connectivity_failed";
 /// 事件名：执行。
 pub const EV_EXECUTE: &str = "execute";
 /// 事件名：Owner 提交 TerminalOutcome。
@@ -303,6 +305,141 @@ pub fn service_session_lifecycle(resource: &str, profile: &str) -> Result<Value,
         "terminal_outcome_commit_count": terminal_outcome_commit_count,
         "redundant_commit_rejected": redundant_commit_rejected,
         "terminal_outcome": outcome_name(&TerminalOutcome::Completed),
+        "session": {
+            "id": owner.id().0,
+            "phase": phase_name(&status.phase),
+            "outcome": outcome_name(&status.outcome),
+        }
+    }))
+}
+
+/// 运行一次 Connectivity 建连失败的**逆序回滚**路径（吸收 K10 assume/Unreserve 逆序幂等）。
+///
+/// 验证产品不变量（PRODUCT §2/§6 + ARCHITECTURE §6）：
+/// 1. 顺序：Plan -> Session -> Connectivity Establishment（先规划后建连）；
+/// 2. W12 认证门控：未认证的链路绝不进入 Established，失败事件结构化上报；
+/// 3. Worker 只发事件：Connectivity 失败由 Owner 提交唯一终态 `Failed`；
+/// 4. 逆序回滚：终态确定后 Draining -> Disposed，且重复回滚幂等（被拒绝、状态不变）。
+///
+/// 纯内存、确定性。
+pub fn connectivity_failure_rollback(
+    destination: &str,
+    profile: &str,
+) -> Result<Value, NexusError> {
+    let mut events: Vec<&'static str> = Vec::new();
+
+    // 1) Ingress：构造中立 FlowContext 并提交。
+    let flow = nexus_ingress::from_native_api(destination, profile);
+    events.push(EV_FLOW_SUBMITTED);
+
+    // 2) Policy：动作化有序链求值。
+    let policy = nexus_policy::PolicyEngine::default_network().evaluate(&flow);
+    let decision = policy.decision;
+    events.push(EV_POLICY_EVALUATED);
+
+    // 3) Registry：单一候选（relay，未认证）。
+    let resource: ResourceId = flow.resource.clone();
+    let mut registry = Registry::new();
+    registry.register(ProviderRecord {
+        id: ProviderId("provider-relay-b".into()),
+        resource: resource.clone(),
+        placement: "regional-relay".into(),
+        locator: "relay-b.exit".into(),
+        capabilities: vec!["internet-access".into()],
+        present: true,
+    });
+    let candidates = registry.candidates(&resource);
+    let mut measurements = MeasurementTable::new();
+    measurements.record(
+        ProviderId("provider-relay-b".into()),
+        LinkMeasurement {
+            rtt_ms: Some(60),
+            confidence_percent: 90,
+            ..Default::default()
+        },
+    );
+
+    // 4) Planner：K5 快照 + Filter/Score 两阶段（先规划）。
+    let snapshot = PlanningSnapshot::new(candidates.clone(), decision.constraints.clone());
+    let planned = nexus_planner::plan_from_snapshot(&resource, &snapshot, &decision.intent, |p| {
+        measurements.get(p).cloned()
+    })?;
+    events.push(EV_PLAN_SELECTED);
+
+    // 5) Session 创建（先于建连）。
+    let mut owner = SessionOwner::new(SessionId("sess-rollback-1".into()));
+    owner
+        .transition_phase(LifecyclePhase::Active)
+        .map_err(NexusError::from)?;
+    events.push(EV_SESSION_CREATED);
+
+    // 6) Connectivity Establishment（后于 Plan + Session）——未认证 → Failed（W12）。
+    events.push(EV_CONNECTIVITY_ESTABLISHMENT);
+    let locator = planned.plan.path.first().cloned().unwrap_or_default();
+    let establishment =
+        nexus_connectivity::establish(&nexus_connectivity::EstablishmentRequest::new(
+            owner.id().0.clone(),
+            locator.clone(),
+            true,
+            false,
+        ));
+    let failed_reason = match establishment.state {
+        nexus_connectivity::ConnectivityState::Failed { error } => error.to_string(),
+        other => {
+            return Err(NexusError::Internal {
+                message: format!("expected authentication failure but got state {other:?}"),
+            });
+        }
+    };
+    events.push(EV_CONNECTIVITY_FAILED);
+
+    // 7) Worker 只上报失败事件（不写 Outcome）。
+    owner
+        .record_connectivity_failed(locator.clone(), failed_reason.clone())
+        .map_err(NexusError::from)?;
+
+    // 8) Owner 提交唯一终态。
+    owner
+        .commit_outcome(TerminalOutcome::Failed(
+            NexusError::ConnectivityEstablishmentFailed {
+                provider: planned.plan.provider_id.clone(),
+                reason: failed_reason.clone(),
+            },
+        ))
+        .map_err(NexusError::from)?;
+    events.push(EV_TERMINAL_OUTCOME_COMMITTED);
+
+    // 9) 逆序回滚：Draining -> Disposed（K10 逆序幂等）。
+    owner
+        .transition_phase(LifecyclePhase::Draining)
+        .map_err(NexusError::from)?;
+    owner
+        .transition_phase(LifecyclePhase::Disposed)
+        .map_err(NexusError::from)?;
+
+    // 幂等：重复回滚（再次 Draining 迁移）必须被拒绝且状态保持 Disposed。
+    let rollback_idempotent = matches!(
+        owner.transition_phase(LifecyclePhase::Draining),
+        Err(nexus_session::SessionError::InvalidPhaseTransition { .. })
+    ) && owner.phase() == LifecyclePhase::Disposed;
+
+    let status = owner.status();
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "plan": {
+            "provider_id": planned.plan.provider_id.0,
+            "placement": planned.plan.placement,
+            "locator": locator,
+        },
+        "connectivity": {
+            "state": "Failed",
+            "reason": failed_reason,
+        },
+        "rollback": {
+            "idempotent": rollback_idempotent,
+            "drained_to_disposed": owner.phase() == LifecyclePhase::Disposed,
+        },
         "session": {
             "id": owner.id().0,
             "phase": phase_name(&status.phase),

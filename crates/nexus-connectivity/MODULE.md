@@ -44,7 +44,12 @@
 
 - 默认最小 surface：`private -> pub(crate) -> pub`。
 - Public API 变更必须保持结构化、可版本化并有调用方验证。
-- 本骨架只提供最小编译锚点；业务 API 在实现阶段增量添加。
+- 已实现（阶段 B）：
+  - `ConnectivityState`：NotAttempted / Establishing / Established{authenticated} / Failed{error}；
+  - `EstablishmentRequest`（领域中立：session_tag + locator + 认证门控）；
+  - `establish`：确定性纯函数（零 I/O），空 locator → InvalidLocator；`require_authenticated` 未认证 → AuthenticationRequired（W12，绝不进入 Established）；
+  - `ConnectivityEvent` 序列（Establishing / Authenticated / Established / Failed）供 Owner 消费；
+  - `ConnectivityError` 结构化错误面（delivery 层自持，不依赖领域错误）。
 
 ## Verification
 
