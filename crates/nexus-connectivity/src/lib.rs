@@ -14,6 +14,12 @@
 //! - `require_authenticated` 时未认证即失败，不产生任何 Established 状态；
 //! - 每次尝试输出结构化事件序列，供 Owner 状态机消费（Worker 只发事件）。
 //!
+//! 双 trait 解耦（吸收点 W2/W7）：
+//! - `ConnectivityRuntime` 注入 `VirtualPacketInterface`（IP 包）与
+//!   `PacketCarrier`（承载帧）两个独立 trait，本层只做编排不实现任何一方；
+//! - `send_frame` 在 `authenticated=false` 时直接拒绝（W7：未认证前不发送
+//!   流量、不改 Locator），且完全不触碰 carrier。
+//!
 //! 详细边界见同目录 `MODULE.md`。
 
 #![forbid(unsafe_code)]
@@ -39,6 +45,15 @@ pub enum ConnectivityError {
     },
     /// 目标 locator 无效/为空。
     InvalidLocator { locator: String },
+    /// 底层平台/承载 I/O 失败（由 `PlatformError` 映射）。
+    Io {
+        /// 失败操作名。
+        operation: String,
+        /// 可诊断原因。
+        message: String,
+    },
+    /// 输入无效（承载/平台层校验失败）。
+    Invalid { message: String },
 }
 
 impl core::fmt::Display for ConnectivityError {
@@ -53,6 +68,10 @@ impl core::fmt::Display for ConnectivityError {
             Self::InvalidLocator { locator } => {
                 write!(f, "invalid locator: {locator:?}")
             }
+            Self::Io { operation, message } => {
+                write!(f, "connectivity io error during {operation}: {message}")
+            }
+            Self::Invalid { message } => write!(f, "connectivity invalid input: {message}"),
         }
     }
 }
@@ -214,6 +233,111 @@ pub fn establish(request: &EstablishmentRequest) -> EstablishmentResult {
     }
 }
 
+// ---------- 双 trait 编排（吸收点 W2/W7） ----------
+
+use nexus_platform::{PacketCarrier, PlatformError, VirtualPacketInterface};
+
+/// 双 trait 注入的 Connectivity 编排器。
+///
+/// W2（WireGuard `tun.Device` / `conn.Bind` 解耦）：
+/// - `vpi` 只负责 IP 包读/写（`VirtualPacketInterface`）；
+/// - `carrier` 只负责封装帧收发（`PacketCarrier`）；
+/// - 本类型只做编排与门控，不实现任何一方。
+///
+/// W7（认证后才允许触碰对端）：
+/// - `send_frame(..., authenticated=false)` 直接返回 `AuthenticationRequired`，
+///   且**不调用** carrier 的 `send_to`（未认证流量零发送）。
+pub struct ConnectivityRuntime {
+    vpi: Box<dyn VirtualPacketInterface>,
+    carrier: Box<dyn PacketCarrier>,
+}
+
+impl ConnectivityRuntime {
+    /// 注入 VPI 与 Carrier（两者解耦，可独立替换/测试替身）。
+    #[must_use]
+    pub fn new(vpi: Box<dyn VirtualPacketInterface>, carrier: Box<dyn PacketCarrier>) -> Self {
+        Self { vpi, carrier }
+    }
+
+    /// 只读访问注入的 VPI（不转移所有权）。
+    pub fn vpi(&mut self) -> &mut dyn VirtualPacketInterface {
+        self.vpi.as_mut()
+    }
+
+    /// 只读访问注入的 Carrier（不转移所有权）。
+    pub fn carrier(&mut self) -> &mut dyn PacketCarrier {
+        self.carrier.as_mut()
+    }
+
+    /// 绑定承载本地地址/端口；返回本地 locator。
+    pub fn bind_local(&mut self, local_locator: &str) -> Result<String, ConnectivityError> {
+        self.carrier.bind(local_locator).map_err(map_platform_error)
+    }
+
+    /// 仅认证通过后向对端发送一帧封装数据（W7 门控）。
+    ///
+    /// `authenticated=false` 时返回 `AuthenticationRequired`，不触碰 carrier。
+    pub fn send_frame(
+        &mut self,
+        peer_locator: &str,
+        frame: &[u8],
+        authenticated: bool,
+    ) -> Result<(), ConnectivityError> {
+        if !authenticated {
+            return Err(ConnectivityError::AuthenticationRequired {
+                locator: peer_locator.to_string(),
+            });
+        }
+        if peer_locator.is_empty() {
+            return Err(ConnectivityError::InvalidLocator {
+                locator: String::new(),
+            });
+        }
+        self.carrier
+            .send_to(peer_locator, frame)
+            .map_err(map_platform_error)
+    }
+
+    /// 接收一帧封装数据（委托 carrier；无数据返回 `Ok(0)`）。
+    pub fn receive_frame(&mut self, output: &mut [u8]) -> Result<usize, ConnectivityError> {
+        self.carrier
+            .receive_into(output)
+            .map_err(map_platform_error)
+    }
+
+    /// 从 VPI 读取一个 IP 包（委托 vpi；不含加密/建连）。
+    pub fn read_ip_packet(&mut self, output: &mut [u8]) -> Result<usize, ConnectivityError> {
+        self.vpi.receive(output).map_err(map_platform_error)
+    }
+
+    /// 向 VPI 写入一个 IP 包（委托 vpi）。
+    pub fn write_ip_packet(&mut self, packet: &[u8]) -> Result<(), ConnectivityError> {
+        self.vpi.send(packet).map_err(map_platform_error)
+    }
+
+    /// 当前承载本地 locator。
+    #[must_use]
+    pub fn local_locator(&self) -> Option<String> {
+        self.carrier.local_locator()
+    }
+}
+
+/// `PlatformError` → `ConnectivityError` 映射（结构化、保留可诊断原因）。
+fn map_platform_error(e: PlatformError) -> ConnectivityError {
+    match e {
+        PlatformError::Io { operation, message } => ConnectivityError::Io { operation, message },
+        PlatformError::Invalid { message } => ConnectivityError::Invalid { message },
+        PlatformError::Unavailable { capability } => ConnectivityError::Io {
+            operation: "capability".to_string(),
+            message: format!("unavailable: {capability}"),
+        },
+        PlatformError::NotFound { key } => ConnectivityError::Io {
+            operation: "lookup".to_string(),
+            message: format!("not found: {key}"),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,5 +432,177 @@ mod tests {
             locator: "x.exit".into(),
         };
         assert!(err.to_string().contains("authentication required"));
+    }
+
+    // ---------- ConnectivityRuntime 双 trait 编排（W2/W7） ----------
+
+    use std::sync::{Arc, Mutex};
+
+    /// 已发送帧的共享记录（peer, frame）。
+    type SentFrames = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+    /// 内存 mock VPI：写进 buffer 的包可被读回（共享状态供断言）。
+    struct MockVpi {
+        packets: Vec<Vec<u8>>,
+        written: Arc<Mutex<usize>>,
+    }
+
+    impl MockVpi {
+        fn new() -> Self {
+            Self {
+                packets: Vec::new(),
+                written: Arc::new(Mutex::new(0)),
+            }
+        }
+    }
+
+    impl VirtualPacketInterface for MockVpi {
+        fn receive(&mut self, output: &mut [u8]) -> Result<usize, PlatformError> {
+            match self.packets.pop() {
+                Some(p) if p.len() <= output.len() => {
+                    output[..p.len()].copy_from_slice(&p);
+                    Ok(p.len())
+                }
+                Some(_) => Err(PlatformError::Invalid {
+                    message: "mock buffer too small".into(),
+                }),
+                None => Ok(0),
+            }
+        }
+        fn send(&mut self, packet: &[u8]) -> Result<(), PlatformError> {
+            *self.written.lock().unwrap() += 1;
+            self.packets.push(packet.to_vec());
+            Ok(())
+        }
+    }
+
+    /// 内存 mock carrier：记录帧与本地 locator（共享状态供断言）。
+    struct MockCarrier {
+        local: Arc<Mutex<Option<String>>>,
+        sent: SentFrames,
+        inbound: Vec<Vec<u8>>,
+    }
+
+    impl MockCarrier {
+        fn new() -> Self {
+            Self {
+                local: Arc::new(Mutex::new(None)),
+                sent: Arc::new(Mutex::new(Vec::new())),
+                inbound: Vec::new(),
+            }
+        }
+    }
+
+    impl PacketCarrier for MockCarrier {
+        fn bind(&mut self, local: &str) -> Result<String, PlatformError> {
+            *self.local.lock().unwrap() = Some(local.to_string());
+            Ok(local.to_string())
+        }
+        fn send_to(&mut self, peer: &str, frame: &[u8]) -> Result<(), PlatformError> {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((peer.to_string(), frame.to_vec()));
+            Ok(())
+        }
+        fn receive_into(&mut self, output: &mut [u8]) -> Result<usize, PlatformError> {
+            match self.inbound.pop() {
+                Some(f) if f.len() <= output.len() => {
+                    output[..f.len()].copy_from_slice(&f);
+                    Ok(f.len())
+                }
+                Some(_) => Err(PlatformError::Invalid {
+                    message: "mock inbound too large".into(),
+                }),
+                None => Ok(0),
+            }
+        }
+        fn local_locator(&self) -> Option<String> {
+            self.local.lock().unwrap().clone()
+        }
+    }
+
+    #[test]
+    fn runtime_binds_local_and_reports_locator() {
+        let mut rt =
+            ConnectivityRuntime::new(Box::new(MockVpi::new()), Box::new(MockCarrier::new()));
+        let loc = rt.bind_local("0.0.0.0:51820").unwrap();
+        assert_eq!(loc, "0.0.0.0:51820");
+        assert_eq!(rt.local_locator().as_deref(), Some("0.0.0.0:51820"));
+    }
+
+    #[test]
+    fn send_frame_blocks_unauthenticated_without_touching_carrier() {
+        let carrier = MockCarrier::new();
+        let sent = Arc::clone(&carrier.sent);
+        let mut rt = ConnectivityRuntime::new(Box::new(MockVpi::new()), Box::new(carrier));
+        let err = rt.send_frame("peer.exit", b"handshake", false).unwrap_err();
+        assert!(matches!(
+            err,
+            ConnectivityError::AuthenticationRequired { .. }
+        ));
+        // W7：未认证不触碰 carrier（零发送）。
+        assert_eq!(sent.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn send_frame_authenticated_reaches_carrier() {
+        let carrier = MockCarrier::new();
+        let sent = Arc::clone(&carrier.sent);
+        let mut rt = ConnectivityRuntime::new(Box::new(MockVpi::new()), Box::new(carrier));
+        rt.send_frame("peer.exit", b"encrypted-frame", true)
+            .unwrap();
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "peer.exit");
+        assert_eq!(sent[0].1, b"encrypted-frame");
+    }
+
+    #[test]
+    fn send_frame_empty_peer_fails_invalid_locator() {
+        let carrier = MockCarrier::new();
+        let sent = Arc::clone(&carrier.sent);
+        let mut rt = ConnectivityRuntime::new(Box::new(MockVpi::new()), Box::new(carrier));
+        let err = rt.send_frame("", b"x", true).unwrap_err();
+        assert!(matches!(err, ConnectivityError::InvalidLocator { .. }));
+        assert_eq!(sent.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn vpi_and_carrier_roundtrip_are_independent() {
+        let carrier = MockCarrier::new();
+        let sent = Arc::clone(&carrier.sent);
+        let mut rt = ConnectivityRuntime::new(Box::new(MockVpi::new()), Box::new(carrier));
+        // IP 包走 VPI（不经过 carrier）。
+        rt.write_ip_packet(&[0x45, 0x00, 0x00, 0x14]).unwrap();
+        let mut ip = [0u8; 32];
+        let n = rt.read_ip_packet(&mut ip).unwrap();
+        assert_eq!(&ip[..n], &[0x45, 0x00, 0x00, 0x14]);
+        // 承载帧走 carrier（不经过 VPI）。
+        rt.send_frame("peer.exit", b"frame", true).unwrap();
+        assert_eq!(sent.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn platform_io_error_maps_to_connectivity_io() {
+        let err = map_platform_error(PlatformError::Io {
+            operation: "send_to".into(),
+            message: "network unreachable".into(),
+        });
+        match err {
+            ConnectivityError::Io { operation, message } => {
+                assert_eq!(operation, "send_to");
+                assert_eq!(message, "network unreachable");
+            }
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn platform_invalid_maps_to_connectivity_invalid() {
+        let err = map_platform_error(PlatformError::Invalid {
+            message: "bad frame".into(),
+        });
+        assert!(matches!(err, ConnectivityError::Invalid { .. }));
     }
 }

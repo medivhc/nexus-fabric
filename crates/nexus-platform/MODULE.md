@@ -48,6 +48,10 @@
 已实现（revision f8c7113+）：
 
 - `PlatformError` 结构化平台错误：`Unavailable`（对应 PRODUCT §7 显式 Capability Unsupported）、`Io`、`NotFound`、`Invalid`；全部能力 trait 的错误从 `String` 迁移为 `PlatformError`。
+- `VirtualPacketInterface`：IP 包读/写（`receive`/`send`），不含加密与建连。
+- `PacketCarrier`（WireGuard `conn.Bind` 等价物）：承载传输封装帧的
+  `bind`/`send_to`/`receive_into`/`local_locator`，与 VPI 解耦；加密打洞
+  编排在 `nexus-connectivity` 层消费（吸收点 W2）。
 
 ## Verification
 

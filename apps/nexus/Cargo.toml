@@ -20,4 +20,5 @@ nexus-measurement = { path = "../../crates/nexus-measurement" }
 nexus-planner = { path = "../../crates/nexus-planner" }
 nexus-session = { path = "../../crates/nexus-session" }
 nexus-connectivity = { path = "../../crates/nexus-connectivity" }
+nexus-platform = { path = "../../crates/nexus-platform" }
 serde_json = { version = "1", default-features = false, features = ["std"] }

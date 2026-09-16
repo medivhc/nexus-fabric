@@ -34,6 +34,10 @@
 
 - Evaluation 是低成本规划输入；Establishment 只在 Plan/Session 之后触发。
 - 连接失败报告事实，由 Core Planner 决定替代 Plan。
+- 双 trait 解耦（W2）：本层消费 `VirtualPacketInterface`（IP 包）与
+  `PacketCarrier`（承载帧）两个独立注入 trait，只编排不实现。
+- 认证门控（W7）：`send_frame(authenticated=false)` 直接拒绝，且不触碰
+  carrier（未认证零发送、不改 Locator）。
 
 ## Side Effects
 
@@ -50,6 +54,12 @@
   - `establish`：确定性纯函数（零 I/O），空 locator → InvalidLocator；`require_authenticated` 未认证 → AuthenticationRequired（W12，绝不进入 Established）；
   - `ConnectivityEvent` 序列（Establishing / Authenticated / Established / Failed）供 Owner 消费；
   - `ConnectivityError` 结构化错误面（delivery 层自持，不依赖领域错误）。
+- 已实现（W2/W7 双 trait 编排）：
+  - `ConnectivityRuntime`：注入 `Box<dyn VirtualPacketInterface>` +
+    `Box<dyn PacketCarrier>`，提供 `bind_local` / `send_frame`（认证门控）/
+    `receive_frame` / `read_ip_packet` / `write_ip_packet` / `local_locator`；
+  - `ConnectivityError::Io` / `Invalid` 变体：`PlatformError` 结构化映射
+    （保留 operation/message，不丢诊断原因）。
 
 ## Verification
 

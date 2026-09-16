@@ -1,0 +1,39 @@
+schema_version = 1
+id = "product.connectivity-carrier-split"
+title = "Connectivity 双 trait 解耦：VPI（IP 包）与 PacketCarrier（承载帧）注入编排，认证门控生效"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#2-network"
+
+[given]
+vpi = "mock-virtual-packet-interface"
+carrier = "mock-packet-carrier"
+auth_gate = "w7-authenticated-before-frame"
+
+# 可执行 E4：组合根 example 以 mock VPI + mock Carrier 注入 ConnectivityRuntime，
+# 验证：未认证 send_frame 被拒、认证后帧到达 carrier、IP 包经 VPI 往返。
+[when]
+command = "cargo run --quiet -p nexus --example connectivity_carrier_split -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "auth_gate"
+equals = "blocked_before_authenticated"
+
+[[expect]]
+field = "carrier_frames"
+equals = 1
+
+[[expect]]
+field = "vpi_packets"
+equals = 1
+
+[[expect]]
+field = "local_locator"
+non_empty = true
+
+[[expect]]
+field = "error_mapped"
+equals = "io_mapped"

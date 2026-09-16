@@ -72,6 +72,23 @@ pub trait VirtualPacketInterface: Send {
     fn send(&mut self, packet: &[u8]) -> Result<(), PlatformError>;
 }
 
+/// 承载传输（WireGuard `conn.Bind` 等价物）：把封装帧送达对端 locator。
+///
+/// 与 [`VirtualPacketInterface`] 解耦（W2）：
+/// - VPI 只负责读写 IP 包（进/出虚拟网卡），不含加密与打洞；
+/// - `PacketCarrier` 只负责封装帧的发送/接收（UDP/隧道承载），不感知 IP 语义；
+/// - 加密、建连、认证门控等编排由 `nexus-connectivity` 层消费这两个 trait。
+pub trait PacketCarrier: Send {
+    /// 绑定本地地址/端口（打洞或会话建立前）。返回本地 locator。
+    fn bind(&mut self, local_locator: &str) -> Result<String, PlatformError>;
+    /// 向对端 locator 发送一帧封装数据。
+    fn send_to(&mut self, peer_locator: &str, frame: &[u8]) -> Result<(), PlatformError>;
+    /// 接收一帧封装数据；无可用数据时返回 `Ok(0)`（非阻塞语义由实现决定）。
+    fn receive_into(&mut self, output: &mut [u8]) -> Result<usize, PlatformError>;
+    /// 当前绑定地址（未绑定时为 `None`）。
+    fn local_locator(&self) -> Option<String>;
+}
+
 pub trait TransparentIngressProvider: Send {
     fn start(&mut self) -> Result<(), PlatformError>;
     fn stop(&mut self) -> Result<(), PlatformError>;
