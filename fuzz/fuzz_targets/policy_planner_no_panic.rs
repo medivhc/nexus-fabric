@@ -106,22 +106,15 @@ fuzz_target!(|data: &[u8]| {
         })
         .collect();
 
-    let _ = nexus_planner::plan(
-        &resource,
-        &intent,
-        &constraints,
-        &candidates,
-        |id| {
-            let idx: usize = id
-                .0
-                .strip_prefix("provider-")
+    let _ = nexus_planner::plan(&resource, &intent, &constraints, &candidates, |id| {
+        let idx: usize =
+            id.0.strip_prefix("provider-")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
-            candidates.get(idx).map(|c| LinkMeasurement {
-                rtt_ms: Some((c.locator.len() % 100) as u32),
-                confidence_percent: 80,
-                ..Default::default()
-            })
-        },
-    );
+        candidates.get(idx).map(|c| LinkMeasurement {
+            rtt_ms: Some((c.locator.len() % 100) as u32),
+            confidence_percent: 80,
+            ..Default::default()
+        })
+    });
 });
