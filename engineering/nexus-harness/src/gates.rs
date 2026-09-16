@@ -470,10 +470,19 @@ pub fn fuzz_gate(repo: &Repo) -> Gate {
             "no fuzz targets declared (fuzz/Cargo.toml missing)",
         );
     }
-    let g = cargo(repo, &["fuzz", "check"]);
-    Gate {
-        name: "selected-fuzz".to_string(),
-        ..g
+    // cargo-fuzz 依赖 libfuzzer 的 nightly `-Z` 选项；显式使用 +nightly 工具链。
+    let (ok, out) = run_at(&repo.root, "cargo", &["+nightly", "fuzz", "check"]);
+    if ok {
+        Gate::ok("selected-fuzz", "ok")
+    } else {
+        Gate::fail(
+            "selected-fuzz",
+            if out.is_empty() {
+                "command failed"
+            } else {
+                &out
+            },
+        )
     }
 }
 

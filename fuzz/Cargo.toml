@@ -1,0 +1,29 @@
+# cargo-fuzz 独立 workspace（不属于根 workspace；由 harness selected-fuzz gate 检查）。
+# 需要 nightly toolchain：cargo +nightly fuzz check / run。
+[workspace]
+
+[package]
+name = "nexus-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nexus-domain = { path = "../crates/nexus-domain" }
+nexus-policy = { path = "../crates/nexus-policy" }
+nexus-planner = { path = "../crates/nexus-planner" }
+nexus-registry = { path = "../crates/nexus-registry" }
+nexus-measurement = { path = "../crates/nexus-measurement" }
+
+[[bin]]
+name = "policy-planner-no-panic"
+path = "fuzz_targets/policy_planner_no_panic.rs"
+test = false
+doc = false
+bench = false

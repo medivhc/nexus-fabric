@@ -1,0 +1,4 @@
+# cargo-fuzz 运行产物（重建：cargo +nightly fuzz run <target> 自动生成）
+/target
+/artifacts
+/corpus
