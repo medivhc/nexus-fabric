@@ -90,7 +90,23 @@ Platform Capability
 
 Write-back 必须创建新 Workspace Commit，而不是修改 pinned Snapshot。
 
-## 6. Session 语义
+## 6. 远程资源访问（Remote Resource Access）
+
+Nexus 允许一个节点作为请求方，通过标准 Intent 访问另一个节点（提供方）上的资源。远程访问复用单节点流水线：
+
+```text
+Resolve -> Plan -> Session -> Connectivity -> Execute -> Observe
+```
+
+远程资源访问必须满足：
+
+- Discovery 解析提供方 Peer 的 Endpoint；P0 使用静态发现，发现协议后置。
+- 认证门控在业务帧转发前完成：未通过认证的请求在帧流建立后、业务帧前被拒绝，返回 `AUTHORIZATION_DENIED`。
+- Transport 提供长度前缀帧协议；P0 冻结为 TCP + u32 大端长度前缀帧。
+- 建连失败按逆序幂等回滚（Connectivity -> Session -> Plan 释放），Session 物理排空到 Disposed，TerminalOutcome 由 Owner 唯一提交 `Failed`。
+- Service 是远程访问的第一个资源类型；InternetAccess / Workspace / Compute 的远程访问后置。
+
+## 7. Session 语义
 
 Session 使用双轨状态：
 
@@ -104,7 +120,7 @@ Unfinished | Completed | Failed | Cancelled
 
 Completed/Failed/Cancelled 只能提交一次；资源清理可以在 Outcome 确定后继续，最终 LifecyclePhase 到达 Disposed。
 
-## 7. 跨平台产品语义
+## 8. 跨平台产品语义
 
 Nexus 保证 Semantic Portability，而不是强迫所有平台 API 一致。
 
@@ -127,7 +143,7 @@ native API
 
 平台缺少某项能力时，必须返回明确的 Capability Unsupported 或选择文档化降级路径，不能静默改变产品语义。
 
-## 8. 可观察性
+## 9. 可观察性
 
 关键 Resource/Session 必须可被 CLI/GUI/Agent 观察。
 
@@ -145,7 +161,7 @@ diagnose
 platform capabilities
 ```
 
-## 9. 完成条件
+## 10. 完成条件
 
 关键用户可见 Capability 原则上至少需要一条 E4 Product Scenario 或 E5 External Observation 证据。
 

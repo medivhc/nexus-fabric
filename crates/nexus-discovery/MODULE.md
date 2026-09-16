@@ -43,9 +43,20 @@
 
 ## Public API
 
+### 冻结契约（remote P0，scenarios/product/remote_service_access_flow.toml）
+
+- `pub struct PeerId(pub String)`：提供方节点标识。Identity != Locator：Peer 不携带 Endpoint 本身。
+- `pub struct StaticDiscovery { peers: HashMap<PeerId, SocketAddr> }`：静态发现表（发现协议后置）。
+  - `pub fn new(peers: impl IntoIterator<Item = (PeerId, SocketAddr)>) -> Self`
+  - `pub fn resolve(&self, peer: &PeerId) -> Result<SocketAddr, DiscoveryError>`
+- `pub enum DiscoveryError { PeerUnknown(PeerId) }`
+
+冻结语义：`resolve` 只做静态表查询，不发起网络 I/O、不建立 Connectivity（Discovery != Connectivity Establishment）；P0 的 Peer/Endpoint 关系由组合根以静态表注入。
+
+### 常规要求
+
 - 默认最小 surface：`private -> pub(crate) -> pub`。
 - Public API 变更必须保持结构化、可版本化并有调用方验证。
-- 本骨架只提供最小编译锚点；业务 API 在实现阶段增量添加。
 
 ## Verification
 

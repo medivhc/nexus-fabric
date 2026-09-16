@@ -43,9 +43,23 @@
 
 ## Public API
 
+### 冻结契约（remote P0，scenarios/product/remote_service_access_flow.toml）
+
+- `pub trait ServiceTransport`：注入的帧通道，避免 service -> transport 依赖边（架构允许依赖仅 domain/session/delivery）；由组合根以 transport::FrameStream 适配装配。
+  - `pub fn send_frame(&mut self, payload: &[u8]) -> Result<(), ServiceError>`
+  - `pub fn recv_frame(&mut self) -> Result<Vec<u8>, ServiceError>`
+- `pub struct ServiceSession`：Nexus-aware Service Session（PRODUCT §3 connect 语义）。
+  - `pub fn connect(transport: Box<dyn ServiceTransport>) -> Result<Self, ServiceError>`
+  - `pub fn phase(&self) -> ServicePhase`
+- `pub enum ServicePhase { Connecting, Active, Closed }`
+- `pub enum ServiceError { Transport, Unauthorized, Closed }`
+
+冻结语义：connect != forward（P0 只冻结 connect；forward 后置）；外部监听必须显式授权（`ServicePlanExtension.loopback_authorization_required`）。
+
+### 常规要求
+
 - 默认最小 surface：`private -> pub(crate) -> pub`。
 - Public API 变更必须保持结构化、可版本化并有调用方验证。
-- 本骨架只提供最小编译锚点；业务 API 在实现阶段增量添加。
 
 ## Verification
 

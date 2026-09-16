@@ -42,9 +42,22 @@
 
 ## Public API
 
+### 冻结契约（remote P0，scenarios/product/remote_service_access_flow.toml）
+
+- `pub fn connect(endpoint: &SocketAddr) -> Result<FrameStream, TransportError>`
+  建立到远端 Endpoint 的 TCP 连接，封装为长度前缀帧流。transport 不在 harness.toml `[portable_core]` 清单，允许使用 `std::net`。
+- `pub struct FrameStream`：帧流。
+  - `pub fn send_frame(&mut self, payload: &[u8]) -> Result<(), TransportError>`
+  - `pub fn recv_frame(&mut self) -> Result<Vec<u8>, TransportError>`
+- 帧协议冻结：`u32` 大端长度前缀 + payload（空 payload 合法）。
+- `pub enum TransportError { ConnectFailed, Closed, Protocol }`
+
+冻结语义：帧协议与错误变体在 remote P0 内为 Protected；实现阶段只允许补全行为与诊断信息，不得改变帧格式或签名。
+
+### 常规要求
+
 - 默认最小 surface：`private -> pub(crate) -> pub`。
 - Public API 变更必须保持结构化、可版本化并有调用方验证。
-- 本骨架只提供最小编译锚点；业务 API 在实现阶段增量添加。
 
 ## Verification
 

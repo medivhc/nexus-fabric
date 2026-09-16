@@ -41,9 +41,20 @@
 
 ## Public API
 
+### 冻结契约（remote P0，scenarios/product/remote_service_access_flow.toml）
+
+- `pub struct PreSharedToken(pub String)`：预共享令牌（P0 门控；完整握手后置）。
+- `pub struct Principal(pub String)`：认证通过后的主体标识。
+- `pub fn verify_token(token: &PreSharedToken, expected: &PreSharedToken) -> Result<Principal, AuthError>`
+  使用常量时间比较；失败结构化返回。
+- `pub enum AuthError { Unauthorized }`
+
+冻结语义：认证门控发生在业务帧转发之前（W7：未认证帧不得进入业务处理）；本模块纯校验、无 I/O、保持 portable（WASI check 覆盖）。
+
+### 常规要求
+
 - 默认最小 surface：`private -> pub(crate) -> pub`。
 - Public API 变更必须保持结构化、可版本化并有调用方验证。
-- 本骨架只提供最小编译锚点；业务 API 在实现阶段增量添加。
 
 ## Verification
 
