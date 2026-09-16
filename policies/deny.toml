@@ -1,0 +1,68 @@
+# cargo-deny execution config for the Nexus repository.
+# Enforced by the harness `dependency-governance` gate via:
+#   cargo deny --config policies/deny.toml check advisories licenses bans sources
+#
+# Strategy layer (policy decisions) lives in policies/dependencies.toml;
+# this file is the machine-executor configuration. Keep the license allowlist
+# in sync with policies/dependencies.toml [licenses].allow.
+
+[advisories]
+# RustSec advisory database (local clone path + source).
+db-path = "$CARGO_HOME/advisory-dbs"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# cargo-deny >= 0.20: vulnerability advisories always fail; no lint field.
+# unmaintained: fail only when a workspace direct dependency is unmaintained.
+unmaintained = "workspace"
+# unsound: fail only when a workspace direct dependency is unsound.
+unsound = "workspace"
+# yanked=deny enforces supply-chain hygiene (never resolve to yanked crates).
+yanked = "deny"
+# Advisories evaluated and accepted must be recorded here with a reason.
+ignore = []
+# Warnings for ignore entries that no longer apply (keeps ignore list honest).
+unused-ignored-advisory = "warn"
+
+[licenses]
+# cargo-deny >= 0.20: every license is DENIED unless explicitly allowed here
+# (the old unlicensed/copyleft/default lint fields were removed; deny-by-default
+# is now the only behavior). Nexus policy: allowlist matches
+# policies/dependencies.toml [licenses].allow.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+]
+# Official default (0.8) tolerates trivial license-text differences.
+confidence-threshold = 0.8
+# Warn when an allowlisted license is unused (keeps the allowlist honest).
+unused-allowed-license = "warn"
+# Per-crate exceptions (when a license is justified for a specific crate):
+exceptions = []
+# Manual license clarifications for crates without machine-readable license:
+# [[licenses.clarify]]
+
+[bans]
+# Duplicate versions are tolerated at warn level; treat as review signal.
+multiple-versions = "warn"
+# Wildcard version requirements are warn (cargo-deny default), NOT deny:
+# Nexus workspace crates declare internal deps as path-only ({ path = ... }),
+# which cargo-deny reports as wildcard. Those are local-source deps (locked by
+# Cargo.lock), not registry `*` requirements, so deny would false-positive on
+# the standard workspace pattern. Registry wildcards still surface as warnings.
+wildcards = "warn"
+highlight = "all"
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+# Only crates.io is an allowed source; git deps and other registries denied.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

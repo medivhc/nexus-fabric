@@ -333,6 +333,9 @@ pub fn architecture_gate(config: &Config) -> Gate {
 }
 
 /// Light dependency-governance gate: lockfile present + policy parses.
+/// Dependency governance: static checks (lockfile + policy parse) AND real
+/// cargo-deny execution (advisories / licenses / bans / sources) against
+/// policies/deny.toml. cargo-deny missing => UNKNOWN, never a silent PASS.
 pub fn dependency_gate(repo: &Repo, config: &Config) -> Gate {
     if !repo.root.join("Cargo.lock").exists() {
         return Gate::fail(
@@ -345,12 +348,42 @@ pub fn dependency_gate(repo: &Repo, config: &Config) -> Gate {
         Ok(t) => t,
         Err(e) => return Gate::fail("dependency-governance", &format!("read failed: {e}")),
     };
-    match toml::from_str::<toml::Value>(&text) {
-        Ok(_) => Gate::ok(
+    if let Err(e) = toml::from_str::<toml::Value>(&text) {
+        return Gate::fail("dependency-governance", &format!("parse failed: {e}"));
+    }
+    if !cargo_tool_available(repo, "deny") {
+        return Gate::unknown(
             "dependency-governance",
-            "Cargo.lock present; dependencies.toml parses",
-        ),
-        Err(e) => Gate::fail("dependency-governance", &format!("parse failed: {e}")),
+            "static checks passed; cargo-deny not installed (install with: cargo install cargo-deny --locked)",
+        );
+    }
+    let deny_cfg = config.policies_dir.join("deny.toml");
+    let (ok, out) = run_at_full(
+        &repo.root,
+        "cargo",
+        &[
+            "deny",
+            "--config",
+            deny_cfg.to_str().unwrap_or("policies/deny.toml"),
+            "check",
+            "advisories",
+            "licenses",
+            "bans",
+            "sources",
+        ],
+    );
+    if ok {
+        Gate::ok(
+            "dependency-governance",
+            "cargo-deny: advisories/licenses/bans/sources PASS",
+        )
+    } else {
+        let tail: Vec<&str> = out.lines().rev().take(20).collect();
+        let tail = tail.iter().rev().cloned().collect::<Vec<_>>().join("\n");
+        Gate::fail(
+            "dependency-governance",
+            &format!("cargo-deny check FAILED:\n{tail}"),
+        )
     }
 }
 
@@ -690,5 +723,20 @@ mod tests {
         );
         assert!(names.iter().all(|n| declared.contains(n)));
         assert!(!names.iter().any(|n| n == "serde_json" || n == "syn"));
+    }
+
+    #[test]
+    fn dependency_gate_runs_cargo_deny_when_available() {
+        let repo = Repo::discover().expect("repo must be discoverable");
+        let config = Config::load(&repo).expect("config must load from harness.toml");
+        let g = dependency_gate(&repo, &config);
+        assert_ne!(g.verdict, "FAIL", "dependency gate failed: {}", g.detail);
+        if cargo_tool_available(&repo, "deny") {
+            assert_eq!(
+                g.verdict, "PASS",
+                "cargo-deny installed but gate not PASS: {}",
+                g.detail
+            );
+        }
     }
 }

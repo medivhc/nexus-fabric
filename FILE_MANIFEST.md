@@ -136,6 +136,7 @@
 | `harness.toml` | Machine-readable contract/policy/scenario |
 | `policies/architecture.toml` | Machine-readable contract/policy/scenario |
 | `policies/dependencies.toml` | Machine-readable contract/policy/scenario |
+| `policies/deny.toml` | Machine-readable contract/policy/scenario (cargo-deny executor config) |
 | `policies/quality.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/README.md` | Repository contract/documentation |
 | `scenarios/engineering/harness_status_verdicts.toml` | Machine-readable contract/policy/scenario |

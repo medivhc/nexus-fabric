@@ -24,6 +24,11 @@ allow = [
 [security]
 advisory_gate = "deny-known-vulnerabilities"
 recommended_tool = "cargo-deny"
+# Machine enforcement: policies/deny.toml is the cargo-deny executor config
+# (same license allowlist, advisories always fail, yanked denied, sources
+# restricted to crates.io). Executed by the harness `dependency-governance`
+# gate via `cargo deny --config policies/deny.toml check advisories licenses
+# bans sources`; cargo-deny missing makes the gate UNKNOWN, never silent PASS.
 
 [supply_chain]
 lockfile_required = true
