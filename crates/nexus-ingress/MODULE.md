@@ -34,6 +34,10 @@
 - Ingress 是系统级 Driver 输入源，但通过 SessionManager/Application Layer 提交流量上下文。
 - Transparent interception 位于 nexus-platform-*。
 - 该 crate 必须保持 WASI/portable 可检查。
+- SOCKS5 握手为有状态 enum 状态机（sing-box 吸收）：握手完成（Established）前
+  不产出 `FlowContext`；失败路径必须返回结构化 `Socks5Error` 并进入 `Failed`。
+- 状态机只做协议解析（RFC 1928/1929 帧格式），不持有认证凭据库；RFC 1929
+  凭据格式合法即回成功，授权策略由上层决定。
 
 ## Side Effects
 
@@ -44,7 +48,20 @@
 
 - 默认最小 surface：`private -> pub(crate) -> pub`。
 - Public API 变更必须保持结构化、可版本化并有调用方验证。
-- 本骨架只提供最小编译锚点；业务 API 在实现阶段增量添加。
+- 已实现（骨架）：
+  - `classify` + `from_socks5` / `from_http` / `from_virtual_packet_interface` /
+    `from_native_api`：按 `FlowOrigin` 构造中立 `FlowContext`（纯函数，零 I/O）。
+- 已实现（SOCKS5 有状态握手状态机，sing-box 吸收）：
+  - `Socks5Handshake`：`new()` / `state()` / `feed(&mut self, bytes) -> Socks5Step` /
+    `take_data()`（Established 后的数据面字节）；
+  - `Socks5State`：Greeting / MethodSelected / UserPassAuth / Established / Failed；
+  - `Socks5Step { state, response, flow, needs_more }`：需发送的响应字节 +
+    握手完成时的 `FlowContext`（origin=Socks5, destination="host:port"）；
+  - `Socks5Error`：BadVersion / BadMethodCount / NoAcceptableMethod / BadAuthVersion /
+    AuthFailed / BadRequestVersion / UnsupportedCommand / UnsupportedAddressType /
+    InvalidAddress（结构化，非文本日志）。
+  - 支持 CONNECT（ATYP IPv4/域名/IPv6）；BIND/UDP ASSOCIATE 显式返回
+    command-not-supported。
 
 ## Verification
 
