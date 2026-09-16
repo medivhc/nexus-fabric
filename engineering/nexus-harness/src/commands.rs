@@ -270,8 +270,11 @@ pub fn verify(sub: &str) -> Outcome {
                 "workspace-tests" => gates::workspace_tests_gate(&repo),
                 "integration" => gates::integration_gate(&repo),
                 "product-scenarios" => {
-                    let (sr, g) =
-                        scenario_run(&config, "product-scenarios", &["product", "engineering"]);
+                    let (sr, g) = scenario_run(
+                        &config,
+                        "product-scenarios",
+                        &["product", "engineering", "platform"],
+                    );
                     scenarios.extend(sr);
                     g
                 }

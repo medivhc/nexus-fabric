@@ -1,19 +1,55 @@
 schema_version = 1
 id = "platform.virtual-packet-interface"
-title = "平台 Packet Adapter 保持统一 Packet Semantics"
+title = "Windows VPI 能力声明满足统一 Packet Semantics（wintun 窄 FFI 后端）"
 evidence_strength = "E4"
+requirement = "PRODUCT.md#7-跨平台产品语义"
 
 [given]
-platforms = ["linux", "windows", "macos", "android", "ios"]
+platform = "windows"
+backend = "wintun"
+adapter_api = "nexus-platform-windows"
 
+# 可执行 E4：组合根（apps/nexus-platform-host）暴露只读能力声明（不创建驱动
+# 对象），harness 按路径求值。真实驱动收发由部署环境可选 smoke 验证。
 [when]
-action = "inject_and_receive_ip_packet"
+command = "cargo run --quiet -p nexus-platform-host --features platform-windows -- vpi-capabilities --json"
 
 [[expect]]
-capability = "packet_ingress"
+field = "backend"
+equals = "wintun"
 
 [[expect]]
-capability = "packet_injection"
+field = "portable_consumer"
+equals = "nexus-ingress"
 
 [[expect]]
-portable_consumer = "nexus-ingress"
+field = "capabilities.packet_ingress"
+equals = true
+
+[[expect]]
+field = "capabilities.packet_injection"
+equals = true
+
+[[expect]]
+field = "capabilities.ipv4"
+equals = true
+
+[[expect]]
+field = "capabilities.ipv6"
+equals = true
+
+[[expect]]
+field = "capabilities.mtu_configurable"
+equals = true
+
+[[expect]]
+field = "capabilities.route_include"
+equals = true
+
+[[expect]]
+field = "mtu"
+equals = 1420
+
+[[expect]]
+field = "adapter_api"
+equals = "nexus-platform-windows"
