@@ -57,7 +57,23 @@ Merge/Commit/持久化路径必须返回结构化 `WorkspaceError`，不得 pani
 
 - 默认最小 surface：`private -> pub(crate) -> pub`。
 - Public API 变更必须保持结构化、可版本化并有调用方验证。
-- 本骨架只提供最小编译锚点；业务 API 在实现阶段增量添加。
+
+### 冻结契约（remote P0 扩展，scenarios/product/remote_workspace_commit_flow.toml）
+
+- `pub trait WorkspaceTransport`：注入的帧通道，避免 workspace -> transport 依赖边（架构允许依赖仅 domain/session/delivery/storage）；由组合根以 `transport::FrameStream` 适配装配。
+  - `pub fn send_frame(&mut self, payload: &[u8]) -> Result<(), WorkspaceError>`
+  - `pub fn recv_frame(&mut self) -> Result<Vec<u8>, WorkspaceError>`
+- `pub struct RemoteWorkspaceSession`：远程提交会话（PRODUCT §6）。
+  - `pub fn commit(transport: Box<dyn WorkspaceTransport>, change_set: &[u8]) -> Result<Self, WorkspaceError>`
+    在已认证帧通道上发送 ChangeSet 帧并接收结果帧；响应 `OK:HEAD:<commit_id>` 提取新 Head 后进入 Active，`REJECTED` 视为提供方拒绝。
+  - `pub fn phase(&self) -> WorkspaceRemotePhase`
+  - `pub fn head(&self) -> Option<&CommitId>`
+- `pub enum WorkspaceRemotePhase { Sending, Active, Closed }`
+- `WorkspaceError` 新增变体：`Transport` / `RemoteRejected` / `RemoteProtocol`。
+
+### 冻结语义
+
+远程提交必须显式完成往返后才 Active；提供方拒绝（RemoteRejected）与协议未识别帧（RemoteProtocol）是可诊断失败，不得吞为成功；未知 parent 的 ChangeSet 由提供方按现有 `UnknownCommit` 语义拒绝。
 
 ## Verification
 

@@ -1,0 +1,108 @@
+schema_version = 1
+id = "product.remote-workspace-commit-flow"
+title = "Node A 经远程闭环向 Node B 的 Workspace 远程提交并取回新 Head"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#remote"
+
+[given]
+requester = "node-a"
+provider = "node-b"
+resource = "workspace"
+auth = "pre-shared-token"
+transport = "tcp-length-prefix-frame"
+change_set = "C0\nremote.txt\nremote-content"
+
+# 可执行 E4：与 Service/InternetAccess/Compute 同一闭环骨架（Resolve -> Plan -> Session ->
+# Connectivity -> Execute），Execute 阶段为 Workspace 远程提交：Node A 发送 ChangeSet 帧，
+# Node B 侧真实 Workspace 应用 commit_changes 并返回新 Head（真实 TCP 帧往返）。
+[when]
+command = "cargo run --quiet -p nexus --example remote_workspace_commit_flow -- --json"
+
+# 冻结期望：全链 6 事件（含 workspace_commit_applied）；静态发现解析 Node B；认证门控
+# 在业务帧前通过；Planner 决策 Provider = Node B；Session 双轨 Completed/Disposed 且
+# TerminalOutcome 只提交一次；远程提交完成后新 Head 由响应帧带回（Head 非空、基于 C0）。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "events.0"
+equals = "remote_provider_resolved"
+
+[[expect]]
+field = "events.1"
+equals = "plan_selected"
+
+[[expect]]
+field = "events.2"
+equals = "session_created"
+
+[[expect]]
+field = "events.3"
+equals = "connectivity_established"
+
+[[expect]]
+field = "events.4"
+equals = "workspace_commit_applied"
+
+[[expect]]
+field = "events.5"
+equals = "remote_access_completed"
+
+# 静态发现解析出 Node B 的 Endpoint（Identity != Locator）。
+[[expect]]
+field = "discovery.peer_id"
+equals = "node-b"
+
+[[expect]]
+field = "discovery.endpoint"
+non_empty = true
+
+[[expect]]
+field = "transport.kind"
+equals = "tcp-frame"
+
+# 认证门控在业务帧前通过（预共享 Token 校验成功，产出 Principal）。
+[[expect]]
+field = "auth.gate"
+equals = "token_verified"
+
+[[expect]]
+field = "auth.principal"
+non_empty = true
+
+# Planner 真实决策：Provider = Node B（远程提供方）。
+[[expect]]
+field = "plan.provider_id"
+equals = "node-b"
+
+# Session 双轨：业务完成后 Owner 唯一提交 Completed，物理排空到 Disposed。
+[[expect]]
+field = "session.phase"
+equals = "Disposed"
+
+[[expect]]
+field = "session.outcome"
+equals = "Completed"
+
+[[expect]]
+field = "terminal_outcome_commit_count"
+equals = 1
+
+# Workspace 远程提交：响应帧带回新 Head（基于 C0 提交），会话 Active。
+[[expect]]
+field = "workspace.phase"
+equals = "Active"
+
+[[expect]]
+field = "workspace.head"
+non_empty = true
+
+[[expect]]
+field = "workspace.parent"
+equals = "C0"
+
+# 架构不变量：nexus-network 不依赖 nexus-ingress（ARCHITECTURE §3 禁止边）。
+[[expect]]
+field = "architecture.network_depends_on_ingress"
+equals = false
