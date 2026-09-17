@@ -57,6 +57,30 @@
 
 冻结语义：`resolve` 只做注册中心查询，不发起网络 I/O、不建立 Connectivity（Discovery != Connectivity Establishment）；TTL 过期后 Peer 不可解析（不得返回过期 Endpoint）；`announce` 幂等刷新。
 
+### 冻结契约（remote P0 扩展，网络发现协议，scenarios/product/remote_presence_network_discovery_flow.toml）
+
+- `pub trait DiscoveryTransport { fn exchange(&mut self, request: &[u8]) -> Result<Vec<u8>, DiscoveryError> }`
+  发现协议传输抽象：一次请求-响应往返。不携带发现业务语义；实现由 Composition Root 注入
+  （组合根 P0 为 TCP + 长度前缀帧），Discovery 层零 I/O。
+- `pub struct PresenceClient { registry: PresenceRegistry }`：请求方侧网络发现客户端（本地缓存已发现公告）。
+  - `pub fn discover(&mut self, transport: &mut impl DiscoveryTransport, peer: &PeerId) -> Result<Presence, DiscoveryError>`
+    经发现协议拉取远端 Presence：编码 `Discover` 请求帧 -> exchange -> 解码响应；
+    `Announce` 则缓存入本地注册中心并返回；`PeerUnknown`/`PeerExpired` 原样返回（不得缓存、不得使用）。
+  - `pub fn resolve_local(&self, peer: &PeerId) -> Result<SocketAddr, DiscoveryError>`：查本地缓存（代理 `PresenceRegistry::resolve`）。
+- `pub struct PresenceServer`：提供方侧无状态协议处理器。
+  - `pub fn handle(&self, registry: &PresenceRegistry, request: &[u8]) -> Vec<u8>`
+    解码 `Discover` -> `registry.resolve` -> 编码 `Announce` 或 `PeerUnknown`/`PeerExpired` 响应帧。
+- `pub enum DiscoveryFrame { Discover(PeerId), Announce { peer: PeerId, endpoint: SocketAddr, ttl_secs: u64 }, PeerUnknown(PeerId), PeerExpired(PeerId) }`
+  `pub fn encode_frame(frame: &DiscoveryFrame) -> Result<Vec<u8>, DiscoveryError>` / `pub fn decode_frame(payload: &[u8]) -> Result<DiscoveryFrame, DiscoveryError>`
+  帧格式：type tag (u8) + 字段（字符串为 u16 BE 长度前缀 + UTF-8，endpoint 为地址字符串）。确定性、可移植、无新依赖。
+- `pub enum DiscoveryError` 新增变体：`Transport(String)`（发现协议传输失败：发送/接收/解码失败，携带原因）。
+
+冻结语义：`PresenceClient` 不直接持有网络（`DiscoveryTransport` 单请求-响应注入）；
+`PresenceServer::handle` 无状态、不发起 I/O、只做 registry 查询与帧编解码；
+`Discover` 不建立 Connectivity（Discovery != Connectivity Establishment）；
+网络发现只解析 Endpoint，建连仍走后续 Plan/Connectivity 阶段；
+过期 Presence 经协议返回 `PeerExpired`，客户端不得使用过期 Endpoint。
+
 ### 冻结契约（remote P0，scenarios/product/remote_service_access_flow.toml）
 
 - `pub struct PeerId(pub String)`：提供方节点标识。Identity != Locator：Peer 不携带 Endpoint 本身。

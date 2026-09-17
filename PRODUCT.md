@@ -100,7 +100,7 @@ Resolve -> Plan -> Session -> Connectivity -> Execute -> Observe
 
 远程资源访问必须满足：
 
-- Discovery 解析提供方 Peer 的 Endpoint；P0 支持静态发现表与动态 Presence 注册（`PresenceRegistry`：announce/resolve + TTL 过期语义）两种模式；发现协议的网络传输后置。
+- Discovery 解析提供方 Peer 的 Endpoint；P0 支持静态发现表与动态 Presence 注册（`PresenceRegistry`：announce/resolve + TTL 过期语义）两种模式；动态 Presence 支持网络发现协议（`Discover`/`Announce`/`PeerUnknown`/`PeerExpired` 帧），发现请求-响应经注入的 `DiscoveryTransport` 在节点间传输（组合根 P0 为 TCP + 长度前缀帧）；Presence 注册与网络发现协议解耦——请求方经协议拉取远端公告、本地缓存并按 TTL 刷新，过期公告不得使用。
 - 认证门控在业务帧转发前完成：未通过认证的请求在帧流建立后、业务帧前被拒绝，返回 `AUTHORIZATION_DENIED`。
 - Transport 提供长度前缀帧协议；P0 冻结为 TCP + u32 大端长度前缀帧。
 - 建连失败按逆序幂等回滚（Connectivity -> Session -> Plan 释放），Session 物理排空到 Disposed，TerminalOutcome 由 Owner 唯一提交 `Failed`。
