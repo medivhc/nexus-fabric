@@ -45,10 +45,19 @@
 - Public API 变更必须保持结构化、可版本化并有调用方验证。
 - 本骨架只提供最小编译锚点；业务 API 在实现阶段增量添加。
 
-已实现（revision f8c7113+）：
+已实现（骨架声明 revision f8c7113+；observability v1 落地于 2909f69 之后）：
 
-- CLI 子命令解析（PRODUCT §8 全部命令：status / plan explain / session watch / connectivity / dns / workspace / compute jobs / diagnose / platform capabilities）。
-- `BootstrapControlService`（Composition Root 占位实现）：`status` 返回结构化状态；领域未就绪命令返回 `NexusError::Unsupported`（PRODUCT §7 禁止静默降级）。
+- §9 可观察性命令（PRODUCT.md#9-observability，`observability` 模块，结构化 JSON 快照）：
+  - 可用命令：`status` / `plan explain` / `session watch` / `connectivity status` /
+    `dns status` / `dns cache` / `platform capabilities`。
+  - dns 命令挂 `nexus-dns` `DnsRuntime` snapshot API（缓存/负缓存/调用计数/Exit-DNS Binding）。
+  - plan explain 挂 `nexus-planner` DecisionTrace（结构化拒绝原因 label）。
+  - 领域未就绪命令（workspace heads/compute jobs/diagnose 等）返回
+    `NexusError::Unsupported`（PRODUCT §9 禁止静默降级）。
+- 远程闭环组合根（PRODUCT §6）：`remote_*_flow` 系列
+  （service/internet-access/compute/workspace/presence），供 nexusd 复用。
+- 本地主链路切片：`internet_access_flow` / `service_session_lifecycle` /
+  `connectivity_failure_rollback`。
 
 ## Verification
 

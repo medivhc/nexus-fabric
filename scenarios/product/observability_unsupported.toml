@@ -1,0 +1,24 @@
+schema_version = 1
+id = "product.observability-unsupported"
+title = "§9 可观察性：领域未就绪命令显式 UNSUPPORTED（禁止静默降级）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#9-observability"
+
+[given]
+domain_state = "workspace heads not ready"
+no_silent_degradation = "explicit UNSUPPORTED error, exit 0"
+
+[when]
+command = "cargo run --quiet -p nexusd -- workspace heads --json"
+
+[[expect]]
+field = "verdict"
+equals = "FAIL"
+
+[[expect]]
+field = "error.code"
+equals = "UNSUPPORTED"
+
+[[expect]]
+field = "error.command"
+equals = "workspace heads"

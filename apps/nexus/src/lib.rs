@@ -12,6 +12,10 @@
 
 #![forbid(unsafe_code)]
 
+/// §9 可观察性命令（status / plan explain / session watch / connectivity status /
+/// dns status / dns cache / platform capabilities），见 PRODUCT.md#9-observability。
+pub mod observability;
+
 use nexus_domain::{
     LifecyclePhase, NexusError, ProviderId, ResourceId, SessionId, TerminalOutcome,
 };

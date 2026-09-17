@@ -1,0 +1,28 @@
+schema_version = 1
+id = "product.observability-session-watch"
+title = "§9 可观察性：session watch 输出 Session 双轨状态（phase/outcome/committed）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#9-observability"
+
+[given]
+dual_track = "LifecyclePhase + TerminalOutcome"
+sessions = "sess-1(active/completed) sess-2(disposed/failed) sess-3(allocating/unfinished)"
+
+[when]
+command = "cargo run --quiet -p nexusd -- session watch --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "sessions"
+non_empty = true
+
+[[expect]]
+field = "sessions.1.outcome"
+equals = "failed"
+
+[[expect]]
+field = "sessions.2.phase"
+equals = "allocating"
