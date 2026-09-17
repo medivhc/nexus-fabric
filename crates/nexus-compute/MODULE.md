@@ -44,9 +44,25 @@
 
 ## Public API
 
+### 冻结契约（remote P0 扩展，scenarios/product/remote_compute_job_flow.toml）
+
+- `pub trait ComputeTransport`：注入的帧通道，避免 compute -> transport 依赖边（架构允许依赖仅 domain/session/delivery/workspace）；由组合根以 `transport::FrameStream` 适配装配。
+  - `pub fn send_frame(&mut self, payload: &[u8]) -> Result<(), ComputeError>`
+  - `pub fn recv_frame(&mut self) -> Result<Vec<u8>, ComputeError>`
+- `pub struct ComputeJobSession`：远程计算作业会话（PRODUCT §2/§6）。
+  - `pub fn submit(transport: Box<dyn ComputeTransport>, job: &[u8]) -> Result<Self, ComputeError>`
+    在已认证帧通道上提交作业帧并接收结果帧；响应 `OK:<result>` 提取结果后进入 Active，`REJECTED` 视为提供方拒绝。
+  - `pub fn phase(&self) -> ComputePhase`
+  - `pub fn result(&self) -> Option<&str>`
+- `pub enum ComputePhase { Submitting, Active, Closed }`
+- `pub enum ComputeError { Transport, Rejected, Closed, Protocol }`
+
+冻结语义：作业必须显式提交（submit 完成往返后才 Active）；提供方拒绝（REJECTED）与协议未识别帧（Protocol）是可诊断失败，不得吞为成功。
+
+### 常规要求
+
 - 默认最小 surface：`private -> pub(crate) -> pub`。
 - Public API 变更必须保持结构化、可版本化并有调用方验证。
-- 本骨架只提供最小编译锚点；业务 API 在实现阶段增量添加。
 
 ## Verification
 

@@ -104,7 +104,7 @@ Resolve -> Plan -> Session -> Connectivity -> Execute -> Observe
 - 认证门控在业务帧转发前完成：未通过认证的请求在帧流建立后、业务帧前被拒绝，返回 `AUTHORIZATION_DENIED`。
 - Transport 提供长度前缀帧协议；P0 冻结为 TCP + u32 大端长度前缀帧。
 - 建连失败按逆序幂等回滚（Connectivity -> Session -> Plan 释放），Session 物理排空到 Disposed，TerminalOutcome 由 Owner 唯一提交 `Failed`。
-- Service 与 InternetAccess 是远程访问的首批资源类型；Workspace / Compute 的远程访问后置。
+- Service、InternetAccess 与 Compute 是远程访问的首批资源类型；Workspace 的远程访问后置。
 
 ## 7. Session 语义
 
