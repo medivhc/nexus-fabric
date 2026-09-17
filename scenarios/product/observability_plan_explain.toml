@@ -1,0 +1,28 @@
+schema_version = 1
+id = "product.observability-plan-explain"
+title = "§9 可观察性：plan explain 输出 Plan + DecisionTrace 结构化拒绝原因"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#9-observability"
+
+[given]
+planner = "filter/score (kube-scheduler inspired)"
+decision_trace = "considered candidates with structured reject labels"
+
+[when]
+command = "cargo run --quiet -p nexusd -- plan explain --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "plan.provider"
+equals = "p1"
+
+[[expect]]
+field = "trace.selected"
+equals = "p1"
+
+[[expect]]
+field = "trace.considered.1.rejected_reason"
+equals = "missing_capability"
