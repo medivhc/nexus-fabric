@@ -466,6 +466,8 @@ pub const EV_COMPUTE_JOB_REJECTED: &str = "compute_job_rejected";
 pub const EV_WORKSPACE_COMMIT_APPLIED: &str = "workspace_commit_applied";
 /// 事件名：远程 Workspace 提交被提供方拒绝（REJECTED 帧）。
 pub const EV_WORKSPACE_COMMIT_REJECTED: &str = "workspace_commit_rejected";
+/// 事件名：动态 Presence 解析失败（PeerExpired/PeerUnknown，未进入 Plan/Session）。
+pub const EV_PRESENCE_RESOLUTION_FAILED: &str = "presence_resolution_failed";
 /// 事件名：远程网络认证门控拒绝（W7：未认证帧不得进入业务处理）。
 pub const EV_NETWORK_AUTH_REJECTED: &str = "network_auth_rejected";
 /// 事件名：远程资源访问闭环完成（Owner 已提交终态并排空到 Disposed）。
@@ -1968,6 +1970,241 @@ pub fn remote_workspace_rejected_rollback() -> Result<Value, NexusError> {
         },
         "architecture": {
             "network_depends_on_ingress": arch_violation,
+        }
+    }))
+}
+
+/// 运行一次基于动态 Presence 发现的远程闭环（PRODUCT §6）：Node B 向
+/// `PresenceRegistry` 发布 Presence（真实可达 Endpoint + TTL），Node A 经
+/// 注册中心动态解析（取代静态表注入）后，完成与 Service 相同的
+/// Discovery -> Plan -> Session -> Connectivity -> Auth -> Service 闭环。
+///
+/// 进程内双节点模拟：Node B 在回环端口监听并提供服务握手（CONNECT -> READY），
+/// Presence 由 Node B 主动 announce、Node A 主动 resolve。确定性、可重放。
+pub fn remote_presence_dynamic_flow() -> Result<Value, NexusError> {
+    let mut events: Vec<&'static str> = Vec::new();
+
+    // 0) Node B（提供方）：绑定回环端口，后台线程接受连接并完成服务握手。
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| NexusError::Internal {
+            message: format!("cannot bind node-b listener: {e}"),
+        })?;
+    let node_b_addr = listener.local_addr().map_err(|e| NexusError::Internal {
+        message: format!("cannot read node-b listener addr: {e}"),
+    })?;
+    let node_b_server = std::thread::spawn(move || {
+        if let Ok(mut fs) = nexus_transport::accept(&listener) {
+            if let Ok(frame) = fs.recv_frame() {
+                if frame == b"CONNECT" {
+                    let _ = fs.send_frame(b"READY");
+                }
+            }
+        }
+    });
+
+    // 1) 动态发现：Node B 发布 Presence（真实监听地址 + TTL），Node A 经注册中心解析。
+    let mut presence = nexus_discovery::PresenceRegistry::default();
+    presence
+        .announce(nexus_discovery::PeerId("node-b".into()), node_b_addr, 60)
+        .map_err(|e| NexusError::Internal {
+            message: e.to_string(),
+        })?;
+    let endpoint = presence
+        .resolve(&nexus_discovery::PeerId("node-b".into()))
+        .map_err(|e| NexusError::Internal {
+            message: e.to_string(),
+        })?;
+    let presence_announced = presence.is_announced(&nexus_discovery::PeerId("node-b".into()));
+    let presence_expired = presence.is_expired(&nexus_discovery::PeerId("node-b".into()));
+    events.push(EV_REMOTE_PROVIDER_RESOLVED);
+
+    // 2) Policy：Service 画像展开为 Intent + Constraint（authorization=explicit）。
+    let flow = nexus_ingress::from_native_api("service", "RemoteBalanced");
+    let decision = nexus_policy::PolicyEngine::default_service()
+        .evaluate(&flow)
+        .decision;
+
+    // 3) Registry + Core Planner：唯一系统级规划，Provider = node-b（远程提供方）。
+    let resource: ResourceId = flow.resource.clone();
+    let mut registry = Registry::new();
+    registry.register(ProviderRecord {
+        id: ProviderId("node-b".into()),
+        resource: resource.clone(),
+        placement: "remote-provider".into(),
+        locator: "node-b.endpoint".into(),
+        capabilities: vec!["service-session".into()],
+        present: true,
+    });
+    let candidates = registry.candidates(&resource);
+    let mut measurements = MeasurementTable::new();
+    measurements.record(
+        ProviderId("node-b".into()),
+        LinkMeasurement {
+            rtt_ms: Some(5),
+            confidence_percent: 99,
+            ..Default::default()
+        },
+    );
+    let snapshot = PlanningSnapshot::new(candidates.clone(), decision.constraints.clone());
+    let planned = nexus_planner::plan_from_snapshot(&resource, &snapshot, &decision.intent, |p| {
+        measurements.get(p).cloned()
+    })?;
+    events.push(EV_PLAN_SELECTED);
+
+    // 4) Session：Owner 创建并进入 Active（先于建连）。
+    let mut owner = SessionOwner::new(SessionId("sess-presence-service-1".into()));
+    owner
+        .transition_phase(LifecyclePhase::Active)
+        .map_err(NexusError::from)?;
+    events.push(EV_SESSION_CREATED);
+
+    // 5) Connectivity：建立到 Node B 的 TCP 长度前缀帧流（Plan + Session 之后）。
+    let frame_stream = nexus_transport::connect(&endpoint).map_err(|e| {
+        NexusError::ConnectivityEstablishmentFailed {
+            provider: planned.plan.provider_id.clone(),
+            reason: e.to_string(),
+        }
+    })?;
+    events.push(EV_REMOTE_CONNECTIVITY_ESTABLISHED);
+
+    // 6) Auth：预共享 Token 门控在业务帧前通过（W7：未认证帧不得进入业务处理）。
+    let token = nexus_auth::PreSharedToken("nexus-preshared-token".into());
+    let expected = nexus_auth::PreSharedToken("nexus-preshared-token".into());
+    let principal = nexus_auth::verify_token(&token, &expected).map_err(|_| {
+        NexusError::AuthorizationDenied {
+            principal: "remote-requester".into(),
+        }
+    })?;
+
+    // 7) Service：握手（CONNECT -> READY）。
+    let service_session = nexus_service::ServiceSession::connect(Box::new(FrameStreamAdapter {
+        inner: frame_stream,
+    }))
+    .map_err(|e| NexusError::SessionFailed {
+        session: owner.id().clone(),
+        reason: e.to_string(),
+    })?;
+    events.push(EV_SERVICE_CONNECTED);
+
+    // 8) Owner 唯一提交 Completed；终态后 cleanup 推进到 Disposed。
+    owner
+        .commit_outcome(TerminalOutcome::Completed)
+        .map_err(NexusError::from)?;
+    owner
+        .transition_phase(LifecyclePhase::Draining)
+        .map_err(NexusError::from)?;
+    owner
+        .transition_phase(LifecyclePhase::Disposed)
+        .map_err(NexusError::from)?;
+    events.push(EV_REMOTE_ACCESS_COMPLETED);
+
+    // 回收 Node B 线程（结构化并发：线程有明确 Owner，主流程 join）。
+    if node_b_server.join().is_err() {
+        return Err(NexusError::Internal {
+            message: "node-b server thread panicked".into(),
+        });
+    }
+
+    let status = owner.status();
+    let terminal_outcome_commit_count = owner
+        .events()
+        .iter()
+        .filter(|e| matches!(e, nexus_session::SessionEvent::OutcomeCommitted { .. }))
+        .count();
+    let arch_violation = network_depends_on_ingress()?;
+
+    Ok(json!({
+        "verdict": "PASS",
+        "discovery": {
+            "mode": "dynamic",
+            "peer_id": "node-b",
+            "endpoint": endpoint.to_string(),
+        },
+        "presence": {
+            "announced": presence_announced,
+            "expired": presence_expired,
+            "ttl_secs": 60,
+        },
+        "events": events,
+        "transport": {
+            "kind": "tcp-frame",
+        },
+        "auth": {
+            "gate": "token_verified",
+            "principal": principal.0,
+        },
+        "plan": {
+            "provider_id": planned.plan.provider_id.0,
+            "placement": planned.plan.placement,
+            "path": planned.plan.path,
+        },
+        "session": {
+            "id": owner.id().0,
+            "phase": phase_name(&status.phase),
+            "outcome": outcome_name(&status.outcome),
+        },
+        "terminal_outcome_commit_count": terminal_outcome_commit_count,
+        "service": {
+            "phase": service_session.phase().to_string(),
+        },
+        "architecture": {
+            "network_depends_on_ingress": arch_violation,
+        }
+    }))
+}
+
+/// 运行一次 Presence 过期拒绝路径（PRODUCT §6）：Node B 以 TTL=0 发布 Presence
+/// （立即过期），Node A 动态解析失败（PeerExpired）——失败发生在 Discovery 阶段
+/// （未到 Plan/Session/Connectivity），输出结构化拒绝（PEER_EXPIRED），
+/// 不得返回过期 Endpoint、不进入资源访问。
+pub fn remote_presence_expired_rollback() -> Result<Value, NexusError> {
+    let mut events: Vec<&'static str> = Vec::new();
+
+    // 1) 动态发现：Node B 以 TTL=0 发布 Presence（立即过期）。
+    let mut presence = nexus_discovery::PresenceRegistry::default();
+    let placeholder: std::net::SocketAddr =
+        "127.0.0.1:1".parse().map_err(|e| NexusError::Internal {
+            message: format!("invalid placeholder endpoint: {e}"),
+        })?;
+    presence
+        .announce(nexus_discovery::PeerId("node-b".into()), placeholder, 0)
+        .map_err(|e| NexusError::Internal {
+            message: e.to_string(),
+        })?;
+    let presence_announced = presence.is_announced(&nexus_discovery::PeerId("node-b".into()));
+    let presence_expired = presence.is_expired(&nexus_discovery::PeerId("node-b".into()));
+
+    // 2) 动态解析：TTL 过期 -> PeerExpired（结构化拒绝，不返回过期 Endpoint）。
+    let resolved = presence.resolve(&nexus_discovery::PeerId("node-b".into()));
+    match resolved {
+        Err(nexus_discovery::DiscoveryError::PeerExpired(_)) => {
+            events.push(EV_PRESENCE_RESOLUTION_FAILED);
+        }
+        Err(e) => {
+            return Err(NexusError::Internal {
+                message: format!("expected PeerExpired, got {e}"),
+            });
+        }
+        Ok(_) => {
+            return Err(NexusError::Internal {
+                message: "expected PeerExpired but endpoint resolved".into(),
+            });
+        }
+    }
+
+    Ok(json!({
+        "verdict": "PASS",
+        "discovery": {
+            "mode": "dynamic",
+            "peer_id": "node-b",
+        },
+        "presence": {
+            "announced": presence_announced,
+            "expired": presence_expired,
+        },
+        "events": events,
+        "error": {
+            "code": "PEER_EXPIRED",
         }
     }))
 }

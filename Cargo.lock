@@ -45,6 +45,7 @@ dependencies = [
  "nexus-connectivity",
  "nexus-control-api",
  "nexus-discovery",
+ "nexus-dns",
  "nexus-domain",
  "nexus-ingress",
  "nexus-measurement",
