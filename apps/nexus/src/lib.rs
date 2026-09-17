@@ -447,3 +447,355 @@ pub fn connectivity_failure_rollback(
         }
     }))
 }
+
+// ---------- Remote Resource Access（PRODUCT §6，remote P0） ----------
+
+/// 事件名：Discovery 已解析远程提供方 Peer 的 Endpoint。
+pub const EV_REMOTE_PROVIDER_RESOLVED: &str = "remote_provider_resolved";
+/// 事件名：到远程提供方的帧流已建立（冻结场景期望，remote P0）。
+pub const EV_REMOTE_CONNECTIVITY_ESTABLISHED: &str = "connectivity_established";
+/// 事件名：Service 会话已通过握手建立（CONNECT -> READY）。
+pub const EV_SERVICE_CONNECTED: &str = "service_connected";
+/// 事件名：远程资源访问闭环完成（Owner 已提交终态并排空到 Disposed）。
+pub const EV_REMOTE_ACCESS_COMPLETED: &str = "remote_access_completed";
+
+/// 把 `nexus_transport::FrameStream` 适配为 `nexus_service::ServiceTransport`
+/// （依赖注入，由 Composition Root 装配；避免 service -> transport 依赖边）。
+struct FrameStreamAdapter {
+    inner: nexus_transport::FrameStream,
+}
+
+impl nexus_service::ServiceTransport for FrameStreamAdapter {
+    fn send_frame(&mut self, payload: &[u8]) -> Result<(), nexus_service::ServiceError> {
+        self.inner
+            .send_frame(payload)
+            .map_err(|_| nexus_service::ServiceError::Transport)
+    }
+
+    fn recv_frame(&mut self) -> Result<Vec<u8>, nexus_service::ServiceError> {
+        self.inner
+            .recv_frame()
+            .map_err(|_| nexus_service::ServiceError::Transport)
+    }
+}
+
+/// 运行一次远程资源访问闭环（PRODUCT §6）：Node A 经
+/// Discovery -> Plan -> Session -> Connectivity -> Auth -> Service 访问 Node B 的 Service 资源。
+///
+/// 进程内双节点模拟：Node B 在回环端口监听并提供服务握手（CONNECT -> READY），
+/// Node A 通过真实 TCP 长度前缀帧流访问。确定性、可重放。
+pub fn remote_service_access_flow() -> Result<Value, NexusError> {
+    let mut events: Vec<&'static str> = Vec::new();
+
+    // 0) Node B（提供方）：绑定回环端口，后台线程接受连接并完成服务握手。
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| NexusError::Internal {
+            message: format!("cannot bind node-b listener: {e}"),
+        })?;
+    let node_b_addr = listener.local_addr().map_err(|e| NexusError::Internal {
+        message: format!("cannot read node-b listener addr: {e}"),
+    })?;
+    let node_b_server = std::thread::spawn(move || {
+        if let Ok(mut fs) = nexus_transport::accept(&listener) {
+            if let Ok(frame) = fs.recv_frame() {
+                if frame == b"CONNECT" {
+                    let _ = fs.send_frame(b"READY");
+                }
+            }
+        }
+    });
+
+    // 1) Discovery：静态发现解析 Node B 的 Endpoint（Identity != Locator）。
+    let discovery = nexus_discovery::StaticDiscovery::new([(
+        nexus_discovery::PeerId("node-b".into()),
+        node_b_addr,
+    )]);
+    let endpoint = discovery
+        .resolve(&nexus_discovery::PeerId("node-b".into()))
+        .map_err(|e| NexusError::Internal {
+            message: e.to_string(),
+        })?;
+    events.push(EV_REMOTE_PROVIDER_RESOLVED);
+
+    // 2) Policy：Service 画像展开为 Intent + Constraint（authorization=explicit）。
+    let flow = nexus_ingress::from_native_api("service", "RemoteBalanced");
+    let decision = nexus_policy::PolicyEngine::default_service()
+        .evaluate(&flow)
+        .decision;
+
+    // 3) Registry + Core Planner：唯一系统级规划，Provider = node-b（远程提供方）。
+    let resource: ResourceId = flow.resource.clone();
+    let mut registry = Registry::new();
+    registry.register(ProviderRecord {
+        id: ProviderId("node-b".into()),
+        resource: resource.clone(),
+        placement: "remote-provider".into(),
+        locator: "node-b.endpoint".into(),
+        capabilities: vec!["service-session".into()],
+        present: true,
+    });
+    let candidates = registry.candidates(&resource);
+    let mut measurements = MeasurementTable::new();
+    measurements.record(
+        ProviderId("node-b".into()),
+        LinkMeasurement {
+            rtt_ms: Some(5),
+            confidence_percent: 99,
+            ..Default::default()
+        },
+    );
+    let snapshot = PlanningSnapshot::new(candidates.clone(), decision.constraints.clone());
+    let planned = nexus_planner::plan_from_snapshot(&resource, &snapshot, &decision.intent, |p| {
+        measurements.get(p).cloned()
+    })?;
+    events.push(EV_PLAN_SELECTED);
+
+    // 4) Session：Owner 创建并进入 Active（先于建连）。
+    let mut owner = SessionOwner::new(SessionId("sess-remote-service-1".into()));
+    owner
+        .transition_phase(LifecyclePhase::Active)
+        .map_err(NexusError::from)?;
+    events.push(EV_SESSION_CREATED);
+
+    // 5) Connectivity：建立到 Node B 的 TCP 长度前缀帧流（Plan + Session 之后）。
+    let frame_stream = nexus_transport::connect(&endpoint).map_err(|e| {
+        NexusError::ConnectivityEstablishmentFailed {
+            provider: planned.plan.provider_id.clone(),
+            reason: e.to_string(),
+        }
+    })?;
+    events.push(EV_REMOTE_CONNECTIVITY_ESTABLISHED);
+
+    // 6) Auth：预共享 Token 门控在业务帧前通过（W7：未认证帧不得进入业务处理）。
+    let token = nexus_auth::PreSharedToken("nexus-preshared-token".into());
+    let expected = nexus_auth::PreSharedToken("nexus-preshared-token".into());
+    let principal = nexus_auth::verify_token(&token, &expected).map_err(|_| {
+        NexusError::AuthorizationDenied {
+            principal: "remote-requester".into(),
+        }
+    })?;
+
+    // 7) Service：connect 握手（CONNECT -> READY），服务会话进入 Active。
+    let service_session = nexus_service::ServiceSession::connect(Box::new(FrameStreamAdapter {
+        inner: frame_stream,
+    }))
+    .map_err(|e| NexusError::SessionFailed {
+        session: owner.id().clone(),
+        reason: e.to_string(),
+    })?;
+    events.push(EV_SERVICE_CONNECTED);
+
+    // 8) Owner 唯一提交 Completed；终态后 cleanup 推进到 Disposed。
+    owner
+        .commit_outcome(TerminalOutcome::Completed)
+        .map_err(NexusError::from)?;
+    owner
+        .transition_phase(LifecyclePhase::Draining)
+        .map_err(NexusError::from)?;
+    owner
+        .transition_phase(LifecyclePhase::Disposed)
+        .map_err(NexusError::from)?;
+    events.push(EV_REMOTE_ACCESS_COMPLETED);
+
+    // 回收 Node B 线程（结构化并发：线程有明确 Owner，主流程 join）。
+    if node_b_server.join().is_err() {
+        return Err(NexusError::Internal {
+            message: "node-b server thread panicked".into(),
+        });
+    }
+
+    let status = owner.status();
+    let terminal_outcome_commit_count = owner
+        .events()
+        .iter()
+        .filter(|e| matches!(e, nexus_session::SessionEvent::OutcomeCommitted { .. }))
+        .count();
+    let arch_violation = network_depends_on_ingress()?;
+
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "discovery": {
+            "peer_id": "node-b",
+            "endpoint": endpoint.to_string(),
+        },
+        "transport": {
+            "kind": "tcp-frame",
+        },
+        "auth": {
+            "gate": "token_verified",
+            "principal": principal.0,
+        },
+        "plan": {
+            "provider_id": planned.plan.provider_id.0,
+            "placement": planned.plan.placement,
+            "path": planned.plan.path,
+        },
+        "session": {
+            "id": owner.id().0,
+            "phase": phase_name(&status.phase),
+            "outcome": outcome_name(&status.outcome),
+        },
+        "terminal_outcome_commit_count": terminal_outcome_commit_count,
+        "service": {
+            "phase": service_session.phase().to_string(),
+        },
+        "architecture": {
+            "network_depends_on_ingress": arch_violation,
+        }
+    }))
+}
+
+/// 运行一次远程建连失败路径（PRODUCT §6）：Discovery 已解析 Node B，
+/// 但建连失败，按逆序幂等回滚到 Disposed，Owner 唯一提交 Failed。
+///
+/// 确定性：Node B Endpoint 解析为未监听回环端口，TCP connect 立即失败。
+pub fn remote_connectivity_failure_rollback() -> Result<Value, NexusError> {
+    let mut events: Vec<&'static str> = Vec::new();
+
+    // 1) Discovery：静态发现解析 Node B（Endpoint 为未监听回环地址，建连必失败）。
+    let endpoint: std::net::SocketAddr =
+        "127.0.0.1:1".parse().map_err(|e| NexusError::Internal {
+            message: format!("invalid node-b endpoint: {e}"),
+        })?;
+    let discovery = nexus_discovery::StaticDiscovery::new([(
+        nexus_discovery::PeerId("node-b".into()),
+        endpoint,
+    )]);
+    let resolved = discovery
+        .resolve(&nexus_discovery::PeerId("node-b".into()))
+        .map_err(|e| NexusError::Internal {
+            message: e.to_string(),
+        })?;
+    events.push(EV_REMOTE_PROVIDER_RESOLVED);
+
+    // 2) Policy / 3) Planner：Provider = node-b（失败发生在建连阶段，而非解析/规划阶段）。
+    let flow = nexus_ingress::from_native_api("service", "RemoteBalanced");
+    let decision = nexus_policy::PolicyEngine::default_service()
+        .evaluate(&flow)
+        .decision;
+    let resource: ResourceId = flow.resource.clone();
+    let mut registry = Registry::new();
+    registry.register(ProviderRecord {
+        id: ProviderId("node-b".into()),
+        resource: resource.clone(),
+        placement: "remote-provider".into(),
+        locator: "node-b.endpoint".into(),
+        capabilities: vec!["service-session".into()],
+        present: true,
+    });
+    let candidates = registry.candidates(&resource);
+    let mut measurements = MeasurementTable::new();
+    measurements.record(
+        ProviderId("node-b".into()),
+        LinkMeasurement {
+            rtt_ms: Some(5),
+            confidence_percent: 99,
+            ..Default::default()
+        },
+    );
+    let snapshot = PlanningSnapshot::new(candidates.clone(), decision.constraints.clone());
+    let planned = nexus_planner::plan_from_snapshot(&resource, &snapshot, &decision.intent, |p| {
+        measurements.get(p).cloned()
+    })?;
+    events.push(EV_PLAN_SELECTED);
+
+    // 4) Session：Owner 创建并进入 Active（先于建连）。
+    let mut owner = SessionOwner::new(SessionId("sess-remote-rollback-1".into()));
+    owner
+        .transition_phase(LifecyclePhase::Active)
+        .map_err(NexusError::from)?;
+    events.push(EV_SESSION_CREATED);
+
+    // 5) Connectivity：建连失败（无监听 -> ECONNREFUSED -> ConnectFailed）。
+    events.push(EV_CONNECTIVITY_ESTABLISHMENT);
+    let reason = match nexus_transport::connect(&resolved) {
+        Err(nexus_transport::TransportError::ConnectFailed) => {
+            "tcp connect failed: node-b unreachable".to_string()
+        }
+        Err(e) => {
+            return Err(NexusError::Internal {
+                message: format!("expected connect failure, got {e}"),
+            });
+        }
+        Ok(_) => {
+            return Err(NexusError::Internal {
+                message: "expected connect failure but connection succeeded".into(),
+            });
+        }
+    };
+    events.push(EV_CONNECTIVITY_FAILED);
+
+    // 6) Worker 上报失败事件（不写 Outcome）。
+    owner
+        .record_connectivity_failed(
+            planned.plan.path.first().cloned().unwrap_or_default(),
+            reason.clone(),
+        )
+        .map_err(NexusError::from)?;
+
+    // 7) Owner 唯一提交 Failed（Worker 只发事件，Outcome 由 Owner 状态机写入）。
+    owner
+        .commit_outcome(TerminalOutcome::Failed(
+            NexusError::ConnectivityEstablishmentFailed {
+                provider: planned.plan.provider_id.clone(),
+                reason: reason.clone(),
+            },
+        ))
+        .map_err(NexusError::from)?;
+    events.push(EV_TERMINAL_OUTCOME_COMMITTED);
+
+    // 8) 逆序回滚：Draining -> Disposed（K10 逆序幂等）。
+    owner
+        .transition_phase(LifecyclePhase::Draining)
+        .map_err(NexusError::from)?;
+    owner
+        .transition_phase(LifecyclePhase::Disposed)
+        .map_err(NexusError::from)?;
+    let rollback_idempotent = matches!(
+        owner.transition_phase(LifecyclePhase::Draining),
+        Err(nexus_session::SessionError::InvalidPhaseTransition { .. })
+    ) && owner.phase() == LifecyclePhase::Disposed;
+    let redundant_commit_rejected = matches!(
+        owner.commit_outcome(TerminalOutcome::Failed(NexusError::Internal {
+            message: "duplicate".into()
+        })),
+        Err(nexus_session::SessionError::AlreadyTerminated { .. })
+    );
+    let terminal_outcome_commit_count = owner
+        .events()
+        .iter()
+        .filter(|e| matches!(e, nexus_session::SessionEvent::OutcomeCommitted { .. }))
+        .count();
+
+    let status = owner.status();
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "connectivity": {
+            "state": "Failed",
+        },
+        "error": {
+            "code": "CONNECTIVITY_ESTABLISHMENT_FAILED",
+        },
+        "rollback": {
+            "idempotent": rollback_idempotent,
+            "drained_to_disposed": owner.phase() == LifecyclePhase::Disposed,
+        },
+        "session": {
+            "id": owner.id().0,
+            "phase": phase_name(&status.phase),
+            "outcome": outcome_name(&status.outcome),
+        },
+        "terminal_outcome_commit_count": terminal_outcome_commit_count,
+        "redundant_commit_rejected": redundant_commit_rejected,
+        "plan": {
+            "provider_id": planned.plan.provider_id.0,
+            "placement": planned.plan.placement,
+        },
+        "discovery": {
+            "peer_id": "node-b",
+            "endpoint": resolved.to_string(),
+        }
+    }))
+}

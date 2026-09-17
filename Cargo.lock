@@ -40,8 +40,10 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 name = "nexus"
 version = "0.1.0"
 dependencies = [
+ "nexus-auth",
  "nexus-connectivity",
  "nexus-control-api",
+ "nexus-discovery",
  "nexus-domain",
  "nexus-ingress",
  "nexus-measurement",
@@ -49,7 +51,9 @@ dependencies = [
  "nexus-platform",
  "nexus-policy",
  "nexus-registry",
+ "nexus-service",
  "nexus-session",
+ "nexus-transport",
  "serde_json",
 ]
 
