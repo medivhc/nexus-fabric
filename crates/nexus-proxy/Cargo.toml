@@ -1,0 +1,15 @@
+[package]
+name = "nexus-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nexus-domain = { path = "../nexus-domain" }
+nexus-proxy-config = { path = "../nexus-proxy-config" }
+nexus-connectivity = { path = "../nexus-connectivity" }
+nexus-measurement = { path = "../nexus-measurement" }

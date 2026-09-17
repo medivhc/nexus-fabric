@@ -1,0 +1,43 @@
+schema_version = 1
+id = "product.proxy-selector-group"
+title = "selector 策略组手动切换 direct/relay 候选并断言选中 tag"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-proxy-kernel"
+
+[given]
+group_kind = "selector"
+candidates = ["direct", "relay"]
+initial_selection = "direct"
+operation = "switch_to relay then switch_to direct"
+probe = "none (manual switch is deterministic, zero I/O)"
+
+# 可执行 E4：组合根 example 构建 selector 策略组（候选 direct/relay），
+# 先断言初始选中 = direct，执行 switch_to("relay") 后断言选中 = relay，
+# 再 switch_to("direct") 后断言选中 = direct。全程零网络探测。
+# 断言确定性字段：verdict、group_type、初始/切换后选中 tag。
+[when]
+command = "cargo run --quiet -p nexus --example proxy_selector_group -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "group_type"
+equals = "selector"
+
+[[expect]]
+field = "initial_selected"
+equals = "direct"
+
+[[expect]]
+field = "after_switch_to_relay"
+equals = "relay"
+
+[[expect]]
+field = "after_switch_back"
+equals = "direct"
+
+[[expect]]
+field = "candidate_count"
+equals = 2

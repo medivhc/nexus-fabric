@@ -53,6 +53,8 @@ dependencies = [
  "nexus-planner",
  "nexus-platform",
  "nexus-policy",
+ "nexus-proxy",
+ "nexus-proxy-config",
  "nexus-registry",
  "nexus-service",
  "nexus-session",
@@ -232,6 +234,20 @@ dependencies = [
 
 [[package]]
 name = "nexus-proto"
+version = "0.1.0"
+
+[[package]]
+name = "nexus-proxy"
+version = "0.1.0"
+dependencies = [
+ "nexus-connectivity",
+ "nexus-domain",
+ "nexus-measurement",
+ "nexus-proxy-config",
+]
+
+[[package]]
+name = "nexus-proxy-config"
 version = "0.1.0"
 
 [[package]]

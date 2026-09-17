@@ -168,3 +168,68 @@ platform capabilities
 关键用户可见 Capability 原则上至少需要一条 E4 Product Scenario 或 E5 External Observation 证据。
 
 代码存在、单元测试通过、Agent 声称完成、README 标记完成，都不是最终完成判据。
+
+## 11. 代理内核 / Rule-Based Routing Proxy {#11-proxy-kernel}
+
+在既有「远程资源访问闭环」（§6）之外，新增一条独立产品线：规则分流代理内核
+（参考 meow-rs / sing-box 机制）。该产品线不修改 §2 Network / InternetAccess 的
+既有语义，不污染已冻结的远程闭环 E4 场景。
+
+P0 最小闭环：
+
+```text
+SOCKS5 入站（复用 nexus-ingress 状态机）
+  -> RuleSet 静态规则表（顺序匹配）
+  -> rule_action 动作链（第一动作选定出站 tag）
+  -> 策略组（selector 手动 / urltest 按 measurement 自动选优）
+  -> Direct / Relay 出站（复用 nexus-connectivity LinkActivator）
+  -> 配置层 YAML -> typed structs（Nexus 首个配置入口）
+```
+
+### 11.1 用户可观察语义
+
+- 系统从 YAML 配置文件加载入站监听、规则表、策略组与出站定义；解析失败必须
+  返回结构化配置错误（`CONFIG_INVALID`），不得静默回退默认。
+- SOCKS5 入站复用 `nexus-ingress` 的 `Socks5Handshake` 状态机（RFC 1928/1929）；
+  握手完成产出 `FlowContext`（origin=socks5, destination）后进入规则引擎。
+- 规则引擎对每个 FlowContext 按声明顺序匹配静态规则表，首条命中即终止
+  （first-match）。规则类型 P0 冻结为：
+  - `DOMAIN-SUFFIX`：目的域名等于或以 `.` 拼接规则后缀结尾；
+  - `DOMAIN`：目的域名精确匹配；
+  - `IP-CIDR`：目的为 IP literal 且落在 CIDR 网段内；
+  - `MATCH`：兜底规则（必须存在于规则表末尾，匹配一切未命中流量）。
+- 每条规则命中后产出 `rule_action` 动作链（有序动作列表）。P0 冻结第一动作
+  为 `SELECT_OUTBOUND <tag>`（选定出站或策略组 tag）；动作链为日后 DNS hijack /
+  route-options 等后置扩展留口，但 P0 不实现额外动作类型。
+- 策略组：
+  - `selector`：手动指定候选出站 tag 列表，当前选中项可经 API 切换；切换为
+    确定性操作（不发起网络探测）。
+  - `urltest`：对候选出站执行 measurement（复用 `nexus-planner` 的 measurement
+    选择与 `nexus-connectivity` 的 `LinkProbe`），按离线可复现的确定性数据
+    （注入 mock measurement）选择延迟最低候选；P0 禁止真实网络探测。
+- 出站：
+  - `Direct`：直连，复用 `nexus-connectivity` 的 Direct 链路激活；
+  - `Relay`：进程内中继转发，复用 `nexus-connectivity` 的 Relay 链路激活；
+    P0 不实现真实加密代理协议栈。
+- 每次分流决策必须可观察：命中规则名、规则类型、选定出站 tag、策略组类型、
+  动作链首动作。
+
+### 11.2 P0 明确不做（不得写进本期 expectation）
+
+以下为 P1+ 展望，本期契约不承诺、不冻结为 expectation：
+
+- 真实加密代理协议栈（Shadowsocks / Vmess / Trojan / Hysteria2）；
+- TUN 透明代理 / Virtual Packet Interface 全局拦截；
+- Clash 订阅 YAML 在线解析与自动更新；
+- LoadBalance / Relay 链式策略组（多跳）；
+- DNS 多 server 规则路由（DNS hijack 仅在动作链模型中留口，不在 P0 实现）。
+
+### 11.3 失败语义
+
+```text
+CONFIG_INVALID              YAML 解析失败 / 规则表无 MATCH 兜底 / 出站 tag 悬空
+NO_MATCH_RULE               规则表缺 MATCH 兜底且流量未命中任何具体规则
+OUTBOUND_TAG_UNRESOLVED     动作链选定的出站或策略组 tag 不存在
+SELECTOR_EMPTY              selector 策略组候选列表为空
+URLTEST_NO_VALID_CANDIDATE  urltest 组所有候选均无有效 measurement
+```

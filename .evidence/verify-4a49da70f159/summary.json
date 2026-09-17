@@ -1,0 +1,21 @@
+{
+  "bindings": {
+    "configuration_digest": "4c650a3bb170619ae70e90e49d699b8408bce9ca",
+    "contract_hash": "e7204bb0cc84bcd8973455a0c52ffa188d786f0c",
+    "dirty_state": true,
+    "feature_set": [
+      "workspace:default"
+    ],
+    "harness_schema_version": 1,
+    "platform_capability_digest": "1bf5ebe28eab776674d87e5d5770d3266aaa7d89",
+    "source_revision": "ccfb261a14cb5efb5c6afaecf034eec614c105fb",
+    "target_triple": "x86_64-pc-windows-msvc",
+    "toolchain_version": "1.95.0",
+    "working_tree_digest": "5bea99492e41e6a6b69f94c16c21bb71cf308609"
+  },
+  "command": "verify",
+  "id": "4a49da70f159",
+  "message": "bindings changed since this evidence was produced; refresh with nexus-harness verify",
+  "schema_version": 1,
+  "verdict": "STALE"
+}

@@ -1,0 +1,43 @@
+schema_version = 1
+id = "product.proxy-socks5-domain-rule-forward"
+title = "SOCKS5 CONNECT 命中 DOMAIN-SUFFIX 规则 -> 走 direct 出站"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-proxy-kernel"
+
+[given]
+inbound = "socks5 (reuse nexus-ingress Socks5Handshake)"
+rule_table = "static ordered: DOMAIN-SUFFIX example.com -> direct; MATCH -> fallback"
+flow = "CONNECT mail.example.com:443"
+matching = "first-match wins"
+
+# 可执行 E4：组合根 example 驱动 SOCKS5 握手完成（复用 nexus-ingress），
+# 经 RuleEngine 对 FlowContext 执行顺序匹配；mail.example.com 命中
+# DOMAIN-SUFFIX example.com 规则，动作链首动作 SELECT_OUTBOUND 指向 direct 出站。
+# 断言确定性字段：verdict、flow_origin、matched_rule、rule_kind、
+# selected_outbound_tag。禁止断言时序/外部资源。
+[when]
+command = "cargo run --quiet -p nexus --example proxy_socks5_domain_rule -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "flow_origin"
+equals = "socks5"
+
+[[expect]]
+field = "matched_rule"
+equals = "rule-example-suffix"
+
+[[expect]]
+field = "rule_kind"
+equals = "domain_suffix"
+
+[[expect]]
+field = "selected_outbound_tag"
+equals = "direct"
+
+[[expect]]
+field = "first_action"
+equals = "select_outbound"

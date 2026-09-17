@@ -14,6 +14,8 @@ nexus-control-api = { path = "../../crates/nexus-control-api" }
 # 依赖边仍由 policies/architecture.toml 约束，app 不在该约束的 crates/ 集合内）。
 nexus-domain = { path = "../../crates/nexus-domain" }
 nexus-ingress = { path = "../../crates/nexus-ingress" }
+nexus-proxy-config = { path = "../../crates/nexus-proxy-config" }
+nexus-proxy = { path = "../../crates/nexus-proxy" }
 nexus-policy = { path = "../../crates/nexus-policy" }
 nexus-registry = { path = "../../crates/nexus-registry" }
 nexus-measurement = { path = "../../crates/nexus-measurement" }
