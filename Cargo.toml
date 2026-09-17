@@ -10,6 +10,8 @@ members = [
   "crates/nexus-discovery",
   "crates/nexus-connectivity",
   "crates/nexus-ingress",
+  "crates/nexus-proxy-config",
+  "crates/nexus-proxy",
   "crates/nexus-dns",
   "crates/nexus-policy",
   "crates/nexus-auth",
