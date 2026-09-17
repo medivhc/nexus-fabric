@@ -15,7 +15,7 @@
   },
   "command": "verify",
   "id": "4a49da70f159",
-  "message": "full verify: 1 gate(s) failed: product-scenarios",
+  "message": "bindings changed since this evidence was produced; refresh with nexus-harness verify",
   "schema_version": 1,
-  "verdict": "FAIL"
+  "verdict": "STALE"
 }
