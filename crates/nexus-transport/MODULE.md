@@ -49,6 +49,7 @@
 - `pub struct FrameStream`：帧流。
   - `pub fn send_frame(&mut self, payload: &[u8]) -> Result<(), TransportError>`
   - `pub fn recv_frame(&mut self) -> Result<Vec<u8>, TransportError>`
+  - `pub fn into_raw(self) -> std::net::TcpStream`：取回底层 TCP 流，供真实 relay 双向字节中继使用（新增 API，不改动任何冻结签名与帧协议）。
 - 帧协议冻结：`u32` 大端长度前缀 + payload（空 payload 合法）。
 - `pub enum TransportError { ConnectFailed, Closed, Protocol }`
 

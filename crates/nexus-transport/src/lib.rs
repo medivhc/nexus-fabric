@@ -81,6 +81,12 @@ impl FrameStream {
             .map_err(|_| TransportError::Closed)?;
         Ok(payload)
     }
+
+    /// 取回底层 TCP 流，供真实 relay 双向字节中继使用（帧格式不变，
+    /// 中继对帧字节完全透明）。
+    pub fn into_raw(self) -> TcpStream {
+        self.stream
+    }
 }
 
 /// 建立到远端 Endpoint 的 TCP 连接并封装为长度前缀帧流（冻结契约）。

@@ -1,0 +1,38 @@
+schema_version = 1
+id = "product.observability-workspace-heads"
+title = "§9 可观察性：workspace heads 输出 Head Set 快照（离线分叉可观察）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#9-observability"
+
+[given]
+domain_state = "workspace dag ready (init + two offline commits)"
+observability = "head set snapshot via nexus-workspace DAG"
+
+[when]
+command = "cargo run --quiet -p nexusd -- workspace heads --json"
+
+# 冻结期望：两次离线提交在同一 base 上分叉 -> HeadSet 含两个 Head；
+# 命令以 PASS 完成，不再以 UNSUPPORTED 拒绝（requirement-change：2026-09-18）。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "workspace heads"
+
+[[expect]]
+field = "head_count"
+equals = 2
+
+[[expect]]
+field = "diverge"
+equals = true
+
+[[expect]]
+field = "heads.0"
+non_empty = true
+
+[[expect]]
+field = "heads.1"
+non_empty = true

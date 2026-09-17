@@ -366,6 +366,86 @@ pub fn status() -> Result<Value, NexusError> {
     }))
 }
 
+// ---------- 命令：workspace heads ----------
+
+/// `workspace heads`：在演示工作区上构造离线分叉（两个 Head），输出 Head Set
+/// 快照（挂 nexus-workspace DAG：init -> 两次离线提交 -> HeadSet 分叉）。
+pub fn workspace_heads() -> Result<Value, NexusError> {
+    use nexus_storage::InMemoryContentStore;
+    use nexus_workspace::{Change, Workspace, WorkspaceId};
+
+    let mut ws = Workspace::init(
+        WorkspaceId("ws-observability-1".into()),
+        InMemoryContentStore::new(),
+    )
+    .map_err(|e| NexusError::Internal {
+        message: format!("workspace init failed: {e}"),
+    })?;
+    let base = ws
+        .heads()
+        .heads
+        .first()
+        .cloned()
+        .ok_or_else(|| NexusError::Internal {
+            message: "workspace without base head".into(),
+        })?;
+
+    // 本地节点离线提交 a.txt（替换 Head）。
+    let local = ws
+        .commit_changes(
+            &base,
+            &[Change {
+                path: "a.txt".into(),
+                content: b"local-a".to_vec(),
+            }],
+        )
+        .map_err(|e| NexusError::Internal {
+            message: format!("commit local failed: {e}"),
+        })?;
+
+    // 远端节点离线提交 b.txt（同一 base，HeadSet 分叉 -> {local, remote}）。
+    let remote = ws
+        .commit_changes(
+            &base,
+            &[Change {
+                path: "b.txt".into(),
+                content: b"remote-b".to_vec(),
+            }],
+        )
+        .map_err(|e| NexusError::Internal {
+            message: format!("commit remote failed: {e}"),
+        })?;
+
+    let heads = ws.heads();
+    let head_ids: Vec<String> = heads.heads.iter().map(|h| h.0.clone()).collect();
+    let parents: Vec<String> = head_ids
+        .iter()
+        .map(|id| {
+            ws.commit(&nexus_workspace::CommitId(id.clone()))
+                .map(|c| {
+                    c.parents
+                        .iter()
+                        .map(|p| p.0.clone())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default()
+        })
+        .collect();
+
+    Ok(json!({
+        "verdict": "PASS",
+        "command": "workspace heads",
+        "workspace": "ws-observability-1",
+        "head_count": heads.len(),
+        "diverge": heads.len() > 1,
+        "heads": head_ids,
+        "local_head": local.0,
+        "remote_head": remote.0,
+        "parents": parents,
+    }))
+}
+
 // ---------- 未就绪命令 ----------
 
 /// 领域未就绪命令的显式拒绝（PRODUCT §9：禁止静默降级；apps/nexus MODULE 契约）。

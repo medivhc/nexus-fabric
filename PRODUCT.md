@@ -107,6 +107,7 @@ Resolve -> Plan -> Session -> Connectivity -> Execute -> Observe
 - Connectivity 链路激活按候选顺序执行（v9 §243 P0 子集）：Direct 探测成功即建立直连；Direct 不可达（NAT 场景）时回退 Relay 候选；全部候选不可达返回结构化 `NO_LINK_AVAILABLE`，不替换业务 Provider（由 Core Planner 生成替代 Plan）。P0 的 Relay 为进程内中继转发，中继协议（DERP/自定义）后置。
 - Service、InternetAccess、Compute 与 Workspace 是远程访问的首批资源类型；Workspace 远程语义为远程提交（Node A 经闭环向 Node B 的 Workspace 应用 ChangeSet 并取回新 Head）。
 - 远程闭环同时以两种形态交付：SDK 组合根函数（apps/nexus）与 daemon 单次执行入口（apps/nexusd `run <resource> --json`）；daemon 对未知资源返回结构化拒绝（`UNKNOWN_RESOURCE`，exit 0 = 请求已被处理）。
+- 真实网络交付（real transport）：远端闭环除进程内组合根外，提供真实 TCP 交付形态——提供方 `host` 在真实地址监听并完成**服务端**认证门控（`AUTH` 帧在业务帧前，失败返回 `AUTH_DENIED`）；请求方经静态发现解析真实 Endpoint 后建立真实帧流并执行线上认证；直连不可达时经真实 `relay`（`DIAL` + 字节中继）回退。wire 应用帧（AUTH/AUTH_OK/AUTH_DENIED/CONNECT/READY/ECHO/COMPUTE/RESULT/HTTP/DIAL/RELAY_OK）为应用层协议，传输帧格式仍冻结为 TCP + u32 大端长度前缀。
 
 ## 7. Session 语义
 
@@ -213,6 +214,25 @@ SOCKS5 入站（复用 nexus-ingress 状态机）
     P0 不实现真实加密代理协议栈。
 - 每次分流决策必须可观察：命中规则名、规则类型、选定出站 tag、策略组类型、
   动作链首动作。
+
+### 11.4 真实 SOCKS5 数据面（real socks proxy，2026-09-18）
+
+在 §11 P0 决策内核之外，交付真实 SOCKS5 上网数据面全链路：
+
+```text
+SOCKS5 入站（Socks5Handshake 状态机，真实字节流）
+  -> FlowContext -> 规则路由（§11 纯决策语义，零 I/O）
+  -> Session 双轨（Active -> Disposed，TerminalOutcome 唯一提交）
+  -> 真实出站连接（代理即出口；域名在此真实 DNS 解析后拨号）
+  -> 双向字节中继（客户端 <-> 出站）
+```
+
+- 出站激活从 §11 P0 的 mock `LinkActivator` 提升为真实 `std::net::TcpStream`
+  拨号（Direct 语义）；不引入加密代理协议（与 §11.2 边界一致）。
+- 每次会话必须可观察：握手结果（NO-AUTH 回复）、CONNECT 回复码、命中规则、
+  选定出站 tag、Session phase/outcome、双向中继字节数。
+- E4 场景：`scenarios/product/daemon_real_socks_proxy_flow.toml`（本地 HTTP 目标
+  + 原始 SOCKS5 客户端经代理真实往返 HTTP 200）。
 
 ### 11.2 P0 明确不做（不得写进本期 expectation）
 

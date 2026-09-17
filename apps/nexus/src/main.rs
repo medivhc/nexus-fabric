@@ -1,13 +1,15 @@
 //! nexus — 用户 CLI 前端。
 //!
 //! 仅负责：参数解析 → 构造 `ControlCommand` → 调用 `ControlService` → 渲染结构化输出。
-//! 可复用核心逻辑必须下沉到对应 crate；本 app 承担前端与 Composition Root 角色。
+//! 已就绪命令直接路由到 `nexus::observability` SDK 快照（与 nexusd 同源，不复制领域逻辑）；
+//! 未就绪命令返回结构化 `Unsupported`（PRODUCT §9 禁止静默降级）。
 
 #![forbid(unsafe_code)]
 
 use nexus_control_api::{
     ControlCommand, ControlOutput, ControlService, NexusError, ResourceId, SessionId, StatusView,
 };
+use serde_json::Value;
 
 const USAGE: &str = "\
 nexus — Nexus 统一 Resource Fabric 控制面 CLI
@@ -34,6 +36,10 @@ nexus — Nexus 统一 Resource Fabric 控制面 CLI
   diagnose                                统一诊断
   platform capabilities                   平台能力清单
   help / --help                           显示本帮助
+
+说明: status / plan explain / session watch / connectivity status / dns status /
+      dns cache / workspace heads / platform capabilities 已路由到 SDK 可观察性快照；
+      其余命令在领域实现就绪前返回显式 UNSUPPORTED。
 ";
 
 fn main() {
@@ -57,7 +63,7 @@ fn run(args: &[String]) -> i32 {
         }
     };
 
-    let service = BootstrapControlService;
+    let service = CliControlService;
     match service.execute(command) {
         Ok(output) => {
             for line in output.to_lines() {
@@ -136,53 +142,59 @@ fn parse_command(args: &[String]) -> Result<ControlCommand, String> {
     }
 }
 
-/// Composition Root 的最小 ControlService：领域实现尚未就绪的命令返回
-/// 结构化 `Unsupported`（PRODUCT §7 禁止静默改变语义）。
-struct BootstrapControlService;
+/// 渲染 SDK 可观察性 JSON 为结构化行（pretty JSON）。
+fn json_to_lines(json: &Value) -> Vec<String> {
+    serde_json::to_string_pretty(json)
+        .map(|s| s.lines().map(str::to_string).collect())
+        .unwrap_or_else(|_| vec![json.to_string()])
+}
 
-impl ControlService for BootstrapControlService {
+/// Composition Root 的 ControlService：已就绪命令路由到 `nexus::observability`
+/// 快照（与 nexusd 同源）；未就绪命令返回结构化 `Unsupported`。
+struct CliControlService;
+
+impl ControlService for CliControlService {
     fn execute(&self, command: ControlCommand) -> Result<ControlOutput, NexusError> {
-        match command {
-            ControlCommand::Status => Ok(ControlOutput::Status(StatusView {
-                lines: vec![
-                    "nexus control plane: contract bootstrap".into(),
-                    "domain runtimes not yet implemented; use 'plan explain' etc. once available"
-                        .into(),
-                ],
-            })),
-            ControlCommand::PlanExplain { .. } => Err(NexusError::Unsupported {
-                feature: "plan explain (planner not yet implemented)".into(),
-            }),
-            ControlCommand::SessionWatch { .. } => Err(NexusError::Unsupported {
-                feature: "session watch (session runtime not yet implemented)".into(),
-            }),
-            ControlCommand::ConnectivityStatus
-            | ControlCommand::ConnectivityCandidates
+        let json = match command {
+            ControlCommand::Status => nexus::observability::status()?,
+            ControlCommand::PlanExplain { .. } => nexus::observability::plan_explain()?,
+            ControlCommand::SessionWatch { .. } => nexus::observability::session_watch()?,
+            ControlCommand::ConnectivityStatus => nexus::observability::connectivity_status()?,
+            ControlCommand::DnsStatus => nexus::observability::dns_status()?,
+            ControlCommand::DnsCache => nexus::observability::dns_cache()?,
+            ControlCommand::WorkspaceHeads { .. } => nexus::observability::workspace_heads()?,
+            ControlCommand::PlatformCapabilities => nexus::observability::platform_capabilities()?,
+            ControlCommand::ConnectivityCandidates
             | ControlCommand::ConnectivityProbe { .. }
-            | ControlCommand::ConnectivityLinks => Err(NexusError::Unsupported {
-                feature: "connectivity observability (connectivity not yet implemented)".into(),
-            }),
-            ControlCommand::DnsStatus
-            | ControlCommand::DnsResolve { .. }
-            | ControlCommand::DnsProviders
-            | ControlCommand::DnsCache => Err(NexusError::Unsupported {
-                feature: "dns observability (dns not yet implemented)".into(),
-            }),
-            ControlCommand::WorkspaceHeads { .. }
-            | ControlCommand::WorkspaceConflicts { .. }
-            | ControlCommand::WorkspaceCache { .. } => Err(NexusError::Unsupported {
-                feature: "workspace observability (workspace not yet implemented)".into(),
-            }),
-            ControlCommand::ComputeJobs => Err(NexusError::Unsupported {
-                feature: "compute jobs (compute not yet implemented)".into(),
-            }),
-            ControlCommand::Diagnose => Err(NexusError::Unsupported {
-                feature: "diagnose (diagnostics not yet implemented)".into(),
-            }),
-            ControlCommand::PlatformCapabilities => Err(NexusError::Unsupported {
-                feature: "platform capabilities (platform adapters not yet implemented)".into(),
-            }),
-        }
+            | ControlCommand::ConnectivityLinks => {
+                return Err(NexusError::Unsupported {
+                    feature: "connectivity candidates/probe/links (domain state not ready)".into(),
+                });
+            }
+            ControlCommand::DnsResolve { .. } | ControlCommand::DnsProviders => {
+                return Err(NexusError::Unsupported {
+                    feature: "dns resolve/providers (domain state not ready)".into(),
+                });
+            }
+            ControlCommand::WorkspaceConflicts { .. } | ControlCommand::WorkspaceCache { .. } => {
+                return Err(NexusError::Unsupported {
+                    feature: "workspace conflicts/cache (domain state not ready)".into(),
+                });
+            }
+            ControlCommand::ComputeJobs => {
+                return Err(NexusError::Unsupported {
+                    feature: "compute jobs (domain state not ready)".into(),
+                });
+            }
+            ControlCommand::Diagnose => {
+                return Err(NexusError::Unsupported {
+                    feature: "diagnose (domain state not ready)".into(),
+                });
+            }
+        };
+        Ok(ControlOutput::Status(StatusView {
+            lines: json_to_lines(&json),
+        }))
     }
 }
 
@@ -242,7 +254,7 @@ mod tests {
 
     #[test]
     fn status_output_is_structured() {
-        let out = BootstrapControlService
+        let out = CliControlService
             .execute(ControlCommand::Status)
             .expect("status must not fail");
         assert!(matches!(out, ControlOutput::Status(_)));
@@ -250,10 +262,35 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_command_returns_structured_error() {
-        let err = BootstrapControlService
-            .execute(ControlCommand::PlanExplain {
+    fn ready_commands_route_to_sdk_snapshots() {
+        for cmd in [
+            ControlCommand::Status,
+            ControlCommand::PlanExplain {
                 resource: ResourceId("net".into()),
+            },
+            ControlCommand::SessionWatch {
+                session: SessionId("sess-1".into()),
+            },
+            ControlCommand::ConnectivityStatus,
+            ControlCommand::DnsStatus,
+            ControlCommand::DnsCache,
+            ControlCommand::WorkspaceHeads {
+                workspace: "ws1".into(),
+            },
+            ControlCommand::PlatformCapabilities,
+        ] {
+            assert!(
+                CliControlService.execute(cmd).is_ok(),
+                "ready command must route to sdk snapshot"
+            );
+        }
+    }
+
+    #[test]
+    fn not_ready_command_returns_structured_error() {
+        let err = CliControlService
+            .execute(ControlCommand::WorkspaceConflicts {
+                workspace: "ws1".into(),
             })
             .expect_err("must be unsupported");
         assert!(matches!(err, NexusError::Unsupported { .. }));

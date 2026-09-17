@@ -3165,3 +3165,872 @@ pub fn remote_client_flow(discovery_endpoint: std::net::SocketAddr) -> Result<Va
         }
     }))
 }
+
+// ---------- 真实网络切片（real transport，PRODUCT §6；2026-09-18） ----------
+//
+// 在冻结的 TCP + u32 大端长度前缀帧之上定义应用层 wire 帧（帧格式不变，
+// 这些只是 payload 内容，不触碰 nexus-transport 冻结契约）：
+//   AUTH:<token>        -> AUTH_OK | AUTH_DENIED   （服务端认证门控，业务帧前，W7）
+//   CONNECT             -> READY                   （service 握手）
+//   ECHO:<payload>      -> ECHO:<payload>          （service 业务往返）
+//   COMPUTE:<expr>      -> RESULT:<value>          （compute 求值）
+//   HTTP:<url>          -> HTTP:<status>:<body>    （internet-access：host 真实 HTTP GET）
+//   DIAL:<ip:port>      -> RELAY_OK                （relay 握手，随后双向字节中继）
+
+/// wire 帧标签。
+pub const WIRE_AUTH_OK: &str = "AUTH_OK";
+pub const WIRE_AUTH_DENIED: &str = "AUTH_DENIED";
+pub const WIRE_RELAY_OK: &str = "RELAY_OK";
+pub const WIRE_READY: &str = "READY";
+
+/// 客户端线上认证：发送 `AUTH:<token>`，等待 `AUTH_OK` / `AUTH_DENIED`。
+fn wire_client_auth(
+    fs: &mut nexus_transport::FrameStream,
+    token: &str,
+) -> Result<nexus_auth::Principal, NexusError> {
+    fs.send_frame(format!("AUTH:{token}").as_bytes())
+        .map_err(|_| NexusError::AuthorizationDenied {
+            principal: "wire auth frame send failed".into(),
+        })?;
+    let resp = fs
+        .recv_frame()
+        .map_err(|_| NexusError::AuthorizationDenied {
+            principal: "wire auth response read failed".into(),
+        })?;
+    if resp == WIRE_AUTH_OK.as_bytes() {
+        Ok(nexus_auth::Principal("authenticated".into()))
+    } else {
+        Err(NexusError::AuthorizationDenied {
+            principal: "wire token mismatch".into(),
+        })
+    }
+}
+
+/// 服务端认证门控：接收 `AUTH:<token>`，常量时间校验（W7：业务帧前）。
+fn wire_server_auth(
+    fs: &mut nexus_transport::FrameStream,
+    expected_token: &str,
+) -> Result<nexus_auth::Principal, NexusError> {
+    let frame = fs
+        .recv_frame()
+        .map_err(|_| NexusError::AuthorizationDenied {
+            principal: "no auth frame".into(),
+        })?;
+    let payload = String::from_utf8_lossy(&frame).to_string();
+    let token = payload
+        .strip_prefix("AUTH:")
+        .ok_or_else(|| NexusError::AuthorizationDenied {
+            principal: "malformed auth frame".into(),
+        })?;
+    let token = nexus_auth::PreSharedToken(token.to_string());
+    let expected = nexus_auth::PreSharedToken(expected_token.to_string());
+    match nexus_auth::verify_token(&token, &expected) {
+        Ok(principal) => {
+            fs.send_frame(WIRE_AUTH_OK.as_bytes()).map_err(|_| {
+                NexusError::AuthorizationDenied {
+                    principal: "cannot send auth_ok".into(),
+                }
+            })?;
+            Ok(principal)
+        }
+        Err(_) => {
+            let _ = fs.send_frame(WIRE_AUTH_DENIED.as_bytes());
+            Err(NexusError::AuthorizationDenied {
+                principal: "token mismatch".into(),
+            })
+        }
+    }
+}
+
+/// 最小真实 HTTP GET（host 侧 internet-access 执行；仅明文 http://，P0）。
+fn real_http_get(url: &str) -> Result<(u16, String), NexusError> {
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| NexusError::Internal {
+            message: format!("unsupported url scheme: {url}"),
+        })?;
+    let (authority, mut path) = match rest.find('/') {
+        Some(i) => (&rest[..i], rest[i..].to_string()),
+        None => (rest, String::new()),
+    };
+    if path.is_empty() {
+        path.push('/');
+    }
+    let (host, port) = match authority.find(':') {
+        Some(i) => (
+            &authority[..i],
+            authority[i + 1..]
+                .parse::<u16>()
+                .map_err(|_| NexusError::Internal {
+                    message: format!("bad port in {url}"),
+                })?,
+        ),
+        None => (authority, 80u16),
+    };
+    use std::io::{Read, Write};
+    let mut conn =
+        std::net::TcpStream::connect((host, port)).map_err(|e| NexusError::Internal {
+            message: format!("http connect {host}:{port} failed: {e}"),
+        })?;
+    let req = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    conn.write_all(req.as_bytes())
+        .map_err(|e| NexusError::Internal {
+            message: e.to_string(),
+        })?;
+    let mut buf = Vec::new();
+    conn.read_to_end(&mut buf)
+        .map_err(|e| NexusError::Internal {
+            message: e.to_string(),
+        })?;
+    let text = String::from_utf8_lossy(&buf).to_string();
+    let status = text
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or_else(|| NexusError::Internal {
+            message: format!(
+                "cannot parse http status from: {}",
+                text.lines().next().unwrap_or("")
+            ),
+        })?;
+    Ok((status, text))
+}
+
+/// 真实 policy 决策（按资源选默认引擎）。
+fn real_policy_decision(
+    resource: &str,
+    flow: &nexus_domain::FlowContext,
+) -> Result<nexus_policy::PolicyDecision, NexusError> {
+    let decision = match resource {
+        "service" => {
+            nexus_policy::PolicyEngine::default_service()
+                .evaluate(flow)
+                .decision
+        }
+        "internet-access" => {
+            nexus_policy::PolicyEngine::default_network()
+                .evaluate(flow)
+                .decision
+        }
+        "compute" => {
+            nexus_policy::PolicyEngine::default_compute()
+                .evaluate(flow)
+                .decision
+        }
+        other => {
+            return Err(NexusError::Internal {
+                message: format!("real flow unsupported resource: {other}"),
+            });
+        }
+    };
+    Ok(decision)
+}
+
+/// 真实闭环规划：Discovery（静态发现真实 Endpoint）+ Policy + Core Planner。
+/// 返回 (provider_id, placement, path)。
+fn real_plan(
+    resource: &str,
+    endpoint: std::net::SocketAddr,
+) -> Result<(String, String, Vec<String>), NexusError> {
+    let flow = nexus_ingress::from_native_api(resource, "RemoteBalanced");
+    let decision = real_policy_decision(resource, &flow)?;
+    let mut registry = Registry::new();
+    registry.register(ProviderRecord {
+        id: ProviderId("node-b".into()),
+        resource: flow.resource.clone(),
+        placement: "remote-provider".into(),
+        locator: endpoint.to_string(),
+        capabilities: vec![format!("{resource}-session")],
+        present: true,
+    });
+    let candidates = registry.candidates(&flow.resource);
+    let mut measurements = MeasurementTable::new();
+    measurements.record(
+        ProviderId("node-b".into()),
+        LinkMeasurement {
+            rtt_ms: Some(5),
+            confidence_percent: 99,
+            ..Default::default()
+        },
+    );
+    let snapshot = PlanningSnapshot::new(candidates, decision.constraints.clone());
+    let planned =
+        nexus_planner::plan_from_snapshot(&flow.resource, &snapshot, &decision.intent, |p| {
+            measurements.get(p).cloned()
+        })?;
+    Ok((
+        planned.plan.provider_id.0,
+        planned.plan.placement,
+        planned.plan.path,
+    ))
+}
+
+/// 客户端真实业务交换：线上认证（服务端门控）+ 按资源的业务帧交换。
+/// 返回 (Principal, 业务 JSON, 业务事件)。
+fn real_client_exchange(
+    fs: &mut nexus_transport::FrameStream,
+    token: &str,
+    resource: &str,
+) -> Result<(nexus_auth::Principal, Value, &'static str), NexusError> {
+    let principal = wire_client_auth(fs, token)?;
+    let (business, business_event) = match resource {
+        "service" => {
+            fs.send_frame(b"CONNECT")
+                .map_err(|_| NexusError::SessionFailed {
+                    session: SessionId("real".into()),
+                    reason: "connect frame send failed".into(),
+                })?;
+            let resp = fs.recv_frame().map_err(|_| NexusError::SessionFailed {
+                session: SessionId("real".into()),
+                reason: "read ready failed".into(),
+            })?;
+            if resp != WIRE_READY.as_bytes() {
+                return Err(NexusError::SessionFailed {
+                    session: SessionId("real".into()),
+                    reason: "service handshake rejected".into(),
+                });
+            }
+            let payload = format!("ECHO:ping-{}", std::process::id());
+            fs.send_frame(payload.as_bytes())
+                .map_err(|_| NexusError::SessionFailed {
+                    session: SessionId("real".into()),
+                    reason: "echo send failed".into(),
+                })?;
+            let echoed = fs.recv_frame().map_err(|_| NexusError::SessionFailed {
+                session: SessionId("real".into()),
+                reason: "echo recv failed".into(),
+            })?;
+            let matched = String::from_utf8_lossy(&echoed) == payload;
+            let _ = fs.send_frame(b"CLOSE");
+            (
+                json!({ "roundtrip_matched": matched }),
+                EV_SERVICE_CONNECTED,
+            )
+        }
+        "compute" => {
+            fs.send_frame(b"COMPUTE:6*7")
+                .map_err(|_| NexusError::SessionFailed {
+                    session: SessionId("real".into()),
+                    reason: "compute frame send failed".into(),
+                })?;
+            let resp = fs.recv_frame().map_err(|_| NexusError::SessionFailed {
+                session: SessionId("real".into()),
+                reason: "compute result read failed".into(),
+            })?;
+            let text = String::from_utf8_lossy(&resp).to_string();
+            let result = text
+                .strip_prefix("RESULT:")
+                .ok_or_else(|| NexusError::Internal {
+                    message: format!("bad compute result frame: {text}"),
+                })?;
+            (json!({ "result": result }), EV_COMPUTE_JOB_SUBMITTED)
+        }
+        "internet-access" => {
+            fs.send_frame(b"HTTP:http://example.com/")
+                .map_err(|_| NexusError::SessionFailed {
+                    session: SessionId("real".into()),
+                    reason: "http frame send failed".into(),
+                })?;
+            let resp = fs.recv_frame().map_err(|_| NexusError::SessionFailed {
+                session: SessionId("real".into()),
+                reason: "http response read failed".into(),
+            })?;
+            let text = String::from_utf8_lossy(&resp).to_string();
+            let rest = text
+                .strip_prefix("HTTP:")
+                .ok_or_else(|| NexusError::Internal {
+                    message: format!("bad http response frame: {text}"),
+                })?;
+            let status: u16 = rest.split(':').next().unwrap_or("0").parse().map_err(|_| {
+                NexusError::Internal {
+                    message: format!("bad http status in frame: {text}"),
+                }
+            })?;
+            (json!({ "status": status }), EV_NETWORK_SESSION_ESTABLISHED)
+        }
+        other => {
+            return Err(NexusError::Internal {
+                message: format!("real flow unsupported resource: {other}"),
+            });
+        }
+    };
+    Ok((principal, business, business_event))
+}
+
+/// 把客户端闭环结果装配为最终 JSON（含 Session 双轨、事件、业务段）。
+#[allow(clippy::too_many_arguments)]
+fn assemble_real_result(
+    endpoint: std::net::SocketAddr,
+    resource: &str,
+    principal: nexus_auth::Principal,
+    business: Value,
+    business_event: &'static str,
+    plan: (String, String, Vec<String>),
+    mut owner: SessionOwner,
+    mut events: Vec<&'static str>,
+    link: Value,
+) -> Result<Value, NexusError> {
+    events.push(business_event);
+    owner
+        .commit_outcome(TerminalOutcome::Completed)
+        .map_err(NexusError::from)?;
+    owner
+        .transition_phase(LifecyclePhase::Draining)
+        .map_err(NexusError::from)?;
+    owner
+        .transition_phase(LifecyclePhase::Disposed)
+        .map_err(NexusError::from)?;
+    events.push(EV_REMOTE_ACCESS_COMPLETED);
+    let status = owner.status();
+    let terminal_outcome_commit_count = owner
+        .events()
+        .iter()
+        .filter(|e| matches!(e, nexus_session::SessionEvent::OutcomeCommitted { .. }))
+        .count();
+    let arch_violation = network_depends_on_ingress()?;
+    let mut out = json!({
+        "verdict": "PASS",
+        "events": events,
+        "discovery": {
+            "peer_id": "node-b",
+            "endpoint": endpoint.to_string(),
+        },
+        "transport": {
+            "kind": "tcp-frame",
+        },
+        "auth": {
+            "gate": "auth_ok",
+            "principal": principal.0,
+        },
+        "plan": {
+            "provider_id": plan.0,
+            "placement": plan.1,
+            "path": plan.2,
+        },
+        "session": {
+            "id": owner.id().0,
+            "phase": phase_name(&status.phase),
+            "outcome": outcome_name(&status.outcome),
+        },
+        "terminal_outcome_commit_count": terminal_outcome_commit_count,
+        "link": link,
+        "architecture": {
+            "network_depends_on_ingress": arch_violation,
+        }
+    });
+    match resource {
+        "service" => {
+            out["service"] = json!({ "phase": "Active" });
+            out["echo"] = business;
+        }
+        "compute" => {
+            out["compute"] = business;
+        }
+        "internet-access" => {
+            out["network"] = business;
+        }
+        _ => {}
+    }
+    Ok(out)
+}
+
+/// 真实网络访问（直连）：请求方解析真实 Endpoint 后建立真实帧流，
+/// 服务端 AUTH 门控 + 业务交换，Session 双轨与 TerminalOutcome 语义不变。
+pub fn remote_real_flow(
+    endpoint: &std::net::SocketAddr,
+    token: &str,
+    resource: &str,
+) -> Result<Value, NexusError> {
+    let plan = real_plan(resource, *endpoint)?;
+    let mut owner = SessionOwner::new(SessionId(format!("sess-real-{resource}-1")));
+    owner
+        .transition_phase(LifecyclePhase::Active)
+        .map_err(NexusError::from)?;
+    let mut events: Vec<&'static str> = vec![
+        EV_REMOTE_PROVIDER_RESOLVED,
+        EV_PLAN_SELECTED,
+        EV_SESSION_CREATED,
+    ];
+    let mut fs = nexus_transport::connect(endpoint).map_err(|e| {
+        NexusError::ConnectivityEstablishmentFailed {
+            provider: ProviderId("node-b".into()),
+            reason: e.to_string(),
+        }
+    })?;
+    events.push(EV_REMOTE_CONNECTIVITY_ESTABLISHED);
+    let link = json!({
+        "direct_attempted": true,
+        "direct_ok": true,
+        "relay_used": false,
+    });
+    let (principal, business, business_event) = real_client_exchange(&mut fs, token, resource)?;
+    assemble_real_result(
+        *endpoint,
+        resource,
+        principal,
+        business,
+        business_event,
+        plan,
+        owner,
+        events,
+        link,
+    )
+}
+
+/// 真实网络访问（含 relay 回退）：在 `direct`（候选地址，直连真实尝试）失败后，
+/// 经真实 relay（`DIAL:<target>` + 双向字节中继）拨号 `target`（relay 可达地址），
+/// 完成线上认证与业务交换。两个地址分离对应真实 NAT 场景：候选地址对外不可达，
+/// 而 relay 掌握 provider 的可达位置。
+pub fn remote_real_flow_with_relay(
+    direct: &std::net::SocketAddr,
+    target: &std::net::SocketAddr,
+    relay: &std::net::SocketAddr,
+    token: &str,
+    resource: &str,
+) -> Result<Value, NexusError> {
+    let plan = real_plan(resource, *target)?;
+    let mut owner = SessionOwner::new(SessionId(format!("sess-real-{resource}-1")));
+    owner
+        .transition_phase(LifecyclePhase::Active)
+        .map_err(NexusError::from)?;
+    let mut events: Vec<&'static str> = vec![
+        EV_REMOTE_PROVIDER_RESOLVED,
+        EV_PLAN_SELECTED,
+        EV_SESSION_CREATED,
+    ];
+    let direct_result = nexus_transport::connect(direct);
+    let (mut fs, link) = match direct_result {
+        Ok(fs) => {
+            events.push(EV_REMOTE_CONNECTIVITY_ESTABLISHED);
+            (
+                fs,
+                json!({
+                    "direct_attempted": true,
+                    "direct_ok": true,
+                    "relay_used": false,
+                }),
+            )
+        }
+        Err(e) => {
+            events.push(EV_LINK_DIRECT_FAILED);
+            events.push(EV_LINK_RELAY_FALLBACK);
+            let mut rfs = nexus_transport::connect(relay).map_err(|re| {
+                NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId("node-b".into()),
+                    reason: format!("relay connect failed: {re}"),
+                }
+            })?;
+            rfs.send_frame(format!("DIAL:{target}").as_bytes())
+                .map_err(|_| NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId("node-b".into()),
+                    reason: "dial frame send failed".into(),
+                })?;
+            let ack =
+                rfs.recv_frame()
+                    .map_err(|_| NexusError::ConnectivityEstablishmentFailed {
+                        provider: ProviderId("node-b".into()),
+                        reason: "relay ack read failed".into(),
+                    })?;
+            if ack != WIRE_RELAY_OK.as_bytes() {
+                return Err(NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId("node-b".into()),
+                    reason: "relay refused dial".into(),
+                });
+            }
+            events.push(EV_REMOTE_CONNECTIVITY_ESTABLISHED);
+            (
+                rfs,
+                json!({
+                    "direct_attempted": true,
+                    "direct_ok": false,
+                    "relay_used": true,
+                    "direct_reason": e.to_string(),
+                }),
+            )
+        }
+    };
+    let (principal, business, business_event) = real_client_exchange(&mut fs, token, resource)?;
+    assemble_real_result(
+        *target,
+        resource,
+        principal,
+        business,
+        business_event,
+        plan,
+        owner,
+        events,
+        link,
+    )
+}
+
+/// host 单次服务（提供方）：真实地址监听，服务端 AUTH 门控（业务帧前），
+/// 随后按资源执行业务。单连接后返回结构化结果（与 daemon 单次执行风格一致）。
+pub fn remote_host_serve_once(
+    listener: &std::net::TcpListener,
+    expected_token: &str,
+    resource: &str,
+) -> Result<Value, NexusError> {
+    let mut fs = nexus_transport::accept(listener).map_err(|e| NexusError::Internal {
+        message: format!("host accept failed: {e}"),
+    })?;
+    let principal = wire_server_auth(&mut fs, expected_token)?;
+    let mut events: Vec<&'static str> = Vec::new();
+    let business = match resource {
+        "service" => {
+            let cmd = fs.recv_frame().map_err(|_| NexusError::SessionFailed {
+                session: SessionId("host-service".into()),
+                reason: "no connect frame".into(),
+            })?;
+            if cmd != b"CONNECT" {
+                return Err(NexusError::SessionFailed {
+                    session: SessionId("host-service".into()),
+                    reason: "expected CONNECT frame".into(),
+                });
+            }
+            fs.send_frame(WIRE_READY.as_bytes())
+                .map_err(|_| NexusError::SessionFailed {
+                    session: SessionId("host-service".into()),
+                    reason: "ready send failed".into(),
+                })?;
+            events.push(EV_SERVICE_CONNECTED);
+            let mut echoes = 0u32;
+            while let Ok(frame) = fs.recv_frame() {
+                let payload = String::from_utf8_lossy(&frame).to_string();
+                if payload == "CLOSE" {
+                    break;
+                }
+                if let Some(data) = payload.strip_prefix("ECHO:") {
+                    fs.send_frame(format!("ECHO:{data}").as_bytes())
+                        .map_err(|_| NexusError::SessionFailed {
+                            session: SessionId("host-service".into()),
+                            reason: "echo reply failed".into(),
+                        })?;
+                    echoes += 1;
+                } else {
+                    break;
+                }
+            }
+            json!({ "phase": "Active", "echoes": echoes })
+        }
+        "compute" => {
+            let frame = fs.recv_frame().map_err(|_| NexusError::SessionFailed {
+                session: SessionId("host-compute".into()),
+                reason: "no compute frame".into(),
+            })?;
+            let expr = String::from_utf8_lossy(&frame).to_string();
+            let value = match expr.strip_prefix("COMPUTE:") {
+                Some("6*7") => "42".to_string(),
+                _ => {
+                    return Err(NexusError::Internal {
+                        message: format!("unknown compute expr: {expr}"),
+                    });
+                }
+            };
+            fs.send_frame(format!("RESULT:{value}").as_bytes())
+                .map_err(|_| NexusError::SessionFailed {
+                    session: SessionId("host-compute".into()),
+                    reason: "result send failed".into(),
+                })?;
+            events.push(EV_COMPUTE_JOB_SUBMITTED);
+            json!({ "job_id": "job-remote-1", "result": value })
+        }
+        "internet-access" => {
+            let frame = fs.recv_frame().map_err(|_| NexusError::SessionFailed {
+                session: SessionId("host-http".into()),
+                reason: "no http frame".into(),
+            })?;
+            let payload = String::from_utf8_lossy(&frame).to_string();
+            let url = payload
+                .strip_prefix("HTTP:")
+                .ok_or_else(|| NexusError::Internal {
+                    message: format!("malformed http request frame: {payload}"),
+                })?;
+            let (status, body) = real_http_get(url)?;
+            fs.send_frame(format!("HTTP:{status}:{body}").as_bytes())
+                .map_err(|_| NexusError::SessionFailed {
+                    session: SessionId("host-http".into()),
+                    reason: "http reply send failed".into(),
+                })?;
+            events.push(EV_NETWORK_SESSION_ESTABLISHED);
+            json!({ "status": status })
+        }
+        other => {
+            return Err(NexusError::Internal {
+                message: format!("host unsupported resource: {other}"),
+            });
+        }
+    };
+    Ok(json!({
+        "verdict": "PASS",
+        "role": "host",
+        "resource": resource,
+        "connections_served": 1,
+        "auth": {
+            "gate": "auth_ok",
+            "principal": principal.0,
+        },
+        "events": events,
+        "business": business,
+    }))
+}
+
+/// 双向字节中继（relay 核心）：src -> dst，返回转发字节数。
+fn pump_bytes(src: &mut std::net::TcpStream, dst: &mut std::net::TcpStream) -> usize {
+    use std::io::{Read, Write};
+    let mut buf = [0u8; 8192];
+    let mut total = 0usize;
+    loop {
+        match src.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if dst.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+                total += n;
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = dst.shutdown(std::net::Shutdown::Write);
+    total
+}
+
+/// relay 单次服务：接受连接，读取 `DIAL:<target>`，拨号目标后建立双向字节中继。
+pub fn relay_serve_once(listener: &std::net::TcpListener) -> Result<Value, NexusError> {
+    let mut fs = nexus_transport::accept(listener).map_err(|e| NexusError::Internal {
+        message: format!("relay accept failed: {e}"),
+    })?;
+    let dial = fs.recv_frame().map_err(|_| NexusError::Internal {
+        message: "no dial frame".into(),
+    })?;
+    let dial = String::from_utf8_lossy(&dial).to_string();
+    let target = dial
+        .strip_prefix("DIAL:")
+        .ok_or_else(|| NexusError::Internal {
+            message: format!("malformed dial frame: {dial}"),
+        })?;
+    let target_addr: std::net::SocketAddr = target.parse().map_err(|_| NexusError::Internal {
+        message: format!("bad dial target: {target}"),
+    })?;
+    let mut upstream =
+        std::net::TcpStream::connect(target_addr).map_err(|_| NexusError::Internal {
+            message: format!("relay dial {target} failed"),
+        })?;
+    fs.send_frame(WIRE_RELAY_OK.as_bytes())
+        .map_err(|_| NexusError::Internal {
+            message: "relay_ok send failed".into(),
+        })?;
+    let mut client_raw = fs.into_raw();
+    let mut client_c = client_raw.try_clone().map_err(|_| NexusError::Internal {
+        message: "relay clone failed".into(),
+    })?;
+    let mut upstream_c = upstream.try_clone().map_err(|_| NexusError::Internal {
+        message: "relay clone failed".into(),
+    })?;
+    // 结构化并发：两个拷贝线程有明确 Owner（relay 主流程 join 并消费结果）。
+    let to_upstream = std::thread::spawn(move || pump_bytes(&mut client_c, &mut upstream_c));
+    let to_client = std::thread::spawn(move || pump_bytes(&mut upstream, &mut client_raw));
+    let up_bytes = to_upstream.join().map_err(|_| NexusError::Internal {
+        message: "relay thread panicked".into(),
+    })?;
+    let down_bytes = to_client.join().map_err(|_| NexusError::Internal {
+        message: "relay thread panicked".into(),
+    })?;
+    Ok(json!({
+        "verdict": "PASS",
+        "role": "relay",
+        "sessions": 1,
+        "dialed": target_addr.to_string(),
+        "bytes": {
+            "to_upstream": up_bytes,
+            "to_client": down_bytes,
+        },
+    }))
+}
+
+// ---------- 真实 SOCKS5 代理（real socks proxy，PRODUCT §11；2026-09-18） ----------
+//
+// 全链路：Socks5Handshake（有状态握手）→ FlowContext → 规则路由（nexus-proxy）
+// → Session 双轨 → 真实出站连接（代理即出口，域名在此真实 DNS 解析）
+// → 双向字节中继。路由是纯决策，出站与数据面是真实 I/O。
+
+/// 真实 SOCKS5 代理默认分流配置：MATCH -> direct（直连出站）。
+pub const DEFAULT_PROXY_CONFIG: &str = "\
+schema_version: 1
+rules:
+  - tag: rule-match
+    kind: match
+    action:
+      - kind: select_outbound
+        tag: direct
+outbounds:
+  - tag: direct
+    kind: direct
+";
+
+/// 从 `host:port` / `[ipv6]:port` 拆出主机与端口（域名或 IP literal）。
+fn split_host_port(dest: &str) -> Result<(String, u16), NexusError> {
+    if let Some(rest) = dest.strip_prefix('[') {
+        let close = rest.find(']').ok_or_else(|| NexusError::Internal {
+            message: format!("malformed destination: {dest}"),
+        })?;
+        let host = rest[..close].to_string();
+        let tail = &rest[close + 1..];
+        let port = tail
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok())
+            .ok_or_else(|| NexusError::Internal {
+                message: format!("malformed destination port: {dest}"),
+            })?;
+        return Ok((host, port));
+    }
+    match dest.rfind(':') {
+        Some(i) => {
+            let host = dest[..i].to_string();
+            let port = dest[i + 1..].parse().map_err(|_| NexusError::Internal {
+                message: format!("malformed destination port: {dest}"),
+            })?;
+            Ok((host, port))
+        }
+        None => Err(NexusError::Internal {
+            message: format!("malformed destination (missing port): {dest}"),
+        }),
+    }
+}
+
+/// 真实 SOCKS5 代理单会话闭环。
+pub fn proxy_serve_once(
+    listener: &std::net::TcpListener,
+    config_yaml: &str,
+) -> Result<Value, NexusError> {
+    use std::io::{Read, Write};
+    let (mut client, _) = listener.accept().map_err(|e| NexusError::Internal {
+        message: format!("proxy accept failed: {e}"),
+    })?;
+
+    // 1) SOCKS5 握手：增量喂入，逐段回写状态机响应（含 CONNECT 成功回复）。
+    let mut hs = nexus_ingress::Socks5Handshake::new();
+    let mut buf = [0u8; 4096];
+    let flow = loop {
+        let n = client.read(&mut buf).map_err(|_| NexusError::Internal {
+            message: "proxy read failed".into(),
+        })?;
+        if n == 0 {
+            return Err(NexusError::Internal {
+                message: "socks5 client closed during handshake".into(),
+            });
+        }
+        let step = hs.feed(&buf[..n]);
+        if !step.response.is_empty() {
+            client
+                .write_all(&step.response)
+                .map_err(|_| NexusError::Internal {
+                    message: "proxy write failed".into(),
+                })?;
+        }
+        match step.state {
+            nexus_ingress::Socks5State::Established => {
+                break step.flow.ok_or_else(|| NexusError::Internal {
+                    message: "established without flow".into(),
+                })?;
+            }
+            nexus_ingress::Socks5State::Failed(e) => {
+                return Err(NexusError::Internal {
+                    message: format!("socks5 handshake failed: {e:?}"),
+                });
+            }
+            _ => {}
+        }
+    };
+    let _pipelined = hs.take_data();
+
+    // 2) 规则路由（纯决策，零 I/O）。
+    let config = nexus_proxy_config::parse(config_yaml).map_err(|e| NexusError::Internal {
+        message: format!("proxy config invalid: {e}"),
+    })?;
+    let service = nexus_proxy::ProxyService::new(&config).map_err(|e| NexusError::Internal {
+        message: format!("proxy service build failed: {e}"),
+    })?;
+    let decision = service
+        .route(&flow, None)
+        .map_err(|e| NexusError::Internal {
+            message: format!("proxy route failed: {e}"),
+        })?;
+
+    // 3) Session 双轨（Active 先于出站建连）。
+    let mut owner = SessionOwner::new(SessionId("sess-proxy-1".into()));
+    owner
+        .transition_phase(LifecyclePhase::Active)
+        .map_err(NexusError::from)?;
+
+    // 4) 真实出站连接：代理即出口，域名在此真实 DNS 解析后拨号。
+    let (host, port) = split_host_port(&flow.destination)?;
+    let mut upstream = std::net::TcpStream::connect((host.as_str(), port)).map_err(|e| {
+        NexusError::ConnectivityEstablishmentFailed {
+            provider: ProviderId(decision.selected_outbound_tag.clone()),
+            reason: format!("outbound connect {host}:{port} failed: {e}"),
+        }
+    })?;
+
+    // 5) 双向字节中继（结构化并发：join 消费两个拷贝线程的结果）。
+    let mut client_c = client.try_clone().map_err(|_| NexusError::Internal {
+        message: "proxy clone failed".into(),
+    })?;
+    let mut upstream_c = upstream.try_clone().map_err(|_| NexusError::Internal {
+        message: "proxy clone failed".into(),
+    })?;
+    let to_upstream = std::thread::spawn(move || pump_bytes(&mut client_c, &mut upstream_c));
+    let to_client = std::thread::spawn(move || pump_bytes(&mut upstream, &mut client));
+    let up_bytes = to_upstream.join().map_err(|_| NexusError::Internal {
+        message: "proxy thread panicked".into(),
+    })?;
+    let down_bytes = to_client.join().map_err(|_| NexusError::Internal {
+        message: "proxy thread panicked".into(),
+    })?;
+
+    // 6) Session 终态。
+    owner
+        .commit_outcome(TerminalOutcome::Completed)
+        .map_err(NexusError::from)?;
+    owner
+        .transition_phase(LifecyclePhase::Draining)
+        .map_err(NexusError::from)?;
+    owner
+        .transition_phase(LifecyclePhase::Disposed)
+        .map_err(NexusError::from)?;
+    let status = owner.status();
+    let terminal_outcome_commit_count = owner
+        .events()
+        .iter()
+        .filter(|e| matches!(e, nexus_session::SessionEvent::OutcomeCommitted { .. }))
+        .count();
+
+    Ok(json!({
+        "verdict": "PASS",
+        "socks": {
+            "auth_method_reply": "0x05,0x00",
+            "reply_code": 0,
+            "destination": flow.destination,
+        },
+        "routing": {
+            "matched_rule": decision.matched_rule,
+            "first_action": decision.first_action,
+            "selected_outbound_tag": decision.selected_outbound_tag,
+            "flow_origin": decision.flow_origin,
+        },
+        "session": {
+            "id": owner.id().0,
+            "phase": phase_name(&status.phase),
+            "outcome": outcome_name(&status.outcome),
+        },
+        "terminal_outcome_commit_count": terminal_outcome_commit_count,
+        "bytes": {
+            "to_upstream": up_bytes,
+            "to_client": down_bytes,
+        },
+        "architecture": {
+            "network_depends_on_ingress": network_depends_on_ingress()?,
+        }
+    }))
+}

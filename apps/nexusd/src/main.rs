@@ -7,7 +7,13 @@ use serde_json::Value;
 /// nexusd：桌面/服务端主 Runtime Composition Root。
 ///
 /// 用法：
-///   nexusd run <service|internet-access|compute> [--json]
+///   nexusd run <service|internet-access|compute> [--json]          -> 进程内组合根闭环
+///   nexusd run <resource> --endpoint <ip:port> [--relay <ip:port>]
+///              [--direct <ip:port>] [--token <t>] --json            -> 真实网络访问（real transport）
+///   nexusd host <service|internet-access|compute> --addr <ip:port>
+///              [--token <t>]                                       -> 提供方：服务端 AUTH 门控 + 业务
+///   nexusd relay --addr <ip:port>                                  -> 真实 relay：DIAL + 字节中继
+///   nexusd proxy --addr <ip:port> [--config <path>]                -> 真实 SOCKS5 数据面
 ///   nexusd run <unknown> --json            -> 结构化拒绝（UNKNOWN_RESOURCE，exit 0）
 ///   nexusd status --json                   -> §9 可观察性总览
 ///   nexusd dns status --json / dns cache --json
@@ -22,14 +28,20 @@ use serde_json::Value;
 /// `nexus` SDK 组合根函数，不复制领域逻辑。无效 CLI 用法 exit 非 0。
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.as_slice() {
-        [verb, resource, flag] if verb == "run" && flag == "--json" => run_resource(resource),
-        [verb, resource] if verb == "run" => run_resource(resource),
+    match args.first().map(String::as_str) {
+        Some("run") => run_resource(&args[1..]),
+        Some("host") => host_resource(&args[1..]),
+        Some("relay") => relay_resource(&args[1..]),
+        Some("proxy") => proxy_resource(&args[1..]),
         // §9 可观察性子命令：首个 token 命中即路由（透传完整命令，含 verb）。
-        [verb, ..] if is_observability_verb(verb) => dispatch_observability(&args),
+        Some(verb) if is_observability_verb(verb) => dispatch_observability(&args),
         _ => {
             eprintln!(
                 "usage: nexusd run <service|internet-access|compute> [--json] | \
+                 nexusd run <resource> --endpoint <ip:port> [--relay <ip:port>] [--direct <ip:port>] [--token <t>] --json | \
+                 nexusd host <resource> --addr <ip:port> [--token <t>] | \
+                 nexusd relay --addr <ip:port> | \
+                 nexusd proxy --addr <ip:port> [--config <path>] | \
                  <status|dns|session|connectivity|plan|platform> ... --json"
             );
             ExitCode::FAILURE
@@ -53,6 +65,25 @@ fn is_observability_verb(verb: &str) -> bool {
     )
 }
 
+/// 解析 `--flag <value>` / `--flag`（布尔）形式；非 flag token 忽略。
+fn parse_flags(args: &[String]) -> std::collections::HashMap<String, Option<String>> {
+    let mut map = std::collections::HashMap::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg.starts_with("--") {
+            if let Some(value) = args.get(i + 1).filter(|v| !v.starts_with("--")) {
+                map.insert(arg.clone(), Some(value.clone()));
+                i += 2;
+                continue;
+            }
+            map.insert(arg.clone(), None);
+        }
+        i += 1;
+    }
+    map
+}
+
 /// 路由 §9 可观察性子命令到 SDK `observability` 模块。
 fn dispatch_observability(args: &[String]) -> ExitCode {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -64,6 +95,7 @@ fn dispatch_observability(args: &[String]) -> ExitCode {
         ["connectivity", "status", "--json"] => nexus::observability::connectivity_status(),
         ["plan", "explain", "--json"] => nexus::observability::plan_explain(),
         ["platform", "capabilities", "--json"] => nexus::observability::platform_capabilities(),
+        ["workspace", "heads", "--json"] => nexus::observability::workspace_heads(),
         // 领域未就绪命令：显式 UNSUPPORTED（禁止静默降级，exit 0 = 请求已被处理）。
         cmd => {
             let name = cmd
@@ -81,23 +113,233 @@ fn dispatch_observability(args: &[String]) -> ExitCode {
     print_json_result(result)
 }
 
-/// 路由资源名到 SDK 组合根闭环，并包装 daemon 入口元数据。
-fn run_resource(resource: &str) -> ExitCode {
-    let result: Result<Value, _> = match resource {
-        "service" => nexus::remote_service_access_flow().map(|v| enrich("service", v)),
-        "internet-access" => {
-            nexus::remote_internet_access_flow().map(|v| enrich("internet-access", v))
+/// 路由资源名到 SDK 组合根闭环；带 `--endpoint` 时走真实网络访问（real transport）。
+fn run_resource(args: &[String]) -> ExitCode {
+    let Some(resource) = args.first() else {
+        eprintln!(
+            "usage: nexusd run <service|internet-access|compute> [--endpoint <ip:port>] [--relay <ip:port>] [--token <t>] [--json]"
+        );
+        return ExitCode::FAILURE;
+    };
+    let flags = parse_flags(args);
+    let result: Result<Value, String> = match flags.get("--endpoint").and_then(|v| v.as_deref()) {
+        Some(endpoint) => {
+            let endpoint: std::net::SocketAddr = match endpoint.parse() {
+                Ok(a) => a,
+                Err(_) => {
+                    println!(
+                        "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"invalid endpoint {endpoint}\"}}}}"
+                    );
+                    return ExitCode::SUCCESS;
+                }
+            };
+            let token = flags
+                .get("--token")
+                .and_then(|v| v.as_deref())
+                .unwrap_or("nexus-preshared-token")
+                .to_string();
+            match flags.get("--relay").and_then(|v| v.as_deref()) {
+                Some(relay) => {
+                    let relay: std::net::SocketAddr = match relay.parse() {
+                        Ok(a) => a,
+                        Err(_) => {
+                            println!(
+                                "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"invalid relay {relay}\"}}}}"
+                            );
+                            return ExitCode::SUCCESS;
+                        }
+                    };
+                    // 直连候选：默认等于 endpoint；真实 NAT 场景下候选与 relay 可达地址不同。
+                    let direct: std::net::SocketAddr = match flags
+                        .get("--direct")
+                        .and_then(|v| v.as_deref())
+                    {
+                        Some(raw) => match raw.parse() {
+                            Ok(a) => a,
+                            Err(_) => {
+                                println!(
+                                    "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"invalid direct {raw}\"}}}}"
+                                );
+                                return ExitCode::SUCCESS;
+                            }
+                        },
+                        None => endpoint,
+                    };
+                    nexus::remote_real_flow_with_relay(&direct, &endpoint, &relay, &token, resource)
+                        .map(|v| enrich("real-transport", v))
+                        .map_err(|e| e.to_string())
+                }
+                None => nexus::remote_real_flow(&endpoint, &token, resource)
+                    .map(|v| enrich("real-transport", v))
+                    .map_err(|e| e.to_string()),
+            }
         }
-        "compute" => nexus::remote_compute_job_flow().map(|v| enrich("compute", v)),
-        other => {
-            // 未知资源：结构化拒绝（exit 0 = 请求已被 daemon 处理，拒绝也是处理结果）。
+        None => match resource.as_str() {
+            "service" => nexus::remote_service_access_flow()
+                .map(|v| enrich("service", v))
+                .map_err(|e| e.to_string()),
+            "internet-access" => nexus::remote_internet_access_flow()
+                .map(|v| enrich("internet-access", v))
+                .map_err(|e| e.to_string()),
+            "compute" => nexus::remote_compute_job_flow()
+                .map(|v| enrich("compute", v))
+                .map_err(|e| e.to_string()),
+            other => {
+                // 未知资源：结构化拒绝（exit 0 = 请求已被 daemon 处理，拒绝也是处理结果）。
+                println!(
+                    "{{\"verdict\":\"REJECTED\",\"error\":{{\"code\":\"UNKNOWN_RESOURCE\",\"resource\":\"{other}\"}},\"daemon\":{{\"entry\":\"nexusd\"}}}}"
+                );
+                return ExitCode::SUCCESS;
+            }
+        },
+    };
+    print_json_result(result)
+}
+
+/// 提供方入口：真实地址监听，服务端 AUTH 门控 + 按资源执行业务（单连接）。
+fn host_resource(args: &[String]) -> ExitCode {
+    let Some(resource) = args.first() else {
+        eprintln!(
+            "usage: nexusd host <service|internet-access|compute> --addr <ip:port> [--token <t>]"
+        );
+        return ExitCode::FAILURE;
+    };
+    let flags = parse_flags(args);
+    let addr: std::net::SocketAddr = match flags.get("--addr").and_then(|v| v.as_deref()) {
+        Some(raw) => match raw.parse() {
+            Ok(a) => a,
+            Err(_) => {
+                println!(
+                    "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"invalid addr {raw}\"}}}}"
+                );
+                return ExitCode::SUCCESS;
+            }
+        },
+        None => match "127.0.0.1:8787".parse() {
+            Ok(a) => a,
+            Err(_) => return ExitCode::FAILURE,
+        },
+    };
+    let token = flags
+        .get("--token")
+        .and_then(|v| v.as_deref())
+        .unwrap_or("nexus-preshared-token")
+        .to_string();
+    let result: Result<Value, String> = (|| {
+        let listener =
+            std::net::TcpListener::bind(addr).map_err(|e| format!("bind {addr} failed: {e}"))?;
+        nexus::remote_host_serve_once(&listener, &token, resource).map_err(|e| e.to_string())
+    })();
+    print_json_result(result.map(|v| {
+        let mut json = v;
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert(
+                "daemon".into(),
+                serde_json::json!({
+                    "entry": "nexusd",
+                    "command": "host",
+                    "resource": resource,
+                    "addr": addr.to_string(),
+                }),
+            );
+        }
+        json
+    }))
+}
+
+/// relay 入口：真实监听，DIAL + 双向字节中继（单会话）。
+fn relay_resource(args: &[String]) -> ExitCode {
+    let flags = parse_flags(args);
+    let addr: std::net::SocketAddr = match flags.get("--addr").and_then(|v| v.as_deref()) {
+        Some(raw) => match raw.parse() {
+            Ok(a) => a,
+            Err(_) => {
+                println!(
+                    "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"invalid addr {raw}\"}}}}"
+                );
+                return ExitCode::SUCCESS;
+            }
+        },
+        None => match "127.0.0.1:8788".parse() {
+            Ok(a) => a,
+            Err(_) => return ExitCode::FAILURE,
+        },
+    };
+    let result: Result<Value, String> = (|| {
+        let listener =
+            std::net::TcpListener::bind(addr).map_err(|e| format!("bind {addr} failed: {e}"))?;
+        nexus::relay_serve_once(&listener).map_err(|e| e.to_string())
+    })();
+    print_json_result(result.map(|v| {
+        let mut json = v;
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert(
+                "daemon".into(),
+                serde_json::json!({
+                    "entry": "nexusd",
+                    "command": "relay",
+                    "addr": addr.to_string(),
+                }),
+            );
+        }
+        json
+    }))
+}
+
+/// 真实 SOCKS5 数据面入口：监听后逐会话完成握手 → 规则路由 → Session →
+/// 真实出站 → 字节中继；每会话输出一条结构化 JSON（Ctrl-C 停止）。
+fn proxy_resource(args: &[String]) -> ExitCode {
+    let flags = parse_flags(args);
+    let addr: std::net::SocketAddr = match flags.get("--addr").and_then(|v| v.as_deref()) {
+        Some(raw) => match raw.parse() {
+            Ok(a) => a,
+            Err(_) => {
+                println!(
+                    "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"invalid addr {raw}\"}}}}"
+                );
+                return ExitCode::SUCCESS;
+            }
+        },
+        None => match "127.0.0.1:1080".parse() {
+            Ok(a) => a,
+            Err(_) => return ExitCode::FAILURE,
+        },
+    };
+    let config_yaml = match flags.get("--config").and_then(|v| v.as_deref()) {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                println!(
+                    "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"read config {path} failed: {e}\"}}}}"
+                );
+                return ExitCode::SUCCESS;
+            }
+        },
+        None => nexus::DEFAULT_PROXY_CONFIG.to_string(),
+    };
+    let listener = match std::net::TcpListener::bind(addr) {
+        Ok(l) => l,
+        Err(e) => {
             println!(
-                "{{\"verdict\":\"REJECTED\",\"error\":{{\"code\":\"UNKNOWN_RESOURCE\",\"resource\":\"{other}\"}},\"daemon\":{{\"entry\":\"nexusd\"}}}}"
+                "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"bind {addr} failed: {e}\"}}}}"
             );
             return ExitCode::SUCCESS;
         }
     };
-    print_json_result(result)
+    println!(
+        "{{\"verdict\":\"READY\",\"daemon\":{{\"entry\":\"nexusd\",\"command\":\"proxy\",\"addr\":\"{addr}\"}}}}"
+    );
+    // 服务循环：逐会话阻塞 accept；每会话独立闭环（结构化并发：会话内线程 join）。
+    loop {
+        match nexus::proxy_serve_once(&listener, &config_yaml) {
+            Ok(json) => println!("{json}"),
+            Err(e) => {
+                println!(
+                    "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"{e}\"}}}}"
+                );
+            }
+        }
+    }
 }
 
 /// 在 SDK 输出的 JSON 对象上附加 daemon 入口元数据（场景断言 daemon.entry / daemon.resource）。

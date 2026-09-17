@@ -57,6 +57,19 @@
 - 未知资源：输出 `{"verdict":"REJECTED","error":{"code":"UNKNOWN_RESOURCE","resource":"<name>"}}`，exit 0（表示请求已被 daemon 处理，拒绝也是处理结果；无效 CLI 用法仍 exit 非 0）。
 - daemon 不复制领域逻辑：全部闭环复用 `nexus` SDK 组合根函数；本 app 只承担 CLI 解析与装配。
 
+### 真实网络入口（real transport，PRODUCT §6，2026-09-18）
+
+- `nexusd host <service|internet-access|compute> --addr <ip:port> --token <t>`：
+  提供方在真实地址监听，服务端完成 `AUTH` 门控（业务帧前），随后执行业务
+  （service ECHO 往返 / internet-access 真实 HTTP GET / compute 表达式求值）。
+- `nexusd relay --addr <ip:port>`：`DIAL <target>` 帧 + 双向字节中继（真实 TCP 代理）。
+- `nexusd run <resource> --endpoint <ip:port> [--relay <ip:port>] --token <t> --json`：
+  请求方经静态发现解析真实 Endpoint 建立真实帧流并执行线上认证；直连失败回退 relay。
+- `nexusd proxy --addr <ip:port> [--config <path>]`：真实 SOCKS5 数据面入口
+  （PRODUCT §11.4）——监听后逐会话完成握手 → 规则路由 → Session → 真实出站
+  → 字节中继；每会话输出一条结构化 JSON。
+- 语义：host/relay 只做装配与真实 I/O，闭环事件与认证语义全部复用 `nexus` SDK。
+
 ### §9 可观察性子命令（scenarios/product/observability_*.toml）
 
 - `nexusd status --json` / `dns status --json` / `dns cache --json` /

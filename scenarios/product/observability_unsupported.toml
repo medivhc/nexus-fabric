@@ -5,11 +5,11 @@ evidence_strength = "E4"
 requirement = "PRODUCT.md#9-observability"
 
 [given]
-domain_state = "workspace heads not ready"
+domain_state = "workspace conflicts not ready"
 no_silent_degradation = "explicit UNSUPPORTED error, exit 0"
 
 [when]
-command = "cargo run --quiet -p nexusd -- workspace heads --json"
+command = "cargo run --quiet -p nexusd -- workspace conflicts --json"
 
 [[expect]]
 field = "verdict"
@@ -21,4 +21,4 @@ equals = "UNSUPPORTED"
 
 [[expect]]
 field = "error.command"
-equals = "workspace heads"
+equals = "workspace conflicts"
