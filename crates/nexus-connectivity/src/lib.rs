@@ -54,6 +54,11 @@ pub enum ConnectivityError {
     },
     /// 输入无效（承载/平台层校验失败）。
     Invalid { message: String },
+    /// 所有候选链路均不可达（不替换业务 Provider，由 Core Planner 生成替代 Plan）。
+    NoLinkAvailable {
+        /// 已尝试的候选类型（按激活顺序）。
+        attempted: Vec<LinkKind>,
+    },
 }
 
 impl core::fmt::Display for ConnectivityError {
@@ -72,6 +77,15 @@ impl core::fmt::Display for ConnectivityError {
                 write!(f, "connectivity io error during {operation}: {message}")
             }
             Self::Invalid { message } => write!(f, "connectivity invalid input: {message}"),
+            Self::NoLinkAvailable { attempted } => write!(
+                f,
+                "no link available after attempting: {}",
+                attempted
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         }
     }
 }
@@ -335,6 +349,178 @@ fn map_platform_error(e: PlatformError) -> ConnectivityError {
             operation: "lookup".to_string(),
             message: format!("not found: {key}"),
         },
+    }
+}
+
+// ---------- 链路激活：Direct -> Relay Fallback（v9 §239/§243 P0 子集） ----------
+
+/// 候选链路类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LinkKind {
+    /// 直连（LAN / IPv6 / Public Endpoint）。
+    Direct,
+    /// 经中继（DERP 类）。NAT 场景回退路径。
+    Relay,
+}
+
+impl core::fmt::Display for LinkKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Direct => f.write_str("direct"),
+            Self::Relay => f.write_str("relay"),
+        }
+    }
+}
+
+/// 领域中立候选链路（激活顺序输入，v9 §239：成本/可达性用于选择）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkCandidate {
+    /// 候选类型。
+    pub kind: LinkKind,
+    /// 出口 locator。
+    pub locator: String,
+    /// 预估建连成本（毫秒；由 Evaluation 输入，激活器只做顺序决策）。
+    pub setup_cost_ms: u64,
+}
+
+impl LinkCandidate {
+    /// 构造候选链路。
+    #[must_use]
+    pub fn new(kind: LinkKind, locator: impl Into<String>, setup_cost_ms: u64) -> Self {
+        Self {
+            kind,
+            locator: locator.into(),
+            setup_cost_ms,
+        }
+    }
+}
+
+/// 候选可达性探测（由 Composition Root 以真实 I/O 实现；Connectivity 只做策略编排，零 I/O）。
+pub trait LinkProbe {
+    /// 探测候选可达性；`Ok(())` 表示可达，`Err(reason)` 保留失败原因。
+    fn probe(&self, candidate: &LinkCandidate) -> Result<(), String>;
+}
+
+/// 链路激活过程事件（Worker 只发事件，不直接修改 Owner Outcome）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkActivationEvent {
+    /// 开始尝试某类候选。
+    Attempting { kind: LinkKind, locator: String },
+    /// 该候选不可达（保留原因，供 explain/replay）。
+    AttemptFailed {
+        kind: LinkKind,
+        locator: String,
+        reason: String,
+    },
+    /// 选中并建立某类链路。
+    Established { kind: LinkKind, locator: String },
+}
+
+/// 链路激活结果：选中链路 + 完整事件序列（可重放、可 explain）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkSelection {
+    /// 最终选中链路类型。
+    pub kind: LinkKind,
+    /// 选中链路的 locator（物理建连目标）。
+    pub locator: String,
+    /// 完整激活事件序列。
+    pub events: Vec<LinkActivationEvent>,
+}
+
+/// 链路激活器：按 v9 §243 激活顺序（Direct -> Relay Fallback）决策。
+///
+/// 规则：
+/// 1. 认证门控（W12）：`require_authenticated` 且未认证 -> `AuthenticationRequired`，
+///    在任何探测之前拦截（未认证零探测、零发送）；
+/// 2. Direct 探测成功 -> 选中 Direct；
+/// 3. Direct 失败且提供 Relay 候选 -> 尝试 Relay；成功 -> 选中 Relay；
+/// 4. 全部失败 -> `NoLinkAvailable { attempted }`（不替换业务 Provider）。
+pub struct LinkActivator<P: LinkProbe> {
+    probe: P,
+}
+
+impl<P: LinkProbe> LinkActivator<P> {
+    /// 注入可达性探测（真实 I/O 由组合根提供）。
+    #[must_use]
+    pub fn new(probe: P) -> Self {
+        Self { probe }
+    }
+
+    /// 按序激活候选链路并返回选中结果。
+    ///
+    /// `direct` 必须存在；`relay` 为可选回退候选（NAT 场景提供）。
+    pub fn activate(
+        &self,
+        direct: &LinkCandidate,
+        relay: Option<&LinkCandidate>,
+        require_authenticated: bool,
+        authenticated: bool,
+    ) -> Result<LinkSelection, ConnectivityError> {
+        if require_authenticated && !authenticated {
+            return Err(ConnectivityError::AuthenticationRequired {
+                locator: direct.locator.clone(),
+            });
+        }
+
+        let mut events = Vec::new();
+
+        // 1) Direct
+        events.push(LinkActivationEvent::Attempting {
+            kind: LinkKind::Direct,
+            locator: direct.locator.clone(),
+        });
+        match self.probe.probe(direct) {
+            Ok(()) => {
+                events.push(LinkActivationEvent::Established {
+                    kind: LinkKind::Direct,
+                    locator: direct.locator.clone(),
+                });
+                return Ok(LinkSelection {
+                    kind: LinkKind::Direct,
+                    locator: direct.locator.clone(),
+                    events,
+                });
+            }
+            Err(reason) => {
+                events.push(LinkActivationEvent::AttemptFailed {
+                    kind: LinkKind::Direct,
+                    locator: direct.locator.clone(),
+                    reason,
+                });
+            }
+        }
+
+        // 2) Relay fallback
+        let mut attempted = vec![LinkKind::Direct];
+        if let Some(relay) = relay {
+            events.push(LinkActivationEvent::Attempting {
+                kind: LinkKind::Relay,
+                locator: relay.locator.clone(),
+            });
+            match self.probe.probe(relay) {
+                Ok(()) => {
+                    events.push(LinkActivationEvent::Established {
+                        kind: LinkKind::Relay,
+                        locator: relay.locator.clone(),
+                    });
+                    return Ok(LinkSelection {
+                        kind: LinkKind::Relay,
+                        locator: relay.locator.clone(),
+                        events,
+                    });
+                }
+                Err(reason) => {
+                    attempted.push(LinkKind::Relay);
+                    events.push(LinkActivationEvent::AttemptFailed {
+                        kind: LinkKind::Relay,
+                        locator: relay.locator.clone(),
+                        reason,
+                    });
+                }
+            }
+        }
+
+        Err(ConnectivityError::NoLinkAvailable { attempted })
     }
 }
 
@@ -604,5 +790,133 @@ mod tests {
             message: "bad frame".into(),
         });
         assert!(matches!(err, ConnectivityError::Invalid { .. }));
+    }
+    // ---------- Link Activator ----------
+
+    /// 可编程探测替身：按候选类型返回预置结果。
+    struct MockProbe {
+        results: std::collections::HashMap<LinkKind, Result<(), String>>,
+    }
+
+    impl MockProbe {
+        fn new(results: std::collections::HashMap<LinkKind, Result<(), String>>) -> Self {
+            Self { results }
+        }
+    }
+
+    impl LinkProbe for MockProbe {
+        fn probe(&self, candidate: &LinkCandidate) -> Result<(), String> {
+            self.results
+                .get(&candidate.kind)
+                .cloned()
+                .unwrap_or_else(|| Err("no result configured".into()))
+        }
+    }
+
+    fn candidate(kind: LinkKind, locator: &str) -> LinkCandidate {
+        LinkCandidate::new(kind, locator, 10)
+    }
+
+    #[test]
+    fn direct_ok_selects_direct_without_probing_relay() {
+        let mut results = std::collections::HashMap::new();
+        results.insert(LinkKind::Direct, Ok(()));
+        // Relay 无结果配置：若被探测将失败，用于验证未被触碰。
+        let activator = LinkActivator::new(MockProbe::new(results));
+        let direct = candidate(LinkKind::Direct, "edge-a.exit");
+        let relay = candidate(LinkKind::Relay, "relay-a.exit");
+        let sel = activator
+            .activate(&direct, Some(&relay), false, false)
+            .expect("direct ok");
+        assert_eq!(sel.kind, LinkKind::Direct);
+        assert_eq!(sel.locator, "edge-a.exit");
+        assert_eq!(sel.events.len(), 2); // Attempting + Established
+        assert!(matches!(
+            sel.events.last(),
+            Some(LinkActivationEvent::Established {
+                kind: LinkKind::Direct,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn direct_fail_relay_ok_selects_relay() {
+        let mut results = std::collections::HashMap::new();
+        results.insert(LinkKind::Direct, Err("nat unreachable".into()));
+        results.insert(LinkKind::Relay, Ok(()));
+        let activator = LinkActivator::new(MockProbe::new(results));
+        let direct = candidate(LinkKind::Direct, "10.0.0.5:4242");
+        let relay = candidate(LinkKind::Relay, "relay-a.exit");
+        let sel = activator
+            .activate(&direct, Some(&relay), false, false)
+            .expect("relay ok");
+        assert_eq!(sel.kind, LinkKind::Relay);
+        assert_eq!(sel.locator, "relay-a.exit");
+        // Attempting Direct, AttemptFailed Direct, Attempting Relay, Established Relay
+        assert_eq!(sel.events.len(), 4);
+        assert!(matches!(
+            sel.events[1],
+            LinkActivationEvent::AttemptFailed { kind: LinkKind::Direct, ref reason, .. } if reason == "nat unreachable"
+        ));
+        assert!(matches!(
+            sel.events.last(),
+            Some(LinkActivationEvent::Established {
+                kind: LinkKind::Relay,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn direct_fail_no_relay_is_no_link_available() {
+        let mut results = std::collections::HashMap::new();
+        results.insert(LinkKind::Direct, Err("connection refused".into()));
+        let activator = LinkActivator::new(MockProbe::new(results));
+        let direct = candidate(LinkKind::Direct, "10.0.0.5:4242");
+        let err = activator
+            .activate(&direct, None, false, false)
+            .expect_err("must fail");
+        match err {
+            ConnectivityError::NoLinkAvailable { attempted } => {
+                assert_eq!(attempted, vec![LinkKind::Direct]);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn both_fail_is_no_link_available_with_full_attempt_list() {
+        let mut results = std::collections::HashMap::new();
+        results.insert(LinkKind::Direct, Err("nat unreachable".into()));
+        results.insert(LinkKind::Relay, Err("relay down".into()));
+        let activator = LinkActivator::new(MockProbe::new(results));
+        let direct = candidate(LinkKind::Direct, "10.0.0.5:4242");
+        let relay = candidate(LinkKind::Relay, "relay-a.exit");
+        let err = activator
+            .activate(&direct, Some(&relay), false, false)
+            .expect_err("must fail");
+        match err {
+            ConnectivityError::NoLinkAvailable { attempted } => {
+                assert_eq!(attempted, vec![LinkKind::Direct, LinkKind::Relay]);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_gate_blocks_before_any_probe() {
+        let mut results = std::collections::HashMap::new();
+        results.insert(LinkKind::Direct, Ok(()));
+        let activator = LinkActivator::new(MockProbe::new(results));
+        let direct = candidate(LinkKind::Direct, "edge-a.exit");
+        let relay = candidate(LinkKind::Relay, "relay-a.exit");
+        let err = activator
+            .activate(&direct, Some(&relay), true, false)
+            .expect_err("auth must gate");
+        assert!(matches!(
+            err,
+            ConnectivityError::AuthenticationRequired { ref locator } if locator == "edge-a.exit"
+        ));
     }
 }

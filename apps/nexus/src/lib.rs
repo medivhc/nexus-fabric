@@ -468,6 +468,12 @@ pub const EV_WORKSPACE_COMMIT_APPLIED: &str = "workspace_commit_applied";
 pub const EV_WORKSPACE_COMMIT_REJECTED: &str = "workspace_commit_rejected";
 /// 事件名：动态 Presence 解析失败（PeerExpired/PeerUnknown，未进入 Plan/Session）。
 pub const EV_PRESENCE_RESOLUTION_FAILED: &str = "presence_resolution_failed";
+/// 事件名：链路激活 Direct 候选探测失败（NAT 不可达）。
+pub const EV_LINK_DIRECT_FAILED: &str = "link_direct_failed";
+/// 事件名：链路激活回退到 Relay 中继（Direct 失败后选中 Relay）。
+pub const EV_LINK_RELAY_FALLBACK: &str = "link_relay_fallback";
+/// 事件名：链路激活 Relay 候选探测失败（无可用中继）。
+pub const EV_LINK_RELAY_FAILED: &str = "link_relay_failed";
 /// 事件名：远程网络认证门控拒绝（W7：未认证帧不得进入业务处理）。
 pub const EV_NETWORK_AUTH_REJECTED: &str = "network_auth_rejected";
 /// 事件名：远程资源访问闭环完成（Owner 已提交终态并排空到 Disposed）。
@@ -543,6 +549,67 @@ impl nexus_workspace::WorkspaceTransport for FrameStreamAdapter {
 ///
 /// 进程内双节点模拟：Node B 在回环端口监听并提供服务握手（CONNECT -> READY），
 /// Node A 通过真实 TCP 长度前缀帧流访问。确定性、可重放。
+/// 真实 TCP 可达性探测（Composition Root 注入 `LinkProbe`；Connectivity 层零 I/O）。
+///
+/// 对候选 locator 发起带超时的 TCP 连接尝试；成功即可达（连接随即释放），
+/// 失败保留结构化原因（如 `connection refused`，模拟 NAT 阻塞/端口不可达）。
+struct TcpProbe;
+
+impl nexus_connectivity::LinkProbe for TcpProbe {
+    fn probe(&self, candidate: &nexus_connectivity::LinkCandidate) -> Result<(), String> {
+        let addr: std::net::SocketAddr = candidate
+            .locator
+            .parse()
+            .map_err(|e| format!("invalid locator: {e}"))?;
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// 进程内双向帧转发（A <-> B），用于 Node R 中继的两跳路径（A -> R -> B）。
+fn relay_bridge(mut a: std::net::TcpStream, mut b: std::net::TcpStream) {
+    let mut a2 = match a.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let mut b2 = match b.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let a_to_b = std::thread::spawn(move || forward_bytes(&mut a, &mut b));
+    let b_to_a = std::thread::spawn(move || forward_bytes(&mut b2, &mut a2));
+    let _ = a_to_b.join();
+    let _ = b_to_a.join();
+}
+
+/// 单向字节转发循环（EOF/错误即停）。
+fn forward_bytes(r: &mut std::net::TcpStream, w: &mut std::net::TcpStream) {
+    use std::io::{Read, Write};
+    let mut buf = [0u8; 4096];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if w.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// 生成一个"已释放端口"地址（bind 后立即 drop）——用于模拟 NAT 后不可直连
+/// 的 Direct 候选（连接必然被拒，与真实 NAT 外部探测失败同构）。
+fn freed_port_addr() -> std::net::SocketAddr {
+    let tmp = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind temp listener")
+        .local_addr()
+        .expect("local addr");
+    // drop(tmp) 自动发生：端口释放，后续 connect 将得到 ConnectionRefused。
+    tmp
+}
+
 pub fn remote_service_access_flow() -> Result<Value, NexusError> {
     let mut events: Vec<&'static str> = Vec::new();
 
@@ -2206,5 +2273,396 @@ pub fn remote_presence_expired_rollback() -> Result<Value, NexusError> {
         "error": {
             "code": "PEER_EXPIRED",
         }
+    }))
+}
+
+/// 运行一次 NAT 回退闭环（PRODUCT §6）：Node B 位于 NAT 后（Direct 候选 = 已释放
+/// 端口的映射地址，真实探测必然 ConnectionRefused），Node R 为进程内中继
+/// （A<->R<->B 两跳字节转发）。组合根经 `LinkActivator` 按序激活：Direct 探测失败
+/// -> Relay 回退成功 -> 经中继建立帧流 -> 复用 Discovery/Plan/Session/Auth/Service
+/// 完整闭环。
+pub fn remote_nat_relay_fallback_flow() -> Result<Value, NexusError> {
+    let mut events: Vec<&'static str> = Vec::new();
+
+    // 0) Node B（提供方，真实服务端点）：回环监听，完成 Service 握手。
+    let listener_b =
+        std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| NexusError::Internal {
+            message: format!("cannot bind node-b listener: {e}"),
+        })?;
+    let node_b_addr = listener_b.local_addr().map_err(|e| NexusError::Internal {
+        message: format!("cannot read node-b addr: {e}"),
+    })?;
+    let node_b_server = std::thread::spawn(move || {
+        if let Ok(mut fs) = nexus_transport::accept(&listener_b) {
+            if let Ok(frame) = fs.recv_frame() {
+                if frame == b"CONNECT" {
+                    let _ = fs.send_frame(b"READY");
+                }
+            }
+        }
+    });
+
+    // 1) Node R（中继）：回环监听，双向转发（A <-> B）。
+    //    探测连接（TcpProbe 立即 drop）会被识别并丢弃，不转发到 Node B。
+    let relay_listener =
+        std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| NexusError::Internal {
+            message: format!("cannot bind node-r listener: {e}"),
+        })?;
+    let relay_addr = relay_listener
+        .local_addr()
+        .map_err(|e| NexusError::Internal {
+            message: format!("cannot read node-r addr: {e}"),
+        })?;
+    let relay_node = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        loop {
+            let (mut client, _) = match relay_listener.accept() {
+                Ok(pair) => pair,
+                Err(_) => break,
+            };
+            // 丢弃可达性探测连接（立即 EOF）：读首字节，无数据则忽略并继续 accept。
+            let mut first = [0u8; 1];
+            let _ = client.set_read_timeout(Some(std::time::Duration::from_millis(300)));
+            match client.read(&mut first) {
+                Ok(0) | Err(_) => continue,
+                Ok(_) => {}
+            }
+            let _ = client.set_read_timeout(None);
+            // 真实请求连接：建立到 Node B 的上游并双向转发；处理完即退出。
+            if let Ok(mut upstream) = std::net::TcpStream::connect(node_b_addr) {
+                if upstream.write_all(&first).is_ok() {
+                    relay_bridge(client, upstream);
+                }
+            }
+            break;
+        }
+    });
+
+    // 2) Discovery：静态发现解析 Node B 的 NAT 映射地址（Direct 候选，不可达）。
+    let nat_addr = freed_port_addr();
+    let discovery = nexus_discovery::StaticDiscovery::new([(
+        nexus_discovery::PeerId("node-b".into()),
+        nat_addr,
+    )]);
+    let direct_locator = discovery
+        .resolve(&nexus_discovery::PeerId("node-b".into()))
+        .map_err(|e| NexusError::Internal {
+            message: e.to_string(),
+        })?;
+    events.push(EV_REMOTE_PROVIDER_RESOLVED);
+
+    // 3) Policy：Service 画像（authorization=explicit）。
+    let flow = nexus_ingress::from_native_api("service", "RemoteBalanced");
+    let decision = nexus_policy::PolicyEngine::default_service()
+        .evaluate(&flow)
+        .decision;
+
+    // 4) Registry + Core Planner：唯一系统级规划，Provider = node-b。
+    let resource: ResourceId = flow.resource.clone();
+    let mut registry = Registry::new();
+    registry.register(ProviderRecord {
+        id: ProviderId("node-b".into()),
+        resource: resource.clone(),
+        placement: "remote-provider".into(),
+        locator: "node-b.endpoint".into(),
+        capabilities: vec!["service-session".into()],
+        present: true,
+    });
+    let candidates = registry.candidates(&resource);
+    let mut measurements = MeasurementTable::new();
+    measurements.record(
+        ProviderId("node-b".into()),
+        LinkMeasurement {
+            rtt_ms: Some(5),
+            confidence_percent: 99,
+            ..Default::default()
+        },
+    );
+    let snapshot = PlanningSnapshot::new(candidates.clone(), decision.constraints.clone());
+    let planned = nexus_planner::plan_from_snapshot(&resource, &snapshot, &decision.intent, |p| {
+        measurements.get(p).cloned()
+    })?;
+    events.push(EV_PLAN_SELECTED);
+
+    // 5) Session：Owner 创建并进入 Active（先于建连）。
+    let mut owner = SessionOwner::new(SessionId("sess-nat-relay-service-1".into()));
+    owner
+        .transition_phase(LifecyclePhase::Active)
+        .map_err(NexusError::from)?;
+    events.push(EV_SESSION_CREATED);
+
+    // 6) Link Activation：Direct 探测失败（NAT）-> Relay 回退成功（真实 TCP 探测）。
+    let direct_candidate = nexus_connectivity::LinkCandidate::new(
+        nexus_connectivity::LinkKind::Direct,
+        direct_locator.to_string(),
+        1,
+    );
+    let relay_candidate = nexus_connectivity::LinkCandidate::new(
+        nexus_connectivity::LinkKind::Relay,
+        relay_addr.to_string(),
+        15,
+    );
+    let activator = nexus_connectivity::LinkActivator::new(TcpProbe);
+    let selection = activator
+        .activate(&direct_candidate, Some(&relay_candidate), false, false)
+        .map_err(|e| NexusError::Internal {
+            message: format!("link activation failed unexpectedly: {e}"),
+        })?;
+    let direct_reason = selection
+        .events
+        .iter()
+        .find_map(|e| match e {
+            nexus_connectivity::LinkActivationEvent::AttemptFailed {
+                kind: nexus_connectivity::LinkKind::Direct,
+                reason,
+                ..
+            } => Some(reason.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    events.push(EV_LINK_DIRECT_FAILED);
+    if selection.kind == nexus_connectivity::LinkKind::Relay {
+        events.push(EV_LINK_RELAY_FALLBACK);
+    }
+
+    // 7) Connectivity：经选中链路（Relay）建立 TCP 长度前缀帧流（激活决策之后）。
+    let endpoint: std::net::SocketAddr =
+        selection
+            .locator
+            .parse()
+            .map_err(|e| NexusError::Internal {
+                message: format!("invalid selected locator: {e}"),
+            })?;
+    let frame_stream = nexus_transport::connect(&endpoint).map_err(|e| {
+        NexusError::ConnectivityEstablishmentFailed {
+            provider: planned.plan.provider_id.clone(),
+            reason: e.to_string(),
+        }
+    })?;
+    events.push(EV_REMOTE_CONNECTIVITY_ESTABLISHED);
+
+    // 8) Auth：预共享 Token 门控在业务帧前通过。
+    let token = nexus_auth::PreSharedToken("nexus-preshared-token".into());
+    let expected = nexus_auth::PreSharedToken("nexus-preshared-token".into());
+    let principal = nexus_auth::verify_token(&token, &expected).map_err(|_| {
+        NexusError::AuthorizationDenied {
+            principal: "remote-requester".into(),
+        }
+    })?;
+
+    // 9) Service：握手（CONNECT -> READY，经中继两跳）。
+    let service_session = nexus_service::ServiceSession::connect(Box::new(FrameStreamAdapter {
+        inner: frame_stream,
+    }))
+    .map_err(|e| NexusError::SessionFailed {
+        session: owner.id().clone(),
+        reason: e.to_string(),
+    })?;
+    events.push(EV_SERVICE_CONNECTED);
+
+    // 10) Owner 唯一提交 Completed；终态后 cleanup 推进到 Disposed。
+    owner
+        .commit_outcome(TerminalOutcome::Completed)
+        .map_err(NexusError::from)?;
+    owner
+        .transition_phase(LifecyclePhase::Draining)
+        .map_err(NexusError::from)?;
+    owner
+        .transition_phase(LifecyclePhase::Disposed)
+        .map_err(NexusError::from)?;
+    events.push(EV_REMOTE_ACCESS_COMPLETED);
+
+    // 11) 回收 Node R / Node B 线程（结构化并发：join 确认结束）。
+    if relay_node.join().is_err() {
+        return Err(NexusError::Internal {
+            message: "node-r relay thread panicked".into(),
+        });
+    }
+    if node_b_server.join().is_err() {
+        return Err(NexusError::Internal {
+            message: "node-b server thread panicked".into(),
+        });
+    }
+
+    let status = owner.status();
+    let terminal_outcome_commit_count = owner
+        .events()
+        .iter()
+        .filter(|e| matches!(e, nexus_session::SessionEvent::OutcomeCommitted { .. }))
+        .count();
+    let arch_violation = network_depends_on_ingress()?;
+
+    Ok(json!({
+        "verdict": "PASS",
+        "discovery": {
+            "peer_id": "node-b",
+            "endpoint": direct_locator.to_string(),
+        },
+        "events": events,
+        "link": {
+            "kind": "relay",
+            "direct_attempted": true,
+            "direct_reason": direct_reason,
+            "relay_locator": selection.locator,
+        },
+        "transport": {
+            "kind": "tcp-frame",
+        },
+        "auth": {
+            "gate": "token_verified",
+            "principal": principal.0,
+        },
+        "plan": {
+            "provider_id": planned.plan.provider_id.0,
+            "placement": planned.plan.placement,
+            "path": planned.plan.path,
+        },
+        "session": {
+            "id": owner.id().0,
+            "phase": phase_name(&status.phase),
+            "outcome": outcome_name(&status.outcome),
+        },
+        "terminal_outcome_commit_count": terminal_outcome_commit_count,
+        "service": {
+            "phase": service_session.phase().to_string(),
+        },
+        "architecture": {
+            "network_depends_on_ingress": arch_violation,
+        }
+    }))
+}
+
+/// 运行一次 Relay 不可用拒绝路径（PRODUCT §6）：Direct（NAT 不可达）与 Relay
+/// （中继端口未监听）均探测失败 -> `NoLinkAvailable` 结构化拒绝（NO_LINK_AVAILABLE）；
+/// 失败发生在 Connectivity 阶段，Session 逆序幂等回滚（Failed -> Draining -> Disposed），
+/// 不替换业务 Provider、不进入资源访问。
+pub fn remote_relay_unavailable_rollback() -> Result<Value, NexusError> {
+    let mut events: Vec<&'static str> = Vec::new();
+
+    // 0) Discovery：Node B 的 NAT 映射地址（Direct 候选，不可达）。
+    let nat_addr = freed_port_addr();
+    let discovery = nexus_discovery::StaticDiscovery::new([(
+        nexus_discovery::PeerId("node-b".into()),
+        nat_addr,
+    )]);
+    let direct_locator = discovery
+        .resolve(&nexus_discovery::PeerId("node-b".into()))
+        .map_err(|e| NexusError::Internal {
+            message: e.to_string(),
+        })?;
+    events.push(EV_REMOTE_PROVIDER_RESOLVED);
+
+    // 1) Policy + Planner。
+    let flow = nexus_ingress::from_native_api("service", "RemoteBalanced");
+    let decision = nexus_policy::PolicyEngine::default_service()
+        .evaluate(&flow)
+        .decision;
+    let resource: ResourceId = flow.resource.clone();
+    let mut registry = Registry::new();
+    registry.register(ProviderRecord {
+        id: ProviderId("node-b".into()),
+        resource: resource.clone(),
+        placement: "remote-provider".into(),
+        locator: "node-b.endpoint".into(),
+        capabilities: vec!["service-session".into()],
+        present: true,
+    });
+    let candidates = registry.candidates(&resource);
+    let mut measurements = MeasurementTable::new();
+    measurements.record(
+        ProviderId("node-b".into()),
+        LinkMeasurement {
+            rtt_ms: Some(5),
+            confidence_percent: 99,
+            ..Default::default()
+        },
+    );
+    let snapshot = PlanningSnapshot::new(candidates.clone(), decision.constraints.clone());
+    let _planned =
+        nexus_planner::plan_from_snapshot(&resource, &snapshot, &decision.intent, |p| {
+            measurements.get(p).cloned()
+        })?;
+    events.push(EV_PLAN_SELECTED);
+
+    // 2) Session：Owner 创建并进入 Active（Connectivity 失败后逆序回滚）。
+    let mut owner = SessionOwner::new(SessionId("sess-relay-unavailable-1".into()));
+    owner
+        .transition_phase(LifecyclePhase::Active)
+        .map_err(NexusError::from)?;
+    events.push(EV_SESSION_CREATED);
+
+    // 3) Link Activation：Direct 与 Relay 均不可达（中继端口未监听 -> 连接被拒）。
+    let relay_addr = freed_port_addr();
+    let direct_candidate = nexus_connectivity::LinkCandidate::new(
+        nexus_connectivity::LinkKind::Direct,
+        direct_locator.to_string(),
+        1,
+    );
+    let relay_candidate = nexus_connectivity::LinkCandidate::new(
+        nexus_connectivity::LinkKind::Relay,
+        relay_addr.to_string(),
+        15,
+    );
+    let activator = nexus_connectivity::LinkActivator::new(TcpProbe);
+    let attempted_relay =
+        match activator.activate(&direct_candidate, Some(&relay_candidate), false, false) {
+            Err(nexus_connectivity::ConnectivityError::NoLinkAvailable { attempted }) => {
+                attempted.contains(&nexus_connectivity::LinkKind::Relay)
+            }
+            Err(e) => {
+                return Err(NexusError::Internal {
+                    message: format!("expected NoLinkAvailable, got {e}"),
+                });
+            }
+            Ok(_) => {
+                return Err(NexusError::Internal {
+                    message: "expected NoLinkAvailable but a link was selected".into(),
+                });
+            }
+        };
+    events.push(EV_LINK_DIRECT_FAILED);
+    if attempted_relay {
+        events.push(EV_LINK_RELAY_FAILED);
+    }
+
+    // 4) Session 逆序幂等回滚：Failed -> Draining -> Disposed（唯一一次 Outcome 提交）。
+    owner
+        .commit_outcome(TerminalOutcome::Failed(NexusError::Internal {
+            message: "no link available".into(),
+        }))
+        .map_err(NexusError::from)?;
+    owner
+        .transition_phase(LifecyclePhase::Draining)
+        .map_err(NexusError::from)?;
+    owner
+        .transition_phase(LifecyclePhase::Disposed)
+        .map_err(NexusError::from)?;
+
+    let status = owner.status();
+    let terminal_outcome_commit_count = owner
+        .events()
+        .iter()
+        .filter(|e| matches!(e, nexus_session::SessionEvent::OutcomeCommitted { .. }))
+        .count();
+
+    Ok(json!({
+        "verdict": "PASS",
+        "discovery": {
+            "peer_id": "node-b",
+        },
+        "events": events,
+        "error": {
+            "code": "NO_LINK_AVAILABLE",
+        },
+        "link": {
+            "direct_attempted": true,
+            "relay_attempted": attempted_relay,
+        },
+        "session": {
+            "id": owner.id().0,
+            "phase": phase_name(&status.phase),
+            "outcome": outcome_name(&status.outcome),
+        },
+        "terminal_outcome_commit_count": terminal_outcome_commit_count,
     }))
 }
