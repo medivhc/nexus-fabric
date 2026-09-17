@@ -65,6 +65,22 @@
 - 该 crate 的规则匹配核心（纯函数部分）保持 Portable；LinkProbe/LinkActivator
   的注入点由 Composition Root 装配。
 
+## Allowed Equivalence: urltest selection
+
+经审核的允许等价决策（P0 冻结记录）：`urltest` 组复用 `nexus-measurement` 的
+选优语义（RTT 最低者胜出；缺失 measurement 排后；同分按候选 tag 字典序决胜），
+但不直接调用 `nexus-planner::score_candidates`。
+
+理由：`nexus-planner::score_candidates` 作用于 `nexus-registry::ProviderRecord`，
+而 `nexus-registry` 不在本 crate 的 Allowed Dependencies 内（代理内核是独立产品线，
+不得把 Provider/Registry 图谱拉进分流内核）。因此 urltest 经由 Composition Root
+注入的 `MeasurementSource` trait（离线确定性 `BTreeMap<String, u32>`）承载同一套
+选优语义，而非在本 crate 内重新引入 Registry 依赖。
+
+这是经审核的等价决策，不是第二套系统级 Plan：它不复制 Planner 的规划/建连时序，
+不产生系统级 `Plan`，仅在领域局部按 measurement 选出一个出站 tag；规则引擎仍是
+代理内核产品线的领域局部组件，满足上文 Invariants 中“不产生第二套系统级 Plan”的约束。
+
 ## Side Effects
 
 - 出站链路激活（经注入的 `LinkActivator`）产生网络副作用；规则匹配本身无副作用。

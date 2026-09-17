@@ -59,7 +59,7 @@ layer = "portable-core"
 [[crate]]
 name = "nexus-proxy"
 allowed_internal_dependencies = ["nexus-domain", "nexus-proxy-config", "nexus-ingress", "nexus-policy", "nexus-planner", "nexus-connectivity", "nexus-measurement"]
-portable = false
+portable = true
 layer = "portable-core"
 
 [[crate]]
