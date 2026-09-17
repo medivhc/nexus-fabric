@@ -472,6 +472,8 @@ pub const EV_WORKSPACE_COMMIT_APPLIED: &str = "workspace_commit_applied";
 pub const EV_WORKSPACE_COMMIT_REJECTED: &str = "workspace_commit_rejected";
 /// 事件名：动态 Presence 解析失败（PeerExpired/PeerUnknown，未进入 Plan/Session）。
 pub const EV_PRESENCE_RESOLUTION_FAILED: &str = "presence_resolution_failed";
+/// 事件名：网络发现协议往返成功（Discover 请求已发出并收到 Announce 响应）。
+pub const EV_PRESENCE_DISCOVERED: &str = "presence_discovered";
 /// 事件名：链路激活 Direct 候选探测失败（NAT 不可达）。
 pub const EV_LINK_DIRECT_FAILED: &str = "link_direct_failed";
 /// 事件名：链路激活回退到 Relay 中继（Direct 失败后选中 Relay）。
@@ -2668,5 +2670,332 @@ pub fn remote_relay_unavailable_rollback() -> Result<Value, NexusError> {
             "outcome": outcome_name(&status.outcome),
         },
         "terminal_outcome_commit_count": terminal_outcome_commit_count,
+    }))
+}
+
+/// 把 `FrameStream` 适配为 `DiscoveryTransport`（发现协议单请求-响应往返；
+/// 依赖注入，由 Composition Root 装配；避免 discovery -> transport 依赖边）。
+struct DiscoveryFrameTransport {
+    inner: nexus_transport::FrameStream,
+}
+
+impl nexus_discovery::DiscoveryTransport for DiscoveryFrameTransport {
+    fn exchange(&mut self, request: &[u8]) -> Result<Vec<u8>, nexus_discovery::DiscoveryError> {
+        self.inner
+            .send_frame(request)
+            .map_err(|e| nexus_discovery::DiscoveryError::Transport(e.to_string()))?;
+        self.inner
+            .recv_frame()
+            .map_err(|e| nexus_discovery::DiscoveryError::Transport(e.to_string()))
+    }
+}
+
+/// 运行一次基于网络发现协议的远程闭环（PRODUCT §6）：Node A 经发现协议（TCP +
+/// 长度前缀帧）向 Node B 的 `PresenceServer` 发送 `Discover` 请求帧，收到
+/// `Announce` 响应帧后缓存入本地 `PresenceClient`，解析 Endpoint，随后完成与
+/// 动态 Presence 相同的 Discovery -> Plan -> Session -> Connectivity -> Auth ->
+/// Service 闭环。Node A 侧无提供方注册中心——发现必须经网络协议达成。
+pub fn remote_presence_network_discovery_flow() -> Result<Value, NexusError> {
+    let mut events: Vec<&'static str> = Vec::new();
+
+    // 0) Node B（提供方）：绑定发现端点（网络发现协议）与资源端点（服务握手）。
+    let discovery_listener =
+        std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| NexusError::Internal {
+            message: format!("cannot bind discovery listener: {e}"),
+        })?;
+    let discovery_addr = discovery_listener
+        .local_addr()
+        .map_err(|e| NexusError::Internal {
+            message: format!("cannot read discovery addr: {e}"),
+        })?;
+    let resource_listener =
+        std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| NexusError::Internal {
+            message: format!("cannot bind resource listener: {e}"),
+        })?;
+    let resource_addr = resource_listener
+        .local_addr()
+        .map_err(|e| NexusError::Internal {
+            message: format!("cannot read resource addr: {e}"),
+        })?;
+
+    // Node B 注册中心：announce 资源 Presence（真实可达资源端点 + TTL）。
+    let mut registry = nexus_discovery::PresenceRegistry::default();
+    registry
+        .announce(nexus_discovery::PeerId("node-b".into()), resource_addr, 60)
+        .map_err(|e| NexusError::Internal {
+            message: e.to_string(),
+        })?;
+
+    let node_b_server = std::thread::spawn(move || {
+        // 发现服务：accept -> 请求帧 -> PresenceServer::handle -> 响应帧。
+        if let Ok(mut fs) = nexus_transport::accept(&discovery_listener) {
+            if let Ok(request) = fs.recv_frame() {
+                let response = nexus_discovery::PresenceServer.handle(&registry, &request);
+                if !response.is_empty() {
+                    let _ = fs.send_frame(&response);
+                }
+            }
+        }
+        // 资源服务：accept -> CONNECT/READY。
+        if let Ok(mut fs) = nexus_transport::accept(&resource_listener) {
+            if let Ok(frame) = fs.recv_frame() {
+                if frame == b"CONNECT" {
+                    let _ = fs.send_frame(b"READY");
+                }
+            }
+        }
+    });
+
+    // 1) 网络发现：Node A 经发现协议拉取 Node B 的动态 Presence（本地无注册中心）。
+    let mut frames: Vec<&'static str> = Vec::new();
+    frames.push("discover");
+    let mut client = nexus_discovery::PresenceClient::default();
+    let frame_stream = nexus_transport::connect(&discovery_addr).map_err(|e| {
+        NexusError::ConnectivityEstablishmentFailed {
+            provider: ProviderId("node-b".into()),
+            reason: e.to_string(),
+        }
+    })?;
+    let mut transport = DiscoveryFrameTransport {
+        inner: frame_stream,
+    };
+    let presence = client
+        .discover(&mut transport, &nexus_discovery::PeerId("node-b".into()))
+        .map_err(|e| NexusError::Internal {
+            message: e.to_string(),
+        })?;
+    frames.push("announce");
+    let endpoint = client
+        .resolve_local(&nexus_discovery::PeerId("node-b".into()))
+        .map_err(|e| NexusError::Internal {
+            message: e.to_string(),
+        })?;
+    let presence_announced = client.is_announced(&nexus_discovery::PeerId("node-b".into()));
+    events.push(EV_PRESENCE_DISCOVERED);
+    events.push(EV_REMOTE_PROVIDER_RESOLVED);
+
+    // 2) Policy：Service 画像展开为 Intent + Constraint（authorization=explicit）。
+    let flow = nexus_ingress::from_native_api("service", "RemoteBalanced");
+    let decision = nexus_policy::PolicyEngine::default_service()
+        .evaluate(&flow)
+        .decision;
+
+    // 3) Registry + Core Planner：唯一系统级规划，Provider = node-b（远程提供方）。
+    let resource: ResourceId = flow.resource.clone();
+    let mut registry_plan = Registry::new();
+    registry_plan.register(ProviderRecord {
+        id: ProviderId("node-b".into()),
+        resource: resource.clone(),
+        placement: "remote-provider".into(),
+        locator: "node-b.endpoint".into(),
+        capabilities: vec!["service-session".into()],
+        present: true,
+    });
+    let candidates = registry_plan.candidates(&resource);
+    let mut measurements = MeasurementTable::new();
+    measurements.record(
+        ProviderId("node-b".into()),
+        LinkMeasurement {
+            rtt_ms: Some(5),
+            confidence_percent: 99,
+            ..Default::default()
+        },
+    );
+    let snapshot = PlanningSnapshot::new(candidates.clone(), decision.constraints.clone());
+    let planned = nexus_planner::plan_from_snapshot(&resource, &snapshot, &decision.intent, |p| {
+        measurements.get(p).cloned()
+    })?;
+    events.push(EV_PLAN_SELECTED);
+
+    // 4) Session：Owner 创建并进入 Active（先于建连）。
+    let mut owner = SessionOwner::new(SessionId("sess-presence-net-service-1".into()));
+    owner
+        .transition_phase(LifecyclePhase::Active)
+        .map_err(NexusError::from)?;
+    events.push(EV_SESSION_CREATED);
+
+    // 5) Connectivity：建立到 Node B 资源端点的 TCP 长度前缀帧流（Plan + Session 之后）。
+    let resource_stream = nexus_transport::connect(&endpoint).map_err(|e| {
+        NexusError::ConnectivityEstablishmentFailed {
+            provider: planned.plan.provider_id.clone(),
+            reason: e.to_string(),
+        }
+    })?;
+    events.push(EV_REMOTE_CONNECTIVITY_ESTABLISHED);
+
+    // 6) Auth：预共享 Token 门控在业务帧前通过（W7：未认证帧不得进入业务处理）。
+    let token = nexus_auth::PreSharedToken("nexus-preshared-token".into());
+    let expected = nexus_auth::PreSharedToken("nexus-preshared-token".into());
+    let principal = nexus_auth::verify_token(&token, &expected).map_err(|_| {
+        NexusError::AuthorizationDenied {
+            principal: "remote-requester".into(),
+        }
+    })?;
+
+    // 7) Service：握手（CONNECT -> READY）。
+    let service_session = nexus_service::ServiceSession::connect(Box::new(FrameStreamAdapter {
+        inner: resource_stream,
+    }))
+    .map_err(|e| NexusError::SessionFailed {
+        session: owner.id().clone(),
+        reason: e.to_string(),
+    })?;
+    events.push(EV_SERVICE_CONNECTED);
+
+    // 8) Owner 唯一提交 Completed；终态后 cleanup 推进到 Disposed。
+    owner
+        .commit_outcome(TerminalOutcome::Completed)
+        .map_err(NexusError::from)?;
+    owner
+        .transition_phase(LifecyclePhase::Draining)
+        .map_err(NexusError::from)?;
+    owner
+        .transition_phase(LifecyclePhase::Disposed)
+        .map_err(NexusError::from)?;
+    events.push(EV_REMOTE_ACCESS_COMPLETED);
+
+    // 回收 Node B 线程（结构化并发：线程有明确 Owner，主流程 join）。
+    if node_b_server.join().is_err() {
+        return Err(NexusError::Internal {
+            message: "node-b server thread panicked".into(),
+        });
+    }
+
+    let status = owner.status();
+    let terminal_outcome_commit_count = owner
+        .events()
+        .iter()
+        .filter(|e| matches!(e, nexus_session::SessionEvent::OutcomeCommitted { .. }))
+        .count();
+    let arch_violation = network_depends_on_ingress()?;
+
+    Ok(json!({
+        "verdict": "PASS",
+        "discovery": {
+            "mode": "network",
+            "peer_id": "node-b",
+            "endpoint": endpoint.to_string(),
+            "frames": frames,
+        },
+        "presence": {
+            "source": "network",
+            "announced": presence_announced,
+            "ttl_secs": presence.ttl_secs,
+        },
+        "events": events,
+        "transport": {
+            "kind": "tcp-frame",
+        },
+        "auth": {
+            "gate": "token_verified",
+            "principal": principal.0,
+        },
+        "plan": {
+            "provider_id": planned.plan.provider_id.0,
+            "placement": planned.plan.placement,
+            "path": planned.plan.path,
+        },
+        "session": {
+            "id": owner.id().0,
+            "phase": phase_name(&status.phase),
+            "outcome": outcome_name(&status.outcome),
+        },
+        "terminal_outcome_commit_count": terminal_outcome_commit_count,
+        "service": {
+            "phase": service_session.phase().to_string(),
+        },
+        "architecture": {
+            "network_depends_on_ingress": arch_violation,
+        }
+    }))
+}
+
+/// 运行一次网络发现拒绝路径（PRODUCT §6）：Node B 的注册中心为空（未发布任何
+/// Presence），Node A 经发现协议查询 node-b，`PresenceServer` 回 `PeerUnknown`
+/// 帧；`PresenceClient` 返回 `PeerUnknown` 错误（不得缓存、不得使用）——
+/// 失败发生在 Discovery 阶段（未到 Plan/Session/Connectivity），流程输出
+/// 结构化拒绝（PEER_UNKNOWN），不进入资源访问。
+pub fn remote_presence_network_unknown_rollback() -> Result<Value, NexusError> {
+    let mut events: Vec<&'static str> = Vec::new();
+
+    // 0) Node B（提供方）：绑定发现端点；注册中心为空（node-b 未发布 Presence）。
+    let discovery_listener =
+        std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| NexusError::Internal {
+            message: format!("cannot bind discovery listener: {e}"),
+        })?;
+    let discovery_addr = discovery_listener
+        .local_addr()
+        .map_err(|e| NexusError::Internal {
+            message: format!("cannot read discovery addr: {e}"),
+        })?;
+    let registry = nexus_discovery::PresenceRegistry::default();
+
+    let node_b_server = std::thread::spawn(move || {
+        if let Ok(mut fs) = nexus_transport::accept(&discovery_listener) {
+            if let Ok(request) = fs.recv_frame() {
+                let response = nexus_discovery::PresenceServer.handle(&registry, &request);
+                if !response.is_empty() {
+                    let _ = fs.send_frame(&response);
+                }
+            }
+        }
+    });
+
+    // 1) 网络发现：Node A 查询未发布 Peer -> 协议回 PeerUnknown（结构化拒绝）。
+    let mut frames: Vec<&'static str> = Vec::new();
+    frames.push("discover");
+    let mut client = nexus_discovery::PresenceClient::default();
+    let frame_stream = nexus_transport::connect(&discovery_addr).map_err(|e| {
+        NexusError::ConnectivityEstablishmentFailed {
+            provider: ProviderId("node-b".into()),
+            reason: e.to_string(),
+        }
+    })?;
+    let mut transport = DiscoveryFrameTransport {
+        inner: frame_stream,
+    };
+    let discovered = client.discover(&mut transport, &nexus_discovery::PeerId("node-b".into()));
+    match discovered {
+        Err(nexus_discovery::DiscoveryError::PeerUnknown(_)) => {
+            frames.push("peer_unknown");
+            events.push(EV_PRESENCE_RESOLUTION_FAILED);
+        }
+        Err(e) => {
+            return Err(NexusError::Internal {
+                message: format!("expected PeerUnknown, got {e}"),
+            });
+        }
+        Ok(_) => {
+            return Err(NexusError::Internal {
+                message: "expected PeerUnknown but presence resolved".into(),
+            });
+        }
+    }
+    let cached = client.is_announced(&nexus_discovery::PeerId("node-b".into()));
+
+    // 回收 Node B 线程（结构化并发：线程有明确 Owner，主流程 join）。
+    if node_b_server.join().is_err() {
+        return Err(NexusError::Internal {
+            message: "node-b server thread panicked".into(),
+        });
+    }
+
+    Ok(json!({
+        "verdict": "PASS",
+        "discovery": {
+            "mode": "network",
+            "peer_id": "node-b",
+            "frames": frames,
+        },
+        "events": events,
+        "error": {
+            "code": "PEER_UNKNOWN",
+        },
+        "presence": {
+            "cached": cached,
+        },
+        "session": {
+            "established": false,
+        }
     }))
 }
