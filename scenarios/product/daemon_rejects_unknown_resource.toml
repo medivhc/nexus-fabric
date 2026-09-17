@@ -1,0 +1,32 @@
+schema_version = 1
+id = "product.daemon-rejects-unknown-resource"
+title = "nexusd 对未知资源返回结构化拒绝（UNKNOWN_RESOURCE）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#remote"
+
+[given]
+daemon = "nexusd"
+resource = "unknown"
+expectation = "structured-rejection"
+
+# 可执行 E4：daemon 输入校验——未知资源不进入闭环，输出结构化拒绝 JSON，
+# exit 0 表示请求已被 daemon 处理（拒绝也是处理结果；无效 CLI 用法仍 exit 非 0）。
+[when]
+command = "cargo run --quiet -p nexusd -- run frobnicate --json"
+
+# 冻结期望：拒绝语义（REJECTED）与错误码（UNKNOWN_RESOURCE）结构化输出。
+[[expect]]
+field = "verdict"
+equals = "REJECTED"
+
+[[expect]]
+field = "error.code"
+equals = "UNKNOWN_RESOURCE"
+
+[[expect]]
+field = "error.resource"
+equals = "frobnicate"
+
+[[expect]]
+field = "daemon.entry"
+equals = "nexusd"

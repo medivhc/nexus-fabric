@@ -105,6 +105,7 @@ Resolve -> Plan -> Session -> Connectivity -> Execute -> Observe
 - Transport 提供长度前缀帧协议；P0 冻结为 TCP + u32 大端长度前缀帧。
 - 建连失败按逆序幂等回滚（Connectivity -> Session -> Plan 释放），Session 物理排空到 Disposed，TerminalOutcome 由 Owner 唯一提交 `Failed`。
 - Service、InternetAccess 与 Compute 是远程访问的首批资源类型；Workspace 的远程访问后置。
+- 远程闭环同时以两种形态交付：SDK 组合根函数（apps/nexus）与 daemon 单次执行入口（apps/nexusd `run <resource> --json`）；daemon 对未知资源返回结构化拒绝（`UNKNOWN_RESOURCE`，exit 0 = 请求已被处理）。
 
 ## 7. Session 语义
 

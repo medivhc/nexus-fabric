@@ -1,0 +1,103 @@
+schema_version = 1
+id = "product.daemon-run-remote-service-flow"
+title = "nexusd daemon 单次执行入口装配 SDK 远程服务闭环"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#remote"
+
+[given]
+daemon = "nexusd"
+resource = "service"
+auth = "pre-shared-token"
+transport = "tcp-length-prefix-frame"
+
+# 可执行 E4：daemon 进程真实运行，装配 SDK 组合根远程闭环并输出单个 JSON 对象。
+# 这是 SDK+example 之外的第二种交付形态（PRODUCT §6：SDK 组合根函数 / daemon 入口）。
+[when]
+command = "cargo run --quiet -p nexusd -- run service --json"
+
+# 冻结期望：daemon 装配的闭环与 SDK 语义一致（同一冻结事件链），并携带 daemon 入口标识。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "daemon.entry"
+equals = "nexusd"
+
+[[expect]]
+field = "daemon.resource"
+equals = "service"
+
+[[expect]]
+field = "events.0"
+equals = "remote_provider_resolved"
+
+[[expect]]
+field = "events.1"
+equals = "plan_selected"
+
+[[expect]]
+field = "events.2"
+equals = "session_created"
+
+[[expect]]
+field = "events.3"
+equals = "connectivity_established"
+
+[[expect]]
+field = "events.4"
+equals = "service_connected"
+
+[[expect]]
+field = "events.5"
+equals = "remote_access_completed"
+
+# 静态发现解析出 Node B 的 Endpoint（Identity != Locator）。
+[[expect]]
+field = "discovery.peer_id"
+equals = "node-b"
+
+[[expect]]
+field = "discovery.endpoint"
+non_empty = true
+
+[[expect]]
+field = "transport.kind"
+equals = "tcp-frame"
+
+# 认证门控在业务帧前通过（预共享 Token 校验成功，产出 Principal）。
+[[expect]]
+field = "auth.gate"
+equals = "token_verified"
+
+[[expect]]
+field = "auth.principal"
+non_empty = true
+
+# Planner 真实决策：Provider = Node B（远程提供方）。
+[[expect]]
+field = "plan.provider_id"
+equals = "node-b"
+
+# Session 双轨：业务完成后 Owner 唯一提交 Completed，物理排空到 Disposed。
+[[expect]]
+field = "session.phase"
+equals = "Disposed"
+
+[[expect]]
+field = "session.outcome"
+equals = "Completed"
+
+[[expect]]
+field = "terminal_outcome_commit_count"
+equals = 1
+
+# 服务会话：握手（CONNECT -> READY）后 Active。
+[[expect]]
+field = "service.phase"
+equals = "Active"
+
+# 架构不变量：nexus-network 不依赖 nexus-ingress（ARCHITECTURE §3 禁止边）。
+[[expect]]
+field = "architecture.network_depends_on_ingress"
+equals = false
