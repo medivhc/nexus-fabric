@@ -1,0 +1,73 @@
+schema_version = 1
+id = "product.remote-relay-unavailable-rollback"
+title = "Direct 与 Relay 均不可达：Link Activation 结构化失败并回滚"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#6-remote"
+
+[given]
+requester = "node-a"
+provider = "node-b"
+resource = "service"
+topology = "nat-behind-no-relay"
+expectation = "structured-rejection"
+
+# 可执行 E4：Direct 候选不可达（NAT）且 Relay 候选也不可达（中继端口未监听）：
+# LinkActivator 按序探测全部失败 -> NoLinkAvailable（结构化拒绝 NO_LINK_AVAILABLE）；
+# 失败发生在 Connectivity 阶段，Session 逆序幂等回滚（Failed -> Disposed），
+# 不替换业务 Provider、不进入资源访问。
+[when]
+command = "cargo run --quiet -p nexus --example remote_relay_unavailable_rollback -- --json"
+
+# 冻结期望：激活失败事件链（Direct 失败 -> Relay 失败）；错误码 NO_LINK_AVAILABLE；
+# Session 回滚到 Disposed + Failed；TerminalOutcome 唯一提交一次。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "discovery.peer_id"
+equals = "node-b"
+
+[[expect]]
+field = "events.0"
+equals = "remote_provider_resolved"
+
+[[expect]]
+field = "events.1"
+equals = "plan_selected"
+
+[[expect]]
+field = "events.2"
+equals = "session_created"
+
+[[expect]]
+field = "events.3"
+equals = "link_direct_failed"
+
+[[expect]]
+field = "events.4"
+equals = "link_relay_failed"
+
+[[expect]]
+field = "error.code"
+equals = "NO_LINK_AVAILABLE"
+
+[[expect]]
+field = "link.direct_attempted"
+equals = true
+
+[[expect]]
+field = "link.relay_attempted"
+equals = true
+
+[[expect]]
+field = "session.phase"
+equals = "Disposed"
+
+[[expect]]
+field = "session.outcome"
+equals = "Failed"
+
+[[expect]]
+field = "terminal_outcome_commit_count"
+equals = 1

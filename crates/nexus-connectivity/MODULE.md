@@ -61,6 +61,24 @@
   - `ConnectivityError::Io` / `Invalid` 变体：`PlatformError` 结构化映射
     （保留 operation/message，不丢诊断原因）。
 
+### 冻结契约（remote NAT/Relay P0，scenarios/product/remote_nat_relay_fallback_flow.toml）
+
+- `LinkKind { Direct, Relay }`：候选链路类型（v9 §239：Direct 含 LAN/IPv6/Public Endpoint，Relay 为 DERP 类中继）。
+- `LinkCandidate { kind, locator, setup_cost_ms }`：领域中立候选链路（激活顺序输入）。
+- `trait LinkProbe { fn probe(&self, candidate: &LinkCandidate) -> Result<(), String> }`：
+  候选可达性探测，由 Composition Root 以真实 I/O 实现；Connectivity 只做策略编排，零 I/O。
+- `LinkActivationEvent { Attempting{kind,locator}, AttemptFailed{kind,locator,reason}, Established{kind,locator} }`：
+  激活过程结构化事件（Worker 只发事件）。
+- `LinkSelection { kind, locator, events }`：激活结果（选中链路 + 完整事件序列，可重放）。
+- `LinkActivator<P: LinkProbe>`：`new(probe)` / `activate(direct: &LinkCandidate, relay: Option<&LinkCandidate>, require_authenticated: bool, authenticated: bool) -> Result<LinkSelection, ConnectivityError>`。
+  激活顺序（v9 §243 P0 子集）：Direct 探测成功即选 Direct；Direct 失败且 Relay 可用 -> Relay 回退；
+  全部失败 -> `NoLinkAvailable`；认证门控（W12）在**任何探测之前**拦截（未认证零探测、零发送）。
+- `ConnectivityError` 新增变体：`NoLinkAvailable { attempted: Vec<LinkKind> }`。
+
+冻结语义：激活失败只报告事实，不替换业务 Provider（由 Core Planner 生成替代 Plan）；
+`activate` 是确定性策略编排（探测结果来自注入的 `LinkProbe`，不自行发起网络 I/O）；
+NAT/中继场景的物理建连（组合根 transport::connect）发生在激活决策之后。
+
 ## Verification
 
 最低：

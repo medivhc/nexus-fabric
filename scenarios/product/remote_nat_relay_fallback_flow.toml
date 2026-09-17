@@ -1,0 +1,116 @@
+schema_version = 1
+id = "product.remote-nat-relay-fallback-flow"
+title = "Node B 位于 NAT 后：Direct 不可达时回退 Relay 中继完成远程闭环"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#6-remote"
+
+[given]
+requester = "node-a"
+provider = "node-b"
+resource = "service"
+topology = "nat-behind-with-relay"
+activation_order = "direct-then-relay"
+
+# 可执行 E4：Node B 的真实端点仅在中继侧可达（Direct 候选为 NAT 映射地址，
+# 进程内模拟为未监听端口 -> 探测失败）；组合根经 LinkActivator 按序激活：
+# Direct 失败 -> Relay 回退（Node R 进程内中继：A<->R<->B 两跳转发）-> 建连 ->
+# 经中继完成 Service 握手，复用 Discovery/Plan/Session/Auth 完整闭环。
+[when]
+command = "cargo run --quiet -p nexus --example remote_nat_relay_fallback_flow -- --json"
+
+# 冻结期望：Discovery 解析提供方（Direct 候选 = NAT 映射地址，不可达）；
+# 激活顺序事件链（Direct 失败 -> Relay 回退 -> 建连）；最终链路类型 = Relay；
+# 认证门控在业务帧前通过；Planner 决策 Provider = Node B；Session 双轨
+# Completed/Disposed 且 TerminalOutcome 只提交一次；Service 会话 Active。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "discovery.peer_id"
+equals = "node-b"
+
+[[expect]]
+field = "events.0"
+equals = "remote_provider_resolved"
+
+[[expect]]
+field = "events.1"
+equals = "plan_selected"
+
+[[expect]]
+field = "events.2"
+equals = "session_created"
+
+[[expect]]
+field = "events.3"
+equals = "link_direct_failed"
+
+[[expect]]
+field = "events.4"
+equals = "link_relay_fallback"
+
+[[expect]]
+field = "events.5"
+equals = "connectivity_established"
+
+[[expect]]
+field = "events.6"
+equals = "service_connected"
+
+[[expect]]
+field = "events.7"
+equals = "remote_access_completed"
+
+# 激活结果：Relay 中继链路（NAT 回退成功）。
+[[expect]]
+field = "link.kind"
+equals = "relay"
+
+[[expect]]
+field = "link.direct_attempted"
+equals = true
+
+[[expect]]
+field = "link.direct_reason"
+non_empty = true
+
+[[expect]]
+field = "link.relay_locator"
+non_empty = true
+
+[[expect]]
+field = "transport.kind"
+equals = "tcp-frame"
+
+[[expect]]
+field = "auth.gate"
+equals = "token_verified"
+
+[[expect]]
+field = "auth.principal"
+non_empty = true
+
+[[expect]]
+field = "plan.provider_id"
+equals = "node-b"
+
+[[expect]]
+field = "session.phase"
+equals = "Disposed"
+
+[[expect]]
+field = "session.outcome"
+equals = "Completed"
+
+[[expect]]
+field = "terminal_outcome_commit_count"
+equals = 1
+
+[[expect]]
+field = "service.phase"
+equals = "Active"
+
+[[expect]]
+field = "architecture.network_depends_on_ingress"
+equals = false
