@@ -55,7 +55,9 @@ dependencies = [
  "nexus-registry",
  "nexus-service",
  "nexus-session",
+ "nexus-storage",
  "nexus-transport",
+ "nexus-workspace",
  "serde_json",
 ]
 

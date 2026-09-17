@@ -462,6 +462,10 @@ pub const EV_NETWORK_SESSION_ESTABLISHED: &str = "network_session_established";
 pub const EV_COMPUTE_JOB_SUBMITTED: &str = "compute_job_submitted";
 /// 事件名：远程计算作业被提供方拒绝（REJECTED 帧）。
 pub const EV_COMPUTE_JOB_REJECTED: &str = "compute_job_rejected";
+/// 事件名：远程 Workspace 提交已应用并取回新 Head（OK:HEAD 往返成功）。
+pub const EV_WORKSPACE_COMMIT_APPLIED: &str = "workspace_commit_applied";
+/// 事件名：远程 Workspace 提交被提供方拒绝（REJECTED 帧）。
+pub const EV_WORKSPACE_COMMIT_REJECTED: &str = "workspace_commit_rejected";
 /// 事件名：远程网络认证门控拒绝（W7：未认证帧不得进入业务处理）。
 pub const EV_NETWORK_AUTH_REJECTED: &str = "network_auth_rejected";
 /// 事件名：远程资源访问闭环完成（Owner 已提交终态并排空到 Disposed）。
@@ -512,6 +516,23 @@ impl nexus_compute::ComputeTransport for FrameStreamAdapter {
         self.inner
             .recv_frame()
             .map_err(|_| nexus_compute::ComputeError::Closed)
+    }
+}
+impl nexus_workspace::WorkspaceTransport for FrameStreamAdapter {
+    fn send_frame(&mut self, payload: &[u8]) -> Result<(), nexus_workspace::WorkspaceError> {
+        self.inner
+            .send_frame(payload)
+            .map_err(|e| nexus_workspace::WorkspaceError::Transport {
+                reason: e.to_string(),
+            })
+    }
+
+    fn recv_frame(&mut self) -> Result<Vec<u8>, nexus_workspace::WorkspaceError> {
+        self.inner
+            .recv_frame()
+            .map_err(|e| nexus_workspace::WorkspaceError::Transport {
+                reason: e.to_string(),
+            })
     }
 }
 
@@ -1540,6 +1561,413 @@ pub fn remote_compute_rejected_rollback() -> Result<Value, NexusError> {
         "discovery": {
             "peer_id": "node-b",
             "endpoint": resolved.to_string(),
+        }
+    }))
+}
+
+/// 运行一次远程 Workspace 提交闭环（PRODUCT §6）：Node A 经
+/// Discovery -> Plan -> Session -> Connectivity -> Auth -> Workspace 向 Node B 的
+/// Workspace 提交 ChangeSet（`<parent>\n<path>\n<content>` 帧）并取回新 Head。
+///
+/// 进程内双节点模拟：Node B 在回环端口监听，后台线程内运行真实
+/// `Workspace::init + commit_changes`（InMemoryContentStore），返回 `OK:HEAD:<id>`；
+/// Node A 通过真实 TCP 长度前缀帧流完成远程提交。确定性、可重放。
+pub fn remote_workspace_commit_flow() -> Result<Value, NexusError> {
+    let mut events: Vec<&'static str> = Vec::new();
+    const PARENT: &str = "C0";
+
+    // 0) Node B（提供方）：绑定回环端口，后台线程内运行真实 Workspace 并应用远程提交。
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| NexusError::Internal {
+            message: format!("cannot bind node-b listener: {e}"),
+        })?;
+    let node_b_addr = listener.local_addr().map_err(|e| NexusError::Internal {
+        message: format!("cannot read node-b listener addr: {e}"),
+    })?;
+    let node_b_server = std::thread::spawn(move || {
+        if let Ok(mut fs) = nexus_transport::accept(&listener) {
+            if let Ok(frame) = fs.recv_frame() {
+                // ChangeSet 帧格式：<parent>\n<path>\n<content>
+                let text = String::from_utf8_lossy(&frame);
+                let mut parts = text.splitn(3, '\n');
+                let parent = parts.next().unwrap_or_default().to_string();
+                let path = parts.next().unwrap_or_default().to_string();
+                let content = parts.next().unwrap_or_default().as_bytes().to_vec();
+                let ws = nexus_workspace::Workspace::init(
+                    nexus_workspace::WorkspaceId("ws-b".into()),
+                    nexus_storage::InMemoryContentStore::new(),
+                );
+                let response = match ws {
+                    Ok(mut ws) => match ws.commit_changes(
+                        &nexus_workspace::CommitId(parent),
+                        &[nexus_workspace::Change { path, content }],
+                    ) {
+                        Ok(head) => format!("OK:HEAD:{}", head.0),
+                        Err(e) => format!("REJECTED:{e}"),
+                    },
+                    Err(e) => format!("REJECTED:{e}"),
+                };
+                let _ = fs.send_frame(response.as_bytes());
+            }
+        }
+    });
+
+    // 1) Discovery：静态发现解析 Node B 的 Endpoint（Identity != Locator）。
+    let discovery = nexus_discovery::StaticDiscovery::new([(
+        nexus_discovery::PeerId("node-b".into()),
+        node_b_addr,
+    )]);
+    let endpoint = discovery
+        .resolve(&nexus_discovery::PeerId("node-b".into()))
+        .map_err(|e| NexusError::Internal {
+            message: e.to_string(),
+        })?;
+    events.push(EV_REMOTE_PROVIDER_RESOLVED);
+
+    // 2) Policy：Workspace 画像展开为 Intent + Constraint（authorization=explicit）。
+    let flow = nexus_ingress::from_native_api("workspace", "RemoteBalanced");
+    let decision = nexus_policy::PolicyEngine::default_workspace()
+        .evaluate(&flow)
+        .decision;
+
+    // 3) Registry + Core Planner：唯一系统级规划，Provider = node-b（远程 Workspace）。
+    let resource: ResourceId = flow.resource.clone();
+    let mut registry = Registry::new();
+    registry.register(ProviderRecord {
+        id: ProviderId("node-b".into()),
+        resource: resource.clone(),
+        placement: "remote-provider".into(),
+        locator: "node-b.endpoint".into(),
+        capabilities: vec!["workspace-sync".into()],
+        present: true,
+    });
+    let candidates = registry.candidates(&resource);
+    let mut measurements = MeasurementTable::new();
+    measurements.record(
+        ProviderId("node-b".into()),
+        LinkMeasurement {
+            rtt_ms: Some(5),
+            confidence_percent: 99,
+            ..Default::default()
+        },
+    );
+    let snapshot = PlanningSnapshot::new(candidates.clone(), decision.constraints.clone());
+    let planned = nexus_planner::plan_from_snapshot(&resource, &snapshot, &decision.intent, |p| {
+        measurements.get(p).cloned()
+    })?;
+    events.push(EV_PLAN_SELECTED);
+
+    // 4) Session：Owner 创建并进入 Active（先于建连）。
+    let mut owner = SessionOwner::new(SessionId("sess-remote-workspace-1".into()));
+    owner
+        .transition_phase(LifecyclePhase::Active)
+        .map_err(NexusError::from)?;
+    events.push(EV_SESSION_CREATED);
+
+    // 5) Connectivity：建立到 Node B 的 TCP 长度前缀帧流（Plan + Session 之后）。
+    let frame_stream = nexus_transport::connect(&endpoint).map_err(|e| {
+        NexusError::ConnectivityEstablishmentFailed {
+            provider: planned.plan.provider_id.clone(),
+            reason: e.to_string(),
+        }
+    })?;
+    events.push(EV_REMOTE_CONNECTIVITY_ESTABLISHED);
+
+    // 6) Auth：预共享 Token 门控在 ChangeSet 帧前通过（W7：未认证帧不得进入业务处理）。
+    let token = nexus_auth::PreSharedToken("nexus-preshared-token".into());
+    let expected = nexus_auth::PreSharedToken("nexus-preshared-token".into());
+    let principal = nexus_auth::verify_token(&token, &expected).map_err(|_| {
+        NexusError::AuthorizationDenied {
+            principal: "remote-requester".into(),
+        }
+    })?;
+
+    // 7) Workspace：远程提交（ChangeSet 帧 -> OK:HEAD:<id>，取回新 Head）。
+    let change_set = format!("{PARENT}\nremote.txt\nremote-content");
+    let ws_session = nexus_workspace::RemoteWorkspaceSession::commit(
+        Box::new(FrameStreamAdapter {
+            inner: frame_stream,
+        }),
+        change_set.as_bytes(),
+    )
+    .map_err(|e| NexusError::SessionFailed {
+        session: owner.id().clone(),
+        reason: e.to_string(),
+    })?;
+    events.push(EV_WORKSPACE_COMMIT_APPLIED);
+
+    // 8) Owner 唯一提交 Completed；终态后 cleanup 推进到 Disposed。
+    owner
+        .commit_outcome(TerminalOutcome::Completed)
+        .map_err(NexusError::from)?;
+    owner
+        .transition_phase(LifecyclePhase::Draining)
+        .map_err(NexusError::from)?;
+    owner
+        .transition_phase(LifecyclePhase::Disposed)
+        .map_err(NexusError::from)?;
+    events.push(EV_REMOTE_ACCESS_COMPLETED);
+
+    // 回收 Node B 线程（结构化并发：线程有明确 Owner，主流程 join）。
+    if node_b_server.join().is_err() {
+        return Err(NexusError::Internal {
+            message: "node-b server thread panicked".into(),
+        });
+    }
+
+    let status = owner.status();
+    let terminal_outcome_commit_count = owner
+        .events()
+        .iter()
+        .filter(|e| matches!(e, nexus_session::SessionEvent::OutcomeCommitted { .. }))
+        .count();
+    let arch_violation = network_depends_on_ingress()?;
+
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "discovery": {
+            "peer_id": "node-b",
+            "endpoint": endpoint.to_string(),
+        },
+        "transport": {
+            "kind": "tcp-frame",
+        },
+        "auth": {
+            "gate": "token_verified",
+            "principal": principal.0,
+        },
+        "plan": {
+            "provider_id": planned.plan.provider_id.0,
+            "placement": planned.plan.placement,
+            "path": planned.plan.path,
+        },
+        "session": {
+            "id": owner.id().0,
+            "phase": phase_name(&status.phase),
+            "outcome": outcome_name(&status.outcome),
+        },
+        "terminal_outcome_commit_count": terminal_outcome_commit_count,
+        "workspace": {
+            "phase": ws_session.phase().to_string(),
+            "head": ws_session.head().map(|h| h.0.clone()).unwrap_or_default(),
+            "parent": PARENT,
+        },
+        "architecture": {
+            "network_depends_on_ingress": arch_violation,
+        }
+    }))
+}
+
+/// 运行一次远程 Workspace 提交被拒路径（PRODUCT §6）：Discovery 已解析 Node B、
+/// 认证通过（token 正确）、ChangeSet 帧真实提交（携带未知 parent），但提供方
+/// 真实 Workspace 按 `UnknownCommit` 语义拒绝（REJECTED 帧）——Owner 唯一提交
+/// Failed(WORKSPACE_COMMIT_REJECTED)，按逆序幂等回滚到 Disposed。
+pub fn remote_workspace_rejected_rollback() -> Result<Value, NexusError> {
+    let mut events: Vec<&'static str> = Vec::new();
+
+    // 0) Node B（提供方）：绑定回环端口，后台线程内运行真实 Workspace；
+    //    未知 parent 的 ChangeSet -> commit_changes 返回 UnknownCommit -> REJECTED 帧。
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| NexusError::Internal {
+            message: format!("cannot bind node-b listener: {e}"),
+        })?;
+    let node_b_addr = listener.local_addr().map_err(|e| NexusError::Internal {
+        message: format!("cannot read node-b listener addr: {e}"),
+    })?;
+    let node_b_server = std::thread::spawn(move || {
+        if let Ok(mut fs) = nexus_transport::accept(&listener) {
+            if let Ok(frame) = fs.recv_frame() {
+                let text = String::from_utf8_lossy(&frame);
+                let mut parts = text.splitn(3, '\n');
+                let parent = parts.next().unwrap_or_default().to_string();
+                let path = parts.next().unwrap_or_default().to_string();
+                let content = parts.next().unwrap_or_default().as_bytes().to_vec();
+                let ws = nexus_workspace::Workspace::init(
+                    nexus_workspace::WorkspaceId("ws-b-rejected".into()),
+                    nexus_storage::InMemoryContentStore::new(),
+                );
+                let response = match ws {
+                    Ok(mut ws) => match ws.commit_changes(
+                        &nexus_workspace::CommitId(parent),
+                        &[nexus_workspace::Change { path, content }],
+                    ) {
+                        Ok(_) => "OK:HEAD:C9".to_string(),
+                        Err(e) => format!("REJECTED:{e}"),
+                    },
+                    Err(e) => format!("REJECTED:{e}"),
+                };
+                let _ = fs.send_frame(response.as_bytes());
+            }
+        }
+    });
+
+    // 1) Discovery：静态发现解析 Node B（真实监听地址，帧流可建立）。
+    let discovery = nexus_discovery::StaticDiscovery::new([(
+        nexus_discovery::PeerId("node-b".into()),
+        node_b_addr,
+    )]);
+    let resolved = discovery
+        .resolve(&nexus_discovery::PeerId("node-b".into()))
+        .map_err(|e| NexusError::Internal {
+            message: e.to_string(),
+        })?;
+    events.push(EV_REMOTE_PROVIDER_RESOLVED);
+
+    // 2) Policy / 3) Planner：Provider = node-b（失败发生在提交阶段，而非解析/规划阶段）。
+    let flow = nexus_ingress::from_native_api("workspace", "RemoteBalanced");
+    let decision = nexus_policy::PolicyEngine::default_workspace()
+        .evaluate(&flow)
+        .decision;
+    let resource: ResourceId = flow.resource.clone();
+    let mut registry = Registry::new();
+    registry.register(ProviderRecord {
+        id: ProviderId("node-b".into()),
+        resource: resource.clone(),
+        placement: "remote-provider".into(),
+        locator: "node-b.endpoint".into(),
+        capabilities: vec!["workspace-sync".into()],
+        present: true,
+    });
+    let candidates = registry.candidates(&resource);
+    let mut measurements = MeasurementTable::new();
+    measurements.record(
+        ProviderId("node-b".into()),
+        LinkMeasurement {
+            rtt_ms: Some(5),
+            confidence_percent: 99,
+            ..Default::default()
+        },
+    );
+    let snapshot = PlanningSnapshot::new(candidates.clone(), decision.constraints.clone());
+    let planned = nexus_planner::plan_from_snapshot(&resource, &snapshot, &decision.intent, |p| {
+        measurements.get(p).cloned()
+    })?;
+    events.push(EV_PLAN_SELECTED);
+
+    // 4) Session：Owner 创建并进入 Active（先于建连）。
+    let mut owner = SessionOwner::new(SessionId("sess-remote-ws-reject-1".into()));
+    owner
+        .transition_phase(LifecyclePhase::Active)
+        .map_err(NexusError::from)?;
+    events.push(EV_SESSION_CREATED);
+
+    // 5) Connectivity：帧流真实建立（Node B 在监听）。
+    let frame_stream = nexus_transport::connect(&resolved).map_err(|e| {
+        NexusError::ConnectivityEstablishmentFailed {
+            provider: planned.plan.provider_id.clone(),
+            reason: e.to_string(),
+        }
+    })?;
+    events.push(EV_REMOTE_CONNECTIVITY_ESTABLISHED);
+
+    // 6) Auth：预共享 Token 校验通过（失败发生在提供方拒绝，而非认证阶段）。
+    let token = nexus_auth::PreSharedToken("nexus-preshared-token".into());
+    let expected = nexus_auth::PreSharedToken("nexus-preshared-token".into());
+    let principal = nexus_auth::verify_token(&token, &expected).map_err(|_| {
+        NexusError::AuthorizationDenied {
+            principal: "remote-requester".into(),
+        }
+    })?;
+
+    // 7) Workspace：提交携带未知 parent 的 ChangeSet，提供方拒绝 -> RemoteRejected。
+    let rejected = nexus_workspace::RemoteWorkspaceSession::commit(
+        Box::new(FrameStreamAdapter {
+            inner: frame_stream,
+        }),
+        b"UNKNOWN\nremote.txt\nremote-content",
+    );
+    let reason = match rejected {
+        Err(nexus_workspace::WorkspaceError::RemoteRejected { reason }) => {
+            format!("provider rejected workspace commit: {reason}")
+        }
+        Err(e) => {
+            return Err(NexusError::Internal {
+                message: format!("expected rejection, got {e}"),
+            });
+        }
+        Ok(_) => {
+            return Err(NexusError::Internal {
+                message: "expected rejection but commit succeeded".into(),
+            });
+        }
+    };
+    events.push(EV_WORKSPACE_COMMIT_REJECTED);
+
+    // 8) 回收 Node B 线程（结构化并发：线程有明确 Owner，主流程 join）。
+    if node_b_server.join().is_err() {
+        return Err(NexusError::Internal {
+            message: "node-b server thread panicked".into(),
+        });
+    }
+
+    // 9) Owner 唯一提交 Failed(WORKSPACE_COMMIT_REJECTED)。
+    owner
+        .commit_outcome(TerminalOutcome::Failed(
+            NexusError::WorkspaceCommitRejected {
+                workspace: "ws-b-rejected".into(),
+                reason: reason.clone(),
+            },
+        ))
+        .map_err(NexusError::from)?;
+    events.push(EV_TERMINAL_OUTCOME_COMMITTED);
+
+    // 10) 逆序回滚：Draining -> Disposed（K10 逆序幂等）。
+    owner
+        .transition_phase(LifecyclePhase::Draining)
+        .map_err(NexusError::from)?;
+    owner
+        .transition_phase(LifecyclePhase::Disposed)
+        .map_err(NexusError::from)?;
+    let rollback_idempotent = matches!(
+        owner.transition_phase(LifecyclePhase::Draining),
+        Err(nexus_session::SessionError::InvalidPhaseTransition { .. })
+    ) && owner.phase() == LifecyclePhase::Disposed;
+    let redundant_commit_rejected = matches!(
+        owner.commit_outcome(TerminalOutcome::Failed(NexusError::Internal {
+            message: "duplicate".into()
+        })),
+        Err(nexus_session::SessionError::AlreadyTerminated { .. })
+    );
+    let terminal_outcome_commit_count = owner
+        .events()
+        .iter()
+        .filter(|e| matches!(e, nexus_session::SessionEvent::OutcomeCommitted { .. }))
+        .count();
+    let arch_violation = network_depends_on_ingress()?;
+
+    let status = owner.status();
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "auth": {
+            "gate": "token_verified",
+            "principal": principal.0,
+        },
+        "error": {
+            "code": "WORKSPACE_COMMIT_REJECTED",
+        },
+        "rollback": {
+            "idempotent": rollback_idempotent,
+            "drained_to_disposed": owner.phase() == LifecyclePhase::Disposed,
+        },
+        "session": {
+            "id": owner.id().0,
+            "phase": phase_name(&status.phase),
+            "outcome": outcome_name(&status.outcome),
+        },
+        "terminal_outcome_commit_count": terminal_outcome_commit_count,
+        "redundant_commit_rejected": redundant_commit_rejected,
+        "plan": {
+            "provider_id": planned.plan.provider_id.0,
+            "placement": planned.plan.placement,
+        },
+        "discovery": {
+            "peer_id": "node-b",
+            "endpoint": resolved.to_string(),
+        },
+        "architecture": {
+            "network_depends_on_ingress": arch_violation,
         }
     }))
 }

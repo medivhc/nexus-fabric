@@ -158,6 +158,12 @@ pub enum WorkspaceError {
     MergeConflict(MergeConflict),
     /// 两个提交之间不存在公共祖先（异常 DAG）。
     NoCommonAncestor { left: CommitId, right: CommitId },
+    /// 远程帧通道传输失败（remote P0：WorkspaceTransport 注入通道）。
+    Transport { reason: String },
+    /// 提供方拒绝远程提交（响应帧 `REJECTED`）。
+    RemoteRejected { reason: String },
+    /// 响应帧不符合 `OK:HEAD:<id>` / `REJECTED` 协议（不可吞为成功）。
+    RemoteProtocol { frame: String },
 }
 
 impl fmt::Display for WorkspaceError {
@@ -175,6 +181,11 @@ impl fmt::Display for WorkspaceError {
             }
             Self::NoCommonAncestor { left, right } => {
                 write!(f, "no common ancestor between {left:?} and {right:?}")
+            }
+            Self::Transport { reason } => write!(f, "remote transport failure: {reason}"),
+            Self::RemoteRejected { reason } => write!(f, "remote workspace rejected: {reason}"),
+            Self::RemoteProtocol { frame } => {
+                write!(f, "unrecognized remote workspace frame: {frame:?}")
             }
         }
     }
@@ -1098,5 +1109,150 @@ mod tests {
         let report = restored.reconcile_journal().expect("reconcile ok");
         assert_eq!(report.total, 0);
         assert_eq!(restored.heads().heads[0], c1);
+    }
+}
+
+/// 远程提交会话阶段（MODULE.md 冻结契约：远程提交必须显式完成往返后才 Active）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceRemotePhase {
+    /// 正在发送 ChangeSet 帧、等待响应。
+    Sending,
+    /// 已收到 `OK:HEAD:<id>` 响应帧，往返完成。
+    Active,
+    /// 会话已关闭。
+    Closed,
+}
+
+impl fmt::Display for WorkspaceRemotePhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sending => write!(f, "Sending"),
+            Self::Active => write!(f, "Active"),
+            Self::Closed => write!(f, "Closed"),
+        }
+    }
+}
+
+/// 注入的远程帧通道（MODULE.md 冻结契约：避免 workspace -> transport 依赖边）。
+///
+/// 由组合根以 `transport::FrameStream` 适配装配（apps/nexus FrameStreamAdapter）。
+pub trait WorkspaceTransport {
+    /// 发送一帧。
+    fn send_frame(&mut self, payload: &[u8]) -> Result<(), WorkspaceError>;
+    /// 接收一帧。
+    fn recv_frame(&mut self) -> Result<Vec<u8>, WorkspaceError>;
+}
+
+/// 远程提交会话（PRODUCT §6）：在已认证帧通道上向提供方 Workspace 提交 ChangeSet，
+/// 响应 `OK:HEAD:<commit_id>` 提取新 Head 后进入 Active；`REJECTED` 视为提供方拒绝。
+#[derive(Debug, Clone)]
+pub struct RemoteWorkspaceSession {
+    phase: WorkspaceRemotePhase,
+    head: Option<CommitId>,
+}
+
+impl RemoteWorkspaceSession {
+    /// 发送 ChangeSet 帧并接收结果帧，完成一次远程提交往返。
+    ///
+    /// - `OK:HEAD:<commit_id>` -> Active，携带新 Head；
+    /// - `REJECTED[:reason]` -> `WorkspaceError::RemoteRejected`（提供方拒绝）；
+    /// - 其他帧 -> `WorkspaceError::RemoteProtocol`（协议不可识别，不得吞为成功）。
+    pub fn commit(
+        mut transport: Box<dyn WorkspaceTransport>,
+        change_set: &[u8],
+    ) -> Result<Self, WorkspaceError> {
+        transport.send_frame(change_set)?;
+        let frame = transport.recv_frame()?;
+        let text = String::from_utf8(frame).map_err(|_| WorkspaceError::RemoteProtocol {
+            frame: "<non-utf8>".into(),
+        })?;
+        if let Some(rest) = text.strip_prefix("OK:HEAD:") {
+            let head = CommitId(rest.trim().to_string());
+            if head.0.is_empty() {
+                return Err(WorkspaceError::RemoteProtocol { frame: text });
+            }
+            Ok(Self {
+                phase: WorkspaceRemotePhase::Active,
+                head: Some(head),
+            })
+        } else if text.starts_with("REJECTED") {
+            let reason = text
+                .strip_prefix("REJECTED")
+                .unwrap_or_default()
+                .trim_start_matches(':')
+                .trim()
+                .to_string();
+            Err(WorkspaceError::RemoteRejected { reason })
+        } else {
+            Err(WorkspaceError::RemoteProtocol { frame: text })
+        }
+    }
+
+    /// 当前阶段。
+    #[must_use]
+    pub fn phase(&self) -> WorkspaceRemotePhase {
+        self.phase.clone()
+    }
+
+    /// 提供方返回的新 Head（仅 Active 后有值）。
+    #[must_use]
+    pub fn head(&self) -> Option<&CommitId> {
+        self.head.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod remote_session_tests {
+    use super::*;
+
+    /// 测试用帧通道：预设响应帧。
+    struct FakeTransport {
+        rx: Vec<u8>,
+    }
+
+    impl WorkspaceTransport for FakeTransport {
+        fn send_frame(&mut self, _payload: &[u8]) -> Result<(), WorkspaceError> {
+            Ok(())
+        }
+        fn recv_frame(&mut self) -> Result<Vec<u8>, WorkspaceError> {
+            Ok(self.rx.clone())
+        }
+    }
+
+    #[test]
+    fn commit_ok_extracts_new_head_and_activates() {
+        let session = RemoteWorkspaceSession::commit(
+            Box::new(FakeTransport {
+                rx: b"OK:HEAD:C1".to_vec(),
+            }),
+            b"C0\nremote.txt\ncontent",
+        )
+        .expect("commit ok");
+        assert_eq!(session.phase(), WorkspaceRemotePhase::Active);
+        assert_eq!(session.head(), Some(&CommitId("C1".into())));
+    }
+
+    #[test]
+    fn commit_rejected_maps_to_remote_rejected() {
+        let err = RemoteWorkspaceSession::commit(
+            Box::new(FakeTransport {
+                rx: b"REJECTED:no such commit".to_vec(),
+            }),
+            b"UNKNOWN\nremote.txt\ncontent",
+        )
+        .expect_err("should be rejected");
+        assert!(matches!(err, WorkspaceError::RemoteRejected { .. }));
+    }
+
+    #[test]
+    fn commit_unknown_frame_maps_to_protocol_error() {
+        let err = RemoteWorkspaceSession::commit(
+            Box::new(FakeTransport {
+                rx: b"garbage".to_vec(),
+            }),
+            b"C0\nremote.txt\ncontent",
+        )
+        .expect_err("should be protocol error");
+        assert!(matches!(err, WorkspaceError::RemoteProtocol { .. }));
     }
 }

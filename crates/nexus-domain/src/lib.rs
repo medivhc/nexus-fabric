@@ -280,6 +280,8 @@ pub enum NexusError {
     AuthorizationDenied { principal: String },
     /// 远程计算作业被提供方拒绝（PRODUCT §6，remote P0 扩展）。
     ComputeJobRejected { job_id: String, reason: String },
+    /// 远程 Workspace 提交被提供方拒绝（PRODUCT §6，remote P0 扩展）。
+    WorkspaceCommitRejected { workspace: String, reason: String },
     /// 平台缺少所需能力（PRODUCT §7：必须显式返回，不能静默降级语义）。
     PlatformCapabilityUnavailable { capability: String },
     /// Session 运行失败。
@@ -302,7 +304,8 @@ impl NexusError {
             Self::AuthorizationDenied { .. }
             | Self::DnsResolutionFailed { .. }
             | Self::SessionFailed { .. }
-            | Self::ComputeJobRejected { .. } => FailureDisposition::Abort,
+            | Self::ComputeJobRejected { .. }
+            | Self::WorkspaceCommitRejected { .. } => FailureDisposition::Abort,
             Self::Unsupported { .. } | Self::Internal { .. } => FailureDisposition::Escalate,
         }
     }
@@ -338,6 +341,12 @@ impl fmt::Display for NexusError {
             }
             Self::ComputeJobRejected { job_id, reason } => {
                 write!(f, "compute job {job_id} rejected by provider: {reason}")
+            }
+            Self::WorkspaceCommitRejected { workspace, reason } => {
+                write!(
+                    f,
+                    "workspace {workspace} commit rejected by provider: {reason}"
+                )
             }
             Self::PlatformCapabilityUnavailable { capability } => {
                 write!(f, "platform capability unavailable: {capability}")
