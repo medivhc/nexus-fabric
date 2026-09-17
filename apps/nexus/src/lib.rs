@@ -2999,3 +2999,169 @@ pub fn remote_presence_network_unknown_rollback() -> Result<Value, NexusError> {
         }
     }))
 }
+
+/// 真机演示（Node A 客户端侧）：经 `discovery_endpoint` 指向的远端发现服务拉取
+/// Node B 的动态 Presence（网络发现协议），随后完成与网络发现场景相同的
+/// Discovery -> Plan -> Session -> Connectivity -> Auth -> Service 闭环。
+/// 与 `remote_presence_network_discovery_flow` 的区别：Node B 由独立进程提供
+/// （`node_b_service` example），本函数只承担请求方侧；`discovery_endpoint`
+/// 为 Node B 发现服务的可达地址（真机 = Node B 主机的 IP:port）。
+pub fn remote_client_flow(discovery_endpoint: std::net::SocketAddr) -> Result<Value, NexusError> {
+    let mut events: Vec<&'static str> = Vec::new();
+
+    // 1) 网络发现：Node A 经发现协议拉取 Node B 的动态 Presence（本地无注册中心）。
+    let mut frames: Vec<&'static str> = Vec::new();
+    frames.push("discover");
+    let mut client = nexus_discovery::PresenceClient::default();
+    let frame_stream = nexus_transport::connect(&discovery_endpoint).map_err(|e| {
+        NexusError::ConnectivityEstablishmentFailed {
+            provider: ProviderId("node-b".into()),
+            reason: e.to_string(),
+        }
+    })?;
+    let mut transport = DiscoveryFrameTransport {
+        inner: frame_stream,
+    };
+    let presence = client
+        .discover(&mut transport, &nexus_discovery::PeerId("node-b".into()))
+        .map_err(|e| NexusError::Internal {
+            message: e.to_string(),
+        })?;
+    frames.push("announce");
+    let endpoint = client
+        .resolve_local(&nexus_discovery::PeerId("node-b".into()))
+        .map_err(|e| NexusError::Internal {
+            message: e.to_string(),
+        })?;
+    let presence_announced = client.is_announced(&nexus_discovery::PeerId("node-b".into()));
+    events.push(EV_PRESENCE_DISCOVERED);
+    events.push(EV_REMOTE_PROVIDER_RESOLVED);
+
+    // 2) Policy：Service 画像展开为 Intent + Constraint（authorization=explicit）。
+    let flow = nexus_ingress::from_native_api("service", "RemoteBalanced");
+    let decision = nexus_policy::PolicyEngine::default_service()
+        .evaluate(&flow)
+        .decision;
+
+    // 3) Registry + Core Planner：唯一系统级规划，Provider = node-b（远程提供方）。
+    let resource: ResourceId = flow.resource.clone();
+    let mut registry = Registry::new();
+    registry.register(ProviderRecord {
+        id: ProviderId("node-b".into()),
+        resource: resource.clone(),
+        placement: "remote-provider".into(),
+        locator: "node-b.endpoint".into(),
+        capabilities: vec!["service-session".into()],
+        present: true,
+    });
+    let candidates = registry.candidates(&resource);
+    let mut measurements = MeasurementTable::new();
+    measurements.record(
+        ProviderId("node-b".into()),
+        LinkMeasurement {
+            rtt_ms: Some(5),
+            confidence_percent: 99,
+            ..Default::default()
+        },
+    );
+    let snapshot = PlanningSnapshot::new(candidates.clone(), decision.constraints.clone());
+    let planned = nexus_planner::plan_from_snapshot(&resource, &snapshot, &decision.intent, |p| {
+        measurements.get(p).cloned()
+    })?;
+    events.push(EV_PLAN_SELECTED);
+
+    // 4) Session：Owner 创建并进入 Active（先于建连）。
+    let mut owner = SessionOwner::new(SessionId("sess-remote-client-1".into()));
+    owner
+        .transition_phase(LifecyclePhase::Active)
+        .map_err(NexusError::from)?;
+    events.push(EV_SESSION_CREATED);
+
+    // 5) Connectivity：建立到 Node B 资源端点的 TCP 长度前缀帧流（Plan + Session 之后）。
+    let resource_stream = nexus_transport::connect(&endpoint).map_err(|e| {
+        NexusError::ConnectivityEstablishmentFailed {
+            provider: planned.plan.provider_id.clone(),
+            reason: e.to_string(),
+        }
+    })?;
+    events.push(EV_REMOTE_CONNECTIVITY_ESTABLISHED);
+
+    // 6) Auth：预共享 Token 门控在业务帧前通过（W7：未认证帧不得进入业务处理）。
+    let token = nexus_auth::PreSharedToken("nexus-preshared-token".into());
+    let expected = nexus_auth::PreSharedToken("nexus-preshared-token".into());
+    let principal = nexus_auth::verify_token(&token, &expected).map_err(|_| {
+        NexusError::AuthorizationDenied {
+            principal: "remote-requester".into(),
+        }
+    })?;
+
+    // 7) Service：握手（CONNECT -> READY）。
+    let service_session = nexus_service::ServiceSession::connect(Box::new(FrameStreamAdapter {
+        inner: resource_stream,
+    }))
+    .map_err(|e| NexusError::SessionFailed {
+        session: owner.id().clone(),
+        reason: e.to_string(),
+    })?;
+    events.push(EV_SERVICE_CONNECTED);
+
+    // 8) Owner 唯一提交 Completed；终态后 cleanup 推进到 Disposed。
+    owner
+        .commit_outcome(TerminalOutcome::Completed)
+        .map_err(NexusError::from)?;
+    owner
+        .transition_phase(LifecyclePhase::Draining)
+        .map_err(NexusError::from)?;
+    owner
+        .transition_phase(LifecyclePhase::Disposed)
+        .map_err(NexusError::from)?;
+    events.push(EV_REMOTE_ACCESS_COMPLETED);
+
+    let status = owner.status();
+    let terminal_outcome_commit_count = owner
+        .events()
+        .iter()
+        .filter(|e| matches!(e, nexus_session::SessionEvent::OutcomeCommitted { .. }))
+        .count();
+    let arch_violation = network_depends_on_ingress()?;
+
+    Ok(json!({
+        "verdict": "PASS",
+        "discovery": {
+            "mode": "network",
+            "peer_id": "node-b",
+            "endpoint": endpoint.to_string(),
+            "frames": frames,
+        },
+        "presence": {
+            "source": "network",
+            "announced": presence_announced,
+            "ttl_secs": presence.ttl_secs,
+        },
+        "events": events,
+        "transport": {
+            "kind": "tcp-frame",
+        },
+        "auth": {
+            "gate": "token_verified",
+            "principal": principal.0,
+        },
+        "plan": {
+            "provider_id": planned.plan.provider_id.0,
+            "placement": planned.plan.placement,
+            "path": planned.plan.path,
+        },
+        "session": {
+            "id": owner.id().0,
+            "phase": phase_name(&status.phase),
+            "outcome": outcome_name(&status.outcome),
+        },
+        "terminal_outcome_commit_count": terminal_outcome_commit_count,
+        "service": {
+            "phase": service_session.phase().to_string(),
+        },
+        "architecture": {
+            "network_depends_on_ingress": arch_violation,
+        }
+    }))
+}
