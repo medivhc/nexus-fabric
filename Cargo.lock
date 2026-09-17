@@ -41,6 +41,7 @@ name = "nexus"
 version = "0.1.0"
 dependencies = [
  "nexus-auth",
+ "nexus-compute",
  "nexus-connectivity",
  "nexus-control-api",
  "nexus-discovery",

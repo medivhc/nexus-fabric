@@ -36,7 +36,8 @@ pub const CONSTRAINT_AUTHORIZATION: &str = "authorization";
 pub const CAPABILITY_INTERNET_ACCESS: &str = "internet-access";
 /// Nexus-aware Service Session 能力值。
 pub const CAPABILITY_SERVICE_SESSION: &str = "service-session";
-
+/// 远程 Compute Job 执行能力值（PRODUCT §6，remote P0 扩展）。
+pub const CAPABILITY_COMPUTE_JOB: &str = "compute-job";
 // ---------- 动作化有序链（吸收点 S1/S2/S7） ----------
 
 /// 策略动作。
@@ -176,6 +177,27 @@ impl PolicyEngine {
                 },
                 PolicyAction::SelectProvider {
                     capability: CAPABILITY_SERVICE_SESSION.into(),
+                    exit_dns: None,
+                },
+            ],
+        }])
+    }
+
+    /// 默认 Compute 策略：要求 `compute-job` 能力 + 显式授权（PRODUCT §2/§6，remote P0 扩展）。
+    ///
+    /// 动作顺序即产出顺序：先累积 `authorization` 约束，再以终态动作选择远程执行器。
+    #[must_use]
+    pub fn default_compute() -> Self {
+        Self::new(vec![PolicyRule {
+            id: "default-compute".into(),
+            match_: PolicyMatch::default(),
+            actions: vec![
+                PolicyAction::AddConstraint {
+                    key: CONSTRAINT_AUTHORIZATION.into(),
+                    value: "explicit".into(),
+                },
+                PolicyAction::SelectProvider {
+                    capability: CAPABILITY_COMPUTE_JOB.into(),
                     exit_dns: None,
                 },
             ],
