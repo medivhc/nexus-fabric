@@ -212,3 +212,34 @@ Verdict
 ```
 
 Harness 不拥有业务真相、不重写 Cargo/Git/Test/Tracing/Benchmark，也不被 production crate 依赖。
+
+## 11. 代理内核产品线（Rule-Based Routing Proxy）
+
+代理内核是独立于 §6 远程资源访问闭环的第二条产品线，其驱动链与既有
+Ingress -> Application Service -> Policy -> Core Planner -> Session Runtime ->
+Network Runtime 平行但不合并：
+
+```text
+SOCKS5 Ingress（nexus-ingress Socks5Handshake）
+  -> FlowContext
+  -> nexus-proxy RuleEngine（静态规则表顺序匹配）
+  -> rule_action 动作链（首动作 SELECT_OUTBOUND tag）
+  -> nexus-proxy GroupRegistry（selector / urltest）
+  -> nexus-connectivity LinkActivator（Direct / Relay）
+```
+
+衔接约束：
+
+- `nexus-proxy` 复用 `nexus-ingress` 的 `FlowContext` 与 `Socks5Handshake`，
+  但不修改 ingress 的协议状态机语义。
+- 规则引擎是领域局部组件，**不是**系统级 Core Planner；它不产生第二套系统级
+  Plan，也不修改 `NetworkPlanExtension`。规则动作链属于 `nexus-proxy` 内部的
+  typed extension，不污染领域中立的 `Plan` 模型。
+- 出站激活委派 `nexus-connectivity::LinkActivator`（Direct -> Relay 回退），
+  与远程资源访问闭环共享同一 Delivery Infrastructure。
+- `nexus-proxy-config` 是 Nexus 首个配置文件入口（YAML -> typed structs），
+  位于 portable-core 层，不依赖运行时 crate。
+- Portable Core 不引入平台 API：SOCKS5 监听 socket、LinkProbe 的真实 I/O 由
+  Composition Root / `nexus-platform-*` 注入。
+- `nexus-proxy` 不反向依赖 `nexus-network` / `nexus-service` / `nexus-workspace`
+  / `nexus-compute`；代理内核产品线与远程资源访问闭环共享底座但不互相调用业务逻辑。
