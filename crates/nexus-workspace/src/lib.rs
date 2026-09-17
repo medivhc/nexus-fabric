@@ -193,6 +193,51 @@ impl fmt::Display for WorkspaceError {
 
 impl std::error::Error for WorkspaceError {}
 
+/// Workspace 访问通道（PRODUCT §4：无 FUSE/Mount 环境仍可使用 Workspace）。
+///
+/// 访问通道只决定"如何看到/写入权威数据"，不改变权威模型本身
+/// （Commit DAG + Head Set + Manifest 始终完整）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceAccessProvider {
+    /// 平台原生目录挂载（FUSE / File Provider）。
+    NativeMountDirectory,
+    /// Materialization 物化目录（无 Mount 环境的投影通道）。
+    MaterializedDirectory,
+    /// 纯 Native API（结构化读写，不经文件系统投影；总可用兜底）。
+    NativeApi,
+}
+
+impl WorkspaceAccessProvider {
+    /// 稳定机器名（供 E4 场景机检，不随语言/展示变化）。
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::NativeMountDirectory => "NativeMountDirectory",
+            Self::MaterializedDirectory => "MaterializedDirectory",
+            Self::NativeApi => "NativeApi",
+        }
+    }
+}
+
+/// 选择 Workspace 访问通道（纯函数、确定性，可重放）。
+///
+/// 优先级：Native Mount > Materialization > Native API（PRODUCT §4 的兜底通道，
+/// 总可用）。所有通道都保持产品语义；`product_semantics_preserved` 是投影层
+/// 的设计不变量，由组合根在 E4 场景中输出。
+#[must_use]
+pub fn select_access_provider(
+    native_mount: bool,
+    materialization: bool,
+) -> WorkspaceAccessProvider {
+    if native_mount {
+        WorkspaceAccessProvider::NativeMountDirectory
+    } else if materialization {
+        WorkspaceAccessProvider::MaterializedDirectory
+    } else {
+        WorkspaceAccessProvider::NativeApi
+    }
+}
+
 /// Manifest：路径 -> 内容对象。确定性序列化（按 path 排序），存入 CAS。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct Manifest {
@@ -1254,5 +1299,40 @@ mod remote_session_tests {
         )
         .expect_err("should be protocol error");
         assert!(matches!(err, WorkspaceError::RemoteProtocol { .. }));
+    }
+}
+
+#[cfg(test)]
+mod access_provider_tests {
+    use super::*;
+
+    #[test]
+    fn native_mount_wins_when_available() {
+        let p = select_access_provider(true, false);
+        assert_eq!(p, WorkspaceAccessProvider::NativeMountDirectory);
+        assert_eq!(p.name(), "NativeMountDirectory");
+    }
+
+    #[test]
+    fn materialization_fallback_without_mount() {
+        // 场景 platform.workspace-projection-fallback 的路径。
+        let p = select_access_provider(false, true);
+        assert_eq!(p, WorkspaceAccessProvider::MaterializedDirectory);
+        assert_eq!(p.name(), "MaterializedDirectory");
+    }
+
+    #[test]
+    fn native_api_is_total_fallback() {
+        let p = select_access_provider(false, false);
+        assert_eq!(p, WorkspaceAccessProvider::NativeApi);
+        assert_eq!(p.name(), "NativeApi");
+    }
+
+    #[test]
+    fn selection_is_deterministic() {
+        assert_eq!(
+            select_access_provider(false, true),
+            select_access_provider(false, true)
+        );
     }
 }

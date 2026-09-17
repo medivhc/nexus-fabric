@@ -75,6 +75,21 @@ Merge/Commit/持久化路径必须返回结构化 `WorkspaceError`，不得 pani
 
 远程提交必须显式完成往返后才 Active；提供方拒绝（RemoteRejected）与协议未识别帧（RemoteProtocol）是可诊断失败，不得吞为成功；未知 parent 的 ChangeSet 由提供方按现有 `UnknownCommit` 语义拒绝。
 
+### 冻结契约（platform.workspace-projection-fallback E4）
+
+- `pub enum WorkspaceAccessProvider { NativeMountDirectory, MaterializedDirectory, NativeApi }`：
+  Workspace 的访问通道（PRODUCT §4——无 FUSE/Mount 环境仍可通过 Native API、
+  Materialization 或平台式 Projection 使用 Workspace）。
+- `pub fn select_access_provider(native_mount: bool, materialization: bool) -> WorkspaceAccessProvider`：
+  纯函数、确定性。`native_mount=true` → `NativeMountDirectory`；否则
+  `materialization=true` → `MaterializedDirectory`；否则 → `NativeApi`
+  （PRODUCT §4 保证的兜底通道，总可用）。
+- 任何通道都必须保持产品语义（Commit DAG / Head Set / Manifest 仍完整可用）；
+  `product_semantics_preserved` 由组合根按场景契约输出。
+- 场景映射：`scenarios/platform/workspace_projection_fallback.toml` 由
+  `crates/nexus-workspace/examples/workspace_projection_fallback.rs` 驱动，经
+  harness 的 `product-scenarios` gate 求值。
+
 ## Verification
 
 最低：
