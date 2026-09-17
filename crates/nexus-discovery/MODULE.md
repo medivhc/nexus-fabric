@@ -43,6 +43,20 @@
 
 ## Public API
 
+### 冻结契约（remote P0 扩展，scenarios/product/remote_presence_dynamic_flow.toml）
+
+- `pub struct Presence { peer: PeerId, endpoint: SocketAddr, ttl_secs: u64, announced_at: Instant }`
+  动态 Presence：提供方主动发布的可达性公告（AGENTS.md §15 冷启动 reconcile 的重新发布 Provider Presence）。
+- `pub struct PresenceRegistry { presences: Vec<Presence> }`：进程内动态发现注册中心。
+  - `pub fn announce(&mut self, peer: PeerId, endpoint: SocketAddr, ttl_secs: u64) -> Result<(), DiscoveryError>`
+    发布/刷新提供方 Presence（幂等：重复 announce 刷新记录）。
+  - `pub fn resolve(&self, peer: &PeerId) -> Result<SocketAddr, DiscoveryError>`
+    动态解析：Presence 存在且未过期 -> Endpoint；未发布 -> `PeerUnknown`；已过期 -> `PeerExpired`。
+  - `pub fn is_announced(&self, peer: &PeerId) -> bool`
+- `pub enum DiscoveryError` 新增变体：`PeerExpired(PeerId)`。
+
+冻结语义：`resolve` 只做注册中心查询，不发起网络 I/O、不建立 Connectivity（Discovery != Connectivity Establishment）；TTL 过期后 Peer 不可解析（不得返回过期 Endpoint）；`announce` 幂等刷新。
+
 ### 冻结契约（remote P0，scenarios/product/remote_service_access_flow.toml）
 
 - `pub struct PeerId(pub String)`：提供方节点标识。Identity != Locator：Peer 不携带 Endpoint 本身。
