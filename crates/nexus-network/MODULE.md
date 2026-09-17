@@ -46,9 +46,25 @@
 
 ## Public API
 
+### 冻结契约（remote P0 扩展，scenarios/product/remote_internet_access_flow.toml）
+
+- `pub trait NetworkTransport`：注入的帧通道，避免 network -> transport 依赖边（架构允许依赖仅 domain/policy/planner/session/delivery/dns）；由组合根以 `transport::FrameStream` 适配装配。
+  - `pub fn send_frame(&mut self, payload: &[u8]) -> Result<(), NetworkError>`
+  - `pub fn recv_frame(&mut self) -> Result<Vec<u8>, NetworkError>`
+- `pub struct NetworkSession`：InternetAccess 远程网络会话（PRODUCT §2/§6）。
+  - `pub fn establish(transport: Box<dyn NetworkTransport>, request: &[u8]) -> Result<Self, NetworkError>`
+    在已认证的帧通道上发送请求帧并接收响应帧；成功提取 HTTP 状态码后进入 Active。
+  - `pub fn phase(&self) -> NetworkPhase`
+  - `pub fn response_status(&self) -> Option<&str>`
+- `pub enum NetworkPhase { Connecting, Active, Closed }`
+- `pub enum NetworkError { Transport, Unauthorized, Closed }`
+
+冻结语义：网络会话必须显式建立（establish 完成请求/响应往返后才 Active）；未通过认证的请求不得进入业务处理（W7）。
+
+### 常规要求
+
 - 默认最小 surface：`private -> pub(crate) -> pub`。
 - Public API 变更必须保持结构化、可版本化并有调用方验证。
-- 本骨架只提供最小编译锚点；业务 API 在实现阶段增量添加。
 
 ## Verification
 
