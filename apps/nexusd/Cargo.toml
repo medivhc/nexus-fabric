@@ -9,6 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+nexus = { path = "../nexus" }
 nexus-control-api = { path = "../../crates/nexus-control-api" }
 nexus-registry = { path = "../../crates/nexus-registry" }
 nexus-discovery = { path = "../../crates/nexus-discovery" }
@@ -19,3 +20,4 @@ nexus-workspace = { path = "../../crates/nexus-workspace" }
 nexus-compute = { path = "../../crates/nexus-compute" }
 nexus-diagnostics = { path = "../../crates/nexus-diagnostics" }
 nexus-platform = { path = "../../crates/nexus-platform" }
+serde_json = { version = "1", default-features = false, features = ["std"] }

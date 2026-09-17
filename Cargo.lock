@@ -283,6 +283,7 @@ dependencies = [
 name = "nexusd"
 version = "0.1.0"
 dependencies = [
+ "nexus",
  "nexus-compute",
  "nexus-control-api",
  "nexus-diagnostics",
@@ -293,6 +294,7 @@ dependencies = [
  "nexus-registry",
  "nexus-service",
  "nexus-workspace",
+ "serde_json",
 ]
 
 [[package]]
