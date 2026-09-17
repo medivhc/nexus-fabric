@@ -456,6 +456,10 @@ pub const EV_REMOTE_PROVIDER_RESOLVED: &str = "remote_provider_resolved";
 pub const EV_REMOTE_CONNECTIVITY_ESTABLISHED: &str = "connectivity_established";
 /// 事件名：Service 会话已通过握手建立（CONNECT -> READY）。
 pub const EV_SERVICE_CONNECTED: &str = "service_connected";
+/// 事件名：远程网络会话已建立（请求/响应往返成功，携带 HTTP 状态码）。
+pub const EV_NETWORK_SESSION_ESTABLISHED: &str = "network_session_established";
+/// 事件名：远程网络认证门控拒绝（W7：未认证帧不得进入业务处理）。
+pub const EV_NETWORK_AUTH_REJECTED: &str = "network_auth_rejected";
 /// 事件名：远程资源访问闭环完成（Owner 已提交终态并排空到 Disposed）。
 pub const EV_REMOTE_ACCESS_COMPLETED: &str = "remote_access_completed";
 
@@ -476,6 +480,20 @@ impl nexus_service::ServiceTransport for FrameStreamAdapter {
         self.inner
             .recv_frame()
             .map_err(|_| nexus_service::ServiceError::Transport)
+    }
+}
+
+impl nexus_network::NetworkTransport for FrameStreamAdapter {
+    fn send_frame(&mut self, payload: &[u8]) -> Result<(), nexus_network::NetworkError> {
+        self.inner
+            .send_frame(payload)
+            .map_err(|_| nexus_network::NetworkError::Transport)
+    }
+
+    fn recv_frame(&mut self) -> Result<Vec<u8>, nexus_network::NetworkError> {
+        self.inner
+            .recv_frame()
+            .map_err(|_| nexus_network::NetworkError::Closed)
     }
 }
 
@@ -777,6 +795,347 @@ pub fn remote_connectivity_failure_rollback() -> Result<Value, NexusError> {
         },
         "error": {
             "code": "CONNECTIVITY_ESTABLISHMENT_FAILED",
+        },
+        "rollback": {
+            "idempotent": rollback_idempotent,
+            "drained_to_disposed": owner.phase() == LifecyclePhase::Disposed,
+        },
+        "session": {
+            "id": owner.id().0,
+            "phase": phase_name(&status.phase),
+            "outcome": outcome_name(&status.outcome),
+        },
+        "terminal_outcome_commit_count": terminal_outcome_commit_count,
+        "redundant_commit_rejected": redundant_commit_rejected,
+        "plan": {
+            "provider_id": planned.plan.provider_id.0,
+            "placement": planned.plan.placement,
+        },
+        "discovery": {
+            "peer_id": "node-b",
+            "endpoint": resolved.to_string(),
+        }
+    }))
+}
+
+// ---------- Remote InternetAccess（PRODUCT §6，remote P0 扩展） ----------
+
+/// 运行一次远程 InternetAccess 访问闭环（PRODUCT §2/§6）：Node A 经
+/// Discovery -> Plan -> Session -> Connectivity -> Auth -> Network 访问 Node B 的
+/// InternetAccess 出口，完成一次真实 HTTP 请求/响应帧往返。
+///
+/// 进程内双节点模拟：Node B 在回环端口监听并模拟 InternetAccess 出口
+/// （任意请求帧 -> HTTP 200 响应帧），Node A 通过真实 TCP 长度前缀帧流访问。
+/// 确定性、可重放。
+pub fn remote_internet_access_flow() -> Result<Value, NexusError> {
+    let mut events: Vec<&'static str> = Vec::new();
+
+    // 0) Node B（提供方）：绑定回环端口，后台线程接受连接并模拟 InternetAccess 出口。
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| NexusError::Internal {
+            message: format!("cannot bind node-b listener: {e}"),
+        })?;
+    let node_b_addr = listener.local_addr().map_err(|e| NexusError::Internal {
+        message: format!("cannot read node-b listener addr: {e}"),
+    })?;
+    let node_b_server = std::thread::spawn(move || {
+        if let Ok(mut fs) = nexus_transport::accept(&listener) {
+            if fs.recv_frame().is_ok() {
+                // InternetAccess 出口：任意请求帧 -> HTTP 200 响应帧。
+                let _ = fs.send_frame(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            }
+        }
+    });
+
+    // 1) Discovery：静态发现解析 Node B 的 Endpoint（Identity != Locator）。
+    let discovery = nexus_discovery::StaticDiscovery::new([(
+        nexus_discovery::PeerId("node-b".into()),
+        node_b_addr,
+    )]);
+    let endpoint = discovery
+        .resolve(&nexus_discovery::PeerId("node-b".into()))
+        .map_err(|e| NexusError::Internal {
+            message: e.to_string(),
+        })?;
+    events.push(EV_REMOTE_PROVIDER_RESOLVED);
+
+    // 2) Policy：InternetAccess 画像展开为 Intent + Constraint（authorization=explicit）。
+    let flow = nexus_ingress::from_native_api("internet-access", "RemoteBalanced");
+    let decision = nexus_policy::PolicyEngine::default_network()
+        .evaluate(&flow)
+        .decision;
+
+    // 3) Registry + Core Planner：唯一系统级规划，Provider = node-b（远程出口）。
+    let resource: ResourceId = flow.resource.clone();
+    let mut registry = Registry::new();
+    registry.register(ProviderRecord {
+        id: ProviderId("node-b".into()),
+        resource: resource.clone(),
+        placement: "remote-provider".into(),
+        locator: "node-b.endpoint".into(),
+        capabilities: vec!["internet-access".into()],
+        present: true,
+    });
+    let candidates = registry.candidates(&resource);
+    let mut measurements = MeasurementTable::new();
+    measurements.record(
+        ProviderId("node-b".into()),
+        LinkMeasurement {
+            rtt_ms: Some(5),
+            confidence_percent: 99,
+            ..Default::default()
+        },
+    );
+    let snapshot = PlanningSnapshot::new(candidates.clone(), decision.constraints.clone());
+    let planned = nexus_planner::plan_from_snapshot(&resource, &snapshot, &decision.intent, |p| {
+        measurements.get(p).cloned()
+    })?;
+    events.push(EV_PLAN_SELECTED);
+
+    // 4) Session：Owner 创建并进入 Active（先于建连）。
+    let mut owner = SessionOwner::new(SessionId("sess-remote-network-1".into()));
+    owner
+        .transition_phase(LifecyclePhase::Active)
+        .map_err(NexusError::from)?;
+    events.push(EV_SESSION_CREATED);
+
+    // 5) Connectivity：建立到 Node B 的 TCP 长度前缀帧流（Plan + Session 之后）。
+    let frame_stream = nexus_transport::connect(&endpoint).map_err(|e| {
+        NexusError::ConnectivityEstablishmentFailed {
+            provider: planned.plan.provider_id.clone(),
+            reason: e.to_string(),
+        }
+    })?;
+    events.push(EV_REMOTE_CONNECTIVITY_ESTABLISHED);
+
+    // 6) Auth：预共享 Token 门控在业务帧前通过（W7：未认证帧不得进入业务处理）。
+    let token = nexus_auth::PreSharedToken("nexus-preshared-token".into());
+    let expected = nexus_auth::PreSharedToken("nexus-preshared-token".into());
+    let principal = nexus_auth::verify_token(&token, &expected).map_err(|_| {
+        NexusError::AuthorizationDenied {
+            principal: "remote-requester".into(),
+        }
+    })?;
+
+    // 7) Network：建立 InternetAccess 网络会话（请求帧 -> 响应帧 -> HTTP 状态码）。
+    let network_session = nexus_network::NetworkSession::establish(
+        Box::new(FrameStreamAdapter {
+            inner: frame_stream,
+        }),
+        b"GET / HTTP/1.1\r\nHost: example.invalid\r\n\r\n",
+    )
+    .map_err(|e| NexusError::SessionFailed {
+        session: owner.id().clone(),
+        reason: e.to_string(),
+    })?;
+    events.push(EV_NETWORK_SESSION_ESTABLISHED);
+
+    // 8) Owner 唯一提交 Completed；终态后 cleanup 推进到 Disposed。
+    owner
+        .commit_outcome(TerminalOutcome::Completed)
+        .map_err(NexusError::from)?;
+    owner
+        .transition_phase(LifecyclePhase::Draining)
+        .map_err(NexusError::from)?;
+    owner
+        .transition_phase(LifecyclePhase::Disposed)
+        .map_err(NexusError::from)?;
+    events.push(EV_REMOTE_ACCESS_COMPLETED);
+
+    // 回收 Node B 线程（结构化并发：线程有明确 Owner，主流程 join）。
+    if node_b_server.join().is_err() {
+        return Err(NexusError::Internal {
+            message: "node-b server thread panicked".into(),
+        });
+    }
+
+    let status = owner.status();
+    let terminal_outcome_commit_count = owner
+        .events()
+        .iter()
+        .filter(|e| matches!(e, nexus_session::SessionEvent::OutcomeCommitted { .. }))
+        .count();
+    let arch_violation = network_depends_on_ingress()?;
+
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "discovery": {
+            "peer_id": "node-b",
+            "endpoint": endpoint.to_string(),
+        },
+        "transport": {
+            "kind": "tcp-frame",
+        },
+        "auth": {
+            "gate": "token_verified",
+            "principal": principal.0,
+        },
+        "plan": {
+            "provider_id": planned.plan.provider_id.0,
+            "placement": planned.plan.placement,
+            "path": planned.plan.path,
+        },
+        "session": {
+            "id": owner.id().0,
+            "phase": phase_name(&status.phase),
+            "outcome": outcome_name(&status.outcome),
+        },
+        "terminal_outcome_commit_count": terminal_outcome_commit_count,
+        "network": {
+            "phase": network_session.phase().to_string(),
+            "response": {
+                "status": network_session.response_status().unwrap_or_default(),
+            },
+        },
+        "architecture": {
+            "network_depends_on_ingress": arch_violation,
+        }
+    }))
+}
+
+/// 运行一次远程网络认证门控拒绝路径（PRODUCT §6）：Discovery 已解析 Node B、
+/// 帧流真实建立，但预共享 Token 不匹配——W7 门控在业务帧前拒绝，
+/// Owner 唯一提交 Failed(AUTHORIZATION_DENIED)，按逆序幂等回滚到 Disposed。
+///
+/// 确定性：Node B 在回环端口监听（帧流可建立），requester 持有错误 Token。
+pub fn remote_network_auth_rejected_rollback() -> Result<Value, NexusError> {
+    let mut events: Vec<&'static str> = Vec::new();
+
+    // 0) Node B（提供方）：绑定回环端口并接受连接；认证拒绝路径不发业务帧，
+    //    连接关闭后 recv 返回 Closed，线程自然退出（无泄漏、有 Owner）。
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| NexusError::Internal {
+            message: format!("cannot bind node-b listener: {e}"),
+        })?;
+    let node_b_addr = listener.local_addr().map_err(|e| NexusError::Internal {
+        message: format!("cannot read node-b listener addr: {e}"),
+    })?;
+    let node_b_server = std::thread::spawn(move || {
+        if let Ok(mut fs) = nexus_transport::accept(&listener) {
+            // 未认证请求帧被门控拦截，不进入业务处理；等待连接关闭（recv 返回 Closed）。
+            let _ = fs.recv_frame();
+        }
+    });
+
+    // 1) Discovery：静态发现解析 Node B（真实监听地址，帧流可建立）。
+    let discovery = nexus_discovery::StaticDiscovery::new([(
+        nexus_discovery::PeerId("node-b".into()),
+        node_b_addr,
+    )]);
+    let resolved = discovery
+        .resolve(&nexus_discovery::PeerId("node-b".into()))
+        .map_err(|e| NexusError::Internal {
+            message: e.to_string(),
+        })?;
+    events.push(EV_REMOTE_PROVIDER_RESOLVED);
+
+    // 2) Policy / 3) Planner：Provider = node-b（失败发生在认证阶段，而非解析/规划阶段）。
+    let flow = nexus_ingress::from_native_api("internet-access", "RemoteBalanced");
+    let decision = nexus_policy::PolicyEngine::default_network()
+        .evaluate(&flow)
+        .decision;
+    let resource: ResourceId = flow.resource.clone();
+    let mut registry = Registry::new();
+    registry.register(ProviderRecord {
+        id: ProviderId("node-b".into()),
+        resource: resource.clone(),
+        placement: "remote-provider".into(),
+        locator: "node-b.endpoint".into(),
+        capabilities: vec!["internet-access".into()],
+        present: true,
+    });
+    let candidates = registry.candidates(&resource);
+    let mut measurements = MeasurementTable::new();
+    measurements.record(
+        ProviderId("node-b".into()),
+        LinkMeasurement {
+            rtt_ms: Some(5),
+            confidence_percent: 99,
+            ..Default::default()
+        },
+    );
+    let snapshot = PlanningSnapshot::new(candidates.clone(), decision.constraints.clone());
+    let planned = nexus_planner::plan_from_snapshot(&resource, &snapshot, &decision.intent, |p| {
+        measurements.get(p).cloned()
+    })?;
+    events.push(EV_PLAN_SELECTED);
+
+    // 4) Session：Owner 创建并进入 Active（先于建连）。
+    let mut owner = SessionOwner::new(SessionId("sess-remote-network-auth-1".into()));
+    owner
+        .transition_phase(LifecyclePhase::Active)
+        .map_err(NexusError::from)?;
+    events.push(EV_SESSION_CREATED);
+
+    // 5) Connectivity：帧流真实建立（Node B 在监听；认证失败发生在业务帧之前）。
+    let frame_stream = nexus_transport::connect(&resolved).map_err(|e| {
+        NexusError::ConnectivityEstablishmentFailed {
+            provider: planned.plan.provider_id.clone(),
+            reason: e.to_string(),
+        }
+    })?;
+    events.push(EV_REMOTE_CONNECTIVITY_ESTABLISHED);
+
+    // 6) Auth：预共享 Token 不匹配 -> 门控拒绝（W7：未认证帧不得进入业务处理）。
+    let token = nexus_auth::PreSharedToken("wrong-token".into());
+    let expected = nexus_auth::PreSharedToken("nexus-preshared-token".into());
+    let principal = "remote-requester".to_string();
+    if nexus_auth::verify_token(&token, &expected).is_ok() {
+        return Err(NexusError::Internal {
+            message: "expected auth rejection but token verified".into(),
+        });
+    }
+    events.push(EV_NETWORK_AUTH_REJECTED);
+
+    // 7) 关闭帧流（业务帧从未发送），回收 Node B 线程。
+    drop(frame_stream);
+    if node_b_server.join().is_err() {
+        return Err(NexusError::Internal {
+            message: "node-b server thread panicked".into(),
+        });
+    }
+
+    // 8) Owner 唯一提交 Failed(AUTHORIZATION_DENIED)。
+    owner
+        .commit_outcome(TerminalOutcome::Failed(NexusError::AuthorizationDenied {
+            principal,
+        }))
+        .map_err(NexusError::from)?;
+    events.push(EV_TERMINAL_OUTCOME_COMMITTED);
+
+    // 9) 逆序回滚：Draining -> Disposed（K10 逆序幂等）。
+    owner
+        .transition_phase(LifecyclePhase::Draining)
+        .map_err(NexusError::from)?;
+    owner
+        .transition_phase(LifecyclePhase::Disposed)
+        .map_err(NexusError::from)?;
+    let rollback_idempotent = matches!(
+        owner.transition_phase(LifecyclePhase::Draining),
+        Err(nexus_session::SessionError::InvalidPhaseTransition { .. })
+    ) && owner.phase() == LifecyclePhase::Disposed;
+    let redundant_commit_rejected = matches!(
+        owner.commit_outcome(TerminalOutcome::Failed(NexusError::Internal {
+            message: "duplicate".into()
+        })),
+        Err(nexus_session::SessionError::AlreadyTerminated { .. })
+    );
+    let terminal_outcome_commit_count = owner
+        .events()
+        .iter()
+        .filter(|e| matches!(e, nexus_session::SessionEvent::OutcomeCommitted { .. }))
+        .count();
+
+    let status = owner.status();
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "auth": {
+            "gate": "blocked_before_authenticated",
+        },
+        "error": {
+            "code": "AUTHORIZATION_DENIED",
         },
         "rollback": {
             "idempotent": rollback_idempotent,

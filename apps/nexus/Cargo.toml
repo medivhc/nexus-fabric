@@ -24,5 +24,6 @@ nexus-discovery = { path = "../../crates/nexus-discovery" }
 nexus-transport = { path = "../../crates/nexus-transport" }
 nexus-auth = { path = "../../crates/nexus-auth" }
 nexus-service = { path = "../../crates/nexus-service" }
+nexus-network = { path = "../../crates/nexus-network" }
 nexus-platform = { path = "../../crates/nexus-platform" }
 serde_json = { version = "1", default-features = false, features = ["std"] }

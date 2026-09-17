@@ -47,6 +47,7 @@ dependencies = [
  "nexus-domain",
  "nexus-ingress",
  "nexus-measurement",
+ "nexus-network",
  "nexus-planner",
  "nexus-platform",
  "nexus-policy",
