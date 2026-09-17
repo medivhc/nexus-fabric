@@ -80,7 +80,9 @@ crates = [
   "nexus-session",
   "nexus-measurement",
   "nexus-delivery",
-  "nexus-ingress"
+  "nexus-ingress",
+  "nexus-proxy-config",
+  "nexus-proxy"
 ]
 
 [hooks]
