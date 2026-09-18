@@ -1,0 +1,45 @@
+{
+  "gates": [
+    {
+      "detail": "no whitespace errors",
+      "name": "whitespace",
+      "verdict": "PASS"
+    },
+    {
+      "detail": "ok",
+      "name": "format",
+      "verdict": "PASS"
+    },
+    {
+      "detail": "ok",
+      "name": "check",
+      "verdict": "PASS"
+    },
+    {
+      "detail": "ok",
+      "name": "clippy",
+      "verdict": "PASS"
+    },
+    {
+      "detail": "32 crates declared",
+      "name": "architecture-policy",
+      "verdict": "PASS"
+    },
+    {
+      "detail": "cargo-deny: advisories/licenses/bans/sources PASS",
+      "name": "dependency-governance",
+      "verdict": "PASS"
+    },
+    {
+      "detail": "no affected crates changed",
+      "name": "affected-tests",
+      "verdict": "PASS"
+    },
+    {
+      "detail": "ok",
+      "name": "selected-properties",
+      "verdict": "PASS"
+    }
+  ],
+  "scenarios": []
+}
