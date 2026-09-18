@@ -32,6 +32,8 @@ nexus-workspace = { path = "../../crates/nexus-workspace" }
 nexus-dns = { path = "../../crates/nexus-dns" }
 nexus-outbound-shadowsocks = { path = "../../crates/nexus-outbound-shadowsocks" }
 nexus-outbound-vmess = { path = "../../crates/nexus-outbound-vmess" }
+nexus-outbound-trojan = { path = "../../crates/nexus-outbound-trojan" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 nexus-storage = { path = "../../crates/nexus-storage" }
 nexus-platform = { path = "../../crates/nexus-platform" }
 serde_json = { version = "1", default-features = false, features = ["std"] }

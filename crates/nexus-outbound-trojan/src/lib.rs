@@ -1,0 +1,372 @@
+//! nexus-outbound-trojan
+//!
+//! Trojan 出站 adapter（PRODUCT §11.9）：实现
+//! `nexus-connectivity::OutboundAdapter`，在 TCP 字节流上叠加 TLS（rustls 0.23 + ring）
+//! 与 trojan 请求头 `hex(SHA-224(password)) | CRLF | ATYP+ADDR+PORT | CRLF`。
+//!
+//! 离线确定性 E4：rcgen 动态自签证书，客户端把该唯一证书作为唯一信任根（公钥 pin），
+//! loopback 127.0.0.1 同一进程内 TLS server+client；不连公网。
+
+#![forbid(unsafe_code)]
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+
+use nexus_connectivity::{ConnectivityError, OutboundAdapter, OutboundHandoff};
+use sha2::{Digest, Sha224};
+
+// ---------- 结构化错误 ----------
+
+/// Trojan 出站结构化错误（不以日志文本代替类型）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrojanError {
+    /// 密码首行 hash 不匹配（不泄露密码/hash）。
+    AuthDenied,
+    /// 请求头长度/格式非法。
+    InvalidHeader,
+    /// TLS 配置或握手失败。
+    Tls,
+    /// 底层 I/O 失败。
+    Io,
+}
+
+impl core::fmt::Display for TrojanError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::AuthDenied => write!(f, "trojan auth denied"),
+            Self::InvalidHeader => write!(f, "trojan invalid header"),
+            Self::Tls => write!(f, "trojan tls error"),
+            Self::Io => write!(f, "trojan io error"),
+        }
+    }
+}
+
+impl std::error::Error for TrojanError {}
+
+impl From<std::io::Error> for TrojanError {
+    fn from(_: std::io::Error) -> Self {
+        Self::Io
+    }
+}
+
+// ---------- 目标地址（ATYP 子集） ----------
+
+/// Trojan 请求目标（ATYP 子集，与 shadowsocks 一致）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrojanTarget {
+    /// ATYP=1 IPv4。
+    Ipv4([u8; 4], u16),
+    /// ATYP=3 domain。
+    Domain(String, u16),
+}
+
+impl TrojanTarget {
+    /// 稳定 host 标签（观测/断言用）。
+    #[must_use]
+    pub fn host_label(&self) -> String {
+        match self {
+            Self::Ipv4(oct, _) => oct.iter().map(u8::to_string).collect::<Vec<_>>().join("."),
+            Self::Domain(d, _) => d.clone(),
+        }
+    }
+
+    /// 端口。
+    #[must_use]
+    pub fn port(&self) -> u16 {
+        match self {
+            Self::Ipv4(_, p) | Self::Domain(_, p) => *p,
+        }
+    }
+}
+
+// ---------- 密码 hash 与请求头编解码 ----------
+
+fn to_hex(data: &[u8]) -> String {
+    let mut s = String::with_capacity(data.len() * 2);
+    for b in data {
+        s.push(char::from_digit(u32::from(*b >> 4), 16).unwrap_or('0'));
+        s.push(char::from_digit(u32::from(*b & 0x0f), 16).unwrap_or('0'));
+    }
+    s
+}
+
+/// 计算 trojan 密码首行：`hex(SHA-224(password))`（小写 hex，56 字符）。
+#[must_use]
+pub fn auth_hash(password: &str) -> String {
+    let mut h = Sha224::new();
+    h.update(password.as_bytes());
+    to_hex(&h.finalize())
+}
+
+/// 编码 trojan 请求头：`hex(SHA-224(password)) | CRLF | ATYP+ADDR+PORT | CRLF`。
+#[must_use]
+pub fn encode_request(password: &str, target: &TrojanTarget) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(auth_hash(password).as_bytes());
+    out.extend_from_slice(b"\r\n");
+    match target {
+        TrojanTarget::Ipv4(oct, port) => {
+            out.push(0x01);
+            out.extend_from_slice(oct);
+            out.extend_from_slice(&port.to_be_bytes());
+        }
+        TrojanTarget::Domain(host, port) => {
+            out.push(0x03);
+            out.push(host.len().min(255) as u8);
+            out.extend_from_slice(host.as_bytes());
+            out.extend_from_slice(&port.to_be_bytes());
+        }
+    }
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// 解码并校验 trojan 请求头：先验证首行 `hex(SHA-224(password))`，再解析 ATYP 目标。
+///
+/// # Errors
+///
+/// hash 不匹配返回 `AuthDenied`；头部长度/格式非法返回 `InvalidHeader`。
+pub fn parse_request(password: &str, buf: &[u8]) -> Result<TrojanTarget, TrojanError> {
+    // 找到第一个 CRLF，分隔密码行与地址行。
+    let pos = buf
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .ok_or(TrojanError::InvalidHeader)?;
+    let hash_line = &buf[..pos];
+    let rest = &buf[pos + 2..];
+
+    let expected = auth_hash(password);
+    if hash_line.len() != expected.len() || to_hex(hash_line) != to_hex(expected.as_bytes()) {
+        // 注意：不把 hash 内容写进错误。
+        return Err(TrojanError::AuthDenied);
+    }
+
+    // 地址行应为 ATYP+ADDR+PORT，且以 CRLF 结尾。
+    let addr = rest
+        .strip_suffix(b"\r\n")
+        .ok_or(TrojanError::InvalidHeader)?;
+    if addr.len() < 2 {
+        return Err(TrojanError::InvalidHeader);
+    }
+    match addr[0] {
+        0x01 => {
+            if addr.len() != 1 + 4 + 2 {
+                return Err(TrojanError::InvalidHeader);
+            }
+            let mut oct = [0u8; 4];
+            oct.copy_from_slice(&addr[1..5]);
+            let port = u16::from_be_bytes([addr[5], addr[6]]);
+            Ok(TrojanTarget::Ipv4(oct, port))
+        }
+        0x03 => {
+            let dlen = addr[1] as usize;
+            let need = 2 + dlen + 2;
+            if addr.len() != need {
+                return Err(TrojanError::InvalidHeader);
+            }
+            let host = std::str::from_utf8(&addr[2..2 + dlen])
+                .map_err(|_| TrojanError::InvalidHeader)?
+                .to_string();
+            let port = u16::from_be_bytes([addr[2 + dlen], addr[2 + dlen + 1]]);
+            Ok(TrojanTarget::Domain(host, port))
+        }
+        _ => Err(TrojanError::InvalidHeader),
+    }
+}
+
+// ---------- adapter ----------
+
+/// Trojan 出站 adapter（离线交接；真实 TLS 会话在 example 层）。
+pub struct TrojanAdapter {
+    tag: String,
+    locator: String,
+}
+
+impl TrojanAdapter {
+    /// 构造 adapter。
+    #[must_use]
+    pub fn new(
+        tag: impl Into<String>,
+        locator: impl Into<String>,
+        _password: impl Into<String>,
+    ) -> Self {
+        Self {
+            tag: tag.into(),
+            locator: locator.into(),
+        }
+    }
+
+    /// 配置的服务端 locator。
+    #[must_use]
+    pub fn locator(&self) -> &str {
+        &self.locator
+    }
+}
+
+impl OutboundAdapter for TrojanAdapter {
+    fn outbound_kind(&self) -> &'static str {
+        "trojan"
+    }
+
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    fn handoff(&self, locator: &str) -> Result<OutboundHandoff, ConnectivityError> {
+        Ok(OutboundHandoff {
+            kind: self.outbound_kind().to_string(),
+            tag: self.tag.clone(),
+            locator: locator.to_string(),
+        })
+    }
+}
+
+// ---------- loopback TLS 材料（rcgen 自签 + 公钥 pin） ----------
+
+use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use rustls::{ClientConfig, ServerConfig};
+
+/// 自签证书材料（cert DER + PKCS8 key DER）。
+pub struct LoopbackIdentity {
+    /// 服务端证书 DER（同时作为客户端唯一信任根，即公钥 pin）。
+    pub cert_der: Vec<u8>,
+    /// 服务端私钥 PKCS8 DER。
+    pub key_der: Vec<u8>,
+}
+
+/// 用 rcgen 生成一张自签证书（CN/SAN = localhost），离线、确定性可复现。
+///
+/// # Errors
+///
+/// rcgen 生成失败返回 `Tls`。
+pub fn generate_loopback_identity() -> Result<LoopbackIdentity, TrojanError> {
+    let key_pair = rcgen::KeyPair::generate().map_err(|_| TrojanError::Tls)?;
+    let params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .map_err(|_| TrojanError::Tls)?;
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|_| TrojanError::Tls)?;
+    let key_der = key_pair.serialize_der();
+    let cert_der = cert.der().to_vec();
+    Ok(LoopbackIdentity { cert_der, key_der })
+}
+
+fn ring_provider() -> std::sync::Arc<rustls::crypto::CryptoProvider> {
+    std::sync::Arc::new(rustls::crypto::ring::default_provider())
+}
+
+/// 构造服务端 TLS 配置（仅持有自签证书）。
+///
+/// # Errors
+///
+/// 证书/key 解析失败返回 `Tls`。
+pub fn server_config(identity: &LoopbackIdentity) -> Result<ServerConfig, TrojanError> {
+    let cert = CertificateDer::from(identity.cert_der.clone());
+    let key = PrivatePkcs8KeyDer::from(identity.key_der.clone());
+    let config = ServerConfig::builder_with_provider(ring_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|_| TrojanError::Tls)?
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key.into())
+        .map_err(|_| TrojanError::Tls)?;
+    Ok(config)
+}
+
+/// 构造客户端 TLS 配置：把自签证书作为**唯一**信任根（公钥 pin，不依赖系统根）。
+///
+/// # Errors
+///
+/// 证书加入 root store 失败返回 `Tls`。
+pub fn client_config(identity: &LoopbackIdentity) -> Result<ClientConfig, TrojanError> {
+    let cert = CertificateDer::from(identity.cert_der.clone());
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert).map_err(|_| TrojanError::Tls)?;
+    let config = ClientConfig::builder_with_provider(ring_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|_| TrojanError::Tls)?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(config)
+}
+
+// ---------- TLS 会话 IO 原语 ----------
+
+/// 在已建立的 TLS stream 上写一段字节（flush）。
+///
+/// # Errors
+///
+/// I/O 失败返回 `Io`。
+pub fn tls_write(
+    tls: &mut rustls::Stream<'_, rustls::ClientConnection, TcpStream>,
+    buf: &[u8],
+) -> Result<(), TrojanError> {
+    tls.write_all(buf)?;
+    tls.flush()?;
+    Ok(())
+}
+
+/// 从 TLS stream 读满 `out.len()` 字节。
+///
+/// # Errors
+///
+/// 连接过早关闭或 I/O 失败返回 `Io`。
+pub fn tls_read_exact(
+    tls: &mut rustls::Stream<'_, rustls::ClientConnection, TcpStream>,
+    out: &mut [u8],
+) -> Result<(), TrojanError> {
+    tls.read_exact(out)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_hash_is_56_hex() {
+        let h = auth_hash("demo");
+        assert_eq!(h.len(), 56);
+        assert!(h.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn request_roundtrip_ipv4() {
+        let t = TrojanTarget::Ipv4([127, 0, 0, 1], 8388);
+        let raw = encode_request("demo", &t);
+        assert!(raw.ends_with(b"\r\n"));
+        assert_eq!(parse_request("demo", &raw).unwrap(), t);
+    }
+
+    #[test]
+    fn request_roundtrip_domain() {
+        let t = TrojanTarget::Domain("target.internal".to_string(), 1080);
+        let raw = encode_request("pw", &t);
+        assert_eq!(parse_request("pw", &raw).unwrap(), t);
+    }
+
+    #[test]
+    fn wrong_password_is_auth_denied() {
+        let t = TrojanTarget::Ipv4([127, 0, 0, 1], 9000);
+        let raw = encode_request("correct", &t);
+        assert_eq!(parse_request("wrong", &raw), Err(TrojanError::AuthDenied));
+    }
+
+    #[test]
+    fn adapter_kind_and_handoff() {
+        let a = TrojanAdapter::new("trojan-out", "troj.example:443", "pw");
+        assert_eq!(a.outbound_kind(), "trojan");
+        assert_eq!(a.tag(), "trojan-out");
+        let h = a.handoff("10.0.0.1:443").unwrap();
+        assert_eq!(h.kind, "trojan");
+        assert_eq!(h.locator, "10.0.0.1:443");
+    }
+
+    #[test]
+    fn loopback_identity_generates() {
+        let id = generate_loopback_identity().unwrap();
+        assert!(!id.cert_der.is_empty());
+        assert!(!id.key_der.is_empty());
+        server_config(&id).unwrap();
+        client_config(&id).unwrap();
+    }
+}
