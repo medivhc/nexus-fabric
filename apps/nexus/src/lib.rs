@@ -4113,7 +4113,11 @@ impl nexus_measurement::LatencyProbe for TcpLatencyProbe {
         let start = std::time::Instant::now();
         let socket = std::net::TcpStream::connect_timeout(&addr, self.timeout)
             .map_err(|e| format!("connect failed: {e}"))?;
-        let rtt_ms = u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX);
+        // 最小刻度 1ms：loopback 建连 <1ms 时 as_millis() 截断为 0，产品口径
+        // 不允许 0（0 语义保留给"无测量"），统一钳制为 1。
+        let rtt_ms = u32::try_from(start.elapsed().as_millis())
+            .map(|ms| ms.max(1))
+            .unwrap_or(u32::MAX);
         drop(socket);
         Ok(LinkMeasurement {
             rtt_ms: Some(rtt_ms),
