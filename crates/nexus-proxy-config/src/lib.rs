@@ -220,6 +220,8 @@ pub enum OutboundKind {
     Direct,
     /// 进程内中继（复用 nexus-connectivity Relay 链路）。
     Relay,
+    /// Shadowsocks AEAD 出站（§11.6；nexus-outbound-shadowsocks）。
+    Shadowsocks,
 }
 
 impl OutboundKind {
@@ -229,6 +231,7 @@ impl OutboundKind {
         match self {
             Self::Direct => "direct",
             Self::Relay => "relay",
+            Self::Shadowsocks => "shadowsocks",
         }
     }
 
@@ -236,9 +239,12 @@ impl OutboundKind {
         match s {
             "direct" => Ok(Self::Direct),
             "relay" => Ok(Self::Relay),
+            "shadowsocks" => Ok(Self::Shadowsocks),
             other => Err(ConfigError::new(
                 "kind",
-                format!("unknown outbound kind '{other}' (P0 supports 'direct'/'relay')"),
+                format!(
+                    "unknown outbound kind '{other}' (supports 'direct'/'relay'/'shadowsocks')"
+                ),
             )),
         }
     }
@@ -249,8 +255,12 @@ impl OutboundKind {
 pub struct OutboundConfig {
     pub tag: String,
     pub kind: OutboundKind,
-    /// 出口 locator（direct 可空）。
+    /// 出口 locator（direct 可空；shadowsocks 形如 host:port）。
     pub locator: Option<String>,
+    /// shadowsocks method（仅 shadowsocks 出站）。
+    pub method: Option<String>,
+    /// shadowsocks password（仅 shadowsocks 出站）。
+    pub password: Option<String>,
 }
 
 /// DNS 多 server 路由配置（PRODUCT §11.5）。
@@ -572,7 +582,15 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
             let kind =
                 OutboundKind::parse(kind_s).map_err(|e| refield(e, &format!("{field}.kind")))?;
             let locator = opt_str(item, "locator");
-            outbounds.push(OutboundConfig { tag, kind, locator });
+            let method = opt_str(item, "method");
+            let password = opt_str(item, "password");
+            outbounds.push(OutboundConfig {
+                tag,
+                kind,
+                locator,
+                method,
+                password,
+            });
         }
     }
     if outbounds.is_empty() {
@@ -580,6 +598,24 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
             "outbounds",
             "at least one outbound required",
         ));
+    }
+
+    // Shadowsocks 出站必须携带合法 method 与非空 password（§11.6）。
+    for o in &outbounds {
+        if o.kind == OutboundKind::Shadowsocks {
+            if o.method.as_deref() != Some("chacha20-ietf-poly1305") {
+                return Err(ConfigError::new(
+                    format!("outbounds[{}].method", o.tag),
+                    "shadowsocks outbound requires method 'chacha20-ietf-poly1305'",
+                ));
+            }
+            if o.password.as_ref().map(String::is_empty).unwrap_or(true) {
+                return Err(ConfigError::new(
+                    format!("outbounds[{}].password", o.tag),
+                    "shadowsocks outbound requires a non-empty password",
+                ));
+            }
+        }
     }
 
     // ---- groups ----
