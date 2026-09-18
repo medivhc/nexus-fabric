@@ -177,6 +177,204 @@ impl OutboundAdapter for ShadowsocksAdapter {
     }
 }
 
+// ---------- 真实 TCP 会话层（§11.6.1） ----------
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+
+/// 会话方向角色：决定 c2s / s2c 哪把 key 用于发送。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// 客户端：TX=c2s key，RX=s2c key。
+    Client,
+    /// 服务端：TX=s2c key，RX=c2s key。
+    Server,
+}
+
+/// SS 请求目标地址（ATYP 子集）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SsTarget {
+    /// ATYP=1 IPv4。
+    Ipv4([u8; 4], u16),
+    /// ATYP=3 domain。
+    Domain(String, u16),
+}
+
+impl SsTarget {
+    /// 稳定 host 标签（观测/断言用）。
+    #[must_use]
+    pub fn host_label(&self) -> String {
+        match self {
+            Self::Ipv4(oct, _) => oct.iter().map(u8::to_string).collect::<Vec<_>>().join("."),
+            Self::Domain(d, _) => d.clone(),
+        }
+    }
+
+    /// 端口。
+    #[must_use]
+    pub fn port(&self) -> u16 {
+        match self {
+            Self::Ipv4(_, p) | Self::Domain(_, p) => *p,
+        }
+    }
+}
+
+/// 编码 SS request header：`ATYP | addr | port(2 BE)`。
+///
+/// IPv4 为 `0x01 | 4 字节 IP | port`；domain 为 `0x03 | len(1) | host | port`。
+#[must_use]
+pub fn encode_request(target: &SsTarget) -> Vec<u8> {
+    let mut out = Vec::new();
+    match target {
+        SsTarget::Ipv4(oct, port) => {
+            out.push(0x01);
+            out.extend_from_slice(oct);
+            out.extend_from_slice(&port.to_be_bytes());
+        }
+        SsTarget::Domain(host, port) => {
+            out.push(0x03);
+            out.push(host.len().min(255) as u8);
+            out.extend_from_slice(host.as_bytes());
+            out.extend_from_slice(&port.to_be_bytes());
+        }
+    }
+    out
+}
+
+/// 解码 SS request header 原始字节；ATYP/长度非法返回 `InvalidFrame`。
+///
+/// # Errors
+///
+/// 长度不足、未知 ATYP、domain 长度与实际不符返回 `InvalidFrame`。
+pub fn parse_request(buf: &[u8]) -> Result<SsTarget, OutboundCipherError> {
+    if buf.len() < 2 {
+        return Err(OutboundCipherError::InvalidFrame);
+    }
+    match buf[0] {
+        0x01 => {
+            if buf.len() != 1 + 4 + 2 {
+                return Err(OutboundCipherError::InvalidFrame);
+            }
+            let mut oct = [0u8; 4];
+            oct.copy_from_slice(&buf[1..5]);
+            let port = u16::from_be_bytes([buf[5], buf[6]]);
+            Ok(SsTarget::Ipv4(oct, port))
+        }
+        0x03 => {
+            let dlen = buf[1] as usize;
+            let need = 2 + dlen + 2;
+            if buf.len() != need {
+                return Err(OutboundCipherError::InvalidFrame);
+            }
+            let host = std::str::from_utf8(&buf[2..2 + dlen])
+                .map_err(|_| OutboundCipherError::InvalidFrame)?
+                .to_string();
+            let port = u16::from_be_bytes([buf[2 + dlen], buf[2 + dlen + 1]]);
+            Ok(SsTarget::Domain(host, port))
+        }
+        _ => Err(OutboundCipherError::InvalidFrame),
+    }
+}
+
+/// 双向加密会话流：c2s/s2c 两把独立 key（HKDF info 区分），TX 方向固定计数 nonce。
+pub struct SsStream {
+    tx: ChaCha20Poly1305,
+    rx: ChaCha20Poly1305,
+    tx_counter: u64,
+}
+
+fn derive_key(method: SsMethod, ikm: &[u8], info: &[u8]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(method.as_str().as_bytes()), ikm);
+    let mut out = [0u8; 32];
+    hk.expand(info, &mut out).expect("hkdf expand 32 bytes");
+    out
+}
+
+impl SsStream {
+    /// 按角色构造会话：Client TX=c2s/RX=s2c；Server 相反。
+    ///
+    /// # Errors
+    ///
+    /// key 派生失败返回 `KeyDerivation`（HKDF 固定 32B 实际不会失败）。
+    pub fn new(password: &str, method: SsMethod, role: Role) -> Result<Self, OutboundCipherError> {
+        let ikm = password.as_bytes();
+        let c2s = derive_key(method, ikm, b"ss-c2s");
+        let s2c = derive_key(method, ikm, b"ss-s2c");
+        let (tx, rx) = match role {
+            Role::Client => (c2s, s2c),
+            Role::Server => (s2c, c2s),
+        };
+        Ok(Self {
+            tx: ChaCha20Poly1305::new(Key::from_slice(&tx)),
+            rx: ChaCha20Poly1305::new(Key::from_slice(&rx)),
+            tx_counter: 0,
+        })
+    }
+
+    /// 加密一段明文记录：输出 `nonce(12B) || ciphertext+tag`。
+    ///
+    /// # Errors
+    ///
+    /// AEAD 加密失败返回 `DecryptFailed`。
+    pub fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, OutboundCipherError> {
+        let mut nonce = [0u8; 12];
+        nonce[..8].copy_from_slice(&self.tx_counter.to_le_bytes());
+        self.tx_counter = self.tx_counter.wrapping_add(1);
+        let ct = self
+            .tx
+            .encrypt(Nonce::from_slice(&nonce), plaintext)
+            .map_err(|_| OutboundCipherError::DecryptFailed)?;
+        let mut frame = nonce.to_vec();
+        frame.extend(ct);
+        Ok(frame)
+    }
+
+    /// 解密一段 `nonce(12B) || ciphertext+tag` 记录（用 RX key，帧内 nonce）。
+    ///
+    /// # Errors
+    ///
+    /// 帧过短返回 `InvalidFrame`；AEAD 校验失败返回 `DecryptFailed`。
+    pub fn open(&mut self, frame: &[u8]) -> Result<Vec<u8>, OutboundCipherError> {
+        if frame.len() < 12 + 16 {
+            return Err(OutboundCipherError::InvalidFrame);
+        }
+        let (nonce, ct) = frame.split_at(12);
+        self.rx
+            .decrypt(Nonce::from_slice(nonce), ct)
+            .map_err(|_| OutboundCipherError::DecryptFailed)
+    }
+}
+
+/// 写一条记录帧：`u32 BE length || record`。
+///
+/// # Errors
+///
+/// 底层 I/O 错误透传为 `std::io::Error`。
+pub fn write_record(stream: &mut TcpStream, record: &[u8]) -> std::io::Result<()> {
+    stream.write_all(&u32::to_be_bytes(record.len() as u32))?;
+    stream.write_all(record)
+}
+
+/// 读一条记录帧：先读 `u32 BE length`，再读对应字节。
+///
+/// # Errors
+///
+/// 连接过早关闭或长度非法时返回 `std::io::Error`。
+pub fn read_record(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf)?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > 16 * 1024 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "record too large",
+        ));
+    }
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +413,44 @@ mod tests {
         assert_eq!(a.outbound_kind(), "shadowsocks");
         assert_eq!(a.method_label(), "chacha20-ietf-poly1305");
         assert_eq!(a.tag(), "t");
+    }
+
+    #[test]
+    fn request_codec_ipv4_roundtrip() {
+        let t = SsTarget::Ipv4([127, 0, 0, 1], 8388);
+        let enc = encode_request(&t);
+        assert_eq!(parse_request(&enc).unwrap(), t);
+        assert_eq!(t.host_label(), "127.0.0.1");
+        assert_eq!(t.port(), 8388);
+    }
+
+    #[test]
+    fn request_codec_domain_roundtrip() {
+        let t = SsTarget::Domain("target.internal".to_string(), 1080);
+        let enc = encode_request(&t);
+        assert_eq!(parse_request(&enc).unwrap(), t);
+    }
+
+    #[test]
+    fn session_client_server_seal_open() {
+        let mut client = SsStream::new("pw", SsMethod::Chacha20IetfPoly1305, Role::Client).unwrap();
+        let mut server = SsStream::new("pw", SsMethod::Chacha20IetfPoly1305, Role::Server).unwrap();
+        let req = encode_request(&SsTarget::Ipv4([127, 0, 0, 1], 9000));
+        let frame = client.seal(&req).unwrap();
+        let plain = server.open(&frame).unwrap();
+        assert_eq!(plain, req);
+        // reverse direction uses s2c key.
+        let reply = server.seal(b"echo").unwrap();
+        assert_eq!(client.open(&reply).unwrap(), b"echo");
+    }
+
+    #[test]
+    fn session_wrong_password_fails() {
+        let mut client =
+            SsStream::new("one", SsMethod::Chacha20IetfPoly1305, Role::Client).unwrap();
+        let mut server =
+            SsStream::new("two", SsMethod::Chacha20IetfPoly1305, Role::Server).unwrap();
+        let frame = client.seal(b"x").unwrap();
+        assert!(server.open(&frame).is_err());
     }
 }
