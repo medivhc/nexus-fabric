@@ -854,6 +854,215 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Clash 订阅节点解析（PRODUCT.md §11.8）
+// ---------------------------------------------------------------------------
+
+/// 一条被显式拒绝（不支持）的订阅节点行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectedEntry {
+    /// 原始行文本（截断保留以可诊断）。
+    pub line: String,
+    /// 拒绝原因（如 "unsupported scheme 'trojan'"）。
+    pub reason: String,
+}
+
+/// 订阅解析结果：成功映射的出站 + 被拒绝的行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionParse {
+    /// 映射出的出站（ss/vmess）。
+    pub outbounds: Vec<OutboundConfig>,
+    /// 显式拒绝的行（未知协议等，非致命）。
+    pub rejected: Vec<RejectedEntry>,
+}
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// 标准 base64 字母表解码（支持 `=` 填充；输入先剥离全部空白）。
+///
+/// # Errors
+///
+/// 含非字母表字符、或长度对齐非法时返回 `ConfigError`。
+fn base64_decode(text: &str) -> Result<Vec<u8>, ConfigError> {
+    let clean: Vec<u8> = text.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let mut lut = [u8::MAX; 256];
+    for (i, &c) in B64.iter().enumerate() {
+        lut[c as usize] = i as u8;
+    }
+    let mut out = Vec::with_capacity(clean.len() / 4 * 3);
+    let mut iter = clean.iter().copied().enumerate().peekable();
+    while let Some((idx, byte)) = iter.next() {
+        if byte == b'=' {
+            break;
+        }
+        let d0 = lut[byte as usize];
+        if d0 == u8::MAX {
+            return Err(ConfigError::new(
+                "subscription",
+                format!("invalid base64 char at byte {idx}"),
+            ));
+        }
+        let Some((_, b1)) = iter.next() else {
+            return Err(ConfigError::new("subscription", "truncated base64"));
+        };
+        let d1 = lut[b1 as usize];
+        if d1 == u8::MAX {
+            return Err(ConfigError::new("subscription", "invalid base64 char"));
+        }
+        out.push((d0 << 2) | (d1 >> 4));
+        // 第三个 sextet：可能是 '=' 填充。
+        match iter.next() {
+            Some((_, b2)) if b2 != b'=' => {
+                let d2 = lut[b2 as usize];
+                if d2 == u8::MAX {
+                    return Err(ConfigError::new("subscription", "invalid base64 char"));
+                }
+                out.push((d1 << 4) | (d2 >> 2));
+                match iter.next() {
+                    Some((_, b3)) if b3 != b'=' => {
+                        let d3 = lut[b3 as usize];
+                        if d3 == u8::MAX {
+                            return Err(ConfigError::new("subscription", "invalid base64 char"));
+                        }
+                        out.push((d2 << 6) | d3);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    let _ = &mut iter;
+    Ok(out)
+}
+
+/// 从 `host:port` 末尾拆出端口。
+fn split_host_port(hostport: &str) -> Option<(&str, u16)> {
+    let (host, port) = hostport.rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    Some((host, port))
+}
+
+/// 解析单行 `scheme://userinfo@host:port#name` 为出站；不支持的 scheme 返回 rejected 原因。
+fn parse_node_line(line: &str) -> Result<OutboundConfig, (String, RejectedEntry)> {
+    let (scheme, rest) = line.split_once("://").ok_or_else(|| {
+        (
+            line.to_string(),
+            RejectedEntry {
+                line: line.to_string(),
+                reason: "no scheme".to_string(),
+            },
+        )
+    })?;
+    let (target, name) = rest.split_once('#').unwrap_or((rest, line));
+    let name = percent_name(name);
+    let (userinfo, hostport) = target.rsplit_once('@').ok_or_else(|| {
+        (
+            line.to_string(),
+            RejectedEntry {
+                line: line.to_string(),
+                reason: "missing userinfo@host".to_string(),
+            },
+        )
+    })?;
+    let (host, port) = split_host_port(hostport).ok_or_else(|| {
+        (
+            line.to_string(),
+            RejectedEntry {
+                line: line.to_string(),
+                reason: "bad host:port".to_string(),
+            },
+        )
+    })?;
+    let locator = format!("{host}:{port}");
+
+    match scheme {
+        "ss" => {
+            // userinfo = base64("method:password")
+            let raw = base64_decode(userinfo).map_err(|e| {
+                (
+                    line.to_string(),
+                    RejectedEntry {
+                        line: line.to_string(),
+                        reason: format!("ss userinfo decode: {e}"),
+                    },
+                )
+            })?;
+            let text = String::from_utf8(raw).map_err(|_| {
+                (
+                    line.to_string(),
+                    RejectedEntry {
+                        line: line.to_string(),
+                        reason: "ss userinfo not utf-8".to_string(),
+                    },
+                )
+            })?;
+            let (method, password) = text.split_once(':').ok_or_else(|| {
+                (
+                    line.to_string(),
+                    RejectedEntry {
+                        line: line.to_string(),
+                        reason: "ss userinfo needs method:password".to_string(),
+                    },
+                )
+            })?;
+            Ok(OutboundConfig {
+                tag: name,
+                kind: OutboundKind::Shadowsocks,
+                locator: Some(locator),
+                method: Some(method.to_string()),
+                password: Some(password.to_string()),
+            })
+        }
+        "vmess" => Ok(OutboundConfig {
+            tag: name,
+            kind: OutboundKind::Vmess,
+            locator: Some(locator),
+            method: Some("chacha20-poly1305".to_string()),
+            password: Some(userinfo.to_string()),
+        }),
+        other => Err((
+            line.to_string(),
+            RejectedEntry {
+                line: line.to_string(),
+                reason: format!("unsupported scheme '{other}'"),
+            },
+        )),
+    }
+}
+
+/// `#name` 去除可能的 `%23` 等编码占位；本期仅做字面截取，保留可读字符。
+fn percent_name(raw: &str) -> String {
+    raw.trim().to_string()
+}
+
+/// 解析 Clash/通用 base64 订阅文本为出站列表 + 拒绝行（§11.8，纯函数、离线）。
+///
+/// # Errors
+///
+/// 整段 base64 非法（字符/对齐）返回 `ConfigError`。
+pub fn parse_clash_subscription(text: &str) -> Result<SubscriptionParse, ConfigError> {
+    let bytes = base64_decode(text)?;
+    let decoded = String::from_utf8(bytes)
+        .map_err(|_| ConfigError::new("subscription", "decoded bytes not utf-8"))?;
+    let mut outbounds = Vec::new();
+    let mut rejected = Vec::new();
+    for line in decoded.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match parse_node_line(line) {
+            Ok(o) => outbounds.push(o),
+            Err((_, entry)) => rejected.push(entry),
+        }
+    }
+    Ok(SubscriptionParse {
+        outbounds,
+        rejected,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
