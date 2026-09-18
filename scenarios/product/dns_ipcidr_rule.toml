@@ -1,0 +1,36 @@
+schema_version = 1
+id = "product.dns-ipcidr-rule"
+title = "DNS IP-CIDR 规则选 server + 解析缓存按 server 隔离（离线确定性）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-proxy-kernel"
+
+[given]
+servers = "server-a / server-b, each with an injected offline mock Resolver"
+rules = "one ip_cidr 10.0.0.0/8 -> server-a; MATCH default -> server-b"
+offline = "mock resolvers only; no real DNS transport"
+
+# Executable E4: a request whose client_ip is in 10.0.0.0/8 must route to server-a;
+# a request outside the prefix routes to server-b (MATCH). Cache isolation: after
+# warming server-a for a shared name, server-b's same-name query must NOT hit server-a's cache.
+[when]
+command = "cargo run --quiet -p nexus --example dns_ipcidr_rule -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "ipcidr_server"
+equals = "server-a"
+
+[[expect]]
+field = "other_server"
+equals = "server-b"
+
+[[expect]]
+field = "a_cache_hit"
+equals = true
+
+[[expect]]
+field = "b_cache_isolated"
+equals = true

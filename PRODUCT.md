@@ -280,6 +280,21 @@ SOCKS5 入站（Socks5Handshake 状态机，真实字节流）
 - E4 场景：`scenarios/product/dns_rule_server_selection.toml`（两个 server A/B，规则把
   example.internal 指向 A、其余 MATCH 指向 B；离线注入，断言路由与解析结果）。
 
+### 11.5.1 DNS IP-CIDR 规则与按 server 缓存隔离（P1，2026-09-18）
+
+在多 server DNS 路由（§11.5）上扩两件事：
+
+- **IP-CIDR 规则**：`DnsRouteRule` 除域名匹配外新增 IP-CIDR 匹配。请求携带可选的
+  客户端/目标 `client_ip`；规则按声明顺序首匹配，域名规则语义不变，IP-CIDR 规则仅在
+  `client_ip` 为 IPv4 且落在该前缀时命中，否则落到 `default_server`（MATCH 兜底）。
+  本期只支持 IPv4 前缀（`a.b.c.d/p`，p∈0..32），手写确定性解析，不引入 IP 解析第三方依赖。
+- **按 server 缓存隔离**：`MultiServerDns` 的解析缓存按 `(server_tag, name, qtype)` 分键，
+  不同 server 不共享缓存。向 server A 查过的记录不会让 server B 的同名查询直接命中 A 的缓存——
+  跨 server 解析必须经该 server 自己注入的 `Resolver`。这避免跨 server 结果污染。
+- 既有单 server `DnsRuntime` 的缓存/环路/RDRC/Exit-DNS Binding 语义与既有三条 DNS
+  冻结场景（`dns_exit_binding` / `observability_dns_cache` / `dns_rule_server_selection`）零回归。
+- E4 场景：`scenarios/product/dns_ipcidr_rule.toml`。
+
 ### 11.6 OutboundAdapter 接缝与 Shadowsocks 出站（AEAD，2026-09-18）
 
 把 `nexus-connectivity` 的出站激活从闭合的 `LinkKind {Direct, Relay}` 枚举推广为显式

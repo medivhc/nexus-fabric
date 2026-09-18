@@ -142,6 +142,21 @@ impl MultiServerDns {
 
 Public API 变更必须保持结构化、可版本化并有调用方验证。
 
+### 冻结契约：DNS IP-CIDR 规则与按 server 缓存隔离（§11.5.1，scenarios/product/dns_ipcidr_rule.toml）
+
+- `enum DnsMatch { Domain(String), IpCidr { network: u32, prefix: u8 } }`；
+  `DnsRouteRule { matcher: DnsMatch, server: String }`。域名匹配语义不变。
+- `DnsRouter::select(name, client_ip: Option<IpAddr>) -> DnsServerSelection`：
+  按声明顺序首匹配；`IpCidr` 规则仅当 `client_ip` 是 IPv4 且 `(ip & mask) == network` 时命中；
+  无命中走 `default_server`。`select_server(name)` 等价于 `select(name, None)`。
+- IPv4 CIDR 手写解析：`a.b.c.d/p`，p∈0..=32；非法前缀/非法 IP 由 config 层拒绝。
+- `MultiServerDns` 缓存键 = `(server_tag, name, qtype)`：不同 server 分表，互不命中；
+  命中返回 `from_cache=true` 且不调用该 server 注入的 `Resolver`。
+- `MultiServerDns::resolve_with(name, qtype, client_ip)`；`resolve(name, qtype)` 等价
+  `resolve_with(name, qtype, None)`。`ServerResolved` 新增 `from_cache: bool`。
+- 不变量：跨 server 同名查询不共享缓存；既有单 server `DnsRuntime` 语义与既有 DNS 冻结场景零回归。
+- 离线确定性：缓存由 Composition Root 注入的 mock `Resolver` 产生，本层不发起真实网络。
+
 ## Verification
 
 最低：
