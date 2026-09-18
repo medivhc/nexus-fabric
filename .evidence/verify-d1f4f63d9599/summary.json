@@ -1,0 +1,21 @@
+{
+  "bindings": {
+    "configuration_digest": "5c0f3649d31a2f991867a0946c0724127afa1e27",
+    "contract_hash": "7fa5de1da7f27767da5cfcd675e6e042f8093c07",
+    "dirty_state": true,
+    "feature_set": [
+      "workspace:default"
+    ],
+    "harness_schema_version": 1,
+    "platform_capability_digest": "1bf5ebe28eab776674d87e5d5770d3266aaa7d89",
+    "source_revision": "d7c40dddac6b7c8db1dcf742e7efa5d0b6273ead",
+    "target_triple": "x86_64-pc-windows-msvc",
+    "toolchain_version": "1.95.0",
+    "working_tree_digest": "161f844c841e9ce74f3daf8cd09de1f1fa4e163c"
+  },
+  "command": "verify",
+  "id": "d1f4f63d9599",
+  "message": "full verify: 21 gates, 21 pass, 0 fail, 0 unknown",
+  "schema_version": 1,
+  "verdict": "PASS"
+}
