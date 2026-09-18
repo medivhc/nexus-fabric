@@ -13,6 +13,8 @@ P0 实现边界（`DnsRuntime`）：
 - RDRC 负缓存：解析失败进入负缓存，TTL 内不重试底层解析；
 - Exit-DNS Binding：按 `domain -> exit` 规则决策出口，决策结果进入
   `NetworkPlanExtension.exit_dns_binding`（`version = NetworkPlanExtension::VERSION`）。
+- 多 server DNS 路由（`DnsRouter` + `MultiServerDns`）：配置多个注入式 `Resolver` server，
+  按域名规则首匹配选择本次解析走哪个 server，MATCH 兜底；路由决策可观察。
 
 ## Non-Responsibilities
 
@@ -54,6 +56,13 @@ P0 实现边界（`DnsRuntime`）：
   `PreferV4` 使 v4 地址排前、`PreferV6` 使 v6 地址排前。
 - Exit-DNS Binding：`exit_dns_binding(name)` 返回首个匹配 `domain -> exit` 规则
   的出口；无匹配返回 `None`；决策数据只进入 `NetworkPlanExtension`。
+- DNS 多 server 路由：规则表声明顺序首匹配；域名匹配 = 精确或 `.{domain}` 子域；
+  无具体命中 -> `default_server`。
+- `MultiServerDns::new` 校验所有规则与 `default_server` 引用的 server tag 均存在；
+  悬空返回 `DnsError::UnknownServer`。
+- 选中 server 后，解析只经该 server 注入的 `Resolver` 完成，不跨 server。
+- 多 server 路由为离线确定性决策：`Resolver` 由 Composition Root 注入，本层不发起真实网络。
+- 既有单 server `DnsRuntime` 的缓存/环路守卫/RDRC/Exit-DNS Binding 语义不变。
 - DNS 特定规划数据进入 NetworkPlanExtension。
 - 系统 DNS 修改由 Platform Capability 完成。
 
@@ -105,6 +114,24 @@ struct ExitDnsDecision {
     from_cache: bool,
     exit: Option<String>,
     preference: IpPreference,
+}
+
+// --- DNS 多 server 路由（§11.5）---
+// DnsError 新增变体：UnknownServer(String)。
+struct DnsRouteRule { domain: String, server: String }
+struct DnsServerSelection { server: String, matched_domain: Option<String> }
+struct DnsRouter { /* rules: Vec<DnsRouteRule>, default_server: String */ }
+impl DnsRouter {
+    fn new(rules: Vec<DnsRouteRule>, default_server: String) -> Self;
+    fn select(&self, name: &str) -> DnsServerSelection;
+}
+struct ServerResolved { name: String, server: String, addresses: Vec<IpAddr> }
+struct MultiServerDns { /* servers: Vec<(String, Box<dyn Resolver>), router: DnsRouter */ }
+impl MultiServerDns {
+    fn new(servers: Vec<(String, Box<dyn Resolver>)>, router: DnsRouter)
+        -> Result<Self, DnsError>;   // 悬空 server tag -> UnknownServer
+    fn select_server(&self, name: &str) -> DnsServerSelection;
+    fn resolve(&mut self, name: &str, qtype: DnsType) -> Result<ServerResolved, DnsError>;
 }
 ```
 
