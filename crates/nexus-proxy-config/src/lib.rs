@@ -65,6 +65,8 @@ pub struct ProxyConfig {
     pub groups: Vec<GroupConfig>,
     /// 出站定义（direct / relay）。
     pub outbounds: Vec<OutboundConfig>,
+    /// 可选 DNS 多 server 路由段（§11.5）。
+    pub dns: Option<DnsConfig>,
 }
 
 /// 入站监听配置。
@@ -249,6 +251,33 @@ pub struct OutboundConfig {
     pub kind: OutboundKind,
     /// 出口 locator（direct 可空）。
     pub locator: Option<String>,
+}
+
+/// DNS 多 server 路由配置（PRODUCT §11.5）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsConfig {
+    /// 可选 DNS server 定义。
+    pub servers: Vec<DnsServerConfig>,
+    /// 有序域名路由规则（首匹配）。
+    pub rules: Vec<DnsRouteRuleConfig>,
+    /// MATCH 兜底 server tag。
+    pub default_server: String,
+}
+
+/// 单个 DNS server 配置。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsServerConfig {
+    /// server 标识。
+    pub tag: String,
+    /// 上游地址（离线标签，本期不拨号）。
+    pub address: String,
+}
+
+/// 一条 DNS 路由规则配置：命中 `domain` 的查询走 `server`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsRouteRuleConfig {
+    pub domain: String,
+    pub server: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -651,6 +680,41 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
         });
     }
 
+    // ---- dns（可选，§11.5）----
+    let dns = if let Some(dns_node) = root.get("dns") {
+        let sseq = req_seq(dns_node, "servers", "dns")?;
+        let mut servers = Vec::new();
+        for (i, item) in sseq.iter().enumerate() {
+            let f = format!("dns.servers[{i}]");
+            let tag = req_str(item, "tag", &f)?.to_string();
+            let address = req_str(item, "address", &f)?.to_string();
+            servers.push(DnsServerConfig { tag, address });
+        }
+        if servers.is_empty() {
+            return Err(ConfigError::new(
+                "dns.servers",
+                "at least one dns server required",
+            ));
+        }
+        let mut rules = Vec::new();
+        if let Some(rseq) = dns_node.get("rules").and_then(Node::as_seq) {
+            for (i, item) in rseq.iter().enumerate() {
+                let f = format!("dns.rules[{i}]");
+                let domain = req_str(item, "domain", &f)?.to_string();
+                let server = req_str(item, "server", &f)?.to_string();
+                rules.push(DnsRouteRuleConfig { domain, server });
+            }
+        }
+        let default_server = req_str(dns_node, "default_server", "dns")?.to_string();
+        Some(DnsConfig {
+            servers,
+            rules,
+            default_server,
+        })
+    } else {
+        None
+    };
+
     // ---- 结构化校验（MODULE.md Invariants / PRODUCT.md §11.3） ----
     if rules.last().map(|r| r.kind) != Some(RuleKind::Match) {
         return Err(ConfigError::new(
@@ -680,6 +744,25 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
         }
     }
 
+    // DNS 规则与兜底引用的 server tag 必须已定义（DNS_SERVER_UNRESOLVED）。
+    if let Some(cfg) = &dns {
+        let dns_tags: BTreeSet<&str> = cfg.servers.iter().map(|s| s.tag.as_str()).collect();
+        for r in &cfg.rules {
+            if !dns_tags.contains(r.server.as_str()) {
+                return Err(ConfigError::new(
+                    format!("dns.rules[{}].server", r.domain),
+                    format!("dns server '{}' is not defined", r.server),
+                ));
+            }
+        }
+        if !dns_tags.contains(cfg.default_server.as_str()) {
+            return Err(ConfigError::new(
+                "dns.default_server",
+                format!("dns server '{}' is not defined", cfg.default_server),
+            ));
+        }
+    }
+
     // 策略组候选必须引用已定义出站。
     for g in &groups {
         for c in &g.candidates {
@@ -698,6 +781,7 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
         rules,
         groups,
         outbounds,
+        dns,
     })
 }
 
@@ -786,5 +870,31 @@ outbounds:
         let yaml = "schema_version: 2\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
         let err = parse(yaml).expect_err("must fail");
         assert_eq!(err.field, "schema_version");
+    }
+
+    #[test]
+    fn parses_optional_dns_section() {
+        let yaml = "\
+schema_version: 1\nrules:\n  - tag: m\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\ndns:\n  servers:\n    - tag: a\n      address: 1.1.1.1\n    - tag: b\n      address: 8.8.8.8\n  rules:\n    - domain: example.internal\n      server: a\n  default_server: b\n";
+        let cfg = parse(yaml).expect("ok");
+        let d = cfg.dns.expect("dns present");
+        assert_eq!(d.servers.len(), 2);
+        assert_eq!(d.rules[0].server, "a");
+        assert_eq!(d.default_server, "b");
+    }
+
+    #[test]
+    fn absent_dns_section_is_none() {
+        let yaml = "schema_version: 1\nrules:\n  - tag: m\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
+        let cfg = parse(yaml).expect("ok");
+        assert!(cfg.dns.is_none());
+    }
+
+    #[test]
+    fn dangling_dns_server_is_config_invalid() {
+        let yaml = "\
+schema_version: 1\nrules:\n  - tag: m\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\ndns:\n  servers:\n    - tag: a\n      address: 1.1.1.1\n  rules:\n    - domain: x\n      server: ghost\n  default_server: a\n";
+        let err = parse(yaml).expect_err("must fail");
+        assert!(err.reason.contains("ghost"), "{err:?}");
     }
 }

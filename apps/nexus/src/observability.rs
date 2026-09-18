@@ -56,7 +56,8 @@ fn map_dns(err: DnsError) -> NexusError {
         DnsError::ResolutionFailed(name)
         | DnsError::LoopDetected(name)
         | DnsError::NegativeCached(name)
-        | DnsError::InvalidQuery(name) => NexusError::DnsResolutionFailed { name },
+        | DnsError::InvalidQuery(name)
+        | DnsError::UnknownServer(name) => NexusError::DnsResolutionFailed { name },
     }
 }
 

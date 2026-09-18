@@ -83,6 +83,8 @@ pub enum DnsError {
     NegativeCached(String),
     /// 非法查询（空名等）。
     InvalidQuery(String),
+    /// 多 server 路由（§11.5）：规则或兜底引用的 server tag 未定义。
+    UnknownServer(String),
 }
 
 impl std::fmt::Display for DnsError {
@@ -92,6 +94,7 @@ impl std::fmt::Display for DnsError {
             Self::LoopDetected(name) => write!(f, "dns loop detected for {name}"),
             Self::NegativeCached(name) => write!(f, "dns query {name} is negative-cached"),
             Self::InvalidQuery(name) => write!(f, "invalid dns query: {name:?}"),
+            Self::UnknownServer(tag) => write!(f, "dns server '{tag}' is not defined"),
         }
     }
 }
@@ -170,6 +173,143 @@ pub struct ExitDnsDecision {
     pub exit: Option<String>,
     /// 使用的偏好。
     pub preference: IpPreference,
+}
+
+// ---------- DNS 多 server 路由（§11.5） ----------
+
+/// 一条 DNS 路由规则：命中 `domain`（精确或子域）的查询走指定 `server` tag。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsRouteRule {
+    /// 匹配域名（精确或以 `.` 拼接后缀结尾）。
+    pub domain: String,
+    /// 命中后路由到的 server tag。
+    pub server: String,
+}
+
+/// 一次 server 选择结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsServerSelection {
+    /// 选中的 server tag。
+    pub server: String,
+    /// 命中的规则 domain；无具体命中（走 MATCH 兜底）时为 `None`。
+    pub matched_domain: Option<String>,
+}
+
+/// 多 server 路由器：域名规则声明顺序首匹配，否则 `default_server`（MATCH 兜底）。
+#[derive(Debug, Clone)]
+pub struct DnsRouter {
+    rules: Vec<DnsRouteRule>,
+    default_server: String,
+}
+
+impl DnsRouter {
+    /// 构造路由器。
+    #[must_use]
+    pub fn new(rules: Vec<DnsRouteRule>, default_server: String) -> Self {
+        Self {
+            rules,
+            default_server,
+        }
+    }
+
+    /// 首匹配：查询名等于 `domain` 或以 `.{domain}` 结尾；无命中走 `default_server`。
+    #[must_use]
+    pub fn select(&self, name: &str) -> DnsServerSelection {
+        for rule in &self.rules {
+            if name == rule.domain || name.ends_with(&format!(".{}", rule.domain)) {
+                return DnsServerSelection {
+                    server: rule.server.clone(),
+                    matched_domain: Some(rule.domain.clone()),
+                };
+            }
+        }
+        DnsServerSelection {
+            server: self.default_server.clone(),
+            matched_domain: None,
+        }
+    }
+
+    /// 路由器引用的全部 server tag（规则 + 兜底），供构造期校验。
+    #[must_use]
+    pub fn referenced_servers(&self) -> Vec<&str> {
+        let mut v: Vec<&str> = self.rules.iter().map(|r| r.server.as_str()).collect();
+        v.push(self.default_server.as_str());
+        v
+    }
+}
+
+/// 经选中 server 解析的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerResolved {
+    /// 查询名。
+    pub name: String,
+    /// 实际承担解析的 server tag。
+    pub server: String,
+    /// 该 server 解析出的地址。
+    pub addresses: Vec<IpAddr>,
+}
+
+/// 多 server DNS 运行时：按 `DnsRouter` 选 server，再用该 server 注入的 `Resolver` 解析。
+///
+/// 离线确定性：每个 server 由 Composition Root 注入内存 mock `Resolver`；本层不发起真实网络。
+pub struct MultiServerDns {
+    servers: Vec<(String, Box<dyn Resolver>)>,
+    router: DnsRouter,
+}
+
+impl MultiServerDns {
+    /// 构造并校验：所有规则与 `default_server` 引用的 tag 必须存在于 `servers`，
+    /// 否则返回 `DnsError::UnknownServer`。
+    ///
+    /// # Errors
+    ///
+    /// 任一被引用的 server tag 未在 `servers` 中定义时返回 `UnknownServer`。
+    pub fn new(
+        servers: Vec<(String, Box<dyn Resolver>)>,
+        router: DnsRouter,
+    ) -> Result<Self, DnsError> {
+        let tags: std::collections::BTreeSet<&str> =
+            servers.iter().map(|(t, _)| t.as_str()).collect();
+        for tag in router.referenced_servers() {
+            if !tags.contains(tag) {
+                return Err(DnsError::UnknownServer(tag.to_string()));
+            }
+        }
+        Ok(Self { servers, router })
+    }
+
+    /// 仅做 server 选择（不触发解析）。
+    #[must_use]
+    pub fn select_server(&self, name: &str) -> DnsServerSelection {
+        self.router.select(name)
+    }
+
+    /// 选择 server 并经该 server 的 `Resolver` 解析；不跨 server。
+    ///
+    /// # Errors
+    ///
+    /// 空名返回 `InvalidQuery`；底层 `Resolver` 失败透传其 `DnsError`。
+    pub fn resolve(&mut self, name: &str, qtype: DnsType) -> Result<ServerResolved, DnsError> {
+        if name.is_empty() {
+            return Err(DnsError::InvalidQuery(name.to_string()));
+        }
+        let selection = self.router.select(name);
+        let resolver = self
+            .servers
+            .iter_mut()
+            .find(|(tag, _)| tag == &selection.server)
+            .map(|(_, r)| r)
+            .expect("router validated all referenced server tags exist");
+        let addresses = resolver.resolve(&DnsQuery {
+            name: name.to_string(),
+            qtype,
+        })?;
+        Ok(ServerResolved {
+            name: name.to_string(),
+            server: selection.server,
+            addresses,
+        })
+    }
 }
 
 // ---------- DnsRuntime ----------
@@ -589,5 +729,70 @@ mod tests {
                 .iter()
                 .any(|(n, t)| n == "blacklisted.internal" && *t == DnsType::A)
         );
+    }
+
+    // --- DNS 多 server 路由（§11.5）---
+
+    struct ConstResolver(IpAddr);
+    impl Resolver for ConstResolver {
+        fn resolve(&mut self, _q: &DnsQuery) -> Result<Vec<IpAddr>, DnsError> {
+            Ok(vec![self.0])
+        }
+    }
+
+    fn two_servers() -> MultiServerDns {
+        let rules = vec![DnsRouteRule {
+            domain: "example.internal".to_string(),
+            server: "a".to_string(),
+        }];
+        let router = DnsRouter::new(rules, "b".to_string());
+        let servers = vec![
+            (
+                "a".to_string(),
+                Box::new(ConstResolver(V4)) as Box<dyn Resolver>,
+            ),
+            (
+                "b".to_string(),
+                Box::new(ConstResolver(V6)) as Box<dyn Resolver>,
+            ),
+        ];
+        MultiServerDns::new(servers, router).expect("wire")
+    }
+
+    #[test]
+    fn dns_router_exact_and_suffix_first_match() {
+        let r = two_servers();
+        assert_eq!(r.select_server("example.internal").server, "a");
+        assert_eq!(r.select_server("sub.example.internal").server, "a");
+        assert_eq!(r.select_server("other.example").server, "b");
+    }
+
+    #[test]
+    fn multi_server_resolve_routes_to_selected_server() {
+        let mut r = two_servers();
+        let a = r.resolve("example.internal", DnsType::A).unwrap();
+        assert_eq!(a.server, "a");
+        assert_eq!(a.addresses, vec![V4]);
+        let b = r.resolve("other.example", DnsType::A).unwrap();
+        assert_eq!(b.server, "b");
+        assert_eq!(b.addresses, vec![V6]);
+    }
+
+    #[test]
+    fn multi_server_new_rejects_dangling_server() {
+        let rules = vec![DnsRouteRule {
+            domain: "x".to_string(),
+            server: "ghost".to_string(),
+        }];
+        let router = DnsRouter::new(rules, "b".to_string());
+        let servers = vec![(
+            "b".to_string(),
+            Box::new(ConstResolver(V6)) as Box<dyn Resolver>,
+        )];
+        match MultiServerDns::new(servers, router) {
+            Err(DnsError::UnknownServer(tag)) => assert_eq!(tag, "ghost"),
+            Ok(_) => panic!("expected dangling server to be rejected"),
+            Err(e) => panic!("expected UnknownServer, got {e:?}"),
+        }
     }
 }
