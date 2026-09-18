@@ -75,11 +75,15 @@
 ### §9 可观察性子命令（scenarios/product/observability_*.toml）
 
 - `nexusd status --json` / `dns status --json` / `dns cache --json` /
-  `session watch --json` / `connectivity status --json` / `plan explain --json` /
-  `workspace heads --json` / `workspace conflicts --json` / `compute jobs --json` /
+  `dns resolve --json` / `dns providers --json` /
+  `session watch --json` / `connectivity status --json` /
+  `connectivity candidates --json` / `connectivity probe --json` / `connectivity links --json` /
+  `plan explain --json` /
+  `workspace heads --json` / `workspace conflicts --json` / `workspace cache --json` /
+  `compute jobs --json` /
   `diagnose --json` / `platform capabilities --json`：路由到 SDK `observability` 模块，
   stdout 输出单个 JSON。
-- 领域未就绪子命令（connectivity probe 等）：
+- 领域未就绪子命令（connectivity trace 等）：
   输出 `{"verdict":"FAIL","error":{"code":"UNSUPPORTED","command":"<name>"}}`，exit 0。
 - 无效 CLI 用法仍 exit 非 0。
 

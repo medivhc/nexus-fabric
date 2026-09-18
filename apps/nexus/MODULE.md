@@ -49,14 +49,16 @@
 
 - §9 可观察性命令（PRODUCT.md#9-observability，`observability` 模块，结构化 JSON 快照）：
   - 可用命令：`status` / `plan explain` / `session watch` / `connectivity status` /
-    `dns status` / `dns cache` / `workspace heads` / `workspace conflicts` /
+    `connectivity candidates` / `connectivity probe` / `connectivity links` /
+    `dns status` / `dns cache` / `dns resolve` / `dns providers` /
+    `workspace heads` / `workspace conflicts` / `workspace cache` /
     `compute jobs` / `diagnose` / `platform capabilities`。
   - dns 命令挂 `nexus-dns` `DnsRuntime` snapshot API（缓存/负缓存/调用计数/Exit-DNS Binding）。
   - plan explain 挂 `nexus-planner` DecisionTrace（结构化拒绝原因 label）。
   - workspace heads/conflicts 挂 `nexus-workspace` DAG（Head Set 分叉 / 三方合并冲突快照）。
   - compute jobs 挂 `nexus-compute` ComputeJobSession（内存帧通道提交，Active/Closed 阶段快照）。
   - diagnose 聚合各子系统快照输出健康报告（逐项 ready + overall）。
-  - 领域未就绪命令（connectivity probe 等）返回
+  - 领域未就绪命令（connectivity trace 等）返回
     `NexusError::Unsupported`（PRODUCT §9 禁止静默降级）。
 - 远程闭环组合根（PRODUCT §6）：`remote_*_flow` 系列
   （service/internet-access/compute/workspace/presence），供 nexusd 复用。

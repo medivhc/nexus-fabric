@@ -176,6 +176,21 @@ PRODUCT §9）。
 - `diagnose`：输出子系统健康聚合报告——逐子系统（status/connectivity/dns/workspace/
   plan/session/platform）给出 ready 判定与关键摘要，并输出 overall 结论。
 
+六命令可观察语义（2026-09-18 冻结）：
+
+- `connectivity candidates`：输出链路候选快照——按 LinkKind 构造 direct/relay 候选
+  （locator + setup cost），输出候选清单。
+- `connectivity probe`：输出候选探测快照——对候选逐个执行 `LinkProbe`（内存注入），
+  输出每候选 ok/fail 与激活选择。
+- `connectivity links`：输出已建立链路快照——经 `LinkActivator` 激活选择并输出链路
+  kind、locator 与激活事件链。
+- `dns resolve`：输出解析快照——经 `DnsRuntime` 解析示例域名，输出地址列表、
+  TTL 与 Exit-DNS Binding。
+- `dns providers`：输出 DNS 提供方快照——上游地址集合、Exit 规则表与服务器路由清单
+  （`DnsRouter` 引用服务器）。
+- `workspace cache`：输出内容存储缓存快照——对象计数、protected roots 计数与
+  GC 保留期语义（mark_roots + sweep_older_than）。
+
 ## 10. 完成条件
 
 关键用户可见 Capability 原则上至少需要一条 E4 Product Scenario 或 E5 External Observation 证据。

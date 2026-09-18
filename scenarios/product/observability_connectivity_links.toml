@@ -1,0 +1,38 @@
+schema_version = 1
+id = "product.observability-connectivity-links"
+title = "§9 可观察性：connectivity links 输出已建立链路快照"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#9-observability"
+
+[given]
+domain_state = "link activation ready (LinkActivator direct establishment)"
+observability = "established link snapshot with activation event chain"
+
+[when]
+command = "cargo run --quiet -p nexusd -- connectivity links --json"
+
+# 冻结期望：经 LinkActivator 激活 direct 链路，输出链路 kind/locator 与
+# 激活事件链（requirement-change：2026-09-18，由 UNSUPPORTED 转为真实实现）。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "connectivity links"
+
+[[expect]]
+field = "links.0.kind"
+non_empty = true
+
+[[expect]]
+field = "links.0.locator"
+non_empty = true
+
+[[expect]]
+field = "links.0.events"
+non_empty = true
+
+[[expect]]
+field = "established_count"
+equals = 1

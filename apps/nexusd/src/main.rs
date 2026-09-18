@@ -16,9 +16,9 @@ use serde_json::Value;
 ///   nexusd proxy --addr <ip:port> [--config <path>]                -> 真实 SOCKS5 数据面
 ///   nexusd run <unknown> --json            -> 结构化拒绝（UNKNOWN_RESOURCE，exit 0）
 ///   nexusd status --json                   -> §9 可观察性总览
-///   nexusd dns status --json / dns cache --json
+///   nexusd dns status --json / dns cache --json / dns resolve --json / dns providers --json
 ///   nexusd session watch --json
-///   nexusd connectivity status --json
+///   nexusd connectivity status --json / candidates --json / probe --json / links --json
 ///   nexusd plan explain --json
 ///   nexusd platform capabilities --json
 ///   nexusd <workspace|compute|diagnose> ... --json
@@ -91,12 +91,18 @@ fn dispatch_observability(args: &[String]) -> ExitCode {
         ["status", "--json"] => nexus::observability::status(),
         ["dns", "status", "--json"] => nexus::observability::dns_status(),
         ["dns", "cache", "--json"] => nexus::observability::dns_cache(),
+        ["dns", "resolve", "--json"] => nexus::observability::dns_resolve(),
+        ["dns", "providers", "--json"] => nexus::observability::dns_providers(),
         ["session", "watch", "--json"] => nexus::observability::session_watch(),
         ["connectivity", "status", "--json"] => nexus::observability::connectivity_status(),
+        ["connectivity", "candidates", "--json"] => nexus::observability::connectivity_candidates(),
+        ["connectivity", "probe", "--json"] => nexus::observability::connectivity_probe(),
+        ["connectivity", "links", "--json"] => nexus::observability::connectivity_links(),
         ["plan", "explain", "--json"] => nexus::observability::plan_explain(),
         ["platform", "capabilities", "--json"] => nexus::observability::platform_capabilities(),
         ["workspace", "heads", "--json"] => nexus::observability::workspace_heads(),
         ["workspace", "conflicts", "--json"] => nexus::observability::workspace_conflicts(),
+        ["workspace", "cache", "--json"] => nexus::observability::workspace_cache(),
         ["compute", "jobs", "--json"] => nexus::observability::compute_jobs(),
         ["diagnose", "--json"] => nexus::observability::diagnose(),
         // 领域未就绪命令：显式 UNSUPPORTED（禁止静默降级，exit 0 = 请求已被处理）。

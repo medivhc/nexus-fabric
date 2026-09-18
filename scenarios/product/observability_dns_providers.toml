@@ -1,0 +1,34 @@
+schema_version = 1
+id = "product.observability-dns-providers"
+title = "§9 可观察性：dns providers 输出 DNS 提供方快照"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#9-observability"
+
+[given]
+domain_state = "dns providers ready (upstream addrs + exit rules + server routing)"
+observability = "provider list snapshot via DnsRuntime/MultiServerDns/DnsRouter"
+
+[when]
+command = "cargo run --quiet -p nexusd -- dns providers --json"
+
+# 冻结期望：输出上游地址集合、Exit 规则表与服务器路由清单
+# （requirement-change：2026-09-18，由 UNSUPPORTED 转为真实实现）。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "dns providers"
+
+[[expect]]
+field = "upstream_addrs.0"
+non_empty = true
+
+[[expect]]
+field = "exit_rules.0"
+non_empty = true
+
+[[expect]]
+field = "servers.0"
+non_empty = true

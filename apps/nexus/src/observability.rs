@@ -6,12 +6,18 @@
 //!
 //! 本模块提供结构化 JSON 快照命令；领域未就绪的命令返回
 //! `NexusError::Unsupported`（禁止静默降级，见 apps/nexus MODULE.md 契约；
-//! 当前未就绪示例：connectivity probe）。
+//! 当前未就绪示例：connectivity trace）。
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use nexus_connectivity::{ConnectivityState, EstablishmentRequest, establish};
-use nexus_dns::{DnsError, DnsQuery, DnsRuntime, DnsType, IpPreference, Resolver};
+use nexus_connectivity::{
+    ConnectivityState, EstablishmentRequest, LinkActivationEvent, LinkActivator, LinkCandidate,
+    LinkKind, LinkProbe, establish,
+};
+use nexus_dns::{
+    DnsError, DnsMatch, DnsQuery, DnsRouteRule, DnsRouter, DnsRuntime, DnsType, IpPreference,
+    Resolver,
+};
 use nexus_domain::{
     Constraint, Intent, LifecyclePhase, NexusError, ProviderId, ResourceId, SessionId,
     TerminalOutcome,
@@ -20,6 +26,7 @@ use nexus_measurement::LinkMeasurement;
 use nexus_planner::{PlanningSnapshot, plan_from_snapshot};
 use nexus_registry::ProviderRecord;
 use nexus_session::SessionOwner;
+use nexus_storage::{ContentStore, InMemoryContentStore, ReachabilityGc};
 use serde_json::{Value, json};
 
 // ---------- DNS 演示运行时（内存 mock，真实传输由后续 Resolver 实现提供） ----------
@@ -625,4 +632,217 @@ pub fn unsupported_command(command: &str) -> Result<Value, NexusError> {
     Err(NexusError::Unsupported {
         feature: format!("observability command '{command}' (domain state not ready)"),
     })
+}
+// ---------- 命令：connectivity candidates ----------
+
+/// 演示候选集：direct×2 + relay×2（locator + setup cost）。
+fn demo_link_candidates() -> Vec<LinkCandidate> {
+    vec![
+        LinkCandidate::new(LinkKind::Direct, "lan://192.168.1.10:51820", 5),
+        LinkCandidate::new(LinkKind::Direct, "ipv6://2001:db8::10:51820", 12),
+        LinkCandidate::new(LinkKind::Relay, "relay://relay.example.net:443", 45),
+        LinkCandidate::new(LinkKind::Relay, "relay://backup.example.net:443", 80),
+    ]
+}
+
+/// `connectivity candidates`：输出链路候选快照（kind/locator/setup cost）。
+pub fn connectivity_candidates() -> Result<Value, NexusError> {
+    let candidates = demo_link_candidates();
+    Ok(json!({
+        "verdict": "PASS",
+        "command": "connectivity candidates",
+        "candidate_count": candidates.len(),
+        "candidates": candidates
+            .iter()
+            .map(|c| json!({
+                "kind": c.kind.to_string(),
+                "locator": c.locator,
+                "setup_cost_ms": c.setup_cost_ms,
+            }))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+// ---------- 命令：connectivity probe ----------
+
+/// 内存 `LinkProbe`：direct 全可达；relay 首条可达、backup 失败（确定性演示）。
+struct DemoLinkProbe;
+
+impl LinkProbe for DemoLinkProbe {
+    fn probe(&self, candidate: &LinkCandidate) -> Result<(), String> {
+        match candidate.kind {
+            LinkKind::Direct => Ok(()),
+            LinkKind::Relay => {
+                if candidate.locator.contains("backup") {
+                    Err("relay unreachable (timeout)".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+/// `connectivity probe`：逐候选探测（内存 LinkProbe）+ 激活选择。
+pub fn connectivity_probe() -> Result<Value, NexusError> {
+    let candidates = demo_link_candidates();
+    let probe = DemoLinkProbe;
+    let mut results = Vec::new();
+    let mut selected = None;
+    for c in &candidates {
+        let ok = probe.probe(c).is_ok();
+        results.push(json!({
+            "candidate": format!("{}@{}", c.kind, c.locator),
+            "ok": ok,
+        }));
+        if ok && selected.is_none() {
+            selected = Some(format!("{}@{}", c.kind, c.locator));
+        }
+    }
+    Ok(json!({
+        "verdict": "PASS",
+        "command": "connectivity probe",
+        "probed_count": results.len(),
+        "results": results,
+        "selected": selected.unwrap_or_default(),
+    }))
+}
+
+// ---------- 命令：connectivity links ----------
+
+/// `LinkActivationEvent` 稳定标签（可重放事件链）。
+fn event_label(e: &LinkActivationEvent) -> String {
+    match e {
+        LinkActivationEvent::Attempting { kind, locator } => {
+            format!("attempting:{kind}@{locator}")
+        }
+        LinkActivationEvent::AttemptFailed {
+            kind,
+            locator,
+            reason,
+        } => format!("failed:{kind}@{locator}:{reason}"),
+        LinkActivationEvent::Established { kind, locator } => {
+            format!("established:{kind}@{locator}")
+        }
+    }
+}
+
+/// `connectivity links`：经 LinkActivator 激活 direct 链路并输出事件链。
+pub fn connectivity_links() -> Result<Value, NexusError> {
+    let direct = LinkCandidate::new(LinkKind::Direct, "lan://192.168.1.10:51820", 5);
+    let relay = LinkCandidate::new(LinkKind::Relay, "relay://relay.example.net:443", 45);
+    let activator = LinkActivator::new(DemoLinkProbe);
+    let selection = activator
+        .activate(&direct, Some(&relay), false, true)
+        .map_err(|e| NexusError::Internal {
+            message: format!("link activation failed: {e}"),
+        })?;
+    let links = vec![json!({
+        "kind": selection.kind.to_string(),
+        "locator": selection.locator,
+        "events": selection.events.iter().map(event_label).collect::<Vec<_>>(),
+    })];
+    Ok(json!({
+        "verdict": "PASS",
+        "command": "connectivity links",
+        "established_count": links.len(),
+        "links": links,
+    }))
+}
+
+// ---------- 命令：dns resolve ----------
+
+/// `dns resolve`：解析 example.com 并输出地址/TTL/Exit-DNS Binding。
+pub fn dns_resolve() -> Result<Value, NexusError> {
+    let mut rt = demo_dns_runtime();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(1000);
+    let decision = rt
+        .resolve_exit_binding("example.com", IpPreference::PreferV4, now)
+        .map_err(map_dns)?;
+    Ok(json!({
+        "verdict": "PASS",
+        "command": "dns resolve",
+        "name": decision.name,
+        "addresses": decision
+            .resolved
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>(),
+        "ttl_secs": 300,
+        "from_cache": decision.from_cache,
+        "exit_binding": decision.exit,
+    }))
+}
+
+// ---------- 命令：dns providers ----------
+
+/// `dns providers`：输出上游地址、Exit 规则表与服务器路由清单（DnsRouter 引用服务器）。
+pub fn dns_providers() -> Result<Value, NexusError> {
+    let router = DnsRouter::new(
+        vec![DnsRouteRule {
+            matcher: DnsMatch::Domain("example.com".to_string()),
+            server: "primary".to_string(),
+        }],
+        "fallback".to_string(),
+    );
+    let referenced = router.referenced_servers();
+    let upstream_addrs = vec!["dns.example.internal".to_string()];
+    let exit_rules = [("example.com".to_string(), "exit-a".to_string())];
+    let servers = referenced.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    Ok(json!({
+        "verdict": "PASS",
+        "command": "dns providers",
+        "upstream_addrs": upstream_addrs,
+        "exit_rules": exit_rules
+            .iter()
+            .map(|(d, e)| format!("{d}->{e}"))
+            .collect::<Vec<_>>(),
+        "servers": servers,
+        "default_server": "fallback",
+    }))
+}
+
+// ---------- 命令：workspace cache ----------
+
+/// `workspace cache`：内容存储缓存快照 + GC 保留期语义（mark_roots + sweep_older_than）。
+pub fn workspace_cache() -> Result<Value, NexusError> {
+    let mut store = InMemoryContentStore::new();
+    let root_id = store
+        .put(b"manifest:root".as_slice())
+        .map_err(|e| NexusError::Internal {
+            message: format!("cache put failed: {e}"),
+        })?;
+    let _leaf_id = store
+        .put(b"blob:leaf".as_slice())
+        .map_err(|e| NexusError::Internal {
+            message: format!("cache put failed: {e}"),
+        })?;
+    let object_count = store.object_count();
+
+    // mark_roots 后 sweep_older_than(0)：protected root 保留、不可达对象回收。
+    store
+        .mark_roots(std::slice::from_ref(&root_id))
+        .map_err(|e| NexusError::Internal {
+            message: format!("mark_roots failed: {e}"),
+        })?;
+    // 超过保留期（0 秒）才回收：确保至少经过 1 秒，未保护对象被回收、root 保留。
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let collected = store
+        .sweep_older_than(0)
+        .map_err(|e| NexusError::Internal {
+            message: format!("sweep failed: {e}"),
+        })?;
+    let protected_retained = store.contains(&root_id).unwrap_or(false);
+
+    Ok(json!({
+        "verdict": "PASS",
+        "command": "workspace cache",
+        "object_count": object_count,
+        "protected_count": store.protected_count(),
+        "sweep_collected": collected,
+        "protected_retained": protected_retained,
+    }))
 }

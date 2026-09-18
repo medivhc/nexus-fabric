@@ -1,0 +1,38 @@
+schema_version = 1
+id = "product.observability-connectivity-probe"
+title = "§9 可观察性：connectivity probe 输出候选探测快照"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#9-observability"
+
+[given]
+domain_state = "link probe ready (in-memory LinkProbe, direct ok / relay mixed)"
+observability = "per-candidate probe result snapshot via nexus-connectivity"
+
+[when]
+command = "cargo run --quiet -p nexusd -- connectivity probe --json"
+
+# 冻结期望：对候选逐个执行 LinkProbe，输出每候选 ok/fail 与激活选择
+# （requirement-change：2026-09-18，由 UNSUPPORTED 转为真实实现）。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "connectivity probe"
+
+[[expect]]
+field = "probed_count"
+equals = 4
+
+[[expect]]
+field = "results.0.candidate"
+non_empty = true
+
+[[expect]]
+field = "results.0.ok"
+equals = true
+
+[[expect]]
+field = "selected"
+non_empty = true

@@ -68,6 +68,18 @@ impl InMemoryContentStore {
         Self::default()
     }
 
+    /// 当前对象总数（缓存快照观察出口，PRODUCT §9 workspace cache）。
+    #[must_use]
+    pub fn object_count(&self) -> usize {
+        self.objects.len()
+    }
+
+    /// 当前 protected root 数（GC 保护观察出口，PRODUCT §9 workspace cache）。
+    #[must_use]
+    pub fn protected_count(&self) -> usize {
+        self.protected.len()
+    }
+
     fn now_unix() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

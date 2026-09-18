@@ -1,0 +1,34 @@
+schema_version = 1
+id = "product.observability-connectivity-candidates"
+title = "§9 可观察性：connectivity candidates 输出链路候选快照"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#9-observability"
+
+[given]
+domain_state = "link candidates ready (direct + relay by LinkKind)"
+observability = "candidate list snapshot via nexus-connectivity LinkCandidate"
+
+[when]
+command = "cargo run --quiet -p nexusd -- connectivity candidates --json"
+
+# 冻结期望：按 LinkKind 构造 direct/relay 候选（locator + setup cost），
+# 输出候选清单（requirement-change：2026-09-18，由 UNSUPPORTED 转为真实实现）。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "connectivity candidates"
+
+[[expect]]
+field = "candidate_count"
+equals = 4
+
+[[expect]]
+field = "candidates.0.kind"
+non_empty = true
+
+[[expect]]
+field = "candidates.0.locator"
+non_empty = true

@@ -1,0 +1,38 @@
+schema_version = 1
+id = "product.observability-workspace-cache"
+title = "§9 可观察性：workspace cache 输出内容存储缓存快照"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#9-observability"
+
+[given]
+domain_state = "content store ready (objects + protected roots + ReachabilityGc)"
+observability = "cache snapshot with GC retention semantics"
+
+[when]
+command = "cargo run --quiet -p nexusd -- workspace cache --json"
+
+# 冻结期望：对象计数 + protected roots 计数 + mark_roots 后 sweep_older_than：
+# 保护对象不被回收（requirement-change：2026-09-18，由 UNSUPPORTED 转为真实实现）。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "workspace cache"
+
+[[expect]]
+field = "object_count"
+equals = 2
+
+[[expect]]
+field = "protected_count"
+equals = 1
+
+[[expect]]
+field = "sweep_collected"
+equals = 1
+
+[[expect]]
+field = "protected_retained"
+equals = true
