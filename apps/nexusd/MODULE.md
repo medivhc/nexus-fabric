@@ -60,8 +60,10 @@
 ### 真实网络入口（real transport，PRODUCT §6，2026-09-18）
 
 - `nexusd host <service|internet-access|compute> --addr <ip:port> --token <t>`：
-  提供方在真实地址监听，服务端完成 `AUTH` 门控（业务帧前），随后执行业务
+  提供方在真实地址**持续监听**（服务循环，逐连接独立认证 + 业务闭环），
+  服务端完成 `AUTH` 门控（业务帧前），随后执行业务
   （service ECHO 往返 / internet-access 真实 HTTP GET / compute 表达式求值）。
+  认证拒绝输出 `AUTH_DENIED` 结果后继续服务，不退出。
 - `nexusd relay --addr <ip:port>`：`DIAL <target>` 帧 + 双向字节中继（真实 TCP 代理）。
 - `nexusd run <resource> --endpoint <ip:port> [--relay <ip:port>] --token <t> --json`：
   请求方经静态发现解析真实 Endpoint 建立真实帧流并执行线上认证；直连失败回退 relay。

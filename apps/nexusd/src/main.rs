@@ -110,7 +110,7 @@ fn dispatch_observability(args: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
     };
-    print_json_result(result)
+    print_json_result(result.map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())))
 }
 
 /// 路由资源名到 SDK 组合根闭环；带 `--endpoint` 时走真实网络访问（real transport）。
@@ -122,7 +122,10 @@ fn run_resource(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let flags = parse_flags(args);
-    let result: Result<Value, String> = match flags.get("--endpoint").and_then(|v| v.as_deref()) {
+    let result: Result<Value, (String, String)> = match flags
+        .get("--endpoint")
+        .and_then(|v| v.as_deref())
+    {
         Some(endpoint) => {
             let endpoint: std::net::SocketAddr = match endpoint.parse() {
                 Ok(a) => a,
@@ -167,23 +170,23 @@ fn run_resource(args: &[String]) -> ExitCode {
                     };
                     nexus::remote_real_flow_with_relay(&direct, &endpoint, &relay, &token, resource)
                         .map(|v| enrich("real-transport", v))
-                        .map_err(|e| e.to_string())
+                        .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string()))
                 }
                 None => nexus::remote_real_flow(&endpoint, &token, resource)
                     .map(|v| enrich("real-transport", v))
-                    .map_err(|e| e.to_string()),
+                    .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
             }
         }
         None => match resource.as_str() {
             "service" => nexus::remote_service_access_flow()
                 .map(|v| enrich("service", v))
-                .map_err(|e| e.to_string()),
+                .map_err(|e| ("INTERNAL".to_string(), e.to_string())),
             "internet-access" => nexus::remote_internet_access_flow()
                 .map(|v| enrich("internet-access", v))
-                .map_err(|e| e.to_string()),
+                .map_err(|e| ("INTERNAL".to_string(), e.to_string())),
             "compute" => nexus::remote_compute_job_flow()
                 .map(|v| enrich("compute", v))
-                .map_err(|e| e.to_string()),
+                .map_err(|e| ("INTERNAL".to_string(), e.to_string())),
             other => {
                 // 未知资源：结构化拒绝（exit 0 = 请求已被 daemon 处理，拒绝也是处理结果）。
                 println!(
@@ -196,7 +199,7 @@ fn run_resource(args: &[String]) -> ExitCode {
     print_json_result(result)
 }
 
-/// 提供方入口：真实地址监听，服务端 AUTH 门控 + 按资源执行业务（单连接）。
+/// 提供方入口：真实地址持续监听，服务端 AUTH 门控 + 按资源执行业务（服务循环）。
 fn host_resource(args: &[String]) -> ExitCode {
     let Some(resource) = args.first() else {
         eprintln!(
@@ -225,26 +228,27 @@ fn host_resource(args: &[String]) -> ExitCode {
         .and_then(|v| v.as_deref())
         .unwrap_or("nexus-preshared-token")
         .to_string();
-    let result: Result<Value, String> = (|| {
-        let listener =
-            std::net::TcpListener::bind(addr).map_err(|e| format!("bind {addr} failed: {e}"))?;
-        nexus::remote_host_serve_once(&listener, &token, resource).map_err(|e| e.to_string())
-    })();
-    print_json_result(result.map(|v| {
-        let mut json = v;
-        if let Some(obj) = json.as_object_mut() {
-            obj.insert(
-                "daemon".into(),
-                serde_json::json!({
-                    "entry": "nexusd",
-                    "command": "host",
-                    "resource": resource,
-                    "addr": addr.to_string(),
-                }),
+    let listener = match std::net::TcpListener::bind(addr) {
+        Ok(l) => l,
+        Err(e) => {
+            println!(
+                "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"bind {addr} failed: {e}\"}}}}"
             );
+            return ExitCode::SUCCESS;
         }
-        json
-    }))
+    };
+    println!(
+        "{{\"verdict\":\"READY\",\"daemon\":{{\"entry\":\"nexusd\",\"command\":\"host\",\"resource\":\"{resource}\",\"addr\":\"{addr}\"}}}}"
+    );
+    // 服务循环：逐连接 accept，每连接独立 AUTH 门控 + 业务闭环
+    // （SDK serve_loop 打印每连接结果；认证拒绝输出 AUTH_DENIED 后继续服务）。
+    if let Err(e) = nexus::remote_host_serve_loop(&listener, &token, resource) {
+        println!(
+            "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"{e}\"}}}}"
+        );
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
 }
 
 /// relay 入口：真实监听，DIAL + 双向字节中继（单会话）。
@@ -265,10 +269,10 @@ fn relay_resource(args: &[String]) -> ExitCode {
             Err(_) => return ExitCode::FAILURE,
         },
     };
-    let result: Result<Value, String> = (|| {
-        let listener =
-            std::net::TcpListener::bind(addr).map_err(|e| format!("bind {addr} failed: {e}"))?;
-        nexus::relay_serve_once(&listener).map_err(|e| e.to_string())
+    let result: Result<Value, (String, String)> = (|| {
+        let listener = std::net::TcpListener::bind(addr)
+            .map_err(|e| ("INTERNAL".to_string(), format!("bind {addr} failed: {e}")))?;
+        nexus::relay_serve_once(&listener).map_err(|e| ("INTERNAL".to_string(), e.to_string()))
     })();
     print_json_result(result.map(|v| {
         let mut json = v;
@@ -354,14 +358,14 @@ fn enrich(resource: &str, mut json: Value) -> Value {
 }
 
 /// 输出结构化 JSON；无论成功/失败均 exit 0（请求已被 daemon 处理）。
-fn print_json_result(result: Result<Value, impl std::fmt::Display>) -> ExitCode {
+fn print_json_result(result: Result<Value, (String, String)>) -> ExitCode {
     match result {
         Ok(json) => {
             println!("{json}");
         }
-        Err(e) => {
+        Err((code, message)) => {
             println!(
-                "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"{e}\"}}}}"
+                "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"{code}\",\"message\":\"{message}\"}}}}"
             );
         }
     }

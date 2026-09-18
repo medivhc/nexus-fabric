@@ -3200,9 +3200,11 @@ fn wire_client_auth(
     if resp == WIRE_AUTH_OK.as_bytes() {
         Ok(nexus_auth::Principal("authenticated".into()))
     } else {
-        Err(NexusError::AuthorizationDenied {
-            principal: "wire token mismatch".into(),
-        })
+        let reason = String::from_utf8_lossy(&resp)
+            .strip_prefix("AUTH_DENIED:")
+            .map(str::to_string)
+            .unwrap_or_else(|| "wire token mismatch".into());
+        Err(NexusError::AuthorizationDenied { principal: reason })
     }
 }
 
@@ -3234,7 +3236,7 @@ fn wire_server_auth(
             Ok(principal)
         }
         Err(_) => {
-            let _ = fs.send_frame(WIRE_AUTH_DENIED.as_bytes());
+            let _ = fs.send_frame("AUTH_DENIED:token mismatch".as_bytes());
             Err(NexusError::AuthorizationDenied {
                 principal: "token mismatch".into(),
             })
@@ -3666,15 +3668,14 @@ pub fn remote_real_flow_with_relay(
 
 /// host 单次服务（提供方）：真实地址监听，服务端 AUTH 门控（业务帧前），
 /// 随后按资源执行业务。单连接后返回结构化结果（与 daemon 单次执行风格一致）。
-pub fn remote_host_serve_once(
-    listener: &std::net::TcpListener,
+/// 已连接会话的 host 服务：服务端 AUTH 门控（业务帧前）+ 按资源执行业务。
+/// accept 由调用方完成（serve_once 单连接 / serve_loop 持续服务共用）。
+fn host_serve_connected(
+    fs: &mut nexus_transport::FrameStream,
     expected_token: &str,
     resource: &str,
 ) -> Result<Value, NexusError> {
-    let mut fs = nexus_transport::accept(listener).map_err(|e| NexusError::Internal {
-        message: format!("host accept failed: {e}"),
-    })?;
-    let principal = wire_server_auth(&mut fs, expected_token)?;
+    let principal = wire_server_auth(fs, expected_token)?;
     let mut events: Vec<&'static str> = Vec::new();
     let business = match resource {
         "service" => {
@@ -3773,6 +3774,59 @@ pub fn remote_host_serve_once(
         "events": events,
         "business": business,
     }))
+}
+
+/// host 单次服务（提供方）：真实地址监听，单连接后返回结构化结果
+/// （与 daemon 单次执行风格一致；E4 场景 daemon-real-host-flow 使用）。
+pub fn remote_host_serve_once(
+    listener: &std::net::TcpListener,
+    expected_token: &str,
+    resource: &str,
+) -> Result<Value, NexusError> {
+    let mut fs = nexus_transport::accept(listener).map_err(|e| NexusError::Internal {
+        message: format!("host accept failed: {e}"),
+    })?;
+    host_serve_connected(&mut fs, expected_token, resource)
+}
+
+/// host 服务循环（提供方持续服务）：逐连接 accept，每连接独立 AUTH 门控 + 业务闭环。
+/// 认证拒绝打印 AUTH_DENIED 后继续服务；仅 accept 失败（listener 失效）返回 Err。
+pub fn remote_host_serve_loop(
+    listener: &std::net::TcpListener,
+    expected_token: &str,
+    resource: &str,
+) -> Result<(), NexusError> {
+    loop {
+        let mut fs = nexus_transport::accept(listener).map_err(|e| NexusError::Internal {
+            message: format!("host accept failed: {e}"),
+        })?;
+        match host_serve_connected(&mut fs, expected_token, resource) {
+            Ok(json) => println!("{json}"),
+            Err(NexusError::AuthorizationDenied { principal }) => println!(
+                "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"AUTH_DENIED\",\"message\":\"{principal}\"}}}}"
+            ),
+            Err(e) => println!(
+                "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"{e}\"}}}}"
+            ),
+        }
+    }
+}
+
+/// 把 `NexusError` 映射为稳定的 CLI 错误码（UI 层序列化用，禁止泄漏内部细节）。
+pub fn error_code(err: &NexusError) -> &'static str {
+    match err {
+        NexusError::NoProvider { .. } => "NO_PROVIDER",
+        NexusError::ConstraintUnsatisfied { .. } => "CONSTRAINT_UNSATISFIED",
+        NexusError::ConnectivityEstablishmentFailed { .. } => "CONNECT_FAILED",
+        NexusError::DnsResolutionFailed { .. } => "DNS_RESOLUTION_FAILED",
+        NexusError::AuthorizationDenied { .. } => "AUTH_DENIED",
+        NexusError::ComputeJobRejected { .. } => "COMPUTE_REJECTED",
+        NexusError::WorkspaceCommitRejected { .. } => "WORKSPACE_REJECTED",
+        NexusError::PlatformCapabilityUnavailable { .. } => "CAPABILITY_UNAVAILABLE",
+        NexusError::SessionFailed { .. } => "SESSION_FAILED",
+        NexusError::Unsupported { .. } => "UNSUPPORTED",
+        NexusError::Internal { .. } => "INTERNAL",
+    }
 }
 
 /// 双向字节中继（relay 核心）：src -> dst，返回转发字节数。

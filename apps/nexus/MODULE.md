@@ -56,9 +56,11 @@
     `NexusError::Unsupported`（PRODUCT §9 禁止静默降级）。
 - 远程闭环组合根（PRODUCT §6）：`remote_*_flow` 系列
   （service/internet-access/compute/workspace/presence），供 nexusd 复用。
-- 真实网络切片（real transport，PRODUCT §6）：`remote_host_serve_once` /
-  `relay_serve_once` / `remote_real_flow` / `remote_real_flow_with_relay` ——
-  真实 TCP 帧流 + 服务端 `AUTH` 门控（业务帧前）+ `DIAL` 字节中继回退；
+- 真实网络切片（real transport，PRODUCT §6）：`remote_host_serve_once`（单连接）/
+  `remote_host_serve_loop`（持续服务循环）/ `relay_serve_once` / `remote_real_flow` /
+  `remote_real_flow_with_relay` / `error_code` ——
+  真实 TCP 帧流 + 服务端 `AUTH` 门控（业务帧前，失败回 `AUTH_DENIED:<reason>`，客户端透传
+  为 `AuthorizationDenied`，禁止抹成通用建连失败）+ `DIAL` 字节中继回退；
   host 侧支持 service（ECHO 往返）/ internet-access（真实 HTTP GET）/ compute（表达式求值）。
 - 真实 SOCKS5 代理数据面（PRODUCT §11.4）：`proxy_serve_once` /
   `DEFAULT_PROXY_CONFIG` —— 握手（Socks5Handshake）→ 规则路由（nexus-proxy）
