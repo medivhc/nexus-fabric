@@ -1,0 +1,37 @@
+schema_version = 1
+id = "product.cli-dns-resolve"
+title = "nexus CLI 前端：dns resolve 接线到 observability 快照（--json）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#9-observability"
+
+[given]
+domain_state = "dns runtime ready (demo resolver, example.com v6+v4)"
+cli_frontend = "nexus CLI 前端解析 resolve <name> 后路由到 observability 快照"
+
+[when]
+command = "cargo run --quiet -p nexus -- dns resolve example.com --json"
+
+# 冻结期望：CLI 前端此前对该命令返回 UNSUPPORTED；现输出地址列表、TTL 与 Exit-DNS Binding。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "dns resolve"
+
+[[expect]]
+field = "name"
+equals = "example.com"
+
+[[expect]]
+field = "addresses.0"
+non_empty = true
+
+[[expect]]
+field = "addresses.1"
+non_empty = true
+
+[[expect]]
+field = "exit_binding"
+non_empty = true

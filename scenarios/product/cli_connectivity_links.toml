@@ -1,0 +1,37 @@
+schema_version = 1
+id = "product.cli-connectivity-links"
+title = "nexus CLI 前端：connectivity links 接线到 observability 快照（--json）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#9-observability"
+
+[given]
+domain_state = "link activation ready (LinkActivator direct establishment)"
+cli_frontend = "nexus CLI 前端把全部 17 个观察命令接线到同一 observability 快照"
+
+[when]
+command = "cargo run --quiet -p nexus -- connectivity links --json"
+
+# 冻结期望：CLI 前端此前对该命令返回 UNSUPPORTED；现输出已建立链路与事件链。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "connectivity links"
+
+[[expect]]
+field = "links.0.kind"
+non_empty = true
+
+[[expect]]
+field = "links.0.locator"
+non_empty = true
+
+[[expect]]
+field = "links.0.events"
+non_empty = true
+
+[[expect]]
+field = "established_count"
+equals = 1

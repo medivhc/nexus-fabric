@@ -1,0 +1,41 @@
+schema_version = 1
+id = "product.cli-compute-jobs"
+title = "nexus CLI 前端：compute jobs 接线到 observability 快照（--json）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#9-observability"
+
+[given]
+domain_state = "compute sessions ready (submitted via in-memory transport)"
+cli_frontend = "nexus CLI 前端把全部 17 个观察命令接线到同一 observability 快照"
+
+[when]
+command = "cargo run --quiet -p nexus -- compute jobs --json"
+
+# 冻结期望：CLI 前端此前对该命令返回 UNSUPPORTED；现输出作业阶段/结果快照。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "compute jobs"
+
+[[expect]]
+field = "jobs.0.id"
+non_empty = true
+
+[[expect]]
+field = "jobs.0.phase"
+one_of = ["Active", "Closed"]
+
+[[expect]]
+field = "jobs.1.phase"
+one_of = ["Active", "Closed"]
+
+[[expect]]
+field = "active_count"
+equals = 1
+
+[[expect]]
+field = "closed_count"
+equals = 1

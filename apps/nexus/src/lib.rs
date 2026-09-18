@@ -12,6 +12,8 @@
 
 #![forbid(unsafe_code)]
 
+/// CLI 前端 ControlService（17 命令接线 + --json 双输出 + exit 语义）。
+pub mod control_service;
 /// §9 可观察性命令（status / plan explain / session watch / connectivity status /
 /// dns status / dns cache / platform capabilities），见 PRODUCT.md#9-observability。
 pub mod observability;

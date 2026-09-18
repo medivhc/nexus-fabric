@@ -1,0 +1,33 @@
+schema_version = 1
+id = "product.cli-connectivity-candidates"
+title = "nexus CLI 前端：connectivity candidates 接线到 observability 快照（--json）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#9-observability"
+
+[given]
+domain_state = "link candidates ready (direct + relay by LinkKind)"
+cli_frontend = "nexus CLI 前端把全部 17 个观察命令接线到同一 observability 快照"
+
+[when]
+command = "cargo run --quiet -p nexus -- connectivity candidates --json"
+
+# 冻结期望：CLI 前端此前对该命令返回 UNSUPPORTED；现与 nexusd 同源输出候选快照。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "connectivity candidates"
+
+[[expect]]
+field = "candidate_count"
+equals = 4
+
+[[expect]]
+field = "candidates.0.kind"
+non_empty = true
+
+[[expect]]
+field = "candidates.0.locator"
+non_empty = true

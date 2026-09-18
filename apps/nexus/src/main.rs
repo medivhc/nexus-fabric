@@ -1,21 +1,20 @@
 //! nexus — 用户 CLI 前端。
 //!
 //! 仅负责：参数解析 → 构造 `ControlCommand` → 调用 `ControlService` → 渲染结构化输出。
-//! 已就绪命令直接路由到 `nexus::observability` SDK 快照（与 nexusd 同源，不复制领域逻辑）；
-//! 未就绪命令返回结构化 `Unsupported`（PRODUCT §9 禁止静默降级）。
+//! 全部 17 个 §9 观察命令直接路由到 `nexus::observability` SDK 快照（与 nexusd 同源，
+//! 不复制领域逻辑）；领域未就绪命令（如 connectivity trace）返回结构化 `Unsupported`
+//! （PRODUCT §9 禁止静默降级）。
 
 #![forbid(unsafe_code)]
 
-use nexus_control_api::{
-    ControlCommand, ControlOutput, ControlService, NexusError, ResourceId, SessionId, StatusView,
-};
-use serde_json::Value;
+use nexus::control_service::{ControlServiceImpl, render_text};
+use nexus_control_api::{ControlCommand, ResourceId, SessionId};
 
 const USAGE: &str = "\
 nexus — Nexus 统一 Resource Fabric 控制面 CLI
 
 用法:
-  nexus <command> [args]
+  nexus [--json] <command> [args]
 
 命令:
   status                                  总体状态
@@ -37,9 +36,13 @@ nexus — Nexus 统一 Resource Fabric 控制面 CLI
   platform capabilities                   平台能力清单
   help / --help                           显示本帮助
 
-说明: status / plan explain / session watch / connectivity status / dns status /
-      dns cache / workspace heads / platform capabilities 已路由到 SDK 可观察性快照；
-      其余命令在领域实现就绪前返回显式 UNSUPPORTED。
+输出:
+  --json        原样打印 observability 快照 JSON（机器可读，stderr 静默）。
+  默认          渲染人读文本视图（JSON 的字段投影）。
+
+exit 语义（对齐 nexusd）:
+  0             业务成功；NexusError 领域拒绝（verdict=FAIL，请求已被处理）。
+  2             用法/解析错误（缺参、未知命令）。
 ";
 
 fn main() {
@@ -48,13 +51,23 @@ fn main() {
     std::process::exit(code);
 }
 
+/// 从参数中剥离全局 `--json`，返回 (json_mode, 剩余 args)。
+/// 在 `parse_command` 之前剥离，位置参数与 `--json` 顺序无关。
+fn split_json_flag(args: &[String]) -> (bool, Vec<String>) {
+    let json_mode = args.iter().any(|a| a == "--json");
+    let rest: Vec<String> = args.iter().filter(|a| *a != "--json").cloned().collect();
+    (json_mode, rest)
+}
+
 fn run(args: &[String]) -> i32 {
+    let (json_mode, args) = split_json_flag(args);
+
     if args.is_empty() || matches!(args[0].as_str(), "help" | "--help" | "-h") {
         print!("{USAGE}");
         return 0;
     }
 
-    let command = match parse_command(args) {
+    let command = match parse_command(&args) {
         Ok(cmd) => cmd,
         Err(msg) => {
             eprintln!("error: {msg}");
@@ -63,17 +76,28 @@ fn run(args: &[String]) -> i32 {
         }
     };
 
-    let service = CliControlService;
-    match service.execute(command) {
-        Ok(output) => {
-            for line in output.to_lines() {
-                println!("{line}");
+    let service = ControlServiceImpl;
+    match service.snapshot(&command) {
+        Ok(json) => {
+            if json_mode {
+                // --json：快照 JSON 原样打到 stdout，stderr 静默。
+                println!("{json}");
+            } else {
+                for line in render_text(&json) {
+                    println!("{line}");
+                }
             }
             0
         }
         Err(err) => {
-            eprintln!("error: {err}");
-            1
+            // 领域拒绝：--json 下输出结构化 FAIL JSON（exit 0 = 请求已被处理）；
+            // 人读模式打到 stderr。与 nexusd print_json_result 一致。
+            if json_mode {
+                println!("{}", service.error_to_json(&err));
+            } else {
+                eprintln!("error: {err}");
+            }
+            0
         }
     }
 }
@@ -142,69 +166,17 @@ fn parse_command(args: &[String]) -> Result<ControlCommand, String> {
     }
 }
 
-/// 渲染 SDK 可观察性 JSON 为结构化行（pretty JSON）。
-fn json_to_lines(json: &Value) -> Vec<String> {
-    serde_json::to_string_pretty(json)
-        .map(|s| s.lines().map(str::to_string).collect())
-        .unwrap_or_else(|_| vec![json.to_string()])
-}
-
-/// Composition Root 的 ControlService：已就绪命令路由到 `nexus::observability`
-/// 快照（与 nexusd 同源）；未就绪命令返回结构化 `Unsupported`。
-struct CliControlService;
-
-impl ControlService for CliControlService {
-    fn execute(&self, command: ControlCommand) -> Result<ControlOutput, NexusError> {
-        let json = match command {
-            ControlCommand::Status => nexus::observability::status()?,
-            ControlCommand::PlanExplain { .. } => nexus::observability::plan_explain()?,
-            ControlCommand::SessionWatch { .. } => nexus::observability::session_watch()?,
-            ControlCommand::ConnectivityStatus => nexus::observability::connectivity_status()?,
-            ControlCommand::DnsStatus => nexus::observability::dns_status()?,
-            ControlCommand::DnsCache => nexus::observability::dns_cache()?,
-            ControlCommand::WorkspaceHeads { .. } => nexus::observability::workspace_heads()?,
-            ControlCommand::PlatformCapabilities => nexus::observability::platform_capabilities()?,
-            ControlCommand::ConnectivityCandidates
-            | ControlCommand::ConnectivityProbe { .. }
-            | ControlCommand::ConnectivityLinks => {
-                return Err(NexusError::Unsupported {
-                    feature: "connectivity candidates/probe/links (domain state not ready)".into(),
-                });
-            }
-            ControlCommand::DnsResolve { .. } | ControlCommand::DnsProviders => {
-                return Err(NexusError::Unsupported {
-                    feature: "dns resolve/providers (domain state not ready)".into(),
-                });
-            }
-            ControlCommand::WorkspaceConflicts { .. } | ControlCommand::WorkspaceCache { .. } => {
-                return Err(NexusError::Unsupported {
-                    feature: "workspace conflicts/cache (domain state not ready)".into(),
-                });
-            }
-            ControlCommand::ComputeJobs => {
-                return Err(NexusError::Unsupported {
-                    feature: "compute jobs (domain state not ready)".into(),
-                });
-            }
-            ControlCommand::Diagnose => {
-                return Err(NexusError::Unsupported {
-                    feature: "diagnose (domain state not ready)".into(),
-                });
-            }
-        };
-        Ok(ControlOutput::Status(StatusView {
-            lines: json_to_lines(&json),
-        }))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nexus_control_api::ControlOutput;
+    use nexus_control_api::ResourceId;
 
     fn parse(args: &[&str]) -> Result<ControlCommand, String> {
         parse_command(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    fn run_str(args: &[&str]) -> i32 {
+        run(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
     }
 
     #[test]
@@ -253,46 +225,49 @@ mod tests {
     }
 
     #[test]
-    fn status_output_is_structured() {
-        let out = CliControlService
-            .execute(ControlCommand::Status)
-            .expect("status must not fail");
-        assert!(matches!(out, ControlOutput::Status(_)));
-        assert!(!out.to_lines().is_empty());
+    fn json_flag_is_stripped_before_parse() {
+        let args = vec![
+            "connectivity".to_string(),
+            "candidates".to_string(),
+            "--json".to_string(),
+        ];
+        let (json_mode, rest) = split_json_flag(&args);
+        assert!(json_mode);
+        assert_eq!(rest, vec!["connectivity", "candidates"]);
+        assert_eq!(
+            parse_command(&rest).unwrap(),
+            ControlCommand::ConnectivityCandidates
+        );
     }
 
     #[test]
-    fn ready_commands_route_to_sdk_snapshots() {
-        for cmd in [
-            ControlCommand::Status,
-            ControlCommand::PlanExplain {
-                resource: ResourceId("net".into()),
-            },
-            ControlCommand::SessionWatch {
-                session: SessionId("sess-1".into()),
-            },
-            ControlCommand::ConnectivityStatus,
-            ControlCommand::DnsStatus,
-            ControlCommand::DnsCache,
-            ControlCommand::WorkspaceHeads {
-                workspace: "ws1".into(),
-            },
-            ControlCommand::PlatformCapabilities,
-        ] {
-            assert!(
-                CliControlService.execute(cmd).is_ok(),
-                "ready command must route to sdk snapshot"
-            );
-        }
+    fn json_flag_anywhere_is_stripped() {
+        let args = vec![
+            "dns".to_string(),
+            "--json".to_string(),
+            "resolve".to_string(),
+            "example.com".to_string(),
+        ];
+        let (json_mode, rest) = split_json_flag(&args);
+        assert!(json_mode);
+        assert_eq!(
+            parse_command(&rest).unwrap(),
+            ControlCommand::DnsResolve {
+                name: "example.com".into(),
+            }
+        );
     }
 
     #[test]
-    fn not_ready_command_returns_structured_error() {
-        let err = CliControlService
-            .execute(ControlCommand::WorkspaceConflicts {
-                workspace: "ws1".into(),
-            })
-            .expect_err("must be unsupported");
-        assert!(matches!(err, NexusError::Unsupported { .. }));
+    fn usage_error_exits_2_on_missing_arg() {
+        // 用法/解析错误走 parse_command 错误路径 -> exit 2。
+        let code = run_str(&["plan", "explain"]);
+        assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn help_exits_0() {
+        assert_eq!(run_str(&[]), 0);
+        assert_eq!(run_str(&["help"]), 0);
     }
 }

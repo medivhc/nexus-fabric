@@ -60,6 +60,9 @@
   - diagnose 聚合各子系统快照输出健康报告（逐项 ready + overall）。
   - 领域未就绪命令（connectivity trace 等）返回
     `NexusError::Unsupported`（PRODUCT §9 禁止静默降级）。
+  - CLI 前端（apps/nexus/src/main.rs + control_service.rs）：把全部 17 个 §9 观察命令
+    接线到同一 `observability` 快照；全局 `--json` 双输出（JSON 原样 / 人读文本投影）；
+    exit 语义对齐 nexusd（用法错误 exit 2，业务成功 exit 0，领域拒绝 verdict=FAIL 且 exit 0）。
 - 远程闭环组合根（PRODUCT §6）：`remote_*_flow` 系列
   （service/internet-access/compute/workspace/presence），供 nexusd 复用。
 - 真实网络切片（real transport，PRODUCT §6）：`remote_host_serve_once`（单连接）/

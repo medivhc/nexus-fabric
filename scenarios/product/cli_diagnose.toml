@@ -1,0 +1,33 @@
+schema_version = 1
+id = "product.cli-diagnose"
+title = "nexus CLI 前端：diagnose 接线到 observability 快照（--json）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#9-observability"
+
+[given]
+domain_state = "subsystem snapshots ready (status/connectivity/dns/workspace/plan/session/platform)"
+cli_frontend = "nexus CLI 前端把全部 17 个观察命令接线到同一 observability 快照"
+
+[when]
+command = "cargo run --quiet -p nexus -- diagnose --json"
+
+# 冻结期望：CLI 前端此前对该命令返回 UNSUPPORTED；现输出子系统健康聚合报告。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "diagnose"
+
+[[expect]]
+field = "subsystems.0.name"
+non_empty = true
+
+[[expect]]
+field = "subsystems.0.ready"
+equals = true
+
+[[expect]]
+field = "overall"
+equals = "healthy"

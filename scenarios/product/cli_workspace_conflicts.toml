@@ -1,0 +1,37 @@
+schema_version = 1
+id = "product.cli-workspace-conflicts"
+title = "nexus CLI 前端：workspace conflicts 接线到 observability 快照（--json）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#9-observability"
+
+[given]
+domain_state = "workspace dag ready (two heads diverge on same path)"
+cli_frontend = "nexus CLI 前端解析 conflicts <workspace> 后路由到 observability 快照"
+
+[when]
+command = "cargo run --quiet -p nexus -- workspace conflicts ws1 --json"
+
+# 冻结期望：CLI 前端此前对该命令返回 UNSUPPORTED；现输出三方合并冲突快照。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "workspace conflicts"
+
+[[expect]]
+field = "conflict_count"
+equals = 1
+
+[[expect]]
+field = "conflict_paths.0"
+equals = "a.txt"
+
+[[expect]]
+field = "head_count"
+equals = 2
+
+[[expect]]
+field = "disposition"
+equals = "Diverged"

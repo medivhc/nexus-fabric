@@ -191,6 +191,17 @@ PRODUCT §9）。
 - `workspace cache`：输出内容存储缓存快照——对象计数、protected roots 计数与
   GC 保留期语义（mark_roots + sweep_older_than）。
 
+### 9.1 CLI 前端接线与双输出（2026-09-18 冻结）
+
+- `nexus` CLI 前端把全部 17 个 §9 观察命令接线到同一 `observability` 快照
+  （与 nexusd 同源，不复制领域逻辑），不再存在"其余命令返回 UNSUPPORTED"的接线缺口；
+  领域未就绪命令（如 `connectivity trace`）仍显式返回结构化 `UNSUPPORTED`。
+- 全局 `--json` 开关：`--json` 模式把快照 JSON 原样打到 stdout（单行 JSON，stderr 静默）；
+  默认模式渲染人读文本视图（JSON 的字段投影，风格对齐 `ControlOutput::to_lines`）。
+- exit 语义对齐 nexusd：用法/解析错误（缺参、未知命令）exit 2 并打印 usage；
+  业务成功 exit 0；`NexusError` 领域拒绝输出 `verdict=FAIL` 结构化 JSON 且 exit 0
+  （请求已被处理，与 `print_json_result` 一致）。
+
 ## 10. 完成条件
 
 关键用户可见 Capability 原则上至少需要一条 E4 Product Scenario 或 E5 External Observation 证据。
