@@ -187,3 +187,9 @@ name = "nexus-proto"
 allowed_internal_dependencies = []
 portable = true
 layer = "portable-core"
+
+[[crate]]
+name = "nexus-outbound-shadowsocks"
+allowed_internal_dependencies = ["nexus-connectivity"]
+portable = false
+layer = "outbound"

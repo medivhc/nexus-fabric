@@ -79,6 +79,18 @@
 `activate` 是确定性策略编排（探测结果来自注入的 `LinkProbe`，不自行发起网络 I/O）；
 NAT/中继场景的物理建连（组合根 transport::connect）发生在激活决策之后。
 
+### 冻结契约（OutboundAdapter 接缝，PRODUCT §11.6）
+
+- `trait OutboundAdapter`：一种真实出站协议实现（Direct / Relay / Shadowsocks）的领域中立接缝：
+  - `fn outbound_kind(&self) -> &'static str`（"direct" / "relay" / "shadowsocks"）；
+  - `fn tag(&self) -> &str`；
+  - `fn handoff(&self, locator: &str) -> Result<OutboundHandoff, ConnectivityError>`（离线交接，零真实网络）。
+- `OutboundHandoff { kind, tag, locator }`：离线交接结果 DTO。
+- Deletion Test（AGENTS.md §12）成立：Shadowsocks 是首个带真实 AEAD 加解密的出站，与仅做
+  可达性探测的 Direct/Relay 构成独立变化维度；DirectAdapter / RelayAdapter 复用既有
+  `LinkProbe` 语义，`LinkActivator` / `LinkKind` / `LinkProbe` / `LinkSelection` 既有行为不变。
+- trait 保持领域中立、可移植；具体 AEAD 加密实现位于 `nexus-outbound-shadowsocks`（portable=false）。
+
 ## Verification
 
 最低：
