@@ -346,6 +346,20 @@ OutboundAdapter trait（nexus-connectivity，领域中立、可移植）
 Trojan / Hysteria2 本段不交付：二者分别需要 TLS（rustls）与 QUIC（quinn），会拉入 ring
 （C/汇编）与大量传递依赖树，工程量超出单段合理范围且 ring 不可 wasm 移植；评审证据见交付报告。
 
+### 11.8 Clash 订阅节点解析（base64 URI 列表，P1，2026-09-18）
+
+在配置层 `nexus-proxy-config` 增加订阅解析：输入一段 base64 订阅文本 → 解码 → 逐行解析
+`scheme://userinfo@host:port#name` 形式的节点 URI → 产出与现有出站模型兼容的 `OutboundConfig` 列表。
+
+- **零新第三方依赖**：手写标准 base64 解码器（标准字母表，支持 `=` 填充；Cargo.lock 无 base64 crate）。
+- 本期仅映射 `ss://`（Shadowsocks；userinfo 为 base64 `method:password`）与 `vmess://`
+  （VMess；userinfo 为 UUID）两种 URI，复用仓库已有两个 adapter。
+- 其它协议行（trojan:// 等）**显式拒绝并记录**进 `rejected`（不致命、不静默吞掉），
+  其余合法行照常产出出站；base64 非法字符/长度对齐错误返回 `CONFIG_INVALID`。
+- 纯函数、离线确定性：同一份订阅文本永远产出同一 `SubscriptionParse`；不下载订阅、不发网络。
+- E4 场景：`scenarios/product/proxy_clash_subscription_parse.toml`（喂含 1 ss + 1 vmess +
+  1 未知协议行的固定 base64 订阅；断言解析出 2 个出站、未知协议被记录拒绝、字段正确）。
+
 ### 11.6.1 Shadowsocks 真实 TCP 会话闭环（P1，2026-09-18）
 
 把 Shadowsocks 出站从「离线 AEAD 自洽往返」提升为**真实 TCP 会话闭环**：同一进程内

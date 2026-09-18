@@ -1,0 +1,51 @@
+schema_version = 1
+id = "product.proxy-clash-subscription-parse"
+title = "Clash 订阅 base64 解码后逐行解析 ss/vmess 节点，未知协议行显式拒绝"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-proxy-kernel"
+
+[given]
+input = "fixed base64 subscription: 1 ss:// + 1 vmess:// + 1 trojan:// (unknown) line"
+zero_dependency = "hand-written standard base64 decoder, no new crate"
+offline = "pure function, deterministic"
+
+# 可执行 E4：example 解码固定 base64 订阅，逐行解析节点 URI；
+# 断言解析出 2 个出站（ss/vmess），未知 trojan:// 行被记录拒绝，且字段正确。
+[when]
+command = "cargo run --quiet -p nexus --example proxy_clash_subscription_parse -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "outbounds"
+equals = 2
+
+[[expect]]
+field = "rejected"
+equals = 1
+
+[[expect]]
+field = "ss_protocol"
+equals = "shadowsocks"
+
+[[expect]]
+field = "ss_host"
+equals = "ss.example.com"
+
+[[expect]]
+field = "ss_port"
+equals = 8388
+
+[[expect]]
+field = "vm_protocol"
+equals = "vmess"
+
+[[expect]]
+field = "vm_host"
+equals = "vm.example.com"
+
+[[expect]]
+field = "vm_port"
+equals = 10086
