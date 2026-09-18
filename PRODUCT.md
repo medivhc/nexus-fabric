@@ -242,7 +242,31 @@ SOCKS5 入站（Socks5Handshake 状态机，真实字节流）
 - TUN 透明代理 / Virtual Packet Interface 全局拦截；
 - Clash 订阅 YAML 在线解析与自动更新；
 - LoadBalance / Relay 链式策略组（多跳）；
-- DNS 多 server 规则路由（DNS hijack 仅在动作链模型中留口，不在 P0 实现）。
+- DNS hijack 透明拦截（仅在动作链模型中留口，不在本期实现；DNS 多 server 规则路由见 §11.5）。
+
+### 11.5 DNS 多 server 规则路由（multi-server DNS rule routing，2026-09-18）
+
+在既有单 server Exit-DNS Binding 之外，把 DNS 解析推广为「多 server + 按域名规则选择本次
+解析走哪个 server」（吸收 sing-box DNS rules）：
+
+```text
+配置多个 DNS server（tag + 上游地址）
+  -> DNS 规则表（domain 规则，声明顺序首匹配）
+  -> 命中规则：本次解析路由到规则指定 server tag
+  -> 未命中：MATCH 兜底 -> default_server
+  -> 该 server 注入的离线 Resolver 执行解析（P0 不接真实 UDP DNS）
+```
+
+- 配置层 YAML 新增可选 `dns:` 段：`servers: [{tag, address}]`、`rules: [{domain, server}]`、
+  `default_server`；规则或兜底引用悬空 server tag 返回 `CONFIG_INVALID`。
+- 域名规则匹配语义与 Exit-DNS Binding 一致：查询名等于规则 domain 或以 `.{domain}`
+  结尾；首条命中即终止，其后规则不再评估。
+- 路由决策可观察：本次解析选用的 server tag、命中规则 domain（无具体命中为空，走默认 server）。
+- 离线确定性：P0 由 Composition Root 为每个 server 注入内存 mock Resolver；不发起真实网络。
+  既有单 server `DnsRuntime`（Exit-DNS Binding、缓存、环路守卫、RDRC 负缓存、观测快照）
+  行为保持不变。
+- E4 场景：`scenarios/product/dns_rule_server_selection.toml`（两个 server A/B，规则把
+  example.internal 指向 A、其余 MATCH 指向 B；离线注入，断言路由与解析结果）。
 
 ### 11.3 失败语义
 
@@ -252,4 +276,5 @@ NO_MATCH_RULE               规则表缺 MATCH 兜底且流量未命中任何具
 OUTBOUND_TAG_UNRESOLVED     动作链选定的出站或策略组 tag 不存在
 SELECTOR_EMPTY              selector 策略组候选列表为空
 URLTEST_NO_VALID_CANDIDATE  urltest 组所有候选均无有效 measurement
+DNS_SERVER_UNRESOLVED       DNS 规则或 MATCH 兜底引用的 server tag 未定义
 ```
