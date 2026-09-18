@@ -1,9 +1,0 @@
-cargo :     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.10s
-所在位置 行:1 字符: 40
-+ ... -kernel-p0; cargo run -p nexus-harness -- verify --fast --json 2>&1 | ...
-+                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : NotSpecified: (    Finished `d...get(s) in 0.10s:String) [], RemoteException
-    + FullyQualifiedErrorId : NativeCommandError
-
-     Running `target\debug\nexus-harness.exe verify --fast --json`
-{"command":"verify","evidence":{"bindings":{"configuration_digest":"5b5005ebf1f79eba1ce6ab27d38af8d0e241c961","contract_hash":"e7204bb0cc84bcd8973455a0c52ffa188d786f0c","dirty_state":true,"feature_set":["workspace:default"],"harness_schema_version":1,"platform_capability_digest":"1bf5ebe28eab776674d87e5d5770d3266aaa7d89","source_revision":"a9e8da702f61bcf11e5a4780b8946b5e22bb2d1f","target_triple":"x86_64-pc-windows-msvc","toolchain_version":"1.95.0","working_tree_digest":"8910887fc73362ffa80fb98715cc66f5c8434ca3"},"dir":"verify-db0bbe28847a","id":"db0bbe28847a","verdict":"PASS"},"gates":[{"detail":"no whitespace errors","name":"whitespace","verdict":"PASS"},{"detail":"ok","name":"format","verdict":"PASS"},{"detail":"ok","name":"check","verdict":"PASS"},{"detail":"ok","name":"clippy","verdict":"PASS"},{"detail":"29 crates declared","name":"architecture-policy","verdict":"PASS"},{"detail":"cargo-deny: advisories/licenses/bans/sources PASS","name":"dependency-governance","verdict":"PASS"},{"detail":"no affected crates changed","name":"affected-tests","verdict":"PASS"},{"detail":"ok","name":"selected-properties","verdict":"PASS"}],"message":"fast verify: 8 gates, 8 pass, 0 fail, 0 unknown","schema_version":1,"verdict":"PASS"}
