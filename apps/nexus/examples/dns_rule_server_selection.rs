@@ -76,9 +76,16 @@ fn main() {
     let rules: Vec<DnsRouteRule> = dns
         .rules
         .iter()
-        .map(|r| DnsRouteRule {
-            domain: r.domain.clone(),
-            server: r.server.clone(),
+        .map(|r| {
+            let matcher = match (&r.domain, &r.ip_cidr) {
+                (Some(d), _) => nexus_dns::DnsMatch::Domain(d.clone()),
+                (None, Some(c)) => nexus_dns::DnsMatch::ip_cidr(c).expect("valid cidr"),
+                (None, None) => panic!("dns rule needs domain or ip_cidr"),
+            };
+            DnsRouteRule {
+                matcher,
+                server: r.server.clone(),
+            }
         })
         .collect();
     let router = DnsRouter::new(rules, dns.default_server.clone());

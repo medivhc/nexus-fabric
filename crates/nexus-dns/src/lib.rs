@@ -177,11 +177,72 @@ pub struct ExitDnsDecision {
 
 // ---------- DNS 多 server 路由（§11.5） ----------
 
-/// 一条 DNS 路由规则：命中 `domain`（精确或子域）的查询走指定 `server` tag。
+/// DNS 规则匹配子句（§11.5.1）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsMatch {
+    /// 域名精确/`.{domain}` 子域匹配。
+    Domain(String),
+    /// IPv4 CIDR：network（大端 u32）+ 前缀；对请求 `client_ip` 匹配。
+    IpCidr { network: u32, prefix: u8 },
+}
+
+impl DnsMatch {
+    /// 构造 IPv4 CIDR 匹配子句；`s` 形如 `a.b.c.d/p`（p∈0..=32）。
+    ///
+    /// # Errors
+    ///
+    /// 格式/前缀非法返回 `DnsError::InvalidQuery`。
+    pub fn ip_cidr(s: &str) -> Result<Self, DnsError> {
+        let (addr, prefix) = s
+            .split_once('/')
+            .ok_or_else(|| DnsError::InvalidQuery(format!("bad cidr '{s}'")))?;
+        let octets: Vec<u8> = addr
+            .split('.')
+            .map(|o| {
+                o.parse::<u8>()
+                    .map_err(|_| DnsError::InvalidQuery(addr.to_string()))
+            })
+            .collect::<Result<_, _>>()?;
+        if octets.len() != 4 {
+            return Err(DnsError::InvalidQuery(addr.to_string()));
+        }
+        let prefix: u8 = prefix
+            .parse()
+            .map_err(|_| DnsError::InvalidQuery(prefix.to_string()))?;
+        if prefix > 32 {
+            return Err(DnsError::InvalidQuery(format!(
+                "prefix /{prefix} too large"
+            )));
+        }
+        let network = u32::from_be_bytes([octets[0], octets[1], octets[2], octets[3]]);
+        Ok(Self::IpCidr { network, prefix })
+    }
+
+    /// 是否命中；`name` 为查询名，`client_ip` 为可选请求客户端/目标 IP。
+    fn matches(&self, name: &str, client_ip: Option<IpAddr>) -> bool {
+        match self {
+            Self::Domain(d) => name == d || name.ends_with(&format!(".{d}")),
+            Self::IpCidr { network, prefix } => match client_ip {
+                Some(IpAddr::V4(v4)) => {
+                    let ip = u32::from_be_bytes(v4.octets());
+                    let mask = if *prefix == 0 {
+                        0u32
+                    } else {
+                        u32::MAX.checked_shl(32 - u32::from(*prefix)).unwrap_or(0)
+                    };
+                    (ip & mask) == (network & mask)
+                }
+                _ => false,
+            },
+        }
+    }
+}
+
+/// 一条 DNS 路由规则。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsRouteRule {
-    /// 匹配域名（精确或以 `.` 拼接后缀结尾）。
-    pub domain: String,
+    /// 匹配子句（域名或 IPv4 CIDR）。
+    pub matcher: DnsMatch,
     /// 命中后路由到的 server tag。
     pub server: String,
 }
@@ -212,14 +273,19 @@ impl DnsRouter {
         }
     }
 
-    /// 首匹配：查询名等于 `domain` 或以 `.{domain}` 结尾；无命中走 `default_server`。
+    /// 首匹配（§11.5.1）：按规则声明顺序，域名或 IPv4 CIDR 命中即选；无命中走
+    /// `default_server`。`client_ip` 仅对 CIDR 规则有意义。
     #[must_use]
-    pub fn select(&self, name: &str) -> DnsServerSelection {
+    pub fn select(&self, name: &str, client_ip: Option<IpAddr>) -> DnsServerSelection {
         for rule in &self.rules {
-            if name == rule.domain || name.ends_with(&format!(".{}", rule.domain)) {
+            if rule.matcher.matches(name, client_ip) {
+                let label = match &rule.matcher {
+                    DnsMatch::Domain(d) => d.clone(),
+                    DnsMatch::IpCidr { .. } => "ip_cidr".to_string(),
+                };
                 return DnsServerSelection {
                     server: rule.server.clone(),
-                    matched_domain: Some(rule.domain.clone()),
+                    matched_domain: Some(label),
                 };
             }
         }
@@ -247,6 +313,8 @@ pub struct ServerResolved {
     pub server: String,
     /// 该 server 解析出的地址。
     pub addresses: Vec<IpAddr>,
+    /// 是否命中该 server 自己的缓存（按 server 隔离，§11.5.1）。
+    pub from_cache: bool,
 }
 
 /// 多 server DNS 运行时：按 `DnsRouter` 选 server，再用该 server 注入的 `Resolver` 解析。
@@ -255,6 +323,8 @@ pub struct ServerResolved {
 pub struct MultiServerDns {
     servers: Vec<(String, Box<dyn Resolver>)>,
     router: DnsRouter,
+    /// 按 (server_tag, name, qtype) 隔离的解析缓存（§11.5.1）。
+    cache: HashMap<(String, String, DnsType), Vec<IpAddr>>,
 }
 
 impl MultiServerDns {
@@ -275,13 +345,17 @@ impl MultiServerDns {
                 return Err(DnsError::UnknownServer(tag.to_string()));
             }
         }
-        Ok(Self { servers, router })
+        Ok(Self {
+            servers,
+            router,
+            cache: HashMap::new(),
+        })
     }
 
-    /// 仅做 server 选择（不触发解析）。
+    /// 仅做 server 选择（不触发解析；client_ip=None）。
     #[must_use]
     pub fn select_server(&self, name: &str) -> DnsServerSelection {
-        self.router.select(name)
+        self.router.select(name, None)
     }
 
     /// 选择 server 并经该 server 的 `Resolver` 解析；不跨 server。
@@ -290,10 +364,37 @@ impl MultiServerDns {
     ///
     /// 空名返回 `InvalidQuery`；底层 `Resolver` 失败透传其 `DnsError`。
     pub fn resolve(&mut self, name: &str, qtype: DnsType) -> Result<ServerResolved, DnsError> {
+        self.resolve_with(name, qtype, None)
+    }
+
+    /// 选择 server（可用 `client_ip` 命中 IP-CIDR 规则）并经该 server 解析；
+    /// 缓存按 `(server_tag, name, qtype)` 隔离，跨 server 不命中缓存。
+    ///
+    /// # Errors
+    ///
+    /// 空名返回 `InvalidQuery`；底层 `Resolver` 失败透传其 `DnsError`。
+    pub fn resolve_with(
+        &mut self,
+        name: &str,
+        qtype: DnsType,
+        client_ip: Option<IpAddr>,
+    ) -> Result<ServerResolved, DnsError> {
         if name.is_empty() {
             return Err(DnsError::InvalidQuery(name.to_string()));
         }
-        let selection = self.router.select(name);
+        let selection = self.router.select(name, client_ip);
+        let cache_key = (selection.server.clone(), name.to_string(), qtype);
+
+        // 按 server 隔离的缓存命中：不调用该 server 的 Resolver。
+        if let Some(cached) = self.cache.get(&cache_key) {
+            return Ok(ServerResolved {
+                name: name.to_string(),
+                server: selection.server,
+                addresses: cached.clone(),
+                from_cache: true,
+            });
+        }
+
         let resolver = self
             .servers
             .iter_mut()
@@ -304,10 +405,12 @@ impl MultiServerDns {
             name: name.to_string(),
             qtype,
         })?;
+        self.cache.insert(cache_key, addresses.clone());
         Ok(ServerResolved {
             name: name.to_string(),
             server: selection.server,
             addresses,
+            from_cache: false,
         })
     }
 }
@@ -742,7 +845,7 @@ mod tests {
 
     fn two_servers() -> MultiServerDns {
         let rules = vec![DnsRouteRule {
-            domain: "example.internal".to_string(),
+            matcher: DnsMatch::Domain("example.internal".to_string()),
             server: "a".to_string(),
         }];
         let router = DnsRouter::new(rules, "b".to_string());
@@ -781,7 +884,7 @@ mod tests {
     #[test]
     fn multi_server_new_rejects_dangling_server() {
         let rules = vec![DnsRouteRule {
-            domain: "x".to_string(),
+            matcher: DnsMatch::Domain("x".to_string()),
             server: "ghost".to_string(),
         }];
         let router = DnsRouter::new(rules, "b".to_string());
