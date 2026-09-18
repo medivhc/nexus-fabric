@@ -234,6 +234,8 @@ pub enum OutboundKind {
     Shadowsocks,
     /// VMess AEAD 出站（§11.7；nexus-outbound-vmess）。
     Vmess,
+    /// Trojan TLS 出站（§11.9；nexus-outbound-trojan）。
+    Trojan,
 }
 
 impl OutboundKind {
@@ -245,6 +247,7 @@ impl OutboundKind {
             Self::Relay => "relay",
             Self::Shadowsocks => "shadowsocks",
             Self::Vmess => "vmess",
+            Self::Trojan => "trojan",
         }
     }
 
@@ -254,10 +257,11 @@ impl OutboundKind {
             "relay" => Ok(Self::Relay),
             "shadowsocks" => Ok(Self::Shadowsocks),
             "vmess" => Ok(Self::Vmess),
+            "trojan" => Ok(Self::Trojan),
             other => Err(ConfigError::new(
                 "kind",
                 format!(
-                    "unknown outbound kind '{other}' (supports direct/relay/shadowsocks/vmess)"
+                    "unknown outbound kind '{other}' (supports direct/relay/shadowsocks/vmess/trojan)"
                 ),
             )),
         }
@@ -275,6 +279,12 @@ pub struct OutboundConfig {
     pub method: Option<String>,
     /// shadowsocks password（仅 shadowsocks 出站）。
     pub password: Option<String>,
+    /// trojan ALPN 协议列表（§11.9.3，可空）。
+    pub alpn: Option<Vec<String>>,
+    /// trojan 是否跳过服务端证书链校验（§11.9.3）。
+    pub skip_cert_verify: Option<bool>,
+    /// trojan 请求头格式（§11.9.2）："standard" | "singbox"，缺省 standard。
+    pub header_format: Option<String>,
 }
 
 /// DNS 多 server 路由配置（PRODUCT §11.5）。
@@ -538,6 +548,21 @@ fn opt_str(node: &Node, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// 可选字符串列表（flow list `[a, b]` 或 `- ` 序列）。
+fn opt_str_seq(node: &Node, key: &str) -> Option<Vec<String>> {
+    node.get(key).and_then(Node::as_seq).map(|items| {
+        items
+            .iter()
+            .filter_map(|n| n.as_str().map(str::to_string))
+            .collect()
+    })
+}
+
+/// 可选布尔（仅字面 `true` 为真，其余标量为假）。
+fn opt_bool(node: &Node, key: &str) -> Option<bool> {
+    node.get(key).and_then(Node::as_str).map(|s| s == "true")
+}
+
 fn req_seq<'a>(node: &'a Node, key: &str, field: &str) -> Result<&'a [Node], ConfigError> {
     node.get(key)
         .and_then(Node::as_seq)
@@ -600,12 +625,18 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
             let locator = opt_str(item, "locator");
             let method = opt_str(item, "method");
             let password = opt_str(item, "password");
+            let alpn = opt_str_seq(item, "alpn");
+            let skip_cert_verify = opt_bool(item, "skip_cert_verify");
+            let header_format = opt_str(item, "header_format");
             outbounds.push(OutboundConfig {
                 tag,
                 kind,
                 locator,
                 method,
                 password,
+                alpn,
+                skip_cert_verify,
+                header_format,
             });
         }
     }
@@ -630,6 +661,32 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
                     format!("outbounds[{}].password", o.tag),
                     "shadowsocks outbound requires a non-empty password",
                 ));
+            }
+        }
+    }
+
+    // Trojan 出站（§11.9.3）：password/locator 必填；header_format 仅 standard|singbox。
+    for o in &outbounds {
+        if o.kind == OutboundKind::Trojan {
+            if o.password.as_ref().map(String::is_empty).unwrap_or(true) {
+                return Err(ConfigError::new(
+                    format!("outbounds[{}].password", o.tag),
+                    "trojan outbound requires a non-empty password",
+                ));
+            }
+            if o.locator.as_ref().map(String::is_empty).unwrap_or(true) {
+                return Err(ConfigError::new(
+                    format!("outbounds[{}].locator", o.tag),
+                    "trojan outbound requires a locator (host:port)",
+                ));
+            }
+            if let Some(hf) = o.header_format.as_deref() {
+                if hf != "standard" && hf != "singbox" {
+                    return Err(ConfigError::new(
+                        format!("outbounds[{}].header_format", o.tag),
+                        format!("header_format must be 'standard' or 'singbox', got '{hf}'"),
+                    ));
+                }
             }
         }
     }
@@ -1012,6 +1069,9 @@ fn parse_node_line(line: &str) -> Result<OutboundConfig, (String, RejectedEntry)
                 locator: Some(locator),
                 method: Some(method.to_string()),
                 password: Some(password.to_string()),
+                alpn: None,
+                skip_cert_verify: None,
+                header_format: None,
             })
         }
         "vmess" => Ok(OutboundConfig {
@@ -1020,6 +1080,9 @@ fn parse_node_line(line: &str) -> Result<OutboundConfig, (String, RejectedEntry)
             locator: Some(locator),
             method: Some("chacha20-poly1305".to_string()),
             password: Some(userinfo.to_string()),
+            alpn: None,
+            skip_cert_verify: None,
+            header_format: None,
         }),
         other => Err((
             line.to_string(),
@@ -1174,5 +1237,102 @@ schema_version: 1\nrules:\n  - tag: m\n    kind: match\n    action:\n      - kin
 schema_version: 1\nrules:\n  - tag: m\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\ndns:\n  servers:\n    - tag: a\n      address: 1.1.1.1\n  rules:\n    - domain: x\n      server: ghost\n  default_server: a\n";
         let err = parse(yaml).expect_err("must fail");
         assert!(err.reason.contains("ghost"), "{err:?}");
+    }
+
+    #[test]
+    fn parses_trojan_node_config() {
+        let yaml = "\
+schema_version: 1
+rules:
+  - tag: m
+    kind: match
+    action:
+      - kind: select_outbound
+        tag: t-a
+outbounds:
+  - tag: t-a
+    kind: trojan
+    locator: ty-3.tr202613.com:443
+    password: CHANGE_ME
+    alpn: [h2, http/1.1]
+    skip_cert_verify: true
+    header_format: singbox
+  - tag: t-b
+    kind: trojan
+    locator: os-3.tr202613.com:443
+    password: CHANGE_ME
+    alpn: [h2, http/1.1]
+    skip_cert_verify: true
+    header_format: singbox
+";
+        let cfg = parse(yaml).expect("ok");
+        assert_eq!(cfg.outbounds.len(), 2);
+        assert_eq!(cfg.outbounds[0].kind.as_str(), "trojan");
+        assert_eq!(
+            cfg.outbounds[0].alpn.as_ref().unwrap(),
+            &vec!["h2", "http/1.1"]
+        );
+        assert_eq!(cfg.outbounds[0].skip_cert_verify, Some(true));
+        assert_eq!(cfg.outbounds[0].header_format.as_deref(), Some("singbox"));
+    }
+
+    #[test]
+    fn trojan_missing_password_is_config_invalid() {
+        let yaml = "\
+schema_version: 1
+rules:
+  - tag: m
+    kind: match
+    action:
+      - kind: select_outbound
+        tag: t
+outbounds:
+  - tag: t
+    kind: trojan
+    locator: example:443
+";
+        let err = parse(yaml).expect_err("must fail");
+        assert!(err.reason.contains("password"), "{err:?}");
+    }
+
+    #[test]
+    fn trojan_bad_header_format_is_config_invalid() {
+        let yaml = "\
+schema_version: 1
+rules:
+  - tag: m
+    kind: match
+    action:
+      - kind: select_outbound
+        tag: t
+outbounds:
+  - tag: t
+    kind: trojan
+    locator: example:443
+    password: pwd
+    header_format: bogus
+";
+        let err = parse(yaml).expect_err("must fail");
+        assert!(err.reason.contains("header_format"), "{err:?}");
+    }
+
+    #[test]
+    fn trojan_default_header_format_is_standard() {
+        let yaml = "\
+schema_version: 1
+rules:
+  - tag: m
+    kind: match
+    action:
+      - kind: select_outbound
+        tag: t
+outbounds:
+  - tag: t
+    kind: trojan
+    locator: example:443
+    password: pwd
+";
+        let cfg = parse(yaml).expect("ok");
+        assert_eq!(cfg.outbounds[0].header_format, None);
     }
 }
