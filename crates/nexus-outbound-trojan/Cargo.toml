@@ -1,0 +1,15 @@
+[package]
+name = "nexus-outbound-trojan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nexus-connectivity = { path = "../nexus-connectivity" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+sha2 = "0.10.9"
