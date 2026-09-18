@@ -96,6 +96,9 @@ fn dispatch_observability(args: &[String]) -> ExitCode {
         ["plan", "explain", "--json"] => nexus::observability::plan_explain(),
         ["platform", "capabilities", "--json"] => nexus::observability::platform_capabilities(),
         ["workspace", "heads", "--json"] => nexus::observability::workspace_heads(),
+        ["workspace", "conflicts", "--json"] => nexus::observability::workspace_conflicts(),
+        ["compute", "jobs", "--json"] => nexus::observability::compute_jobs(),
+        ["diagnose", "--json"] => nexus::observability::diagnose(),
         // 领域未就绪命令：显式 UNSUPPORTED（禁止静默降级，exit 0 = 请求已被处理）。
         cmd => {
             let name = cmd

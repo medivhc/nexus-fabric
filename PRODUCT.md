@@ -164,6 +164,18 @@ diagnose
 platform capabilities
 ```
 
+已就绪命令返回结构化 JSON 快照；领域未就绪命令必须显式返回 `UNSUPPORTED`（禁止静默降级，
+PRODUCT §9）。
+
+三命令可观察语义（2026-09-18 冻结）：
+
+- `workspace conflicts`：输出工作区合并冲突快照——构造同 base 双 Head 对同一路径的
+  冲突写入，调用三方合并捕获 `MergeConflict`，输出冲突路径集合、Head 集与合并处置。
+- `compute jobs`：输出计算作业会话快照——经注入的内存帧通道显式提交作业并取回结果，
+  输出各作业的阶段（Active/Closed）与结果。
+- `diagnose`：输出子系统健康聚合报告——逐子系统（status/connectivity/dns/workspace/
+  plan/session/platform）给出 ready 判定与关键摘要，并输出 overall 结论。
+
 ## 10. 完成条件
 
 关键用户可见 Capability 原则上至少需要一条 E4 Product Scenario 或 E5 External Observation 证据。

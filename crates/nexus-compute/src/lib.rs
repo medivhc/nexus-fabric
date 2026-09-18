@@ -120,6 +120,16 @@ impl ComputeJobSession {
     pub fn result(&self) -> Option<&str> {
         self.result.as_deref()
     }
+
+    /// 关闭已提交的作业会话：Active -> Closed，结果保留。
+    /// `observability compute jobs` 借此展示 Closed 阶段快照（2026-09-18）。
+    #[must_use]
+    pub fn close(self) -> Self {
+        Self {
+            phase: ComputePhase::Closed,
+            result: self.result,
+        }
+    }
 }
 
 #[cfg(test)]

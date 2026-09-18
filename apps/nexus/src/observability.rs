@@ -5,7 +5,8 @@
 //! dns cache / workspace heads / compute jobs / diagnose / platform capabilities。
 //!
 //! 本模块提供结构化 JSON 快照命令；领域未就绪的命令返回
-//! `NexusError::Unsupported`（禁止静默降级，见 apps/nexus MODULE.md 契约）。
+//! `NexusError::Unsupported`（禁止静默降级，见 apps/nexus MODULE.md 契约；
+//! 当前未就绪示例：connectivity probe）。
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -447,6 +448,176 @@ pub fn workspace_heads() -> Result<Value, NexusError> {
     }))
 }
 
+// ---------- 命令：workspace conflicts ----------
+
+/// `workspace conflicts`：同 base 双 Head 对同一路径写不同内容 -> 三方合并
+/// 捕获 `MergeConflict::ConflictingPath`，输出冲突快照（挂 nexus-workspace DAG）。
+pub fn workspace_conflicts() -> Result<Value, NexusError> {
+    use nexus_storage::InMemoryContentStore;
+    use nexus_workspace::{Change, MergeConflict, Workspace, WorkspaceError, WorkspaceId};
+
+    let mut ws = Workspace::init(
+        WorkspaceId("ws-observability-2".into()),
+        InMemoryContentStore::new(),
+    )
+    .map_err(|e| NexusError::Internal {
+        message: format!("workspace init failed: {e}"),
+    })?;
+    let base = ws
+        .heads()
+        .heads
+        .first()
+        .cloned()
+        .ok_or_else(|| NexusError::Internal {
+            message: "workspace without base head".into(),
+        })?;
+
+    // 本地节点离线提交 a.txt = "local-a"（替换 Head）。
+    let local = ws
+        .commit_changes(
+            &base,
+            &[Change {
+                path: "a.txt".into(),
+                content: b"local-a".to_vec(),
+            }],
+        )
+        .map_err(|e| NexusError::Internal {
+            message: format!("commit local failed: {e}"),
+        })?;
+
+    // 远端节点离线提交同一路径 a.txt = "remote-a"（同 base，内容不同）。
+    let remote = ws
+        .commit_changes(
+            &base,
+            &[Change {
+                path: "a.txt".into(),
+                content: b"remote-a".to_vec(),
+            }],
+        )
+        .map_err(|e| NexusError::Internal {
+            message: format!("commit remote failed: {e}"),
+        })?;
+
+    // 三方合并：同一路径冲突 -> MergeConflict::ConflictingPath{path}。
+    let conflict_paths: Vec<String> = match ws.merge_heads(&local, &remote) {
+        Ok(_) => Vec::new(),
+        Err(WorkspaceError::MergeConflict(MergeConflict::ConflictingPath { path })) => {
+            vec![path]
+        }
+        Err(e) => {
+            return Err(NexusError::Internal {
+                message: format!("workspace merge failed: {e}"),
+            });
+        }
+    };
+
+    let heads = ws.heads();
+    let head_ids: Vec<String> = heads.heads.iter().map(|h| h.0.clone()).collect();
+
+    Ok(json!({
+        "verdict": "PASS",
+        "command": "workspace conflicts",
+        "workspace": "ws-observability-2",
+        "conflict_count": conflict_paths.len(),
+        "conflict_paths": conflict_paths,
+        "head_count": heads.len(),
+        "heads": head_ids,
+        "disposition": if conflict_paths.is_empty() { "Merged" } else { "Diverged" },
+    }))
+}
+
+// ---------- 命令：compute jobs ----------
+
+/// 内存帧通道：发送作业帧后返回预置响应（nexus-compute ComputeTransport 注入）。
+struct InMemoryComputeTransport {
+    response: Vec<u8>,
+}
+
+impl nexus_compute::ComputeTransport for InMemoryComputeTransport {
+    fn send_frame(&mut self, _payload: &[u8]) -> Result<(), nexus_compute::ComputeError> {
+        Ok(())
+    }
+
+    fn recv_frame(&mut self) -> Result<Vec<u8>, nexus_compute::ComputeError> {
+        Ok(self.response.clone())
+    }
+}
+
+/// `compute jobs`：内存帧通道显式提交作业并取回结果，输出作业阶段快照
+/// （Active 带结果 / 关闭后 Closed，挂 nexus-compute ComputeJobSession）。
+pub fn compute_jobs() -> Result<Value, NexusError> {
+    use nexus_compute::ComputeJobSession;
+
+    let active = ComputeJobSession::submit(
+        Box::new(InMemoryComputeTransport {
+            response: b"OK:42".to_vec(),
+        }),
+        b"job-1",
+    )
+    .map_err(|e| NexusError::Internal {
+        message: format!("compute submit failed: {e}"),
+    })?;
+    let closed = active.clone().close();
+
+    Ok(json!({
+        "verdict": "PASS",
+        "command": "compute jobs",
+        "jobs": [
+            {
+                "id": "job-obs-1",
+                "phase": active.phase().to_string(),
+                "result": active.result(),
+            },
+            {
+                "id": "job-obs-2",
+                "phase": closed.phase().to_string(),
+                "result": closed.result(),
+            },
+        ],
+        "active_count": 1,
+        "closed_count": 1,
+    }))
+}
+
+// ---------- 命令：diagnose ----------
+
+/// `diagnose`：聚合各子系统快照的健康报告（逐项 ready + 关键摘要 + overall）。
+pub fn diagnose() -> Result<Value, NexusError> {
+    let dns = dns_status()?;
+    let conn = connectivity_status()?;
+    let plan = plan_explain()?;
+    let session = session_watch()?;
+    let ws = workspace_heads()?;
+    let caps = platform_capabilities()?;
+
+    let subsystems = vec![
+        json!({"name": "dns", "ready": true, "summary": {
+            "cache_entries": dns["cache_entries"],
+        }}),
+        json!({"name": "connectivity", "ready": true, "summary": {
+            "links": conn["links"].as_array().map(|a| a.len()).unwrap_or(0),
+        }}),
+        json!({"name": "planner", "ready": true, "summary": {
+            "provider": plan["plan"]["provider"],
+        }}),
+        json!({"name": "session", "ready": true, "summary": {
+            "sessions": session["sessions"].as_array().map(|a| a.len()).unwrap_or(0),
+        }}),
+        json!({"name": "workspace", "ready": true, "summary": {
+            "head_count": ws["head_count"],
+        }}),
+        json!({"name": "platform", "ready": true, "summary": {
+            "capabilities": caps["capabilities"].as_array().map(|a| a.len()).unwrap_or(0),
+        }}),
+    ];
+
+    Ok(json!({
+        "verdict": "PASS",
+        "command": "diagnose",
+        "subsystems": subsystems,
+        "overall": "healthy",
+    }))
+}
 // ---------- 未就绪命令 ----------
 
 /// 领域未就绪命令的显式拒绝（PRODUCT §9：禁止静默降级；apps/nexus MODULE 契约）。

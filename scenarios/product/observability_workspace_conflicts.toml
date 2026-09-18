@@ -1,0 +1,39 @@
+schema_version = 1
+id = "product.observability-workspace-conflicts"
+title = "§9 可观察性：workspace conflicts 输出三方合并冲突快照（同路径冲突可观察）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#9-observability"
+
+[given]
+domain_state = "workspace dag ready (two heads diverge on same path)"
+observability = "merge conflict snapshot via nexus-workspace merge_heads"
+
+[when]
+command = "cargo run --quiet -p nexusd -- workspace conflicts --json"
+
+# 冻结期望：同 base 双 Head 对同一路径 a.txt 写不同内容 -> merge_heads
+# 返回 MergeConflict::ConflictingPath{path:a.txt}；命令以 PASS 输出冲突快照
+# （requirement-change：2026-09-18，由 UNSUPPORTED 转为真实实现）。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "workspace conflicts"
+
+[[expect]]
+field = "conflict_count"
+equals = 1
+
+[[expect]]
+field = "conflict_paths.0"
+equals = "a.txt"
+
+[[expect]]
+field = "head_count"
+equals = 2
+
+[[expect]]
+field = "disposition"
+equals = "Diverged"

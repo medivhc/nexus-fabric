@@ -76,8 +76,10 @@
 
 - `nexusd status --json` / `dns status --json` / `dns cache --json` /
   `session watch --json` / `connectivity status --json` / `plan explain --json` /
-  `platform capabilities --json`：路由到 SDK `observability` 模块，stdout 输出单个 JSON。
-- 领域未就绪子命令（workspace heads / compute jobs / diagnose 等）：
+  `workspace heads --json` / `workspace conflicts --json` / `compute jobs --json` /
+  `diagnose --json` / `platform capabilities --json`：路由到 SDK `observability` 模块，
+  stdout 输出单个 JSON。
+- 领域未就绪子命令（connectivity probe 等）：
   输出 `{"verdict":"FAIL","error":{"code":"UNSUPPORTED","command":"<name>"}}`，exit 0。
 - 无效 CLI 用法仍 exit 非 0。
 

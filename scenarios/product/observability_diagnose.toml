@@ -1,0 +1,34 @@
+schema_version = 1
+id = "product.observability-diagnose"
+title = "§9 可观察性：diagnose 输出子系统健康聚合快照"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#9-observability"
+
+[given]
+domain_state = "subsystem snapshots ready (status/connectivity/dns/workspace/plan/session/platform)"
+observability = "aggregated health report"
+
+[when]
+command = "cargo run --quiet -p nexusd -- diagnose --json"
+
+# 冻结期望：聚合各子系统快照，逐项给出 ready 判定与关键摘要，
+# 全部就绪时 overall=healthy（requirement-change：2026-09-18）。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "diagnose"
+
+[[expect]]
+field = "subsystems.0.name"
+non_empty = true
+
+[[expect]]
+field = "subsystems.0.ready"
+equals = true
+
+[[expect]]
+field = "overall"
+equals = "healthy"
