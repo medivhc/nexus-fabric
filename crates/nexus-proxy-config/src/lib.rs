@@ -232,6 +232,8 @@ pub enum OutboundKind {
     Relay,
     /// Shadowsocks AEAD 出站（§11.6；nexus-outbound-shadowsocks）。
     Shadowsocks,
+    /// VMess AEAD 出站（§11.7；nexus-outbound-vmess）。
+    Vmess,
 }
 
 impl OutboundKind {
@@ -242,6 +244,7 @@ impl OutboundKind {
             Self::Direct => "direct",
             Self::Relay => "relay",
             Self::Shadowsocks => "shadowsocks",
+            Self::Vmess => "vmess",
         }
     }
 
@@ -250,10 +253,11 @@ impl OutboundKind {
             "direct" => Ok(Self::Direct),
             "relay" => Ok(Self::Relay),
             "shadowsocks" => Ok(Self::Shadowsocks),
+            "vmess" => Ok(Self::Vmess),
             other => Err(ConfigError::new(
                 "kind",
                 format!(
-                    "unknown outbound kind '{other}' (supports 'direct'/'relay'/'shadowsocks')"
+                    "unknown outbound kind '{other}' (supports direct/relay/shadowsocks/vmess)"
                 ),
             )),
         }

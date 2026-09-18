@@ -193,3 +193,9 @@ name = "nexus-outbound-shadowsocks"
 allowed_internal_dependencies = ["nexus-connectivity"]
 portable = false
 layer = "outbound"
+
+[[crate]]
+name = "nexus-outbound-vmess"
+allowed_internal_dependencies = ["nexus-connectivity"]
+portable = false
+layer = "outbound"

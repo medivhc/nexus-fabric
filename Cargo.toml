@@ -34,6 +34,7 @@ members = [
   "crates/nexus-diagnostics",
   "crates/nexus-proto",
   "crates/nexus-outbound-shadowsocks",
+  "crates/nexus-outbound-vmess",
   "engineering/nexus-harness",
 ]
 
