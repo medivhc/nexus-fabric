@@ -1,0 +1,29 @@
+schema_version = 1
+id = "product.proxy-trojan-header-format"
+title = "Trojan 请求头格式兼容（Singbox 命令字节 + Standard 回归）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11.9.2"
+
+[given]
+topology = "same-process loopback 127.0.0.1: TLS server + TLS client (rustls/ring), rcgen self-signed"
+offline = "no public network; threads joined"
+modes = "two assertions in one run: (a) singbox server expects 0x01 CMD byte, client uses Singbox format; (b) standard server uses standard parser, client uses Standard format"
+
+[when]
+command = "cargo run --quiet -p nexus --example proxy_trojan_header_format -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "kind"
+equals = "trojan"
+
+[[expect]]
+field = "singbox_roundtrip_ok"
+equals = true
+
+[[expect]]
+field = "standard_roundtrip_ok"
+equals = true

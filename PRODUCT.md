@@ -464,6 +464,27 @@ rustls 0.23 内置 dangerous API 与 ALPN，不引入新 crate）：
   为真实节点测试脚手架，CLI/环境变量参数化 `--server/--password/--sni/--target/--alpn/--skip-verify`，
   默认占位、不硬编码任何真实密码。
 
+#### 11.9.2 请求头格式兼容模式（Standard / Singbox，2026-09-18）
+
+不同服务器实现对 trojan 请求头「地址行」前是否带命令字节存在差异：
+
+- **Standard（trojan-gfw 规范，默认）**：`hex(SHA-224(pwd)) | CRLF | ATYP+ADDR+PORT | CRLF`，
+  无命令字节。这是 trojan 规范原文，也是本 crate 既有行为，**默认值保持 Standard，不翻转**。
+- **Singbox（sing-box 系服务器变体）**：`hex(SHA-224(pwd)) | CRLF | CMD(0x01 CONNECT) | ATYP+ADDR+PORT | CRLF`，
+  ATYP 前多一个 `0x01` 命令字节。实测某 sing-box 系机场要求该格式，否则被 fallback 到伪装 nginx
+  返回 HTTP 400；带 `0x01` 命令字节才得正常中继。
+
+- **选择机制**：`TrojanHeaderFormat::{Standard, Singbox}`，客户端编码与本地 server 解析成对使用；
+  真实节点由配置 / E5 脚手架 `--format` 开关选择。默认 Standard 的理由：trojan-gfw 规范是事实标准，
+  翻转默认会要求把既有 3 条冻结 E4 改写为 Singbox（构成 requirement-change），故保持默认并显式切换。
+- **失败语义**：格式不匹配时 server 解析出 `INVALID_HEADER`（不会被误判为 `AUTH_DENIED`）；
+  密码仍按首行 hash 校验，错误面不变。
+- 既有 3 条 trojan E4（adapter / auth-rejected / real-tls-params）继续走 Standard，零回归。
+- E4 场景：`scenarios/product/proxy_trojan_header_format.toml`——同一 example 内两条断言：
+  (a) Singbox：本地 server 期待命令字节，客户端切 Singbox → 握手+认证+往返 PASS；
+  (b) Standard 回归：本地 server 用标准解析器，客户端切 Standard → 往返 PASS。
+- E5：`trojan_real_server.rs` 增加 `--format standard|singbox`（默认 standard），供真实节点复测。
+
 ### 11.6.1 Shadowsocks 真实 TCP 会话闭环（P1，2026-09-18）
 
 把 Shadowsocks 出站从「离线 AEAD 自洽往返」提升为**真实 TCP 会话闭环**：同一进程内
