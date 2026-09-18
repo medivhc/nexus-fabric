@@ -1,0 +1,20 @@
+{
+  "bindings": {
+    "configuration_digest": "ad34962552e2dc798d8cdac30a45cb0d9adf282d",
+    "contract_hash": "e9dbb929f3f4fda656912e16c271278ea1d575ab",
+    "dirty_state": true,
+    "feature_set": [
+      "workspace:default"
+    ],
+    "harness_schema_version": 1,
+    "platform_capability_digest": "1bf5ebe28eab776674d87e5d5770d3266aaa7d89",
+    "source_revision": "80acd0ddcfd66adbd3d3036589aad20e62bacc2f",
+    "target_triple": "x86_64-pc-windows-msvc",
+    "toolchain_version": "1.95.0",
+    "working_tree_digest": "69f2b4357cae207865bed371e33d779908a0aa6f"
+  },
+  "env": {
+    "arch": "x86_64",
+    "os": "windows"
+  }
+}

@@ -237,6 +237,7 @@ dependencies = [
  "nexus-storage",
  "nexus-transport",
  "nexus-workspace",
+ "rustls",
  "serde_json",
 ]
 
