@@ -238,7 +238,7 @@ SOCKS5 入站（Socks5Handshake 状态机，真实字节流）
 
 以下为 P1+ 展望，本期契约不承诺、不冻结为 expectation：
 
-- 真实加密代理协议栈（Shadowsocks / Vmess / Trojan / Hysteria2）；
+- 真实加密代理协议栈（Vmess / Trojan / Hysteria2；Shadowsocks AEAD 见 §11.6）；
 - TUN 透明代理 / Virtual Packet Interface 全局拦截；
 - Clash 订阅 YAML 在线解析与自动更新；
 - LoadBalance / Relay 链式策略组（多跳）；
@@ -268,6 +268,32 @@ SOCKS5 入站（Socks5Handshake 状态机，真实字节流）
 - E4 场景：`scenarios/product/dns_rule_server_selection.toml`（两个 server A/B，规则把
   example.internal 指向 A、其余 MATCH 指向 B；离线注入，断言路由与解析结果）。
 
+### 11.6 OutboundAdapter 接缝与 Shadowsocks 出站（AEAD，2026-09-18）
+
+把 `nexus-connectivity` 的出站激活从闭合的 `LinkKind {Direct, Relay}` 枚举推广为显式
+`OutboundAdapter` trait：Direct / Relay / Shadowsocks 是三个**真实**出站实现。Deletion Test
+（AGENTS.md §12）在此成立——Shadowsocks 是第一个带真实 AEAD 加解密的出站，与仅做可达性
+探测的 Direct/Relay 构成独立变化维度（此前仅 Direct/Relay 两个 kind 标签、无第二维行为时，
+该 trait 属推测性设计，已在第 1/3 步判停并推迟）。
+
+```text
+OutboundAdapter trait（nexus-connectivity，领域中立、可移植）
+  -> DirectAdapter / RelayAdapter（复用既有 LinkProbe 可达性语义，行为不变）
+  -> ShadowsocksAdapter（nexus-outbound-shadowsocks：AEAD 封装）
+  -> Composition Root 按 tag 注册 adapter；规则选定出站 tag -> 取对应 adapter 承接流量
+```
+
+- Shadowsocks 出站：配置 `{tag, server, port, method, password}`；本期冻结 method 为
+  `chacha20-ietf-poly1305`（纯 Rust AEAD，已实测 wasm32-wasip1 可编译、license/advisory
+  通过）；password 经确定性 KDF（HKDF-SHA256，盐=method 标签）派生会话 key。
+- 离线确定性：本步不连真实 SS 服务器，E4 场景仅断言「规则把流量导向 shadowsocks adapter」
+  且「AEAD encrypt(plaintext) -> decrypt 自洽往返」；不引入真实 TCP/握手帧。
+- 新出站 adapter 不削弱既有 Direct/Relay 行为；既有全部产品场景零回归。
+- `nexus-outbound-shadowsocks` 为 portable=false（出站/交付层，依赖第三方 crypto），不进入
+  `harness.toml [portable_core]` 清单；`OutboundAdapter` trait 本身保持领域中立、可移植。
+- E4 场景：`scenarios/product/proxy_shadowsocks_adapter.toml`（配置 shadowsocks 出站，规则指向
+  它；断言 selected adapter kind=shadowsocks 且 AEAD 往返一致）。
+
 ### 11.3 失败语义
 
 ```text
@@ -277,4 +303,5 @@ OUTBOUND_TAG_UNRESOLVED     动作链选定的出站或策略组 tag 不存在
 SELECTOR_EMPTY              selector 策略组候选列表为空
 URLTEST_NO_VALID_CANDIDATE  urltest 组所有候选均无有效 measurement
 DNS_SERVER_UNRESOLVED       DNS 规则或 MATCH 兜底引用的 server tag 未定义
+OUTBOUND_ADAPTER_UNAVAILABLE 选定出站 tag 无已注册的 OutboundAdapter 承接
 ```

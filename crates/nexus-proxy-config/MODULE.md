@@ -60,7 +60,10 @@
     tag: String }`；
   - `GroupConfig`：`{ tag, kind: "selector"|"urltest", candidates: Vec<String>,
     (urltest 可选 tolerance/latency_budget) }`；
-  - `OutboundConfig`：`{ tag, kind: "direct"|"relay", locator: Option<String> }`；
+  - `OutboundConfig`：`{ tag, kind: "direct"|"relay"|"shadowsocks", locator: Option<String> }`；
+  - Shadowsocks 出站（§11.6）：`kind: "shadowsocks"` 时 `locator` 形如 `host:port`，
+    并携带 `method`（本期仅 `"chacha20-ietf-poly1305"`）与 `password`；method 非法 / 字段缺失
+    返回 `CONFIG_INVALID`。
   - `parse(yaml: &str) -> Result<ProxyConfig, ConfigError>`。
 
 ## Verification

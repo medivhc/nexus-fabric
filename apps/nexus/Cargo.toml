@@ -30,6 +30,7 @@ nexus-network = { path = "../../crates/nexus-network" }
 nexus-compute = { path = "../../crates/nexus-compute" }
 nexus-workspace = { path = "../../crates/nexus-workspace" }
 nexus-dns = { path = "../../crates/nexus-dns" }
+nexus-outbound-shadowsocks = { path = "../../crates/nexus-outbound-shadowsocks" }
 nexus-storage = { path = "../../crates/nexus-storage" }
 nexus-platform = { path = "../../crates/nexus-platform" }
 serde_json = { version = "1", default-features = false, features = ["std"] }

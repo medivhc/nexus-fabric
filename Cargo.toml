@@ -33,6 +33,7 @@ members = [
   "crates/nexus-platform-ios",
   "crates/nexus-diagnostics",
   "crates/nexus-proto",
+  "crates/nexus-outbound-shadowsocks",
   "engineering/nexus-harness",
 ]
 
