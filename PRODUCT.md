@@ -281,6 +281,31 @@ SOCKS5 入站（Socks5Handshake 状态机，真实字节流）
 - LoadBalance / Relay 链式策略组（多跳）；
 - DNS hijack 透明拦截（仅在动作链模型中留口，不在本期实现；DNS 多 server 规则路由见 §11.5）。
 
+#### Trojan / Hysteria2 出站依赖评审（实测 scratch，2026-09-18）
+
+在仓库外临时 scratch crate 实测（`cargo add` + `cargo deny` + `cargo check --target
+wasm32-wasip1`），结论据真实命令输出，非预判：
+
+- **Trojan（rustls 0.23 + ring，std，不含 platform-verifier）**：CONDITIONAL / 维持后置。
+  - architecture：新 adapter crate 应 portable=false、layer=outbound，nexus-proxy 不直接依赖 TLS；可隔离。
+  - feature：rustls 客户端 TLS 满足 trojan over TLS；
+  - license：25 个传递包，ring/rustls/rustls-webpki 均 MIT/Apache-2.0（在 allowlist）；
+    scratch 树无被拒第三方 license（唯一 FAIL 是 scratch 包自身缺 license 字段，非依赖）；
+  - security：`cargo deny check advisories` = ok（exit 0）；ring 有公开审计记录；
+  - portability：**FAIL（实测）** `cargo check --target wasm32-wasip1` 失败（ring 无 wasm asm）；
+    但 adapter 标 portable=false 即可隔离，不污染 portable-core；
+  - supply-chain：25 包，rustls/ring 维护活跃。
+  - 剩余边界：离线确定性 E4 需 loopback TLS + 自签 CA pinning（可能再引 rcgen 类证书依赖），
+    单段闭环工作量偏大，维持后置待专门一段。
+- **Hysteria2（quinn 0.11 + rustls/ring）**：FAIL / 维持后置。
+  - license：**FAIL（实测）** 默认 quinn 链经 rustls-platform-verifier 拉入
+    `webpki-root-certs v1.0.9` = `CDLA-Permissive-2.0`，不在 allowlist（cargo deny licenses exit 4）；
+  - security：advisories ok；
+  - portability：**FAIL（实测 exit 101）** socket2/quinn-udp 在 wasm32-wasip1 编译失败（无 UDP）；
+  - supply-chain：88 个传递包，运行时（quinn-udp + smol）重。
+  - 前置条件：需先评审是否把 CDLA-Permissive-2.0 加入 allowlist（策略决策，非本步可擅自放宽），
+    且 QUIC/QUIC-UDP 与离线 E4 确定性闭环不匹配——维持后置。
+
 ### 11.5 DNS 多 server 规则路由（multi-server DNS rule routing，2026-09-18）
 
 在既有单 server Exit-DNS Binding 之外，把 DNS 解析推广为「多 server + 按域名规则选择本次
