@@ -12,6 +12,7 @@
 提供：
 - 请求头编码/解码与密码 SHA-224 校验（纯函数，可单测）；
 - rcgen 动态自签证书生成 + rustls 客户端证书 pinning / 服务端配置构造；
+- 面向真实节点的客户端 TLS 参数：skip-cert-verify（danger API）+ ALPN 下发；
 - 离线 loopback E4 所需的 TLS 会话原语（不连公网）。
 
 ## Non-Responsibilities
@@ -49,6 +50,8 @@
 - TLS 客户端只接受被 pin 的服务端证书（`CertificateVerifier` 自定义）；
 - 离线确定性：同一份 password+目标永远产生同一请求头字节；不连公网；
 - server/client 会话线程必须 join 回收（结构化并发）。
+- skip-cert-verify 仅跳过证书链/主机名校验，**仍执行 TLS 握手签名校验**；ALPN 协商结果可观测；
+- SNI 由调用方以 `ServerName` 传入，本 crate 不硬编码域名、不硬编码真实密码。
 
 ## Side Effects
 
@@ -57,7 +60,8 @@
 ## Verification
 
 - crate 内单测：请求头编解码往返、错密码 → `AUTH_DENIED`、kind/tag 稳定；
-- E4：`scenarios/product/proxy_trojan_adapter.toml`、`proxy_trojan_auth_rejected.toml`。
+- E4：`scenarios/product/proxy_trojan_adapter.toml`、`proxy_trojan_auth_rejected.toml`、
+  `proxy_trojan_real_tls_params.toml`（skip-verify + ALPN 协商 + 往返）。
 
 ## Portability
 
@@ -67,3 +71,10 @@
 ## Unsafe
 
 本 crate 自身 `#![forbid(unsafe_code)]`；ring 内部 unsafe 属第三方，不在本 crate 扩散。
+
+## Public API（新增，§11.9.1）
+
+- `client_config_dangerous_skip_verify(alpn: &[&[u8]]) -> Result<ClientConfig, TrojanError>`：
+  用 rustls `danger::ServerCertVerifier` 自定义实现跳过服务端证书校验，并下发 ALPN 列表；
+  握手签名仍校验。零新依赖（rustls 0.23 内置）。
+- `ServerName` 由调用方传入（SNI 不硬编码）。

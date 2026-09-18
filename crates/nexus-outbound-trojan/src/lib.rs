@@ -289,6 +289,78 @@ pub fn client_config(identity: &LoopbackIdentity) -> Result<ClientConfig, Trojan
     Ok(config)
 }
 
+// ---------- 真实节点客户端：skip-cert-verify + ALPN（§11.9.1） ----------
+
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, Error, SignatureScheme};
+
+/// 跳过证书链/主机名校验，但仍校验 TLS 握手签名的危险 verifier。
+///
+/// 仅用于内网/自签 trojan 节点的 `skip-cert-verify` 模式（§11.9.1）。本 crate 仍
+/// `#![forbid(unsafe_code)]`；"dangerous" 只是 rustls API 命名。
+#[derive(Debug)]
+struct SkipCertVerify;
+
+impl ServerCertVerifier for SkipCertVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        let schemes = rustls::crypto::ring::default_provider().signature_verification_algorithms;
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &schemes)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        let schemes = rustls::crypto::ring::default_provider().signature_verification_algorithms;
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &schemes)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// 构造面向真实节点的客户端配置：跳过证书校验 + 下发 ALPN 列表。
+///
+/// SNI 由调用方以 `ServerName` 传入。`alpn` 为空表示不下发 ALPN。
+///
+/// # Errors
+///
+/// 协议版本不支持返回 `Tls`。
+pub fn client_config_dangerous_skip_verify(alpn: &[&[u8]]) -> Result<ClientConfig, TrojanError> {
+    let mut config = ClientConfig::builder_with_provider(ring_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|_| TrojanError::Tls)?
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(SkipCertVerify))
+        .with_no_client_auth();
+    if !alpn.is_empty() {
+        config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    }
+    Ok(config)
+}
+
 // ---------- TLS 会话 IO 原语 ----------
 
 /// 在已建立的 TLS stream 上写一段字节（flush）。
