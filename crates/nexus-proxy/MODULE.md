@@ -97,6 +97,10 @@
 - 默认最小 surface：`private -> pub(crate) -> pub`。
 - P0 冻结接口骨架（实现阶段填充）：
   - `RuleEngine::new(config: &ProxyConfig) -> Self`：从配置构建规则表（纯函数）；
+  - `RuleData`：组合根注入的规则数据（geoip 国家码→CIDR、geosite 分类→域名、
+    rule-providers 解析结果；`Default` 为空）；`RuleEngine::new` 委托空数据，
+    `RuleEngine::with_data(config, &RuleData)` / `ProxyService::with_rule_data`
+    启用完整能力（§11.11，编译期展开，决策零 I/O）；
   - `RuleEngine::route(&self, flow: &FlowContext) -> RoutingDecision`：
     对单个 FlowContext 执行顺序匹配，返回动作链首动作 + 出站 tag；
   - `SelectorGroup::new(candidates, initial)` / `select(&self) -> &str` /

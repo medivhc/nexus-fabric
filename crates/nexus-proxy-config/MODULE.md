@@ -60,8 +60,8 @@
 - P0 冻结接口骨架（实现阶段填充）：
   - `ProxyConfig`：typed root struct（`inbounds` / `rules` / `groups` / `outbounds` / `speedtest`）；
   - `InboundConfig`：`{ tag, kind: "socks5", listen }`；
-  - `RuleConfig`：`{ kind: "domain_suffix"|"domain"|"ip_cidr"|"match", match: String,
-    action: ActionChainConfig }`；
+  - `RuleConfig`：`{ kind: "domain_suffix"|"domain"|"ip_cidr"|"geoip"|"geosite"|"rule_set"|"match", match: String,
+    action: ActionChainConfig, no_resolve: bool（默认 false）}`；
   - `ActionChainConfig`：有序动作列表；P0 首动作为 `{ kind: "select_outbound",
     tag: String }`；
   - `GroupConfig`：`{ tag, kind: "selector"|"urltest", candidates: Vec<String>,
@@ -69,6 +69,8 @@
   - `OutboundConfig`：`{ tag, kind: "direct"|"relay"|"shadowsocks"|"vmess"|"trojan",
     locator: Option<String> }`；
   - `SpeedtestConfig`：`{ target, timeout_ms, probe_kind }` 可选段（§11.10），缺失走默认值；
+  - `RuleProviderConfig`：`{ tag, behavior: "domain"|"ipcidr"|"classical", path: String }`（§11.11）；
+    规则引用 `kind: "rule_set"`，provider 名不存在 / behavior 非法 / path 缺失 → `CONFIG_INVALID`；
   - Shadowsocks 出站（§11.6）：`kind: "shadowsocks"` 时 `locator` 形如 `host:port`，
     并携带 `method`（本期仅 `"chacha20-ietf-poly1305"`）与 `password`；method 非法 / 字段缺失
     返回 `CONFIG_INVALID`。

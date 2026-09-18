@@ -33,7 +33,9 @@ use std::net::IpAddr;
 use nexus_connectivity::{LinkActivator, LinkCandidate, LinkKind, LinkProbe, LinkSelection};
 use nexus_domain::{FlowContext, FlowOrigin};
 use nexus_measurement::LinkMeasurement;
-use nexus_proxy_config::{ActionKind, GroupKind, OutboundKind, ProxyConfig, RuleKind};
+use nexus_proxy_config::{
+    ActionKind, GroupKind, OutboundKind, ProviderBehavior, ProxyConfig, RuleKind,
+};
 
 // ---------------------------------------------------------------------------
 // 结构化错误（PRODUCT.md §11.3 / MODULE.md Outputs）
@@ -54,6 +56,14 @@ pub enum ProxyError {
     InvalidTarget { target: String },
     /// IP-CIDR 规则参数非法。
     InvalidCidr { cidr: String },
+    /// GEOIP 规则引用未注入的国家码。
+    UnknownGeoCountry { code: String },
+    /// GEOSITE 规则引用未注入的分类。
+    UnknownGeoSite { category: String },
+    /// RULE-SET 规则引用未定义的 provider。
+    UnknownRuleProvider { name: String },
+    /// rule-provider 规则行非法（classical 语法 / 嵌套数据规则 / CIDR 非法）。
+    InvalidProviderRule { line: String },
     /// 出站激活失败（来自注入的 Connectivity 层）。
     Connectivity(String),
     /// 配置层错误透传。
@@ -71,6 +81,10 @@ impl core::fmt::Display for ProxyError {
             Self::UrlTestNoValidCandidate => write!(f, "URLTEST_NO_VALID_CANDIDATE"),
             Self::InvalidTarget { target } => write!(f, "INVALID_TARGET: {target}"),
             Self::InvalidCidr { cidr } => write!(f, "INVALID_CIDR: {cidr}"),
+            Self::UnknownGeoCountry { code } => write!(f, "GEOIP_UNKNOWN_COUNTRY: {code}"),
+            Self::UnknownGeoSite { category } => write!(f, "GEOSITE_UNKNOWN_CATEGORY: {category}"),
+            Self::UnknownRuleProvider { name } => write!(f, "RULE_PROVIDER_UNKNOWN: {name}"),
+            Self::InvalidProviderRule { line } => write!(f, "RULE_PROVIDER_INVALID_RULE: {line}"),
             Self::Connectivity(msg) => write!(f, "CONNECTIVITY: {msg}"),
             Self::Config(e) => write!(f, "CONFIG_INVALID: {e}"),
         }
@@ -88,6 +102,77 @@ impl From<nexus_proxy_config::ConfigError> for ProxyError {
 // ---------------------------------------------------------------------------
 // 中立分流目标：从 FlowContext.destination 抽出 domain / ip
 // ---------------------------------------------------------------------------
+
+/// 组合根注入的规则数据（§11.11）；决策内核零 I/O，数据全部在编译期展开为静态 `Matcher`。
+///
+/// `Default` 为空（不启用 GEOIP / GEOSITE / rule-providers），既有调用零回归。
+#[derive(Debug, Clone, Default)]
+pub struct RuleData {
+    /// GEOIP 库：国家码（大写）→ CIDR 列表。
+    pub geoip: std::collections::HashMap<String, Vec<String>>,
+    /// GEOSITE 清单：分类 → 域名后缀列表。
+    pub geosite: std::collections::HashMap<String, Vec<String>>,
+    /// rule-providers：provider 名 →（行为，原始行列表）。
+    pub providers: std::collections::HashMap<String, (ProviderBehavior, Vec<String>)>,
+}
+
+/// 把 classical 规则行 `<KIND>,<pattern>` 编译为匹配器（无 policy 行，action 由引用规则提供）。
+///
+/// # Errors
+///
+/// 语法非法 / 嵌套数据规则（geoip、geosite、rule_set）/ CIDR 非法时返回 `InvalidProviderRule`。
+fn compile_provider(
+    behavior: ProviderBehavior,
+    lines: &[String],
+) -> Result<Vec<Matcher>, ProxyError> {
+    match behavior {
+        // domain：合并为单个后缀集（语义等价于逐行，一次匹配）。
+        ProviderBehavior::Domain => Ok(vec![Matcher::GeoSite(lines.to_vec())]),
+        ProviderBehavior::IpCidr => lines
+            .iter()
+            .map(|c| {
+                IpPrefix::parse(c.trim())
+                    .map(Matcher::IpCidr)
+                    .map_err(|_| ProxyError::InvalidProviderRule { line: c.clone() })
+            })
+            .collect(),
+        ProviderBehavior::Classical => lines
+            .iter()
+            .map(|line| {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    return Err(ProxyError::InvalidProviderRule {
+                        line: line.to_string(),
+                    });
+                }
+                let mut parts = line.splitn(2, ',');
+                let kind_s = parts.next().unwrap_or_default().trim();
+                let pattern = parts.next().unwrap_or_default().trim();
+                let kind =
+                    RuleKind::parse(kind_s).map_err(|_| ProxyError::InvalidProviderRule {
+                        line: line.to_string(),
+                    })?;
+                match kind {
+                    RuleKind::DomainSuffix => Ok(Matcher::DomainSuffix(pattern.to_string())),
+                    RuleKind::Domain => Ok(Matcher::Domain(pattern.to_string())),
+                    RuleKind::IpCidr => {
+                        IpPrefix::parse(pattern).map(Matcher::IpCidr).map_err(|_| {
+                            ProxyError::InvalidProviderRule {
+                                line: line.to_string(),
+                            }
+                        })
+                    }
+                    RuleKind::Match => Ok(Matcher::Match),
+                    RuleKind::GeoIp | RuleKind::GeoSite | RuleKind::RuleSet => {
+                        Err(ProxyError::InvalidProviderRule {
+                            line: line.to_string(),
+                        })
+                    }
+                }
+            })
+            .collect(),
+    }
+}
 
 /// 分流目标（从 `FlowContext.destination` 派生）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,6 +313,9 @@ enum Matcher {
     DomainSuffix(String),
     Domain(String),
     IpCidr(IpPrefix),
+    GeoIp(Vec<IpPrefix>),
+    GeoSite(Vec<String>),
+    RuleSet(Box<[Matcher]>),
     Match,
 }
 
@@ -243,6 +331,17 @@ impl Matcher {
                 Some(ip) => prefix.contains(ip),
                 None => false,
             },
+            Self::GeoIp(prefixes) => match &target.ip {
+                Some(ip) => prefixes.iter().any(|p| p.contains(ip)),
+                None => false,
+            },
+            Self::GeoSite(domains) => match &target.domain {
+                Some(d) => domains
+                    .iter()
+                    .any(|cat| d == cat || d.ends_with(&format!(".{cat}"))),
+                None => false,
+            },
+            Self::RuleSet(inner) => inner.iter().any(|m| m.matches(target)),
             Self::Match => true,
         }
     }
@@ -283,6 +382,7 @@ struct CompiledRule {
     kind: RuleKind,
     matcher: Matcher,
     action: Vec<RuleAction>,
+    no_resolve: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +400,8 @@ pub struct RouteOutput {
     pub first_action: String,
     /// 首动作本身。
     pub action: RuleAction,
+    /// 命中规则的 no-resolve 标志（§11.11）。
+    pub no_resolve: bool,
 }
 
 /// 规则引擎：从 `ProxyConfig` 构建静态规则表，对 `FlowTarget` 做线性首匹配扫描。
@@ -310,18 +412,59 @@ pub struct RuleEngine {
 }
 
 impl RuleEngine {
-    /// 从配置构建规则表（纯函数）。
+    /// 从配置构建规则表（纯函数，注入空 `RuleData`）。
     ///
     /// # Errors
     ///
     /// IP-CIDR 参数非法时返回 `InvalidCidr`。
     pub fn new(config: &ProxyConfig) -> Result<Self, ProxyError> {
+        Self::with_data(config, &RuleData::default())
+    }
+
+    /// 从配置构建规则表（纯函数），启用组合根注入的 GEOIP / GEOSITE / rule-providers 数据
+    /// （§11.11）；数据全部在编译期展开为静态匹配器，运行匹配零 I/O。
+    ///
+    /// # Errors
+    ///
+    /// IP-CIDR 参数非法返回 `InvalidCidr`；引用未注入国家码 / 分类 / provider 或
+    /// provider 规则行非法时返回对应结构化错误。
+    pub fn with_data(config: &ProxyConfig, data: &RuleData) -> Result<Self, ProxyError> {
         let mut rules = Vec::with_capacity(config.rules.len());
         for r in &config.rules {
             let matcher = match r.kind {
                 RuleKind::DomainSuffix => Matcher::DomainSuffix(r.pattern.clone()),
                 RuleKind::Domain => Matcher::Domain(r.pattern.clone()),
                 RuleKind::IpCidr => Matcher::IpCidr(IpPrefix::parse(&r.pattern)?),
+                RuleKind::GeoIp => {
+                    let code = r.pattern.to_ascii_uppercase();
+                    let prefixes = data
+                        .geoip
+                        .get(&code)
+                        .ok_or_else(|| ProxyError::UnknownGeoCountry { code: code.clone() })?;
+                    let parsed = prefixes
+                        .iter()
+                        .map(|c| IpPrefix::parse(c.trim()))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Matcher::GeoIp(parsed)
+                }
+                RuleKind::GeoSite => {
+                    let domains =
+                        data.geosite
+                            .get(&r.pattern)
+                            .ok_or_else(|| ProxyError::UnknownGeoSite {
+                                category: r.pattern.clone(),
+                            })?;
+                    Matcher::GeoSite(domains.clone())
+                }
+                RuleKind::RuleSet => {
+                    let (behavior, lines) = data.providers.get(&r.pattern).ok_or_else(|| {
+                        ProxyError::UnknownRuleProvider {
+                            name: r.pattern.clone(),
+                        }
+                    })?;
+                    let inner = compile_provider(*behavior, lines)?;
+                    Matcher::RuleSet(inner.into_boxed_slice())
+                }
                 RuleKind::Match => Matcher::Match,
             };
             let action = r
@@ -337,6 +480,7 @@ impl RuleEngine {
                 kind: r.kind,
                 matcher,
                 action,
+                no_resolve: r.no_resolve,
             });
         }
         Ok(Self { rules })
@@ -356,6 +500,7 @@ impl RuleEngine {
                     rule_kind: rule.kind,
                     first_action: first.kind_tag().to_string(),
                     action: first.clone(),
+                    no_resolve: rule.no_resolve,
                 });
             }
         }
@@ -557,6 +702,8 @@ pub struct RoutingDecision {
     pub group_type: Option<String>,
     /// relay 组的完整跳序列表（非 relay 组为空）；末元素即出口。
     pub relay_hops: Vec<String>,
+    /// 命中规则的 no-resolve 标志（§11.11）。
+    pub no_resolve: bool,
 }
 
 /// 编排 service：持有 RuleEngine + 出站注册表 + 策略组注册表。
@@ -575,7 +722,12 @@ impl ProxyService {
     ///
     /// 规则表编译失败（如非法 CIDR）时返回对应错误。
     pub fn new(config: &ProxyConfig) -> Result<Self, ProxyError> {
-        let engine = RuleEngine::new(config)?;
+        Self::with_rule_data(config, &RuleData::default())
+    }
+
+    /// 从配置构建编排 service，启用组合根注入的规则数据（§11.11）。
+    pub fn with_rule_data(config: &ProxyConfig, data: &RuleData) -> Result<Self, ProxyError> {
+        let engine = RuleEngine::with_data(config, data)?;
 
         let outbounds = config
             .outbounds
@@ -674,6 +826,7 @@ impl ProxyService {
             matched_rule: routed.matched_rule,
             rule_kind: routed.rule_kind,
             first_action: routed.first_action,
+            no_resolve: routed.no_resolve,
             flow_origin: origin_tag(flow.origin).to_string(),
             selected_outbound_tag,
             selected_group_tag,

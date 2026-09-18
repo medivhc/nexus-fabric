@@ -225,7 +225,17 @@ SOCKS5 入站（复用 nexus-ingress 状态机）
   - `DOMAIN-SUFFIX`：目的域名等于或以 `.` 拼接规则后缀结尾；
   - `DOMAIN`：目的域名精确匹配；
   - `IP-CIDR`：目的为 IP literal 且落在 CIDR 网段内；
+  - `GEOIP`：目的 IP 归属地为规则指定国家码（数据由组合根注入的 GEOIP 库展开为
+    CIDR 列表，编译期静态匹配，见 §11.11）；
+  - `GEOSITE`：目的域名属于规则指定分类集合（数据由组合根注入的分类清单展开为
+    域名后缀集，编译期静态匹配，见 §11.11）；
+  - `RULE-SET`：引用 rule-providers 定义的规则集（domain / ipcidr / classical
+    三种行为，编译期展开为内联匹配器，保持 provider 内声明顺序首匹配，见 §11.11）；
   - `MATCH`：兜底规则（必须存在于规则表末尾，匹配一切未命中流量）。
+- IP 类规则（`IP-CIDR` / `GEOIP` / `RULE-SET`(ipcidr)）对未解析的域名流量不命中
+  （`FlowContext` 未携带目标 IP）；规则可选 `no_resolve: true`（默认 false）——该标志为
+  编译期属性并进入分流决策可观察字段，表示「命中评估不要求先做 DNS 解析」；真实解析差异
+  由数据面（§11.4）承接。
 - 每条规则命中后产出 `rule_action` 动作链（有序动作列表）。P0 冻结第一动作
   为 `SELECT_OUTBOUND <tag>`（选定出站或策略组 tag）；动作链为日后 DNS hijack /
   route-options 等后置扩展留口，但 P0 不实现额外动作类型。
@@ -552,6 +562,40 @@ loopback 127.0.0.1 起 SS server 端 + 客户端，走真实 `std::net::TcpStrea
   缺失走默认值；非法字段返回 `CONFIG_INVALID`。
 - E4 场景：`proxy_speedtest.toml`（注入 mock 三候选，断言排序与 JSON 形态）、
   `proxy_speedtest_loopback.toml`（loopback 真 TCP，断言 latency_ms 有值且低于阈值）。
+
+### 11.11 GEOIP / GEOSITE / rule-providers（规则数据注入，2026-09-18）
+
+在 §11.1 冻结的静态规则表之外，为规则引擎引入三类**编译期数据注入**的匹配能力：
+GEOIP 国家库、GEOSITE 域名分类清单、rule-providers 本地规则集。数据文件由组合根
+（apps/nexus）加载后注入决策内核，`nexus-proxy` 保持纯决策零 I/O（匹配数据全部在
+编译期展开为静态 `Matcher`）。
+
+- GEOIP：`kind: geoip, match: "<国家码>"`（两字母，如 `CN`）；组合根注入
+  `geoip` 库（国家码 → CIDR 列表，自研紧凑二进制 `geoip.nex`，零第三方依赖）；
+  编译期把国家码展开为 CIDR 列表（`Matcher::GeoIp`）；国家码不存在于注入库 →
+  `CONFIG_INVALID`（不静默降级为不匹配）。
+- GEOSITE：`kind: geosite, match: "<分类>"`（如 `cn`）；组合根注入分类清单
+  （分类 → 域名后缀列表，纯文本 `geosite/<cat>.txt`，每行一个域名）；编译期展开
+  为域名后缀集（`Matcher::GeoSite`，后缀匹配语义与 DOMAIN-SUFFIX 一致）；
+  分类不存在 → `CONFIG_INVALID`。
+- rule-providers：配置 `rule-providers: { <name>: { behavior: "domain"|"ipcidr"|
+  "classical", path: <本地文件> } }`；规则引用 `kind: rule_set, match: "<name>"`；
+  编译期把 provider 文件内容展开为内联匹配器（`Matcher::RuleSet`，保持 provider 内
+  声明顺序首匹配）：
+  - `domain`：每行一个域名（后缀匹配语义同 GEOSITE）；
+  - `ipcidr`：每行一个 CIDR（复用 `IpPrefix` 手写解析）；
+  - `classical`：每行 `<KIND>,<pattern>`（复用现有全部 RuleKind，无 policy 行，
+    action 由引用规则提供）。
+  provider 名不存在 / behavior 非法 / path 缺失 → `CONFIG_INVALID`。
+- no-resolve：`RuleConfig` 新增可选 `no_resolve: bool`（默认 false）；IP 类规则对
+  未解析域名流量不命中的语义不变（`FlowTarget.ip=None` 不匹配），标志为编译期属性并
+  进入分流决策可观察字段（真实解析差异由数据面 §11.4 承接）。
+- 可观察：分流决策命中规则类型扩展为 `geoip` / `geosite` / `rule_set`，并携带
+  国家码 / 分类 / provider 名（`matched_rule` 即规则名，类型字段区分）。
+- 离线确定性：注入数据全部为本地文件/内嵌样本，E4 场景可复现；在线拉取
+  （rule-providers `url` + 刷新）与真实数据生成工具（公开数据 → `geoip.nex`）后置。
+- E4 场景：`proxy_geoip_rule.toml` / `proxy_geosite_rule.toml` /
+  `proxy_rule_set.toml` / `proxy_rule_invalid.toml`。
 
 ### 11.3 失败语义
 

@@ -69,6 +69,8 @@ pub struct ProxyConfig {
     pub dns: Option<DnsConfig>,
     /// 可选节点测速段（§11.10）；缺失走默认值。
     pub speedtest: Option<SpeedtestConfig>,
+    /// 可选 rule-providers 规则集定义（§11.11）。
+    pub rule_providers: Vec<RuleProviderConfig>,
 }
 
 /// 入站监听配置。
@@ -91,6 +93,12 @@ pub enum RuleKind {
     Domain,
     /// 目的为 IP literal 且落在 CIDR 网段内。
     IpCidr,
+    /// 目的 IP 归属地为规则指定国家码（数据注入，§11.11）。
+    GeoIp,
+    /// 目的域名属于规则指定分类集合（数据注入，§11.11）。
+    GeoSite,
+    /// 引用 rule-providers 规则集（数据注入，§11.11）。
+    RuleSet,
     /// 兜底规则（匹配一切未命中流量）。
     Match,
 }
@@ -103,15 +111,22 @@ impl RuleKind {
             Self::DomainSuffix => "domain_suffix",
             Self::Domain => "domain",
             Self::IpCidr => "ip_cidr",
+            Self::GeoIp => "geoip",
+            Self::GeoSite => "geosite",
+            Self::RuleSet => "rule_set",
             Self::Match => "match",
         }
     }
 
-    fn parse(s: &str) -> Result<Self, ConfigError> {
+    /// 解析 YAML kind 取值（classical provider 规则行跨 crate 复用，§11.11）。
+    pub fn parse(s: &str) -> Result<Self, ConfigError> {
         match s {
             "domain_suffix" => Ok(Self::DomainSuffix),
             "domain" => Ok(Self::Domain),
             "ip_cidr" => Ok(Self::IpCidr),
+            "geoip" => Ok(Self::GeoIp),
+            "geosite" => Ok(Self::GeoSite),
+            "rule_set" => Ok(Self::RuleSet),
             "match" => Ok(Self::Match),
             other => Err(ConfigError::new(
                 "kind",
@@ -132,6 +147,54 @@ pub struct RuleConfig {
     pub pattern: String,
     /// 命中后的动作链（有序）。
     pub action: ActionChainConfig,
+    /// no-resolve 标志（IP 类规则对未解析域名流量不命中；默认 false，§11.11）。
+    pub no_resolve: bool,
+}
+
+/// rule-provider 行为（§11.11）。
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ProviderBehavior {
+    /// 每行一个域名（后缀匹配语义同 GEOSITE）。
+    Domain,
+    /// 每行一个 CIDR（复用 `IpPrefix` 解析）。
+    IpCidr,
+    /// 每行 `<KIND>,<pattern>`（复用现有全部 RuleKind）。
+    Classical,
+}
+
+impl ProviderBehavior {
+    /// 稳定的机器可读标签。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Domain => "domain",
+            Self::IpCidr => "ipcidr",
+            Self::Classical => "classical",
+        }
+    }
+
+    fn parse(s: &str) -> Result<Self, ConfigError> {
+        match s {
+            "domain" => Ok(Self::Domain),
+            "ipcidr" => Ok(Self::IpCidr),
+            "classical" => Ok(Self::Classical),
+            other => Err(ConfigError::new(
+                "behavior",
+                format!("unknown provider behavior '{other}'"),
+            )),
+        }
+    }
+}
+
+/// rule-provider 配置（P0 本地文件；在线 `url` 拉取后置，§11.11）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleProviderConfig {
+    /// provider 标识（规则 `kind: rule_set, match: <tag>` 引用）。
+    pub tag: String,
+    /// 规则集行为。
+    pub behavior: ProviderBehavior,
+    /// 本地规则集文件路径。
+    pub path: String,
 }
 
 /// 动作链配置：有序动作列表。P0 首动作为 `select_outbound`，后续动作为 P1+ 扩展口。
@@ -770,6 +833,7 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
         let kind_s = req_str(item, "kind", &field)?;
         let kind = RuleKind::parse(kind_s).map_err(|e| refield(e, &format!("{field}.kind")))?;
         let pattern = opt_str(item, "match").unwrap_or_default();
+        let no_resolve = opt_bool(item, "no_resolve").unwrap_or(false);
 
         let action_node = item
             .get("action")
@@ -800,6 +864,7 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
             kind,
             pattern,
             action: ActionChainConfig { actions },
+            no_resolve,
         });
     }
 
@@ -941,6 +1006,32 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
     } else {
         None
     };
+    // ---- rule-providers（可选，§11.11）----
+    let mut rule_providers = Vec::new();
+    if let Some(rp_node) = root.get("rule-providers") {
+        let entries = match rp_node {
+            Node::Map(items) => items,
+            _ => return Err(ConfigError::new("rule-providers", "must be a mapping")),
+        };
+        for (name, item) in entries {
+            let field = format!("rule-providers.{name}");
+            let behavior_s = req_str(item, "behavior", &field)?;
+            let behavior = ProviderBehavior::parse(behavior_s)
+                .map_err(|e| refield(e, &format!("{field}.behavior")))?;
+            let path = req_str(item, "path", &field)?.to_string();
+            if path.is_empty() {
+                return Err(ConfigError::new(
+                    format!("{field}.path"),
+                    "path must not be empty",
+                ));
+            }
+            rule_providers.push(RuleProviderConfig {
+                tag: name.clone(),
+                behavior,
+                path,
+            });
+        }
+    }
     // 策略组候选必须引用已定义出站。
     for g in &groups {
         for c in &g.candidates {
@@ -961,6 +1052,7 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
         outbounds,
         dns,
         speedtest,
+        rule_providers,
     })
 }
 

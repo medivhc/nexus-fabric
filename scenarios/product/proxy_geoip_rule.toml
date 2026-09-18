@@ -1,0 +1,42 @@
+schema_version = 1
+id = "product.proxy-geoip-rule"
+title = "GEOIP 规则：按国家码匹配目标 IP 归属地"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-proxy-kernel"
+
+[given]
+command = "proxy route"
+rule_kind = "geoip"
+data = "injected GEOIP db (CN->[1.0.1.0/24, 1.2.3.0/24], US->[8.8.8.0/24])"
+network = "none (offline data injection)"
+
+# 可执行 E4：组合根注入 geoip 库，SOCKS5 CONNECT 三个目标：
+# 1) 1.2.3.4（CN 网段）→ 命中 geoip 规则；
+# 2) 8.8.8.8（US 网段）→ geoip 不命中，走 MATCH；
+# 3) example.com（域名，未解析）→ geoip 不命中（IP 类规则对无 IP 流量不命中）。
+[when]
+command = "cargo run --quiet -p nexus --example proxy_geoip_rule -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "case_cn.rule_kind"
+equals = "geoip"
+
+[[expect]]
+field = "case_cn.matched_rule"
+equals = "rule-geoip-cn"
+
+[[expect]]
+field = "case_us.rule_kind"
+equals = "match"
+
+[[expect]]
+field = "case_domain.rule_kind"
+equals = "match"
+
+[[expect]]
+field = "case_cn.no_resolve"
+equals = false
