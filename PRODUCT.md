@@ -306,6 +306,25 @@ wasm32-wasip1`），结论据真实命令输出，非预判：
   - 前置条件：需先评审是否把 CDLA-Permissive-2.0 加入 allowlist（策略决策，非本步可擅自放宽），
     且 QUIC/QUIC-UDP 与离线 E4 确定性闭环不匹配——维持后置。
 
+#### Trojan TLS 依赖复审 + 证书方案（rustls+ring+rcgen，实测 scratch，2026-09-18）
+
+针对离线确定性 E4 所需的 loopback TLS + 自签 CA pinning，复审 `rustls 0.23(ring,std)` +
+ `rcgen 0.13`（纯 Rust、MIT）组合：
+
+- 传递规模：32 包（无 rustls-platform-verifier / webpki-root-certs），**避免 CDLA**；
+- license：`cargo deny check licenses` 无被拒第三方依赖（唯一 exit 4 是 scratch 包自身缺
+  license 字段；ring/rustls/rustls-webpki/rcgen 均 MIT/Apache-2.0，在 allowlist）；
+- security：`cargo deny check advisories` = ok（exit 0）；
+- portability：`cargo check --target wasm32-wasip1` **FAIL（实测 exit 101，ring 需 clang/C asm）**，
+  以 `nexus-outbound-trojan` 标 `portable=false` 隔离，不污染 portable-core（11 crate）；
+- architecture：`policies/architecture.toml` 已声明 `nexus-outbound-trojan`
+  （portable=false / layer=outbound / allowed_internal_deps=[nexus-connectivity]），
+  nexus-proxy 不依赖 TLS crate（组合根装配，同 shadowsocks/vmess）；
+- supply-chain：rcgen/rustls/ring 维护活跃。
+
+**结论：rcgen 评审通过，采用 rcgen 动态自签测试证书**（不落固定 PEM fixture）。Trojan
+六项评审通过，从「CONDITIONAL 后置」转为「进入实现阶段」；hysteria2 维持后置不变。
+
 ### 11.5 DNS 多 server 规则路由（multi-server DNS rule routing，2026-09-18）
 
 在既有单 server Exit-DNS Binding 之外，把 DNS 解析推广为「多 server + 按域名规则选择本次
