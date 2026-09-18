@@ -283,10 +283,12 @@ pub struct DnsServerConfig {
     pub address: String,
 }
 
-/// 一条 DNS 路由规则配置：命中 `domain` 的查询走 `server`。
+/// 一条 DNS 路由规则配置：命中 `domain`（域名）或 `ip_cidr`（IPv4 前缀，§11.5.1）走 `server`。
+/// `domain` 与 `ip_cidr` 必须恰好给一个。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsRouteRuleConfig {
-    pub domain: String,
+    pub domain: Option<String>,
+    pub ip_cidr: Option<String>,
     pub server: String,
 }
 
@@ -736,9 +738,26 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
         if let Some(rseq) = dns_node.get("rules").and_then(Node::as_seq) {
             for (i, item) in rseq.iter().enumerate() {
                 let f = format!("dns.rules[{i}]");
-                let domain = req_str(item, "domain", &f)?.to_string();
+                let domain = opt_str(item, "domain");
+                let ip_cidr = opt_str(item, "ip_cidr");
                 let server = req_str(item, "server", &f)?.to_string();
-                rules.push(DnsRouteRuleConfig { domain, server });
+                if domain.is_none() && ip_cidr.is_none() {
+                    return Err(ConfigError::new(
+                        f,
+                        "dns rule requires exactly one of `domain` or `ip_cidr`",
+                    ));
+                }
+                if domain.is_some() && ip_cidr.is_some() {
+                    return Err(ConfigError::new(
+                        f,
+                        "dns rule must not set both `domain` and `ip_cidr`",
+                    ));
+                }
+                rules.push(DnsRouteRuleConfig {
+                    domain,
+                    ip_cidr,
+                    server,
+                });
             }
         }
         let default_server = req_str(dns_node, "default_server", "dns")?.to_string();
@@ -786,7 +805,7 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
         for r in &cfg.rules {
             if !dns_tags.contains(r.server.as_str()) {
                 return Err(ConfigError::new(
-                    format!("dns.rules[{}].server", r.domain),
+                    format!("dns.rules[server={}]", r.server),
                     format!("dns server '{}' is not defined", r.server),
                 ));
             }
