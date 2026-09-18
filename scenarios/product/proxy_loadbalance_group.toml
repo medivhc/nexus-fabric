@@ -1,0 +1,41 @@
+schema_version = 1
+id = "product.proxy-loadbalance-group"
+title = "load_balance 策略组对 3 候选 round-robin 均匀分发"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-proxy-kernel"
+
+[given]
+group_kind = "load_balance"
+candidates = ["out-a", "out-b", "out-c"]
+policy = "round-robin cursor: candidate[cursor % n], advance each decision"
+probe = "none (deterministic, zero I/O)"
+
+# 可执行 E4：构建 load_balance 组（3 候选），连续发起 6 次分流决策，
+# 断言 round-robin 均匀分发——每个候选恰好命中 2 次（6/3）。
+# 断言确定性字段：verdict、group_type、各候选命中次数。
+[when]
+command = "cargo run --quiet -p nexus --example proxy_loadbalance_group -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "group_type"
+equals = "load_balance"
+
+[[expect]]
+field = "hits_a"
+equals = 2
+
+[[expect]]
+field = "hits_b"
+equals = 2
+
+[[expect]]
+field = "hits_c"
+equals = 2
+
+[[expect]]
+field = "total"
+equals = 6

@@ -57,7 +57,13 @@
 - 策略组解析：
   - `selector`：直接返回当前选中 tag，切换为确定性操作（不探测）；
   - `urltest`：从注入的离线 measurement 数据中选 RTT 最低候选；无有效候选
-    返回 `UrltestNoValidCandidate`。
+    返回 `UrltestNoValidCandidate`；
+  - `load_balance`：round-robin 均匀分发——组内确定性游标，每次决策选
+    `candidate[cursor % n]` 并推进游标；连续 N 次在 n 个候选上各命中次数差 ≤1。
+    游标为进程内状态（`Cell<usize>`，不产生副作用、不探测）；
+  - `relay`：链式级联，候选列表即跳序 `[A, B, ...]`；决策把完整跳序写入
+    `RoutingDecision.relay_hops`，`selected_outbound_tag` 为列表最后一跳（出口）。
+    离线确定性（mock 两跳均经过），不建真实第二跳。
 - 出站激活委派 `nexus-connectivity::LinkActivator`：Direct 成功即直连；Direct
   不可达回退 Relay；全部不可达报告事实，不替换配置中的出站 tag。
 - 规则引擎不调用系统级 Core Planner；它是代理内核产品线的领域局部组件，
@@ -97,6 +103,8 @@
     `switch_to(&mut self, tag)`：手动选择组；
   - `UrltestGroup::new(candidates)` / `select(&self, measurements: &MeasurementSource)
     -> Result<&str, ProxyError>`：按离线 measurement 自动选优；
+  - `LoadBalanceGroup`：round-robin 组，`pick(&self) -> &str` 选当前游标候选并推进；
+  - relay 组由 `GroupKind::Relay` 配置承载，跳序列表经 `RoutingDecision.relay_hops` 暴露。
   - `ProxyService`：编排 service，持有 RuleEngine + Group 注册表 + Outbound 注册表，
     对每个入站 FlowContext 执行 route -> group resolve -> outbound activate。
 
