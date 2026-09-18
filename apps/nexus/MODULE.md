@@ -71,6 +71,8 @@
 - 真实 SOCKS5 代理数据面（PRODUCT §11.4）：`proxy_serve_once` /
   `DEFAULT_PROXY_CONFIG` —— 握手（Socks5Handshake）→ 规则路由（nexus-proxy）
   → Session 双轨 → 真实出站连接 → 双向字节中继。
+- 真实节点测速（PRODUCT §11.10）：TcpLatencyProbe（std::net connect_timeout，非 portable）
+  + proxy_speedtest()（批量测速、RTT 排序 JSON 输出）；结果可经 MeasurementSource 喂 urltest。
 - 本地主链路切片：`internet_access_flow` / `service_session_lifecycle` /
   `connectivity_failure_rollback`。
 

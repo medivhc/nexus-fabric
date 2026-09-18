@@ -126,3 +126,52 @@ mod tests {
         assert_eq!(m.loss_permyriad, None);
     }
 }
+// ---------- 节点测速契约（PRODUCT §11.10） ----------
+
+/// 测速探测目标（P0 冻结 http/https；scheme 仅作展示与后续 http204 实现区分）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeTarget {
+    /// URL scheme（`http` / `https`）。
+    pub scheme: String,
+    /// 目标主机（域名或 IP）。
+    pub host: String,
+    /// 目标端口。
+    pub port: u16,
+    /// 请求路径（空串等价 `/`）。
+    pub path: String,
+}
+
+impl ProbeTarget {
+    /// 构造探测目标。
+    #[must_use]
+    pub fn new(
+        scheme: impl Into<String>,
+        host: impl Into<String>,
+        port: u16,
+        path: impl Into<String>,
+    ) -> Self {
+        Self {
+            scheme: scheme.into(),
+            host: host.into(),
+            port,
+            path: path.into(),
+        }
+    }
+
+    /// 稳定展示形态（`scheme://host:port/path`）。
+    #[must_use]
+    pub fn display(&self) -> String {
+        let path = if self.path.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", self.path)
+        };
+        format!("{}://{}:{}{}", self.scheme, self.host, self.port, path)
+    }
+}
+
+/// 节点延迟探测契约：由组合根以真实 I/O 实现（非 portable 层），本 crate 零 I/O。
+pub trait LatencyProbe {
+    /// 探测目标并产出事实测量；失败保留结构化原因（不伪造默认值）。
+    fn probe(&self, target: &ProbeTarget) -> Result<LinkMeasurement, String>;
+}

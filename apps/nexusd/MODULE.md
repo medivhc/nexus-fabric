@@ -70,6 +70,7 @@
 - `nexusd proxy --addr <ip:port> [--config <path>]`：真实 SOCKS5 数据面入口
   （PRODUCT §11.4）——监听后逐会话完成握手 → 规则路由 → Session → 真实出站
   → 字节中继；每会话输出一条结构化 JSON。
+- `nexusd proxy speedtest --json`：节点测速批量结果表（PRODUCT §11.10）。
 - 语义：host/relay 只做装配与真实 I/O，闭环事件与认证语义全部复用 `nexus` SDK。
 
 ### §9 可观察性子命令（scenarios/product/observability_*.toml）

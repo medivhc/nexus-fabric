@@ -67,6 +67,8 @@ pub struct ProxyConfig {
     pub outbounds: Vec<OutboundConfig>,
     /// 可选 DNS 多 server 路由段（§11.5）。
     pub dns: Option<DnsConfig>,
+    /// 可选节点测速段（§11.10）；缺失走默认值。
+    pub speedtest: Option<SpeedtestConfig>,
 }
 
 /// 入站监听配置。
@@ -314,6 +316,18 @@ pub struct DnsRouteRuleConfig {
     pub domain: Option<String>,
     pub ip_cidr: Option<String>,
     pub server: String,
+}
+
+/// 节点测速配置段（可选，PRODUCT §11.10）；缺失字段走默认值
+/// （target=`http://www.gstatic.com/generate_204`、timeout_ms=5000、probe_kind=`tcp`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeedtestConfig {
+    /// 探测目标（仅 http/https）。
+    pub target: String,
+    /// 探测超时（毫秒）。
+    pub timeout_ms: u64,
+    /// 探测方式（P0 仅 `"tcp"`）。
+    pub probe_kind: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -889,6 +903,44 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
         }
     }
 
+    // ---- speedtest（可选，§11.10）----
+    let speedtest = if let Some(st_node) = root.get("speedtest") {
+        let target = match st_node.get("target") {
+            Some(v) => match v.as_str() {
+                Some(s) if s.starts_with("http://") || s.starts_with("https://") => s.to_string(),
+                _ => {
+                    return Err(ConfigError::new("speedtest.target", "must be http(s) URL"));
+                }
+            },
+            None => "http://www.gstatic.com/generate_204".to_string(),
+        };
+        let timeout_ms = match st_node.get("timeout_ms") {
+            Some(v) => v
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .ok_or_else(|| ConfigError::new("speedtest.timeout_ms", "must be integer"))?,
+            None => 5000,
+        };
+        let probe_kind = match st_node.get("probe_kind") {
+            Some(v) => match v.as_str() {
+                Some("tcp") => "tcp".to_string(),
+                _ => {
+                    return Err(ConfigError::new(
+                        "speedtest.probe_kind",
+                        "P0 only supports `tcp`",
+                    ));
+                }
+            },
+            None => "tcp".to_string(),
+        };
+        Some(SpeedtestConfig {
+            target,
+            timeout_ms,
+            probe_kind,
+        })
+    } else {
+        None
+    };
     // 策略组候选必须引用已定义出站。
     for g in &groups {
         for c in &g.candidates {
@@ -908,6 +960,7 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
         groups,
         outbounds,
         dns,
+        speedtest,
     })
 }
 

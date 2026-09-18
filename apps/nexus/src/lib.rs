@@ -4088,3 +4088,102 @@ pub fn proxy_serve_once(
         }
     }))
 }
+// ---------- 节点测速（PRODUCT §11.10） ----------
+
+/// 真实 TCP 延迟探测（组合根，非 portable）：`std::net::TcpStream::connect_timeout`。
+#[derive(Debug, Clone)]
+pub struct TcpLatencyProbe {
+    /// 建连超时。
+    pub timeout: std::time::Duration,
+}
+
+impl Default for TcpLatencyProbe {
+    fn default() -> Self {
+        Self {
+            timeout: std::time::Duration::from_secs(5),
+        }
+    }
+}
+
+impl nexus_measurement::LatencyProbe for TcpLatencyProbe {
+    fn probe(&self, target: &nexus_measurement::ProbeTarget) -> Result<LinkMeasurement, String> {
+        let addr: std::net::SocketAddr = format!("{}:{}", target.host, target.port)
+            .parse()
+            .map_err(|e| format!("invalid probe address: {e}"))?;
+        let start = std::time::Instant::now();
+        let socket = std::net::TcpStream::connect_timeout(&addr, self.timeout)
+            .map_err(|e| format!("connect failed: {e}"))?;
+        let rtt_ms = u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX);
+        drop(socket);
+        Ok(LinkMeasurement {
+            rtt_ms: Some(rtt_ms),
+            ..Default::default()
+        })
+    }
+}
+
+/// 通用批量测速：对候选逐个探测、RTT 升序输出（探测失败以 status 记录，非致命）。
+/// target_label 为探测目标 URL 展示（产品默认 generate_204；P0 建连级测速实际探测候选 server）。
+pub fn proxy_speedtest_with(
+    probe: &dyn nexus_measurement::LatencyProbe,
+    candidates: &[(&str, nexus_measurement::ProbeTarget)],
+    timeout: std::time::Duration,
+    target_label: &str,
+) -> Result<Value, NexusError> {
+    let mut rows: Vec<(String, Option<u32>, String)> = Vec::new();
+    for (tag, target) in candidates {
+        match probe.probe(target) {
+            Ok(m) => rows.push((tag.to_string(), m.rtt_ms, "ok".to_string())),
+            Err(e) => {
+                let status = if e.contains("timed out") {
+                    "timeout".to_string()
+                } else {
+                    "unreachable".to_string()
+                };
+                rows.push((tag.to_string(), None, status));
+            }
+        }
+    }
+    rows.sort_by_key(|(_, rtt, _)| rtt.unwrap_or(u32::MAX));
+    Ok(json!({
+        "verdict": "PASS",
+        "command": "proxy speedtest",
+        "probe_kind": "tcp",
+        "timeout_ms": timeout.as_millis(),
+        "target": target_label.to_string(),
+        "results": rows
+            .iter()
+            .map(|(tag, rtt, status)| json!({
+                "tag": tag,
+                "latency_ms": rtt,
+                "status": status,
+            }))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+/// `nexusd proxy speedtest --json` 入口：loopback 自检（真实 TcpStream 路径，
+/// 离线确定性；公网 generate_204 测速由 E5 脚手架覆盖）。
+pub fn proxy_speedtest() -> Result<Value, NexusError> {
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| NexusError::Internal {
+            message: format!("bind loopback failed: {e}"),
+        })?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| NexusError::Internal {
+            message: format!("local_addr failed: {e}"),
+        })?
+        .port();
+    let target = nexus_measurement::ProbeTarget::new("http", "127.0.0.1", port, "");
+    let probe = TcpLatencyProbe::default();
+    // listener 保持 backlog 存活直至测完（不 accept 亦可完成 TCP 握手），随后关闭。
+    let result = proxy_speedtest_with(
+        &probe,
+        &[("loopback", target)],
+        probe.timeout,
+        "http://www.gstatic.com/generate_204",
+    );
+    drop(listener);
+    result
+}

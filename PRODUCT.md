@@ -233,8 +233,10 @@ SOCKS5 入站（复用 nexus-ingress 状态机）
   - `selector`：手动指定候选出站 tag 列表，当前选中项可经 API 切换；切换为
     确定性操作（不发起网络探测）。
   - `urltest`：对候选出站执行 measurement（复用 `nexus-planner` 的 measurement
-    选择与 `nexus-connectivity` 的 `LinkProbe`），按离线可复现的确定性数据
-    （注入 mock measurement）选择延迟最低候选；P0 禁止真实网络探测。
+    选择与 `nexus-connectivity` 的 `LinkProbe`），从 `MeasurementSource` 读取
+    事实测量并选择延迟最低候选；组合根可注入离线确定性数据
+    （`OfflineMeasurements`，E4 可复现）或真实 `LatencyProbe` 测速结果
+    （§11.10 节点测速，E5 真机）。
   - `load_balance`：在多候选间按 `round-robin` 均匀分发——组内维护一个确定性游标，
     每次分流决策按 `candidate[cursor % n]` 选出站并推进游标；连续 N 次请求在 n 个候选上
     均匀分布（N>=n 时各候选命中次数差 ≤1）。离线确定性，不探测。
@@ -527,6 +529,29 @@ loopback 127.0.0.1 起 SS server 端 + 客户端，走真实 `std::net::TcpStrea
   server->client 加密、client 解密比对）。
 - 既有离线自洽 E4（`product.proxy-shadowsocks-adapter`）行为不变、不回归。
 - E4 场景：`scenarios/product/proxy_shadowsocks_real_tcp.toml`。
+
+### 11.10 节点测速（real node speedtest，2026-09-18）
+
+在 urltest 策略组之外，提供对候选出站的**真实延迟测量**能力：组合根注入
+`LatencyProbe`（真实 `std::net::TcpStream::connect_timeout`，非 portable 层），
+对配置内候选出站逐一探测目标并产出 `LinkMeasurement` 事实测量；测量结果写入
+`MeasurementTable` 并可被 urltest 经 `MeasurementSource` 消费（决策逻辑零改动）。
+
+- 命令：`nexusd proxy speedtest --json` —— 对全部候选出站批量测速，按 RTT
+  升序输出结果表。
+- 指标：`latency_ms`（±毫秒，未测得为 null）、`status`（`ok` / `timeout` /
+  `unreachable` / `dns_failed`）、`probe_kind`（`tcp` / `http204`，P0 冻结
+  `tcp`，`http204` 为同一 trait 的后置实现）、target、时间戳。
+- 默认探测目标：`http://www.gstatic.com/generate_204`（Clash 惯例）；目标仅
+  http/https、默认公网、超时上限 5s（可配）。
+- 安全边界：只做建连级延迟探测（TCP connect），不做下载吞吐测速（P0 无
+  throughput 指标）；单节点探测失败以 `status` 记录（非致命），不中断批量。
+- 确定性策略：E4 场景注入 `OfflineMeasurements`（排序/选择可复现）；
+  E5 以 loopback 真实 TCP 服务测真实 `LatencyProbe`（本机确定性闭环）。
+- 配置：YAML `proxy:` 下可选 `speedtest: {target, timeout_ms, probe_kind}`；
+  缺失走默认值；非法字段返回 `CONFIG_INVALID`。
+- E4 场景：`proxy_speedtest.toml`（注入 mock 三候选，断言排序与 JSON 形态）、
+  `proxy_speedtest_loopback.toml`（loopback 真 TCP，断言 latency_ms 有值且低于阈值）。
 
 ### 11.3 失败语义
 

@@ -58,7 +58,7 @@
 
 - 默认最小 surface：`private -> pub(crate) -> pub`。
 - P0 冻结接口骨架（实现阶段填充）：
-  - `ProxyConfig`：typed root struct（`inbounds` / `rules` / `groups` / `outbounds`）；
+  - `ProxyConfig`：typed root struct（`inbounds` / `rules` / `groups` / `outbounds` / `speedtest`）；
   - `InboundConfig`：`{ tag, kind: "socks5", listen }`；
   - `RuleConfig`：`{ kind: "domain_suffix"|"domain"|"ip_cidr"|"match", match: String,
     action: ActionChainConfig }`；
@@ -68,6 +68,7 @@
     (urltest 可选 tolerance/latency_budget) }`；
   - `OutboundConfig`：`{ tag, kind: "direct"|"relay"|"shadowsocks"|"vmess"|"trojan",
     locator: Option<String> }`；
+  - `SpeedtestConfig`：`{ target, timeout_ms, probe_kind }` 可选段（§11.10），缺失走默认值；
   - Shadowsocks 出站（§11.6）：`kind: "shadowsocks"` 时 `locator` 形如 `host:port`，
     并携带 `method`（本期仅 `"chacha20-ietf-poly1305"`）与 `password`；method 非法 / 字段缺失
     返回 `CONFIG_INVALID`。

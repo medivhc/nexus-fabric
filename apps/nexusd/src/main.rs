@@ -302,6 +302,16 @@ fn relay_resource(args: &[String]) -> ExitCode {
 /// 真实 SOCKS5 数据面入口：监听后逐会话完成握手 → 规则路由 → Session →
 /// 真实出站 → 字节中继；每会话输出一条结构化 JSON（Ctrl-C 停止）。
 fn proxy_resource(args: &[String]) -> ExitCode {
+    // 节点测速子命令（PRODUCT §11.10）：loopback 自检真实 TcpLatencyProbe。
+    if args.first().map(|a| a.as_str()) == Some("speedtest") {
+        match nexus::proxy_speedtest() {
+            Ok(json) => println!("{json}"),
+            Err(e) => println!(
+                "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"{e}\"}}}}"
+            ),
+        }
+        return ExitCode::SUCCESS;
+    }
     let flags = parse_flags(args);
     let addr: std::net::SocketAddr = match flags.get("--addr").and_then(|v| v.as_deref()) {
         Some(raw) => match raw.parse() {

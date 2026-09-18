@@ -45,7 +45,8 @@
 - Public API 变更必须保持结构化、可版本化并有调用方验证。
 - 本骨架只提供最小编译锚点；业务 API 在实现阶段增量添加。
 
-## Verification
+- 节点测速契约（PRODUCT §11.10）：LatencyProbe trait + ProbeTarget 纯类型（零 I/O、可移植）；$nl   真实探测实现由组合根注入（非 portable）。
+$nl## Verification
 
 最低：
 
