@@ -485,6 +485,29 @@ rustls 0.23 内置 dangerous API 与 ALPN，不引入新 crate）：
   (b) Standard 回归：本地 server 用标准解析器，客户端切 Standard → 往返 PASS。
 - E5：`trojan_real_server.rs` 增加 `--format standard|singbox`（默认 standard），供真实节点复测。
 
+#### 11.9.3 Trojan 节点配置项（配置层，2026-09-18）
+
+`nexus-proxy-config` 的 `OutboundKind` 增加 `Trojan`；`OutboundConfig` 在既有 `tag/kind/locator/`
+`method/password` 之上增加 trojan 节点字段：
+
+- `password: Option<String>`（trojan 必填，复用既有字段）；
+- `alpn: Option<Vec<String>>`（ALPN 协议列表，如 `[h2, http/1.1]`，可空）；
+- `skip_cert_verify: Option<bool>`（是否跳过服务端证书链校验，默认 false）；
+- `header_format: Option<String>`（`"standard"` | `"singbox"`，缺省即 `"standard"`，§11.9.2）。
+
+校验（`kind: trojan` 时）：
+- `password` 必填且非空、`locator` 必填（`host:port`）；缺失 → `CONFIG_INVALID`；
+- `header_format` 若给值，必须是 `standard` 或 `singbox`，其它值 → `CONFIG_INVALID`；
+- 未给 `header_format` 时按 `standard` 解释（不翻转既有默认）。
+
+真实节点样例（密码一律占位 `CHANGE_ME`，严禁真实凭据入库）：
+`examples/configs/trojan_nodes.example.yaml`（日本-TY-3 / 日本-OS-3 两节点，
+server 域名/端口/ALPN/udp/skip-cert-verify 可用真实公开值，密码占位）。
+
+E4 场景：`scenarios/product/proxy_trojan_node_config.toml`——喂含两个 trojan 节点（Singbox +
+skip-verify + alpn）的 YAML，断言解析出 2 个 `OutboundConfig`、`kind=trojan`、`alpn=[h2,http/1.1]`、
+`skip_cert_verify=true`、`header_format=singbox`；再喂一个缺 `password` 的 trojan 节点 → `CONFIG_INVALID`。
+
 ### 11.6.1 Shadowsocks 真实 TCP 会话闭环（P1，2026-09-18）
 
 把 Shadowsocks 出站从「离线 AEAD 自洽往返」提升为**真实 TCP 会话闭环**：同一进程内

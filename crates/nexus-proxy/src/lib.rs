@@ -710,6 +710,9 @@ impl ProxyService {
             // Shadowsocks / VMess 出站不经 LinkActivator 探测；其链路由对应
             // nexus-outbound-* adapter 在 Composition Root 承接（§11.6/§11.7）。
             OutboundKind::Direct | OutboundKind::Shadowsocks | OutboundKind::Vmess => None,
+            // Trojan 出站不经 LinkActivator 探测；由 nexus-outbound-trojan adapter 在
+            // Composition Root 承接（§11.9）。
+            OutboundKind::Trojan => None,
         };
         activator
             .activate(&direct, relay.as_ref(), false, false)

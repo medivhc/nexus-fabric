@@ -47,6 +47,8 @@
   逐行解析 `scheme://userinfo@host:port#name`；仅 `ss://` / `vmess://` 映射为出站，
   其它协议行**显式拒绝并记录**（计入 `rejected`，不致命、不静默吞掉）；
   base64 非法字符/长度对齐错误返回 `CONFIG_INVALID`。离线确定性，纯函数。
+- Trojan 出站（§11.9.3）：`kind=trojan` 时 `password`/`locator` 必填；`header_format` 仅允许
+  `standard`（默认）或 `singbox`；非法值缺失返回 `CONFIG_INVALID`。
 
 ## Side Effects
 
@@ -64,10 +66,14 @@
     tag: String }`；
   - `GroupConfig`：`{ tag, kind: "selector"|"urltest", candidates: Vec<String>,
     (urltest 可选 tolerance/latency_budget) }`；
-  - `OutboundConfig`：`{ tag, kind: "direct"|"relay"|"shadowsocks", locator: Option<String> }`；
+  - `OutboundConfig`：`{ tag, kind: "direct"|"relay"|"shadowsocks"|"vmess"|"trojan",
+    locator: Option<String> }`；
   - Shadowsocks 出站（§11.6）：`kind: "shadowsocks"` 时 `locator` 形如 `host:port`，
     并携带 `method`（本期仅 `"chacha20-ietf-poly1305"`）与 `password`；method 非法 / 字段缺失
     返回 `CONFIG_INVALID`。
+  - Trojan 出站（§11.9.3）：`kind: "trojan"` 时 `locator` 形如 `host:port` 且 `password` 必填非空；
+    可选 `alpn: Vec<String>`、`skip_cert_verify: bool`、`header_format: "standard"|"singbox"`
+    （缺省 `standard`）；`header_format` 非法 / `password` 或 `locator` 缺失 → `CONFIG_INVALID`。
   - `parse_clash_subscription(text: &str) -> Result<SubscriptionParse, ConfigError>`（§11.8）：
     解码 base64 订阅、逐行解析节点 URI，产出 `outbounds: Vec<OutboundConfig>` 与
     `rejected: Vec<RejectedEntry>`（未知协议行及原因）；

@@ -1,0 +1,41 @@
+schema_version = 1
+id = "product.proxy-trojan-node-config"
+title = "Trojan 节点配置解析（两节点 + 缺 password 拒绝）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11.9.3"
+
+[given]
+topology = "offline pure YAML->typed structs parse; no network"
+nodes = "two trojan outbounds: singbox header_format, skip_cert_verify=true, alpn=[h2,http/1.1]"
+negative = "a trojan outbound missing password must yield CONFIG_INVALID"
+
+[when]
+command = "cargo run --quiet -p nexus --example proxy_trojan_node_config -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "kind"
+equals = "trojan"
+
+[[expect]]
+field = "node_count"
+equals = 2
+
+[[expect]]
+field = "alpn_matches"
+equals = true
+
+[[expect]]
+field = "skip_cert_verify_true"
+equals = true
+
+[[expect]]
+field = "header_format_singbox"
+equals = true
+
+[[expect]]
+field = "missing_password_rejected"
+equals = true
