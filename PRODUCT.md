@@ -445,6 +445,25 @@ Trojan / Hysteria2 本段不交付：二者分别需要 TLS（rustls）与 QUIC�
   - `scenarios/product/proxy_trojan_adapter.toml`（loopback TLS，正确密码，握手通过、请求头送达、payload 往返）；
   - `scenarios/product/proxy_trojan_auth_rejected.toml`（错密码 → server 结构化 `AUTH_DENIED`，无中继）。
 
+#### 11.9.1 真实 TLS 连接参数（skip-cert-verify + ALPN + SNI，2026-09-18）
+
+在离线公钥 pin 模式之外，增加面向真实 trojan 服务器的客户端 TLS 参数（零新依赖，全部用
+rustls 0.23 内置 dangerous API 与 ALPN，不引入新 crate）：
+
+- **skip-cert-verify**：`client_config_dangerous_skip_verify(alpn)` 用 rustls
+  `danger::ServerCertVerifier` 自定义实现跳过服务端证书链校验（用于自签/内网 trojan 节点）；
+  仍保留 TLS 握手签名校验（不把整个握手降级为明文）。错误面保持结构化 `TLS`。
+- **ALPN**：`with_alpn_protocols(...)` 下发客户端 ALPN 列表（如 `h2` / `http/1.1`）；
+  协商结果可观测（`negotiated_alpn`）。
+- **SNI**：由调用方以 `ServerName` 传入（example/E5 层），本 crate 不硬编码域名。
+- 离线公钥 pin 模式（§11.9 原有 `client_config`）保持不变，既有两条 E4 零回归。
+- E4 场景：`scenarios/product/proxy_trojan_real_tls_params.toml`——loopback 起配置了
+  ALPN 列表的 TLS server，客户端用 skip-verify 连接，确定性断言 ALPN 协商命中预期、
+  skip 模式握手通过、认证后一段数据往返成功。
+- E5（非 E4，不进 scenarios/product/）：`apps/nexus/examples/trojan_real_server.rs`
+  为真实节点测试脚手架，CLI/环境变量参数化 `--server/--password/--sni/--target/--alpn/--skip-verify`，
+  默认占位、不硬编码任何真实密码。
+
 ### 11.6.1 Shadowsocks 真实 TCP 会话闭环（P1，2026-09-18）
 
 把 Shadowsocks 出站从「离线 AEAD 自洽往返」提升为**真实 TCP 会话闭环**：同一进程内

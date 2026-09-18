@@ -1,0 +1,37 @@
+schema_version = 1
+id = "product.proxy-trojan-real-tls-params"
+title = "Trojan 真实 TLS 参数（skip-cert-verify + ALPN 协商 + 数据往返）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11.9.1"
+
+[given]
+topology = "same-process loopback 127.0.0.1: TLS server (ALPN list) + TLS client (skip-verify)"
+tls = "rustls 0.23(ring); client skips cert chain verification; ALPN h2/http/1.1"
+offline = "no public network; threads joined"
+
+[when]
+command = "cargo run --quiet -p nexus --example proxy_trojan_real_tls_params -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "kind"
+equals = "trojan"
+
+[[expect]]
+field = "tls_ok"
+equals = true
+
+[[expect]]
+field = "alpn_negotiated"
+equals = "http/1.1"
+
+[[expect]]
+field = "auth_accepted"
+equals = true
+
+[[expect]]
+field = "data_roundtrip_ok"
+equals = true
