@@ -196,6 +196,7 @@ dependencies = [
  "nexus-measurement",
  "nexus-network",
  "nexus-outbound-shadowsocks",
+ "nexus-outbound-vmess",
  "nexus-planner",
  "nexus-platform",
  "nexus-policy",
@@ -317,6 +318,15 @@ version = "0.1.0"
 dependencies = [
  "chacha20poly1305",
  "hkdf",
+ "nexus-connectivity",
+ "sha2",
+]
+
+[[package]]
+name = "nexus-outbound-vmess"
+version = "0.1.0"
+dependencies = [
+ "chacha20poly1305",
  "nexus-connectivity",
  "sha2",
 ]

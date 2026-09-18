@@ -707,9 +707,9 @@ impl ProxyService {
         let direct = LinkCandidate::new(LinkKind::Direct, locator.clone(), 0);
         let relay = match record.kind {
             OutboundKind::Relay => Some(LinkCandidate::new(LinkKind::Relay, locator, 0)),
-            // Shadowsocks 出站不经 LinkActivator 探测；其链路由 nexus-outbound-shadowsocks
-            // adapter 在 Composition Root 承接（§11.6），此处不产生 Relay 候选。
-            OutboundKind::Direct | OutboundKind::Shadowsocks => None,
+            // Shadowsocks / VMess 出站不经 LinkActivator 探测；其链路由对应
+            // nexus-outbound-* adapter 在 Composition Root 承接（§11.6/§11.7）。
+            OutboundKind::Direct | OutboundKind::Shadowsocks | OutboundKind::Vmess => None,
         };
         activator
             .activate(&direct, relay.as_ref(), false, false)
