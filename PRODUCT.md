@@ -220,6 +220,12 @@ SOCKS5 入站（复用 nexus-ingress 状态机）
   - `urltest`：对候选出站执行 measurement（复用 `nexus-planner` 的 measurement
     选择与 `nexus-connectivity` 的 `LinkProbe`），按离线可复现的确定性数据
     （注入 mock measurement）选择延迟最低候选；P0 禁止真实网络探测。
+  - `load_balance`：在多候选间按 `round-robin` 均匀分发——组内维护一个确定性游标，
+    每次分流决策按 `candidate[cursor % n]` 选出站并推进游标；连续 N 次请求在 n 个候选上
+    均匀分布（N>=n 时各候选命中次数差 ≤1）。离线确定性，不探测。
+  - `relay`：链式级联——组的候选列表即跳序 `[A, B, ...]`，流量先经 A 再交 B（…）；
+    决策结果暴露完整跳序列表 `relay_hops`，最终出口为列表最后一跳。本步为离线确定性决策
+    （mock 两跳均被经过），不建真实第二跳连接；真实多跳转发后置。
 - 出站：
   - `Direct`：直连，复用 `nexus-connectivity` 的 Direct 链路激活；
   - `Relay`：进程内中继转发，复用 `nexus-connectivity` 的 Relay 链路激活；

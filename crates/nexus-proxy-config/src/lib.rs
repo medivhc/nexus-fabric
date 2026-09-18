@@ -180,6 +180,10 @@ pub enum GroupKind {
     Selector,
     /// 按离线 measurement 选最低延迟。
     UrlTest,
+    /// round-robin 在多候选间均匀分发。
+    LoadBalance,
+    /// 链式级联：候选列表即跳序 [A, B, ...]。
+    Relay,
 }
 
 impl GroupKind {
@@ -189,6 +193,8 @@ impl GroupKind {
         match self {
             Self::Selector => "selector",
             Self::UrlTest => "urltest",
+            Self::LoadBalance => "load_balance",
+            Self::Relay => "relay",
         }
     }
 
@@ -196,9 +202,13 @@ impl GroupKind {
         match s {
             "selector" => Ok(Self::Selector),
             "urltest" => Ok(Self::UrlTest),
+            "load_balance" => Ok(Self::LoadBalance),
+            "relay" => Ok(Self::Relay),
             other => Err(ConfigError::new(
                 "kind",
-                format!("unknown group kind '{other}' (P0 supports 'selector'/'urltest')"),
+                format!(
+                    "unknown group kind '{other}' (supports selector/urltest/load_balance/relay)"
+                ),
             )),
         }
     }

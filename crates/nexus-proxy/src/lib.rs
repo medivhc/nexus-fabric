@@ -26,6 +26,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 
@@ -533,6 +534,8 @@ struct GroupRecord {
     kind: GroupKind,
     candidates: Vec<String>,
     selected: String,
+    /// load_balance round-robin 游标（进程内确定性状态；Cell 保持 route(&self) 不可变签名）。
+    cursor: Cell<usize>,
 }
 
 /// 一次分流决策的可观察结果（MODULE.md Outputs / PRODUCT.md §11.1）。
@@ -552,6 +555,8 @@ pub struct RoutingDecision {
     pub selected_group_tag: Option<String>,
     /// 策略组类型（若首动作命中组）。
     pub group_type: Option<String>,
+    /// relay 组的完整跳序列表（非 relay 组为空）；末元素即出口。
+    pub relay_hops: Vec<String>,
 }
 
 /// 编排 service：持有 RuleEngine + 出站注册表 + 策略组注册表。
@@ -598,6 +603,7 @@ impl ProxyService {
                         kind: g.kind,
                         candidates: g.candidates.clone(),
                         selected,
+                        cursor: Cell::new(0),
                     },
                 )
             })
@@ -626,20 +632,33 @@ impl ProxyService {
         let routed = self.engine.route(&target)?;
         let action_tag = routed.action.target_tag().to_string();
 
-        let (selected_outbound_tag, selected_group_tag, group_type) =
+        let (selected_outbound_tag, selected_group_tag, group_type, relay_hops) =
             match self.groups.get(&action_tag) {
                 Some(group) => {
+                    let mut relay_hops: Vec<String> = Vec::new();
                     let concrete = match group.kind {
                         GroupKind::Selector => group.selected.clone(),
                         GroupKind::UrlTest => {
                             let source = measurements.ok_or(ProxyError::UrlTestNoValidCandidate)?;
                             lowest_rtt(&group.candidates, source)?
                         }
+                        GroupKind::LoadBalance => {
+                            let n = group.candidates.len();
+                            let idx = group.cursor.get() % n;
+                            group.cursor.set((group.cursor.get() + 1) % n);
+                            group.candidates[idx].clone()
+                        }
+                        GroupKind::Relay => {
+                            relay_hops = group.candidates.clone();
+                            // 出口为跳序末跳（配置已保证非空）。
+                            relay_hops.last().cloned().unwrap_or_default()
+                        }
                     };
                     (
                         concrete,
                         Some(action_tag.clone()),
                         Some(group.kind.as_str().to_string()),
+                        relay_hops,
                     )
                 }
                 None => {
@@ -647,7 +666,7 @@ impl ProxyService {
                     if !self.outbounds.contains_key(&action_tag) {
                         return Err(ProxyError::OutboundTagUnresolved { tag: action_tag });
                     }
-                    (action_tag, None, None)
+                    (action_tag, None, None, Vec::new())
                 }
             };
 
@@ -659,6 +678,7 @@ impl ProxyService {
             selected_outbound_tag,
             selected_group_tag,
             group_type,
+            relay_hops,
         })
     }
 

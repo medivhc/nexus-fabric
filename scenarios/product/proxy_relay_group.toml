@@ -1,0 +1,37 @@
+schema_version = 1
+id = "product.proxy-relay-group"
+title = "relay 链式策略组把流量先经 A 再交 B，断言两跳均经过"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-proxy-kernel"
+
+[given]
+group_kind = "relay"
+hops = ["out-a", "out-b"]
+policy = "candidates are ordered hop path [A, B]; selected exit = last hop"
+probe = "none (offline deterministic two-hop decision, zero real second-hop connection)"
+
+# 可执行 E4：构建 relay 组（跳序 [A, B]），发起一次分流决策，
+# 断言完整跳序列表 = [A, B]（两跳都被经过），最终出口 tag = B。
+# 断言确定性字段：verdict、group_type、relay_hops 长度、首跳、末跳。
+[when]
+command = "cargo run --quiet -p nexus --example proxy_relay_group -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "group_type"
+equals = "relay"
+
+[[expect]]
+field = "hop_count"
+equals = 2
+
+[[expect]]
+field = "hop_first"
+equals = "out-a"
+
+[[expect]]
+field = "hop_last"
+equals = "out-b"
