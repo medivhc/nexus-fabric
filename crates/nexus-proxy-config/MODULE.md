@@ -9,7 +9,7 @@
 ## Non-Responsibilities
 
 - 不执行规则匹配、不选择出站、不发起网络 I/O；
-- 不解析 Clash 订阅 YAML（P1+）；
+- 不解析 Clash YAML 配置语法（仅解析 Clash/通用 base64 订阅的「节点 URI 列表」形态，§11.8）；
 - 不持有运行时状态（选中项、measurement 缓存），只负责一次性配置装载与校验。
 
 ## Inputs
@@ -43,6 +43,10 @@
 - selector 策略组候选列表不得为空；urltest 组同理。
 - 该 crate 必须保持 WASI/portable 可检查（不直接读写文件系统；文件 I/O 由
   Composition Root 完成，本层只消费已读入的文本）。
+- 订阅解析（§11.8）：base64 整段解码（手写标准 base64 解码器，零第三方依赖）；
+  逐行解析 `scheme://userinfo@host:port#name`；仅 `ss://` / `vmess://` 映射为出站，
+  其它协议行**显式拒绝并记录**（计入 `rejected`，不致命、不静默吞掉）；
+  base64 非法字符/长度对齐错误返回 `CONFIG_INVALID`。离线确定性，纯函数。
 
 ## Side Effects
 
@@ -64,6 +68,9 @@
   - Shadowsocks 出站（§11.6）：`kind: "shadowsocks"` 时 `locator` 形如 `host:port`，
     并携带 `method`（本期仅 `"chacha20-ietf-poly1305"`）与 `password`；method 非法 / 字段缺失
     返回 `CONFIG_INVALID`。
+  - `parse_clash_subscription(text: &str) -> Result<SubscriptionParse, ConfigError>`（§11.8）：
+    解码 base64 订阅、逐行解析节点 URI，产出 `outbounds: Vec<OutboundConfig>` 与
+    `rejected: Vec<RejectedEntry>`（未知协议行及原因）；
   - `parse(yaml: &str) -> Result<ProxyConfig, ConfigError>`。
 
 ## Verification
