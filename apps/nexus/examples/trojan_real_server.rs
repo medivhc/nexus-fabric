@@ -20,7 +20,9 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 
-use nexus_outbound_trojan::{TrojanTarget, client_config_dangerous_skip_verify, encode_request};
+use nexus_outbound_trojan::{
+    TrojanHeaderFormat, TrojanTarget, client_config_dangerous_skip_verify, encode_request_fmt,
+};
 
 #[derive(Default, Clone)]
 struct Args {
@@ -30,6 +32,7 @@ struct Args {
     target: String,
     alpn: String,
     skip_verify: bool,
+    format: String,
 }
 
 fn parse_args() -> Args {
@@ -43,6 +46,7 @@ fn parse_args() -> Args {
             "--target" => a.target = it.next().unwrap_or_default(),
             "--alpn" => a.alpn = it.next().unwrap_or_default(),
             "--skip-verify" => a.skip_verify = true,
+            "--format" => a.format = it.next().unwrap_or_default(),
             _ => {}
         }
     }
@@ -80,6 +84,11 @@ fn main() {
         std::process::exit(2);
     }
 
+    let fmt = if args.format.eq_ignore_ascii_case("singbox") {
+        TrojanHeaderFormat::Singbox
+    } else {
+        TrojanHeaderFormat::Standard
+    };
     let alpn: Vec<&[u8]> = alpn_list(&args.alpn);
 
     // TLS 客户端：真实节点固定走 skip-cert-verify 模式（本脚手架用途）。
@@ -134,7 +143,7 @@ fn main() {
 
     // 发 trojan 请求头。
     let target = parse_target(&args.target);
-    let header = encode_request(&args.password, &target);
+    let header = encode_request_fmt(&args.password, &target, fmt);
     let auth_ok = match tls.write_all(&header) {
         Ok(_) => true,
         Err(e) => {

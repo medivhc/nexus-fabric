@@ -98,12 +98,37 @@ pub fn auth_hash(password: &str) -> String {
     to_hex(&h.finalize())
 }
 
-/// 编码 trojan 请求头：`hex(SHA-224(password)) | CRLF | ATYP+ADDR+PORT | CRLF`。
+/// 请求头地址行格式选择（PRODUCT §11.9.2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrojanHeaderFormat {
+    /// trojan-gfw 规范：`ATYP+ADDR+PORT`，无命令字节（**默认**）。
+    #[default]
+    Standard,
+    /// sing-box 系变体：ATYP 前带 `0x01` CONNECT 命令字节。
+    Singbox,
+}
+
+/// 编码 trojan 请求头（Standard 默认）。
 #[must_use]
 pub fn encode_request(password: &str, target: &TrojanTarget) -> Vec<u8> {
+    encode_request_fmt(password, target, TrojanHeaderFormat::Standard)
+}
+
+/// 按指定格式编码 trojan 请求头。
+///
+/// Singbox 格式在地址行 ATYP 前插入 `0x01`（CONNECT）命令字节。
+#[must_use]
+pub fn encode_request_fmt(
+    password: &str,
+    target: &TrojanTarget,
+    fmt: TrojanHeaderFormat,
+) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(auth_hash(password).as_bytes());
     out.extend_from_slice(b"\r\n");
+    if matches!(fmt, TrojanHeaderFormat::Singbox) {
+        out.push(0x01); // CMD = CONNECT
+    }
     match target {
         TrojanTarget::Ipv4(oct, port) => {
             out.push(0x01);
@@ -121,12 +146,26 @@ pub fn encode_request(password: &str, target: &TrojanTarget) -> Vec<u8> {
     out
 }
 
-/// 解码并校验 trojan 请求头：先验证首行 `hex(SHA-224(password))`，再解析 ATYP 目标。
+/// 解码并校验 trojan 请求头（Standard 默认）。
 ///
 /// # Errors
 ///
 /// hash 不匹配返回 `AuthDenied`；头部长度/格式非法返回 `InvalidHeader`。
 pub fn parse_request(password: &str, buf: &[u8]) -> Result<TrojanTarget, TrojanError> {
+    parse_request_fmt(password, buf, TrojanHeaderFormat::Standard)
+}
+
+/// 按指定格式解码并校验 trojan 请求头。
+///
+/// # Errors
+///
+/// hash 不匹配返回 `AuthDenied`；头部长度/格式非法（含命令字节位置不符）返回
+/// `InvalidHeader`。
+pub fn parse_request_fmt(
+    password: &str,
+    buf: &[u8],
+    fmt: TrojanHeaderFormat,
+) -> Result<TrojanTarget, TrojanError> {
     // 找到第一个 CRLF，分隔密码行与地址行。
     let pos = buf
         .windows(2)
@@ -141,10 +180,16 @@ pub fn parse_request(password: &str, buf: &[u8]) -> Result<TrojanTarget, TrojanE
         return Err(TrojanError::AuthDenied);
     }
 
-    // 地址行应为 ATYP+ADDR+PORT，且以 CRLF 结尾。
+    // 地址行应为 [CMD] ATYP+ADDR+PORT，且以 CRLF 结尾。
     let addr = rest
         .strip_suffix(b"\r\n")
         .ok_or(TrojanError::InvalidHeader)?;
+    let addr = match fmt {
+        TrojanHeaderFormat::Standard => addr,
+        TrojanHeaderFormat::Singbox => addr
+            .strip_prefix(&[0x01])
+            .ok_or(TrojanError::InvalidHeader)?,
+    };
     if addr.len() < 2 {
         return Err(TrojanError::InvalidHeader);
     }
