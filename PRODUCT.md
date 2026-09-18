@@ -306,6 +306,26 @@ OutboundAdapter trait（nexus-connectivity，领域中立、可移植）
 - E4 场景：`scenarios/product/proxy_shadowsocks_adapter.toml`（配置 shadowsocks 出站，规则指向
   它；断言 selected adapter kind=shadowsocks 且 AEAD 往返一致）。
 
+### 11.6.1 Shadowsocks 真实 TCP 会话闭环（P1，2026-09-18）
+
+把 Shadowsocks 出站从「离线 AEAD 自洽往返」提升为**真实 TCP 会话闭环**：同一进程内
+loopback 127.0.0.1 起 SS server 端 + 客户端，走真实 `std::net::TcpStream`（blocking，
+与仓库既有 real-host/relay E4 同一 loopback 形态）+ 真实 AEAD 封装，确定性、离线、可复现。
+本步不连公网。
+
+会话语义：
+
+- 方向分离：c2s 与 s2c 使用经 HKDF 不同 info 标签派生的两把独立 key，避免同 key nonce 复用；
+  每方向 nonce 自 0 固定计数递增（不调 getrandom）。
+- 记录帧：`u32 BE length || AEAD record`，record = `nonce(12B) || ciphertext+tag`。
+- 客户端首帧为加密 request header：`[ATYP(1)=1 IPv4 | 3 domain] | addr | port(2 BE)`；
+  server 端解密并解析目标地址后，真实 `TcpStream::connect` 到该 loopback 目标并中继双向字节。
+- 离线可复现：目标为另一个 loopback echo 端；断言握手成功、目标地址被 server 正确解析、
+  一段 payload 往返被正确加解密（client->server 加密、server->echo、echo->server 明文、
+  server->client 加密、client 解密比对）。
+- 既有离线自洽 E4（`product.proxy-shadowsocks-adapter`）行为不变、不回归。
+- E4 场景：`scenarios/product/proxy_shadowsocks_real_tcp.toml`。
+
 ### 11.3 失败语义
 
 ```text

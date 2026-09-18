@@ -60,6 +60,24 @@ impl nexus_connectivity::OutboundAdapter for ShadowsocksAdapter { ... }
 enum OutboundCipherError { KeyDerivation, InvalidFrame, DecryptFailed }
 ```
 
+### 冻结契约：真实 TCP 会话（§11.6.1，scenarios/product/proxy_shadowsocks_real_tcp.toml）
+
+在保留既有离线 `ShadowsocksAdapter::encrypt/decrypt` 自洽 API 不变的前提下新增会话层：
+
+- `enum Role { Client, Server }`；`struct SsStream`：持 c2s / s2c 两把独立 key（HKDF info
+  分别为 `b"ss-c2s"` / `b"ss-s2c"`，盐=method），TX 方向 nonce 自 0 固定计数递增。
+- `SsStream::new(password, method, role)`：Client TX=c2s/RX=s2c；Server 相反。
+- `seal(plaintext) -> nonce(12B)||ct+tag`；`open(frame) -> plaintext`（用 RX key，帧内 nonce）。
+- `enum SsTarget { Ipv4([u8;4],u16), Domain(String,u16) }`；`encode_request(&SsTarget)->Vec<u8>`
+  （ATYP=1 IPv4 / =3 domain）、`parse_request(&[u8])->Result<SsTarget>`。
+- 记录帧 I/O：`write_record(&mut TcpStream, &[u8])` / `read_record(&mut TcpStream)`
+  （`u32 BE length` 前缀），纯 std，零新依赖。
+- 不变量：同一方向 nonce 不重复；c2s/s2c key 互不派生混淆；request header 长度/ATYP 非法
+  返回 `InvalidFrame`；AEAD 校验失败返回 `DecryptFailed`。
+- 离线 loopback：目标为另一 loopback echo 端；server 解析目标后真实 `TcpStream::connect` 并中继。
+- 结构化并发：server/echo 用 `std::thread::spawn`，调用方 `join()` 回收，不丢 JoinHandle。
+- 既有 `ShadowsocksAdapter` 自洽 E4 行为不变。
+
 ## Verification
 
 最低：
