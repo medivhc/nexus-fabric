@@ -327,6 +327,25 @@ OutboundAdapter trait（nexus-connectivity，领域中立、可移植）
 - E4 场景：`scenarios/product/proxy_shadowsocks_adapter.toml`（配置 shadowsocks 出站，规则指向
   它；断言 selected adapter kind=shadowsocks 且 AEAD 往返一致）。
 
+### 11.7 VMess 出站 adapter（AEAD 记录，P1，2026-09-18）
+
+在同一 `OutboundAdapter` 接缝上新增第四个真实出站实现 VMess。Deletion Test（AGENTS.md §12）
+已成立：Direct / Relay / Shadowsocks / VMess 是四个带真实行为的出站维度，新增 VMess 不改动
+既有激活/选路路径，仅新增一个 adapter 实现并注册。
+
+- VMess 出站：复用已评审入仓的 RustCrypto `chacha20poly1305` + `sha2`，**零新第三方依赖**；
+  UUID（16 字节）经 SHA-256 确定性派生会话 key；本期冻结安全方法为 `chacha20-poly1305`；
+  固定计数器 nonce（离线确定性，不调 getrandom）。
+- 记录层：`nonce(12B) || ciphertext+tag`，与 Shadowsocks 记录一致的离线 AEAD 自洽往返；
+  不追求与真实 vmess server 的线格式逐字节兼容（真实多跳/TLS 传输后置）。
+- `nexus-outbound-vmess` 为 portable=false（出站/交付层，依赖第三方 crypto），不进入
+  `harness.toml [portable_core]` 清单。
+- E4 场景：`scenarios/product/proxy_vmess_adapter.toml`（配置 vmess 出站，规则指向它；
+  断言 selected adapter kind=vmess 且 AEAD 往返一致）。
+
+Trojan / Hysteria2 本段不交付：二者分别需要 TLS（rustls）与 QUIC（quinn），会拉入 ring
+（C/汇编）与大量传递依赖树，工程量超出单段合理范围且 ring 不可 wasm 移植；评审证据见交付报告。
+
 ### 11.6.1 Shadowsocks 真实 TCP 会话闭环（P1，2026-09-18）
 
 把 Shadowsocks 出站从「离线 AEAD 自洽往返」提升为**真实 TCP 会话闭环**：同一进程内
