@@ -257,7 +257,11 @@ SOCKS5 入站（Socks5Handshake 状态机，真实字节流）
 以下为 P1+ 展望，本期契约不承诺、不冻结为 expectation：
 
 - 真实加密代理协议栈（Vmess / Trojan / Hysteria2；Shadowsocks AEAD 见 §11.6）；
-- TUN 透明代理 / Virtual Packet Interface 全局拦截；
+- TUN 透明代理 / Virtual Packet Interface 全局拦截：维持后置。窄 wintun C ABI 绑定
+  已在 `nexus-platform-windows/src/wintun.rs` 落地（手写 `LoadLibraryW` 动态加载、
+  无第三方 FFI crate、纯符号解析部分已单测），但真实 TUN 会话需管理员权限、随附
+  `wintun.dll` 与真实路由表改写，无法在离线确定性 E4 内闭环——须待平台评审通过后
+  以 E5 真机观察验收（ARCHITECTURE 明确 Virtual Packet Interface != TUN）；
 - Clash 订阅 YAML 在线解析与自动更新；
 - LoadBalance / Relay 链式策略组（多跳）；
 - DNS hijack 透明拦截（仅在动作链模型中留口，不在本期实现；DNS 多 server 规则路由见 §11.5）。
