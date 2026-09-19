@@ -427,7 +427,9 @@ fn extract_dst_ip_from_ipv4(packet: &[u8]) -> Option<String> {
 
 use std::sync::Mutex;
 
-/// 内存模拟 VPI（进程内内存 buffer）。
+/// 内存模拟 VPI（测试工具，生产代码请勿使用）。
+///
+/// 用于单元测试和 E4 离线场景执行，不实现真实 TUN 驱动。
 pub struct MemoryVpi {
     /// 接收缓冲区（对端写入，本节点读取）。
     recv_buf: Mutex<Vec<u8>>,
@@ -483,7 +485,9 @@ impl VirtualPacketInterface for MemoryVpi {
     }
 }
 
-/// 内存模拟 PacketCarrier（进程内双向通道）。
+/// 内存模拟 PacketCarrier（测试工具，生产代码请勿使用）。
+///
+/// 用于单元测试和 E4 离线场景执行，不实现真实 UDP 网络栈。
 pub struct MemoryCarrier {
     /// 发送缓冲区（本节点发送，对端接收）——与对端的 recv_buf 共享。
     send_buf: Arc<Mutex<Vec<u8>>>,
