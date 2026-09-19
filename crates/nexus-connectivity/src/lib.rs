@@ -35,6 +35,7 @@ pub const fn module_summary() -> &'static str {
 
 // ---------- 虚拟子网组网（Virtual Subnet Networking） ----------
 
+pub mod nat;
 pub mod virtual_subnet;
 
 // ---------- 结构化错误（不以日志文本代替错误类型） ----------

@@ -1,0 +1,39 @@
+schema_version = 1
+id = "product.nat-hole-punching"
+title = "NAT 打洞：STUN 映射获取 + UDP 打洞建连"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#connectivity"
+
+[given]
+resource = "p2p-direct"
+locator = "peer-b"
+stun_server = "stun.example.org:3478"
+
+# 可执行 E4：组合根驱动 NAT 打洞流程并输出 JSON。
+[when]
+command = "cargo run --quiet -p nexus --example nat_hole_punching -- --json"
+
+# 冻结期望：STUN 获取映射、NAT 类型检测、UDP 打洞成功。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "stun.local_mapping"
+not_equals = null
+
+[[expect]]
+field = "stun.public_mapping"
+not_equals = null
+
+[[expect]]
+field = "nat.type"
+equals = "RestrictedCone"
+
+[[expect]]
+field = "hole_punch.success"
+equals = true
+
+[[expect]]
+field = "hole_punch.rtt_ms"
+greater_than = 0
