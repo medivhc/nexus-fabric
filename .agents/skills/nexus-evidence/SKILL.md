@@ -100,8 +100,12 @@ nexus-harness explain --json
 新增/修改 Tests / Scenarios：
 Fast Verification：
 Review Evidence ID / Path：
+Review Round：<第几轮 Review>
 Review Verdict：APPROVED / CHANGES_REQUESTED / COMMENTED / BLOCKED
 Reviewer：<独立执行者标识>
+Review Dimension Changes：<与上一轮对比的维度变化（如果是第 2+ 轮）>
+  - edge-coverage: FAIL → PASS
+  - test-quality: WARN → PASS
 Full Verification：
 Evidence ID / Path：
 Evidence Freshness：

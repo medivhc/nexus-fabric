@@ -1,6 +1,6 @@
 ---
 name: nexus-review
-description: 在 Nexus 仓库中，当实现 Agent 完成代码修改并通过 verify --fast 之后、提交 Candidate Completion 之前，执行独立代码审查。由独立于实现 Agent 的执行者（另一个 Agent 会话或人工）完成，覆盖契约一致性、边界覆盖、API 面控制、依赖边界、错误处理、测试质量、复杂度控制、可观测性八个维度，输出 Review Evidence 到 .evidence/review-<id>/。禁止实现 Agent 自行 Review 自己的变更；Review Verdict = CHANGES_REQUESTED 时必须修改后重新 Review，不得直接进入 verify --full。
+description: 在 Nexus 仓库中，当实现 Agent 完成代码修改并通过 verify --fast 之后、提交 Candidate Completion 之前，执行独立代码审查。由独立于实现 Agent 的执行者（另一个 Agent 会话或人工）完成，覆盖契约一致性、边界覆盖、API 面控制、依赖边界、错误处理、测试质量、复杂度控制、可观测性八个维度，输出 Review Evidence 到 .evidence/review-<id>/。禁止实现 Agent 自行 Review 自己的变更；Review Verdict = CHANGES_REQUESTED 时必须修改后重新 Review，不得直接进入 verify --full。Review 是量化迭代过程，每一轮都要对比上一轮的维度变化。
 ---
 
 # nexus-review
@@ -83,21 +83,48 @@ Nexus 的独立 Review 环节：自动化验证回答"代码对不对"，独立 
 - 热路径是否有无节制的 per-packet / per-frame 日志？
 - 遇到非确定性问题时，是否有足够的记录支持 replay / 调试？
 
-## Verdict 语义
+## Verdict 语义（量化）
+
+每个维度的状态为 PASS / WARN / FAIL，最终 Verdict 由最差维度决定：
 
 ```text
-APPROVED           所有维度 PASS 或只有非阻塞建议，可以进入 verify --full
-CHANGES_REQUESTED  存在至少一个 FAIL 维度，必须修改后重新 Review
-COMMENTED          有建议但不阻塞，记录在案即可
+APPROVED           0 个 FAIL，0 个 WARN（或只有非阻塞建议），可以进入 verify --full
+CHANGES_REQUESTED  ≥ 1 个 FAIL，必须修改后重新走 fast verify + 再次独立 Review
+COMMENTED          0 个 FAIL，≥ 1 个 WARN，有建议但不阻塞，记录在案即可
 BLOCKED            发现契约冲突，需要切换到 requirement-change 流程
 ```
+
+## 迭代闭环（必须显式记录）
+
+Review 不是一次性的，必须形成"检查 → 修正 → 再检查"的迭代循环：
+
+```text
+第 1 轮 Review
+  ↓
+CHANGES_REQUESTED → 记录 FAIL 维度 + 阻塞项
+  ↓
+修正代码
+  ↓
+重新 fast verify
+  ↓
+第 2 轮 Review（独立于第 1 轮的执行者）
+  ↓
+对比第 1 轮：哪些 FAIL 变成了 PASS？哪些维度退步了？
+  ↓
+... 直到 Verdict = APPROVED 或 COMMENTED
+```
+
+每一轮 Review 都必须：
+- 引用上一轮的 Review Evidence ID
+- 记录本轮与上一轮的维度变化（哪些从 FAIL→PASS，哪些新增了 FAIL）
+- 迭代次数有上限（默认 3 轮，超过则升级为 BLOCKED，需要人工介入）
 
 ## 输出：Review Evidence
 
 Review 完成后，在 `.evidence/review-<id>/` 下生成：
 
 ```text
-summary.json      Review verdict + 维度结果 + 阻塞项 + 建议
+summary.json      Review verdict + 维度结果 + 阻塞项 + 建议 + 上一轮对比
 findings.md       详细的 Review 意见（可读形式）
 ```
 
@@ -107,6 +134,8 @@ findings.md       详细的 Review 意见（可读形式）
 {
   "schema_version": 1,
   "review_id": "<12字符短id>",
+  "review_round": 1,
+  "previous_review_id": null,
   "verdict": "APPROVED | CHANGES_REQUESTED | COMMENTED | BLOCKED",
   "reviewer": "<独立执行者标识>",
   "source_revision": "<git commit sha>",
@@ -126,7 +155,13 @@ findings.md       详细的 Review 意见（可读形式）
       "recommendation": "..."
     }
   ],
+  "dimension_changes": {
+    "edge-coverage": "FAIL → PASS",
+    "test-quality": "WARN → PASS"
+  },
   "blocking_issues": ["<阻塞进入 full verification 的问题列表>"],
+  "blocking_issues_fixed": ["<已修复的阻塞项>"],
+  "blocking_issues_remaining": ["<剩余阻塞项>"],
   "non_blocking_suggestions": ["<不阻塞但建议改进的问题列表>"]
 }
 ```
@@ -138,6 +173,7 @@ findings.md       详细的 Review 意见（可读形式）
 - 相关的 Scenario 文件。
 - `nexus-harness context <target>` 的输出。
 - 实现 Agent 的 Candidate Completion 报告草稿。
+- 上一轮 Review 的 summary.json（如果不是第 1 轮）。
 
 ## 问题沉淀
 
@@ -152,5 +188,6 @@ Review 中发现的有复用价值的问题，需要沉淀到知识库：
 
 - **前置**：`nexus-harness verify --fast` 必须已通过。
 - **后续**：Review Verdict = APPROVED 后，才能运行 `nexus-harness verify --full`。
+- **迭代**：CHANGES_REQUESTED → 修正 → 重新 fast verify → 再次独立 Review（最多 3 轮）。
 - **关联**：Review Evidence 的 `source_revision` / `working_tree_digest` / `contract_hash` 必须与同期的 verify Evidence 绑定一致。
 - **沉淀**：有复用价值的问题 → 写入 `.agents/knowledge/` 知识库。

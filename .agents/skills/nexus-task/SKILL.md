@@ -63,11 +63,23 @@ description: 在 Nexus 仓库内执行一次端到端工程任务时使用（修
 
    禁止通过削弱 gate（删测试、改 expected value、降低 timeout、skip 失败 Scenario）来解决失败。
 
-6. **独立 Review**：verify --fast 通过后，进入独立 Review 环节。读取 `nexus-review` 技能，由独立于实现的执行者完成八个维度的审查，输出 Review Evidence 到 `.evidence/review-<id>/`。
+6. **独立 Review（量化迭代）**：verify --fast 通过后，进入独立 Review 环节。读取 `nexus-review` 技能，由独立于实现的执行者完成八个维度的审查，输出 Review Evidence 到 `.evidence/review-<id>/`。
 
-   - Review Verdict = `CHANGES_REQUESTED`：修改后重新走 fast verify + Review。
-   - Review Verdict = `BLOCKED`：报告 Contract Conflict，停止实现。
-   - Review Verdict = `APPROVED` 或 `COMMENTED`：进入下一步。
+   Review 是量化迭代过程，不是一次性检查：
+
+   ```text
+   第 1 轮 Review
+     ├─ APPROVED / COMMENTED → 进入 Full Verify
+     └─ CHANGES_REQUESTED → 修正 FAIL 维度 → 重新 fast verify → 第 2 轮 Review
+           ├─ APPROVED / COMMENTED → 进入 Full Verify
+           └─ CHANGES_REQUESTED → 修正 → 重新 fast verify → 第 3 轮 Review
+                 └─ 仍 CHANGES_REQUESTED → 升级 BLOCKED，人工介入
+   ```
+
+   每一轮 Review 都必须：
+   - 引用上一轮的 Review Evidence ID
+   - 记录维度变化（哪些 FAIL→PASS，哪些退步了）
+   - 最多迭代 3 轮，超过则升级 BLOCKED
 
    禁止实现 Agent 自行 Review 自己刚写的变更。
 
