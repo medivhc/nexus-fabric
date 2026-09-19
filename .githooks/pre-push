@@ -1,8 +1,9 @@
 #!/bin/sh
-# Nexus pre-push gate (AGENTS.md §19/§20 Evidence 与 Verdict / §7 Protected Paths).
+# Nexus pre-push gate (AGENTS.md §19/§19.1/§20 Evidence & Verdict / §7 Protected Paths).
 #   1. nexus-harness verify --fast must not be FAIL/BLOCKED
 #   2. STALE evidence blocks push (fresh evidence is a precondition for completion)
 #   3. pushed range modifying protected contract paths must carry a contract marker
+#   4. code changes require Review Evidence with APPROVED/COMMENTED verdict
 # stdin (git): <local ref> <local sha> <remote ref> <remote sha>
 set -u
 
@@ -55,6 +56,43 @@ if [ -n "$remote_sha" ] && [ "$remote_sha" != "000000000000000000000000000000000
       log_error "pushed range modifies protected contract paths without 'contract:'/'requirement-change:' marker:"
       printf '%s\n' "$protected" | sed 's/^/    /'
       fail=1
+    fi
+  fi
+fi
+
+# --- 4. code changes require Review Evidence ------------------------------------
+# Check if pushed range modifies any Rust code in crates/
+if [ -n "$remote_sha" ] && [ "$remote_sha" != "0000000000000000000000000000000000000000" ]; then
+  range="${remote_sha}..HEAD"
+  code_changed="$(git diff --name-only "$range" -- 'crates/*.rs' 2>/dev/null | head -1 || true)"
+
+  if [ -n "$code_changed" ]; then
+    # Find latest Review Evidence
+    review_dir="$(ls -1d "$ROOT/.evidence"/review-* 2>/dev/null | sort | tail -1 || true)"
+
+    if [ -z "$review_dir" ]; then
+      log_error "pushed range modifies Rust code but no Review Evidence found in .evidence/"
+      log_error "  Run independent Review first (see nexus-review skill)"
+      fail=1
+    else
+      summary_json="$review_dir/summary.json"
+      if [ ! -f "$summary_json" ]; then
+        log_error "Review Evidence found at $review_dir but missing summary.json"
+        fail=1
+      else
+        review_verdict="$(sed -n 's/.*"verdict"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$summary_json" | head -1)"
+        case "$review_verdict" in
+          APPROVED|COMMENTED)
+            log_info "Review Evidence = $review_verdict ($(basename "$review_dir"))"
+            ;;
+          CHANGES_REQUESTED|BLOCKED|*)
+            log_error "Latest Review Evidence verdict = ${review_verdict:-unknown}"
+            log_error "  Review must be APPROVED or COMMENTED before pushing code changes"
+            log_error "  Review dir: $review_dir"
+            fail=1
+            ;;
+        esac
+      fi
     fi
   fi
 fi
