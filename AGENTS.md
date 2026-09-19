@@ -1430,6 +1430,13 @@ nexus-harness test affected
 nexus-harness verify --fast
 ```
 
+Fast Verify 通过后，必须执行**独立 Review**（详见 §19.1）：
+
+- 由独立于实现的执行者完成八个维度的审查
+- 输出 Review Evidence 到 `.evidence/review-<id>/`
+- Verdict = APPROVED / COMMENTED 后才能进入 Full Verify
+- Verdict = CHANGES_REQUESTED 时必须修改后重新走 fast verify + Review
+
 准备 Candidate Completion 前运行：
 
 
@@ -1489,6 +1496,128 @@ portable-core checks
 ```
 
 禁止通过削弱 gate 来解决失败。
+
+
+
+***
+
+## 19.1 独立 Review（Independent Review）
+
+自动化验证回答"代码对不对"，独立 Review 回答"代码好不好、全不全、有没有踩坑"。
+
+### 独立性规则
+
+- Review 执行者必须独立于实现执行者。
+- 同一个 Agent 会话中刚写完代码，不能紧接着自己写 Review 报告。
+- Review 报告的 `reviewer` 字段必须填写独立执行者标识（Agent 会话 ID 或人工姓名）。
+
+### 八个检查维度
+
+```
+1. 契约一致性（contract-consistency）
+   - 实现是否严格遵循 MODULE.md 的 Invariants 和边界
+   - Scenario expectation 是否被静默修改以迎合实现
+
+2. 边界覆盖（edge-coverage）
+   - 错误路径是否完整覆盖
+   - 状态转换是否完备
+   - 资源释放是否正确
+
+3. API 面控制（api-surface-minimization）
+   - 是否有不该暴露为 pub 的类型 / 函数
+   - 是否把 pub(crate) 偷偷提升成了 pub
+
+4. 依赖边界（dependency-boundary）
+   - 是否引入了 policies/architecture.toml 未声明的内部依赖
+   - 是否违反了层级约束
+
+5. 错误处理质量（error-handling-quality）
+   - 正常业务失败是否用类型化 Result 而不是 panic / unwrap
+   - 错误类型是否保留足够上下文
+
+6. 测试质量（test-quality）
+   - 测试是否真实验证了行为，而不是只测 happy path
+   - 新增的测试是否覆盖了本次变更引入的新代码路径
+
+7. 复杂度控制（complexity-control）
+   - 是否有过度设计
+   - 新增的 trait / 接口是否过了 Deletion Test
+
+8. 可观测性（observability）
+   - 关键路径是否有结构化事件 / 日志
+   - 是否有必要的关联字段
+```
+
+### Verdict 语义
+
+```
+APPROVED           所有维度 PASS 或只有非阻塞建议，可以进入 verify --full
+CHANGES_REQUESTED  存在至少一个 FAIL 维度，必须修改后重新 Review
+COMMENTED          有建议但不阻塞，记录在案即可
+BLOCKED            发现契约冲突，需要切换到 requirement-change 流程
+```
+
+### 输出：Review Evidence
+
+Review 完成后，在 `.evidence/review-<id>/` 下生成：
+
+```
+summary.json      Review verdict + 维度结果 + 阻塞项 + 建议
+findings.md       详细的 Review 意见（可读形式）
+```
+
+
+
+***
+
+## 19.2 动态知识库（Dynamic Knowledge Base）
+
+每个项目都应该有一个持续积累的知识库，把踩坑、模式、教训沉淀下来，避免重复犯错。
+
+### 位置
+
+```
+.agents/knowledge/
+├── README.md         说明文档
+├── index.json        条目索引（按 id / module / category 索引）
+└── entries/          条目存放
+    └── YYYY-MM-DD-<slug>.md
+```
+
+### 写入触发点
+
+- Review 发现问题并修复后
+- 实现过程中踩坑并解决后
+- 完成一个重要 feature 后
+- 发现可复用的实现模式后
+
+### 读取触发点
+
+- 任务开始前（检索是否有相关历史经验）
+- 遇到类似问题时
+- Review 时（对照历史踩坑清单）
+
+### 条目格式
+
+```markdown
+---
+id: <short-id>
+date: YYYY-MM-DD
+module: <crate-name>
+category: implementation-pitfall | implementation-pattern | architecture-decision
+task_type: feature | bugfix | refactor | ...
+---
+
+# 标题
+
+## 问题/模式描述
+
+## 原因分析
+
+## 解决方案
+
+## 教训/可复用要点
+```
 
 
 
