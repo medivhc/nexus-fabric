@@ -26,6 +26,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod geoip_nex;
+
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
@@ -102,6 +104,39 @@ impl From<nexus_proxy_config::ConfigError> for ProxyError {
 // ---------------------------------------------------------------------------
 // 中立分流目标：从 FlowContext.destination 抽出 domain / ip
 // ---------------------------------------------------------------------------
+
+/// provider 内容来源（§11.12，命中来源可观察）。
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ProviderSource {
+    /// 纯本地文件（无 `url`）。
+    Local,
+    /// 使用本地缓存（含拉取失败回退过期缓存）。
+    Cached,
+    /// 本次从在线源拉取。
+    Online,
+}
+
+/// provider 拉取结果（§11.12）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedProvider {
+    /// 规则集原始行。
+    pub lines: Vec<String>,
+    /// 内容来源。
+    pub source: ProviderSource,
+}
+
+/// 规则数据拉取接口（§11.12；纯接口零 I/O，实现由组合根提供）。
+///
+/// 组合根遍历 `config.rule_providers` 调用 `load`，把结果组装进
+/// [`RuleData::providers`]，再经 [`RuleEngine::with_data`](crate::RuleEngine::with_data)
+/// 编译期展开——决策内核不感知拉取来源。
+pub trait ProviderFetcher {
+    /// 加载 provider 原始内容（本地 / 缓存 / 在线），返回行列表与来源。
+    fn load(
+        &mut self,
+        cfg: &nexus_proxy_config::RuleProviderConfig,
+    ) -> Result<FetchedProvider, String>;
+}
 
 /// 组合根注入的规则数据（§11.11）；决策内核零 I/O，数据全部在编译期展开为静态 `Matcher`。
 ///

@@ -186,15 +186,19 @@ impl ProviderBehavior {
     }
 }
 
-/// rule-provider 配置（P0 本地文件；在线 `url` 拉取后置，§11.11）。
+/// rule-provider 配置（§11.11 本地；§11.12 在线 `url` + 刷新）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleProviderConfig {
     /// provider 标识（规则 `kind: rule_set, match: <tag>` 引用）。
     pub tag: String,
     /// 规则集行为。
     pub behavior: ProviderBehavior,
-    /// 本地规则集文件路径。
+    /// 本地规则集文件路径（有 `url` 时为缓存落盘位置）。
     pub path: String,
+    /// 在线源（可选；无则纯本地加载，§11.11 语义不变）。
+    pub url: Option<String>,
+    /// 刷新间隔秒数（可选；默认 86400，必须 ≥ 1）。
+    pub refresh_interval_secs: Option<u64>,
 }
 
 /// 动作链配置：有序动作列表。P0 首动作为 `select_outbound`，后续动作为 P1+ 扩展口。
@@ -618,6 +622,12 @@ fn req_str<'a>(node: &'a Node, key: &str, field: &str) -> Result<&'a str, Config
         .ok_or_else(|| ConfigError::new(field, format!("missing or non-string field '{key}'")))
 }
 
+/// 读取可选 u64 字段（YAML 数值以字符串标量承载）。
+fn opt_u64(node: &Node, key: &str) -> Option<u64> {
+    node.get(key)
+        .and_then(Node::as_str)
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
 fn opt_str(node: &Node, key: &str) -> Option<String> {
     node.get(key)
         .and_then(Node::as_str)
@@ -1025,10 +1035,22 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
                     "path must not be empty",
                 ));
             }
+            let url = opt_str(item, "url");
+            let refresh_interval_secs = match opt_u64(item, "refresh_interval_secs") {
+                Some(0) => {
+                    return Err(ConfigError::new(
+                        format!("{field}.refresh_interval_secs"),
+                        "must be >= 1",
+                    ));
+                }
+                other => other,
+            };
             rule_providers.push(RuleProviderConfig {
                 tag: name.clone(),
                 behavior,
                 path,
+                url,
+                refresh_interval_secs,
             });
         }
     }

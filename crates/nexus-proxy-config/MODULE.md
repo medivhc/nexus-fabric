@@ -69,7 +69,10 @@
   - `OutboundConfig`：`{ tag, kind: "direct"|"relay"|"shadowsocks"|"vmess"|"trojan",
     locator: Option<String> }`；
   - `SpeedtestConfig`：`{ target, timeout_ms, probe_kind }` 可选段（§11.10），缺失走默认值；
-  - `RuleProviderConfig`：`{ tag, behavior: "domain"|"ipcidr"|"classical", path: String }`（§11.11）；
+  - `RuleProviderConfig`：`{ tag, behavior: "domain"|"ipcidr"|"classical", path: String,
+    url: Option<String>, refresh_interval_secs: Option<u64> }`（§11.11 / §11.12）；
+    `url` 为在线源（可选，默认无 → 纯本地），`refresh_interval_secs` 刷新间隔
+    （默认 86400，必须 ≥ 1，非法 → `CONFIG_INVALID`）；
     规则引用 `kind: "rule_set"`，provider 名不存在 / behavior 非法 / path 缺失 → `CONFIG_INVALID`；
   - Shadowsocks 出站（§11.6）：`kind: "shadowsocks"` 时 `locator` 形如 `host:port`，
     并携带 `method`（本期仅 `"chacha20-ietf-poly1305"`）与 `password`；method 非法 / 字段缺失

@@ -603,11 +603,56 @@ GEOIP 国家库、GEOSITE 域名分类清单、rule-providers 本地规则集。
   进入分流决策可观察字段（真实解析差异由数据面 §11.4 承接）。
 - 可观察：分流决策命中规则类型扩展为 `geoip` / `geosite` / `rule_set`，并携带
   国家码 / 分类 / provider 名（`matched_rule` 即规则名，类型字段区分）。
-- 离线确定性：注入数据全部为本地文件/内嵌样本，E4 场景可复现；在线拉取
-  （rule-providers `url` + 刷新）与真实数据生成工具（公开数据 → `geoip.nex`）后置。
+- 离线确定性：注入数据全部为本地文件/内嵌样本，E4 场景可复现；在线拉取与
+  真实数据生成工具见 §11.12（2026-09-19 已实现）。
 - E4 场景：`proxy_geoip_rule.toml` / `proxy_geosite_rule.toml` /
   `proxy_rule_set.toml` / `proxy_rule_invalid.toml`。
 
+
+### 11.12 在线规则数据（rule-providers 拉取与数据生成工具，2026-09-19）
+
+§11.11 的注入数据由离线确定性闭环升级为可消费在线规则集：rule-providers 支持
+在线 `url` 源（缓存 + 刷新），并落地 `geoip.nex` 二进制格式与生成工具。决策内核
+不变——`nexus-proxy` 保持纯决策零 I/O，拉取与格式解析全部发生在数据加载层
+（组合根 / 解析器）。
+
+#### A. rule-providers 在线拉取
+
+- 配置：`RuleProviderConfig` 新增可选 `url: Option<String>`（在线源）与
+  `refresh_interval_secs: Option<u64>`（刷新间隔，默认 86400，必须 ≥ 1）。
+  `path` 语义升级为**本地缓存落盘位置**；仅配置 `path`（无 `url`）时维持纯本地
+  加载（§11.11 语义不变）。
+- `ProviderFetcher` trait（`nexus-proxy` 定义，纯接口零 I/O）：
+  `load(&mut self, cfg: &RuleProviderConfig) -> Result<FetchedProvider, String>`；
+  `FetchedProvider { lines: Vec<String>, source: ProviderSource }`；
+  `ProviderSource::{Local, Cached, Online}`——命中来源进入可观察输出。
+- 组合根实现（apps/nexus）：`FileProviderFetcher`（仅本地，无 url 路径）；
+  `CachedHttpProviderFetcher`（有 url 时：本地缓存存在且未过期 → 直接用缓存；
+  过期/缺失 → HTTP GET 拉取并写回缓存；拉取失败 → 回退过期缓存并标记
+  `Cached`；无任何可用数据 → 结构化失败）。
+- 数据流：组合根遍历 `config.rule_providers` → `fetcher.load` → 组装
+  `RuleData.providers` → `RuleEngine::with_data`（§11.11 编译期展开不变）。
+- 失败语义：在线拉取失败且无可用缓存 → `RULE_PROVIDER_FETCH_FAILED`
+  （结构化错误，不静默降级）；其余校验沿用 §11.11。
+- 确定性策略：E4 注入 mock fetcher（固定内容，source 可复现）；E5 以本地
+  HTTP server 提供 provider 文件驱动真实 `CachedHttpProviderFetcher`
+  （离线确定性闭环，不经公网）。
+- E4 场景：`proxy_rule_provider_fetch.toml`。
+
+#### B. `geoip.nex` 二进制格式与生成工具
+
+- 格式 v1（小端，无第三方依赖）：`magic "NXGEOIP\0"`（8 字节）+ `u32` 国家数 N
+  + N 项依次：`[code: 2 字节 ASCII] + [cidr_count: u32] + cidr_count ×
+  [base: u32（IPv4 地址按网络字节序存为小端 u32）] + cidr_count × [prefix: u8]`。
+  文件可顺序遍历解析；非法 magic / 截断 / 非法 CIDR → 结构化解析错误。
+- 解析器：`nexus-proxy::geoip_nex::parse(&[u8]) -> Result<HashMap<String, Vec<String>>,
+  ParseError>`（输出 CIDR 文本，与 `RuleData.geoip` 兼容；纯函数零 I/O）。
+- 生成工具：apps/nexus example `geoip_nex_build`：输入 JSON 中间格式
+  （`{"CN":["1.0.1.0/24", ...], ...}`）→ 输出 `geoip.nex` 文件；CIDR 非法 → 拒绝
+  并指明行。公开数据源适配（GeoLite2 / ip2region 等）为 P1 源插件，不绑定许可。
+- 确定性策略：E2 单测（roundtrip / 截断 / 坏 magic）+ E4 场景 roundtrip：
+  内存构造 → 解析 → 注入 `RuleData` → 路由断言。
+- E4 场景：`geoip_nex_roundtrip.toml`。
 ### 11.3 失败语义
 
 ```text

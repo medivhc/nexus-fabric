@@ -97,6 +97,12 @@
 - 默认最小 surface：`private -> pub(crate) -> pub`。
 - P0 冻结接口骨架（实现阶段填充）：
   - `RuleEngine::new(config: &ProxyConfig) -> Self`：从配置构建规则表（纯函数）；
+  - `ProviderFetcher` trait（§11.12，纯接口零 I/O）：`load(&mut self, cfg: &RuleProviderConfig)`
+    -> `Result<FetchedProvider, String>`；`FetchedProvider { lines, source }`，
+    `ProviderSource::{Local, Cached, Online}` 命中来源可观察；组合根负责实现
+    （`FileProviderFetcher` / `CachedHttpProviderFetcher`）；
+  - `geoip_nex::parse(&[u8]) -> Result<HashMap<String, Vec<String>>, ParseError>`
+    （§11.12 格式 v1，纯函数零 I/O，输出与 `RuleData.geoip` 兼容）；
   - `RuleData`：组合根注入的规则数据（geoip 国家码→CIDR、geosite 分类→域名、
     rule-providers 解析结果；`Default` 为空）；`RuleEngine::new` 委托空数据，
     `RuleEngine::with_data(config, &RuleData)` / `ProxyService::with_rule_data`
