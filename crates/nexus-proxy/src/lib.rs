@@ -27,6 +27,7 @@
 #![forbid(unsafe_code)]
 
 pub mod geoip_nex;
+pub mod geosite_nex;
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
