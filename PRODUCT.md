@@ -653,6 +653,28 @@ GEOIP 国家库、GEOSITE 域名分类清单、rule-providers 本地规则集。
 - 确定性策略：E2 单测（roundtrip / 截断 / 坏 magic）+ E4 场景 roundtrip：
   内存构造 → 解析 → 注入 `RuleData` → 路由断言。
 - E4 场景：`geoip_nex_roundtrip.toml`。
+
+### 11.13 `geosite.nex` 二进制格式与生成工具（2026-09-20）
+
+§11.11 的 GEOSITE 注入数据由纯文本 `geosite/<cat>.txt` 升级为可消费的
+`geosite.nex` 二进制格式与生成工具——与 §11.12 B（geoip.nex）对称。决策内核
+不变——`nexus-proxy` 保持纯决策零 I/O，格式解析全部发生在数据加载层。
+
+- 格式 v1（小端，无第三方依赖）：
+  `magic "NXGEOSITE\0"`（10 字节）+ `u32` 分类数 N + N 项依次：
+  `[name_len: u32][name: UTF-8 bytes]` + `[domain_count: u32]` +
+  `domain_count × [domain_len: u32][domain: UTF-8 bytes]`。
+  文件可顺序遍历解析；非法 magic / 截断 / 非 UTF-8 → 结构化解析错误。
+- 解析器：`nexus-proxy::geosite_nex::parse(&[u8]) -> Result<HashMap<String,
+  Vec<String>>, ParseError>`（输出分类 → 域名列表，与 `RuleData.geosite` 兼容；
+  纯函数零 I/O）。
+- 生成工具：apps/nexus example `geosite_nex_build`：输入 JSON 中间格式
+  （`{"cn":["example.cn", ...], ...}`）→ 输出 `geosite.nex` 文件；分类重复 /
+  非字符串域名 → 拒绝并指明条目。
+- 确定性策略：E2 单测（roundtrip / 截断 / 坏 magic / 非 UTF-8 / 分类重复）+
+  E4 场景 roundtrip：内存构造 → 解析 → 注入 `RuleData.geosite` → 路由断言。
+- E4 场景：`geosite_nex_roundtrip.toml`。
+
 ### 11.3 失败语义
 
 ```text
