@@ -6,12 +6,13 @@
 //!
 //! 内存构造 `geoip.nex` 字节流（[`nexus_proxy::geoip_nex::build`]）→
 //! [`parse`](nexus_proxy::geoip_nex::parse) 还原为国家码 → CIDR 表 →
-//! 注入 `RuleData.geoip` → 决策内核路由：
-//! - IP `1.2.3.4` 命中 `geoip: CN`（direct）；
-//! - IP `8.8.8.8` 命中 `geoip: US`（direct）；
-//! - IP `9.9.9.9` 不命中，走 `MATCH`。
+//! 注入 `RuleData.geoip` → 决策内核路由（契约冻结：规则仅 `geoip: CN`）：
 //!
-//! 输出携带 `file_size`（字节数）与 `entry_count`（国家数）供场景断言。
+//! - IP `1.2.3.4` 命中 `geoip: CN`（direct）；
+//! - IP `8.8.8.8`（US 库存在但无 US 规则）与域名流量走 `MATCH`。
+//!
+//! 输出携带 `command` / `file_size` / `entry_count` / `parsed_*_cidrs`
+//! 供场景断言（roundtrip 完整性）。
 
 #![forbid(unsafe_code)]
 
@@ -33,12 +34,6 @@ rules:
     action:
       - kind: select_outbound
         tag: direct
-  - tag: rule-geoip-us
-    kind: geoip
-    match: US
-    action:
-      - kind: select_outbound
-        tag: direct
   - tag: rule-match
     kind: match
     match: \"\"
@@ -54,12 +49,21 @@ outbounds:
     locator: \"\"
 ";
 
-fn route(service: &ProxyService, ip: [u8; 4]) -> serde_json::Value {
+fn route(service: &ProxyService, ip: Option<[u8; 4]>, domain: Option<&str>) -> serde_json::Value {
     let mut hs = Socks5Handshake::new();
     hs.feed(&[0x05, 0x01, 0x00]);
-    let step = hs.feed(&[
-        0x05, 0x01, 0x00, 0x01, ip[0], ip[1], ip[2], ip[3], 0x1f, 0x90,
-    ]);
+    let step = match (ip, domain) {
+        (Some(oct), _) => hs.feed(&[
+            0x05, 0x01, 0x00, 0x01, oct[0], oct[1], oct[2], oct[3], 0x1f, 0x90,
+        ]),
+        (None, Some(d)) => {
+            let mut payload = vec![0x05, 0x01, 0x00, 0x03, d.len() as u8];
+            payload.extend_from_slice(d.as_bytes());
+            payload.extend_from_slice(&[0x1f, 0x90]);
+            hs.feed(&payload)
+        }
+        _ => unreachable!(),
+    };
     let flow = match step.state {
         Socks5State::Established => step.flow.expect("flow produced"),
         other => panic!("unexpected handshake state: {other:?}"),
@@ -80,6 +84,8 @@ fn main() {
     let bytes = build(&[("CN", cn), ("US", us)]);
     let geoip = parse(&bytes).expect("geoip.nex must parse");
     let entry_count = geoip.len();
+    let parsed_cn_cidrs = geoip.get("CN").map_or(0, Vec::len);
+    let parsed_us_cidrs = geoip.get("US").map_or(0, Vec::len);
 
     let cfg = parse_config(CONFIG).expect("config must parse");
     let data = nexus_proxy::RuleData {
@@ -88,30 +94,32 @@ fn main() {
     };
     let service = ProxyService::with_rule_data(&cfg, &data).expect("service build");
 
-    let case_cn = route(&service, [1, 2, 3, 4]);
-    let case_us = route(&service, [8, 8, 8, 8]);
-    let case_match = route(&service, [9, 9, 9, 9]);
+    let case_cn = route(&service, Some([1, 2, 3, 4]), None);
+    let case_us = route(&service, Some([8, 8, 8, 8]), None);
+    let case_domain = route(&service, None, Some("example.com"));
 
     if as_json {
         println!(
-            "{{\"verdict\":\"PASS\",\"file_size\":{},\"entry_count\":{},\"case_cn\":{},\"case_us\":{},\"case_match\":{}}}",
+            "{{\"verdict\":\"PASS\",\"command\":\"geoip.nex roundtrip\",\"file_size\":{},\"entry_count\":{},\"parsed_cn_cidrs\":{},\"parsed_us_cidrs\":{},\"case_cn\":{},\"case_us\":{},\"case_domain\":{}}}",
             bytes.len(),
             entry_count,
+            parsed_cn_cidrs,
+            parsed_us_cidrs,
             case_cn,
             case_us,
-            case_match
+            case_domain
         );
     } else {
         println!(
-            "file={}B entries={} cn={}({}) us={}({}) match={}({})",
+            "file={}B entries={} cn={}({}) us={}({}) domain={}({})",
             bytes.len(),
             entry_count,
             case_cn["matched_rule"],
             case_cn["rule_kind"],
             case_us["matched_rule"],
             case_us["rule_kind"],
-            case_match["matched_rule"],
-            case_match["rule_kind"]
+            case_domain["matched_rule"],
+            case_domain["rule_kind"]
         );
     }
 }
