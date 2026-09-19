@@ -55,6 +55,8 @@ impl VirtualSubnetConfig {
 /// 隧道 Peer 配置。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelPeer {
+    /// Peer ID（用于事件关联）。
+    pub peer_id: String,
     /// 对端虚拟 IP。
     pub virtual_ip: String,
     /// 对端物理 locator。
@@ -65,8 +67,10 @@ impl TunnelPeer {
     /// 创建隧道 Peer。
     #[must_use]
     pub fn new(virtual_ip: impl Into<String>, locator: impl Into<String>) -> Self {
+        let virtual_ip = virtual_ip.into();
         Self {
-            virtual_ip: virtual_ip.into(),
+            peer_id: format!("peer-{virtual_ip}"),
+            virtual_ip,
             locator: locator.into(),
         }
     }
@@ -94,6 +98,61 @@ pub struct TunnelStats {
     pub bytes_received: u64,
     /// 丢包数。
     pub packets_dropped: u64,
+}
+
+/// 虚拟子网结构化事件（用于可观测性和重放）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VirtualSubnetEvent {
+    /// 隧道创建。
+    TunnelCreated {
+        /// 隧道 ID。
+        tunnel_id: String,
+        /// 子网 CIDR。
+        subnet_cidr: String,
+    },
+    /// Peer 已注册。
+    PeerRegistered {
+        /// 隧道 ID。
+        tunnel_id: String,
+        /// Peer ID。
+        peer_id: String,
+        /// Peer 虚拟 IP。
+        virtual_ip: String,
+    },
+    /// Peer 状态变更。
+    PeerStateChanged {
+        /// 隧道 ID。
+        tunnel_id: String,
+        /// Peer ID。
+        peer_id: String,
+        /// 新状态。
+        new_state: TunnelState,
+    },
+    /// 数据包已发送。
+    PacketSent {
+        /// 隧道 ID。
+        tunnel_id: String,
+        /// Peer ID。
+        peer_id: String,
+        /// 字节数。
+        bytes: u64,
+    },
+    /// 数据包已接收。
+    PacketReceived {
+        /// 隧道 ID。
+        tunnel_id: String,
+        /// Peer ID。
+        peer_id: String,
+        /// 字节数。
+        bytes: u64,
+    },
+    /// 发生错误。
+    Error {
+        /// 隧道 ID。
+        tunnel_id: String,
+        /// 错误信息。
+        message: String,
+    },
 }
 
 /// 隧道帧头（P0 简化：纯文本标记）。
@@ -140,10 +199,14 @@ impl TunnelFrameHeader {
 /// 6. 解封装提取原始 IP 包
 /// 7. 写入 VPI
 pub struct VirtualSubnetTunnel {
+    /// 隧道 ID（用于事件关联）。
+    tunnel_id: String,
     /// 子网配置。
     config: VirtualSubnetConfig,
-    /// Peer 表：虚拟 IP → (locator, state, stats)。
-    peers: HashMap<String, (String, TunnelState, TunnelStats)>,
+    /// Peer 表：虚拟 IP → (peer_id, locator, state, stats)。
+    peers: HashMap<String, (String, String, TunnelState, TunnelStats)>,
+    /// 事件收集（用于可观测性和重放）。
+    events: Vec<VirtualSubnetEvent>,
     /// VPI 接口。
     vpi: Box<dyn VirtualPacketInterface>,
     /// PacketCarrier。
@@ -157,9 +220,16 @@ impl VirtualSubnetTunnel {
         vpi: Box<dyn VirtualPacketInterface>,
         carrier: Box<dyn PacketCarrier>,
     ) -> Self {
+        let tunnel_id = format!("tunnel-{}", config.virtual_ip);
+        let events = vec![VirtualSubnetEvent::TunnelCreated {
+            tunnel_id: tunnel_id.clone(),
+            subnet_cidr: config.cidr.clone(),
+        }];
         Self {
+            tunnel_id,
             config,
             peers: HashMap::new(),
+            events,
             vpi,
             carrier,
         }
@@ -176,8 +246,9 @@ impl VirtualSubnetTunnel {
             });
         }
         self.peers.insert(
-            peer.virtual_ip,
+            peer.virtual_ip.clone(),
             (
+                peer.peer_id,
                 peer.locator,
                 TunnelState::Disconnected,
                 TunnelStats::default(),
@@ -189,20 +260,25 @@ impl VirtualSubnetTunnel {
     /// 设置 Peer 状态。
     pub fn set_peer_state(&mut self, virtual_ip: &str, state: TunnelState) {
         if let Some(entry) = self.peers.get_mut(virtual_ip) {
-            entry.1 = state;
+            self.events.push(VirtualSubnetEvent::PeerStateChanged {
+                tunnel_id: self.tunnel_id.clone(),
+                peer_id: entry.0.clone(),
+                new_state: state,
+            });
+            entry.2 = state;
         }
     }
 
     /// 获取 Peer 状态。
     #[must_use]
     pub fn peer_state(&self, virtual_ip: &str) -> Option<TunnelState> {
-        self.peers.get(virtual_ip).map(|(_, state, _)| *state)
+        self.peers.get(virtual_ip).map(|(_, _, state, _)| *state)
     }
 
     /// 获取 Peer 统计。
     #[must_use]
     pub fn peer_stats(&self, virtual_ip: &str) -> Option<&TunnelStats> {
-        self.peers.get(virtual_ip).map(|(_, _, stats)| stats)
+        self.peers.get(virtual_ip).map(|(_, _, _, stats)| stats)
     }
 
     /// 获取所有 Peer 列表。
@@ -210,7 +286,7 @@ impl VirtualSubnetTunnel {
     pub fn peers(&self) -> Vec<(&str, TunnelState)> {
         self.peers
             .iter()
-            .map(|(ip, (_, state, _))| (ip.as_str(), *state))
+            .map(|(ip, (_, _, state, _))| (ip.as_str(), *state))
             .collect()
     }
 
@@ -220,7 +296,7 @@ impl VirtualSubnetTunnel {
         dst_virtual_ip: &str,
         packet: &[u8],
     ) -> Result<(), ConnectivityError> {
-        let (locator, state, stats) =
+        let (_peer_id, locator, state, stats) =
             self.peers
                 .get_mut(dst_virtual_ip)
                 .ok_or_else(|| ConnectivityError::Invalid {
@@ -279,7 +355,7 @@ impl VirtualSubnetTunnel {
             })?;
 
         // 更新发送方统计
-        if let Some((_, _, stats)) = self.peers.get_mut(&header.src_virtual_ip) {
+        if let Some((_, _, _, stats)) = self.peers.get_mut(&header.src_virtual_ip) {
             stats.bytes_received += n as u64;
         }
 
@@ -322,6 +398,18 @@ impl VirtualSubnetTunnel {
     #[must_use]
     pub fn config(&self) -> &VirtualSubnetConfig {
         &self.config
+    }
+
+    /// 获取隧道 ID。
+    #[must_use]
+    pub fn tunnel_id(&self) -> &str {
+        &self.tunnel_id
+    }
+
+    /// 获取事件流（用于可观测性和重放）。
+    #[must_use]
+    pub fn events(&self) -> &[VirtualSubnetEvent] {
+        &self.events
     }
 }
 
