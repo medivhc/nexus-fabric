@@ -6,5 +6,13 @@
     "module": "nexus-connectivity",
     "category": "implementation-pitfall",
     "summary": "虚拟子网组网 P0 实现的 4 个踩坑：scenario expect 路径嵌套、MemoryCarrier 缺 Default、rsplitn 已废弃、PowerShell 转义地狱"
+  },
+  {
+    "id": "vsub-p1-001",
+    "file": "entries/2026-09-19-p1-bidirectional-roundtrip.md",
+    "date": "2026-09-19",
+    "module": "nexus-connectivity",
+    "category": "implementation-pattern",
+    "summary": "P1 双向包往返实现：用 Arc<Mutex<Vec>> 共享缓冲区实现真正双向通道，测试替身要足够真实"
   }
 ]
