@@ -1548,22 +1548,68 @@ portable-core checks
    - 是否有必要的关联字段
 ```
 
-### Verdict 语义
+### Verdict 语义（量化）
+
+每个维度的状态为 PASS / WARN / FAIL，最终 Verdict 由最差维度决定：
 
 ```
-APPROVED           所有维度 PASS 或只有非阻塞建议，可以进入 verify --full
-CHANGES_REQUESTED  存在至少一个 FAIL 维度，必须修改后重新 Review
-COMMENTED          有建议但不阻塞，记录在案即可
+APPROVED           0 个 FAIL，0 个 WARN（或只有非阻塞建议），可以进入 verify --full
+CHANGES_REQUESTED  ≥ 1 个 FAIL，必须修改后重新走 fast verify + 再次独立 Review
+COMMENTED          0 个 FAIL，≥ 1 个 WARN，有建议但不阻塞，记录在案即可
 BLOCKED            发现契约冲突，需要切换到 requirement-change 流程
 ```
+
+### 迭代闭环（必须显式记录）
+
+Review 不是一次性的，必须形成"检查 → 修正 → 再检查"的迭代循环：
+
+```
+第 1 轮 Review
+  ↓
+CHANGES_REQUESTED → 记录 FAIL 维度 + 阻塞项
+  ↓
+修正代码
+  ↓
+重新 fast verify
+  ↓
+第 2 轮 Review（独立于第 1 轮的执行者）
+  ↓
+对比第 1 轮：哪些 FAIL 变成了 PASS？哪些维度退步了？
+  ↓
+... 直到 Verdict = APPROVED 或 COMMENTED
+```
+
+每一轮 Review 都必须：
+- 引用上一轮的 Review Evidence ID
+- 记录本轮与上一轮的维度变化（哪些从 FAIL→PASS，哪些新增了 FAIL）
+- 迭代次数有上限（默认 3 轮，超过则升级为 BLOCKED，需要人工介入）
 
 ### 输出：Review Evidence
 
 Review 完成后，在 `.evidence/review-<id>/` 下生成：
 
 ```
-summary.json      Review verdict + 维度结果 + 阻塞项 + 建议
+summary.json      Review verdict + 维度结果 + 阻塞项 + 建议 + 上一轮对比
 findings.md       详细的 Review 意见（可读形式）
+```
+
+summary.json 必须包含：
+
+```json
+{
+  "review_round": 2,
+  "previous_review_id": "review-vsub01",
+  "dimension_changes": {
+    "edge-coverage": "FAIL → PASS",
+    "test-quality": "WARN → PASS",
+    "observability": "WARN → WARN"
+  },
+  "dimensions": [
+    { "name": "edge-coverage", "status": "PASS", "findings": [...] }
+  ],
+  "blocking_issues_fixed": ["..."],
+  "blocking_issues_remaining": []
+}
 ```
 
 
