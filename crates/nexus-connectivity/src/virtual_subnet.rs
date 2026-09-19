@@ -13,6 +13,7 @@
 
 use nexus_platform::{PacketCarrier, PlatformError, VirtualPacketInterface};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::ConnectivityError;
 
@@ -396,36 +397,41 @@ impl VirtualPacketInterface for MemoryVpi {
 
 /// 内存模拟 PacketCarrier（进程内双向通道）。
 pub struct MemoryCarrier {
-    /// 发送缓冲区（本节点发送，对端接收）。
-    send_buf: Mutex<Vec<u8>>,
-    /// 接收缓冲区（对端发送，本节点接收）。
-    recv_buf: Mutex<Vec<u8>>,
+    /// 发送缓冲区（本节点发送，对端接收）——与对端的 recv_buf 共享。
+    send_buf: Arc<Mutex<Vec<u8>>>,
+    /// 接收缓冲区（对端发送，本节点接收）——与对端的 send_buf 共享。
+    recv_buf: Arc<Mutex<Vec<u8>>>,
     /// 绑定的 locator。
     local_locator: Mutex<Option<String>>,
 }
 
 impl MemoryCarrier {
-    /// 创建空的 MemoryCarrier。
+    /// 创建空的 MemoryCarrier（独立缓冲区，不与任何对端连接）。
     #[must_use]
     pub fn new() -> Self {
         Self {
-            send_buf: Mutex::new(Vec::new()),
-            recv_buf: Mutex::new(Vec::new()),
+            send_buf: Arc::new(Mutex::new(Vec::new())),
+            recv_buf: Arc::new(Mutex::new(Vec::new())),
             local_locator: Mutex::new(None),
         }
     }
 
-    /// 创建一对互连的 MemoryCarrier（P0 简化：手动连接 send->recv）。
+    /// 创建一对真正互连的 MemoryCarrier：A.send <-> B.recv, B.send <-> A.recv。
     #[must_use]
-    pub fn pair() -> (Self, Self) {
+    pub fn connected_pair() -> (Self, Self) {
+        let a_send = Arc::new(Mutex::new(Vec::new()));
+        let b_send = Arc::new(Mutex::new(Vec::new()));
+
+        // A 的接收 = B 的发送
+        // B 的接收 = A 的发送
         let a = Self {
-            send_buf: Mutex::new(Vec::new()),
-            recv_buf: Mutex::new(Vec::new()),
+            send_buf: a_send.clone(),
+            recv_buf: b_send.clone(),
             local_locator: Mutex::new(None),
         };
         let b = Self {
-            send_buf: Mutex::new(Vec::new()),
-            recv_buf: Mutex::new(Vec::new()),
+            send_buf: b_send.clone(),
+            recv_buf: a_send.clone(),
             local_locator: Mutex::new(None),
         };
         (a, b)

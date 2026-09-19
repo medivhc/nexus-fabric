@@ -38,4 +38,4 @@ non_empty = true
 
 [[expect]]
 field = "packet_roundtrip.bytes_received"
-equals = 0
+non_empty = true
