@@ -5,6 +5,7 @@ mod config;
 mod env;
 mod evidence;
 mod gates;
+mod run_scenario;
 mod scenario;
 
 use serde_json::{Value, json};
@@ -63,6 +64,7 @@ fn dispatch(command: &str, rest: &[String]) -> Outcome {
         "test" => commands::test_affected(),
         "verify" => commands::verify(rest.first().map(String::as_str).unwrap_or("")),
         "explain" => commands::explain(),
+        "run" => run_scenario::run_scenario(rest),
         "bench" | "replay" => (
             "UNKNOWN".to_string(),
             format!(

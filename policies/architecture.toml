@@ -205,3 +205,9 @@ name = "nexus-outbound-trojan"
 allowed_internal_dependencies = ["nexus-connectivity"]
 portable = false
 layer = "outbound"
+
+[[crate]]
+name = "nexus-harness"
+allowed_internal_dependencies = ["nexus-connectivity", "nexus-domain", "nexus-platform"]
+portable = false
+layer = "engineering"

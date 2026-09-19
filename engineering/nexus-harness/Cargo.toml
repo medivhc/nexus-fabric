@@ -12,3 +12,4 @@ workspace = true
 # MIT OR Apache-2.0 (in policies/dependencies.toml allowlist); default-features = false
 serde_json = { version = "1", default-features = false, features = ["std"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
+nexus-connectivity = { path = "../../crates/nexus-connectivity" }

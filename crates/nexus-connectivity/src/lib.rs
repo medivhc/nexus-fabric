@@ -1,4 +1,4 @@
-//! nexus-connectivity
+﻿//! nexus-connectivity
 //!
 //! 提供 Connectivity Evaluation、Link Establishment、NAT Traversal、Hole Punching、
 //! Assisted/Relay Fallback 与 Link State。
@@ -32,6 +32,10 @@ pub const NEXUS_CONNECTIVITY_MODULE: &str = "nexus-connectivity";
 pub const fn module_summary() -> &'static str {
     "提供 Connectivity Evaluation、Link Establishment、NAT Traversal、Hole Punching、Assisted/Relay Fallback 与 Link State。"
 }
+
+// ---------- 虚拟子网组网（Virtual Subnet Networking） ----------
+
+pub mod virtual_subnet;
 
 // ---------- 结构化错误（不以日志文本代替错误类型） ----------
 

@@ -1,0 +1,41 @@
+schema_version = 1
+id = "product.virtual-subnet-tunnel"
+title = "两节点虚拟子网点对点隧道闭环（VPI 包往返）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-虚拟子网组网"
+
+[given]
+subnet_cidr = "10.0.0.0/24"
+node_a_virtual_ip = "10.0.0.1"
+node_b_virtual_ip = "10.0.0.2"
+
+[when]
+command = "nexus-harness run virtual-subnet-tunnel --json"
+
+[[expect]]
+field = "subnet.cidr"
+equals = "10.0.0.0/24"
+
+[[expect]]
+field = "node_a.virtual_ip"
+equals = "10.0.0.1"
+
+[[expect]]
+field = "node_b.virtual_ip"
+equals = "10.0.0.2"
+
+[[expect]]
+field = "tunnel.status"
+equals = "Connected"
+
+[[expect]]
+field = "packet_roundtrip.ok"
+equals = true
+
+[[expect]]
+field = "packet_roundtrip.bytes_sent"
+non_empty = true
+
+[[expect]]
+field = "packet_roundtrip.bytes_received"
+equals = 0

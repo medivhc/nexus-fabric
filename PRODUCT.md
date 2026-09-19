@@ -619,3 +619,68 @@ URLTEST_NO_VALID_CANDIDATE  urltest 组所有候选均无有效 measurement
 DNS_SERVER_UNRESOLVED       DNS 规则或 MATCH 兜底引用的 server tag 未定义
 OUTBOUND_ADAPTER_UNAVAILABLE 选定出站 tag 无已注册的 OutboundAdapter 承接
 ```
+
+## 12. 虚拟子网组网（Virtual Subnet Networking）
+
+在既有远程资源访问闭环（§6）和代理内核（§11）之外，新增第三条产品线：
+**虚拟子网组网**（参考 EasyTier / WireGuard 组网模式）。该产品线不修改既有
+产品线的语义，不污染已冻结的 E4 场景。
+
+核心概念：
+
+```text
+VirtualSubnet: 一个虚拟三层网段，所有成员节点在同一个虚拟 IP CIDR 内。
+VirtualIp:    每个节点在虚拟子网中的虚拟 IP（静态分配或由子网分配器分配）。
+TunnelPeer:   对端节点的物理端点（locator + 虚拟 IP 映射）。
+PacketTunnel: 数据面循环：VPI 读 IP 包 → 封装 → 发给对端；
+              对端收到 → 解封装 → 写回 VPI。
+```
+
+### 12.1 P0 最小闭环
+
+```text
+节点 A：
+  创建 VPI 接口，分配虚拟 IP 10.0.0.1/24
+  注册 Peer B（虚拟 IP 10.0.0.2，物理 locator 由配置注入）
+  启动 PacketTunnel 数据面循环
+
+节点 B：
+  创建 VPI 接口，分配虚拟 IP 10.0.0.2/24
+  注册 Peer A（虚拟 IP 10.0.0.1，物理 locator 由配置注入）
+  启动 PacketTunnel 数据面循环
+
+数据面：
+  A 的 VPI 收到目的为 10.0.0.2 的包
+    → 封装为隧道帧（源/目虚拟 IP 标记）
+    → 通过 PacketCarrier 发给 B 的物理 locator
+    → B 的 PacketCarrier 收到帧
+    → 解封装提取原始 IP 包
+    → 写入 B 的 VPI
+    → B 操作系统处理后回包，反向同理
+```
+
+### 12.2 用户可观察语义
+
+- 节点启动后声明所属 VirtualSubnet（CIDR + 自身 VirtualIp）。
+- 每个 Peer 的隧道状态可观察：Disconnected / Handshaking / Connected / Failed。
+- 数据面统计可观察：每 Peer 的上行/下行字节数、丢包数、重传数（P0 只统计计数）。
+- 隧道建立失败返回结构化错误（`PEER_UNREACHABLE` / `AUTH_FAILED` / `INVALID_SUBNET`）。
+
+### 12.3 P0 明确不做
+
+- 真实 UDP NAT 打洞（P0 用 Direct / Relay 已有链路激活策略）。
+- 多节点网状拓扑自动路由（P0 只支持点对点直连，路由表静态配置）。
+- 子网跨子网路由（P0 只支持同一 CIDR 内的节点互通）。
+- WireGuard 风格 Noise 协议加密（P0 用 Shadowsocks 风格 AEAD 或明文，加密后置）。
+- 自动 IP 分配（P0 静态配置）。
+- 真实 TUN 驱动集成（P0 用注入的内存 VPI 做离线确定性 E4，真实驱动是 E5）。
+
+### 12.4 失败语义
+
+```text
+INVALID_VIRTUAL_IP          虚拟 IP 不在子网 CIDR 范围内
+PEER_NOT_FOUND              目标虚拟 IP 无对应 Peer 注册
+TUNNEL_HANDSHAKE_FAILED     隧道握手失败
+ENCAPSULATION_ERROR         包封装失败
+DECAPSULATION_ERROR         包解封装失败
+```
