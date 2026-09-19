@@ -99,6 +99,9 @@ nexus-harness explain --json
 修改实现：
 新增/修改 Tests / Scenarios：
 Fast Verification：
+Review Evidence ID / Path：
+Review Verdict：APPROVED / CHANGES_REQUESTED / COMMENTED / BLOCKED
+Reviewer：<独立执行者标识>
 Full Verification：
 Evidence ID / Path：
 Evidence Freshness：
@@ -106,5 +109,7 @@ Evidence Freshness：
 Candidate Completion：yes / no
 Final Verdict：仅 Harness 可决定
 ```
+
+没有 Review Evidence 时，不能提交 Candidate Completion（纯文档/格式调整且不改变行为的变更可降级）。
 
 如果 Full Verification 没有产生适当且 fresh 的 Evidence，不要写 `done` / `complete` / `finished`。

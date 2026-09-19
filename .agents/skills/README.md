@@ -6,6 +6,8 @@
 |---|---|---|
 | `nexus-task` | 在仓库内执行一次端到端工程任务（改代码/文档/配置/验证流程） | §1–§4, §9, §13–§18, §23, §26 |
 | `nexus-contract-first` | 新能力或需求变化，需要改已冻结的 Product/Scenario 期望（feature / requirement-change） | §5–§7, §25 |
+| `nexus-review` | 实现完成、fast verify 通过后，提交 Candidate Completion 前的独立代码审查 | §6 不可自证原则 |
+| `nexus-knowledge` | 检索历史工程经验（坑、Review 问题、架构决策），或沉淀新经验到知识库 | §27 决策原则 |
 | `nexus-evidence` | 生成/解读/报告验证证据，判断新鲜度，输出完成报告 | §6, §20, §24, §26 |
 
 ## 加载方式

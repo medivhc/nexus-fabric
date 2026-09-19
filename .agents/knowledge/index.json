@@ -1,0 +1,10 @@
+[
+  {
+    "id": "vsub-pitfall-001",
+    "file": "entries/2026-09-19-virtual-subnet-pitfalls.md",
+    "date": "2026-09-19",
+    "module": "nexus-connectivity",
+    "category": "implementation-pitfall",
+    "summary": "虚拟子网组网 P0 实现的 4 个踩坑：scenario expect 路径嵌套、MemoryCarrier 缺 Default、rsplitn 已废弃、PowerShell 转义地狱"
+  }
+]

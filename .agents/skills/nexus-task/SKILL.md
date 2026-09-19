@@ -40,6 +40,8 @@ description: 在 Nexus 仓库内执行一次端到端工程任务时使用（修
    默认读取顺序：PRODUCT.md → ARCHITECTURE.md → 相关 crates/<crate>/MODULE.md → Public API → 相关 Tests/Scenarios → 相关实现。
    README、代码注释、旧测试输出、过期 benchmark 不能高于正式契约和最新 Evidence。
 
+   **同时检索知识库**：读取 `nexus-knowledge` 技能，检索与目标模块相关的历史经验条目，了解有哪些已知的坑和注意事项。
+
 3. **feature / requirement-change 必须走契约先行**：读取 `nexus-contract-first` 技能，完成契约阶段并拿到 Red Evidence 和 Contract Hash 后再进入实现。
 
 4. **实现**：
@@ -59,17 +61,25 @@ description: 在 Nexus 仓库内执行一次端到端工程任务时使用（修
    nexus-harness verify --fast
    ```
 
-   准备 Candidate Completion 前运行：
+   禁止通过削弱 gate（删测试、改 expected value、降低 timeout、skip 失败 Scenario）来解决失败。
+
+6. **独立 Review**：verify --fast 通过后，进入独立 Review 环节。读取 `nexus-review` 技能，由独立于实现的执行者完成八个维度的审查，输出 Review Evidence 到 `.evidence/review-<id>/`。
+
+   - Review Verdict = `CHANGES_REQUESTED`：修改后重新走 fast verify + Review。
+   - Review Verdict = `BLOCKED`：报告 Contract Conflict，停止实现。
+   - Review Verdict = `APPROVED` 或 `COMMENTED`：进入下一步。
+
+   禁止实现 Agent 自行 Review 自己刚写的变更。
+
+7. **Full Verification**：Review 通过后运行：
 
    ```text
    nexus-harness verify --full
    ```
 
-   禁止通过削弱 gate（删测试、改 expected value、降低 timeout、skip 失败 Scenario）来解决失败。
+8. **失败处理**：gate 失败时先判断失败类型（Implementation Failure / Contract Conflict / Environment Failure / Unsupported Capability），使用 `nexus-harness explain --json`，不要连续修改无关位置碰运气。
 
-6. **失败处理**：gate 失败时先判断失败类型（Implementation Failure / Contract Conflict / Environment Failure / Unsupported Capability），使用 `nexus-harness explain --json`，不要连续修改无关位置碰运气。
-
-7. **输出 Candidate Completion 报告**：格式见 `nexus-evidence` 技能。报告不是 Final PASS——最终 PASS 必须由 Harness/Verifier 产生。
+9. **输出 Candidate Completion 报告**：格式见 `nexus-evidence` 技能。报告不是 Final PASS——最终 PASS 必须由 Harness/Verifier 产生。
 
 ## 关键规则
 
