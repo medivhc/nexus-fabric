@@ -158,7 +158,7 @@ fn main() {
     // 隧道内发 HTTP GET /。
     let http_req = format!(
         "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-        args.sni
+        target.host_label()
     );
     let relay_ok = match tls.write_all(http_req.as_bytes()) {
         Ok(_) => true,
