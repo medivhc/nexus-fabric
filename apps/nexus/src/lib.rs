@@ -4852,6 +4852,7 @@ pub fn virtual_subnet_encrypted_3node_flow() -> Result<Value, NexusError> {
         "c_vpi_payload": c_vpi_payload,
         "c_vpi_len": c_vpi_len,
         "b_bytes_forwarded": b_bytes_forwarded,
+        "b_bytes_forwarded_ok": b_bytes_forwarded > 0,
         "a_encrypted": a_encrypted,
         "b_encrypted": b_encrypted,
         "c_encrypted": c_encrypted,

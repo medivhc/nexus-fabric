@@ -35,9 +35,8 @@ field = "c_vpi_len"
 equals = 16
 
 [[expect]]
-field = "b_bytes_forwarded"
-kind = "gt"
-equals = 0
+field = "b_bytes_forwarded_ok"
+equals = true
 
 [[expect]]
 field = "a_encrypted"
