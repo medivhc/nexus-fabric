@@ -2,9 +2,9 @@
 
 > 版本：基于 master
 >
-> `4fd2f74`
+> `9f5dc8e`
 >
-> （2026-09-18 校验）
+> （2026-09-20 校验）
 > 校验证据：
 >
 > `nexus-harness verify --full`
@@ -15,7 +15,7 @@
 >
 > （evidence
 >
-> `verify-df42be73eca6`
+> `verify-c909d8536eb6`
 >
 > ）
 
@@ -38,13 +38,13 @@ Nexus 向用户提供一个统一 **Resource Fabric**：用户表达 "要使用�
 ```
 Resolve Candidate Providers
 
-&#x20; → Plan Placement + Path
+ → Plan Placement + Path
 
-&#x20; → Create Session
+ → Create Session
 
-&#x20; → Establish Connectivity
+ → Establish Connectivity
 
-&#x20; → Execute
+ → Execute
 ```
 
 核心不变量（由场景机检强制）：
@@ -64,7 +64,6 @@ Resolve Candidate Providers
 ### 2.1 环境要求
 
 
-
 | 项                  | 要求                                 |
 | ------------------ | ---------------------------------- |
 | Rust               | stable 1.95.0（`rustc` / `cargo`）   |
@@ -74,13 +73,11 @@ Resolve Candidate Providers
 ### 2.2 构建
 
 
-
 ```
 cargo build --workspace
 ```
 
 ### 2.3 三个入口
-
 
 
 | 二进制                   | 角色                    | 命令示例                                          |
@@ -109,8 +106,7 @@ cargo build --workspace
 
 ## 3. 功能总览
 
-以下 29 项功能均已通过代码级校验（场景 PASS + 驱动可运行）。括号内为场景 ID 与期望条数。
-
+以下 32 项功能均已通过代码级校验（场景 PASS + 驱动可运行）。括号内为场景 ID 与期望条数。
 
 
 | #  | 功能                           | 场景（E4/E3）                                            | 用户入口                                          |
@@ -144,6 +140,9 @@ cargo build --workspace
 | 27 | Observability: dns cache     | `product.observability-dns-cache` (3)                | `nexusd dns cache --json`                     |
 | 28 | 未就绪命令显式 UNSUPPORTED          | `product.observability-unsupported` (3)              | `nexusd workspace heads --json`               |
 | 29 | Windows VPI 能力声明（wintun）     | `platform.virtual-packet-interface` (10)             | `nexus-platform-host vpi-capabilities --json` |
+| 30 | 虚拟子网隧道（Virtual Subnet）      | `product.virtual-subnet-tunnel` (7)                  | example / SDK                                 |
+| 31 | NAT 打洞（STUN + UDP 打洞）       | （单元测试覆盖，待 E4 场景完善）                     | SDK / example                                 |
+| 32 | 独立 Review + 动态知识库          | （工程方法论，非用户功能）                           | `.agents/skills/` + `.agents/knowledge/`    |
 
 
 
@@ -224,6 +223,34 @@ cargo build --workspace
   * 观察：`nexusd dns status --json` / `nexusd dns cache --json`
 
 * **代码级校验**：场景 `product.dns-exit-binding`（8 期望）→ PASS；驱动 `apps/nexus/examples/dns_exit_binding.rs`
+
+#### 4.1.6 虚拟子网隧道（Virtual Subnet）
+
+
+
+* **能力**：节点间虚拟 IP 互通隧道，支持双节点点对点虚拟 IP 收发，结构化事件输出支持 replay / 调试。
+
+* **用户用法**：
+
+
+  * example：`cargo run --quiet -p nexus --example virtual_subnet_tunnel -- --json`
+
+  * SDK：`nexus_connectivity::virtual_subnet::VirtualSubnetTunnel`
+
+* **代码级校验**：场景 `product.virtual-subnet-tunnel`（7 期望）→ PASS；驱动 `crates/nexus-connectivity/src/virtual_subnet.rs`；单元测试 7 项
+
+#### 4.1.7 NAT 打洞（STUN + UDP 打洞）
+
+
+
+* **能力**：STUN 协议获取公网映射 + NAT 类型检测 + UDP 打洞建连。支持结构化事件输出。
+
+* **用户用法**：
+
+
+  * SDK：`nexus_connectivity::nat::StunClient` / `nexus_connectivity::nat::HolePuncher`
+
+* **代码级校验**：单元测试 7 项（STUN 请求构造、响应解析、随机 Transaction ID 等）；待 E4 场景完善
 
 ### 4.2 Service
 
@@ -473,6 +500,28 @@ SDK 层：`nexus::observability::{status, dns_status, dns_cache, session_watch, 
 
 * **代码级校验**：场景 `platform.virtual-packet-interface`（10 期望）→ PASS；实现 `apps/nexus-platform-host`（`vpi-capabilities` 命令）
 
+### 4.9 工程方法论
+
+#### 4.9.1 独立 Review 量化闭环
+
+
+
+* **能力**：Fast Verify 通过后必须执行独立 Review，八个维度量化检查（契约一致性 / 边界覆盖 / API 面控制 / 依赖边界 / 错误处理 / 测试质量 / 复杂度控制 / 可观测性），Verdict = CHANGES_REQUESTED 时迭代修正，最多 3 轮。
+
+* **位置**：`.agents/skills/nexus-review/SKILL.md`
+
+* **证据**：`.evidence/review-<id>/summary.json`（含 review_round、dimension_changes 等字段）
+
+#### 4.9.2 动态知识库
+
+
+
+* **能力**：持续沉淀踩坑、模式、教训，避免重复犯错。任务开始前检索相关历史经验。
+
+* **位置**：`.agents/knowledge/`（entries/ 目录 + index.json）
+
+* **条目格式**：YAML frontmatter + Markdown 正文（问题/原因/解决方案/教训）
+
 
 
 ***
@@ -480,7 +529,6 @@ SDK 层：`nexus::observability::{status, dns_status, dns_cache, session_watch, 
 ## 5. 验证体系（如何复现校验）
 
 ### 5.1 验证链
-
 
 
 ```
@@ -495,7 +543,7 @@ nexus-harness verify --full  # 21 门禁（预备交付前）
 
 ### 5.2 21 门禁清单（verify --full）
 
-whitespace、format、check、clippy、architecture-policy、dependency-governance（cargo-deny）、affected-tests、selected-properties、workspace-tests、integration（3 targets）、product-scenarios（product/engineering/platform 三目录）、regression、architecture-policy、dependency-governance、coverage-summary、selected-fuzz、selected-concurrency、performance-budgets、platform-checks、feature-matrix（62 member×feature 检查）、portable-core（9 crate 编译 wasm32-wasip1）。
+whitespace、format、check、clippy、architecture-policy、dependency-governance（cargo-deny）、affected-tests、selected-properties、workspace-tests、integration（3 targets）、product-scenarios（product/engineering/platform 三目录）、regression、architecture-policy、dependency-governance、coverage-summary、selected-fuzz、selected-concurrency、performance-budgets、platform-checks、feature-matrix（72 member×feature 检查）、portable-core（11 crate 编译 wasm32-wasip1）。
 
 ### 5.3 场景求值机制
 
@@ -512,11 +560,11 @@ whitespace、format、check、clippy、architecture-policy、dependency-governan
 ## 6. 已知限制与未实现功能
 
 
-
 | 项                                            | 状态        | 说明                                                                                                        |
 | -------------------------------------------- | --------- | --------------------------------------------------------------------------------------------------------- |
 | Workspace Projection（无 Mount 平台使用 Workspace） | 场景已冻结、未实现 | `platform.workspace-projection-fallback` 静态 UNKNOWN（MaterializedDirectory 访问提供者未实现）                       |
 | `nexus` CLI 领域执行                             | bootstrap | 命令解析完整，除 `status` 外返回结构化 Unsupported；可执行入口走 `nexusd`                                                      |
 | 传输层 crate                                    | stub      | `nexus-delivery`、`nexus-diagnostics`、`nexus-proto`、`nexus-platform-{linux,macos,android,ios}` 为 12–16 行骨架 |
 | fuzz 门禁                                      | 需 nightly | `cargo +nightly fuzz check`（stable 下 libfuzzer -Z 选项失败）                                                   |
+| NAT 打洞 E4 场景                               | 待完善      | 单元测试覆盖，待补充产品级 E4 场景                                                                              |
 | 磁盘注意                                         | 本机        | 构建产物优先放 D:（C:/E: 高水位告警）                                                                                   |
