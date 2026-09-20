@@ -14,5 +14,13 @@
     "module": "nexus-connectivity",
     "category": "implementation-pattern",
     "summary": "P1 双向包往返实现：用 Arc<Mutex<Vec>> 共享缓冲区实现真正双向通道，测试替身要足够真实"
+  },
+  {
+    "id": "http204-probe-001",
+    "file": "entries/2026-09-20-http204-latency-probe.md",
+    "date": "2026-09-20",
+    "module": "apps/nexus",
+    "category": "implementation-pattern",
+    "summary": "Http204LatencyProbe：trait 不加 kind() 保持 portable，probe_kind 作参数由组合根传入；BufRead trait 必须显式导入"
   }
 ]

@@ -999,10 +999,11 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
         let probe_kind = match st_node.get("probe_kind") {
             Some(v) => match v.as_str() {
                 Some("tcp") => "tcp".to_string(),
+                Some("http204") => "http204".to_string(),
                 _ => {
                     return Err(ConfigError::new(
                         "speedtest.probe_kind",
-                        "P0 only supports `tcp`",
+                        "must be `tcp` or `http204`",
                     ));
                 }
             },

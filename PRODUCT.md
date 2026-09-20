@@ -561,18 +561,23 @@ loopback 127.0.0.1 起 SS server 端 + 客户端，走真实 `std::net::TcpStrea
 - 命令：`nexusd proxy speedtest --json` —— 对全部候选出站批量测速，按 RTT
   升序输出结果表。
 - 指标：`latency_ms`（±毫秒，未测得为 null）、`status`（`ok` / `timeout` /
-  `unreachable` / `dns_failed`）、`probe_kind`（`tcp` / `http204`，P0 冻结
-  `tcp`，`http204` 为同一 trait 的后置实现）、target、时间戳。
+  `unreachable` / `dns_failed`）、`probe_kind`（`tcp` / `http204`）、target、时间戳。
+  `tcp`：仅建连级 RTT（connect_timeout）。`http204`：TCP 建连后发送
+  `GET {path} HTTP/1.1` 并等待响应首行 `204 No Content`，计时覆盖建连 +
+  请求发送 + 响应首字返回；非 204 响应或读取超时记为 `unreachable`。
 - 默认探测目标：`http://www.gstatic.com/generate_204`（Clash 惯例）；目标仅
   http/https、默认公网、超时上限 5s（可配）。
-- 安全边界：只做建连级延迟探测（TCP connect），不做下载吞吐测速（P0 无
-  throughput 指标）；单节点探测失败以 `status` 记录（非致命），不中断批量。
+- 安全边界：`tcp` 只做建连级延迟探测；`http204` 只发单行 GET、只读响应首行，
+  不做下载吞吐测速（无 throughput 指标）；单节点探测失败以 `status` 记录（非致命），
+  不中断批量。
 - 确定性策略：E4 场景注入 `OfflineMeasurements`（排序/选择可复现）；
   E5 以 loopback 真实 TCP 服务测真实 `LatencyProbe`（本机确定性闭环）。
 - 配置：YAML `proxy:` 下可选 `speedtest: {target, timeout_ms, probe_kind}`；
   缺失走默认值；非法字段返回 `CONFIG_INVALID`。
-- E4 场景：`proxy_speedtest.toml`（注入 mock 三候选，断言排序与 JSON 形态）、
-  `proxy_speedtest_loopback.toml`（loopback 真 TCP，断言 latency_ms 有值且低于阈值）。
+- E4 场景：`proxy_speedtest.toml`（注入 mock 三候选 tcp，断言排序与 JSON 形态）、
+  `proxy_speedtest_loopback.toml`（loopback 真 TCP，断言 latency_ms 有值且低于阈值）、
+  `proxy_speedtest_http204.toml`（注入 mock 三候选 http204，断言 probe_kind=http204 与排序）、
+  `proxy_speedtest_http204_loopback.toml`（loopback 真 HTTP/204 服务，断言 204 路径 ok）。
 
 ### 11.11 GEOIP / GEOSITE / rule-providers（规则数据注入，2026-09-18）
 

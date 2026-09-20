@@ -4129,13 +4129,78 @@ impl nexus_measurement::LatencyProbe for TcpLatencyProbe {
     }
 }
 
+/// 真实 HTTP/204 延迟探测（组合根，非 portable）：TCP connect 后发送单行 GET，
+/// 等待响应首行 `204 No Content`；计时覆盖建连 + 请求发送 + 响应首字返回。
+#[derive(Debug, Clone)]
+pub struct Http204LatencyProbe {
+    /// 建连与读取超时。
+    pub timeout: std::time::Duration,
+}
+
+impl Default for Http204LatencyProbe {
+    fn default() -> Self {
+        Self {
+            timeout: std::time::Duration::from_secs(5),
+        }
+    }
+}
+
+impl nexus_measurement::LatencyProbe for Http204LatencyProbe {
+    fn probe(&self, target: &nexus_measurement::ProbeTarget) -> Result<LinkMeasurement, String> {
+        use std::io::{BufRead, Write};
+        let addr: std::net::SocketAddr = format!("{}:{}", target.host, target.port)
+            .parse()
+            .map_err(|e| format!("invalid probe address: {e}"))?;
+        let start = std::time::Instant::now();
+        let mut stream = std::net::TcpStream::connect_timeout(&addr, self.timeout)
+            .map_err(|e| format!("connect failed: {e}"))?;
+        stream
+            .set_read_timeout(Some(self.timeout))
+            .map_err(|e| format!("set read timeout: {e}"))?;
+        stream
+            .set_write_timeout(Some(self.timeout))
+            .map_err(|e| format!("set write timeout: {e}"))?;
+        let path = if target.path.is_empty() {
+            "/"
+        } else {
+            &target.path
+        };
+        let req = format!(
+            "GET {path} HTTP/1.1\r\nHost: {}:{}\r\nConnection: close\r\nUser-Agent: nexus-speedtest\r\nAccept: */*\r\n\r\n",
+            target.host, target.port
+        );
+        stream
+            .write_all(req.as_bytes())
+            .map_err(|e| format!("write request failed: {e}"))?;
+        let mut reader = std::io::BufReader::new(&mut stream);
+        let mut first_line = Vec::new();
+        reader
+            .read_until(b'\n', &mut first_line)
+            .map_err(|e| format!("read status line failed: {e}"))?;
+        let line = String::from_utf8_lossy(&first_line);
+        let status_code = line.split_whitespace().nth(1);
+        if status_code != Some("204") {
+            return Err(format!("unexpected status line: {}", line.trim_end()));
+        }
+        let rtt_ms = u32::try_from(start.elapsed().as_millis())
+            .map(|ms| ms.max(1))
+            .unwrap_or(u32::MAX);
+        Ok(LinkMeasurement {
+            rtt_ms: Some(rtt_ms),
+            ..Default::default()
+        })
+    }
+}
+
 /// 通用批量测速：对候选逐个探测、RTT 升序输出（探测失败以 status 记录，非致命）。
-/// target_label 为探测目标 URL 展示（产品默认 generate_204；P0 建连级测速实际探测候选 server）。
+/// target_label 为探测目标 URL 展示（产品默认 generate_204）。
+/// probe_kind 为本次测速使用的探测类型标签（`tcp` / `http204`），原样进入 JSON。
 pub fn proxy_speedtest_with(
     probe: &dyn nexus_measurement::LatencyProbe,
     candidates: &[(&str, nexus_measurement::ProbeTarget)],
     timeout: std::time::Duration,
     target_label: &str,
+    probe_kind: &str,
 ) -> Result<Value, NexusError> {
     let mut rows: Vec<(String, Option<u32>, String)> = Vec::new();
     for (tag, target) in candidates {
@@ -4155,7 +4220,7 @@ pub fn proxy_speedtest_with(
     Ok(json!({
         "verdict": "PASS",
         "command": "proxy speedtest",
-        "probe_kind": "tcp",
+        "probe_kind": probe_kind,
         "timeout_ms": timeout.as_millis(),
         "target": target_label.to_string(),
         "results": rows
@@ -4190,6 +4255,7 @@ pub fn proxy_speedtest() -> Result<Value, NexusError> {
         &[("loopback", target)],
         probe.timeout,
         "http://www.gstatic.com/generate_204",
+        "tcp",
     );
     drop(listener);
     result

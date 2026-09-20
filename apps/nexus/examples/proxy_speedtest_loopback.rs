@@ -26,6 +26,7 @@ fn main() {
         &[("loopback", target)],
         probe.timeout,
         "http://www.gstatic.com/generate_204",
+        "tcp",
     )
     .expect("speedtest PASS");
     drop(listener);

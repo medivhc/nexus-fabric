@@ -69,6 +69,7 @@
   - `OutboundConfig`：`{ tag, kind: "direct"|"relay"|"shadowsocks"|"vmess"|"trojan",
     locator: Option<String> }`；
   - `SpeedtestConfig`：`{ target, timeout_ms, probe_kind }` 可选段（§11.10），缺失走默认值；
+    `probe_kind` 取值 `"tcp"`（默认）或 `"http204"`，其他 → `CONFIG_INVALID`。
   - `RuleProviderConfig`：`{ tag, behavior: "domain"|"ipcidr"|"classical", path: String,
     url: Option<String>, refresh_interval_secs: Option<u64> }`（§11.11 / §11.12）；
     `url` 为在线源（可选，默认无 → 纯本地），`refresh_interval_secs` 刷新间隔

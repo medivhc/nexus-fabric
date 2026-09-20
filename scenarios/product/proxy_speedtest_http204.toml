@@ -1,0 +1,51 @@
+schema_version = 1
+id = "product.proxy-speedtest-http204"
+title = "proxy speedtest http204 probe_kind 按 measurement 排序输出（离线 mock）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-proxy-kernel"
+
+[given]
+command = "proxy speedtest"
+probe_kind = "http204"
+measurement_source = "offline deterministic mock (RTT: relay-slow=320ms relay-fast=85ms relay-mid=150ms)"
+sorting = "RTT ascending"
+network = "none (offline mock, no real probe)"
+
+# 可执行 E4：组合根 example 注入离线确定性 measurement（三个候选 mock RTT），
+# 使用 Http204LatencyProbe 对应的批量测速路径（probe_kind=http204），
+# 断言结果按 RTT 升序、三候选齐全、probe_kind=http204、verdict=PASS。
+# 禁止断言真实 RTT 绝对值（mock 数据本身是断言的一部分）。
+[when]
+command = "cargo run --quiet -p nexus --example proxy_speedtest_http204 -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "proxy speedtest"
+
+[[expect]]
+field = "probe_kind"
+equals = "http204"
+
+[[expect]]
+field = "target"
+equals = "http://www.gstatic.com/generate_204"
+
+[[expect]]
+field = "results.0.tag"
+equals = "relay-fast"
+
+[[expect]]
+field = "results.0.latency_ms"
+equals = 85
+
+[[expect]]
+field = "results.1.tag"
+equals = "relay-mid"
+
+[[expect]]
+field = "results.2.tag"
+equals = "relay-slow"

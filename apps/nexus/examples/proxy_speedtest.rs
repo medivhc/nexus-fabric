@@ -50,6 +50,7 @@ fn main() {
         &candidates,
         std::time::Duration::from_secs(5),
         "http://www.gstatic.com/generate_204",
+        "tcp",
     )
     .expect("speedtest PASS");
 
