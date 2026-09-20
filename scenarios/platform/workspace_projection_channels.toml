@@ -1,0 +1,83 @@
+schema_version = 1
+id = "platform.workspace-projection-channels"
+title = "NativeApi 与 MaterializedDirectory 投影通道完整读写提交闭环"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#4-Workspace"
+
+[given]
+native_mount = false
+materialization = true
+
+# 可执行 E4：nexus-workspace 组合根示例驱动两个通道并输出 JSON。
+[when]
+command = "cargo run --quiet -p nexus-workspace --example workspace_projection_channels -- --json"
+
+# 冻结期望：
+# 1) NativeApi 通道：write → read 回读 → list_dir → commit → head 前进 →
+#    新实例从 state_root 恢复 → 读到已提交内容；
+# 2) MaterializedDirectory 通道：materialize → 从目录读 → 写新文件到目录 →
+#    commit → head 前进且内容已提交；
+# 3) 产品语义保持（Commit DAG / Head Set / Manifest 完整）。
+[[expect]]
+field = "native_api.write_ok"
+equals = true
+
+[[expect]]
+field = "native_api.read_back_ok"
+equals = true
+
+[[expect]]
+field = "native_api.read_content_match"
+equals = true
+
+[[expect]]
+field = "native_api.list_dir_count"
+equals = 2
+
+[[expect]]
+field = "native_api.commit_ok"
+equals = true
+
+[[expect]]
+field = "native_api.head_advanced"
+equals = true
+
+[[expect]]
+field = "native_api.recovery_read_ok"
+equals = true
+
+[[expect]]
+field = "native_api.recovery_content_match"
+equals = true
+
+[[expect]]
+field = "native_api.not_found_on_missing"
+equals = true
+
+[[expect]]
+field = "materialized.materialize_ok"
+equals = true
+
+[[expect]]
+field = "materialized.dir_read_ok"
+equals = true
+
+[[expect]]
+field = "materialized.dir_write_ok"
+equals = true
+
+[[expect]]
+field = "materialized.commit_ok"
+equals = true
+
+[[expect]]
+field = "materialized.head_advanced"
+equals = true
+
+[[expect]]
+field = "materialized.content_committed"
+equals = true
+
+[[expect]]
+field = "product_semantics_preserved"
+equals = true

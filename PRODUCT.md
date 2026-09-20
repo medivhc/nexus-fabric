@@ -69,6 +69,19 @@ Replica Set
 - 支持 WorkingSet、Profile、WorkspaceGraph 与 Prefetch，但这些不是权威内容。
 - 支持 Reachability GC、Storage Quota、Shallow Sync 与 Sparse Replica。
 - 无 FUSE/Mount 环境仍可通过 Native API、Materialization 或平台式 Projection 使用。
+  - **Native API 通道**：`NativeApiWorkspaceAccess` 提供结构化读写（`read_file` /
+    `write_file` / `list_dir` / `delete`），写入操作暂存于 WorkingSet（内存 HashMap），
+    不立即落 Commit；`commit` 时把 WorkingSet 暂存内容与删除集合落成新 Commit，
+    Head 前进。读取操作合并 WorkingSet 与当前 Head Manifest 的内容。无文件系统依赖，
+    可在 WASM / 嵌入式等无 FS 环境运行。
+  - **Materialized Directory 通道**：`MaterializedDirectoryAccess` 把 Workspace 当前
+    Head 的全部文件物化到本地临时目录；`read_file` / `write_file` / `list_dir` /
+    `delete` 直接操作本地文件系统；`commit` 时扫描本地目录与上次快照的差异，构建
+    ChangeSet（新增 / 修改 / 删除）提交回 Workspace，Head 前进并持久化。
+  - 两个通道都保持产品语义：Commit DAG / Head Set / Manifest 始终完整；
+    `product_semantics_preserved = true`。
+  - 错误语义：读取不存在的文件返回 `WorkspaceError::NotFound { path }`；
+    删除不存在的路径返回 `WorkspaceError::NotFound { path }`。
 
 ## 5. Compute
 

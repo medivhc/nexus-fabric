@@ -71,6 +71,33 @@ Merge/Commit/持久化路径必须返回结构化 `WorkspaceError`，不得 pani
 - `pub enum WorkspaceRemotePhase { Sending, Active, Closed }`
 - `WorkspaceError` 新增变体：`Transport` / `RemoteRejected` / `RemoteProtocol`。
 
+### 冻结契约（platform.workspace-projection-channels E4）
+
+- `pub struct NativeApiWorkspaceAccess<S: ContentStore>`：Native API 访问通道。
+  - `pub fn new(workspace: Workspace<S>) -> Self`：包裹已有 Workspace 实例。
+  - `pub fn into_workspace(self) -> Workspace<S>`：消费通道，拿回内部 Workspace。
+  - WorkingSet 语义：`write_file` 写入内存暂存 `HashMap<String, Vec<u8>>`；
+    `delete` 写入内存暂存 `HashSet<String>`（标记删除）；`read_file` 先查 WorkingSet
+    （含暂存删 → `NotFound`），再从当前 Head Manifest 经 ContentStore 读取；
+    `list_dir` 合并 WorkingSet 暂存变更与当前 Head Manifest。
+  - `commit()`：把 WorkingSet 暂存内容 + 删除集合落成新 Commit
+    （复用 `journal_pending` / `commit_pending` 或等价路径），Head 前进，
+    WorkingSet 清空。返回新 CommitId。
+  - `pub struct MaterializedDirectoryAccess<S: ContentStore>`：物化目录访问通道。
+  - `pub fn materialize(workspace: Workspace<S>, dir: PathBuf) -> Result<Self, WorkspaceError>`：
+    构造时把当前 Head Manifest 的全部文件物化到 `dir`（递归创建子目录）。
+  - `pub fn into_parts(self) -> (Workspace<S>, PathBuf)`：消费通道，拿回 Workspace 与目录路径。
+  - `read_file` / `write_file` / `list_dir` / `delete`：直接操作本地文件系统。
+  - `commit()`：扫描 `dir` 与构造时快照（Manifest）的差异——
+    新增 / 修改文件 → `Change`，删除文件 → 从 Manifest 移除——构建 ChangeSet
+    提交回 Workspace，Head 前进。
+- `WorkspaceError` 新增变体：`NotFound { path: String }`（读取 / 删除不存在的路径）、`PathTraversal { path: String }`（路径越界）。
+- 场景映射：`scenarios/platform/workspace_projection_channels.toml` 由
+  `crates/nexus-workspace/examples/workspace_projection_channels.rs` 驱动，经
+  harness 的 `product-scenarios` gate 求值。
+- 不变量：两个通道都不改变 Commit DAG / Head Set / Manifest 的权威语义；
+  `product_semantics_preserved` 由组合根按场景契约输出。
+
 ### 冻结语义
 
 远程提交必须显式完成往返后才 Active；提供方拒绝（RemoteRejected）与协议未识别帧（RemoteProtocol）是可诊断失败，不得吞为成功；未知 parent 的 ChangeSet 由提供方按现有 `UnknownCommit` 语义拒绝。
@@ -101,14 +128,17 @@ cargo clippy -p nexus-workspace --all-targets -- -D warnings
 
 如果该模块影响产品行为，还必须映射 Integration/Scenario Evidence。
 
-本模块映射两个 E4 场景：
+本模块映射三个 E4 场景：
 
 - `scenarios/product/workspace_offline_merge.toml`：由
   `crates/nexus-workspace/examples/workspace_offline_merge.rs` 驱动，经 harness 的
   `product-scenarios` gate 求值；
 - `scenarios/regression/crash_recovery.toml`：由
   `crates/nexus-workspace/examples/crash_recovery.rs` 驱动（含 nexus-session 会话记录
-  reconcile），经 harness 的 `regression` gate 求值。
+  reconcile），经 harness 的 `regression` gate 求值；
+- `scenarios/platform/workspace_projection_channels.toml`：由
+  `crates/nexus-workspace/examples/workspace_projection_channels.rs` 驱动，经
+  harness 的 `product-scenarios` gate 求值。
 
 ## Performance Budget
 
