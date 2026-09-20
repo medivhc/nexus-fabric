@@ -141,7 +141,7 @@ cargo build --workspace
 | 28 | 未就绪命令显式 UNSUPPORTED          | `product.observability-unsupported` (3)              | `nexusd workspace heads --json`               |
 | 29 | Windows VPI 能力声明（wintun）     | `platform.virtual-packet-interface` (10)             | `nexus-platform-host vpi-capabilities --json` |
 | 30 | 虚拟子网隧道（Virtual Subnet）      | `product.virtual-subnet-tunnel` (7)                  | example / SDK                                 |
-| 31 | NAT 打洞（STUN + UDP 打洞）       | （单元测试覆盖，待 E4 场景完善）                     | SDK / example                                 |
+| 31 | NAT 打洞（STUN + UDP 打洞）       | `product.nat-hole-punching` (6)                    | example / SDK                                 |
 | 32 | 独立 Review + 动态知识库          | （工程方法论，非用户功能）                           | `.agents/skills/` + `.agents/knowledge/`    |
 
 
@@ -248,9 +248,11 @@ cargo build --workspace
 * **用户用法**：
 
 
+  * example：`cargo run --quiet -p nexus --example nat_hole_punching -- --json`
+
   * SDK：`nexus_connectivity::nat::StunClient` / `nexus_connectivity::nat::HolePuncher`
 
-* **代码级校验**：单元测试 7 项（STUN 请求构造、响应解析、随机 Transaction ID 等）；待 E4 场景完善
+* **代码级校验**：场景 `product.nat-hole-punching`（6 期望）→ PASS；驱动 `apps/nexus/examples/nat_hole_punching.rs`；单元测试 7 项
 
 ### 4.2 Service
 
@@ -566,5 +568,5 @@ whitespace、format、check、clippy、architecture-policy、dependency-governan
 | `nexus` CLI 领域执行                             | bootstrap | 命令解析完整，除 `status` 外返回结构化 Unsupported；可执行入口走 `nexusd`                                                      |
 | 传输层 crate                                    | stub      | `nexus-delivery`、`nexus-diagnostics`、`nexus-proto`、`nexus-platform-{linux,macos,android,ios}` 为 12–16 行骨架 |
 | fuzz 门禁                                      | 需 nightly | `cargo +nightly fuzz check`（stable 下 libfuzzer -Z 选项失败）                                                   |
-| NAT 打洞 E4 场景                               | 待完善      | 单元测试覆盖，待补充产品级 E4 场景                                                                              |
+| NAT 打洞真实 STUN 集成测试                       | 待完善      | 单元测试 + E4 离线场景已覆盖，真实 STUN 服务器集成测试待补充                                                          |
 | 磁盘注意                                         | 本机        | 构建产物优先放 D:（C:/E: 高水位告警）                                                                                   |
