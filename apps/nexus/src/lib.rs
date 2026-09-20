@@ -4962,3 +4962,114 @@ pub fn mesh_dns_flow() -> Result<Value, NexusError> {
         "ttl_expired": ttl_expired,
     }))
 }
+
+/// E4 场景 `product.firewall-rules`：Mesh 网络防火墙规则匹配引擎。
+///
+/// 纯内存骨架：不接真实 socket/TUN；用同一 `FirewallEngine` 评估三类 mock 包，
+/// 覆盖默认拒绝白名单、Allow 白名单、Deny 端口封锁、CIDR 网段匹配与 first-match-wins。
+pub fn firewall_flow() -> Result<Value, NexusError> {
+    use nexus_connectivity::firewall::{
+        FirewallAction, FirewallConfig, FirewallEngine, FirewallRule, FirewallVerdict,
+        PacketContext, PortRange, Protocol, dns_query_context,
+    };
+
+    let rule_mesh_tcp = FirewallRule::new(
+        FirewallAction::Allow,
+        Some("10.0.0.0/24"),
+        Some("10.0.0.0/24"),
+        None,
+        None,
+        Some(Protocol::Tcp),
+    )
+    .map_err(|e| NexusError::Internal {
+        message: format!("firewall rule mesh-tcp: {e}"),
+    })?;
+    let rule_deny_dns = FirewallRule::new(
+        FirewallAction::Deny,
+        None::<String>,
+        None::<String>,
+        None,
+        Some(PortRange::single(53)),
+        Some(Protocol::Udp),
+    )
+    .map_err(|e| NexusError::Internal {
+        message: format!("firewall rule deny-dns: {e}"),
+    })?;
+    let rule_allow_admin_dns = FirewallRule::new(
+        FirewallAction::Allow,
+        Some("10.0.0.5"),
+        Some("10.0.0.0/24"),
+        None,
+        Some(PortRange::single(53)),
+        Some(Protocol::Udp),
+    )
+    .map_err(|e| NexusError::Internal {
+        message: format!("firewall rule allow-admin-dns: {e}"),
+    })?;
+
+    let cfg = FirewallConfig::new(
+        FirewallAction::Deny,
+        vec![rule_mesh_tcp, rule_deny_dns, rule_allow_admin_dns],
+    )
+    .map_err(|e| NexusError::Internal {
+        message: format!("firewall config: {e}"),
+    })?;
+    let engine = FirewallEngine::new(&cfg).map_err(|e| NexusError::Internal {
+        message: format!("firewall engine: {e}"),
+    })?;
+
+    let inbound_unauthorized = PacketContext::transport(
+        "203.0.113.10",
+        "10.0.0.1",
+        Some(40000),
+        Some(80),
+        Protocol::Tcp,
+    );
+    let inbound_verdict = engine.evaluate(&inbound_unauthorized);
+
+    let whitelisted =
+        PacketContext::transport("10.0.0.5", "10.0.0.1", Some(50000), Some(22), Protocol::Tcp);
+    let whitelisted_verdict = engine.evaluate(&whitelisted);
+
+    let forwarded = PacketContext::transport(
+        "10.0.0.5",
+        "10.0.0.9",
+        Some(50001),
+        Some(443),
+        Protocol::Tcp,
+    );
+    let forwarded_verdict = engine.evaluate(&forwarded);
+
+    let cidr_hit = PacketContext::transport(
+        "10.0.0.200",
+        "10.0.0.100",
+        Some(50002),
+        Some(8080),
+        Protocol::Tcp,
+    );
+    let cidr_hit_verdict = engine.evaluate(&cidr_hit);
+
+    let dns_blocked = dns_query_context("10.0.0.6", "10.0.0.53");
+    let dns_blocked_verdict = engine.evaluate(&dns_blocked);
+
+    let admin_dns = dns_query_context("10.0.0.5", "10.0.0.53");
+    let admin_dns_verdict = engine.evaluate(&admin_dns);
+
+    let verdict_str = |v: FirewallVerdict| v.as_str();
+
+    Ok(json!({
+        "verdict": "PASS",
+        "command": "firewall-rules",
+        "default_policy": engine.default_policy().as_str(),
+        "rule_count": engine.rule_count(),
+        "inbound_unauthorized": { "verdict": verdict_str(inbound_verdict) },
+        "whitelisted_peer": { "verdict": verdict_str(whitelisted_verdict) },
+        "forwarded_packet": { "verdict": verdict_str(forwarded_verdict) },
+        "cidr_hit": { "verdict": verdict_str(cidr_hit_verdict) },
+        "dns_blocked": { "verdict": verdict_str(dns_blocked_verdict) },
+        "first_match_wins": {
+            "admin_dns_verdict": verdict_str(admin_dns_verdict),
+            "expected": "deny"
+        },
+    }))
+}

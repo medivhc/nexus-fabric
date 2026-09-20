@@ -12,6 +12,7 @@ pub fn run_scenario(args: &[String]) -> Outcome {
         "nat-hole-punching" => run_nat_hole_punching(),
         "multihop-routing" => run_multihop_routing(),
         "mesh-dns" => run_mesh_dns(),
+        "firewall-rules" => run_firewall_rules(),
         _ => (
             "BLOCKED".to_string(),
             format!("unknown run subcommand: {subcommand}"),
@@ -759,6 +760,194 @@ fn run_mesh_dns() -> Outcome {
             "FAIL".to_string(),
             format!(
                 "mesh-dns: invariants failed (resolves={query_from_b_resolves}, unknown={query_unknown}, ttl_expired={ttl_expired})"
+            ),
+            extra,
+        )
+    }
+}
+
+/// E4: Mesh 网络防火墙规则匹配引擎（内存骨架，PRODUCT §12-firewall-rules）。
+///
+/// 与 `nexus::firewall_flow()` 同语义；按 nexus-harness 架构策略直接用
+/// `nexus_connectivity::firewall` 内联实现。演示三个检查点：
+/// - 入站包（inbound）：外部未授权源 -> 默认拒绝；
+/// - 转发包（forwarded）：mesh 内 /24 网段互访 -> 白名单 Allow；
+/// - DNS 查询上下文：UDP/53 -> Deny 规则拦截；并验证 first-match-wins。
+fn run_firewall_rules() -> Outcome {
+    use nexus_connectivity::firewall::{
+        FirewallAction, FirewallConfig, FirewallEngine, FirewallRule, PacketContext, PortRange,
+        Protocol, dns_query_context,
+    };
+
+    // 规则顺序（first-match-wins）：
+    // 1. Allow mesh 内 TCP（10.0.0.0/24 <-> 10.0.0.0/24）；
+    // 2. Deny 所有 UDP/53（DNS 出口封锁）；
+    // 3. Allow 来自 10.0.0.5 的 UDP/53（若 first-match-wins 失效，本条会错误放行）。
+    let rule_mesh_tcp = FirewallRule::new(
+        FirewallAction::Allow,
+        Some("10.0.0.0/24"),
+        Some("10.0.0.0/24"),
+        None,
+        None,
+        Some(Protocol::Tcp),
+    );
+    let rule_deny_dns = FirewallRule::new(
+        FirewallAction::Deny,
+        None::<String>,
+        None::<String>,
+        None,
+        Some(PortRange::single(53)),
+        Some(Protocol::Udp),
+    );
+    let rule_allow_admin_dns = FirewallRule::new(
+        FirewallAction::Allow,
+        Some("10.0.0.5"),
+        Some("10.0.0.0/24"),
+        None,
+        Some(PortRange::single(53)),
+        Some(Protocol::Udp),
+    );
+
+    let (rule_mesh_tcp, rule_deny_dns, rule_allow_admin_dns) =
+        match (rule_mesh_tcp, rule_deny_dns, rule_allow_admin_dns) {
+            (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                return (
+                    "FAIL".to_string(),
+                    format!("firewall-rules: build rule: {e}"),
+                    Vec::new(),
+                );
+            }
+        };
+
+    let cfg = match FirewallConfig::new(
+        FirewallAction::Deny,
+        vec![rule_mesh_tcp, rule_deny_dns, rule_allow_admin_dns],
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                "FAIL".to_string(),
+                format!("firewall-rules: build config: {e}"),
+                Vec::new(),
+            );
+        }
+    };
+    let engine = match FirewallEngine::new(&cfg) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                "FAIL".to_string(),
+                format!("firewall-rules: build engine: {e}"),
+                Vec::new(),
+            );
+        }
+    };
+
+    // 检查点 1：入站未授权包（外部源访问 mesh 内 80 端口）-> 未命中任何规则 -> 默认 Deny。
+    let inbound_unauthorized = PacketContext::transport(
+        "203.0.113.10",
+        "10.0.0.1",
+        Some(40000),
+        Some(80),
+        Protocol::Tcp,
+    );
+    let inbound_verdict = engine.evaluate(&inbound_unauthorized);
+
+    // 检查点 2：白名单放行（mesh 内 10.0.0.5 -> 10.0.0.1 的 SSH/TCP）-> 规则 1 Allow。
+    let whitelisted =
+        PacketContext::transport("10.0.0.5", "10.0.0.1", Some(50000), Some(22), Protocol::Tcp);
+    let whitelisted_verdict = engine.evaluate(&whitelisted);
+
+    // 检查点 3：转发包（多跳路由场景，10.0.0.5 -> 10.0.0.9 的 HTTPS/TCP）-> 规则 1 Allow。
+    let forwarded = PacketContext::transport(
+        "10.0.0.5",
+        "10.0.0.9",
+        Some(50001),
+        Some(443),
+        Protocol::Tcp,
+    );
+    let forwarded_verdict = engine.evaluate(&forwarded);
+
+    // CIDR 网段匹配：10.0.0.200 -> 10.0.0.100 都在 /24 内 -> Allow。
+    let cidr_hit = PacketContext::transport(
+        "10.0.0.200",
+        "10.0.0.100",
+        Some(50002),
+        Some(8080),
+        Protocol::Tcp,
+    );
+    let cidr_hit_verdict = engine.evaluate(&cidr_hit);
+
+    // 检查点 4：DNS 查询上下文（任意源 -> 10.0.0.53:53/UDP）-> 规则 2 Deny。
+    let dns_blocked = dns_query_context("10.0.0.6", "10.0.0.53");
+    let dns_blocked_verdict = engine.evaluate(&dns_blocked);
+
+    // 检查点 5：first-match-wins —— 即使规则 3 精确允许 10.0.0.5 的 DNS，
+    // 规则 2 先命中，仍应 Deny。
+    let admin_dns = dns_query_context("10.0.0.5", "10.0.0.53");
+    let admin_dns_verdict = engine.evaluate(&admin_dns);
+
+    let ok = inbound_verdict == nexus_connectivity::firewall::FirewallVerdict::Deny
+        && whitelisted_verdict == nexus_connectivity::firewall::FirewallVerdict::Allow
+        && forwarded_verdict == nexus_connectivity::firewall::FirewallVerdict::Allow
+        && cidr_hit_verdict == nexus_connectivity::firewall::FirewallVerdict::Allow
+        && dns_blocked_verdict == nexus_connectivity::firewall::FirewallVerdict::Deny
+        && admin_dns_verdict == nexus_connectivity::firewall::FirewallVerdict::Deny;
+
+    let extra = vec![
+        (
+            "default_policy".to_string(),
+            json!(engine.default_policy().as_str()),
+        ),
+        ("rule_count".to_string(), json!(engine.rule_count())),
+        (
+            "inbound_unauthorized".to_string(),
+            json!({ "verdict": inbound_verdict.as_str() }),
+        ),
+        (
+            "whitelisted_peer".to_string(),
+            json!({ "verdict": whitelisted_verdict.as_str() }),
+        ),
+        (
+            "forwarded_packet".to_string(),
+            json!({ "verdict": forwarded_verdict.as_str() }),
+        ),
+        (
+            "cidr_hit".to_string(),
+            json!({ "verdict": cidr_hit_verdict.as_str() }),
+        ),
+        (
+            "dns_blocked".to_string(),
+            json!({ "verdict": dns_blocked_verdict.as_str() }),
+        ),
+        (
+            "first_match_wins".to_string(),
+            json!({
+                "admin_dns_verdict": admin_dns_verdict.as_str(),
+                "expected": "deny"
+            }),
+        ),
+    ];
+
+    if ok {
+        (
+            "PASS".to_string(),
+            "firewall-rules: default-deny + whitelist allow + port deny + CIDR + first-match-wins verified"
+                .to_string(),
+            extra,
+        )
+    } else {
+        (
+            "FAIL".to_string(),
+            format!(
+                "firewall-rules: invariants failed (inbound={}, whitelist={}, forwarded={}, cidr={}, dns={}, admin_dns={})",
+                inbound_verdict,
+                whitelisted_verdict,
+                forwarded_verdict,
+                cidr_hit_verdict,
+                dns_blocked_verdict,
+                admin_dns_verdict
             ),
             extra,
         )

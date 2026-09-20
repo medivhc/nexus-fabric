@@ -54,6 +54,10 @@ pub mod routing;
 
 pub mod mesh_dns;
 
+// ---------- Mesh 防火墙规则匹配引擎（E4：product.firewall-rules） ----------
+
+pub mod firewall;
+
 // ---------- 结构化错误（不以日志文本代替错误类型） ----------
 
 /// Connectivity 层的结构化错误（delivery 层自有错误面，不依赖领域错误）。

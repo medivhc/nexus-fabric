@@ -1,0 +1,55 @@
+schema_version = 1
+id = "product.firewall-rules"
+title = "Mesh 网络防火墙规则匹配引擎（默认拒绝白名单 + first-match-wins）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-firewall-rules"
+
+[given]
+subnet_cidr = "10.0.0.0/24"
+default_policy = "deny"
+rules = [
+  "allow tcp 10.0.0.0/24 <-> 10.0.0.0/24",
+  "deny udp/53 (all DNS)",
+  "allow udp/53 from 10.0.0.5 (admin, should be shadowed by first-match-wins)",
+]
+
+[when]
+command = "nexus-harness run firewall-rules --json"
+
+[[expect]]
+field = "default_policy"
+equals = "deny"
+
+[[expect]]
+field = "rule_count"
+equals = 3
+
+# 外部未授权入站包：未命中任何规则 -> 默认拒绝
+[[expect]]
+field = "inbound_unauthorized.verdict"
+equals = "deny"
+
+# 白名单 Allow：mesh 内 TCP 互访（SSH）放行
+[[expect]]
+field = "whitelisted_peer.verdict"
+equals = "allow"
+
+# 转发包：多跳路由场景下 mesh 内 TCP 放行
+[[expect]]
+field = "forwarded_packet.verdict"
+equals = "allow"
+
+# CIDR 网段匹配：/24 内任意主机对命中
+[[expect]]
+field = "cidr_hit.verdict"
+equals = "allow"
+
+# DNS 查询上下文：UDP/53 被 Deny 规则封锁
+[[expect]]
+field = "dns_blocked.verdict"
+equals = "deny"
+
+# first-match-wins：即使后一条规则精确允许 10.0.0.5 的 DNS，前一条 deny 先生效
+[[expect]]
+field = "first_match_wins.admin_dns_verdict"
+equals = "deny"
