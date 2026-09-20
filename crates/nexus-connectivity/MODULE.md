@@ -231,6 +231,35 @@ NAT/中继场景的物理建连（组合根 transport::connect）发生在激活
 冻结语义：纯内存、纯同步、纯函数骨架；不接真实 socket/TUN/iptables；不支持 IPv6；
 真实包抓取、conntrack 状态化规则、规则热加载留 TODO；
 本模块保持 portable、零真实网络、无 `unsafe`。
+### 冻结契约（带宽控制 / QoS 令牌桶，scenarios/product/bandwidth_qos.toml）
+
+- `BandwidthLimit { max_bytes_per_sec: u64, burst_size: u64 }`：
+  `new(max_bytes_per_sec, burst_size) -> Result<Self, QosError>`（速率必须 > 0、
+  burst 必须 >= 1，否则 `QosError::InvalidLimit`）；`rate()` / `burst()` 只读。
+- `trait QosClock { fn now(&self) -> Duration }`：单调时钟抽象（可注入）；
+  `MonotonicClock::new()` 基于 `std::time::Instant`，返回构造点起算的单调时长；
+  测试 / E4 用显式 `Duration` 假时钟推进。
+- `TokenBucket`：`new(&BandwidthLimit)`（初始满桶 = burst_size）；
+  - `refill(now)`：按 `rate` 字节/秒线性补充，封顶 `burst_size`；时间回退不补充；
+  - `try_consume(bytes, now) -> bool`：够令牌则扣减并返回 `true`，不够返回 `false`
+    （不阻塞、不 sleep）；
+  - `remaining_tokens() -> u64`（向下取整）/ `capacity()` / `rate()`。
+- `QosConfig { ingress: Option<BandwidthLimit>, egress: Option<BandwidthLimit> }`：
+  两方向限制；`None` 表示该方向不限制（恒放行）。
+- `PerEndpointStats { up_bytes, down_bytes }`：单连接/节点累计放行字节（Default 归零）。
+- `QosStats { bytes_allowed, bytes_dropped, tokens_remaining, endpoints: HashMap<String, PerEndpointStats> }`：
+  聚合快照（放行/丢弃字节 + 出站剩余令牌 + 各 tag up/down 累计）。
+- `QosController`：持有入站/出站两个令牌桶 + 统计表；
+  - `new(&QosConfig)`（两方向桶按 limit 建为满桶）；
+  - `try_egress(tag, bytes, now) -> bool` / `try_ingress(tag, bytes, now) -> bool`：
+    命中限制返回 `false` 并计 `bytes_dropped`（不计入任何 up/down）；放行计入
+    `bytes_allowed` 与该 tag 的 `up_bytes`（egress）/ `down_bytes`（ingress）；
+  - `snapshot() -> QosStats` / `egress_tokens_remaining()` / `ingress_tokens_remaining()`。
+- `QosError { InvalidLimit { message } }`：类型化错误面，`Display` + `std::error::Error`。
+
+冻结语义：纯内存、纯同步、纯函数骨架；不接真实 socket/TUN/内核 tc；不引入 `time` crate，
+仅 std（`std::time::{Duration, Instant}`）；无 `unsafe`、库代码不 panic/unwrap/expect；
+整形排队、优先级/公平排队、per-flow 分流、真实数据面挂接留 TODO。
 ## Verification
 
 最低：

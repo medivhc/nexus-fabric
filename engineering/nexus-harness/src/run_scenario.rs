@@ -13,6 +13,7 @@ pub fn run_scenario(args: &[String]) -> Outcome {
         "multihop-routing" => run_multihop_routing(),
         "mesh-dns" => run_mesh_dns(),
         "firewall-rules" => run_firewall_rules(),
+        "bandwidth-qos" => run_bandwidth_qos(),
         _ => (
             "BLOCKED".to_string(),
             format!("unknown run subcommand: {subcommand}"),
@@ -948,6 +949,112 @@ fn run_firewall_rules() -> Outcome {
                 cidr_hit_verdict,
                 dns_blocked_verdict,
                 admin_dns_verdict
+            ),
+            extra,
+        )
+    }
+}
+
+/// E4: 带宽控制 / QoS 令牌桶限流（内存骨架，PRODUCT §12.8-bandwidth-qos）。
+///
+/// 与 `nexus::bandwidth_qos_flow()` 同语义；按 nexus-harness 架构策略直接用
+/// `nexus_connectivity::qos` 内联实现。演示五个检查点：
+/// (a) 初始突发 burst_size 字节放行；
+/// (b) 同刻持续发送超过平均速率后后续包被拒；
+/// (c) 推进时钟 1 秒后令牌恢复又可发；
+/// (d) 两个连接 up 统计相互独立；
+/// (e) 被拒绝字节计入 dropped 而非 allowed。
+fn run_bandwidth_qos() -> Outcome {
+    use nexus_connectivity::qos::{BandwidthLimit, QosConfig, QosController};
+    use std::time::Duration;
+
+    let egress_limit = match BandwidthLimit::new(1000, 1000) {
+        Ok(l) => l,
+        Err(e) => {
+            return (
+                "FAIL".to_string(),
+                format!("bandwidth-qos: build limit: {e}"),
+                Vec::new(),
+            );
+        }
+    };
+    let cfg = QosConfig::new(None, Some(egress_limit));
+    let mut ctl = QosController::new(&cfg);
+
+    let t0 = Duration::ZERO;
+    let t1 = Duration::from_secs(1);
+
+    // (a) 初始突发：满桶 1000 字节放行。
+    let burst_allowed = ctl.try_egress("conn-a", 1000, t0);
+    // (b) 同刻持续发送：令牌已空，再发 100 字节被拒。
+    let excess_after_burst_rejected = !ctl.try_egress("conn-a", 100, t0);
+    // (c) 推进时钟 1 秒：补满令牌，conn-a 又可发 500 字节。
+    let recovered_after_second = ctl.try_egress("conn-a", 500, t1);
+    // (d) 第二连接 conn-b 独立消耗；两连接 up 统计互不影响。
+    let conn_b_allowed = ctl.try_egress("conn-b", 300, t1);
+
+    let snap = ctl.snapshot();
+    let conn_a_up = snap
+        .endpoints
+        .get("conn-a")
+        .map(|s| s.up_bytes)
+        .unwrap_or(0);
+    let conn_b_up = snap
+        .endpoints
+        .get("conn-b")
+        .map(|s| s.up_bytes)
+        .unwrap_or(0);
+
+    let ok = burst_allowed
+        && excess_after_burst_rejected
+        && recovered_after_second
+        && conn_b_allowed
+        && conn_a_up == 1500
+        && conn_b_up == 300
+        && snap.bytes_allowed == 1800
+        && snap.bytes_dropped == 100;
+
+    let extra = vec![
+        ("rate_bps".to_string(), json!(1000)),
+        ("burst_bytes".to_string(), json!(1000)),
+        ("burst_allowed".to_string(), json!(burst_allowed)),
+        (
+            "excess_after_burst_rejected".to_string(),
+            json!(excess_after_burst_rejected),
+        ),
+        (
+            "recovered_after_second".to_string(),
+            json!(recovered_after_second),
+        ),
+        (
+            "connections".to_string(),
+            json!({
+                "conn_a_up_bytes": conn_a_up,
+                "conn_b_up_bytes": conn_b_up,
+                "conn_b_allowed": conn_b_allowed,
+            }),
+        ),
+        ("bytes_allowed".to_string(), json!(snap.bytes_allowed)),
+        ("bytes_dropped".to_string(), json!(snap.bytes_dropped)),
+        (
+            "egress_tokens_remaining".to_string(),
+            json!(snap.tokens_remaining),
+        ),
+    ];
+
+    if ok {
+        (
+            "PASS".to_string(),
+            "bandwidth-qos: burst allow + over-limit reject + 1s recovery + per-conn stats + dropped accounting verified"
+                .to_string(),
+            extra,
+        )
+    } else {
+        (
+            "FAIL".to_string(),
+            format!(
+                "bandwidth-qos: invariants failed (burst={burst_allowed}, excess_rejected={excess_after_burst_rejected}, recovered={recovered_after_second}, conn_a_up={conn_a_up}, conn_b_up={conn_b_up}, allowed={}, dropped={})",
+                snap.bytes_allowed, snap.bytes_dropped
             ),
             extra,
         )
