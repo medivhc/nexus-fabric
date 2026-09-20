@@ -863,7 +863,6 @@ DECAPSULATION_ERROR         包解封装失败
   互不可见（A 的 peers 只有 B，C 的 peers 只有 B）。
 - 冻结边界（P1 不做）：动态路由协议、最短路径算法、跨子网、加密、真实 TUN。
 
-
 ### 12.6 P1.1 多跳动态路由（距离矢量，2026-09-20）
 
 §12.5 在冻结边界中明确"动态路由协议、最短路径算法"为 P1 不做项。
@@ -929,3 +928,45 @@ DECAPSULATION_ERROR         包解封装失败
     （poison reverse）、不做触发更新；
   - 不跨子网、不接加密（复用 §12 既有 encryption 概念，本任务不接入）；
   - 不引入 tokio / 异步任务 / 长期 spawn（显式 tick 推进，纯同步纯函数骨架）。
+### 12.7 P2 隧道加密（链路加密接入虚拟子网数据面，2026-09-20）
+
+§12.3 冻结"加密后置"；§6 链路加密原语（`nexus-connectivity::encryption`，
+PRODUCT §6）已交付。本节把加密**接入虚拟子网数据面**：开启后隧道帧整体
+AEAD 加密，每跳独立会话（WireGuard 式链路加密），§12.5 路由语义保持。
+
+- 加密原语复用（不改 wire 布局）：X25519 纯 ephemeral 双公钥握手、
+  HKDF-SHA256 方向子密钥（tx/rx）、ChaCha20Poly1305 数据帧（22 字节
+  version|type|seq|nonce 头作 AAD）、1024 位滑动防重放窗口。
+- 接入 API（`VirtualSubnetTunnel`）：
+  - `enable_encryption(config: EncryptionConfig)`：开启加密模式（默认关闭，
+    明文模式与 §12.1-§12.5 语义不变）；`is_encryption_enabled() -> bool`。
+  - `begin_handshake(peer_virtual_ip)`：发起方生成临时密钥对，经 carrier 发
+    `HANDSHAKE_INIT`（33 字节），暂存本端密钥等待响应。
+  - `accept_handshake(peer_virtual_ip, msg)`：响应方生成临时密钥对，经
+    `handshake_respond` 派生本端会话并回 `HANDSHAKE_RESP`。
+  - `complete_handshake(peer_virtual_ip, resp)`：发起方用响应方公钥完成派生
+    （新增 `KeyPair::derive_directional(peer_public, initiator)`，分步握手专用）。
+  - 握手成功前不发送数据帧（peer state 沿用 Handshaking→Connected；发送仍
+    校验 Connected）。
+- 数据面语义（加密模式）：
+  - 发送：`TunnelFrameHeader.serialize() + payload` 整体作为明文，
+    `encrypt_frame(session.tx, tx_seq, inner)` 后经 carrier 发送；tx_seq 递增。
+  - 接收：按长度+type 分流握手帧/数据帧；数据帧以**对端会话 rx 依次试解密**
+    （tag 失败=错误密钥），成功后再经 `ReplayWindow::check_and_accept` 防重放；
+    解密或防重放失败 → 整帧丢弃并返回结构化错误（不暴露明文）。
+  - 中间节点转发：解密后 dst≠本机 → 用 next_hop 会话**重新加密**同一明文
+    （虚拟 IP 头内容不变，§12.5"帧头不剥不改"语义保持）后转发；计
+    `bytes_forwarded` 并发 `PacketForwarded` 事件（字节数按 wire 密文长度）。
+- 可观察性：加密模式下各节点 `is_encryption_enabled=true`；peer state 经
+  握手推进到 Connected；防重放拒绝计 `dropped`（TunnelStats 复用）。
+- 失败语义：无匹配会话解密 / tag 失败 / 重放拒绝 → 结构化错误
+  `CRYPTO_ERROR` / `REPLAY_REJECTED`（复用 `EncryptionError` 语义）；
+  对未握手 peer 发送数据帧 → 结构化错误（沿用 next_hop not connected）。
+- E2 单测：分步握手与既有一步握手派生一致（确定性交叉验证）、双节点
+  加密收发 roundtrip、篡改/重放拒绝、明文模式回归。
+- E4 场景：`virtual_subnet_encrypted_3node.toml`——A—B—C 链（A 不直连 C），
+  全节点加密，A→C 经 B 转发：断言 C 的 VPI 收到原始 payload、B 的
+  `bytes_forwarded > 0`、wire 密文不含明文泄漏、重放同一密文被拒、
+  各节点 `is_encryption_enabled=true`。
+- 冻结边界（P2 不做）：长期身份/公钥持久化（纯 ephemeral 握手）、密钥
+  周期轮换逻辑、psk 绑定、真实线上传输（内存 carrier 闭环）。

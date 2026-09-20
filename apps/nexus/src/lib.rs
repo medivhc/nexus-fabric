@@ -4663,6 +4663,205 @@ pub fn link_encryption_flow() -> Result<Value, NexusError> {
     }))
 }
 
+/// E4 产品场景 `product.virtual-subnet-encrypted-3node` 的可执行驱动（Composition Root）。
+///
+/// 三节点 A(10.0.0.1)—B(10.0.0.2)—C(10.0.0.3) 虚拟子网：加密模式开启后，
+/// 每跳独立 ephemeral 握手派生会话密钥，数据面整体 AEAD 加密；
+/// 中间节点 B 用下一跳会话重新加密同一明文转发（帧头内容不变）。
+pub fn virtual_subnet_encrypted_3node_flow() -> Result<Value, NexusError> {
+    use nexus_connectivity::encryption::EncryptionConfig;
+    use nexus_connectivity::virtual_subnet::{
+        MemoryVpi, MeshCarrier, TunnelPeer, VirtualSubnetConfig, VirtualSubnetTunnel,
+    };
+
+    // 三向 MeshCarrier：A↔B、B↔C（A 与 C 不直连）
+    let mut mesh_a = MeshCarrier::new();
+    let mut mesh_b = MeshCarrier::new();
+    let mut mesh_c = MeshCarrier::new();
+    let a_recv = mesh_a.recv_handle();
+    let b_recv = mesh_b.recv_handle();
+    let c_recv = mesh_c.recv_handle();
+    mesh_a.connect_peer("B_locator", b_recv.clone());
+    mesh_b.connect_peer("A_locator", a_recv.clone());
+    mesh_b.connect_peer("C_locator", c_recv.clone());
+    mesh_c.connect_peer("B_locator", b_recv.clone());
+
+    let cfg_a = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
+    let cfg_b = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.2");
+    let cfg_c = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.3");
+    let vpi_c = Box::new(MemoryVpi::new());
+    let c_vpi_sent = vpi_c.sent_handle();
+
+    let mut tunnel_a =
+        VirtualSubnetTunnel::new(cfg_a, Box::new(MemoryVpi::new()), Box::new(mesh_a));
+    let mut tunnel_b =
+        VirtualSubnetTunnel::new(cfg_b, Box::new(MemoryVpi::new()), Box::new(mesh_b));
+    let mut tunnel_c = VirtualSubnetTunnel::new(cfg_c, vpi_c, Box::new(mesh_c));
+
+    // 路由：A 去 C 经 B；C 去 A 经 B；B 无路由（A/C 均直连）
+    tunnel_a
+        .add_peer(TunnelPeer::new("10.0.0.2", "B_locator"))
+        .map_err(|e| NexusError::Internal {
+            message: format!("add peer: {e}"),
+        })?;
+    tunnel_a
+        .add_route("10.0.0.3", "10.0.0.2")
+        .map_err(|e| NexusError::Internal {
+            message: format!("add route: {e}"),
+        })?;
+    tunnel_b
+        .add_peer(TunnelPeer::new("10.0.0.1", "A_locator"))
+        .map_err(|e| NexusError::Internal {
+            message: format!("add peer: {e}"),
+        })?;
+    tunnel_b
+        .add_peer(TunnelPeer::new("10.0.0.3", "C_locator"))
+        .map_err(|e| NexusError::Internal {
+            message: format!("add peer: {e}"),
+        })?;
+    tunnel_c
+        .add_peer(TunnelPeer::new("10.0.0.2", "B_locator"))
+        .map_err(|e| NexusError::Internal {
+            message: format!("add peer: {e}"),
+        })?;
+    tunnel_c
+        .add_route("10.0.0.1", "10.0.0.2")
+        .map_err(|e| NexusError::Internal {
+            message: format!("add route: {e}"),
+        })?;
+
+    // 开启加密模式（三节点）
+    tunnel_a.enable_encryption(EncryptionConfig::default());
+    tunnel_b.enable_encryption(EncryptionConfig::default());
+    tunnel_c.enable_encryption(EncryptionConfig::default());
+    let a_encrypted = tunnel_a.is_encryption_enabled();
+    let b_encrypted = tunnel_b.is_encryption_enabled();
+    let c_encrypted = tunnel_c.is_encryption_enabled();
+
+    // 握手 A↔B（A 发起）
+    tunnel_a
+        .begin_handshake("10.0.0.2")
+        .map_err(|e| NexusError::Internal {
+            message: format!("begin_handshake: {e}"),
+        })?;
+    let mut buf = [0u8; 4096];
+    let _ = tunnel_b
+        .recv_and_deliver(&mut buf)
+        .map_err(|e| NexusError::Internal {
+            message: format!("b accept: {e}"),
+        })?;
+    let _ = tunnel_a
+        .recv_and_deliver(&mut buf)
+        .map_err(|e| NexusError::Internal {
+            message: format!("a complete: {e}"),
+        })?;
+
+    // 握手 B↔C（B 发起）
+    tunnel_b
+        .begin_handshake("10.0.0.3")
+        .map_err(|e| NexusError::Internal {
+            message: format!("begin_handshake: {e}"),
+        })?;
+    let _ = tunnel_c
+        .recv_and_deliver(&mut buf)
+        .map_err(|e| NexusError::Internal {
+            message: format!("c accept: {e}"),
+        })?;
+    let _ = tunnel_b
+        .recv_and_deliver(&mut buf)
+        .map_err(|e| NexusError::Internal {
+            message: format!("b complete: {e}"),
+        })?;
+
+    // 断言两侧握手状态
+    let a_b_state = tunnel_a
+        .peer_state("10.0.0.2")
+        .map(|s| format!("{s:?}"))
+        .unwrap_or("None".into());
+    let c_b_state = tunnel_c
+        .peer_state("10.0.0.2")
+        .map(|s| format!("{s:?}"))
+        .unwrap_or("None".into());
+    if a_b_state != "Connected" || c_b_state != "Connected" {
+        return Err(NexusError::Internal {
+            message: format!("handshake state mismatch: a_b={a_b_state} c_b={c_b_state}"),
+        });
+    }
+
+    // A 发 ping → C（16B，经 B 转发）
+    let payload = b"ping-from-a-to-c";
+    tunnel_a
+        .send_ip_packet("10.0.0.3", payload)
+        .map_err(|e| NexusError::Internal {
+            message: format!("send: {e}"),
+        })?;
+
+    // 密文泄漏检查：抓取 A→B 链路的 wire 密文，不得含明文载荷与帧头分隔符
+    let wire_ab = b_recv.lock().unwrap().clone();
+    let leak_marker = payload.as_slice();
+    let wire_plaintext_leak = wire_ab.windows(leak_marker.len()).any(|w| w == leak_marker)
+        || wire_ab.windows(2).any(|w| w == b"->");
+
+    // B 收（解密 seq0，转发给 C 时重加密）
+    let b_delivered = tunnel_b
+        .recv_and_deliver(&mut buf)
+        .map_err(|e| NexusError::Internal {
+            message: format!("b recv: {e}"),
+        })?;
+    if b_delivered.is_none() {
+        return Err(NexusError::Internal {
+            message: "B did not receive A frame".to_string(),
+        });
+    }
+    let b_bytes_forwarded = tunnel_b
+        .peer_stats("10.0.0.3")
+        .map(|s| s.bytes_forwarded)
+        .unwrap_or(0);
+
+    // C 收（解密，写 VPI）
+    let c_delivered = tunnel_c
+        .recv_and_deliver(&mut buf)
+        .map_err(|e| NexusError::Internal {
+            message: format!("c recv: {e}"),
+        })?;
+    let c_vpi_len = c_delivered.map(|(_, l)| l).unwrap_or(0);
+    let c_vpi_payload = String::from_utf8_lossy(&c_vpi_sent.lock().unwrap()).to_string();
+    if c_vpi_payload != "ping-from-a-to-c" {
+        return Err(NexusError::Internal {
+            message: format!("C VPI payload mismatch: {c_vpi_payload:?}"),
+        });
+    }
+
+    // 防重放：重放 A→B 同一密文帧 → B 拒绝（REPLAY_REJECTED）
+    b_recv.lock().unwrap().extend_from_slice(&wire_ab);
+    let replay_err = tunnel_b.recv_and_deliver(&mut buf);
+    let replay_rejected = matches!(
+        replay_err,
+        Err(nexus_connectivity::ConnectivityError::Invalid { ref message })
+            if message.contains("REPLAY_REJECTED")
+    );
+    if !replay_rejected {
+        return Err(NexusError::Internal {
+            message: format!("replay frame was not rejected: {replay_err:?}"),
+        });
+    }
+
+    Ok(json!({
+        "verdict": "PASS",
+        "command": "virtual subnet encrypted 3node",
+        "c_vpi_payload": c_vpi_payload,
+        "c_vpi_len": c_vpi_len,
+        "b_bytes_forwarded": b_bytes_forwarded,
+        "a_encrypted": a_encrypted,
+        "b_encrypted": b_encrypted,
+        "c_encrypted": c_encrypted,
+        "a_b_state": a_b_state,
+        "c_b_state": c_b_state,
+        "wire_plaintext_leak": wire_plaintext_leak,
+        "replay_rejected": replay_rejected,
+    }))
+}
+
 fn enc_err(e: nexus_connectivity::encryption::EncryptionError) -> NexusError {
     NexusError::Internal {
         message: format!("link encryption failed: {e}"),
