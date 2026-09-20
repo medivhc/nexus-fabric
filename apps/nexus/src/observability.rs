@@ -9,6 +9,7 @@
 //! 当前未就绪示例：connectivity trace）。
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::{OnceLock, RwLock};
 
 use nexus_connectivity::{
     ConnectivityState, EstablishmentRequest, LinkActivationEvent, LinkActivator, LinkCandidate,
@@ -58,6 +59,31 @@ fn demo_dns_runtime() -> DnsRuntime {
     )
 }
 
+// ---------- 进程级 DNS 运行时单例 ----------
+//
+// 旧实现：每个 observability 命令都新建一个 DnsRuntime，两次调用之间缓存/调用计数
+// 互不共享。守护进程（nexusd serve）按 HTTP 请求调用这些函数，于是每个 LocalAPI
+// 请求都看到一份全新、互不相干的快照。改为进程级单例：首次访问时惰性初始化，
+// 之后所有命令共享同一份状态，`nexusd status` 多次返回一致（缓存累积、计数累加）。
+//
+// resolve / resolve_exit_binding 需要 &mut self，故取用写锁；读侧快照（cache_snapshot
+// 等）也在同一写锁保护下读取，避免与并发解析竞争。
+
+static DNS_RUNTIME: OnceLock<RwLock<DnsRuntime>> = OnceLock::new();
+
+/// 返回进程级 DNS 运行时单例（惰性初始化一次）。
+fn dns_runtime() -> &'static RwLock<DnsRuntime> {
+    DNS_RUNTIME.get_or_init(|| RwLock::new(demo_dns_runtime()))
+}
+
+/// 取用 DNS 运行时写锁。锁中毒（持锁线程在临界区 panic）映射为类型化 Internal 错误，
+/// 不用 panic/unwrap 表示可恢复失败（见 AGENTS §18）。
+fn dns_runtime_write() -> Result<std::sync::RwLockWriteGuard<'static, DnsRuntime>, NexusError> {
+    dns_runtime().write().map_err(|e| NexusError::Internal {
+        message: format!("dns runtime lock poisoned: {e}"),
+    })
+}
+
 /// `DnsError` -> `NexusError` 映射（PRODUCT §2 DNS_RESOLUTION_FAILED）。
 fn map_dns(err: DnsError) -> NexusError {
     match err {
@@ -81,7 +107,7 @@ fn dns_type_label(t: DnsType) -> &'static str {
 
 /// `dns status`：解析一次示例并报告运行时状态（缓存/负缓存/调用计数/Exit-DNS Binding）。
 pub fn dns_status() -> Result<Value, NexusError> {
-    let mut rt = demo_dns_runtime();
+    let mut rt = dns_runtime_write()?;
     let answer = rt
         .resolve(
             &DnsQuery {
@@ -110,7 +136,7 @@ pub fn dns_status() -> Result<Value, NexusError> {
 
 /// `dns cache`：输出正/负缓存快照明细（挂 DnsRuntime snapshot API）。
 pub fn dns_cache() -> Result<Value, NexusError> {
-    let mut rt = demo_dns_runtime();
+    let mut rt = dns_runtime_write()?;
     rt.resolve(
         &DnsQuery {
             name: "example.com".to_string(),
@@ -754,7 +780,7 @@ pub fn connectivity_links() -> Result<Value, NexusError> {
 
 /// `dns resolve`：解析 example.com 并输出地址/TTL/Exit-DNS Binding。
 pub fn dns_resolve() -> Result<Value, NexusError> {
-    let mut rt = demo_dns_runtime();
+    let mut rt = dns_runtime_write()?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -845,4 +871,78 @@ pub fn workspace_cache() -> Result<Value, NexusError> {
         "sweep_collected": collected,
         "protected_retained": protected_retained,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `dns_runtime()` 必须返回同一个进程级单例（指针恒等），而非每次新建。
+    #[test]
+    fn dns_runtime_singleton_is_identical_across_calls() {
+        let a: *const RwLock<DnsRuntime> = dns_runtime();
+        let b: *const RwLock<DnsRuntime> = dns_runtime();
+        assert_eq!(
+            a, b,
+            "dns_runtime() must return the same process-wide singleton"
+        );
+    }
+
+    /// 行为证明：连续两次 `dns_status()` 共享同一份 DNS 运行时状态。
+    /// 第一次对 example.com 的解析把结果写入单例缓存；第二次同名查询应命中缓存
+    /// （from_cache=true），证明两次调用看到的是同一个 DnsRuntime。若每次都新建
+    /// 运行时（旧 bug），第二次会得到空缓存，from_cache 为 false。
+    #[test]
+    fn dns_status_shares_state_across_calls() {
+        let first = dns_status().expect("dns_status first call");
+        let second = dns_status().expect("dns_status second call");
+
+        assert_eq!(
+            second["from_cache"],
+            json!(true),
+            "second dns_status must hit the singleton's cache (from_cache=true)"
+        );
+        assert!(
+            second["cache_entries"].as_u64().unwrap_or(0) >= 1,
+            "singleton must retain example.com in the positive cache"
+        );
+        assert!(
+            second["resolver_calls"].as_u64().unwrap_or(0) >= 1,
+            "resolver_calls must be accumulated, not reset to a fresh runtime"
+        );
+        // 保持既有 JSON 形态不变。
+        assert_eq!(first["verdict"], json!("PASS"));
+        assert_eq!(second["verdict"], json!("PASS"));
+    }
+
+    /// 持写锁区间内的确定性证明：同一单例上第二次同名解析命中缓存，调用计数不再增长。
+    /// 全程持锁，避免与其它测试线程交错导致计数抖动。
+    #[test]
+    fn singleton_resolve_second_call_hits_cache() {
+        let mut rt = dns_runtime_write().expect("acquire dns runtime write lock");
+        let query = DnsQuery {
+            name: "example.com".to_string(),
+            qtype: DnsType::A,
+        };
+
+        let calls_before = rt.resolver_call_count();
+        rt.resolve(&query, IpPreference::PreferV4, 1000)
+            .expect("first example.com resolve");
+        let calls_after_first = rt.resolver_call_count();
+
+        let second = rt
+            .resolve(&query, IpPreference::PreferV4, 1000)
+            .expect("second example.com resolve");
+        let calls_after_second = rt.resolver_call_count();
+
+        assert!(
+            second.from_cache,
+            "second resolve on the singleton must be a cache hit"
+        );
+        assert_eq!(
+            calls_after_first, calls_after_second,
+            "cache hit must not increment resolver_call_count"
+        );
+        assert!(calls_after_first >= calls_before, "resolve observed");
+    }
 }

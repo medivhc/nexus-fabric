@@ -153,7 +153,11 @@ impl IpPreference {
 ///
 /// P0 由测试与 E4 场景注入内存 mock；真实 UDP/TLS/HTTPS 传输由后续
 /// `Resolver` 实现提供，本 crate 不依赖具体传输。
-pub trait Resolver {
+///
+/// `Send + Sync` 超约束：`DnsRuntime` 会被守护进程在多线程 HTTP 服务中经
+/// 锁共享持有，故底层 resolver 必须可跨线程传递与共享。所有现有实现者均为
+/// 无状态或仅含 Send+Sync 数据的 mock。
+pub trait Resolver: Send + Sync {
     /// 解析查询，返回一组地址；失败保留可诊断错误。
     fn resolve(&mut self, query: &DnsQuery) -> Result<Vec<IpAddr>, DnsError>;
 }
