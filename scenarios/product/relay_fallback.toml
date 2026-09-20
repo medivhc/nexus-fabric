@@ -1,0 +1,101 @@
+schema_version = 1
+id = "product.relay-fallback"
+title = "NAT 打洞失败：RelayChannel 中继回退转发数据完成闭环"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#connectivity"
+
+[given]
+resource = "p2p-relay"
+relay_server = "relay.example.org:9999"
+peer_id = "peer-b"
+topology = "nat-behind-relay"
+fallback_order = "direct-then-relay"
+
+# 可执行 E4：组合根驱动 Direct 打洞 -> 失败 -> Relay 回退 -> 经中继转发数据闭环，输出 JSON。
+[when]
+command = "cargo run --quiet -p nexus --example relay_fallback -- --json"
+
+# 冻结期望：Direct 打洞启动并失败；Relay 连接建立并转发/接收数据；最终链路 = Relay；
+# 中继四元组（server/peer_id/state/字节计数）齐备。
+# 说明：求值器 scenario.rs 已确认布尔 equals（toml_scalar_to_json 处理 Boolean，
+# 且现有 nat_hole_punching.toml / remote_nat_relay_fallback_flow.toml 已实际使用
+# equals = true / equals = false），故按授权加回 hole_punch.success equals = false，
+# 与 hole_punch.reason non_empty 共同锁定"打洞失败"语义。
+# 语法说明：严格 TOML 不允许 [[expect]] 表头后同行续写键值（单行紧凑形式会被
+# toml::from_str 拒绝、load_file 静默丢弃场景），故每个 [[expect]] 展开为多行，
+# 与仓库现有 product 场景风格一致；field 路径与期望值一字未改。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "events.0"
+equals = "direct_hole_punch_started"
+
+[[expect]]
+field = "events.1"
+equals = "direct_hole_punch_failed"
+
+[[expect]]
+field = "events.2"
+equals = "relay_connecting"
+
+[[expect]]
+field = "events.3"
+equals = "relay_connected"
+
+[[expect]]
+field = "events.4"
+equals = "relay_data_forwarded"
+
+[[expect]]
+field = "events.5"
+equals = "relay_data_received"
+
+[[expect]]
+field = "events.6"
+equals = "relay_fallback_completed"
+
+[[expect]]
+field = "hole_punch.attempted"
+equals = true
+
+[[expect]]
+field = "hole_punch.success"
+equals = false
+
+[[expect]]
+field = "hole_punch.reason"
+non_empty = true
+
+[[expect]]
+field = "link.kind"
+equals = "relay"
+
+[[expect]]
+field = "link.direct_attempted"
+equals = true
+
+[[expect]]
+field = "link.direct_failed"
+equals = true
+
+[[expect]]
+field = "relay.server"
+non_empty = true
+
+[[expect]]
+field = "relay.peer_id"
+equals = "peer-b"
+
+[[expect]]
+field = "relay.state"
+equals = "connected"
+
+[[expect]]
+field = "relay.bytes_sent"
+non_empty = true
+
+[[expect]]
+field = "relay.bytes_received"
+non_empty = true

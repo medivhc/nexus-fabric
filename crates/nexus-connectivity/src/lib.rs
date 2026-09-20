@@ -38,6 +38,10 @@ pub const fn module_summary() -> &'static str {
 pub mod nat;
 pub mod virtual_subnet;
 
+// ---------- 中继通道（Relay Fallback Channel） ----------
+
+pub mod relay;
+
 // ---------- 结构化错误（不以日志文本代替错误类型） ----------
 
 /// Connectivity 层的结构化错误（delivery 层自有错误面，不依赖领域错误）。

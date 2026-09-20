@@ -105,6 +105,35 @@ NAT/中继场景的物理建连（组合根 transport::connect）发生在激活
   与 MemoryCarrier（点对点）并存；不引入新 trait，只扩展现成数据面。
 - 不做：动态路由、最短路径、跨子网、加密、真实 TUN。
 
+### 冻结契约（RelayChannel 中继通道 P0，scenarios/product/relay_fallback.toml）
+
+- `RelayConfig { relay_server, peer_id }`：领域中立中继配置（服务器 locator + 对端 peer 标识）；
+  `new(relay_server, peer_id)` / `validate() -> Result<(), ConnectivityError>`（任一字段空 -> `Invalid`）。
+- `RelayState { Disconnected, Connecting, Connected, Failed }`：通道状态机；`Display` 输出
+  `disconnected` / `connecting` / `connected` / `failed`。
+- `RelayStats { bytes_sent, bytes_received, forward_requests }`：单调流量统计（`Default` 归零）。
+- `RelayEvent`：`Connecting{relay_server,peer_id}` / `Connected{relay_server,peer_id}` /
+  `ConnectFailed{relay_server,peer_id,reason}` / `DataForwarded{peer_id,bytes}` /
+  `DataReceived{peer_id,bytes}` / `Closed{peer_id}`（Worker 只发事件）。
+- `trait RelayTransport`：`connect(&mut self, &RelayConfig) -> Result<(), String>` /
+  `forward(&mut self, peer_id, &[u8]) -> Result<(), String>` /
+  `receive(&mut self, peer_id, &mut [u8]) -> Result<usize, String>`；真实 DERP 建连由
+  Composition Root / platform 注入，本层零真实网络。
+- `RelayChannel`：`new(config, Box<dyn RelayTransport>)`（初始 `Disconnected`、事件为空）；
+  - `connect() -> Result<RelayState, ConnectivityError>`：先 `validate`，严格状态机
+    `Disconnected -> Connecting(发 Connecting) -> transport.connect()`；成功 `Connected`（发 Connected），
+    失败 `Failed`（发 ConnectFailed）并返回 `Io{operation:"relay_connect"}`；
+  - `forward(&[u8])` / `receive(&mut [u8])`：仅 `Connected` 允许，否则 `Invalid("relay not connected")`；
+    成功后累加 `bytes_sent` / `bytes_received` / `forward_requests` 并发对应数据事件；
+  - `close()`：回到 `Disconnected` 并发 `Closed` 事件；
+  - `state()` / `stats()` / `events()` / `config()` 只读访问器。
+- `MockRelayTransport`：离线确定性回环替身（`new(connect_result)` / `inject_echo(&[u8])` / `sent()`），
+  供单测与 E4 产品场景驱动，不发起真实网络。
+
+冻结语义：未 `Connected` 不允许 `forward` / `receive`（门控，未建连零数据面）；`connect` 严格走状态机；
+真实中继建连、加密、平台 socket 留 TODO，由 Composition Root / `nexus-platform-*` 完成；
+本骨架为可移植纯 std 实现，不新增第三方依赖、不含 `unsafe`。
+
 ## Verification
 
 最低：
