@@ -562,8 +562,8 @@ loopback 127.0.0.1 起 SS server 端 + 客户端，走真实 `std::net::TcpStrea
   升序输出结果表。
 - 指标：`latency_ms`（±毫秒，未测得为 null）、`status`（`ok` / `timeout` /
   `unreachable` / `dns_failed`）、`probe_kind`（`tcp` / `http204`）、target、时间戳。
-  `tcp`：仅建连级 RTT（connect_timeout）。`http204`：TCP 建连后发送
-  `GET {path} HTTP/1.1` 并等待响应首行 `204 No Content`，计时覆盖建连 +
+  `tcp`：仅建连级 RTT（connect_timeout）。`http204`：TCP 建连后发送单行明文 GET（P0 不做 TLS，target.scheme==https 直接记为 unreachable），
+  `GET {path} HTTP/1.1` 等待响应首行 `204 No Content`，计时覆盖建连 +
   请求发送 + 响应首字返回；非 204 响应或读取超时记为 `unreachable`。
 - 默认探测目标：`http://www.gstatic.com/generate_204`（Clash 惯例）；目标仅
   http/https、默认公网、超时上限 5s（可配）。

@@ -4148,6 +4148,12 @@ impl Default for Http204LatencyProbe {
 impl nexus_measurement::LatencyProbe for Http204LatencyProbe {
     fn probe(&self, target: &nexus_measurement::ProbeTarget) -> Result<LinkMeasurement, String> {
         use std::io::{BufRead, Write};
+        if target.scheme == "https" {
+            return Err(
+                "http204 probe P0 only supports plaintext HTTP target (https not supported)"
+                    .to_string(),
+            );
+        }
         let addr: std::net::SocketAddr = format!("{}:{}", target.host, target.port)
             .parse()
             .map_err(|e| format!("invalid probe address: {e}"))?;
