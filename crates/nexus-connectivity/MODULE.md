@@ -198,6 +198,39 @@ NAT/中继场景的物理建连（组合根 transport::connect）发生在激活
 帧头入 AAD 防篡改；接收方先验 tag 再做防重放；
 本模块保持 portable、零真实网络（真实传输/握手重传/密钥轮换留 TODO），
 仅依赖 ring 0.17（已在依赖树）。
+
+### 冻结契约（Mesh 防火墙规则匹配引擎，scenarios/product/firewall_rules.toml）
+
+- `Protocol { Tcp, Udp, Icmp }`：协议枚举；`as_str()` / `Display` / `FromStr`（小写标签）。
+- `FirewallAction { Allow, Deny }`：规则动作；`as_str()` / `Display`。
+- `FirewallVerdict { Allow, Deny }`：引擎对一个包的最终判定；`as_str()` / `is_allow()` / `Display`。
+- `PortRange { start: u16, end: u16 }`：inclusive 端口范围；
+  - `PortRange::new(start, end) -> Result<Self, FirewallError>`：`start > end` 返回 `InvalidRule`；
+  - `PortRange::single(p)`：单端口；
+  - `contains(u16) -> bool`：inclusive 匹配。
+- `FirewallRule { action, src_ip, dst_ip, src_port, dst_port, protocol }`：
+  五元组子集；任一 `Option` 为 `None` 表示该维通配。
+  - `FirewallRule::new(action, src_ip, dst_ip, src_port, dst_port, protocol) -> Result<Self, FirewallError>`：
+    空字符串规范化为 `None`；预校验 IP/CIDR 合法性。
+  - `FirewallRule::action_only(action)`：纯动作兜底规则。
+  - `src_ip` / `dst_ip` 支持精确 IPv4（`10.0.0.5`）或简化 IPv4 CIDR（`10.0.0.0/24`，按位掩码比较，含非整字节前缀如 `/26`）。
+- `FirewallConfig { default_policy: FirewallAction, rules: Vec<FirewallRule> }`：
+  `new(default_policy, rules) -> Result<Self, FirewallError>`，构造期校验全部规则。
+- `PacketContext { src_ip, dst_ip, src_port, dst_port, protocol }`：进入引擎的包元数据；
+  - `PacketContext::transport(src, dst, src_port, dst_port, protocol)`：TCP/UDP 包；
+  - `PacketContext::control(src, dst)`：ICMP 包（无端口）。
+- `FirewallEngine`：持有已编译规则视图（IP 预解析为内部 `IpEntry`）；
+  - `FirewallEngine::new(&FirewallConfig) -> Result<Self, FirewallError>`；
+  - `evaluate(&self, &PacketContext) -> FirewallVerdict`：按规则顺序 **first-match-wins**；
+    任一已设置维不命中即跳过该规则；全部未命中走 `default_policy`（白名单模式默认 `Deny`）；
+  - `rule_count()` / `default_policy()`：只读访问器。
+- `dns_query_context(src_ip, dns_server_ip) -> PacketContext`：把 DNS 查询映射成
+  `udp/53` 包上下文（演示 DNS 过滤集成点）。
+- `FirewallError { InvalidRule { message } }`：类型化错误面，`Display` + `std::error::Error`。
+
+冻结语义：纯内存、纯同步、纯函数骨架；不接真实 socket/TUN/iptables；不支持 IPv6；
+真实包抓取、conntrack 状态化规则、规则热加载留 TODO；
+本模块保持 portable、零真实网络、无 `unsafe`。
 ## Verification
 
 最低：
