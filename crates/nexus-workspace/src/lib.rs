@@ -18,6 +18,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::path::PathBuf;
 
 use nexus_storage::{ContentStore, ObjectId};
 
@@ -164,6 +165,8 @@ pub enum WorkspaceError {
     RemoteRejected { reason: String },
     /// 响应帧不符合 `OK:HEAD:<id>` / `REJECTED` 协议（不可吞为成功）。
     RemoteProtocol { frame: String },
+    /// 读取或删除不存在的路径（投影通道语义）。
+    NotFound { path: String },
 }
 
 impl fmt::Display for WorkspaceError {
@@ -187,6 +190,7 @@ impl fmt::Display for WorkspaceError {
             Self::RemoteProtocol { frame } => {
                 write!(f, "unrecognized remote workspace frame: {frame:?}")
             }
+            Self::NotFound { path } => write!(f, "path not found: {path}"),
         }
     }
 }
@@ -279,9 +283,16 @@ pub trait WorkspaceAccess {
 /// 原生 API 通道（纯结构化读写，不经文件系统投影）
 ///
 /// 这是兜底通道：任何平台都能用，包括 WASM、嵌入式等无文件系统环境。
+///
+/// 写入操作暂存于 WorkingSet（内存 HashMap），不立即落 Commit；
+/// `commit` 时把 WorkingSet 暂存内容与删除集合落成新 Commit。
 pub struct NativeApiWorkspaceAccess<S: ContentStore> {
     workspace: Workspace<S>,
     provider: WorkspaceAccessProvider,
+    /// 暂存写入：path → content（尚未落 Commit）。
+    staged_writes: HashMap<String, Vec<u8>>,
+    /// 暂存删除：path（标记尚未落 Commit 的删除）。
+    staged_deletes: HashSet<String>,
 }
 
 impl<S: ContentStore> NativeApiWorkspaceAccess<S> {
@@ -290,6 +301,8 @@ impl<S: ContentStore> NativeApiWorkspaceAccess<S> {
         Self {
             workspace,
             provider: WorkspaceAccessProvider::NativeApi,
+            staged_writes: HashMap::new(),
+            staged_deletes: HashSet::new(),
         }
     }
 
@@ -300,46 +313,363 @@ impl<S: ContentStore> NativeApiWorkspaceAccess<S> {
 }
 
 impl<S: ContentStore> WorkspaceAccess for NativeApiWorkspaceAccess<S> {
-    fn read_file(&self, _path: &str) -> Result<Vec<u8>, WorkspaceError> {
-        // TODO: 从当前 head 的 manifest 中读取文件内容
-        // 当前简化：返回不支持的错误，因为我们还没有实现 read_file
-        Err(WorkspaceError::StoreFailure {
-            reason: "read_file not yet implemented for NativeApi".into(),
+    fn read_file(&self, path: &str) -> Result<Vec<u8>, WorkspaceError> {
+        // 暂存删除优先 → NotFound。
+        if self.staged_deletes.contains(path) {
+            return Err(WorkspaceError::NotFound {
+                path: path.to_string(),
+            });
+        }
+        // 暂存写入优先 → 返回 WorkingSet 内容。
+        if let Some(content) = self.staged_writes.get(path) {
+            return Ok(content.clone());
+        }
+        // 否则从当前 Head Manifest 经 ContentStore 读取。
+        match self.workspace.read_from_head(path)? {
+            Some(bytes) => Ok(bytes),
+            None => Err(WorkspaceError::NotFound {
+                path: path.to_string(),
+            }),
+        }
+    }
+
+    fn write_file(&mut self, path: &str, content: &[u8]) -> Result<(), WorkspaceError> {
+        self.staged_writes
+            .insert(path.to_string(), content.to_vec());
+        self.staged_deletes.remove(path);
+        Ok(())
+    }
+
+    fn list_dir(&self, path: &str) -> Result<Vec<DirEntry>, WorkspaceError> {
+        // 获取当前 Head Manifest 的所有路径。
+        let head_paths = self.workspace.list_head_paths()?;
+
+        // 合并 WorkingSet：从 head_paths 构建初始集合。
+        let mut merged: HashMap<String, u64> = HashMap::new();
+        for p in &head_paths {
+            // 不读取内容来计算大小——在 NativeApi 通道中，
+            // 我们从 store 读取来获取大小（但为了性能，我们只列文件名）。
+            if !self.staged_deletes.contains(p) {
+                // 对于已提交文件，尝试读取大小。
+                if let Some(bytes) = self.workspace.read_from_head(p)? {
+                    merged.insert(p.clone(), bytes.len() as u64);
+                }
+            }
+        }
+
+        // 应用暂存写入。
+        for (p, content) in &self.staged_writes {
+            merged.insert(p.clone(), content.len() as u64);
+        }
+
+        // 移除暂存删除。
+        for p in &self.staged_deletes {
+            merged.remove(p);
+        }
+
+        // 过滤出以指定 path 为前缀的条目。
+        let prefix = if path.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", path)
+        };
+
+        let mut entries: Vec<DirEntry> = merged
+            .keys()
+            .filter(|p| p.starts_with(&prefix))
+            .map(|p| {
+                let relative = p.strip_prefix(&prefix).unwrap_or(p);
+                // 判断是否是目录（存在子路径以它为前缀）。
+                let is_dir = merged.keys().any(|q| q.starts_with(&format!("{}/", p)));
+                let size = if is_dir { None } else { merged.get(p).copied() };
+                DirEntry {
+                    path: relative.to_string(),
+                    is_dir,
+                    size,
+                }
+            })
+            .collect();
+
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(entries)
+    }
+
+    fn delete(&mut self, path: &str) -> Result<(), WorkspaceError> {
+        // 检查是否存在（在 WorkingSet 或已提交内容中）。
+        let exists = self.staged_writes.contains_key(path)
+            || self.staged_deletes.contains(path)
+            || self.workspace.read_from_head(path)?.is_some();
+        if !exists {
+            return Err(WorkspaceError::NotFound {
+                path: path.to_string(),
+            });
+        }
+        self.staged_writes.remove(path);
+        self.staged_deletes.insert(path.to_string());
+        Ok(())
+    }
+
+    fn commit(&mut self, _message: &str) -> Result<CommitId, WorkspaceError> {
+        // 如果没有暂存变更，返回当前 Head。
+        if self.staged_writes.is_empty() && self.staged_deletes.is_empty() {
+            return self
+                .workspace
+                .heads()
+                .heads
+                .first()
+                .cloned()
+                .ok_or_else(|| WorkspaceError::StoreFailure {
+                    reason: "no head to commit".into(),
+                });
+        }
+
+        let head = self.workspace.heads().heads[0].clone();
+        let writes: Vec<Change> = self
+            .staged_writes
+            .iter()
+            .map(|(path, content)| Change {
+                path: path.clone(),
+                content: content.clone(),
+            })
+            .collect();
+        let deletes: Vec<String> = self.staged_deletes.iter().cloned().collect();
+
+        let new_head = self
+            .workspace
+            .commit_with_deletes(&head, &writes, &deletes)?;
+
+        // 清空 WorkingSet。
+        self.staged_writes.clear();
+        self.staged_deletes.clear();
+
+        Ok(new_head)
+    }
+
+    fn head(&self) -> Option<&CommitId> {
+        self.workspace.heads().heads.first()
+    }
+
+    fn provider_type(&self) -> WorkspaceAccessProvider {
+        self.provider
+    }
+}
+
+/// 物化目录通道（把 Workspace 当前 Head 物化到本地文件系统目录）
+///
+/// 无 Mount 环境下的投影通道：构造时把当前 Head 的全部文件物化到本地目录；
+/// 读写操作直接走本地 FS；`commit` 时扫描差异落回 Workspace。
+pub struct MaterializedDirectoryAccess<S: ContentStore> {
+    workspace: Workspace<S>,
+    dir: PathBuf,
+    /// 物化时的路径快照（用于 commit 时计算删除差异）。
+    materialized_paths: HashSet<String>,
+    provider: WorkspaceAccessProvider,
+}
+
+impl<S: ContentStore> MaterializedDirectoryAccess<S> {
+    /// 构造并物化：把 `workspace` 当前 Head 的全部文件写入 `dir`。
+    ///
+    /// 递归创建子目录；已存在的文件会被覆盖。
+    pub fn materialize(workspace: Workspace<S>, dir: PathBuf) -> Result<Self, WorkspaceError> {
+        // 创建根目录。
+        std::fs::create_dir_all(&dir).map_err(|e| WorkspaceError::StoreFailure {
+            reason: format!("create dir {}: {e}", dir.display()),
+        })?;
+
+        // 读取当前 Head 的所有路径。
+        let paths = workspace.list_head_paths()?;
+        let mut materialized_paths = HashSet::new();
+
+        for path in &paths {
+            let content =
+                workspace
+                    .read_from_head(path)?
+                    .ok_or_else(|| WorkspaceError::MissingObject {
+                        id: ObjectId(path.clone()),
+                    })?;
+            let file_path = dir.join(path);
+            if let Some(parent) = file_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| WorkspaceError::StoreFailure {
+                    reason: format!("create parent {}: {e}", parent.display()),
+                })?;
+            }
+            std::fs::write(&file_path, &content).map_err(|e| WorkspaceError::StoreFailure {
+                reason: format!("write {}: {e}", file_path.display()),
+            })?;
+            materialized_paths.insert(path.clone());
+        }
+
+        Ok(Self {
+            workspace,
+            dir,
+            materialized_paths,
+            provider: WorkspaceAccessProvider::MaterializedDirectory,
+        })
+    }
+
+    /// 消费通道，拿回 Workspace 与目录路径。
+    pub fn into_parts(self) -> (Workspace<S>, PathBuf) {
+        (self.workspace, self.dir)
+    }
+
+    /// 递归扫描目录，收集所有相对路径文件。
+    fn scan_dir(&self) -> Result<HashSet<String>, WorkspaceError> {
+        let mut paths = HashSet::new();
+        self.scan_recursive(&self.dir, "", &mut paths)?;
+        Ok(paths)
+    }
+
+    fn scan_recursive(
+        &self,
+        base: &PathBuf,
+        prefix: &str,
+        out: &mut HashSet<String>,
+    ) -> Result<(), WorkspaceError> {
+        let entries = std::fs::read_dir(base).map_err(|e| WorkspaceError::StoreFailure {
+            reason: format!("read dir {}: {e}", base.display()),
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|e| WorkspaceError::StoreFailure {
+                reason: format!("dir entry: {e}"),
+            })?;
+            let path = entry.path();
+            let rel = if prefix.is_empty() {
+                entry.file_name().to_string_lossy().to_string()
+            } else {
+                format!("{}/{}", prefix, entry.file_name().to_string_lossy())
+            };
+            if path.is_dir() {
+                self.scan_recursive(&path, &rel, out)?;
+            } else {
+                out.insert(rel);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<S: ContentStore> WorkspaceAccess for MaterializedDirectoryAccess<S> {
+    fn read_file(&self, path: &str) -> Result<Vec<u8>, WorkspaceError> {
+        let file_path = self.dir.join(path);
+        std::fs::read(&file_path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                WorkspaceError::NotFound {
+                    path: path.to_string(),
+                }
+            } else {
+                WorkspaceError::StoreFailure {
+                    reason: format!("read {}: {e}", file_path.display()),
+                }
+            }
         })
     }
 
     fn write_file(&mut self, path: &str, content: &[u8]) -> Result<(), WorkspaceError> {
-        // TODO: 写入到 WorkingSet
-        // 当前简化：返回不支持的错误
-        let _ = (path, content);
-        Err(WorkspaceError::StoreFailure {
-            reason: "write_file not yet implemented for NativeApi".into(),
-        })
+        let file_path = self.dir.join(path);
+        if let Some(parent) = file_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| WorkspaceError::StoreFailure {
+                reason: format!("create parent {}: {e}", parent.display()),
+            })?;
+        }
+        std::fs::write(&file_path, content).map_err(|e| WorkspaceError::StoreFailure {
+            reason: format!("write {}: {e}", file_path.display()),
+        })?;
+        Ok(())
     }
 
     fn list_dir(&self, path: &str) -> Result<Vec<DirEntry>, WorkspaceError> {
-        // TODO: 列出目录内容
-        // 当前简化：返回空列表
-        let _ = path;
-        Ok(Vec::new())
+        let dir_path = if path.is_empty() {
+            self.dir.clone()
+        } else {
+            self.dir.join(path)
+        };
+        let entries = std::fs::read_dir(&dir_path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                WorkspaceError::NotFound {
+                    path: path.to_string(),
+                }
+            } else {
+                WorkspaceError::StoreFailure {
+                    reason: format!("read dir {}: {e}", dir_path.display()),
+                }
+            }
+        })?;
+
+        let mut result = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| WorkspaceError::StoreFailure {
+                reason: format!("dir entry: {e}"),
+            })?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            let metadata = entry.metadata().map_err(|e| WorkspaceError::StoreFailure {
+                reason: format!("metadata: {e}"),
+            })?;
+            let is_dir = metadata.is_dir();
+            let size = if is_dir { None } else { Some(metadata.len()) };
+            result.push(DirEntry {
+                path: name,
+                is_dir,
+                size,
+            });
+        }
+        result.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(result)
     }
 
     fn delete(&mut self, path: &str) -> Result<(), WorkspaceError> {
-        // TODO: 删除文件/目录
-        // 当前简化：返回不支持的错误
-        let _ = path;
-        Err(WorkspaceError::StoreFailure {
-            reason: "delete not yet implemented for NativeApi".into(),
+        let file_path = self.dir.join(path);
+        std::fs::remove_file(&file_path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                WorkspaceError::NotFound {
+                    path: path.to_string(),
+                }
+            } else {
+                WorkspaceError::StoreFailure {
+                    reason: format!("delete {}: {e}", file_path.display()),
+                }
+            }
         })
     }
 
-    fn commit(&mut self, message: &str) -> Result<CommitId, WorkspaceError> {
-        // TODO: 提交变更
-        // 当前简化：返回不支持的错误
-        let _ = message;
-        Err(WorkspaceError::StoreFailure {
-            reason: "commit not yet implemented for NativeApi".into(),
-        })
+    fn commit(&mut self, _message: &str) -> Result<CommitId, WorkspaceError> {
+        // 扫描当前目录文件。
+        let current_paths = self.scan_dir()?;
+
+        // 计算差异：
+        // - 新增/修改：current_paths 中的文件，读取内容构建 Change。
+        // - 删除：materialized_paths 中有但 current_paths 中没有的。
+        let mut writes: Vec<Change> = Vec::new();
+        let mut deletes: Vec<String> = Vec::new();
+
+        for path in &current_paths {
+            let file_path = self.dir.join(path);
+            let content = std::fs::read(&file_path).map_err(|e| WorkspaceError::StoreFailure {
+                reason: format!("read {}: {e}", file_path.display()),
+            })?;
+            writes.push(Change {
+                path: path.clone(),
+                content,
+            });
+        }
+
+        for path in &self.materialized_paths {
+            if !current_paths.contains(path) {
+                deletes.push(path.clone());
+            }
+        }
+
+        let head = self.workspace.heads().heads[0].clone();
+        let new_head = if writes.is_empty() && deletes.is_empty() {
+            head
+        } else {
+            self.workspace
+                .commit_with_deletes(&head, &writes, &deletes)?
+        };
+
+        // 更新物化快照。
+        self.materialized_paths = current_paths;
+
+        Ok(new_head)
     }
 
     fn head(&self) -> Option<&CommitId> {
@@ -372,6 +702,11 @@ impl Manifest {
         }
         self.entries.push((path, id));
         self.entries.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+
+    /// 移除路径条目（如果存在）。
+    fn remove(&mut self, path: &str) {
+        self.entries.retain(|(p, _)| p != path);
     }
 
     /// 相对 `base` 的增量：本 Manifest 中与 base 不同的所有路径。
@@ -805,6 +1140,98 @@ impl<S: ContentStore> Workspace<S> {
     ) -> Result<CommitId, WorkspaceError> {
         let id = self.journal_pending(parent, changes)?;
         self.commit_pending(&id)
+    }
+
+    /// 带删除的离线写入：写前登记 + 完成提交，支持同时写入和删除路径。
+    ///
+    /// `writes` 中的路径会被写入或覆盖；`deletes` 中的路径会从新 Manifest 移除。
+    /// 其余语义与 `commit_changes` 相同。
+    pub fn commit_with_deletes(
+        &mut self,
+        parent: &CommitId,
+        writes: &[Change],
+        deletes: &[String],
+    ) -> Result<CommitId, WorkspaceError> {
+        let parent_commit = self
+            .commits
+            .get(parent)
+            .ok_or_else(|| WorkspaceError::UnknownCommit { id: parent.clone() })?;
+        let mut manifest = self.load_manifest(&parent_commit.root_manifest_id)?;
+        for change in writes {
+            let oid = self
+                .store
+                .put(&change.content)
+                .map_err(|reason| WorkspaceError::StoreFailure { reason })?;
+            manifest.set(change.path.clone(), oid);
+        }
+        for path in deletes {
+            manifest.remove(path);
+        }
+        let root_manifest_id = self
+            .store
+            .put(&manifest.to_bytes())
+            .map_err(|reason| WorkspaceError::StoreFailure { reason })?;
+        let id = self.next_commit_id();
+        let head_action = if self.heads.contains(parent) {
+            HeadAction::Replace(parent.clone())
+        } else {
+            HeadAction::Add
+        };
+        self.journal.push(JournalEntry {
+            commit_id: id.clone(),
+            parents: vec![parent.clone()],
+            root_manifest_id,
+            head_action,
+        });
+        // 写前日志：marker 先落盘，然后立即完成提交（marker 清除）。
+        self.persist_state()?;
+        self.commit_pending(&id)
+    }
+
+    /// 从当前 Head 的 Manifest 读取文件内容。
+    ///
+    /// 返回 `Ok(None)` 表示路径不存在于当前 Head。
+    pub fn read_from_head(&self, path: &str) -> Result<Option<Vec<u8>>, WorkspaceError> {
+        let head = self
+            .heads
+            .heads
+            .first()
+            .ok_or_else(|| WorkspaceError::StoreFailure {
+                reason: "no head commit".into(),
+            })?;
+        let commit = self
+            .commits
+            .get(head)
+            .ok_or_else(|| WorkspaceError::UnknownCommit { id: head.clone() })?;
+        let manifest = self.load_manifest(&commit.root_manifest_id)?;
+        match manifest.get(path) {
+            Some(oid) => {
+                let bytes = self
+                    .store
+                    .get(oid)
+                    .map_err(|reason| WorkspaceError::StoreFailure { reason })?
+                    .ok_or_else(|| WorkspaceError::MissingObject { id: oid.clone() })?;
+                Ok(Some(bytes))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// 列出当前 Head Manifest 中的所有文件路径。
+    pub fn list_head_paths(&self) -> Result<Vec<String>, WorkspaceError> {
+        let head = self
+            .heads
+            .heads
+            .first()
+            .ok_or_else(|| WorkspaceError::StoreFailure {
+                reason: "no head commit".into(),
+            })?;
+        let commit = self
+            .commits
+            .get(head)
+            .ok_or_else(|| WorkspaceError::UnknownCommit { id: head.clone() })?;
+        let manifest = self.load_manifest(&commit.root_manifest_id)?;
+        Ok(manifest.entries.iter().map(|(p, _)| p.clone()).collect())
     }
 
     /// 冷启动日志回放（AGENTS.md §15）：对 journal 中每个 marker，
