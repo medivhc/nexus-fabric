@@ -14,6 +14,8 @@
 
 /// CLI 前端 ControlService（17 命令接线 + --json 双输出 + exit 语义）。
 pub mod control_service;
+/// nexusd serve LocalAPI 瘦客户端（裸 TCP HTTP GET，CLI 不再进程内装配 SDK）。
+pub mod localapi_client;
 /// §9 可观察性命令（status / plan explain / session watch / connectivity status /
 /// dns status / dns cache / platform capabilities），见 PRODUCT.md#9-observability。
 pub mod observability;

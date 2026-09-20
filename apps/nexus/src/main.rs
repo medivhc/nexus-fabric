@@ -1,20 +1,35 @@
-//! nexus — 用户 CLI 前端。
+//! nexus — 用户 CLI 前端（瘦客户端模式）。
 //!
-//! 仅负责：参数解析 → 构造 `ControlCommand` → 调用 `ControlService` → 渲染结构化输出。
-//! 全部 17 个 §9 观察命令直接路由到 `nexus::observability` SDK 快照（与 nexusd 同源，
-//! 不复制领域逻辑）；领域未就绪命令（如 connectivity trace）返回结构化 `Unsupported`
+//! 职责：参数解析 → 构造 `ControlCommand` → 通过 [`nexus::localapi_client`] 向
+//! `nexusd serve` 的 HTTP LocalAPI 发裸 GET → 渲染结构化输出。
+//!
+//! 对有 LocalAPI 路由的 7 个观察命令（status / dns status / dns cache / session watch /
+//! plan explain / connectivity status / platform capabilities），CLI 不进程内装配 SDK，
+//! 而是把 daemon 返回的 JSON 原文渲染（--json 原样 / 默认人读投影）。
+//!
+//! 对暂无 daemon 路由的命令（dns resolve/providers、connectivity candidates/probe/links、
+//! workspace heads/conflicts/cache、compute jobs、diagnose），CLI 本地合成
+//! `UNSUPPORTED` FAIL JSON（与 nexusd 兜底同形），不回退到进程内 observability
 //! （PRODUCT §9 禁止静默降级）。
+//!
+//! `run <resource>` 仍走进程内 SDK 路径（LocalAPI 无对应路由）。
 
 #![forbid(unsafe_code)]
 
 use nexus::control_service::{ControlServiceImpl, render_text};
+use nexus::localapi_client::{self, DEFAULT_LOCALAPI_ADDR};
 use nexus_control_api::{ControlCommand, ResourceId, SessionId};
+use serde_json::Value;
 
 const USAGE: &str = "\
-nexus — Nexus 统一 Resource Fabric 控制面 CLI
+nexus — Nexus 统一 Resource Fabric 控制面 CLI（瘦客户端）
 
 用法:
-  nexus [--json] <command> [args]
+  nexus [--json] [--addr <ip:port>] <command> [args]
+
+全局选项:
+  --json        原样打印 daemon 返回 JSON（机器可读，stderr 静默）。
+  --addr <host:port>   nexusd serve LocalAPI 地址（默认 127.0.0.1:18080）。
 
 命令:
   status                                  总体状态
@@ -30,20 +45,20 @@ nexus — Nexus 统一 Resource Fabric 控制面 CLI
   dns cache                               DNS 缓存
   workspace heads <workspace>             Workspace Head Set
   workspace conflicts <workspace>         未合并冲突
-  workspace cache <workspace>             Workspace 缓存状态
+  workspace cache <workspace>            Workspace 缓存状态
   compute jobs                            Compute 任务
   diagnose                                统一诊断
   platform capabilities                   平台能力清单
-  run <resource>                          执行远程资源访问
+  run <resource>                          执行远程资源访问（进程内 SDK）
   help / --help                           显示本帮助
 
-输出:
-  --json        原样打印 observability 快照 JSON（机器可读，stderr 静默）。
-  默认          渲染人读文本视图（JSON 的字段投影）。
+前置条件:
+  观察命令需要先在另一个终端启动 `nexusd serve --addr <ip:port>`。
+  daemon 未运行时，CLI 输出 DAEMON_UNREACHABLE FAIL JSON（exit 0）。
 
 exit 语义（对齐 nexusd）:
-  0             业务成功；NexusError 领域拒绝（verdict=FAIL，请求已被处理）。
-  2             用法/解析错误（缺参、未知命令）。
+  0             业务结果（含 verdict=FAIL / daemon 不可达，请求已被处理）。
+  2             用法/解析错误（缺参、未知命令、--socket 在本构建不可用）。
 ";
 
 fn main() {
@@ -60,8 +75,47 @@ fn split_json_flag(args: &[String]) -> (bool, Vec<String>) {
     (json_mode, rest)
 }
 
+/// 剥离全局 `--addr <ip:port>`；遇 `--socket` 报错（本构建不支持 socket 传输）。
+/// 返回 (addr, 剩余 args)。
+fn extract_transport_flags(args: &[String]) -> Result<(String, Vec<String>), String> {
+    let mut addr = DEFAULT_LOCALAPI_ADDR.to_string();
+    let mut rest = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--addr" => {
+                let value = args
+                    .get(i + 1)
+                    .filter(|v| !v.starts_with("--"))
+                    .ok_or_else(|| "missing value for --addr".to_string())?;
+                addr = value.clone();
+                i += 2;
+            }
+            "--socket" => {
+                return Err(
+                    "--socket transport is not available in this build; use --addr <ip:port> (TCP loopback)"
+                        .to_string(),
+                );
+            }
+            other => {
+                rest.push(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    Ok((addr, rest))
+}
+
 fn run(args: &[String]) -> i32 {
-    let (json_mode, args) = split_json_flag(args);
+    let (addr, args) = match extract_transport_flags(args) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            eprint!("{USAGE}");
+            return 2;
+        }
+    };
+    let (json_mode, args) = split_json_flag(&args);
 
     if args.is_empty() || matches!(args[0].as_str(), "help" | "--help" | "-h") {
         print!("{USAGE}");
@@ -77,30 +131,66 @@ fn run(args: &[String]) -> i32 {
         }
     };
 
-    let service = ControlServiceImpl;
-    match service.snapshot(&command) {
-        Ok(json) => {
+    // Run 保持进程内 SDK 路径（LocalAPI 无对应路由）。
+    if matches!(command, ControlCommand::Run { .. }) {
+        let service = ControlServiceImpl;
+        return match service.snapshot(&command) {
+            Ok(json) => render_and_exit(&json, json_mode),
+            Err(err) => {
+                if json_mode {
+                    println!("{}", service.error_to_json(&err));
+                } else {
+                    eprintln!("error: {err}");
+                }
+                0
+            }
+        };
+    }
+
+    // 有 daemon 路由 → 裸 HTTP GET；无路由 → 本地合成 UNSUPPORTED。
+    match localapi_client::route_for(&command) {
+        Some(path) => query_daemon(&addr, path, json_mode),
+        None => {
+            let json = localapi_client::unsupported_json(&command);
+            render_and_exit(&json, json_mode)
+        }
+    }
+}
+
+/// 向 daemon 发一次 GET，解析 body JSON，按模式渲染。
+fn query_daemon(addr: &str, path: &str, json_mode: bool) -> i32 {
+    match localapi_client::http_get(addr, path) {
+        Ok(body) => match serde_json::from_str::<Value>(&body) {
+            Ok(json) => render_and_exit(&json, json_mode),
+            Err(e) => {
+                // daemon 返回了无法解析为 JSON 的 body：结构化 FAIL（exit 0）。
+                let json = localapi_client::bad_response_json(addr, &e.to_string());
+                render_and_exit(&json, json_mode)
+            }
+        },
+        Err(e) => {
+            // 连接失败：--json 打结构化 FAIL JSON 到 stdout（exit 0）；人读打 stderr。
             if json_mode {
-                // --json：快照 JSON 原样打到 stdout，stderr 静默。
+                let json = localapi_client::unreachable_json(addr, &e.to_string());
                 println!("{json}");
             } else {
-                for line in render_text(&json) {
-                    println!("{line}");
-                }
-            }
-            0
-        }
-        Err(err) => {
-            // 领域拒绝：--json 下输出结构化 FAIL JSON（exit 0 = 请求已被处理）；
-            // 人读模式打到 stderr。与 nexusd print_json_result 一致。
-            if json_mode {
-                println!("{}", service.error_to_json(&err));
-            } else {
-                eprintln!("error: {err}");
+                eprintln!("error: {e}");
             }
             0
         }
     }
+}
+
+/// 按输出模式渲染 JSON：--json 原样打 stdout；人读走 `render_text` 投影。
+fn render_and_exit(json: &Value, json_mode: bool) -> i32 {
+    if json_mode {
+        println!("{json}");
+    } else {
+        for line in render_text(json) {
+            println!("{line}");
+        }
+    }
+    0
 }
 
 fn parse_command(args: &[String]) -> Result<ControlCommand, String> {
@@ -267,7 +357,7 @@ mod tests {
 
     #[test]
     fn usage_error_exits_2_on_missing_arg() {
-        // 用法/解析错误走 parse_command 错误路径 -> exit 2。
+        // 用法/解析错误走 parse_command 错误路径 -> exit 2（不触网）。
         let code = run_str(&["plan", "explain"]);
         assert_eq!(code, 2);
     }
@@ -276,5 +366,49 @@ mod tests {
     fn help_exits_0() {
         assert_eq!(run_str(&[]), 0);
         assert_eq!(run_str(&["help"]), 0);
+    }
+
+    #[test]
+    fn addr_flag_extracts_value_and_leaves_command() {
+        let args = vec![
+            "--addr".to_string(),
+            "127.0.0.1:9999".to_string(),
+            "status".to_string(),
+        ];
+        let (addr, rest) = extract_transport_flags(&args).unwrap();
+        assert_eq!(addr, "127.0.0.1:9999");
+        assert_eq!(rest, vec!["status".to_string()]);
+    }
+
+    #[test]
+    fn addr_defaults_to_loopback() {
+        let args = vec!["status".to_string()];
+        let (addr, rest) = extract_transport_flags(&args).unwrap();
+        assert_eq!(addr, DEFAULT_LOCALAPI_ADDR);
+        assert_eq!(rest, vec!["status".to_string()]);
+    }
+
+    #[test]
+    fn socket_flag_is_rejected() {
+        let args = vec!["--socket".to_string(), "/tmp/nexusd.sock".to_string()];
+        let err = extract_transport_flags(&args).unwrap_err();
+        assert!(err.contains("--socket"));
+        // 端到端：--socket 必须 exit 2（用法错误），且不触网。
+        assert_eq!(run_str(&["--socket", "/tmp/nexusd.sock", "status"]), 2);
+    }
+
+    #[test]
+    fn status_with_no_daemon_exits_0_with_fail_json() {
+        // 没有 daemon 在 18080 上：--json 模式输出 DAEMON_UNREACHABLE FAIL JSON 到 stdout，
+        // exit 0（请求已被处理，只是连不上）。
+        let code = run_str(&["--json", "status"]);
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn unsupported_command_synthesizes_local_fail_json() {
+        // connectivity candidates 无 daemon 路由：本地合成 UNSUPPORTED，不触网。
+        let code = run_str(&["--json", "connectivity", "candidates"]);
+        assert_eq!(code, 0);
     }
 }
