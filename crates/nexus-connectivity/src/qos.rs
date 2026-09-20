@@ -529,4 +529,65 @@ mod tests {
         let b = c.now();
         assert!(b >= a);
     }
+    #[test]
+    fn clock_rollback_does_not_grant_extra_tokens() {
+        let limit = BandwidthLimit::new(1000, 1000).unwrap();
+        let mut bucket = TokenBucket::new(&limit);
+
+        // 消耗 800，剩 200。
+        assert!(bucket.try_consume(800, Duration::ZERO));
+        assert_eq!(bucket.remaining_tokens(), 200);
+        // 推进到 0.5s：按 1000 B/s 补 500 -> 700，last_refill=0.5s。
+        bucket.refill(Duration::from_millis(500));
+        assert_eq!(bucket.remaining_tokens(), 700);
+
+        // 时钟回退到 0.1s（< last_refill=0.5s）：refill 保守地不补充、也不改 last_refill。
+        bucket.refill(Duration::from_millis(100));
+        // 钉住真实行为：回退不导致多给令牌（仍为 700）。
+        assert_eq!(bucket.remaining_tokens(), 700);
+        // 回退后再正向推进到 0.6s：从 last_refill=0.5s 起算 0.1s 补 100 -> 800。
+        bucket.refill(Duration::from_millis(600));
+        assert_eq!(bucket.remaining_tokens(), 800);
+    }
+
+    #[test]
+    fn burst_size_one_allows_only_single_byte_then_recovers() {
+        let limit = BandwidthLimit::new(100, 1).unwrap();
+        let mut bucket = TokenBucket::new(&limit);
+        // 初始 burst=1：只够 1 字节。
+        assert!(bucket.try_consume(1, Duration::ZERO));
+        // 同刻第 2 字节被拒。
+        assert!(!bucket.try_consume(1, Duration::ZERO));
+        assert_eq!(bucket.remaining_tokens(), 0);
+        // 推进 1 秒：rate=100 B/s 补 100，但封顶 burst=1 -> 仍只有 1 字节。
+        bucket.refill(Duration::from_secs(1));
+        assert_eq!(bucket.remaining_tokens(), 1);
+        assert!(bucket.try_consume(1, Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn zero_byte_consume_always_allowed_and_spends_nothing() {
+        let limit = BandwidthLimit::new(1000, 1000).unwrap();
+        let mut bucket = TokenBucket::new(&limit);
+        let before = bucket.remaining_tokens();
+        // 请求 0 字节：放行且不消耗令牌。
+        assert!(bucket.try_consume(0, Duration::ZERO));
+        assert_eq!(bucket.remaining_tokens(), before);
+        // 跨越时间后再请求 0 字节同样放行，令牌不变。
+        assert!(bucket.try_consume(0, Duration::from_millis(500)));
+        assert_eq!(bucket.remaining_tokens(), before);
+    }
+
+    #[test]
+    fn oversize_packet_is_rejected_as_whole_and_spends_nothing() {
+        let limit = BandwidthLimit::new(1000, 1000).unwrap();
+        let mut bucket = TokenBucket::new(&limit);
+        // 消耗到剩 200。
+        assert!(bucket.try_consume(800, Duration::ZERO));
+        assert_eq!(bucket.remaining_tokens(), 200);
+        // 单包请求 500 > 剩余 200：整包被拒，不按比例扣减。
+        assert!(!bucket.try_consume(500, Duration::ZERO));
+        // 令牌保持 200 不变。
+        assert_eq!(bucket.remaining_tokens(), 200);
+    }
 }
