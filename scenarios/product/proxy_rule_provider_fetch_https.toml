@@ -1,0 +1,41 @@
+schema_version = 1
+id = "product.proxy-rule-provider-fetch-https"
+title = "rule-providers https 在线拉取：本地 TLS server 驱动真实 CachedHttpProviderFetcher"
+evidence_strength = "E5"
+requirement = "PRODUCT.md#11-proxy-kernel"
+
+[given]
+command = "rule-providers https url fetch"
+provider_fetcher = "CachedHttpProviderFetcher with injected TLS root (rcgen self-signed)"
+network = "offline loopback (local rustls TLS server, no public internet)"
+
+# 可执行 E5：example 起本地 rustls TLS server（rcgen 自签证书）提供 provider
+# 文本，注入自签 CA 为 root store 的 CachedHttpProviderFetcher 以
+# https://127.0.0.1:<port>/provider.txt 拉取；断言 source=Online、行内容与
+# server 返回一致、缓存文件已落盘（离线确定性闭环，不经公网）。
+[when]
+command = "cargo run --quiet -p nexus --example proxy_rule_provider_fetch_https -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "proxy rule-provider https fetch"
+
+[[expect]]
+field = "fetched_source"
+equals = "Online"
+
+[[expect]]
+field = "line_count"
+equals = 2
+
+[[expect]]
+field = "first_line"
+equals = "example.com"
+
+[[expect]]
+field = "cache_written"
+equals = true
