@@ -1,4 +1,4 @@
-﻿//! nexus-connectivity
+//! nexus-connectivity
 //!
 //! 提供 Connectivity Evaluation、Link Establishment、NAT Traversal、Hole Punching、
 //! Assisted/Relay Fallback 与 Link State。
@@ -41,6 +41,10 @@ pub mod virtual_subnet;
 // ---------- 中继通道（Relay Fallback Channel） ----------
 
 pub mod relay;
+
+// ---------- 链路加密（WireGuard 风格 X25519 + ChaCha20Poly1305） ----------
+
+pub mod encryption;
 
 // ---------- 结构化错误（不以日志文本代替错误类型） ----------
 

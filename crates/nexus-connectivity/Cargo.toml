@@ -11,3 +11,6 @@ workspace = true
 [dependencies]
 nexus-delivery = { path = "../nexus-delivery" }
 nexus-platform = { path = "../nexus-platform" }
+# 链路加密基元（X25519 ECDH / HKDF-SHA256 / ChaCha20Poly1305 AEAD）。
+# ring 0.17.14 已在 workspace 依赖树（经 rustls 引入），此处仅声明直接使用。
+ring = { version = "0.17", default-features = false, features = ["std"] }

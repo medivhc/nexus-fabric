@@ -134,6 +134,43 @@ NAT/中继场景的物理建连（组合根 transport::connect）发生在激活
 真实中继建连、加密、平台 socket 留 TODO，由 Composition Root / `nexus-platform-*` 完成；
 本骨架为可移植纯 std 实现，不新增第三方依赖、不含 `unsafe`。
 
+### 冻结契约（Link Encryption 链路加密 P0，scenarios/product/link_encryption.toml）
+
+- `encryption::KeyPair`：节点长期 X25519 密钥对。
+  - `KeyPair::generate() -> Result<KeyPair, EncryptionError>`（内部用 `ring::rand::SystemRandom`，
+    不暴露 rng 注入点；长期私钥持久化/序列化留 TODO——ring 0.17 不导出私钥字节）；
+  - `public_key_bytes(&self) -> &[u8; 32]`：导出公钥用于握手交换。
+  - 握手消费私钥（`agree_ephemeral` move 语义），一个 `KeyPair` 只参与一次握手。
+- `encryption::HandshakeMessage { msg_type, public_key }`：自包含固定字节布局
+  （type(1) + 公钥(32)），`to_bytes()` / `from_bytes()`。
+- `encryption::KeyPair::handshake_initiate(&self, peer_pub) -> Result<(HandshakeMessage, DirectionalKeys), _>`：
+  initiator 发起，返回握手 INIT 消息与 initiator 视角的方向密钥。
+- `encryption::KeyPair::handshake_respond(&self, &HandshakeMessage) -> Result<(HandshakeMessage, DirectionalKeys), _>`：
+  responder 响应，返回握手 RESP 消息与 responder 视角的方向密钥。
+- 密钥派生：X25519 ECDH 共享密钥 -> HKDF-SHA256（salt 固定标签，info 字典序双公钥）
+  得 32 字节 base；再 HKDF-Expand 两次派生方向子密钥
+  （initiator.tx 与 responder.rx 相同，responder.tx 与 initiator.rx 相同），
+  避免双向同序号 nonce 复用。
+- `encryption::DirectionalKeys { tx: SessionKey, rx: SessionKey }`：
+  `tx` 用于加密本端发送帧，`rx` 用于解密对端帧。
+- `encryption::SessionKey::from_bytes(&[u8;32])` / `material() -> &[u8;32]`：
+  单方向 AEAD 密钥封装（ChaCha20Poly1305）。
+- `encrypt_frame(&SessionKey, seq, plaintext) -> Result<Vec<u8>, EncryptionError>` /
+  `decrypt_frame(&SessionKey, &[u8]) -> Result<(u64, Vec<u8>), EncryptionError>`：
+  wire 布局 `[version(1)|type(1)|seq(8 BE)|nonce(12)|ciphertext|tag(16)]`；
+  **整段 22 字节帧头作为 AEAD AAD 认证**，篡改 seq/version/type 必致 tag 失败。
+- `ReplayWindow`：64 位序号 + 1024 位滑动位图；
+  `check_and_accept(seq)` 对重复/过旧序号返回 `EncryptionError::ReplayRejected{seq}`。
+- `EncryptionConfig { algorithm: AeadAlgorithm, key_rotation_after_frames: u64 }`：
+  P0 仅 `ChaCha20Poly1305`；rotation 阈值仅记录，轮换逻辑 TODO。
+- `EncryptionError`：typed enum（InvalidKey / DecryptionFailed /
+  ReplayRejected{seq} / HandshakeFailed / FrameTooShort / UnsupportedVersion /
+  UnexpectedFrameType{actual}），Display + std::error::Error。
+
+冻结语义：握手成功前不允许发送业务帧；方向子密钥隔离双向 nonce；
+帧头入 AAD 防篡改；接收方先验 tag 再做防重放；
+本模块保持 portable、零真实网络（真实传输/握手重传/密钥轮换留 TODO），
+仅依赖 ring 0.17（已在依赖树）。
 ## Verification
 
 最低：

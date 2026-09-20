@@ -288,6 +288,7 @@ version = "0.1.0"
 dependencies = [
  "nexus-delivery",
  "nexus-platform",
+ "ring",
 ]
 
 [[package]]

@@ -4547,3 +4547,132 @@ fn uuid_like() -> String {
         .as_nanos();
     format!("{:016x}", nanos)
 }
+
+/// E4 `product.link-encryption` 的离线确定性切片：全内存 mock 驱动
+/// WireGuard 风格链路加密闭环——
+///
+/// ```text
+/// 生成两对 X25519 KeyPair
+///   -> initiator(A) <-> responder(B) 握手（公钥字节在内存中互相"发送"）
+///   -> 双端派生相同 SessionKey
+///   -> 加密业务帧 -> 对端解密 + 防重放窗口校验
+///   -> 重复序号被重放窗口拒绝
+///   -> 错误密钥派生的会话密钥解密失败
+/// ```
+///
+/// 全程零真实网络；错误一律 typed `Result`，无 panic。
+pub fn link_encryption_flow() -> Result<Value, NexusError> {
+    use nexus_connectivity::encryption::{
+        EncryptionError, HandshakeMessage, KeyPair, ReplayWindow, decrypt_frame, encrypt_frame,
+    };
+
+    let mut events: Vec<&'static str> = Vec::new();
+
+    // 1) 生成本地（initiator）与对端（responder）两对长期密钥。
+    let local = KeyPair::generate().map_err(enc_err)?;
+    let peer = KeyPair::generate().map_err(enc_err)?;
+    let local_pub = *local.public_key_bytes();
+    let peer_pub = *peer.public_key_bytes();
+    events.push("keypair_generated");
+
+    // 2) 握手：A 发起（携带 A 公钥）-> B 响应（携带 B 公钥），双端派生 SessionKey。
+    let (init_msg, keys_a) = local.handshake_initiate(&peer_pub).map_err(enc_err)?;
+    // 模拟"网络传输"：把 initiator 消息字节序列化后交给 responder 解析。
+    let init_wire = init_msg.to_bytes();
+    let parsed_init = HandshakeMessage::from_bytes(&init_wire).map_err(enc_err)?;
+    let (_resp_msg, keys_b) = peer.handshake_respond(&parsed_init).map_err(enc_err)?;
+    events.push("handshake_completed");
+    events.push("session_established");
+
+    // 3) A 用会话密钥加密业务帧；B 解密并经防重放窗口接受。
+    let payload = b"nexus-secret-link-payload";
+    let seq: u64 = 1;
+    let frame = encrypt_frame(&keys_a.tx, seq, payload).map_err(enc_err)?;
+    events.push("frame_encrypted");
+
+    let mut rx_window = ReplayWindow::new();
+    let (got_seq, plaintext) = decrypt_frame(&keys_b.rx, &frame).map_err(enc_err)?;
+    rx_window.check_and_accept(got_seq).map_err(enc_err)?;
+    if plaintext.as_slice() != payload {
+        return Err(NexusError::Internal {
+            message: "link encryption: decrypted payload mismatch".to_string(),
+        });
+    }
+    events.push("frame_decrypted");
+
+    // 4) 重放：相同序号再发一帧，B 解密成功但被防重放窗口拒绝。
+    let replay_frame = encrypt_frame(&keys_a.tx, seq, payload).map_err(enc_err)?;
+    let (replay_seq, _) = decrypt_frame(&keys_b.rx, &replay_frame).map_err(enc_err)?;
+    let replay_rejected = matches!(
+        rx_window.check_and_accept(replay_seq),
+        Err(EncryptionError::ReplayRejected { seq: _ })
+    );
+    if !replay_rejected {
+        return Err(NexusError::Internal {
+            message: "link encryption: replay frame was not rejected".to_string(),
+        });
+    }
+    events.push("replay_rejected");
+
+    // 5) 错误密钥：用另一对密钥 (C, D) 派生的会话密钥必须无法解密 A->B 的帧。
+    let other_local = KeyPair::generate().map_err(enc_err)?;
+    let other_peer = KeyPair::generate().map_err(enc_err)?;
+    let (other_init, other_keys) = other_local
+        .handshake_initiate(other_peer.public_key_bytes())
+        .map_err(enc_err)?;
+    let (_, other_rx) = other_peer.handshake_respond(&other_init).map_err(enc_err)?;
+    let wrong_key_rejected = matches!(
+        decrypt_frame(&other_rx.rx, &frame),
+        Err(EncryptionError::DecryptionFailed)
+    ) || matches!(
+        decrypt_frame(&other_keys.tx, &frame),
+        Err(EncryptionError::DecryptionFailed)
+    );
+    if !wrong_key_rejected {
+        return Err(NexusError::Internal {
+            message: "link encryption: wrong-key frame was not rejected".to_string(),
+        });
+    }
+    events.push("wrong_key_rejected");
+
+    events.push("encryption_completed");
+
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "handshake": {
+            "local_public_key": hex16(&local_pub),
+            "peer_public_key": hex16(&peer_pub),
+            "session_key_established": true,
+            "session_key_bytes": keys_a.tx.material().len(),
+        },
+        "frame": {
+            "seq": got_seq,
+            "bytes": frame.len(),
+            "nonce_len": 12,
+            "tag_len": 16,
+            "plaintext_len": plaintext.len(),
+        },
+        "replay": {
+            "rejected": replay_rejected,
+            "duplicate_seq": replay_seq,
+        },
+        "wrong_key": {
+            "rejected": wrong_key_rejected,
+        }
+    }))
+}
+
+fn enc_err(e: nexus_connectivity::encryption::EncryptionError) -> NexusError {
+    NexusError::Internal {
+        message: format!("link encryption failed: {e}"),
+    }
+}
+
+fn hex16(bytes: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
