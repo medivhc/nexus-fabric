@@ -2543,6 +2543,96 @@ pub fn remote_nat_relay_fallback_flow() -> Result<Value, NexusError> {
     }))
 }
 
+/// 离线可编程 `LinkProbe` 替身（E4 relay-fallback 专用，零真实 I/O）：
+/// Direct 候选必然不可达（模拟 NAT 阻塞），Relay 候选必然可达。
+struct RelayFallbackProbe;
+
+impl nexus_connectivity::LinkProbe for RelayFallbackProbe {
+    fn probe(&self, candidate: &nexus_connectivity::LinkCandidate) -> Result<(), String> {
+        match candidate.kind {
+            nexus_connectivity::LinkKind::Direct => Err("nat unreachable".to_string()),
+            nexus_connectivity::LinkKind::Relay => Ok(()),
+        }
+    }
+}
+
+/// 运行一次 Relay 回退闭环的**离线确定性切片**（E4 `product.relay-fallback`）：
+/// Direct 打洞必然失败（NAT 不可达）-> `LinkActivator` 回退选中 Relay ->
+/// 经 `RelayChannel`（`MockRelayTransport` 回环）建连、转发、接收。
+/// 全程零真实网络、零线程，事件序列与字节计数完全确定、可重放。
+pub fn relay_fallback_flow() -> Result<Value, NexusError> {
+    let mut events: Vec<&'static str> = Vec::new();
+
+    // 1) Link Activation：Direct 打洞失败 -> Relay 回退成功。
+    let direct = nexus_connectivity::LinkCandidate::new(
+        nexus_connectivity::LinkKind::Direct,
+        "10.0.0.5:4242",
+        10,
+    );
+    let relay = nexus_connectivity::LinkCandidate::new(
+        nexus_connectivity::LinkKind::Relay,
+        "relay.example.org:9999",
+        50,
+    );
+    events.push("direct_hole_punch_started");
+    let selection = nexus_connectivity::LinkActivator::new(RelayFallbackProbe)
+        .activate(&direct, Some(&relay), false, false)
+        .map_err(|e| NexusError::Internal {
+            message: format!("relay fallback link activation failed: {e}"),
+        })?;
+    events.push("direct_hole_punch_failed");
+
+    // 2) Relay 建连（离线 Mock 回环；先注入待接收字节再移交所有权）。
+    events.push("relay_connecting");
+    let config = nexus_connectivity::relay::RelayConfig::new("relay.example.org:9999", "peer-b");
+    let transport = nexus_connectivity::relay::MockRelayTransport::new(Ok(()));
+    let payload = b"relay-payload-12345";
+    transport.inject_echo(payload);
+    let mut channel = nexus_connectivity::relay::RelayChannel::new(config, Box::new(transport));
+    channel.connect().map_err(|e| NexusError::Internal {
+        message: format!("relay connect failed: {e}"),
+    })?;
+    events.push("relay_connected");
+
+    // 3) 经中继转发 -> 回环接收。
+    channel.forward(payload).map_err(|e| NexusError::Internal {
+        message: format!("relay forward failed: {e}"),
+    })?;
+    events.push("relay_data_forwarded");
+
+    let mut buf = [0u8; 64];
+    channel
+        .receive(&mut buf)
+        .map_err(|e| NexusError::Internal {
+            message: format!("relay receive failed: {e}"),
+        })?;
+    events.push("relay_data_received");
+
+    events.push("relay_fallback_completed");
+
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "hole_punch": {
+            "attempted": true,
+            "success": false,
+            "reason": "nat unreachable",
+        },
+        "link": {
+            "kind": selection.kind.to_string(),
+            "direct_attempted": true,
+            "direct_failed": true,
+        },
+        "relay": {
+            "server": channel.config().relay_server,
+            "peer_id": channel.config().peer_id,
+            "state": channel.state().to_string(),
+            "bytes_sent": channel.stats().bytes_sent,
+            "bytes_received": channel.stats().bytes_received,
+        }
+    }))
+}
+
 /// 运行一次 Relay 不可用拒绝路径（PRODUCT §6）：Direct（NAT 不可达）与 Relay
 /// （中继端口未监听）均探测失败 -> `NoLinkAvailable` 结构化拒绝（NO_LINK_AVAILABLE）；
 /// 失败发生在 Connectivity 阶段，Session 逆序幂等回滚（Failed -> Draining -> Disposed），
