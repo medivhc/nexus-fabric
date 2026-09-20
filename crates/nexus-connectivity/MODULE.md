@@ -105,6 +105,33 @@ NAT/中继场景的物理建连（组合根 transport::connect）发生在激活
   与 MemoryCarrier（点对点）并存；不引入新 trait，只扩展现成数据面。
 - 不做：动态路由、最短路径、跨子网、加密、真实 TUN。
 
+### 冻结契约（VirtualSubnet 链路加密接入 P2，PRODUCT §12.6）
+
+- `VirtualSubnetTunnel` 新增：
+  - `enable_encryption(config: EncryptionConfig)`：开启加密模式（默认关闭，
+    明文模式与 §12.1-§12.5 语义不变）；`is_encryption_enabled() -> bool`。
+  - `begin_handshake(peer_virtual_ip) -> Result<(), ConnectivityError>`：发起方
+    生成临时 `KeyPair`，经 carrier 发 `HANDSHAKE_INIT`，暂存本端密钥。
+  - `accept_handshake(peer_virtual_ip, &HandshakeMessage) -> Result<(), ConnectivityError>`：
+    响应方生成临时 `KeyPair` 并经 `handshake_respond` 派生会话，回
+    `HANDSHAKE_RESP`，peer state → Connected。
+  - `complete_handshake(peer_virtual_ip, &HandshakeMessage) -> Result<(), ConnectivityError>`：
+    发起方用 RESP 公钥经 `derive_directional` 派生会话，peer state → Connected。
+- `encryption::KeyPair` 新增 `derive_directional(peer_public, initiator) ->
+  Result<DirectionalKeys, EncryptionError>`：纯 ephemeral 分步握手专用
+  （initiator 侧在收到对端公钥后完成派生；responder 侧仍走既有
+  `handshake_respond`）。
+- 数据面（加密模式）：发送 = `encrypt_frame(session.tx, tx_seq, 完整虚拟子网帧)`；
+  接收 = 按长度+type 分流握手/数据帧，数据帧以各对端会话 rx 试解密 +
+  `ReplayWindow::check_and_accept` 防重放；中间节点用 next_hop 会话重新加密
+  转发（虚拟 IP 头内容不变，字节数按 wire 密文长度计）。
+- 失败语义：解密失败/无匹配会话/重放拒绝 → 结构化错误（复用 `EncryptionError`
+  语义映射 `CRYPTO_ERROR` / `REPLAY_REJECTED`）；未握手 peer 发送 → 沿用
+  next_hop not connected。
+- Deletion Test：加密模式是虚拟子网数据面的独立变化维度（真实公网流量前提），
+  复用 §6 已冻结的 encryption 原语；新增 API 均为 VirtualSubnetTunnel 方法
+  + 一个 KeyPair 分步派生方法，无新 trait、无投机抽象。
+
 ### 冻结契约（RelayChannel 中继通道 P0，scenarios/product/relay_fallback.toml）
 
 - `RelayConfig { relay_server, peer_id }`：领域中立中继配置（服务器 locator + 对端 peer 标识）；

@@ -1,4 +1,4 @@
-﻿//! 铏氭嫙瀛愮綉缁勭綉锛圴irtual Subnet Networking锛?
+//! 铏氭嫙瀛愮綉缁勭綉锛圴irtual Subnet Networking锛?
 //!
 //! 鍙傝€?EasyTier / WireGuard 缁勭綉妯″紡锛?
 //! - 鑺傜偣鍦ㄥ悓涓€铏氭嫙 CIDR 缃戞鍐咃紝鍚勬湁鑷繁鐨勮櫄鎷?IP
@@ -16,6 +16,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::ConnectivityError;
+use crate::encryption::{
+    DirectionalKeys, EncryptionConfig, EncryptionError, HANDSHAKE_INIT, HANDSHAKE_RESP,
+    HandshakeMessage, KeyPair, ReplayWindow, decrypt_frame, encrypt_frame,
+};
 
 /// 铏氭嫙瀛愮綉閰嶇疆銆?
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +54,16 @@ impl VirtualSubnetConfig {
             .unwrap_or("");
         ip.starts_with(network_prefix)
     }
+}
+
+/// 加密会话（§12.6）：对端虚拟 IP 的链路会话状态。
+struct PeerCryptoSession {
+    /// 方向子密钥（tx=本端发送，rx=本端接收）。
+    keys: DirectionalKeys,
+    /// 本端发送序号（encrypt_frame 使用，递增防重放）。
+    tx_seq: u64,
+    /// 本端接收防重放窗口。
+    rx_replay: ReplayWindow,
 }
 
 /// 闅ч亾 Peer 閰嶇疆銆?
@@ -229,6 +243,12 @@ pub struct VirtualSubnetTunnel {
     vpi: Box<dyn VirtualPacketInterface>,
     /// PacketCarrier銆?
     carrier: Box<dyn PacketCarrier>,
+    /// 加密模式配置（None = 明文模式，§12.1-§12.5 语义不变）。
+    encryption: Option<EncryptionConfig>,
+    /// 加密会话表（§12.6）：对端虚拟 IP -> 会话。
+    crypto_sessions: HashMap<String, PeerCryptoSession>,
+    /// 握手进行中（发起方视角）：对端虚拟 IP -> 待消费本端密钥。
+    pending_handshakes: HashMap<String, KeyPair>,
 }
 
 impl VirtualSubnetTunnel {
@@ -251,6 +271,9 @@ impl VirtualSubnetTunnel {
             events,
             vpi,
             carrier,
+            encryption: None,
+            crypto_sessions: HashMap::new(),
+            pending_handshakes: HashMap::new(),
         }
     }
 
@@ -270,6 +293,131 @@ impl VirtualSubnetTunnel {
             });
         }
         self.routes.insert(dst, next_hop);
+        Ok(())
+    }
+
+    /// 开启加密模式（§12.6）：默认关闭，明文模式与 §12.1-§12.5 语义不变。
+    /// 开启后数据帧整体 AEAD 加密；未完成握手的 peer 发送被拒。
+    pub fn enable_encryption(&mut self, config: EncryptionConfig) {
+        self.encryption = Some(config);
+    }
+
+    /// 加密模式是否开启。
+    #[must_use]
+    pub fn is_encryption_enabled(&self) -> bool {
+        self.encryption.is_some()
+    }
+
+    /// 发起加密握手（§12.6）：生成临时密钥对，经 carrier 发 `HANDSHAKE_INIT`
+    /// （虚拟子网层载体 `hs:<peer_vip>:<33B>`），暂存本端密钥等响应。
+    ///
+    /// # Errors
+    ///
+    /// peer 未注册 / 加密未开启 / 密钥生成失败时返回结构化错误。
+    pub fn begin_handshake(&mut self, peer_virtual_ip: &str) -> Result<(), ConnectivityError> {
+        if self.encryption.is_none() {
+            return Err(ConnectivityError::Invalid {
+                message: "encryption not enabled".to_string(),
+            });
+        }
+        let (_peer_id, locator, _state, _stats) =
+            self.peers
+                .get(peer_virtual_ip)
+                .ok_or_else(|| ConnectivityError::Invalid {
+                    message: format!("PEER_NOT_FOUND: {peer_virtual_ip}"),
+                })?;
+        let locator = locator.clone();
+        let keypair = KeyPair::generate().map_err(encryption_err)?;
+        let msg = HandshakeMessage {
+            msg_type: HANDSHAKE_INIT,
+            public_key: *keypair.public_key_bytes(),
+        };
+        let wire = handshake_wire(&self.config.virtual_ip, &msg);
+        self.carrier
+            .send_to(&locator, &wire)
+            .map_err(|e| ConnectivityError::Io {
+                operation: "handshake_send".to_string(),
+                message: e.to_string(),
+            })?;
+        self.pending_handshakes
+            .insert(peer_virtual_ip.to_string(), keypair);
+        self.set_peer_state(peer_virtual_ip, TunnelState::Handshaking);
+        Ok(())
+    }
+
+    /// 响应加密握手（§12.6）：生成临时密钥对，经 `handshake_respond` 派生
+    /// 会话并回 `HANDSHAKE_RESP`，peer 进入 Connected。
+    ///
+    /// # Errors
+    ///
+    /// peer 未注册 / 加密未开启 / 握手失败时返回结构化错误。
+    pub fn accept_handshake(
+        &mut self,
+        peer_virtual_ip: &str,
+        msg: &HandshakeMessage,
+    ) -> Result<(), ConnectivityError> {
+        if self.encryption.is_none() {
+            return Err(ConnectivityError::Invalid {
+                message: "encryption not enabled".to_string(),
+            });
+        }
+        let (_peer_id, locator, _state, _stats) =
+            self.peers
+                .get(peer_virtual_ip)
+                .ok_or_else(|| ConnectivityError::Invalid {
+                    message: format!("PEER_NOT_FOUND: {peer_virtual_ip}"),
+                })?;
+        let locator = locator.clone();
+        let keypair = KeyPair::generate().map_err(encryption_err)?;
+        let (resp, keys) = keypair.handshake_respond(msg).map_err(encryption_err)?;
+        let wire = handshake_wire(&self.config.virtual_ip, &resp);
+        self.carrier
+            .send_to(&locator, &wire)
+            .map_err(|e| ConnectivityError::Io {
+                operation: "handshake_send".to_string(),
+                message: e.to_string(),
+            })?;
+        self.crypto_sessions.insert(
+            peer_virtual_ip.to_string(),
+            PeerCryptoSession {
+                keys,
+                tx_seq: 0,
+                rx_replay: ReplayWindow::new(),
+            },
+        );
+        self.set_peer_state(peer_virtual_ip, TunnelState::Connected);
+        Ok(())
+    }
+
+    /// 完成加密握手（§12.6，发起方）：用 RESP 公钥经 `derive_directional`
+    /// 派生会话，peer 进入 Connected。
+    ///
+    /// # Errors
+    ///
+    /// 无待消费的发起密钥（未 begin）/ 派生失败时返回结构化错误。
+    pub fn complete_handshake(
+        &mut self,
+        peer_virtual_ip: &str,
+        resp: &HandshakeMessage,
+    ) -> Result<(), ConnectivityError> {
+        let keypair = self
+            .pending_handshakes
+            .remove(peer_virtual_ip)
+            .ok_or_else(|| ConnectivityError::Invalid {
+                message: format!("HANDSHAKE_IN_PROGRESS: no pending init for {peer_virtual_ip}"),
+            })?;
+        let keys = keypair
+            .derive_directional(&resp.public_key, true)
+            .map_err(encryption_err)?;
+        self.crypto_sessions.insert(
+            peer_virtual_ip.to_string(),
+            PeerCryptoSession {
+                keys,
+                tx_seq: 0,
+                rx_replay: ReplayWindow::new(),
+            },
+        );
+        self.set_peer_state(peer_virtual_ip, TunnelState::Connected);
         Ok(())
     }
 
@@ -370,18 +518,35 @@ impl VirtualSubnetTunnel {
             src_virtual_ip: self.config.virtual_ip.clone(),
             dst_virtual_ip: dst_virtual_ip.to_string(),
         };
-        let mut frame = header.serialize();
-        frame.extend_from_slice(packet);
+        let mut inner = header.serialize();
+        inner.extend_from_slice(packet);
 
-        // 4. 閫氳繃 carrier 鍙戠粰 next_hop
+        // 加密模式：整帧 AEAD 加密（会话不存在 = 未握手，拒绝发送）
+        let wire = if let Some(session) = self.crypto_sessions.get_mut(&next_hop) {
+            let cipher = encrypt_frame(&session.keys.tx, session.tx_seq, &inner).map_err(|e| {
+                ConnectivityError::Invalid {
+                    message: format!("CRYPTO_ERROR: {e}"),
+                }
+            })?;
+            session.tx_seq += 1;
+            cipher
+        } else if self.encryption.is_some() {
+            return Err(ConnectivityError::Invalid {
+                message: format!("peer {next_hop} not handshaken"),
+            });
+        } else {
+            inner
+        };
+
+        // 通过 carrier 发给 next_hop
         self.carrier
-            .send_to(locator, &frame)
+            .send_to(locator, &wire)
             .map_err(|e| ConnectivityError::Io {
                 operation: "send_to".to_string(),
                 message: e.to_string(),
             })?;
 
-        stats.bytes_sent += frame.len() as u64;
+        stats.bytes_sent += wire.len() as u64;
         Ok(())
     }
 
@@ -408,28 +573,85 @@ impl VirtualSubnetTunnel {
 
         let data = buffer[..n].to_vec();
 
-        // 瑙ｅ皝瑁?
-        let (header, payload) =
-            TunnelFrameHeader::deserialize(&data).ok_or_else(|| ConnectivityError::Invalid {
-                message: "invalid tunnel frame header".to_string(),
+        // 握手帧分流（§12.6，虚拟子网层载体 "hs:<peer_vip>:<33B>"）。
+        // 握手帧不写 VPI、不计数据统计；成功/失败均返回 Ok(None) 表示非数据帧。
+        if data.starts_with(b"hs:") {
+            let rest = &data[3..];
+            let Some(colon) = rest.iter().position(|b| *b == b':') else {
+                return Err(ConnectivityError::Invalid {
+                    message: "invalid handshake frame".to_string(),
+                });
+            };
+            let sender_vip = String::from_utf8_lossy(&rest[..colon]).to_string();
+            let msg = HandshakeMessage::from_bytes(&rest[colon + 1..]).map_err(|e| {
+                ConnectivityError::Invalid {
+                    message: format!("HANDSHAKE_FAILED: {e}"),
+                }
             })?;
+            match msg.msg_type {
+                HANDSHAKE_INIT => self.accept_handshake(&sender_vip, &msg)?,
+                HANDSHAKE_RESP => self.complete_handshake(&sender_vip, &msg)?,
+                _ => {
+                    return Err(ConnectivityError::Invalid {
+                        message: format!("HANDSHAKE_FAILED: unexpected type {}", msg.msg_type),
+                    });
+                }
+            }
+            return Ok(None);
+        }
 
-        // 鏇存柊鍙戦€佹柟缁熻
-        if let Some((_, _, _, stats)) = self.peers.get_mut(&header.src_virtual_ip) {
+        // 解封装（明文模式：直接解析；加密模式：按各对端会话 rx 试解密）
+        let (header, payload, plain_full) = if self.encryption.is_some() {
+            let mut found: Option<(String, Vec<u8>)> = None;
+            for (vip, session) in self.crypto_sessions.iter_mut() {
+                if let Ok((seq, plain)) = decrypt_frame(&session.keys.rx, &data) {
+                    session.rx_replay.check_and_accept(seq).map_err(|e| {
+                        ConnectivityError::Invalid {
+                            message: format!("REPLAY_REJECTED: {e}"),
+                        }
+                    })?;
+                    found = Some((vip.clone(), plain));
+                    break;
+                }
+            }
+            let (sender_vip, plain) = found.ok_or_else(|| ConnectivityError::Invalid {
+                message: "CRYPTO_ERROR: no matching session or bad tag".to_string(),
+            })?;
+            let (header, payload) = TunnelFrameHeader::deserialize(&plain).ok_or_else(|| {
+                ConnectivityError::Invalid {
+                    message: "invalid tunnel frame header".to_string(),
+                }
+            })?;
+            (header, payload.to_vec(), (sender_vip, plain))
+        } else {
+            let (header, payload) = TunnelFrameHeader::deserialize(&data).ok_or_else(|| {
+                ConnectivityError::Invalid {
+                    message: "invalid tunnel frame header".to_string(),
+                }
+            })?;
+            (header, payload.to_vec(), (String::new(), data))
+        };
+
+        // 更新发送方统计（加密模式用试解密命中的 sender；明文模式用 header.src）
+        let sender_vip = if plain_full.0.is_empty() {
+            header.src_virtual_ip.clone()
+        } else {
+            plain_full.0.clone()
+        };
+        if let Some((_, _, _, stats)) = self.peers.get_mut(&sender_vip) {
             stats.bytes_received += n as u64;
         }
 
-        // 鏈満鐩殑 鈫?鍐?VPI
+        // 本机目的 -> 写 VPI
         if header.dst_virtual_ip == self.config.virtual_ip {
-            self.vpi.send(payload).map_err(|e| ConnectivityError::Io {
+            self.vpi.send(&payload).map_err(|e| ConnectivityError::Io {
                 operation: "vpi_send".to_string(),
                 message: e.to_string(),
             })?;
-            return Ok(Some((header.src_virtual_ip, payload.len())));
+            return Ok(Some((sender_vip, payload.len())));
         }
 
-        // 闈炴湰鏈虹洰鐨?鈫?杞彂锛圥1 搂12.5锛?
-        // 鍏堟煡鐩磋繛 peer锛堜腑闂磋妭鐐规湰韬氨鏄渶缁堢洰鐨勭殑鐩磋繛閭诲眳锛夛紝鍐嶆煡闈欐€佽矾鐢辫〃
+        // 非本机目的 -> 转发（§12.5：先查直连 peer，再查静态路由表）
         let next_hop = if self.peers.contains_key(&header.dst_virtual_ip) {
             header.dst_virtual_ip.clone()
         } else {
@@ -457,31 +679,46 @@ impl VirtualSubnetTunnel {
         }
         let locator = locator.clone();
 
-        // 鎶婂師濮嬪抚锛堜笉瑙?payload锛夎浆鍙戠粰 next_hop
+        // 转发：明文模式发原数据；加密模式用 next_hop 会话重新加密同一明文
+        // （虚拟 IP 头内容不变，§12.5"帧头不剥不改"语义保持）。
+        let wire =
+            if self.encryption.is_some() {
+                let session = self.crypto_sessions.get_mut(&next_hop).ok_or_else(|| {
+                    ConnectivityError::Invalid {
+                        message: format!("peer {next_hop} not handshaken"),
+                    }
+                })?;
+                let cipher = encrypt_frame(&session.keys.tx, session.tx_seq, &plain_full.1)
+                    .map_err(|e| ConnectivityError::Invalid {
+                        message: format!("CRYPTO_ERROR: {e}"),
+                    })?;
+                session.tx_seq += 1;
+                cipher
+            } else {
+                plain_full.1
+            };
         self.carrier
-            .send_to(&locator, &data)
+            .send_to(&locator, &wire)
             .map_err(|e| ConnectivityError::Io {
                 operation: "forward_send_to".to_string(),
                 message: e.to_string(),
             })?;
 
-        // 鏇存柊杞彂缁熻 + 鍙戜簨浠?
+        // 更新转发统计 + 发事件
         if let Some((_, _, _, stats)) = self.peers.get_mut(&next_hop) {
-            stats.bytes_forwarded += n as u64;
+            stats.bytes_forwarded += wire.len() as u64;
         }
         self.events.push(VirtualSubnetEvent::PacketForwarded {
             tunnel_id: self.tunnel_id.clone(),
             src_virtual_ip: header.src_virtual_ip.clone(),
             dst_virtual_ip: header.dst_virtual_ip.clone(),
             next_hop: next_hop.clone(),
-            bytes: n as u64,
+            bytes: wire.len() as u64,
         });
 
-        // 杞彂鍚庝笉鍐?VPI锛岃繑鍥炲師濮?src 鍜屽抚闀?
-        Ok(Some((header.src_virtual_ip, n)))
+        // 转发后不写 VPI，返回原始 src 和帧长
+        Ok(Some((sender_vip, n)))
     }
-
-    /// 浠?VPI 璇讳竴涓?IP 鍖呭苟璺敱鍒板搴?Peer銆?
     pub fn read_vpi_and_route(
         &mut self,
         buffer: &mut [u8],
@@ -527,6 +764,25 @@ impl VirtualSubnetTunnel {
 }
 
 /// 浠?IPv4 鍖呮彁鍙栫洰鐨?IP锛圥0 绠€鍖栧疄鐜帮細鍙栫 16-19 瀛楄妭锛夈€?
+/// 构造虚拟子网层握手载体（§12.6）：`hs:<peer_virtual_ip>:<HandshakeMessage 33B>`。
+/// 明文仅含公开公钥与类型，无机密；数据帧（密文 ≥40B）不会以 `hs:` 开头。
+#[must_use]
+fn handshake_wire(peer_virtual_ip: &str, msg: &HandshakeMessage) -> Vec<u8> {
+    let mut out = Vec::with_capacity(3 + peer_virtual_ip.len() + 1 + 33);
+    out.extend_from_slice(b"hs:");
+    out.extend_from_slice(peer_virtual_ip.as_bytes());
+    out.push(b':');
+    out.extend_from_slice(&msg.to_bytes());
+    out
+}
+
+/// 把加密错误映射为 `ConnectivityError::Invalid`（结构化、可诊断）。
+fn encryption_err(e: EncryptionError) -> ConnectivityError {
+    ConnectivityError::Invalid {
+        message: format!("HANDSHAKE_FAILED: {e}"),
+    }
+}
+
 fn extract_dst_ip_from_ipv4(packet: &[u8]) -> Option<String> {
     if packet.len() < 20 {
         return None;
@@ -547,7 +803,7 @@ pub struct MemoryVpi {
     /// 鎺ユ敹缂撳啿鍖猴紙瀵圭鍐欏叆锛屾湰鑺傜偣璇诲彇锛夈€?
     recv_buf: Mutex<Vec<u8>>,
     /// 鍙戦€佺紦鍐插尯锛堟湰鑺傜偣鍐欏叆锛屽绔鍙栵級銆?
-    send_buf: Mutex<Vec<u8>>,
+    send_buf: Arc<Mutex<Vec<u8>>>,
 }
 
 impl MemoryVpi {
@@ -556,7 +812,7 @@ impl MemoryVpi {
     pub fn new() -> Self {
         Self {
             recv_buf: Mutex::new(Vec::new()),
-            send_buf: Mutex::new(Vec::new()),
+            send_buf: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -571,6 +827,11 @@ impl MemoryVpi {
     pub fn take_sent(&self) -> Vec<u8> {
         let mut buf = self.send_buf.lock().unwrap();
         std::mem::take(&mut *buf)
+    }
+    /// 娉ㄥ叆涓€涓?VPI 宸插彂閫佺殑鍖呯殑鍙ユ焺锛堢敤浜?E4 闈炲悓姝ユ祦绋嬶細VPI 琚?move 杩?tunnel 鍚庝粛鍙鍙栧彂閫佹暟鎹級銆?
+    #[must_use]
+    pub fn sent_handle(&self) -> Arc<Mutex<Vec<u8>>> {
+        self.send_buf.clone()
     }
 }
 
@@ -1043,5 +1304,101 @@ mod tests {
         let mut buf = [0u8; 1024];
         let err = tunnel_b.recv_and_deliver(&mut buf).unwrap_err();
         assert!(matches!(err, ConnectivityError::Invalid { .. }));
+    }
+    #[test]
+    fn encrypted_pair_handshake_and_roundtrip() -> Result<(), ConnectivityError> {
+        // 双节点加密：A begin → B 收 INIT accept → A 收 RESP complete → 数据收发。
+        let cfg_a = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
+        let cfg_b = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.2");
+        let (ca, cb) = MemoryCarrier::connected_pair();
+        let mut ta = VirtualSubnetTunnel::new(cfg_a, Box::new(MemoryVpi::new()), Box::new(ca));
+        let mut tb = VirtualSubnetTunnel::new(cfg_b, Box::new(MemoryVpi::new()), Box::new(cb));
+        ta.add_peer(TunnelPeer::new("10.0.0.2", "mem-b"))?;
+        tb.add_peer(TunnelPeer::new("10.0.0.1", "mem-a"))?;
+        ta.enable_encryption(EncryptionConfig::default());
+        tb.enable_encryption(EncryptionConfig::default());
+        assert!(ta.is_encryption_enabled());
+
+        // 握手：A 发起
+        ta.begin_handshake("10.0.0.2")?;
+        assert_eq!(ta.peer_state("10.0.0.2"), Some(TunnelState::Handshaking));
+        let mut buf = [0u8; 4096];
+        assert!(tb.recv_and_deliver(&mut buf)?.is_none()); // 握手帧不写 VPI
+        assert_eq!(tb.peer_state("10.0.0.1"), Some(TunnelState::Connected));
+        assert!(ta.recv_and_deliver(&mut buf)?.is_none());
+        assert_eq!(ta.peer_state("10.0.0.2"), Some(TunnelState::Connected));
+
+        // 数据：A → B
+        ta.send_ip_packet("10.0.0.2", b"secret-a-to-b")?;
+        let got = tb.recv_and_deliver(&mut buf)?;
+        let (sender, len) = got.expect("data frame delivered");
+        assert_eq!(sender, "10.0.0.1");
+        assert_eq!(len, b"secret-a-to-b".len());
+
+        // 统计按 wire 密文长度计（> 明文长度）
+        assert!(
+            ta.peer_stats("10.0.0.2").map(|s| s.bytes_sent).unwrap()
+                > b"secret-a-to-b".len() as u64
+        );
+        assert!(
+            tb.peer_stats("10.0.0.1").map(|s| s.bytes_received).unwrap()
+                > b"secret-a-to-b".len() as u64
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn encrypted_replay_frame_rejected() -> Result<(), ConnectivityError> {
+        // 重放同一密文帧 → ReplayWindow 拒绝（REPLAY_REJECTED）。
+        let mut mesh_a = MeshCarrier::new();
+        let mut mesh_b = MeshCarrier::new();
+        let a_recv = mesh_a.recv_handle();
+        let b_recv = mesh_b.recv_handle();
+        mesh_a.connect_peer("B_locator", b_recv.clone());
+        mesh_b.connect_peer("A_locator", a_recv.clone());
+
+        let cfg_a = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
+        let cfg_b = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.2");
+        let mut ta = VirtualSubnetTunnel::new(cfg_a, Box::new(MemoryVpi::new()), Box::new(mesh_a));
+        let mut tb = VirtualSubnetTunnel::new(cfg_b, Box::new(MemoryVpi::new()), Box::new(mesh_b));
+        ta.add_peer(TunnelPeer::new("10.0.0.2", "B_locator"))?;
+        tb.add_peer(TunnelPeer::new("10.0.0.1", "A_locator"))?;
+        ta.enable_encryption(EncryptionConfig::default());
+        tb.enable_encryption(EncryptionConfig::default());
+        ta.begin_handshake("10.0.0.2")?;
+        let mut buf = [0u8; 4096];
+        let _ = tb.recv_and_deliver(&mut buf)?;
+        let _ = ta.recv_and_deliver(&mut buf)?;
+
+        ta.send_ip_packet("10.0.0.2", b"frame-1")?;
+        let wire = b_recv.lock().unwrap().clone(); // 密文帧
+        assert!(tb.recv_and_deliver(&mut buf)?.is_some());
+        // 重放：注入同一密文
+        b_recv.lock().unwrap().extend_from_slice(&wire);
+        let err = tb.recv_and_deliver(&mut buf).expect_err("replay must fail");
+        assert!(err.to_string().contains("REPLAY_REJECTED"), "got: {err}");
+        Ok(())
+    }
+
+    #[test]
+    fn encrypted_plaintext_mode_regression() -> Result<(), ConnectivityError> {
+        // 不开启加密：明文模式语义与 §12.1-§12.5 完全一致。
+        let cfg_a = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
+        let cfg_b = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.2");
+        let (ca, cb) = MemoryCarrier::connected_pair();
+        let mut ta = VirtualSubnetTunnel::new(cfg_a, Box::new(MemoryVpi::new()), Box::new(ca));
+        let mut tb = VirtualSubnetTunnel::new(cfg_b, Box::new(MemoryVpi::new()), Box::new(cb));
+        ta.add_peer(TunnelPeer::new("10.0.0.2", "mem-b"))?;
+        tb.add_peer(TunnelPeer::new("10.0.0.1", "mem-a"))?;
+        ta.set_peer_state("10.0.0.2", TunnelState::Connected);
+        tb.set_peer_state("10.0.0.1", TunnelState::Connected);
+
+        ta.send_ip_packet("10.0.0.2", b"plaintext-ok")?;
+        let mut buf = [0u8; 4096];
+        let (sender, len) = tb.recv_and_deliver(&mut buf)?.expect("delivered");
+        assert_eq!(sender, "10.0.0.1");
+        assert_eq!(len, b"plaintext-ok".len());
+        assert!(!ta.is_encryption_enabled());
+        Ok(())
     }
 }

@@ -342,6 +342,22 @@ impl KeyPair {
         };
         Ok((msg, keys))
     }
+
+    /// 分步握手（纯 ephemeral 双公钥）：本端已生成临时密钥对并发出自身公钥，
+    /// 收到对端公钥后完成密钥派生。
+    ///
+    /// `initiator=true` 取发起方视角（本端 `tx` 与对端 `rx` 相同）；`false` 取
+    /// 响应方视角。与 [`Self::handshake_respond`] 派生结果一致（同一 base +
+    /// 角色切分），用于对端公钥未知、需先交换公钥的场景（§12.6 虚拟子网
+    /// 加密接入）。
+    pub fn derive_directional(
+        self,
+        peer_public: &[u8; PUBLIC_KEY_LEN],
+        initiator: bool,
+    ) -> Result<DirectionalKeys, EncryptionError> {
+        let base = derive_base(self.private, &self.public, peer_public)?;
+        DirectionalKeys::split(&base, initiator)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -574,6 +590,31 @@ impl Default for EncryptionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stepped_handshake_matches_one_step() -> Result<(), EncryptionError> {
+        // 纯 ephemeral 分步握手（先交换公钥再派生）与既有一步握手派生一致。
+        let a = KeyPair::generate()?;
+        let b = KeyPair::generate()?;
+        // a 的 INIT 消息 = 自身公钥（不经 initiate，避免消费 a）。
+        let init_msg = HandshakeMessage {
+            msg_type: HANDSHAKE_INIT,
+            public_key: *a.public_key_bytes(),
+        };
+        let (resp_msg, kb) = b.handshake_respond(&init_msg)?;
+        // 分步：a 用 resp_msg 里的 b 公钥 + initiator 视角派生。
+        let ka = a.derive_directional(&resp_msg.public_key, true)?;
+
+        assert_eq!(ka.tx.material(), kb.rx.material());
+        assert_eq!(ka.rx.material(), kb.tx.material());
+        // 分步与一步走同一 base/切分逻辑：用 ka 发帧，kb 必须能解。
+        let frame = encrypt_frame(&ka.tx, 5, b"stepped")?;
+        let (seq, plain) = decrypt_frame(&kb.rx, &frame)?;
+        assert_eq!(seq, 5);
+        assert_eq!(&plain, b"stepped");
+        // 篡改后的帧用对端 rx 解不开（密钥正确性由 roundtrip 覆盖）。
+        Ok(())
+    }
 
     #[test]
     fn roundtrip_encrypt_decrypt() -> Result<(), EncryptionError> {
