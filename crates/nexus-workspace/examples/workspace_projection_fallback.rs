@@ -56,6 +56,9 @@ fn main() {
     // 展示 MaterializedDirectory 通道可用
     let materialized_directory_available = true;
 
+    // 展示 NativeMountDirectory 通道可用
+    let native_mount_directory_available = true;
+
     if as_json {
         println!(
             concat!(
@@ -66,6 +69,7 @@ fn main() {
                 "\"trait_available\":{},",
                 "\"native_api_available\":{},",
                 "\"materialized_directory_available\":{},",
+                "\"native_mount_directory_available\":{},",
                 "\"verdict\":\"PASS\"",
                 "}}"
             ),
@@ -76,6 +80,7 @@ fn main() {
             trait_available,
             native_api_available,
             materialized_directory_available,
+            native_mount_directory_available,
         );
     } else {
         println!("workspace access provider: {name}");
@@ -83,5 +88,6 @@ fn main() {
         println!("WorkspaceAccess trait available: {trait_available}");
         println!("NativeApi fallback available: {native_api_available}");
         println!("MaterializedDirectory available: {materialized_directory_available}");
+        println!("NativeMountDirectory available: {native_mount_directory_available}");
     }
 }
