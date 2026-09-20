@@ -34,6 +34,7 @@ nexus — Nexus 统一 Resource Fabric 控制面 CLI
   compute jobs                            Compute 任务
   diagnose                                统一诊断
   platform capabilities                   平台能力清单
+  run <resource>                          执行远程资源访问
   help / --help                           显示本帮助
 
 输出:
@@ -161,6 +162,12 @@ fn parse_command(args: &[String]) -> Result<ControlCommand, String> {
         "platform" => match args.get(1).map(String::as_str) {
             Some("capabilities") => Ok(ControlCommand::PlatformCapabilities),
             _ => Err("usage: nexus platform capabilities".into()),
+        },
+        "run" => match args.get(1) {
+            Some(resource) => Ok(ControlCommand::Run {
+                resource: resource.clone(),
+            }),
+            None => Err("usage: nexus run <resource>".into()),
         },
         other => Err(format!("unknown command: {other}")),
     }
