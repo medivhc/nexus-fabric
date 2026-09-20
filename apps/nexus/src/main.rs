@@ -45,7 +45,7 @@ nexus — Nexus 统一 Resource Fabric 控制面 CLI（瘦客户端）
   dns cache                               DNS 缓存
   workspace heads <workspace>             Workspace Head Set
   workspace conflicts <workspace>         未合并冲突
-  workspace cache <workspace>            Workspace 缓存状态
+  workspace cache <workspace>             Workspace 缓存状态
   compute jobs                            Compute 任务
   diagnose                                统一诊断
   platform capabilities                   平台能力清单
@@ -55,6 +55,13 @@ nexus — Nexus 统一 Resource Fabric 控制面 CLI（瘦客户端）
 前置条件:
   观察命令需要先在另一个终端启动 `nexusd serve --addr <ip:port>`。
   daemon 未运行时，CLI 输出 DAEMON_UNREACHABLE FAIL JSON（exit 0）。
+
+输出:
+  --json        原样打印 observability 快照 JSON（机器可读，stderr 静默）。
+  默认          渲染人读文本视图（JSON 的字段投影）。
+  --socket <path> / --addr <ip:port>
+                thin-client 远程传输目标（--addr 为 TCP loopback；
+                --socket 暂仅服务端监听支持，CLI 建连待落地）。
 
 exit 语义（对齐 nexusd）:
   0             业务结果（含 verdict=FAIL / daemon 不可达，请求已被处理）。
@@ -75,10 +82,23 @@ fn split_json_flag(args: &[String]) -> (bool, Vec<String>) {
     (json_mode, rest)
 }
 
-/// 剥离全局 `--addr <ip:port>`；遇 `--socket` 报错（本构建不支持 socket 传输）。
-/// 返回 (addr, 剩余 args)。
-fn extract_transport_flags(args: &[String]) -> Result<(String, Vec<String>), String> {
-    let mut addr = DEFAULT_LOCALAPI_ADDR.to_string();
+/// thin-client 远程传输目标：Unix domain socket 或 TCP loopback 地址。
+///
+/// CLI 端当前仅支持 TCP loopback（`--addr`）；`--socket` 服务端监听已支持，
+/// CLI 建连待落地。
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // Socket variant reserved for future CLI socket transport; extract() returns Err on --socket.
+enum RemoteTarget {
+    /// `--socket <path>`（Unix: unix socket；Windows: named pipe）。
+    Socket(String),
+    /// `--addr <ip:port>`（TCP loopback）。
+    Tcp(String),
+}
+
+/// 从参数中剥离全局 `--addr <ip:port>`；遇 `--socket` 报错。
+/// 返回 (remote, 剩余 args)。
+fn extract_remote_target(args: &[String]) -> Result<(RemoteTarget, Vec<String>), String> {
+    let mut remote = RemoteTarget::Tcp(DEFAULT_LOCALAPI_ADDR.to_string());
     let mut rest = Vec::with_capacity(args.len());
     let mut i = 0;
     while i < args.len() {
@@ -88,7 +108,7 @@ fn extract_transport_flags(args: &[String]) -> Result<(String, Vec<String>), Str
                     .get(i + 1)
                     .filter(|v| !v.starts_with("--"))
                     .ok_or_else(|| "missing value for --addr".to_string())?;
-                addr = value.clone();
+                remote = RemoteTarget::Tcp(value.clone());
                 i += 2;
             }
             "--socket" => {
@@ -103,14 +123,22 @@ fn extract_transport_flags(args: &[String]) -> Result<(String, Vec<String>), Str
             }
         }
     }
-    Ok((addr, rest))
+    Ok((remote, rest))
 }
 
 fn run(args: &[String]) -> i32 {
-    let (addr, args) = match extract_transport_flags(args) {
+    let (target, args) = match extract_remote_target(args) {
         Ok(v) => v,
         Err(msg) => {
             eprintln!("error: {msg}");
+            eprint!("{USAGE}");
+            return 2;
+        }
+    };
+    let addr = match target {
+        RemoteTarget::Tcp(a) => a,
+        RemoteTarget::Socket(_) => {
+            eprintln!("error: --socket not supported in CLI client build");
             eprint!("{USAGE}");
             return 2;
         }
@@ -375,23 +403,23 @@ mod tests {
             "127.0.0.1:9999".to_string(),
             "status".to_string(),
         ];
-        let (addr, rest) = extract_transport_flags(&args).unwrap();
-        assert_eq!(addr, "127.0.0.1:9999");
+        let (target, rest) = extract_remote_target(&args).unwrap();
+        assert_eq!(target, RemoteTarget::Tcp("127.0.0.1:9999".into()));
         assert_eq!(rest, vec!["status".to_string()]);
     }
 
     #[test]
     fn addr_defaults_to_loopback() {
         let args = vec!["status".to_string()];
-        let (addr, rest) = extract_transport_flags(&args).unwrap();
-        assert_eq!(addr, DEFAULT_LOCALAPI_ADDR);
+        let (target, rest) = extract_remote_target(&args).unwrap();
+        assert_eq!(target, RemoteTarget::Tcp(DEFAULT_LOCALAPI_ADDR.into()));
         assert_eq!(rest, vec!["status".to_string()]);
     }
 
     #[test]
     fn socket_flag_is_rejected() {
         let args = vec!["--socket".to_string(), "/tmp/nexusd.sock".to_string()];
-        let err = extract_transport_flags(&args).unwrap_err();
+        let err = extract_remote_target(&args).unwrap_err();
         assert!(err.contains("--socket"));
         // 端到端：--socket 必须 exit 2（用法错误），且不触网。
         assert_eq!(run_str(&["--socket", "/tmp/nexusd.sock", "status"]), 2);
