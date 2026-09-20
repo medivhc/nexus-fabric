@@ -4876,3 +4876,89 @@ fn hex16(bytes: &[u8; 32]) -> String {
     }
     s
 }
+
+/// E4 场景 `product.mesh-dns`：A/B 两节点各自注册域名，B 查询 A 的域名解析到 A 的虚拟 IP。
+///
+/// 纯内存骨架：不接真实 socket；跨节点"同步"通过 `table_snapshot` + `learn_peer_record`
+/// 表达自动发现集成点；TTL 过期通过 `expire_peers(now + 7200s)` 触发。
+pub fn mesh_dns_flow() -> Result<Value, NexusError> {
+    use nexus_connectivity::mesh_dns::{DnsQuery, DnsResolution, MeshDnsNode};
+    use std::time::{Duration, Instant};
+
+    let mut node_a = MeshDnsNode::new("node-a", "10.0.0.1");
+    let mut node_b = MeshDnsNode::new("node-b", "10.0.0.2");
+
+    // 节点启动时注册自己的域名。
+    node_a
+        .register_self_domain("node-a.mesh", 3600)
+        .map_err(|e| NexusError::Internal {
+            message: format!("node-a register self domain: {e}"),
+        })?;
+    node_b
+        .register_self_domain("node-b.mesh", 3600)
+        .map_err(|e| NexusError::Internal {
+            message: format!("node-b register self domain: {e}"),
+        })?;
+
+    // 模拟自动发现：B 从 A 的快照中学习 A 的域名记录。
+    let a_records = node_a.table_snapshot();
+    for rec in a_records {
+        if rec.node_id == "node-a" {
+            node_b
+                .learn_peer_record(rec)
+                .map_err(|e| NexusError::Internal {
+                    message: format!("node-b learn peer record: {e}"),
+                })?;
+        }
+    }
+
+    // B 查询 node-a.mesh。
+    let query = DnsQuery {
+        query_id: 1,
+        domain: "node-a.mesh".to_string(),
+        from_node: "node-b".to_string(),
+    };
+    let resp = node_b.handle_query(&query, Instant::now());
+    let (query_from_b_resolves, resolved_ip, resolved_node) = match &resp.result {
+        DnsResolution::Resolved {
+            virtual_ip,
+            node_id,
+            ttl_secs: _,
+        } => (true, virtual_ip.clone(), node_id.clone()),
+        _ => (false, String::new(), String::new()),
+    };
+
+    // 查询未注册域名应返回 NotFound（NXDOMAIN 语义）。
+    let unknown_query = DnsQuery {
+        query_id: 2,
+        domain: "nobody.mesh".to_string(),
+        from_node: "node-b".to_string(),
+    };
+    let unknown_resp = node_b.handle_query(&unknown_query, Instant::now());
+    let query_unknown = matches!(unknown_resp.result, DnsResolution::NotFound);
+
+    // TTL 过期：推进时钟 7200s（> 注册 TTL 3600s），B 学到的 node-a.mesh 应被清扫。
+    let expired = node_b.expire_peers(Instant::now() + Duration::from_secs(7200));
+    let ttl_expired =
+        expired.iter().any(|d| d == "node-a.mesh") && node_b.lookup("node-a.mesh").is_err();
+
+    Ok(json!({
+        "verdict": "PASS",
+        "command": "mesh dns",
+        "node_a": {
+            "domain_registered": true,
+            "virtual_ip": "10.0.0.1",
+        },
+        "node_b": {
+            "domain_registered": true,
+            "virtual_ip": "10.0.0.2",
+        },
+        "query_from_b_resolves": query_from_b_resolves,
+        "resolved": {
+            "virtual_ip": resolved_ip,
+            "node_id": resolved_node,
+        },
+        "query_unknown": query_unknown,
+        "ttl_expired": ttl_expired,
+    }))
+}

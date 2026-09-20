@@ -1,0 +1,49 @@
+schema_version = 1
+id = "product.mesh-dns"
+title = "Mesh 网络内域名注册与跨节点解析闭环"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-mesh-dns"
+
+[given]
+subnet_cidr = "10.0.0.0/24"
+node_a_id = "node-a"
+node_a_virtual_ip = "10.0.0.1"
+node_b_id = "node-b"
+node_b_virtual_ip = "10.0.0.2"
+node_a_domain = "node-a.mesh"
+node_b_domain = "node-b.mesh"
+record_ttl_secs = 3600
+
+[when]
+command = "nexus-harness run mesh-dns --json"
+
+[[expect]]
+field = "node_a.domain_registered"
+equals = true
+
+[[expect]]
+field = "node_b.domain_registered"
+equals = true
+
+[[expect]]
+field = "query_from_b_resolves"
+equals = true
+
+# B 查询 node-a.mesh 应解析到 A 的虚拟 IP 与 node_id
+[[expect]]
+field = "resolved.virtual_ip"
+equals = "10.0.0.1"
+
+[[expect]]
+field = "resolved.node_id"
+equals = "node-a"
+
+# 查询未注册域名应返回 NotFound（NXDOMAIN 语义）
+[[expect]]
+field = "query_unknown"
+equals = true
+
+# 注册记录 TTL 过期后被清除
+[[expect]]
+field = "ttl_expired"
+equals = true

@@ -50,6 +50,10 @@ pub mod encryption;
 
 pub mod routing;
 
+// ---------- Mesh DNS（域名注册与解析） ----------
+
+pub mod mesh_dns;
+
 // ---------- 结构化错误（不以日志文本代替错误类型） ----------
 
 /// Connectivity 层的结构化错误（delivery 层自有错误面，不依赖领域错误）。
