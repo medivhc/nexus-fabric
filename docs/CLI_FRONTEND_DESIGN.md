@@ -1,6 +1,12 @@
 # nexus CLI 前端功能设计
 
-> 状态：设计稿（未实现）
+> 状态：~~设计稿（未实现）~~ **已过时 / superseded（2026-09-20）**：本设计（CLI 进程内接线
+> `observability`）已被 **thin-client 架构**取代——`nexus` CLI 经 `nexusd serve` 的 HTTP
+> LocalAPI 查询 daemon 快照，7 个命令有 daemon 路由，暂无路由命令（dns resolve/providers、
+> connectivity candidates/probe/links、workspace heads/conflicts/cache、compute jobs、
+> diagnose）本地合成显式 `UNSUPPORTED`，不回退进程内 observability（PRODUCT §9 禁止静默降级）。
+> 本文保留作历史参考；实施请以 PRODUCT §9.1（2026-09-20 requirement-change）、
+> `apps/nexus/src/main.rs` / `localapi_client.rs` 与代码为准。
 > 基线：master `23d504b`；依据代码 `apps/nexus/src/main.rs`、`apps/nexus/src/observability.rs`、`crates/nexus-control-api/src/lib.rs`、`apps/nexusd/src/main.rs`
 
 ---

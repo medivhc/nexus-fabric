@@ -14,17 +14,19 @@ stun_server = "stun.example.org:3478"
 command = "cargo run --quiet -p nexus --example nat_hole_punching -- --json"
 
 # 冻结期望：STUN 获取映射、NAT 类型检测、UDP 打洞成功。
+# （bugfix 2026-09-20：修复非法 TOML——`null` 非合法 TOML 值，`not_equals` / `greater_than`
+#  亦非 loader 支持的期望类型，场景此前无法加载求值；统一改为非空断言，语义不变。）
 [[expect]]
 field = "verdict"
 equals = "PASS"
 
 [[expect]]
 field = "stun.local_mapping"
-not_equals = null
+non_empty = true
 
 [[expect]]
 field = "stun.public_mapping"
-not_equals = null
+non_empty = true
 
 [[expect]]
 field = "nat.type"
@@ -36,4 +38,4 @@ equals = true
 
 [[expect]]
 field = "hole_punch.rtt_ms"
-greater_than = 0
+non_empty = true

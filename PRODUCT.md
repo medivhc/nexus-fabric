@@ -191,16 +191,25 @@ PRODUCT §9）。
 - `workspace cache`：输出内容存储缓存快照——对象计数、protected roots 计数与
   GC 保留期语义（mark_roots + sweep_older_than）。
 
-### 9.1 CLI 前端接线与双输出（2026-09-18 冻结）
+### 9.1 CLI 前端接线与双输出（2026-09-18 冻结；2026-09-20 requirement-change：thin-client）
 
-- `nexus` CLI 前端把全部 17 个 §9 观察命令接线到同一 `observability` 快照
-  （与 nexusd 同源，不复制领域逻辑），不再存在"其余命令返回 UNSUPPORTED"的接线缺口；
-  领域未就绪命令（如 `connectivity trace`）仍显式返回结构化 `UNSUPPORTED`。
-- 全局 `--json` 开关：`--json` 模式把快照 JSON 原样打到 stdout（单行 JSON，stderr 静默）；
-  默认模式渲染人读文本视图（JSON 的字段投影，风格对齐 `ControlOutput::to_lines`）。
+- `nexus` CLI 为 **thin-client**：观察命令经 `--addr`（默认 `127.0.0.1:18080`）查询
+  `nexusd serve` 的 HTTP LocalAPI，数据只来自 daemon 的 `observability` 快照
+  （与 nexusd 同源，CLI 不复制领域逻辑）。
+- 已实现 daemon 路由的 7 个命令（`status` / `dns status` / `dns cache` / `session watch` /
+  `plan explain` / `connectivity status` / `platform capabilities`）：查询 daemon 快照并原样渲染；
+  daemon 未运行 / 连接失败 → 结构化 `DAEMON_UNREACHABLE`（`--json`，exit 0）。
+- 暂无 daemon 路由的 10 个命令（`dns resolve` / `dns providers` / `connectivity candidates` /
+  `connectivity probe` / `connectivity links` / `workspace heads` / `workspace conflicts` /
+  `workspace cache` / `compute jobs` / `diagnose`）：CLI 本地合成显式 `UNSUPPORTED` FAIL JSON
+  （与 nexusd 兜底同形），**不回退到进程内 observability**——领域未就绪即显式拒绝，
+  禁止静默降级；对应命令在 `nexusd <verb> --json` 进程内路径仍可用。
+- `nexus run <resource>` 保持进程内 SDK 路径（LocalAPI 无对应路由）。
+- 全局 `--json` 开关：`--json` 模式把 daemon / 本地 JSON 原样打到 stdout（单行 JSON，stderr 静默）；
+  默认模式渲染人读文本视图（JSON 的字段投影）。
 - exit 语义对齐 nexusd：用法/解析错误（缺参、未知命令）exit 2 并打印 usage；
-  业务成功 exit 0；`NexusError` 领域拒绝输出 `verdict=FAIL` 结构化 JSON 且 exit 0
-  （请求已被处理，与 `print_json_result` 一致）。
+  业务成功 exit 0；结构化失败（`UNSUPPORTED` / `DAEMON_UNREACHABLE` / 领域拒绝）输出
+  `verdict=FAIL` JSON 且 exit 0（请求已被处理）。
 
 ## 10. 完成条件
 
