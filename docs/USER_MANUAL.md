@@ -1,19 +1,19 @@
 # Nexus 用户手册
 
 > 版本：基于 master
-> `6ff5fb1`
-> （2026-09-20 校验；工作区含未提交临时文件，dirty_state=true）
+> `0a819ed`
+> （2026-09-20 校验；工作区含未提交无关文件，dirty_state=true）
 > 校验证据：
 > `nexus-harness verify --full`
 > →
 > **21/21 门禁 PASS，0 FAIL，0 unknown**
 > （evidence
-> `verify-5f1ab155b802`
-> ，绑定 6ff5fb1 /dirty，contract_hash 9b9dcab3…）
-> 本次修复（requirement-change + bugfix，2026-09-20）后 product-scenarios 门禁转绿：
-> `product.nat-hole-punching` 场景进入求值并 PASS；
-> 9 个 `cli-*` 场景按 thin-client 契约（无路由命令显式 `UNSUPPORTED`）全部 PASS；
-> 修复记录见 §6.2。
+> `verify-25a825fea486`
+> ，绑定 0a819ed /dirty，contract_hash b7eb77d4…）
+> 2026-09-20：NAT 场景 TOML 修复 + 9 个 `cli-*` 场景 thin-client 契约（requirement-change）
+> 后 product-scenarios 转绿；随后 **Workspace Projection 通道落地**（NativeApi WorkingSet +
+> MaterializedDirectory 物化目录，E4 场景 `platform.workspace-projection-channels` 16 期望）
+> 已合并（0a819ed）。修复/落地记录见 §6.2。
 > 本手册所列每个功能的可机检场景（E4/E3）在本次校验中均 PASS。
 
 本手册只收录**有完整实现逻辑、用户可达**的功能。每个功能均附代码级校验：可机检场景（E4/E3）在 `verify --full` 中 PASS、可执行驱动（example / CLI 命令 / 集成测试）与来源代码路径。
@@ -142,7 +142,7 @@ cargo build --workspace
 | 37 | Proxy 规则路由内核                                            | `proxy-*` 场景族（见 §4.1.10）                                                                                                                                                                    | `nexusd proxy --addr <ip:port> [--config <path>]` / example |
 | 38 | 出站适配器（SS / VMess / Trojan）                              | `proxy-*-adapter` 等 8 场景（见 §4.1.10）                                                                                                                                                         | example                                                     |
 | 39 | 规则数据注入（geoip.nex/geosite.nex/rule-providers / Clash 订阅） | `geoip-nex-roundtrip` (8) / `geosite-nex-roundtrip` (8) / `proxy-rule-provider-fetch` (11) / `proxy-clash-subscription-parse` (9)                                                           | example / 配置                                                |
-| 40 | Workspace Projection 访问通道                               | `platform.workspace-projection-fallback` (4)                                                                                                                                                | example / SDK                                               |
+| 40 | Workspace Projection 访问通道                               | `platform.workspace-projection-fallback` (4) / `platform.workspace-projection-channels` (16)                                                                                                | example / SDK                                               |
 | 41 | nexusd serve 常驻 daemon（HTTP LocalAPI）                   | 集成测试 E3（`apps/nexusd/tests/serve_localapi_e2e.rs`，4 用例）                                                                                                                                     | `nexusd serve --addr <ip:port>`                             |
 | 42 | nexus CLI thin-client + run                             | `product.cli-run-command` (5)                                                                                                                                                               | `nexus run service --json` / `nexus status --json`          |
 | 43 | 真实节点数据面（host /relay/ SOCKS5）                            | `daemon-real-host-flow` (9) / `daemon-real-relay-flow` (9) / `daemon-real-socks-proxy-flow` (11) / `daemon-real-host-auth-denied` (5)                                                       | \`nexusd host                                               |
@@ -534,9 +534,9 @@ cargo build --workspace
 
   * SDK：`nexus_workspace::{WorkspaceAccess, NativeApiWorkspaceAccess, select_access_provider}`（`crates/nexus-workspace/src/lib.rs`）
 
-* **代码级校验**：场景 `platform.workspace-projection-fallback`（4 期望：选中 `MaterializedDirectory` + 产品语义保持）→ PASS
+* **代码级校验**：场景 `platform.workspace-projection-fallback`（4 期望：选中 `MaterializedDirectory` + 产品语义保持）→ PASS；`platform.workspace-projection-channels`（16 期望：NativeApi 读写/commit/恢复/NotFound + Materialized 物化/读写/回写）→ PASS（2026-09-20，feature/workspace-projection-api 合并）
 
-* **已知边界**：NativeApi 通道的 `read_file / write_file / delete / commit` 当前返回 `StoreFailure` 占位（`head / list_dir` 可用）；Materialized / NativeMount 目前为选择语义 + API 声明，具体目录实现待落地（见 §6.1）。
+* **已知边界**：NativeApi 通道已实现 WorkingSet 合并语义（read 合并 Head Manifest、write/delete 落 WorkingSet、commit 落新 Commit、list_dir 单层 + 合成父目录项、路径越界拒绝 `PathTraversal` / 缺失文件 `NotFound`）；MaterializedDirectory 已实现 Head Manifest 物化到本地目录 + 差异回写；NativeMountDirectory 真实目录挂载仍为 API 声明待落地（见 §6.1）。
 
 ### 4.5 Session
 
@@ -729,7 +729,7 @@ whitespace、format、check、clippy、architecture-policy、dependency-governan
 
 | 项                                       | 状态          | 说明                                                                                                                                   |
 | --------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| Workspace Projection 通道（NativeApi 文件操作） | 部分实现        | 三通道选择 + WorkspaceAccess trait 已实现（E4 PASS）；NativeApi 的 read/write/delete/commit 为 StoreFailure 占位；Materialized/NativeMount 具体目录实现待落地 |
+| Workspace Projection 通道（NativeApi + MaterializedDirectory） | 已实现 | 三通道选择 + NativeApi WorkingSet 读写/commit + MaterializedDirectory 物化目录均已落地（E4 `platform.workspace-projection-channels` 16 期望 PASS，2026-09-20）；NativeMountDirectory 真实目录挂载仍为 API 声明待落地 |
 | nexus CLI 观察命令                          | thin-client | 7 命令需先启动 `nexusd serve`（默认目标 127.0.0.1:18080）；其余 10 命令显式 UNSUPPORTED；`--socket` CLI 端未落地                                             |
 | nexusd serve `--socket`（Windows）        | UNSUPPORTED | named-pipe transport 未实现（std 无 named-pipe server，平台专有 I/O 应收敛到 nexus-platform-windows）；用 `--addr` TCP loopback                       |
 | http204 probe 与 https                   | 不支持         | P0 仅明文 HTTP；`target.scheme == https` 直接记为 `unreachable`（不做 TLS）                                                                      |
