@@ -238,6 +238,119 @@ pub fn select_access_provider(
     }
 }
 
+/// 目录条目（用于 list_dir）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    /// 条目路径（相对 workspace 根）
+    pub path: String,
+    /// 是否是目录
+    pub is_dir: bool,
+    /// 文件大小（字节），目录为 None
+    pub size: Option<u64>,
+}
+
+/// Workspace 统一访问接口
+///
+/// 无论底层是 Mount、物化目录还是纯 API，用户都通过这个 trait 访问。
+/// 访问通道只改变"怎么访问"，不改变权威模型（Commit DAG / Head Set / Manifest）。
+pub trait WorkspaceAccess {
+    /// 读取文件内容
+    fn read_file(&self, path: &str) -> Result<Vec<u8>, WorkspaceError>;
+
+    /// 写入文件内容（进入 WorkingSet）
+    fn write_file(&mut self, path: &str, content: &[u8]) -> Result<(), WorkspaceError>;
+
+    /// 列出目录内容
+    fn list_dir(&self, path: &str) -> Result<Vec<DirEntry>, WorkspaceError>;
+
+    /// 删除文件/目录
+    fn delete(&mut self, path: &str) -> Result<(), WorkspaceError>;
+
+    /// 提交变更到 Workspace
+    fn commit(&mut self, message: &str) -> Result<CommitId, WorkspaceError>;
+
+    /// 获取当前 Head
+    fn head(&self) -> Option<&CommitId>;
+
+    /// 获取当前访问通道类型
+    fn provider_type(&self) -> WorkspaceAccessProvider;
+}
+
+/// 原生 API 通道（纯结构化读写，不经文件系统投影）
+///
+/// 这是兜底通道：任何平台都能用，包括 WASM、嵌入式等无文件系统环境。
+pub struct NativeApiWorkspaceAccess<S: ContentStore> {
+    workspace: Workspace<S>,
+    provider: WorkspaceAccessProvider,
+}
+
+impl<S: ContentStore> NativeApiWorkspaceAccess<S> {
+    /// 创建原生 API 通道
+    pub fn new(workspace: Workspace<S>) -> Self {
+        Self {
+            workspace,
+            provider: WorkspaceAccessProvider::NativeApi,
+        }
+    }
+
+    /// 消费访问通道，拿回内部 Workspace
+    pub fn into_workspace(self) -> Workspace<S> {
+        self.workspace
+    }
+}
+
+impl<S: ContentStore> WorkspaceAccess for NativeApiWorkspaceAccess<S> {
+    fn read_file(&self, _path: &str) -> Result<Vec<u8>, WorkspaceError> {
+        // TODO: 从当前 head 的 manifest 中读取文件内容
+        // 当前简化：返回不支持的错误，因为我们还没有实现 read_file
+        Err(WorkspaceError::StoreFailure {
+            reason: "read_file not yet implemented for NativeApi".into(),
+        })
+    }
+
+    fn write_file(&mut self, path: &str, content: &[u8]) -> Result<(), WorkspaceError> {
+        // TODO: 写入到 WorkingSet
+        // 当前简化：返回不支持的错误
+        let _ = (path, content);
+        Err(WorkspaceError::StoreFailure {
+            reason: "write_file not yet implemented for NativeApi".into(),
+        })
+    }
+
+    fn list_dir(&self, path: &str) -> Result<Vec<DirEntry>, WorkspaceError> {
+        // TODO: 列出目录内容
+        // 当前简化：返回空列表
+        let _ = path;
+        Ok(Vec::new())
+    }
+
+    fn delete(&mut self, path: &str) -> Result<(), WorkspaceError> {
+        // TODO: 删除文件/目录
+        // 当前简化：返回不支持的错误
+        let _ = path;
+        Err(WorkspaceError::StoreFailure {
+            reason: "delete not yet implemented for NativeApi".into(),
+        })
+    }
+
+    fn commit(&mut self, message: &str) -> Result<CommitId, WorkspaceError> {
+        // TODO: 提交变更
+        // 当前简化：返回不支持的错误
+        let _ = message;
+        Err(WorkspaceError::StoreFailure {
+            reason: "commit not yet implemented for NativeApi".into(),
+        })
+    }
+
+    fn head(&self) -> Option<&CommitId> {
+        self.workspace.heads().heads.first()
+    }
+
+    fn provider_type(&self) -> WorkspaceAccessProvider {
+        self.provider
+    }
+}
+
 /// Manifest：路径 -> 内容对象。确定性序列化（按 path 排序），存入 CAS。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct Manifest {
