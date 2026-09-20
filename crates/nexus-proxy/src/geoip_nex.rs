@@ -158,6 +158,63 @@ where
     out
 }
 
+/// 解析 IPv4 文本为 u32（网络字节序：`a.b.c.d` → `a<<24 | b<<16 | c<<8 | d`）。
+///
+/// # Errors
+///
+/// 非 4 段 / 段非数字 / 段 > 255 → 结构化 `String` 错误。
+pub fn parse_ipv4(s: &str) -> Result<u32, String> {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() != 4 {
+        return Err(format!("invalid ipv4: {s}"));
+    }
+    let mut v = 0u32;
+    for p in parts {
+        let oct: u8 = p
+            .parse()
+            .map_err(|_| format!("invalid ipv4 octet {p:?} in {s}"))?;
+        v = (v << 8) | u32::from(oct);
+    }
+    Ok(v)
+}
+
+/// u32（网络字节序）转 IPv4 文本。
+#[must_use]
+pub fn format_ipv4(v: u32) -> String {
+    let o = v.to_be_bytes();
+    format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3])
+}
+
+/// 把 IPv4 整数区间 `[start, end]` 贪婪拆分为 CIDR 列表 `(base, prefix)`。
+///
+/// 纯函数零 I/O：从 `start` 起每次取当前对齐可容纳的最大 2^n 块，且不越过
+/// `end`；输出按地址升序且互不重叠（§11.15 源插件区间→CIDR）。
+///
+/// # Panics
+///
+/// `start > end` 时 panic（调用方应先校验区间合法）。
+#[must_use]
+pub fn cidrs_from_range(start: u32, end: u32) -> Vec<(u32, u8)> {
+    assert!(start <= end, "start {start} > end {end}");
+    let mut out = Vec::new();
+    let mut cur = u64::from(start);
+    let end = u64::from(end);
+    while cur <= end {
+        let room = end - cur + 1;
+        // 当前地址对齐允许的最大块：2^max_align（0 对齐 2^32 → /0 全段）。
+        let max_align = (cur as u32).trailing_zeros();
+        let mut size = 1u64 << max_align;
+        while size > room {
+            size >>= 1;
+        }
+        debug_assert!(size.is_power_of_two() && size <= room);
+        let prefix = 32 - size.trailing_zeros() as u8;
+        out.push((cur as u32, prefix));
+        cur += size;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +262,54 @@ mod tests {
         bytes.extend_from_slice(&u32::from_be_bytes([9, 9, 9, 0]).to_le_bytes());
         bytes.push(24);
         assert!(matches!(parse(&bytes), Err(ParseError::DuplicateCode(_))));
+    }
+
+    #[test]
+    fn ipv4_parse_and_format() {
+        assert_eq!(parse_ipv4("8.8.8.8").unwrap(), 0x0808_0808);
+        assert_eq!(parse_ipv4("1.0.1.0").unwrap(), 0x0100_0100);
+        assert_eq!(parse_ipv4("255.255.255.255").unwrap(), u32::MAX);
+        assert_eq!(format_ipv4(0x0808_0808), "8.8.8.8");
+        assert!(parse_ipv4("1.2.3").is_err());
+        assert!(parse_ipv4("1.2.3.256").is_err());
+        assert!(parse_ipv4("1.2.3.x").is_err());
+    }
+
+    #[test]
+    fn cidrs_single_ip() {
+        assert_eq!(
+            cidrs_from_range(0x0808_0808, 0x0808_0808),
+            vec![(0x0808_0808, 32)]
+        );
+        assert_eq!(cidrs_from_range(0, 0), vec![(0, 32)]);
+        assert_eq!(cidrs_from_range(u32::MAX, u32::MAX), vec![(u32::MAX, 32)]);
+    }
+
+    #[test]
+    fn cidrs_full_range() {
+        assert_eq!(cidrs_from_range(0, u32::MAX), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn cidrs_split_range() {
+        // 1.0.1.0 - 1.0.3.255 = 1.0.1.0/24 + 1.0.2.0/23
+        assert_eq!(
+            cidrs_from_range(0x0100_0100, 0x0100_03ff),
+            vec![(0x0100_0100, 24), (0x0100_0200, 23)]
+        );
+    }
+
+    #[test]
+    fn cidrs_cross_octet_boundary() {
+        // 1.0.0.255 - 1.0.1.0 跨 /24 边界：两个 /32。
+        assert_eq!(
+            cidrs_from_range(0x0100_00ff, 0x0100_0100),
+            vec![(0x0100_00ff, 32), (0x0100_0100, 32)]
+        );
+        // 10.0.0.0 - 10.0.0.255：单 /24。
+        assert_eq!(
+            cidrs_from_range(0x0a00_0000, 0x0a00_00ff),
+            vec![(0x0a00_0000, 24)]
+        );
     }
 }

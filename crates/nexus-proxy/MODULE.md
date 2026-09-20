@@ -105,6 +105,9 @@
     （§11.12 格式 v1，纯函数零 I/O，输出与 `RuleData.geoip` 兼容）；
   - `geosite_nex::parse(&[u8]) -> Result<HashMap<String, Vec<String>>, ParseError>`
     （§11.13 格式 v1，纯函数零 I/O，输出与 `RuleData.geosite` 兼容）；
+  - `geoip_nex::cidrs_from_range(start: u32, end: u32) -> Vec<(u32, u8)>`：
+    IPv4 区间贪婪拆分为 CIDR 列表（纯函数零 I/O，§11.15 源插件使用）；
+  - `geoip_nex::{parse_ipv4, format_ipv4}`：IPv4 文本 ↔ u32 互转（纯函数）；
   - `RuleData`：组合根注入的规则数据（geoip 国家码→CIDR、geosite 分类→域名、
     rule-providers 解析结果；`Default` 为空）；`RuleEngine::new` 委托空数据，
     `RuleEngine::with_data(config, &RuleData)` / `ProxyService::with_rule_data`

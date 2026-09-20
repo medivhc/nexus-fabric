@@ -724,6 +724,31 @@ GEOIP 国家库、GEOSITE 域名分类清单、rule-providers 本地规则集。
   行内容一致、缓存已落盘。
 - E5 场景：`proxy_rule_provider_fetch_https.toml`。
 
+### 11.15 公开数据源插件（ip2region TXT → `geoip.nex`，2026-09-20）
+
+§11.12 B 标注"公开数据源适配（GeoLite2 / ip2region 等）为 P1 源插件，不绑定许可"。
+本节落地首期源插件：**ip2region TXT 文本格式 → `geoip.nex`**（数据文件由用户自行
+获取，插件不绑定任何数据源的许可/下载流程）。
+
+- 输入：ip2region 公开 TXT（UTF-8），每行
+  `start_ip|end_ip|country|province|city|isp`（竖线分隔，7 列取前 2 列 IP 与第 3 列
+  国家）；空行 / `#` 注释行忽略；国家字段为 `0` / `内网IP` / `未分配` 或无法识别的
+  文本 → 跳过并计入 `skipped`（可观察，不静默丢弃）。
+- 国家映射：内置常用中文国家名 → ISO 3166-1 alpha-2 表（约 60 条，覆盖常见流量
+  国家）；映射表是纯数据，随源插件维护。
+- 区间转 CIDR：`nexus-proxy::geoip_nex::cidrs_from_range(start, end) -> Vec<(u32, u8)>`
+  （贪婪 2^n 拆分，纯函数零 I/O）——输出为 §11.12 B 兼容的 CIDR（base u32 + prefix）。
+- 工具：apps/nexus example `geoip_source_ip2region` 双模式：
+  - `geoip_source_ip2region <input.txt> <output.nex>`：真实文件模式，stdout
+    `ok <categories> <cidrs> <skipped>`；
+  - `geoip_source_ip2region --json`：内置确定性样本 → 生成 → 解析回读 → JSON
+    （供 E4 场景断言）。
+- 确定性策略：E2 单测（`cidrs_from_range` 边界：单 IP / 整段 / 跨 /8 边界 /
+  `parse_ipv4` 非法输入）+ E4 场景（内置样本 → 工具 → roundtrip 解析 → 断言
+  CN/US 的 CIDR 与 skipped 计数）。
+- 明确不做（后续批次）：ip2region xdb 二进制、GeoLite2 mmdb/CSV、数据自动下载。
+- E4 场景：`geoip_source_ip2region.toml`。
+
 ### 11.3 失败语义
 
 ```text
