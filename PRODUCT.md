@@ -702,6 +702,28 @@ GEOIP 国家库、GEOSITE 域名分类清单、rule-providers 本地规则集。
   E4 场景 roundtrip：内存构造 → 解析 → 注入 `RuleData.geosite` → 路由断言。
 - E4 场景：`geosite_nex_roundtrip.toml`。
 
+### 11.14 rule-provider TLS 在线拉取（https，2026-09-20）
+
+§11.12 A 的 `CachedHttpProviderFetcher` 仅支持 `http://` 明文；本节升级为支持
+`https://`（TLS 1.3，rustls），使真实 Clash 订阅的 https rule-provider 可消费。
+决策内核不变——`nexus-proxy` 保持纯决策零 I/O；`ProviderFetcher` trait 与
+`ProviderSource::{Local, Cached, Online}` 语义完全不变（TLS 命中仍为 `Online`）。
+
+- 配置：`url` 协议白名单由 `http://` 扩展为 `http:// | https://`；其余校验
+  （`refresh_interval_secs ≥ 1` 等）不变。
+- 实现（组合根 apps/nexus）：`CachedHttpProviderFetcher` 按 `url` 协议分流——
+  `http://` 走既有明文 GET（不变）；`https://` 走 rustls TLS 1.3 客户端 GET，
+  默认信任 Mozilla 根（`webpki-roots`），测试/自签场景可注入自定义 root store
+  （`with_tls_roots`）。拉取 → 写缓存 → `Online`；缓存新鲜 → `Cached`；拉取失败
+  → 回退过期缓存 → `Cached`；无任何可用数据 → 结构化失败（与 §11.12 一致，
+  `RULE_PROVIDER_FETCH_FAILED`，不静默降级）。
+- 失败语义：TLS 握手失败 / 证书校验失败 / 域名校验失败 → 结构化错误
+  （`RULE_PROVIDER_FETCH_FAILED`），不静默降级，不写坏缓存。
+- 确定性策略：E5 本地 TLS server（rcgen 自签证书 + rustls server）驱动真实
+  `CachedHttpProviderFetcher`（离线确定性闭环，不经公网）；断言 `source=Online`、
+  行内容一致、缓存已落盘。
+- E5 场景：`proxy_rule_provider_fetch_https.toml`。
+
 ### 11.3 失败语义
 
 ```text

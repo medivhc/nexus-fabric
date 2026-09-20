@@ -34,6 +34,11 @@ nexus-outbound-shadowsocks = { path = "../../crates/nexus-outbound-shadowsocks" 
 nexus-outbound-vmess = { path = "../../crates/nexus-outbound-vmess" }
 nexus-outbound-trojan = { path = "../../crates/nexus-outbound-trojan" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-native-certs = { version = "0.8", default-features = false }
 nexus-storage = { path = "../../crates/nexus-storage" }
 nexus-platform = { path = "../../crates/nexus-platform" }
 serde_json = { version = "1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# 仅示例/测试：本地 TLS server 自签证书（§11.14 E5 离线确定性闭环）。
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
