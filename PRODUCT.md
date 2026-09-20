@@ -121,6 +121,7 @@ Resolve -> Plan -> Session -> Connectivity -> Execute -> Observe
 - Service、InternetAccess、Compute 与 Workspace 是远程访问的首批资源类型；Workspace 远程语义为远程提交（Node A 经闭环向 Node B 的 Workspace 应用 ChangeSet 并取回新 Head）。
 - 远程闭环同时以两种形态交付：SDK 组合根函数（apps/nexus）与 daemon 单次执行入口（apps/nexusd `run <resource> --json`）；daemon 对未知资源返回结构化拒绝（`UNKNOWN_RESOURCE`，exit 0 = 请求已被处理）。
 - 真实网络交付（real transport）：远端闭环除进程内组合根外，提供真实 TCP 交付形态——提供方 `host` 在真实地址监听并完成**服务端**认证门控（`AUTH` 帧在业务帧前，失败返回 `AUTH_DENIED`）；请求方经静态发现解析真实 Endpoint 后建立真实帧流并执行线上认证；直连不可达时经真实 `relay`（`DIAL` + 字节中继）回退。wire 应用帧（AUTH/AUTH_OK/AUTH_DENIED/CONNECT/READY/ECHO/COMPUTE/RESULT/HTTP/DIAL/RELAY_OK）为应用层协议，传输帧格式仍冻结为 TCP + u32 大端长度前缀。
+- 链路加密（link encryption，WireGuard 风格，`nexus-connectivity::encryption`）：每个节点持有长期 X25519 密钥对；Direct 与 Relay 通道在建链后、承载业务帧之前必须完成一次握手——握手双方交换公钥并经 X25519 ECDH + HKDF-SHA256 派生一次性 `SessionKey`；**握手成功前不允许发送任何业务帧**，会话密钥每次握手重新派生、不复用长期私钥。数据帧使用 AEAD（ChaCha20Poly1305）加密并携带显式 64 位序号；接收方经滑动窗口做防重放校验，序号过旧或重复一律拒绝，且密文 tag 校验失败即整帧丢弃（不暴露明文）。P0 先交付全内存 mock 骨架与 E4 闭环，真实线上传输、握手重传与密钥周期轮换留 TODO。
 
 ## 7. Session 语义
 

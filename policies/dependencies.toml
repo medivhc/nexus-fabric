@@ -82,3 +82,18 @@ portability = "pure Rust, no OS-specific API; app is not on the portable-core WA
 supply_chain = "already present in Cargo.lock, no lockfile change required"
 approved = true
 approved_date = "2026-09-15"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-connectivity"
+crate = "ring"
+version = "0.17"
+default_features = false
+features = ["std"]
+architecture_layer = "delivery layer; only used by new `encryption` module (X25519/HKDF/AEAD), no new internal edge"
+feature_scope = "std feature only (alloc implied); no pem/test/dev features enabled"
+license = "Apache-2.0 AND ISC (allowlisted)"
+security = "no known advisories; already compiled in workspace via rustls 0.23"
+portability = "crate portable=false; BoringSSL C code already built on all supported host targets"
+supply_chain = "0.17.14 already pinned in Cargo.lock; no lockfile churn expected"
+approved = true
+approved_date = "2026-09-20"
