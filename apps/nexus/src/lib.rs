@@ -2633,6 +2633,125 @@ pub fn relay_fallback_flow() -> Result<Value, NexusError> {
     }))
 }
 
+/// 运行一次自动发现闭环的**离线确定性切片**（E4 `product.auto-discovery`）：
+/// 经引导节点注册自身 -> 从引导注册表对等发现 node-b/node-c -> 对每个 peer
+/// 复用 `RelayFallbackProbe` 编排 Direct 打洞（必然失败）回退 Relay（必然成功）->
+/// 任一 peer 建连成功即 `mark_connected`。全程零真实网络，事件序列与发现数量完全确定。
+///
+/// 依赖冻结的 `nexus_discovery::auto_discovery` API（DiscoveryConfig / BootstrapRegistry /
+/// AutoDiscovery / DiscoveredNode / DiscoveryState）；错误一律 typed `Result`，无 panic。
+pub fn auto_discovery_flow() -> Result<Value, NexusError> {
+    use nexus_discovery::auto_discovery::{
+        AutoDiscovery, BootstrapRegistry, DiscoveredNode, DiscoveryConfig,
+    };
+
+    let mut events: Vec<&'static str> = Vec::new();
+
+    // 1) 引导配置 + 内存注册表（预置两个已在线 peer，模拟 bootstrap 上的在线节点视图）。
+    let cfg = DiscoveryConfig {
+        bootstrap_nodes: vec!["bootstrap-1:7000".into(), "bootstrap-2:7000".into()],
+        node_id: "node-a".into(),
+    };
+    let node_id = cfg.node_id.clone();
+    let bootstrap_count = cfg.bootstrap_nodes.len();
+
+    let mut registry = BootstrapRegistry::new();
+    registry.register(DiscoveredNode {
+        node_id: "node-b".into(),
+        virtual_ip: "100.64.0.2".into(),
+        locator: "node-b.locator:7000".into(),
+        last_seen: 0,
+    });
+    registry.register(DiscoveredNode {
+        node_id: "node-c".into(),
+        virtual_ip: "100.64.0.3".into(),
+        locator: "node-c.locator:7000".into(),
+        last_seen: 0,
+    });
+
+    // 2) 自身注册到引导注册表，并上报心跳。
+    let mut auto_discovery = AutoDiscovery::new(cfg);
+    auto_discovery
+        .register(&mut registry, "100.64.0.1", "node-a.locator", 1000)
+        .map_err(|e| NexusError::Internal {
+            message: format!("auto-discovery self register failed: {e}"),
+        })?;
+    auto_discovery
+        .heartbeat(&mut registry, 1000)
+        .map_err(|e| NexusError::Internal {
+            message: format!("auto-discovery self heartbeat failed: {e}"),
+        })?;
+    events.push("bootstrap_registered");
+    events.push("heartbeat_ok");
+
+    // 3) 对等发现：从引导注册表取回在线 peer。
+    let peers = auto_discovery
+        .discover_peers(&registry)
+        .map_err(|e| NexusError::Internal {
+            message: format!("auto-discovery discover_peers failed: {e}"),
+        })?;
+    events.push("peers_discovered");
+
+    // 4) 对每个 peer 编排建连：Direct 打洞失败 -> Relay 回退成功（复用 RelayFallbackProbe）。
+    let mut discovered: Vec<Value> = Vec::new();
+    let mut any_connected = false;
+    for peer in &peers {
+        events.push("peer_link_attempted");
+        let direct = nexus_connectivity::LinkCandidate::new(
+            nexus_connectivity::LinkKind::Direct,
+            peer.locator.as_str(),
+            10,
+        );
+        let relay = nexus_connectivity::LinkCandidate::new(
+            nexus_connectivity::LinkKind::Relay,
+            "relay.example.org:9999",
+            50,
+        );
+        let selection = nexus_connectivity::LinkActivator::new(RelayFallbackProbe)
+            .activate(&direct, Some(&relay), false, false)
+            .map_err(|e| NexusError::Internal {
+                message: format!("auto-discovery peer link activation failed: {e}"),
+            })?;
+        let link_kind = match selection.kind {
+            nexus_connectivity::LinkKind::Direct => "Direct",
+            nexus_connectivity::LinkKind::Relay => "Relay",
+        };
+        discovered.push(json!({
+            "node_id": peer.node_id,
+            "virtual_ip": peer.virtual_ip,
+            "link": link_kind,
+        }));
+        events.push("peer_connected");
+        any_connected = true;
+    }
+
+    // 5) 任一 peer 建连成功即标记 Connected，否则离线。
+    if any_connected {
+        auto_discovery.mark_connected();
+    } else {
+        auto_discovery.mark_offline();
+    }
+    events.push("auto_discovery_completed");
+
+    let state = auto_discovery.state().as_str();
+    Ok(json!({
+        "verdict": "PASS",
+        "bootstrap": {
+            "registered": true,
+            "bootstrap_nodes": bootstrap_count,
+        },
+        "node": {
+            "node_id": node_id,
+            "state": state,
+        },
+        "discovered": {
+            "count": peers.len(),
+            "peers": discovered,
+        },
+        "events": events,
+    }))
+}
+
 /// 运行一次 Relay 不可用拒绝路径（PRODUCT §6）：Direct（NAT 不可达）与 Relay
 /// （中继端口未监听）均探测失败 -> `NoLinkAvailable` 结构化拒绝（NO_LINK_AVAILABLE）；
 /// 失败发生在 Connectivity 阶段，Session 逆序幂等回滚（Failed -> Draining -> Disposed），
