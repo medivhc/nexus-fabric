@@ -862,3 +862,70 @@ DECAPSULATION_ERROR         包解封装失败
   断言 C 的 VPI 收到原始 payload、B 的 bytes_forwarded > 0、A 与 C 的 peer 表
   互不可见（A 的 peers 只有 B，C 的 peers 只有 B）。
 - 冻结边界（P1 不做）：动态路由协议、最短路径算法、跨子网、加密、真实 TUN。
+
+
+### 12.6 P1.1 多跳动态路由（距离矢量，2026-09-20）
+
+§12.5 在冻结边界中明确"动态路由协议、最短路径算法"为 P1 不做项。
+本节作为 **requirement-change** 突破该边界，冻结 P1.1 的最小动态路由闭环：
+距离矢量（Distance Vector，Bellman-Ford 简化版），邻居间周期性交换路由通告，
+直连不可达时由中间节点转发。本任务为纯内存骨架，真实 UDP/socket 留 TODO。
+
+```text
+线性拓扑（4 节点，两端无直连，经 3 跳可达）：
+  A (10.0.0.1) -- B (10.0.0.2) -- C (10.0.0.3) -- D (10.0.0.4)
+  A 与 D 不直连；A -> D 的包依次经 B、C 转发
+```
+
+- 拓扑发现：节点启动时已知直连邻居（add_direct_peer，cost=1）；非直连目标
+  完全依靠邻居通告学习，不做链路状态泛洪、不做 SPF。
+- 路由数据结构：
+  - RouteEntry { destination: String, next_hop: String, cost: u32,
+    last_updated_tick: u64 }；
+  - RoutingTable { local_virtual_ip, entries: HashMap<dst, RouteEntry> }；
+  - 路由通告 RoutingAdvertisement = Vec<(dst_virtual_ip, cost)>（发给邻居的路由视图）。
+- 距离矢量合并规则（apply_advertisement(from_peer, adv, now_tick)）：
+  - 对 adv 中每条 (dst, cost_via)，候选代价 candidate = cost_via + 1；
+  - 跳过 dst == from_peer 的条目（对端自身由 add_direct_peer 直连维护，
+    不通过其通告反向再学一条 cost=1 的对等路由）；
+  - 本地无该 dst -> 新增 RouteAdded；
+  - 本地已有且 next_hop == from_peer -> 刷新 last_updated_tick（同下一跳路由
+    保持新鲜；cost 变化时发 RouteUpdated）；
+  - 本地已有但 candidate < existing.cost -> 切换下一跳为 from_peer，发 RouteUpdated；
+  - 其余情况保持原条目不动。
+- 水平分割（Split Horizon，防环路的最小实现）：
+  advertise_to(neighbor) 生成发给 neighbor 的通告时，**不包含**
+  next_hop == neighbor 的条目——即从 neighbor 学到的路由，不再发回 neighbor。
+- 路由超时：expire_stale(now_tick, ticks_to_live) 删除
+  now_tick - last_updated_tick > ticks_to_live 的条目，每条发 RouteExpired。
+  时间由显式 now_tick: u64 逻辑时钟推进，**不 sleep、不 tokio**。
+- 转发语义（MultihopRouter::forward(packet, now_tick)）：
+  - 包结构 RoutablePacket { src, dst, ttl: u8, payload }，初始 TTL=64；
+  - dst == local_virtual_ip -> DeliverLocal（本地交付）；
+  - ttl == 0 -> 错误 TtlExceeded 并发 TtlExceeded 事件（防无限循环）；
+  - 查路由表命中 -> ForwardTo { next_hop, ttl: packet.ttl - 1 }，
+    并发 PacketForwarded { src, dst, next_hop, ttl } 事件；
+  - 未命中 -> 错误 NoRouteToDst。
+- 错误码：
+  - NoRouteToDst { dst }：路由表无 dst 条目（与 §12.5 语义对齐，本模块独立
+    类型化 enum，不复用 ConnectivityError::Invalid 字符串匹配）；
+  - TtlExceeded { dst, hops }：TTL 耗尽仍未到目的地；
+  - InvalidPacket { message }：包字段非法（空 src/dst 等）；
+  - NotADirectPeer { peer }：转发目标不是直连邻居（骨架期由上层校验）。
+- 可观察性：
+  - RoutingEvent 枚举：RouteAdded{dst,next_hop,cost} /
+    RouteUpdated{dst,old_cost,new_cost} / RouteExpired{dst} /
+    PacketForwarded{src,dst,next_hop,ttl} / TtlExceeded{dst,hop_count}；
+  - MultihopRouter 累积事件，events() / take_events() 供 Owner 状态机消费。
+- E4 场景：scenarios/product/multihop_routing.toml（id=product.multihop-routing），
+  命令 nexus-harness run multihop-routing --json：
+  - 4 节点线性拓扑 A--B--C--D，初始仅直连邻居；
+  - 2~3 轮通告后收敛：A 到 D 的 next_hop=B、cost=3；D 到 A 对称；
+  - A->D 发一包，逐跳 A->B->C->D，D 本地交付，TTL 从 64 递减到 61；
+  - 推进逻辑时钟超过 TTL 后某条非直连路由被 RouteExpired 删除。
+- 冻结边界（P1.1 不做）：
+  - 真实 UDP 发送/接收、socket、平台 TUN 一律 TODO（纯内存 mock）；
+  - <=3 跳以内的简单路由，不做完整 Bellman-Ford 全量迭代计数、不做毒性反转
+    （poison reverse）、不做触发更新；
+  - 不跨子网、不接加密（复用 §12 既有 encryption 概念，本任务不接入）；
+  - 不引入 tokio / 异步任务 / 长期 spawn（显式 tick 推进，纯同步纯函数骨架）。
