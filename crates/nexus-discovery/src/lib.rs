@@ -262,7 +262,7 @@ const FRAME_PEER_UNKNOWN: u8 = 3;
 const FRAME_PEER_EXPIRED: u8 = 4;
 
 /// 写入长度前缀字符串（u16 BE + UTF-8）。
-fn put_str(out: &mut Vec<u8>, s: &str) -> Result<(), DiscoveryError> {
+pub(crate) fn put_str(out: &mut Vec<u8>, s: &str) -> Result<(), DiscoveryError> {
     let len =
         u16::try_from(s.len()).map_err(|_| DiscoveryError::Transport("string too long".into()))?;
     out.extend_from_slice(&len.to_be_bytes());
@@ -271,7 +271,7 @@ fn put_str(out: &mut Vec<u8>, s: &str) -> Result<(), DiscoveryError> {
 }
 
 /// 读取长度前缀字符串（u16 BE + UTF-8）。
-fn get_str(buf: &[u8], pos: &mut usize) -> Result<String, DiscoveryError> {
+pub(crate) fn get_str(buf: &[u8], pos: &mut usize) -> Result<String, DiscoveryError> {
     if *pos + 2 > buf.len() {
         return Err(DiscoveryError::Transport("frame truncated".into()));
     }
@@ -594,3 +594,7 @@ mod network_discovery_tests {
         );
     }
 }
+
+// ---------- 自动节点发现（引导注册 + 对等发现 + 心跳保活；纯内存骨架） ----------
+
+pub mod auto_discovery;

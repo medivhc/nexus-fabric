@@ -81,6 +81,44 @@
 网络发现只解析 Endpoint，建连仍走后续 Plan/Connectivity 阶段；
 过期 Presence 经协议返回 `PeerExpired`，客户端不得使用过期 Endpoint。
 
+### 冻结契约（自动发现扩展，scenarios/product/auto_discovery.toml）
+
+纯同步、内存骨架、无新依赖、无 tokio/async；真实网络传输留 TODO，由 Composition Root 注入。
+
+- `pub struct DiscoveryConfig { pub bootstrap_nodes: Vec<String>, pub node_id: String }`
+  自动发现配置（bootstrap_nodes 为引导节点标识串；node_id 为本节点标识）。
+- `pub enum DiscoveryState { Idle, Discovering, Connected, Offline }`
+  状态机（`#[derive(Debug, Clone, Copy, PartialEq, Eq)]`）；
+  `pub fn as_str(self) -> &'static str` 返回 `"idle"/"discovering"/"connected"/"offline"`。
+- `pub struct DiscoveredNode { pub node_id: String, pub virtual_ip: String, pub locator: String, pub last_seen: u64 }`
+  已发现对等节点（Identity != Locator；last_seen 由调用方注入，便于确定性测试）。
+- `pub struct BootstrapRegistry { peers: Vec<DiscoveredNode> }`：引导注册中心（服务端侧，纯内存、无 I/O）。
+  - `pub fn new() -> Self`
+  - `pub fn register(&mut self, node: DiscoveredNode)`：按 node_id 幂等 upsert，刷新 virtual_ip/locator/last_seen。
+  - `pub fn get_peers(&self, exclude: &str) -> Vec<DiscoveredNode>`：排除 self，按 node_id 升序返回以保证确定性。
+  - `pub fn heartbeat(&mut self, node_id: &str, now: u64) -> Result<(), DiscoveryError>`：
+    刷新 last_seen；未知节点返回 `PeerUnknown(PeerId)`。
+  - `pub fn peer_count(&self) -> usize`：注册节点总数（含 self）。
+- `pub struct AutoDiscovery { config, state, known_peers }`：自动发现状态机（客户端侧；心跳由 Owner 周期性调用 `heartbeat()` 驱动）。
+  - `pub fn new(config: DiscoveryConfig) -> Self`（初始 `Idle`）。
+  - `pub fn state(&self) -> DiscoveryState` / `pub fn config(&self) -> &DiscoveryConfig` / `pub fn known_peers(&self) -> &[DiscoveredNode]`。
+  - `pub fn register(&mut self, registry: &mut BootstrapRegistry, virtual_ip: &str, locator: &str, now: u64) -> Result<(), DiscoveryError>`
+    把本节点 upsert 进 registry；state: `Idle -> Discovering`。
+  - `pub fn discover_peers(&mut self, registry: &BootstrapRegistry) -> Result<Vec<DiscoveredNode>, DiscoveryError>`
+    拉取 peers 更新 `known_peers`；拉到至少一个 peer 时 state 保持 `Discovering`（建连成功后由调用方 `mark_connected`）。
+  - `pub fn heartbeat(&mut self, registry: &mut BootstrapRegistry, now: u64) -> Result<(), DiscoveryError>`：透传 `registry.heartbeat` 错误。
+  - `pub fn mark_connected(&mut self)` / `pub fn mark_offline(&mut self)`：状态转移到 `Connected` / `Offline`。
+- `pub enum AutoDiscoveryFrame { Register{node_id, virtual_ip, locator}, GetPeers{node_id}, PeerList{peers}, Heartbeat{node_id, now} }`
+  `pub fn encode_auto_frame(&AutoDiscoveryFrame) -> Result<Vec<u8>, DiscoveryError>` / `pub fn decode_auto_frame(&[u8]) -> Result<AutoDiscoveryFrame, DiscoveryError>`
+  帧格式：type tag (u8) Register=11 / GetPeers=12 / PeerList=13 / Heartbeat=14；
+  字符串为 u16 BE 长度前缀 + UTF-8（复用 lib.rs `put_str`/`get_str`）；u64 为大端 8 字节；
+  PeerList 节点数量为 u16 BE 前缀，每个节点依次 node_id/virtual_ip/locator 三字符串 + last_seen u64。
+  空帧/未知 tag/截断/非法 utf8/越界一律返回 `Transport(String)`。
+
+冻结语义：发现 != 建连——`AutoDiscovery` 只做注册/拉取/心跳，不发起 Connectivity；
+建连由 Composition Root 编排；状态机转移为 `Idle -> Discovering -> Connected -> Offline`；
+`register`/`heartbeat`/`discover_peers` 均为纯内存操作，无网络 I/O。
+
 ### 冻结契约（remote P0，scenarios/product/remote_service_access_flow.toml）
 
 - `pub struct PeerId(pub String)`：提供方节点标识。Identity != Locator：Peer 不携带 Endpoint 本身。
