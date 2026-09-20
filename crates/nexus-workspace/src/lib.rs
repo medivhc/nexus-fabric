@@ -350,10 +350,7 @@ impl<S: ContentStore> WorkspaceAccess for NativeApiWorkspaceAccess<S> {
         // 合并 WorkingSet：从 head_paths 构建初始集合。
         let mut merged: HashMap<String, u64> = HashMap::new();
         for p in &head_paths {
-            // 不读取内容来计算大小——在 NativeApi 通道中，
-            // 我们从 store 读取来获取大小（但为了性能，我们只列文件名）。
             if !self.staged_deletes.contains(p) {
-                // 对于已提交文件，尝试读取大小。
                 if let Some(bytes) = self.workspace.read_from_head(p)? {
                     merged.insert(p.clone(), bytes.len() as u64);
                 }
@@ -370,31 +367,51 @@ impl<S: ContentStore> WorkspaceAccess for NativeApiWorkspaceAccess<S> {
             merged.remove(p);
         }
 
-        // 单层列表：只列出 path 目录下的直接子条目（不递归）。
+        // 单层列表：列出 path 目录下的直接子条目（合成父目录项）。
         let prefix = if path.is_empty() {
             String::new()
         } else {
             format!("{}/", path)
         };
 
-        let mut entries: Vec<DirEntry> = merged
-            .keys()
-            .filter(|p| p.starts_with(&prefix))
-            .filter(|p| {
-                // 只保留直接子条目：strip prefix 后不再包含 '/'。
-                let relative = p.strip_prefix(&prefix).unwrap_or(p);
-                !relative.contains('/')
-            })
-            .map(|p| {
-                let relative = p.strip_prefix(&prefix).unwrap_or(p);
-                // 判断是否是目录（存在子路径以它为前缀）。
-                let is_dir = merged.keys().any(|q| q.starts_with(&format!("{}/", p)));
-                let size = if is_dir { None } else { merged.get(p).copied() };
-                DirEntry {
-                    path: relative.to_string(),
-                    is_dir,
-                    size,
-                }
+        // 收集直接子条目：
+        // - 文件：strip prefix 后无 '/' → 作为文件条目
+        // - 目录：strip prefix 后有 '/' → 取第一段作为目录条目
+        let mut entries_map: HashMap<String, (bool, Option<u64>)> = HashMap::new();
+
+        for p in merged.keys() {
+            if !p.starts_with(&prefix) {
+                continue;
+            }
+            let relative = p.strip_prefix(&prefix).unwrap_or(p);
+            if relative.is_empty() {
+                continue;
+            }
+            // 取第一段（直接子条目名）。
+            let first_segment = relative.split('/').next().unwrap_or(relative);
+            // 判断是否是目录：存在其他路径以 first_segment/ 开头。
+            let is_dir = merged
+                .keys()
+                .any(|q| q.starts_with(&format!("{prefix}{first_segment}/")));
+
+            if is_dir {
+                entries_map
+                    .entry(first_segment.to_string())
+                    .or_insert((true, None));
+            } else {
+                let size = merged.get(p).copied();
+                entries_map
+                    .entry(first_segment.to_string())
+                    .or_insert((false, size));
+            }
+        }
+
+        let mut entries: Vec<DirEntry> = entries_map
+            .into_iter()
+            .map(|(name, (is_dir, size))| DirEntry {
+                path: name,
+                is_dir,
+                size,
             })
             .collect();
 

@@ -80,7 +80,7 @@ Merge/Commit/持久化路径必须返回结构化 `WorkspaceError`，不得 pani
     `delete` 写入内存暂存 `HashSet<String>`（标记删除）；`read_file` 先查 WorkingSet
     （含暂存删 → `NotFound`），再从当前 Head Manifest 经 ContentStore 读取；
     `list_dir` 合并 WorkingSet 暂存变更与当前 Head Manifest。
-  - `commit(message: &str)`：把 WorkingSet 暂存内容 + 删除集合落成新 Commit
+  - `commit()`：把 WorkingSet 暂存内容 + 删除集合落成新 Commit
     （复用 `journal_pending` / `commit_pending` 或等价路径），Head 前进，
     WorkingSet 清空。返回新 CommitId。
   - `pub struct MaterializedDirectoryAccess<S: ContentStore>`：物化目录访问通道。
@@ -88,10 +88,10 @@ Merge/Commit/持久化路径必须返回结构化 `WorkspaceError`，不得 pani
     构造时把当前 Head Manifest 的全部文件物化到 `dir`（递归创建子目录）。
   - `pub fn into_parts(self) -> (Workspace<S>, PathBuf)`：消费通道，拿回 Workspace 与目录路径。
   - `read_file` / `write_file` / `list_dir` / `delete`：直接操作本地文件系统。
-  - `commit(message: &str)`：扫描 `dir` 与构造时快照（Manifest）的差异——
+  - `commit()`：扫描 `dir` 与构造时快照（Manifest）的差异——
     新增 / 修改文件 → `Change`，删除文件 → 从 Manifest 移除——构建 ChangeSet
     提交回 Workspace，Head 前进。
-- `WorkspaceError` 新增变体：`NotFound { path: String }`（读取 / 删除不存在的路径）。
+- `WorkspaceError` 新增变体：`NotFound { path: String }`（读取 / 删除不存在的路径）、`PathTraversal { path: String }`（路径越界）。
 - 场景映射：`scenarios/platform/workspace_projection_channels.toml` 由
   `crates/nexus-workspace/examples/workspace_projection_channels.rs` 驱动，经
   harness 的 `product-scenarios` gate 求值。
