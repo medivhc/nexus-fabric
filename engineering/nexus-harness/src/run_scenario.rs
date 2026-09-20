@@ -11,6 +11,7 @@ pub fn run_scenario(args: &[String]) -> Outcome {
         "virtual-subnet-mesh" => run_virtual_subnet_mesh(),
         "nat-hole-punching" => run_nat_hole_punching(),
         "multihop-routing" => run_multihop_routing(),
+        "mesh-dns" => run_mesh_dns(),
         _ => (
             "BLOCKED".to_string(),
             format!("unknown run subcommand: {subcommand}"),
@@ -644,6 +645,120 @@ fn run_multihop_routing() -> Outcome {
             "FAIL".to_string(),
             format!(
                 "multihop-routing: invariants failed (delivered={delivered}, ttl={ttl_arrives_d}, fwd_events={forward_event_count}, expired={route_expired}, expired_contains_d={expired_contains_d})"
+            ),
+            extra,
+        )
+    }
+}
+
+/// E4: Mesh DNS 域名注册与跨节点解析（内存骨架）。
+///
+/// 与 `nexus::mesh_dns_flow()` 同语义；按 nexus-harness 架构策略（allowed_internal_dependencies
+/// 不含 app 层 `nexus`）直接用 `nexus_connectivity::mesh_dns` 内联实现。
+fn run_mesh_dns() -> Outcome {
+    use nexus_connectivity::mesh_dns::{DnsQuery, DnsResolution, MeshDnsNode};
+    use std::time::{Duration, Instant};
+
+    let mut node_a = MeshDnsNode::new("node-a", "10.0.0.1");
+    let mut node_b = MeshDnsNode::new("node-b", "10.0.0.2");
+
+    if let Err(e) = node_a.register_self_domain("node-a.mesh", 3600) {
+        return (
+            "FAIL".to_string(),
+            format!("mesh-dns: node-a register self domain: {e}"),
+            Vec::new(),
+        );
+    }
+    if let Err(e) = node_b.register_self_domain("node-b.mesh", 3600) {
+        return (
+            "FAIL".to_string(),
+            format!("mesh-dns: node-b register self domain: {e}"),
+            Vec::new(),
+        );
+    }
+
+    // 模拟自动发现：B 从 A 的快照学习 A 的域名记录。
+    for rec in node_a.table_snapshot() {
+        if rec.node_id == "node-a" {
+            if let Err(e) = node_b.learn_peer_record(rec) {
+                return (
+                    "FAIL".to_string(),
+                    format!("mesh-dns: node-b learn peer record: {e}"),
+                    Vec::new(),
+                );
+            }
+        }
+    }
+
+    // B 查询 node-a.mesh。
+    let query = DnsQuery {
+        query_id: 1,
+        domain: "node-a.mesh".to_string(),
+        from_node: "node-b".to_string(),
+    };
+    let resp = node_b.handle_query(&query, Instant::now());
+    let (query_from_b_resolves, resolved_ip, resolved_node) = match &resp.result {
+        DnsResolution::Resolved {
+            virtual_ip,
+            node_id,
+            ..
+        } => (true, virtual_ip.clone(), node_id.clone()),
+        _ => (false, String::new(), String::new()),
+    };
+
+    // 查询未注册域名应返回 NotFound。
+    let unknown_query = DnsQuery {
+        query_id: 2,
+        domain: "nobody.mesh".to_string(),
+        from_node: "node-b".to_string(),
+    };
+    let unknown_resp = node_b.handle_query(&unknown_query, Instant::now());
+    let query_unknown = matches!(unknown_resp.result, DnsResolution::NotFound);
+
+    // TTL 过期：推进时钟 7200s（> 注册 TTL 3600s）。
+    let expired = node_b.expire_peers(Instant::now() + Duration::from_secs(7200));
+    let ttl_expired =
+        expired.iter().any(|d| d == "node-a.mesh") && node_b.lookup("node-a.mesh").is_err();
+
+    let ok = query_from_b_resolves
+        && resolved_ip == "10.0.0.1"
+        && resolved_node == "node-a"
+        && query_unknown
+        && ttl_expired;
+
+    let extra = vec![
+        (
+            "node_a".to_string(),
+            json!({ "domain_registered": true, "virtual_ip": "10.0.0.1" }),
+        ),
+        (
+            "node_b".to_string(),
+            json!({ "domain_registered": true, "virtual_ip": "10.0.0.2" }),
+        ),
+        (
+            "query_from_b_resolves".to_string(),
+            json!(query_from_b_resolves),
+        ),
+        (
+            "resolved".to_string(),
+            json!({ "virtual_ip": resolved_ip, "node_id": resolved_node }),
+        ),
+        ("query_unknown".to_string(), json!(query_unknown)),
+        ("ttl_expired".to_string(), json!(ttl_expired)),
+    ];
+
+    if ok {
+        (
+            "PASS".to_string(),
+            "mesh-dns: domain registration + cross-node resolution + TTL expiry verified"
+                .to_string(),
+            extra,
+        )
+    } else {
+        (
+            "FAIL".to_string(),
+            format!(
+                "mesh-dns: invariants failed (resolves={query_from_b_resolves}, unknown={query_unknown}, ttl_expired={ttl_expired})"
             ),
             extra,
         )
