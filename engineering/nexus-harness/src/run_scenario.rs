@@ -10,6 +10,7 @@ pub fn run_scenario(args: &[String]) -> Outcome {
         "virtual-subnet-tunnel" => run_virtual_subnet_tunnel(),
         "virtual-subnet-mesh" => run_virtual_subnet_mesh(),
         "nat-hole-punching" => run_nat_hole_punching(),
+        "multihop-routing" => run_multihop_routing(),
         _ => (
             "BLOCKED".to_string(),
             format!("unknown run subcommand: {subcommand}"),
@@ -322,4 +323,329 @@ fn run_nat_hole_punching() -> Outcome {
             ("events.count".to_string(), json!(event_count)),
         ],
     )
+}
+
+/// E4 测试：四节点线性拓扑距离矢量多跳路由（PRODUCT §12.6）。
+///
+/// 拓扑：A(10.0.0.1) -- B(10.0.0.2) -- C(10.0.0.3) -- D(10.0.0.4)。
+/// 初始仅直连邻居；3 轮邻居通告后收敛；A->D 包经 3 跳到达 D 本地交付；
+/// 推进逻辑时钟超过 TTL 后 A 的远端路由 D 被超时删除。
+fn run_multihop_routing() -> Outcome {
+    use nexus_connectivity::routing::{
+        ForwardDecision, MultihopRouter, RoutablePacket, RoutingEvent,
+    };
+
+    // ---- 1. 建拓扑 ----
+    let mut a = MultihopRouter::new("10.0.0.1");
+    let mut b = MultihopRouter::new("10.0.0.2");
+    let mut c = MultihopRouter::new("10.0.0.3");
+    let mut d = MultihopRouter::new("10.0.0.4");
+
+    a.table_mut().add_direct_peer("10.0.0.2", 0);
+    b.table_mut().add_direct_peer("10.0.0.1", 0);
+    b.table_mut().add_direct_peer("10.0.0.3", 0);
+    c.table_mut().add_direct_peer("10.0.0.2", 0);
+    c.table_mut().add_direct_peer("10.0.0.4", 0);
+    d.table_mut().add_direct_peer("10.0.0.3", 0);
+
+    // 邻居表（每节点通告对象）。
+    let neighbors: [Vec<&str>; 4] = [
+        vec!["10.0.0.2"],
+        vec!["10.0.0.1", "10.0.0.3"],
+        vec!["10.0.0.2", "10.0.0.4"],
+        vec!["10.0.0.3"],
+    ];
+
+    // ---- 2. 3 轮距离矢量通告收敛 ----
+    for tick in 1..=3u64 {
+        // 不可变快照阶段：收集 (src, dst, adv)。
+        type Delivery = (String, String, Vec<(String, u32)>);
+        let deliveries: Vec<Delivery> = [
+            (&a, &neighbors[0]),
+            (&b, &neighbors[1]),
+            (&c, &neighbors[2]),
+            (&d, &neighbors[3]),
+        ]
+        .into_iter()
+        .flat_map(|(r, ns)| {
+            ns.iter().map(move |n| {
+                (
+                    r.table().local_virtual_ip().to_string(),
+                    n.to_string(),
+                    r.table().advertise_to(n),
+                )
+            })
+        })
+        .collect();
+        // 可变投递阶段。
+        for (src, dst, adv) in deliveries {
+            match dst.as_str() {
+                "10.0.0.1" => {
+                    a.table_mut().apply_advertisement(&src, &adv, tick);
+                }
+                "10.0.0.2" => {
+                    b.table_mut().apply_advertisement(&src, &adv, tick);
+                }
+                "10.0.0.3" => {
+                    c.table_mut().apply_advertisement(&src, &adv, tick);
+                }
+                "10.0.0.4" => {
+                    d.table_mut().apply_advertisement(&src, &adv, tick);
+                }
+                other => {
+                    return (
+                        "FAIL".to_string(),
+                        format!("multihop-routing: unknown neighbor {other}"),
+                        Vec::new(),
+                    );
+                }
+            }
+        }
+    }
+
+    // ---- 3. 收敛断言 ----
+    let a_to_d = match a.table().lookup("10.0.0.4") {
+        Some(e) => e.clone(),
+        None => {
+            return (
+                "FAIL".to_string(),
+                "multihop-routing: A did not learn route to D after 3 rounds".to_string(),
+                Vec::new(),
+            );
+        }
+    };
+    let d_to_a = match d.table().lookup("10.0.0.1") {
+        Some(e) => e.clone(),
+        None => {
+            return (
+                "FAIL".to_string(),
+                "multihop-routing: D did not learn route to A after 3 rounds".to_string(),
+                Vec::new(),
+            );
+        }
+    };
+
+    if a_to_d.next_hop != "10.0.0.2" || a_to_d.cost != 3 {
+        return (
+            "FAIL".to_string(),
+            format!("multihop-routing: A->D route wrong: {:?}", a_to_d),
+            Vec::new(),
+        );
+    }
+    if d_to_a.next_hop != "10.0.0.3" || d_to_a.cost != 3 {
+        return (
+            "FAIL".to_string(),
+            format!("multihop-routing: D->A route wrong: {:?}", d_to_a),
+            Vec::new(),
+        );
+    }
+
+    // ---- 4. A->D 发包，逐跳转发 ----
+    let pkt = RoutablePacket::new("10.0.0.1", "10.0.0.4", b"hello-multihop");
+    let mut cur = pkt;
+    let mut ttl_at_each_hop: Vec<u8> = Vec::new();
+
+    // A -> B
+    let decision_a = match a.forward(&cur, 4) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                "FAIL".to_string(),
+                format!("multihop-routing: A forward failed: {e}"),
+                Vec::new(),
+            );
+        }
+    };
+    let next_b = match decision_a {
+        ForwardDecision::ForwardTo { next_hop, ttl } => {
+            ttl_at_each_hop.push(ttl);
+            cur = RoutablePacket { ttl, ..cur };
+            next_hop
+        }
+        other => {
+            return (
+                "FAIL".to_string(),
+                format!("multihop-routing: A expected ForwardTo, got {:?}", other),
+                Vec::new(),
+            );
+        }
+    };
+    debug_assert_eq!(next_b, "10.0.0.2");
+
+    // B -> C
+    let decision_b = match b.forward(&cur, 4) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                "FAIL".to_string(),
+                format!("multihop-routing: B forward failed: {e}"),
+                Vec::new(),
+            );
+        }
+    };
+    let next_c = match decision_b {
+        ForwardDecision::ForwardTo { next_hop, ttl } => {
+            ttl_at_each_hop.push(ttl);
+            cur = RoutablePacket { ttl, ..cur };
+            next_hop
+        }
+        other => {
+            return (
+                "FAIL".to_string(),
+                format!("multihop-routing: B expected ForwardTo, got {:?}", other),
+                Vec::new(),
+            );
+        }
+    };
+    debug_assert_eq!(next_c, "10.0.0.3");
+
+    // C -> D
+    let decision_c = match c.forward(&cur, 4) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                "FAIL".to_string(),
+                format!("multihop-routing: C forward failed: {e}"),
+                Vec::new(),
+            );
+        }
+    };
+    let ttl_arrives_d = match decision_c {
+        ForwardDecision::ForwardTo { next_hop, ttl } => {
+            ttl_at_each_hop.push(ttl);
+            debug_assert_eq!(next_hop, "10.0.0.4");
+            cur = RoutablePacket { ttl, ..cur };
+            ttl
+        }
+        other => {
+            return (
+                "FAIL".to_string(),
+                format!("multihop-routing: C expected ForwardTo, got {:?}", other),
+                Vec::new(),
+            );
+        }
+    };
+
+    // D 本地交付
+    let decision_d = match d.forward(&cur, 4) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                "FAIL".to_string(),
+                format!("multihop-routing: D forward failed: {e}"),
+                Vec::new(),
+            );
+        }
+    };
+    let delivered = matches!(decision_d, ForwardDecision::DeliverLocal);
+
+    // 收集跨节点 PacketForwarded 事件数。
+    let forward_event_count = a
+        .events()
+        .iter()
+        .chain(b.events().iter())
+        .chain(c.events().iter())
+        .filter(|e| matches!(e, RoutingEvent::PacketForwarded { .. }))
+        .count();
+
+    // ---- 5. 路由超时：推进逻辑时钟超过 TTL ----
+    // 最后一次通告在 tick=3，TTL=5 个 tick；now=10 → 间隔 7 > 5 → A 学到的 D 路由过期。
+    let expire_events = a.table_mut().expire_stale(10, 5);
+    let route_expired = !expire_events.is_empty();
+    let expired_destinations: Vec<String> = expire_events
+        .iter()
+        .filter_map(|e| match e {
+            RoutingEvent::RouteExpired { dst } => Some(dst.clone()),
+            _ => None,
+        })
+        .collect();
+    // 必须把远端路由 D(10.0.0.4) 删掉（C 也会一起过期，因为它的 last_updated 也是 tick=3）。
+    let expired_contains_d = expired_destinations.iter().any(|d| d == "10.0.0.4");
+    // 直连路由 B 不应被删除。
+    let direct_b_still_present = a.table().lookup("10.0.0.2").is_some();
+
+    let ok = delivered
+        && ttl_arrives_d == 61
+        && forward_event_count == 3
+        && route_expired
+        && expired_contains_d
+        && direct_b_still_present;
+
+    let extra = vec![
+        ("topology".to_string(), json!("linear")),
+        (
+            "node_a".to_string(),
+            json!({
+                "virtual_ip": "10.0.0.1",
+                "direct_peer_count": a.table().direct_peer_count(),
+                "route_to_d": {
+                    "next_hop": a_to_d.next_hop,
+                    "cost": a_to_d.cost
+                }
+            }),
+        ),
+        (
+            "node_b".to_string(),
+            json!({
+                "virtual_ip": "10.0.0.2",
+                "direct_peer_count": b.table().direct_peer_count(),
+            }),
+        ),
+        (
+            "node_c".to_string(),
+            json!({
+                "virtual_ip": "10.0.0.3",
+                "direct_peer_count": c.table().direct_peer_count(),
+            }),
+        ),
+        (
+            "node_d".to_string(),
+            json!({
+                "virtual_ip": "10.0.0.4",
+                "direct_peer_count": d.table().direct_peer_count(),
+                "route_to_a": {
+                    "next_hop": d_to_a.next_hop,
+                    "cost": d_to_a.cost
+                }
+            }),
+        ),
+        (
+            "packet_delivered_to_d".to_string(),
+            json!({
+                "ok": delivered,
+                "ttl_at_delivery": ttl_arrives_d,
+                "ttl_each_hop": ttl_at_each_hop,
+            }),
+        ),
+        (
+            "forward_events".to_string(),
+            json!({ "count": forward_event_count }),
+        ),
+        (
+            "expiration".to_string(),
+            json!({
+                "route_expired": route_expired,
+                "expired_destinations": expired_destinations,
+                "expired_contains_d": expired_contains_d,
+                "direct_b_still_present": direct_b_still_present,
+            }),
+        ),
+    ];
+
+    if ok {
+        (
+            "PASS".to_string(),
+            "multihop-routing: 4-node linear DV convergence + 3-hop forwarding + route expiry verified"
+                .to_string(),
+            extra,
+        )
+    } else {
+        (
+            "FAIL".to_string(),
+            format!(
+                "multihop-routing: invariants failed (delivered={delivered}, ttl={ttl_arrives_d}, fwd_events={forward_event_count}, expired={route_expired}, expired_contains_d={expired_contains_d})"
+            ),
+            extra,
+        )
+    }
 }
