@@ -4,6 +4,7 @@
 //! - STUN Binding Request/Response
 //! - NAT 类型检测（Full Cone / Restricted Cone / Port Restricted / Symmetric）
 //! - UDP 打洞建连
+//! - 结构化事件输出（支持 replay / 调试）
 
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
@@ -14,6 +15,51 @@ const STUN_BINDING_REQUEST: u16 = 0x0001;
 const STUN_BINDING_RESPONSE: u16 = 0x0101;
 /// STUN Magic Cookie
 const STUN_MAGIC_COOKIE: u32 = 0x2112A442;
+
+/// NAT 事件（结构化日志，支持 replay）
+#[derive(Debug, Clone)]
+pub enum NatEvent {
+    /// STUN 请求已发送
+    StunRequestSent {
+        /// STUN 服务器地址
+        server: SocketAddr,
+        /// 事务 ID
+        transaction_id: [u8; 12],
+    },
+    /// STUN 响应已接收
+    StunResponseReceived {
+        /// STUN 服务器地址
+        server: SocketAddr,
+        /// 公网映射地址
+        public_mapping: SocketAddr,
+        /// RTT
+        rtt_ms: u64,
+    },
+    /// NAT 类型检测完成
+    NatTypeDetected {
+        /// 检测到的 NAT 类型
+        nat_type: NatType,
+    },
+    /// 打洞开始
+    HolePunchStarted {
+        /// 目标 peer 地址
+        target: SocketAddr,
+    },
+    /// 打洞成功
+    HolePunchSuccess {
+        /// 目标 peer 地址
+        target: SocketAddr,
+        /// RTT
+        rtt_ms: u64,
+    },
+    /// 打洞失败
+    HolePunchFailed {
+        /// 目标 peer 地址
+        target: SocketAddr,
+        /// 失败原因
+        reason: String,
+    },
+}
 
 /// NAT 类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +88,7 @@ pub struct StunMapping {
 /// STUN 客户端
 pub struct StunClient {
     socket: UdpSocket,
+    events: Vec<NatEvent>,
 }
 
 impl StunClient {
@@ -49,13 +96,25 @@ impl StunClient {
     pub fn new(local_addr: SocketAddr) -> Result<Self, std::io::Error> {
         let socket = UdpSocket::bind(local_addr)?;
         socket.set_read_timeout(Some(Duration::from_secs(3)))?;
-        Ok(Self { socket })
+        Ok(Self {
+            socket,
+            events: Vec::new(),
+        })
     }
 
     /// 发送 Binding Request，获取公网映射
-    pub fn get_mapping(&self, stun_server: SocketAddr) -> Result<StunMapping, NatError> {
-        // 构造 STUN Binding Request
-        let request = build_stun_binding_request();
+    pub fn get_mapping(&mut self, stun_server: SocketAddr) -> Result<StunMapping, NatError> {
+        let start = Instant::now();
+
+        // 构造 STUN Binding Request（随机 Transaction ID）
+        let transaction_id = random_transaction_id();
+        let request = build_stun_binding_request(&transaction_id);
+
+        self.events.push(NatEvent::StunRequestSent {
+            server: stun_server,
+            transaction_id,
+        });
+
         self.socket.send_to(&request, stun_server)?;
 
         // 接收响应
@@ -66,12 +125,19 @@ impl StunClient {
         let public = parse_stun_binding_response(&buf[..n])?;
         let local = self.socket.local_addr()?;
 
+        let rtt_ms = start.elapsed().as_millis() as u64;
+        self.events.push(NatEvent::StunResponseReceived {
+            server: stun_server,
+            public_mapping: public,
+            rtt_ms,
+        });
+
         Ok(StunMapping { local, public })
     }
 
     /// 检测 NAT 类型
     pub fn detect_nat_type(
-        &self,
+        &mut self,
         stun_server1: SocketAddr,
         stun_server2: SocketAddr,
     ) -> Result<NatType, NatError> {
@@ -82,13 +148,26 @@ impl StunClient {
         let mapping2 = self.get_mapping(stun_server2)?;
 
         // 如果两个映射不同，说明是对称 NAT
-        if mapping1.public != mapping2.public {
-            return Ok(NatType::Symmetric);
-        }
+        let nat_type = if mapping1.public != mapping2.public {
+            NatType::Symmetric
+        } else {
+            // TODO: 进一步检测 FullCone / RestrictedCone / PortRestrictedCone
+            NatType::RestrictedCone
+        };
 
-        // TODO: 进一步检测 FullCone / RestrictedCone / PortRestrictedCone
-        // 简化实现：先返回 RestrictedCone
-        Ok(NatType::RestrictedCone)
+        self.events.push(NatEvent::NatTypeDetected { nat_type });
+
+        Ok(nat_type)
+    }
+
+    /// 获取事件收集
+    pub fn events(&self) -> &[NatEvent] {
+        &self.events
+    }
+
+    /// 清空事件收集
+    pub fn clear_events(&mut self) {
+        self.events.clear();
     }
 
     /// 本地 socket
@@ -100,6 +179,7 @@ impl StunClient {
 /// UDP 打洞器
 pub struct HolePuncher {
     socket: UdpSocket,
+    events: Vec<NatEvent>,
 }
 
 impl HolePuncher {
@@ -107,13 +187,18 @@ impl HolePuncher {
     pub fn new(local_addr: SocketAddr) -> Result<Self, std::io::Error> {
         let socket = UdpSocket::bind(local_addr)?;
         socket.set_read_timeout(Some(Duration::from_secs(5)))?;
-        Ok(Self { socket })
+        Ok(Self {
+            socket,
+            events: Vec::new(),
+        })
     }
 
     /// 执行打洞：向目标地址发包，尝试打通 NAT
-    pub fn punch(&self, target: SocketAddr) -> Result<bool, NatError> {
+    pub fn punch(&mut self, target: SocketAddr) -> Result<bool, NatError> {
         let start = Instant::now();
         let hello = b"punch-hello";
+
+        self.events.push(NatEvent::HolePunchStarted { target });
 
         // 连续发包打洞
         for _ in 0..10 {
@@ -124,6 +209,9 @@ impl HolePuncher {
             match self.socket.recv_from(&mut buf) {
                 Ok((n, from)) => {
                     if from == target && &buf[..n] == b"punch-hello-ack" {
+                        let rtt_ms = start.elapsed().as_millis() as u64;
+                        self.events
+                            .push(NatEvent::HolePunchSuccess { target, rtt_ms });
                         return Ok(true);
                     }
                 }
@@ -137,6 +225,11 @@ impl HolePuncher {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+
+        self.events.push(NatEvent::HolePunchFailed {
+            target,
+            reason: "timeout".to_string(),
+        });
 
         Ok(false)
     }
@@ -162,6 +255,16 @@ impl HolePuncher {
             Err(NatError::InvalidResponse)
         }
     }
+
+    /// 获取事件收集
+    pub fn events(&self) -> &[NatEvent] {
+        &self.events
+    }
+
+    /// 清空事件收集
+    pub fn clear_events(&mut self) {
+        self.events.clear();
+    }
 }
 
 /// NAT 错误类型
@@ -173,8 +276,6 @@ pub enum NatError {
     StunParse(String),
     /// 无效响应
     InvalidResponse,
-    /// 超时
-    Timeout,
 }
 
 impl std::fmt::Display for NatError {
@@ -183,7 +284,6 @@ impl std::fmt::Display for NatError {
             NatError::Io(e) => write!(f, "IO error: {}", e),
             NatError::StunParse(s) => write!(f, "STUN parse error: {}", s),
             NatError::InvalidResponse => write!(f, "invalid response"),
-            NatError::Timeout => write!(f, "timeout"),
         }
     }
 }
@@ -196,8 +296,22 @@ impl From<std::io::Error> for NatError {
     }
 }
 
+/// 生成随机 Transaction ID
+fn random_transaction_id() -> [u8; 12] {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+
+    let mut id = [0u8; 12];
+    id[0..8].copy_from_slice(&(nanos as u64).to_be_bytes());
+    id[8..12].copy_from_slice(&(nanos as u32).wrapping_mul(0x9e3779b9).to_be_bytes());
+    id
+}
+
 /// 构造 STUN Binding Request
-fn build_stun_binding_request() -> Vec<u8> {
+fn build_stun_binding_request(transaction_id: &[u8; 12]) -> Vec<u8> {
     let mut msg = Vec::with_capacity(20);
 
     // Message Type: Binding Request (0x0001)
@@ -210,9 +324,7 @@ fn build_stun_binding_request() -> Vec<u8> {
     msg.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
 
     // Transaction ID（12 字节，随机）
-    msg.extend_from_slice(&[
-        0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44,
-    ]);
+    msg.extend_from_slice(transaction_id);
 
     msg
 }
@@ -284,13 +396,89 @@ mod tests {
 
     #[test]
     fn test_stun_request_build() {
-        let req = build_stun_binding_request();
+        let txn_id = [0x12; 12];
+        let req = build_stun_binding_request(&txn_id);
         assert_eq!(req.len(), 20);
         assert_eq!(&req[0..2], &STUN_BINDING_REQUEST.to_be_bytes());
+        assert_eq!(&req[8..20], &txn_id);
+    }
+
+    #[test]
+    fn test_random_transaction_id() {
+        let id1 = random_transaction_id();
+        let id2 = random_transaction_id();
+        // 两次调用应该不同（时间不同）
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_parse_stun_response_success() {
+        // 构造一个模拟的 STUN Binding Response
+        let mut buf = Vec::new();
+
+        // Message Type: Binding Response
+        buf.extend_from_slice(&STUN_BINDING_RESPONSE.to_be_bytes());
+
+        // Message Length: 8（XOR-MAPPED-ADDRESS 8 字节）
+        buf.extend_from_slice(&8u16.to_be_bytes());
+
+        // Magic Cookie
+        buf.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+
+        // Transaction ID
+        buf.extend_from_slice(&[0x12; 12]);
+
+        // XOR-MAPPED-ADDRESS attribute
+        // Type: 0x0020
+        buf.extend_from_slice(&0x0020u16.to_be_bytes());
+        // Length: 8
+        buf.extend_from_slice(&8u16.to_be_bytes());
+        // Reserved: 0, Family: 0x01 (IPv4)
+        buf.extend_from_slice(&[0x00, 0x01]);
+
+        // XOR Port (假设公网端口是 54321)
+        let port = 54321u16;
+        let xor_port = port ^ (STUN_MAGIC_COOKIE >> 16) as u16;
+        buf.extend_from_slice(&xor_port.to_be_bytes());
+
+        // XOR IP (假设公网 IP 是 1.2.3.4)
+        let ip = u32::from_be_bytes([1, 2, 3, 4]);
+        let xor_ip = ip ^ STUN_MAGIC_COOKIE;
+        buf.extend_from_slice(&xor_ip.to_be_bytes());
+
+        let result = parse_stun_binding_response(&buf).unwrap();
+        assert_eq!(result.port(), 54321);
+        assert_eq!(result.ip().to_string(), "1.2.3.4");
+    }
+
+    #[test]
+    fn test_parse_stun_response_too_short() {
+        let buf = [0u8; 10];
+        let result = parse_stun_binding_response(&buf);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_stun_response_wrong_type() {
+        let mut buf = vec![0u8; 20];
+        // 错误的消息类型
+        buf[0] = 0x00;
+        buf[1] = 0x00;
+        let result = parse_stun_binding_response(&buf);
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_nat_type_debug() {
         assert_eq!(format!("{:?}", NatType::FullCone), "FullCone");
+    }
+
+    #[test]
+    fn test_nat_event_debug() {
+        let event = NatEvent::NatTypeDetected {
+            nat_type: NatType::RestrictedCone,
+        };
+        let s = format!("{:?}", event);
+        assert!(s.contains("NatTypeDetected"));
     }
 }
