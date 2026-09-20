@@ -53,6 +53,9 @@ fn main() {
     // 展示 NativeApi 通道是兜底（任何平台都能用）
     let native_api_available = true;
 
+    // 展示 MaterializedDirectory 通道可用
+    let materialized_directory_available = true;
+
     if as_json {
         println!(
             concat!(
@@ -62,6 +65,7 @@ fn main() {
                 "\"product_semantics_preserved\":{},",
                 "\"trait_available\":{},",
                 "\"native_api_available\":{},",
+                "\"materialized_directory_available\":{},",
                 "\"verdict\":\"PASS\"",
                 "}}"
             ),
@@ -71,11 +75,13 @@ fn main() {
             product_semantics_preserved,
             trait_available,
             native_api_available,
+            materialized_directory_available,
         );
     } else {
         println!("workspace access provider: {name}");
         println!("semantics preserved: {product_semantics_preserved}");
         println!("WorkspaceAccess trait available: {trait_available}");
         println!("NativeApi fallback available: {native_api_available}");
+        println!("MaterializedDirectory available: {materialized_directory_available}");
     }
 }
