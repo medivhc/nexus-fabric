@@ -2,7 +2,7 @@
 
 use std::process::ExitCode;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// nexusd：桌面/服务端主 Runtime Composition Root。
 ///
@@ -30,6 +30,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("run") => run_resource(&args[1..]),
+        Some("serve") => serve_resource(&args[1..]),
         Some("host") => host_resource(&args[1..]),
         Some("relay") => relay_resource(&args[1..]),
         Some("proxy") => proxy_resource(&args[1..]),
@@ -39,6 +40,7 @@ fn main() -> ExitCode {
             eprintln!(
                 "usage: nexusd run <service|internet-access|compute> [--json] | \
                  nexusd run <resource> --endpoint <ip:port> [--relay <ip:port>] [--direct <ip:port>] [--token <t>] --json | \
+                 nexusd serve --addr <ip:port> | \
                  nexusd host <resource> --addr <ip:port> [--token <t>] | \
                  nexusd relay --addr <ip:port> | \
                  nexusd proxy --addr <ip:port> [--config <path>] | \
@@ -206,6 +208,141 @@ fn run_resource(args: &[String]) -> ExitCode {
         },
     };
     print_json_result(result)
+}
+
+/// serve 子命令：常驻 daemon，提供 HTTP LocalAPI，CLI 通过 socket 查询状态。
+///
+/// 用法：nexusd serve --addr <ip:port>
+///
+/// 路由：
+///   GET /localapi/v0/status             → 总览快照
+///   GET /localapi/v0/dns/status         → DNS 状态
+///   GET /localapi/v0/dns/cache          → DNS 正/负缓存
+///   GET /localapi/v0/session/watch      → Session 双轨状态
+///   GET /localapi/v0/plan/explain       → Plan + DecisionTrace
+///   GET /localapi/v0/connectivity/status → 建连状态
+///   GET /localapi/v0/platform/capabilities → 平台能力
+fn serve_resource(args: &[String]) -> ExitCode {
+    let flags = parse_flags(args);
+    let addr: std::net::SocketAddr = match flags.get("--addr").and_then(|v| v.as_deref()) {
+        Some(raw) => match raw.parse() {
+            Ok(a) => a,
+            Err(_) => {
+                println!(
+                    "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"invalid addr {raw}\"}}}}"
+                );
+                return ExitCode::SUCCESS;
+            }
+        },
+        None => match "127.0.0.1:0".parse() {
+            Ok(a) => a,
+            Err(_) => return ExitCode::FAILURE,
+        },
+    };
+    let listener = match std::net::TcpListener::bind(addr) {
+        Ok(l) => l,
+        Err(e) => {
+            println!(
+                "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"bind {addr} failed: {e}\"}}}}"
+            );
+            return ExitCode::SUCCESS;
+        }
+    };
+    let actual_addr = listener.local_addr().expect("local_addr");
+    println!(
+        "{{\"verdict\":\"READY\",\"daemon\":{{\"entry\":\"nexusd\",\"command\":\"serve\",\"addr\":\"{actual_addr}\"}}}}"
+    );
+    // 服务循环：逐连接 accept，解析 HTTP 请求行，路由到 observability 函数。
+    for stream in listener.incoming() {
+        match stream {
+            Ok(mut stream) => {
+                if let Err(e) = handle_localapi_request(&mut stream) {
+                    eprintln!("serve connection error: {e}");
+                }
+            }
+            Err(e) => {
+                eprintln!("serve accept error: {e}");
+                break;
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// 处理单个 LocalAPI HTTP 请求：读请求行，路由，写 JSON 响应。
+fn handle_localapi_request(stream: &mut std::net::TcpStream) -> Result<(), String> {
+    use std::io::{BufRead, BufReader};
+    let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+    // 读请求行（GET /localapi/v0/status HTTP/1.1）
+    let mut request_line = String::new();
+    reader
+        .read_line(&mut request_line)
+        .map_err(|e| format!("read request line: {e}"))?;
+    let parts: Vec<&str> = request_line.split_whitespace().collect();
+    if parts.len() < 2 || parts[0] != "GET" {
+        write_http_json(
+            stream,
+            405,
+            &json!({"verdict":"FAIL","error":{"code":"METHOD_NOT_ALLOWED"}}),
+        )
+        .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    let path = parts[1];
+    // 路由
+    let result: Result<Value, (String, String)> = match path {
+        "/localapi/v0/status" => nexus::observability::status()
+            .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
+        "/localapi/v0/dns/status" => nexus::observability::dns_status()
+            .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
+        "/localapi/v0/dns/cache" => nexus::observability::dns_cache()
+            .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
+        "/localapi/v0/session/watch" => nexus::observability::session_watch()
+            .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
+        "/localapi/v0/plan/explain" => nexus::observability::plan_explain()
+            .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
+        "/localapi/v0/connectivity/status" => nexus::observability::connectivity_status()
+            .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
+        "/localapi/v0/platform/capabilities" => nexus::observability::platform_capabilities()
+            .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
+        _ => {
+            write_http_json(
+                stream,
+                404,
+                &json!({"verdict":"FAIL","error":{"code":"NOT_FOUND","path":path}}),
+            )
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+    };
+    let body = match result {
+        Ok(v) => v,
+        Err((code, msg)) => json!({"verdict":"FAIL","error":{"code":code,"message":msg}}),
+    };
+    write_http_json(stream, 200, &body).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 写一个 JSON HTTP 响应。
+fn write_http_json(
+    stream: &mut std::net::TcpStream,
+    status: u16,
+    body: &Value,
+) -> Result<(), std::io::Error> {
+    use std::io::Write;
+    let body_str = serde_json::to_string(body)?;
+    let status_text = match status {
+        200 => "OK",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        _ => "Internal Server Error",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_str}",
+        body_str.len()
+    );
+    stream.write_all(response.as_bytes())?;
+    Ok(())
 }
 
 /// 提供方入口：真实地址持续监听，服务端 AUTH 门控 + 按资源执行业务（服务循环）。
