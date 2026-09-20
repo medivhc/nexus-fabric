@@ -756,3 +756,39 @@ TUNNEL_HANDSHAKE_FAILED     隧道握手失败
 ENCAPSULATION_ERROR         包封装失败
 DECAPSULATION_ERROR         包解封装失败
 ```
+
+
+### 12.5 P1 静态路由与三节点转发闭环（2026-09-20）
+
+§12.3 明确"多节点网状拓扑自动路由"为 P0 不做项，但括号注明"路由表静态配置"。
+本节冻结 P1 的静态路由最小闭环：三节点链 A—B—C，A 与 C 无直连，B 作为中间转发节点。
+不做动态路由发现、不做最短路径计算、不做跨子网；路由表为**显式静态配置**。
+
+```text
+节点 A (10.0.0.1)  ──直连──  节点 B (10.0.0.2)  ──直连──  节点 C (10.0.0.3)
+       │                                                         │
+       └──────── A 不直连 C；A → C 的包必须经 B 转发 ─────────────┘
+```
+
+- 路由表（每节点静态配置，非自动发现）：
+  - A：`routes = { "10.0.0.3" → "10.0.0.2" }`（C 经 B）
+  - B：`routes = {}`（A 和 C 都是直连 peer，无需转发）
+  - C：`routes = { "10.0.0.1" → "10.0.0.2" }`（A 经 B，回包对称）
+- 转发语义（IP 路由器模型）：
+  - `send_ip_packet(dst, packet)`：若 dst 是直连 Connected peer，直发；
+    否则查 `routes[dst]` 得 next_hop，把同一隧道帧（src=自己、dst=原始 dst）
+    发给 next_hop。帧头 **不剥不改**，保留原始 dst 供中间节点判断。
+  - `recv_and_deliver`：解封装后，若 `header.dst_virtual_ip == self.config.virtual_ip`
+    → 写 VPI；否则查 `routes[dst]` 得 next_hop，**重新封装同帧**发给 next_hop
+    并计 `bytes_forwarded`；若 routes 无 next_hop → 结构化错误 `NO_ROUTE_TO_DST`。
+- 新错误码：
+  - `NO_ROUTE_TO_DST`：收到一个 dst 非本机且路由表无 next_hop 的帧。
+  - `ROUTE_NEXT_HOP_NOT_PEER`：`add_route` 注册的 next_hop 不是已注册 peer。
+- 可观察性：
+  - `TunnelStats` 新增 `bytes_forwarded: u64`（中间节点累计转发字节）。
+  - 新增事件 `VirtualSubnetEvent::PacketForwarded { tunnel_id, src_virtual_ip,
+    dst_virtual_ip, next_hop, bytes }`。
+- E4 场景：`virtual_subnet_mesh_3node.toml`——A 经 B 转发一个 IP 包到 C：
+  断言 C 的 VPI 收到原始 payload、B 的 bytes_forwarded > 0、A 与 C 的 peer 表
+  互不可见（A 的 peers 只有 B，C 的 peers 只有 B）。
+- 冻结边界（P1 不做）：动态路由协议、最短路径算法、跨子网、加密、真实 TUN。

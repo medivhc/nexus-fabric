@@ -8,6 +8,7 @@ pub fn run_scenario(args: &[String]) -> Outcome {
     let subcommand = args.first().map(String::as_str).unwrap_or("");
     match subcommand {
         "virtual-subnet-tunnel" => run_virtual_subnet_tunnel(),
+        "virtual-subnet-mesh" => run_virtual_subnet_mesh(),
         _ => (
             "BLOCKED".to_string(),
             format!("unknown run subcommand: {subcommand}"),
@@ -126,6 +127,148 @@ fn run_virtual_subnet_tunnel() -> Outcome {
         (
             "FAIL".to_string(),
             "virtual-subnet-tunnel: bidirectional roundtrip failed".to_string(),
+            extra,
+        )
+    }
+}
+
+/// E4 test: three-node virtual subnet with static routing and forwarding (P1 §12.5).
+///
+/// A(10.0.0.1) -- B(10.0.0.2) -- C(10.0.0.3); A and C do NOT peer directly.
+/// A sends a packet to C; B forwards it; C delivers to VPI.
+fn run_virtual_subnet_mesh() -> Outcome {
+    use nexus_connectivity::virtual_subnet::*;
+
+    let mut mesh_a = MeshCarrier::new();
+    let mut mesh_b = MeshCarrier::new();
+    let mut mesh_c = MeshCarrier::new();
+
+    let a_recv = mesh_a.recv_handle();
+    let b_recv = mesh_b.recv_handle();
+    let c_recv = mesh_c.recv_handle();
+
+    // A<->B
+    mesh_a.connect_peer("B_locator", b_recv.clone());
+    mesh_b.connect_peer("A_locator", a_recv.clone());
+    // B<->C
+    mesh_b.connect_peer("C_locator", c_recv.clone());
+    mesh_c.connect_peer("B_locator", b_recv.clone());
+
+    let vpi_a = Box::new(MemoryVpi::new());
+    let vpi_b = Box::new(MemoryVpi::new());
+    let vpi_c = Box::new(MemoryVpi::new());
+
+    let cfg_a = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
+    let cfg_b = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.2");
+    let cfg_c = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.3");
+
+    let mut tunnel_a = VirtualSubnetTunnel::new(cfg_a, vpi_a, Box::new(mesh_a));
+    let mut tunnel_b = VirtualSubnetTunnel::new(cfg_b, vpi_b, Box::new(mesh_b));
+    let mut tunnel_c = VirtualSubnetTunnel::new(cfg_c, vpi_c, Box::new(mesh_c));
+
+    // A only knows B
+    tunnel_a
+        .add_peer(TunnelPeer::new("10.0.0.2", "B_locator"))
+        .expect("A add peer B");
+    tunnel_a.set_peer_state("10.0.0.2", TunnelState::Connected);
+    // A's static route: C via B
+    tunnel_a
+        .add_route("10.0.0.3", "10.0.0.2")
+        .expect("A add route to C via B");
+
+    // B knows A and C (both direct)
+    tunnel_b
+        .add_peer(TunnelPeer::new("10.0.0.1", "A_locator"))
+        .expect("B add peer A");
+    tunnel_b
+        .add_peer(TunnelPeer::new("10.0.0.3", "C_locator"))
+        .expect("B add peer C");
+    tunnel_b.set_peer_state("10.0.0.1", TunnelState::Connected);
+    tunnel_b.set_peer_state("10.0.0.3", TunnelState::Connected);
+
+    // C only knows B
+    tunnel_c
+        .add_peer(TunnelPeer::new("10.0.0.2", "B_locator"))
+        .expect("C add peer B");
+    tunnel_c.set_peer_state("10.0.0.2", TunnelState::Connected);
+
+    // A sends IP packet destined to C (10.0.0.3)
+    let mut packet = vec![0u8; 20];
+    packet[16] = 10;
+    packet[17] = 0;
+    packet[18] = 0;
+    packet[19] = 3;
+    packet.extend_from_slice(b"hello-from-a");
+    let packet_len = packet.len();
+
+    tunnel_a
+        .send_ip_packet("10.0.0.3", &packet)
+        .expect("A send to C via route");
+
+    // B receives frame, forwards to C
+    let mut buf = [0u8; 2048];
+    let b_delivered = tunnel_b
+        .recv_and_deliver(&mut buf)
+        .expect("B recv and forward")
+        .is_some();
+
+    // C receives forwarded frame, delivers to VPI
+    let c_recv = tunnel_c
+        .recv_and_deliver(&mut buf)
+        .expect("C recv and deliver");
+    let c_delivered = c_recv.is_some();
+    let c_payload_len = c_recv.map(|(_, n)| n).unwrap_or(0);
+    let payload_matches = c_payload_len == packet_len;
+
+    // Stats
+    let b_fwd = tunnel_b
+        .peer_stats("10.0.0.3")
+        .map(|s| s.bytes_forwarded)
+        .unwrap_or(0);
+    let a_sent_b = tunnel_a
+        .peer_stats("10.0.0.2")
+        .map(|s| s.bytes_sent)
+        .unwrap_or(0);
+    let a_peer_count = tunnel_a.peers().len();
+    let c_peer_count = tunnel_c.peers().len();
+
+    let ok = b_delivered && c_delivered && payload_matches && b_fwd > 0 && a_sent_b > 0;
+
+    let extra = vec![
+        ("subnet".to_string(), json!({"cidr": "10.0.0.0/24"})),
+        (
+            "node_a".to_string(),
+            json!({"virtual_ip": "10.0.0.1", "peer_count": a_peer_count, "bytes_sent_to_b": a_sent_b}),
+        ),
+        (
+            "node_b".to_string(),
+            json!({"virtual_ip": "10.0.0.2", "bytes_forwarded": b_fwd}),
+        ),
+        (
+            "node_c".to_string(),
+            json!({"virtual_ip": "10.0.0.3", "peer_count": c_peer_count}),
+        ),
+        (
+            "packet_delivered_to_c".to_string(),
+            json!({
+                "ok": c_delivered,
+                "payload_matches": payload_matches,
+                "payload_len": c_payload_len,
+                "expected_len": packet_len
+            }),
+        ),
+    ];
+
+    if ok {
+        (
+            "PASS".to_string(),
+            "virtual-subnet-mesh: A->B->C static route forwarding verified".to_string(),
+            extra,
+        )
+    } else {
+        (
+            "FAIL".to_string(),
+            "virtual-subnet-mesh: forwarding failed".to_string(),
             extra,
         )
     }

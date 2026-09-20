@@ -1,0 +1,61 @@
+schema_version = 1
+id = "product.virtual-subnet-mesh-3node"
+title = "三节点虚拟子网静态路由转发闭环（A→B→C，B 转发）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-5-P1-静态路由与三节点转发闭环"
+
+[given]
+subnet_cidr = "10.0.0.0/24"
+node_a_virtual_ip = "10.0.0.1"
+node_b_virtual_ip = "10.0.0.2"
+node_c_virtual_ip = "10.0.0.3"
+# A 与 C 不直连；A→C 经 B
+node_a_route_to_c_via_b = true
+
+[when]
+command = "nexus-harness run virtual-subnet-mesh --json"
+
+[[expect]]
+field = "subnet.cidr"
+equals = "10.0.0.0/24"
+
+[[expect]]
+field = "node_a.virtual_ip"
+equals = "10.0.0.1"
+
+[[expect]]
+field = "node_b.virtual_ip"
+equals = "10.0.0.2"
+
+[[expect]]
+field = "node_c.virtual_ip"
+equals = "10.0.0.3"
+
+# A 只注册了 B 一个 peer（不知道 C 的 locator）
+[[expect]]
+field = "node_a.peer_count"
+equals = 1
+
+# C 只注册了 B 一个 peer
+[[expect]]
+field = "node_c.peer_count"
+equals = 1
+
+# B 转发：C 的 VPI 收到原始 payload
+[[expect]]
+field = "packet_delivered_to_c.ok"
+equals = true
+
+[[expect]]
+field = "packet_delivered_to_c.payload_matches"
+equals = true
+
+# B 作为中间节点，bytes_forwarded > 0
+[[expect]]
+field = "node_b.bytes_forwarded"
+non_zero = true
+
+# A 的发送统计（发给 B）
+[[expect]]
+field = "node_a.bytes_sent_to_b"
+non_empty = true

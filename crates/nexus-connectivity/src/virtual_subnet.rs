@@ -1,15 +1,15 @@
-﻿//! 虚拟子网组网（Virtual Subnet Networking）
+﻿//! 铏氭嫙瀛愮綉缁勭綉锛圴irtual Subnet Networking锛?
 //!
-//! 参考 EasyTier / WireGuard 组网模式：
-//! - 节点在同一虚拟 CIDR 网段内，各有自己的虚拟 IP
-//! - 每个 Peer 的物理 locator 静态配置（P0）
-//! - 数据面：VPI 读 IP 包 → 封装 → 发给对端；对端收到 → 解封装 → 写回 VPI
+//! 鍙傝€?EasyTier / WireGuard 缁勭綉妯″紡锛?
+//! - 鑺傜偣鍦ㄥ悓涓€铏氭嫙 CIDR 缃戞鍐咃紝鍚勬湁鑷繁鐨勮櫄鎷?IP
+//! - 姣忎釜 Peer 鐨勭墿鐞?locator 闈欐€侀厤缃紙P0锛?
+//! - 鏁版嵁闈細VPI 璇?IP 鍖?鈫?灏佽 鈫?鍙戠粰瀵圭锛涘绔敹鍒?鈫?瑙ｅ皝瑁?鈫?鍐欏洖 VPI
 //!
-//! P0 边界：
-//! - 点对点直连（不做网状自动路由）
-//! - 静态配置 Peer（不做自动发现）
-//! - 明文封装（加密后置）
-//! - 内存模拟 VPI/Carrier（真实 TUN 是 E5）
+//! P0 杈圭晫锛?
+//! - 鐐瑰鐐圭洿杩烇紙涓嶅仛缃戠姸鑷姩璺敱锛?
+//! - 闈欐€侀厤缃?Peer锛堜笉鍋氳嚜鍔ㄥ彂鐜帮級
+//! - 鏄庢枃灏佽锛堝姞瀵嗗悗缃級
+//! - 鍐呭瓨妯℃嫙 VPI/Carrier锛堢湡瀹?TUN 鏄?E5锛?
 
 use nexus_platform::{PacketCarrier, PlatformError, VirtualPacketInterface};
 use std::collections::HashMap;
@@ -17,17 +17,17 @@ use std::sync::Arc;
 
 use crate::ConnectivityError;
 
-/// 虚拟子网配置。
+/// 铏氭嫙瀛愮綉閰嶇疆銆?
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtualSubnetConfig {
-    /// 子网 CIDR（如 "10.0.0.0/24"）。
+    /// 瀛愮綉 CIDR锛堝 "10.0.0.0/24"锛夈€?
     pub cidr: String,
-    /// 本节点的虚拟 IP（如 "10.0.0.1"）。
+    /// 鏈妭鐐圭殑铏氭嫙 IP锛堝 "10.0.0.1"锛夈€?
     pub virtual_ip: String,
 }
 
 impl VirtualSubnetConfig {
-    /// 创建虚拟子网配置。
+    /// 鍒涘缓铏氭嫙瀛愮綉閰嶇疆銆?
     #[must_use]
     pub fn new(cidr: impl Into<String>, virtual_ip: impl Into<String>) -> Self {
         Self {
@@ -36,10 +36,10 @@ impl VirtualSubnetConfig {
         }
     }
 
-    /// 校验虚拟 IP 是否在子网范围内（P0 简化：字符串前缀匹配）。
+    /// 鏍￠獙铏氭嫙 IP 鏄惁鍦ㄥ瓙缃戣寖鍥村唴锛圥0 绠€鍖栵細瀛楃涓插墠缂€鍖归厤锛夈€?
     #[must_use]
     pub fn is_valid_virtual_ip(&self, ip: &str) -> bool {
-        // P0 简化实现：提取 CIDR 的网络地址部分，检查 IP 是否前缀匹配
+        // P0 绠€鍖栧疄鐜帮細鎻愬彇 CIDR 鐨勭綉缁滃湴鍧€閮ㄥ垎锛屾鏌?IP 鏄惁鍓嶇紑鍖归厤
         let network_prefix = self
             .cidr
             .split('/')
@@ -52,19 +52,19 @@ impl VirtualSubnetConfig {
     }
 }
 
-/// 隧道 Peer 配置。
+/// 闅ч亾 Peer 閰嶇疆銆?
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelPeer {
-    /// Peer ID（用于事件关联）。
+    /// Peer ID锛堢敤浜庝簨浠跺叧鑱旓級銆?
     pub peer_id: String,
-    /// 对端虚拟 IP。
+    /// 瀵圭铏氭嫙 IP銆?
     pub virtual_ip: String,
-    /// 对端物理 locator。
+    /// 瀵圭鐗╃悊 locator銆?
     pub locator: String,
 }
 
 impl TunnelPeer {
-    /// 创建隧道 Peer。
+    /// 鍒涘缓闅ч亾 Peer銆?
     #[must_use]
     pub fn new(virtual_ip: impl Into<String>, locator: impl Into<String>) -> Self {
         let virtual_ip = virtual_ip.into();
@@ -76,102 +76,117 @@ impl TunnelPeer {
     }
 }
 
-/// 隧道状态。
+/// 闅ч亾鐘舵€併€?
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TunnelState {
-    /// 未连接。
+    /// 鏈繛鎺ャ€?
     Disconnected,
-    /// 握手进行中。
+    /// 鎻℃墜杩涜涓€?
     Handshaking,
-    /// 已连接。
+    /// 宸茶繛鎺ャ€?
     Connected,
-    /// 连接失败。
+    /// 杩炴帴澶辫触銆?
     Failed,
 }
 
-/// 隧道统计数据。
+/// 闅ч亾缁熻鏁版嵁銆?
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TunnelStats {
-    /// 上行字节数（本节点发给对端）。
+    /// 涓婅瀛楄妭鏁帮紙鏈妭鐐瑰彂缁欏绔級銆?
     pub bytes_sent: u64,
-    /// 下行字节数（本节点从对端接收）。
+    /// 涓嬭瀛楄妭鏁帮紙鏈妭鐐逛粠瀵圭鎺ユ敹锛夈€?
     pub bytes_received: u64,
-    /// 丢包数。
+    /// 涓㈠寘鏁般€?
     pub packets_dropped: u64,
+    /// 鏈妭鐐逛綔涓轰腑闂磋浆鍙戣妭鐐圭疮璁¤浆鍙戝瓧鑺傦紙P1 搂12.5锛夈€?
+    pub bytes_forwarded: u64,
 }
 
-/// 虚拟子网结构化事件（用于可观测性和重放）。
+/// 铏氭嫙瀛愮綉缁撴瀯鍖栦簨浠讹紙鐢ㄤ簬鍙娴嬫€у拰閲嶆斁锛夈€?
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VirtualSubnetEvent {
-    /// 隧道创建。
+    /// 闅ч亾鍒涘缓銆?
     TunnelCreated {
-        /// 隧道 ID。
+        /// 闅ч亾 ID銆?
         tunnel_id: String,
-        /// 子网 CIDR。
+        /// 瀛愮綉 CIDR銆?
         subnet_cidr: String,
     },
-    /// Peer 已注册。
+    /// Peer 宸叉敞鍐屻€?
     PeerRegistered {
-        /// 隧道 ID。
+        /// 闅ч亾 ID銆?
         tunnel_id: String,
-        /// Peer ID。
+        /// Peer ID銆?
         peer_id: String,
-        /// Peer 虚拟 IP。
+        /// Peer 铏氭嫙 IP銆?
         virtual_ip: String,
     },
-    /// Peer 状态变更。
+    /// Peer 鐘舵€佸彉鏇淬€?
     PeerStateChanged {
-        /// 隧道 ID。
+        /// 闅ч亾 ID銆?
         tunnel_id: String,
-        /// Peer ID。
+        /// Peer ID銆?
         peer_id: String,
-        /// 新状态。
+        /// 鏂扮姸鎬併€?
         new_state: TunnelState,
     },
-    /// 数据包已发送。
+    /// 鏁版嵁鍖呭凡鍙戦€併€?
     PacketSent {
-        /// 隧道 ID。
+        /// 闅ч亾 ID銆?
         tunnel_id: String,
-        /// Peer ID。
+        /// Peer ID銆?
         peer_id: String,
-        /// 字节数。
+        /// 瀛楄妭鏁般€?
         bytes: u64,
     },
-    /// 数据包已接收。
+    /// 鏁版嵁鍖呭凡鎺ユ敹銆?
     PacketReceived {
-        /// 隧道 ID。
+        /// 闅ч亾 ID銆?
         tunnel_id: String,
-        /// Peer ID。
+        /// Peer ID銆?
         peer_id: String,
-        /// 字节数。
+        /// 瀛楄妭鏁般€?
         bytes: u64,
     },
-    /// 发生错误。
+    /// 鍙戠敓閿欒銆?
     Error {
-        /// 隧道 ID。
+        /// 闅ч亾 ID銆?
         tunnel_id: String,
-        /// 错误信息。
+        /// 閿欒淇℃伅銆?
         message: String,
+    },
+    /// 鍖呰鏈妭鐐逛綔涓轰腑闂磋烦杞彂鍒颁笅涓€璺筹紙P1 搂12.5锛夈€?
+    PacketForwarded {
+        /// 闅ч亾 ID銆?
+        tunnel_id: String,
+        /// 鍘熷婧愯櫄鎷?IP銆?
+        src_virtual_ip: String,
+        /// 鏈€缁堢洰鐨勮櫄鎷?IP銆?
+        dst_virtual_ip: String,
+        /// 涓嬩竴璺宠櫄鎷?IP銆?
+        next_hop: String,
+        /// 杞彂瀛楄妭鏁般€?
+        bytes: u64,
     },
 }
 
-/// 隧道帧头（P0 简化：纯文本标记）。
+/// 闅ч亾甯уご锛圥0 绠€鍖栵細绾枃鏈爣璁帮級銆?
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelFrameHeader {
-    /// 源虚拟 IP。
+    /// 婧愯櫄鎷?IP銆?
     pub src_virtual_ip: String,
-    /// 目的虚拟 IP。
+    /// 鐩殑铏氭嫙 IP銆?
     pub dst_virtual_ip: String,
 }
 
 impl TunnelFrameHeader {
-    /// 序列化帧头（P0 简化：`src->dst:` 前缀）。
+    /// 搴忓垪鍖栧抚澶达紙P0 绠€鍖栵細`src->dst:` 鍓嶇紑锛夈€?
     #[must_use]
     pub fn serialize(&self) -> Vec<u8> {
         format!("{}->{}:", self.src_virtual_ip, self.dst_virtual_ip).into_bytes()
     }
 
-    /// 反序列化帧头（P0 简化：解析 `src->dst:` 前缀）。
+    /// 鍙嶅簭鍒楀寲甯уご锛圥0 绠€鍖栵細瑙ｆ瀽 `src->dst:` 鍓嶇紑锛夈€?
     pub fn deserialize(data: &[u8]) -> Option<(Self, &[u8])> {
         let text = std::str::from_utf8(data).ok()?;
         let colon_pos = text.find(':')?;
@@ -188,33 +203,36 @@ impl TunnelFrameHeader {
     }
 }
 
-/// 虚拟子网隧道（数据面编排器）。
+/// 铏氭嫙瀛愮綉闅ч亾锛堟暟鎹潰缂栨帓鍣級銆?
 ///
-/// 注入 VPI 和 PacketCarrier，负责：
-/// 1. 从 VPI 读 IP 包
-/// 2. 根据目的虚拟 IP 查找对应 Peer 的物理 locator
-/// 3. 封装隧道帧头
-/// 4. 通过 PacketCarrier 发给对端
-/// 5. 从 PacketCarrier 读帧
-/// 6. 解封装提取原始 IP 包
-/// 7. 写入 VPI
+/// 娉ㄥ叆 VPI 鍜?PacketCarrier锛岃礋璐ｏ細
+/// 1. 浠?VPI 璇?IP 鍖?
+/// 2. 鏍规嵁鐩殑铏氭嫙 IP 鏌ユ壘瀵瑰簲 Peer 鐨勭墿鐞?locator
+/// 3. 灏佽闅ч亾甯уご
+/// 4. 閫氳繃 PacketCarrier 鍙戠粰瀵圭
+/// 5. 浠?PacketCarrier 璇诲抚
+/// 6. 瑙ｅ皝瑁呮彁鍙栧師濮?IP 鍖?
+/// 7. 鍐欏叆 VPI
 pub struct VirtualSubnetTunnel {
-    /// 隧道 ID（用于事件关联）。
+    /// 闅ч亾 ID锛堢敤浜庝簨浠跺叧鑱旓級銆?
     tunnel_id: String,
-    /// 子网配置。
+    /// 瀛愮綉閰嶇疆銆?
     config: VirtualSubnetConfig,
-    /// Peer 表：虚拟 IP → (peer_id, locator, state, stats)。
+    /// Peer 琛細铏氭嫙 IP 鈫?(peer_id, locator, state, stats)銆?
     peers: HashMap<String, (String, String, TunnelState, TunnelStats)>,
-    /// 事件收集（用于可观测性和重放）。
+    /// 闈欐€佽矾鐢辫〃锛圥1 搂12.5锛夛細鐩殑铏氭嫙 IP 鈫?涓嬩竴璺宠櫄鎷?IP銆?
+    /// 浠呯敤浜庣洰鐨勯潪鐩磋繛 peer 鐨勮浆鍙戝喅绛栵紱鐩磋繛 peer 鐩村彂涓嶆煡璺敱琛ㄣ€?
+    routes: HashMap<String, String>,
+    /// 浜嬩欢鏀堕泦锛堢敤浜庡彲瑙傛祴鎬у拰閲嶆斁锛夈€?
     events: Vec<VirtualSubnetEvent>,
-    /// VPI 接口。
+    /// VPI 鎺ュ彛銆?
     vpi: Box<dyn VirtualPacketInterface>,
-    /// PacketCarrier。
+    /// PacketCarrier銆?
     carrier: Box<dyn PacketCarrier>,
 }
 
 impl VirtualSubnetTunnel {
-    /// 创建虚拟子网隧道。
+    /// 鍒涘缓铏氭嫙瀛愮綉闅ч亾銆?
     pub fn new(
         config: VirtualSubnetConfig,
         vpi: Box<dyn VirtualPacketInterface>,
@@ -229,13 +247,33 @@ impl VirtualSubnetTunnel {
             tunnel_id,
             config,
             peers: HashMap::new(),
+            routes: HashMap::new(),
             events,
             vpi,
             carrier,
         }
     }
 
-    /// 注册 Peer。
+    /// 娉ㄥ唽闈欐€佽矾鐢憋紙P1 搂12.5锛夈€俷ext_hop 蹇呴』鏄凡娉ㄥ唽 peer銆?
+    pub fn add_route(
+        &mut self,
+        dst: impl Into<String>,
+        next_hop: impl Into<String>,
+    ) -> Result<(), ConnectivityError> {
+        let dst = dst.into();
+        let next_hop = next_hop.into();
+        if !self.peers.contains_key(&next_hop) {
+            return Err(ConnectivityError::Invalid {
+                message: format!(
+                    "ROUTE_NEXT_HOP_NOT_PEER: next-hop {next_hop} is not a registered peer"
+                ),
+            });
+        }
+        self.routes.insert(dst, next_hop);
+        Ok(())
+    }
+
+    /// 娉ㄥ唽 Peer銆?
     pub fn add_peer(&mut self, peer: TunnelPeer) -> Result<(), ConnectivityError> {
         if !self.config.is_valid_virtual_ip(&peer.virtual_ip) {
             return Err(ConnectivityError::Invalid {
@@ -257,7 +295,7 @@ impl VirtualSubnetTunnel {
         Ok(())
     }
 
-    /// 设置 Peer 状态。
+    /// 璁剧疆 Peer 鐘舵€併€?
     pub fn set_peer_state(&mut self, virtual_ip: &str, state: TunnelState) {
         if let Some(entry) = self.peers.get_mut(virtual_ip) {
             self.events.push(VirtualSubnetEvent::PeerStateChanged {
@@ -269,19 +307,19 @@ impl VirtualSubnetTunnel {
         }
     }
 
-    /// 获取 Peer 状态。
+    /// 鑾峰彇 Peer 鐘舵€併€?
     #[must_use]
     pub fn peer_state(&self, virtual_ip: &str) -> Option<TunnelState> {
         self.peers.get(virtual_ip).map(|(_, _, state, _)| *state)
     }
 
-    /// 获取 Peer 统计。
+    /// 鑾峰彇 Peer 缁熻銆?
     #[must_use]
     pub fn peer_stats(&self, virtual_ip: &str) -> Option<&TunnelStats> {
         self.peers.get(virtual_ip).map(|(_, _, _, stats)| stats)
     }
 
-    /// 获取所有 Peer 列表。
+    /// 鑾峰彇鎵€鏈?Peer 鍒楄〃銆?
     #[must_use]
     pub fn peers(&self) -> Vec<(&str, TunnelState)> {
         self.peers
@@ -290,26 +328,44 @@ impl VirtualSubnetTunnel {
             .collect()
     }
 
-    /// 发送一个 IP 包到对端（封装 + carrier send）。
+    /// 鍙戦€佷竴涓?IP 鍖呭埌瀵圭锛堝皝瑁?+ carrier send锛夈€?
+    ///
+    /// P1 搂12.5锛氳嫢 dst 鏄洿杩?Connected peer 鍒欑洿鍙戯紱鍚﹀垯鏌ラ潤鎬佽矾鐢辫〃
+    /// 寰?next_hop锛屾妸鍚屼竴甯э紙鍘熷 dst 涓嶅彉锛夊彂缁?next_hop銆?
     pub fn send_ip_packet(
         &mut self,
         dst_virtual_ip: &str,
         packet: &[u8],
     ) -> Result<(), ConnectivityError> {
+        // 1. 瑙ｆ瀽鍑轰笅涓€璺筹紙鐩磋繛 peer 鎴栭潤鎬佽矾鐢憋級
+        let next_hop = if self.peers.contains_key(dst_virtual_ip) {
+            dst_virtual_ip.to_string()
+        } else {
+            self.routes
+                .get(dst_virtual_ip)
+                .cloned()
+                .ok_or_else(|| ConnectivityError::Invalid {
+                    message: format!(
+                        "NO_ROUTE_TO_DST: no direct peer and no route for {dst_virtual_ip}"
+                    ),
+                })?
+        };
+
+        // 2. 鏍￠獙 next_hop 鏄?Connected peer
         let (_peer_id, locator, state, stats) =
             self.peers
-                .get_mut(dst_virtual_ip)
+                .get_mut(&next_hop)
                 .ok_or_else(|| ConnectivityError::Invalid {
-                    message: format!("peer {dst_virtual_ip} not found"),
+                    message: format!("next-hop peer {next_hop} not found"),
                 })?;
 
         if *state != TunnelState::Connected {
             return Err(ConnectivityError::Invalid {
-                message: format!("peer {dst_virtual_ip} not connected"),
+                message: format!("next-hop peer {next_hop} not connected"),
             });
         }
 
-        // 封装隧道帧
+        // 3. 灏佽闅ч亾甯э紙dst 濮嬬粓鏄師濮?dst锛屼緵涓棿鑺傜偣鍒ゆ柇鏈€缁堢洰鐨勫湴锛?
         let header = TunnelFrameHeader {
             src_virtual_ip: self.config.virtual_ip.clone(),
             dst_virtual_ip: dst_virtual_ip.to_string(),
@@ -317,7 +373,7 @@ impl VirtualSubnetTunnel {
         let mut frame = header.serialize();
         frame.extend_from_slice(packet);
 
-        // 通过 carrier 发送
+        // 4. 閫氳繃 carrier 鍙戠粰 next_hop
         self.carrier
             .send_to(locator, &frame)
             .map_err(|e| ConnectivityError::Io {
@@ -329,7 +385,11 @@ impl VirtualSubnetTunnel {
         Ok(())
     }
 
-    /// 接收一个隧道帧，解封装后写入 VPI。
+    /// 鎺ユ敹涓€涓毀閬撳抚锛岃В灏佽鍚庡啓鍏?VPI锛屾垨鎸夐潤鎬佽矾鐢辫浆鍙戙€?
+    ///
+    /// P1 搂12.5锛氳嫢 `header.dst_virtual_ip == self.config.virtual_ip` 鈫?鍐?VPI锛?
+    /// 鍚﹀垯鏌?`routes[dst]` 寰?next_hop锛屾妸鍘熷甯э紙鍚?header锛夎浆鍙戠粰 next_hop锛?
+    /// 璁?`bytes_forwarded` 骞跺彂 `PacketForwarded` 浜嬩欢銆?
     pub fn recv_and_deliver(
         &mut self,
         buffer: &mut [u8],
@@ -346,29 +406,82 @@ impl VirtualSubnetTunnel {
             return Ok(None);
         }
 
-        let data = &buffer[..n];
+        let data = buffer[..n].to_vec();
 
-        // 解封装
+        // 瑙ｅ皝瑁?
         let (header, payload) =
-            TunnelFrameHeader::deserialize(data).ok_or_else(|| ConnectivityError::Invalid {
+            TunnelFrameHeader::deserialize(&data).ok_or_else(|| ConnectivityError::Invalid {
                 message: "invalid tunnel frame header".to_string(),
             })?;
 
-        // 更新发送方统计
+        // 鏇存柊鍙戦€佹柟缁熻
         if let Some((_, _, _, stats)) = self.peers.get_mut(&header.src_virtual_ip) {
             stats.bytes_received += n as u64;
         }
 
-        // 写入 VPI
-        self.vpi.send(payload).map_err(|e| ConnectivityError::Io {
-            operation: "vpi_send".to_string(),
-            message: e.to_string(),
-        })?;
+        // 鏈満鐩殑 鈫?鍐?VPI
+        if header.dst_virtual_ip == self.config.virtual_ip {
+            self.vpi.send(payload).map_err(|e| ConnectivityError::Io {
+                operation: "vpi_send".to_string(),
+                message: e.to_string(),
+            })?;
+            return Ok(Some((header.src_virtual_ip, payload.len())));
+        }
 
-        Ok(Some((header.src_virtual_ip, payload.len())))
+        // 闈炴湰鏈虹洰鐨?鈫?杞彂锛圥1 搂12.5锛?
+        // 鍏堟煡鐩磋繛 peer锛堜腑闂磋妭鐐规湰韬氨鏄渶缁堢洰鐨勭殑鐩磋繛閭诲眳锛夛紝鍐嶆煡闈欐€佽矾鐢辫〃
+        let next_hop = if self.peers.contains_key(&header.dst_virtual_ip) {
+            header.dst_virtual_ip.clone()
+        } else {
+            self.routes
+                .get(&header.dst_virtual_ip)
+                .cloned()
+                .ok_or_else(|| ConnectivityError::Invalid {
+                    message: format!(
+                        "NO_ROUTE_TO_DST: received frame for {} but no route",
+                        header.dst_virtual_ip
+                    ),
+                })?
+        };
+
+        let (_peer_id, locator, state, _stats) =
+            self.peers
+                .get(&next_hop)
+                .ok_or_else(|| ConnectivityError::Invalid {
+                    message: format!("next-hop peer {next_hop} not found"),
+                })?;
+        if *state != TunnelState::Connected {
+            return Err(ConnectivityError::Invalid {
+                message: format!("next-hop peer {next_hop} not connected"),
+            });
+        }
+        let locator = locator.clone();
+
+        // 鎶婂師濮嬪抚锛堜笉瑙?payload锛夎浆鍙戠粰 next_hop
+        self.carrier
+            .send_to(&locator, &data)
+            .map_err(|e| ConnectivityError::Io {
+                operation: "forward_send_to".to_string(),
+                message: e.to_string(),
+            })?;
+
+        // 鏇存柊杞彂缁熻 + 鍙戜簨浠?
+        if let Some((_, _, _, stats)) = self.peers.get_mut(&next_hop) {
+            stats.bytes_forwarded += n as u64;
+        }
+        self.events.push(VirtualSubnetEvent::PacketForwarded {
+            tunnel_id: self.tunnel_id.clone(),
+            src_virtual_ip: header.src_virtual_ip.clone(),
+            dst_virtual_ip: header.dst_virtual_ip.clone(),
+            next_hop: next_hop.clone(),
+            bytes: n as u64,
+        });
+
+        // 杞彂鍚庝笉鍐?VPI锛岃繑鍥炲師濮?src 鍜屽抚闀?
+        Ok(Some((header.src_virtual_ip, n)))
     }
 
-    /// 从 VPI 读一个 IP 包并路由到对应 Peer。
+    /// 浠?VPI 璇讳竴涓?IP 鍖呭苟璺敱鍒板搴?Peer銆?
     pub fn read_vpi_and_route(
         &mut self,
         buffer: &mut [u8],
@@ -385,8 +498,8 @@ impl VirtualSubnetTunnel {
             return Ok(None);
         }
 
-        // P0 简化：从 IP 包提取目的 IP（第 16-19 字节是目的 IP）
-        // 真实实现应该解析 IP 头，P0 简化为取前 24 字节内的目的 IP 字段
+        // P0 绠€鍖栵細浠?IP 鍖呮彁鍙栫洰鐨?IP锛堢 16-19 瀛楄妭鏄洰鐨?IP锛?
+        // 鐪熷疄瀹炵幇搴旇瑙ｆ瀽 IP 澶达紝P0 绠€鍖栦负鍙栧墠 24 瀛楄妭鍐呯殑鐩殑 IP 瀛楁
         let packet = &buffer[..n];
         let dst_ip = extract_dst_ip_from_ipv4(packet).unwrap_or_default();
 
@@ -394,51 +507,51 @@ impl VirtualSubnetTunnel {
         Ok(Some(n))
     }
 
-    /// 获取子网配置。
+    /// 鑾峰彇瀛愮綉閰嶇疆銆?
     #[must_use]
     pub fn config(&self) -> &VirtualSubnetConfig {
         &self.config
     }
 
-    /// 获取隧道 ID。
+    /// 鑾峰彇闅ч亾 ID銆?
     #[must_use]
     pub fn tunnel_id(&self) -> &str {
         &self.tunnel_id
     }
 
-    /// 获取事件流（用于可观测性和重放）。
+    /// 鑾峰彇浜嬩欢娴侊紙鐢ㄤ簬鍙娴嬫€у拰閲嶆斁锛夈€?
     #[must_use]
     pub fn events(&self) -> &[VirtualSubnetEvent] {
         &self.events
     }
 }
 
-/// 从 IPv4 包提取目的 IP（P0 简化实现：取第 16-19 字节）。
+/// 浠?IPv4 鍖呮彁鍙栫洰鐨?IP锛圥0 绠€鍖栧疄鐜帮細鍙栫 16-19 瀛楄妭锛夈€?
 fn extract_dst_ip_from_ipv4(packet: &[u8]) -> Option<String> {
     if packet.len() < 20 {
         return None;
     }
-    // IPv4 头第 16-19 字节是目的 IP
+    // IPv4 澶寸 16-19 瀛楄妭鏄洰鐨?IP
     let dst = &packet[16..20];
     Some(format!("{}.{}.{}.{}", dst[0], dst[1], dst[2], dst[3]))
 }
 
-// ---------- 内存模拟实现（离线确定性 E4） ----------
+// ---------- 鍐呭瓨妯℃嫙瀹炵幇锛堢绾跨‘瀹氭€?E4锛?----------
 
 use std::sync::Mutex;
 
-/// 内存模拟 VPI（测试工具，生产代码请勿使用）。
+/// 鍐呭瓨妯℃嫙 VPI锛堟祴璇曞伐鍏凤紝鐢熶骇浠ｇ爜璇峰嬁浣跨敤锛夈€?
 ///
-/// 用于单元测试和 E4 离线场景执行，不实现真实 TUN 驱动。
+/// 鐢ㄤ簬鍗曞厓娴嬭瘯鍜?E4 绂荤嚎鍦烘櫙鎵ц锛屼笉瀹炵幇鐪熷疄 TUN 椹卞姩銆?
 pub struct MemoryVpi {
-    /// 接收缓冲区（对端写入，本节点读取）。
+    /// 鎺ユ敹缂撳啿鍖猴紙瀵圭鍐欏叆锛屾湰鑺傜偣璇诲彇锛夈€?
     recv_buf: Mutex<Vec<u8>>,
-    /// 发送缓冲区（本节点写入，对端读取）。
+    /// 鍙戦€佺紦鍐插尯锛堟湰鑺傜偣鍐欏叆锛屽绔鍙栵級銆?
     send_buf: Mutex<Vec<u8>>,
 }
 
 impl MemoryVpi {
-    /// 创建内存 VPI。
+    /// 鍒涘缓鍐呭瓨 VPI銆?
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -447,13 +560,13 @@ impl MemoryVpi {
         }
     }
 
-    /// 注入一个待接收的包（模拟对端发来）。
+    /// 娉ㄥ叆涓€涓緟鎺ユ敹鐨勫寘锛堟ā鎷熷绔彂鏉ワ級銆?
     pub fn inject_recv(&self, data: &[u8]) {
         let mut buf = self.recv_buf.lock().unwrap();
         buf.extend_from_slice(data);
     }
 
-    /// 读取已发送的包（模拟本节点发出）。
+    /// 璇诲彇宸插彂閫佺殑鍖咃紙妯℃嫙鏈妭鐐瑰彂鍑猴級銆?
     #[must_use]
     pub fn take_sent(&self) -> Vec<u8> {
         let mut buf = self.send_buf.lock().unwrap();
@@ -485,20 +598,20 @@ impl VirtualPacketInterface for MemoryVpi {
     }
 }
 
-/// 内存模拟 PacketCarrier（测试工具，生产代码请勿使用）。
+/// 鍐呭瓨妯℃嫙 PacketCarrier锛堟祴璇曞伐鍏凤紝鐢熶骇浠ｇ爜璇峰嬁浣跨敤锛夈€?
 ///
-/// 用于单元测试和 E4 离线场景执行，不实现真实 UDP 网络栈。
+/// 鐢ㄤ簬鍗曞厓娴嬭瘯鍜?E4 绂荤嚎鍦烘櫙鎵ц锛屼笉瀹炵幇鐪熷疄 UDP 缃戠粶鏍堛€?
 pub struct MemoryCarrier {
-    /// 发送缓冲区（本节点发送，对端接收）——与对端的 recv_buf 共享。
+    /// 鍙戦€佺紦鍐插尯锛堟湰鑺傜偣鍙戦€侊紝瀵圭鎺ユ敹锛夆€斺€斾笌瀵圭鐨?recv_buf 鍏变韩銆?
     send_buf: Arc<Mutex<Vec<u8>>>,
-    /// 接收缓冲区（对端发送，本节点接收）——与对端的 send_buf 共享。
+    /// 鎺ユ敹缂撳啿鍖猴紙瀵圭鍙戦€侊紝鏈妭鐐规帴鏀讹級鈥斺€斾笌瀵圭鐨?send_buf 鍏变韩銆?
     recv_buf: Arc<Mutex<Vec<u8>>>,
-    /// 绑定的 locator。
+    /// 缁戝畾鐨?locator銆?
     local_locator: Mutex<Option<String>>,
 }
 
 impl MemoryCarrier {
-    /// 创建空的 MemoryCarrier（独立缓冲区，不与任何对端连接）。
+    /// 鍒涘缓绌虹殑 MemoryCarrier锛堢嫭绔嬬紦鍐插尯锛屼笉涓庝换浣曞绔繛鎺ワ級銆?
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -508,14 +621,14 @@ impl MemoryCarrier {
         }
     }
 
-    /// 创建一对真正互连的 MemoryCarrier：A.send <-> B.recv, B.send <-> A.recv。
+    /// 鍒涘缓涓€瀵圭湡姝ｄ簰杩炵殑 MemoryCarrier锛欰.send <-> B.recv, B.send <-> A.recv銆?
     #[must_use]
     pub fn connected_pair() -> (Self, Self) {
         let a_send = Arc::new(Mutex::new(Vec::new()));
         let b_send = Arc::new(Mutex::new(Vec::new()));
 
-        // A 的接收 = B 的发送
-        // B 的接收 = A 的发送
+        // A 鐨勬帴鏀?= B 鐨勫彂閫?
+        // B 鐨勬帴鏀?= A 鐨勫彂閫?
         let a = Self {
             send_buf: a_send.clone(),
             recv_buf: b_send.clone(),
@@ -529,16 +642,16 @@ impl MemoryCarrier {
         (a, b)
     }
 
-    /// 把另一个 carrier 的接收缓冲区连到本节点的发送缓冲区。
+    /// 鎶婂彟涓€涓?carrier 鐨勬帴鏀剁紦鍐插尯杩炲埌鏈妭鐐圭殑鍙戦€佺紦鍐插尯銆?
     pub fn connect_to(&self, other: &MemoryCarrier) {
-        // 简化：把 self.send_buf 的内容复制到 other.recv_buf
-        // 实际应该用 channel，但为了 E4 确定性，我们直接操作
+        // 绠€鍖栵細鎶?self.send_buf 鐨勫唴瀹瑰鍒跺埌 other.recv_buf
+        // 瀹為檯搴旇鐢?channel锛屼絾涓轰簡 E4 纭畾鎬э紝鎴戜滑鐩存帴鎿嶄綔
         let send = self.send_buf.lock().unwrap();
         let mut recv = other.recv_buf.lock().unwrap();
         recv.extend_from_slice(&send);
     }
 
-    /// 注入一个待接收的帧。
+    /// 娉ㄥ叆涓€涓緟鎺ユ敹鐨勫抚銆?
     pub fn inject_recv(&self, data: &[u8]) {
         let mut buf = self.recv_buf.lock().unwrap();
         buf.extend_from_slice(data);
@@ -578,7 +691,90 @@ impl Default for MemoryCarrier {
     }
 }
 
-// ---------- 测试 ----------
+/// 澶氬绔唴瀛?PacketCarrier锛圥1 搂12.5 涓夎妭鐐?mesh 娴嬭瘯鏇胯韩锛夈€?
+///
+/// 涓?`MemoryCarrier`锛堢偣瀵圭偣锛変笉鍚岋紝`MeshCarrier` 鎸?`peer_locator` 鎶婂抚
+/// 璺敱鍒颁笉鍚屽绔殑鎺ユ敹缂撳啿鍖猴紝鐢ㄤ簬涓夎妭鐐?A鈥擝鈥擟 绂荤嚎纭畾鎬?E4銆?
+/// 鐢熶骇浠ｇ爜璇峰嬁浣跨敤銆?
+pub struct MeshCarrier {
+    /// 鏈妭鐐规帴鏀剁紦鍐插尯锛堟墍鏈夌洿杩炲绔啓鍏ヨ繖閲岋級銆?
+    recv_buf: Arc<Mutex<Vec<u8>>>,
+    /// peer_locator 鈫?瀵圭鐨?recv_buf锛坰end_to 鏃舵寜 locator 鍐欏叆锛夈€?
+    links: HashMap<String, Arc<Mutex<Vec<u8>>>>,
+    /// 缁戝畾鐨?locator銆?
+    local_locator: Mutex<Option<String>>,
+}
+
+impl MeshCarrier {
+    /// 鍒涘缓绌?MeshCarrier銆?
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            recv_buf: Arc::new(Mutex::new(Vec::new())),
+            links: HashMap::new(),
+            local_locator: Mutex::new(None),
+        }
+    }
+
+    /// 鎶婂绔?locator 杩炲埌瀵圭鐨勬帴鏀剁紦鍐插尯銆?
+    pub fn connect_peer(&mut self, peer_locator: &str, peer_recv: Arc<Mutex<Vec<u8>>>) {
+        self.links.insert(peer_locator.to_string(), peer_recv);
+    }
+
+    /// 鑾峰彇鏈妭鐐规帴鏀剁紦鍐插尯锛堢敤浜庤瀵圭杩炲埌鑷繁锛夈€?
+    #[must_use]
+    pub fn recv_handle(&self) -> Arc<Mutex<Vec<u8>>> {
+        self.recv_buf.clone()
+    }
+
+    /// 娉ㄥ叆涓€涓緟鎺ユ敹鐨勫抚锛堟祴璇曠敤锛夈€?
+    pub fn inject_recv(&self, data: &[u8]) {
+        let mut buf = self.recv_buf.lock().unwrap();
+        buf.extend_from_slice(data);
+    }
+}
+
+impl Default for MeshCarrier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PacketCarrier for MeshCarrier {
+    fn bind(&mut self, local_locator: &str) -> Result<String, PlatformError> {
+        *self.local_locator.lock().unwrap() = Some(local_locator.to_string());
+        Ok(local_locator.to_string())
+    }
+
+    fn send_to(&mut self, peer_locator: &str, frame: &[u8]) -> Result<(), PlatformError> {
+        let peer_recv =
+            self.links
+                .get(peer_locator)
+                .cloned()
+                .ok_or_else(|| PlatformError::Invalid {
+                    message: format!("no link to peer locator {peer_locator}"),
+                })?;
+        let mut buf = peer_recv.lock().unwrap();
+        buf.extend_from_slice(frame);
+        Ok(())
+    }
+
+    fn receive_into(&mut self, output: &mut [u8]) -> Result<usize, PlatformError> {
+        let mut buf = self.recv_buf.lock().unwrap();
+        let n = buf.len().min(output.len());
+        if n > 0 {
+            output[..n].copy_from_slice(&buf[..n]);
+            buf.drain(..n);
+        }
+        Ok(n)
+    }
+
+    fn local_locator(&self) -> Option<String> {
+        self.local_locator.lock().unwrap().clone()
+    }
+}
+
+// ---------- 娴嬭瘯 ----------
 
 #[cfg(test)]
 mod tests {
@@ -620,24 +816,24 @@ mod tests {
 
     #[test]
     fn test_virtual_subnet_tunnel_basic() {
-        // 节点 A
+        // 鑺傜偣 A
         let config_a = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
         let vpi_a = Box::new(MemoryVpi::new());
         let carrier_a = Box::new(MemoryCarrier::new());
 
         let mut tunnel_a = VirtualSubnetTunnel::new(config_a, vpi_a, carrier_a);
 
-        // 节点 B 的 carrier
+        // 鑺傜偣 B 鐨?carrier
         let mut carrier_b = MemoryCarrier::new();
         carrier_b.bind("10.0.0.2:10000").unwrap();
 
-        // 注册 Peer B
+        // 娉ㄥ唽 Peer B
         tunnel_a
             .add_peer(TunnelPeer::new("10.0.0.2", "10.0.0.2:10000"))
             .unwrap();
         tunnel_a.set_peer_state("10.0.0.2", TunnelState::Connected);
 
-        // 发送一个 IP 包（目的 IP 10.0.0.2）
+        // 鍙戦€佷竴涓?IP 鍖咃紙鐩殑 IP 10.0.0.2锛?
         let mut ip_packet = vec![0u8; 20];
         ip_packet[16] = 10;
         ip_packet[17] = 0;
@@ -647,7 +843,7 @@ mod tests {
 
         tunnel_a.send_ip_packet("10.0.0.2", &ip_packet).unwrap();
 
-        // 检查统计
+        // 妫€鏌ョ粺璁?
         let stats = tunnel_a.peer_stats("10.0.0.2").unwrap();
         assert!(stats.bytes_sent > 0);
     }
@@ -674,7 +870,7 @@ mod tests {
         tunnel
             .add_peer(TunnelPeer::new("10.0.0.2", "peer:10000"))
             .unwrap();
-        // 不设置 Connected 状态
+        // 涓嶈缃?Connected 鐘舵€?
 
         let packet = vec![0u8; 20];
         let result = tunnel.send_ip_packet("10.0.0.2", &packet);
@@ -690,5 +886,162 @@ mod tests {
 
         let result = tunnel.add_peer(TunnelPeer::new("192.168.1.2", "peer:10000"));
         assert!(result.is_err());
+    }
+
+    // ---------- P1 搂12.5 闈欐€佽矾鐢变笁鑺傜偣杞彂 ----------
+
+    #[test]
+    fn test_add_route_rejects_non_peer_next_hop() {
+        let config = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
+        let vpi = Box::new(MemoryVpi::new());
+        let carrier = Box::new(MemoryCarrier::new());
+        let mut tunnel = VirtualSubnetTunnel::new(config, vpi, carrier);
+
+        // next_hop 10.0.0.9 鏈敞鍐?鈫?鎷掔粷
+        let err = tunnel.add_route("10.0.0.3", "10.0.0.9").unwrap_err();
+        assert!(matches!(err, ConnectivityError::Invalid { .. }));
+    }
+
+    #[test]
+    fn test_send_to_unknown_dst_no_route_fails() {
+        let config = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
+        let vpi = Box::new(MemoryVpi::new());
+        let carrier = Box::new(MemoryCarrier::new());
+        let mut tunnel = VirtualSubnetTunnel::new(config, vpi, carrier);
+
+        let packet = vec![0u8; 20];
+        let err = tunnel.send_ip_packet("10.0.0.99", &packet).unwrap_err();
+        assert!(matches!(err, ConnectivityError::Invalid { .. }));
+    }
+
+    #[test]
+    fn test_three_node_mesh_forwarding() {
+        // 涓夎妭鐐?A(10.0.0.1) -- B(10.0.0.2) -- C(10.0.0.3)
+        // A 鍜?C 涓嶇洿杩烇紱A 鈫?C 缁?B 杞彂
+        let mut mesh_a = MeshCarrier::new();
+        let mut mesh_b = MeshCarrier::new();
+        let mut mesh_c = MeshCarrier::new();
+
+        let a_recv = mesh_a.recv_handle();
+        let b_recv = mesh_b.recv_handle();
+        let c_recv = mesh_c.recv_handle();
+
+        // A鈫擝 鍙屽悜
+        mesh_a.connect_peer("B_locator", b_recv.clone());
+        mesh_b.connect_peer("A_locator", a_recv.clone());
+        // B鈫擟 鍙屽悜
+        mesh_b.connect_peer("C_locator", c_recv.clone());
+        mesh_c.connect_peer("B_locator", b_recv.clone());
+
+        // 涓変釜 MemoryVpi
+        let vpi_a = Box::new(MemoryVpi::new());
+        let vpi_b = Box::new(MemoryVpi::new());
+        let vpi_c = Box::new(MemoryVpi::new());
+
+        let cfg_a = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
+        let cfg_b = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.2");
+        let cfg_c = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.3");
+
+        let mut tunnel_a = VirtualSubnetTunnel::new(cfg_a, vpi_a, Box::new(mesh_a));
+        let mut tunnel_b = VirtualSubnetTunnel::new(cfg_b, vpi_b, Box::new(mesh_b));
+        let mut tunnel_c = VirtualSubnetTunnel::new(cfg_c, vpi_c, Box::new(mesh_c));
+
+        // A 鍙敞鍐?B
+        tunnel_a
+            .add_peer(TunnelPeer::new("10.0.0.2", "B_locator"))
+            .unwrap();
+        tunnel_a.set_peer_state("10.0.0.2", TunnelState::Connected);
+        // A 鐨勮矾鐢憋細C 缁?B
+        tunnel_a.add_route("10.0.0.3", "10.0.0.2").unwrap();
+
+        // B 娉ㄥ唽 A 鍜?C
+        tunnel_b
+            .add_peer(TunnelPeer::new("10.0.0.1", "A_locator"))
+            .unwrap();
+        tunnel_b
+            .add_peer(TunnelPeer::new("10.0.0.3", "C_locator"))
+            .unwrap();
+        tunnel_b.set_peer_state("10.0.0.1", TunnelState::Connected);
+        tunnel_b.set_peer_state("10.0.0.3", TunnelState::Connected);
+        // B 鐨勮矾鐢辫〃涓虹┖锛圓 鍜?C 閮芥槸鐩磋繛锛?
+
+        // C 鍙敞鍐?B
+        tunnel_c
+            .add_peer(TunnelPeer::new("10.0.0.2", "B_locator"))
+            .unwrap();
+        tunnel_c.set_peer_state("10.0.0.2", TunnelState::Connected);
+
+        // 鏋勯€犱竴涓洰鐨勪负 C 鐨?IP 鍖?
+        let mut packet = vec![0u8; 20];
+        packet[16] = 10;
+        packet[17] = 0;
+        packet[18] = 0;
+        packet[19] = 3;
+        packet.extend_from_slice(b"hello-from-a");
+
+        // A 鍙戦€佺粰 C 鈫?璺敱鍒?B
+        tunnel_a.send_ip_packet("10.0.0.3", &packet).unwrap();
+
+        // B 鏀跺埌甯?鈫?dst 涓嶆槸 B 鈫?杞彂缁?C
+        let mut buf = [0u8; 1024];
+        let delivered = tunnel_b.recv_and_deliver(&mut buf).unwrap();
+        assert!(delivered.is_some());
+        // B 鐨?bytes_forwarded > 0
+        assert!(tunnel_b.peer_stats("10.0.0.3").unwrap().bytes_forwarded > 0);
+
+        // C 鏀跺埌杞彂鍚庣殑甯?鈫?dst == C 鈫?鍐?VPI
+        let delivered_c = tunnel_c.recv_and_deliver(&mut buf).unwrap();
+        assert!(delivered_c.is_some());
+        // C 瑙ｅ皝瑁呭悗鎷垮埌 payload锛岄暱搴﹀簲绛変簬鍘熷 packet
+        assert_eq!(delivered_c.unwrap().1, packet.len());
+
+        // A 涓嶇煡閬?C 鐨?locator
+        assert!(tunnel_a.peer_stats("10.0.0.3").is_none());
+    }
+
+    #[test]
+    fn test_recv_frame_for_unknown_dst_no_route_fails() {
+        // B 鏀跺埌涓€涓?dst=10.0.0.9 鐨勫抚锛屼絾 B 鏃笉鐩磋繛 10.0.0.9 涔熸病鏈夎矾鐢?
+        let mesh_b = MeshCarrier::new();
+        let b_recv = mesh_b.recv_handle();
+
+        let vpi_b = Box::new(MemoryVpi::new());
+        let cfg_b = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.2");
+        let mut tunnel_b = VirtualSubnetTunnel::new(cfg_b, vpi_b, Box::new(mesh_b));
+        tunnel_b
+            .add_peer(TunnelPeer::new("10.0.0.1", "A_locator"))
+            .unwrap();
+        tunnel_b.set_peer_state("10.0.0.1", TunnelState::Connected);
+
+        // 浼€犱竴涓抚锛歴rc=10.0.0.1, dst=10.0.0.9
+        let fake_frame = b"10.0.0.1->10.0.0.9:hello";
+        b_recv.lock().unwrap().extend_from_slice(fake_frame);
+
+        let mut buf = [0u8; 1024];
+        let err = tunnel_b.recv_and_deliver(&mut buf).unwrap_err();
+        assert!(matches!(err, ConnectivityError::Invalid { .. }));
+    }
+
+    #[test]
+    fn test_forward_to_disconnected_next_hop_fails() {
+        // B 鏀跺埌 dst=C 鐨勫抚锛屼絾 C peer 鏈?Connected 鈫?杞彂澶辫触
+        let mesh_b = MeshCarrier::new();
+        let b_recv = mesh_b.recv_handle();
+
+        let vpi_b = Box::new(MemoryVpi::new());
+        let cfg_b = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.2");
+        let mut tunnel_b = VirtualSubnetTunnel::new(cfg_b, vpi_b, Box::new(mesh_b));
+        // B 娉ㄥ唽浜?C 浣嗕笉 Connected
+        tunnel_b
+            .add_peer(TunnelPeer::new("10.0.0.3", "C_locator"))
+            .unwrap();
+
+        // 浼€犲抚锛歴rc=A, dst=C
+        let fake_frame = b"10.0.0.1->10.0.0.3:hello";
+        b_recv.lock().unwrap().extend_from_slice(fake_frame);
+
+        let mut buf = [0u8; 1024];
+        let err = tunnel_b.recv_and_deliver(&mut buf).unwrap_err();
+        assert!(matches!(err, ConnectivityError::Invalid { .. }));
     }
 }

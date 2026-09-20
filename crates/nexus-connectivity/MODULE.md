@@ -91,6 +91,20 @@ NAT/中继场景的物理建连（组合根 transport::connect）发生在激活
   `LinkProbe` 语义，`LinkActivator` / `LinkKind` / `LinkProbe` / `LinkSelection` 既有行为不变。
 - trait 保持领域中立、可移植；具体 AEAD 加密实现位于 `nexus-outbound-shadowsocks`（portable=false）。
 
+### 冻结契约（VirtualSubnet 静态路由 P1，PRODUCT §12.5）
+
+- `VirtualSubnetTunnel` 新增 `routes: HashMap<dst_virtual_ip, next_hop_virtual_ip>` 静态路由表。
+- 新增 `add_route(dst, next_hop) -> Result<(), ConnectivityError>`：next_hop 必须是已注册 peer，
+  否则 `ConnectivityError::Invalid(ROUTE_NEXT_HOP_NOT_PEER)`。
+- `send_ip_packet`：dst 非直连 Connected peer 时查 `routes[dst]`，把同一帧（原始 dst 不变）
+  发给 next_hop；查不到 → `ConnectivityError::Invalid(NO_ROUTE_TO_DST)`。
+- `recv_and_deliver`：dst 非本机时查 `routes[dst]` 重新封装同帧转发给 next_hop，
+  计 `TunnelStats.bytes_forwarded`；无 next_hop → `NO_ROUTE_TO_DST`。
+- 新增事件 `VirtualSubnetEvent::PacketForwarded { tunnel_id, src, dst, next_hop, bytes }`。
+- Deletion Test：MeshCarrier（多对端 carrier 测试替身）是独立变化维度（三节点 E4 必需），
+  与 MemoryCarrier（点对点）并存；不引入新 trait，只扩展现成数据面。
+- 不做：动态路由、最短路径、跨子网、加密、真实 TUN。
+
 ## Verification
 
 最低：
