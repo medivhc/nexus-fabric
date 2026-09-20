@@ -40,6 +40,8 @@ nexus — Nexus 统一 Resource Fabric 控制面 CLI
 输出:
   --json        原样打印 observability 快照 JSON（机器可读，stderr 静默）。
   默认          渲染人读文本视图（JSON 的字段投影）。
+  --socket <path> / --addr <ip:port>
+                thin-client 远程传输目标（当前分支仅解析并提示，未真正建连）。
 
 exit 语义（对齐 nexusd）:
   0             业务成功；NexusError 领域拒绝（verdict=FAIL，请求已被处理）。
@@ -60,8 +62,73 @@ fn split_json_flag(args: &[String]) -> (bool, Vec<String>) {
     (json_mode, rest)
 }
 
+/// thin-client 远程传输目标：Unix domain socket 或 TCP loopback 地址。
+///
+/// 仅在被 `nexus-cli-thin-client` 分支真正用于建连；本分支只解析并接受，
+/// 据此在 stderr 打印一次说明（见 `run`），不影响进程内快照输出。
+#[derive(Debug, Clone, PartialEq)]
+enum RemoteTarget {
+    /// `--socket <path>`（Unix: unix socket；Windows: named pipe）。
+    Socket(String),
+    /// `--addr <ip:port>`（TCP loopback）。
+    Tcp(String),
+}
+
+impl RemoteTarget {
+    /// 用于 stderr 提示的人类可读标志名。
+    fn as_flag_help(&self) -> &'static str {
+        match self {
+            RemoteTarget::Socket(_) => "--socket",
+            RemoteTarget::Tcp(_) => "--addr",
+        }
+    }
+}
+
+/// 从参数中剥离全局 `--socket <path>` / `--addr <ip:port>`，返回
+/// (remote, 剩余 args)。二者均为值参数；缺值时忽略该标志。
+/// 后出现者覆盖先出现者（与 parse_flags 语义一致）。
+fn extract_remote_target(args: &[String]) -> (Option<RemoteTarget>, Vec<String>) {
+    let mut remote = None;
+    let mut rest = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--socket" | "--addr" => {
+                let kind = args[i].clone();
+                match args.get(i + 1).filter(|v| !v.starts_with("--")) {
+                    Some(value) => {
+                        remote = Some(if kind == "--socket" {
+                            RemoteTarget::Socket(value.clone())
+                        } else {
+                            RemoteTarget::Tcp(value.clone())
+                        });
+                        i += 2;
+                    }
+                    None => i += 1,
+                }
+            }
+            other => {
+                rest.push(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    (remote, rest)
+}
+
 fn run(args: &[String]) -> i32 {
     let (json_mode, args) = split_json_flag(args);
+    let (remote, args) = extract_remote_target(&args);
+
+    // --socket / --addr 为 thin-client 远程传输标志。本分支 CLI 仍走进程内快照
+    // （真实 HTTP-over-socket/TCP 远程传输随 nexus-cli-thin-client 分支落地）；
+    // 这里接受并解析标志，打印清晰说明，不崩溃、不影响现有输出。
+    if let Some(target) = &remote {
+        eprintln!(
+            "note: {} accepted; thin-client remote transport lands with the nexus-cli-thin-client branch, falling back to in-process snapshot.",
+            target.as_flag_help()
+        );
+    }
 
     if args.is_empty() || matches!(args[0].as_str(), "help" | "--help" | "-h") {
         print!("{USAGE}");
