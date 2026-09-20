@@ -58,6 +58,8 @@ pub enum ControlCommand {
     Diagnose,
     /// `platform capabilities`：平台能力清单。
     PlatformCapabilities,
+    /// `run <resource>`：执行远程资源访问。
+    Run { resource: String },
 }
 
 // ---------- 结构化输出 DTO（机器接口，版本化） ----------

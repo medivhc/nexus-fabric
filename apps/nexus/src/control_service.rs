@@ -45,6 +45,7 @@ impl ControlServiceImpl {
             ControlCommand::ComputeJobs => crate::observability::compute_jobs()?,
             ControlCommand::Diagnose => crate::observability::diagnose()?,
             ControlCommand::PlatformCapabilities => crate::observability::platform_capabilities()?,
+            ControlCommand::Run { resource } => crate::run_resource(resource)?,
         };
         Ok(json)
     }
