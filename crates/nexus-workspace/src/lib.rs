@@ -167,6 +167,8 @@ pub enum WorkspaceError {
     RemoteProtocol { frame: String },
     /// 读取或删除不存在的路径（投影通道语义）。
     NotFound { path: String },
+    /// 路径越界（尝试访问物化目录外的文件）。
+    PathTraversal { path: String },
 }
 
 impl fmt::Display for WorkspaceError {
@@ -191,6 +193,7 @@ impl fmt::Display for WorkspaceError {
                 write!(f, "unrecognized remote workspace frame: {frame:?}")
             }
             Self::NotFound { path } => write!(f, "path not found: {path}"),
+            Self::PathTraversal { path } => write!(f, "path traversal blocked: {path}"),
         }
     }
 }
@@ -271,7 +274,7 @@ pub trait WorkspaceAccess {
     fn delete(&mut self, path: &str) -> Result<(), WorkspaceError>;
 
     /// 提交变更到 Workspace
-    fn commit(&mut self, message: &str) -> Result<CommitId, WorkspaceError>;
+    fn commit(&mut self) -> Result<CommitId, WorkspaceError>;
 
     /// 获取当前 Head
     fn head(&self) -> Option<&CommitId>;
@@ -367,7 +370,7 @@ impl<S: ContentStore> WorkspaceAccess for NativeApiWorkspaceAccess<S> {
             merged.remove(p);
         }
 
-        // 过滤出以指定 path 为前缀的条目。
+        // 单层列表：只列出 path 目录下的直接子条目（不递归）。
         let prefix = if path.is_empty() {
             String::new()
         } else {
@@ -377,6 +380,11 @@ impl<S: ContentStore> WorkspaceAccess for NativeApiWorkspaceAccess<S> {
         let mut entries: Vec<DirEntry> = merged
             .keys()
             .filter(|p| p.starts_with(&prefix))
+            .filter(|p| {
+                // 只保留直接子条目：strip prefix 后不再包含 '/'。
+                let relative = p.strip_prefix(&prefix).unwrap_or(p);
+                !relative.contains('/')
+            })
             .map(|p| {
                 let relative = p.strip_prefix(&prefix).unwrap_or(p);
                 // 判断是否是目录（存在子路径以它为前缀）。
@@ -409,7 +417,7 @@ impl<S: ContentStore> WorkspaceAccess for NativeApiWorkspaceAccess<S> {
         Ok(())
     }
 
-    fn commit(&mut self, _message: &str) -> Result<CommitId, WorkspaceError> {
+    fn commit(&mut self) -> Result<CommitId, WorkspaceError> {
         // 如果没有暂存变更，返回当前 Head。
         if self.staged_writes.is_empty() && self.staged_deletes.is_empty() {
             return self
@@ -423,7 +431,15 @@ impl<S: ContentStore> WorkspaceAccess for NativeApiWorkspaceAccess<S> {
                 });
         }
 
-        let head = self.workspace.heads().heads[0].clone();
+        let head = self
+            .workspace
+            .heads()
+            .heads
+            .first()
+            .cloned()
+            .ok_or_else(|| WorkspaceError::StoreFailure {
+                reason: "no head".into(),
+            })?;
         let writes: Vec<Change> = self
             .staged_writes
             .iter()
@@ -512,6 +528,23 @@ impl<S: ContentStore> MaterializedDirectoryAccess<S> {
         (self.workspace, self.dir)
     }
 
+    /// 验证路径安全：拒绝 `../`、绝对路径、Windows 盘符等越界路径。
+    fn validate_path(path: &str) -> Result<(), WorkspaceError> {
+        use std::path::Component;
+        let p = PathBuf::from(path);
+        for comp in p.components() {
+            match comp {
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(WorkspaceError::PathTraversal {
+                        path: path.to_string(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// 递归扫描目录，收集所有相对路径文件。
     fn scan_dir(&self) -> Result<HashSet<String>, WorkspaceError> {
         let mut paths = HashSet::new();
@@ -550,6 +583,7 @@ impl<S: ContentStore> MaterializedDirectoryAccess<S> {
 
 impl<S: ContentStore> WorkspaceAccess for MaterializedDirectoryAccess<S> {
     fn read_file(&self, path: &str) -> Result<Vec<u8>, WorkspaceError> {
+        Self::validate_path(path)?;
         let file_path = self.dir.join(path);
         std::fs::read(&file_path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -565,6 +599,7 @@ impl<S: ContentStore> WorkspaceAccess for MaterializedDirectoryAccess<S> {
     }
 
     fn write_file(&mut self, path: &str, content: &[u8]) -> Result<(), WorkspaceError> {
+        Self::validate_path(path)?;
         let file_path = self.dir.join(path);
         if let Some(parent) = file_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| WorkspaceError::StoreFailure {
@@ -578,6 +613,9 @@ impl<S: ContentStore> WorkspaceAccess for MaterializedDirectoryAccess<S> {
     }
 
     fn list_dir(&self, path: &str) -> Result<Vec<DirEntry>, WorkspaceError> {
+        if !path.is_empty() {
+            Self::validate_path(path)?;
+        }
         let dir_path = if path.is_empty() {
             self.dir.clone()
         } else {
@@ -617,6 +655,7 @@ impl<S: ContentStore> WorkspaceAccess for MaterializedDirectoryAccess<S> {
     }
 
     fn delete(&mut self, path: &str) -> Result<(), WorkspaceError> {
+        Self::validate_path(path)?;
         let file_path = self.dir.join(path);
         std::fs::remove_file(&file_path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -631,7 +670,7 @@ impl<S: ContentStore> WorkspaceAccess for MaterializedDirectoryAccess<S> {
         })
     }
 
-    fn commit(&mut self, _message: &str) -> Result<CommitId, WorkspaceError> {
+    fn commit(&mut self) -> Result<CommitId, WorkspaceError> {
         // 扫描当前目录文件。
         let current_paths = self.scan_dir()?;
 
@@ -658,7 +697,15 @@ impl<S: ContentStore> WorkspaceAccess for MaterializedDirectoryAccess<S> {
             }
         }
 
-        let head = self.workspace.heads().heads[0].clone();
+        let head = self
+            .workspace
+            .heads()
+            .heads
+            .first()
+            .cloned()
+            .ok_or_else(|| WorkspaceError::StoreFailure {
+                reason: "no head".into(),
+            })?;
         let new_head = if writes.is_empty() && deletes.is_empty() {
             head
         } else {
@@ -1874,5 +1921,212 @@ mod access_provider_tests {
             select_access_provider(false, true),
             select_access_provider(false, true)
         );
+    }
+}
+
+#[cfg(test)]
+mod workspace_access_tests {
+    use super::*;
+    use nexus_storage::InMemoryContentStore;
+
+    fn new_native_access() -> NativeApiWorkspaceAccess<InMemoryContentStore> {
+        let ws = Workspace::init(
+            WorkspaceId("ws-native-test".into()),
+            InMemoryContentStore::new(),
+        )
+        .expect("init ok");
+        NativeApiWorkspaceAccess::new(ws)
+    }
+
+    #[test]
+    fn native_api_write_then_read_without_commit() {
+        let mut access = new_native_access();
+        access.write_file("hello.txt", b"world").expect("write ok");
+        // 不 commit，直接读 → 从 WorkingSet 读。
+        let content = access.read_file("hello.txt").expect("read ok");
+        assert_eq!(content, b"world".to_vec());
+    }
+
+    #[test]
+    fn native_api_commit_persists_new_content() {
+        let mut access = new_native_access();
+        let base_head = access.head().cloned().expect("has head");
+        access.write_file("a.txt", b"v1").expect("write ok");
+        let new_head = access.commit().expect("commit ok");
+        assert_ne!(new_head, base_head);
+        // commit 后仍能读到。
+        let content = access.read_file("a.txt").expect("read after commit");
+        assert_eq!(content, b"v1".to_vec());
+    }
+
+    #[test]
+    fn native_api_delete_removes_from_listing() {
+        let mut access = new_native_access();
+        access.write_file("keep.txt", b"keep").expect("write");
+        access.write_file("drop.txt", b"drop").expect("write");
+        access.commit().expect("commit");
+
+        // 删除 drop.txt。
+        access.delete("drop.txt").expect("delete");
+        let entries = access.list_dir("").expect("list");
+        let names: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert!(names.contains(&"keep.txt"));
+        assert!(!names.contains(&"drop.txt"));
+    }
+
+    #[test]
+    fn native_api_empty_commit_returns_current_head() {
+        let mut access = new_native_access();
+        let head_before = access.head().cloned().expect("has head");
+        let head_after = access.commit().expect("empty commit");
+        assert_eq!(head_before, head_after);
+    }
+
+    #[test]
+    fn native_api_read_missing_returns_not_found() {
+        let access = new_native_access();
+        let err = access
+            .read_file("nonexistent.txt")
+            .expect_err("should fail");
+        assert!(matches!(
+            err,
+            WorkspaceError::NotFound { path } if path == "nonexistent.txt"
+        ));
+    }
+
+    #[test]
+    fn native_api_delete_missing_returns_not_found() {
+        let mut access = new_native_access();
+        let err = access.delete("nonexistent.txt").expect_err("should fail");
+        assert!(matches!(err, WorkspaceError::NotFound { .. }));
+    }
+
+    // ---------- MaterializedDirectoryAccess tests ----------
+
+    fn temp_dir(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "nexus-ws-proj-test-{}-{}-{}",
+            label,
+            std::process::id(),
+            n
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn new_materialized_access() -> (MaterializedDirectoryAccess<InMemoryContentStore>, PathBuf) {
+        let store = InMemoryContentStore::new();
+        let mut ws = Workspace::init(WorkspaceId("ws-mat-test".into()), store).expect("init");
+        let base = ws.heads().heads.first().cloned().expect("head");
+        ws.commit_changes(
+            &base,
+            &[Change {
+                path: "seed.txt".into(),
+                content: b"seed-content".to_vec(),
+            }],
+        )
+        .expect("seed commit");
+        let dir = temp_dir("mat");
+        let access =
+            MaterializedDirectoryAccess::materialize(ws, dir.clone()).expect("materialize");
+        (access, dir)
+    }
+
+    #[test]
+    fn materialize_writes_files_to_dir() {
+        let (access, dir) = new_materialized_access();
+        let seed_file = dir.join("seed.txt");
+        assert!(
+            seed_file.exists(),
+            "seed.txt should exist in materialized dir"
+        );
+        let content = std::fs::read(&seed_file).expect("read seed");
+        assert_eq!(content, b"seed-content".to_vec());
+        let _ = access; // keep alive
+    }
+
+    #[test]
+    fn materialized_write_commit_advances_head() {
+        let (mut access, dir) = new_materialized_access();
+        let base_head = access.head().cloned().expect("head");
+
+        // 写新文件到目录。
+        access.write_file("new.txt", b"new-content").expect("write");
+        let new_head = access.commit().expect("commit");
+        assert_ne!(new_head, base_head);
+
+        // 从 Workspace 读回验证。
+        let content = access.read_file("new.txt").expect("read committed");
+        assert_eq!(content, b"new-content".to_vec());
+        let _ = dir;
+    }
+
+    #[test]
+    fn materialized_delete_commit_removes_from_workspace() {
+        let (mut access, dir) = new_materialized_access();
+        // 删除物化目录中的 seed.txt。
+        access.delete("seed.txt").expect("delete");
+        access.commit().expect("commit");
+
+        // 验证 Workspace 中 seed.txt 已不存在。
+        let err = access.read_file("seed.txt").expect_err("should be gone");
+        assert!(matches!(err, WorkspaceError::NotFound { .. }));
+        let _ = dir;
+    }
+
+    #[test]
+    fn materialized_read_missing_returns_not_found() {
+        let (access, dir) = new_materialized_access();
+        let err = access
+            .read_file("nonexistent.txt")
+            .expect_err("should fail");
+        assert!(matches!(err, WorkspaceError::NotFound { .. }));
+        let _ = dir;
+    }
+
+    #[test]
+    fn materialized_path_traversal_is_rejected() {
+        let (mut access, dir) = new_materialized_access();
+        // 尝试越界写。
+        let err = access
+            .write_file("../escape.txt", b"bad")
+            .expect_err("traversal should fail");
+        assert!(matches!(err, WorkspaceError::PathTraversal { .. }));
+        // 尝试越界读。
+        let err = access
+            .read_file("../escape.txt")
+            .expect_err("traversal should fail");
+        assert!(matches!(err, WorkspaceError::PathTraversal { .. }));
+        // 尝试越界删。
+        let err = access
+            .delete("../escape.txt")
+            .expect_err("traversal should fail");
+        assert!(matches!(err, WorkspaceError::PathTraversal { .. }));
+        let _ = dir;
+    }
+
+    #[test]
+    fn materialized_single_level_listing() {
+        let (mut access, dir) = new_materialized_access();
+        // 创建子目录。
+        access
+            .write_file("subdir/child.txt", b"child")
+            .expect("write");
+        let entries = access.list_dir("").expect("list root");
+        // 根级别应该有 seed.txt 和 subdir（目录）。
+        let names: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert!(names.contains(&"seed.txt"));
+        assert!(names.contains(&"subdir"));
+        // subdir 应该被标记为目录。
+        let subdir_entry = entries
+            .iter()
+            .find(|e| e.path == "subdir")
+            .expect("subdir entry");
+        assert!(subdir_entry.is_dir);
+        let _ = dir;
     }
 }
