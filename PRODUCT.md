@@ -970,3 +970,40 @@ AEAD 加密，每跳独立会话（WireGuard 式链路加密），§12.5 路由�
   各节点 `is_encryption_enabled=true`。
 - 冻结边界（P2 不做）：长期身份/公钥持久化（纯 ephemeral 握手）、密钥
   周期轮换逻辑、psk 绑定、真实线上传输（内存 carrier 闭环）。
+
+### 12.8 P2 带宽控制 / QoS（令牌桶限流骨架，2026-09-21） {#12-bandwidth-qos}
+
+§12.1-§12.7 已打通组网 / 转发 / 加密数据面；本节把**出站与入站带宽整形**接入
+delivery 层（`nexus-connectivity::qos`）。纯内存、纯同步、可注入时钟骨架。
+
+- 令牌桶（`TokenBucket`）：按 `max_bytes_per_sec` 字节/秒线性 refill，上限
+  `burst_size`；初始满桶允许一次性突发 `burst_size` 字节。
+  - `refill(now)`：按经过时间补充令牌，封顶 `burst_size`；
+  - `try_consume(bytes, now) -> bool`：够令牌则扣减并放行，不够直接拒绝
+    （**不阻塞、不 sleep**）；
+  - `remaining_tokens() -> u64`：向下取整的剩余令牌（诊断/快照）。
+- 可注入时钟（`QosClock` trait）：`fn now(&self) -> Duration`；
+  真实实现 `MonotonicClock` 基于 `std::time::Instant`（构造点起算的单调时长）；
+  单测 / E4 用显式 `Duration` 假时钟推进，保证确定性。
+- 带宽限制（`BandwidthLimit`）：`new(max_bytes_per_sec, burst_size) -> Result<_, QosError>`，
+  速率必须 > 0、burst 必须 >= 1，否则 `QosError::InvalidLimit`。
+- 配置（`QosConfig { ingress, egress }`）：两方向各自的 `Option<BandwidthLimit>`；
+  `None` 表示该方向不限制（恒放行）。
+- 控制器（`QosController`）：持有入站/出站两个令牌桶 + 统计表；
+  - `try_egress(tag, bytes, now) -> bool` / `try_ingress(tag, bytes, now) -> bool`：
+    命中限制返回 `false` 并把字节计入 `bytes_dropped`；放行计入 `bytes_allowed` 与
+    该 tag 的 `up_bytes`（egress）/ `down_bytes`（ingress）；
+  - `snapshot() -> QosStats`：聚合计数 + `HashMap<tag, PerEndpointStats{up,down}>`。
+- 错误面：`QosError::InvalidLimit { message }`，`Display` + `std::error::Error`；
+  库代码不用 `panic!` / `unwrap!` / `expect!`。
+- 集成语义（演示）：转发路径先过 `QosController` 再过 firewall 判定；被 QoS 拒绝的
+  流量计 dropped，不计 allowed、不进入后续过滤。本骨架不改旧模块签名。
+- E4 场景：`scenarios/product/bandwidth_qos.toml`（id=`product.bandwidth-qos`），
+  命令 `nexus-harness run bandwidth-qos --json`（出站 1000 B/s、burst 1000）：
+  - (a) 初始突发 1000 字节放行；
+  - (b) 同刻再发 100 字节被拒；
+  - (c) 推进时钟 1 秒后令牌恢复，又可发 500 字节；
+  - (d) conn-a up=1500、conn-b up=300，两连接统计互不影响；
+  - (e) bytes_allowed=1800、bytes_dropped=100（拒绝字节不计入 allowed）。
+- 冻结边界（P2 不做）：整形排队（缓冲/平滑）、优先级 / 公平排队、per-flow 哈希分流、
+  真实 socket/TUN 挂接、配置热加载与持久化（留 TODO）；不引入 `time` crate，仅 std。

@@ -58,6 +58,10 @@ pub mod mesh_dns;
 
 pub mod firewall;
 
+// ---------- 带宽控制 / QoS 令牌桶限流（E4：product.bandwidth-qos） ----------
+
+pub mod qos;
+
 // ---------- 结构化错误（不以日志文本代替错误类型） ----------
 
 /// Connectivity 层的结构化错误（delivery 层自有错误面，不依赖领域错误）。

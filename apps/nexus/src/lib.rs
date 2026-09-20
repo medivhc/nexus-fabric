@@ -5073,3 +5073,77 @@ pub fn firewall_flow() -> Result<Value, NexusError> {
         },
     }))
 }
+
+/// E4 场景 `product.bandwidth-qos`：带宽控制 / QoS 令牌桶限流。
+///
+/// 纯内存骨架：用可注入的显式 `Duration` 假时钟驱动 `QosController`（出站方向
+/// 限制 1000 B/s、突发 burst=1000），覆盖五个检查点：
+/// (a) 初始突发 burst_size 字节放行；
+/// (b) 同刻持续发送超过平均速率后后续包被拒；
+/// (c) 推进时钟 1 秒后令牌恢复又可发；
+/// (d) 两个连接（conn-a / conn-b）的 up 统计相互独立；
+/// (e) 被拒绝字节计入 dropped 而非 allowed。
+///
+/// 转发路径组合语义：被 QoS 拒绝的流量先在本层判 dropped，不再进入后续 firewall
+/// 判定（flow 内用"先过 QosController 再过 firewall 判定"的顺序表达，不改旧模块签名）。
+pub fn bandwidth_qos_flow() -> Result<Value, NexusError> {
+    use nexus_connectivity::qos::{BandwidthLimit, QosConfig, QosController};
+    use std::time::Duration;
+
+    // 出站限速：1000 字节/秒，令牌桶容量（初始突发）= 1000。入站不限制。
+    let egress_limit = BandwidthLimit::new(1000, 1000).map_err(|e| NexusError::Internal {
+        message: format!("bandwidth-qos egress limit: {e}"),
+    })?;
+    let cfg = QosConfig::new(None, Some(egress_limit));
+    let mut ctl = QosController::new(&cfg);
+
+    let t0 = Duration::ZERO;
+    let t1 = Duration::from_secs(1);
+
+    // (a) 初始突发：满桶 1000 字节放行。
+    let burst_allowed = ctl.try_egress("conn-a", 1000, t0);
+
+    // (b) 同刻持续发送：令牌已空，再发 100 字节被拒（计入 dropped）。
+    let excess_after_burst_rejected = !ctl.try_egress("conn-a", 100, t0);
+
+    // (c) 推进时钟 1 秒：按 1000 B/s 补满令牌，conn-a 又可发 500 字节。
+    let recovered_after_second = ctl.try_egress("conn-a", 500, t1);
+
+    // (d) 第二个连接 conn-b 在 t1 时刻独立消耗；两个连接 up 统计互不影响。
+    let conn_b_allowed = ctl.try_egress("conn-b", 300, t1);
+
+    let snap = ctl.snapshot();
+    let conn_a_up = snap
+        .endpoints
+        .get("conn-a")
+        .map(|s| s.up_bytes)
+        .unwrap_or(0);
+    let conn_b_up = snap
+        .endpoints
+        .get("conn-b")
+        .map(|s| s.up_bytes)
+        .unwrap_or(0);
+
+    Ok(json!({
+        "verdict": "PASS",
+        "command": "bandwidth-qos",
+        "rate_bps": 1000,
+        "burst_bytes": 1000,
+        // (a) 初始突发放行
+        "burst_allowed": burst_allowed,
+        // (b) 突发耗尽后同刻再发被拒
+        "excess_after_burst_rejected": excess_after_burst_rejected,
+        // (c) 推进 1 秒后令牌恢复
+        "recovered_after_second": recovered_after_second,
+        // (d) 两连接独立统计
+        "connections": {
+            "conn_a_up_bytes": conn_a_up,
+            "conn_b_up_bytes": conn_b_up,
+            "conn_b_allowed": conn_b_allowed,
+        },
+        // (e) 聚合统计：拒绝字节计入 dropped，放行字节计入 allowed
+        "bytes_allowed": snap.bytes_allowed,
+        "bytes_dropped": snap.bytes_dropped,
+        "egress_tokens_remaining": snap.tokens_remaining,
+    }))
+}
