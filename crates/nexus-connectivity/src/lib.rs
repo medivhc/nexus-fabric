@@ -70,6 +70,15 @@ pub mod reconnect;
 
 pub mod node_tags;
 
+// ---------- 批次2：健康检查 / 节点优先级 / 连接复用（纯逻辑骨架） ----------
+
+/// 连接复用池（idle 复用 + max_total 上限 + idle 超时回收）。
+pub mod connection_pool;
+/// 节点健康检查（探针状态机：Healthy/Degraded/Unhealthy）。
+pub mod health_check;
+/// 节点优先级选择器（priority 升序 -> latency 升序 -> bandwidth 降序）。
+pub mod node_priority;
+
 // ---------- 结构化错误（不以日志文本代替错误类型） ----------
 
 /// Connectivity 层的结构化错误（delivery 层自有错误面，不依赖领域错误）。
