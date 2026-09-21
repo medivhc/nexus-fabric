@@ -1,0 +1,50 @@
+schema_version = 1
+id = "product.auto-reconnect"
+title = "自动断线重连（指数退避 + 最大重试 + 状态机）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-auto-reconnect"
+
+[given]
+max_retries = 3
+initial_delay_ms = 100
+max_delay_ms = 800
+backoff_factor = 2.0
+clock = "injectable fake clock (explicit Duration; no sleep, no tokio)"
+
+[when]
+command = "nexus-harness run auto-reconnect --json"
+
+# (a) 首次断线后下一次退避延迟 = initial_delay（100ms，factor^0）
+[[expect]]
+field = "initial_backoff_is_100ms"
+equals = true
+
+# (b) 失败后指数翻倍：第 2 次 next_delay == 200，第 3 次 == 400
+[[expect]]
+field = "backoff_doubles"
+equals = true
+
+# (c) 退避延迟封顶：第 4 次若发生，next_delay 不超过 max_delay（800ms）
+[[expect]]
+field = "backoff_caps_at_max"
+equals = true
+
+# (d) 达到 max_retries 后进入 GiveUp，不再发起新尝试
+[[expect]]
+field = "give_up_after_max_retries"
+equals = true
+
+# (e) 退避中途成功重连：状态回到 Connected，重试计数清零，退避重置为 initial
+[[expect]]
+field = "reconnect_success_resets_state"
+equals = true
+
+# (f) 流驱动的总尝试次数 = max_retries
+[[expect]]
+field = "attempt_count"
+equals = 3
+
+# (g) 成功恢复路径的最终状态
+[[expect]]
+field = "final_state"
+equals = "Connected"
