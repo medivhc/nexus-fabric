@@ -66,6 +66,10 @@ pub mod qos;
 
 pub mod reconnect;
 
+// ---------- 节点分组标签（打标 + 过滤 + 路由选择，E4：product.node-tags） ----------
+
+pub mod node_tags;
+
 // ---------- 结构化错误（不以日志文本代替错误类型） ----------
 
 /// Connectivity 层的结构化错误（delivery 层自有错误面，不依赖领域错误）。
