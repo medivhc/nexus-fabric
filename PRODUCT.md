@@ -1046,3 +1046,57 @@ socket 集成留 P3 产品化）；打洞由外部 HolePuncher 驱动后经隧�
   帧经 relay 送达）；断言含 `Probing` 中间态可见。
 - 冻结边界（P2.2 不做）：tunnel 内真实 UDP 打洞（HolePuncher 挂接留 P3）、
   打洞重试策略、多候选并发打洞、NAT 类型驱动的路径选择。
+
+
+### 12.10 P2.3 节点健康检查（探针状态机骨架，2026-09-21） {#12-health-check}
+
+`health_check.rs`（`nexus-connectivity::health_check`）：delivery 层节点健康状态骨架。
+纯内存、纯同步、注入逻辑时钟（`now_ms` 由调用方传入，不读真实墙钟）。
+
+- `HealthConfig { probe_interval_ms, timeout_ms, failure_threshold }`：构造校验
+  `failure_threshold >= 1`、`probe_interval_ms > 0`，非法返回 `HealthCheckError::InvalidConfig`。
+- `HealthState`：`Healthy` / `Degraded` / `Unhealthy`，提供 `as_str()` 与 `Display`。
+- `HealthChecker::record_probe(node_id, success, now_ms) -> Result<HealthState, _>`：
+  按 node_id 维护连续失败计数。转移规则：连续失败 0 次 → `Healthy`；
+  `0 < 连续失败 < failure_threshold` → `Degraded`；`连续失败 >= failure_threshold` →
+  `Unhealthy`；任意一次成功立即回到 `Healthy`。新节点首次记录即注册。
+- 错误面独立：`HealthCheckError { InvalidConfig, UnknownNode }`，类型化，非 panic。
+- E4 场景：`health_check.toml`（id=`product.health-check`）——新节点初始 Healthy、
+  连续失败 1/2 次 Degraded、达到 threshold Unhealthy、一次成功恢复 Healthy、
+  未记录节点查询返回 UnknownNode。
+- 冻结边界（P2.3 不做）：真实定时探测线程、真实网络探活、跨节点状态同步、
+  持久化（留 TODO）。
+
+### 12.11 P2.3 节点优先级选择（2026-09-21） {#12-node-priority}
+
+`node_priority.rs`（`nexus-connectivity::node_priority`）：多候选路由的优先级选择骨架。
+
+- `NodePriority { node_id, priority: u8 }`：priority ∈ 0..=100，**越小越优先**；
+  越界返回 `PriorityError::InvalidPriority`。
+- `RouteCandidate { node_id, priority, latency_ms, bandwidth_mbps }`：单条候选路由。
+- `PrioritySelector`：维护 node_id → priority 映射；
+  `select_best(&[RouteCandidate]) -> Option<RouteCandidate>`，排序键为
+  **(priority 升序, latency_ms 升序, bandwidth_mbps 降序)**，空列表返回 `None`。
+- 错误面独立：`PriorityError { InvalidPriority { value }, UnknownNode }`。
+- E4 场景：`node_priority.toml`（id=`product.node-priority`）——优先级压倒延迟
+  （priority=5 高延迟仍胜 priority=10 低延迟）、同优先级选低延迟、
+  同优先级同延迟选高带宽、空候选返回 None、越界优先级被拒。
+- 冻结边界（P2.3 不做）：与多跳路由 `routing` 的真实挂接、动态优先级学习（留 TODO）。
+
+### 12.12 P2.3 连接复用池（2026-09-21） {#12-connection-pool}
+
+`connection_pool.rs`（`nexus-connectivity::connection_pool`）：连接复用骨架。
+
+- `PoolConfig { max_idle, max_total, idle_timeout_ms }`：构造校验
+  `max_total >= 1`、`max_idle <= max_total`，非法返回 `PoolError::InvalidConfig`。
+- `PooledConnection { key, conn_id }`：模拟连接句柄，conn_id 自增。
+- `ConnectionPool`：`acquire(key)` 有空闲则复用（取最旧），否则未达 `max_total`
+  新建，达上限返回 `PoolError::Exhausted`；`release(conn, now_ms)` 归还为空闲并
+  记录时间戳，空闲数超过 `max_idle` 时淘汰最旧；`evict_idle(now_ms)` 淘汰空闲
+  超过 `idle_timeout_ms` 的连接；`snapshot()` 暴露 idle/active/total/created_total。
+- 引用计数用显式 acquire/release 模拟（不引入 Arc/Drop hook，保持可测试）。
+- E4 场景：`connection_pool.toml`（id=`product.connection-pool`）——二次 acquire
+  同 key 复用同 conn_id、占满 max_total 后 Exhausted、max_idle 收敛、
+  逻辑时钟推进后 evict_idle 回收、非法配置被拒。
+- 冻结边界（P2.3 不做）：真实 TCP 连接复用、线程安全 Send/Sync、
+  与 relay/nat 数据面挂接（留 TODO）。

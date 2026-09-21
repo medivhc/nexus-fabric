@@ -5529,3 +5529,230 @@ pub fn node_tags_flow() -> Result<Value, NexusError> {
         },
     }))
 }
+
+// ---------- 批次2 E4 flows（health-check / node-priority / connection-pool） ----------
+
+/// E4 场景 `product.health-check`：节点健康检查骨架（注入逻辑时钟）。
+///
+/// 新节点初始 Healthy；连续失败到达 failure_threshold 前 Degraded、
+/// 达到后 Unhealthy；一次成功立即恢复 Healthy；未记录节点查询返回 UnknownNode。
+pub fn health_check_flow() -> Result<serde_json::Value, nexus_domain::NexusError> {
+    use nexus_connectivity::health_check::{HealthCheckError, HealthChecker, HealthConfig};
+
+    let cfg = HealthConfig::new(1_000, 500, 3).map_err(|e| nexus_domain::NexusError::Internal {
+        message: format!("health check config: {e}"),
+    })?;
+    let mut checker = HealthChecker::new(cfg);
+
+    let initial = checker.record_probe("node-a", true, 0).map_err(|e| {
+        nexus_domain::NexusError::Internal {
+            message: format!("record initial probe: {e}"),
+        }
+    })?;
+
+    let after_f1 = checker.record_probe("node-a", false, 100).map_err(|e| {
+        nexus_domain::NexusError::Internal {
+            message: format!("record failure #1: {e}"),
+        }
+    })?;
+
+    let after_f2 = checker.record_probe("node-a", false, 200).map_err(|e| {
+        nexus_domain::NexusError::Internal {
+            message: format!("record failure #2: {e}"),
+        }
+    })?;
+
+    let at_threshold = checker.record_probe("node-a", false, 300).map_err(|e| {
+        nexus_domain::NexusError::Internal {
+            message: format!("record failure #3: {e}"),
+        }
+    })?;
+
+    let recovered = checker.record_probe("node-a", true, 400).map_err(|e| {
+        nexus_domain::NexusError::Internal {
+            message: format!("record recovery probe: {e}"),
+        }
+    })?;
+
+    let unknown_kind = match checker.state("never-seen-node") {
+        Err(HealthCheckError::UnknownNode(_)) => "unknown_node",
+        Ok(state) => {
+            return Err(nexus_domain::NexusError::Internal {
+                message: format!("expected UnknownNode but got state {state:?}"),
+            });
+        }
+        Err(other) => {
+            return Err(nexus_domain::NexusError::Internal {
+                message: format!("expected UnknownNode but got {other}"),
+            });
+        }
+    };
+
+    Ok(serde_json::json!({
+        "verdict": "PASS",
+        "command": "health-check",
+        "config": {
+            "probe_interval_ms": 1_000,
+            "timeout_ms": 500,
+            "failure_threshold": 3,
+        },
+        "initial_node_state": initial.as_str(),
+        "after_one_failure": after_f1.as_str(),
+        "after_two_failures": after_f2.as_str(),
+        "at_threshold_failure": at_threshold.as_str(),
+        "after_recovery": recovered.as_str(),
+        "unknown_node_error": unknown_kind,
+    }))
+}
+
+/// E4 场景 `product.node-priority`：节点优先级选择器。
+///
+/// 排序键 (priority 升序, latency_ms 升序, bandwidth_mbps 降序)；
+/// 演示优先级压倒延迟、同优先级选低延迟、同优先级同延迟选高带宽、空候选 None、越界被拒。
+pub fn node_priority_flow() -> Result<Value, NexusError> {
+    use nexus_connectivity::node_priority::{PrioritySelector, RouteCandidate};
+
+    let mut selector = PrioritySelector::new();
+    selector
+        .set("node-a", 10)
+        .map_err(|e| NexusError::Internal {
+            message: format!("set node-a priority: {e}"),
+        })?;
+    selector
+        .set("node-b", 5)
+        .map_err(|e| NexusError::Internal {
+            message: format!("set node-b priority: {e}"),
+        })?;
+
+    let prio_a = selector.get("node-a").map_err(|e| NexusError::Internal {
+        message: format!("get node-a priority: {e}"),
+    })?;
+    let prio_b = selector.get("node-b").map_err(|e| NexusError::Internal {
+        message: format!("get node-b priority: {e}"),
+    })?;
+
+    let c_low_prio_high_lat =
+        RouteCandidate::new("node-b", prio_b, 100, 100).map_err(|e| NexusError::Internal {
+            message: format!("candidate node-b: {e}"),
+        })?;
+    let c_high_prio_low_lat =
+        RouteCandidate::new("node-a", prio_a, 10, 100).map_err(|e| NexusError::Internal {
+            message: format!("candidate node-a: {e}"),
+        })?;
+    let best_override = PrioritySelector::select_best(&[c_low_prio_high_lat, c_high_prio_low_lat]);
+
+    let c_same_prio_slow =
+        RouteCandidate::new("slow", 10, 20, 100).map_err(|e| NexusError::Internal {
+            message: format!("candidate slow: {e}"),
+        })?;
+    let c_same_prio_fast =
+        RouteCandidate::new("fast", 10, 10, 100).map_err(|e| NexusError::Internal {
+            message: format!("candidate fast: {e}"),
+        })?;
+    let best_latency = PrioritySelector::select_best(&[c_same_prio_slow, c_same_prio_fast]);
+
+    let c_low_bw =
+        RouteCandidate::new("low-bw", 10, 10, 100).map_err(|e| NexusError::Internal {
+            message: format!("candidate low-bw: {e}"),
+        })?;
+    let c_high_bw =
+        RouteCandidate::new("high-bw", 10, 10, 1000).map_err(|e| NexusError::Internal {
+            message: format!("candidate high-bw: {e}"),
+        })?;
+    let best_bandwidth = PrioritySelector::select_best(&[c_low_bw, c_high_bw]);
+
+    let best_empty: Option<RouteCandidate> = PrioritySelector::select_best(&[]);
+
+    let invalid_rejected = RouteCandidate::new("bad", 101, 10, 100).is_err();
+
+    Ok(json!({
+        "verdict": "PASS",
+        "command": "node-priority",
+        "registered": {
+            "node_a": prio_a,
+            "node_b": prio_b,
+        },
+        "priority_overrides_latency": {
+            "selected_node_id": best_override.as_ref().map(|c| c.node_id.clone()),
+            "selected_priority": best_override.as_ref().map(|c| c.priority),
+        },
+        "same_priority_lower_latency": {
+            "selected_node_id": best_latency.as_ref().map(|c| c.node_id.clone()),
+            "selected_latency_ms": best_latency.as_ref().map(|c| c.latency_ms),
+        },
+        "same_priority_same_latency_higher_bandwidth": {
+            "selected_node_id": best_bandwidth.as_ref().map(|c| c.node_id.clone()),
+            "selected_bandwidth_mbps": best_bandwidth.as_ref().map(|c| c.bandwidth_mbps),
+        },
+        "empty_candidates": {
+            "selected_node_id": best_empty.map(|c| c.node_id),
+        },
+        "invalid_priority_rejected": invalid_rejected,
+    }))
+}
+
+/// E4 场景 `product.connection-pool`：连接池复用、上限保护与空闲超时回收。
+pub fn connection_pool_flow() -> Result<Value, NexusError> {
+    use nexus_connectivity::connection_pool::{ConnectionPool, PoolConfig, PoolError};
+
+    let cfg = PoolConfig::new(2, 3, 1000).map_err(|e| NexusError::Internal {
+        message: format!("pool config: {e}"),
+    })?;
+    let mut pool = ConnectionPool::new(cfg);
+
+    let a1 = pool.acquire("node-a").map_err(|e| NexusError::Internal {
+        message: format!("acquire node-a first: {e}"),
+    })?;
+    let acquire_first_conn_id = a1.conn_id;
+
+    pool.release(a1.clone(), 0)
+        .map_err(|e| NexusError::Internal {
+            message: format!("release a1: {e}"),
+        })?;
+    let a2 = pool.acquire("node-a").map_err(|e| NexusError::Internal {
+        message: format!("acquire node-a reuse: {e}"),
+    })?;
+    let reuse_same = a2.conn_id == a1.conn_id;
+    let reuse_conn_id = a2.conn_id;
+    pool.release(a2, 0).map_err(|e| NexusError::Internal {
+        message: format!("release a2: {e}"),
+    })?;
+
+    let b = pool.acquire("node-b").map_err(|e| NexusError::Internal {
+        message: format!("acquire node-b: {e}"),
+    })?;
+    let c = pool.acquire("node-c").map_err(|e| NexusError::Internal {
+        message: format!("acquire node-c: {e}"),
+    })?;
+    let exhausted = matches!(pool.acquire("node-d"), Err(PoolError::Exhausted));
+
+    pool.release(b, 0).map_err(|e| NexusError::Internal {
+        message: format!("release b: {e}"),
+    })?;
+    pool.release(c, 0).map_err(|e| NexusError::Internal {
+        message: format!("release c: {e}"),
+    })?;
+    let after_max_idle_idle = pool.snapshot().idle_count;
+
+    let evicted = pool.evict_idle(2000);
+    let final_snap = pool.snapshot();
+
+    let invalid_config_rejected = PoolConfig::new(0, 0, 1000).is_err();
+
+    Ok(json!({
+        "verdict": "PASS",
+        "command": "connection-pool",
+        "acquire_first": { "conn_id": acquire_first_conn_id },
+        "reuse": { "same_conn_id": reuse_same, "conn_id": reuse_conn_id },
+        "exhausted": exhausted,
+        "after_max_idle": { "idle_count": after_max_idle_idle },
+        "evicted_count": evicted,
+        "final_snapshot": {
+            "idle_count": final_snap.idle_count,
+            "active_count": final_snap.active_count,
+            "total_count": final_snap.total_count,
+            "created_total": final_snap.created_total,
+        },
+        "invalid_config_rejected": invalid_config_rejected,
+    }))
+}
