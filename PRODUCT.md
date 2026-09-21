@@ -1258,3 +1258,53 @@ CLI 走进程内 SDK（同 `run` 路径），状态为本地文件（默认 `~/.
   encryption 开关。
 - 冻结边界（P3.1 不做）：真实 TUN（P3-2）、nexusd daemon 托管、持续运行
   （CLI 单次命令语义）、订阅配置热重载。
+
+### 12.18 P2.3 节点分组隔离（2026-09-21） {#12-group-isolation}
+
+`group_isolation.rs`（`nexus-connectivity::group_isolation`）：节点分组访问隔离骨架。
+
+- `IsolationMode`：`Full`（按组隔离）/ `None`（全开），带稳定 `as_str()`。
+- `GroupConfig { group_name, mode }`：构造校验 `group_name` 非空，空串返回
+  `GroupIsolationError::InvalidGroupName`。
+- `GroupIsolation`：`define_group(GroupConfig)` 声明组；`assign(node, group)` 把节点划入
+  已声明组（未声明组返回 `UnknownGroup`）；`allow_exception(src, dst)` 登记单向跨组放行；
+  `check(src, dst) -> AccessDecision`。
+- 决策规则（`Full`）：任一节点未分配 -> `Deny`；同组 -> `Allow`；跨组且例外表含
+  `(src_group, dst_group)` -> `Allow`；其余跨组 -> `Deny`。`None` 一律 `Allow`。
+  例外单向、不自动对称。
+- E4 场景：`group_isolation.toml`（id=`product.group-isolation`）--同组 Allow、
+  跨组默认 Deny、例外后 Allow、None 全开、未分配 Deny、空组名/未知组拒绝。
+- 冻结边界（P2.3 不做）：真实 ACL 下发、规则热更新、与 firewall/node_tags 联动（留 TODO）。
+
+### 12.19 P2.3 带宽分配策略（2026-09-21） {#12-bandwidth-policy}
+
+`bandwidth_policy.rs`（`nexus-connectivity::bandwidth_policy`）：按组/按节点配额分配骨架
+（与 `qos` 令牌桶互补，不重复其时钟 refill）。
+
+- `BandwidthPolicy { group_quota_bytes_per_sec, per_node_quota_bytes_per_sec }`：构造校验
+  两个 quota 均 > 0，否则 `BandwidthPolicyError::InvalidQuota`。
+- `Priority`：`High`/`Normal`/`Low`（`rank()` High=0 最高）；`OverflowStrategy`：
+  `Drop`/`Queue`；`AllocationOutcome`：`Granted`/`Dropped`/`Queued`（各带 `bytes` 与 `as_str()`）。
+- `PolicyAllocator`：`register_node(node, group, priority)`；`try_allocate(node, bytes, now_second)`
+  按逻辑秒 `now_second` 跨秒清零组/节点已用计数。Normal/Low 需组与节点配额都够才 Grant；
+  High 只要组内尚有任意配额即放行到组剩余上限（可超节点配额，不做抢占）；配额不足按
+  Drop/Queue（Queue 不记账并累计）。未注册节点 -> Dropped。
+- E4 场景：`bandwidth_policy.toml`（id=`product.bandwidth-policy`）--配额内 Grant、
+  组配额耗尽 Drop、未注册 Drop、Queue 策略 Queued、跨秒重置恢复 Grant。
+- 冻结边界（P2.3 不做）：真实排队缓冲/回灌、跨流公平调度、动态抢占、真实单调时钟（留 TODO）。
+
+### 12.20 P2.3 日志级别控制（2026-09-21） {#12-log-level}
+
+`log_level.rs`（`nexus-connectivity::log_level`）：全局/模块级日志级别查询与动态调整骨架。
+
+- `LogLevel`：`Error`/`Warn`/`Info`/`Debug`/`Trace`，带 `as_str()`、`severity()`
+  （Error=0...Trace=4），实现 `std::str::FromStr`（大小写不敏感，非法返回
+  `LogLevelError::InvalidLevel`）。
+- `LogLevelConfig { global, module_overrides }`：`new(global)`、`set_module(module, level)`。
+- `LogLevelController`：`effective_level(module)`（覆盖优先、否则全局）；`set_global(level)`；
+  `set_module_level(module, level)`；`enabled(module, level)`（level.severity <= 有效级别
+  severity 才输出）；`propose(new_config) -> LevelApplyResult`（本骨架简化为总是 Applied
+  并整体替换，真实校验留 TODO）。
+- E4 场景：`log_level.toml`（id=`product.log-level`）--模块覆盖生效、未覆盖回退全局、
+  enabled 阈值判断、set_global/set_module_level 动态调整、字符串解析。
+- 冻结边界（P2.3 不做）：真实接 `tracing`/`log` 后端、EnvFilter 热刷新、指标导出（留 TODO）。
