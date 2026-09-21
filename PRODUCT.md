@@ -1046,3 +1046,47 @@ socket 集成留 P3 产品化）；打洞由外部 HolePuncher 驱动后经隧�
   帧经 relay 送达）；断言含 `Probing` 中间态可见。
 - 冻结边界（P2.2 不做）：tunnel 内真实 UDP 打洞（HolePuncher 挂接留 P3）、
   打洞重试策略、多候选并发打洞、NAT 类型驱动的路径选择。
+
+### 12.10 P2.3+P2.4 广域协调核心 + 自动 IP 分配（2026-09-21）
+
+静态 locator 无法扩展（IP 漂移、NAT 后不可预知）。本节交付**协调控制平面核心**与
+**虚拟子网自动 IP 分配**：节点经协调器注册（PeerId = X25519 公钥哈希）→ 通告
+locator → 领号（自动 IP）→ 拉取对端列表 → 建连。复用 `nexus-discovery`
+PresenceRegistry 的"通告/过期"语义扩展到广域（本模块独立实现，零依赖）。
+
+- 新模块 `nexus-connectivity::coord`（Portable Core：零 I/O、零第三方依赖，
+  可编译 WASI）：
+  - `Coordinator`：`announce(now, peer, locator, ttl_secs)`（幂等刷新）/
+    `heartbeat(now, peer, ttl_secs)`（刷新 TTL，未知 peer → `PeerUnknown`）/
+    `peer_list(now)` 返回未过期 peer 的**三元组** (peer, locator, virtual_ip)
+    （vip 由分配器补充，供节点拉取后 add_peer 建连；vip 未领号 → `PeerUnknown`），
+    注册顺序稳定；
+    `resolve_locator(now, peer)`（未知/过期 → 结构化错误）。显式 `now_secs`
+    注入保证确定性（无 `Instant`）。
+  - `VirtualIpAllocator`：`new(cidr)`（校验 IPv4 CIDR）/
+    `allocate(now, peer)`（顺序分配空闲 IP；同 peer 重复领号**幂等**返回原号；
+    耗尽 → `NoAddressAvailable`）/
+    `allocate_specific(now, peer, virtual_ip)`（显式保留；被占用 →
+    `AddressInUse`）/
+    `release(now, peer)`（释放回池复用）。
+  - `CoordFrame`：`Announce{peer,locator,ttl}` / `Heartbeat{peer,ttl}` /
+    `PeerListReq` / `PeerListResp{peers}`（三元组 (peer,locator,virtual_ip)）/
+    `AllocateReq{peer}` /
+    `AllocateResp{peer,virtual_ip}` / `AllocateNack{peer,reason}` /
+    `ReleaseReq{peer}` / `UnknownPeer{peer}` / `ExpiredPeer{peer}` ——
+    u8 tag + u16 长度前缀字符串 + u64 BE 编解码（与 DiscoveryFrame 同风格，
+    确定性、可移植）。
+  - `peer_id_from_public_key(&[u8;32]) -> String`：FNV-1a 64 确定性哈希
+    （标识用途；安全强度留 P3）。
+- 接入（Composition Root / apps/nexus example）：**loopback TCP 协调端点**
+  （`127.0.0.1` 随机端口，真实 socket）——节点经 JSON 化输出验证
+  注册→领号→拉取→建连→数据面互通全链路（E5）。
+- E4 场景：`coord_core.toml`（分配器：分配顺序/幂等重领/显式保留冲突/释放
+  复用/耗尽；协调器：announce→peer_list / 过期 / 未知；帧编解码 roundtrip）。
+- E5 场景：`coord_join_loopback.toml`（loopback TCP 双节点：announce →
+  allocate → peer_list 获得动态 locator+vip → 构建 VirtualSubnetTunnel →
+  双向包互通）。
+- 冻结边界（P3 再做）：TLS 公网形态（§11.14 rustls 栈挂接）、HTTP/JSON
+  协议（本批自定义帧）、心跳周期/租约过期定时器（本批显式 TTL 注入）、
+  Planner/Session 深度融合（本批建连直用 VirtualSubnetTunnel）、跨子网
+  路由（P2-5）。
