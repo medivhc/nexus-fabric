@@ -333,3 +333,22 @@ cargo clippy -p nexus-connectivity --all-targets -- -D warnings
 ## Platform Constraints
 
 平台专有代码只允许存在于 `nexus-platform-*` 或 Composition Root。Portable crate 必须通过相应 portability gate。
+
+### 冻结契约（跨子网路由与出口节点 P2-5，PRODUCT §12.14）
+
+- 新模块 `cidr`（portable：零 I/O、零第三方依赖，可编译 WASI）：
+  - `CidrPrefix { network: u32, prefix_len: u8 }`；`parse_cidr` 校验 IPv4 点分 + 前缀
+    0..=32（`0.0.0.0/0` 合法）；网络地址主机位必须全零；错误 `CidrError`
+    { InvalidFormat / InvalidPrefixLength / NotANetworkAddress }；
+  - `cidr_contains` 纯函数；`longest_prefix_match` 返回最长前缀命中（同长取先）。
+- `VirtualSubnetTunnel` 增量（§12.5 冻结 API 不变）：
+  - `add_prefix_route(cidr_str, next_hop)` / `prefix_routes()`（发送侧前缀路由）；
+  - `add_local_prefix(cidr_str)` / `local_prefixes()`（接收侧可达前缀，命中写 VPI）；
+  - `mark_egress(virtual_ip)` / `egress_peers()`（出口兜底，顺序取第一个）；
+  - 决策顺序：直连 Connected → 精确 routes → 最长前缀 → egress → NoRouteToDst；
+  - 新事件变体 `LocalPrefixDelivered { dst, bytes }`（旧变体不变）。
+- 不变量：
+  - 前缀路由 next_hop 必须是已注册 peer；egress 必须是已注册 peer；
+  - 帧头不剥不改（§12.5 保持）；
+  - 接收侧：dst==本机 vip 或命中 local_prefixes 才写 VPI，否则转发。
+- 边界：`routing.rs`（距离矢量 P1.1）不耦合本模块；协调器广播/出口 NAT/P3。

@@ -13,6 +13,15 @@
 
 use nexus_platform::{PacketCarrier, PlatformError, VirtualPacketInterface};
 use std::collections::HashMap;
+
+/// 把 `CidrPrefix` 格式化为 "a.b.c.d/len"。
+fn format_cidr(p: &crate::cidr::CidrPrefix) -> String {
+    let octets = p.network.to_be_bytes();
+    format!(
+        "{}.{}.{}.{}/{}",
+        octets[0], octets[1], octets[2], octets[3], p.prefix_len
+    )
+}
 use std::sync::Arc;
 
 use crate::ConnectivityError;
@@ -209,6 +218,15 @@ pub enum VirtualSubnetEvent {
         /// 杞彂瀛楄妭鏁般€?
         bytes: u64,
     },
+    /// 本地前缀递送（P2-5 §12.14）：dst 命中 local_prefixes 写 VPI。
+    LocalPrefixDelivered {
+        /// 隧道 ID。
+        tunnel_id: String,
+        /// 最终目的虚拟 IP。
+        dst_virtual_ip: String,
+        /// 本地递送字节数。
+        bytes: u64,
+    },
 }
 
 /// 闅ч亾甯уご锛圥0 绠€鍖栵細绾枃鏈爣璁帮級銆?
@@ -264,6 +282,12 @@ pub struct VirtualSubnetTunnel {
     /// 闈欐€佽矾鐢辫〃锛圥1 搂12.5锛夛細鐩殑铏氭嫙 IP 鈫?涓嬩竴璺宠櫄鎷?IP銆?
     /// 浠呯敤浜庣洰鐨勯潪鐩磋繛 peer 鐨勮浆鍙戝喅绛栵紱鐩磋繛 peer 鐩村彂涓嶆煡璺敱琛ㄣ€?
     routes: HashMap<String, String>,
+    /// 鍓嶇紑璺敱琛?P2-5 搂12.14锛?CIDR 鍓嶇紑 鈫?涓嬩竴璺?缂栫爜鐢?crate::cidr::parse_cidr 鏉ユ帶锛夈€?
+    prefix_routes: Vec<(crate::cidr::CidrPrefix, String)>,
+    /// 鏈湴鍙揪鍓嶇紑锛圥2-5 搂12.14锛夛細鎺ユ敹鏂?dst 鍛戒腑鍐?VPI 銆?
+    local_prefixes: Vec<crate::cidr::CidrPrefix>,
+    /// 鍑哄彛鑺傜偣锛圥2-5 搂12.14锛夛細鏍囪涓嬈″簭锛屽喅绛栧彇绗竴涓€?
+    egress_peer_vips: Vec<String>,
     /// 浜嬩欢鏀堕泦锛堢敤浜庡彲瑙傛祴鎬у拰閲嶆斁锛夈€?
     events: Vec<VirtualSubnetEvent>,
     /// VPI 鎺ュ彛銆?
@@ -295,6 +319,9 @@ impl VirtualSubnetTunnel {
             config,
             peers: HashMap::new(),
             routes: HashMap::new(),
+            prefix_routes: Vec::new(),
+            local_prefixes: Vec::new(),
+            egress_peer_vips: Vec::new(),
             events,
             vpi,
             carrier,
@@ -321,6 +348,93 @@ impl VirtualSubnetTunnel {
         }
         self.routes.insert(dst, next_hop);
         Ok(())
+    }
+
+    /// 注册前缀路由（P2-5 §12.14）：`cidr_str`（如 "192.168.5.0/24"）→ next_hop。
+    ///
+    /// next_hop 必须是已注册 peer；CIDR 非法 → 结构化错误。
+    pub fn add_prefix_route(
+        &mut self,
+        cidr_str: &str,
+        next_hop: impl Into<String>,
+    ) -> Result<(), ConnectivityError> {
+        let next_hop = next_hop.into();
+        if !self.peers.contains_key(&next_hop) {
+            return Err(ConnectivityError::Invalid {
+                message: format!(
+                    "ROUTE_NEXT_HOP_NOT_PEER: next-hop {next_hop} is not a registered peer"
+                ),
+            });
+        }
+        let prefix = crate::cidr::parse_cidr(cidr_str).map_err(|e| ConnectivityError::Invalid {
+            message: format!("CIDR_ERROR: {e}"),
+        })?;
+        self.prefix_routes.push((prefix, next_hop));
+        Ok(())
+    }
+
+    /// 前缀路由列表（注入顺序）。
+    #[must_use]
+    pub fn prefix_routes(&self) -> Vec<(String, String)> {
+        self.prefix_routes
+            .iter()
+            .map(|(p, nh)| (format_cidr(p), nh.clone()))
+            .collect()
+    }
+
+    /// 声明本节点可达前缀（P2-5 §12.14，接收侧投递边界）。
+    pub fn add_local_prefix(&mut self, cidr_str: &str) -> Result<(), ConnectivityError> {
+        let prefix = crate::cidr::parse_cidr(cidr_str).map_err(|e| ConnectivityError::Invalid {
+            message: format!("CIDR_ERROR: {e}"),
+        })?;
+        self.local_prefixes.push(prefix);
+        Ok(())
+    }
+
+    /// 本节点可达前缀列表。
+    #[must_use]
+    pub fn local_prefixes(&self) -> Vec<String> {
+        self.local_prefixes.iter().map(format_cidr).collect()
+    }
+
+    /// 把已注册 peer 标记为出口节点（P2-5 §12.14）。
+    pub fn mark_egress(&mut self, virtual_ip: impl Into<String>) -> Result<(), ConnectivityError> {
+        let vip = virtual_ip.into();
+        if !self.peers.contains_key(&vip) {
+            return Err(ConnectivityError::Invalid {
+                message: format!("EGRESS_NOT_PEER: {vip} is not a registered peer"),
+            });
+        }
+        if !self.egress_peer_vips.contains(&vip) {
+            self.egress_peer_vips.push(vip);
+        }
+        Ok(())
+    }
+
+    /// 出口节点列表（标记顺序）。
+    #[must_use]
+    pub fn egress_peers(&self) -> Vec<String> {
+        self.egress_peer_vips.clone()
+    }
+
+    /// 统一转发决策（P2-5 §12.14）：① 直连 peer → ② 精确 routes → ③ 最长前缀
+    /// prefix_routes → ④ 出口节点（egress 顺序第一个）→ ⑤ `NO_ROUTE_TO_DST`。
+    fn resolve_next_hop(&self, dst: &str) -> Result<String, ConnectivityError> {
+        if self.peers.contains_key(dst) {
+            return Ok(dst.to_string());
+        }
+        if let Some(next_hop) = self.routes.get(dst) {
+            return Ok(next_hop.clone());
+        }
+        if let Some(next_hop) = crate::cidr::longest_prefix_match(&self.prefix_routes, dst) {
+            return Ok(next_hop.clone());
+        }
+        if let Some(egress) = self.egress_peer_vips.first() {
+            return Ok(egress.clone());
+        }
+        Err(ConnectivityError::Invalid {
+            message: format!("NO_ROUTE_TO_DST: no route for {dst}"),
+        })
     }
 
     /// 开启加密模式（§12.6）：默认关闭，明文模式与 §12.1-§12.5 语义不变。
@@ -597,19 +711,8 @@ impl VirtualSubnetTunnel {
         dst_virtual_ip: &str,
         packet: &[u8],
     ) -> Result<(), ConnectivityError> {
-        // 1. 瑙ｆ瀽鍑轰笅涓€璺筹紙鐩磋繛 peer 鎴栭潤鎬佽矾鐢憋級
-        let next_hop = if self.peers.contains_key(dst_virtual_ip) {
-            dst_virtual_ip.to_string()
-        } else {
-            self.routes
-                .get(dst_virtual_ip)
-                .cloned()
-                .ok_or_else(|| ConnectivityError::Invalid {
-                    message: format!(
-                        "NO_ROUTE_TO_DST: no direct peer and no route for {dst_virtual_ip}"
-                    ),
-                })?
-        };
+        // 1. 解析出下一跳（统一决策：直连 → 精确 → 最长前缀 → 出口，§12.5/§12.14）
+        let next_hop = self.resolve_next_hop(dst_virtual_ip)?;
 
         // 2. 鏍￠獙 next_hop 鏄?Connected peer
         let (_peer_id, locator, state, stats) =
@@ -763,20 +866,26 @@ impl VirtualSubnetTunnel {
             return Ok(Some((sender_vip, payload.len())));
         }
 
+        // 命中本节点可达前缀（P2-5 §12.14）→ 写 VPI + LocalPrefixDelivered 事件
+        if self
+            .local_prefixes
+            .iter()
+            .any(|p| crate::cidr::cidr_contains(p, &header.dst_virtual_ip))
+        {
+            self.vpi.send(&payload).map_err(|e| ConnectivityError::Io {
+                operation: "vpi_send".to_string(),
+                message: e.to_string(),
+            })?;
+            self.events.push(VirtualSubnetEvent::LocalPrefixDelivered {
+                tunnel_id: self.tunnel_id.clone(),
+                dst_virtual_ip: header.dst_virtual_ip.clone(),
+                bytes: payload.len() as u64,
+            });
+            return Ok(Some((sender_vip, payload.len())));
+        }
+
         // 非本机目的 -> 转发（§12.5：先查直连 peer，再查静态路由表）
-        let next_hop = if self.peers.contains_key(&header.dst_virtual_ip) {
-            header.dst_virtual_ip.clone()
-        } else {
-            self.routes
-                .get(&header.dst_virtual_ip)
-                .cloned()
-                .ok_or_else(|| ConnectivityError::Invalid {
-                    message: format!(
-                        "NO_ROUTE_TO_DST: received frame for {} but no route",
-                        header.dst_virtual_ip
-                    ),
-                })?
-        };
+        let next_hop = self.resolve_next_hop(&header.dst_virtual_ip)?;
 
         let (_peer_id, locator, state, _stats) =
             self.peers

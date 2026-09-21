@@ -6244,3 +6244,178 @@ pub fn coord_join_loopback_flow() -> Result<Value, NexusError> {
         },
     }))
 }
+
+/// E4 产品场景 `product.cross-subnet` 的可执行驱动。
+///
+/// 覆盖：cidr 纯函数（合法解析/默认路由/非网络地址/前缀越界/contains）、
+/// 最长前缀匹配（/16 与 /24 并存选 /24、默认路由、空表）、数据面
+/// （前缀路由投递 + 本地前缀递送 + 出口兜底 + 无路由无出口拒绝）。
+pub fn cross_subnet_flow() -> Result<Value, NexusError> {
+    use nexus_connectivity::cidr::{cidr_contains, longest_prefix_match, parse_cidr};
+    use nexus_connectivity::virtual_subnet::{
+        MemoryVpi, MeshCarrier, TunnelPeer, TunnelState, VirtualSubnetConfig, VirtualSubnetEvent,
+        VirtualSubnetTunnel,
+    };
+
+    // ---- cidr 纯函数 ----
+    let parse_ok = parse_cidr("192.168.5.0/24").is_ok();
+    let default_route_ok = parse_cidr("0.0.0.0/0").is_ok();
+    let not_network_rejected = match parse_cidr("192.168.5.1/24") {
+        Err(e) => e.to_string(),
+        Ok(_) => "PARSE_OK".to_string(),
+    };
+    let invalid_len_rejected = match parse_cidr("10.0.0.0/33") {
+        Err(e) => e.to_string(),
+        Ok(_) => "PARSE_OK".to_string(),
+    };
+    let office = parse_cidr("192.168.5.0/24").expect("office cidr");
+    let contains_true = cidr_contains(&office, "192.168.5.10");
+    let contains_false = cidr_contains(&office, "192.168.6.1");
+
+    // 最长前缀：broad /16 与 office /24 并存 → 192.168.5.10 命中 /24 (node-c)
+    let broad = parse_cidr("192.168.0.0/16").expect("broad cidr");
+    let routes = vec![
+        (broad, "10.99.0.2".to_string()),
+        (office, "10.99.0.3".to_string()),
+    ];
+    let longest_prefix_next_hop = longest_prefix_match(&routes, "192.168.5.10")
+        .cloned()
+        .unwrap_or_default();
+    let default = parse_cidr("0.0.0.0/0").expect("default cidr");
+    let default_next_hop = longest_prefix_match(&[(default, "10.99.0.2".to_string())], "8.8.8.8")
+        .cloned()
+        .unwrap_or_default();
+    let none_found = longest_prefix_match(&[], "8.8.8.8").is_none();
+
+    // ---- 数据面：A → B（前缀路由 + 本地前缀递送 + 出口兜底）----
+    let mut mesh_a = MeshCarrier::new();
+    let mut mesh_b = MeshCarrier::new();
+    let a_recv = mesh_a.recv_handle();
+    let b_recv = mesh_b.recv_handle();
+    mesh_a.connect_peer("udp://127.0.0.1:41001", b_recv.clone());
+    mesh_b.connect_peer("udp://127.0.0.1:41002", a_recv.clone());
+
+    let mut tunnel_a = VirtualSubnetTunnel::new(
+        VirtualSubnetConfig::new("10.99.0.0/24", "10.99.0.1"),
+        Box::new(MemoryVpi::new()),
+        Box::new(mesh_a),
+    );
+    let mut tunnel_b = VirtualSubnetTunnel::new(
+        VirtualSubnetConfig::new("10.99.0.0/24", "10.99.0.2"),
+        Box::new(MemoryVpi::new()),
+        Box::new(mesh_b),
+    );
+    tunnel_a
+        .add_peer(TunnelPeer::new("10.99.0.2", "udp://127.0.0.1:41001"))
+        .map_err(|e| NexusError::Internal {
+            message: e.to_string(),
+        })?;
+    tunnel_a.set_peer_state("10.99.0.2", TunnelState::Connected);
+    tunnel_b
+        .add_peer(TunnelPeer::new("10.99.0.1", "udp://127.0.0.1:41002"))
+        .map_err(|e| NexusError::Internal {
+            message: e.to_string(),
+        })?;
+    tunnel_b.set_peer_state("10.99.0.1", TunnelState::Connected);
+
+    // A 通告"可达 192.168.5.0/24 经 B"；B 声明本地可达 office 网段 + 默认路由（出口侧投递面）
+    tunnel_a
+        .add_prefix_route("192.168.5.0/24", "10.99.0.2")
+        .map_err(|e| NexusError::Internal {
+            message: e.to_string(),
+        })?;
+    tunnel_b
+        .add_local_prefix("192.168.5.0/24")
+        .map_err(|e| NexusError::Internal {
+            message: e.to_string(),
+        })?;
+    tunnel_b
+        .add_local_prefix("0.0.0.0/0")
+        .map_err(|e| NexusError::Internal {
+            message: e.to_string(),
+        })?;
+    // A 标记 B 为出口节点（无前缀路由的非虚拟网段流量 → 兜底 B）
+    tunnel_a
+        .mark_egress("10.99.0.2")
+        .map_err(|e| NexusError::Internal {
+            message: e.to_string(),
+        })?;
+
+    // 前缀命中：A 发 192.168.5.10（office 网段）→ 经 B → B 命中本地前缀 → 写 VPI
+    tunnel_a
+        .send_ip_packet("192.168.5.10", b"office-packet")
+        .map_err(|e| NexusError::Internal {
+            message: format!("office send: {e}"),
+        })?;
+    let mut buf = [0u8; 4096];
+    let office_delivered = match tunnel_b.recv_and_deliver(&mut buf) {
+        Ok(Some((sender, len))) => sender == "10.99.0.1" && len == b"office-packet".len(),
+        other => {
+            return Err(NexusError::Internal {
+                message: format!("b recv office unexpected: {other:?}"),
+            });
+        }
+    };
+    let local_prefix_delivered = tunnel_b
+        .events()
+        .iter()
+        .any(|ev| matches!(ev, VirtualSubnetEvent::LocalPrefixDelivered { dst_virtual_ip, .. } if dst_virtual_ip == "192.168.5.10"));
+
+    // 出口兜底：A 发 8.8.8.8（无精确/前缀路由）→ 决策走 egress B → B 命中默认前缀 → 写 VPI
+    tunnel_a
+        .send_ip_packet("8.8.8.8", b"egress-packet")
+        .map_err(|e| NexusError::Internal {
+            message: format!("egress send: {e}"),
+        })?;
+    let egress_delivered = match tunnel_b.recv_and_deliver(&mut buf) {
+        Ok(Some((sender, len))) => sender == "10.99.0.1" && len == b"egress-packet".len(),
+        other => {
+            return Err(NexusError::Internal {
+                message: format!("b recv egress unexpected: {other:?}"),
+            });
+        }
+    };
+
+    // 无路由无出口：独立隧道 A2（无 egress、无前缀路由）发 8.8.8.8 → NO_ROUTE_TO_DST
+    let mesh_a2 = MeshCarrier::new();
+    let mut tunnel_a2 = VirtualSubnetTunnel::new(
+        VirtualSubnetConfig::new("10.99.0.0/24", "10.99.0.1"),
+        Box::new(MemoryVpi::new()),
+        Box::new(mesh_a2),
+    );
+    let no_route_no_egress_rejected = match tunnel_a2.send_ip_packet("8.8.8.8", b"x") {
+        Err(e) => {
+            let s = e.to_string();
+            if s.contains("NO_ROUTE_TO_DST") {
+                "NoRouteToDst".to_string()
+            } else {
+                s
+            }
+        }
+        Ok(()) => "SENT".to_string(),
+    };
+
+    Ok(serde_json::json!({
+        "verdict": "PASS",
+        "command": "cross-subnet",
+        "cidr": {
+            "parse_ok": parse_ok,
+            "default_route_ok": default_route_ok,
+            "not_network_rejected": not_network_rejected,
+            "invalid_len_rejected": invalid_len_rejected,
+            "contains_true": contains_true,
+            "contains_false": contains_false,
+        },
+        "lookup": {
+            "longest_prefix_next_hop": longest_prefix_next_hop,
+            "default_next_hop": default_next_hop,
+            "none_found": none_found,
+        },
+        "data": {
+            "office_delivered": office_delivered,
+            "local_prefix_delivered": local_prefix_delivered,
+            "egress_delivered": egress_delivered,
+            "no_route_no_egress_rejected": no_route_no_egress_rejected,
+        },
+    }))
+}

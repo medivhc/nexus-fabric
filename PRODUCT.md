@@ -1142,3 +1142,44 @@ PresenceRegistry 的"通告/过期"语义扩展到广域（本模块独立实现
   逻辑时钟推进后 evict_idle 回收、非法配置被拒。
 - 冻结边界（P2.3 不做）：真实 TCP 连接复用、线程安全 Send/Sync、
   与 relay/nat 数据面挂接（留 TODO）。
+
+### 12.14 P2-5 跨子网路由与出口节点（2026-09-21） {#12-cross-subnet-egress}
+
+§12.3 明确 P0 不做跨子网，本节随 P2 解冻（designs P2-5 §118-130）。§12.5 静态路由
+为精确 `dst → next_hop`；本节扩展为**前缀路由（CIDR + 最长前缀匹配）**与**出口节点
+兜底**，同时保持 §12.5 精确路由语义不变（其场景 expectation 为 Protected）。
+
+- `cidr` 模块（`nexus-connectivity::cidr`，portable：零依赖、可 WASI）：
+  - `CidrPrefix { network: u32, prefix_len: u8 }`；
+  - `parse_cidr("192.168.5.0/24") -> Result<CidrPrefix, CidrError>`：IPv4 点分十进制
+    + `/` + 前缀 0..=32（`0.0.0.0/0` = 默认路由合法）；网络地址主机位必须全零
+    （`192.168.5.1/24` 拒绝）；格式/范围非法 → `CidrError`
+    （`InvalidFormat` / `InvalidPrefixLength` / `NotANetworkAddress`）；
+  - `cidr_contains(&CidrPrefix, ip: &str) -> bool`：ip 解析失败返回 false；
+  - `longest_prefix_match<'a>(routes: &'a [(CidrPrefix, String)], ip: &str)
+    -> Option<&'a String>`：返回包含 ip 且前缀最长的 next_hop；同长度取表内先者
+    （稳定）。
+- `VirtualSubnetTunnel` 扩展（§12.5 API 不变，纯增量）：
+  - `add_prefix_route(cidr_str, next_hop)`：发送侧前缀路由（cidr 非法 / next_hop
+    未注册 → 结构化错误）；`prefix_routes() -> Vec<(String, String)>`（注入顺序）；
+  - `add_local_prefix(cidr_str)`：**本节点可达前缀**（接收侧投递边界，如办公室网
+    `192.168.5.0/24`）；`local_prefixes() -> Vec<String>`；
+  - `mark_egress(virtual_ip)`：把已注册 peer 标记为出口节点；`egress_peers() -> Vec<String>`
+    （标记顺序）；
+  - **发送/转发决策（send_ip_packet 与 recv 转发统一）**：① dst 是直连 Connected
+    peer → 直发；② 精确 `routes[dst]`（§12.5）；③ 前缀路由**最长前缀匹配**；
+    ④ 出口节点（egress_peers 顺序第一个）；⑤ 皆无 → `NO_ROUTE_TO_DST`。
+    帧头不剥不改语义保持（§12.5）；
+  - **接收决策**：`header.dst == 本机 vip` **或命中 local_prefixes** → 写 VPI 并推
+    `LocalPrefixDelivered { dst, bytes }` 事件；否则按发送决策转发（精确→前缀→出口）。
+  - 新增事件变体 `LocalPrefixDelivered`（VirtualSubnetEvent 扩展，旧事件不变）。
+- 出口融合边界（与 §11 代理内核）：组网流量在 VPI 域内转发（VirtualSubnetTunnel 负责）；
+  **出口节点收到非本虚拟网段帧后如何出公网 = §11 outbound 代理内核职责**，本批只交付
+  "投递到出口节点"语义，不实现 NAT/代理挂接。不修改 §11 已冻结场景。
+- 子网通告：节点本地 `add_prefix_route` / `add_local_prefix` 即"我可达 <cidr>"的注入面；
+  **经协调器（P2-3）广播子网通告留 P3 公网协调器**（本批冻结不做）。
+- E4 场景：`cross_subnet.toml`（id=`product.cross-subnet`）——纯函数
+  （parse/cidr_contains/longest_prefix 边界与最长前缀选路）+ 数据面
+  （前缀命中投递、本地前缀递送、出口兜底、无路由无出口 NoRouteToDst）。
+- 冻结边界（P2-5 不做）：协调器广播子网通告、出口 NAT/公网访问实现、前缀路由
+  动态学习与过期（全部留 P3 TODO）。

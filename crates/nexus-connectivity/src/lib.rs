@@ -35,6 +35,7 @@ pub const fn module_summary() -> &'static str {
 
 // ---------- 虚拟子网组网（Virtual Subnet Networking） ----------
 
+pub mod cidr;
 pub mod coord;
 pub mod nat;
 pub mod virtual_subnet;

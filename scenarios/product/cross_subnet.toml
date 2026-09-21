@@ -1,0 +1,78 @@
+schema_version = 1
+id = "product.cross-subnet"
+title = "跨子网路由与出口节点：CIDR 前缀匹配 + 最长前缀 + 出口兜底（E4）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-14-P2-5-跨子网路由与出口节点"
+
+[given]
+subnet_cidr = "10.99.0.0/24"
+node_a_vip = "10.99.0.1"
+node_b_vip = "10.99.0.2"
+node_c_vip = "10.99.0.3"
+office_cidr = "192.168.5.0/24"
+broad_cidr = "192.168.0.0/16"
+default_cidr = "0.0.0.0/0"
+
+# 可执行 E4（example cross_subnet --json，纯函数 + MeshCarrier 双节点数据面）：
+# - cidr 纯函数：合法解析 / 默认路由 / 非网络地址拒绝 / 前缀越界拒绝 /
+#   contains 命中与未命中；
+# - 最长前缀匹配：broad(/16) 与 office(/24) 并存时 192.168.5.10 命中 office；
+#   默认路由 0.0.0.0/0 命中任意 IP；空表返回 None；
+# - 数据面：A 精确直连 B；A 注入 office 前缀路由 → 发 192.168.5.10 经 B，
+#   B 命中本地前缀 → 写 VPI + LocalPrefixDelivered；A 标记 B 为出口 →
+#   发 8.8.8.8（无前缀路由）→ 经 B（出口兜底）；无路由无出口 → NoRouteToDst。
+
+[when]
+command = "cargo run --quiet -p nexus --example cross_subnet -- --json"
+
+[[expect]]
+field = "cidr.parse_ok"
+equals = true
+
+[[expect]]
+field = "cidr.default_route_ok"
+equals = true
+
+[[expect]]
+field = "cidr.not_network_rejected"
+equals = "NotANetworkAddress"
+
+[[expect]]
+field = "cidr.invalid_len_rejected"
+equals = "InvalidPrefixLength"
+
+[[expect]]
+field = "cidr.contains_true"
+equals = true
+
+[[expect]]
+field = "cidr.contains_false"
+equals = false
+
+[[expect]]
+field = "lookup.longest_prefix_next_hop"
+equals = "10.99.0.3"
+
+[[expect]]
+field = "lookup.default_next_hop"
+equals = "10.99.0.2"
+
+[[expect]]
+field = "lookup.none_found"
+equals = true
+
+[[expect]]
+field = "data.office_delivered"
+equals = true
+
+[[expect]]
+field = "data.local_prefix_delivered"
+equals = true
+
+[[expect]]
+field = "data.egress_delivered"
+equals = true
+
+[[expect]]
+field = "data.no_route_no_egress_rejected"
+equals = "NoRouteToDst"
