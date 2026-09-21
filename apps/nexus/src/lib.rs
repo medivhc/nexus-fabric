@@ -6261,11 +6261,25 @@ pub fn cross_subnet_flow() -> Result<Value, NexusError> {
     let parse_ok = parse_cidr("192.168.5.0/24").is_ok();
     let default_route_ok = parse_cidr("0.0.0.0/0").is_ok();
     let not_network_rejected = match parse_cidr("192.168.5.1/24") {
-        Err(e) => e.to_string(),
+        Err(e) => {
+            let s = e.to_string();
+            if s.contains("CIDR_NOT_A_NETWORK_ADDRESS") {
+                "NotANetworkAddress".to_string()
+            } else {
+                s
+            }
+        }
         Ok(_) => "PARSE_OK".to_string(),
     };
     let invalid_len_rejected = match parse_cidr("10.0.0.0/33") {
-        Err(e) => e.to_string(),
+        Err(e) => {
+            let s = e.to_string();
+            if s.contains("CIDR_INVALID_PREFIX_LENGTH") {
+                "InvalidPrefixLength".to_string()
+            } else {
+                s
+            }
+        }
         Ok(_) => "PARSE_OK".to_string(),
     };
     let office = parse_cidr("192.168.5.0/24").expect("office cidr");
