@@ -1533,3 +1533,53 @@ nexusd（daemon 组合根）接入 subnet 真实路径：隧道由 daemon 生命
   leave（删除状态文件）后子进程退出、退出后 status → DOWN。
 - 冻结边界（P3.5 不做）：daemon serve 控制通道（localapi 常驻命令）、
   隧道热重载、多隧道并发管理、崩溃恢复（§15 冷启动对账）。
+
+### 12.33 P2.3 数据压缩（compression，2026-09-21）{#12-compression}
+
+`compression.rs`（`nexus-connectivity::compression`）：链路载荷压缩选路 + 帧头封装 + 压缩率统计骨架。
+
+- `CompressionAlgorithm`：`None` / `Gzip` / `Lz4`，`as_str()` 稳定标签，`tag()`/`from_tag()` 帧头字节往返（0/1/2）。
+- `CompressionConfig { algorithm, level(0-9), min_original_bytes(>=1) }`：`new` 校验；
+  level>9 或 min_original_bytes<1 -> `CompressionError::InvalidConfig`。
+- `CompressionCodec::new(cfg)`：`should_compress(len)` 在 algorithm!=None 且
+  `len >= min_original_bytes` 时为真（自适应门控，小报文透传）；
+  `encode(data)` 输出 `CompressedBlock { algorithm_tag, original_len, compressed, payload }`，
+  `decode(block)` 对称解出原字节（tag 未知 -> `UnknownAlgorithmTag`）。
+- `CompressionStats`：saturating 累计 original/compressed/blocks，`ratio() = 1 - compressed/original`。
+- 冻结边界（骨架不做）：真实 gzip/lz4 编解码（引入 flate2/lz4 需 dependency 评审，当前身份透传 + 帧头标记）、
+  魔数/校验和、压缩字典协商。
+- E4 场景：`compression.toml`（id=`product.compression`）--None 不压缩、低于阈值透传、
+  高于阈值标记 compressed、统计 blocks/original/ratio、未知 tag 拒绝。
+
+### 12.34 P2.3 分片传输（fragmentation，2026-09-21）{#12-fragmentation}
+
+`fragmentation.rs`（`nexus-connectivity::fragmentation`）：大报文分片 + 重组 + 超时清理 + 缓冲上限骨架。
+
+- `FragmentConfig { max_fragment_size(>=1), max_reassembly_buffer(>=1), reassembly_timeout_ms(>0) }`：`new` 校验。
+- `Fragmenter::fragment(data, packet_id)`：按 max_fragment_size 切成有序
+  `Fragment { packet_id, index(0..total), total, payload }`；空 data 也产 1 片（total=1）。
+- `Reassembler::push(fragment, now_ms)`：按 packet_id 聚合，重复片幂等；
+  收齐 -> `Complete { data }` 并释放上下文，否则 `Waiting { received, total }`；
+  total 漂移 -> `TotalMismatch`；缓冲超限 -> `ReassemblyBufferExceeded`。
+- `Reassembler::gc(now_ms)`：丢弃 `now_ms - inserted_at_ms > reassembly_timeout_ms` 的未完成上下文，
+  返回丢弃个数并释放字节。
+- 冻结边界（骨架不做）：真实网络收发、重传/选择性 ACK、序列号抗重放。
+- E4 场景：`fragmentation.toml`（id=`product.fragmentation`）--200 字节按 64 切 4 片重组 roundtrip、
+  空数据单片完成、重复片幂等、total 漂移拒绝、gc 超时回收、缓冲上限拒绝。
+
+### 12.35 P2.3 证书管理（certificate-manager，2026-09-21）{#12-certificate-manager}
+
+`certificate_manager.rs`（`nexus-connectivity::certificate_manager`）：证书加载骨架 + 过期检查 + 自签名识别 + 原子轮换。
+
+- `CertificateConfig { cert_path, key_path, ca_path: Option }`：非空校验，空串 -> `InvalidConfig`。
+- `CertificateInfo { subject, serial, not_before_unix, not_after_unix, self_signed }`：
+  `new` 校验 `not_before < not_after`。
+- `CertificateManager::new(cfg, current, now)`：构造时校验当前证书已生效且未过期
+  （`NotYetValid` / `Expired`）。
+- `check_expiry(now, warn_before_secs)` -> `ExpiryStatus::Valid` /
+  `ExpiringSoon { remaining_secs }`（remaining<=warn）/ `Expired`（错误）。
+- `rotate(new_cert, now)`：新证书必须当前有效，原子替换并返回旧证书，`rotations`+1。
+- 冻结边界（骨架不做）：真实 PEM 解析/文件 I/O（当前由调用方在内存构造 CertificateInfo）、
+  CA 链构建与 SAN 校验、fs 热轮换监听。
+- E4 场景：`certificate_manager.toml`（id=`product.certificate-manager`）--
+  未生效/过期证书拒绝构造、Valid/ExpiringSoon/Expired 三态分类、rotate 成功换主并记次数、坏新证书拒绝轮换。
