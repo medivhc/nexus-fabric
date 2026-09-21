@@ -21,7 +21,7 @@ filter_role_edge = "role=edge"
 filter_no_match = "region=xx"
 
 [when]
-command = "nexus-harness run node-tags --json"
+command = "cargo run --quiet -p nexus --example node_tags -- --json"
 
 [[expect]]
 field = "tagged_nodes"
