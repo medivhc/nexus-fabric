@@ -1183,3 +1183,46 @@ PresenceRegistry 的"通告/过期"语义扩展到广域（本模块独立实现
   （前缀命中投递、本地前缀递送、出口兜底、无路由无出口 NoRouteToDst）。
 - 冻结边界（P2-5 不做）：协调器广播子网通告、出口 NAT/公网访问实现、前缀路由
   动态学习与过期（全部留 P3 TODO）。
+### 12.15 P2.3 节点优雅退出（2026-09-21） {#12-graceful-exit}
+
+`graceful_exit.rs`（`nexus-connectivity::graceful_exit`）：节点优雅退出状态机骨架。
+
+- `ExitConfig { grace_period_ms, notify_peers, wait_for_drain }`：构造校验
+  `grace_period_ms > 0`，非法返回 `GracefulExitError::InvalidConfig`。
+- `ExitState`：`Active / Draining / Exiting / Exited`，各带稳定 `as_str()`。
+- `GracefulExit`：`begin_draining(now_ms)` 标记进入 Draining 并记录起始时间；
+  `notify_peers(peers)` 在 `notify_peers=true` 时记录已通知对端；
+  `advance(active_connections, now_ms)` 推进状态——仍有连接且在宽限期内且
+  `wait_for_drain=true` 则停在 Draining，连接排空或宽限期超时则进入 Exiting，
+  再推进一次进入终态 Exited。
+- E4 场景：`graceful_exit.toml`（id=`product.graceful-exit`）——Active→Draining→
+  Exiting→Exited 全链路、未排空仍 Draining、超时强制 Exiting、notify 开关、非法配置被拒。
+- 冻结边界（P2.3 不做）：真实网络通知对端、真实 drain 等待、进程信号挂接（留 TODO）。
+
+### 12.16 P2.3 配置热加载（2026-09-21） {#12-config-hot-reload}
+
+`config_hot_reload.rs`（`nexus-connectivity::config_hot_reload`）：配置热加载门控骨架。
+
+- `HotReloadConfig { watch_interval_ms, validate_before_apply }`：构造校验
+  `watch_interval_ms > 0`，非法返回 `HotReloadError::InvalidConfig`。
+- `ReloadResult`：`Success { applied_revision } / Failed { reason }`，带稳定 `as_str()`。
+- `HotReloadManager`：`propose_reload(new_revision, valid)`——`validate_before_apply=true`
+  且 `valid=false` 时返回 `Failed` 且已生效 revision 不变；否则把已生效 revision
+  推进到 `new_revision` 返回 `Success`；`current_revision()` 暴露当前已生效版本。
+- E4 场景：`config_hot_reload.toml`（id=`product.config-hot-reload`）——合法提议推进
+  revision、校验开启时非法提议 Failed 且 revision 不变、关闭校验时放宽应用、非法配置被拒。
+- 冻结边界（P2.3 不做）：真实文件 watcher 线程、真实配置解析与原子切换（留 TODO）。
+
+### 12.17 P2.3 流量统计汇总（2026-09-21） {#12-traffic-stats}
+
+`traffic_stats.rs`（`nexus-connectivity::traffic_stats`）：按节点流量记账与全量快照骨架。
+
+- `TrafficSummary { total_rx_bytes, total_tx_bytes, active_connections, active_nodes }`：
+  快照 DTO，派生 Clone/PartialEq/Debug。
+- `StatsCollector`：`record_node_bytes(node, rx, tx)` 饱和累加字节、节点自动注册；
+  `record_connection(node, active)` 增减活跃连接数（饱和不回绕）；
+  `node_summary(node)` 返回单节点 (rx, tx, active_conns) 或 None；
+  `snapshot()` 汇总所有节点字节总数、活跃连接总数与节点数。
+- E4 场景：`traffic_stats.toml`（id=`product.traffic-stats`）——字节累加、连接增减、
+  未知节点 None、跨节点 snapshot 汇总、上限饱和。
+- 冻结边界（P2.3 不做）：真实数据面字节 hook、指标导出到可观测层、周期快照（留 TODO）。

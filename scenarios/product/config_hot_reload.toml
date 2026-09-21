@@ -1,0 +1,53 @@
+schema_version = 1
+id = "product.config-hot-reload"
+title = "配置热加载：校验门控通过才推进 revision"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-config-hot-reload"
+
+[given]
+watch_interval_ms = 1000
+validate_before_apply = true
+
+[when]
+command = "cargo run --quiet -p nexus --example config_hot_reload -- --json"
+
+# 合法提议（valid=true）→ Success，revision 推进到 1
+[[expect]]
+field = "first_propose.kind"
+equals = "success"
+
+[[expect]]
+field = "first_propose.applied_revision"
+equals = 1
+
+[[expect]]
+field = "first_propose.current_revision"
+equals = 1
+
+# 校验开启时非法提议（valid=false）→ Failed，revision 保持不变
+[[expect]]
+field = "invalid_propose_rejected.kind"
+equals = "failed"
+
+[[expect]]
+field = "invalid_propose_rejected.current_revision"
+equals = 1
+
+# 再次合法提议 → Success，revision 推进到 3
+[[expect]]
+field = "second_propose.applied_revision"
+equals = 3
+
+[[expect]]
+field = "second_propose.current_revision"
+equals = 3
+
+# 关闭前置校验时，即使 valid=false 也应用
+[[expect]]
+field = "relaxed_validate.applied_revision"
+equals = 4
+
+# 非法配置（watch_interval_ms=0）被拒绝
+[[expect]]
+field = "invalid_config_rejected"
+equals = true

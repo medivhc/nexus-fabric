@@ -81,6 +81,15 @@ pub mod health_check;
 /// 节点优先级选择器（priority 升序 -> latency 升序 -> bandwidth 降序）。
 pub mod node_priority;
 
+// ---------- 批次3：优雅退出 / 配置热加载 / 流量统计（纯逻辑骨架） ----------
+
+/// 配置热加载（校验门控 + revision 推进，纯逻辑）。
+pub mod config_hot_reload;
+/// 节点优雅退出（Active/Draining/Exiting/Exited 状态机）。
+pub mod graceful_exit;
+/// 流量统计汇总（按节点记账 + 全量快照）。
+pub mod traffic_stats;
+
 // ---------- 结构化错误（不以日志文本代替错误类型） ----------
 
 /// Connectivity 层的结构化错误（delivery 层自有错误面，不依赖领域错误）。
