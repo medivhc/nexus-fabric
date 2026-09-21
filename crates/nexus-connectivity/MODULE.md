@@ -155,7 +155,7 @@ NAT/中继场景的物理建连（组合根 transport::connect）发生在激活
   VirtualSubnetTunnel 方法 + 一个状态枚举变体，无新 trait、无投机抽象；
   真实 UDP 打洞（HolePuncher 挂接）冻结在 P3 产品化。
 
-### 冻结契约（VirtualSubnet 协调核心 + 自动 IP 分配 P2.3+P2.4，PRODUCT §12.10）
+### 冻结契约（VirtualSubnet 协调核心 + 自动 IP 分配 P2.3+P2.4，PRODUCT §12.13）
 
 - 新模块 `coord`（portable：零 I/O、零第三方依赖，可编译 WASI）：
   - `Coordinator`：`announce(now_secs, peer, locator, ttl_secs)` 幂等刷新；

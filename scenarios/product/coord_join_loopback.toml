@@ -2,7 +2,7 @@ schema_version = 1
 id = "product.coord-join-loopback"
 title = "协调全链路（E5）：loopback TCP 注册→领号→拉取→建连→互通"
 evidence_strength = "E5"
-requirement = "PRODUCT.md#12-10-P2.3+P2.4-广域协调核心-自动-IP-分配"
+requirement = "PRODUCT.md#12-13-P2.3+P2.4-广域协调核心-自动-IP-分配"
 
 [given]
 subnet_cidr = "10.99.0.0/24"
