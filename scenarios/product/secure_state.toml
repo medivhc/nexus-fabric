@@ -1,0 +1,48 @@
+schema_version = 1
+id = "product.secure-state"
+title = "CLI 状态文件加密：--encrypt-state 加密落盘 + status 解密读回（E4）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-secure-state"
+
+[given]
+state_cidr = "10.99.0.0/24"
+state_vip = "10.99.0.1"
+
+# 可执行 E4（example subnet_cli --json，进程内闭环）：
+# - encrypt.up_ok：--encrypt-state 装配成功；
+# - encrypt.file_encrypted：状态文件非明文 JSON（首字节含 NEXSEC1/NEXDP1 格式 magic）；
+# - encrypt.file_magic：状态文件格式标识（"NEXSEC1" 或 "NEXDP1"，按平台）；
+# - encrypt.read_back_vip / encrypt.peer_count：加密状态解密读回字段一致；
+# - encrypt.up_after_leave：leave 清除后 DOWN；
+# - tamper.decrypt_failed：篡改密文后 status → STORE_ERROR（不 panic）。
+
+[when]
+command = "cargo run --quiet -p nexus --example subnet_cli -- --json"
+
+[[expect]]
+field = "encrypt.up_ok"
+equals = true
+
+[[expect]]
+field = "encrypt.file_encrypted"
+equals = true
+
+[[expect]]
+field = "encrypt.file_magic"
+one_of = ["NEXSEC1", "NEXDP1"]
+
+[[expect]]
+field = "encrypt.read_back_vip"
+equals = "10.99.0.1"
+
+[[expect]]
+field = "encrypt.peer_count"
+equals = 2
+
+[[expect]]
+field = "encrypt.up_after_leave"
+equals = false
+
+[[expect]]
+field = "tamper.decrypt_failed"
+equals = "STORE_ERROR"

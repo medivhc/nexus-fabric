@@ -1414,9 +1414,10 @@ Mesh 网络流量过滤：默认拒绝白名单 + 声明顺序首匹配（first-
 CLI 走进程内 SDK（同 `run` 路径），状态为本地文件（默认 `~/.nexus/subnet.json`，
 `--state <path>` 可覆盖；NEXUS_HOME 影响默认目录）。
 
-- `nexus subnet up --config <path> [--state <path>] [--json]`：读 TOML → 校验 →
+- `nexus subnet up --config <path> [--state <path>] [--encrypt-state] [--json]`：读 TOML → 校验 →
   进程内装配 `VirtualSubnetTunnel`（MeshCarrier mock carrier，真实 TUN 留 P3-2）→
-  状态写状态文件 → 输出 `{ verdict, command:"subnet up", subnet:{ up, tunnel_id,
+  状态写状态文件（`--encrypt-state` 时以加密形式落盘，§12.31）→
+  输出 `{ verdict, command:"subnet up", subnet:{ up, tunnel_id,
   virtual_ip, cidr, peer_count, egress_peer_count, prefix_route_count, encryption } }`。
   同 virtual_ip 重复 up → 幂等覆盖（刷新状态文件）。
 - `nexus subnet status [--state <path>] [--json]`：读状态文件输出隧道状态；无状态
@@ -1482,9 +1483,32 @@ E4 场景 `tun_dataplane.toml`：UdpCarrier 本地回环收发对齐（E4 可离
 - **文件格式**：`NEXSEC1` magic + 12 字节 nonce + ciphertext（ring AEAD）。
 - **能力声明**：`caps.secure_store`（Windows DPAPI → true；Linux machine-id
   存在 → true）。缺失时调用方走 `Unavailable` 结构化降级。
-- 冻结边界（P3.3 不做）：CLI/状态文件加密集成（`subnet up --encrypt-state`
-  留 P3.4）、密钥轮换、多用户密钥共享、TEE/HSM。
+- 冻结边界（P3.3 不做）：密钥轮换、多用户密钥共享、TEE/HSM。
+  CLI/状态文件加密集成（`subnet up --encrypt-state`）→ P3.4（§12.31）。
 
 E4 场景 `secure_store.toml`：DPAPI put/get 往返 + 缺失键 Ok(None)（Windows
 真机，无需管理员）+ machine-id 解析纯函数（合法/非法）+ ring AEAD 加解密
 往返 + 文件 magic/密文≠明文。Linux 真机文件权限走 E5（WSL/真实 Linux）。
+
+### 12.31 P3.4 CLI 状态文件加密（2026-09-21）{#12-secure-state}
+
+把 §12.28 状态文件从明文升级为平台加密落盘（§12.30 冻结边界中的 P3.4）。
+
+- `nexus subnet up --config <path> [--state <path>] [--encrypt-state]`：`--encrypt-state`
+  时状态 JSON 经平台保护加密后写入状态文件（文件路径语义不变，`--state` 仍指向该文件）。
+- **加密状态文件格式**（文件首字节格式 magic 识别）：
+  - `NEXSEC1`：Linux machine-id 派生密钥（HKDF-SHA256，§12.30）+ ChaCha20-Poly1305
+    AEAD 密文（`NEXSEC1 || nonce(12B) || ciphertext || tag`）；
+  - `NEXDP1`：Windows DPAPI blob（`NEXDP1 || CryptProtectData(plain)`，绑定当前用户+机器）。
+- `nexus subnet status` 自动检测：`NEXSEC1`/`NEXDP1` 前缀 → 解密后解析；否则按明文
+  JSON 解析（向后兼容 P3.1 状态文件）。解密失败（密钥变化 / 篡改）→
+  `{ verdict:"STORE_ERROR", error:"..." }`（exit 0，结构化，不 panic）。
+- 能力缺失（Linux `/etc/machine-id` 不存在或非法）→ `{ verdict:"STORE_ERROR",
+  error:"SECURE_STORE_UNAVAILABLE", ... }`，**不 fallback 明文**（§12.30 Unavailable 语义）。
+- `nexus subnet leave` 语义不变（删除状态文件）。
+- E4 场景：`secure_state.toml`（id=`product.secure-state`，example 进程内闭环）——
+  `--encrypt-state` 后状态文件非明文（含格式 magic）、status 读回加密状态字段、
+  leave 清除、篡改/解密失败 → STORE_ERROR。Windows 侧走 DPAPI 真机；
+  Linux 侧格式/纯逻辑平台无关（真实 `/etc/machine-id` 走 E5）。
+- 冻结边界（P3.4 不做）：状态文件迁移（明文→加密自动转换）、密钥轮换
+  （§12.30）、多用户密钥共享、加密状态文件备份恢复。

@@ -6617,7 +6617,7 @@ pub fn traffic_stats_flow() -> Result<Value, NexusError> {
 /// 进程内全闭环：写 fixture TOML → up（装配+状态文件）→ 幂等 up → status →
 /// leave → status（down）→ 四类非法配置拒绝（CONFIG_ERROR）。
 pub fn subnet_cli_flow() -> Result<Value, NexusError> {
-    use crate::subnet_cli::{subnet_leave, subnet_status, subnet_up};
+    use crate::subnet_cli::{NEXDP1_MAGIC, subnet_leave, subnet_status, subnet_up};
     use std::path::PathBuf;
 
     fn write_cfg(path: &std::path::Path, text: &str) -> Result<(), String> {
@@ -6689,9 +6689,10 @@ locator = "udp://127.0.0.1:42001"
     .map_err(|e| NexusError::Internal { message: e })?;
 
     // up（首次）
-    let up_json = subnet_up(&cfg_ok, &state).map_err(|e| NexusError::Internal { message: e })?;
+    let up_json =
+        subnet_up(&cfg_ok, &state, false).map_err(|e| NexusError::Internal { message: e })?;
     // up 幂等（同 vip 覆盖，仍成功）
-    subnet_up(&cfg_ok, &state).map_err(|e| NexusError::Internal { message: e })?;
+    subnet_up(&cfg_ok, &state, false).map_err(|e| NexusError::Internal { message: e })?;
     let up = up_json.get("subnet").cloned().unwrap_or_default();
 
     // status（读回）
@@ -6724,9 +6725,69 @@ locator = "udp://127.0.0.1:42001"
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
+    // ---- P3.4 加密状态（§12.31）：--encrypt-state 加密落盘 + status 解密读回 ----
+    let state_sec = dir.join("subnet-state-secure.json");
+    let enc_up_json =
+        subnet_up(&cfg_ok, &state_sec, true).map_err(|e| NexusError::Internal { message: e })?;
+    let enc_up_ok = enc_up_json
+        .get("subnet")
+        .and_then(|s| s.get("up"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let enc_bytes = std::fs::read(&state_sec).map_err(|e| NexusError::Internal {
+        message: e.to_string(),
+    })?;
+    let file_encrypted = enc_bytes.starts_with(b"NEXSEC1") || enc_bytes.starts_with(NEXDP1_MAGIC);
+    let file_magic = if enc_bytes.starts_with(b"NEXSEC1") {
+        "NEXSEC1"
+    } else if enc_bytes.starts_with(NEXDP1_MAGIC) {
+        "NEXDP1"
+    } else {
+        "PLAIN"
+    }
+    .to_string();
+
+    // 加密状态 status 读回（解密后字段一致）
+    let enc_status_json = subnet_status(&state_sec);
+    let sec_read_back_vip = enc_status_json
+        .get("subnet")
+        .and_then(|s| s.get("virtual_ip"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let sec_peer_count = enc_status_json
+        .get("subnet")
+        .and_then(|s| s.get("peer_count"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    // leave 加密状态 → status DOWN
+    subnet_leave(&state_sec);
+    let sec_up_after_leave = subnet_status(&state_sec)
+        .get("subnet")
+        .and_then(|s| s.get("up"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    // 篡改密文（magic 后第 1 字节翻转）→ status STORE_ERROR（不 panic）
+    let mut tampered = enc_bytes.clone();
+    if tampered.len() > NEXDP1_MAGIC.len() + 2 {
+        tampered[NEXDP1_MAGIC.len() + 1] ^= 0x01;
+    }
+    std::fs::write(&state_sec, &tampered).map_err(|e| NexusError::Internal {
+        message: e.to_string(),
+    })?;
+    let tamper_verdict = subnet_status(&state_sec)
+        .get("verdict")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    // 清理加密状态文件
+    std::fs::remove_file(&state_sec).ok();
+
     // 四类非法配置
     let classify = |path: &PathBuf| -> String {
-        match subnet_up(path, &state) {
+        match subnet_up(path, &state, false) {
             Err(_) => "CONFIG_ERROR".to_string(),
             Ok(_) => "ACCEPTED".to_string(),
         }
@@ -6757,6 +6818,15 @@ locator = "udp://127.0.0.1:42001"
         },
         "leave": { "left": left },
         "status_after_leave": { "up": up_after_leave },
+        "encrypt": {
+            "up_ok": enc_up_ok,
+            "file_encrypted": file_encrypted,
+            "file_magic": file_magic,
+            "read_back_vip": sec_read_back_vip,
+            "peer_count": sec_peer_count,
+            "up_after_leave": sec_up_after_leave,
+        },
+        "tamper": { "decrypt_failed": tamper_verdict },
         "config": {
             "bad_cidr": bad_cidr,
             "vip_outside_subnet": vip_outside_subnet,

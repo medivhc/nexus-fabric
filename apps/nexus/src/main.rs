@@ -244,6 +244,7 @@ fn run_subnet(args: &[String], json_mode: bool) -> i32 {
     let mut tun = false;
     let mut tun_name: Option<String> = None;
     let mut listen: Option<String> = None;
+    let mut encrypt_state = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -262,6 +263,10 @@ fn run_subnet(args: &[String], json_mode: bool) -> i32 {
                 };
                 state = Some(PathBuf::from(v));
                 i += 2;
+            }
+            "--encrypt-state" => {
+                encrypt_state = true;
+                i += 1;
             }
             "--tun" => {
                 tun = true;
@@ -308,7 +313,7 @@ fn run_subnet(args: &[String], json_mode: bool) -> i32 {
                     Err(e) => nexus::subnet_cli::classify_tun_error(&e),
                 }
             } else {
-                match subnet_up(&cfg, &state_path) {
+                match subnet_up(&cfg, &state_path, encrypt_state) {
                     Ok(v) => v,
                     Err(e) => serde_json::json!({
                         "verdict": "CONFIG_ERROR",

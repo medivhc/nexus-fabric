@@ -1,4 +1,5 @@
-//! P3.1 子网 CLI（PRODUCT §12.28）：TOML 配置 → VirtualSubnetTunnel 装配 + 状态文件。
+//! P3.1 子网 CLI（PRODUCT §12.28）+ P3.4 状态文件加密（§12.31）：
+//! TOML 配置 → VirtualSubnetTunnel 装配 + 状态文件（明文或平台加密）。
 //!
 //! Composition Root 层（apps/nexus 允许 I/O）：配置校验 → 进程内装配（MeshCarrier
 //! mock carrier，真实 TUN 留 P3-2）→ 状态写入本地文件（默认 `~/.nexus/subnet.json`，
@@ -14,6 +15,9 @@ use nexus_connectivity::virtual_subnet::{
 use nexus_platform::{PacketCarrier, UdpCarrier, VirtualPacketInterface};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// Windows DPAPI 加密状态文件格式 magic（§12.31）：`NEXDP1 || DPAPI blob`。
+pub const NEXDP1_MAGIC: &[u8; 6] = b"NEXDP1";
 
 /// TUN 接口名最大字节数（对齐 Linux IFNAMSIZ-1 与 wintun 名称约束）。
 pub const MAX_TUN_NAME_BYTES: usize = 15;
@@ -170,8 +174,12 @@ fn validate(config: &SubnetConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// `subnet up --config <path>`：校验 → 装配 → 写状态文件。
-pub fn subnet_up(config_path: &Path, state_path: &Path) -> Result<Value, String> {
+/// `subnet up --config <path>`：校验 → 装配 → 写状态文件（`--encrypt-state` 加密落盘）。
+pub fn subnet_up(
+    config_path: &Path,
+    state_path: &Path,
+    encrypt_state: bool,
+) -> Result<Value, String> {
     let config = parse_config(config_path)?;
     let _tunnel = assemble_with(
         &config,
@@ -193,7 +201,12 @@ pub fn subnet_up(config_path: &Path, state_path: &Path) -> Result<Value, String>
     if let Some(parent) = state_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("MKDIR_STATE: {e}"))?;
     }
-    std::fs::write(state_path, json).map_err(|e| format!("WRITE_STATE: {e}"))?;
+    if encrypt_state {
+        let enc = encrypt_state_bytes(json.as_bytes())?;
+        std::fs::write(state_path, enc).map_err(|e| format!("WRITE_STATE_ENCRYPTED: {e}"))?;
+    } else {
+        std::fs::write(state_path, json).map_err(|e| format!("WRITE_STATE: {e}"))?;
+    }
     Ok(serde_json::json!({
         "verdict": "PASS",
         "command": "subnet up",
@@ -210,16 +223,88 @@ pub fn subnet_up(config_path: &Path, state_path: &Path) -> Result<Value, String>
     }))
 }
 
-/// `subnet status`：读状态文件。
+/// 平台保护加密状态字节（§12.31）：
+/// - Windows：`NEXDP1 || DPAPI blob`（绑定当前用户+机器）；
+/// - Linux：`NEXSEC1` AEAD 密文（machine-id 派生密钥）。
+///   能力缺失 → 结构化错误（`SECURE_STORE_UNAVAILABLE`，不 fallback 明文）。
+fn encrypt_state_bytes(plain: &[u8]) -> Result<Vec<u8>, String> {
+    #[cfg(windows)]
+    {
+        let blob = nexus_platform_windows::dpapi::protect(plain)
+            .map_err(|e| format!("DPAPI_PROTECT: {e}"))?;
+        let mut out = Vec::with_capacity(NEXDP1_MAGIC.len() + blob.len());
+        out.extend_from_slice(NEXDP1_MAGIC);
+        out.extend_from_slice(&blob);
+        Ok(out)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let key = nexus_platform_linux::secure_store::derive_key_from_machine_id()
+            .map_err(|_| "SECURE_STORE_UNAVAILABLE: machine-id missing or invalid".to_string())?;
+        nexus_platform::secure_store::encrypt_record(&key, plain)
+            .map_err(|e| format!("AEAD_ENCRYPT: {e:?}"))
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        Err("SECURE_STORE_UNAVAILABLE: no platform secure store".into())
+    }
+}
+
+/// 平台保护解密状态字节（自动检测格式 magic；明文直接通过，向后兼容 P3.1）。
+///
+/// 解密失败（密钥变化 / 篡改 / 平台不匹配）→ 结构化错误（调用方转 STORE_ERROR）。
+fn decrypt_state_bytes(enc: &[u8]) -> Result<Vec<u8>, String> {
+    if enc.starts_with(nexus_platform::secure_store::NEXSEC1_MAGIC) {
+        #[cfg(target_os = "linux")]
+        {
+            let key =
+                nexus_platform_linux::secure_store::derive_key_from_machine_id().map_err(|_| {
+                    "SECURE_STORE_UNAVAILABLE: machine-id missing or invalid".to_string()
+                })?;
+            nexus_platform::secure_store::decrypt_record(&key, enc)
+                .map_err(|e| format!("AEAD_DECRYPT: {e:?}"))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err("STORE_ERROR: NEXSEC1 state requires Linux secure store".into())
+        }
+    } else if enc.starts_with(NEXDP1_MAGIC) {
+        #[cfg(windows)]
+        {
+            nexus_platform_windows::dpapi::unprotect(&enc[NEXDP1_MAGIC.len()..])
+                .map_err(|e| format!("DPAPI_UNPROTECT: {e}"))
+        }
+        #[cfg(not(windows))]
+        {
+            Err("STORE_ERROR: NEXDP1 state requires Windows DPAPI".into())
+        }
+    } else {
+        // 明文状态（P3.1 兼容）。
+        Ok(enc.to_vec())
+    }
+}
+
+/// `subnet status`：读状态文件（自动检测加密格式，§12.31）。
+///
+/// 缺失/不可读 → DOWN；加密解密失败（篡改/密钥变化/平台不匹配）→ STORE_ERROR
+/// （结构化，不 panic）；明文 JSON 损坏 → DOWN（P3.1 兼容）。
 pub fn subnet_status(state_path: &Path) -> Value {
-    let Ok(text) = std::fs::read_to_string(state_path) else {
+    let Ok(bytes) = std::fs::read(state_path) else {
         return serde_json::json!({
             "verdict": "DOWN",
             "command": "subnet status",
             "subnet": { "up": false },
         });
     };
-    match serde_json::from_str::<SubnetState>(&text) {
+    let Ok(plain) = decrypt_state_bytes(&bytes) else {
+        return serde_json::json!({
+            "verdict": "STORE_ERROR",
+            "command": "subnet status",
+            "subnet": { "up": false },
+            "error": "STORE_ERROR",
+        });
+    };
+    match serde_json::from_slice::<SubnetState>(&plain) {
         Ok(state) => serde_json::json!({
             "verdict": "PASS",
             "command": "subnet status",
@@ -342,7 +427,7 @@ pub fn subnet_up_tun(
     let vpi = nexus_platform_windows::WintunVpiAdapter::create(tun_name, "Nexus")
         .map_err(|e| format!("TUN_ERROR: wintun create: {e}"))?;
     let _tunnel = assemble_with(&config, Box::new(vpi), Box::new(carrier))?;
-    let mut out = subnet_up(config_path, state_path)?;
+    let mut out = subnet_up(config_path, state_path, false)?;
     if let Some(obj) = out.as_object_mut() {
         obj.insert("local_locator".into(), serde_json::json!(bound));
     }
@@ -366,7 +451,7 @@ pub fn subnet_up_tun(
     let vpi = nexus_platform_linux::TunVpi::create(tun_name)
         .map_err(|e| format!("TUN_ERROR: tun create: {e}"))?;
     let _tunnel = assemble_with(&config, Box::new(vpi), Box::new(carrier))?;
-    let mut out = subnet_up(config_path, state_path)?;
+    let mut out = subnet_up(config_path, state_path, false)?;
     if let Some(obj) = out.as_object_mut() {
         obj.insert("local_locator".into(), serde_json::json!(bound));
     }
