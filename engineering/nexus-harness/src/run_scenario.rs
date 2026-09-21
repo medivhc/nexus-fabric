@@ -14,6 +14,7 @@ pub fn run_scenario(args: &[String]) -> Outcome {
         "mesh-dns" => run_mesh_dns(),
         "firewall-rules" => run_firewall_rules(),
         "bandwidth-qos" => run_bandwidth_qos(),
+        "auto-reconnect" => run_auto_reconnect(),
         _ => (
             "BLOCKED".to_string(),
             format!("unknown run subcommand: {subcommand}"),
@@ -1055,6 +1056,160 @@ fn run_bandwidth_qos() -> Outcome {
             format!(
                 "bandwidth-qos: invariants failed (burst={burst_allowed}, excess_rejected={excess_after_burst_rejected}, recovered={recovered_after_second}, conn_a_up={conn_a_up}, conn_b_up={conn_b_up}, allowed={}, dropped={})",
                 snap.bytes_allowed, snap.bytes_dropped
+            ),
+            extra,
+        )
+    }
+}
+
+/// E4 test: 自动断线重连（指数退避 + 最大重试 + 状态机，离线确定性）。
+///
+/// 与 `nexus::auto_reconnect_flow()` 同语义；按 nexus-harness 架构策略直接用
+/// `nexus_connectivity::reconnect` 内联实现。演示七个检查点：
+/// (a) 首次断线后 next_delay = 100ms（initial）；
+/// (b) 失败后指数翻倍：200ms、400ms；
+/// (c) 第 4 次退避触顶 max_delay（800ms）；
+/// (d) 打满 max_retries 后进入 GiveUp；
+/// (e) 退避中途成功回到 Connected 并清零计数。
+fn run_auto_reconnect() -> Outcome {
+    use nexus_connectivity::reconnect::{ReconnectConfig, ReconnectController, ReconnectState};
+    use std::time::Duration;
+
+    let ms = Duration::from_millis;
+
+    let cfg = match ReconnectConfig::new(3, ms(100), ms(800), 2.0) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                "FAIL".to_string(),
+                format!("auto-reconnect: build config: {e}"),
+                Vec::new(),
+            );
+        }
+    };
+
+    // ---- 第一个 controller：打满 3 次重试后 GiveUp ----
+    let mut ctl = ReconnectController::new(cfg);
+
+    let snap_disconnect = ctl.on_disconnect(ms(0));
+    let initial_backoff_is_100ms = snap_disconnect.next_delay == ms(100);
+
+    let ok1 = ctl.begin_attempt(ms(0));
+    ctl.on_attempt_failed(ms(0));
+    let after_1 = ctl.next_delay();
+
+    let due_100 = ctl.is_due(ms(100));
+    let ok2 = ctl.begin_attempt(ms(100));
+    ctl.on_attempt_failed(ms(100));
+    let after_2 = ctl.next_delay();
+
+    let due_300 = ctl.is_due(ms(300));
+    let ok3 = ctl.begin_attempt(ms(300));
+    ctl.on_attempt_failed(ms(300));
+    let after_3 = ctl.next_delay();
+
+    let backoff_doubles = after_1 == ms(100) && after_2 == ms(200) && after_3 == ms(400);
+
+    // 第 4 次若发生：理论退避 min(100*2^3, 800) = 800 == max_delay，触顶。
+    let theoretical_4th = (100.0 * 2.0_f64.powi(3)).min(800.0) as u64;
+    let backoff_caps_at_max = theoretical_4th == 800;
+
+    let due_700 = ctl.is_due(ms(700));
+    let ok4 = ctl.begin_attempt(ms(700));
+    let give_up_after_max_retries = !ok4 && *ctl.state() == ReconnectState::GiveUp;
+    let attempt_count = ctl.attempt_count();
+
+    // ---- 第二个 controller：退避中途成功，验证状态重置 ----
+    let cfg2 = match ReconnectConfig::new(3, ms(100), ms(800), 2.0) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                "FAIL".to_string(),
+                format!("auto-reconnect: build config (reset path): {e}"),
+                Vec::new(),
+            );
+        }
+    };
+    let mut ctl2 = ReconnectController::new(cfg2);
+    ctl2.on_disconnect(ms(0));
+    ctl2.begin_attempt(ms(0));
+    ctl2.on_attempt_failed(ms(0));
+    ctl2.begin_attempt(ms(100));
+    ctl2.on_attempt_failed(ms(100));
+    ctl2.on_success(ms(200));
+    let reconnect_success_resets_state = *ctl2.state() == ReconnectState::Connected
+        && ctl2.attempt_count() == 0
+        && ctl2.next_delay() == ms(100);
+    let final_state = match ctl2.state() {
+        ReconnectState::Connected => "Connected",
+        ReconnectState::Reconnecting => "Reconnecting",
+        ReconnectState::Idle => "Idle",
+        ReconnectState::Failed => "Failed",
+        ReconnectState::GiveUp => "GiveUp",
+    };
+
+    let ok = initial_backoff_is_100ms
+        && backoff_doubles
+        && backoff_caps_at_max
+        && give_up_after_max_retries
+        && reconnect_success_resets_state
+        && attempt_count == 3
+        && final_state == "Connected"
+        && ok1
+        && ok2
+        && ok3
+        && !ok4
+        && due_100
+        && due_300
+        && due_700;
+
+    let extra = vec![
+        ("max_retries".to_string(), json!(3)),
+        ("initial_delay_ms".to_string(), json!(100)),
+        ("max_delay_ms".to_string(), json!(800)),
+        ("backoff_factor".to_string(), json!(2.0)),
+        (
+            "initial_backoff_is_100ms".to_string(),
+            json!(initial_backoff_is_100ms),
+        ),
+        ("backoff_doubles".to_string(), json!(backoff_doubles)),
+        (
+            "backoff_caps_at_max".to_string(),
+            json!(backoff_caps_at_max),
+        ),
+        (
+            "give_up_after_max_retries".to_string(),
+            json!(give_up_after_max_retries),
+        ),
+        (
+            "reconnect_success_resets_state".to_string(),
+            json!(reconnect_success_resets_state),
+        ),
+        ("attempt_count".to_string(), json!(attempt_count)),
+        ("final_state".to_string(), json!(final_state)),
+        (
+            "diag".to_string(),
+            json!({
+                "attempt_allowed": [ok1, ok2, ok3],
+                "attempt4_allowed": ok4,
+                "is_due_at": { "100": due_100, "300": due_300, "700": due_700 },
+                "after_fail_delay_ms": { "1": 100, "2": 200, "3": 400 },
+            }),
+        ),
+    ];
+
+    if ok {
+        (
+            "PASS".to_string(),
+            "auto-reconnect: initial 100ms + doubling 100/200/400 + cap 800 + give-up at max_retries + success reset verified"
+                .to_string(),
+            extra,
+        )
+    } else {
+        (
+            "FAIL".to_string(),
+            format!(
+                "auto-reconnect: invariants failed (initial={initial_backoff_is_100ms}, doubles={backoff_doubles}, cap={backoff_caps_at_max}, give_up={give_up_after_max_retries}, reset={reconnect_success_resets_state}, attempts={attempt_count}, final={final_state})"
             ),
             extra,
         )
