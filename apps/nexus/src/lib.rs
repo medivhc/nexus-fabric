@@ -5399,3 +5399,133 @@ pub fn auto_reconnect_flow() -> Result<Value, NexusError> {
         },
     }))
 }
+
+/// E4 场景 `product.node-tags`：Mesh 节点分组标签。
+///
+/// 纯内存骨架：
+/// (a) 构建 5 个带标签的节点；
+/// (b) 按精确标签过滤（region=us -> 2 节点）；
+/// (c) 按多标签 AND 过滤（region=us AND role=db -> 1 节点）；
+/// (d) 按存在性过滤（tier key 存在 -> 5 节点）；
+/// (e) 无匹配过滤（region=xx -> 0 节点）；
+/// (f) 按标签选择下一跳（role=edge AND tier=1 -> 选中第一个匹配节点）；
+/// (g) 标签字符串解析。
+pub fn node_tags_flow() -> Result<Value, NexusError> {
+    use nexus_connectivity::node_tags::{
+        NodeInfo, NodeTag, TagFilter, TagMatcher, parse_filters, parse_tags,
+    };
+
+    // 构建 5 个带标签的节点
+    let nodes = vec![
+        NodeInfo::new(
+            "node-us-edge",
+            "10.0.0.1",
+            parse_tags(&["region=us", "role=edge", "tier=1"]).map_err(|e| {
+                NexusError::Internal {
+                    message: format!("parse tags us-edge: {e}"),
+                }
+            })?,
+        ),
+        NodeInfo::new(
+            "node-eu-edge",
+            "10.0.0.2",
+            parse_tags(&["region=eu", "role=edge", "tier=1"]).map_err(|e| {
+                NexusError::Internal {
+                    message: format!("parse tags eu-edge: {e}"),
+                }
+            })?,
+        ),
+        NodeInfo::new(
+            "node-us-db",
+            "10.0.0.3",
+            parse_tags(&["region=us", "role=db", "tier=0"]).map_err(|e| NexusError::Internal {
+                message: format!("parse tags us-db: {e}"),
+            })?,
+        ),
+        NodeInfo::new(
+            "node-eu-db",
+            "10.0.0.4",
+            parse_tags(&["region=eu", "role=db", "tier=0"]).map_err(|e| NexusError::Internal {
+                message: format!("parse tags eu-db: {e}"),
+            })?,
+        ),
+        NodeInfo::new(
+            "node-cn-relay",
+            "10.0.0.5",
+            parse_tags(&["region=cn", "role=relay", "tier=2"]).map_err(|e| {
+                NexusError::Internal {
+                    message: format!("parse tags cn-relay: {e}"),
+                }
+            })?,
+        ),
+    ];
+
+    // (b) 精确过滤：region=us
+    let filter_us =
+        TagMatcher::new(
+            parse_filters(&["region=us"]).map_err(|e| NexusError::Internal {
+                message: format!("parse filter region=us: {e}"),
+            })?,
+        );
+    let region_us_nodes = filter_us.filter_nodes(&nodes);
+
+    // (c) 多标签 AND 过滤：region=us AND role=db
+    let filter_us_db = TagMatcher::new(parse_filters(&["region=us", "role=db"]).map_err(|e| {
+        NexusError::Internal {
+            message: format!("parse filter region=us role=db: {e}"),
+        }
+    })?);
+    let region_us_db_nodes = filter_us_db.filter_nodes(&nodes);
+
+    // (d) 存在性过滤：tier key 存在
+    let filter_tier_exists = TagMatcher::new(vec![TagFilter::exists("tier").map_err(|e| {
+        NexusError::Internal {
+            message: format!("filter exists tier: {e}"),
+        }
+    })?]);
+    let tier_exists_nodes = filter_tier_exists.filter_nodes(&nodes);
+
+    // (e) 无匹配：region=xx
+    let filter_no_match =
+        TagMatcher::new(
+            parse_filters(&["region=xx"]).map_err(|e| NexusError::Internal {
+                message: format!("parse filter region=xx: {e}"),
+            })?,
+        );
+    let no_match_nodes = filter_no_match.filter_nodes(&nodes);
+
+    // (f) 按标签选择下一跳：role=edge AND tier=1，选第一个命中节点
+    let filter_edge_tier1 =
+        TagMatcher::new(parse_filters(&["role=edge", "tier=1"]).map_err(|e| {
+            NexusError::Internal {
+                message: format!("parse filter role=edge tier=1: {e}"),
+            }
+        })?);
+    let next_hop = filter_edge_tier1.filter_nodes(&nodes).into_iter().next();
+
+    // (g) 标签解析
+    let parsed = NodeTag::parse("region=us").map_err(|e| NexusError::Internal {
+        message: format!("parse tag region=us: {e}"),
+    })?;
+
+    Ok(json!({
+        "verdict": "PASS",
+        "command": "node-tags",
+        "tagged_nodes": nodes.len(),
+        "filter_region_us": { "count": region_us_nodes.len() },
+        "filter_role_db": { "count": nodes.iter().filter(|n| n.has_tag("role", "db")).count() },
+        "filter_region_and_role": { "count": region_us_db_nodes.len() },
+        "filter_key_exists": { "count": tier_exists_nodes.len() },
+        "filter_no_match": { "count": no_match_nodes.len() },
+        "next_hop": {
+            "selected": next_hop.map(|n| json!({
+                "node_id": n.node_id,
+                "virtual_ip": n.virtual_ip,
+            })).unwrap_or(json!({ "node_id": null }))
+        },
+        "parsed_tag": {
+            "key": parsed.key,
+            "value": parsed.value,
+        },
+    }))
+}
