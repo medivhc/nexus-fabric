@@ -1,0 +1,60 @@
+schema_version = 1
+id = "product.fragmentation"
+title = "分片传输：分片重组、幂等、超时 GC 与缓冲上限"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-fragmentation"
+
+[given]
+max_fragment_size = 64
+max_reassembly_buffer = 4096
+reassembly_timeout_ms = 1000
+
+[when]
+command = "cargo run --quiet -p nexus --example fragmentation -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "fragmentation"
+
+# 200 字节 / 64 = 4 片，重组 roundtrip 一致
+[[expect]]
+field = "roundtrip_ok"
+equals = true
+
+[[expect]]
+field = "fragment_count"
+equals = 4
+
+# 空数据产 1 片即完成
+[[expect]]
+field = "empty_single_fragment"
+equals = true
+
+# 重复片幂等（不重复计字节）
+[[expect]]
+field = "duplicate_idempotent"
+equals = true
+
+# total 漂移被拒绝
+[[expect]]
+field = "total_mismatch_rejected"
+equals = true
+
+# now=500 < timeout=1000 不回收
+[[expect]]
+field = "gc_before"
+equals = 0
+
+# now=1001 > timeout=1000 回收 1 个未完成上下文
+[[expect]]
+field = "gc_expired_dropped"
+equals = 1
+
+# 缓冲上限 16 字节时放 20 字节片被拒
+[[expect]]
+field = "buffer_exceeded_rejected"
+equals = true
