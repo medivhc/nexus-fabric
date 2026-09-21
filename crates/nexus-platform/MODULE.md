@@ -21,6 +21,9 @@
 ## Allowed Dependencies
 
 - 无 Nexus 内部依赖。
+- 第三方：`ring`（HKDF-SHA256 + ChaCha20-Poly1305，SecureStore 平台无关核心，
+  PRODUCT §12.30；license Apache-2.0 AND ISC 在 allowlist，dependency review
+  见 `policies/dependencies.toml`）。
 
 ## Forbidden Dependencies
 
@@ -52,6 +55,9 @@
 - `PacketCarrier`（WireGuard `conn.Bind` 等价物）：承载传输封装帧的
   `bind`/`send_to`/`receive_into`/`local_locator`，与 VPI 解耦；加密打洞
   编排在 `nexus-connectivity` 层消费（吸收点 W2）。
+- `secure_store`（PRODUCT §12.30）：machine-id 解析（32 hex → 16 字节）、
+  HKDF-SHA256 密钥派生、NEXSEC1 AEAD 记录（`magic || nonce || ct || tag`）
+  加解密——平台无关纯逻辑，DPAPI / machine-id 文件后端在 `nexus-platform-*`。
 
 ## Verification
 

@@ -97,3 +97,18 @@ portability = "crate portable=false; BoringSSL C code already built on all suppo
 supply_chain = "0.17.14 already pinned in Cargo.lock; no lockfile churn expected"
 approved = true
 approved_date = "2026-09-20"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-platform"
+crate = "ring"
+version = "0.17"
+default_features = false
+features = ["std"]
+architecture_layer = "platform-abstraction layer; SecureStore 平台无关核心 (PRODUCT §12.30) 使用 HKDF-SHA256 + ChaCha20-Poly1305 AEAD, 与 nexus-connectivity 共享同一锁版本"
+feature_scope = "std feature only; no pem/test/dev features enabled"
+license = "Apache-2.0 AND ISC (allowlisted; 同 nexus-connectivity 已审条目)"
+security = "no known advisories; workspace 已编译验证"
+portability = "nexus-platform 不在 harness.toml [portable_core] WASI 清单 (portable=false); ring 的 BoringSSL C 代码在 host 目标已构建"
+supply_chain = "0.17.14 已在 Cargo.lock, 无锁文件膨胀"
+approved = true
+approved_date = "2026-09-21"

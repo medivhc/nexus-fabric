@@ -96,3 +96,6 @@ pub trait TransparentIngressProvider: Send {
     fn stop(&mut self) -> Result<(), PlatformError>;
 }
 pub use udp_carrier::UdpCarrier;
+
+/// SecureStore 平台无关核心（machine-id 解析 / NEXSEC1 格式 / AEAD 记录）。
+pub mod secure_store;

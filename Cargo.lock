@@ -413,6 +413,9 @@ dependencies = [
 [[package]]
 name = "nexus-platform"
 version = "0.1.0"
+dependencies = [
+ "ring",
+]
 
 [[package]]
 name = "nexus-platform-android"
