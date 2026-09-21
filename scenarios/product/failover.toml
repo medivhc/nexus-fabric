@@ -1,0 +1,70 @@
+schema_version = 1
+id = "product.failover"
+title = "故障转移：主备切换、连续退备与自动回切"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-failover"
+
+[given]
+primary = "primary"
+standbys = ["s1", "s2"]
+auto_failback = true
+
+[when]
+command = "cargo run --quiet -p nexus --example failover -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "failover"
+
+# 初始在主节点
+[[expect]]
+field = "starts_on_primary"
+equals = true
+
+# 主节点失败 -> 切到第一个备节点
+[[expect]]
+field = "after_primary_failure_active"
+equals = "s1"
+
+[[expect]]
+field = "after_primary_failure_state"
+equals = "standby"
+
+# 当前备节点再失败 -> 退到下一个备节点
+[[expect]]
+field = "after_second_failure_active"
+equals = "s2"
+
+# 全部备节点失败 -> Failed
+[[expect]]
+field = "exhausted_state"
+equals = "failed"
+
+# auto_failback=true：主恢复后切回 Primary
+[[expect]]
+field = "auto_failback_active"
+equals = "primary"
+
+# auto_failback=false：主恢复不切回
+[[expect]]
+field = "no_failback_active"
+equals = "s1"
+
+# 构造校验：空主节点被拒
+[[expect]]
+field = "empty_primary_rejected"
+equals = true
+
+# 构造校验：备节点含主节点被拒
+[[expect]]
+field = "standby_contains_primary_rejected"
+equals = true
+
+# 构造校验：重复备节点被拒
+[[expect]]
+field = "duplicate_standby_rejected"
+equals = true

@@ -1308,6 +1308,75 @@ CLI 走进程内 SDK（同 `run` 路径），状态为本地文件（默认 `~/.
 - E4 场景：`log_level.toml`（id=`product.log-level`）--模块覆盖生效、未覆盖回退全局、
   enabled 阈值判断、set_global/set_module_level 动态调整、字符串解析。
 - 冻结边界（P2.3 不做）：真实接 `tracing`/`log` 后端、EnvFilter 热刷新、指标导出（留 TODO）。
+
+### 12.21 P2.3 故障转移（2026-09-21） {#12-failover}
+
+`failover.rs`（`nexus-connectivity::failover`）：主备故障转移 + 自动回切状态机骨架。
+
+- `FailoverConfig { primary_node, standby_nodes, auto_failback }`：`new` 校验
+  `primary_node` 非空；`standby_nodes` 不得含空串、不得重复、不得含 `primary_node`，
+  否则 `FailoverError::InvalidPrimary` / `InvalidStandby`。
+- `FailoverState`：`Primary` / `Standby { node }` / `FailingOver { from, to }` / `Failed`，
+  各带 `as_str()`（"primary"/"standby"/"failing-over"/"failed"）与 Display。
+- `FailoverManager`：`new(config)` 初始 `state=Primary`、`active=primary_node`；
+  `active_node()` / `state()` / `consecutive_failures()` / `last_failure_ms()` 只读暴露。
+- `report_failure(node, now_ms)`：累加连续失败与 `last_failure_ms`；失败节点即当前 active
+  时按 standby 列表顺序切到下一个尚未失败的备节点（`FailingOver` -> `Standby`，
+  同步骨架内直接落 `Standby`）；无可用备节点 -> `Failed`。
+- `report_recovery(node, now_ms)`：`auto_failback=true` 且 `node==primary_node` 且当前不在
+  Primary -> 切回 Primary 并清零连续失败；否则仅把该节点标记为可用。
+- E4 场景：`failover.toml`（id=`product.failover`）--主失败切首备、连续失败退多备、
+  无备 -> Failed、auto_failback 回切、不 auto_failback 不回切、构造校验三类拒绝。
+- 冻结边界（P2.3 不做）：真实健康探测、真实流量摘除/挂载、跨进程持久化、真实单调时钟
+  （`now_ms` 由调用方注入，留 TODO）。
+
+### 12.22 P2.3 节点发现增强（2026-09-21） {#12-discovery-enhanced}
+
+`discovery_enhanced.rs`（`nexus-connectivity::discovery_enhanced`）：多策略节点发现骨架。
+
+- `DiscoveryConfig { interval_ms, timeout_ms, max_peers }`：`new` 校验三者均 > 0，
+  否则 `DiscoveryError::InvalidConfig`。
+- `DiscoveryStrategy`：`Multicast` / `Bootstrap` / `Manual`，带 `as_str()`，实现
+  `std::str::FromStr`（大小写不敏感，非法返回 `DiscoveryError::InvalidStrategy`）。
+- `DiscoveredPeer { node_id, endpoint, last_seen_ms }`：可 Clone/PartialEq/Debug。
+- `EnhancedDiscovery`：`new(config)` 默认启用全部三种策略；`enable_strategy` /
+  `disable_strategy` / `is_strategy_enabled` 控制策略集合。
+- `advertise(strategy, node_id, endpoint, now_ms)`：策略未启用 -> 静默忽略（返回
+  `Ok(false)`）；`node_id`/`endpoint` 空串 -> `InvalidAdvertise`；同 `node_id` 已存在
+  -> upsert 刷新 endpoint 与 `last_seen_ms`；表满且为新节点 -> 按 `last_seen_ms`
+  最旧驱逐一条再插入。
+- `prune_expired(now_ms) -> usize`：删除 `now_ms - last_seen_ms > timeout_ms` 的邻居；
+  `peer_count()` / `peers_snapshot()`（按 node_id 升序确定性输出）/ `get_peer(node_id)`。
+- E4 场景：`discovery_enhanced.toml`（id=`product.discovery-enhanced`）--upsert 去重、
+  停用策略忽略、超时清理、max_peers 驱逐最旧、FromStr 解析与非法、快照排序。
+- 冻结边界（P2.3 不做）：真实组播收发、bootstrap 服务器查询、TLS 握手、节点真实性校验、
+  真实单调时钟（`now_ms` 由调用方注入，留 TODO）。
+
+### 12.23 P2.3 智能重试（2026-09-21） {#12-smart-retry}
+
+`smart_retry.rs`（`nexus-connectivity::smart_retry`）：指数退避 + 错误分类 + 熔断骨架。
+
+- `RetryConfig { max_attempts, initial_delay_ms, backoff_factor, failure_threshold,
+  circuit_open_ms }`：`new` 校验 `max_attempts>=1`、`initial_delay_ms>0`、
+  `backoff_factor>=1`、`failure_threshold>=1`、`circuit_open_ms>0`，否则
+  `RetryError::InvalidConfig`。
+- `RetryableClass`：`Retryable` / `Fatal`（由调用方对错误分类后传入）。
+- `CircuitState`：`Closed` / `Open { opened_at_ms }` / `HalfOpen`，带 `as_str()`。
+- `RetryDecision`：`AllowAttempt { attempt, next_delay_ms }` /
+  `StopRetry { reason: &'static str }` / `CircuitOpen { retry_after_ms }`，带 `as_str()`。
+- `RetryExecutor`：`compute_backoff(attempt)` 按 `initial_delay_ms *
+  backoff_factor^(attempt-1)` 计算（attempt 从 1 开始，saturating 并 cap 到
+  `u64::MAX/2`）；`decide(attempt, now_ms)` 在熔断未冷却时返回 `CircuitOpen`，
+  冷却期过放行一次 `AllowAttempt`（视为 HalfOpen），超过 `max_attempts` 返回 `StopRetry`，
+  否则 `AllowAttempt`。
+- `record_success(now_ms)`：清零连续失败、熔断回 `Closed`；`record_failure(now_ms, class)`：
+  连续失败 +1，达 `failure_threshold` 即 `Open { opened_at_ms }`；Fatal 在本骨架仅记录，
+  停止语义由 `decide` 配合 `max_attempts` 体现。
+- E4 场景：`smart_retry.toml`（id=`product.smart-retry`）--退避指数序列、超次数 StopRetry、
+  达阈值 Open、冷却期内 CircuitOpen、过冷却放行一次、record_success 复位。
+- 冻结边界（P2.3 不做）：真实异步调度、jitter 防惊群、半开后真实试探过渡、真实单调时钟
+  （`now_ms` 由调用方注入，留 TODO）。
+
 ### 12.17 P3.2 真实 TUN 数据面驱动（2026-09-21） {#12-tun-dataplane}
 
 接 P3.1（§12.16 mock carrier 留真实 TUN 到 P3-2 的边界）：把"装配隧道"从
