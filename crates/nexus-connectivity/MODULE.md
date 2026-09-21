@@ -362,3 +362,13 @@ cargo clippy -p nexus-connectivity --all-targets -- -D warnings
   出口 `mark_egress`；加密 `enable_encryption`（P2-1 §12.7）。
 - 不变量：配置校验失败不得进入装配（先校验后装配）；CLI 状态文件不是
   crate 层概念（crate 无 I/O）。
+
+### 冻结契约（真实数据面消费边界 P3.2，PRODUCT §12.17）
+
+- 装配语义扩展：`subnet up --tun` 时 `VirtualSubnetTunnel` 的 VPI 取
+  `WintunVpiAdapter`/`TunVpi`、carrier 取 `UdpCarrier`；其余装配不变（§12.16）。
+- carrier 契约：`PacketCarrier` 的帧是**封装后线格式**（wire frame），
+  `VirtualSubnetTunnel` 不感知 UDP 语义；`UdpCarrier::bind` 解析
+  `udp://<host>:<port>` 并绑定，`receive_into` 无数据 Ok(0)。
+- 不变量：CLI 装配失败（VPI/carrier 创建）不得落到状态文件写入；mock 与真实
+  数据面在 tunnel 层无分支（仅构造期选择）。

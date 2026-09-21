@@ -44,3 +44,9 @@ toml = "0.8"
 [dev-dependencies]
 # 仅示例/测试：本地 TLS server 自签证书（§11.14 E5 离线确定性闭环）。
 rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+
+[target.'cfg(windows)'.dependencies]
+nexus-platform-windows = { path = "../../crates/nexus-platform-windows" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nexus-platform-linux = { path = "../../crates/nexus-platform-linux" }

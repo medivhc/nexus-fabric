@@ -1308,3 +1308,30 @@ CLI 走进程内 SDK（同 `run` 路径），状态为本地文件（默认 `~/.
 - E4 场景：`log_level.toml`（id=`product.log-level`）--模块覆盖生效、未覆盖回退全局、
   enabled 阈值判断、set_global/set_module_level 动态调整、字符串解析。
 - 冻结边界（P2.3 不做）：真实接 `tracing`/`log` 后端、EnvFilter 热刷新、指标导出（留 TODO）。
+### 12.17 P3.2 真实 TUN 数据面驱动（2026-09-21） {#12-tun-dataplane}
+
+接 P3.1（§12.16 mock carrier 留真实 TUN 到 P3-2 的边界）：把"装配隧道"从
+内存 mock 升级为真实系统数据面。三层：
+
+- **真实承载** `UdpCarrier`（nexus-platform，实现 `PacketCarrier`）：标准 UDP
+  socket，非阻塞；locator 格式 `udp://<host>:<port>`（bind 解析并绑定、
+  send_to 按 locator 发、receive_into 收一帧，无数据 Ok(0)）。
+- **真实虚拟网卡**：
+  - Windows：复用 `nexus-platform-windows::WintunVpiAdapter`（窄 wintun C ABI
+    绑定已落地，§12.10 后 PRODUCT 记录）：加载签名 `wintun.dll`（wintun.net
+    分发）→ 创建命名 Layer3 适配器 → 会话读写 IP 帧；需管理员。
+  - Linux：新增 `nexus-platform-linux::TunVpi`（`/dev/net/tun` + ioctl，窄 FFI
+    unsafe 集中一个模块，仿 wintun.rs 纪律）；读写 IP 帧；需 root/cap_net_admin。
+- **CLI 装配**：`nexus subnet up --tun [--tun-name <n>] [--listen <locator>]` 用真实
+  `WintunVpiAdapter`/`TunVpi` + `UdpCarrier` 替代 `MemoryVpi` + `MeshCarrier`；
+  无 `--tun` 行为不变（§12.16 mock）。装配失败（dll 缺失 / 权限不足 /
+  驱动未安装）→ `{ verdict:"TUN_ERROR", error:"..." }`（exit 0 结构化）。
+  `--tun` 时本地 UDP 承载默认绑定 `udp://0.0.0.0:0`（OS 分配端口），可用
+  `--listen <locator>` 覆盖。
+- 冻结边界（P3.2 不做）：路由表/防火墙改写（§12.10 网络栈管理后置）、
+  DNS 覆写、多适配器管理、隧道持续运行（daemon 托管留 P3.3）。
+
+E4 场景 `tun_dataplane.toml`：UdpCarrier 本地回环收发对齐（E4 可离线闭环）、
+`--tun` 装配错误路径（无 dll/无权限 → TUN_ERROR 结构化）、Linux TunVpi
+参数校验纯逻辑。真实设备验收走 E5（Windows 真机：wintun.dll 安装 + 适配器
+创建 + 帧读写；管理员权限是前置条件）。

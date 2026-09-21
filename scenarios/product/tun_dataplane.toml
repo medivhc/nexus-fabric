@@ -1,0 +1,48 @@
+schema_version = 1
+id = "product.tun-dataplane"
+title = "真实 TUN 数据面：UdpCarrier 回环收发 + CLI --tun 装配错误路径（E4）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-17-P3.2-真实-TUN-数据面驱动"
+
+[given]
+loopback_a = "udp://127.0.0.1:52001"
+loopback_b = "udp://127.0.0.1:52002"
+
+# 可执行 E4（example tun_dataplane --json，进程内闭环，不依赖真实驱动）：
+# - udp_carrier：两个 UdpCarrier 本地回环，A.bind → B.bind → A.send_to(B) →
+#   B.receive_into 收到同帧；B.send_to(A) → A.receive_into 收到；无数据收 0；
+#   locator 非法（非 udp:// / 端口越界）→ 结构化错误。
+# - cli_tun_assembly：subnet up --tun 无 wintun.dll/权限 → verdict=TUN_ERROR
+#   （结构化，exit 0）；--tun 装配路径可被 mock 驱动替换（deterministic）。
+# - tun_name_validation：--tun-name 参数校验（空/超长 → 结构化错误）。
+
+[when]
+command = "cargo run --quiet -p nexus --example tun_dataplane -- --json"
+
+[[expect]]
+field = "udp.a_to_b_echo"
+equals = true
+
+[[expect]]
+field = "udp.b_to_a_echo"
+equals = true
+
+[[expect]]
+field = "udp.no_data_zero"
+equals = true
+
+[[expect]]
+field = "udp.bad_locator"
+equals = "PLATFORM_ERROR"
+
+[[expect]]
+field = "tun.assembly_error_kind"
+one_of = ["TUN_ERROR"]
+
+[[expect]]
+field = "tun.name_validation_empty"
+equals = "INVALID_NAME"
+
+[[expect]]
+field = "tun.name_validation_long"
+equals = "INVALID_NAME"

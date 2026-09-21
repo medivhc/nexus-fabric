@@ -20,7 +20,7 @@ pub const BACKEND: &str = "wintun";
 /// wintun 适配器会话（Adapter + Session + 模块句柄三合一所有权）。
 ///
 /// 生命周期（见 `wintun.rs` Safety Invariant）：
-/// `EndSession → CloseAdapter → FreeAdapter → (module Drop: FreeLibrary)`。
+/// `EndSession → CloseAdapter → (module Drop: FreeLibrary)`（wintun.h 0.14 无 FreeAdapter）。
 pub struct WintunVpiAdapter {
     module: WintunModule,
     adapter_handle: *mut c_void,
@@ -123,13 +123,12 @@ impl WintunVpiAdapter {
 impl Drop for WintunVpiAdapter {
     fn drop(&mut self) {
         let api = self.module.api();
-        // SAFETY：句柄均有效；严格按 EndSession → CloseAdapter → FreeAdapter
+        // SAFETY：句柄均有效；严格按 EndSession → CloseAdapter
         // 顺序释放（wintun 要求 session 先于 adapter 结束）。之后 WintunModule
         // 的 Drop 再 FreeLibrary，函数指针不再被使用。
         unsafe {
             (api.end_session)(self.session_handle);
             (api.close_adapter)(self.adapter_handle);
-            (api.free_adapter)(self.adapter_handle);
         }
     }
 }

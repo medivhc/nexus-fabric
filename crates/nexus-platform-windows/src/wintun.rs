@@ -8,7 +8,7 @@
 //! - **Safety Invariant**：`WintunModule` 持有 `HMODULE` 所有权；其 Drop
 //!   （`FreeLibrary`）必须在所有借用该模块函数指针的句柄（Adapter/Session）
 //!   释放之后发生。`WintunVpiAdapter` 以字段顺序保证：
-//!   `EndSession → CloseAdapter → FreeAdapter → (module Drop: FreeLibrary)`。
+//!   `EndSession → CloseAdapter → (module Drop: FreeLibrary)`（wintun.h 0.14 无 FreeAdapter，CloseAdapter 即关闭并释放）。
 //! - 本模块之外不扩散 unsafe；包长校验、错误映射等逻辑为纯函数，可单测。
 
 use nexus_platform::PlatformError;
@@ -37,8 +37,6 @@ type CreateAdapterFn = unsafe extern "system" fn(*const u16, *const u16, *const 
 type OpenAdapterFn = unsafe extern "system" fn(*const u16) -> Handle;
 /// `WintunCloseAdapter(HANDLE Adapter)`。
 type CloseAdapterFn = unsafe extern "system" fn(Handle);
-/// `WintunFreeAdapter(HANDLE Adapter) -> DWORD`（0 成功）。
-type FreeAdapterFn = unsafe extern "system" fn(Handle) -> u32;
 /// `WintunStartSession(HANDLE Adapter, DWORD Capacity) -> HANDLE`。
 type StartSessionFn = unsafe extern "system" fn(Handle, u32) -> Handle;
 /// `WintunEndSession(HANDLE Session)`。
@@ -60,7 +58,6 @@ pub(crate) struct WintunApi {
     pub create_adapter: CreateAdapterFn,
     pub open_adapter: OpenAdapterFn,
     pub close_adapter: CloseAdapterFn,
-    pub free_adapter: FreeAdapterFn,
     pub start_session: StartSessionFn,
     pub end_session: EndSessionFn,
     pub receive_packet: ReceivePacketFn,
@@ -154,7 +151,6 @@ fn build_api(loader: impl Fn(&[u8]) -> *mut c_void) -> Result<WintunApi, Platfor
         create_adapter: resolve!(CreateAdapterFn, "WintunCreateAdapter"),
         open_adapter: resolve!(OpenAdapterFn, "WintunOpenAdapter"),
         close_adapter: resolve!(CloseAdapterFn, "WintunCloseAdapter"),
-        free_adapter: resolve!(FreeAdapterFn, "WintunFreeAdapter"),
         start_session: resolve!(StartSessionFn, "WintunStartSession"),
         end_session: resolve!(EndSessionFn, "WintunEndSession"),
         receive_packet: resolve!(ReceivePacketFn, "WintunReceivePacket"),
@@ -206,7 +202,7 @@ mod tests {
         let api = build_api(|_| fake_ptr()).expect("all symbols resolve");
         assert_eq!(
             std::mem::size_of::<WintunApi>(),
-            std::mem::size_of::<[usize; 11]>()
+            std::mem::size_of::<[usize; 10]>()
         );
         let _ = api.create_adapter;
     }

@@ -18,7 +18,9 @@
 
 use nexus::control_service::{ControlServiceImpl, render_text};
 use nexus::localapi_client::{self, DEFAULT_LOCALAPI_ADDR};
-use nexus::subnet_cli::{default_state_path, subnet_leave, subnet_status, subnet_up};
+use nexus::subnet_cli::{
+    default_state_path, subnet_leave, subnet_status, subnet_up, subnet_up_tun,
+};
 use nexus_control_api::{ControlCommand, ResourceId, SessionId};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -239,6 +241,9 @@ fn run_subnet(args: &[String], json_mode: bool) -> i32 {
     };
     let mut config: Option<PathBuf> = None;
     let mut state: Option<PathBuf> = None;
+    let mut tun = false;
+    let mut tun_name: Option<String> = None;
+    let mut listen: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -258,6 +263,26 @@ fn run_subnet(args: &[String], json_mode: bool) -> i32 {
                 state = Some(PathBuf::from(v));
                 i += 2;
             }
+            "--tun" => {
+                tun = true;
+                i += 1;
+            }
+            "--tun-name" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("error: missing value for --tun-name");
+                    return 2;
+                };
+                tun_name = Some(v.clone());
+                i += 2;
+            }
+            "--listen" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("error: missing value for --listen");
+                    return 2;
+                };
+                listen = Some(v.clone());
+                i += 2;
+            }
             other if other.starts_with("--") => {
                 eprintln!("error: unknown option: {other}");
                 return 2;
@@ -275,13 +300,22 @@ fn run_subnet(args: &[String], json_mode: bool) -> i32 {
                 eprintln!("error: subnet up requires --config <path>");
                 return 2;
             };
-            match subnet_up(&cfg, &state_path) {
-                Ok(v) => v,
-                Err(e) => serde_json::json!({
-                    "verdict": "CONFIG_ERROR",
-                    "command": "subnet up",
-                    "error": e,
-                }),
+            if tun {
+                let name = tun_name.unwrap_or_else(|| "nexus0".to_string());
+                let lsn = listen.unwrap_or_else(|| "udp://0.0.0.0:0".to_string());
+                match subnet_up_tun(&cfg, &state_path, &name, &lsn) {
+                    Ok(v) => v,
+                    Err(e) => nexus::subnet_cli::classify_tun_error(&e),
+                }
+            } else {
+                match subnet_up(&cfg, &state_path) {
+                    Ok(v) => v,
+                    Err(e) => serde_json::json!({
+                        "verdict": "CONFIG_ERROR",
+                        "command": "subnet up",
+                        "error": e,
+                    }),
+                }
             }
         }
         "status" => subnet_status(&state_path),

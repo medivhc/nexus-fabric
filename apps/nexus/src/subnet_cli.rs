@@ -11,8 +11,12 @@ use nexus_connectivity::encryption::EncryptionConfig;
 use nexus_connectivity::virtual_subnet::{
     MemoryVpi, MeshCarrier, TunnelPeer, TunnelState, VirtualSubnetConfig, VirtualSubnetTunnel,
 };
+use nexus_platform::{PacketCarrier, UdpCarrier, VirtualPacketInterface};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// TUN 接口名最大字节数（对齐 Linux IFNAMSIZ-1 与 wintun 名称约束）。
+pub const MAX_TUN_NAME_BYTES: usize = 15;
 
 /// 子网 TOML 配置（`[subnet]` 表）。
 #[derive(Debug, Clone, Deserialize)]
@@ -166,49 +170,14 @@ fn validate(config: &SubnetConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// 按已校验配置装配隧道（MeshCarrier mock carrier）。
-fn assemble(config: &SubnetConfig) -> Result<VirtualSubnetTunnel, String> {
-    let s = &config.subnet;
-    let mut tunnel = VirtualSubnetTunnel::new(
-        VirtualSubnetConfig::new(s.cidr.clone(), s.virtual_ip.clone()),
-        Box::new(MemoryVpi::new()),
-        Box::new(MeshCarrier::new()),
-    );
-    for peer in &s.peers {
-        tunnel
-            .add_peer(TunnelPeer::new(
-                peer.virtual_ip.clone(),
-                peer.locator.clone(),
-            ))
-            .map_err(|e| e.to_string())?;
-        tunnel.set_peer_state(&peer.virtual_ip, TunnelState::Connected);
-    }
-    for route in &s.routes {
-        tunnel
-            .add_route(route.dst.clone(), route.next_hop.clone())
-            .map_err(|e| e.to_string())?;
-    }
-    for route in &s.prefix_routes {
-        tunnel
-            .add_prefix_route(&route.cidr, route.next_hop.clone())
-            .map_err(|e| e.to_string())?;
-    }
-    for cidr in &s.local_prefixes {
-        tunnel.add_local_prefix(cidr).map_err(|e| e.to_string())?;
-    }
-    for vip in &s.egress {
-        tunnel.mark_egress(vip.clone()).map_err(|e| e.to_string())?;
-    }
-    if s.encryption {
-        tunnel.enable_encryption(EncryptionConfig::default());
-    }
-    Ok(tunnel)
-}
-
 /// `subnet up --config <path>`：校验 → 装配 → 写状态文件。
 pub fn subnet_up(config_path: &Path, state_path: &Path) -> Result<Value, String> {
     let config = parse_config(config_path)?;
-    let _tunnel = assemble(&config)?;
+    let _tunnel = assemble_with(
+        &config,
+        Box::new(MemoryVpi::new()),
+        Box::new(MeshCarrier::new()),
+    )?;
     let s = &config.subnet;
     let state = SubnetState {
         up: true,
@@ -281,4 +250,125 @@ pub fn subnet_leave(state_path: &Path) -> Value {
         "command": "subnet leave",
         "subnet": { "left": left },
     })
+}
+
+/// 校验 TUN 接口名（纯函数，P3.2）：非空、≤15 字节、不含 NUL。
+pub fn validate_tun_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("INVALID_NAME: tun name is empty".into());
+    }
+    if name.len() > MAX_TUN_NAME_BYTES {
+        return Err(format!(
+            "INVALID_NAME: tun name too long: {} bytes (max {MAX_TUN_NAME_BYTES})",
+            name.len()
+        ));
+    }
+    if name.contains('\0') {
+        return Err("INVALID_NAME: tun name contains NUL".into());
+    }
+    Ok(())
+}
+
+/// `--tun` 装配错误分类（纯函数，确定性测试）：VPI/carrier 创建错误 →
+/// `{ verdict:"TUN_ERROR", command:"subnet up", error }`。
+pub fn classify_tun_error(err: &str) -> Value {
+    serde_json::json!({
+        "verdict": "TUN_ERROR",
+        "command": "subnet up",
+        "error": err,
+    })
+}
+
+/// 按已校验配置装配隧道（可指定 VPI 与 carrier，P3.2 真实数据面）。
+fn assemble_with(
+    config: &SubnetConfig,
+    vpi: Box<dyn VirtualPacketInterface>,
+    carrier: Box<dyn PacketCarrier>,
+) -> Result<VirtualSubnetTunnel, String> {
+    let s = &config.subnet;
+    let mut tunnel = VirtualSubnetTunnel::new(
+        VirtualSubnetConfig::new(s.cidr.clone(), s.virtual_ip.clone()),
+        vpi,
+        carrier,
+    );
+    for peer in &s.peers {
+        tunnel
+            .add_peer(TunnelPeer::new(
+                peer.virtual_ip.clone(),
+                peer.locator.clone(),
+            ))
+            .map_err(|e| e.to_string())?;
+        tunnel.set_peer_state(&peer.virtual_ip, TunnelState::Connected);
+    }
+    for route in &s.routes {
+        tunnel
+            .add_route(route.dst.clone(), route.next_hop.clone())
+            .map_err(|e| e.to_string())?;
+    }
+    for route in &s.prefix_routes {
+        tunnel
+            .add_prefix_route(&route.cidr, route.next_hop.clone())
+            .map_err(|e| e.to_string())?;
+    }
+    for cidr in &s.local_prefixes {
+        tunnel.add_local_prefix(cidr).map_err(|e| e.to_string())?;
+    }
+    for vip in &s.egress {
+        tunnel.mark_egress(vip.clone()).map_err(|e| e.to_string())?;
+    }
+    if s.encryption {
+        tunnel.enable_encryption(EncryptionConfig::default());
+    }
+    Ok(tunnel)
+}
+
+/// `subnet up --tun`：真实 VPI（Windows wintun / Linux tun）+ 真实 UDP 承载。
+///
+/// 失败（dll 缺失 / 权限不足 / 驱动未安装 / 设备创建失败）→ `TUN_ERROR`
+/// 结构化（exit 0）。成功输出含 `local_locator`（本地承载实际绑定地址）。
+#[cfg(windows)]
+pub fn subnet_up_tun(
+    config_path: &Path,
+    state_path: &Path,
+    tun_name: &str,
+    listen: &str,
+) -> Result<Value, String> {
+    validate_tun_name(tun_name)?;
+    let config = parse_config(config_path)?;
+    let mut carrier = UdpCarrier::new();
+    let bound = carrier
+        .bind(listen)
+        .map_err(|e| format!("TUN_ERROR: udp bind: {e}"))?;
+    let vpi = nexus_platform_windows::WintunVpiAdapter::create(tun_name, "Nexus")
+        .map_err(|e| format!("TUN_ERROR: wintun create: {e}"))?;
+    let _tunnel = assemble_with(&config, Box::new(vpi), Box::new(carrier))?;
+    let mut out = subnet_up(config_path, state_path)?;
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("local_locator".into(), serde_json::json!(bound));
+    }
+    Ok(out)
+}
+
+/// `subnet up --tun`（Linux 实现：/dev/net/tun + UDP 承载）。
+#[cfg(target_os = "linux")]
+pub fn subnet_up_tun(
+    config_path: &Path,
+    state_path: &Path,
+    tun_name: &str,
+    listen: &str,
+) -> Result<Value, String> {
+    validate_tun_name(tun_name)?;
+    let config = parse_config(config_path)?;
+    let mut carrier = UdpCarrier::new();
+    let bound = carrier
+        .bind(listen)
+        .map_err(|e| format!("TUN_ERROR: udp bind: {e}"))?;
+    let vpi = nexus_platform_linux::TunVpi::create(tun_name)
+        .map_err(|e| format!("TUN_ERROR: tun create: {e}"))?;
+    let _tunnel = assemble_with(&config, Box::new(vpi), Box::new(carrier))?;
+    let mut out = subnet_up(config_path, state_path)?;
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("local_locator".into(), serde_json::json!(bound));
+    }
+    Ok(out)
 }

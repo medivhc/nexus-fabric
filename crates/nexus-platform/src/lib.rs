@@ -78,6 +78,8 @@ pub trait VirtualPacketInterface: Send {
 /// - VPI 只负责读写 IP 包（进/出虚拟网卡），不含加密与打洞；
 /// - `PacketCarrier` 只负责封装帧的发送/接收（UDP/隧道承载），不感知 IP 语义；
 /// - 加密、建连、认证门控等编排由 `nexus-connectivity` 层消费这两个 trait。
+pub mod udp_carrier;
+
 pub trait PacketCarrier: Send {
     /// 绑定本地地址/端口（打洞或会话建立前）。返回本地 locator。
     fn bind(&mut self, local_locator: &str) -> Result<String, PlatformError>;
@@ -93,3 +95,4 @@ pub trait TransparentIngressProvider: Send {
     fn start(&mut self) -> Result<(), PlatformError>;
     fn stop(&mut self) -> Result<(), PlatformError>;
 }
+pub use udp_carrier::UdpCarrier;

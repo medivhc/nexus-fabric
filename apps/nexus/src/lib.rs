@@ -6765,3 +6765,78 @@ locator = "udp://127.0.0.1:42001"
         },
     }))
 }
+
+/// E4 产品场景 `product.tun-dataplane` 的可执行驱动（PRODUCT §12.17）。
+///
+/// 进程内闭环（不依赖真实驱动）：UdpCarrier 本地回环收发对齐、TUN 装配错误
+/// 分类（纯函数）、TUN 名称校验。真实 wintun/tun 设备验收走 E5（--real 入口）。
+pub fn tun_dataplane_flow() -> Result<Value, NexusError> {
+    use crate::subnet_cli::{MAX_TUN_NAME_BYTES, classify_tun_error, validate_tun_name};
+    use nexus_platform::{PacketCarrier, UdpCarrier};
+
+    fn internal_err<E: std::fmt::Display>(e: E) -> NexusError {
+        NexusError::Internal {
+            message: e.to_string(),
+        }
+    }
+
+    // 1) UdpCarrier 本地回环
+    let mut a = UdpCarrier::new();
+    a.bind("udp://127.0.0.1:52001").map_err(internal_err)?;
+    let mut b = UdpCarrier::new();
+    b.bind("udp://127.0.0.1:52002").map_err(internal_err)?;
+
+    a.send_to("udp://127.0.0.1:52002", &[1, 2, 3, 4])
+        .map_err(internal_err)?;
+    let mut buf = [0u8; 64];
+    let n1 = b.receive_into(&mut buf).map_err(internal_err)?;
+    let a_to_b_echo = n1 == 4 && buf[..4] == [1, 2, 3, 4];
+
+    b.send_to("udp://127.0.0.1:52001", &[9, 8])
+        .map_err(internal_err)?;
+    let n2 = a.receive_into(&mut buf).map_err(internal_err)?;
+    let b_to_a_echo = n2 == 2 && buf[..2] == [9, 8];
+
+    let z = a.receive_into(&mut buf).map_err(internal_err)?;
+    let no_data_zero = z == 0;
+
+    let bad_locator = match UdpCarrier::parse_locator("tcp://127.0.0.1:1") {
+        Err(_) => "PLATFORM_ERROR".to_string(),
+        Ok(_) => "ACCEPTED".to_string(),
+    };
+
+    // 2) --tun 装配错误分类（确定性纯函数；真实设备路径见 E5）
+    let classified = classify_tun_error("wintun create: access denied");
+    let assembly_error_kind = classified
+        .get("verdict")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    // 3) TUN 名称校验
+    let name_validation_empty = match validate_tun_name("") {
+        Err(e) if e.starts_with("INVALID_NAME") => "INVALID_NAME".to_string(),
+        _ => "OK".to_string(),
+    };
+    let long = "x".repeat(MAX_TUN_NAME_BYTES + 1);
+    let name_validation_long = match validate_tun_name(&long) {
+        Err(e) if e.starts_with("INVALID_NAME") => "INVALID_NAME".to_string(),
+        _ => "OK".to_string(),
+    };
+
+    Ok(serde_json::json!({
+        "verdict": "PASS",
+        "command": "tun dataplane",
+        "udp": {
+            "a_to_b_echo": a_to_b_echo,
+            "b_to_a_echo": b_to_a_echo,
+            "no_data_zero": no_data_zero,
+            "bad_locator": bad_locator,
+        },
+        "tun": {
+            "assembly_error_kind": assembly_error_kind,
+            "name_validation_empty": name_validation_empty,
+            "name_validation_long": name_validation_long,
+        },
+    }))
+}

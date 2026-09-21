@@ -250,6 +250,8 @@ dependencies = [
  "nexus-outbound-vmess",
  "nexus-planner",
  "nexus-platform",
+ "nexus-platform-linux",
+ "nexus-platform-windows",
  "nexus-policy",
  "nexus-proxy",
  "nexus-proxy-config",

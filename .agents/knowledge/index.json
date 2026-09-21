@@ -22,5 +22,13 @@
     "module": "apps/nexus",
     "category": "implementation-pattern",
     "summary": "Http204LatencyProbe：trait 不加 kind() 保持 portable，probe_kind 作参数由组合根传入；BufRead trait 必须显式导入"
+  },
+  {
+    "id": "vsub-mesh-001",
+    "file": "entries/2026-09-20-virtual-subnet-static-routing.md",
+    "date": "2026-09-20",
+    "module": "nexus-connectivity",
+    "category": "implementation-pattern",
+    "summary": "P1 静态路由三节点转发：路由表 next_hop 配置、帧头不改只改物理下一跳、直连优先于路由表、MeshCarrier 多对端测试替身、scenario JSON 字段必须嵌套"
   }
 ]
