@@ -34,6 +34,7 @@ fn main() -> ExitCode {
         Some("host") => host_resource(&args[1..]),
         Some("relay") => relay_resource(&args[1..]),
         Some("proxy") => proxy_resource(&args[1..]),
+        Some("subnet") => dispatch_subnet(&args[1..]),
         // §9 可观察性子命令：首个 token 命中即路由（透传完整命令，含 verb）。
         Some(verb) if is_observability_verb(verb) => dispatch_observability(&args),
         _ => {
@@ -122,6 +123,69 @@ fn dispatch_observability(args: &[String]) -> ExitCode {
         }
     };
     print_json_result(result.map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())))
+}
+
+/// P3.5（§12.32）：nexusd 托管 subnet（daemon 组合根直接调用 subnet_cli）。
+fn dispatch_subnet(args: &[String]) -> ExitCode {
+    let Some(sub) = args.first().map(String::as_str) else {
+        eprintln!(
+            "usage: nexusd subnet <up|status|leave> [--config <path>] [--state <path>] [--encrypt-state] [--foreground] [--json]"
+        );
+        return ExitCode::FAILURE;
+    };
+    let flags = parse_flags(args);
+    let state_path = flags
+        .get("--state")
+        .and_then(|v| v.as_deref())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(nexus::subnet_cli::default_state_path);
+    match sub {
+        "up" => {
+            let Some(cfg) = flags.get("--config").and_then(|v| v.as_deref()) else {
+                eprintln!("error: nexusd subnet up requires --config <path>");
+                return ExitCode::FAILURE;
+            };
+            let cfg = std::path::PathBuf::from(cfg);
+            let encrypt = flags.contains_key("--encrypt-state");
+            if flags.contains_key("--foreground") {
+                // 常驻：装配持有隧道，直到 leave 信号（状态文件删除）→ 优雅退出 0
+                match subnet_foreground(&cfg, &state_path, encrypt) {
+                    Ok(code) => ExitCode::from(code),
+                    Err(e) => print_json_result(Err(e)),
+                }
+            } else {
+                let result = nexus::subnet_cli::subnet_up(&cfg, &state_path, encrypt)
+                    .map_err(|e| ("CONFIG_ERROR".to_string(), e));
+                print_json_result(result)
+            }
+        }
+        "status" => print_json_result(Ok(nexus::subnet_cli::subnet_status(&state_path))),
+        "leave" => print_json_result(Ok(nexus::subnet_cli::subnet_leave(&state_path))),
+        other => {
+            eprintln!("error: unknown nexusd subnet subcommand: {other}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// P3.5 常驻运行循环：持有隧道（进程为 Owner，随 drop 清理），
+/// 轮询 leave 信号（状态文件被删除）→ 优雅退出 0。
+fn subnet_foreground(
+    cfg: &std::path::Path,
+    state_path: &std::path::Path,
+    encrypt: bool,
+) -> Result<u8, (String, String)> {
+    let _tunnel = nexus::subnet_cli::assemble_default_tunnel(cfg)
+        .map_err(|e| ("CONFIG_ERROR".to_string(), e))?;
+    let up = nexus::subnet_cli::subnet_up(cfg, state_path, encrypt)
+        .map_err(|e| ("CONFIG_ERROR".to_string(), e))?;
+    println!("{up}");
+    loop {
+        if !state_path.exists() {
+            return Ok(0);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 }
 
 /// 路由资源名到 SDK 组合根闭环；带 `--endpoint` 时走真实网络访问（real transport）。

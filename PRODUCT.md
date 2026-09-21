@@ -1512,3 +1512,24 @@ E4 场景 `secure_store.toml`：DPAPI put/get 往返 + 缺失键 Ok(None)（Wind
   Linux 侧格式/纯逻辑平台无关（真实 `/etc/machine-id` 走 E5）。
 - 冻结边界（P3.4 不做）：状态文件迁移（明文→加密自动转换）、密钥轮换
   （§12.30）、多用户密钥共享、加密状态文件备份恢复。
+
+### 12.32 P3.5 nexusd 托管 subnet 常驻（2026-09-21）{#12-subnet-daemon}
+
+nexusd（daemon 组合根）接入 subnet 真实路径：隧道由 daemon 生命周期持有，
+为 serve 常驻控制通道铺路。
+
+- `nexusd subnet up --config <path> [--state <path>] [--encrypt-state] [--foreground]`：
+  daemon 组合根直接调用 §12.28/§12.31 语义（TOML 校验 → 装配 → 状态文件，
+  `--encrypt-state` 加密落盘）。默认一次性执行（与 `nexus subnet up` 行为一致）；
+  `--foreground` 时装配后**常驻**：隧道对象由 daemon 进程持有（进程是 owner），
+  持续运行直到 leave 信号（状态文件被删除）或 SIGTERM/Ctrl-C → 优雅退出。
+- `nexusd subnet status [--state <path>]` / `nexusd subnet leave [--state <path>]`：
+  复用 §12.28/§12.31（自动检测加密格式、STORE_ERROR、明文兼容）。
+- **隧道生命周期骨架**：daemon 进程内 `SubnetRuntime` 为隧道唯一 Owner
+  （AGENTS §13 结构化并发：up 注册、leave 注销、进程退出随 drop 清理）。
+  `--foreground` 常驻进程退出码：正常 leave → 0；被信号终止 → 128+signal。
+- E4 场景：`subnet_daemon.toml`（example 进程内 spawn `nexusd subnet up --foreground`
+  子进程）——up 后状态文件就绪、`nexusd subnet status` 读回字段一致、
+  leave（删除状态文件）后子进程退出、退出后 status → DOWN。
+- 冻结边界（P3.5 不做）：daemon serve 控制通道（localapi 常驻命令）、
+  隧道热重载、多隧道并发管理、崩溃恢复（§15 冷启动对账）。

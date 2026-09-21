@@ -407,6 +407,17 @@ fn assemble_with(
     Ok(tunnel)
 }
 
+/// P3.5（§12.32）：daemon 组合根默认装配（MemoryVpi + MeshCarrier），
+/// 返回隧道对象供 nexusd 常驻持有（进程为 Owner，随 drop 清理）。
+pub fn assemble_default_tunnel(config_path: &Path) -> Result<VirtualSubnetTunnel, String> {
+    let config = parse_config(config_path)?;
+    assemble_with(
+        &config,
+        Box::new(MemoryVpi::new()),
+        Box::new(MeshCarrier::new()),
+    )
+}
+
 /// `subnet up --tun`：真实 VPI（Windows wintun / Linux tun）+ 真实 UDP 承载。
 ///
 /// 失败（dll 缺失 / 权限不足 / 驱动未安装 / 设备创建失败）→ `TUN_ERROR`
