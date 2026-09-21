@@ -2,7 +2,7 @@ schema_version = 1
 id = "product.cli-subnet"
 title = "子网 CLI：TOML 配置装配 + up/status/leave 状态闭环（E4）"
 evidence_strength = "E4"
-requirement = "PRODUCT.md#12-16-P3.1-子网-CLI-与-TOML-配置"
+requirement = "PRODUCT.md#12-subnet-cli"
 
 [given]
 subnet_cidr = "10.99.0.0/24"

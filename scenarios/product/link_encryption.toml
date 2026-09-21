@@ -2,7 +2,7 @@ schema_version = 1
 id = "product.link-encryption"
 title = "WireGuard 风格链路加密：握手派生会话密钥 -> 数据帧 AEAD 加解密 -> 防重放与错误密钥拒绝闭环"
 evidence_strength = "E4"
-requirement = "PRODUCT.md#6"
+requirement = "PRODUCT.md#remote"
 
 [given]
 topology = "two-peers-in-memory"

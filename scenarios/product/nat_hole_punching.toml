@@ -2,7 +2,7 @@ schema_version = 1
 id = "product.nat-hole-punching"
 title = "NAT 打洞：STUN 映射获取 + UDP 打洞建连"
 evidence_strength = "E4"
-requirement = "PRODUCT.md#connectivity"
+requirement = "PRODUCT.md#remote"
 
 [given]
 resource = "p2p-direct"

@@ -2,7 +2,7 @@ schema_version = 1
 id = "product.virtual-subnet-tunnel"
 title = "两节点虚拟子网点对点隧道闭环（VPI 包往返）"
 evidence_strength = "E4"
-requirement = "PRODUCT.md#12-虚拟子网组网"
+requirement = "PRODUCT.md#12-virtual-subnet-networking"
 
 [given]
 subnet_cidr = "10.0.0.0/24"

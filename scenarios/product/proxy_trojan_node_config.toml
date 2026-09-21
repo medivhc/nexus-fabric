@@ -2,7 +2,7 @@ schema_version = 1
 id = "product.proxy-trojan-node-config"
 title = "Trojan 节点配置解析（两节点 + 缺 password 拒绝）"
 evidence_strength = "E4"
-requirement = "PRODUCT.md#11.9.3"
+requirement = "PRODUCT.md#11-trojan-node-config"
 
 [given]
 topology = "offline pure YAML->typed structs parse; no network"

@@ -1,4 +1,4 @@
-//! E4 产品场景 `product.tun-dataplane` 的可执行驱动（PRODUCT §12.17）。
+//! E4 产品场景 `product.tun-dataplane` 的可执行驱动（PRODUCT §12.29）。
 //!
 //! 由 `scenarios/product/tun_dataplane.toml` 的 [when].command 调用：
 //!

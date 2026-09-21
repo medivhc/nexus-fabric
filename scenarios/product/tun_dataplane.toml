@@ -2,7 +2,7 @@ schema_version = 1
 id = "product.tun-dataplane"
 title = "真实 TUN 数据面：UdpCarrier 回环收发 + CLI --tun 装配错误路径（E4）"
 evidence_strength = "E4"
-requirement = "PRODUCT.md#12-17-P3.2-真实-TUN-数据面驱动"
+requirement = "PRODUCT.md#12-tun-dataplane"
 
 [given]
 loopback_a = "udp://127.0.0.1:52001"

@@ -2,7 +2,7 @@ schema_version = 1
 id = "product.dns-exit-binding"
 title = "DNS 子系统：解析→缓存→环路守卫→RDRC 负缓存→Exit-DNS Binding 进入 NetworkPlanExtension"
 evidence_strength = "E4"
-requirement = "PRODUCT.md#2-network"
+requirement = "PRODUCT.md#network"
 
 [given]
 resolver = "memory-mock (example.com -> 93.184.216.34 / 2606:2800:220:1:248:1893:25c8:1946; blacklisted.internal -> REFUSED)"

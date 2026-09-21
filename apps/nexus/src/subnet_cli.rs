@@ -1,4 +1,4 @@
-//! P3.1 子网 CLI（PRODUCT §12.16）：TOML 配置 → VirtualSubnetTunnel 装配 + 状态文件。
+//! P3.1 子网 CLI（PRODUCT §12.28）：TOML 配置 → VirtualSubnetTunnel 装配 + 状态文件。
 //!
 //! Composition Root 层（apps/nexus 允许 I/O）：配置校验 → 进程内装配（MeshCarrier
 //! mock carrier，真实 TUN 留 P3-2）→ 状态写入本地文件（默认 `~/.nexus/subnet.json`，

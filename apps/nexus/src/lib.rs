@@ -6766,7 +6766,7 @@ locator = "udp://127.0.0.1:42001"
     }))
 }
 
-/// E4 产品场景 `product.tun-dataplane` 的可执行驱动（PRODUCT §12.17）。
+/// E4 产品场景 `product.tun-dataplane` 的可执行驱动（PRODUCT §12.29）。
 ///
 /// 进程内闭环（不依赖真实驱动）：UdpCarrier 本地回环收发对齐、TUN 装配错误
 /// 分类（纯函数）、TUN 名称校验。真实 wintun/tun 设备验收走 E5（--real 入口）。

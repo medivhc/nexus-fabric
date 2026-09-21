@@ -2,7 +2,7 @@ schema_version = 1
 id = "product.multihop-routing"
 title = "四节点线性拓扑距离矢量多跳路由闭环（A-B-C-D，3 跳可达）"
 evidence_strength = "E4"
-requirement = "PRODUCT.md#12-6-P1-1-多跳动态路由距离矢量"
+requirement = "PRODUCT.md#12-multihop-routing"
 
 [given]
 topology = "linear"

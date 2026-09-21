@@ -2,7 +2,7 @@ schema_version = 1
 id = "product.remote-nat-relay-fallback-flow"
 title = "Node B 位于 NAT 后：Direct 不可达时回退 Relay 中继完成远程闭环"
 evidence_strength = "E4"
-requirement = "PRODUCT.md#6-remote"
+requirement = "PRODUCT.md#remote"
 
 [given]
 requester = "node-a"

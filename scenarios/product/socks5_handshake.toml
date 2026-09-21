@@ -2,7 +2,7 @@ schema_version = 1
 id = "product.socks5-handshake"
 title = "SOCKS5 有状态握手状态机：分步喂字节推进 Greeting→Method→Request→Established，失败路径结构化"
 evidence_strength = "E4"
-requirement = "PRODUCT.md#2-network"
+requirement = "PRODUCT.md#network"
 
 [given]
 protocol = "socks5-rfc1928-rfc1929"

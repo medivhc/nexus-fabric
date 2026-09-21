@@ -2,7 +2,7 @@ schema_version = 1
 id = "product.proxy-trojan-auth-rejected"
 title = "Trojan 错密码结构化拒绝（AUTH_DENIED，TLS 通过但不中继）"
 evidence_strength = "E4"
-requirement = "PRODUCT.md#11.9"
+requirement = "PRODUCT.md#11-trojan"
 
 [given]
 topology = "same-process loopback 127.0.0.1: trojan server + trojan client (wrong password)"

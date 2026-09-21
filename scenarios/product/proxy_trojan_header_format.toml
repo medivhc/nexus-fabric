@@ -2,7 +2,7 @@ schema_version = 1
 id = "product.proxy-trojan-header-format"
 title = "Trojan 请求头格式兼容（Singbox 命令字节 + Standard 回归）"
 evidence_strength = "E4"
-requirement = "PRODUCT.md#11.9.2"
+requirement = "PRODUCT.md#11-trojan-header-format"
 
 [given]
 topology = "same-process loopback 127.0.0.1: TLS server + TLS client (rustls/ring), rcgen self-signed"

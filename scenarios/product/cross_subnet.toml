@@ -2,7 +2,7 @@ schema_version = 1
 id = "product.cross-subnet"
 title = "跨子网路由与出口节点：CIDR 前缀匹配 + 最长前缀 + 出口兜底（E4）"
 evidence_strength = "E4"
-requirement = "PRODUCT.md#12-14-P2-5-跨子网路由与出口节点"
+requirement = "PRODUCT.md#12-cross-subnet"
 
 [given]
 subnet_cidr = "10.99.0.0/24"

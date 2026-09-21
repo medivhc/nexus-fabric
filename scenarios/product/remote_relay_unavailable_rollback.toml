@@ -2,7 +2,7 @@ schema_version = 1
 id = "product.remote-relay-unavailable-rollback"
 title = "Direct 与 Relay 均不可达：Link Activation 结构化失败并回滚"
 evidence_strength = "E4"
-requirement = "PRODUCT.md#6-remote"
+requirement = "PRODUCT.md#remote"
 
 [given]
 requester = "node-a"

@@ -2,7 +2,7 @@ schema_version = 1
 id = "platform.workspace-projection-fallback"
 title = "无 Mount 平台仍可通过 Materialization/Native API 使用 Workspace"
 evidence_strength = "E4"
-requirement = "PRODUCT.md#4-Workspace"
+requirement = "PRODUCT.md#workspace"
 
 [given]
 native_mount = false

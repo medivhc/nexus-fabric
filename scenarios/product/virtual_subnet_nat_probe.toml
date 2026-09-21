@@ -2,7 +2,7 @@ schema_version = 1
 id = "product.virtual-subnet-nat-probe"
 title = "NAT 打洞集成：成功直连 / 失败 Relay 回退（数据面闭环双路径）"
 evidence_strength = "E4"
-requirement = "PRODUCT.md#12-9-P2-2-NAT-打洞集成"
+requirement = "PRODUCT.md#12-nat-probe"
 
 [given]
 subnet_cidr = "10.0.0.0/24"

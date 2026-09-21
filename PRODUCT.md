@@ -16,7 +16,7 @@ Compute
 
 这些是产品分类，不是互相割裂的底层系统。
 
-## 2. Network / InternetAccess
+## 2. Network / InternetAccess {#network}
 
 Network Resource 必须支持：
 
@@ -45,7 +45,7 @@ Service 是 Resource。
 
 `connect` 建立 Nexus-aware Service Session；`forward` 创建本地 listener 并把本地连接映射到 Service Session。对非 loopback 的监听必须显式授权。
 
-## 4. Workspace
+## 4. Workspace {#workspace}
 
 Workspace 是版本化、内容寻址、支持离线分叉的 Data Resource。
 
@@ -103,7 +103,7 @@ Platform Capability
 
 Write-back 必须创建新 Workspace Commit，而不是修改 pinned Snapshot。
 
-## 6. 远程资源访问（Remote Resource Access）
+## 6. 远程资源访问（Remote Resource Access） {#remote}
 
 Nexus 允许一个节点作为请求方，通过标准 Intent 访问另一个节点（提供方）上的资源。远程访问复用单节点流水线：
 
@@ -123,7 +123,7 @@ Resolve -> Plan -> Session -> Connectivity -> Execute -> Observe
 - 真实网络交付（real transport）：远端闭环除进程内组合根外，提供真实 TCP 交付形态——提供方 `host` 在真实地址监听并完成**服务端**认证门控（`AUTH` 帧在业务帧前，失败返回 `AUTH_DENIED`）；请求方经静态发现解析真实 Endpoint 后建立真实帧流并执行线上认证；直连不可达时经真实 `relay`（`DIAL` + 字节中继）回退。wire 应用帧（AUTH/AUTH_OK/AUTH_DENIED/CONNECT/READY/ECHO/COMPUTE/RESULT/HTTP/DIAL/RELAY_OK）为应用层协议，传输帧格式仍冻结为 TCP + u32 大端长度前缀。
 - 链路加密（link encryption，WireGuard 风格，`nexus-connectivity::encryption`）：每个节点持有长期 X25519 密钥对；Direct 与 Relay 通道在建链后、承载业务帧之前必须完成一次握手——握手双方交换公钥并经 X25519 ECDH + HKDF-SHA256 派生一次性 `SessionKey`；**握手成功前不允许发送任何业务帧**，会话密钥每次握手重新派生、不复用长期私钥。数据帧使用 AEAD（ChaCha20Poly1305）加密并携带显式 64 位序号；接收方经滑动窗口做防重放校验，序号过旧或重复一律拒绝，且密文 tag 校验失败即整帧丢弃（不暴露明文）。P0 先交付全内存 mock 骨架与 E4 闭环，真实线上传输、握手重传与密钥周期轮换留 TODO。
 
-## 7. Session 语义
+## 7. Session 语义 {#session}
 
 Session 使用双轨状态：
 
@@ -137,7 +137,7 @@ Unfinished | Completed | Failed | Cancelled
 
 Completed/Failed/Cancelled 只能提交一次；资源清理可以在 Outcome 确定后继续，最终 LifecyclePhase 到达 Disposed。
 
-## 8. 跨平台产品语义
+## 8. 跨平台产品语义 {#cross-platform}
 
 Nexus 保证 Semantic Portability，而不是强迫所有平台 API 一致。
 
@@ -160,7 +160,7 @@ native API
 
 平台缺少某项能力时，必须返回明确的 Capability Unsupported 或选择文档化降级路径，不能静默改变产品语义。
 
-## 9. 可观察性
+## 9. 可观察性 {#9-observability}
 
 关键 Resource/Session 必须可被 CLI/GUI/Agent 观察。
 
@@ -205,7 +205,7 @@ PRODUCT §9）。
 - `workspace cache`：输出内容存储缓存快照——对象计数、protected roots 计数与
   GC 保留期语义（mark_roots + sweep_older_than）。
 
-### 9.1 CLI 前端接线与双输出（2026-09-18 冻结；2026-09-20 requirement-change：thin-client）
+### 9.1 CLI 前端接线与双输出（2026-09-18 冻结；2026-09-20 requirement-change：thin-client） {#cli}
 
 - `nexus` CLI 为 **thin-client**：观察命令经 `--addr`（默认 `127.0.0.1:18080`）查询
   `nexusd serve` 的 HTTP LocalAPI，数据只来自 daemon 的 `observability` 快照
@@ -371,7 +371,7 @@ wasm32-wasip1`），结论据真实命令输出，非预判：
 **结论：rcgen 评审通过，采用 rcgen 动态自签测试证书**（不落固定 PEM fixture）。Trojan
 六项评审通过，从「CONDITIONAL 后置」转为「进入实现阶段」；hysteria2 维持后置不变。
 
-### 11.5 DNS 多 server 规则路由（multi-server DNS rule routing，2026-09-18）
+### 11.5 DNS 多 server 规则路由（multi-server DNS rule routing，2026-09-18） {#11-dns}
 
 在既有单 server Exit-DNS Binding 之外，把 DNS 解析推广为「多 server + 按域名规则选择本次
 解析走哪个 server」（吸收 sing-box DNS rules）：
@@ -469,7 +469,7 @@ Trojan / Hysteria2 本段不交付：二者分别需要 TLS（rustls）与 QUIC�
 - E4 场景：`scenarios/product/proxy_clash_subscription_parse.toml`（喂含 1 ss + 1 vmess +
   1 未知协议行的固定 base64 订阅；断言解析出 2 个出站、未知协议被记录拒绝、字段正确）。
 
-### 11.9 Trojan 出站 adapter（TLS + SHA-224 请求头，P1，2026-09-18）
+### 11.9 Trojan 出站 adapter（TLS + SHA-224 请求头，P1，2026-09-18） {#11-trojan}
 
 在同一 `OutboundAdapter` 接缝上新增第五个真实出站实现 Trojan。Deletion Test（AGENTS.md §12）
 已成立：Direct / Relay / Shadowsocks / VMess / Trojan 是五个带真实行为的出站维度；Trojan 是首个
@@ -491,7 +491,7 @@ Trojan / Hysteria2 本段不交付：二者分别需要 TLS（rustls）与 QUIC�
   - `scenarios/product/proxy_trojan_adapter.toml`（loopback TLS，正确密码，握手通过、请求头送达、payload 往返）；
   - `scenarios/product/proxy_trojan_auth_rejected.toml`（错密码 → server 结构化 `AUTH_DENIED`，无中继）。
 
-#### 11.9.1 真实 TLS 连接参数（skip-cert-verify + ALPN + SNI，2026-09-18）
+#### 11.9.1 真实 TLS 连接参数（skip-cert-verify + ALPN + SNI，2026-09-18） {#11-trojan-real-tls}
 
 在离线公钥 pin 模式之外，增加面向真实 trojan 服务器的客户端 TLS 参数（零新依赖，全部用
 rustls 0.23 内置 dangerous API 与 ALPN，不引入新 crate）：
@@ -510,7 +510,7 @@ rustls 0.23 内置 dangerous API 与 ALPN，不引入新 crate）：
   为真实节点测试脚手架，CLI/环境变量参数化 `--server/--password/--sni/--target/--alpn/--skip-verify`，
   默认占位、不硬编码任何真实密码。
 
-#### 11.9.2 请求头格式兼容模式（Standard / Singbox，2026-09-18）
+#### 11.9.2 请求头格式兼容模式（Standard / Singbox，2026-09-18） {#11-trojan-header-format}
 
 不同服务器实现对 trojan 请求头「地址行」前是否带命令字节存在差异：
 
@@ -531,7 +531,7 @@ rustls 0.23 内置 dangerous API 与 ALPN，不引入新 crate）：
   (b) Standard 回归：本地 server 用标准解析器，客户端切 Standard → 往返 PASS。
 - E5：`trojan_real_server.rs` 增加 `--format standard|singbox`（默认 standard），供真实节点复测。
 
-#### 11.9.3 Trojan 节点配置项（配置层，2026-09-18）
+#### 11.9.3 Trojan 节点配置项（配置层，2026-09-18） {#11-trojan-node-config}
 
 `nexus-proxy-config` 的 `OutboundKind` 增加 `Trojan`；`OutboundConfig` 在既有 `tag/kind/locator/`
 `method/password` 之上增加 trojan 节点字段：
@@ -762,7 +762,7 @@ DNS_SERVER_UNRESOLVED       DNS 规则或 MATCH 兜底引用的 server tag 未�
 OUTBOUND_ADAPTER_UNAVAILABLE 选定出站 tag 无已注册的 OutboundAdapter 承接
 ```
 
-## 12. 虚拟子网组网（Virtual Subnet Networking）
+## 12. 虚拟子网组网（Virtual Subnet Networking） {#12-virtual-subnet-networking}
 
 在既有远程资源访问闭环（§6）和代理内核（§11）之外，新增第三条产品线：
 **虚拟子网组网**（参考 EasyTier / WireGuard 组网模式）。该产品线不修改既有
@@ -828,7 +828,7 @@ DECAPSULATION_ERROR         包解封装失败
 ```
 
 
-### 12.5 P1 静态路由与三节点转发闭环（2026-09-20）
+### 12.5 P1 静态路由与三节点转发闭环（2026-09-20）{#12-static-routing}
 
 §12.3 明确"多节点网状拓扑自动路由"为 P0 不做项，但括号注明"路由表静态配置"。
 本节冻结 P1 的静态路由最小闭环：三节点链 A—B—C，A 与 C 无直连，B 作为中间转发节点。
@@ -863,7 +863,7 @@ DECAPSULATION_ERROR         包解封装失败
   互不可见（A 的 peers 只有 B，C 的 peers 只有 B）。
 - 冻结边界（P1 不做）：动态路由协议、最短路径算法、跨子网、加密、真实 TUN。
 
-### 12.6 P1.1 多跳动态路由（距离矢量，2026-09-20）
+### 12.6 P1.1 多跳动态路由（距离矢量，2026-09-20）{#12-multihop-routing}
 
 §12.5 在冻结边界中明确"动态路由协议、最短路径算法"为 P1 不做项。
 本节作为 **requirement-change** 突破该边界，冻结 P1.1 的最小动态路由闭环：
@@ -928,7 +928,7 @@ DECAPSULATION_ERROR         包解封装失败
     （poison reverse）、不做触发更新；
   - 不跨子网、不接加密（复用 §12 既有 encryption 概念，本任务不接入）；
   - 不引入 tokio / 异步任务 / 长期 spawn（显式 tick 推进，纯同步纯函数骨架）。
-### 12.7 P2 隧道加密（链路加密接入虚拟子网数据面，2026-09-20）
+### 12.7 P2 隧道加密（链路加密接入虚拟子网数据面，2026-09-20）{#12-encryption}
 
 §12.3 冻结"加密后置"；§6 链路加密原语（`nexus-connectivity::encryption`，
 PRODUCT §6）已交付。本节把加密**接入虚拟子网数据面**：开启后隧道帧整体
@@ -971,7 +971,7 @@ AEAD 加密，每跳独立会话（WireGuard 式链路加密），§12.5 路由�
 - 冻结边界（P2 不做）：长期身份/公钥持久化（纯 ephemeral 握手）、密钥
   周期轮换逻辑、psk 绑定、真实线上传输（内存 carrier 闭环）。
 
-### 12.8 P2 带宽控制 / QoS（令牌桶限流骨架，2026-09-21） {#12-bandwidth-qos}
+### 12.8 P2 带宽控制 / QoS（令牌桶限流骨架，2026-09-21）{#12-bandwidth-qos}
 
 §12.1-§12.7 已打通组网 / 转发 / 加密数据面；本节把**出站与入站带宽整形**接入
 delivery 层（`nexus-connectivity::qos`）。纯内存、纯同步、可注入时钟骨架。
@@ -1008,7 +1008,7 @@ delivery 层（`nexus-connectivity::qos`）。纯内存、纯同步、可注入�
 - 冻结边界（P2 不做）：整形排队（缓冲/平滑）、优先级 / 公平排队、per-flow 哈希分流、
   真实 socket/TUN 挂接、配置热加载与持久化（留 TODO）；不引入 `time` crate，仅 std。
 
-### 12.9 P2.2 NAT 打洞集成（数据面闭环，2026-09-21）
+### 12.9 P2.2 NAT 打洞集成（数据面闭环，2026-09-21）{#12-nat-probe}
 
 nat.rs（`nexus-connectivity::nat`：StunClient / HolePuncher / NatType，PRODUCT §connectivity）
 已交付且 E4 已绿；§12.1-§12.8 的 peer locator 为**静态配置注入**。本节把打洞接入
@@ -1047,7 +1047,7 @@ socket 集成留 P3 产品化）；打洞由外部 HolePuncher 驱动后经隧�
 - 冻结边界（P2.2 不做）：tunnel 内真实 UDP 打洞（HolePuncher 挂接留 P3）、
   打洞重试策略、多候选并发打洞、NAT 类型驱动的路径选择。
 
-### 12.13 P2.3+P2.4 广域协调核心 + 自动 IP 分配（2026-09-21）
+### 12.10 P2.3+P2.4 广域协调核心 + 自动 IP 分配（2026-09-21）{#12-coord}
 
 静态 locator 无法扩展（IP 漂移、NAT 后不可预知）。本节交付**协调控制平面核心**与
 **虚拟子网自动 IP 分配**：节点经协调器注册（PeerId = X25519 公钥哈希）→ 通告
@@ -1090,7 +1090,7 @@ PresenceRegistry 的"通告/过期"语义扩展到广域（本模块独立实现
   协议（本批自定义帧）、心跳周期/租约过期定时器（本批显式 TTL 注入）、
   Planner/Session 深度融合（本批建连直用 VirtualSubnetTunnel）、跨子网
   路由（P2-5）。
-### 12.10 P2.3 节点健康检查（探针状态机骨架，2026-09-21） {#12-health-check}
+### 12.11 P2.3 节点健康检查（探针状态机骨架，2026-09-21）{#12-health-check}
 
 `health_check.rs`（`nexus-connectivity::health_check`）：delivery 层节点健康状态骨架。
 纯内存、纯同步、注入逻辑时钟（`now_ms` 由调用方传入，不读真实墙钟）。
@@ -1109,7 +1109,7 @@ PresenceRegistry 的"通告/过期"语义扩展到广域（本模块独立实现
 - 冻结边界（P2.3 不做）：真实定时探测线程、真实网络探活、跨节点状态同步、
   持久化（留 TODO）。
 
-### 12.11 P2.3 节点优先级选择（2026-09-21） {#12-node-priority}
+### 12.12 P2.3 节点优先级选择（2026-09-21）{#12-node-priority}
 
 `node_priority.rs`（`nexus-connectivity::node_priority`）：多候选路由的优先级选择骨架。
 
@@ -1125,7 +1125,7 @@ PresenceRegistry 的"通告/过期"语义扩展到广域（本模块独立实现
   同优先级同延迟选高带宽、空候选返回 None、越界优先级被拒。
 - 冻结边界（P2.3 不做）：与多跳路由 `routing` 的真实挂接、动态优先级学习（留 TODO）。
 
-### 12.12 P2.3 连接复用池（2026-09-21） {#12-connection-pool}
+### 12.13 P2.3 连接复用池（2026-09-21）{#12-connection-pool}
 
 `connection_pool.rs`（`nexus-connectivity::connection_pool`）：连接复用骨架。
 
@@ -1143,7 +1143,169 @@ PresenceRegistry 的"通告/过期"语义扩展到广域（本模块独立实现
 - 冻结边界（P2.3 不做）：真实 TCP 连接复用、线程安全 Send/Sync、
   与 relay/nat 数据面挂接（留 TODO）。
 
-### 12.14 P2-5 跨子网路由与出口节点（2026-09-21） {#12-cross-subnet-egress}
+### 12.14 P2.3 节点优雅退出（2026-09-21）{#12-graceful-exit}
+
+`graceful_exit.rs`（`nexus-connectivity::graceful_exit`）：节点优雅退出状态机骨架。
+
+- `ExitConfig { grace_period_ms, notify_peers, wait_for_drain }`：构造校验
+  `grace_period_ms > 0`，非法返回 `GracefulExitError::InvalidConfig`。
+- `ExitState`：`Active / Draining / Exiting / Exited`，各带稳定 `as_str()`。
+- `GracefulExit`：`begin_draining(now_ms)` 标记进入 Draining 并记录起始时间；
+  `notify_peers(peers)` 在 `notify_peers=true` 时记录已通知对端；
+  `advance(active_connections, now_ms)` 推进状态——仍有连接且在宽限期内且
+  `wait_for_drain=true` 则停在 Draining，连接排空或宽限期超时则进入 Exiting，
+  再推进一次进入终态 Exited。
+- E4 场景：`graceful_exit.toml`（id=`product.graceful-exit`）——Active→Draining→
+  Exiting→Exited 全链路、未排空仍 Draining、超时强制 Exiting、notify 开关、非法配置被拒。
+- 冻结边界（P2.3 不做）：真实网络通知对端、真实 drain 等待、进程信号挂接（留 TODO）。
+
+### 12.15 P2.3 配置热加载（2026-09-21）{#12-config-hot-reload}
+
+`config_hot_reload.rs`（`nexus-connectivity::config_hot_reload`）：配置热加载门控骨架。
+
+- `HotReloadConfig { watch_interval_ms, validate_before_apply }`：构造校验
+  `watch_interval_ms > 0`，非法返回 `HotReloadError::InvalidConfig`。
+- `ReloadResult`：`Success { applied_revision } / Failed { reason }`，带稳定 `as_str()`。
+- `HotReloadManager`：`propose_reload(new_revision, valid)`——`validate_before_apply=true`
+  且 `valid=false` 时返回 `Failed` 且已生效 revision 不变；否则把已生效 revision
+  推进到 `new_revision` 返回 `Success`；`current_revision()` 暴露当前已生效版本。
+- E4 场景：`config_hot_reload.toml`（id=`product.config-hot-reload`）——合法提议推进
+  revision、校验开启时非法提议 Failed 且 revision 不变、关闭校验时放宽应用、非法配置被拒。
+- 冻结边界（P2.3 不做）：真实文件 watcher 线程、真实配置解析与原子切换（留 TODO）。
+
+### 12.16 P2.3 流量统计汇总（2026-09-21）{#12-traffic-stats}
+
+`traffic_stats.rs`（`nexus-connectivity::traffic_stats`）：按节点流量记账与全量快照骨架。
+
+- `TrafficSummary { total_rx_bytes, total_tx_bytes, active_connections, active_nodes }`：
+  快照 DTO，派生 Clone/PartialEq/Debug。
+- `StatsCollector`：`record_node_bytes(node, rx, tx)` 饱和累加字节、节点自动注册；
+  `record_connection(node, active)` 增减活跃连接数（饱和不回绕）；
+  `node_summary(node)` 返回单节点 (rx, tx, active_conns) 或 None；
+  `snapshot()` 汇总所有节点字节总数、活跃连接总数与节点数。
+- E4 场景：`traffic_stats.toml`（id=`product.traffic-stats`）——字节累加、连接增减、
+  未知节点 None、跨节点 snapshot 汇总、上限饱和。
+- 冻结边界（P2.3 不做）：真实数据面字节 hook、指标导出到可观测层、周期快照（留 TODO）。
+
+### 12.17 P2.3 节点分组隔离（2026-09-21）{#12-group-isolation}
+
+`group_isolation.rs`（`nexus-connectivity::group_isolation`）：节点分组访问隔离骨架。
+
+- `IsolationMode`：`Full`（按组隔离）/ `None`（全开），带稳定 `as_str()`。
+- `GroupConfig { group_name, mode }`：构造校验 `group_name` 非空，空串返回
+  `GroupIsolationError::InvalidGroupName`。
+- `GroupIsolation`：`define_group(GroupConfig)` 声明组；`assign(node, group)` 把节点划入
+  已声明组（未声明组返回 `UnknownGroup`）；`allow_exception(src, dst)` 登记单向跨组放行；
+  `check(src, dst) -> AccessDecision`。
+- 决策规则（`Full`）：任一节点未分配 -> `Deny`；同组 -> `Allow`；跨组且例外表含
+  `(src_group, dst_group)` -> `Allow`；其余跨组 -> `Deny`。`None` 一律 `Allow`。
+  例外单向、不自动对称。
+- E4 场景：`group_isolation.toml`（id=`product.group-isolation`）--同组 Allow、
+  跨组默认 Deny、例外后 Allow、None 全开、未分配 Deny、空组名/未知组拒绝。
+- 冻结边界（P2.3 不做）：真实 ACL 下发、规则热更新、与 firewall/node_tags 联动（留 TODO）。
+
+### 12.18 P2.3 带宽分配策略（2026-09-21）{#12-bandwidth-policy}
+
+`bandwidth_policy.rs`（`nexus-connectivity::bandwidth_policy`）：按组/按节点配额分配骨架
+（与 `qos` 令牌桶互补，不重复其时钟 refill）。
+
+- `BandwidthPolicy { group_quota_bytes_per_sec, per_node_quota_bytes_per_sec }`：构造校验
+  两个 quota 均 > 0，否则 `BandwidthPolicyError::InvalidQuota`。
+- `Priority`：`High`/`Normal`/`Low`（`rank()` High=0 最高）；`OverflowStrategy`：
+  `Drop`/`Queue`；`AllocationOutcome`：`Granted`/`Dropped`/`Queued`（各带 `bytes` 与 `as_str()`）。
+- `PolicyAllocator`：`register_node(node, group, priority)`；`try_allocate(node, bytes, now_second)`
+  按逻辑秒 `now_second` 跨秒清零组/节点已用计数。Normal/Low 需组与节点配额都够才 Grant；
+  High 只要组内尚有任意配额即放行到组剩余上限（可超节点配额，不做抢占）；配额不足按
+  Drop/Queue（Queue 不记账并累计）。未注册节点 -> Dropped。
+- E4 场景：`bandwidth_policy.toml`（id=`product.bandwidth-policy`）--配额内 Grant、
+  组配额耗尽 Drop、未注册 Drop、Queue 策略 Queued、跨秒重置恢复 Grant。
+- 冻结边界（P2.3 不做）：真实排队缓冲/回灌、跨流公平调度、动态抢占、真实单调时钟（留 TODO）。
+
+### 12.19 P2.3 日志级别控制（2026-09-21）{#12-log-level}
+
+`log_level.rs`（`nexus-connectivity::log_level`）：全局/模块级日志级别查询与动态调整骨架。
+
+- `LogLevel`：`Error`/`Warn`/`Info`/`Debug`/`Trace`，带 `as_str()`、`severity()`
+  （Error=0...Trace=4），实现 `std::str::FromStr`（大小写不敏感，非法返回
+  `LogLevelError::InvalidLevel`）。
+- `LogLevelConfig { global, module_overrides }`：`new(global)`、`set_module(module, level)`。
+- `LogLevelController`：`effective_level(module)`（覆盖优先、否则全局）；`set_global(level)`；
+  `set_module_level(module, level)`；`enabled(module, level)`（level.severity <= 有效级别
+  severity 才输出）；`propose(new_config) -> LevelApplyResult`（本骨架简化为总是 Applied
+  并整体替换，真实校验留 TODO）。
+- E4 场景：`log_level.toml`（id=`product.log-level`）--模块覆盖生效、未覆盖回退全局、
+  enabled 阈值判断、set_global/set_module_level 动态调整、字符串解析。
+- 冻结边界（P2.3 不做）：真实接 `tracing`/`log` 后端、EnvFilter 热刷新、指标导出（留 TODO）。
+
+### 12.20 P2.3 故障转移（2026-09-21）{#12-failover}
+
+`failover.rs`（`nexus-connectivity::failover`）：主备故障转移 + 自动回切状态机骨架。
+
+- `FailoverConfig { primary_node, standby_nodes, auto_failback }`：`new` 校验
+  `primary_node` 非空；`standby_nodes` 不得含空串、不得重复、不得含 `primary_node`，
+  否则 `FailoverError::InvalidPrimary` / `InvalidStandby`。
+- `FailoverState`：`Primary` / `Standby { node }` / `FailingOver { from, to }` / `Failed`，
+  各带 `as_str()`（"primary"/"standby"/"failing-over"/"failed"）与 Display。
+- `FailoverManager`：`new(config)` 初始 `state=Primary`、`active=primary_node`；
+  `active_node()` / `state()` / `consecutive_failures()` / `last_failure_ms()` 只读暴露。
+- `report_failure(node, now_ms)`：累加连续失败与 `last_failure_ms`；失败节点即当前 active
+  时按 standby 列表顺序切到下一个尚未失败的备节点（`FailingOver` -> `Standby`，
+  同步骨架内直接落 `Standby`）；无可用备节点 -> `Failed`。
+- `report_recovery(node, now_ms)`：`auto_failback=true` 且 `node==primary_node` 且当前不在
+  Primary -> 切回 Primary 并清零连续失败；否则仅把该节点标记为可用。
+- E4 场景：`failover.toml`（id=`product.failover`）--主失败切首备、连续失败退多备、
+  无备 -> Failed、auto_failback 回切、不 auto_failback 不回切、构造校验三类拒绝。
+- 冻结边界（P2.3 不做）：真实健康探测、真实流量摘除/挂载、跨进程持久化、真实单调时钟
+  （`now_ms` 由调用方注入，留 TODO）。
+
+### 12.21 P2.3 节点发现增强（2026-09-21）{#12-discovery-enhanced}
+
+`discovery_enhanced.rs`（`nexus-connectivity::discovery_enhanced`）：多策略节点发现骨架。
+
+- `DiscoveryConfig { interval_ms, timeout_ms, max_peers }`：`new` 校验三者均 > 0，
+  否则 `DiscoveryError::InvalidConfig`。
+- `DiscoveryStrategy`：`Multicast` / `Bootstrap` / `Manual`，带 `as_str()`，实现
+  `std::str::FromStr`（大小写不敏感，非法返回 `DiscoveryError::InvalidStrategy`）。
+- `DiscoveredPeer { node_id, endpoint, last_seen_ms }`：可 Clone/PartialEq/Debug。
+- `EnhancedDiscovery`：`new(config)` 默认启用全部三种策略；`enable_strategy` /
+  `disable_strategy` / `is_strategy_enabled` 控制策略集合。
+- `advertise(strategy, node_id, endpoint, now_ms)`：策略未启用 -> 静默忽略（返回
+  `Ok(false)`）；`node_id`/`endpoint` 空串 -> `InvalidAdvertise`；同 `node_id` 已存在
+  -> upsert 刷新 endpoint 与 `last_seen_ms`；表满且为新节点 -> 按 `last_seen_ms`
+  最旧驱逐一条再插入。
+- `prune_expired(now_ms) -> usize`：删除 `now_ms - last_seen_ms > timeout_ms` 的邻居；
+  `peer_count()` / `peers_snapshot()`（按 node_id 升序确定性输出）/ `get_peer(node_id)`。
+- E4 场景：`discovery_enhanced.toml`（id=`product.discovery-enhanced`）--upsert 去重、
+  停用策略忽略、超时清理、max_peers 驱逐最旧、FromStr 解析与非法、快照排序。
+- 冻结边界（P2.3 不做）：真实组播收发、bootstrap 服务器查询、TLS 握手、节点真实性校验、
+  真实单调时钟（`now_ms` 由调用方注入，留 TODO）。
+
+### 12.22 P2.3 智能重试（2026-09-21）{#12-smart-retry}
+
+`smart_retry.rs`（`nexus-connectivity::smart_retry`）：指数退避 + 错误分类 + 熔断骨架。
+
+- `RetryConfig { max_attempts, initial_delay_ms, backoff_factor, failure_threshold,
+  circuit_open_ms }`：`new` 校验 `max_attempts>=1`、`initial_delay_ms>0`、
+  `backoff_factor>=1`、`failure_threshold>=1`、`circuit_open_ms>0`，否则
+  `RetryError::InvalidConfig`。
+- `RetryableClass`：`Retryable` / `Fatal`（由调用方对错误分类后传入）。
+- `CircuitState`：`Closed` / `Open { opened_at_ms }` / `HalfOpen`，带 `as_str()`。
+- `RetryDecision`：`AllowAttempt { attempt, next_delay_ms }` /
+  `StopRetry { reason: &'static str }` / `CircuitOpen { retry_after_ms }`，带 `as_str()`。
+- `RetryExecutor`：`compute_backoff(attempt)` 按 `initial_delay_ms *
+  backoff_factor^(attempt-1)` 计算（attempt 从 1 开始，saturating 并 cap 到
+  `u64::MAX/2`）；`decide(attempt, now_ms)` 在熔断未冷却时返回 `CircuitOpen`，
+  冷却期过放行一次 `AllowAttempt`（视为 HalfOpen），超过 `max_attempts` 返回 `StopRetry`，
+  否则 `AllowAttempt`。
+- `record_success(now_ms)`：清零连续失败、熔断回 `Closed`；`record_failure(now_ms, class)`：
+  连续失败 +1，达 `failure_threshold` 即 `Open { opened_at_ms }`；Fatal 在本骨架仅记录，
+  停止语义由 `decide` 配合 `max_attempts` 体现。
+- E4 场景：`smart_retry.toml`（id=`product.smart-retry`）--退避指数序列、超次数 StopRetry、
+  达阈值 Open、冷却期内 CircuitOpen、过冷却放行一次、record_success 复位。
+- 冻结边界（P2.3 不做）：真实异步调度、jitter 防惊群、半开后真实试探过渡、真实单调时钟
+  （`now_ms` 由调用方注入，留 TODO）。
+
+### 12.23 P2-5 跨子网路由与出口节点（2026-09-21）{#12-cross-subnet}
 
 §12.3 明确 P0 不做跨子网，本节随 P2 解冻（designs P2-5 §118-130）。§12.5 静态路由
 为精确 `dst → next_hop`；本节扩展为**前缀路由（CIDR + 最长前缀匹配）**与**出口节点
@@ -1183,51 +1345,70 @@ PresenceRegistry 的"通告/过期"语义扩展到广域（本模块独立实现
   （前缀命中投递、本地前缀递送、出口兜底、无路由无出口 NoRouteToDst）。
 - 冻结边界（P2-5 不做）：协调器广播子网通告、出口 NAT/公网访问实现、前缀路由
   动态学习与过期（全部留 P3 TODO）。
-### 12.15 P2.3 节点优雅退出（2026-09-21） {#12-graceful-exit}
+### 12.24 P2.3 Mesh 域名注册与解析（mesh-dns，2026-09-21）{#12-mesh-dns}
+Mesh 网络内节点注册域名（`<node>.mesh`），其他节点可跨节点解析到目标
+虚拟 IP 与 node_id（纯内存注册表，不接真实 DNS 协议）。
 
-`graceful_exit.rs`（`nexus-connectivity::graceful_exit`）：节点优雅退出状态机骨架。
+- 注册：节点加入时注册记录 `domain -> {virtual_ip, node_id, ttl_secs}`；
+  未注册域名查询返回 NotFound（NXDOMAIN 语义）。
+- 解析：跨节点查询按域名精确匹配，返回目标虚拟 IP 与 node_id；
+  注册/解析结果均进入结构化快照（可观察）。
+- TTL：注册记录带 TTL，由显式逻辑时钟推进，过期后记录清除
+  （不 sleep、不 tokio）。
+- E4 场景：`scenarios/product/mesh_dns.toml`（id=product.mesh-dns）——
+  A/B 各注册域名、B 查询 node-a.mesh 解析到 10.0.0.1 + node-a、
+  未注册域名 NotFound、TTL 过期清除。
+- 冻结边界（P2.3 不做）：真实 DNS 服务器/协议（UDP 53）、缓存分层、
+  与 §11.5 多 server DNS 路由的挂接（留 TODO）。
+### 12.25 P2.3 防火墙规则引擎（firewall-rules，2026-09-21）{#12-firewall-rules}
+Mesh 网络流量过滤：默认拒绝白名单 + 声明顺序首匹配（first-match-wins）。
 
-- `ExitConfig { grace_period_ms, notify_peers, wait_for_drain }`：构造校验
-  `grace_period_ms > 0`，非法返回 `GracefulExitError::InvalidConfig`。
-- `ExitState`：`Active / Draining / Exiting / Exited`，各带稳定 `as_str()`。
-- `GracefulExit`：`begin_draining(now_ms)` 标记进入 Draining 并记录起始时间；
-  `notify_peers(peers)` 在 `notify_peers=true` 时记录已通知对端；
-  `advance(active_connections, now_ms)` 推进状态——仍有连接且在宽限期内且
-  `wait_for_drain=true` 则停在 Draining，连接排空或宽限期超时则进入 Exiting，
-  再推进一次进入终态 Exited。
-- E4 场景：`graceful_exit.toml`（id=`product.graceful-exit`）——Active→Draining→
-  Exiting→Exited 全链路、未排空仍 Draining、超时强制 Exiting、notify 开关、非法配置被拒。
-- 冻结边界（P2.3 不做）：真实网络通知对端、真实 drain 等待、进程信号挂接（留 TODO）。
+- 规则语言（P0 冻结）：
+  - `allow <proto> <cidr> <-> <cidr>`：双向网段放行（如 `tcp 10.0.0.0/24` 互访）；
+  - `deny <proto>/<port>`：协议+端口封锁（如 `udp/53` 全部 DNS）；
+  - `allow <proto>/<port> from <ip>`：单点放行（可被前置 deny 遮蔽）。
+- 决策语义：
+  - 未命中任何规则 -> 默认策略（default_policy，P0 冻结为 deny）；
+  - 命中规则按声明顺序首条生效（first-match-wins），后置规则不覆盖；
+  - 转发包（多跳路由场景）按同一规则集评估（§12.5/§12.6 语义不变）。
+- 可观察：default_policy、rule_count、每次决策的 verdict（allow/deny）。
+- E4 场景：`scenarios/product/firewall_rules.toml`（id=product.firewall-rules）
+  ——入站未授权 deny、白名单 allow、转发 allow、CIDR 命中、
+  DNS 封锁、first-match-wins 遮蔽（admin 单点放行被前置 deny 覆盖）。
+- 冻结边界（P2.3 不做）：真实网卡挂接/iptables/nftables 改写、
+  规则热更新、与 QoS（§12.8）/node_tags（§12.27）联动（留 TODO）。
+### 12.26 P2.3 自动断线重连（auto-reconnect，2026-09-21）{#12-auto-reconnect}
+连接断开后自动重连：指数退避 + 最大重试 + 状态机（显式逻辑时钟注入，
+不 sleep、不 tokio）。
 
-### 12.16 P2.3 配置热加载（2026-09-21） {#12-config-hot-reload}
+- 退避：首次失败后 `next_delay = initial_delay`（factor^0）；
+  连续失败指数翻倍（×backoff_factor），封顶 `max_delay_ms`。
+- 重试：达 `max_retries` 进入 GiveUp，不再发起新尝试
+  （attempt_count 封顶 = max_retries）。
+- 恢复：退避中途成功 -> 回到 Connected、重试计数清零、退避重置为 initial。
+- 可观察：退避序列、attempt_count、状态机终态（Connected / GiveUp）。
+- E4 场景：`scenarios/product/auto_reconnect.toml`（id=product.auto-reconnect）
+  ——initial=100ms、翻倍 200/400、封顶 800、3 次后 GiveUp、
+  成功恢复重置。
+- 冻结边界（P2.3 不做）：真实调度线程、真实网络监听/心跳、
+  与 failover（§12.20）联动（留 TODO）。
+### 12.27 P2.3 节点标签（node-tags，2026-09-21）{#12-node-tags}
+节点打标（key=value）与按标签过滤/路由选择。
 
-`config_hot_reload.rs`（`nexus-connectivity::config_hot_reload`）：配置热加载门控骨架。
-
-- `HotReloadConfig { watch_interval_ms, validate_before_apply }`：构造校验
-  `watch_interval_ms > 0`，非法返回 `HotReloadError::InvalidConfig`。
-- `ReloadResult`：`Success { applied_revision } / Failed { reason }`，带稳定 `as_str()`。
-- `HotReloadManager`：`propose_reload(new_revision, valid)`——`validate_before_apply=true`
-  且 `valid=false` 时返回 `Failed` 且已生效 revision 不变；否则把已生效 revision
-  推进到 `new_revision` 返回 `Success`；`current_revision()` 暴露当前已生效版本。
-- E4 场景：`config_hot_reload.toml`（id=`product.config-hot-reload`）——合法提议推进
-  revision、校验开启时非法提议 Failed 且 revision 不变、关闭校验时放宽应用、非法配置被拒。
-- 冻结边界（P2.3 不做）：真实文件 watcher 线程、真实配置解析与原子切换（留 TODO）。
-
-### 12.17 P2.3 流量统计汇总（2026-09-21） {#12-traffic-stats}
-
-`traffic_stats.rs`（`nexus-connectivity::traffic_stats`）：按节点流量记账与全量快照骨架。
-
-- `TrafficSummary { total_rx_bytes, total_tx_bytes, active_connections, active_nodes }`：
-  快照 DTO，派生 Clone/PartialEq/Debug。
-- `StatsCollector`：`record_node_bytes(node, rx, tx)` 饱和累加字节、节点自动注册；
-  `record_connection(node, active)` 增减活跃连接数（饱和不回绕）；
-  `node_summary(node)` 返回单节点 (rx, tx, active_conns) 或 None；
-  `snapshot()` 汇总所有节点字节总数、活跃连接总数与节点数。
-- E4 场景：`traffic_stats.toml`（id=`product.traffic-stats`）——字节累加、连接增减、
-  未知节点 None、跨节点 snapshot 汇总、上限饱和。
-- 冻结边界（P2.3 不做）：真实数据面字节 hook、指标导出到可观测层、周期快照（留 TODO）。
-
-### 12.16 P3.1 子网 CLI 与 TOML 配置（2026-09-21） {#12-subnet-cli}
+- 标签模型：`NodeTag { key, value }`；字符串 `"key=value"` 解析，
+  非法格式结构化拒绝。
+- 过滤语义：
+  - 精确匹配：`key=value` 命中；
+  - 多标签 AND：全部标签均命中才返回；
+  - key 存在性匹配：仅要求 key 存在（不限值）。
+- 路由选择：按标签组合选择下一跳（如 `role=edge` 且 `tier=1`），
+  同候选按声明顺序取先者（确定性）。
+- E4 场景：`scenarios/product/node_tags.toml`（id=product.node-tags）
+  ——5 节点打标、region=us 命中 2、role=db 命中 2、AND 命中 1、
+  key 存在命中 5、无匹配 0、next_hop 选择、标签解析。
+- 冻结边界（P2.3 不做）：真实路由表挂接、标签动态传播、
+  与 discovery/coord（§12.10/§12.21）联动（留 TODO）。
+### 12.28 P3.1 子网 CLI 与 TOML 配置（2026-09-21）{#12-subnet-cli}
 
 产品化第一块：用户可用的 `nexus subnet` 命令族 + TOML 配置格式（designs P3 §132-138）。
 CLI 走进程内 SDK（同 `run` 路径），状态为本地文件（默认 `~/.nexus/subnet.json`，
@@ -1248,9 +1429,9 @@ CLI 走进程内 SDK（同 `run` 路径），状态为本地文件（默认 `~/.
   - `encryption = false`（默认关，P2-1 §12.7 开关）；
   - `[[peers]]`：`virtual_ip` + `locator`（virtual_ip 须在 cidr 内）；
   - `[[routes]]`：`dst` + `next_hop`（§12.5 精确路由）；
-  - `[[prefix_routes]]`：`cidr` + `next_hop`（§12.14 前缀路由）；
-  - `local_prefixes = ["192.168.5.0/24"]`（§12.14 本地可达前缀）；
-  - `egress = ["10.99.0.2"]`（§12.14 出口节点标记）。
+  - `[[prefix_routes]]`：`cidr` + `next_hop`（§12.23 前缀路由）；
+  - `local_prefixes = ["192.168.5.0/24"]`（§12.23 本地可达前缀）；
+  - `egress = ["10.99.0.2"]`（§12.23 出口节点标记）。
 - 配置校验错误（cidr 非法 / virtual_ip 不在子网 / peer 不在子网 / 文件缺失 /
   TOML 解析失败）→ `{ verdict:"CONFIG_ERROR", error:"..." }`（exit 0，结构化）。
 - E4 场景：`cli_subnet.toml`（id=`product.cli-subnet`，example 进程内全闭环）——
@@ -1259,127 +1440,8 @@ CLI 走进程内 SDK（同 `run` 路径），状态为本地文件（默认 `~/.
 - 冻结边界（P3.1 不做）：真实 TUN（P3-2）、nexusd daemon 托管、持续运行
   （CLI 单次命令语义）、订阅配置热重载。
 
-### 12.18 P2.3 节点分组隔离（2026-09-21） {#12-group-isolation}
-
-`group_isolation.rs`（`nexus-connectivity::group_isolation`）：节点分组访问隔离骨架。
-
-- `IsolationMode`：`Full`（按组隔离）/ `None`（全开），带稳定 `as_str()`。
-- `GroupConfig { group_name, mode }`：构造校验 `group_name` 非空，空串返回
-  `GroupIsolationError::InvalidGroupName`。
-- `GroupIsolation`：`define_group(GroupConfig)` 声明组；`assign(node, group)` 把节点划入
-  已声明组（未声明组返回 `UnknownGroup`）；`allow_exception(src, dst)` 登记单向跨组放行；
-  `check(src, dst) -> AccessDecision`。
-- 决策规则（`Full`）：任一节点未分配 -> `Deny`；同组 -> `Allow`；跨组且例外表含
-  `(src_group, dst_group)` -> `Allow`；其余跨组 -> `Deny`。`None` 一律 `Allow`。
-  例外单向、不自动对称。
-- E4 场景：`group_isolation.toml`（id=`product.group-isolation`）--同组 Allow、
-  跨组默认 Deny、例外后 Allow、None 全开、未分配 Deny、空组名/未知组拒绝。
-- 冻结边界（P2.3 不做）：真实 ACL 下发、规则热更新、与 firewall/node_tags 联动（留 TODO）。
-
-### 12.19 P2.3 带宽分配策略（2026-09-21） {#12-bandwidth-policy}
-
-`bandwidth_policy.rs`（`nexus-connectivity::bandwidth_policy`）：按组/按节点配额分配骨架
-（与 `qos` 令牌桶互补，不重复其时钟 refill）。
-
-- `BandwidthPolicy { group_quota_bytes_per_sec, per_node_quota_bytes_per_sec }`：构造校验
-  两个 quota 均 > 0，否则 `BandwidthPolicyError::InvalidQuota`。
-- `Priority`：`High`/`Normal`/`Low`（`rank()` High=0 最高）；`OverflowStrategy`：
-  `Drop`/`Queue`；`AllocationOutcome`：`Granted`/`Dropped`/`Queued`（各带 `bytes` 与 `as_str()`）。
-- `PolicyAllocator`：`register_node(node, group, priority)`；`try_allocate(node, bytes, now_second)`
-  按逻辑秒 `now_second` 跨秒清零组/节点已用计数。Normal/Low 需组与节点配额都够才 Grant；
-  High 只要组内尚有任意配额即放行到组剩余上限（可超节点配额，不做抢占）；配额不足按
-  Drop/Queue（Queue 不记账并累计）。未注册节点 -> Dropped。
-- E4 场景：`bandwidth_policy.toml`（id=`product.bandwidth-policy`）--配额内 Grant、
-  组配额耗尽 Drop、未注册 Drop、Queue 策略 Queued、跨秒重置恢复 Grant。
-- 冻结边界（P2.3 不做）：真实排队缓冲/回灌、跨流公平调度、动态抢占、真实单调时钟（留 TODO）。
-
-### 12.20 P2.3 日志级别控制（2026-09-21） {#12-log-level}
-
-`log_level.rs`（`nexus-connectivity::log_level`）：全局/模块级日志级别查询与动态调整骨架。
-
-- `LogLevel`：`Error`/`Warn`/`Info`/`Debug`/`Trace`，带 `as_str()`、`severity()`
-  （Error=0...Trace=4），实现 `std::str::FromStr`（大小写不敏感，非法返回
-  `LogLevelError::InvalidLevel`）。
-- `LogLevelConfig { global, module_overrides }`：`new(global)`、`set_module(module, level)`。
-- `LogLevelController`：`effective_level(module)`（覆盖优先、否则全局）；`set_global(level)`；
-  `set_module_level(module, level)`；`enabled(module, level)`（level.severity <= 有效级别
-  severity 才输出）；`propose(new_config) -> LevelApplyResult`（本骨架简化为总是 Applied
-  并整体替换，真实校验留 TODO）。
-- E4 场景：`log_level.toml`（id=`product.log-level`）--模块覆盖生效、未覆盖回退全局、
-  enabled 阈值判断、set_global/set_module_level 动态调整、字符串解析。
-- 冻结边界（P2.3 不做）：真实接 `tracing`/`log` 后端、EnvFilter 热刷新、指标导出（留 TODO）。
-
-### 12.21 P2.3 故障转移（2026-09-21） {#12-failover}
-
-`failover.rs`（`nexus-connectivity::failover`）：主备故障转移 + 自动回切状态机骨架。
-
-- `FailoverConfig { primary_node, standby_nodes, auto_failback }`：`new` 校验
-  `primary_node` 非空；`standby_nodes` 不得含空串、不得重复、不得含 `primary_node`，
-  否则 `FailoverError::InvalidPrimary` / `InvalidStandby`。
-- `FailoverState`：`Primary` / `Standby { node }` / `FailingOver { from, to }` / `Failed`，
-  各带 `as_str()`（"primary"/"standby"/"failing-over"/"failed"）与 Display。
-- `FailoverManager`：`new(config)` 初始 `state=Primary`、`active=primary_node`；
-  `active_node()` / `state()` / `consecutive_failures()` / `last_failure_ms()` 只读暴露。
-- `report_failure(node, now_ms)`：累加连续失败与 `last_failure_ms`；失败节点即当前 active
-  时按 standby 列表顺序切到下一个尚未失败的备节点（`FailingOver` -> `Standby`，
-  同步骨架内直接落 `Standby`）；无可用备节点 -> `Failed`。
-- `report_recovery(node, now_ms)`：`auto_failback=true` 且 `node==primary_node` 且当前不在
-  Primary -> 切回 Primary 并清零连续失败；否则仅把该节点标记为可用。
-- E4 场景：`failover.toml`（id=`product.failover`）--主失败切首备、连续失败退多备、
-  无备 -> Failed、auto_failback 回切、不 auto_failback 不回切、构造校验三类拒绝。
-- 冻结边界（P2.3 不做）：真实健康探测、真实流量摘除/挂载、跨进程持久化、真实单调时钟
-  （`now_ms` 由调用方注入，留 TODO）。
-
-### 12.22 P2.3 节点发现增强（2026-09-21） {#12-discovery-enhanced}
-
-`discovery_enhanced.rs`（`nexus-connectivity::discovery_enhanced`）：多策略节点发现骨架。
-
-- `DiscoveryConfig { interval_ms, timeout_ms, max_peers }`：`new` 校验三者均 > 0，
-  否则 `DiscoveryError::InvalidConfig`。
-- `DiscoveryStrategy`：`Multicast` / `Bootstrap` / `Manual`，带 `as_str()`，实现
-  `std::str::FromStr`（大小写不敏感，非法返回 `DiscoveryError::InvalidStrategy`）。
-- `DiscoveredPeer { node_id, endpoint, last_seen_ms }`：可 Clone/PartialEq/Debug。
-- `EnhancedDiscovery`：`new(config)` 默认启用全部三种策略；`enable_strategy` /
-  `disable_strategy` / `is_strategy_enabled` 控制策略集合。
-- `advertise(strategy, node_id, endpoint, now_ms)`：策略未启用 -> 静默忽略（返回
-  `Ok(false)`）；`node_id`/`endpoint` 空串 -> `InvalidAdvertise`；同 `node_id` 已存在
-  -> upsert 刷新 endpoint 与 `last_seen_ms`；表满且为新节点 -> 按 `last_seen_ms`
-  最旧驱逐一条再插入。
-- `prune_expired(now_ms) -> usize`：删除 `now_ms - last_seen_ms > timeout_ms` 的邻居；
-  `peer_count()` / `peers_snapshot()`（按 node_id 升序确定性输出）/ `get_peer(node_id)`。
-- E4 场景：`discovery_enhanced.toml`（id=`product.discovery-enhanced`）--upsert 去重、
-  停用策略忽略、超时清理、max_peers 驱逐最旧、FromStr 解析与非法、快照排序。
-- 冻结边界（P2.3 不做）：真实组播收发、bootstrap 服务器查询、TLS 握手、节点真实性校验、
-  真实单调时钟（`now_ms` 由调用方注入，留 TODO）。
-
-### 12.23 P2.3 智能重试（2026-09-21） {#12-smart-retry}
-
-`smart_retry.rs`（`nexus-connectivity::smart_retry`）：指数退避 + 错误分类 + 熔断骨架。
-
-- `RetryConfig { max_attempts, initial_delay_ms, backoff_factor, failure_threshold,
-  circuit_open_ms }`：`new` 校验 `max_attempts>=1`、`initial_delay_ms>0`、
-  `backoff_factor>=1`、`failure_threshold>=1`、`circuit_open_ms>0`，否则
-  `RetryError::InvalidConfig`。
-- `RetryableClass`：`Retryable` / `Fatal`（由调用方对错误分类后传入）。
-- `CircuitState`：`Closed` / `Open { opened_at_ms }` / `HalfOpen`，带 `as_str()`。
-- `RetryDecision`：`AllowAttempt { attempt, next_delay_ms }` /
-  `StopRetry { reason: &'static str }` / `CircuitOpen { retry_after_ms }`，带 `as_str()`。
-- `RetryExecutor`：`compute_backoff(attempt)` 按 `initial_delay_ms *
-  backoff_factor^(attempt-1)` 计算（attempt 从 1 开始，saturating 并 cap 到
-  `u64::MAX/2`）；`decide(attempt, now_ms)` 在熔断未冷却时返回 `CircuitOpen`，
-  冷却期过放行一次 `AllowAttempt`（视为 HalfOpen），超过 `max_attempts` 返回 `StopRetry`，
-  否则 `AllowAttempt`。
-- `record_success(now_ms)`：清零连续失败、熔断回 `Closed`；`record_failure(now_ms, class)`：
-  连续失败 +1，达 `failure_threshold` 即 `Open { opened_at_ms }`；Fatal 在本骨架仅记录，
-  停止语义由 `decide` 配合 `max_attempts` 体现。
-- E4 场景：`smart_retry.toml`（id=`product.smart-retry`）--退避指数序列、超次数 StopRetry、
-  达阈值 Open、冷却期内 CircuitOpen、过冷却放行一次、record_success 复位。
-- 冻结边界（P2.3 不做）：真实异步调度、jitter 防惊群、半开后真实试探过渡、真实单调时钟
-  （`now_ms` 由调用方注入，留 TODO）。
-
-### 12.17 P3.2 真实 TUN 数据面驱动（2026-09-21） {#12-tun-dataplane}
-
-接 P3.1（§12.16 mock carrier 留真实 TUN 到 P3-2 的边界）：把"装配隧道"从
+### 12.29 P3.2 真实 TUN 数据面驱动（2026-09-21）{#12-tun-dataplane}
+接 P3.1（§12.28 mock carrier 留真实 TUN 到 P3-2 的边界）：把"装配隧道"从
 内存 mock 升级为真实系统数据面。三层：
 
 - **真实承载** `UdpCarrier`（nexus-platform，实现 `PacketCarrier`）：标准 UDP
@@ -1387,20 +1449,42 @@ CLI 走进程内 SDK（同 `run` 路径），状态为本地文件（默认 `~/.
   send_to 按 locator 发、receive_into 收一帧，无数据 Ok(0)）。
 - **真实虚拟网卡**：
   - Windows：复用 `nexus-platform-windows::WintunVpiAdapter`（窄 wintun C ABI
-    绑定已落地，§12.10 后 PRODUCT 记录）：加载签名 `wintun.dll`（wintun.net
+    绑定已落地，§11.2 后 PRODUCT 记录）：加载签名 `wintun.dll`（wintun.net
     分发）→ 创建命名 Layer3 适配器 → 会话读写 IP 帧；需管理员。
   - Linux：新增 `nexus-platform-linux::TunVpi`（`/dev/net/tun` + ioctl，窄 FFI
     unsafe 集中一个模块，仿 wintun.rs 纪律）；读写 IP 帧；需 root/cap_net_admin。
 - **CLI 装配**：`nexus subnet up --tun [--tun-name <n>] [--listen <locator>]` 用真实
   `WintunVpiAdapter`/`TunVpi` + `UdpCarrier` 替代 `MemoryVpi` + `MeshCarrier`；
-  无 `--tun` 行为不变（§12.16 mock）。装配失败（dll 缺失 / 权限不足 /
+  无 `--tun` 行为不变（§12.28 mock）。装配失败（dll 缺失 / 权限不足 /
   驱动未安装）→ `{ verdict:"TUN_ERROR", error:"..." }`（exit 0 结构化）。
   `--tun` 时本地 UDP 承载默认绑定 `udp://0.0.0.0:0`（OS 分配端口），可用
   `--listen <locator>` 覆盖。
-- 冻结边界（P3.2 不做）：路由表/防火墙改写（§12.10 网络栈管理后置）、
+- 冻结边界（P3.2 不做）：路由表/防火墙改写（网络栈管理能力后置，P3.x）、
   DNS 覆写、多适配器管理、隧道持续运行（daemon 托管留 P3.3）。
 
 E4 场景 `tun_dataplane.toml`：UdpCarrier 本地回环收发对齐（E4 可离线闭环）、
 `--tun` 装配错误路径（无 dll/无权限 → TUN_ERROR 结构化）、Linux TunVpi
 参数校验纯逻辑。真实设备验收走 E5（Windows 真机：wintun.dll 安装 + 适配器
 创建 + 帧读写；管理员权限是前置条件）。
+
+### 12.30 P3.3 加密持久化（secure-store）（2026-09-21）{#12-secure-store}
+
+平台级加密持久化（designs P3 §132-138）：把敏感状态/配置以"系统保护"形式落盘，
+替代明文。两层：
+
+- **平台实现**（`SecureStore` trait，get/put）：
+  - Windows：`nexus-platform-windows::DpapiSecureStore`——DPAPI 窄 FFI
+    （CryptProtectData/CryptUnprotectData，仿 wintun.rs unsafe 纪律）；
+    绑定当前 Windows 用户 + 机器，无需管理员。
+  - Linux：`nexus-platform-linux::FileSecureStore`——密钥派生自
+    `/etc/machine-id`（HKDF-SHA256，ring）+ ChaCha20-Poly1305 AEAD 加密文件；
+    文件权限 0600。machine-id 缺失 → `Unavailable`（平台能力缺失）。
+- **文件格式**：`NEXSEC1` magic + 12 字节 nonce + ciphertext（ring AEAD）。
+- **能力声明**：`caps.secure_store`（Windows DPAPI → true；Linux machine-id
+  存在 → true）。缺失时调用方走 `Unavailable` 结构化降级。
+- 冻结边界（P3.3 不做）：CLI/状态文件加密集成（`subnet up --encrypt-state`
+  留 P3.4）、密钥轮换、多用户密钥共享、TEE/HSM。
+
+E4 场景 `secure_store.toml`：DPAPI put/get 往返 + 缺失键 Ok(None)（Windows
+真机，无需管理员）+ machine-id 解析纯函数（合法/非法）+ ring AEAD 加解密
+往返 + 文件 magic/密文≠明文。Linux 真机文件权限走 E5（WSL/真实 Linux）。

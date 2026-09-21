@@ -353,7 +353,7 @@ cargo clippy -p nexus-connectivity --all-targets -- -D warnings
   - 接收侧：dst==本机 vip 或命中 local_prefixes 才写 VPI，否则转发。
 - 边界：`routing.rs`（距离矢量 P1.1）不耦合本模块；协调器广播/出口 NAT/P3。
 
-### 冻结契约（子网 CLI 消费边界 P3.1，PRODUCT §12.16）
+### 冻结契约（子网 CLI 消费边界 P3.1，PRODUCT §12.28）
 
 - 配置装配（apps/nexus Composition Root）经 `VirtualSubnetConfig::new(cidr, virtual_ip)`
   与 `is_valid_virtual_ip` 校验；cidr 由 `cidr::parse_cidr` 把关。
@@ -363,7 +363,7 @@ cargo clippy -p nexus-connectivity --all-targets -- -D warnings
 - 不变量：配置校验失败不得进入装配（先校验后装配）；CLI 状态文件不是
   crate 层概念（crate 无 I/O）。
 
-### 冻结契约（真实数据面消费边界 P3.2，PRODUCT §12.17）
+### 冻结契约（真实数据面消费边界 P3.2，PRODUCT §12.29）
 
 - 装配语义扩展：`subnet up --tun` 时 `VirtualSubnetTunnel` 的 VPI 取
   `WintunVpiAdapter`/`TunVpi`、carrier 取 `UdpCarrier`；其余装配不变（§12.16）。
@@ -372,3 +372,11 @@ cargo clippy -p nexus-connectivity --all-targets -- -D warnings
   `udp://<host>:<port>` 并绑定，`receive_into` 无数据 Ok(0)。
 - 不变量：CLI 装配失败（VPI/carrier 创建）不得落到状态文件写入；mock 与真实
   数据面在 tunnel 层无分支（仅构造期选择）。
+
+### 冻结契约（加密持久化消费边界 P3.3，PRODUCT §12.30）
+
+- `SecureStore`（nexus-platform）语义：`get` 缺失键 → `Ok(None)`；`put` 幂等覆盖；
+  平台能力缺失 → `Unavailable`（不 panic、不 fallback 明文）。
+- 平台实现职责：Windows `DpapiSecureStore`（DPAPI，绑定用户+机器）；
+  Linux `FileSecureStore`（machine-id 派生密钥 + AEAD 文件）。crate 层无
+  全局状态；文件格式 `NEXSEC1` 为平台实现内部约定。

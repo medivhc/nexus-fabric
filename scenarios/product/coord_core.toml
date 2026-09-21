@@ -2,7 +2,7 @@ schema_version = 1
 id = "product.coord-core"
 title = "协调核心：自动 IP 分配器 + 协调器纯函数 + 帧编解码（E4）"
 evidence_strength = "E4"
-requirement = "PRODUCT.md#12-13-P2.3+P2.4-广域协调核心-自动-IP-分配"
+requirement = "PRODUCT.md#12-coord"
 
 [given]
 subnet_cidr = "10.99.0.0/24"

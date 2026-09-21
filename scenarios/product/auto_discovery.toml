@@ -2,7 +2,7 @@ schema_version = 1
 id = "product.auto-discovery"
 title = "自动节点发现：引导注册 + 对等节点发现 + Direct/Relay 建连回退"
 evidence_strength = "E4"
-requirement = "PRODUCT.md#discovery"
+requirement = "PRODUCT.md#remote"
 
 [given]
 bootstrap_nodes = "bootstrap-1,bootstrap-2"
