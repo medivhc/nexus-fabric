@@ -37,7 +37,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-native-certs = { version = "0.8", default-features = false }
 nexus-storage = { path = "../../crates/nexus-storage" }
 nexus-platform = { path = "../../crates/nexus-platform" }
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
+toml = "0.8"
 
 [dev-dependencies]
 # 仅示例/测试：本地 TLS server 自签证书（§11.14 E5 离线确定性闭环）。

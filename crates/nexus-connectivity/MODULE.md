@@ -352,3 +352,13 @@ cargo clippy -p nexus-connectivity --all-targets -- -D warnings
   - 帧头不剥不改（§12.5 保持）；
   - 接收侧：dst==本机 vip 或命中 local_prefixes 才写 VPI，否则转发。
 - 边界：`routing.rs`（距离矢量 P1.1）不耦合本模块；协调器广播/出口 NAT/P3。
+
+### 冻结契约（子网 CLI 消费边界 P3.1，PRODUCT §12.16）
+
+- 配置装配（apps/nexus Composition Root）经 `VirtualSubnetConfig::new(cidr, virtual_ip)`
+  与 `is_valid_virtual_ip` 校验；cidr 由 `cidr::parse_cidr` 把关。
+- `VirtualSubnetTunnel` 装配语义：peers → `add_peer` + `set_peer_state`；
+  精确路由 `add_route`；前缀路由 `add_prefix_route`；本地前缀 `add_local_prefix`；
+  出口 `mark_egress`；加密 `enable_encryption`（P2-1 §12.7）。
+- 不变量：配置校验失败不得进入装配（先校验后装配）；CLI 状态文件不是
+  crate 层概念（crate 无 I/O）。

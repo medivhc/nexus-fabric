@@ -18,8 +18,10 @@
 
 use nexus::control_service::{ControlServiceImpl, render_text};
 use nexus::localapi_client::{self, DEFAULT_LOCALAPI_ADDR};
+use nexus::subnet_cli::{default_state_path, subnet_leave, subnet_status, subnet_up};
 use nexus_control_api::{ControlCommand, ResourceId, SessionId};
 use serde_json::Value;
+use std::path::PathBuf;
 
 const USAGE: &str = "\
 nexus — Nexus 统一 Resource Fabric 控制面 CLI（瘦客户端）
@@ -150,6 +152,11 @@ fn run(args: &[String]) -> i32 {
         return 0;
     }
 
+    // 子网命令族走进程内 SDK（PRODUCT §12.16）。
+    if args[0].as_str() == "subnet" {
+        return run_subnet(&args[1..], json_mode);
+    }
+
     let command = match parse_command(&args) {
         Ok(cmd) => cmd,
         Err(msg) => {
@@ -221,6 +228,72 @@ fn render_and_exit(json: &Value, json_mode: bool) -> i32 {
     0
 }
 
+/// `subnet up/status/leave`：进程内 SDK（LocalAPI 无 subnet 路由，同 `run` 路径）。
+/// 配置/状态路径由 `--config <path>` / `--state <path>` 指定，默认
+/// `~/.nexus/subnet.json`（PRODUCT §12.16）。
+fn run_subnet(args: &[String], json_mode: bool) -> i32 {
+    let Some(sub) = args.first() else {
+        eprintln!("error: missing subnet subcommand (up|status|leave)");
+        eprint!("{USAGE}");
+        return 2;
+    };
+    let mut config: Option<PathBuf> = None;
+    let mut state: Option<PathBuf> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--config" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("error: missing value for --config");
+                    return 2;
+                };
+                config = Some(PathBuf::from(v));
+                i += 2;
+            }
+            "--state" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("error: missing value for --state");
+                    return 2;
+                };
+                state = Some(PathBuf::from(v));
+                i += 2;
+            }
+            other if other.starts_with("--") => {
+                eprintln!("error: unknown option: {other}");
+                return 2;
+            }
+            other => {
+                eprintln!("error: unexpected argument: {other}");
+                return 2;
+            }
+        }
+    }
+    let state_path = state.unwrap_or_else(default_state_path);
+    let json = match sub.as_str() {
+        "up" => {
+            let Some(cfg) = config else {
+                eprintln!("error: subnet up requires --config <path>");
+                return 2;
+            };
+            match subnet_up(&cfg, &state_path) {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({
+                    "verdict": "CONFIG_ERROR",
+                    "command": "subnet up",
+                    "error": e,
+                }),
+            }
+        }
+        "status" => subnet_status(&state_path),
+        "leave" => subnet_leave(&state_path),
+        other => {
+            eprintln!("error: unknown subnet subcommand: {other}");
+            eprint!("{USAGE}");
+            return 2;
+        }
+    };
+    render_and_exit(&json, json_mode)
+}
 fn parse_command(args: &[String]) -> Result<ControlCommand, String> {
     let need = |i: usize, what: &str| -> Result<String, String> {
         args.get(i)

@@ -1,0 +1,82 @@
+schema_version = 1
+id = "product.cli-subnet"
+title = "子网 CLI：TOML 配置装配 + up/status/leave 状态闭环（E4）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-16-P3.1-子网-CLI-与-TOML-配置"
+
+[given]
+subnet_cidr = "10.99.0.0/24"
+node_a_vip = "10.99.0.1"
+node_b_vip = "10.99.0.2"
+node_c_vip = "10.99.0.3"
+
+# 可执行 E4（example subnet_cli --json，进程内全闭环，tmp 状态文件）：
+# - up：TOML 配置装配（vip/cidr/peers/routes/prefix_routes/local_prefixes/egress/
+#   encryption 全落位）+ 状态文件写入 + 同 vip 幂等覆盖；
+# - status：读状态文件输出隧道字段；
+# - leave：清除状态（left=true），再 status → up=false；
+# - 配置非法四类拒绝：cidr 非法 / virtual_ip 不在子网 / peer 不在子网 /
+#   文件缺失 → verdict=CONFIG_ERROR。
+
+[when]
+command = "cargo run --quiet -p nexus --example subnet_cli -- --json"
+
+[[expect]]
+field = "up.up_ok"
+equals = true
+
+[[expect]]
+field = "up.virtual_ip"
+equals = "10.99.0.1"
+
+[[expect]]
+field = "up.cidr"
+equals = "10.99.0.0/24"
+
+[[expect]]
+field = "up.peer_count"
+equals = 2
+
+[[expect]]
+field = "up.egress_peer_count"
+equals = 1
+
+[[expect]]
+field = "up.prefix_route_count"
+equals = 1
+
+[[expect]]
+field = "up.encryption"
+equals = true
+
+[[expect]]
+field = "status.read_back_vip"
+equals = "10.99.0.1"
+
+[[expect]]
+field = "status.peer_count"
+equals = 2
+
+[[expect]]
+field = "leave.left"
+equals = true
+
+[[expect]]
+field = "status_after_leave.up"
+equals = false
+
+[[expect]]
+field = "config.bad_cidr"
+equals = "CONFIG_ERROR"
+
+[[expect]]
+field = "config.vip_outside_subnet"
+equals = "CONFIG_ERROR"
+
+[[expect]]
+field = "config.peer_outside_subnet"
+equals = "CONFIG_ERROR"
+
+[[expect]]
+field = "config.missing_file"
+equals = "CONFIG_ERROR"

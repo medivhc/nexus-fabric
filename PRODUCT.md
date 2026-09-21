@@ -1226,3 +1226,35 @@ PresenceRegistry 的"通告/过期"语义扩展到广域（本模块独立实现
 - E4 场景：`traffic_stats.toml`（id=`product.traffic-stats`）——字节累加、连接增减、
   未知节点 None、跨节点 snapshot 汇总、上限饱和。
 - 冻结边界（P2.3 不做）：真实数据面字节 hook、指标导出到可观测层、周期快照（留 TODO）。
+
+### 12.16 P3.1 子网 CLI 与 TOML 配置（2026-09-21） {#12-subnet-cli}
+
+产品化第一块：用户可用的 `nexus subnet` 命令族 + TOML 配置格式（designs P3 §132-138）。
+CLI 走进程内 SDK（同 `run` 路径），状态为本地文件（默认 `~/.nexus/subnet.json`，
+`--state <path>` 可覆盖；NEXUS_HOME 影响默认目录）。
+
+- `nexus subnet up --config <path> [--state <path>] [--json]`：读 TOML → 校验 →
+  进程内装配 `VirtualSubnetTunnel`（MeshCarrier mock carrier，真实 TUN 留 P3-2）→
+  状态写状态文件 → 输出 `{ verdict, command:"subnet up", subnet:{ up, tunnel_id,
+  virtual_ip, cidr, peer_count, egress_peer_count, prefix_route_count, encryption } }`。
+  同 virtual_ip 重复 up → 幂等覆盖（刷新状态文件）。
+- `nexus subnet status [--state <path>] [--json]`：读状态文件输出隧道状态；无状态
+  → `{ verdict:"DOWN", command:"subnet status", subnet:{ up:false } }`（exit 0）。
+- `nexus subnet leave [--state <path>] [--json]`：删除状态文件 →
+  `{ verdict, command:"subnet leave", subnet:{ left:true } }`；无状态 → left:false。
+- TOML 配置（`[subnet]` 表）：
+  - `cidr`（必填，"10.99.0.0/24"，`cidr::parse_cidr` 校验）；
+  - `virtual_ip`（必填，须在 cidr 内——`is_valid_virtual_ip`）；
+  - `encryption = false`（默认关，P2-1 §12.7 开关）；
+  - `[[peers]]`：`virtual_ip` + `locator`（virtual_ip 须在 cidr 内）；
+  - `[[routes]]`：`dst` + `next_hop`（§12.5 精确路由）；
+  - `[[prefix_routes]]`：`cidr` + `next_hop`（§12.14 前缀路由）；
+  - `local_prefixes = ["192.168.5.0/24"]`（§12.14 本地可达前缀）；
+  - `egress = ["10.99.0.2"]`（§12.14 出口节点标记）。
+- 配置校验错误（cidr 非法 / virtual_ip 不在子网 / peer 不在子网 / 文件缺失 /
+  TOML 解析失败）→ `{ verdict:"CONFIG_ERROR", error:"..." }`（exit 0，结构化）。
+- E4 场景：`cli_subnet.toml`（id=`product.cli-subnet`，example 进程内全闭环）——
+  up（装配字段）/ status（读状态）/ leave（清除）/ up 幂等 / 配置非法四类拒绝 /
+  encryption 开关。
+- 冻结边界（P3.1 不做）：真实 TUN（P3-2）、nexusd daemon 托管、持续运行
+  （CLI 单次命令语义）、订阅配置热重载。

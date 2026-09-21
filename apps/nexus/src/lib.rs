@@ -21,6 +21,7 @@ pub mod localapi_client;
 /// dns status / dns cache / platform capabilities），见 PRODUCT.md#9-observability。
 pub mod observability;
 pub mod provider_fetcher;
+pub mod subnet_cli;
 
 use nexus_domain::{
     LifecyclePhase, NexusError, ProviderId, ResourceId, SessionId, TerminalOutcome,
@@ -6607,6 +6608,160 @@ pub fn traffic_stats_flow() -> Result<Value, NexusError> {
             "total_tx_bytes": snap.total_tx_bytes,
             "active_connections": snap.active_connections,
             "active_nodes": snap.active_nodes,
+        },
+    }))
+}
+
+/// E4 产品场景 `product.cli-subnet` 的可执行驱动。
+///
+/// 进程内全闭环：写 fixture TOML → up（装配+状态文件）→ 幂等 up → status →
+/// leave → status（down）→ 四类非法配置拒绝（CONFIG_ERROR）。
+pub fn subnet_cli_flow() -> Result<Value, NexusError> {
+    use crate::subnet_cli::{subnet_leave, subnet_status, subnet_up};
+    use std::path::PathBuf;
+
+    fn write_cfg(path: &std::path::Path, text: &str) -> Result<(), String> {
+        std::fs::write(path, text).map_err(|e| format!("write cfg: {e}"))
+    }
+
+    let dir = std::env::temp_dir().join(format!("nexus-subnet-cli-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| NexusError::Internal {
+        message: e.to_string(),
+    })?;
+    let cfg_ok = dir.join("subnet-ok.toml");
+    let cfg_bad_cidr = dir.join("subnet-bad-cidr.toml");
+    let cfg_vip_outside = dir.join("subnet-vip-outside.toml");
+    let cfg_peer_outside = dir.join("subnet-peer-outside.toml");
+    let cfg_missing = dir.join("subnet-missing.toml");
+    let state = dir.join("subnet-state.json");
+
+    let ok_text = r#"[subnet]
+cidr = "10.99.0.0/24"
+virtual_ip = "10.99.0.1"
+encryption = true
+local_prefixes = ["192.168.5.0/24"]
+egress = ["10.99.0.2"]
+
+[[subnet.peers]]
+virtual_ip = "10.99.0.2"
+locator = "udp://127.0.0.1:42001"
+
+[[subnet.peers]]
+virtual_ip = "10.99.0.3"
+locator = "udp://127.0.0.1:42002"
+
+[[subnet.routes]]
+dst = "10.99.0.9"
+next_hop = "10.99.0.2"
+
+[[subnet.prefix_routes]]
+cidr = "192.168.5.0/24"
+next_hop = "10.99.0.2"
+"#;
+    write_cfg(&cfg_ok, ok_text).map_err(|e| NexusError::Internal { message: e })?;
+    write_cfg(
+        &cfg_bad_cidr,
+        r#"[subnet]
+cidr = "999.1.1.0/24"
+virtual_ip = "10.99.0.1"
+"#,
+    )
+    .map_err(|e| NexusError::Internal { message: e })?;
+    write_cfg(
+        &cfg_vip_outside,
+        r#"[subnet]
+cidr = "10.99.0.0/24"
+virtual_ip = "10.99.1.1"
+"#,
+    )
+    .map_err(|e| NexusError::Internal { message: e })?;
+    write_cfg(
+        &cfg_peer_outside,
+        r#"[subnet]
+cidr = "10.99.0.0/24"
+virtual_ip = "10.99.0.1"
+
+[[subnet.peers]]
+virtual_ip = "10.99.1.1"
+locator = "udp://127.0.0.1:42001"
+"#,
+    )
+    .map_err(|e| NexusError::Internal { message: e })?;
+
+    // up（首次）
+    let up_json = subnet_up(&cfg_ok, &state).map_err(|e| NexusError::Internal { message: e })?;
+    // up 幂等（同 vip 覆盖，仍成功）
+    subnet_up(&cfg_ok, &state).map_err(|e| NexusError::Internal { message: e })?;
+    let up = up_json.get("subnet").cloned().unwrap_or_default();
+
+    // status（读回）
+    let status_json = subnet_status(&state);
+    let read_back_vip = status_json
+        .get("subnet")
+        .and_then(|s| s.get("virtual_ip"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let status_peer_count = status_json
+        .get("subnet")
+        .and_then(|s| s.get("peer_count"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    // leave
+    let leave_json = subnet_leave(&state);
+    let left = leave_json
+        .get("subnet")
+        .and_then(|s| s.get("left"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // status after leave → down
+    let status_after = subnet_status(&state);
+    let up_after_leave = status_after
+        .get("subnet")
+        .and_then(|s| s.get("up"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    // 四类非法配置
+    let classify = |path: &PathBuf| -> String {
+        match subnet_up(path, &state) {
+            Err(_) => "CONFIG_ERROR".to_string(),
+            Ok(_) => "ACCEPTED".to_string(),
+        }
+    };
+    let bad_cidr = classify(&cfg_bad_cidr);
+    let vip_outside_subnet = classify(&cfg_vip_outside);
+    let peer_outside_subnet = classify(&cfg_peer_outside);
+    let missing_file = classify(&cfg_missing);
+
+    // 清理
+    std::fs::remove_dir_all(&dir).ok();
+
+    Ok(serde_json::json!({
+        "verdict": "PASS",
+        "command": "subnet cli",
+        "up": {
+            "up_ok": true,
+            "virtual_ip": up.get("virtual_ip").and_then(|v| v.as_str()).unwrap_or_default(),
+            "cidr": up.get("cidr").and_then(|v| v.as_str()).unwrap_or_default(),
+            "peer_count": up.get("peer_count").and_then(|v| v.as_u64()).unwrap_or(0),
+            "egress_peer_count": up.get("egress_peer_count").and_then(|v| v.as_u64()).unwrap_or(0),
+            "prefix_route_count": up.get("prefix_route_count").and_then(|v| v.as_u64()).unwrap_or(0),
+            "encryption": up.get("encryption").and_then(|v| v.as_bool()).unwrap_or(false),
+        },
+        "status": {
+            "read_back_vip": read_back_vip,
+            "peer_count": status_peer_count,
+        },
+        "leave": { "left": left },
+        "status_after_leave": { "up": up_after_leave },
+        "config": {
+            "bad_cidr": bad_cidr,
+            "vip_outside_subnet": vip_outside_subnet,
+            "peer_outside_subnet": peer_outside_subnet,
+            "missing_file": missing_file,
         },
     }))
 }
