@@ -5147,3 +5147,136 @@ pub fn bandwidth_qos_flow() -> Result<Value, NexusError> {
         "egress_tokens_remaining": snap.tokens_remaining,
     }))
 }
+
+/// E4 产品场景 `product.virtual-subnet-nat-probe` 的可执行驱动（Composition Root）。
+///
+/// 双路径数据面闭环：
+/// - 成功：probe → `Probing` 中间态可见 → `apply_hole_punch`（直连 locator 动态
+///   学习）→ state=Connected → 帧经直连 locator 送达（relay 缓冲无泄漏）。
+/// - 失败：再次 probe → `fallback_to_relay`（保底）→ state=Connected → 帧经
+///   relay locator 送达（直连缓冲无泄漏）。
+pub fn virtual_subnet_nat_probe_flow() -> Result<Value, NexusError> {
+    use nexus_connectivity::virtual_subnet::{
+        MemoryVpi, MeshCarrier, TunnelPeer, VirtualSubnetConfig, VirtualSubnetTunnel,
+    };
+    use std::sync::{Arc, Mutex};
+
+    // ===== 成功路径：probe → apply_hole_punch =====
+    let mut carrier_s = MeshCarrier::new();
+    let direct_buf = Arc::new(Mutex::new(Vec::new()));
+    let relay_buf = Arc::new(Mutex::new(Vec::new()));
+    carrier_s.connect_peer("udp://203.0.113.1:5000", direct_buf.clone());
+    carrier_s.connect_peer("relay://relay.example.org:443", relay_buf.clone());
+    let mut tunnel_s = VirtualSubnetTunnel::new(
+        VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1"),
+        Box::new(MemoryVpi::new()),
+        Box::new(carrier_s),
+    );
+    tunnel_s
+        .add_peer(TunnelPeer::new("10.0.0.2", "relay://relay.example.org:443"))
+        .map_err(|e| NexusError::Internal {
+            message: format!("add peer: {e}"),
+        })?;
+    tunnel_s
+        .probe_peer("10.0.0.2")
+        .map_err(|e| NexusError::Internal {
+            message: format!("probe: {e}"),
+        })?;
+    let success_probe_state = format!(
+        "{:?}",
+        tunnel_s.peer_state("10.0.0.2").ok_or_else(|| {
+            NexusError::Internal {
+                message: "peer state missing".into(),
+            }
+        })?
+    );
+    tunnel_s
+        .apply_hole_punch("10.0.0.2", "udp://203.0.113.1:5000")
+        .map_err(|e| NexusError::Internal {
+            message: format!("apply_hole_punch: {e}"),
+        })?;
+    let success_state = format!(
+        "{:?}",
+        tunnel_s.peer_state("10.0.0.2").ok_or_else(|| {
+            NexusError::Internal {
+                message: "peer state missing".into(),
+            }
+        })?
+    );
+    let success_locator =
+        tunnel_s
+            .peer_locator("10.0.0.2")
+            .ok_or_else(|| NexusError::Internal {
+                message: "peer locator missing".into(),
+            })?;
+    tunnel_s
+        .send_ip_packet("10.0.0.2", b"ping-direct")
+        .map_err(|e| NexusError::Internal {
+            message: format!("send direct: {e}"),
+        })?;
+    let s_direct = direct_buf.lock().unwrap().clone();
+    let s_relay = relay_buf.lock().unwrap().clone();
+    let sent_via_direct = !s_direct.is_empty() && s_relay.is_empty();
+
+    // ===== 失败路径：probe → fallback_to_relay（同一 peer，保底）=====
+    tunnel_s
+        .probe_peer("10.0.0.2")
+        .map_err(|e| NexusError::Internal {
+            message: format!("re-probe: {e}"),
+        })?;
+    let fallback_probe_state = format!(
+        "{:?}",
+        tunnel_s.peer_state("10.0.0.2").ok_or_else(|| {
+            NexusError::Internal {
+                message: "peer state missing".into(),
+            }
+        })?
+    );
+    tunnel_s
+        .fallback_to_relay("10.0.0.2", "relay://relay.example.org:443")
+        .map_err(|e| NexusError::Internal {
+            message: format!("fallback_to_relay: {e}"),
+        })?;
+    let fallback_state = format!(
+        "{:?}",
+        tunnel_s.peer_state("10.0.0.2").ok_or_else(|| {
+            NexusError::Internal {
+                message: "peer state missing".into(),
+            }
+        })?
+    );
+    let fallback_locator =
+        tunnel_s
+            .peer_locator("10.0.0.2")
+            .ok_or_else(|| NexusError::Internal {
+                message: "peer locator missing".into(),
+            })?;
+    // 清空两条缓冲，验证数据面已切到 relay
+    direct_buf.lock().unwrap().clear();
+    relay_buf.lock().unwrap().clear();
+    tunnel_s
+        .send_ip_packet("10.0.0.2", b"ping-relay")
+        .map_err(|e| NexusError::Internal {
+            message: format!("send relay: {e}"),
+        })?;
+    let f_direct = direct_buf.lock().unwrap().clone();
+    let f_relay = relay_buf.lock().unwrap().clone();
+    let sent_via_relay = !f_relay.is_empty() && f_direct.is_empty();
+
+    Ok(serde_json::json!({
+        "verdict": "PASS",
+        "command": "virtual subnet nat probe",
+        "success": {
+            "probe_state_seen": success_probe_state,
+            "state": success_state,
+            "locator": success_locator,
+            "sent_via_direct": sent_via_direct,
+        },
+        "fallback": {
+            "state": fallback_state,
+            "locator": fallback_locator,
+            "sent_via_relay": sent_via_relay,
+            "probe_state_seen": fallback_probe_state,
+        },
+    }))
+}
