@@ -1007,3 +1007,42 @@ delivery 层（`nexus-connectivity::qos`）。纯内存、纯同步、可注入�
   - (e) bytes_allowed=1800、bytes_dropped=100（拒绝字节不计入 allowed）。
 - 冻结边界（P2 不做）：整形排队（缓冲/平滑）、优先级 / 公平排队、per-flow 哈希分流、
   真实 socket/TUN 挂接、配置热加载与持久化（留 TODO）；不引入 `time` crate，仅 std。
+
+### 12.9 P2.2 NAT 打洞集成（数据面闭环，2026-09-21）
+
+nat.rs（`nexus-connectivity::nat`：StunClient / HolePuncher / NatType，PRODUCT §connectivity）
+已交付且 E4 已绿；§12.1-§12.8 的 peer locator 为**静态配置注入**。本节把打洞接入
+虚拟子网数据面：打洞成功 → peer locator **动态学习**（切直连）；失败 → **Relay
+回退**（保底路径）。tunnel 侧不持有真实 UDP socket（保持 portable 边界，真实
+socket 集成留 P3 产品化）；打洞由外部 HolePuncher 驱动后经隧道 API 落账。
+
+- `TunnelState` 新增 `Probing`（打洞中间态，Disconnected → Probing → Connected /
+  Failed 转换）。
+- 接入 API（`VirtualSubnetTunnel`）：
+  - `probe_peer(peer_virtual_ip) -> Result<(), ConnectivityError>`：peer 置
+    `Probing`，发 `ProbeStarted` 事件。
+  - `apply_hole_punch(peer_virtual_ip, direct_locator) -> Result<(), ConnectivityError>`：
+    打洞成功 → peers locator 更新为直连地址（动态学习）+ state `Connected` +
+    `PeerLocatorUpdated` 事件；此后发送走新 locator。
+  - `fallback_to_relay(peer_virtual_ip, relay_locator) -> Result<(), ConnectivityError>`：
+    打洞失败 → peers locator 切 relay + state `Connected` + `RelayFallback` 事件；
+    保底路径。
+  - `peer_locator(peer_virtual_ip) -> Option<String>`：查询当前 locator（动态
+    学习结果可观察）。
+- 数据面语义：locator 更新**即刻生效**（`send_ip_packet` 使用 peers 表当前
+  locator）；§12.5 路由 / §12.7 加密语义不变。
+- 事件：`VirtualSubnetEvent` 新增 `ProbeStarted { peer_id }` /
+  `PeerLocatorUpdated { peer_id, new_locator }` / `RelayFallback { peer_id,
+  relay_locator }`（tunnel_id 贯通，与 NatEvent 语义对齐）。
+- 失败语义：对未注册 peer 的 probe / apply / fallback → `PEER_NOT_FOUND`；
+  已注册 peer 的 apply / fallback 幂等（允许覆盖更新 locator）。
+- E2 单测：成功路径（probe → apply → locator 更新 + Connected + 帧走新
+  locator）、失败路径（probe → fallback → locator=relay + Connected + 帧走
+  relay）、未知 peer 拒绝。
+- E4 场景：`virtual_subnet_nat_probe.toml`（id=product.virtual-subnet-nat-probe）——
+  双路径：成功（probe → apply_hole_punch("udp://203.0.113.1:5000") → locator
+  更新 + Connected + 帧经直连 locator 送达）与失败（probe →
+  fallback_to_relay("relay://relay.example:443") → locator=relay + Connected +
+  帧经 relay 送达）；断言含 `Probing` 中间态可见。
+- 冻结边界（P2.2 不做）：tunnel 内真实 UDP 打洞（HolePuncher 挂接留 P3）、
+  打洞重试策略、多候选并发打洞、NAT 类型驱动的路径选择。

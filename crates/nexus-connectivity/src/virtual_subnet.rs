@@ -95,6 +95,8 @@ impl TunnelPeer {
 pub enum TunnelState {
     /// 鏈繛鎺ャ€?
     Disconnected,
+    /// NAT hole-punch probing in progress (P2.2 §12.9).
+    Probing,
     /// 鎻℃墜杩涜涓€?
     Handshaking,
     /// 宸茶繛鎺ャ€?
@@ -143,6 +145,31 @@ pub enum VirtualSubnetEvent {
         peer_id: String,
         /// 鏂扮姸鎬併€?
         new_state: TunnelState,
+    },
+    /// Hole-punch probe started for a peer (P2.2 §12.9).
+    ProbeStarted {
+        /// Tunnel ID.
+        tunnel_id: String,
+        /// Peer ID.
+        peer_id: String,
+    },
+    /// Peer locator dynamically updated after successful hole punch (P2.2 §12.9).
+    PeerLocatorUpdated {
+        /// Tunnel ID.
+        tunnel_id: String,
+        /// Peer ID.
+        peer_id: String,
+        /// New direct locator.
+        new_locator: String,
+    },
+    /// Peer fell back to relay after hole-punch failure (P2.2 §12.9).
+    RelayFallback {
+        /// Tunnel ID.
+        tunnel_id: String,
+        /// Peer ID.
+        peer_id: String,
+        /// Relay locator.
+        relay_locator: String,
     },
     /// 鏁版嵁鍖呭凡鍙戦€併€?
     PacketSent {
@@ -443,6 +470,91 @@ impl VirtualSubnetTunnel {
         Ok(())
     }
 
+    /// Start NAT hole-punch probing for a peer (P2.2 §12.9).
+    ///
+    /// Transitions the peer to `Probing` and emits `ProbeStarted`.
+    pub fn probe_peer(&mut self, peer_virtual_ip: &str) -> Result<(), ConnectivityError> {
+        let peer_id = self
+            .peers
+            .get(peer_virtual_ip)
+            .map(|(id, _, _, _)| id.clone())
+            .ok_or_else(|| ConnectivityError::Invalid {
+                message: format!("PEER_NOT_FOUND: peer {peer_virtual_ip} not found"),
+            })?;
+        self.set_peer_state(peer_virtual_ip, TunnelState::Probing);
+        self.events.push(VirtualSubnetEvent::ProbeStarted {
+            tunnel_id: self.tunnel_id.clone(),
+            peer_id,
+        });
+        Ok(())
+    }
+
+    /// Apply a successful hole-punch result: dynamically learn the peer's direct
+    /// locator and switch the data plane to it (P2.2 §12.9).
+    pub fn apply_hole_punch(
+        &mut self,
+        peer_virtual_ip: &str,
+        direct_locator: impl Into<String>,
+    ) -> Result<(), ConnectivityError> {
+        let (peer_id, new_locator) = {
+            let _entry =
+                self.peers
+                    .get_mut(peer_virtual_ip)
+                    .ok_or_else(|| ConnectivityError::Invalid {
+                        message: format!("PEER_NOT_FOUND: peer {peer_virtual_ip} not found"),
+                    })?;
+            (_entry.0.clone(), direct_locator.into())
+        };
+        let mut locator_new = None;
+        if let Some((_, locator, _, _)) = self.peers.get_mut(peer_virtual_ip) {
+            locator_new = Some(std::mem::replace(locator, new_locator.clone()));
+        }
+        let _ = locator_new;
+        self.set_peer_state(peer_virtual_ip, TunnelState::Connected);
+        self.events.push(VirtualSubnetEvent::PeerLocatorUpdated {
+            tunnel_id: self.tunnel_id.clone(),
+            peer_id,
+            new_locator,
+        });
+        Ok(())
+    }
+
+    /// Fall back to a relay path after hole-punch failure (P2.2 §12.9).
+    pub fn fallback_to_relay(
+        &mut self,
+        peer_virtual_ip: &str,
+        relay_locator: impl Into<String>,
+    ) -> Result<(), ConnectivityError> {
+        let (peer_id, new_locator) = {
+            let _entry =
+                self.peers
+                    .get_mut(peer_virtual_ip)
+                    .ok_or_else(|| ConnectivityError::Invalid {
+                        message: format!("PEER_NOT_FOUND: peer {peer_virtual_ip} not found"),
+                    })?;
+            (_entry.0.clone(), relay_locator.into())
+        };
+        let mut locator_new = None;
+        if let Some((_, locator, _, _)) = self.peers.get_mut(peer_virtual_ip) {
+            locator_new = Some(std::mem::replace(locator, new_locator.clone()));
+        }
+        let _ = locator_new;
+        self.set_peer_state(peer_virtual_ip, TunnelState::Connected);
+        self.events.push(VirtualSubnetEvent::RelayFallback {
+            tunnel_id: self.tunnel_id.clone(),
+            peer_id,
+            relay_locator: new_locator,
+        });
+        Ok(())
+    }
+
+    /// Query the peer's current (possibly dynamically learned) locator (P2.2 §12.9).
+    #[must_use]
+    pub fn peer_locator(&self, peer_virtual_ip: &str) -> Option<String> {
+        self.peers
+            .get(peer_virtual_ip)
+            .map(|(_, locator, _, _)| locator.clone())
+    }
     /// 璁剧疆 Peer 鐘舵€併€?
     pub fn set_peer_state(&mut self, virtual_ip: &str, state: TunnelState) {
         if let Some(entry) = self.peers.get_mut(virtual_ip) {
@@ -1400,5 +1512,113 @@ mod tests {
         assert_eq!(len, b"plaintext-ok".len());
         assert!(!ta.is_encryption_enabled());
         Ok(())
+    }
+
+    #[test]
+    fn test_nat_probe_success_updates_locator_and_routes_direct() {
+        // A probes B: initial locator is relay; after successful hole punch the
+        // data plane must switch to the dynamically learned direct locator.
+        let config = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
+        let mut carrier = MeshCarrier::new();
+        let direct_buf = Arc::new(Mutex::new(Vec::new()));
+        let relay_buf = Arc::new(Mutex::new(Vec::new()));
+        carrier.connect_peer("udp://203.0.113.1:5000", direct_buf.clone());
+        carrier.connect_peer("relay://relay.example.org:443", relay_buf.clone());
+        let mut tunnel =
+            VirtualSubnetTunnel::new(config, Box::new(MemoryVpi::new()), Box::new(carrier));
+        tunnel
+            .add_peer(TunnelPeer::new("10.0.0.2", "relay://relay.example.org:443"))
+            .unwrap();
+
+        tunnel.probe_peer("10.0.0.2").unwrap();
+        assert_eq!(tunnel.peer_state("10.0.0.2"), Some(TunnelState::Probing));
+        // Probing is not yet usable for data-plane send.
+        assert!(tunnel.send_ip_packet("10.0.0.2", b"early").is_err());
+
+        tunnel
+            .apply_hole_punch("10.0.0.2", "udp://203.0.113.1:5000")
+            .unwrap();
+        assert_eq!(tunnel.peer_state("10.0.0.2"), Some(TunnelState::Connected));
+        assert_eq!(
+            tunnel.peer_locator("10.0.0.2").as_deref(),
+            Some("udp://203.0.113.1:5000")
+        );
+
+        tunnel.send_ip_packet("10.0.0.2", b"ping-direct").unwrap();
+        let direct = direct_buf.lock().unwrap().clone();
+        let relay = relay_buf.lock().unwrap().clone();
+        assert!(!direct.is_empty());
+        assert!(relay.is_empty());
+
+        let events = tunnel.events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, VirtualSubnetEvent::ProbeStarted { .. }))
+        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, VirtualSubnetEvent::PeerLocatorUpdated { new_locator, .. } if new_locator == "udp://203.0.113.1:5000")));
+    }
+
+    #[test]
+    fn test_nat_probe_failure_falls_back_to_relay() {
+        // A probes B with an initial direct locator; punch fails and the tunnel
+        // falls back to the relay locator: data plane must route via relay.
+        let config = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
+        let mut carrier = MeshCarrier::new();
+        let direct_buf = Arc::new(Mutex::new(Vec::new()));
+        let relay_buf = Arc::new(Mutex::new(Vec::new()));
+        carrier.connect_peer("udp://203.0.113.1:5000", direct_buf.clone());
+        carrier.connect_peer("relay://relay.example.org:443", relay_buf.clone());
+        let mut tunnel =
+            VirtualSubnetTunnel::new(config, Box::new(MemoryVpi::new()), Box::new(carrier));
+        tunnel
+            .add_peer(TunnelPeer::new("10.0.0.2", "udp://203.0.113.1:5000"))
+            .unwrap();
+
+        tunnel.probe_peer("10.0.0.2").unwrap();
+        assert_eq!(tunnel.peer_state("10.0.0.2"), Some(TunnelState::Probing));
+
+        tunnel
+            .fallback_to_relay("10.0.0.2", "relay://relay.example.org:443")
+            .unwrap();
+        assert_eq!(tunnel.peer_state("10.0.0.2"), Some(TunnelState::Connected));
+        assert_eq!(
+            tunnel.peer_locator("10.0.0.2").as_deref(),
+            Some("relay://relay.example.org:443")
+        );
+
+        tunnel.send_ip_packet("10.0.0.2", b"ping-relay").unwrap();
+        let direct = direct_buf.lock().unwrap().clone();
+        let relay = relay_buf.lock().unwrap().clone();
+        assert!(relay.len() > direct.len());
+
+        assert!(tunnel
+            .events()
+            .iter()
+            .any(|e| matches!(e, VirtualSubnetEvent::RelayFallback { relay_locator, .. } if relay_locator == "relay://relay.example.org:443")));
+    }
+
+    #[test]
+    fn test_nat_probe_unknown_peer_fails() {
+        let config = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
+        let mut tunnel = VirtualSubnetTunnel::new(
+            config,
+            Box::new(MemoryVpi::new()),
+            Box::new(MeshCarrier::new()),
+        );
+        let err = tunnel.probe_peer("10.0.0.99").unwrap_err();
+        assert!(err.to_string().contains("PEER_NOT_FOUND"));
+        assert!(
+            tunnel
+                .apply_hole_punch("10.0.0.99", "udp://1.1.1.1:1")
+                .is_err()
+        );
+        assert!(
+            tunnel
+                .fallback_to_relay("10.0.0.99", "relay://r:1")
+                .is_err()
+        );
     }
 }

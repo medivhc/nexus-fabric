@@ -132,6 +132,29 @@ NAT/中继场景的物理建连（组合根 transport::connect）发生在激活
   复用 §6 已冻结的 encryption 原语；新增 API 均为 VirtualSubnetTunnel 方法
   + 一个 KeyPair 分步派生方法，无新 trait、无投机抽象。
 
+### 冻结契约（VirtualSubnet NAT 打洞集成 P2.2，PRODUCT §12.9）
+
+- `TunnelState` 新增 `Probing`（打洞中间态）。
+- `VirtualSubnetTunnel` 新增：
+  - `probe_peer(peer_virtual_ip) -> Result<(), ConnectivityError>`：peer 置
+    `Probing`，发 `ProbeStarted` 事件；未注册 peer → `PEER_NOT_FOUND`。
+  - `apply_hole_punch(peer_virtual_ip, direct_locator) -> Result<(), ConnectivityError>`：
+    打洞成功 → peers locator 动态更新 + state `Connected` + `PeerLocatorUpdated`
+    事件；未注册 peer → `PEER_NOT_FOUND`；幂等（可覆盖更新）。
+  - `fallback_to_relay(peer_virtual_ip, relay_locator) -> Result<(), ConnectivityError>`：
+    打洞失败 → peers locator 切 relay + state `Connected` + `RelayFallback`
+    事件；未注册 peer → `PEER_NOT_FOUND`；幂等。
+  - `peer_locator(peer_virtual_ip) -> Option<String>`：查询当前 locator。
+- 数据面：locator 更新即刻生效（`send_ip_packet` / 转发使用 peers 表当前
+  locator）；§12.5 路由、§12.6 加密语义不变。
+- 事件：`VirtualSubnetEvent` 新增 `ProbeStarted { peer_id }` /
+  `PeerLocatorUpdated { peer_id, new_locator }` /
+  `RelayFallback { peer_id, relay_locator }`。
+- Deletion Test：打洞集成是虚拟子网数据面的独立变化维度（真实公网场景
+  peer locator 动态学习），复用 nat.rs 既有原语语义；新增 API 均为
+  VirtualSubnetTunnel 方法 + 一个状态枚举变体，无新 trait、无投机抽象；
+  真实 UDP 打洞（HolePuncher 挂接）冻结在 P3 产品化。
+
 ### 冻结契约（RelayChannel 中继通道 P0，scenarios/product/relay_fallback.toml）
 
 - `RelayConfig { relay_server, peer_id }`：领域中立中继配置（服务器 locator + 对端 peer 标识）；
