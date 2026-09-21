@@ -155,6 +155,30 @@ NAT/中继场景的物理建连（组合根 transport::connect）发生在激活
   VirtualSubnetTunnel 方法 + 一个状态枚举变体，无新 trait、无投机抽象；
   真实 UDP 打洞（HolePuncher 挂接）冻结在 P3 产品化。
 
+### 冻结契约（VirtualSubnet 协调核心 + 自动 IP 分配 P2.3+P2.4，PRODUCT §12.13）
+
+- 新模块 `coord`（portable：零 I/O、零第三方依赖，可编译 WASI）：
+  - `Coordinator`：`announce(now_secs, peer, locator, ttl_secs)` 幂等刷新；
+    `heartbeat(now_secs, peer, ttl_secs)` 刷新 TTL（未知 peer →
+    `PeerUnknown`）；`peer_list(now_secs)` 返回未过期 (peer, locator, virtual_ip) 三元组（vip
+    由分配器补充；vip 未领号 → `PeerUnknown`；注册顺序稳定）；
+    `resolve_locator(now_secs, peer)`（过期 → `PeerExpired`）。
+    显式 `now_secs` 注入（不用 `Instant`）保证确定性。
+  - `VirtualIpAllocator`：`new(cidr)` 校验 IPv4 CIDR；`allocate(now_secs, peer)`
+    顺序分配空闲 IP（同 peer 幂等返回原号；耗尽 → `NoAddressAvailable`）；
+    `allocate_specific(now_secs, peer, virtual_ip)` 显式保留（占用 →
+    `AddressInUse`）；`release(now_secs, peer)` 释放复用。
+  - `CoordFrame` 10 变体 + `encode_frame`/`decode_frame`（u8 tag + u16 长度
+    前缀字符串 + u64 BE；确定性、可移植）。
+  - `peer_id_from_public_key(&[u8;32]) -> String`：FNV-1a 64 确定性哈希
+    （标识用途）。
+- 接入：loopback TCP 协调端点在 apps/nexus example（Composition Root），
+  crate 内零 I/O。
+- Deletion Test：协调核心与自动 IP 是虚拟子网控制平面的独立变化维度（真实
+  广域扩展前提），复用 PresenceRegistry 语义；无新 trait、无投机抽象。
+- 失败语义：全部 `Result + CoordError`（PeerUnknown / PeerExpired /
+  AddressInUse / NoAddressAvailable / InvalidCidr / InvalidFrame），无 panic。
+
 ### 冻结契约（RelayChannel 中继通道 P0，scenarios/product/relay_fallback.toml）
 
 - `RelayConfig { relay_server, peer_id }`：领域中立中继配置（服务器 locator + 对端 peer 标识）；

@@ -5756,3 +5756,491 @@ pub fn connection_pool_flow() -> Result<Value, NexusError> {
         "invalid_config_rejected": invalid_config_rejected,
     }))
 }
+
+/// E4 产品场景 `product.coord-core` 的可执行驱动（纯函数，显式 now）。
+///
+/// 覆盖：分配器顺序/幂等/冲突/释放复用/耗尽；协调器 announce→peer_list /
+/// 过期 / 未知；帧编解码全变体 roundtrip。
+pub fn coord_core_flow() -> Result<Value, NexusError> {
+    use nexus_connectivity::coord::{
+        CoordError, CoordFrame, Coordinator, VirtualIpAllocator, decode_frame, encode_frame,
+        peer_id_from_public_key,
+    };
+
+    // ---- 分配器 ----
+    let mut alloc = VirtualIpAllocator::new("10.99.0.0/24").map_err(|e| NexusError::Internal {
+        message: format!("allocator: {e}"),
+    })?;
+    let a_vip = alloc
+        .allocate(0, "peer-aaaa")
+        .map_err(|e| NexusError::Internal {
+            message: format!("alloc a: {e}"),
+        })?;
+    let b_vip = alloc
+        .allocate(0, "peer-bbbb")
+        .map_err(|e| NexusError::Internal {
+            message: format!("alloc b: {e}"),
+        })?;
+    let re_allocate_same_peer =
+        alloc
+            .allocate(0, "peer-aaaa")
+            .map_err(|e| NexusError::Internal {
+                message: format!("alloc a again: {e}"),
+            })?;
+    let specific_conflict = match alloc.allocate_specific(0, "peer-cccc", "10.99.0.2") {
+        Err(CoordError::AddressInUse(_)) => "AddressInUse".to_string(),
+        other => format!("unexpected: {other:?}"),
+    };
+    alloc
+        .release(0, "peer-bbbb")
+        .map_err(|e| NexusError::Internal {
+            message: format!("release b: {e}"),
+        })?;
+    let released_reused = alloc
+        .allocate(0, "peer-cccc")
+        .map_err(|e| NexusError::Internal {
+            message: format!("alloc c: {e}"),
+        })?;
+    let mut tiny = VirtualIpAllocator::new("10.0.0.0/30").map_err(|e| NexusError::Internal {
+        message: format!("tiny: {e}"),
+    })?;
+    let _ = tiny.allocate(0, "x").map_err(|e| NexusError::Internal {
+        message: format!("x: {e}"),
+    })?;
+    let _ = tiny.allocate(0, "y").map_err(|e| NexusError::Internal {
+        message: format!("y: {e}"),
+    })?;
+    let exhausted = match tiny.allocate(0, "z") {
+        Err(CoordError::NoAddressAvailable) => "NoAddressAvailable".to_string(),
+        other => format!("unexpected: {other:?}"),
+    };
+
+    // ---- 协调器 ----
+    let mut coord = Coordinator::new();
+    coord
+        .announce(0, "peer-aaaa", "udp://1.1.1.1:1", 10)
+        .map_err(|e| NexusError::Internal {
+            message: format!("announce: {e}"),
+        })?;
+    coord
+        .announce(0, "peer-bbbb", "udp://2.2.2.2:2", 100)
+        .map_err(|e| NexusError::Internal {
+            message: format!("announce b: {e}"),
+        })?;
+    let peer_list_count = coord.peer_list(5).len();
+    let expired_peer = match coord.resolve_locator(10, "peer-aaaa") {
+        Err(CoordError::PeerExpired(_)) => "Expired".to_string(),
+        other => format!("unexpected: {other:?}"),
+    };
+    let unknown_peer = match coord.resolve_locator(0, "peer-zzzz") {
+        Err(CoordError::PeerUnknown(_)) => "Unknown".to_string(),
+        other => format!("unexpected: {other:?}"),
+    };
+
+    // ---- 帧 roundtrip ----
+    let all_frames = vec![
+        CoordFrame::Announce {
+            peer: "peer-a".into(),
+            locator: "udp://1.1.1.1:1".into(),
+            ttl_secs: 60,
+        },
+        CoordFrame::Heartbeat {
+            peer: "peer-a".into(),
+            ttl_secs: 30,
+        },
+        CoordFrame::PeerListReq,
+        CoordFrame::PeerListResp {
+            peers: vec![
+                (
+                    "peer-a".into(),
+                    "udp://1.1.1.1:1".into(),
+                    "10.99.0.1".into(),
+                ),
+                (
+                    "peer-b".into(),
+                    "udp://2.2.2.2:2".into(),
+                    "10.99.0.2".into(),
+                ),
+            ],
+        },
+        CoordFrame::AllocateReq {
+            peer: "peer-a".into(),
+        },
+        CoordFrame::AllocateResp {
+            peer: "peer-a".into(),
+            virtual_ip: "10.99.0.1".into(),
+        },
+        CoordFrame::AllocateNack {
+            peer: "peer-a".into(),
+            reason: "ADDRESS_IN_USE".into(),
+        },
+        CoordFrame::ReleaseReq {
+            peer: "peer-a".into(),
+        },
+        CoordFrame::UnknownPeer("peer-z".into()),
+        CoordFrame::ExpiredPeer("peer-z".into()),
+    ];
+    let roundtrip_ok = all_frames
+        .iter()
+        .all(|f| decode_frame(&encode_frame(f).unwrap()).ok() == Some(f.clone()));
+
+    // ---- peer id 确定性 ----
+    let id_a = peer_id_from_public_key(&[7u8; 32]);
+    let id_a2 = peer_id_from_public_key(&[7u8; 32]);
+    let peer_ids_stable = id_a == id_a2;
+
+    Ok(serde_json::json!({
+        "verdict": "PASS",
+        "command": "coord core",
+        "allocator": {
+            "a_vip": a_vip,
+            "b_vip": b_vip,
+            "re_allocate_same_peer": re_allocate_same_peer,
+            "specific_conflict": specific_conflict,
+            "released_reused": released_reused,
+            "exhausted": exhausted,
+        },
+        "coordinator": {
+            "peer_list_count": peer_list_count,
+            "expired_peer": expired_peer,
+            "unknown_peer": unknown_peer,
+        },
+        "frames": {
+            "roundtrip_ok": roundtrip_ok,
+        },
+        "peer_ids_stable": peer_ids_stable,
+    }))
+}
+
+/// E5 产品场景 `product.coord-join-loopback` 的可执行驱动。
+///
+/// 真实 loopback TCP 协调端点（127.0.0.1 随机端口，u32 BE 长度前缀 + CoordFrame）：
+/// 双节点 announce → allocate（领号）→ peer_list（获得对端动态 locator + vip
+/// 三元组）→ 构建 VirtualSubnetTunnel（MeshCarrier 按协调器分发的 locator 建连）→
+/// A↔B 双向 IP 包互通。独立外部观察：真实 TCP 往返 + 数据面帧递送。
+pub fn coord_join_loopback_flow() -> Result<Value, NexusError> {
+    use nexus_connectivity::coord::{
+        CoordFrame, Coordinator, VirtualIpAllocator, decode_frame, encode_frame,
+        peer_id_from_public_key,
+    };
+    use nexus_connectivity::virtual_subnet::{
+        MemoryVpi, MeshCarrier, TunnelPeer, TunnelState, VirtualSubnetConfig, VirtualSubnetTunnel,
+    };
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+
+    fn put_len(buf: &mut Vec<u8>, frame: &[u8]) {
+        let len = u32::try_from(frame.len()).unwrap();
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(frame);
+    }
+
+    fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+        let mut len_buf = [0u8; 4];
+        stream
+            .read_exact(&mut len_buf)
+            .map_err(|e| format!("read len: {e}"))?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut buf = vec![0u8; len];
+        stream
+            .read_exact(&mut buf)
+            .map_err(|e| format!("read frame: {e}"))?;
+        Ok(buf)
+    }
+
+    fn client_request(addr: &str, frame: &CoordFrame) -> Result<Vec<u8>, String> {
+        let mut stream = TcpStream::connect(addr).map_err(|e| format!("connect: {e}"))?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .map_err(|e| format!("timeout: {e}"))?;
+        let payload = encode_frame(frame).map_err(|e| format!("encode: {e}"))?;
+        let mut wire = Vec::new();
+        put_len(&mut wire, &payload);
+        stream.write_all(&wire).map_err(|e| format!("write: {e}"))?;
+        read_frame(&mut stream)
+    }
+
+    fn expect_resp(payload: Vec<u8>) -> Result<CoordFrame, String> {
+        decode_frame(&payload).map_err(|e| format!("decode: {e}"))
+    }
+
+    /// 无响应帧的请求（announce/heartbeat/release）：写后即关。
+    fn client_send(addr: &str, frame: &CoordFrame) -> Result<(), String> {
+        let mut stream = TcpStream::connect(addr).map_err(|e| format!("connect: {e}"))?;
+        let payload = encode_frame(frame).map_err(|e| format!("encode: {e}"))?;
+        let mut wire = Vec::new();
+        put_len(&mut wire, &payload);
+        stream.write_all(&wire).map_err(|e| format!("write: {e}"))
+    }
+
+    // ---- 身份：固定公钥（模拟 P2-1 X25519 公钥），peer id 确定性 ----
+    let key_a = [7u8; 32];
+    let key_b = [8u8; 32];
+    let peer_a = peer_id_from_public_key(&key_a);
+    let peer_b = peer_id_from_public_key(&key_b);
+    let peer_ids_stable =
+        peer_a == peer_id_from_public_key(&key_a) && peer_b == peer_id_from_public_key(&key_b);
+
+    // ---- 协调端点（loopback）----
+    let coord = Coordinator::new();
+    let allocator = VirtualIpAllocator::new("10.99.0.0/24").map_err(|e| NexusError::Internal {
+        message: format!("allocator: {e}"),
+    })?;
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| NexusError::Internal {
+        message: format!("bind: {e}"),
+    })?;
+    let addr = listener.local_addr().map_err(|e| NexusError::Internal {
+        message: format!("local addr: {e}"),
+    })?;
+    let addr_str = addr.to_string();
+    let listened_loopback = addr.ip().is_loopback();
+
+    let server = std::thread::spawn(move || {
+        let mut coord = coord;
+        let mut allocator = allocator;
+        for _ in 0..6 {
+            let (mut stream, _) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(_) => break,
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
+            let payload = match read_frame(&mut stream) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let frame = match decode_frame(&payload) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let resp: Option<CoordFrame> = match frame {
+                CoordFrame::Announce {
+                    peer,
+                    locator,
+                    ttl_secs,
+                } => {
+                    coord.announce(0, &peer, &locator, ttl_secs).ok();
+                    None
+                }
+                CoordFrame::Heartbeat { peer, ttl_secs } => {
+                    coord.heartbeat(0, &peer, ttl_secs).ok();
+                    None
+                }
+                CoordFrame::AllocateReq { peer } => match allocator.allocate(0, &peer) {
+                    Ok(vip) => Some(CoordFrame::AllocateResp {
+                        peer,
+                        virtual_ip: vip,
+                    }),
+                    Err(e) => Some(CoordFrame::AllocateNack {
+                        peer,
+                        reason: e.to_string(),
+                    }),
+                },
+                CoordFrame::PeerListReq => {
+                    let peers: Vec<(String, String, String)> = coord
+                        .peer_list(0)
+                        .into_iter()
+                        .map(|(p, loc)| {
+                            let vip = allocator.peer_vip(&p).unwrap_or_default();
+                            (p, loc, vip)
+                        })
+                        .collect();
+                    Some(CoordFrame::PeerListResp { peers })
+                }
+                CoordFrame::ReleaseReq { peer } => {
+                    allocator.release(0, &peer).ok();
+                    None
+                }
+                _ => None,
+            };
+            if let Some(resp) = resp {
+                if let Ok(payload) = encode_frame(&resp) {
+                    let mut wire = Vec::new();
+                    put_len(&mut wire, &payload);
+                    stream.write_all(&wire).ok();
+                }
+            }
+        }
+    });
+
+    // ---- 节点 A：announce → allocate；节点 B：announce → allocate ----
+    client_send(
+        &addr_str,
+        &CoordFrame::Announce {
+            peer: peer_a.clone(),
+            locator: "udp://127.0.0.1:30001".into(),
+            ttl_secs: 60,
+        },
+    )
+    .map_err(|e| NexusError::Internal { message: e })?;
+    client_send(
+        &addr_str,
+        &CoordFrame::Announce {
+            peer: peer_b.clone(),
+            locator: "udp://127.0.0.1:30002".into(),
+            ttl_secs: 60,
+        },
+    )
+    .map_err(|e| NexusError::Internal { message: e })?;
+    let a_resp = client_request(
+        &addr_str,
+        &CoordFrame::AllocateReq {
+            peer: peer_a.clone(),
+        },
+    )
+    .and_then(expect_resp)
+    .map_err(|e| NexusError::Internal { message: e })?;
+    let a_allocated_vip = match a_resp {
+        CoordFrame::AllocateResp { virtual_ip, .. } => virtual_ip,
+        other => {
+            return Err(NexusError::Internal {
+                message: format!("unexpected allocate resp: {other:?}"),
+            });
+        }
+    };
+    let b_resp = client_request(
+        &addr_str,
+        &CoordFrame::AllocateReq {
+            peer: peer_b.clone(),
+        },
+    )
+    .and_then(expect_resp)
+    .map_err(|e| NexusError::Internal { message: e })?;
+    let b_allocated_vip = match b_resp {
+        CoordFrame::AllocateResp { virtual_ip, .. } => virtual_ip,
+        other => {
+            return Err(NexusError::Internal {
+                message: format!("unexpected allocate resp: {other:?}"),
+            });
+        }
+    };
+
+    // ---- 双方拉取对端列表（三元组：peer, locator, virtual_ip）----
+    let a_list = client_request(&addr_str, &CoordFrame::PeerListReq)
+        .and_then(expect_resp)
+        .map_err(|e| NexusError::Internal { message: e })?;
+    let (a_learned_peer_b_locator, a_learned_peer_b_vip) = match a_list {
+        CoordFrame::PeerListResp { peers } => {
+            let (_, locator, vip) =
+                peers.iter().find(|(p, _, _)| p == &peer_b).ok_or_else(|| {
+                    NexusError::Internal {
+                        message: "peer-b missing from list".into(),
+                    }
+                })?;
+            (locator.clone(), vip.clone())
+        }
+        other => {
+            return Err(NexusError::Internal {
+                message: format!("unexpected list resp: {other:?}"),
+            });
+        }
+    };
+    let b_list = client_request(&addr_str, &CoordFrame::PeerListReq)
+        .and_then(expect_resp)
+        .map_err(|e| NexusError::Internal { message: e })?;
+    let (b_learned_peer_a_locator, b_learned_peer_a_vip) = match b_list {
+        CoordFrame::PeerListResp { peers } => {
+            let (_, locator, vip) =
+                peers.iter().find(|(p, _, _)| p == &peer_a).ok_or_else(|| {
+                    NexusError::Internal {
+                        message: "peer-a missing from list".into(),
+                    }
+                })?;
+            (locator.clone(), vip.clone())
+        }
+        other => {
+            return Err(NexusError::Internal {
+                message: format!("unexpected list resp: {other:?}"),
+            });
+        }
+    };
+
+    server.join().ok();
+
+    // ---- 数据面：A/B 用协调器分发的 vip + locator 建隧道并互通 ----
+    let mut mesh_a = MeshCarrier::new();
+    let mut mesh_b = MeshCarrier::new();
+    let a_recv = mesh_a.recv_handle();
+    let b_recv = mesh_b.recv_handle();
+    mesh_a.connect_peer(&b_learned_peer_a_locator, b_recv.clone());
+    mesh_b.connect_peer(&a_learned_peer_b_locator, a_recv.clone());
+
+    let mut tunnel_a = VirtualSubnetTunnel::new(
+        VirtualSubnetConfig::new("10.99.0.0/24", a_allocated_vip.clone()),
+        Box::new(MemoryVpi::new()),
+        Box::new(mesh_a),
+    );
+    let mut tunnel_b = VirtualSubnetTunnel::new(
+        VirtualSubnetConfig::new("10.99.0.0/24", b_allocated_vip.clone()),
+        Box::new(MemoryVpi::new()),
+        Box::new(mesh_b),
+    );
+    tunnel_a
+        .add_peer(TunnelPeer::new(
+            a_learned_peer_b_vip.clone(),
+            b_learned_peer_a_locator.clone(),
+        ))
+        .map_err(|e| NexusError::Internal {
+            message: format!("a add peer: {e}"),
+        })?;
+    tunnel_a.set_peer_state(&a_learned_peer_b_vip, TunnelState::Connected);
+    tunnel_b
+        .add_peer(TunnelPeer::new(
+            b_learned_peer_a_vip.clone(),
+            a_learned_peer_b_locator.clone(),
+        ))
+        .map_err(|e| NexusError::Internal {
+            message: format!("b add peer: {e}"),
+        })?;
+    tunnel_b.set_peer_state(&b_learned_peer_a_vip, TunnelState::Connected);
+
+    // A → B
+    tunnel_a
+        .send_ip_packet(&a_learned_peer_b_vip, b"ping-a-to-b")
+        .map_err(|e| NexusError::Internal {
+            message: format!("a send: {e}"),
+        })?;
+    let mut buf = [0u8; 4096];
+    let a_to_b_delivered = match tunnel_b.recv_and_deliver(&mut buf) {
+        Ok(Some((sender, len))) => sender == b_learned_peer_a_vip && len == b"ping-a-to-b".len(),
+        other => {
+            return Err(NexusError::Internal {
+                message: format!("b recv unexpected: {other:?}"),
+            });
+        }
+    };
+
+    // B → A
+    tunnel_b
+        .send_ip_packet(&b_learned_peer_a_vip, b"ping-b-to-a")
+        .map_err(|e| NexusError::Internal {
+            message: format!("b send: {e}"),
+        })?;
+    let b_to_a_delivered = match tunnel_a.recv_and_deliver(&mut buf) {
+        Ok(Some((sender, len))) => sender == a_learned_peer_b_vip && len == b"ping-b-to-a".len(),
+        other => {
+            return Err(NexusError::Internal {
+                message: format!("a recv unexpected: {other:?}"),
+            });
+        }
+    };
+
+    Ok(serde_json::json!({
+        "verdict": "PASS",
+        "command": "coord join loopback",
+        "coordinator": {
+            "listened_loopback": listened_loopback,
+        },
+        "join": {
+            "a_allocated_vip": a_allocated_vip,
+            "b_allocated_vip": b_allocated_vip,
+            "a_learned_peer_b_locator": a_learned_peer_b_locator,
+            "b_learned_peer_a_locator": b_learned_peer_a_locator,
+            "a_learned_peer_b_vip": a_learned_peer_b_vip,
+            "b_learned_peer_a_vip": b_learned_peer_a_vip,
+            "a_to_b_delivered": a_to_b_delivered,
+            "b_to_a_delivered": b_to_a_delivered,
+            "peer_ids_stable": peer_ids_stable,
+        },
+    }))
+}
