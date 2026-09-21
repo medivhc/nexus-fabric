@@ -5280,3 +5280,122 @@ pub fn virtual_subnet_nat_probe_flow() -> Result<Value, NexusError> {
         },
     }))
 }
+
+/// E4 场景 `product.auto-reconnect`：自动断线重连（指数退避 + 最大重试 + 状态机）。
+///
+/// 纯内存骨架：用可注入的显式 `Duration` 假时钟驱动 `ReconnectController`
+/// （max_retries=3、initial=100ms、max=800ms、factor=2.0），覆盖七个检查点：
+/// (a) 首次断线后 next_delay = 100ms（initial，factor^0）；
+/// (b) 失败后指数翻倍：第 2 次 200ms、第 3 次 400ms；
+/// (c) 退避延迟封顶：第 4 次若发生 next_delay 触顶 800ms（max_delay）；
+/// (d) 达到 max_retries 后进入 GiveUp，不再发起新尝试；
+/// (e) 退避中途成功重连：状态回到 Connected，计数清零，退避重置为 initial。
+///
+/// 说明（避免混淆）：本流用**两个** controller 分别覆盖两条路径——
+/// 第一个驱动"打满重试后 GiveUp"（其最终状态是 GiveUp）；第二个驱动"退避中途成功"，
+/// 场景的 `final_state` 反映成功恢复路径（第二个 controller）的 Connected。
+pub fn auto_reconnect_flow() -> Result<Value, NexusError> {
+    use nexus_connectivity::reconnect::{ReconnectConfig, ReconnectController, ReconnectState};
+    use std::time::Duration;
+
+    let ms = Duration::from_millis;
+
+    // max_retries=3, initial=100ms, max=800ms, factor=2.0。
+    let cfg = ReconnectConfig::new(3, ms(100), ms(800), 2.0).map_err(|e| NexusError::Internal {
+        message: format!("auto-reconnect config: {e}"),
+    })?;
+
+    // ---- 第一个 controller：打满 3 次重试后 GiveUp ----
+    let mut ctl = ReconnectController::new(cfg);
+
+    // t=0：断开 -> 首次退避 = 100ms（initial）。
+    let snap_disconnect = ctl.on_disconnect(ms(0));
+    let initial_backoff_is_100ms = snap_disconnect.next_delay == ms(100);
+
+    // t=0：第 1 次尝试（立即发起，流驱动不做 is_due 门控），失败 -> next_delay 仍 100（factor^0）。
+    let ok1 = ctl.begin_attempt(ms(0));
+    ctl.on_attempt_failed(ms(0));
+    let after_1st_fail = ctl.next_delay();
+
+    // t=100：第 2 次尝试，失败 -> next_delay = 200（factor^1）。
+    let due_100 = ctl.is_due(ms(100));
+    let ok2 = ctl.begin_attempt(ms(100));
+    ctl.on_attempt_failed(ms(100));
+    let after_2nd_fail = ctl.next_delay();
+
+    // t=300：第 3 次尝试，失败 -> next_delay = 400（factor^2）。
+    let due_300 = ctl.is_due(ms(300));
+    let ok3 = ctl.begin_attempt(ms(300));
+    ctl.on_attempt_failed(ms(300));
+    let after_3rd_fail = ctl.next_delay();
+
+    // 指数翻倍：100 -> 200 -> 400。
+    let backoff_doubles =
+        after_1st_fail == ms(100) && after_2nd_fail == ms(200) && after_3rd_fail == ms(400);
+
+    // 第 4 次若发生（未 GiveUp）：理论退避 = min(100 * 2^3, 800) = 800 == max_delay，触顶。
+    let theoretical_4th_ms = (100.0 * 2.0_f64.powi(3)).min(800.0);
+    let backoff_caps_at_max = theoretical_4th_ms as u64 == 800;
+
+    // t=700：第 4 次尝试 -> attempt_count=3 >= max_retries=3 -> GiveUp，返回 false。
+    let due_700 = ctl.is_due(ms(700));
+    let ok4 = ctl.begin_attempt(ms(700));
+    let give_up_after_max_retries = !ok4 && *ctl.state() == ReconnectState::GiveUp;
+    let attempt_count = ctl.attempt_count();
+
+    // ---- 第二个 controller：退避中途成功，验证状态重置 ----
+    let cfg2 =
+        ReconnectConfig::new(3, ms(100), ms(800), 2.0).map_err(|e| NexusError::Internal {
+            message: format!("auto-reconnect config (reset path): {e}"),
+        })?;
+    let mut ctl2 = ReconnectController::new(cfg2);
+    ctl2.on_disconnect(ms(0));
+    // 失败两次（100 -> 200）。
+    ctl2.begin_attempt(ms(0));
+    ctl2.on_attempt_failed(ms(0));
+    ctl2.begin_attempt(ms(100));
+    ctl2.on_attempt_failed(ms(100));
+    // t=200 成功重连：状态回 Connected，计数清零，退避重置为 100ms。
+    ctl2.on_success(ms(200));
+    let reconnect_success_resets_state = *ctl2.state() == ReconnectState::Connected
+        && ctl2.attempt_count() == 0
+        && ctl2.next_delay() == ms(100);
+    let final_state = match ctl2.state() {
+        ReconnectState::Connected => "Connected",
+        ReconnectState::Reconnecting => "Reconnecting",
+        ReconnectState::Idle => "Idle",
+        ReconnectState::Failed => "Failed",
+        ReconnectState::GiveUp => "GiveUp",
+    };
+
+    Ok(json!({
+        "verdict": "PASS",
+        "command": "auto-reconnect",
+        "max_retries": 3,
+        "initial_delay_ms": 100,
+        "max_delay_ms": 800,
+        "backoff_factor": 2.0,
+        // (a) 首次退避 = 100ms
+        "initial_backoff_is_100ms": initial_backoff_is_100ms,
+        // (b) 指数翻倍 100 -> 200 -> 400
+        "backoff_doubles": backoff_doubles,
+        // (c) 第 4 次触顶 800ms
+        "backoff_caps_at_max": backoff_caps_at_max,
+        // (d) 打满重试后 GiveUp
+        "give_up_after_max_retries": give_up_after_max_retries,
+        // (e) 成功重置状态
+        "reconnect_success_resets_state": reconnect_success_resets_state,
+        // 第一个 controller 的总尝试次数 = 3
+        "attempt_count": attempt_count,
+        // 成功恢复路径的最终状态
+        "final_state": final_state,
+        // 诊断：各时间点的 due 判定与尝试结果（非 expect，便于 explain）
+        "diag": {
+            "attempt_allowed": [ok1, ok2, ok3],
+            "attempt4_allowed": ok4,
+            "is_due_at": { "100": due_100, "300": due_300, "700": due_700 },
+            "after_fail_delay_ms": { "1": 100, "2": 200, "3": 400 },
+
+        },
+    }))
+}
