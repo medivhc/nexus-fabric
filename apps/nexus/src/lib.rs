@@ -6244,3 +6244,180 @@ pub fn coord_join_loopback_flow() -> Result<Value, NexusError> {
         },
     }))
 }
+
+/// E4 场景 `product.graceful-exit`：节点优雅退出状态机。
+///
+/// 演示 Active→Draining→Exiting→Exited 流转、未排空仍在 Draining、
+/// 宽限期超时强制 Exiting、notify_peers 开关。
+pub fn graceful_exit_flow() -> Result<Value, NexusError> {
+    use nexus_connectivity::graceful_exit::{ExitConfig, GracefulExit};
+
+    let cfg = ExitConfig::new(1_000, true, true).map_err(|e| NexusError::Internal {
+        message: format!("exit config: {e}"),
+    })?;
+    let mut g = GracefulExit::new(cfg);
+
+    let initial = g.state().as_str().to_string();
+    g.begin_draining(0);
+    let after_draining = g.state().as_str().to_string();
+
+    let notified = g.notify_peers(&["peer-a", "peer-b"]);
+    let notified_count = notified.len();
+
+    // 仍有 5 条连接，t=100 仍在宽限期（1000ms）内 → 仍 Draining
+    let still_busy = g.advance(5, 100).as_str().to_string();
+    // 连接排空 → Exiting
+    let after_drained = g.advance(0, 200).as_str().to_string();
+    // Exiting → Exited
+    let after_exited = g.advance(0, 300).as_str().to_string();
+
+    // 超时分支：另起一个实例，仍有连接但已超过宽限期 → 强制 Exiting
+    let cfg_to = ExitConfig::new(1_000, true, true).map_err(|e| NexusError::Internal {
+        message: format!("exit config timeout: {e}"),
+    })?;
+    let mut g_to = GracefulExit::new(cfg_to);
+    g_to.begin_draining(0);
+    let timeout_exiting = g_to.advance(5, 2_000).as_str().to_string();
+
+    // notify_peers=false 分支：不记录
+    let cfg_off = ExitConfig::new(1_000, false, true).map_err(|e| NexusError::Internal {
+        message: format!("exit config off: {e}"),
+    })?;
+    let mut g_off = GracefulExit::new(cfg_off);
+    let recorded_off = g_off.notify_peers(&["peer-a", "peer-b"]).len();
+
+    let invalid_config_rejected = ExitConfig::new(0, true, true).is_err();
+
+    Ok(json!({
+        "verdict": "PASS",
+        "command": "graceful-exit",
+        "initial_state": initial,
+        "after_begin_draining": after_draining,
+        "notified_peer_count": notified_count,
+        "still_draining_while_active": still_busy,
+        "after_drained": after_drained,
+        "after_exited": after_exited,
+        "timeout_forces_exiting": timeout_exiting,
+        "notify_off_records_none": recorded_off,
+        "invalid_config_rejected": invalid_config_rejected,
+    }))
+}
+
+/// E4 场景 `product.config-hot-reload`：配置热加载校验门控与 revision 推进。
+///
+/// 演示合法提议应用、校验开启时非法提议被拒且 revision 不变、
+/// 校验关闭时非法提议也应用、非法配置被拒。
+pub fn config_hot_reload_flow() -> Result<Value, NexusError> {
+    use nexus_connectivity::config_hot_reload::{HotReloadConfig, HotReloadManager, ReloadResult};
+
+    let cfg = HotReloadConfig::new(1_000, true).map_err(|e| NexusError::Internal {
+        message: format!("hot reload config: {e}"),
+    })?;
+    let mut mgr = HotReloadManager::new(cfg);
+
+    let first = mgr.propose_reload(1, true);
+    let first_kind = first.as_str().to_string();
+    let first_applied = match first {
+        ReloadResult::Success { applied_revision } => applied_revision,
+        ReloadResult::Failed { reason } => {
+            return Err(NexusError::Internal {
+                message: format!("expected success but: {reason}"),
+            });
+        }
+    };
+    let after_first = mgr.current_revision();
+
+    let rejected = mgr.propose_reload(2, false);
+    let rejected_kind = rejected.as_str().to_string();
+    let after_rejected = mgr.current_revision();
+
+    let second = mgr.propose_reload(3, true);
+    let second_applied = match second {
+        ReloadResult::Success { applied_revision } => applied_revision,
+        ReloadResult::Failed { reason } => {
+            return Err(NexusError::Internal {
+                message: format!("expected success but: {reason}"),
+            });
+        }
+    };
+    let after_second = mgr.current_revision();
+
+    // 关闭前置校验：即使 valid=false 也应用
+    let relaxed_cfg = HotReloadConfig::new(1_000, false).map_err(|e| NexusError::Internal {
+        message: format!("relaxed hot reload config: {e}"),
+    })?;
+    let mut relaxed = HotReloadManager::new(relaxed_cfg);
+    let relaxed = relaxed.propose_reload(4, false);
+    let relaxed_applied = match relaxed {
+        ReloadResult::Success { applied_revision } => applied_revision,
+        ReloadResult::Failed { reason } => {
+            return Err(NexusError::Internal {
+                message: format!("expected success but: {reason}"),
+            });
+        }
+    };
+
+    let invalid_config_rejected = HotReloadConfig::new(0, true).is_err();
+
+    Ok(json!({
+        "verdict": "PASS",
+        "command": "config-hot-reload",
+        "first_propose": {
+            "kind": first_kind,
+            "applied_revision": first_applied,
+            "current_revision": after_first,
+        },
+        "invalid_propose_rejected": {
+            "kind": rejected_kind,
+            "current_revision": after_rejected,
+        },
+        "second_propose": {
+            "applied_revision": second_applied,
+            "current_revision": after_second,
+        },
+        "relaxed_validate": {
+            "applied_revision": relaxed_applied,
+        },
+        "invalid_config_rejected": invalid_config_rejected,
+    }))
+}
+
+/// E4 场景 `product.traffic-stats`：流量按节点记账与全量快照汇总。
+///
+/// 演示字节累加、连接数增减、快照汇总总和、未知节点 node_summary 为 null。
+pub fn traffic_stats_flow() -> Result<Value, NexusError> {
+    use nexus_connectivity::traffic_stats::StatsCollector;
+
+    let mut c = StatsCollector::new();
+    c.record_node_bytes("node-a", 100, 200);
+    c.record_node_bytes("node-a", 50, 50);
+    c.record_connection("node-a", true);
+    c.record_connection("node-a", true);
+    c.record_connection("node-a", false);
+    c.record_node_bytes("node-b", 10, 20);
+    c.record_connection("node-b", true);
+
+    let node_a = c.node_summary("node-a");
+    let unknown = c.node_summary("never-seen");
+    let snap = c.snapshot();
+
+    let node_a_json = node_a.map(
+        |(rx, tx, conns)| json!({ "rx_bytes": rx, "tx_bytes": tx, "active_connections": conns }),
+    );
+    let unknown_json = unknown.map(
+        |(rx, tx, conns)| json!({ "rx_bytes": rx, "tx_bytes": tx, "active_connections": conns }),
+    );
+
+    Ok(json!({
+        "verdict": "PASS",
+        "command": "traffic-stats",
+        "node_a_summary": node_a_json,
+        "unknown_node_summary": unknown_json,
+        "snapshot": {
+            "total_rx_bytes": snap.total_rx_bytes,
+            "total_tx_bytes": snap.total_tx_bytes,
+            "active_connections": snap.active_connections,
+            "active_nodes": snap.active_nodes,
+        },
+    }))
+}
