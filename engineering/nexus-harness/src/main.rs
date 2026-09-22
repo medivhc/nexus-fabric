@@ -65,11 +65,11 @@ fn dispatch(command: &str, rest: &[String]) -> Outcome {
         "verify" => commands::verify(rest.first().map(String::as_str).unwrap_or("")),
         "explain" => commands::explain(),
         "run" => run_scenario::run_scenario(rest),
-        "bench" | "replay" => (
+        "bench" => commands::bench(),
+        "replay" => (
             "UNKNOWN".to_string(),
-            format!(
-                "{command} gate is not implemented in the MVP harness (recorded UNKNOWN, not silently passed)"
-            ),
+            "replay gate is not implemented in the MVP harness (recorded UNKNOWN, not silently passed)"
+                .to_string(),
             Vec::new(),
         ),
         _ => (

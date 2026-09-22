@@ -1612,3 +1612,21 @@ nexusd（daemon 组合根）接入 subnet 真实路径：隧道由 daemon 生命
   复核。
 - 冻结边界（P3.6 不做）：热路径微优化（仅建基线）、加密算法替换、跨机
   benchmark、harness bench gate 实现（留 P3.7）。
+
+### 12.37 P3.7 harness bench gate（bench-gate，2026-09-22）{#12-bench-gate}
+
+把 P3.6 的加密数据面性能基准接入 Harness 正式门禁（AGENTS §21 性能规范的
+机器化执行）：`nexus-harness bench` 运行 `perf_bench` E4 驱动，解析输出
+verdict，按 PRODUCT §12.36 预算表判定；`verify --full` 挂载 `bench` gate。
+
+- **bench gate 语义**：
+  - 运行 `cargo run -q -p nexus --example perf_bench -- --json`（repo root）；
+  - 输出 verdict=PASS → gate PASS（detail 带四指标摘要）；
+  - verdict=WARN → gate PASS + detail 注明（WARN 不阻塞，AGENTS §19.1 语义）；
+  - verdict=FAIL → gate FAIL（性能回归阻断）；
+  - 命令失败 / JSON 解析失败 / 无输出 → gate UNKNOWN（不静默通过）。
+- **挂载**：`[verification.full] gates` 增加 `"bench"`；fast 不挂（保持快速）。
+- **baseline 语义**：复用 P3.6 固化基线（`.evidence/bench-p3c04/baseline.json`，
+  环境指纹一致时比较；缺失时首次运行重建立）。
+- 冻结边界（P3.7 不做）：bench 参数化（帧数/载荷/多轮）、跨机远程基准、
+  热路径微优化——均不在本项。

@@ -1,0 +1,33 @@
+schema_version = 1
+id = "engineering.bench-gate-verdicts"
+title = "nexus-harness bench 运行加密数据面性能基准并输出预算 verdict（P3.7）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-bench-gate"
+
+[given]
+repository = "initialized"
+baseline = "established (P3.6 .evidence/bench-p3c04/baseline.json，缺失时首测重建立)"
+network = "none (进程内闭环)"
+
+[when]
+command = "nexus-harness bench --json"
+
+[[expect]]
+field = "schema_version"
+equals = 1
+
+[[expect]]
+field = "command"
+equals = "bench"
+
+[[expect]]
+field = "verdict"
+one_of = ["PASS", "FAIL", "UNKNOWN"]
+
+[[expect]]
+field = "bench.gate"
+equals = "bench"
+
+[[expect]]
+field = "bench.detail"
+non_empty = true

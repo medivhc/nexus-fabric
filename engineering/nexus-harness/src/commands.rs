@@ -229,6 +229,24 @@ pub fn test_affected() -> Outcome {
     (verdict, message, extras)
 }
 
+/// Standalone benchmark run: executes the P3.6 perf_bench driver and reports
+/// its budget verdict (P3.7). WARN maps to PASS-with-note; run/parse failure
+/// => UNKNOWN (never silently passed).
+pub fn bench() -> Outcome {
+    let (repo, config) = match setup() {
+        Ok(x) => x,
+        Err(o) => return o,
+    };
+    let gate = gates::bench_gate(&repo, &config);
+    let verdict = gate.verdict.clone();
+    let message = gate.detail.clone();
+    let extras = vec![(
+        "bench".to_string(),
+        json!({"gate": gate.name, "verdict": gate.verdict, "detail": gate.detail}),
+    )];
+    (verdict, message, extras)
+}
+
 pub fn verify(sub: &str) -> Outcome {
     let mode = match sub {
         "" | "--fast" => "fast",
@@ -289,6 +307,7 @@ pub fn verify(sub: &str) -> Outcome {
                 "selected-fuzz" => gates::fuzz_gate(&repo),
                 "selected-concurrency" => gates::concurrency_gate(&repo),
                 "performance-budgets" => gates::performance_budgets_gate(&config),
+                "bench" => gates::bench_gate(&repo, &config),
                 "platform-checks" => gates::platform_checks_gate(&config),
                 "feature-matrix" => gates::feature_matrix_gate(&repo),
                 "portable-core" => gates::portable_core_gate(&repo, &config),

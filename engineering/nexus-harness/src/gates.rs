@@ -549,6 +549,72 @@ pub fn concurrency_gate(repo: &Repo) -> Gate {
     }
 }
 
+/// Bench gate: run the encrypted-dataplane performance benchmark (P3.6
+/// `perf_bench` E4 driver) and map its budget verdict onto the gate.
+/// PASS => gate PASS (metrics in detail); WARN => PASS with note (non-blocking);
+/// FAIL => gate FAIL (regression blocks); run/parse failure => UNKNOWN (never
+/// silently passed). Baseline comparison happens inside the driver
+/// (PRODUCT §12.36 / §12.37).
+pub fn bench_gate(repo: &Repo, _config: &Config) -> Gate {
+    let (ok, text) = run_at_full(
+        &repo.root,
+        "cargo",
+        &[
+            "run",
+            "--quiet",
+            "-p",
+            "nexus",
+            "--example",
+            "perf_bench",
+            "--",
+            "--json",
+        ],
+    );
+    if !ok {
+        return Gate::unknown(
+            "bench",
+            &format!("perf_bench run failed (exit != 0): {}", text.trim()),
+        );
+    }
+    bench_verdict_gate(&text)
+}
+
+/// Map perf_bench driver output onto a bench Gate (pure; unit-testable).
+fn bench_verdict_gate(text: &str) -> Gate {
+    // The driver prints exactly one JSON object on stdout; take the last
+    // brace-delimited line in case cargo merged build notes into stderr.
+    let line = text.lines().rev().find(|l| l.trim_start().starts_with('{'));
+    let Some(line) = line else {
+        return Gate::unknown("bench", "perf_bench produced no JSON output");
+    };
+    let v: Value = match serde_json::from_str(line.trim()) {
+        Ok(v) => v,
+        Err(e) => {
+            return Gate::unknown("bench", &format!("perf_bench JSON parse failed: {e}"));
+        }
+    };
+    let verdict = v
+        .get("verdict")
+        .and_then(Value::as_str)
+        .unwrap_or("FAIL")
+        .to_string();
+    let metric = |path: &str| -> f64 { v.pointer(path).and_then(|x| x.as_f64()).unwrap_or(0.0) };
+    let detail = format!(
+        "aead {:.1} MB/s ({:.2}us/frame) / tunnel {:.1} MB/s ({:.2}us rtt); budget verdict: {}",
+        metric("/aead/throughput_mbps"),
+        metric("/aead/frame_roundtrip_us"),
+        metric("/tunnel/throughput_mbps"),
+        metric("/tunnel/roundtrip_us"),
+        verdict,
+    );
+    match verdict.as_str() {
+        "PASS" => Gate::ok("bench", &detail),
+        "WARN" => Gate::ok("bench", &format!("{detail} (WARN: non-blocking)")),
+        "FAIL" => Gate::fail("bench", &detail),
+        other => Gate::unknown("bench", &format!("{detail} (unexpected verdict: {other}")),
+    }
+}
+
 /// Performance budgets: require machine-readable thresholds in
 /// policies/quality.toml [performance]; absent => UNKNOWN (no budget to check).
 pub fn performance_budgets_gate(config: &Config) -> Gate {
@@ -738,5 +804,37 @@ mod tests {
                 g.detail
             );
         }
+    }
+
+    #[test]
+    fn bench_verdict_gate_maps_budget_verdicts() {
+        let pass = r#"{"verdict":"PASS","aead":{"frame_roundtrip_us":3.5,"throughput_mbps":600.0},"tunnel":{"throughput_mbps":60.0,"roundtrip_us":11.5}}"#;
+        let g = bench_verdict_gate(pass);
+        assert_eq!(g.verdict, "PASS");
+        assert!(g.detail.contains("600.0 MB/s"));
+        assert!(g.detail.contains("60.0 MB/s"));
+
+        let warn = r#"{"verdict":"WARN","aead":{"frame_roundtrip_us":3.5,"throughput_mbps":300.0},"tunnel":{"throughput_mbps":60.0,"roundtrip_us":11.5},"budget":{"warns":["aead_throughput 0.5x"]}}"#;
+        let g = bench_verdict_gate(warn);
+        assert_eq!(g.verdict, "PASS", "WARN must be non-blocking: {}", g.detail);
+        assert!(g.detail.contains("WARN: non-blocking"));
+
+        let fail = r#"{"verdict":"FAIL","aead":{"frame_roundtrip_us":3.5,"throughput_mbps":0.2},"tunnel":{"throughput_mbps":60.0,"roundtrip_us":11.5},"budget":{"fails":["aead_throughput_below_abs_min"]}}"#;
+        let g = bench_verdict_gate(fail);
+        assert_eq!(g.verdict, "FAIL");
+
+        let empty = "cargo: warning: nothing here";
+        let g = bench_verdict_gate(empty);
+        assert_eq!(
+            g.verdict, "UNKNOWN",
+            "no JSON output must not pass silently"
+        );
+
+        let bad = "not json at all {";
+        let g = bench_verdict_gate(bad);
+        assert_eq!(
+            g.verdict, "UNKNOWN",
+            "unparseable output must not pass silently"
+        );
     }
 }

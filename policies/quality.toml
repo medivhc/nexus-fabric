@@ -38,6 +38,7 @@ gates = [
   "selected-fuzz",
   "selected-concurrency",
   "performance-budgets",
+  "bench",
   "platform-checks",
   "feature-matrix",
   "portable-core"
