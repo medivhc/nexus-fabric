@@ -1583,3 +1583,32 @@ nexusd（daemon 组合根）接入 subnet 真实路径：隧道由 daemon 生命
   CA 链构建与 SAN 校验、fs 热轮换监听。
 - E4 场景：`certificate_manager.toml`（id=`product.certificate-manager`）--
   未生效/过期证书拒绝构造、Valid/ExpiringSoon/Expired 三态分类、rotate 成功换主并记次数、坏新证书拒绝轮换。
+
+### 12.36 P3.6 加密数据面性能基准（performance-benchmark）（2026-09-22）{#12-perf-benchmark}
+
+加密数据面（P2 链路加密后）的性能预算与基准测量（AGENTS §21 性能规范）：
+不允许"优化模糊的更快"——先定义预算，再测基线，产出 benchmark Evidence。
+
+- **测量目标**（`apps/nexus/examples/perf_bench.rs`，E4 进程内闭环）：
+  - AEAD 帧路径：`encrypt_frame` + `decrypt_frame` 单帧往返延迟（µs）与
+    批量吞吐（MB/s，1 KiB payload × N 帧）；
+  - 隧道数据面：`VirtualSubnetTunnel` 加密模式 `send_ip_packet` →
+    对端 `recv_and_deliver` 进程内端到端吞吐（MB/s）与往返延迟。
+- **Performance Budget（本机基准，随 benchmark 输出固化）**：
+
+  | 指标 | baseline（首次实测） | noise tolerance | warning | blocking |
+  | --- | --- | --- | --- | --- |
+  | AEAD 帧往返延迟（µs/帧，p50） | 实测记录 | ±30% | > 2× baseline | > 5× baseline |
+  | AEAD 吞吐（MB/s） | 实测记录 | ±30% | < 0.5× baseline | < 0.2× baseline |
+  | 隧道数据面吞吐（MB/s） | 实测记录 | ±30% | < 0.5× baseline | < 0.2× baseline |
+  | 隧道数据面往返延迟（µs） | 实测记录 | ±30% | > 2× baseline | > 5× baseline |
+
+  baseline 首测定格并写入 evidence（含 target/toolchain 环境指纹）；后续回归
+  按同一指纹比较。本机噪声 > noise tolerance 时只记 WARN 不 FAIL（除非触
+  blocking）。
+- **Evidence**：benchmark 输出 JSON（verdict + 各指标数值/单位/threshold 判定）
+  落 `.evidence/bench-<id>/`；Full verify 不强制含 perf gate（MVP harness 无
+  bench gate），性能回归由本场景 E4 + 手动 `cargo run --example perf_bench`
+  复核。
+- 冻结边界（P3.6 不做）：热路径微优化（仅建基线）、加密算法替换、跨机
+  benchmark、harness bench gate 实现（留 P3.7）。

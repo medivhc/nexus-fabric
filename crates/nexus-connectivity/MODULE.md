@@ -380,3 +380,13 @@ cargo clippy -p nexus-connectivity --all-targets -- -D warnings
 - 平台实现职责：Windows `DpapiSecureStore`（DPAPI，绑定用户+机器）；
   Linux `FileSecureStore`（machine-id 派生密钥 + AEAD 文件）。crate 层无
   全局状态；文件格式 `NEXSEC1` 为平台实现内部约定。
+
+### 冻结契约（加密数据面性能边界 P3.6，PRODUCT §12.36）
+
+- `encrypt_frame`/`decrypt_frame`：单帧 O(payload) 时间，不得引入每帧分配
+  之外的额外复制；帧往返延迟以 PRODUCT §12.36 预算表为准（baseline 固化）。
+- `VirtualSubnetTunnel` 加密模式数据面：`send_ip_packet` → 对端
+  `recv_and_deliver` 端到端吞吐/延迟遵循同一预算表；热路径禁止 per-frame
+  日志（AGENTS §22）。
+- benchmark 语义：进程内闭环（无真实网络），输出 JSON 断言只锁结构不锁
+  绝对值（verdict 由预算表计算）；baseline 首测定格入 evidence。
