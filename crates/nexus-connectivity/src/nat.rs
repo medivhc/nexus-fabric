@@ -390,6 +390,39 @@ fn parse_stun_binding_response(buf: &[u8]) -> Result<SocketAddr, NatError> {
     ))
 }
 
+/// STUN 离线编解码自检（确定性、零网络）。
+///
+/// 构造一个带已知 XOR-MAPPED-ADDRESS 的合成 Binding Response 并经
+/// `parse_stun_binding_response` 解析，同时校验 `build_stun_binding_request` 长度。
+/// 供 E4 场景驱动（example）与 harness 在**无真实 STUN 服务器**时确认编解码正确性，
+/// 不伪造公网映射。返回 `(request_len, parsed_public_addr)`。
+pub fn codec_self_test() -> Result<(usize, SocketAddr), NatError> {
+    let txn = [0xAB; 12];
+    let request = build_stun_binding_request(&txn);
+
+    // 合成一个指向 1.2.3.4:54321 的 XOR-MAPPED-ADDRESS 响应。
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&STUN_BINDING_RESPONSE.to_be_bytes());
+    buf.extend_from_slice(&8u16.to_be_bytes());
+    buf.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+    buf.extend_from_slice(&txn);
+    buf.extend_from_slice(&0x0020u16.to_be_bytes());
+    buf.extend_from_slice(&8u16.to_be_bytes());
+    buf.extend_from_slice(&[0x00, 0x01]);
+    let port = 54321u16;
+    buf.extend_from_slice(&(port ^ (STUN_MAGIC_COOKIE >> 16) as u16).to_be_bytes());
+    let ip = u32::from_be_bytes([1, 2, 3, 4]);
+    buf.extend_from_slice(&(ip ^ STUN_MAGIC_COOKIE).to_be_bytes());
+
+    let parsed = parse_stun_binding_response(&buf)?;
+    if parsed.port() != port || parsed.ip().to_string() != "1.2.3.4" {
+        return Err(NatError::StunParse(
+            "codec self-test: parsed address mismatch".to_string(),
+        ));
+    }
+    Ok((request.len(), parsed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

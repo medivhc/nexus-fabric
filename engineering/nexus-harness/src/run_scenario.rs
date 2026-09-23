@@ -280,53 +280,38 @@ fn run_virtual_subnet_mesh() -> Outcome {
     }
 }
 
-/// E4 test: NAT hole punching (STUN + UDP punching, offline deterministic).
+/// E4 test: NAT hole punching — offline STUN codec self-test (honest).
+///
+/// 2026-09-24 requirement-change nat01：旧实现硬编码 public_mapping=203.0.113.42 /
+/// nat.type=RestrictedCone / hole_punch.success=true（假）。现改为确定性编解码自检：
+/// 构造并解析合成 XOR-MAPPED-ADDRESS 响应；不伪造公网映射，真实两 peer 打洞置 deferred。
 fn run_nat_hole_punching() -> Outcome {
-    use nexus_connectivity::nat::{NatType, StunClient};
-    use std::net::SocketAddr;
+    use nexus_connectivity::nat::codec_self_test;
 
-    // 模拟：两个本地地址
-    let node_a_addr: SocketAddr = "127.0.0.1:11001".parse().unwrap();
-
-    // 创建 STUN 客户端
-    let mut stun_client = match StunClient::new(node_a_addr) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                "FAIL".to_string(),
-                format!("failed to create StunClient: {}", e),
-                Vec::new(),
-            );
-        }
-    };
-
-    // 模拟获取映射
-    let local_mapping = node_a_addr.to_string();
-    let public_mapping = "203.0.113.42:54321".to_string();
-
-    // 检测 NAT 类型
-    let nat_type = NatType::RestrictedCone;
-
-    // 清空事件
-    stun_client.clear_events();
-
-    // 模拟打洞成功
-    let hole_punch_success = true;
-    let rtt_ms = 1u64;
-    let event_count = 6u64;
-
-    (
-        "PASS".to_string(),
-        "nat-hole-punching: STUN mapping + NAT type + UDP punching verified".to_string(),
-        vec![
-            ("stun.local_mapping".to_string(), json!(local_mapping)),
-            ("stun.public_mapping".to_string(), json!(public_mapping)),
-            ("nat.type".to_string(), json!(format!("{:?}", nat_type))),
-            ("hole_punch.success".to_string(), json!(hole_punch_success)),
-            ("hole_punch.rtt_ms".to_string(), json!(rtt_ms)),
-            ("events.count".to_string(), json!(event_count)),
-        ],
-    )
+    match codec_self_test() {
+        Ok((req_len, parsed)) => (
+            "PASS".to_string(),
+            "nat-hole-punching: offline STUN codec self-test passed (real punch deferred to P3)"
+                .to_string(),
+            vec![
+                ("codec.request_build_ok".to_string(), json!(true)),
+                ("codec.response_parse_ok".to_string(), json!(true)),
+                ("codec.request_bytes".to_string(), json!(req_len)),
+                (
+                    "codec.parsed_self_test_addr".to_string(),
+                    json!(parsed.to_string()),
+                ),
+                ("nat.type".to_string(), json!("Unknown")),
+                ("hole_punch.success".to_string(), json!(false)),
+                ("hole_punch.deferred".to_string(), json!(true)),
+            ],
+        ),
+        Err(e) => (
+            "FAIL".to_string(),
+            format!("nat-hole-punching: codec self-test failed: {e}"),
+            Vec::new(),
+        ),
+    }
 }
 
 /// E4 测试：四节点线性拓扑距离矢量多跳路由（PRODUCT §12.6）。

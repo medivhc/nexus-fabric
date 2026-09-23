@@ -1,41 +1,47 @@
 schema_version = 1
 id = "product.nat-hole-punching"
-title = "NAT 打洞：STUN 映射获取 + UDP 打洞建连"
+title = "NAT 打洞：STUN 编解码自检 + 可选真实 STUN 映射（离线 E4；真实跨主机打洞 P3）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#remote"
+
+# 真实性审计（2026-09-24，requirement-change nat01）：
+# 旧驱动硬编码 public_mapping=203.0.113.42 / nat.type=RestrictedCone / hole_punch.success=true，
+# 与"真实打洞"之名不符。现冻结期望为**可离线确定性验证**的编解码正确性；
+# 真实 external mapped address 由驱动可选地查询 stun.l.google.com:19302（real_stun 字段），
+# 其值环境相关，不作为冻结期望。真实两 peer 跨公网打洞冻结在 P3（PRODUCT 12.3/12.9）。
 
 [given]
 resource = "p2p-direct"
 locator = "peer-b"
-stun_server = "stun.example.org:3478"
+stun_server = "stun.l.google.com:19302"
 
-# 可执行 E4：组合根驱动 NAT 打洞流程并输出 JSON。
+# 可执行 E4：组合根驱动 STUN 编解码自检（+可选真实 STUN）并输出 JSON。
 [when]
 command = "cargo run --quiet -p nexus --example nat_hole_punching -- --json"
 
-# 冻结期望：STUN 获取映射、NAT 类型检测、UDP 打洞成功。
-# （bugfix 2026-09-20：修复非法 TOML——`null` 非合法 TOML 值，`not_equals` / `greater_than`
-#  亦非 loader 支持的期望类型，场景此前无法加载求值；统一改为非空断言，语义不变。）
 [[expect]]
 field = "verdict"
 equals = "PASS"
 
+# 冻结期望：RFC5389 Binding Request 构造 + XOR-MAPPED-ADDRESS 解析正确（确定性）。
 [[expect]]
-field = "stun.local_mapping"
-non_empty = true
-
-[[expect]]
-field = "stun.public_mapping"
-non_empty = true
-
-[[expect]]
-field = "nat.type"
-equals = "RestrictedCone"
-
-[[expect]]
-field = "hole_punch.success"
+field = "codec.request_build_ok"
 equals = true
 
 [[expect]]
-field = "hole_punch.rtt_ms"
+field = "codec.response_parse_ok"
+equals = true
+
+# 诚实：本批不伪造 NAT 类型（单服务器无法区分 cone 变体），固定 Unknown。
+[[expect]]
+field = "nat.type"
+equals = "Unknown"
+
+# 诚实：真实两 peer 打洞未实现，明确 deferred，不再冻结 success=true。
+[[expect]]
+field = "hole_punch.deferred"
+equals = true
+
+[[expect]]
+field = "stun.local_mapping"
 non_empty = true
