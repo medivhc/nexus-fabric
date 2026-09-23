@@ -750,6 +750,47 @@ GEOIP 国家库、GEOSITE 域名分类清单、rule-providers 本地规则集。
 - 明确不做（后续批次）：ip2region xdb 二进制、GeoLite2 mmdb/CSV、数据自动下载。
 - E4 场景：`geoip_source_ip2region.toml`。
 
+### 11.16 节点加密出站数据面（node outbound tunnel data plane，2026-09-24）
+
+把 §11.6 / §11.7 / §11.9 的节点 adapter（Shadowsocks / VMess / Trojan）接入 §11.4 的
+真实 SOCKS5 数据面：规则路由选定节点型出站时，流量经真实加密隧道出站（对齐 Clash
+节点客户端用途，替代其本地代理角色）。
+
+数据面链路：
+
+```text
+SOCKS5 入站（Socks5Handshake，§11.4 不变）
+  -> FlowContext -> 规则路由（§11.1 纯决策，零改动）
+  -> 按 selected_outbound.kind 建立真实出站连接：
+       direct      -> TcpStream::connect(destination)（§11.4 现状，零回归）
+       shadowsocks -> TcpStream::connect(node.locator)
+                      + SsStream(Role::Client) 会话（§11.6.1 复用）
+                      + seal(encode_request(destination)) 加密 request header
+                      + 双向 record 帧中继（read_record / write_record）
+       trojan      -> rustls TLS 握手（SNI=节点域名，ALPN，skip-cert-verify §11.9.1）
+                      + trojan 请求头（standard / singbox，§11.9.2）
+                      + 双向透明中继
+       vmess       -> vmess AEAD 请求头 + 记录中继（§11.7）
+  -> 双向字节中继（客户端 <-> 节点隧道）
+```
+
+- 配置零新增：复用 `OutboundConfig` 既有字段（kind / locator / method / password /
+  alpn / skip_cert_verify / header_format），节点型 kind 的校验沿用 §11.9.3。
+- 用户可观察（新增字段；direct 会话不出现或为空）：
+  - `routing.outbound_kind`：选定出站的 kind 标签（direct / shadowsocks / trojan / vmess）；
+  - `outbound`：`{ kind, node_locator, method?, tls: { sni?, alpn?, skip_cert_verify? },
+    header_format? }`（按 kind 可空）。
+- 失败语义：节点建连失败 / 协议握手失败 / 隧道中继失败 →
+  `ConnectivityEstablishmentFailed { provider: <selected outbound tag> }`，会话级
+  结构化 FAIL；服务循环继续 accept 下一会话（逐会话隔离，不中断 daemon）。
+- 回归保障：direct 路径与既有 `daemon_real_socks_proxy_flow` 行为零变化。
+- 冻结边界（本期不做）：UDP 隧道 / QUIC / 多路复用 / 节点自动切换（selector /
+  urltest 已由 §11.1 提供）/ 订阅在线更新（§11.2 维持）。
+- E4 场景：`scenarios/product/proxy_outbound_shadowsocks_flow.toml`——loopback：
+  echo 目标 + 本地 SS server + nexus proxy（配置 outbound=ss-node → 本地 SS server）+
+  原始 SOCKS5 客户端经 proxy 访问 echo；断言 SS server 收到加密连接、
+  request header 目标送达、payload 经加密隧道往返、`routing.outbound_kind=shadowsocks`。
+
 ### 11.3 失败语义
 
 ```text

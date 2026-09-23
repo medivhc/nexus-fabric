@@ -4234,30 +4234,187 @@ pub fn proxy_serve_once(
         .transition_phase(LifecyclePhase::Active)
         .map_err(NexusError::from)?;
 
-    // 4) 真实出站连接：代理即出口，域名在此真实 DNS 解析后拨号。
-    let (host, port) = split_host_port(&flow.destination)?;
-    let mut upstream = std::net::TcpStream::connect((host.as_str(), port)).map_err(|e| {
-        NexusError::ConnectivityEstablishmentFailed {
+    // 4) 真实出站连接：按 selected outbound 的 kind 建立数据面（§11.16）。
+    //    direct      -> 直连 destination（§11.4 现状，零回归）
+    //    shadowsocks -> 连节点 locator + SsStream 客户端会话 + 加密 request header
+    //                   + 双向 record 帧中继（read_record / write_record）
+    //    trojan/vmess-> 数据面隧道不在本期冻结 E4 范围，结构化失败（不静默直连）
+    let selected = config
+        .outbounds
+        .iter()
+        .find(|o| o.tag == decision.selected_outbound_tag)
+        .ok_or_else(|| NexusError::ConnectivityEstablishmentFailed {
             provider: ProviderId(decision.selected_outbound_tag.clone()),
-            reason: format!("outbound connect {host}:{port} failed: {e}"),
+            reason: format!(
+                "selected outbound tag {} missing in config",
+                decision.selected_outbound_tag
+            ),
+        })?;
+    let (host, port) = split_host_port(&flow.destination)?;
+    let outbound_kind = selected.kind.as_str();
+    let outbound;
+    let (up_bytes, down_bytes) = match selected.kind {
+        nexus_proxy_config::OutboundKind::Direct => {
+            let mut upstream =
+                std::net::TcpStream::connect((host.as_str(), port)).map_err(|e| {
+                    NexusError::ConnectivityEstablishmentFailed {
+                        provider: ProviderId(decision.selected_outbound_tag.clone()),
+                        reason: format!("outbound connect {host}:{port} failed: {e}"),
+                    }
+                })?;
+            // 双向字节中继（结构化并发：join 消费两个拷贝线程的结果）。
+            let mut client_c = client.try_clone().map_err(|_| NexusError::Internal {
+                message: "proxy clone failed".into(),
+            })?;
+            let mut upstream_c = upstream.try_clone().map_err(|_| NexusError::Internal {
+                message: "proxy clone failed".into(),
+            })?;
+            let to_upstream =
+                std::thread::spawn(move || pump_bytes(&mut client_c, &mut upstream_c));
+            let to_client = std::thread::spawn(move || pump_bytes(&mut upstream, &mut client));
+            let up = to_upstream.join().map_err(|_| NexusError::Internal {
+                message: "proxy thread panicked".into(),
+            })?;
+            let down = to_client.join().map_err(|_| NexusError::Internal {
+                message: "proxy thread panicked".into(),
+            })?;
+            outbound = json!({ "kind": "direct" });
+            (up, down)
         }
-    })?;
-
-    // 5) 双向字节中继（结构化并发：join 消费两个拷贝线程的结果）。
-    let mut client_c = client.try_clone().map_err(|_| NexusError::Internal {
-        message: "proxy clone failed".into(),
-    })?;
-    let mut upstream_c = upstream.try_clone().map_err(|_| NexusError::Internal {
-        message: "proxy clone failed".into(),
-    })?;
-    let to_upstream = std::thread::spawn(move || pump_bytes(&mut client_c, &mut upstream_c));
-    let to_client = std::thread::spawn(move || pump_bytes(&mut upstream, &mut client));
-    let up_bytes = to_upstream.join().map_err(|_| NexusError::Internal {
-        message: "proxy thread panicked".into(),
-    })?;
-    let down_bytes = to_client.join().map_err(|_| NexusError::Internal {
-        message: "proxy thread panicked".into(),
-    })?;
+        nexus_proxy_config::OutboundKind::Shadowsocks => {
+            use nexus_outbound_shadowsocks::{
+                Role, SsMethod, SsStream, SsTarget, encode_request, read_record, write_record,
+            };
+            let locator = selected.locator.clone().ok_or_else(|| {
+                NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: "shadowsocks outbound missing locator".into(),
+                }
+            })?;
+            let (nhost, nport) = split_host_port(&locator)?;
+            let mut node = std::net::TcpStream::connect((nhost.as_str(), nport)).map_err(|e| {
+                NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: format!("ss node connect {locator} failed: {e}"),
+                }
+            })?;
+            let method = SsMethod::parse(
+                selected
+                    .method
+                    .as_deref()
+                    .unwrap_or(SsMethod::Chacha20IetfPoly1305.as_str()),
+            )
+            .map_err(|e| NexusError::Internal {
+                message: format!("ss method parse failed: {e:?}"),
+            })?;
+            let password = selected.password.clone().ok_or_else(|| {
+                NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: "shadowsocks outbound missing password".into(),
+                }
+            })?;
+            let mut tx_sess = SsStream::new(&password, method, Role::Client).map_err(|e| {
+                NexusError::Internal {
+                    message: format!("ss client session failed: {e:?}"),
+                }
+            })?;
+            let mut rx_sess = SsStream::new(&password, method, Role::Client).map_err(|e| {
+                NexusError::Internal {
+                    message: format!("ss client session failed: {e:?}"),
+                }
+            })?;
+            // 加密 request header（目标 = SOCKS5 destination）→ 节点
+            let target = if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+                SsTarget::Ipv4(ip.octets(), port)
+            } else {
+                SsTarget::Domain(host.clone(), port)
+            };
+            let req_frame = tx_sess.seal(&encode_request(&target)).map_err(|e| {
+                NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: format!("ss request header seal failed: {e:?}"),
+                }
+            })?;
+            write_record(&mut node, &req_frame).map_err(|e| {
+                NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: format!("ss request header send failed: {e}"),
+                }
+            })?;
+            // 双向 record 帧中继：client→node 读明文→seal→write_record；
+            // node→client read_record→open→写明文。TX/RX 各持独立会话实例（Rx 帧内 nonce）。
+            let mut client_up = client.try_clone().map_err(|_| NexusError::Internal {
+                message: "proxy clone failed".into(),
+            })?;
+            let mut node_up = node.try_clone().map_err(|_| NexusError::Internal {
+                message: "proxy clone failed".into(),
+            })?;
+            let mut client_down = client.try_clone().map_err(|_| NexusError::Internal {
+                message: "proxy clone failed".into(),
+            })?;
+            let mut node_down = node.try_clone().map_err(|_| NexusError::Internal {
+                message: "proxy clone failed".into(),
+            })?;
+            let to_upstream = std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                let mut total = 0usize;
+                loop {
+                    match client_up.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            match tx_sess
+                                .seal(&buf[..n])
+                                .map(|f| write_record(&mut node_up, &f))
+                            {
+                                Ok(Ok(())) => total += n,
+                                _ => break,
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                total
+            });
+            let to_client = std::thread::spawn(move || {
+                let mut total = 0usize;
+                while let Ok(frame) = read_record(&mut node_down) {
+                    match rx_sess.open(&frame) {
+                        Ok(plain) => {
+                            if client_down.write_all(&plain).is_err() {
+                                break;
+                            }
+                            total += plain.len();
+                        }
+                        Err(_) => break,
+                    }
+                }
+                total
+            });
+            let up = to_upstream.join().map_err(|_| NexusError::Internal {
+                message: "proxy thread panicked".into(),
+            })?;
+            let down = to_client.join().map_err(|_| NexusError::Internal {
+                message: "proxy thread panicked".into(),
+            })?;
+            outbound = json!({
+                "kind": "shadowsocks",
+                "node_locator": locator,
+                "method": method.as_str(),
+            });
+            (up, down)
+        }
+        nexus_proxy_config::OutboundKind::Relay
+        | nexus_proxy_config::OutboundKind::Trojan
+        | nexus_proxy_config::OutboundKind::Vmess => {
+            return Err(NexusError::ConnectivityEstablishmentFailed {
+                provider: ProviderId(decision.selected_outbound_tag.clone()),
+                reason: format!(
+                    "outbound kind {} data-plane tunnel not in frozen E4 scope (next batch)",
+                    selected.kind.as_str()
+                ),
+            });
+        }
+    };
 
     // 6) Session 终态。
     owner
@@ -4287,8 +4444,10 @@ pub fn proxy_serve_once(
             "matched_rule": decision.matched_rule,
             "first_action": decision.first_action,
             "selected_outbound_tag": decision.selected_outbound_tag,
+            "outbound_kind": outbound_kind,
             "flow_origin": decision.flow_origin,
         },
+        "outbound": outbound,
         "session": {
             "id": owner.id().0,
             "phase": phase_name(&status.phase),

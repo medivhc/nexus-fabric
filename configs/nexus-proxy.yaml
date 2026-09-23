@@ -1,0 +1,81 @@
+# Nexus 代理配置 —— 替代 Clash Verge（SOCKS5 入口 + 规则分流）
+#
+# 对应 Clash Verge 现网参数（实测 verge.yaml）：
+#   - 混合端口 127.0.0.1:7897（verge_mixed_port: 7897）
+#   - DNS fake-ip 关闭（TUN 未开），本配置不接管系统 DNS
+#   - 用户分流偏好：公司域名（gpal.com 等）必须直连（fake-ip-filter 同源）
+#
+# 启动：
+#   nexusd proxy --addr 127.0.0.1:7897 --config nexus-proxy.yaml
+#
+# 当前能力边界（重要）：
+#   * 已实现并核实：SOCKS5 入站握手、规则分流决策、真实 TCP 直连出口、
+#     Session 生命周期与可观测输出。
+#   * 未接入 CLI 数据面：shadowsocks / trojan / vmess 节点型加密出站
+#     （适配器与 E4 示例已在库层落地，但 nexusd proxy 的出口暂为直连）。
+#     因此本配置的 outbounds 暂以 direct 为主；节点段填充后即可升级为
+#     "订阅节点分流" 模式。
+
+schema_version: 1
+
+inbounds:
+  - tag: socks5-in
+    kind: socks5
+    listen: 127.0.0.1:7897   # 与 Clash Verge 混合端口对齐
+
+rules:
+  # 内网 / 回环直连
+  - tag: rule-direct-lan
+    kind: ip_cidr
+    match: 192.168.0.0/16
+    action:
+      - kind: select_outbound
+        tag: direct
+  - tag: rule-direct-local
+    kind: ip_cidr
+    match: 10.0.0.0/8
+    action:
+      - kind: select_outbound
+        tag: direct
+  - tag: rule-direct-loopback
+    kind: ip_cidr
+    match: 127.0.0.0/8
+    action:
+      - kind: select_outbound
+        tag: direct
+  # 公司域名直连（对齐 Clash fake-ip-filter 的 gpal.com 保底）
+  - tag: rule-direct-company
+    kind: domain_suffix
+    match: gpal.com
+    action:
+      - kind: select_outbound
+        tag: direct
+  - tag: rule-direct-company2
+    kind: domain_suffix
+    match: geometricalpal.com
+    action:
+      - kind: select_outbound
+        tag: direct
+  # 兜底
+  - tag: rule-match
+    kind: match
+    match: ""
+    action:
+      - kind: select_outbound
+        tag: direct
+
+outbounds:
+  - tag: direct
+    kind: direct
+    locator: ""
+
+# --- 节点型出站（等 CLI 数据面接入后启用，示例结构） ---
+# outbounds:
+#   - tag: node-jp
+#     kind: shadowsocks        # 或 trojan / vmess
+#     locator: "1.2.3.4:8388"
+#     method: aes-128-gcm
+#     password: "xxxx"
+#   - tag: proxy-group
+#     kind: selector
+#     candidates: [node-jp, direct]
