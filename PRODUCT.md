@@ -1671,3 +1671,73 @@ verdict，按 PRODUCT §12.36 预算表判定；`verify --full` 挂载 `bench` g
   环境指纹一致时比较；缺失时首次运行重建立）。
 - 冻结边界（P3.7 不做）：bench 参数化（帧数/载荷/多轮）、跨机远程基准、
   热路径微优化——均不在本项。
+
+## 13. Windows 系统代理接管与常驻自启（system-proxy + autostart，2026-09-24）{#13-system-proxy}
+
+桌面/Windows 场景下，nexusd 作为本地入口把系统 WinINET 代理指向本地数据面，
+并提供开机常驻能力。本项只交付 Windows 平台；非 Windows 显式 `Unavailable`，
+不静默降级（PRODUCT §8）。
+
+### 13.1 用户可观察语义
+
+nexusd（Windows）提供子命令（均输出单个 JSON 对象，`--json`）：
+
+```text
+nexusd system-proxy status --json
+    -> 读取 HKCU\...\Internet Settings 的 ProxyEnable / ProxyServer。
+nexusd system-proxy set --server 127.0.0.1:7898 --json
+    -> 写 ProxyEnable=1 + ProxyServer=<server>，并广播刷新。
+nexusd system-proxy clear --json
+    -> 写 ProxyEnable=0，广播刷新（保留 ProxyServer 值，与 Clash 行为一致）。
+nexusd system-proxy e2e --json
+    -> 自清理闭环：snapshot 原值 -> set 127.0.0.1:7898 -> 读回校验
+       -> 无条件恢复 snapshot -> 广播刷新 -> 读回校验一致 -> 输出 verdict。
+nexusd autostart install --json | remove --json | status --json
+    -> 注册/移除/查询“当前用户登录时启动 nexusd”的计划任务。
+```
+
+固定语义：
+
+- 注册表位置固定为
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`；
+  `ProxyEnable` 为 DWORD(0/1)，`ProxyServer` 为 REG_SZ。
+- 任何写注册表后必须紧接 `InternetSetOption(INTERNET_OPTION_SETTINGS_CHANGED)`
+  与 `InternetSetOption(INTERNET_OPTION_REFRESH)` 广播；否则注册表改了不生效。
+- 演示/默认本地端口固定 **7898**；**禁止使用 7897**（Clash Verge 占用）。
+- 所有 `system-proxy` 测试场景必须自清理：setup 记录原始 ProxyEnable/ProxyServer，
+  teardown 无条件恢复原值并再次广播刷新；测试结束后注册表值与测试前逐位一致。
+  禁止把系统代理留在开启状态。
+
+### 13.2 常驻自启方案（冻结：计划任务，非 Windows 服务）
+
+本项冻结为 **当前用户登录触发的计划任务**，不采用 Windows 服务（`sc.exe`）：
+
+- 理由：WinINET 系统代理是 **HKCU 交互用户** 状态；以 SYSTEM 运行的服务操作的是
+  `HKU\.DEFAULT`，无法接管当前桌面用户的代理。计划任务在用户会话内运行 nexusd，
+  才能正确读写该用户的 HKCU 代理。
+- 触发器：当前用户 ONLOGON；运行身份为当前用户（普通权限，无需 UAC 提权）。
+- 动作：启动 `nexusd serve --addr 127.0.0.1:7898`。
+- 任务名前缀固定 `nexus-`；**临时测试任务名必须带 `nexus-test-` 前缀**，测试后删除，
+  用 `Get-ScheduledTask` / `schtasks /query` 确认无残留。
+- 安装/移除经 `schtasks.exe`（在 `nexus-platform-windows` 内 spawn，非 portable core）。
+
+### 13.3 架构与失败语义
+
+- 平台特有代码（注册表 FFI、WinINET 通知、schtasks 调用）只允许存在于
+  `nexus-platform-windows`；portable core 不直接调 Win32。
+- `nexus-platform` 暴露 trait：`SystemProxyController`（snapshot/apply/refresh）与
+  `AutostartRegistrar`（install/remove/status）；Windows 实现经组合根装配到 nexusd。
+- 非 Windows 平台：nexusd 子命令返回结构化 `Unavailable`（exit 0，请求已处理）。
+- 业务失败用 typed `Result`（`PlatformError`），不以 panic 表达可恢复失败。
+- 不操作用户 clash-verge 进程/配置；测试端口避开 7897。
+
+### 13.4 E4 映射
+
+- `scenarios/platform/windows_system_proxy.toml`：`nexusd system-proxy e2e --json`
+  自清理闭环（HKCU 读写 + InternetSetOption 广播 + 恢复一致性），E4。
+- 计划任务真实 create/start/监听 7898/end/delete 周期为部署环境 E5 smoke
+  （需在用户会话内运行），不进 harness 反复门禁；其命令构造/前缀/幂等由
+  `nexus-platform-windows` 单元测试覆盖。
+
+- 冻结边界（本项不做）：系统代理 PAC / AutoConfigURL、按进程代理（WPAD/
+  per-app）、SYSTEM 服务化、全局 `HKLM` 代理、多用户切换会话代理同步。

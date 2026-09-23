@@ -21,3 +21,6 @@ nexus-compute = { path = "../../crates/nexus-compute" }
 nexus-diagnostics = { path = "../../crates/nexus-diagnostics" }
 nexus-platform = { path = "../../crates/nexus-platform" }
 serde_json = { version = "1", default-features = false, features = ["std"] }
+
+[target.'cfg(windows)'.dependencies]
+nexus-platform-windows = { path = "../../crates/nexus-platform-windows" }

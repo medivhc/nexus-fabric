@@ -58,6 +58,10 @@
 - `secure_store`（PRODUCT §12.30）：machine-id 解析（32 hex → 16 字节）、
   HKDF-SHA256 密钥派生、NEXSEC1 AEAD 记录（`magic || nonce || ct || tag`）
   加解密——平台无关纯逻辑，DPAPI / machine-id 文件后端在 `nexus-platform-*`。
+- `SystemProxyController`（PRODUCT §13）：snapshot/apply/refresh 当前用户的
+  系统代理（WinINET）状态；具体注册表/WinINET 通知在 `nexus-platform-windows`。
+- `AutostartRegistrar`（PRODUCT §13）：install/remove/status 当前用户登录自启
+  条目；具体计划任务操作在 `nexus-platform-windows`。
 
 ## Verification
 

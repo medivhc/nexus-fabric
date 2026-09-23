@@ -2,10 +2,14 @@
 
 ## Responsibility
 
-实现 Windows 平台 Capability Adapter，首期交付 **VirtualPacketInterface**：经
-`wintun.dll` 窄 C ABI（运行时动态加载，不静态链接）创建/打开 wintun 适配器、
-启动会话、收发原始 IP 包，并对上层暴露 `nexus-platform::VirtualPacketInterface`
-统一语义。
+实现 Windows 平台 Capability Adapter：
+
+- **VirtualPacketInterface**（wintun 窄 C ABI，运行时动态加载）。
+- **SystemProxyController**（PRODUCT §13）：读写 `HKCU\...\Internet Settings`
+  的 `ProxyEnable`(DWORD) / `ProxyServer`(REG_SZ)，并经
+  `InternetSetOption(INTERNET_OPTION_SETTINGS_CHANGED + REFRESH)` 广播刷新。
+- **AutostartRegistrar**（PRODUCT §13）：经 `schtasks.exe` 注册/移除/查询
+  “当前用户 ONLOGON 启动 nexusd”的计划任务（非 Windows 服务）。
 
 能力声明为静态常量（wintun 的能力面），由组合根 `apps/nexus-platform-host`
 的 `vpi-capabilities` 命令暴露给 E4 验证；驱动/内核对象的真实创建只在显式
@@ -48,8 +52,15 @@ Adapter API 中发生。
 
 - 只实现 `nexus-platform` capability traits；能力缺失显式返回
   `PlatformError::Unavailable`。
-- `unsafe` 只允许存在于 `wintun.rs` 一个模块，每处带 Safety Invariant 注释；
+- `unsafe` 只允许存在于 `wintun.rs` 与 `wininet_proxy.rs`（注册表 advapi32 与
+  wininet 窄 FFI）两个模块，每处带 Safety Invariant 注释；`autostart.rs` 经
+  `std::process::Command` 调用 `schtasks.exe`（安全 Rust，无 unsafe）；
   其余模块 `#![deny(unsafe_op_in_unsafe_fn)]` 且不扩散 unsafe。
+- WinINET 代理写路径：改注册表后必须成对调用
+  `INTERNET_OPTION_SETTINGS_CHANGED` + `INTERNET_OPTION_REFRESH`，缺一不生效；
+  提供方不缓存“已刷新”状态，每次 apply 都广播。
+- 自启任务名前缀固定 `nexus-`；临时测试任务名必须带 `nexus-test-` 前缀，
+  install/remove 幂等（已存在则覆盖创建，remove 不存在视为成功）。
 - 生命周期守卫顺序固定：`WintunEndSession` → `WintunCloseAdapter` →
   `WintunFreeAdapter`；`Drop` 按此顺序执行，不 panic。
 - 包长边界：receive 拷贝前校验目标缓冲；send 前校验包长
@@ -66,6 +77,10 @@ Adapter API 中发生。
 - 默认最小 surface：`private -> pub(crate) -> pub`。
 - 公开：`WintunVpiAdapter`（open/create）、`capabilities()`、
   `mtu()`、`backend()`、`MAX_PACKET_SIZE`。
+- 公开（PRODUCT §13）：`WinInetSystemProxy`（实现 `SystemProxyController`：
+  `snapshot()`/`apply(enabled,server)`/`refresh()`）；`TaskSchedulerAutostart`
+  （实现 `AutostartRegistrar`：`install(exe,args)`/`remove()`/`status()`）。
+  自启固定任务名常量与 `nexus-test-` 前缀规则公开可见。
 
 ## Verification
 

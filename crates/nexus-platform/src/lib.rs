@@ -99,3 +99,38 @@ pub use udp_carrier::UdpCarrier;
 
 /// SecureStore 平台无关核心（machine-id 解析 / NEXSEC1 格式 / AEAD 记录）。
 pub mod secure_store;
+
+/// 当前用户 WinINET 系统代理快照（PRODUCT §13）。
+///
+/// `server` 对应注册表 `ProxyServer`（如 `127.0.0.1:7898`）；未设置为 `None`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemProxyState {
+    pub enabled: bool,
+    pub server: Option<String>,
+}
+
+/// 系统代理控制器：读写当前用户 WinINET 代理并广播刷新（PRODUCT §13）。
+///
+/// 具体注册表 / `InternetSetOption` 通知只存在于 `nexus-platform-*`；
+/// portable core 经此 trait 消费。
+pub trait SystemProxyController: Send + Sync {
+    /// 读取当前 `ProxyEnable` / `ProxyServer`。
+    fn snapshot(&self) -> Result<SystemProxyState, PlatformError>;
+    /// 写 `ProxyEnable` + `ProxyServer`，并成对广播
+    /// `INTERNET_OPTION_SETTINGS_CHANGED` + `INTERNET_OPTION_REFRESH`。
+    fn apply(&self, enabled: bool, server: Option<&str>) -> Result<(), PlatformError>;
+    /// 仅广播刷新（不写注册表）。
+    fn refresh(&self) -> Result<(), PlatformError>;
+}
+
+/// 常驻自启注册器（当前用户 ONLOGON 计划任务，PRODUCT §13）。
+///
+/// 具体任务计划操作只存在于 `nexus-platform-*`。
+pub trait AutostartRegistrar: Send + Sync {
+    /// 注册/覆盖开机自启任务，返回最终任务名。
+    fn install(&self, exe_path: &str, args: &[&str]) -> Result<String, PlatformError>;
+    /// 移除自启任务（不存在视为成功）。
+    fn remove(&self) -> Result<(), PlatformError>;
+    /// 任务是否已注册。
+    fn is_installed(&self) -> Result<bool, PlatformError>;
+}

@@ -549,6 +549,7 @@ dependencies = [
  "nexus-ingress",
  "nexus-network",
  "nexus-platform",
+ "nexus-platform-windows",
  "nexus-registry",
  "nexus-service",
  "nexus-workspace",
