@@ -1294,6 +1294,248 @@ pub fn parse_clash_subscription(text: &str) -> Result<SubscriptionParse, ConfigE
     })
 }
 
+// ---------------------------------------------------------------------------
+// 订阅节点在线更新（PRODUCT.md §11.17，requirement-change）
+//
+// 本 crate 只持有可移植、纯内存、离线的配置与状态机：
+// - [`SubscriptionSourceConfig`]：订阅源声明（url/interval/user-agent/headers/TLS 选项）；
+// - [`SubscriptionRuntime`]：喂入一次拉取到的订阅文本（Ok(body)）或失败（Err），
+//   复用 [`parse_clash_subscription`] 解析、整体替换订阅节点集、失败回退保留旧集。
+//
+// 真正的 HTTP(S) 拉取与后台拉取线程在组合根（apps/nexus）装配，不污染 portable core。
+// ---------------------------------------------------------------------------
+
+/// 订阅源配置（§11.17）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionSourceConfig {
+    /// 订阅源标识（可观察事件关联字段）。
+    pub tag: String,
+    /// 订阅地址（`http://` 明文 / `https://` rustls，§11.14 传输层）。
+    pub url: String,
+    /// 拉取间隔秒数（逻辑时钟；>= 1）。
+    pub interval_secs: u64,
+    /// HTTP `User-Agent` 请求头。
+    pub user_agent: String,
+    /// 附加请求头（有序）。
+    pub headers: Vec<(String, String)>,
+    /// https 是否跳过服务端证书校验（自签/私有场景；默认 false 走 Mozilla 根）。
+    pub tls_skip_cert_verify: bool,
+}
+
+impl SubscriptionSourceConfig {
+    /// 构造并校验：tag 非空、url 为 http/https、interval >= 1。
+    ///
+    /// # Errors
+    ///
+    /// 非法字段返回 `ConfigError`（`CONFIG_INVALID` 语义）。
+    pub fn new(
+        tag: impl Into<String>,
+        url: impl Into<String>,
+        interval_secs: u64,
+    ) -> Result<Self, ConfigError> {
+        let tag = tag.into();
+        let url = url.into();
+        if tag.is_empty() {
+            return Err(ConfigError::new("subscription.tag", "must not be empty"));
+        }
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err(ConfigError::new(
+                "subscription.url",
+                format!("url must be http:// or https://, got '{url}'"),
+            ));
+        }
+        if interval_secs < 1 {
+            return Err(ConfigError::new(
+                "subscription.interval_secs",
+                "must be >= 1",
+            ));
+        }
+        Ok(Self {
+            tag,
+            url,
+            interval_secs,
+            user_agent: "Nexus-Subscription/1".to_string(),
+            headers: Vec::new(),
+            tls_skip_cert_verify: false,
+        })
+    }
+
+    /// 覆盖默认 User-Agent。
+    #[must_use]
+    pub fn with_user_agent(mut self, ua: impl Into<String>) -> Self {
+        self.user_agent = ua.into();
+        self
+    }
+
+    /// 追加一个附加请求头。
+    #[must_use]
+    pub fn with_header(mut self, k: impl Into<String>, v: impl Into<String>) -> Self {
+        self.headers.push((k.into(), v.into()));
+        self
+    }
+
+    /// 设置 https 跳过证书校验。
+    #[must_use]
+    pub fn with_tls_skip_cert_verify(mut self, skip: bool) -> Self {
+        self.tls_skip_cert_verify = skip;
+        self
+    }
+}
+
+/// 一次订阅拉取尝试的结构化可观察事件（§11.17）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionUpdateEvent {
+    /// 订阅源 tag（关联字段）。
+    pub subscription_tag: String,
+    /// 本次是第几次尝试（从 1 开始）。
+    pub attempt: u64,
+    /// 本次拉取+解析是否成功并热生效。
+    pub ok: bool,
+    /// 尝试前有效节点数。
+    pub node_count_before: usize,
+    /// 尝试后有效节点数（失败时应与 before 相同）。
+    pub node_count_after: usize,
+    /// 本次解析被显式拒绝的未知协议行数。
+    pub rejected: u32,
+    /// 本次拉取耗时（毫秒）。
+    pub latency_ms: u64,
+    /// 失败原因（`ok=false` 时）。
+    pub error: Option<String>,
+}
+
+/// 订阅节点运行时状态机（纯内存、离线、确定性）。
+///
+/// 不变量：
+/// - 本地手写 outbounds 在整个生命周期内恒定保留，永不被订阅清空；
+/// - 订阅节点集独立于本地 outbounds；每次成功拉取**整体替换**订阅节点集（非累积）；
+/// - 失败（拉取或解析失败）时订阅节点集保持上一次成功的值（无历史则为空）；
+/// - 有效节点数 = `local_outbounds.len() + subscription_nodes.len()`。
+pub struct SubscriptionRuntime {
+    source_tag: String,
+    local_outbounds: Vec<OutboundConfig>,
+    subscription_nodes: Vec<OutboundConfig>,
+    last_body: Option<String>,
+    attempt: u64,
+}
+
+impl SubscriptionRuntime {
+    /// 用本地手写 outbounds 构造（这些节点恒定保留）。
+    #[must_use]
+    pub fn new(source_tag: impl Into<String>, local_outbounds: Vec<OutboundConfig>) -> Self {
+        Self {
+            source_tag: source_tag.into(),
+            local_outbounds,
+            subscription_nodes: Vec::new(),
+            last_body: None,
+            attempt: 0,
+        }
+    }
+
+    /// 当前有效节点数（本地 ++ 订阅）。
+    #[must_use]
+    pub fn effective_node_count(&self) -> usize {
+        self.local_outbounds.len() + self.subscription_nodes.len()
+    }
+
+    /// 当前有效节点列表（本地手写 outbounds ++ 当前订阅节点集）。
+    #[must_use]
+    pub fn effective_nodes(&self) -> Vec<OutboundConfig> {
+        self.local_outbounds
+            .iter()
+            .chain(self.subscription_nodes.iter())
+            .cloned()
+            .collect()
+    }
+
+    /// 上一次成功拉取的订阅原文（缓存兜底用；无则 `None`）。
+    #[must_use]
+    pub fn last_body(&self) -> Option<&str> {
+        self.last_body.as_deref()
+    }
+
+    /// 已发生的尝试次数。
+    #[must_use]
+    pub fn attempt(&self) -> u64 {
+        self.attempt
+    }
+
+    /// 喂入一次拉取结果：
+    ///
+    /// - `Ok(text)`：解析订阅；成功则整体替换订阅节点集（同订阅内 tag 去重，后出现者覆盖），
+    ///   记录 last_body；
+    /// - `Err(e)` 或解析失败：保留上一次成功的订阅节点集，**不清空**。
+    ///
+    /// 返回结构化事件；是否推进热生效 revision 由调用方（组合根按 `ok` 决定）。
+    pub fn apply_body(
+        &mut self,
+        body: Result<String, String>,
+        latency_ms: u64,
+    ) -> SubscriptionUpdateEvent {
+        self.attempt += 1;
+        let attempt = self.attempt;
+        let before = self.effective_node_count();
+        let after_ok = |parsed: SubscriptionParse| {
+            // 同订阅内 tag 去重：后出现者覆盖先出现者。
+            let mut deduped: Vec<OutboundConfig> = Vec::with_capacity(parsed.outbounds.len());
+            for node in parsed.outbounds {
+                match deduped.iter().position(|n| n.tag == node.tag) {
+                    Some(pos) => deduped[pos] = node,
+                    None => deduped.push(node),
+                }
+            }
+            deduped
+        };
+        match body {
+            Ok(text) => match parse_clash_subscription(&text) {
+                Ok(parsed) => {
+                    let rejected = parsed.rejected.len() as u32;
+                    self.subscription_nodes = after_ok(parsed);
+                    self.last_body = Some(text);
+                    let after = self.effective_node_count();
+                    SubscriptionUpdateEvent {
+                        subscription_tag: self.source_tag.clone(),
+                        attempt,
+                        ok: true,
+                        node_count_before: before,
+                        node_count_after: after,
+                        rejected,
+                        latency_ms,
+                        error: None,
+                    }
+                }
+                Err(e) => {
+                    // 解析失败：保留旧订阅节点集。
+                    let after = self.effective_node_count();
+                    SubscriptionUpdateEvent {
+                        subscription_tag: self.source_tag.clone(),
+                        attempt,
+                        ok: false,
+                        node_count_before: before,
+                        node_count_after: after,
+                        rejected: 0,
+                        latency_ms,
+                        error: Some(format!("parse: {e}")),
+                    }
+                }
+            },
+            Err(e) => {
+                // 拉取失败：保留旧订阅节点集。
+                let after = self.effective_node_count();
+                SubscriptionUpdateEvent {
+                    subscription_tag: self.source_tag.clone(),
+                    attempt,
+                    ok: false,
+                    node_count_before: before,
+                    node_count_after: after,
+                    rejected: 0,
+                    latency_ms,
+                    error: Some(e),
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1502,5 +1744,131 @@ outbounds:
 ";
         let cfg = parse(yaml).expect("ok");
         assert_eq!(cfg.outbounds[0].header_format, None);
+    }
+}
+
+#[cfg(test)]
+mod subscription_online_tests {
+    use super::*;
+
+    /// 极简标准字母表 base64 编码（仅测试用）。
+    fn b64(data: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut s = String::new();
+        for chunk in data.chunks(3) {
+            let n = chunk.len();
+            let b0 = chunk[0] as u32;
+            let b1 = if n > 1 { chunk[1] as u32 } else { 0 };
+            let b2 = if n > 2 { chunk[2] as u32 } else { 0 };
+            let bits = (b0 << 16) | (b1 << 8) | b2;
+            s.push(T[((bits >> 18) & 63) as usize] as char);
+            s.push(T[((bits >> 12) & 63) as usize] as char);
+            s.push(if n > 1 {
+                T[((bits >> 6) & 63) as usize] as char
+            } else {
+                '='
+            });
+            s.push(if n > 2 {
+                T[(bits & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+        s
+    }
+
+    fn local_direct() -> Vec<OutboundConfig> {
+        vec![OutboundConfig {
+            tag: "direct".to_string(),
+            kind: OutboundKind::Direct,
+            locator: Some("".to_string()),
+            method: None,
+            password: None,
+            alpn: None,
+            skip_cert_verify: None,
+            header_format: None,
+        }]
+    }
+
+    #[test]
+    fn source_config_rejects_bad_inputs() {
+        assert!(SubscriptionSourceConfig::new("", "http://x", 60).is_err());
+        assert!(SubscriptionSourceConfig::new("s", "ftp://x", 60).is_err());
+        assert!(SubscriptionSourceConfig::new("s", "http://x", 0).is_err());
+        let ok = SubscriptionSourceConfig::new("sub", "https://127.0.0.1:1/x", 60)
+            .expect("valid")
+            .with_user_agent("ua")
+            .with_header("K", "V")
+            .with_tls_skip_cert_verify(true);
+        assert_eq!(ok.user_agent, "ua");
+        assert!(ok.tls_skip_cert_verify);
+    }
+
+    #[test]
+    fn success_pull_adds_sub_nodes_and_keeps_local() {
+        let body = b64(
+            b"ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpw@h1:8388#NodeA\nvmess://uuid@h2:10086#NodeB",
+        );
+        let mut rt = SubscriptionRuntime::new("sub", local_direct());
+        assert_eq!(rt.effective_node_count(), 1);
+        let ev = rt.apply_body(Ok(body), 5);
+        assert!(ev.ok);
+        assert_eq!(ev.node_count_before, 1);
+        assert_eq!(ev.node_count_after, 3); // local direct + 2 sub
+        assert_eq!(ev.rejected, 0);
+        assert_eq!(rt.attempt(), 1);
+    }
+
+    #[test]
+    fn failed_pull_keeps_previous_nodes_and_does_not_clear() {
+        let body = b64(b"ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpw@h1:8388#NodeA");
+        let mut rt = SubscriptionRuntime::new("sub", local_direct());
+        rt.apply_body(Ok(body), 5);
+        assert_eq!(rt.effective_node_count(), 2);
+        // 拉取失败：节点数保持不变（回退），不清空。
+        let ev = rt.apply_body(Err("connect refused".to_string()), 1);
+        assert!(!ev.ok);
+        assert_eq!(ev.node_count_before, 2);
+        assert_eq!(ev.node_count_after, 2);
+        assert!(ev.error.is_some());
+        assert_eq!(rt.effective_node_count(), 2);
+    }
+
+    #[test]
+    fn subsequent_success_replaces_subset_wholesale() {
+        let b1 = b64(b"ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpw@h1:8388#NodeA");
+        let b2 = b64(b"ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpw@h1:8388#NodeA\n\
+              ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpw@h2:8389#NodeB\n\
+              ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpw@h3:8390#NodeC");
+        let mut rt = SubscriptionRuntime::new("sub", local_direct());
+        rt.apply_body(Ok(b1), 5);
+        assert_eq!(rt.effective_node_count(), 2); // local + 1
+        rt.apply_body(Ok(b2), 6);
+        // 整体替换：订阅集从 1 -> 3，非累积（不是 1+1+3=5）。
+        assert_eq!(rt.effective_node_count(), 4); // local + 3
+    }
+
+    #[test]
+    fn unknown_scheme_lines_are_rejected_not_fatal() {
+        let body =
+            b64(b"ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpw@h1:8388#NodeA\ntrojan://p@tr:443#Bad");
+        let mut rt = SubscriptionRuntime::new("sub", local_direct());
+        let ev = rt.apply_body(Ok(body), 5);
+        assert!(ev.ok);
+        assert_eq!(ev.rejected, 1);
+        assert_eq!(ev.node_count_after, 2); // local + 1 valid
+    }
+
+    #[test]
+    fn parse_failure_keeps_previous_subset() {
+        let good = b64(b"ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpw@h1:8388#NodeA");
+        let mut rt = SubscriptionRuntime::new("sub", local_direct());
+        rt.apply_body(Ok(good), 5);
+        assert_eq!(rt.effective_node_count(), 2);
+        // 非法 base64：解析失败，保留旧集。
+        let ev = rt.apply_body(Ok("!!!not-base64!!!".to_string()), 5);
+        assert!(!ev.ok);
+        assert_eq!(ev.node_count_after, 2);
+        assert_eq!(rt.effective_node_count(), 2);
     }
 }

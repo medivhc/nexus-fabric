@@ -22,6 +22,8 @@ pub mod localapi_client;
 pub mod observability;
 pub mod provider_fetcher;
 pub mod subnet_cli;
+/// §11.17 订阅节点在线更新拉取器（HTTP 拉取 + 解析合并 + 热生效 + 结构化并发 Owner）。
+pub mod subscription_updater;
 
 use nexus_domain::{
     LifecyclePhase, NexusError, ProviderId, ResourceId, SessionId, TerminalOutcome,
