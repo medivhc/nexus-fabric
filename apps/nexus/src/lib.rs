@@ -4403,15 +4403,209 @@ pub fn proxy_serve_once(
             });
             (up, down)
         }
-        nexus_proxy_config::OutboundKind::Relay
-        | nexus_proxy_config::OutboundKind::Trojan
-        | nexus_proxy_config::OutboundKind::Vmess => {
+        nexus_proxy_config::OutboundKind::Trojan => {
+            // §11.16 trojan 数据面：rustls TLS（SNI=节点域名、ALPN、skip-cert-verify）
+            // + trojan 请求头（standard/singbox）+ 双向透明中继 client<->TLS。
+            use nexus_outbound_trojan::{TrojanHeaderFormat, TrojanTarget, encode_request_fmt};
+            use rustls::pki_types::ServerName;
+            use std::sync::Arc;
+
+            let locator = selected.locator.clone().ok_or_else(|| {
+                NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: "trojan outbound missing locator".into(),
+                }
+            })?;
+            let (nhost, nport) = split_host_port(&locator)?;
+            let mut node = std::net::TcpStream::connect((nhost.as_str(), nport)).map_err(|e| {
+                NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: format!("trojan node connect {locator} failed: {e}"),
+                }
+            })?;
+            let password = selected.password.clone().ok_or_else(|| {
+                NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: "trojan outbound missing password".into(),
+                }
+            })?;
+
+            let header_format = match selected.header_format.as_deref() {
+                Some("singbox") => TrojanHeaderFormat::Singbox,
+                _ => TrojanHeaderFormat::Standard,
+            };
+            let skip_verify = selected.skip_cert_verify.unwrap_or(false);
+            let alpn: Vec<Vec<u8>> = selected
+                .alpn
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.into_bytes())
+                .collect();
+            let alpn_ref: Vec<&[u8]> = alpn.iter().map(|v| v.as_slice()).collect();
+
+            // 客户端 TLS 配置：skip-cert-verify（自签/内网节点）或系统信任根。
+            let tls_cfg: Result<rustls::ClientConfig, NexusError> = if skip_verify {
+                nexus_outbound_trojan::client_config_dangerous_skip_verify(&alpn_ref).map_err(|e| {
+                    NexusError::ConnectivityEstablishmentFailed {
+                        provider: ProviderId(decision.selected_outbound_tag.clone()),
+                        reason: format!("trojan client tls config failed: {e}"),
+                    }
+                })
+            } else {
+                let mut roots = rustls::RootCertStore::empty();
+                for c in rustls_native_certs::load_native_certs().certs {
+                    let _ = roots.add(c);
+                }
+                let prov = Arc::new(rustls::crypto::ring::default_provider());
+                let mut cfg = rustls::ClientConfig::builder_with_provider(prov)
+                    .with_safe_default_protocol_versions()
+                    .map_err(|_| NexusError::Internal {
+                        message: "tls versions".into(),
+                    })?
+                    .with_root_certificates(roots)
+                    .with_no_client_auth();
+                if !alpn.is_empty() {
+                    cfg.alpn_protocols = alpn.clone();
+                }
+                Ok(cfg)
+            };
+            let tls_cfg = tls_cfg?;
+
+            let sni = ServerName::try_from(nhost.clone()).map_err(|_| {
+                NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: format!("trojan sni invalid: {nhost}"),
+                }
+            })?;
+            let mut conn = rustls::ClientConnection::new(Arc::new(tls_cfg), sni).map_err(|e| {
+                NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: format!("trojan client connection failed: {e}"),
+                }
+            })?;
+
+            // 写入 trojan 请求头（write_all/flush 同时驱动 TLS 握手）。
+            let target = if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+                TrojanTarget::Ipv4(ip.octets(), port)
+            } else {
+                TrojanTarget::Domain(host.clone(), port)
+            };
+            let header = encode_request_fmt(&password, &target, header_format);
+            {
+                let mut tls = rustls::Stream::new(&mut conn, &mut node);
+                tls.write_all(&header).map_err(|e| {
+                    NexusError::ConnectivityEstablishmentFailed {
+                        provider: ProviderId(decision.selected_outbound_tag.clone()),
+                        reason: format!("trojan header write failed: {e}"),
+                    }
+                })?;
+                tls.flush()
+                    .map_err(|e| NexusError::ConnectivityEstablishmentFailed {
+                        provider: ProviderId(decision.selected_outbound_tag.clone()),
+                        reason: format!("trojan handshake/header flush failed: {e}"),
+                    })?;
+            }
+
+            // 双向透明中继：rustls ClientConnection 不可跨线程分裂，用非阻塞单线程
+            // poll 在 client 与 TLS 之间搬运字节（loopback E4 小流量足够；本函数单线程
+            // 闭环承担结构化并发，无泄漏 JoinHandle）。
+            node.set_nonblocking(true)
+                .map_err(|e| NexusError::Internal {
+                    message: format!("trojan node nonblocking: {e}"),
+                })?;
+            client
+                .set_nonblocking(true)
+                .map_err(|e| NexusError::Internal {
+                    message: format!("trojan client nonblocking: {e}"),
+                })?;
+            let mut up_bytes = 0usize;
+            let mut down_bytes = 0usize;
+            let mut cbuf = [0u8; 8192];
+            let mut sbuf = [0u8; 8192];
+            let mut c_open = true;
+            let mut tls_open = true;
+            {
+                let mut tls = rustls::Stream::new(&mut conn, &mut node);
+                loop {
+                    if !c_open && !tls_open {
+                        break;
+                    }
+                    let mut progressed = false;
+                    if c_open {
+                        match client.read(&mut cbuf) {
+                            Ok(0) => c_open = false,
+                            Ok(n) => match tls.write_all(&cbuf[..n]) {
+                                Ok(()) => match tls.flush() {
+                                    Ok(()) => {
+                                        up_bytes += n;
+                                        progressed = true;
+                                    }
+                                    Err(_) => tls_open = false,
+                                },
+                                Err(_) => tls_open = false,
+                            },
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(_) => c_open = false,
+                        }
+                    }
+                    if tls_open && c_open {
+                        match tls.read(&mut sbuf) {
+                            Ok(0) => tls_open = false,
+                            Ok(n) => match client.write_all(&sbuf[..n]) {
+                                Ok(()) => {
+                                    down_bytes += n;
+                                    progressed = true;
+                                }
+                                Err(_) => {
+                                    // 投递到 client 失败：client 已不可达，隧道整体终止。
+                                    c_open = false;
+                                    tls_open = false;
+                                }
+                            },
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(_) => tls_open = false,
+                        }
+                    } else if tls_open && !c_open {
+                        // client 已断开：直接终止节点侧，避免节点不发 close_notify 时空转。
+                        tls_open = false;
+                    }
+                    if !progressed {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                }
+            }
+            // 尽力向节点发送 close_notify（不阻断结果）。
+            conn.send_close_notify();
+            let _ = node.set_nonblocking(false);
+
+            let hf_label = match header_format {
+                TrojanHeaderFormat::Standard => "standard",
+                TrojanHeaderFormat::Singbox => "singbox",
+            };
+            outbound = json!({
+                "kind": "trojan",
+                "node_locator": locator,
+                "tls": {
+                    "sni": nhost,
+                    "alpn": selected.alpn,
+                    "skip_cert_verify": skip_verify,
+                },
+                "header_format": hf_label,
+            });
+            (up_bytes, down_bytes)
+        }
+        nexus_proxy_config::OutboundKind::Relay => {
             return Err(NexusError::ConnectivityEstablishmentFailed {
                 provider: ProviderId(decision.selected_outbound_tag.clone()),
-                reason: format!(
-                    "outbound kind {} data-plane tunnel not in frozen E4 scope (next batch)",
-                    selected.kind.as_str()
-                ),
+                reason: "relay outbound data-plane tunnel not in this batch scope (deferred)"
+                    .into(),
+            });
+        }
+        nexus_proxy_config::OutboundKind::Vmess => {
+            return Err(NexusError::ConnectivityEstablishmentFailed {
+                provider: ProviderId(decision.selected_outbound_tag.clone()),
+                reason: "vmess outbound data-plane not in this batch: nexus-outbound-vmess currently provides only self-consistent AEAD encrypt/decrypt roundtrip; missing VMess request-header encoder, AEAD chunk wire framing, and session-key derivation required for a real node tunnel (deferred)".into(),
             });
         }
     };
