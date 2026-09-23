@@ -3,6 +3,8 @@
 ## Responsibility
 
 提供 portable SOCKS5/HTTP 代理协议状态机、Packet/Stream 解码、Flow Classification 与 FlowContext 构造。
+其中 Packet 解码（§11.17 TUN 透明入站）：把 wintun/VPI 读到的原始 IPv4 包纯函数解析为
+`TunPacket`（proto + 四元组地址端口），供上层构造中立 `FlowContext`。
 
 ## Non-Responsibilities
 
@@ -51,6 +53,14 @@
 - 已实现（骨架）：
   - `classify` + `from_socks5` / `from_http` / `from_virtual_packet_interface` /
     `from_native_api`：按 `FlowOrigin` 构造中立 `FlowContext`（纯函数，零 I/O）。
+- 已实现（§11.17 TUN IP 包解码，纯函数零 I/O，portable）：
+  - `ip_packet::TunPacket { protocol: u8, src_ip: [u8;4], dst_ip: [u8;4],
+    src_port: u16, dst_port: u16 }`：解析后的 IPv4 传输五元组；
+  - `ip_packet::parse_ipv4_packet(&[u8]) -> Option<TunPacket>`：仅接受 IPv4 且传输层为
+    TCP(6)/UDP(17)；版本非 4、IHL 非法、截断、ICMP/其他协议、IPv6 一律返回 `None`
+    （调用方计入 dropped，本模块不持有计数、不日志）；
+  - `TunPacket::destination(&self) -> String`：`"dst_ip:dst_port"`，直接喂给
+    `from_virtual_packet_interface` 构造 `FlowContext`。
 - 已实现（SOCKS5 有状态握手状态机，sing-box 吸收）：
   - `Socks5Handshake`：`new()` / `state()` / `feed(&mut self, bytes) -> Socks5Step` /
     `take_data()`（Established 后的数据面字节）；

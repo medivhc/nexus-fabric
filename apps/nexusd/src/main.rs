@@ -601,6 +601,18 @@ fn proxy_resource(args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let flags = parse_flags(args);
+    // §11.17 TUN 透明入站：--tun 走真实 wintun adapter 开卡（E5，需管理员 + wintun.dll
+    // 与 nexusd.exe 同目录）。成功返回 adapter 元数据后随 Drop 释放句柄；失败结构化 TUN_ERROR。
+    if flags.contains_key("--tun") {
+        let tun_name = flags
+            .get("--tun-name")
+            .and_then(|v| v.as_deref())
+            .unwrap_or("nexus-tun")
+            .to_string();
+        let result = nexus::tun_proxy_real_open(&tun_name)
+            .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string()));
+        return print_json_result(result);
+    }
     let addr: std::net::SocketAddr = match flags.get("--addr").and_then(|v| v.as_deref()) {
         Some(raw) => match raw.parse() {
             Ok(a) => a,

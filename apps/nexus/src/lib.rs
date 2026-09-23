@@ -7069,3 +7069,188 @@ pub fn tun_dataplane_flow() -> Result<Value, NexusError> {
         },
     }))
 }
+
+// ---------------------------------------------------------------------------
+// §11.17 TUN 透明代理入站（E4：MemoryVpi 离线闭环；E5：--real 走真实 wintun）
+// ---------------------------------------------------------------------------
+
+/// 构造一个合法 IPv4 包（IHL=5，20 字节头 + 4 字节传输端口）。
+fn build_ipv4_packet(protocol: u8, src: [u8; 4], sport: u16, dst: [u8; 4], dport: u16) -> Vec<u8> {
+    let mut p = vec![0u8; 24];
+    p[0] = (4u8 << 4) | 5;
+    p[8] = 64; // TTL
+    p[9] = protocol;
+    p[12..16].copy_from_slice(&src);
+    p[16..20].copy_from_slice(&dst);
+    p[20..22].copy_from_slice(&sport.to_be_bytes());
+    p[22..24].copy_from_slice(&dport.to_be_bytes());
+    p
+}
+
+const TUN_PROXY_CONFIG: &str = "\
+schema_version: 1
+rules:
+  - tag: rule-internal-cidr
+    kind: ip_cidr
+    match: 10.0.0.0/8
+    action:
+      - kind: select_outbound
+        tag: relay-group
+  - tag: rule-match
+    kind: match
+    match: \"\"
+    action:
+      - kind: select_outbound
+        tag: direct
+groups:
+  - tag: relay-group
+    kind: selector
+    candidates: [relay]
+outbounds:
+  - tag: direct
+    kind: direct
+    locator: \"\"
+  - tag: relay
+    kind: relay
+    locator: relay.internal:443
+";
+
+/// E4 产品场景 `product.proxy-tun-inbound` 的进程内闭环（PRODUCT §11.17）。
+///
+/// 注入 `MemoryVpi`（离线确定性 VPI 替身）四条 IP 包：
+/// 1) TCP 192.168.1.5:12345 -> 10.1.2.3:443（命中 ip_cidr -> relay-group）；
+/// 2) UDP 192.168.1.5:53000 -> 8.8.8.8:53（落入 MATCH -> direct）；
+/// 3) 与 1 同 5 元组的第二个 TCP 包（NAT cache hit）；
+/// 4) ICMP 坏包（计入 dropped，不 panic）。
+pub fn tun_proxy_flow() -> Result<Value, NexusError> {
+    use nexus_connectivity::virtual_subnet::MemoryVpi;
+    use nexus_ingress::ip_packet::parse_ipv4_packet;
+    use nexus_platform::VirtualPacketInterface;
+    use nexus_proxy::ProxyService;
+    use nexus_proxy::tun::TunNatRouter;
+
+    fn internal_err<E: std::fmt::Display>(e: E) -> NexusError {
+        NexusError::Internal {
+            message: e.to_string(),
+        }
+    }
+
+    let cfg = nexus_proxy_config::parse(TUN_PROXY_CONFIG).map_err(|e| NexusError::Internal {
+        message: format!("tun proxy config invalid: {e}"),
+    })?;
+    let service = ProxyService::new(&cfg).map_err(|e| NexusError::Internal {
+        message: format!("tun proxy service build failed: {e}"),
+    })?;
+    let mut router = TunNatRouter::new(service);
+
+    let mut vpi = MemoryVpi::new();
+    // 四条包按序注入；每条注入后 drain 一次读循环。
+    let packets: Vec<Vec<u8>> = vec![
+        build_ipv4_packet(6, [192, 168, 1, 5], 12345, [10, 1, 2, 3], 443), // p1 TCP -> cidr
+        build_ipv4_packet(17, [192, 168, 1, 5], 53000, [8, 8, 8, 8], 53),  // p2 UDP -> MATCH
+        build_ipv4_packet(6, [192, 168, 1, 5], 12345, [10, 1, 2, 3], 443), // p3 同 p1（cache hit）
+        build_ipv4_packet(1, [192, 168, 1, 5], 0, [10, 9, 9, 9], 0),       // p4 ICMP 坏包
+    ];
+
+    let mut first_flow: Option<Value> = None;
+    let mut udp_flow: Option<Value> = None;
+    let mut replay: Option<Value> = None;
+    for (idx, pkt) in packets.iter().enumerate() {
+        vpi.inject_recv(pkt);
+        let mut buf = [0u8; 2048];
+        // drain：MemoryVpi 一次读回已注入的整包（真实 wintun 亦一包一收）。
+        loop {
+            let n = vpi.receive(&mut buf).map_err(&internal_err)?;
+            if n == 0 {
+                break;
+            }
+            match parse_ipv4_packet(&buf[..n]) {
+                Some(parsed) => {
+                    let out =
+                        router
+                            .route_packet(&parsed, n)
+                            .map_err(|e| NexusError::Internal {
+                                message: format!("tun route failed: {e}"),
+                            })?;
+                    let v = serde_json::json!({
+                        "destination": out.destination,
+                        "protocol": out.protocol,
+                        "flow_origin": out.flow_origin,
+                        "matched_rule": out.matched_rule,
+                        "selected_outbound_tag": out.selected_outbound_tag,
+                        "cache_hit": out.cache_hit,
+                    });
+                    match idx {
+                        0 => first_flow = Some(v),
+                        1 => udp_flow = Some(v),
+                        _ => replay = Some(v),
+                    }
+                }
+                None => router.record_dropped(n),
+            }
+        }
+    }
+
+    let s = router.stats();
+    Ok(serde_json::json!({
+        "verdict": "PASS",
+        "command": "tun proxy inbound",
+        "first_flow": first_flow.unwrap_or(Value::Null),
+        "udp_flow": udp_flow.unwrap_or(Value::Null),
+        "replay": replay.unwrap_or(Value::Null),
+        "stats": {
+            "packets": s.packets,
+            "bytes": s.bytes,
+            "dropped": s.dropped,
+            "mappings": s.mappings,
+            "cache_hits": s.cache_hits,
+        },
+    }))
+}
+
+/// E5：真实 wintun adapter 开卡 + 能力/版本 + 一次非阻塞读帧（PRODUCT §11.17）。
+///
+/// 成功返回结构化 JSON（adapter 句柄在函数返回时随 Drop 释放：EndSession ->
+/// CloseAdapter -> FreeLibrary）；失败返回 `TUN_ERROR` 结构化结果（由调用方按 exit 0 输出）。
+/// 需管理员 + nexusd.exe 同目录存在签名 `wintun.dll` + 已安装 wintun.sys 驱动。
+pub fn tun_proxy_real_open(tun_name: &str) -> Result<Value, NexusError> {
+    #[cfg(windows)]
+    {
+        use nexus_platform::VirtualPacketInterface;
+        match nexus_platform_windows::WintunVpiAdapter::create(tun_name, "Nexus") {
+            Ok(mut vpi) => {
+                let caps = nexus_platform_windows::WintunVpiAdapter::capabilities();
+                Ok(serde_json::json!({
+                    "verdict": "PASS",
+                    "command": "tun proxy real open",
+                    "backend": nexus_platform_windows::WintunVpiAdapter::backend(),
+                    "mtu": nexus_platform_windows::WintunVpiAdapter::mtu(),
+                    "driver_version": vpi.driver_version(),
+                    "adapter_name": tun_name,
+                    "capabilities": {
+                        "packet_ingress": caps.packet_ingress,
+                        "packet_injection": caps.packet_injection,
+                        "ipv4": caps.ipv4,
+                        "ipv6": caps.ipv6,
+                    },
+                    "read_frame": {
+                        "bytes": vpi.receive(&mut [0u8; 2048]).map(|n| n as u64).unwrap_or(0),
+                    }
+                }))
+            }
+            Err(e) => Ok(serde_json::json!({
+                "verdict": "TUN_ERROR",
+                "command": "tun proxy real open",
+                "adapter_name": tun_name,
+                "error": e.to_string(),
+            })),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = tun_name;
+        Err(NexusError::Internal {
+            message: "TUN transparent inbound (wintun) only supported on Windows".into(),
+        })
+    }
+}

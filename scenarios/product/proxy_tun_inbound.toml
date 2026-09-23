@@ -1,0 +1,85 @@
+schema_version = 1
+id = "product.proxy-tun-inbound"
+title = "TUN 透明入站：IPv4/TCP|UDP 包解析 -> FlowContext(vpi) -> 规则路由 -> 5元组 NAT 缓存（E4，MemoryVpi 离线）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-tun-transparent-inbound"
+
+[given]
+inbound = "wintun/VPI 读原始 IP 包（E4 用 nexus-connectivity::MemoryVpi 注入，离线确定性）"
+parse = "nexus-ingress::ip_packet 纯函数：IPv4 + TCP(6)/UDP(17) -> TunPacket(dst_ip:dst_port)"
+rule_table = "static ordered: IP-CIDR 10.0.0.0/8 -> relay-group(selector->relay); MATCH -> direct"
+flows = "p1 TCP 192.168.1.5:12345 -> 10.1.2.3:443 (cidr miss? no: hit cidr); p2 UDP 192.168.1.5:53000 -> 8.8.8.8:53 (MATCH); p3 same 5-tuple as p1 (NAT cache hit); p4 ICMP/截断坏包 (dropped)"
+
+# 可执行 E4（example tun_proxy --json，进程内闭环，不依赖真实驱动）：
+# - p1 解析 proto=tcp，destination=10.1.2.3:443，FlowContext.origin=virtual-packet-interface，
+#   命中 ip_cidr 10.0.0.0/8 -> relay-group 解析为 outbound tag relay；
+# - p2 解析 proto=udp，destination=8.8.8.8:53，非 IP-CIDR -> MATCH -> direct；
+# - p3 与 p1 同 5 元组 -> cache_hit=true，mappings 不增（仍为 2）；
+# - p4 坏包 -> dropped+1，不 panic；计数器 packets=4/bytes/dropped=1/mappings=2/cache_hits=1。
+
+[when]
+command = "cargo run --quiet -p nexus --example tun_proxy -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "first_flow.flow_origin"
+equals = "virtual-packet-interface"
+
+[[expect]]
+field = "first_flow.destination"
+equals = "10.1.2.3:443"
+
+[[expect]]
+field = "first_flow.protocol"
+equals = 6
+
+[[expect]]
+field = "first_flow.matched_rule"
+equals = "rule-internal-cidr"
+
+[[expect]]
+field = "first_flow.selected_outbound_tag"
+equals = "relay"
+
+[[expect]]
+field = "udp_flow.destination"
+equals = "8.8.8.8:53"
+
+[[expect]]
+field = "udp_flow.protocol"
+equals = 17
+
+[[expect]]
+field = "udp_flow.matched_rule"
+equals = "rule-match"
+
+[[expect]]
+field = "udp_flow.selected_outbound_tag"
+equals = "direct"
+
+[[expect]]
+field = "replay.cache_hit"
+equals = true
+
+[[expect]]
+field = "replay.matched_rule"
+equals = "rule-internal-cidr"
+
+[[expect]]
+field = "stats.packets"
+equals = 4
+
+[[expect]]
+field = "stats.dropped"
+equals = 1
+
+[[expect]]
+field = "stats.mappings"
+equals = 2
+
+[[expect]]
+field = "stats.cache_hits"
+equals = 1
