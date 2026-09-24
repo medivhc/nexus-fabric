@@ -4181,41 +4181,98 @@ pub fn proxy_serve_once(
         message: format!("proxy accept failed: {e}"),
     })?;
 
-    // 1) SOCKS5 握手：增量喂入，逐段回写状态机响应（含 CONNECT 成功回复）。
-    let mut hs = nexus_ingress::Socks5Handshake::new();
+    // 1) 混合握手（§11.19）：首字节 0x05 -> 既有 Socks5Handshake；否则 -> HttpProxyHandshake。
+    //    同一端口按首字节分流，互不干扰。握手产出中立 FlowContext + 首段需先写上给上游的字节
+    //    （SOCKS5 隧道内 pipelined；HTTP 转发型改写后的 origin-form 请求行+请求头）。
     let mut buf = [0u8; 4096];
-    let flow = loop {
-        let n = client.read(&mut buf).map_err(|_| NexusError::Internal {
-            message: "proxy read failed".into(),
-        })?;
-        if n == 0 {
-            return Err(NexusError::Internal {
-                message: "socks5 client closed during handshake".into(),
-            });
-        }
-        let step = hs.feed(&buf[..n]);
-        if !step.response.is_empty() {
-            client
-                .write_all(&step.response)
-                .map_err(|_| NexusError::Internal {
-                    message: "proxy write failed".into(),
-                })?;
-        }
-        match step.state {
-            nexus_ingress::Socks5State::Established => {
-                break step.flow.ok_or_else(|| NexusError::Internal {
-                    message: "established without flow".into(),
-                })?;
+    let n0 = client.read(&mut buf).map_err(|_| NexusError::Internal {
+        message: "proxy read failed".into(),
+    })?;
+    if n0 == 0 {
+        return Err(NexusError::Internal {
+            message: "client closed during handshake".into(),
+        });
+    }
+    let (flow, inbound_kind, seed_to_upstream) = if buf[0] == 0x05 {
+        // ---- SOCKS5 分支（§11.4，零回归）----
+        let mut hs = nexus_ingress::Socks5Handshake::new();
+        let mut step = hs.feed(&buf[..n0]);
+        let flow = loop {
+            if !step.response.is_empty() {
+                client
+                    .write_all(&step.response)
+                    .map_err(|_| NexusError::Internal {
+                        message: "proxy write failed".into(),
+                    })?;
             }
-            nexus_ingress::Socks5State::Failed(e) => {
-                return Err(NexusError::Internal {
-                    message: format!("socks5 handshake failed: {e:?}"),
-                });
+            match step.state {
+                nexus_ingress::Socks5State::Established => {
+                    break step.flow.ok_or_else(|| NexusError::Internal {
+                        message: "established without flow".into(),
+                    })?;
+                }
+                nexus_ingress::Socks5State::Failed(e) => {
+                    return Err(NexusError::Internal {
+                        message: format!("socks5 handshake failed: {e:?}"),
+                    });
+                }
+                _ => {
+                    let n = client.read(&mut buf).map_err(|_| NexusError::Internal {
+                        message: "proxy read failed".into(),
+                    })?;
+                    if n == 0 {
+                        return Err(NexusError::Internal {
+                            message: "socks5 client closed during handshake".into(),
+                        });
+                    }
+                    step = hs.feed(&buf[..n]);
+                }
             }
-            _ => {}
-        }
+        };
+        // 隧道内 pipelined 字节先写上给上游（严格中继，不丢字节）。
+        let pipelined = hs.take_data();
+        (flow, "socks5".to_string(), pipelined)
+    } else {
+        // ---- HTTP 代理分支（§11.19）----
+        let mut hs = nexus_ingress::HttpProxyHandshake::new();
+        let mut step = hs.feed(&buf[..n0]);
+        let flow = loop {
+            if !step.response.is_empty() {
+                client
+                    .write_all(&step.response)
+                    .map_err(|_| NexusError::Internal {
+                        message: "proxy write failed".into(),
+                    })?;
+            }
+            match step.state {
+                nexus_ingress::HttpProxyState::Established => {
+                    break step.flow.ok_or_else(|| NexusError::Internal {
+                        message: "established without flow".into(),
+                    })?;
+                }
+                nexus_ingress::HttpProxyState::Failed(e) => {
+                    return Err(NexusError::Internal {
+                        message: format!("http proxy handshake failed: {e:?}"),
+                    });
+                }
+                _ => {
+                    let n = client.read(&mut buf).map_err(|_| NexusError::Internal {
+                        message: "proxy read failed".into(),
+                    })?;
+                    if n == 0 {
+                        return Err(NexusError::Internal {
+                            message: "http client closed during handshake".into(),
+                        });
+                    }
+                    step = hs.feed(&buf[..n]);
+                }
+            }
+        };
+        // 转发型：upstream_prefix（改写后的 origin-form 请求行+请求头）+ 握手后 pipelined 字节。
+        let mut seed = step.upstream_prefix;
+        seed.extend(hs.take_data());
+        (flow, "http".to_string(), seed)
     };
-    let _pipelined = hs.take_data();
 
     // 2) 规则路由（纯决策，零 I/O）。
     let config = nexus_proxy_config::parse(config_yaml).map_err(|e| NexusError::Internal {
@@ -4264,6 +4321,16 @@ pub fn proxy_serve_once(
                         reason: format!("outbound connect {host}:{port} failed: {e}"),
                     }
                 })?;
+            // §11.19：握手产出的首段字节（HTTP 改写后的 origin-form 请求 / SOCKS5 pipelined）
+            // 必须先写上给上游，再进入双向中继。
+            if !seed_to_upstream.is_empty() {
+                upstream.write_all(&seed_to_upstream).map_err(|e| {
+                    NexusError::ConnectivityEstablishmentFailed {
+                        provider: ProviderId(decision.selected_outbound_tag.clone()),
+                        reason: format!("upstream seed write failed: {e}"),
+                    }
+                })?;
+            }
             // 双向字节中继（结构化并发：join 消费两个拷贝线程的结果）。
             let mut client_c = client.try_clone().map_err(|_| NexusError::Internal {
                 message: "proxy clone failed".into(),
@@ -4360,6 +4427,15 @@ pub fn proxy_serve_once(
             let to_upstream = std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 let mut total = 0usize;
+                if !seed_to_upstream.is_empty() {
+                    match tx_sess
+                        .seal(&seed_to_upstream)
+                        .map(|f| write_record(&mut node_up, &f))
+                    {
+                        Ok(Ok(())) => total += seed_to_upstream.len(),
+                        _ => return total,
+                    }
+                }
                 loop {
                     match client_up.read(&mut buf) {
                         Ok(0) => break,
@@ -4507,6 +4583,20 @@ pub fn proxy_serve_once(
                         provider: ProviderId(decision.selected_outbound_tag.clone()),
                         reason: format!("trojan handshake/header flush failed: {e}"),
                     })?;
+                // §11.19：握手首段字节（HTTP 改写后的请求）随 TLS 一并写给节点。
+                if !seed_to_upstream.is_empty() {
+                    tls.write_all(&seed_to_upstream).map_err(|e| {
+                        NexusError::ConnectivityEstablishmentFailed {
+                            provider: ProviderId(decision.selected_outbound_tag.clone()),
+                            reason: format!("trojan seed write failed: {e}"),
+                        }
+                    })?;
+                    tls.flush()
+                        .map_err(|e| NexusError::ConnectivityEstablishmentFailed {
+                            provider: ProviderId(decision.selected_outbound_tag.clone()),
+                            reason: format!("trojan seed flush failed: {e}"),
+                        })?;
+                }
             }
 
             // 双向透明中继：rustls ClientConnection 不可跨线程分裂，用非阻塞单线程
@@ -4631,6 +4721,9 @@ pub fn proxy_serve_once(
 
     Ok(json!({
         "verdict": "PASS",
+        "inbound": {
+            "kind": inbound_kind,
+        },
         "socks": {
             "auth_method_reply": "0x05,0x00",
             "reply_code": 0,
