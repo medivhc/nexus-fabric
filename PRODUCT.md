@@ -323,7 +323,7 @@ SOCKS5 入站（Socks5Handshake 状态机，真实字节流）
   无第三方 FFI crate、纯符号解析部分已单测），但真实 TUN 会话需管理员权限、随附
   `wintun.dll` 与真实路由表改写，无法在离线确定性 E4 内闭环——须待平台评审通过后
   以 E5 真机观察验收（ARCHITECTURE 明确 Virtual Packet Interface != TUN）；
-- Clash 订阅 YAML 在线解析与自动更新；
+- Clash 订阅节点在线拉取与热生效（已移出本冻结清单，本批次交付，见 §11.17）；
 - LoadBalance / Relay 链式策略组（多跳）；
 - DNS hijack 透明拦截（仅在动作链模型中留口，不在本期实现；DNS 多 server 规则路由见 §11.5）。
 
@@ -785,12 +785,69 @@ SOCKS5 入站（Socks5Handshake，§11.4 不变）
   结构化 FAIL；服务循环继续 accept 下一会话（逐会话隔离，不中断 daemon）。
 - 回归保障：direct 路径与既有 `daemon_real_socks_proxy_flow` 行为零变化。
 - 冻结边界（本期不做）：UDP 隧道 / QUIC / 多路复用 / 节点自动切换（selector /
-  urltest 已由 §11.1 提供）/ 订阅在线更新（§11.2 维持）。
+  urltest 已由 §11.1 提供）/ 订阅在线更新（已交付，见 §11.17，本边界不再冻结此项）。
 - E4 场景：`scenarios/product/proxy_outbound_shadowsocks_flow.toml`——loopback：
   echo 目标 + 本地 SS server + nexus proxy（配置 outbound=ss-node → 本地 SS server）+
   原始 SOCKS5 客户端经 proxy 访问 echo；断言 SS server 收到加密连接、
   request header 目标送达、payload 经加密隧道往返、`routing.outbound_kind=shadowsocks`。
 
+### 11.17 订阅节点在线更新（subscription online update，requirement-change，2026-09-24）
+
+§11.2 曾把「Clash 订阅在线解析与自动更新」列为 P0 冻结不做项；本节作为
+**requirement-change** 正式交付：nexusd 按可配置间隔从 HTTP(S) 订阅源在线拉取
+base64 订阅文本，复用 §11.8 的离线解析（`parse_clash_subscription`）把节点 URI
+解析为 `OutboundConfig`，热生效地替换运行时节点列表，无需重启进程。
+
+数据面链路：
+
+```text
+SubscriptionSourceConfig（url / interval_secs / user_agent / headers / tls 选项）
+  -> 后台拉取器（Owner：CancellationToken + JoinSet + Reaper；禁止丢弃 JoinHandle）
+  -> http:// 明文 / https:// rustls GET（复用 §11.12 / §11.14 CachedHttpProviderFetcher 传输层）
+  -> parse_clash_subscription（§11.8 纯函数：base64 解码 + ss/vmess 节点映射 + 未知协议显式拒绝）
+  -> 合并：本地手写 outbounds 恒定保留；订阅节点集每次成功拉取整体替换上一次订阅节点集；
+           同一订阅内按 tag 去重（后出现者覆盖）
+  -> HotReloadManager.propose_reload(revision, valid=true)（§12.15 热生效门控，不重启进程）
+  -> 结构化可观察事件
+```
+
+- **订阅源配置**（`subscriptions:` 段，可选；缺失则无在线订阅，行为与本批前一致）：
+  `{ tag, url, interval_secs, user_agent?, headers?: [[k,v]...], tls_skip_cert_verify? }`。
+  `url` 协议白名单 `http:// | https://`；`interval_secs >= 1`；非法（空 url / 协议非法 /
+  interval=0）返回 `CONFIG_INVALID`。`user_agent` 缺省为 `Nexus-Subscription/1`；
+  `headers` 为附加请求头；`tls_skip_cert_verify=true` 时 https 客户端不校验服务端证书
+  （自签/私有场景，默认 false 走 Mozilla 根，与 §11.14 一致）。
+- **合并语义**：本地手写 `outbounds`（direct / reject 等）**恒定保留、永不被订阅清空**；
+  订阅产出的节点集是一个独立可替换集合——每次**成功**拉取整体替换上一次订阅节点集
+  （非累积、非追加合并）；同一订阅内 tag 重复时后出现者覆盖先出现者。
+  运行时有效节点列表 = 本地手写 outbounds ++ 当前成功订阅节点集。
+- **失败回退**：拉取失败（网络错误 / TLS 错误 / 非 200 / base64 非法 / 解析后 0 节点）
+  时**保留上一次成功的订阅节点集**，运行时节点列表不变，**不得清空当前节点**；
+  本批次回退为进程内保留上一次成功的订阅节点集；跨重启的落盘缓存兜底（§11.12 缓存语义）
+  属后续 crash-consistency 工作，不在本期冻结 expectation 内。首次启动即失败且无任何
+  历史订阅节点时，运行时节点列表 = 本地手写 outbounds（空订阅集），不致命。
+- **热生效**：一次拉取成功并合并后，经 `HotReloadManager.propose_reload(new_revision,
+  valid=true)`（§12.15）把新节点集原子生效，**不重启进程**；拉取失败不推进 revision，
+  已生效节点列表保持不变。
+- **结构化并发**：后台拉取任务有唯一 Owner（`CancellationToken` 请求协作式停止、
+  `JoinSet` 收集 worker、`Reaper` 在 Owner drop 时确认回收 worker）；禁止 `tokio::spawn` /
+  等价物后丢弃 JoinHandle。worker 只发事件、不直接写 TerminalOutcome。
+- **可观察事件**（结构化，带关联字段 `subscription_tag` / `subscription_url`）：
+  `{ attempt: u64, ok: bool, node_count_before: usize, node_count_after: usize,
+  rejected: u32, latency_ms: u64, error?: string }`；Hot Path 不对每包打日志，
+  事件按拉取周期（分钟级）产出。
+- **错误面**：配置非法 `CONFIG_INVALID`；单次拉取失败是事件级（`ok=false`）而非进程级
+  致命错误，服务循环继续 accept 下一会话；以类型化 `Result` 表达，不以 panic 表示可恢复失败。
+- **零回归**：§11.8 `proxy-clash-subscription-parse`、§11.12/§11.14 rule-provider 拉取、
+  §12.15 `config_hot_reload` 既有冻结场景行为不变。
+- **冻结边界（本期不做）**：订阅 YAML 规则集（仅 base64 URI 列表，§11.8 范围）、
+  订阅节点测速自动选路（urltest 已由 §11.1 提供）、多订阅源按 tag 合并冲突策略、
+  订阅节点与 selector/urltest 组的自动挂接（仅静态注入 outbounds）、
+  https 订阅源拉取接线（E4 以 loopback http 闭环；https 复用 §11.14 rustls 栈为后续接线）。
+- E4 场景：`scenarios/product/proxy_subscription_online_update.toml`——本地 loopback
+  HTTP 订阅源（可变内容 + 可制造失败）：首次拉取 2 节点 -> 热生效节点数 +2；
+  拉取失败 -> 节点数保持不变（回退）；再次拉取 3 节点（含 1 未知协议行）-> 节点数 +3、
+  rejected=1；断言 `HotReloadManager` revision 在成功时推进、失败时不推进。
 ### 11.3 失败语义
 
 ```text
