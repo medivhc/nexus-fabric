@@ -1204,6 +1204,10 @@ socket 集成留 P3 产品化）；打洞由外部 HolePuncher 驱动后经隧�
 - 冻结边界（P2.2 不做）：tunnel 内真实 UDP 打洞（HolePuncher 挂接留 P3）、
   打洞重试策略、多候选并发打洞、NAT 类型驱动的路径选择。
 
+#### 12.9.1 E4 场景真实性修正（requirement-change nat01，2026-09-24）
+
+审计发现 product.nat-hole-punching 的 E4 驱动此前硬编码公网映射（203.0.113.42:54321）、NAT 类型（RestrictedCone）与打洞成功（rtt=1ms），与真实打洞之名不符。现修正为诚实边界：E4 冻结期望改为确定性离线编解码自检（RFC5389 Binding Request 构造 + XOR-MAPPED-ADDRESS 解析，nat::codec_self_test），不再冻结伪造的 nat.type==RestrictedCone / hole_punch.success==true；驱动可选地对真实 STUN 服务器（默认 stun.l.google.com:19302）发起 Binding Request，可达时 real_stun=true，否则诚实 real_stun=false（公网映射值环境相关，不入冻结期望）。真实两 peer 跨公网 UDP 打洞与 TUN<->UDP pump Owner 循环仍冻结在 P3；本批以 E5 外部观察（真实 STUN 公网映射、 Windows<->mylinux UdpCarrier 跨主机 RTT）落入 .evidence/nat-real-nat01/。
+
 ### 12.10 P2.3+P2.4 广域协调核心 + 自动 IP 分配（2026-09-21）{#12-coord}
 
 静态 locator 无法扩展（IP 漂移、NAT 后不可预知）。本节交付**协调控制平面核心**与
