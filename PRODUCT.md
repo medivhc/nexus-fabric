@@ -318,11 +318,11 @@ SOCKS5 入站（Socks5Handshake 状态机，真实字节流）
 以下为 P1+ 展望，本期契约不承诺、不冻结为 expectation：
 
 - 真实加密代理协议栈（Vmess / Trojan / Hysteria2；Shadowsocks AEAD 见 §11.6）；
-- TUN 透明代理 / Virtual Packet Interface 全局拦截：维持后置。窄 wintun C ABI 绑定
-  已在 `nexus-platform-windows/src/wintun.rs` 落地（手写 `LoadLibraryW` 动态加载、
-  无第三方 FFI crate、纯符号解析部分已单测），但真实 TUN 会话需管理员权限、随附
-  `wintun.dll` 与真实路由表改写，无法在离线确定性 E4 内闭环——须待平台评审通过后
-  以 E5 真机观察验收（ARCHITECTURE 明确 Virtual Packet Interface != TUN）；
+- TUN 透明代理 / Virtual Packet Interface 全局拦截：已转 §11.18 落地（portable
+  IP 包解析 + 规则路由 + NAT 决策 E4 离线闭环；真实 wintun adapter 开卡与收发为 E5）。
+  窄 wintun C ABI 绑定（手写 LoadLibraryW、无第三方 FFI、纯符号解析单测）与
+  WintunVpiAdapter 复用 §12.29；真实双向字节中继回写、路由表改写、IPv6、DNS 劫持
+  仍为 §11.18 冻结边界（下批）；
 - Clash 订阅节点在线拉取与热生效（已移出本冻结清单，本批次交付，见 §11.17）；
 - LoadBalance / Relay 链式策略组（多跳）；
 - DNS hijack 透明拦截（仅在动作链模型中留口，不在本期实现；DNS 多 server 规则路由见 §11.5）。
@@ -848,6 +848,65 @@ SubscriptionSourceConfig（url / interval_secs / user_agent / headers / tls 选�
   HTTP 订阅源（可变内容 + 可制造失败）：首次拉取 2 节点 -> 热生效节点数 +2；
   拉取失败 -> 节点数保持不变（回退）；再次拉取 3 节点（含 1 未知协议行）-> 节点数 +3、
   rejected=1；断言 `HotReloadManager` revision 在成功时推进、失败时不推进。
+### 11.18 TUN 透明代理入站（TUN transparent proxy inbound，2026-09-24）
+
+把 §11 代理内核的入站从「仅 SOCKS5 显式代理」扩展为「可被 TUN 虚拟网卡透明接管全局
+流量」，对齐 Clash TUN 模式语义。与 §12.29（虚拟子网 mesh 隧道线的 PacketTunnel）是
+**两条独立数据面**：§12.29 把 VPI 包封装后发给对端节点组网；本节把 VPI 包解出来按
+§11 规则表路由到出站（代理上网）。二者复用同一个 `nexus-platform::VirtualPacketInterface`
+trait 与 `nexus-platform-windows::WintunVpiAdapter`，但上层编排互不调用。
+
+数据面链路（portable core 部分，离线可确定性闭环）：
+
+```text
+wintun 虚拟网卡（nexus-platform-windows::WintunVpiAdapter，§12.29 窄 C ABI 已落地）
+  -> VirtualPacketInterface::receive 读原始 IP 包
+  -> nexus-ingress::ip_packet 纯函数解析 IPv4 头 + TCP(6)/UDP(17) 传输头 -> TunPacket
+       { proto, src_ip:src_port, dst_ip:dst_port }
+  -> FlowContext(origin=VirtualPacketInterface, destination="dst_ip:dst_port")
+       （复用 ingress::from_virtual_packet_interface，中立零 I/O）
+  -> nexus-proxy::ProxyService::route（§11.1 纯决策，零改动）
+  -> nexus-proxy::TunNatRouter 按 5 元组缓存分流决策
+       （首包决策并建映射；同流后续包命中缓存，不再重跑规则表）
+  -> selected_outbound_tag（可观察；出站 adapter 承接见 §11.4/§11.16）
+```
+
+- **平台边界（ARCHITECTURE §10/§11）**：wintun 是 Windows 平台能力，只存在于
+  `nexus-platform-windows`；portable core（`nexus-ingress` / `nexus-proxy`）只消费注入的
+  `nexus-platform::VirtualPacketInterface` trait，不直接调 wintun API。`nexus-ingress` 的
+  IP 包解析是纯字节解码（零 I/O、`#![forbid(unsafe_code)]`），不触碰任何平台句柄。
+- **解析语义**：仅处理 IPv4 且传输协议为 TCP(6) 或 UDP(17) 的包。版本非 4、IHL 非法、
+  长度截断、协议为 ICMP(1)/其他、IPv6 的包一律解析为 `None` 并计入 `dropped` 计数
+  （结构化丢弃，不 panic、不写 per-packet 日志）。端口从传输头前 4 字节提取。
+- **NAT/连接跟踪**：`TunNatRouter` 以 `(proto, src_ip, src_port, dst_ip, dst_port)` 为键
+  缓存 `RoutingDecision`。首包 miss → 走 `ProxyService::route` 并建映射；后续同键包
+  hit → 直接复用缓存决策（可观察 `cache_hit=true`，`mappings` 计数不增）。这是 TUN
+  per-packet 数据面相对 SOCKS5 per-stream 的独立变化维度，故独立成模块（Deletion Test：
+  删除它则每个 IP 包都重跑线性规则表，破坏「同流一次决策」的独立约束）。
+- **可观察性**（counter/histogram，禁止 per-packet 日志）：`packets_in` / `bytes_in` /
+  `dropped`（无法解析或非 TCP/UDP）/ `mappings`（活跃 5 元组映射数）/ `cache_hits`。
+  每条新流首次决策输出 `matched_rule` / `selected_outbound_tag` / `flow_origin`
+  （flow_origin=`virtual-packet-interface`）。
+- **失败语义**：wintun adapter 创建失败（缺 `wintun.dll` / 无管理员权限 / 驱动未安装）
+  → 结构化 `{ verdict:"TUN_ERROR", error:"..." }`（exit 0，不静默回退为 SOCKS5 监听）。
+  包解析失败计入 `dropped`，不中断读循环。
+- **CLI**：`nexusd proxy --tun [--tun-name <n>] [--config <path>]` 在既有 SOCKS5 监听之外
+  追加 TUN 入站；无 `--tun` 时既有 `nexusd proxy --addr` 行为零变化。`--tun` 装配走真实
+  `WintunVpiAdapter::create`（E5，需管理员 + 随附 `wintun.dll` 于 nexusd.exe 同目录）。
+- **E4 场景**：`scenarios/product/proxy_tun_inbound.toml`——组合根注入 `MemoryVpi`
+  （离线确定性替身）：注入一条 IPv4/TCP SYN（dst=10.1.2.3:443，命中 ip_cidr 规则）+
+  一条 IPv4/UDP（dst=8.8.8.8:53，落入 MATCH）+ 同 TCP 5 元组第二个包（应 cache_hit）+
+  一个截断/ICMP 坏包（计入 dropped）。断言解析、FlowContext origin、命中规则、选定出站、
+  NAT 映射数与 cache_hit、计数器。不依赖真实驱动。
+- **E5 真机观察**：`cargo run -p nexus --example tun_proxy -- --real [--tun-name <n>]`
+  （管理员）→ 真实 `WintunVpiAdapter::create` 成功，输出 `backend`/`mtu`/`driver_version`/
+  `capabilities` 与一次非阻塞 `receive`（0 = 无包）。创建失败 → `verdict=TUN_ERROR`。
+- **冻结边界（本期不做，下批）**：真实双向 TCP/UDP 字节中继回写 TUN（userspace TCP/IP
+  栈 / tun2socks 式连接跟踪与报文改写）、路由表增删（route include/exclude）、IPv6 解析、
+  DNS 劫持接入 §11.5 DNS 模块、MTU/MSS 钳制。本期 E4 冻结的是「解析 → 分类 → 规则路由
+  → NAT 决策」portable 闭环；真实报文拨号与回写为下批。
+
+
 ### 11.3 失败语义
 
 ```text

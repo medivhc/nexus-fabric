@@ -481,6 +481,7 @@ version = "0.1.0"
 dependencies = [
  "nexus-connectivity",
  "nexus-domain",
+ "nexus-ingress",
  "nexus-measurement",
  "nexus-proxy-config",
 ]

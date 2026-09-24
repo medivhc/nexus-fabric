@@ -15,6 +15,9 @@
 
 use nexus_domain::{FlowContext, FlowOrigin, ResourceId};
 
+/// §11.17 TUN 透明入站：原始 IPv4 包纯函数解码（零 I/O）。
+pub mod ip_packet;
+
 /// 稳定模块标识；业务实现应通过公开类型/trait 增量加入，而不是扩大隐式全局状态。
 pub const NEXUS_INGRESS_MODULE: &str = "nexus-ingress";
 

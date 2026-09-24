@@ -11,7 +11,8 @@
 - 不实现 SOCKS5 协议状态机（复用 `nexus-ingress`）；
 - 不解析 YAML（复用 `nexus-proxy-config`）；
 - 不实现真实加密代理协议栈（Shadowsocks/Vmess/Trojan，P1+）；
-- 不实现 TUN 透明代理（P1+）；
+- 不直接创建/打开 wintun 等平台透明拦截设备（那属于 `nexus-platform-*`；本模块只消费
+  `nexus-ingress` 解出的 `TunPacket` 与中立 `FlowContext`，§11.17）；
 - 不实现 Clash 订阅解析（P1+）；
 - 不创建第二套系统级 Core Planner（规则引擎是领域局部组件，不是 Planner）。
 
@@ -122,6 +123,13 @@
   - relay 组由 `GroupKind::Relay` 配置承载，跳序列表经 `RoutingDecision.relay_hops` 暴露。
   - `ProxyService`：编排 service，持有 RuleEngine + Group 注册表 + Outbound 注册表，
     对每个入站 FlowContext 执行 route -> group resolve -> outbound activate。
+  - `TunNatRouter`（§11.17，portable 纯决策 + 进程内 5 元组缓存，零网络 I/O）：
+    `TunNatRouter::new(ProxyService)` 构造；`route_packet(&mut self, &TunPacket) ->
+    Result<TunRouteOutcome, ProxyError>`——首包 miss 走 `ProxyService::route` 建映射，
+    同 `(proto, src_ip, src_port, dst_ip, dst_port)` 后续包 hit 复用缓存决策（`cache_hit`）；
+    `stats() -> TunStats { packets, bytes, dropped, mappings, cache_hits }`。
+    它是 TUN per-packet 数据面相对 SOCKS5 per-stream 的独立决策频率维度，不产生第二套
+    系统级 Plan。
 
 ## Verification
 

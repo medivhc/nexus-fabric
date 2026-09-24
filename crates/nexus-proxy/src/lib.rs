@@ -28,6 +28,7 @@
 
 pub mod geoip_nex;
 pub mod geosite_nex;
+pub mod tun;
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
