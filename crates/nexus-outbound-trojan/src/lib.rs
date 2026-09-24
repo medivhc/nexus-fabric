@@ -2,7 +2,8 @@
 //!
 //! Trojan 出站 adapter（PRODUCT §11.9）：实现
 //! `nexus-connectivity::OutboundAdapter`，在 TCP 字节流上叠加 TLS（rustls 0.23 + ring）
-//! 与 trojan 请求头 `hex(SHA-224(password)) | CRLF | ATYP+ADDR+PORT | CRLF`。
+//! 与 trojan 请求头 `hex(SHA-224(password)) | CRLF | CMD(0x01 CONNECT) | ATYP+ADDR+PORT | CRLF`
+//! （trojan-gfw 官方线上格式，PRODUCT §11.9.2）。
 //!
 //! 离线确定性 E4：rcgen 动态自签证书，客户端把该唯一证书作为唯一信任根（公钥 pin），
 //! loopback 127.0.0.1 同一进程内 TLS server+client；不连公网。
@@ -99,12 +100,16 @@ pub fn auth_hash(password: &str) -> String {
 }
 
 /// 请求头地址行格式选择（PRODUCT §11.9.2）。
+///
+/// 2026-09-25 requirement-change：两变体**字节完全等价**——均按 trojan-gfw 官方线上布局输出
+/// `hex | CRLF | CMD(0x01 CONNECT) | ATYP+ADDR+PORT | CRLF`。`Singbox` 仅为既有配置字符串的
+/// 兼容别名保留。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrojanHeaderFormat {
-    /// trojan-gfw 规范：`ATYP+ADDR+PORT`，无命令字节（**默认**）。
+    /// trojan-gfw 官方线上格式：含 `CMD(0x01 CONNECT)` 命令字节（**默认**）。
     #[default]
     Standard,
-    /// sing-box 系变体：ATYP 前带 `0x01` CONNECT 命令字节。
+    /// 与 Standard 字节等价的兼容别名（同样含 `0x01` CMD）。
     Singbox,
 }
 
@@ -116,19 +121,21 @@ pub fn encode_request(password: &str, target: &TrojanTarget) -> Vec<u8> {
 
 /// 按指定格式编码 trojan 请求头。
 ///
-/// Singbox 格式在地址行 ATYP 前插入 `0x01`（CONNECT）命令字节。
+/// Standard 与 Singbox 字节等价（PRODUCT §11.9.2）：均输出官方线上布局
+/// `hex(SHA-224(pwd)) | CRLF | CMD(0x01 CONNECT) | ATYP+ADDR+PORT | CRLF`。
+/// `fmt` 仅为配置兼容保留，不改变字节输出。
 #[must_use]
 pub fn encode_request_fmt(
     password: &str,
     target: &TrojanTarget,
     fmt: TrojanHeaderFormat,
 ) -> Vec<u8> {
+    // 两变体字节等价（§11.9.2）：均输出 CMD(0x01 CONNECT)。
+    let _ = fmt;
     let mut out = Vec::new();
     out.extend_from_slice(auth_hash(password).as_bytes());
     out.extend_from_slice(b"\r\n");
-    if matches!(fmt, TrojanHeaderFormat::Singbox) {
-        out.push(0x01); // CMD = CONNECT
-    }
+    out.push(0x01); // CMD = CONNECT
     match target {
         TrojanTarget::Ipv4(oct, port) => {
             out.push(0x01);
@@ -157,9 +164,12 @@ pub fn parse_request(password: &str, buf: &[u8]) -> Result<TrojanTarget, TrojanE
 
 /// 按指定格式解码并校验 trojan 请求头。
 ///
+/// Standard 与 Singbox 字节等价（PRODUCT §11.9.2）：先 strip 地址行前导 `0x01`
+/// CONNECT 命令字节，再读 ATYP+ADDR+PORT。`fmt` 仅为配置兼容保留。
+///
 /// # Errors
 ///
-/// hash 不匹配返回 `AuthDenied`；头部长度/格式非法（含命令字节位置不符）返回
+/// hash 不匹配返回 `AuthDenied`；头部长度/格式非法（含命令字节缺失/位置不符）返回
 /// `InvalidHeader`。
 pub fn parse_request_fmt(
     password: &str,
@@ -180,16 +190,15 @@ pub fn parse_request_fmt(
         return Err(TrojanError::AuthDenied);
     }
 
-    // 地址行应为 [CMD] ATYP+ADDR+PORT，且以 CRLF 结尾。
+    // 地址行应为 CMD(0x01 CONNECT) ATYP+ADDR+PORT，且以 CRLF 结尾。
+    // Standard/Singbox 等价（§11.9.2）：统一 strip 前导 0x01 CMD 字节后再读 ATYP。
+    let _ = fmt;
     let addr = rest
         .strip_suffix(b"\r\n")
         .ok_or(TrojanError::InvalidHeader)?;
-    let addr = match fmt {
-        TrojanHeaderFormat::Standard => addr,
-        TrojanHeaderFormat::Singbox => addr
-            .strip_prefix(&[0x01])
-            .ok_or(TrojanError::InvalidHeader)?,
-    };
+    let addr = addr
+        .strip_prefix(&[0x01])
+        .ok_or(TrojanError::InvalidHeader)?;
     if addr.len() < 2 {
         return Err(TrojanError::InvalidHeader);
     }

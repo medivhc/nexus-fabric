@@ -510,26 +510,43 @@ rustls 0.23 内置 dangerous API 与 ALPN，不引入新 crate）：
   为真实节点测试脚手架，CLI/环境变量参数化 `--server/--password/--sni/--target/--alpn/--skip-verify`，
   默认占位、不硬编码任何真实密码。
 
-#### 11.9.2 请求头格式兼容模式（Standard / Singbox，2026-09-18） {#11-trojan-header-format}
+#### 11.9.2 请求头格式（Standard = trojan-gfw 官方线上格式，含 CMD 字节；2026-09-25 修订） {#11-trojan-header-format}
 
-不同服务器实现对 trojan 请求头「地址行」前是否带命令字节存在差异：
+> 2026-09-25 requirement-change 修订：真机 E5（2026-09-24，真实机场节点
+> hk-1.tr202613.com:465，skip_cert_verify，alpn=[h2,http/1.1]）实证——此前把「Standard」
+> 误读为「无命令字节」的规范原文，实际上 trojan-gfw / sing-box / xray 线上服务端统一要求
+> **地址行前必须带 `CMD(0x01 CONNECT)` 命令字节**。旧 Standard 缺 CMD 字节时所有 HTTP 出站
+> 被目标 nginx 返 400、HTTPS 000；补上 CMD 字节后 google/gstatic generate_204 立即 204。
+> 旧 E4 是「自洽闭环」（本地 server 用同逻辑 parse），从未与真实服务端互操作，故掩盖了该缺陷。
 
-- **Standard（trojan-gfw 规范，默认）**：`hex(SHA-224(pwd)) | CRLF | ATYP+ADDR+PORT | CRLF`，
-  无命令字节。这是 trojan 规范原文，也是本 crate 既有行为，**默认值保持 Standard，不翻转**。
-- **Singbox（sing-box 系服务器变体）**：`hex(SHA-224(pwd)) | CRLF | CMD(0x01 CONNECT) | ATYP+ADDR+PORT | CRLF`，
-  ATYP 前多一个 `0x01` 命令字节。实测某 sing-box 系机场要求该格式，否则被 fallback 到伪装 nginx
-  返回 HTTP 400；带 `0x01` 命令字节才得正常中继。
+标准 trojan 请求头字节布局（**Standard，默认**，与 trojan-gfw 官方线上规范一致）：
 
+```text
+hex(SHA-224(password)) | CRLF | CMD(0x01 CONNECT) | ATYP | ADDR | PORT(BE) | CRLF
+```
+
+- **Standard（默认）**：含 `CMD(0x01 CONNECT)` 命令字节。这是 trojan-gfw 规范原文，也是
+  trojan-gfw / sing-box / xray 服务端实际要求的线上格式。默认值保持 Standard，不翻转。
+- **Singbox**：与 Standard **字节完全等价**（同样含 `0x01` CMD 字节），作为既有配置字符串的
+  兼容别名保留——历史配置里写过 `header_format: singbox` 的节点无需改动；两者编码/解析输出
+  逐字节相同。
+
+- **字节级不变量**：`encode_request_fmt(pwd, target, Standard)` 在 `hex(56B) + CRLF(2B)`
+  之后（0-based offset 58）必须紧接 `0x01`（CMD=CONNECT），其后才是 ATYP；即 IPv4 目标时
+  offset 58=`0x01`(CMD)、offset 59=`0x01`(ATYP=IPv4)。`encode(Standard) == encode(Singbox)`
+  对同一目标恒成立。
 - **选择机制**：`TrojanHeaderFormat::{Standard, Singbox}`，客户端编码与本地 server 解析成对使用；
-  真实节点由配置 / E5 脚手架 `--format` 开关选择。默认 Standard 的理由：trojan-gfw 规范是事实标准，
-  翻转默认会要求把既有 3 条冻结 E4 改写为 Singbox（构成 requirement-change），故保持默认并显式切换。
-- **失败语义**：格式不匹配时 server 解析出 `INVALID_HEADER`（不会被误判为 `AUTH_DENIED`）；
-  密码仍按首行 hash 校验，错误面不变。
-- 既有 3 条 trojan E4（adapter / auth-rejected / real-tls-params）继续走 Standard，零回归。
-- E4 场景：`scenarios/product/proxy_trojan_header_format.toml`——同一 example 内两条断言：
-  (a) Singbox：本地 server 期待命令字节，客户端切 Singbox → 握手+认证+往返 PASS；
-  (b) Standard 回归：本地 server 用标准解析器，客户端切 Standard → 往返 PASS。
-- E5：`trojan_real_server.rs` 增加 `--format standard|singbox`（默认 standard），供真实节点复测。
+  真实节点由配置 / E5 脚手架 `--format` 开关选择。两变体字节等价，选择不改变线上行为，仅为
+  配置兼容。
+- **失败语义**：server 按「先 strip 前导 `0x01` CMD 再读 ATYP」解析；命令字节缺失/非法或地址行
+  长度不符 → `INVALID_HEADER`（不会被误判为 `AUTH_DENIED`）；密码仍按首行 hash 校验，错误面不变。
+- 既有 3 条 trojan E4（adapter / auth-rejected / real-tls-params）继续走 Standard——现在 Standard
+  自带 CMD 字节，本地 `parse_request` 同步 strip 它，端到端自洽，零回归。
+- E4 场景：`scenarios/product/proxy_trojan_header_format.toml`——同一 example 内：
+  (a) 往返：本地 server 与 client 同格式 → 握手+认证+往返 PASS；
+  (b) **字节级互操作断言**：`encode(Standard)` 在 hex+CRLF 后紧接 `0x01` CMD 字节，且
+  `encode(Standard)` 与 `encode(Singbox)` 逐字节相同（锁定官方线上字节布局，防止再退化为无 CMD）。
+- E5：`trojan_real_server.rs` 保留 `--format standard|singbox`（默认 standard），供真实节点复测。
 
 #### 11.9.3 Trojan 节点配置项（配置层，2026-09-18） {#11-trojan-node-config}
 
@@ -539,7 +556,7 @@ rustls 0.23 内置 dangerous API 与 ALPN，不引入新 crate）：
 - `password: Option<String>`（trojan 必填，复用既有字段）；
 - `alpn: Option<Vec<String>>`（ALPN 协议列表，如 `[h2, http/1.1]`，可空）；
 - `skip_cert_verify: Option<bool>`（是否跳过服务端证书链校验，默认 false）；
-- `header_format: Option<String>`（`"standard"` | `"singbox"`，缺省即 `"standard"`，§11.9.2）。
+- `header_format: Option<String>`（`"standard"` | `"singbox"`，缺省即 `"standard"`，§11.9.2；两值字节等价，仅为配置兼容别名）。
 
 校验（`kind: trojan` 时）：
 - `password` 必填且非空、`locator` 必填（`host:port`）；缺失 → `CONFIG_INVALID`；
