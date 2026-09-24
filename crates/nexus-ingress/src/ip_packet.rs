@@ -1,4 +1,4 @@
-//! §11.17 TUN 透明入站：原始 IPv4 包的纯函数解码。
+//! §11.18 TUN 透明入站：原始 IPv4 包的纯函数解码。
 //!
 //! 本模块零 I/O、零 unsafe（继承 `#![forbid(unsafe_code)]`），只做字节校验与字段提取，
 //! 不持有计数、不打日志。它把 wintun/VPI 读到的 IP 帧解析为中立 `TunPacket`，
@@ -12,7 +12,7 @@ pub const PROTO_UDP: u8 = 17;
 /// 最小 IPv4 头长度（无选项）。
 const MIN_IPV4_HEADER: usize = 20;
 
-/// 解析后的 IPv4 传输五元组（§11.17）。
+/// 解析后的 IPv4 传输五元组（§11.18）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TunPacket {
     /// IP 层协议号（仅 TCP=6 / UDP=17）。

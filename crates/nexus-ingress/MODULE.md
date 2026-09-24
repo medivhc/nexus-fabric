@@ -3,7 +3,7 @@
 ## Responsibility
 
 提供 portable SOCKS5/HTTP 代理协议状态机、Packet/Stream 解码、Flow Classification 与 FlowContext 构造。
-其中 Packet 解码（§11.17 TUN 透明入站）：把 wintun/VPI 读到的原始 IPv4 包纯函数解析为
+其中 Packet 解码（§11.18 TUN 透明入站）：把 wintun/VPI 读到的原始 IPv4 包纯函数解析为
 `TunPacket`（proto + 四元组地址端口），供上层构造中立 `FlowContext`。
 
 ## Non-Responsibilities
@@ -53,7 +53,7 @@
 - 已实现（骨架）：
   - `classify` + `from_socks5` / `from_http` / `from_virtual_packet_interface` /
     `from_native_api`：按 `FlowOrigin` 构造中立 `FlowContext`（纯函数，零 I/O）。
-- 已实现（§11.17 TUN IP 包解码，纯函数零 I/O，portable）：
+- 已实现（§11.18 TUN IP 包解码，纯函数零 I/O，portable）：
   - `ip_packet::TunPacket { protocol: u8, src_ip: [u8;4], dst_ip: [u8;4],
     src_port: u16, dst_port: u16 }`：解析后的 IPv4 传输五元组；
   - `ip_packet::parse_ipv4_packet(&[u8]) -> Option<TunPacket>`：仅接受 IPv4 且传输层为

@@ -7267,7 +7267,7 @@ pub fn tun_dataplane_flow() -> Result<Value, NexusError> {
 }
 
 // ---------------------------------------------------------------------------
-// §11.17 TUN 透明代理入站（E4：MemoryVpi 离线闭环；E5：--real 走真实 wintun）
+// §11.18 TUN 透明代理入站（E4：MemoryVpi 离线闭环；E5：--real 走真实 wintun）
 // ---------------------------------------------------------------------------
 
 /// 构造一个合法 IPv4 包（IHL=5，20 字节头 + 4 字节传输端口）。
@@ -7311,7 +7311,7 @@ outbounds:
     locator: relay.internal:443
 ";
 
-/// E4 产品场景 `product.proxy-tun-inbound` 的进程内闭环（PRODUCT §11.17）。
+/// E4 产品场景 `product.proxy-tun-inbound` 的进程内闭环（PRODUCT §11.18）。
 ///
 /// 注入 `MemoryVpi`（离线确定性 VPI 替身）四条 IP 包：
 /// 1) TCP 192.168.1.5:12345 -> 10.1.2.3:443（命中 ip_cidr -> relay-group）；
@@ -7404,7 +7404,7 @@ pub fn tun_proxy_flow() -> Result<Value, NexusError> {
     }))
 }
 
-/// E5：真实 wintun adapter 开卡 + 能力/版本 + 一次非阻塞读帧（PRODUCT §11.17）。
+/// E5：真实 wintun adapter 开卡 + 能力/版本 + 一次非阻塞读帧（PRODUCT §11.18）。
 ///
 /// 成功返回结构化 JSON（adapter 句柄在函数返回时随 Drop 释放：EndSession ->
 /// CloseAdapter -> FreeLibrary）；失败返回 `TUN_ERROR` 结构化结果（由调用方按 exit 0 输出）。

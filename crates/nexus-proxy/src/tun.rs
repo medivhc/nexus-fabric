@@ -1,4 +1,4 @@
-//! §11.17 TUN 透明入站：per-packet NAT/决策缓存（portable，零网络 I/O）。
+//! §11.18 TUN 透明入站：per-packet NAT/决策缓存（portable，零网络 I/O）。
 //!
 //! wintun/VPI 每来一个 IP 包，不能像 SOCKS5 那样每连接决策一次——必须按 5 元组缓存
 //! 首包的 `RoutingDecision`，同流后续包直接命中。本模块是 TUN per-packet 数据面相对
@@ -32,7 +32,7 @@ pub struct TunRouteOutcome {
     pub cache_hit: bool,
 }
 
-/// TUN 入站计数器（§11.17 可观测性；counter，禁止 per-packet 日志）。
+/// TUN 入站计数器（§11.18 可观测性；counter，禁止 per-packet 日志）。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct TunStats {
     /// 收到并尝试处理的包总数。

@@ -1,4 +1,4 @@
-//! E4 产品场景 `product.proxy-tun-inbound` 的可执行驱动（Composition Root，PRODUCT §11.17）。
+//! E4 产品场景 `product.proxy-tun-inbound` 的可执行驱动（Composition Root，PRODUCT §11.18）。
 //!
 //! ```text
 //! cargo run --quiet -p nexus --example tun_proxy -- --json
