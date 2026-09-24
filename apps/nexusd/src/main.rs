@@ -35,6 +35,9 @@ fn main() -> ExitCode {
         Some("relay") => relay_resource(&args[1..]),
         Some("proxy") => proxy_resource(&args[1..]),
         Some("subnet") => dispatch_subnet(&args[1..]),
+        // PRODUCT §13：Windows 系统代理接管 + 常驻自启。
+        Some("system-proxy") => dispatch_system_proxy(&args[1..]),
+        Some("autostart") => dispatch_autostart(&args[1..]),
         // §9 可观察性子命令：首个 token 命中即路由（透传完整命令，含 verb）。
         Some(verb) if is_observability_verb(verb) => dispatch_observability(&args),
         _ => {
@@ -721,6 +724,200 @@ fn proxy_resource(args: &[String]) -> ExitCode {
             }
         }
     }
+}
+
+/// 把 `SystemProxyState` 转成 JSON（cfg(windows) 实现类型可见）。
+#[cfg(windows)]
+fn proxy_state_json(s: &nexus_platform::SystemProxyState) -> Value {
+    json!({"enabled": s.enabled, "server": s.server})
+}
+
+/// PRODUCT §13.1：Windows 系统代理查询/设置/清除/自清理闭环。
+///
+/// 所有输出为单个 JSON 对象（stdout）；错误也以 JSON 表达（exit 0 = 请求已处理）。
+/// `e2e` 在单次进程内 snapshot -> set 7898 -> 读回 -> **无条件恢复** -> 读回一致。
+#[cfg(windows)]
+fn dispatch_system_proxy(args: &[String]) -> ExitCode {
+    use nexus_platform::SystemProxyController;
+    use nexus_platform_windows::WinInetSystemProxy;
+
+    let ctrl = WinInetSystemProxy::new();
+    let sub = args.first().map(String::as_str).unwrap_or("");
+
+    match sub {
+        "status" => match ctrl.snapshot() {
+            Ok(s) => {
+                println!("{}", json!({"verdict":"PASS","proxy":proxy_state_json(&s)}));
+            }
+            Err(e) => println!(
+                "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"{e}\"}}}}"
+            ),
+        },
+        "set" => {
+            let flags = parse_flags(args);
+            let server = flags.get("--server").and_then(|v| v.as_deref());
+            match ctrl.apply(true, server) {
+                Ok(()) => match ctrl.snapshot() {
+                    Ok(s) => println!("{}", json!({"verdict":"PASS","proxy":proxy_state_json(&s)})),
+                    Err(e) => println!(
+                        "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"{e}\"}}}}"
+                    ),
+                },
+                Err(e) => println!(
+                    "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"{e}\"}}}}"
+                ),
+            }
+        }
+        "clear" => match ctrl.apply(false, None) {
+            Ok(()) => match ctrl.snapshot() {
+                Ok(s) => println!("{}", json!({"verdict":"PASS","proxy":proxy_state_json(&s)})),
+                Err(e) => println!(
+                    "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"{e}\"}}}}"
+                ),
+            },
+            Err(e) => println!(
+                "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"{e}\"}}}}"
+            ),
+        },
+        "e2e" => {
+            // 自清理闭环：先 snapshot 原值。任何后续失败都必须先恢复。
+            let before = match ctrl.snapshot() {
+                Ok(s) => s,
+                Err(e) => {
+                    println!(
+                        "{}",
+                        json!({"verdict":"FAIL","stage":"snapshot-before","error":e.to_string()})
+                    );
+                    return ExitCode::SUCCESS;
+                }
+            };
+            let before_json = proxy_state_json(&before);
+
+            let after_set = match ctrl
+                .apply(true, Some("127.0.0.1:7898"))
+                .and_then(|_| ctrl.snapshot())
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    // 设置失败也要尝试恢复（理论上 before 未变，但保持对称）。
+                    let _ = ctrl.apply(before.enabled, before.server.as_deref());
+                    println!(
+                        "{}",
+                        json!({"verdict":"FAIL","stage":"apply-set","error":e.to_string(),"before":before_json})
+                    );
+                    return ExitCode::SUCCESS;
+                }
+            };
+            let after_set_ok =
+                after_set.enabled && after_set.server.as_deref() == Some("127.0.0.1:7898");
+            let after_set_json = proxy_state_json(&after_set);
+
+            // 无条件恢复原值并广播。
+            let restore_res = ctrl.apply(before.enabled, before.server.as_deref());
+            let after_restore = ctrl.snapshot().unwrap_or_else(|_| before.clone());
+            let after_restore_json = proxy_state_json(&after_restore);
+            let restore_consistent = restore_res.is_ok() && after_restore == before;
+
+            let verdict = if after_set_ok && restore_consistent {
+                "PASS"
+            } else {
+                "FAIL"
+            };
+            println!(
+                "{}",
+                json!({
+                    "verdict": verdict,
+                    "proxy": {
+                        "before": before_json,
+                        "after_set": after_set_json,
+                        "after_restore": after_restore_json
+                    },
+                    "restore_consistent": restore_consistent
+                })
+            );
+        }
+        other => println!(
+            "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"UNKNOWN\",\"message\":\"unknown system-proxy subcommand {other}\"}}}}"
+        ),
+    }
+    ExitCode::SUCCESS
+}
+
+/// 非 Windows：显式 Unavailable，不静默降级（PRODUCT §8/§13）。
+#[cfg(not(windows))]
+fn dispatch_system_proxy(_args: &[String]) -> ExitCode {
+    println!(
+        "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"UNSUPPORTED\",\"message\":\"system-proxy only implemented on Windows\"}}}}"
+    );
+    ExitCode::SUCCESS
+}
+
+/// PRODUCT §13.2：当前用户 ONLOGON 计划任务自启 install/remove/status。
+#[cfg(windows)]
+fn dispatch_autostart(args: &[String]) -> ExitCode {
+    use nexus_platform::AutostartRegistrar;
+    use nexus_platform_windows::TaskSchedulerAutostart;
+
+    let reg = TaskSchedulerAutostart::new();
+    let sub = args.first().map(String::as_str).unwrap_or("");
+
+    match sub {
+        "install" => {
+            let exe = match std::env::current_exe() {
+                Ok(p) => p.to_string_lossy().to_string(),
+                Err(e) => {
+                    println!(
+                        "{}",
+                        json!({"verdict":"FAIL","error":{"code":"INTERNAL","message":e.to_string()}})
+                    );
+                    return ExitCode::SUCCESS;
+                }
+            };
+            match reg.install(&exe, &["serve", "--addr", "127.0.0.1:7898"]) {
+                Ok(task) => println!(
+                    "{}",
+                    json!({"verdict":"PASS","autostart":{"installed":true,"task":task}})
+                ),
+                Err(e) => println!(
+                    "{}",
+                    json!({"verdict":"FAIL","error":{"code":"INTERNAL","message":e.to_string()}})
+                ),
+            }
+        }
+        "remove" => match reg.remove() {
+            Ok(()) => println!(
+                "{}",
+                json!({"verdict":"PASS","autostart":{"installed":false}})
+            ),
+            Err(e) => println!(
+                "{}",
+                json!({"verdict":"FAIL","error":{"code":"INTERNAL","message":e.to_string()}})
+            ),
+        },
+        "status" => match reg.is_installed() {
+            Ok(installed) => println!(
+                "{}",
+                json!({"verdict":"PASS","autostart":{"installed":installed}})
+            ),
+            Err(e) => println!(
+                "{}",
+                json!({"verdict":"FAIL","error":{"code":"INTERNAL","message":e.to_string()}})
+            ),
+        },
+        other => println!(
+            "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"UNKNOWN\",\"message\":\"unknown autostart subcommand {other}\"}}}}"
+        ),
+    }
+    ExitCode::SUCCESS
+}
+
+/// 非 Windows：显式 Unavailable。
+#[cfg(not(windows))]
+fn dispatch_autostart(_args: &[String]) -> ExitCode {
+    println!(
+        "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"UNSUPPORTED\",\"message\":\"autostart only implemented on Windows\"}}}}"
+    );
+    ExitCode::SUCCESS
 }
 
 /// 在 SDK 输出的 JSON 对象上附加 daemon 入口元数据（场景断言 daemon.entry / daemon.resource）。

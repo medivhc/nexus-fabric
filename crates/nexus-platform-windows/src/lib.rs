@@ -9,9 +9,11 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![forbid(missing_docs)]
 
+pub mod autostart;
 pub mod dpapi;
 pub mod secure_store;
 pub mod vpi;
+pub mod wininet_proxy;
 pub mod wintun;
 
 /// 稳定模块标识；业务实现应通过公开类型/trait 增量加入，而不是扩大隐式全局状态。
@@ -23,5 +25,7 @@ pub const fn module_summary() -> &'static str {
     "实现 Windows 平台 Capability Adapter（wintun VirtualPacketInterface）。"
 }
 
+pub use autostart::TaskSchedulerAutostart;
 pub use secure_store::DpapiSecureStore;
 pub use vpi::WintunVpiAdapter;
+pub use wininet_proxy::WinInetSystemProxy;
