@@ -923,6 +923,60 @@ wintun 虚拟网卡（nexus-platform-windows::WintunVpiAdapter，§12.29 窄 C A
   DNS 劫持接入 §11.5 DNS 模块、MTU/MSS 钳制。本期 E4 冻结的是「解析 → 分类 → 规则路由
   → NAT 决策」portable 闭环；真实报文拨号与回写为下批。
 
+### 11.19 HTTP/混合代理入站（HTTP & mixed proxy inbound，2026-09-25）
+
+§11.4 的 SOCKS5 入站是唯一显式代理入口，导致系统代理接管（§13 WinINET）后，浏览器 /
+PowerShell 等走 HTTP 代理协议（`http://127.0.0.1:7897`）的客户端被立即拒绝（连接被重置）。
+Clash Verge 的 7897 是**混合端口**（同一 TCP 端口同时接受 SOCKS5 与 HTTP 代理）。本节把入站
+扩展为「混合」语义，使 WinINET 应用流量经 `nexusd system-proxy set` 后真实可用。
+
+数据面链路（与 §11.4 同一出站与中继底座，仅握手段新增 HTTP 分支）：
+
+```text
+TCP accept（apps/nexus，非 portable I/O）
+  -> 首字节判定：0x05 -> 既有 Socks5Handshake（§11.4，零回归）
+                否则 -> nexus-ingress::HttpProxyHandshake（纯函数，零 I/O）
+  -> FlowContext（origin=FlowOrigin::Http，复用 ingress::from_http，中立）
+  -> 规则路由（§11.1 纯决策，零改动）-> Session 双轨 -> 真实出站 -> 双向字节中继
+```
+
+- **混合端口判定**：accept 后读首帧，首字节 `0x05` 走 SOCKS5 状态机；否则走 HTTP 代理
+  状态机。两种协议在同一监听端口按首字节分流，互不干扰；同一会话只走其中一条分支。
+- **配置**：`inbounds[].kind` 新增 `"mixed"`（同一端口 SOCKS5+HTTP 共存）；保留
+  `"socks5"` 既有语义（仅 SOCKS5）。未知 kind 仍被配置层拒绝。`nexusd proxy --addr`
+  默认监听行为与既有示例闭环保持兼容（组合根按首字节自动混合，无需新 CLI 标志）。
+- **HttpProxyHandshake 语义（portable core，`#![forbid(unsafe_code)]`，零 I/O、零平台 API）**：
+  增量 `feed()`，与 `Socks5Handshake` 同构（返回结构化 Step{state, response, flow,
+  needs_more, upstream_prefix}）。必须读到请求头结束（`\r\n\r\n`）才进入 `Established`，
+  未读完 `needs_more=true`。
+  - `CONNECT host:port HTTP/1.1\r\n...\r\n\r\n`：destination=`host:port`，回写
+    `HTTP/1.1 200 Connection Established\r\n\r\n`，随后裸中继（隧道语义）。
+  - 绝对形式转发 `GET|HEAD|POST ... http://host[:port]/path?query HTTP/1.1\r\n...\r\n\r\n`：
+    解析出 destination（缺省端口 80），把请求行改写为 origin-form
+    `METHOD /path?query HTTP/1.1` 并随已收到的请求头一并作为 `upstream_prefix` 先写上
+    游，再双向中继；握手阶段不回写响应（响应由上游 origin 透传回客户端）。
+  - 非 CONNECT 但 target 为 origin-form（`GET /path`，无 scheme）、未知方法、坏请求行
+    → 结构化 `HttpProxyError`，回写 `HTTP/1.1 400 Bad Request\r\n\r\n`。
+  - 只解析请求行与必要边界，不做完整 HTTP 语义（不解析 body、不做 chunked 重组）。
+- **平台边界（ARCHITECTURE §10/§11）**：HTTP 代理协议状态机（请求行/绝对 URL 解析、
+  CONNECT 200 响应、origin-form 改写）在 `nexus-ingress`（portable 纯函数）；真实
+  `TcpListener` accept / 读写 / 中继在 `apps/nexus`（非 portable）。`nexus-ingress` 不直接
+  调 Core Planner / 平台 API / `std::net`。
+- **可观察性**：每会话输出 `inbound_kind`（`socks5` / `http`）、HTTP 分支的 method 与
+  destination；其余路由 / Session / 字节计数与 §11.4 一致。
+- **失败语义**：坏 HTTP 请求行 → 400 响应后关闭会话（结构化错误，不 panic）；握手中途
+  客户端断开 → 结构化内部错误，不静默直连。
+- **E4 场景**：`scenarios/product/proxy_http_mixed_inbound.toml`——loopback 本地 HTTP
+  origin（回 200）+ Nexus 混合入站：(i) 用原始 HTTP 代理客户端（绝对形式 GET）经混合端口
+  请求 origin，断言 200；(ii) 同端口再发一个 CONNECT 隧道请求，断言 200 Connection
+  Established 后隧道内 GET 200；(iii) 同端口再发 SOCKS5 握手，断言仍通（mixed 共存）。
+- **E5 真机观察（本期不冻结，Review WARN 记录即可）**：`nexusd system-proxy set` 后
+  WinINET 应用（浏览器 / Invoke-WebRequest）经 7897 真实联网。涉及 registry 修改与停
+  clash-verge 复用 7897，验收后必须恢复基线（ProxyEnable=0）并重启 clash-verge。
+- **冻结边界（本期不做，下批）**：HTTP 代理认证（Proxy-Authorization）、HTTPS 绝对形式
+  （`https://` scheme，本期仅 `http://` 绝对形式 + CONNECT 隧道）、CONNECT 之外的方法
+  到上游的完整 body/chunked 处理（本期透传字节）、HTTP/2、端口复用之外的独立 HTTP 监听口。
+
 
 ### 11.3 失败语义
 

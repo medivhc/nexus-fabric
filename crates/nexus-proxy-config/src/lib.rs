@@ -820,10 +820,10 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
             let field = format!("inbounds[{i}]");
             let tag = req_str(item, "tag", &field)?.to_string();
             let kind = req_str(item, "kind", &field)?.to_string();
-            if kind != "socks5" {
+            if kind != "socks5" && kind != "mixed" {
                 return Err(ConfigError::new(
                     format!("{field}.kind"),
-                    format!("P0 supports only 'socks5', got '{kind}'"),
+                    format!("supports 'socks5' or 'mixed', got '{kind}'"),
                 ));
             }
             let listen = req_str(item, "listen", &field)?.to_string();

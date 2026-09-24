@@ -404,6 +404,335 @@ fn socks5_failure_rep(e: &Socks5Error) -> u8 {
     }
 }
 
+// ---------- HTTP 代理有状态握手状态机（RFC 7230 请求行 / CONNECT，§11.19） ----------
+
+/// 结构化 HTTP 代理协议错误（非文本日志）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpProxyError {
+    /// 请求行不是 `METHOD SP request-target SP HTTP/x.y` 三段。
+    BadRequestLine,
+    /// 方法既非 CONNECT 也非可转发方法。
+    UnknownMethod { method: String },
+    /// 非 CONNECT 但 request-target 是 origin-form（`/path`，无 scheme），代理要求绝对形式。
+    OriginFormNotAllowed,
+    /// 绝对形式 URL scheme 不是 `http://`（本期不支持 `https://` 绝对形式）。
+    UnsupportedScheme,
+    /// authority（host[:port]）无法解析。
+    InvalidAuthority,
+}
+
+impl core::fmt::Display for HttpProxyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::BadRequestLine => write!(f, "http-proxy bad request line"),
+            Self::UnknownMethod { method } => write!(f, "http-proxy unknown method {method}"),
+            Self::OriginFormNotAllowed => {
+                write!(f, "http-proxy origin-form target requires absolute-form")
+            }
+            Self::UnsupportedScheme => write!(f, "http-proxy only supports http:// absolute-form"),
+            Self::InvalidAuthority => write!(f, "http-proxy invalid authority"),
+        }
+    }
+}
+
+impl std::error::Error for HttpProxyError {}
+
+/// HTTP 代理握手阶段。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpProxyState {
+    /// 等待请求行结束（`\r\n`）。
+    RequestLine,
+    /// 已解析请求行，等待请求头结束（`\r\n\r\n`）。
+    Headers,
+    /// 握手完成，可进入数据面。
+    Established,
+    /// 握手失败（结构化原因）。
+    Failed(HttpProxyError),
+}
+
+/// `feed` 的单步产物。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpProxyStep {
+    /// 推进后的状态。
+    pub state: HttpProxyState,
+    /// 需要向客户端发送的响应字节（CONNECT=200；错误=400；转发型为空）。
+    pub response: Vec<u8>,
+    /// 握手完成时产出的中立 FlowContext（仅 `Established` 时 `Some`）。
+    pub flow: Option<FlowContext>,
+    /// 已收到合法前缀但输入不足，等待更多字节。
+    pub needs_more: bool,
+    /// 转发型握手：应先写上给上游的字节（改写后的 origin-form 请求行 + 已收请求头）。
+    /// CONNECT 隧道为空（先回 200 再裸中继）。
+    pub upstream_prefix: Vec<u8>,
+}
+
+/// HTTP 代理有状态握手状态机（portable 纯函数，零 I/O）。
+///
+/// 与 `Socks5Handshake` 同构：增量 `feed`，内部缓冲直到请求头结束（`\r\n\r\n`）。
+/// CONNECT 回 200 后裸中继；绝对形式 GET/POST 把请求行改写为 origin-form 并随请求头
+/// 作为 `upstream_prefix` 先写上给上游。
+pub struct HttpProxyHandshake {
+    state: HttpProxyState,
+    buf: Vec<u8>,
+    // 请求行解析后、等待请求头阶段携带的中间结果。
+    is_connect: bool,
+    destination: String,
+    /// 请求行结束后的偏移（请求头起始），用于切片已收请求头。
+    headers_start: usize,
+    /// 转发型：改写后的 origin-form 请求行（含结尾 `\r\n`）。
+    rewritten_line: Vec<u8>,
+}
+
+impl HttpProxyHandshake {
+    /// 新建握手状态机（起始 `RequestLine`）。
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state: HttpProxyState::RequestLine,
+            buf: Vec::new(),
+            is_connect: false,
+            destination: String::new(),
+            headers_start: 0,
+            rewritten_line: Vec::new(),
+        }
+    }
+
+    /// 当前状态。
+    #[must_use]
+    pub fn state(&self) -> &HttpProxyState {
+        &self.state
+    }
+
+    /// 取出握手完成后剩余的数据面字节（仅在 `Established` 后有意义）。
+    #[must_use]
+    pub fn take_data(&mut self) -> Vec<u8> {
+        core::mem::take(&mut self.buf)
+    }
+
+    /// 喂入字节并推进状态机。
+    pub fn feed(&mut self, bytes: &[u8]) -> HttpProxyStep {
+        self.buf.extend_from_slice(bytes);
+        let mut response = Vec::new();
+        let mut flow = None;
+        let mut upstream_prefix = Vec::new();
+        loop {
+            match self.state.clone() {
+                HttpProxyState::RequestLine => {
+                    // 找请求行结束（第一个 \r\n）。
+                    let line_end = match find_subsequence(&self.buf, b"\r\n") {
+                        Some(i) => i,
+                        None => break,
+                    };
+                    let line = &self.buf[..line_end];
+                    match parse_request_line(line) {
+                        Ok((method, target, version)) => {
+                            self.headers_start = line_end + 2;
+                            if method == "CONNECT" {
+                                // CONNECT host:port —— target 即 authority。
+                                match parse_authority(target) {
+                                    Ok(dest) => {
+                                        self.is_connect = true;
+                                        self.destination = dest;
+                                        self.rewritten_line.clear();
+                                        self.state = HttpProxyState::Headers;
+                                    }
+                                    Err(e) => {
+                                        response = bad_request();
+                                        self.state = HttpProxyState::Failed(e);
+                                        break;
+                                    }
+                                }
+                            } else {
+                                // 转发型：origin-form（/path）直接拒绝；否则要求绝对形式 http://。
+                                if target.starts_with('/') {
+                                    response = bad_request();
+                                    self.state = HttpProxyState::Failed(
+                                        HttpProxyError::OriginFormNotAllowed,
+                                    );
+                                    break;
+                                }
+                                match parse_absolute_url(target) {
+                                    Ok((dest, path_target)) => {
+                                        self.is_connect = false;
+                                        self.destination = dest;
+                                        self.rewritten_line =
+                                            format!("{method} {path_target} {version}\r\n")
+                                                .into_bytes();
+                                        self.state = HttpProxyState::Headers;
+                                    }
+                                    Err(e) => {
+                                        response = bad_request();
+                                        self.state = HttpProxyState::Failed(e);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            response = bad_request();
+                            self.state = HttpProxyState::Failed(e);
+                            break;
+                        }
+                    }
+                }
+                HttpProxyState::Headers => {
+                    // 找请求头结束（\r\n\r\n）。
+                    let header_end = match find_subsequence(&self.buf, b"\r\n\r\n") {
+                        Some(i) => i,
+                        None => break,
+                    };
+                    let consumed = header_end + 4;
+                    if self.is_connect {
+                        response = b"HTTP/1.1 200 Connection Established\r\n\r\n".to_vec();
+                        flow = Some(classify(FlowOrigin::Http, &self.destination, ""));
+                    } else {
+                        // upstream_prefix = 改写后的 origin-form 请求行 + 已收请求头（含结尾 \r\n\r\n）。
+                        upstream_prefix = self.rewritten_line.clone();
+                        upstream_prefix.extend_from_slice(&self.buf[self.headers_start..consumed]);
+                        flow = Some(classify(FlowOrigin::Http, &self.destination, ""));
+                    }
+                    self.buf.drain(..consumed);
+                    self.state = HttpProxyState::Established;
+                    break;
+                }
+                HttpProxyState::Established | HttpProxyState::Failed(_) => break,
+            }
+        }
+        let needs_more = matches!(
+            self.state,
+            HttpProxyState::RequestLine | HttpProxyState::Headers
+        ) && !self.buf.is_empty();
+        HttpProxyStep {
+            state: self.state.clone(),
+            response,
+            flow,
+            needs_more,
+            upstream_prefix,
+        }
+    }
+}
+
+impl Default for HttpProxyHandshake {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 结构化 400 响应体。
+fn bad_request() -> Vec<u8> {
+    b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n".to_vec()
+}
+
+/// 在 haystack 中找 needle 的起始下标（纯字节搜索，portable）。
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// 解析请求行：`METHOD SP request-target SP HTTP/x.y`。返回 (method, target, version)。
+fn parse_request_line(line: &[u8]) -> Result<(&str, &str, &str), HttpProxyError> {
+    let text = core::str::from_utf8(line).map_err(|_| HttpProxyError::BadRequestLine)?;
+    let mut parts = text.split_whitespace();
+    let method = parts.next().ok_or(HttpProxyError::BadRequestLine)?;
+    let target = parts.next().ok_or(HttpProxyError::BadRequestLine)?;
+    let version = parts.next().ok_or(HttpProxyError::BadRequestLine)?;
+    if parts.next().is_some() {
+        return Err(HttpProxyError::BadRequestLine);
+    }
+    if method.is_empty() || target.is_empty() || version.is_empty() {
+        return Err(HttpProxyError::BadRequestLine);
+    }
+    if !version.starts_with("HTTP/") {
+        return Err(HttpProxyError::BadRequestLine);
+    }
+    // 可转发方法白名单：CONNECT 单独处理；其余常见安全方法放行。
+    const FORWARDABLE: [&str; 6] = ["GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS"];
+    if method != "CONNECT" && !FORWARDABLE.contains(&method) {
+        return Err(HttpProxyError::UnknownMethod {
+            method: method.to_string(),
+        });
+    }
+    Ok((method, target, version))
+}
+
+/// 解析 CONNECT authority：`host:port` 或 `[ipv6]:port`。缺省端口 443。
+fn parse_authority(target: &str) -> Result<String, HttpProxyError> {
+    let (host, port) = split_host_port(target).map_err(|_| HttpProxyError::InvalidAuthority)?;
+    if host.is_empty() {
+        return Err(HttpProxyError::InvalidAuthority);
+    }
+    Ok(format!("{host}:{port}"))
+}
+
+/// 解析绝对形式 URL：`http://host[:port]/path?query`。返回 (destination, path?query)。
+fn parse_absolute_url(target: &str) -> Result<(String, String), HttpProxyError> {
+    let rest = target
+        .strip_prefix("http://")
+        .ok_or(HttpProxyError::UnsupportedScheme)?;
+    // 拆 authority 与 path。
+    let (authority, path_query) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    // 剥离 userinfo（@ 之后才是 host）。
+    let authority = match authority.rfind('@') {
+        Some(at) => &authority[at + 1..],
+        None => authority,
+    };
+    if authority.is_empty() {
+        return Err(HttpProxyError::InvalidAuthority);
+    }
+    // 缺省端口 80（HTTP 绝对形式）。
+    let (host, port) = split_host_port_or_default(authority, 80)?;
+    Ok((format!("{host}:{port}"), path_query.to_string()))
+}
+
+/// 拆 `host:port` / `[ipv6]:port`；无端口时用 default_port。
+fn split_host_port_or_default(
+    authority: &str,
+    default_port: u16,
+) -> Result<(String, u16), HttpProxyError> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let close = rest.find(']').ok_or(HttpProxyError::InvalidAuthority)?;
+        let host = rest[..close].to_string();
+        let tail = &rest[close + 1..];
+        let port = match tail.strip_prefix(':') {
+            Some(p) => p.parse().map_err(|_| HttpProxyError::InvalidAuthority)?,
+            None => default_port,
+        };
+        return Ok((host, port));
+    }
+    match authority.rfind(':') {
+        Some(i) => {
+            let host = authority[..i].to_string();
+            let port = authority[i + 1..]
+                .parse()
+                .map_err(|_| HttpProxyError::InvalidAuthority)?;
+            Ok((host, port))
+        }
+        None => Ok((authority.to_string(), default_port)),
+    }
+}
+
+/// 拆 `host:port`（必须有端口），用于 CONNECT target。
+fn split_host_port(target: &str) -> Result<(String, u16), HttpProxyError> {
+    if let Some(rest) = target.strip_prefix('[') {
+        let close = rest.find(']').ok_or(HttpProxyError::InvalidAuthority)?;
+        let host = rest[..close].to_string();
+        let tail = &rest[close + 1..];
+        let port = tail
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok())
+            .ok_or(HttpProxyError::InvalidAuthority)?;
+        return Ok((host, port));
+    }
+    let i = target.rfind(':').ok_or(HttpProxyError::InvalidAuthority)?;
+    let host = target[..i].to_string();
+    let port = target[i + 1..]
+        .parse()
+        .map_err(|_| HttpProxyError::InvalidAuthority)?;
+    Ok((host, port))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -603,5 +932,108 @@ mod tests {
         hs.feed(&[0x05, 0x01, 0x00]);
         let step = hs.feed(&[0x05, 0x01, 0x00, 0x03, 0x00, 0x00, 0x50]);
         assert_eq!(step.state, Socks5State::Failed(Socks5Error::InvalidAddress));
+    }
+
+    // ---------- HTTP 代理有状态握手状态机（§11.19） ----------
+
+    #[test]
+    fn http_connect_replies_200_and_establishes_flow() {
+        let mut hs = HttpProxyHandshake::new();
+        let step = hs.feed(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n");
+        assert_eq!(step.state, HttpProxyState::Established);
+        assert_eq!(
+            step.response,
+            b"HTTP/1.1 200 Connection Established\r\n\r\n".to_vec()
+        );
+        assert!(step.upstream_prefix.is_empty());
+        let flow = step.flow.expect("flow");
+        assert_eq!(flow.origin, FlowOrigin::Http);
+        assert_eq!(flow.destination, "example.com:443");
+    }
+
+    #[test]
+    fn http_absolute_get_rewrites_origin_form_prefix() {
+        let mut hs = HttpProxyHandshake::new();
+        let step =
+            hs.feed(b"GET http://example.com/path?x=1 HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        assert_eq!(step.state, HttpProxyState::Established);
+        assert!(step.response.is_empty());
+        assert_eq!(step.flow.unwrap().destination, "example.com:80");
+        // 改写后的 origin-form 请求行 + 原请求头。
+        assert_eq!(
+            step.upstream_prefix,
+            b"GET /path?x=1 HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn http_absolute_get_explicit_port_preserved() {
+        let mut hs = HttpProxyHandshake::new();
+        let step = hs.feed(b"GET http://example.com:8080/ HTTP/1.1\r\n\r\n");
+        assert_eq!(step.state, HttpProxyState::Established);
+        assert_eq!(step.flow.unwrap().destination, "example.com:8080");
+        assert_eq!(step.upstream_prefix, b"GET / HTTP/1.1\r\n\r\n".to_vec());
+    }
+
+    #[test]
+    fn http_truncated_request_line_waits_for_more() {
+        let mut hs = HttpProxyHandshake::new();
+        let step = hs.feed(b"GET http://exa");
+        assert_eq!(step.state, HttpProxyState::RequestLine);
+        assert!(step.needs_more);
+        let step = hs.feed(b"mple.com/ HTTP/1.1\r\n\r\n");
+        assert_eq!(step.state, HttpProxyState::Established);
+        assert_eq!(step.flow.unwrap().destination, "example.com:80");
+    }
+
+    #[test]
+    fn http_origin_form_get_is_rejected() {
+        let mut hs = HttpProxyHandshake::new();
+        let step = hs.feed(b"GET /path HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert_eq!(
+            step.state,
+            HttpProxyState::Failed(HttpProxyError::OriginFormNotAllowed)
+        );
+        assert!(step.response.starts_with(b"HTTP/1.1 400 Bad Request"));
+    }
+
+    #[test]
+    fn http_unknown_scheme_is_rejected() {
+        let mut hs = HttpProxyHandshake::new();
+        let step = hs.feed(b"GET https://example.com/ HTTP/1.1\r\n\r\n");
+        assert_eq!(
+            step.state,
+            HttpProxyState::Failed(HttpProxyError::UnsupportedScheme)
+        );
+    }
+
+    #[test]
+    fn http_bad_request_line_is_400() {
+        let mut hs = HttpProxyHandshake::new();
+        let step = hs.feed(b"garbage line here\r\n\r\n");
+        assert!(matches!(
+            step.state,
+            HttpProxyState::Failed(HttpProxyError::BadRequestLine)
+        ));
+    }
+
+    #[test]
+    fn http_connect_missing_port_is_invalid() {
+        let mut hs = HttpProxyHandshake::new();
+        let step = hs.feed(b"CONNECT example.com HTTP/1.1\r\n\r\n");
+        assert_eq!(
+            step.state,
+            HttpProxyState::Failed(HttpProxyError::InvalidAuthority)
+        );
+    }
+
+    #[test]
+    fn http_established_take_data_exposes_pipelined_bytes() {
+        let mut hs = HttpProxyHandshake::new();
+        let mut bytes = b"CONNECT example.com:443 HTTP/1.1\r\n\r\n".to_vec();
+        bytes.extend_from_slice(b"GET /secret HTTP/1.1\r\n");
+        let step = hs.feed(&bytes);
+        assert_eq!(step.state, HttpProxyState::Established);
+        assert_eq!(hs.take_data(), b"GET /secret HTTP/1.1\r\n".to_vec());
     }
 }
