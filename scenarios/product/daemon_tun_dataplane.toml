@@ -1,0 +1,33 @@
+schema_version = 1
+id = "product.daemon-tun-dataplane"
+title = "nexusd 常驻真实 TUN/UDP 数据面：--tun --foreground 装配与失败路径（E4）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-daemon-tun-dataplane"
+
+[given]
+# 可执行 E4（example daemon_tun_daemon --json，进程内 spawn `nexusd subnet up
+# --foreground --tun` 子进程）：
+# - 非管理员 / 无 wintun.dll / 无 /dev/net/tun 环境：第一行 stdout 为
+#   {verdict:"TUN_ERROR",...}，子进程自行退出（exit 0），不写状态文件，
+#   绝不静默降级回 mock MemoryVpi+MeshCarrier；
+# - 管理员环境：第一行 stdout 为 PASS 且含 local_locator（UDP 实际绑定地址），
+#   删状态文件触发 leave → 常驻子进程优雅退出 0 → status → DOWN；
+# - daemon_tun.verdict_ok：两种环境下行为都符合契约（TUN_ERROR 结构化或真实 up）；
+# - daemon_tun.exited_ok：子进程最终正常退出（exit success）；
+# - daemon_tun.no_state_left：无论哪条路径，测试结束后状态文件都不应残留
+#   （失败路径本就不写；成功路径 leave 已删除）。
+
+[when]
+command = "cargo run --quiet -p nexus --example daemon_tun_daemon -- --json"
+
+[[expect]]
+field = "daemon_tun.verdict_ok"
+equals = true
+
+[[expect]]
+field = "daemon_tun.exited_ok"
+equals = true
+
+[[expect]]
+field = "daemon_tun.no_state_left"
+equals = true

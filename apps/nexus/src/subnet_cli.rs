@@ -418,6 +418,44 @@ pub fn assemble_default_tunnel(config_path: &Path) -> Result<VirtualSubnetTunnel
     )
 }
 
+/// 按已校验配置装配**真实数据面**隧道（UdpCarrier + 平台 VPI）。
+///
+/// 返回 `(tunnel, bound_locator)`：调用方持有 tunnel（进程为 Owner，随 drop 清理
+/// wintun/tun 适配器与 UDP socket），`bound` 为 UDP 实际绑定地址。失败返回以
+/// `TUN_ERROR:` 开头的错误字符串（udp bind / vpi create / assemble_with）。
+#[cfg(windows)]
+fn assemble_real_tunnel(
+    config: &SubnetConfig,
+    tun_name: &str,
+    listen: &str,
+) -> Result<(VirtualSubnetTunnel, String), String> {
+    let mut carrier = UdpCarrier::new();
+    let bound = carrier
+        .bind(listen)
+        .map_err(|e| format!("TUN_ERROR: udp bind: {e}"))?;
+    let vpi = nexus_platform_windows::WintunVpiAdapter::create(tun_name, "Nexus")
+        .map_err(|e| format!("TUN_ERROR: wintun create: {e}"))?;
+    let tunnel = assemble_with(config, Box::new(vpi), Box::new(carrier))?;
+    Ok((tunnel, bound))
+}
+
+/// Linux 实现（/dev/net/tun + UDP 承载）。
+#[cfg(target_os = "linux")]
+fn assemble_real_tunnel(
+    config: &SubnetConfig,
+    tun_name: &str,
+    listen: &str,
+) -> Result<(VirtualSubnetTunnel, String), String> {
+    let mut carrier = UdpCarrier::new();
+    let bound = carrier
+        .bind(listen)
+        .map_err(|e| format!("TUN_ERROR: udp bind: {e}"))?;
+    let vpi = nexus_platform_linux::TunVpi::create(tun_name)
+        .map_err(|e| format!("TUN_ERROR: tun create: {e}"))?;
+    let tunnel = assemble_with(config, Box::new(vpi), Box::new(carrier))?;
+    Ok((tunnel, bound))
+}
+
 /// `subnet up --tun`：真实 VPI（Windows wintun / Linux tun）+ 真实 UDP 承载。
 ///
 /// 失败（dll 缺失 / 权限不足 / 驱动未安装 / 设备创建失败）→ `TUN_ERROR`
@@ -431,13 +469,7 @@ pub fn subnet_up_tun(
 ) -> Result<Value, String> {
     validate_tun_name(tun_name)?;
     let config = parse_config(config_path)?;
-    let mut carrier = UdpCarrier::new();
-    let bound = carrier
-        .bind(listen)
-        .map_err(|e| format!("TUN_ERROR: udp bind: {e}"))?;
-    let vpi = nexus_platform_windows::WintunVpiAdapter::create(tun_name, "Nexus")
-        .map_err(|e| format!("TUN_ERROR: wintun create: {e}"))?;
-    let _tunnel = assemble_with(&config, Box::new(vpi), Box::new(carrier))?;
+    let (_tunnel, bound) = assemble_real_tunnel(&config, tun_name, listen)?;
     let mut out = subnet_up(config_path, state_path, false)?;
     if let Some(obj) = out.as_object_mut() {
         obj.insert("local_locator".into(), serde_json::json!(bound));
@@ -455,16 +487,27 @@ pub fn subnet_up_tun(
 ) -> Result<Value, String> {
     validate_tun_name(tun_name)?;
     let config = parse_config(config_path)?;
-    let mut carrier = UdpCarrier::new();
-    let bound = carrier
-        .bind(listen)
-        .map_err(|e| format!("TUN_ERROR: udp bind: {e}"))?;
-    let vpi = nexus_platform_linux::TunVpi::create(tun_name)
-        .map_err(|e| format!("TUN_ERROR: tun create: {e}"))?;
-    let _tunnel = assemble_with(&config, Box::new(vpi), Box::new(carrier))?;
+    let (_tunnel, bound) = assemble_real_tunnel(&config, tun_name, listen)?;
     let mut out = subnet_up(config_path, state_path, false)?;
     if let Some(obj) = out.as_object_mut() {
         obj.insert("local_locator".into(), serde_json::json!(bound));
     }
     Ok(out)
+}
+
+/// P3.8（§12.38）：daemon 常驻真实数据面装配。
+///
+/// 与 CLI `subnet_up_tun` 复用同一 `assemble_real_tunnel`，但**返回隧道对象**供
+/// nexusd 常驻持有（进程为唯一 Owner，AGENTS §13/§14；函数返回 / drop 时清理
+/// wintun/tun 适配器与 UDP socket）。失败返回以 `TUN_ERROR:` 开头的错误字符串
+/// （tun 名校验失败为 `INVALID_NAME:`，调用方据此分类）。
+#[cfg(any(windows, target_os = "linux"))]
+pub fn assemble_real_tunnel_for_daemon(
+    config_path: &Path,
+    tun_name: &str,
+    listen: &str,
+) -> Result<(VirtualSubnetTunnel, String), String> {
+    validate_tun_name(tun_name)?;
+    let config = parse_config(config_path)?;
+    assemble_real_tunnel(&config, tun_name, listen)
 }

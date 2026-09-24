@@ -1575,6 +1575,45 @@ nexusd（daemon 组合根）接入 subnet 真实路径：隧道由 daemon 生命
 - 冻结边界（P3.5 不做）：daemon serve 控制通道（localapi 常驻命令）、
   隧道热重载、多隧道并发管理、崩溃恢复（§15 冷启动对账）。
 
+### 12.38 P3.8 nexusd daemon 常驻真实 TUN/UDP 数据面（2026-09-24）{#12-daemon-tun-dataplane}
+
+接 §12.32（P3.5 daemon 常驻但使用 mock MemoryVpi+MeshCarrier）与 §12.29（P3.2
+CLI 一次性 `--tun` 真实数据面但随进程退出即 drop）：让 daemon 常驻时承载**真实**
+组网数据面（wintun/tun 虚拟网卡 + UDP 承载），对齐 easytier 的常驻形态。
+
+- **命令面**：`nexusd subnet up --config <path> [--state <path>] [--encrypt-state]
+  [--foreground] [--tun] [--tun-name <n>] [--listen <locator>] [--json]`。
+- **数据面选择**：不带 `--tun` 时行为与 §12.32 逐字节一致（MemoryVpi + MeshCarrier
+  mock 常驻），`product.subnet-daemon` 期望保持 Protected。`--tun` 是**显式**数据面
+  开关，绝不静默切换。
+- **`--tun` 必须与 `--foreground` 同用**：单独 `--tun`（无 `--foreground`）→
+  结构化错误 `{ verdict:"FAIL", error:{ code:"CONFIG_ERROR",
+  message:"--tun requires --foreground" } }`（exit 0）。`--tun` 的语义就是 daemon
+  常驻持有真实隧道；一次性 CLI 形态已由 `nexus subnet up --tun`（§12.29）覆盖。
+- **真实数据面装配**（复用 §12.29 的共享装配核心，不复制领域逻辑）：
+  `UdpCarrier::bind(listen)` → 平台 VPI create（Windows
+  `nexus-platform-windows::WintunVpiAdapter::create(tun_name,"Nexus")`；Linux
+  `nexus-platform-linux::TunVpi::create(tun_name)`）→ 共享 `assemble_with`（peers
+  建连、mark_egress、`encryption=true` 时 `enable_encryption`）。tun_name 默认
+  `nexus0`（经 `validate_tun_name` 校验），listen 默认 `udp://0.0.0.0:0`（OS 分配
+  端口）。
+- **持有与常驻**：隧道对象由 daemon 进程持有（进程为唯一 Owner，AGENTS §13/§14），
+  成功后输出 up JSON（额外含 `local_locator` = UDP 实际绑定地址，与 §12.29 CLI
+  一致），随后进入与 §12.32 相同的 200ms 轮询循环；leave（状态文件被删除）→
+  优雅退出 0，函数返回时 drop 清理 wintun 适配器与 UDP socket。
+- **失败语义（不降级）**：UDP bind 失败或 VPI create 失败（wintun.dll 缺失 /
+  非管理员 os error 5 / /dev/net/tun 未就绪）→ 返回
+  `{ verdict:"TUN_ERROR", command:"subnet up", error:"TUN_ERROR: ..." }`
+  （exit 0），**不写状态文件、不进入常驻循环、绝不静默降级回 mock**。
+- E4 场景 `daemon_tun_dataplane.toml`（id=`product.daemon-tun-dataplane`，
+  example `daemon_tun_daemon --json`，进程内 spawn `nexusd subnet up --foreground
+  --tun`）：非管理员环境 → 第一行 stdout 为 TUN_ERROR 结构化、子进程自行退出
+  （exit 0）、状态文件未留下；管理员环境 → 第一行为 PASS 且含 `local_locator`、
+  删状态文件后优雅退出 0、退出后 status → DOWN。两种环境都断言
+  `daemon_tun.verdict_ok / exited_ok / no_state_left` 为 true。
+- 冻结边界（P3.8 不做）：路由表/防火墙改写、DNS 覆写、多适配器管理、隧道热重载、
+  crash 后冷启动对账（§15）、serve 控制通道下发 TUN 参数；均沿用 §12.29/§12.32
+  既有边界。
 ### 12.33 P2.3 数据压缩（compression，2026-09-21）{#12-compression}
 
 `compression.rs`（`nexus-connectivity::compression`）：链路载荷压缩选路 + 帧头封装 + 压缩率统计骨架。
