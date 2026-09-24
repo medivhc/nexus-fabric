@@ -294,25 +294,6 @@ SOCKS5 入站（复用 nexus-ingress 状态机）
 - 每次分流决策必须可观察：命中规则名、规则类型、选定出站 tag、策略组类型、
   动作链首动作。
 
-### 11.4 真实 SOCKS5 数据面（real socks proxy，2026-09-18）
-
-在 §11 P0 决策内核之外，交付真实 SOCKS5 上网数据面全链路：
-
-```text
-SOCKS5 入站（Socks5Handshake 状态机，真实字节流）
-  -> FlowContext -> 规则路由（§11 纯决策语义，零 I/O）
-  -> Session 双轨（Active -> Disposed，TerminalOutcome 唯一提交）
-  -> 真实出站连接（代理即出口；域名在此真实 DNS 解析后拨号）
-  -> 双向字节中继（客户端 <-> 出站）
-```
-
-- 出站激活从 §11 P0 的 mock `LinkActivator` 提升为真实 `std::net::TcpStream`
-  拨号（Direct 语义）；不引入加密代理协议（与 §11.2 边界一致）。
-- 每次会话必须可观察：握手结果（NO-AUTH 回复）、CONNECT 回复码、命中规则、
-  选定出站 tag、Session phase/outcome、双向中继字节数。
-- E4 场景：`scenarios/product/daemon_real_socks_proxy_flow.toml`（本地 HTTP 目标
-  + 原始 SOCKS5 客户端经代理真实往返 HTTP 200）。
-
 ### 11.2 P0 明确不做（不得写进本期 expectation）
 
 以下为 P1+ 展望，本期契约不承诺、不冻结为 expectation：
@@ -371,6 +352,37 @@ wasm32-wasip1`），结论据真实命令输出，非预判：
 **结论：rcgen 评审通过，采用 rcgen 动态自签测试证书**（不落固定 PEM fixture）。Trojan
 六项评审通过，从「CONDITIONAL 后置」转为「进入实现阶段」；hysteria2 维持后置不变。
 
+### 11.3 失败语义
+
+```text
+CONFIG_INVALID              YAML 解析失败 / 规则表无 MATCH 兜底 / 出站 tag 悬空
+NO_MATCH_RULE               规则表缺 MATCH 兜底且流量未命中任何具体规则
+OUTBOUND_TAG_UNRESOLVED     动作链选定的出站或策略组 tag 不存在
+SELECTOR_EMPTY              selector 策略组候选列表为空
+URLTEST_NO_VALID_CANDIDATE  urltest 组所有候选均无有效 measurement
+DNS_SERVER_UNRESOLVED       DNS 规则或 MATCH 兜底引用的 server tag 未定义
+OUTBOUND_ADAPTER_UNAVAILABLE 选定出站 tag 无已注册的 OutboundAdapter 承接
+```
+
+### 11.4 真实 SOCKS5 数据面（real socks proxy，2026-09-18）
+
+在 §11 P0 决策内核之外，交付真实 SOCKS5 上网数据面全链路：
+
+```text
+SOCKS5 入站（Socks5Handshake 状态机，真实字节流）
+  -> FlowContext -> 规则路由（§11 纯决策语义，零 I/O）
+  -> Session 双轨（Active -> Disposed，TerminalOutcome 唯一提交）
+  -> 真实出站连接（代理即出口；域名在此真实 DNS 解析后拨号）
+  -> 双向字节中继（客户端 <-> 出站）
+```
+
+- 出站激活从 §11 P0 的 mock `LinkActivator` 提升为真实 `std::net::TcpStream`
+  拨号（Direct 语义）；不引入加密代理协议（与 §11.2 边界一致）。
+- 每次会话必须可观察：握手结果（NO-AUTH 回复）、CONNECT 回复码、命中规则、
+  选定出站 tag、Session phase/outcome、双向中继字节数。
+- E4 场景：`scenarios/product/daemon_real_socks_proxy_flow.toml`（本地 HTTP 目标
+  + 原始 SOCKS5 客户端经代理真实往返 HTTP 200）。
+
 ### 11.5 DNS 多 server 规则路由（multi-server DNS rule routing，2026-09-18） {#11-dns}
 
 在既有单 server Exit-DNS Binding 之外，把 DNS 解析推广为「多 server + 按域名规则选择本次
@@ -395,7 +407,7 @@ wasm32-wasip1`），结论据真实命令输出，非预判：
 - E4 场景：`scenarios/product/dns_rule_server_selection.toml`（两个 server A/B，规则把
   example.internal 指向 A、其余 MATCH 指向 B；离线注入，断言路由与解析结果）。
 
-### 11.5.1 DNS IP-CIDR 规则与按 server 缓存隔离（P1，2026-09-18）
+### 11.5.1 DNS IP-CIDR 规则与按 server 缓存隔离（P1，2026-09-18） {#11-dns-ipcidr}
 
 在多 server DNS 路由（§11.5）上扩两件事：
 
@@ -410,7 +422,7 @@ wasm32-wasip1`），结论据真实命令输出，非预判：
   冻结场景（`dns_exit_binding` / `observability_dns_cache` / `dns_rule_server_selection`）零回归。
 - E4 场景：`scenarios/product/dns_ipcidr_rule.toml`。
 
-### 11.6 OutboundAdapter 接缝与 Shadowsocks 出站（AEAD，2026-09-18）
+### 11.6 OutboundAdapter 接缝与 Shadowsocks 出站（AEAD，2026-09-18） {#11-outbound-adapter}
 
 把 `nexus-connectivity` 的出站激活从闭合的 `LinkKind {Direct, Relay}` 枚举推广为显式
 `OutboundAdapter` trait：Direct / Relay / Shadowsocks 是三个**真实**出站实现。Deletion Test
@@ -436,7 +448,27 @@ OutboundAdapter trait（nexus-connectivity，领域中立、可移植）
 - E4 场景：`scenarios/product/proxy_shadowsocks_adapter.toml`（配置 shadowsocks 出站，规则指向
   它；断言 selected adapter kind=shadowsocks 且 AEAD 往返一致）。
 
-### 11.7 VMess 出站 adapter（AEAD 记录，P1，2026-09-18）
+### 11.6.1 Shadowsocks 真实 TCP 会话闭环（P1，2026-09-18） {#11-shadowsocks-real-tcp}
+
+把 Shadowsocks 出站从「离线 AEAD 自洽往返」提升为**真实 TCP 会话闭环**：同一进程内
+loopback 127.0.0.1 起 SS server 端 + 客户端，走真实 `std::net::TcpStream`（blocking，
+与仓库既有 real-host/relay E4 同一 loopback 形态）+ 真实 AEAD 封装，确定性、离线、可复现。
+本步不连公网。
+
+会话语义：
+
+- 方向分离：c2s 与 s2c 使用经 HKDF 不同 info 标签派生的两把独立 key，避免同 key nonce 复用；
+  每方向 nonce 自 0 固定计数递增（不调 getrandom）。
+- 记录帧：`u32 BE length || AEAD record`，record = `nonce(12B) || ciphertext+tag`。
+- 客户端首帧为加密 request header：`[ATYP(1)=1 IPv4 | 3 domain] | addr | port(2 BE)`；
+  server 端解密并解析目标地址后，真实 `TcpStream::connect` 到该 loopback 目标并中继双向字节。
+- 离线可复现：目标为另一个 loopback echo 端；断言握手成功、目标地址被 server 正确解析、
+  一段 payload 往返被正确加解密（client->server 加密、server->echo、echo->server 明文、
+  server->client 加密、client 解密比对）。
+- 既有离线自洽 E4（`product.proxy-shadowsocks-adapter`）行为不变、不回归。
+- E4 场景：`scenarios/product/proxy_shadowsocks_real_tcp.toml`。
+
+### 11.7 VMess 出站 adapter（AEAD 记录，P1，2026-09-18） {#11-vmess}
 
 在同一 `OutboundAdapter` 接缝上新增第四个真实出站实现 VMess。Deletion Test（AGENTS.md §12）
 已成立：Direct / Relay / Shadowsocks / VMess 是四个带真实行为的出站维度，新增 VMess 不改动
@@ -455,7 +487,7 @@ OutboundAdapter trait（nexus-connectivity，领域中立、可移植）
 Trojan / Hysteria2 本段不交付：二者分别需要 TLS（rustls）与 QUIC（quinn），会拉入 ring
 （C/汇编）与大量传递依赖树，工程量超出单段合理范围且 ring 不可 wasm 移植；评审证据见交付报告。
 
-### 11.8 Clash 订阅节点解析（base64 URI 列表，P1，2026-09-18）
+### 11.8 Clash 订阅节点解析（base64 URI 列表，P1，2026-09-18） {#11-clash-subscription-parse}
 
 在配置层 `nexus-proxy-config` 增加订阅解析：输入一段 base64 订阅文本 → 解码 → 逐行解析
 `scheme://userinfo@host:port#name` 形式的节点 URI → 产出与现有出站模型兼容的 `OutboundConfig` 列表。
@@ -571,27 +603,7 @@ E4 场景：`scenarios/product/proxy_trojan_node_config.toml`——喂含两个 
 skip-verify + alpn）的 YAML，断言解析出 2 个 `OutboundConfig`、`kind=trojan`、`alpn=[h2,http/1.1]`、
 `skip_cert_verify=true`、`header_format=singbox`；再喂一个缺 `password` 的 trojan 节点 → `CONFIG_INVALID`。
 
-### 11.6.1 Shadowsocks 真实 TCP 会话闭环（P1，2026-09-18）
-
-把 Shadowsocks 出站从「离线 AEAD 自洽往返」提升为**真实 TCP 会话闭环**：同一进程内
-loopback 127.0.0.1 起 SS server 端 + 客户端，走真实 `std::net::TcpStream`（blocking，
-与仓库既有 real-host/relay E4 同一 loopback 形态）+ 真实 AEAD 封装，确定性、离线、可复现。
-本步不连公网。
-
-会话语义：
-
-- 方向分离：c2s 与 s2c 使用经 HKDF 不同 info 标签派生的两把独立 key，避免同 key nonce 复用；
-  每方向 nonce 自 0 固定计数递增（不调 getrandom）。
-- 记录帧：`u32 BE length || AEAD record`，record = `nonce(12B) || ciphertext+tag`。
-- 客户端首帧为加密 request header：`[ATYP(1)=1 IPv4 | 3 domain] | addr | port(2 BE)`；
-  server 端解密并解析目标地址后，真实 `TcpStream::connect` 到该 loopback 目标并中继双向字节。
-- 离线可复现：目标为另一个 loopback echo 端；断言握手成功、目标地址被 server 正确解析、
-  一段 payload 往返被正确加解密（client->server 加密、server->echo、echo->server 明文、
-  server->client 加密、client 解密比对）。
-- 既有离线自洽 E4（`product.proxy-shadowsocks-adapter`）行为不变、不回归。
-- E4 场景：`scenarios/product/proxy_shadowsocks_real_tcp.toml`。
-
-### 11.10 节点测速（real node speedtest，2026-09-18）
+### 11.10 节点测速（real node speedtest，2026-09-18） {#11-speedtest}
 
 在 urltest 策略组之外，提供对候选出站的**真实延迟测量**能力：组合根注入
 `LatencyProbe`（真实 `std::net::TcpStream::connect_timeout`，非 portable 层），
@@ -619,7 +631,7 @@ loopback 127.0.0.1 起 SS server 端 + 客户端，走真实 `std::net::TcpStrea
   `proxy_speedtest_http204.toml`（注入 mock 三候选 http204，断言 probe_kind=http204 与排序）、
   `proxy_speedtest_http204_loopback.toml`（loopback 真 HTTP/204 服务，断言 204 路径 ok）。
 
-### 11.11 GEOIP / GEOSITE / rule-providers（规则数据注入，2026-09-18）
+### 11.11 GEOIP / GEOSITE / rule-providers（规则数据注入，2026-09-18） {#11-geoip-geosite-providers}
 
 在 §11.1 冻结的静态规则表之外，为规则引擎引入三类**编译期数据注入**的匹配能力：
 GEOIP 国家库、GEOSITE 域名分类清单、rule-providers 本地规则集。数据文件由组合根
@@ -654,7 +666,7 @@ GEOIP 国家库、GEOSITE 域名分类清单、rule-providers 本地规则集。
   `proxy_rule_set.toml` / `proxy_rule_invalid.toml`。
 
 
-### 11.12 在线规则数据（rule-providers 拉取与数据生成工具，2026-09-19）
+### 11.12 在线规则数据（rule-providers 拉取与数据生成工具，2026-09-19） {#11-rule-providers-online}
 
 §11.11 的注入数据由离线确定性闭环升级为可消费在线规则集：rule-providers 支持
 在线 `url` 源（缓存 + 刷新），并落地 `geoip.nex` 二进制格式与生成工具。决策内核
@@ -699,7 +711,7 @@ GEOIP 国家库、GEOSITE 域名分类清单、rule-providers 本地规则集。
   内存构造 → 解析 → 注入 `RuleData` → 路由断言。
 - E4 场景：`geoip_nex_roundtrip.toml`。
 
-### 11.13 `geosite.nex` 二进制格式与生成工具（2026-09-20）
+### 11.13 `geosite.nex` 二进制格式与生成工具（2026-09-20） {#11-geosite-nex}
 
 §11.11 的 GEOSITE 注入数据由纯文本 `geosite/<cat>.txt` 升级为可消费的
 `geosite.nex` 二进制格式与生成工具——与 §11.12 B（geoip.nex）对称。决策内核
@@ -720,7 +732,7 @@ GEOIP 国家库、GEOSITE 域名分类清单、rule-providers 本地规则集。
   E4 场景 roundtrip：内存构造 → 解析 → 注入 `RuleData.geosite` → 路由断言。
 - E4 场景：`geosite_nex_roundtrip.toml`。
 
-### 11.14 rule-provider TLS 在线拉取（https，2026-09-20）
+### 11.14 rule-provider TLS 在线拉取（https，2026-09-20） {#11-rule-provider-https}
 
 §11.12 A 的 `CachedHttpProviderFetcher` 仅支持 `http://` 明文；本节升级为支持
 `https://`（TLS 1.3，rustls），使真实 Clash 订阅的 https rule-provider 可消费。
@@ -742,7 +754,7 @@ GEOIP 国家库、GEOSITE 域名分类清单、rule-providers 本地规则集。
   行内容一致、缓存已落盘。
 - E5 场景：`proxy_rule_provider_fetch_https.toml`。
 
-### 11.15 公开数据源插件（ip2region TXT → `geoip.nex`，2026-09-20）
+### 11.15 公开数据源插件（ip2region TXT → `geoip.nex`，2026-09-20） {#11-public-datasource-plugin}
 
 §11.12 B 标注"公开数据源适配（GeoLite2 / ip2region 等）为 P1 源插件，不绑定许可"。
 本节落地首期源插件：**ip2region TXT 文本格式 → `geoip.nex`**（数据文件由用户自行
@@ -767,7 +779,7 @@ GEOIP 国家库、GEOSITE 域名分类清单、rule-providers 本地规则集。
 - 明确不做（后续批次）：ip2region xdb 二进制、GeoLite2 mmdb/CSV、数据自动下载。
 - E4 场景：`geoip_source_ip2region.toml`。
 
-### 11.16 节点加密出站数据面（node outbound tunnel data plane，2026-09-24）
+### 11.16 节点加密出站数据面（node outbound tunnel data plane，2026-09-24） {#11-outbound-tunnel-dataplane}
 
 把 §11.6 / §11.7 / §11.9 的节点 adapter（Shadowsocks / VMess / Trojan）接入 §11.4 的
 真实 SOCKS5 数据面：规则路由选定节点型出站时，流量经真实加密隧道出站（对齐 Clash
@@ -808,7 +820,7 @@ SOCKS5 入站（Socks5Handshake，§11.4 不变）
   原始 SOCKS5 客户端经 proxy 访问 echo；断言 SS server 收到加密连接、
   request header 目标送达、payload 经加密隧道往返、`routing.outbound_kind=shadowsocks`。
 
-### 11.17 订阅节点在线更新（subscription online update，requirement-change，2026-09-24）
+### 11.17 订阅节点在线更新（subscription online update，requirement-change，2026-09-24） {#11-subscription-update}
 
 §11.2 曾把「Clash 订阅在线解析与自动更新」列为 P0 冻结不做项；本节作为
 **requirement-change** 正式交付：nexusd 按可配置间隔从 HTTP(S) 订阅源在线拉取
@@ -865,7 +877,7 @@ SubscriptionSourceConfig（url / interval_secs / user_agent / headers / tls 选�
   HTTP 订阅源（可变内容 + 可制造失败）：首次拉取 2 节点 -> 热生效节点数 +2；
   拉取失败 -> 节点数保持不变（回退）；再次拉取 3 节点（含 1 未知协议行）-> 节点数 +3、
   rejected=1；断言 `HotReloadManager` revision 在成功时推进、失败时不推进。
-### 11.18 TUN 透明代理入站（TUN transparent proxy inbound，2026-09-24）
+### 11.18 TUN 透明代理入站（TUN transparent proxy inbound，2026-09-24） {#11-tun-transparent-inbound}
 
 把 §11 代理内核的入站从「仅 SOCKS5 显式代理」扩展为「可被 TUN 虚拟网卡透明接管全局
 流量」，对齐 Clash TUN 模式语义。与 §12.29（虚拟子网 mesh 隧道线的 PacketTunnel）是
@@ -923,7 +935,7 @@ wintun 虚拟网卡（nexus-platform-windows::WintunVpiAdapter，§12.29 窄 C A
   DNS 劫持接入 §11.5 DNS 模块、MTU/MSS 钳制。本期 E4 冻结的是「解析 → 分类 → 规则路由
   → NAT 决策」portable 闭环；真实报文拨号与回写为下批。
 
-### 11.19 HTTP/混合代理入站（HTTP & mixed proxy inbound，2026-09-25）
+### 11.19 HTTP/混合代理入站（HTTP & mixed proxy inbound，2026-09-25） {#11-http-mixed-inbound}
 
 §11.4 的 SOCKS5 入站是唯一显式代理入口，导致系统代理接管（§13 WinINET）后，浏览器 /
 PowerShell 等走 HTTP 代理协议（`http://127.0.0.1:7897`）的客户端被立即拒绝（连接被重置）。
@@ -977,18 +989,6 @@ TCP accept（apps/nexus，非 portable I/O）
   （`https://` scheme，本期仅 `http://` 绝对形式 + CONNECT 隧道）、CONNECT 之外的方法
   到上游的完整 body/chunked 处理（本期透传字节）、HTTP/2、端口复用之外的独立 HTTP 监听口。
 
-
-### 11.3 失败语义
-
-```text
-CONFIG_INVALID              YAML 解析失败 / 规则表无 MATCH 兜底 / 出站 tag 悬空
-NO_MATCH_RULE               规则表缺 MATCH 兜底且流量未命中任何具体规则
-OUTBOUND_TAG_UNRESOLVED     动作链选定的出站或策略组 tag 不存在
-SELECTOR_EMPTY              selector 策略组候选列表为空
-URLTEST_NO_VALID_CANDIDATE  urltest 组所有候选均无有效 measurement
-DNS_SERVER_UNRESOLVED       DNS 规则或 MATCH 兜底引用的 server tag 未定义
-OUTBOUND_ADAPTER_UNAVAILABLE 选定出站 tag 无已注册的 OutboundAdapter 承接
-```
 
 ## 12. 虚拟子网组网（Virtual Subnet Networking） {#12-virtual-subnet-networking}
 
@@ -1766,45 +1766,6 @@ nexusd（daemon 组合根）接入 subnet 真实路径：隧道由 daemon 生命
 - 冻结边界（P3.5 不做）：daemon serve 控制通道（localapi 常驻命令）、
   隧道热重载、多隧道并发管理、崩溃恢复（§15 冷启动对账）。
 
-### 12.38 P3.8 nexusd daemon 常驻真实 TUN/UDP 数据面（2026-09-24）{#12-daemon-tun-dataplane}
-
-接 §12.32（P3.5 daemon 常驻但使用 mock MemoryVpi+MeshCarrier）与 §12.29（P3.2
-CLI 一次性 `--tun` 真实数据面但随进程退出即 drop）：让 daemon 常驻时承载**真实**
-组网数据面（wintun/tun 虚拟网卡 + UDP 承载），对齐 easytier 的常驻形态。
-
-- **命令面**：`nexusd subnet up --config <path> [--state <path>] [--encrypt-state]
-  [--foreground] [--tun] [--tun-name <n>] [--listen <locator>] [--json]`。
-- **数据面选择**：不带 `--tun` 时行为与 §12.32 逐字节一致（MemoryVpi + MeshCarrier
-  mock 常驻），`product.subnet-daemon` 期望保持 Protected。`--tun` 是**显式**数据面
-  开关，绝不静默切换。
-- **`--tun` 必须与 `--foreground` 同用**：单独 `--tun`（无 `--foreground`）→
-  结构化错误 `{ verdict:"FAIL", error:{ code:"CONFIG_ERROR",
-  message:"--tun requires --foreground" } }`（exit 0）。`--tun` 的语义就是 daemon
-  常驻持有真实隧道；一次性 CLI 形态已由 `nexus subnet up --tun`（§12.29）覆盖。
-- **真实数据面装配**（复用 §12.29 的共享装配核心，不复制领域逻辑）：
-  `UdpCarrier::bind(listen)` → 平台 VPI create（Windows
-  `nexus-platform-windows::WintunVpiAdapter::create(tun_name,"Nexus")`；Linux
-  `nexus-platform-linux::TunVpi::create(tun_name)`）→ 共享 `assemble_with`（peers
-  建连、mark_egress、`encryption=true` 时 `enable_encryption`）。tun_name 默认
-  `nexus0`（经 `validate_tun_name` 校验），listen 默认 `udp://0.0.0.0:0`（OS 分配
-  端口）。
-- **持有与常驻**：隧道对象由 daemon 进程持有（进程为唯一 Owner，AGENTS §13/§14），
-  成功后输出 up JSON（额外含 `local_locator` = UDP 实际绑定地址，与 §12.29 CLI
-  一致），随后进入与 §12.32 相同的 200ms 轮询循环；leave（状态文件被删除）→
-  优雅退出 0，函数返回时 drop 清理 wintun 适配器与 UDP socket。
-- **失败语义（不降级）**：UDP bind 失败或 VPI create 失败（wintun.dll 缺失 /
-  非管理员 os error 5 / /dev/net/tun 未就绪）→ 返回
-  `{ verdict:"TUN_ERROR", command:"subnet up", error:"TUN_ERROR: ..." }`
-  （exit 0），**不写状态文件、不进入常驻循环、绝不静默降级回 mock**。
-- E4 场景 `daemon_tun_dataplane.toml`（id=`product.daemon-tun-dataplane`，
-  example `daemon_tun_daemon --json`，进程内 spawn `nexusd subnet up --foreground
-  --tun`）：非管理员环境 → 第一行 stdout 为 TUN_ERROR 结构化、子进程自行退出
-  （exit 0）、状态文件未留下；管理员环境 → 第一行为 PASS 且含 `local_locator`、
-  删状态文件后优雅退出 0、退出后 status → DOWN。两种环境都断言
-  `daemon_tun.verdict_ok / exited_ok / no_state_left` 为 true。
-- 冻结边界（P3.8 不做）：路由表/防火墙改写、DNS 覆写、多适配器管理、隧道热重载、
-  crash 后冷启动对账（§15）、serve 控制通道下发 TUN 参数；均沿用 §12.29/§12.32
-  既有边界。
 ### 12.33 P2.3 数据压缩（compression，2026-09-21）{#12-compression}
 
 `compression.rs`（`nexus-connectivity::compression`）：链路载荷压缩选路 + 帧头封装 + 压缩率统计骨架。
@@ -1902,6 +1863,45 @@ verdict，按 PRODUCT §12.36 预算表判定；`verify --full` 挂载 `bench` g
 - 冻结边界（P3.7 不做）：bench 参数化（帧数/载荷/多轮）、跨机远程基准、
   热路径微优化——均不在本项。
 
+### 12.38 P3.8 nexusd daemon 常驻真实 TUN/UDP 数据面（2026-09-24）{#12-daemon-tun-dataplane}
+
+接 §12.32（P3.5 daemon 常驻但使用 mock MemoryVpi+MeshCarrier）与 §12.29（P3.2
+CLI 一次性 `--tun` 真实数据面但随进程退出即 drop）：让 daemon 常驻时承载**真实**
+组网数据面（wintun/tun 虚拟网卡 + UDP 承载），对齐 easytier 的常驻形态。
+
+- **命令面**：`nexusd subnet up --config <path> [--state <path>] [--encrypt-state]
+  [--foreground] [--tun] [--tun-name <n>] [--listen <locator>] [--json]`。
+- **数据面选择**：不带 `--tun` 时行为与 §12.32 逐字节一致（MemoryVpi + MeshCarrier
+  mock 常驻），`product.subnet-daemon` 期望保持 Protected。`--tun` 是**显式**数据面
+  开关，绝不静默切换。
+- **`--tun` 必须与 `--foreground` 同用**：单独 `--tun`（无 `--foreground`）→
+  结构化错误 `{ verdict:"FAIL", error:{ code:"CONFIG_ERROR",
+  message:"--tun requires --foreground" } }`（exit 0）。`--tun` 的语义就是 daemon
+  常驻持有真实隧道；一次性 CLI 形态已由 `nexus subnet up --tun`（§12.29）覆盖。
+- **真实数据面装配**（复用 §12.29 的共享装配核心，不复制领域逻辑）：
+  `UdpCarrier::bind(listen)` → 平台 VPI create（Windows
+  `nexus-platform-windows::WintunVpiAdapter::create(tun_name,"Nexus")`；Linux
+  `nexus-platform-linux::TunVpi::create(tun_name)`）→ 共享 `assemble_with`（peers
+  建连、mark_egress、`encryption=true` 时 `enable_encryption`）。tun_name 默认
+  `nexus0`（经 `validate_tun_name` 校验），listen 默认 `udp://0.0.0.0:0`（OS 分配
+  端口）。
+- **持有与常驻**：隧道对象由 daemon 进程持有（进程为唯一 Owner，AGENTS §13/§14），
+  成功后输出 up JSON（额外含 `local_locator` = UDP 实际绑定地址，与 §12.29 CLI
+  一致），随后进入与 §12.32 相同的 200ms 轮询循环；leave（状态文件被删除）→
+  优雅退出 0，函数返回时 drop 清理 wintun 适配器与 UDP socket。
+- **失败语义（不降级）**：UDP bind 失败或 VPI create 失败（wintun.dll 缺失 /
+  非管理员 os error 5 / /dev/net/tun 未就绪）→ 返回
+  `{ verdict:"TUN_ERROR", command:"subnet up", error:"TUN_ERROR: ..." }`
+  （exit 0），**不写状态文件、不进入常驻循环、绝不静默降级回 mock**。
+- E4 场景 `daemon_tun_dataplane.toml`（id=`product.daemon-tun-dataplane`，
+  example `daemon_tun_daemon --json`，进程内 spawn `nexusd subnet up --foreground
+  --tun`）：非管理员环境 → 第一行 stdout 为 TUN_ERROR 结构化、子进程自行退出
+  （exit 0）、状态文件未留下；管理员环境 → 第一行为 PASS 且含 `local_locator`、
+  删状态文件后优雅退出 0、退出后 status → DOWN。两种环境都断言
+  `daemon_tun.verdict_ok / exited_ok / no_state_left` 为 true。
+- 冻结边界（P3.8 不做）：路由表/防火墙改写、DNS 覆写、多适配器管理、隧道热重载、
+  crash 后冷启动对账（§15）、serve 控制通道下发 TUN 参数；均沿用 §12.29/§12.32
+  既有边界。
 ## 13. Windows 系统代理接管与常驻自启（system-proxy + autostart，2026-09-24）{#13-system-proxy}
 
 桌面/Windows 场景下，nexusd 作为本地入口把系统 WinINET 代理指向本地数据面，
