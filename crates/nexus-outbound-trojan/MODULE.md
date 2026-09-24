@@ -7,14 +7,14 @@
 
 实现 `nexus_connectivity::OutboundAdapter` 的第五个真实出站实现 **Trojan**：
 在既有 TCP 字节流之上叠加 TLS（rustls 0.23 + ring）与 trojan 请求头
-（`hex(SHA-224(password)) | CRLF | ATYP+ADDR+PORT | CRLF`），其后双向透明中继。
+（`hex(SHA-224(password)) | CRLF | CMD(0x01 CONNECT) | ATYP+ADDR+PORT | CRLF`，与 trojan-gfw 官方线上格式一致），其后双向透明中继。
 
 提供：
 - 请求头编码/解码与密码 SHA-224 校验（纯函数，可单测）；
 - rcgen 动态自签证书生成 + rustls 客户端证书 pinning / 服务端配置构造；
 - 面向真实节点的客户端 TLS 参数：skip-cert-verify（danger API）+ ALPN 下发；
 - 离线 loopback E4 所需的 TLS 会话原语（不连公网）；
-- 请求头格式兼容：Standard（trojan-gfw，无命令字节，默认）与 Singbox（ATYP 前带 0x01 CONNECT）。
+- 请求头格式：Standard（trojan-gfw 官方线上格式，含 CMD(0x01 CONNECT)，默认）与 Singbox（字节等价别名，保留以兼容既有配置）。
 
 ## Non-Responsibilities
 
@@ -53,8 +53,9 @@
 - server/client 会话线程必须 join 回收（结构化并发）。
 - skip-cert-verify 仅跳过证书链/主机名校验，**仍执行 TLS 握手签名校验**；ALPN 协商结果可观测；
 - SNI 由调用方以 `ServerName` 传入，本 crate 不硬编码域名、不硬编码真实密码。
-- 请求头**默认 Standard**（trojan-gfw 规范）；客户端编码与本地 server 解析按同一 `TrojanHeaderFormat` 配对；
-  格式不匹配 → `INVALID_HEADER`（不被误判为 `AUTH_DENIED`）。
+- 请求头**默认 Standard**（trojan-gfw 官方线上格式，含 `CMD(0x01 CONNECT)`）；Standard 与 Singbox 字节等价；
+  客户端编码与本地 server 解析按同一 `TrojanHeaderFormat` 配对，解析前 strip 前导 `0x01` CMD 字节；
+  命令字节缺失/非法或地址行长度不符 → `INVALID_HEADER`（不被误判为 `AUTH_DENIED`）。
 
 ## Side Effects
 
@@ -65,7 +66,7 @@
 - crate 内单测：请求头编解码往返、错密码 → `AUTH_DENIED`、kind/tag 稳定；
 - E4：`scenarios/product/proxy_trojan_adapter.toml`、`proxy_trojan_auth_rejected.toml`、
   `proxy_trojan_real_tls_params.toml`（skip-verify + ALPN 协商 + 往返）、
-  `proxy_trojan_header_format.toml`（Singbox 命令字节格式 + Standard 回归）。
+  `proxy_trojan_header_format.toml`（同格式往返 + 字节级互操作断言：Standard 含 CMD 字节且与 Singbox 逐字节相同）。
 
 ## Portability
 
@@ -85,7 +86,8 @@
 
 ## Public API（新增，§11.9.2）
 
-- `TrojanHeaderFormat::{Standard, Singbox}`：请求头格式选择。Standard=trojan-gfw（无命令字节，默认）；
-  Singbox=ATYP 前带 `0x01` CONNECT 命令字节（sing-box 系服务器变体）。
+- `TrojanHeaderFormat::{Standard, Singbox}`：请求头格式选择。Standard=trojan-gfw 官方线上格式
+  （含 `CMD(0x01 CONNECT)`，默认）；Singbox 为字节等价兼容别名（同样含 `0x01` CMD）。
 - `encode_request_fmt(password, target, fmt)` / `parse_request_fmt(password, buf, fmt)`：
-  按格式编解码；`encode_request` / `parse_request` 保留为 Standard 默认，既有调用零回归。
+  按格式编解码；两变体输出逐字节相同；`encode_request` / `parse_request` 保留为 Standard 默认，
+  既有调用零回归。

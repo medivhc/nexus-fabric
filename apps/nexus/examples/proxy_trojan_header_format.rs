@@ -4,10 +4,10 @@
 //! cargo run --quiet -p nexus --example proxy_trojan_header_format -- --json
 //! ```
 //!
-//! 同一进程内 loopback 127.0.0.1：rcgen 自签证书，TLS server + client。同一进程内跑两段：
-//! (a) Singbox：本地 server 用 Singbox 解析器（期待 `0x01` CONNECT 命令字节），客户端切
-//!     `TrojanHeaderFormat::Singbox` → 握手+认证+往返；
-//! (b) Standard 回归：本地 server 用标准解析器，客户端切 `Standard`（无命令字节）→ 往返。
+//! 同一进程内 loopback 127.0.0.1：rcgen 自签证书，TLS server + client。
+//! (a) 同格式往返：本地 server 与 client 同格式（Standard / Singbox 各跑一次）→ 握手+认证+往返；
+//! (b) 字节级互操作断言（PRODUCT §11.9.2）：`encode(Standard)` 在 hex(56B)+CRLF(2B) 之后
+//!     紧接 `0x01` CMD 字节（其后才是 ATYP），且 `encode(Standard) == encode(Singbox)` 逐字节相同。
 //! 离线、确定性；线程 join 回收。
 
 #![forbid(unsafe_code)]
@@ -108,32 +108,54 @@ fn main() {
 
     let identity = generate_loopback_identity().expect("self-signed identity");
 
-    // (a) Singbox：server 期待命令字节，client 切 Singbox。
+    // (a) 同格式往返：Standard 与 Singbox 各跑一次（server 与 client 同格式）。
     let singbox_roundtrip_ok = run_session(
         &identity,
         TrojanHeaderFormat::Singbox,
         TrojanHeaderFormat::Singbox,
     );
-    // (b) Standard 回归：server 用标准解析，client 切 Standard。
     let standard_roundtrip_ok = run_session(
         &identity,
         TrojanHeaderFormat::Standard,
         TrojanHeaderFormat::Standard,
     );
 
-    let verdict = singbox_roundtrip_ok && standard_roundtrip_ok;
+    // (b) 字节级互操作断言（PRODUCT §11.9.2）：官方线上布局为
+    //   hex(56B) | CRLF(2B) | CMD(0x01) | ATYP | ADDR | PORT(BE) | CRLF
+    // 对 IPv4 目标（ATYP=0x01），头部总长 = 56+2+1(CMD)+1(ATYP)+4+2+2 = 68：
+    //   offset 56..58 = CRLF；offset 58 = 0x01(CMD)；offset 59 = 0x01(ATYP=IPv4)；
+    //   offset 60..64 = 目标 octets。Standard 与 Singbox 必须逐字节相同。
+    let probe = TrojanTarget::Ipv4([127, 0, 0, 1], 8388);
+    let std_enc = encode_request_fmt(PASSWORD, &probe, TrojanHeaderFormat::Standard);
+    let sbx_enc = encode_request_fmt(PASSWORD, &probe, TrojanHeaderFormat::Singbox);
+    let standard_header_has_cmd_byte = std_enc.len() == 68
+        && std_enc[56..58] == [0x0du8, 0x0a]
+        && std_enc[58] == 0x01 // CMD = CONNECT
+        && std_enc[59] == 0x01 // ATYP = IPv4
+        && std_enc[60..64] == [127u8, 0, 0, 1];
+    let header_formats_byte_identical = std_enc == sbx_enc;
+
+    let verdict = singbox_roundtrip_ok
+        && standard_roundtrip_ok
+        && standard_header_has_cmd_byte
+        && header_formats_byte_identical;
 
     if as_json {
         println!(
-            "{{\"verdict\":\"{}\",\"kind\":\"trojan\",\"singbox_roundtrip_ok\":{},\"standard_roundtrip_ok\":{}}}",
+            "{{\"verdict\":\"{}\",\"kind\":\"trojan\",\"singbox_roundtrip_ok\":{},\"standard_roundtrip_ok\":{},\"standard_header_has_cmd_byte\":{},\"header_formats_byte_identical\":{}}}",
             if verdict { "PASS" } else { "FAIL" },
             singbox_roundtrip_ok,
-            standard_roundtrip_ok
+            standard_roundtrip_ok,
+            standard_header_has_cmd_byte,
+            header_formats_byte_identical
         );
     } else {
         println!(
-            "trojan header format: singbox={} standard={}",
-            singbox_roundtrip_ok, standard_roundtrip_ok
+            "trojan header format: singbox={} standard={} std_cmd_byte={} byte_identical={}",
+            singbox_roundtrip_ok,
+            standard_roundtrip_ok,
+            standard_header_has_cmd_byte,
+            header_formats_byte_identical
         );
     }
 }
