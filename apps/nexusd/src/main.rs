@@ -129,7 +129,7 @@ fn dispatch_observability(args: &[String]) -> ExitCode {
 fn dispatch_subnet(args: &[String]) -> ExitCode {
     let Some(sub) = args.first().map(String::as_str) else {
         eprintln!(
-            "usage: nexusd subnet <up|status|leave> [--config <path>] [--state <path>] [--encrypt-state] [--foreground] [--json]"
+            "usage: nexusd subnet <up|status|leave> [--config <path>] [--state <path>] [--encrypt-state] [--foreground] [--tun] [--tun-name <n>] [--listen <locator>] [--json]"
         );
         return ExitCode::FAILURE;
     };
@@ -147,11 +147,37 @@ fn dispatch_subnet(args: &[String]) -> ExitCode {
             };
             let cfg = std::path::PathBuf::from(cfg);
             let encrypt = flags.contains_key("--encrypt-state");
+            let use_tun = flags.contains_key("--tun");
+            // §12.38：--tun 必须与 --foreground 同用（一次性 CLI --tun 归 `nexus subnet up --tun`）。
+            if use_tun && !flags.contains_key("--foreground") {
+                return print_json_result(Err((
+                    "CONFIG_ERROR".to_string(),
+                    "--tun requires --foreground (one-shot CLI --tun is `nexus subnet up --tun`)"
+                        .to_string(),
+                )));
+            }
             if flags.contains_key("--foreground") {
                 // 常驻：装配持有隧道，直到 leave 信号（状态文件删除）→ 优雅退出 0
-                match subnet_foreground(&cfg, &state_path, encrypt) {
-                    Ok(code) => ExitCode::from(code),
-                    Err(e) => print_json_result(Err(e)),
+                if use_tun {
+                    let tun_name = flags
+                        .get("--tun-name")
+                        .and_then(|v| v.as_deref())
+                        .unwrap_or("nexus0")
+                        .to_string();
+                    let listen = flags
+                        .get("--listen")
+                        .and_then(|v| v.as_deref())
+                        .unwrap_or("udp://0.0.0.0:0")
+                        .to_string();
+                    match subnet_foreground_real(&cfg, &state_path, encrypt, &tun_name, &listen) {
+                        Ok(code) => ExitCode::from(code),
+                        Err(e) => print_json_result(Err(e)),
+                    }
+                } else {
+                    match subnet_foreground(&cfg, &state_path, encrypt) {
+                        Ok(code) => ExitCode::from(code),
+                        Err(e) => print_json_result(Err(e)),
+                    }
                 }
             } else {
                 let result = nexus::subnet_cli::subnet_up(&cfg, &state_path, encrypt)
@@ -180,6 +206,50 @@ fn subnet_foreground(
     let up = nexus::subnet_cli::subnet_up(cfg, state_path, encrypt)
         .map_err(|e| ("CONFIG_ERROR".to_string(), e))?;
     println!("{up}");
+    loop {
+        if !state_path.exists() {
+            return Ok(0);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// P3.8（§12.38）真实数据面常驻：wintun/tun + UDP 承载，隧道由 daemon 进程持有。
+///
+/// 成功：装配真实隧道 → 写状态文件 → up JSON 含 `local_locator` → 进入与
+/// `subnet_foreground` 相同的 200ms leave 轮询循环；leave（状态文件删除）→
+/// 优雅退出 0，函数返回时 drop 清理 wintun/tun 适配器与 UDP socket。
+///
+/// 失败（udp bind / wintun or tun create 失败）：**不写状态文件、不进入常驻循环、
+/// 绝不静默降级 mock**，输出 `TUN_ERROR` 结构化（exit 0）。tun 名校验等其它
+/// 配置错误 → `CONFIG_ERROR`（exit 0）。
+fn subnet_foreground_real(
+    cfg: &std::path::Path,
+    state_path: &std::path::Path,
+    encrypt: bool,
+    tun_name: &str,
+    listen: &str,
+) -> Result<u8, (String, String)> {
+    let (tunnel, local_locator) =
+        match nexus::subnet_cli::assemble_real_tunnel_for_daemon(cfg, tun_name, listen) {
+            Ok(v) => v,
+            Err(e) => {
+                if e.starts_with("TUN_ERROR") {
+                    // 结构化 TUN_ERROR：Ok 语义（verdict=TUN_ERROR, exit 0），不降级。
+                    println!("{}", nexus::subnet_cli::classify_tun_error(&e));
+                    return Ok(0);
+                }
+                return Err(("CONFIG_ERROR".to_string(), e));
+            }
+        };
+    let mut up = nexus::subnet_cli::subnet_up(cfg, state_path, encrypt)
+        .map_err(|e| ("CONFIG_ERROR".to_string(), e))?;
+    if let Some(obj) = up.as_object_mut() {
+        obj.insert("local_locator".into(), json!(local_locator));
+    }
+    println!("{up}");
+    // 持有真实隧道直到函数返回（drop 清理 wintun/tun 适配器与 UDP socket）。
+    let _held = tunnel;
     loop {
         if !state_path.exists() {
             return Ok(0);
