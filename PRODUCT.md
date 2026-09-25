@@ -2164,63 +2164,72 @@ nexusd autostart install --json | remove --json | status --json
 - 冻结边界（本项不做）：系统代理 PAC / AutoConfigURL、按进程代理（WPAD/
   per-app）、SYSTEM 服务化、全局 `HKLM` 代理、多用户切换会话代理同步。
 
-
 ## 14. 计划任务与事件驱动（Scheduled Task Submission） {#14-schedule}
 
-计划任务把「一次提交」扩展为「按时间表自动提交」：任务意图在注册时固定，
-到期由调度器触发并进入既有 Intent 校验、权限检查与任务生命周期
-（PRODUCT §6 / §10.2 / §11）。本项是白皮书 §21.2 的 P0 最小闭环；
-事件触发（Webhook / 文件变化 / 上游完成）与工作流编排列为 P1，不得写进本期
-expectation。
+> 契约锚点：`PRODUCT.md#14-schedule`（`scenarios/product/schedule_flow.toml` 的
+> requirement）。P0 最小闭环：本地、单机、内存调度 + 触发回调；不引入事件触发、
+> cron、daemon 常驻、跨节点与工作流 DAG（冻结边界见 §14.2）。
 
-### 14.1 用户可观察语义
+### 14.1 可观察语义
 
-- `nexus schedule at <epoch_secs> --resource <resource> [--project <project>] --
-  <command...>`：注册一次性计划任务，返回 schedule id；`at` 必须为未来时间。
-- `nexus schedule every <interval_secs> --resource <resource> [--project <project>] --
-  <command...>`：注册周期计划任务，`interval_secs` 必须 > 0。
-- `nexus schedule list --json`：返回全部计划任务（id、spec、intent、next_run、
-  state、fire_count）。
-- `nexus schedule cancel <id>`：取消 `Scheduled` 状态的条目；已触发（`Fired`）或
-  不存在返回结构化错误。
-- `nexus schedule tick [--now <epoch_secs>]`：推进调度器，触发所有到期条目，
-  返回本次触发结果（schedule_id、task_id、触发次数）；`--now` 用于确定性演示
-  与测试，缺省使用当前时间。
-- 触发时按注册时的执行意图（resource / command / project）提交结构化 Intent，
-  失败遵循 §14.3；成功进入既有任务状态与产物语义，触发记录进入活动。
+组合根 `apps/nexus` 的 `schedule` 子命令暴露五个用户可观察操作：
 
-### 14.2 P0 范围
+| 操作 | 语义 | 结果 / 错误 |
+| --- | --- | --- |
+| `schedule at <ts> --resource <r> -- <cmd...>` | 一次性：到达 Unix 秒触发一次 | 返回 schedule id；过去时间 → `INVALID_SCHEDULE` |
+| `schedule every <secs> --resource <r> -- <cmd...>` | 周期：注册后每间隔触发一次，`next_run` 逐次前移 | 返回 schedule id；`secs <= 0` → `INVALID_SCHEDULE` |
+| `schedule list` | 列出全部条目（id / spec / next_run / state / fire_count） | 空表输出空数组 |
+| `schedule cancel <id>` | 取消 `Scheduled` 条目，阻止后续触发 | `Fired` / 已取消 / 不存在 → `SCHEDULE_NOT_FOUND` |
+| `schedule tick` | 推进调度：触发全部到期条目并提交执行意图 | 每次触发至多提交一次；失败语义见 §14.3 |
 
-- 调度器为进程内组件（`nexus-scheduler`，portable-core）：注册、取消、列表与
-  tick 判定；不直接依赖执行路径，触发动作由组合根注入的提交回调完成。
-- 注册表持久化由组合根完成（本地 JSON 文件，路径可配置）；注册 / 取消 / tick
-  结果在操作成功后持久化。
-- 触发驱动：P0 由宿主进程周期性调用 `tick` 驱动（CLI 提供手动 tick 入口）；
-  daemon 常驻调度、事件触发与复杂日历（cron）表达式为 P1。
+### 14.2 P0 范围与冻结边界
+
+P0 最小闭环：
+
+- `At` 一次性 / `Every` 周期两类时间表；
+- 到期触发：由调用方驱动的 `tick`（组合根以时钟 / 墙钟驱动），触发时通过注入回调
+  提交结构化执行意图（Intent），提交成功后条目按规则推进（`At` → `Fired`，
+  `Every` → `next_run` 前移）；
+- 注册表持久化：`snapshot` / `restore` 支持崩溃后重载，到期未触发条目重载后触发；
+- 取消与列表。
+
+P0 冻结边界（本项不做）：
+
+- 事件触发（Webhook / 文件变化 / 上游任务完成）；
+- cron / 复杂日历表达式；
+- daemon 常驻调度进程；
+- 跨节点 / 分布式调度；
+- 工作流 DAG 编排与依赖。
+
+以上列为 P1+，需走新契约流程（requirement-change）引入。
 
 ### 14.3 失败语义
 
-```text
-INVALID_SCHEDULE     at 为过去时间 / interval ≤ 0 / 缺少命令
-SCHEDULE_NOT_FOUND   cancel 不存在的 id，或条目已 Fired
-SUBMIT_FAILED        触发时 Intent 提交失败：条目保持 Scheduled，下次 tick 重试
-```
+| 错误 | 触发条件 | 行为 |
+| --- | --- | --- |
+| `INVALID_SCHEDULE` | `at` 为过去时间；`interval_secs <= 0`；缺 resource 或 command | 注册失败，返回错误，不写入注册表 |
+| `SCHEDULE_NOT_FOUND` | cancel 不存在 id，或条目已 `Fired` / 已 `Cancelled` | 取消失败 |
+| `SUBMIT_FAILED` | 触发时执行意图提交失败（回调返回 Err） | `TriggerRecord { ok: false }`；条目保持 `Scheduled`、`next_run` 不变，下次 `tick` 重试；错误消息随 `error` 字段输出，可诊断（Retry / Escalate） |
 
 ### 14.4 幂等与恢复
 
-- 单条目单次触发只提交一次：同一 tick 内对已触发条目不重复提交；`At` 条目触发
-  后置 `Fired`，`Every` 条目触发后重排 `next_run` 并保持 `Scheduled`。
-- 崩溃 / 重启后加载持久化注册表：到期未触发条目重新触发；重复触发风险遵循
-  PRODUCT §10.2 幂等键与 §11.3 声明（不承诺通用 exactly-once）。
-- 触发记录（schedule_id、trigger_at、task_id）进入活动记录，可追溯。
+- 同一 `tick` 内每个条目至多触发一次；`At` 触发成功即置 `Fired`，后续 tick 不再提交；
+- `Every` 触发成功后 `next_run_secs += interval_secs`，保持 `Scheduled`；
+- 触发失败不推进条目，下次 tick 重试（不静默丢弃）；
+- 崩溃 / 重启：从 `SchedulerSnapshot` 恢复注册表（含 `next_id` 单调性），到期未触发
+  条目重新触发；重复触发风险由调用方幂等键消除（PRODUCT §10.2 / §11.3），本模块
+  不承诺 exactly-once；
+- 状态权威来源为组合根持久化的快照，恢复为幂等操作。
 
 ### 14.5 E4 映射
 
-- `scenarios/product/schedule_flow.toml`（id=product.schedule-flow）：确定性闭环
-  ——`at` 到期触发一次不重复、`every` 重排后续触发、`cancel` 阻止触发、注册表
-  保存 / 重载状态一致且到期条目重载后触发。
-
-### 冻结边界（P0 不做）
-
-- 事件触发（Webhook / 文件变化 / 上游任务完成）、复杂日历表达式、daemon 常驻
-  调度、跨节点调度、工作流 DAG 编排。
+- 场景：`scenarios/product/schedule_flow.toml`（`id = product.schedule-flow`，E4，
+  requirement `PRODUCT.md#14-schedule`）。
+- 命令：`cargo run --quiet -p nexus --example schedule_flow -- --json`。
+- 断言（11 条）：`verdict=PASS`；`at.fired_once` / `at.no_duplicate` /
+  `at.state_after_fire=Fired`；`every.rescheduled` / `every.fire_count=2` /
+  `every.state_stays_scheduled=Scheduled`；`cancel.blocked_fire=true`；
+  `persist.reload_state_matches=true` / `persist.expired_reloaded_fired=true`；
+  `submit.total_calls=4`（at 1 + every 2 + 重载到期 1；cancel 不触发）。
+- 实现：`crates/nexus-scheduler`（portable-core，零 Nexus 内部依赖）；组合根接线在
+  `apps/nexus`。
