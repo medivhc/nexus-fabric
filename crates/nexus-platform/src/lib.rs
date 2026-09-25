@@ -89,6 +89,14 @@ pub trait PacketCarrier: Send {
     fn receive_into(&mut self, output: &mut [u8]) -> Result<usize, PlatformError>;
     /// 当前绑定地址（未绑定时为 `None`）。
     fn local_locator(&self) -> Option<String>;
+    /// 最近一次 `receive_into` 成功收帧的**来源 locator**（NAT 会话回程学习，
+    /// P4.1 真机收尾：响应方据此回包到发起方的 NAT 映射地址）。
+    ///
+    /// 无会话概念或未收过帧的实现返回 `None`（默认）；UDP 类实现返回
+    /// `udp://<src_ip>:<src_port>`。
+    fn last_peer_locator(&self) -> Option<String> {
+        None
+    }
 }
 
 pub trait TransparentIngressProvider: Send {

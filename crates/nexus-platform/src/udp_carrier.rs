@@ -16,6 +16,8 @@ use crate::{PacketCarrier, PlatformError};
 pub struct UdpCarrier {
     socket: Option<UdpSocket>,
     local_locator: Option<String>,
+    /// 最近一次成功收帧的来源（`udp://<ip>:<port>`，NAT 会话回程用）。
+    last_peer: Option<String>,
 }
 
 impl UdpCarrier {
@@ -25,6 +27,7 @@ impl UdpCarrier {
         Self {
             socket: None,
             local_locator: None,
+            last_peer: None,
         }
     }
 
@@ -102,7 +105,10 @@ impl PacketCarrier for UdpCarrier {
             message: "carrier not bound".into(),
         })?;
         match socket.recv_from(output) {
-            Ok((n, _src)) => Ok(n),
+            Ok((n, src)) => {
+                self.last_peer = Some(format!("udp://{}:{}", src.ip(), src.port()));
+                Ok(n)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
             Err(e) => Err(PlatformError::Io {
                 operation: "udp recv_from".into(),
@@ -113,6 +119,10 @@ impl PacketCarrier for UdpCarrier {
 
     fn local_locator(&self) -> Option<String> {
         self.local_locator.clone()
+    }
+
+    fn last_peer_locator(&self) -> Option<String> {
+        self.last_peer.clone()
     }
 }
 
@@ -131,6 +141,25 @@ mod tests {
         assert!(UdpCarrier::parse_locator("udp://:52001").is_err());
         assert!(UdpCarrier::parse_locator("udp://127.0.0.1:0").is_err());
         assert!(UdpCarrier::parse_locator("udp://127.0.0.1:65536").is_err());
+    }
+
+    #[test]
+    fn last_peer_tracks_received_source() {
+        // 双 socket 回环：A 发帧到 B，B 记录来源 locator。
+        let mut a = UdpCarrier::new();
+        a.bind("udp://127.0.0.1:55001").unwrap();
+        let mut b = UdpCarrier::new();
+        b.bind("udp://127.0.0.1:55002").unwrap();
+        let a_loc = a.local_locator().unwrap();
+        b.send_to(&a_loc, b"ping").unwrap();
+        let mut buf = [0u8; 64];
+        assert_eq!(a.receive_into(&mut buf).unwrap(), 4);
+        let src = a.last_peer_locator().expect("source recorded");
+        assert!(src.starts_with("udp://127.0.0.1:"));
+        assert_ne!(src, a_loc);
+        // 未收帧的 carrier：None（默认语义）。
+        let c = UdpCarrier::new();
+        assert_eq!(c.last_peer_locator(), None);
     }
 
     #[test]

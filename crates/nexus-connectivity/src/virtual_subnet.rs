@@ -582,6 +582,24 @@ impl VirtualSubnetTunnel {
                 peer_id: peer_id.clone(),
             });
         }
+        // NAT 会话回程学习（P4.1 真机收尾）：TOFU 校验通过后、回包发出前，
+        // 用 UDP 来源刷新对端 locator（公网响应方需回包到发起方 NAT 映射地址）。
+        // 身份不匹配/帧解析失败时不会到达此处，防伪造包投毒；非 UDP 承载为 None。
+        let locator = if let Some(src) = self.carrier.last_peer_locator() {
+            if let Some(entry) = self.peers.get_mut(peer_virtual_ip) {
+                if entry.1 != src {
+                    entry.1 = src.clone();
+                    self.events.push(VirtualSubnetEvent::PeerLocatorUpdated {
+                        tunnel_id: self.tunnel_id.clone(),
+                        peer_id: peer_id.clone(),
+                        new_locator: src.clone(),
+                    });
+                }
+            }
+            src
+        } else {
+            locator
+        };
         let eph = KeyPair::generate().map_err(encryption_err)?;
         let static_key = self.identity.identity().unwrap().clone();
         let keys = derive_authed_keys(
@@ -642,6 +660,20 @@ impl VirtualSubnetTunnel {
                 tunnel_id: self.tunnel_id.clone(),
                 peer_id: peer_id.clone(),
             });
+        }
+        // NAT 会话回程学习（对称，发起方侧）：TOFU 校验通过后用 RESP 来源刷新对端
+        // locator。身份不匹配时不会到达此处；非 UDP 承载为 None。
+        if let Some(src) = self.carrier.last_peer_locator() {
+            if let Some(entry) = self.peers.get_mut(peer_virtual_ip) {
+                if entry.1 != src {
+                    entry.1 = src.clone();
+                    self.events.push(VirtualSubnetEvent::PeerLocatorUpdated {
+                        tunnel_id: self.tunnel_id.clone(),
+                        peer_id: peer_id.clone(),
+                        new_locator: src,
+                    });
+                }
+            }
         }
         let keys = derive_authed_keys(
             &pending.static_key,
@@ -1196,6 +1228,8 @@ pub struct MemoryCarrier {
     recv_buf: Arc<Mutex<Vec<u8>>>,
     /// 缁戝畾鐨?locator銆?
     local_locator: Mutex<Option<String>>,
+    /// Last frame source (NAT session-return learning test seam; None by default).
+    last_source: Mutex<Option<String>>,
 }
 
 impl MemoryCarrier {
@@ -1206,7 +1240,13 @@ impl MemoryCarrier {
             send_buf: Arc::new(Mutex::new(Vec::new())),
             recv_buf: Arc::new(Mutex::new(Vec::new())),
             local_locator: Mutex::new(None),
+            last_source: Mutex::new(None),
         }
+    }
+
+    /// Set the last frame source (test seam: emulate a UDP carrier NAT-mapped source).
+    pub fn set_last_source(&self, locator: impl Into<String>) {
+        *self.last_source.lock().unwrap() = Some(locator.into());
     }
 
     /// 鍒涘缓涓€瀵圭湡姝ｄ簰杩炵殑 MemoryCarrier锛欰.send <-> B.recv, B.send <-> A.recv銆?
@@ -1220,11 +1260,13 @@ impl MemoryCarrier {
         let a = Self {
             send_buf: a_send.clone(),
             recv_buf: b_send.clone(),
+            last_source: Mutex::new(None),
             local_locator: Mutex::new(None),
         };
         let b = Self {
             send_buf: b_send.clone(),
             recv_buf: a_send.clone(),
+            last_source: Mutex::new(None),
             local_locator: Mutex::new(None),
         };
         (a, b)
@@ -1270,6 +1312,18 @@ impl PacketCarrier for MemoryCarrier {
 
     fn local_locator(&self) -> Option<String> {
         self.local_locator.lock().unwrap().clone()
+    }
+
+    fn last_peer_locator(&self) -> Option<String> {
+        self.last_source.lock().unwrap().clone()
+    }
+}
+
+impl MemoryCarrier {
+    /// Inject a raw frame into the receive buffer (test seam).
+    pub fn inject(&self, frame: &[u8]) {
+        let mut buf = self.recv_buf.lock().unwrap();
+        buf.extend_from_slice(frame);
     }
 }
 
@@ -1670,6 +1724,64 @@ mod tests {
         assert!(
             tb.peer_stats("10.0.0.1").map(|s| s.bytes_received).unwrap()
                 > b"secret-a-to-b".len() as u64
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn handshake_source_learning_updates_locator_and_emits_event() -> Result<(), ConnectivityError>
+    {
+        // NAT 会话回程（P4.1 真机收尾）：B（公网）收到 A（NAT 后）的 INIT 握手帧后，
+        // 用 carrier 来源刷新 A 的发送目的地 locator，并发出 PeerLocatorUpdated 事件。
+        let cfg_a = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
+        let cfg_b = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.2");
+        let (ca, cb) = MemoryCarrier::connected_pair();
+        cb.set_last_source("udp://223.166.166.161:51821"); // A 的 NAT 映射地址
+        let mut ta = VirtualSubnetTunnel::new(cfg_a, Box::new(MemoryVpi::new()), Box::new(ca));
+        let mut tb = VirtualSubnetTunnel::new(cfg_b, Box::new(MemoryVpi::new()), Box::new(cb));
+        ta.add_peer(TunnelPeer::new("10.0.0.2", "mem-b"))?;
+        tb.add_peer(TunnelPeer::new("10.0.0.1", "mem-a"))?;
+        ta.enable_encryption(EncryptionConfig::default());
+        tb.enable_encryption(EncryptionConfig::default());
+
+        ta.begin_handshake("10.0.0.2")?;
+        let mut buf = [0u8; 4096];
+        assert!(tb.recv_and_deliver(&mut buf)?.is_none()); // 握手帧不写 VPI
+        // 来源学习：locator 从占位刷新为 NAT 映射地址，事件可观测。
+        assert_eq!(
+            tb.peer_locator("10.0.0.1").as_deref(),
+            Some("udp://223.166.166.161:51821")
+        );
+        assert!(tb.events().iter().any(|e| matches!(
+            e,
+            VirtualSubnetEvent::PeerLocatorUpdated { new_locator, .. }
+                if new_locator == "udp://223.166.166.161:51821"
+        )));
+        Ok(())
+    }
+
+    #[test]
+    fn handshake_failure_does_not_learn_source() -> Result<(), ConnectivityError> {
+        // 防投毒：握手帧解析失败（非法 msg 体）→ recv_and_deliver 返回 Err，
+        // 来源学习不生效，locator 保持原值、无 PeerLocatorUpdated 事件。
+        let cfg_b = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.2");
+        let (_, cb) = MemoryCarrier::connected_pair();
+        cb.set_last_source("udp://223.166.166.161:51821");
+        let mut wire = b"hs:10.0.0.1:".to_vec();
+        wire.extend_from_slice(&[0u8; 3]); // 非法 HandshakeMessage 体
+        cb.inject(&wire);
+        let mut tb = VirtualSubnetTunnel::new(cfg_b, Box::new(MemoryVpi::new()), Box::new(cb));
+        tb.add_peer(TunnelPeer::new("10.0.0.1", "mem-a"))?;
+        tb.enable_encryption(EncryptionConfig::default());
+
+        let mut buf = [0u8; 4096];
+        let err = tb.recv_and_deliver(&mut buf).unwrap_err();
+        assert!(matches!(err, ConnectivityError::Invalid { .. }));
+        assert_eq!(tb.peer_locator("10.0.0.1").as_deref(), Some("mem-a"));
+        assert!(
+            !tb.events()
+                .iter()
+                .any(|e| matches!(e, VirtualSubnetEvent::PeerLocatorUpdated { .. }))
         );
         Ok(())
     }
