@@ -1431,6 +1431,41 @@ Symmetric NAT 浪费打洞预算：
   `[dead, mem-b]` 先到先用成功 + `[dead1, dead2]` 全失败耗尽 relay 回退。
 - 冻结边界（本子项不做）：真实公网多路打洞 E5（vps 恢复后补）。
 
+#### 12.9.6 P4.2 CLI 层真实 UDP 打洞接线 + 打洞状态观察（2026-09-26）{#12-punch-cli}
+
+打洞 API（§12.9.3–12.9.5）在 crate 层完成；本节把多候选打洞接进用户可观察的
+CLI（真实 UDP carrier，替代 example 驱动），并让打洞结果经 `subnet status`
+可复查（打洞事件可观察通道）。
+
+- `nexus subnet punch <peer_vip> <targets...> --config <path> --listen
+  <udp://host:port>（必填；UdpCarrier 拒绝 0 端口）[--attempts N] [--json]`：
+  装配真实 UDP carrier
+  （`UdpCarrier::bind(listen)`）+ MemoryVpi（打洞为控制面，不需 TUN）→
+  add_peer（peer_vip，locator=targets 首项）→ `begin_hole_punch_multi` →
+  本地接收循环（`recv_and_deliver` + `punch_tick`，attempts 上限）→ 输出
+  `{ verdict, command, state, locator, attempts, events[] }`；`events` 为
+  打洞事件链（`HolePunchStarted{targets}` / `HolePunchSucceeded{target}` /
+  `HolePunchFailed{targets}`，含候选列表）。打洞为异步——对端需在线回 `pa`。
+- 打洞状态观察（observability 通道）：`subnet punch` 把结果写回 subnet 状态
+  文件（`SubnetState.punch`：peer_vip / state / locator / targets / attempts /
+  succeeded；老状态文件无该字段 → `#[serde(default)]` 兼容）；`subnet status`
+  输出 `subnet.punch`——打洞结果跨进程可复查（不依赖 daemon 常驻）。
+- 失败语义：config 缺失/不可读 → `READ_CONFIG`；TOML 非法 → `PARSE_TOML`；
+  校验失败 → `CIDR`/`PEER_OUTSIDE_SUBNET` 等；
+  listen 非法/绑定失败 →
+  `PUNCH_BIND_FAILED`；peer 未注册 → `PEER_NOT_FOUND`；空候选 →
+  `HOLE_PUNCH_EMPTY_TARGETS`；尝试耗尽 → `HolePunchFailed` 事件 + state 记录
+  最终 peer 状态（Connected / Failed / Probing / Disconnected，取 peer_state
+  实值；不承诺 CLI 常驻等待对端）。装配/建连阶段错误透传 ConnectivityError
+  （保留 core 错误码）。
+- E4 场景：`subnet_punch_cli.toml`（id=product.subnet-punch-cli）——真实 UDP
+  双端 loopback：resp 侧（example 内线程）监听回 `pa` + CLI 子进程发起
+  `subnet punch` → Connected + 事件链含 targets；`subnet_punch_status.toml`
+  （id=product.subnet-punch-status）——punch 后 `subnet status` 反映
+  `subnet.punch`（可观察闭环）。
+- 冻结边界（本子项不做）：真实公网跨 NAT 打洞 E5；CLI 常驻 / daemon 自驱
+  打洞（P3.8 演进）。
+
 ### 12.10 P2.3+P2.4 广域协调核心 + 自动 IP 分配（2026-09-21）{#12-coord}
 
 静态 locator 无法扩展（IP 漂移、NAT 后不可预知）。本节交付**协调控制平面核心**与

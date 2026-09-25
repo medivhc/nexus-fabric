@@ -245,6 +245,10 @@ fn run_subnet(args: &[String], json_mode: bool) -> i32 {
     let mut tun_name: Option<String> = None;
     let mut listen: Option<String> = None;
     let mut encrypt_state = false;
+    // P4.2 §12.9.6：punch 的位置参数（<peer_vip> <targets...>）与尝试次数。
+    let mut punch_peer: Option<String> = None;
+    let mut punch_targets: Vec<String> = Vec::new();
+    let mut attempts = 10u32;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -288,13 +292,39 @@ fn run_subnet(args: &[String], json_mode: bool) -> i32 {
                 listen = Some(v.clone());
                 i += 2;
             }
+            "--attempts" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("error: missing value for --attempts");
+                    return 2;
+                };
+                match v.parse::<u32>() {
+                    Ok(n) => {
+                        attempts = n;
+                        i += 2;
+                    }
+                    Err(_) => {
+                        eprintln!("error: --attempts must be a positive integer");
+                        return 2;
+                    }
+                }
+            }
             other if other.starts_with("--") => {
                 eprintln!("error: unknown option: {other}");
                 return 2;
             }
             other => {
-                eprintln!("error: unexpected argument: {other}");
-                return 2;
+                // punch 子命令的位置参数：第一个是 peer_vip，其余是 targets。
+                if sub == "punch" {
+                    if punch_peer.is_none() {
+                        punch_peer = Some(other.to_string());
+                    } else {
+                        punch_targets.push(other.to_string());
+                    }
+                    i += 1;
+                } else {
+                    eprintln!("error: unexpected argument: {other}");
+                    return 2;
+                }
             }
         }
     }
@@ -325,6 +355,36 @@ fn run_subnet(args: &[String], json_mode: bool) -> i32 {
         }
         "status" => subnet_status(&state_path),
         "leave" => subnet_leave(&state_path),
+        "punch" => {
+            let Some(cfg) = config else {
+                eprintln!("error: subnet punch requires --config <path>");
+                return 2;
+            };
+            let Some(peer) = punch_peer else {
+                eprintln!("error: subnet punch requires <peer_vip> <targets...>");
+                return 2;
+            };
+            // --listen 必填：UdpCarrier 拒绝 0 端口（"locator zero port"）。
+            let Some(lsn) = listen else {
+                eprintln!("error: subnet punch requires --listen <udp://host:port>");
+                return 2;
+            };
+            match nexus::subnet_cli::subnet_punch(
+                &cfg,
+                &state_path,
+                &peer,
+                &punch_targets,
+                &lsn,
+                attempts,
+            ) {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({
+                    "verdict": "PUNCH_ERROR",
+                    "command": "subnet punch",
+                    "error": e,
+                }),
+            }
+        }
         other => {
             eprintln!("error: unknown subnet subcommand: {other}");
             eprint!("{USAGE}");

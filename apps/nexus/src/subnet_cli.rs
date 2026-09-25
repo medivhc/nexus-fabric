@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use nexus_connectivity::cidr::{cidr_contains, parse_cidr};
 use nexus_connectivity::encryption::EncryptionConfig;
 use nexus_connectivity::virtual_subnet::{
-    MemoryVpi, MeshCarrier, TunnelPeer, TunnelState, VirtualSubnetConfig, VirtualSubnetTunnel,
+    MemoryVpi, MeshCarrier, TunnelPeer, TunnelState, VirtualSubnetConfig, VirtualSubnetEvent,
+    VirtualSubnetTunnel,
 };
 use nexus_platform::{PacketCarrier, UdpCarrier, VirtualPacketInterface};
 use serde::{Deserialize, Serialize};
@@ -102,6 +103,26 @@ pub struct SubnetState {
     pub prefix_route_count: usize,
     /// 加密是否开启。
     pub encryption: bool,
+    /// 最近一次打洞结果（P4.2 §12.9.6；老状态文件无该字段 → 兼容）。
+    #[serde(default)]
+    pub punch: Option<PunchRecord>,
+}
+
+/// 打洞结果记录（P4.2 §12.9.6，`subnet punch` 写入，`subnet status` 复查）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PunchRecord {
+    /// 对端虚拟 IP。
+    pub peer_vip: String,
+    /// 最终 peer 状态（Connected / Failed / Probing / Disconnected，实值）。
+    pub state: String,
+    /// 最终 locator（直连或 relay）。
+    pub locator: String,
+    /// 候选 locator 列表。
+    pub targets: Vec<String>,
+    /// 尝试次数。
+    pub attempts: u32,
+    /// 是否打洞成功。
+    pub succeeded: bool,
 }
 
 /// 默认状态文件路径：`$NEXUS_HOME/subnet.json` 或 `~/.nexus/subnet.json`。
@@ -196,6 +217,7 @@ pub fn subnet_up(
         egress_peer_count: s.egress.len(),
         prefix_route_count: s.prefix_routes.len(),
         encryption: s.encryption,
+        punch: None,
     };
     let json = serde_json::to_string_pretty(&state).map_err(|e| format!("SERIALIZE: {e}"))?;
     if let Some(parent) = state_path.parent() {
@@ -317,6 +339,7 @@ pub fn subnet_status(state_path: &Path) -> Value {
                 "egress_peer_count": state.egress_peer_count,
                 "prefix_route_count": state.prefix_route_count,
                 "encryption": state.encryption,
+                "punch": state.punch,
             },
         }),
         Err(_) => serde_json::json!({
@@ -510,4 +533,127 @@ pub fn assemble_real_tunnel_for_daemon(
     validate_tun_name(tun_name)?;
     let config = parse_config(config_path)?;
     assemble_real_tunnel(&config, tun_name, listen)
+}
+
+/// `subnet punch <peer_vip> <targets...>`（P4.2 §12.9.6）：真实 UDP carrier
+/// 打洞——装配（UdpCarrier bind listen + MemoryVpi）→ `begin_hole_punch_multi`
+/// → 本地接收循环（recv_and_deliver + punch_tick，attempts 上限）→ 输出
+/// `{ verdict, command, state, locator, attempts, bound, events[] }`；结果写入
+/// subnet 状态文件（`SubnetState.punch`），供 `subnet status` 复查。
+pub fn subnet_punch(
+    config_path: &Path,
+    state_path: &Path,
+    peer_vip: &str,
+    targets: &[String],
+    listen: &str,
+    attempts: u32,
+) -> Result<Value, String> {
+    if targets.is_empty() {
+        return Err("HOLE_PUNCH_EMPTY_TARGETS: no punch targets".into());
+    }
+    if attempts == 0 {
+        return Err("INVALID_ATTEMPTS: attempts must be > 0".into());
+    }
+    let config = parse_config(config_path)?;
+    let peer_known = config.subnet.peers.iter().any(|p| p.virtual_ip == peer_vip)
+        || config.subnet.egress.iter().any(|e| e == peer_vip);
+    if !peer_known {
+        return Err(format!("PEER_NOT_FOUND: {peer_vip} not in [subnet.peers]"));
+    }
+    let mut carrier = UdpCarrier::new();
+    let bound = carrier
+        .bind(listen)
+        .map_err(|e| format!("PUNCH_BIND_FAILED: {e}"))?;
+    let mut tunnel = assemble_with(&config, Box::new(MemoryVpi::new()), Box::new(carrier))?;
+    tunnel
+        .add_peer(TunnelPeer::new(peer_vip, targets[0].clone()))
+        .map_err(|e| e.to_string())?;
+    tunnel
+        .begin_hole_punch_multi(peer_vip, targets)
+        .map_err(|e| e.to_string())?;
+
+    let mut buf = [0u8; 4096];
+    let mut used = 0u32;
+    for _ in 0..attempts {
+        used += 1;
+        // 收对端帧（ph/pa 处理在 tunnel 内部完成）。
+        if let Err(e) = tunnel.recv_and_deliver(&mut buf) {
+            eprintln!("recv_and_deliver: {e}");
+        }
+        if tunnel.peer_state(peer_vip) == Some(TunnelState::Connected) {
+            break;
+        }
+        if tunnel.punch_tick(peer_vip).is_err() {
+            break;
+        }
+        if tunnel.peer_state(peer_vip) == Some(TunnelState::Connected) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let final_state = tunnel
+        .peer_state(peer_vip)
+        .unwrap_or(TunnelState::Disconnected);
+    let final_locator = tunnel
+        .peer_locator(peer_vip)
+        .unwrap_or_else(|| targets[0].clone());
+    let succeeded = final_state == TunnelState::Connected;
+    let events: Vec<String> = tunnel
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            VirtualSubnetEvent::HolePunchStarted { targets, .. } => {
+                Some(format!("started({})", targets.join(",")))
+            }
+            VirtualSubnetEvent::HolePunchSucceeded { target, .. } => {
+                Some(format!("succeeded({target})"))
+            }
+            VirtualSubnetEvent::HolePunchFailed { targets, .. } => {
+                Some(format!("failed({})", targets.join(",")))
+            }
+            _ => None,
+        })
+        .collect();
+
+    let record = PunchRecord {
+        peer_vip: peer_vip.to_string(),
+        state: format!("{final_state:?}"),
+        locator: final_locator.clone(),
+        targets: targets.to_vec(),
+        attempts: used,
+        succeeded,
+    };
+    // 打洞结果持久化（observability 通道：`subnet status` 复查）。
+    update_state_punch(state_path, record)?;
+
+    Ok(serde_json::json!({
+        "verdict": if succeeded { "PASS" } else { "FAIL" },
+        "command": "subnet punch",
+        "state": format!("{final_state:?}"),
+        "locator": final_locator,
+        "attempts": used,
+        "bound": bound,
+        "events": events,
+    }))
+}
+
+/// 把打洞结果写回 subnet 状态文件（保留既有字段，`punch` 覆盖更新）。
+///
+/// 加密模式按**原文件 magic** 保留（NEXDP1 / NEXSEC1 → 加密重写；老明文 →
+/// 保持明文），避免跨调用把加密状态文件静默降级为明文。
+fn update_state_punch(state_path: &Path, punch: PunchRecord) -> Result<(), String> {
+    let bytes = std::fs::read(state_path).map_err(|e| format!("STATE_READ: {e}"))?;
+    let plain = decrypt_state_bytes(&bytes).map_err(|e| format!("STATE_DECRYPT: {e}"))?;
+    let mut state: SubnetState =
+        serde_json::from_slice(&plain).map_err(|e| format!("STATE_PARSE: {e}"))?;
+    state.punch = Some(punch);
+    let json = serde_json::to_string_pretty(&state).map_err(|e| format!("SERIALIZE: {e}"))?;
+    let enc = if bytes.starts_with(nexus_platform::secure_store::NEXSEC1_MAGIC)
+        || bytes.starts_with(NEXDP1_MAGIC)
+    {
+        encrypt_state_bytes(json.as_bytes())?
+    } else {
+        json.into_bytes()
+    };
+    std::fs::write(state_path, enc).map_err(|e| format!("STATE_WRITE: {e}"))
 }

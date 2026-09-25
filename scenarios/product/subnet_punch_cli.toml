@@ -1,0 +1,38 @@
+schema_version = 1
+id = "product.subnet-punch-cli"
+title = "CLI 层真实 UDP 打洞接线：resp 回 pa + CLI subnet punch → Connected + 事件链"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-punch-cli"
+
+[given]
+delivery = "real-udp-loopback"
+punch = "multi-candidate"
+transport = "udp-datagram"
+
+# 可执行 E4：example 内 resp 线程（真实 UDP bind + 收 ph 回 pa）+ 主线程 spawn
+# `nexus subnet punch` CLI（真实接线）→ Connected + 事件链（含 targets）。
+[when]
+command = "cargo run --quiet -p nexus --example subnet_punch_cli"
+
+# 冻结期望：CLI 打洞成功（Connected）；事件链非空（started/succeeded 已过滤
+# 生成，成功时至少含 succeeded）；punch 结果写回状态文件（status 复查见
+# subnet-punch-status 场景）。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "punch.verdict"
+equals = "PASS"
+
+[[expect]]
+field = "punch.state"
+equals = "Connected"
+
+[[expect]]
+field = "punch.succeeded"
+equals = true
+
+[[expect]]
+field = "punch.events_nonempty"
+equals = true
