@@ -186,6 +186,30 @@ NAT/中继场景的物理建连（组合根 transport::connect）发生在激活
 - 冻结边界（后续）：多候选并发打洞、NAT 类型驱动路径选择、真实公网跨 NAT
   打洞 E5。
 
+### 冻结契约（NAT 类型驱动的路径选择 P4.2，PRODUCT §12.9.4）
+
+- `nexus-connectivity::nat` 新增纯函数决策表：
+  `nat_path_decision(nat_type: NatType) -> PathDecision { Direct | Relay }`：
+  FullCone / RestrictedCone / PortRestrictedCone → `Direct`（打洞可通）；
+  Symmetric → `Relay`（打洞不可通，直达 relay）；Unknown → `Direct`
+  （保守尝试打洞，失败自动 fallback relay，保底路径不变）。
+- `VirtualSubnetTunnel` 新增：
+  - `plan_connectivity(peer_vip, nat_type, direct_target) ->
+    Result<ConnectivityPlan, ConnectivityError>`：决策 `Direct` →
+    `ConnectivityPlan::Direct { target }`（调用方继续 `begin_hole_punch`）；
+    决策 `Relay` → `ConnectivityPlan::Relay { locator }`（取
+    `relay_locator(peer_vip)` 配置；未配置 → Err(`RELAY_NOT_CONFIGURED`)）；
+    两种决策均发 `PathDecided { peer_vip, nat_type, decision }` 事件。
+- 事件：`VirtualSubnetEvent` 新增 `PathDecided { peer_vip, nat_type,
+  decision }`（tunnel_id 贯通；nat_type/decision 为 `nat.rs` 类型）。
+- 失败语义：未注册 peer → `PEER_NOT_FOUND`；Relay 决策但未配置 relay
+  locator → `RELAY_NOT_CONFIGURED`（结构化 Err，无 panic）。
+- 真实 STUN 跨公网探测（`StunClient::detect_nat_type`）为 E5 外部观察：
+  E2/E4 注入 NAT 类型，本模块保持 portable（零 I/O）。
+- Deletion Test：路径选择是打洞发起/relay 直达的独立决策维度；复用
+  `nat.rs` NatType/PathDecision 纯函数与 §12.9.3 打洞/relay API，无新 trait。
+- 冻结边界（后续）：多候选并发打洞、真实公网跨 NAT 打洞 E5。
+
 ### 冻结契约（VirtualSubnet 协调核心 + 自动 IP 分配 P2.3+P2.4，PRODUCT §12.13）
 
 - 新模块 `coord`（portable：零 I/O、零第三方依赖，可编译 WASI）：

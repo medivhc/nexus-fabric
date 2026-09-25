@@ -76,6 +76,31 @@ pub enum NatType {
     Unknown,
 }
 
+/// 路径决策（P4.2 §12.9.4，NAT 类型驱动路径选择的输出）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathDecision {
+    /// 打洞直连。
+    Direct,
+    /// 走 relay（TURN 中继，§12.9.2）。
+    Relay,
+}
+
+/// NAT 类型驱动的路径决策表（P4.2 §12.9.4）。
+///
+/// FullCone/RestrictedCone/PortRestrictedCone → Direct（打洞可通）；
+/// Symmetric → Relay（打洞不可通，直达 relay）；Unknown → Direct（保守尝试
+/// 打洞，失败自动 fallback relay，保底路径不变）。
+#[must_use]
+pub fn nat_path_decision(nat_type: NatType) -> PathDecision {
+    match nat_type {
+        NatType::Symmetric => PathDecision::Relay,
+        NatType::FullCone
+        | NatType::RestrictedCone
+        | NatType::PortRestrictedCone
+        | NatType::Unknown => PathDecision::Direct,
+    }
+}
+
 /// STUN 映射结果
 #[derive(Debug, Clone)]
 pub struct StunMapping {
@@ -513,6 +538,30 @@ mod tests {
         };
         let s = format!("{:?}", event);
         assert!(s.contains("NatTypeDetected"));
+    }
+
+    // ---------- P4.2 §12.9.4 NAT 类型驱动的路径决策表 ----------
+
+    #[test]
+    fn test_nat_path_decision_full_table() {
+        // FullCone/RestrictedCone/PortRestrictedCone → Direct（可打洞）；
+        // Symmetric → Relay（直达中继）；Unknown → Direct（保守打洞）。
+        assert_eq!(nat_path_decision(NatType::FullCone), PathDecision::Direct);
+        assert_eq!(
+            nat_path_decision(NatType::RestrictedCone),
+            PathDecision::Direct
+        );
+        assert_eq!(
+            nat_path_decision(NatType::PortRestrictedCone),
+            PathDecision::Direct
+        );
+        assert_eq!(nat_path_decision(NatType::Symmetric), PathDecision::Relay);
+        assert_eq!(nat_path_decision(NatType::Unknown), PathDecision::Direct);
+    }
+
+    #[test]
+    fn test_path_decision_debug() {
+        assert_eq!(format!("{:?}", PathDecision::Relay), "Relay");
     }
 }
 // test

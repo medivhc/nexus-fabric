@@ -1373,6 +1373,40 @@ XOR-RELAYED-ADDRESS / 生命周期；DERP 是进程内字节中继。
 - 冻结边界（本子项不做）：多候选并发打洞、NAT 类型驱动的路径选择
   （STUN 探测决策直连/relay）、真实公网跨 NAT 打洞 E5（vps 恢复后补）。
 
+#### 12.9.4 P4.2 NAT 类型驱动的路径选择（2026-09-25）{#12-nat-path}
+
+打洞前先探测 NAT 类型（`StunClient::detect_nat_type`，真实跨公网探测为 E5；
+E4 注入决策结果），由决策表决定"打洞直连"还是"直接走 relay"，避免对
+Symmetric NAT 浪费打洞预算：
+
+- `nexus-connectivity::nat` 新增纯函数决策表：
+  `nat_path_decision(nat_type: NatType) -> PathDecision { Direct | Relay }`：
+  - `FullCone` / `RestrictedCone` / `PortRestrictedCone` → `Direct`
+    （打洞可通，发起 `ph` 打洞）；
+  - `Symmetric` → `Relay`（打洞不可通，直接走配置的 relay locator）；
+  - `Unknown`（未探测/探测失败）→ `Direct`（保守尝试打洞，失败自动
+    fallback relay，保底路径不变）。
+- `VirtualSubnetTunnel::plan_connectivity(peer_vip, nat_type, direct_target) ->
+  Result<ConnectivityPlan, ConnectivityError>`：
+  - 决策 `Direct` → `ConnectivityPlan::Direct { target }`（调用方继续
+    `begin_hole_punch`）；
+  - 决策 `Relay` → `ConnectivityPlan::Relay { locator }`（取
+    `relay_locator(peer_vip)` 配置；未配置 → Err(`RELAY_NOT_CONFIGURED`)）；
+  - 两种决策均发 `PathDecided { peer_vip, nat_type, decision }` 事件。
+- 事件：`VirtualSubnetEvent` 新增 `PathDecided { peer_vip, nat_type, decision }`
+  （tunnel_id 贯通）。
+- 失败语义：peer 未注册 → `PEER_NOT_FOUND`；`Relay` 决策但未配置 relay
+  locator → `RELAY_NOT_CONFIGURED`（结构化 Err，无 panic）。
+- E2 单测：决策表全类型（FullCone/RestrictedCone/PortRestrictedCone → Direct、
+  Symmetric → Relay、Unknown → Direct）；`plan_connectivity` 三分支
+  （Direct plan + PathDecided 事件、Symmetric+relay 配置 → Relay plan、
+  Symmetric 无 relay → Err）。
+- E4 场景：`path_decision.toml`（id=product.path-decision）——注入各 NAT 类型
+  断言决策表 + `plan_connectivity` 集成（Symmetric → Relay plan 且不发起打洞
+  帧；RestrictedCone → Direct plan 后打洞流程继续）。
+- 冻结边界（本子项不做）：真实 STUN 跨公网探测 E5（vps 恢复后补）、
+  多候选并发打洞（下一子项）。
+
 ### 12.10 P2.3+P2.4 广域协调核心 + 自动 IP 分配（2026-09-21）{#12-coord}
 
 静态 locator 无法扩展（IP 漂移、NAT 后不可预知）。本节交付**协调控制平面核心**与

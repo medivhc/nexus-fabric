@@ -1,0 +1,87 @@
+schema_version = 1
+id = "product.path-decision"
+title = "NAT 类型驱动的路径选择：决策表 + plan_connectivity 集成（Symmetric 直达 relay / 锥型直连打洞）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-nat-path"
+
+[given]
+subnet_cidr = "10.0.0.0/24"
+node_a_virtual_ip = "10.0.0.1"
+node_b_virtual_ip = "10.0.0.2"
+direct_target = "mem-b"
+relay_locator = "relay://relay.example.org:443"
+
+# 可执行 E4：单进程注入 NAT 类型驱动路径选择并输出 JSON。
+# - 决策表全类型断言：FullCone/RestrictedCone/PortRestrictedCone → Direct、
+#   Symmetric → Relay、Unknown → Direct（保守打洞）。
+# - plan_connectivity 集成三分支：
+#   * RestrictedCone + target → Direct plan（PathDecided 事件，可继续打洞）；
+#   * Symmetric + relay 配置 → Relay plan（不发 ph 打洞帧，carrier 无打洞帧）；
+#   * Symmetric 无 relay 配置 → Err(RELAY_NOT_CONFIGURED)。
+# 真实 STUN 跨公网探测（detect_nat_type）为 E5 外部观察。
+[when]
+command = "cargo run --quiet -p nexus --example path_decision -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "nat path decision"
+
+# --- 决策表 ---
+[[expect]]
+field = "decision_table.full_cone"
+equals = "Direct"
+
+[[expect]]
+field = "decision_table.restricted_cone"
+equals = "Direct"
+
+[[expect]]
+field = "decision_table.port_restricted"
+equals = "Direct"
+
+[[expect]]
+field = "decision_table.symmetric"
+equals = "Relay"
+
+[[expect]]
+field = "decision_table.unknown"
+equals = "Direct"
+
+# --- Direct plan（锥型 → 继续打洞）---
+[[expect]]
+field = "plan.direct.kind"
+equals = "Direct"
+
+[[expect]]
+field = "plan.direct.target"
+equals = "mem-b"
+
+[[expect]]
+field = "plan.direct.path_decided"
+equals = true
+
+# --- Relay plan（Symmetric → 直达 relay，不发起打洞）---
+[[expect]]
+field = "plan.relay.kind"
+equals = "Relay"
+
+[[expect]]
+field = "plan.relay.locator"
+equals = "relay://relay.example.org:443"
+
+[[expect]]
+field = "plan.relay.path_decided"
+equals = true
+
+[[expect]]
+field = "plan.relay.no_punch_frames"
+equals = true
+
+# --- Symmetric 无 relay → 结构化 Err ---
+[[expect]]
+field = "plan.no_relay.err_contains"
+equals = "RELAY_NOT_CONFIGURED"
