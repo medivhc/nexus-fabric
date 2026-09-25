@@ -307,6 +307,29 @@ NAT/中继场景的物理建连（组合根 transport::connect）发生在激活
 冻结语义：纯内存、纯同步、纯函数骨架；不接真实 socket/TUN/内核 tc；不引入 `time` crate，
 仅 std（`std::time::{Duration, Instant}`）；无 `unsafe`、库代码不 panic/unwrap/expect；
 整形排队、优先级/公平排队、per-flow 分流、真实数据面挂接留 TODO。
+
+### 冻结契约（身份密钥与 TOFU 自动交换 P4.1，PRODUCT §12.39，scenarios/product/identity_auto_exchange.toml）
+
+- `trait SecretStore { fn read_secret(&self, key) -> Option<Vec<u8>>; fn write_secret(&mut self, key, value) -> Result<(), IdentityError> }`：
+  secret 后端抽象（注入），实现 `InMemorySecretStore`（HashMap，测试/内存驱动用）；真实持久化
+  由 daemon 装配注入（平台 secure-store，PRODUCT §12.30），本 crate 不直接触盘。
+  读失败语义：当前抽象以 `Option` 表示"无记录"（InMemory 后端不失败）；真实后端（如平台
+  secure-store 不可用）在 P4.1 冻结边界内并入握手拒绝路径（`IdentityRejected`），由注入层保证。
+- `IdentityManager`：`load_or_generate()`（无身份 -> 生成 X25519 static 并持久化，返回是否新生成）、
+  `peer_id_of(static_pub) -> String`（SHA-256 前 16 字节 hex = PeerId）、
+  `verify_peer(record_key, static_pub) -> Result<IdentityAction>`（TOFU：首学 PeerLearned /
+  匹配 PeerVerified / 替换 Err(PeerIdentityChanged)）、`known_peer(key)`、`peer_id()`。
+- **TOFU 记录键 = 对端虚拟 IP（VIP）**：同一 VIP 更换 static 公钥即拒绝（防身份顶替），
+  与 PRODUCT §12.39 一致；`PeerId` 仅用于事件/显示。
+- 握手 wire v2：`HANDSHAKE_INIT/RESP` 各 65B（`type + ephemeral_pub(32) + static_pub(32)`）；
+  混合 DH `dh1=DH(init.static, resp.eph)`、`dh2=DH(init.eph, resp.static)`、`dh3=DH(eph_i, eph_r)`，
+  按角色对称计算后 `HKDF-SHA256(dh1∥dh2∥dh3, salt=b"nexus-link-encryption-v2")` -> 方向子密钥
+  （info 不变）；数据帧 AEAD 布局不变（22B 头作 AAD、1024 位重放窗口）。
+- 事件：`IdentityKeyGenerated{tunnel_id}` / `PeerIdentityLearned{tunnel_id, peer_id}` /
+  `PeerIdentityRejected{tunnel_id, peer_id}`；身份不匹配时握手路径返回
+  `ConnectivityError::IdentityRejected{peer_id}`，错误码 `IDENTITY_CHANGED`。
+- 冻结边界：不实现 CA/吊销/轮换、SPKI pinning 界面、双向 NAT 打洞/TURN 真机验证
+  （留 P4.2）、多节点自动发现/join（留 P4.3）；身份持久化失败（store 不可用）不降级明文。
 ## Verification
 
 最低：
@@ -390,3 +413,53 @@ cargo clippy -p nexus-connectivity --all-targets -- -D warnings
   日志（AGENTS §22）。
 - benchmark 语义：进程内闭环（无真实网络），输出 JSON 断言只锁结构不锁
   绝对值（verdict 由预算表计算）；baseline 首测定格入 evidence。
+
+
+### 冻结契约（TURN 中继分配 RFC5766 P2.5，scenarios/product/turn_relay_allocate.toml）
+
+- 新模块 `nexus-connectivity::turn`（Portable Core：零真实网络、零新增第三方依赖，可编译 WASI；
+  复用 `nat.rs` 的 STUN 基础头：magic cookie 0x2112A442 / 12 字节 transaction id / XOR 地址）。
+- `TurnClientConfig { server, username, password, realm, nonce, lifetime_secs }`：
+  - `new(server, username, password, lifetime_secs)`（realm/nonce 初始空）；
+  - `validate() -> Result<(), TurnError>`：`server/username/password` 任一空 -> `Invalid`。
+- `TurnAllocationState { Unallocated, Requesting, Allocated{relayed_addr:String, expires_secs:u32},
+  Failed{reason:String} }`；`Display` 输出 `unallocated/requesting/allocated/failed`。
+- RFC5766 编解码（确定性、可移植，纯 std + 已在依赖树的 `ring`）：
+  - TURN 消息类型：Allocate Request 0x003 / Allocate Error Response 0x113 / Refresh 0x006。
+  - 属性：REQUESTED-TRANSPORT(0x0019, UDP=17) / XOR-RELAYED-ADDRESS(0x0016) /
+    ERROR-CODE(0x0009) / NONCE(0x0015) / REALM(0x0014) / LIFETIME(0x000d) /
+    MESSAGE-INTEGRITY(0x0008, HMAC-SHA1) / USERNAME(0x0006)。
+  - `build_allocate_request(txid, username, realm, nonce, key: Option<&[u8;16]>) -> Vec<u8>`：
+    无凭证时只带 Requested-Transport；带 key 时追加 USERNAME/REALM/NONCE + MESSAGE-INTEGRITY。
+  - `parse_allocate_response(buf) -> Result<ParsedTurnMessage, TurnError>`：解析消息类型、
+    ERROR-CODE(code,reason)、REALM、NONCE、XOR-RELAYED-ADDRESS。
+  - `long_term_key(username, realm, password) -> [u8;16]`：MD5(`username:realm:password`)
+    （RFC5389 §10.2，纯 std 小实现，RFC1321 测试向量单测锁定）。
+  - `codec_self_test() -> Result<(usize, std::net::SocketAddr), TurnError>`：离线自检
+    Allocate Request 构造长度 + 合成成功响应解析 XOR-RELAYED-ADDRESS + MESSAGE-INTEGRITY 往返。
+- `trait TurnTransport`：`fn send_recv(&mut self, request: &[u8]) -> Result<Vec<u8>, String>`；
+  真实 UDP/TLS 到 TURN 服务器由 Composition Root / `nexus-platform-*` 注入，本层零真实网络。
+- `MockTurnTransport`：离线确定性回环——首请求回合成 401（realm="example.org"、
+  nonce="abc123"），二次回成功（XOR-RELAYED-ADDRESS=192.0.2.1:54320、LIFETIME=600）；
+  `new()` 构造，不发起真实网络。
+- `TurnClient { config, state, events }`：
+  - `new(config, Box<dyn TurnTransport>)`（初始 `Unallocated`、events 空）；
+  - `allocate() -> Result<TurnAllocationState, TurnError>`：严格编排
+    `Unallocated -> Requesting`（发无凭证 Allocate）-> 收 401（取 realm/nonce）-> 派生 key
+    -> 发带 MESSAGE-INTEGRITY Allocate -> `Allocated`（记录 relayed_addr/expires_secs）；
+    任一步失败 -> `Failed{reason}`；二次 Allocate 重复调用直接 `Invalid`；
+  - `state()` / `events()` / `relayed_address()` 只读访问器。
+- `TurnError` 类型化枚举：`Invalid{message}` / `AllocateFailed{code:u16,reason:String}` /
+  `AuthChallengeFailed` / `IntegrityMismatch` / `NoRelayedAddress`；Display + std::error::Error。
+- 事件 `TurnEvent { AllocateSent, AuthChallengeReceived{realm,nonce},
+  AllocateSuccess{relayed,expires_secs}, AllocateFailed{code,reason} }`（Worker 只发事件）。
+
+冻结语义：
+- `allocate` 是确定性策略编排（响应来自注入的 `TurnTransport`，不自行发起网络 I/O）；
+  真实 TURN 服务器交互（UDP/TLS socket、ChannelData、ChannelBind、CreatePermission、
+  Refresh 定时器）留 P3。
+- 未 `Allocated` 不视为可经中继建连；分配失败只报告事实，不替换业务 Provider。
+- 本骨架为可移植纯 std 实现，不新增第三方依赖（MD5 纯 std 小实现；HMAC-SHA1 用 `ring` 0.17）、
+  不含 `unsafe`。
+- Deletion Test 成立：TURN 分配/凭证/生命周期语义是与 DERP 类 `RelayChannel`（DIAL 字节中继）、
+  STUN 打洞三个独立变化维度；复用 `nat.rs` STUN 头原语，无新系统级 trait、无投机抽象。

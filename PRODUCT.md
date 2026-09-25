@@ -1279,6 +1279,48 @@ socket 集成留 P3 产品化）；打洞由外部 HolePuncher 驱动后经隧�
 
 审计发现 product.nat-hole-punching 的 E4 驱动此前硬编码公网映射（203.0.113.42:54321）、NAT 类型（RestrictedCone）与打洞成功（rtt=1ms），与真实打洞之名不符。现修正为诚实边界：E4 冻结期望改为确定性离线编解码自检（RFC5389 Binding Request 构造 + XOR-MAPPED-ADDRESS 解析，nat::codec_self_test），不再冻结伪造的 nat.type==RestrictedCone / hole_punch.success==true；驱动可选地对真实 STUN 服务器（默认 stun.l.google.com:19302）发起 Binding Request，可达时 real_stun=true，否则诚实 real_stun=false（公网映射值环境相关，不入冻结期望）。真实两 peer 跨公网 UDP 打洞与 TUN<->UDP pump Owner 循环仍冻结在 P3；本批以 E5 外部观察（真实 STUN 公网映射、 Windows<->mylinux UdpCarrier 跨主机 RTT）落入 .evidence/nat-real-nat01/。
 
+### 12.9.2 P2.5 TURN 中继分配（RFC 5766，2026-09-25）{#12-turn}
+
+当 STUN 打洞失败（Symmetric NAT / 两端限制型 NAT 后无法直连）时，节点必须能通过配置的
+**TURN 服务器**完成中继分配（Allocation），获得一对 relayed transport address 并经其收发，
+作为 Direct 打洞失败后的兜底中继路径之一（与既有 DERP 类 `RelayChannel` 并列）。TURN 与
+DERP 的区别：TURN 是标准协议（RFC 5766），带显式 Allocate / 长期凭证（RFC 5389 §10.2）/
+XOR-RELAYED-ADDRESS / 生命周期；DERP 是进程内字节中继。
+
+- 新模块 `nexus-connectivity::turn`（Portable Core：零真实网络、零新增第三方依赖，可编译 WASI）：
+  - TURN 客户端配置 `TurnClientConfig { server, username, password, realm, nonce, lifetime_secs }`；
+    `validate()` 拒绝空 `server/username/password`；`realm/nonce` 初始为空（由 401 挑战填充）。
+  - 分配状态机 `TurnAllocationState { Unallocated, Requesting,
+    Allocated{relayed_addr, expires_secs}, Failed{reason} }`。
+  - RFC 5766 编解码（复用 `nat.rs` 的 STUN 基础头：magic cookie / transaction id / XOR 地址）：
+    Allocate Request(0x003) / Allocate Error Response(0x113) / Requested-Transport(0x19,UDP=17) /
+    XOR-RELAYED-ADDRESS(0x16) / ERROR-CODE(0x9) / NONCE(0x15) / REALM(0x14) / LIFETIME(0xd) /
+    MESSAGE-INTEGRITY(0x8, HMAC-SHA1)。
+  - 长期凭证 `key = MD5(username:realm:password)`（RFC 5389 §10.2，纯 std 小实现），
+    用于计算 MESSAGE-INTEGRITY；HMAC-SHA1 用已在依赖树的 `ring`。
+  - 分配编排 `TurnClient::allocate()`：
+    1. `Unallocated` -> 发无凭证 Allocate Request；
+    2. 收到 401 Unauthenticated -> 提取 realm/nonce，派生 key，重发带 MESSAGE-INTEGRITY 的 Allocate；
+    3. 成功 -> 解析 XOR-RELAYED-ADDRESS 得 relayed_addr，状态 `Allocated`；
+    4. 任一步失败 -> `Failed{reason}`（保留 ERROR-CODE / 原因）。
+  - `trait TurnTransport`（接缝）：`send_recv(&[u8]) -> Result<Vec<u8>, String>`；真实
+    UDP/TLS 到 TURN 服务器由 Composition Root / `nexus-platform-*` 注入，本层零真实网络。
+  - `MockTurnTransport`：离线确定性回环——首请求回合成 401（含 realm/nonce），二次回成功
+    （含 XOR-RELAYED-ADDRESS=192.0.2.1:54320），供单测与 E4 产品场景驱动。
+  - `codec_self_test()`：离线构造并解析合成 Allocate 响应 + 计算/校验 MESSAGE-INTEGRITY，零网络。
+- 失败语义：结构化 `TurnError`（Invalid / AllocateFailed{code,reason} / AuthChallengeFailed /
+  IntegrityMismatch / NoRelayedAddress）；无 panic。
+- Deletion Test（AGENTS.md §12）：TURN 分配/凭证/生命周期语义是与 DERP 类 `RelayChannel`
+  （DIAL 字节中继）、STUN 打洞三个独立变化维度；复用 `nat.rs` 的 STUN 头原语，不新增系统级
+  trait、不投机抽象。
+- 冻结边界（P2.5 不做）：真实 UDP/TLS socket 到真实 TURN 服务器、ChannelData 编码、
+  ChannelBind、CreatePermission、Refresh 定时器、TURN-over-TLS/TCP、真实中继数据转发 pump、
+  多 TURN 服务器选路与配额；这些挂接与产品化留 P3。
+- E4 场景：`scenarios/product/turn_relay_allocate.toml`（id=product.turn-relay-allocate）——
+  离线确定性：codec 自检（Allocate Request 构造 + XOR-RELAYED-ADDRESS 解析 +
+  MESSAGE-INTEGRITY 往返）+ MockTransport 驱动 401 挑战 -> 凭证重发 -> Allocated，
+  relayed_addr=192.0.2.1:54320、realm/nonce 非空。真实公网 TURN Allocate 为 E5 外部观察。
+
 ### 12.10 P2.3+P2.4 广域协调核心 + 自动 IP 分配（2026-09-21）{#12-coord}
 
 静态 locator 无法扩展（IP 漂移、NAT 后不可预知）。本节交付**协调控制平面核心**与
@@ -1902,6 +1944,46 @@ CLI 一次性 `--tun` 真实数据面但随进程退出即 drop）：让 daemon 
 - 冻结边界（P3.8 不做）：路由表/防火墙改写、DNS 覆写、多适配器管理、隧道热重载、
   crash 后冷启动对账（§15）、serve 控制通道下发 TUN 参数；均沿用 §12.29/§12.32
   既有边界。
+### 12.39 P4.1 多节点真实互联：身份密钥与自动交换（2026-09-25）{#12-identity-auto-exchange}
+
+接 §12.38（daemon 常驻真实 TUN/UDP 数据面，单机真实）与 §12.7（加密握手为
+**纯 ephemeral**、无身份认证，§12.10 注册标识的防伪造留 P3）：让跨机建连具备
+**长期身份 + 首次信任自动交换**（TOFU），支撑公网多节点真实互联（P4 目标：
+替代 Clash Verge 的组网形态，对齐 easytier/Tailscale 的互联语义）。
+
+- **身份模型**：每个节点持有**长期 X25519 static 身份密钥对**（`IdentityKeyPair`，
+  = 节点身份，`PeerId = static 公钥 SHA-256 前 16 字节`，与 §12.10 coord 注册标识
+  一致）；首次运行自动生成并经 secure-store（§12.30）加密持久化（`identity` 记录），
+  不落明文配置文件。
+- **握手 wire 升级（v2，替代 §12.7 纯 ephemeral 布局）**：`HANDSHAKE_INIT` /
+  `HANDSHAKE_RESP` 各携带 `ephemeral_pub ∥ static_pub`（发起方/响应方各自身份公钥）。
+  会话派生为 WireGuard 式混合 DH：
+  `dh1 = DH(static_priv, eph_pub_peer)`，`dh2 = DH(eph_priv, static_pub_peer)`，
+  `dh3 = DH(eph_priv, eph_pub_peer)` → `HKDF-SHA256(dh1 ∥ dh2 ∥ dh3)` → 方向子密钥
+  （tx/rx）。**同时提供身份认证与前向保密**；§12.7 既有数据帧 AEAD 布局
+  （version|type|seq|nonce 头作 AAD、1024 位滑动重放窗口）不变。
+- **自动交换（TOFU，首次信任）**：握手完成时，对端 static 公钥写入 peer 身份表
+  （secure-store 加密持久化，**键 = 对端虚拟 IP（VIP）**——同一 VIP 更换身份即
+  拒绝，防身份顶替）；后续握手必须匹配已存公钥。
+  - 对端 static 公钥与已存不一致 → 握手拒绝，事件 `IdentityMismatch`，
+    错误码 `IDENTITY_CHANGED`（防身份替换/MITM）；不落新身份。
+  - 无已存身份（首次）→ 自动学习并持久化，事件 `PeerIdentityLearned`。
+  - 本端无身份密钥 → 自动生成并持久化，事件 `IdentityKeyGenerated`。
+- **驱动接入**：`VirtualSubnetTunnel::begin_handshake` / `accept_handshake` 携带
+  本端 `IdentityKeyPair`（由 daemon/CLI 装配注入）；握手完成事件序列与 §12.7
+  一致（`HandshakeCompleted → SessionEstablished`），既有 `link-encryption` 场景
+  期望 Protected。
+- **失败语义**：加密未开启 / peer 未注册 → 沿用 §12.7 结构化错误；身份持久化失败
+  （secure-store 不可用）→ 握手拒绝 `IDENTITY_STORE_UNAVAILABLE`，不进入无认证
+  降级明文（绝不静默降级）。
+- E4 场景 `identity_auto_exchange.toml`（id=`product.identity-auto-exchange`，
+  example `identity_auto_exchange --json`，双进程真实 UDP 或内存驱动两种形态）：
+  断言 `identity_key_generated`、`first_handshake_learned`、`data_frame_decrypted`（数据帧
+  往返，实现补充更严格验证）、`second_handshake_verified`、`identity_mismatch_rejected`
+  事件与 `verdict=PASS`；断言位置按 toml `events.3/events.4` 对齐。
+- 冻结边界（P4.1 不做）：CA/证书吊销与轮换、SPKI pinning 管理界面、双向 NAT
+  打洞与 TURN 中继的**真机**验证（原语已交付 §12.9/turn.rs，留 P4.2）、多节点
+  自动发现/`join` 命令（留 P4.3）。
 ## 13. Windows 系统代理接管与常驻自启（system-proxy + autostart，2026-09-24）{#13-system-proxy}
 
 桌面/Windows 场景下，nexusd 作为本地入口把系统 WinINET 代理指向本地数据面，

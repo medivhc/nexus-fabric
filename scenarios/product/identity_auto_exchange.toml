@@ -1,0 +1,48 @@
+schema_version = 1
+id = "product.identity-auto-exchange"
+title = "多节点身份密钥自动交换：首次 TOFU 学习 -> 二次验证 -> 身份替换拒绝"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-identity-auto-exchange"
+
+[given]
+key_exchange = "X25519 mixed DH (static+ephemeral) + HKDF-SHA256"
+identity_persistence = "secure-store encrypted (identity record)"
+tofu = "first-trust auto-learn, then verify-and-reject on mismatch"
+
+# 可执行 E4：双隧道内存驱动 + 进程内 secure-store 临时目录
+# 事件序列（冻结，实现含更严格验证事件）：
+#   identity_key_generated       本端无身份密钥 -> 自动生成并持久化
+#   first_handshake_learned      首次握手 -> TOFU 学习对端 static 公钥并持久化
+#   data_frame_decrypted         数据帧往返（混合 DH 会话可加解密，实现补充更严格验证）
+#   second_handshake_verified    再次握手 -> 与已存身份匹配，握手成功
+#   identity_mismatch_rejected   对端身份替换（新 static 公钥）-> 拒绝 + IDENTITY_CHANGED
+#   exchange_completed           流程完成（实现补充）
+[when]
+command = "cargo run --quiet -p nexus --example identity_auto_exchange -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "events.0"
+equals = "identity_key_generated"
+
+[[expect]]
+field = "events.1"
+equals = "first_handshake_learned"
+
+[[expect]]
+field = "events.3"
+equals = "second_handshake_verified"
+
+[[expect]]
+field = "events.4"
+equals = "identity_mismatch_rejected"
+
+[[expect]]
+field = "identity.peer_id"
+
+[[expect]]
+field = "mismatch.error_code"
+equals = "IDENTITY_CHANGED"

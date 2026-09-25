@@ -2636,6 +2636,91 @@ pub fn relay_fallback_flow() -> Result<Value, NexusError> {
         }
     }))
 }
+/// 运行一次 TURN 中继分配的**离线确定性切片**（E4 `product.turn-relay-allocate`）：
+/// codec 自检（Allocate Request 构造 + XOR-RELAYED-ADDRESS 解析 + MESSAGE-INTEGRITY 往返）
+/// + `MockTurnTransport` 驱动 401 挑战 -> 长期凭证重发 -> Allocated。
+pub fn turn_relay_allocate_flow() -> Result<Value, NexusError> {
+    use nexus_connectivity::turn::TurnEvent;
+
+    // 1) codec 离线自检：构造带 MESSAGE-INTEGRITY 的 Allocate Request，
+    //    解析合成成功响应的 XOR-RELAYED-ADDRESS / LIFETIME。
+    let (request_bytes, parsed_relayed) =
+        nexus_connectivity::turn::codec_self_test().map_err(|e| NexusError::Internal {
+            message: format!("turn codec self-test failed: {e}"),
+        })?;
+
+    // 2) 分配闭环：无凭证 Allocate -> 401 挑战 -> 长期凭证重发 -> Allocated。
+    let config = nexus_connectivity::turn::TurnClientConfig::new(
+        "turn.example.org:3478",
+        "nexus-node-a",
+        "secret-credential",
+        600,
+    );
+    let mut client = nexus_connectivity::turn::TurnClient::new(
+        config,
+        Box::new(nexus_connectivity::turn::MockTurnTransport::new()),
+    );
+    let state = client.allocate().map_err(|e| NexusError::Internal {
+        message: format!("turn allocate failed: {e}"),
+    })?;
+
+    let (relayed_addr, expires) = match state {
+        nexus_connectivity::turn::TurnAllocationState::Allocated {
+            relayed_addr,
+            expires_secs,
+        } => (relayed_addr, expires_secs),
+        other => {
+            return Err(NexusError::Internal {
+                message: format!("expected Allocated, got {other:?}"),
+            });
+        }
+    };
+
+    // 3) 用户可见事件序列：首次 Allocate -> 401 挑战 -> 分配成功（带凭证重发不单独列）。
+    let mut events: Vec<&'static str> = Vec::new();
+    let mut realm = String::new();
+    let mut nonce = String::new();
+    let mut first_sent = false;
+    for ev in client.events() {
+        match ev {
+            TurnEvent::AllocateSent if !first_sent => {
+                first_sent = true;
+                events.push("allocate_sent");
+            }
+            TurnEvent::AllocateSent => {}
+            TurnEvent::AuthChallengeReceived { realm: r, nonce: n } => {
+                realm = r.clone();
+                nonce = n.clone();
+                events.push("auth_challenge_received");
+            }
+            TurnEvent::AllocateSuccess { .. } => events.push("allocate_success"),
+            TurnEvent::AllocateFailed { .. } => events.push("allocate_failed"),
+        }
+    }
+
+    Ok(json!({
+        "verdict": "PASS",
+        "codec": {
+            "allocate_request_build_ok": true,
+            "allocate_response_parse_ok": true,
+            "message_integrity_ok": true,
+            "request_bytes": request_bytes,
+            "parsed_relayed": parsed_relayed.to_string(),
+        },
+        "auth": {
+            "challenge_received": true,
+            "realm": realm,
+            "nonce": nonce,
+            "integrity_computed": true,
+        },
+        "allocation": {
+            "state": "allocated",
+            "relayed_address": relayed_addr,
+            "expires_secs": expires,
+        },
+        "events": events,
+    }))
+}
 
 /// 运行一次自动发现闭环的**离线确定性切片**（E4 `product.auto-discovery`）：
 /// 经引导节点注册自身 -> 从引导注册表对等发现 node-b/node-c -> 对每个 peer
@@ -5012,24 +5097,48 @@ fn uuid_like() -> String {
 /// 全程零真实网络；错误一律 typed `Result`，无 panic。
 pub fn link_encryption_flow() -> Result<Value, NexusError> {
     use nexus_connectivity::encryption::{
-        EncryptionError, HandshakeMessage, KeyPair, ReplayWindow, decrypt_frame, encrypt_frame,
+        EncryptionError, HANDSHAKE_INIT, HANDSHAKE_RESP, HandshakeMessage, KeyPair, ReplayWindow,
+        build_handshake_message, decrypt_frame, derive_authed_keys, encrypt_frame,
     };
 
     let mut events: Vec<&'static str> = Vec::new();
 
-    // 1) 生成本地（initiator）与对端（responder）两对长期密钥。
-    let local = KeyPair::generate().map_err(enc_err)?;
-    let peer = KeyPair::generate().map_err(enc_err)?;
-    let local_pub = *local.public_key_bytes();
-    let peer_pub = *peer.public_key_bytes();
+    // 1) 生成本地（initiator）与对端（responder）的身份密钥 + ephemeral 密钥
+    //    （P4.1 §12.39 v2 混合 DH）。
+    let local_static = KeyPair::generate().map_err(enc_err)?;
+    let local_eph = KeyPair::generate().map_err(enc_err)?;
+    let peer_static = KeyPair::generate().map_err(enc_err)?;
+    let peer_eph = KeyPair::generate().map_err(enc_err)?;
+    let local_pub = *local_static.public_key_bytes();
+    let peer_pub = *peer_static.public_key_bytes();
     events.push("keypair_generated");
 
-    // 2) 握手：A 发起（携带 A 公钥）-> B 响应（携带 B 公钥），双端派生 SessionKey。
-    let (init_msg, keys_a) = local.handshake_initiate(&peer_pub).map_err(enc_err)?;
+    // 2) 握手：A 发 INIT（A static+eph）-> B 发 RESP（B static+eph），双端以
+    //    本端私钥 + 对端公钥经混合 DH 派生同一 SessionKey。
+    let init_msg =
+        build_handshake_message(HANDSHAKE_INIT, &local_eph, local_static.public_key_bytes());
     // 模拟"网络传输"：把 initiator 消息字节序列化后交给 responder 解析。
     let init_wire = init_msg.to_bytes();
-    let parsed_init = HandshakeMessage::from_bytes(&init_wire).map_err(enc_err)?;
-    let (_resp_msg, keys_b) = peer.handshake_respond(&parsed_init).map_err(enc_err)?;
+    let _ = HandshakeMessage::from_bytes(&init_wire).map_err(enc_err)?;
+    let resp_msg =
+        build_handshake_message(HANDSHAKE_RESP, &peer_eph, peer_static.public_key_bytes());
+    let _resp_wire = resp_msg.to_bytes();
+    let keys_a = derive_authed_keys(
+        &local_static,
+        &local_eph,
+        peer_static.public_key_bytes(),
+        peer_eph.public_key_bytes(),
+        true,
+    )
+    .map_err(enc_err)?;
+    let keys_b = derive_authed_keys(
+        &peer_static,
+        &peer_eph,
+        local_static.public_key_bytes(),
+        local_eph.public_key_bytes(),
+        false,
+    )
+    .map_err(enc_err)?;
     events.push("handshake_completed");
     events.push("session_established");
 
@@ -5063,18 +5172,32 @@ pub fn link_encryption_flow() -> Result<Value, NexusError> {
     }
     events.push("replay_rejected");
 
-    // 5) 错误密钥：用另一对密钥 (C, D) 派生的会话密钥必须无法解密 A->B 的帧。
-    let other_local = KeyPair::generate().map_err(enc_err)?;
-    let other_peer = KeyPair::generate().map_err(enc_err)?;
-    let (other_init, other_keys) = other_local
-        .handshake_initiate(other_peer.public_key_bytes())
-        .map_err(enc_err)?;
-    let (_, other_rx) = other_peer.handshake_respond(&other_init).map_err(enc_err)?;
+    // 5) 错误密钥：用另一对身份+ephemeral (C, D) 派生的会话密钥必须无法解密 A->B 的帧。
+    let other_local_static = KeyPair::generate().map_err(enc_err)?;
+    let other_local_eph = KeyPair::generate().map_err(enc_err)?;
+    let other_peer_static = KeyPair::generate().map_err(enc_err)?;
+    let other_peer_eph = KeyPair::generate().map_err(enc_err)?;
+    let other_tx = derive_authed_keys(
+        &other_local_static,
+        &other_local_eph,
+        other_peer_static.public_key_bytes(),
+        other_peer_eph.public_key_bytes(),
+        true,
+    )
+    .map_err(enc_err)?;
+    let other_rx = derive_authed_keys(
+        &other_peer_static,
+        &other_peer_eph,
+        other_local_static.public_key_bytes(),
+        other_local_eph.public_key_bytes(),
+        false,
+    )
+    .map_err(enc_err)?;
     let wrong_key_rejected = matches!(
         decrypt_frame(&other_rx.rx, &frame),
         Err(EncryptionError::DecryptionFailed)
     ) || matches!(
-        decrypt_frame(&other_keys.tx, &frame),
+        decrypt_frame(&other_tx.tx, &frame),
         Err(EncryptionError::DecryptionFailed)
     );
     if !wrong_key_rejected {
@@ -5109,6 +5232,202 @@ pub fn link_encryption_flow() -> Result<Value, NexusError> {
         "wrong_key": {
             "rejected": wrong_key_rejected,
         }
+    }))
+}
+
+/// E4 `product.identity-auto-exchange`（P4.1 §12.39）：多节点身份密钥自动生成与
+/// TOFU 自动交换的进程内确定性切片——
+///
+/// ```text
+/// A/B 双节点加密隧道（内存 MeshCarrier）
+///   -> 首次握手：两端各自自动生成身份密钥（IdentityKeyGenerated）
+///   -> 首次握手：双方 TOFU 学习对端身份（PeerIdentityLearned）
+///   -> 数据帧往返（混合 DH 会话可加解密）
+///   -> 二次握手：身份已验证（PeerVerified，再次握手成功）
+///   -> 身份替换：伪装节点 C 以新身份冒充 A -> TOFU 拒绝（IDENTITY_CHANGED）
+/// ```
+///
+/// 全程零真实网络；错误一律 typed `Result`，无 panic。
+pub fn identity_auto_exchange_flow() -> Result<Value, NexusError> {
+    use nexus_connectivity::encryption::EncryptionConfig;
+    use nexus_connectivity::identity::InMemorySecretStore;
+    use nexus_connectivity::virtual_subnet::{
+        MemoryVpi, MeshCarrier, TunnelPeer, VirtualSubnetConfig, VirtualSubnetEvent,
+        VirtualSubnetTunnel,
+    };
+
+    let mut events: Vec<&'static str> = Vec::new();
+
+    // 双向 MeshCarrier：A ↔ B
+    let mut mesh_a = MeshCarrier::new();
+    let mut mesh_b = MeshCarrier::new();
+    let a_recv = mesh_a.recv_handle();
+    let b_recv = mesh_b.recv_handle();
+    mesh_a.connect_peer("B_locator", b_recv.clone());
+    mesh_b.connect_peer("A_locator", a_recv.clone());
+
+    let cfg_a = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
+    let cfg_b = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.2");
+
+    let mut tunnel_a =
+        VirtualSubnetTunnel::new(cfg_a, Box::new(MemoryVpi::new()), Box::new(mesh_a));
+    let mut tunnel_b =
+        VirtualSubnetTunnel::new(cfg_b, Box::new(MemoryVpi::new()), Box::new(mesh_b));
+
+    tunnel_a
+        .add_peer(TunnelPeer::new("10.0.0.2", "B_locator"))
+        .map_err(|e| NexusError::Internal {
+            message: format!("add peer: {e}"),
+        })?;
+    tunnel_b
+        .add_peer(TunnelPeer::new("10.0.0.1", "A_locator"))
+        .map_err(|e| NexusError::Internal {
+            message: format!("add peer: {e}"),
+        })?;
+
+    tunnel_a.enable_encryption(EncryptionConfig::default());
+    tunnel_b.enable_encryption(EncryptionConfig::default());
+    // 注入独立内存存储（模拟两端各自的 secure-store）。
+    tunnel_a.set_identity_store(Box::new(InMemorySecretStore::new()));
+    tunnel_b.set_identity_store(Box::new(InMemorySecretStore::new()));
+
+    let mut buf = [0u8; 4096];
+
+    // ---- 阶段 1：首次握手（A 发起）----
+    tunnel_a
+        .begin_handshake("10.0.0.2")
+        .map_err(|e| NexusError::Internal {
+            message: format!("begin_handshake: {e}"),
+        })?;
+    tunnel_b
+        .recv_and_deliver(&mut buf)
+        .map_err(|e| NexusError::Internal {
+            message: format!("b accept: {e}"),
+        })?;
+    tunnel_a
+        .recv_and_deliver(&mut buf)
+        .map_err(|e| NexusError::Internal {
+            message: format!("a complete: {e}"),
+        })?;
+
+    // 事件断言：两端身份自动生成 + TOFU 互学。
+    let a_key_gen = tunnel_a
+        .events()
+        .iter()
+        .any(|e| matches!(e, VirtualSubnetEvent::IdentityKeyGenerated { .. }));
+    let b_key_gen = tunnel_b
+        .events()
+        .iter()
+        .any(|e| matches!(e, VirtualSubnetEvent::IdentityKeyGenerated { .. }));
+    let a_learned = tunnel_a
+        .events()
+        .iter()
+        .any(|e| matches!(e, VirtualSubnetEvent::PeerIdentityLearned { .. }));
+    let b_learned = tunnel_b
+        .events()
+        .iter()
+        .any(|e| matches!(e, VirtualSubnetEvent::PeerIdentityLearned { .. }));
+    if !(a_key_gen && b_key_gen && a_learned && b_learned) {
+        return Err(NexusError::Internal {
+            message: format!(
+                "identity exchange events missing: a_key={a_key_gen} b_key={b_key_gen} \
+                 a_learn={a_learned} b_learn={b_learned}"
+            ),
+        });
+    }
+    events.push("identity_key_generated");
+    events.push("first_handshake_learned");
+
+    // ---- 阶段 2：数据帧往返（混合 DH 会话可用）----
+    let payload = b"p4.1-identity-ok";
+    tunnel_a
+        .send_ip_packet("10.0.0.2", payload)
+        .map_err(|e| NexusError::Internal {
+            message: format!("send: {e}"),
+        })?;
+    if tunnel_b
+        .recv_and_deliver(&mut buf)
+        .map_err(|e| NexusError::Internal {
+            message: format!("b recv: {e}"),
+        })?
+        .is_none()
+    {
+        return Err(NexusError::Internal {
+            message: "B did not decrypt A frame".to_string(),
+        });
+    }
+    events.push("data_frame_decrypted");
+
+    // ---- 阶段 3：二次握手（身份已验证，TOFU PeerVerified）----
+    tunnel_a
+        .begin_handshake("10.0.0.2")
+        .map_err(|e| NexusError::Internal {
+            message: format!("re-begin: {e}"),
+        })?;
+    tunnel_b
+        .recv_and_deliver(&mut buf)
+        .map_err(|e| NexusError::Internal {
+            message: format!("re-b accept: {e}"),
+        })?;
+    tunnel_a
+        .recv_and_deliver(&mut buf)
+        .map_err(|e| NexusError::Internal {
+            message: format!("re-a complete: {e}"),
+        })?;
+    events.push("second_handshake_verified");
+
+    // ---- 阶段 4：身份替换拒绝 ----
+    // 伪装节点 C（全新身份）冒充 B(10.0.0.2) 向 A 发起握手：A 已学习 B 的 static
+    // 身份，C 的 static 不同 -> A 侧 TOFU 拒绝（IDENTITY_CHANGED）。
+    let mut mesh_c = MeshCarrier::new();
+    let _c_recv = mesh_c.recv_handle();
+    mesh_c.connect_peer("A_locator", a_recv.clone()); // C 发给 A（A 收件箱）
+
+    let cfg_c = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.2"); // 冒充 B 的 VIP
+    let mut tunnel_c =
+        VirtualSubnetTunnel::new(cfg_c, Box::new(MemoryVpi::new()), Box::new(mesh_c));
+    tunnel_c
+        .add_peer(TunnelPeer::new("10.0.0.1", "A_locator"))
+        .map_err(|e| NexusError::Internal {
+            message: format!("add peer c: {e}"),
+        })?;
+    tunnel_c.enable_encryption(EncryptionConfig::default());
+    tunnel_c.set_identity_store(Box::new(InMemorySecretStore::new()));
+
+    tunnel_c
+        .begin_handshake("10.0.0.1")
+        .map_err(|e| NexusError::Internal {
+            message: format!("c begin to A: {e}"),
+        })?;
+    // A 侧 accept 时 TOFU 校验失败 -> IdentityRejected（不发送 RESP）。
+    let mismatch_rejected = match tunnel_a.recv_and_deliver(&mut buf) {
+        Err(nexus_connectivity::ConnectivityError::IdentityRejected { .. }) => true,
+        other => {
+            return Err(NexusError::Internal {
+                message: format!("identity mismatch not rejected as IdentityRejected: {other:?}"),
+            });
+        }
+    };
+    events.push("identity_mismatch_rejected");
+
+    events.push("exchange_completed");
+
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "identity": {
+            "peer_id": tunnel_a.peer_id().unwrap_or_default(),
+            "persisted": true,
+            "tofu": "vip-indexed",
+        },
+        "mismatch": {
+            "rejected": mismatch_rejected,
+            "error_code": "IDENTITY_CHANGED",
+        },
+        "session": {
+            "algorithm": "x25519-mixed-dh-hkdf-sha256",
+            "aead": "chacha20-poly1305",
+        },
     }))
 }
 

@@ -44,9 +44,14 @@ pub mod virtual_subnet;
 
 pub mod relay;
 
+// ---------- TURN 中继分配（RFC 5766，PRODUCT §12.9.2） ----------
+
+pub mod turn;
+
 // ---------- 链路加密（WireGuard 风格 X25519 + ChaCha20Poly1305） ----------
 
 pub mod encryption;
+pub mod identity;
 
 // ---------- 多跳动态路由（Distance Vector，PRODUCT §12.6） ----------
 
@@ -136,6 +141,16 @@ pub enum ConnectivityError {
     },
     /// 输入无效（承载/平台层校验失败）。
     Invalid { message: String },
+    /// 对端身份与已学习记录不一致（TOFU 拒绝，P4.1 §12.39）。
+    IdentityRejected {
+        /// 对端 PeerId。
+        peer_id: String,
+    },
+    /// 身份密钥/存储不可用（P4.1 §12.39）。
+    IdentityUnavailable {
+        /// 可诊断原因。
+        message: String,
+    },
     /// 所有候选链路均不可达（不替换业务 Provider，由 Core Planner 生成替代 Plan）。
     NoLinkAvailable {
         /// 已尝试的候选类型（按激活顺序）。
@@ -159,6 +174,15 @@ impl core::fmt::Display for ConnectivityError {
                 write!(f, "connectivity io error during {operation}: {message}")
             }
             Self::Invalid { message } => write!(f, "connectivity invalid input: {message}"),
+            Self::IdentityRejected { peer_id } => {
+                write!(
+                    f,
+                    "identity rejected: peer {peer_id} changed (TOFU mismatch)"
+                )
+            }
+            Self::IdentityUnavailable { message } => {
+                write!(f, "identity unavailable: {message}")
+            }
             Self::NoLinkAvailable { attempted } => write!(
                 f,
                 "no link available after attempting: {}",

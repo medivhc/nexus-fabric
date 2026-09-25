@@ -27,8 +27,10 @@ use std::sync::Arc;
 use crate::ConnectivityError;
 use crate::encryption::{
     DirectionalKeys, EncryptionConfig, EncryptionError, HANDSHAKE_INIT, HANDSHAKE_RESP,
-    HandshakeMessage, KeyPair, ReplayWindow, decrypt_frame, encrypt_frame,
+    HandshakeMessage, KeyPair, ReplayWindow, build_handshake_message, decrypt_frame,
+    derive_authed_keys, encrypt_frame,
 };
+use crate::identity::{IdentityAction, IdentityManager, InMemorySecretStore, SecretStore};
 
 /// 铏氭嫙瀛愮綉閰嶇疆銆?
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +75,14 @@ struct PeerCryptoSession {
     tx_seq: u64,
     /// 本端接收防重放窗口。
     rx_replay: ReplayWindow,
+}
+
+/// 进行中的握手（发起方视角，P4.1 §12.39）：本端 ephemeral + static 身份。
+struct PendingHandshake {
+    /// 本端 ephemeral 密钥对（会话材料，每握手全新）。
+    eph: KeyPair,
+    /// 本端 static 身份密钥（长期，参与混合 DH 与 TOFU 校验）。
+    static_key: KeyPair,
 }
 
 /// 闅ч亾 Peer 閰嶇疆銆?
@@ -227,6 +237,27 @@ pub enum VirtualSubnetEvent {
         /// 本地递送字节数。
         bytes: u64,
     },
+    /// 本端身份密钥自动生成并持久化（P4.1 §12.39）。
+    IdentityKeyGenerated {
+        /// 隧道 ID。
+        tunnel_id: String,
+        /// 本端 PeerId。
+        peer_id: String,
+    },
+    /// 首次握手 TOFU 学习对端身份（P4.1 §12.39）。
+    PeerIdentityLearned {
+        /// 隧道 ID。
+        tunnel_id: String,
+        /// 对端 PeerId。
+        peer_id: String,
+    },
+    /// 对端身份不匹配被拒绝（TOFU mismatch，P4.1 §12.39）。
+    PeerIdentityRejected {
+        /// 隧道 ID。
+        tunnel_id: String,
+        /// 对端 PeerId。
+        peer_id: String,
+    },
 }
 
 /// 闅ч亾甯уご锛圥0 绠€鍖栵細绾枃鏈爣璁帮級銆?
@@ -298,8 +329,10 @@ pub struct VirtualSubnetTunnel {
     encryption: Option<EncryptionConfig>,
     /// 加密会话表（§12.6）：对端虚拟 IP -> 会话。
     crypto_sessions: HashMap<String, PeerCryptoSession>,
-    /// 握手进行中（发起方视角）：对端虚拟 IP -> 待消费本端密钥。
-    pending_handshakes: HashMap<String, KeyPair>,
+    /// 握手进行中（发起方视角，P4.1 §12.39）：对端虚拟 IP -> 本端 eph+static。
+    pending_handshakes: HashMap<String, PendingHandshake>,
+    /// 节点身份管理器（P4.1 §12.39）：本端长期身份 + 对端 TOFU 表。
+    identity: IdentityManager,
 }
 
 impl VirtualSubnetTunnel {
@@ -328,7 +361,31 @@ impl VirtualSubnetTunnel {
             encryption: None,
             crypto_sessions: HashMap::new(),
             pending_handshakes: HashMap::new(),
+            identity: IdentityManager::new(Box::new(InMemorySecretStore::new())),
         }
+    }
+
+    /// 注入持久化身份存储（平台 secure-store；默认进程内内存存储）。
+    pub fn set_identity_store(&mut self, store: Box<dyn SecretStore>) {
+        self.identity = IdentityManager::new(store);
+    }
+
+    /// 确保本端身份已加载（首次自动生成并持久化，事件 IdentityKeyGenerated）。
+    fn ensure_identity(&mut self) -> Result<(), ConnectivityError> {
+        if self.identity.identity().is_none() {
+            let generated = self.identity.load_or_generate().map_err(|e| {
+                ConnectivityError::IdentityUnavailable {
+                    message: e.to_string(),
+                }
+            })?;
+            if generated {
+                self.events.push(VirtualSubnetEvent::IdentityKeyGenerated {
+                    tunnel_id: self.tunnel_id.clone(),
+                    peer_id: self.identity.peer_id().unwrap_or_default(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// 娉ㄥ唽闈欐€佽矾鐢憋紙P1 搂12.5锛夈€俷ext_hop 蹇呴』鏄凡娉ㄥ唽 peer銆?
@@ -461,6 +518,7 @@ impl VirtualSubnetTunnel {
                 message: "encryption not enabled".to_string(),
             });
         }
+        self.ensure_identity()?;
         let (_peer_id, locator, _state, _stats) =
             self.peers
                 .get(peer_virtual_ip)
@@ -468,11 +526,9 @@ impl VirtualSubnetTunnel {
                     message: format!("PEER_NOT_FOUND: {peer_virtual_ip}"),
                 })?;
         let locator = locator.clone();
-        let keypair = KeyPair::generate().map_err(encryption_err)?;
-        let msg = HandshakeMessage {
-            msg_type: HANDSHAKE_INIT,
-            public_key: *keypair.public_key_bytes(),
-        };
+        let eph = KeyPair::generate().map_err(encryption_err)?;
+        let static_key = self.identity.identity().unwrap().clone();
+        let msg = build_handshake_message(HANDSHAKE_INIT, &eph, static_key.public_key_bytes());
         let wire = handshake_wire(&self.config.virtual_ip, &msg);
         self.carrier
             .send_to(&locator, &wire)
@@ -480,8 +536,10 @@ impl VirtualSubnetTunnel {
                 operation: "handshake_send".to_string(),
                 message: e.to_string(),
             })?;
-        self.pending_handshakes
-            .insert(peer_virtual_ip.to_string(), keypair);
+        self.pending_handshakes.insert(
+            peer_virtual_ip.to_string(),
+            PendingHandshake { eph, static_key },
+        );
         self.set_peer_state(peer_virtual_ip, TunnelState::Handshaking);
         Ok(())
     }
@@ -502,6 +560,7 @@ impl VirtualSubnetTunnel {
                 message: "encryption not enabled".to_string(),
             });
         }
+        self.ensure_identity()?;
         let (_peer_id, locator, _state, _stats) =
             self.peers
                 .get(peer_virtual_ip)
@@ -509,8 +568,31 @@ impl VirtualSubnetTunnel {
                     message: format!("PEER_NOT_FOUND: {peer_virtual_ip}"),
                 })?;
         let locator = locator.clone();
-        let keypair = KeyPair::generate().map_err(encryption_err)?;
-        let (resp, keys) = keypair.handshake_respond(msg).map_err(encryption_err)?;
+        // TOFU：校验发起方身份（首次学习 / 已一致 / 不匹配拒绝）。
+        let peer_id = IdentityManager::peer_id_of(&msg.static_public);
+        let action = self
+            .identity
+            .verify_peer(peer_virtual_ip, &msg.static_public)
+            .map_err(|_| ConnectivityError::IdentityRejected {
+                peer_id: peer_id.clone(),
+            })?;
+        if action == IdentityAction::PeerLearned {
+            self.events.push(VirtualSubnetEvent::PeerIdentityLearned {
+                tunnel_id: self.tunnel_id.clone(),
+                peer_id: peer_id.clone(),
+            });
+        }
+        let eph = KeyPair::generate().map_err(encryption_err)?;
+        let static_key = self.identity.identity().unwrap().clone();
+        let keys = derive_authed_keys(
+            &static_key,
+            &eph,
+            &msg.static_public,
+            &msg.public_key,
+            false,
+        )
+        .map_err(encryption_err)?;
+        let resp = build_handshake_message(HANDSHAKE_RESP, &eph, static_key.public_key_bytes());
         let wire = handshake_wire(&self.config.virtual_ip, &resp);
         self.carrier
             .send_to(&locator, &wire)
@@ -541,15 +623,34 @@ impl VirtualSubnetTunnel {
         peer_virtual_ip: &str,
         resp: &HandshakeMessage,
     ) -> Result<(), ConnectivityError> {
-        let keypair = self
+        let pending = self
             .pending_handshakes
             .remove(peer_virtual_ip)
             .ok_or_else(|| ConnectivityError::Invalid {
                 message: format!("HANDSHAKE_IN_PROGRESS: no pending init for {peer_virtual_ip}"),
             })?;
-        let keys = keypair
-            .derive_directional(&resp.public_key, true)
-            .map_err(encryption_err)?;
+        // TOFU：校验响应方身份（首次学习 / 已一致 / 不匹配拒绝）。
+        let peer_id = IdentityManager::peer_id_of(&resp.static_public);
+        let action = self
+            .identity
+            .verify_peer(peer_virtual_ip, &resp.static_public)
+            .map_err(|_| ConnectivityError::IdentityRejected {
+                peer_id: peer_id.clone(),
+            })?;
+        if action == IdentityAction::PeerLearned {
+            self.events.push(VirtualSubnetEvent::PeerIdentityLearned {
+                tunnel_id: self.tunnel_id.clone(),
+                peer_id: peer_id.clone(),
+            });
+        }
+        let keys = derive_authed_keys(
+            &pending.static_key,
+            &pending.eph,
+            &resp.static_public,
+            &resp.public_key,
+            true,
+        )
+        .map_err(encryption_err)?;
         self.crypto_sessions.insert(
             peer_virtual_ip.to_string(),
             PeerCryptoSession {
@@ -978,6 +1079,11 @@ impl VirtualSubnetTunnel {
     }
 
     /// 鑾峰彇浜嬩欢娴侊紙鐢ㄤ簬鍙娴嬫€у拰閲嶆斁锛夈€?
+    /// 本端 PeerId（P4.1 §12.39，身份自动生成后可用）。
+    pub fn peer_id(&self) -> Option<String> {
+        self.identity.peer_id()
+    }
+
     #[must_use]
     pub fn events(&self) -> &[VirtualSubnetEvent] {
         &self.events
@@ -989,7 +1095,7 @@ impl VirtualSubnetTunnel {
 /// 明文仅含公开公钥与类型，无机密；数据帧（密文 ≥40B）不会以 `hs:` 开头。
 #[must_use]
 fn handshake_wire(peer_virtual_ip: &str, msg: &HandshakeMessage) -> Vec<u8> {
-    let mut out = Vec::with_capacity(3 + peer_virtual_ip.len() + 1 + 33);
+    let mut out = Vec::with_capacity(3 + peer_virtual_ip.len() + 1 + 65);
     out.extend_from_slice(b"hs:");
     out.extend_from_slice(peer_virtual_ip.as_bytes());
     out.push(b':');

@@ -1,15 +1,19 @@
-//! 链路加密（WireGuard 风格）：节点长期 X25519 密钥对 -> 握手派生会话密钥 ->
-//! ChaCha20Poly1305 AEAD 数据帧 -> 滑动窗口防重放。
+//! 链路加密（WireGuard 风格）：节点长期 X25519 身份密钥 + ephemeral 会话密钥 ->
+//! 混合 DH 握手派生会话密钥 -> ChaCha20Poly1305 AEAD 数据帧 -> 滑动窗口防重放。
 //!
 //! 本模块保持 portable、零真实网络：所有"传输"都是内存字节切片交换。
 //! 真实线上建连、握手重传与密钥周期轮换留 TODO（见 PRODUCT.md §6 链路加密）。
 //!
-//! 加密基元统一使用 `ring 0.17`（已在 workspace 依赖树中）：
-//! - X25519 ECDH：`ring::agreement::{X25519, EphemeralPrivateKey, agree_ephemeral}`；
+//! 加密基元：
+//! - X25519 密钥与 DH：`x25519-dalek`（可序列化身份密钥，P4.1 §12.39）；
 //! - KDF：`ring::hkdf::HKDF_SHA256`；
 //! - AEAD：`ring::aead::{CHACHA20_POLY1305, LessSafeKey, Nonce}`。
 //!
-//! 帧布局（wire）：
+//! 握手（v2，P4.1 §12.39）：INIT/RESP 各携带 ephemeral + static 公钥（65B），
+//! 会话 = WireGuard 式混合 DH（dh1=DH(static,eph_peer) ∥ dh2=DH(eph,static_peer)
+//! ∥ dh3=DH(eph,eph_peer)）-> HKDF -> 方向子密钥，同时提供身份认证与前向保密。
+//!
+//! 帧布局（wire，数据帧与 §12.7 一致）：
 //!
 //! ```text
 //! [0]     version  (u8, 当前 = 1)
@@ -22,7 +26,7 @@
 //!
 //! 安全不变量：
 //! - 握手成功前不允许发送任何业务帧；
-//! - 会话密钥每次握手重新派生，不复用长期私钥；
+//! - 会话密钥每次握手重新派生（ephemeral 不复用）；
 //! - 帧头（version|type|seq|nonce，共 22 字节）作为 AEAD AAD 一并认证，
 //!   攻击者篡改 seq/version/type 都会导致 tag 校验失败；
 //! - 双向独立子密钥：initiator 与 responder 各自的发送/接收密钥不同，
@@ -31,10 +35,10 @@
 
 #![forbid(unsafe_code)]
 
+use rand::rngs::OsRng;
 use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
-use ring::agreement::{EphemeralPrivateKey, UnparsedPublicKey, X25519, agree_ephemeral};
 use ring::hkdf;
-use ring::rand::SystemRandom;
+use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 
 /// 当前 wire 版本字节。
 pub const WIRE_VERSION: u8 = 1;
@@ -114,43 +118,64 @@ impl std::error::Error for EncryptionError {}
 // 密钥对
 // ---------------------------------------------------------------------------
 
-/// 节点长期 X25519 密钥对。
+/// 节点长期 X25519 密钥对（身份密钥，P4.1 §12.39）。
 ///
-/// 私钥材料保存在 `ring::agreement::EphemeralPrivateKey` 内部，不对外暴露字节
-/// （ring 0.17 不公开私钥序列化）；公钥可安全导出，用于握手交换。
-///
-/// 注意：握手会消费私钥（`agree_ephemeral` move 语义），因此一个 `KeyPair`
-/// 只能参与一次握手；长期身份持久化 / 私钥序列化留 TODO。
+/// 私钥以 32 字节种子保存在 `x25519_dalek::StaticSecret` 内，可通过
+/// [`Self::to_seed`] / [`Self::from_seed`] 序列化持久化（secure-store），
+/// 支撑长期身份与自动密钥交换；`generate` 仅生成临时（ephemeral）会话密钥。
+#[derive(Clone)]
 pub struct KeyPair {
-    private: EphemeralPrivateKey,
+    private: StaticSecret,
     public: [u8; PUBLIC_KEY_LEN],
+}
+
+impl core::fmt::Debug for KeyPair {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // 不打印私钥材料（dalek StaticSecret 不实现 Debug，防意外泄露）。
+        f.debug_struct("KeyPair")
+            .field("public", &self.public)
+            .finish_non_exhaustive()
+    }
 }
 
 impl KeyPair {
     /// 使用系统 CSPRNG 生成新的 X25519 密钥对。
     pub fn generate() -> Result<Self, EncryptionError> {
-        let rng = SystemRandom::new();
-        let private = EphemeralPrivateKey::generate(&X25519, &rng)
-            .map_err(|_| EncryptionError::HandshakeFailed)?;
-        let public = private
-            .compute_public_key()
-            .map_err(|_| EncryptionError::HandshakeFailed)?;
-        let mut bytes = [0u8; PUBLIC_KEY_LEN];
-        let raw = public.as_ref();
-        if raw.len() != PUBLIC_KEY_LEN {
-            return Err(EncryptionError::InvalidKey);
-        }
-        bytes.copy_from_slice(raw);
-        Ok(Self {
-            private,
-            public: bytes,
-        })
+        let private = StaticSecret::random_from_rng(OsRng);
+        Ok(Self::from_secret(private))
+    }
+
+    /// 从 32 字节种子恢复身份密钥对（持久化加载，P4.1 §12.39）。
+    #[must_use]
+    pub fn from_seed(seed: &[u8; PUBLIC_KEY_LEN]) -> Self {
+        Self::from_secret(StaticSecret::from(*seed))
+    }
+
+    /// 导出私钥种子（32 字节），用于 secure-store 加密持久化。
+    #[must_use]
+    pub fn to_seed(&self) -> [u8; PUBLIC_KEY_LEN] {
+        self.private.to_bytes()
+    }
+
+    /// 由 StaticSecret 构造 KeyPair 并计算公钥。
+    fn from_secret(private: StaticSecret) -> Self {
+        let public = *XPublicKey::from(&private).as_bytes();
+        Self { private, public }
     }
 
     /// 公钥字节（X25519 编码，32 字节），可安全发送给对端。
     #[must_use]
     pub fn public_key_bytes(&self) -> &[u8; PUBLIC_KEY_LEN] {
         &self.public
+    }
+
+    /// X25519 ECDH：本端私钥 × 对端公钥（供混合 DH 使用）。
+    fn diffie_hellman(&self, peer_public: &[u8; PUBLIC_KEY_LEN]) -> [u8; PUBLIC_KEY_LEN] {
+        let peer = XPublicKey::from(*peer_public);
+        let shared = self.private.diffie_hellman(&peer);
+        let mut out = [0u8; PUBLIC_KEY_LEN];
+        out.copy_from_slice(shared.as_bytes());
+        out
     }
 }
 
@@ -244,17 +269,20 @@ fn hkdf_expand_key(
 // 握手
 // ---------------------------------------------------------------------------
 
-/// 握手消息：自包含固定字节布局（type + 32 字节对端公钥）。
+/// 握手消息（v2，P4.1 §12.39）：自包含固定字节布局
+/// `type + ephemeral 公钥(32B) + static 身份公钥(32B)`，共 65 字节。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandshakeMessage {
     /// 消息类型：`HANDSHAKE_INIT` 或 `HANDSHAKE_RESP`。
     pub msg_type: u8,
-    /// 发送方公钥。
+    /// 发送方 ephemeral 公钥（会话密钥材料，每握手全新）。
     pub public_key: [u8; PUBLIC_KEY_LEN],
+    /// 发送方 static 身份公钥（长期身份，用于认证与自动交换）。
+    pub static_public: [u8; PUBLIC_KEY_LEN],
 }
 
 impl HandshakeMessage {
-    const WIRE_LEN: usize = 1 /* type */ + PUBLIC_KEY_LEN;
+    const WIRE_LEN: usize = 1 /* type */ + PUBLIC_KEY_LEN + PUBLIC_KEY_LEN;
 
     /// 序列化为固定字节布局（不带 version 前缀，由承载层自行分帧）。
     #[must_use]
@@ -262,6 +290,7 @@ impl HandshakeMessage {
         let mut out = Vec::with_capacity(Self::WIRE_LEN);
         out.push(self.msg_type);
         out.extend_from_slice(&self.public_key);
+        out.extend_from_slice(&self.static_public);
         out
     }
 
@@ -276,30 +305,57 @@ impl HandshakeMessage {
         }
         let mut public_key = [0u8; PUBLIC_KEY_LEN];
         public_key.copy_from_slice(&bytes[1..1 + PUBLIC_KEY_LEN]);
+        let mut static_public = [0u8; PUBLIC_KEY_LEN];
+        static_public.copy_from_slice(&bytes[1 + PUBLIC_KEY_LEN..1 + 2 * PUBLIC_KEY_LEN]);
         Ok(Self {
             msg_type,
             public_key,
+            static_public,
         })
     }
 }
 
-/// 从 X25519 ECDH 共享密钥 + 双方公钥派生握手 base 材料（32 字节）。
+/// WireGuard 式混合 DH 派生握手 base 材料（P4.1 §12.39，替代 v1 单 ECDH）。
 ///
-/// HKDF info 按字典序拼接两个公钥，与谁先发起无关，保证两端 base 一致。
-fn derive_base(
-    local_private: EphemeralPrivateKey,
-    local_pub: &[u8; PUBLIC_KEY_LEN],
-    remote_pub: &[u8; PUBLIC_KEY_LEN],
+/// 三个 X25519 ECDH 拼接后经 HKDF-SHA256（salt = `nexus-link-encryption-v2`）：
+/// - dh1 = DH(本端 static, 对端 ephemeral)：对端 ephemeral 被本端身份认证；
+/// - dh2 = DH(本端 ephemeral, 对端 static)：本端 ephemeral 被对端身份认证；
+/// - dh3 = DH(本端 ephemeral, 对端 ephemeral)：前向保密。
+///
+/// 双方各自以本端私钥计算，得到同一 base（X25519 DH 对称性）。
+fn derive_base_authed(
+    my_static: &KeyPair,
+    my_eph: &KeyPair,
+    peer_static: &[u8; PUBLIC_KEY_LEN],
+    peer_eph: &[u8; PUBLIC_KEY_LEN],
+    initiator: bool,
 ) -> Result<[u8; SESSION_KEY_LEN], EncryptionError> {
-    let peer = UnparsedPublicKey::new(&X25519, remote_pub.as_slice());
-    let shared = agree_ephemeral(local_private, &peer, |secret| secret.to_vec())
-        .map_err(|_| EncryptionError::HandshakeFailed)?;
+    // WireGuard 角色对称：dh1 恒为 DH(发起方 static, 响应方 eph)，dh2 恒为
+    // DH(发起方 eph, 响应方 static)，dh3 = DH(eph_i, eph_r)。
+    // initiator: dh1=DH(A.static,B.eph) dh2=DH(A.eph,B.static)
+    // responder: dh1=DH(B.eph,A.static) dh2=DH(B.static,A.eph) —— 与发起方同值。
+    let (dh1_static, dh1_eph) = if initiator {
+        (my_static, peer_eph)
+    } else {
+        (my_eph, peer_static)
+    };
+    let (dh2_static, dh2_eph) = if initiator {
+        (my_eph, peer_static)
+    } else {
+        (my_static, peer_eph)
+    };
+    let dh1 = dh1_static.diffie_hellman(dh1_eph);
+    let dh2 = dh2_static.diffie_hellman(dh2_eph);
+    let dh3 = my_eph.diffie_hellman(peer_eph);
+    let mut material = [0u8; 3 * PUBLIC_KEY_LEN];
+    material[0..PUBLIC_KEY_LEN].copy_from_slice(&dh1);
+    material[PUBLIC_KEY_LEN..2 * PUBLIC_KEY_LEN].copy_from_slice(&dh2);
+    material[2 * PUBLIC_KEY_LEN..3 * PUBLIC_KEY_LEN].copy_from_slice(&dh3);
 
-    let mut ordered = [local_pub.as_slice(), remote_pub.as_slice()];
+    let mut ordered = [my_static.public.as_slice(), peer_static.as_slice()];
     ordered.sort();
-
-    let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, b"nexus-link-encryption-v1");
-    let prk = salt.extract(&shared);
+    let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, b"nexus-link-encryption-v2");
+    let prk = salt.extract(&material);
     let okm = prk
         .expand(&ordered, hkdf::HKDF_SHA256)
         .map_err(|_| EncryptionError::HandshakeFailed)?;
@@ -309,55 +365,36 @@ fn derive_base(
     Ok(out)
 }
 
-impl KeyPair {
-    /// 发起握手：消费本端私钥，产出握手消息 + 双向会话密钥（initiator 视角）。
-    pub fn handshake_initiate(
-        self,
-        peer_public: &[u8; PUBLIC_KEY_LEN],
-    ) -> Result<(HandshakeMessage, DirectionalKeys), EncryptionError> {
-        let base = derive_base(self.private, &self.public, peer_public)?;
-        let keys = DirectionalKeys::split(&base, true)?;
-        let msg = HandshakeMessage {
-            msg_type: HANDSHAKE_INIT,
-            public_key: self.public,
-        };
-        Ok((msg, keys))
+/// 构造握手消息（INIT/RESP）：携带本端 ephemeral + static 身份公钥。
+///
+/// 仅构造消息，不做密钥派生——对端 ephemeral 在响应/完成阶段才可知，
+/// 混合 DH 由 [`derive_authed_keys`] 在拿到双方 ephemeral 后计算。
+#[must_use]
+pub fn build_handshake_message(
+    msg_type: u8,
+    eph: &KeyPair,
+    static_public: &[u8; PUBLIC_KEY_LEN],
+) -> HandshakeMessage {
+    HandshakeMessage {
+        msg_type,
+        public_key: *eph.public_key_bytes(),
+        static_public: *static_public,
     }
+}
 
-    /// 响应握手：消费本端私钥，产出响应消息 + 双向会话密钥（responder 视角）。
-    pub fn handshake_respond(
-        self,
-        initiator_message: &HandshakeMessage,
-    ) -> Result<(HandshakeMessage, DirectionalKeys), EncryptionError> {
-        if initiator_message.msg_type != HANDSHAKE_INIT {
-            return Err(EncryptionError::UnexpectedFrameType {
-                actual: initiator_message.msg_type,
-            });
-        }
-        let base = derive_base(self.private, &self.public, &initiator_message.public_key)?;
-        let keys = DirectionalKeys::split(&base, false)?;
-        let msg = HandshakeMessage {
-            msg_type: HANDSHAKE_RESP,
-            public_key: self.public,
-        };
-        Ok((msg, keys))
-    }
-
-    /// 分步握手（纯 ephemeral 双公钥）：本端已生成临时密钥对并发出自身公钥，
-    /// 收到对端公钥后完成密钥派生。
-    ///
-    /// `initiator=true` 取发起方视角（本端 `tx` 与对端 `rx` 相同）；`false` 取
-    /// 响应方视角。与 [`Self::handshake_respond`] 派生结果一致（同一 base +
-    /// 角色切分），用于对端公钥未知、需先交换公钥的场景（§12.6 虚拟子网
-    /// 加密接入）。
-    pub fn derive_directional(
-        self,
-        peer_public: &[u8; PUBLIC_KEY_LEN],
-        initiator: bool,
-    ) -> Result<DirectionalKeys, EncryptionError> {
-        let base = derive_base(self.private, &self.public, peer_public)?;
-        DirectionalKeys::split(&base, initiator)
-    }
+/// 混合 DH 派生双向会话密钥（P4.1 §12.39，对称计算，两端结果一致）。
+///
+/// `initiator=true` 取发起方视角（本端 `tx` 与对端 `rx` 相同）；`false` 取响应方
+/// 视角。双方传入各自私钥（static/eph）与对端公钥（static/eph）。
+pub fn derive_authed_keys(
+    my_static: &KeyPair,
+    my_eph: &KeyPair,
+    peer_static: &[u8; PUBLIC_KEY_LEN],
+    peer_eph: &[u8; PUBLIC_KEY_LEN],
+    initiator: bool,
+) -> Result<DirectionalKeys, EncryptionError> {
+    let base = derive_base_authed(my_static, my_eph, peer_static, peer_eph, initiator)?;
+    DirectionalKeys::split(&base, initiator)
 }
 
 // ---------------------------------------------------------------------------
@@ -591,38 +628,57 @@ impl Default for EncryptionConfig {
 mod tests {
     use super::*;
 
+    /// v2 时序辅助：发起方 a（static_a + eph_a）与响应方 b（static_b + eph_b）
+    /// 各自以本端私钥 + 对端公钥派生会话（与驱动层 begin/accept/complete 同序）。
+    fn authed_pair(
+        a_static: &KeyPair,
+        a_eph: &KeyPair,
+        b_static: &KeyPair,
+        b_eph: &KeyPair,
+    ) -> Result<(DirectionalKeys, DirectionalKeys), EncryptionError> {
+        let ka = derive_authed_keys(
+            a_static,
+            a_eph,
+            b_static.public_key_bytes(),
+            b_eph.public_key_bytes(),
+            true,
+        )?;
+        let kb = derive_authed_keys(
+            b_static,
+            b_eph,
+            a_static.public_key_bytes(),
+            a_eph.public_key_bytes(),
+            false,
+        )?;
+        Ok((ka, kb))
+    }
+
     #[test]
     fn stepped_handshake_matches_one_step() -> Result<(), EncryptionError> {
-        // 纯 ephemeral 分步握手（先交换公钥再派生）与既有一步握手派生一致。
-        let a = KeyPair::generate()?;
-        let b = KeyPair::generate()?;
-        // a 的 INIT 消息 = 自身公钥（不经 initiate，避免消费 a）。
-        let init_msg = HandshakeMessage {
-            msg_type: HANDSHAKE_INIT,
-            public_key: *a.public_key_bytes(),
-        };
-        let (resp_msg, kb) = b.handshake_respond(&init_msg)?;
-        // 分步：a 用 resp_msg 里的 b 公钥 + initiator 视角派生。
-        let ka = a.derive_directional(&resp_msg.public_key, true)?;
+        // v2 混合 DH：双方以同一 static 身份 + ephemeral 派生，密钥一致。
+        let a_static = KeyPair::generate()?;
+        let a_eph = KeyPair::generate()?;
+        let b_static = KeyPair::generate()?;
+        let b_eph = KeyPair::generate()?;
+        let (ka, kb) = authed_pair(&a_static, &a_eph, &b_static, &b_eph)?;
 
         assert_eq!(ka.tx.material(), kb.rx.material());
         assert_eq!(ka.rx.material(), kb.tx.material());
-        // 分步与一步走同一 base/切分逻辑：用 ka 发帧，kb 必须能解。
         let frame = encrypt_frame(&ka.tx, 5, b"stepped")?;
         let (seq, plain) = decrypt_frame(&kb.rx, &frame)?;
         assert_eq!(seq, 5);
         assert_eq!(&plain, b"stepped");
-        // 篡改后的帧用对端 rx 解不开（密钥正确性由 roundtrip 覆盖）。
         Ok(())
     }
 
     #[test]
     fn roundtrip_encrypt_decrypt() -> Result<(), EncryptionError> {
-        let a = KeyPair::generate()?;
-        let b = KeyPair::generate()?;
-        let (msg, ka) = a.handshake_initiate(b.public_key_bytes())?;
-        let (_, kb) = b.handshake_respond(&msg)?;
-
+        let (ka, kb) = authed_pair(
+            &KeyPair::generate()?,
+            &KeyPair::generate()?,
+            &KeyPair::generate()?,
+            &KeyPair::generate()?,
+        )?;
         let frame = encrypt_frame(&ka.tx, 7, b"hello-nexus")?;
         let (seq, plain) = decrypt_frame(&kb.rx, &frame)?;
         assert_eq!(seq, 7);
@@ -632,10 +688,12 @@ mod tests {
 
     #[test]
     fn directional_keys_match_across_peers() -> Result<(), EncryptionError> {
-        let a = KeyPair::generate()?;
-        let b = KeyPair::generate()?;
-        let (msg, ka) = a.handshake_initiate(b.public_key_bytes())?;
-        let (_, kb) = b.handshake_respond(&msg)?;
+        let (ka, kb) = authed_pair(
+            &KeyPair::generate()?,
+            &KeyPair::generate()?,
+            &KeyPair::generate()?,
+            &KeyPair::generate()?,
+        )?;
 
         // initiator.tx == responder.rx；responder.tx == initiator.rx；两把不同。
         assert_eq!(ka.tx.material(), kb.rx.material());
@@ -660,20 +718,21 @@ mod tests {
 
     #[test]
     fn wrong_key_fails_decryption() -> Result<(), EncryptionError> {
-        let a = KeyPair::generate()?;
-        let b = KeyPair::generate()?;
-        let (msg_ab, ka) = a.handshake_initiate(b.public_key_bytes())?;
-        let (_, kb) = b.handshake_respond(&msg_ab)?;
+        let (ka, kb) = authed_pair(
+            &KeyPair::generate()?,
+            &KeyPair::generate()?,
+            &KeyPair::generate()?,
+            &KeyPair::generate()?,
+        )?;
         let frame = encrypt_frame(&ka.tx, 1, b"secret")?;
 
-        let d = KeyPair::generate()?;
-        let c = KeyPair::generate()?;
-        let (msg_dc, kd) = d.handshake_initiate(c.public_key_bytes())?;
-        let (_, kc) = c.handshake_respond(&msg_dc)?;
-        assert!(matches!(
-            decrypt_frame(&kc.rx, &frame),
-            Err(EncryptionError::DecryptionFailed)
-        ));
+        // 独立另一对身份+ephemeral 派生的密钥解不开。
+        let (kd, _kc) = authed_pair(
+            &KeyPair::generate()?,
+            &KeyPair::generate()?,
+            &KeyPair::generate()?,
+            &KeyPair::generate()?,
+        )?;
         assert!(matches!(
             decrypt_frame(&kd.tx, &frame),
             Err(EncryptionError::DecryptionFailed)
@@ -686,11 +745,33 @@ mod tests {
     }
 
     #[test]
+    fn identity_mismatch_derives_different_keys() -> Result<(), EncryptionError> {
+        // 同一 ephemeral、不同 static 身份 -> 派生不同密钥（身份参与认证）。
+        let a_static = KeyPair::generate()?;
+        let a_eph = KeyPair::generate()?;
+        let b_static = KeyPair::generate()?;
+        let b_eph = KeyPair::generate()?;
+        let (ka, _kb) = authed_pair(&a_static, &a_eph, &b_static, &b_eph)?;
+
+        let impostor = KeyPair::generate()?;
+        let (k_bad, _) = authed_pair(&a_static, &a_eph, &impostor, &b_eph)?;
+        assert_ne!(ka.tx.material(), k_bad.tx.material());
+        // 用错误身份派生的密钥解不开真实帧。
+        assert!(matches!(
+            decrypt_frame(&k_bad.rx, &encrypt_frame(&ka.tx, 1, b"x")?),
+            Err(EncryptionError::DecryptionFailed)
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn frame_header_tamper_rejected() -> Result<(), EncryptionError> {
-        let a = KeyPair::generate()?;
-        let b = KeyPair::generate()?;
-        let (msg, ka) = a.handshake_initiate(b.public_key_bytes())?;
-        let (_, kb) = b.handshake_respond(&msg)?;
+        let (ka, kb) = authed_pair(
+            &KeyPair::generate()?,
+            &KeyPair::generate()?,
+            &KeyPair::generate()?,
+            &KeyPair::generate()?,
+        )?;
         let mut frame = encrypt_frame(&ka.tx, 42, b"payload")?;
 
         // 篡改 seq 字节（frame[2..10]）：AAD 校验必须失败。
@@ -718,15 +799,18 @@ mod tests {
 
     #[test]
     fn distinct_keypairs_distinct_sessions() -> Result<(), EncryptionError> {
-        let a1 = KeyPair::generate()?;
-        let b1 = KeyPair::generate()?;
-        let (msg1, k1) = a1.handshake_initiate(b1.public_key_bytes())?;
-        let (_, _r1) = b1.handshake_respond(&msg1)?;
-
-        let a2 = KeyPair::generate()?;
-        let b2 = KeyPair::generate()?;
-        let (msg2, k2) = a2.handshake_initiate(b2.public_key_bytes())?;
-        let (_, _r2) = b2.handshake_respond(&msg2)?;
+        let (k1, _r1) = authed_pair(
+            &KeyPair::generate()?,
+            &KeyPair::generate()?,
+            &KeyPair::generate()?,
+            &KeyPair::generate()?,
+        )?;
+        let (k2, _r2) = authed_pair(
+            &KeyPair::generate()?,
+            &KeyPair::generate()?,
+            &KeyPair::generate()?,
+            &KeyPair::generate()?,
+        )?;
 
         let frame = encrypt_frame(&k1.tx, 3, b"x")?;
         assert!(matches!(
@@ -811,8 +895,10 @@ mod tests {
         let msg = HandshakeMessage {
             msg_type: HANDSHAKE_INIT,
             public_key: [7u8; 32],
+            static_public: [9u8; 32],
         };
         let bytes = msg.to_bytes();
+        assert_eq!(bytes.len(), 1 + 2 * PUBLIC_KEY_LEN);
         let parsed = HandshakeMessage::from_bytes(&bytes)?;
         assert_eq!(parsed, msg);
         assert!(HandshakeMessage::from_bytes(&bytes[..bytes.len() - 1]).is_err());
@@ -821,10 +907,12 @@ mod tests {
 
     #[test]
     fn frame_too_short_and_bad_version() -> Result<(), EncryptionError> {
-        let a = KeyPair::generate()?;
-        let b = KeyPair::generate()?;
-        let (msg, ka) = a.handshake_initiate(b.public_key_bytes())?;
-        let (_, kb) = b.handshake_respond(&msg)?;
+        let (ka, kb) = authed_pair(
+            &KeyPair::generate()?,
+            &KeyPair::generate()?,
+            &KeyPair::generate()?,
+            &KeyPair::generate()?,
+        )?;
         let frame = encrypt_frame(&ka.tx, 1, b"x")?;
 
         assert!(matches!(
@@ -837,6 +925,18 @@ mod tests {
             decrypt_frame(&kb.rx, &bad),
             Err(EncryptionError::UnsupportedVersion)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn keypair_seed_roundtrip_preserves_identity() -> Result<(), EncryptionError> {
+        // 身份密钥持久化：from_seed(to_seed()) 恢复同一公钥（PeerId 稳定）。
+        let kp = KeyPair::generate()?;
+        let restored = KeyPair::from_seed(&kp.to_seed());
+        assert_eq!(kp.public_key_bytes(), restored.public_key_bytes());
+        // 不同种子 -> 不同公钥。
+        let other = KeyPair::from_seed(&[1u8; 32]);
+        assert_ne!(kp.public_key_bytes(), other.public_key_bytes());
         Ok(())
     }
 }

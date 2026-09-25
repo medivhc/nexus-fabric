@@ -112,3 +112,33 @@ portability = "nexus-platform 不在 harness.toml [portable_core] WASI 清单 (p
 supply_chain = "0.17.14 已在 Cargo.lock, 无锁文件膨胀"
 approved = true
 approved_date = "2026-09-21"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-connectivity"
+crate = "x25519-dalek"
+version = "2"
+default_features = false
+features = ["static_secrets", "zeroize"]
+architecture_layer = "delivery layer; P4.1 §12.39 身份密钥 (IdentityKeyPair) 需私钥可序列化 (ring EphemeralPrivateKey 不暴露私钥导出)，仅用于 encryption 模块长期身份，无新内部架构边"
+feature_scope = "static_secrets (StaticSecret to/from seed 支持身份持久化) + zeroize (私钥落零) 两个 feature；default-features=false 排除 alloc/std 不需要路径"
+license = "BSD-3-Clause (allowlisted)"
+security = "X25519 公钥密码学标准实现 (curve25519-dalek 2 系)，无已知 advisories; 混合 DH 仅作 KDF 输入，不直接输出"
+portability = "纯 Rust (curve25519-dalek/fiat-crypto/subtle)，无 C 代码、无 OS-specific API；nexus-connectivity 不在 portable_core WASI 清单 (portable=false)"
+supply_chain = "2.0.1 已由 Cargo.lock 锁定；传递依赖全为纯 Rust (curve25519-dalek/fiat-crypto/subtle/rand_chacha/ppv-lite86)"
+approved = true
+approved_date = "2026-09-25"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-connectivity"
+crate = "rand"
+version = "0.8"
+default_features = false
+features = ["std", "getrandom"]
+architecture_layer = "delivery layer; x25519-dalek StaticSecret::random_from_rng 的 CSPRNG 来源 (OsRng)，仅 encryption 模块使用，无新架构边"
+feature_scope = "std + getrandom (OsRng 系统熵)；不启用 small_rng/thread_rng 等非安全生成器"
+license = "MIT OR Apache-2.0 (allowlisted)"
+security = "rand_core 0.6 系成熟 CSPRNG 生态；OsRng 走 getrandom 系统熵源"
+portability = "纯 Rust；getrandom 在 Windows 走 RtlGenRandom，无需额外依赖"
+supply_chain = "0.8.5 已由 Cargo.lock 锁定；传递依赖 rand_core/rand_chacha/ppv-lite86 纯 Rust"
+approved = true
+approved_date = "2026-09-25"
