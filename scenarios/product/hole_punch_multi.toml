@@ -1,0 +1,54 @@
+schema_version = 1
+id = "product.hole-punch-multi"
+title = "P4.2 多候选并发打洞：先到先用成功 + 全候选耗尽 relay 回退"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-holepunch-multi"
+
+[given]
+subnet_cidr = "10.0.0.0/24"
+node_a_virtual_ip = "10.0.0.1"
+node_b_virtual_ip = "10.0.0.2"
+relay_locator = "relay://relay.example.org:443"
+
+# 可执行 E4：单进程注入多候选打洞并输出 JSON。
+# - success 分支：A 对 B targets=["udp://127.0.0.1:9", "mem-b"]——
+#   经 carrier 发 2 个 ph，B 按最后一个来源回 pa，A 落账 Connected，
+#   HolePunchSucceeded{target="mem-b"}（正确候选胜出，先到先用）。
+# - fallback 分支：C 对 D targets=[两个 dead] + relay 配置——
+#   punch_tick 耗尽 → HolePunchFailed 事件 + RelayFallback → Connected。
+[when]
+command = "cargo run --quiet -p nexus --example hole_punch_multi -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "hole punch multi"
+
+# --- 多候选成功（先到先用）---
+[[expect]]
+field = "success.state"
+equals = "Connected"
+
+[[expect]]
+field = "success.target"
+equals = "mem-b"
+
+[[expect]]
+field = "success.hole_punch_succeeded"
+equals = true
+
+# --- 全候选耗尽 → relay 回退 ---
+[[expect]]
+field = "fallback.state"
+equals = "Connected"
+
+[[expect]]
+field = "fallback.relay_fallback"
+equals = true
+
+[[expect]]
+field = "fallback.hole_punch_failed"
+equals = true

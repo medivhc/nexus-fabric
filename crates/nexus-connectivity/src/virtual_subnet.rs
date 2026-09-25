@@ -161,8 +161,8 @@ impl Default for HolePunchConfig {
 /// 进行中的打洞（P4.2 §12.9.3）：发起目标 + 已尝试次数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingPunch {
-    /// 打洞目标 locator。
-    pub(crate) target: String,
+    /// 打洞候选 locator 列表（多候选并发，先到先用）。
+    pub(crate) targets: Vec<String>,
     /// 已尝试次数（首次发起=1 后递增）。
     pub(crate) attempts: u32,
 }
@@ -913,15 +913,43 @@ impl VirtualSubnetTunnel {
         peer_virtual_ip: &str,
         target: &str,
     ) -> Result<(), ConnectivityError> {
+        self.begin_hole_punch_multi(peer_virtual_ip, &[target.to_string()])
+    }
+
+    /// 非阻塞发起对 peer 的多候选并发打洞（P4.2 §12.9.5）。
+    ///
+    /// 置 `Probing` + `HolePunchStarted` 事件，记录 pending
+    /// `{ targets, attempts: 0 }`，经 carrier 对**每个**候选发第 1 个 `ph`
+    /// 帧（同一 socket，WireGuard 风格）。任一候选收到 `pa` 确认（来源学习，
+    /// NAT 会话回程）即落账 Connected（先到先用），清理 pending。
+    ///
+    /// 失败语义：未注册 peer → `PEER_NOT_FOUND`；空候选列表 →
+    /// `HOLE_PUNCH_EMPTY_TARGETS`。
+    ///
+    /// 注意：状态迁移（Probing + 事件 + pending）先于发送发生；若 carrier
+    /// `send_to` 失败返回 Err，peer 已处于 `Probing`（调用方可用 `punch_tick`
+    /// 继续重试或让其耗尽）。
+    pub fn begin_hole_punch_multi(
+        &mut self,
+        peer_virtual_ip: &str,
+        targets: &[String],
+    ) -> Result<(), ConnectivityError> {
         self.peers
             .get(peer_virtual_ip)
             .ok_or_else(|| ConnectivityError::Invalid {
                 message: format!("PEER_NOT_FOUND: peer {peer_virtual_ip} not found"),
             })?;
+        if targets.is_empty() {
+            return Err(ConnectivityError::Invalid {
+                message: format!(
+                    "HOLE_PUNCH_EMPTY_TARGETS: peer {peer_virtual_ip} has no punch targets"
+                ),
+            });
+        }
         self.pending_punches.insert(
             peer_virtual_ip.to_string(),
             PendingPunch {
-                target: target.to_string(),
+                targets: targets.to_vec(),
                 attempts: 0,
             },
         );
@@ -931,12 +959,14 @@ impl VirtualSubnetTunnel {
             peer_vip: peer_virtual_ip.to_string(),
         });
         let frame = hole_punch_frame(b'h', &self.config.virtual_ip, &self.hole_punch_config.magic);
-        self.carrier
-            .send_to(target, &frame)
-            .map_err(|e| ConnectivityError::Io {
-                operation: "hole_punch_send".to_string(),
-                message: e.to_string(),
-            })?;
+        for target in targets {
+            self.carrier
+                .send_to(target, &frame)
+                .map_err(|e| ConnectivityError::Io {
+                    operation: "hole_punch_send".to_string(),
+                    message: e.to_string(),
+                })?;
+        }
         Ok(())
     }
 
@@ -957,13 +987,14 @@ impl VirtualSubnetTunnel {
         if pending.attempts < self.hole_punch_config.max_attempts {
             let frame =
                 hole_punch_frame(b'h', &self.config.virtual_ip, &self.hole_punch_config.magic);
-            let target = pending.target.clone();
-            self.carrier
-                .send_to(&target, &frame)
-                .map_err(|e| ConnectivityError::Io {
-                    operation: "hole_punch_retry".to_string(),
-                    message: e.to_string(),
-                })?;
+            for target in &pending.targets {
+                self.carrier
+                    .send_to(target, &frame)
+                    .map_err(|e| ConnectivityError::Io {
+                        operation: "hole_punch_retry".to_string(),
+                        message: e.to_string(),
+                    })?;
+            }
             return Ok(());
         }
         // 尝试耗尽 → 失败
@@ -1102,8 +1133,13 @@ impl VirtualSubnetTunnel {
             b'a' if self.peer_state(&sender_vip) == Some(TunnelState::Probing)
                 && self.pending_punches.contains_key(&sender_vip) =>
             {
-                let pending = self.pending_punches.remove(&sender_vip).unwrap();
-                let target = source.unwrap_or(pending.target);
+                let target = {
+                    let pending = self.pending_punches.get(&sender_vip).unwrap();
+                    source
+                        .clone()
+                        .unwrap_or_else(|| pending.targets.first().cloned().unwrap_or_default())
+                };
+                self.pending_punches.remove(&sender_vip);
                 self.apply_hole_punch(&sender_vip, target.clone())?;
                 self.events.push(VirtualSubnetEvent::HolePunchSucceeded {
                     tunnel_id: self.tunnel_id.clone(),
@@ -1543,9 +1579,9 @@ impl VirtualPacketInterface for MemoryVpi {
 /// 鐢ㄤ簬鍗曞厓娴嬭瘯鍜?E4 绂荤嚎鍦烘櫙鎵ц锛屼笉瀹炵幇鐪熷疄 UDP 缃戠粶鏍堛€?
 pub struct MemoryCarrier {
     /// 鍙戦€佺紦鍐插尯锛堟湰鑺傜偣鍙戦€侊紝瀵圭鎺ユ敹锛夆€斺€斾笌瀵圭鐨?recv_buf 鍏变韩銆?
-    send_buf: Arc<Mutex<Vec<u8>>>,
+    send_buf: Arc<Mutex<Vec<Vec<u8>>>>,
     /// 鎺ユ敹缂撳啿鍖猴紙瀵圭鍙戦€侊紝鏈妭鐐规帴鏀讹級鈥斺€斾笌瀵圭鐨?send_buf 鍏变韩銆?
-    recv_buf: Arc<Mutex<Vec<u8>>>,
+    recv_buf: Arc<Mutex<Vec<Vec<u8>>>>,
     /// 缁戝畾鐨?locator銆?
     local_locator: Mutex<Option<String>>,
     /// Last frame source (NAT session-return learning test seam; None by default).
@@ -1598,13 +1634,13 @@ impl MemoryCarrier {
         // 瀹為檯搴旇鐢?channel锛屼絾涓轰簡 E4 纭畾鎬э紝鎴戜滑鐩存帴鎿嶄綔
         let send = self.send_buf.lock().unwrap();
         let mut recv = other.recv_buf.lock().unwrap();
-        recv.extend_from_slice(&send);
+        recv.extend(send.iter().cloned());
     }
 
     /// 娉ㄥ叆涓€涓緟鎺ユ敹鐨勫抚銆?
     pub fn inject_recv(&self, data: &[u8]) {
         let mut buf = self.recv_buf.lock().unwrap();
-        buf.extend_from_slice(data);
+        buf.push(data.to_vec());
     }
 }
 
@@ -1616,20 +1652,20 @@ impl PacketCarrier for MemoryCarrier {
 
     fn send_to(&mut self, _peer_locator: &str, frame: &[u8]) -> Result<(), PlatformError> {
         let mut buf = self.send_buf.lock().unwrap();
-        buf.extend_from_slice(frame);
+        buf.push(frame.to_vec());
         Ok(())
     }
 
     fn receive_into(&mut self, output: &mut [u8]) -> Result<usize, PlatformError> {
         let mut buf = self.recv_buf.lock().unwrap();
-        let n = buf.len().min(output.len());
-        if n > 0 {
-            output[..n].copy_from_slice(&buf[..n]);
-            buf.drain(..n);
+        if buf.is_empty() {
+            return Ok(0);
         }
+        let frame = buf.remove(0);
+        let n = frame.len().min(output.len());
+        output[..n].copy_from_slice(&frame[..n]);
         Ok(n)
     }
-
     fn local_locator(&self) -> Option<String> {
         self.local_locator.lock().unwrap().clone()
     }
@@ -1643,7 +1679,7 @@ impl MemoryCarrier {
     /// Inject a raw frame into the receive buffer (test seam).
     pub fn inject(&self, frame: &[u8]) {
         let mut buf = self.recv_buf.lock().unwrap();
-        buf.extend_from_slice(frame);
+        buf.push(frame.to_vec());
     }
 }
 
@@ -2682,6 +2718,154 @@ mod tests {
             VirtualSubnetTunnel::new(config, Box::new(MemoryVpi::new()), Box::new(carrier));
         let err = tunnel
             .plan_connectivity("10.0.0.99", crate::nat::NatType::FullCone, "x")
+            .unwrap_err();
+        assert!(err.to_string().contains("PEER_NOT_FOUND"));
+    }
+
+    // ---------- P4.2 §12.9.5 多候选并发打洞 ----------
+
+    #[test]
+    fn test_begin_hole_punch_multi_success_first_ack_wins() {
+        // 多候选 [dead, mem-b]：B 按来源回 pa（mem-b 为可达候选），
+        // A 落账 Connected，HolePunchSucceeded{target="mem-b"}（先到先用）。
+        let (ca, cb) = MemoryCarrier::connected_pair();
+        ca.set_last_source("mem-b");
+        cb.set_last_source("mem-b");
+        let mut ta = VirtualSubnetTunnel::new(
+            VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1"),
+            Box::new(MemoryVpi::new()),
+            Box::new(ca),
+        );
+        let mut tb = VirtualSubnetTunnel::new(
+            VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.2"),
+            Box::new(MemoryVpi::new()),
+            Box::new(cb),
+        );
+        ta.add_peer(TunnelPeer::new("10.0.0.2", "mem-b")).unwrap();
+        tb.add_peer(TunnelPeer::new("10.0.0.1", "mem-a")).unwrap();
+
+        ta.begin_hole_punch_multi(
+            "10.0.0.2",
+            &["udp://127.0.0.1:9".to_string(), "mem-b".to_string()],
+        )
+        .unwrap();
+        let mut buf = [0u8; 4096];
+        for _ in 0..10 {
+            tb.recv_and_deliver(&mut buf).unwrap();
+            ta.recv_and_deliver(&mut buf).unwrap();
+            if ta.peer_state("10.0.0.2") == Some(TunnelState::Connected) {
+                break;
+            }
+            ta.punch_tick("10.0.0.2").unwrap();
+        }
+        assert_eq!(ta.peer_state("10.0.0.2"), Some(TunnelState::Connected));
+        assert!(ta.events().iter().any(|e| matches!(
+            e,
+            VirtualSubnetEvent::HolePunchSucceeded { target, .. } if target == "mem-b"
+        )));
+    }
+
+    #[test]
+    fn test_begin_hole_punch_multi_all_dead_falls_back_to_relay() {
+        // 多候选全失败 + relay 配置：punch_tick 耗尽 → HolePunchFailed +
+        // RelayFallback → Connected（relay 保底）。
+        let config = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
+        let carrier = MemoryCarrier::new();
+        let mut tunnel =
+            VirtualSubnetTunnel::new(config, Box::new(MemoryVpi::new()), Box::new(carrier));
+        tunnel
+            .add_peer(TunnelPeer::new("10.0.0.2", "dead"))
+            .unwrap();
+        tunnel.set_relay_locator("10.0.0.2", "relay://relay.example.org:443");
+
+        tunnel
+            .begin_hole_punch_multi(
+                "10.0.0.2",
+                &[
+                    "udp://127.0.0.1:9001".to_string(),
+                    "udp://127.0.0.1:9002".to_string(),
+                ],
+            )
+            .unwrap();
+        for _ in 0..=10 {
+            match tunnel.punch_tick("10.0.0.2") {
+                Ok(()) => {
+                    if tunnel.peer_state("10.0.0.2") == Some(TunnelState::Connected) {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        assert_eq!(tunnel.peer_state("10.0.0.2"), Some(TunnelState::Connected));
+        assert!(
+            tunnel
+                .events()
+                .iter()
+                .any(|e| matches!(e, VirtualSubnetEvent::HolePunchFailed { .. }))
+        );
+        assert!(
+            tunnel
+                .events()
+                .iter()
+                .any(|e| matches!(e, VirtualSubnetEvent::RelayFallback { .. }))
+        );
+    }
+
+    #[test]
+    fn test_begin_hole_punch_multi_single_target_compatible() {
+        // 单候选兼容：targets=[mem-b] 等价 begin_hole_punch。
+        let (ca, cb) = MemoryCarrier::connected_pair();
+        let mut ta = VirtualSubnetTunnel::new(
+            VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1"),
+            Box::new(MemoryVpi::new()),
+            Box::new(ca),
+        );
+        let mut tb = VirtualSubnetTunnel::new(
+            VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.2"),
+            Box::new(MemoryVpi::new()),
+            Box::new(cb),
+        );
+        ta.add_peer(TunnelPeer::new("10.0.0.2", "mem-b")).unwrap();
+        tb.add_peer(TunnelPeer::new("10.0.0.1", "mem-a")).unwrap();
+
+        ta.begin_hole_punch_multi("10.0.0.2", &["mem-b".to_string()])
+            .unwrap();
+        let mut buf = [0u8; 4096];
+        for _ in 0..10 {
+            tb.recv_and_deliver(&mut buf).unwrap();
+            ta.recv_and_deliver(&mut buf).unwrap();
+            if ta.peer_state("10.0.0.2") == Some(TunnelState::Connected) {
+                break;
+            }
+            ta.punch_tick("10.0.0.2").unwrap();
+        }
+        assert_eq!(ta.peer_state("10.0.0.2"), Some(TunnelState::Connected));
+    }
+
+    #[test]
+    fn test_begin_hole_punch_multi_empty_targets_rejected() {
+        // 空候选列表 → HOLE_PUNCH_EMPTY_TARGETS（结构化 Err）。
+        let config = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
+        let carrier = MemoryCarrier::new();
+        let mut tunnel =
+            VirtualSubnetTunnel::new(config, Box::new(MemoryVpi::new()), Box::new(carrier));
+        tunnel
+            .add_peer(TunnelPeer::new("10.0.0.2", "dead"))
+            .unwrap();
+        let err = tunnel.begin_hole_punch_multi("10.0.0.2", &[]).unwrap_err();
+        assert!(err.to_string().contains("HOLE_PUNCH_EMPTY_TARGETS"));
+    }
+
+    #[test]
+    fn test_begin_hole_punch_multi_unknown_peer_rejected() {
+        // 未注册 peer → PEER_NOT_FOUND。
+        let config = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
+        let carrier = MemoryCarrier::new();
+        let mut tunnel =
+            VirtualSubnetTunnel::new(config, Box::new(MemoryVpi::new()), Box::new(carrier));
+        let err = tunnel
+            .begin_hole_punch_multi("10.0.0.99", &["x".to_string()])
             .unwrap_err();
         assert!(err.to_string().contains("PEER_NOT_FOUND"));
     }

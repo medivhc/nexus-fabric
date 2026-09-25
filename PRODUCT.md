@@ -1407,6 +1407,30 @@ Symmetric NAT 浪费打洞预算：
 - 冻结边界（本子项不做）：真实 STUN 跨公网探测 E5（vps 恢复后补）、
   多候选并发打洞（下一子项）。
 
+#### 12.9.5 P4.2 多候选并发打洞（2026-09-25）{#12-holepunch-multi}
+
+同一 peer 可同时向多个候选 locator 打洞，**先到先用**：
+
+- `VirtualSubnetTunnel::begin_hole_punch_multi(peer_vip, targets: &[String]) ->
+  Result<(), ConnectivityError>`：非阻塞——peer 置 `Probing` +
+  `HolePunchStarted` 事件 + 记录 pending `{ targets, attempts: 0 }`，经
+  carrier 对**每个**候选发第 1 个 `ph` 帧（同一 socket，WireGuard 风格）。
+  单候选 `begin_hole_punch(peer_vip, target)` 保持兼容（内部等价
+  `targets = [target]`）。
+- 候选语义：任一候选收到 `pa` 确认（来源学习，NAT 会话回程）即落账
+  Connected（先到先用），清理 pending；多候选共享同一 attempts 预算
+  （`max_attempts`，`punch_tick` 重发**全部**候选）。
+- 失败语义：未注册 peer → `PEER_NOT_FOUND`；空候选列表 →
+  `HOLE_PUNCH_EMPTY_TARGETS`；尝试耗尽 → `HolePunchFailed` 事件 + 配置了
+  relay locator 则自动 `fallback_to_relay` 并 Ok，否则
+  Err(`HOLE_PUNCH_FAILED`)。
+- E2 单测：multi 成功（`[dead, mem-b]` → Connected，正确候选胜出）、multi
+  全失败（`[dead1, dead2]` → 耗尽 fallback/Err）、单候选兼容（
+  `begin_hole_punch` 等价 `targets=[target]`）、空候选 Err、未注册 peer Err。
+- E4 场景：`hole_punch_multi.toml`（id=product.hole-punch-multi）——
+  `[dead, mem-b]` 先到先用成功 + `[dead1, dead2]` 全失败耗尽 relay 回退。
+- 冻结边界（本子项不做）：真实公网多路打洞 E5（vps 恢复后补）。
+
 ### 12.10 P2.3+P2.4 广域协调核心 + 自动 IP 分配（2026-09-21）{#12-coord}
 
 静态 locator 无法扩展（IP 漂移、NAT 后不可预知）。本节交付**协调控制平面核心**与
@@ -2139,3 +2163,64 @@ nexusd autostart install --json | remove --json | status --json
 
 - 冻结边界（本项不做）：系统代理 PAC / AutoConfigURL、按进程代理（WPAD/
   per-app）、SYSTEM 服务化、全局 `HKLM` 代理、多用户切换会话代理同步。
+
+
+## 14. 计划任务与事件驱动（Scheduled Task Submission） {#14-schedule}
+
+计划任务把「一次提交」扩展为「按时间表自动提交」：任务意图在注册时固定，
+到期由调度器触发并进入既有 Intent 校验、权限检查与任务生命周期
+（PRODUCT §6 / §10.2 / §11）。本项是白皮书 §21.2 的 P0 最小闭环；
+事件触发（Webhook / 文件变化 / 上游完成）与工作流编排列为 P1，不得写进本期
+expectation。
+
+### 14.1 用户可观察语义
+
+- `nexus schedule at <epoch_secs> --resource <resource> [--project <project>] --
+  <command...>`：注册一次性计划任务，返回 schedule id；`at` 必须为未来时间。
+- `nexus schedule every <interval_secs> --resource <resource> [--project <project>] --
+  <command...>`：注册周期计划任务，`interval_secs` 必须 > 0。
+- `nexus schedule list --json`：返回全部计划任务（id、spec、intent、next_run、
+  state、fire_count）。
+- `nexus schedule cancel <id>`：取消 `Scheduled` 状态的条目；已触发（`Fired`）或
+  不存在返回结构化错误。
+- `nexus schedule tick [--now <epoch_secs>]`：推进调度器，触发所有到期条目，
+  返回本次触发结果（schedule_id、task_id、触发次数）；`--now` 用于确定性演示
+  与测试，缺省使用当前时间。
+- 触发时按注册时的执行意图（resource / command / project）提交结构化 Intent，
+  失败遵循 §14.3；成功进入既有任务状态与产物语义，触发记录进入活动。
+
+### 14.2 P0 范围
+
+- 调度器为进程内组件（`nexus-scheduler`，portable-core）：注册、取消、列表与
+  tick 判定；不直接依赖执行路径，触发动作由组合根注入的提交回调完成。
+- 注册表持久化由组合根完成（本地 JSON 文件，路径可配置）；注册 / 取消 / tick
+  结果在操作成功后持久化。
+- 触发驱动：P0 由宿主进程周期性调用 `tick` 驱动（CLI 提供手动 tick 入口）；
+  daemon 常驻调度、事件触发与复杂日历（cron）表达式为 P1。
+
+### 14.3 失败语义
+
+```text
+INVALID_SCHEDULE     at 为过去时间 / interval ≤ 0 / 缺少命令
+SCHEDULE_NOT_FOUND   cancel 不存在的 id，或条目已 Fired
+SUBMIT_FAILED        触发时 Intent 提交失败：条目保持 Scheduled，下次 tick 重试
+```
+
+### 14.4 幂等与恢复
+
+- 单条目单次触发只提交一次：同一 tick 内对已触发条目不重复提交；`At` 条目触发
+  后置 `Fired`，`Every` 条目触发后重排 `next_run` 并保持 `Scheduled`。
+- 崩溃 / 重启后加载持久化注册表：到期未触发条目重新触发；重复触发风险遵循
+  PRODUCT §10.2 幂等键与 §11.3 声明（不承诺通用 exactly-once）。
+- 触发记录（schedule_id、trigger_at、task_id）进入活动记录，可追溯。
+
+### 14.5 E4 映射
+
+- `scenarios/product/schedule_flow.toml`（id=product.schedule-flow）：确定性闭环
+  ——`at` 到期触发一次不重复、`every` 重排后续触发、`cancel` 阻止触发、注册表
+  保存 / 重载状态一致且到期条目重载后触发。
+
+### 冻结边界（P0 不做）
+
+- 事件触发（Webhook / 文件变化 / 上游任务完成）、复杂日历表达式、daemon 常驻
+  调度、跨节点调度、工作流 DAG 编排。

@@ -210,6 +210,36 @@ NAT/中继场景的物理建连（组合根 transport::connect）发生在激活
   `nat.rs` NatType/PathDecision 纯函数与 §12.9.3 打洞/relay API，无新 trait。
 - 冻结边界（后续）：多候选并发打洞、真实公网跨 NAT 打洞 E5。
 
+### 冻结契约（多候选并发打洞 P4.2，PRODUCT §12.9.5）
+
+- `VirtualSubnetTunnel` 新增：
+  - `begin_hole_punch_multi(peer_vip, targets: &[String]) ->
+    Result<(), ConnectivityError>`：非阻塞——peer 置 `Probing` +
+    `HolePunchStarted` 事件 + 记录 pending `{ targets, attempts: 0 }`，经
+    carrier 对**每个**候选发第 1 个 `ph` 帧（同一 socket，WireGuard 风格）。
+  - `begin_hole_punch(peer_vip, target)` 保持兼容：内部等价
+    `begin_hole_punch_multi(peer_vip, &[target])`。
+- pending 结构：`PendingPunch { targets: Vec<String>, attempts: u32 }`；
+  多候选共享同一 attempts 预算（`max_attempts`，`punch_tick` 重发全部候选）。
+- 成功语义：任一候选收到 `pa` 确认（来源学习，NAT 会话回程）即落账
+  Connected（先到先用），清理 pending；`pa` 无来源时兜底取
+  `pending.targets.first()`。再次收到 `pa`（已 Connected）幂等忽略。
+- 失败语义：未注册 peer → `PEER_NOT_FOUND`；空候选列表 →
+  `HOLE_PUNCH_EMPTY_TARGETS`；尝试耗尽 → `HolePunchFailed` 事件 + 配置了
+  relay locator 则自动 `fallback_to_relay` 并 Ok，否则 Err(`HOLE_PUNCH_FAILED`)。
+- MemoryCarrier 数据报语义（P4.2）：`send_buf/recv_buf` 改 `Vec<Vec<u8>>`
+  逐帧存取（`receive_into` 每次弹一帧），`inject/inject_recv` 追加单帧；
+  多候选多帧不拼接。`last_source` 仍为测试 seam（`set_last_source`），
+  `send_to` 不自动记录来源。
+- E2：multi 成功（`[dead, mem-b]` 先到先用 → Connected + target=mem-b）、
+  multi 全失败（耗尽 → HolePunchFailed + RelayFallback）、单候选兼容、
+  空候选 Err、未注册 peer Err。
+- E4 场景：`hole_punch_multi.toml`（id=product.hole-punch-multi）——
+  `[dead, mem-b]` 成功 + `[dead1, dead2]` 耗尽 relay 回退。
+- Deletion Test：多候选是打洞发起维度的独立扩展（候选集选择/预算共享/
+  先到先用）；复用 §12.9.3 carrier 帧流与落账 API，无新 trait。
+- 冻结边界（后续）：真实公网多路打洞 E5。
+
 ### 冻结契约（VirtualSubnet 协调核心 + 自动 IP 分配 P2.3+P2.4，PRODUCT §12.13）
 
 - 新模块 `coord`（portable：零 I/O、零第三方依赖，可编译 WASI）：
