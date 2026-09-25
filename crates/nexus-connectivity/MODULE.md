@@ -153,7 +153,38 @@ NAT/中继场景的物理建连（组合根 transport::connect）发生在激活
 - Deletion Test：打洞集成是虚拟子网数据面的独立变化维度（真实公网场景
   peer locator 动态学习），复用 nat.rs 既有原语语义；新增 API 均为
   VirtualSubnetTunnel 方法 + 一个状态枚举变体，无新 trait、无投机抽象；
-  真实 UDP 打洞（HolePuncher 挂接）冻结在 P3 产品化。
+  真实 UDP 打洞由 P4.2 tunnel 级打洞状态机挂接（见下节）。
+
+### 冻结契约（tunnel 级双向打洞状态机 P4.2，PRODUCT §12.9.3）
+
+- `HolePunchConfig { max_attempts: u32 = 10, attempt_timeout: Duration = 500ms,
+  magic: [u8;4] = b"NXHP" }`（默认总预算 ~5s，与 `HolePuncher::punch` 对齐）。
+- `VirtualSubnetTunnel` 新增：
+  - `begin_hole_punch(peer_vip, target) -> Result<(), ConnectivityError>`：
+    非阻塞发起：peer 置 `Probing` + `HolePunchStarted` 事件 + 记录 pending
+    punch { target, attempts: 0 }，经 carrier 发第 1 个 `ph` 帧。
+  - `punch_tick(peer_vip) -> Result<(), ConnectivityError>`：重试推进——
+    已 Connected / 无 pending → 幂等 Ok；attempts < max → 重发 `ph`；
+    attempts == max → `HolePunchFailed` 事件 + 清理：配置 relay 则自动
+    `fallback_to_relay` 并 Ok，否则 Err(`HOLE_PUNCH_FAILED`)。
+  - `relay_locator(peer_vip) -> Option<String>` / `set_relay_locator(peer_vip,
+    locator)`：relay 回退配置。
+- 打洞帧协议（与数据帧/握手帧共用同一 PacketCarrier，同一 socket）：
+  `ph:<sender_vip>:<magic4>`（请求）/ `pa:<sender_vip>:<magic4>`（确认）；
+  sender_vip 为发起方自身虚拟 IP；magic4 = `b"NXHP"` 防误判。
+- 接收侧分流（`recv_and_deliver`）：`ph` 帧 → 学习来源（NAT 回程）+
+  回 `pa` 到来源（无来源则配置 locator）+ 置 sender Connected（双向可达）；
+  `pa` 帧 → 学习来源 + 仅本地发起中（Probing）落账（防伪造成功）→
+  `apply_hole_punch` + `HolePunchSucceeded { target }` 事件。
+- 事件：`VirtualSubnetEvent` 新增 `HolePunchStarted { peer_vip }` /
+  `HolePunchSucceeded { peer_vip, target }` / `HolePunchFailed { peer_vip, reason }`。
+- 失败语义：未注册 peer → `PEER_NOT_FOUND`；打洞帧 magic 校验失败 → 丢弃
+  （Ok(None)，防数据帧/握手帧误判）；打洞帧不写 VPI、不计数据统计。
+- Deletion Test：打洞状态机是隧道连通性建立（直连/relay 路径决策）的独立
+  变化维度；复用 carrier 帧流（无新 socket/trait）与 §12.9 落账 API；
+  无投机抽象。
+- 冻结边界（后续）：多候选并发打洞、NAT 类型驱动路径选择、真实公网跨 NAT
+  打洞 E5。
 
 ### 冻结契约（VirtualSubnet 协调核心 + 自动 IP 分配 P2.3+P2.4，PRODUCT §12.13）
 

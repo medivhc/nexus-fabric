@@ -137,6 +137,36 @@ pub struct TunnelStats {
     pub bytes_forwarded: u64,
 }
 
+/// 打洞重试配置（P4.2 §12.9.3）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HolePunchConfig {
+    /// 最大尝试次数（含首次发起，默认 10）。
+    pub max_attempts: u32,
+    /// 单次尝试等待对端 ack 的超时（默认 500ms，总预算 ~5s）。
+    pub attempt_timeout: std::time::Duration,
+    /// 打洞帧 magic（4 字节，默认 b"NXHP"），防数据帧/握手帧误判。
+    pub magic: [u8; 4],
+}
+
+impl Default for HolePunchConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 10,
+            attempt_timeout: std::time::Duration::from_millis(500),
+            magic: *b"NXHP",
+        }
+    }
+}
+
+/// 进行中的打洞（P4.2 §12.9.3）：发起目标 + 已尝试次数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingPunch {
+    /// 打洞目标 locator。
+    pub(crate) target: String,
+    /// 已尝试次数（首次发起=1 后递增）。
+    pub(crate) attempts: u32,
+}
+
 /// 铏氭嫙瀛愮綉缁撴瀯鍖栦簨浠讹紙鐢ㄤ簬鍙娴嬫€у拰閲嶆斁锛夈€?
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VirtualSubnetEvent {
@@ -189,6 +219,31 @@ pub enum VirtualSubnetEvent {
         peer_id: String,
         /// Relay locator.
         relay_locator: String,
+    },
+    /// Hole punch initiated for peer (P4.2 §12.9.3).
+    HolePunchStarted {
+        /// Tunnel ID.
+        tunnel_id: String,
+        /// Peer virtual IP.
+        peer_vip: String,
+    },
+    /// Hole punch completed via pa ack (P4.2 §12.9.3).
+    HolePunchSucceeded {
+        /// Tunnel ID.
+        tunnel_id: String,
+        /// Peer virtual IP.
+        peer_vip: String,
+        /// Direct target locator now in use.
+        target: String,
+    },
+    /// Hole punch exhausted attempts (P4.2 §12.9.3).
+    HolePunchFailed {
+        /// Tunnel ID.
+        tunnel_id: String,
+        /// Peer virtual IP.
+        peer_vip: String,
+        /// Failure reason.
+        reason: String,
     },
     /// 鏁版嵁鍖呭凡鍙戦€併€?
     PacketSent {
@@ -333,6 +388,12 @@ pub struct VirtualSubnetTunnel {
     pending_handshakes: HashMap<String, PendingHandshake>,
     /// 节点身份管理器（P4.1 §12.39）：本端长期身份 + 对端 TOFU 表。
     identity: IdentityManager,
+    /// 打洞状态机（P4.2 §12.9.3）：对端虚拟 IP -> 进行中打洞（target + 已尝试次数）。
+    pending_punches: HashMap<String, PendingPunch>,
+    /// 打洞重试配置（P4.2 §12.9.3）。
+    hole_punch_config: HolePunchConfig,
+    /// 已配置 relay locator（P4.2 §12.9.3）：对端虚拟 IP -> relay locator。
+    relay_locators: HashMap<String, String>,
 }
 
 impl VirtualSubnetTunnel {
@@ -362,6 +423,9 @@ impl VirtualSubnetTunnel {
             crypto_sessions: HashMap::new(),
             pending_handshakes: HashMap::new(),
             identity: IdentityManager::new(Box::new(InMemorySecretStore::new())),
+            pending_punches: HashMap::new(),
+            hole_punch_config: HolePunchConfig::default(),
+            relay_locators: HashMap::new(),
         }
     }
 
@@ -802,6 +866,190 @@ impl VirtualSubnetTunnel {
             .get(peer_virtual_ip)
             .map(|(_, locator, _, _)| locator.clone())
     }
+
+    /// 查询已配置 relay locator（P4.2 §12.9.3，TURN 中继地址）。
+    #[must_use]
+    pub fn relay_locator(&self, peer_virtual_ip: &str) -> Option<String> {
+        self.relay_locators.get(peer_virtual_ip).cloned()
+    }
+
+    /// 配置 peer 的 relay locator（P4.2 §12.9.3，打洞失败回退用）。
+    pub fn set_relay_locator(&mut self, peer_virtual_ip: &str, locator: impl Into<String>) {
+        self.relay_locators
+            .insert(peer_virtual_ip.to_string(), locator.into());
+    }
+
+    /// 非阻塞发起对 peer 的双向打洞（P4.2 §12.9.3）。
+    ///
+    /// 置 `Probing` + `HolePunchStarted` 事件，记录 pending punch，经 carrier
+    /// 向 target 发第 1 个 `ph` 帧。完成由收 `pa` 帧（recv_and_deliver）落账；
+    /// 重试/失败由 `punch_tick` 推进。
+    ///
+    /// 注意：状态迁移（Probing + 事件 + pending）先于发送发生；若 carrier
+    /// `send_to` 失败返回 Err，peer 已处于 `Probing`（调用方可用 `punch_tick`
+    /// 继续重试或让其耗尽）。
+    pub fn begin_hole_punch(
+        &mut self,
+        peer_virtual_ip: &str,
+        target: &str,
+    ) -> Result<(), ConnectivityError> {
+        self.peers
+            .get(peer_virtual_ip)
+            .ok_or_else(|| ConnectivityError::Invalid {
+                message: format!("PEER_NOT_FOUND: peer {peer_virtual_ip} not found"),
+            })?;
+        self.pending_punches.insert(
+            peer_virtual_ip.to_string(),
+            PendingPunch {
+                target: target.to_string(),
+                attempts: 0,
+            },
+        );
+        self.set_peer_state(peer_virtual_ip, TunnelState::Probing);
+        self.events.push(VirtualSubnetEvent::HolePunchStarted {
+            tunnel_id: self.tunnel_id.clone(),
+            peer_vip: peer_virtual_ip.to_string(),
+        });
+        let frame = hole_punch_frame(b'h', &self.config.virtual_ip, &self.hole_punch_config.magic);
+        self.carrier
+            .send_to(target, &frame)
+            .map_err(|e| ConnectivityError::Io {
+                operation: "hole_punch_send".to_string(),
+                message: e.to_string(),
+            })?;
+        Ok(())
+    }
+
+    /// 推进一次打洞重试状态机（P4.2 §12.9.3）。
+    ///
+    /// 已 Connected → 幂等 Ok；无 pending → 幂等 Ok；attempts < max_attempts →
+    /// 重发 `ph` 帧并 Ok；attempts == max_attempts → `HolePunchFailed` 事件 +
+    /// 清理 pending：配置了 relay locator 则自动 `fallback_to_relay` 并 Ok，
+    /// 否则返回 Err(HOLE_PUNCH_FAILED)。
+    pub fn punch_tick(&mut self, peer_virtual_ip: &str) -> Result<(), ConnectivityError> {
+        if self.peer_state(peer_virtual_ip) == Some(TunnelState::Connected) {
+            return Ok(());
+        }
+        let Some(pending) = self.pending_punches.get_mut(peer_virtual_ip) else {
+            return Ok(());
+        };
+        pending.attempts += 1;
+        if pending.attempts < self.hole_punch_config.max_attempts {
+            let frame =
+                hole_punch_frame(b'h', &self.config.virtual_ip, &self.hole_punch_config.magic);
+            let target = pending.target.clone();
+            self.carrier
+                .send_to(&target, &frame)
+                .map_err(|e| ConnectivityError::Io {
+                    operation: "hole_punch_retry".to_string(),
+                    message: e.to_string(),
+                })?;
+            return Ok(());
+        }
+        // 尝试耗尽 → 失败
+        let reason = format!("attempts exhausted ({})", pending.attempts);
+        self.pending_punches.remove(peer_virtual_ip);
+        self.events.push(VirtualSubnetEvent::HolePunchFailed {
+            tunnel_id: self.tunnel_id.clone(),
+            peer_vip: peer_virtual_ip.to_string(),
+            reason: reason.clone(),
+        });
+        if let Some(relay) = self.relay_locators.get(peer_virtual_ip).cloned() {
+            self.fallback_to_relay(peer_virtual_ip, relay)?;
+            Ok(())
+        } else {
+            Err(ConnectivityError::Invalid {
+                message: format!("HOLE_PUNCH_FAILED: {reason}"),
+            })
+        }
+    }
+
+    /// 处理打洞帧（P4.2 §12.9.3）：`ph` 请求 → 学习来源 + 回 `pa` 到来源；
+    /// `pa` 确认 → 学习来源 + 若本端发起中（Probing）则落账 Connected。
+    ///
+    /// magic 校验失败视为非打洞帧（丢弃，Ok(None)），防数据帧/握手帧误判。
+    fn handle_hole_punch_frame(
+        &mut self,
+        data: &[u8],
+    ) -> Result<Option<(String, usize)>, ConnectivityError> {
+        if data.len() < 3 || data[1] != b'h' && data[1] != b'a' {
+            return Err(ConnectivityError::Invalid {
+                message: "invalid hole punch frame".to_string(),
+            });
+        }
+        let rest = &data[3..];
+        let Some(colon) = rest.iter().position(|b| *b == b':') else {
+            return Err(ConnectivityError::Invalid {
+                message: "invalid hole punch frame (missing separator)".to_string(),
+            });
+        };
+        let sender_vip = String::from_utf8_lossy(&rest[..colon]).to_string();
+        let magic = &rest[colon + 1..];
+        if magic.len() != self.hole_punch_config.magic.len()
+            || magic != self.hole_punch_config.magic
+        {
+            // 非打洞帧：丢弃
+            return Ok(None);
+        }
+
+        // 学习来源（NAT 会话回程）
+        let source = self.carrier.last_peer_locator();
+        if let Some(src) = source.clone() {
+            if let Some((_, locator, _, _)) = self.peers.get_mut(&sender_vip) {
+                if *locator != src {
+                    *locator = src.clone();
+                    self.events.push(VirtualSubnetEvent::PeerLocatorUpdated {
+                        tunnel_id: self.tunnel_id.clone(),
+                        peer_id: sender_vip.clone(),
+                        new_locator: src,
+                    });
+                }
+            }
+        }
+
+        match data[1] {
+            b'h' => {
+                // 打洞请求：回 pa 到来源（无来源则回配置 locator）
+                let target = source.unwrap_or_else(|| {
+                    self.peers
+                        .get(&sender_vip)
+                        .map(|(_, l, _, _)| l.clone())
+                        .unwrap_or_default()
+                });
+                if !target.is_empty() {
+                    let pa = hole_punch_frame(
+                        b'a',
+                        &self.config.virtual_ip,
+                        &self.hole_punch_config.magic,
+                    );
+                    self.carrier
+                        .send_to(&target, &pa)
+                        .map_err(|e| ConnectivityError::Io {
+                            operation: "hole_punch_ack".to_string(),
+                            message: e.to_string(),
+                        })?;
+                    // 收到 ph 证明对端可达本端（回 pa 后双向可达）：置对端
+                    // Connected，数据面即可经学习/配置 locator 发送。
+                    self.set_peer_state(&sender_vip, TunnelState::Connected);
+                }
+            }
+            // 打洞确认：仅本地发起中（Probing）时落账，防伪造成功
+            b'a' if self.peer_state(&sender_vip) == Some(TunnelState::Probing)
+                && self.pending_punches.contains_key(&sender_vip) =>
+            {
+                let pending = self.pending_punches.remove(&sender_vip).unwrap();
+                let target = source.unwrap_or(pending.target);
+                self.apply_hole_punch(&sender_vip, target.clone())?;
+                self.events.push(VirtualSubnetEvent::HolePunchSucceeded {
+                    tunnel_id: self.tunnel_id.clone(),
+                    peer_vip: sender_vip.clone(),
+                    target,
+                });
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
     /// 璁剧疆 Peer 鐘舵€併€?
     pub fn set_peer_state(&mut self, virtual_ip: &str, state: TunnelState) {
         if let Some(entry) = self.peers.get_mut(virtual_ip) {
@@ -946,6 +1194,13 @@ impl VirtualSubnetTunnel {
                 }
             }
             return Ok(None);
+        }
+
+        // 打洞帧分流（P4.2 §12.9.3）：载体 "ph:<sender_vip>:<magic4>" /
+        // "pa:<sender_vip>:<magic4>"。打洞帧不写 VPI、不计数据统计；
+        // 均返回 Ok(None) 表示非数据帧。
+        if data.starts_with(b"ph:") || data.starts_with(b"pa:") {
+            return self.handle_hole_punch_frame(&data);
         }
 
         // 解封装（明文模式：直接解析；加密模式：按各对端会话 rx 试解密）
@@ -1331,6 +1586,21 @@ impl Default for MemoryCarrier {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 打洞帧构造（P4.2 §12.9.3）：`p<h|a>:<peer_vip>:<magic4>`。
+///
+/// kind_byte 为 b'h'（ph 请求）或 b'a'（pa 确认）。
+#[must_use]
+fn hole_punch_frame(kind_byte: u8, peer_vip: &str, magic: &[u8; 4]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(3 + peer_vip.len() + 1 + magic.len());
+    out.push(b'p');
+    out.push(kind_byte);
+    out.push(b':');
+    out.extend_from_slice(peer_vip.as_bytes());
+    out.push(b':');
+    out.extend_from_slice(magic);
+    out
 }
 
 /// 澶氬绔唴瀛?PacketCarrier锛圥1 搂12.5 涓夎妭鐐?mesh 娴嬭瘯鏇胯韩锛夈€?
@@ -1947,5 +2217,265 @@ mod tests {
                 .fallback_to_relay("10.0.0.99", "relay://r:1")
                 .is_err()
         );
+    }
+
+    // ---------- P4.2 §12.9.3 tunnel 级双向打洞状态机 ----------
+
+    #[test]
+    fn test_hole_punch_success_ph_pa_connects_and_routes() {
+        // A 发起打洞 B（target=mem-b）：B 收 ph 自动回 pa + 置 A Connected；
+        // A 收 pa 落账（locator=target + Connected）；数据帧 A→B 送达。
+        let cfg_a = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
+        let cfg_b = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.2");
+        let (ca, cb) = MemoryCarrier::connected_pair();
+        let vpi_b = MemoryVpi::new();
+        let vpi_b_sent = vpi_b.sent_handle();
+        let mut ta = VirtualSubnetTunnel::new(cfg_a, Box::new(MemoryVpi::new()), Box::new(ca));
+        let mut tb = VirtualSubnetTunnel::new(cfg_b, Box::new(vpi_b), Box::new(cb));
+        ta.add_peer(TunnelPeer::new("10.0.0.2", "mem-b")).unwrap();
+        tb.add_peer(TunnelPeer::new("10.0.0.1", "mem-a")).unwrap();
+
+        ta.begin_hole_punch("10.0.0.2", "mem-b").unwrap();
+        assert_eq!(ta.peer_state("10.0.0.2"), Some(TunnelState::Probing));
+
+        let mut buf = [0u8; 4096];
+        for _ in 0..10 {
+            tb.recv_and_deliver(&mut buf).unwrap();
+            ta.recv_and_deliver(&mut buf).unwrap();
+            if ta.peer_state("10.0.0.2") == Some(TunnelState::Connected) {
+                break;
+            }
+            ta.punch_tick("10.0.0.2").unwrap();
+        }
+
+        assert_eq!(ta.peer_state("10.0.0.2"), Some(TunnelState::Connected));
+        assert_eq!(ta.peer_locator("10.0.0.2").as_deref(), Some("mem-b"));
+        // ph 接收方：收到请求即双向可达 → 置对端 Connected
+        assert_eq!(tb.peer_state("10.0.0.1"), Some(TunnelState::Connected));
+
+        // 数据帧 A→B 走打洞后 locator 送达（写 B 的 VPI）
+        ta.send_ip_packet("10.0.0.2", b"ping").unwrap();
+        tb.recv_and_deliver(&mut buf).unwrap();
+        let payload = {
+            let mut v = vpi_b_sent.lock().unwrap();
+            let p = v.clone();
+            v.clear();
+            p
+        };
+        assert_eq!(payload, b"ping");
+
+        // 事件链：HolePunchStarted → HolePunchSucceeded
+        assert!(
+            ta.events()
+                .iter()
+                .any(|e| matches!(e, VirtualSubnetEvent::HolePunchStarted { .. }))
+        );
+        assert!(
+            ta.events()
+                .iter()
+                .any(|e| matches!(e, VirtualSubnetEvent::HolePunchSucceeded { .. }))
+        );
+    }
+
+    #[test]
+    fn test_hole_punch_exhausted_fails_without_relay() {
+        // 无监听 target：尝试耗尽 → HolePunchFailed + 无 relay 时 Err(HOLE_PUNCH_FAILED)。
+        let config = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
+        let carrier = MemoryCarrier::new();
+        let mut tunnel =
+            VirtualSubnetTunnel::new(config, Box::new(MemoryVpi::new()), Box::new(carrier));
+        tunnel
+            .add_peer(TunnelPeer::new("10.0.0.2", "dead"))
+            .unwrap();
+
+        tunnel
+            .begin_hole_punch("10.0.0.2", "udp://127.0.0.1:9")
+            .unwrap();
+        let mut err = None;
+        for _ in 0..12 {
+            match tunnel.punch_tick("10.0.0.2") {
+                Ok(()) => {}
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        assert!(err.is_some(), "punch should exhaust and fail");
+        assert!(err.unwrap().to_string().contains("HOLE_PUNCH_FAILED"));
+        assert!(
+            tunnel
+                .events()
+                .iter()
+                .any(|e| matches!(e, VirtualSubnetEvent::HolePunchFailed { .. }))
+        );
+        assert_ne!(tunnel.peer_state("10.0.0.2"), Some(TunnelState::Connected));
+    }
+
+    #[test]
+    fn test_hole_punch_exhausted_falls_back_to_relay() {
+        // 无监听 target + 配置 relay：耗尽 → HolePunchFailed → 自动 fallback（保底）。
+        let config = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
+        let carrier = MemoryCarrier::new();
+        let mut tunnel =
+            VirtualSubnetTunnel::new(config, Box::new(MemoryVpi::new()), Box::new(carrier));
+        tunnel
+            .add_peer(TunnelPeer::new("10.0.0.2", "dead"))
+            .unwrap();
+        tunnel.set_relay_locator("10.0.0.2", "relay://relay.example.org:443");
+
+        tunnel
+            .begin_hole_punch("10.0.0.2", "udp://127.0.0.1:9")
+            .unwrap();
+        for _ in 0..12 {
+            match tunnel.punch_tick("10.0.0.2") {
+                Ok(()) => {}
+                Err(_) => break,
+            }
+            if tunnel.peer_state("10.0.0.2") == Some(TunnelState::Connected) {
+                break;
+            }
+        }
+
+        assert_eq!(tunnel.peer_state("10.0.0.2"), Some(TunnelState::Connected));
+        assert_eq!(
+            tunnel.peer_locator("10.0.0.2").as_deref(),
+            Some("relay://relay.example.org:443")
+        );
+        assert!(
+            tunnel
+                .events()
+                .iter()
+                .any(|e| matches!(e, VirtualSubnetEvent::HolePunchFailed { .. }))
+        );
+        assert!(
+            tunnel
+                .events()
+                .iter()
+                .any(|e| matches!(e, VirtualSubnetEvent::RelayFallback { .. }))
+        );
+    }
+
+    #[test]
+    fn test_hole_punch_frames_not_written_to_vpi() {
+        // ph/pa 打洞帧是控制面：不写 VPI（B 收 ph 后 send_buf 为空）。
+        let cfg_a = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
+        let cfg_b = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.2");
+        let (ca, cb) = MemoryCarrier::connected_pair();
+        let vpi_b = MemoryVpi::new();
+        let vpi_b_sent = vpi_b.sent_handle();
+        let mut ta = VirtualSubnetTunnel::new(cfg_a, Box::new(MemoryVpi::new()), Box::new(ca));
+        let mut tb = VirtualSubnetTunnel::new(cfg_b, Box::new(vpi_b), Box::new(cb));
+        ta.add_peer(TunnelPeer::new("10.0.0.2", "mem-b")).unwrap();
+        tb.add_peer(TunnelPeer::new("10.0.0.1", "mem-a")).unwrap();
+
+        ta.begin_hole_punch("10.0.0.2", "mem-b").unwrap();
+        let mut buf = [0u8; 4096];
+        tb.recv_and_deliver(&mut buf).unwrap(); // B 收 ph → 回 pa（控制面）
+        let payload = {
+            let mut v = vpi_b_sent.lock().unwrap();
+            let p = v.clone();
+            v.clear();
+            p
+        };
+        assert!(payload.is_empty(), "punch frames must not reach VPI");
+
+        ta.recv_and_deliver(&mut buf).unwrap(); // A 收 pa → 落账
+        assert_eq!(ta.peer_state("10.0.0.2"), Some(TunnelState::Connected));
+    }
+
+    // ---------- P4.2 §12.9.3 边界路径（Review R1 WARN 闭合） ----------
+
+    #[test]
+    fn test_hole_punch_ph_learns_source_from_carrier() {
+        // B 收 ph 时 carrier.last_peer_locator()=Some(公网映射)：
+        // B 侧 A locator 更新为来源（NAT 会话回程）+ 回 pa 到来源 → A 落账 Connected。
+        let cfg_a = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
+        let cfg_b = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.2");
+        let (ca, cb) = MemoryCarrier::connected_pair();
+        cb.set_last_source("udp://203.0.113.1:5000");
+        let mut ta = VirtualSubnetTunnel::new(cfg_a, Box::new(MemoryVpi::new()), Box::new(ca));
+        let mut tb = VirtualSubnetTunnel::new(cfg_b, Box::new(MemoryVpi::new()), Box::new(cb));
+        ta.add_peer(TunnelPeer::new("10.0.0.2", "mem-b")).unwrap();
+        tb.add_peer(TunnelPeer::new("10.0.0.1", "initial-a"))
+            .unwrap();
+
+        ta.begin_hole_punch("10.0.0.2", "mem-b").unwrap();
+        let mut buf = [0u8; 4096];
+        for _ in 0..10 {
+            tb.recv_and_deliver(&mut buf).unwrap();
+            ta.recv_and_deliver(&mut buf).unwrap();
+            if ta.peer_state("10.0.0.2") == Some(TunnelState::Connected) {
+                break;
+            }
+            ta.punch_tick("10.0.0.2").unwrap();
+        }
+
+        // B 侧 A 的 locator 动态学习为来源（NAT 回程）
+        assert_eq!(
+            tb.peer_locator("10.0.0.1").as_deref(),
+            Some("udp://203.0.113.1:5000")
+        );
+        assert_eq!(tb.peer_state("10.0.0.1"), Some(TunnelState::Connected));
+        // A 侧落账 + 事件
+        assert_eq!(ta.peer_state("10.0.0.2"), Some(TunnelState::Connected));
+        assert!(tb.events().iter().any(|e| matches!(
+            e,
+            VirtualSubnetEvent::PeerLocatorUpdated { new_locator, .. }
+                if new_locator == "udp://203.0.113.1:5000"
+        )));
+    }
+
+    #[test]
+    fn test_hole_punch_pa_ignored_when_not_probing() {
+        // 未发起打洞（无 pending）：收到 pa 确认帧不落账（防伪造成功）。
+        let cfg_a = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
+        let (ca, _cb) = MemoryCarrier::connected_pair();
+        ca.inject(b"pa:10.0.0.2:NXHP");
+        let mut ta = VirtualSubnetTunnel::new(cfg_a, Box::new(MemoryVpi::new()), Box::new(ca));
+        ta.add_peer(TunnelPeer::new("10.0.0.2", "mem-b")).unwrap();
+
+        let mut buf = [0u8; 4096];
+        let r = ta.recv_and_deliver(&mut buf).unwrap();
+        assert!(r.is_none(), "unexpected pa must be swallowed");
+        assert_ne!(ta.peer_state("10.0.0.2"), Some(TunnelState::Connected));
+        assert!(
+            !ta.events()
+                .iter()
+                .any(|e| matches!(e, VirtualSubnetEvent::HolePunchSucceeded { .. }))
+        );
+    }
+
+    #[test]
+    fn test_hole_punch_magic_mismatch_dropped() {
+        // magic 错配的打洞帧被丢弃：不回 pa、不置 Connected、不写 VPI。
+        let cfg_b = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.2");
+        let (ca, cb) = MemoryCarrier::connected_pair();
+        cb.inject(b"ph:10.0.0.1:BAD!");
+        let vpi_b = MemoryVpi::new();
+        let vpi_b_sent = vpi_b.sent_handle();
+        let mut ta = VirtualSubnetTunnel::new(
+            VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1"),
+            Box::new(MemoryVpi::new()),
+            Box::new(ca),
+        );
+        let mut tb = VirtualSubnetTunnel::new(cfg_b, Box::new(vpi_b), Box::new(cb));
+        ta.add_peer(TunnelPeer::new("10.0.0.2", "mem-b")).unwrap();
+        tb.add_peer(TunnelPeer::new("10.0.0.1", "mem-a")).unwrap();
+
+        let mut buf = [0u8; 4096];
+        let r = tb.recv_and_deliver(&mut buf).unwrap();
+        assert!(r.is_none(), "bad-magic frame must be dropped");
+        assert_eq!(tb.peer_state("10.0.0.1"), Some(TunnelState::Disconnected));
+        let payload = {
+            let mut v = vpi_b_sent.lock().unwrap();
+            let p = v.clone();
+            v.clear();
+            p
+        };
+        assert!(payload.is_empty());
+        // A 无回包（B 未回 pa）
+        let r2 = ta.recv_and_deliver(&mut buf).unwrap();
+        assert!(r2.is_none());
     }
 }

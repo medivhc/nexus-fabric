@@ -1321,6 +1321,58 @@ XOR-RELAYED-ADDRESS / 生命周期；DERP 是进程内字节中继。
   MESSAGE-INTEGRITY 往返）+ MockTransport 驱动 401 挑战 -> 凭证重发 -> Allocated，
   relayed_addr=192.0.2.1:54320、realm/nonce 非空。真实公网 TURN Allocate 为 E5 外部观察。
 
+#### 12.9.3 P4.2 tunnel 级双向打洞状态机（HolePuncher 挂接，2026-09-25）{#12-holepunch-tunnel}
+
+§12.9 的 `probe_peer`/`apply_hole_punch`/`fallback_to_relay` 是"外部打洞成功后
+落账"的骨架 API。本节把**打洞状态机挂接到 tunnel 数据面**：打洞帧与数据帧/握手帧
+**共用同一 PacketCarrier（同一 socket，WireGuard 风格）**——tunnel 不新增 socket
+依赖、保持 portable 边界（§11），真实 UDP 由 `UdpCarrier`（nexus-platform）提供。
+
+- 打洞帧协议（虚拟子网层载体，明文，不与数据帧冲突）：
+  - `ph:<peer_vip>:<magic4>`：发起方打洞请求（punch hello）。
+  - `pa:<peer_vip>:<magic4>`：接收方确认（punch ack），回包到发起方来源地址。
+  - `magic4 = b"NXHP"`：防把数据帧/握手帧误判为打洞帧。
+- 接入 API（`VirtualSubnetTunnel`，非阻塞 + 显式推进，便于单进程 E4 与
+  双进程 E5 共用同一驱动循环）：
+  - `begin_hole_punch(peer_vip, target: &str) -> Result<(), ConnectivityError>`：
+    非阻塞发起：peer 置 `Probing` + `HolePunchStarted` 事件 + 记录 pending
+    punch { target, attempts: 0 }，经 carrier 向 target 发第 1 个 `ph` 帧。
+  - `punch_tick(peer_vip) -> Result<(), ConnectivityError>`：推进一次重试状态机——
+    若该 peer 已 Connected 则幂等 Ok；否则 attempts+1：attempts < max_attempts
+    → 重发 `ph` 帧并 Ok；attempts == max_attempts → `HolePunchFailed { reason }`
+    事件 + 清理 pending：若已配置 relay locator（`relay_locator(peer_vip)` 非空）
+    → 自动 `fallback_to_relay`（保底，Connected + `RelayFallback` 事件）并 Ok，
+    否则返回 Err(`HOLE_PUNCH_FAILED`)。
+  - 调用方驱动循环（E4/E5 通用）：`begin_hole_punch` → 循环 { 各端
+    `recv_and_deliver`（ph 自动回 pa、pa 自动落账）；观察 Connected；未达则
+    `punch_tick`；达 deadline 停止 }。
+  - `relay_locator(peer_vip) -> Option<String>`：查询已配置 relay locator
+    （TURN 中继地址，§12.9.2 分配所得），供失败回退判定。
+- 接收侧分流（`recv_and_deliver`）：`ph:` 帧 → 学习来源
+  （`last_peer_locator`，NAT 会话回程）+ 经 carrier 回 `pa` 帧到来源 +
+  `Ok(None)`；`pa:` 帧 → 学习来源 + 若该 peer 处于 `Probing`（本端发起中）则
+  完成打洞（`apply_hole_punch(peer_vip, source)` 落账 + Connected +
+  `PeerLocatorUpdated` + `HolePunchSucceeded { target }` 事件）。非打洞/
+  握手/数据帧行为不变。
+- 重试配置：`HolePunchConfig { max_attempts: u32 = 10, attempt_timeout: Duration =
+  500ms, magic: [u8; 4] = b"NXHP" }`（总预算 ~5s，与 `HolePuncher::punch` 对齐）。
+- 事件：`VirtualSubnetEvent` 新增 `HolePunchStarted { peer_vip }` /
+  `HolePunchSucceeded { peer_vip, target }` / `HolePunchFailed { peer_vip, reason }`
+  （tunnel_id 贯通；与 `NatEvent` 语义对齐，可观测打洞全流程）。
+- 失败语义：peer 未注册 → `PEER_NOT_FOUND`；对端来源学习仅在 `ph`/`pa` 帧
+  （不可伪造成功，`pa` 仅在本地发起 `Probing` 时落账）；重试幂等（多次调用
+  不残留状态，`HolePunchStarted` 每次新发）。
+- E2 单测：成功路径（ph→pa→locator 更新 + Connected + 帧走新 locator）、
+  失败路径（无监听 target → 尝试耗尽 → Failed + 无 relay 时 Err / 有 relay 时
+  自动 fallback）、`ph` 请求自动回 `pa` + 来源学习、`ph`/`pa` 帧不写 VPI。
+- E4 场景：`virtual_subnet_holepunch.toml`（id=product.virtual-subnet-holepunch）——
+  回环双进程真实 UDP（复用 P4.1 `udp_peer_identity` 双进程模式）：A 对 B
+  `begin_hole_punch`（B 初始 locator 占位不可达）→ B 收 `ph` 自动回 `pa` →
+  A 落账 Connected + 数据帧经直连送达（roundtrip 成功）；失败路径：target
+  无监听 → HolePunchFailed +（配置 relay 时）fallback_to_relay。
+- 冻结边界（本子项不做）：多候选并发打洞、NAT 类型驱动的路径选择
+  （STUN 探测决策直连/relay）、真实公网跨 NAT 打洞 E5（vps 恢复后补）。
+
 ### 12.10 P2.3+P2.4 广域协调核心 + 自动 IP 分配（2026-09-21）{#12-coord}
 
 静态 locator 无法扩展（IP 漂移、NAT 后不可预知）。本节交付**协调控制平面核心**与
