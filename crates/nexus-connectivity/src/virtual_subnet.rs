@@ -235,6 +235,8 @@ pub enum VirtualSubnetEvent {
         tunnel_id: String,
         /// Peer virtual IP.
         peer_vip: String,
+        /// Candidate target locators attempted (P4.2 §12.9.5).
+        targets: Vec<String>,
     },
     /// Hole punch completed via pa ack (P4.2 §12.9.3).
     HolePunchSucceeded {
@@ -253,6 +255,8 @@ pub enum VirtualSubnetEvent {
         peer_vip: String,
         /// Failure reason.
         reason: String,
+        /// Candidate target locators attempted (P4.2 §12.9.5).
+        targets: Vec<String>,
     },
     /// Path decision emitted from NAT-type-driven selection (P4.2 §12.9.4).
     PathDecided {
@@ -957,6 +961,7 @@ impl VirtualSubnetTunnel {
         self.events.push(VirtualSubnetEvent::HolePunchStarted {
             tunnel_id: self.tunnel_id.clone(),
             peer_vip: peer_virtual_ip.to_string(),
+            targets: targets.to_vec(),
         });
         let frame = hole_punch_frame(b'h', &self.config.virtual_ip, &self.hole_punch_config.magic);
         for target in targets {
@@ -999,11 +1004,13 @@ impl VirtualSubnetTunnel {
         }
         // 尝试耗尽 → 失败
         let reason = format!("attempts exhausted ({})", pending.attempts);
+        let tried_targets = pending.targets.clone();
         self.pending_punches.remove(peer_virtual_ip);
         self.events.push(VirtualSubnetEvent::HolePunchFailed {
             tunnel_id: self.tunnel_id.clone(),
             peer_vip: peer_virtual_ip.to_string(),
             reason: reason.clone(),
+            targets: tried_targets,
         });
         if let Some(relay) = self.relay_locators.get(peer_virtual_ip).cloned() {
             self.fallback_to_relay(peer_virtual_ip, relay)?;
@@ -2763,6 +2770,12 @@ mod tests {
             e,
             VirtualSubnetEvent::HolePunchSucceeded { target, .. } if target == "mem-b"
         )));
+        // WARN-5：HolePunchStarted 携带候选列表。
+        assert!(ta.events().iter().any(|e| matches!(
+            e,
+            VirtualSubnetEvent::HolePunchStarted { targets, .. }
+                if targets == &["udp://127.0.0.1:9".to_string(), "mem-b".to_string()]
+        )));
     }
 
     #[test]
@@ -2868,5 +2881,94 @@ mod tests {
             .begin_hole_punch_multi("10.0.0.99", &["x".to_string()])
             .unwrap_err();
         assert!(err.to_string().contains("PEER_NOT_FOUND"));
+    }
+
+    #[test]
+    fn test_hole_punch_multi_second_pa_after_connected_is_ignored() {
+        // WARN-3：multi 落账 Connected 后，迟到 pa 幂等忽略（Succeeded 不重复）。
+        let (ca, cb) = MemoryCarrier::connected_pair();
+        ca.set_last_source("mem-b");
+        cb.set_last_source("mem-b");
+        let mut ta = VirtualSubnetTunnel::new(
+            VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1"),
+            Box::new(MemoryVpi::new()),
+            Box::new(ca),
+        );
+        let mut tb = VirtualSubnetTunnel::new(
+            VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.2"),
+            Box::new(MemoryVpi::new()),
+            Box::new(cb),
+        );
+        ta.add_peer(TunnelPeer::new("10.0.0.2", "mem-b")).unwrap();
+        tb.add_peer(TunnelPeer::new("10.0.0.1", "mem-a")).unwrap();
+        ta.begin_hole_punch_multi(
+            "10.0.0.2",
+            &["udp://127.0.0.1:9".to_string(), "mem-b".to_string()],
+        )
+        .unwrap();
+        let mut buf = [0u8; 4096];
+        for _ in 0..10 {
+            tb.recv_and_deliver(&mut buf).unwrap();
+            ta.recv_and_deliver(&mut buf).unwrap();
+            if ta.peer_state("10.0.0.2") == Some(TunnelState::Connected) {
+                break;
+            }
+            ta.punch_tick("10.0.0.2").unwrap();
+        }
+        assert_eq!(ta.peer_state("10.0.0.2"), Some(TunnelState::Connected));
+        let succeeded_before = ta
+            .events()
+            .iter()
+            .filter(|e| matches!(e, VirtualSubnetEvent::HolePunchSucceeded { .. }))
+            .count();
+        // 迟到 pa（sender = 对端 vip）：非 Probing → 守卫拒绝，幂等忽略。
+        // B 侧 carrier 直发（B.send_buf 与 A.recv_buf 共享）。
+        let late_pa = hole_punch_frame(b'a', "10.0.0.2", &ta.hole_punch_config.magic);
+        tb.carrier.send_to("mem-a", &late_pa).unwrap();
+        ta.recv_and_deliver(&mut buf).unwrap();
+        assert_eq!(ta.peer_state("10.0.0.2"), Some(TunnelState::Connected));
+        let succeeded_after = ta
+            .events()
+            .iter()
+            .filter(|e| matches!(e, VirtualSubnetEvent::HolePunchSucceeded { .. }))
+            .count();
+        assert_eq!(
+            succeeded_before, succeeded_after,
+            "second pa after Connected must be idempotently ignored"
+        );
+    }
+
+    #[test]
+    fn test_hole_punch_multi_pa_without_source_falls_back_to_first_target() {
+        // WARN-4：pa 无来源（last_source=None）→ 兜底 targets.first() 落账。
+        let (ca, cb) = MemoryCarrier::connected_pair(); // 不 set_last_source
+        let mut ta = VirtualSubnetTunnel::new(
+            VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1"),
+            Box::new(MemoryVpi::new()),
+            Box::new(ca),
+        );
+        let mut tb = VirtualSubnetTunnel::new(
+            VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.2"),
+            Box::new(MemoryVpi::new()),
+            Box::new(cb),
+        );
+        ta.add_peer(TunnelPeer::new("10.0.0.2", "mem-b")).unwrap();
+        tb.add_peer(TunnelPeer::new("10.0.0.1", "mem-a")).unwrap();
+        ta.begin_hole_punch_multi("10.0.0.2", &["dead-first".to_string(), "mem-b".to_string()])
+            .unwrap();
+        let mut buf = [0u8; 4096];
+        for _ in 0..10 {
+            tb.recv_and_deliver(&mut buf).unwrap();
+            ta.recv_and_deliver(&mut buf).unwrap();
+            if ta.peer_state("10.0.0.2") == Some(TunnelState::Connected) {
+                break;
+            }
+            ta.punch_tick("10.0.0.2").unwrap();
+        }
+        assert_eq!(ta.peer_state("10.0.0.2"), Some(TunnelState::Connected));
+        assert!(ta.events().iter().any(|e| matches!(
+            e,
+            VirtualSubnetEvent::HolePunchSucceeded { target, .. } if target == "dead-first"
+        )));
     }
 }

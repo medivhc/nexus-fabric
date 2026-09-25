@@ -227,6 +227,11 @@ NAT/中继场景的物理建连（组合根 transport::connect）发生在激活
 - 失败语义：未注册 peer → `PEER_NOT_FOUND`；空候选列表 →
   `HOLE_PUNCH_EMPTY_TARGETS`；尝试耗尽 → `HolePunchFailed` 事件 + 配置了
   relay locator 则自动 `fallback_to_relay` 并 Ok，否则 Err(`HOLE_PUNCH_FAILED`)。
+- 重复发起语义（WARN-1 吸收）：同 peer 再次 `begin_hole_punch_multi` 覆盖旧
+  pending（targets / attempts 重置）——新发起取代在途打洞；不发射
+  `HolePunchSuperseded` 事件，观察者以最后一次 `HolePunchStarted` 为准。
+- 事件载荷（WARN-5 吸收）：`HolePunchStarted` 与 `HolePunchFailed` 携带
+  `targets: Vec<String>`（本次尝试的候选列表），失败后可按事件面复盘候选。
 - MemoryCarrier 数据报语义（P4.2）：`send_buf/recv_buf` 改 `Vec<Vec<u8>>`
   逐帧存取（`receive_into` 每次弹一帧），`inject/inject_recv` 追加单帧；
   多候选多帧不拼接。`last_source` 仍为测试 seam（`set_last_source`），
