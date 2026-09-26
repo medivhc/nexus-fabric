@@ -215,7 +215,7 @@ Harness 不拥有业务真相、不重写 Cargo/Git/Test/Tracing/Benchmark，也
 
 ## 11. 代理内核产品线（Rule-Based Routing Proxy）
 
-代理内核是独立于 §6 远程资源访问闭环的第二条产品线，其驱动链与既有
+代理内核是独立于 PRODUCT §6 远程资源访问闭环（Remote Resource Access）的第二条产品线，其驱动链与既有
 Ingress -> Application Service -> Policy -> Core Planner -> Session Runtime ->
 Network Runtime 平行但不合并：
 

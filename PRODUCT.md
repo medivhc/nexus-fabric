@@ -16,6 +16,27 @@ Compute
 
 这些是产品分类，不是互相割裂的底层系统。
 
+### 1.1 设备能力（Devices） {#devices}
+
+设备能力与 Network / Service / Workspace / Compute 并列，是 Resource 的一种
+产品分类。设备能力指节点上可由资源运行时激活、观测与回收的平台级能力，
+P0 冻结为：
+
+```text
+VirtualPacketInterface   虚拟网卡数据面（TUN / wintun / 平台 packet tunnel，§8 / §12.29）
+SecureStore              平台级加密持久化（DPAPI / machine-id，§12.30 / §12.31）
+SystemProxyController    WinINET 系统代理控制（snapshot / apply / refresh，§13）
+AutostartRegistrar       登录自启注册（install / remove / status，§13）
+```
+
+- 设备能力经平台 capability adapter 注入使用；Portable Core 不直接调用平台
+  API（§8 / §11.18 / §12.29 平台边界语义保持）。
+- 能力缺失必须显式返回 `Unavailable` / 结构化降级路径，禁止静默改变产品语义
+  （§8 / §13 语义；如 secure-store 缺失 → `SECURE_STORE_UNAVAILABLE`，§12.31）。
+- 设备能力不作为独立 Command 面暴露：其用户可观察语义由其消费产品线承载
+  （subnet / system-proxy / secure-state），本小节不新增 CLI 命令、不新增
+  expectation。
+
 ## 2. Network / InternetAccess {#network}
 
 Network Resource 必须支持：
@@ -225,11 +246,33 @@ PRODUCT §9）。
   业务成功 exit 0；结构化失败（`UNSUPPORTED` / `DAEMON_UNREACHABLE` / 领域拒绝）输出
   `verdict=FAIL` JSON 且 exit 0（请求已被处理）。
 
+### 9.2 Observe + Adapt 反馈闭环 {#observe-adapt}
+
+README 的资源使用流水线以 Observe + Adapt 收尾：可观察快照（§9）不是终点，
+而是 Core Planner 重规划的输入。
+
+- Observe：CLI / GUI / Agent 经 §9 命令族取得结构化快照（status / connectivity /
+  dns / session / measurement / plan explain）。
+- Adapt：观测到 Connectivity 失效、DNS 解析变化、Measurement 劣化或 Session
+  失败时，Core Planner 重新执行 Plan（Provider / Placement / Path /
+  ExecutionStrategy），产出替代 Plan（Replan）；Replan 结果经 `plan explain` /
+  `session watch` 可观察（§2 的 Replan 可观察项是本闭环的产品语义锚点）。
+- 闭环边界：Adapt 不静默改变已生效 Session 的 TerminalOutcome；替代 Plan 仍须
+  走 §2 / §6 的 Session → Connectivity 时序（Plan before Connectivity 保持）。
+- 本小节是产品语义声明：不新增命令、不修改九/六命令已冻结的可观察语义
+  （2026-09-18 冻结 expectation 保持 Protected）。
+
 ## 10. 完成条件
 
 关键用户可见 Capability 原则上至少需要一条 E4 Product Scenario 或 E5 External Observation 证据。
 
 代码存在、单元测试通过、Agent 声称完成、README 标记完成，都不是最终完成判据。
+
+### 10.1 幂等与重复触发（Idempotency） {#idempotency}
+
+对可能重复提交的外部副作用（Schedule 触发、Connectivity 事件上报、Write-back
+Commit），模块必须提供幂等键或等价去重机制，由调用方以幂等键消除重复触发
+风险。本仓库不承诺跨进程 exactly-once（语义详见 §14.4）。
 
 ## 11. 代理内核 / Rule-Based Routing Proxy {#11-proxy-kernel}
 
@@ -1238,7 +1281,7 @@ delivery 层（`nexus-connectivity::qos`）。纯内存、纯同步、可注入�
 
 ### 12.9 P2.2 NAT 打洞集成（数据面闭环，2026-09-21）{#12-nat-probe}
 
-nat.rs（`nexus-connectivity::nat`：StunClient / HolePuncher / NatType，PRODUCT §connectivity）
+nat.rs（`nexus-connectivity::nat`：StunClient / HolePuncher / NatType，PRODUCT §6 Connectivity 链路激活语义）
 已交付且 E4 已绿；§12.1-§12.8 的 peer locator 为**静态配置注入**。本节把打洞接入
 虚拟子网数据面：打洞成功 → peer locator **动态学习**（切直连）；失败 → **Relay
 回退**（保底路径）。tunnel 侧不持有真实 UDP socket（保持 portable 边界，真实
@@ -2252,7 +2295,7 @@ P0 冻结边界（本项不做）：
 - `Every` 触发成功后 `next_run_secs += interval_secs`，保持 `Scheduled`；
 - 触发失败不推进条目，下次 tick 重试（不静默丢弃）；
 - 崩溃 / 重启：从 `SchedulerSnapshot` 恢复注册表（含 `next_id` 单调性），到期未触发
-  条目重新触发；重复触发风险由调用方幂等键消除（PRODUCT §10.2 / §11.3），本模块
+  条目重新触发；重复触发风险由调用方幂等键消除（PRODUCT §10.1 / §11.3），本模块
   不承诺 exactly-once；
 - 状态权威来源为组合根持久化的快照，恢复为幂等操作。
 
@@ -2268,3 +2311,47 @@ P0 冻结边界（本项不做）：
   `submit.total_calls=4`（at 1 + every 2 + 重载到期 1；cancel 不触发）。
 - 实现：`crates/nexus-scheduler`（portable-core，零 Nexus 内部依赖）；组合根接线在
   `apps/nexus`。
+
+## 15. 持久化与恢复（Persist / Recover） {#15-persist-recover}
+
+README 的资源使用流水线以 Persist / Recover 收尾。本仓库对持久状态的恢复
+语义如下（对应 §12.32 / §12.38 引用的「§15 冷启动对账」）。
+
+### 15.1 产品语义
+
+- 有持久状态的关键路径必须支持崩溃恢复（panic / process crash / power loss，
+  AGENTS §15 Crash Consistency 语义）。
+- 恢复路径为幂等操作：冷启动必须先执行 Reconciliation，再接受新任务。
+
+### 15.2 冷启动对账（Cold-Start Reconciliation）
+
+```text
+加载 durable state
+  ↓
+重放 / 验证 journal
+  ↓
+reconcile session
+  ↓
+reconcile workspace heads
+  ↓
+reconcile compute jobs / artifacts
+  ↓
+清理或重建 orphan OS resources
+  ↓
+重新发布 Provider Presence
+  ↓
+accept new work
+```
+
+- 对账步骤与 AGENTS §15 一致；各步骤幂等、可重放。
+- 已成功提交的本地数据不得因远端 Head 变化被静默丢弃（§4 Workspace 语义）。
+- 计划任务的恢复：从 SchedulerSnapshot 恢复注册表，到期未触发条目重触发
+  （§14.4，调用方幂等键消除重复，不承诺 exactly-once，PRODUCT §10.1）。
+
+### 15.3 冻结边界
+
+- 本仓库当前交付的恢复语义按产品线分布：Schedule（§14.4）、Subnet 状态文件
+  （§12.28 / §12.31 / §12.32 leave 语义）、Workspace（§4）。
+- 统一的 daemon 级冷启动对账执行器（把 §15.2 全步骤接入 nexusd serve 启动路径）
+  为后续工作，不在本期冻结 expectation 内；本小节是产品语义声明，不新增命令、
+  不修改既有场景 expectation。
