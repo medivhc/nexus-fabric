@@ -1,0 +1,57 @@
+schema_version = 1
+id = "product.schedule-flow"
+title = "计划任务：at 到期触发一次、every 重排续触发、cancel 阻止、持久化重载"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#14-schedule"
+
+[when]
+command = "cargo run --quiet -p nexus --example schedule_flow -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+# at：到期 tick 触发一次，且后续 tick 不重复提交
+[[expect]]
+field = "at.fired_once"
+equals = true
+
+[[expect]]
+field = "at.no_duplicate"
+equals = true
+
+[[expect]]
+field = "at.state_after_fire"
+equals = "Fired"
+
+# every：触发后 next_run 前移并保持 Scheduled；连续到期继续触发
+[[expect]]
+field = "every.rescheduled"
+equals = true
+
+[[expect]]
+field = "every.fire_count"
+equals = 2
+
+[[expect]]
+field = "every.state_stays_scheduled"
+equals = "Scheduled"
+
+# cancel：取消后即使到期也不触发
+[[expect]]
+field = "cancel.blocked_fire"
+equals = true
+
+# 持久化：保存 -> 重载状态一致；到期未触发条目重载后触发
+[[expect]]
+field = "persist.reload_state_matches"
+equals = true
+
+[[expect]]
+field = "persist.expired_reloaded_fired"
+equals = true
+
+# 提交回调总调用次数 = at(1) + every(2) + 重载到期(1) = 4（cancel 不触发）
+[[expect]]
+field = "submit.total_calls"
+equals = 4

@@ -288,6 +288,7 @@ dependencies = [
  "nexus-proxy",
  "nexus-proxy-config",
  "nexus-registry",
+ "nexus-scheduler",
  "nexus-service",
  "nexus-session",
  "nexus-storage",
@@ -529,6 +530,13 @@ name = "nexus-registry"
 version = "0.1.0"
 dependencies = [
  "nexus-domain",
+]
+
+[[package]]
+name = "nexus-scheduler"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

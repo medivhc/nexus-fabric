@@ -76,6 +76,7 @@ crates = [
   "nexus-registry",
   "nexus-policy",
   "nexus-auth",
+  "nexus-scheduler",
   "nexus-planner",
   "nexus-session",
   "nexus-measurement",

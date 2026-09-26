@@ -87,6 +87,12 @@ portable = true
 layer = "portable-core"
 
 [[crate]]
+name = "nexus-scheduler"
+allowed_internal_dependencies = []
+portable = true
+layer = "portable-core"
+
+[[crate]]
 name = "nexus-session"
 allowed_internal_dependencies = ["nexus-domain"]
 portable = true

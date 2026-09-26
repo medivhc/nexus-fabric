@@ -15,6 +15,7 @@ members = [
   "crates/nexus-dns",
   "crates/nexus-policy",
   "crates/nexus-auth",
+  "crates/nexus-scheduler",
   "crates/nexus-planner",
   "crates/nexus-session",
   "crates/nexus-measurement",
