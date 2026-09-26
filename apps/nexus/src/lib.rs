@@ -17,10 +17,13 @@ pub mod control_service;
 pub mod geoip_sources;
 /// nexusd serve LocalAPI 瘦客户端（裸 TCP HTTP GET，CLI 不再进程内装配 SDK）。
 pub mod localapi_client;
+/// Auto-Mesh 自动挡组网编排器（Phase 1：自动打洞 + 断线重连）。
+pub mod mesh;
 /// §9 可观察性命令（status / plan explain / session watch / connectivity status /
 /// dns status / dns cache / platform capabilities），见 PRODUCT.md#9-observability。
 pub mod observability;
 pub mod provider_fetcher;
+pub mod schedule_cli;
 pub mod subnet_cli;
 /// §11.17 订阅节点在线更新拉取器（HTTP 拉取 + 解析合并 + 热生效 + 结构化并发 Owner）。
 pub mod subscription_updater;
@@ -7861,4 +7864,141 @@ pub fn tun_proxy_real_open(tun_name: &str) -> Result<Value, NexusError> {
             message: "TUN transparent inbound (wintun) only supported on Windows".into(),
         })
     }
+}
+
+/// E4 产品场景 `product.schedule-cli` 的可执行驱动（Composition Root）。
+///
+/// 与 `nexus schedule` CLI 同一代码路径（schedule_cli 模块）：验证 at/every 注册、
+/// 过去时间拒绝、取消、列表、tick 到期触发与持久化重载。使用进程 id 唯一临时
+/// 状态文件，结束后清理；不触碰用户默认注册表（~/.nexus/schedule.json）。
+pub fn schedule_cli_flow() -> Result<Value, NexusError> {
+    use crate::schedule_cli::{
+        error_json, schedule_at, schedule_cancel, schedule_every, schedule_list, schedule_tick,
+        unix_now_secs,
+    };
+
+    let dir = std::env::temp_dir().join(format!("nexus-schedule-cli-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| NexusError::Internal {
+        message: format!("create temp dir: {e}"),
+    })?;
+    let state = dir.join("schedule.json");
+    let _ = std::fs::remove_file(&state);
+
+    let now = unix_now_secs();
+
+    // 1. at：未来时间注册成功，返回 schedule id。
+    let at_ok = schedule_at(
+        now + 100000,
+        "rust-build",
+        &["cargo".to_string(), "test".to_string()],
+        &state,
+    )
+    .is_ok_and(|v| {
+        v["verdict"] == "PASS"
+            && v["schedule_id"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("sch-"))
+    });
+
+    // 2. at 过去时间 → INVALID_SCHEDULE。
+    let invalid_past = match schedule_at(now - 1, "rust-build", &["cargo".to_string()], &state) {
+        Err(e) => error_json("schedule at", &e)["verdict"] == "INVALID_SCHEDULE",
+        Ok(_) => false,
+    };
+
+    // 3. every 注册成功。
+    let every_ok = schedule_every(
+        60,
+        "rust-build",
+        &["cargo".to_string(), "build".to_string()],
+        &state,
+    )
+    .is_ok_and(|v| v["verdict"] == "PASS");
+
+    // 4. list：注册后共 2 条。
+    let after_register = schedule_list(&state)
+        .map(|v| v["count"].as_u64().unwrap_or(0))
+        .unwrap_or(0);
+
+    // 5. cancel：第一条取消成功；取消不存在 id → SCHEDULE_NOT_FOUND。
+    let first_id = schedule_list(&state)
+        .ok()
+        .and_then(|v| v["schedules"].as_array().cloned())
+        .and_then(|arr| arr.first().cloned())
+        .and_then(|e| e["id"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    let cancel_ok = schedule_cancel(&first_id, &state).is_ok_and(|v| v["state"] == "Cancelled");
+    let cancel_not_found = match schedule_cancel("sch-999", &state) {
+        Err(e) => error_json("schedule cancel", &e)["verdict"] == "SCHEDULE_NOT_FOUND",
+        Ok(_) => false,
+    };
+
+    // 6. list：取消后仍 2 条（PRODUCT §14.1「列出全部条目」，Cancelled 条目保留）。
+    let after_cancel = schedule_list(&state)
+        .map(|v| v["count"].as_u64().unwrap_or(0))
+        .unwrap_or(0);
+
+    // 7. tick：以当前墙钟锚定注册 2 秒后到期的 at 条目，sleep 3 秒后 tick 触发恰 1 条
+    //（不依赖流程开头的 now 快照，消除慢机器上的 2 秒漂移窗口）。
+    schedule_at(
+        unix_now_secs() + 2,
+        "rust-build",
+        &["cargo".to_string(), "test".to_string()],
+        &state,
+    )
+    .map_err(|e| NexusError::Internal {
+        message: format!("schedule_at: {e}"),
+    })?;
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let tick_fired_once = schedule_tick(&state, unix_now_secs())
+        .is_ok_and(|v| v["fired"] == 1 && v["records"][0]["ok"] == true);
+
+    // 8. 持久化重载：重新读注册表，条目数与 next_run 均保留（PRODUCT §14.4）。
+    let before: Vec<(String, i64)> = schedule_list(&state)
+        .ok()
+        .and_then(|v| v["schedules"].as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .map(|e| {
+            (
+                e["id"].as_str().unwrap_or("").to_string(),
+                e["next_run_secs"].as_i64().unwrap_or(0),
+            )
+        })
+        .collect();
+    let reloaded = schedule_list(&state)
+        .ok()
+        .and_then(|v| v["schedules"].as_array().cloned())
+        .unwrap_or_default();
+    let reload_preserved = reloaded.len() == before.len()
+        && before.iter().all(|(id, next)| {
+            reloaded.iter().any(|e| {
+                e["id"].as_str() == Some(id.as_str()) && e["next_run_secs"].as_i64() == Some(*next)
+            })
+        });
+
+    // 清理临时目录。
+    let _ = std::fs::remove_file(&state);
+    let _ = std::fs::remove_dir(&dir);
+
+    let ok = at_ok
+        && invalid_past
+        && every_ok
+        && after_register == 2
+        && cancel_ok
+        && cancel_not_found
+        && after_cancel == 2
+        && tick_fired_once
+        && reload_preserved;
+
+    Ok(json!({
+        "verdict": if ok { "PASS" } else { "FAIL" },
+        "command": "schedule-cli",
+        "at": { "register_ok": at_ok, "invalid_past_rejected": invalid_past },
+        "every": { "register_ok": every_ok },
+        "cancel": { "ok": cancel_ok, "not_found": cancel_not_found },
+        "list": { "after_register": after_register, "after_cancel": after_cancel },
+        "tick": { "fired_once": tick_fired_once },
+        "persist": { "reload_preserved": reload_preserved },
+    }))
 }

@@ -1,19 +1,21 @@
 # Nexus 用户手册
 
 > 版本：基于 master
-> `0a819ed`
-> （2026-09-20 校验；工作区含未提交无关文件，dirty_state=true）
+> `b6c2a41`
+> （2026-09-26 校验；工作区含未提交无关文件，dirty_state=true）
 > 校验证据：
 > `nexus-harness verify --full`
 > →
-> **21/21 门禁 PASS，0 FAIL，0 unknown**
-> （evidence
-> `verify-25a825fea486`
-> ，绑定 0a819ed /dirty，contract_hash b7eb77d4…）
+> **22/22 门禁 PASS，0 FAIL，0 unknown**
+> （evidence `verify-4ce69aac9494`，绑定 b6c2a41 /dirty，contract_hash 2384d0f0…）
+> 2026-09-26：计划任务 CLI 接入（PRODUCT §14，`nexus schedule at|every|list|cancel|tick`，
+> 新 E4 场景 `product.schedule-cli` / `product.schedule-cli-reachable`，Red Evidence
+> `.evidence/red-schedcli-20260926/`）；`nexusd` 用法错误 exit 统一为 2、USAGE 补
+> subnet/system-proxy/autostart/proxy speedtest。修复/落地记录见 §6.2。
 > 2026-09-20：NAT 场景 TOML 修复 + 9 个 `cli-*` 场景 thin-client 契约（requirement-change）
 > 后 product-scenarios 转绿；随后 **Workspace Projection 通道落地**（NativeApi WorkingSet +
 > MaterializedDirectory 物化目录，E4 场景 `platform.workspace-projection-channels` 16 期望）
-> 已合并（0a819ed）。修复/落地记录见 §6.2。
+> 已合并（0a819ed）。
 > 本手册所列每个功能的可机检场景（E4/E3）在本次校验中均 PASS。
 
 本手册只收录**有完整实现逻辑、用户可达**的功能。每个功能均附代码级校验：可机检场景（E4/E3）在 `verify --full` 中 PASS、可执行驱动（example / CLI 命令 / 集成测试）与来源代码路径。
@@ -97,7 +99,7 @@ cargo build --workspace
 
 ## 3. 功能总览
 
-以下 44 项功能均已通过代码级校验（场景 / 集成测试 PASS + 驱动可运行）。括号内为场景 ID 与期望条数；历史遗留限制与本次修复记录见 §6。
+以下 50 项功能均已通过代码级校验（场景 / 集成测试 PASS + 驱动可运行）。括号内为场景 ID 与期望条数；历史遗留限制与本次修复记录见 §6。45–50 为 2026-09-26 实测落地项（schedule CLI 有 E4 场景；其余为 E5 实测 + example 驱动）。
 
 
 
@@ -147,6 +149,12 @@ cargo build --workspace
 | 42 | nexus CLI thin-client + run                             | `product.cli-run-command` (5)                                                                                                                                                               | `nexus run service --json` / `nexus status --json`          |
 | 43 | 真实节点数据面（host /relay/ SOCKS5）                            | `daemon-real-host-flow` (9) / `daemon-real-relay-flow` (9) / `daemon-real-socks-proxy-flow` (11) / `daemon-real-host-auth-denied` (5)                                                       | \`nexusd host                                               |
 | 44 | 独立 Review + 动态知识库                                       | （工程方法论，非用户功能）                                                                                                                                                                               | `.agents/skills/` + `.agents/knowledge/`                    |
+| 45 | 计划任务 CLI（PRODUCT §14）                                 | `product.schedule-cli` (10) / `product.schedule-cli-reachable` (1)                                                                                                                                        | `nexus schedule at\|every\|list\|cancel\|tick`            |
+| 46 | nexus CLI 虚拟子网命令族                                        | `product.virtual-subnet-tunnel` (7) / `product.virtual-subnet-mesh-3node` (9)（进程内 SDK 入口）                                                                                                            | `nexus subnet up\|status\|leave\|punch`                  |
+| 47 | nexusd 托管 subnet（daemon 组合根）                               | 实测 E5（PRODUCT §12.32 / §12.38；`--tun` 须与 `--foreground` 同用）                                                                                                                                | `nexusd subnet up\|status\|leave [--config] [--foreground] [--tun]` |
+| 48 | TUN 透明入站数据面（wintun）                                       | 实测 E5（需管理员 + wintun.dll 与 exe 同目录；PRODUCT §11.18 / §12.38）                                                                                                                                 | `nexusd proxy --tun` / `nexus subnet up --tun`            |
+| 49 | 系统代理控制（WinInet）                                          | 实测 E5（PRODUCT §8 / §13；`e2e` 自清理闭环）                                                                                                                                                | `nexusd system-proxy status\|set\|clear\|e2e`          |
+| 50 | 开机自启注册（Task Scheduler ONLOGON）                             | 实测 E5（PRODUCT §13.2）                                                                                                                                                                          | `nexusd autostart install\|remove\|status`              |
 
 
 
@@ -759,6 +767,39 @@ whitespace、format、check、clippy、architecture-policy、dependency-governan
 3. **旧手册验证声明已 STALE → 已回写**：旧版头部声称 "基于 9f5dc8e / 21 门禁全 PASS
    （evidence verify-c909d8536eb6）"，而该证据绑定 `4539d3f4`（非 9f5dc8e），且 HEAD 已推进
    24 个提交。本次已按修复后 HEAD 重新校验并如实记录（见头部证据 ID）。
+
+### 6.3 修复记录（2026-09-26：feature + bugfix，HEAD b6c2a41 校验发现）
+
+1. **`nexus schedule` CLI 完全不可达 → 已修复（feature，Contract-First）**：PRODUCT §14 契约
+   已冻结（`schedule at|every|list|cancel|tick` 五操作 + 三错误名），但旧实现 `nexus schedule`
+   报 `unknown command`（exit 2）、E4 example 不存在（exit 101）。本次按契约先行落地：
+   新增 `apps/nexus/src/schedule_cli.rs`（组合根：注册表持久化 `~/.nexus/schedule.json`，
+   `--state` 可覆盖；snapshot/restore 崩溃重载，损坏快照显式 `STATE_ERROR` 不静默丢弃）、
+   `apps/nexus/src/main.rs` 接线（`run_schedule`：at/every/list/cancel/tick；用法错误 exit 2，
+   业务错误输出 `INVALID_SCHEDULE` / `SCHEDULE_NOT_FOUND` / `SUBMIT_FAILED` JSON exit 0）、
+   E4 驱动 `apps/nexus/examples/schedule_cli_flow.rs`。新场景
+   `product.schedule-cli`（10 期望）/ `product.schedule-cli-reachable`（1 期望）；
+   Red Evidence `.evidence/red-schedcli-20260926/`（旧实现双 FAIL）。实现中发现并修正
+   1 处错误契约期望（`list.after_cancel` 1→2，依据 PRODUCT §14.1「列出全部条目」）。
+
+2. **`nexusd` 帮助未列已实现命令、用法错误 exit 不一致 → 已修复（bugfix）**：
+   `nexusd --help`（兜底 usage）未列 subnet / system-proxy / autostart / proxy speedtest
+   （实测均可用）；5 处用户可达的用法错误路径从 `ExitCode::FAILURE`（1）统一为 2
+   （main 兜底未知命令、`subnet` 缺子命令 / `up` 缺 `--config` / 未知子命令、
+   `host` 缺 resource），与 nexus CLI 的 exit 语义对齐（0=业务已处理，2=用法错误）；
+   system-proxy / autostart 的未知子命令输出 JSON FAIL（exit 0，属业务结果）保持不变。
+
+3. **手册基线落后 HEAD 一周 → 已回写**：旧手册声明基于 0a819ed（2026-09-20，
+   evidence verify-25a825fea486），而 09-21 后落地功能（schedule CLI、subnet CLI、
+   TUN 数据面、身份自动交换、订阅在线更新等示例面）均未收录，按手册自述规则旧证据
+   已 STALE。本次已按当前 HEAD（b6c2a41）重新校验并如实记录：§3 功能清单 44→50，
+   并补充「已实现但未纳入 E4 校验的示例面」清单（见下）。
+
+**已实现但未纳入 E4 校验的示例面（E0–E3 级，example 可运行，待补 E4 场景）**：
+`identity_auto_exchange`（身份自动交换）、`proxy_subscription_online_update`（订阅在线更新）、
+`turn_relay_allocate`（TURN relay 分配）、`secure_store`（安全存储）、`subnet_daemon` /
+`subnet_punch_cli`（daemon 托管 / 打洞 CLI 驱动）、`tun_dataplane` / `tun_proxy`
+（TUN 数据面 example）。
 
 **剩余限制（非阻塞）**：NAT 打洞为 example 级 E4（确定性 STUN mock + 打洞），真实 STUN 服务器
 集成测试待完善；`cli-*` 场景的产品行为由“直接返回数据”收缩为“显式 UNSUPPORTED”，属

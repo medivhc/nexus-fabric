@@ -83,6 +83,14 @@
 - 真实节点测速（PRODUCT §11.10）：TcpLatencyProbe（std::net connect_timeout，非 portable）
   + Http204LatencyProbe（connect 后发单行 GET、等响应首行 204，非 portable）
   + proxy_speedtest_with(probe, candidates, timeout, target_label, probe_kind)（批量测速、RTT 排序 JSON 输出）；结果可经 MeasurementSource 喂 urltest。
+- 计划任务 CLI（PRODUCT §14）：`schedule_cli` 模块（组合根）——`nexus schedule
+  at|every|list|cancel|tick` 五个用户可观察操作；注册表持久化到
+  `~/.nexus/schedule.json`（`--state` 可覆盖；`SchedulerSnapshot` 落盘/重载，
+  PRODUCT §14.2 / §14.4，损坏快照显式 `STATE_ERROR` 不静默丢弃）；业务错误输出
+  `INVALID_SCHEDULE` / `SCHEDULE_NOT_FOUND` / `SUBMIT_FAILED` 结构化 JSON（exit 0，
+  PRODUCT §14.3）；用法错误 exit 2（对齐本 CLI exit 语义）；触发回调生成 task id，
+  不实现执行路径（P0 冻结边界）。单进程假设：并发 `nexus schedule` 调用各自
+  load-modify-save，不提供 lost-update 保护（P0 边界，多进程调度为 P1+）。
 - 本地主链路切片：`internet_access_flow` / `service_session_lifecycle` /
   `connectivity_failure_rollback`。
 

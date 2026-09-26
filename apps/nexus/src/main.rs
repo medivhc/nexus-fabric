@@ -18,6 +18,10 @@
 
 use nexus::control_service::{ControlServiceImpl, render_text};
 use nexus::localapi_client::{self, DEFAULT_LOCALAPI_ADDR};
+use nexus::schedule_cli::{
+    default_state_path as schedule_state_path, error_json as schedule_error_json, schedule_at,
+    schedule_cancel, schedule_every, schedule_list, schedule_tick, unix_now_secs,
+};
 use nexus::subnet_cli::{
     default_state_path, subnet_leave, subnet_status, subnet_up, subnet_up_tun,
 };
@@ -54,6 +58,8 @@ nexus — Nexus 统一 Resource Fabric 控制面 CLI（瘦客户端）
   diagnose                                统一诊断
   platform capabilities                   平台能力清单
   run <resource>                          执行远程资源访问（进程内 SDK）
+  subnet up|status|leave|punch            虚拟子网命令族（进程内 SDK，PRODUCT §12.28）
+  schedule at|every|list|cancel|tick      计划任务命令族（进程内 SDK，PRODUCT §14）
   help / --help                           显示本帮助
 
 前置条件:
@@ -157,6 +163,10 @@ fn run(args: &[String]) -> i32 {
     // 子网命令族走进程内 SDK（PRODUCT §12.16）。
     if args[0].as_str() == "subnet" {
         return run_subnet(&args[1..], json_mode);
+    }
+    // 计划任务命令族走进程内 SDK（PRODUCT §14）。
+    if args[0].as_str() == "schedule" {
+        return run_schedule(&args[1..], json_mode);
     }
 
     let command = match parse_command(&args) {
@@ -393,6 +403,127 @@ fn run_subnet(args: &[String], json_mode: bool) -> i32 {
     };
     render_and_exit(&json, json_mode)
 }
+
+/// `schedule at|every|list|cancel|tick`：进程内 SDK（LocalAPI 无 schedule 路由，
+/// 同 `run` / `subnet` 路径，PRODUCT §14）。注册表路径由 `--state <path>` 指定，
+/// 默认 `~/.nexus/schedule.json`；`--` 之后为触发命令。
+fn run_schedule(args: &[String], json_mode: bool) -> i32 {
+    let Some(sub) = args.first() else {
+        eprintln!("error: missing schedule subcommand (at|every|list|cancel|tick)");
+        eprint!("{USAGE}");
+        return 2;
+    };
+    let mut state: Option<PathBuf> = None;
+    let mut resource: Option<String> = None;
+    let mut command: Vec<String> = Vec::new();
+    let mut positional: Vec<String> = Vec::new();
+    let mut after_ddash = false;
+    let mut i = 1;
+    while i < args.len() {
+        let a = &args[i];
+        if !after_ddash && a == "--" {
+            after_ddash = true;
+            i += 1;
+            continue;
+        }
+        if !after_ddash && a == "--state" {
+            let Some(v) = args.get(i + 1) else {
+                eprintln!("error: missing value for --state");
+                return 2;
+            };
+            state = Some(PathBuf::from(v));
+            i += 2;
+            continue;
+        }
+        if !after_ddash && a == "--resource" {
+            let Some(v) = args.get(i + 1) else {
+                eprintln!("error: missing value for --resource");
+                return 2;
+            };
+            resource = Some(v.clone());
+            i += 2;
+            continue;
+        }
+        if !after_ddash && a.starts_with("--") {
+            eprintln!("error: unknown option: {a}");
+            return 2;
+        }
+        if after_ddash {
+            command.push(a.clone());
+            i += 1;
+            continue;
+        }
+        positional.push(a.clone());
+        i += 1;
+    }
+    let state_path = state.unwrap_or_else(schedule_state_path);
+
+    match sub.as_str() {
+        "at" | "every" => {
+            let Some(ts) = positional.first() else {
+                eprintln!("error: missing timestamp for schedule {sub}");
+                return 2;
+            };
+            let Ok(ts) = ts.parse::<i64>() else {
+                eprintln!("error: {ts} is not an integer timestamp");
+                return 2;
+            };
+            let Some(res) = resource else {
+                eprintln!("error: schedule {sub} requires --resource <r>");
+                return 2;
+            };
+            if command.is_empty() {
+                eprintln!("error: schedule {sub} requires a command after --");
+                return 2;
+            }
+            let result = if sub == "at" {
+                schedule_at(ts, &res, &command, &state_path)
+            } else {
+                schedule_every(ts, &res, &command, &state_path)
+            };
+            render_schedule_result(&result, &format!("schedule {sub}"), json_mode)
+        }
+        "list" => render_schedule_result(&schedule_list(&state_path), "schedule list", json_mode),
+        "cancel" => {
+            let Some(id) = positional.first() else {
+                eprintln!("error: schedule cancel requires <id>");
+                return 2;
+            };
+            render_schedule_result(
+                &schedule_cancel(id, &state_path),
+                "schedule cancel",
+                json_mode,
+            )
+        }
+        "tick" => render_schedule_result(
+            &schedule_tick(&state_path, unix_now_secs()),
+            "schedule tick",
+            json_mode,
+        ),
+        other => {
+            eprintln!("error: unknown schedule subcommand: {other}");
+            eprint!("{USAGE}");
+            2
+        }
+    }
+}
+
+/// schedule 业务结果：成功 / 业务失败均输出结构化 JSON（exit 0，请求已被处理；
+/// PRODUCT §14.3 错误名 INVALID_SCHEDULE / SCHEDULE_NOT_FOUND / SUBMIT_FAILED）。
+fn render_schedule_result(
+    result: &Result<Value, nexus::schedule_cli::ScheduleCliError>,
+    command: &str,
+    json_mode: bool,
+) -> i32 {
+    match result {
+        Ok(json) => render_and_exit(json, json_mode),
+        Err(err) => {
+            let json = schedule_error_json(command, err);
+            render_and_exit(&json, json_mode)
+        }
+    }
+}
+
 fn parse_command(args: &[String]) -> Result<ControlCommand, String> {
     let need = |i: usize, what: &str| -> Result<String, String> {
         args.get(i)
@@ -610,5 +741,53 @@ mod tests {
         // connectivity candidates 无 daemon 路由：本地合成 UNSUPPORTED，不触网。
         let code = run_str(&["--json", "connectivity", "candidates"]);
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn schedule_requires_subcommand() {
+        assert_eq!(run_str(&["schedule"]), 2);
+    }
+
+    #[test]
+    fn schedule_at_requires_args() {
+        assert_eq!(run_str(&["schedule", "at"]), 2);
+        assert_eq!(run_str(&["schedule", "at", "1000"]), 2); // 缺 --resource
+        assert_eq!(run_str(&["schedule", "at", "1000", "--resource", "r"]), 2); // 缺命令
+        assert_eq!(
+            run_str(&[
+                "schedule",
+                "at",
+                "not-an-int",
+                "--resource",
+                "r",
+                "--",
+                "echo",
+                "hi"
+            ]),
+            2
+        );
+    }
+
+    #[test]
+    fn schedule_unknown_subcommand_exits_2() {
+        assert_eq!(run_str(&["schedule", "bogus"]), 2);
+    }
+
+    #[test]
+    fn schedule_list_with_temp_state_is_pass() {
+        // 显式 --state 指向临时文件：空注册表输出 verdict=PASS（exit 0，业务结果）。
+        let dir = std::env::temp_dir().join(format!("nexus-sched-main-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("s.json");
+        let _ = std::fs::remove_file(&state);
+        let code = run_str(&[
+            "schedule",
+            "list",
+            "--state",
+            state.to_str().unwrap(),
+            "--json",
+        ]);
+        assert_eq!(code, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

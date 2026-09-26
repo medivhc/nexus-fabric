@@ -48,9 +48,13 @@ fn main() -> ExitCode {
                  nexusd host <resource> --addr <ip:port> [--token <t>] | \
                  nexusd relay --addr <ip:port> | \
                  nexusd proxy --addr <ip:port> [--config <path>] | \
+                 nexusd proxy speedtest | \
+                 nexusd subnet <up|status|leave> [--config <path>] [--state <path>] [--foreground] [--tun] | \
+                 nexusd system-proxy <status|set|clear|e2e> | \
+                 nexusd autostart <install|remove|status> | \
                  <status|dns|session|connectivity|plan|platform> ... --json"
             );
-            ExitCode::FAILURE
+            ExitCode::from(2)
         }
     }
 }
@@ -134,7 +138,7 @@ fn dispatch_subnet(args: &[String]) -> ExitCode {
         eprintln!(
             "usage: nexusd subnet <up|status|leave> [--config <path>] [--state <path>] [--encrypt-state] [--foreground] [--tun] [--tun-name <n>] [--listen <locator>] [--json]"
         );
-        return ExitCode::FAILURE;
+        return ExitCode::from(2);
     };
     let flags = parse_flags(args);
     let state_path = flags
@@ -146,7 +150,7 @@ fn dispatch_subnet(args: &[String]) -> ExitCode {
         "up" => {
             let Some(cfg) = flags.get("--config").and_then(|v| v.as_deref()) else {
                 eprintln!("error: nexusd subnet up requires --config <path>");
-                return ExitCode::FAILURE;
+                return ExitCode::from(2);
             };
             let cfg = std::path::PathBuf::from(cfg);
             let encrypt = flags.contains_key("--encrypt-state");
@@ -192,7 +196,7 @@ fn dispatch_subnet(args: &[String]) -> ExitCode {
         "leave" => print_json_result(Ok(nexus::subnet_cli::subnet_leave(&state_path))),
         other => {
             eprintln!("error: unknown nexusd subnet subcommand: {other}");
-            ExitCode::FAILURE
+            ExitCode::from(2)
         }
     }
 }
@@ -204,17 +208,16 @@ fn subnet_foreground(
     state_path: &std::path::Path,
     encrypt: bool,
 ) -> Result<u8, (String, String)> {
-    let _tunnel = nexus::subnet_cli::assemble_default_tunnel(cfg)
+    let tunnel = nexus::subnet_cli::assemble_default_tunnel(cfg)
         .map_err(|e| ("CONFIG_ERROR".to_string(), e))?;
     let up = nexus::subnet_cli::subnet_up(cfg, state_path, encrypt)
         .map_err(|e| ("CONFIG_ERROR".to_string(), e))?;
     println!("{up}");
-    loop {
-        if !state_path.exists() {
-            return Ok(0);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
+    // Auto-Mesh 自动挡：自动打洞 + 断线自动重连。
+    let mut mesh = nexus::mesh::AutoMeshController::new(tunnel, 500);
+    let state_path_owned = state_path.to_path_buf();
+    mesh.run(move || !state_path_owned.exists());
+    Ok(0)
 }
 
 /// P3.8（§12.38）真实数据面常驻：wintun/tun + UDP 承载，隧道由 daemon 进程持有。
@@ -251,14 +254,12 @@ fn subnet_foreground_real(
         obj.insert("local_locator".into(), json!(local_locator));
     }
     println!("{up}");
+    // Auto-Mesh 自动挡：自动打洞 + 断线自动重连。
     // 持有真实隧道直到函数返回（drop 清理 wintun/tun 适配器与 UDP socket）。
-    let _held = tunnel;
-    loop {
-        if !state_path.exists() {
-            return Ok(0);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
+    let mut mesh = nexus::mesh::AutoMeshController::new(tunnel, 500);
+    let state_path_owned = state_path.to_path_buf();
+    mesh.run(move || !state_path_owned.exists());
+    Ok(0)
 }
 
 /// 路由资源名到 SDK 组合根闭环；带 `--endpoint` 时走真实网络访问（real transport）。
@@ -575,7 +576,7 @@ fn host_resource(args: &[String]) -> ExitCode {
         eprintln!(
             "usage: nexusd host <service|internet-access|compute> --addr <ip:port> [--token <t>]"
         );
-        return ExitCode::FAILURE;
+        return ExitCode::from(2);
     };
     let flags = parse_flags(args);
     let addr: std::net::SocketAddr = match flags.get("--addr").and_then(|v| v.as_deref()) {
