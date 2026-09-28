@@ -1,4 +1,4 @@
-//! E4 产品场景 `product.pipeline-qos` 的可执行驱动（PRODUCT §12.40）。
+//! E4 产品场景 `product.pipeline-qos` 的可执行驱动（PRODUCT §12.41）。
 //!
 //! ```text
 //! cargo run --quiet -p nexus --example pipeline_qos -- --json

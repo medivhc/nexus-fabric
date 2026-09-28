@@ -341,7 +341,7 @@ pub enum VirtualSubnetEvent {
         /// 对端 PeerId。
         peer_id: String,
     },
-    /// 数据面管线：出/入向包被防火墙规则丢弃（PRODUCT §12.40）。
+    /// 数据面管线：出/入向包被防火墙规则丢弃（PRODUCT §12.41）。
     PacketDroppedByFirewall {
         /// 隧道 ID。
         tunnel_id: String,
@@ -352,7 +352,7 @@ pub enum VirtualSubnetEvent {
         /// 目的虚拟 IP。
         dst_virtual_ip: String,
     },
-    /// 数据面管线：出/入向包因 QoS 令牌不足被丢弃（PRODUCT §12.40）。
+    /// 数据面管线：出/入向包因 QoS 令牌不足被丢弃（PRODUCT §12.41）。
     QosLimited {
         /// 隧道 ID。
         tunnel_id: String,
@@ -363,7 +363,7 @@ pub enum VirtualSubnetEvent {
         /// 被丢弃字节。
         bytes: u64,
     },
-    /// 数据面管线：一个数据块被分片发出（PRODUCT §12.40）。
+    /// 数据面管线：一个数据块被分片发出（PRODUCT §12.41）。
     FragmentSent {
         /// 隧道 ID。
         tunnel_id: String,
@@ -455,7 +455,7 @@ pub struct VirtualSubnetTunnel {
     hole_punch_config: HolePunchConfig,
     /// 已配置 relay locator（P4.2 §12.9.3）：对端虚拟 IP -> relay locator。
     relay_locators: HashMap<String, String>,
-    /// 数据面管线（PRODUCT §12.40）：None = 完全透传，wire 字节与冻结前逐字节一致。
+    /// 数据面管线（PRODUCT §12.41）：None = 完全透传，wire 字节与冻结前逐字节一致。
     pipeline: Option<dataplane_pipeline::DataplanePipeline>,
 }
 
@@ -498,7 +498,7 @@ impl VirtualSubnetTunnel {
         self.identity = IdentityManager::new(store);
     }
 
-    /// 启用数据面管线（PRODUCT §12.40）：把 firewall/QoS/compression/fragmentation 挂进收发路径。
+    /// 启用数据面管线（PRODUCT §12.41）：把 firewall/QoS/compression/fragmentation 挂进收发路径。
     /// 未启用前 wire 字节逐字节透传；启用后数据帧以 NXP1 魔数开头。
     pub fn enable_dataplane_pipeline(&mut self, cfg: DataplanePipelineConfig) {
         self.pipeline = Some(dataplane_pipeline::DataplanePipeline::new(cfg));
@@ -1298,7 +1298,7 @@ impl VirtualSubnetTunnel {
         let mut inner = header.serialize();
         inner.extend_from_slice(packet);
 
-        // 数据面管线（§12.40）：明文会话激活管线；门控/压缩/分片后产生 NXP1 wire 单元。
+        // 数据面管线（§12.41）：明文会话激活管线；门控/压缩/分片后产生 NXP1 wire 单元。
         if let Some(pipeline) = self.pipeline.as_mut() {
             if !self.crypto_sessions.contains_key(&next_hop) {
                 let outcome =
@@ -1402,7 +1402,7 @@ impl VirtualSubnetTunnel {
 
         let data = buffer[..n].to_vec();
 
-        // 数据面管线（§12.40）：识别 NXP1 管线单元，逆序重组/解压/门控后还原 legacy inner。
+        // 数据面管线（§12.41）：识别 NXP1 管线单元，逆序重组/解压/门控后还原 legacy inner。
         let data = if dataplane_pipeline::is_pipeline_unit(&data) {
             match self.pipeline.as_mut() {
                 Some(pipeline) => match pipeline.ingress(&data, "")? {

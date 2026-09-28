@@ -18,7 +18,7 @@ nexus-platform = { path = "../nexus-platform" }
 ring = { version = "0.17", default-features = false, features = ["std"] }
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
 rand = { version = "0.8", default-features = false, features = ["std", "getrandom"] }
-# 数据面真实压缩（PRODUCT §12.40）：gzip 用 flate2 的纯 Rust 后端（不依赖系统 zlib，
+# 数据面真实压缩（PRODUCT §12.41）：gzip 用 flate2 的纯 Rust 后端（不依赖系统 zlib，
 # 保持 portable）；lz4 用 lz4_flex（纯 Rust、no_std 兼容）。均 default-features=false。
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 lz4_flex = { version = "0.11", default-features = false }

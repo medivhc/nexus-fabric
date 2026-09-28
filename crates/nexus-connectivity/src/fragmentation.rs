@@ -225,7 +225,7 @@ impl Fragment {
         self.payload.len()
     }
 
-    /// 消费并取回载荷字节（数据面管线 wire 序列化用，PRODUCT §12.40）。
+    /// 消费并取回载荷字节（数据面管线 wire 序列化用，PRODUCT §12.41）。
     #[must_use]
     pub fn into_payload(self) -> Vec<u8> {
         self.payload

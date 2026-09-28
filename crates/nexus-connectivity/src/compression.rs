@@ -2,7 +2,7 @@
 //!
 //! 本模块是 delivery 层共享底座的数据压缩：
 //! - **算法选择**：`CompressionAlgorithm` 三态--`None`（不压缩）/ `Gzip` / `Lz4`；
-//!   Gzip 经 flate2（rust_backend）、Lz4 经 lz4_flex 做真实编解码（PRODUCT §12.40）；
+//!   Gzip 经 flate2（rust_backend）、Lz4 经 lz4_flex 做真实编解码（PRODUCT §12.41）；
 //! - **自适应门控**：`CompressionCodec::should_compress(data_len)` 在
 //!   `algorithm != None` 且 `data_len >= min_original_bytes` 时才压缩；过小报文直接透传
 //!   （避免元数据开销超过收益）；
@@ -12,7 +12,7 @@
 //!   `ratio()` 返回 `1.0 - compressed/original`（未压缩块按 compressed==original 计入，
 //!   不污染压缩率；不可压缩数据略膨胀时经 clamp 仍为 0）。
 //!
-//! 边界（PRODUCT §12.33/§12.40 冻结）：
+//! 边界（PRODUCT §12.33/§12.41 冻结）：
 //! - 纯内存、纯同步、纯逻辑；不读墙钟、不做真实 I/O；压缩库均为纯 Rust（rust_backend）；
 //! - `CompressionCodec` 持有配置与统计，`encode`/`decode` 做真实 gzip/lz4；
 //! - 统计用 saturating 累加，不溢出。
@@ -237,7 +237,7 @@ impl CompressedBlock {
         self.payload.len()
     }
 
-    /// 载荷字节（借用；数据面管线 wire 序列化用，PRODUCT §12.40）。
+    /// 载荷字节（借用；数据面管线 wire 序列化用，PRODUCT §12.41）。
     #[must_use]
     pub fn payload(&self) -> &[u8] {
         &self.payload

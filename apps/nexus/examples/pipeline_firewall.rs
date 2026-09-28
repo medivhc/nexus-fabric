@@ -1,4 +1,4 @@
-//! E4 产品场景 `product.pipeline-firewall` 的可执行驱动（PRODUCT §12.40）。
+//! E4 产品场景 `product.pipeline-firewall` 的可执行驱动（PRODUCT §12.41）。
 //!
 //! 由 `scenarios/product/pipeline_firewall.toml` 的 [when].command 调用：
 //!

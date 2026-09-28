@@ -1,4 +1,4 @@
-//! 数据面管线（PRODUCT §12.40）：把 firewall / QoS / compression / fragmentation 六个骨架
+//! 数据面管线（PRODUCT §12.41）：把 firewall / QoS / compression / fragmentation 六个骨架
 //! 串成 VirtualSubnetTunnel 收发路径上的每包门控/记账/压缩/分片环节。
 //!
 //! 核心不变量：未启用管线时，本模块不参与，wire 字节与冻结前逐字节一致。
@@ -260,7 +260,7 @@ impl DataplanePipeline {
         wire: &[u8],
         tag: &str,
     ) -> Result<IngressOutcome, ConnectivityError> {
-        // 周期回收超时的重组上下文（§12.40）。
+        // 周期回收超时的重组上下文（§12.41）。
         self.reassembler.gc(self.clock_now.as_millis() as u64);
         if wire.len() < HEADER_LEN {
             return Ok(IngressOutcome::NeedMore);

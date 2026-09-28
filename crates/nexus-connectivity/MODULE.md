@@ -398,7 +398,7 @@ NAT/中继场景的物理建连（组合根 transport::connect）发生在激活
 仅 std（`std::time::{Duration, Instant}`）；无 `unsafe`、库代码不 panic/unwrap/expect；
 整形排队、优先级/公平排队、per-flow 分流、真实数据面挂接留 TODO。
 
-### 冻结契约（数据面真实挂接 dataplane-pipeline，PRODUCT §12.40，scenarios/product/pipeline_*.toml）
+### 冻结契约（数据面真实挂接 dataplane-pipeline，PRODUCT §12.41，scenarios/product/pipeline_*.toml）
 
 把 firewall / QoS / compression / fragmentation 六个骨架真实挂进 `VirtualSubnetTunnel`
 收发管线与 `RelayChannel`，作为每包门控/记账/压缩/分片环节。

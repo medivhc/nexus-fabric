@@ -165,7 +165,7 @@ pub struct RelayChannel {
     stats: RelayStats,
     events: Vec<RelayEvent>,
     transport: Box<dyn RelayTransport>,
-    /// 可选载荷压缩（PRODUCT §12.40）：None = 逐字节透传。
+    /// 可选载荷压缩（PRODUCT §12.41）：None = 逐字节透传。
     compression: Option<crate::compression::CompressionCodec>,
 }
 
@@ -183,7 +183,7 @@ impl RelayChannel {
         }
     }
 
-    /// 启用数据面载荷压缩（PRODUCT §12.40）；未调用前 forward/receive 逐字节透传。
+    /// 启用数据面载荷压缩（PRODUCT §12.41）；未调用前 forward/receive 逐字节透传。
     pub fn enable_compression(&mut self, cfg: crate::compression::CompressionConfig) {
         self.compression = Some(crate::compression::CompressionCodec::new(cfg));
     }
@@ -238,7 +238,7 @@ impl RelayChannel {
     /// 成功后累加 `bytes_sent` / `forward_requests` 并发 `DataForwarded` 事件。
     pub fn forward(&mut self, data: &[u8]) -> Result<(), ConnectivityError> {
         self.ensure_connected()?;
-        // 可选压缩（§12.40）：Some=压缩为 block wire；None=逐字节透传。
+        // 可选压缩（§12.41）：Some=压缩为 block wire；None=逐字节透传。
         let wire: Vec<u8> = if let Some(codec) = &mut self.compression {
             let block = codec.encode(data);
             let mut w = Vec::with_capacity(6 + block.payload_len());
@@ -278,7 +278,7 @@ impl RelayChannel {
                 message,
             })?;
         if n > 0 {
-            // 可选解压（§12.40）：Some=解析 block wire 并还原原始字节；None=透传。
+            // 可选解压（§12.41）：Some=解析 block wire 并还原原始字节；None=透传。
             let delivered = if let Some(codec) = self.compression.as_mut() {
                 let wire = &output[..n];
                 let block = crate::dataplane_pipeline::deserialize_block(wire).map_err(|e| {
