@@ -483,4 +483,60 @@ mod tests {
         let e = GracefulExitError::InvalidConfig("bad grace".into());
         assert!(e.to_string().contains("bad grace"));
     }
+
+    fn valid_frame() -> Vec<u8> {
+        GoodbyeFrame::new("peer-a", "shutting-down").encode()
+    }
+
+    #[test]
+    fn goodbye_roundtrip() {
+        let frame = GoodbyeFrame::new("peer-a", "shutting-down");
+        let decoded = decode_goodbye(&frame.encode()).expect("decode");
+        assert_eq!(decoded, frame);
+        assert_eq!(decoded.version, 1);
+    }
+
+    #[test]
+    fn decode_goodbye_error_matrix() {
+        let base = valid_frame();
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("empty", vec![]),
+            ("too-short-3", vec![1, b'G', 0x00]),
+            ("bad-type", {
+                let mut b = base.clone();
+                b[1] = b'X';
+                b
+            }),
+            ("truncated-peer", base[..6].to_vec()),
+            ("truncated-reason", base[..(base.len() - 3)].to_vec()),
+            ("trailing-bytes", {
+                let mut b = base.clone();
+                b.push(0x00);
+                b
+            }),
+        ];
+        for (name, buf) in cases {
+            let err = decode_goodbye(&buf).expect_err(&format!("{name} should err"));
+            assert!(
+                matches!(err, GracefulExitError::InvalidFrame(_)),
+                "{name}: expected InvalidFrame, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_goodbye_non_utf8_peer() {
+        // version=1, type='G', peer_len=2, peer=[0xff,0xfe] (invalid utf8)
+        let buf = [1u8, b'G', 0x00, 0x02, 0xff, 0xfe, 0x00, 0x00];
+        let err = decode_goodbye(&buf).expect_err("non-utf8 peer");
+        assert!(matches!(err, GracefulExitError::InvalidFrame(_)));
+    }
+
+    #[test]
+    fn decode_goodbye_non_utf8_reason() {
+        // peer="a", reason=[0xff]
+        let buf = [1u8, b'G', 0x00, 0x01, b'a', 0x00, 0x01, 0xff];
+        let err = decode_goodbye(&buf).expect_err("non-utf8 reason");
+        assert!(matches!(err, GracefulExitError::InvalidFrame(_)));
+    }
 }

@@ -350,4 +350,48 @@ mod tests {
         let e = HotReloadError::InvalidConfig("bad interval".into());
         assert!(e.to_string().contains("bad interval"));
     }
+
+    // ---- FileWatcher std 轮询测试（临时文件） ----
+
+    fn tmp_path(tag: &str) -> std::path::PathBuf {
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("nexus-watch-{pid}-{tag}.txt"))
+    }
+
+    #[test]
+    fn filewatcher_baseline_then_change_then_unchanged() {
+        let p = tmp_path("baseline");
+        std::fs::write(&p, "v1").unwrap();
+        let mut w = FileWatcher::new(&p);
+        // 首次 = 基线。
+        assert!(!w.poll_changed().unwrap());
+        // 内容变化。
+        std::fs::write(&p, "v2-changed").unwrap();
+        assert!(w.poll_changed().unwrap());
+        // 内容未变。
+        assert!(!w.poll_changed().unwrap());
+        // 读回当前内容。
+        assert_eq!(w.read_current().unwrap(), "v2-changed");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn filewatcher_missing_file_is_io() {
+        let p = tmp_path("does-not-exist");
+        let _ = std::fs::remove_file(&p);
+        let mut w = FileWatcher::new(&p);
+        let err = w.poll_changed().expect_err("missing file");
+        assert!(matches!(err, HotReloadError::Io(_)));
+    }
+
+    #[test]
+    fn filewatcher_non_utf8_is_io() {
+        let p = tmp_path("non-utf8");
+        std::fs::write(&p, [0xffu8, 0xfe, 0x00, 0x01]).unwrap();
+        let mut w = FileWatcher::new(&p);
+        w.poll_changed().unwrap(); // baseline ok
+        let err = w.read_current().expect_err("non-utf8");
+        assert!(matches!(err, HotReloadError::Io(_)));
+        std::fs::remove_file(&p).ok();
+    }
 }

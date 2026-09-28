@@ -312,7 +312,7 @@ impl HealthMonitor {
                             let cf = lock_or_recover(&t_checker)
                                 .consecutive_failures(node_id)
                                 .unwrap_or(0);
-                            t_events.lock().unwrap().push(HealthEvent {
+                            lock_or_recover(&t_events).push(HealthEvent {
                                 node_id: node_id.clone(),
                                 from: prev,
                                 to: new,
@@ -337,6 +337,11 @@ impl HealthMonitor {
 
     /// 协作式停止 + join。必须在 example 退出前调用，不留线程。
     pub fn cancel(mut self) {
+        self.shutdown();
+    }
+
+    /// 协作式停止 + join（共享内部实现；cancel 与 Drop 共用）。
+    fn shutdown(&mut self) {
         self.stop_flag.store(true, Ordering::Relaxed);
         {
             let (lock, cvar) = &*self.signal;
@@ -351,7 +356,7 @@ impl HealthMonitor {
 
     /// 取走并返回累积的状态转移事件（读侧非阻塞）。
     pub fn drain_events(&self) -> Vec<HealthEvent> {
-        std::mem::take(&mut *self.events.lock().unwrap())
+        std::mem::take(&mut *lock_or_recover(&self.events))
     }
 
     /// 只读当前节点健康状态。
@@ -362,6 +367,16 @@ impl HealthMonitor {
     /// 监控启动至今的真实毫秒数。
     pub fn elapsed_ms(&self) -> u64 {
         self.started_at.elapsed().as_millis() as u64
+    }
+}
+
+/// AbortOnDropHandle 语义（AGENTS §13）：调用方忘记 `cancel(self)` 时，
+/// drop 仍会置位停止位、唤醒并 join worker，避免线程泄漏。
+impl Drop for HealthMonitor {
+    fn drop(&mut self) {
+        if self.handle.is_some() {
+            self.shutdown();
+        }
     }
 }
 

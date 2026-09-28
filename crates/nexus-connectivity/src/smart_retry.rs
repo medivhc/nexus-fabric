@@ -237,17 +237,43 @@ pub struct RetryExecutor {
 impl<E: std::fmt::Debug> std::fmt::Display for RetryRunError<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RetryRunError::StopAttempts { attempts, .. } => {
-                write!(f, "RETRY_STOP: exhausted after {attempts} attempts")
+            RetryRunError::StopAttempts {
+                attempts,
+                last_error,
+            } => {
+                write!(
+                    f,
+                    "RETRY_STOP: exhausted after {attempts} attempts; last_error={last_error:?}"
+                )
             }
-            RetryRunError::Fatal { attempts, .. } => {
-                write!(f, "RETRY_FATAL: failed at attempt {attempts}")
+            RetryRunError::Fatal { attempts, error } => {
+                write!(
+                    f,
+                    "RETRY_FATAL: failed at attempt {attempts}; error={error:?}"
+                )
             }
         }
     }
 }
 
 impl<E: std::fmt::Debug> std::error::Error for RetryRunError<E> {}
+
+impl<E: std::fmt::Debug> RetryRunError<E> {
+    /// 实际尝试次数。
+    #[must_use]
+    pub fn attempts(&self) -> u32 {
+        match self {
+            Self::StopAttempts { attempts, .. } | Self::Fatal { attempts, .. } => *attempts,
+        }
+    }
+    /// 取走携带的最后一次业务错误（若有）。
+    pub fn into_inner(self) -> Option<E> {
+        match self {
+            Self::StopAttempts { last_error, .. } => last_error,
+            Self::Fatal { error, .. } => Some(error),
+        }
+    }
+}
 
 impl RetryExecutor {
     /// 用配置构造执行器；初始熔断 `Closed`、连续失败 0。

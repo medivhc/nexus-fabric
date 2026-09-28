@@ -524,4 +524,130 @@ mod tests {
         // now=1200: delta=1100 > 1000
         assert_eq!(pool.evict_idle(1200), 1);
     }
+
+    // ---- RealizedPool with mock factory ----
+
+    #[derive(Debug)]
+    struct MockHandle {
+        id: u64,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Drop for MockHandle {
+        fn drop(&mut self) {
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Default)]
+    struct MockFactory {
+        next: std::sync::atomic::AtomicU64,
+        fail: std::sync::atomic::AtomicBool,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl ConnectionFactory for MockFactory {
+        type Handle = MockHandle;
+        fn connect(&self, _key: &str) -> Result<MockHandle, PoolError> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(PoolError::InvalidConfig("boom".into()));
+            }
+            let id = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            Ok(MockHandle {
+                id,
+                dropped: self.dropped.clone(),
+            })
+        }
+    }
+
+    fn realized(
+        cfg: PoolConfig,
+    ) -> (
+        RealizedPool<MockFactory>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let f = MockFactory {
+            next: std::sync::atomic::AtomicU64::new(0),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            dropped: dropped.clone(),
+        };
+        (RealizedPool::new(cfg, f), dropped)
+    }
+
+    #[test]
+    fn realized_reuses_same_handle() {
+        let (mut pool, _d) = realized(cfg());
+        let c1 = pool.acquire("a").expect("ok");
+        assert_eq!(c1.handle.id, 1);
+        pool.release(c1, 0).expect("ok");
+        let c2 = pool.acquire("a").expect("ok");
+        assert_eq!(c2.conn_id, 1, "reused conn id");
+        assert_eq!(c2.handle.id, 1, "same handle object");
+        assert_eq!(pool.snapshot().created_total, 1);
+    }
+
+    #[test]
+    fn realized_exhausted_at_max_total() {
+        let (mut pool, _d) = realized(cfg()); // max_total=3
+        let _a = pool.acquire("a").unwrap();
+        let _b = pool.acquire("b").unwrap();
+        let _c = pool.acquire("c").unwrap();
+        let err = pool.acquire("d").expect_err("exhausted");
+        assert_eq!(err, PoolError::Exhausted);
+    }
+
+    #[test]
+    fn realized_max_idle_eviction_drops_handle() {
+        let (mut pool, dropped) = realized(cfg()); // max_idle=2, max_total=3
+        let a = pool.acquire("a").unwrap();
+        let b = pool.acquire("b").unwrap();
+        let c = pool.acquire("c").unwrap();
+        pool.release(a, 0).unwrap();
+        pool.release(b, 0).unwrap();
+        pool.release(c, 0).unwrap();
+        // idle len 3 > max_idle 2 -> evict oldest (a)
+        assert_eq!(pool.snapshot().idle_count, 2);
+        assert_eq!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "evicted handle dropped"
+        );
+    }
+
+    #[test]
+    fn realized_double_release_unknown_key() {
+        let (mut pool, _d) = realized(cfg());
+        let c = pool.acquire("a").unwrap();
+        pool.release(c, 0).unwrap();
+        // can't double release: c was moved into release; build a fake
+        let fake = RealizedConnection {
+            key: "a".into(),
+            conn_id: 999,
+            handle: MockHandle {
+                id: 999,
+                dropped: Default::default(),
+            },
+        };
+        let err = pool.release(fake, 0).expect_err("unknown");
+        assert!(matches!(err, PoolError::UnknownKey(_)));
+    }
+
+    #[test]
+    fn realized_factory_failure_does_not_pollute() {
+        let cfg = cfg();
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let f = MockFactory {
+            next: std::sync::atomic::AtomicU64::new(0),
+            fail: std::sync::atomic::AtomicBool::new(true),
+            dropped: dropped.clone(),
+        };
+        let mut pool = RealizedPool::new(cfg, f);
+        let err = pool.acquire("a").expect_err("factory boom");
+        assert!(matches!(err, PoolError::InvalidConfig(_)));
+        // pool unchanged: 0 active, 0 idle
+        let s = pool.snapshot();
+        assert_eq!(s.active_count, 0);
+        assert_eq!(s.idle_count, 0);
+        assert_eq!(s.total_count, 0);
+    }
 }
