@@ -25,12 +25,16 @@ fn format_cidr(p: &crate::cidr::CidrPrefix) -> String {
 use std::sync::Arc;
 
 use crate::ConnectivityError;
+use crate::dataplane_pipeline::{
+    self, DataplanePipelineConfig, EgressOutcome, IngressOutcome, PipelineStats,
+};
 use crate::encryption::{
     DirectionalKeys, EncryptionConfig, EncryptionError, HANDSHAKE_INIT, HANDSHAKE_RESP,
     HandshakeMessage, KeyPair, ReplayWindow, build_handshake_message, decrypt_frame,
     derive_authed_keys, encrypt_frame,
 };
 use crate::identity::{IdentityAction, IdentityManager, InMemorySecretStore, SecretStore};
+use std::time::Duration;
 
 /// 铏氭嫙瀛愮綉閰嶇疆銆?
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,6 +341,39 @@ pub enum VirtualSubnetEvent {
         /// 对端 PeerId。
         peer_id: String,
     },
+    /// 数据面管线：出/入向包被防火墙规则丢弃（PRODUCT §12.40）。
+    PacketDroppedByFirewall {
+        /// 隧道 ID。
+        tunnel_id: String,
+        /// 方向（"egress"/"ingress"）。
+        direction: &'static str,
+        /// 源虚拟 IP。
+        src_virtual_ip: String,
+        /// 目的虚拟 IP。
+        dst_virtual_ip: String,
+    },
+    /// 数据面管线：出/入向包因 QoS 令牌不足被丢弃（PRODUCT §12.40）。
+    QosLimited {
+        /// 隧道 ID。
+        tunnel_id: String,
+        /// 方向（"egress"/"ingress"）。
+        direction: &'static str,
+        /// 关联对端 tag。
+        tag: String,
+        /// 被丢弃字节。
+        bytes: u64,
+    },
+    /// 数据面管线：一个数据块被分片发出（PRODUCT §12.40）。
+    FragmentSent {
+        /// 隧道 ID。
+        tunnel_id: String,
+        /// 所属报文 ID。
+        packet_id: u64,
+        /// 本片序号。
+        index: u16,
+        /// 总分片数。
+        total: u16,
+    },
 }
 
 /// 闅ч亾甯уご锛圥0 绠€鍖栵細绾枃鏈爣璁帮級銆?
@@ -357,10 +394,10 @@ impl TunnelFrameHeader {
 
     /// 鍙嶅簭鍒楀寲甯уご锛圥0 绠€鍖栵細瑙ｆ瀽 `src->dst:` 鍓嶇紑锛夈€?
     pub fn deserialize(data: &[u8]) -> Option<(Self, &[u8])> {
-        let text = std::str::from_utf8(data).ok()?;
-        let colon_pos = text.find(':')?;
-        let header_part = &text[..colon_pos];
-        let mut parts = header_part.split("->");
+        // 仅对头部（第一个 ':' 之前）做 UTF-8 解析；载荷为任意二进制（IP 包非 UTF-8）。
+        let colon_pos = data.iter().position(|&b| b == b':')?;
+        let header_text = std::str::from_utf8(&data[..colon_pos]).ok()?;
+        let mut parts = header_text.split("->");
         let src = parts.next()?;
         let dst = parts.next()?;
         let header = Self {
@@ -418,6 +455,8 @@ pub struct VirtualSubnetTunnel {
     hole_punch_config: HolePunchConfig,
     /// 已配置 relay locator（P4.2 §12.9.3）：对端虚拟 IP -> relay locator。
     relay_locators: HashMap<String, String>,
+    /// 数据面管线（PRODUCT §12.40）：None = 完全透传，wire 字节与冻结前逐字节一致。
+    pipeline: Option<dataplane_pipeline::DataplanePipeline>,
 }
 
 impl VirtualSubnetTunnel {
@@ -450,12 +489,46 @@ impl VirtualSubnetTunnel {
             pending_punches: HashMap::new(),
             hole_punch_config: HolePunchConfig::default(),
             relay_locators: HashMap::new(),
+            pipeline: None,
         }
     }
 
     /// 注入持久化身份存储（平台 secure-store；默认进程内内存存储）。
     pub fn set_identity_store(&mut self, store: Box<dyn SecretStore>) {
         self.identity = IdentityManager::new(store);
+    }
+
+    /// 启用数据面管线（PRODUCT §12.40）：把 firewall/QoS/compression/fragmentation 挂进收发路径。
+    /// 未启用前 wire 字节逐字节透传；启用后数据帧以 NXP1 魔数开头。
+    pub fn enable_dataplane_pipeline(&mut self, cfg: DataplanePipelineConfig) {
+        self.pipeline = Some(dataplane_pipeline::DataplanePipeline::new(cfg));
+    }
+
+    /// 注入管线逻辑时钟（QoS 确定性推进；默认 0）。
+    pub fn set_dataplane_clock(&mut self, now: Duration) {
+        if let Some(p) = &mut self.pipeline {
+            p.set_clock(now);
+        }
+    }
+
+    /// 调整管线 PacketContext 默认协议/端口（切换命中/未命中防火墙规则的流）。
+    pub fn set_dataplane_defaults(
+        &mut self,
+        proto: crate::firewall::Protocol,
+        src_port: u16,
+        dst_port: u16,
+    ) {
+        if let Some(p) = &mut self.pipeline {
+            p.set_defaults(proto, src_port, dst_port);
+        }
+    }
+
+    /// 管线只读统计快照（未启用时返回全 0）。
+    #[must_use]
+    pub fn pipeline_stats(&self) -> PipelineStats {
+        self.pipeline
+            .as_ref()
+            .map_or(PipelineStats::default(), |p| p.stats())
     }
 
     /// 确保本端身份已加载（首次自动生成并持久化，事件 IdentityKeyGenerated）。
@@ -1225,6 +1298,58 @@ impl VirtualSubnetTunnel {
         let mut inner = header.serialize();
         inner.extend_from_slice(packet);
 
+        // 数据面管线（§12.40）：明文会话激活管线；门控/压缩/分片后产生 NXP1 wire 单元。
+        if let Some(pipeline) = self.pipeline.as_mut() {
+            if !self.crypto_sessions.contains_key(&next_hop) {
+                let outcome =
+                    pipeline.egress(&inner, &self.config.virtual_ip, dst_virtual_ip, &next_hop)?;
+                match outcome {
+                    EgressOutcome::DroppedFirewall => {
+                        self.events
+                            .push(VirtualSubnetEvent::PacketDroppedByFirewall {
+                                tunnel_id: self.tunnel_id.clone(),
+                                direction: "egress",
+                                src_virtual_ip: self.config.virtual_ip.clone(),
+                                dst_virtual_ip: dst_virtual_ip.to_string(),
+                            });
+                        return Ok(());
+                    }
+                    EgressOutcome::DroppedQos => {
+                        self.events.push(VirtualSubnetEvent::QosLimited {
+                            tunnel_id: self.tunnel_id.clone(),
+                            direction: "egress",
+                            tag: next_hop.clone(),
+                            bytes: inner.len() as u64,
+                        });
+                        return Ok(());
+                    }
+                    EgressOutcome::Send(units) => {
+                        for unit in units {
+                            // 分片单元发 FragmentSent 事件（kind=2：wire[5]）。
+                            if unit.len() >= 18 && unit[5] == 2 {
+                                let packet_id = u64::from_be_bytes(unit[6..14].try_into().unwrap());
+                                let index = u16::from_be_bytes(unit[14..16].try_into().unwrap());
+                                let total = u16::from_be_bytes(unit[16..18].try_into().unwrap());
+                                self.events.push(VirtualSubnetEvent::FragmentSent {
+                                    tunnel_id: self.tunnel_id.clone(),
+                                    packet_id,
+                                    index,
+                                    total,
+                                });
+                            }
+                            self.carrier.send_to(locator, &unit).map_err(|e| {
+                                ConnectivityError::Io {
+                                    operation: "send_to".to_string(),
+                                    message: e.to_string(),
+                                }
+                            })?;
+                            stats.bytes_sent += unit.len() as u64;
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        }
         // 加密模式：整帧 AEAD 加密（会话不存在 = 未握手，拒绝发送）
         let wire = if let Some(session) = self.crypto_sessions.get_mut(&next_hop) {
             let cipher = encrypt_frame(&session.keys.tx, session.tx_seq, &inner).map_err(|e| {
@@ -1277,6 +1402,19 @@ impl VirtualSubnetTunnel {
 
         let data = buffer[..n].to_vec();
 
+        // 数据面管线（§12.40）：识别 NXP1 管线单元，逆序重组/解压/门控后还原 legacy inner。
+        let data = if dataplane_pipeline::is_pipeline_unit(&data) {
+            match self.pipeline.as_mut() {
+                Some(pipeline) => match pipeline.ingress(&data, "")? {
+                    IngressOutcome::Drop => return Ok(None),
+                    IngressOutcome::NeedMore => return Ok(None),
+                    IngressOutcome::Deliver(inner) => inner,
+                },
+                None => data,
+            }
+        } else {
+            data
+        };
         // 握手帧分流（§12.6，虚拟子网层载体 "hs:<peer_vip>:<33B>"）。
         // 握手帧不写 VPI、不计数据统计；成功/失败均返回 Ok(None) 表示非数据帧。
         if data.starts_with(b"hs:") {

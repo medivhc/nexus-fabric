@@ -224,6 +224,12 @@ impl Fragment {
     pub fn payload_len(&self) -> usize {
         self.payload.len()
     }
+
+    /// 消费并取回载荷字节（数据面管线 wire 序列化用，PRODUCT §12.40）。
+    #[must_use]
+    pub fn into_payload(self) -> Vec<u8> {
+        self.payload
+    }
 }
 
 // ---------- 分片器 ----------

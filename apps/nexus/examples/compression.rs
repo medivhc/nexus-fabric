@@ -15,6 +15,19 @@
 use nexus_connectivity::compression::{CompressionAlgorithm, CompressionCodec, CompressionConfig};
 use serde_json::json;
 
+/// 高熵不可压缩数据（SplitMix64）：真实 gzip 不收缩，压缩率 clamp 为 0。
+fn incompressible(n: usize) -> Vec<u8> {
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    (0..n).map(|_| next() as u8).collect()
+}
+
 /// 跑一遍压缩选路矩阵，返回单个 JSON 对象。
 fn run() -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     // 1) None 算法：大报文也不压缩。
@@ -33,7 +46,7 @@ fn run() -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let below_threshold_passthrough =
         !small_block.is_compressed() && small_block.algorithm_tag() == 1;
 
-    let large = vec![0x22; 2048];
+    let large = incompressible(2048);
     let large_block = gz.encode(&large);
     let above_threshold_compressed =
         large_block.is_compressed() && large_block.algorithm_tag() == 1;
@@ -42,7 +55,7 @@ fn run() -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     // 3) tag 往返。
     let tag_roundtrip = CompressionAlgorithm::Gzip.as_str().to_string();
 
-    // 4) 统计骨架：两帧（一压一透传），身份透传 -> ratio=0。
+    // 4) 统计骨架：两帧（一压一透传），不可压缩数据不收缩 -> ratio=0。
     let s = gz.stats();
     let blocks = s.blocks();
     let original_total = s.original_total();

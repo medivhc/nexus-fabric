@@ -1,9 +1,8 @@
 //! 数据压缩（算法选择 + 自适应门控 + 帧头封装 + 压缩统计，内存骨架，纯逻辑）。
 //!
-//! 本模块是 delivery 层共享底座的数据压缩骨架：
+//! 本模块是 delivery 层共享底座的数据压缩：
 //! - **算法选择**：`CompressionAlgorithm` 三态--`None`（不压缩）/ `Gzip` / `Lz4`；
-//!   骨架内 `Gzip`/`Lz4` 尚未接真实压缩库（见文末 TODO），当前以**身份透传 + 帧头标记**
-//!   验证选路与统计逻辑；
+//!   Gzip 经 flate2（rust_backend）、Lz4 经 lz4_flex 做真实编解码（PRODUCT §12.40）；
 //! - **自适应门控**：`CompressionCodec::should_compress(data_len)` 在
 //!   `algorithm != None` 且 `data_len >= min_original_bytes` 时才压缩；过小报文直接透传
 //!   （避免元数据开销超过收益）；
@@ -11,20 +10,23 @@
 //!   `original_len`、`compressed` 标记与 `payload`；`encode`/`decode` 对称；
 //! - **统计**：`CompressionStats` 累计 `original_total` / `compressed_total` / `blocks`，
 //!   `ratio()` 返回 `1.0 - compressed/original`（未压缩块按 compressed==original 计入，
-//!   不污染压缩率）。
+//!   不污染压缩率；不可压缩数据略膨胀时经 clamp 仍为 0）。
 //!
-//! 边界（PRODUCT §12.33 冻结）：
-//! - 纯内存、纯同步、纯逻辑骨架；不读墙钟、不做真实 I/O、不引入第三方压缩库；
-//! - `Gzip`/`Lz4` 的真实压缩/解压留 TODO（引入 flate2 / lz4 需走 dependency 评审）；
+//! 边界（PRODUCT §12.33/§12.40 冻结）：
+//! - 纯内存、纯同步、纯逻辑；不读墙钟、不做真实 I/O；压缩库均为纯 Rust（rust_backend）；
+//! - `CompressionCodec` 持有配置与统计，`encode`/`decode` 做真实 gzip/lz4；
 //! - 统计用 saturating 累加，不溢出。
 //!
-//! TODO（真实压缩集成，非本骨架范围）：
-//! - 引入 `flate2`（gzip）与 `lz4_flex`（lz4），经 dependency 评审后替换身份透传；
-//! - 帧头增加魔数 / 校验和（当前仅 tag + len，防错不防伪）。
+//! 帧头仅 tag + len，不防伪（魔数/校验和留 TODO）。
 //!
 //! 错误面独立：`CompressionError` 是本模块自有类型化 enum，不以 panic / 日志代替。
 
 use std::fmt;
+use std::io::Write;
+
+use flate2::Compression;
+use flate2::read::GzDecoder;
+use lz4_flex::block::{compress_prepend_size, decompress_size_prepended};
 
 // ---------- 错误 ----------
 
@@ -235,6 +237,12 @@ impl CompressedBlock {
         self.payload.len()
     }
 
+    /// 载荷字节（借用；数据面管线 wire 序列化用，PRODUCT §12.40）。
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
     /// 消费并取回载荷字节。
     #[must_use]
     pub fn into_payload(self) -> Vec<u8> {
@@ -329,7 +337,7 @@ impl CompressionCodec {
     ///
     /// - 算法 None -> 标签 0、`compressed=false`、载荷原样；
     /// - 长度低于阈值 -> 标签仍记录所选算法、`compressed=false`、载荷原样（自适应透传）；
-    /// - 否则 -> `compressed=true`；骨架内载荷为原始字节的身份拷贝（真实 gzip/lz4 TODO）。
+    /// - 否则 -> `compressed=true`，载荷为真实 gzip / lz4 压缩字节。
     pub fn encode(&mut self, data: &[u8]) -> CompressedBlock {
         let alg = self.config.algorithm;
         let should = self.should_compress(data.len());
@@ -341,12 +349,16 @@ impl CompressionCodec {
                 payload: data.to_vec(),
             }
         } else if should {
-            // TODO: 此处接入真实 gzip/lz4 压缩；骨架先身份拷贝。
+            let payload = match alg {
+                CompressionAlgorithm::Gzip => gzip_compress(data, self.config.level),
+                CompressionAlgorithm::Lz4 => compress_prepend_size(data),
+                CompressionAlgorithm::None => data.to_vec(),
+            };
             CompressedBlock {
                 algorithm_tag: alg.tag(),
                 original_len: data.len(),
                 compressed: true,
-                payload: data.to_vec(),
+                payload,
             }
         } else {
             // 低于阈值透传：仍记录所选算法标签，便于对端识别。
@@ -363,16 +375,34 @@ impl CompressionCodec {
 
     /// 解码一帧（与 `encode` 对称）。
     ///
-    /// 校验：tag 必须可识别；`compressed=true` 时 `original_len` 必须与载荷一致
-    /// （骨架身份透传约束；真实压缩后此约束放宽为"解出 original_len 字节"）。
+    /// 校验：tag 必须可识别；`compressed=true` 时按所选算法真实解压出 `original_len`
+    /// 字节，解失败（流损坏/长度不符）返回 `InconsistentBlock`。
     pub fn decode(&self, block: CompressedBlock) -> Result<Vec<u8>, CompressionError> {
-        let _alg = CompressionAlgorithm::from_tag(block.algorithm_tag)?;
-        if block.compressed && block.payload.len() != block.original_len {
+        let alg = CompressionAlgorithm::from_tag(block.algorithm_tag)?;
+        if !block.compressed {
+            return Ok(block.payload);
+        }
+        let out = match alg {
+            CompressionAlgorithm::Gzip => gzip_decompress(&block.payload)?,
+            CompressionAlgorithm::Lz4 => {
+                decompress_size_prepended(&block.payload).map_err(|_| {
+                    CompressionError::InconsistentBlock {
+                        reason: "lz4 decompress failed",
+                    }
+                })?
+            }
+            CompressionAlgorithm::None => {
+                return Err(CompressionError::InconsistentBlock {
+                    reason: "compressed block with none algorithm",
+                });
+            }
+        };
+        if out.len() != block.original_len {
             return Err(CompressionError::InconsistentBlock {
-                reason: "compressed block payload len != original_len (skeleton identity)",
+                reason: "decompressed len != original_len",
             });
         }
-        Ok(block.payload)
+        Ok(out)
     }
 
     /// 当前统计快照。
@@ -380,6 +410,29 @@ impl CompressionCodec {
     pub fn stats(&self) -> &CompressionStats {
         &self.stats
     }
+}
+
+// ---------- 真实 gzip 编解码（flate2 rust_backend） ----------
+
+/// 用 gzip 压缩 `data`，级别 clamp 到 0-9。
+fn gzip_compress(data: &[u8], level: u8) -> Vec<u8> {
+    let mut encoder =
+        flate2::write::GzEncoder::new(Vec::new(), Compression::new(level.min(9) as u32));
+    // 压缩为内存操作，写入失败仅因 OOM；此处不 panic，失败时退化为空载荷（decode 会拒绝）。
+    let _ = encoder.write_all(data);
+    encoder.finish().unwrap_or_default()
+}
+
+/// 用 gzip 解压 `data`；失败映射为类型化 `InconsistentBlock`。
+fn gzip_decompress(data: &[u8]) -> Result<Vec<u8>, CompressionError> {
+    let mut decoder = GzDecoder::new(data);
+    let mut out = Vec::new();
+    std::io::Read::read_to_end(&mut decoder, &mut out).map_err(|_| {
+        CompressionError::InconsistentBlock {
+            reason: "gzip decode failed",
+        }
+    })?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -423,14 +476,34 @@ mod tests {
     #[test]
     fn stats_track_original_and_ratio() {
         let mut c = CompressionCodec::new(cfg(CompressionAlgorithm::Gzip));
-        c.encode(&[0u8; 1000]); // 压（骨架身份拷贝，载荷=1000）
+        // 高熵不可压缩数据（SplitMix64）：真实 gzip 不收缩（略膨胀），ratio 经 clamp 仍为 0。
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let incompressible: Vec<u8> = (0..1000).map(|_| next() as u8).collect();
+        c.encode(&incompressible); // 压（不可压缩，载荷 >= 原始）
         c.encode(&[0u8; 10]); // 透传（<64）
         let s = c.stats();
         assert_eq!(s.blocks(), 2);
         assert_eq!(s.original_total(), 1010);
-        assert_eq!(s.compressed_total(), 1010);
-        // 骨架身份透传 -> 压缩率为 0。
+        // 不可压缩数据不应收缩；统计载荷不小于原始。
+        assert!(s.compressed_total() >= s.original_total());
+        // 不可压缩 -> 压缩率 clamp 为 0。
         assert_eq!(s.ratio(), 0.0);
+    }
+
+    #[test]
+    fn compressible_data_shrinks() {
+        let mut c = CompressionCodec::new(cfg(CompressionAlgorithm::Gzip));
+        c.encode(&[0u8; 4096]); // 高可压缩
+        let s = c.stats();
+        assert!(s.compressed_total() < s.original_total());
+        assert!(s.ratio() > 0.0);
     }
 
     #[test]
