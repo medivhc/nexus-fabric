@@ -398,6 +398,37 @@ NAT/中继场景的物理建连（组合根 transport::connect）发生在激活
 仅 std（`std::time::{Duration, Instant}`）；无 `unsafe`、库代码不 panic/unwrap/expect；
 整形排队、优先级/公平排队、per-flow 分流、真实数据面挂接留 TODO。
 
+### 冻结契约（数据面真实挂接 dataplane-pipeline，PRODUCT §12.40，scenarios/product/pipeline_*.toml）
+
+把 firewall / QoS / compression / fragmentation 六个骨架真实挂进 `VirtualSubnetTunnel`
+收发管线与 `RelayChannel`，作为每包门控/记账/压缩/分片环节。
+
+- **核心不变量（零配置透传）**：未调用 `VirtualSubnetTunnel::enable_dataplane_pipeline` 时，
+  `send_ip_packet` / `recv_and_deliver` 的 wire 字节与冻结前逐字节一致；既有全部 E4
+  场景 Protected。管线只在显式 `enable_dataplane_pipeline(cfg)` 后激活。
+- `DataplanePipelineConfig`：`{ firewall: Option<FirewallEngine>, qos: Option<QosConfig>,
+  compression: Option<CompressionConfig>, fragmentation: Option<FragmentConfig>,
+  default_proto: Protocol, default_src_port: u16, default_dst_port: u16 }`（`Default` 全 None）。
+- `VirtualSubnetTunnel::enable_dataplane_pipeline(&mut self, cfg: DataplanePipelineConfig)`：
+  激活管线；`set_dataplane_clock(&mut self, now: Duration)`：逻辑时钟注入（QoS 确定性）；
+  `pipeline_stats(&self) -> PipelineStats`：只读快照。
+- `PipelineStats { firewall_dropped, qos_dropped, fragments_sent, compression_blocks,
+  wire_bytes_sent, wire_bytes_received }`：纯计数/聚合，热路径无 per-frame 日志。
+- **wire 单元**：激活后数据帧以魔数 `NXP1`（u8×4）开头，与 `src->dst:`/`hs:`/`ph:`/`pa:`
+  帧区分；发送序 = firewall 出向 → qos 出向 → compression → fragmentation → carrier；
+  接收序 = 重组 → 解压 → firewall 入向（对称）→ qos 入向 → wire 记账 → legacy 解封装。
+- **firewall**：在 tunnel header（src VIP→dst VIP）上按 `default_proto/port` 构造 PacketContext
+  评估；出向/入向 Deny 均丢弃并计数，出向不触碰 carrier，入向不写 VPI。入向 inner 不可解析时
+  按 fail-closed 丢弃（不静默放行畸形帧）。
+- **qos**：令牌不足 = 丢弃（不排队）；时钟用 `set_dataplane_clock` 注入值。出向按 inner 字节
+  （压缩前）计量；入向按 block_wire 字节（解压前）计量，tag 为空串=聚合记账（不分对端）。
+- **compression 真实化**：Gzip=flate2(rust_backend)，Lz4=lz4_flex；`should_compress` 门控与
+  `CompressedBlock` 字段语义不变；不可压缩数据略膨胀时 `ratio()` clamp 为 0。
+- **RelayChannel**：forward/receive 按配置挂 compression/qos/stats，未配置透传；relay 分片留 TODO。
+
+冻结边界（本项不做）：管线与加密会话共存（仅明文数据面激活管线）、真实 IP 头解析/conntrack、
+排队缓冲、生产 MonotonicClock、relay 分片、规则热更新。
+
 ### 冻结契约（身份密钥与 TOFU 自动交换 P4.1，PRODUCT §12.39，scenarios/product/identity_auto_exchange.toml）
 
 - `trait SecretStore { fn read_secret(&self, key) -> Option<Vec<u8>>; fn write_secret(&mut self, key, value) -> Result<(), IdentityError> }`：

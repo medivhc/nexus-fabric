@@ -120,6 +120,11 @@ pub mod compression;
 /// 分片传输（大报文分片 + 重组 + 超时清理 + 缓冲上限）。
 pub mod fragmentation;
 
+// ---------- 数据面真实挂接（firewall/QoS/compression/fragmentation 挂进隧道管线，PRODUCT §12.40） ----------
+
+/// 数据面管线：把骨架串成 VirtualSubnetTunnel 每包门控/记账/压缩/分片环节。
+pub mod dataplane_pipeline;
+
 // ---------- 结构化错误（不以日志文本代替错误类型） ----------
 
 /// Connectivity 层的结构化错误（delivery 层自有错误面，不依赖领域错误）。

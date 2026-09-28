@@ -2172,6 +2172,56 @@ CLI 一次性 `--tun` 真实数据面但随进程退出即 drop）：让 daemon 
 - 冻结边界（P4.1 不做）：CA/证书吊销与轮换、SPKI pinning 管理界面、双向 NAT
   打洞与 TURN 中继的**真机**验证（原语已交付 §12.9/turn.rs，留 P4.2）、多节点
   自动发现/`join` 命令（留 P4.3）。
+
+### 12.40 数据面真实挂接（dataplane-pipeline，2026-09-28）{#12-dataplane-pipeline}
+
+把 §12.25 firewall、§12.8/§12.26 QoS/bandwidth_policy、§12.33 compression、
+§12.34 fragmentation 六个纯逻辑骨架**真实挂进** `VirtualSubnetTunnel` 收发管线与
+`RelayChannel` 数据面，作为每包门控/记账/压缩/分片环节。本项把骨架从"纯函数
+可单测"升级为"真在隧道每包上生效"，但保持零配置时逐字节透传。
+
+- **零配置透传（核心不变量）**：未调用 `enable_dataplane_pipeline` 时，
+  `send_ip_packet`/`recv_and_deliver` 的 wire 字节与冻结前**逐字节一致**；既有全部
+  E4 场景 Protected。管线只在显式 `enable_dataplane_pipeline(cfg)` 后激活。
+- **管线单元 wire 格式**：激活后数据帧以私有魔数 `NXP1`（u8×4）开头，与既有
+  `src->dst:` / `hs:` / `ph:` / `pa:` 帧天然区分；接收端识别魔数后走管线逆序处理，
+  否则走 legacy 解封装（向后兼容未启用管线的对端）。
+- **发送路径顺序**：firewall 出向判定 → qos/bandwidth_policy 出向令牌门控 →
+  compression 自适应压缩 → fragmentation 按 MTU 分片 → carrier 发送。
+- **接收路径逆序**：分片重组 → 解压 → firewall 入向判定（与出向同一引擎、对称决策）
+  → qos 入向令牌门控 → traffic_stats 真实 wire 字节记账 → 还原 legacy 帧交既有
+  解封装/转发逻辑。
+- **firewall 语义**：管线在 tunnel header（src VIP → dst VIP）上评估 `PacketContext`，
+  协议/端口由 `DataplanePipelineConfig` 配置（默认 TCP）；出向 Deny → 丢弃 +
+  `PacketDroppedByFirewall` 事件，**不触碰 carrier**；入向 Deny → 丢弃、不写 VPI。
+  真实 IP 头解析 / conntrack 留 TODO（与 §12.25 冻结边界一致）。
+- **qos/bandwidth_policy 语义**：令牌不足 = **丢弃**（不排队；管线为同步 P0，无缓冲
+  线程），发 `QosLimited` 事件并计数；时钟由 `set_dataplane_clock(now)` 逻辑注入
+  （E4 确定性推进），生产 MonotonicClock 集成留 TODO。
+- **compression 真实化**：Gzip 用 flate2（rust_backend），Lz4 用 lz4_flex；
+  `should_compress` 自适应门控与 `CompressedBlock` 字段语义不变，仅让 `encode/decode`
+  做真实编解码；不可压缩数据输出略大于输入时 `ratio()` 经 clamp 仍为 0
+  （不引入"存还是压"再决策，`is_compressed` 仍反映长度门控）。
+  既有 `compression.toml`（§12.33）期望 ratio=0.0 / blocks=2 / original_total=2080
+  保持：example 大载荷改为高熵不可压缩数据，真实 gzip 不收缩，ratio 经 clamp 仍 0.0；
+  可压缩负载的真实正压缩率由新场景 `pipeline-compression` 断言。
+- **fragmentation 语义**：block 超过 `max_fragment_size` 才分片；每片独立管线单元携带
+  packet_id/index/total；对端重组收齐后交付，未收齐返回 0 字节（不投递），超时 gc 沿用骨架。
+- **RelayChannel**：forward/receive 路径按配置挂 compression/qos/traffic_stats，未配置
+  透传，复用 RelayStats/RelayEvent；分片在 relay 留 TODO（relay 帧为单 datagram）。
+- **可观察**：热路径只计数/聚合（`PacketDroppedByFirewall`/`QosLimited`/`FragmentSent`
+  事件 + counters），禁止 per-frame 日志（AGENTS §22）。
+- E4 场景（均 `cargo run --quiet -p nexus --example <name> -- --json`，E4）：
+  - `pipeline_firewall.toml`（id=`product.pipeline-firewall`）——双节点隧道 + firewall
+    规则拦截指定流 + traffic_stats 只计放行字节；
+  - `pipeline_compression.toml`（id=`product.pipeline-compression`）——可压缩/不可压缩
+    负载经隧道真实往返，tag 与 ratio 断言；
+  - `pipeline_fragmentation.toml`（id=`product.pipeline-fragmentation`）——MTU < 报文
+    → 分片→重组后完整一致；
+  - `pipeline_qos.toml`（id=`product.pipeline-qos`）——带宽限额生效（注入时钟保证确定性）。
+- 冻结边界（本项不做）：管线与加密会话共存（当前仅明文数据面激活管线，加密会话 wire 不变）、
+  真实 IP 头解析/conntrack、排队缓冲、生产时钟、relay 分片、规则热更新。
+
 ## 13. Windows 系统代理接管与常驻自启（system-proxy + autostart，2026-09-24）{#13-system-proxy}
 
 桌面/Windows 场景下，nexusd 作为本地入口把系统 WinINET 代理指向本地数据面，

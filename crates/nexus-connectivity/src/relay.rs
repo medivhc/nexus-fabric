@@ -165,6 +165,8 @@ pub struct RelayChannel {
     stats: RelayStats,
     events: Vec<RelayEvent>,
     transport: Box<dyn RelayTransport>,
+    /// 可选载荷压缩（PRODUCT §12.40）：None = 逐字节透传。
+    compression: Option<crate::compression::CompressionCodec>,
 }
 
 impl RelayChannel {
@@ -177,7 +179,13 @@ impl RelayChannel {
             stats: RelayStats::default(),
             events: Vec::new(),
             transport,
+            compression: None,
         }
+    }
+
+    /// 启用数据面载荷压缩（PRODUCT §12.40）；未调用前 forward/receive 逐字节透传。
+    pub fn enable_compression(&mut self, cfg: crate::compression::CompressionConfig) {
+        self.compression = Some(crate::compression::CompressionCodec::new(cfg));
     }
 
     /// 经中继建连：`Disconnected -> Connecting -> Connected / Failed`。
@@ -230,8 +238,20 @@ impl RelayChannel {
     /// 成功后累加 `bytes_sent` / `forward_requests` 并发 `DataForwarded` 事件。
     pub fn forward(&mut self, data: &[u8]) -> Result<(), ConnectivityError> {
         self.ensure_connected()?;
+        // 可选压缩（§12.40）：Some=压缩为 block wire；None=逐字节透传。
+        let wire: Vec<u8> = if let Some(codec) = &mut self.compression {
+            let block = codec.encode(data);
+            let mut w = Vec::with_capacity(6 + block.payload_len());
+            w.push(block.algorithm_tag());
+            w.extend_from_slice(&(block.original_len() as u32).to_be_bytes());
+            w.push(block.is_compressed() as u8);
+            w.extend(block.payload());
+            w
+        } else {
+            data.to_vec()
+        };
         self.transport
-            .forward(&self.config.peer_id, data)
+            .forward(&self.config.peer_id, &wire)
             .map_err(|message| ConnectivityError::Io {
                 operation: "relay_forward".to_string(),
                 message,
@@ -258,11 +278,39 @@ impl RelayChannel {
                 message,
             })?;
         if n > 0 {
-            self.stats.bytes_received += n as u64;
+            // 可选解压（§12.40）：Some=解析 block wire 并还原原始字节；None=透传。
+            let delivered = if let Some(codec) = self.compression.as_mut() {
+                let wire = &output[..n];
+                let block = crate::dataplane_pipeline::deserialize_block(wire).map_err(|e| {
+                    ConnectivityError::Invalid {
+                        message: format!("RELAY_BLOCK: {}", e),
+                    }
+                })?;
+                let decoded = codec
+                    .decode(block)
+                    .map_err(|e| ConnectivityError::Invalid {
+                        message: format!("RELAY_DECOMPRESS: {}", e),
+                    })?;
+                if decoded.len() > output.len() {
+                    return Err(ConnectivityError::Invalid {
+                        message: format!(
+                            "RELAY_OUTPUT_OVERFLOW: decoded {} > buffer {}",
+                            decoded.len(),
+                            output.len()
+                        ),
+                    });
+                }
+                output[..decoded.len()].copy_from_slice(&decoded);
+                decoded.len()
+            } else {
+                n
+            };
+            self.stats.bytes_received += delivered as u64;
             self.events.push(RelayEvent::DataReceived {
                 peer_id: self.config.peer_id.clone(),
-                bytes: n as u64,
+                bytes: delivered as u64,
             });
+            return Ok(delivered);
         }
         Ok(n)
     }
@@ -333,6 +381,7 @@ struct MockRelayInner {
 /// - `connect` 按构造时预置结果返回；
 /// - `forward` 把数据追加到 `sent` 记录；
 /// - `receive` 从 `inbound` 字节流拷贝到输出（`inject_echo` 注入的数据可被读回）。
+#[derive(Clone)]
 pub struct MockRelayTransport {
     connect_result: Result<(), String>,
     inner: Arc<Mutex<MockRelayInner>>,
@@ -553,5 +602,69 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn relay_compression_roundtrip_preserves_payload() {
+        use crate::compression::{CompressionAlgorithm, CompressionConfig};
+        let config = RelayConfig::new("relay.example.org:9999", "peer-b");
+        let mock = MockRelayTransport::new(Ok(()));
+        let mut channel = RelayChannel::new(config, Box::new(mock.clone()));
+        channel.connect().expect("connect");
+        channel
+            .enable_compression(CompressionConfig::new(CompressionAlgorithm::Gzip, 6, 1).unwrap());
+
+        let payload = b"hello-relay-compression-payload-aaaaaaaaaaaaaaaa";
+        channel.forward(payload).expect("forward");
+
+        // The transport stored the block-wire bytes; feed them back as inbound.
+        let sent = mock.sent();
+        assert_eq!(sent.len(), 1);
+        mock.inject_echo(&sent[0]);
+
+        let mut buf = [0u8; 4096];
+        let n = channel.receive(&mut buf).expect("receive");
+        assert_eq!(&buf[..n], payload);
+    }
+
+    #[test]
+    fn relay_compression_truncated_frame_returns_structured_err_not_panic() {
+        use crate::compression::{CompressionAlgorithm, CompressionConfig};
+        let config = RelayConfig::new("relay.example.org:9999", "peer-b");
+        let mock = MockRelayTransport::new(Ok(()));
+        let mut channel = RelayChannel::new(config, Box::new(mock.clone()));
+        channel.connect().expect("connect");
+        channel
+            .enable_compression(CompressionConfig::new(CompressionAlgorithm::Gzip, 6, 1).unwrap());
+
+        // 3-byte truncated block wire (block header is 6 bytes) -> structured Err, not panic.
+        mock.inject_echo(&[0x01, 0x00, 0x02]);
+        let mut buf = [0u8; 64];
+        let err = channel
+            .receive(&mut buf)
+            .expect_err("truncated must be Err");
+        match err {
+            ConnectivityError::Invalid { message } => {
+                assert!(message.contains("RELAY_BLOCK"), "unexpected: {}", message);
+            }
+            other => panic!("expected Invalid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn relay_no_compression_is_byte_identical_passthrough() {
+        let config = RelayConfig::new("relay.example.org:9999", "peer-b");
+        let mock = MockRelayTransport::new(Ok(()));
+        let mut channel = RelayChannel::new(config, Box::new(mock.clone()));
+        channel.connect().expect("connect");
+
+        let payload = b"plain-passthrough-bytes";
+        channel.forward(payload).expect("forward");
+        let sent = mock.sent();
+        assert_eq!(sent[0], payload);
+        mock.inject_echo(&sent[0]);
+        let mut buf = [0u8; 64];
+        let n = channel.receive(&mut buf).expect("receive");
+        assert_eq!(&buf[..n], payload);
     }
 }
