@@ -1,0 +1,55 @@
+schema_version = 1
+id = "product.connection-pool-real"
+title = "连接池真实工厂：loopback echo TCP 复用 / 上限保护 / 句柄回收"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-connection-pool-real"
+
+[given]
+pool = { max_idle = 2, max_total = 3, idle_timeout_ms = 100000 }
+
+[when]
+command = "cargo run --quiet -p nexus --example connection_pool_real -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "connection-pool-real"
+
+# 首次 acquire 新建 conn_id=1，真实 echo 往返成功
+[[expect]]
+field = "first_conn_id"
+equals = 1
+
+[[expect]]
+field = "first_echo_ok"
+equals = true
+
+# release 后再 acquire 同 key 复用同一条真实 TCP 流（conn_id 不变），且复用后 echo 仍成功
+[[expect]]
+field = "reused_same_conn"
+equals = true
+
+[[expect]]
+field = "reused_conn_id"
+equals = 1
+
+[[expect]]
+field = "echo_on_reused_ok"
+equals = true
+
+# 占满 max_total 后再 acquire 新 key → Exhausted
+[[expect]]
+field = "exhausted"
+equals = true
+
+# 最终快照
+[[expect]]
+field = "final_total"
+equals = 3
+
+[[expect]]
+field = "final_idle"
+equals = 2

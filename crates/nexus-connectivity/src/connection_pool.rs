@@ -258,6 +258,153 @@ impl ConnectionPool {
     }
 }
 
+// === 12.40.4 真实工厂连接池（包装真实句柄，淘汰时 drop 关闭 socket） ==========
+
+/// 连接工厂接缝：按需创建真实连接对象（组合根实现，如连 loopback echo server
+/// 的 TCP 流）。crate 内不发起网络。
+pub trait ConnectionFactory {
+    /// 真实句柄类型（如 `std::net::TcpStream`）。
+    type Handle;
+    /// 为 `key`（node_id/目标）新建一条真实连接。
+    fn connect(&self, key: &str) -> Result<Self::Handle, PoolError>;
+}
+
+/// 空闲队列条目：持有真实句柄（淘汰时 drop 即关闭底层 socket）。
+struct IdleRealized<H> {
+    conn_id: u64,
+    key: String,
+    handle: H,
+    released_at_ms: u64,
+}
+
+/// 从池中借出的真实连接：持有真实句柄，`release` 归还后句柄回到空闲队列。
+#[derive(Debug)]
+pub struct RealizedConnection<H> {
+    /// 所属节点 key。
+    pub key: String,
+    /// 连接唯一 ID（池内自增，从 1 开始；复用时不变）。
+    pub conn_id: u64,
+    /// 真实句柄（调用方可读写，如 TCP echo 往返）。
+    pub handle: H,
+}
+
+/// 真实工厂连接池：在 `PoolConfig` 计数语义上包装真实句柄。
+///
+/// - `acquire` 命中同 key 空闲则复用同一条真实句柄（conn_id 不变）；
+///   未命中调 `factory.connect` 新建；超 `max_total` 返回 `Exhausted`；
+/// - `release` 归还句柄到空闲；超 `max_idle` 淘汰最旧（drop 句柄关闭 socket）；
+/// - `evict_idle` 按注入逻辑时钟淘汰超时空闲句柄。
+///
+/// 既有 `ConnectionPool` 纯内存骨架与 `connection_pool.toml` expectation 不受影响。
+pub struct RealizedPool<F: ConnectionFactory> {
+    cfg: PoolConfig,
+    factory: F,
+    idle: VecDeque<IdleRealized<F::Handle>>,
+    active: HashSet<u64>,
+    next_conn_id: u64,
+    created_total: u64,
+    /// conn_id -> 活跃 key（用于 release 校验）。
+    active_keys: HashMap<u64, String>,
+}
+
+impl<F: ConnectionFactory> RealizedPool<F> {
+    /// 用配置与工厂构造池。
+    pub fn new(cfg: PoolConfig, factory: F) -> Self {
+        Self {
+            cfg,
+            factory,
+            idle: VecDeque::new(),
+            active: HashSet::new(),
+            next_conn_id: 1,
+            created_total: 0,
+            active_keys: HashMap::new(),
+        }
+    }
+
+    /// 获取 key 的连接；复用同 key 空闲句柄，未命中经工厂新建；超上限 `Exhausted`。
+    pub fn acquire(&mut self, key: &str) -> Result<RealizedConnection<F::Handle>, PoolError> {
+        // 1) 复用：找同 key 最旧空闲。
+        if let Some(pos) = self.idle.iter().position(|e| e.key == key) {
+            let e = self.idle.remove(pos).expect("pos just verified");
+            self.active.insert(e.conn_id);
+            self.active_keys.insert(e.conn_id, e.key.clone());
+            return Ok(RealizedConnection {
+                key: e.key,
+                conn_id: e.conn_id,
+                handle: e.handle,
+            });
+        }
+        // 2) 上限。
+        let total = self.active.len() + self.idle.len();
+        if total >= self.cfg.max_total {
+            return Err(PoolError::Exhausted);
+        }
+        // 3) 新建（工厂失败不改变池状态）。
+        let handle = self.factory.connect(key)?;
+        let conn_id = self.next_conn_id;
+        self.next_conn_id += 1;
+        self.created_total += 1;
+        self.active.insert(conn_id);
+        self.active_keys.insert(conn_id, key.to_string());
+        Ok(RealizedConnection {
+            key: key.to_string(),
+            conn_id,
+            handle,
+        })
+    }
+
+    /// 归还连接为空闲；超 `max_idle` 淘汰最旧（drop 句柄关闭 socket）。
+    pub fn release(
+        &mut self,
+        conn: RealizedConnection<F::Handle>,
+        now_ms: u64,
+    ) -> Result<(), PoolError> {
+        if !self.active.remove(&conn.conn_id) {
+            return Err(PoolError::UnknownKey(conn.key));
+        }
+        self.active_keys.remove(&conn.conn_id);
+        self.idle.push_back(IdleRealized {
+            conn_id: conn.conn_id,
+            key: conn.key,
+            handle: conn.handle,
+            released_at_ms: now_ms,
+        });
+        while self.idle.len() > self.cfg.max_idle {
+            let old = self.idle.pop_front().expect("len > max_idle >= 1");
+            // drop old.handle -> 关闭底层真实 socket。
+            drop(old);
+        }
+        Ok(())
+    }
+
+    /// 按注入逻辑时钟淘汰空闲超时连接（drop 句柄），返回淘汰条数。
+    pub fn evict_idle(&mut self, now_ms: u64) -> usize {
+        let threshold = self.cfg.idle_timeout_ms;
+        let mut evicted = 0;
+        while let Some(front) = self.idle.front() {
+            if now_ms.saturating_sub(front.released_at_ms) > threshold {
+                let old = self.idle.pop_front().expect("front verified");
+                drop(old);
+                evicted += 1;
+            } else {
+                break;
+            }
+        }
+        evicted
+    }
+
+    /// 与 `ConnectionPool::snapshot` 同字段的只读快照。
+    #[must_use]
+    pub fn snapshot(&self) -> PoolSnapshot {
+        PoolSnapshot {
+            idle_count: self.idle.len(),
+            active_count: self.active.len(),
+            total_count: self.idle.len() + self.active.len(),
+            created_total: self.created_total,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

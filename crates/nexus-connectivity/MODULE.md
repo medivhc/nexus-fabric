@@ -553,3 +553,51 @@ cargo clippy -p nexus-connectivity --all-targets -- -D warnings
   不含 `unsafe`。
 - Deletion Test 成立：TURN 分配/凭证/生命周期语义是与 DERP 类 `RelayChannel`（DIAL 字节中继）、
   STUN 打洞三个独立变化维度；复用 `nat.rs` STUN 头原语，无新系统级 trait、无投机抽象。
+
+### 冻结契约（可靠性真实化 real I/O 集成，PRODUCT §12.40，2026-09-28）
+
+把 §12.11/§12.13/§12.14/§12.15/§12.20/§12.22 六个纯内存骨架升级为"真实 I/O
+经注入 trait / 组合根"的形态。**既有纯函数 API（注入 `now_ms` 路径）语义全部
+Protected，不得改动**；以下为 additive 新增。
+
+- `health_check`：
+  - `trait HealthProbe: Send + Sync + 'static { fn probe(&self, node_id: &str, target: &str) -> Result<(), String> }`：
+    真实 TCP/应用层 ping 由组合根实现，crate 零 socket。
+  - `HealthEvent { node_id: String, from: HealthState, to: HealthState, consecutive_failures: u32, at_ms: u64 }`：
+    结构化转移事件（Worker 只发事件）。
+  - `HealthMonitor::spawn(cfg: HealthConfig, probe: Box<dyn HealthProbe>, nodes: Vec<(String,String)>)
+    -> Result<Self, HealthCheckError>`：有 Owner 的 std 线程（Arc<AtomicBool> 停止位 +
+    Condvar 超时唤醒 + JoinHandle，AGENTS §13；`cancel(self)` 置位+notify+join）。
+    按 `probe_interval_ms` 真实墙钟驱动，结果喂 `HealthChecker::record_probe(success, real_now_ms)`；
+    状态转移 push `HealthEvent`。`drain_events()` / `state(node)` 只读。
+  - 超时 `timeout_ms` 由注入 probe 实现（`connect_timeout`）遵守；crate 不 spawn per-probe 线程。
+- `failover`：
+  - `FailoverManager::apply_health_event(&mut self, event: &HealthEvent, now_ms: u64)`：
+    Unhealthy→`report_failure`、Healthy→`report_recovery`、Degraded→忽略。
+    additive，不改既有切换/回切语义。
+- `smart_retry`：
+  - `RetryExecutor::execute<T,E,F>(&mut self, op: F) -> Result<T, RetryRunError<E>>`，
+    `F: FnMut(u32) -> Result<T, (E, RetryableClass)>`：真实 Instant + `thread::sleep`
+    退避循环；`CircuitOpen` 睡 retry_after 再试探；`Fatal`/`StopRetry` 即返回。
+    `RetryRunError<E>` 携带最后一次业务错误与原因。
+- `connection_pool`：
+  - `trait ConnectionFactory { type Handle; fn connect(&self, key: &str) -> Result<Self::Handle, PoolError> }`。
+  - `RealizedPool<F: ConnectionFactory>` / `RealizedConnection<H>`：包装真实句柄，
+    复用/上限/空闲回收计数语义与 `ConnectionPool` 对齐；淘汰时 drop 句柄关 socket。
+    既有 `ConnectionPool` 类型与 `connection_pool.toml` expectation Protected。
+- `graceful_exit`：
+  - `GoodbyeFrame { version: u8, peer_id: String, reason: String }` +
+    `encode() -> Vec<u8>` / `decode_goodbye(&[u8]) -> Result<GoodbyeFrame, GracefulExitError>`；
+    线格式 `[ver=1][type=0x47][peer_len u16BE][peer][reason_len u16BE][reason]`；
+    新增 `GracefulExitError::InvalidFrame(String)`。
+  - `GracefulExit::drain_real<F: Fn() -> u32>(&mut self, active: F) -> ExitState`：
+    真实墙钟宽限期轮询，排空或超时进 Exiting。
+- `config_hot_reload`：
+  - `FileWatcher::new(path)` / `poll_changed() -> Result<bool, HotReloadError>` /
+    `read_current() -> Result<String, HotReloadError>`：std 轮询（metadata mtime/len +
+    FNV-1a 内容哈希），**不引入 notify crate**。新增 `HotReloadError::Io(String)`。
+- 不变量：crate 内 policy 仍零真实 socket；真实 TCP/TLS/文件/线程只经注入 trait 或
+  std 定时器；无 `unsafe`；不新增第三方依赖；所有长期任务有 Owner 且 `cancel`/drop 前 join。
+- Deletion Test：六个新接缝对应六个独立的"真实 I/O 落地"维度（定时器/事件消费/
+  执行循环/真实句柄/线格式+drain/文件轮询），各自可独立替换实现；不引入第二套
+  系统级 Plan，不改 virtual_subnet/relay/lib（片1 所有）。

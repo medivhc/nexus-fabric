@@ -201,6 +201,170 @@ impl HealthChecker {
     }
 }
 
+// === 12.40.1 真实定时器 + 注入探测（real I/O 经注入 trait） ==================
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+/// 健康探测器接缝：真实 TCP 握手 / 应用层 ping 由组合根（example）实现，
+/// crate 内不发起网络。超时由实现方遵守 `HealthConfig.timeout_ms`
+/// （如 `TcpStream::connect_timeout`）。
+pub trait HealthProbe: Send + Sync + 'static {
+    /// 探测目标节点；`Ok(())` 表示可达，`Err(String)` 表示不可达（含超时）。
+    fn probe(&self, node_id: &str, target: &str) -> Result<(), String>;
+}
+
+/// 健康状态转移结构化事件（Worker/Monitor 只发事件，AGENTS §14）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthEvent {
+    pub node_id: String,
+    pub from: HealthState,
+    pub to: HealthState,
+    pub consecutive_failures: u32,
+    pub at_ms: u64,
+}
+
+struct MonitorSignal {
+    stop: bool,
+}
+
+fn lock_or_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl HealthChecker {
+    /// 查询节点当前连续失败计数（additive；从未记录返回 `UnknownNode`）。
+    pub fn consecutive_failures(&self, node_id: &str) -> Result<u32, HealthCheckError> {
+        let entry = self
+            .nodes
+            .get(node_id)
+            .ok_or_else(|| HealthCheckError::UnknownNode(node_id.to_string()))?;
+        Ok(entry.consecutive_failures)
+    }
+}
+
+/// 有 Owner 的真实定时器探测线程（AGENTS §13：CancellationToken(Arc<AtomicBool>)
+/// + Condvar 唤醒 + JoinHandle 持有；`cancel(self)` 置位 + notify + join，不留后台线程）。
+pub struct HealthMonitor {
+    stop_flag: Arc<AtomicBool>,
+    signal: Arc<(Mutex<MonitorSignal>, Condvar)>,
+    checker: Arc<Mutex<HealthChecker>>,
+    events: Arc<Mutex<Vec<HealthEvent>>>,
+    handle: Option<JoinHandle<()>>,
+    started_at: Instant,
+}
+
+impl HealthMonitor {
+    /// 启动后台探测线程。`nodes` 为 `(node_id, target)` 列表；`target` 原样传给
+    /// `HealthProbe::probe`（真实地址由组合根解释）。节点在首次 `record_probe`
+    /// 时自动注册（与 `HealthChecker` 语义一致）。
+    pub fn spawn(
+        cfg: HealthConfig,
+        probe: Box<dyn HealthProbe>,
+        nodes: Vec<(String, String)>,
+    ) -> Result<Self, HealthCheckError> {
+        if nodes.is_empty() {
+            return Err(HealthCheckError::InvalidConfig(
+                "nodes must not be empty".to_string(),
+            ));
+        }
+        let checker = Arc::new(Mutex::new(HealthChecker::new(cfg)));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let signal = Arc::new((Mutex::new(MonitorSignal { stop: false }), Condvar::new()));
+        let started_at = Instant::now();
+
+        let t_checker = checker.clone();
+        let t_events = events.clone();
+        let t_stop = stop_flag.clone();
+        let t_sig = signal.clone();
+        let interval = cfg.probe_interval_ms;
+
+        let handle = thread::spawn(move || {
+            loop {
+                // 可中断地等待一个探测周期。
+                {
+                    let (lock, cvar) = &*t_sig;
+                    let g = lock_or_recover(lock);
+                    if g.stop || t_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let _ = cvar.wait_timeout(g, Duration::from_millis(interval));
+                }
+                if t_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                for (node_id, target) in &nodes {
+                    if t_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let now_ms = started_at.elapsed().as_millis() as u64;
+                    let prev = lock_or_recover(&t_checker).state(node_id).ok();
+                    let success = probe.probe(node_id, target).is_ok();
+                    let new_state = lock_or_recover(&t_checker)
+                        .record_probe(node_id, success, now_ms)
+                        .ok();
+                    if let (Some(prev), Some(new)) = (prev, new_state) {
+                        if prev != new {
+                            let cf = lock_or_recover(&t_checker)
+                                .consecutive_failures(node_id)
+                                .unwrap_or(0);
+                            t_events.lock().unwrap().push(HealthEvent {
+                                node_id: node_id.clone(),
+                                from: prev,
+                                to: new,
+                                consecutive_failures: cf,
+                                at_ms: now_ms,
+                            });
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            stop_flag,
+            signal,
+            checker,
+            events,
+            handle: Some(handle),
+            started_at,
+        })
+    }
+
+    /// 协作式停止 + join。必须在 example 退出前调用，不留线程。
+    pub fn cancel(mut self) {
+        self.stop_flag.store(true, Ordering::Relaxed);
+        {
+            let (lock, cvar) = &*self.signal;
+            let mut g = lock_or_recover(lock);
+            g.stop = true;
+            cvar.notify_all();
+        }
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+
+    /// 取走并返回累积的状态转移事件（读侧非阻塞）。
+    pub fn drain_events(&self) -> Vec<HealthEvent> {
+        std::mem::take(&mut *self.events.lock().unwrap())
+    }
+
+    /// 只读当前节点健康状态。
+    pub fn state(&self, node_id: &str) -> Result<HealthState, HealthCheckError> {
+        lock_or_recover(&self.checker).state(node_id)
+    }
+
+    /// 监控启动至今的真实毫秒数。
+    pub fn elapsed_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis() as u64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

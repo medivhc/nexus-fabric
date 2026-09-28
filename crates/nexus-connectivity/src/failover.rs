@@ -306,6 +306,25 @@ impl FailoverManager {
     }
 }
 
+// === 12.40.2 消费健康事件流驱动主备切换（additive） ============================
+
+use crate::health_check::{HealthEvent, HealthState};
+
+impl FailoverManager {
+    /// 消费一条健康事件（PRODUCT §12.40.2），驱动既有 `report_failure` /
+    /// `report_recovery`，不改既有切换/回切语义：
+    /// - `event.to == Unhealthy` -> `report_failure(node_id, now_ms)`；
+    /// - `event.to == Healthy`   -> `report_recovery(node_id, now_ms)`；
+    /// - `event.to == Degraded`  -> 忽略（不切换）。
+    pub fn apply_health_event(&mut self, event: &HealthEvent, now_ms: u64) {
+        match event.to {
+            HealthState::Unhealthy => self.report_failure(&event.node_id, now_ms),
+            HealthState::Healthy => self.report_recovery(&event.node_id, now_ms),
+            HealthState::Degraded => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

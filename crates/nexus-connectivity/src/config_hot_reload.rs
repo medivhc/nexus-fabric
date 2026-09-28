@@ -31,6 +31,8 @@ use std::fmt;
 pub enum HotReloadError {
     /// 配置非法（如 watch_interval_ms=0）。
     InvalidConfig(String),
+    /// 文件 I/O 错误（读取 / metadata 失败，或内容非 UTF-8）。
+    Io(String),
 }
 
 impl fmt::Display for HotReloadError {
@@ -38,6 +40,9 @@ impl fmt::Display for HotReloadError {
         match self {
             Self::InvalidConfig(msg) => {
                 write!(f, "HOT_RELOAD_INVALID_CONFIG: {msg}")
+            }
+            Self::Io(msg) => {
+                write!(f, "HOT_RELOAD_IO: {msg}")
             }
         }
     }
@@ -162,6 +167,69 @@ impl HotReloadManager {
     #[must_use]
     pub fn current_revision(&self) -> u64 {
         self.current_revision
+    }
+}
+
+// === 12.40.6 配置文件 std 轮询 watcher（不引入 notify crate） ===================
+
+use std::path::{Path, PathBuf};
+
+/// std 文件轮询 watcher：按内容指纹（长度 + FNV-1a 哈希）判断配置文件是否变化。
+///
+/// 不引入 `notify`/`notify-debouncer`；调用方按 `watch_interval_ms` 周期主动调
+/// `poll_changed()`，变化后 `read_current()` 取内容并自行校验，再喂给
+/// `HotReloadManager::propose_reload`。
+pub struct FileWatcher {
+    path: PathBuf,
+    last_len: Option<u64>,
+    last_hash: Option<u64>,
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+impl FileWatcher {
+    /// 绑定一个配置文件路径；首次 `poll_changed()` 建立基线（返回 false）。
+    pub fn new(path: impl AsRef<Path>) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+            last_len: None,
+            last_hash: None,
+        }
+    }
+
+    fn fingerprint(&self) -> Result<(u64, u64), HotReloadError> {
+        let bytes = std::fs::read(&self.path)
+            .map_err(|e| HotReloadError::Io(format!("read {:?}: {e}", self.path)))?;
+        Ok((bytes.len() as u64, fnv1a(&bytes)))
+    }
+
+    /// 轮询一次；相对上次指纹（长度或内容哈希）变化即返回 `Ok(true)`。
+    /// 首次调用为基线，返回 `Ok(false)`。
+    pub fn poll_changed(&mut self) -> Result<bool, HotReloadError> {
+        let (len, hash) = self.fingerprint()?;
+        let changed = match (self.last_len, self.last_hash) {
+            (Some(l), Some(h)) => l != len || h != hash,
+            (None, None) => false,
+            _ => true,
+        };
+        self.last_len = Some(len);
+        self.last_hash = Some(hash);
+        Ok(changed)
+    }
+
+    /// 读取文件当前内容（UTF-8）。
+    pub fn read_current(&self) -> Result<String, HotReloadError> {
+        let bytes = std::fs::read(&self.path)
+            .map_err(|e| HotReloadError::Io(format!("read {:?}: {e}", self.path)))?;
+        String::from_utf8(bytes)
+            .map_err(|_| HotReloadError::Io("config file is not valid utf-8".to_string()))
     }
 }
 

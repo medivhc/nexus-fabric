@@ -2172,6 +2172,105 @@ CLI 一次性 `--tun` 真实数据面但随进程退出即 drop）：让 daemon 
 - 冻结边界（P4.1 不做）：CA/证书吊销与轮换、SPKI pinning 管理界面、双向 NAT
   打洞与 TURN 中继的**真机**验证（原语已交付 §12.9/turn.rs，留 P4.2）、多节点
   自动发现/`join` 命令（留 P4.3）。
+
+### 12.40 可靠性真实化：真实定时器/探测/连接/再见帧/文件轮询（2026-09-28）{#12-realize-reliability}
+
+接 §12.11/§12.13/§12.14/§12.15/§12.20/§12.22 六个纯内存骨架：把"真实 I/O 集成"
+从 TODO 落地为**经注入 trait / 组合根**的真实形态，同时保留既有确定性路径
+（注入 `now_ms` 的纯函数 API 语义不变，其 E4 场景 expectation 为 Protected）。
+crate 内 policy 逻辑保持零真实 socket；真实 TCP / 线程定时器 / 文件轮询通过
+注入接缝或 std 定时器发生在组合根（example）。本项**不新增第三方依赖**。
+
+#### 12.40.1 健康检查真实定时器 + 真实探测（{#12-health-check-real}）
+
+- `trait HealthProbe: Send + Sync + 'static`：`fn probe(&self, node_id: &str, target: &str)
+  -> Result<(), String>`；真实 TCP 握手 / 应用层 ping 由组合根实现（如
+  `TcpStream::connect_timeout(addr, timeout_ms)`），crate 不发起网络。
+- `HealthEvent { node_id, from: HealthState, to: HealthState, consecutive_failures, at_ms }`：
+  状态转移结构化事件（Worker/Monitor 只发事件）。
+- `HealthMonitor::spawn(cfg, probe: Box<dyn HealthProbe>, nodes: Vec<(String,String)>)
+  -> Result<Self, HealthCheckError>`：起一个**有 Owner** 的 std 线程（结构化并发，
+  AGENTS §13：CancellationToken(Arc<AtomicBool>) + Condvar 唤醒 + JoinHandle 持有，
+  禁止丢 JoinHandle）。按 `probe_interval_ms` 真实墙钟驱动，对每个 node 调
+  `probe.probe`，结果喂给 `HealthChecker::record_probe(success, real_now_ms)`；
+  `from != to` 时 push 一条 `HealthEvent`。`cancel(self)`：置停止位 + notify_all + join，
+  example 退出前调用，不留后台线程。
+- `HealthMonitor::drain_events() -> Vec<HealthEvent>` / `state(node_id)`：只读快照。
+- 既有 `HealthChecker` 注入 `now_ms` 语义完全保留（§12.11 Protected）。
+- E4：`health_check_real.toml`（id=`product.health-check-real`，example
+  `health_check_real --json`）——loopback listener 起停：初始探测成功 Healthy；
+  停 listener → 连续失败达 threshold → Unhealthy 事件；再起 listener → 一次成功
+  → Healthy 事件；断言事件链含 `healthy->degraded->unhealthy->healthy`。
+- 冻结边界：不接跨节点状态同步、不做持久化、探测 worker 线程池（单线程轮询足够）。
+
+#### 12.40.2 故障转移消费健康事件流（{#12-failover-health}）
+
+- `FailoverManager::apply_health_event(&mut self, event: &HealthEvent, now_ms: u64)`
+  （additive，不改既有 `report_failure`/`report_recovery` 语义）：
+  `event.to == Unhealthy` → `report_failure(node_id, now_ms)`；
+  `event.to == Healthy` → `report_recovery(node_id, now_ms)`；
+  `Degraded` → 忽略（不切换）。
+- E4：`failover_health.toml`（id=`product.failover-health`，example
+  `failover_health --json`）——注入合成健康事件：primary 变 Unhealthy → 切到 s1；
+  s1 变 Unhealthy → 退到 s2；primary 恢复 Healthy 且 auto_failback=true → 切回 Primary。
+- 冻结边界：真实数据面连接摘除/挂载、跨进程持久化（留 TODO）。
+
+#### 12.40.3 智能重试真实执行（{#12-smart-retry-real}）
+
+- `RetryExecutor::execute<T,E,F>(&mut self, op: F) -> Result<T, RetryRunError<E>>`：
+  真实墙钟（`std::time::Instant`）驱动的退避重试循环——`decide(attempt, real_now)`
+  决策后 `std::thread::sleep(compute_backoff)` 真实退避；`CircuitOpen` 时 sleep
+  `retry_after_ms` 再试探；`StopRetry` 或 `Fatal` 错误即返回。`op` 返回
+  `Ok(T)` / `Err((E, RetryableClass))`；成功 `record_success`，可重试失败
+  `record_failure`。既有 `RetryConfig`/`RetryExecutor::decide/compute_backoff` 语义不变。
+- E4：`smart_retry_real.toml`（id=`product.smart-retry-real`，example
+  `smart_retry_real --json`）——op 前 2 次返回 Retryable 失败、第 3 次成功；断言
+  `attempts == 3`、成功后熔断 closed、累计 sleep 退避发生过。
+- 冻结边界：jitter、真实异步调度器（本项 std::thread::sleep 同步阻塞）。
+
+#### 12.40.4 连接池真实工厂（{#12-connection-pool-real}）
+
+- `trait ConnectionFactory { type Handle; fn connect(&self, key: &str) -> Result<Self::Handle, PoolError> }`：
+  按需创建真实连接（组合根实现连 loopback echo server 的 TCP 流）。
+- `RealizedPool<F: ConnectionFactory>` / `RealizedConnection<H>`：在既有
+  `PoolConfig` 计数语义上包装真实句柄——`acquire` 命中空闲则复用同一条真实句柄
+  （conn_id 不变），未命中调 `factory.connect` 新建；`release` 归还句柄到空闲；
+  超 `max_idle` / `evict_idle` 淘汰时 drop 句柄（关闭 socket）；`snapshot()` 与
+  `ConnectionPool` 同字段。既有 `ConnectionPool::acquire/release` 语义与
+  `connection_pool.toml` expectation 完全 Protected。
+- E4：`connection_pool_real.toml`（id=`product.connection-pool-real`，example
+  `connection_pool_real --json`）——连 loopback echo server：复用同一 conn_id 的
+  真实 TCP 流（echo 往返成功）、占满 `max_total` 后 `Exhausted`、idle 淘汰后句柄 drop。
+- 冻结边界：Send+Sync 并发共享池、LRU、空闲探活（留 TODO）。
+
+#### 12.40.5 再见帧 wire codec + 真实宽限期 drain（{#12-graceful-exit-real}）
+
+- `GoodbyeFrame { version: u8, peer_id: String, reason: String }`：版本化确定线格式
+  `[version(1)=1][type(1)=0x47 'G'][peer_len(u16 BE)][peer_id utf8][reason_len(u16 BE)][reason utf8]`；
+  `GoodbyeFrame::encode() -> Vec<u8>` / `decode_goodbye(&[u8]) -> Result<GoodbyeFrame, GracefulExitError>`
+  往返一致；截断/魔错/长度不符 → 结构化 `InvalidFrame`。
+- `GracefulExit::drain_real<F: Fn() -> u32>(&mut self, active: F) -> ExitState`：
+  真实墙钟宽限期——轮询 `active()` 取活跃连接数，连接排空即进 `Exiting`，
+  超过 `grace_period_ms` 强制进 `Exiting`；返回 `Exiting`/`Exited`。
+- E4：`graceful_exit_real.toml`（id=`product.graceful-exit-real`，example
+  `graceful_exit_real --json`）——loopback TCP 对端：本端 encode 再见帧发出、对端
+  decode 回显字段一致；`drain_real` 在活跃连接逐步清零时推进 Draining→Exiting；
+  宽限期超时强制退出。
+- 冻结边界：隧道/中继级再见帧钩子（不改 virtual_subnet.rs/relay.rs，见 coordination items）、
+  对端 ACK 等待。
+
+#### 12.40.6 配置文件 std 轮询 watcher（{#12-config-hot-reload-real}）
+
+- `FileWatcher { path }`：`poll_changed() -> Result<bool, HotReloadError>` 用 std
+  轮询（`std::fs::metadata` mtime/len + 内容 FNV-1a 哈希）判断变化；**不引入 notify crate**。
+  `read_current() -> Result<String, HotReloadError>` 读当前内容。
+- 变化后：调用方读取 → 注入校验 → `HotReloadManager::propose_reload(revision, valid)`
+  推进 revision（§12.15 语义不变）。
+- E4：`config_hot_reload_watch.toml`（id=`product.config-hot-reload-watch`，example
+  `config_hot_reload_watch --json`）——真实临时文件：创建 → poll 基线 → 修改内容
+  → poll_changed=true → 校验后 propose_reload → revision 前进；再修改一次再前进；
+  结束删除临时文件。
+- 冻结边界：inode/rename 语义、原子 rename 替换、真实配置格式解析（调用方注入）。
 ## 13. Windows 系统代理接管与常驻自启（system-proxy + autostart，2026-09-24）{#13-system-proxy}
 
 桌面/Windows 场景下，nexusd 作为本地入口把系统 WinINET 代理指向本地数据面，

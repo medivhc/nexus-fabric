@@ -33,6 +33,8 @@ use std::fmt;
 pub enum GracefulExitError {
     /// 配置非法（如 grace_period_ms=0）。
     InvalidConfig(String),
+    /// 再见帧 wire 格式非法（截断 / 魔错 / 长度不符 / UTF-8 解码失败）。
+    InvalidFrame(String),
 }
 
 impl fmt::Display for GracefulExitError {
@@ -40,6 +42,9 @@ impl fmt::Display for GracefulExitError {
         match self {
             Self::InvalidConfig(msg) => {
                 write!(f, "GRACEFUL_EXIT_INVALID_CONFIG: {msg}")
+            }
+            Self::InvalidFrame(msg) => {
+                write!(f, "GRACEFUL_EXIT_INVALID_FRAME: {msg}")
             }
         }
     }
@@ -212,6 +217,129 @@ impl GracefulExit {
     #[must_use]
     pub fn notified_peer_count(&self) -> usize {
         self.notified.len()
+    }
+}
+
+// === 12.40.5 再见帧 wire codec + 真实墙钟宽限期 drain ==========================
+
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// 再见帧类型标签线字节（ASCII 'G'）。
+pub const GOODBYE_FRAME_TYPE: u8 = b'G';
+/// 再见帧线格式版本。
+pub const GOODBYE_FRAME_VERSION: u8 = 1;
+
+/// 节点下线再见帧（版本化确定线格式）。
+///
+/// 线格式：`[version u8=1][type u8=0x47 'G'][peer_len u16 BE][peer_id utf8]
+/// [reason_len u16 BE][reason utf8]`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoodbyeFrame {
+    /// 线格式版本（当前恒为 1）。
+    pub version: u8,
+    /// 发送方 peer 标识。
+    pub peer_id: String,
+    /// 人可读下线原因。
+    pub reason: String,
+}
+
+impl GoodbyeFrame {
+    /// 用 peer_id / reason 构造版本 1 再见帧。
+    #[must_use]
+    pub fn new(peer_id: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            version: GOODBYE_FRAME_VERSION,
+            peer_id: peer_id.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// 编码为确定线格式字节。
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let peer = self.peer_id.as_bytes();
+        let reason = self.reason.as_bytes();
+        let mut out = Vec::with_capacity(4 + peer.len() + 2 + reason.len());
+        out.push(self.version);
+        out.push(GOODBYE_FRAME_TYPE);
+        out.extend_from_slice(&(peer.len() as u16).to_be_bytes());
+        out.extend_from_slice(peer);
+        out.extend_from_slice(&(reason.len() as u16).to_be_bytes());
+        out.extend_from_slice(reason);
+        out
+    }
+}
+
+/// 解码再见帧；截断 / 魔错 / 长度不符 / 非 UTF-8 / 尾字节均报 `InvalidFrame`。
+pub fn decode_goodbye(buf: &[u8]) -> Result<GoodbyeFrame, GracefulExitError> {
+    if buf.len() < 4 {
+        return Err(GracefulExitError::InvalidFrame(format!(
+            "frame too short: {} bytes",
+            buf.len()
+        )));
+    }
+    let version = buf[0];
+    if buf[1] != GOODBYE_FRAME_TYPE {
+        return Err(GracefulExitError::InvalidFrame(format!(
+            "bad type byte: 0x{:02x}",
+            buf[1]
+        )));
+    }
+    let peer_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+    let mut idx = 4usize;
+    if buf.len() < idx + peer_len + 2 {
+        return Err(GracefulExitError::InvalidFrame(
+            "truncated peer id".to_string(),
+        ));
+    }
+    let peer = std::str::from_utf8(&buf[idx..idx + peer_len])
+        .map_err(|_| GracefulExitError::InvalidFrame("peer id not utf-8".to_string()))?;
+    idx += peer_len;
+    let reason_len = u16::from_be_bytes([buf[idx], buf[idx + 1]]) as usize;
+    idx += 2;
+    if buf.len() < idx + reason_len {
+        return Err(GracefulExitError::InvalidFrame(
+            "truncated reason".to_string(),
+        ));
+    }
+    let reason = std::str::from_utf8(&buf[idx..idx + reason_len])
+        .map_err(|_| GracefulExitError::InvalidFrame("reason not utf-8".to_string()))?;
+    idx += reason_len;
+    if idx != buf.len() {
+        return Err(GracefulExitError::InvalidFrame(format!(
+            "trailing {} bytes",
+            buf.len() - idx
+        )));
+    }
+    Ok(GoodbyeFrame {
+        version,
+        peer_id: peer.to_string(),
+        reason: reason.to_string(),
+    })
+}
+
+impl GracefulExit {
+    /// 真实墙钟宽限期 drain（PRODUCT §12.40.5）。
+    ///
+    /// 调用前应已 `begin_draining(0)`；本方法按约 20ms 轮询 `active()` 取活跃连接数，
+    /// 喂给既有 `advance(active, now_ms)`：连接排空或超过 `grace_period_ms` 即推进到
+    /// `Exiting`。返回最终状态（`Exiting` / `Exited`）。
+    pub fn drain_real<F: Fn() -> u32>(&mut self, active: F) -> ExitState {
+        let start = Instant::now();
+        loop {
+            let a = active();
+            let now_ms = start.elapsed().as_millis() as u64;
+            let st = self.advance(a, now_ms);
+            if st != ExitState::Draining {
+                return st;
+            }
+            if start.elapsed() >= Duration::from_millis(self.cfg.grace_period_ms) {
+                // 宽限期已到：强制推进一次（now 远超 drain_start）。
+                return self.advance(a, self.cfg.grace_period_ms + 1);
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 

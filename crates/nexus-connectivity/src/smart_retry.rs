@@ -234,6 +234,21 @@ pub struct RetryExecutor {
     last_attempt_ms: Option<u64>,
 }
 
+impl<E: std::fmt::Debug> std::fmt::Display for RetryRunError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RetryRunError::StopAttempts { attempts, .. } => {
+                write!(f, "RETRY_STOP: exhausted after {attempts} attempts")
+            }
+            RetryRunError::Fatal { attempts, .. } => {
+                write!(f, "RETRY_FATAL: failed at attempt {attempts}")
+            }
+        }
+    }
+}
+
+impl<E: std::fmt::Debug> std::error::Error for RetryRunError<E> {}
+
 impl RetryExecutor {
     /// 用配置构造执行器；初始熔断 `Closed`、连续失败 0。
     #[must_use]
@@ -337,6 +352,89 @@ impl RetryExecutor {
     #[must_use]
     pub fn last_attempt_ms(&self) -> Option<u64> {
         self.last_attempt_ms
+    }
+}
+
+// === 12.40.3 真实执行集成（真实墙钟 + thread::sleep 退避） =====================
+
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// `RetryExecutor::execute` 的失败结果（携带最后一次业务错误与原因）。
+#[derive(Debug)]
+pub enum RetryRunError<E> {
+    /// 超过 `max_attempts` 仍未成功。
+    StopAttempts {
+        /// 最后一次业务错误（若一次都没成功且 op 从未返回错误，则为 None）。
+        last_error: Option<E>,
+        /// 实际尝试次数。
+        attempts: u32,
+    },
+    /// 业务侧判定为 `Fatal`，不再重试。
+    Fatal {
+        /// 触发 Fatal 的业务错误。
+        error: E,
+        /// 实际尝试次数（含本次）。
+        attempts: u32,
+    },
+}
+
+impl RetryExecutor {
+    /// 真实墙钟驱动的退避重试循环（PRODUCT §12.40.3）。
+    ///
+    /// `op(attempt)` 返回 `Ok(T)` 成功；`Err((E, RetryableClass))`：
+    /// - `Retryable`：`record_failure` 后按退避/熔断真实 sleep 再试；
+    /// - `Fatal`：立即返回 `RetryRunError::Fatal`。
+    ///
+    /// 真实时间以本调用开始的 `Instant` 为零点喂给既有 `decide` / `record_*`；
+    /// 退避与熔断冷却用 `std::thread::sleep` 真实阻塞。既有纯函数决策语义不变。
+    pub fn execute<T, E, F>(&mut self, mut op: F) -> Result<T, RetryRunError<E>>
+    where
+        F: FnMut(u32) -> Result<T, (E, RetryableClass)>,
+    {
+        let start = Instant::now();
+        let now_ms = || start.elapsed().as_millis() as u64;
+        let mut attempt_no: u32 = 1;
+        let mut last_error: Option<E> = None;
+
+        loop {
+            match self.decide(attempt_no, now_ms()) {
+                RetryDecision::StopRetry { .. } => {
+                    return Err(RetryRunError::StopAttempts {
+                        last_error,
+                        attempts: attempt_no.saturating_sub(1),
+                    });
+                }
+                RetryDecision::CircuitOpen { retry_after_ms } => {
+                    // 熔断冷却：真实等待后再试探。
+                    thread::sleep(Duration::from_millis(retry_after_ms));
+                    continue;
+                }
+                RetryDecision::AllowAttempt { attempt, .. } => {
+                    // attempt>=2 时真实退避一个 backoff。
+                    if attempt > 1 {
+                        thread::sleep(Duration::from_millis(self.compute_backoff(attempt)));
+                    }
+                    match op(attempt) {
+                        Ok(value) => {
+                            self.record_success(now_ms());
+                            return Ok(value);
+                        }
+                        Err((error, class)) => {
+                            self.record_failure(now_ms(), class);
+                            if class == RetryableClass::Fatal {
+                                return Err(RetryRunError::Fatal {
+                                    error,
+                                    attempts: attempt,
+                                });
+                            }
+                            last_error = Some(error);
+                            attempt_no = attempt.saturating_add(1);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
