@@ -615,14 +615,9 @@ impl Loop {
                 if matches!(lc.quic.poll_timeout(), Some(t) if t <= now) {
                     lc.quic.handle_timeout(now);
                 }
-                loop {
-                    match lc.quic.poll_endpoint_events() {
-                        Some(ev) => {
-                            if let Some(cev) = self.endpoint.handle_event(lc.handle, ev) {
-                                lc.quic.handle_event(cev);
-                            }
-                        }
-                        None => break,
+                while let Some(ev) = lc.quic.poll_endpoint_events() {
+                    if let Some(cev) = self.endpoint.handle_event(lc.handle, ev) {
+                        lc.quic.handle_event(cev);
                     }
                 }
                 let mut evs = Vec::new();
@@ -726,10 +721,10 @@ impl Loop {
                         }
                     }
                 }
-                if ss.send_fin && !ss.fin_sent && ss.send_buf.is_empty() {
-                    if lc.quic.send_stream(qid).finish().is_ok() {
-                        ss.fin_sent = true;
-                    }
+                if ss.send_fin && !ss.fin_sent && ss.send_buf.is_empty()
+                    && lc.quic.send_stream(qid).finish().is_ok()
+                {
+                    ss.fin_sent = true;
                 }
             }
         }
@@ -796,23 +791,23 @@ impl Loop {
                     lc.shared.accepted_cv.notify_all();
                 }
             }
-            quinn_proto::Event::Stream(quinn_proto::StreamEvent::Opened { dir }) => {
-                if dir == Dir::Bi {
-                    let sh = match self.live.get_mut(&id) {
-                        Some(lc) => match lc.quic.streams().accept(Dir::Bi) {
-                            Some(qid) => {
-                                let sh = Arc::new(StreamShared::new(id, self.tx.clone()));
-                                lc.streams.insert(qid, sh.clone());
-                                sh
-                            }
-                            None => return,
-                        },
+            quinn_proto::Event::Stream(quinn_proto::StreamEvent::Opened { dir })
+                if dir == Dir::Bi =>
+            {
+                let sh = match self.live.get_mut(&id) {
+                    Some(lc) => match lc.quic.streams().accept(Dir::Bi) {
+                        Some(qid) => {
+                            let sh = Arc::new(StreamShared::new(id, self.tx.clone()));
+                            lc.streams.insert(qid, sh.clone());
+                            sh
+                        }
                         None => return,
-                    };
-                    if let Some(lc) = self.live.get(&id) {
-                        lc.shared.accepted.lock().unwrap().push_back(sh);
-                        lc.shared.accepted_cv.notify_all();
-                    }
+                    },
+                    None => return,
+                };
+                if let Some(lc) = self.live.get(&id) {
+                    lc.shared.accepted.lock().unwrap().push_back(sh);
+                    lc.shared.accepted_cv.notify_all();
                 }
             }
             // Readable/Writable/Finished/Stopped/Available/Datagram*: the pump
