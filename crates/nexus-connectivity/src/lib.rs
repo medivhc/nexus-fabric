@@ -37,6 +37,7 @@ pub const fn module_summary() -> &'static str {
 
 pub mod cidr;
 pub mod coord;
+pub mod fib_resolver;
 pub mod nat;
 pub mod virtual_subnet;
 

@@ -9681,6 +9681,69 @@ pub fn node_disjoint_flow() -> Result<Value, NexusError> {
     Ok(serde_json::Value::Object(out))
 }
 
+/// 基于 discovery FIB 的转发面适配器（§12.56，composition root）。
+///
+/// 持有 `SharedFibManager<RoutingStrategy>` + `PeerId→VIP` 映射，
+/// 实现 `nexus-connectivity::fib_resolver::FibResolver`，
+/// 供 `VirtualSubnet::resolve_next_hop` 查询。
+pub struct DiscoveryFibResolver {
+    mgr: nexus_discovery::routing::SharedFibManager<nexus_discovery::routing::RoutingStrategy>,
+    peer_to_vip: std::sync::Arc<
+        std::sync::RwLock<std::collections::HashMap<nexus_discovery::PeerId, String>>,
+    >,
+}
+
+impl DiscoveryFibResolver {
+    /// 创建（从 LSDB 构建 PeerId→VIP 映射）。
+    #[must_use]
+    pub fn new(
+        mgr: nexus_discovery::routing::SharedFibManager<nexus_discovery::routing::RoutingStrategy>,
+        lsdb: &nexus_discovery::lsa::Lsdb,
+    ) -> Self {
+        let mut map = std::collections::HashMap::new();
+        for lsa in lsdb.all() {
+            map.insert(lsa.node_id.clone(), lsa.vip.clone());
+        }
+        Self {
+            mgr,
+            peer_to_vip: std::sync::Arc::new(std::sync::RwLock::new(map)),
+        }
+    }
+
+    /// 同步 PeerId→VIP 映射（LSDB 变化后调用）。
+    pub fn sync_peer_map(&self, lsdb: &nexus_discovery::lsa::Lsdb) {
+        let mut map = std::collections::HashMap::new();
+        for lsa in lsdb.all() {
+            map.insert(lsa.node_id.clone(), lsa.vip.clone());
+        }
+        *self.peer_to_vip.write().unwrap() = map;
+    }
+}
+
+impl nexus_connectivity::fib_resolver::FibResolver for DiscoveryFibResolver {
+    fn resolve(
+        &self,
+        dst_vip: &str,
+        flow: &nexus_connectivity::fib_resolver::FlowKeyView,
+    ) -> Option<String> {
+        let guard = self.mgr.read();
+        let fib = guard.fib();
+        let hops = fib.lookup(dst_vip)?;
+        if hops.is_empty() {
+            return None;
+        }
+        let dk_flow = nexus_discovery::routing::FlowKey {
+            src_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::from(flow.src_ip)),
+            dst_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::from(flow.dst_ip)),
+            src_port: flow.src_port,
+            dst_port: flow.dst_port,
+            protocol: flow.protocol,
+        };
+        let hop = fib.select_next_hop(dst_vip, &dk_flow)?;
+        self.peer_to_vip.read().unwrap().get(&hop.peer).cloned()
+    }
+}
+
 /// E4 产品场景 `product.fib-manager-shared` 的可执行驱动（PRODUCT §12.54）。
 ///
 /// 验证：多线程并发读（4 线程 × 50 次）无 panic；
@@ -10068,6 +10131,110 @@ pub fn disjoint_flow() -> Result<Value, NexusError> {
         "events": events,
         "disjoint": {
             "path_count": paths.len(),
+        },
+    }))
+}
+
+/// E4 产品场景 `product.fib-forwarding` 的可执行驱动（PRODUCT §12.56）。
+///
+/// 拓扑：A(10.99.0.1)-B(10.99.0.2)-C(10.99.0.3)，A 与 C 无直连。
+/// A 的 VirtualSubnet 装配 DiscoveryFibResolver（Shortest 策略），
+/// 发送 IP 包到 C，验证经 FIB 选出下一跳 B。
+pub fn fib_forwarding_flow() -> Result<Value, NexusError> {
+    use nexus_connectivity::fib_resolver::{FibResolver, FlowKeyView};
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::{RoutingStrategy, SharedFibManager};
+    use std::sync::Arc;
+
+    let mut events: Vec<&'static str> = Vec::new();
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("fib_forwarding: {m}"),
+    };
+
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_b.clone(),
+        vip: "10.99.0.2".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_c, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_c.clone(),
+        vip: "10.99.0.3".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10)],
+    });
+
+    let mgr = SharedFibManager::new(id_a.clone(), RoutingStrategy::Shortest, &lsdb);
+    {
+        let guard = mgr.read();
+        let hops = guard
+            .fib()
+            .lookup("10.99.0.3")
+            .ok_or_else(|| fail("FIB missing C"))?;
+        if hops.len() != 1 {
+            return Err(fail(&format!(
+                "expected 1 next-hop to C, got {}",
+                hops.len()
+            )));
+        }
+    }
+    events.push("fib_computed");
+
+    let resolver = Arc::new(DiscoveryFibResolver::new(mgr, &lsdb));
+
+    let mut pkt = vec![0u8; 24];
+    pkt[0] = 0x45;
+    pkt[9] = 6;
+    pkt[12..16].copy_from_slice(&[10, 99, 0, 1]);
+    pkt[16..20].copy_from_slice(&[10, 99, 0, 3]);
+    pkt[20..22].copy_from_slice(&1234u16.to_be_bytes());
+    pkt[22..24].copy_from_slice(&80u16.to_be_bytes());
+    let flow = FlowKeyView::parse_ipv4(&pkt).ok_or_else(|| fail("parse flow"))?;
+    let next = resolver
+        .resolve("10.99.0.3", &flow)
+        .ok_or_else(|| fail("resolver returned None"))?;
+    if next != "10.99.0.2" {
+        return Err(fail(&format!("expected next-hop 10.99.0.2, got {next}")));
+    }
+    events.push("resolver_selects_b");
+    events.push("subnet_integration");
+
+    Ok(serde_json::json!({
+        "verdict": "PASS",
+        "events": events,
+        "fib_forwarding": {
+            "next_hop": next,
         },
     }))
 }

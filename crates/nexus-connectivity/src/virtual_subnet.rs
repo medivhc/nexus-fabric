@@ -457,6 +457,8 @@ pub struct VirtualSubnetTunnel {
     relay_locators: HashMap<String, String>,
     /// 数据面管线（PRODUCT §12.41）：None = 完全透传，wire 字节与冻结前逐字节一致。
     pipeline: Option<dataplane_pipeline::DataplanePipeline>,
+    /// FIB 解析器（§12.56，可选）：动态选路替代静态 routes。
+    fib_resolver: Option<crate::fib_resolver::SharedFibResolver>,
 }
 
 impl VirtualSubnetTunnel {
@@ -490,6 +492,7 @@ impl VirtualSubnetTunnel {
             hole_punch_config: HolePunchConfig::default(),
             relay_locators: HashMap::new(),
             pipeline: None,
+            fib_resolver: None,
         }
     }
 
@@ -550,6 +553,11 @@ impl VirtualSubnetTunnel {
     }
 
     /// 娉ㄥ唽闈欐€佽矾鐢憋紙P1 搂12.5锛夈€俷ext_hop 蹇呴』鏄凡娉ㄥ唽 peer銆?
+    /// 设置 FIB 解析器（§12.56）：动态选路。设为 None 则禁用，回退静态路由。
+    pub fn set_fib_resolver(&mut self, resolver: Option<crate::fib_resolver::SharedFibResolver>) {
+        self.fib_resolver = resolver;
+    }
+
     pub fn add_route(
         &mut self,
         dst: impl Into<String>,
@@ -637,9 +645,24 @@ impl VirtualSubnetTunnel {
 
     /// 统一转发决策（P2-5 §12.14）：① 直连 peer → ② 精确 routes → ③ 最长前缀
     /// prefix_routes → ④ 出口节点（egress 顺序第一个）→ ⑤ `NO_ROUTE_TO_DST`。
-    fn resolve_next_hop(&self, dst: &str) -> Result<String, ConnectivityError> {
+    fn resolve_next_hop(
+        &self,
+        dst: &str,
+        packet: Option<&[u8]>,
+    ) -> Result<String, ConnectivityError> {
         if self.peers.contains_key(dst) {
             return Ok(dst.to_string());
+        }
+        // §12.56: FIB 优先于静态路由（动态发现 > 静态配置）。
+        if let Some(resolver) = &self.fib_resolver {
+            let flow_opt = packet.and_then(crate::fib_resolver::FlowKeyView::parse_ipv4);
+            if let Some(flow) = flow_opt {
+                if let Some(next_hop) = resolver.resolve(dst, &flow) {
+                    if self.peers.contains_key(&next_hop) {
+                        return Ok(next_hop);
+                    }
+                }
+            }
         }
         if let Some(next_hop) = self.routes.get(dst) {
             return Ok(next_hop.clone());
@@ -1274,7 +1297,7 @@ impl VirtualSubnetTunnel {
         packet: &[u8],
     ) -> Result<(), ConnectivityError> {
         // 1. 解析出下一跳（统一决策：直连 → 精确 → 最长前缀 → 出口，§12.5/§12.14）
-        let next_hop = self.resolve_next_hop(dst_virtual_ip)?;
+        let next_hop = self.resolve_next_hop(dst_virtual_ip, Some(packet))?;
 
         // 2. 鏍￠獙 next_hop 鏄?Connected peer
         let (_peer_id, locator, state, stats) =
@@ -1519,7 +1542,7 @@ impl VirtualSubnetTunnel {
         }
 
         // 非本机目的 -> 转发（§12.5：先查直连 peer，再查静态路由表）
-        let next_hop = self.resolve_next_hop(&header.dst_virtual_ip)?;
+        let next_hop = self.resolve_next_hop(&header.dst_virtual_ip, Some(&payload))?;
 
         let (_peer_id, locator, state, _stats) =
             self.peers

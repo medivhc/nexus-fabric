@@ -2888,3 +2888,26 @@ LSDB/LSA/泛洪协议零改动（设计文档既定映射）。
 （`id=product.node-disjoint`），验证两条路径无共享中间节点。
 **冻结边界**：K>2 点不交（后续）；真实转发面挂接（后续）。
 **契约 hash**：`94923b114b458611ecc1b9f866d61234b3aff4e7026d11b7b6cb5f1414f387dc`（verify 时写入）。
+
+### §12.56 P5 去中心化选路：转发面挂接 FIB
+
+**状态**：候选。
+**范围**：`VirtualSubnet::resolve_next_hop` 集成 FIB 查询，替代静态路由。
+**设计**：
+- `nexus-connectivity` 新增 `FibResolver` trait（不依赖 `nexus-discovery`）：
+  `fn resolve(&self, dst_vip: &str, flow: &FlowKeyView) -> Option<String>`
+  返回下一跳 VIP；`None` 表示无 FIB 条目，回退原有逻辑。
+- `FlowKeyView`：精简流标识（src/dst IP u32 + 端口 u16 + 协议 u8），
+  由 IP 包解析得到；解析失败 → 回退静态路由。
+  （不提供 `hash()`：实际流哈希由 discovery 侧 `Fib::select_next_hop` 完成，
+  避免两套实现分叉。）
+- `VirtualSubnet` 新增 `fib_resolver: Option<Arc<dyn FibResolver>>`；
+  `resolve_next_hop` 优先级：直连 peer > FIB > 静态 routes > 前缀 > 出口。
+- `apps/nexus` 实现 `DiscoveryFibResolver`：
+  `SharedFibManager` + `PeerId→VIP` 映射（随 LSDB 指纹同步更新）+
+  加权流哈希选择（复用 §12.52 语义，经 discovery `Fib::select_next_hop`）。
+**非目标**：IPv6 流解析（仅 IPv4）；真实 TUN 数据面（已有 §11.18）。
+**E4**：`scenarios/product/fib_forwarding.toml`
+（`id=product.fib-forwarding`），3 节点经 FIB 转发验证。
+**冻结边界**：距离矢量退役（§12.57）；策略热切换（§12.58）。
+**契约 hash**：`b64bfb98327b48afde28c9bccfc9747697b5d4472fc0e6f1a8aebbf931dd0fb4`（verify 时写入）。
