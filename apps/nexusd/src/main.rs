@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 /// nexusd：桌面/服务端主 Runtime Composition Root。
 ///
 /// 用法：
-///   nexusd run <service|internet-access|compute> [--json]          -> 进程内组合根闭环
-///   nexusd run <resource> --endpoint <ip:port> [--relay <ip:port>]
+///   nexusd run <service|internet-access|compute|workspace> [--json] -> 进程内组合根闭环
+///   nexusd run <service|internet-access|compute> --endpoint <ip:port> [--relay <ip:port>]
 ///              [--direct <ip:port>] [--token <t>] --json            -> 真实网络访问（real transport）
 ///   nexusd host <service|internet-access|compute> --addr <ip:port>
 ///              [--token <t>]                                       -> 提供方：服务端 AUTH 门控 + 业务
@@ -42,8 +42,8 @@ fn main() -> ExitCode {
         Some(verb) if is_observability_verb(verb) => dispatch_observability(&args),
         _ => {
             eprintln!(
-                "usage: nexusd run <service|internet-access|compute> [--json] | \
-                 nexusd run <resource> --endpoint <ip:port> [--relay <ip:port>] [--direct <ip:port>] [--token <t>] --json | \
+                "usage: nexusd run <service|internet-access|compute|workspace> [--json] | \
+                 nexusd run <service|internet-access|compute> --endpoint <ip:port> [--relay <ip:port>] [--direct <ip:port>] [--token <t>] --json | \
                  nexusd serve [--addr <ip:port> | --socket <path>] | \
                  nexusd host <resource> --addr <ip:port> [--token <t>] | \
                  nexusd relay --addr <ip:port> | \
@@ -278,7 +278,7 @@ fn subnet_foreground_real(
 fn run_resource(args: &[String]) -> ExitCode {
     let Some(resource) = args.first() else {
         eprintln!(
-            "usage: nexusd run <service|internet-access|compute> [--endpoint <ip:port>] [--relay <ip:port>] [--token <t>] [--json]"
+            "usage: nexusd run <service|internet-access|compute|workspace> [--endpoint <ip:port>] [--relay <ip:port>] [--token <t>] [--json]"
         );
         return ExitCode::FAILURE;
     };
@@ -347,6 +347,9 @@ fn run_resource(args: &[String]) -> ExitCode {
                 .map_err(|e| ("INTERNAL".to_string(), e.to_string())),
             "compute" => nexus::remote_compute_job_flow()
                 .map(|v| enrich("compute", v))
+                .map_err(|e| ("INTERNAL".to_string(), e.to_string())),
+            "workspace" => nexus::remote_workspace_commit_flow()
+                .map(|v| enrich("workspace", v))
                 .map_err(|e| ("INTERNAL".to_string(), e.to_string())),
             other => {
                 // 未知资源：结构化拒绝（exit 0 = 请求已被 daemon 处理，拒绝也是处理结果）。
