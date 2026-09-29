@@ -9443,3 +9443,152 @@ pub fn fib_manager_flow() -> Result<Value, NexusError> {
         },
     }))
 }
+
+/// E4 产品场景 `product.disjoint` 的可执行驱动（PRODUCT §12.51）。
+///
+/// 拓扑：A-B(10)-D、A-C(10)-D、B-C(5)。Suurballe 应得 2 条边不交：
+/// A-B-D（20）与 A-C-D（20）。
+pub fn disjoint_flow() -> Result<Value, NexusError> {
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::{Disjoint, PathComputer, TopoView};
+
+    let mut events: Vec<&'static str> = Vec::new();
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("disjoint: {m}"),
+    };
+
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    let id_d = PeerId("node-d".to_string());
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    });
+    for (id, vip, nbs) in [
+        (
+            id_b.clone(),
+            "10.99.0.2",
+            vec![link(&id_a, 10), link(&id_d, 10), link(&id_c, 5)],
+        ),
+        (
+            id_c.clone(),
+            "10.99.0.3",
+            vec![link(&id_a, 10), link(&id_d, 10), link(&id_b, 5)],
+        ),
+        (
+            id_d.clone(),
+            "10.99.0.4",
+            vec![link(&id_b, 10), link(&id_c, 10)],
+        ),
+    ] {
+        lsdb.update(Lsa {
+            node_id: id,
+            vip: vip.to_string(),
+            incarnation: 1,
+            seq: 1,
+            capabilities: 0,
+            locator: None,
+            neighbors: nbs,
+        });
+    }
+    let topo = TopoView::from_lsdb(&lsdb);
+
+    // ---- 阶段 1：得 2 条 ----
+    let dj = Disjoint::new();
+    if dj.name() != "disjoint" {
+        return Err(fail("name"));
+    }
+    let paths = dj.compute_paths(&topo, &id_a, &id_d);
+    if paths.len() != 2 {
+        return Err(fail(&format!(
+            "should find 2 disjoint, got {}",
+            paths.len()
+        )));
+    }
+    events.push("disjoint_found");
+
+    // ---- 阶段 2：无共享有向边 ----
+    let edges = |p: &nexus_discovery::routing::Path| {
+        p.nodes
+            .windows(2)
+            .map(|w| (w[0].0.clone(), w[1].0.clone()))
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let e1 = edges(&paths[0]);
+    let e2 = edges(&paths[1]);
+    if !e1.is_disjoint(&e2) {
+        return Err(fail("paths share edges"));
+    }
+    events.push("disjoint_no_shared_edge");
+
+    // ---- 阶段 3：桥接拓扑只 1 条 ----
+    // A-B-D 唯一通道（B 为桥）。
+    let mut lsdb2 = Lsdb::new(id_a.clone());
+    lsdb2.update_local(Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10)],
+    });
+    lsdb2.update(Lsa {
+        node_id: id_b.clone(),
+        vip: "10.99.0.2".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    });
+    lsdb2.update(Lsa {
+        node_id: id_d.clone(),
+        vip: "10.99.0.4".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10)],
+    });
+    let topo2 = TopoView::from_lsdb(&lsdb2);
+    let paths2 = dj.compute_paths(&topo2, &id_a, &id_d);
+    if paths2.len() != 1 {
+        return Err(fail("bridge should yield 1 path"));
+    }
+    events.push("single_when_bridge");
+
+    // ---- 阶段 4：不可达 ----
+    let id_iso = PeerId("node-iso".to_string());
+    if !dj.compute_paths(&topo, &id_a, &id_iso).is_empty() {
+        return Err(fail("unreachable should be empty"));
+    }
+    events.push("unreachable_empty");
+
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "disjoint": {
+            "path_count": paths.len(),
+        },
+    }))
+}

@@ -524,7 +524,7 @@ impl KShortest {
     }
 
     /// 计算节点序列的总代价（沿拓扑查链路代价）。
-    fn path_cost(topo: &TopoView, nodes: &[&str]) -> u64 {
+    pub(crate) fn path_cost(topo: &TopoView, nodes: &[&str]) -> u64 {
         let mut cost = 0u64;
         for w in nodes.windows(2) {
             let (u, v) = (w[0], w[1]);
@@ -572,6 +572,252 @@ impl PathComputer for KShortest {
                 }
             })
             .collect()
+    }
+}
+
+/// Disjoint 边不交路径（Suurballe 算法）：src→dst 的 2 条边不交最短路（§12.51）。
+///
+/// 总代价最小；单链路故障不影响备用路径。`compute_paths` 返回 0/1/2 条。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Disjoint;
+
+impl Disjoint {
+    /// 创建 Disjoint 算路器。
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Suurballe 算法：返回至多 2 条边不交路径（节点序列）。
+    fn suurballe<'t>(topo: &TopoView<'t>, src: &'t str, dst: &'t str) -> Vec<Vec<&'t str>> {
+        // 步骤 1：Dijkstra 得 dist1。
+        let (dist1, prev1) = ShortestPath::dijkstra(topo, src);
+        let p1 = match ShortestPath::build_node_seq(src, dst, &dist1, &prev1) {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+
+        // 步骤 2：将 P1 的边反向（用于后续抵消）。
+        let p1_edges: HashSet<(&'t str, &'t str)> = p1.windows(2).map(|w| (w[0], w[1])).collect();
+
+        // 步骤 3-4：在变换边权 w'(u,v) = w(u,v) + dist1[u] - dist1[v] 上 Dijkstra，
+        // 其中 P1 的边已反向（反向边权为 -w）。
+        let (dist2, prev2) = Self::dijkstra_suurballe(topo, src, &dist1, &p1_edges);
+        let p2 = match ShortestPath::build_node_seq(src, dst, &dist2, &prev2) {
+            Some(p) => p,
+            // P2 不存在 → 只有 P1 一条不交路。
+            None => return vec![p1],
+        };
+
+        // 步骤 5：合并 P1/P2，删除重叠的正反边对，得 2 条不交路径。
+        Self::combine_disjoint(p1, p2)
+    }
+
+    /// Suurballe 第二步 Dijkstra：P1 边反向 + 边权变换。
+    fn dijkstra_suurballe<'t>(
+        topo: &TopoView<'t>,
+        src: &'t str,
+        dist1: &HashMap<&'t str, u64>,
+        p1_edges: &HashSet<(&'t str, &'t str)>,
+    ) -> (HashMap<&'t str, u64>, HashMap<&'t str, &'t str>) {
+        let mut dist: HashMap<&'t str, u64> = HashMap::new();
+        let mut prev: HashMap<&'t str, &'t str> = HashMap::new();
+        let mut heap: BinaryHeap<(Reverse<u64>, &'t str)> = BinaryHeap::new();
+        dist.insert(src, 0);
+        heap.push((Reverse(0), src));
+
+        // 构建有效边集：原边（P1 边除外）+ P1 边的反向边。
+        // 为简单起见，在松弛时动态判断。
+        while let Some((Reverse(d), u)) = heap.pop() {
+            if d > *dist.get(u).unwrap_or(&u64::MAX) {
+                continue;
+            }
+            let du1 = dist1.get(u).copied().unwrap_or(u64::MAX);
+            if du1 == u64::MAX {
+                continue;
+            }
+            // 原图的出边（跳过 P1 的边，它们被反向边替代）。
+            for &(v, w) in topo.out_edges(u) {
+                if p1_edges.contains(&(u, v)) {
+                    continue; // P1 边，反向后才可用
+                }
+                let dv1 = dist1.get(v).copied().unwrap_or(u64::MAX);
+                if dv1 == u64::MAX {
+                    continue;
+                }
+                let wp = w.saturating_add(du1).saturating_sub(dv1);
+                let nd = d.saturating_add(wp);
+                if nd < *dist.get(v).unwrap_or(&u64::MAX) {
+                    dist.insert(v, nd);
+                    prev.insert(v, u);
+                    heap.push((Reverse(nd), v));
+                }
+            }
+            // P1 反向边：若 (v,u) 在 P1 中（即存在 (a,b)=(v,u)），则 u 可经反向边到 v。
+            // 变换后权为 0（因 P1 为最短路，dist1[u] = dist1[v] + w(v,u)）。
+            for &(a, b) in p1_edges {
+                if b != u {
+                    continue;
+                }
+                let v = a;
+                let dv1 = dist1.get(v).copied().unwrap_or(u64::MAX);
+                if dv1 == u64::MAX {
+                    continue;
+                }
+                let wp = 0u64; // 反向边变换后权为 0
+                let nd = d.saturating_add(wp);
+                if nd < *dist.get(v).unwrap_or(&u64::MAX) {
+                    dist.insert(v, nd);
+                    prev.insert(v, u);
+                    heap.push((Reverse(nd), v));
+                }
+            }
+        }
+        (dist, prev)
+    }
+
+    /// 合并两条路径，删除正反抵消的边对，提取 2 条边不交路径。
+    ///
+    /// 算法：将 P1/P2 的边放入多重集；P2 中若某边 (u,v) 的反向 (v,u) 在 P1 中，
+    /// 则双双删除；剩余边构成 2 条 src→dst 不交路径（经 DFS 提取）。
+    pub(crate) fn combine_disjoint<'t>(p1: Vec<&'t str>, p2: Vec<&'t str>) -> Vec<Vec<&'t str>> {
+        use std::collections::HashMap as Map;
+
+        // 边计数：(u,v) -> 出现次数（P1 与 P2 的边都 +=1）。
+        // 后续循环中，正反边对 (u,v)/(v,u) 按 min 数量抵消。
+        let mut edge_count: Map<(&'t str, &'t str), i32> = Map::new();
+        for w in p1.windows(2) {
+            *edge_count.entry((w[0], w[1])).or_insert(0) += 1;
+        }
+        for w in p2.windows(2) {
+            *edge_count.entry((w[0], w[1])).or_insert(0) += 1;
+        }
+        // 删除正反抵消对：若 (u,v) 和 (v,u) 都存在，抵消 min 数量。
+        let keys: Vec<(&'t str, &'t str)> = edge_count.keys().copied().collect();
+        for (u, v) in keys {
+            if u >= v {
+                continue; // 每对只处理一次
+            }
+            let cuv = edge_count.get(&(u, v)).copied().unwrap_or(0);
+            let cvu = edge_count.get(&(v, u)).copied().unwrap_or(0);
+            let cancel = cuv.min(cvu);
+            if cancel > 0 {
+                *edge_count.get_mut(&(u, v)).unwrap() -= cancel;
+                *edge_count.get_mut(&(v, u)).unwrap() -= cancel;
+            }
+        }
+
+        // 构建邻接表（剩余边），DFS 提取 2 条 src→dst 路径。
+        let mut adj: Map<&'t str, Vec<&'t str>> = Map::new();
+        for ((u, v), cnt) in edge_count {
+            for _ in 0..cnt {
+                adj.entry(u).or_default().push(v);
+            }
+        }
+
+        let src = p1[0];
+        let dst = p1[p1.len() - 1];
+        let mut result = Vec::new();
+        for _ in 0..2 {
+            if let Some(path) = Self::dfs_path(&adj, src, dst) {
+                // 从邻接表中删除已用边。
+                for w in path.windows(2) {
+                    if let Some(neighbors) = adj.get_mut(w[0]) {
+                        if let Some(pos) = neighbors.iter().position(|&x| x == w[1]) {
+                            neighbors.remove(pos);
+                        }
+                    }
+                }
+                result.push(path);
+            } else {
+                break;
+            }
+        }
+        result
+    }
+
+    /// DFS 在邻接表中找 src→dst 路径。
+    fn dfs_path<'t>(
+        adj: &HashMap<&'t str, Vec<&'t str>>,
+        src: &'t str,
+        dst: &'t str,
+    ) -> Option<Vec<&'t str>> {
+        let mut visited: HashMap<&'t str, bool> = HashMap::new();
+        let mut path: Vec<&'t str> = Vec::new();
+
+        fn dfs<'a>(
+            cur: &'a str,
+            dst: &'a str,
+            adj: &HashMap<&'a str, Vec<&'a str>>,
+            visited: &mut HashMap<&'a str, bool>,
+            path: &mut Vec<&'a str>,
+        ) -> bool {
+            path.push(cur);
+            if cur == dst {
+                return true;
+            }
+            visited.insert(cur, true);
+            if let Some(neighbors) = adj.get(cur) {
+                for &next in neighbors {
+                    if !visited.get(next).copied().unwrap_or(false)
+                        && dfs(next, dst, adj, visited, path)
+                    {
+                        return true;
+                    }
+                }
+            }
+            path.pop();
+            visited.insert(cur, false);
+            false
+        }
+
+        if dfs(src, dst, adj, &mut visited, &mut path) {
+            Some(path)
+        } else {
+            None
+        }
+    }
+
+    /// 计算节点序列的总代价（复用 KShortest 的实现）。
+    fn path_cost(topo: &TopoView, nodes: &[&str]) -> u64 {
+        KShortest::path_cost(topo, nodes)
+    }
+}
+
+impl PathComputer for Disjoint {
+    fn name(&self) -> &'static str {
+        "disjoint"
+    }
+
+    fn compute(&self, topo: &TopoView, src: &PeerId, dst: &PeerId) -> Option<Path> {
+        self.compute_paths(topo, src, dst).into_iter().next()
+    }
+
+    fn compute_paths(&self, topo: &TopoView, src: &PeerId, dst: &PeerId) -> Vec<Path> {
+        let src_key = src.0.as_str();
+        let dst_key = dst.0.as_str();
+        if !topo.contains(src) || !topo.contains(dst) {
+            return Vec::new();
+        }
+        if src_key == dst_key {
+            return vec![Path {
+                nodes: vec![src.clone()],
+                cost: 0,
+            }];
+        }
+        let mut paths: Vec<Path> = Self::suurballe(topo, src_key, dst_key)
+            .into_iter()
+            .map(|nodes| {
+                let cost = Self::path_cost(topo, &nodes);
+                Path {
+                    nodes: nodes.into_iter().map(|s| PeerId(s.to_string())).collect(),
+                    cost,
+                }
+            })
+            .collect();
+        // 按代价升序。
+        paths.sort_by_key(|p| p.cost);
+        paths
     }
 }
 
@@ -1418,5 +1664,99 @@ mod tests {
         let direct = mgr.fib().select_next_hop("10.0.0.4", &flow).unwrap();
         assert_eq!(hop, direct);
         assert!(mgr.select("10.9.9.9", &flow).is_none());
+    }
+
+    fn disjoint_lsdb() -> (Lsdb, PeerId, PeerId) {
+        // A-B(10)-D，A-C(10)-D，B-C(5)。
+        let a = peer("a");
+        let d = peer("d");
+        let mut db = Lsdb::new(a.clone());
+        db.update_local(lsa("a", "10.0.0.1", vec![link("b", 10), link("c", 10)]));
+        db.update(lsa(
+            "b",
+            "10.0.0.2",
+            vec![link("a", 10), link("d", 10), link("c", 5)],
+        ));
+        db.update(lsa(
+            "c",
+            "10.0.0.3",
+            vec![link("a", 10), link("d", 10), link("b", 5)],
+        ));
+        db.update(lsa("d", "10.0.0.4", vec![link("b", 10), link("c", 10)]));
+        (db, a, d)
+    }
+
+    fn path_edges(p: &Path) -> std::collections::HashSet<(String, String)> {
+        p.nodes
+            .windows(2)
+            .map(|w| (w[0].0.clone(), w[1].0.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn disjoint_finds_two_edge_disjoint() {
+        let (db, a, d) = disjoint_lsdb();
+        let topo = TopoView::from_lsdb(&db);
+        let dj = Disjoint::new();
+        assert_eq!(dj.name(), "disjoint");
+
+        let paths = dj.compute_paths(&topo, &a, &d);
+        assert_eq!(paths.len(), 2);
+        // 无共享有向边。
+        let e1 = path_edges(&paths[0]);
+        let e2 = path_edges(&paths[1]);
+        assert!(e1.is_disjoint(&e2), "shared edges: {e1:?} vs {e2:?}");
+        // 每条无环。
+        for p in &paths {
+            let mut seen = std::collections::HashSet::new();
+            for n in &p.nodes {
+                assert!(seen.insert(n));
+            }
+        }
+        // compute() 返回第一条。
+        assert_eq!(dj.compute(&topo, &a, &d).unwrap().cost, paths[0].cost);
+    }
+
+    #[test]
+    fn disjoint_single_when_bridge() {
+        // 桥接拓扑：A-B-D 唯一，只返回 1 条。
+        let a = peer("a");
+        let d = peer("d");
+        let mut db = Lsdb::new(a.clone());
+        db.update_local(lsa("a", "10.0.0.1", vec![link("b", 10)]));
+        db.update(lsa("b", "10.0.0.2", vec![link("a", 10), link("d", 10)]));
+        db.update(lsa("d", "10.0.0.4", vec![link("b", 10)]));
+        let topo = TopoView::from_lsdb(&db);
+        let paths = Disjoint::new().compute_paths(&topo, &a, &d);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].cost, 20);
+    }
+
+    #[test]
+    fn disjoint_unreachable_empty() {
+        let (db, a, _) = disjoint_lsdb();
+        let topo = TopoView::from_lsdb(&db);
+        assert!(
+            Disjoint::new()
+                .compute_paths(&topo, &a, &peer("ghost"))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn combine_disjoint_cancels_reverse_edges() {
+        // 直接测试边抵消：P1 含 (b,d)，P2 含反向 (d,b) → 抵消后不残留。
+        let p1 = vec!["a", "b", "d"];
+        let p2 = vec!["a", "c", "d", "b", "a"];
+        let result = Disjoint::combine_disjoint(p1, p2);
+        // 抵消后：(b,d)x1 与 (d,b)x1 抵消；结果中不得残留该边对。
+        for path in &result {
+            for w in path.windows(2) {
+                assert!(
+                    !((w[0] == "b" && w[1] == "d") || (w[0] == "d" && w[1] == "b")),
+                    "cancelled edge remains: {w:?}"
+                );
+            }
+        }
     }
 }

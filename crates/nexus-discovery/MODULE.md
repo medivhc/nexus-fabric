@@ -283,3 +283,16 @@ LSA/LSDB/算路/FIB 零改动。
 - Deletion Test：FIB 管理器是"变化检测 + 代际管理"的独立维度
   （之前调用方手写指纹判断或无脑重算）；删除后要么每次全量重算
   （浪费），要么漏掉拓扑变化（错误）。
+
+### 冻结契约（Disjoint 不交路径 P5，PRODUCT §12.51，scenarios/product/disjoint.toml）
+
+在 §12.50 的 `routing` 模块上增量：新增 `PathComputer` 实现 `Disjoint`；
+LSA/LSDB/算路/FIB/管理器零改动。
+
+- `pub struct Disjoint`：`Disjoint::new()`；`name()=="disjoint"`。
+- Suurballe 算法：Dijkstra 得 dist1 → P1 边反向 → 变换边权
+  `w'(u,v)=w+dist1[u]-dist1[v]`（反向边权为 0）上 Dijkstra 得 P2 →
+  合并抵消正反边对 → DFS 提取 2 条边不交路径。
+- `compute_paths` 返回 0/1/2 条（按代价升序）；边不交指无共享有向边。
+- Deletion Test：Disjoint 是"故障隔离"的独立维度（K-shortest 的备用路
+  可能共享链路，单点故障双路全断）；删除后无链路级容灾路径来源。

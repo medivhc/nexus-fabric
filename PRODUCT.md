@@ -2792,3 +2792,33 @@ LSDB/LSA/泛洪协议零改动（设计文档既定映射）。
 - 冻结边界：多线程共享（`Arc<RwLock>` 包装为后续，按需）；
   真实转发面挂接（后续）；指纹算法更换（后续如有需求）。
 - 契约 hash：`334cb6f424acd248c98a4fc27c79dc163273bc7d`（verify 时写入）。
+
+### 12.51 P5 去中心化选路：Disjoint 不交路径（Suurballe，主备）（2026-09-29）{#12-disjoint}
+
+接 §12.50（FIB 管理器）。本项交付边不交路径算法（portable core，
+零 I/O、零第三方依赖）：新增 `PathComputer` 实现 `Disjoint`，
+用 Suurballe 算法求 src→dst 的 2 条边不交最短路（总代价最小）。
+用于高可靠主备：单链路故障不影响备用路径。
+
+- **`Disjoint`**：`Disjoint::new()`；`name()=="disjoint"`。
+- **Suurballe 算法**：
+  1. Dijkstra 求 dist1（src 为源）；
+  2. 变换边权 `w'(u,v) = w(u,v) + dist1[u] - dist1[v]`（非负）；
+  3. 在 w' 上 Dijkstra 求 dist2/prev2；
+  4. P1 = prev1 的 src→dst 路径，P2 = prev2 的 src→dst 路径；
+  5. 合并 P1/P2，删除重叠边（正反抵消），得 2 条边不交路径。
+- **`compute_paths`** 返回 0/1/2 条：不可达 → 空；只有 1 条不交路 → 1 条；
+  2 条不交 → 2 条（按代价升序）。`compute()` 返回第一条。
+- **边不交定义**：两条路径无共享有向边（无向边视为两条有向边；
+  共享节点允许，仅边不交）。
+- E4 场景 `disjoint.toml`（id=`product.disjoint`，
+  `cargo run --quiet -p nexus --example disjoint -- --json`）：
+  拓扑 A-B(10)-D、A-C(10)-D、B-C(5)：
+  - `disjoint_found`：A→D 得 2 条边不交（A-B-D 与 A-C-D）；
+  - `disjoint_no_shared_edge`：两条无共享边；
+  - `single_when_bridge`：桥接拓扑（A-B-D 唯一）只返回 1 条；
+  - `unreachable_empty`：不可达返回空。
+  期望 `verdict=PASS`。
+- 冻结边界：点不交（后续）；K>2 不交（后续）；`RoutingStrategy` 集成（后续）；
+  真实转发面挂接（后续）。
+- 契约 hash：`3ca1ac1483577a481cb3a27c94654cfca8b03d29`（verify 时写入）。

@@ -110,5 +110,13 @@
     "module": "nexus-discovery",
     "category": "implementation-pattern",
     "summary": "FIB 管理器：LSDB 指纹（FNV-1a）触发按需重算；单测需手动 seq=2、双向建边；borrow 冲突用局部变量"
+  },
+  {
+    "id": "disjoint-suurballe-implementation",
+    "file": "entries/2026-09-29-disjoint-suurballe-implementation.md",
+    "date": "2026-09-29",
+    "module": "nexus-discovery",
+    "category": "implementation-pattern",
+    "summary": "Disjoint 不交路径 Suurballe：P1 边反向不可省；反向边权为 0 的原理；KShortest::path_cost 复用"
   }
 ]
