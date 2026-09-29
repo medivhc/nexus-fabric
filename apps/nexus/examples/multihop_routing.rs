@@ -10,9 +10,10 @@
 //! 3. A->D 包经 3 跳转发，TTL 从 64 递减到 61；
 //! 4. 推进逻辑时钟超过 TTL 后非直连路由被超时删除。
 //!
-//! 不带 `--json` 时打印人类可读摘要；带 `--json` 时打印单个 JSON 对象。
+//! 不带 `--json` 时打印人类可读摘要；带 `--json` 时打印单个 JSON 对象.
 
 #![forbid(unsafe_code)]
+#![allow(deprecated)] // §12.57 已退役：历史示例保留
 
 use nexus_connectivity::routing::{ForwardDecision, MultihopRouter, RoutablePacket};
 

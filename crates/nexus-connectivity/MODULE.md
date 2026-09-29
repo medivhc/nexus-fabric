@@ -504,7 +504,7 @@ cargo clippy -p nexus-connectivity --all-targets -- -D warnings
   - 前缀路由 next_hop 必须是已注册 peer；egress 必须是已注册 peer；
   - 帧头不剥不改（§12.5 保持）；
   - 接收侧：dst==本机 vip 或命中 local_prefixes 才写 VPI，否则转发。
-- 边界：`routing.rs`（距离矢量 P1.1）不耦合本模块；协调器广播/出口 NAT/P3。
+- 边界：`routing.rs`（距离矢量 P1.1）已于 §12.57 退役（deprecated），由 `nexus-discovery` FIB 取代；不耦合本模块；协调器广播/出口 NAT/P3。
 
 ### 冻结契约（子网 CLI 消费边界 P3.1，PRODUCT §12.28）
 
