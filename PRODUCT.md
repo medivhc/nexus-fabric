@@ -2932,3 +2932,19 @@ LSDB/LSA/泛洪协议零改动（设计文档既定映射）。
 **E4**：`cargo check --workspace` 通过（deprecated 不破坏构建）。
 **冻结边界**：策略热切换（§12.58）。
 **契约 hash**：`650706bfc4a03bf0ca0e4107f3ad78617a17a4637952406f0c8cc57ba0dca68e`（verify 时写入）。
+
+### §12.58 P5 去中心化选路：策略热切换
+
+**状态**：候选。
+**范围**：运行时切换 `[routing] strategy` 无需重启。
+**设计**：
+- `SharedFibManager<RoutingStrategy>` 新增 `set_strategy()`：
+  原子替换 `computer` 字段并强制重算 FIB（指纹不变但策略变）。
+- 切换语义：新策略解析失败 → 保持旧策略（fail-closed）；
+  切换期间正在转发的包不受影响（`Arc<RwLock>` RCU 风格）。
+- `apps/nexus` 提供 `strategy_hot_reload_flow` E4 驱动（模拟配置变更）。
+**非目标**：inotify 真实文件监听（用轮询）；其他配置项热切换。
+**E4**：`scenarios/product/strategy_hot_reload.toml`
+（`id=product.strategy-hot-reload`），shortest→ecmp 切换验证 FIB 重算。
+**冻结边界**：无（B 层最后一块）。
+**契约 hash**：`2c9bb6e6a3db71c2a68372c9f7e823fef191fdf6e0018620234a1c26ace27df0`（verify 时写入）。

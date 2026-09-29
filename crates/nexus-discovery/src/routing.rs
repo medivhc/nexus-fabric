@@ -1401,6 +1401,22 @@ impl<C: PathComputer> FibManager<C> {
         &self.current
     }
 
+    /// 强制重算 FIB（不检查指纹；用于策略切换等指纹不变但需重算的场景）。
+    ///
+    /// 代际 +1，返回新代际。
+    pub fn force_recompute(&mut self, lsdb: &Lsdb) -> u64 {
+        self.generation += 1;
+        let generation = self.generation;
+        self.current = Fib::compute(lsdb, &self.self_id, &self.computer, generation);
+        self.last_fingerprint = Self::fingerprint(lsdb);
+        generation
+    }
+
+    /// 替换算路器（§12.58 热切换用；调用方负责随后调 `force_recompute`）。
+    pub fn set_computer(&mut self, computer: C) {
+        self.computer = computer;
+    }
+
     /// 当前代际。
     #[must_use]
     pub fn generation(&self) -> u64 {
@@ -1460,6 +1476,24 @@ impl<C: PathComputer + Send + Sync> SharedFibManager<C> {
             .write()
             .expect("fib rwlock poisoned")
             .maybe_recompute(lsdb)
+    }
+}
+
+/// `SharedFibManager<RoutingStrategy>` 的热切换扩展（§12.58）。
+impl SharedFibManager<RoutingStrategy> {
+    /// 原子切换选路策略并强制重算 FIB（§12.58）。
+    ///
+    /// - 持有写锁期间完成替换 + 重算，读者要么看到旧策略完整 FIB，
+    ///   要么看到新策略完整 FIB（RCU 风格，无中间状态）。
+    /// - 返回新代际。
+    ///
+    /// # Panics
+    ///
+    /// 锁中毒时 panic（同 `read`）。
+    pub fn set_strategy(&self, strategy: RoutingStrategy, lsdb: &Lsdb) -> u64 {
+        let mut guard = self.inner.write().expect("fib rwlock poisoned");
+        guard.set_computer(strategy);
+        guard.force_recompute(lsdb)
     }
 }
 
@@ -2072,6 +2106,24 @@ mod tests {
         assert!(writer.join().expect("writer panicked"));
         assert_eq!(shared.read().generation(), 2);
         assert!(shared.read().fib().lookup("10.0.0.5").is_some());
+    }
+
+    #[test]
+    fn shared_fib_manager_set_strategy() {
+        // §12.58：热切换策略，FIB 按新策略重算。
+        let (db, a, _, _, _) = diamond_lsdb();
+        let shared = SharedFibManager::new(a.clone(), RoutingStrategy::Shortest, &db);
+        assert_eq!(shared.read().generation(), 1);
+        assert_eq!(shared.read().fib().lookup("10.0.0.4").unwrap().len(), 1);
+
+        let new_gen = shared.set_strategy(RoutingStrategy::Ecmp, &db);
+        assert_eq!(new_gen, 2);
+        assert_eq!(shared.read().generation(), 2);
+        assert_eq!(shared.read().fib().lookup("10.0.0.4").unwrap().len(), 2);
+
+        let new_gen = shared.set_strategy(RoutingStrategy::KShortest { k: 2 }, &db);
+        assert_eq!(new_gen, 3);
+        assert_eq!(shared.read().fib().lookup("10.0.0.4").unwrap().len(), 2);
     }
 
     #[test]

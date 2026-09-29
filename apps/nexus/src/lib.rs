@@ -10239,3 +10239,125 @@ pub fn fib_forwarding_flow() -> Result<Value, NexusError> {
         },
     }))
 }
+
+/// E4 产品场景 `product.strategy-hot-reload` 的可执行驱动（PRODUCT §12.58）。
+///
+/// 验证：SharedFibManager<RoutingStrategy> 从 Shortest 热切换到 ECMP，
+/// FIB 重算（A→D 从 1 条下一跳变为 2 条），代际递增，无需重启。
+pub fn strategy_hot_reload_flow() -> Result<Value, NexusError> {
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::{RoutingStrategy, SharedFibManager};
+
+    let mut events: Vec<&'static str> = Vec::new();
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("strategy_hot_reload: {m}"),
+    };
+
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    let id_d = PeerId("node-d".to_string());
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_b.clone(),
+        vip: "10.99.0.2".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_c.clone(),
+        vip: "10.99.0.3".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_d.clone(),
+        vip: "10.99.0.4".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    });
+
+    let mgr = SharedFibManager::new(id_a.clone(), RoutingStrategy::Shortest, &lsdb);
+    assert_eq!(mgr.read().generation(), 1);
+    {
+        let guard = mgr.read();
+        let hops = guard
+            .fib()
+            .lookup("10.99.0.4")
+            .ok_or_else(|| fail("FIB missing D"))?;
+        if hops.len() != 1 {
+            return Err(fail("shortest should give 1 next-hop"));
+        }
+    }
+    events.push("initial_shortest");
+
+    let new_gen = mgr.set_strategy(RoutingStrategy::Ecmp, &lsdb);
+    if new_gen != 2 {
+        return Err(fail(&format!("expected generation 2, got {new_gen}")));
+    }
+    {
+        let guard = mgr.read();
+        let hops = guard
+            .fib()
+            .lookup("10.99.0.4")
+            .ok_or_else(|| fail("FIB missing D"))?;
+        if hops.len() != 2 {
+            return Err(fail("ecmp should give 2 next-hops"));
+        }
+    }
+    events.push("hot_switch_to_ecmp");
+
+    if RoutingStrategy::parse("invalid-strategy").is_ok() {
+        return Err(fail("invalid strategy should not parse"));
+    }
+    let next_hops = {
+        let guard = mgr.read();
+        let hops = guard
+            .fib()
+            .lookup("10.99.0.4")
+            .ok_or_else(|| fail("FIB missing D"))?;
+        if hops.len() != 2 {
+            return Err(fail("FIB should remain ecmp"));
+        }
+        hops.len()
+    };
+    events.push("invalid_rejected");
+
+    Ok(serde_json::json!({
+        "verdict": "PASS",
+        "events": events,
+        "hot_reload": {
+            "generation": mgr.read().generation(),
+            "next_hops": next_hops,
+        },
+    }))
+}
