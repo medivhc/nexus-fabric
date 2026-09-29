@@ -2822,3 +2822,20 @@ LSDB/LSA/泛洪协议零改动（设计文档既定映射）。
 - 冻结边界：点不交（后续）；K>2 不交（后续）；`RoutingStrategy` 集成（后续）；
   真实转发面挂接（后续）。
 - 契约 hash：`3ca1ac1483577a481cb3a27c94654cfca8b03d29`（verify 时写入）。
+
+### §12.52 P5 去中心化选路：加权选择（Weighted Selection）
+
+**状态**：候选。
+**范围**：`Fib::select_next_hop` 支持按 `NextHop.weight` 加权选择；权重
+按路径代价反比分配（代价越小权重越大），权重全 1 时退化为均分。
+**设计**：
+- `Fib::compute` 为每条下一跳按路径代价分配权重：
+  `weight = max_cost - path_cost + 1`（最低代价得最高权重）。
+- `select_next_hop` 改为加权：`h = hash % total_weight`，落到权重区间。
+- 权重全 1 时行为与之前一致（均分）。
+**非目标**：动态权重调整；带宽感知权重；真实转发面挂接。
+**E4**：`scenarios/product/weighted_selection.toml`
+（`id=product.weighted-selection`），不同代价路径按权重比例分散。
+**冻结边界**：动态权重（后续）；`RoutingStrategy` 集成（后续）；
+真实转发面挂接（后续）。
+**契约 hash**：`fbc78159233e22718c67d540cdebc0d6fa245a463fbc0442e72b4424c5c1f565`（verify 时写入）。

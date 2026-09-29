@@ -1,0 +1,41 @@
+schema_version = 1
+id = "product.weighted-selection"
+title = "加权选择：权重按代价反比分配，流按权重比例分散"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12.52-weighted-selection"
+
+[given]
+topology = "asymmetric diamond: A-B(10ms)-D cost 20, A-C(10ms)-D(20ms) cost 30; K=2 gives 2 NextHops"
+fib_shape = "weights = max_cost - min_cost + 1 (B=11, C=1); select_next_hop uses weighted hash % total"
+api = "Fib::compute assigns weights; FlowKey 5-tuple; FNV-1a 64 flow hash"
+
+# 可执行 E4：进程内非对称拓扑（A 视角）+ 加权选择
+#   weights_assigned       FIB 权重为 [11, 1]（B 便宜得高权重）
+#   weighted_distribution  1000 流按 ~11:1 分散（B >= 80%, C <= 20%）
+#   equal_cost_uniform     ECMP 等代价时权重全 1（单跳 weight=1）
+[when]
+command = "cargo run --quiet -p nexus --example weighted_selection -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "events.0"
+equals = "weights_assigned"
+
+[[expect]]
+field = "events.1"
+equals = "weighted_distribution"
+
+[[expect]]
+field = "events.2"
+equals = "equal_cost_uniform"
+
+[[expect]]
+field = "weighted.weights.0"
+equals = 11
+
+[[expect]]
+field = "weighted.weights.1"
+equals = 1

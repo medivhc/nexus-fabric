@@ -916,9 +916,9 @@ impl PathComputer for RoutingStrategy {
 pub struct NextHop {
     /// 下一跳节点。
     pub peer: PeerId,
-    /// 负载分担权重（本期恒为 1）。
+    /// 负载分担权重（§12.52：max_cost - path_cost + 1；等代价时全 1）。
     pub weight: u32,
-    /// 所属路径标识（本期恒为 0）。
+    /// 所属路径标识（§12.46 起：排序后按 0,1,2… 分配）。
     pub path_id: u32,
 }
 
@@ -1004,20 +1004,29 @@ impl Fib {
                 // 各路径的第二跳即下一跳，去重（多条等代价路径可能共享第二跳）。
                 // 按 peer 排序：FIB 条目内顺序确定，与 HashMap 迭代顺序无关
                 //（未来按流哈希选下一跳时，跨节点必须一致，否则 TCP 重排序）。
-                let mut seen: Vec<&PeerId> = Vec::new();
-                let mut hops: Vec<NextHop> = Vec::new();
+                //
+                // 权重（§12.52）：每下一跳取经该跳的最小路径代价，
+                // weight = max_cost - min_cost + 1（最便宜得最高权重；
+                // 等代价时全 1，退化为均分）。
+                let mut best_cost: HashMap<&PeerId, u64> = HashMap::new();
                 for path in paths.iter() {
                     if let Some(next) = path.nodes.get(1) {
-                        if !seen.contains(&next) {
-                            seen.push(next);
-                            hops.push(NextHop {
-                                peer: next.clone(),
-                                weight: 1,
-                                path_id: 0, // 占位，排序后重分配
-                            });
+                        let e = best_cost.entry(next).or_insert(u64::MAX);
+                        if path.cost < *e {
+                            *e = path.cost;
                         }
                     }
                 }
+                let max_cost = best_cost.values().copied().max().unwrap_or(0);
+                let mut hops: Vec<NextHop> = best_cost
+                    .iter()
+                    .map(|(next, cost)| NextHop {
+                        peer: (*next).clone(),
+                        // max-min+1 >= 1 恒成立；代价差极大时截断到 u32::MAX。
+                        weight: (max_cost - *cost + 1).min(u64::from(u32::MAX)) as u32,
+                        path_id: 0, // 占位，排序后重分配
+                    })
+                    .collect();
                 // 按 peer 排序：FIB 条目内顺序确定，与 HashMap 迭代顺序无关
                 //（未来按流哈希选下一跳时，跨节点必须一致，否则 TCP 重排序）。
                 // 排序后再分配 path_id（0,1,2…），保证跨运行一致。
@@ -1048,10 +1057,11 @@ impl Fib {
         self.entries.get(vip).map(Vec::as_slice)
     }
 
-    /// 按流哈希选择下一跳（§12.47）。
+    /// 按流哈希选择下一跳（§12.47，§12.52 加权）。
     ///
-    /// 同一 `FlowKey` 恒返回同一条（FIB 条目内按 peer 排序，`hash % n`
-    /// 索引跨节点一致）；单下一跳直接返回；未知/不可达 VIP → `None`。
+    /// 同一 `FlowKey` 恒返回同一条（FIB 条目内按 peer 排序，`hash % total_weight`
+    /// 落权重区间，跨节点一致）；单下一跳直接返回；未知/不可达 VIP → `None`。
+    /// 权重全 1 时退化为 `hash % n` 均分（与 §12.47 行为一致）。
     /// 纯函数：零 I/O，不修改 FIB。
     #[must_use]
     pub fn select_next_hop(&self, vip: &str, flow: &FlowKey) -> Option<&NextHop> {
@@ -1062,8 +1072,20 @@ impl Fib {
         if hops.len() == 1 {
             return Some(&hops[0]);
         }
-        let idx = (flow.hash() % hops.len() as u64) as usize;
-        hops.get(idx)
+        // 加权：h 落在哪个权重区间就选哪条。
+        let total: u64 = hops.iter().map(|h| u64::from(h.weight)).sum();
+        if total == 0 {
+            return None; // 权重全 0（不应发生），防御性返回 None
+        }
+        let mut h = flow.hash() % total;
+        for hop in hops {
+            let w = u64::from(hop.weight);
+            if h < w {
+                return Some(hop);
+            }
+            h -= w;
+        }
+        None // total>0 时不可达（h < total 恒成立）
     }
 
     /// 条目数（不含本端）。
@@ -1470,6 +1492,62 @@ mod tests {
         assert_eq!(hop.peer, b);
         assert!(fib.select_next_hop("10.9.9.9", &flow).is_none());
         assert!(fib.select_next_hop("10.0.0.1", &flow).is_none()); // 本端无条目
+    }
+
+    #[test]
+    fn weighted_selection_equal_cost_degenerates_to_uniform() {
+        // 等代价（ECMP）时权重全 1，行为与 §12.47 均分一致。
+        let (db, a, _, _, _) = diamond_lsdb();
+        let fib = Fib::compute(&db, &a, &Ecmp::new(), 1);
+        let hops = fib.lookup("10.0.0.4").unwrap();
+        assert!(hops.iter().all(|h| h.weight == 1));
+    }
+
+    #[test]
+    fn weighted_selection_cheaper_gets_higher_weight() {
+        // K-shortest 不同代价：便宜路径权重更高。
+        // 拓扑：a-b-d (20)，a-c-d (30)。K=2。
+        let (a, b, c, _d) = (peer("a"), peer("b"), peer("c"), peer("d"));
+        let mut db = Lsdb::new(a.clone());
+        db.update_local(lsa("a", "10.0.0.1", vec![link("b", 10), link("c", 10)]));
+        db.update(lsa("b", "10.0.0.2", vec![link("a", 10), link("d", 10)]));
+        db.update(lsa("c", "10.0.0.3", vec![link("a", 10), link("d", 20)]));
+        db.update(lsa("d", "10.0.0.4", vec![link("b", 10), link("c", 20)]));
+        let fib = Fib::compute(&db, &a, &KShortest::new(2), 1);
+        let hops = fib.lookup("10.0.0.4").unwrap();
+        assert_eq!(hops.len(), 2);
+        // 按 peer 排序：b 在前（cost 20），c 在后（cost 30）。
+        // weight = 30-20+1=11 (b)，30-30+1=1 (c)。
+        assert_eq!(hops[0].peer, b);
+        assert_eq!(hops[0].weight, 11);
+        assert_eq!(hops[1].peer, c);
+        assert_eq!(hops[1].weight, 1);
+    }
+
+    #[test]
+    fn weighted_selection_distributes_proportionally() {
+        // 1000 流按 11:1 比例分散（b 得 ~91.7%，c 得 ~8.3%）。
+        let (a, _b, _c, _d) = (peer("a"), peer("b"), peer("c"), peer("d"));
+        let mut db = Lsdb::new(a.clone());
+        db.update_local(lsa("a", "10.0.0.1", vec![link("b", 10), link("c", 10)]));
+        db.update(lsa("b", "10.0.0.2", vec![link("a", 10), link("d", 10)]));
+        db.update(lsa("c", "10.0.0.3", vec![link("a", 10), link("d", 20)]));
+        db.update(lsa("d", "10.0.0.4", vec![link("b", 10), link("c", 20)]));
+        let fib = Fib::compute(&db, &a, &KShortest::new(2), 1);
+        let hops = fib.lookup("10.0.0.4").unwrap();
+        let mut counts = [0u32, 0u32];
+        for i in 0..1000u16 {
+            let hop = fib
+                .select_next_hop("10.0.0.4", &flow_key(20000 + i, 80))
+                .unwrap();
+            let idx = hops.iter().position(|h| h == hop).unwrap();
+            counts[idx] += 1;
+        }
+        // b 期望 ~917，c 期望 ~83；允许 ±10% 波动。
+        assert!(
+            counts[0] >= 800 && counts[1] <= 200,
+            "counts={counts:?} (expected ~917/~83)"
+        );
     }
 
     #[test]

@@ -9444,6 +9444,146 @@ pub fn fib_manager_flow() -> Result<Value, NexusError> {
     }))
 }
 
+/// E4 产品场景 `product.weighted-selection` 的可执行驱动（PRODUCT §12.52）。
+///
+/// 拓扑：A-B(10)-D（代价 20）、A-C(10)-D(20)（代价 30）。K=2 时 FIB 权重：
+/// B = 30-20+1 = 11，C = 30-30+1 = 1；1000 流按 ~11:1 分散。
+pub fn weighted_selection_flow() -> Result<Value, NexusError> {
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::{Ecmp, Fib, FlowKey, KShortest};
+
+    let mut events: Vec<&'static str> = Vec::new();
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("weighted_selection: {m}"),
+    };
+
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    let id_d = PeerId("node-d".to_string());
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+
+    // 非对称菱形：A-B-D 代价 20，A-C-D 代价 30。
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_b.clone(),
+        vip: "10.99.0.2".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_c.clone(),
+        vip: "10.99.0.3".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 20)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_d.clone(),
+        vip: "10.99.0.4".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 20)],
+    });
+
+    let parse_ip = |s: &str| -> Result<std::net::IpAddr, NexusError> {
+        s.parse().map_err(|_| fail("bad test ip literal"))
+    };
+
+    // ---- 事件 1：权重按代价反比分配 ----
+    let fib = Fib::compute(&lsdb, &id_a, &KShortest::new(2), 1);
+    let hops = fib
+        .lookup("10.99.0.4")
+        .ok_or_else(|| fail("fib missing D"))?;
+    if hops.len() != 2 {
+        return Err(fail("expected 2 next-hops"));
+    }
+    // 按 peer 排序：node-b 在前（weight 11），node-c 在后（weight 1）。
+    if hops[0].weight != 11 || hops[1].weight != 1 {
+        return Err(fail(&format!(
+            "weights: b={} c={}",
+            hops[0].weight, hops[1].weight
+        )));
+    }
+    events.push("weights_assigned");
+
+    // ---- 事件 2：1000 流按 ~11:1 分散 ----
+    let mut counts = [0u32, 0u32];
+    for i in 0..1000u16 {
+        let flow = FlowKey {
+            src_ip: parse_ip("10.99.0.1")?,
+            dst_ip: parse_ip("10.99.0.4")?,
+            src_port: 30000 + i,
+            dst_port: 80,
+            protocol: 6,
+        };
+        let hop = fib
+            .select_next_hop("10.99.0.4", &flow)
+            .ok_or_else(|| fail("no next-hop"))?;
+        let idx = hops
+            .iter()
+            .position(|h| h == hop)
+            .ok_or_else(|| fail("hop mismatch"))?;
+        counts[idx] += 1;
+    }
+    if counts[0] < 800 || counts[1] > 200 {
+        return Err(fail(&format!("distribution: {counts:?}")));
+    }
+    events.push("weighted_distribution");
+
+    // ---- 事件 3：等代价时权重全 1（退化为均分）----
+    let fib_ecmp = Fib::compute(&lsdb, &id_a, &Ecmp::new(), 1);
+    // ECMP 在非对称拓扑下 A→D 只有 1 条最短路径（经 B，代价 20）。
+    let hops_ecmp = fib_ecmp
+        .lookup("10.99.0.4")
+        .ok_or_else(|| fail("ecmp fib missing D"))?;
+    if hops_ecmp.len() != 1 || hops_ecmp[0].weight != 1 {
+        return Err(fail("ecmp should have single weight-1 hop"));
+    }
+    events.push("equal_cost_uniform");
+
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "weighted".to_string(),
+        serde_json::json!({
+            "weights": [hops[0].weight, hops[1].weight],
+            "distribution": counts,
+        }),
+    );
+    out.insert(
+        "events".to_string(),
+        serde_json::Value::Array(events.into_iter().map(serde_json::Value::from).collect()),
+    );
+    out.insert("verdict".to_string(), serde_json::Value::from("PASS"));
+    Ok(serde_json::Value::Object(out))
+}
+
 /// E4 产品场景 `product.disjoint` 的可执行驱动（PRODUCT §12.51）。
 ///
 /// 拓扑：A-B(10)-D、A-C(10)-D、B-C(5)。Suurballe 应得 2 条边不交：
