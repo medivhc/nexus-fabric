@@ -2943,8 +2943,46 @@ LSDB/LSA/泛洪协议零改动（设计文档既定映射）。
 - 切换语义：新策略解析失败 → 保持旧策略（fail-closed）；
   切换期间正在转发的包不受影响（`Arc<RwLock>` RCU 风格）。
 - `apps/nexus` 提供 `strategy_hot_reload_flow` E4 驱动（模拟配置变更）。
+**设计**（watcher，2026-09-29 补）：
+- `apps/nexus::strategy_watcher::StrategyWatcher`：轮询 TOML 配置文件，
+  监听 `[routing] strategy` 变化并热应用。
+  - **位置理由**：配置文件归属 app 层（`subnet_cli::SubnetConfig` 拥有
+    TOML 解析）；`nexus-discovery` 是可移植纯库，不做文件 I/O、不 spawn
+    线程、不引入 TOML 依赖。watcher 是 app 层装配逻辑。
+- **变化检测**：mtime + 内容哈希（FNV-1a 64，手写零依赖）双重确认；
+  mtime 不变 → 静默跳过；mtime 变但哈希不变 → 静默跳过，不记录事件。
+- **变更流程**：读文件 → `toml::from_str::<SubnetConfig>` →
+  `routing_strategy()` → `RoutingStrategy::parse` → 与上次应用策略比较。
+  - 任一步失败 → 记录 `ParseFailed{reason}` / `ReadFailed{reason}` 事件，
+    绝不调用 `set_strategy()`，旧策略与旧 FIB 原样保留（fail-closed）。
+  - 解析成功但策略与上次相同 → 记录 `Unchanged` 事件，不触发重算。
+  - 解析成功且策略不同 → `set_strategy()` 原子切换并强制重算，
+    记录 `Applied{strategy, generation}` 事件。
+  - 加锁顺序：lsdb 读锁 → fib 写锁；应用层不得在持有 fib 读锁时再取
+    lsdb 写锁（避免与 watcher 交叉死锁）。
+- **Owner 与生命周期**：
+  - `StrategyWatcher` handle 拥有工作线程 `JoinHandle<()>`、
+    `Arc<AtomicBool>` 停止信号、
+    `Arc<Mutex<VecDeque<ReloadEvent>>>` 有界事件缓冲；
+    归属启动它的组件（daemon/CLI），不使用全局单例。
+  - `stop(&mut self)`：置停止标志 → join 工作线程 → 返回；
+    停止延迟 ≤ 1 个轮询间隔（内部按 ≤100ms 切片 sleep 保证响应性）。
+  - `Drop` 语义（文档化）：置停止标志；若当前线程不是 watcher 线程
+    自身则 join（避免自 join 死锁）；推荐显式调用 `stop()` 以便观察
+    join 结果。watcher 线程内 drop handle 不会死锁（跳过 join，
+    线程因停止位自行退出）。
+- **结果记录**：有界环形缓冲（默认 64 条，`WatcherConfig.max_events`
+  可配）；`ReloadEvent { seq, timestamp_ms, kind }`，`seq` 单调递增；
+  `events()` 返回快照，可查询。kind ∈ `Applied` / `Unchanged` /
+  `ParseFailed` / `ReadFailed`。
+- **Deletion Test**：不启动 watcher 时系统退化为"无热加载"——手动
+  `set_strategy()` 仍可用，无 panic、无挂起、无泄漏线程。
 **非目标**：inotify 真实文件监听（用轮询）；其他配置项热切换。
 **E4**：`scenarios/product/strategy_hot_reload.toml`
-（`id=product.strategy-hot-reload`），shortest→ecmp 切换验证 FIB 重算。
+（`id=product.strategy-hot-reload`），shortest→ecmp 切换验证 FIB 重算；
+`scenarios/product/strategy_watcher.toml`
+（`id=product.strategy-watcher`），真实临时 TOML 文件 → watcher 检测
+`[routing]` 变更 → FIB 重算（generation+1）→ 非法内容保持旧策略 →
+`stop()` join 回收验证。
 **冻结边界**：无（B 层最后一块）。
-**契约 hash**：`2c9bb6e6a3db71c2a68372c9f7e823fef191fdf6e0018620234a1c26ace27df0`（verify 时写入）。
+**契约 hash**：`c2d7d1d1bbdfbb9357a24e880eb172621b05080134b487d5b784beca8709389e`（verify 时写入；计算方法：SHA-256 over §12.58 节文本自 `### §12.58` 至文件末，排除本行）。
