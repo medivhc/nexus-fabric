@@ -119,7 +119,17 @@ fn spki_ed25519_raw(spki_der: &[u8]) -> Result<[u8; 32], String> {
         data: spki_der,
         pos: 0,
     };
-    let mut spki = outer.read_seq()?;
+    let spki = outer.read_seq()?;
+    spki_content_ed25519_raw(spki.content)
+}
+
+/// Parse the *content* of a SubjectPublicKeyInfo SEQUENCE (outer tag already
+/// consumed).
+fn spki_content_ed25519_raw(content: &[u8]) -> Result<[u8; 32], String> {
+    let mut spki = Der {
+        data: content,
+        pos: 0,
+    };
     let mut alg = spki.read_seq()?;
     let oid = alg.read_tlv()?;
     if oid.tag != 0x06 || oid.content != &ED25519_OID_TLV[2..] {
@@ -165,7 +175,7 @@ fn cert_spki_ed25519_raw(cert_der: &[u8]) -> Result<[u8; 32], String> {
     if spki.tag != 0x30 {
         return Err("cert: expected SPKI SEQUENCE".into());
     }
-    spki_ed25519_raw(spki.content)
+    spki_content_ed25519_raw(spki.content)
 }
 
 // ---------------------------------------------------------------------------
@@ -292,39 +302,5 @@ mod tests {
         let mut bad = vec![0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x71, 0x03, 0x21, 0x00];
         bad.extend_from_slice(&[0xabu8; 32]);
         assert!(spki_ed25519_raw(&bad).is_err());
-    }
-}
-
-#[cfg(test)]
-mod dbg_tests {
-    use super::*;
-    fn dump(d: &[u8], mut p: usize, end: usize, depth: usize, out: &mut Vec<String>) {
-        while p < end {
-            if p + 2 > d.len() { out.push(format!("{:depth$}TRUNC", "", depth=depth*2)); break; }
-            let tag = d[p];
-            let (len, hlen) = if d[p+1] & 0x80 == 0 { (d[p+1] as usize, 2) }
-                else {
-                    let n = (d[p+1] & 0x7f) as usize;
-                    if n > 4 || p+2+n > d.len() { out.push(format!("{:depth$}BADLEN", "", depth=depth*2)); break; }
-                    let mut v = 0usize;
-                    for j in 0..n { v = (v << 8) | d[p+2+j] as usize; }
-                    (v, 2+n)
-                };
-            out.push(format!("{:depth$}tag {:02x} len {}", "", tag, len, depth=depth*2));
-            if tag == 0x30 && depth < 4 {
-                dump(d, p+hlen, p+hlen+len, depth+1, out);
-            }
-            p += hlen + len;
-        }
-    }
-    #[test]
-    fn dbg_cert_walk() {
-        let id = generate_identity().expect("keygen");
-        let r = cert_spki_ed25519_raw(&id.cert_der);
-        let mut out = Vec::new();
-        out.push(format!("walk: {}", r.is_ok()));
-        dump(&id.cert_der, 0, id.cert_der.len(), 0, &mut out);
-        println!("{}", out.join("\n"));
-        panic!("dump done");
     }
 }
