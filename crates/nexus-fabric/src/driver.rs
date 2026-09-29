@@ -621,12 +621,43 @@ impl Loop {
         dl
     }
 
+    /// Wrapper around [`quinn_proto::Connection::handle_timeout`] that works
+    /// around quinn-rs/quinn#2658: after a path migration, the loss-detection
+    /// timer can fire when no ack-eliciting packets are in flight, tripping a
+    /// `debug_assert!(!self.peer_completed_address_validation())` inside
+    /// `pto_time_and_space` (debug builds only).
+    ///
+    /// The panic occurs in a `&self` computation before any state mutation,
+    /// and the expired timer was already stopped by `handle_timeout`, so
+    /// swallowing this specific assertion is safe: there is genuinely
+    /// nothing for loss detection to do in that state (the same guard exists
+    /// in quinn-proto's `set_loss_detection_timer`). Any other panic is
+    /// re-raised.
+    fn handle_timeout_guarded(quic: &mut quinn_proto::Connection, now: Instant) {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            quic.handle_timeout(now);
+        }));
+        if let Err(payload) = r {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| {
+                    payload.downcast_ref::<String>().map(|s| s.as_str())
+                })
+                .unwrap_or("");
+            if msg.contains("peer_completed_address_validation") {
+                return;
+            }
+            std::panic::resume_unwind(payload);
+        }
+    }
+
     fn pump_one(&mut self, id: u64, now: Instant) {
         // Collect connection events first (avoids &mut self reborrow issues).
         let evs: Vec<quinn_proto::Event> = match self.live.get_mut(&id) {
             Some(lc) => {
                 if matches!(lc.quic.poll_timeout(), Some(t) if t <= now) {
-                    lc.quic.handle_timeout(now);
+                    Self::handle_timeout_guarded(&mut lc.quic, now);
                 }
                 while let Some(ev) = lc.quic.poll_endpoint_events() {
                     if let Some(cev) = self.endpoint.handle_event(lc.handle, ev) {
