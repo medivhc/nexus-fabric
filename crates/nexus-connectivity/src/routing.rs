@@ -1,3 +1,4 @@
+#![allow(deprecated)] // §12.57 退役模块：内部实现允许自引用
 //! 多跳动态路由（Distance Vector，P1.1 PRODUCT §12.6）。
 //!
 //! 本模块是 delivery 层共享底座的路由骨架：
@@ -157,6 +158,12 @@ pub enum RoutingEvent {
 ///
 /// 纯数据结构：所有方法同步、无 I/O、无 spawn。时间由显式 `now_tick` 推进。
 #[derive(Debug, Clone)]
+/// 已退役（§12.57）：距离矢量路由已被 `nexus-discovery` FIB 取代。
+/// 保留用于历史测试，新代码请勿使用。
+#[deprecated(
+    since = "0.1.0",
+    note = "retired by §12.57; use nexus-discovery FIB instead"
+)]
 pub struct RoutingTable {
     /// 本节点虚拟 IP（用于判断本地交付）。
     local_virtual_ip: String,
@@ -392,6 +399,11 @@ pub enum ForwardDecision {
 ///
 /// 纯同步纯函数：`forward` 只查路由表并返回决策，不真正发包；
 /// 真实 UDP/socket 发送由 Composition Root 在拿到 `ForwardTo` 后完成（TODO）。
+/// 已退役（§12.57）：见 `RoutingTable`。
+#[deprecated(
+    since = "0.1.0",
+    note = "retired by §12.57; use nexus-discovery FIB instead"
+)]
 pub struct MultihopRouter {
     /// 路由表。
     table: RoutingTable,
@@ -500,6 +512,7 @@ impl MultihopRouter {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // 历史测试：退役模块的回归覆盖
 mod tests {
     use super::*;
 

@@ -1136,6 +1136,10 @@ DECAPSULATION_ERROR         包解封装失败
 
 ### 12.6 P1.1 多跳动态路由（距离矢量，2026-09-20）{#12-multihop-routing}
 
+> **已退役（§12.57，2026-09-29）**：本节的距离矢量实现（`MultihopRouter`/`RoutingTable`）
+> 已被 `nexus-discovery` FIB 取代，标记 `#[deprecated]`。代码与测试保留为历史证据，
+> 新代码请勿使用。
+
 §12.5 在冻结边界中明确"动态路由协议、最短路径算法"为 P1 不做项。
 本节作为 **requirement-change** 突破该边界，冻结 P1.1 的最小动态路由闭环：
 距离矢量（Distance Vector，Bellman-Ford 简化版），邻居间周期性交换路由通告，
@@ -2888,3 +2892,20 @@ LSDB/LSA/泛洪协议零改动（设计文档既定映射）。
 （`id=product.node-disjoint`），验证两条路径无共享中间节点。
 **冻结边界**：K>2 点不交（后续）；真实转发面挂接（后续）。
 **契约 hash**：`94923b114b458611ecc1b9f866d61234b3aff4e7026d11b7b6cb5f1414f387dc`（verify 时写入）。
+
+### §12.57 P5 去中心化选路：距离矢量退役
+
+**状态**：候选。
+**范围**：`nexus-connectivity::routing`（§12.6 距离矢量）标记为已退役。
+**设计**：
+- `MultihopRouter`、`RoutingTable` 等加 `#[deprecated]`（指路 `nexus-discovery` FIB）。
+- MODULE.md 更新：标记"已退役"，说明替代方案。
+- 保留代码与测试（历史证据），不删除。
+- PRODUCT §12.6 加退役注记。
+- 外部消费者（`nexus-harness` 的 `run_multihop_routing`、
+  `apps/nexus/examples/multihop_routing.rs`）加 `#[allow(deprecated)]`
+  保留历史场景。
+**非目标**：删除代码；迁移调用方（生产零引用）。
+**E4**：`cargo check --workspace` 通过（deprecated 不破坏构建）。
+**冻结边界**：策略热切换（§12.58）。
+**契约 hash**：`650706bfc4a03bf0ca0e4107f3ad78617a17a4637952406f0c8cc57ba0dca68e`（verify 时写入）。

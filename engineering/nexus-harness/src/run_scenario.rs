@@ -319,6 +319,7 @@ fn run_nat_hole_punching() -> Outcome {
 /// 拓扑：A(10.0.0.1) -- B(10.0.0.2) -- C(10.0.0.3) -- D(10.0.0.4)。
 /// 初始仅直连邻居；3 轮邻居通告后收敛；A->D 包经 3 跳到达 D 本地交付；
 /// 推进逻辑时钟超过 TTL 后 A 的远端路由 D 被超时删除。
+#[allow(deprecated)] // §12.57 已退役：历史场景保留
 fn run_multihop_routing() -> Outcome {
     use nexus_connectivity::routing::{
         ForwardDecision, MultihopRouter, RoutablePacket, RoutingEvent,
