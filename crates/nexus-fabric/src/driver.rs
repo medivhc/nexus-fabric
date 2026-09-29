@@ -505,6 +505,7 @@ impl Loop {
             .live
             .get_mut(&conn)
             .ok_or(FabricError::Closed(0))?;
+        eprintln!("[drv] dgram queued, qlen={}", lc.dgram_tx_q.len());
         lc.dgram_tx_q.push_back(data);
         Ok(())
     }
