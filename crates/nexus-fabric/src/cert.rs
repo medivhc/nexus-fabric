@@ -19,7 +19,7 @@ use std::sync::Arc;
 use quinn_proto::rustls::{
     self,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    crypto::{ring::default_provider as ring_provider, CryptoProvider},
+    crypto::ring::default_provider as ring_provider,
     pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
     ClientConfig as TlsClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme,
 };
@@ -177,14 +177,12 @@ fn cert_spki_ed25519_raw(cert_der: &[u8]) -> Result<[u8; 32], String> {
 #[derive(Debug)]
 pub struct PeerPinVerifier {
     expected: [u8; 32],
-    provider: Arc<CryptoProvider>,
 }
 
 impl PeerPinVerifier {
     pub fn new(expected: PeerId) -> Self {
         Self {
             expected: expected.0,
-            provider: Arc::new(ring_provider()),
         }
     }
 
@@ -253,10 +251,7 @@ impl ServerCertVerifier for PeerPinVerifier {
 /// Build the QUIC client crypto config: TLS 1.3, peer-key pinning, no client auth (P0).
 pub fn build_client_crypto(expected: PeerId) -> Result<QuicClientConfig, FabricError> {
     let provider = Arc::new(ring_provider());
-    let verifier = Arc::new(PeerPinVerifier {
-        expected: expected.0,
-        provider: provider.clone(),
-    });
+    let verifier = Arc::new(PeerPinVerifier::new(expected));
     let cfg = TlsClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| terr(format!("TLS 1.3 unavailable: {e:?}")))?

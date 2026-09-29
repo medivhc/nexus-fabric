@@ -68,6 +68,9 @@ impl Default for ConnConfig {
 #[derive(Debug, Clone)]
 pub struct FabricConn {
     inner: Arc<ConnShared>,
+    // Ownership anchor: keeps the driver thread alive as long as any
+    // connection (or the listener) exists. Never read directly.
+    #[allow(dead_code)]
     driver: Arc<Driver>,
 }
 

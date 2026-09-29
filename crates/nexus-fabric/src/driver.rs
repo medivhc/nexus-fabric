@@ -100,7 +100,6 @@ impl ConnShared {
 /// (documented limitation; the frozen API returns bytes-accepted).
 pub struct StreamShared {
     pub conn_id: u64,
-    pub qid: StreamId,
     pub tx: mpsc::Sender<Cmd>,
     pub state: Mutex<StreamState>,
     pub cv: Condvar,
@@ -116,10 +115,9 @@ pub struct StreamState {
 }
 
 impl StreamShared {
-    fn new(conn_id: u64, qid: StreamId, tx: mpsc::Sender<Cmd>) -> Self {
+    fn new(conn_id: u64, tx: mpsc::Sender<Cmd>) -> Self {
         Self {
             conn_id,
-            qid,
             tx,
             state: Mutex::new(StreamState {
                 send_buf: VecDeque::new(),
@@ -497,7 +495,7 @@ impl Loop {
             .streams()
             .open(Dir::Bi)
             .ok_or_else(|| FabricError::Transport("stream limit reached".into()))?;
-        let sh = Arc::new(StreamShared::new(conn, qid, self.tx.clone()));
+        let sh = Arc::new(StreamShared::new(conn, self.tx.clone()));
         lc.streams.insert(qid, sh.clone());
         Ok(sh)
     }
@@ -803,7 +801,7 @@ impl Loop {
                     let sh = match self.live.get_mut(&id) {
                         Some(lc) => match lc.quic.streams().accept(Dir::Bi) {
                             Some(qid) => {
-                                let sh = Arc::new(StreamShared::new(id, qid, self.tx.clone()));
+                                let sh = Arc::new(StreamShared::new(id, self.tx.clone()));
                                 lc.streams.insert(qid, sh.clone());
                                 sh
                             }
