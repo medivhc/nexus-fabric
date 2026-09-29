@@ -8658,3 +8658,159 @@ pub fn dijkstra_fib_flow() -> Result<Value, NexusError> {
         "generation": fib2.generation(),
     }))
 }
+
+/// E4 `product.ecmp`（PRODUCT §12.46）的可执行驱动。
+///
+/// ```text
+/// 菱形拓扑进程内（A 视角）：A-B 10ms、B-D 10ms、A-C 10ms、C-D 10ms；
+/// A→D 有两条 20ms 等代价最短路（经 B、经 C），FIB 填 2 条 NextHop
+/// ```
+///
+/// 全程零真实网络；错误一律 typed `Result`，无 panic。
+pub fn ecmp_flow() -> Result<Value, NexusError> {
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::{Ecmp, Fib, PathComputer, ShortestPath};
+
+    let mut events: Vec<&'static str> = Vec::new();
+
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    let id_d = PeerId("node-d".to_string());
+
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+
+    // 菱形拓扑（链路对称）。
+    let lsa_a = Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    };
+    let lsa_b = Lsa {
+        node_id: id_b.clone(),
+        vip: "10.99.0.2".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    };
+    let lsa_c = Lsa {
+        node_id: id_c.clone(),
+        vip: "10.99.0.3".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    };
+    let lsa_d = Lsa {
+        node_id: id_d.clone(),
+        vip: "10.99.0.4".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    };
+
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(lsa_a);
+    lsdb.update(lsa_b);
+    lsdb.update(lsa_c);
+    lsdb.update(lsa_d);
+
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("ecmp: {m}"),
+    };
+
+    // ---- 阶段 1：Ecmp 找到 2 条等代价最短路 ----
+    let ecmp = Ecmp::new();
+    if ecmp.name() != "ecmp" {
+        return Err(fail("computer name mismatch"));
+    }
+    let topo = nexus_discovery::routing::TopoView::from_lsdb(&lsdb);
+    let paths = ecmp.compute_paths(&topo, &id_a, &id_d);
+    if paths.len() != 2 {
+        return Err(fail("A->D should have 2 equal-cost paths"));
+    }
+    for p in &paths {
+        if p.cost != 20 || p.nodes.len() != 3 {
+            return Err(fail("ECMP path cost/hops wrong"));
+        }
+    }
+    // 两条路径的第二跳不同（B vs C）。
+    let mut second_hops: Vec<String> = paths.iter().map(|p| p.nodes[1].0.clone()).collect();
+    second_hops.sort();
+    if second_hops != vec!["node-b".to_string(), "node-c".to_string()] {
+        return Err(fail("ECMP second hops should be B and C"));
+    }
+    // compute() 返回其中一条（兼容单路径语义）。
+    let single = ecmp
+        .compute(&topo, &id_a, &id_d)
+        .ok_or_else(|| fail("no path"))?;
+    if single.cost != 20 {
+        return Err(fail("compute() should return one shortest path"));
+    }
+    events.push("ecmp_paths_found");
+
+    // ---- 阶段 2：FIB 多下一跳 ----
+    let fib = Fib::compute(&lsdb, &id_a, &ecmp, 1);
+    let hops_d = fib
+        .lookup("10.99.0.4")
+        .ok_or_else(|| fail("fib missing D"))?;
+    if hops_d.len() != 2 {
+        return Err(fail("FIB A->D should have 2 next hops"));
+    }
+    let mut peers: Vec<String> = hops_d.iter().map(|h| h.peer.0.clone()).collect();
+    peers.sort();
+    if peers != vec!["node-b".to_string(), "node-c".to_string()] {
+        return Err(fail("FIB next hops should be B and C"));
+    }
+    // path_id 为路径序号（0/1），weight 恒 1。
+    if hops_d.iter().any(|h| h.weight != 1) {
+        return Err(fail("weight should be 1"));
+    }
+    events.push("fib_multi_nexthop");
+
+    // ---- 阶段 3：单路径兼容（ShortestPath 行为不变） ----
+    let sp = ShortestPath::new();
+    let fib_sp = Fib::compute(&lsdb, &id_a, &sp, 1);
+    let hops_sp = fib_sp
+        .lookup("10.99.0.4")
+        .ok_or_else(|| fail("sp fib missing D"))?;
+    if hops_sp.len() != 1 {
+        return Err(fail("ShortestPath FIB should stay vec_single"));
+    }
+    // A→B 只有一条路，Ecmp 下也是单下一跳。
+    let hops_b = fib
+        .lookup("10.99.0.2")
+        .ok_or_else(|| fail("fib missing B"))?;
+    if hops_b.len() != 1 || hops_b[0].peer != id_b {
+        return Err(fail("A->B should stay single next hop"));
+    }
+    events.push("single_path_compat");
+
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "fib": {
+            "a_to_d_next_hops": hops_d.len(),
+            "entry_shape": "vec_multi",
+        },
+    }))
+}

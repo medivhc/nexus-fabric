@@ -179,7 +179,7 @@ LSDB。本期 LSA 只负责发现（`neighbors` 为空）；选路为后续 feat
 - `pub struct TopoView<'a>`：`from_lsdb(&Lsdb)`（O(V+E)）；链路按通告方向建边，
   不要求对称；`node_count()`、`contains(&PeerId)`。
 - `pub struct Path { pub nodes: Vec<PeerId>（含 src/dst）, pub cost: u64 }`。
-- `pub trait PathComputer { fn name(&self) -> &'static str; fn compute(&self, topo: &TopoView, src: &PeerId, dst: &PeerId) -> Option<Path>; fn compute_all(&self, topo: &TopoView, src: &PeerId) -> HashMap<PeerId, Path>（默认逐 dst，有批量优化需求的 impl 覆盖） }`；
+- `pub trait PathComputer { fn name(&self) -> &'static str; fn compute(&self, topo: &TopoView, src: &PeerId, dst: &PeerId) -> Option<Path>; fn compute_all(&self, topo: &TopoView, src: &PeerId) -> HashMap<PeerId, Path>（默认逐 dst，有批量优化需求的 impl 覆盖）; fn compute_paths(&self, topo: &TopoView, src: &PeerId, dst: &PeerId) -> Vec<Path>（默认退化为单路径）; fn compute_all_paths(&self, topo: &TopoView, src: &PeerId) -> HashMap<PeerId, Vec<Path>>（默认逐 dst） }`；
   本项 `pub struct ShortestPath`（Dijkstra，`name()=="shortest"`，BinaryHeap 最小堆，
   单次运行算全目的地）。
 - 链路代价 `max(latency_ms, 1)`（u64）；不可达 → `None`；src==dst → 零代价单节点路径。
@@ -202,3 +202,17 @@ LSDB。本期 LSA 只负责发现（`neighbors` 为空）；选路为后续 feat
 ## Platform Constraints
 
 平台专有代码只允许存在于 `nexus-platform-*` 或 Composition Root。Portable crate 必须通过相应 portability gate。
+
+### 冻结契约（ECMP 等代价多路径 P5，PRODUCT §12.46，scenarios/product/ecmp.toml）
+
+在 §12.45 的 `routing` 模块上增量：新增 `PathComputer` 实现 `Ecmp`；
+`Fib::compute` 改用 `compute_all_paths`，按去重后的第二跳填 `Vec<NextHop>`。
+LSA/LSDB/泛洪协议零改动。
+
+- `pub struct Ecmp`：`name()=="ecmp"`；Dijkstra 保留所有等代价前驱
+  （链路代价 ≥ 1，前驱表完备），DFS 枚举全部等代价最短路；
+  `compute()` 返回其中一条（兼容单路径语义）。
+- `Fib` 多下一跳：`NextHop{peer, weight: 恒 1, path_id: 路径序号}`；
+  单路径算法下行为与 §12.45 一致（每 dst 1 条）。
+- Deletion Test：ECMP 是算路算法的独立变化维度（只加 `PathComputer` impl，
+  不动 LSDB/FIB/协议），与 ShortestPath 正交。

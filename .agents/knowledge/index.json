@@ -70,5 +70,13 @@
     "module": "nexus-discovery",
     "category": "implementation-pitfall",
     "summary": "FIB 构建时不要对每个目的地跑一次 Dijkstra——单源运行已给出全目的地最短路；文档需区分单次调用与批量场景复杂度"
+  },
+  {
+    "id": "ecmp-review-001",
+    "file": "entries/2026-09-29-ecmp-predecessor-completeness.md",
+    "date": "2026-09-29",
+    "module": "nexus-discovery",
+    "category": "implementation-pattern",
+    "summary": "ECMP 等代价前驱表完备性证明（代价≥1→前驱先弹出）、路径枚举指数爆炸风险、HashMap 迭代导致多路径顺序跨运行不确定（未来流哈希风险）"
   }
 ]

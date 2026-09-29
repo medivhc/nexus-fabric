@@ -1,0 +1,41 @@
+schema_version = 1
+id = "product.ecmp"
+title = "ECMP 等代价多路径：多条等代价最短路 → FIB 多下一跳"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-ecmp"
+
+[given]
+topology = "diamond: A-B(10ms), B-D(10ms), A-C(10ms), C-D(10ms); A->D has two 20ms equal-cost paths"
+fib_shape = "dst vip -> Vec<NextHop>; multiple next_hops for ECMP"
+api = "PathComputer::compute_paths (default single); Ecmp overrides to multi"
+
+# 可执行 E4：进程内菱形拓扑（A 视角）
+#   ecmp_paths_found      A→D 找到 2 条等代价最短路（经 B、经 C）
+#   fib_multi_nexthop     FIB 中 A→D 有 2 条 NextHop（B 和 C）
+#   single_path_compat    单路径 dst（如 A→B）仍为 vec_single，行为与 §12.45 一致
+[when]
+command = "cargo run --quiet -p nexus --example ecmp -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "events.0"
+equals = "ecmp_paths_found"
+
+[[expect]]
+field = "events.1"
+equals = "fib_multi_nexthop"
+
+[[expect]]
+field = "events.2"
+equals = "single_path_compat"
+
+[[expect]]
+field = "fib.a_to_d_next_hops"
+equals = 2
+
+[[expect]]
+field = "fib.entry_shape"
+equals = "vec_multi"

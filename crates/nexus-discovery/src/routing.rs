@@ -76,7 +76,7 @@ pub struct Path {
     pub cost: u64,
 }
 
-/// 算路抽象（未来 ECMP / K-shortest / Disjoint / Constrained 只加新 impl）。
+/// 算路抽象（未来 K-shortest / Disjoint / Constrained 只加新 impl）。
 pub trait PathComputer {
     /// 算法名（`"shortest"` / `"ecmp"` / …）。
     fn name(&self) -> &'static str;
@@ -91,6 +91,26 @@ pub trait PathComputer {
             let dst = PeerId(id.to_string());
             if let Some(path) = self.compute(topo, src, &dst) {
                 out.insert(dst, path);
+            }
+        }
+        out
+    }
+    /// 计算 src → dst 的全部路径（多路径；默认退化为 `compute` 的单条）。
+    ///
+    /// ECMP 覆盖为返回所有等代价最短路。
+    fn compute_paths(&self, topo: &TopoView, src: &PeerId, dst: &PeerId) -> Vec<Path> {
+        self.compute(topo, src, dst).into_iter().collect()
+    }
+    /// 计算 src → 全目的地的全部路径（批量多路径；默认逐 dst 调用 `compute_paths`）。
+    ///
+    /// 多路径算法应覆盖为单次运行，避免 V 倍冗余。
+    fn compute_all_paths(&self, topo: &TopoView, src: &PeerId) -> HashMap<PeerId, Vec<Path>> {
+        let mut out = HashMap::new();
+        for id in topo.node_ids() {
+            let dst = PeerId(id.to_string());
+            let paths = self.compute_paths(topo, src, &dst);
+            if !paths.is_empty() {
+                out.insert(dst, paths);
             }
         }
         out
@@ -207,7 +227,149 @@ impl ShortestPath {
     }
 }
 
-/// 下一跳（FIB 条目元素；从第一天就是 Vec 形状，本期每 dst 1 条）。
+/// ECMP 等代价多路径：Dijkstra 保留所有等代价前驱，枚举全部等代价最短路。
+///
+/// 最坏情况：等代价路径数可指数增长（如多层菱形级联）。本实现无上限截断——
+/// 调用方（`Fib::compute`）只取去重后的第二跳，不保留全路径；直接调用
+/// `compute_paths` 时应评估拓扑规模。百节点常规拓扑无此问题。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Ecmp;
+
+impl Ecmp {
+    /// 创建 ECMP 算路器。
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// 单源 Dijkstra（保留所有等代价前驱），返回（距离表，前驱表）。
+    ///
+    /// 链路代价 ≥ 1，故等代价前驱一定在当前节点之前被弹出，前驱表完备。
+    fn dijkstra_ecmp<'t>(
+        topo: &TopoView<'t>,
+        src: &'t str,
+    ) -> (HashMap<&'t str, u64>, HashMap<&'t str, Vec<&'t str>>) {
+        let mut dist: HashMap<&'t str, u64> = HashMap::new();
+        let mut prev: HashMap<&'t str, Vec<&'t str>> = HashMap::new();
+        let mut heap: BinaryHeap<(Reverse<u64>, &'t str)> = BinaryHeap::new();
+        dist.insert(src, 0);
+        heap.push((Reverse(0), src));
+
+        while let Some((Reverse(d), u)) = heap.pop() {
+            if d > *dist.get(u).unwrap_or(&u64::MAX) {
+                continue;
+            }
+            for &(v, w) in topo.out_edges(u) {
+                let nd = d.saturating_add(w);
+                let cur = *dist.get(v).unwrap_or(&u64::MAX);
+                if nd < cur {
+                    dist.insert(v, nd);
+                    prev.insert(v, vec![u]);
+                    heap.push((Reverse(nd), v));
+                } else if nd == cur {
+                    // 等代价：追加前驱（去重；v 尚未弹出，前驱表最终完备）。
+                    let entry = prev.entry(v).or_default();
+                    if !entry.contains(&u) {
+                        entry.push(u);
+                    }
+                }
+            }
+        }
+        (dist, prev)
+    }
+
+    /// 从前驱表枚举 src → dst 的全部最短路（DFS 回溯前驱 DAG）。
+    fn enumerate_paths(
+        src: &PeerId,
+        dst_key: &str,
+        dist: &HashMap<&str, u64>,
+        prev: &HashMap<&str, Vec<&str>>,
+    ) -> Vec<Path> {
+        let cost = match dist.get(dst_key) {
+            Some(&c) => c,
+            None => return Vec::new(),
+        };
+        // DFS：从 dst 沿前驱回溯到 src，收集全部路径（反转后为 src→dst）。
+        fn dfs<'a>(
+            cur: &'a str,
+            src_key: &str,
+            prev: &HashMap<&'a str, Vec<&'a str>>,
+            stack: &mut Vec<&'a str>,
+            out: &mut Vec<Vec<&'a str>>,
+        ) {
+            stack.push(cur);
+            if cur == src_key {
+                out.push(stack.iter().rev().copied().collect());
+            } else if let Some(preds) = prev.get(cur) {
+                for &p in preds {
+                    // 前驱 DAG 无环（代价严格递减），无需 visited。
+                    dfs(p, src_key, prev, stack, out);
+                }
+            }
+            stack.pop();
+        }
+        let mut raw: Vec<Vec<&str>> = Vec::new();
+        dfs(dst_key, src.0.as_str(), prev, &mut Vec::new(), &mut raw);
+        raw.into_iter()
+            .map(|nodes| Path {
+                nodes: nodes.into_iter().map(|s| PeerId(s.to_string())).collect(),
+                cost,
+            })
+            .collect()
+    }
+}
+
+impl PathComputer for Ecmp {
+    fn name(&self) -> &'static str {
+        "ecmp"
+    }
+
+    fn compute(&self, topo: &TopoView, src: &PeerId, dst: &PeerId) -> Option<Path> {
+        self.compute_paths(topo, src, dst).into_iter().next()
+    }
+
+    fn compute_paths(&self, topo: &TopoView, src: &PeerId, dst: &PeerId) -> Vec<Path> {
+        let src_key = src.0.as_str();
+        let dst_key = dst.0.as_str();
+        if !topo.contains(src) || !topo.contains(dst) {
+            return Vec::new();
+        }
+        if src_key == dst_key {
+            return vec![Path {
+                nodes: vec![src.clone()],
+                cost: 0,
+            }];
+        }
+        let (dist, prev) = Self::dijkstra_ecmp(topo, src_key);
+        Self::enumerate_paths(src, dst_key, &dist, &prev)
+    }
+
+    fn compute_all_paths(&self, topo: &TopoView, src: &PeerId) -> HashMap<PeerId, Vec<Path>> {
+        let src_key = src.0.as_str();
+        if !topo.contains(src) {
+            return HashMap::new();
+        }
+        let (dist, prev) = Self::dijkstra_ecmp(topo, src_key);
+        let mut out = HashMap::new();
+        for id in topo.node_ids() {
+            let dst = PeerId(id.to_string());
+            let paths = if id == src_key {
+                vec![Path {
+                    nodes: vec![src.clone()],
+                    cost: 0,
+                }]
+            } else {
+                Self::enumerate_paths(src, id, &dist, &prev)
+            };
+            if !paths.is_empty() {
+                out.insert(dst, paths);
+            }
+        }
+        out
+    }
+}
+
+/// 下一跳（FIB 条目元素；从第一天就是 Vec 形状，ECMP 下每 dst 可多条）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NextHop {
     /// 下一跳节点。
@@ -228,7 +390,8 @@ pub struct Fib {
 impl Fib {
     /// 全量重算并整体替换（RCU 风格；调用方持有新旧两代，原子切换）。
     ///
-    /// 单次 Dijkstra（O(E log V)）算出全目的地最短路，再逐 dst 取第二跳填 FIB。
+    /// 单次算路得出全目的地（多）路径，按去重后的第二跳填 `Vec<NextHop>`；
+    /// 单路径算法退化为每 dst 1 条（与 §12.45 行为一致）。
     #[must_use]
     pub fn compute<C: PathComputer>(
         lsdb: &Lsdb,
@@ -237,23 +400,39 @@ impl Fib {
         generation: u64,
     ) -> Self {
         let topo = TopoView::from_lsdb(lsdb);
-        let paths = computer.compute_all(&topo, self_id);
+        let all_paths = computer.compute_all_paths(&topo, self_id);
         let mut entries = HashMap::new();
         for lsa in lsdb.all() {
             if lsa.node_id.0 == self_id.0 {
                 continue; // 本端无条目
             }
-            if let Some(path) = paths.get(&lsa.node_id) {
-                // 最短路的第二跳即下一跳（单节点路径无第二跳，跳过）。
-                if let Some(next) = path.nodes.get(1) {
-                    entries.insert(
-                        lsa.vip.clone(),
-                        vec![NextHop {
-                            peer: next.clone(),
-                            weight: 1,
-                            path_id: 0,
-                        }],
-                    );
+            if let Some(paths) = all_paths.get(&lsa.node_id) {
+                // 各路径的第二跳即下一跳，去重（多条等代价路径可能共享第二跳）。
+                // 按 peer 排序：FIB 条目内顺序确定，与 HashMap 迭代顺序无关
+                //（未来按流哈希选下一跳时，跨节点必须一致，否则 TCP 重排序）。
+                let mut seen: Vec<&PeerId> = Vec::new();
+                let mut hops: Vec<NextHop> = Vec::new();
+                for path in paths.iter() {
+                    if let Some(next) = path.nodes.get(1) {
+                        if !seen.contains(&next) {
+                            seen.push(next);
+                            hops.push(NextHop {
+                                peer: next.clone(),
+                                weight: 1,
+                                path_id: 0, // 占位，排序后重分配
+                            });
+                        }
+                    }
+                }
+                // 按 peer 排序：FIB 条目内顺序确定，与 HashMap 迭代顺序无关
+                //（未来按流哈希选下一跳时，跨节点必须一致，否则 TCP 重排序）。
+                // 排序后再分配 path_id（0,1,2…），保证跨运行一致。
+                hops.sort_by(|a, b| a.peer.0.cmp(&b.peer.0));
+                for (idx, hop) in hops.iter_mut().enumerate() {
+                    hop.path_id = idx as u32;
+                }
+                if !hops.is_empty() {
+                    entries.insert(lsa.vip.clone(), hops);
                 }
             }
         }
@@ -410,5 +589,104 @@ mod tests {
     fn link_cost_minimum_one() {
         assert_eq!(link_cost(0), 1);
         assert_eq!(link_cost(10), 10);
+    }
+
+    /// 菱形拓扑：A-B 10ms，B-D 10ms，A-C 10ms，C-D 10ms。
+    /// A→D 有两条 20ms 等代价最短路（经 B / 经 C）。
+    fn diamond_lsdb() -> (Lsdb, PeerId, PeerId, PeerId, PeerId) {
+        let (a, b, c, d) = (peer("a"), peer("b"), peer("c"), peer("d"));
+        let mut db = Lsdb::new(a.clone());
+        db.update_local(lsa("a", "10.0.0.1", vec![link("b", 10), link("c", 10)]));
+        db.update(lsa("b", "10.0.0.2", vec![link("a", 10), link("d", 10)]));
+        db.update(lsa("c", "10.0.0.3", vec![link("a", 10), link("d", 10)]));
+        db.update(lsa("d", "10.0.0.4", vec![link("b", 10), link("c", 10)]));
+        (db, a, b, c, d)
+    }
+
+    #[test]
+    fn ecmp_finds_all_equal_cost_paths() {
+        let (db, a, b, c, d) = diamond_lsdb();
+        let topo = TopoView::from_lsdb(&db);
+        let ecmp = Ecmp::new();
+        assert_eq!(ecmp.name(), "ecmp");
+
+        let paths = ecmp.compute_paths(&topo, &a, &d);
+        assert_eq!(paths.len(), 2);
+        for p in &paths {
+            assert_eq!(p.cost, 20);
+            assert_eq!(p.nodes.len(), 3);
+        }
+        let mut seconds: Vec<String> = paths.iter().map(|p| p.nodes[1].0.clone()).collect();
+        seconds.sort();
+        assert_eq!(seconds, vec!["b".to_string(), "c".to_string()]);
+
+        // compute() 返回其中一条（兼容单路径语义）。
+        let one = ecmp.compute(&topo, &a, &d).unwrap();
+        assert_eq!(one.cost, 20);
+        // 不可达 → 空。
+        assert!(ecmp.compute_paths(&topo, &a, &peer("ghost")).is_empty());
+        let _ = (b, c);
+    }
+
+    #[test]
+    fn ecmp_fib_has_multiple_next_hops() {
+        let (db, a, b, c, _) = diamond_lsdb();
+        let ecmp = Ecmp::new();
+        let fib = Fib::compute(&db, &a, &ecmp, 1);
+        // A→D：2 条 NextHop（B 和 C）。
+        let hops = fib.lookup("10.0.0.4").unwrap();
+        assert_eq!(hops.len(), 2);
+        let mut peers: Vec<String> = hops.iter().map(|h| h.peer.0.clone()).collect();
+        peers.sort();
+        assert_eq!(peers, vec!["b".to_string(), "c".to_string()]);
+        // A→B：单条路径，仍为 1 条 NextHop。
+        let hops_b = fib.lookup("10.0.0.2").unwrap();
+        assert_eq!(hops_b.len(), 1);
+        assert_eq!(hops_b[0].peer, b);
+        let _ = c;
+    }
+
+    #[test]
+    fn shortest_path_compute_paths_stays_single() {
+        // ShortestPath 经默认 compute_paths 仍为单路径（兼容）。
+        let (db, a, _, _, d) = diamond_lsdb();
+        let topo = TopoView::from_lsdb(&db);
+        let sp = ShortestPath::new();
+        let paths = sp.compute_paths(&topo, &a, &d);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].cost, 20);
+    }
+
+    #[test]
+    fn fib_dedups_shared_second_hop() {
+        // 两条等代价路径共享第二跳 B：A-B-D（20）与 A-B-C-D（20）。
+        // FIB 去重后应只有 1 条 NextHop（B），而非 2 条。
+        let (a, b, c, d) = (peer("a"), peer("b"), peer("c"), peer("d"));
+        let mut db = Lsdb::new(a.clone());
+        db.update_local(lsa("a", "10.0.0.1", vec![link("b", 10)]));
+        db.update(lsa(
+            "b",
+            "10.0.0.2",
+            vec![link("a", 10), link("d", 10), link("c", 5)],
+        ));
+        db.update(lsa("c", "10.0.0.3", vec![link("b", 5), link("d", 5)]));
+        db.update(lsa("d", "10.0.0.4", vec![link("b", 10), link("c", 5)]));
+
+        let topo = TopoView::from_lsdb(&db);
+        let ecmp = Ecmp::new();
+        // 确认确实有 2 条等代价路径。
+        let paths = ecmp.compute_paths(&topo, &a, &d);
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().all(|p| p.cost == 20));
+        // 两条路径第二跳都是 B。
+        assert!(paths.iter().all(|p| p.nodes[1] == b));
+
+        // FIB 去重：1 条 NextHop。
+        let fib = Fib::compute(&db, &a, &ecmp, 1);
+        let hops = fib.lookup("10.0.0.4").unwrap();
+        assert_eq!(hops.len(), 1);
+        assert_eq!(hops[0].peer, b);
+        assert_eq!(hops[0].path_id, 0);
+        let _ = (c, d);
     }
 }

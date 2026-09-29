@@ -2642,3 +2642,24 @@ LSDB → 只读拓扑视图（`TopoView`）→ 算路抽象（`PathComputer`）�
 - 冻结边界：真实转发面挂接；距离矢量退役（迁移为后续 feature，本项不动 §12.6 代码）；
   按流哈希选路（转发面，后续）；增量算路（本项全量重算，O(E log V)）。
 - 契约 hash 冻结（verify 时写入）。
+
+### 12.46 P5 去中心化选路：ECMP 等代价多路径（2026-09-29）{#12-ecmp}
+
+接 §12.45（Dijkstra/FIB）。本项交付等代价多路径（portable core，零 I/O）：
+新增 `PathComputer` 实现 `Ecmp`，FIB 的 `Vec<NextHop>` 从本项起真正填多条。
+LSDB/LSA/泛洪协议零改动（设计文档既定映射）。
+
+- **`Ecmp`**：`name()=="ecmp"`；Dijkstra 保留所有等代价前驱，枚举所有等代价
+  最短路；`compute()` 返回其中一条（第一条），`compute_paths()` 返回全部。
+- **`PathComputer::compute_paths`**（trait 新增，有默认实现）：`fn compute_paths(&self, topo: &TopoView, src: &PeerId, dst: &PeerId) -> Vec<Path>`；
+  默认退化为 `compute()` 的单路径；`Ecmp` 覆盖为多路径。
+- **FIB 多下一跳**：`Fib::compute` 改用 `compute_all_paths`（批量版），按去重后的第二跳
+  生成 `NextHop`（`weight` 本期恒 1，`path_id` 为排序后的去重序号）；单路径时行为与 §12.45 一致。
+- E4 场景 `ecmp.toml`（id=`product.ecmp`，
+  `cargo run --quiet -p nexus --example ecmp -- --json`）：
+  菱形拓扑（A-B 10ms、B-D 10ms、A-C 10ms、C-D 10ms；A→D 两条 20ms 等代价路径）；
+  期望 `verdict=PASS`，`a_to_d_next_hops=2`（B 和 C），`a_to_d_via` 含 node-b/node-c，
+  `entry_shape=vec_multi`。
+- 冻结边界：按流哈希选下一跳（转发面，后续）；K-shortest/Disjoint/Constrained
+  （后续 `PathComputer` impl）；`[routing] strategy` 配置装配（后续）。
+- 契约 hash 冻结（verify 时写入）。
