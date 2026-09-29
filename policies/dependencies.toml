@@ -158,3 +158,49 @@ os_transitive_deps = "none beyond ring's cc (already accepted)"
 approved = true
 approved_date = "2026-09-30"
 review_basis = "docs/foundation/PHASE0-INVENTORY.md#6 (live eval on xc-pc-linux)"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-fabric"
+crate = "bytes"
+version = "1"
+default_features = false
+features = []
+architecture_layer = "delivery (session layer); buffer types for the quinn-proto sans-IO API"
+feature_scope = "no features enabled; Bytes/BytesMut only"
+license = "MIT (allowlisted)"
+security = "no known advisories in allowlist; cargo-deny recommended for CI"
+portability = "pure Rust, no OS-specific API"
+supply_chain = "version pinned by Cargo.lock (lockfile_required); already in tree via quinn-proto"
+approved = true
+approved_date = "2026-09-30"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-fabric"
+crate = "rcgen"
+version = "0.13"
+default_features = false
+features = []
+architecture_layer = "delivery (session layer); self-signed ed25519 certs binding PeerId"
+feature_scope = "no features enabled; KeyPair/CertificateParams only"
+license = "MIT OR Apache-2.0 (allowlisted)"
+security = "no known advisories in allowlist; cargo-deny recommended for CI"
+portability = "pure Rust; ring backend already in tree"
+supply_chain = "version pinned by Cargo.lock (lockfile_required); already in tree via nexus-outbound-trojan (0.13.2)"
+approved = true
+approved_date = "2026-09-30"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-fabric"
+crate = "ring"
+version = "0.17"
+default_features = false
+features = []
+architecture_layer = "delivery (session layer); ed25519 signature verification in the PeerId-pinning TLS verifier"
+feature_scope = "no features enabled; signature::UnparsedPublicKey only"
+license = "MIT OR Apache-2.0 (allowlisted; ISC also granted upstream)"
+security = "no known advisories in allowlist; cargo-deny recommended for CI"
+portability = "has C/asm build via cc (already accepted in tree via quinn-proto/rustls)"
+supply_chain = "version pinned by Cargo.lock (lockfile_required); already in tree via quinn-proto (0.17.14)"
+os_transitive_deps = "cc build only (already accepted)"
+approved = true
+approved_date = "2026-09-30"

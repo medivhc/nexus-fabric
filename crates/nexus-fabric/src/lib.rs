@@ -1,15 +1,29 @@
 //! Nexus fabric session layer: `FabricConn`.
 //!
-//! Contract stage (Phase A): public API surface is frozen by `MODULE.md`.
-//! All constructors currently return "not implemented"; the first E4 scenarios
-//! (`product.fabric-conn-basic`, `product.fabric-conn-roam`) are expected to be
-//! BLOCKED until the quinn-proto driver lands.
+//! QUIC-like connections over UDP (quinn-proto sans-IO + a self-written std
+//! driver thread; the repository is tokio-free): reliable bidirectional
+//! streams, unreliable datagrams, E2E encryption (TLS 1.3), and connections
+//! identified by `(PeerId, ConnectionId)` decoupled from the UDP 5-tuple so
+//! they survive local address changes (roaming, S2/S3).
 //!
 //! Naming note: `FabricConn` is deliberately distinct from `nexus-session`'s
 //! task-execution `Session`. Do not conflate the two.
+//!
+//! Phase B additions to the frozen API surface (all truly necessary for the
+//! frozen E4 scenarios; no frozen expectation changed):
+//! - `FabricConn::accept_bi`: the echo server must accept the peer's stream.
+//! - `FabricConn::rebind`: the roam scenario rebinds the client mid-transfer.
+//! - `FabricListener::peer_id` / `local_addr`: the dialing side needs both.
+
+mod cert;
+mod driver;
 
 use std::fmt;
 use std::net::SocketAddr;
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
+
+use driver::{Cmd, ConnShared, Driver, StreamShared};
 
 /// Node identity: ed25519 public key (cf. iroh's EndpointId).
 ///
@@ -37,101 +51,264 @@ pub struct ConnConfig {
     /// Candidate underlay addresses, in preference order (supplied by the path layer).
     pub addrs: Vec<SocketAddr>,
     /// Handshake timeout.
-    pub handshake_timeout: std::time::Duration,
+    pub handshake_timeout: Duration,
 }
 
 impl Default for ConnConfig {
     fn default() -> Self {
         Self {
             addrs: Vec::new(),
-            handshake_timeout: std::time::Duration::from_secs(10),
+            handshake_timeout: Duration::from_secs(10),
         }
     }
 }
 
 /// A QUIC-like connection to a peer: reliable streams, unreliable datagrams,
-/// E2E encryption, statistics. Sync API (the driver runs on its own threads;
-/// the repository is tokio-free).
-///
-/// Contract stage: not implemented.
-#[derive(Debug)]
+/// E2E encryption, statistics. Sync API (the driver runs on its own std thread).
+#[derive(Debug, Clone)]
 pub struct FabricConn {
-    peer: PeerId,
-    id: ConnectionId,
+    inner: Arc<ConnShared>,
+    driver: Arc<Driver>,
 }
 
 impl FabricConn {
-    /// Actively establish a connection (QUIC/TLS 1.3 handshake, peer authentication).
-    pub fn connect(peer: PeerId, _config: &ConnConfig) -> Result<Self, FabricError> {
-        let _ = peer;
-        Err(FabricError::not_implemented("connect"))
+    /// Actively establish a connection (QUIC/TLS 1.3 handshake with peer-key
+    /// pinning, S1). Blocks until the handshake completes or `handshake_timeout`
+    /// elapses. Uses `config.addrs[0]` (P0: no racing yet).
+    pub fn connect(peer: PeerId, config: &ConnConfig) -> Result<Self, FabricError> {
+        if config.addrs.is_empty() {
+            return Err(FabricError::PathUnreachable);
+        }
+        let driver = Driver::new_client()?;
+        let inner = driver.connect(peer, config.addrs[0], config.handshake_timeout)?;
+        Ok(Self { inner, driver })
     }
 
     pub fn peer(&self) -> PeerId {
-        self.peer
+        self.inner.peer
     }
 
     pub fn id(&self) -> ConnectionId {
-        self.id
+        self.inner.id
     }
 
     /// Open a reliable bidirectional stream (ordered, complete delivery, S4).
     pub fn open_bi(&self) -> Result<(SendStream, RecvStream), FabricError> {
-        Err(FabricError::not_implemented("open_bi"))
+        let (tx, rx) = mpsc::channel();
+        self.inner
+            .tx
+            .send(Cmd::OpenBi {
+                conn: self.inner.id.0,
+                reply: tx,
+            })
+            .map_err(|_| FabricError::Closed(0))?;
+        let sh = rx.recv().map_err(|_| FabricError::Closed(0))??;
+        Ok(split_stream(sh))
+    }
+
+    /// Accept a remotely-initiated bidirectional stream (blocking).
+    ///
+    /// Phase B addition: required by the echo side of the product scenarios.
+    pub fn accept_bi(&self) -> Result<(SendStream, RecvStream), FabricError> {
+        let mut q = self.inner.accepted.lock().unwrap();
+        loop {
+            if let Some(sh) = q.pop_front() {
+                return Ok(split_stream(sh));
+            }
+            if let Some(e) = self.inner.state.lock().unwrap().closed.clone() {
+                return Err(e);
+            }
+            q = self
+                .inner
+                .accepted_cv
+                .wait(q)
+                .map_err(|_| FabricError::Transport("lock poisoned".into()))?;
+        }
     }
 
     /// Send an unreliable datagram (best-effort, S5). Max 1200 bytes pre-PMTUD.
-    pub fn send_datagram(&self, _data: &[u8]) -> Result<(), FabricError> {
-        Err(FabricError::not_implemented("send_datagram"))
+    pub fn send_datagram(&self, data: &[u8]) -> Result<(), FabricError> {
+        if data.len() > 1200 {
+            return Err(FabricError::Transport(
+                "datagram too large (S5: 1200 byte cap)".into(),
+            ));
+        }
+        let (tx, rx) = mpsc::channel();
+        self.inner
+            .tx
+            .send(Cmd::SendDatagram {
+                conn: self.inner.id.0,
+                data: data.to_vec(),
+                reply: tx,
+            })
+            .map_err(|_| FabricError::Closed(0))?;
+        rx.recv().map_err(|_| FabricError::Closed(0))?
     }
 
-    /// Receive an unreliable datagram.
+    /// Receive an unreliable datagram (blocking).
     pub fn recv_datagram(&self) -> Result<Vec<u8>, FabricError> {
-        Err(FabricError::not_implemented("recv_datagram"))
+        let mut q = self.inner.dgrams.lock().unwrap();
+        loop {
+            if let Some(d) = q.pop_front() {
+                return Ok(d);
+            }
+            if let Some(e) = self.inner.state.lock().unwrap().closed.clone() {
+                return Err(e);
+            }
+            q = self
+                .inner
+                .dgram_cv
+                .wait(q)
+                .map_err(|_| FabricError::Transport("lock poisoned".into()))?;
+        }
+    }
+
+    /// Rebind the underlying UDP socket to a new local port (active migration).
+    ///
+    /// Phase B addition: the roam scenario's client rebinds mid-transfer (S3).
+    /// Unacknowledged data is retransmitted on the new path; the peer migrates
+    /// via QUIC path validation (S6). Blocks until the swap completes.
+    pub fn rebind(&self) -> Result<(), FabricError> {
+        let (tx, rx) = mpsc::channel();
+        self.inner
+            .tx
+            .send(Cmd::Rebind {
+                conn: self.inner.id.0,
+                reply: tx,
+            })
+            .map_err(|_| FabricError::Closed(0))?;
+        rx.recv().map_err(|_| FabricError::Closed(0))??;
+        Ok(())
     }
 
     /// Measured connection statistics (S8: honest, unknown marked as such).
     pub fn stats(&self) -> ConnStats {
-        ConnStats::unknown()
+        self.inner.stats.lock().unwrap().clone()
     }
 
-    /// Graceful close: sends a close frame (S7).
-    pub fn close(&self, _code: u32, _reason: &[u8]) {}
+    /// Graceful close: queues a close frame (S7, best-effort delivery).
+    pub fn close(&self, code: u32, reason: &[u8]) {
+        let _ = self.inner.tx.send(Cmd::Close {
+            conn: self.inner.id.0,
+            code,
+            reason: reason.to_vec(),
+        });
+    }
+}
+
+fn split_stream(sh: Arc<StreamShared>) -> (SendStream, RecvStream) {
+    (
+        SendStream {
+            shared: sh.clone(),
+        },
+        RecvStream { shared: sh },
+    )
 }
 
 /// Passive side: accept incoming connections.
-pub struct FabricListener;
+#[derive(Debug, Clone)]
+pub struct FabricListener {
+    driver: Arc<Driver>,
+}
 
 impl FabricListener {
-    pub fn bind(_addr: SocketAddr) -> Result<Self, FabricError> {
-        Err(FabricError::not_implemented("bind"))
+    pub fn bind(addr: SocketAddr) -> Result<Self, FabricError> {
+        Ok(Self {
+            driver: Driver::new_server(addr)?,
+        })
     }
 
     pub fn accept(&self) -> Result<FabricConn, FabricError> {
-        Err(FabricError::not_implemented("accept"))
+        let inner = self.driver.accept_conn()?;
+        Ok(FabricConn {
+            inner,
+            driver: self.driver.clone(),
+        })
+    }
+
+    /// This endpoint's [`PeerId`], for the dialing side to pin.
+    ///
+    /// Phase B addition: the product scenarios dial with an expected peer.
+    pub fn peer_id(&self) -> PeerId {
+        self.driver
+            .shared()
+            .peer_id
+            .expect("server driver always has an identity")
+    }
+
+    /// Local UDP address, for the dialing side's [`ConnConfig`].
+    ///
+    /// Phase B addition: the product scenarios bind port 0 and discover it.
+    pub fn local_addr(&self) -> Result<SocketAddr, FabricError> {
+        Ok(*self.driver.shared().local_addr.lock().unwrap())
     }
 }
 
 /// Reliable send half of a bidirectional stream.
-pub struct SendStream;
+///
+/// P0: `write` buffers in memory and returns immediately; the driver moves
+/// bytes into QUIC. There is no backpressure yet (documented limitation).
+pub struct SendStream {
+    shared: Arc<StreamShared>,
+}
 
 impl SendStream {
-    pub fn write(&mut self, _buf: &[u8]) -> Result<usize, FabricError> {
-        Err(FabricError::not_implemented("SendStream::write"))
+    pub fn write(&mut self, buf: &[u8]) -> Result<usize, FabricError> {
+        let mut ss = self.shared.state.lock().unwrap();
+        if let Some(e) = ss.error.clone() {
+            return Err(e);
+        }
+        ss.send_buf.extend_from_slice(buf);
+        let _ = self.shared.tx.send(Cmd::Pump {
+            conn: self.shared.conn_id,
+        });
+        Ok(buf.len())
     }
 
     /// Signal end-of-stream; the peer observes EOF after all bytes (S4).
     pub fn finish(&mut self) -> Result<(), FabricError> {
-        Err(FabricError::not_implemented("SendStream::finish"))
+        let mut ss = self.shared.state.lock().unwrap();
+        if let Some(e) = ss.error.clone() {
+            return Err(e);
+        }
+        ss.send_fin = true;
+        let _ = self.shared.tx.send(Cmd::Pump {
+            conn: self.shared.conn_id,
+        });
+        Ok(())
     }
 }
 
 /// Reliable receive half of a bidirectional stream.
-pub struct RecvStream;
+///
+/// `read` blocks until data is available; `Ok(0)` signals EOF (after `finish`).
+pub struct RecvStream {
+    shared: Arc<StreamShared>,
+}
 
 impl RecvStream {
-    pub fn read(&mut self, _buf: &mut [u8]) -> Result<usize, FabricError> {
-        Err(FabricError::not_implemented("RecvStream::read"))
+    pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, FabricError> {
+        let mut ss = self.shared.state.lock().unwrap();
+        loop {
+            if let Some(e) = ss.error.clone() {
+                return Err(e);
+            }
+            if !ss.recv_buf.is_empty() {
+                let n = ss.recv_buf.len().min(buf.len());
+                for (i, b) in ss.recv_buf.drain(..n).enumerate() {
+                    buf[i] = b;
+                }
+                return Ok(n);
+            }
+            if ss.recv_eof {
+                return Ok(0);
+            }
+            ss = self
+                .shared
+                .cv
+                .wait(ss)
+                .map_err(|_| FabricError::Transport("lock poisoned".into()))?;
+        }
     }
 }
 
@@ -181,12 +358,6 @@ pub enum FabricError {
     Transport(String),
 }
 
-impl FabricError {
-    fn not_implemented(op: &str) -> Self {
-        FabricError::Transport(format!("not implemented (contract stage): {op}"))
-    }
-}
-
 impl fmt::Display for FabricError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -210,9 +381,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn contract_stage_stubs_are_honest() {
-        // Red Evidence anchor: every constructor fails loudly until the driver lands.
+    fn connect_without_candidates_is_path_unreachable() {
+        // No underlay addresses: the path layer must supply another path.
         let err = FabricConn::connect(PeerId([0u8; 32]), &ConnConfig::default()).unwrap_err();
-        assert!(matches!(err, FabricError::Transport(_)));
+        assert_eq!(err, FabricError::PathUnreachable);
+    }
+
+    #[test]
+    fn peer_id_debug_is_short() {
+        let s = format!("{:?}", PeerId([0xabu8; 32]));
+        assert!(s.starts_with("PeerId(abababab"));
     }
 }
