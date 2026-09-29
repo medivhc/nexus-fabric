@@ -9030,8 +9030,18 @@ pub fn routing_strategy_flow() -> Result<Value, NexusError> {
     events.push("parse_ok");
 
     // ---- 阶段 2：parse_err ----
-    if RoutingStrategy::parse("k-shortest").is_ok() {
-        return Err(fail("parse k-shortest should err"));
+    // §12.53 起：裸 "k-shortest" 默认 k=2（不再是错误）。
+    match RoutingStrategy::parse("k-shortest") {
+        Ok(RoutingStrategy::KShortest { k: 2 }) => {}
+        other => {
+            return Err(fail(&format!(
+                "parse k-shortest should default k=2, got {:?}",
+                other
+            )));
+        }
+    }
+    if RoutingStrategy::parse("k-shortest:0").is_ok() {
+        return Err(fail("parse k-shortest:0 should err"));
     }
     events.push("parse_err");
 
@@ -9142,8 +9152,15 @@ pub fn routing_strategy_flow() -> Result<Value, NexusError> {
     let bad: crate::subnet_cli::SubnetConfig =
         toml::from_str("[subnet]\ncidr=\"10.99.0.0/24\"\n[routing]\nstrategy=\"k-shortest\"\n")
             .map_err(|e| fail(&format!("toml parse: {e}")))?;
-    if bad.routing_strategy().is_ok() {
-        return Err(fail("unknown strategy should err"));
+    // §12.53 起：裸 "k-shortest" 默认 k=2（不再是错误）。
+    match bad.routing_strategy() {
+        Ok(RoutingStrategy::KShortest { k: 2 }) => {}
+        other => {
+            return Err(fail(&format!(
+                "toml k-shortest should default k=2, got {:?}",
+                other
+            )));
+        }
     }
     // [routing] 段存在但缺 strategy 字段 → serde 默认回落为 Shortest。
     let no_field: crate::subnet_cli::SubnetConfig =
