@@ -2612,3 +2612,33 @@ accept new work
 - 统一的 daemon 级冷启动对账执行器（把 §15.2 全步骤接入 nexusd serve 启动路径）
   为后续工作，不在本期冻结 expectation 内；本小节是产品语义声明，不新增命令、
   不修改既有场景 expectation。
+
+### 12.45 P5 去中心化选路：Dijkstra 最短路 + FIB（2026-09-29）{#12-dijkstra-fib}
+
+接 §12.44（LSA/LSDB）。本项交付基于 LSDB 的**选路计算**（portable core，零 I/O）：
+LSDB → 只读拓扑视图（`TopoView`）→ 算路抽象（`PathComputer`）→ 转发表（`FIB`）。
+现有距离矢量路由（§12.6）保留不动；本项不接真实转发面（数据面挂接为后续 feature）。
+
+- **LSA 携带链路**：节点在本端 LSA 的 `neighbors` 中通告链路（`LinkAdvert{neighbor, metrics}`）；
+  §12.44 的"neighbors 为空"是发现阶段的临时状态，本项起节点填充真实邻接。
+- **TopoView**：`TopoView::from_lsdb(&Lsdb)` 构建只读图；链路按通告方向建边
+  （A 通告 B 即有 A→B 边，不要求对称——与链路状态语义一致）。
+- **PathComputer trait**：`fn name(&self) -> &'static str; fn compute(&self, topo: &TopoView, src: &PeerId, dst: &PeerId) -> Option<Path>`；
+  `Path{nodes: Vec<PeerId>（含 src/dst）, cost: u64}`。
+  本项实现 `ShortestPath`（Dijkstra）；ECMP / K-shortest / Disjoint / Constrained 为后续
+  feature（只加新 impl，不动 LSDB/FIB/协议）。
+- **链路代价**：`cost = max(latency_ms, 1)`（u64；用 LSA 结构化度量中的延迟字段）。
+- **FIB**：从第一天就是 `dst vip → Vec<NextHop>` 形状；
+  `NextHop{peer: PeerId, weight: u32（本期恒 1）, path_id: u32（本期恒 0）}`。
+  本项每 dst 只填 1 条 next_hop（最短路的第二跳）；未来多路径只加条目，不改形状。
+- **原子更新**：`Fib::compute(lsdb, self_id, computer, generation)` 单次 Dijkstra
+  （O(E log V)）算出全目的地最短路后整体替换（代际版本号，RCU 风格）；
+  不用逐条改，避免半新半旧。
+- E4 场景 `dijkstra_fib.toml`（id=`product.dijkstra-fib`，
+  `cargo run --quiet -p nexus --example dijkstra_fib -- --json`）：
+  四节点拓扑（A-B 10ms、B-D 10ms、A-C 50ms、C-D 10ms、B-C 10ms）；
+  期望 `verdict=PASS`，`a_to_c_via=node-b`（20ms 间接优于 50ms 直连）、
+  `a_to_d_via=node-b`、`entry_shape=vec_single`、`generation` 递增。
+- 冻结边界：真实转发面挂接；距离矢量退役（迁移为后续 feature，本项不动 §12.6 代码）；
+  按流哈希选路（转发面，后续）；增量算路（本项全量重算，O(E log V)）。
+- 契约 hash 冻结（verify 时写入）。

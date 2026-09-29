@@ -170,6 +170,27 @@ LSDB。本期 LSA 只负责发现（`neighbors` 为空）；选路为后续 feat
 - Deletion Test：LSA 发现是去中心化拓扑同步的独立变化维度，与 `DiscoveryFrame`
  （presence 查询）正交；无新 trait。
 
+### 冻结契约（Dijkstra 选路 P5，PRODUCT §12.45，scenarios/product/dijkstra_fib.toml）
+
+新模块 `routing`（portable：零 I/O、零第三方依赖）：LSDB → `TopoView` →
+`PathComputer` → `FIB`。本项起 LSA 的 `neighbors` 填充真实链路通告
+（§12.44 的"neighbors 为空"是发现阶段的临时状态）。
+
+- `pub struct TopoView<'a>`：`from_lsdb(&Lsdb)`（O(V+E)）；链路按通告方向建边，
+  不要求对称；`node_count()`、`contains(&PeerId)`。
+- `pub struct Path { pub nodes: Vec<PeerId>（含 src/dst）, pub cost: u64 }`。
+- `pub trait PathComputer { fn name(&self) -> &'static str; fn compute(&self, topo: &TopoView, src: &PeerId, dst: &PeerId) -> Option<Path>; fn compute_all(&self, topo: &TopoView, src: &PeerId) -> HashMap<PeerId, Path>（默认逐 dst，有批量优化需求的 impl 覆盖） }`；
+  本项 `pub struct ShortestPath`（Dijkstra，`name()=="shortest"`，BinaryHeap 最小堆，
+  单次运行算全目的地）。
+- 链路代价 `max(latency_ms, 1)`（u64）；不可达 → `None`；src==dst → 零代价单节点路径。
+- `pub struct NextHop { pub peer: PeerId, pub weight: u32（本期恒 1）, pub path_id: u32（本期恒 0） }`。
+- `pub struct Fib`：`compute(lsdb, self_id, computer, generation)` 全量重算整体替换
+  （RCU 风格）；`dst vip → Vec<NextHop>`（本期每 dst 1 条）；`generation()`、
+  `lookup(vip)`、`len()`；本端无条目。
+- Deletion Test：选路是 LSDB 上的独立计算维度（未来 ECMP/K-shortest/Disjoint 只加
+  `PathComputer` impl，不动 LSDB/FIB/协议），与泛洪/编解码正交；`PathComputer`
+  通过"多算法共享 FIB/TopoView"的独立变化维度。
+
 ## Observability
 
 稳定结构化字段优先于自由文本；如涉及 Session/Provider/Path/Workspace，应携带对应 correlation id。

@@ -62,5 +62,13 @@
     "module": "nexus-discovery",
     "category": "implementation-pattern",
     "summary": "解码不可信长度前缀时用 Vec::with_capacity(n.min(CAP)) 防过度分配；min 仅为容量提示非截断，Review 时需区分"
+  },
+  {
+    "id": "dijkstra-fib-001",
+    "file": "entries/2026-09-29-dijkstra-single-source.md",
+    "date": "2026-09-29",
+    "module": "nexus-discovery",
+    "category": "implementation-pitfall",
+    "summary": "FIB 构建时不要对每个目的地跑一次 Dijkstra——单源运行已给出全目的地最短路；文档需区分单次调用与批量场景复杂度"
   }
 ]

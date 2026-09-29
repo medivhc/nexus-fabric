@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod lsa;
+pub mod routing;
 
 use std::collections::HashMap;
 use std::fmt;

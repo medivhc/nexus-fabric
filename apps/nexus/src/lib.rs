@@ -8487,3 +8487,174 @@ pub fn lsa_discovery_flow() -> Result<Value, NexusError> {
         "converged": { "node_count": 3 },
     }))
 }
+
+/// E4 `product.dijkstra-fib`（PRODUCT §12.45）的可执行驱动。
+///
+/// ```text
+/// 四节点进程内（A 视角）：LSDB（含链路通告）→ TopoView → Dijkstra →
+/// FIB（dst vip → Vec<NextHop>）；验证间接最短路优于慢直连
+/// ```
+///
+/// 全程零真实网络；错误一律 typed `Result`，无 panic。
+pub fn dijkstra_fib_flow() -> Result<Value, NexusError> {
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::{Fib, PathComputer, ShortestPath, TopoView};
+
+    let mut events: Vec<&'static str> = Vec::new();
+
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    let id_d = PeerId("node-d".to_string());
+
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+
+    // 四节点 LSA（neighbors 已填充链路通告；链路对称）。
+    // 拓扑：A-B 10ms，B-D 10ms，A-C 50ms，C-D 10ms，B-C 10ms。
+    let lsa_a = Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 50)],
+    };
+    let lsa_b = Lsa {
+        node_id: id_b.clone(),
+        vip: "10.99.0.2".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_c, 10), link(&id_d, 10)],
+    };
+    let lsa_c = Lsa {
+        node_id: id_c.clone(),
+        vip: "10.99.0.3".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 50), link(&id_b, 10), link(&id_d, 10)],
+    };
+    let lsa_d = Lsa {
+        node_id: id_d.clone(),
+        vip: "10.99.0.4".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    };
+
+    // A 的 LSDB：本端经 update_local，其余经泛洪 update。
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(lsa_a);
+    lsdb.update(lsa_b);
+    lsdb.update(lsa_c);
+    lsdb.update(lsa_d);
+
+    // ---- 阶段 1：TopoView 建图 ----
+    let topo = TopoView::from_lsdb(&lsdb);
+    if topo.node_count() != 4 {
+        return Err(NexusError::Internal {
+            message: "dijkstra fib: topo node count != 4".to_string(),
+        });
+    }
+    events.push("topo_built");
+
+    // ---- 阶段 2：Dijkstra 最短路 ----
+    let computer = ShortestPath::new();
+    if computer.name() != "shortest" {
+        return Err(NexusError::Internal {
+            message: "dijkstra fib: computer name mismatch".to_string(),
+        });
+    }
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("dijkstra fib: {m}"),
+    };
+    // A→B：直连 10ms。
+    let p_b = computer
+        .compute(&topo, &id_a, &id_b)
+        .ok_or_else(|| fail("no path A->B"))?;
+    if p_b.cost != 10 || p_b.nodes.len() != 2 {
+        return Err(fail("A->B path wrong"));
+    }
+    // A→C：A-B-C 20ms 优于 A-C 直连 50ms。
+    let p_c = computer
+        .compute(&topo, &id_a, &id_c)
+        .ok_or_else(|| fail("no path A->C"))?;
+    if p_c.cost != 20 || p_c.nodes != vec![id_a.clone(), id_b.clone(), id_c.clone()] {
+        return Err(fail("A->C should go via B"));
+    }
+    // A→D：A-B-D 20ms 最短。
+    let p_d = computer
+        .compute(&topo, &id_a, &id_d)
+        .ok_or_else(|| fail("no path A->D"))?;
+    if p_d.cost != 20 || p_d.nodes != vec![id_a.clone(), id_b.clone(), id_d.clone()] {
+        return Err(fail("A->D should go via B"));
+    }
+    // 不可达：未知节点 → None。
+    if computer
+        .compute(&topo, &id_a, &PeerId("node-x".to_string()))
+        .is_some()
+    {
+        return Err(fail("unknown dst should have no path"));
+    }
+    events.push("shortest_paths_ok");
+
+    // ---- 阶段 3：FIB（dst vip → Vec<NextHop>，本期每 dst 1 条） ----
+    let fib = Fib::compute(&lsdb, &id_a, &computer, 1);
+    if fib.generation() != 1 {
+        return Err(fail("fib generation != 1"));
+    }
+    let check_via = |vip: &str, expect_peer: &PeerId| -> Result<(), NexusError> {
+        let hops = fib.lookup(vip).ok_or_else(|| fail("fib missing dst"))?;
+        if hops.len() != 1 {
+            return Err(fail("fib entry should be vec_single"));
+        }
+        if hops[0].peer != *expect_peer || hops[0].weight != 1 || hops[0].path_id != 0 {
+            return Err(fail("fib next_hop wrong"));
+        }
+        Ok(())
+    };
+    check_via("10.99.0.2", &id_b)?;
+    check_via("10.99.0.3", &id_b)?;
+    check_via("10.99.0.4", &id_b)?;
+    // 本端无条目；未知 VIP 无条目。
+    if fib.lookup("10.99.0.1").is_some() || fib.lookup("10.99.9.9").is_some() {
+        return Err(fail("fib should not contain self/unknown"));
+    }
+    events.push("fib_shape_ok");
+
+    // ---- 阶段 4：代际原子替换（重算 → 新 generation；旧 FIB 不变） ----
+    let fib2 = Fib::compute(&lsdb, &id_a, &computer, 2);
+    if fib2.generation() != 2 || fib.generation() != 1 {
+        return Err(fail("generation not bumped atomically"));
+    }
+    // 旧 FIB 内容不受影响（整体替换，非原地修改）。
+    check_via("10.99.0.4", &id_b)?;
+    events.push("generation_bumped");
+
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "fib": {
+            "a_to_c_via": "node-b",
+            "a_to_d_via": "node-b",
+            "entry_shape": "vec_single",
+        },
+        "generation": fib2.generation(),
+    }))
+}
