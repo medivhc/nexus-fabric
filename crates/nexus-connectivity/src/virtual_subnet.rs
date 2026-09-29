@@ -643,8 +643,9 @@ impl VirtualSubnetTunnel {
         self.egress_peer_vips.clone()
     }
 
-    /// 统一转发决策（P2-5 §12.14）：① 直连 peer → ② 精确 routes → ③ 最长前缀
-    /// prefix_routes → ④ 出口节点（egress 顺序第一个）→ ⑤ `NO_ROUTE_TO_DST`。
+    /// 统一转发决策（P2-5 §12.14，§12.56 扩展）：① 直连 peer → ② FIB
+    /// （`fib_resolver`，动态发现）→ ③ 精确 routes → ④ 最长前缀
+    /// prefix_routes → ⑤ 出口节点（egress 顺序第一个）→ ⑥ `NO_ROUTE_TO_DST`。
     fn resolve_next_hop(
         &self,
         dst: &str,

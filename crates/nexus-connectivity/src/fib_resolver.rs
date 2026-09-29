@@ -53,17 +53,11 @@ impl FlowKeyView {
 
         let header_len = ihl * 4;
         let (src_port, dst_port) = match protocol {
-            6 | 17 => {
-                // TCP/UDP：端口在传输头前 4 字节。
-                if packet.len() >= header_len + 4 {
-                    (
-                        u16::from_be_bytes(packet[header_len..header_len + 2].try_into().ok()?),
-                        u16::from_be_bytes(packet[header_len + 2..header_len + 4].try_into().ok()?),
-                    )
-                } else {
-                    (0, 0)
-                }
-            }
+            // TCP/UDP：端口在传输头前 4 字节；包太短时端口回退为 0。
+            6 | 17 if packet.len() >= header_len + 4 => (
+                u16::from_be_bytes(packet[header_len..header_len + 2].try_into().ok()?),
+                u16::from_be_bytes(packet[header_len + 2..header_len + 4].try_into().ok()?),
+            ),
             _ => (0, 0),
         };
         Some(Self {
@@ -155,6 +149,36 @@ mod tests {
     #[test]
     fn parse_rejects_short() {
         assert!(FlowKeyView::parse_ipv4(&[0u8; 10]).is_none());
+    }
+
+    #[test]
+    fn parse_with_ip_options() {
+        // IHL=6（24 字节头，4 字节选项）：端口偏移应跳过选项。
+        let mut pkt = vec![0u8; 28];
+        pkt[0] = 0x46; // IPv4, IHL=6
+        pkt[9] = 6; // TCP
+        pkt[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        pkt[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        // 选项 4 字节（20..24），端口在 24..28。
+        pkt[24..26].copy_from_slice(&8080u16.to_be_bytes());
+        pkt[26..28].copy_from_slice(&80u16.to_be_bytes());
+        let fk = FlowKeyView::parse_ipv4(&pkt).unwrap();
+        assert_eq!(fk.src_port, 8080);
+        assert_eq!(fk.dst_port, 80);
+    }
+
+    #[test]
+    fn parse_truncated_transport_ports_fallback() {
+        // TCP 但包在传输头处截断：端口回退为 0，仍返回 Some。
+        let mut pkt = vec![0u8; 20];
+        pkt[0] = 0x45;
+        pkt[9] = 6; // TCP
+        pkt[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        pkt[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        let fk = FlowKeyView::parse_ipv4(&pkt).unwrap();
+        assert_eq!(fk.src_port, 0);
+        assert_eq!(fk.dst_port, 0);
+        assert_eq!(fk.protocol, 6);
     }
 
     #[test]

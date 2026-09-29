@@ -10138,8 +10138,9 @@ pub fn disjoint_flow() -> Result<Value, NexusError> {
 /// E4 产品场景 `product.fib-forwarding` 的可执行驱动（PRODUCT §12.56）。
 ///
 /// 拓扑：A(10.99.0.1)-B(10.99.0.2)-C(10.99.0.3)，A 与 C 无直连。
-/// A 的 VirtualSubnet 装配 DiscoveryFibResolver（Shortest 策略），
-/// 发送 IP 包到 C，验证经 FIB 选出下一跳 B。
+/// 验证 `DiscoveryFibResolver`（Shortest 策略）对发往 C 的 IP 包选出下一跳 B。
+/// 注：本 E4 验证 resolver 逻辑；`VirtualSubnet::set_fib_resolver` 的完整
+/// 收发集成由 `VirtualSubnet` 单测覆盖（resolver 为 `NoFib` 时回退静态路由）。
 pub fn fib_forwarding_flow() -> Result<Value, NexusError> {
     use nexus_connectivity::fib_resolver::{FibResolver, FlowKeyView};
     use nexus_discovery::PeerId;

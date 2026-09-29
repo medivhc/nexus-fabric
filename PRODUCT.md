@@ -2904,7 +2904,8 @@ LSDB/LSA/泛洪协议零改动（设计文档既定映射）。
 - `VirtualSubnet` 新增 `fib_resolver: Option<Arc<dyn FibResolver>>`；
   `resolve_next_hop` 优先级：直连 peer > FIB > 静态 routes > 前缀 > 出口。
 - `apps/nexus` 实现 `DiscoveryFibResolver`：
-  `SharedFibManager` + `PeerId→VIP` 映射（随 LSDB 指纹同步更新）+
+  `SharedFibManager` + `PeerId→VIP` 映射（`sync_peer_map` 手动同步；
+  LSDB 变化后调用方负责同步，映射陈旧时 resolve 返回 None 回退静态路由）+
   加权流哈希选择（复用 §12.52 语义，经 discovery `Fib::select_next_hop`）。
 **非目标**：IPv6 流解析（仅 IPv4）；真实 TUN 数据面（已有 §11.18）。
 **E4**：`scenarios/product/fib_forwarding.toml`
