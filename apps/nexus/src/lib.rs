@@ -8128,3 +8128,148 @@ pub fn psk_handshake_admission_flow() -> Result<Value, NexusError> {
         "absent": { "error": absent_err },
     }))
 }
+
+/// E4 `product.decentralized-join-config`（PRODUCT §12.43）的可执行驱动。
+///
+/// ```text
+/// derive_vip 确定性（同公钥同 CIDR -> 同 VIP）
+///   -> 派生 VIP 在 CIDR 内
+///   -> nonce 递增 -> 不同 VIP
+///   -> 有 bootstrap 无 PSK -> PSK_REQUIRED 错误（fail-closed）
+///   -> 有 bootstrap 有 PSK -> 通过
+///   -> legacy 配置（无 bootstrap 无 PSK）-> 通过（行为不变）
+/// ```
+///
+/// 全程零真实网络；错误一律 typed `Result`，无 panic。
+pub fn decentralized_join_config_flow() -> Result<Value, NexusError> {
+    use nexus_connectivity::coord::derive_vip;
+    use nexus_connectivity::encryption::KeyPair;
+
+    let mut events: Vec<&'static str> = Vec::new();
+
+    // 1) 确定性：同公钥 + 同 CIDR + nonce=0 -> 同 VIP。
+    let kp = KeyPair::generate().map_err(enc_err)?;
+    let pubkey = *kp.public_key_bytes();
+    let vip_a = derive_vip(&pubkey, "10.99.0.0/24", 0).map_err(|e| NexusError::Internal {
+        message: format!("derive_vip: {e:?}"),
+    })?;
+    let vip_b = derive_vip(&pubkey, "10.99.0.0/24", 0).map_err(|e| NexusError::Internal {
+        message: format!("derive_vip: {e:?}"),
+    })?;
+    if vip_a != vip_b {
+        return Err(NexusError::Internal {
+            message: "decentralized join: derive_vip not deterministic".to_string(),
+        });
+    }
+    events.push("vip_derived_deterministic");
+
+    // 2) 派生 VIP 在 CIDR 内（10.99.0.0/24，跳过 .0 和 .255）。
+    let octets = vip_a.octets();
+    if octets[0] != 10 || octets[1] != 99 || octets[2] != 0 || octets[3] == 0 || octets[3] == 255 {
+        return Err(NexusError::Internal {
+            message: format!("decentralized join: derived VIP {vip_a} outside cidr"),
+        });
+    }
+    events.push("vip_in_cidr");
+
+    // 3) nonce 递增 -> 不同 VIP（冲突重派机制的基础）。
+    let vip_c = derive_vip(&pubkey, "10.99.0.0/24", 1).map_err(|e| NexusError::Internal {
+        message: format!("derive_vip: {e:?}"),
+    })?;
+    if vip_c == vip_a {
+        return Err(NexusError::Internal {
+            message: "decentralized join: nonce increment did not change VIP".to_string(),
+        });
+    }
+    events.push("vip_nonce_changes");
+
+    // 4-6) 配置层：写 TOML，走 subnet_up 验证 fail-closed 与兼容性。
+    use crate::subnet_cli::subnet_up;
+    use std::path::PathBuf;
+
+    fn write_cfg(dir: &std::path::Path, name: &str, text: &str) -> Result<PathBuf, NexusError> {
+        let p = dir.join(name);
+        std::fs::write(&p, text).map_err(|e| NexusError::Internal {
+            message: format!("write test config: {e}"),
+        })?;
+        Ok(p)
+    }
+
+    let dir = std::env::temp_dir().join(format!("nexus-join-cfg-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| NexusError::Internal {
+        message: e.to_string(),
+    })?;
+    let state = dir.join("state.json");
+
+    // 4) 有 bootstrap 无 PSK -> PSK_REQUIRED（fail-closed）。
+    let cfg_no_psk = write_cfg(
+        &dir,
+        "bootstrap-no-psk.toml",
+        r#"[subnet]
+cidr = "10.99.0.0/24"
+encryption = true
+
+[[subnet.bootstrap]]
+address = "udp://203.0.113.10:11010"
+"#,
+    )?;
+    let psk_required_err = match subnet_up(&cfg_no_psk, &state, false) {
+        Err(e) if e.contains("PSK_REQUIRED") => "PSK_REQUIRED",
+        Err(e) => {
+            return Err(NexusError::Internal {
+                message: format!("decentralized join: expected PSK_REQUIRED, got {e}"),
+            });
+        }
+        Ok(_) => {
+            return Err(NexusError::Internal {
+                message: "decentralized join: bootstrap without PSK was not rejected".to_string(),
+            });
+        }
+    };
+    events.push("bootstrap_psk_required");
+
+    // 5) 有 bootstrap 有 PSK -> 通过。
+    let cfg_psk = write_cfg(
+        &dir,
+        "bootstrap-psk.toml",
+        r#"[subnet]
+cidr = "10.99.0.0/24"
+virtual_ip = "10.99.0.5"
+encryption = true
+network_psk = "test-psk-001"
+
+[[subnet.bootstrap]]
+address = "udp://203.0.113.10:11010"
+"#,
+    )?;
+    subnet_up(&cfg_psk, &state, false).map_err(|e| NexusError::Internal {
+        message: format!("decentralized join: bootstrap+psk rejected: {e}"),
+    })?;
+    events.push("bootstrap_psk_ok");
+
+    // 6) legacy 配置（无 bootstrap 无 PSK）-> 通过（行为不变）。
+    let cfg_legacy = write_cfg(
+        &dir,
+        "legacy.toml",
+        r#"[subnet]
+cidr = "10.99.0.0/24"
+virtual_ip = "10.99.0.1"
+encryption = true
+
+[[subnet.peers]]
+virtual_ip = "10.99.0.2"
+locator = "udp://127.0.0.1:42001"
+"#,
+    )?;
+    subnet_up(&cfg_legacy, &state, false).map_err(|e| NexusError::Internal {
+        message: format!("decentralized join: legacy config rejected: {e}"),
+    })?;
+    events.push("legacy_config_unchanged");
+
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "psk_required": { "error": psk_required_err },
+        "derived_vip": vip_a.to_string(),
+    }))
+}

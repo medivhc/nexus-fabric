@@ -1,0 +1,53 @@
+schema_version = 1
+id = "product.decentralized-join-config"
+title = "去中心化组网配置层：确定性 VIP 派生 + PSK 装配 + bootstrap 列表"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-decentralized-join-config"
+
+[given]
+vip_derivation = "fnv1a64(static_public || nonce_be64) mod usable_count, skip network/broadcast"
+psk_fail_closed = "bootstrap non-empty without PSK -> PSK_REQUIRED; legacy config unchanged"
+bootstrap = "[[bootstrap]] address list, udp://host:port"
+
+# 可执行 E4：纯内存配置解析 + 派生，零真实网络
+# 事件序列（冻结）：
+#   vip_derived_deterministic  同公钥同 CIDR -> 同 VIP（nonce=0）
+#   vip_in_cidr                派生 VIP 在 CIDR 内
+#   vip_nonce_changes          nonce 递增 -> 不同 VIP
+#   bootstrap_psk_required     有 bootstrap 无 PSK -> PSK_REQUIRED 错误
+#   bootstrap_psk_ok           有 bootstrap 有 PSK -> 通过
+#   legacy_config_unchanged    无 bootstrap 无 PSK 的 legacy 配置 -> 通过
+[when]
+command = "cargo run --quiet -p nexus --example decentralized_join_config -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "events.0"
+equals = "vip_derived_deterministic"
+
+[[expect]]
+field = "events.1"
+equals = "vip_in_cidr"
+
+[[expect]]
+field = "events.2"
+equals = "vip_nonce_changes"
+
+[[expect]]
+field = "events.3"
+equals = "bootstrap_psk_required"
+
+[[expect]]
+field = "events.4"
+equals = "bootstrap_psk_ok"
+
+[[expect]]
+field = "events.5"
+equals = "legacy_config_unchanged"
+
+[[expect]]
+field = "psk_required.error"
+equals = "PSK_REQUIRED"

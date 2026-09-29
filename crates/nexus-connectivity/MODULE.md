@@ -269,6 +269,15 @@ NAT/中继场景的物理建连（组合根 transport::connect）发生在激活
 - 失败语义：全部 `Result + CoordError`（PeerUnknown / PeerExpired /
   AddressInUse / NoAddressAvailable / InvalidCidr / InvalidFrame），无 panic。
 
+### 冻结契约（确定性 VIP 派生 P5，PRODUCT §12.43，scenarios/product/decentralized_join_config.toml）
+
+- `derive_vip(&[u8; 32], cidr: &str, nonce: u64) -> Result<Ipv4Addr, CoordError>`：
+  FNV-1a 64（`static_public ∥ nonce_be64`）→ `network + 1 + (h mod usable)`，
+  跳过网络/广播地址；同输入 → 同输出；nonce 递增 → 不同输出（冲突重派基础）。
+  IPv4 only（与 `CidrInfo` 一致）；CIDR 非法 → `InvalidCidr`；零 I/O portable。
+- Deletion Test：确定性派生是去中心化寻址的独立变化维度（替代中心分配器），
+  与 `VirtualIpAllocator` 正交；无新 trait。
+
 ### 冻结契约（RelayChannel 中继通道 P0，scenarios/product/relay_fallback.toml）
 
 - `RelayConfig { relay_server, peer_id }`：领域中立中继配置（服务器 locator + 对端 peer 标识）；

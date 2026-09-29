@@ -2352,6 +2352,45 @@ crate 内 policy 逻辑保持零真实 socket；真实 TCP / 线程定时器 / �
 - 冻结边界（本项不做）：PSK 在线轮换协议、Ed25519 身份签名、CLI/TOML 装配与
   fail-closed（Phase 1）、`virtual_subnet.rs` 握手路径的 PSK 穿透（Phase 1）。
 
+### 12.43 P5 去中心化组网配置层：确定性 VIP + PSK 装配 + bootstrap 列表（2026-09-29）{#12-decentralized-join-config}
+
+接 §12.42（PSK 网络准入的 crypto 机制）。本项交付去中心化组网的**配置层**：
+节点只需 CIDR + PSK + bootstrap 列表即可入网，不再手写全网静态 peer 列表。
+网络协议（Hello/Welcome、LSA 泛洪/LSDB）为后续 feature，本项只做配置与派生。
+
+- **确定性 VIP 派生**：`derive_vip(static_public, cidr, nonce)`（`nexus-connectivity`，
+  portable core，零 I/O）：
+  `h = fnv1a64(static_public ∥ nonce_be64)`，`vip = network + 1 + (h mod usable)`，
+  其中 `usable = 2^host_bits - 2`，跳过网络地址与广播地址。
+  同一公钥 + CIDR + nonce → 同一 VIP；nonce 递增用于冲突重派（冲突解决协议为后续
+  feature，本项只交付派生函数）。
+  注：`subnet up` 的 E4/mock 路径用临时身份派生（同一节点每次运行 VIP 不同）；
+  生产 daemon 必须用 §12.39 持久身份（secure-store），见后续 feature。
+- **配置变更**（`apps/nexus/src/subnet_cli.rs`，`[subnet]` 段）：
+  - `virtual_ip` 改为可选；缺省 → 从本端身份公钥（§12.39 `IdentityKeyPair`）确定性派生；
+    显式填写 → 手动覆盖（兼容既有部署，覆盖优先于派生）。
+  - 新增 `network_psk`（内联字符串，按 UTF-8 字节；二进制 PSK 请用文件方式）
+    / `network_psk_file`（文件路径），二者互斥；
+    `network_psk_file` 要求 Unix 权限 0600（过松则拒绝启动）。
+  - 新增 `[[subnet.bootstrap]]` 列表：`{ address = "udp://host:port", name? }`（name 仅日志用）。
+- **fail-closed 边界**（不破坏既有契约）：
+  - `[[bootstrap]]` 非空 **且** 未配置 PSK → `subnet up` 拒绝启动，
+    结构化错误 `PSK_REQUIRED`（exit 0，CONFIG_ERROR 语义）。
+  - 既有 legacy 配置（`virtual_ip` + `[[subnet.peers]]`，无 bootstrap、无 PSK）
+    **行为不变**（`product.cli-subnet` 场景 Protected）——fail-closed 仅作用于新路径。
+  - `network_psk` 与 `network_psk_file` 同时设置 → `PSK_CONFLICT` 错误。
+- **IPv4 范围**：本项 `derive_vip` 与既有 `cidr.rs` 一致，仅支持 IPv4；
+  IPv6 派生为冻结边界（后续 feature）。
+- E4 场景 `decentralized_join_config.toml`（id=`product.decentralized-join-config`，
+  example `decentralized_join_config --json`，零真实网络）：断言
+  `vip_derived_deterministic`（同公钥同 CIDR → 同 VIP）、`vip_in_cidr`、
+  `vip_nonce_changes`（nonce 递增 → 不同 VIP）、`bootstrap_psk_required`
+ （有 bootstrap 无 PSK → `PSK_REQUIRED`）、`bootstrap_psk_ok`（有 PSK → 通过）、
+  `legacy_config_unchanged`（无 bootstrap 无 PSK 的 legacy 配置 → 通过）
+  与 `verdict=PASS`。
+- 冻结边界（本项不做）：Hello/Welcome 入网协议、LSA 泛洪/LSDB、VIP 冲突解决协议、
+  IPv6、PSK 在线轮换。
+
 ## 13. Windows 系统代理接管与常驻自启（system-proxy + autostart，2026-09-24）{#13-system-proxy}
 
 桌面/Windows 场景下，nexusd 作为本地入口把系统 WinINET 代理指向本地数据面，
