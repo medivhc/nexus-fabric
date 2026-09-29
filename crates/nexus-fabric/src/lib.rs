@@ -54,6 +54,7 @@ impl Default for ConnConfig {
 /// the repository is tokio-free).
 ///
 /// Contract stage: not implemented.
+#[derive(Debug)]
 pub struct FabricConn {
     peer: PeerId,
     id: ConnectionId,
