@@ -223,3 +223,9 @@ name = "nexus-fabric"
 allowed_internal_dependencies = []
 portable = false
 layer = "delivery"
+
+[[crate]]
+name = "nexus-path"
+allowed_internal_dependencies = []
+portable = false
+layer = "delivery"
