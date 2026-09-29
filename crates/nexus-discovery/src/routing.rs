@@ -1242,6 +1242,63 @@ impl<C: PathComputer> FibManager<C> {
     }
 }
 
+/// 线程共享的 FIB 管理器（§12.54）。
+///
+/// `Arc<RwLock<FibManager<C>>>` 包装：多线程并发读 FIB，独占写触发重算。
+/// 仅用 `std::sync`，保持 portable core（无第三方依赖）。
+///
+/// `Send + Sync` 要求：`C: Send + Sync`（`RwLock` 传递）。
+#[derive(Debug)]
+pub struct SharedFibManager<C: PathComputer> {
+    inner: std::sync::Arc<std::sync::RwLock<FibManager<C>>>,
+}
+
+impl<C: PathComputer + Send + Sync> SharedFibManager<C> {
+    /// 创建并初始计算 FIB（generation=1）。
+    #[must_use]
+    pub fn new(self_id: PeerId, computer: C, lsdb: &Lsdb) -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::RwLock::new(FibManager::new(
+                self_id, computer, lsdb,
+            ))),
+        }
+    }
+
+    /// 并发读：返回读 guard（多线程可同时持有）。
+    ///
+    /// # Panics
+    ///
+    /// 锁中毒时 panic（持有写 guard 的线程 panic 导致；正常流程不应发生）。
+    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, FibManager<C>> {
+        self.inner.read().expect("fib rwlock poisoned")
+    }
+
+    /// 独占写：LSDB 指纹变化时重算 FIB，返回是否重算。
+    ///
+    /// # Panics
+    ///
+    /// 锁中毒时 panic（同 `read`）。
+    ///
+    /// # Deadlock
+    ///
+    /// `std::sync::RwLock` 不可重入：持有 `read()` guard 的同线程
+    /// 调用本方法会永久死锁。先 drop 读 guard 再调用。
+    pub fn maybe_recompute(&self, lsdb: &Lsdb) -> bool {
+        self.inner
+            .write()
+            .expect("fib rwlock poisoned")
+            .maybe_recompute(lsdb)
+    }
+}
+
+impl<C: PathComputer> Clone for SharedFibManager<C> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: std::sync::Arc::clone(&self.inner),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1796,6 +1853,53 @@ mod tests {
         // 再次无变化 → false。
         assert!(!mgr.maybe_recompute(&db2));
         assert_eq!(mgr.generation(), 2);
+    }
+
+    #[test]
+    fn shared_fib_manager_concurrent_read() {
+        // 多线程并发读：8 线程 × 100 次读，无 panic、无数据竞争。
+        let (db, a, _, _, _) = diamond_lsdb();
+        let shared = SharedFibManager::new(a.clone(), Ecmp::new(), &db);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let s = shared.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..100 {
+                    let guard = s.read();
+                    assert!(guard.fib().lookup("10.0.0.4").is_some());
+                    assert_eq!(guard.generation(), 1);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("reader thread panicked");
+        }
+    }
+
+    #[test]
+    fn shared_fib_manager_write_triggers_recompute() {
+        // 写线程触发重算，读线程看到新 generation。
+        let (db, a, _, _, _) = diamond_lsdb();
+        let shared = SharedFibManager::new(a.clone(), Ecmp::new(), &db);
+        assert_eq!(shared.read().generation(), 1);
+
+        let mut db2 = db;
+        db2.update(lsa("e", "10.0.0.5", vec![link("d", 10)]));
+        db2.update(Lsa {
+            node_id: peer("d"),
+            vip: "10.0.0.4".to_string(),
+            incarnation: 1,
+            seq: 2,
+            capabilities: 0,
+            locator: None,
+            neighbors: vec![link("b", 10), link("c", 10), link("e", 10)],
+        });
+
+        let s = shared.clone();
+        let writer = std::thread::spawn(move || s.maybe_recompute(&db2));
+        assert!(writer.join().expect("writer panicked"));
+        assert_eq!(shared.read().generation(), 2);
+        assert!(shared.read().fib().lookup("10.0.0.5").is_some());
     }
 
     #[test]

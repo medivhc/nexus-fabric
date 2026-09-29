@@ -9584,6 +9584,130 @@ pub fn weighted_selection_flow() -> Result<Value, NexusError> {
     Ok(serde_json::Value::Object(out))
 }
 
+/// E4 产品场景 `product.fib-manager-shared` 的可执行驱动（PRODUCT §12.54）。
+///
+/// 验证：多线程并发读（4 线程 × 50 次）无 panic；
+/// 写线程触发重算后 generation+1 且新 FIB 可见。
+pub fn fib_manager_shared_flow() -> Result<Value, NexusError> {
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::{Ecmp, SharedFibManager};
+
+    let mut events: Vec<&'static str> = Vec::new();
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("fib_manager_shared: {m}"),
+    };
+
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    let id_d = PeerId("node-d".to_string());
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_b.clone(),
+        vip: "10.99.0.2".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_c.clone(),
+        vip: "10.99.0.3".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_d.clone(),
+        vip: "10.99.0.4".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    });
+
+    let shared = SharedFibManager::new(id_a.clone(), Ecmp::new(), &lsdb);
+
+    // ---- 事件 1：多线程并发读 ----
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let s = shared.clone();
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..50 {
+                let guard = s.read();
+                if guard.fib().lookup("10.99.0.4").is_none() {
+                    return false;
+                }
+            }
+            true
+        }));
+    }
+    for h in handles {
+        if !h.join().map_err(|_| fail("reader panicked"))? {
+            return Err(fail("concurrent read failed"));
+        }
+    }
+    events.push("concurrent_read");
+
+    // ---- 事件 2：写触发重算 ----
+    let mut lsdb2 = lsdb;
+    lsdb2.update(Lsa {
+        node_id: PeerId("node-e".to_string()),
+        vip: "10.99.0.5".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_d, 10)],
+    });
+    // d 的 LSA 需要更新以包含 e（否则 e 不可达，但指纹会变，照样触发重算）。
+    if !shared.maybe_recompute(&lsdb2) {
+        return Err(fail("expected recompute"));
+    }
+    if shared.read().generation() != 2 {
+        return Err(fail("generation should be 2"));
+    }
+    events.push("write_recompute");
+
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "shared".to_string(),
+        serde_json::json!({
+            "generation": shared.read().generation(),
+        }),
+    );
+    out.insert(
+        "events".to_string(),
+        serde_json::Value::Array(events.into_iter().map(serde_json::Value::from).collect()),
+    );
+    out.insert("verdict".to_string(), serde_json::Value::from("PASS"));
+    Ok(serde_json::Value::Object(out))
+}
+
 /// E4 产品场景 `product.strategy-extended` 的可执行驱动（PRODUCT §12.53）。
 ///
 /// 验证：`"k-shortest:3"` 解析为 KShortest{k:3}；

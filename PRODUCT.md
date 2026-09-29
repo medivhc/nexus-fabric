@@ -2856,3 +2856,20 @@ LSDB/LSA/泛洪协议零改动（设计文档既定映射）。
 （`id=product.strategy-extended`），解析 + 装配 + 算路验证。
 **冻结边界**：策略热切换（后续）；真实转发面挂接（后续）。
 **契约 hash**：`37f092680ee72cc69f41a47a797b2333f50a02b646a468198a983a01405a218b`（verify 时写入）。
+
+### §12.54 P5 去中心化选路：FibManager 多线程共享
+
+**状态**：候选。
+**范围**：`SharedFibManager<C>` 包装 `Arc<RwLock<FibManager<C>>>`，
+支持多线程并发读 + 独占写触发重算。
+**设计**：
+- `SharedFibManager::new(self_id, computer, lsdb)` 创建；`clone()` 共享所有权。
+- `read()` 返回 `RwLockReadGuard`（并发读 FIB）。
+- `maybe_recompute()` 需写锁（独占）。
+- 仅用 `std::sync`，保持 portable core（无第三方依赖）。
+- `C: PathComputer` 需 `Send + Sync`（`RwLock` 要求）。
+**非目标**：异步接口；真实转发面挂接。
+**E4**：`scenarios/product/fib_manager_shared.toml`
+（`id=product.fib-manager-shared`），多线程并发读 + 写触发重算。
+**冻结边界**：真实转发面挂接（后续）。
+**契约 hash**：`9c95b8a3a4bb273c04b1cc85da148f79cd3d917ca1915348b003bab0f35dad34`（verify 时写入）。
