@@ -298,50 +298,33 @@ mod tests {
 #[cfg(test)]
 mod dbg_tests {
     use super::*;
+    fn dump(d: &[u8], mut p: usize, end: usize, depth: usize, out: &mut Vec<String>) {
+        while p < end {
+            if p + 2 > d.len() { out.push(format!("{:depth$}TRUNC", "", depth=depth*2)); break; }
+            let tag = d[p];
+            let (len, hlen) = if d[p+1] & 0x80 == 0 { (d[p+1] as usize, 2) }
+                else {
+                    let n = (d[p+1] & 0x7f) as usize;
+                    if n > 4 || p+2+n > d.len() { out.push(format!("{:depth$}BADLEN", "", depth=depth*2)); break; }
+                    let mut v = 0usize;
+                    for j in 0..n { v = (v << 8) | d[p+2+j] as usize; }
+                    (v, 2+n)
+                };
+            out.push(format!("{:depth$}tag {:02x} len {}", "", tag, len, depth=depth*2));
+            if tag == 0x30 && depth < 4 {
+                dump(d, p+hlen, p+hlen+len, depth+1, out);
+            }
+            p += hlen + len;
+        }
+    }
     #[test]
     fn dbg_cert_walk() {
         let id = generate_identity().expect("keygen");
         let r = cert_spki_ed25519_raw(&id.cert_der);
-        println!("walk result: {:?}", r.as_ref().map(|_| "ok").map_err(|e| e.clone()));
-        // dump first-level structure
-        let d = &id.cert_der;
-        let mut p = 0;
-        p += 1; // seq tag
-        let (mut len, mut hlen) = (0usize, 1usize);
-        if d[1] & 0x80 == 0 { len = d[1] as usize; hlen = 2; }
-        else { let n = (d[1] & 0x7f) as usize; for i in 0..n { len = (len << 8) | d[2+i] as usize; } hlen = 2 + n; }
-        p = hlen;
-        println!("outer seq len {len}");
-        for i in 0..3 {
-            if p >= d.len() { break; }
-            let tag = d[p];
-            let (l, h) = if d[p+1] & 0x80 == 0 { (d[p+1] as usize, 2) } else {
-                let n = (d[p+1] & 0x7f) as usize;
-                let mut v = 0usize;
-                for j in 0..n { v = (v << 8) | d[p+2+j] as usize; }
-                (v, 2+n)
-            };
-            println!("elem {i}: tag {tag:02x} len {l}");
-            p += h + l;
-        }
-        // tbs walk
-        let mut tbs_pos = hlen;
-        // skip outer seq header already; tbs is first elem: find its content start
-        let (tl, th) = if d[tbs_pos+1] & 0x80 == 0 { (d[tbs_pos+1] as usize, 2) } else { (0,0) };
-        println!("tbs: tag {:02x} len {tl}", d[tbs_pos]);
-        let mut q = tbs_pos + th;
-        for i in 0..8 {
-            if q >= d.len() { break; }
-            let tag = d[q];
-            let (l, h) = if d[q+1] & 0x80 == 0 { (d[q+1] as usize, 2) } else {
-                let n = (d[q+1] & 0x7f) as usize;
-                let mut v = 0usize;
-                for j in 0..n { v = (v << 8) | d[q+2+j] as usize; }
-                (v, 2+n)
-            };
-            println!("tbs elem {i}: tag {tag:02x} len {l}");
-            q += h + l;
-        }
+        let mut out = Vec::new();
+        out.push(format!("walk: {}", r.is_ok()));
+        dump(&id.cert_der, 0, id.cert_der.len(), 0, &mut out);
+        println!("{}", out.join("\n"));
         panic!("dump done");
     }
 }
