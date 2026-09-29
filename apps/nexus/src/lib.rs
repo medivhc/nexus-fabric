@@ -8814,3 +8814,187 @@ pub fn ecmp_flow() -> Result<Value, NexusError> {
         },
     }))
 }
+
+/// E4 产品场景 `product.flow-hash` 的可执行驱动（PRODUCT §12.47）。
+///
+/// 菱形拓扑（同 ecmp_flow）：A→D 有 2 条 20ms 等代价路径，FIB 持有 2 条 NextHop。
+/// 验证按流哈希选择下一跳：同流恒定、异流分散、单路径稳定、未知 VIP 为 None。
+pub fn flow_hash_selection() -> Result<Value, NexusError> {
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::{Ecmp, Fib, FlowKey};
+
+    let mut events: Vec<&'static str> = Vec::new();
+
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    let id_d = PeerId("node-d".to_string());
+
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+
+    // 菱形拓扑（链路对称），VIP 段与 ecmp_flow 一致。
+    let lsa_a = Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    };
+    let lsa_b = Lsa {
+        node_id: id_b.clone(),
+        vip: "10.99.0.2".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    };
+    let lsa_c = Lsa {
+        node_id: id_c.clone(),
+        vip: "10.99.0.3".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    };
+    let lsa_d = Lsa {
+        node_id: id_d.clone(),
+        vip: "10.99.0.4".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    };
+
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(lsa_a);
+    lsdb.update(lsa_b);
+    lsdb.update(lsa_c);
+    lsdb.update(lsa_d);
+
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("flow_hash: {m}"),
+    };
+    let parse_ip = |s: &str| -> Result<std::net::IpAddr, NexusError> {
+        s.parse().map_err(|_| fail("bad test ip literal"))
+    };
+
+    // ---- 前置：A→D FIB 有 2 条 NextHop（B 和 C）----
+    let fib = Fib::compute(&lsdb, &id_a, &Ecmp::new(), 1);
+    let hops_d = fib
+        .lookup("10.99.0.4")
+        .ok_or_else(|| fail("fib missing D"))?;
+    if hops_d.len() != 2 {
+        return Err(fail("FIB A->D should have 2 next hops"));
+    }
+
+    // ---- 阶段 1：同流恒定（同一 FlowKey 选 100 次，结果恒定）----
+    let flow = FlowKey {
+        src_ip: parse_ip("10.99.0.1")?,
+        dst_ip: parse_ip("10.99.0.4")?,
+        src_port: 12345,
+        dst_port: 80,
+        protocol: 6,
+    };
+    let first = fib
+        .select_next_hop("10.99.0.4", &flow)
+        .ok_or_else(|| fail("select should hit"))?;
+    for _ in 0..99 {
+        let hop = fib
+            .select_next_hop("10.99.0.4", &flow)
+            .ok_or_else(|| fail("select should hit"))?;
+        if hop != first {
+            return Err(fail("same flow must select same next hop"));
+        }
+    }
+    events.push("flow_stable");
+
+    // ---- 阶段 2：异流分散（1000 个不同流，每条下一跳 ≥ 30%）----
+    let mut count_b = 0u32;
+    let mut count_c = 0u32;
+    for i in 0..1000u32 {
+        let f = FlowKey {
+            src_ip: parse_ip("10.99.0.1")?,
+            dst_ip: parse_ip("10.99.0.4")?,
+            // 端口递增构造不同流（src_port 循环 + dst_port 递增，避免 u16 溢出）。
+            src_port: (10000 + (i % 5000)) as u16,
+            dst_port: (80 + (i / 5000)) as u16,
+            protocol: 6,
+        };
+        let hop = fib
+            .select_next_hop("10.99.0.4", &f)
+            .ok_or_else(|| fail("select should hit"))?;
+        if hop.peer == id_b {
+            count_b += 1;
+        } else if hop.peer == id_c {
+            count_c += 1;
+        } else {
+            return Err(fail("unexpected next hop peer"));
+        }
+    }
+    if count_b + count_c != 1000 {
+        return Err(fail("flow count mismatch"));
+    }
+    // 每条 ≥ 30%：哈希分散性门限（FNV-1a 在 1000 样本下远高于此）。
+    if count_b < 300 || count_c < 300 {
+        return Err(fail(&format!(
+            "flows should spread across next hops (b={count_b}, c={count_c})"
+        )));
+    }
+    events.push("flows_spread");
+
+    // ---- 阶段 3：单路径稳定（A→B 只有 1 条下一跳，恒返回该条）----
+    let hops_b = fib
+        .lookup("10.99.0.2")
+        .ok_or_else(|| fail("fib missing B"))?;
+    if hops_b.len() != 1 {
+        return Err(fail("A->B should have single next hop"));
+    }
+    for i in 0..50u32 {
+        let f = FlowKey {
+            src_ip: parse_ip("10.99.0.1")?,
+            dst_ip: parse_ip("10.99.0.2")?,
+            src_port: (20000 + i) as u16,
+            dst_port: 443,
+            protocol: 6,
+        };
+        let hop = fib
+            .select_next_hop("10.99.0.2", &f)
+            .ok_or_else(|| fail("select should hit"))?;
+        if hop.peer != id_b {
+            return Err(fail("single next hop must be B"));
+        }
+    }
+    events.push("single_path_stable");
+
+    // ---- 阶段 4：未知 VIP 返回 None ----
+    if fib.select_next_hop("10.99.9.9", &flow).is_some() {
+        return Err(fail("unknown VIP should return None"));
+    }
+    events.push("unknown_vip_none");
+
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "selection": {
+            "a_to_d_next_hops": hops_d.len(),
+            "flow_stable_rounds": 100,
+            "spread_b": count_b,
+            "spread_c": count_c,
+        },
+    }))
+}

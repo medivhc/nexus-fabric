@@ -380,6 +380,58 @@ pub struct NextHop {
     pub path_id: u32,
 }
 
+/// 流标识（5 元组）：按流哈希选择下一跳的输入。
+///
+/// `protocol` 为 IP 协议号（6=TCP，17=UDP）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FlowKey {
+    /// 源 IP。
+    pub src_ip: std::net::IpAddr,
+    /// 目的 IP。
+    pub dst_ip: std::net::IpAddr,
+    /// 源端口。
+    pub src_port: u16,
+    /// 目的端口。
+    pub dst_port: u16,
+    /// IP 协议号。
+    pub protocol: u8,
+}
+
+impl FlowKey {
+    /// FNV-1a 64 流哈希（portable core 手写，零依赖）。
+    ///
+    /// 输入为 5 元组字段的确定性字节序：IP 按 16 字节展开（IPv4 用
+    /// `::ffff:` 映射形式），端口 BE，协议号占单字节。跨平台、跨运行、跨节点
+    /// 结果一致——FIB 条目按 peer 排序后，`hash % n` 的索引在各节点相同。
+    #[must_use]
+    pub fn hash(&self) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+        let mut h = FNV_OFFSET;
+        // IP 统一按 16 字节展开：IPv4 用 ::ffff:a.b.c.d 映射形式，保证
+        // 同一地址的两种写法哈希一致。
+        for ip in [self.src_ip, self.dst_ip] {
+            let bytes: [u8; 16] = match ip {
+                std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
+                std::net::IpAddr::V6(v6) => v6.octets(),
+            };
+            for b in bytes {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(FNV_PRIME);
+            }
+        }
+        for port in [self.src_port, self.dst_port] {
+            for b in port.to_be_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(FNV_PRIME);
+            }
+        }
+        h ^= u64::from(self.protocol);
+        h = h.wrapping_mul(FNV_PRIME);
+        h
+    }
+}
+
 /// 转发表：`dst vip → Vec<NextHop>`；代际版本号，整体替换。
 #[derive(Debug, Clone)]
 pub struct Fib {
@@ -452,6 +504,24 @@ impl Fib {
     #[must_use]
     pub fn lookup(&self, vip: &str) -> Option<&[NextHop]> {
         self.entries.get(vip).map(Vec::as_slice)
+    }
+
+    /// 按流哈希选择下一跳（§12.47）。
+    ///
+    /// 同一 `FlowKey` 恒返回同一条（FIB 条目内按 peer 排序，`hash % n`
+    /// 索引跨节点一致）；单下一跳直接返回；未知/不可达 VIP → `None`。
+    /// 纯函数：零 I/O，不修改 FIB。
+    #[must_use]
+    pub fn select_next_hop(&self, vip: &str, flow: &FlowKey) -> Option<&NextHop> {
+        let hops = self.lookup(vip)?;
+        if hops.is_empty() {
+            return None;
+        }
+        if hops.len() == 1 {
+            return Some(&hops[0]);
+        }
+        let idx = (flow.hash() % hops.len() as u64) as usize;
+        hops.get(idx)
     }
 
     /// 条目数（不含本端）。
@@ -688,5 +758,75 @@ mod tests {
         assert_eq!(hops[0].peer, b);
         assert_eq!(hops[0].path_id, 0);
         let _ = (c, d);
+    }
+
+    fn flow_key(src_port: u16, dst_port: u16) -> FlowKey {
+        FlowKey {
+            src_ip: "10.0.0.1".parse().unwrap(),
+            dst_ip: "10.0.0.4".parse().unwrap(),
+            src_port,
+            dst_port,
+            protocol: 6,
+        }
+    }
+
+    #[test]
+    fn flow_hash_is_deterministic() {
+        // 同一 FlowKey 多次哈希结果一致；不同字段改变哈希。
+        let f = flow_key(1234, 80);
+        assert_eq!(f.hash(), f.hash());
+        assert_ne!(f.hash(), flow_key(1235, 80).hash());
+        assert_ne!(f.hash(), flow_key(1234, 81).hash());
+        // protocol 参与哈希：TCP(6) 与 UDP(17) 同 4 元组哈希不同。
+        let udp = FlowKey { protocol: 17, ..f };
+        assert_ne!(f.hash(), udp.hash());
+        // IPv4 与其 IPv6 映射形式哈希一致。
+        let mapped = FlowKey {
+            src_ip: "::ffff:10.0.0.1".parse().unwrap(),
+            ..f
+        };
+        assert_eq!(f.hash(), mapped.hash());
+    }
+
+    #[test]
+    fn select_next_hop_same_flow_stable() {
+        // 菱形拓扑：A→D 有 2 条下一跳；同一流恒选同一条。
+        let (db, a, _, _, _) = diamond_lsdb();
+        let fib = Fib::compute(&db, &a, &Ecmp::new(), 1);
+        let flow = flow_key(5000, 443);
+        let first = fib.select_next_hop("10.0.0.4", &flow).unwrap();
+        for _ in 0..50 {
+            assert_eq!(fib.select_next_hop("10.0.0.4", &flow).unwrap(), first);
+        }
+    }
+
+    #[test]
+    fn select_next_hop_spreads_flows() {
+        // 200 个不同流应分散到两条下一跳（每条 ≥ 25%）。
+        let (db, a, _, _, _) = diamond_lsdb();
+        let fib = Fib::compute(&db, &a, &Ecmp::new(), 1);
+        let hops = fib.lookup("10.0.0.4").unwrap();
+        assert_eq!(hops.len(), 2);
+        let mut counts = [0u32, 0u32];
+        for i in 0..200u16 {
+            let hop = fib
+                .select_next_hop("10.0.0.4", &flow_key(10000 + i, 80))
+                .unwrap();
+            let idx = hops.iter().position(|h| h == hop).unwrap();
+            counts[idx] += 1;
+        }
+        assert!(counts[0] >= 50 && counts[1] >= 50, "counts={counts:?}");
+    }
+
+    #[test]
+    fn select_next_hop_single_and_unknown() {
+        // 单下一跳直接返回；未知 VIP → None。
+        let (db, a, b, _, _) = diamond_lsdb();
+        let fib = Fib::compute(&db, &a, &Ecmp::new(), 1);
+        let flow = flow_key(6000, 22);
+        let hop = fib.select_next_hop("10.0.0.2", &flow).unwrap();
+        assert_eq!(hop.peer, b);
+        assert!(fib.select_next_hop("10.9.9.9", &flow).is_none());
+        assert!(fib.select_next_hop("10.0.0.1", &flow).is_none()); // 本端无条目
     }
 }

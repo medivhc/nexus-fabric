@@ -2663,3 +2663,34 @@ LSDB/LSA/泛洪协议零改动（设计文档既定映射）。
 - 冻结边界：按流哈希选下一跳（转发面，后续）；K-shortest/Disjoint/Constrained
   （后续 `PathComputer` impl）；`[routing] strategy` 配置装配（后续）。
 - 契约 hash 冻结（verify 时写入）。
+
+### 12.47 P5 去中心化选路：按流哈希选择 FIB 下一跳（2026-09-29）{#12-flow-hash}
+
+接 §12.46（ECMP 多下一跳）。本项交付按流哈希的下一跳选择（portable core，
+零 I/O、零第三方依赖）：FIB 的 `Vec<NextHop>` 有多条时，按 5 元组流哈希
+确定性选一条；同一流恒选同一条（避免 TCP 重排序/跨路径抖动），不同流
+在各下一跳间分散。
+
+- **`FlowKey`**：5 元组 `FlowKey { src_ip: IpAddr, dst_ip: IpAddr,
+  src_port: u16, dst_port: u16, protocol: u8 }`（protocol 为 IP 协议号，
+  6=TCP/17=UDP）；`Clone + Copy + PartialEq + Eq + Hash + Debug`。
+- **流哈希**：FNV-1a 64（portable core 手写实现，零依赖）；输入为 5 元组
+  字段的确定性字节序（IP 按 16 字节展开，IPv4 用 `::ffff:` 映射形式；
+  端口 BE；协议号占单字节）；跨平台、跨运行、跨节点结果一致。
+- **`Fib::select_next_hop`**：
+  `fn select_next_hop(&self, vip: &str, flow: &FlowKey) -> Option<&NextHop>`；
+  未知/不可达 VIP → `None`；单下一跳直接返回该条；多下一跳按
+  `hash(flow) % n` 取索引（FIB 条目内已按 peer 排序，索引跨节点一致）。
+- **反向流一致性**：同一双向流的两个方向（src/dst 互换）不要求选同一条
+  下一跳（各方向独立按其 5 元组哈希；对称选路是后续转发面的事）。
+- E4 场景 `flow_hash.toml`（id=`product.flow-hash`，
+  `cargo run --quiet -p nexus --example flow_hash -- --json`）：
+  菱形拓扑（同 §12.46，A→D 两条 20ms 等代价路径，FIB 有 2 条 NextHop）；
+  期望 `verdict=PASS`，事件：
+  - `flow_stable`：同一 `FlowKey` 连续选择 100 次结果恒定；
+  - `flows_spread`：1000 个不同流分散到 2 条下一跳（每条 ≥ 30%）；
+  - `single_path_stable`：单下一跳 dst（A→B）选择恒为该条；
+  - `unknown_vip_none`：未知 VIP 返回 `None`。
+- 冻结边界：真实转发面挂接（后续）；加权选择（`weight` 非 1 时，后续）；
+  一致性哈希/最小重映射（后续如有需求）；`[routing] strategy` 配置装配（后续）。
+- 契约 hash：`16252a20211d2b498355a829a7517788229ec922`（verify 时写入）。

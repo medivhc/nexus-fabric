@@ -78,5 +78,13 @@
     "module": "nexus-discovery",
     "category": "implementation-pattern",
     "summary": "ECMP 等代价前驱表完备性证明（代价≥1→前驱先弹出）、路径枚举指数爆炸风险、HashMap 迭代导致多路径顺序跨运行不确定（未来流哈希风险）"
+  },
+  {
+    "id": "flow-hash-selection",
+    "file": "entries/2026-09-29-flow-hash-selection.md",
+    "date": "2026-09-29",
+    "module": "nexus-discovery",
+    "category": "implementation-pattern",
+    "summary": "按流哈希选择 FIB 下一跳：FlowKey 5 元组 + 手写 FNV-1a 64 + hash % n；IPv4 映射 IPv6 保证写法一致；反向流不要求同选"
   }
 ]

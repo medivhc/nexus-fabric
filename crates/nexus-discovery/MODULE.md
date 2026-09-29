@@ -216,3 +216,20 @@ LSA/LSDB/泛洪协议零改动。
   单路径算法下行为与 §12.45 一致（每 dst 1 条）。
 - Deletion Test：ECMP 是算路算法的独立变化维度（只加 `PathComputer` impl，
   不动 LSDB/FIB/协议），与 ShortestPath 正交。
+
+### 冻结契约（按流哈希选择下一跳 P5，PRODUCT §12.47，scenarios/product/flow_hash.toml）
+
+在 §12.46 的 `routing` 模块上增量：新增 `FlowKey`（5 元组）与
+`Fib::select_next_hop`；LSA/LSDB/泛洪/算路协议零改动。
+
+- `pub struct FlowKey { src_ip: IpAddr, dst_ip: IpAddr, src_port: u16,
+  dst_port: u16, protocol: u8 }`：`Clone + Copy + PartialEq + Eq + Hash + Debug`。
+- `FlowKey::hash() -> u64`：FNV-1a 64 手写实现（零依赖）；IP 按 16 字节展开
+  （IPv4 映射为 IPv6 兼容形式，两种写法哈希一致）；端口 BE；跨平台/跨运行/
+  跨节点确定。
+- `Fib::select_next_hop(&self, vip: &str, flow: &FlowKey) -> Option<&NextHop>`：
+  未知/不可达 → `None`；单下一跳直接返回；多条按 `hash % n` 索引
+  （条目内按 peer 排序，索引跨节点一致）；纯函数，零 I/O。
+- Deletion Test：流哈希选择是转发面的独立变化维度（ECMP 只决定"有哪些下一跳"，
+  本项决定"某流走哪一条"），与算路算法正交；删除后 ECMP 的 `Vec<NextHop>`
+  无消费者，转发面无法做 per-flow 一致选路。
