@@ -40,14 +40,14 @@ fn run() -> Result<(String, bool), String> {
     let listener =
         FabricListener::bind("127.0.0.1:0".parse().unwrap()).map_err(|e| format!("bind: {e}"))?;
     let server_peer = listener.peer_id();
-    let server_addr: SocketAddr =
-        listener.local_addr().map_err(|e| format!("local_addr: {e}"))?;
+    let server_addr: SocketAddr = listener
+        .local_addr()
+        .map_err(|e| format!("local_addr: {e}"))?;
 
     // Server: accept -> echo the stream -> count datagrams.
     let server = thread::spawn(move || -> Result<(usize, usize), String> {
         let conn = listener.accept().map_err(|e| format!("accept: {e}"))?;
-        let (mut send, mut recv) =
-            conn.accept_bi().map_err(|e| format!("accept_bi: {e}"))?;
+        let (mut send, mut recv) = conn.accept_bi().map_err(|e| format!("accept_bi: {e}"))?;
         let mut data = Vec::new();
         let mut buf = [0u8; 65536];
         loop {
@@ -81,8 +81,7 @@ fn run() -> Result<(String, bool), String> {
         addrs: vec![server_addr],
         handshake_timeout: Duration::from_secs(10),
     };
-    let conn =
-        FabricConn::connect(server_peer, &config).map_err(|e| format!("connect: {e}"))?;
+    let conn = FabricConn::connect(server_peer, &config).map_err(|e| format!("connect: {e}"))?;
     let (mut send, mut recv) = conn.open_bi().map_err(|e| format!("open_bi: {e}"))?;
     let payload = payload();
     let mut off = 0;
@@ -127,15 +126,12 @@ fn run() -> Result<(String, bool), String> {
     };
     // peer.authenticated: connect() pins the server's key; a successful
     // handshake means the peer was authenticated (else HandshakeFailed).
-    let pass =
-        echo_bytes_match && in_order && received_at_least_one && rtt.is_some();
+    let pass = echo_bytes_match && in_order && received_at_least_one && rtt.is_some();
     let verdict = if pass { "PASS" } else { "FAIL" };
     let detail = if pass {
         String::new()
     } else {
-        format!(
-            ",\"detail\":\"echo_match={echo_bytes_match} dgrams={dcount} rtt={rtt_json}\""
-        )
+        format!(",\"detail\":\"echo_match={echo_bytes_match} dgrams={dcount} rtt={rtt_json}\"")
     };
     Ok((
         format!(

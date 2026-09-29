@@ -61,8 +61,9 @@ fn run() -> Result<(String, bool), String> {
     let listener =
         FabricListener::bind("127.0.0.1:0".parse().unwrap()).map_err(|e| format!("bind: {e}"))?;
     let server_peer = listener.peer_id();
-    let server_addr: SocketAddr =
-        listener.local_addr().map_err(|e| format!("local_addr: {e}"))?;
+    let server_addr: SocketAddr = listener
+        .local_addr()
+        .map_err(|e| format!("local_addr: {e}"))?;
 
     // Server: read the stream, hash it, signal rebind at 1 MiB, track the
     // maximum gap between consecutive reads (app-visible stall).
@@ -104,8 +105,7 @@ fn run() -> Result<(String, bool), String> {
         addrs: vec![server_addr],
         handshake_timeout: Duration::from_secs(10),
     };
-    let conn =
-        FabricConn::connect(server_peer, &config).map_err(|e| format!("connect: {e}"))?;
+    let conn = FabricConn::connect(server_peer, &config).map_err(|e| format!("connect: {e}"))?;
     let id_before = conn.id();
     let path_before = conn.stats().active_path;
     let (mut send, _recv) = conn.open_bi().map_err(|e| format!("open_bi: {e}"))?;
@@ -117,9 +117,7 @@ fn run() -> Result<(String, bool), String> {
             let c = chunk(off, end);
             let mut woff = 0;
             while woff < c.len() {
-                woff += send
-                    .write(&c[woff..])
-                    .map_err(|e| format!("write: {e}"))?;
+                woff += send.write(&c[woff..]).map_err(|e| format!("write: {e}"))?;
             }
             off = end;
         }

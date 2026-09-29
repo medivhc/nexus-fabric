@@ -13,19 +13,20 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{
+    Arc, Condvar, Mutex,
     atomic::{AtomicU64, Ordering},
-    mpsc, Arc, Condvar, Mutex,
+    mpsc,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use quinn_proto::{
-    crypto::rustls::QuicClientConfig, ClientConfig, ConnectionHandle, DatagramEvent, Dir,
-    Endpoint, EndpointConfig, ServerConfig, StreamId, VarInt,
+    ClientConfig, ConnectionHandle, DatagramEvent, Dir, Endpoint, EndpointConfig, ServerConfig,
+    StreamId, VarInt, crypto::rustls::QuicClientConfig,
 };
 
-use crate::cert::{build_client_crypto, build_server_config, generate_identity, Identity};
+use crate::cert::{Identity, build_client_crypto, build_server_config, generate_identity};
 use crate::{ConnStats, ConnectionId, FabricError, PeerId};
 
 /// Logical connection ids; process-wide unique (P0: one driver per connection
@@ -165,7 +166,9 @@ pub enum Cmd {
         reply: mpsc::Sender<Result<(), FabricError>>,
     },
     /// State changed (write/finish/datagram queued): pump soon.
-    Pump { conn: u64 },
+    Pump {
+        conn: u64,
+    },
     Rebind {
         conn: u64,
         reply: mpsc::Sender<Result<SocketAddr, FabricError>>,
@@ -203,14 +206,20 @@ impl Driver {
         bind: SocketAddr,
         server: Option<(ServerConfig, Identity)>,
     ) -> Result<Arc<Self>, FabricError> {
-        let socket =
-            UdpSocket::bind(bind).map_err(|e| FabricError::Transport(e.to_string()))?;
+        let socket = UdpSocket::bind(bind).map_err(|e| FabricError::Transport(e.to_string()))?;
         let local_addr = socket
             .local_addr()
             .map_err(|e| FabricError::Transport(e.to_string()))?;
-        let (server_config, identity) = server.map(|(c, i)| (Some(Arc::new(c)), Some(i))).unwrap_or((None, None));
+        let (server_config, identity) = server
+            .map(|(c, i)| (Some(Arc::new(c)), Some(i)))
+            .unwrap_or((None, None));
         let peer_id = identity.as_ref().map(|i| i.peer_id);
-        let endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), server_config.clone(), false, None);
+        let endpoint = Endpoint::new(
+            Arc::new(EndpointConfig::default()),
+            server_config.clone(),
+            false,
+            None,
+        );
         let (tx, rx) = mpsc::channel();
         let shared = Arc::new(DriverShared {
             conns: Mutex::new(HashMap::new()),
@@ -422,7 +431,7 @@ impl Loop {
                         if e.kind() == io::ErrorKind::WouldBlock
                             || e.kind() == io::ErrorKind::TimedOut =>
                     {
-                        break
+                        break;
                     }
                     Err(_) => break,
                 }
@@ -467,11 +476,8 @@ impl Loop {
             }
             Cmd::Close { conn, code, reason } => {
                 if let Some(lc) = self.live.get_mut(&conn) {
-                    lc.quic.close(
-                        Instant::now(),
-                        VarInt::from_u32(code),
-                        Bytes::from(reason),
-                    );
+                    lc.quic
+                        .close(Instant::now(), VarInt::from_u32(code), Bytes::from(reason));
                 }
             }
         }
@@ -511,10 +517,7 @@ impl Loop {
     }
 
     fn cmd_open_bi(&mut self, conn: u64) -> Result<Arc<StreamShared>, FabricError> {
-        let lc = self
-            .live
-            .get_mut(&conn)
-            .ok_or(FabricError::Closed(0))?;
+        let lc = self.live.get_mut(&conn).ok_or(FabricError::Closed(0))?;
         let qid = lc
             .quic
             .streams()
@@ -526,10 +529,7 @@ impl Loop {
     }
 
     fn cmd_send_datagram(&mut self, conn: u64, data: Vec<u8>) -> Result<(), FabricError> {
-        let lc = self
-            .live
-            .get_mut(&conn)
-            .ok_or(FabricError::Closed(0))?;
+        let lc = self.live.get_mut(&conn).ok_or(FabricError::Closed(0))?;
         lc.dgram_tx_q.push_back(data);
         Ok(())
     }
@@ -599,8 +599,11 @@ impl Loop {
             Ok((handle, quic)) => {
                 let id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
                 // P0: no client auth, so the peer id is unknown (zeroed, documented).
-                let shared =
-                    Arc::new(ConnShared::new(ConnectionId(id), PeerId([0u8; 32]), self.tx.clone()));
+                let shared = Arc::new(ConnShared::new(
+                    ConnectionId(id),
+                    PeerId([0u8; 32]),
+                    self.tx.clone(),
+                ));
                 self.handle_map.insert(handle, id);
                 self.live.insert(
                     id,
@@ -709,8 +712,7 @@ impl Loop {
         // Reap fully-closed connections (keep shared state for late stats()).
         let reaped = match self.live.get_mut(&id) {
             Some(lc) => {
-                lc.quic.poll_timeout().is_none()
-                    && lc.shared.state.lock().unwrap().closed.is_some()
+                lc.quic.poll_timeout().is_none() && lc.shared.state.lock().unwrap().closed.is_some()
             }
             None => false,
         };
@@ -755,7 +757,9 @@ impl Loop {
                         }
                     }
                 }
-                if ss.send_fin && !ss.fin_sent && ss.send_buf.is_empty()
+                if ss.send_fin
+                    && !ss.fin_sent
+                    && ss.send_buf.is_empty()
                     && lc.quic.send_stream(qid).finish().is_ok()
                 {
                     ss.fin_sent = true;
@@ -785,8 +789,7 @@ impl Loop {
                                 }
                                 Err(quinn_proto::ReadError::Blocked) => break,
                                 Err(quinn_proto::ReadError::Reset(code)) => {
-                                    ss.error =
-                                        Some(FabricError::Closed(code.into_inner() as u32));
+                                    ss.error = Some(FabricError::Closed(code.into_inner() as u32));
                                     break;
                                 }
                             }
@@ -825,9 +828,7 @@ impl Loop {
                     lc.shared.accepted_cv.notify_all();
                 }
             }
-            quinn_proto::Event::Stream(quinn_proto::StreamEvent::Opened {
-                dir: Dir::Bi,
-            }) => {
+            quinn_proto::Event::Stream(quinn_proto::StreamEvent::Opened { dir: Dir::Bi }) => {
                 let sh = match self.live.get_mut(&id) {
                     Some(lc) => match lc.quic.streams().accept(Dir::Bi) {
                         Some(qid) => {
@@ -876,9 +877,7 @@ fn map_close_reason(reason: &quinn_proto::ConnectionError) -> FabricError {
         E::TimedOut => FabricError::Timeout,
         E::LocallyClosed => FabricError::Closed(0),
         E::TransportError(e) => FabricError::Transport(format!("transport: {e:?}")),
-        E::ConnectionClosed(c) => {
-            FabricError::Transport(format!("closed: {:?}", c.error_code))
-        }
+        E::ConnectionClosed(c) => FabricError::Transport(format!("closed: {:?}", c.error_code)),
         E::VersionMismatch => FabricError::Transport("version mismatch".into()),
         E::Reset => FabricError::Transport("stateless reset".into()),
         E::CidsExhausted => FabricError::Transport("connection ids exhausted".into()),
@@ -894,10 +893,7 @@ mod tests {
     fn poll_timeout_never_zero() {
         // Regression: a zero poll timeout made `set_read_timeout` fail with
         // InvalidInput, leaving a freshly rebound socket blocking forever.
-        assert_eq!(
-            min_poll_timeout(Duration::ZERO),
-            Duration::from_millis(1)
-        );
+        assert_eq!(min_poll_timeout(Duration::ZERO), Duration::from_millis(1));
         assert_eq!(
             min_poll_timeout(Duration::from_millis(5)),
             Duration::from_millis(5)

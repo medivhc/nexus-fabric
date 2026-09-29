@@ -17,13 +17,13 @@
 use std::sync::Arc;
 
 use quinn_proto::rustls::{
-    self,
+    self, ClientConfig as TlsClientConfig, DigitallySignedStruct, Error as TlsError,
+    SignatureScheme,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     crypto::ring::default_provider as ring_provider,
     pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
-    ClientConfig as TlsClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme,
 };
-use quinn_proto::{crypto::rustls::QuicClientConfig, ServerConfig};
+use quinn_proto::{ServerConfig, crypto::rustls::QuicClientConfig};
 
 use crate::{FabricError, PeerId};
 
@@ -289,8 +289,7 @@ mod tests {
         let id = generate_identity().expect("keygen");
         assert_ne!(id.peer_id.0, [0u8; 32]);
         // The peer id must match what our DER parser extracts from our own cert.
-        let from_cert =
-            cert_spki_ed25519_raw(&id.cert_der).expect("parse own cert");
+        let from_cert = cert_spki_ed25519_raw(&id.cert_der).expect("parse own cert");
         assert_eq!(from_cert, id.peer_id.0);
     }
 
@@ -299,7 +298,9 @@ mod tests {
         assert!(cert_spki_ed25519_raw(&[]).is_err());
         assert!(cert_spki_ed25519_raw(&[0x30, 0x03, 0x01, 0x02, 0x03]).is_err());
         // A valid SPKI with the wrong OID must be rejected (algorithm confusion).
-        let mut bad = vec![0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x71, 0x03, 0x21, 0x00];
+        let mut bad = vec![
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x71, 0x03, 0x21, 0x00,
+        ];
         bad.extend_from_slice(&[0xabu8; 32]);
         assert!(spki_ed25519_raw(&bad).is_err());
     }

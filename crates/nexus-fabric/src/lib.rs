@@ -20,7 +20,7 @@ mod driver;
 
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use driver::{Cmd, ConnShared, Driver, StreamShared};
@@ -200,12 +200,7 @@ impl FabricConn {
 }
 
 fn split_stream(sh: Arc<StreamShared>) -> (SendStream, RecvStream) {
-    (
-        SendStream {
-            shared: sh.clone(),
-        },
-        RecvStream { shared: sh },
-    )
+    (SendStream { shared: sh.clone() }, RecvStream { shared: sh })
 }
 
 /// Passive side: accept incoming connections.
