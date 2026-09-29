@@ -645,7 +645,13 @@ impl Loop {
             while let Some(d) = lc.dgram_tx_q.pop_front() {
                 let len = d.len();
                 match lc.quic.datagrams().send(Bytes::from(d), true) {
-                    Ok(()) => lc.bytes_sent += len as u64,
+                    Ok(()) => {
+                        eprintln!(
+                            "[drv] dgram sent ok, quic-outgoing-space={}",
+                            lc.quic.datagrams().send_buffer_space()
+                        );
+                        lc.bytes_sent += len as u64;
+                    }
                     Err(quinn_proto::SendDatagramError::Blocked(data)) => {
                         lc.dgram_tx_q.push_front(data.to_vec());
                         break;
