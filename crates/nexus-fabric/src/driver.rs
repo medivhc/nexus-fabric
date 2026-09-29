@@ -516,20 +516,26 @@ impl Loop {
         Ok(())
     }
 
-    /// Active migration: swap the UDP socket and tell QUIC the local
-    /// address changed. The peer migrates via path validation (S3, S6).
+    /// Active migration: swap the UDP socket so subsequent packets go out
+    /// from a new local port. The peer migrates via QUIC path validation
+    /// (S3, S6) when it sees the new source address (passive migration).
+    ///
+    /// Note: we deliberately do NOT call quinn-proto's
+    /// `local_address_changed()` here: its `update_rem_cid` + `ping` path
+    /// trips a `debug_assert!` in quinn-proto 0.11.18's `pto_time_and_space`
+    /// when the connection goes idle post-migration. Passive migration
+    /// (new source address observed by the peer) is RFC 9000 §9-compliant
+    /// and sufficient.
     fn cmd_rebind(&mut self, conn: u64) -> Result<SocketAddr, FabricError> {
-        let lc = self
-            .live
-            .get_mut(&conn)
-            .ok_or(FabricError::Closed(0))?;
+        if !self.live.contains_key(&conn) {
+            return Err(FabricError::Closed(0));
+        }
         let sock =
             UdpSocket::bind("127.0.0.1:0").map_err(|e| FabricError::Transport(e.to_string()))?;
         let addr = sock
             .local_addr()
             .map_err(|e| FabricError::Transport(e.to_string()))?;
         self.socket = sock;
-        lc.quic.local_address_changed();
         *self.shared.local_addr.lock().unwrap() = addr;
         // Refresh stats immediately so the caller observes the new path.
         self.update_stats(conn);
