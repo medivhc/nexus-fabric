@@ -217,3 +217,9 @@ name = "nexus-harness"
 allowed_internal_dependencies = ["nexus-connectivity", "nexus-domain", "nexus-platform"]
 portable = false
 layer = "engineering"
+
+[[crate]]
+name = "nexus-fabric"
+allowed_internal_dependencies = []
+portable = false
+layer = "delivery"
