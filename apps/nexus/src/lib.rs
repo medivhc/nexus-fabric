@@ -9584,6 +9584,124 @@ pub fn weighted_selection_flow() -> Result<Value, NexusError> {
     Ok(serde_json::Value::Object(out))
 }
 
+/// E4 产品场景 `product.strategy-extended` 的可执行驱动（PRODUCT §12.53）。
+///
+/// 验证：`"k-shortest:3"` 解析为 KShortest{k:3}；
+/// `"disjoint"` 解析为 Disjoint；
+/// 非法参数返回 InvalidParameter；
+/// 策略装配后算路（K=2 得 2 条，Disjoint 得 2 条）。
+pub fn strategy_extended_flow() -> Result<Value, NexusError> {
+    use nexus_discovery::routing::{PathComputer, RoutingStrategy, StrategyParseError};
+
+    let mut events: Vec<&'static str> = Vec::new();
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("strategy_extended: {m}"),
+    };
+
+    // ---- 事件 1：k-shortest:3 解析 ----
+    match RoutingStrategy::parse("k-shortest:3") {
+        Ok(RoutingStrategy::KShortest { k: 3 }) => events.push("parse_kshortest"),
+        other => return Err(fail(&format!("parse k-shortest:3 -> {other:?}"))),
+    }
+
+    // ---- 事件 2：disjoint 解析 ----
+    match RoutingStrategy::parse("disjoint") {
+        Ok(RoutingStrategy::Disjoint) => events.push("parse_disjoint"),
+        other => return Err(fail(&format!("parse disjoint -> {other:?}"))),
+    }
+
+    // ---- 事件 3：非法参数 ----
+    match RoutingStrategy::parse("k-shortest:0") {
+        Err(StrategyParseError::InvalidParameter(_)) => events.push("reject_invalid"),
+        other => return Err(fail(&format!("k-shortest:0 -> {other:?}"))),
+    }
+
+    // ---- 事件 4：策略装配算路 ----
+    // 用 diamond 拓扑验证委托：KShortest{2} 得 2 条，Disjoint 得 2 条。
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::TopoView;
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    let id_d = PeerId("node-d".to_string());
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_b.clone(),
+        vip: "10.99.0.2".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_c.clone(),
+        vip: "10.99.0.3".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_d.clone(),
+        vip: "10.99.0.4".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    });
+    let topo = TopoView::from_lsdb(&lsdb);
+    let k2 = RoutingStrategy::parse("k-shortest:2").map_err(|_| fail("parse k2"))?;
+    let paths_k2 = k2.compute_paths(&topo, &id_a, &id_d);
+    let dis = RoutingStrategy::parse("disjoint").map_err(|_| fail("parse dis"))?;
+    let paths_dis = dis.compute_paths(&topo, &id_a, &id_d);
+    if paths_k2.len() != 2 || paths_dis.len() != 2 {
+        return Err(fail(&format!(
+            "k2={}, dis={}",
+            paths_k2.len(),
+            paths_dis.len()
+        )));
+    }
+    events.push("delegate_compute");
+
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "strategy".to_string(),
+        serde_json::json!({
+            "kshortest_paths": paths_k2.len(),
+            "disjoint_paths": paths_dis.len(),
+        }),
+    );
+    out.insert(
+        "events".to_string(),
+        serde_json::Value::Array(events.into_iter().map(serde_json::Value::from).collect()),
+    );
+    out.insert("verdict".to_string(), serde_json::Value::from("PASS"));
+    Ok(serde_json::Value::Object(out))
+}
+
 /// E4 产品场景 `product.disjoint` 的可执行驱动（PRODUCT §12.51）。
 ///
 /// 拓扑：A-B(10)-D、A-C(10)-D、B-C(5)。Suurballe 应得 2 条边不交：

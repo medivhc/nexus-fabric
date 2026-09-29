@@ -2839,3 +2839,20 @@ LSDB/LSA/泛洪协议零改动（设计文档既定映射）。
 **冻结边界**：动态权重（后续）；`RoutingStrategy` 集成（后续）；
 真实转发面挂接（后续）。
 **契约 hash**：`fbc78159233e22718c67d540cdebc0d6fa245a463fbc0442e72b4424c5c1f565`（verify 时写入）。
+
+### §12.53 P5 去中心化选路：策略集成 KShortest/Disjoint
+
+**状态**：候选。
+**范围**：`RoutingStrategy` 新增参数化变体 `KShortest { k }`、`Disjoint`，
+配置字符串支持 `"k-shortest:3"`、`"disjoint"`。
+**设计**：
+- `RoutingStrategy::KShortest { k: usize }` 委托 `KShortest::new(k)`。
+- `RoutingStrategy::Disjoint` 委托 `Disjoint::new()`。
+- `parse` 大小写不敏感；`"k-shortest"` 无参数时默认 k=2；
+  非法 k（如 0、非数字）→ `Err(InvalidParameter)`。
+- `name()` 返回 `"k-shortest"` / `"disjoint"`。
+**非目标**：策略热切换；动态 k 调整；真实转发面挂接。
+**E4**：`scenarios/product/strategy_extended.toml`
+（`id=product.strategy-extended`），解析 + 装配 + 算路验证。
+**冻结边界**：策略热切换（后续）；真实转发面挂接（后续）。
+**契约 hash**：`37f092680ee72cc69f41a47a797b2333f50a02b646a468198a983a01405a218b`（verify 时写入）。

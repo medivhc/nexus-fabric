@@ -831,6 +831,12 @@ pub enum RoutingStrategy {
     Shortest,
     /// 等代价多路径。
     Ecmp,
+    /// K 条最短路（Yen 算法；§12.53）。
+    ///
+    /// 不变量：`k >= 1`（`parse` 保证；直接构造时调用方负责）。
+    KShortest { k: usize },
+    /// 两条边不交路径（Suurballe 算法；§12.53）。
+    Disjoint,
 }
 
 /// 策略解析错误。
@@ -838,12 +844,15 @@ pub enum RoutingStrategy {
 pub enum StrategyParseError {
     /// 未知策略名（保留原字符串）。
     Unknown(String),
+    /// 参数非法（如 `k-shortest:0`、`k-shortest:abc`；保留原字符串）。
+    InvalidParameter(String),
 }
 
 impl std::fmt::Display for StrategyParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unknown(s) => write!(f, "unknown routing strategy '{s}'"),
+            Self::InvalidParameter(s) => write!(f, "invalid routing strategy parameter '{s}'"),
         }
     }
 }
@@ -851,11 +860,33 @@ impl std::fmt::Display for StrategyParseError {
 impl RoutingStrategy {
     /// 解析配置字符串（大小写不敏感，前后空白忽略）。
     ///
-    /// `"shortest"` → `Shortest`，`"ecmp"` → `Ecmp`；其他 → `Err(Unknown)`。
+    /// `"shortest"` → `Shortest`，`"ecmp"` → `Ecmp`，
+    /// `"k-shortest"` / `"k-shortest:3"` → `KShortest { k }`（默认 k=2），
+    /// `"disjoint"` → `Disjoint`；其他 → `Err(Unknown)`；
+    /// 非法 k（0、非数字）→ `Err(InvalidParameter)`。
     pub fn parse(s: &str) -> Result<Self, StrategyParseError> {
-        match s.trim().to_ascii_lowercase().as_str() {
+        let lower = s.trim().to_ascii_lowercase();
+        // 带参数形式：k-shortest:3
+        if let Some((name, param)) = lower.split_once(':') {
+            match name.trim() {
+                "k-shortest" | "kshortest" => {
+                    let k: usize = param
+                        .trim()
+                        .parse()
+                        .map_err(|_| StrategyParseError::InvalidParameter(s.to_string()))?;
+                    if k == 0 {
+                        return Err(StrategyParseError::InvalidParameter(s.to_string()));
+                    }
+                    return Ok(Self::KShortest { k });
+                }
+                _ => return Err(StrategyParseError::Unknown(s.to_string())),
+            }
+        }
+        match lower.as_str() {
             "shortest" => Ok(Self::Shortest),
             "ecmp" => Ok(Self::Ecmp),
+            "k-shortest" | "kshortest" => Ok(Self::KShortest { k: 2 }),
+            "disjoint" => Ok(Self::Disjoint),
             _ => Err(StrategyParseError::Unknown(s.to_string())),
         }
     }
@@ -879,6 +910,8 @@ impl PathComputer for RoutingStrategy {
         match self {
             Self::Shortest => ShortestPath.name(),
             Self::Ecmp => Ecmp.name(),
+            Self::KShortest { k } => KShortest::new(*k).name(),
+            Self::Disjoint => Disjoint::new().name(),
         }
     }
 
@@ -886,6 +919,8 @@ impl PathComputer for RoutingStrategy {
         match self {
             Self::Shortest => ShortestPath.compute(topo, src, dst),
             Self::Ecmp => Ecmp.compute(topo, src, dst),
+            Self::KShortest { k } => KShortest::new(*k).compute(topo, src, dst),
+            Self::Disjoint => Disjoint::new().compute(topo, src, dst),
         }
     }
 
@@ -893,6 +928,8 @@ impl PathComputer for RoutingStrategy {
         match self {
             Self::Shortest => ShortestPath.compute_all(topo, src),
             Self::Ecmp => Ecmp.compute_all(topo, src),
+            Self::KShortest { k } => KShortest::new(*k).compute_all(topo, src),
+            Self::Disjoint => Disjoint::new().compute_all(topo, src),
         }
     }
 
@@ -900,6 +937,8 @@ impl PathComputer for RoutingStrategy {
         match self {
             Self::Shortest => ShortestPath.compute_paths(topo, src, dst),
             Self::Ecmp => Ecmp.compute_paths(topo, src, dst),
+            Self::KShortest { k } => KShortest::new(*k).compute_paths(topo, src, dst),
+            Self::Disjoint => Disjoint::new().compute_paths(topo, src, dst),
         }
     }
 
@@ -907,6 +946,8 @@ impl PathComputer for RoutingStrategy {
         match self {
             Self::Shortest => ShortestPath.compute_all_paths(topo, src),
             Self::Ecmp => Ecmp.compute_all_paths(topo, src),
+            Self::KShortest { k } => KShortest::new(*k).compute_all_paths(topo, src),
+            Self::Disjoint => Disjoint::new().compute_all_paths(topo, src),
         }
     }
 }
@@ -1558,13 +1599,60 @@ mod tests {
             RoutingStrategy::parse(" shortest "),
             Ok(RoutingStrategy::Shortest)
         );
+        // §12.53：k-shortest（默认 k=2）与 disjoint。
         assert_eq!(
             RoutingStrategy::parse("k-shortest"),
-            Err(StrategyParseError::Unknown("k-shortest".to_string()))
+            Ok(RoutingStrategy::KShortest { k: 2 })
+        );
+        assert_eq!(
+            RoutingStrategy::parse("K-Shortest:3"),
+            Ok(RoutingStrategy::KShortest { k: 3 })
+        );
+        assert_eq!(
+            RoutingStrategy::parse("disjoint"),
+            Ok(RoutingStrategy::Disjoint)
+        );
+        // 非法参数。
+        assert_eq!(
+            RoutingStrategy::parse("k-shortest:0"),
+            Err(StrategyParseError::InvalidParameter(
+                "k-shortest:0".to_string()
+            ))
+        );
+        assert_eq!(
+            RoutingStrategy::parse("k-shortest:abc"),
+            Err(StrategyParseError::InvalidParameter(
+                "k-shortest:abc".to_string()
+            ))
+        );
+        assert_eq!(
+            RoutingStrategy::parse("unknown-strategy"),
+            Err(StrategyParseError::Unknown("unknown-strategy".to_string()))
         );
         assert!(RoutingStrategy::parse("").is_err());
         // Default 为 Shortest（向后兼容）。
         assert_eq!(RoutingStrategy::default(), RoutingStrategy::Shortest);
+    }
+
+    #[test]
+    fn routing_strategy_extended_delegates() {
+        // KShortest/Disjoint 策略委托行为与直接使用具体类型一致。
+        let (db, a, _, _, d) = diamond_lsdb();
+        let topo = TopoView::from_lsdb(&db);
+        let via_strategy = RoutingStrategy::KShortest { k: 2 };
+        let direct = KShortest::new(2);
+        assert_eq!(
+            via_strategy.compute_paths(&topo, &a, &d).len(),
+            direct.compute_paths(&topo, &a, &d).len()
+        );
+        let via_disjoint = RoutingStrategy::Disjoint;
+        let direct_disjoint = Disjoint::new();
+        assert_eq!(
+            via_disjoint.compute_paths(&topo, &a, &d).len(),
+            direct_disjoint.compute_paths(&topo, &a, &d).len()
+        );
+        assert_eq!(via_strategy.name(), "k-shortest");
+        assert_eq!(via_disjoint.name(), "disjoint");
     }
 
     #[test]
