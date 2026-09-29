@@ -27,9 +27,10 @@ field = "connection.id_unchanged"
 equals = true
 
 # 首版宽松门限：只要求"不断"，恢复速度后续收紧。
+# harness 不支持 max，故 example 输出布尔值（stalled_ms 仍作为诊断字段输出）。
 [[expect]]
-field = "stream.stalled_ms"
-max = 5000
+field = "stream.stalled_within_budget"
+equals = true
 
 [[expect]]
 field = "stats.active_path_changed"

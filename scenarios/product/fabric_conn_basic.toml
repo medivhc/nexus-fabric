@@ -28,13 +28,15 @@ field = "stream.in_order"
 equals = true
 
 # 不可靠语义：只要求尽力（loopback 应全收，但契约不承诺）。
+# harness 只支持 equals/one_of/non_empty，故 example 输出布尔值。
 [[expect]]
-field = "datagrams.received"
-min = 1
+field = "datagrams.received_at_least_one"
+equals = true
 
+# rtt 被实测到（null -> NonEmpty 失败；数字 -> 通过）。
 [[expect]]
 field = "stats.rtt_ms"
-present = true
+non_empty = true
 
 [[expect]]
 field = "peer.authenticated"
