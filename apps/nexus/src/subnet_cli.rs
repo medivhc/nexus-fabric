@@ -29,6 +29,39 @@ pub const MAX_TUN_NAME_BYTES: usize = 15;
 pub struct SubnetConfig {
     /// `[subnet]` 表。
     pub subnet: SubnetSection,
+    /// `[routing]` 表（§12.48，可选；缺省 → 默认策略）。
+    #[serde(default)]
+    pub routing: RoutingSection,
+}
+
+/// `[routing]` 配置段（§12.48）：选路策略。
+#[derive(Debug, Clone, Deserialize)]
+pub struct RoutingSection {
+    /// 选路策略（`"shortest"` / `"ecmp"`）；缺省 → `"shortest"`（向后兼容）。
+    #[serde(default = "default_routing_strategy")]
+    pub strategy: String,
+}
+
+fn default_routing_strategy() -> String {
+    "shortest".to_string()
+}
+
+impl Default for RoutingSection {
+    fn default() -> Self {
+        Self {
+            strategy: default_routing_strategy(),
+        }
+    }
+}
+
+impl SubnetConfig {
+    /// 解析 `[routing] strategy` 为 `RoutingStrategy`（§12.48）。
+    ///
+    /// 未知策略 → `Err("ROUTING_STRATEGY: ...")`（CONFIG_ERROR 语义，fail-closed）。
+    pub fn routing_strategy(&self) -> Result<nexus_discovery::routing::RoutingStrategy, String> {
+        nexus_discovery::routing::RoutingStrategy::parse(&self.routing.strategy)
+            .map_err(|e| format!("ROUTING_STRATEGY: {e} (want 'shortest' or 'ecmp')"))
+    }
 }
 
 /// `[subnet]` 配置段。

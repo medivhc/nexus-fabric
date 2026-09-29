@@ -233,3 +233,21 @@ LSA/LSDB/泛洪协议零改动。
 - Deletion Test：流哈希选择是转发面的独立变化维度（ECMP 只决定"有哪些下一跳"，
   本项决定"某流走哪一条"），与算路算法正交；删除后 ECMP 的 `Vec<NextHop>`
   无消费者，转发面无法做 per-flow 一致选路。
+
+### 冻结契约（`[routing] strategy` 配置装配 P5，PRODUCT §12.48，scenarios/product/routing_strategy.toml）
+
+在 §12.47 的 `routing` 模块上增量：新增 `RoutingStrategy` 枚举；
+LSA/LSDB/泛洪/算路/FIB 零改动。
+
+- `pub enum RoutingStrategy { Shortest, Ecmp }`：
+  `Clone + Copy + PartialEq + Eq + Debug`；`Default` 为 `Shortest`（向后兼容）。
+- `RoutingStrategy::parse(s: &str) -> Result<Self, StrategyParseError>`：
+  大小写不敏感、前后空白忽略；未知 → `Err(Unknown(s))`。
+- `impl PathComputer for RoutingStrategy`：各方法静态委托给对应变体
+  （`ShortestPath` / `Ecmp`）；`name()` 与直接使用具体类型一致。
+- 配置层（`apps/nexus/src/subnet_cli.rs`）：subnet TOML 新增顶层 `[routing]` 段，
+  `strategy` 字段缺省 → `"shortest"`；`SubnetConfig::routing_strategy()` 解析，
+  未知值 → `Err("ROUTING_STRATEGY: ...")`（fail-closed）。
+- Deletion Test：策略装配是"配置→算法选择"的独立变化维度（之前各调用方
+  hardcode 具体 `PathComputer` 类型）；删除后新增策略需改所有调用点，
+  违反开闭原则。

@@ -2694,3 +2694,38 @@ LSDB/LSA/泛洪协议零改动（设计文档既定映射）。
 - 冻结边界：真实转发面挂接（后续）；加权选择（`weight` 非 1 时，后续）；
   一致性哈希/最小重映射（后续如有需求）；`[routing] strategy` 配置装配（后续）。
 - 契约 hash：`16252a20211d2b498355a829a7517788229ec922`（verify 时写入）。
+
+### 12.48 P5 去中心化选路：`[routing] strategy` 配置装配（2026-09-29）{#12-routing-strategy}
+
+接 §12.47（流哈希选择）。本项交付选路策略的配置化装配（portable core，
+零 I/O、零第三方依赖）：`[routing] strategy` 配置项决定使用哪种 `PathComputer`，
+`RoutingStrategy` 枚举本身实现 `PathComputer`（静态分发，无堆分配），
+调用方无需 hardcode 具体算法。
+
+- **`RoutingStrategy`**（`nexus-discovery::routing`）：
+  `enum RoutingStrategy { Shortest, Ecmp }`；
+  `Clone + Copy + PartialEq + Eq + Debug`。
+- **`RoutingStrategy::parse(s: &str)`**：解析配置字符串（大小写不敏感，
+  前后空白忽略）；`"shortest"` → `Shortest`，`"ecmp"` → `Ecmp`；
+  未知字符串 → `Err(StrategyParseError::Unknown)`（保留原字符串）。
+- **`impl PathComputer for RoutingStrategy`**：各方法直接委托给对应变体
+  （`ShortestPath` / `Ecmp`）；`name()` 返回 `"shortest"` / `"ecmp"`，
+  与直接使用具体类型的行为一致。
+- **配置**（`apps/nexus/src/subnet_cli.rs`，subnet TOML 新增顶层 `[routing]` 段）：
+  ```toml
+  [routing]
+  strategy = "ecmp"  # 可选，默认 "shortest"（向后兼容）；未知值 → CONFIG_ERROR
+  ```
+  缺省 `[routing]` 段或缺省 `strategy` 字段 → `Shortest`（行为与既有部署一致）。
+- E4 场景 `routing_strategy.toml`（id=`product.routing-strategy`，
+  `cargo run --quiet -p nexus --example routing_strategy -- --json`）：
+  - `parse_ok`：`"ecmp"`/`"ECMP"`/`" shortest "` 解析正确；
+  - `parse_err`：`"k-shortest"` 返回 `Err`；
+  - `strategy_computes`：`RoutingStrategy::Ecmp` 在菱形拓扑上算出 2 条等代价路径，
+    `Fib::compute` 得 2 条 NextHop；
+  - `strategy_default`：缺省配置 → `Shortest`，A→D 只有 1 条 NextHop；
+  - `config_toml`：含 `[routing] strategy="ecmp"` 的 TOML 解析出 `Ecmp`。
+  期望 `verdict=PASS`。
+- 冻结边界：K-shortest/Disjoint 等新策略（后续 `PathComputer` impl + 新变体）；
+  真实转发面挂接（后续）；策略热切换（后续）。
+- 契约 hash：`e5a663d8a5c1c12da2d8c8fcb3a9b050881dc589`（verify 时写入）。

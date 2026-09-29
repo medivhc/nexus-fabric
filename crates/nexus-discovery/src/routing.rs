@@ -369,6 +369,96 @@ impl PathComputer for Ecmp {
     }
 }
 
+/// 选路策略（`[routing] strategy` 配置项，§12.48）。
+///
+/// 枚举本身实现 `PathComputer`（静态分发）：调用方按配置选用策略，
+/// 无需 hardcode 具体算法。新增策略 = 新变体 + 委托分支。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingStrategy {
+    /// 最短路（Dijkstra；默认，向后兼容）。
+    Shortest,
+    /// 等代价多路径。
+    Ecmp,
+}
+
+/// 策略解析错误。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StrategyParseError {
+    /// 未知策略名（保留原字符串）。
+    Unknown(String),
+}
+
+impl std::fmt::Display for StrategyParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown(s) => write!(f, "unknown routing strategy '{s}'"),
+        }
+    }
+}
+
+impl RoutingStrategy {
+    /// 解析配置字符串（大小写不敏感，前后空白忽略）。
+    ///
+    /// `"shortest"` → `Shortest`，`"ecmp"` → `Ecmp`；其他 → `Err(Unknown)`。
+    pub fn parse(s: &str) -> Result<Self, StrategyParseError> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "shortest" => Ok(Self::Shortest),
+            "ecmp" => Ok(Self::Ecmp),
+            _ => Err(StrategyParseError::Unknown(s.to_string())),
+        }
+    }
+
+    /// 默认策略（`shortest`，向后兼容：既有部署无 `[routing]` 段时行为不变）。
+    fn default_strategy() -> Self {
+        Self::Shortest
+    }
+}
+
+impl Default for RoutingStrategy {
+    fn default() -> Self {
+        Self::default_strategy()
+    }
+}
+
+impl std::error::Error for StrategyParseError {}
+
+impl PathComputer for RoutingStrategy {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Shortest => ShortestPath.name(),
+            Self::Ecmp => Ecmp.name(),
+        }
+    }
+
+    fn compute(&self, topo: &TopoView, src: &PeerId, dst: &PeerId) -> Option<Path> {
+        match self {
+            Self::Shortest => ShortestPath.compute(topo, src, dst),
+            Self::Ecmp => Ecmp.compute(topo, src, dst),
+        }
+    }
+
+    fn compute_all(&self, topo: &TopoView, src: &PeerId) -> HashMap<PeerId, Path> {
+        match self {
+            Self::Shortest => ShortestPath.compute_all(topo, src),
+            Self::Ecmp => Ecmp.compute_all(topo, src),
+        }
+    }
+
+    fn compute_paths(&self, topo: &TopoView, src: &PeerId, dst: &PeerId) -> Vec<Path> {
+        match self {
+            Self::Shortest => ShortestPath.compute_paths(topo, src, dst),
+            Self::Ecmp => Ecmp.compute_paths(topo, src, dst),
+        }
+    }
+
+    fn compute_all_paths(&self, topo: &TopoView, src: &PeerId) -> HashMap<PeerId, Vec<Path>> {
+        match self {
+            Self::Shortest => ShortestPath.compute_all_paths(topo, src),
+            Self::Ecmp => Ecmp.compute_all_paths(topo, src),
+        }
+    }
+}
+
 /// 下一跳（FIB 条目元素；从第一天就是 Vec 形状，ECMP 下每 dst 可多条）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NextHop {
@@ -828,5 +918,46 @@ mod tests {
         assert_eq!(hop.peer, b);
         assert!(fib.select_next_hop("10.9.9.9", &flow).is_none());
         assert!(fib.select_next_hop("10.0.0.1", &flow).is_none()); // 本端无条目
+    }
+
+    #[test]
+    fn routing_strategy_parse() {
+        assert_eq!(RoutingStrategy::parse("ecmp"), Ok(RoutingStrategy::Ecmp));
+        assert_eq!(RoutingStrategy::parse("ECMP"), Ok(RoutingStrategy::Ecmp));
+        assert_eq!(
+            RoutingStrategy::parse(" shortest "),
+            Ok(RoutingStrategy::Shortest)
+        );
+        assert_eq!(
+            RoutingStrategy::parse("k-shortest"),
+            Err(StrategyParseError::Unknown("k-shortest".to_string()))
+        );
+        assert!(RoutingStrategy::parse("").is_err());
+        // Default 为 Shortest（向后兼容）。
+        assert_eq!(RoutingStrategy::default(), RoutingStrategy::Shortest);
+    }
+
+    #[test]
+    fn routing_strategy_delegates_to_computers() {
+        // 策略枚举委托行为与直接使用具体类型一致。
+        let (db, a, _, _, d) = diamond_lsdb();
+        let topo = TopoView::from_lsdb(&db);
+
+        let via_strategy = RoutingStrategy::Ecmp;
+        assert_eq!(via_strategy.name(), "ecmp");
+        let paths_s = via_strategy.compute_paths(&topo, &a, &d);
+        let paths_e = Ecmp::new().compute_paths(&topo, &a, &d);
+        assert_eq!(paths_s.len(), paths_e.len());
+        assert_eq!(paths_s.len(), 2);
+
+        let via_shortest = RoutingStrategy::Shortest;
+        assert_eq!(via_shortest.name(), "shortest");
+        let one_s = via_shortest.compute(&topo, &a, &d).unwrap();
+        let one_p = ShortestPath::new().compute(&topo, &a, &d).unwrap();
+        assert_eq!(one_s.cost, one_p.cost);
+
+        // Fib::compute 接受策略枚举（PathComputer）。
+        let fib = Fib::compute(&db, &a, &via_strategy, 1);
+        assert_eq!(fib.lookup("10.0.0.4").unwrap().len(), 2);
     }
 }

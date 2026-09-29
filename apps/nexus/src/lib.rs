@@ -8998,3 +8998,168 @@ pub fn flow_hash_selection() -> Result<Value, NexusError> {
         },
     }))
 }
+
+/// E4 产品场景 `product.routing-strategy` 的可执行驱动（PRODUCT §12.48）。
+///
+/// 验证 `[routing] strategy` 配置装配：字符串解析 → `RoutingStrategy` →
+/// `PathComputer` 委托 → FIB。菱形拓扑（同 ecmp_flow）。
+pub fn routing_strategy_flow() -> Result<Value, NexusError> {
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::{Fib, PathComputer, RoutingStrategy};
+
+    let mut events: Vec<&'static str> = Vec::new();
+
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("routing_strategy: {m}"),
+    };
+
+    // ---- 阶段 1：parse_ok ----
+    if RoutingStrategy::parse("ecmp") != Ok(RoutingStrategy::Ecmp) {
+        return Err(fail("parse ecmp"));
+    }
+    if RoutingStrategy::parse("ECMP") != Ok(RoutingStrategy::Ecmp) {
+        return Err(fail("parse ECMP (case-insensitive)"));
+    }
+    if RoutingStrategy::parse(" shortest ") != Ok(RoutingStrategy::Shortest) {
+        return Err(fail("parse ' shortest ' (trim)"));
+    }
+    if RoutingStrategy::parse("").is_ok() {
+        return Err(fail("parse empty should err"));
+    }
+    events.push("parse_ok");
+
+    // ---- 阶段 2：parse_err ----
+    if RoutingStrategy::parse("k-shortest").is_ok() {
+        return Err(fail("parse k-shortest should err"));
+    }
+    events.push("parse_err");
+
+    // ---- 菱形拓扑 ----
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    let id_d = PeerId("node-d".to_string());
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    });
+    for (id, vip, nbs) in [
+        (
+            id_b.clone(),
+            "10.99.0.2",
+            vec![link(&id_a, 10), link(&id_d, 10)],
+        ),
+        (
+            id_c.clone(),
+            "10.99.0.3",
+            vec![link(&id_a, 10), link(&id_d, 10)],
+        ),
+        (
+            id_d.clone(),
+            "10.99.0.4",
+            vec![link(&id_b, 10), link(&id_c, 10)],
+        ),
+    ] {
+        lsdb.update(Lsa {
+            node_id: id,
+            vip: vip.to_string(),
+            incarnation: 1,
+            seq: 1,
+            capabilities: 0,
+            locator: None,
+            neighbors: nbs,
+        });
+    }
+
+    // ---- 阶段 3：strategy_computes（Ecmp 经策略装配）----
+    let strat = RoutingStrategy::Ecmp;
+    if strat.name() != "ecmp" {
+        return Err(fail("strategy name"));
+    }
+    let topo = nexus_discovery::routing::TopoView::from_lsdb(&lsdb);
+    let paths = strat.compute_paths(&topo, &id_a, &id_d);
+    if paths.len() != 2 {
+        return Err(fail("Ecmp strategy should find 2 paths"));
+    }
+    let fib = Fib::compute(&lsdb, &id_a, &strat, 1);
+    let hops_d = fib
+        .lookup("10.99.0.4")
+        .ok_or_else(|| fail("fib missing D"))?;
+    if hops_d.len() != 2 {
+        return Err(fail("Ecmp strategy FIB should have 2 next hops"));
+    }
+    events.push("strategy_computes");
+
+    // ---- 阶段 4：strategy_default（缺省 → Shortest）----
+    let def = RoutingStrategy::default();
+    if def != RoutingStrategy::Shortest {
+        return Err(fail("default should be Shortest"));
+    }
+    let fib_def = Fib::compute(&lsdb, &id_a, &def, 1);
+    let hops_def = fib_def
+        .lookup("10.99.0.4")
+        .ok_or_else(|| fail("fib missing D"))?;
+    if hops_def.len() != 1 {
+        return Err(fail("Shortest strategy FIB should have 1 next hop"));
+    }
+    events.push("strategy_default");
+
+    // ---- 阶段 5：config_toml（TOML [routing] 解析）----
+    let toml_str = "[subnet]\ncidr = \"10.99.0.0/24\"\n[routing]\nstrategy = \"ecmp\"\n";
+    let parsed: crate::subnet_cli::SubnetConfig =
+        toml::from_str(toml_str).map_err(|e| fail(&format!("toml parse: {e}")))?;
+    let from_cfg = parsed
+        .routing_strategy()
+        .map_err(|e| fail(&format!("strategy from config: {e}")))?;
+    if from_cfg != RoutingStrategy::Ecmp {
+        return Err(fail("toml [routing] strategy=ecmp"));
+    }
+    // 缺省 [routing] 段 → Shortest。
+    let empty: crate::subnet_cli::SubnetConfig =
+        toml::from_str("[subnet]\ncidr=\"10.99.0.0/24\"\n")
+            .map_err(|e| fail(&format!("toml parse: {e}")))?;
+    if empty.routing_strategy().map_err(|e| fail(&e))? != RoutingStrategy::Shortest {
+        return Err(fail("missing [routing] should default to Shortest"));
+    }
+    // 未知策略 → CONFIG_ERROR。
+    let bad: crate::subnet_cli::SubnetConfig =
+        toml::from_str("[subnet]\ncidr=\"10.99.0.0/24\"\n[routing]\nstrategy=\"k-shortest\"\n")
+            .map_err(|e| fail(&format!("toml parse: {e}")))?;
+    if bad.routing_strategy().is_ok() {
+        return Err(fail("unknown strategy should err"));
+    }
+    // [routing] 段存在但缺 strategy 字段 → serde 默认回落为 Shortest。
+    let no_field: crate::subnet_cli::SubnetConfig =
+        toml::from_str("[subnet]\ncidr=\"10.99.0.0/24\"\n[routing]\n")
+            .map_err(|e| fail(&format!("toml parse: {e}")))?;
+    if no_field.routing_strategy().map_err(|e| fail(&e))? != RoutingStrategy::Shortest {
+        return Err(fail("missing strategy field should default to Shortest"));
+    }
+    events.push("config_toml");
+
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "strategy": {
+            "ecmp_next_hops": hops_d.len(),
+            "default_next_hops": hops_def.len(),
+        },
+    }))
+}

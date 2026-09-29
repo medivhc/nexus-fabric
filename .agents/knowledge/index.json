@@ -86,5 +86,13 @@
     "module": "nexus-discovery",
     "category": "implementation-pattern",
     "summary": "按流哈希选择 FIB 下一跳：FlowKey 5 元组 + 手写 FNV-1a 64 + hash % n；IPv4 映射 IPv6 保证写法一致；反向流不要求同选"
+  },
+  {
+    "id": "routing-strategy-assembly",
+    "file": "entries/2026-09-29-routing-strategy-assembly.md",
+    "date": "2026-09-29",
+    "module": "nexus-discovery",
+    "category": "implementation-pattern",
+    "summary": "[routing] strategy 配置装配：RoutingStrategy 枚举直接实现 PathComputer（静态分发）；覆盖全部默认方法避免丢失批量优化"
   }
 ]
