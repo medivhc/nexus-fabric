@@ -2729,3 +2729,34 @@ LSDB/LSA/泛洪协议零改动（设计文档既定映射）。
 - 冻结边界：K-shortest/Disjoint 等新策略（后续 `PathComputer` impl + 新变体）；
   真实转发面挂接（后续）；策略热切换（后续）。
 - 契约 hash：`e5a663d8a5c1c12da2d8c8fcb3a9b050881dc589`（verify 时写入）。
+
+### 12.49 P5 去中心化选路：K-shortest 路径（Yen 算法，主备）（2026-09-29）{#12-k-shortest}
+
+接 §12.48（策略装配）。本项交付 K-shortest 路径算法（portable core，
+零 I/O、零第三方依赖）：新增 `PathComputer` 实现 `KShortest`，
+用 Yen 算法求 src→dst 的前 K 条无环最短路（代价可不同，不限于等代价）。
+用于主备路径：首条为主用，其余为备用。
+
+- **`KShortest`**：`KShortest::new(k)`，`k >= 1`；`k == 0` → 构造时 panic
+  （fail-fast，编程错误）；`name()=="k-shortest"`。
+- **Yen 算法**：P1 = Dijkstra 最短路；P(k) 经"spur node"枚举：
+  对 P(k-1) 的每个中间节点为 spur，root path 为其前缀，临时删除
+  会形成环的边/节点后 Dijkstra 求 spur path，候选中最短者为 P(k)。
+  无环保证：spur 计算时删除 root path 上的节点（spur 自身除外）。
+- **`compute_paths`** 返回至多 K 条（按代价升序）；不足 K 条时返回实际条数；
+  不可达 → 空 Vec。`compute()` 返回第一条（最短）。
+- **复杂度**：O(K·V·(E log V))；百节点 K≤3 无压力。K 大时调用方自负。
+- **`RoutingStrategy` 暂不加 `KShortest` 变体**（冻结边界）：策略枚举的
+  变体需要配置字符串映射；K 为参数化（非常量），装配方式待后续设计。
+  本项只交付算法，调用方直接构造 `KShortest::new(k)`。
+- E4 场景 `k_shortest.toml`（id=`product.k-shortest`，
+  `cargo run --quiet -p nexus --example k_shortest -- --json`）：
+  拓扑 A-B(10)-D、A-C(10)-D、A-D(35)（直连 35ms）：
+  - `k_paths_found`：K=3 时 A→D 得 3 条（20ms 经 B、20ms 经 C、35ms 直连）；
+  - `k_ordered`：按代价升序；
+  - `k_truncated`：K=2 时只返回 2 条；
+  - `k_unreachable`：孤立节点返回空。
+  期望 `verdict=PASS`。
+- 冻结边界：`RoutingStrategy` 集成（待参数化策略设计）；Disjoint
+  （边/点不交）路径（后续）；真实转发面挂接（后续）。
+- 契约 hash：`d28e3c0a52b8308c2d3d3b9a40d18651556141b1`（verify 时写入）。

@@ -94,5 +94,13 @@
     "module": "nexus-discovery",
     "category": "implementation-pattern",
     "summary": "[routing] strategy 配置装配：RoutingStrategy 枚举直接实现 PathComputer（静态分发）；覆盖全部默认方法避免丢失批量优化"
+  },
+  {
+    "id": "kshortest-yen-implementation",
+    "file": "entries/2026-09-29-kshortest-yen-implementation.md",
+    "date": "2026-09-29",
+    "module": "nexus-discovery",
+    "category": "implementation-pattern",
+    "summary": "K-shortest 路径 Yen 算法：dijkstra_excluding 带排除集；spur 区间三处易错点；K=1 退化断言"
   }
 ]

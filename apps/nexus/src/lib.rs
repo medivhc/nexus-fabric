@@ -9163,3 +9163,130 @@ pub fn routing_strategy_flow() -> Result<Value, NexusError> {
         },
     }))
 }
+
+/// E4 产品场景 `product.k-shortest` 的可执行驱动（PRODUCT §12.49）。
+///
+/// 拓扑：A-B(10)、B-D(10)、A-C(10)、C-D(10)、A-D(35 直连)。
+/// K=3 时 A→D 应得 3 条：20ms 经 B、20ms 经 C、35ms 直连（按代价升序）。
+pub fn k_shortest_flow() -> Result<Value, NexusError> {
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::{KShortest, PathComputer, TopoView};
+
+    let mut events: Vec<&'static str> = Vec::new();
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("k_shortest: {m}"),
+    };
+
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    let id_d = PeerId("node-d".to_string());
+    let id_iso = PeerId("node-iso".to_string());
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10), link(&id_d, 35)],
+    });
+    for (id, vip, nbs) in [
+        (
+            id_b.clone(),
+            "10.99.0.2",
+            vec![link(&id_a, 10), link(&id_d, 10)],
+        ),
+        (
+            id_c.clone(),
+            "10.99.0.3",
+            vec![link(&id_a, 10), link(&id_d, 10)],
+        ),
+        (
+            id_d.clone(),
+            "10.99.0.4",
+            vec![link(&id_b, 10), link(&id_c, 10), link(&id_a, 35)],
+        ),
+        (id_iso.clone(), "10.99.0.9", vec![]),
+    ] {
+        lsdb.update(Lsa {
+            node_id: id,
+            vip: vip.to_string(),
+            incarnation: 1,
+            seq: 1,
+            capabilities: 0,
+            locator: None,
+            neighbors: nbs,
+        });
+    }
+    let topo = TopoView::from_lsdb(&lsdb);
+
+    // ---- 阶段 1：K=3 得 3 条 ----
+    let ks3 = KShortest::new(3);
+    if ks3.name() != "k-shortest" {
+        return Err(fail("name"));
+    }
+    let paths = ks3.compute_paths(&topo, &id_a, &id_d);
+    if paths.len() != 3 {
+        return Err(fail(&format!(
+            "K=3 should find 3 paths, got {}",
+            paths.len()
+        )));
+    }
+    events.push("k_paths_found");
+
+    // ---- 阶段 2：按代价升序 ----
+    let costs: Vec<u64> = paths.iter().map(|p| p.cost).collect();
+    if costs != vec![20, 20, 35] {
+        return Err(fail(&format!("costs should be [20,20,35], got {costs:?}")));
+    }
+    // 前两条为经 B / 经 C（顺序不限），第三条为直连。
+    if paths[2].nodes.len() != 2 || paths[2].nodes[1] != id_d {
+        return Err(fail("3rd path should be direct A->D"));
+    }
+    events.push("k_ordered");
+
+    // ---- 阶段 3：K=2 截断 ----
+    let ks2 = KShortest::new(2);
+    let paths2 = ks2.compute_paths(&topo, &id_a, &id_d);
+    if paths2.len() != 2 {
+        return Err(fail("K=2 should return 2 paths"));
+    }
+    // compute() 返回第一条（最短）。
+    let first = ks3
+        .compute(&topo, &id_a, &id_d)
+        .ok_or_else(|| fail("compute"))?;
+    if first.cost != 20 {
+        return Err(fail("compute() should return shortest"));
+    }
+    events.push("k_truncated");
+
+    // ---- 阶段 4：不可达 → 空 ----
+    let empty = ks3.compute_paths(&topo, &id_a, &id_iso);
+    if !empty.is_empty() {
+        return Err(fail("unreachable should return empty"));
+    }
+    events.push("k_unreachable");
+
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "kshortest": {
+            "k3_count": paths.len(),
+            "k3_costs": costs,
+        },
+    }))
+}

@@ -251,3 +251,17 @@ LSA/LSDB/泛洪/算路/FIB 零改动。
 - Deletion Test：策略装配是"配置→算法选择"的独立变化维度（之前各调用方
   hardcode 具体 `PathComputer` 类型）；删除后新增策略需改所有调用点，
   违反开闭原则。
+
+### 冻结契约（K-shortest 路径 P5，PRODUCT §12.49，scenarios/product/k_shortest.toml）
+
+在 §12.48 的 `routing` 模块上增量：新增 `PathComputer` 实现 `KShortest`；
+LSA/LSDB/泛洪/算路/FIB/策略枚举零改动。
+
+- `pub struct KShortest`：`KShortest::new(k)`（`k>=1`，`k==0` panic）；
+  `name()=="k-shortest"`；`k()` 返回 K 值。
+- Yen 算法：P1 = Dijkstra；P(k) 经 spur node 枚举（删除成环边/节点后
+  Dijkstra 求 spur path）；返回至多 K 条无环路径，按代价升序；
+  不可达 → 空 Vec；`compute()` 返回第一条。
+- 复杂度 O(K·V·(E log V))；`RoutingStrategy` 暂不集成（K 参数化，待设计）。
+- Deletion Test：K-shortest 是"非等代价多路径"的独立变化维度
+  （ECMP 只给等代价，K-shortest 给主备）；删除后无备用路径来源。

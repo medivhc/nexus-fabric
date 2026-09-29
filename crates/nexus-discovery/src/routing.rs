@@ -7,7 +7,7 @@
 //! Constrained 为后续 feature（只加 `PathComputer` impl，不动 LSDB/FIB/协议）。
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use crate::PeerId;
 use crate::lsa::Lsdb;
@@ -225,6 +225,66 @@ impl ShortestPath {
             cost,
         })
     }
+
+    /// 带排除集的 Dijkstra（Yen 算法用）：跳过 `excluded_nodes` 中的节点
+    /// 和 `excluded_edges` 中的有向边。
+    fn dijkstra_excluding<'t>(
+        topo: &TopoView<'t>,
+        src: &'t str,
+        excluded_nodes: &HashSet<&'t str>,
+        excluded_edges: &HashSet<(&'t str, &'t str)>,
+    ) -> (HashMap<&'t str, u64>, HashMap<&'t str, &'t str>) {
+        let mut dist: HashMap<&'t str, u64> = HashMap::new();
+        let mut prev: HashMap<&'t str, &'t str> = HashMap::new();
+        let mut heap: BinaryHeap<(Reverse<u64>, &'t str)> = BinaryHeap::new();
+        if excluded_nodes.contains(src) {
+            return (dist, prev);
+        }
+        dist.insert(src, 0);
+        heap.push((Reverse(0), src));
+
+        while let Some((Reverse(d), u)) = heap.pop() {
+            if d > *dist.get(u).unwrap_or(&u64::MAX) {
+                continue;
+            }
+            for &(v, w) in topo.out_edges(u) {
+                if excluded_nodes.contains(v) {
+                    continue;
+                }
+                if excluded_edges.contains(&(u, v)) {
+                    continue;
+                }
+                let nd = d.saturating_add(w);
+                if nd < *dist.get(v).unwrap_or(&u64::MAX) {
+                    dist.insert(v, nd);
+                    prev.insert(v, u);
+                    heap.push((Reverse(nd), v));
+                }
+            }
+        }
+        (dist, prev)
+    }
+
+    /// 从前驱表重建 src_key → dst_key 的节点序列（`&str` 形式，Yen 算法用）；
+    /// 不可达 → `None`。
+    fn build_node_seq<'t>(
+        src_key: &'t str,
+        dst_key: &'t str,
+        dist: &HashMap<&'t str, u64>,
+        prev: &HashMap<&'t str, &'t str>,
+    ) -> Option<Vec<&'t str>> {
+        if !dist.contains_key(dst_key) {
+            return None;
+        }
+        let mut rev: Vec<&'t str> = vec![dst_key];
+        let mut cur = dst_key;
+        while cur != src_key {
+            cur = *prev.get(cur)?;
+            rev.push(cur);
+        }
+        rev.reverse();
+        Some(rev)
+    }
 }
 
 /// ECMP 等代价多路径：Dijkstra 保留所有等代价前驱，枚举全部等代价最短路。
@@ -366,6 +426,152 @@ impl PathComputer for Ecmp {
             }
         }
         out
+    }
+}
+
+/// K-shortest 路径（Yen 算法）：src→dst 的前 K 条无环最短路（§12.49）。
+///
+/// 代价可不同（不限于等代价）：首条为主用，其余为备用。`k >= 1`；
+/// `k == 0` 构造时 panic（fail-fast）。
+/// 复杂度 O(K·V·(E log V))。
+#[derive(Debug, Clone, Copy)]
+pub struct KShortest {
+    k: usize,
+}
+
+impl KShortest {
+    /// 创建 K-shortest 算路器（`k >= 1`）。
+    ///
+    /// # Panics
+    ///
+    /// `k == 0` 时 panic。
+    #[must_use]
+    pub fn new(k: usize) -> Self {
+        assert!(k >= 1, "KShortest: k must be >= 1");
+        Self { k }
+    }
+
+    /// K 值。
+    #[must_use]
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    /// Yen 算法：返回至多 K 条无环最短路（节点序列，`&str` 形式）。
+    fn yen<'t>(topo: &TopoView<'t>, src: &'t str, dst: &'t str, k: usize) -> Vec<Vec<&'t str>> {
+        // P1：Dijkstra 最短路。
+        let (dist, prev) = ShortestPath::dijkstra(topo, src);
+        let first = match ShortestPath::build_node_seq(src, dst, &dist, &prev) {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+        let mut result: Vec<Vec<&'t str>> = vec![first];
+        // 候选堆：(代价, 路径)；BinaryHeap 为最大堆，用 Reverse 取最小。
+        let mut candidates: BinaryHeap<(Reverse<u64>, Vec<&'t str>)> = BinaryHeap::new();
+
+        for _ in 1..k {
+            let prev_path = &result[result.len() - 1];
+            // 对 P(k-1) 的每个中间节点（不含终点）为 spur node。
+            for spur_idx in 0..prev_path.len() - 1 {
+                let spur_node = prev_path[spur_idx];
+                let root_path: Vec<&'t str> = prev_path[0..=spur_idx].to_vec();
+
+                // 删除会导致环的边：若某已选路径的前缀与 root_path 相同，
+                // 删除其 spur 边（spur_node → 下一跳）。
+                let mut removed_edges: HashSet<(&'t str, &'t str)> = HashSet::new();
+                for p in &result {
+                    if p.len() > spur_idx + 1 && p[0..=spur_idx] == root_path[..] {
+                        removed_edges.insert((p[spur_idx], p[spur_idx + 1]));
+                    }
+                }
+                // 删除 root_path 上的节点（spur 自身除外），保证无环。
+                let removed_nodes: HashSet<&'t str> =
+                    root_path[0..spur_idx].iter().copied().collect();
+
+                let (dist2, prev2) = ShortestPath::dijkstra_excluding(
+                    topo,
+                    spur_node,
+                    &removed_nodes,
+                    &removed_edges,
+                );
+                if let Some(spur_seq) = ShortestPath::build_node_seq(spur_node, dst, &dist2, &prev2)
+                {
+                    // 总路径 = root_path + spur_path[1..]（spur_node 不重复）。
+                    let mut total = root_path.clone();
+                    total.extend_from_slice(&spur_seq[1..]);
+                    let cost = Self::path_cost(topo, &total);
+                    candidates.push((Reverse(cost), total));
+                }
+            }
+
+            if candidates.is_empty() {
+                break;
+            }
+            // 取最短且未选过的候选（Yen 可能产生重复）。
+            let mut next_path = None;
+            while let Some((_, path)) = candidates.pop() {
+                if !result.contains(&path) {
+                    next_path = Some(path);
+                    break;
+                }
+            }
+            match next_path {
+                Some(p) => result.push(p),
+                None => break,
+            }
+        }
+        result
+    }
+
+    /// 计算节点序列的总代价（沿拓扑查链路代价）。
+    fn path_cost(topo: &TopoView, nodes: &[&str]) -> u64 {
+        let mut cost = 0u64;
+        for w in nodes.windows(2) {
+            let (u, v) = (w[0], w[1]);
+            // 拓扑边必存在（路径由 Dijkstra 产生）；防御性 unwrap_or(1)。
+            let edge_cost = topo
+                .out_edges(u)
+                .iter()
+                .find(|(nb, _)| *nb == v)
+                .map(|(_, c)| *c)
+                .unwrap_or(1);
+            cost = cost.saturating_add(edge_cost);
+        }
+        cost
+    }
+}
+
+impl PathComputer for KShortest {
+    fn name(&self) -> &'static str {
+        "k-shortest"
+    }
+
+    fn compute(&self, topo: &TopoView, src: &PeerId, dst: &PeerId) -> Option<Path> {
+        self.compute_paths(topo, src, dst).into_iter().next()
+    }
+
+    fn compute_paths(&self, topo: &TopoView, src: &PeerId, dst: &PeerId) -> Vec<Path> {
+        let src_key = src.0.as_str();
+        let dst_key = dst.0.as_str();
+        if !topo.contains(src) || !topo.contains(dst) {
+            return Vec::new();
+        }
+        if src_key == dst_key {
+            return vec![Path {
+                nodes: vec![src.clone()],
+                cost: 0,
+            }];
+        }
+        Self::yen(topo, src_key, dst_key, self.k)
+            .into_iter()
+            .map(|nodes| {
+                let cost = Self::path_cost(topo, &nodes);
+                Path {
+                    nodes: nodes.into_iter().map(|s| PeerId(s.to_string())).collect(),
+                    cost,
+                }
+            })
+            .collect()
     }
 }
 
@@ -959,5 +1165,91 @@ mod tests {
         // Fib::compute 接受策略枚举（PathComputer）。
         let fib = Fib::compute(&db, &a, &via_strategy, 1);
         assert_eq!(fib.lookup("10.0.0.4").unwrap().len(), 2);
+    }
+
+    /// K-shortest 测试拓扑：A-B(10)-D，A-C(10)-D，A-D(35 直连)。
+    fn kshortest_lsdb() -> (Lsdb, PeerId, PeerId) {
+        let a = peer("a");
+        let d = peer("d");
+        let mut db = Lsdb::new(a.clone());
+        db.update_local(lsa(
+            "a",
+            "10.0.0.1",
+            vec![link("b", 10), link("c", 10), link("d", 35)],
+        ));
+        db.update(lsa("b", "10.0.0.2", vec![link("a", 10), link("d", 10)]));
+        db.update(lsa("c", "10.0.0.3", vec![link("a", 10), link("d", 10)]));
+        db.update(lsa(
+            "d",
+            "10.0.0.4",
+            vec![link("b", 10), link("c", 10), link("a", 35)],
+        ));
+        (db, a, d)
+    }
+
+    #[test]
+    fn kshortest_finds_k_ordered_paths() {
+        let (db, a, d) = kshortest_lsdb();
+        let topo = TopoView::from_lsdb(&db);
+        let ks = KShortest::new(3);
+        assert_eq!(ks.name(), "k-shortest");
+        assert_eq!(ks.k(), 3);
+
+        let paths = ks.compute_paths(&topo, &a, &d);
+        assert_eq!(paths.len(), 3);
+        let costs: Vec<u64> = paths.iter().map(|p| p.cost).collect();
+        assert_eq!(costs, vec![20, 20, 35]);
+        // 每条无环。
+        for p in &paths {
+            let mut seen = std::collections::HashSet::new();
+            for n in &p.nodes {
+                assert!(seen.insert(n), "path has cycle: {p:?}");
+            }
+        }
+        // compute() 返回最短。
+        assert_eq!(ks.compute(&topo, &a, &d).unwrap().cost, 20);
+    }
+
+    #[test]
+    fn kshortest_truncates_and_handles_unreachable() {
+        let (db, a, d) = kshortest_lsdb();
+        let topo = TopoView::from_lsdb(&db);
+        // K=2 只返回 2 条。
+        assert_eq!(KShortest::new(2).compute_paths(&topo, &a, &d).len(), 2);
+        // K=1 退化为最短路。
+        let one = KShortest::new(1).compute_paths(&topo, &a, &d);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].cost, 20);
+        // 不可达 → 空。
+        assert!(
+            KShortest::new(3)
+                .compute_paths(&topo, &a, &peer("ghost"))
+                .is_empty()
+        );
+        // 自到自。
+        let self_path = KShortest::new(3).compute_paths(&topo, &a, &a);
+        assert_eq!(self_path.len(), 1);
+        assert_eq!(self_path[0].cost, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "k must be >= 1")]
+    fn kshortest_zero_panics() {
+        let _ = KShortest::new(0);
+    }
+
+    #[test]
+    fn kshortest_k_larger_than_available() {
+        // K 大于实际路径数时返回实际条数（不 panic、不重复）。
+        let (db, a, d) = kshortest_lsdb();
+        let topo = TopoView::from_lsdb(&db);
+        let paths = KShortest::new(10).compute_paths(&topo, &a, &d);
+        // 该拓扑 A→D 恰 3 条无环路（经 B、经 C、直连）。
+        assert_eq!(paths.len(), 3);
+        let mut seen = std::collections::HashSet::new();
+        for p in &paths {
+            let key: Vec<String> = p.nodes.iter().map(|n| n.0.clone()).collect();
+            assert!(seen.insert(key), "duplicate path: {p:?}");
+        }
     }
 }
