@@ -61,3 +61,11 @@ architecture_policy = "policies/architecture.toml"
 dependency_policy = "policies/dependencies.toml"
 quality_policy = "policies/quality.toml"
 harness = "harness.toml"
+
+[patch.crates-io]
+# Nexus patch: quinn-proto 0.11.18 + fix for quinn-rs/quinn#2658
+# (loss-detection timer firing post-migration with no ack-eliciting packets
+# in flight trips a debug_assert in pto_time_and_space). The patch adds the
+# same guard that already exists in set_loss_detection_timer to
+# on_loss_detection_timeout. Upstream issue is open with no fix released.
+quinn-proto = { path = "vendor/quinn-proto" }

@@ -155,6 +155,7 @@ security = "RustSec DB fetch failed on 2026-09-30 (network); re-check at impleme
 portability = "sans-IO, no socket code; not in portable_core; old wasm32-wasip1 FAIL was quinn-udp/socket2 (not pulled)"
 supply_chain = "58 pkgs total; no C deps except ring's cc build (already in tree); rustls 0.23.45 matches existing tree version"
 os_transitive_deps = "none beyond ring's cc (already accepted)"
+patch = "vendor/quinn-proto ([patch.crates-io]): quinn-proto 0.11.18 + Nexus patch for quinn-rs/quinn#2658 (adds missing guard in on_loss_detection_timeout mirroring set_loss_detection_timer; required for connection migration without debug_assert panic). Upstream issue open, no fixed release. Patch is minimal and documented in vendor/quinn-proto/src/connection/mod.rs."
 approved = true
 approved_date = "2026-09-30"
 review_basis = "docs/foundation/PHASE0-INVENTORY.md#6 (live eval on xc-pc-linux)"
