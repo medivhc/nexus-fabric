@@ -8003,3 +8003,128 @@ pub fn schedule_cli_flow() -> Result<Value, NexusError> {
         "persist": { "reload_preserved": reload_preserved },
     }))
 }
+
+/// E4 `product.psk-handshake-admission`（PRODUCT §12.42）的可执行驱动。
+///
+/// ```text
+/// 同 PSK 双端握手 -> 会话建立 -> 数据帧往返解密成功
+///   -> 异 PSK 双端派生密钥不同 -> 数据帧解密失败 DecryptionFailed
+///   -> 单边无 PSK -> 数据帧解密失败 DecryptionFailed
+/// ```
+///
+/// 全程零真实网络；错误一律 typed `Result`，无 panic。
+pub fn psk_handshake_admission_flow() -> Result<Value, NexusError> {
+    use nexus_connectivity::encryption::{
+        EncryptionError, KeyPair, decrypt_frame, derive_authed_keys, derive_authed_keys_with_psk,
+        encrypt_frame,
+    };
+
+    /// 双端握手钥匙对（A=initiator, B=responder），可选 PSK。
+    fn handshake_pair(
+        psk_a: Option<&[u8]>,
+        psk_b: Option<&[u8]>,
+    ) -> Result<
+        (
+            nexus_connectivity::encryption::DirectionalKeys,
+            nexus_connectivity::encryption::DirectionalKeys,
+        ),
+        NexusError,
+    > {
+        let a_static = KeyPair::generate().map_err(enc_err)?;
+        let a_eph = KeyPair::generate().map_err(enc_err)?;
+        let b_static = KeyPair::generate().map_err(enc_err)?;
+        let b_eph = KeyPair::generate().map_err(enc_err)?;
+        let derive = |mine_s: &KeyPair,
+                      mine_e: &KeyPair,
+                      peer_s: &[u8; 32],
+                      peer_e: &[u8; 32],
+                      initiator: bool,
+                      psk: Option<&[u8]>| {
+            match psk {
+                Some(p) => {
+                    derive_authed_keys_with_psk(mine_s, mine_e, peer_s, peer_e, initiator, p)
+                }
+                None => derive_authed_keys(mine_s, mine_e, peer_s, peer_e, initiator),
+            }
+            .map_err(enc_err)
+        };
+        let keys_a = derive(
+            &a_static,
+            &a_eph,
+            b_static.public_key_bytes(),
+            b_eph.public_key_bytes(),
+            true,
+            psk_a,
+        )?;
+        let keys_b = derive(
+            &b_static,
+            &b_eph,
+            a_static.public_key_bytes(),
+            a_eph.public_key_bytes(),
+            false,
+            psk_b,
+        )?;
+        Ok((keys_a, keys_b))
+    }
+
+    let mut events: Vec<&'static str> = Vec::new();
+    let psk: &[u8] = b"test-network-psk-001";
+    let other_psk: &[u8] = b"different-psk-002";
+    let payload = b"psk-admission-probe";
+    let seq: u64 = 7;
+
+    // 1) 同 PSK：握手完成，数据帧往返。
+    let (keys_a, keys_b) = handshake_pair(Some(psk), Some(psk))?;
+    events.push("psk_handshake_completed");
+    let frame = encrypt_frame(&keys_a.tx, seq, payload).map_err(enc_err)?;
+    let (got_seq, plain) = decrypt_frame(&keys_b.rx, &frame).map_err(enc_err)?;
+    if got_seq != seq || plain.as_slice() != payload {
+        return Err(NexusError::Internal {
+            message: "psk admission: same-psk roundtrip mismatch".to_string(),
+        });
+    }
+    events.push("psk_data_frame_decrypted");
+
+    // 2) 异 PSK：派生密钥不同，首个数据帧解密必须失败。
+    let (keys_c, keys_d) = handshake_pair(Some(psk), Some(other_psk))?;
+    let bad_frame = encrypt_frame(&keys_c.tx, seq, payload).map_err(enc_err)?;
+    let mismatch_err = match decrypt_frame(&keys_d.rx, &bad_frame) {
+        Err(EncryptionError::DecryptionFailed) => "DecryptionFailed",
+        Err(e) => {
+            return Err(NexusError::Internal {
+                message: format!("psk admission: mismatch gave unexpected error {e:?}"),
+            });
+        }
+        Ok(_) => {
+            return Err(NexusError::Internal {
+                message: "psk admission: mismatched-psk frame decrypted (must fail)".to_string(),
+            });
+        }
+    };
+    events.push("psk_mismatch_rejected");
+
+    // 3) 单边无 PSK：同样必须解密失败。
+    let (keys_e, keys_f) = handshake_pair(Some(psk), None)?;
+    let bad_frame2 = encrypt_frame(&keys_e.tx, seq, payload).map_err(enc_err)?;
+    let absent_err = match decrypt_frame(&keys_f.rx, &bad_frame2) {
+        Err(EncryptionError::DecryptionFailed) => "DecryptionFailed",
+        Err(e) => {
+            return Err(NexusError::Internal {
+                message: format!("psk admission: absent-psk gave unexpected error {e:?}"),
+            });
+        }
+        Ok(_) => {
+            return Err(NexusError::Internal {
+                message: "psk admission: absent-psk frame decrypted (must fail)".to_string(),
+            });
+        }
+    };
+    events.push("psk_absent_rejected");
+
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "mismatch": { "error": mismatch_err },
+        "absent": { "error": absent_err },
+    }))
+}

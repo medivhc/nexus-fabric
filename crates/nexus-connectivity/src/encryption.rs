@@ -323,12 +323,18 @@ impl HandshakeMessage {
 /// - dh3 = DH(本端 ephemeral, 对端 ephemeral)：前向保密。
 ///
 /// 双方各自以本端私钥计算，得到同一 base（X25519 DH 对称性）。
+///
+/// P5 §12.42 PSK 网络准入：`psk = Some(..)` 时 salt 扩展为
+/// `b"nexus-link-encryption-v2" ∥ psk`。PSK 不同/缺失 → salt 不同 → base 不同 →
+/// 方向子密钥全部不同 → 首个 AEAD 数据帧解密失败。`None` 时沿用原固定 salt，
+/// 既有行为逐字节不变。
 fn derive_base_authed(
     my_static: &KeyPair,
     my_eph: &KeyPair,
     peer_static: &[u8; PUBLIC_KEY_LEN],
     peer_eph: &[u8; PUBLIC_KEY_LEN],
     initiator: bool,
+    psk: Option<&[u8]>,
 ) -> Result<[u8; SESSION_KEY_LEN], EncryptionError> {
     // WireGuard 角色对称：dh1 恒为 DH(发起方 static, 响应方 eph)，dh2 恒为
     // DH(发起方 eph, 响应方 static)，dh3 = DH(eph_i, eph_r)。
@@ -354,7 +360,12 @@ fn derive_base_authed(
 
     let mut ordered = [my_static.public.as_slice(), peer_static.as_slice()];
     ordered.sort();
-    let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, b"nexus-link-encryption-v2");
+    // §12.42：PSK 混入 salt（无 PSK 时退化为原固定 salt）。
+    let mut salt_material = b"nexus-link-encryption-v2".to_vec();
+    if let Some(p) = psk {
+        salt_material.extend_from_slice(p);
+    }
+    let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, &salt_material);
     let prk = salt.extract(&material);
     let okm = prk
         .expand(&ordered, hkdf::HKDF_SHA256)
@@ -386,6 +397,9 @@ pub fn build_handshake_message(
 ///
 /// `initiator=true` 取发起方视角（本端 `tx` 与对端 `rx` 相同）；`false` 取响应方
 /// 视角。双方传入各自私钥（static/eph）与对端公钥（static/eph）。
+///
+/// 本函数为无 PSK 模式（§12.39 语义，行为与之前逐字节一致）；PSK 模式见
+/// [`derive_authed_keys_with_psk`]（§12.42）。
 pub fn derive_authed_keys(
     my_static: &KeyPair,
     my_eph: &KeyPair,
@@ -393,7 +407,32 @@ pub fn derive_authed_keys(
     peer_eph: &[u8; PUBLIC_KEY_LEN],
     initiator: bool,
 ) -> Result<DirectionalKeys, EncryptionError> {
-    let base = derive_base_authed(my_static, my_eph, peer_static, peer_eph, initiator)?;
+    let base = derive_base_authed(my_static, my_eph, peer_static, peer_eph, initiator, None)?;
+    DirectionalKeys::split(&base, initiator)
+}
+
+/// PSK 绑定的混合 DH 会话派生（P5 §12.42 网络准入）。
+///
+/// 与 [`derive_authed_keys`] 相同，仅 HKDF salt 扩展为
+/// `b"nexus-link-encryption-v2" ∥ psk`。双方 PSK 一致 → 与无 PSK 模式互操作之外的
+/// 独立密钥空间；PSK 不一致/缺失 → 对端派生密钥不同 → 首个 AEAD 数据帧
+/// `DecryptionFailed`。
+pub fn derive_authed_keys_with_psk(
+    my_static: &KeyPair,
+    my_eph: &KeyPair,
+    peer_static: &[u8; PUBLIC_KEY_LEN],
+    peer_eph: &[u8; PUBLIC_KEY_LEN],
+    initiator: bool,
+    psk: &[u8],
+) -> Result<DirectionalKeys, EncryptionError> {
+    let base = derive_base_authed(
+        my_static,
+        my_eph,
+        peer_static,
+        peer_eph,
+        initiator,
+        Some(psk),
+    )?;
     DirectionalKeys::split(&base, initiator)
 }
 

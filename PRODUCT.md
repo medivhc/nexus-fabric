@@ -2320,6 +2320,38 @@ crate 内 policy 逻辑保持零真实 socket；真实 TCP / 线程定时器 / �
 - 冻结边界（本项不做）：管线与加密会话共存（当前仅明文数据面激活管线，加密会话 wire 不变）、
   真实 IP 头解析/conntrack、排队缓冲、生产时钟、relay 分片、规则热更新。
 
+### 12.42 P5 PSK 网络准入：握手 PSK 绑定（2026-09-29）{#12-psk-admission}
+
+接 §12.39（三重 DH 已提供**双向身份认证**：完成握手需知晓与所声明 `static_public`
+对应的 static 私钥；TOFU 做身份持久化与替换拒绝）。本项补的是另一块：
+**网络准入控制（admission control）**——§12.39 下任何自生成密钥对的节点都能完成
+握手（TOFU 自动学习），网络成员实质开放；PSK 绑定后，PSK 即"网络"的定义，
+只有持相同 PSK 的节点能派生出可用的会话密钥（WireGuard PSK 同款语义）。
+
+- **机制**：network PSK 混入 `derive_base_authed` 的 HKDF-SHA256 salt
+ （`salt = b"nexus-link-encryption-v2" ∥ psk`；无 PSK 时沿用原固定 salt，
+  既有行为逐字节不变）。base 是全部会话密钥的根，PSK 不同 → base 不同 →
+  方向子密钥全部不同。
+- **可观察语义**：
+  - 双方相同 PSK → 握手完成，数据帧正常加解密（与无 PSK 模式行为一致）；
+  - PSK 不同 / 一方有 PSK 一方无 → 握手消息交换本身不受影响（65B 明文），
+    但派生密钥不同，**首个 AEAD 数据帧解密失败**（`DecryptionFailed`）→ 建连失败。
+    失败点在数据面是该握手模式的标准行为（与 WireGuard PSK 一致）。
+- **机制与策略分离**：crypto 层（portable core）同时支持 `Some(psk)` / `None`
+  两种模式；fail-closed 策略（未配置 PSK 拒绝组网）在装配层（`subnet up`，Phase 1
+  去中心化组网时交付），不在 crypto 层硬编码。
+- **PSK 处理要求**：内存零化（zeroize）；日志永不打印 PSK 或其哈希；
+  推荐经文件注入（`network_psk_file` + 0600 权限检查，装配层实现）。
+- **API**：新增 `derive_authed_keys_with_psk(..., psk: &[u8])`；
+  既有 `derive_authed_keys` 保持签名与行为不变（= `psk=None`），既有全部 E4 场景 Protected。
+- E4 场景 `psk_handshake_admission.toml`（id=`product.psk-handshake-admission`，
+  example `psk_handshake_admission --json`，零真实网络）：断言
+  `psk_handshake_completed`（同 PSK 建连）、`psk_data_frame_decrypted`（同 PSK 数据往返）、
+  `psk_mismatch_rejected`（异 PSK 解密失败）、`psk_absent_rejected`（单边无 PSK 解密失败）
+  与 `verdict=PASS`。
+- 冻结边界（本项不做）：PSK 在线轮换协议、Ed25519 身份签名、CLI/TOML 装配与
+  fail-closed（Phase 1）、`virtual_subnet.rs` 握手路径的 PSK 穿透（Phase 1）。
+
 ## 13. Windows 系统代理接管与常驻自启（system-proxy + autostart，2026-09-24）{#13-system-proxy}
 
 桌面/Windows 场景下，nexusd 作为本地入口把系统 WinINET 代理指向本地数据面，

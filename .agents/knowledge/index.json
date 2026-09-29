@@ -46,5 +46,13 @@
     "module": "apps/nexus",
     "category": "implementation-pitfall",
     "summary": "TCP pump_bytes 半双工 EOF 缺少双向 shutdown 导致场景执行死锁挂起 >1 小时；harness 加载 scenario 缺少 given.platform 过滤导致跨平台误报"
+  },
+  {
+    "id": "psk-empty-001",
+    "file": "entries/2026-09-29-psk-empty-secret-semantics.md",
+    "date": "2026-09-29",
+    "module": "nexus-connectivity",
+    "category": "implementation-pitfall",
+    "summary": "可选密钥参数(&[u8])必须显式定义空值语义：PSK 为空字节串时 salt 塌缩为无 PSK，静默降级准入控制；契约应二选一（文档化退化或 fail-closed 拒绝）并配断言"
   }
 ]
