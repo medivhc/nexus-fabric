@@ -77,9 +77,10 @@ fn run() -> Result<(String, bool), String> {
     });
 
     // Client.
-    let mut config = ConnConfig::default();
-    config.addrs = vec![server_addr];
-    config.handshake_timeout = Duration::from_secs(10);
+    let config = ConnConfig {
+        addrs: vec![server_addr],
+        handshake_timeout: Duration::from_secs(10),
+    };
     let conn =
         FabricConn::connect(server_peer, &config).map_err(|e| format!("connect: {e}"))?;
     let (mut send, mut recv) = conn.open_bi().map_err(|e| format!("open_bi: {e}"))?;
