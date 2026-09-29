@@ -258,7 +258,7 @@ impl SendStream {
         if let Some(e) = ss.error.clone() {
             return Err(e);
         }
-        ss.send_buf.extend_from_slice(buf);
+        ss.send_buf.extend(buf.iter().copied());
         let _ = self.shared.tx.send(Cmd::Pump {
             conn: self.shared.conn_id,
         });

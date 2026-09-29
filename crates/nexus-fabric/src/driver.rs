@@ -64,6 +64,15 @@ pub struct ConnState {
     pub closed: Option<FabricError>,
 }
 
+impl std::fmt::Debug for ConnShared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnShared")
+            .field("id", &self.id)
+            .field("peer", &self.peer)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ConnShared {
     fn new(id: ConnectionId, peer: PeerId, tx: mpsc::Sender<Cmd>) -> Self {
         Self {
@@ -165,6 +174,12 @@ pub struct Driver {
     tx: mpsc::Sender<Cmd>,
     shared: Arc<DriverShared>,
     thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl std::fmt::Debug for Driver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Driver").finish_non_exhaustive()
+    }
 }
 
 pub struct DriverShared {
@@ -293,6 +308,7 @@ impl Driver {
                 .map_err(|_| FabricError::Transport("lock poisoned".into()))?;
             st = g;
         }
+        drop(st);
         Ok(shared)
     }
 
@@ -664,11 +680,13 @@ impl Loop {
         }
         self.update_stats(id);
         // Reap fully-closed connections (keep shared state for late stats()).
-        let reaped = matches!(
-            self.live.get(&id),
-            Some(lc) if lc.quic.poll_timeout().is_none()
-                && lc.shared.state.lock().unwrap().closed.is_some()
-        );
+        let reaped = match self.live.get_mut(&id) {
+            Some(lc) => {
+                lc.quic.poll_timeout().is_none()
+                    && lc.shared.state.lock().unwrap().closed.is_some()
+            }
+            None => false,
+        };
         if reaped {
             if let Some(lc) = self.live.remove(&id) {
                 self.handle_map.remove(&lc.handle);
@@ -718,6 +736,9 @@ impl Loop {
             }
         }
         // RECV: QUIC -> app buffer.
+        // quinn-proto 0.11: Chunks::next() yields Ok(Some(chunk)) for data,
+        // Ok(None) when the stream is finished AND fully read (= EOF),
+        // Err(Blocked) when no data is available yet.
         {
             let mut ss = sh.state.lock().unwrap();
             if ss.error.is_none() && !ss.recv_eof {
@@ -729,21 +750,16 @@ impl Loop {
                                 Ok(Some(chunk)) => {
                                     got = true;
                                     lc.bytes_recv += chunk.bytes.len() as u64;
-                                    ss.recv_buf.extend_from_slice(&chunk.bytes);
-                                    if chunk.eof {
-                                        ss.recv_eof = true;
-                                    }
+                                    ss.recv_buf.extend(chunk.bytes.iter().copied());
                                 }
-                                Ok(None) => break,
+                                Ok(None) => {
+                                    ss.recv_eof = true;
+                                    break;
+                                }
+                                Err(quinn_proto::ReadError::Blocked) => break,
                                 Err(quinn_proto::ReadError::Reset(code)) => {
                                     ss.error =
                                         Some(FabricError::Closed(code.into_inner() as u32));
-                                    break;
-                                }
-                                Err(_) => {
-                                    ss.error = Some(FabricError::Transport(
-                                        "stream read error".into(),
-                                    ));
                                     break;
                                 }
                             }
@@ -838,5 +854,6 @@ fn map_close_reason(reason: &quinn_proto::ConnectionError) -> FabricError {
         }
         E::VersionMismatch => FabricError::Transport("version mismatch".into()),
         E::Reset => FabricError::Transport("stateless reset".into()),
+        E::CidsExhausted => FabricError::Transport("connection ids exhausted".into()),
     }
 }
