@@ -120,7 +120,7 @@ fn spki_ed25519_raw(spki_der: &[u8]) -> Result<[u8; 32], String> {
         pos: 0,
     };
     let spki = outer.read_seq()?;
-    spki_content_ed25519_raw(spki.content)
+    spki_content_ed25519_raw(spki.data)
 }
 
 /// Parse the *content* of a SubjectPublicKeyInfo SEQUENCE (outer tag already
