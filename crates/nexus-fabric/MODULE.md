@@ -48,6 +48,17 @@ quinn-proto driver runs on its own std threads (the repository is tokio-free).
 - S8: 统计诚实：无样本时标记 unknown，不编造 0。
 - FabricConn != nexus-session Session。
 
+## Deletion Test（§12 新抽象论证）
+
+如果删除 `nexus-fabric`、让上层直接依赖 `quinn-proto`：
+- 会话语义（S1–S8：E2E 加密、CID 解耦、漫游、统计口径）将散落在各调用方，
+  失去单一可冻结的语义契约；
+- 路径层与投影层将各自发明连接抽象，破坏 "Identity != Locator" 的统一解释；
+- 失去独立的测试替身边界（路径层需要 mock FabricConn 做选路测试）。
+
+独立变化维度：会话语义的演进（0-RTT、多路径）与传输实现（quinn-proto 升级/替换）
+是两个维度的变化。故独立 crate 成立。
+
 ## Side Effects
 
 - UDP socket 收发；driver 线程（有明确 owner，见 §13 结构化并发要求，实现阶段落实）。
