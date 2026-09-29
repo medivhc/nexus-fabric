@@ -32,6 +32,16 @@ use crate::{ConnStats, ConnectionId, FabricError, PeerId};
 /// on the client side, one driver per listener on the server side).
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Lower bound for the UDP poll timeout in the driver drain loop.
+///
+/// `UdpSocket::set_read_timeout(Some(Duration::ZERO))` is rejected with
+/// `InvalidInput`, leaving the socket in whatever mode it had. On a freshly
+/// rebound socket that means blocking forever. A zero computed timeout means
+/// a QUIC timer is already due; wait minimally instead of hanging.
+fn min_poll_timeout(d: Duration) -> Duration {
+    d.max(Duration::from_millis(1))
+}
+
 /// Upper bound for a command-channel wakeup while blocked in `recv_from`.
 /// Bounds both command latency and QUIC timer granularity (P0: coarse pacing is fine).
 const POLL_CAP: Duration = Duration::from_millis(5);
@@ -397,7 +407,15 @@ impl Loop {
                 let now = Instant::now();
                 let deadline = self.next_deadline(now);
                 let timeout = deadline.saturating_duration_since(now).min(POLL_CAP);
-                self.socket.set_read_timeout(Some(timeout)).ok();
+                // Never pass a zero timeout: `set_read_timeout(Some(ZERO))`
+                // is rejected with InvalidInput, leaving the socket as-is.
+                // On a freshly rebound socket that means blocking forever.
+                // A zero timeout means a timer is already due, so use a
+                // minimal wait and let the next pump handle it.
+                let timeout = min_poll_timeout(timeout);
+                if let Err(e) = self.socket.set_read_timeout(Some(timeout)) {
+                    debug_assert!(false, "set_read_timeout failed: {e:?}");
+                }
                 match self.socket.recv_from(&mut self.buf) {
                     Ok((n, remote)) => self.on_udp(n, remote),
                     Err(e)
@@ -864,5 +882,29 @@ fn map_close_reason(reason: &quinn_proto::ConnectionError) -> FabricError {
         E::VersionMismatch => FabricError::Transport("version mismatch".into()),
         E::Reset => FabricError::Transport("stateless reset".into()),
         E::CidsExhausted => FabricError::Transport("connection ids exhausted".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn poll_timeout_never_zero() {
+        // Regression: a zero poll timeout made `set_read_timeout` fail with
+        // InvalidInput, leaving a freshly rebound socket blocking forever.
+        assert_eq!(
+            min_poll_timeout(Duration::ZERO),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            min_poll_timeout(Duration::from_millis(5)),
+            Duration::from_millis(5)
+        );
+        assert_eq!(
+            min_poll_timeout(Duration::from_secs(10)),
+            Duration::from_secs(10)
+        );
     }
 }
