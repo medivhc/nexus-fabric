@@ -2391,6 +2391,44 @@ crate 内 policy 逻辑保持零真实 socket；真实 TCP / 线程定时器 / �
 - 冻结边界（本项不做）：Hello/Welcome 入网协议、LSA 泛洪/LSDB、VIP 冲突解决协议、
   IPv6、PSK 在线轮换。
 
+### 12.44 P5 去中心化发现：Hello/Welcome 入网 + LSA 泛洪/LSDB（2026-09-29）{#12-lsa-discovery}
+
+接 §12.43（配置层）。本项交付去中心化发现的**协议与状态机**（portable core，
+零 I/O）：新节点经 bootstrap 入网（Hello/Welcome），全网经 LSA 泛洪收敛到一致的
+链路状态数据库（LSDB）。本项 LSA **只负责发现**（peer 集合）；选路（Dijkstra）
+与转发表为后续 feature，现有距离矢量路由（§12.6）保留。
+
+- **LSA 帧格式**（`nexus-discovery::lsa`，版本化）：
+  `[version: u8=1][tag: u8][fields...]`；未知 tag → `Transport` 错误（不静默忽略，
+  由调用方决定断开或计数）。
+  - `Hello { node_id, vip, capabilities: u32, incarnation: u64 }`：新节点 → bootstrap。
+  - `Welcome { lsas: Vec<Lsa> }`：bootstrap → 新节点，全量 LSA 快照（仅入网时一次）。
+  - `LsaAdvert { lsa: Lsa }`：邻居间泛洪。
+  - `Lsa { node_id, vip, incarnation: u64, seq: u64, capabilities: u32,
+    locator: Option<String>, neighbors: Vec<LinkAdvert> }`。
+    `neighbors` 本项为空（发现不需链路信息），字段保留供选路 feature 用。
+  - 字符串 = `u16 BE` 长度前缀 + UTF-8；整数 = BE；`Option<String>` = `u8` 存在位 + 字符串。
+- **LSDB**（`Lsdb`）：
+  - `update(lsa) -> UpdateOutcome`（`New` / `Updated` / `Stale` / `SelfIgnored`）：
+    以 `(incarnation, seq)` 二元组比新旧；本端 LSA 永不被覆盖（`SelfIgnored`）。
+  - `get(node_id)`、`all()`、`len()` 只读视图。
+- **泛洪语义**（纯决策逻辑，发送由装配层执行）：
+  - `SeenCache::should_flood(node_id, incarnation, seq) -> bool`：未见过的
+    `(node_id, incarnation, seq)` → 泛洪；见过 → 丢弃。`SeenCache` 为有界 FIFO
+    （`new(capacity)` 指定容量，防内存无限增长；FIFO 在此是正确选择——淘汰旧条目
+    仅导致可能的重复泛洪，不影响正确性）。
+  - 接收方更新 LSDB 成功（`New`/`Updated`）→ 向除来源外的所有邻居转发。
+- **入网流程**：`Hello` → `Welcome`（全量快照种子 LSDB）→ `LsaAdvert` 增量收敛。
+  （协议序列；`JoinState` 状态机为后续装配层实现，本项 E4 由 flow 手动驱动。）
+- E4 场景 `lsa_discovery.toml`（id=`product.lsa-discovery`，
+  example `lsa_discovery --json`，三节点进程内）：断言
+  `hello_welcome_completed`（A 经 B 入网，LSDB 有 A+B）、`lsa_flood_converged`
+  （C 经 B 入网后，A 经泛洪学到 C，三节点 LSDB 一致）、`lsa_stale_rejected`
+  （旧 seq 的 LSA 被拒绝）、`lsa_self_ignored`（本端 LSA 不被覆盖）
+  与 `verdict=PASS`。
+- 冻结边界（本项不做）：真实 UDP 传输装配、Dijkstra 选路、FIB 多下一跳、
+  incarnation 持久化（本项内存）、VIP 冲突解决协议、gossip 反熵优化。
+
 ## 13. Windows 系统代理接管与常驻自启（system-proxy + autostart，2026-09-24）{#13-system-proxy}
 
 桌面/Windows 场景下，nexusd 作为本地入口把系统 WinINET 代理指向本地数据面，

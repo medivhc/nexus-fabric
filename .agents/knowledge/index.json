@@ -54,5 +54,13 @@
     "module": "nexus-connectivity",
     "category": "implementation-pitfall",
     "summary": "可选密钥参数(&[u8])必须显式定义空值语义：PSK 为空字节串时 salt 塌缩为无 PSK，静默降级准入控制；契约应二选一（文档化退化或 fail-closed 拒绝）并配断言"
+  },
+  {
+    "id": "lsa-codec-alloc-001",
+    "file": "entries/2026-09-29-lsa-codec-alloc-guard.md",
+    "date": "2026-09-29",
+    "module": "nexus-discovery",
+    "category": "implementation-pattern",
+    "summary": "解码不可信长度前缀时用 Vec::with_capacity(n.min(CAP)) 防过度分配；min 仅为容量提示非截断，Review 时需区分"
   }
 ]

@@ -9,6 +9,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod lsa;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;

@@ -149,6 +149,27 @@ cargo clippy -p nexus-discovery --all-targets -- -D warnings
 
 未定义性能预算的路径不得宣称“性能完成”。进入 hot path 后必须在 Contract 中增加 baseline、noise tolerance、warning threshold 与 blocking threshold。
 
+### 冻结契约（LSA 发现协议 P5，PRODUCT §12.44，scenarios/product/lsa_discovery.toml）
+
+新模块 `lsa`（portable：零 I/O、零第三方依赖）：Hello/Welcome 入网 + LSA 泛洪 +
+LSDB。本期 LSA 只负责发现（`neighbors` 为空）；选路为后续 feature。
+
+- 帧格式：`[version: u8=1][tag: u8][fields...]`；字符串 = `u16 BE` 长度前缀 + UTF-8；
+  整数 = BE；`Option<String>` = `u8` 存在位 + 字符串。版本不匹配 / 未知 tag /
+  截断 / 尾随字节 → `DiscoveryError::Transport`。
+- `pub enum LsaFrame { Hello { node_id, vip, capabilities: u32, incarnation: u64 },
+  Welcome { lsas: Vec<Lsa> }, LsaAdvert { lsa: Lsa } }`；
+  `pub fn encode_lsa_frame / decode_lsa_frame`（确定性、可移植）。
+- `pub struct Lsa { node_id: PeerId, vip: String, incarnation: u64, seq: u64,
+  capabilities: u32, locator: Option<String>, neighbors: Vec<LinkAdvert> }`。
+- `pub struct Lsdb`：`new(self_id)`；`update(lsa) -> UpdateOutcome`
+ （本端 → `SelfIgnored`；新 → `New`；`(incarnation, seq)` 更新 → `Updated`；
+  否则 → `Stale`）；`update_local(lsa)`（本端发布）；`get / contains / all / len`。
+- `pub struct SeenCache`：`new(capacity)`；`should_flood(node_id, incarnation, seq) -> bool`
+ （有界 FIFO 去重，防内存无限增长）。
+- Deletion Test：LSA 发现是去中心化拓扑同步的独立变化维度，与 `DiscoveryFrame`
+ （presence 查询）正交；无新 trait。
+
 ## Observability
 
 稳定结构化字段优先于自由文本；如涉及 Session/Provider/Path/Workspace，应携带对应 correlation id。
