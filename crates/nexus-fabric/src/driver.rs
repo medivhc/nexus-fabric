@@ -649,12 +649,15 @@ impl Loop {
                         lc.dgram_tx_q.push_front(data.to_vec());
                         break;
                     }
-                    Err(_) => { /* best-effort drop (S5) */ }
+                    Err(e) => {
+                        eprintln!("[drv] dgram send DROP: {e:?}");
+                    }
                 }
             }
             let shared = lc.shared.clone();
             let mut got = false;
             while let Some(b) = lc.quic.datagrams().recv() {
+                eprintln!("[drv] dgram recv {}", b.len());
                 lc.bytes_recv += b.len() as u64;
                 shared.dgrams.lock().unwrap().push_back(b.to_vec());
                 got = true;
