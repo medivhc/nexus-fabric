@@ -634,10 +634,17 @@ impl Loop {
     /// in quinn-proto's `set_loss_detection_timer`). Any other panic is
     /// re-raised.
     fn handle_timeout_guarded(quic: &mut quinn_proto::Connection, now: Instant) {
+        eprintln!("[dbg] handle_timeout_guarded: entering");
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             quic.handle_timeout(now);
         }));
+        eprintln!("[dbg] handle_timeout_guarded: catch_unwind returned");
         if let Err(payload) = r {
+            let is_str = payload.downcast_ref::<&str>().is_some();
+            let is_string = payload.downcast_ref::<String>().is_some();
+            eprintln!(
+                "[dbg] caught panic in handle_timeout: is_str={is_str} is_string={is_string}"
+            );
             let msg = payload
                 .downcast_ref::<&str>()
                 .copied()
@@ -645,6 +652,7 @@ impl Loop {
                     payload.downcast_ref::<String>().map(|s| s.as_str())
                 })
                 .unwrap_or("");
+            eprintln!("[dbg] panic msg: {msg}");
             if msg.contains("peer_completed_address_validation") {
                 return;
             }
