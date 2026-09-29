@@ -512,7 +512,6 @@ impl Loop {
             .live
             .get_mut(&conn)
             .ok_or(FabricError::Closed(0))?;
-        eprintln!("[drv] dgram queued, qlen={}", lc.dgram_tx_q.len());
         lc.dgram_tx_q.push_back(data);
         Ok(())
     }
@@ -653,25 +652,19 @@ impl Loop {
                 let len = d.len();
                 match lc.quic.datagrams().send(Bytes::from(d), true) {
                     Ok(()) => {
-                        eprintln!(
-                            "[drv] dgram sent ok, quic-outgoing-space={}",
-                            lc.quic.datagrams().send_buffer_space()
-                        );
                         lc.bytes_sent += len as u64;
                     }
                     Err(quinn_proto::SendDatagramError::Blocked(data)) => {
                         lc.dgram_tx_q.push_front(data.to_vec());
                         break;
                     }
-                    Err(e) => {
-                        eprintln!("[drv] dgram send DROP: {e:?}");
-                    }
+                    // Best-effort drop (S5).
+                    Err(_) => {}
                 }
             }
             let shared = lc.shared.clone();
             let mut got = false;
             while let Some(b) = lc.quic.datagrams().recv() {
-                eprintln!("[drv] dgram recv {}", b.len());
                 lc.bytes_recv += b.len() as u64;
                 shared.dgrams.lock().unwrap().push_back(b.to_vec());
                 got = true;
