@@ -215,8 +215,14 @@ fn subnet_foreground(
     println!("{up}");
     // Auto-Mesh 自动挡：自动打洞 + 断线自动重连。
     let mut mesh = nexus::mesh::AutoMeshController::new(tunnel, 500);
+
+    // crash 恢复：从磁盘加载已发现的 peer
+    let mesh_state = state_path.with_extension("mesh.json");
+    mesh.load_state(&mesh_state);
+
     let state_path_owned = state_path.to_path_buf();
-    mesh.run(move || !state_path_owned.exists());
+    let mesh_state_clone = mesh_state.clone();
+    mesh.run_with_save(move || !state_path_owned.exists(), Some(mesh_state_clone));
     Ok(0)
 }
 
@@ -257,8 +263,14 @@ fn subnet_foreground_real(
     // Auto-Mesh 自动挡：自动打洞 + 断线自动重连。
     // 持有真实隧道直到函数返回（drop 清理 wintun/tun 适配器与 UDP socket）。
     let mut mesh = nexus::mesh::AutoMeshController::new(tunnel, 500);
+
+    // crash 恢复：从磁盘加载已发现的 peer
+    let mesh_state = state_path.with_extension("mesh.json");
+    mesh.load_state(&mesh_state);
+
     let state_path_owned = state_path.to_path_buf();
-    mesh.run(move || !state_path_owned.exists());
+    let mesh_state_clone = mesh_state.clone();
+    mesh.run_with_save(move || !state_path_owned.exists(), Some(mesh_state_clone));
     Ok(0)
 }
 

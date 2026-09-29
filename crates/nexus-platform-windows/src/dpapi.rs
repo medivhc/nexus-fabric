@@ -9,17 +9,21 @@
 //!   （`FreeLibrary`）必须在所有借用该模块函数指针的句柄释放之后发生。
 //!   本模块之外不扩散 unsafe；错误映射为纯逻辑，可单测。
 
+#[cfg(windows)]
 use std::ffi::c_void;
 use std::io;
 
 /// `CRYPTPROTECT_UI_FORBIDDEN`（0x1）：禁止任何 UI 提示。
 pub const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x0000_0001;
 
+#[cfg(windows)]
 /// Windows `HANDLE` / `HMODULE`。
 type Handle = *mut c_void;
+#[cfg(windows)]
 /// Win32 `BOOL`。
 type Bool = i32;
 
+#[cfg(windows)]
 /// Win32 `DATA_BLOB`（DPAPI 输入/输出结构）。
 #[repr(C)]
 pub struct DataBlob {
@@ -29,6 +33,7 @@ pub struct DataBlob {
     pub pb_data: *mut u8,
 }
 
+#[cfg(windows)]
 /// `CryptProtectData(pDataIn, szDataDescr, pOptionalEntropy, pvReserved,
 /// pPromptStruct, dwFlags, pDataOut) -> BOOL`。
 type ProtectFn = unsafe extern "system" fn(
@@ -41,6 +46,7 @@ type ProtectFn = unsafe extern "system" fn(
     *mut DataBlob,
 ) -> Bool;
 
+#[cfg(windows)]
 /// 持有 crypt32 模块句柄与解析出的 DPAPI 函数指针。
 pub struct DpapiModule {
     module: Handle,
@@ -48,10 +54,12 @@ pub struct DpapiModule {
     unprotect: ProtectFn,
 }
 
+#[cfg(windows)]
 // SAFETY 论证：模块句柄与函数指针跨线程迁移安全（无进行中调用）；Drop 在
 // 最后使用后执行 FreeLibrary。
 unsafe impl Send for DpapiModule {}
 
+#[cfg(windows)]
 impl DpapiModule {
     /// 加载 crypt32.dll 并解析 DPAPI 导出（系统常驻库，加载必成功；
     /// 解析失败为环境异常）。
@@ -75,6 +83,7 @@ impl DpapiModule {
     }
 }
 
+#[cfg(windows)]
 impl Drop for DpapiModule {
     fn drop(&mut self) {
         // SAFETY：模块句柄有效且为本结构独占。
@@ -82,14 +91,17 @@ impl Drop for DpapiModule {
     }
 }
 
+#[cfg(windows)]
 /// 持有 DPAPI 输出 blob 所有权的最小句柄（Drop 时 LocalFree）。
 pub struct OwnedBlob {
     blob: DataBlob,
 }
 
+#[cfg(windows)]
 // SAFETY 论证：blob 指针由本结构独占，跨线程迁移（Send）时无进行中的调用。
 unsafe impl Send for OwnedBlob {}
 
+#[cfg(windows)]
 impl OwnedBlob {
     /// 把 DPAPI 输出的 blob 包为拥有者。
     ///
@@ -109,6 +121,7 @@ impl OwnedBlob {
     }
 }
 
+#[cfg(windows)]
 impl Drop for OwnedBlob {
     fn drop(&mut self) {
         if !self.blob.pb_data.is_null() {
@@ -118,6 +131,7 @@ impl Drop for OwnedBlob {
     }
 }
 
+#[cfg(windows)]
 unsafe extern "system" {
     /// kernel32!LoadLibraryW：加载 DLL 并返回模块句柄。
     fn LoadLibraryW(lp_file_name: *const u16) -> Handle;
@@ -129,6 +143,7 @@ unsafe extern "system" {
     fn LocalFree(h_mem: *mut c_void) -> *mut c_void;
 }
 
+#[cfg(windows)]
 /// 加载 crypt32.dll（系统常驻）。
 fn load_library() -> Result<Handle, io::Error> {
     let name: Vec<u16> = "crypt32.dll\0".encode_utf16().collect();
@@ -144,6 +159,7 @@ fn load_library() -> Result<Handle, io::Error> {
     }
 }
 
+#[cfg(windows)]
 /// 按名称解析导出（name 须含 NUL）。
 fn resolve(module: Handle, name: &[u8]) -> Result<ProtectFn, io::Error> {
     // SAFETY：module 有效；name 为 NUL 结尾。
@@ -159,6 +175,7 @@ fn resolve(module: Handle, name: &[u8]) -> Result<ProtectFn, io::Error> {
 }
 
 /// 用 DPAPI 加密明文（绑定当前 Windows 用户 + 机器，无需管理员）。
+#[cfg(windows)]
 pub fn protect(data: &[u8]) -> io::Result<Vec<u8>> {
     let api = DpapiModule::load()?;
     let input = DataBlob {
@@ -192,7 +209,18 @@ pub fn protect(data: &[u8]) -> io::Result<Vec<u8>> {
     Ok(owned.bytes().to_vec())
 }
 
+/// 非 Windows 环境下的纯软件模拟加密（用于跨平台场景与测试验证）。
+#[cfg(not(windows))]
+pub fn protect(data: &[u8]) -> io::Result<Vec<u8>> {
+    let mut out = b"MOCK_DPAPI:".to_vec();
+    for b in data {
+        out.push(b ^ 0x5a);
+    }
+    Ok(out)
+}
+
 /// 用 DPAPI 解密密文 blob。
+#[cfg(windows)]
 pub fn unprotect(cipher: &[u8]) -> io::Result<Vec<u8>> {
     let api = DpapiModule::load()?;
     let input = DataBlob {
@@ -226,11 +254,29 @@ pub fn unprotect(cipher: &[u8]) -> io::Result<Vec<u8>> {
     Ok(owned.bytes().to_vec())
 }
 
+/// 非 Windows 环境下的纯软件模拟解密。
+#[cfg(not(windows))]
+pub fn unprotect(cipher: &[u8]) -> io::Result<Vec<u8>> {
+    if !cipher.starts_with(b"MOCK_DPAPI:") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid mock dpapi header",
+        ));
+    }
+    let data = &cipher[b"MOCK_DPAPI:".len()..];
+    let mut out = Vec::with_capacity(data.len());
+    for b in data {
+        out.push(b ^ 0x5a);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    #[cfg(windows)]
     fn protect_unprotect_roundtrip() {
         let secret = b"nexus secure store secret";
         let cipher = protect(secret).expect("dpapi protect");
@@ -241,6 +287,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn protect_empty_is_valid() {
         let cipher = protect(b"").expect("dpapi protect empty");
         assert!(!cipher.is_empty());

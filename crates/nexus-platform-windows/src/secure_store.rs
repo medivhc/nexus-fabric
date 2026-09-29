@@ -90,6 +90,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn put_get_roundtrip_and_missing() {
         let store = DpapiSecureStore::new(tmp_dir("rt"));
         assert!(store.get("absent").unwrap().is_none());

@@ -363,6 +363,7 @@ pub fn dependency_gate(repo: &Repo, config: &Config) -> Gate {
         "cargo",
         &[
             "deny",
+            "--offline",
             "--config",
             deny_cfg.to_str().unwrap_or("policies/deny.toml"),
             "check",

@@ -12,6 +12,7 @@ pub mod tun;
 pub mod tun_vpi;
 
 pub use secure_store::FileSecureStore;
+pub use tun_vpi::TunVpi;
 
 pub const NEXUS_PLATFORM_LINUX_MODULE: &str = "nexus-platform-linux";
 

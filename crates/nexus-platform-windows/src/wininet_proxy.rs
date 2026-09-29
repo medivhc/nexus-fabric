@@ -12,25 +12,36 @@
 //! - 业务逻辑（宽字符串转换、DWORD→bool、读回比较）为纯函数，可单测，不碰注册表。
 
 use nexus_platform::{PlatformError, SystemProxyController, SystemProxyState};
+#[cfg(windows)]
 use std::ffi::c_void;
-use std::os::windows::ffi::OsStrExt;
 
 // --- 类型与常量（winreg.h / wininet.h 窄子集） ---
 
+#[cfg(windows)]
 type HKey = *mut c_void;
+#[cfg(windows)]
 type LStatus = i32;
+#[cfg(windows)]
 /// `HKEY_CURRENT_USER` 伪句柄。
 const HKEY_CURRENT_USER: HKey = 0x8000_0001usize as HKey;
+#[cfg(windows)]
 const KEY_SET_VALUE: u32 = 0x0002;
+#[cfg(windows)]
 const KEY_READ: u32 = 0x20019;
+#[cfg(windows)]
 const REG_SZ: u32 = 1;
+#[cfg(windows)]
 const ERROR_SUCCESS: i32 = 0;
+#[cfg(windows)]
 const INTERNET_OPTION_SETTINGS_CHANGED: u32 = 39;
+#[cfg(windows)]
 const INTERNET_OPTION_REFRESH: u32 = 37;
 
+#[cfg(windows)]
 /// Internet Settings 子键（相对 HKCU）。
 const SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 
+#[cfg(windows)]
 #[link(name = "advapi32")]
 unsafe extern "system" {
     fn RegOpenKeyExW(
@@ -59,6 +70,7 @@ unsafe extern "system" {
     fn RegCloseKey(h_key: HKey) -> LStatus;
 }
 
+#[cfg(windows)]
 #[link(name = "wininet")]
 unsafe extern "system" {
     fn InternetSetOptionW(
@@ -69,20 +81,20 @@ unsafe extern "system" {
     ) -> i32;
 }
 
+#[cfg(any(windows, test))]
 /// 把 Rust 字符串转为以 NUL 结尾的宽字符向量。
 fn to_wide(s: &str) -> Vec<u16> {
-    std::ffi::OsStr::new(s)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
+    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+#[cfg(any(windows, test))]
 /// 把 `Vec<u16>`（可能含末尾 NUL）转成 Rust String，丢弃尾部 NUL。
 fn from_wide_nul(buf: &[u16]) -> String {
     let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     String::from_utf16_lossy(&buf[..end])
 }
 
+#[cfg(windows)]
 fn reg_error(op: &str, code: LStatus) -> PlatformError {
     PlatformError::Io {
         operation: op.to_string(),
@@ -94,6 +106,7 @@ fn reg_error(op: &str, code: LStatus) -> PlatformError {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WinInetSystemProxy;
 
+#[cfg(windows)]
 impl WinInetSystemProxy {
     /// 创建一个控制器（无内部状态；每次调用都直接读写注册表）。
     #[must_use]
@@ -226,6 +239,7 @@ impl WinInetSystemProxy {
     }
 }
 
+#[cfg(windows)]
 impl SystemProxyController for WinInetSystemProxy {
     fn snapshot(&self) -> Result<SystemProxyState, PlatformError> {
         let hkey = Self::open_key(KEY_READ)?;
@@ -280,6 +294,47 @@ impl SystemProxyController for WinInetSystemProxy {
                 message: format!("settings_changed={ok1} refresh={ok2}"),
             });
         }
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+static MOCK_PROXY_STATE: std::sync::Mutex<Option<SystemProxyState>> = std::sync::Mutex::new(None);
+
+#[cfg(not(windows))]
+impl WinInetSystemProxy {
+    /// 创建一个控制器（非 Windows 模拟）。
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(not(windows))]
+impl SystemProxyController for WinInetSystemProxy {
+    fn snapshot(&self) -> Result<SystemProxyState, PlatformError> {
+        let guard = MOCK_PROXY_STATE.lock().unwrap();
+        Ok(guard.clone().unwrap_or(SystemProxyState {
+            enabled: false,
+            server: None,
+        }))
+    }
+
+    fn apply(&self, enabled: bool, server: Option<&str>) -> Result<(), PlatformError> {
+        let mut guard = MOCK_PROXY_STATE.lock().unwrap();
+        let cur_server = guard.as_ref().and_then(|s| s.server.clone());
+        let new_server = match server {
+            Some(s) => Some(s.to_string()),
+            None => cur_server,
+        };
+        *guard = Some(SystemProxyState {
+            enabled,
+            server: new_server,
+        });
+        Ok(())
+    }
+
+    fn refresh(&self) -> Result<(), PlatformError> {
         Ok(())
     }
 }

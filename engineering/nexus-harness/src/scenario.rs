@@ -24,6 +24,7 @@ pub enum ExpectKind {
 #[derive(Clone)]
 pub struct Scenario {
     pub id: String,
+    pub platform: Option<String>,
     pub command: Option<String>,
     pub expects: Vec<ScenarioExpect>,
 }
@@ -39,6 +40,11 @@ fn load_file(path: &PathBuf) -> Option<Scenario> {
     let text = std::fs::read_to_string(path).ok()?;
     let v: toml::Value = toml::from_str(&text).ok()?;
     let id = v.get("id")?.as_str()?.to_string();
+    let platform = v
+        .get("given")
+        .and_then(|g| g.get("platform"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_string);
     let command = v
         .get("when")?
         .get("command")
@@ -67,6 +73,7 @@ fn load_file(path: &PathBuf) -> Option<Scenario> {
         .unwrap_or_default();
     Some(Scenario {
         id,
+        platform,
         command,
         expects,
     })
@@ -186,6 +193,25 @@ pub fn run_gate(config: &Config, gate_name: &str, subdirs: &[&str]) -> (Vec<Scen
     let mut results: Vec<ScenarioResult> = Vec::new();
     let mut failed = false;
     for s in &scenarios {
+        if let Some(plat) = &s.platform {
+            let current_plat = if cfg!(windows) {
+                "windows"
+            } else if cfg!(target_os = "linux") {
+                "linux"
+            } else if cfg!(target_os = "macos") {
+                "macos"
+            } else {
+                "other"
+            };
+            if plat != current_plat {
+                results.push(ScenarioResult {
+                    id: s.id.clone(),
+                    verdict: "UNKNOWN".to_string(),
+                    detail: format!("platform contract ({plat} required, host is {current_plat})"),
+                });
+                continue;
+            }
+        }
         match &s.command {
             None => results.push(ScenarioResult {
                 id: s.id.clone(),
@@ -246,6 +272,7 @@ mod tests {
     fn scenario(expects: Vec<ScenarioExpect>) -> Scenario {
         Scenario {
             id: "t".to_string(),
+            platform: None,
             command: None,
             expects,
         }

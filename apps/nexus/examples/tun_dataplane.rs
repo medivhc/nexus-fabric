@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 use nexus::tun_dataplane_flow;
+#[cfg(windows)]
 use nexus_platform::VirtualPacketInterface;
 
 fn main() {

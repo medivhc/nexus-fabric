@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 use nexus::tun_proxy_flow;
+#[cfg(windows)]
 use nexus_platform::VirtualPacketInterface;
 
 fn main() {

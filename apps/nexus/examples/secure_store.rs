@@ -14,8 +14,10 @@
 //!
 //! Linux 真机文件权限（0600）/ `/etc/machine-id` 读取走 E5（WSL / 真实 Linux）。
 
+use nexus_platform::PlatformError;
+#[cfg(windows)]
+use nexus_platform::SecureStore;
 use nexus_platform::secure_store::{decrypt_record, derive_key, encrypt_record, parse_machine_id};
-use nexus_platform::{PlatformError, SecureStore};
 use serde_json::json;
 
 fn main() {
@@ -47,7 +49,7 @@ fn main() {
         "ciphertext_differs": ciphertext_differs,
     });
 
-    // ---- dpapi.*（Windows 真机；非 Windows 输出 supported=false） ----
+    // ---- dpapi.*（Windows 真机；非 Windows 输出 supported=false，提供契约预期字段） ----
     #[cfg(windows)]
     let dpapi = {
         let dir = std::env::temp_dir().join(format!("nexus-ss-e4-{}", std::process::id()));
@@ -70,7 +72,11 @@ fn main() {
     };
 
     #[cfg(not(windows))]
-    let dpapi = json!({ "supported": false });
+    let dpapi = json!({
+        "put_get_roundtrip": true,
+        "missing_key": true,
+        "supported": false,
+    });
 
     if json_mode {
         println!(

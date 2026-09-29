@@ -20,6 +20,7 @@ type Handle = *mut c_void;
 
 // --- 窄系统绑定：仅 kernel32 的三个动态加载函数（手写 extern，不引入第三方） ---
 
+#[cfg(windows)]
 unsafe extern "system" {
     /// kernel32!LoadLibraryW：加载 DLL 并返回模块句柄；失败返回 NULL。
     fn LoadLibraryW(lp_file_name: *const u16) -> Handle;
@@ -27,6 +28,22 @@ unsafe extern "system" {
     fn GetProcAddress(h_module: Handle, lp_proc_name: *const u8) -> *mut c_void;
     /// kernel32!FreeLibrary：释放模块引用；返回 0 表示失败（模块仍被引用）。
     fn FreeLibrary(h_lib_module: Handle) -> i32;
+}
+
+#[cfg(not(windows))]
+#[allow(non_snake_case)]
+unsafe fn LoadLibraryW(_: *const u16) -> Handle {
+    std::ptr::null_mut()
+}
+#[cfg(not(windows))]
+#[allow(non_snake_case)]
+unsafe fn GetProcAddress(_: Handle, _: *const u8) -> *mut c_void {
+    std::ptr::null_mut()
+}
+#[cfg(not(windows))]
+#[allow(non_snake_case)]
+unsafe fn FreeLibrary(_: Handle) -> i32 {
+    1
 }
 
 // --- wintun.h 0.14 窄 ABI：函数指针类型（WINAPI = stdcall） ---

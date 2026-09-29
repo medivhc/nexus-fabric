@@ -19,7 +19,7 @@ fn tmp_dir() -> PathBuf {
     std::env::temp_dir().join(format!("nexus-p426-it-{}", std::process::id()))
 }
 
-fn write_cfg(peer_vip: Option<&str>) -> PathBuf {
+fn write_cfg(tag: &str, peer_vip: Option<&str>) -> PathBuf {
     let dir = tmp_dir();
     std::fs::create_dir_all(&dir).unwrap();
     let peer_line = match peer_vip {
@@ -36,7 +36,7 @@ fn write_cfg(peer_vip: Option<&str>) -> PathBuf {
          cidr = \"10.0.0.0/24\"\n\
          encryption = false{peer_line}\n"
     );
-    let path = dir.join("punch.toml");
+    let path = dir.join(format!("punch.{tag}.toml"));
     std::fs::write(&path, cfg).unwrap();
     path
 }
@@ -55,7 +55,7 @@ fn pick_port() -> u16 {
 
 #[test]
 fn punch_empty_targets_errors() {
-    let cfg = write_cfg(Some("10.0.0.2"));
+    let cfg = write_cfg("empty", Some("10.0.0.2"));
     let state = state_path("empty");
     subnet_up(&cfg, &state, false).unwrap();
     let err = subnet_punch(&cfg, &state, "10.0.0.2", &[], "udp://127.0.0.1:0", 10)
@@ -68,7 +68,7 @@ fn punch_empty_targets_errors() {
 
 #[test]
 fn punch_zero_attempts_errors() {
-    let cfg = write_cfg(Some("10.0.0.2"));
+    let cfg = write_cfg("zero", Some("10.0.0.2"));
     let state = state_path("zero");
     subnet_up(&cfg, &state, false).unwrap();
     let err = subnet_punch(
@@ -85,7 +85,7 @@ fn punch_zero_attempts_errors() {
 
 #[test]
 fn punch_unknown_peer_errors() {
-    let cfg = write_cfg(Some("10.0.0.2"));
+    let cfg = write_cfg("unknown", Some("10.0.0.2"));
     let state = state_path("unknown");
     subnet_up(&cfg, &state, false).unwrap();
     let err = subnet_punch(
@@ -103,7 +103,8 @@ fn punch_unknown_peer_errors() {
 #[test]
 fn punch_missing_config_errors() {
     let state = state_path("cfgmiss");
-    subnet_up(&write_cfg(Some("10.0.0.2")), &state, false).unwrap();
+    let cfg = write_cfg("cfgmiss", Some("10.0.0.2"));
+    subnet_up(&cfg, &state, false).unwrap();
     let missing = tmp_dir().join("missing.toml");
     let err = subnet_punch(
         &missing,
@@ -119,7 +120,7 @@ fn punch_missing_config_errors() {
 
 #[test]
 fn subnet_status_after_up_punch_is_null() {
-    let cfg = write_cfg(Some("10.0.0.2"));
+    let cfg = write_cfg("null", Some("10.0.0.2"));
     let state = state_path("null");
     subnet_up(&cfg, &state, false).unwrap();
     let status = subnet_status(&state);
@@ -132,7 +133,7 @@ fn subnet_status_after_up_punch_is_null() {
 
 #[test]
 fn punch_invalid_listen_errors() {
-    let cfg = write_cfg(Some("10.0.0.2"));
+    let cfg = write_cfg("listen", Some("10.0.0.2"));
     let state = state_path("listen");
     subnet_up(&cfg, &state, false).unwrap();
     let err = subnet_punch(
@@ -150,7 +151,8 @@ fn punch_invalid_listen_errors() {
 #[test]
 fn punch_invalid_config_parse_errors() {
     let state = state_path("cfgparse");
-    subnet_up(&write_cfg(Some("10.0.0.2")), &state, false).unwrap();
+    let cfg = write_cfg("cfgparse", Some("10.0.0.2"));
+    subnet_up(&cfg, &state, false).unwrap();
     let bad = tmp_dir().join("bad.toml");
     std::fs::write(&bad, "this is [ not valid toml").unwrap();
     let err = subnet_punch(
@@ -168,7 +170,7 @@ fn punch_invalid_config_parse_errors() {
 #[test]
 fn punch_encrypted_state_preserved() {
     let _g = port_lock().lock().unwrap();
-    let cfg = write_cfg(Some("10.0.0.2"));
+    let cfg = write_cfg("enc", Some("10.0.0.2"));
     let state = state_path("enc");
     subnet_up(&cfg, &state, true).unwrap();
     let raw_after_up = std::fs::read(&state).unwrap();
@@ -202,7 +204,7 @@ fn punch_encrypted_state_preserved() {
 #[test]
 fn punch_failure_persists_state_for_status() {
     let _g = port_lock().lock().unwrap();
-    let cfg = write_cfg(Some("10.0.0.2"));
+    let cfg = write_cfg("fail", Some("10.0.0.2"));
     let state = state_path("fail");
     subnet_up(&cfg, &state, false).unwrap();
     // dead 目标（无监听端口）单次尝试 → 失败仍持久化 punch 记录。

@@ -65,12 +65,13 @@ fn main() {
             break;
         }
         response.extend_from_slice(&buf[..n]);
-        if response.windows(4).any(|w| w == b"\r\n\r\n") && response.len() > 200 {
+        if response.windows(4).any(|w| w == b"\r\n\r\n") && response.ends_with(b"hello") {
             break;
         }
     }
     let text = String::from_utf8_lossy(&response).to_string();
     let http_ok = text.contains("200 OK") && text.contains("hello");
+    let _ = client.shutdown(std::net::Shutdown::Both);
 
     let proxy_json = proxy
         .join()

@@ -4152,7 +4152,8 @@ fn pump_bytes(src: &mut std::net::TcpStream, dst: &mut std::net::TcpStream) -> u
             Err(_) => break,
         }
     }
-    let _ = dst.shutdown(std::net::Shutdown::Write);
+    let _ = dst.shutdown(std::net::Shutdown::Both);
+    let _ = src.shutdown(std::net::Shutdown::Both);
     total
 }
 

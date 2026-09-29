@@ -30,5 +30,21 @@
     "module": "nexus-connectivity",
     "category": "implementation-pattern",
     "summary": "P1 静态路由三节点转发：路由表 next_hop 配置、帧头不改只改物理下一跳、直连优先于路由表、MeshCarrier 多对端测试替身、scenario JSON 字段必须嵌套"
+  },
+  {
+    "id": "ps-lineend-001",
+    "file": "entries/2026-09-26-lineend-anchor-and-udp-flaky.md",
+    "date": "2026-09-26",
+    "module": "apps/nexus",
+    "category": "implementation-pitfall",
+    "summary": "仓库 .rs 行尾不统一（LF/CRLF 混用）致 PowerShell 锚点替换 count=0；subnet_punch_cli 在 harness full 重负载下 UDP 竞态偶发 FAIL，重跑即过（22/22）"
+  },
+  {
+    "id": "linux-migration-pitfall-001",
+    "file": "entries/2026-09-29-tcp-pump-deadlock-and-platform-scenario-gating.md",
+    "date": "2026-09-29",
+    "module": "apps/nexus",
+    "category": "implementation-pitfall",
+    "summary": "TCP pump_bytes 半双工 EOF 缺少双向 shutdown 导致场景执行死锁挂起 >1 小时；harness 加载 scenario 缺少 given.platform 过滤导致跨平台误报"
   }
 ]

@@ -124,14 +124,12 @@ locator = "udp://127.0.0.1:42002"
         .unwrap_or_default()
         .to_string();
 
-    let verdict_ok: bool;
-    let mut exited_ok = false;
-    match verdict.as_str() {
+    let (verdict_ok, exited_ok) = match verdict.as_str() {
         // 3a) 无权限 / 无驱动：TUN_ERROR 结构化，子进程应已退出，不写状态文件。
         "TUN_ERROR" => {
-            exited_ok = wait_exit(&mut child, Duration::from_millis(4000))?;
+            let exited_ok = wait_exit(&mut child, Duration::from_millis(4000))?;
             // 失败路径绝不写状态文件（也绝不降级 mock 常驻，否则子进程不会退出）。
-            verdict_ok = exited_ok && !state.exists();
+            (exited_ok && !state.exists(), exited_ok)
         }
         // 3b) 管理员环境：真实 up 含 local_locator；删状态文件触发 leave → 优雅退出。
         "PASS" => {
@@ -139,7 +137,7 @@ locator = "udp://127.0.0.1:42002"
             // 状态文件已写（up 成功路径）。
             let state_written = state.exists();
             std::fs::remove_file(&state).map_err(|e| e.to_string())?;
-            exited_ok = wait_exit(&mut child, Duration::from_millis(6000))?;
+            let exited_ok = wait_exit(&mut child, Duration::from_millis(6000))?;
             // 退出后 status → DOWN。
             let after_out = Command::new(&nexusd)
                 .args([
@@ -158,15 +156,18 @@ locator = "udp://127.0.0.1:42002"
                 .and_then(|s| s.get("up"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
-            verdict_ok = has_local_locator && state_written && exited_ok && !up_after_leave;
+            (
+                has_local_locator && state_written && exited_ok && !up_after_leave,
+                exited_ok,
+            )
         }
         // 其它 verdict（FAIL / 未知）→ 不符合契约。
         _ => {
             // 兜底：确保子进程退出并清理。
             let _ = wait_exit(&mut child, Duration::from_millis(2000));
-            verdict_ok = false;
+            (false, false)
         }
-    }
+    };
 
     // 4) 兜底清理：任何分支都确保子进程已回收。
     match child.try_wait().map_err(|e| e.to_string())? {
