@@ -390,17 +390,24 @@ impl Loop {
             for id in ids {
                 self.pump_one(id, now);
             }
-            // 3. Incoming UDP (timeout = next timer, capped).
-            let now = Instant::now();
-            let deadline = self.next_deadline(now);
-            let timeout = deadline.saturating_duration_since(now).min(POLL_CAP);
-            self.socket.set_read_timeout(Some(timeout)).ok();
-            match self.socket.recv_from(&mut self.buf) {
-                Ok((n, remote)) => self.on_udp(n, remote),
-                Err(e)
-                    if e.kind() == io::ErrorKind::WouldBlock
-                        || e.kind() == io::ErrorKind::TimedOut => {}
-                Err(_) => {}
+            // 3. Incoming UDP: drain the socket fully (a single recv_from per
+            // iteration lets bursts overflow the kernel buffer), then block
+            // briefly for the next packet or timer.
+            loop {
+                let now = Instant::now();
+                let deadline = self.next_deadline(now);
+                let timeout = deadline.saturating_duration_since(now).min(POLL_CAP);
+                self.socket.set_read_timeout(Some(timeout)).ok();
+                match self.socket.recv_from(&mut self.buf) {
+                    Ok((n, remote)) => self.on_udp(n, remote),
+                    Err(e)
+                        if e.kind() == io::ErrorKind::WouldBlock
+                            || e.kind() == io::ErrorKind::TimedOut =>
+                    {
+                        break
+                    }
+                    Err(_) => break,
+                }
             }
             // 4. Pump again (applies incoming packets).
             let now = Instant::now();
