@@ -9290,3 +9290,156 @@ pub fn k_shortest_flow() -> Result<Value, NexusError> {
         },
     }))
 }
+
+/// E4 产品场景 `product.fib-manager` 的可执行驱动（PRODUCT §12.50）。
+///
+/// 验证 FibManager：初始计算、无变化不重算、拓扑变化重算、经管理器选路。
+pub fn fib_manager_flow() -> Result<Value, NexusError> {
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::{Ecmp, FibManager, FlowKey};
+
+    let mut events: Vec<&'static str> = Vec::new();
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("fib_manager: {m}"),
+    };
+
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    let id_d = PeerId("node-d".to_string());
+    let id_e = PeerId("node-e".to_string());
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+
+    // 菱形拓扑。
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    });
+    for (id, vip, nbs) in [
+        (
+            id_b.clone(),
+            "10.99.0.2",
+            vec![link(&id_a, 10), link(&id_d, 10)],
+        ),
+        (
+            id_c.clone(),
+            "10.99.0.3",
+            vec![link(&id_a, 10), link(&id_d, 10)],
+        ),
+        (
+            id_d.clone(),
+            "10.99.0.4",
+            vec![link(&id_b, 10), link(&id_c, 10)],
+        ),
+    ] {
+        lsdb.update(Lsa {
+            node_id: id,
+            vip: vip.to_string(),
+            incarnation: 1,
+            seq: 1,
+            capabilities: 0,
+            locator: None,
+            neighbors: nbs,
+        });
+    }
+
+    // ---- 阶段 1：初始计算 ----
+    let mut mgr = FibManager::new(id_a.clone(), Ecmp::new(), &lsdb);
+    if mgr.generation() != 1 {
+        return Err(fail("initial generation should be 1"));
+    }
+    if mgr.fib().lookup("10.99.0.4").is_none() {
+        return Err(fail("initial FIB should have D"));
+    }
+    let gen1 = mgr.generation();
+    events.push("initial_computed");
+
+    // ---- 阶段 2：无变化不重算 ----
+    if mgr.maybe_recompute(&lsdb) {
+        return Err(fail("no change should return false"));
+    }
+    if mgr.generation() != gen1 {
+        return Err(fail("generation should not bump"));
+    }
+    events.push("no_change_no_recompute");
+
+    // ---- 阶段 3：拓扑变化重算 ----
+    lsdb.update(Lsa {
+        node_id: id_e.clone(),
+        vip: "10.99.0.5".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_d, 10)],
+    });
+    // D 也通告 E（双向）。
+    lsdb.update(Lsa {
+        node_id: id_d.clone(),
+        vip: "10.99.0.4".to_string(),
+        incarnation: 1,
+        seq: 2,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10), link(&id_e, 10)],
+    });
+    if !mgr.maybe_recompute(&lsdb) {
+        return Err(fail("topo change should return true"));
+    }
+    if mgr.generation() != 2 {
+        return Err(fail("generation should be 2"));
+    }
+    if mgr.fib().lookup("10.99.0.5").is_none() {
+        return Err(fail("FIB should contain E after recompute"));
+    }
+    let gen2 = mgr.generation();
+    events.push("topo_change_recomputes");
+
+    // ---- 阶段 4：经管理器选路 ----
+    let flow = FlowKey {
+        src_ip: "10.99.0.1".parse().map_err(|_| fail("bad ip"))?,
+        dst_ip: "10.99.0.4".parse().map_err(|_| fail("bad ip"))?,
+        src_port: 1234,
+        dst_port: 80,
+        protocol: 6,
+    };
+    let hop = mgr
+        .select("10.99.0.4", &flow)
+        .ok_or_else(|| fail("select"))?;
+    if hop.peer != id_b && hop.peer != id_c {
+        return Err(fail("select should return B or C"));
+    }
+    // 同流恒定。
+    let hop2 = mgr
+        .select("10.99.0.4", &flow)
+        .ok_or_else(|| fail("select"))?;
+    if hop != hop2 {
+        return Err(fail("same flow should select same"));
+    }
+    events.push("select_via_manager");
+
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "manager": {
+            "initial_generation": gen1,
+            "after_change_generation": gen2,
+        },
+    }))
+}

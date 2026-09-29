@@ -265,3 +265,21 @@ LSA/LSDB/泛洪/算路/FIB/策略枚举零改动。
 - 复杂度 O(K·V·(E log V))；`RoutingStrategy` 暂不集成（K 参数化，待设计）。
 - Deletion Test：K-shortest 是"非等代价多路径"的独立变化维度
   （ECMP 只给等代价，K-shortest 给主备）；删除后无备用路径来源。
+
+### 冻结契约（FIB 管理器 P5，PRODUCT §12.50，scenarios/product/fib_manager.toml）
+
+在 §12.49 的 `routing` 模块上增量：新增 `FibManager<C: PathComputer>`；
+LSA/LSDB/算路/FIB 零改动。
+
+- `FibManager::new(self_id, computer, lsdb)`：初始计算，generation=1。
+- `maybe_recompute(&mut self, lsdb) -> bool`：指纹变化 → 重算 + generation+1
+  → `true`；否则无操作 → `false`。
+- `fib() -> &Fib`、`generation() -> u64`、
+  `select(vip, flow) -> Option<&NextHop>`（委托 `Fib::select_next_hop`）。
+- LSDB 指纹：FNV-1a 64 over 排序后的全部 LSA
+  `(node_id, incarnation BE, seq BE, neighbor 列表排序, latency)`；
+  正确性靠版本向量：`Lsdb::update` 强制 `(incarnation, seq)` 递增，
+  任何被应用的更新必 bump 版本 → 指纹变化（未直接哈希的字段经此间接覆盖）。
+- Deletion Test：FIB 管理器是"变化检测 + 代际管理"的独立维度
+  （之前调用方手写指纹判断或无脑重算）；删除后要么每次全量重算
+  （浪费），要么漏掉拓扑变化（错误）。

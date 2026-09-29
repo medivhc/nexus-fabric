@@ -833,6 +833,106 @@ impl Fib {
     }
 }
 
+/// FIB 管理器：跟踪 LSDB 指纹，按需重算 FIB（§12.50）。
+///
+/// 调用方无需手写"LSDB 变了没"的判断：`maybe_recompute` 在指纹变化时
+/// 重算并递增代际，否则为无操作。单线程；多线程共享时外层加锁。
+#[derive(Debug)]
+pub struct FibManager<C: PathComputer> {
+    computer: C,
+    self_id: PeerId,
+    generation: u64,
+    current: Fib,
+    last_fingerprint: u64,
+}
+
+impl<C: PathComputer> FibManager<C> {
+    /// 创建管理器并初始计算 FIB（generation=1）。
+    pub fn new(self_id: PeerId, computer: C, lsdb: &Lsdb) -> Self {
+        let fingerprint = Self::fingerprint(lsdb);
+        let current = Fib::compute(lsdb, &self_id, &computer, 1);
+        Self {
+            computer,
+            self_id,
+            generation: 1,
+            current,
+            last_fingerprint: fingerprint,
+        }
+    }
+
+    /// LSDB 指纹：FNV-1a 64 over 全部 LSA 的
+    /// `(node_id, incarnation BE, seq BE, neighbor 列表)`。
+    ///
+    /// 正确性机制：`Lsdb::update` 强制 `(incarnation, seq)` 递增（否则判 Stale），
+    /// 故任何被应用的 LSA 更新必 bump 版本向量 → 指纹变化。未直接哈希的字段
+    /// （vip/capabilities/locator/loss/bandwidth）经版本向量间接覆盖。
+    /// LSA 按 node_id 排序、neighbor 按 (id, latency) 排序后哈希，
+    /// 保证指纹与 Vec 顺序无关。
+    fn fingerprint(lsdb: &Lsdb) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+        let mut h = FNV_OFFSET;
+        let mut mix = |bytes: &[u8]| {
+            for b in bytes {
+                h ^= u64::from(*b);
+                h = h.wrapping_mul(FNV_PRIME);
+            }
+        };
+        let mut lsas: Vec<_> = lsdb.all();
+        lsas.sort_by(|a, b| a.node_id.0.cmp(&b.node_id.0));
+        for lsa in lsas {
+            mix(lsa.node_id.0.as_bytes());
+            mix(&lsa.incarnation.to_be_bytes());
+            mix(&lsa.seq.to_be_bytes());
+            // (neighbor_id, latency) 按 id 排序后哈希：与 Vec 顺序无关，
+            // 避免同一逻辑 LSA 因顺序不同误触发重算。
+            let mut nbs: Vec<(&str, u32)> = lsa
+                .neighbors
+                .iter()
+                .map(|nb| (nb.neighbor.0.as_str(), nb.metrics.latency_ms))
+                .collect();
+            nbs.sort_unstable();
+            for (nb, latency) in nbs {
+                mix(nb.as_bytes());
+                mix(&latency.to_be_bytes());
+            }
+        }
+        h
+    }
+
+    /// 若 LSDB 指纹变化，重算 FIB、generation+1，返回 `true`；
+    /// 否则无操作，返回 `false`。
+    pub fn maybe_recompute(&mut self, lsdb: &Lsdb) -> bool {
+        let fp = Self::fingerprint(lsdb);
+        if fp == self.last_fingerprint {
+            return false;
+        }
+        self.generation += 1;
+        let generation = self.generation;
+        self.current = Fib::compute(lsdb, &self.self_id, &self.computer, generation);
+        self.last_fingerprint = fp;
+        true
+    }
+
+    /// 当前 FIB。
+    #[must_use]
+    pub fn fib(&self) -> &Fib {
+        &self.current
+    }
+
+    /// 当前代际。
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// 经当前 FIB 按流哈希选择下一跳（§12.47）。
+    #[must_use]
+    pub fn select(&self, vip: &str, flow: &FlowKey) -> Option<&NextHop> {
+        self.current.select_next_hop(vip, flow)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1251,5 +1351,72 @@ mod tests {
             let key: Vec<String> = p.nodes.iter().map(|n| n.0.clone()).collect();
             assert!(seen.insert(key), "duplicate path: {p:?}");
         }
+    }
+
+    #[test]
+    fn fib_manager_recomputes_on_change_only() {
+        let (db, a, _, _, _) = diamond_lsdb();
+        let mut mgr = FibManager::new(a.clone(), Ecmp::new(), &db);
+        assert_eq!(mgr.generation(), 1);
+        assert!(mgr.fib().lookup("10.0.0.4").is_some());
+
+        // 无变化 → false，generation 不变。
+        let mut db2 = db;
+        assert!(!mgr.maybe_recompute(&db2));
+        assert_eq!(mgr.generation(), 1);
+
+        // 新增 LSA → true，generation+1。
+        // e 与 d 双向建边（有向拓扑语义），保证 a 可达 e。
+        db2.update(lsa("e", "10.0.0.5", vec![link("d", 10)]));
+        db2.update(Lsa {
+            node_id: peer("d"),
+            vip: "10.0.0.4".to_string(),
+            incarnation: 1,
+            seq: 2, // 递增，否则 update 判 stale
+            capabilities: 0,
+            locator: None,
+            neighbors: vec![link("b", 10), link("c", 10), link("e", 10)],
+        });
+        assert!(mgr.maybe_recompute(&db2));
+        assert_eq!(mgr.generation(), 2);
+        assert!(mgr.fib().lookup("10.0.0.5").is_some());
+
+        // 再次无变化 → false。
+        assert!(!mgr.maybe_recompute(&db2));
+        assert_eq!(mgr.generation(), 2);
+    }
+
+    #[test]
+    fn fib_manager_detects_metric_change() {
+        // 链路代价变化（seq 递增 + latency 改变）也触发重算。
+        let (db, a, _, _, _) = diamond_lsdb();
+        let mut mgr = FibManager::new(a.clone(), ShortestPath::new(), &db);
+        assert_eq!(mgr.generation(), 1);
+
+        let mut db2 = db;
+        // b 的 LSA：seq 递增（否则 update 判 stale），b-d 延迟从 10 改为 50。
+        db2.update(Lsa {
+            node_id: peer("b"),
+            vip: "10.0.0.2".to_string(),
+            incarnation: 1,
+            seq: 2,
+            capabilities: 0,
+            locator: None,
+            neighbors: vec![link("a", 10), link("c", 10), link("d", 50)],
+        });
+        assert!(mgr.maybe_recompute(&db2));
+        assert_eq!(mgr.generation(), 2);
+    }
+
+    #[test]
+    fn fib_manager_select_delegates() {
+        let (db, a, _, _, _) = diamond_lsdb();
+        let mgr = FibManager::new(a.clone(), Ecmp::new(), &db);
+        let flow = flow_key(1234, 80);
+        let hop = mgr.select("10.0.0.4", &flow).unwrap();
+        // 与直接经 FIB 选择一致。
+        let direct = mgr.fib().select_next_hop("10.0.0.4", &flow).unwrap();
+        assert_eq!(hop, direct);
+        assert!(mgr.select("10.9.9.9", &flow).is_none());
     }
 }

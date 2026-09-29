@@ -2760,3 +2760,35 @@ LSDB/LSA/泛洪协议零改动（设计文档既定映射）。
 - 冻结边界：`RoutingStrategy` 集成（待参数化策略设计）；Disjoint
   （边/点不交）路径（后续）；真实转发面挂接（后续）。
 - 契约 hash：`d28e3c0a52b8308c2d3d3b9a40d18651556141b1`（verify 时写入）。
+
+### 12.50 P5 去中心化选路：FIB 管理器（LSDB 指纹触发重算）（2026-09-29）{#12-fib-manager}
+
+接 §12.49（K-shortest）。本项交付 FIB 的生产级管理器（portable core，
+零 I/O、零第三方依赖）：`FibManager` 持有算路器与当前 FIB，
+跟踪 LSDB 指纹，仅在拓扑变化时重算并递增代际；调用方经管理器
+做下一跳选择，无需手写"LSDB 变了没"的判断。
+
+- **`FibManager<C: PathComputer>`**（`nexus-discovery::routing`）：
+  - `new(self_id, computer, lsdb)`：初始计算 FIB（generation=1）。
+  - `maybe_recompute(&mut self, lsdb) -> bool`：计算 LSDB 指纹；
+    若与上次不同 → 重算 FIB、generation+1、返回 `true`；
+    否则返回 `false`（FIB 不变）。
+  - `fib(&self) -> &Fib`、`generation(&self) -> u64`。
+  - `select(&self, vip, flow) -> Option<&NextHop>`：经当前 FIB 按流哈希选择。
+- **LSDB 指纹**：FNV-1a 64 over 全部 LSA 的
+  `(node_id, incarnation BE, seq BE, neighbor 列表)`；
+  任一 LSA 新增/更新 → 指纹变化。指纹碰撞概率可忽略（64 位）。
+- **代际语义**：`new` 后 generation=1；每次实际重算 +1；
+  `maybe_recompute` 返回 `false` 时 generation 不变。
+- E4 场景 `fib_manager.toml`（id=`product.fib-manager`，
+  `cargo run --quiet -p nexus --example fib_manager -- --json`）：
+  - `initial_computed`：`new` 后 FIB 可用（A→D 有下一跳），generation=1；
+  - `no_change_no_recompute`：无变化时 `maybe_recompute` 返回 `false`，
+    generation 不变；
+  - `topo_change_recomputes`：新增节点 E 后 `maybe_recompute` 返回 `true`，
+    generation=2，FIB 含 E；
+  - `select_via_manager`：经 `select` 按流哈希选下一跳成功。
+  期望 `verdict=PASS`。
+- 冻结边界：多线程共享（`Arc<RwLock>` 包装为后续，按需）；
+  真实转发面挂接（后续）；指纹算法更换（后续如有需求）。
+- 契约 hash：`334cb6f424acd248c98a4fc27c79dc163273bc7d`（verify 时写入）。

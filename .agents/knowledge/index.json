@@ -102,5 +102,13 @@
     "module": "nexus-discovery",
     "category": "implementation-pattern",
     "summary": "K-shortest 路径 Yen 算法：dijkstra_excluding 带排除集；spur 区间三处易错点；K=1 退化断言"
+  },
+  {
+    "id": "fib-manager-fingerprint",
+    "file": "entries/2026-09-29-fib-manager-fingerprint.md",
+    "date": "2026-09-29",
+    "module": "nexus-discovery",
+    "category": "implementation-pattern",
+    "summary": "FIB 管理器：LSDB 指纹（FNV-1a）触发按需重算；单测需手动 seq=2、双向建边；borrow 冲突用局部变量"
   }
 ]
