@@ -791,9 +791,9 @@ impl Loop {
                     lc.shared.accepted_cv.notify_all();
                 }
             }
-            quinn_proto::Event::Stream(quinn_proto::StreamEvent::Opened { dir })
-                if dir == Dir::Bi =>
-            {
+            quinn_proto::Event::Stream(quinn_proto::StreamEvent::Opened {
+                dir: Dir::Bi,
+            }) => {
                 let sh = match self.live.get_mut(&id) {
                     Some(lc) => match lc.quic.streams().accept(Dir::Bi) {
                         Some(qid) => {

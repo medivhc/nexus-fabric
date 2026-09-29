@@ -294,3 +294,54 @@ mod tests {
         assert!(spki_ed25519_raw(&bad).is_err());
     }
 }
+
+#[cfg(test)]
+mod dbg_tests {
+    use super::*;
+    #[test]
+    fn dbg_cert_walk() {
+        let id = generate_identity().expect("keygen");
+        let r = cert_spki_ed25519_raw(&id.cert_der);
+        println!("walk result: {:?}", r.as_ref().map(|_| "ok").map_err(|e| e.clone()));
+        // dump first-level structure
+        let d = &id.cert_der;
+        let mut p = 0;
+        p += 1; // seq tag
+        let (mut len, mut hlen) = (0usize, 1usize);
+        if d[1] & 0x80 == 0 { len = d[1] as usize; hlen = 2; }
+        else { let n = (d[1] & 0x7f) as usize; for i in 0..n { len = (len << 8) | d[2+i] as usize; } hlen = 2 + n; }
+        p = hlen;
+        println!("outer seq len {len}");
+        for i in 0..3 {
+            if p >= d.len() { break; }
+            let tag = d[p];
+            let (l, h) = if d[p+1] & 0x80 == 0 { (d[p+1] as usize, 2) } else {
+                let n = (d[p+1] & 0x7f) as usize;
+                let mut v = 0usize;
+                for j in 0..n { v = (v << 8) | d[p+2+j] as usize; }
+                (v, 2+n)
+            };
+            println!("elem {i}: tag {tag:02x} len {l}");
+            p += h + l;
+        }
+        // tbs walk
+        let mut tbs_pos = hlen;
+        // skip outer seq header already; tbs is first elem: find its content start
+        let (tl, th) = if d[tbs_pos+1] & 0x80 == 0 { (d[tbs_pos+1] as usize, 2) } else { (0,0) };
+        println!("tbs: tag {:02x} len {tl}", d[tbs_pos]);
+        let mut q = tbs_pos + th;
+        for i in 0..8 {
+            if q >= d.len() { break; }
+            let tag = d[q];
+            let (l, h) = if d[q+1] & 0x80 == 0 { (d[q+1] as usize, 2) } else {
+                let n = (d[q+1] & 0x7f) as usize;
+                let mut v = 0usize;
+                for j in 0..n { v = (v << 8) | d[q+2+j] as usize; }
+                (v, 2+n)
+            };
+            println!("tbs elem {i}: tag {tag:02x} len {l}");
+            q += h + l;
+        }
+        panic!("dump done");
+    }
+}
