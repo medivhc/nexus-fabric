@@ -44,6 +44,14 @@ impl<'a> TopoView<'a> {
         Self { adj }
     }
 
+    /// 从邻接表构建（`pub(crate)`，用于节点分裂等合成拓扑）。
+    ///
+    /// 调用方负责保证引用的字符串存活期覆盖 `Self`。
+    #[must_use]
+    pub(crate) fn from_adj(adj: HashMap<&'a str, Vec<(&'a str, u64)>>) -> Self {
+        Self { adj }
+    }
+
     /// 节点数。
     #[must_use]
     pub fn node_count(&self) -> usize {
@@ -62,7 +70,7 @@ impl<'a> TopoView<'a> {
     }
 
     /// 节点的出边（邻居 ID，代价）。
-    fn out_edges(&self, node: &str) -> &[(&'a str, u64)] {
+    pub(crate) fn out_edges(&self, node: &str) -> &[(&'a str, u64)] {
         self.adj.get(node).map_or(&[], Vec::as_slice)
     }
 }
@@ -589,7 +597,11 @@ impl Disjoint {
     }
 
     /// Suurballe 算法：返回至多 2 条边不交路径（节点序列）。
-    fn suurballe<'t>(topo: &TopoView<'t>, src: &'t str, dst: &'t str) -> Vec<Vec<&'t str>> {
+    pub(crate) fn suurballe<'t>(
+        topo: &TopoView<'t>,
+        src: &'t str,
+        dst: &'t str,
+    ) -> Vec<Vec<&'t str>> {
         // 步骤 1：Dijkstra 得 dist1。
         let (dist1, prev1) = ShortestPath::dijkstra(topo, src);
         let p1 = match ShortestPath::build_node_seq(src, dst, &dist1, &prev1) {
@@ -816,6 +828,166 @@ impl PathComputer for Disjoint {
             })
             .collect();
         // 按代价升序。
+        paths.sort_by_key(|p| p.cost);
+        paths
+    }
+}
+
+/// 点不交路径算路器（§12.55）：两条除 src/dst 外无共享节点的路径。
+///
+/// 节点分裂法：每节点 v（除 src/dst）分裂为 `v_in → v_out`（代价 0）；
+/// 原边 (u,v) 变为 `(u_out, v_in)`。在分裂图上求边不交（Suurballe），
+/// 映射回原图即点不交（分裂内部边唯一，两条路不能同过一节点）。
+pub struct NodeDisjoint;
+
+impl NodeDisjoint {
+    /// 创建算路器。
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// 构建分裂图的 owned 邻接表。
+    ///
+    /// 返回 `HashMap<String, Vec<(String, u64)>>`；调用方将其转为
+    /// `TopoView`（经 `from_adj`）后运行 Suurballe。
+    ///
+    /// 节点 ID 假设：不得含 NUL 字符（`\0` 用作分裂后缀分隔符）。
+    /// 实践中 PeerId 为 hostname/hex 风格，安全。
+    fn split_graph(topo: &TopoView, src: &str, dst: &str) -> HashMap<String, Vec<(String, u64)>> {
+        let mut adj: HashMap<String, Vec<(String, u64)>> = HashMap::new();
+
+        // 分裂 ID 映射（src/dst 不分裂）。
+        // 注意：邻居可能悬空（有边但无 LSA，泛洪收敛中的常态），
+        // 需为悬空邻居同样建立分裂映射（其 v_out 无出边，自然成死端）。
+        let mut in_id = HashMap::<String, String>::new();
+        let mut out_id = HashMap::<String, String>::new();
+        let ensure_split =
+            |node: &str,
+             in_id: &mut HashMap<String, String>,
+             out_id: &mut HashMap<String, String>,
+             adj: &mut HashMap<String, Vec<(String, u64)>>| {
+                let key = node.to_string();
+                if in_id.contains_key(&key) {
+                    return;
+                }
+                if node == src || node == dst {
+                    in_id.insert(key.clone(), key.clone());
+                    out_id.insert(key.clone(), key);
+                } else {
+                    let i = format!("{node}\0in");
+                    let o = format!("{node}\0out");
+                    // 分裂内部边：v_in → v_out，代价 0。
+                    adj.entry(i.clone()).or_default().push((o.clone(), 0));
+                    in_id.insert(key.clone(), i);
+                    out_id.insert(key, o);
+                }
+            };
+        for node in topo.node_ids() {
+            ensure_split(node, &mut in_id, &mut out_id, &mut adj);
+        }
+        // 原边 (u,v) → (u_out, v_in)；悬空邻居在此处补分裂映射。
+        // 先收集边（避免借用冲突），再建图。
+        let mut edges: Vec<(String, String, u64)> = Vec::new();
+        for node in topo.node_ids() {
+            for (nbr, cost) in topo.out_edges(node) {
+                edges.push((node.to_string(), nbr.to_string(), *cost));
+            }
+        }
+        for (_u, v, _) in &edges {
+            ensure_split(v, &mut in_id, &mut out_id, &mut adj);
+        }
+        for (u, v, cost) in edges {
+            let u_out = out_id[&u].clone();
+            let v_in = in_id[&v].clone();
+            adj.entry(u_out.clone()).or_default().push((v_in, cost));
+            adj.entry(u_out).or_default();
+        }
+        adj
+    }
+
+    /// 将分裂图路径映射回原节点（去分裂后缀、去重连续重复）。
+    ///
+    /// 分裂 ID 形如 `"v\0in"` / `"v\0out"`，原名取 `\0` 之前
+    /// （节点 ID 不得含 NUL，见 `split_graph`）。
+    fn unsplit(path: Vec<&str>) -> Vec<String> {
+        let mut out = Vec::new();
+        for s in path {
+            // split('\0') 对 &str 恒返回至少一项。
+            let orig = s.split('\0').next().unwrap();
+            if out.last().map(|l: &String| l.as_str()) != Some(orig) {
+                out.push(orig.to_string());
+            }
+        }
+        out
+    }
+}
+
+impl Default for NodeDisjoint {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PathComputer for NodeDisjoint {
+    fn name(&self) -> &'static str {
+        "node-disjoint"
+    }
+
+    fn compute(&self, topo: &TopoView, src: &PeerId, dst: &PeerId) -> Option<Path> {
+        self.compute_paths(topo, src, dst).into_iter().next()
+    }
+
+    fn compute_paths(&self, topo: &TopoView, src: &PeerId, dst: &PeerId) -> Vec<Path> {
+        let src_key = src.0.as_str();
+        let dst_key = dst.0.as_str();
+        if !topo.contains(src) || !topo.contains(dst) {
+            return Vec::new();
+        }
+        if src_key == dst_key {
+            return vec![Path {
+                nodes: vec![src.clone()],
+                cost: 0,
+            }];
+        }
+        // 1. 构建分裂图（owned）。
+        let split_owned = Self::split_graph(topo, src_key, dst_key);
+        // 2. 转为 &str 引用的 TopoView（split_owned 存活于整个作用域）。
+        let mut adj_ref: HashMap<&str, Vec<(&str, u64)>> = HashMap::new();
+        for (k, v) in &split_owned {
+            adj_ref.insert(
+                k.as_str(),
+                v.iter().map(|(n, c)| (n.as_str(), *c)).collect(),
+            );
+        }
+        let split_topo = TopoView::from_adj(adj_ref);
+        // 3. 在分裂图上运行 Suurballe（边不交）。
+        let split_paths = Disjoint::suurballe(&split_topo, src_key, dst_key);
+        // 4. 映射回原节点并计算代价（用原 topo）。
+        let mut paths: Vec<Path> = split_paths
+            .into_iter()
+            .map(|nodes| {
+                let unsplit = Self::unsplit(nodes);
+                let cost = unsplit
+                    .windows(2)
+                    .map(|w| {
+                        let c = topo
+                            .out_edges(&w[0])
+                            .iter()
+                            .find(|(n, _)| *n == w[1])
+                            .map(|(_, c)| *c);
+                        // 分裂图边必源于原图边（或分裂内部边代价 0，已在 unsplit 去重），
+                        // 此处 Some 为不变量。
+                        debug_assert!(c.is_some(), "split edge not in original topo");
+                        c.unwrap_or(0)
+                    })
+                    .sum();
+                Path {
+                    nodes: unsplit.into_iter().map(PeerId).collect(),
+                    cost,
+                }
+            })
+            .collect();
         paths.sort_by_key(|p| p.cost);
         paths
     }
@@ -2028,5 +2200,113 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn node_disjoint_finds_two() {
+        // 菱形拓扑：A-B-D 与 A-C-D 点不交（除 A/D）。
+        let (db, a, _, _, d) = diamond_lsdb();
+        let topo = TopoView::from_lsdb(&db);
+        let nd = NodeDisjoint::new();
+        assert_eq!(nd.name(), "node-disjoint");
+
+        let paths = nd.compute_paths(&topo, &a, &d);
+        assert_eq!(paths.len(), 2);
+        // 无共享中间节点。
+        let mid1: std::collections::HashSet<_> =
+            paths[0].nodes[1..paths[0].nodes.len() - 1].iter().collect();
+        let mid2: std::collections::HashSet<_> =
+            paths[1].nodes[1..paths[1].nodes.len() - 1].iter().collect();
+        assert!(
+            mid1.is_disjoint(&mid2),
+            "shared nodes: {mid1:?} vs {mid2:?}"
+        );
+    }
+
+    #[test]
+    fn node_disjoint_no_shared_mid_nodes() {
+        // 验证点不交性（无论返回几条）。
+        let (db, a, _, _, d) = diamond_lsdb();
+        let topo = TopoView::from_lsdb(&db);
+
+        let paths = NodeDisjoint::new().compute_paths(&topo, &a, &d);
+        assert!(!paths.is_empty());
+        // 代价断言：菱形两条路代价均为 20。
+        for p in &paths {
+            assert_eq!(p.cost, 20);
+        }
+        for i in 0..paths.len() {
+            for j in (i + 1)..paths.len() {
+                let mid_i: std::collections::HashSet<_> =
+                    paths[i].nodes[1..paths[i].nodes.len() - 1].iter().collect();
+                let mid_j: std::collections::HashSet<_> =
+                    paths[j].nodes[1..paths[j].nodes.len() - 1].iter().collect();
+                assert!(
+                    mid_i.is_disjoint(&mid_j),
+                    "shared nodes: {mid_i:?} vs {mid_j:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn node_disjoint_dangling_neighbor_no_panic() {
+        // 回归：B 的 LSA 宣告邻居 ghost，但 ghost 无 LSA（泛洪收敛中常态）。
+        // 旧实现在 split_graph 中直接索引 in_id[nbr] 会 panic。
+        let (a, _b, _c, d) = (peer("a"), peer("b"), peer("c"), peer("d"));
+        let mut db = Lsdb::new(a.clone());
+        db.update_local(lsa("a", "10.0.0.1", vec![link("b", 10), link("c", 10)]));
+        // b 宣告 ghost 邻居，但 ghost 从未发布 LSA。
+        db.update(lsa(
+            "b",
+            "10.0.0.2",
+            vec![link("a", 10), link("d", 10), link("ghost", 10)],
+        ));
+        db.update(lsa("c", "10.0.0.3", vec![link("a", 10), link("d", 10)]));
+        db.update(lsa("d", "10.0.0.4", vec![link("b", 10), link("c", 10)]));
+        let topo = TopoView::from_lsdb(&db);
+
+        // 不 panic，且仍能算出点不交路径（ghost 为死端，不影响）。
+        let paths = NodeDisjoint::new().compute_paths(&topo, &a, &d);
+        assert_eq!(paths.len(), 2);
+    }
+
+    #[test]
+    fn node_disjoint_bridge_single() {
+        // 桥接拓扑：A-B-D 唯一，只返回 1 条。
+        let a = peer("a");
+        let d = peer("d");
+        let mut db = Lsdb::new(a.clone());
+        db.update_local(lsa("a", "10.0.0.1", vec![link("b", 10)]));
+        db.update(lsa("b", "10.0.0.2", vec![link("a", 10), link("d", 10)]));
+        db.update(lsa("d", "10.0.0.3", vec![link("b", 10)]));
+        let topo = TopoView::from_lsdb(&db);
+
+        let paths = NodeDisjoint::new().compute_paths(&topo, &a, &d);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].cost, 20);
+    }
+
+    #[test]
+    fn node_disjoint_unreachable_empty() {
+        // 不可达 → 0 条。
+        let (db, a, _, _, _) = diamond_lsdb();
+        let topo = TopoView::from_lsdb(&db);
+        assert!(
+            NodeDisjoint::new()
+                .compute_paths(&topo, &a, &peer("ghost"))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn node_disjoint_src_eq_dst() {
+        // src == dst → 单节点路径。
+        let (db, a, _, _, _) = diamond_lsdb();
+        let topo = TopoView::from_lsdb(&db);
+        let paths = NodeDisjoint::new().compute_paths(&topo, &a, &a);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].nodes, vec![a]);
+        assert_eq!(paths[0].cost, 0);
     }
 }

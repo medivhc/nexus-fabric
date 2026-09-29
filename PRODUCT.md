@@ -2873,3 +2873,18 @@ LSDB/LSA/泛洪协议零改动（设计文档既定映射）。
 （`id=product.fib-manager-shared`），多线程并发读 + 写触发重算。
 **冻结边界**：真实转发面挂接（后续）。
 **契约 hash**：`9c95b8a3a4bb273c04b1cc85da148f79cd3d917ca1915348b003bab0f35dad34`（verify 时写入）。
+
+### §12.55 P5 去中心化选路：点不交路径（Node-Disjoint）
+
+**状态**：候选。
+**范围**：`NodeDisjoint` 算路器，两条除 src/dst 外无共享节点的路径。
+**设计**：
+- 节点分裂法：每节点 v（除 src/dst）分裂为 v_in → v_out，
+  内部边容量 1（代价 0），原边接到分裂节点上。
+- 在分裂图上运行 Suurballe（边不交），映射回原图即点不交。
+- 不可达时返回 0 条；桥接（唯一路径）时返回 1 条（与 §12.51 一致）。
+**非目标**：K>2 点不交；真实转发面挂接。
+**E4**：`scenarios/product/node_disjoint.toml`
+（`id=product.node-disjoint`），验证两条路径无共享中间节点。
+**冻结边界**：K>2 点不交（后续）；真实转发面挂接（后续）。
+**契约 hash**：`94923b114b458611ecc1b9f866d61234b3aff4e7026d11b7b6cb5f1414f387dc`（verify 时写入）。

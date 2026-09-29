@@ -9584,6 +9584,103 @@ pub fn weighted_selection_flow() -> Result<Value, NexusError> {
     Ok(serde_json::Value::Object(out))
 }
 
+/// E4 产品场景 `product.node-disjoint` 的可执行驱动（PRODUCT §12.55）。
+///
+/// 拓扑：菱形 A-B-D / A-C-D。验证两条路径除 src/dst 外无共享节点。
+pub fn node_disjoint_flow() -> Result<Value, NexusError> {
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::{NodeDisjoint, PathComputer, TopoView};
+    use std::collections::HashSet;
+
+    let mut events: Vec<&'static str> = Vec::new();
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("node_disjoint: {m}"),
+    };
+
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    let id_d = PeerId("node-d".to_string());
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_b.clone(),
+        vip: "10.99.0.2".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_c.clone(),
+        vip: "10.99.0.3".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_d.clone(),
+        vip: "10.99.0.4".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    });
+    let topo = TopoView::from_lsdb(&lsdb);
+
+    // ---- 事件 1：得 2 条路径 ----
+    let paths = NodeDisjoint::new().compute_paths(&topo, &id_a, &id_d);
+    if paths.len() != 2 {
+        return Err(fail(&format!("expected 2 paths, got {}", paths.len())));
+    }
+    events.push("two_paths_found");
+
+    // ---- 事件 2：无共享中间节点 ----
+    let mid0: HashSet<_> = paths[0].nodes[1..paths[0].nodes.len() - 1].iter().collect();
+    let mid1: HashSet<_> = paths[1].nodes[1..paths[1].nodes.len() - 1].iter().collect();
+    if !mid0.is_disjoint(&mid1) {
+        return Err(fail("paths share intermediate nodes"));
+    }
+    events.push("no_shared_mid_nodes");
+
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "node_disjoint".to_string(),
+        serde_json::json!({
+            "path_count": paths.len(),
+        }),
+    );
+    out.insert(
+        "events".to_string(),
+        serde_json::Value::Array(events.into_iter().map(serde_json::Value::from).collect()),
+    );
+    out.insert("verdict".to_string(), serde_json::Value::from("PASS"));
+    Ok(serde_json::Value::Object(out))
+}
+
 /// E4 产品场景 `product.fib-manager-shared` 的可执行驱动（PRODUCT §12.54）。
 ///
 /// 验证：多线程并发读（4 线程 × 50 次）无 panic；
