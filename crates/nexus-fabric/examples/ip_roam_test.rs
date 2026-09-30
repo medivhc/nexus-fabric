@@ -177,8 +177,7 @@ fn child_b() {
                 std::io::stdout().flush().unwrap();
             }
             "GO2" => {
-                // 等一会儿让迁移发生，然后发
-                std::thread::sleep(Duration::from_secs(2));
+                // 立即发送（不等迁移），测试是否需要等待。
                 s.write(b"hello2").expect("write2");
                 println!("B_SENT2");
                 std::io::stdout().flush().unwrap();
