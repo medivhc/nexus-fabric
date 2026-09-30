@@ -183,6 +183,24 @@ accept 线程，sync，零 tokio）把 SOCKS5/HTTP 显式代理映射为 fabric 
   `ingress_handshake_errors` / `ingress_egress_local` /
   `ingress_egress_remote`。
 
+**S26（进程归因与 QoS 标记）**：流建立时对本机 socket 做一次进程归因，
+结果按流缓存为 `FlowLabels` 随流元数据往下传（标记，不做排队调度）：
+- `ProcessAttributor` trait：`attribute(local, remote, proto) -> Attribution`；
+  `Attribution { pid: Option<u32>, process_name: Option<String> }`，
+  查不到时为 unknown（`None`），不阻塞、不重试。
+- Linux 实现（`#[cfg(target_os = "linux")]`，std-only，解析 `/proc`）：
+  `/proc/net/tcp` + `/proc/net/udp`（P0 仅 IPv4；tcp6/udp6 后置）→
+  按 (local, remote) 五元组找 socket inode → 遍历 `/proc/<pid>/fd/*`
+  symlink 找 `socket:[inode]` → 读 `/proc/<pid>/comm` 得进程名。
+  非 Linux 用 `NoopAttributor`（恒返回 unknown）；Windows WFP 后置。
+- `QosClass`：`High` / `Normal` / `Low` / `Background`；
+  `QosConfig`：进程名精确匹配 → 类（P0；glob/正则后置）；
+  无规则命中或 unknown → `Normal`。
+- 接入点：TUN 路径 TCP/UDP 流创建时（五元组查本机 socket）、语义入口
+  accept 成功时（对端 socket 归因）。归因失败绝不影响流建立。
+- 不做：per-packet 归因、按类排队调度（会话层/路径层尚无排队机制，后置）、
+  IPv6、Windows WFP。
+
 ## Side Effects
 
 - TUN 设备读写（`TunDevice::read` / `write`）。
