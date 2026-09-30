@@ -313,7 +313,7 @@ enum RouteTarget {
 **决策流水线**（投影层内，per-packet）：
 ```
 包 → 解析 5 元组
-  → 虚拟子网？（最长前缀匹配，fast path）
+  → 虚拟子网？（最长前缀匹配，fast path，不经过规则引擎）
       → 是：FIB → MeshPeer
       → 否：规则引擎（Clash 式：域名/IP/geoip/进程）
           → DIRECT → Egress{self}
@@ -328,18 +328,54 @@ enum RouteTarget {
 3. 数据面统一：fabric datagram 加 1 字节意图位（mesh 转发 vs 出口 NAT），
    接收方按位分流。
 
+**意图位协议**（v1）：
+```
+bit 0-1: 意图类型（00=mesh 转发，01=egress NAT，10=保留，11=保留）
+bit 2-5: egress 跳数（已用跳数，防环路，见下）
+bit 6-7: 保留
+```
+意图位放在 fabric datagram 载荷首字节（P0 零开销原则 §S2 让位于此，
+1 字节是统一路由的最小代价）。
+
+**Egress NAT 状态管理**：
+- 出口节点维护连接跟踪表：`{内网 5 元组 → (源 peer, 出口 socket)}`。
+- 回包路径：出口节点收到互联网回包 → 查连接跟踪表 → 封装为 fabric
+  datagram（意图位=mesh 转发语义，回包不需要再决策）→ 发回源 peer。
+- TCP：P0 只做 UDP NAT；TCP 需 §6.1 阶段二（L4 中继）先行。
+- NAT 表项超时：UDP 120s 无活动回收（可配置）。
+
+**域名规则的数据来源**（技术 gap，方案已定）：
+TUN 抓的是 IP 包，没有域名。Clash 式域名规则需要 IP→域名映射：
+- P0：只做 IP/CIDR/GeoIP/端口规则（不需要域名）。
+- P1：DNS 劫持——投影层内置 DNS server，记录查询结果 `IP→域名`，
+  规则引擎查表。SNI 嗅探作为补充（DoH/DoT 场景）。
+- 规则引擎查不到域名时，降级为 IP 规则。
+
 **链式出口**（少见但支持）：先经某节点出、再走代理。每个节点的出口决策是
 本地独立的，链条自动组合——A 的规则说"经日本节点出"，日本节点的规则说
 "走美国代理"，无需在协议里编码整条链。UDP 可先行；TCP 需 §6.1 阶段二
 （L4 中继，smoltcp）先把流终结再塞进代理。
 
-**环路防护**：递归决策可能配出环路（A→B→A）。egress 意图带跳数上限
-（默认 2 跳），超了直接 Drop。
+**环路防护**：递归决策可能配出环路（A→B→A）。egress 意图带跳数
+（意图位 bit 2-5），每经过一次 egress 加 1，超过上限（默认 2）直接 Drop。
+
+**三层协作**（与 §3.5、§4 的关系）：
+一次"经日本节点出口"的完整路径涉及三层，各管各的：
+- 投影层（§6.4）：决策 `Egress{日本节点}`（选谁出口）
+- 路径层（§4）：到日本节点的传输走哪条路（直连 QUIC / 经代理的 QUIC / TURN）
+- 传输层（§3.5）：如果选"经代理的 QUIC"，字节流跑在 Trojan 隧道里
+三层正交，独立演进。
 
 **与现状的关系**：
 - 复用：`resolve_next_hop` 的 FIB 逻辑、路径层的 peer 打分、规则匹配器
 - 新建：`RouteTarget` 决策点（投影层内）、Egress NAT 模块、意图位协议
 - 取代：`tun.rs` 的 `selected_outbound_tag` 概念被 `RouteTarget` 取代
+
+**实施阶段**：
+- Phase 3b-1：`RouteTarget` + 决策流水线（虚拟子网 fast path + IP 规则），
+  Egress{self} 本地 NAT（UDP only）
+- Phase 3b-2：Egress{peer} 跨节点出口 + 回包路径 + 跳数防环
+- Phase 3b-3：DNS 劫持 → 域名规则；TCP（依赖 L4 中继）
 
 ---
 
