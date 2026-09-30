@@ -123,10 +123,8 @@ pub struct NatStats {
     pub reply_received: u64,
     /// Inbound packets with no matching flow (dropped).
     pub reply_dropped: u64,
-    /// Entries evicted by timeout.
+    /// Entries evicted (timeout + capacity bound, S14).
     pub evicted: u64,
-    /// Entries evicted by capacity bound (S14).
-    pub capacity_evicted: u64,
     /// Current tracked flows (WARN-6: observable snapshot).
     pub current_flows: usize,
 }
@@ -216,7 +214,7 @@ impl EgressNat {
             .map(|(k, _)| *k);
         if let Some(k) = oldest {
             self.table.remove(&k);
-            self.stats.capacity_evicted += 1;
+            self.stats.evicted += 1;
         }
     }
 
@@ -359,13 +357,13 @@ mod tests {
         }
         assert_eq!(nat.flow_count(), 3);
         assert_eq!(nat.stats().current_flows, 3);
-        assert_eq!(nat.stats().capacity_evicted, 0);
+        assert_eq!(nat.stats().evicted, 0);
 
         // One more: oldest (sport 1000) evicted, newest kept.
         let pkt = udp_packet([10, 0, 0, 1], [8, 8, 8, 8], 2000, 53);
         nat.translate_outbound(&pkt, "self");
         assert_eq!(nat.flow_count(), 3);
-        assert_eq!(nat.stats().capacity_evicted, 1);
+        assert_eq!(nat.stats().evicted, 1);
         assert_eq!(nat.stats().current_flows, 3);
 
         // Oldest flow's reply no longer matches.
@@ -386,7 +384,7 @@ mod tests {
         nat.translate_outbound(&p2, "self");
         nat.translate_outbound(&p1, "self"); // refresh, not new
         assert_eq!(nat.flow_count(), 2);
-        assert_eq!(nat.stats().capacity_evicted, 0);
+        assert_eq!(nat.stats().evicted, 0);
     }
 
     #[test]
