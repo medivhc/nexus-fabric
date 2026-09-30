@@ -1,0 +1,40 @@
+schema_version = 1
+id = "product.discovery-static"
+title = "三源发现：静态/LSA/聚合优先级、去重与可观测计数"
+evidence_strength = "E4"
+requirement = "DESIGN.md#8.2"
+
+[given]
+static_table = "peer-a -> 10.0.0.1:5001, peer-b -> 10.0.0.9:5009（显式映射）"
+lsa_source = "Lsdb：peer-b locator udp://10.0.0.2:5002；peer-c locator udp://10.0.0.3:5003；peer-d locator 非法 scheme（跳过）；peer-e 无 locator（跳过）"
+mdns_source = "本场景无网络，MdnsDiscovery 缓存为空"
+priority = "静态 > LSA > mDNS；同地址多源去重，保留最高优先级来源标注"
+
+[when]
+command = "cargo run --quiet -p nexus --example discovery_static -- --json"
+
+# 冻结期望（D1/D2/D4/D5/D6）：example 内部断言全部行为后才输出 PASS；
+# toml 钉住关键可观察字段（verdict=PASS 蕴含其余字段正确）。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "static_resolve"
+equals = "10.0.0.1:5001"
+
+[[expect]]
+field = "lsa_resolve"
+equals = "10.0.0.2:5002"
+
+[[expect]]
+field = "aggregate_first_source"
+equals = "static"
+
+[[expect]]
+field = "unknown_empty"
+equals = true
+
+[[expect]]
+field = "metrics_miss"
+equals = 1

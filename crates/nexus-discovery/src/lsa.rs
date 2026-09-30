@@ -440,6 +440,47 @@ impl SeenCache {
     }
 }
 
+// ---------- LSA 发现源（DESIGN §8.2 D4） ----------
+
+/// LSA 发现源：从 LSDB 只读提取 peer → 可达地址。
+///
+/// 读取本已随 LSA 泛洪扩散的 `Lsa.locator` 字段（P5 冻结），**无线协议扩展**。
+/// locator 为 `"udp://host:port"` 字面量形式；不可解析的 locator 被跳过
+/// （该源对该 peer 无地址，不报错——见 [`Discovery`](super::Discovery) 语义）。
+#[derive(Debug)]
+pub struct LsaDiscovery<'a> {
+    lsdb: &'a Lsdb,
+}
+
+impl<'a> LsaDiscovery<'a> {
+    /// 借用 LSDB 构造（只读，不拷贝）。
+    #[must_use]
+    pub fn new(lsdb: &'a Lsdb) -> Self {
+        Self { lsdb }
+    }
+
+    /// 解析 LSA locator 字符串为 SocketAddr。
+    ///
+    /// 仅接受 `udp://host:port`（host 为 IP 字面量）；其他 scheme / 主机名 /
+    /// 非法格式返回 `None`（诚实跳过，不 panic）。
+    #[must_use]
+    pub fn parse_locator(locator: &str) -> Option<std::net::SocketAddr> {
+        let rest = locator.strip_prefix("udp://")?;
+        rest.parse::<std::net::SocketAddr>().ok()
+    }
+}
+
+impl super::Discovery for LsaDiscovery<'_> {
+    fn resolve(&self, peer: &super::PeerId) -> Vec<std::net::SocketAddr> {
+        self.lsdb
+            .get(peer)
+            .and_then(|lsa| lsa.locator.as_deref())
+            .and_then(Self::parse_locator)
+            .into_iter()
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
