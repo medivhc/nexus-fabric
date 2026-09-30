@@ -960,6 +960,9 @@ name = "nexus-proxy-transport"
 version = "0.1.0"
 dependencies = [
  "nexus-fabric",
+ "nexus-outbound-shadowsocks",
+ "nexus-outbound-trojan",
+ "nexus-proxy-config",
 ]
 
 [[package]]
