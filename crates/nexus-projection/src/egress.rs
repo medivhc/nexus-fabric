@@ -473,8 +473,9 @@ fn ipv4_checksum(header: &[u8]) -> u16 {
 /// this packet for NAT validation (S11), so it must be well-formed.
 fn build_reply_packet(orig: &FlowKey, payload: &[u8]) -> Vec<u8> {
     let mut pkt = vec![0u8; 20 + 8 + payload.len()];
+    let total_len = pkt.len() as u16;
     pkt[0] = 0x45; // v4, IHL 5
-    pkt[2..4].copy_from_slice(&(pkt.len() as u16).to_be_bytes());
+    pkt[2..4].copy_from_slice(&total_len.to_be_bytes());
     pkt[8] = 64; // TTL
     pkt[9] = 17; // UDP
     pkt[12..16].copy_from_slice(&orig.dst_ip.to_be_bytes()); // src = orig dst
