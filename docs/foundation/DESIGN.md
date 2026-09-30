@@ -371,6 +371,23 @@ TUN 抓的是 IP 包，没有域名。Clash 式域名规则需要 IP→域名映
 - 新建：`RouteTarget` 决策点（投影层内）、Egress NAT 模块、意图位协议
 - 取代：`tun.rs` 的 `selected_outbound_tag` 概念被 `RouteTarget` 取代
 
+**老代码迁移策略**（用户决策，2026-09-30）：
+可用老代码，但语义和名称必须与新设计一致：
+- `nexus-proxy::RuleEngine` 的规则匹配核心保留（已测试的 Clash 级逻辑），
+  由它实现 `nexus-domain::RuleEngine` trait，内部翻译
+  `RouteOutput → RouteTarget`（DIRECT→Egress{self}，PROXY→Egress{peer}，
+  REJECT→Drop）。翻译必须是语义精确的，不允许"近似对应"。
+- 命名一致性：对外暴露的一律用新设计名称（`RouteTarget`、`Egress`、
+  `MeshPeer`）；老名称（`selected_outbound_tag`、`outbound`）只允许出现在
+  适配器内部，不许泄漏到新 API。
+- 依赖方向：`nexus-proxy` 实现 trait（它本来就依赖 `nexus-domain`），
+  `nexus-projection` 经 `Box<dyn RuleEngine>` 注入，永不直接依赖 `nexus-proxy`。
+  接线在 `apps/nexus` 组装时完成。
+- `tun.rs` 的旧直调按 §12.57 前例标 `#[deprecated]`，现有消费者继续工作，
+  新代码一律走 `RuleEngine` trait。
+- 分阶段：3b-1 用 `SimpleRuleEngine`（零新增依赖）；3b-3 接入完整规则引擎
+  适配器，`RouteTarget` 契约不变。
+
 **实施阶段**：
 - Phase 3b-1：`RouteTarget` + 决策流水线（虚拟子网 fast path + IP 规则），
   Egress{self} 本地 NAT（UDP only）
