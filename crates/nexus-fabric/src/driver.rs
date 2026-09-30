@@ -582,8 +582,13 @@ impl Loop {
         // Rebind always reverts to a fresh direct UDP socket (S9): re-creating
         // a TURN allocation mid-connection is out of scope for 4b. The TURN
         // path is exercised without rebind (see product.fabric-turn-relay).
+        //
+        // D0 (N1 装配)：绑定 0.0.0.0 而非 127.0.0.1。回环绑定在真实拓扑
+        // （双 netns + veth / 任何非回环 underlay）下无法到达对端，
+        // rebind 后的连接会永久失联；wildcard 让内核按路由选源地址，
+        // 在回环拓扑上的行为与原来一致（回归风险低）。
         let sock: Box<dyn UdpTransport> = Box::new(
-            StdUdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            StdUdpTransport::bind("0.0.0.0:0".parse().unwrap())
                 .map_err(|e| FabricError::Transport(e.to_string()))?,
         );
         let addr = sock
