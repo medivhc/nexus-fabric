@@ -52,6 +52,18 @@ fn main() {
     }
     let netns_isolated = true;
 
+    // 1.5 拉起 lo（unshare 后 lo 是 DOWN；本地交付需要 lo UP）。
+    let lo_ifindex = ifname_to_index("lo");
+    if lo_ifindex != 0 {
+        let mut nl_lo = match NlSocket::open() {
+            Ok(n) => n,
+            Err(e) => fail(&format!("open netlink for lo: {e}")),
+        };
+        if let Err(e) = nl_lo.set_link_up(lo_ifindex) {
+            fail(&format!("set lo up: {e}"));
+        }
+    }
+
     // 2. 建 TUN 设备。
     let _tun = match TunFd::open_tun(IFNAME.as_bytes()) {
         Ok(t) => t,
