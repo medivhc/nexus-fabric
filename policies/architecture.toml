@@ -232,7 +232,7 @@ name = "nexus-turn"
 
 [[crate]]
 name = "nexus-proxy-transport"
-allowed_internal_dependencies = ["nexus-fabric"]
+allowed_internal_dependencies = ["nexus-fabric", "nexus-outbound-shadowsocks", "nexus-outbound-trojan", "nexus-proxy-config"]
 portable = false
 layer = "delivery"
 

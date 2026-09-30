@@ -1,0 +1,35 @@
+schema_version = 1
+id = "product.proxy-transport-trojan"
+title = "ProxyTransport：QUIC over Trojan 明文握手（T2/T4/T6）"
+evidence_strength = "E4"
+requirement = "docs/foundation/DESIGN.md#3.5"
+
+[given]
+topology = "self-built minimal trojan server (parse_request, AuthDenied closes); A dials B via plaintext trojan handshake; QUIC over length-prefixed TCP (T2)"
+payload_stream = "64KB deterministic bytes"
+
+# 可执行 E4：自研最小 trojan server（读请求头→parse_request→AuthDenied 则关闭→
+# 明文双向中继到 B）→ A 经 trojan 建 QUIC 到 B → 64KB 回显并校验完整 →
+# 输出 stats JSON，断言 proxy_relayed_bytes > 0（T2/T6）且 QUIC 载荷对代理
+# 仍是密文（X2；明文的只是握手头与 2 字节长度前缀，TLS 后置已在契约明说）。
+[when]
+command = "cargo run --quiet -p nexus-proxy-transport --example proxy_trojan_quic -- --json"
+
+# 冻结期望（T2/T6）。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "roundtrip_ok"
+equals = true
+
+# 64KB 必须完整走 trojan 隧道（relayed 字节数被实测到）。
+[[expect]]
+field = "proxy_relayed_bytes"
+non_empty = true
+
+# 代理看到的 QUIC 载荷是密文：明文载荷匹配次数必须为 0（X2）。
+[[expect]]
+field = "proxy_saw_plaintext_bytes"
+equals = 0
