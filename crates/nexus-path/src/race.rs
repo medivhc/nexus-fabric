@@ -9,9 +9,9 @@
 //! `race_connect` blocks until a winner or the total timeout.
 
 use std::io;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -107,143 +107,122 @@ pub fn race_connect(
     let deadline = start + Duration::from_millis(budget.total_timeout_ms);
     let cancel = Arc::new(AtomicBool::new(false));
 
-    // (index, result) channel; also used to detect "no thread left running".
+    // (index, result) channel.
     let (tx, rx) = mpsc::channel::<(usize, io::Result<u64>)>();
 
-    // &dyn PathConnector is Send (PathConnector: Sync), so it can be shared
-    // across attempt threads via Arc.
-    let connector = Arc::new(connector);
+    // Scoped threads: they may borrow `connector` and `ordered` from this
+    // frame (no 'static required). The scope joins all threads on exit.
+    thread::scope(|scope| {
+        let mut next_idx = 0usize;
+        let mut attempts = 0u32;
+        let mut running = 0usize; // currently live attempt threads
+        let mut last_error: Option<io::Error> = None;
 
-    let mut handles = Vec::new();
-    let mut next_idx = 0usize;
-    let mut attempts = 0u32;
-    let mut last_error: Option<io::Error> = None;
-    let mut completed = 0usize; // attempts that reported (ok or err)
-
-    // Launch one attempt for ordered[next_idx].
-    let mut launch = |idx: usize,
-                      tx: mpsc::Sender<(usize, io::Result<u64>)>,
-                      cancel: Arc<AtomicBool>,
-                      connector: Arc<&dyn PathConnector>,
-                      path: CandidatePath|
-     -> thread::JoinHandle<()> {
-        thread::spawn(move || {
-            let res = connector.connect(&path, &cancel);
-            // If the race is over, the receiver may be gone; that's fine.
-            let _ = tx.send((idx, res));
-        })
-    };
-
-    // Start the first attempt immediately.
-    {
-        let path = ordered[0].clone();
-        handles.push(launch(
-            0,
-            tx.clone(),
-            Arc::clone(&cancel),
-            Arc::clone(&connector),
-            path,
-        ));
-        next_idx = 1;
-        attempts = 1;
-    }
-    let mut next_stagger_at = start + Duration::from_millis(budget.stagger_delay_ms);
-
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-
-        // Stagger: launch next attempt if due and we have capacity.
-        if next_idx < ordered.len()
-            && handles.len() < budget.max_parallel.max(1)
-            && now >= next_stagger_at
-        {
-            let path = ordered[next_idx].clone();
-            handles.push(launch(
-                next_idx,
-                tx.clone(),
-                Arc::clone(&cancel),
-                Arc::clone(&connector),
-                path,
-            ));
-            next_idx += 1;
+        // Launch one attempt for ordered[idx].
+        let mut launch = |idx: usize| {
+            let tx = tx.clone();
+            let cancel = Arc::clone(&cancel);
+            let path = ordered[idx].clone();
+            // `connector` and `path` are borrowed/moved into the scoped thread.
+            scope.spawn(move || {
+                let res = connector.connect(&path, &cancel);
+                // If the race is over, the receiver may be gone; that's fine.
+                let _ = tx.send((idx, res));
+            });
+            running += 1;
             attempts += 1;
-            next_stagger_at = now + Duration::from_millis(budget.stagger_delay_ms);
-        }
+        };
 
-        // Wait for the next completion, but no longer than the next deadline.
-        let wait_until = next_stagger_at.min(deadline);
-        let timeout = wait_until.saturating_duration_since(Instant::now());
-        match rx.recv_timeout(timeout) {
-            Ok((idx, res)) => {
-                completed += 1;
-                match res {
-                    Ok(bytes) => {
-                        // Winner! Cancel the rest, join, account.
-                        cancel.store(true, Ordering::SeqCst);
-                        let mut wasted = 0u64;
-                        // Drain any already-completed non-winner results.
-                        while let Ok((other_idx, other_res)) = rx.try_recv() {
-                            completed += 1;
-                            if other_idx != idx {
-                                if let Ok(b) = other_res {
-                                    wasted += b;
+        // Start the first attempt immediately.
+        launch(0);
+        next_idx = 1;
+        let mut next_stagger_at = start + Duration::from_millis(budget.stagger_delay_ms);
+
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+
+            // Stagger: launch next attempt if due and we have capacity.
+            if next_idx < ordered.len()
+                && running < budget.max_parallel.max(1)
+                && now >= next_stagger_at
+            {
+                launch(next_idx);
+                next_idx += 1;
+                next_stagger_at = now + Duration::from_millis(budget.stagger_delay_ms);
+            }
+
+            // Wait for the next completion, but no longer than the next deadline.
+            let wait_until = next_stagger_at.min(deadline);
+            let timeout = wait_until.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(timeout) {
+                Ok((idx, res)) => {
+                    running -= 1;
+                    match res {
+                        Ok(_bytes) => {
+                            // Winner! Cancel the rest; scope will join them.
+                            cancel.store(true, Ordering::SeqCst);
+                            let mut wasted = 0u64;
+                            // Drain any already-completed non-winner results.
+                            while let Ok((other_idx, other_res)) = rx.try_recv() {
+                                if other_idx != idx {
+                                    running -= 1;
+                                    if let Ok(b) = other_res {
+                                        wasted += b;
+                                    }
                                 }
                             }
-                            let _ = other_idx;
+                            // Note: attempts still running when we return are
+                            // cancelled (via `cancel`) and joined by the scope.
+                            // Their byte counts are unobservable -> not in
+                            // `wasted_bytes` (R4 honest omission).
+                            return Ok(RaceOutcome {
+                                winner: ordered[idx].clone(),
+                                attempts,
+                                wasted_bytes: wasted,
+                                elapsed_ms: start.elapsed().as_millis() as u64,
+                            });
                         }
-                        for h in handles {
-                            let _ = h.join();
-                        }
-                        return Ok(RaceOutcome {
-                            winner: ordered[idx].clone(),
-                            attempts,
-                            wasted_bytes: wasted,
-                            elapsed_ms: start.elapsed().as_millis() as u64,
-                        });
-                    }
-                    Err(e) => {
-                        last_error = Some(e);
-                        // If all launched attempts failed and none remain to
-                        // launch, the race is lost.
-                        if completed == handles.len() && next_idx >= ordered.len() {
-                            break;
+                        Err(e) => {
+                            last_error = Some(e);
+                            // If all launched attempts failed and none remain
+                            // to launch, the race is lost.
+                            if running == 0 && next_idx >= ordered.len() {
+                                break;
+                            }
                         }
                     }
                 }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Loop around: maybe stagger the next attempt.
-                continue;
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // All senders gone without a result — shouldn't happen, but
-                // treat as failure rather than hang.
-                break;
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Loop around: maybe stagger the next attempt.
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // All senders gone without a result — shouldn't happen,
+                    // but treat as failure rather than hang.
+                    break;
+                }
             }
         }
-    }
 
-    // Timeout or all-failed: cancel, join, report.
-    cancel.store(true, Ordering::SeqCst);
-    for h in handles {
-        let _ = h.join();
-    }
-    if Instant::now() >= deadline {
-        Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
-                "race_connect: total timeout {}ms exceeded",
-                budget.total_timeout_ms
-            ),
-        ))
-    } else {
-        Err(last_error.unwrap_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "race_connect: all attempts failed")
-        }))
-    }
+        // Timeout or all-failed: cancel; scope joins the threads.
+        cancel.store(true, Ordering::SeqCst);
+        if Instant::now() >= deadline {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "race_connect: total timeout {}ms exceeded",
+                    budget.total_timeout_ms
+                ),
+            ))
+        } else {
+            Err(last_error.unwrap_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, "race_connect: all attempts failed")
+            }))
+        }
+    })
 }
 
 #[cfg(test)]
