@@ -15,6 +15,7 @@
 pub mod dns;
 pub mod egress;
 pub mod routing;
+pub mod tcp;
 pub mod transport;
 
 pub use dns::{
@@ -29,6 +30,7 @@ pub use egress::{
 /// used — not modified — here).
 pub use nexus_domain::{RouteRequest, RouteTarget, RuleEngine};
 pub use routing::{Cidr, Router, UnifiedRouter, format_ipv4, parse_ipv4_dst};
+pub use tcp::{TcpEgress, TcpRelayStats, TcpTermStats};
 pub use transport::{DatagramTransport, FabricTransport, MockTransport, TransportError};
 
 use std::collections::VecDeque;
@@ -42,10 +44,12 @@ use std::thread;
 use std::time::Duration;
 
 /// Intent byte (fabric datagram payload, first byte — DESIGN.md §6.4):
-/// bit 0-1 = type (00 = mesh forward, 01 = egress NAT),
+/// bit 0-1 = type (00 = mesh forward, 01 = egress NAT, 10 = TCP byte stream),
 /// bit 2-5 = egress hop count (loop protection), bit 6-7 = reserved.
 pub const INTENT_MESH: u8 = 0x00;
 pub const INTENT_EGRESS: u8 = 0x01;
+/// 3b-5 (S22): TCP byte-stream frames (see `tcp::encode_stream_frame`).
+pub const INTENT_STREAM: u8 = 0x02;
 
 /// Encode the intent byte.
 pub fn encode_intent(is_egress: bool, hops: u8) -> u8 {
@@ -61,6 +65,17 @@ pub fn encode_intent(is_egress: bool, hops: u8) -> u8 {
 /// Decode the intent byte → (is_egress, hop_count).
 pub fn decode_intent(b: u8) -> (bool, u8) {
     ((b & 0x03) == INTENT_EGRESS, (b >> 2) & 0x0F)
+}
+
+/// Encode the intent byte with an explicit kind
+/// (`INTENT_MESH` / `INTENT_EGRESS` / `INTENT_STREAM`).
+pub fn encode_intent_kind(kind: u8, hops: u8) -> u8 {
+    (kind & 0x03) | ((hops & 0x0F) << 2)
+}
+
+/// Decode the intent byte → (kind, hop_count).
+pub fn decode_intent_kind(b: u8) -> (u8, u8) {
+    (b & 0x03, (b >> 2) & 0x0F)
 }
 
 /// Routing counters (S12: drops are visible, never silent).
@@ -242,15 +257,312 @@ fn send_with_intent(
     }
 }
 
-/// L3 tunnel projection: TUN <-> fabric datagrams, with unified routing.
+/// One tcp-poll iteration (3b-5, S21/S22/S23).
 ///
-/// Three background threads (owner: this struct, joined on `close`/`Drop`):
+/// Drives the terminator (harvests `TcpEvent`s) and the relay (harvests
+/// `RelayEvent`s), emitting STREAM-intent frames and writing TUN-bound
+/// packets. `peer == "self"` loopbacks are delivered directly to the local
+/// relay/terminator instead of going through the transport.
+fn tcp_poll_once(
+    tcp: &Arc<Mutex<TcpEgress>>,
+    transport_slot: &Arc<Mutex<Arc<dyn DatagramTransport>>>,
+    tun: &Arc<Mutex<Box<dyn TunDevice>>>,
+    stats: &Arc<Mutex<TunStats>>,
+    mtu: usize,
+) {
+    use tcp::{STREAM_FIN, STREAM_RST, STREAM_SYN, decode_stream_frame, encode_stream_frame};
+
+    // Helper: emit a STREAM frame to `peer` ("self" = local loopback).
+    let emit = |tcp: &Arc<Mutex<TcpEgress>>,
+                transport_slot: &Arc<Mutex<Arc<dyn DatagramTransport>>>,
+                stats: &Arc<Mutex<TunStats>>,
+                peer: &str,
+                stream_id: u32,
+                flags: u8,
+                payload: &[u8]| {
+        if peer == "self" {
+            // Local loopback: feed directly to the other side.
+            let frame = encode_stream_frame(stream_id, flags, payload);
+            let (sid, fl, pl) = match decode_stream_frame(&frame) {
+                Some(t) => t,
+                None => return,
+            };
+            let mut t = lock(tcp);
+            if t.terminator.lookup_id(sid).is_some() {
+                // Originator side (frame came from our own relay).
+                let pkts = if fl & STREAM_RST != 0 {
+                    t.terminator.handle_fabric_rst(sid)
+                } else if fl & STREAM_FIN != 0 {
+                    t.terminator.handle_fabric_fin(sid)
+                } else {
+                    t.terminator.handle_fabric_data(sid, pl)
+                };
+                drop(t);
+                let mut tun = lock(tun);
+                for p in pkts {
+                    if tun.write(&p).is_ok() {
+                        let mut s = lock(stats);
+                        s.packets_in += 1;
+                        s.bytes_in += p.len() as u64;
+                    }
+                }
+            } else {
+                // Egress side.
+                let evs = t.relay.handle_frame(sid, fl, pl, "self");
+                drop(t);
+                // Relay events loop back to the terminator directly.
+                for e in evs {
+                    handle_relay_event_loopback(tcp, tun, stats, e);
+                }
+            }
+            return;
+        }
+        let frame = encode_stream_frame(stream_id, flags, payload);
+        let transport = lock(transport_slot).clone();
+        send_with_intent(
+            &transport,
+            stats,
+            peer,
+            &frame,
+            mtu,
+            encode_intent_kind(INTENT_STREAM, 0),
+        );
+    };
+
+    // Terminator events.
+    let term_events = { lock(tcp).terminator.poll() };
+    for ev in term_events {
+        match ev {
+            tcp::TcpEvent::Syn {
+                stream_id,
+                dst,
+                peer,
+            } => {
+                let mut payload = Vec::with_capacity(6);
+                payload.extend_from_slice(&dst.ip().octets());
+                payload.extend_from_slice(&dst.port().to_be_bytes());
+                emit(
+                    tcp,
+                    transport_slot,
+                    stats,
+                    &peer,
+                    stream_id,
+                    STREAM_SYN,
+                    &payload,
+                );
+            }
+            tcp::TcpEvent::Data {
+                stream_id,
+                peer,
+                bytes,
+            } => {
+                emit(tcp, transport_slot, stats, &peer, stream_id, 0, &bytes);
+            }
+            tcp::TcpEvent::Closed {
+                stream_id,
+                peer,
+                reset,
+            } => {
+                let flags = if reset { STREAM_RST } else { STREAM_FIN };
+                emit(tcp, transport_slot, stats, &peer, stream_id, flags, &[]);
+            }
+            tcp::TcpEvent::TunPacket(pkt) => {
+                let mut tun = lock(tun);
+                if tun.write(&pkt).is_ok() {
+                    let mut s = lock(stats);
+                    s.packets_in += 1;
+                    s.bytes_in += pkt.len() as u64;
+                }
+            }
+        }
+    }
+
+    // Relay events.
+    let relay_events = { lock(tcp).relay.poll() };
+    for ev in relay_events {
+        match ev {
+            tcp::RelayEvent::Data {
+                stream_id,
+                peer,
+                bytes,
+            } => {
+                emit(tcp, transport_slot, stats, &peer, stream_id, 0, &bytes);
+            }
+            tcp::RelayEvent::Closed {
+                stream_id,
+                peer,
+                reset,
+            } => {
+                let flags = if reset { STREAM_RST } else { STREAM_FIN };
+                emit(tcp, transport_slot, stats, &peer, stream_id, flags, &[]);
+            }
+        }
+    }
+}
+
+/// Handle an inbound STREAM-intent datagram (3b-5, S22).
+///
+/// Dispatches by table lookup: stream_id known to the terminator → we are
+/// the originator (feed bytes into smoltcp, write TUN packets); otherwise
+/// we are the egress (relay the frame to the `TcpStream`). Immediate relay
+/// events (e.g. connect-failure RST) are sent back via the transport.
+fn handle_stream_datagram(
+    tcp_egress_slot: &Arc<Mutex<Option<Arc<Mutex<TcpEgress>>>>>,
+    transport_slot: &Arc<Mutex<Arc<dyn DatagramTransport>>>,
+    tun: &Arc<Mutex<Box<dyn TunDevice>>>,
+    stats: &Arc<Mutex<TunStats>>,
+    from_peer: &str,
+    frame: &[u8],
+    mtu: usize,
+) {
+    use tcp::{STREAM_FIN, STREAM_RST};
+    let tcp = match lock(tcp_egress_slot).clone() {
+        Some(t) => t,
+        None => return, // TCP egress not enabled: drop.
+    };
+    let (stream_id, flags, payload) = match tcp::decode_stream_frame(frame) {
+        Some(t) => t,
+        None => return,
+    };
+    // Originator?
+    let is_originator = { lock(&tcp).terminator.lookup_id(stream_id).is_some() };
+    if is_originator {
+        let pkts = {
+            let mut t = lock(&tcp);
+            if flags & STREAM_RST != 0 {
+                t.terminator.handle_fabric_rst(stream_id)
+            } else if flags & STREAM_FIN != 0 {
+                t.terminator.handle_fabric_fin(stream_id)
+            } else {
+                t.terminator.handle_fabric_data(stream_id, payload)
+            }
+        };
+        let mut tun = lock(tun);
+        for p in pkts {
+            if tun.write(&p).is_ok() {
+                let mut s = lock(stats);
+                s.packets_in += 1;
+                s.bytes_in += p.len() as u64;
+            }
+        }
+        return;
+    }
+    // Egress side.
+    let events = {
+        lock(&tcp)
+            .relay
+            .handle_frame(stream_id, flags, payload, from_peer)
+    };
+    // Immediate events (connect failure → RST) go back over the transport.
+    for ev in events {
+        let (sid, peer, flags, payload) = match ev {
+            tcp::RelayEvent::Data {
+                stream_id,
+                peer,
+                bytes,
+            } => (stream_id, peer, 0u8, bytes),
+            tcp::RelayEvent::Closed {
+                stream_id,
+                peer,
+                reset,
+            } => (
+                stream_id,
+                peer,
+                if reset { STREAM_RST } else { STREAM_FIN },
+                vec![],
+            ),
+        };
+        let frame = tcp::encode_stream_frame(sid, flags, &payload);
+        let transport = lock(transport_slot).clone();
+        send_with_intent(
+            &transport,
+            stats,
+            &peer,
+            &frame,
+            mtu,
+            encode_intent_kind(INTENT_STREAM, 0),
+        );
+    }
+}
+
+/// Feed a TUN TCP packet routed to egress into the smoltcp terminator
+/// (3b-5, S21); write the stack's replies back to the TUN.
+fn handle_tcp_uplink_packet(
+    tcp_egress_slot: &Arc<Mutex<Option<Arc<Mutex<TcpEgress>>>>>,
+    tun: &Arc<Mutex<Box<dyn TunDevice>>>,
+    stats: &Arc<Mutex<TunStats>>,
+    route_stats: &Arc<Mutex<RouteStats>>,
+    pkt: &[u8],
+    peer: &str,
+    pkt_len: usize,
+) {
+    let tun_pkts = {
+        let tcp = match lock(tcp_egress_slot).clone() {
+            Some(t) => t,
+            None => return,
+        };
+        lock(&tcp).terminator.handle_uplink(pkt, peer)
+    };
+    {
+        let mut tun = lock(tun);
+        for p in tun_pkts {
+            if tun.write(&p).is_ok() {
+                let mut s = lock(stats);
+                s.packets_in += 1;
+                s.bytes_in += p.len() as u64;
+            }
+        }
+    }
+    lock(route_stats).egress_remote += 1;
+    let mut s = lock(stats);
+    s.packets_out += 1;
+    s.bytes_out += pkt_len as u64;
+}
+
+/// Deliver a relay-side event back to the local terminator ("self"
+/// loopback path).
+fn handle_relay_event_loopback(
+    tcp: &Arc<Mutex<TcpEgress>>,
+    tun: &Arc<Mutex<Box<dyn TunDevice>>>,
+    stats: &Arc<Mutex<TunStats>>,
+    ev: tcp::RelayEvent,
+) {
+    let mut t = lock(tcp);
+    let pkts = match ev {
+        tcp::RelayEvent::Data {
+            stream_id, bytes, ..
+        } => t.terminator.handle_fabric_data(stream_id, &bytes),
+        tcp::RelayEvent::Closed {
+            stream_id, reset, ..
+        } => {
+            if reset {
+                t.terminator.handle_fabric_rst(stream_id)
+            } else {
+                t.terminator.handle_fabric_fin(stream_id)
+            }
+        }
+    };
+    drop(t);
+    let mut tun = lock(tun);
+    for p in pkts {
+        if tun.write(&p).is_ok() {
+            let mut s = lock(stats);
+            s.packets_in += 1;
+            s.bytes_in += p.len() as u64;
+        }
+    }
+}
+///
+/// Four background threads (owner: this struct, joined on `close`/`Drop`):
 /// - uplink: TUN.read -> route -> MTU check -> transport / local NAT / drop
 /// - downlink: transport.recv -> hop validation (S13) -> TUN.write or NAT
-///   (+ real socket egress when enabled, S18)
+///   (+ real socket egress when enabled, S18; + STREAM frames, S22)
 /// - egress-recv: real socket replies -> reverse NAT -> transport back to
 ///   the origin peer with mesh intent (S19), or to the local TUN for
 ///   `Egress{self}`.
+/// - tcp-poll: drives the smoltcp terminator and the TcpStream relay
+///   (3b-5, S21/S22/S23): harvests byte-stream events and emits STREAM
+///   frames, delivers TUN-bound packets.
 ///
 /// `send_packet` is the test/E4 injection path (same routing + MTU check as
 /// the uplink thread). `recv_packet` polls the transport directly and is
@@ -277,12 +589,18 @@ pub struct Projection {
     /// egress-recv threads (spawned in `new`) see the builder-installed
     /// instance — same pattern as `router_slot` / `transport_slot`.
     real_egress_slot: Arc<Mutex<Option<Arc<RealUdpEgress>>>>,
+    /// TCP egress (3b-5, S21/S22/S23): smoltcp terminator + TcpStream relay.
+    /// Shared slot; the tcp-poll thread (spawned in `new`) sees the
+    /// builder-installed instance. Inner `Mutex` because the uplink,
+    /// downlink and tcp-poll threads all drive it.
+    tcp_egress_slot: Arc<Mutex<Option<Arc<Mutex<TcpEgress>>>>>,
     stats: Arc<Mutex<TunStats>>,
     path_switches: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     uplink: Option<thread::JoinHandle<()>>,
     downlink: Option<thread::JoinHandle<()>>,
     egress_recv: Option<thread::JoinHandle<()>>,
+    tcp_poll: Option<thread::JoinHandle<()>>,
 }
 
 impl Projection {
@@ -330,8 +648,12 @@ impl Projection {
         // installs the instance; the downlink and egress-recv threads read
         // it through this shared slot.
         let real_egress_slot: Arc<Mutex<Option<Arc<RealUdpEgress>>>> = Arc::new(Mutex::new(None));
+        // TCP-egress slot: `with_tcp_egress` (builder) installs the
+        // instance; the uplink, downlink and tcp-poll threads read it
+        // through this shared slot.
+        let tcp_egress_slot: Arc<Mutex<Option<Arc<Mutex<TcpEgress>>>>> = Arc::new(Mutex::new(None));
 
-        let (uplink, downlink, egress_recv) = if spawn_threads {
+        let (uplink, downlink, egress_recv, tcp_poll) = if spawn_threads {
             // Uplink: TUN -> route -> transport / local NAT / drop.
             let up = {
                 let tun = Arc::clone(&tun);
@@ -342,6 +664,7 @@ impl Projection {
                 let route_stats = Arc::clone(&route_stats);
                 let egress_nat = Arc::clone(&egress_nat);
                 let real_egress_slot = Arc::clone(&real_egress_slot);
+                let tcp_egress_slot = Arc::clone(&tcp_egress_slot);
                 thread::Builder::new()
                     .name("projection-uplink".into())
                     .spawn(move || {
@@ -366,6 +689,28 @@ impl Projection {
                             let pkt = &buf[..n];
                             // Route first (S9/S10/S12).
                             let target = classify(&router, pkt);
+                            // 3b-5 (S21): TCP packets routed to egress go to
+                            // the smoltcp terminator when enabled, not the
+                            // UDP NAT / raw forward path.
+                            let is_tcp_egress = matches!(target, RouteTarget::Egress { .. })
+                                && tcp::parse_tcp(pkt).is_some()
+                                && lock(&tcp_egress_slot).is_some();
+                            if is_tcp_egress {
+                                let peer = match target {
+                                    RouteTarget::Egress { ref peer } => peer.clone(),
+                                    _ => unreachable!(),
+                                };
+                                handle_tcp_uplink_packet(
+                                    &tcp_egress_slot,
+                                    &tun,
+                                    &stats,
+                                    &route_stats,
+                                    pkt,
+                                    &peer,
+                                    n,
+                                );
+                                continue;
+                            }
                             match target {
                                 RouteTarget::Drop => {
                                     lock(&route_stats).dropped += 1;
@@ -439,6 +784,7 @@ impl Projection {
                 let route_stats = Arc::clone(&route_stats);
                 let egress_nat = Arc::clone(&egress_nat);
                 let real_egress_slot = Arc::clone(&real_egress_slot);
+                let tcp_egress_slot = Arc::clone(&tcp_egress_slot);
                 // F1 fix: the downlink must see the router so DNS responses
                 // arriving via transport feed the DnsCache (S17). The routing
                 // decision itself is discarded — the packet is already here,
@@ -457,7 +803,24 @@ impl Projection {
                                         Some((b, rest)) => (*b, rest),
                                         None => continue, // empty datagram: drop
                                     };
-                                    let (is_egress, hops) = decode_intent(intent_byte);
+                                    let (kind, hops) = decode_intent_kind(intent_byte);
+                                    if kind == INTENT_STREAM {
+                                        // 3b-5 (S22): TCP byte-stream frame.
+                                        handle_stream_datagram(
+                                            &tcp_egress_slot,
+                                            &transport_slot,
+                                            &tun,
+                                            &stats,
+                                            &from_peer,
+                                            pkt,
+                                            mtu,
+                                        );
+                                        let mut s = lock(&stats);
+                                        s.packets_in += 1;
+                                        s.bytes_in += pkt.len() as u64;
+                                        continue;
+                                    }
+                                    let is_egress = kind == INTENT_EGRESS;
                                     if is_egress {
                                         // S13: validate hop count before
                                         // handling (loop protection).
@@ -587,9 +950,38 @@ impl Projection {
                     })
                     .expect("spawn projection egress-recv")
             };
-            (Some(up), Some(down), Some(er))
+            // tcp-poll (3b-5, S21/S22/S23): drives the smoltcp terminator
+            // and the TcpStream relay. Harvests byte-stream events and
+            // emits STREAM frames; delivers TUN-bound packets. Exits on
+            // shutdown so `close` can join it.
+            let tp = {
+                let tcp_egress_slot = Arc::clone(&tcp_egress_slot);
+                let transport_slot = Arc::clone(&transport_slot);
+                let tun = Arc::clone(&tun);
+                let stats = Arc::clone(&stats);
+                let shutdown = Arc::clone(&shutdown);
+                thread::Builder::new()
+                    .name("projection-tcp-poll".into())
+                    .spawn(move || {
+                        while !shutdown.load(Ordering::Relaxed) {
+                            let tcp = lock(&tcp_egress_slot).clone();
+                            match tcp {
+                                None => {
+                                    thread::sleep(Duration::from_millis(10));
+                                    continue;
+                                }
+                                Some(tcp) => {
+                                    tcp_poll_once(&tcp, &transport_slot, &tun, &stats, mtu);
+                                    thread::sleep(Duration::from_millis(10));
+                                }
+                            }
+                        }
+                    })
+                    .expect("spawn projection tcp-poll")
+            };
+            (Some(up), Some(down), Some(er), Some(tp))
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
 
         Self {
@@ -601,12 +993,14 @@ impl Projection {
             route_stats,
             egress_nat,
             real_egress_slot,
+            tcp_egress_slot,
             stats,
             path_switches,
             shutdown,
             uplink,
             downlink,
             egress_recv,
+            tcp_poll,
         }
     }
 
@@ -678,6 +1072,34 @@ impl Projection {
     /// Real-egress counters (S18/S19), or `None` when not enabled.
     pub fn real_egress_stats(&self) -> Option<RealEgressStats> {
         lock(&self.real_egress_slot).as_ref().map(|re| re.stats())
+    }
+
+    /// Enable TCP egress (3b-5, S21/S22/S23). Installs the terminator+relay
+    /// and makes it visible to the uplink, downlink and tcp-poll threads.
+    pub fn with_tcp_egress(self) -> Self {
+        *lock(&self.tcp_egress_slot) = Some(Arc::new(Mutex::new(TcpEgress::new())));
+        self
+    }
+
+    /// TCP terminator counters (S21/S23), or `None` when not enabled.
+    pub fn tcp_term_stats(&self) -> Option<TcpTermStats> {
+        lock(&self.tcp_egress_slot)
+            .as_ref()
+            .map(|t| lock(t).terminator.stats())
+    }
+
+    /// TCP relay counters (S22), or `None` when not enabled.
+    pub fn tcp_relay_stats(&self) -> Option<TcpRelayStats> {
+        lock(&self.tcp_egress_slot)
+            .as_ref()
+            .map(|t| lock(t).relay.stats())
+    }
+
+    /// Live TCP connections (terminator + relay), or `None` when disabled.
+    pub fn tcp_conn_count(&self) -> Option<usize> {
+        lock(&self.tcp_egress_slot)
+            .as_ref()
+            .map(|t| lock(t).conn_count())
     }
 
     /// Bound addresses of live egress flow sockets (E4 probing, S19).
@@ -753,6 +1175,27 @@ impl Projection {
     /// are dropped, counted, and reported — never truncated or fragmented.
     pub fn send_packet(&mut self, packet: &[u8]) -> Result<(), ProjectionError> {
         let target = classify(&self.router_slot, packet);
+        // 3b-5 (S21): mirror the uplink thread — TCP to egress goes to the
+        // smoltcp terminator when enabled.
+        if matches!(target, RouteTarget::Egress { .. })
+            && tcp::parse_tcp(packet).is_some()
+            && lock(&self.tcp_egress_slot).is_some()
+        {
+            let peer = match target {
+                RouteTarget::Egress { ref peer } => peer.clone(),
+                _ => unreachable!(),
+            };
+            handle_tcp_uplink_packet(
+                &self.tcp_egress_slot,
+                &self.tun,
+                &self.stats,
+                &self.route_stats,
+                packet,
+                &peer,
+                packet.len(),
+            );
+            return Ok(());
+        }
         match target {
             RouteTarget::Drop => {
                 lock(&self.route_stats).dropped += 1;
@@ -866,9 +1309,14 @@ impl Projection {
         if let Some(h) = self.egress_recv.take() {
             let _ = h.join();
         }
+        if let Some(h) = self.tcp_poll.take() {
+            let _ = h.join();
+        }
         // S20: drop the real egress after the threads using it have joined,
         // closing all flow sockets.
         *lock(&self.real_egress_slot) = None;
+        // S23: drop the TCP egress after the threads joined.
+        *lock(&self.tcp_egress_slot) = None;
     }
 }
 
