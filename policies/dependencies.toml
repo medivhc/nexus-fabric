@@ -161,6 +161,23 @@ approved_date = "2026-09-30"
 review_basis = "2026-09-30 foundation decision: userspace TCP stack = smoltcp (MEMORY.md); live build eval on 2026-09-30 (no-default-features set compiles)"
 
 [[dependency_reviews.direct]]
+consumer = "crates/nexus-projection"
+crate = "tun-rs"
+version = "2.8"
+default_features = false
+features = []
+architecture_layer = "projection (real TUN device, sync API)"
+feature_scope = "sync only; no async/async_io/async_std/async_framed features (repo is std-only, no tokio)"
+license = "Apache-2.0 (allowlisted; to be confirmed by cargo-deny at implementation time)"
+security = "RustSec DB to be checked at implementation time via harness gate"
+portability = "Windows/Linux/macOS/BSD/Android/OpenHarmony/iOS/tvOS; Windows needs wintun.dll shipped with binary (later packaging task); iOS/Android use SyncDevice::from_fd (later task)"
+supply_chain = "version pinned by Cargo.lock (lockfile_required); default deps: byteorder/bytes/getifaddrs/ipnet/libc/log (all MIT/Apache-2.0, no async)"
+os_transitive_deps = "libc (accepted)"
+approved = true
+approved_date = "2026-09-30"
+review_basis = "2026-09-30 dep review: tun2 rejected (WTFPL); tun-rs 2.8.11 Apache-2.0, 551k+ downloads, sync API"
+
+[[dependency_reviews.direct]]
 consumer = "crates/nexus-fabric"
 crate = "quinn-proto"
 version = "0.11"

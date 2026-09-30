@@ -17,6 +17,7 @@ pub mod egress;
 pub mod routing;
 pub mod tcp;
 pub mod transport;
+pub mod tun_rs_device;
 
 pub use dns::{
     DEFAULT_DNS_CACHE_ENTRIES, DNS_CACHE_TTL_CAP, DnsCache, DnsSniffer, DnsStats, Sniffed,
@@ -90,7 +91,7 @@ pub struct RouteStats {
 }
 
 /// Abstraction over a TUN device. Implementations: `MockTun` (E4),
-/// OS-specific (E5, `os::linux`).
+/// `tun_rs_device::TunRsDevice` (E5, real OS device via tun-rs v2).
 pub trait TunDevice: Send {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>;
     fn write(&mut self, packet: &[u8]) -> io::Result<usize>;
