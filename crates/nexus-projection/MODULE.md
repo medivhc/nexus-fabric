@@ -51,6 +51,7 @@ P0 不做：TCP NAT（依赖 L4 中继）、
 - `nexus-domain`（`RouteTarget`、`RouteRequest`、`RuleEngine`）
 - `nexus-fabric`（`FabricConn::send_datagram` / `recv_datagram` 类型）
 - `nexus-path`（`PathManager` 事件类型，仅类型）
+- `nexus-ingress`（SOCKS5/HTTP 代理协议状态机；仅解析器，零 I/O）
 
 ## Forbidden Dependencies
 
@@ -158,6 +159,29 @@ write 写入完整 IP 包）。`MockTun` 保留用于 E4（无特权环境）；
 `TunRsDevice` 用于 E5（需 CAP_NET_ADMIN/root）。IP地址分配、路由表、
 DNS 配置**不在**本阶段范围（P3.x 后置边界，见 2026-09-29 冻结决策）。
 创建失败（无特权）时返回 `io::Error`，调用方可降级为 SKIP。
+
+**S25（语义入口）**：`SemanticIngress::bind(addr)`（std `TcpListener` +
+accept 线程，sync，零 tokio）把 SOCKS5/HTTP 显式代理映射为 fabric 流：
+- 握手复用 `nexus-ingress` 的 `Socks5Handshake` / HTTP 代理状态机（零
+  I/O 纯函数）；首字节嗅探：`0x05` → SOCKS5，否则按 HTTP 请求行解析。
+  BIND / UDP ASSOCIATE / plain HTTP absolute-form（非 CONNECT）显式拒绝。
+- 握手成功得 `destination`（host:port，host 可为域名或 IP）→ 经
+  `UnifiedRouter` 走**同一条**统一决策链（与 TUN 一致）：
+  - `Egress{self}` → 本地 `TcpStream::connect`（DIRECT 语义；域名本地解析）；
+  - `Egress{peer}` → fabric STREAM 意图 `0x02` 向 peer 发 SYN；
+  - `Drop` → SOCKS5 回复 `0x02` / HTTP 回 `403`，计数 `ingress_dropped`。
+- SYN 载荷（S22 扩展）：首字节 addr-type（`0x01`=IPv4 后跟 4 字节，
+  `0x03`=域名 后跟 1 字节长度 + 域名），最后 2 字节 port（u16be）。
+  兼容：载荷长 6 字节时按 3b-5 旧格式（IPv4+port）解析。originator 自 3d
+  起统一用 typed 形式。egress 侧收到域名形式 → 解析（走 S17 缓存）→
+  `TcpStream` 连接目标 → 复用 S22 中继。域名不在 originator 本地解析
+  （避免审查环境 DNS 泄漏/污染）。
+- 中继：client socket ⟷ fabric stream（`Egress{peer}`）或 ⟷ 本地
+  `TcpStream`（`Egress{self}`）双向字节中继；任一端 EOF/错误 → 关闭对端。
+- 握手失败 → 协议错误响应 + 计数 `ingress_handshake_errors`，关闭连接。
+- 统计：`ingress_accepted` / `ingress_dropped` /
+  `ingress_handshake_errors` / `ingress_egress_local` /
+  `ingress_egress_remote`。
 
 ## Side Effects
 
