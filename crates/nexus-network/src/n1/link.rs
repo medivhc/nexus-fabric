@@ -78,6 +78,11 @@ pub struct LinkStateWatcher {
     discovery: Arc<dyn N1Discovery>,
     sink: Arc<dyn N1EventSink>,
     config: LinkConfig,
+    /// 上次 rebind 时间：rebind 后需要给 QUIC 的 PTO/拥塞恢复留出时间，
+    /// 避免"rebind 太频繁、QUIC 来不及发包"的死循环。指数退避。
+    last_rebind: Mutex<Option<Instant>>,
+    /// 连续 rebind 次数（用于退避计算；心跳恢复后清零）。
+    rebind_streak: Mutex<u32>,
 }
 
 impl LinkStateWatcher {
@@ -96,6 +101,8 @@ impl LinkStateWatcher {
             discovery,
             sink,
             config,
+            last_rebind: Mutex::new(None),
+            rebind_streak: Mutex::new(0),
         };
         let stop_c = Arc::clone(&stop);
         let thread = thread::Builder::new()
@@ -169,7 +176,12 @@ impl LinkStateWatcher {
                         self.conn.close(); // 打断 pinger 的阻塞读
                         break;
                     }
-                    if last_pong.lock().unwrap().elapsed() > self.config.heartbeat_timeout {
+                    let pong_age = last_pong.lock().unwrap().elapsed();
+                    // 心跳健康（近期收到 pong）：重置 rebind 退避计数。
+                    if pong_age < self.config.probe_interval * 2 {
+                        *self.rebind_streak.lock().unwrap() = 0;
+                    }
+                    if pong_age > self.config.heartbeat_timeout {
                         self.recover("heartbeat timeout");
                         // FIX（rebind 死循环）：rebind 后旧 keepalive 流已不可靠
                         // （对端迁移前它处于未知状态），必须丢弃并退出，由 watch()
@@ -236,13 +248,29 @@ impl LinkStateWatcher {
             // stationary 端：不上报 RebindSucceeded，仅记录跳过。
             return;
         }
+        // rebind 退避：死链路后 QUIC 的 PTO/拥塞窗口需要时间恢复，
+        // 连续快速 rebind 会打断恢复。指数退避：3s, 6s, 12s, ...，上限 30s。
+        let streak = *self.rebind_streak.lock().unwrap();
+        let backoff_secs = (3u64 << streak.min(3)).min(30);
+        let should_rebind = match *self.last_rebind.lock().unwrap() {
+            None => true,
+            Some(t) => t.elapsed() >= Duration::from_secs(backoff_secs),
+        };
+        if !should_rebind {
+            // 退避期内：不上报重复 rebind，等待 QUIC 恢复。
+            return;
+        }
         match self.conn.rebind() {
-            Ok(()) => self.sink.emit(N1Event {
-                peer: self.peer,
-                connection_id: cid,
-                kind: N1EventKind::RebindSucceeded,
-                disposition: N1Disposition::Retry,
-            }),
+            Ok(()) => {
+                *self.last_rebind.lock().unwrap() = Some(Instant::now());
+                *self.rebind_streak.lock().unwrap() = streak + 1;
+                self.sink.emit(N1Event {
+                    peer: self.peer,
+                    connection_id: cid,
+                    kind: N1EventKind::RebindSucceeded,
+                    disposition: N1Disposition::Retry,
+                })
+            }
             Err(e) => self.sink.emit(N1Event {
                 peer: self.peer,
                 connection_id: cid,
