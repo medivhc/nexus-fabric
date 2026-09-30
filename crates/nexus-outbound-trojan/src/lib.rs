@@ -11,7 +11,6 @@
 #![forbid(unsafe_code)]
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
 
 use nexus_connectivity::{ConnectivityError, OutboundAdapter, OutboundHandoff};
 use sha2::{Digest, Sha224};
