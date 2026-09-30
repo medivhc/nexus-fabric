@@ -3,6 +3,7 @@
 //! Uses a fake `PathConnector` with injected latency:
 //! - direct (preferred by stagger order) sleeps 800ms
 //! - turn sleeps 50ms
+//!
 //! With stagger_delay 200ms, turn starts 200ms after direct but finishes
 //! first (at ~250ms vs ~800ms), so turn must win.
 //!
