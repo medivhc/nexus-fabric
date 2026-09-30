@@ -560,6 +560,7 @@ impl Projection {
     /// - origin peer is "self": write to the TUN, return `true`;
     /// - origin peer is remote: forward back via the transport with mesh
     ///   intent (the originator's downlink validates it via NAT, S11).
+    ///
     /// Returns `false` if the reply matches no tracked flow.
     /// Production uses real egress sockets instead of this method.
     pub fn handle_egress_reply(&self, reply: &[u8]) -> bool {

@@ -54,10 +54,13 @@ pub trait DatagramTransport: Send + Sync {
 /// the datagram with this transport's name so the receiver knows the origin.
 pub struct MockTransport {
     name: String,
-    peers: Mutex<HashMap<String, mpsc::Sender<(String, Vec<u8>)>>>,
+    peers: Mutex<PeerMap>,
     inbox_rx: Mutex<mpsc::Receiver<(String, Vec<u8>)>>,
     inbox_tx: mpsc::Sender<(String, Vec<u8>)>,
 }
+
+/// Peer name → inbox sender for [`MockTransport`].
+type PeerMap = HashMap<String, mpsc::Sender<(String, Vec<u8>)>>;
 
 impl MockTransport {
     /// Create an unlinked transport named `name`.
@@ -137,14 +140,9 @@ impl FabricTransport {
             thread::Builder::new()
                 .name(format!("fabric-pump-{name}"))
                 .spawn(move || {
-                    loop {
-                        match conn.recv_datagram() {
-                            Ok(d) => {
-                                if tx.send((name.clone(), d)).is_err() {
-                                    break; // inbox gone
-                                }
-                            }
-                            Err(_) => break, // closed / poisoned
+                    while let Ok(d) = conn.recv_datagram() {
+                        if tx.send((name.clone(), d)).is_err() {
+                            break; // inbox gone
                         }
                     }
                 })
