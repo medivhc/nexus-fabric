@@ -653,6 +653,23 @@ fn child_b(
                     "dev",
                     &cfg.veth,
                 ])?;
+                // 主动 rebind（模拟 OS 网络变更通知）：不等 3s 心跳超时，
+                // 避免 QUIC 在长死链路后难以恢复。watcher 仍作为后备。
+                if let Some(conn) = mgr.connection_for(&peer) {
+                    match conn.rebind() {
+                        Ok(()) => {
+                            eprintln!("[child b] proactive rebind ok");
+                            // 手动上报事件（watcher 未触发，故无自动事件）。
+                            sink.emit(nexus_network::n1::N1Event {
+                                peer,
+                                connection_id: conn.connection_id(),
+                                kind: nexus_network::n1::N1EventKind::RebindSucceeded,
+                                disposition: nexus_network::n1::N1Disposition::Retry,
+                            });
+                        }
+                        Err(e) => eprintln!("[child b] proactive rebind failed: {e:?}"),
+                    }
+                }
                 roamed = true;
                 println!("ROAMED");
                 std::io::stdout().flush().map_err(|e| e.to_string())?;
