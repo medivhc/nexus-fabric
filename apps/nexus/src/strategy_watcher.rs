@@ -306,7 +306,7 @@ fn watch_loop(
     }
 }
 
-/// 单次轮询：mtime + 哈希双重确认 → 解析 → 比较 → 应用/记录。
+/// 单次轮询：内容哈希为真相来源（mtime 仅快速路径）→ 解析 → 比较 → 应用/记录。
 ///
 /// 失败路径（读失败/解析失败）只记录事件，绝不调用 `set_strategy()`。
 fn poll_once(
@@ -318,7 +318,10 @@ fn poll_once(
     events: &Arc<Mutex<VecDeque<ReloadEvent>>>,
     seq: &Arc<AtomicU64>,
 ) {
-    // 1. mtime 检查
+    // 1. mtime 快速路径。注意：粗粒度时间戳的文件系统上连续写入的 mtime
+    //    可能完全不变（2026-09-30 真机复现：/tmp 上 99/100 次紧循环写入
+    //    mtime 相同），因此 mtime 只能做提示，不能做决定；内容哈希才是
+    //    真相来源，每次轮询都必须验证。
     let mtime = match std::fs::metadata(path) {
         Ok(m) => m.modified().ok(),
         Err(e) => {
@@ -336,12 +339,12 @@ fn poll_once(
             return;
         }
     };
-    if mtime == baseline.mtime {
-        return; // 静默跳过
+    let mtime_changed = mtime != baseline.mtime;
+    if mtime_changed {
+        baseline.mtime = mtime;
     }
-    baseline.mtime = mtime;
 
-    // 2. 读文件 + 哈希确认
+    // 2. 读文件 + 哈希确认（配置文件很小，每次轮询读+哈希开销可忽略）
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
@@ -362,7 +365,7 @@ fn poll_once(
     baseline.healthy = true;
     let hash = fnv1a_64(&bytes);
     if hash == baseline.hash {
-        return; // mtime 变但内容不变 → 静默跳过，不记录事件
+        return; // 内容不变 → 静默跳过，不记录事件（无论 mtime 是否变化）
     }
     baseline.hash = hash;
 
@@ -481,5 +484,52 @@ mod tests {
         assert_eq!(q.len(), 3);
         let seqs: Vec<u64> = q.iter().map(|e| e.seq).collect();
         assert_eq!(seqs, vec![2, 3, 4]);
+    }
+
+    /// 回归测试（2026-09-30）：粗粒度时间戳文件系统上，文件内容变化时
+    /// mtime 可能完全不变。`poll_once` 必须以内容哈希为真相来源，不能
+    /// 因 mtime 未变而静默跳过。
+    #[test]
+    fn poll_once_detects_change_when_mtime_unchanged() {
+        use nexus_discovery::PeerId;
+
+        let path = std::env::temp_dir().join(format!(
+            "nexus-watcher-mtime-test-{}.toml",
+            std::process::id()
+        ));
+        // 文件当前内容：strategy = "ecmp"
+        std::fs::write(
+            &path,
+            "[subnet]\ncidr = \"10.99.0.0/24\"\n[routing]\nstrategy = \"ecmp\"\n",
+        )
+        .unwrap();
+
+        // 模拟粗粒度时间戳：基线 mtime 取文件当前 mtime（与"变化后"相同），
+        // 但哈希/策略是旧的（shortest）。
+        let mtime = std::fs::metadata(&path).unwrap().modified().ok();
+        let mut baseline = Baseline {
+            mtime,
+            hash: fnv1a_64(b"stale"),
+            strategy: RoutingStrategy::Shortest,
+            healthy: true,
+        };
+
+        let id = PeerId("a".to_string());
+        let lsdb = Arc::new(RwLock::new(Lsdb::new(id.clone())));
+        let fib = SharedFibManager::new(id, RoutingStrategy::Shortest, &lsdb.read().unwrap());
+        let events = Arc::new(Mutex::new(VecDeque::new()));
+        let seq = Arc::new(AtomicU64::new(0));
+
+        poll_once(&path, 16, &mut baseline, &fib, &lsdb, &events, &seq);
+
+        let q = events.lock().unwrap();
+        assert!(
+            q.iter().any(|e| matches!(
+                &e.kind,
+                ReloadEventKind::Applied { strategy, .. } if strategy == "ecmp"
+            )),
+            "mtime 相同但内容变化时必须检测到并应用，否则静默丢更新"
+        );
+        std::fs::remove_file(&path).ok();
     }
 }
