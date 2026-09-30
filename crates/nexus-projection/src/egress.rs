@@ -11,6 +11,7 @@
 
 use nexus_domain::{RouteRequest, RouteTarget, RuleEngine};
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
@@ -552,19 +553,19 @@ impl RealUdpEgress {
             });
         }
         // Get-or-create the flow socket; retransmits reuse it (S18).
-        if !sockets.contains_key(&orig) {
-            match UdpSocket::bind("0.0.0.0:0") {
+        let sock = match sockets.entry(orig) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => match UdpSocket::bind("0.0.0.0:0") {
                 Ok(s) => {
                     let _ = s.set_nonblocking(true);
-                    sockets.insert(orig, s);
+                    e.insert(s)
                 }
                 Err(_) => {
                     lock(&self.stats).egress_send_failed += 1;
                     return false;
                 }
-            }
-        }
-        let sock = &sockets[&orig];
+            },
+        };
         let trans = match translated_key(sock, &orig) {
             Some(t) => t,
             None => {

@@ -95,13 +95,8 @@ fn run() -> Result<(String, bool), String> {
         .port();
     std::thread::spawn(move || {
         let mut buf = [0u8; 65535];
-        loop {
-            match echo_sock.recv_from(&mut buf) {
-                Ok((n, src)) => {
-                    let _ = echo_sock.send_to(&buf[..n], src);
-                }
-                Err(_) => break,
-            }
+        while let Ok((n, src)) = echo_sock.recv_from(&mut buf) {
+            let _ = echo_sock.send_to(&buf[..n], src);
         }
     });
 
