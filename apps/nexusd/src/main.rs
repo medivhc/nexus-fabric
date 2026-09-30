@@ -741,6 +741,8 @@ fn proxy_resource(args: &[String]) -> ExitCode {
     println!(
         "{{\"verdict\":\"READY\",\"daemon\":{{\"entry\":\"nexusd\",\"command\":\"proxy\",\"addr\":\"{addr}\"}}}}"
     );
+    // P4：进程启动时注册 builtin 混淆插件（plain/xor）。
+    nexus::init_obfs_plugins();
     // 服务循环：逐会话阻塞 accept；每会话独立闭环（结构化并发：会话内线程 join）。
     loop {
         match nexus::proxy_serve_once(&listener, &config_yaml) {

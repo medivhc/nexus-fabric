@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 nexus-connectivity = { path = "../nexus-connectivity" }
+nexus-plugin = { path = "../nexus-plugin" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = "0.13"
 sha2 = "0.10.9"

@@ -9,8 +9,13 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 
 pub mod builtin;
+pub mod dial;
 pub mod registry;
 
+pub use dial::{
+    DialFailReason, dial_err_count, dial_ok_count, dial_with_obfs, global_registry,
+    init_builtin_plugins, wrap_stream,
+};
 pub use registry::PluginRegistry;
 
 /// 混淆传输接口版本。`register()` 时硬校验（S2）。

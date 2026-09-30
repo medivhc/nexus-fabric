@@ -354,6 +354,10 @@ pub struct OutboundConfig {
     pub skip_cert_verify: Option<bool>,
     /// trojan 请求头格式（§11.9.2）："standard" | "singbox"，缺省 standard。
     pub header_format: Option<String>,
+    /// 混淆插件名（§7.3 二期；None = plain 直通；未知名 → dial 硬失败）。
+    pub obfs: Option<String>,
+    /// 混淆插件参数 key（如 xor 的 key 材料；None/空 → 需 key 的插件 wrap 失败）。
+    pub obfs_key: Option<String>,
 }
 
 /// DNS 多 server 路由配置（PRODUCT §11.5）。
@@ -715,6 +719,8 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
             let alpn = opt_str_seq(item, "alpn");
             let skip_cert_verify = opt_bool(item, "skip_cert_verify");
             let header_format = opt_str(item, "header_format");
+            let obfs = opt_str(item, "obfs");
+            let obfs_key = opt_str(item, "obfs_key");
             outbounds.push(OutboundConfig {
                 tag,
                 kind,
@@ -724,6 +730,8 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
                 alpn,
                 skip_cert_verify,
                 header_format,
+                obfs,
+                obfs_key,
             });
         }
     }
@@ -1240,6 +1248,8 @@ fn parse_node_line(line: &str) -> Result<OutboundConfig, (String, RejectedEntry)
                 alpn: None,
                 skip_cert_verify: None,
                 header_format: None,
+                obfs: None,
+                obfs_key: None,
             })
         }
         "vmess" => Ok(OutboundConfig {
@@ -1251,6 +1261,8 @@ fn parse_node_line(line: &str) -> Result<OutboundConfig, (String, RejectedEntry)
             alpn: None,
             skip_cert_verify: None,
             header_format: None,
+            obfs: None,
+            obfs_key: None,
         }),
         other => Err((
             line.to_string(),
@@ -1687,6 +1699,40 @@ outbounds:
     }
 
     #[test]
+    fn parses_obfs_plugin_config() {
+        // P2：obfs/obfs_key 从 YAML 解析；缺省为 None（plain 直通）。
+        let yaml = "\
+schema_version: 1
+rules:
+  - tag: m
+    kind: match
+    action:
+      - kind: select_outbound
+        tag: ss-a
+outbounds:
+  - tag: ss-a
+    kind: shadowsocks
+    locator: 127.0.0.1:8388
+    method: chacha20-ietf-poly1305
+password: <redacted>
+    obfs: xor
+    obfs_key: test-key-123
+  - tag: ss-b
+    kind: shadowsocks
+    locator: 127.0.0.1:8389
+    method: chacha20-ietf-poly1305
+password: <redacted>
+";
+        let cfg = parse(yaml).expect("ok");
+        assert_eq!(cfg.outbounds.len(), 2);
+        assert_eq!(cfg.outbounds[0].obfs.as_deref(), Some("xor"));
+        assert_eq!(cfg.outbounds[0].obfs_key.as_deref(), Some("test-key-123"));
+        // 未配置 → None = plain（P6）。
+        assert_eq!(cfg.outbounds[1].obfs, None);
+        assert_eq!(cfg.outbounds[1].obfs_key, None);
+    }
+
+    #[test]
     fn trojan_missing_password_is_config_invalid() {
         let yaml = "\
 schema_version: 1
@@ -1787,6 +1833,8 @@ mod subscription_online_tests {
             alpn: None,
             skip_cert_verify: None,
             header_format: None,
+            obfs: None,
+            obfs_key: None,
         }]
     }
 

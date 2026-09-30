@@ -4261,7 +4261,17 @@ fn split_host_port(dest: &str) -> Result<(String, u16), NexusError> {
     }
 }
 
+/// 初始化混淆插件（P4）：注册 builtin（plain/xor）到全局注册表。
+///
+/// 幂等；`nexusd proxy` 在服务循环前调用一次。`dial_with_obfs`/`wrap_stream`
+/// 内部也有懒初始化，此处显式调用是为了"进程启动时注册"的确定性语义。
+pub fn init_obfs_plugins() {
+    nexus_plugin::init_builtin_plugins();
+}
+
 /// 真实 SOCKS5 代理单会话闭环。
+///
+/// 调用方（`nexusd proxy`）应在服务循环前调一次 [`init_obfs_plugins`]（P4）。
 pub fn proxy_serve_once(
     listener: &std::net::TcpListener,
     config_yaml: &str,
@@ -4451,11 +4461,37 @@ pub fn proxy_serve_once(
                 }
             })?;
             let (nhost, nport) = split_host_port(&locator)?;
-            let mut node = std::net::TcpStream::connect((nhost.as_str(), nport)).map_err(|e| {
+            // §7.3 插件接线（P1）：先建 raw TCP，再按方向独立 wrap。
+            // 写方向的所有字节（请求头 + 中继数据）走同一个 wrapped handle，
+            // 保证插件变换位置连续（S7）；读方向走另一个 handle。
+            // obfs=None → plain 直通（P6 零回归）。
+            let raw = std::net::TcpStream::connect((nhost.as_str(), nport)).map_err(|e| {
                 NexusError::ConnectivityEstablishmentFailed {
                     provider: ProviderId(decision.selected_outbound_tag.clone()),
                     reason: format!("ss node connect {locator} failed: {e}"),
                 }
+            })?;
+            let raw_down = raw.try_clone().map_err(|_| NexusError::Internal {
+                message: "proxy clone failed".into(),
+            })?;
+            let obfs_params = nexus_plugin::ObfsParams {
+                key: selected.obfs_key.as_deref().unwrap_or("").as_bytes(),
+            };
+            let mut node_up =
+                nexus_plugin::wrap_stream(raw, selected.obfs.as_deref(), &obfs_params).map_err(
+                    |e| NexusError::ConnectivityEstablishmentFailed {
+                        provider: ProviderId(decision.selected_outbound_tag.clone()),
+                        reason: format!("ss obfs wrap failed: {e}"),
+                    },
+                )?;
+            let mut node_down = nexus_plugin::wrap_stream(
+                raw_down,
+                selected.obfs.as_deref(),
+                &obfs_params,
+            )
+            .map_err(|e| NexusError::ConnectivityEstablishmentFailed {
+                provider: ProviderId(decision.selected_outbound_tag.clone()),
+                reason: format!("ss obfs wrap failed: {e}"),
             })?;
             let method = SsMethod::parse(
                 selected
@@ -4494,7 +4530,8 @@ pub fn proxy_serve_once(
                     reason: format!("ss request header seal failed: {e:?}"),
                 }
             })?;
-            write_record(&mut node, &req_frame).map_err(|e| {
+            // 请求头走写方向的 wrapped handle（S7：写方向字节连续）。
+            write_record(&mut node_up, &req_frame).map_err(|e| {
                 NexusError::ConnectivityEstablishmentFailed {
                     provider: ProviderId(decision.selected_outbound_tag.clone()),
                     reason: format!("ss request header send failed: {e}"),
@@ -4505,15 +4542,10 @@ pub fn proxy_serve_once(
             let mut client_up = client.try_clone().map_err(|_| NexusError::Internal {
                 message: "proxy clone failed".into(),
             })?;
-            let mut node_up = node.try_clone().map_err(|_| NexusError::Internal {
-                message: "proxy clone failed".into(),
-            })?;
             let mut client_down = client.try_clone().map_err(|_| NexusError::Internal {
                 message: "proxy clone failed".into(),
             })?;
-            let mut node_down = node.try_clone().map_err(|_| NexusError::Internal {
-                message: "proxy clone failed".into(),
-            })?;
+            // node_up / node_down 已在上面按方向 wrap 好，直接 move 进线程。
             let to_upstream = std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 let mut total = 0usize;
@@ -4585,12 +4617,29 @@ pub fn proxy_serve_once(
                 }
             })?;
             let (nhost, nport) = split_host_port(&locator)?;
-            let mut node = std::net::TcpStream::connect((nhost.as_str(), nport)).map_err(|e| {
+            // §7.3 插件接线（P1）：obfs 包在 TLS 之下。先建 raw TCP 并设
+            // nonblocking（wrapped 流透传 WouldBlock），再 wrap；
+            // obfs=None → plain 直通（P6 零回归）。
+            let raw = std::net::TcpStream::connect((nhost.as_str(), nport)).map_err(|e| {
                 NexusError::ConnectivityEstablishmentFailed {
                     provider: ProviderId(decision.selected_outbound_tag.clone()),
                     reason: format!("trojan node connect {locator} failed: {e}"),
                 }
             })?;
+            raw.set_nonblocking(true)
+                .map_err(|e| NexusError::Internal {
+                    message: format!("trojan node nonblocking: {e}"),
+                })?;
+            let obfs_params = nexus_plugin::ObfsParams {
+                key: selected.obfs_key.as_deref().unwrap_or("").as_bytes(),
+            };
+            let mut node =
+                nexus_plugin::wrap_stream(raw, selected.obfs.as_deref(), &obfs_params).map_err(
+                    |e| NexusError::ConnectivityEstablishmentFailed {
+                        provider: ProviderId(decision.selected_outbound_tag.clone()),
+                        reason: format!("trojan obfs wrap failed: {e}"),
+                    },
+                )?;
             let password = selected.password.clone().ok_or_else(|| {
                 NexusError::ConnectivityEstablishmentFailed {
                     provider: ProviderId(decision.selected_outbound_tag.clone()),
@@ -4692,10 +4741,7 @@ pub fn proxy_serve_once(
             // 双向透明中继：rustls ClientConnection 不可跨线程分裂，用非阻塞单线程
             // poll 在 client 与 TLS 之间搬运字节（loopback E4 小流量足够；本函数单线程
             // 闭环承担结构化并发，无泄漏 JoinHandle）。
-            node.set_nonblocking(true)
-                .map_err(|e| NexusError::Internal {
-                    message: format!("trojan node nonblocking: {e}"),
-                })?;
+            // node 已在 wrap 前设为 nonblocking（见上）；wrapped 流透传 WouldBlock。
             client
                 .set_nonblocking(true)
                 .map_err(|e| NexusError::Internal {
@@ -4759,7 +4805,8 @@ pub fn proxy_serve_once(
             }
             // 尽力向节点发送 close_notify（不阻断结果）。
             conn.send_close_notify();
-            let _ = node.set_nonblocking(false);
+            // node 是 wrapped 流（Box<dyn ObfuscatedStream>），无法恢复 inner 的
+            // blocking 模式；arm 结束时流即 drop 关闭 fd，无需恢复。
 
             let hf_label = match header_format {
                 TrojanHeaderFormat::Standard => "standard",

@@ -34,6 +34,7 @@ nexus-dns = { path = "../../crates/nexus-dns" }
 nexus-outbound-shadowsocks = { path = "../../crates/nexus-outbound-shadowsocks" }
 nexus-outbound-vmess = { path = "../../crates/nexus-outbound-vmess" }
 nexus-outbound-trojan = { path = "../../crates/nexus-outbound-trojan" }
+nexus-plugin = { path = "../../crates/nexus-plugin" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-native-certs = { version = "0.8", default-features = false }
 nexus-storage = { path = "../../crates/nexus-storage" }

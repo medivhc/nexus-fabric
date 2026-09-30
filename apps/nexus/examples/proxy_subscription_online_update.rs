@@ -63,6 +63,8 @@ fn main() {
         alpn: None,
         skip_cert_verify: None,
         header_format: None,
+        obfs: None,
+        obfs_key: None,
     }];
 
     let source = SubscriptionSourceConfig::new(
