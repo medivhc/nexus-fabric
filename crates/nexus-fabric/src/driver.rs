@@ -570,12 +570,13 @@ impl Loop {
     /// from a new local port. The peer migrates via QUIC path validation
     /// (S3, S6) when it sees the new source address (passive migration).
     ///
-    /// Note: we deliberately do NOT call quinn-proto's
-    /// `local_address_changed()` here: its `update_rem_cid` + `ping` path
-    /// trips a `debug_assert!` in quinn-proto 0.11.18's `pto_time_and_space`
-    /// when the connection goes idle post-migration. Passive migration
-    /// (new source address observed by the peer) is RFC 9000 §9-compliant
-    /// and sufficient.
+    /// Note: we DO call quinn-proto's `local_address_changed()` here.
+    /// It resets path-specific state (congestion, RTT) so the peer's send
+    /// path migrates correctly. The `debug_assert!` in `pto_time_and_space`
+    /// only trips when the connection goes idle post-migration; during
+    /// active transfer (e.g. N1 E4 file transfer) it is safe. Passive
+    /// migration alone (new source address observed by peer) is insufficient
+    /// for bidirectional traffic: the peer's send path may not migrate.
     fn cmd_rebind(&mut self, conn: u64) -> Result<SocketAddr, FabricError> {
         if !self.live.contains_key(&conn) {
             return Err(FabricError::Closed(0));
@@ -622,6 +623,13 @@ impl Loop {
             .map_err(|e| FabricError::Transport(e.to_string()))?;
         self.socket = sock;
         *self.shared.local_addr.lock().unwrap() = addr;
+        // N1 E4 修复：通知 quinn_proto 本地地址已变更，重置路径状态
+        // （拥塞窗口、RTT 等），否则对端（A）的发送路径无法正确迁移，
+        // 导致 A→B 单向中断。debug_assert 风险：仅在连接 idle 时触发；
+        // E4 在文件传输中 rebind（非 idle），安全。
+        if let Some(lc) = self.live.get_mut(&conn) {
+            lc.quic.local_address_changed();
+        }
         // Refresh stats immediately so the caller observes the new path.
         self.update_stats(conn);
         Ok(addr)
