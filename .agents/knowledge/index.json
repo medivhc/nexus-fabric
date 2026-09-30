@@ -150,5 +150,13 @@
     "module": "nexus-path",
     "category": "implementation-pitfall",
     "summary": "Review 发现：enum 判别值 as usize 强转做数组索引是潜伏 panic（debug_assert 在 release 被编译掉）；改用 exhaustive match 让加 variant 变成编译错误"
+  },
+  {
+    "id": "coverage-run-flaky-timing-test",
+    "file": "entries/2026-09-30-coverage-run-flaky-timing-test.md",
+    "date": "2026-09-30",
+    "module": "nexus-projection",
+    "category": "environment-pitfall",
+    "summary": "llvm-cov 插桩运行放大时序敏感测试 flakiness：rebind_failure_keeps_connection 在 coverage 下挂、单独跑 3/3 过；coverage-summary UNKNOWN 不阻塞，整体 PASS"
   }
 ]
