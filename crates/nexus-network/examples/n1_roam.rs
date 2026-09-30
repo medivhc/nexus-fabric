@@ -593,6 +593,8 @@ fn child_b(
     std::io::stdout().flush().map_err(|e| e.to_string())?;
 
     // ROAM 指令与 TCP 接收并发：ROAM 来自 stdin，接收在独立线程。
+    // 接收到 FILE_SIZE 后即停，不等待 EOF（FIN 可能在 roam 后链路抖动中丢失；
+    // A 侧仍会 shutdown(Write) 发 FIN 作为优雅关闭）。
     let receiver = std::thread::spawn(move || -> Result<(u64, usize, u64), String> {
         let (mut stream, _) = listener.accept().map_err(|e| format!("tcp accept: {e}"))?;
         let mut hash = Fnv64::new();
@@ -600,7 +602,7 @@ fn child_b(
         let mut buf = [0u8; 65536];
         let mut last: Option<Instant> = None;
         let mut max_gap = Duration::ZERO;
-        loop {
+        while total < FILE_SIZE {
             let n = stream
                 .read(&mut buf)
                 .map_err(|e| format!("tcp read: {e}"))?;
