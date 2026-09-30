@@ -393,13 +393,16 @@ impl PathManager {
 
     /// Remove a candidate. If it was the active path, the best remaining one
     /// is selected immediately (failover semantics); with no alternative,
-    /// the active path becomes `None`. No event is emitted: the removed path
-    /// no longer exists to serve as the event's `from`.
+    /// the active path becomes `None`.
+    ///
+    /// S9: removing the active path with a backup available emits
+    /// `PathEvent::Switched` (S6's event form, reason `PathFailed`); with no
+    /// backup, no event is emitted (nothing to switch to).
     pub fn remove_candidate(&mut self, remote: &SocketAddr) {
         let now = Instant::now();
         let mut state = self.inner.state.lock().unwrap();
         let was_active = state.active == Some(*remote);
-        state.candidates.remove(remote);
+        let removed = state.candidates.remove(remote);
         if state
             .pending
             .as_ref()
@@ -408,9 +411,23 @@ impl PathManager {
             state.pending = None;
         }
         if was_active {
-            state.active = best_candidate(&state, None);
+            let new_active = best_candidate(&state, None);
+            state.active = new_active;
             state.active_selected_at = now;
             state.pending = None;
+            if let (Some(removed), Some(to_addr)) = (removed, new_active) {
+                let from = removed.path;
+                let to = state.candidates[&to_addr].path.clone();
+                self.inner
+                    .events
+                    .lock()
+                    .unwrap()
+                    .push_back(PathEvent::Switched {
+                        from,
+                        to,
+                        reason: SwitchReason::PathFailed,
+                    });
+            }
         }
     }
 
@@ -739,6 +756,41 @@ mod tests {
         assert_eq!(pm.current_path().unwrap().kind, PathKind::Turn);
         pm.remove_candidate(&addr(9002));
         assert!(pm.current_path().is_none());
+    }
+
+    #[test]
+    fn remove_active_emits_switched_event() {
+        // S9: removing the active path with a backup available must emit
+        // `PathEvent::Switched` (S6's event form).
+        let mut pm = PathManager::new(fast_config());
+        pm.add_candidate(candidate(PathKind::Direct, 9001, 0.0));
+        pm.add_candidate(candidate(PathKind::Turn, 9002, 5.0));
+        pm.on_stats(&addr(9001), stats(10, 0.0));
+        pm.on_stats(&addr(9002), stats(50, 0.0));
+        let active = pm.current_path().unwrap().remote_addr;
+        // Drain any events from setup so only remove_candidate's event remains.
+        while pm.poll_event().is_some() {}
+        pm.remove_candidate(&active);
+        match pm.poll_event() {
+            Some(PathEvent::Switched { from, to, reason }) => {
+                assert_eq!(from.remote_addr, active);
+                assert_ne!(to.remote_addr, active);
+                assert_eq!(reason, SwitchReason::PathFailed);
+            }
+            other => panic!("expected Switched after removing active path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remove_last_candidate_emits_no_event() {
+        // S9: no backup -> no Switched (nothing to switch to).
+        let mut pm = PathManager::new(fast_config());
+        pm.add_candidate(candidate(PathKind::Direct, 9001, 0.0));
+        pm.on_stats(&addr(9001), stats(10, 0.0));
+        while pm.poll_event().is_some() {}
+        pm.remove_candidate(&addr(9001));
+        assert!(pm.current_path().is_none());
+        assert!(pm.poll_event().is_none());
     }
 
     #[test]

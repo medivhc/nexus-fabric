@@ -14,6 +14,7 @@
 
 pub mod dns;
 pub mod egress;
+pub mod path_link;
 pub mod process;
 pub mod routing;
 pub mod semantic;
@@ -32,6 +33,7 @@ pub use egress::{
 /// Re-exported domain types for unified routing (defined in `nexus-domain`,
 /// used — not modified — here).
 pub use nexus_domain::{RouteRequest, RouteTarget, RuleEngine};
+pub use path_link::{PathLink, PathLinkStats};
 pub use process::{
     Attribution, FlowLabels, PlatformAttributor, ProcessAttributor, Proto, QosClass, QosConfig,
 };
