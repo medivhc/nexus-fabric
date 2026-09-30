@@ -33,11 +33,19 @@ const PROXY_COST: f64 = 8.0;
 /// Number of [`PathKind`] variants; sizes the per-kind counter arrays.
 const KIND_COUNT: usize = 4;
 
-/// Index into per-kind counter arrays. Relies on `PathKind`'s declaration
-/// order (Direct, Mesh, Turn, Proxy); guarded by `kind_discriminants_stable`.
+/// Index into per-kind counter arrays.
+///
+/// Exhaustive match (not `kind as usize`): adding a `PathKind` variant in
+/// the future is a compile error here, forcing `KIND_COUNT` and the counter
+/// arrays to be updated together. The `as usize` cast would have compiled
+/// fine and panicked at runtime instead (review WARN #1).
 fn kind_idx(kind: PathKind) -> usize {
-    debug_assert!((kind as usize) < KIND_COUNT);
-    kind as usize
+    match kind {
+        PathKind::Direct => 0,
+        PathKind::Mesh => 1,
+        PathKind::Turn => 2,
+        PathKind::Proxy => 3,
+    }
 }
 
 /// Minimal proxy endpoint (F1). Authentication and other proxy options stay in
@@ -169,11 +177,13 @@ impl FallbackChain {
 
 /// Staggered connect over the fallback chain (F2).
 ///
-/// Delegates to [`race_connect`] so stagger order, budget enforcement and
-/// cooperative cancellation (R1/R5) apply unchanged; the attempt order is the
-/// chain order (R1 requirement-change: caller order is respected). The
-/// winning tier is `outcome.winner.kind`. F5 counters are updated on success;
-/// a failed race still counts as an attempt but changes no win counters.
+/// Takes an already-expanded [`FallbackChain`] (expansion happens in
+/// [`FallbackChain::expand`]) and delegates to [`race_connect`] so stagger
+/// order, budget enforcement and cooperative cancellation (R1/R5) apply
+/// unchanged; the attempt order is the chain order (R1 requirement-change:
+/// caller order is respected). The winning tier is `outcome.winner.kind`.
+/// F5 counters are updated on success; a failed race still counts as an
+/// attempt but changes no win counters.
 ///
 /// The actual dialing (direct socket / SOCKS5 handshake / TURN allocate) is
 /// performed by `connector`, provided by the composition root; this function
@@ -394,6 +404,11 @@ mod tests {
         match pm.poll_event() {
             Some(PathEvent::Switched { to, reason, .. }) => {
                 assert_eq!(to.kind, PathKind::Proxy);
+                // Both reasons are legitimate here (review #4): BetterScore is
+                // the expected degrade-driven switch; PathAdded is accepted
+                // because the initial active-path selection among freshly
+                // added candidates also emits Switched, and the test must not
+                // be brittle about which one the manager picked first.
                 assert!(
                     reason == SwitchReason::BetterScore || reason == SwitchReason::PathAdded,
                     "unexpected reason {reason:?}"

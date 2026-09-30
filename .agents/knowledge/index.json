@@ -134,5 +134,21 @@
     "module": "nexus-platform-linux",
     "category": "implementation-pitfall",
     "summary": "unshare(CLONE_NEWNET) 后必须拉起 lo，否则 TUN 自身地址的 UDP 本地交付超时（send 成功 recv 超时）"
+  },
+  {
+    "id": "shared-target-dir-stale-rmeta",
+    "file": "entries/2026-09-30-shared-target-dir-stale-rmeta.md",
+    "date": "2026-09-30",
+    "module": "engineering",
+    "category": "implementation-pitfall",
+    "summary": "多 worktree 共享 CARGO_TARGET_DIR 导致陈旧 rmeta 幻影编译错误（看到别的 worktree 的类型定义）；每 worktree 配独立 target dir，怀疑时 touch 相关 lib.rs 强制重建验证"
+  },
+  {
+    "id": "enum-discriminant-index",
+    "file": "entries/2026-09-30-enum-discriminant-index.md",
+    "date": "2026-09-30",
+    "module": "nexus-path",
+    "category": "implementation-pitfall",
+    "summary": "Review 发现：enum 判别值 as usize 强转做数组索引是潜伏 panic（debug_assert 在 release 被编译掉）；改用 exhaustive match 让加 variant 变成编译错误"
   }
 ]
