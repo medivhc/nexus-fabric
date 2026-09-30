@@ -22,8 +22,8 @@ pub use dns::{
     parse_dns_query, parse_dns_response,
 };
 pub use egress::{
-    DEFAULT_MAX_NAT_ENTRIES, DomainMatch, DomainRule, EgressNat, FlowKey, NatStats, RealEgressStats,
-    RealUdpEgress, Rule, SimpleRuleEngine,
+    DEFAULT_MAX_NAT_ENTRIES, DomainMatch, DomainRule, EgressNat, FlowKey, NatStats,
+    RealEgressStats, RealUdpEgress, Rule, SimpleRuleEngine,
 };
 /// Re-exported domain types for unified routing (defined in `nexus-domain`,
 /// used — not modified — here).
@@ -329,8 +329,7 @@ impl Projection {
         // Real-egress slot: `with_real_egress` (builder, runs after `new`)
         // installs the instance; the downlink and egress-recv threads read
         // it through this shared slot.
-        let real_egress_slot: Arc<Mutex<Option<Arc<RealUdpEgress>>>> =
-            Arc::new(Mutex::new(None));
+        let real_egress_slot: Arc<Mutex<Option<Arc<RealUdpEgress>>>> = Arc::new(Mutex::new(None));
 
         let (uplink, downlink, egress_recv) = if spawn_threads {
             // Uplink: TUN -> route -> transport / local NAT / drop.
@@ -385,8 +384,7 @@ impl Projection {
                                                 re.send(pkt, "self");
                                             }
                                             None => {
-                                                lock(&egress_nat)
-                                                    .translate_outbound(pkt, peer);
+                                                lock(&egress_nat).translate_outbound(pkt, peer);
                                             }
                                         }
                                         let mut s = lock(&stats);
@@ -557,8 +555,7 @@ impl Projection {
                                             // S19: mesh intent back to the
                                             // originator; its downlink
                                             // NAT-validates it (S11).
-                                            let transport =
-                                                lock(&transport_slot).clone();
+                                            let transport = lock(&transport_slot).clone();
                                             send_with_intent(
                                                 &transport,
                                                 &stats,

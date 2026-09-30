@@ -21,8 +21,8 @@
 //! Usage: cargo run -p nexus-projection --example egress_real_udp -- --json
 
 use nexus_projection::{
-    FlowKey, MockTun, Projection, ProjectionConfig, RouteTarget, Rule, SimpleRuleEngine,
-    TunDevice, UnifiedRouter,
+    FlowKey, MockTun, Projection, ProjectionConfig, RouteTarget, Rule, SimpleRuleEngine, TunDevice,
+    UnifiedRouter,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
@@ -72,7 +72,10 @@ fn skip(reason: &str) -> (String, bool) {
 fn main() {
     let (report, pass) = match run() {
         Ok(r) => r,
-        Err(e) => (format!("{{\"verdict\":\"FAIL\",\"detail\":\"{e}\"}}"), false),
+        Err(e) => (
+            format!("{{\"verdict\":\"FAIL\",\"detail\":\"{e}\"}}"),
+            false,
+        ),
     };
     println!("{report}");
     if !pass {

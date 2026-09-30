@@ -1014,10 +1014,7 @@ mod tests {
     /// as a probe destination.
     fn concrete_addr(a: TestSocketAddr) -> TestSocketAddr {
         if a.ip().is_unspecified() {
-            TestSocketAddr::new(
-                TestIpAddr::V4(TestIpv4Addr::new(127, 0, 0, 1)),
-                a.port(),
-            )
+            TestSocketAddr::new(TestIpAddr::V4(TestIpv4Addr::new(127, 0, 0, 1)), a.port())
         } else {
             a
         }
