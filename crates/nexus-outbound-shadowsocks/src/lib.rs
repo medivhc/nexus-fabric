@@ -180,7 +180,6 @@ impl OutboundAdapter for ShadowsocksAdapter {
 // ---------- 真实 TCP 会话层（§11.6.1） ----------
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
 
 /// 会话方向角色：决定 c2s / s2c 哪把 key 用于发送。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
