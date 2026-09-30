@@ -60,6 +60,12 @@ impl ProxyTransport {
     }
 
     /// X6: `(handshake_ok, handshake_err, framed_bytes)`.
+    ///
+    /// - `handshake_ok` is 1 if the SOCKS5 handshake succeeded (object exists).
+    /// - `handshake_err` counts post-handshake protocol/framing errors
+    ///   (e.g. oversize frame, buffer overflow). A failed SOCKS5 handshake
+    ///   prevents object creation, so it is reported via `Err`, not here.
+    /// - `framed_bytes` counts payload bytes sent/recv'd (excludes headers).
     pub fn counters(&self) -> (u64, u64, u64) {
         (
             self.handshake_ok.load(Ordering::Relaxed),
@@ -85,7 +91,7 @@ impl UdpTransport for ProxyTransport {
                 let len = u16::from_be_bytes([self.read_buf[0], self.read_buf[1]]) as usize;
                 if len > MAX_DATAGRAM {
                     self.record_err();
-                    return Err(ProxyError::FrameTooLarge(len as u16).into());
+                    return Err(ProxyError::FrameTooLarge(len).into());
                 }
                 if self.read_buf.len() >= FRAME_HEADER_LEN + len {
                     if len > buf.len() {
@@ -134,7 +140,7 @@ impl UdpTransport for ProxyTransport {
 
     fn send_to(&self, buf: &[u8], _target: SocketAddr) -> std::io::Result<usize> {
         if buf.len() > MAX_DATAGRAM {
-            return Err(ProxyError::FrameTooLarge(buf.len() as u16).into());
+            return Err(ProxyError::FrameTooLarge(buf.len()).into());
         }
         let mut stream = self
             .stream
@@ -224,7 +230,8 @@ mod tests {
         let tx = ProxyTransport::new(client, target());
         let big = vec![0u8; MAX_DATAGRAM + 1];
         let err = tx.send_to(&big, target()).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        // X1: oversize send_to must be InvalidInput, never silently truncated.
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("too large"));
     }
 

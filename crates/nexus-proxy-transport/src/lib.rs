@@ -75,7 +75,7 @@ pub enum ProxyError {
     /// Malformed server reply (bad version, truncated, unknown ATYP…).
     BadReply(&'static str),
     /// Frame length prefix exceeds [`MAX_DATAGRAM`] (X1).
-    FrameTooLarge(u16),
+    FrameTooLarge(usize),
     /// Received frame does not fit the caller's buffer.
     FrameOverflow { frame: usize, buf: usize },
 }
@@ -115,6 +115,16 @@ impl From<ProxyError> for io::Error {
     fn from(e: ProxyError) -> Self {
         match e {
             ProxyError::Io(inner) => inner,
+            // X1: oversize send_to must be InvalidInput, not generic Other.
+            ProxyError::FrameTooLarge(n) => io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("proxy: frame too large ({n} > {MAX_DATAGRAM})"),
+            ),
+            // Inbound protocol violation: peer sent a frame we cannot honor.
+            ProxyError::FrameOverflow { frame, buf } => io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("proxy: frame ({frame}B) exceeds buffer ({buf}B)"),
+            ),
             other => io::Error::other(other.to_string()),
         }
     }
