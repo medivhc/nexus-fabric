@@ -97,10 +97,11 @@ socket，`nexus-fabric` 的被动迁移保证流不中断。
 `≤ max_parallel`）与 `wasted_bytes: u64`（非获胜路径上已完成尝试所消耗的
 字节数；胜出时刻仍在进行的尝试不计入——无法观测其最终字节数，诚实省略）。
 
-**R5（sync 竞速）**：竞速使用 std 线程（`thread::spawn` + `mpsc`），零 tokio、
-零 async runtime。`race_connect` 是阻塞调用。`PathConnector::connect` 必须
-协作响应 `cancel: &AtomicBool`（定期检查、及时返回）；胜出/超时后 racer
-置位 `cancel` 并 `join` 所有尝试线程。不遵守 cancel 约定的 connector
+**R5（sync 竞速）**：竞速使用 std 线程（`thread::scope` + `mpsc`，scoped threads
+允许借用 connector，无需 `'static`），零 tokio、零 async runtime。
+`race_connect` 是阻塞调用。`PathConnector::connect` 必须协作响应
+`cancel: &AtomicBool`（定期检查、及时返回）；胜出/超时后 racer 置位
+`cancel`，scope 保证 join 所有尝试线程。不遵守 cancel 约定的 connector
 可能导致 `join` 阻塞——这是 connector 的 bug，不是 racer 的。
 
 **R6（语义守恒）**：S1–S9 不变；`score()` 无样本时返回 `None`（S7）；

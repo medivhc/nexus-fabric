@@ -83,6 +83,8 @@ pub struct PathStats {
 pub struct PathConfig {
     /// Challenger must beat the active path by this relative margin
     /// (e.g. 0.20 = 20% better) to switch (S4, R3).
+    /// Valid range: [0, 1]. Negative values are clamped to 0 (any improvement
+    /// triggers); values > 1 are allowed but mean "never switch on score".
     pub hysteresis_pct: f64,
     /// New path must hold the lead for this long before switching.
     pub switch_hold_ms: u64,
@@ -285,8 +287,10 @@ impl Inner {
         // by `hysteresis_pct` (e.g. 20%). If the active score is not positive,
         // the relative margin is undefined; any strictly better challenger
         // qualifies (the active path is effectively unusable).
+        // Clamp negative hysteresis_pct to 0 (defensive; negative would invert).
+        let pct = state.config.hysteresis_pct.max(0.0);
         let beats_hysteresis = if active_score > 0.0 {
-            (chall_score - active_score) / active_score >= state.config.hysteresis_pct
+            (chall_score - active_score) / active_score >= pct
         } else {
             chall_score > active_score
         };
@@ -650,7 +654,7 @@ mod tests {
 
     #[test]
     fn hysteresis_blocks_small_margin() {
-        // S4/S5: challenger beating active by less than hysteresis_db -> no switch.
+        // S4/S5: challenger beating active by less than hysteresis_pct -> no switch.
         let mut pm = PathManager::new(fast_config());
         pm.add_candidate(candidate(PathKind::Direct, 9001, 0.0));
         pm.add_candidate(candidate(PathKind::Mesh, 9003, 0.05)); // -0.1 pts vs direct
@@ -672,7 +676,7 @@ mod tests {
 
     #[test]
     fn hysteresis_hold_then_switch() {
-        // S4: margin >= hysteresis_db held for switch_hold_ms -> switch.
+        // S4: margin >= hysteresis_pct held for switch_hold_ms -> switch.
         let mut pm = PathManager::new(fast_config()); // hold 50ms, alpha 1.0
         pm.add_candidate(candidate(PathKind::Direct, 9001, 0.0));
         pm.add_candidate(candidate(PathKind::Turn, 9002, 5.0));
