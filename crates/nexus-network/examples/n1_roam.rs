@@ -657,7 +657,7 @@ fn child_b(
                     &cfg.veth,
                 ])?;
                 // 主动 rebind（模拟 OS 网络变更通知）：不等 3s 心跳超时，
-                // 避免 QUIC 在长死链路后难以恢复。watcher 仍作为后备。
+                // 避免 QUIC 在长死链路后难以恢复。
                 if let Some(conn) = mgr.connection_for(&peer) {
                     match conn.rebind() {
                         Ok(()) => {
@@ -669,6 +669,14 @@ fn child_b(
                                 kind: nexus_network::n1::N1EventKind::RebindSucceeded,
                                 disposition: nexus_network::n1::N1Disposition::Retry,
                             });
+                            // 迁移触发：rebind 后立即从新地址发包，让 A 的 QUIC
+                            // 被动迁移到新路径。否则 A 持续向旧地址发包，传输卡死。
+                            // B 的 watcher 已禁用（enable_watcher=false），故此处手动触发。
+                            for _ in 0..3 {
+                                let _ = conn.send_datagram(b"n1-migrate");
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                            }
+                            eprintln!("[child b] migration trigger sent");
                         }
                         Err(e) => eprintln!("[child b] proactive rebind failed: {e:?}"),
                     }
