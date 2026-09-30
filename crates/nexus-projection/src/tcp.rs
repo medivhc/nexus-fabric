@@ -11,7 +11,7 @@ use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, SocketAddrV4, TcpStream};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -44,6 +44,47 @@ pub const RELAY_WRITE_PENDING_CAP: usize = 256 * 1024;
 pub const STREAM_SYN: u8 = 0x01;
 pub const STREAM_FIN: u8 = 0x02;
 pub const STREAM_RST: u8 = 0x04;
+
+/// TTL for cancelled-connect keys (N-new-1): pruned in `drain_connects` so
+/// a worker thread that never reports back cannot grow the set without bound.
+const CANCELLED_TTL: Duration = Duration::from_secs(60);
+
+/// F1-residual: seed `next_id` per instance so two nodes that start
+/// initiating TCP at the same time almost surely allocate different
+/// stream ids (collision ~2^-32). Combined with the (peer, stream_id)
+/// dispatch guard, same-peer cross connections can no longer deterministically
+/// collide. std-only entropy, no new dependencies.
+fn random_stream_id_seed() -> u32 {
+    #[cfg(unix)]
+    {
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            let mut buf = [0u8; 4];
+            if f.read_exact(&mut buf).is_ok() {
+                let seed = u32::from_ne_bytes(buf);
+                if seed != 0 {
+                    return seed;
+                }
+            }
+        }
+    }
+    // Fallback: fnv-1a over (time, pid, stack address).
+    let probe = 0u64;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |x: u64| {
+        for b in x.to_ne_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    mix(SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() ^ ((d.subsec_nanos() as u64) << 32))
+        .unwrap_or(0x9e37_79b9));
+    mix(std::process::id() as u64);
+    mix(&probe as *const u64 as usize as u64);
+    let seed = (h >> 32) as u32 ^ h as u32;
+    if seed == 0 { 0x9e37_79b9 } else { seed }
+}
 
 /// Encode a STREAM frame body (without the intent byte).
 pub fn encode_stream_frame(stream_id: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
@@ -294,6 +335,10 @@ pub struct TcpTermStats {
     /// W1: fabric bytes retained (not dropped) because the smoltcp send
     /// buffer was full.
     pub send_buffer_full: u64,
+    /// W-new (F1-residual defense in depth): a STREAM SYN frame that
+    /// resolved to our own terminator entry was dropped instead of being
+    /// injected as application data.
+    pub stream_syn_to_originator_dropped: u64,
 }
 
 pub struct TcpTerminator {
@@ -322,7 +367,8 @@ impl TcpTerminator {
             sockets: SocketSet::new(vec![]),
             conns: HashMap::new(),
             by_id: HashMap::new(),
-            next_id: AtomicU32::new(1),
+            // F1-residual: per-instance random seed, not a fixed 1.
+            next_id: AtomicU32::new(random_stream_id_seed()),
             max_conns: MAX_TCP_CONNS,
             stats: TcpTermStats::default(),
         }
@@ -341,6 +387,13 @@ impl TcpTerminator {
         self.conns.len()
     }
 
+    /// Test-only: allocated stream ids (ids are random-seeded since
+    /// F1-residual, so tests must never assume id 1).
+    #[cfg(test)]
+    pub fn stream_ids(&self) -> Vec<u32> {
+        self.by_id.keys().copied().collect()
+    }
+
     pub fn lookup_id(&self, stream_id: u32) -> Option<FourTuple> {
         self.by_id.get(&stream_id).copied()
     }
@@ -348,7 +401,8 @@ impl TcpTerminator {
     /// F1: the peer this stream_id was originated for, if we are the
     /// originator. Dispatch must compare this against the frame's
     /// `from_peer` — a bare `lookup_id` is_some() check misroutes when
-    /// this node is both originator and egress (both counters start at 1).
+    /// this node is both originator and egress for the same peer (ids are
+    /// allocated per originator, random-seeded since F1-residual).
     pub fn peer_for(&self, stream_id: u32) -> Option<String> {
         let key = self.by_id.get(&stream_id)?;
         self.conns.get(key).map(|c| c.peer.clone())
@@ -449,6 +503,31 @@ impl TcpTerminator {
         self.flush_pending(key);
         self.poll_iface();
         self.drain_tx()
+    }
+
+    /// Dispatch an inbound STREAM frame for a connection we originated
+    /// (S22). A SYN flag here means misrouting — an originator never
+    /// receives SYN — so drop and count instead of injecting the 6-byte
+    /// address payload as application data (F1-residual defense in depth,
+    /// W-new). Consolidates the RST/FIN/DATA dispatch used by both the
+    /// downlink path and the self-loopback path.
+    pub fn handle_originator_frame(
+        &mut self,
+        stream_id: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<Vec<u8>> {
+        if flags & STREAM_SYN != 0 {
+            self.stats.stream_syn_to_originator_dropped += 1;
+            return vec![];
+        }
+        if flags & STREAM_RST != 0 {
+            self.handle_fabric_rst(stream_id)
+        } else if flags & STREAM_FIN != 0 {
+            self.handle_fabric_fin(stream_id)
+        } else {
+            self.handle_fabric_data(stream_id, payload)
+        }
     }
 
     /// Try to push retained bytes into the smoltcp send buffer.
@@ -655,8 +734,8 @@ impl TcpTerminator {
 // TcpRelay: egress side (S22/S23).
 // ---------------------------------------------------------------------------
 
-/// Relay table key: stream_ids are allocated per originator (both sides
-/// start at 1), so the table must be keyed by (peer, stream_id) — F1.
+/// Relay table key: stream_ids are allocated per originator (random-seeded
+/// since F1-residual), so the table is keyed by (peer, stream_id) — F1.
 type RelayKey = (String, u32);
 
 struct RelayConn {
@@ -711,8 +790,9 @@ pub struct TcpRelay {
     /// SYNs with a connect in flight (W2).
     pending: HashMap<RelayKey, PendingSyn>,
     /// Keys whose in-flight connect was cancelled (RST arrived first);
-    /// late worker results for these are dropped.
-    cancelled: HashSet<RelayKey>,
+    /// late worker results for these are dropped. Pruned by age in
+    /// `drain_connects` (N-new-1).
+    cancelled: HashMap<RelayKey, std::time::Instant>,
     connect_tx: mpsc::Sender<ConnectResult>,
     connect_rx: mpsc::Receiver<ConnectResult>,
     max_conns: usize,
@@ -731,7 +811,7 @@ impl TcpRelay {
         Self {
             conns: HashMap::new(),
             pending: HashMap::new(),
-            cancelled: HashSet::new(),
+            cancelled: HashMap::new(),
             connect_tx,
             connect_rx,
             max_conns: MAX_TCP_CONNS,
@@ -840,14 +920,14 @@ impl TcpRelay {
             });
             return out;
         }
-        if self.cancelled.contains(&key) {
+        if self.cancelled.contains_key(&key) {
             return out; // RST'd while connecting: drop late frames.
         }
         // DATA/FIN for a connect still in flight: buffer / record.
         if let Some(p) = self.pending.get_mut(&key) {
             if flags & STREAM_RST != 0 {
                 self.pending.remove(&key);
-                self.cancelled.insert(key);
+                self.cancelled.insert(key, std::time::Instant::now());
                 return out;
             }
             if flags & STREAM_FIN != 0 {
@@ -857,7 +937,8 @@ impl TcpRelay {
             if !payload.is_empty() {
                 if p.first_data.len() + payload.len() > RELAY_PENDING_DATA_CAP {
                     self.pending.remove(&key);
-                    self.cancelled.insert(key.clone());
+                    self.cancelled
+                        .insert(key.clone(), std::time::Instant::now());
                     out.push(RelayEvent::Closed {
                         stream_id,
                         peer: from_peer.to_string(),
@@ -900,7 +981,7 @@ impl TcpRelay {
     /// Drain finished worker connects into the table.
     fn drain_connects(&mut self, out: &mut Vec<RelayEvent>) {
         while let Ok(res) = self.connect_rx.try_recv() {
-            if self.cancelled.remove(&res.key) {
+            if self.cancelled.remove(&res.key).is_some() {
                 continue; // RST arrived while connecting: drop the stream.
             }
             let mut p = match self.pending.remove(&res.key) {
@@ -946,6 +1027,14 @@ impl TcpRelay {
                 },
             );
         }
+        // N-new-1: bound the cancelled set; a worker that panics (or whose
+        // result arrives after the 60s TTL) must not grow it without bound.
+        // Pruning is safe: `pending` was already removed when the key was
+        // cancelled, so a late ConnectResult hits the pending-miss path and
+        // is dropped regardless of whether the key is still cancelled.
+        let now = std::time::Instant::now();
+        self.cancelled
+            .retain(|_, t| now.duration_since(*t) < CANCELLED_TTL);
     }
 
     /// Poll internet-side sockets; harvest bytes / EOF / errors.
@@ -1042,8 +1131,9 @@ impl TcpEgress {
 
     /// F1: true iff `stream_id` is a connection we originated *for*
     /// `from_peer`. A bare "id known to terminator" check misroutes when
-    /// this node is both originator and egress, because both stream_id
-    /// counters start at 1.
+    /// this node is both originator and egress, because ids are allocated
+    /// per originator (random-seeded since F1-residual; the peer comparison
+    /// is the deterministic guard).
     pub fn is_originator_frame(&self, stream_id: u32, from_peer: &str) -> bool {
         self.terminator.peer_for(stream_id).as_deref() == Some(from_peer)
     }
@@ -1402,17 +1492,21 @@ mod tests {
 
     #[test]
     fn dual_role_dispatches_by_peer() {
-        // F1: one TcpEgress is originator for peer-C (stream 1) while a
-        // different node (peer-A) may use stream 1 against us as egress.
-        // Dispatch must compare from_peer, not just id presence.
+        // F1: one TcpEgress is originator for peer-C while a different
+        // node (peer-A) may use the same stream_id against us as egress.
+        // Dispatch must compare from_peer, not just id presence. The
+        // allocated id is captured (never assumed: ids are random-seeded).
         let mut e = TcpEgress::new();
         let syn = craft_tcp([10, 0, 0, 2], [9, 9, 9, 9], 40010, 443, 5000, 0, 0x02, &[]);
         let _ = e.terminator.handle_uplink(&syn, "peer-C");
-        assert_eq!(e.terminator.peer_for(1).as_deref(), Some("peer-C"));
-        assert!(e.is_originator_frame(1, "peer-C"));
-        assert!(!e.is_originator_frame(1, "peer-A")); // A's stream 1 → egress
-        assert!(!e.is_originator_frame(1, "self"));
-        assert!(!e.is_originator_frame(4242, "peer-C")); // unknown id → egress
+        let ids = e.terminator.stream_ids();
+        assert_eq!(ids.len(), 1);
+        let sid = ids[0];
+        assert_eq!(e.terminator.peer_for(sid).as_deref(), Some("peer-C"));
+        assert!(e.is_originator_frame(sid, "peer-C"));
+        assert!(!e.is_originator_frame(sid, "peer-A")); // A's stream → egress
+        assert!(!e.is_originator_frame(sid, "self"));
+        assert!(!e.is_originator_frame(sid.wrapping_add(4242), "peer-C")); // unknown id → egress
     }
 
     /// Spawn a one-connection echo server; returns its address.
@@ -1494,6 +1588,81 @@ mod tests {
         assert_eq!(got_c, b"pingC", "peer-C's bytes misrouted");
     }
 
+    #[test]
+    fn stream_id_seeds_differ() {
+        // F1-residual: two terminators must not start their id counters at
+        // the same value. Per-instance random seeding makes a collision
+        // ~2^-32 (the deterministic guard is the (peer, id) dispatch).
+        let mut a = TcpTerminator::new();
+        let mut b = TcpTerminator::new();
+        let syn_a = craft_tcp([10, 0, 0, 2], [1, 2, 3, 4], 40020, 8080, 7000, 0, 0x02, &[]);
+        let syn_b = craft_tcp([10, 0, 0, 2], [1, 2, 3, 4], 40021, 8080, 7000, 0, 0x02, &[]);
+        let _ = a.handle_uplink(&syn_a, "peer-B");
+        let _ = b.handle_uplink(&syn_b, "peer-B");
+        let id_a = a.stream_ids()[0];
+        let id_b = b.stream_ids()[0];
+        assert_ne!(
+            id_a, id_b,
+            "per-instance stream_id seeds must differ (2^-32 collision)"
+        );
+    }
+
+    #[test]
+    fn cross_peer_same_id_dispatch() {
+        // F1-residual (deterministic): the same stream_id is used in both
+        // directions against this node — we originated `sid` for peer-B,
+        // and peer-C sends us a SYN frame with the same id. Dispatch must
+        // be by (peer, stream_id): the colliding SYN opens a relay entry
+        // keyed (peer-C, sid) and never touches our terminator connection.
+        let mut e = TcpEgress::new();
+        let syn = craft_tcp([10, 0, 0, 2], [1, 2, 3, 4], 40030, 8080, 8000, 0, 0x02, &[]);
+        let _ = e.terminator.handle_uplink(&syn, "peer-B");
+        let ids = e.terminator.stream_ids();
+        assert_eq!(ids.len(), 1);
+        let sid = ids[0];
+
+        // Direction guard: our id for peer-B...
+        assert!(e.is_originator_frame(sid, "peer-B"));
+        // ...is NOT ours when it arrives from peer-C.
+        assert!(!e.is_originator_frame(sid, "peer-C"));
+
+        // Colliding SYN from peer-C opens a peer-namespaced relay entry.
+        let addr = echo_server();
+        e.relay
+            .handle_frame(sid, STREAM_SYN, &syn_payload_for(addr), "peer-C");
+        wait_relay_has(&mut e.relay, "peer-C", sid);
+        assert!(e.relay.has("peer-C", sid));
+        assert!(
+            !e.relay.has("peer-B", sid),
+            "relay must not shadow our own terminator id"
+        );
+        // Terminator's own connection is untouched.
+        assert_eq!(e.terminator.peer_for(sid).as_deref(), Some("peer-B"));
+        assert_eq!(e.terminator.conn_count(), 1);
+    }
+
+    #[test]
+    fn originator_syn_frame_dropped_not_injected() {
+        // W-new: a SYN frame that resolves to our own terminator entry must
+        // be dropped and counted — the 6-byte address payload must never be
+        // injected into the smoltcp socket as application data.
+        let mut term = TcpTerminator::new();
+        let syn = craft_tcp([10, 0, 0, 2], [1, 2, 3, 4], 40031, 8080, 9000, 0, 0x02, &[]);
+        let _ = term.handle_uplink(&syn, "peer-B");
+        let ids = term.stream_ids();
+        assert_eq!(ids.len(), 1);
+        let sid = ids[0];
+        let payload = syn_payload_for("127.0.0.1:1".parse::<SocketAddr>().unwrap());
+        let pkts = term.handle_originator_frame(sid, STREAM_SYN, &payload);
+        assert!(pkts.is_empty(), "misrouted SYN must produce no TUN packets");
+        assert_eq!(term.stats().stream_syn_to_originator_dropped, 1);
+        // Connection state untouched: still one conn, no corruption.
+        assert_eq!(term.conn_count(), 1);
+        // DATA path still works afterwards.
+        let _ = term.handle_originator_frame(sid, 0, b"");
+        assert_eq!(term.stats().stream_syn_to_originator_dropped, 1);
+    }
+
     /// Payload length of a TUN-bound IPv4/TCP packet.
     fn tun_payload_len(p: &[u8]) -> u64 {
         let tot = u16::from_be_bytes([p[2], p[3]]) as usize;
@@ -1503,6 +1672,8 @@ mod tests {
 
     fn establish(term: &mut TcpTerminator) -> (u32, u32) {
         // SYN -> SYN-ACK, ACK -> Established. Returns (stream_id, srv_seq).
+        // The stream_id is captured from the Syn event (ids are
+        // random-seeded since F1-residual, never assume 1).
         let syn = craft_tcp([10, 0, 0, 2], [1, 2, 3, 4], 40002, 8082, 3000, 0, 0x02, &[]);
         let tun_pkts = term.handle_uplink(&syn, "peer-B");
         assert_eq!(tun_pkts.len(), 1);
@@ -1523,8 +1694,14 @@ mod tests {
             &[],
         );
         term.handle_uplink(&ack, "peer-B");
-        let _ = term.poll();
-        (1, srv_seq)
+        let mut sid = 0;
+        for e in term.poll() {
+            if let TcpEvent::Syn { stream_id, .. } = e {
+                sid = stream_id;
+            }
+        }
+        assert_ne!(sid, 0, "expected Syn event after handshake");
+        (sid, srv_seq)
     }
 
     #[test]

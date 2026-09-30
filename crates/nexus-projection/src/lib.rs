@@ -290,14 +290,10 @@ fn tcp_poll_once(
             let mut t = lock(tcp);
             // F1: dispatch by (stream_id, from_peer), not by id alone.
             if t.is_originator_frame(sid, "self") {
-                // Originator side (frame came from our own relay).
-                let pkts = if fl & STREAM_RST != 0 {
-                    t.terminator.handle_fabric_rst(sid)
-                } else if fl & STREAM_FIN != 0 {
-                    t.terminator.handle_fabric_fin(sid)
-                } else {
-                    t.terminator.handle_fabric_data(sid, pl)
-                };
+                // Originator side (frame came from our own relay). SYN
+                // frames are dropped+counted inside (W-new), never injected
+                // as application data.
+                let pkts = t.terminator.handle_originator_frame(sid, fl, pl);
                 drop(t);
                 let mut tun = lock(tun);
                 for p in pkts {
@@ -427,17 +423,13 @@ fn handle_stream_datagram(
     };
     // Originator? F1: compare the frame's from_peer against the peer the
     // stream was originated for — id-only lookup misroutes dual-role nodes.
+    // SYN frames are dropped+counted inside handle_originator_frame (W-new).
     let is_originator = { lock(&tcp).is_originator_frame(stream_id, from_peer) };
     if is_originator {
         let pkts = {
-            let mut t = lock(&tcp);
-            if flags & STREAM_RST != 0 {
-                t.terminator.handle_fabric_rst(stream_id)
-            } else if flags & STREAM_FIN != 0 {
-                t.terminator.handle_fabric_fin(stream_id)
-            } else {
-                t.terminator.handle_fabric_data(stream_id, payload)
-            }
+            lock(&tcp)
+                .terminator
+                .handle_originator_frame(stream_id, flags, payload)
         };
         let mut tun = lock(tun);
         for p in pkts {
