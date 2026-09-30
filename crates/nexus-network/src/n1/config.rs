@@ -329,6 +329,7 @@ impl Parser {
                 heartbeat_timeout: std::time::Duration::from_millis(
                     self.heartbeat_timeout_ms.unwrap_or(15000),
                 ),
+                enable_rebind: true,
             },
         })
     }

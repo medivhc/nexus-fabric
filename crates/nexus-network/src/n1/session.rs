@@ -283,6 +283,7 @@ mod tests {
                 // keepalive 立即失败的替身：watcher 线程会快速退出，不干扰单测。
                 probe_interval: std::time::Duration::from_secs(3600),
                 heartbeat_timeout: std::time::Duration::from_secs(3600),
+                enable_rebind: true,
             },
         )
     }
@@ -347,6 +348,7 @@ mod tests {
             LinkConfig {
                 probe_interval: std::time::Duration::from_secs(3600),
                 heartbeat_timeout: std::time::Duration::from_secs(3600),
+                enable_rebind: true,
             },
         );
         let p = peer_id(5);

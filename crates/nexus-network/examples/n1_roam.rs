@@ -413,6 +413,9 @@ fn child_main(cfg: ChildCfg) -> Result<(), String> {
     let link_cfg = LinkConfig {
         probe_interval: PROBE_INTERVAL,
         heartbeat_timeout: HEARTBEAT_TIMEOUT,
+        // A 是 stationary 端：不主动 rebind，避免与 B 的迁移冲突；
+        // B 是 roam 端：需要 rebind 恢复。
+        enable_rebind: cfg.role != 'a',
     };
 
     if cfg.role == 'a' {

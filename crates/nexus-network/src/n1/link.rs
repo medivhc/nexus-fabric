@@ -39,6 +39,9 @@ pub struct LinkConfig {
     pub probe_interval: Duration,
     /// 心跳超时：超过此时长未收到 pong 即判定 Link 失败。
     pub heartbeat_timeout: Duration,
+    /// 失败后是否执行 rebind 恢复。 stationary 端（如 E4 的 A）可关闭，
+    /// 避免与 roam 端同时重绑导致 QUIC 迁移混乱。
+    pub enable_rebind: bool,
 }
 
 impl Default for LinkConfig {
@@ -46,6 +49,7 @@ impl Default for LinkConfig {
         Self {
             probe_interval: Duration::from_secs(5),
             heartbeat_timeout: Duration::from_secs(15),
+            enable_rebind: true,
         }
     }
 }
@@ -217,6 +221,10 @@ impl LinkStateWatcher {
         // resolve 结果用于审计与诊断；rebind 由传输层按当前 locator 执行
         // （fabric 的 rebind 语义：换本地 socket，QUIC 被动迁移）。
         let _ = addrs;
+        if !self.config.enable_rebind {
+            // stationary 端：不上报 RebindSucceeded，仅记录跳过。
+            return;
+        }
         match self.conn.rebind() {
             Ok(()) => self.sink.emit(N1Event {
                 peer: self.peer,
@@ -452,6 +460,7 @@ mod tests {
             LinkConfig {
                 probe_interval: Duration::from_millis(50),
                 heartbeat_timeout: Duration::from_millis(200),
+                enable_rebind: true,
             },
         );
         // 等待：2×50ms pong + 200ms 超时 + 恢复，1.5s 裕量充足。
@@ -507,6 +516,7 @@ mod tests {
             LinkConfig {
                 probe_interval: Duration::from_millis(50),
                 heartbeat_timeout: Duration::from_secs(30),
+                enable_rebind: true,
             },
         );
         thread::sleep(Duration::from_millis(800));
@@ -547,6 +557,7 @@ mod tests {
             LinkConfig {
                 probe_interval: Duration::from_millis(50),
                 heartbeat_timeout: Duration::from_secs(10),
+                enable_rebind: true,
             },
         );
         thread::sleep(Duration::from_millis(200));

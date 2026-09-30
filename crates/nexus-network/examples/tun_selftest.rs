@@ -82,9 +82,8 @@ fn main() {
         std::thread::sleep(Duration::from_millis(200));
     }
     let got = reader.join().unwrap();
-    println!("{{\"verdict\":\"{}\",\"packets_received\":{got}}}", if got >= 3 {
-        "PASS"
-    } else {
-        "FAIL"
-    });
+    println!(
+        "{{\"verdict\":\"{}\",\"packets_received\":{got}}}",
+        if got >= 3 { "PASS" } else { "FAIL" }
+    );
 }
