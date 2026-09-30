@@ -81,6 +81,11 @@ impl MockTransport {
         lock(&self.peers).insert(peer_name.to_string(), peer_inbox);
     }
 
+    /// Remove a peer link (e.g. the "self" loopback from `new_for_test`).
+    pub fn unlink_peer(&self, peer_name: &str) {
+        lock(&self.peers).remove(peer_name);
+    }
+
     /// Our inbox sender, for a peer to `link_peer` to.
     pub fn inbox_sender(&self) -> mpsc::Sender<(String, Vec<u8>)> {
         self.inbox_tx.clone()

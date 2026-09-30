@@ -499,6 +499,8 @@ impl Projection {
     /// Test/E4 helper: link this projection's mock transport to a peer's.
     /// Both projections must have been created via `new` (mock transport).
     /// Panics if a custom transport was injected via `with_transport`.
+    /// Removes any "self" loopback link (from `new_for_test`) so the named
+    /// peer takes precedence.
     pub fn link_mock_peer(&mut self, peer_name: &str, peer: &Projection) {
         let my_mock = self
             .mock_transport
@@ -508,6 +510,7 @@ impl Projection {
             .mock_transport
             .as_ref()
             .expect("link_mock_peer requires mock transport on peer");
+        my_mock.unlink_peer("self");
         my_mock.link_peer(peer_name, peer_mock.inbox_sender());
     }
 
