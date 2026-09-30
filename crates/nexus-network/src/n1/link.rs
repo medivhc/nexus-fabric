@@ -42,6 +42,11 @@ pub struct LinkConfig {
     /// 失败后是否执行 rebind 恢复。 stationary 端（如 E4 的 A）可关闭，
     /// 避免与 roam 端同时重绑导致 QUIC 迁移混乱。
     pub enable_rebind: bool,
+    /// 是否启动 LinkStateWatcher（keepalive 观测）。默认 true。
+    /// E4 的 roam 端（B）可关闭：B 在 ROAM 时由外部主动触发 rebind
+    /// （模拟 OS 网络变更通知），watcher 的并发流操作会与主动 rebind
+    /// 竞态导致连接状态损坏。关闭后 watcher 不启动，rebind 完全由外部驱动。
+    pub enable_watcher: bool,
 }
 
 impl Default for LinkConfig {
@@ -50,6 +55,7 @@ impl Default for LinkConfig {
             probe_interval: Duration::from_secs(5),
             heartbeat_timeout: Duration::from_secs(15),
             enable_rebind: true,
+            enable_watcher: true,
         }
     }
 }
@@ -500,6 +506,7 @@ mod tests {
                 probe_interval: Duration::from_millis(50),
                 heartbeat_timeout: Duration::from_millis(200),
                 enable_rebind: true,
+                enable_watcher: true,
             },
         );
         // 等待：2×50ms pong + 200ms 超时 + 恢复，1.5s 裕量充足。
@@ -556,6 +563,7 @@ mod tests {
                 probe_interval: Duration::from_millis(50),
                 heartbeat_timeout: Duration::from_secs(30),
                 enable_rebind: true,
+                enable_watcher: true,
             },
         );
         thread::sleep(Duration::from_millis(800));
@@ -597,6 +605,7 @@ mod tests {
                 probe_interval: Duration::from_millis(50),
                 heartbeat_timeout: Duration::from_secs(10),
                 enable_rebind: true,
+                enable_watcher: true,
             },
         );
         thread::sleep(Duration::from_millis(200));

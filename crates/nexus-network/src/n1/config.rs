@@ -330,6 +330,7 @@ impl Parser {
                     self.heartbeat_timeout_ms.unwrap_or(15000),
                 ),
                 enable_rebind: true,
+                enable_watcher: true,
             },
         })
     }

@@ -106,15 +106,21 @@ impl N1SessionManager {
 
     fn insert_conn(&self, peer: N1PeerId, conn: Box<dyn N1Connection>) {
         let conn: Arc<dyn N1Connection> = conn.into();
-        let watcher = LinkStateWatcher::start(
-            peer,
-            Arc::clone(&conn),
-            Arc::clone(&self.discovery),
-            Arc::clone(&self.sink),
-            self.link_config.clone(),
-        );
+        // enable_watcher=false 时不启动 watcher（E4 roam 端 B：rebind 由外部主动驱动，
+        // 避免 watcher 并发流操作与主动 rebind 竞态）。
+        let watcher = if self.link_config.enable_watcher {
+            Some(LinkStateWatcher::start(
+                peer,
+                Arc::clone(&conn),
+                Arc::clone(&self.discovery),
+                Arc::clone(&self.sink),
+                self.link_config.clone(),
+            ))
+        } else {
+            None
+        };
         let mut peers = self.peers.lock().unwrap();
-        peers.insert(peer, N1Peer::new(conn, Some(watcher)));
+        peers.insert(peer, N1Peer::new(conn, watcher));
     }
 
     /// 入向接受循环（阻塞）：在调用方线程上运行，直到 `stop` 被置位。
@@ -284,6 +290,7 @@ mod tests {
                 probe_interval: std::time::Duration::from_secs(3600),
                 heartbeat_timeout: std::time::Duration::from_secs(3600),
                 enable_rebind: true,
+                enable_watcher: true,
             },
         )
     }
@@ -349,6 +356,7 @@ mod tests {
                 probe_interval: std::time::Duration::from_secs(3600),
                 heartbeat_timeout: std::time::Duration::from_secs(3600),
                 enable_rebind: true,
+                enable_watcher: true,
             },
         );
         let p = peer_id(5);

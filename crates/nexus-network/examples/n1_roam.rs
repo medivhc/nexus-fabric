@@ -410,15 +410,15 @@ fn child_main(cfg: ChildCfg) -> Result<(), String> {
     let sink = Arc::new(CollectSink {
         events: Mutex::new(vec![]),
     });
+    // E4 配置：B（roam 端）禁用 watcher，只靠 ROAM 主动 rebind。
+    // A（stationary）保留 watcher 做观测，但不主动 rebind。
+    // 原因：B 的 watcher 并发流操作会与 ROAM 主动 rebind 竞态，
+    // 导致连接状态损坏、迁移失败。watcher 的 reactive 能力由单测覆盖。
     let link_cfg = LinkConfig {
         probe_interval: PROBE_INTERVAL,
         heartbeat_timeout: HEARTBEAT_TIMEOUT,
-        // E4 配置：A/B 的 watcher 都不主动 rebind。
-        // A 是 stationary 端（本来就不 rebind）；B 在 ROAM 时由 E4 主动触发
-        // rebind（模拟 OS 网络变更通知），watcher 只做观测不上报动作，
-        // 避免主动 rebind 后旧流错误又触发 watcher 重复 rebind 打断 QUIC 迁移。
-        // watcher 的 reactive rebind 能力由单测覆盖（link::tests）。
         enable_rebind: false,
+        enable_watcher: cfg.role == 'a',
     };
 
     if cfg.role == 'a' {
