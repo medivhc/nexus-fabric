@@ -111,6 +111,7 @@ impl N1Connection for FabricConnAdapter {
         if data.len() > 1200 {
             return Err(N1Error::OversizeDatagram(data.len()));
         }
+        eprintln!("[dgram] send len={}", data.len());
         self.inner.send_datagram(data).map_err(map_fabric_err)
     }
     fn recv_datagram(&self) -> Result<Vec<u8>, N1Error> {
@@ -488,8 +489,10 @@ fn child_a(
         return Err(format!("expected SEND, got {cmd:?}"));
     }
     let server = format!("{VPI_B}:{TCP_PORT}");
+    eprintln!("[child a] tcp connecting to {server}...");
     let mut stream =
         TcpStream::connect(&server).map_err(|e| format!("tcp connect {server}: {e}"))?;
+    eprintln!("[child a] tcp connected!");
     let mut hash = Fnv64::new();
     let mut off = 0;
     let mut half_signaled = false;
