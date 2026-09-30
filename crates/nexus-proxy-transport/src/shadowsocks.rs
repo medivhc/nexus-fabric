@@ -284,6 +284,8 @@ mod tests {
             alpn: None,
             skip_cert_verify: None,
             header_format: None,
+            obfs: None,
+            obfs_key: None,
         }
     }
 
