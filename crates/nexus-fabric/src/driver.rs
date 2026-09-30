@@ -31,6 +31,38 @@ use crate::cert::{Identity, build_client_crypto, build_server_config, generate_i
 use crate::transport::{StdUdpTransport, UdpTransport};
 use crate::{ConnStats, ConnectionId, FabricError, PeerId};
 
+/// Placeholder transport used during `cmd_rebind` between closing the old
+/// socket and binding the new one (F-EDGE-1). All operations fail; it is
+/// never observable outside the rebind window.
+struct ClosedTransport;
+
+impl UdpTransport for ClosedTransport {
+    fn recv_from(&mut self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "socket closed for rebind",
+        ))
+    }
+    fn send_to(&self, _buf: &[u8], _target: SocketAddr) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "socket closed for rebind",
+        ))
+    }
+    fn set_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "socket closed for rebind",
+        ))
+    }
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "socket closed for rebind",
+        ))
+    }
+}
+
 /// Logical connection ids; process-wide unique (P0: one driver per connection
 /// on the client side, one driver per listener on the server side).
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
@@ -254,6 +286,7 @@ impl Driver {
             handle_map: HashMap::new(),
             buf: vec![0u8; RECV_BUF],
             out: Vec::new(),
+            diag_last_remote: None,
         };
         let thread = thread::Builder::new()
             .name("nexus-fabric-drv".into())
@@ -417,6 +450,8 @@ struct Loop {
     handle_map: HashMap<ConnectionHandle, u64>,
     buf: Vec<u8>,
     out: Vec<u8>,
+    // 临时诊断字段（E4 迁移调试，事后删除）。
+    diag_last_remote: Option<SocketAddr>,
 }
 
 impl Loop {
@@ -594,8 +629,17 @@ impl Loop {
         // 随机端口会导致对端按旧端口发送的包丢失；若原 IP 已不存在
         // （如 roam 后旧 IP 被删除），则回退到 wildcard。
         // Server 必须保留端口（well-known），bind 失败则报错而非回退。
+        //
+        // F-EDGE-1 修复：必须先释放旧 socket 再 bind。旧 socket 在新 bind
+        // 成功前仍持有端口（StdUdpTransport 无 SO_REUSEADDR），否则
+        // bind(orig) 与 bind(0.0.0.0:port) 恒 EADDRINUSE，端口保留成死代码。
+        // 若全部 bind 失败，连接失去 socket（不可恢复，返回 Err）。
         let orig = *self.shared.local_addr.lock().unwrap();
         let is_server = self.server_config.is_some();
+        drop(std::mem::replace(
+            &mut self.socket,
+            Box::new(ClosedTransport),
+        ));
         let sock: Box<dyn UdpTransport> = match StdUdpTransport::bind(orig) {
             Ok(s) => Box::new(s),
             Err(e) => {
@@ -623,21 +667,29 @@ impl Loop {
             .map_err(|e| FabricError::Transport(e.to_string()))?;
         self.socket = sock;
         *self.shared.local_addr.lock().unwrap() = addr;
-        // N1 E4 修复：通知 quinn_proto 本地地址已变更，重置路径状态
-        // （拥塞窗口、RTT 等），否则对端（A）的发送路径无法正确迁移，
-        // 导致 A→B 单向中断。debug_assert 风险：仅在连接 idle 时触发；
-        // E4 在文件传输中 rebind（非 idle），安全。
-        if let Some(lc) = self.live.get_mut(&conn) {
-            lc.quic.local_address_changed();
-        }
+        // F-EDGE-2：移除无条件 local_address_changed() 调用。
+        // 该调用只影响本端（B）路径状态，不能帮助对端（A）迁移发送路径；
+        // A 的迁移靠收到 B 新源地址包时的被动迁移（QUIC 标准行为）。
+        // 旧代码刻意不调用（quinn-proto 0.11.18 pto_time_and_space 在
+        // 迁移后 idle 时触发 debug_assert）；无条件调用重引入该风险。
+        // B 的迁移触发包由调用方（E4 burst / 业务数据）驱动发出。
         // Refresh stats immediately so the caller observes the new path.
         self.update_stats(conn);
+        eprintln!("[fabric-diag] rebind ok: orig={orig} new={addr} is_server={is_server}");
         Ok(addr)
     }
 
     fn on_udp(&mut self, n: usize, remote: SocketAddr) {
         let now = Instant::now();
         let local_ip = self.socket.local_addr().ok().map(|a| a.ip());
+        // 临时诊断：记录收到的远端地址变化（E4 迁移调试用，事后删除）。
+        if self.diag_last_remote != Some(remote) {
+            eprintln!(
+                "[fabric-diag] recv from new remote: {remote} (was {:?})",
+                self.diag_last_remote
+            );
+            self.diag_last_remote = Some(remote);
+        }
         let data = BytesMut::from(&self.buf[..n]);
         let ev = self
             .endpoint

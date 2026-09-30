@@ -106,6 +106,8 @@ fn map_fabric_err(e: FabricError) -> N1Error {
 
 struct FabricConnAdapter {
     inner: FabricConn,
+    // F-EDGE-3：串行化并发 rebind（watcher 超时与手动/平台通知可能并发触发）。
+    rebind_lock: std::sync::Mutex<()>,
 }
 
 impl N1Connection for FabricConnAdapter {
@@ -133,6 +135,8 @@ impl N1Connection for FabricConnAdapter {
         })))
     }
     fn rebind(&self) -> Result<(), N1Error> {
+        // F-EDGE-3：同一连接的并发 rebind 串行化，避免 socket 替换竞态。
+        let _guard = self.rebind_lock.lock().unwrap();
         self.inner.rebind().map_err(map_fabric_err)
     }
     fn connection_id(&self) -> u64 {
@@ -202,7 +206,10 @@ impl FabricDialer {
         };
         let conn =
             FabricConn::connect_with_transport(peer, &cfg, transport).map_err(map_fabric_err)?;
-        Ok(Box::new(FabricConnAdapter { inner: conn }))
+        Ok(Box::new(FabricConnAdapter {
+            inner: conn,
+            rebind_lock: std::sync::Mutex::new(()),
+        }))
     }
 }
 
@@ -243,7 +250,13 @@ impl N1Listener for FabricListenerAdapter {
     fn accept(&self) -> Result<(N1PeerId, Box<dyn N1Connection>), N1Error> {
         let conn = self.inner.accept().map_err(map_fabric_err)?;
         let peer = N1PeerId(conn.peer().0);
-        Ok((peer, Box::new(FabricConnAdapter { inner: conn })))
+        Ok((
+            peer,
+            Box::new(FabricConnAdapter {
+                inner: conn,
+                rebind_lock: std::sync::Mutex::new(()),
+            }),
+        ))
     }
 }
 
