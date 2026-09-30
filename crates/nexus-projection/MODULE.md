@@ -10,9 +10,10 @@
    （`MeshPeer` / `Egress` / `Drop`），Clash TUN 与 EasyTier TUN 在此融合。
 3. **本地出口 NAT**（Phase 3b-1 新增）：`Egress{self}` 的 UDP NAT（含连接跟踪）。
 
-P0 不做：域名规则（3b-3）、TCP NAT（依赖 L4 中继）、
+P0 不做：TCP NAT（依赖 L4 中继）、
 语义入口（§6.2）、进程 QoS（§6.3）。
 3b-2（跨节点 Egress + 跳数防环 + NAT 上限）已完成。
+3b-3（域名规则：DNS 嗅探 + 域名→出口映射 + 解析缓存）进行中。
 
 ## Non-Responsibilities
 
@@ -22,7 +23,8 @@ P0 不做：域名规则（3b-3）、TCP NAT（依赖 L4 中继）、
 - 不做 TUN 设备路由决策的旧模型（`nexus-proxy/tun.rs` 的 `selected_outbound_tag`
   被 `RouteTarget` 取代）。
 - 不做 QUIC 传输（`nexus-fabric`）、路径选择（`nexus-path`）。
-- 不做跨节点 Egress（3b-2）、域名规则（3b-3）。
+- 不做跨节点 Egress（3b-2，已完成）。
+- 3b-3 做域名规则（DNS 嗅探 + 域名→出口映射 + 解析缓存）。
 
 ## Inputs
 
@@ -98,6 +100,21 @@ P0 不做：域名规则（3b-3）、TCP NAT（依赖 L4 中继）、
 **S14（NAT 表上限）**：`EgressNat` 表项数不超过 `max_entries`（默认 65536）。
 满时丢弃最旧表项（LRU）并计数（`evicted`），保证新流不被洪水完全堵死。
 
+**S15（DNS 嗅探无损）**：DNS 查询/响应包的嗅探**不修改包内容**，只提取信息
+（查询包的 QNAME、响应包的 A/AAAA 记录）。嗅探失败（非 DNS 载荷、解析错误、
+截断包）时按普通包走 IP 规则，**不丢包**、不计数为错误（`dns_sniff_failed`
+仅调试计数）。
+
+**S16（域名规则优先）**：`RouteRequest.domain` 为 Some 时，域名规则（后缀/
+精确/关键字）**优先于** IP/CIDR/端口规则匹配；域名无命中时回退到 IP 规则。
+同一域名在规则不变时决策一致（确定性，类 S9）。
+
+**S17（解析缓存继承）**：DNS 响应中的 A/AAAA 记录写入 `domain → IP` 缓存；
+后续发往缓存 IP 的非 DNS 包自动填充 `domain`，继承该域名的路由决策。
+缓存项 TTL 上限 300s（取 DNS TTL 与 300s 的较小值），超时失效；缓存上限
+4096 项，满时驱逐最旧并计数（`dns_cache_evicted`）。DNS 响应包本身按查询
+域名的规则决策（保证查询与响应路径一致）。
+
 ## Side Effects
 
 - TUN 设备读写（`TunDevice::read` / `write`）。
@@ -127,7 +144,15 @@ pub trait Router: Send + Sync {
 }
 
 /// P0 最小规则引擎：IP/CIDR/端口规则。
+/// 3b-3 扩展：域名后缀/精确/关键字规则（域名优先于 IP，S16）。
 pub struct SimpleRuleEngine { /* ... */ }
+
+/// DNS 嗅探器：从 UDP 包中提取 QNAME（查询）/ A-AAAA 记录（响应）。
+/// std-only 最小 wire 解析，无外部依赖（S15）。
+pub struct DnsSniffer { /* ... */ }
+
+/// 域名→IP 解析缓存：TTL + 容量上限（S17）。
+pub struct DnsCache { /* ... */ }
 
 /// 本地出口 UDP NAT（Egress{self}）。
 pub struct EgressNat { /* ... */ }
@@ -175,8 +200,14 @@ fabric 传输（E4 验证封装逻辑）；与 fabric 的真实接线是下一�
   UDP NAT → 回包验证）
 - E4: `product.fabric-egress-remote`（TUN 包 → Egress{peer} → 对端 NAT →
   回包，mock peer）
+- E4: `product.fabric-egress-domain`（3b-3：DNS 查询嗅探 → 域名规则命中 →
+  Egress{peer}；DNS 响应建缓存；后续发往解析 IP 的包继承域名决策；
+  域名无命中回退 IP 规则；嗅探失败不丢包）
 - 单元测试：S1 包完整、S5 超大包丢弃计数、S2 意图位开销、S9 路由确定性、
-  S10 虚拟子网优先、S11 NAT 回包、S12 Drop 计数、MockTun 集成
+  S10 虚拟子网优先、S11 NAT 回包、S12 Drop 计数、S13 跳数验证、S14 NAT 上限、
+  S15 DNS 嗅探无损（坏包/非 DNS 不丢包）、S16 域名优先（域名命中覆盖 IP 规则、
+  无命中回退）、S17 解析缓存（响应建缓存、TTL 失效、容量驱逐、后续包继承）、
+  MockTun 集成
 
 ## Performance Budget
 
