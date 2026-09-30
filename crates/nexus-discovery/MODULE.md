@@ -296,3 +296,101 @@ LSA/LSDB/算路/FIB/管理器零改动。
 - `compute_paths` 返回 0/1/2 条（按代价升序）；边不交指无共享有向边。
 - Deletion Test：Disjoint 是"故障隔离"的独立维度（K-shortest 的备用路
   可能共享链路，单点故障双路全断）；删除后无链路级容灾路径来源。
+
+### 冻结契约（三源发现 D1–D6，DESIGN §8.2，scenarios/product/discovery_static.toml + discovery_mdns.toml）
+
+在现有 `nexus-discovery` 上增量：统一 `Discovery` trait + 静态/mDNS/LSA 三源 +
+聚合 + 可观测。已有冻结契约（remote P0 / Presence / auto_discovery / LSA P5 /
+Dijkstra / ECMP / flow_hash / routing_strategy / k_shortest / fib_manager /
+disjoint）零改动。
+
+- **D1（Discovery trait）**：
+  `pub trait Discovery { fn resolve(&self, peer: &PeerId) -> Vec<SocketAddr>; }`
+  （对标 iroh Discovery，sync）。语义：只做查询，不发起网络 I/O、不建立
+  Connectivity（Discovery != Connectivity Establishment）；未知 peer 返回空
+  Vec（不报错）。实现者：`StaticDiscovery`、`LsaDiscovery`、`MdnsDiscovery`、
+  `AggregateDiscovery`。
+  命名调和（冻结 API 不动）：`StaticDiscovery` 已有 inherent
+  `resolve(&self, peer: &PeerId) -> Result<SocketAddr, DiscoveryError>`
+  （remote P0 冻结）；方法调用语法中 inherent 优先，trait 方法须经 UFCS
+  （`Discovery::resolve(&x, &peer)`）或泛型界调用。本契约明确记录此二义性，
+  不得"修复"为改名（那会破坏冻结 API）。
+  Deletion Test：trait 是多源异构实现之上的统一抽象维度；
+  `AggregateDiscovery` 依赖它而非具体类型；删除后聚合器需对每种源做枚举分发，
+  与源类型耦合。不同于"为优雅而抽象"。
+
+- **D2（静态源）**：复用冻结的 `StaticDiscovery`（`new`/`resolve`/`register`
+  签名零改动）；新增 `impl Discovery for StaticDiscovery`：
+  `Ok(addr) -> vec![addr]`，`Err(_) -> vec![]`（满足 D1"无条目 → 空"）。
+
+- **D3（mDNS 源）**：`pub struct MdnsDiscovery` —— 纯状态机 + DNS 子集编解码，
+  **零 I/O**（portable：`#![forbid(unsafe_code)]`，零第三方依赖）。
+  - 服务名 `pub const MDNS_SERVICE: &str = "_nexus._udp.local"`；
+    组播端点 `pub const MDNS_ADDR: &str = "224.0.0.251:5353"`；
+    记录 TTL `pub const MDNS_TTL_SECS: u32 = 120`。
+  - 实例名 `nx-<sanitized-peerid>._nexus._udp.local`（sanitized =
+    PeerId 保留 `[a-zA-Z0-9-]` 其余转 `-`，截断 32 字符；全空则 `new`
+    返回 `Err(DiscoveryError::Transport(..))`）。
+  - `pub fn new(peer_id: PeerId, service_port: u16, announce_ip: IpAddr) -> Result<Self, DiscoveryError>`
+    （announce_ip 由组合根注入，discovery 不猜测本机地址）。
+  - `pub fn encode_query(&self) -> Vec<u8>`：PTR 查询（QR=0，QTYPE=PTR/ANY）。
+  - `pub fn encode_announce(&self) -> Vec<u8>`：unsolicited 响应
+    （QR=1/AA=1）：PTR + SRV(port) + TXT(`peer=<PeerId>`) + A(announce_ip)。
+  - `pub fn handle_datagram(&mut self, data: &[u8], now: Instant) -> Vec<Vec<u8>>`：
+    解码失败/畸形包静默忽略（返回空，不报错）；PTR 查询（服务名匹配）→
+    返回 announce 响应；响应包 → 提取 (peer, ip, port) 更新缓存（跳过
+    `peer == self` 的自回环）；每次调用附带一次过期清理。
+  - `pub fn prune_expired(&mut self, now: Instant)`（组合根周期性调用）。
+  - `impl Discovery for MdnsDiscovery`：返回缓存快照（过期条目依赖
+    `prune_expired`/`handle_datagram` 清理，此为组合根义务，文档明说）。
+  - DNS 子集：header/question/answer 编解码；RDATA 仅 PTR/SRV/TXT/A；
+    解码处理压缩指针（有界跳转、防越界；长度前缀解码用 capacity hint，
+    见知识条目 lsa-codec-alloc-001）；未知 RR 类型跳过。
+  - **只做发现，不做认证**：mDNS 记录无认证；发现的地址只是拨号候选，
+    身份认证是会话层的事（DESIGN §8.1 ed25519）。MODULE 明确声明。
+  - 诚实边界：跨子网不工作（组播范围限制）；实例名冲突解决超出范围
+    （文档明说）；已知应答抑制等 RFC 6762 完整行为不实现（只需 Nexus
+    节点互发现，无需与 Avahi/Bonjour 互操作）。
+  - Socket 装配（bind 5353 + SO_REUSEADDR + 加入组播组）与 pump 循环是
+    **组合根职责**（apps/nexus），`std` 无法设置 SO_REUSEADDR（5353 与
+    本机其他 mDNS 响应者共存必需），见 D-D-1。
+
+- **D4（LSA 源）**：`pub struct LsaDiscovery<'a> { lsdb: &'a Lsdb }`，
+  `pub fn new(lsdb: &'a Lsdb) -> Self`；`impl Discovery` 从
+  `lsdb.get(peer)` 取 `Lsa.locator: Option<String>`（P5 已冻结字段，
+  **无线协议扩展**，本期无第二期拆分）。
+  `pub fn parse_locator(s: &str) -> Option<SocketAddr>`：仅接受
+  `udp://host:port` 字面量（`strip_prefix("udp://")` + `SocketAddr::from_str`）；
+  其他 scheme / 主机名 / 非法格式 → `None`（该源无地址，不报错、不 panic）。
+  Deletion Test：LSA 地址提取是"mesh 内已扩散信息复用"的独立维度，
+  与静态配置（人工）/mDNS（局域网）正交。
+
+- **D5（聚合）**：`pub enum DiscoverySource { Static, Lsa, Mdns }`
+  （变体顺序即优先级：静态 > LSA > mDNS）；
+  `pub struct ResolvedAddr { pub addr: SocketAddr, pub source: DiscoverySource }`；
+  `pub struct AggregateDiscovery<'a> { /* StaticDiscovery + LsaDiscovery<'a> + MdnsDiscovery + metrics */ }`。
+  - `pub fn new(static_src: StaticDiscovery, lsdb: &'a Lsdb, mdns: MdnsDiscovery) -> Self`
+  - `pub fn resolve_with_sources(&self, peer: &PeerId) -> Vec<ResolvedAddr>`：
+    按优先级依次查询；按 `SocketAddr` 去重（保留最高优先级来源标注）。
+  - `pub fn metrics(&self) -> &DiscoveryMetrics`；
+    `pub fn mdns_mut(&mut self) -> &mut MdnsDiscovery`（组合根 pump 用）。
+  - `impl Discovery for AggregateDiscovery`：只返回地址（去重后）；
+    每次调用更新 D6 计数器（`&self` + 内部 `AtomicU64`）。
+
+- **D6（可观测）**：`pub struct DiscoveryMetrics`（`AtomicU64` 计数器，
+  `Default` 全零）；`pub fn snapshot(&self) -> DiscoveryMetricsSnapshot`
+ （`{ hits_static, hits_lsa, hits_mdns, miss }`，`u64`）。
+  语义：每次 `AggregateDiscovery::resolve`，有 ≥1 地址产出的源
+  `hits_{source}++`；全空则 `miss++`（去重前计数，如实记录）。
+  Prometheus 命名约定（导出是组合根职责）：
+  `discovery_hits{source="static|lsa|mdns"}`、`discovery_miss`。
+
+- **D-D-1（mDNS 二选一评审结论）**：手写最小 mDNS（本契约 D3），不用
+  `mdns-sd`。评审依据：① `mdns-sd` 许可（Apache-2.0/MIT）虽兼容，但其
+  内部自建 daemon 线程，与 AGENTS.md §13 结构化并发（Owner/CancellationToken/
+  JoinSet）冲突，且引入整套 RFC 6762/6763 通用性（Avahi/Bonjour 互操作）
+  是我们不需要的——只有 Nexus 节点使用 `_nexus._udp.local`；
+  ② 仓库先例（手写 LSA 编解码、discovery 帧、窄 netlink、TURN）证明子集
+  协议手写可控、可确定性单测；③ 组合根 socket 装配批准新增 `socket2`
+  （safe、MIT/Apache-2.0、传递闭包仅 libc/windows-sys），**仅限 apps/nexus**
+  （组合根），`nexus-discovery` 保持零第三方依赖、零 I/O。
