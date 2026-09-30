@@ -51,7 +51,9 @@ const VPI_B: &str = "10.144.0.2";
 const VPI_NET: &str = "10.144.0.0";
 const VPI_CIDR: u8 = 24;
 const TCP_PORT: u16 = 7000;
-const TUN_MTU: u16 = 1200;
+// TUN MTU 必须小于 QUIC datagram 最大载荷（path MTU 1200 - QUIC/IP/UDP 开销
+// ~60 字节 - DATAGRAM 帧头）。设为 1100 确保 IP 包能装入 datagram。
+const TUN_MTU: u16 = 1100;
 const FILE_SIZE: usize = 2 * 1024 * 1024;
 /// 契约默认 5s；E4 配 1s（scenario 冻结期望可配置）。
 const PROBE_INTERVAL: Duration = Duration::from_secs(1);
@@ -111,7 +113,6 @@ impl N1Connection for FabricConnAdapter {
         if data.len() > 1200 {
             return Err(N1Error::OversizeDatagram(data.len()));
         }
-        eprintln!("[dgram] send len={}", data.len());
         self.inner.send_datagram(data).map_err(map_fabric_err)
     }
     fn recv_datagram(&self) -> Result<Vec<u8>, N1Error> {
@@ -489,10 +490,8 @@ fn child_a(
         return Err(format!("expected SEND, got {cmd:?}"));
     }
     let server = format!("{VPI_B}:{TCP_PORT}");
-    eprintln!("[child a] tcp connecting to {server}...");
     let mut stream =
         TcpStream::connect(&server).map_err(|e| format!("tcp connect {server}: {e}"))?;
-    eprintln!("[child a] tcp connected!");
     let mut hash = Fnv64::new();
     let mut off = 0;
     let mut half_signaled = false;
@@ -783,6 +782,7 @@ fn parent_main() -> Result<String, String> {
     // 前置检查：sudo -n 可用于 /usr/bin/ip（apppen NOPASSWD sudoers）。
     let sudo_ok = Command::new("/usr/bin/sudo")
         .args(["-n", "/usr/bin/ip", "-o", "link", "show"])
+        .stdout(std::process::Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
