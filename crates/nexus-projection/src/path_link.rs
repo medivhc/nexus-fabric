@@ -220,7 +220,20 @@ mod tests {
             return; // sandbox: UDP blocked, true verification on xc-pc-linux
         }
         let (conn_a, _conn_b) = quic_pair().expect("real QUIC pair");
+        // Arm the failure path: close, then wait until the driver reaps the
+        // connection (cmd_rebind returns Err(Closed) for reaped conns).
         conn_a.close(0, b"test");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if conn_a.rebind().is_err() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "conn never reaped after close"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
         let (pm, active) = manager_two_paths();
         let mut link = PathLink::new(pm);
         link.add_conn("b", conn_a);
