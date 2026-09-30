@@ -22,7 +22,7 @@
 //! Usage: cargo run -p nexus-projection --example egress_domain -- --json
 
 use nexus_projection::{
-    MockTun, Projection, ProjectionConfig, RouteTarget, Router, Rule, SimpleRuleEngine, TunDevice,
+    MockTun, Projection, ProjectionConfig, RouteTarget, Rule, SimpleRuleEngine, TunDevice,
     UnifiedRouter,
 };
 use std::sync::{Arc, Mutex};
@@ -210,13 +210,13 @@ fn run() -> Result<(String, bool), String> {
     // --- 4. A's downlink NAT-validates the response, writes to A's TUN.
     wait_for(|| a.nat_stats().reply_received == 1, "A reply received")?;
 
-    // --- 5. A's router sniffs the response: learns the cache (S17) and
-    // decides the response itself by the queried domain.
-    let response_target = router_a.route_packet(&response);
-    let response_routed_by_domain = response_target
-        == RouteTarget::Egress {
-            peer: "B".to_string(),
-        };
+    // --- 5. F1 fix: the downlink thread now runs the response through
+    // router_a.route_packet for DNS learning (S17) — no manual call.
+    // Wait for the cache to be learned via the real production path.
+    wait_for(
+        || router_a.dns_stats().cache_inserted == 1,
+        "cache learned via downlink",
+    )?;
     let cache_inserted = router_a.dns_stats().cache_inserted;
 
     // --- 6. Packet to the resolved IP inherits the cached domain (S17):
@@ -250,7 +250,6 @@ fn run() -> Result<(String, bool), String> {
 
     let verdict = dns_query_egress_remote == 1
         && intent_egress_bit_set
-        && response_routed_by_domain
         && cache_inserted == 1
         && cached_ip_egress_remote == 1
         && dns_query_fallback_egress_self == 1

@@ -415,6 +415,11 @@ impl Projection {
                 let shutdown = Arc::clone(&shutdown);
                 let route_stats = Arc::clone(&route_stats);
                 let egress_nat = Arc::clone(&egress_nat);
+                // F1 fix: the downlink must see the router so DNS responses
+                // arriving via transport feed the DnsCache (S17). The routing
+                // decision itself is discarded — the packet is already here,
+                // we only want the sniffing/learning side effect.
+                let router = Arc::clone(&router);
                 thread::Builder::new()
                     .name("projection-downlink".into())
                     .spawn(move || {
@@ -450,6 +455,17 @@ impl Projection {
                                         // Mesh forward, or an egress reply
                                         // returning: validate via NAT when
                                         // tracked, then deliver to TUN.
+                                        // S17: run the packet through the
+                                        // router for DNS learning (response
+                                        // -> DnsCache). The decision is
+                                        // discarded; delivery was already
+                                        // determined by the sender.
+                                        {
+                                            let guard = lock(&router);
+                                            if let Some(r) = guard.as_ref() {
+                                                let _ = r.route_packet(pkt);
+                                            }
+                                        }
                                         let is_reply = lock(&egress_nat).peek_reply(pkt).is_some();
                                         if is_reply {
                                             lock(&egress_nat).translate_inbound(pkt);
