@@ -4484,15 +4484,12 @@ pub fn proxy_serve_once(
                         reason: format!("ss obfs wrap failed: {e}"),
                     },
                 )?;
-            let mut node_down = nexus_plugin::wrap_stream(
-                raw_down,
-                selected.obfs.as_deref(),
-                &obfs_params,
-            )
-            .map_err(|e| NexusError::ConnectivityEstablishmentFailed {
-                provider: ProviderId(decision.selected_outbound_tag.clone()),
-                reason: format!("ss obfs wrap failed: {e}"),
-            })?;
+            let mut node_down =
+                nexus_plugin::wrap_stream(raw_down, selected.obfs.as_deref(), &obfs_params)
+                    .map_err(|e| NexusError::ConnectivityEstablishmentFailed {
+                        provider: ProviderId(decision.selected_outbound_tag.clone()),
+                        reason: format!("ss obfs wrap failed: {e}"),
+                    })?;
             let method = SsMethod::parse(
                 selected
                     .method
@@ -4633,13 +4630,11 @@ pub fn proxy_serve_once(
             let obfs_params = nexus_plugin::ObfsParams {
                 key: selected.obfs_key.as_deref().unwrap_or("").as_bytes(),
             };
-            let mut node =
-                nexus_plugin::wrap_stream(raw, selected.obfs.as_deref(), &obfs_params).map_err(
-                    |e| NexusError::ConnectivityEstablishmentFailed {
-                        provider: ProviderId(decision.selected_outbound_tag.clone()),
-                        reason: format!("trojan obfs wrap failed: {e}"),
-                    },
-                )?;
+            let mut node = nexus_plugin::wrap_stream(raw, selected.obfs.as_deref(), &obfs_params)
+                .map_err(|e| NexusError::ConnectivityEstablishmentFailed {
+                provider: ProviderId(decision.selected_outbound_tag.clone()),
+                reason: format!("trojan obfs wrap failed: {e}"),
+            })?;
             let password = selected.password.clone().ok_or_else(|| {
                 NexusError::ConnectivityEstablishmentFailed {
                     provider: ProviderId(decision.selected_outbound_tag.clone()),

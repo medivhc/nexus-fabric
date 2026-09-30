@@ -35,8 +35,7 @@ fn run() -> Result<String, Outcome> {
     match dial_with_obfs(addr, Some("no-such-plugin"), &params) {
         Ok(_) => {
             return Err(Outcome::Fail(
-                "dial with unknown plugin succeeded: silent fallback to plain (P3 violated)"
-                    .into(),
+                "dial with unknown plugin succeeded: silent fallback to plain (P3 violated)".into(),
             ));
         }
         Err(e) => {

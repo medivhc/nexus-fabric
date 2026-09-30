@@ -12,8 +12,8 @@
 //!
 //! 只用公开 API + 可观测输出。TCP loopback 不可用 → SKIP（exit 0）。
 
-use nexus_proxy_config::{OutboundConfig, OutboundKind};
 use nexus_plugin::{ObfsParams, dial_ok_count, dial_with_obfs, init_builtin_plugins, wrap_stream};
+use nexus_proxy_config::{OutboundConfig, OutboundKind};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::thread;
@@ -71,8 +71,14 @@ fn run() -> Result<String, Outcome> {
         let mut w = vec![0u8; N];
         raw.read_exact(&mut w)
             .map_err(|e| format!("read wire: {e}"))?;
-        let mut wrapped = wrap_stream(raw, Some("xor"), &ObfsParams { key: KEY.as_bytes() })
-            .map_err(|e| format!("server wrap: {e}"))?;
+        let mut wrapped = wrap_stream(
+            raw,
+            Some("xor"),
+            &ObfsParams {
+                key: KEY.as_bytes(),
+            },
+        )
+        .map_err(|e| format!("server wrap: {e}"))?;
         let p = plaintext();
         wrapped
             .write_all(&p)
@@ -82,8 +88,8 @@ fn run() -> Result<String, Outcome> {
     });
 
     // 2. 经 dial_with_obfs 拨号（P1 统一接线点）。
-    let mut wrapped =
-        dial_with_obfs(node_addr, obfs, &params).map_err(|e| Outcome::Fail(format!("dial: {e}")))?;
+    let mut wrapped = dial_with_obfs(node_addr, obfs, &params)
+        .map_err(|e| Outcome::Fail(format!("dial: {e}")))?;
     // 3. 发 P。
     wrapped
         .write_all(&p)
