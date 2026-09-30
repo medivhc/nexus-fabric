@@ -44,7 +44,10 @@ impl<'a> AggregateDiscovery<'a> {
                 Discovery::resolve(&self.static_src, peer),
             ),
             (DiscoverySource::Lsa, self.lsa_src.resolve(peer)),
-            (DiscoverySource::Mdns, Discovery::resolve(&self.mdns_src, peer)),
+            (
+                DiscoverySource::Mdns,
+                Discovery::resolve(&self.mdns_src, peer),
+            ),
         ];
         for (source, addrs) in sources {
             for addr in addrs {
@@ -136,8 +139,7 @@ mod tests {
 
     #[test]
     fn priority_static_over_lsa() {
-        let static_src =
-            StaticDiscovery::new([(peer("n1"), addr("10.0.0.1:1111"))]);
+        let static_src = StaticDiscovery::new([(peer("n1"), addr("10.0.0.1:1111"))]);
         let db = lsdb_with(&[("n1", Some("udp://10.0.0.2:2222"))]);
         let agg = AggregateDiscovery::new(static_src, &db, mdns("self"));
         let r = agg.resolve_with_sources(&peer("n1"));
@@ -150,8 +152,7 @@ mod tests {
 
     #[test]
     fn dedup_keeps_highest_priority_source() {
-        let static_src =
-            StaticDiscovery::new([(peer("n1"), addr("10.0.0.1:1111"))]);
+        let static_src = StaticDiscovery::new([(peer("n1"), addr("10.0.0.1:1111"))]);
         // LSA 通告了与静态表相同的地址 → 去重后只剩一条，来源标注为 Static。
         let db = lsdb_with(&[("n1", Some("udp://10.0.0.1:1111"))]);
         let agg = AggregateDiscovery::new(static_src, &db, mdns("self"));
@@ -175,9 +176,11 @@ mod tests {
 
     #[test]
     fn metrics_count_per_source_hit() {
-        let static_src =
-            StaticDiscovery::new([(peer("n1"), addr("10.0.0.1:1111"))]);
-        let db = lsdb_with(&[("n1", Some("udp://10.0.0.2:2222")), ("n2", Some("udp://10.0.0.3:3333"))]);
+        let static_src = StaticDiscovery::new([(peer("n1"), addr("10.0.0.1:1111"))]);
+        let db = lsdb_with(&[
+            ("n1", Some("udp://10.0.0.2:2222")),
+            ("n2", Some("udp://10.0.0.3:3333")),
+        ]);
         let agg = AggregateDiscovery::new(static_src, &db, mdns("self"));
         Discovery::resolve(&agg, &peer("n1")); // static + lsa
         Discovery::resolve(&agg, &peer("n2")); // lsa only

@@ -41,6 +41,10 @@ nexus-platform = { path = "../../crates/nexus-platform" }
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 toml = "0.8"
+# mDNS 组合根 socket 装配（bind 5353 + SO_REUSEADDR + 加入组播组）；
+# std 无法设置 SO_REUSEADDR。D-D-1 评审批准，仅限组合根（apps/nexus）使用，
+# nexus-discovery 保持零第三方依赖、零 I/O。
+socket2 = { version = "0.6", default-features = false }
 
 [dev-dependencies]
 # 仅示例/测试：本地 TLS server 自签证书（§11.14 E5 离线确定性闭环）。

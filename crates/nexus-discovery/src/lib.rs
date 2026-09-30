@@ -14,6 +14,8 @@ pub mod lsa;
 pub mod mdns;
 pub mod routing;
 
+pub use aggregate::AggregateDiscovery;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
@@ -205,9 +207,7 @@ impl DiscoveryMetrics {
     /// 读取当前计数快照。
     #[must_use]
     pub fn snapshot(&self) -> DiscoveryMetricsSnapshot {
-        let load = |a: &std::sync::atomic::AtomicU64| {
-            a.load(std::sync::atomic::Ordering::Relaxed)
-        };
+        let load = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
         DiscoveryMetricsSnapshot {
             hits_static: load(&self.hits_static),
             hits_lsa: load(&self.hits_lsa),

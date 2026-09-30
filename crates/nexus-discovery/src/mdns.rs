@@ -119,7 +119,9 @@ fn decode_name(buf: &[u8], pos: &mut usize) -> Option<String> {
             p += 1 + len;
         }
     }
-    *pos += consumed.unwrap_or(p - *pos);
+    // 注意：必须用 unwrap_or_else——unwrap_or 的参数是立即求值的，
+    // 指针跳转后 p < *pos，`p - *pos` 会下溢（即使 consumed 为 Some）。
+    *pos += consumed.unwrap_or_else(|| p - *pos);
     Some(out)
 }
 
@@ -267,11 +269,7 @@ fn sanitize_instance(peer_id: &str) -> Option<String> {
         s.truncate(32);
     }
     let s = s.trim_matches('-').to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    if s.is_empty() { None } else { Some(s) }
 }
 
 impl MdnsDiscovery {
@@ -547,28 +545,21 @@ mod tests {
 
     #[test]
     fn decode_name_handles_compression() {
-        // 手工构造带压缩指针的包：问题名后接指向它的指针。
-        let mut pkt = Vec::new();
-        put_u16(&mut pkt, 0);
-        put_u16(&mut pkt, FLAG_QR | FLAG_AA);
-        put_u16(&mut pkt, 0);
-        put_u16(&mut pkt, 1);
-        put_u16(&mut pkt, 0);
-        put_u16(&mut pkt, 0);
-        let name_off = pkt.len();
-        encode_name(&mut pkt, "nx-x._nexus._udp.local");
-        put_u16(&mut pkt, TYPE_A);
-        put_u16(&mut pkt, CLASS_IN);
-        put_u32(&mut pkt, MDNS_TTL_SECS);
-        put_u16(&mut pkt, 2 + 4); // RDLEN: 指针(2) + 4 字节
-        pkt.push(0xC0 | ((name_off >> 8) as u8));
-        pkt.push((name_off & 0xFF) as u8);
-        pkt.extend_from_slice(&[1, 2, 3, 4]);
-        let p = decode_packet(&pkt).expect("decode with compression");
-        assert!(p.is_response);
-        assert_eq!(p.answers.len(), 1);
-        assert_eq!(p.answers[0].name, "nx-x._nexus._udp.local");
-        assert!(matches!(p.answers[0].rdata, RData::A(_)));
+        // buffer：offset 0 处是完整域名，之后是一个指向 offset 0 的压缩指针。
+        let mut buf = Vec::new();
+        encode_name(&mut buf, "nx-x._nexus._udp.local");
+        let ptr_pos = buf.len();
+        buf.push(0xC0);
+        buf.push(0x00);
+        let mut pos = ptr_pos;
+        let name = decode_name(&buf, &mut pos).expect("decode with compression");
+        assert_eq!(name, "nx-x._nexus._udp.local");
+        assert_eq!(pos, ptr_pos + 2); // 指针只消费 2 字节。
+
+        // 自指指针循环必须有界终止（返回 None 而非死循环）。
+        let evil = vec![0xC0, 0x00];
+        let mut p = 0;
+        assert!(decode_name(&evil, &mut p).is_none());
     }
 
     #[test]
