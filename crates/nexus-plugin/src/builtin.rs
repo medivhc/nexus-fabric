@@ -59,6 +59,11 @@ impl ObfuscateTransport for PlainTransport {
 // ---------------------------------------------------------------------------
 
 /// `xor` 插件：按 `key[(pos+i) % key.len()]` 异或，读写位置独立计数。
+///
+/// 威胁模型声明（W3）：本插件只做**流量混淆**（反指纹、反被动探测），
+/// **不提供机密性**——无 nonce 的重复密钥流，读写双向共用同一 key 且都从
+/// 位置 0 起始；相同明文在相同位置产生相同密文。需要机密性的场景请用
+/// 传输层加密（如 QUIC/TLS），不要把本插件当作加密使用。
 pub struct XorTransport;
 
 pub struct XorStream {
@@ -99,7 +104,12 @@ impl Write for XorStream {
             let chunk_len = end - done;
             tmp[..chunk_len].copy_from_slice(&buf[done..end]);
             self.xor_in_place(self.wpos + done as u64, &mut tmp[..chunk_len]);
-            self.inner.write_all(&tmp[..chunk_len])?;
+            // W1：若某块写入失败，先推进已完整写入块的位置再返回 Err，
+            // 否则 keystream 位置不变量被破坏（调用方继续用该流会永久错位）。
+            if let Err(e) = self.inner.write_all(&tmp[..chunk_len]) {
+                self.wpos += done as u64;
+                return Err(e);
+            }
             done = end;
         }
         self.wpos += done as u64;

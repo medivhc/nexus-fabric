@@ -10,6 +10,11 @@ use std::sync::Arc;
 ///
 /// - `register()`：先做版本硬校验（S2），再查重名；失败的插件不进表。
 /// - 计数 `wrap_ok` / `wrap_err` 按插件名（S6）。
+///
+/// 并发说明（W2）：本类型非 `Sync`（`wrap` 为计数取 `&mut self`）。
+/// 预期用法是启动时单线程注册，运行时如需多线程共享则由调用方包
+/// `Mutex<PluginRegistry>`；`Arc<dyn ObfuscateTransport>` 本身是
+/// `Send + Sync`，取出来之后可脱离锁使用。
 pub struct PluginRegistry {
     plugins: HashMap<&'static str, Arc<dyn ObfuscateTransport>>,
     wrap_ok: HashMap<&'static str, u64>,
@@ -61,14 +66,18 @@ impl PluginRegistry {
     /// 用指定插件 `wrap` 一条流，并按插件名计数成功/失败（S6）。
     ///
     /// 失败时返回 `io::Error`，本层不自动回退（S4）；计数 `wrap_err` +1。
+    /// 注意：`stream` 是 move 进来的，`wrap` 失败时调用方**拿不回原流**——
+    /// 失败回退 = 重新拨一条新连接（C2）。
     pub fn wrap(
         &mut self,
         name: &str,
         stream: TcpStream,
         params: &ObfsParams,
     ) -> io::Result<Box<dyn ObfuscatedStream>> {
-        let plugin = match self.plugins.get(name) {
-            Some(p) => Arc::clone(p),
+        // C3：用 map 里存的 key（`&'static str`）做计数，避免二次调用
+        // `plugin.name()`（若某插件的 name() 非纯函数会错位）。
+        let (key, plugin) = match self.plugins.get_key_value(name) {
+            Some((k, p)) => (*k, Arc::clone(p)),
             None => {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
@@ -76,8 +85,7 @@ impl PluginRegistry {
                 ))
             }
         };
-        // `plugins.get` 的不可变借用已结束，现在可变借用计数器。
-        let key: &'static str = plugin.name();
+        // `plugins` 的不可变借用已结束，现在可变借用计数器。
         match plugin.wrap(stream, params) {
             Ok(s) => {
                 *self.wrap_ok.entry(key).or_insert(0) += 1;

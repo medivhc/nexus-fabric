@@ -113,15 +113,30 @@ fn run() -> Result<String, Outcome> {
 }
 
 fn main() {
-    // `--json` 为 E4 驱动约定的输出开关（本 example 只输出 JSON）。
-    let _json = std::env::args().any(|a| a == "--json");
+    // `--json` 为 E4 驱动约定的输出开关（C8）：带上输出机器可读 JSON，
+    // 不带输出人类可读摘要。
+    let json = std::env::args().any(|a| a == "--json");
     match run() {
-        Ok(out) => println!("{out}"),
+        Ok(out) => {
+            if json {
+                println!("{out}");
+            } else {
+                println!("plugin-obfs E4: PASS (wire_obfuscated=true, roundtrip_ok=true)");
+            }
+        }
         Err(Outcome::Skip(reason)) => {
-            println!("{{\"verdict\":\"SKIP\",\"reason\":{reason:?}}}");
+            if json {
+                println!("{{\"verdict\":\"SKIP\",\"reason\":{reason:?}}}");
+            } else {
+                println!("plugin-obfs E4: SKIP ({reason})");
+            }
         }
         Err(Outcome::Fail(reason)) => {
-            println!("{{\"verdict\":\"FAIL\",\"reason\":{reason:?}}}");
+            if json {
+                println!("{{\"verdict\":\"FAIL\",\"reason\":{reason:?}}}");
+            } else {
+                eprintln!("plugin-obfs E4: FAIL ({reason})");
+            }
             std::process::exit(1);
         }
     }
