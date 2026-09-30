@@ -151,7 +151,6 @@ impl FabricTransport {
             inbox_rx: Mutex::new(rx),
         }
     }
-
 }
 
 impl DatagramTransport for FabricTransport {
