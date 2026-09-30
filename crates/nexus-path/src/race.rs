@@ -113,30 +113,26 @@ pub fn race_connect(
     // Scoped threads: they may borrow `connector` and `ordered` from this
     // frame (no 'static required). The scope joins all threads on exit.
     thread::scope(|scope| {
-        let mut next_idx = 0usize;
+        let mut next_idx = 1usize; // 0 is launched immediately below
         let mut attempts = 0u32;
         let mut running = 0usize; // currently live attempt threads
         let mut last_error: Option<io::Error> = None;
+        let mut next_stagger_at;
 
-        // Launch one attempt for ordered[idx].
-        let mut launch = |idx: usize| {
+        // Start the first attempt immediately.
+        {
             let tx = tx.clone();
             let cancel = Arc::clone(&cancel);
-            let path = ordered[idx].clone();
-            // `connector` and `path` are borrowed/moved into the scoped thread.
+            let path = ordered[0].clone();
             scope.spawn(move || {
                 let res = connector.connect(&path, &cancel);
                 // If the race is over, the receiver may be gone; that's fine.
-                let _ = tx.send((idx, res));
+                let _ = tx.send((0, res));
             });
             running += 1;
             attempts += 1;
-        };
-
-        // Start the first attempt immediately.
-        launch(0);
-        next_idx = 1;
-        let mut next_stagger_at = start + Duration::from_millis(budget.stagger_delay_ms);
+            next_stagger_at = start + Duration::from_millis(budget.stagger_delay_ms);
+        }
 
         loop {
             let now = Instant::now();
@@ -149,7 +145,16 @@ pub fn race_connect(
                 && running < budget.max_parallel.max(1)
                 && now >= next_stagger_at
             {
-                launch(next_idx);
+                let idx = next_idx;
+                let tx = tx.clone();
+                let cancel = Arc::clone(&cancel);
+                let path = ordered[idx].clone();
+                scope.spawn(move || {
+                    let res = connector.connect(&path, &cancel);
+                    let _ = tx.send((idx, res));
+                });
+                running += 1;
+                attempts += 1;
                 next_idx += 1;
                 next_stagger_at = now + Duration::from_millis(budget.stagger_delay_ms);
             }
