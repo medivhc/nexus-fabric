@@ -1,0 +1,11 @@
+[package]
+name = "nexus-proxy-transport"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "QUIC over SOCKS5 CONNECT: length-prefixed framing over TCP, implements nexus-fabric UdpTransport (DESIGN §3.5)"
+
+[dependencies]
+nexus-fabric = { path = "../nexus-fabric" }
+
+[dev-dependencies]

@@ -38,6 +38,7 @@ members = [
   "crates/nexus-outbound-vmess",
   "crates/nexus-outbound-trojan",
   "crates/nexus-fabric",
+  "crates/nexus-proxy-transport",
   "crates/nexus-path",
   "crates/nexus-projection",
   "engineering/nexus-harness",
