@@ -592,13 +592,23 @@ impl Loop {
         // N1 E4 修复：优先尝试绑定到原地址（保留端口）。Listener 重绑到
         // 随机端口会导致对端按旧端口发送的包丢失；若原 IP 已不存在
         // （如 roam 后旧 IP 被删除），则回退到 wildcard。
+        // Server 必须保留端口（well-known），bind 失败则报错而非回退。
         let orig = *self.shared.local_addr.lock().unwrap();
+        let is_server = self.server_config.is_some();
         let sock: Box<dyn UdpTransport> = match StdUdpTransport::bind(orig) {
             Ok(s) => Box::new(s),
-            Err(_) => Box::new(
-                StdUdpTransport::bind("0.0.0.0:0".parse().unwrap())
-                    .map_err(|e| FabricError::Transport(e.to_string()))?,
-            ),
+            Err(e) => {
+                if is_server {
+                    return Err(FabricError::Transport(format!(
+                        "server rebind must preserve {orig}, bind failed: {e}"
+                    )));
+                }
+                // Client: 原 IP 已消失（如 roam），回退到 wildcard。
+                Box::new(
+                    StdUdpTransport::bind("0.0.0.0:0".parse().unwrap())
+                        .map_err(|e| FabricError::Transport(e.to_string()))?,
+                )
+            }
         };
         let addr = sock
             .local_addr()
