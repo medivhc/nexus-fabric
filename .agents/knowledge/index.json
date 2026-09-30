@@ -134,5 +134,13 @@
     "module": "nexus-platform-linux",
     "category": "implementation-pitfall",
     "summary": "unshare(CLONE_NEWNET) 后必须拉起 lo，否则 TUN 自身地址的 UDP 本地交付超时（send 成功 recv 超时）"
+  },
+  {
+    "id": "unwrap-or-eager-001",
+    "file": "entries/2026-09-30-unwrap-or-eager-eval.md",
+    "date": "2026-09-30",
+    "module": "nexus-discovery",
+    "category": "implementation-pitfall",
+    "summary": "Option::unwrap_or 参数立即求值：decode_name 压缩指针跳转后 p<*pos，`p - *pos` 下溢 panic；改 unwrap_or_else。ok_or 同理"
   }
 ]
