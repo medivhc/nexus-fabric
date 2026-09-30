@@ -656,6 +656,8 @@ impl Loop {
         } else {
             // Client：直接 wildcard 随机端口，保证新地址与旧的不同，
             // 触发对端 QUIC 被动迁移。端口保留非必需（迁移不依赖端口）。
+            // DIAG-V2: 确认新代码生效。
+            eprintln!("[fabric-diag] client rebind using 0.0.0.0:0 (v2)");
             Box::new(
                 StdUdpTransport::bind("0.0.0.0:0".parse().unwrap())
                     .map_err(|e| FabricError::Transport(e.to_string()))?,
