@@ -719,4 +719,24 @@ mod tests {
             "server must count unauthorized relay attempts"
         );
     }
+
+    /// Refresh 真实往返（T4）：allocate → refresh 成功续租，`is_expired()` 为
+    /// false；分配在 server 侧仍然有效（可继续 create_permission）。
+    #[test]
+    fn server_refresh_renews_allocation() {
+        let server = TurnServer::bind("127.0.0.1:0".parse().unwrap(), test_creds()).unwrap();
+        let saddr = server.main_addr();
+
+        let a = crate::TurnClient::allocate(saddr, test_creds()).unwrap();
+        assert!(!a.is_expired());
+
+        // refresh 成功：续租并更新 expires_at。
+        a.refresh().unwrap();
+        assert!(!a.is_expired());
+
+        // 续租后分配仍有效：permission 可建。
+        let b = crate::TurnClient::allocate(saddr, test_creds()).unwrap();
+        a.create_permission(b.relayed_addr()).unwrap();
+        b.create_permission(a.relayed_addr()).unwrap();
+    }
 }

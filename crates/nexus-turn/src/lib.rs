@@ -8,11 +8,11 @@
 //!
 //! 全同步 std API，零 tokio（T5）。
 
-pub mod auth;
+pub(crate) mod auth;
 pub mod client;
 pub mod server;
 pub mod socket;
-pub mod stun;
+pub(crate) mod stun;
 
 pub use client::{TurnClient, TurnCredentials, TurnStats};
 pub use server::TurnServer;

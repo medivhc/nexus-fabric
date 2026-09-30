@@ -44,6 +44,8 @@ RFC 5766 TURN 的最小可用实现（client + 自测用最小 server），为�
 **T1（最小子集）**：实现 RFC 5766 的 Allocate / Refresh / CreatePermission /
 ChannelBind / ChannelData / Send indication + 长效认证（HMAC-SHA1，
 key = MD5(username:realm:password)）。STUN 短期认证、TCP 中继后置。
+认证为双向：client 请求带 MI；server 响应（除 401 外）亦带 MI，client
+在 `transact()` 校验（RFC 5766 §2.2）。
 
 **T2（中继不解密）**：TURN 只中继 UDP 载荷，不触碰上层加密
 （`nexus-fabric` S1：中继节点只能看到密文）。
@@ -69,7 +71,22 @@ key = MD5(username:realm:password)）。STUN 短期认证、TCP 中继后置。
 ## Side Effects
 
 - UDP socket（直连 TURN server）。
-- 后台线程：可选的 refresh 保活（由调用方启停；Drop 时停止）。
+- 后台线程：`TurnServer` 的主循环线程（Drop 时停止并 join）。
+- 注意：`TurnClient` **没有**后台 refresh 保活线程；`refresh()` 需调用方显式
+  调用（当前 E4/路径层按需调用）。MODULE 旧文案“可选的 refresh 保活（由调用方
+  启停）”指的就是这个显式调用语义，不是后台线程。
+
+### 控制/数据面共享 socket 语义（WARN-4 说明）
+
+- `TurnClient` 的控制面（`transact`）与数据面（`TurnSocket::recv_from`，由
+  fabric driver 线程常驻调用）**共享同一个 UDP socket 和同一把锁**。
+- `transact` 持锁阻塞 `recv` 期间到达的 ChannelData 会被静默丢弃（QUIC 重传
+  恢复，属性能抖动非正确性问题）；反之 driver 持锁 `recv` 时到达的控制面
+  响应也会被丢弃（`recv_via_relay` 只处理 ChannelData/Data indication）。
+- 设计约束：同一时刻只允许一个控制面事务在途（`transact` 串行化）。若
+  refresh 响应恰在 driver 持锁时到达被丢弃，`transact` 会 3s 超时并标记分配
+  过期——窗口极窄（需与 driver 的 recv 精确交错），但语义上存在。后续如需
+  根治，应在 `transact` 中暂存 ChannelData 而非丢弃。
 
 ## Public API
 
@@ -96,6 +113,26 @@ key = MD5(username:realm:password)）。STUN 短期认证、TCP 中继后置。
 
 - 计数：`turn_allocations`, `turn_refreshed`, `turn_unauthorized_dropped`,
   `turn_relayed_bytes`, `turn_allocation_expired`.
+- **未计数的静默丢弃**（设计说明，非遗漏）：
+  - client 收到未知 channel 的 ChannelData → 丢弃（无计数；对端协议错误，
+    QUIC 层无感）。
+  - `transact` 收到 txn 不匹配的响应 → 丢弃（单事务在途，不应发生）。
+  - server 收到无分配源的 Send indication → 丢弃（无计数；未认证流量）。
+  - 上述三处若需可观测性，应加计数器（当前为有意省略，保持最小）。
+
+## 已知偏离与限制（诚实边界）
+
+- **权限粒度**：server 按 RFC 5766 以 IP 为单位记录 permission；client 侧
+  `TurnClient` 以 `SocketAddr`（IP:port）为单位做发送前检查（更严格，安全
+  方向）。两者语义有差异，但 client 侧只会更保守，不会导致误放行。
+- **401 stale-nonce**：`allocate` 收到 401 会自动提取 realm/nonce 重发一次；
+  `refresh` 收到 401 则直接标记分配过期（不重试）。自研 server 的 nonce 永不
+  变更，故 E4 不触发；对接第三方 TURN server 时若遇 nonce 轮换需调用方重新
+  `allocate`。
+- **Loopback 限制**：`TurnClient::allocate` 绑定 `127.0.0.1:0`，
+  `TurnServer` 的中继 socket 也绑定 `127.0.0.1:0`。作为通用 client API，
+  `TurnClient` 目前不支持绑定非 loopback 地址；`TurnServer` 明确仅用于自测
+  （见 Non-Responsibilities）。
 
 ## Recovery Semantics
 
