@@ -90,6 +90,13 @@ P0 不做：跨节点 Egress（3b-2）、域名规则（3b-3）、TCP NAT（依�
 **S12（Drop 可见）**：`RouteTarget::Drop` 的包丢弃并计数（`route_dropped`），
 不静默消失。
 
+**S13（跳数验证）**：接收侧在处理 egress 意图包之前必须验证跳数
+（意图位 bit 2-5）。跳数超过 `max_egress_hops`（默认 2）时丢弃并计数
+（`hop_limit_exceeded`），不转发、不入 NAT 表。防止 A→B→A 环路无限转发。
+
+**S14（NAT 表上限）**：`EgressNat` 表项数不超过 `max_entries`（默认 65536）。
+满时丢弃最旧表项（LRU）并计数（`nat_evicted`），保证新流不被洪水完全堵死。
+
 ## Side Effects
 
 - TUN 设备读写（`TunDevice::read` / `write`）。
@@ -103,6 +110,14 @@ pub trait TunDevice: Send {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>;
     fn write(&mut self, packet: &[u8]) -> io::Result<usize>;
     fn name(&self) -> &str;
+}
+
+/// 数据报传输抽象：按 peer 名发送/接收。实现由组装方注入
+/// （`apps/nexus` 用真实 FabricConn，测试用 mock）。
+/// Projection 永不直接依赖 nexus-fabric 的连接管理。
+pub trait DatagramTransport: Send + Sync {
+    fn send_to(&self, peer: &str, data: &[u8]) -> Result<(), TransportError>;
+    fn recv(&self) -> Option<(String, Vec<u8>)>;  // (from_peer, data)
 }
 
 /// 统一路由决策器：虚拟子网 fast path + 规则引擎。
