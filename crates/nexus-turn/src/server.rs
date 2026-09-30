@@ -254,6 +254,7 @@ fn send_success(
     let _ = main_sock.send_to(&bytes, src);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_error(
     main_sock: &UdpSocket,
     req: &stun::DecodedMessage,

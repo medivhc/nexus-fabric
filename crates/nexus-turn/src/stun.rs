@@ -63,6 +63,7 @@ pub const fn msg_type(method: u16, class: u8) -> u16 {
 }
 
 /// 从消息类型解出（方法，类）。
+#[allow(dead_code)]
 pub fn split_type(t: u16) -> (u16, u8) {
     // 方法位：u16 bit13..9（M11..M7）、bit7..5（M6..M4）、bit3..0（M3..M0）；
     // 注意 bit8（C1）与 bit4（C0）是类位，必须排除。
@@ -267,10 +268,6 @@ impl StunMessage {
         self
     }
 
-    pub fn get(&self, t: u16) -> Option<&Attribute> {
-        self.attrs.iter().find(|a| a.attr_type() == t)
-    }
-
     /// 编码（不带 MESSAGE-INTEGRITY 计算；MI 属性按原样写入）。
     pub fn encode(&self) -> Vec<u8> {
         let mut body = Vec::new();
@@ -303,6 +300,7 @@ pub struct DecodedMessage {
     /// MESSAGE-INTEGRITY 属性值在原始数据报中的字节偏移（无则为 None）。
     pub mi_value_offset: Option<usize>,
     /// 本次解码消费的字节数（头声明长度）。
+    #[allow(dead_code)]
     pub consumed: usize,
 }
 

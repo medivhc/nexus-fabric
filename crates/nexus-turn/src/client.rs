@@ -482,7 +482,7 @@ fn verify_response_integrity(raw: &[u8], key: &[u8]) -> bool {
         return false;
     }
     let mi_off = raw.len() - 20;
-    if &raw[mi_off - 4..mi_off] != &[0x00, 0x08, 0x00, 0x14] {
+    if raw[mi_off - 4..mi_off] != [0x00, 0x08, 0x00, 0x14] {
         return false;
     }
     verify_integrity(raw, mi_off, key)
