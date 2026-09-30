@@ -49,8 +49,8 @@ P0 不做：跨节点 Egress（3b-2）、域名规则（3b-3）、TCP NAT（依�
 
 - `tokio`, 任何 async runtime
 - `nexus-proxy`（旧规则引擎；新决策经 `nexus-domain::RuleEngine` trait）
-- 平台 TUN FFI（`TunDevice` trait 抽象；Linux 实现在 crate 内 `os::linux` 模块，
-  narrow unsafe，仿 `tun-dataplane` 纪律）
+- 手写平台 TUN FFI（用户决策 2026-09-30：用 `tun-rs` v2 跨平台库，
+  不重复造轮子。`TunDevice` trait 保留，`TunRsDevice` 包装 `tun-rs::SyncDevice`）
 
 ## Invariants
 
@@ -180,8 +180,11 @@ fabric 传输（E4 验证封装逻辑）；与 fabric 的真实接线是下一�
 ## Platform Constraints
 
 - `MockTun` 纯 std，无平台代码。
-- 真实 TUN（Linux `/dev/net/tun`）在 `os::linux` 模块，narrow unsafe；
-  P0 可以只给 trait + MockTun，真实实现后置（E5）。
+- 真实 TUN（E5）：用 `tun-rs` v2（sync API，`default-features = false`，
+  不启用 `async`/`async_io`）。跨平台：Linux/macOS/Windows/Android/iOS。
+  Windows 需 wintun.dll 随二进制分发；iOS/Android 用 `SyncDevice::from_fd`
+  接管系统给的 fd。
+- 引入 `tun-rs` 时需走依赖评审（license/security/portability），见 AGENTS.md §4。
 
 ## Deletion Test
 
