@@ -413,9 +413,12 @@ fn child_main(cfg: ChildCfg) -> Result<(), String> {
     let link_cfg = LinkConfig {
         probe_interval: PROBE_INTERVAL,
         heartbeat_timeout: HEARTBEAT_TIMEOUT,
-        // A 是 stationary 端：不主动 rebind，避免与 B 的迁移冲突；
-        // B 是 roam 端：需要 rebind 恢复。
-        enable_rebind: cfg.role != 'a',
+        // E4 配置：A/B 的 watcher 都不主动 rebind。
+        // A 是 stationary 端（本来就不 rebind）；B 在 ROAM 时由 E4 主动触发
+        // rebind（模拟 OS 网络变更通知），watcher 只做观测不上报动作，
+        // 避免主动 rebind 后旧流错误又触发 watcher 重复 rebind 打断 QUIC 迁移。
+        // watcher 的 reactive rebind 能力由单测覆盖（link::tests）。
+        enable_rebind: false,
     };
 
     if cfg.role == 'a' {
