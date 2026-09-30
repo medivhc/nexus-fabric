@@ -272,6 +272,9 @@ pub struct Projection {
 impl Projection {
     pub fn new(tun: Box<dyn TunDevice>, config: ProjectionConfig) -> Self {
         let transport = Arc::new(MockTransport::new("local"));
+        // Self-link: single-projection E4 (e.g. egress_basic) expects mesh
+        // packets to loop back, mirroring the 3b-1 mpsc loopback.
+        transport.link_peer("self", transport.inbox_sender());
         Self::new_inner(tun, config, transport.clone(), Some(transport), true)
     }
 
