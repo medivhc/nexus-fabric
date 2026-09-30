@@ -650,6 +650,10 @@ impl RealUdpEgress {
     }
 
     /// Bound addresses of live flow sockets (observability / E4 probing).
+    ///
+    /// NOTE: sockets are bound to the wildcard, so the returned addresses
+    /// may be `0.0.0.0:port`; replace the IP with a concrete local address
+    /// (e.g. loopback) before using one as a probe destination.
     pub fn socket_addrs(&self) -> Vec<SocketAddr> {
         lock(&self.sockets)
             .values()
@@ -1003,7 +1007,21 @@ mod tests {
     // limitation, not a code defect.
 
     use std::net::UdpSocket as TestUdpSocket;
+    use std::net::{IpAddr as TestIpAddr, Ipv4Addr as TestIpv4Addr, SocketAddr as TestSocketAddr};
     use std::thread as test_thread;
+
+    /// Replace a wildcard address with loopback so it is directly usable
+    /// as a probe destination.
+    fn concrete_addr(a: TestSocketAddr) -> TestSocketAddr {
+        if a.ip().is_unspecified() {
+            TestSocketAddr::new(
+                TestIpAddr::V4(TestIpv4Addr::new(127, 0, 0, 1)),
+                a.port(),
+            )
+        } else {
+            a
+        }
+    }
 
     /// Bind a loopback "internet" endpoint. Panics with a clear message if
     /// UDP is unavailable (so the failure is diagnosable, not silent).
@@ -1127,7 +1145,7 @@ mod tests {
         // Attacker socket (not the flow's peer) sends junk to the flow socket.
         let attacker = fake_internet();
         attacker
-            .send_to(b"junk-unmapped-probe", addrs[0])
+            .send_to(b"junk-unmapped-probe", concrete_addr(addrs[0]))
             .expect("probe send");
 
         poll_until(

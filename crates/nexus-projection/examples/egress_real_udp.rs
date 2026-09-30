@@ -24,7 +24,7 @@ use nexus_projection::{
     FlowKey, MockTun, Projection, ProjectionConfig, RouteTarget, Rule, SimpleRuleEngine,
     TunDevice, UnifiedRouter,
 };
-use std::net::UdpSocket;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -233,14 +233,19 @@ fn run() -> Result<(String, bool), String> {
     }
     let reply_bytes_match = replies_ok == N;
 
-    // 5. S19: unmapped probe dropped and counted.
+    // 5. S19: unmapped probe dropped and counted. Flow sockets are bound
+    // to the wildcard, so substitute loopback for the probe destination.
     let addrs = b.real_egress_socket_addrs();
     if addrs.is_empty() {
         return Err("B has no flow sockets for the unmapped probe".into());
     }
+    let mut target: SocketAddr = addrs[0];
+    if target.ip().is_unspecified() {
+        target.set_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+    }
     let attacker = UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("attacker bind: {e}"))?;
     attacker
-        .send_to(b"junk-unmapped-probe", addrs[0])
+        .send_to(b"junk-unmapped-probe", target)
         .map_err(|e| format!("probe send: {e}"))?;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
