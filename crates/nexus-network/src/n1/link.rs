@@ -171,13 +171,24 @@ impl LinkStateWatcher {
                     }
                     if last_pong.lock().unwrap().elapsed() > self.config.heartbeat_timeout {
                         self.recover("heartbeat timeout");
-                        // 恢复后重置基线，避免陈旧计时器立即再触发。
-                        *last_pong.lock().unwrap() = Instant::now();
+                        // FIX（rebind 死循环）：rebind 后旧 keepalive 流已不可靠
+                        // （对端迁移前它处于未知状态），必须丢弃并退出，由 watch()
+                        // 重开新流。继续复用旧流会导致"流错误→再 rebind"的死循环。
+                        break;
                     }
                 }
             }
         }
-        let _ = pinger.join();
+        // 回收 pinger：旧流错误时它会自行退出；若旧流侥幸存活导致阻塞，
+        // 超时后分离（它会在连接关闭时退出），避免阻塞恢复流程。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pinger.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        if pinger.is_finished() {
+            let _ = pinger.join();
+        }
+        // 未结束则 drop JoinHandle 分离线程（Rust drop JoinHandle = detach）。
     }
 
     /// 恢复：`discovery.resolve(peer)` → `conn.rebind()`，全程结构化事件上报。
