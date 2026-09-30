@@ -6,8 +6,10 @@
 //! production `PathLink::pump()` -> `FabricConn::rebind()`.
 //!
 //! Asserts: all bytes echoed (transfer uninterrupted), CID unchanged,
-//! and B observes A's new source port (real QUIC migration, not a purely
-//! logical switch).
+//! and A's UDP source port changed (real socket rebind, not a purely
+//! logical switch; the peer observes this as a remote-port change).
+//! Note: `ConnStats.active_path` is the endpoint's OWN local address
+//! (driver source), so the port change is observed A-side.
 //!
 //! Sandbox (UDP EPERM) -> {"verdict":"SKIP"}; any other failure -> FAIL.
 
@@ -115,7 +117,6 @@ fn main() {
 }
 
 struct BState {
-    conn: Option<FabricConn>,
     received: usize,
 }
 
@@ -137,10 +138,7 @@ fn run() -> Result<String, String> {
         .local_addr()
         .map_err(|e| format!("local_addr: {e}"))?;
 
-    let b_state = Arc::new(Mutex::new(BState {
-        conn: None,
-        received: 0,
-    }));
+    let b_state = Arc::new(Mutex::new(BState { received: 0 }));
     let b_done = Arc::new(AtomicBool::new(false));
     {
         let b_state = b_state.clone();
@@ -150,7 +148,6 @@ fn run() -> Result<String, String> {
                 Ok(c) => c,
                 Err(_) => return,
             };
-            b_state.lock().unwrap().conn = Some(conn.clone());
             // Echo exactly one bi stream until N bytes received.
             let (mut tx, mut rx) = match conn.accept_bi() {
                 Ok(s) => s,
@@ -184,22 +181,12 @@ fn run() -> Result<String, String> {
         Err(e) => return Err(format!("connect: {e}")),
     };
     let cid_before = conn_a.id();
-
-    // Wait for B to accept (for port observation).
-    let b_port_before = {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(conn) = b_state.lock().unwrap().conn.clone() {
-                if let Some(path) = conn.stats().active_path {
-                    break path.port();
-                }
-            }
-            if Instant::now() > deadline {
-                return Err("B never accepted / no active_path".to_string());
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    };
+    // A's own UDP source port before the switch (active_path = own local addr).
+    let a_port_before = conn_a
+        .stats()
+        .active_path
+        .map(|a| a.port())
+        .ok_or("no active_path after connect")?;
 
     // --- PathManager with two logical candidates ---
     let mut pm = PathManager::new(PathConfig {
@@ -315,20 +302,16 @@ fn run() -> Result<String, String> {
         ));
     }
 
-    // B must observe A's new source port (real QUIC migration).
+    // A's UDP source port must have changed: cmd_rebind swaps the socket
+    // synchronously and refreshes stats (the peer observes this as a
+    // remote-port change). This proves a real rebind, not a logical flip.
     let remote_port_changed = {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut changed = false;
         while Instant::now() < deadline {
-            let port_now = b_state
-                .lock()
-                .unwrap()
-                .conn
-                .clone()
-                .and_then(|c| c.stats().active_path)
-                .map(|a| a.port());
+            let port_now = conn_a.stats().active_path.map(|a| a.port());
             if let Some(p) = port_now {
-                if p != b_port_before {
+                if p != a_port_before {
                     changed = true;
                     break;
                 }
@@ -339,7 +322,7 @@ fn run() -> Result<String, String> {
     };
     if !remote_port_changed {
         return Err(format!(
-            "B never observed a source-port change (still {b_port_before})"
+            "A's source port never changed (still {a_port_before})"
         ));
     }
 
