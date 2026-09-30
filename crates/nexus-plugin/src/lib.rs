@@ -13,8 +13,8 @@ pub mod dial;
 pub mod registry;
 
 pub use dial::{
-    DialFailReason, dial_err_count, dial_ok_count, dial_with_obfs, global_registry,
-    init_builtin_plugins, wrap_stream,
+    dial_err_count, dial_ok_count, dial_with_obfs, global_registry, init_builtin_plugins,
+    wrap_stream, DialFailReason,
 };
 pub use registry::PluginRegistry;
 

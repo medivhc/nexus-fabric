@@ -35,9 +35,7 @@ pub fn init_builtin_plugins() {
 }
 
 fn lock_global() -> std::sync::MutexGuard<'static, PluginRegistry> {
-    global_registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    global_registry().lock().unwrap_or_else(|e| e.into_inner())
 }
 
 // ---------------------------------------------------------------------------
@@ -78,7 +76,9 @@ fn dial_err_map() -> &'static Mutex<HashMap<(String, String), u64>> {
     DIAL_ERR.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn lock_map<K, V>(m: &'static Mutex<HashMap<K, V>>) -> std::sync::MutexGuard<'static, HashMap<K, V>> {
+fn lock_map<K, V>(
+    m: &'static Mutex<HashMap<K, V>>,
+) -> std::sync::MutexGuard<'static, HashMap<K, V>> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -127,8 +127,8 @@ pub fn dial_with_obfs(
     obfs: Option<&str>,
     params: &ObfsParams,
 ) -> io::Result<Box<dyn ObfuscatedStream>> {
-    let stream = TcpStream::connect(addr)
-        .inspect_err(|_| incr_dial_err("-", DialFailReason::Connect))?;
+    let stream =
+        TcpStream::connect(addr).inspect_err(|_| incr_dial_err("-", DialFailReason::Connect))?;
     wrap_stream(stream, obfs, params)
 }
 
@@ -260,10 +260,6 @@ mod tests {
         init_builtin_plugins();
         init_builtin_plugins();
         // builtin 仍在（重复初始化不 panic、不重复注册）。
-        assert!(global_registry()
-            .lock()
-            .unwrap()
-            .names()
-            .contains(&"xor"));
+        assert!(global_registry().lock().unwrap().names().contains(&"xor"));
     }
 }

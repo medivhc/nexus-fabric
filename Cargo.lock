@@ -556,6 +556,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ca88d725a0a943b096803bd34e73a4437208b6077654cc4ecb2947a5f91618d"
 
 [[package]]
+name = "md5"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -672,6 +678,7 @@ dependencies = [
  "nexus-platform",
  "nexus-platform-linux",
  "nexus-platform-windows",
+ "nexus-plugin",
  "nexus-policy",
  "nexus-proxy",
  "nexus-proxy-config",
@@ -814,6 +821,7 @@ dependencies = [
  "chacha20poly1305",
  "hkdf",
  "nexus-connectivity",
+ "nexus-plugin",
  "sha2",
 ]
 
@@ -822,6 +830,7 @@ name = "nexus-outbound-trojan"
 version = "0.1.0"
 dependencies = [
  "nexus-connectivity",
+ "nexus-plugin",
  "rcgen",
  "rustls",
  "sha2",
@@ -902,6 +911,10 @@ version = "0.1.0"
 dependencies = [
  "nexus-platform",
 ]
+
+[[package]]
+name = "nexus-plugin"
+version = "0.1.0"
 
 [[package]]
 name = "nexus-policy"
@@ -991,6 +1004,16 @@ version = "0.1.0"
 dependencies = [
  "nexus-delivery",
  "nexus-platform",
+]
+
+[[package]]
+name = "nexus-turn"
+version = "0.1.0"
+dependencies = [
+ "hmac",
+ "md5",
+ "nexus-fabric",
+ "sha1",
 ]
 
 [[package]]
@@ -1423,6 +1446,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest",
 ]
 
 [[package]]
