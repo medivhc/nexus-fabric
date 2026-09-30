@@ -196,7 +196,7 @@ layer = "portable-core"
 
 [[crate]]
 name = "nexus-outbound-shadowsocks"
-allowed_internal_dependencies = ["nexus-connectivity"]
+allowed_internal_dependencies = ["nexus-connectivity", "nexus-plugin"]
 portable = false
 layer = "outbound"
 
@@ -208,7 +208,7 @@ layer = "outbound"
 
 [[crate]]
 name = "nexus-outbound-trojan"
-allowed_internal_dependencies = ["nexus-connectivity"]
+allowed_internal_dependencies = ["nexus-connectivity", "nexus-plugin"]
 portable = false
 layer = "outbound"
 

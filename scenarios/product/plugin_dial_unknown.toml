@@ -1,0 +1,27 @@
+schema_version = 1
+id = "product.plugin-dial-unknown"
+title = "插件接入真实拨号：未知插件名 → dial 直接失败（硬校验，不静默回退）"
+evidence_strength = "E4"
+requirement = "docs/foundation/DESIGN.md#7.3"
+
+[given]
+topology = "TcpListener（真机 127.0.0.1:0，仅用于提供可拨地址；不接受连接也行）；client 调 dial_with_obfs(obfs=Some(\"no-such-plugin\"))"
+packets = "无业务包：dial 必须在 wrap 阶段失败"
+
+# 可执行 E4：example 在真机跑：
+# - dial_with_obfs(server_addr, Some("no-such-plugin"), params) 必须返回 Err，
+#   且 err.kind() == ErrorKind::NotFound（P2/P3 硬校验）。
+# - 断言可观测：dial_err("-", "unknown_plugin") 或 dial_err("no-such-plugin",
+#   "unknown_plugin") 计数 == 1（P5）；dial_ok 计数 == 0。
+# - 关键：失败后不得有"回退到 plain 明文建连"的行为——本用例直接断言 dial
+#   返回 Err 即覆盖（回退意味着 Ok，此处 Ok 即 FAIL）。
+# - 只用公开 API + 可观测输出，无"上帝之手"。
+# - TCP loopback 不可用（沙箱）→ {"verdict":"SKIP","reason":"..."}，exit 0。
+# PASS 路径的字段由实现者在真机上验证；本 scenario 只门禁"不 FAIL"。
+[when]
+command = "cargo run --quiet -p nexus --example plugin_dial_unknown -- --json"
+
+# 冻结期望。
+[[expect]]
+field = "verdict"
+one_of = ["PASS", "SKIP"]

@@ -60,6 +60,11 @@
 **S6（可观测）**：`names()` 列出已注册插件；计数 `wrap_ok` / `wrap_err`
 （按插件名）。
 
+**S7（dial 方向独立）**：拨号集成对读/写方向使用独立的 wrapped handle；
+插件的 Read 变换与 Write 变换必须相互独立（不得在两个方向间共享可变
+状态）。单个 wrapped handle 只在单一方向上使用时，其变换位置从 0 开始
+连续（xor 的 rpos/wpos 模型）。违反此条的插件在 dial 集成下行为未定义。
+
 ## Side Effects
 
 - 无（纯内存注册表 + 流变换）。
@@ -96,6 +101,77 @@
 ## Platform Constraints
 
 - 纯 std + TCP，无平台相关代码。
+
+## Dial Wiring — 插件接入真实拨号（P1–P6）
+
+> 本期（二期）：把混淆插件接到 ss/trojan 的真实 outbound TCP dial 上。
+> 接线点唯一（P1）；失败语义延续 S4（不自动回退明文，防降级攻击）。
+
+### P1（统一接线点）
+
+`dial.rs` 提供两个同步 std 入口：
+
+- `dial_with_obfs(addr: SocketAddr, obfs: Option<&str>, params: &ObfsParams)
+  -> io::Result<Box<dyn ObfuscatedStream>>`
+  ＝ `wrap_stream(TcpStream::connect(addr)?, obfs, params)`。
+- `wrap_stream(stream: TcpStream, obfs: Option<&str>, params: &ObfsParams)
+  -> io::Result<Box<dyn ObfuscatedStream>>`
+  ＝ 在**全局注册表**按名查插件并 `wrap`；`obfs=None` → 用 `plain`
+  （零变换，直通）。
+
+拨号站点（`apps/nexus` 的 ss/trojan arm）从 `OutboundConfig` 取出
+`(obfs, obfs_key)` 后调用；本 crate 不感知 `OutboundConfig`
+（依赖倒置：出站侧依赖本 crate，本 crate 不反向依赖）。
+
+**方向独立 handle**：需要双向中继的拨号点必须先 `try_clone` 出独立的
+raw handle 再各自 `wrap_stream`——写方向的所有字节（握手/请求头 +
+中继数据）走同一个 wrapped handle，读方向走另一个；两个方向的变换位置
+各自从 0 开始连续、不交错（S7）。
+
+### P2（配置）
+
+`OutboundConfig` 新增（`nexus-proxy-config`）：
+- `obfs: Option<String>` — 插件名；`None` = plain 直通。
+- `obfs_key: Option<String>` — 插件参数 key（如 xor 的 key 材料）；
+  需要 key 的插件在 key 缺失/空时 `wrap` 失败（显式错误，不回退）。
+
+未知插件名 → `wrap_stream`/`dial_with_obfs` 返回
+`io::ErrorKind::NotFound`（dial 直接失败，硬校验，不静默回退）。
+
+### P3（失败语义）
+
+`dial_with_obfs` 任一步失败（connect / 未知插件 / wrap）→ 整个 dial 返回
+`io::Error`；**不自动回退到 plain**（S4 延续）。调用方（`apps/nexus`）
+映射为 `NexusError::ConnectivityEstablishmentFailed`。
+
+### P4（注册表接线）
+
+全局单例：`static GLOBAL: OnceLock<Mutex<PluginRegistry>>`；
+`global_registry() -> &'static Mutex<PluginRegistry>` 懒初始化并注册
+builtin（plain/xor）；二进制可在启动时显式调 `init_builtin_plugins()`
+（幂等）。`dial_with_obfs`/`wrap_stream` 内部取全局注册表。
+
+### P5（可观测）
+
+- `dial_ok(plugin) -> u64`：计数 `obfs_dial_ok{plugin}`。
+- `dial_err(plugin, reason) -> u64`：计数
+  `obfs_dial_err{plugin,reason}`，`reason ∈ {connect, unknown_plugin, wrap}`；
+  `plugin="-"` 表示 connect 阶段失败（尚无插件名）。
+- wrap 层复用注册表现有的 `wrap_ok`/`wrap_err`（S6）。
+
+### P6（零回归）
+
+`obfs=None` 时走 `plain`：逐字节直通；未配置 obfs 的现有 outbound
+行为逐字节一致（现有单测全过）。
+
+### 范围说明（诚实边界）
+
+- vmess：本期无真实 dial（`proxy_serve_once` 的 Vmess arm 仍为
+  `ConnectivityEstablishmentFailed`，data-plane deferred）；只加配置字段
+  （前向兼容），不接 dial。待 vmess 真实 dial 落地后再接。
+- UDP dial 混淆后置；dlopen 动态加载后置（仍是静态注册）；
+  规则引擎按策略选插件后置（只做 per-outbound 静态配置）。
+- E4 只有 Linux 真机（沙箱 TCP loopback 不可用 → SKIP）。
 
 ## Deletion Test
 
