@@ -105,7 +105,7 @@ fn main() {
         Box::new(SharedTun(tun.clone())),
         ProjectionConfig::default(),
     )
-    .with_router(Box::new(router));
+    .with_router(Arc::new(router));
 
     // 1. 50 UDP packets to the internet → Egress{self}.
     let egress_pkts: Vec<Vec<u8>> = (0..50)

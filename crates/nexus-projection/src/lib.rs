@@ -12,11 +12,19 @@
 //! [`MockTransport`] for tests/E4; [`FabricTransport`] wraps real
 //! `nexus-fabric::FabricConn` peers (3b-2).
 
+pub mod dns;
 pub mod egress;
 pub mod routing;
 pub mod transport;
 
-pub use egress::{DEFAULT_MAX_NAT_ENTRIES, EgressNat, FlowKey, NatStats, Rule, SimpleRuleEngine};
+pub use dns::{
+    DEFAULT_DNS_CACHE_ENTRIES, DNS_CACHE_TTL_CAP, DnsCache, DnsSniffer, DnsStats, Sniffed,
+    parse_dns_query, parse_dns_response,
+};
+pub use egress::{
+    DEFAULT_MAX_NAT_ENTRIES, DomainMatch, DomainRule, EgressNat, FlowKey, NatStats, Rule,
+    SimpleRuleEngine,
+};
 /// Re-exported domain types for unified routing (defined in `nexus-domain`,
 /// used — not modified — here).
 pub use nexus_domain::{RouteRequest, RouteTarget, RuleEngine};
@@ -190,14 +198,12 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// Classify a packet via the installed router, or default to mesh when
-/// no router is set (legacy raw path).
+/// no router is set (legacy raw path). Uses the packet-level entry so
+/// DNS-sniffing routers (3b-3, S15/S17) see every packet.
 fn classify(router_slot: &Arc<Mutex<Option<Arc<dyn Router>>>>, packet: &[u8]) -> RouteTarget {
     let guard = lock(router_slot);
     match guard.as_ref() {
-        Some(r) => r.route(&RouteRequest {
-            packet,
-            domain: None,
-        }),
+        Some(r) => r.route_packet(packet),
         None => RouteTarget::MeshPeer {
             peer: "legacy".to_string(),
         },
@@ -535,9 +541,9 @@ impl Projection {
 
     /// Install the unified router (builder). The already-spawned uplink
     /// thread and `send_packet` pick it up through the shared slot.
-    pub fn with_router(self, router: Box<dyn Router>) -> Self {
-        let arc: Arc<dyn Router> = router.into();
-        *lock(&self.router_slot) = Some(arc);
+    /// Takes `Arc` so drivers can keep a handle (e.g. for `dns_stats`).
+    pub fn with_router(self, router: Arc<dyn Router>) -> Self {
+        *lock(&self.router_slot) = Some(router);
         self
     }
 
@@ -887,7 +893,7 @@ mod tests {
     fn s9_s12_with_router_send_packet_routes() {
         let tun = Box::new(MockTun::default());
         let mut p = Projection::new_for_test(tun, ProjectionConfig::default())
-            .with_router(Box::new(test_router()));
+            .with_router(Arc::new(test_router()));
 
         // Egress{self}
         p.send_packet(&udp_pkt([8, 8, 8, 8], 1000, 53)).unwrap();
@@ -909,7 +915,7 @@ mod tests {
     fn s11_handle_egress_reply_matches() {
         let tun = Box::new(MockTun::default());
         let mut p = Projection::new_for_test(tun, ProjectionConfig::default())
-            .with_router(Box::new(test_router()));
+            .with_router(Arc::new(test_router()));
 
         let out = udp_pkt([8, 8, 8, 8], 2000, 53);
         p.send_packet(&out).unwrap();

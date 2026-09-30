@@ -160,7 +160,7 @@ fn run() -> Result<(String, bool), String> {
         }),
         ProjectionConfig::default(),
     )
-    .with_router(Box::new(router_a))
+    .with_router(Arc::new(router_a))
     .with_transport(transport_a);
 
     let b = Projection::new(
@@ -169,7 +169,7 @@ fn run() -> Result<(String, bool), String> {
         }),
         ProjectionConfig::default(),
     )
-    .with_router(Box::new(router_b))
+    .with_router(Arc::new(router_b))
     .with_transport(transport_b);
 
     const N: u32 = 30;

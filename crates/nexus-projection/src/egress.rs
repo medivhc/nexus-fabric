@@ -22,25 +22,141 @@ pub struct Rule {
     pub target: RouteTarget,
 }
 
+/// Domain match kind (3b-3, S16).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DomainMatch {
+    /// Exact hostname, e.g. `ads.example.com`.
+    Exact(String),
+    /// Suffix, e.g. `example.com` matches `www.example.com` and itself.
+    Suffix(String),
+    /// Substring, e.g. `ads` matches `ads-tracker.example.com`.
+    Keyword(String),
+}
+
+/// A domain → [`RouteTarget`] rule. Checked before IP rules (S16):
+/// exact > suffix > keyword; first added wins within a kind.
+#[derive(Debug, Clone)]
+pub struct DomainRule {
+    pub matcher: DomainMatch,
+    pub target: RouteTarget,
+}
+
+/// Normalize a domain for comparison: lowercase, no trailing dot.
+fn normalize_domain(d: &str) -> String {
+    d.trim().trim_end_matches('.').to_lowercase()
+}
+
+impl DomainMatch {
+    /// Does this matcher hit the (already normalized) domain?
+    fn matches(&self, domain: &str) -> bool {
+        match self {
+            DomainMatch::Exact(e) => domain == e,
+            DomainMatch::Suffix(s) => domain == s || domain.ends_with(&format!(".{s}")),
+            DomainMatch::Keyword(k) => domain.contains(k),
+        }
+    }
+
+    /// Priority rank for S16 ordering (lower = checked first).
+    fn rank(&self) -> u8 {
+        match self {
+            DomainMatch::Exact(_) => 0,
+            DomainMatch::Suffix(_) => 1,
+            DomainMatch::Keyword(_) => 2,
+        }
+    }
+}
+
 /// P0 minimal rule engine: ordered CIDR rules over the packet's IPv4
 /// destination. First match wins; no match (or unparsable packet) → `Drop`.
+///
+/// 3b-3: domain rules (`Exact`/`Suffix`/`Keyword`). When `req.domain` is
+/// `Some`, domain rules are consulted first (exact > suffix > keyword,
+/// S16); a domain miss falls back to the IP rules.
 pub struct SimpleRuleEngine {
     rules: Vec<Rule>,
+    domain_rules: Vec<DomainRule>,
 }
 
 impl SimpleRuleEngine {
     pub fn new(rules: Vec<Rule>) -> Self {
-        Self { rules }
+        Self {
+            rules,
+            domain_rules: Vec::new(),
+        }
     }
 
     /// Number of rules (observability).
     pub fn rule_count(&self) -> usize {
-        self.rules.len()
+        self.rules.len() + self.domain_rules.len()
+    }
+
+    /// Add a DOMAIN-SUFFIX rule (normalized; empty suffixes are ignored).
+    pub fn add_domain_suffix_rule(&mut self, suffix: &str, target: RouteTarget) {
+        let s = normalize_domain(suffix);
+        if s.is_empty() {
+            return;
+        }
+        self.domain_rules.push(DomainRule {
+            matcher: DomainMatch::Suffix(s),
+            target,
+        });
+    }
+
+    /// Add a DOMAIN (exact) rule.
+    pub fn add_domain_exact_rule(&mut self, domain: &str, target: RouteTarget) {
+        let d = normalize_domain(domain);
+        if d.is_empty() {
+            return;
+        }
+        self.domain_rules.push(DomainRule {
+            matcher: DomainMatch::Exact(d),
+            target,
+        });
+    }
+
+    /// Add a DOMAIN-KEYWORD rule.
+    pub fn add_domain_keyword_rule(&mut self, keyword: &str, target: RouteTarget) {
+        let k = normalize_domain(keyword);
+        if k.is_empty() {
+            return;
+        }
+        self.domain_rules.push(DomainRule {
+            matcher: DomainMatch::Keyword(k),
+            target,
+        });
+    }
+
+    /// Number of domain rules (observability).
+    pub fn domain_rule_count(&self) -> usize {
+        self.domain_rules.len()
+    }
+
+    /// Match domain rules only (S16 ordering). Returns `None` on miss.
+    fn match_domain(&self, domain: &str) -> Option<RouteTarget> {
+        let domain = normalize_domain(domain);
+        if domain.is_empty() {
+            return None;
+        }
+        for rank in 0..=2u8 {
+            for r in &self.domain_rules {
+                if r.matcher.rank() == rank && r.matcher.matches(&domain) {
+                    return Some(r.target.clone());
+                }
+            }
+        }
+        None
     }
 }
 
 impl RuleEngine for SimpleRuleEngine {
     fn decide(&self, req: &RouteRequest) -> RouteTarget {
+        // S16: domain rules take priority over IP rules.
+        if let Some(domain) = req.domain {
+            if let Some(target) = self.match_domain(domain) {
+                return target;
+            }
+            // Miss: fall through to IP rules.
+        }
         let dst = match parse_ipv4_dst(req.packet) {
             Some(d) => d,
             None => return RouteTarget::Drop,
@@ -399,5 +515,164 @@ mod tests {
         assert_eq!(nat.stats().reply_dropped, 0);
         let unknown = udp_packet([8, 8, 8, 8], [10, 0, 0, 1], 53, 9999);
         assert_eq!(nat.peek_reply(&unknown), None);
+    }
+
+    /// Engine with a domain suffix rule plus IP rules (S16 test fixture).
+    fn domain_engine() -> SimpleRuleEngine {
+        let mut e = SimpleRuleEngine::new(vec![
+            Rule {
+                cidr: "1.2.3.0/24".parse().unwrap(),
+                target: RouteTarget::Drop,
+            },
+            Rule {
+                cidr: "0.0.0.0/0".parse().unwrap(),
+                target: RouteTarget::Egress {
+                    peer: "self".to_string(),
+                },
+            },
+        ]);
+        e.add_domain_suffix_rule(
+            "blocked.example",
+            RouteTarget::Egress {
+                peer: "B".to_string(),
+            },
+        );
+        e
+    }
+
+    #[test]
+    fn s16_domain_suffix_beats_ip_rule() {
+        // dst 1.2.3.4 would Drop by IP rule, but the domain rule wins (S16).
+        let e = domain_engine();
+        let pkt = udp_packet([10, 0, 0, 1], [1, 2, 3, 4], 1234, 80);
+        let req = RouteRequest {
+            packet: &pkt,
+            domain: Some("www.blocked.example"),
+        };
+        assert_eq!(
+            e.decide(&req),
+            RouteTarget::Egress {
+                peer: "B".to_string()
+            }
+        );
+        // Suffix also matches the bare domain itself.
+        let req = RouteRequest {
+            packet: &pkt,
+            domain: Some("blocked.example"),
+        };
+        assert_eq!(
+            e.decide(&req),
+            RouteTarget::Egress {
+                peer: "B".to_string()
+            }
+        );
+        // ...but not a lookalike that merely shares a tail.
+        let req = RouteRequest {
+            packet: &pkt,
+            domain: Some("notblocked.example"),
+        };
+        assert_eq!(e.decide(&req), RouteTarget::Drop);
+    }
+
+    #[test]
+    fn s16_domain_no_match_falls_back_to_ip() {
+        let e = domain_engine();
+        // No domain rule for this host: IP rules decide (S16 fallback).
+        let pkt = udp_packet([10, 0, 0, 1], [8, 8, 8, 8], 1234, 80);
+        let req = RouteRequest {
+            packet: &pkt,
+            domain: Some("www.allowed.example"),
+        };
+        assert_eq!(
+            e.decide(&req),
+            RouteTarget::Egress {
+                peer: "self".to_string()
+            }
+        );
+        // domain=None behaves exactly like the old IP-only engine.
+        let req = RouteRequest {
+            packet: &pkt,
+            domain: None,
+        };
+        assert_eq!(
+            e.decide(&req),
+            RouteTarget::Egress {
+                peer: "self".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn s16_domain_kind_priority_exact_over_suffix_over_keyword() {
+        let mut e = SimpleRuleEngine::new(vec![]);
+        // All three kinds match www.ads.example.com; exact must win.
+        e.add_domain_keyword_rule("ads", RouteTarget::Drop);
+        e.add_domain_suffix_rule(
+            "example.com",
+            RouteTarget::Egress {
+                peer: "suffix".to_string(),
+            },
+        );
+        e.add_domain_exact_rule(
+            "www.ads.example.com",
+            RouteTarget::Egress {
+                peer: "exact".to_string(),
+            },
+        );
+        let pkt = udp_packet([10, 0, 0, 1], [8, 8, 8, 8], 1, 80);
+        let req = RouteRequest {
+            packet: &pkt,
+            domain: Some("www.ads.example.com"),
+        };
+        assert_eq!(
+            e.decide(&req),
+            RouteTarget::Egress {
+                peer: "exact".to_string()
+            }
+        );
+        // Suffix beats keyword for a host with no exact rule.
+        let req = RouteRequest {
+            packet: &pkt,
+            domain: Some("cdn.ads.example.com"),
+        };
+        assert_eq!(
+            e.decide(&req),
+            RouteTarget::Egress {
+                peer: "suffix".to_string()
+            }
+        );
+        // Keyword alone.
+        let req = RouteRequest {
+            packet: &pkt,
+            domain: Some("ads-tracker.other.net"),
+        };
+        assert_eq!(e.decide(&req), RouteTarget::Drop);
+    }
+
+    #[test]
+    fn s16_domain_matching_case_insensitive() {
+        let mut e = SimpleRuleEngine::new(vec![]);
+        e.add_domain_suffix_rule(
+            "Blocked.Example.",
+            RouteTarget::Egress {
+                peer: "B".to_string(),
+            },
+        );
+        assert_eq!(e.domain_rule_count(), 1);
+        let pkt = udp_packet([10, 0, 0, 1], [8, 8, 8, 8], 1, 80);
+        let req = RouteRequest {
+            packet: &pkt,
+            domain: Some("WWW.BLOCKED.EXAMPLE"),
+        };
+        assert_eq!(
+            e.decide(&req),
+            RouteTarget::Egress {
+                peer: "B".to_string()
+            }
+        );
+        // Empty matchers are ignored (never match-all).
+        e.add_domain_keyword_rule("", RouteTarget::Drop);
+        e.add_domain_suffix_rule(".", RouteTarget::Drop);
+        assert_eq!(e.domain_rule_count(), 1);
     }
 }
