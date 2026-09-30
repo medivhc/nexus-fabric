@@ -40,6 +40,7 @@ members = [
   "crates/nexus-fabric",
   "crates/nexus-path",
   "crates/nexus-projection",
+  "crates/nexus-plugin",
   "engineering/nexus-harness",
 ]
 
