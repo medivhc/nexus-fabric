@@ -4614,8 +4614,9 @@ pub fn proxy_serve_once(
                 }
             })?;
             let (nhost, nport) = split_host_port(&locator)?;
-            // §7.3 插件接线（P1）：obfs 包在 TLS 之下。先建 raw TCP 并设
-            // nonblocking（wrapped 流透传 WouldBlock），再 wrap；
+            // §7.3 插件接线（P1）：obfs 包在 TLS 之下。先建 raw TCP（保持 blocking，
+            // TLS 握手期间 rustls 用阻塞 I/O，提前 nonblocking 会导致 WouldBlock 硬失败），
+            // clone 一个 handle 留待握手后设 nonblocking（同 fd 共享 flag），再 wrap；
             // obfs=None → plain 直通（P6 零回归）。
             let raw = std::net::TcpStream::connect((nhost.as_str(), nport)).map_err(|e| {
                 NexusError::ConnectivityEstablishmentFailed {
@@ -4623,10 +4624,9 @@ pub fn proxy_serve_once(
                     reason: format!("trojan node connect {locator} failed: {e}"),
                 }
             })?;
-            raw.set_nonblocking(true)
-                .map_err(|e| NexusError::Internal {
-                    message: format!("trojan node nonblocking: {e}"),
-                })?;
+            let raw_nb = raw.try_clone().map_err(|e| NexusError::Internal {
+                message: format!("trojan node clone for nonblocking: {e}"),
+            })?;
             let obfs_params = nexus_plugin::ObfsParams {
                 key: selected.obfs_key.as_deref().unwrap_or("").as_bytes(),
             };
@@ -4736,7 +4736,13 @@ pub fn proxy_serve_once(
             // 双向透明中继：rustls ClientConnection 不可跨线程分裂，用非阻塞单线程
             // poll 在 client 与 TLS 之间搬运字节（loopback E4 小流量足够；本函数单线程
             // 闭环承担结构化并发，无泄漏 JoinHandle）。
-            // node 已在 wrap 前设为 nonblocking（见上）；wrapped 流透传 WouldBlock。
+            // node 在 TLS 握手完成后才设为 nonblocking（握手期间必须阻塞 I/O）；
+            // wrapped 流透传 WouldBlock。
+            raw_nb
+                .set_nonblocking(true)
+                .map_err(|e| NexusError::Internal {
+                    message: format!("trojan node nonblocking: {e}"),
+                })?;
             client
                 .set_nonblocking(true)
                 .map_err(|e| NexusError::Internal {
