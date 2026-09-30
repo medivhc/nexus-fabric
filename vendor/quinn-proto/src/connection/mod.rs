@@ -3053,10 +3053,23 @@ impl Connection {
             self.close = true;
         }
 
+        // 临时诊断：记录迁移检查的每个条件（E4 调试）。
+        if remote != self.path.remote {
+            eprintln!(
+                "[quinn-diag] migration check: remote={remote} != path.remote={} is_probing={is_probing_packet} number={number} rx_packet={}",
+                self.path.remote,
+                self.spaces[SpaceId::Data].rx_packet
+            );
+        }
         if remote != self.path.remote
             && !is_probing_packet
             && number == self.spaces[SpaceId::Data].rx_packet
         {
+            eprintln!(
+                "[quinn-diag] MIGRATION TRIGGERED: remote={remote} path.remote={} number={number} rx_packet={}",
+                self.path.remote,
+                self.spaces[SpaceId::Data].rx_packet
+            );
             let ConnectionSide::Server { ref server_config } = self.side else {
                 panic!("packets from unknown remote should be dropped by clients");
             };
