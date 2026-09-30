@@ -75,16 +75,11 @@ impl TunDevice for SharedTun {
 }
 
 fn main() {
-    let json = std::env::args().any(|a| a == "--json");
     let (report, pass) = match run() {
         Ok(r) => r,
         Err(e) => (format!("{{\"verdict\":\"FAIL\",\"detail\":\"{e}\"}}"), false),
     };
-    if json {
-        println!("{report}");
-    } else {
-        println!("{report}");
-    }
+    println!("{report}");
     if !pass {
         std::process::exit(1);
     }
