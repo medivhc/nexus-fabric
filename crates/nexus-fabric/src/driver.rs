@@ -603,11 +603,18 @@ impl Loop {
                         "server rebind must preserve {orig}, bind failed: {e}"
                     )));
                 }
-                // Client: 原 IP 已消失（如 roam），回退到 wildcard。
-                Box::new(
-                    StdUdpTransport::bind("0.0.0.0:0".parse().unwrap())
-                        .map_err(|e| FabricError::Transport(e.to_string()))?,
-                )
+                // Client: 原 IP 已消失（如 roam）。先尝试保留端口的 wildcard
+                // （仅 IP 迁移，端口不变，QUIC 迁移更简单）；若端口也被占用，
+                // 再回退到完全随机端口。
+                let wildcard_port: std::net::SocketAddr =
+                    format!("0.0.0.0:{}", orig.port()).parse().unwrap();
+                match StdUdpTransport::bind(wildcard_port) {
+                    Ok(s) => Box::new(s),
+                    Err(_) => Box::new(
+                        StdUdpTransport::bind("0.0.0.0:0".parse().unwrap())
+                            .map_err(|e| FabricError::Transport(e.to_string()))?,
+                    ),
+                }
             }
         };
         let addr = sock
