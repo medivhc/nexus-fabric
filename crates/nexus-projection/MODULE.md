@@ -13,7 +13,8 @@
 P0 不做：TCP NAT（依赖 L4 中继）、
 语义入口（§6.2）、进程 QoS（§6.3）。
 3b-2（跨节点 Egress + 跳数防环 + NAT 上限）已完成。
-3b-3（域名规则：DNS 嗅探 + 域名→出口映射 + 解析缓存）进行中。
+3b-3（域名规则：DNS 嗅探 + 域名→出口映射 + 解析缓存）已完成。
+3b-4（真实 UDP Egress：egress 节点真实 socket + 回包反向 NAT）进行中。
 
 ## Non-Responsibilities
 
@@ -24,7 +25,8 @@ P0 不做：TCP NAT（依赖 L4 中继）、
   被 `RouteTarget` 取代）。
 - 不做 QUIC 传输（`nexus-fabric`）、路径选择（`nexus-path`）。
 - 不做跨节点 Egress（3b-2，已完成）。
-- 3b-3 做域名规则（DNS 嗅探 + 域名→出口映射 + 解析缓存）。
+- 3b-3 做域名规则（DNS 嗅探 + 域名→出口映射 + 解析缓存，已完成）。
+- 3b-4 做真实 UDP Egress（egress 节点真实 socket + 回包反向 NAT）。
 
 ## Inputs
 
@@ -115,6 +117,19 @@ P0 不做：TCP NAT（依赖 L4 中继）、
 4096 项，满时驱逐最旧并计数（`dns_cache_evicted`）。DNS 响应包本身按查询
 域名的规则决策（保证查询与响应路径一致）。
 
+**S18（真实 socket 发送）**：egress 节点收到 egress 意图包后，经真实
+`UdpSocket` 把 UDP 载荷发往互联网目标（源地址为 egress 节点）。发送失败
+计数（`egress_send_failed`），不 panic；NAT 记录已建则保留（重传可达）。
+P0 只处理 UDP；TCP 包到达真实 egress 时丢弃并计数（`egress_tcp_dropped`）。
+
+**S19（回包反向 NAT）**：socket 收到的回包必须经 NAT 表反查到源 peer；
+无映射的包丢弃并计数（`reply_dropped` 复用 S11），不盲目转发、不猜测目标。
+回包经 transport 发回源 peer，意图位为 mesh（非 egress）。
+
+**S20（Socket 生命周期）**：`UdpSocket` 由 egress 模块拥有，随 `Projection`
+创建而绑定、随 `close()`/`Drop` 而关闭；接收线程阻塞在 `recv_from`，
+关闭时通过 socket 关闭唤醒并 join。线程只持有 Arc clone，不阻止 Drop。
+
 ## Side Effects
 
 - TUN 设备读写（`TunDevice::read` / `write`）。
@@ -153,6 +168,10 @@ pub struct DnsSniffer { /* ... */ }
 
 /// 域名→IP 解析缓存：TTL + 容量上限（S17）。
 pub struct DnsCache { /* ... */ }
+
+/// 真实 UDP 出口：拥有一个 `UdpSocket`，把 egress 意图包的 UDP 载荷发往
+/// 互联网，并把回包反向 NAT 后交回 transport（S18/S19/S20）。
+pub struct RealUdpEgress { /* ... */ }
 
 /// 本地出口 UDP NAT（Egress{self}）。
 pub struct EgressNat { /* ... */ }
@@ -203,10 +222,15 @@ fabric 传输（E4 验证封装逻辑）；与 fabric 的真实接线是下一�
 - E4: `product.fabric-egress-domain`（3b-3：DNS 查询嗅探 → 域名规则命中 →
   Egress{peer}；DNS 响应建缓存；后续发往解析 IP 的包继承域名决策；
   域名无命中回退 IP 规则；嗅探失败不丢包）
+- E4: `product.fabric-egress-real-udp`（3b-4：A 经 Egress{B} 发 UDP 包 →
+  B 经真实 socket 发往本地 echo 服务器 → 回包经 B 的 NAT 反查 →
+  transport 发回 A → A 的 TUN 收到回包；无 mock 回包）
 - 单元测试：S1 包完整、S5 超大包丢弃计数、S2 意图位开销、S9 路由确定性、
   S10 虚拟子网优先、S11 NAT 回包、S12 Drop 计数、S13 跳数验证、S14 NAT 上限、
   S15 DNS 嗅探无损（坏包/非 DNS 不丢包）、S16 域名优先（域名命中覆盖 IP 规则、
   无命中回退）、S17 解析缓存（响应建缓存、TTL 失效、容量驱逐、后续包继承）、
+  S18 真实 socket 发送（发送失败计数不 panic、TCP 丢弃计数）、S19 回包反向
+  NAT（无映射丢弃计数）、S20 socket 生命周期（close 关闭并 join 线程）、
   MockTun 集成
 
 ## Performance Budget

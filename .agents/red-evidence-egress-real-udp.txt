@@ -1,0 +1,45 @@
+RED EVIDENCE — Phase 3b-4 真实 UDP Egress (feature/egress-real-udp)
+================================================================
+Date: 2026-09-30
+Contract: S18 (真实 socket 发送), S19 (回包反向 NAT), S20 (Socket 生命周期)
+
+## Scenario: product.fabric-egress-real-udp → BLOCKED
+
+$ nexus-harness verify --scenario product.fabric-egress-real-udp
+Result: BLOCKED — example `egress_real_udp` 不存在：
+
+error: no example target named `egress_real_udp` in `nexus-projection`
+
+## Unit tests (TDD Red): 以下测试在实现前全部 FAIL（编译失败/缺失）
+
+1. `egress::tests::real_egress_sends_via_socket` (S18)
+   → FAIL: `RealUdpEgress` 不存在
+
+2. `egress::tests::real_egress_send_failure_counted` (S18)
+   → FAIL: 同上
+
+3. `egress::tests::real_egress_reply_reverse_nat` (S19)
+   → FAIL: 同上
+
+4. `egress::tests::real_egress_unmapped_reply_dropped` (S19)
+   → FAIL: 同上
+
+5. `egress::tests::real_egress_tcp_dropped` (S18)
+   → FAIL: 同上
+
+6. `egress::tests::real_egress_close_joins_thread` (S20)
+   → FAIL: 同上
+
+## 现状确认（互联网侧仍是 mock）
+
+`crates/nexus-projection/src/lib.rs` downlink egress 分支注释：
+"We are the egress node: track the flow so replies route back to the
+origin peer (S11). Production forwards `pkt` to a real internet
+socket here; E4 drives replies via `handle_egress_reply`."
+
+`handle_egress_reply` 是 mock，本 phase 将其替换为真实 socket 路径。
+
+## Contract Hash (frozen, 2026-09-30)
+
+场景文件: scenarios/product/fabric_egress_real_udp.toml (新建)
+MODULE.md: S18/S19/S20 已写入
