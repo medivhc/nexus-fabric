@@ -250,7 +250,7 @@ fn run() -> Result<(String, bool), String> {
 
     let verdict = sent == N
         && a_route.egress_remote == N as u64
-        && b_handled == N
+        && b_handled == N as u64
         && b_nat_stats.egress_handled == N as u64
         && b_forwarded == N
         && a_nat.reply_received == N as u64
