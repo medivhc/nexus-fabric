@@ -180,7 +180,7 @@ fn main() {
                 "\"echo\":{{\"udp_ok\":{}}},",
                 "\"idempotent\":{{\"no_dup_addrs\":{},\"no_dup_routes\":{}}},",
                 "\"dry_run\":{{\"zero_netlink_writes\":{}}},",
-                "\"cleanup\":{{\"addrs_removed\":{},\"routes_removed\":{}}}"
+                "\"cleanup\":{{\"addrs_removed\":{},\"routes_removed\":{}}}}}"
             ),
             netns_isolated,
             addr_assigned,
