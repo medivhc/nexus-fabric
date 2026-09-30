@@ -10,8 +10,9 @@
    （`MeshPeer` / `Egress` / `Drop`），Clash TUN 与 EasyTier TUN 在此融合。
 3. **本地出口 NAT**（Phase 3b-1 新增）：`Egress{self}` 的 UDP NAT（含连接跟踪）。
 
-P0 不做：跨节点 Egress（3b-2）、域名规则（3b-3）、TCP NAT（依赖 L4 中继）、
+P0 不做：域名规则（3b-3）、TCP NAT（依赖 L4 中继）、
 语义入口（§6.2）、进程 QoS（§6.3）。
+3b-2（跨节点 Egress + 跳数防环 + NAT 上限）已完成。
 
 ## Non-Responsibilities
 
@@ -95,7 +96,7 @@ P0 不做：跨节点 Egress（3b-2）、域名规则（3b-3）、TCP NAT（依�
 （`hop_limit_exceeded`），不转发、不入 NAT 表。防止 A→B→A 环路无限转发。
 
 **S14（NAT 表上限）**：`EgressNat` 表项数不超过 `max_entries`（默认 65536）。
-满时丢弃最旧表项（LRU）并计数（`nat_evicted`），保证新流不被洪水完全堵死。
+满时丢弃最旧表项（LRU）并计数（`evicted`），保证新流不被洪水完全堵死。
 
 ## Side Effects
 

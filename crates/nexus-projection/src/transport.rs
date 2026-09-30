@@ -74,11 +74,6 @@ impl MockTransport {
         }
     }
 
-    /// This transport's name (used as the origin tag on send).
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
     /// Register `peer_name`'s inbox (test/E4 wiring).
     pub fn link_peer(&self, peer_name: &str, peer_inbox: mpsc::Sender<(String, Vec<u8>)>) {
         lock(&self.peers).insert(peer_name.to_string(), peer_inbox);
@@ -157,10 +152,6 @@ impl FabricTransport {
         }
     }
 
-    /// Number of peer connections.
-    pub fn peer_count(&self) -> usize {
-        self.conns.len()
-    }
 }
 
 impl DatagramTransport for FabricTransport {
