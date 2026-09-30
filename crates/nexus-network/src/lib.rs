@@ -9,6 +9,13 @@
 /// 稳定模块标识；业务实现应通过公开类型/trait 增量加入，而不是扩大隐式全局状态。
 pub const NEXUS_NETWORK_MODULE: &str = "nexus-network";
 
+/// N1 Universal Connectivity 装配（portable core，M1–M7）。
+///
+/// 契约见同目录 `MODULE.md` "N1 Universal Connectivity 装配契约"一节。
+/// 本模块只经注入 trait 消费 fabric/path/discovery/platform 实现，
+/// 不新增架构边（Deletion Test 见 MODULE.md）。
+pub mod n1;
+
 /// 返回模块的人类可读职责摘要。
 #[must_use]
 pub const fn module_summary() -> &'static str {

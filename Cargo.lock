@@ -811,6 +811,7 @@ dependencies = [
  "nexus-dns",
  "nexus-domain",
  "nexus-planner",
+ "nexus-platform",
  "nexus-policy",
  "nexus-session",
 ]
