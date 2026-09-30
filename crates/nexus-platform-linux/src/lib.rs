@@ -18,6 +18,8 @@ pub mod daemon;
 pub mod dns;
 /// netlink 窄绑定（socket + RTM_NEWADDR/GETADDR/NEWROUTE/DELROUTE/GETROUTE）。
 pub mod netlink;
+/// OS 装配操作日志（O6）。
+pub mod op_log;
 /// 路由表事务性装配（快照/apply/rollback）。
 pub mod route;
 pub mod secure_store;

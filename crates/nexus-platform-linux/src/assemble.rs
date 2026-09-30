@@ -10,6 +10,7 @@ use nexus_platform::PlatformError;
 
 use crate::addr::{AssignOutcome, assign_addr, remove_addr};
 use crate::netlink::{NlSocket, ifname_to_index};
+use crate::op_log::OpLog;
 use crate::route::{ApplyReport, NetworkSnapshot, RoutePlan, nl_err};
 
 /// OS 装配配置。
@@ -27,6 +28,8 @@ pub struct OsAssembleConfig {
     pub default_route: bool,
     /// 干跑模式（O4：零 netlink 写）。
     pub dry_run: bool,
+    /// 操作日志路径（O6）；`None` → 当前目录 `os_assemble.log`。
+    pub log_path: Option<std::path::PathBuf>,
 }
 
 /// 清理报告（O6 可观测）。
@@ -45,6 +48,7 @@ pub struct OsAssemble {
     added_addr: bool,
     added_subnet_route: bool,
     added_default_route: bool,
+    op_log: OpLog,
 }
 
 impl OsAssemble {
@@ -56,12 +60,14 @@ impl OsAssemble {
                 key: format!("interface {}", config.ifname),
             });
         }
+        let op_log = OpLog::new(config.log_path.clone());
         Ok(OsAssemble {
             config,
             ifindex,
             added_addr: false,
             added_subnet_route: false,
             added_default_route: false,
+            op_log,
         })
     }
 
@@ -70,6 +76,24 @@ impl OsAssemble {
     /// 2. �等加地址、子网路由、（可选）默认路由；
     /// 3. 任一步失败 → rollback 到快照。
     pub fn apply(&mut self) -> Result<ApplyReport, PlatformError> {
+        let ip_str = format!(
+            "{}.{}.{}.{}",
+            self.config.tun_ip[0],
+            self.config.tun_ip[1],
+            self.config.tun_ip[2],
+            self.config.tun_ip[3]
+        );
+        self.op_log.log(
+            "apply_start",
+            &[
+                ("ifname", &self.config.ifname),
+                ("tun_ip", &ip_str),
+                (
+                    "dry_run",
+                    if self.config.dry_run { "true" } else { "false" },
+                ),
+            ],
+        );
         let before = self.snapshot()?;
         let plan = RoutePlan {
             ifname: self.config.ifname.clone(),
@@ -81,7 +105,12 @@ impl OsAssemble {
         };
 
         if self.config.dry_run {
-            return crate::route::apply(&plan, true);
+            let report = crate::route::apply(&plan, true);
+            self.op_log.log(
+                "apply_dry_run",
+                &[("ifname", &self.config.ifname), ("result", "ok")],
+            );
+            return report;
         }
 
         // 地址（�等）。
@@ -90,9 +119,26 @@ impl OsAssemble {
             self.config.tun_ip,
             self.config.prefixlen,
         ) {
-            Ok(AssignOutcome::Added) => self.added_addr = true,
-            Ok(AssignOutcome::AlreadyPresent) => {}
-            Err(e) => return Err(e),
+            Ok(AssignOutcome::Added) => {
+                self.added_addr = true;
+                self.op_log.log(
+                    "addr_added",
+                    &[("ifname", &self.config.ifname), ("ip", &ip_str)],
+                );
+            }
+            Ok(AssignOutcome::AlreadyPresent) => {
+                self.op_log.log(
+                    "addr_skipped",
+                    &[("ifname", &self.config.ifname), ("ip", &ip_str)],
+                );
+            }
+            Err(e) => {
+                self.op_log.log(
+                    "apply_failed",
+                    &[("ifname", &self.config.ifname), ("stage", "assign_addr")],
+                );
+                return Err(e);
+            }
         }
 
         // 路由（�等 + 失败 rollback）。
@@ -108,14 +154,25 @@ impl OsAssemble {
             let exists = routes
                 .iter()
                 .any(|r| r.dst == dst && r.oif == self.ifindex && r.gateway.is_none());
+            let dst_str = dst
+                .map(|(ip, plen)| format!("{}.{}.{}.{}/{}", ip[0], ip[1], ip[2], ip[3], plen))
+                .unwrap_or_else(|| "default".to_string());
             if exists {
                 report.routes_skipped += 1;
+                self.op_log.log(
+                    "route_skipped",
+                    &[("ifname", &self.config.ifname), ("dst", &dst_str)],
+                );
                 return Ok(());
             }
             nl.new_route(dst, self.ifindex, None)
                 .map_err(nl_err("add route"))?;
             *added_flag = true;
             report.routes_added += 1;
+            self.op_log.log(
+                "route_added",
+                &[("ifname", &self.config.ifname), ("dst", &dst_str)],
+            );
             Ok(())
         };
 
@@ -133,6 +190,10 @@ impl OsAssemble {
         })();
 
         if let Err(e) = result {
+            self.op_log.log(
+                "apply_failed",
+                &[("ifname", &self.config.ifname), ("stage", "apply_route")],
+            );
             // O1：回滚地址（路由还没加或已回滚逻辑内）。
             if self.added_addr {
                 let _ = remove_addr(
@@ -141,23 +202,41 @@ impl OsAssemble {
                     self.config.prefixlen,
                 );
                 self.added_addr = false;
+                self.op_log
+                    .log("rollback_addr_removed", &[("ifname", &self.config.ifname)]);
             }
+            self.op_log
+                .log("rollback_start", &[("ifname", &self.config.ifname)]);
             if let Err(rb_err) = crate::route::rollback(&before) {
+                self.op_log
+                    .log("rollback_failed", &[("ifname", &self.config.ifname)]);
                 return Err(PlatformError::Io {
                     operation: "os assemble rollback".into(),
                     message: format!("apply failed: {e}; rollback ALSO failed: {rb_err}"),
                 });
             }
+            self.op_log
+                .log("rollback_done", &[("ifname", &self.config.ifname)]);
             return Err(e);
         }
 
         report.addrs_added = u32::from(self.added_addr);
         report.addrs_skipped = u32::from(!self.added_addr);
+        self.op_log.log(
+            "apply_done",
+            &[
+                ("ifname", &self.config.ifname),
+                ("addrs_added", &report.addrs_added.to_string()),
+                ("routes_added", &report.routes_added.to_string()),
+            ],
+        );
         Ok(report)
     }
 
     /// 清理本实例创建的条目（�等，O2）。
     pub fn cleanup(&mut self) -> Result<CleanupReport, PlatformError> {
+        self.op_log
+            .log("cleanup_start", &[("ifname", &self.config.ifname)]);
         let mut report = CleanupReport::default();
         let mut nl = NlSocket::open().map_err(nl_err("open netlink"))?;
 
@@ -170,6 +249,10 @@ impl OsAssemble {
                 nl.del_route(None, self.ifindex, None)
                     .map_err(nl_err("delete default route"))?;
                 report.routes_removed += 1;
+                self.op_log.log(
+                    "route_removed",
+                    &[("ifname", &self.config.ifname), ("dst", "default")],
+                );
             }
             self.added_default_route = false;
         }
@@ -182,6 +265,12 @@ impl OsAssemble {
                 nl.del_route(Some(self.config.subnet), self.ifindex, None)
                     .map_err(nl_err("delete subnet route"))?;
                 report.routes_removed += 1;
+                let (ip, plen) = self.config.subnet;
+                let dst = format!("{}.{}.{}.{}/{}", ip[0], ip[1], ip[2], ip[3], plen);
+                self.op_log.log(
+                    "route_removed",
+                    &[("ifname", &self.config.ifname), ("dst", &dst)],
+                );
             }
             self.added_subnet_route = false;
         }
@@ -193,7 +282,17 @@ impl OsAssemble {
             )?;
             report.addrs_removed += 1;
             self.added_addr = false;
+            self.op_log
+                .log("addr_removed", &[("ifname", &self.config.ifname)]);
         }
+        self.op_log.log(
+            "cleanup_done",
+            &[
+                ("ifname", &self.config.ifname),
+                ("addrs_removed", &report.addrs_removed.to_string()),
+                ("routes_removed", &report.routes_removed.to_string()),
+            ],
+        );
         Ok(report)
     }
 
@@ -222,6 +321,7 @@ mod tests {
             subnet: ([10, 99, 0, 0], 24),
             default_route: false,
             dry_run: true,
+            log_path: None,
         };
         let r = OsAssemble::new(config);
         assert!(matches!(r, Err(PlatformError::NotFound { .. })));
@@ -236,6 +336,7 @@ mod tests {
             subnet: ([10, 99, 0, 0], 24),
             default_route: false,
             dry_run: true,
+            log_path: Some(std::env::temp_dir().join("os-assemble-test.log")),
         };
         let mut asm = OsAssemble::new(config).expect("lo exists");
         let report = asm.apply().expect("dry-run");

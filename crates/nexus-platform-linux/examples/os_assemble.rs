@@ -3,7 +3,9 @@
 //! 安全红线：内部 `unshare(CLONE_NEWNET)` 进隔离 netns，**绝不动主网络**。
 //! 无 `CAP_SYS_ADMIN` 时输出 `{"verdict":"SKIP",...}`。
 //!
-//! 只调生产 API（`OsAssemble::apply` / `cleanup`），不用手写 netlink 补状态。
+//! 装配语义只走生产 API（`OsAssemble::apply` / `cleanup`）；
+//! 链路拉起（`set_link_up`）与 TUN 建设备是 E4 fixture（测试环境准备），
+//! 不属于被测的 OS 装配语义。
 
 use std::ffi::c_int;
 use std::net::UdpSocket;
@@ -91,6 +93,7 @@ fn main() {
         subnet: SUBNET,
         default_route: false,
         dry_run: false,
+        log_path: None,
     };
     let mut asm = match OsAssemble::new(config) {
         Ok(a) => a,
@@ -139,6 +142,7 @@ fn main() {
         subnet: SUBNET,
         default_route: false,
         dry_run: true,
+        log_path: None,
     };
     let mut dry_asm = match OsAssemble::new(dry_config) {
         Ok(a) => a,
