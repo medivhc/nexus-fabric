@@ -1,0 +1,46 @@
+RED EVIDENCE — Phase 4b TURN relay (feature/turn-relay)
+================================================================
+Date: 2026-09-30
+Contract: nexus-turn T1–T6 + nexus-fabric S9
+
+## Scenario: product.fabric-turn-relay → BLOCKED
+
+$ cargo run -p nexus-turn --example turn_relay
+Result: BLOCKED — crate `nexus-turn` 只有 Cargo.toml 空壳：
+
+error: no example target named `turn_relay` in `nexus-turn`
+
+## Unit tests (TDD Red): 以下测试在实现前全部 FAIL（编译失败/缺失）
+
+1. `stun::tests::encode_decode_allocate_request` (T1)
+   → FAIL: `nexus_turn::stun` 不存在
+
+2. `stun::tests::xor_mapped_address_roundtrip` (T1)
+   → FAIL: 同上
+
+3. `auth::tests::long_term_credentials_rfc_vector` (T1)
+   → FAIL: RFC 5766 长效认证向量无实现
+
+4. `client::tests::allocate_permission_channel_flow` (T1/T3)
+   → FAIL: `TurnClient` 不存在（需真实 server，E4 级）
+
+5. `fabric::tests::std_transport_matches_socket_behavior` (S9)
+   → FAIL: `UdpTransport` trait 不存在
+
+## 契约要点（已冻结）
+
+- 新 crate `nexus-turn`：T1 最小子集（Allocate/Refresh/CreatePermission/
+  ChannelBind/ChannelData/Send + 长效认证 HMAC-SHA1/MD5）；T2 中继不解密；
+  T3 权限模型；T4 分配生命周期；T5 sync；T6 TurnSocket 语义。
+- `nexus-fabric` S9：driver 经 `UdpTransport` trait 收发；
+  `StdUdpTransport` 默认实现；`connect_with_transport` /
+  `bind_with_transport` 新增；fabric 不反向依赖 turn。
+- 依赖：`hmac` / `sha1` / `md5`（RFC 5766 必需；实现时走依赖评审，
+  见 AGENTS.md §4；全部 MIT/Apache-2.0）。
+- 不做：TURN over TLS/DTLS、STUN 短期认证、TCP 中继、公网部署。
+
+## Contract Hash (frozen, 2026-09-30)
+
+新文件: crates/nexus-turn/{Cargo.toml,MODULE.md}
+修改: Cargo.toml (workspace members), crates/nexus-fabric/MODULE.md (S9)
+场景文件: scenarios/product/fabric_turn_relay.toml (新建)

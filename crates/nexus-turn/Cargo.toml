@@ -1,0 +1,12 @@
+[package]
+name = "nexus-turn"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nexus-fabric = { path = "../nexus-fabric" }
+
+[dev-dependencies]
+
+[features]
+default = []
