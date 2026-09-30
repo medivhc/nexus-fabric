@@ -673,20 +673,26 @@ fn child_b(
                             // 被动迁移到新路径。否则 A 持续向旧地址发包，传输卡死。
                             // B 的 watcher 已禁用（enable_watcher=false），故此处手动触发。
                             // 用开流+写数据（确保驱动 QUIC 发包；datagram 可能只排队）。
-                            match conn.open_keepalive() {
-                                Ok(mut s) => {
-                                    // 发标准 keepalive 帧（MAGIC+seq），A 的 responder 会回 pong。
-                                    // 不等待 pong（避免阻塞），只确保包已从新地址发出，
-                                    // 触发 A 的 QUIC 被动迁移。
-                                    let mut frame = [0u8; 16];
-                                    frame[..8].copy_from_slice(b"N1KALIVE");
-                                    frame[8..].copy_from_slice(&1u64.to_be_bytes());
-                                    let _ = s.write_all(&frame);
-                                    let _ = s.finish();
-                                    eprintln!("[child b] migration trigger sent (stream)");
+                            // 迁移触发：循环发 keepalive 帧，持续驱动 B 的 QUIC，
+                            // 确保 A 收到新地址包并完成被动迁移。单次发送可能因
+                            // driver 未驱动而滞留队列。
+                            for i in 0..10u64 {
+                                match conn.open_keepalive() {
+                                    Ok(mut s) => {
+                                        let mut frame = [0u8; 16];
+                                        frame[..8].copy_from_slice(b"N1KALIVE");
+                                        frame[8..].copy_from_slice(&i.to_be_bytes());
+                                        let _ = s.write_all(&frame);
+                                        let _ = s.finish();
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[child b] migration trigger {i} open failed: {e:?}");
+                                        break;
+                                    }
                                 }
-                                Err(e) => eprintln!("[child b] migration trigger open failed: {e:?}"),
+                                std::thread::sleep(std::time::Duration::from_millis(200));
                             }
+                            eprintln!("[child b] migration trigger burst done");
                         }
                         Err(e) => eprintln!("[child b] proactive rebind failed: {e:?}"),
                     }
