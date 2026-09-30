@@ -150,6 +150,15 @@ egress 侧 TcpStream EOF/错误 → 发 FIN/RST 帧。半开连接（SYN 已收�
 30s 未 ESTABLISHED）回收并计数（`tcp_half_open_expired`）。
 `close()` 时关闭所有流并 join 中继线程。
 
+**S24（真实 TUN 设备）**：`TunRsDevice` 实现 `TunDevice` trait，基于
+`tun-rs` v2 的 sync API（`default-features = false`，不启用任何 async
+feature）。`TunRsDevice::create(name, mtu)` 创建真实 TUN 设备；
+`read`/`write`/`name` 语义与 `TunDevice` 一致（read 返回完整 IP 包，
+write 写入完整 IP 包）。`MockTun` 保留用于 E4（无特权环境）；
+`TunRsDevice` 用于 E5（需 CAP_NET_ADMIN/root）。IP地址分配、路由表、
+DNS 配置**不在**本阶段范围（P3.x 后置边界，见 2026-09-29 冻结决策）。
+创建失败（无特权）时返回 `io::Error`，调用方可降级为 SKIP。
+
 ## Side Effects
 
 - TUN 设备读写（`TunDevice::read` / `write`）。
