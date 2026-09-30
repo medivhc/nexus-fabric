@@ -588,10 +588,18 @@ impl Loop {
         // （双 netns + veth / 任何非回环 underlay）下无法到达对端，
         // rebind 后的连接会永久失联；wildcard 让内核按路由选源地址，
         // 在回环拓扑上的行为与原来一致（回归风险低）。
-        let sock: Box<dyn UdpTransport> = Box::new(
-            StdUdpTransport::bind("0.0.0.0:0".parse().unwrap())
-                .map_err(|e| FabricError::Transport(e.to_string()))?,
-        );
+        //
+        // N1 E4 修复：优先尝试绑定到原地址（保留端口）。Listener 重绑到
+        // 随机端口会导致对端按旧端口发送的包丢失；若原 IP 已不存在
+        // （如 roam 后旧 IP 被删除），则回退到 wildcard。
+        let orig = *self.shared.local_addr.lock().unwrap();
+        let sock: Box<dyn UdpTransport> = match StdUdpTransport::bind(orig) {
+            Ok(s) => Box::new(s),
+            Err(_) => Box::new(
+                StdUdpTransport::bind("0.0.0.0:0".parse().unwrap())
+                    .map_err(|e| FabricError::Transport(e.to_string()))?,
+            ),
+        };
         let addr = sock
             .local_addr()
             .map_err(|e| FabricError::Transport(e.to_string()))?;
