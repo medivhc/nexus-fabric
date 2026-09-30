@@ -1150,6 +1150,9 @@ mod tests {
 
         poll_until(
             || {
+                // Drive the poll loop (the egress-recv thread does this in
+                // production); the junk is dropped and counted.
+                let _ = re.recv_reply();
                 if re.stats().unmapped_dropped == 1 {
                     Some(())
                 } else {
