@@ -142,5 +142,13 @@
     "module": "nexus-discovery",
     "category": "implementation-pitfall",
     "summary": "Option::unwrap_or 参数立即求值：decode_name 压缩指针跳转后 p<*pos，`p - *pos` 下溢 panic；改 unwrap_or_else。ok_or 同理"
+  },
+  {
+    "id": "inherent-trait-ufcs-001",
+    "file": "entries/2026-09-30-inherent-trait-ufcs.md",
+    "date": "2026-09-30",
+    "module": "nexus-discovery",
+    "category": "implementation-pitfall",
+    "summary": "trait 方法与 inherent 方法同名时方法解析优先 inherent，必须用 UFCS 或泛型界调用 trait 版本（D1 Discovery::resolve 调和）"
   }
 ]
