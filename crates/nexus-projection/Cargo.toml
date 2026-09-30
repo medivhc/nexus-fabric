@@ -7,5 +7,6 @@ license.workspace = true
 description = "Projection layer for the Nexus foundation: L3 tunnel (TUN IP packets <-> fabric datagrams)"
 
 [dependencies]
+nexus-domain = { path = "../nexus-domain" }
 
 [dev-dependencies]

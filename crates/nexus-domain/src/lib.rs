@@ -375,6 +375,40 @@ impl fmt::Display for TerminalOutcome {
     }
 }
 
+// ---------- Unified Routing (DESIGN.md §6.4) ----------
+
+/// 统一路由决策：Clash TUN（规则选出口）与 EasyTier TUN（mesh 转发）的
+/// 融合抽象。规则引擎输出此类型，投影层消费。
+///
+/// 长远设计：`Egress { peer: "self" }` 即 Clash 的 DIRECT——本地直连与
+/// 经国外节点出口走同一套 NAT 代码，只是 peer 不同。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteTarget {
+    /// 虚拟子网内：纯转发，对端注入 TUN。
+    MeshPeer { peer: String },
+    /// 去互联网：该节点做 NAT 出口（peer 可为 "self"）。
+    Egress { peer: String },
+    /// 拒绝。
+    Drop,
+}
+
+/// 路由请求的输入。为 P1 预留 `domain` 字段（DNS 劫持填充），P0 为 None。
+#[derive(Debug)]
+pub struct RouteRequest<'a> {
+    /// 原始 IP 包。
+    pub packet: &'a [u8],
+    /// 域名（P0 为 None；P1 由 DNS 劫持提供）。
+    pub domain: Option<&'a str>,
+}
+
+/// 规则引擎 trait：输入路由请求，输出统一路由决策。
+///
+/// P0 由 `SimpleRuleEngine`（IP/CIDR/端口）实现；P1+ 可替换为完整版
+/// （域名/geoip/进程），trait 签名不变。
+pub trait RuleEngine: Send + Sync {
+    fn decide(&self, req: &RouteRequest) -> RouteTarget;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
