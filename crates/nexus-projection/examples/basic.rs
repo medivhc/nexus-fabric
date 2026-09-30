@@ -72,10 +72,8 @@ fn main() {
     let mut b = Projection::new(Box::new(SharedTun(tun_b.clone())), config);
 
     // Wire mock fabric: A -> B, B -> A.
-    let a_inbox = a.inbox_sender();
-    let b_inbox = b.inbox_sender();
-    a.link_peer(b_inbox);
-    b.link_peer(a_inbox);
+    a.link_mock_peer("B", &b);
+    b.link_mock_peer("A", &a);
 
     const N: u32 = 100;
     let packets: Vec<Vec<u8>> = (0..N).map(make_packet).collect();

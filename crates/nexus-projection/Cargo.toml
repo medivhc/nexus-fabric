@@ -8,5 +8,6 @@ description = "Projection layer for the Nexus foundation: L3 tunnel (TUN IP pack
 
 [dependencies]
 nexus-domain = { path = "../nexus-domain" }
+nexus-fabric = { path = "../nexus-fabric" }
 
 [dev-dependencies]

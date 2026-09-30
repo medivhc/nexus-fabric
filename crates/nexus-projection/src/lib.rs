@@ -8,25 +8,26 @@
 //! - `Egress{peer}`: encapsulates with the egress intent bit for the peer;
 //! - `Drop`: counted, not sent (S12).
 //!
-//! P0 transport: internal `mpsc` queues simulate the fabric. `link_peer` wires
-//! two projections together for E4. Future: replace with `FabricConn`
-//! (`send_datagram` / `recv_datagram`) — see comments at `link_peer`.
+//! Transport: [`DatagramTransport`] abstracts peer datagram I/O.
+//! [`MockTransport`] for tests/E4; [`FabricTransport`] wraps real
+//! `nexus-fabric::FabricConn` peers (3b-2).
 
 pub mod egress;
 pub mod routing;
+pub mod transport;
 
-pub use egress::{EgressNat, FlowKey, NatStats, Rule, SimpleRuleEngine};
+pub use egress::{EgressNat, FlowKey, NatStats, Rule, SimpleRuleEngine, DEFAULT_MAX_NAT_ENTRIES};
 /// Re-exported domain types for unified routing (defined in `nexus-domain`,
 /// used — not modified — here).
 pub use nexus_domain::{RouteRequest, RouteTarget, RuleEngine};
 pub use routing::{Cidr, Router, UnifiedRouter, format_ipv4, parse_ipv4_dst};
+pub use transport::{DatagramTransport, FabricTransport, MockTransport, TransportError};
 
 use std::collections::VecDeque;
 use std::io;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
-    mpsc,
 };
 use std::thread;
 use std::time::Duration;
@@ -60,6 +61,8 @@ pub struct RouteStats {
     pub egress_self: u64,
     pub egress_remote: u64,
     pub dropped: u64,
+    /// S13: egress-intent packets dropped for exceeding `max_egress_hops`.
+    pub hop_limit_exceeded: u64,
 }
 
 /// Abstraction over a TUN device. Implementations: `MockTun` (E4),
@@ -134,11 +137,19 @@ impl Default for MockTun {
 pub struct ProjectionConfig {
     /// Max fabric datagram payload. Packets larger than this are dropped (S5).
     pub mtu: usize,
+    /// Max egress hops before a packet is dropped (S13, loop protection).
+    pub max_egress_hops: u8,
+    /// NAT table capacity (S14).
+    pub max_nat_entries: usize,
 }
 
 impl Default for ProjectionConfig {
     fn default() -> Self {
-        Self { mtu: 1400 }
+        Self {
+            mtu: 1400,
+            max_egress_hops: 2,
+            max_nat_entries: DEFAULT_MAX_NAT_ENTRIES,
+        }
     }
 }
 
@@ -193,14 +204,15 @@ fn classify(router_slot: &Arc<Mutex<Option<Arc<dyn Router>>>>, packet: &[u8]) ->
     }
 }
 
-/// Send a packet via the fabric with the given intent byte prepended (S2).
+/// Send a packet via the transport with the given intent byte prepended (S2).
 ///
 /// S5: the full datagram (1 intent byte + packet) must fit in `mtu`;
 /// oversize datagrams are dropped, counted, and reported — never truncated.
-/// Returns `true` if sent.
+/// Returns `true` if accepted by the transport.
 fn send_with_intent(
-    to_net: &FabricSender,
+    transport: &Arc<dyn DatagramTransport>,
     stats: &Arc<Mutex<TunStats>>,
+    peer: &str,
     packet: &[u8],
     mtu: usize,
     intent: u8,
@@ -213,7 +225,7 @@ fn send_with_intent(
     datagram.push(intent);
     datagram.extend_from_slice(packet);
     // S3: best-effort. If the peer is gone, drop silently.
-    if lock(to_net).send(datagram).is_ok() {
+    if transport.send_to(peer, &datagram).is_ok() {
         let mut s = lock(stats);
         s.packets_out += 1;
         s.bytes_out += packet.len() as u64;
@@ -223,29 +235,23 @@ fn send_with_intent(
     }
 }
 
-/// Shared fabric sender. `link_peer` swaps the target; the uplink thread and
-/// `send_packet` both go through here so linking is atomic.
-type FabricSender = Arc<Mutex<mpsc::Sender<Vec<u8>>>>;
-
 /// L3 tunnel projection: TUN <-> fabric datagrams, with unified routing.
 ///
 /// Two background threads (owner: this struct, joined on `close`/`Drop`):
-/// - uplink: TUN.read -> route -> MTU check -> fabric / local NAT / drop
-/// - downlink: fabric -> strip intent byte -> TUN.write
+/// - uplink: TUN.read -> route -> MTU check -> transport / local NAT / drop
+/// - downlink: transport.recv -> hop validation (S13) -> TUN.write or NAT
 ///
 /// `send_packet` is the test/E4 injection path (same routing + MTU check as
-/// the uplink thread). `recv_packet` drains the fabric inbox directly and is
+/// the uplink thread). `recv_packet` polls the transport directly and is
 /// only available on thread-less instances (see `new_for_test`); with threads
-/// running, the downlink thread owns the inbox and writes to the TUN.
+/// running, the downlink thread owns the transport inbox.
 pub struct Projection {
     config: ProjectionConfig,
-    /// Current fabric destination. P0: peer's inbox (see `link_peer`).
-    /// Future: `FabricConn::send_datagram`.
-    to_net: FabricSender,
-    /// Inbound from fabric. `None` once the downlink thread takes ownership.
-    from_net: Option<mpsc::Receiver<Vec<u8>>>,
-    /// Our inbox sender, handed to the peer via `link_peer`.
-    inbox_tx: mpsc::Sender<Vec<u8>>,
+    /// Datagram transport (shared slot; injected via `with_transport`,
+    /// visible to already-spawned threads — same pattern as the router).
+    transport_slot: Arc<Mutex<Arc<dyn DatagramTransport>>>,
+    /// Concrete mock transport, when created via `new` (for `link_mock_peer`).
+    mock_transport: Option<Arc<MockTransport>>,
     /// TUN device, shared with the background threads (also used by
     /// `handle_egress_reply` to deliver mock replies in E4).
     tun: Arc<Mutex<Box<dyn TunDevice>>>,
@@ -254,7 +260,7 @@ pub struct Projection {
     /// to the already-spawned background threads.
     router_slot: Arc<Mutex<Option<Arc<dyn Router>>>>,
     route_stats: Arc<Mutex<RouteStats>>,
-    /// Local egress NAT for `Egress{self}`.
+    /// Local egress NAT for `Egress{self}` (and inbound egress handling).
     egress_nat: Arc<Mutex<EgressNat>>,
     stats: Arc<Mutex<TunStats>>,
     path_switches: Arc<AtomicU64>,
@@ -265,30 +271,48 @@ pub struct Projection {
 
 impl Projection {
     pub fn new(tun: Box<dyn TunDevice>, config: ProjectionConfig) -> Self {
-        Self::new_inner(tun, config, true)
+        let transport = Arc::new(MockTransport::new("local"));
+        Self::new_inner(tun, config, transport.clone(), Some(transport), true)
     }
 
-    fn new_inner(tun: Box<dyn TunDevice>, config: ProjectionConfig, spawn_threads: bool) -> Self {
-        let (inbox_tx, from_net) = mpsc::channel::<Vec<u8>>();
-        // Unlinked: loop back to self. `link_peer` replaces the target.
-        let to_net: FabricSender = Arc::new(Mutex::new(inbox_tx.clone()));
+    /// Build with an explicit transport (e.g. [`FabricTransport`] for real
+    /// fabric). The already-spawned threads pick it up through the shared
+    /// slot. No mock linking is available in this mode.
+    pub fn with_transport(mut self, transport: Arc<dyn DatagramTransport>) -> Self {
+        *lock(&self.transport_slot) = transport;
+        self.mock_transport = None;
+        self
+    }
+
+    fn new_inner(
+        tun: Box<dyn TunDevice>,
+        config: ProjectionConfig,
+        transport: Arc<dyn DatagramTransport>,
+        mock_transport: Option<Arc<MockTransport>>,
+        spawn_threads: bool,
+    ) -> Self {
         let stats = Arc::new(Mutex::new(TunStats::default()));
         let path_switches = Arc::new(AtomicU64::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
         let tun = Arc::new(Mutex::new(tun));
         let mtu = config.mtu;
+        let max_hops = config.max_egress_hops;
         let route_stats = Arc::new(Mutex::new(RouteStats::default()));
-        let egress_nat = Arc::new(Mutex::new(EgressNat::new()));
+        let egress_nat = Arc::new(Mutex::new(EgressNat::new(config.max_nat_entries)));
         // Router is installed later via `with_router`; the threads read it
         // through this shared slot so the builder can run before or after
         // `new` (threads only start in `new`, builder runs before that).
         let router: Arc<Mutex<Option<Arc<dyn Router>>>> = Arc::new(Mutex::new(None));
+        // Transport slot: same pattern — `with_transport` updates it and
+        // the threads see the new transport.
+        let transport_slot: Arc<Mutex<Arc<dyn DatagramTransport>>> =
+            Arc::new(Mutex::new(transport));
 
-        let (uplink, downlink, from_net) = if spawn_threads {
-            // Uplink: TUN -> route -> fabric / local NAT / drop.
+        let (uplink, downlink) = if spawn_threads {
+            // Uplink: TUN -> route -> transport / local NAT / drop.
             let up = {
                 let tun = Arc::clone(&tun);
-                let to_net = Arc::clone(&to_net);
+                let transport_slot = Arc::clone(&transport_slot);
                 let stats = Arc::clone(&stats);
                 let shutdown = Arc::clone(&shutdown);
                 let router = Arc::clone(&router);
@@ -341,10 +365,13 @@ impl Projection {
                                         s.bytes_out += n as u64;
                                         continue;
                                     }
-                                    // Remote egress: forward via fabric.
+                                    // Remote egress: forward via transport.
+                                    // Originator sets hops=0 (S13).
+                                    let transport = lock(&transport_slot).clone();
                                     if !send_with_intent(
-                                        &to_net,
+                                        &transport,
                                         &stats,
+                                        peer,
                                         pkt,
                                         mtu,
                                         encode_intent(true, 0),
@@ -352,11 +379,13 @@ impl Projection {
                                         continue;
                                     }
                                 }
-                                RouteTarget::MeshPeer { .. } => {
+                                RouteTarget::MeshPeer { ref peer } => {
                                     lock(&route_stats).mesh_peer += 1;
+                                    let transport = lock(&transport_slot).clone();
                                     if !send_with_intent(
-                                        &to_net,
+                                        &transport,
                                         &stats,
+                                        peer,
                                         pkt,
                                         mtu,
                                         encode_intent(false, 0),
@@ -369,47 +398,82 @@ impl Projection {
                     })
                     .expect("spawn projection uplink")
             };
-            // Downlink: fabric -> strip intent byte -> TUN.write.
+            // Downlink: transport -> hop validation (S13) -> TUN.write or NAT.
             let down = {
                 let tun = Arc::clone(&tun);
+                let transport_slot = Arc::clone(&transport_slot);
                 let stats = Arc::clone(&stats);
                 let shutdown = Arc::clone(&shutdown);
+                let route_stats = Arc::clone(&route_stats);
+                let egress_nat = Arc::clone(&egress_nat);
                 thread::Builder::new()
                     .name("projection-downlink".into())
                     .spawn(move || {
                         while !shutdown.load(Ordering::Relaxed) {
-                            match from_net.recv_timeout(Duration::from_millis(100)) {
-                                Ok(datagram) => {
+                            let transport = lock(&transport_slot).clone();
+                            match transport.recv() {
+                                Some((from_peer, datagram)) => {
                                     // S2: strip the 1-byte intent; the rest is
                                     // the raw IP packet.
-                                    let pkt = match datagram.split_first() {
-                                        Some((_, rest)) => rest,
+                                    let (intent_byte, pkt) = match datagram.split_first() {
+                                        Some((b, rest)) => (*b, rest),
                                         None => continue, // empty datagram: drop
                                     };
-                                    let mut tun = lock(&tun);
-                                    if tun.write(pkt).is_ok() {
+                                    let (is_egress, hops) = decode_intent(intent_byte);
+                                    if is_egress {
+                                        // S13: validate hop count before
+                                        // handling (loop protection).
+                                        if hops > max_hops {
+                                            lock(&route_stats).hop_limit_exceeded += 1;
+                                            continue;
+                                        }
+                                        // We are the egress node: track the
+                                        // flow so replies route back to the
+                                        // origin peer (S11). Production
+                                        // forwards `pkt` to a real internet
+                                        // socket here; E4 drives replies via
+                                        // `handle_egress_reply`.
+                                        lock(&egress_nat)
+                                            .translate_outbound(pkt, &from_peer);
                                         let mut s = lock(&stats);
                                         s.packets_in += 1;
                                         s.bytes_in += pkt.len() as u64;
+                                    } else {
+                                        // Mesh forward, or an egress reply
+                                        // returning: validate via NAT when
+                                        // tracked, then deliver to TUN.
+                                        let is_reply = lock(&egress_nat)
+                                            .peek_reply(pkt)
+                                            .is_some();
+                                        if is_reply {
+                                            lock(&egress_nat).translate_inbound(pkt);
+                                        }
+                                        let mut tun = lock(&tun);
+                                        if tun.write(pkt).is_ok() {
+                                            let mut s = lock(&stats);
+                                            s.packets_in += 1;
+                                            s.bytes_in += pkt.len() as u64;
+                                        }
                                     }
                                 }
-                                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                                None => {
+                                    thread::sleep(Duration::from_millis(1));
+                                    continue;
+                                }
                             }
                         }
                     })
                     .expect("spawn projection downlink")
             };
-            (Some(up), Some(down), None)
+            (Some(up), Some(down))
         } else {
-            (None, None, Some(from_net))
+            (None, None)
         };
 
         Self {
             config,
-            to_net,
-            from_net,
-            inbox_tx,
+            transport_slot,
+            mock_transport,
             tun,
             router_slot: router,
             route_stats,
@@ -423,24 +487,31 @@ impl Projection {
     }
 
     /// Test helper: create without background threads, so `send_packet` /
-    /// `recv_packet` have exclusive access to the fabric channels.
+    /// `recv_packet` have exclusive access to the transport.
     #[cfg(test)]
     fn new_for_test(tun: Box<dyn TunDevice>, config: ProjectionConfig) -> Self {
-        Self::new_inner(tun, config, false)
+        let transport = Arc::new(MockTransport::new("test"));
+        Self::new_inner(tun, config, transport.clone(), Some(transport), false)
     }
 
-    /// P0 mock fabric wiring: direct our output to the peer's inbox.
-    ///
-    /// Future: replaced by binding to `FabricConn` — `to_net.send(pkt)`
-    /// becomes `fabric.send_datagram(pkt)`, and the downlink thread calls
-    /// `fabric.recv_datagram()` instead of reading `from_net`.
-    pub fn link_peer(&mut self, peer_inbox: mpsc::Sender<Vec<u8>>) {
-        *lock(&self.to_net) = peer_inbox;
+    /// Test/E4 helper: link this projection's mock transport to a peer's.
+    /// Both projections must have been created via `new` (mock transport).
+    /// Panics if a custom transport was injected via `with_transport`.
+    pub fn link_mock_peer(&mut self, peer_name: &str, peer: &Projection) {
+        let my_mock = self
+            .mock_transport
+            .as_ref()
+            .expect("link_mock_peer requires mock transport");
+        let peer_mock = peer
+            .mock_transport
+            .as_ref()
+            .expect("link_mock_peer requires mock transport on peer");
+        my_mock.link_peer(peer_name, peer_mock.inbox_sender());
     }
 
-    /// Our inbox sender, for the peer to `link_peer` to.
-    pub fn inbox_sender(&self) -> mpsc::Sender<Vec<u8>> {
-        self.inbox_tx.clone()
+    /// This projection's mock transport (for `link_mock_peer`).
+    pub fn mock_transport(&self) -> Option<&Arc<MockTransport>> {
+        self.mock_transport.as_ref()
     }
 
     /// Handle a path-switch event from `nexus-path`.
@@ -477,25 +548,49 @@ impl Projection {
 
     /// Feed a mock "internet" reply through the egress NAT (E4/test helper).
     ///
-    /// If the reply's 5-tuple matches a tracked outbound flow, the reply is
-    /// written to the TUN and `true` is returned. Production uses real
-    /// egress sockets instead of this method.
+    /// If the reply's 5-tuple matches a tracked outbound flow:
+    /// - origin peer is "self": write to the TUN, return `true`;
+    /// - origin peer is remote: forward back via the transport with mesh
+    ///   intent (the originator's downlink validates it via NAT, S11).
+    /// Returns `false` if the reply matches no tracked flow.
+    /// Production uses real egress sockets instead of this method.
     pub fn handle_egress_reply(&self, reply: &[u8]) -> bool {
-        let matched = {
+        let (packet, peer) = {
             let mut nat = lock(&self.egress_nat);
-            nat.translate_inbound(reply).is_some()
+            match nat.translate_inbound(reply) {
+                Some((p, peer)) => (p, peer),
+                None => return false,
+            }
         };
-        if !matched {
-            return false;
-        }
-        let mut tun = lock(&self.tun);
-        if tun.write(reply).is_ok() {
-            let mut s = lock(&self.stats);
-            s.packets_in += 1;
-            s.bytes_in += reply.len() as u64;
-            true
+        if peer == "self" {
+            let mut tun = lock(&self.tun);
+            if tun.write(&packet).is_ok() {
+                let mut s = lock(&self.stats);
+                s.packets_in += 1;
+                s.bytes_in += packet.len() as u64;
+                true
+            } else {
+                false
+            }
         } else {
-            false
+            // Remote originator: send the reply back via the transport.
+            // Mesh intent: the originator's downlink NAT-validates it (S11).
+            let mut datagram = Vec::with_capacity(packet.len() + 1);
+            datagram.push(encode_intent(false, 0));
+            datagram.extend_from_slice(&packet);
+            if datagram.len() > self.config.mtu {
+                lock(&self.stats).dropped_oversize += 1;
+                return false;
+            }
+            let transport = lock(&self.transport_slot).clone();
+            if transport.send_to(&peer, &datagram).is_ok() {
+                let mut s = lock(&self.stats);
+                s.packets_out += 1;
+                s.bytes_out += packet.len() as u64;
+                true
+            } else {
+                false
+            }
         }
     }
 
@@ -524,9 +619,11 @@ impl Projection {
                     s.bytes_out += packet.len() as u64;
                     return Ok(());
                 }
+                let transport = lock(&self.transport_slot).clone();
                 if send_with_intent(
-                    &self.to_net,
+                    &transport,
                     &self.stats,
+                    peer,
                     packet,
                     self.config.mtu,
                     encode_intent(true, 0),
@@ -539,14 +636,16 @@ impl Projection {
                     })
                 } else {
                     // S3: best-effort; peer gone.
-                    Err(ProjectionError::Io("fabric send failed".into()))
+                    Err(ProjectionError::Io("transport send failed".into()))
                 }
             }
-            RouteTarget::MeshPeer { .. } => {
+            RouteTarget::MeshPeer { ref peer } => {
                 lock(&self.route_stats).mesh_peer += 1;
+                let transport = lock(&self.transport_slot).clone();
                 if send_with_intent(
-                    &self.to_net,
+                    &transport,
                     &self.stats,
+                    peer,
                     packet,
                     self.config.mtu,
                     encode_intent(false, 0),
@@ -559,7 +658,7 @@ impl Projection {
                     })
                 } else {
                     // S3: best-effort; peer gone.
-                    Err(ProjectionError::Io("fabric send failed".into()))
+                    Err(ProjectionError::Io("transport send failed".into()))
                 }
             }
         }
@@ -568,21 +667,30 @@ impl Projection {
     /// Take a received packet (thread-less test instances only).
     ///
     /// Strips the 1-byte intent (S2); the returned bytes are the raw IP packet.
+    /// Applies S13 hop validation for egress-intent packets.
     pub fn recv_packet(&mut self) -> Option<Vec<u8>> {
-        let rx = self.from_net.as_ref()?;
-        match rx.try_recv() {
-            Ok(datagram) => {
-                let pkt = match datagram.split_first() {
-                    Some((_, rest)) => rest.to_vec(),
-                    None => return None, // empty datagram: drop
-                };
-                let mut s = lock(&self.stats);
-                s.packets_in += 1;
-                s.bytes_in += pkt.len() as u64;
-                Some(pkt)
+        let transport = lock(&self.transport_slot).clone();
+        let (_from_peer, datagram) = transport.recv()?;
+        let (intent_byte, pkt) = match datagram.split_first() {
+            Some((b, rest)) => (*b, rest),
+            None => return None, // empty datagram: drop
+        };
+        let (is_egress, hops) = decode_intent(intent_byte);
+        if is_egress {
+            // S13: hop validation (same as the downlink thread).
+            if hops > self.config.max_egress_hops {
+                lock(&self.route_stats).hop_limit_exceeded += 1;
+                return None;
             }
-            Err(_) => None,
+            // Track for reply routing; the caller handles the packet.
+            lock(&self.egress_nat).translate_outbound(pkt, &_from_peer);
+        } else if lock(&self.egress_nat).peek_reply(pkt).is_some() {
+            lock(&self.egress_nat).translate_inbound(pkt);
         }
+        let mut s = lock(&self.stats);
+        s.packets_in += 1;
+        s.bytes_in += pkt.len() as u64;
+        Some(pkt.to_vec())
     }
 
     pub fn stats(&self) -> TunStats {
@@ -645,7 +753,13 @@ mod tests {
     #[test]
     fn s5_oversize_dropped_and_counted() {
         let tun = Box::new(MockTun::default());
-        let mut p = Projection::new_for_test(tun, ProjectionConfig { mtu: 100 });
+        let mut p = Projection::new_for_test(
+            tun,
+            ProjectionConfig {
+                mtu: 100,
+                ..Default::default()
+            },
+        );
         let big = vec![0u8; 101];
         // S2: datagram = 1 intent byte + packet = 102 > mtu 100.
         let err = p.send_packet(&big).unwrap_err();
@@ -704,10 +818,8 @@ mod tests {
         let tb = Box::new(MockTun::default());
         let mut a = Projection::new_for_test(ta, ProjectionConfig::default());
         let mut b = Projection::new_for_test(tb, ProjectionConfig::default());
-        let ai = a.inbox_sender();
-        let bi = b.inbox_sender();
-        a.link_peer(bi);
-        b.link_peer(ai);
+        a.link_mock_peer("B", &b);
+        b.link_mock_peer("A", &a);
         let pkt = vec![0x45; 64];
         a.send_packet(&pkt).unwrap();
         let got = b.recv_packet().expect("peer delivery");
@@ -814,5 +926,60 @@ mod tests {
         bad[22..24].copy_from_slice(&9999u16.to_be_bytes());
         assert!(!p.handle_egress_reply(&bad));
         assert_eq!(p.nat_stats().reply_dropped, 1);
+    }
+
+    #[test]
+    fn s13_hop_limit_enforced_on_receive() {
+        // Thread-less instance; drive recv_packet directly.
+        let tun = Box::new(MockTun::default());
+        let mut p = Projection::new_for_test(tun, ProjectionConfig::default());
+
+        // Inject an egress datagram with hops=3 (> default max 2) into the
+        // transport inbox, simulating a looping peer.
+        let pkt = udp_pkt([1, 2, 3, 4], 3000, 80);
+        let mut bad_dgram = vec![encode_intent(true, 3)];
+        bad_dgram.extend_from_slice(&pkt);
+        p.mock_transport()
+            .unwrap()
+            .inbox_sender()
+            .send(("evil".to_string(), bad_dgram))
+            .unwrap();
+        assert!(p.recv_packet().is_none());
+        assert_eq!(p.route_stats().hop_limit_exceeded, 1);
+
+        // hops=2 (at the limit) passes.
+        let mut ok_dgram = vec![encode_intent(true, 2)];
+        ok_dgram.extend_from_slice(&pkt);
+        p.mock_transport()
+            .unwrap()
+            .inbox_sender()
+            .send(("ok".to_string(), ok_dgram))
+            .unwrap();
+        let got = p.recv_packet().expect("hops=2 passes");
+        assert_eq!(got, pkt);
+        assert_eq!(p.route_stats().hop_limit_exceeded, 1);
+        // Egress packet was NAT-tracked with the origin peer.
+        assert_eq!(p.nat_stats().egress_handled, 1);
+    }
+
+    #[test]
+    fn s13_custom_max_hops() {
+        let tun = Box::new(MockTun::default());
+        let config = ProjectionConfig {
+            max_egress_hops: 0,
+            ..Default::default()
+        };
+        let mut p = Projection::new_for_test(tun, config);
+        // Even hops=1 exceeds max 0.
+        let pkt = udp_pkt([1, 2, 3, 4], 3001, 80);
+        let mut dgram = vec![encode_intent(true, 1)];
+        dgram.extend_from_slice(&pkt);
+        p.mock_transport()
+            .unwrap()
+            .inbox_sender()
+            .send(("x".to_string(), dgram))
+            .unwrap();
+        assert!(p.recv_packet().is_none());
+        assert_eq!(p.route_stats().hop_limit_exceeded, 1);
     }
 }

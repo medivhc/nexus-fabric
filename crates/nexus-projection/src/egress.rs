@@ -125,29 +125,46 @@ pub struct NatStats {
     pub reply_dropped: u64,
     /// Entries evicted by timeout.
     pub evicted: u64,
+    /// Entries evicted by capacity bound (S14).
+    pub capacity_evicted: u64,
+    /// Current tracked flows (WARN-6: observable snapshot).
+    pub current_flows: usize,
 }
+
+/// Default NAT table capacity (S14).
+pub const DEFAULT_MAX_NAT_ENTRIES: usize = 65536;
 
 /// Connection-tracked UDP NAT for `Egress{self}` (S11).
 ///
 /// P0 simplification: packets are recorded, NOT rewritten (no SNAT).
 /// E4 validates the mapping logic with a mock "internet".
+///
+/// S14: the table is bounded by `max_entries`; when full, the oldest
+/// (least-recently-seen) entry is evicted to make room.
 pub struct EgressNat {
     table: HashMap<FlowKey, NatEntry>,
+    max_entries: usize,
     stats: NatStats,
 }
 
 impl EgressNat {
-    pub fn new() -> Self {
+    pub fn new(max_entries: usize) -> Self {
         Self {
             table: HashMap::new(),
+            max_entries,
             stats: NatStats::default(),
         }
     }
 
     /// Outbound: record the flow. Returns the (unmodified, P0) packet,
     /// or `None` if the packet is unparsable.
+    ///
+    /// S14: if the table is full, evict the oldest entry first.
     pub fn translate_outbound(&mut self, packet: &[u8], peer: &str) -> Option<Vec<u8>> {
         let key = FlowKey::parse(packet)?;
+        if !self.table.contains_key(&key) && self.table.len() >= self.max_entries {
+            self.evict_oldest();
+        }
         self.table.insert(
             key,
             NatEntry {
@@ -156,6 +173,7 @@ impl EgressNat {
             },
         );
         self.stats.egress_handled += 1;
+        self.stats.current_flows = self.table.len();
         Some(packet.to_vec())
     }
 
@@ -185,7 +203,29 @@ impl EgressNat {
             .retain(|_, e| now.duration_since(e.last_seen) <= timeout);
         let n = before - self.table.len();
         self.stats.evicted += n as u64;
+        self.stats.current_flows = self.table.len();
         n
+    }
+
+    /// Evict the single oldest entry (S14 capacity bound).
+    fn evict_oldest(&mut self) {
+        let oldest = self
+            .table
+            .iter()
+            .min_by_key(|(_, e)| e.last_seen)
+            .map(|(k, _)| *k);
+        if let Some(k) = oldest {
+            self.table.remove(&k);
+            self.stats.capacity_evicted += 1;
+        }
+    }
+
+    /// Non-counting reply lookup (for the downlink fast path): does this
+    /// packet match a tracked outbound flow? Returns the origin peer.
+    pub fn peek_reply(&self, packet: &[u8]) -> Option<String> {
+        let reply_key = FlowKey::parse(packet)?;
+        let orig_key = reply_key.reversed();
+        self.table.get(&orig_key).map(|e| e.peer.clone())
     }
 
     /// Number of tracked flows.
@@ -200,7 +240,7 @@ impl EgressNat {
 
 impl Default for EgressNat {
     fn default() -> Self {
-        Self::new()
+        Self::new(DEFAULT_MAX_NAT_ENTRIES)
     }
 }
 
@@ -258,7 +298,7 @@ mod tests {
 
     #[test]
     fn s11_nat_reply_roundtrip() {
-        let mut nat = EgressNat::new();
+        let mut nat = EgressNat::default();
         let out = udp_packet([10, 0, 0, 1], [8, 8, 8, 8], 1234, 53);
         let sent = nat.translate_outbound(&out, "self").expect("recorded");
         assert_eq!(sent, out); // P0: unmodified
@@ -274,7 +314,7 @@ mod tests {
 
     #[test]
     fn s11_nat_unknown_reply_dropped_and_counted() {
-        let mut nat = EgressNat::new();
+        let mut nat = EgressNat::default();
         let reply = udp_packet([8, 8, 8, 8], [10, 0, 0, 1], 53, 9999);
         assert!(nat.translate_inbound(&reply).is_none());
         assert_eq!(nat.stats().reply_dropped, 1);
@@ -283,7 +323,7 @@ mod tests {
 
     #[test]
     fn s11_nat_evict_expired() {
-        let mut nat = EgressNat::new();
+        let mut nat = EgressNat::default();
         let out = udp_packet([10, 0, 0, 1], [8, 8, 8, 8], 1234, 53);
         nat.translate_outbound(&out, "self");
         assert_eq!(nat.flow_count(), 1);
@@ -307,5 +347,59 @@ mod tests {
         let mut pkt = udp_packet([10, 0, 0, 1], [8, 8, 8, 8], 1, 2);
         pkt[9] = 1; // ICMP, not TCP/UDP
         assert!(FlowKey::parse(&pkt).is_none());
+    }
+
+    #[test]
+    fn s14_capacity_evicts_oldest() {
+        let mut nat = EgressNat::new(3);
+        // Fill to capacity with distinct flows.
+        for i in 0..3u16 {
+            let pkt = udp_packet([10, 0, 0, 1], [8, 8, 8, 8], 1000 + i, 53);
+            nat.translate_outbound(&pkt, "self");
+        }
+        assert_eq!(nat.flow_count(), 3);
+        assert_eq!(nat.stats().current_flows, 3);
+        assert_eq!(nat.stats().capacity_evicted, 0);
+
+        // One more: oldest (sport 1000) evicted, newest kept.
+        let pkt = udp_packet([10, 0, 0, 1], [8, 8, 8, 8], 2000, 53);
+        nat.translate_outbound(&pkt, "self");
+        assert_eq!(nat.flow_count(), 3);
+        assert_eq!(nat.stats().capacity_evicted, 1);
+        assert_eq!(nat.stats().current_flows, 3);
+
+        // Oldest flow's reply no longer matches.
+        let old_reply = udp_packet([8, 8, 8, 8], [10, 0, 0, 1], 53, 1000);
+        assert!(nat.translate_inbound(&old_reply).is_none());
+        // Newest flow's reply matches.
+        let new_reply = udp_packet([8, 8, 8, 8], [10, 0, 0, 1], 53, 2000);
+        assert!(nat.translate_inbound(&new_reply).is_some());
+    }
+
+    #[test]
+    fn s14_reinsert_same_flow_no_evict() {
+        // Re-recording an existing flow must not trigger eviction.
+        let mut nat = EgressNat::new(2);
+        let p1 = udp_packet([10, 0, 0, 1], [8, 8, 8, 8], 1000, 53);
+        let p2 = udp_packet([10, 0, 0, 1], [8, 8, 8, 8], 1001, 53);
+        nat.translate_outbound(&p1, "self");
+        nat.translate_outbound(&p2, "self");
+        nat.translate_outbound(&p1, "self"); // refresh, not new
+        assert_eq!(nat.flow_count(), 2);
+        assert_eq!(nat.stats().capacity_evicted, 0);
+    }
+
+    #[test]
+    fn peek_reply_does_not_count() {
+        let mut nat = EgressNat::default();
+        let out = udp_packet([10, 0, 0, 1], [8, 8, 8, 8], 1234, 53);
+        nat.translate_outbound(&out, "peer-x");
+        let reply = udp_packet([8, 8, 8, 8], [10, 0, 0, 1], 53, 1234);
+        assert_eq!(nat.peek_reply(&reply), Some("peer-x".to_string()));
+        // Peek is non-counting.
+        assert_eq!(nat.stats().reply_received, 0);
+        assert_eq!(nat.stats().reply_dropped, 0);
+        let unknown = udp_packet([8, 8, 8, 8], [10, 0, 0, 1], 53, 9999);
+        assert_eq!(nat.peek_reply(&unknown), None);
     }
 }
