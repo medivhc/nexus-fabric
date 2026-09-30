@@ -286,7 +286,6 @@ impl Driver {
             handle_map: HashMap::new(),
             buf: vec![0u8; RECV_BUF],
             out: Vec::new(),
-            diag_last_remote: None,
         };
         let thread = thread::Builder::new()
             .name("nexus-fabric-drv".into())
@@ -450,8 +449,6 @@ struct Loop {
     handle_map: HashMap<ConnectionHandle, u64>,
     buf: Vec<u8>,
     out: Vec<u8>,
-    // 临时诊断字段（E4 迁移调试，事后删除）。
-    diag_last_remote: Option<SocketAddr>,
 }
 
 impl Loop {
@@ -656,8 +653,6 @@ impl Loop {
         } else {
             // Client：直接 wildcard 随机端口，保证新地址与旧的不同，
             // 触发对端 QUIC 被动迁移。端口保留非必需（迁移不依赖端口）。
-            // DIAG-V2: 确认新代码生效。
-            eprintln!("[fabric-diag] client rebind using 0.0.0.0:0 (v2)");
             Box::new(
                 StdUdpTransport::bind("0.0.0.0:0".parse().unwrap())
                     .map_err(|e| FabricError::Transport(e.to_string()))?,
@@ -676,21 +671,12 @@ impl Loop {
         // B 的迁移触发包由调用方（E4 burst / 业务数据）驱动发出。
         // Refresh stats immediately so the caller observes the new path.
         self.update_stats(conn);
-        eprintln!("[fabric-diag] rebind ok: orig={orig} new={addr} is_server={is_server}");
         Ok(addr)
     }
 
     fn on_udp(&mut self, n: usize, remote: SocketAddr) {
         let now = Instant::now();
         let local_ip = self.socket.local_addr().ok().map(|a| a.ip());
-        // 临时诊断：记录收到的远端地址变化（E4 迁移调试用，事后删除）。
-        if self.diag_last_remote != Some(remote) {
-            eprintln!(
-                "[fabric-diag] recv from new remote: {remote} (was {:?})",
-                self.diag_last_remote
-            );
-            self.diag_last_remote = Some(remote);
-        }
         let data = BytesMut::from(&self.buf[..n]);
         let ev = self
             .endpoint

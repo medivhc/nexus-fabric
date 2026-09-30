@@ -7,6 +7,25 @@
 
 ## 0. 重要决定清单（评审意见 + 结果）
 
+### D7 [验证/阻塞] 独立 Review 第 1 轮 CHANGES_REQUESTED → 修复 F-EDGE-1/2/3；N1 E4 迁移 stall 仍 BLOCKED
+
+- Review（`.evidence/review-n1r1/`，reviewer 独立）：1 FAIL（edge-coverage）+ 7 WARN。
+  - **F-EDGE-1**：`cmd_rebind` 端口保留分支是死代码（旧 socket 未释放，无 SO_REUSEADDR，恒 EADDRINUSE）；
+    server 侧 rebind 恒失败（相对基线回归）；`nexus-projection/path_link.rs` 有真实调用方。
+    修复：先关闭旧 socket；Client 直接 `0.0.0.0:0`（保证地址变化，触发迁移），
+    Server 保留 `bind(orig)`。注意：若简单“先关再 bind(orig)”，IP 未变时 rebind 成 no-op，
+    4a E4 回归——已验证并修正。
+  - **F-EDGE-2**：移除无条件 `local_address_changed()`（只影响本端，不能帮对端迁移；
+    恢复旧刻意决定，避开 debug_assert 风险）。
+  - **F-EDGE-3**：`FabricConnAdapter::rebind` 加 Mutex 串行化（watcher 与手动触发并发）。
+- **N1 E4 状态：BLOCKED**。B（Client）rebind 到新地址并发出 burst，A（Server）的 UDP socket
+  确认收到新地址包，但 A 的 quinn-proto 从不执行 `migrate()`（vendor 内加诊断无输出），
+  A→B 数据面 stall。4a E4（端口迁移）PASS，确认基础迁移机制正常；N1 的 IP 变更场景下
+  包在 endpoint→connection 路径被静默丢弃，具体点未定位。知识条目：
+  `.agents/knowledge/entries/2026-10-01-quinn-proto-server-migration-trigger.md`。
+- 决策：E4 不再强行推进；待 quinn-proto 丢弃点定位后再议（可能需调整 E4 策略或升级 quinn-proto）。
+  契约（MODULE.md / scenario TOML）未修改，无需 requirement-change。
+
 ### D0 [架构/阻塞] `nexus-fabric` rebind 绑定地址从 `127.0.0.1:0` 改为 `0.0.0.0:0`
 
 - 现状：`driver.rs::cmd_rebind` 硬编码 `StdUdpTransport::bind("127.0.0.1:0")`。E4 拓扑是双 netns + veth（10.200.0.0/24），rebind 后的回环 socket 无法到达对端，E4 必败；任何真实部署同理。

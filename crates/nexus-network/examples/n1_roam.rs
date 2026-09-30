@@ -688,9 +688,8 @@ fn child_b(
                             // 用开流+写数据（确保驱动 QUIC 发包；datagram 可能只排队）。
                             // 迁移触发：循环发 keepalive 帧，持续驱动 B 的 QUIC，
                             // 确保 A 收到新地址包并完成被动迁移。单次发送可能因
-                            // driver 未驱动而滞留队列。加长到 100 次（20s），
-                            // 提高被动迁移触发概率（quinn-proto 迁移条件严格）。
-                            for i in 0..100u64 {
+                            // driver 未驱动而滞留队列。
+                            for i in 0..10u64 {
                                 match conn.open_keepalive() {
                                     Ok(mut s) => {
                                         let mut frame = [0u8; 16];
