@@ -686,7 +686,9 @@ fn child_b(
                                         let _ = s.finish();
                                     }
                                     Err(e) => {
-                                        eprintln!("[child b] migration trigger {i} open failed: {e:?}");
+                                        eprintln!(
+                                            "[child b] migration trigger {i} open failed: {e:?}"
+                                        );
                                         break;
                                     }
                                 }
