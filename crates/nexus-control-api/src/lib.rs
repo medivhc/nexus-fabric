@@ -60,6 +60,16 @@ pub enum ControlCommand {
     PlatformCapabilities,
     /// `run <resource>`：执行远程资源访问。
     Run { resource: String },
+    /// `network up --config <toml>`：前台装配 N1 Universal Connectivity
+    ///（建 TUN → dial 静态 peers → 起包泵；Ctrl-C 退出）。
+    ///
+    /// M6：经 Application API；由 Composition Root（apps/nexus）实现装配逻辑。
+    NetworkUp {
+        /// N1 配置文件内容（TOML）。
+        config: String,
+    },
+    /// `network status`：N1 装配状态（无 daemon 时诚实标注）。
+    NetworkStatus,
 }
 
 // ---------- 结构化输出 DTO（机器接口，版本化） ----------
