@@ -83,12 +83,16 @@ socket，`nexus-fabric` 的被动迁移保证流不中断。
 执行切换；不排空则切换不生效。`remove_candidate` 移除活跃路径时，
 若有备选候选，必须发出 `Switched`（S6 的事件形式）。
 
-**R1（staggered 竞速）**：`race_connect(candidates, connector, budget)` 按偏好
-排序（`PathKind` 序 then `cost` 升序）依次尝试建连。首候选先发；
+**R1（staggered 竞速）**：`race_connect(candidates, connector, budget)` 按**调用方给定
+的候选顺序**依次尝试建连（2026-09-30 requirement-change：删除内部 `(PathKind, cost)`
+重排；"按什么顺序尝试"是调用方——如 fallback 链 F1——的产品语义，库函数忠实执行，
+不替调用方做产品决策）。首候选先发；
 `stagger_delay_ms`（默认 200ms）内未成功则启动下一候选（最多
 `max_parallel`（默认 2）个并行尝试）。首个成功者胜出，其余协作取消；
 `total_timeout_ms`（默认 5000ms）超限返回 `io::ErrorKind::TimedOut`。
 空候选列表返回 `InvalidInput`。
+变更前行为（已 STALE）：按 `(PathKind, cost)` 排序，Turn 恒在 Proxy 之前；
+与批准的 fallback 链顺序（F1：Direct → Proxy → Turn）冲突，故修订。
 
 **R2（EWMA 实时预测）**：`Ewma` 类型维护 per-path 指数加权移动平均
 （`alpha` 可配置，默认 0.3，钳位到 (0, 1]）。`on_stats()` 喂入 RTT/丢包/
