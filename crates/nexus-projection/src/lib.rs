@@ -33,7 +33,7 @@ pub use egress::{
 pub use nexus_domain::{RouteRequest, RouteTarget, RuleEngine};
 pub use routing::{Cidr, Router, UnifiedRouter, format_ipv4, parse_ipv4_dst};
 pub use semantic::{SemanticDeps, SemanticIngress, SemanticStats};
-pub use tcp::{TcpEgress, TcpRelayStats, TcpTermStats};
+pub use tcp::{SemanticStreamTx, TcpEgress, TcpRelayStats, TcpTermStats};
 pub use transport::{DatagramTransport, FabricTransport, MockTransport, TransportError};
 
 use std::collections::VecDeque;

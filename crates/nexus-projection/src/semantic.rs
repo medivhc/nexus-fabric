@@ -158,7 +158,7 @@ impl SemanticIngress {
                     let _ = h.join();
                 }
             })
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
 
         Ok(Self {
             local_addr,
@@ -484,7 +484,7 @@ fn relay_pair(
 
 fn write_all_nb(mut stream: &TcpStream, mut data: &[u8]) -> std::io::Result<()> {
     while !data.is_empty() {
-        match stream.write(&data) {
+        match stream.write(data) {
             Ok(0) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
@@ -1011,6 +1011,6 @@ mod tests {
             .semantic_deps()
             .expect("router installed → deps available");
         assert_eq!(deps.mtu, ProjectionConfig::default().mtu);
-        let _ = p.close();
+        p.close();
     }
 }

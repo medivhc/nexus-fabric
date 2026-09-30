@@ -1234,10 +1234,14 @@ impl TcpRelay {
 /// `SemanticIngress` (byte-stream clients, not the smoltcp terminator).
 /// Keyed by `(peer, stream_id)` (F1 lesson); the downlink and the
 /// self-loopback path consult it before the terminator/relay dispatch.
+/// S25: inbound channel for a semantic-ingress originator stream.
+/// Payload is `(STREAM flags, frame payload)`.
+pub type SemanticStreamTx = mpsc::SyncSender<(u8, Vec<u8>)>;
+
 pub struct TcpEgress {
     pub terminator: TcpTerminator,
     pub relay: TcpRelay,
-    pub semantic_streams: std::sync::Mutex<HashMap<(String, u32), mpsc::SyncSender<(u8, Vec<u8>)>>>,
+    pub semantic_streams: std::sync::Mutex<HashMap<(String, u32), SemanticStreamTx>>,
 }
 
 impl TcpEgress {
@@ -1264,12 +1268,7 @@ impl TcpEgress {
     }
 
     /// S25: register a semantic-ingress originator stream.
-    pub fn semantic_register(
-        &self,
-        peer: &str,
-        stream_id: u32,
-        tx: mpsc::SyncSender<(u8, Vec<u8>)>,
-    ) {
+    pub fn semantic_register(&self, peer: &str, stream_id: u32, tx: SemanticStreamTx) {
         self.semantic_streams
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1285,11 +1284,7 @@ impl TcpEgress {
     }
 
     /// S25: look up a semantic-ingress originator stream by (peer, id).
-    pub fn semantic_lookup(
-        &self,
-        peer: &str,
-        stream_id: u32,
-    ) -> Option<mpsc::SyncSender<(u8, Vec<u8>)>> {
+    pub fn semantic_lookup(&self, peer: &str, stream_id: u32) -> Option<SemanticStreamTx> {
         self.semantic_streams
             .lock()
             .unwrap_or_else(|e| e.into_inner())

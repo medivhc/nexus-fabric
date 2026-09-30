@@ -201,8 +201,8 @@ fn run() -> Result<String, String> {
 
     let relayed = ingress.stats().relayed_bytes;
     drop(ingress);
-    let _ = a.close();
-    let _ = b.close();
+    a.close();
+    b.close();
 
     Ok(format!(
         "{{\"verdict\":\"PASS\",\"socks5\":{{\"roundtrip_ok\":{socks5_ok}}},\
