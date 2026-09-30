@@ -16,6 +16,7 @@ allow = [
   "Apache-2.0",
   "BSD-2-Clause",
   "BSD-3-Clause",
+  "0BSD",
   "ISC",
   "Unicode-3.0",
   "Zlib"
@@ -150,7 +151,7 @@ default_features = false
 features = ["std", "proto-ipv4", "socket-tcp", "medium-ip"]
 architecture_layer = "projection (TCP egress terminator); userspace TCP state machine, no async runtime, no tokio (repo is std-only)"
 feature_scope = "std+proto-ipv4+socket-tcp+medium-ip only; ipv6/udp/icmp/dns/mqtt/ethernet explicitly disabled for P0"
-license = "MIT OR Apache-2.0 (allowlisted; to be confirmed by cargo-deny at implementation time)"
+license = "0BSD (allowlisted 2026-09-30; OSI-approved, more permissive than MIT; cargo-deny PASS)"
 security = "RustSec DB to be checked at implementation time via harness gate"
 portability = "pure Rust, no_std capable; not in portable_core (projection is platform-side)"
 supply_chain = "version pinned by Cargo.lock (lockfile_required); zero transitive deps with this feature set"
