@@ -2,13 +2,15 @@
 //!
 //! PathManager with direct + mock TURN candidates:
 //!  1. feed initial stats -> direct (cheaper, equal quality) is selected (S3)
-//!  2. degrade direct (RTT spike) -> after hysteresis + hold, switch to TURN (S4)
+//!  2. severely degrade direct (RTT spike to 500ms + 30% loss) -> after
+//!     relative hysteresis (20%) + hold, switch to TURN (S4, R3)
 //!  3. emit JSON covering every frozen expect field.
 //!
 //! Usage: cargo run -p nexus-path --example basic -- --json
 
 use nexus_path::{
-    CandidatePath, PathConfig, PathEvent, PathKind, PathManager, PathStats, SwitchReason,
+    CandidatePath, PathConfig, PathEvent, PathKind, PathManager, PathStats, RaceBudget,
+    SwitchReason,
 };
 use std::net::SocketAddr;
 use std::thread;
@@ -43,11 +45,12 @@ fn main() {
     let json = std::env::args().any(|a| a == "--json");
 
     let mut pm = PathManager::new(PathConfig {
-        hysteresis_db: 1.0,
+        hysteresis_pct: 0.20,
         switch_hold_ms: 200,
         probe_interval_ms: 60_000,
         ewma_alpha: 0.3,
         max_missed_probes: 3,
+        race_budget: RaceBudget::default(),
     });
 
     let direct = addr(9001);
@@ -87,11 +90,14 @@ fn main() {
     let score_direct = pm.score(&direct);
     let score_turn = pm.score(&turn);
 
-    // Phase 2: degrade direct (RTT 10ms -> 500ms). EWMA decays; once TURN
-    // leads by hysteresis_db for switch_hold_ms, we switch.
+    // Phase 2: severely degrade direct (RTT 10ms -> 500ms + 30% loss).
+    // 2026-09-30 requirement-change: loss added so TURN beats the 20%
+    // relative hysteresis (pure RTT degradation only gives ~7.5% margin).
+    // EWMA decays; once TURN leads by hysteresis_pct for switch_hold_ms,
+    // we switch.
     let degraded_direct = || PathStats {
         rtt_ms: Some(500),
-        loss_rate: Some(0.0),
+        loss_rate: Some(0.3),
         throughput_bps: None,
     };
     let deadline = Instant::now() + Duration::from_secs(15);

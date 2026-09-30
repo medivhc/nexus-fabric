@@ -7,10 +7,15 @@ requirement = "docs/foundation/DESIGN.md#4"
 [given]
 topology = "loopback UDP, PathManager with direct + mock TURN candidates (example binary)"
 candidates = "direct (cost 0.0, rtt 10ms) + turn (cost 5.0, rtt 50ms)"
+degradation = "direct degrades to rtt 500ms + 30% loss (2026-09-30 requirement-change: loss added so the challenger beats the 20% relative hysteresis; intent 'severe degradation triggers failover' unchanged)"
 
 # 可执行 E4：example 创建 PathManager -> 添加直连和 TURN 候选 ->
 # 输入探测统计 -> 验证选出直连（分数更高） ->
-# 劣化直连（rtt 飙升）-> 验证 hysteresis 后切换到 TURN -> 输出 JSON。
+# 严重劣化直连（rtt 飙升至 500ms + 30% 丢包）-> 验证 hysteresis（相对 20% +
+# 持续 3s）后切换到 TURN -> 输出 JSON。
+# 背景：2026-09-30 hysteresis 从绝对分差改为相对 20%（用户裁决选 A）。
+# 纯 RTT 劣化下 turn 仅优 ~7.5%，永不触发切换；加入丢包后 turn 优 >50%，
+# 保留"严重劣化触发切换"的产品意图。
 [when]
 command = "cargo run --quiet -p nexus-path --example basic -- --json"
 
