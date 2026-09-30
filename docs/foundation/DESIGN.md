@@ -292,6 +292,55 @@ SOCKS5 / HTTP 代理作为**显式语义入口**（§11 已有）：
 - **Windows**：WFP（Windows Filtering Platform），另一套实现。
 - **调度**：进程名对照配置定优先级类，路径层/会话层按类排队（类似 DiffServ）。例如：文件同步高优先级、后台更新低优先级。
 
+### 6.4 统一路由：Clash TUN 与 EasyTier TUN 的融合（用户决策，2026-09-30）
+
+**核心洞察**：Clash TUN（透明代理入口，按规则选互联网出口）和 EasyTier TUN
+（虚拟网卡，mesh 内转发）都在回答同一个问题——"这个包交给谁"。不需要两个
+TUN 设备，一个 TUN + 统一决策链即可。
+
+**统一抽象**：
+```rust
+enum RouteTarget {
+    MeshPeer { peer: PeerId },  // 虚拟子网内：纯转发，对端注入 TUN
+    Egress { peer: PeerId },    // 去互联网：该节点做 NAT 出口
+    Drop,                       // 拒绝
+}
+```
+
+**关键统一**：Clash 的 DIRECT = `Egress { peer: 自己 }`。本地直连和经国外节点
+出口走同一套 NAT 代码，只是 peer 不同。三态足够，不需要第四态。
+
+**决策流水线**（投影层内，per-packet）：
+```
+包 → 解析 5 元组
+  → 虚拟子网？（最长前缀匹配，fast path）
+      → 是：FIB → MeshPeer
+      → 否：规则引擎（Clash 式：域名/IP/geoip/进程）
+          → DIRECT → Egress{self}
+          → PROXY(组) → 组内选 peer → Egress{peer}
+          → REJECT → Drop
+```
+
+**深层复用**：
+1. Clash 的代理组 = Nexus 的 peer 组。组内选节点（url-test/fallback）直接复用
+   路径层的 RTT 打分和健康检查，不另起一套。
+2. 规则引擎输出收敛：不再输出"出站 tag"这种代理栈私有概念，直接输出 `RouteTarget`。
+3. 数据面统一：fabric datagram 加 1 字节意图位（mesh 转发 vs 出口 NAT），
+   接收方按位分流。
+
+**链式出口**（少见但支持）：先经某节点出、再走代理。每个节点的出口决策是
+本地独立的，链条自动组合——A 的规则说"经日本节点出"，日本节点的规则说
+"走美国代理"，无需在协议里编码整条链。UDP 可先行；TCP 需 §6.1 阶段二
+（L4 中继，smoltcp）先把流终结再塞进代理。
+
+**环路防护**：递归决策可能配出环路（A→B→A）。egress 意图带跳数上限
+（默认 2 跳），超了直接 Drop。
+
+**与现状的关系**：
+- 复用：`resolve_next_hop` 的 FIB 逻辑、路径层的 peer 打分、规则匹配器
+- 新建：`RouteTarget` 决策点（投影层内）、Egress NAT 模块、意图位协议
+- 取代：`tun.rs` 的 `selected_outbound_tag` 概念被 `RouteTarget` 取代
+
 ---
 
 ## 7. 插件机制
