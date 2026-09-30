@@ -19,7 +19,7 @@ pub use egress::{EgressNat, FlowKey, NatStats, Rule, SimpleRuleEngine};
 /// Re-exported domain types for unified routing (defined in `nexus-domain`,
 /// used — not modified — here).
 pub use nexus_domain::{RouteRequest, RouteTarget, RuleEngine};
-pub use routing::{Cidr, Router, UnifiedRouter, format_ipv4, parse_ipv4_dst, parse_ipv4_src};
+pub use routing::{Cidr, Router, UnifiedRouter, format_ipv4, parse_ipv4_dst};
 
 use std::collections::VecDeque;
 use std::io;

@@ -94,7 +94,7 @@ pub fn parse_ipv4_dst(packet: &[u8]) -> Option<u32> {
 }
 
 /// Parse the IPv4 source address (header bytes 12..16).
-pub fn parse_ipv4_src(packet: &[u8]) -> Option<u32> {
+pub(crate) fn parse_ipv4_src(packet: &[u8]) -> Option<u32> {
     parse_ipv4_addr(packet, 12)
 }
 
