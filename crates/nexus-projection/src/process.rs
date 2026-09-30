@@ -329,6 +329,33 @@ mod tests {
         assert!(attr.pid.is_some());
     }
 
+    /// Linux: attribute our own connected UDP socket; expect our own
+    /// process name. (Unconnected UDP sockets have no remote in
+    /// /proc/net/udp, so the positive case uses connect().)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn attribute_own_udp_connection() {
+        use std::net::UdpSocket;
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.connect(server_addr).unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        let attributor = LinuxProcessAttributor;
+        let mut attr = Attribution::unknown();
+        for _ in 0..50 {
+            attr = attributor.attribute(client_addr, server_addr, Proto::Udp);
+            if attr.process_name.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let expected = std::fs::read_to_string("/proc/self/comm").unwrap();
+        assert_eq!(attr.process_name.as_deref(), Some(expected.trim()));
+        assert!(attr.pid.is_some());
+    }
+
     /// A 5-tuple with no socket behind it → unknown (never blocks/panics).
     /// Cross-platform: Linux queries /proc, others use Noop.
     #[test]

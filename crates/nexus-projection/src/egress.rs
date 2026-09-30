@@ -299,6 +299,13 @@ impl EgressNat {
         self.qos = qos;
     }
 
+    /// Labels cached on a UDP flow at creation (S26), or `None` for an
+    /// untracked key. Per-flow observability, symmetric with
+    /// `TcpTerminator::flow_labels`.
+    pub fn flow_labels(&self, key: &FlowKey) -> Option<FlowLabels> {
+        self.table.get(key).map(|e| e.labels.clone())
+    }
+
     /// Outbound: record the flow. Returns the (unmodified, P0) packet,
     /// or `None` if the packet is unparsable.
     ///
@@ -800,14 +807,18 @@ mod tests {
         let out = udp_packet([10, 0, 0, 2], [1, 2, 3, 4], 40000, 53);
         nat.translate_outbound(&out, "self");
         let key = FlowKey::parse(&out).unwrap();
-        let labels = nat.table.get(&key).expect("flow recorded").labels.clone();
+        let labels = nat.flow_labels(&key).expect("labels cached at creation");
         // No socket behind 10.0.0.2:40000 → unknown → Normal.
         assert_eq!(labels.process_name, None);
         assert_eq!(labels.qos_class, QosClass::Normal);
         // Refresh (retransmit) preserves the cached labels.
         nat.translate_outbound(&out, "self");
-        let labels2 = nat.table.get(&key).expect("flow kept").labels.clone();
+        let labels2 = nat.flow_labels(&key).expect("flow kept");
         assert_eq!(labels, labels2);
+        // Untracked key → None.
+        let mut other = key;
+        other.src_port = 40001;
+        assert_eq!(nat.flow_labels(&other), None);
     }
 
     #[test]

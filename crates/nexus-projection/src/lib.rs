@@ -1638,4 +1638,162 @@ mod tests {
         assert!(p.recv_packet().is_none());
         assert_eq!(p.route_stats().hop_limit_exceeded, 1);
     }
+
+    /// Minimal IPv4/TCP SYN with valid checksums (for terminator tests).
+    #[cfg(test)]
+    fn syn_packet(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16) -> Vec<u8> {
+        let mut pkt = vec![0u8; 40];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&40u16.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 6;
+        pkt[12..16].copy_from_slice(&src);
+        pkt[16..20].copy_from_slice(&dst);
+        let c = crate::tcp::ip_checksum(&pkt[..20]);
+        pkt[10..12].copy_from_slice(&c.to_be_bytes());
+        pkt[20..22].copy_from_slice(&sport.to_be_bytes());
+        pkt[22..24].copy_from_slice(&dport.to_be_bytes());
+        pkt[24..28].copy_from_slice(&1000u32.to_be_bytes());
+        pkt[32] = 0x50;
+        pkt[33] = 0x02; // SYN
+        pkt[34..36].copy_from_slice(&8192u16.to_be_bytes());
+        let tc = crate::tcp::tcp_checksum(src, dst, &pkt[20..]);
+        pkt[36..38].copy_from_slice(&tc.to_be_bytes());
+        pkt
+    }
+
+    /// IPv4/UDP packet with explicit source (for NAT tests).
+    #[cfg(test)]
+    fn udp_packet_src(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16) -> Vec<u8> {
+        let mut pkt = vec![0u8; 28];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&28u16.to_be_bytes());
+        pkt[9] = 17;
+        pkt[12..16].copy_from_slice(&src);
+        pkt[16..20].copy_from_slice(&dst);
+        pkt[20..22].copy_from_slice(&sport.to_be_bytes());
+        pkt[22..24].copy_from_slice(&dport.to_be_bytes());
+        pkt[24..26].copy_from_slice(&8u16.to_be_bytes());
+        pkt
+    }
+
+    #[cfg(target_os = "linux")]
+    fn own_comm() -> String {
+        std::fs::read_to_string("/proc/self/comm")
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_attributed(local: SocketAddr, remote: SocketAddr, proto: Proto) {
+        // The (single, cached) attribution in the components below must see
+        // the /proc row; wait until the raw attributor resolves first.
+        let a = PlatformAttributor;
+        for _ in 0..50 {
+            if a.attribute(local, remote, proto).process_name.is_some() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("socket never appeared in /proc");
+    }
+
+    /// S26/W5: `ProjectionConfig.qos` reaches `SemanticDeps` via
+    /// `semantic_deps()`.
+    #[test]
+    fn s26_qos_config_plumbed_to_semantic_deps() {
+        let tun = Box::new(MockTun::default());
+        let config = ProjectionConfig {
+            qos: QosConfig::new().with_rule("myapp", QosClass::High),
+            ..Default::default()
+        };
+        let p = Projection::new_for_test(tun, config).with_router(Arc::new(test_router()));
+        let deps = p.semantic_deps().expect("router installed");
+        assert_eq!(deps.qos.classify(Some("myapp")), QosClass::High);
+        assert_eq!(deps.qos.classify(Some("other")), QosClass::Normal);
+        assert_eq!(deps.qos.classify(None), QosClass::Normal);
+        p.close();
+    }
+
+    /// S26/W5: `ProjectionConfig.qos` reaches the TCP terminator installed
+    /// by `with_tcp_egress` — a SYN carrying a real local 5-tuple is
+    /// attributed to this test process and classified by the rule.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn s26_terminator_qos_wiring_end_to_end() {
+        use std::net::{TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = listener.local_addr().unwrap();
+        let client = TcpStream::connect(server).unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let (_s, _) = listener.accept().unwrap();
+        let comm = own_comm();
+        wait_attributed(client_addr, server, Proto::Tcp);
+
+        let tun = Box::new(MockTun::default());
+        let config = ProjectionConfig {
+            qos: QosConfig::new().with_rule(&comm, QosClass::High),
+            ..Default::default()
+        };
+        let p = Projection::new_for_test(tun, config).with_tcp_egress();
+        let te = lock(&p.tcp_egress_slot)
+            .clone()
+            .expect("tcp egress installed");
+        let syn = syn_packet(
+            [127, 0, 0, 1],
+            [127, 0, 0, 1],
+            client_addr.port(),
+            server.port(),
+        );
+        {
+            let mut te = lock(&te);
+            te.terminator.handle_uplink(&syn, "peer-B");
+            assert_eq!(te.terminator.conn_count(), 1);
+            let id = te.terminator.stream_ids()[0];
+            let labels = te.terminator.flow_labels(id).expect("labels cached");
+            assert_eq!(labels.process_name.as_deref(), Some(comm.as_str()));
+            assert_eq!(labels.qos_class, QosClass::High);
+        }
+        p.close();
+    }
+
+    /// S26/W5: `ProjectionConfig.qos` reaches the shared `EgressNat` —
+    /// a UDP packet carrying a real local 5-tuple is attributed to this
+    /// test process and classified by the rule.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn s26_nat_qos_wiring_end_to_end() {
+        use std::net::UdpSocket;
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.connect(server_addr).unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let comm = own_comm();
+        wait_attributed(client_addr, server_addr, Proto::Udp);
+
+        let tun = Box::new(MockTun::default());
+        let config = ProjectionConfig {
+            qos: QosConfig::new().with_rule(&comm, QosClass::Background),
+            ..Default::default()
+        };
+        let p = Projection::new_for_test(tun, config);
+        let pkt = udp_packet_src(
+            [127, 0, 0, 1],
+            [127, 0, 0, 1],
+            client_addr.port(),
+            server_addr.port(),
+        );
+        let key = FlowKey::parse(&pkt).unwrap();
+        lock(&p.egress_nat)
+            .translate_outbound(&pkt, "self")
+            .expect("udp parsed");
+        let labels = lock(&p.egress_nat)
+            .flow_labels(&key)
+            .expect("labels cached");
+        assert_eq!(labels.process_name.as_deref(), Some(comm.as_str()));
+        assert_eq!(labels.qos_class, QosClass::Background);
+        p.close();
+    }
 }
