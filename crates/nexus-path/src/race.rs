@@ -173,7 +173,6 @@ pub fn race_connect(
                             // Drain any already-completed non-winner results.
                             while let Ok((other_idx, other_res)) = rx.try_recv() {
                                 if other_idx != idx {
-                                    running -= 1;
                                     if let Ok(b) = other_res {
                                         wasted += b;
                                     }
