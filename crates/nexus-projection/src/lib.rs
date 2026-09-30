@@ -491,6 +491,8 @@ impl Projection {
     #[cfg(test)]
     fn new_for_test(tun: Box<dyn TunDevice>, config: ProjectionConfig) -> Self {
         let transport = Arc::new(MockTransport::new("test"));
+        // Self-link so `send_packet` loopback works (single-peer fallback).
+        transport.link_peer("self", transport.inbox_sender());
         Self::new_inner(tun, config, transport.clone(), Some(transport), false)
     }
 
