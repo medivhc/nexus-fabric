@@ -150,5 +150,29 @@
     "module": "nexus-discovery",
     "category": "implementation-pitfall",
     "summary": "trait 方法与 inherent 方法同名时方法解析优先 inherent，必须用 UFCS 或泛型界调用 trait 版本（D1 Discovery::resolve 调和）"
+  },
+  {
+    "id": "shared-target-dir-stale-rmeta",
+    "file": "entries/2026-09-30-shared-target-dir-stale-rmeta.md",
+    "date": "2026-09-30",
+    "module": "engineering",
+    "category": "implementation-pitfall",
+    "summary": "多 worktree 共享 CARGO_TARGET_DIR 导致陈旧 rmeta 幻影编译错误（看到别的 worktree 的类型定义）；每 worktree 配独立 target dir，怀疑时 touch 相关 lib.rs 强制重建验证"
+  },
+  {
+    "id": "enum-discriminant-index",
+    "file": "entries/2026-09-30-enum-discriminant-index.md",
+    "date": "2026-09-30",
+    "module": "nexus-path",
+    "category": "implementation-pitfall",
+    "summary": "Review 发现：enum 判别值 as usize 强转做数组索引是潜伏 panic（debug_assert 在 release 被编译掉）；改用 exhaustive match 让加 variant 变成编译错误"
+  },
+  {
+    "id": "coverage-run-flaky-timing-test",
+    "file": "entries/2026-09-30-coverage-run-flaky-timing-test.md",
+    "date": "2026-09-30",
+    "module": "nexus-projection",
+    "category": "environment-pitfall",
+    "summary": "llvm-cov 插桩运行放大时序敏感测试 flakiness：rebind_failure_keeps_connection 在 coverage 下挂、单独跑 3/3 过；coverage-summary UNKNOWN 不阻塞，整体 PASS"
   }
 ]
