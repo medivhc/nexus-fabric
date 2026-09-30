@@ -55,14 +55,15 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let _json = args.iter().any(|a| a == "--json");
     if !udp_usable() {
-        println!(
-            "{{\"verdict\":\"SKIP\",\"reason\":\"udp send_to not permitted (sandbox)\"}}"
-        );
+        println!("{{\"verdict\":\"SKIP\",\"reason\":\"udp send_to not permitted (sandbox)\"}}");
         return;
     }
     let (json, pass) = match run() {
         Ok(x) => x,
-        Err(e) => (format!("{{\"verdict\":\"FAIL\",\"detail\":\"{}\"}}", esc(&e)), false),
+        Err(e) => (
+            format!("{{\"verdict\":\"FAIL\",\"detail\":\"{}\"}}", esc(&e)),
+            false,
+        ),
     };
     println!("{json}");
     if !pass {
@@ -72,8 +73,8 @@ fn main() {
 
 fn run() -> Result<(String, bool), String> {
     // 1. TURN server.
-    let server =
-        TurnServer::bind("127.0.0.1:0".parse().unwrap(), creds()).map_err(|e| format!("server bind: {e}"))?;
+    let server = TurnServer::bind("127.0.0.1:0".parse().unwrap(), creds())
+        .map_err(|e| format!("server bind: {e}"))?;
     let saddr = server.main_addr();
 
     // 2. A/B 分配中继地址。
@@ -98,11 +99,15 @@ fn run() -> Result<(String, bool), String> {
     }
 
     // 4. B：经 TurnSocket 监听。
+    // 注意：B 线程在 A 确认收完回显前不得退出——FabricConn drop 会 shutdown
+    // driver 线程，若 echo 数据还在 app buffer 未 pump 进 QUIC 就会丢（无背压，
+    // 见 SendStream 文档）。用 channel 做显式握手。
     let transport_b: Box<dyn UdpTransport> = Box::new(TurnSocket::new(client_b.clone()));
     let listener =
         FabricListener::bind_with_transport(transport_b).map_err(|e| format!("B listen: {e}"))?;
     let peer_b = listener.peer_id();
 
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     let server_thread = thread::spawn(move || -> Result<usize, String> {
         let conn = listener.accept().map_err(|e| format!("accept: {e}"))?;
         let (mut send, mut recv) = conn.accept_bi().map_err(|e| format!("accept_bi: {e}"))?;
@@ -117,9 +122,13 @@ fn run() -> Result<(String, bool), String> {
         }
         let mut off = 0;
         while off < data.len() {
-            off += send.write(&data[off..]).map_err(|e| format!("echo write: {e}"))?;
+            off += send
+                .write(&data[off..])
+                .map_err(|e| format!("echo write: {e}"))?;
         }
         send.finish().map_err(|e| format!("echo finish: {e}"))?;
+        // 等 A 确认收完后再退出，保持 driver 存活以 pump 完 echo。
+        let _ = done_rx.recv();
         Ok(data.len())
     });
 
@@ -135,7 +144,9 @@ fn run() -> Result<(String, bool), String> {
     let payload = payload();
     let mut off = 0;
     while off < payload.len() {
-        off += send.write(&payload[off..]).map_err(|e| format!("write: {e}"))?;
+        off += send
+            .write(&payload[off..])
+            .map_err(|e| format!("write: {e}"))?;
     }
     send.finish().map_err(|e| format!("finish: {e}"))?;
     let mut echo = Vec::new();
@@ -147,16 +158,18 @@ fn run() -> Result<(String, bool), String> {
         }
         echo.extend_from_slice(&buf[..n]);
     }
+    // 6. 断言（先通知 B 线程可以退出了，再 join，避免死锁）。
+    let roundtrip_ok = echo == payload;
+    let relayed_bytes = server.stats().relayed_bytes;
+    let relayed_ok = relayed_bytes > 0;
+    let pass = roundtrip_ok && relayed_ok;
+    // 通知 B 线程退出（此时才允许 drop 连接）。
+    let _ = done_tx.send(());
     let server_len = server_thread
         .join()
         .map_err(|_| "server thread panicked".to_string())?
         .map_err(|e| format!("server: {e}"))?;
-
-    // 6. 断言。
-    let roundtrip_ok = echo == payload && server_len == N;
-    let relayed_bytes = server.stats().relayed_bytes;
-    let relayed_ok = relayed_bytes > 0;
-    let pass = roundtrip_ok && relayed_ok;
+    let pass = pass && server_len == N;
     let verdict = if pass { "PASS" } else { "FAIL" };
     let json = format!(
         "{{\"verdict\":\"{verdict}\",\"roundtrip_ok\":{roundtrip_ok},\"relayed_bytes\":{relayed_bytes},\"channel_a_to_b\":\"{ch:#x}\"}}"
