@@ -66,6 +66,12 @@ socket，`nexus-fabric` 的被动迁移保证流不中断。
 **S8（成本可见）**：每条路径的 `cost`（中继带宽、蜂窝计费等）必须显式建模，
 不能隐藏在分数里。
 
+**S9（切换信号）**：`PathEvent::Switched` 是路径切换的唯一对外信号。
+路径层只做决策、不触碰会话层连接（保持对 `nexus-fabric` 零实现依赖，
+见 Allowed Dependencies）。应用层必须排空 `poll_event()` 并驱动会话层
+执行切换；不排空则切换不生效。`remove_candidate` 移除活跃路径时，
+若有备选候选，必须发出 `Switched`（S6 的事件形式）。
+
 ## Side Effects
 
 - 后台探测线程（owner：`PathManager`，Drop 时 join）。

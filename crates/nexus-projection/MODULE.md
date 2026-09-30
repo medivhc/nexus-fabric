@@ -52,6 +52,7 @@ P0 不做：TCP NAT（依赖 L4 中继）、
 - `nexus-fabric`（`FabricConn::send_datagram` / `recv_datagram` 类型）
 - `nexus-path`（`PathManager` 事件类型，仅类型）
 - `nexus-ingress`（SOCKS5/HTTP 代理协议状态机；仅解析器，零 I/O）
+- `nexus-path`（`PathManager` / `PathEvent`；联动胶水所需，见 S27）
 
 ## Forbidden Dependencies
 
@@ -200,6 +201,16 @@ accept 线程，sync，零 tokio）把 SOCKS5/HTTP 显式代理映射为 fabric 
   accept 成功时（对端 socket 归因）。归因失败绝不影响流建立。
 - 不做：per-packet 归因、按类排队调度（会话层/路径层尚无排队机制，后置）、
   IPv6、Windows WFP。
+
+**S27（路径联动）**：`PathLink` 拥有 `PathManager` + peer→`FabricConn`
+映射（依赖倒置：nexus-path 只发事件，联动胶水在 projection，见 S9）：
+- `pump()`：排空 `poll_event()`；在 `Switched{to, ..}` 时找到对应 peer
+  的 `FabricConn` 并调用 `rebind()`（阻塞至新路径生效，CID 不变）。
+- `rebind()` 成功 → 计数 `path_rebinds`；失败 → 计数
+  `path_rebind_errors`，保持旧连接可用（S2：切换不丢连接——失败时不断开）。
+- 无映射的 peer 事件 → 计数 `path_rebind_no_conn` 并忽略（不 panic）。
+- E4 必须走生产 `pump()` 路径（教训：`2026-09-30-e4-must-use-production-path`），
+  禁止手动调 `rebind()` 冒充联动。
 
 ## Side Effects
 
