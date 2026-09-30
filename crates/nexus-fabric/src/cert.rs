@@ -23,7 +23,7 @@ use quinn_proto::rustls::{
     crypto::ring::default_provider as ring_provider,
     pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
 };
-use quinn_proto::{ServerConfig, crypto::rustls::QuicClientConfig};
+use quinn_proto::{ServerConfig, TransportConfig, crypto::rustls::QuicClientConfig};
 
 use crate::{FabricError, PeerId};
 
@@ -258,6 +258,19 @@ impl ServerCertVerifier for PeerPinVerifier {
     }
 }
 
+/// Build the QUIC transport config shared by client and server endpoints.
+///
+/// Enables unreliable datagram support (S5): without
+/// `datagram_receive_buffer_size` quinn-proto negotiates
+/// `max_datagram_frame_size = 0` and every `datagrams().send()` fails with
+/// `Disabled`/`UnsupportedByPeer`, which the driver silently drops. The
+/// 1 MiB buffer holds ~850 max-size (1200 B) datagrams.
+pub fn quic_transport_config() -> Arc<TransportConfig> {
+    let mut t = TransportConfig::default();
+    t.datagram_receive_buffer_size(Some(1024 * 1024));
+    Arc::new(t)
+}
+
 /// Build the QUIC client crypto config: TLS 1.3, peer-key pinning, no client auth (P0).
 pub fn build_client_crypto(expected: PeerId) -> Result<QuicClientConfig, FabricError> {
     let provider = Arc::new(ring_provider());
@@ -276,8 +289,10 @@ pub fn build_client_crypto(expected: PeerId) -> Result<QuicClientConfig, FabricE
 pub fn build_server_config(id: &Identity) -> Result<ServerConfig, FabricError> {
     let cert = CertificateDer::from(id.cert_der.clone());
     let key = PrivatePkcs8KeyDer::from(id.key_der.clone());
-    ServerConfig::with_single_cert(vec![cert], key.into())
-        .map_err(|e| terr(format!("quic server config: {e:?}")))
+    let mut cfg = ServerConfig::with_single_cert(vec![cert], key.into())
+        .map_err(|e| terr(format!("quic server config: {e:?}")))?;
+    cfg.transport_config(quic_transport_config());
+    Ok(cfg)
 }
 
 #[cfg(test)]

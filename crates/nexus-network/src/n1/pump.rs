@@ -189,7 +189,8 @@ impl VpiPump {
         }
     }
 
-    /// 上行循环。
+    /// 上行循环。Ok(0) 表示 VPI 暂无包（非阻塞实现，如 Linux TUN fd），
+    /// 短暂让出而非当作空包处理——否则 100% 空转。
     fn uplink_loop(&self, stop: &AtomicBool) {
         let mut buf = vec![0u8; 4096];
         while !stop.load(Ordering::SeqCst) {
@@ -197,6 +198,11 @@ impl VpiPump {
             let n = {
                 let mut vpi = self.vpi.lock().unwrap();
                 match vpi.receive(&mut buf) {
+                    Ok(0) => {
+                        drop(vpi);
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
                     Ok(n) => n,
                     Err(_) => {
                         if stop.load(Ordering::SeqCst) {

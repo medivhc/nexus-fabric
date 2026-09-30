@@ -523,7 +523,8 @@ impl Loop {
         server_name: &str,
         now: Instant,
     ) -> Result<u64, FabricError> {
-        let cc = ClientConfig::new(Arc::new(crypto));
+        let mut cc = ClientConfig::new(Arc::new(crypto));
+        cc.transport_config(crate::cert::quic_transport_config());
         let (handle, quic) = self
             .endpoint
             .connect(now, cc, remote, server_name)
