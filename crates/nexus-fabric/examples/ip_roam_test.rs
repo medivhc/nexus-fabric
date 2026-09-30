@@ -93,6 +93,7 @@ fn parent() {
     line.clear();
     bout.read_line(&mut line).expect("B go2");
     println!("B: {}", line.trim());
+    assert!(line.contains("B_SENT2_NEWSTREAM"));
     line.clear();
     aout.read_line(&mut line).expect("A recv2");
     println!("A: {}", line.trim());
@@ -127,13 +128,14 @@ fn child_a() {
     let conn = listener.accept().expect("accept");
     let (_s, mut r) = conn.accept_bi().expect("accept_bi");
     let mut buf = [0u8; 1024];
-    // 收第一批
+    // 收第一批（旧流）
     let n = r.read(&mut buf).expect("read1");
     println!("A_RECV1: {} bytes: {}", n, String::from_utf8_lossy(&buf[..n]));
     std::io::stdout().flush().unwrap();
-    // 收第二批（roam 后）
-    r.read(&mut buf).expect("read2");
-    println!("A_RECV2_OK");
+    // 收第二批（新流，roam 后 B 开新流）
+    let (_s2, mut r2) = conn.accept_bi().expect("accept_bi2");
+    let n2 = r2.read(&mut buf).expect("read2");
+    println!("A_RECV2_OK: {} bytes", n2);
     std::io::stdout().flush().unwrap();
     std::thread::sleep(Duration::from_secs(2));
 }
@@ -177,9 +179,10 @@ fn child_b() {
                 std::io::stdout().flush().unwrap();
             }
             "GO2" => {
-                // 立即发送（不等迁移），测试是否需要等待。
-                s.write(b"hello2").expect("write2");
-                println!("B_SENT2");
+                // 开新流（模拟 N1 watcher 的行为），立即发送。
+                let (mut s2, _r2) = conn.open_bi().expect("open_bi2");
+                s2.write(b"hello2").expect("write2");
+                println!("B_SENT2_NEWSTREAM");
                 std::io::stdout().flush().unwrap();
             }
             _ => {}
