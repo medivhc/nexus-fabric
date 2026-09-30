@@ -1,0 +1,43 @@
+schema_version = 1
+id = "product.n1-connectivity-roam"
+title = "N1 装配漫游：VPI 子网内 TCP 传文件，中途改一端 underlay 地址不断流、CID 不变"
+evidence_strength = "E4"
+requirement = "v9 §1/§8/§10/§12 N1 Universal Connectivity；白皮书 §6；M1–M7"
+
+[given]
+topology = "xc-pc-linux 真机；example 内双节点，各自 unshare(CLONE_NEWNET) 隔离 netns；新 netns 第一件事拉起 lo（教训 os-assemble-lo-unshare），再建 TUN（LinuxTunAdapter/TunVpi）、配 VPI 子网 IP、加路由"
+peers = "静态配置：PeerId（ed25519）+ 已知 locator（M3 首期；mDNS/LSA 后置）；Identity≠Locator"
+bearer = "IP 包走 FabricConn unreliable datagram（M2）；Link 保活走可靠双向流；每对端一个 Connection，按 PeerId 索引，与地址解耦（M4）"
+roam = "文件传输中途修改 B 端 underlay 地址（模拟手机关闭 WiFi 切网）；Link State 观测（socket 错误 + 周期重探测）触发 resolve → rebind()（M5）"
+driver_discipline = "example 只做外部可观察操作（发包、等统计、读 JSON）；禁止直接调内部函数补状态（教训 e4-must-use-production-path）"
+
+# 可执行 E4：A→B 经 VPI 子网 TCP 传确定性文件 -> 中途改 B underlay 地址
+# -> rebind 恢复 -> 传输完成 -> 校验文件哈希、CID 不变、确实发生过 rebind。
+[when]
+command = "cargo run --quiet -p nexus-network --example n1_roam -- --json"
+
+# 冻结期望（M7）。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+# 数据面：文件完整到达（哈希一致，不重不漏）。
+[[expect]]
+field = "transfer.hash_match"
+equals = true
+
+# M4：rebind 不换 CID（连接与地址解耦）。
+[[expect]]
+field = "connection.id_unchanged"
+equals = true
+
+# 反空转断言：必须真实发生过 rebind，否则 PASS 无意义。
+[[expect]]
+field = "link.rebind_occurred"
+equals = true
+
+# 首版宽松门限：只要求"不断"，恢复速度后续收紧（harness 不支持 max，
+# 故 example 输出布尔值，stalled_ms 仍作为诊断字段输出）。
+[[expect]]
+field = "transfer.stalled_within_budget"
+equals = true

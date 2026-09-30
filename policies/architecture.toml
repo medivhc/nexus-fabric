@@ -118,7 +118,7 @@ layer = "delivery"
 
 [[crate]]
 name = "nexus-network"
-allowed_internal_dependencies = ["nexus-domain", "nexus-policy", "nexus-planner", "nexus-session", "nexus-delivery", "nexus-dns"]
+allowed_internal_dependencies = ["nexus-domain", "nexus-policy", "nexus-planner", "nexus-session", "nexus-delivery", "nexus-dns", "nexus-platform"]
 portable = false
 layer = "domain-runtime"
 
