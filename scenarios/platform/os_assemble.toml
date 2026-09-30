@@ -1,0 +1,55 @@
+schema_version = 1
+id = "platform.os-assemble"
+title = "Linux OS 装配：TUN 配 IP/路由事务性装配 + 退出清理（netns E4）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-os-assemble"
+
+[given]
+platform = "linux"
+# E4 安全红线：只在隔离 netns 内运行，绝不动真机主网络。
+# example 内部 unshare(CLONE_NEWNET) 进隔离 netns；无 CAP_SYS_ADMIN 时
+# 输出 verdict=SKIP（harness 判 UNKNOWN），不判 FAIL。
+# --dry-run 下零 netlink 写操作。
+
+[when]
+command = "cargo run --quiet -p nexus-platform-linux --example os_assemble -- --json"
+
+[[expect]]
+field = "verdict"
+one_of = ["PASS", "SKIP"]
+
+[[expect]]
+field = "netns.isolated"
+equals = true
+
+[[expect]]
+field = "addr.assigned"
+equals = true
+
+[[expect]]
+field = "route.subnet_installed"
+equals = true
+
+[[expect]]
+field = "echo.udp_ok"
+equals = true
+
+[[expect]]
+field = "idempotent.no_dup_addrs"
+equals = true
+
+[[expect]]
+field = "idempotent.no_dup_routes"
+equals = true
+
+[[expect]]
+field = "dry_run.zero_netlink_writes"
+equals = true
+
+[[expect]]
+field = "cleanup.addrs_removed"
+equals = true
+
+[[expect]]
+field = "cleanup.routes_removed"
+equals = true

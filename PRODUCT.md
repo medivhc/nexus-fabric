@@ -2986,3 +2986,35 @@ LSDB/LSA/泛洪协议零改动（设计文档既定映射）。
 `stop()` join 回收验证。
 **冻结边界**：无（B 层最后一块）。
 **契约 hash**：`c2d7d1d1bbdfbb9357a24e880eb172621b05080134b487d5b784beca8709389e`（verify 时写入；计算方法：SHA-256 over §12.58 节文本自 `### §12.58` 至文件末，排除本行）。
+
+### 12.59 P3.x Linux OS 装配：IP/路由/DNS/daemon（2026-09-30）{#12-os-assemble}
+
+接 §12.29 冻结边界解冻（P3.2 只验证建设备/读写帧，本期补 OS 集成）：
+TUN 设备从"能收发包"到"系统真正走它"。首期只 Linux
+（Windows/macOS 后置）。
+
+- **IP 地址**（`addr.rs`）：给 TUN 设备配地址（如 10.99.0.1/24），netlink；
+  幂等（重复 apply 不产生重复地址）。
+- **路由表**（`route.rs`）：虚拟子网路由必做 + 可选默认路由；
+  **事务性** apply：apply 前拍快照（地址+路由），任一步失败自动 rollback
+  到快照；rollback 本身失败 → 类型化错误 + 告警（不静默）。
+- **DNS**（`dns.rs`）：复用投影层内置 DNS server（DESIGN P1）；
+  **不改** `/etc/resolv.conf` 全局文件；只服务 TUN 网段查询。
+- **daemon**（`daemon.rs`）：自研 daemon（PID 文件防 pkill 误杀、信号处理、
+  退出清理）；正常退出 / SIGTERM / SIGINT → 清理本进程创建的地址和路由；
+  kill -9 无法清理（文档明说）；systemd unit 后置。
+- **SSH 保护**：默认不开 default-route；开启需显式双标志
+  `--default-route --yes-i-know`。
+- **干跑**：`--dry-run` 下零 netlink 写操作，只输出计划。
+- **可观测**：操作日志（`os_assemble.log`）+ 计数器。
+
+E4 场景 `scenarios/platform/os_assemble.toml`（`id=platform.os-assemble`，
+`platform = "linux"`）：
+example 内部 unshare(CLONE_NEWNET) 进隔离 netns（**绝不动真机主网络**），
+建 TUN → apply（配 IP + 加子网路由）→ UDP 回显 → 断言幂等（无重复地址/路由）
+→ `--dry-run` 断言零 netlink 写 → 退出 → 断言地址/路由清理干净；
+无 CAP_SYS_ADMIN 时输出 SKIP（harness 判 UNKNOWN）。
+期望 `verdict=PASS`。
+
+冻结边界：Windows/macOS/Android/iOS 后置；不改 `/etc/resolv.conf`；
+不做 split-DNS 策略（后置）；netns E4 验证机制正确性，非生产拓扑。
