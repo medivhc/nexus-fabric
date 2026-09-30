@@ -143,6 +143,23 @@ supply_chain = "0.8.5 已由 Cargo.lock 锁定；传递依赖 rand_core/rand_cha
 approved = true
 approved_date = "2026-09-25"
 [[dependency_reviews.direct]]
+consumer = "crates/nexus-projection"
+crate = "smoltcp"
+version = "0.12"
+default_features = false
+features = ["std", "proto-ipv4", "socket-tcp", "medium-ip"]
+architecture_layer = "projection (TCP egress terminator); userspace TCP state machine, no async runtime, no tokio (repo is std-only)"
+feature_scope = "std+proto-ipv4+socket-tcp+medium-ip only; ipv6/udp/icmp/dns/mqtt/ethernet explicitly disabled for P0"
+license = "MIT OR Apache-2.0 (allowlisted; to be confirmed by cargo-deny at implementation time)"
+security = "RustSec DB to be checked at implementation time via harness gate"
+portability = "pure Rust, no_std capable; not in portable_core (projection is platform-side)"
+supply_chain = "version pinned by Cargo.lock (lockfile_required); zero transitive deps with this feature set"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-09-30"
+review_basis = "2026-09-30 foundation decision: userspace TCP stack = smoltcp (MEMORY.md); live build eval on 2026-09-30 (no-default-features set compiles)"
+
+[[dependency_reviews.direct]]
 consumer = "crates/nexus-fabric"
 crate = "quinn-proto"
 version = "0.11"

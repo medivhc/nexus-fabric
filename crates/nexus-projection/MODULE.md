@@ -14,7 +14,8 @@ P0 不做：TCP NAT（依赖 L4 中继）、
 语义入口（§6.2）、进程 QoS（§6.3）。
 3b-2（跨节点 Egress + 跳数防环 + NAT 上限）已完成。
 3b-3（域名规则：DNS 嗅探 + 域名→出口映射 + 解析缓存）已完成。
-3b-4（真实 UDP Egress：egress 节点真实 socket + 回包反向 NAT）进行中。
+3b-4（真实 UDP Egress：egress 节点真实 socket + 回包反向 NAT）已完成。
+3b-5（TCP Egress：originator smoltcp 终结 + fabric 字节流 + egress TcpStream 中继）进行中。
 
 ## Non-Responsibilities
 
@@ -26,7 +27,8 @@ P0 不做：TCP NAT（依赖 L4 中继）、
 - 不做 QUIC 传输（`nexus-fabric`）、路径选择（`nexus-path`）。
 - 不做跨节点 Egress（3b-2，已完成）。
 - 3b-3 做域名规则（DNS 嗅探 + 域名→出口映射 + 解析缓存，已完成）。
-- 3b-4 做真实 UDP Egress（egress 节点真实 socket + 回包反向 NAT）。
+- 3b-4 做真实 UDP Egress（egress 节点真实 socket + 回包反向 NAT，已完成）。
+- 3b-5 做 TCP Egress（originator smoltcp 终结 + fabric 字节流 + egress TcpStream 中继）。
 
 ## Inputs
 
@@ -130,6 +132,24 @@ P0 只处理 UDP；TCP 包到达真实 egress 时丢弃并计数（`egress_tcp_d
 创建而绑定、随 `close()`/`Drop` 而关闭；接收线程阻塞在 `recv_from`，
 关闭时通过 socket 关闭唤醒并 join。线程只持有 Arc clone，不阻止 Drop。
 
+**S21（TCP 终结）**：originator 收到路由到 `Egress{peer}` 的 TCP SYN 时，
+用 smoltcp 在本地完成三次握手（SYN→SYN-ACK→ACK），应用无感知。
+握手完成前应用数据不转发；首包非 SYN（无连接状态的 ACK/数据）丢弃并计数
+（`tcp_no_conn_dropped`）。IP 目标在送入 smoltcp 前改写为接口地址，
+真实目标记在流表（stream_id → 真实目标）中。
+
+**S22（字节流中继）**：ESTABLISHED 连接的应用字节经 fabric STREAM 意图
+数据报（意图值 `0x02`，帧格式：stream_id u32be + flags u8 + 数据；
+SYN 帧附带真实目标 ip:port）发往 egress 节点；egress 节点用 `TcpStream`
+连接真实目标，双向中继字节。stream_id 全局唯一（AtomicU64），
+连接表上限 1024，满时拒绝新 SYN 并计数（`tcp_table_full`）。
+
+**S23（连接生命周期）**：任一端 FIN → 对端对应半关闭/全关闭；
+RST/错误 → 对端 RST；smoltcp 侧 socket 关闭 → 发 FIN 帧；
+egress 侧 TcpStream EOF/错误 → 发 FIN/RST 帧。半开连接（SYN 已收、
+30s 未 ESTABLISHED）回收并计数（`tcp_half_open_expired`）。
+`close()` 时关闭所有流并 join 中继线程。
+
 ## Side Effects
 
 - TUN 设备读写（`TunDevice::read` / `write`）。
@@ -172,6 +192,10 @@ pub struct DnsCache { /* ... */ }
 /// 真实 UDP 出口：拥有一个 `UdpSocket`，把 egress 意图包的 UDP 载荷发往
 /// 互联网，并把回包反向 NAT 后交回 transport（S18/S19/S20）。
 pub struct RealUdpEgress { /* ... */ }
+
+/// TCP 出口终结器：originator 侧用 smoltcp 终结 TCP，字节流经 fabric
+/// STREAM 意图转发；egress 侧用 `TcpStream` 中继到真实目标（S21/S22/S23）。
+pub struct TcpEgress { /* ... */ }
 
 /// 本地出口 UDP NAT（Egress{self}）。
 pub struct EgressNat { /* ... */ }
@@ -225,13 +249,19 @@ fabric 传输（E4 验证封装逻辑）；与 fabric 的真实接线是下一�
 - E4: `product.fabric-egress-real-udp`（3b-4：A 经 Egress{B} 发 UDP 包 →
   B 经真实 socket 发往本地 echo 服务器 → 回包经 B 的 NAT 反查 →
   transport 发回 A → A 的 TUN 收到回包；无 mock 回包）
+- E4: `product.fabric-egress-tcp`（3b-5：A 的 TUN 收到 TCP SYN →
+  smoltcp 本地完成握手 → 应用字节经 STREAM 意图到 B →
+  B 经 TcpStream 发往本地 echo 服务器 → 回字节经 STREAM 回 A →
+  smoltcp 发到 A 的 TUN；FIN 双向关闭）
 - 单元测试：S1 包完整、S5 超大包丢弃计数、S2 意图位开销、S9 路由确定性、
   S10 虚拟子网优先、S11 NAT 回包、S12 Drop 计数、S13 跳数验证、S14 NAT 上限、
   S15 DNS 嗅探无损（坏包/非 DNS 不丢包）、S16 域名优先（域名命中覆盖 IP 规则、
   无命中回退）、S17 解析缓存（响应建缓存、TTL 失效、容量驱逐、后续包继承）、
   S18 真实 socket 发送（发送失败计数不 panic、TCP 丢弃计数）、S19 回包反向
   NAT（无映射丢弃计数）、S20 socket 生命周期（close 关闭并 join 线程）、
-  MockTun 集成
+  S21 TCP 终结（smoltcp 本地握手、首包非 SYN 丢弃计数）、S22 字节流中继
+  （STREAM 意图帧、egress TcpStream 双向中继、表满拒绝计数）、S23 连接
+  生命周期（FIN/RST 传播、半开回收、close 清理）、MockTun 集成
 
 ## Performance Budget
 
