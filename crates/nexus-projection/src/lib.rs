@@ -22,8 +22,8 @@ pub use dns::{
     parse_dns_query, parse_dns_response,
 };
 pub use egress::{
-    DEFAULT_MAX_NAT_ENTRIES, DomainMatch, DomainRule, EgressNat, FlowKey, NatStats, Rule,
-    SimpleRuleEngine,
+    DEFAULT_MAX_NAT_ENTRIES, DomainMatch, DomainRule, EgressNat, FlowKey, NatStats, RealEgressStats,
+    RealUdpEgress, Rule, SimpleRuleEngine,
 };
 /// Re-exported domain types for unified routing (defined in `nexus-domain`,
 /// used — not modified — here).
@@ -33,6 +33,7 @@ pub use transport::{DatagramTransport, FabricTransport, MockTransport, Transport
 
 use std::collections::VecDeque;
 use std::io;
+use std::net::SocketAddr;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -243,9 +244,13 @@ fn send_with_intent(
 
 /// L3 tunnel projection: TUN <-> fabric datagrams, with unified routing.
 ///
-/// Two background threads (owner: this struct, joined on `close`/`Drop`):
+/// Three background threads (owner: this struct, joined on `close`/`Drop`):
 /// - uplink: TUN.read -> route -> MTU check -> transport / local NAT / drop
 /// - downlink: transport.recv -> hop validation (S13) -> TUN.write or NAT
+///   (+ real socket egress when enabled, S18)
+/// - egress-recv: real socket replies -> reverse NAT -> transport back to
+///   the origin peer with mesh intent (S19), or to the local TUN for
+///   `Egress{self}`.
 ///
 /// `send_packet` is the test/E4 injection path (same routing + MTU check as
 /// the uplink thread). `recv_packet` polls the transport directly and is
@@ -268,11 +273,16 @@ pub struct Projection {
     route_stats: Arc<Mutex<RouteStats>>,
     /// Local egress NAT for `Egress{self}` (and inbound egress handling).
     egress_nat: Arc<Mutex<EgressNat>>,
+    /// Real UDP egress (3b-4, S18/S19/S20). Shared slot so the downlink and
+    /// egress-recv threads (spawned in `new`) see the builder-installed
+    /// instance — same pattern as `router_slot` / `transport_slot`.
+    real_egress_slot: Arc<Mutex<Option<Arc<RealUdpEgress>>>>,
     stats: Arc<Mutex<TunStats>>,
     path_switches: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     uplink: Option<thread::JoinHandle<()>>,
     downlink: Option<thread::JoinHandle<()>>,
+    egress_recv: Option<thread::JoinHandle<()>>,
 }
 
 impl Projection {
@@ -316,8 +326,13 @@ impl Projection {
         // the threads see the new transport.
         let transport_slot: Arc<Mutex<Arc<dyn DatagramTransport>>> =
             Arc::new(Mutex::new(transport));
+        // Real-egress slot: `with_real_egress` (builder, runs after `new`)
+        // installs the instance; the downlink and egress-recv threads read
+        // it through this shared slot.
+        let real_egress_slot: Arc<Mutex<Option<Arc<RealUdpEgress>>>> =
+            Arc::new(Mutex::new(None));
 
-        let (uplink, downlink) = if spawn_threads {
+        let (uplink, downlink, egress_recv) = if spawn_threads {
             // Uplink: TUN -> route -> transport / local NAT / drop.
             let up = {
                 let tun = Arc::clone(&tun);
@@ -327,6 +342,7 @@ impl Projection {
                 let router = Arc::clone(&router);
                 let route_stats = Arc::clone(&route_stats);
                 let egress_nat = Arc::clone(&egress_nat);
+                let real_egress_slot = Arc::clone(&real_egress_slot);
                 thread::Builder::new()
                     .name("projection-uplink".into())
                     .spawn(move || {
@@ -359,21 +375,30 @@ impl Projection {
                                 RouteTarget::Egress { ref peer } => {
                                     if peer == "self" {
                                         lock(&route_stats).egress_self += 1;
-                                    } else {
-                                        lock(&route_stats).egress_remote += 1;
-                                    }
-                                    // Originator tracks the flow for reply
-                                    // validation (S11), regardless of where
-                                    // the actual internet egress happens.
-                                    lock(&egress_nat).translate_outbound(pkt, peer);
-                                    if peer == "self" {
-                                        // Local egress: leaves via the real
-                                        // socket (production) or mock (E4).
+                                        // Local egress: real socket when
+                                        // enabled (S18, records the flow
+                                        // under the translated key),
+                                        // otherwise the mock record-only
+                                        // path (older E4s).
+                                        match lock(&real_egress_slot).clone() {
+                                            Some(re) => {
+                                                re.send(pkt, "self");
+                                            }
+                                            None => {
+                                                lock(&egress_nat)
+                                                    .translate_outbound(pkt, peer);
+                                            }
+                                        }
                                         let mut s = lock(&stats);
                                         s.packets_out += 1;
                                         s.bytes_out += n as u64;
                                         continue;
                                     }
+                                    lock(&route_stats).egress_remote += 1;
+                                    // Originator tracks the flow for reply
+                                    // validation (S11), regardless of where
+                                    // the actual internet egress happens.
+                                    lock(&egress_nat).translate_outbound(pkt, peer);
                                     // Remote egress: forward via transport.
                                     // Originator sets hops=0 (S13).
                                     let transport = lock(&transport_slot).clone();
@@ -415,6 +440,7 @@ impl Projection {
                 let shutdown = Arc::clone(&shutdown);
                 let route_stats = Arc::clone(&route_stats);
                 let egress_nat = Arc::clone(&egress_nat);
+                let real_egress_slot = Arc::clone(&real_egress_slot);
                 // F1 fix: the downlink must see the router so DNS responses
                 // arriving via transport feed the DnsCache (S17). The routing
                 // decision itself is discarded — the packet is already here,
@@ -441,13 +467,22 @@ impl Projection {
                                             lock(&route_stats).hop_limit_exceeded += 1;
                                             continue;
                                         }
-                                        // We are the egress node: track the
-                                        // flow so replies route back to the
-                                        // origin peer (S11). Production
-                                        // forwards `pkt` to a real internet
-                                        // socket here; E4 drives replies via
+                                        // We are the egress node. 3b-4
+                                        // (S18): forward via the real socket
+                                        // when enabled (records the flow
+                                        // under the translated key);
+                                        // otherwise the record-only mock
+                                        // path — E4 drives replies via
                                         // `handle_egress_reply`.
-                                        lock(&egress_nat).translate_outbound(pkt, &from_peer);
+                                        match lock(&real_egress_slot).clone() {
+                                            Some(re) => {
+                                                re.send(pkt, &from_peer);
+                                            }
+                                            None => {
+                                                lock(&egress_nat)
+                                                    .translate_outbound(pkt, &from_peer);
+                                            }
+                                        }
                                         let mut s = lock(&stats);
                                         s.packets_in += 1;
                                         s.bytes_in += pkt.len() as u64;
@@ -487,9 +522,65 @@ impl Projection {
                     })
                     .expect("spawn projection downlink")
             };
-            (Some(up), Some(down))
+            // Egress-recv (3b-4, S19/S20): real socket replies -> reverse
+            // NAT -> back to the origin peer with mesh intent, or to the
+            // local TUN for `Egress{self}`. Polls `recv_reply`; exits on
+            // shutdown so `close` can join it (S20).
+            let er = {
+                let real_egress_slot = Arc::clone(&real_egress_slot);
+                let transport_slot = Arc::clone(&transport_slot);
+                let tun = Arc::clone(&tun);
+                let stats = Arc::clone(&stats);
+                let shutdown = Arc::clone(&shutdown);
+                thread::Builder::new()
+                    .name("projection-egress-recv".into())
+                    .spawn(move || {
+                        while !shutdown.load(Ordering::Relaxed) {
+                            let re = lock(&real_egress_slot).clone();
+                            match re {
+                                None => {
+                                    thread::sleep(Duration::from_millis(10));
+                                    continue;
+                                }
+                                Some(re) => match re.recv_reply() {
+                                    Some((ip_packet, peer)) => {
+                                        if peer == "self" {
+                                            // Local egress origin: deliver
+                                            // to the TUN directly.
+                                            let mut tun = lock(&tun);
+                                            if tun.write(&ip_packet).is_ok() {
+                                                let mut s = lock(&stats);
+                                                s.packets_in += 1;
+                                                s.bytes_in += ip_packet.len() as u64;
+                                            }
+                                        } else {
+                                            // S19: mesh intent back to the
+                                            // originator; its downlink
+                                            // NAT-validates it (S11).
+                                            let transport =
+                                                lock(&transport_slot).clone();
+                                            send_with_intent(
+                                                &transport,
+                                                &stats,
+                                                &peer,
+                                                &ip_packet,
+                                                mtu,
+                                                encode_intent(false, 0),
+                                            );
+                                        }
+                                    }
+                                    None => {
+                                        thread::sleep(Duration::from_millis(1));
+                                    }
+                                },
+                            }
+                        }
+                    })
+                    .expect("spawn projection egress-recv")
+            };
+            (Some(up), Some(down), Some(er))
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         Self {
@@ -500,11 +591,13 @@ impl Projection {
             router_slot: router,
             route_stats,
             egress_nat,
+            real_egress_slot,
             stats,
             path_switches,
             shutdown,
             uplink,
             downlink,
+            egress_recv,
         }
     }
 
@@ -561,6 +654,29 @@ impl Projection {
     pub fn with_router(self, router: Arc<dyn Router>) -> Self {
         *lock(&self.router_slot) = Some(router);
         self
+    }
+
+    /// Enable real UDP egress (3b-4, S18/S19/S20). Builds the egress from
+    /// this projection's shared NAT table and makes it visible to the
+    /// downlink and egress-recv threads. Fails when UDP is unavailable
+    /// (callers map this to SKIP, not FAIL).
+    pub fn with_real_egress(self) -> io::Result<Self> {
+        let re = RealUdpEgress::new(Arc::clone(&self.egress_nat))?;
+        *lock(&self.real_egress_slot) = Some(Arc::new(re));
+        Ok(self)
+    }
+
+    /// Real-egress counters (S18/S19), or `None` when not enabled.
+    pub fn real_egress_stats(&self) -> Option<RealEgressStats> {
+        lock(&self.real_egress_slot).as_ref().map(|re| re.stats())
+    }
+
+    /// Bound addresses of live egress flow sockets (E4 probing, S19).
+    pub fn real_egress_socket_addrs(&self) -> Vec<SocketAddr> {
+        lock(&self.real_egress_slot)
+            .as_ref()
+            .map(|re| re.socket_addrs())
+            .unwrap_or_default()
     }
 
     /// Routing counters (S12).
@@ -738,6 +854,12 @@ impl Projection {
         if let Some(h) = self.downlink.take() {
             let _ = h.join();
         }
+        if let Some(h) = self.egress_recv.take() {
+            let _ = h.join();
+        }
+        // S20: drop the real egress after the threads using it have joined,
+        // closing all flow sockets.
+        *lock(&self.real_egress_slot) = None;
     }
 }
 

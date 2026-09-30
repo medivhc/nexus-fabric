@@ -11,9 +11,18 @@
 
 use nexus_domain::{RouteRequest, RouteTarget, RuleEngine};
 use std::collections::HashMap;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::routing::{Cidr, parse_ipv4_dst};
+
+/// Lock helper that tolerates poisoning (a panicked thread must not
+/// permanently break the egress path).
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// A single CIDR → [`RouteTarget`] rule. First match wins.
 #[derive(Debug, Clone)]
@@ -228,6 +237,11 @@ pub struct NatEntry {
     /// route the reply back.
     pub peer: String,
     pub last_seen: Instant,
+    /// Original outbound 5-tuple (S19). For the mock path this equals the
+    /// table key; for the real-socket path the key is the *translated*
+    /// tuple (socket address) and `orig` is needed to rebuild the reply
+    /// IP packet for the originator.
+    pub orig: FlowKey,
 }
 
 /// NAT counters (S8/S11: honest, only successful translations counted).
@@ -276,6 +290,19 @@ impl EgressNat {
     /// S14: if the table is full, evict the oldest entry first.
     pub fn translate_outbound(&mut self, packet: &[u8], peer: &str) -> Option<Vec<u8>> {
         let key = FlowKey::parse(packet)?;
+        self.record_flow(key, key, peer);
+        Some(packet.to_vec())
+    }
+
+    /// Record a flow under an explicit key (S18/S19).
+    ///
+    /// The mock path records under the packet's own 5-tuple (`key == orig`).
+    /// The real-socket path records under the *translated* key (the flow
+    /// socket's address) with `orig` = the original 5-tuple, so socket
+    /// replies reverse-lookup correctly.
+    ///
+    /// S14: if the table is full, evict the oldest entry first.
+    pub fn record_flow(&mut self, key: FlowKey, orig: FlowKey, peer: &str) {
         if !self.table.contains_key(&key) && self.table.len() >= self.max_entries {
             self.evict_oldest();
         }
@@ -284,29 +311,44 @@ impl EgressNat {
             NatEntry {
                 peer: peer.to_string(),
                 last_seen: Instant::now(),
+                orig,
             },
         );
         self.stats.egress_handled += 1;
         self.stats.current_flows = self.table.len();
-        Some(packet.to_vec())
     }
 
     /// Inbound reply: reverse-lookup the flow. Returns the packet and the
     /// originating peer, or `None` (counted in `reply_dropped`).
     pub fn translate_inbound(&mut self, packet: &[u8]) -> Option<(Vec<u8>, String)> {
         let reply_key = FlowKey::parse(packet)?;
+        let (_, peer) = self.lookup_reply(&reply_key)?;
+        Some((packet.to_vec(), peer))
+    }
+
+    /// Reverse-lookup by explicit reply key (S19).
+    ///
+    /// Returns the recorded original 5-tuple and the origin peer, or `None`
+    /// (counted in `reply_dropped`). Refreshes `last_seen` on hit, mirroring
+    /// [`EgressNat::translate_inbound`].
+    pub fn lookup_reply(&mut self, reply_key: &FlowKey) -> Option<(FlowKey, String)> {
         let orig_key = reply_key.reversed();
         match self.table.get_mut(&orig_key) {
             Some(entry) => {
                 entry.last_seen = Instant::now();
                 self.stats.reply_received += 1;
-                Some((packet.to_vec(), entry.peer.clone()))
+                Some((entry.orig, entry.peer.clone()))
             }
             None => {
                 self.stats.reply_dropped += 1;
                 None
             }
         }
+    }
+
+    /// Does the table contain `key`? Used to prune dead flow sockets (S20).
+    pub fn contains(&self, key: &FlowKey) -> bool {
+        self.table.contains_key(key)
     }
 
     /// Drop entries idle longer than `timeout`. Returns the evicted count.
@@ -355,6 +397,284 @@ impl EgressNat {
 impl Default for EgressNat {
     fn default() -> Self {
         Self::new(DEFAULT_MAX_NAT_ENTRIES)
+    }
+}
+
+/// Counters for the real UDP egress path (S18/S19).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RealEgressStats {
+    /// Packets forwarded via the real socket (S18).
+    pub real_sent: u64,
+    /// Socket send failures (counted, never panics, S18).
+    pub egress_send_failed: u64,
+    /// Non-UDP packets dropped (P0 is UDP-only, S18).
+    pub egress_tcp_dropped: u64,
+    /// Replies reverse-NAT-matched and handed back (S19).
+    pub reply_routed: u64,
+    /// Replies with no NAT mapping dropped (S19).
+    pub unmapped_dropped: u64,
+}
+
+/// Split an IPv4/UDP packet into (udp_payload, flow_key).
+/// `None` for non-UDP or malformed packets (S18: P0 is UDP-only).
+fn udp_payload(packet: &[u8]) -> Option<(&[u8], FlowKey)> {
+    let key = FlowKey::parse(packet)?;
+    if key.proto != 17 {
+        return None;
+    }
+    let ihl = ((packet[0] & 0x0F) as usize) * 4;
+    if packet.len() < ihl + 8 {
+        return None;
+    }
+    Some((&packet[ihl + 8..], key))
+}
+
+/// Translated NAT key for a flow socket: `{src: bound_addr, dst: orig.dst}`.
+///
+/// The socket is bound to `0.0.0.0:ephemeral`; the wildcard is used verbatim
+/// on both record and reply lookup, so the keys match. The ephemeral port is
+/// unique per flow socket, which is what demultiplexes replies.
+fn translated_key(sock: &UdpSocket, orig: &FlowKey) -> Option<FlowKey> {
+    let local = sock.local_addr().ok()?;
+    let src_ip = match local.ip() {
+        IpAddr::V4(v) => u32::from_be_bytes(v.octets()),
+        IpAddr::V6(_) => return None, // P0: IPv4 only
+    };
+    Some(FlowKey {
+        src_ip,
+        src_port: local.port(),
+        dst_ip: orig.dst_ip,
+        dst_port: orig.dst_port,
+        proto: 17,
+    })
+}
+
+/// IPv4 header checksum (one's complement).
+fn ipv4_checksum(header: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    for chunk in header.chunks(2) {
+        let word = if chunk.len() == 2 {
+            u16::from_be_bytes([chunk[0], chunk[1]]) as u32
+        } else {
+            (chunk[0] as u32) << 8
+        };
+        sum += word;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Rebuild a full IPv4/UDP packet for a reply (S19).
+///
+/// `orig` is the recorded original 5-tuple: the reply's source is the
+/// original destination and vice versa. The originator's downlink parses
+/// this packet for NAT validation (S11), so it must be well-formed.
+fn build_reply_packet(orig: &FlowKey, payload: &[u8]) -> Vec<u8> {
+    let mut pkt = vec![0u8; 20 + 8 + payload.len()];
+    pkt[0] = 0x45; // v4, IHL 5
+    pkt[2..4].copy_from_slice(&(pkt.len() as u16).to_be_bytes());
+    pkt[8] = 64; // TTL
+    pkt[9] = 17; // UDP
+    pkt[12..16].copy_from_slice(&orig.dst_ip.to_be_bytes()); // src = orig dst
+    pkt[16..20].copy_from_slice(&orig.src_ip.to_be_bytes()); // dst = orig src
+    let csum = ipv4_checksum(&pkt[..20]);
+    pkt[10..12].copy_from_slice(&csum.to_be_bytes());
+    pkt[20..22].copy_from_slice(&orig.dst_port.to_be_bytes());
+    pkt[22..24].copy_from_slice(&orig.src_port.to_be_bytes());
+    pkt[24..26].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+    // UDP checksum 0 = not computed (valid for IPv4).
+    pkt[28..].copy_from_slice(payload);
+    pkt
+}
+
+/// Real UDP egress: forwards egress-intent packets via OS sockets (S18/S19/S20).
+///
+/// P0 design:
+/// - One `UdpSocket` per flow (bound `0.0.0.0:0`, non-blocking). A single
+///   socket cannot demultiplex concurrent flows to the same destination
+///   (every reply would share the source port), so per-flow sockets are the
+///   correct userspace NAT. The fd cost is bounded by NAT eviction (S14);
+///   a socket pool is P1 work, not hidden here.
+/// - The NAT table is keyed by the *translated* 5-tuple
+///   (`translated_key`); replies reverse-lookup to the origin peer and the
+///   recorded original 5-tuple, from which a full IP packet is rebuilt.
+/// - Unmapped replies are dropped and counted, never forwarded blindly.
+///
+/// Zero Tokio; std-only. Shared with `Projection` via `Arc`; the
+/// `egress-recv` thread polls [`RealUdpEgress::recv_reply`].
+pub struct RealUdpEgress {
+    nat: Arc<Mutex<EgressNat>>,
+    /// Original FlowKey -> flow socket.
+    sockets: Mutex<HashMap<FlowKey, UdpSocket>>,
+    stats: Mutex<RealEgressStats>,
+}
+
+impl RealUdpEgress {
+    /// Create with the shared NAT table. The probe bind fails fast when UDP
+    /// is unavailable (e.g. sandboxed), so callers can SKIP instead of FAIL.
+    pub fn new(nat: Arc<Mutex<EgressNat>>) -> io::Result<Self> {
+        let probe = UdpSocket::bind("0.0.0.0:0")?;
+        drop(probe);
+        Ok(Self {
+            nat,
+            sockets: Mutex::new(HashMap::new()),
+            stats: Mutex::new(RealEgressStats::default()),
+        })
+    }
+
+    /// Forward one egress packet via the real socket (S18).
+    ///
+    /// Records the flow under the translated key, then sends the UDP payload
+    /// to the packet's destination. Non-UDP packets are dropped and counted
+    /// (`egress_tcp_dropped`). Send failures are counted
+    /// (`egress_send_failed`); the NAT record is retained so a retransmit can
+    /// still match the reply. Never panics; returns `false` on drop.
+    pub fn send(&self, packet: &[u8], peer: &str) -> bool {
+        let (payload, orig) = match udp_payload(packet) {
+            Some(x) => x,
+            None => {
+                lock(&self.stats).egress_tcp_dropped += 1;
+                return false;
+            }
+        };
+        // Lock order (sockets -> nat) is the same in `recv_reply`.
+        let mut sockets = lock(&self.sockets);
+        // Prune sockets whose NAT entry is gone (evicted/expired, S20).
+        {
+            let nat = lock(&self.nat);
+            sockets.retain(|o, s| {
+                translated_key(s, o)
+                    .map(|t| nat.contains(&t))
+                    .unwrap_or(false)
+            });
+        }
+        // Get-or-create the flow socket; retransmits reuse it (S18).
+        if !sockets.contains_key(&orig) {
+            match UdpSocket::bind("0.0.0.0:0") {
+                Ok(s) => {
+                    let _ = s.set_nonblocking(true);
+                    sockets.insert(orig, s);
+                }
+                Err(_) => {
+                    lock(&self.stats).egress_send_failed += 1;
+                    return false;
+                }
+            }
+        }
+        let sock = &sockets[&orig];
+        let trans = match translated_key(sock, &orig) {
+            Some(t) => t,
+            None => {
+                lock(&self.stats).egress_send_failed += 1;
+                return false;
+            }
+        };
+        let dst = SocketAddr::from((Ipv4Addr::from(orig.dst_ip), orig.dst_port));
+        // Record before send: the mapping survives a send failure (S18).
+        lock(&self.nat).record_flow(trans, orig, peer);
+        match sock.send_to(payload, dst) {
+            Ok(_) => {
+                lock(&self.stats).real_sent += 1;
+                true
+            }
+            Err(_) => {
+                lock(&self.stats).egress_send_failed += 1;
+                false
+            }
+        }
+    }
+
+    /// Poll all flow sockets for a reply (non-blocking, S19).
+    ///
+    /// Returns the reply rebuilt as a full IP packet plus the origin peer,
+    /// or `None` when no reply is ready. Unmapped replies are dropped and
+    /// counted (`unmapped_dropped`); a dead flow's socket is pruned, but a
+    /// junk probe on a *live* flow never kills it.
+    pub fn recv_reply(&self) -> Option<(Vec<u8>, String)> {
+        // Phase 1: poll sockets (sockets lock only).
+        let hit: Option<(FlowKey, FlowKey, Vec<u8>, SocketAddr)> = {
+            let sockets = lock(&self.sockets);
+            let mut out = None;
+            for (orig, sock) in sockets.iter() {
+                let mut buf = [0u8; 65535];
+                match sock.recv_from(&mut buf) {
+                    Ok((n, src)) => {
+                        if let Some(trans) = translated_key(sock, orig) {
+                            out = Some((*orig, trans, buf[..n].to_vec(), src));
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(_) => continue, // broken socket: pruned on next send
+                }
+            }
+            out
+        };
+        let (orig, trans, payload, src) = hit?;
+        // Phase 2: NAT reverse lookup (nat lock only).
+        let src_ip = match src.ip() {
+            IpAddr::V4(v) => u32::from_be_bytes(v.octets()),
+            IpAddr::V6(_) => {
+                lock(&self.stats).unmapped_dropped += 1;
+                return None;
+            }
+        };
+        let reply_key = FlowKey {
+            src_ip,
+            src_port: src.port(),
+            dst_ip: trans.src_ip,
+            dst_port: trans.src_port,
+            proto: 17,
+        };
+        let mut nat = lock(&self.nat);
+        match nat.lookup_reply(&reply_key) {
+            Some((orig_key, peer)) => {
+                let pkt = build_reply_packet(&orig_key, &payload);
+                lock(&self.stats).reply_routed += 1;
+                Some((pkt, peer))
+            }
+            None => {
+                lock(&self.stats).unmapped_dropped += 1;
+                // Prune only when the flow itself is gone; a junk probe on
+                // a live flow must not kill it.
+                if !nat.contains(&trans) {
+                    drop(nat);
+                    lock(&self.sockets).remove(&orig);
+                }
+                None
+            }
+        }
+    }
+
+    /// Bound addresses of live flow sockets (observability / E4 probing).
+    pub fn socket_addrs(&self) -> Vec<SocketAddr> {
+        lock(&self.sockets)
+            .values()
+            .filter_map(|s| s.local_addr().ok())
+            .collect()
+    }
+
+    /// Number of live flow sockets.
+    pub fn socket_count(&self) -> usize {
+        lock(&self.sockets).len()
+    }
+
+    /// Egress counters (S18/S19).
+    pub fn stats(&self) -> RealEgressStats {
+        *lock(&self.stats)
+    }
+
+    /// Drop all flow sockets (S20). Idempotent; a polling recv thread
+    /// observes the empty set and exits so the owner can join it.
+    pub fn shutdown_sockets(&self) {
+        lock(&self.sockets).clear();
+    }
+
+    /// Consuming close: drop sockets, release resources (S20).
+    pub fn close(self) {
+        self.shutdown_sockets();
     }
 }
 
@@ -674,5 +994,214 @@ mod tests {
         e.add_domain_keyword_rule("", RouteTarget::Drop);
         e.add_domain_suffix_rule(".", RouteTarget::Drop);
         assert_eq!(e.domain_rule_count(), 1);
+    }
+
+    // ---- 3b-4 real UDP egress (S18/S19/S20) ----
+    // NOTE: these tests need real loopback UDP. They fail in the sandbox
+    // (EPERM on sendto) and pass on xc-pc-linux; that is an environment
+    // limitation, not a code defect.
+
+    use std::net::UdpSocket as TestUdpSocket;
+    use std::thread as test_thread;
+
+    /// Bind a loopback "internet" endpoint. Panics with a clear message if
+    /// UDP is unavailable (so the failure is diagnosable, not silent).
+    fn fake_internet() -> TestUdpSocket {
+        let s = TestUdpSocket::bind("127.0.0.1:0").expect("loopback UDP unavailable");
+        s.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set_read_timeout");
+        s
+    }
+
+    fn real_egress() -> (RealUdpEgress, Arc<Mutex<EgressNat>>) {
+        let nat = Arc::new(Mutex::new(EgressNat::default()));
+        let re = RealUdpEgress::new(Arc::clone(&nat)).expect("RealUdpEgress::new");
+        (re, nat)
+    }
+
+    /// Poll `f` until it returns `Some`, or panic after the deadline.
+    fn poll_until<T>(f: impl Fn() -> Option<T>, what: &str) -> T {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(v) = f() {
+                return v;
+            }
+            if Instant::now() > deadline {
+                panic!("timed out waiting for {what}");
+            }
+            test_thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn real_egress_sends_via_socket() {
+        // S18: the egress node forwards the UDP payload via a real socket.
+        let internet = fake_internet();
+        let dst_port = internet.local_addr().unwrap().port();
+        let (re, nat) = real_egress();
+
+        let pkt = udp_packet([10, 0, 0, 1], [127, 0, 0, 1], 40000, dst_port);
+        assert!(re.send(&pkt, "A"));
+
+        let st = re.stats();
+        assert_eq!(st.real_sent, 1);
+        assert_eq!(st.egress_send_failed, 0);
+        assert_eq!(st.egress_tcp_dropped, 0);
+        assert_eq!(re.socket_count(), 1);
+
+        // The fake internet receives exactly the UDP payload.
+        let mut buf = [0u8; 64];
+        let (n, _src) = internet.recv_from(&mut buf).expect("recv echo request");
+        assert_eq!(&buf[..n], &[1, 2, 3, 4]);
+
+        // NAT recorded the flow (translated key).
+        assert_eq!(nat.lock().unwrap().flow_count(), 1);
+
+        // Retransmit reuses the socket (no new socket, S18).
+        assert!(re.send(&pkt, "A"));
+        assert_eq!(re.socket_count(), 1);
+        assert_eq!(re.stats().real_sent, 2);
+    }
+
+    #[test]
+    fn real_egress_send_failure_counted() {
+        // S18: send failure counted, never panics, returns false — and the
+        // NAT record is retained so a retransmit can still match the reply.
+        let (re, nat) = real_egress();
+        // Port 0 is invalid: send_to fails deterministically.
+        let pkt = udp_packet([10, 0, 0, 1], [127, 0, 0, 1], 40001, 0);
+        assert!(!re.send(&pkt, "A"));
+        let st = re.stats();
+        assert_eq!(st.egress_send_failed, 1);
+        assert_eq!(st.real_sent, 0);
+        assert_eq!(nat.lock().unwrap().flow_count(), 1);
+    }
+
+    #[test]
+    fn real_egress_reply_reverse_nat() {
+        // S19: a reply on the flow socket reverse-NATs to the origin peer,
+        // rebuilt as a full IP packet the originator can validate.
+        let internet = fake_internet();
+        let dst_port = internet.local_addr().unwrap().port();
+        let (re, _nat) = real_egress();
+
+        let pkt = udp_packet([10, 0, 0, 1], [127, 0, 0, 1], 40002, dst_port);
+        assert!(re.send(&pkt, "peer-A"));
+
+        // Fake internet echoes the payload back to the flow socket.
+        let mut buf = [0u8; 64];
+        let (n, src) = internet.recv_from(&mut buf).expect("recv");
+        internet.send_to(&buf[..n], src).expect("echo");
+
+        let (ip_pkt, peer) = poll_until(|| re.recv_reply(), "egress reply");
+        assert_eq!(peer, "peer-A");
+
+        // Rebuilt IP packet: src = original dst, dst = original src.
+        let key = FlowKey::parse(&ip_pkt).expect("well-formed reply packet");
+        assert_eq!(key.src_ip, u32::from_be_bytes([127, 0, 0, 1]));
+        assert_eq!(key.dst_ip, u32::from_be_bytes([10, 0, 0, 1]));
+        assert_eq!(key.src_port, dst_port);
+        assert_eq!(key.dst_port, 40002);
+        assert_eq!(key.proto, 17);
+        assert_eq!(&ip_pkt[28..], &[1, 2, 3, 4]); // payload intact
+
+        let st = re.stats();
+        assert_eq!(st.reply_routed, 1);
+        assert_eq!(st.unmapped_dropped, 0);
+    }
+
+    #[test]
+    fn real_egress_unmapped_reply_dropped() {
+        // S19: a reply with no NAT mapping is dropped and counted — never
+        // forwarded blindly. A junk probe on a *live* flow must not kill it.
+        let internet = fake_internet();
+        let dst_port = internet.local_addr().unwrap().port();
+        let (re, _nat) = real_egress();
+
+        let pkt = udp_packet([10, 0, 0, 1], [127, 0, 0, 1], 40003, dst_port);
+        assert!(re.send(&pkt, "A"));
+        let addrs = re.socket_addrs();
+        assert_eq!(addrs.len(), 1);
+
+        // Attacker socket (not the flow's peer) sends junk to the flow socket.
+        let attacker = fake_internet();
+        attacker
+            .send_to(b"junk-unmapped-probe", addrs[0])
+            .expect("probe send");
+
+        poll_until(
+            || {
+                if re.stats().unmapped_dropped == 1 {
+                    Some(())
+                } else {
+                    None
+                }
+            },
+            "unmapped drop",
+        );
+        let st = re.stats();
+        assert_eq!(st.unmapped_dropped, 1);
+        assert_eq!(st.reply_routed, 0);
+        // The live flow's socket survived the probe.
+        assert_eq!(re.socket_count(), 1);
+
+        // The real reply still routes afterwards.
+        let mut buf = [0u8; 64];
+        let (n, src) = internet.recv_from(&mut buf).expect("recv");
+        internet.send_to(&buf[..n], src).expect("echo");
+        let (ip_pkt, peer) = poll_until(|| re.recv_reply(), "reply after probe");
+        assert_eq!(peer, "A");
+        assert_eq!(FlowKey::parse(&ip_pkt).unwrap().dst_port, 40003);
+    }
+
+    #[test]
+    fn real_egress_tcp_dropped() {
+        // S18: P0 is UDP-only; TCP packets are dropped and counted, and no
+        // socket is created for them.
+        let (re, nat) = real_egress();
+        let mut pkt = udp_packet([10, 0, 0, 1], [127, 0, 0, 1], 40004, 80);
+        pkt[9] = 6; // TCP
+        assert!(!re.send(&pkt, "A"));
+        let st = re.stats();
+        assert_eq!(st.egress_tcp_dropped, 1);
+        assert_eq!(st.real_sent, 0);
+        assert_eq!(re.socket_count(), 0);
+        assert_eq!(nat.lock().unwrap().flow_count(), 0);
+    }
+
+    #[test]
+    fn real_egress_close_joins_thread() {
+        // S20: closing drops the sockets; a polling recv thread observes the
+        // empty set and exits, so the owner can join it.
+        let (re, _nat) = real_egress();
+        let re = Arc::new(re);
+        // Port-0 send fails but still creates the flow socket.
+        let pkt = udp_packet([10, 0, 0, 1], [127, 0, 0, 1], 40005, 0);
+        assert!(!re.send(&pkt, "A"));
+        assert_eq!(re.socket_count(), 1);
+
+        let re2 = Arc::clone(&re);
+        let h = test_thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if re2.socket_count() == 0 {
+                    break;
+                }
+                let _ = re2.recv_reply();
+                assert!(
+                    Instant::now() < deadline,
+                    "recv thread did not observe close"
+                );
+                test_thread::sleep(Duration::from_millis(1));
+            }
+        });
+        test_thread::sleep(Duration::from_millis(50));
+        re.shutdown_sockets();
+        h.join().expect("recv thread joined after close");
+        assert_eq!(re.socket_count(), 0);
+
+        // Consuming close on an owned value.
+        let (re2, _nat2) = real_egress();
+        re2.close();
     }
 }
