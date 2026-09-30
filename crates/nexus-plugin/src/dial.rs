@@ -127,10 +127,8 @@ pub fn dial_with_obfs(
     obfs: Option<&str>,
     params: &ObfsParams,
 ) -> io::Result<Box<dyn ObfuscatedStream>> {
-    let stream = TcpStream::connect(addr).map_err(|e| {
-        incr_dial_err("-", DialFailReason::Connect);
-        e
-    })?;
+    let stream = TcpStream::connect(addr)
+        .inspect_err(|_| incr_dial_err("-", DialFailReason::Connect))?;
     wrap_stream(stream, obfs, params)
 }
 
