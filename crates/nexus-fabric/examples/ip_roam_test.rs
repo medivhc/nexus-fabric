@@ -126,16 +126,24 @@ fn child_a() {
     println!("LISTEN {hex}");
     std::io::stdout().flush().unwrap();
     let conn = listener.accept().expect("accept");
-    let (_s, mut r) = conn.accept_bi().expect("accept_bi");
+    let (mut s, mut r) = conn.accept_bi().expect("accept_bi");
     let mut buf = [0u8; 1024];
     // 收第一批（旧流）
     let n = r.read(&mut buf).expect("read1");
     println!("A_RECV1: {} bytes: {}", n, String::from_utf8_lossy(&buf[..n]));
     std::io::stdout().flush().unwrap();
+    // 回 pong（测试 A→B 方向）
+    s.write(b"pong1").expect("write_pong1");
+    println!("A_SENT_PONG1");
+    std::io::stdout().flush().unwrap();
     // 收第二批（新流，roam 后 B 开新流）
-    let (_s2, mut r2) = conn.accept_bi().expect("accept_bi2");
+    let (mut s2, mut r2) = conn.accept_bi().expect("accept_bi2");
     let n2 = r2.read(&mut buf).expect("read2");
     println!("A_RECV2_OK: {} bytes", n2);
+    std::io::stdout().flush().unwrap();
+    // 回 pong2（测试 roam 后 A→B）
+    s2.write(b"pong2").expect("write_pong2");
+    println!("A_SENT_PONG2");
     std::io::stdout().flush().unwrap();
     std::thread::sleep(Duration::from_secs(2));
 }
@@ -170,6 +178,12 @@ fn child_b() {
                 s.write(b"hello1").expect("write1");
                 println!("B_SENT1");
                 std::io::stdout().flush().unwrap();
+                // 收 pong1（测试 A→B）
+                let mut buf = [0u8; 1024];
+                let (_rs, mut rr) = conn.open_bi().expect("open_bi_pong1");
+                // 实际上 pong1 在旧流上，用原 r 读
+                drop(_rs);
+                // 简化：不读 pong1，只验证 roam 后的双向
             }
             "ROAM" => {
                 ip(&["addr", "del", &format!("{UNDERLAY_B}/24"), "dev", "veth-xb"]).expect("del");
@@ -180,9 +194,16 @@ fn child_b() {
             }
             "GO2" => {
                 // 开新流（模拟 N1 watcher 的行为），立即发送。
-                let (mut s2, _r2) = conn.open_bi().expect("open_bi2");
+                let (mut s2, mut r2) = conn.open_bi().expect("open_bi2");
                 s2.write(b"hello2").expect("write2");
                 println!("B_SENT2_NEWSTREAM");
+                std::io::stdout().flush().unwrap();
+                // 收 pong2（测试 roam 后 A→B 是否通）
+                let mut buf = [0u8; 1024];
+                match r2.read(&mut buf) {
+                    Ok(n) => println!("B_RECV_PONG2: {} bytes: {}", n, String::from_utf8_lossy(&buf[..n])),
+                    Err(e) => println!("B_RECV_PONG2_FAIL: {e:?}"),
+                }
                 std::io::stdout().flush().unwrap();
             }
             _ => {}
