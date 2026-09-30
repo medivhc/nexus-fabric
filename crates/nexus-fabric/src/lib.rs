@@ -17,6 +17,7 @@
 
 mod cert;
 mod driver;
+pub mod transport;
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -24,6 +25,7 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use driver::{Cmd, ConnShared, Driver, StreamShared};
+pub use transport::{StdUdpTransport, UdpTransport};
 
 /// Node identity: ed25519 public key (cf. iroh's EndpointId).
 ///
@@ -83,6 +85,22 @@ impl FabricConn {
             return Err(FabricError::PathUnreachable);
         }
         let driver = Driver::new_client()?;
+        let inner = driver.connect(peer, config.addrs[0], config.handshake_timeout)?;
+        Ok(Self { inner, driver })
+    }
+
+    /// Actively establish a connection over a caller-provided transport (S9),
+    /// e.g. a TURN-relayed socket. `config.addrs[0]` is the destination as
+    /// seen by the transport (for TURN: the peer's relayed address).
+    pub fn connect_with_transport(
+        peer: PeerId,
+        config: &ConnConfig,
+        transport: Box<dyn UdpTransport>,
+    ) -> Result<Self, FabricError> {
+        if config.addrs.is_empty() {
+            return Err(FabricError::PathUnreachable);
+        }
+        let driver = Driver::new_client_with_transport(transport)?;
         let inner = driver.connect(peer, config.addrs[0], config.handshake_timeout)?;
         Ok(Self { inner, driver })
     }
@@ -213,6 +231,15 @@ impl FabricListener {
     pub fn bind(addr: SocketAddr) -> Result<Self, FabricError> {
         Ok(Self {
             driver: Driver::new_server(addr)?,
+        })
+    }
+
+    /// Bind the listener on a caller-provided transport (S9), e.g. a
+    /// TURN-relayed socket. Peers dial the transport's `local_addr()`
+    /// (for TURN: the allocated relay address).
+    pub fn bind_with_transport(transport: Box<dyn UdpTransport>) -> Result<Self, FabricError> {
+        Ok(Self {
+            driver: Driver::new_server_with_transport(transport)?,
         })
     }
 

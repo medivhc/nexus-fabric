@@ -46,6 +46,13 @@ quinn-proto driver runs on its own std threads (the repository is tokio-free).
 - S6: 路径迁移需 challenge/response 验证，防地址欺骗。
 - S7: 显式关闭语义；关闭后新流拒绝。
 - S8: 统计诚实：无样本时标记 unknown，不编造 0。
+- S9: UDP 传输抽象：driver 经 `UdpTransport` trait 收发（`recv_from` /
+  `send_to` / `set_read_timeout` / `local_addr`），不直接拥有 `UdpSocket`；
+  `StdUdpTransport` 为默认实现（行为与之前一致）；`FabricConn::connect` /
+  `FabricListener::bind` 保留原签名（默认用 std socket），新增
+  `connect_with_transport` / `bind_with_transport` 接受
+  `Box<dyn UdpTransport>`（如 `nexus-turn::TurnSocket`）。`nexus-fabric`
+  不依赖 `nexus-turn`（依赖倒置：trait 在 fabric，实现在外）。
 - FabricConn != nexus-session Session。
 
 ## Deletion Test（§12 新抽象论证）

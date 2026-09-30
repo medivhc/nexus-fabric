@@ -240,3 +240,51 @@ supply_chain = "version pinned by Cargo.lock (lockfile_required); already in tre
 os_transitive_deps = "cc build only (already accepted)"
 approved = true
 approved_date = "2026-09-30"
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-turn"
+crate = "hmac"
+version = "0.12"
+default_features = false
+features = []
+architecture_layer = "turn (RFC 5766 MESSAGE-INTEGRITY HMAC-SHA1); no async runtime, repo is std-only"
+feature_scope = "default features only (no std-dependent extras needed; alloc not required)"
+license = "MIT OR Apache-2.0 (allowlisted; crates.io 2026-09-30)"
+security = "RustCrypto maintained; HMAC-SHA1 for STUN integrity is the RFC-mandated primitive (not password hashing); RustSec DB checked via harness gate"
+portability = "pure Rust; already in tree"
+supply_chain = "0.12.1 already pinned by Cargo.lock via hkdf 0.12.4; reuses existing pin, no new transitive deps"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-09-30"
+review_basis = "2026-09-30 4b TURN contract T1: RFC 5766 long-term auth needs SHA-1; 0.10.6 deps cfg-if + digest 0.10 (both already in tree)"
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-turn"
+crate = "sha1"
+version = "0.10"
+default_features = false
+features = []
+architecture_layer = "turn (RFC 5766 MESSAGE-INTEGRITY + nonce/realm handling); no async runtime"
+feature_scope = "default features only; asm feature explicitly off (pure Rust)"
+license = "MIT OR Apache-2.0 (allowlisted; crates.io 2026-09-30)"
+security = "RustCrypto maintained; SHA-1 used only as HMAC inner primitive per RFC 5766 (not for collision-sensitive hashing); RustSec DB checked via harness gate"
+portability = "pure Rust (asm off); already in tree via digest 0.10 ecosystem"
+supply_chain = "version pinned by Cargo.lock (lockfile_required); transitive deps cfg-if + digest 0.10 already in tree"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-09-30"
+review_basis = "2026-09-30 4b TURN contract T1: RFC 5766 key = MD5(username:realm:password); zero-dependency crate"
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-turn"
+crate = "md5"
+version = "0.7"
+default_features = false
+features = []
+architecture_layer = "turn (RFC 5766 long-term credential key derivation); no async runtime"
+feature_scope = "no features exist; zero transitive deps"
+license = "Apache-2.0 OR MIT (allowlisted; crates.io 2026-09-30)"
+security = "MD5 used only for the RFC 5766 key derivation formula (not security-critical hashing); RustSec DB checked via harness gate"
+portability = "pure Rust, zero deps"
+supply_chain = "version pinned by Cargo.lock (lockfile_required); zero transitive deps"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-09-30"
+review_basis = "2026-09-30 4b TURN contract T1: RFC 5766 key = MD5(username:realm:password); zero-dependency crate"
