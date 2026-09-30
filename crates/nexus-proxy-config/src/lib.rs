@@ -1714,14 +1714,14 @@ outbounds:
     kind: shadowsocks
     locator: 127.0.0.1:8388
     method: chacha20-ietf-poly1305
-password: <redacted>
+password: demo-password-123
     obfs: xor
     obfs_key: test-key-123
   - tag: ss-b
     kind: shadowsocks
     locator: 127.0.0.1:8389
     method: chacha20-ietf-poly1305
-password: <redacted>
+password: demo-password-123
 ";
         let cfg = parse(yaml).expect("ok");
         assert_eq!(cfg.outbounds.len(), 2);
