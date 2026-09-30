@@ -15,7 +15,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use crate::auth::{derive_key, stamp_integrity};
+use crate::auth::{derive_key, stamp_integrity, verify_integrity};
 use crate::stun::{
     self, is_channel_data, is_stun_message, valid_channel, Attribute, StunMessage,
     ALLOCATE_REQUEST, ALLOCATE_SUCCESS, ATTR_DATA, ATTR_ERROR_CODE, ATTR_LIFETIME, ATTR_NONCE,
@@ -446,6 +446,13 @@ impl ClientInner {
             let d = stun::decode(raw)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad stun message"))?;
             if d.txn == msg.txn {
+                // RFC 5766 §2.2: 验证响应的 MESSAGE-INTEGRITY（401 质询无 MI，跳过）。
+                if !is_error(&d, 4, 1) && !verify_response_integrity(raw, &self.key) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "turn response integrity check failed",
+                    ));
+                }
                 return Ok(d);
             }
             if d.msg_type == DATA_INDICATION {
@@ -464,6 +471,21 @@ impl ClientInner {
 /// 是否为 class/number 的错误响应。
 fn is_error(d: &stun::DecodedMessage, class: u8, number: u8) -> bool {
     matches!(d.get(ATTR_ERROR_CODE), Some(Attribute::ErrorCode(c, n, _)) if *c == class && *n == number)
+}
+
+/// 验证 server 响应的 MESSAGE-INTEGRITY（RFC 5766 §2.2）。
+///
+/// 约定：server 总把 MI 作为最后一个属性（见 `server::send_success`/`send_error`），
+/// 故 MI 值在数据报尾部 20 字节，前面是属性头 `00 08 00 14`。
+fn verify_response_integrity(raw: &[u8], key: &[u8]) -> bool {
+    if raw.len() < 24 {
+        return false;
+    }
+    let mi_off = raw.len() - 20;
+    if &raw[mi_off - 4..mi_off] != &[0x00, 0x08, 0x00, 0x14] {
+        return false;
+    }
+    verify_integrity(raw, mi_off, key)
 }
 
 fn realm_nonce(d: &stun::DecodedMessage) -> io::Result<(String, String)> {

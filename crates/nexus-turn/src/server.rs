@@ -241,11 +241,17 @@ fn send_success(
     src: SocketAddr,
     success_type: u16,
     attrs: Vec<Attribute>,
+    key: &[u8; 16],
 ) {
     let mut resp = StunMessage::new(success_type);
     resp.txn = req.txn;
     resp.attrs = attrs;
-    let _ = main_sock.send_to(&resp.encode(), src);
+    // RFC 5766 §2.2: 成功响应携带 MESSAGE-INTEGRITY（MI 为最后一个属性）。
+    resp.attrs.push(Attribute::MessageIntegrity([0u8; 20]));
+    let mut bytes = resp.encode();
+    let mi_off = bytes.len() - 20;
+    crate::auth::stamp_integrity(&mut bytes, mi_off, key);
+    let _ = main_sock.send_to(&bytes, src);
 }
 
 fn send_error(
@@ -256,12 +262,18 @@ fn send_error(
     class: u8,
     number: u8,
     reason: &[u8],
+    key: &[u8; 16],
 ) {
     let mut resp = StunMessage::new(failure_type);
     resp.txn = req.txn;
     resp.attrs
         .push(Attribute::ErrorCode(class, number, reason.to_vec()));
-    let _ = main_sock.send_to(&resp.encode(), src);
+    // RFC 5766 §2.2: 错误响应也携带 MESSAGE-INTEGRITY（401 质询除外，由 send_401 单独处理）。
+    resp.attrs.push(Attribute::MessageIntegrity([0u8; 20]));
+    let mut bytes = resp.encode();
+    let mi_off = bytes.len() - 20;
+    crate::auth::stamp_integrity(&mut bytes, mi_off, key);
+    let _ = main_sock.send_to(&bytes, src);
 }
 
 fn handle_allocate(
@@ -280,18 +292,45 @@ fn handle_allocate(
     let relay_sock = match UdpSocket::bind("127.0.0.1:0") {
         Ok(s) => s,
         Err(_) => {
-            send_error(main_sock, req, src, ALLOCATE_FAILURE, 5, 0, b"Server Error");
+            send_error(
+                main_sock,
+                req,
+                src,
+                ALLOCATE_FAILURE,
+                5,
+                0,
+                b"Server Error",
+                &state.key,
+            );
             return;
         }
     };
     if relay_sock.set_nonblocking(true).is_err() {
-        send_error(main_sock, req, src, ALLOCATE_FAILURE, 5, 0, b"Server Error");
+        send_error(
+            main_sock,
+            req,
+            src,
+            ALLOCATE_FAILURE,
+            5,
+            0,
+            b"Server Error",
+            &state.key,
+        );
         return;
     }
     let relay_addr = match relay_sock.local_addr() {
         Ok(a) => a,
         Err(_) => {
-            send_error(main_sock, req, src, ALLOCATE_FAILURE, 5, 0, b"Server Error");
+            send_error(
+                main_sock,
+                req,
+                src,
+                ALLOCATE_FAILURE,
+                5,
+                0,
+                b"Server Error",
+                &state.key,
+            );
             return;
         }
     };
@@ -322,6 +361,7 @@ fn handle_allocate(
             Attribute::XorMappedAddress(src),
             Attribute::Lifetime(600),
         ],
+        &state.key,
     );
 }
 
@@ -347,6 +387,7 @@ fn handle_refresh(
                 4,
                 37,
                 b"Allocation Mismatch",
+                &state.key,
             );
             return;
         }
@@ -362,6 +403,7 @@ fn handle_refresh(
                 src,
                 REFRESH_SUCCESS,
                 vec![Attribute::Lifetime(0)],
+                &state.key,
             );
         }
         Some(Attribute::Lifetime(s)) => {
@@ -372,6 +414,7 @@ fn handle_refresh(
                 src,
                 REFRESH_SUCCESS,
                 vec![Attribute::Lifetime(*s)],
+                &state.key,
             );
         }
         _ => {
@@ -382,6 +425,7 @@ fn handle_refresh(
                 src,
                 REFRESH_SUCCESS,
                 vec![Attribute::Lifetime(600)],
+                &state.key,
             );
         }
     }
@@ -409,6 +453,7 @@ fn handle_create_permission(
                 4,
                 0,
                 b"Bad Request",
+                &state.key,
             );
             return;
         }
@@ -417,7 +462,14 @@ fn handle_create_permission(
         Some(a) => {
             // RFC 5766：权限按 IP（非 IP:port）。
             a.permissions.insert(peer.ip());
-            send_success(main_sock, req, src, CREATE_PERMISSION_SUCCESS, vec![]);
+            send_success(
+                main_sock,
+                req,
+                src,
+                CREATE_PERMISSION_SUCCESS,
+                vec![],
+                &state.key,
+            );
         }
         None => send_error(
             main_sock,
@@ -427,6 +479,7 @@ fn handle_create_permission(
             4,
             37,
             b"Allocation Mismatch",
+            &state.key,
         ),
     }
 }
@@ -453,6 +506,7 @@ fn handle_channel_bind(
                 4,
                 0,
                 b"Bad Request",
+                &state.key,
             );
             return;
         }
@@ -466,6 +520,7 @@ fn handle_channel_bind(
             4,
             0,
             b"Bad Request",
+            &state.key,
         );
         return;
     }
@@ -481,11 +536,19 @@ fn handle_channel_bind(
                     4,
                     3,
                     b"Forbidden",
+                    &state.key,
                 );
                 return;
             }
             a.channels.insert(channel, peer);
-            send_success(main_sock, req, src, CHANNEL_BIND_SUCCESS, vec![]);
+            send_success(
+                main_sock,
+                req,
+                src,
+                CHANNEL_BIND_SUCCESS,
+                vec![],
+                &state.key,
+            );
         }
         None => send_error(
             main_sock,
@@ -495,6 +558,7 @@ fn handle_channel_bind(
             4,
             37,
             b"Allocation Mismatch",
+            &state.key,
         ),
     }
 }
