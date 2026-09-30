@@ -530,6 +530,7 @@ impl Projection {
                 let tun = Arc::clone(&tun);
                 let stats = Arc::clone(&stats);
                 let shutdown = Arc::clone(&shutdown);
+                let router = Arc::clone(&router);
                 thread::Builder::new()
                     .name("projection-egress-recv".into())
                     .spawn(move || {
@@ -542,6 +543,17 @@ impl Projection {
                                 }
                                 Some(re) => match re.recv_reply() {
                                     Some((ip_packet, peer)) => {
+                                        // S17 (review WARN-3 fix): run the
+                                        // reply through the router for DNS
+                                        // learning (response -> DnsCache).
+                                        // Decision discarded; delivery is
+                                        // already determined by NAT lookup.
+                                        {
+                                            let guard = lock(&router);
+                                            if let Some(r) = guard.as_ref() {
+                                                let _ = r.route_packet(&ip_packet);
+                                            }
+                                        }
                                         if peer == "self" {
                                             // Local egress origin: deliver
                                             // to the TUN directly.
