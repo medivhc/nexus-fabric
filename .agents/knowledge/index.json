@@ -118,5 +118,21 @@
     "module": "nexus-discovery",
     "category": "implementation-pattern",
     "summary": "Disjoint 不交路径 Suurballe：P1 边反向不可省；反向边权为 0 的原理；KShortest::path_cost 复用"
+  },
+  {
+    "id": "os-assemble-netlink-decision",
+    "file": "entries/2026-09-30-os-assemble-netlink-decision.md",
+    "date": "2026-09-30",
+    "module": "nexus-platform-linux",
+    "category": "architecture-decision",
+    "summary": "OS 装配 netlink 选型：手写窄 netlink（netlink.rs），零新依赖；rtnetlink 因 tokio 出局，neli 太重；仿 tun.rs 窄 FFI 纪律"
+  },
+  {
+    "id": "os-assemble-lo-unshare",
+    "file": "entries/2026-09-30-os-assemble-lo-unshare.md",
+    "date": "2026-09-30",
+    "module": "nexus-platform-linux",
+    "category": "implementation-pitfall",
+    "summary": "unshare(CLONE_NEWNET) 后必须拉起 lo，否则 TUN 自身地址的 UDP 本地交付超时（send 成功 recv 超时）"
   }
 ]
