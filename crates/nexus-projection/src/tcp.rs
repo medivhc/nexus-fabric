@@ -11,10 +11,11 @@ use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, SocketAddrV4, TcpStream};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
 
 /// smoltcp interface address (packets are rewritten to this dst before
@@ -26,6 +27,17 @@ pub const MAX_TCP_CONNS: usize = 1024;
 
 /// Half-open (SYN received, handshake not finished) expiry (S23).
 pub const HALF_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Blocking-connect timeout for the egress side (W2: connect runs on a
+/// short-lived worker thread, never on the downlink thread).
+pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Cap for DATA buffered while a relay connect is in flight (W2).
+pub const RELAY_PENDING_DATA_CAP: usize = 64 * 1024;
+
+/// Cap for bytes buffered on a relay connection when the non-blocking
+/// write cannot keep up (W2).
+pub const RELAY_WRITE_PENDING_CAP: usize = 256 * 1024;
 
 // STREAM frame flags (after the intent byte:
 // stream_id u32be | flags u8 | payload).
@@ -239,6 +251,9 @@ struct TermConn {
     syn_sent: bool,
     /// Whether we already emitted Closed for this conn.
     close_sent: bool,
+    /// W1: fabric bytes not yet accepted by the smoltcp send buffer
+    /// (back-pressure). Retried on every poll; never silently dropped.
+    pending: Vec<u8>,
 }
 
 /// Events produced by the terminator for the fabric / TUN layer.
@@ -276,6 +291,9 @@ pub struct TcpTermStats {
     pub half_open_expired: u64,
     /// Handshakes completed locally.
     pub handshake_done: u64,
+    /// W1: fabric bytes retained (not dropped) because the smoltcp send
+    /// buffer was full.
+    pub send_buffer_full: u64,
 }
 
 pub struct TcpTerminator {
@@ -284,6 +302,7 @@ pub struct TcpTerminator {
     conns: HashMap<FourTuple, TermConn>,
     by_id: HashMap<u32, FourTuple>,
     next_id: AtomicU32,
+    max_conns: usize,
     stats: TcpTermStats,
 }
 
@@ -304,8 +323,14 @@ impl TcpTerminator {
             conns: HashMap::new(),
             by_id: HashMap::new(),
             next_id: AtomicU32::new(1),
+            max_conns: MAX_TCP_CONNS,
             stats: TcpTermStats::default(),
         }
+    }
+
+    #[cfg(test)]
+    fn set_max_conns(&mut self, max: usize) {
+        self.max_conns = max;
     }
 
     pub fn stats(&self) -> TcpTermStats {
@@ -318,6 +343,15 @@ impl TcpTerminator {
 
     pub fn lookup_id(&self, stream_id: u32) -> Option<FourTuple> {
         self.by_id.get(&stream_id).copied()
+    }
+
+    /// F1: the peer this stream_id was originated for, if we are the
+    /// originator. Dispatch must compare this against the frame's
+    /// `from_peer` — a bare `lookup_id` is_some() check misroutes when
+    /// this node is both originator and egress (both counters start at 1).
+    pub fn peer_for(&self, stream_id: u32) -> Option<String> {
+        let key = self.by_id.get(&stream_id)?;
+        self.conns.get(key).map(|c| c.peer.clone())
     }
 
     fn poll_iface(&mut self) {
@@ -364,7 +398,7 @@ impl TcpTerminator {
                 self.stats.no_conn_dropped += 1;
                 return vec![];
             }
-            if self.conns.len() >= MAX_TCP_CONNS {
+            if self.conns.len() >= self.max_conns {
                 self.stats.table_full += 1;
                 return vec![];
             }
@@ -386,6 +420,7 @@ impl TcpTerminator {
                     state: TermState::SynReceived(SystemTime::now()),
                     syn_sent: false,
                     close_sent: false,
+                    pending: Vec::new(),
                 },
             );
             self.by_id.insert(stream_id, key);
@@ -400,28 +435,62 @@ impl TcpTerminator {
     }
 
     /// Feed bytes arriving from the fabric (DATA frame) into the socket.
+    /// W1: bytes the smoltcp send buffer cannot take are retained in
+    /// `TermConn.pending` and retried on every `poll()` — never dropped.
     /// Returns TUN packets to write back.
     pub fn handle_fabric_data(&mut self, stream_id: u32, data: &[u8]) -> Vec<Vec<u8>> {
         let key = match self.by_id.get(&stream_id) {
             Some(k) => *k,
             None => return vec![],
         };
-        let handle = match self.conns.get(&key) {
-            Some(c) => c.sock,
-            None => return vec![],
-        };
-        {
-            let sock = self.sockets.get_mut::<tcp::Socket>(handle);
-            let mut off = 0;
-            while off < data.len() {
-                match sock.send_slice(&data[off..]) {
-                    Ok(n) if n > 0 => off += n,
-                    _ => break,
-                }
-            }
+        if let Some(c) = self.conns.get_mut(&key) {
+            c.pending.extend_from_slice(data);
         }
+        self.flush_pending(key);
         self.poll_iface();
         self.drain_tx()
+    }
+
+    /// Try to push retained bytes into the smoltcp send buffer.
+    fn flush_pending(&mut self, key: FourTuple) {
+        let handle = match self.conns.get(&key) {
+            Some(c) => c.sock,
+            None => return,
+        };
+        if self
+            .conns
+            .get(&key)
+            .map(|c| c.pending.is_empty())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let sock = self.sockets.get_mut::<tcp::Socket>(handle);
+        // N.B.: borrow dance — take the pending vec out, refill on partial.
+        let mut pending = std::mem::take(&mut self.conns.get_mut(&key).unwrap().pending);
+        let mut off = 0;
+        while off < pending.len() {
+            match sock.send_slice(&pending[off..]) {
+                Ok(n) if n > 0 => off += n,
+                _ => break,
+            }
+        }
+        pending.drain(..off);
+        let c = self.conns.get_mut(&key).unwrap();
+        if !pending.is_empty() {
+            self.stats.send_buffer_full += 1;
+        }
+        c.pending = pending;
+    }
+
+    #[cfg(test)]
+    fn backdate_half_open(&mut self, age: Duration) {
+        let t0 = SystemTime::now() - age;
+        for c in self.conns.values_mut() {
+            if matches!(c.state, TermState::SynReceived(_)) {
+                c.state = TermState::SynReceived(t0);
+            }
+        }
     }
 
     /// Remote FIN: close the local socket (S23).
@@ -490,6 +559,9 @@ impl TcpTerminator {
                     continue;
                 }
             }
+
+            // W1: retry bytes the smoltcp send buffer could not take earlier.
+            self.flush_pending(key);
 
             let sock = self.sockets.get_mut::<tcp::Socket>(handle);
             let sock_state = sock.state();
@@ -579,11 +651,34 @@ impl TcpTerminator {
 // TcpRelay: egress side (S22/S23).
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// TcpRelay: egress side (S22/S23).
+// ---------------------------------------------------------------------------
+
+/// Relay table key: stream_ids are allocated per originator (both sides
+/// start at 1), so the table must be keyed by (peer, stream_id) — F1.
+type RelayKey = (String, u32);
+
 struct RelayConn {
     stream: TcpStream,
     peer: String,
     /// EOF seen on the internet side; FIN frame already emitted.
     fin_sent: bool,
+    /// W2: bytes the non-blocking write could not take yet.
+    write_pending: Vec<u8>,
+}
+
+/// A SYN whose TCP connect is running on a worker thread (W2: the
+/// downlink thread never blocks on connect).
+struct PendingSyn {
+    first_data: Vec<u8>,
+    fin_pending: bool,
+}
+
+/// Result of a worker-thread connect, delivered back via channel.
+struct ConnectResult {
+    key: RelayKey,
+    stream: Option<TcpStream>,
 }
 
 #[derive(Debug)]
@@ -607,10 +702,20 @@ pub struct TcpRelayStats {
     pub relayed_bytes: u64,
     pub table_full: u64,
     pub connect_failed: u64,
+    /// N3: SYN frames with a payload shorter than the 6-byte addr prefix.
+    pub short_syn_dropped: u64,
 }
 
 pub struct TcpRelay {
-    conns: HashMap<u32, RelayConn>,
+    conns: HashMap<RelayKey, RelayConn>,
+    /// SYNs with a connect in flight (W2).
+    pending: HashMap<RelayKey, PendingSyn>,
+    /// Keys whose in-flight connect was cancelled (RST arrived first);
+    /// late worker results for these are dropped.
+    cancelled: HashSet<RelayKey>,
+    connect_tx: mpsc::Sender<ConnectResult>,
+    connect_rx: mpsc::Receiver<ConnectResult>,
+    max_conns: usize,
     stats: TcpRelayStats,
 }
 
@@ -622,10 +727,21 @@ impl Default for TcpRelay {
 
 impl TcpRelay {
     pub fn new() -> Self {
+        let (connect_tx, connect_rx) = mpsc::channel();
         Self {
             conns: HashMap::new(),
+            pending: HashMap::new(),
+            cancelled: HashSet::new(),
+            connect_tx,
+            connect_rx,
+            max_conns: MAX_TCP_CONNS,
             stats: TcpRelayStats::default(),
         }
+    }
+
+    #[cfg(test)]
+    fn set_max_conns(&mut self, max: usize) {
+        self.max_conns = max;
     }
 
     pub fn stats(&self) -> TcpRelayStats {
@@ -633,15 +749,45 @@ impl TcpRelay {
     }
 
     pub fn conn_count(&self) -> usize {
-        self.conns.len()
+        self.conns.len() + self.pending.len()
     }
 
-    pub fn has(&self, stream_id: u32) -> bool {
-        self.conns.contains_key(&stream_id)
+    pub fn has(&self, peer: &str, stream_id: u32) -> bool {
+        let key = (peer.to_string(), stream_id);
+        self.conns.contains_key(&key) || self.pending.contains_key(&key)
+    }
+
+    /// Non-blocking write helper shared by DATA handling and poll flush.
+    /// Returns Err(()) on a fatal error (caller removes the conn + RST).
+    /// WouldBlock remainder is appended to `pending_out`.
+    fn write_nonblocking(
+        stream: &mut TcpStream,
+        pending_out: &mut Vec<u8>,
+        data: &[u8],
+    ) -> Result<(), ()> {
+        let mut off = 0;
+        while off < data.len() {
+            match stream.write(&data[off..]) {
+                Ok(n) => off += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err(()),
+            }
+        }
+        if off < data.len() {
+            pending_out.extend_from_slice(&data[off..]);
+            if pending_out.len() > RELAY_WRITE_PENDING_CAP {
+                return Err(());
+            }
+        }
+        Ok(())
     }
 
     /// Handle a STREAM frame from the originator. Returns events to send back
     /// (currently only used for connect-failure RST).
+    ///
+    /// W2: SYN never blocks the caller — the TCP connect runs on a
+    /// short-lived worker thread and completes in `poll()`.
     pub fn handle_frame(
         &mut self,
         stream_id: u32,
@@ -650,11 +796,16 @@ impl TcpRelay {
         from_peer: &str,
     ) -> Vec<RelayEvent> {
         let mut out = Vec::new();
+        let key: RelayKey = (from_peer.to_string(), stream_id);
         if flags & STREAM_SYN != 0 {
             if payload.len() < 6 {
+                self.stats.short_syn_dropped += 1;
                 return out;
             }
-            if self.conns.len() >= MAX_TCP_CONNS {
+            if self.conns.contains_key(&key) || self.pending.contains_key(&key) {
+                return out; // duplicate SYN: ignore
+            }
+            if self.conns.len() + self.pending.len() >= self.max_conns {
                 self.stats.table_full += 1;
                 out.push(RelayEvent::Closed {
                     stream_id,
@@ -667,47 +818,63 @@ impl TcpRelay {
             ip.copy_from_slice(&payload[..4]);
             let port = u16::from_be_bytes([payload[4], payload[5]]);
             let addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::from(ip), port));
-            match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
-                Ok(s) => {
-                    let _ = s.set_nonblocking(true);
-                    // Any trailing bytes after the 6-byte addr are first data.
-                    let mut stream = s;
-                    let _ = stream.set_nonblocking(false);
-                    if payload.len() > 6 && stream.write_all(&payload[6..]).is_err() {
-                        out.push(RelayEvent::Closed {
-                            stream_id,
-                            peer: from_peer.to_string(),
-                            reset: true,
-                        });
-                        return out;
-                    }
-                    let _ = stream.set_nonblocking(true);
-                    self.conns.insert(
-                        stream_id,
-                        RelayConn {
-                            stream,
-                            peer: from_peer.to_string(),
-                            fin_sent: false,
-                        },
-                    );
-                }
-                Err(_) => {
-                    self.stats.connect_failed += 1;
+            // Any trailing bytes after the 6-byte addr are first data.
+            let mut first_data = Vec::new();
+            if payload.len() > 6 {
+                first_data.extend_from_slice(&payload[6..]);
+            }
+            self.pending.insert(
+                key.clone(),
+                PendingSyn {
+                    first_data,
+                    fin_pending: false,
+                },
+            );
+            // W2: connect off the downlink thread.
+            let tx = self.connect_tx.clone();
+            std::thread::spawn(move || {
+                let stream = TcpStream::connect_timeout(&addr, RELAY_CONNECT_TIMEOUT)
+                    .ok()
+                    .and_then(|s| s.set_nonblocking(true).ok().map(|_| s));
+                let _ = tx.send(ConnectResult { key, stream });
+            });
+            return out;
+        }
+        if self.cancelled.contains(&key) {
+            return out; // RST'd while connecting: drop late frames.
+        }
+        // DATA/FIN for a connect still in flight: buffer / record.
+        if let Some(p) = self.pending.get_mut(&key) {
+            if flags & STREAM_RST != 0 {
+                self.pending.remove(&key);
+                self.cancelled.insert(key);
+                return out;
+            }
+            if flags & STREAM_FIN != 0 {
+                p.fin_pending = true;
+                return out;
+            }
+            if !payload.is_empty() {
+                if p.first_data.len() + payload.len() > RELAY_PENDING_DATA_CAP {
+                    self.pending.remove(&key);
+                    self.cancelled.insert(key.clone());
                     out.push(RelayEvent::Closed {
                         stream_id,
                         peer: from_peer.to_string(),
                         reset: true,
                     });
+                    return out;
                 }
+                p.first_data.extend_from_slice(payload);
             }
             return out;
         }
-        let conn = match self.conns.get_mut(&stream_id) {
+        let conn = match self.conns.get_mut(&key) {
             Some(c) => c,
             None => return out, // unknown stream: drop (S12-style)
         };
         if flags & STREAM_RST != 0 {
-            self.conns.remove(&stream_id);
+            self.conns.remove(&key);
             return out;
         }
         if flags & STREAM_FIN != 0 {
@@ -716,13 +883,10 @@ impl TcpRelay {
             return out;
         }
         if !payload.is_empty() {
-            // Blocking write with a timeout would be nicer; P0: temporarily
-            // switch to blocking, write_all, switch back.
-            let _ = conn.stream.set_nonblocking(false);
-            let r = conn.stream.write_all(payload);
-            let _ = conn.stream.set_nonblocking(true);
+            // W2: non-blocking write; remainder buffered, never blocks.
+            let r = Self::write_nonblocking(&mut conn.stream, &mut conn.write_pending, payload);
             if r.is_err() {
-                self.conns.remove(&stream_id);
+                self.conns.remove(&key);
                 out.push(RelayEvent::Closed {
                     stream_id,
                     peer: from_peer.to_string(),
@@ -733,16 +897,83 @@ impl TcpRelay {
         out
     }
 
+    /// Drain finished worker connects into the table.
+    fn drain_connects(&mut self, out: &mut Vec<RelayEvent>) {
+        while let Ok(res) = self.connect_rx.try_recv() {
+            if self.cancelled.remove(&res.key) {
+                continue; // RST arrived while connecting: drop the stream.
+            }
+            let mut p = match self.pending.remove(&res.key) {
+                Some(p) => p,
+                None => continue,
+            };
+            let (stream_id, peer) = (res.key.1, res.key.0.clone());
+            let mut stream = match res.stream {
+                Some(s) => s,
+                None => {
+                    self.stats.connect_failed += 1;
+                    out.push(RelayEvent::Closed {
+                        stream_id,
+                        peer,
+                        reset: true,
+                    });
+                    continue;
+                }
+            };
+            // Flush data buffered while connecting (W2).
+            let mut write_pending = Vec::new();
+            let first = std::mem::take(&mut p.first_data);
+            let r = Self::write_nonblocking(&mut stream, &mut write_pending, &first);
+            if r.is_err() {
+                self.stats.connect_failed += 1;
+                out.push(RelayEvent::Closed {
+                    stream_id,
+                    peer,
+                    reset: true,
+                });
+                continue;
+            }
+            if p.fin_pending {
+                let _ = stream.shutdown(Shutdown::Write);
+            }
+            self.conns.insert(
+                res.key,
+                RelayConn {
+                    stream,
+                    peer,
+                    fin_sent: false,
+                    write_pending,
+                },
+            );
+        }
+    }
+
     /// Poll internet-side sockets; harvest bytes / EOF / errors.
     pub fn poll(&mut self) -> Vec<RelayEvent> {
         let mut out = Vec::new();
+        self.drain_connects(&mut out);
         let mut remove = Vec::new();
-        let ids: Vec<u32> = self.conns.keys().copied().collect();
+        let ids: Vec<RelayKey> = self.conns.keys().cloned().collect();
         for id in ids {
             let conn = match self.conns.get_mut(&id) {
                 Some(c) => c,
                 None => continue,
             };
+            // W2: flush bytes the non-blocking write could not take yet.
+            if !conn.write_pending.is_empty() {
+                let pending = std::mem::take(&mut conn.write_pending);
+                let r =
+                    Self::write_nonblocking(&mut conn.stream, &mut conn.write_pending, &pending);
+                if r.is_err() {
+                    remove.push(id.clone());
+                    out.push(RelayEvent::Closed {
+                        stream_id: id.1,
+                        peer: conn.peer.clone(),
+                        reset: true,
+                    });
+                    continue;
+                }
+            }
             let mut buf = [0u8; 8192];
             match conn.stream.read(&mut buf) {
                 Ok(0) => {
@@ -750,7 +981,7 @@ impl TcpRelay {
                     if !conn.fin_sent {
                         conn.fin_sent = true;
                         out.push(RelayEvent::Closed {
-                            stream_id: id,
+                            stream_id: id.1,
                             peer: conn.peer.clone(),
                             reset: false,
                         });
@@ -760,16 +991,16 @@ impl TcpRelay {
                 Ok(n) => {
                     self.stats.relayed_bytes += n as u64;
                     out.push(RelayEvent::Data {
-                        stream_id: id,
+                        stream_id: id.1,
                         peer: conn.peer.clone(),
                         bytes: buf[..n].to_vec(),
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(_) => {
-                    remove.push(id);
+                    remove.push(id.clone());
                     out.push(RelayEvent::Closed {
-                        stream_id: id,
+                        stream_id: id.1,
                         peer: conn.peer.clone(),
                         reset: true,
                     });
@@ -807,6 +1038,14 @@ impl TcpEgress {
     /// Total live connections (terminator + relay).
     pub fn conn_count(&self) -> usize {
         self.terminator.conn_count() + self.relay.conn_count()
+    }
+
+    /// F1: true iff `stream_id` is a connection we originated *for*
+    /// `from_peer`. A bare "id known to terminator" check misroutes when
+    /// this node is both originator and egress, because both stream_id
+    /// counters start at 1.
+    pub fn is_originator_frame(&self, stream_id: u32, from_peer: &str) -> bool {
+        self.terminator.peer_for(stream_id).as_deref() == Some(from_peer)
     }
 }
 
@@ -970,7 +1209,18 @@ mod tests {
         syn_payload.extend_from_slice(&sa.port().to_be_bytes());
         let evs = relay.handle_frame(7, STREAM_SYN, &syn_payload, "peer-A");
         assert!(evs.is_empty());
-        assert!(relay.has(7));
+        // W2: connect completes asynchronously on the poll thread.
+        let mut ok = false;
+        for _ in 0..200 {
+            let _ = relay.poll();
+            if relay.has("peer-A", 7) {
+                ok = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ok, "relay connect did not complete");
+        assert!(!relay.has("peer-B", 7));
 
         let evs = relay.handle_frame(7, 0, b"ping", "peer-A");
         assert!(evs.is_empty());
@@ -993,12 +1243,29 @@ mod tests {
 
     #[test]
     fn table_full_rejects_syn() {
-        // S22: table cap enforced.
-        let term = TcpTerminator::new();
-        // Fill the table by shrinking via repeated SYNs is slow; instead
-        // verify the counter path exists by checking default is not full.
-        assert_eq!(term.stats().table_full, 0);
-        assert!(term.conn_count() < MAX_TCP_CONNS);
+        // S22: table cap enforced on both sides (test-only small cap).
+        let mut term = TcpTerminator::new();
+        term.set_max_conns(1);
+        let syn1 = craft_tcp([10, 0, 0, 2], [1, 2, 3, 4], 40000, 8080, 1000, 0, 0x02, &[]);
+        let _ = term.handle_uplink(&syn1, "peer-B");
+        assert_eq!(term.conn_count(), 1);
+        let syn2 = craft_tcp([10, 0, 0, 2], [1, 2, 3, 4], 40001, 8080, 1000, 0, 0x02, &[]);
+        let _ = term.handle_uplink(&syn2, "peer-B");
+        assert_eq!(term.stats().table_full, 1);
+        assert_eq!(term.conn_count(), 1);
+
+        // Relay side: SYN rejected with an RST event.
+        let mut relay = TcpRelay::new();
+        relay.set_max_conns(0);
+        let mut p = vec![127, 0, 0, 1];
+        p.extend_from_slice(&7u16.to_be_bytes());
+        let evs = relay.handle_frame(9, STREAM_SYN, &p, "peer-A");
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, RelayEvent::Closed { reset: true, .. })),
+            "expected RST on table-full SYN"
+        );
+        assert_eq!(relay.stats().table_full, 1);
     }
 
     #[test]
@@ -1051,41 +1318,65 @@ mod tests {
                 .map(std::mem::discriminant)
                 .collect::<Vec<_>>()
         );
-        // Our FIN should be in a TUN packet.
-        let has_fin = term
-            .poll()
-            .iter()
-            .any(|e| matches!(e, TcpEvent::TunPacket(_)));
-        let _ = has_fin;
 
-        // App ACKs our FIN -> socket Closed -> table cleaned.
-        // (seq/ack bookkeeping simplified: ack our FIN with a plausible ACK)
-        // Find our FIN seq from the last TUN packets is complex; instead
-        // drive poll until cleanup via fabricated final ACK is skipped —
-        // we assert cleanup happens once smoltcp reaches Closed.
-        // Feed a RST-free final ACK with generous ack number.
+        // Our FIN must be emitted to the TUN (seq = srv_seq+1, one byte).
+        let mut our_fin_seq = None;
+        for _ in 0..3 {
+            for e in term.poll() {
+                if let TcpEvent::TunPacket(p) = e {
+                    if let Some((_, _, sp, _, flags, _)) = parse_tcp(&p) {
+                        if sp == 8081 && flags & 0x01 != 0 {
+                            our_fin_seq = Some(u32::from_be_bytes([p[24], p[25], p[26], p[27]]));
+                        }
+                    }
+                }
+            }
+            if our_fin_seq.is_some() {
+                break;
+            }
+        }
+        let our_fin_seq = our_fin_seq.expect("our FIN packet missing on TUN");
+
+        // App ACKs our FIN -> smoltcp Closed -> table cleaned (S23).
         let final_ack = craft_tcp(
             [10, 0, 0, 2],
             [1, 2, 3, 4],
             40001,
             8081,
             2002,
-            srv_seq + 2,
+            our_fin_seq + 1,
             0x10,
             &[],
         );
         term.handle_uplink(&final_ack, "peer-B");
-        let _ = term.poll();
-        // May or may not be fully closed depending on exact seq; the
-        // important part (Closed event emitted) is asserted above.
+        for _ in 0..3 {
+            let _ = term.poll();
+        }
+        assert_eq!(
+            term.conn_count(),
+            0,
+            "connection table must be empty after FIN handshake"
+        );
     }
 
     #[test]
     fn half_open_expires() {
-        // S23: counter exists; expiry path is time-based (not sleeping 30s
-        // in a unit test — covered by code review + E4 absence of leaks).
-        let term = TcpTerminator::new();
-        assert_eq!(term.stats().half_open_expired, 0);
+        // S23: SYN received but the handshake never completes → the
+        // half-open connection is reaped after 30s and an RST goes out.
+        let mut term = TcpTerminator::new();
+        let syn = craft_tcp([10, 0, 0, 2], [1, 2, 3, 4], 40003, 8083, 6000, 0, 0x02, &[]);
+        let _ = term.handle_uplink(&syn, "peer-B");
+        assert_eq!(term.conn_count(), 1);
+        term.backdate_half_open(Duration::from_secs(31));
+        let events = term.poll();
+        assert_eq!(term.stats().half_open_expired, 1);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TcpEvent::Closed { reset: true, .. })),
+            "expected RST Closed event for expired half-open"
+        );
+        assert_eq!(term.conn_count(), 0);
     }
 
     #[test]
@@ -1107,5 +1398,193 @@ mod tests {
         assert_eq!(ip_checksum(&rw[..20]), 0);
         // TCP checksum over new pseudo-header verifies to 0.
         assert_eq!(tcp_checksum([10, 0, 0, 2], SMOLTCP_IFACE_IP, &rw[20..]), 0);
+    }
+
+    #[test]
+    fn dual_role_dispatches_by_peer() {
+        // F1: one TcpEgress is originator for peer-C (stream 1) while a
+        // different node (peer-A) may use stream 1 against us as egress.
+        // Dispatch must compare from_peer, not just id presence.
+        let mut e = TcpEgress::new();
+        let syn = craft_tcp([10, 0, 0, 2], [9, 9, 9, 9], 40010, 443, 5000, 0, 0x02, &[]);
+        let _ = e.terminator.handle_uplink(&syn, "peer-C");
+        assert_eq!(e.terminator.peer_for(1).as_deref(), Some("peer-C"));
+        assert!(e.is_originator_frame(1, "peer-C"));
+        assert!(!e.is_originator_frame(1, "peer-A")); // A's stream 1 → egress
+        assert!(!e.is_originator_frame(1, "self"));
+        assert!(!e.is_originator_frame(4242, "peer-C")); // unknown id → egress
+    }
+
+    /// Spawn a one-connection echo server; returns its address.
+    fn echo_server() -> SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = s.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                s.write_all(&buf[..n]).unwrap();
+            }
+        });
+        addr
+    }
+
+    fn syn_payload_for(addr: SocketAddr) -> Vec<u8> {
+        let sa = match addr {
+            SocketAddr::V4(v4) => v4,
+            _ => panic!("expected v4"),
+        };
+        let mut p = vec![];
+        p.extend_from_slice(&sa.ip().octets());
+        p.extend_from_slice(&sa.port().to_be_bytes());
+        p
+    }
+
+    fn wait_relay_has(relay: &mut TcpRelay, peer: &str, sid: u32) {
+        for _ in 0..300 {
+            let _ = relay.poll();
+            if relay.has(peer, sid) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("relay connect for ({peer}, {sid}) did not complete");
+    }
+
+    #[test]
+    fn relay_same_id_routes_by_peer() {
+        // F1: two originators both allocate stream_id 1 against this
+        // relay. Frames must be routed by (peer, stream_id); bytes must
+        // never cross between the two connections.
+        let addr_a = echo_server();
+        let addr_c = echo_server();
+        let mut relay = TcpRelay::new();
+        relay.handle_frame(1, STREAM_SYN, &syn_payload_for(addr_a), "peer-A");
+        relay.handle_frame(1, STREAM_SYN, &syn_payload_for(addr_c), "peer-C");
+        wait_relay_has(&mut relay, "peer-A", 1);
+        wait_relay_has(&mut relay, "peer-C", 1);
+        assert_eq!(relay.conn_count(), 2);
+
+        relay.handle_frame(1, 0, b"pingA", "peer-A");
+        relay.handle_frame(1, 0, b"pingC", "peer-C");
+        let mut got_a = vec![];
+        let mut got_c = vec![];
+        for _ in 0..300 {
+            for e in relay.poll() {
+                if let RelayEvent::Data { peer, bytes, .. } = e {
+                    if peer == "peer-A" {
+                        got_a.extend_from_slice(&bytes);
+                    } else if peer == "peer-C" {
+                        got_c.extend_from_slice(&bytes);
+                    } else {
+                        panic!("unexpected peer {peer}");
+                    }
+                }
+            }
+            if got_a == b"pingA" && got_c == b"pingC" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(got_a, b"pingA", "peer-A's bytes misrouted");
+        assert_eq!(got_c, b"pingC", "peer-C's bytes misrouted");
+    }
+
+    /// Payload length of a TUN-bound IPv4/TCP packet.
+    fn tun_payload_len(p: &[u8]) -> u64 {
+        let tot = u16::from_be_bytes([p[2], p[3]]) as usize;
+        let (_, _, _, _, _, off) = parse_tcp(p).unwrap();
+        (tot - off) as u64
+    }
+
+    fn establish(term: &mut TcpTerminator) -> (u32, u32) {
+        // SYN -> SYN-ACK, ACK -> Established. Returns (stream_id, srv_seq).
+        let syn = craft_tcp([10, 0, 0, 2], [1, 2, 3, 4], 40002, 8082, 3000, 0, 0x02, &[]);
+        let tun_pkts = term.handle_uplink(&syn, "peer-B");
+        assert_eq!(tun_pkts.len(), 1);
+        let srv_seq = u32::from_be_bytes([
+            tun_pkts[0][24],
+            tun_pkts[0][25],
+            tun_pkts[0][26],
+            tun_pkts[0][27],
+        ]);
+        let ack = craft_tcp(
+            [10, 0, 0, 2],
+            [1, 2, 3, 4],
+            40002,
+            8082,
+            3001,
+            srv_seq + 1,
+            0x10,
+            &[],
+        );
+        term.handle_uplink(&ack, "peer-B");
+        let _ = term.poll();
+        (1, srv_seq)
+    }
+
+    #[test]
+    fn fabric_data_backpressure_retained() {
+        // W1: 64KB of fabric bytes into a 16KB smoltcp send buffer. The
+        // excess must be retained (never dropped) and every byte must
+        // eventually reach the TUN once the app ACKs.
+        let mut term = TcpTerminator::new();
+        let (sid, srv_seq) = establish(&mut term);
+
+        let total = 64 * 1024usize;
+        let data = vec![0xABu8; total];
+        let mut delivered = 0u64;
+        let pkts = term.handle_fabric_data(sid, &data);
+        delivered += pkts.iter().map(|p| tun_payload_len(p)).sum::<u64>();
+        assert!(
+            term.stats().send_buffer_full >= 1,
+            "expected send-buffer back-pressure"
+        );
+        let key = term.by_id.get(&sid).copied().unwrap();
+        assert!(
+            !term.conns.get(&key).unwrap().pending.is_empty(),
+            "excess bytes must be retained, not dropped"
+        );
+
+        // App ACKs everything it received; retained bytes flush out.
+        // (ack = srv_seq+1+delivered: cumulative, like a real TCP app.)
+        let mut rounds = 0;
+        loop {
+            let (pending, sendq) = {
+                let c = term.conns.get(&key).unwrap();
+                let h = c.sock;
+                (
+                    c.pending.len(),
+                    term.sockets.get::<tcp::Socket>(h).send_queue(),
+                )
+            };
+            if pending == 0 && sendq == 0 {
+                break;
+            }
+            let ack = craft_tcp(
+                [10, 0, 0, 2],
+                [1, 2, 3, 4],
+                40002,
+                8082,
+                3001,
+                srv_seq + 1 + delivered as u32,
+                0x10,
+                &[],
+            );
+            let pkts = term.handle_uplink(&ack, "peer-B");
+            delivered += pkts.iter().map(|p| tun_payload_len(p)).sum::<u64>();
+            for e in term.poll() {
+                if let TcpEvent::TunPacket(p) = e {
+                    delivered += tun_payload_len(&p);
+                }
+            }
+            rounds += 1;
+            assert!(rounds < 200, "drain did not converge");
+        }
+        assert_eq!(delivered, total as u64, "bytes lost under back-pressure");
     }
 }

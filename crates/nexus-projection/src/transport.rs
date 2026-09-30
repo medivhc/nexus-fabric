@@ -52,8 +52,11 @@ pub trait DatagramTransport: Send + Sync {
 ///
 /// Peers are wired via [`MockTransport::link_peer`]; each `send_to` tags
 /// the datagram with this transport's name so the receiver knows the origin.
+/// For E4 fidelity the name should match the routing-level peer identity
+/// (production `FabricConn` stamps the real PeerId); use
+/// [`MockTransport::set_name`] to align them.
 pub struct MockTransport {
-    name: String,
+    name: Mutex<String>,
     peers: Mutex<PeerMap>,
     inbox_rx: Mutex<mpsc::Receiver<(String, Vec<u8>)>>,
     inbox_tx: mpsc::Sender<(String, Vec<u8>)>,
@@ -67,11 +70,17 @@ impl MockTransport {
     pub fn new(name: &str) -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
-            name: name.to_string(),
+            name: Mutex::new(name.to_string()),
             peers: Mutex::new(HashMap::new()),
             inbox_rx: Mutex::new(rx),
             inbox_tx: tx,
         }
+    }
+
+    /// Rename this transport (E4 wiring: align the stamped `from_peer`
+    /// with the routing-level peer identity).
+    pub fn set_name(&self, name: &str) {
+        *lock(&self.name) = name.to_string();
     }
 
     /// Register `peer_name`'s inbox (test/E4 wiring).
@@ -106,7 +115,7 @@ impl DatagramTransport for MockTransport {
                 }
             })
             .ok_or_else(|| TransportError::PeerNotFound(peer.to_string()))?;
-        tx.send((self.name.clone(), data.to_vec()))
+        tx.send((lock(&self.name).clone(), data.to_vec()))
             .map_err(|_| TransportError::Io("peer inbox closed".into()))
     }
 

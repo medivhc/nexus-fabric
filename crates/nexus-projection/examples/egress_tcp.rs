@@ -224,9 +224,12 @@ fn run() -> Result<(String, bool), String> {
 
     a.link_mock_peer("B", &b);
     b.link_mock_peer("A", &a);
-    b.mock_transport()
-        .unwrap()
-        .link_peer("local", a.mock_transport().unwrap().inbox_sender());
+    // F1: the mock transport must stamp the routing-level peer identity as
+    // `from_peer` (production FabricConn stamps the real PeerId); otherwise
+    // STREAM dispatch cannot tell our originated streams apart from relayed
+    // ones when both sides allocate stream_id from 1.
+    a.mock_transport().unwrap().set_name("A");
+    b.mock_transport().unwrap().set_name("B");
 
     let client_ip = [10, 0, 0, 2];
     let server_ip = [127, 0, 0, 1];

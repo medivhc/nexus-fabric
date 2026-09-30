@@ -288,7 +288,8 @@ fn tcp_poll_once(
                 None => return,
             };
             let mut t = lock(tcp);
-            if t.terminator.lookup_id(sid).is_some() {
+            // F1: dispatch by (stream_id, from_peer), not by id alone.
+            if t.is_originator_frame(sid, "self") {
                 // Originator side (frame came from our own relay).
                 let pkts = if fl & STREAM_RST != 0 {
                     t.terminator.handle_fabric_rst(sid)
@@ -424,8 +425,9 @@ fn handle_stream_datagram(
         Some(t) => t,
         None => return,
     };
-    // Originator?
-    let is_originator = { lock(&tcp).terminator.lookup_id(stream_id).is_some() };
+    // Originator? F1: compare the frame's from_peer against the peer the
+    // stream was originated for — id-only lookup misroutes dual-role nodes.
+    let is_originator = { lock(&tcp).is_originator_frame(stream_id, from_peer) };
     if is_originator {
         let pkts = {
             let mut t = lock(&tcp);
