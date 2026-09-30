@@ -17,3 +17,11 @@ nexus-proxy-config = { path = "../nexus-proxy-config" }
 [[example]]
 name = "proxy_quic"
 path = "examples/proxy_quic.rs"
+
+[[example]]
+name = "proxy_ss_quic"
+path = "examples/proxy_ss_quic.rs"
+
+[[example]]
+name = "proxy_trojan_quic"
+path = "examples/proxy_trojan_quic.rs"
