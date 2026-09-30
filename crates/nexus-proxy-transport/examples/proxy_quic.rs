@@ -254,7 +254,9 @@ fn run() -> Result<(String, bool), String> {
         .recv_timeout(Duration::from_secs(30))
         .map_err(|_| "A: timeout waiting for B peer_id".to_string())?;
     let transport = ProxyTransport::new(tcp_stream, b_tcp_addr);
-    let (t_ok, t_err, t_framed) = transport.counters();
+    // P1-3: clone the counters handle BEFORE the transport is moved into the
+    // driver, then read it AFTER I/O so framed_bytes reflects the transfer.
+    let counters = transport.counters_handle();
     let conn_config = ConnConfig {
         addrs: vec![b_tcp_addr],
         handshake_timeout: Duration::from_secs(20),
@@ -293,6 +295,8 @@ fn run() -> Result<(String, bool), String> {
 
     let relayed_bytes = relayed.load(Ordering::Relaxed);
     let saw_plaintext = saw.load(Ordering::Relaxed);
+    // Read transport counters AFTER the transfer (P1-3).
+    let (t_ok, t_err, t_framed) = counters.get();
     let pass = roundtrip_ok && relayed_bytes > 0 && saw_plaintext == 0;
     let json = format!(
         "{{\"verdict\":\"{}\",\"roundtrip_ok\":{},\"proxy_relayed_bytes\":{},\

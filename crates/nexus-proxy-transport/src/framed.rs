@@ -8,7 +8,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Mutex,
+    Arc, Mutex,
 };
 use std::time::Duration;
 
@@ -19,6 +19,29 @@ use crate::{socks5, ProxyError, Socks5ProxyConfig, FRAME_HEADER_LEN, MAX_DATAGRA
 /// QUIC datagrams over a SOCKS5-established TCP stream (X1).
 ///
 /// Point-to-point: bound to the single CONNECT `target` at construction;
+/// X6 counters, shareable via [`ProxyTransport::counters_handle`].
+///
+/// The transport is moved into the QUIC driver (`connect_with_transport`),
+/// so the E4 example clones this handle *before* the move and reads the
+/// counters *after* the transfer. (P1-3 fix.)
+#[derive(Clone, Default, Debug)]
+pub struct Counters {
+    handshake_ok: Arc<AtomicU64>,
+    handshake_err: Arc<AtomicU64>,
+    framed_bytes: Arc<AtomicU64>,
+}
+
+impl Counters {
+    /// Snapshot as `(handshake_ok, handshake_err, framed_bytes)`.
+    pub fn get(&self) -> (u64, u64, u64) {
+        (
+            self.handshake_ok.load(Ordering::Relaxed),
+            self.handshake_err.load(Ordering::Relaxed),
+            self.framed_bytes.load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// [`UdpTransport::send_to`]'s `target` parameter is ignored (the TCP
 /// connection *is* the target).
 pub struct ProxyTransport {
@@ -27,22 +50,21 @@ pub struct ProxyTransport {
     /// Read buffer for atomic `recv_from`: bytes read from the socket but not
     /// yet consumed as a complete frame. A `recv_from` that times out leaves
     /// this buffer untouched, so the next call resumes at a frame boundary.
+    /// Bounded at `FRAME_HEADER_LEN + MAX_DATAGRAM` (P1-4).
     read_buf: Vec<u8>,
-    handshake_ok: AtomicU64,
-    handshake_err: AtomicU64,
-    framed_bytes: AtomicU64,
+    counters: Counters,
 }
 
 impl ProxyTransport {
     /// Wrap an already SOCKS5-connected stream.
     pub fn new(stream: TcpStream, target: SocketAddr) -> Self {
+        let counters = Counters::default();
+        counters.handshake_ok.store(1, Ordering::Relaxed);
         Self {
             stream: Mutex::new(stream),
             target,
             read_buf: Vec::new(),
-            handshake_ok: AtomicU64::new(1),
-            handshake_err: AtomicU64::new(0),
-            framed_bytes: AtomicU64::new(0),
+            counters,
         }
     }
 
@@ -67,15 +89,17 @@ impl ProxyTransport {
     ///   prevents object creation, so it is reported via `Err`, not here.
     /// - `framed_bytes` counts payload bytes sent/recv'd (excludes headers).
     pub fn counters(&self) -> (u64, u64, u64) {
-        (
-            self.handshake_ok.load(Ordering::Relaxed),
-            self.handshake_err.load(Ordering::Relaxed),
-            self.framed_bytes.load(Ordering::Relaxed),
-        )
+        self.counters.get()
+    }
+
+    /// Cloneable handle to the X6 counters. Use this when the transport is
+    /// moved into the driver but counters must be read after I/O.
+    pub fn counters_handle(&self) -> Counters {
+        self.counters.clone()
     }
 
     fn record_err(&self) {
-        self.handshake_err.fetch_add(1, Ordering::Relaxed);
+        self.counters.handshake_err.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -108,10 +132,22 @@ impl UdpTransport for ProxyTransport {
                     buf[..len]
                         .copy_from_slice(&self.read_buf[FRAME_HEADER_LEN..FRAME_HEADER_LEN + len]);
                     self.read_buf.drain(..FRAME_HEADER_LEN + len);
-                    self.framed_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                    self.counters
+                        .framed_bytes
+                        .fetch_add(len as u64, Ordering::Relaxed);
                     // The "source address" is the real peer (decapsulated), per UdpTransport.
                     return Ok((len, self.target));
                 }
+            }
+            // P1-4: bound the buffer. If we have more than a max-size frame
+            // but still can't parse one, the peer is sending garbage.
+            if self.read_buf.len() > FRAME_HEADER_LEN + MAX_DATAGRAM {
+                self.read_buf.clear();
+                self.record_err();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "proxy: read buffer exceeded max frame size",
+                ));
             }
             // Need more bytes: read from the socket (honors its read timeout).
             let mut stream = self
@@ -129,6 +165,9 @@ impl UdpTransport for ProxyTransport {
                 }
                 Ok(n) => {
                     self.read_buf.extend_from_slice(&tmp[..n]);
+                    // Note: bound check is at the top of the loop, after the
+                    // parse attempt. A single read may bring multiple frames;
+                    // we must try to parse before declaring the buffer full.
                 }
                 Err(e) => {
                     // Timeout or other error: buffer untouched, caller retries.
@@ -150,7 +189,8 @@ impl UdpTransport for ProxyTransport {
         // syscall; not worth the complexity at P1.)
         stream.write_all(&(buf.len() as u16).to_be_bytes())?;
         stream.write_all(buf)?;
-        self.framed_bytes
+        self.counters
+            .framed_bytes
             .fetch_add(buf.len() as u64, Ordering::Relaxed);
         Ok(buf.len())
     }

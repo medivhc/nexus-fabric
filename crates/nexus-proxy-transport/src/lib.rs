@@ -16,7 +16,7 @@
 mod framed;
 mod socks5;
 
-pub use framed::ProxyTransport;
+pub use framed::{Counters, ProxyTransport};
 pub use socks5::socks5_connect;
 
 use std::io;
