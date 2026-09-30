@@ -219,10 +219,12 @@ mod tests {
         if !udp_loopback_available() {
             return; // sandbox: UDP blocked, true verification on xc-pc-linux
         }
-        let (conn_a, _conn_b) = quic_pair().expect("real QUIC pair");
-        // Arm the failure path: close, then wait until the driver reaps the
-        // connection (cmd_rebind returns Err(Closed) for reaped conns).
-        conn_a.close(0, b"test");
+        let (conn_a, conn_b) = quic_pair().expect("real QUIC pair");
+        // Arm the failure path: the peer closes, A's driver reaps the conn
+        // (~0.5s), after which cmd_rebind returns Err(Closed).
+        // (Local close() alone does not reap: the driver keeps the conn in
+        // live; probed 2026-09-30.)
+        conn_b.close(0, b"test");
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             if conn_a.rebind().is_err() {
@@ -230,7 +232,7 @@ mod tests {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "conn never reaped after close"
+                "conn never reaped after peer close"
             );
             std::thread::sleep(Duration::from_millis(50));
         }
