@@ -8,7 +8,7 @@
 //!
 //! Outputs JSON; `--json` flag required (harness convention).
 
-use nexus_path::{race_connect, CandidatePath, PathConnector, PathKind, RaceBudget};
+use nexus_path::{CandidatePath, PathConnector, PathKind, RaceBudget, race_connect};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};

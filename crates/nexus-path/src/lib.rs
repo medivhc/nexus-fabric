@@ -27,7 +27,7 @@ mod ewma;
 mod race;
 
 pub use ewma::Ewma;
-pub use race::{race_connect, PathConnector, RaceBudget, RaceOutcome};
+pub use race::{PathConnector, RaceBudget, RaceOutcome, race_connect};
 
 // ---------------------------------------------------------------------------
 // Scoring weights (defaults).
@@ -254,7 +254,11 @@ impl Inner {
             }
         };
 
-        let active_score = match state.candidates.get(&active_addr).and_then(|e| e.ewma.value()) {
+        let active_score = match state
+            .candidates
+            .get(&active_addr)
+            .and_then(|e| e.ewma.value())
+        {
             Some(s) => s,
             None => {
                 // Active path has unknown score; prefer any known path.
