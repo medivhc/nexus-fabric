@@ -62,12 +62,6 @@ struct SharedTun {
     inner: Arc<Mutex<MockTun>>,
 }
 
-impl SharedTun {
-    fn take_written(&self) -> Vec<Vec<u8>> {
-        self.inner.lock().unwrap().take_written()
-    }
-}
-
 impl TunDevice for SharedTun {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.inner.lock().unwrap().read(buf)
