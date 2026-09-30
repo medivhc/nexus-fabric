@@ -15,7 +15,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::{CandidatePath, PathKind};
+use crate::CandidatePath;
 
 /// Budgets for a single `race_connect` call (R1).
 #[derive(Debug, Clone)]
@@ -222,9 +222,7 @@ pub fn race_connect(
                 ),
             ))
         } else {
-            Err(last_error.unwrap_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "race_connect: all attempts failed")
-            }))
+            Err(last_error.unwrap_or_else(|| io::Error::other("race_connect: all attempts failed")))
         }
     })
 }
@@ -232,6 +230,7 @@ pub fn race_connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PathKind;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::atomic::AtomicUsize;
 
