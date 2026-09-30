@@ -281,10 +281,9 @@ mod tests {
         }
     }
 
-    /// Connector that routes by port: slow port vs fast port.
+    /// Connector that routes by port: slow port vs everything else (fast).
     struct PortRouter {
         slow_port: u16,
-        fast_port: u16,
     }
 
     impl PathConnector for PortRouter {
@@ -326,10 +325,7 @@ mod tests {
             path(PathKind::Direct, 9001, 0.0),
             path(PathKind::Turn, 9002, 5.0),
         ];
-        let conn = PortRouter {
-            slow_port: 9001,
-            fast_port: 9002,
-        };
+        let conn = PortRouter { slow_port: 9001 };
         let budget = RaceBudget {
             stagger_delay_ms: 200,
             max_parallel: 2,
@@ -349,8 +345,7 @@ mod tests {
             path(PathKind::Turn, 9002, 5.0),
         ];
         let conn = PortRouter {
-            slow_port: 9002, // turn is slow here
-            fast_port: 9001, // direct is fast
+            slow_port: 9002, // turn is slow here; direct (9001) is fast
         };
         let budget = RaceBudget::default();
         let outcome = race_connect(&candidates, &conn, &budget).unwrap();

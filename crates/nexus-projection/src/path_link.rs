@@ -102,9 +102,7 @@ impl PathLink {
 mod tests {
     use super::PathLink;
     use nexus_fabric::{ConnConfig, FabricConn, FabricListener};
-    use nexus_path::{
-        CandidatePath, PathConfig, PathKind, PathManager, PathStats, RaceBudget,
-    };
+    use nexus_path::{CandidatePath, PathConfig, PathKind, PathManager, PathStats, RaceBudget};
     use std::net::SocketAddr;
     use std::time::Duration;
 
