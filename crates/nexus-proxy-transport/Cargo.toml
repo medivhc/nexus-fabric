@@ -1,0 +1,15 @@
+[package]
+name = "nexus-proxy-transport"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "QUIC over SOCKS5 CONNECT: length-prefixed framing over TCP, implements nexus-fabric UdpTransport (DESIGN §3.5)"
+
+[dependencies]
+nexus-fabric = { path = "../nexus-fabric" }
+
+[dev-dependencies]
+
+[[example]]
+name = "proxy_quic"
+path = "examples/proxy_quic.rs"

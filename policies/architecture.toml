@@ -226,6 +226,12 @@ layer = "delivery"
 
 [[crate]]
 name = "nexus-turn"
+  allowed_internal_dependencies = ["nexus-fabric"]
+  portable = false
+  layer = "delivery"
+
+[[crate]]
+name = "nexus-proxy-transport"
 allowed_internal_dependencies = ["nexus-fabric"]
 portable = false
 layer = "delivery"
