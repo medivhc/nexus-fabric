@@ -1,12 +1,25 @@
-//! Projection layer: L3 tunnel (TUN <-> fabric datagrams).
+//! Projection layer: L3 tunnel (TUN <-> fabric datagrams) + unified routing.
 //!
-//! Captures IP packets from a TUN device, encapsulates them into fabric
-//! datagrams (payload = raw IP packet, zero overhead per S2), and decapsulates
-//! received datagrams back into the local TUN. P0: L3 tunnel only.
+//! Captures IP packets from a TUN device, classifies each via a [`Router`]
+//! ([`RouteTarget`]: `MeshPeer` / `Egress` / `Drop`), and:
+//! - `MeshPeer`: encapsulates into fabric datagrams (1-byte intent + raw IP
+//!   packet, S2) for mesh forwarding;
+//! - `Egress{self}`: records in the local UDP NAT ([`EgressNat`]);
+//! - `Egress{peer}`: encapsulates with the egress intent bit for the peer;
+//! - `Drop`: counted, not sent (S12).
 //!
 //! P0 transport: internal `mpsc` queues simulate the fabric. `link_peer` wires
 //! two projections together for E4. Future: replace with `FabricConn`
 //! (`send_datagram` / `recv_datagram`) — see comments at `link_peer`.
+
+pub mod egress;
+pub mod routing;
+
+pub use egress::{EgressNat, FlowKey, NatStats, Rule, SimpleRuleEngine};
+/// Re-exported domain types for unified routing (defined in `nexus-domain`,
+/// used — not modified — here).
+pub use nexus_domain::{RouteRequest, RouteTarget, RuleEngine};
+pub use routing::{Cidr, Router, UnifiedRouter, format_ipv4, parse_ipv4_dst, parse_ipv4_src};
 
 use std::collections::VecDeque;
 use std::io;
@@ -17,6 +30,37 @@ use std::sync::{
 };
 use std::thread;
 use std::time::Duration;
+
+/// Intent byte (fabric datagram payload, first byte — DESIGN.md §6.4):
+/// bit 0-1 = type (00 = mesh forward, 01 = egress NAT),
+/// bit 2-5 = egress hop count (loop protection), bit 6-7 = reserved.
+pub const INTENT_MESH: u8 = 0x00;
+pub const INTENT_EGRESS: u8 = 0x01;
+
+/// Encode the intent byte.
+pub fn encode_intent(is_egress: bool, hops: u8) -> u8 {
+    let mut b = if is_egress {
+        INTENT_EGRESS
+    } else {
+        INTENT_MESH
+    };
+    b |= (hops & 0x0F) << 2;
+    b
+}
+
+/// Decode the intent byte → (is_egress, hop_count).
+pub fn decode_intent(b: u8) -> (bool, u8) {
+    ((b & 0x03) == INTENT_EGRESS, (b >> 2) & 0x0F)
+}
+
+/// Routing counters (S12: drops are visible, never silent).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RouteStats {
+    pub mesh_peer: u64,
+    pub egress_self: u64,
+    pub egress_remote: u64,
+    pub dropped: u64,
+}
 
 /// Abstraction over a TUN device. Implementations: `MockTun` (E4),
 /// OS-specific (E5, `os::linux`).
@@ -134,19 +178,64 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Classify a packet via the installed router, or default to mesh when
+/// no router is set (legacy raw path).
+fn classify(router_slot: &Arc<Mutex<Option<Arc<dyn Router>>>>, packet: &[u8]) -> RouteTarget {
+    let guard = lock(router_slot);
+    match guard.as_ref() {
+        Some(r) => r.route(&RouteRequest {
+            packet,
+            domain: None,
+        }),
+        None => RouteTarget::MeshPeer {
+            peer: "legacy".to_string(),
+        },
+    }
+}
+
+/// Send a packet via the fabric with the given intent byte prepended (S2).
+///
+/// S5: the full datagram (1 intent byte + packet) must fit in `mtu`;
+/// oversize datagrams are dropped, counted, and reported — never truncated.
+/// Returns `true` if sent.
+fn send_with_intent(
+    to_net: &FabricSender,
+    stats: &Arc<Mutex<TunStats>>,
+    packet: &[u8],
+    mtu: usize,
+    intent: u8,
+) -> bool {
+    if packet.len() + 1 > mtu {
+        lock(stats).dropped_oversize += 1;
+        return false;
+    }
+    let mut datagram = Vec::with_capacity(packet.len() + 1);
+    datagram.push(intent);
+    datagram.extend_from_slice(packet);
+    // S3: best-effort. If the peer is gone, drop silently.
+    if lock(to_net).send(datagram).is_ok() {
+        let mut s = lock(stats);
+        s.packets_out += 1;
+        s.bytes_out += packet.len() as u64;
+        true
+    } else {
+        false
+    }
+}
+
 /// Shared fabric sender. `link_peer` swaps the target; the uplink thread and
 /// `send_packet` both go through here so linking is atomic.
 type FabricSender = Arc<Mutex<mpsc::Sender<Vec<u8>>>>;
 
-/// L3 tunnel projection: TUN <-> fabric datagrams.
+/// L3 tunnel projection: TUN <-> fabric datagrams, with unified routing.
 ///
 /// Two background threads (owner: this struct, joined on `close`/`Drop`):
-/// - uplink: TUN.read -> MTU check -> fabric (S2: payload = raw IP packet)
-/// - downlink: fabric -> TUN.write
+/// - uplink: TUN.read -> route -> MTU check -> fabric / local NAT / drop
+/// - downlink: fabric -> strip intent byte -> TUN.write
 ///
-/// `send_packet` is the test/E4 injection path (same MTU check as the uplink
-/// thread). `recv_packet` drains the fabric inbox directly and is only
-/// available on thread-less instances (see `new_for_test`); with threads
+/// `send_packet` is the test/E4 injection path (same routing + MTU check as
+/// the uplink thread). `recv_packet` drains the fabric inbox directly and is
+/// only available on thread-less instances (see `new_for_test`); with threads
 /// running, the downlink thread owns the inbox and writes to the TUN.
 pub struct Projection {
     config: ProjectionConfig,
@@ -157,6 +246,16 @@ pub struct Projection {
     from_net: Option<mpsc::Receiver<Vec<u8>>>,
     /// Our inbox sender, handed to the peer via `link_peer`.
     inbox_tx: mpsc::Sender<Vec<u8>>,
+    /// TUN device, shared with the background threads (also used by
+    /// `handle_egress_reply` to deliver mock replies in E4).
+    tun: Arc<Mutex<Box<dyn TunDevice>>>,
+    /// Unified router (`None` = legacy raw path, everything is mesh).
+    /// Shared slot so `with_router` (builder, runs after `new`) is visible
+    /// to the already-spawned background threads.
+    router_slot: Arc<Mutex<Option<Arc<dyn Router>>>>,
+    route_stats: Arc<Mutex<RouteStats>>,
+    /// Local egress NAT for `Egress{self}`.
+    egress_nat: Arc<Mutex<EgressNat>>,
     stats: Arc<Mutex<TunStats>>,
     path_switches: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
@@ -178,14 +277,23 @@ impl Projection {
         let shutdown = Arc::new(AtomicBool::new(false));
         let tun = Arc::new(Mutex::new(tun));
         let mtu = config.mtu;
+        let route_stats = Arc::new(Mutex::new(RouteStats::default()));
+        let egress_nat = Arc::new(Mutex::new(EgressNat::new()));
+        // Router is installed later via `with_router`; the threads read it
+        // through this shared slot so the builder can run before or after
+        // `new` (threads only start in `new`, builder runs before that).
+        let router: Arc<Mutex<Option<Arc<dyn Router>>>> = Arc::new(Mutex::new(None));
 
         let (uplink, downlink, from_net) = if spawn_threads {
-            // Uplink: TUN -> fabric.
+            // Uplink: TUN -> route -> fabric / local NAT / drop.
             let up = {
                 let tun = Arc::clone(&tun);
                 let to_net = Arc::clone(&to_net);
                 let stats = Arc::clone(&stats);
                 let shutdown = Arc::clone(&shutdown);
+                let router = Arc::clone(&router);
+                let route_stats = Arc::clone(&route_stats);
+                let egress_nat = Arc::clone(&egress_nat);
                 thread::Builder::new()
                     .name("projection-uplink".into())
                     .spawn(move || {
@@ -207,24 +315,61 @@ impl Projection {
                                     }
                                 }
                             };
-                            if n > mtu {
-                                lock(&stats).dropped_oversize += 1;
-                                continue;
+                            let pkt = &buf[..n];
+                            // Route first (S9/S10/S12).
+                            let target = classify(&router, pkt);
+                            match target {
+                                RouteTarget::Drop => {
+                                    lock(&route_stats).dropped += 1;
+                                    continue;
+                                }
+                                RouteTarget::Egress { ref peer } => {
+                                    if peer == "self" {
+                                        lock(&route_stats).egress_self += 1;
+                                    } else {
+                                        lock(&route_stats).egress_remote += 1;
+                                    }
+                                    // Originator tracks the flow for reply
+                                    // validation (S11), regardless of where
+                                    // the actual internet egress happens.
+                                    lock(&egress_nat).translate_outbound(pkt, peer);
+                                    if peer == "self" {
+                                        // Local egress: leaves via the real
+                                        // socket (production) or mock (E4).
+                                        let mut s = lock(&stats);
+                                        s.packets_out += 1;
+                                        s.bytes_out += n as u64;
+                                        continue;
+                                    }
+                                    // Remote egress: forward via fabric.
+                                    if !send_with_intent(
+                                        &to_net,
+                                        &stats,
+                                        pkt,
+                                        mtu,
+                                        encode_intent(true, 0),
+                                    ) {
+                                        continue;
+                                    }
+                                }
+                                RouteTarget::MeshPeer { .. } => {
+                                    lock(&route_stats).mesh_peer += 1;
+                                    if !send_with_intent(
+                                        &to_net,
+                                        &stats,
+                                        pkt,
+                                        mtu,
+                                        encode_intent(false, 0),
+                                    ) {
+                                        continue;
+                                    }
+                                }
                             }
-                            // S2: zero overhead — payload is the raw IP packet.
-                            let pkt = buf[..n].to_vec();
-                            let sent = lock(&to_net).send(pkt).is_ok();
-                            if sent {
-                                let mut s = lock(&stats);
-                                s.packets_out += 1;
-                                s.bytes_out += n as u64;
-                            }
-                            // S3: best-effort. If the peer is gone, drop silently.
                         }
                     })
                     .expect("spawn projection uplink")
             };
-            // Downlink: fabric -> TUN. Takes ownership of from_net.
+            // Downlink: fabric -> strip intent byte -> TUN.write.
             let down = {
                 let tun = Arc::clone(&tun);
                 let stats = Arc::clone(&stats);
@@ -234,9 +379,15 @@ impl Projection {
                     .spawn(move || {
                         while !shutdown.load(Ordering::Relaxed) {
                             match from_net.recv_timeout(Duration::from_millis(100)) {
-                                Ok(pkt) => {
+                                Ok(datagram) => {
+                                    // S2: strip the 1-byte intent; the rest is
+                                    // the raw IP packet.
+                                    let pkt = match datagram.split_first() {
+                                        Some((_, rest)) => rest,
+                                        None => continue, // empty datagram: drop
+                                    };
                                     let mut tun = lock(&tun);
-                                    if tun.write(&pkt).is_ok() {
+                                    if tun.write(pkt).is_ok() {
                                         let mut s = lock(&stats);
                                         s.packets_in += 1;
                                         s.bytes_in += pkt.len() as u64;
@@ -259,6 +410,10 @@ impl Projection {
             to_net,
             from_net,
             inbox_tx,
+            tun,
+            router_slot: router,
+            route_stats,
+            egress_nat,
             stats,
             path_switches,
             shutdown,
@@ -302,38 +457,125 @@ impl Projection {
         self.path_switches.load(Ordering::Relaxed)
     }
 
+    /// Install the unified router (builder). The already-spawned uplink
+    /// thread and `send_packet` pick it up through the shared slot.
+    pub fn with_router(self, router: Box<dyn Router>) -> Self {
+        let arc: Arc<dyn Router> = router.into();
+        *lock(&self.router_slot) = Some(arc);
+        self
+    }
+
+    /// Routing counters (S12).
+    pub fn route_stats(&self) -> RouteStats {
+        *lock(&self.route_stats)
+    }
+
+    /// Local egress NAT counters (S11).
+    pub fn nat_stats(&self) -> NatStats {
+        lock(&self.egress_nat).stats()
+    }
+
+    /// Feed a mock "internet" reply through the egress NAT (E4/test helper).
+    ///
+    /// If the reply's 5-tuple matches a tracked outbound flow, the reply is
+    /// written to the TUN and `true` is returned. Production uses real
+    /// egress sockets instead of this method.
+    pub fn handle_egress_reply(&self, reply: &[u8]) -> bool {
+        let matched = {
+            let mut nat = lock(&self.egress_nat);
+            nat.translate_inbound(reply).is_some()
+        };
+        if !matched {
+            return false;
+        }
+        let mut tun = lock(&self.tun);
+        if tun.write(reply).is_ok() {
+            let mut s = lock(&self.stats);
+            s.packets_in += 1;
+            s.bytes_in += reply.len() as u64;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Inject a packet to send (test/E4 path; production uses the TUN).
     ///
-    /// S5: oversize packets are dropped, counted, and reported — never
-    /// truncated or fragmented.
+    /// Routes via the installed router (S9/S10/S12); S5 oversize datagrams
+    /// are dropped, counted, and reported — never truncated or fragmented.
     pub fn send_packet(&mut self, packet: &[u8]) -> Result<(), ProjectionError> {
-        if packet.len() > self.config.mtu {
-            lock(&self.stats).dropped_oversize += 1;
-            return Err(ProjectionError::Oversize {
-                len: packet.len(),
-                mtu: self.config.mtu,
-            });
-        }
-        // S2: zero overhead — the datagram payload IS the raw IP packet.
-        match lock(&self.to_net).send(packet.to_vec()) {
-            Ok(()) => {
-                let mut s = lock(&self.stats);
-                s.packets_out += 1;
-                s.bytes_out += packet.len() as u64;
+        let target = classify(&self.router_slot, packet);
+        match target {
+            RouteTarget::Drop => {
+                lock(&self.route_stats).dropped += 1;
                 Ok(())
             }
-            Err(_) => {
-                // S3: best-effort; peer gone.
-                Err(ProjectionError::Io("fabric send failed".into()))
+            RouteTarget::Egress { ref peer } => {
+                if peer == "self" {
+                    lock(&self.route_stats).egress_self += 1;
+                } else {
+                    lock(&self.route_stats).egress_remote += 1;
+                }
+                // Originator tracks the flow for reply validation (S11).
+                lock(&self.egress_nat).translate_outbound(packet, peer);
+                if peer == "self" {
+                    let mut s = lock(&self.stats);
+                    s.packets_out += 1;
+                    s.bytes_out += packet.len() as u64;
+                    return Ok(());
+                }
+                if send_with_intent(
+                    &self.to_net,
+                    &self.stats,
+                    packet,
+                    self.config.mtu,
+                    encode_intent(true, 0),
+                ) {
+                    Ok(())
+                } else if packet.len() + 1 > self.config.mtu {
+                    Err(ProjectionError::Oversize {
+                        len: packet.len() + 1,
+                        mtu: self.config.mtu,
+                    })
+                } else {
+                    // S3: best-effort; peer gone.
+                    Err(ProjectionError::Io("fabric send failed".into()))
+                }
+            }
+            RouteTarget::MeshPeer { .. } => {
+                lock(&self.route_stats).mesh_peer += 1;
+                if send_with_intent(
+                    &self.to_net,
+                    &self.stats,
+                    packet,
+                    self.config.mtu,
+                    encode_intent(false, 0),
+                ) {
+                    Ok(())
+                } else if packet.len() + 1 > self.config.mtu {
+                    Err(ProjectionError::Oversize {
+                        len: packet.len() + 1,
+                        mtu: self.config.mtu,
+                    })
+                } else {
+                    // S3: best-effort; peer gone.
+                    Err(ProjectionError::Io("fabric send failed".into()))
+                }
             }
         }
     }
 
     /// Take a received packet (thread-less test instances only).
+    ///
+    /// Strips the 1-byte intent (S2); the returned bytes are the raw IP packet.
     pub fn recv_packet(&mut self) -> Option<Vec<u8>> {
         let rx = self.from_net.as_ref()?;
         match rx.try_recv() {
-            Ok(pkt) => {
+            Ok(datagram) => {
+                let pkt = match datagram.split_first() {
+                    Some((_, rest)) => rest.to_vec(),
+                    None => return None, // empty datagram: drop
+                };
                 let mut s = lock(&self.stats);
                 s.packets_in += 1;
                 s.bytes_in += pkt.len() as u64;
@@ -405,18 +647,27 @@ mod tests {
         let tun = Box::new(MockTun::default());
         let mut p = Projection::new_for_test(tun, ProjectionConfig { mtu: 100 });
         let big = vec![0u8; 101];
+        // S2: datagram = 1 intent byte + packet = 102 > mtu 100.
         let err = p.send_packet(&big).unwrap_err();
-        assert_eq!(err, ProjectionError::Oversize { len: 101, mtu: 100 });
+        assert_eq!(err, ProjectionError::Oversize { len: 102, mtu: 100 });
         assert_eq!(p.stats().dropped_oversize, 1);
         assert_eq!(p.stats().packets_out, 0);
-        // Exactly at MTU is fine.
-        let exact = vec![0u8; 100];
+        // Largest fitting packet: 99 + 1 intent = 100 <= mtu.
+        let exact = vec![0u8; 99];
         p.send_packet(&exact).unwrap();
         assert_eq!(p.stats().packets_out, 1);
     }
 
     #[test]
-    fn s2_zero_overhead_payload_is_raw_packet() {
+    fn s2_intent_byte_overhead() {
+        // S2 (revised §6.4): datagram = 1-byte intent + raw IP packet.
+        assert_eq!(encode_intent(false, 0), 0x00);
+        assert_eq!(encode_intent(true, 0), 0x01);
+        assert_eq!(encode_intent(true, 3), 0x01 | (3 << 2));
+        assert_eq!(decode_intent(0x00), (false, 0));
+        assert_eq!(decode_intent(0x01), (true, 0));
+        assert_eq!(decode_intent(0x0D), (true, 3));
+
         let tun = Box::new(MockTun::default());
         let mut p = Projection::new_for_test(tun, ProjectionConfig::default());
         // Minimal IPv4 header (20 bytes).
@@ -426,7 +677,7 @@ mod tests {
         ];
         p.send_packet(&pkt).unwrap();
         let got = p.recv_packet().unwrap();
-        // No projection header: what comes out is exactly what went in.
+        // Intent stripped on receive: the IP packet is byte-identical.
         assert_eq!(got.len(), pkt.len());
         assert_eq!(got, pkt);
     }
@@ -481,5 +732,87 @@ mod tests {
         let p = Projection::new(tun, ProjectionConfig::default());
         // Threads started; close must join them without hanging.
         p.close();
+    }
+
+    /// Build a test router: 10/8 → MeshPeer (fast path), 1.2.3.0/24 → Drop,
+    /// everything else → Egress{self}.
+    fn test_router() -> UnifiedRouter {
+        UnifiedRouter::new(
+            vec!["10.0.0.0/8".parse().unwrap()],
+            Box::new(SimpleRuleEngine::new(vec![
+                Rule {
+                    cidr: "1.2.3.0/24".parse().unwrap(),
+                    target: RouteTarget::Drop,
+                },
+                Rule {
+                    cidr: "0.0.0.0/0".parse().unwrap(),
+                    target: RouteTarget::Egress {
+                        peer: "self".to_string(),
+                    },
+                },
+            ])),
+        )
+    }
+
+    fn udp_pkt(dst: [u8; 4], sport: u16, dport: u16) -> Vec<u8> {
+        let mut pkt = vec![0u8; 32];
+        pkt[0] = 0x45;
+        pkt[9] = 17;
+        pkt[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        pkt[16..20].copy_from_slice(&dst);
+        pkt[20..22].copy_from_slice(&sport.to_be_bytes());
+        pkt[22..24].copy_from_slice(&dport.to_be_bytes());
+        pkt
+    }
+
+    #[test]
+    fn s9_s12_with_router_send_packet_routes() {
+        let tun = Box::new(MockTun::default());
+        let mut p = Projection::new_for_test(tun, ProjectionConfig::default())
+            .with_router(Box::new(test_router()));
+
+        // Egress{self}
+        p.send_packet(&udp_pkt([8, 8, 8, 8], 1000, 53)).unwrap();
+        // MeshPeer via 10/8 fast path
+        p.send_packet(&udp_pkt([10, 1, 2, 3], 1001, 80)).unwrap();
+        // Drop via 1.2.3.0/24 rule
+        p.send_packet(&udp_pkt([1, 2, 3, 4], 1002, 80)).unwrap();
+
+        let rs = p.route_stats();
+        assert_eq!(rs.egress_self, 1);
+        assert_eq!(rs.mesh_peer, 1);
+        assert_eq!(rs.dropped, 1);
+        assert_eq!(rs.egress_remote, 0);
+        // Egress{self} records in NAT; mesh sends via fabric.
+        assert_eq!(p.nat_stats().egress_handled, 1);
+    }
+
+    #[test]
+    fn s11_handle_egress_reply_matches() {
+        let tun = Box::new(MockTun::default());
+        let mut p = Projection::new_for_test(tun, ProjectionConfig::default())
+            .with_router(Box::new(test_router()));
+
+        let out = udp_pkt([8, 8, 8, 8], 2000, 53);
+        p.send_packet(&out).unwrap();
+        assert_eq!(p.nat_stats().egress_handled, 1);
+
+        // Mock reply: reversed 5-tuple.
+        let reply = udp_pkt([8, 8, 8, 8], 2000, 53); // placeholder, rebuild below
+        let mut reply = reply;
+        // src=8.8.8.8:53 dst=10.0.0.1:2000
+        reply[12..16].copy_from_slice(&[8, 8, 8, 8]);
+        reply[16..20].copy_from_slice(&[10, 0, 0, 1]);
+        reply[20..22].copy_from_slice(&53u16.to_be_bytes());
+        reply[22..24].copy_from_slice(&2000u16.to_be_bytes());
+
+        assert!(p.handle_egress_reply(&reply));
+        assert_eq!(p.nat_stats().reply_received, 1);
+
+        // Unknown flow: no match.
+        let mut bad = reply.clone();
+        bad[22..24].copy_from_slice(&9999u16.to_be_bytes());
+        assert!(!p.handle_egress_reply(&bad));
+        assert_eq!(p.nat_stats().reply_dropped, 1);
     }
 }
