@@ -1,6 +1,7 @@
 //! std-thread driver for quinn-proto (sans-IO).
 //!
-//! One OS thread owns the `UdpSocket` and the `quinn_proto::Endpoint`.
+//! One OS thread owns the [`UdpTransport`](crate::transport::UdpTransport)
+//! and the `quinn_proto::Endpoint`.
 //! The public sync API talks to it through an mpsc command channel plus
 //! shared `Mutex`/`Condvar` state. `quinn_proto::Connection` never leaves
 //! the driver thread.
@@ -11,7 +12,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::SocketAddr;
 use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicU64, Ordering},
@@ -27,6 +28,7 @@ use quinn_proto::{
 };
 
 use crate::cert::{Identity, build_client_crypto, build_server_config, generate_identity};
+use crate::transport::{StdUdpTransport, UdpTransport};
 use crate::{ConnStats, ConnectionId, FabricError, PeerId};
 
 /// Logical connection ids; process-wide unique (P0: one driver per connection
@@ -206,8 +208,21 @@ impl Driver {
         bind: SocketAddr,
         server: Option<(ServerConfig, Identity)>,
     ) -> Result<Arc<Self>, FabricError> {
-        let socket = UdpSocket::bind(bind).map_err(|e| FabricError::Transport(e.to_string()))?;
-        let local_addr = socket
+        let transport: Box<dyn UdpTransport> = Box::new(
+            StdUdpTransport::bind(bind).map_err(|e| FabricError::Transport(e.to_string()))?,
+        );
+        Self::spawn_with_transport(transport, server)
+    }
+
+    /// Spawn the driver on a caller-provided transport (S9).
+    ///
+    /// Used for relayed paths (e.g. `nexus-turn::TurnSocket`); the default
+    /// [`Self::spawn`] wraps a direct `UdpSocket`.
+    fn spawn_with_transport(
+        transport: Box<dyn UdpTransport>,
+        server: Option<(ServerConfig, Identity)>,
+    ) -> Result<Arc<Self>, FabricError> {
+        let local_addr = transport
             .local_addr()
             .map_err(|e| FabricError::Transport(e.to_string()))?;
         let (server_config, identity) = server
@@ -232,7 +247,7 @@ impl Driver {
             rx,
             tx: tx.clone(),
             shared: shared.clone(),
-            socket,
+            socket: transport,
             endpoint,
             server_config,
             live: HashMap::new(),
@@ -257,11 +272,27 @@ impl Driver {
         Self::spawn(addr, None)
     }
 
+    /// Client endpoint on a caller-provided transport (S9).
+    pub fn new_client_with_transport(
+        transport: Box<dyn UdpTransport>,
+    ) -> Result<Arc<Self>, FabricError> {
+        Self::spawn_with_transport(transport, None)
+    }
+
     /// Server endpoint: generates an ed25519 identity, binds `addr`.
     pub fn new_server(addr: SocketAddr) -> Result<Arc<Self>, FabricError> {
         let id = generate_identity()?;
         let cfg = build_server_config(&id)?;
         Self::spawn(addr, Some((cfg, id)))
+    }
+
+    /// Server endpoint on a caller-provided transport (S9).
+    pub fn new_server_with_transport(
+        transport: Box<dyn UdpTransport>,
+    ) -> Result<Arc<Self>, FabricError> {
+        let id = generate_identity()?;
+        let cfg = build_server_config(&id)?;
+        Self::spawn_with_transport(transport, Some((cfg, id)))
     }
 
     pub fn shared(&self) -> &Arc<DriverShared> {
@@ -379,7 +410,7 @@ struct Loop {
     rx: mpsc::Receiver<Cmd>,
     tx: mpsc::Sender<Cmd>,
     shared: Arc<DriverShared>,
-    socket: UdpSocket,
+    socket: Box<dyn UdpTransport>,
     endpoint: Endpoint,
     server_config: Option<Arc<ServerConfig>>,
     live: HashMap<u64, LiveConn>,
@@ -548,8 +579,13 @@ impl Loop {
         if !self.live.contains_key(&conn) {
             return Err(FabricError::Closed(0));
         }
-        let sock =
-            UdpSocket::bind("127.0.0.1:0").map_err(|e| FabricError::Transport(e.to_string()))?;
+        // Rebind always reverts to a fresh direct UDP socket (S9): re-creating
+        // a TURN allocation mid-connection is out of scope for 4b. The TURN
+        // path is exercised without rebind (see product.fabric-turn-relay).
+        let sock: Box<dyn UdpTransport> = Box::new(
+            StdUdpTransport::bind("127.0.0.1:0".parse().unwrap())
+                .map_err(|e| FabricError::Transport(e.to_string()))?,
+        );
         let addr = sock
             .local_addr()
             .map_err(|e| FabricError::Transport(e.to_string()))?;
