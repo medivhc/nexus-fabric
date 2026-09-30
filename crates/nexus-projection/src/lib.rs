@@ -16,7 +16,7 @@ pub mod egress;
 pub mod routing;
 pub mod transport;
 
-pub use egress::{EgressNat, FlowKey, NatStats, Rule, SimpleRuleEngine, DEFAULT_MAX_NAT_ENTRIES};
+pub use egress::{DEFAULT_MAX_NAT_ENTRIES, EgressNat, FlowKey, NatStats, Rule, SimpleRuleEngine};
 /// Re-exported domain types for unified routing (defined in `nexus-domain`,
 /// used — not modified — here).
 pub use nexus_domain::{RouteRequest, RouteTarget, RuleEngine};
@@ -436,8 +436,7 @@ impl Projection {
                                         // forwards `pkt` to a real internet
                                         // socket here; E4 drives replies via
                                         // `handle_egress_reply`.
-                                        lock(&egress_nat)
-                                            .translate_outbound(pkt, &from_peer);
+                                        lock(&egress_nat).translate_outbound(pkt, &from_peer);
                                         let mut s = lock(&stats);
                                         s.packets_in += 1;
                                         s.bytes_in += pkt.len() as u64;
@@ -445,9 +444,7 @@ impl Projection {
                                         // Mesh forward, or an egress reply
                                         // returning: validate via NAT when
                                         // tracked, then deliver to TUN.
-                                        let is_reply = lock(&egress_nat)
-                                            .peek_reply(pkt)
-                                            .is_some();
+                                        let is_reply = lock(&egress_nat).peek_reply(pkt).is_some();
                                         if is_reply {
                                             lock(&egress_nat).translate_inbound(pkt);
                                         }

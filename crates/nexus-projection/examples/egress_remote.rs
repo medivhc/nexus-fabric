@@ -77,7 +77,10 @@ impl TunDevice for SharedTun {
 fn main() {
     let (report, pass) = match run() {
         Ok(r) => r,
-        Err(e) => (format!("{{\"verdict\":\"FAIL\",\"detail\":\"{e}\"}}"), false),
+        Err(e) => (
+            format!("{{\"verdict\":\"FAIL\",\"detail\":\"{e}\"}}"),
+            false,
+        ),
     };
     println!("{report}");
     if !pass {

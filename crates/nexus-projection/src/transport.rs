@@ -101,13 +101,16 @@ impl DatagramTransport for MockTransport {
         // Fallback: if the named peer isn't linked but exactly one peer is,
         // use it. Preserves the old single-peer `link_peer` behavior for
         // legacy (unrouted) traffic in tests.
-        let tx = peers.get(peer).or_else(|| {
-            if peers.len() == 1 {
-                peers.values().next()
-            } else {
-                None
-            }
-        }).ok_or_else(|| TransportError::PeerNotFound(peer.to_string()))?;
+        let tx = peers
+            .get(peer)
+            .or_else(|| {
+                if peers.len() == 1 {
+                    peers.values().next()
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| TransportError::PeerNotFound(peer.to_string()))?;
         tx.send((self.name.clone(), data.to_vec()))
             .map_err(|_| TransportError::Io("peer inbox closed".into()))
     }
