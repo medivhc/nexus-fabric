@@ -143,7 +143,7 @@ fn run() -> Result<(String, bool), String> {
     )
     .with_router(Arc::new(router_a));
 
-    let mut b = Projection::new(
+    let b = Projection::new(
         Box::new(SharedTun {
             inner: tun_b.clone(),
         }),
