@@ -13,7 +13,7 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, SocketAddrV4, TcpStream};
+use std::net::{Shutdown, SocketAddr, SocketAddrV4, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
@@ -54,7 +54,108 @@ const CANCELLED_TTL: Duration = Duration::from_secs(60);
 /// stream ids (collision ~2^-32). Combined with the (peer, stream_id)
 /// dispatch guard, same-peer cross connections can no longer deterministically
 /// collide. std-only entropy, no new dependencies.
-fn random_stream_id_seed() -> u32 {
+/// SYN 载荷的目标地址形式（S25，S22 兼容扩展）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SynTarget {
+    /// IPv4 地址 + 端口。
+    V4(std::net::SocketAddrV4),
+    /// 域名 + 端口（egress 侧解析；originator 永不本地解析）。
+    Domain(String, u16),
+}
+
+/// 编码 SYN 载荷（S25 typed 形式，originator 自 3d 起统一使用）。
+///
+/// 首字节 addr-type：`0x01` 后跟 4 字节 IPv4；`0x03` 后跟 1 字节域名长度 +
+/// 域名；最后 2 字节 port（u16be）。host 为 IP 字面量时用 `0x01` 形式。
+pub fn encode_syn_payload(host: &str, port: u16) -> Vec<u8> {
+    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        let mut out = Vec::with_capacity(7);
+        out.push(0x01);
+        out.extend_from_slice(&ip.octets());
+        out.extend_from_slice(&port.to_be_bytes());
+        return out;
+    }
+    let name = host.as_bytes();
+    let len = name.len().min(255) as u8;
+    let mut out = Vec::with_capacity(4 + len as usize);
+    out.push(0x03);
+    out.push(len);
+    out.extend_from_slice(&name[..len as usize]);
+    out.extend_from_slice(&port.to_be_bytes());
+    out
+}
+
+/// 解码 SYN 载荷。返回 `(目标, 消费字节数)`；消费字节之后的内容是首数据。
+///
+/// 兼容：载荷长恰为 6 字节时按 3b-5 旧格式（IPv4 + port）解析。
+/// 格式非法（未知 addr-type、长度越界）时返回 `None`。
+pub fn decode_syn_payload(payload: &[u8]) -> Option<(SynTarget, usize)> {
+    if payload.len() == 6 {
+        // 3b-5 legacy: IPv4(4) + port(2)。
+        let mut ip = [0u8; 4];
+        ip.copy_from_slice(&payload[..4]);
+        let port = u16::from_be_bytes([payload[4], payload[5]]);
+        return Some((
+            SynTarget::V4(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::from(ip),
+                port,
+            )),
+            6,
+        ));
+    }
+    let (&atyp, rest) = payload.split_first()?;
+    match atyp {
+        0x01 => {
+            if rest.len() < 6 {
+                return None;
+            }
+            let mut ip = [0u8; 4];
+            ip.copy_from_slice(&rest[..4]);
+            let port = u16::from_be_bytes([rest[4], rest[5]]);
+            Some((
+                SynTarget::V4(std::net::SocketAddrV4::new(
+                    std::net::Ipv4Addr::from(ip),
+                    port,
+                )),
+                7,
+            ))
+        }
+        0x03 => {
+            let (&len, rest) = rest.split_first()?;
+            let len = len as usize;
+            if rest.len() < len + 2 {
+                return None;
+            }
+            let name = std::str::from_utf8(&rest[..len]).ok()?;
+            if name.is_empty() {
+                return None;
+            }
+            let port = u16::from_be_bytes([rest[len], rest[len + 1]]);
+            Some((SynTarget::Domain(name.to_string(), port), 1 + 1 + len + 2))
+        }
+        _ => None,
+    }
+}
+
+/// Resolve `(host, port)` to a socket address, preferring IPv4.
+///
+/// P0 is IPv4-only (3b-4/3b-5); `ToSocketAddrs` may return `::1` first for
+/// `localhost`, which would fail against IPv4-only targets.
+pub(crate) fn resolve_target_v4(host: &str, port: u16) -> Option<SocketAddr> {
+    let addrs = (host, port).to_socket_addrs().ok()?;
+    let mut fallback = None;
+    for a in addrs {
+        if a.is_ipv4() {
+            return Some(a);
+        }
+        if fallback.is_none() {
+            fallback = Some(a);
+        }
+    }
+    fallback
+}
+
+pub(crate) fn random_stream_id_seed() -> u32 {
     #[cfg(unix)]
     {
         if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
@@ -878,10 +979,14 @@ impl TcpRelay {
         let mut out = Vec::new();
         let key: RelayKey = (from_peer.to_string(), stream_id);
         if flags & STREAM_SYN != 0 {
-            if payload.len() < 6 {
-                self.stats.short_syn_dropped += 1;
-                return out;
-            }
+            // S25: typed SYN 载荷（`decode_syn_payload` 兼容 3b-5 6 字节旧格式）。
+            let (target, data_off) = match decode_syn_payload(payload) {
+                Some(t) => t,
+                None => {
+                    self.stats.short_syn_dropped += 1;
+                    return out;
+                }
+            };
             if self.conns.contains_key(&key) || self.pending.contains_key(&key) {
                 return out; // duplicate SYN: ignore
             }
@@ -894,14 +999,27 @@ impl TcpRelay {
                 });
                 return out;
             }
-            let mut ip = [0u8; 4];
-            ip.copy_from_slice(&payload[..4]);
-            let port = u16::from_be_bytes([payload[4], payload[5]]);
-            let addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::from(ip), port));
-            // Any trailing bytes after the 6-byte addr are first data.
+            // S25: 域名形式在 egress 侧解析（ToSocketAddrs；originator 永不
+            // 本地解析）。解析失败 → RST 回源并计数。
+            let addr: SocketAddr = match target {
+                SynTarget::V4(a) => SocketAddr::V4(a),
+                SynTarget::Domain(host, port) => match resolve_target_v4(&host, port) {
+                    Some(a) => a,
+                    None => {
+                        self.stats.connect_failed += 1;
+                        out.push(RelayEvent::Closed {
+                            stream_id,
+                            peer: from_peer.to_string(),
+                            reset: true,
+                        });
+                        return out;
+                    }
+                },
+            };
+            // 载荷中地址之后的内容是首数据（typed / legacy 均按消费偏移切分）。
             let mut first_data = Vec::new();
-            if payload.len() > 6 {
-                first_data.extend_from_slice(&payload[6..]);
+            if payload.len() > data_off {
+                first_data.extend_from_slice(&payload[data_off..]);
             }
             self.pending.insert(
                 key.clone(),
@@ -1111,9 +1229,15 @@ impl TcpRelay {
 /// originator (terminator) for locally-originated flows and as relay for
 /// STREAM frames arriving from other nodes. `Clone`-free; share via
 /// `Arc<Mutex<..>>` like the other Projection state.
+///
+/// S25: `semantic_streams` registers originator-side STREAM flows owned by
+/// `SemanticIngress` (byte-stream clients, not the smoltcp terminator).
+/// Keyed by `(peer, stream_id)` (F1 lesson); the downlink and the
+/// self-loopback path consult it before the terminator/relay dispatch.
 pub struct TcpEgress {
     pub terminator: TcpTerminator,
     pub relay: TcpRelay,
+    pub semantic_streams: std::sync::Mutex<HashMap<(String, u32), mpsc::SyncSender<(u8, Vec<u8>)>>>,
 }
 
 impl TcpEgress {
@@ -1121,6 +1245,7 @@ impl TcpEgress {
         Self {
             terminator: TcpTerminator::new(),
             relay: TcpRelay::new(),
+            semantic_streams: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1136,6 +1261,40 @@ impl TcpEgress {
     /// is the deterministic guard).
     pub fn is_originator_frame(&self, stream_id: u32, from_peer: &str) -> bool {
         self.terminator.peer_for(stream_id).as_deref() == Some(from_peer)
+    }
+
+    /// S25: register a semantic-ingress originator stream.
+    pub fn semantic_register(
+        &self,
+        peer: &str,
+        stream_id: u32,
+        tx: mpsc::SyncSender<(u8, Vec<u8>)>,
+    ) {
+        self.semantic_streams
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((peer.to_string(), stream_id), tx);
+    }
+
+    /// S25: remove a semantic-ingress originator stream.
+    pub fn semantic_deregister(&self, peer: &str, stream_id: u32) {
+        self.semantic_streams
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(peer.to_string(), stream_id));
+    }
+
+    /// S25: look up a semantic-ingress originator stream by (peer, id).
+    pub fn semantic_lookup(
+        &self,
+        peer: &str,
+        stream_id: u32,
+    ) -> Option<mpsc::SyncSender<(u8, Vec<u8>)>> {
+        self.semantic_streams
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(peer.to_string(), stream_id))
+            .cloned()
     }
 }
 

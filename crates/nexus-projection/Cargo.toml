@@ -9,6 +9,7 @@ description = "Projection layer for the Nexus foundation: L3 tunnel (TUN IP pack
 [dependencies]
 nexus-domain = { path = "../nexus-domain" }
 nexus-fabric = { path = "../nexus-fabric" }
+nexus-ingress = { path = "../nexus-ingress" }
 smoltcp = { version = "0.12", default-features = false, features = ["std", "proto-ipv4", "socket-tcp", "medium-ip"] }
 tun-rs = { version = "2.8", default-features = false }
 

@@ -15,6 +15,7 @@
 pub mod dns;
 pub mod egress;
 pub mod routing;
+pub mod semantic;
 pub mod tcp;
 pub mod transport;
 pub mod tun_rs_device;
@@ -31,6 +32,7 @@ pub use egress::{
 /// used — not modified — here).
 pub use nexus_domain::{RouteRequest, RouteTarget, RuleEngine};
 pub use routing::{Cidr, Router, UnifiedRouter, format_ipv4, parse_ipv4_dst};
+pub use semantic::{SemanticDeps, SemanticIngress, SemanticStats};
 pub use tcp::{TcpEgress, TcpRelayStats, TcpTermStats};
 pub use transport::{DatagramTransport, FabricTransport, MockTransport, TransportError};
 
@@ -289,6 +291,14 @@ fn tcp_poll_once(
                 None => return,
             };
             let mut t = lock(tcp);
+            // S25: semantic-ingress originator streams first — a frame from
+            // our own relay for a semantic stream must reach the semantic
+            // worker, never the terminator or the relay (which would treat
+            // us as the stream's egress and corrupt it).
+            if let Some(tx) = t.semantic_lookup("self", sid) {
+                let _ = tx.try_send((fl, pl.to_vec()));
+                return;
+            }
             // F1: dispatch by (stream_id, from_peer), not by id alone.
             if t.is_originator_frame(sid, "self") {
                 // Originator side (frame came from our own relay). SYN
@@ -336,9 +346,8 @@ fn tcp_poll_once(
                 dst,
                 peer,
             } => {
-                let mut payload = Vec::with_capacity(6);
-                payload.extend_from_slice(&dst.ip().octets());
-                payload.extend_from_slice(&dst.port().to_be_bytes());
+                // S25: originator always uses the typed SYN form.
+                let payload = tcp::encode_syn_payload(&dst.ip().to_string(), dst.port());
                 emit(
                     tcp,
                     transport_slot,
@@ -443,6 +452,16 @@ fn handle_stream_datagram(
         return;
     }
     // Egress side.
+    // S25: semantic-ingress originator streams (byte-stream clients, not the
+    // smoltcp terminator). Keyed by (peer, stream_id) per the F1 lesson.
+    // Checked before the relay: a semantic stream id must never be fed to
+    // the relay as if we were its egress.
+    let sem_tx = { lock(&tcp).semantic_lookup(from_peer, stream_id) };
+    if let Some(tx) = sem_tx {
+        // S3 best-effort: full or dead channel → drop the frame.
+        let _ = tx.try_send((flags, payload.to_vec()));
+        return;
+    }
     let events = {
         lock(&tcp)
             .relay
@@ -1030,6 +1049,18 @@ impl Projection {
     /// This projection's mock transport (for `link_mock_peer`).
     pub fn mock_transport(&self) -> Option<&Arc<MockTransport>> {
         self.mock_transport.as_ref()
+    }
+
+    /// Build the [`SemanticDeps`] for a [`SemanticIngress`] owned alongside
+    /// this projection (S25). Returns `None` when no router is installed.
+    pub fn semantic_deps(&self) -> Option<SemanticDeps> {
+        let router = lock(&self.router_slot).clone()?;
+        Some(SemanticDeps {
+            router,
+            tcp_egress: Arc::clone(&self.tcp_egress_slot),
+            transport: Arc::clone(&self.transport_slot),
+            mtu: self.config.mtu,
+        })
     }
 
     /// Handle a path-switch event from `nexus-path`.
