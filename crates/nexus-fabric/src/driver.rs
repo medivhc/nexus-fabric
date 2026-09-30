@@ -634,33 +634,32 @@ impl Loop {
         // 成功前仍持有端口（StdUdpTransport 无 SO_REUSEADDR），否则
         // bind(orig) 与 bind(0.0.0.0:port) 恒 EADDRINUSE，端口保留成死代码。
         // 若全部 bind 失败，连接失去 socket（不可恢复，返回 Err）。
+        //
+        // 注意：Client rebind 必须产生**不同**的本地地址，否则对端不会
+        // 触发 QUIC 被动迁移。若原 IP 仍存在，直接 bind(orig) 会得到完全
+        // 相同的地址，迁移无从发生。因此 Client 跳过 bind(orig)，直接用
+        // wildcard（新 IP 由路由决定，端口随机），保证地址变化。
         let orig = *self.shared.local_addr.lock().unwrap();
         let is_server = self.server_config.is_some();
         drop(std::mem::replace(
             &mut self.socket,
             Box::new(ClosedTransport),
         ));
-        let sock: Box<dyn UdpTransport> = match StdUdpTransport::bind(orig) {
-            Ok(s) => Box::new(s),
-            Err(e) => {
-                if is_server {
-                    return Err(FabricError::Transport(format!(
-                        "server rebind must preserve {orig}, bind failed: {e}"
-                    )));
-                }
-                // Client: 原 IP 已消失（如 roam）。先尝试保留端口的 wildcard
-                // （仅 IP 迁移，端口不变，QUIC 迁移更简单）；若端口也被占用，
-                // 再回退到完全随机端口。
-                let wildcard_port: std::net::SocketAddr =
-                    format!("0.0.0.0:{}", orig.port()).parse().unwrap();
-                match StdUdpTransport::bind(wildcard_port) {
-                    Ok(s) => Box::new(s),
-                    Err(_) => Box::new(
-                        StdUdpTransport::bind("0.0.0.0:0".parse().unwrap())
-                            .map_err(|e| FabricError::Transport(e.to_string()))?,
-                    ),
-                }
-            }
+        let sock: Box<dyn UdpTransport> = if is_server {
+            // Server：必须保留原地址/端口（well-known）。若原 IP 已不存在
+            // （如本端 roam），bind 失败则报错，不回退（调用方处理）。
+            Box::new(StdUdpTransport::bind(orig).map_err(|e| {
+                FabricError::Transport(format!(
+                    "server rebind must preserve {orig}, bind failed: {e}"
+                ))
+            })?)
+        } else {
+            // Client：直接 wildcard 随机端口，保证新地址与旧的不同，
+            // 触发对端 QUIC 被动迁移。端口保留非必需（迁移不依赖端口）。
+            Box::new(
+                StdUdpTransport::bind("0.0.0.0:0".parse().unwrap())
+                    .map_err(|e| FabricError::Transport(e.to_string()))?,
+            )
         };
         let addr = sock
             .local_addr()
