@@ -371,7 +371,11 @@ fn emit_stream(deps: &SemanticDeps, peer: &str, stream_id: u32, flags: u8, paylo
     let tcp = lock(&deps.tcp_egress).clone();
     let Some(tcp) = tcp else { return };
     if peer == "self" {
-        // Direct relay call (mirrors tcp-poll's self-loopback); connect
+        // Defensive: the route match in `handle_client` guarantees
+        // `peer != "self"` on this path (it takes the local-upstream arm),
+        // so this branch is unreachable in practice. Kept (rather than
+        // panicking) so a future caller can never silently misroute.
+        // Direct relay call mirrors tcp-poll's self-loopback; connect
         // failures come back as immediate RST events → deliver to our own
         // registry entry (we are the originator).
         let events = lock(&tcp)
@@ -1012,5 +1016,48 @@ mod tests {
             .expect("router installed → deps available");
         assert_eq!(deps.mtu, ProjectionConfig::default().mtu);
         p.close();
+    }
+
+    #[test]
+    fn syn_two_char_domain_never_six_bytes() {
+        // Review F1: 2 字符域名的 typed 载荷绝不能是 6 字节（否则解码侧按
+        // 3b-5 旧格式误读为 IPv4 → 静默连错主机）。
+        let enc = tcp::encode_syn_payload("ab", 80);
+        assert_ne!(enc.len(), 6, "typed payload must never be 6 bytes");
+        let (t, _) = tcp::decode_syn_payload(&enc).expect("must decode as typed");
+        // trailing-dot FQDN：与 "ab" 解析等价。
+        assert_eq!(t, tcp::SynTarget::Domain("ab.".to_string(), 80));
+        // 往返一致：egress 侧解析的目标仍是该域名。
+        let addr = tcp::resolve_target_v4("ab.", 80);
+        let _ = addr; // resolution itself needs DNS; shape is what matters
+    }
+
+    #[test]
+    fn http_connect_routes_to_egress_peer() {
+        // S25: HTTP CONNECT 的 destination 同样走统一决策链（S16 域名规则）。
+        let router = peer_b_router();
+        assert_eq!(
+            route_destination(&router, "localhost", 443),
+            RouteTarget::Egress {
+                peer: "B".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn semantic_registry_register_deregister() {
+        // Review G2: 注册表的基本操作；worker 的所有退出路径都必须
+        // deregister（由 handle_client/relay_stream 保证，这里锁定语义）。
+        let tcp = TcpEgress::new();
+        assert_eq!(tcp.semantic_stream_count(), 0);
+        let (tx, _rx) = mpsc::sync_channel::<(u8, Vec<u8>)>(4);
+        tcp.semantic_register("B", 42, tx);
+        assert_eq!(tcp.semantic_stream_count(), 1);
+        assert!(tcp.semantic_lookup("B", 42).is_some());
+        // (peer, id) 键：同 id 不同 peer 不冲突（F1 教训）。
+        assert!(tcp.semantic_lookup("C", 42).is_none());
+        tcp.semantic_deregister("B", 42);
+        assert_eq!(tcp.semantic_stream_count(), 0);
+        assert!(tcp.semantic_lookup("B", 42).is_none());
     }
 }

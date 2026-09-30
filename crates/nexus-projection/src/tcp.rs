@@ -56,7 +56,7 @@ const CANCELLED_TTL: Duration = Duration::from_secs(60);
 /// collide. std-only entropy, no new dependencies.
 /// SYN 载荷的目标地址形式（S25，S22 兼容扩展）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SynTarget {
+pub(crate) enum SynTarget {
     /// IPv4 地址 + 端口。
     V4(std::net::SocketAddrV4),
     /// 域名 + 端口（egress 侧解析；originator 永不本地解析）。
@@ -67,7 +67,12 @@ pub enum SynTarget {
 ///
 /// 首字节 addr-type：`0x01` 后跟 4 字节 IPv4；`0x03` 后跟 1 字节域名长度 +
 /// 域名；最后 2 字节 port（u16be）。host 为 IP 字面量时用 `0x01` 形式。
-pub fn encode_syn_payload(host: &str, port: u16) -> Vec<u8> {
+///
+/// F1：2 字符域名会产生恰好 6 字节的 typed 载荷，而 `decode_syn_payload`
+/// 按冻结的线兼容规则把 6 字节无条件读作 3b-5 旧格式（IPv4+port）——根本
+/// 歧义，egress 会静默连错主机。因此 2 字符域名用 FQDN trailing-dot 形式
+///（`"ab"` → `"ab."`，7 字节），解析器视两者等价。
+pub(crate) fn encode_syn_payload(host: &str, port: u16) -> Vec<u8> {
     if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
         let mut out = Vec::with_capacity(7);
         out.push(0x01);
@@ -75,7 +80,16 @@ pub fn encode_syn_payload(host: &str, port: u16) -> Vec<u8> {
         out.extend_from_slice(&port.to_be_bytes());
         return out;
     }
-    let name = host.as_bytes();
+    // F1: a 2-char domain would encode to exactly 6 bytes, which
+    // `decode_syn_payload` must read as the 3b-5 legacy IPv4+port form
+    // (frozen wire compat) — fundamentally ambiguous. Use the FQDN
+    // trailing-dot form ("ab" → "ab.", 7 bytes); resolvers treat both as
+    // the same name.
+    let name: Vec<u8> = if host.len() == 2 {
+        format!("{host}.").into_bytes()
+    } else {
+        host.as_bytes().to_vec()
+    };
     let len = name.len().min(255) as u8;
     let mut out = Vec::with_capacity(4 + len as usize);
     out.push(0x03);
@@ -89,7 +103,7 @@ pub fn encode_syn_payload(host: &str, port: u16) -> Vec<u8> {
 ///
 /// 兼容：载荷长恰为 6 字节时按 3b-5 旧格式（IPv4 + port）解析。
 /// 格式非法（未知 addr-type、长度越界）时返回 `None`。
-pub fn decode_syn_payload(payload: &[u8]) -> Option<(SynTarget, usize)> {
+pub(crate) fn decode_syn_payload(payload: &[u8]) -> Option<(SynTarget, usize)> {
     if payload.len() == 6 {
         // 3b-5 legacy: IPv4(4) + port(2)。
         let mut ip = [0u8; 4];
@@ -999,43 +1013,43 @@ impl TcpRelay {
                 });
                 return out;
             }
-            // S25: 域名形式在 egress 侧解析（ToSocketAddrs；originator 永不
-            // 本地解析）。解析失败 → RST 回源并计数。
-            let addr: SocketAddr = match target {
-                SynTarget::V4(a) => SocketAddr::V4(a),
-                SynTarget::Domain(host, port) => match resolve_target_v4(&host, port) {
-                    Some(a) => a,
-                    None => {
-                        self.stats.connect_failed += 1;
-                        out.push(RelayEvent::Closed {
-                            stream_id,
-                            peer: from_peer.to_string(),
-                            reset: true,
-                        });
-                        return out;
-                    }
-                },
-            };
+            // S25: 域名形式在 egress 侧解析。解析发生在 connect worker
+            // 线程内（Review W1：`ToSocketAddrs` 可能阻塞秒级，调用方持有
+            // `TcpEgress` 锁，这里只做纯解码）。解析失败 → worker 返回
+            // None → `drain_connects` 计数 connect_failed 并回 RST。
             // 载荷中地址之后的内容是首数据（typed / legacy 均按消费偏移切分）。
             let mut first_data = Vec::new();
             if payload.len() > data_off {
                 first_data.extend_from_slice(&payload[data_off..]);
             }
+            // W2: connect (+ DNS resolution) off the downlink thread.
+            let tx = self.connect_tx.clone();
+            let worker_target = target.clone();
+            let worker_key = key.clone();
+            std::thread::spawn(move || {
+                let stream = match worker_target {
+                    SynTarget::V4(a) => {
+                        let sa = SocketAddr::V4(a);
+                        TcpStream::connect_timeout(&sa, RELAY_CONNECT_TIMEOUT)
+                            .ok()
+                            .and_then(|s| s.set_nonblocking(true).ok().map(|_| s))
+                    }
+                    SynTarget::Domain(host, port) => resolve_target_v4(&host, port)
+                        .and_then(|sa| TcpStream::connect_timeout(&sa, RELAY_CONNECT_TIMEOUT).ok())
+                        .and_then(|s| s.set_nonblocking(true).ok().map(|_| s)),
+                };
+                let _ = tx.send(ConnectResult {
+                    key: worker_key,
+                    stream,
+                });
+            });
             self.pending.insert(
-                key.clone(),
+                key,
                 PendingSyn {
                     first_data,
                     fin_pending: false,
                 },
             );
-            // W2: connect off the downlink thread.
-            let tx = self.connect_tx.clone();
-            std::thread::spawn(move || {
-                let stream = TcpStream::connect_timeout(&addr, RELAY_CONNECT_TIMEOUT)
-                    .ok()
-                    .and_then(|s| s.set_nonblocking(true).ok().map(|_| s));
-                let _ = tx.send(ConnectResult { key, stream });
-            });
             return out;
         }
         if self.cancelled.contains_key(&key) {
@@ -1236,12 +1250,12 @@ impl TcpRelay {
 /// self-loopback path consult it before the terminator/relay dispatch.
 /// S25: inbound channel for a semantic-ingress originator stream.
 /// Payload is `(STREAM flags, frame payload)`.
-pub type SemanticStreamTx = mpsc::SyncSender<(u8, Vec<u8>)>;
+pub(crate) type SemanticStreamTx = mpsc::SyncSender<(u8, Vec<u8>)>;
 
 pub struct TcpEgress {
     pub terminator: TcpTerminator,
     pub relay: TcpRelay,
-    pub semantic_streams: std::sync::Mutex<HashMap<(String, u32), SemanticStreamTx>>,
+    pub(crate) semantic_streams: std::sync::Mutex<HashMap<(String, u32), SemanticStreamTx>>,
 }
 
 impl TcpEgress {
@@ -1268,7 +1282,7 @@ impl TcpEgress {
     }
 
     /// S25: register a semantic-ingress originator stream.
-    pub fn semantic_register(&self, peer: &str, stream_id: u32, tx: SemanticStreamTx) {
+    pub(crate) fn semantic_register(&self, peer: &str, stream_id: u32, tx: SemanticStreamTx) {
         self.semantic_streams
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1276,7 +1290,7 @@ impl TcpEgress {
     }
 
     /// S25: remove a semantic-ingress originator stream.
-    pub fn semantic_deregister(&self, peer: &str, stream_id: u32) {
+    pub(crate) fn semantic_deregister(&self, peer: &str, stream_id: u32) {
         self.semantic_streams
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1284,12 +1298,20 @@ impl TcpEgress {
     }
 
     /// S25: look up a semantic-ingress originator stream by (peer, id).
-    pub fn semantic_lookup(&self, peer: &str, stream_id: u32) -> Option<SemanticStreamTx> {
+    pub(crate) fn semantic_lookup(&self, peer: &str, stream_id: u32) -> Option<SemanticStreamTx> {
         self.semantic_streams
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&(peer.to_string(), stream_id))
             .cloned()
+    }
+
+    /// S25: number of live semantic-ingress originator streams (E4 drain check).
+    pub fn semantic_stream_count(&self) -> usize {
+        self.semantic_streams
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 }
 

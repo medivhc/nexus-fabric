@@ -184,17 +184,22 @@ fn run() -> Result<String, String> {
     let http_ok = &back2 == b"hello-3d-htt";
 
     // --- close clients; both ends should drain to zero connections ---
+    // (Review G1: also drain the semantic originator registry — a leaked
+    // register() entry would otherwise pass this check silently.)
     drop(c1);
     drop(c2);
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
         let ca = a.tcp_conn_count().unwrap_or(999);
         let cb = b.tcp_conn_count().unwrap_or(999);
-        if ca == 0 && cb == 0 {
+        let sa = a.semantic_stream_count().unwrap_or(999);
+        if ca == 0 && cb == 0 && sa == 0 {
             break;
         }
         if std::time::Instant::now() > deadline {
-            return Err(fail(&format!("connections did not drain: a={ca} b={cb}")));
+            return Err(fail(&format!(
+                "connections did not drain: a={ca} b={cb} semantic={sa}"
+            )));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
