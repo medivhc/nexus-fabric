@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nexus_fabric::{ConnConfig, FabricConn, FabricError, FabricListener};
-use nexus_path::{CandidatePath, PathConfig, PathKind, PathManager, PathStats};
+use nexus_path::{CandidatePath, PathConfig, PathKind, PathManager, PathStats, RaceBudget};
 use nexus_projection::PathLink;
 
 const N: usize = 262_144; // 256KB total
@@ -190,11 +190,12 @@ fn run() -> Result<String, String> {
 
     // --- PathManager with two logical candidates ---
     let mut pm = PathManager::new(PathConfig {
-        hysteresis_db: 0.0,
+        hysteresis_pct: 0.0,
         switch_hold_ms: 0,
         probe_interval_ms: 60_000,
         ewma_alpha: 1.0,
         max_missed_probes: 1000,
+        race_budget: RaceBudget::default(),
     });
     pm.add_candidate(candidate(9001));
     pm.add_candidate(candidate(9002));

@@ -1,15 +1,16 @@
 //! Path layer: "which path should packets take to reach the peer?"
 //!
 //! Manages candidate paths (direct → mesh → TURN → proxy), probes them,
-//! scores them, and switches the active path with hysteresis. P0: single
-//! active path, no racing/prediction/multipath.
+//! scores them, and switches the active path with hysteresis. Single active
+//! path (S1); racing is for connection setup only (R1), prediction is EWMA
+//! layer 1 (R2), no multipath concurrency.
 //!
-//! Design notes (see `MODULE.md` S1–S8):
+//! Design notes (see `MODULE.md` S1–S9, R1–R6):
 //! - Scores are EWMA-smoothed per path; a path with no observations has an
 //!   `unknown` score and never participates in selection (S7).
 //! - Switching requires the challenger to beat the active path by
-//!   `hysteresis_db` **and** hold that lead for `switch_hold_ms` (S4), which
-//!   together give connection stickiness (S5).
+//!   `hysteresis_pct` (relative, e.g. 20%) **and** hold that lead for
+//!   `switch_hold_ms` (S4), which together give connection stickiness (S5).
 //! - A path that misses `max_missed_probes` consecutive probes is declared
 //!   failed and replaced immediately, without waiting for hysteresis (S6).
 //! - Switching only swaps the UDP socket/address; the session (CID) is owned
@@ -21,6 +22,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+mod ewma;
+mod race;
+
+pub use ewma::Ewma;
+pub use race::{race_connect, PathConnector, RaceBudget, RaceOutcome};
 
 // ---------------------------------------------------------------------------
 // Scoring weights (defaults).
@@ -74,8 +81,9 @@ pub struct PathStats {
 /// Configuration for path selection.
 #[derive(Debug, Clone)]
 pub struct PathConfig {
-    /// New path must beat current by this margin (in score units) to switch.
-    pub hysteresis_db: f64,
+    /// Challenger must beat the active path by this relative margin
+    /// (e.g. 0.20 = 20% better) to switch (S4, R3).
+    pub hysteresis_pct: f64,
     /// New path must hold the lead for this long before switching.
     pub switch_hold_ms: u64,
     /// Interval between active probe rounds on idle paths.
@@ -84,16 +92,20 @@ pub struct PathConfig {
     pub ewma_alpha: f64,
     /// Consecutive missed probes before a path is declared failed.
     pub max_missed_probes: u32,
+    /// Budgets for connection racing (R1). Used by `race_connect`, not by
+    /// `PathManager` itself (racing is a setup-phase operation).
+    pub race_budget: RaceBudget,
 }
 
 impl Default for PathConfig {
     fn default() -> Self {
         Self {
-            hysteresis_db: 1.0,
-            switch_hold_ms: 2000,
+            hysteresis_pct: 0.20,
+            switch_hold_ms: 3000,
             probe_interval_ms: 5000,
             ewma_alpha: 0.3,
             max_missed_probes: 3,
+            race_budget: RaceBudget::default(),
         }
     }
 }
@@ -122,8 +134,8 @@ pub enum PathEvent {
 /// Per-candidate runtime state.
 struct PathEntry {
     path: CandidatePath,
-    /// EWMA-smoothed score. `None` = unknown (no observations yet, S7).
-    score: Option<f64>,
+    /// EWMA-smoothed score (R2). `value() == None` = unknown (no observations yet, S7).
+    ewma: Ewma,
     missed_probes: u32,
     added_at: Instant,
 }
@@ -182,10 +194,10 @@ fn best_candidate(state: &State, exclude: Option<&SocketAddr>) -> Option<SocketA
     state
         .candidates
         .iter()
-        .filter(|(addr, e)| e.score.is_some() && Some(*addr) != exclude)
+        .filter(|(addr, e)| e.ewma.value().is_some() && Some(*addr) != exclude)
         .max_by(|a, b| {
-            let sa = a.1.score.unwrap();
-            let sb = b.1.score.unwrap();
+            let sa = a.1.ewma.value().unwrap();
+            let sb = b.1.ewma.value().unwrap();
             sa.total_cmp(&sb)
                 // S3: equal quality -> cheaper path ranks higher.
                 .then_with(|| b.1.path.cost.total_cmp(&a.1.path.cost))
@@ -242,7 +254,7 @@ impl Inner {
             }
         };
 
-        let active_score = match state.candidates.get(&active_addr).and_then(|e| e.score) {
+        let active_score = match state.candidates.get(&active_addr).and_then(|e| e.ewma.value()) {
             Some(s) => s,
             None => {
                 // Active path has unknown score; prefer any known path.
@@ -261,11 +273,21 @@ impl Inner {
             }
         };
         let chall_score = state.candidates[&challenger]
-            .score
+            .ewma
+            .value()
             .expect("best_candidate only returns scored paths");
-        let margin = chall_score - active_score;
 
-        if margin >= state.config.hysteresis_db {
+        // R3/S4: relative hysteresis. The challenger must beat the active path
+        // by `hysteresis_pct` (e.g. 20%). If the active score is not positive,
+        // the relative margin is undefined; any strictly better challenger
+        // qualifies (the active path is effectively unusable).
+        let beats_hysteresis = if active_score > 0.0 {
+            (chall_score - active_score) / active_score >= state.config.hysteresis_pct
+        } else {
+            chall_score > active_score
+        };
+
+        if beats_hysteresis {
             let hold_start = match &state.pending {
                 Some(p) if p.candidate == challenger => p.hold_start,
                 _ => {
@@ -380,11 +402,12 @@ impl PathManager {
             .get(&remote)
             .map(|e| e.added_at)
             .unwrap_or_else(Instant::now);
+        let alpha = state.config.ewma_alpha;
         state.candidates.insert(
             remote,
             PathEntry {
                 path,
-                score: None,
+                ewma: Ewma::new(alpha),
                 missed_probes: 0,
                 added_at,
             },
@@ -452,7 +475,6 @@ impl PathManager {
         let mut state = self.inner.state.lock().unwrap();
 
         // Extract config first: `entry` below mutably borrows `state`.
-        let alpha = state.config.ewma_alpha.clamp(0.0, 1.0);
         let max_missed = state.config.max_missed_probes;
 
         let entry = match state.candidates.get_mut(remote) {
@@ -469,12 +491,10 @@ impl PathManager {
             match instant_score(&stats, cost) {
                 Some(instant) => {
                     entry.missed_probes = 0;
-                    entry.score = Some(match entry.score {
-                        // First observation initializes the smoother (S7:
-                        // the path now has data and may be selected).
-                        None => instant,
-                        Some(prev) => alpha * instant + (1.0 - alpha) * prev,
-                    });
+                    // R2: feed the instantaneous score into the per-path EWMA.
+                    // First observation initializes the smoother (S7: the path
+                    // now has data and may be selected).
+                    entry.ewma.update(instant);
                 }
                 None => return, // No usable data; ignore.
             }
@@ -503,7 +523,7 @@ impl PathManager {
             .unwrap()
             .candidates
             .get(remote)
-            .and_then(|e| e.score)
+            .and_then(|e| e.ewma.value())
     }
 }
 
@@ -546,11 +566,12 @@ mod tests {
 
     fn fast_config() -> PathConfig {
         PathConfig {
-            hysteresis_db: 1.0,
+            hysteresis_pct: 0.01, // 1%: tests want switches to trigger easily
             switch_hold_ms: 50,
             probe_interval_ms: 60_000, // keep the probe thread quiet in tests
             ewma_alpha: 1.0,           // no smoothing unless a test wants it
             max_missed_probes: 3,
+            race_budget: RaceBudget::default(),
         }
     }
 

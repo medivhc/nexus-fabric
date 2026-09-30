@@ -102,7 +102,9 @@ impl PathLink {
 mod tests {
     use super::PathLink;
     use nexus_fabric::{ConnConfig, FabricConn, FabricListener};
-    use nexus_path::{CandidatePath, PathConfig, PathKind, PathManager, PathStats};
+    use nexus_path::{
+        CandidatePath, PathConfig, PathKind, PathManager, PathStats, RaceBudget,
+    };
     use std::net::SocketAddr;
     use std::time::Duration;
 
@@ -121,11 +123,12 @@ mod tests {
 
     fn test_config() -> PathConfig {
         PathConfig {
-            hysteresis_db: 0.0,
+            hysteresis_pct: 0.0,
             switch_hold_ms: 0,
             probe_interval_ms: 60_000,
             ewma_alpha: 1.0,
             max_missed_probes: 1000,
+            race_budget: RaceBudget::default(),
         }
     }
 

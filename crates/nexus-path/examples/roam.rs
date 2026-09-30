@@ -10,7 +10,9 @@
 //!
 //! Usage: cargo run -p nexus-path --example roam -- --json
 
-use nexus_path::{CandidatePath, PathConfig, PathEvent, PathKind, PathManager, PathStats};
+use nexus_path::{
+    CandidatePath, PathConfig, PathEvent, PathKind, PathManager, PathStats, RaceBudget,
+};
 use std::net::SocketAddr;
 
 /// Mock of the nexus-fabric session: owns the connection identity (CID);
@@ -75,11 +77,12 @@ fn main() {
     let json = std::env::args().any(|a| a == "--json");
 
     let mut pm = PathManager::new(PathConfig {
-        hysteresis_db: 1.0,
+        hysteresis_pct: 0.20,
         switch_hold_ms: 200,
         probe_interval_ms: 60_000,
         ewma_alpha: 0.3,
         max_missed_probes: 3,
+        race_budget: RaceBudget::default(),
     });
 
     let direct = addr(9001);
