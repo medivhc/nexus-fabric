@@ -505,7 +505,8 @@ impl TcpTerminator {
     }
 
     /// Labels cached on a flow at setup time (S26), or `None` for an
-    /// unknown stream id. Per-flow observability for the future scheduler.
+    /// unknown stream id. Read path for the contracted per-flow cache
+    /// (per-flow observability; the cache would otherwise be unverifiable).
     pub fn flow_labels(&self, stream_id: u32) -> Option<FlowLabels> {
         self.by_id
             .get(&stream_id)
