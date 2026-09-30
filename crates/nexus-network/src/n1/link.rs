@@ -122,9 +122,11 @@ impl LinkStateWatcher {
     }
 
     /// 观测主循环：常驻 responder + pinger/watchdog；流死亡时退避重开。
+    /// enable_watcher=false 时只运行 responder（回对端 ping），不主动 ping。
     fn watch(self, stop: Arc<AtomicBool>) {
         // 响应器：接受对端的 keepalive 流并回 pong。生命周期与观测器一致，
-        // 退出时由 conn.close() 打断其阻塞的 accept。
+        // 退出时由 conn.close() 打断其阻塞的 accept。responder 常开，
+        // 即使 enable_watcher=false（E4 roam 端 B 需要回 A 的 ping）。
         let responder_stop = Arc::clone(&stop);
         let responder_conn = Arc::clone(&self.conn);
         let responder = thread::Builder::new()
@@ -132,20 +134,27 @@ impl LinkStateWatcher {
             .spawn(move || responder_loop(responder_conn, &responder_stop))
             .expect("keepalive responder thread spawn");
 
-        let mut backoff = Duration::from_millis(200);
-        while !stop.load(Ordering::SeqCst) {
-            match self.conn.open_keepalive() {
-                Ok(stream) => {
-                    backoff = Duration::from_millis(200);
-                    self.ping_watch(stream, &stop);
-                }
-                Err(e) => {
-                    if matches!(e, N1Error::Closed) || stop.load(Ordering::SeqCst) {
-                        break;
+        if !self.config.enable_watcher {
+            // 不主动观测：等待停止信号，responder 独立工作。
+            while !stop.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(200));
+            }
+        } else {
+            let mut backoff = Duration::from_millis(200);
+            while !stop.load(Ordering::SeqCst) {
+                match self.conn.open_keepalive() {
+                    Ok(stream) => {
+                        backoff = Duration::from_millis(200);
+                        self.ping_watch(stream, &stop);
                     }
-                    // 流暂时打不开（对端响应器未就绪等）：退避重试，不热循环。
-                    thread::sleep(backoff);
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                    Err(e) => {
+                        if matches!(e, N1Error::Closed) || stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        // 流暂时打不开（对端响应器未就绪等）：退避重试，不热循环。
+                        thread::sleep(backoff);
+                        backoff = (backoff * 2).min(Duration::from_secs(5));
+                    }
                 }
             }
         }
