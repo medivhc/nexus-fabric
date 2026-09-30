@@ -807,11 +807,16 @@ dependencies = [
 name = "nexus-network"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "nexus-delivery",
+ "nexus-discovery",
  "nexus-dns",
  "nexus-domain",
+ "nexus-fabric",
+ "nexus-path",
  "nexus-planner",
  "nexus-platform",
+ "nexus-platform-linux",
  "nexus-policy",
  "nexus-session",
 ]
