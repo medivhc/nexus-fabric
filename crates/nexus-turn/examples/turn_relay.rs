@@ -32,19 +32,17 @@ fn creds() -> TurnCredentials {
 /// 沙箱拦截未连接 UDP socket 的 send_to（EPERM），但放行 connect+send；
 /// 用裸 send_to 探测真实可用性。
 fn udp_usable() -> bool {
-    let probe = match UdpSocket::bind("127.0.0.1:0").and_then(|s| {
-        let t = UdpSocket::bind("127.0.0.1:0")?;
-        let ta = t.local_addr()?;
-        match s.send_to(b"probe", ta) {
-            Ok(_) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(false),
-            Err(_) => Ok(false),
-        }
-    }) {
-        Ok(v) => v,
-        Err(_) => false,
-    };
-    probe
+    UdpSocket::bind("127.0.0.1:0")
+        .and_then(|s| {
+            let t = UdpSocket::bind("127.0.0.1:0")?;
+            let ta = t.local_addr()?;
+            match s.send_to(b"probe", ta) {
+                Ok(_) => Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(false),
+                Err(_) => Ok(false),
+            }
+        })
+        .unwrap_or_default()
 }
 
 fn payload() -> Vec<u8> {
