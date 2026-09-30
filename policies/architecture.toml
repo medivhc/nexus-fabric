@@ -241,3 +241,9 @@ name = "nexus-projection"
 allowed_internal_dependencies = ["nexus-domain", "nexus-fabric", "nexus-ingress", "nexus-path"]
 portable = false
 layer = "delivery"
+
+[[crate]]
+name = "nexus-plugin"
+allowed_internal_dependencies = []
+portable = false
+layer = "delivery"
