@@ -14,6 +14,7 @@
 
 pub mod dns;
 pub mod egress;
+pub mod process;
 pub mod routing;
 pub mod semantic;
 pub mod tcp;
@@ -31,6 +32,9 @@ pub use egress::{
 /// Re-exported domain types for unified routing (defined in `nexus-domain`,
 /// used — not modified — here).
 pub use nexus_domain::{RouteRequest, RouteTarget, RuleEngine};
+pub use process::{
+    Attribution, FlowLabels, PlatformAttributor, ProcessAttributor, Proto, QosClass, QosConfig,
+};
 pub use routing::{Cidr, Router, UnifiedRouter, format_ipv4, parse_ipv4_dst};
 pub use semantic::{SemanticDeps, SemanticIngress, SemanticStats};
 pub use tcp::{TcpEgress, TcpRelayStats, TcpTermStats};
@@ -168,6 +172,8 @@ pub struct ProjectionConfig {
     pub max_egress_hops: u8,
     /// NAT table capacity (S14).
     pub max_nat_entries: usize,
+    /// Process-name → QoS class mapping (S26). Empty by default (all Normal).
+    pub qos: QosConfig,
 }
 
 impl Default for ProjectionConfig {
@@ -176,6 +182,7 @@ impl Default for ProjectionConfig {
             mtu: 1400,
             max_egress_hops: 2,
             max_nat_entries: DEFAULT_MAX_NAT_ENTRIES,
+            qos: QosConfig::default(),
         }
     }
 }
@@ -649,7 +656,11 @@ impl Projection {
         let mtu = config.mtu;
         let max_hops = config.max_egress_hops;
         let route_stats = Arc::new(Mutex::new(RouteStats::default()));
-        let egress_nat = Arc::new(Mutex::new(EgressNat::new(config.max_nat_entries)));
+        let egress_nat = {
+            let mut nat = EgressNat::new(config.max_nat_entries);
+            nat.set_qos(config.qos.clone());
+            Arc::new(Mutex::new(nat))
+        };
         // Router is installed later via `with_router`; the threads read it
         // through this shared slot so the builder can run before or after
         // `new` (threads only start in `new`, builder runs before that).
@@ -1060,6 +1071,8 @@ impl Projection {
             tcp_egress: Arc::clone(&self.tcp_egress_slot),
             transport: Arc::clone(&self.transport_slot),
             mtu: self.config.mtu,
+            attributor: Arc::new(PlatformAttributor),
+            qos: self.config.qos.clone(),
         })
     }
 
@@ -1103,7 +1116,9 @@ impl Projection {
     /// Enable TCP egress (3b-5, S21/S22/S23). Installs the terminator+relay
     /// and makes it visible to the uplink, downlink and tcp-poll threads.
     pub fn with_tcp_egress(self) -> Self {
-        *lock(&self.tcp_egress_slot) = Some(Arc::new(Mutex::new(TcpEgress::new())));
+        let mut te = TcpEgress::new();
+        te.terminator.set_qos(self.config.qos.clone());
+        *lock(&self.tcp_egress_slot) = Some(Arc::new(Mutex::new(te)));
         self
     }
 

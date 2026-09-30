@@ -6,6 +6,7 @@
 //!
 //! std-only + smoltcp; no Tokio.
 
+use crate::process::{FlowLabels, PlatformAttributor, ProcessAttributor, Proto, QosConfig};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
@@ -13,7 +14,8 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, SocketAddrV4, TcpStream, ToSocketAddrs};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpStream, ToSocketAddrs};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
@@ -410,6 +412,8 @@ struct TermConn {
     /// W1: fabric bytes not yet accepted by the smoltcp send buffer
     /// (back-pressure). Retried on every poll; never silently dropped.
     pending: Vec<u8>,
+    /// S26: process/QoS labels resolved once at flow setup, cached here.
+    labels: FlowLabels,
 }
 
 /// Events produced by the terminator for the fabric / TUN layer.
@@ -464,6 +468,10 @@ pub struct TcpTerminator {
     next_id: AtomicU32,
     max_conns: usize,
     stats: TcpTermStats,
+    /// S26: process attributor for flow-setup labeling (best-effort).
+    attributor: Arc<dyn ProcessAttributor>,
+    /// S26: process-name → QoS class mapping.
+    qos: QosConfig,
 }
 
 impl Default for TcpTerminator {
@@ -486,7 +494,23 @@ impl TcpTerminator {
             next_id: AtomicU32::new(random_stream_id_seed()),
             max_conns: MAX_TCP_CONNS,
             stats: TcpTermStats::default(),
+            attributor: Arc::new(PlatformAttributor),
+            qos: QosConfig::default(),
         }
+    }
+
+    /// Override the QoS config used for labeling new flows (S26).
+    pub fn set_qos(&mut self, qos: QosConfig) {
+        self.qos = qos;
+    }
+
+    /// Labels cached on a flow at setup time (S26), or `None` for an
+    /// unknown stream id. Per-flow observability for the future scheduler.
+    pub fn flow_labels(&self, stream_id: u32) -> Option<FlowLabels> {
+        self.by_id
+            .get(&stream_id)
+            .and_then(|k| self.conns.get(k))
+            .map(|c| c.labels.clone())
     }
 
     #[cfg(test)]
@@ -579,17 +603,28 @@ impl TcpTerminator {
                 return vec![];
             }
             let handle = self.sockets.add(sock);
+            // S26: attribute once at flow setup; cached on the TermConn.
+            let src_v4 = SocketAddrV4::new(Ipv4Addr::from(src_ip), src_port);
+            let dst_v4 = SocketAddrV4::new(Ipv4Addr::from(dst_ip), dst_port);
+            let labels = FlowLabels::attribute(
+                &*self.attributor,
+                &self.qos,
+                SocketAddr::V4(src_v4),
+                SocketAddr::V4(dst_v4),
+                Proto::Tcp,
+            );
             self.conns.insert(
                 key,
                 TermConn {
                     stream_id,
                     sock: handle,
                     peer: peer.to_string(),
-                    orig_dst: SocketAddrV4::new(std::net::Ipv4Addr::from(dst_ip), dst_port),
+                    orig_dst: dst_v4,
                     state: TermState::SynReceived(SystemTime::now()),
                     syn_sent: false,
                     close_sent: false,
                     pending: Vec::new(),
+                    labels,
                 },
             );
             self.by_id.insert(stream_id, key);
@@ -1324,6 +1359,7 @@ impl Default for TcpEgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::QosClass;
 
     /// Build a minimal IPv4/TCP packet with correct checksums.
     #[allow(clippy::too_many_arguments)]
@@ -1414,6 +1450,25 @@ mod tests {
         assert_eq!(peer, "peer-B");
         assert_eq!(term.stats().handshake_done, 1);
         let _ = sid;
+    }
+
+    #[test]
+    fn s26_flow_labels_cached_at_setup() {
+        // S26: a TUN TCP flow gets FlowLabels cached on its TermConn at
+        // setup time (SYN), readable via flow_labels().
+        let mut term = TcpTerminator::new();
+        term.set_qos(QosConfig::new().with_rule("no-such-process-xyz", QosClass::High));
+        let syn = craft_tcp([10, 0, 0, 2], [1, 2, 3, 4], 40000, 8080, 1000, 0, 0x02, &[]);
+        let _ = term.handle_uplink(&syn, "peer-B");
+        assert_eq!(term.conn_count(), 1);
+        let id = term.stream_ids()[0];
+        let labels = term.flow_labels(id).expect("labels cached at setup");
+        // No socket behind 10.0.0.2:40000 → unknown → Normal (deterministic
+        // on every platform: Linux /proc finds nothing, others use Noop).
+        assert_eq!(labels.process_name, None);
+        assert_eq!(labels.qos_class, QosClass::Normal);
+        // Unknown stream id → None.
+        assert_eq!(term.flow_labels(id.wrapping_add(0x1234)), None);
     }
 
     #[test]

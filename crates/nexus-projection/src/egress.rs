@@ -17,6 +17,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::process::{FlowLabels, PlatformAttributor, ProcessAttributor, Proto, QosConfig};
 use crate::routing::{Cidr, parse_ipv4_dst};
 
 /// Lock helper that tolerates poisoning (a panicked thread must not
@@ -243,6 +244,8 @@ pub struct NatEntry {
     /// tuple (socket address) and `orig` is needed to rebuild the reply
     /// IP packet for the originator.
     pub orig: FlowKey,
+    /// S26: process/QoS labels resolved once at flow creation, cached here.
+    pub labels: FlowLabels,
 }
 
 /// NAT counters (S8/S11: honest, only successful translations counted).
@@ -274,6 +277,10 @@ pub struct EgressNat {
     table: HashMap<FlowKey, NatEntry>,
     max_entries: usize,
     stats: NatStats,
+    /// S26: process attributor for flow-creation labeling (best-effort).
+    attributor: Arc<dyn ProcessAttributor>,
+    /// S26: process-name → QoS class mapping.
+    qos: QosConfig,
 }
 
 impl EgressNat {
@@ -282,7 +289,14 @@ impl EgressNat {
             table: HashMap::new(),
             max_entries,
             stats: NatStats::default(),
+            attributor: Arc::new(PlatformAttributor),
+            qos: QosConfig::default(),
         }
+    }
+
+    /// Override the QoS config used for labeling new flows (S26).
+    pub fn set_qos(&mut self, qos: QosConfig) {
+        self.qos = qos;
     }
 
     /// Outbound: record the flow. Returns the (unmodified, P0) packet,
@@ -304,15 +318,31 @@ impl EgressNat {
     ///
     /// S14: if the table is full, evict the oldest entry first.
     pub fn record_flow(&mut self, key: FlowKey, orig: FlowKey, peer: &str) {
-        if !self.table.contains_key(&key) && self.table.len() >= self.max_entries {
+        // Refresh path: keep the cached S26 labels, never re-attribute.
+        if let Some(e) = self.table.get_mut(&key) {
+            e.peer = peer.to_string();
+            e.last_seen = Instant::now();
+            self.stats.egress_handled += 1;
+            self.stats.current_flows = self.table.len();
+            return;
+        }
+        if self.table.len() >= self.max_entries {
             self.evict_oldest();
         }
+        // S26: attribute once at flow creation; cached on the NAT entry.
+        // The app owns the original 5-tuple (`orig`), not the translated key.
+        let labels = {
+            let src = SocketAddr::from((Ipv4Addr::from(orig.src_ip), orig.src_port));
+            let dst = SocketAddr::from((Ipv4Addr::from(orig.dst_ip), orig.dst_port));
+            FlowLabels::attribute(&*self.attributor, &self.qos, src, dst, Proto::Udp)
+        };
         self.table.insert(
             key,
             NatEntry {
                 peer: peer.to_string(),
                 last_seen: Instant::now(),
                 orig,
+                labels,
             },
         );
         self.stats.egress_handled += 1;
@@ -687,6 +717,7 @@ impl RealUdpEgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::QosClass;
 
     /// UDP packet: 20B IPv4 + 8B UDP header + payload.
     fn udp_packet(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16) -> Vec<u8> {
@@ -759,6 +790,24 @@ mod tests {
         assert!(nat.translate_inbound(&reply).is_none());
         assert_eq!(nat.stats().reply_dropped, 1);
         assert_eq!(nat.stats().reply_received, 0);
+    }
+
+    #[test]
+    fn s26_nat_entry_caches_labels_at_creation() {
+        // S26: UDP flow creation caches FlowLabels on the NAT entry once;
+        // a refresh keeps the cached labels (no re-attribution).
+        let mut nat = EgressNat::new(16);
+        let out = udp_packet([10, 0, 0, 2], [1, 2, 3, 4], 40000, 53);
+        nat.translate_outbound(&out, "self");
+        let key = FlowKey::parse(&out).unwrap();
+        let labels = nat.table.get(&key).expect("flow recorded").labels.clone();
+        // No socket behind 10.0.0.2:40000 → unknown → Normal.
+        assert_eq!(labels.process_name, None);
+        assert_eq!(labels.qos_class, QosClass::Normal);
+        // Refresh (retransmit) preserves the cached labels.
+        nat.translate_outbound(&out, "self");
+        let labels2 = nat.table.get(&key).expect("flow kept").labels.clone();
+        assert_eq!(labels, labels2);
     }
 
     #[test]

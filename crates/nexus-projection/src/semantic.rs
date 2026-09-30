@@ -30,7 +30,8 @@ use std::time::{Duration, Instant};
 
 use crate::tcp::{self, TcpEgress, encode_syn_payload};
 use crate::{
-    DatagramTransport, INTENT_STREAM, RouteRequest, RouteTarget, Router, encode_intent_kind,
+    DatagramTransport, FlowLabels, INTENT_STREAM, ProcessAttributor, QosClass, QosConfig,
+    RouteRequest, RouteTarget, Router, encode_intent_kind,
 };
 use tcp::{STREAM_FIN, STREAM_RST, STREAM_SYN, encode_stream_frame};
 
@@ -71,6 +72,14 @@ pub struct SemanticStats {
     pub ingress_egress_remote: u64,
     /// Application bytes forwarded toward the target (client → upstream/fabric).
     pub relayed_bytes: u64,
+    /// S26: accepted connections labeled High (best-effort attribution).
+    pub ingress_qos_high: u64,
+    /// S26: accepted connections labeled Normal (incl. unknown attribution).
+    pub ingress_qos_normal: u64,
+    /// S26: accepted connections labeled Low.
+    pub ingress_qos_low: u64,
+    /// S26: accepted connections labeled Background.
+    pub ingress_qos_background: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +97,10 @@ pub struct SemanticDeps {
     pub transport: Arc<Mutex<Arc<dyn DatagramTransport>>>,
     /// MTU for STREAM datagrams.
     pub mtu: usize,
+    /// Process attributor for accept-time labeling (S26).
+    pub attributor: Arc<dyn ProcessAttributor>,
+    /// Process-name → QoS class mapping (S26).
+    pub qos: QosConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -514,6 +527,20 @@ fn handle_client(
     next_id: &Arc<AtomicU32>,
     shutdown: &Arc<AtomicBool>,
 ) {
+    // S26: attribute once at accept time (best-effort; never blocks setup).
+    // The application owns the *peer* side of the accepted socket.
+    let labels = match (stream.peer_addr(), stream.local_addr()) {
+        (Ok(peer), Ok(local)) => {
+            FlowLabels::for_accepted_peer(&*deps.attributor, &deps.qos, peer, local)
+        }
+        _ => FlowLabels::unknown(),
+    };
+    match labels.qos_class {
+        QosClass::High => lock(stats).ingress_qos_high += 1,
+        QosClass::Normal => lock(stats).ingress_qos_normal += 1,
+        QosClass::Low => lock(stats).ingress_qos_low += 1,
+        QosClass::Background => lock(stats).ingress_qos_background += 1,
+    };
     if stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).is_err() {
         return;
     }
@@ -733,6 +760,8 @@ mod tests {
             tcp_egress: Arc::new(Mutex::new(None)),
             transport: Arc::new(Mutex::new(transport)),
             mtu: 1400,
+            attributor: Arc::new(crate::PlatformAttributor),
+            qos: QosConfig::default(),
         };
         (deps, stats)
     }
@@ -931,6 +960,8 @@ mod tests {
             tcp_egress: Arc::new(Mutex::new(None)),
             transport: Arc::new(Mutex::new(transport)),
             mtu: 1400,
+            attributor: Arc::new(crate::PlatformAttributor),
+            qos: QosConfig::default(),
         };
         let mut ing = SemanticIngress::bind("127.0.0.1:0".parse().unwrap(), deps).unwrap();
         let addr = ing.local_addr();
