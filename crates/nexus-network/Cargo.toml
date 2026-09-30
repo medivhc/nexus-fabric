@@ -18,3 +18,11 @@ nexus-dns = { path = "../nexus-dns" }
 # N1 装配：仅复用 VirtualPacketInterface trait（MODULE.md 增补边，
 # policies/architecture.toml 已同步声明）。
 nexus-platform = { path = "../nexus-platform" }
+
+[dev-dependencies]
+# E4 n1_roam 的 composition root 适配器（注入 trait 实现）。
+nexus-fabric = { path = "../nexus-fabric" }
+nexus-path = { path = "../nexus-path" }
+nexus-discovery = { path = "../nexus-discovery" }
+nexus-platform-linux = { path = "../nexus-platform-linux" }
+libc = "0.2"
