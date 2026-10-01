@@ -74,6 +74,97 @@ fn main() -> ExitCode {
     }
 }
 
+/// 从 LoadedConfig 组装 DataplaneConfig（D1-D6）。
+fn build_dataplane_config(loaded: &LoadedConfig) -> nexusd::dataplane::DataplaneConfig {
+    use nexusd::dataplane::DataplaneConfig;
+
+    // Mesh CIDR：network.toml 存在时默认 10.0.0.0/8（MVP；完整解析后置）。
+    let mesh_cidrs = if loaded.network_toml.is_some() {
+        vec!["10.0.0.0/8".to_string()]
+    } else {
+        vec![]
+    };
+    // Bypass：常见内网段（与 Clash Verge 默认一致）。
+    let bypass_cidrs = vec!["192.168.0.0/16".to_string(), "172.16.0.0/12".to_string()];
+
+    // QoS：从 daemon.toml [qos] 映射。
+    let qos_enabled = loaded.daemon.qos.enabled;
+    let mut qos_config = nexus_connectivity::cake::CakeConfig::default();
+    if qos_enabled {
+        qos_config.quantum = loaded.daemon.qos.quantum;
+        qos_config.high_priority_ports = loaded.daemon.qos.high_priority_ports.clone();
+        // mesh/proxy_upload_mbps 映射为 rate_limit（MVP：取最小非零值）。
+        let mesh_bps = loaded.daemon.qos.mesh_upload_mbps * 1_000_000 / 8;
+        let proxy_bps = loaded.daemon.qos.proxy_upload_mbps * 1_000_000 / 8;
+        let rate_bps = match (mesh_bps, proxy_bps) {
+            (0, 0) => 0,
+            (m, 0) => m,
+            (0, p) => p,
+            (m, p) => m.min(p),
+        };
+        if rate_bps > 0 {
+            // burst 默认为 1 秒的量。
+            if let Ok(limit) = nexus_connectivity::qos::BandwidthLimit::new(rate_bps, rate_bps) {
+                qos_config.rate_limit = Some(limit);
+            }
+        }
+    }
+
+    DataplaneConfig {
+        mesh_cidrs,
+        bypass_cidrs,
+        dns_enabled: loaded.dns_toml.is_some(),
+        dns_config: None, // MVP：用默认（dns.toml 解析后置）
+        qos_enabled,
+        qos_config,
+        boost_enabled: false, // MVP：Boost 联动后置
+        n1_configured: loaded.network_toml.is_some(),
+        proxy_configured: loaded.proxy_yaml.is_some(),
+    }
+}
+
+/// 数据面线程主循环：创建 TUN → 处理包 → 出错时退出线程（daemon 继续服务 LocalAPI）。
+fn run_dataplane(config: nexusd::dataplane::DataplaneConfig) {
+    use nexus_projection::TunDevice;
+    // D1：创建单个 TUN（Linux）。
+    let tun: Box<dyn nexus_projection::TunDevice> =
+        match nexus_projection::tun_rs_device::TunRsDevice::create("nexus%d", 1500) {
+            Ok(dev) => {
+                eprintln!("[nexusd] dataplane: TUN {} created", dev.name());
+                Box::new(dev)
+            }
+            Err(e) => {
+                eprintln!(
+                    "[nexusd] dataplane: TUN creation failed ({e}); dataplane disabled, LocalAPI still serving"
+                );
+                return;
+            }
+        };
+
+    let mut dp = match nexusd::dataplane::Dataplane::new(tun, config) {
+        Ok(dp) => dp,
+        Err(e) => {
+            eprintln!("[nexusd] dataplane: init failed ({e}); dataplane disabled");
+            return;
+        }
+    };
+
+    eprintln!("[nexusd] dataplane: running");
+    loop {
+        match dp.process_one() {
+            Ok(true) => continue,
+            Ok(false) => {
+                // 无包：短暂休眠避免忙轮询。
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(e) => {
+                eprintln!("[nexusd] dataplane: TUN read error ({e}); exiting dataplane thread");
+                break;
+            }
+        }
+    }
+}
+
 /// Daemon 主流程：加载配置 → 启动 LocalAPI → 启动 watcher → 事件循环。
 fn run_daemon(config_dir: &str) -> ExitCode {
     let dir = match ConfigDir::new(std::path::Path::new(config_dir)) {
@@ -98,7 +189,17 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     };
     log_enabled_subsystems(&loaded);
 
-    // 2. LocalAPI（后台线程；沿用既有 serve 逻辑）。
+    // 2. 统一数据面（后台线程；TUN 创建失败时降级为无数据面，记日志）。
+    //    D1：单个 TUN 由 nexusd 持有。
+    let dataplane_config = build_dataplane_config(&loaded);
+    std::thread::Builder::new()
+        .name("nexusd-dataplane".to_string())
+        .spawn(move || {
+            run_dataplane(dataplane_config);
+        })
+        .expect("spawn dataplane thread");
+
+    // 3. LocalAPI（后台线程；沿用既有 serve 逻辑）。
     let localapi_addr = loaded.daemon.localapi_addr.clone();
     let (ready_tx, ready_rx) = channel();
     std::thread::Builder::new()
