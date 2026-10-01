@@ -353,7 +353,105 @@ high_priority_ports = "22,53,3389"
 
 ---
 
-## 12. 验证状态
+## 12. 多路径/竞速/预测与统一数据面的集成
+
+> 状态：**设计**（2026-10-01）。竞速/预测代码已存在（`crates/nexus-path/`，已合入 master）；
+> 与统一 daemon 的集成、多路径调度器为新设计，未实现。
+
+### 12.1 现有能力（已合入 master）
+
+| 模块 | 文件 | 能力 |
+|------|------|------|
+| 竞速 | `crates/nexus-path/src/race.rs` | staggered racing，`race_connect`，budget + 协作取消 |
+| 质量预测 | `crates/nexus-path/src/ewma.rs` | per-path EWMA，20% 相对 hysteresis + 3s 保持 |
+| 路径回退 | `crates/nexus-path/src/fallback.rs` | Direct → Proxy → Turn，`FallbackChain` |
+
+### 12.2 在统一数据面中的位置
+
+```
+                    ┌─ 竞速/预测（建连时，control plane）─┐
+                    │  race_connect 选最优路径             │
+                    │  EWMA 跟踪路径质量                   │
+                    └──────────────────┬──────────────────┘
+                                       ↓ 建连完成
+TUN 捕获 → [包分类器] → [QoS: DRR+整形] → [路径调度器] → 转发
+              §6          §11              本节（多路径时）
+                                       ↓
+                              N1 / Proxy egress
+```
+
+**分工**：
+- **竞速/预测**：连接建立时选路。`race_connect` 并发拨多条路径，EWMA 持续打分。
+- **QoS**（§11）：连接建立后，包调度时做流间公平，与底下是哪条路无关。
+- **路径调度器**（多路径时）：在 QoS 之下，按包或按流选择 egress 路径。
+
+三者正交：竞速决定"建哪条"，EWMA 决定"哪条好"，QoS 决定"包怎么排"，调度器决定"包走哪条"。
+
+### 12.3 EWMA 驱动统一分类器
+
+EWMA 的 per-path 分数可输入包分类器（§6），实现动态调整：
+
+```
+分类器决策（伪代码）：
+  if dst in mesh_subnet:
+      path = ewma_best(mesh_paths)      # 选 EWMA 最优的 mesh 路径
+      if path.score < threshold:
+          log::warn!("mesh 路径质量劣化，考虑 proxy")
+          # 可选：按规则溢出到 proxy
+      forward(mesh, path)
+  else if proxy_rule.match(dst):
+      forward(proxy)
+  else:
+      forward(bypass)
+```
+
+- hysteresis（20% + 3s）防止路径乒乓
+- 分类器只读 EWMA 分数，不修改（single writer 仍在 `nexus-path`）
+
+### 12.4 多路径扩展设计
+
+**目标**：单流可同时用多条路径（如 mesh 直连 + proxy 并发），提升吞吐/可靠性。
+
+**架构**：在 QoS 层之下加路径调度器，每个 egress 独立 QoS 实例：
+
+```
+                    ┌─ QoS 实例 A (mesh直连) ─┐
+[QoS: DRR] → [路径调度器]─┼─ QoS 实例 B (proxy) ──┤→ 转发
+                    └─ QoS 实例 C (TURN) ───┘
+```
+
+**调度策略**（可配置）：
+| 策略 | 描述 | 适用 |
+|------|------|------|
+| `single` | 只用最优路径（默认，当前行为） | 低延迟优先 |
+| `per-flow` | 按流哈希固定路径（流内有序） | 通用 |
+| `per-packet` | 按包轮询/加权（需接收端重排） | 吞吐优先，需对端支持 |
+
+**接收端重排**（per-packet 模式）：
+- 包头加 sequence number（复用 QUIC 的包号机制，避免新协议）
+- 接收端按序重组，乱序包缓冲（上限可配置，防内存爆炸）
+
+### 12.5 配置（`network.toml` 扩展）
+
+```toml
+[multipath]
+# 调度策略：single | per-flow | per-packet
+strategy = "single"
+# per-packet 模式的重排缓冲上限（包数）
+reorder_buffer = 64
+# 是否启用 EWMA 驱动的动态分类（§12.3）
+ewma_driven_classifier = true
+```
+
+### 12.6 诚实边界
+
+- 竞速/预测代码已实现并合入，但**尚未与统一 daemon 的分类器集成**（§12.3 为设计）
+- 多路径调度器未实现；per-packet 模式的接收端重排未设计细节
+- EWMA 参数（20%/3s）来自路径层场景，mesh 场景下的最优值需实测
+
+---
+
+## 13. 验证状态
 
 - **单测**：`cargo test -p nexusd` 10/10 通过（含热加载 Applied/Rejected/NeedsRestart 三路径）
 - **功能验证**（2026-10-01）：启动、改文件热加载、坏 YAML 拒绝且进程存活、`nexus config` 三命令，全部通过
