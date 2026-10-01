@@ -1,0 +1,76 @@
+schema_version = 1
+id = "product.dns-unified"
+title = "统一 DNS：mesh > fake-ip > 上游分类与 Fake-IP 生命周期"
+evidence_strength = "E4"
+requirement = "DAEMON_ARCHITECTURE.md#10"
+
+[given]
+# Mesh 侧：peer 主机名 -> 虚拟网 IP
+mesh_suffix = "mesh"
+peer_name = "xc-pc-linux.mesh"
+peer_virtual_ip = "10.144.144.6"
+# 代理侧：命中代理规则的域名 -> fake-ip 池
+proxied_domain = "proxy.example.com"
+fake_ip_range = "198.18.0.0/15"
+fake_ip_ttl_secs = 300
+# 直连侧：bypass 域名 -> 上游
+bypass_domain = "direct.example.com"
+upstream_ip = "93.184.216.34"
+# 自定义 hosts（最高优先级）
+hosts_domain = "local.dev"
+hosts_ip = "127.0.0.1"
+
+[when]
+command = "nexus-harness run dns-unified --json"
+
+# --- 分类顺序 ---
+[[expect]]
+field = "hosts.class"
+equals = "Hosts"
+
+[[expect]]
+field = "mesh.class"
+equals = "Mesh"
+
+[[expect]]
+field = "mesh.ip"
+equals = "10.144.144.6"
+
+[[expect]]
+field = "fakeip.class"
+equals = "FakeIp"
+
+# fake-ip 必须落在 198.18.0.0/15 内
+[[expect]]
+field = "fakeip.in_range"
+equals = true
+
+[[expect]]
+field = "upstream.class"
+equals = "Upstream"
+
+[[expect]]
+field = "upstream.ip"
+equals = "93.184.216.34"
+
+# --- Fake-IP 生命周期 ---
+# 同一域名 TTL 内重复查询返回同一 IP
+[[expect]]
+field = "fakeip.stable_within_ttl"
+equals = true
+
+# 反查一致
+[[expect]]
+field = "fakeip.reverse_lookup"
+equals = "proxy.example.com"
+
+# TTL 过期后回收，反查返回空
+[[expect]]
+field = "fakeip.reclaimed_after_ttl"
+equals = true
+
+# --- 上游隔离 ---
+# mesh/fake-ip/hosts 命中时上游解析器零调用
+[[expect]]
+field = "upstream_resolver_calls_for_local"
+equals = 0

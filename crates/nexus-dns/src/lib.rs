@@ -19,6 +19,13 @@ use std::net::IpAddr;
 
 use nexus_domain::NetworkPlanExtension;
 
+pub mod unified;
+
+pub use unified::{
+    DEFAULT_FAKE_IP_RANGE, DEFAULT_FAKE_IP_TTL_SECS, DEFAULT_MESH_SUFFIX, DnsClass,
+    DnsUnifiedConfig, FakeIpPool, MeshNameResolver, ProxyClassifier, UnifiedAnswer, UnifiedDns,
+};
+
 /// 稳定模块标识；业务实现应通过公开类型/trait 增量加入，而不是扩大隐式全局状态。
 pub const NEXUS_DNS_MODULE: &str = "nexus-dns";
 

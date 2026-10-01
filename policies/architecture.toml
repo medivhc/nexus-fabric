@@ -214,7 +214,7 @@ layer = "outbound"
 
 [[crate]]
 name = "nexus-harness"
-allowed_internal_dependencies = ["nexus-connectivity", "nexus-domain", "nexus-platform"]
+allowed_internal_dependencies = ["nexus-connectivity", "nexus-dns", "nexus-domain", "nexus-platform"]
 portable = false
 layer = "engineering"
 

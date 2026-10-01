@@ -12,6 +12,7 @@ pub fn run_scenario(args: &[String]) -> Outcome {
         "nat-hole-punching" => run_nat_hole_punching(),
         "multihop-routing" => run_multihop_routing(),
         "mesh-dns" => run_mesh_dns(),
+        "dns-unified" => run_dns_unified(),
         "firewall-rules" => run_firewall_rules(),
         "bandwidth-qos" => run_bandwidth_qos(),
         "auto-reconnect" => run_auto_reconnect(),
@@ -748,6 +749,204 @@ fn run_mesh_dns() -> Outcome {
             "FAIL".to_string(),
             format!(
                 "mesh-dns: invariants failed (resolves={query_from_b_resolves}, unknown={query_unknown}, ttl_expired={ttl_expired})"
+            ),
+            extra,
+        )
+    }
+}
+
+/// E4: 统一 DNS 分类与 Fake-IP 生命周期（内存骨架，DAEMON_ARCHITECTURE §10）。
+///
+/// 场景（`scenarios/product/dns_unified.toml`）：
+/// - hosts 精确匹配 > mesh 域名 > 代理规则（fake-ip）> 上游；
+/// - fake-ip 分配/稳定/反查/过期回收；
+/// - mesh/fake-ip/hosts 命中时上游零调用。
+fn run_dns_unified() -> Outcome {
+    use nexus_dns::{
+        DnsClass, DnsQuery, DnsType, DnsUnifiedConfig, MeshNameResolver, ProxyClassifier, Resolver,
+        UnifiedDns,
+    };
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    const MESH_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 144, 144, 6));
+    const UPSTREAM_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+    const HOSTS_IP: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    struct MapMesh {
+        map: HashMap<String, IpAddr>,
+    }
+    impl MeshNameResolver for MapMesh {
+        fn resolve_mesh(&self, name: &str) -> Option<IpAddr> {
+            self.map.get(name).copied()
+        }
+    }
+
+    struct SuffixClassifier;
+    impl ProxyClassifier for SuffixClassifier {
+        fn is_proxied(&self, domain: &str) -> bool {
+            domain == "proxy.example.com"
+        }
+    }
+
+    struct ConstUpstream {
+        calls: std::sync::atomic::AtomicU64,
+    }
+    impl Resolver for ConstUpstream {
+        fn resolve(&mut self, _q: &DnsQuery) -> Result<Vec<IpAddr>, nexus_dns::DnsError> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(vec![UPSTREAM_IP])
+        }
+    }
+
+    let mut mesh_map = HashMap::new();
+    mesh_map.insert("xc-pc-linux.mesh".to_string(), MESH_IP);
+    let config = DnsUnifiedConfig {
+        hosts: vec![("local.dev".to_string(), HOSTS_IP)],
+        ..Default::default()
+    };
+    let mut dns = match UnifiedDns::new(
+        config,
+        Box::new(MapMesh { map: mesh_map }),
+        Box::new(SuffixClassifier),
+        Box::new(ConstUpstream {
+            calls: std::sync::atomic::AtomicU64::new(0),
+        }),
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                "FAIL".to_string(),
+                format!("dns-unified: construct: {e}"),
+                Vec::new(),
+            );
+        }
+    };
+
+    let a = |name: &str| DnsQuery {
+        name: name.to_string(),
+        qtype: DnsType::A,
+    };
+
+    // --- 分类顺序 ---
+    let hosts_ans = dns.resolve(&a("local.dev"), 1000);
+    let hosts_class = hosts_ans
+        .as_ref()
+        .map(|x| x.class.as_str())
+        .unwrap_or("ERR")
+        .to_string();
+
+    let mesh_ans = dns.resolve(&a("xc-pc-linux.mesh"), 1000);
+    let (mesh_class, mesh_ip) = match &mesh_ans {
+        Ok(x) => (x.class.as_str().to_string(), x.records[0].to_string()),
+        Err(_) => ("ERR".to_string(), String::new()),
+    };
+
+    let fake_ans = dns.resolve(&a("proxy.example.com"), 1000);
+    let (fake_class, fake_in_range, fake_ip_str) = match &fake_ans {
+        Ok(x) => {
+            let ip = match x.records[0] {
+                IpAddr::V4(v4) => v4,
+                IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
+            };
+            let in_range = {
+                let v = u32::from_be_bytes(ip.octets());
+                (v & 0xFFFE_0000) == 0xC612_0000 // 198.18.0.0/15
+            };
+            (
+                x.class.as_str().to_string(),
+                in_range,
+                IpAddr::V4(ip).to_string(),
+            )
+        }
+        Err(_) => ("ERR".to_string(), false, String::new()),
+    };
+
+    let up_ans = dns.resolve(&a("direct.example.com"), 1000);
+    let (up_class, up_ip) = match &up_ans {
+        Ok(x) => (x.class.as_str().to_string(), x.records[0].to_string()),
+        Err(_) => ("ERR".to_string(), String::new()),
+    };
+
+    // --- Fake-IP 生命周期 ---
+    let fake_again = dns.resolve(&a("proxy.example.com"), 1100);
+    let stable_within_ttl = match (&fake_ans, &fake_again) {
+        (Ok(x), Ok(y)) => y.from_cache && x.records == y.records,
+        _ => false,
+    };
+    let reverse_lookup = fake_ip_str
+        .parse::<IpAddr>()
+        .ok()
+        .and_then(|ip| match ip {
+            IpAddr::V4(v4) => dns.reverse_lookup(v4).map(str::to_string),
+            IpAddr::V6(_) => None,
+        })
+        .unwrap_or_default();
+    // TTL=300：推进到 1400 后回收。
+    let reclaimed = dns.reclaim_expired(1400);
+    let reverse_after = fake_ip_str.parse::<IpAddr>().ok().and_then(|ip| match ip {
+        IpAddr::V4(v4) => dns.reverse_lookup(v4).map(str::to_string),
+        IpAddr::V6(_) => None,
+    });
+    let reclaimed_after_ttl = reclaimed == 1 && reverse_after.is_none();
+
+    let upstream_calls_for_local = dns.upstream_call_count();
+    // 注意：direct.example.com 走了 1 次上游；本地三类命中不应增加计数。
+    // 在上面的 resolve 调用中，上游只应被调用 1 次（direct.example.com）。
+    let local_isolated = upstream_calls_for_local == 1;
+
+    let ok = hosts_class == "Hosts"
+        && mesh_class == DnsClass::Mesh.as_str()
+        && mesh_ip == "10.144.144.6"
+        && fake_class == DnsClass::FakeIp.as_str()
+        && fake_in_range
+        && up_class == DnsClass::Upstream.as_str()
+        && up_ip == "93.184.216.34"
+        && stable_within_ttl
+        && reverse_lookup == "proxy.example.com"
+        && reclaimed_after_ttl
+        && local_isolated;
+
+    let extra = vec![
+        ("hosts".to_string(), json!({ "class": hosts_class })),
+        (
+            "mesh".to_string(),
+            json!({ "class": mesh_class, "ip": mesh_ip }),
+        ),
+        (
+            "fakeip".to_string(),
+            json!({
+                "class": fake_class,
+                "in_range": fake_in_range,
+                "stable_within_ttl": stable_within_ttl,
+                "reverse_lookup": reverse_lookup,
+                "reclaimed_after_ttl": reclaimed_after_ttl,
+            }),
+        ),
+        (
+            "upstream".to_string(),
+            json!({ "class": up_class, "ip": up_ip }),
+        ),
+        (
+            "upstream_resolver_calls_for_local".to_string(),
+            // 场景期望：本地命中零上游调用；此处直连域名的 1 次是预期的，
+            // 故上报"本地三类之外的上游调用"即 total-1。
+            json!(upstream_calls_for_local.saturating_sub(1)),
+        ),
+    ];
+
+    if ok {
+        (
+            "PASS".to_string(),
+            "dns-unified: classification order + fake-ip lifecycle verified".to_string(),
+            extra,
+        )
+    } else {
+        (
+            "FAIL".to_string(),
+            format!(
+                "dns-unified: invariants failed (hosts={hosts_class}, mesh={mesh_class}, fake={fake_class}, up={up_class}, stable={stable_within_ttl}, reclaimed={reclaimed_after_ttl}, local_isolated={local_isolated})"
             ),
             extra,
         )
