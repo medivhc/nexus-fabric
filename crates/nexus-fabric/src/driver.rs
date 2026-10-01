@@ -102,6 +102,15 @@ pub struct ConnShared {
     pub dgrams: Mutex<VecDeque<Vec<u8>>>,
     pub dgram_cv: Condvar,
     pub stats: Mutex<ConnStats>,
+    /// F-EDGE-3: serializes concurrent `rebind()` calls on this connection.
+    /// The driver loop is single-threaded so `Cmd::Rebind` execution is already
+    /// sequential, but that is incidental to the current implementation, not an
+    /// API-level guarantee. This lock makes the ordering explicit at the
+    /// portable-core boundary: rapid successive rebinds (e.g. link monitor
+    /// backoff + path-switch event firing together) execute in call order,
+    /// never interleaved. Deletion Test: without it, a future multi-threaded
+    /// driver refactor would race the socket swap in `cmd_rebind`.
+    pub rebind_lock: Mutex<()>,
 }
 
 pub struct ConnState {
@@ -134,6 +143,7 @@ impl ConnShared {
             dgrams: Mutex::new(VecDeque::new()),
             dgram_cv: Condvar::new(),
             stats: Mutex::new(ConnStats::unknown()),
+            rebind_lock: Mutex::new(()),
         }
     }
 }

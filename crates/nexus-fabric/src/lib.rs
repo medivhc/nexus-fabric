@@ -189,7 +189,12 @@ impl FabricConn {
     /// Phase B addition: the roam scenario's client rebinds mid-transfer (S3).
     /// Unacknowledged data is retransmitted on the new path; the peer migrates
     /// via QUIC path validation (S6). Blocks until the swap completes.
+    ///
+    /// F-EDGE-3: concurrent `rebind()` calls on this connection are serialized
+    /// via `ConnShared::rebind_lock` (held for the whole call). Successive
+    /// rebinds execute in call order; they are not coalesced.
     pub fn rebind(&self) -> Result<(), FabricError> {
+        let _guard = self.inner.rebind_lock.lock().unwrap();
         let (tx, rx) = mpsc::channel();
         self.inner
             .tx
