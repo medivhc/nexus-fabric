@@ -155,7 +155,10 @@ impl PathScheduler {
     /// - `egresses`：调用方排序（`Single` 取首位为最优；`PerFlow`/`PerPacket`
     ///   按给定顺序做哈希/轮询，顺序变化视为集合变化）；
     /// - `flow_id`：流标识（如 5 元组哈希；`PerFlow` 用，`Single`/`PerPacket` 忽略）；
-    /// - `_seq`：包序号（未来加权/拥塞感知用；当前未使用，下划线前缀防警告）。
+    /// - `seq`：包序号。GAP-2 P4：per-packet 模式下调用方应传入 `nexus-fabric`
+    ///   QSEQ 分配的序号（`FabricConn::send_datagram_seqed` 返回值），以便接收端
+    ///   `ReorderBuffer` 按同一序号空间重排。调度器本身不解释序号语义
+    ///   （加权轮询仅用内部游标；`seq` 当前未用于选择，保留供未来拥塞感知用）。
     ///
     /// 空 `egresses` 返回 `None`（调用方处理无可用 egress，不 panic）。
     pub fn select<'a>(
@@ -163,8 +166,9 @@ impl PathScheduler {
         strategy: MultipathStrategy,
         egresses: &'a [EgressDescriptor],
         flow_id: u64,
-        _seq: u64,
+        seq: u64,
     ) -> Option<&'a EgressDescriptor> {
+        let _ = seq; // P4：序号语义由调用方/ReorderBuffer 解释；选择逻辑暂不用。
         if egresses.is_empty() {
             return None;
         }
@@ -202,12 +206,46 @@ impl PathScheduler {
 
 /// 接收端重排缓冲（per-packet 模式）。
 ///
-/// 按 `seq`（u64 包序号，调用方从包头提取，未来复用 QUIC 包号）缓冲乱序包，
-/// `pop_in_order` 按序吐出连续 seq。容量上限 `capacity`（`O(capacity)` 内存）；
-/// 插入时超限 → 丢弃最小 seq 的包并计数 `dropped()`（防内存爆炸）。
+/// 按 `seq`（u64 包序号，调用方从包头提取；GAP-2 起应为 `nexus-fabric`
+/// QSEQ 分配的序号，见 P4）缓冲乱序包，`pop_in_order` 按序吐出；
+/// 容量有界（`O(reorder_buffer)`），超限丢弃最小 seq 并计数。
 ///
 /// 重复 `seq` 的包：保留先到的，丢弃后到的（计数到 `dropped_duplicate`，
 /// 与容量丢弃分开计数，诊断可区分）。
+///
+/// 序号比较为回绕感知（GAP-2 P1/P2）：`PacketSeq::less` / `distance`，
+/// 序号空间模 2^64。远离回绕点时与朴素 `u64` 比较一致（P5）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PacketSeq(pub u64);
+
+impl PacketSeq {
+    /// `a` 是否在序号空间中早于 `b`（回绕感知，RFC 1982 风格）。
+    ///
+    /// 定义：`a != b` 且 `b.wrapping_sub(a) < 2^63`。
+    /// 远离回绕点时等价于 `a < b`；回绕点附近（如 `a = u64::MAX, b = 0`）
+    /// 正确返回 `true`，而朴素 `a < b` 会错误返回 `false`。
+    pub fn less(a: u64, b: u64) -> bool {
+        a != b && b.wrapping_sub(a) < (1u64 << 63)
+    }
+
+    /// 从 `a` 到 `b` 的前向距离（回绕感知，模 2^64）。
+    ///
+    /// `distance(a, a) == 0`；`distance(u64::MAX, 0) == 1`。
+    pub fn distance(a: u64, b: u64) -> u64 {
+        b.wrapping_sub(a)
+    }
+
+    /// 后继序号（回绕：`u64::MAX.next() == 0`）。
+    pub fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
+
+    /// 原始 u64 值。
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Debug)]
 pub struct ReorderBuffer {
     /// 待按序吐出的包：seq → 载荷。
@@ -269,21 +307,29 @@ impl ReorderBuffer {
 
     /// 喂入一个包（`seq` + 载荷）。
     ///
-    /// - `seq < next_seq`（已吐出）：视为重复/迟到，丢弃并计 `dropped_duplicate`；
+    /// 序号语义为回绕感知（GAP-2 P2）：
+    /// - `PacketSeq::less(seq, next_seq)`（seq 早于期望，回绕感知）：视为
+    ///   重复/迟到，丢弃并计 `dropped_duplicate`；
     /// - 已在缓冲：丢弃并计 `dropped_duplicate`；
-    /// - 插入后超限：丢弃最小 seq（不一定是刚插入的），计 `dropped_overflow`。
+    /// - 插入后超限：丢弃"最早"的包（到 `next_seq` 前向距离最小者，回绕感知，
+    ///   远离回绕点时即最小 seq），计 `dropped_overflow`。
     pub fn push(&mut self, seq: u64, payload: Vec<u8>) {
-        if seq < self.next_seq || self.pending.contains_key(&seq) {
+        if PacketSeq::less(seq, self.next_seq) || self.pending.contains_key(&seq) {
             self.dropped_duplicate += 1;
             return;
         }
         self.pending.insert(seq, payload);
-        // 容量 enforcement：丢弃最小 seq 直到不超限。
-        // BTreeMap 有序，首个即最小。
+        // 容量 enforcement：丢弃最早（前向距离最小）的包直到不超限。
+        // 注意不能直接取 BTreeMap 首个 key：回绕时最早的包可能数值最大
+        // （如 next_seq=MAX-1 时，MAX-1 < MAX < 0 < 1 的数值序是 0 < 1 < MAX-1）。
         while self.pending.len() > self.capacity {
-            // pop_first 稳定版可用（MSRV 需确认）；用迭代器取首 key 再 remove。
-            if let Some(&smallest) = self.pending.keys().next() {
-                self.pending.remove(&smallest);
+            let earliest = self
+                .pending
+                .keys()
+                .min_by_key(|&&k| PacketSeq::distance(self.next_seq, k))
+                .copied();
+            if let Some(k) = earliest {
+                self.pending.remove(&k);
                 self.dropped_overflow += 1;
             } else {
                 break;
@@ -292,14 +338,15 @@ impl ReorderBuffer {
         debug_assert!(self.pending.len() <= self.capacity);
     }
 
-    /// 按序吐出连续可用的包（`next_seq` 起连续的）。
+    /// 按序吐出连续可用的包（`next_seq` 起连续的，回绕感知）。
     ///
-    /// 返回吐出的 `(seq, payload)` 列表（按 seq 升序）；无连续可用时返回空。
+    /// 返回吐出的 `(seq, payload)` 列表（按序号空间升序）；无连续可用时返回空。
+    /// `next_seq` 用 `wrapping_add` 推进（回绕时 `u64::MAX → 0` 不 panic）。
     pub fn pop_in_order(&mut self) -> Vec<(u64, Vec<u8>)> {
         let mut out = Vec::new();
         while let Some(payload) = self.pending.remove(&self.next_seq) {
             out.push((self.next_seq, payload));
-            self.next_seq += 1;
+            self.next_seq = self.next_seq.wrapping_add(1);
             self.emitted += 1;
         }
         out
@@ -607,5 +654,148 @@ mod tests {
         let e = EgressDescriptor::new("proxy", EgressKind::Proxy, 1);
         map.insert(e.clone(), 7u32);
         assert_eq!(map[&e], 7);
+    }
+
+    // ===== GAP-2 (S33): PacketSeq 回绕感知 =====
+
+    #[test]
+    fn packet_seq_less_basic() {
+        // 远离回绕点：与朴素比较一致。
+        assert!(PacketSeq::less(0, 1));
+        assert!(PacketSeq::less(100, 200));
+        assert!(!PacketSeq::less(1, 0));
+        assert!(!PacketSeq::less(5, 5)); // 相等不算 less
+    }
+
+    #[test]
+    fn packet_seq_less_wraparound() {
+        // 回绕点：MAX 早于 0，0 晚于 MAX。
+        assert!(PacketSeq::less(u64::MAX, 0));
+        assert!(PacketSeq::less(u64::MAX - 1, u64::MAX));
+        assert!(PacketSeq::less(u64::MAX, 1));
+        assert!(!PacketSeq::less(0, u64::MAX));
+        assert!(!PacketSeq::less(1, u64::MAX));
+        // 注：朴素 `u64::MAX < 0` 恒为 false（clippy unused_comparisons 会告警），
+        // 而回绕语义下 MAX 应早于 0 —— 这正是 PacketSeq::less 要修复的。
+    }
+
+    #[test]
+    fn packet_seq_less_half_space_boundary() {
+        // 距离恰为 2^63：不算 less（RFC 1982 未定义，取保守 false）。
+        let a = 0u64;
+        let b = 1u64 << 63;
+        assert!(!PacketSeq::less(a, b));
+        assert!(!PacketSeq::less(b, a));
+        // 距离 2^63 - 1：算 less。
+        assert!(PacketSeq::less(a, b - 1));
+    }
+
+    #[test]
+    fn packet_seq_distance() {
+        assert_eq!(PacketSeq::distance(0, 0), 0);
+        assert_eq!(PacketSeq::distance(5, 10), 5);
+        assert_eq!(PacketSeq::distance(u64::MAX, 0), 1);
+        assert_eq!(PacketSeq::distance(u64::MAX - 1, 1), 3);
+        assert_eq!(PacketSeq::distance(0, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn packet_seq_next_wraps() {
+        assert_eq!(PacketSeq(u64::MAX).next(), PacketSeq(0));
+        assert_eq!(PacketSeq(41).next(), PacketSeq(42));
+    }
+
+    #[test]
+    fn reorder_wraparound_reassembled() {
+        // next_seq 从 MAX-1 开始，跨越回绕点乱序到达。
+        let mut rb = ReorderBuffer::new(64);
+        rb.reset(u64::MAX - 1);
+        for seq in [0u64, u64::MAX, 2, u64::MAX - 1, 1] {
+            rb.push(seq, vec![(seq & 0xFF) as u8]);
+        }
+        // 缺的包还没到时，啥也吐不出（next_seq=MAX-1 在缓冲中，应能吐）。
+        let out = rb.pop_in_order();
+        let seqs: Vec<u64> = out.iter().map(|(s, _)| *s).collect();
+        // 期望按序号空间顺序吐出：MAX-1, MAX, 0, 1, 2。
+        assert_eq!(
+            seqs,
+            vec![u64::MAX - 1, u64::MAX, 0, 1, 2],
+            "回绕点重排错误"
+        );
+        assert_eq!(rb.emitted(), 5);
+        // 旧实现（朴素比较）会在这里把 seq=0 误判为迟到丢弃：
+        // 0 < (u64::MAX - 1) 为真 → dropped_duplicate。本实现必须为 0。
+        assert_eq!(rb.dropped_duplicate(), 0);
+    }
+
+    #[test]
+    fn reorder_wraparound_late_duplicate() {
+        let mut rb = ReorderBuffer::new(64);
+        rb.reset(u64::MAX);
+        rb.push(u64::MAX, vec![0xAA]);
+        let out = rb.pop_in_order();
+        assert_eq!(out.len(), 1);
+        assert_eq!(rb.next_seq(), 0); // wrapping_add，不 panic
+        // 迟到包：seq=MAX-1 在回绕语义下早于 next_seq=0 → duplicate。
+        rb.push(u64::MAX - 1, vec![0xBB]);
+        assert_eq!(rb.dropped_duplicate(), 1);
+        // 新包正常接受。
+        rb.push(0, vec![0xCC]);
+        assert_eq!(rb.dropped_duplicate(), 1);
+        let out = rb.pop_in_order();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, 0);
+    }
+
+    #[test]
+    fn reorder_wraparound_overflow_drops_earliest() {
+        // 回绕场景的容量超限：丢弃"最早"（到 next_seq 前向距离最小）的包。
+        let mut rb = ReorderBuffer::new(4);
+        rb.reset(u64::MAX - 1);
+        // 依次推入 MAX-1, MAX, 0, 1, 2（5 个，容量 4）。
+        for seq in [u64::MAX - 1, u64::MAX, 0, 1, 2] {
+            rb.push(seq, vec![(seq & 0xFF) as u8]);
+        }
+        assert_eq!(rb.len(), 4);
+        assert_eq!(rb.dropped_overflow(), 1);
+        // 被丢的应是 MAX-1（最早），剩下 MAX, 0, 1, 2。
+        // 但 next_seq 仍是 MAX-1（已被丢弃）→ 吐不出（诚实不可恢复语义，P2）。
+        assert!(rb.pop_in_order().is_empty());
+        // 验证缓冲内容：再次推入 MAX 应判重复（仍在缓冲中）。
+        let dup_before = rb.dropped_duplicate();
+        rb.push(u64::MAX, vec![0xFF]);
+        assert_eq!(rb.dropped_duplicate(), dup_before + 1);
+    }
+
+    #[test]
+    fn reorder_loss_gap_stalls_honestly() {
+        // 丢包：缺 seq=1，0 到后 2 到了也吐不出 2（诚实等待，不跳过）。
+        let mut rb = ReorderBuffer::new(64);
+        rb.push(0, vec![0]);
+        rb.push(2, vec![2]);
+        rb.push(3, vec![3]);
+        let out = rb.pop_in_order();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, 0);
+        assert_eq!(rb.next_seq(), 1);
+        // 补上丢失的 1 → 2,3 连续吐出。
+        rb.push(1, vec![1]);
+        let out = rb.pop_in_order();
+        let seqs: Vec<u64> = out.iter().map(|(s, _)| *s).collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn reorder_pop_wraps_without_panic() {
+        // pop_in_order 在 next_seq=u64::MAX 时用 wrapping_add 推进（debug 不 panic）。
+        let mut rb = ReorderBuffer::new(64);
+        rb.reset(u64::MAX);
+        rb.push(u64::MAX, vec![0xAA]);
+        rb.push(0, vec![0xBB]);
+        let out = rb.pop_in_order();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0, u64::MAX);
+        assert_eq!(out[1].0, 0);
+        assert_eq!(rb.next_seq(), 1);
     }
 }

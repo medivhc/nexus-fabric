@@ -298,6 +298,43 @@ accept 线程，sync，零 tokio）把 SOCKS5/HTTP 显式代理映射为 fabric 
   则三种策略的切换逻辑与重排缓冲泄漏到每个调用点；策略新增（如
   `PerPacketWeighted`）将要求改动所有调用方。抽象成立。
 
+**S33（包序号回绕，2026-10-01 冻结，GAP-2）**：`multipath.rs` 的序号语义升级。
+
+**Contract hash**：`16df4f6106f0459e5974f180f28521e018324662`
+
+### 背景
+
+S32 的 `ReorderBuffer` 用朴素 `u64` 比较（`seq < next_seq`）判断迟到/重复，
+在序号回绕（`u64::MAX → 0`）时语义错误。GAP-2 要求序号源对齐 fabric 层
+（`nexus-fabric` QSEQ 契约），并正确处理回绕。
+
+### 冻结条款
+
+- **P1**：新增 `PacketSeq(u64)` 新类型，封装回绕感知的序号算术
+  （RFC 1982 风格 serial number arithmetic，模 2^64）：
+  - `PacketSeq::less(a, b)`：`a` 在序号空间中是否"早于" `b`
+    （`b.wrapping_sub(a) < 2^63` 且 `a != b` 时 `a < b`）；
+  - `PacketSeq::distance(a, b)`：从 `a` 到 `b` 的前向距离
+    （`b.wrapping_sub(a)`）。
+- **P2**：`ReorderBuffer` 内部比较全部改用 `PacketSeq` 语义：
+  - `push(seq)`：`seq` 落在 `[next_seq, next_seq + capacity)` 前向窗口内才接受；
+    落在窗口外（迟到超过窗口或过度超前）按重复/溢出计数丢弃；
+  - `pop_in_order()`：按回绕语义的后继（`wrapping_add(1)`）连续吐出。
+- **P3**：`ReorderBuffer::reset(next_seq)` 语义不变（调用方显式设置期望序号）。
+- **P4**：`PathScheduler::select` 的 `seq` 参数文档明确：per-packet 模式下调用方
+  应传入 `nexus-fabric` QSEQ 分配的序号（`send_datagram_seqed` 返回值）；
+  调度器本身不解释序号语义（仍为 `u64`，零行为变化）。
+- **P5**：现有 S32 单测全部保留且通过（回绕场景下朴素比较与回绕感知比较在
+  远离回绕点时一致；`u64::MAX` 附近的新单测覆盖差异）。
+
+### 不变量
+
+- 回绕点两侧的排序正确：`PacketSeq(u64::MAX).next()` == `PacketSeq(0)`，
+  且 `less(MAX, 0)` 为真、`less(0, MAX)` 为假。
+- 缓冲窗口语义：任意时刻缓冲内序号互异且全部落在
+  `[next_seq, next_seq + capacity)` 前向窗口内（回绕意义下）。
+- 容量有界：`len() <= capacity` 恒成立（含回绕场景）。
+
 ## Side Effects
 
 - TUN 设备读写（`TunDevice::read` / `write`）。

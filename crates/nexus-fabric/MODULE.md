@@ -82,6 +82,55 @@ quinn-proto driver runs on its own std threads (the repository is tokio-free).
 - 建连必须完成对端 `PeerId` 认证；认证失败不得建连。
 - `fabric-conn-roam`：传输中 rebind 后 CID 不变、载荷哈希一致、应用层可见停顿 < 5000ms（首版宽松）。
 
+## QSEQ：Fabric 层数据报序号（GAP-2 冻结契约）
+
+**Contract hash**：`16df4f6106f0459e5974f180f28521e018324662`
+
+### 背景与诚实边界
+
+多路径 per-packet 模式需要接收端重排缓冲的序号源。任务原目标是"复用 QUIC
+真实包号"，但经核查：
+
+1. **quinn-proto 0.11 未暴露包号**：`Connection::spaces[space].next_packet_number`
+   为私有字段，无 public API 可读（`vendor/quinn-proto/src/connection/mod.rs`
+   第 386–3766 行 public 方法清单中无包号相关项）。不 patch vendor 代码的前提下
+   **不可直接获取** —— 此为诚实记录的 blocker，不硬造。
+2. **线包号语义不适合重排**：QUIC 有 3 个独立包号空间
+   （Initial/Handshake/ApplicationData）；重传分配**新**包号；多个 datagram
+   可合并进同一个 QUIC 包。重排缓冲需要的是 *datagram 身份* 序号，而非
+   *传输* 序号 —— 线包号是错误的序号空间。
+
+因此定义 **fabric 层数据报序号**：在 `send_datagram` 调用边界（最接近 QUIC
+发送路径的应用可见点）按连接单调分配的 `u64` 回绕序号。这不是 QUIC 线包号，
+契约中明确区分，不混淆。
+
+### 冻结条款
+
+- **Q1**：`FabricConn` 维护每连接单调递增的 datagram 序号计数器（`u64`，
+  `wrapping_add(1)` 回绕），初值为 0。`send_datagram`（非序号版）不分配序号、
+  不影响计数器。
+- **Q2**（新增 API，纯增量、非破坏）：`send_datagram_seqed(&self, data: &[u8])
+  -> Result<u64, FabricError>`：分配序号 `s`（分配后计数器 `wrapping_add(1)`），
+  将 `s` 以 8 字节大端序 prepend 到载荷头部后经 QUIC datagram 发送；返回 `s`。
+  载荷长度限制：`data.len() <= 1192`（1200 上限减 8 字节序号头），超限返回
+  `FabricError::Transport`。
+- **Q3**（新增 API，纯增量、非破坏）：`recv_datagram_seqed(&self)
+  -> Result<(u64, Vec<u8>), FabricError>`：收到的 datagram 若长度 `< 8`，
+  返回 `FabricError::Transport("datagram too short for seq header")`；否则剥离
+  前 8 字节大端序为序号 `s`，返回 `(s, 剩余载荷)`。
+- **Q4**：序号分配与发送是原子的（同一 `send_datagram_seqed` 调用内完成，
+  不存在"取号后发送前"的竞态窗口）。
+- **Q5**：`send_datagram` / `recv_datagram`（非序号版）语义零变化；N1 mesh
+  现有路径不受影响。
+- **Q6**：序号是 per-connection 命名空间；不同连接的序号无可比性。
+  接收端必须按连接维护重排缓冲（`nexus-projection::ReorderBuffer` 按连接实例化）。
+
+### 不变量
+
+- 分配的序号在单连接内严格单调递增（模 2^64 回绕意义下）。
+- `recv_datagram_seqed` 返回的序号即发送端 `send_datagram_seqed` 返回的序号
+  （QUIC datagram 不可靠：允许丢包、允许乱序，不允许篡改/错位）。
+
 ## Verification
 
 最低：
