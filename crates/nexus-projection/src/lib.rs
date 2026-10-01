@@ -12,6 +12,7 @@
 //! [`MockTransport`] for tests/E4; [`FabricTransport`] wraps real
 //! `nexus-fabric::FabricConn` peers (3b-2).
 
+pub mod boost;
 pub mod dns;
 pub mod egress;
 pub mod path_link;
