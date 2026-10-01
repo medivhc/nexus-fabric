@@ -580,6 +580,7 @@ mod tests {
     /// HashMap 不直接用做 egress 键：EgressDescriptor 已派生 Hash，冒烟验证。
     #[test]
     fn egress_descriptor_hashable() {
+        use std::collections::HashMap;
         let mut map = HashMap::new();
         let e = EgressDescriptor::new("proxy", EgressKind::Proxy, 1);
         map.insert(e.clone(), 7u32);
