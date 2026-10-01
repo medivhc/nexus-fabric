@@ -193,14 +193,26 @@ accept 线程，sync，零 tokio）把 SOCKS5/HTTP 显式代理映射为 fabric 
   `/proc/net/tcp` + `/proc/net/udp`（P0 仅 IPv4；tcp6/udp6 后置）→
   按 (local, remote) 五元组找 socket inode → 遍历 `/proc/<pid>/fd/*`
   symlink 找 `socket:[inode]` → 读 `/proc/<pid>/comm` 得进程名。
-  非 Linux 用 `NoopAttributor`（恒返回 unknown）；Windows WFP 后置。
+- Windows 实现（`#[cfg(target_os = "windows")]`，W-PROCATTR，2026-10-01 冻结）：
+  `WindowsProcessAttributor`，经 iphlpapi 窄手写 FFI（`GetExtendedTcpTable` /
+  `GetExtendedUdpTable`，`TCP_TABLE_OWNER_PID_ALL` / `UDP_TABLE_OWNER_PID`），
+  不引入第三方 crate（与 `nexus-platform-windows` 的 wintun/dpapi 手写 extern
+  模式一致）。按 (local, remote) 五元组精确匹配找 `dwOwningPid` → 经
+  kernel32 Toolhelp32 快照（`CreateToolhelp32Snapshot` / `Process32FirstW` /
+  `Process32NextW`）取 exe 文件名。P0 仅 IPv4；IPv6 后置。
+  任何失败（表查询失败、五元组无匹配、快照失败、进程已退出）→
+  `Attribution::unknown()`，不 panic、不阻塞。归因在流建立时做一次，
+  不做 per-packet 归因，不做缓存（与 Linux 实现同复杂度）。
+  非 Linux/Windows 用 `NoopAttributor`（恒返回 unknown）；WFP 仍后置。
+- `PlatformAttributor`：Linux → `LinuxProcessAttributor`；Windows →
+  `WindowsProcessAttributor`；其余 → `NoopAttributor`。
 - `QosClass`：`High` / `Normal` / `Low` / `Background`；
   `QosConfig`：进程名精确匹配 → 类（P0；glob/正则后置）；
   无规则命中或 unknown → `Normal`。
 - 接入点：TUN 路径 TCP/UDP 流创建时（五元组查本机 socket）、语义入口
   accept 成功时（对端 socket 归因）。归因失败绝不影响流建立。
 - 不做：per-packet 归因、按类排队调度（会话层/路径层尚无排队机制，后置）、
-  IPv6、Windows WFP。
+  IPv6、Windows WFP（iphlpapi 已覆盖 P0 需求，WFP 仍后置）。
 
 **S27（路径联动）**：`PathLink` 拥有 `PathManager` + peer→`FabricConn`
 映射（依赖倒置：nexus-path 只发事件，联动胶水在 projection，见 S9）：
