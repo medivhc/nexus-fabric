@@ -58,7 +58,10 @@ fn dial_config_from_outbound(o: &OutboundConfig) -> Option<ProxyDialConfig> {
     match o.kind {
         OutboundKind::Shadowsocks => {
             let password = o.password.clone().filter(|s| !s.is_empty())?;
-            let method = o.method.clone().unwrap_or_else(|| "chacha20-ietf-poly1305".to_string());
+            let method = o
+                .method
+                .clone()
+                .unwrap_or_else(|| "chacha20-ietf-poly1305".to_string());
             // P1 只支持 chacha20-ietf-poly1305（标准 ss）。
             if method != "chacha20-ietf-poly1305" {
                 return None;
@@ -93,10 +96,7 @@ fn dial_config_from_outbound(o: &OutboundConfig) -> Option<ProxyDialConfig> {
 /// P3：从 proxy.yaml 选首个可用出站。
 pub fn select_outbound(proxy_yaml: &str) -> Option<ProxyDialConfig> {
     let config = nexus_proxy_config::parse(proxy_yaml).ok()?;
-    config
-        .outbounds
-        .iter()
-        .find_map(dial_config_from_outbound)
+    config.outbounds.iter().find_map(dial_config_from_outbound)
 }
 
 /// Proxy 转发引擎（dataplane 拥有）。

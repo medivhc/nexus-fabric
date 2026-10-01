@@ -802,9 +802,7 @@ impl TcpTerminator {
             .conns
             .values()
             .filter_map(|c| self.by_id.get(&c.stream_id).map(|k| (c, k)))
-            .find(|(_, k)| {
-                k.src_ip == dst_ip && k.src_port == dst_port && k.dst_port == src_port
-            })
+            .find(|(_, k)| k.src_ip == dst_ip && k.src_port == dst_port && k.dst_port == src_port)
             .map(|(_, k)| k.dst_ip)?;
         rewrite_src(pkt, orig)
     }

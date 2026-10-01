@@ -306,8 +306,11 @@ impl Dataplane {
                             }
                         }
                         // 驱动 engine（回包/重传/事件）。
-                        let more: Vec<Vec<u8>> =
-                            self.proxy_engine.as_mut().map(|e| e.poll()).unwrap_or_default();
+                        let more: Vec<Vec<u8>> = self
+                            .proxy_engine
+                            .as_mut()
+                            .map(|e| e.poll())
+                            .unwrap_or_default();
                         for pkt in more {
                             if self.tun.write(&pkt).is_ok() {
                                 self.with_stats(|s| s.tun_written += 1);

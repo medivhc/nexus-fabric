@@ -7,10 +7,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use nexus_projection::tcp::{TcpTerminator, ip_checksum, tcp_checksum};
-use nexusd::dataplane::{Dataplane, DataplaneConfig};
 use nexus_projection::{MockTun, TunDevice};
+use nexusd::dataplane::{Dataplane, DataplaneConfig};
 use serde_json::json;
 
+#[allow(clippy::too_many_arguments)]
 fn craft_tcp(
     src_ip: [u8; 4],
     dst_ip: [u8; 4],
@@ -132,7 +133,7 @@ fn run() -> serde_json::Value {
     let _ = dp.process_one().expect("syn");
     let _ = mock.lock().unwrap().take_written();
     // 10000 个小 DATA 包。
-    let _payload = vec![0xCDu8; 100];
+    let _payload = [0xCDu8; 100];
     let n_pkts = 10_000u64;
     // 先完成握手（需要 server seq）。
     // 简化：直接测 SYN 包处理（终结器创建连接路径）。

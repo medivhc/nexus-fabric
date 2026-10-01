@@ -1058,6 +1058,8 @@ dependencies = [
 name = "nexusd"
 version = "0.1.0"
 dependencies = [
+ "chacha20poly1305",
+ "hkdf",
  "nexus",
  "nexus-compute",
  "nexus-connectivity",
@@ -1067,15 +1069,18 @@ dependencies = [
  "nexus-dns",
  "nexus-ingress",
  "nexus-network",
+ "nexus-outbound-trojan",
  "nexus-path",
  "nexus-platform",
  "nexus-platform-windows",
  "nexus-projection",
  "nexus-proxy-config",
+ "nexus-proxy-transport",
  "nexus-registry",
  "nexus-service",
  "nexus-workspace",
  "serde_json",
+ "sha1",
  "signal-hook",
  "toml",
 ]

@@ -583,10 +583,10 @@ impl ProcessAttributor for NoopAttributor {
 /// [`WindowsProcessAttributor`] on Windows, [`NoopAttributor`] elsewhere.
 #[cfg(target_os = "linux")]
 pub use LinuxProcessAttributor as PlatformAttributor;
-#[cfg(target_os = "windows")]
-pub use WindowsProcessAttributor as PlatformAttributor;
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub use NoopAttributor as PlatformAttributor;
+#[cfg(target_os = "windows")]
+pub use WindowsProcessAttributor as PlatformAttributor;
 
 #[cfg(test)]
 mod tests {

@@ -16,22 +16,21 @@ use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use nexus_projection::tun_rs_device::TunRsDevice;
 use nexus_projection::TunDevice;
+use nexus_projection::tun_rs_device::TunRsDevice;
 use nexusd::dataplane::{Dataplane, DataplaneConfig};
 use serde_json::json;
 
+/// 捕获的 STREAM 帧（目标地址，原始包）。
+type CapturedFrames = Vec<(Ipv4Addr, Vec<u8>)>;
+
 /// 捕获 N1Sender：记录 STREAM 帧（E4 验证 S4/S5/S6）。
 struct CaptureSender {
-    frames: Arc<Mutex<Vec<(Ipv4Addr, Vec<u8>)>>>,
+    frames: Arc<Mutex<CapturedFrames>>,
 }
 
 impl nexus_network::n1::bridge::N1Sender for CaptureSender {
-    fn send_to_mesh(
-        &self,
-        dst: Ipv4Addr,
-        packet: &[u8],
-    ) -> Result<(), nexus_network::n1::N1Error> {
+    fn send_to_mesh(&self, dst: Ipv4Addr, packet: &[u8]) -> Result<(), nexus_network::n1::N1Error> {
         self.frames.lock().unwrap().push((dst, packet.to_vec()));
         Ok(())
     }
@@ -118,9 +117,7 @@ fn run() -> serde_json::Value {
     };
     eprintln!("[e4] connected!");
     let connect_ms = t0.elapsed().as_millis();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .ok();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
 
     // 6. 发送数据。
     if let Err(e) = stream.write_all(b"hello-e4") {

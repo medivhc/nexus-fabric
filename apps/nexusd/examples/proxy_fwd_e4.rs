@@ -4,6 +4,7 @@
 //! - TCP echo (127.0.0.1:18080)
 //! - UDP echo (127.0.0.1:18081)
 //! - SOCKS5 代理 (127.0.0.1:11080, CONNECT + UDP ASSOCIATE)
+//!
 //! 然后经 ProxyEngine 转发真实流量，验证：
 //! - TCP: SYN → 握手 → 数据 → echo 回包
 //! - UDP: datagram → echo 回包
@@ -57,6 +58,7 @@ fn tcp_checksum(src: [u8; 4], dst: [u8; 4], tcp_seg: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn craft_tcp(
     src_ip: [u8; 4],
     dst_ip: [u8; 4],
@@ -160,13 +162,8 @@ fn start_udp_echo(addr: &str) {
     let sock = UdpSocket::bind(addr).unwrap();
     std::thread::spawn(move || {
         let mut buf = [0u8; 65535];
-        loop {
-            match sock.recv_from(&mut buf) {
-                Ok((n, src)) => {
-                    let _ = sock.send_to(&buf[..n], src);
-                }
-                Err(_) => break,
-            }
+        while let Ok((n, src)) = sock.recv_from(&mut buf) {
+            let _ = sock.send_to(&buf[..n], src);
         }
     });
 }
@@ -224,8 +221,7 @@ fn handle_socks5(mut s: TcpStream) {
                 return;
             }
         };
-        if s
-            .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        if s.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
             .is_err()
         {
             return;
@@ -279,43 +275,36 @@ fn handle_socks5(mut s: TcpStream) {
         }
         // UDP 中继循环。
         let mut buf = [0u8; 65535];
-        loop {
-            match udp.recv_from(&mut buf) {
-                Ok((n, src)) => {
-                    // 解析 SOCKS5 UDP 头，提取目标和载荷。
-                    if n < 10 || buf[2] != 0x00 {
-                        continue;
-                    }
-                    let dst: SocketAddr = match buf[3] {
-                        0x01 => {
-                            let ip = std::net::IpAddr::V4(Ipv4Addr::new(
-                                buf[4], buf[5], buf[6], buf[7],
-                            ));
-                            let port = u16::from_be_bytes([buf[8], buf[9]]);
-                            SocketAddr::new(ip, port)
-                        }
-                        _ => continue,
-                    };
-                    let payload = &buf[10..n];
-                    // 转发到目标，回包再封装。
-                    let tmp = UdpSocket::bind("127.0.0.1:0").unwrap();
-                    tmp.set_read_timeout(Some(Duration::from_secs(5))).ok();
-                    if tmp.send_to(payload, dst).is_err() {
-                        continue;
-                    }
-                    let mut rbuf = [0u8; 65535];
-                    if let Ok((rn, _)) = tmp.recv_from(&mut rbuf) {
-                        let mut out = vec![0x00, 0x00, 0x00, 0x01];
-                        match dst.ip() {
-                            std::net::IpAddr::V4(v4) => out.extend_from_slice(&v4.octets()),
-                            _ => continue,
-                        }
-                        out.extend_from_slice(&dst.port().to_be_bytes());
-                        out.extend_from_slice(&rbuf[..rn]);
-                        let _ = udp.send_to(&out, src);
-                    }
+        while let Ok((n, src)) = udp.recv_from(&mut buf) {
+            // 解析 SOCKS5 UDP 头，提取目标和载荷。
+            if n < 10 || buf[2] != 0x00 {
+                continue;
+            }
+            let dst: SocketAddr = match buf[3] {
+                0x01 => {
+                    let ip = std::net::IpAddr::V4(Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]));
+                    let port = u16::from_be_bytes([buf[8], buf[9]]);
+                    SocketAddr::new(ip, port)
                 }
-                Err(_) => break,
+                _ => continue,
+            };
+            let payload = &buf[10..n];
+            // 转发到目标，回包再封装。
+            let tmp = UdpSocket::bind("127.0.0.1:0").unwrap();
+            tmp.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            if tmp.send_to(payload, dst).is_err() {
+                continue;
+            }
+            let mut rbuf = [0u8; 65535];
+            if let Ok((rn, _)) = tmp.recv_from(&mut rbuf) {
+                let mut out = vec![0x00, 0x00, 0x00, 0x01];
+                match dst.ip() {
+                    std::net::IpAddr::V4(v4) => out.extend_from_slice(&v4.octets()),
+                    _ => continue,
+                }
+                out.extend_from_slice(&dst.port().to_be_bytes());
+                out.extend_from_slice(&rbuf[..rn]);
+                let _ = udp.send_to(&out, src);
             }
         }
     }
@@ -402,7 +391,16 @@ fn test_tcp(engine: &mut ProxyEngine) -> bool {
     seq += 1;
 
     // 2. ACK（完成握手）
-    let ack = craft_tcp(src_ip, dst_ip, src_port, dst_port, seq, srv_seq + 1, 0x10, &[]);
+    let ack = craft_tcp(
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        seq,
+        srv_seq + 1,
+        0x10,
+        &[],
+    );
     let _ = engine.handle_packet(&ack);
     // 驱动 engine（dial 在后台线程）。
     std::thread::sleep(Duration::from_millis(1500));
@@ -410,7 +408,16 @@ fn test_tcp(engine: &mut ProxyEngine) -> bool {
 
     // 3. 发送数据
     let data = b"hello proxy tcp";
-    let data_pkt = craft_tcp(src_ip, dst_ip, src_port, dst_port, seq, srv_seq + 1, 0x18, data);
+    let data_pkt = craft_tcp(
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        seq,
+        srv_seq + 1,
+        0x18,
+        data,
+    );
     let _ = engine.handle_packet(&data_pkt);
 
     // 4. 等待 echo 回包（轮询 poll）。
