@@ -31,6 +31,10 @@
 - `nexus-compute`
 - `nexus-diagnostics`
 - `nexus-platform`
+- `nexus-projection`（统一数据面：TUN/分类器/多路径/Boost）
+- `nexus-connectivity`（统一数据面：CAKE-like QoS）
+- `nexus-dns`（统一数据面：UnifiedDns）
+- `nexus-path`（统一数据面：PathManager/EWMA 选路，Boost 联动）
 
 ## Forbidden Dependencies
 
@@ -100,6 +104,30 @@
   proxy 同理。`enabled=false` 时调度器不实例化（零开销）。
 - 热加载：`[qos]` 任一字段变化 → `NeedsRestart`（子系统启停/重配）；
   无变化时沿用既有分类。
+
+### 统一数据面装配（D1-D6，scenarios/product/dataplane_unified.toml，2026-10-01 冻结）
+
+- **D1（TUN 所有权）**：`nexusd <config-folder>` 启动数据面时，创建并持有单个 TUN
+  设备（Linux: `tun-rs`，设备名 `nexus0`，MTU 1500）。TUN 是唯一包入口；
+  不存在"Clash TUN 与 Mesh TUN 抢设备"（设计文档 §6）。
+- **D2（分类管线）**：从 TUN 读取的每个 IPv4 包 → `PacketClassifier::classify()`：
+  - `Mesh{..}` → N1 转发（`network.toml` 未配置则计数 `mesh_dropped_no_n1`）；
+  - `Proxy` → proxy 转发（`proxy.yaml` 未配置则计数 `proxy_dropped_no_proxy`）；
+  - `Direct` → 直连（MVP 计数 `direct_forwarded`，实际经系统路由）；
+  - `Drop` → 计数 `dropped`。
+- **D3（DNS 拦截）**：UDP 目的端口 53 的包短路分类器 → `UnifiedDns::resolve()` →
+  构造 DNS 响应写回 TUN（`dns_answered` 计数；响应包源端口 53）。
+- **D4（QoS）**：`[qos].enabled=true` 时，分类后、转发前经过 `CakeScheduler`：
+  `enqueue()` 拒绝则计数 `qos_dropped`；`enabled=false` 时零开销直通
+  （`qos_bypassed=true` 可观测）。
+- **D5（多路径）**：`[multipath].strategy` 非 `Single` 时，`PathScheduler::select()`
+  选择 egress；MVP 默认 `Single` 直通。
+- **D6（Boost）**：`[boost].enabled=true` 时，分类器构造传入 `PathManager`，
+  mesh 分类启用 EWMA 只读选路（S30）；禁用时 `candidates=[]`。
+- 可观测：`DataplaneStats { mesh_forwarded, proxy_forwarded, direct_forwarded,
+  dropped, dns_answered, qos_dropped }`，经 LocalAPI `/localapi/v0/dataplane/stats` 暴露。
+- 不变量：单 TUN（D1）；分类器是唯一分类入口（S29）；DNS 不泄露 mesh 内名
+  （nexus-dns S-unified）；QoS 禁用时零开销（D4）。
 
 ### 常规要求
 

@@ -16,6 +16,10 @@ nexus-discovery = { path = "../../crates/nexus-discovery" }
 nexus-ingress = { path = "../../crates/nexus-ingress" }
 nexus-network = { path = "../../crates/nexus-network" }
 nexus-proxy-config = { path = "../../crates/nexus-proxy-config" }
+nexus-projection = { path = "../../crates/nexus-projection" }
+nexus-connectivity = { path = "../../crates/nexus-connectivity" }
+nexus-dns = { path = "../../crates/nexus-dns" }
+nexus-path = { path = "../../crates/nexus-path" }
 toml = "0.8"
 nexus-service = { path = "../../crates/nexus-service" }
 nexus-workspace = { path = "../../crates/nexus-workspace" }
