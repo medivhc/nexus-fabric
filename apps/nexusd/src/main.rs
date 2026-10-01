@@ -110,6 +110,17 @@ fn build_dataplane_config(loaded: &LoadedConfig) -> nexusd::dataplane::Dataplane
         }
     }
 
+    // Boost：从 network.toml [boost] 解析 enabled（D6）。
+    // B3 残余修复：不再硬编码 false。
+    let boost_enabled = loaded
+        .network_toml
+        .as_deref()
+        .and_then(|s| s.parse::<toml::Value>().ok())
+        .and_then(|v| v.get("boost").cloned())
+        .and_then(|b| b.get("enabled").cloned())
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+
     DataplaneConfig {
         mesh_cidrs,
         bypass_cidrs,
@@ -117,7 +128,7 @@ fn build_dataplane_config(loaded: &LoadedConfig) -> nexusd::dataplane::Dataplane
         dns_config: None, // MVP：用默认（dns.toml 解析后置）
         qos_enabled,
         qos_config,
-        boost_enabled: false, // MVP：Boost 联动后置
+        boost_enabled,
         n1_configured: loaded.network_toml.is_some(),
         proxy_configured: loaded.proxy_yaml.is_some(),
     }
