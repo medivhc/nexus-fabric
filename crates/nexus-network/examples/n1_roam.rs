@@ -607,6 +607,8 @@ fn child_b(
         .connection_for(&peer)
         .map(|c| c.connection_id())
         .unwrap_or(0);
+    // cid_after 在 ROAM 处理器 rebind 成功后更新（T-6 修复：真实测量 CID 不变性）。
+    let mut cid_after = cid_before;
     // VPI 路由：10.144.0.0/24 → A。
     let _pump = start_pump(
         tun,
@@ -692,6 +694,8 @@ fn child_b(
                     match conn.rebind() {
                         Ok(()) => {
                             eprintln!("[child b] proactive rebind ok");
+                            // T-6 修复：记录 rebind 后的真实 CID，用于 BYE 的 id_unchanged 校验。
+                            cid_after = conn.connection_id();
                             // 手动上报事件（watcher 未触发，故无自动事件）。
                             sink.emit(nexus_network::n1::N1Event {
                                 peer,
@@ -747,10 +751,8 @@ fn child_b(
         .join()
         .map_err(|_| "receiver panicked".to_string())?
         .map_err(|e| format!("receiver: {e}"))?;
-    // 注意：不在此处调 mgr.connection_for() 取 cid_after——peers 锁可能被
-    // 后台线程持有导致死锁（B 在 receiver.join 后卡死即因此）。
-    // CID 不变性由 A 端 BYE 做权威校验；B 端直接沿用 cid_before 上报。
-    let cid_after = cid_before;
+    // cid_after 已在 ROAM 处理器 rebind 成功后记录（T-6）。
+    // 此处不再调 mgr.connection_for()——peers 锁可能被后台线程持有导致死锁。
     // BYE 用 writeln! 且忽略错误：父进程可能已退出，stdout pipe 断裂时
     // println! 会 panic。用 let _ 避免 broken pipe 导致子进程异常终止。
     // 同时写文件信号：stdout pipe 在进程退出时可能丢数据，父进程轮询文件更可靠。
