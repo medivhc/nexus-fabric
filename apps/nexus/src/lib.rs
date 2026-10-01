@@ -5070,6 +5070,228 @@ pub fn proxy_speedtest() -> Result<Value, NexusError> {
     result
 }
 
+// ---------- bufferbloat 诊断（PRODUCT §11 诊断扩展） ----------
+
+/// bufferbloat 诊断配置。
+#[derive(Debug, Clone)]
+pub struct BufferbloatConfig {
+    /// 代理服务器地址（如 `127.0.0.1:7897`）。
+    pub proxy_addr: std::net::SocketAddr,
+    /// 上行打满时长。
+    pub duration: std::time::Duration,
+    /// 判定阈值：负载延迟 - 基准延迟 > threshold_ms 判为本地 bufferbloat。
+    pub threshold_ms: u64,
+    /// 打满时的并发 TCP 连接数。
+    pub saturate_conns: usize,
+    /// 每次延迟测量的采样次数（取中位数）。
+    pub probe_samples: usize,
+}
+
+impl Default for BufferbloatConfig {
+    fn default() -> Self {
+        Self {
+            // 默认值由调用方覆盖；此处占位避免 Default 被误用。
+            proxy_addr: "127.0.0.1:7897".parse().expect("default proxy addr"),
+            duration: std::time::Duration::from_secs(10),
+            threshold_ms: 100,
+            saturate_conns: 4,
+            probe_samples: 5,
+        }
+    }
+}
+
+/// bufferbloat 诊断结论。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferbloatVerdict {
+    /// 延迟暴涨：拥塞在用户到代理段，QoS 可缓解。
+    BloatLocal,
+    /// 延迟稳定：拥塞在代理服务器之后（或无拥塞），建议换节点。
+    NoBloatUpstream,
+}
+
+impl BufferbloatVerdict {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::BloatLocal => "BUFFERBLOAT_LOCAL",
+            Self::NoBloatUpstream => "NO_BLOAT_UPSTREAM",
+        }
+    }
+
+    pub fn advice(&self) -> &'static str {
+        match self {
+            Self::BloatLocal => "拥塞在用户到代理段，QoS 整形可缓解",
+            Self::NoBloatUpstream => "代理之后拥塞或无拥塞，建议换节点或检查代理服务器",
+        }
+    }
+}
+
+/// 纯函数：按阈值判定 bufferbloat 结论（可单测，无 I/O）。
+pub fn classify_bufferbloat(
+    baseline_ms: u64,
+    loaded_ms: u64,
+    threshold_ms: u64,
+) -> BufferbloatVerdict {
+    let delta = loaded_ms.saturating_sub(baseline_ms);
+    if delta > threshold_ms {
+        BufferbloatVerdict::BloatLocal
+    } else {
+        BufferbloatVerdict::NoBloatUpstream
+    }
+}
+
+/// 纯函数：中位数（可单测；空切片返回 0）。
+pub fn median_ms(values: &mut [u64]) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable();
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        values[mid]
+    } else {
+        // 偶数个取中间两数的平均（下取整），避免抖动。
+        (values[mid - 1] + values[mid]) / 2
+    }
+}
+
+/// 单次 TCP 建连延迟测量（ms）。失败返回 None（调用方决定是否重试/降级）。
+fn probe_once(addr: &std::net::SocketAddr, timeout: std::time::Duration) -> Option<u64> {
+    let start = std::time::Instant::now();
+    let socket = std::net::TcpStream::connect_timeout(addr, timeout).ok()?;
+    let ms = start.elapsed().as_millis().max(1) as u64;
+    drop(socket);
+    Some(ms)
+}
+
+/// 多次测量取中位数；全部失败返回 None。
+fn probe_median(
+    addr: &std::net::SocketAddr,
+    samples: usize,
+    timeout: std::time::Duration,
+) -> Option<u64> {
+    let mut rtts: Vec<u64> = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        if let Some(ms) = probe_once(addr, timeout) {
+            rtts.push(ms);
+        }
+    }
+    if rtts.is_empty() {
+        None
+    } else {
+        Some(median_ms(&mut rtts))
+    }
+}
+
+/// 上行打满工作线程：持续向代理地址发送随机数据，直到收到停止信号。
+/// 代理可能因协议无效关闭连接；关闭后立即重连，保持上行饱和。
+fn saturate_worker(
+    addr: std::net::SocketAddr,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::io::Write;
+    // 64KB 随机块（固定种子 Xorshift，避免每次分配 RNG 开销）。
+    let mut block = vec![0u8; 64 * 1024];
+    let mut x: u64 = 0x9E3779B97F4A7C15;
+    for b in block.iter_mut() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *b = (x >> 33) as u8;
+    }
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut stream = match std::net::TcpStream::connect_timeout(
+            &addr,
+            std::time::Duration::from_secs(5),
+        ) {
+            Ok(s) => s,
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                continue;
+            }
+        };
+        let _ = stream.set_nodelay(true);
+        // 持续发送直到对端关闭或收到停止信号。
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            match stream.write_all(&block) {
+                Ok(()) => {}
+                Err(_) => break, // 对端关闭，重连
+            }
+        }
+    }
+}
+
+/// `nexus proxy bufferbloat-test` 入口：
+///
+/// 1. 空载测基准延迟（TCP connect 中位数）；
+/// 2. 启动 N 个打满线程持续发送；
+/// 3. 负载下再测延迟中位数；
+/// 4. 停止打满，按阈值判定。
+///
+/// 返回结构化 JSON（含 verdict / baseline_ms / loaded_ms / delta_ms / threshold_ms）。
+pub fn proxy_bufferbloat_test(config: &BufferbloatConfig) -> Result<serde_json::Value, NexusError> {
+    let probe_timeout = std::time::Duration::from_secs(5);
+
+    // 1. 基准延迟（空载）。
+    let baseline_ms = probe_median(&config.proxy_addr, config.probe_samples, probe_timeout)
+        .ok_or_else(|| NexusError::Internal {
+            message: format!("baseline probe failed: cannot connect to {}", config.proxy_addr),
+        })?;
+
+    // 2. 启动打满线程。
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut handles = Vec::with_capacity(config.saturate_conns);
+    for _ in 0..config.saturate_conns {
+        let addr = config.proxy_addr;
+        let stop_clone = std::sync::Arc::clone(&stop);
+        handles.push(
+            std::thread::Builder::new()
+                .name("bloat-saturate".to_string())
+                .spawn(move || saturate_worker(addr, stop_clone))
+                .map_err(|e| NexusError::Internal {
+                    message: format!("spawn saturate worker failed: {e}"),
+                })?,
+        );
+    }
+
+    // 3. 负载下测延迟（打满进行中）。
+    // 先等 1s 让上行真正跑满，避免测量时带宽还没起来；测完后补足剩余时长，
+    // 保证总打满时长 ≈ duration（让 buffer 有充分时间堆积）。
+    let saturate_start = std::time::Instant::now();
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let loaded_opt = probe_median(&config.proxy_addr, config.probe_samples, probe_timeout);
+    let elapsed = saturate_start.elapsed();
+    if elapsed < config.duration {
+        std::thread::sleep(config.duration - elapsed);
+    }
+
+    // 4. 停止打满，回收线程。
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for h in handles {
+        let _ = h.join();
+    }
+
+    let loaded_ms = loaded_opt.ok_or_else(|| NexusError::Internal {
+        message: "loaded probe failed: cannot connect under load".to_string(),
+    })?;
+
+    // 5. 判定。
+    let verdict = classify_bufferbloat(baseline_ms, loaded_ms, config.threshold_ms);
+    let delta_ms = loaded_ms.saturating_sub(baseline_ms);
+
+    Ok(serde_json::json!({
+        "verdict": "PASS",
+        "command": "proxy bufferbloat-test",
+        "proxy": config.proxy_addr.to_string(),
+        "baseline_ms": baseline_ms,
+        "loaded_ms": loaded_ms,
+        "delta_ms": delta_ms,
+        "threshold_ms": config.threshold_ms,
+        "diagnosis": verdict.as_str(),
+        "advice": verdict.advice(),
+        "duration_secs": config.duration.as_secs(),
+    }))
+}
+
 /// Run a remote resource access (e.g. service, compute, internet-access).
 ///
 /// This is the CLI entry point for executing resource access flows.
@@ -10430,4 +10652,92 @@ pub fn strategy_hot_reload_flow() -> Result<Value, NexusError> {
             "next_hops": next_hops,
         },
     }))
+}
+
+#[cfg(test)]
+mod bufferbloat_tests {
+    use super::*;
+
+    #[test]
+    fn classify_delta_above_threshold_is_local() {
+        // 延迟暴涨 425ms > 100ms 阈值 → 本地 bufferbloat。
+        assert_eq!(
+            classify_bufferbloat(25, 450, 100),
+            BufferbloatVerdict::BloatLocal
+        );
+    }
+
+    #[test]
+    fn classify_delta_within_threshold_is_upstream() {
+        // 延迟仅 +5ms ≤ 100ms → 代理之后拥塞（或无拥塞）。
+        assert_eq!(
+            classify_bufferbloat(25, 30, 100),
+            BufferbloatVerdict::NoBloatUpstream
+        );
+    }
+
+    #[test]
+    fn classify_delta_equal_threshold_is_upstream() {
+        // 边界：delta == threshold 不算暴涨（严格大于才判）。
+        assert_eq!(
+            classify_bufferbloat(25, 125, 100),
+            BufferbloatVerdict::NoBloatUpstream
+        );
+    }
+
+    #[test]
+    fn classify_loaded_below_baseline_is_upstream() {
+        // 负载延迟反而更低（抖动）：saturating_sub → 0，不误判。
+        assert_eq!(
+            classify_bufferbloat(30, 25, 100),
+            BufferbloatVerdict::NoBloatUpstream
+        );
+    }
+
+    #[test]
+    fn classify_custom_threshold() {
+        // 自定义阈值生效：delta=50，阈值 30 → 本地；阈值 100 → 上游。
+        assert_eq!(
+            classify_bufferbloat(20, 70, 30),
+            BufferbloatVerdict::BloatLocal
+        );
+        assert_eq!(
+            classify_bufferbloat(20, 70, 100),
+            BufferbloatVerdict::NoBloatUpstream
+        );
+    }
+
+    #[test]
+    fn median_odd_count() {
+        let mut v = vec![30u64, 10, 20];
+        assert_eq!(median_ms(&mut v), 20);
+    }
+
+    #[test]
+    fn median_even_count() {
+        // 偶数个取中间两数平均下取整：(20+30)/2=25。
+        let mut v = vec![40u64, 10, 30, 20];
+        assert_eq!(median_ms(&mut v), 25);
+    }
+
+    #[test]
+    fn median_single() {
+        let mut v = vec![42u64];
+        assert_eq!(median_ms(&mut v), 42);
+    }
+
+    #[test]
+    fn median_empty_is_zero() {
+        let mut v: Vec<u64> = vec![];
+        assert_eq!(median_ms(&mut v), 0);
+    }
+
+    #[test]
+    fn verdict_strings() {
+        assert_eq!(BufferbloatVerdict::BloatLocal.as_str(), "BUFFERBLOAT_LOCAL");
+        assert_eq!(
+            BufferbloatVerdict::NoBloatUpstream.as_str(),
+            "NO_BLOAT_UPSTREAM"
+        );
+    }
 }
