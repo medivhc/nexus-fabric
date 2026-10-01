@@ -247,6 +247,12 @@ A ◄──TURN relay──► B          ① 中继建连（现有 4b + fallbac
 
 - Symmetric NAT 只做**有界**端口预测；`Δ` 随机时明确走 relay，
   不宣称 symmetric 穿透能力。
+- **对称–对称组合不在首期范围**（2026-10-02 接线阶段验证结论）：
+  quinn client 严格校验源端口（`remote_may_migrate()=false`），
+  对称 NAT 的响应必从新映射端口发出，client 恒丢弃——在冻结的
+  spray 语义（围绕本地 base 打对端 IP）下数学上不可达。
+  首期覆盖 cone–cone 与 cone–symmetric；对称–对称如需支持，
+  走 requirement-change（改 spray 语义或引入 server 侧迁移）。
 - 打洞成功率是统计量，E4 只证明机制正确，不承诺百分比；
   端口预测场景的 E4 期望包含"快速放弃"分支。
 - **打洞成功不等于路径最优**：direct 只是竞速候选之一，
