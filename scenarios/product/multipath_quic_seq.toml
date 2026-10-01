@@ -1,0 +1,46 @@
+schema_version = 1
+id = "product.multipath-quic-seq"
+title = "多路径序号源：fabric 层 datagram 序号 + 回绕感知重排"
+evidence_strength = "E4"
+requirement = "GAP-2"
+
+[given]
+topology = "loopback UDP, two FabricConn endpoints in one process (example binary)"
+payload_datagram = "seqed datagrams with 8-byte BE header, sent in deliberate out-of-order pattern + wraparound"
+
+# 可执行 E4：example 启动双端点 -> 建连 ->
+# 发送端用 send_datagram_seqed 发 N 个包（含回绕点附近的序号）->
+# 接收端用 recv_datagram_seqed 收包 -> 喂入 ReorderBuffer（回绕感知）->
+# 按序吐出并校验序号连续、载荷完整 -> 输出 JSON。
+[when]
+command = "cargo run --quiet -p nexus-fabric --example seqed_reorder -- --json"
+
+# 冻结期望（Q1-Q6/P1-P5）。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+# 发送端分配的序号严格单调递增（模 2^64）。
+[[expect]]
+field = "sender.seq_monotonic"
+equals = true
+
+# 回绕点被覆盖：分配的序号跨越 u64::MAX -> 0。
+[[expect]]
+field = "sender.wraparound_covered"
+equals = true
+
+# 接收端重排后序号连续（乱序输入 -> 有序输出）。
+[[expect]]
+field = "reorder.in_order"
+equals = true
+
+# 载荷完整性：按序吐出的载荷与发送端一致。
+[[expect]]
+field = "reorder.payload_match"
+equals = true
+
+# 序号头往返：接收端读到的序号 == 发送端分配的序号。
+[[expect]]
+field = "seq_header.roundtrip"
+equals = true
