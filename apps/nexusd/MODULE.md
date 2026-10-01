@@ -35,6 +35,7 @@
 - `nexus-connectivity`（统一数据面：CAKE-like QoS）
 - `nexus-dns`（统一数据面：UnifiedDns）
 - `nexus-path`（统一数据面：PathManager/EWMA 选路，Boost 联动）
+- `signal-hook`（R4：Unix SIGTERM/SIGINT 优雅关闭；MIT/Apache-2.0；`default-features = false`）
 
 ## Forbidden Dependencies
 

@@ -27,6 +27,9 @@ nexus-compute = { path = "../../crates/nexus-compute" }
 nexus-diagnostics = { path = "../../crates/nexus-diagnostics" }
 nexus-platform = { path = "../../crates/nexus-platform" }
 serde_json = { version = "1", default-features = false, features = ["std"] }
+# R4：Unix 信号处理（SIGTERM/SIGINT → 优雅关闭，§13.4）。
+# MIT/Apache-2.0；纯 Rust + libc；default-features = false（最小 surface）。
+signal-hook = { version = "0.3", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 nexus-platform-windows = { path = "../../crates/nexus-platform-windows" }

@@ -28,15 +28,18 @@
 
 #![forbid(unsafe_code)]
 
-mod config;
 mod watcher;
 
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
+use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use config::{ConfigDir, LoadedConfig};
+use nexusd::assembly;
+use nexusd::config::{self, ConfigDir, LoadedConfig};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -74,68 +77,16 @@ fn main() -> ExitCode {
     }
 }
 
-/// 从 LoadedConfig 组装 DataplaneConfig（D1-D6）。
-fn build_dataplane_config(loaded: &LoadedConfig) -> nexusd::dataplane::DataplaneConfig {
-    use nexusd::dataplane::DataplaneConfig;
-
-    // Mesh CIDR：network.toml 存在时默认 10.0.0.0/8（MVP；完整解析后置）。
-    let mesh_cidrs = if loaded.network_toml.is_some() {
-        vec!["10.0.0.0/8".to_string()]
-    } else {
-        vec![]
-    };
-    // Bypass：常见内网段（与 Clash Verge 默认一致）。
-    let bypass_cidrs = vec!["192.168.0.0/16".to_string(), "172.16.0.0/12".to_string()];
-
-    // QoS：从 daemon.toml [qos] 映射。
-    let qos_enabled = loaded.daemon.qos.enabled;
-    let mut qos_config = nexus_connectivity::cake::CakeConfig::default();
-    if qos_enabled {
-        qos_config.quantum = loaded.daemon.qos.quantum;
-        qos_config.high_priority_ports = loaded.daemon.qos.high_priority_ports.clone();
-        // mesh/proxy_upload_mbps 映射为 rate_limit（MVP：取最小非零值）。
-        let mesh_bps = loaded.daemon.qos.mesh_upload_mbps * 1_000_000 / 8;
-        let proxy_bps = loaded.daemon.qos.proxy_upload_mbps * 1_000_000 / 8;
-        let rate_bps = match (mesh_bps, proxy_bps) {
-            (0, 0) => 0,
-            (m, 0) => m,
-            (0, p) => p,
-            (m, p) => m.min(p),
-        };
-        if rate_bps > 0 {
-            // burst 默认为 1 秒的量。
-            if let Ok(limit) = nexus_connectivity::qos::BandwidthLimit::new(rate_bps, rate_bps) {
-                qos_config.rate_limit = Some(limit);
-            }
-        }
-    }
-
-    // Boost：从 network.toml [boost] 解析 enabled（D6）。
-    // B3 残余修复：不再硬编码 false。
-    let boost_enabled = loaded
-        .network_toml
-        .as_deref()
-        .and_then(|s| s.parse::<toml::Value>().ok())
-        .and_then(|v| v.get("boost").cloned())
-        .and_then(|b| b.get("enabled").cloned())
-        .and_then(|e| e.as_bool())
-        .unwrap_or(false);
-
-    DataplaneConfig {
-        mesh_cidrs,
-        bypass_cidrs,
-        dns_enabled: loaded.dns_toml.is_some(),
-        dns_config: None, // MVP：用默认（dns.toml 解析后置）
-        qos_enabled,
-        qos_config,
-        boost_enabled,
-        n1_configured: loaded.network_toml.is_some(),
-        proxy_configured: loaded.proxy_yaml.is_some(),
-    }
-}
-
-/// 数据面线程主循环：创建 TUN → 处理包 → 出错时退出线程（daemon 继续服务 LocalAPI）。
-fn run_dataplane(config: nexusd::dataplane::DataplaneConfig) {
+/// 数据面线程主循环：创建 TUN → 处理包 → 出错或收到关闭信号时退出线程。
+///
+/// R1：`n1_sender` 为 Some 时注入 dataplane（`set_n1_sender`），Mesh 包真发；
+/// 为 None 时保持 D2 计数降级。
+/// R4：每次循环检查 `shutdown` 标志，置位后退出（join 1s 超时由调用方执行）。
+fn run_dataplane(
+    config: nexusd::dataplane::DataplaneConfig,
+    shutdown: Arc<AtomicBool>,
+    n1_sender: Option<Arc<dyn nexus_network::n1::bridge::N1Sender>>,
+) {
     use nexus_projection::TunDevice;
     // D1：创建单个 TUN（Linux）。
     let tun: Box<dyn nexus_projection::TunDevice> =
@@ -163,8 +114,19 @@ fn run_dataplane(config: nexusd::dataplane::DataplaneConfig) {
     // B1：发布 stats 句柄供 LocalAPI 读取。
     nexusd::dataplane::publish_stats_handle(dp.stats_handle());
 
+    // R1：注入 N1 发送器（有则真发，无则 D2 计数降级）。
+    if let Some(sender) = n1_sender {
+        dp.set_n1_sender(sender);
+        eprintln!("[nexusd] dataplane: N1 sender wired (n1_bridge_ready=true)");
+    }
+
     eprintln!("[nexusd] dataplane: running");
     loop {
+        // R4：关闭信号 → 退出循环（TUN 随 Dataplane drop 关闭）。
+        if shutdown.load(Ordering::Relaxed) {
+            eprintln!("[nexusd] dataplane: shutdown signal, exiting");
+            break;
+        }
         match dp.process_one() {
             Ok(true) => continue,
             Ok(false) => {
@@ -179,7 +141,12 @@ fn run_dataplane(config: nexusd::dataplane::DataplaneConfig) {
     }
 }
 
-/// Daemon 主流程：加载配置 → 启动 LocalAPI → 启动 watcher → 事件循环。
+/// Daemon 主流程：加载配置 → 装配子系统 → 启动线程 → 事件循环 → 优雅关闭。
+///
+/// 启动顺序（§13.3）：配置加载 → 校验 → TUN（致命）→ Dataplane → N1（可降级）
+/// → Proxy（可降级）→ LocalAPI → 主循环。
+/// 关闭顺序（§13.4/R4）：SIGTERM/SIGINT → LocalAPI → Dataplane（1s 超时）
+/// → N1（5s 超时）→ TUN（随线程退出）→ exit 0。
 fn run_daemon(config_dir: &str) -> ExitCode {
     let dir = match ConfigDir::new(std::path::Path::new(config_dir)) {
         Ok(d) => d,
@@ -190,6 +157,10 @@ fn run_daemon(config_dir: &str) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+
+    // R4：关闭标志；Unix 下 SIGTERM/SIGINT 置位。
+    let shutdown = Arc::new(AtomicBool::new(false));
+    register_shutdown_flag(&shutdown);
 
     // 1. 启动时加载全部配置（校验失败则拒绝启动）。
     let loaded = match config::load(&dir) {
@@ -203,27 +174,53 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     };
     log_enabled_subsystems(&loaded);
 
-    // 2. 统一数据面（后台线程；TUN 创建失败时降级为无数据面，记日志）。
-    //    D1：单个 TUN 由 nexusd 持有。
-    let dataplane_config = build_dataplane_config(&loaded);
-    std::thread::Builder::new()
+    // 2. 组装 DataplaneConfig（R2/R3；dns.toml 解析失败 → exit 1）。
+    let dataplane_config = match assembly::build_dataplane_config(&loaded) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"CONFIG\",\"message\":\"{e}\"}}}}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // 3. R1：装配 N1 网桥（失败 → 降级，dataplane 照常跑）。
+    let n1_bridge: Option<Arc<nexus_network::n1::bridge::N1MeshBridge>> =
+        match loaded.network_toml.as_deref() {
+            Some(text) => match assembly::assemble_n1(text) {
+                Ok(bridge) => Some(bridge),
+                Err(e) => {
+                    eprintln!(
+                        "[nexusd] WARN: N1 assembly failed ({e}); degraded (mesh packets counted, not sent)"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+    let n1_sender: Option<Arc<dyn nexus_network::n1::bridge::N1Sender>> =
+        n1_bridge.clone().map(|b| b as Arc<dyn nexus_network::n1::bridge::N1Sender>);
+
+    // 4. 统一数据面线程（D1：单个 TUN 由 nexusd 持有；TUN 创建失败则线程内降级）。
+    let dp_shutdown = Arc::clone(&shutdown);
+    let dataplane_handle = std::thread::Builder::new()
         .name("nexusd-dataplane".to_string())
         .spawn(move || {
-            run_dataplane(dataplane_config);
+            run_dataplane(dataplane_config, dp_shutdown, n1_sender);
         })
         .expect("spawn dataplane thread");
 
-    // 3. LocalAPI（后台线程；沿用既有 serve 逻辑）。
+    // 5. LocalAPI 线程（R4：可经 shutdown 标志停止）。
     let localapi_addr = loaded.daemon.localapi_addr.clone();
     let (ready_tx, ready_rx) = channel();
-    std::thread::Builder::new()
+    let api_shutdown = Arc::clone(&shutdown);
+    let localapi_handle = std::thread::Builder::new()
         .name("nexusd-localapi".to_string())
         .spawn(move || {
-            serve_localapi(&localapi_addr, ready_tx);
+            serve_localapi(&localapi_addr, ready_tx, api_shutdown);
         })
         .expect("spawn localapi thread");
     // 等 LocalAPI 就绪（最多 5 秒）。
-    match ready_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+    match ready_rx.recv_timeout(Duration::from_secs(5)) {
         Ok(addr) => println!(
             "{{\"verdict\":\"READY\",\"daemon\":{{\"entry\":\"nexusd\",\"config_dir\":\"{config_dir}\",\"localapi\":\"{addr}\"}}}}"
         ),
@@ -235,15 +232,16 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         }
     }
 
-    // 3. 配置 watcher（后台线程；主线程拥有 JoinHandle，不直接改共享状态）。
+    // 6. 配置 watcher（后台线程；主线程拥有 JoinHandle，不直接改共享状态）。
     let (ev_tx, ev_rx) = channel();
     let _watcher = watcher::spawn(dir.clone(), loaded, ev_tx);
 
-    // 4. 主事件循环：处理重载事件（single writer 原则）。
-    //    注意：当前实现下热加载仅更新"已加载配置快照"并记日志；
-    //    各子系统运行时的实际重装配为后续工作（见模块文档诚实边界）。
+    // 7. 主事件循环：处理重载事件 + 检查关闭信号（single writer 原则）。
     loop {
-        match ev_rx.recv() {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        match ev_rx.recv_timeout(Duration::from_millis(500)) {
             Ok(watcher::ReloadEvent::Applied { files }) => {
                 eprintln!("[nexusd] config hot-reloaded: {files:?}");
             }
@@ -253,13 +251,91 @@ fn run_daemon(config_dir: &str) -> ExitCode {
             Ok(watcher::ReloadEvent::Rejected { error }) => {
                 eprintln!("[nexusd] ERROR: config reload rejected: {error} (keeping old config)");
             }
-            Err(_) => {
-                // watcher 线程退出（不应发生）；记日志并继续（LocalAPI 仍服务）。
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 eprintln!("[nexusd] WARN: config watcher channel closed");
-                std::thread::sleep(std::time::Duration::from_secs(60));
             }
         }
     }
+
+    // 8. R4：优雅关闭（§13.4 反向顺序，超时强制继续）。
+    shutdown_sequence(localapi_handle, dataplane_handle, n1_bridge);
+    ExitCode::from(0)
+}
+
+/// R4：优雅关闭序列（§13.4）。
+///
+/// 顺序：LocalAPI → Dataplane（1s）→ N1（5s）→ TUN（随 dataplane 线程退出）。
+/// 任一步超时 → warn 日志后强制继续，不无限等。
+fn shutdown_sequence(
+    localapi_handle: std::thread::JoinHandle<()>,
+    dataplane_handle: std::thread::JoinHandle<()>,
+    n1_bridge: Option<Arc<nexus_network::n1::bridge::N1MeshBridge>>,
+) {
+    eprintln!("[nexusd] shutdown: stopping LocalAPI");
+    // LocalAPI 线程已通过 shutdown 标志退出 accept 循环；join 确认。
+    join_with_timeout(localapi_handle, Duration::from_secs(2), "localapi");
+
+    eprintln!("[nexusd] shutdown: stopping dataplane");
+    join_with_timeout(dataplane_handle, Duration::from_secs(1), "dataplane");
+
+    if let Some(bridge) = n1_bridge {
+        eprintln!("[nexusd] shutdown: stopping N1");
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            bridge.shutdown();
+            let _ = tx.send(());
+        });
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(_) => eprintln!("[nexusd] shutdown: N1 stopped"),
+            Err(_) => {
+                eprintln!("[nexusd] WARN: shutdown: N1 did not stop in 5s, continuing")
+            }
+        }
+    } else {
+        eprintln!("[nexusd] shutdown: N1 not assembled, skipping");
+    }
+
+    // ProxyEngine 尚无独立运行时（R4 no-op）。
+    eprintln!("[nexusd] shutdown: proxy engine not yet a separate runtime, skipping");
+    // TUN 随 dataplane 线程退出而关闭（Dataplane drop）。
+    eprintln!("[nexusd] shutdown: complete");
+}
+
+/// 带超时的 join；超时后记 warn 并继续（不杀线程，进程退出时回收）。
+fn join_with_timeout(
+    handle: std::thread::JoinHandle<()>,
+    timeout: Duration,
+    name: &str,
+) {
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let _ = handle.join();
+        let _ = tx.send(());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(_) => eprintln!("[nexusd] shutdown: {name} stopped"),
+        Err(_) => eprintln!(
+            "[nexusd] WARN: shutdown: {name} did not stop in {timeout:?}, continuing"
+        ),
+    }
+}
+
+/// R4：注册 Unix 信号处理（SIGTERM/SIGINT → 置位关闭标志）。
+/// 非 Unix 平台为 no-op（诚实：优雅关闭仅 Unix）。
+#[cfg(unix)]
+fn register_shutdown_flag(flag: &Arc<AtomicBool>) {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    for sig in [SIGTERM, SIGINT] {
+        if let Err(e) = signal_hook::flag::register(sig, Arc::clone(flag)) {
+            eprintln!("[nexusd] WARN: failed to register signal handler for {sig}: {e}");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn register_shutdown_flag(_flag: &Arc<AtomicBool>) {
+    eprintln!("[nexusd] WARN: graceful shutdown on signal not supported on this platform");
 }
 
 /// 启动时日志：哪些子系统被配置启用。
@@ -283,7 +359,14 @@ fn log_enabled_subsystems(cfg: &LoadedConfig) {
 }
 
 /// LocalAPI 服务（后台线程版；复用既有 serve 逻辑，READY 经 channel 上报）。
-fn serve_localapi(addr_raw: &str, ready_tx: std::sync::mpsc::Sender<String>) {
+/// LocalAPI 服务（后台线程版；R4：经 shutdown 标志可停止）。
+///
+/// 非阻塞 accept + 100ms 轮询，关闭信号置位后退出循环。
+fn serve_localapi(
+    addr_raw: &str,
+    ready_tx: std::sync::mpsc::Sender<String>,
+    shutdown: Arc<AtomicBool>,
+) {
     let addr: std::net::SocketAddr = match addr_raw.parse() {
         Ok(a) => a,
         Err(e) => {
@@ -298,17 +381,28 @@ fn serve_localapi(addr_raw: &str, ready_tx: std::sync::mpsc::Sender<String>) {
             return;
         }
     };
+    if let Err(e) = listener.set_nonblocking(true) {
+        eprintln!("[nexusd] localapi set_nonblocking failed: {e}");
+        return;
+    }
     let actual = listener
         .local_addr()
         .map(|a| a.to_string())
         .unwrap_or_default();
     let _ = ready_tx.send(actual);
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut s) => {
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            eprintln!("[nexusd] localapi: shutdown signal, exiting");
+            break;
+        }
+        match listener.accept() {
+            Ok((mut s, _)) => {
                 if let Err(e) = handle_localapi_request(&mut s) {
                     eprintln!("[nexusd] localapi error: {e}");
                 }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
             }
             Err(e) => {
                 eprintln!("[nexusd] localapi accept error: {e}");
