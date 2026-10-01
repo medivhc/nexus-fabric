@@ -5199,16 +5199,14 @@ fn saturate_worker(
         *b = (x >> 33) as u8;
     }
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-        let mut stream = match std::net::TcpStream::connect_timeout(
-            &addr,
-            std::time::Duration::from_secs(5),
-        ) {
-            Ok(s) => s,
-            Err(_) => {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                continue;
-            }
-        };
+        let mut stream =
+            match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5)) {
+                Ok(s) => s,
+                Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    continue;
+                }
+            };
         let _ = stream.set_nodelay(true);
         // 持续发送直到对端关闭或收到停止信号。
         while !stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -5234,7 +5232,10 @@ pub fn proxy_bufferbloat_test(config: &BufferbloatConfig) -> Result<serde_json::
     // 1. 基准延迟（空载）。
     let baseline_ms = probe_median(&config.proxy_addr, config.probe_samples, probe_timeout)
         .ok_or_else(|| NexusError::Internal {
-            message: format!("baseline probe failed: cannot connect to {}", config.proxy_addr),
+            message: format!(
+                "baseline probe failed: cannot connect to {}",
+                config.proxy_addr
+            ),
         })?;
 
     // 2. 启动打满线程。

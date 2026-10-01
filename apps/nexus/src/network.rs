@@ -12,19 +12,19 @@
 
 use nexus_control_api::ControlCommand;
 use nexus_discovery::{
-    lsa::Lsdb, mdns::MdnsDiscovery, AggregateDiscovery, Discovery, PeerId as DiscoveryPeerId,
-    StaticDiscovery,
+    AggregateDiscovery, Discovery, PeerId as DiscoveryPeerId, StaticDiscovery, lsa::Lsdb,
+    mdns::MdnsDiscovery,
 };
 use nexus_fabric::{
     ConnConfig, FabricConn, FabricError, PeerId as FabricPeerId, RecvStream, SendStream,
     StdUdpTransport, UdpTransport,
 };
 use nexus_network::n1::{
+    N1Connection, N1Dialer, N1Discovery, N1Error, N1Event, N1EventSink, N1KeepaliveIo,
+    N1KeepaliveStream, N1PeerId,
     config::N1Config,
     pump::{Ipv4Route, PeerConnLookup, VpiPump},
     session::N1SessionManager,
-    N1Connection, N1Dialer, N1Discovery, N1Error, N1Event, N1EventSink, N1KeepaliveIo,
-    N1KeepaliveStream, N1PeerId,
 };
 use nexus_path::{CandidatePath, FallbackChain, FallbackConfig, PathKind};
 use nexus_platform::VirtualPacketInterface;

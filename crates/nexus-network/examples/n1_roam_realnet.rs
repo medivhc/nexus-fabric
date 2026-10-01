@@ -42,10 +42,10 @@ use std::time::{Duration, Instant};
 
 // ---------- 常量 ----------
 
-const UNDERLAY_A: &str = "172.168.12.97";  // enp5s0 有线（真实）
-const UNDERLAY_B: &str = "172.168.9.99";   // wlp6s0 WiFi 次 IP（真实，需预配）
+const UNDERLAY_A: &str = "172.168.12.97"; // enp5s0 有线（真实）
+const UNDERLAY_B: &str = "172.168.9.99"; // wlp6s0 WiFi 次 IP（真实，需预配）
 // B 漫游后：rebind() 用 wildcard，内核按路由选源（实测为 172.168.12.97，端口随机）
-const UNDERLAY_B_CIDR: u8 = 23;  // wlp6s0 是 /23
+const UNDERLAY_B_CIDR: u8 = 23; // wlp6s0 是 /23
 const LISTEN_PORT: u16 = 9000;
 const VPI_A: &str = "10.144.0.1";
 const VPI_B: &str = "10.144.0.2";
@@ -55,7 +55,7 @@ const TCP_PORT: u16 = 7000;
 // TUN MTU 必须小于 QUIC datagram 最大载荷（path MTU 1200 - QUIC/IP/UDP 开销
 // ~60 字节 - DATAGRAM 帧头）。设为 1100 确保 IP 包能装入 datagram。
 const TUN_MTU: u16 = 1100;
-const FILE_SIZE: usize = 10 * 1024 * 1024;  // E5: 10MB
+const FILE_SIZE: usize = 10 * 1024 * 1024; // E5: 10MB
 /// 契约默认 5s；E4 配 1s（scenario 冻结期望可配置）。
 const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -856,8 +856,20 @@ fn parent_main() -> Result<String, String> {
     }
 
     // E5: 预配 B 的 WiFi 次 IP（幂等，先清残留）。
-    let _ = sudo_ip(&["addr", "del", &format!("{UNDERLAY_B}/{UNDERLAY_B_CIDR}"), "dev", "wlp6s0"]);
-    sudo_ip(&["addr", "add", &format!("{UNDERLAY_B}/{UNDERLAY_B_CIDR}"), "dev", "wlp6s0"])?;
+    let _ = sudo_ip(&[
+        "addr",
+        "del",
+        &format!("{UNDERLAY_B}/{UNDERLAY_B_CIDR}"),
+        "dev",
+        "wlp6s0",
+    ]);
+    sudo_ip(&[
+        "addr",
+        "add",
+        &format!("{UNDERLAY_B}/{UNDERLAY_B_CIDR}"),
+        "dev",
+        "wlp6s0",
+    ])?;
     let _ = sudo_ip(&["link", "del", "nrtun0"]);
     let _ = sudo_ip(&["link", "del", "nrtun1"]);
 
@@ -865,7 +877,13 @@ fn parent_main() -> Result<String, String> {
     std::thread::spawn(move || {
         std::thread::sleep(GLOBAL_TIMEOUT);
         eprintln!("[watchdog] global timeout, cleaning up");
-        let _ = sudo_ip(&["addr", "del", &format!("{UNDERLAY_B}/{UNDERLAY_B_CIDR}"), "dev", "wlp6s0"]);
+        let _ = sudo_ip(&[
+            "addr",
+            "del",
+            &format!("{UNDERLAY_B}/{UNDERLAY_B_CIDR}"),
+            "dev",
+            "wlp6s0",
+        ]);
         let _ = sudo_ip(&["link", "del", "nrtun0"]);
         let _ = sudo_ip(&["link", "del", "nrtun1"]);
         println!(
@@ -877,7 +895,13 @@ fn parent_main() -> Result<String, String> {
 
     let result = parent_run();
     // 清理：删次 IP、删 TUN。
-    let _ = sudo_ip(&["addr", "del", &format!("{UNDERLAY_B}/{UNDERLAY_B_CIDR}"), "dev", "wlp6s0"]);
+    let _ = sudo_ip(&[
+        "addr",
+        "del",
+        &format!("{UNDERLAY_B}/{UNDERLAY_B_CIDR}"),
+        "dev",
+        "wlp6s0",
+    ]);
     let _ = sudo_ip(&["link", "del", "nrtun0"]);
     let _ = sudo_ip(&["link", "del", "nrtun1"]);
     result

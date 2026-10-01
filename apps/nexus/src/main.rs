@@ -748,15 +748,17 @@ fn proxy_bufferbloat_test_cli(args: &[String]) -> i32 {
             if json_mode {
                 println!("{json}");
             } else {
-                let baseline = json.get("baseline_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                let baseline = json
+                    .get("baseline_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 let loaded = json.get("loaded_ms").and_then(|v| v.as_u64()).unwrap_or(0);
                 let delta = json.get("delta_ms").and_then(|v| v.as_u64()).unwrap_or(0);
                 let diagnosis = json
                     .get("diagnosis")
                     .and_then(|v| v.as_str())
                     .unwrap_or("UNKNOWN");
-                let advice =
-                    json.get("advice").and_then(|v| v.as_str()).unwrap_or("");
+                let advice = json.get("advice").and_then(|v| v.as_str()).unwrap_or("");
                 println!("Baseline: {baseline}ms | Under load: {loaded}ms | Delta: +{delta}ms");
                 println!("Verdict: {diagnosis}（{advice}）");
             }
@@ -1598,9 +1600,7 @@ mod tests {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_c = std::sync::Arc::clone(&stop);
         let accept_h = std::thread::spawn(move || {
-            listener
-                .set_nonblocking(true)
-                .expect("set_nonblocking");
+            listener.set_nonblocking(true).expect("set_nonblocking");
             while !stop_c.load(std::sync::atomic::Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((s, _)) => {
