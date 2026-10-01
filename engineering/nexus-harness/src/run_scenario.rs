@@ -13,6 +13,7 @@ pub fn run_scenario(args: &[String]) -> Outcome {
         "multihop-routing" => run_multihop_routing(),
         "mesh-dns" => run_mesh_dns(),
         "dns-unified" => run_dns_unified(),
+        "multipath" => run_multipath(),
         "firewall-rules" => run_firewall_rules(),
         "bandwidth-qos" => run_bandwidth_qos(),
         "qos-cake" => run_qos_cake(),
@@ -948,6 +949,139 @@ fn run_dns_unified() -> Outcome {
             "FAIL".to_string(),
             format!(
                 "dns-unified: invariants failed (hosts={hosts_class}, mesh={mesh_class}, fake={fake_class}, up={up_class}, stable={stable_within_ttl}, reclaimed={reclaimed_after_ttl}, local_isolated={local_isolated})"
+            ),
+            extra,
+        )
+    }
+}
+
+/// 场景（`scenarios/product/multipath.toml`）：
+/// - Single：永远选首位 egress（零行为变化）；
+/// - PerFlow：同一 flow_id 确定性 + 多流分布；
+/// - PerPacket：加权轮询覆盖；
+/// - ReorderBuffer：乱序重排 + 容量有界。
+fn run_multipath() -> Outcome {
+    use nexus_projection::multipath::{
+        EgressDescriptor, EgressKind, MultipathStrategy, PathScheduler, ReorderBuffer,
+    };
+    use std::collections::HashSet;
+
+    let egresses = vec![
+        EgressDescriptor::new("mesh-direct", EgressKind::MeshDirect, 1),
+        EgressDescriptor::new("proxy", EgressKind::Proxy, 1),
+        EgressDescriptor::new("turn", EgressKind::Turn, 1),
+    ];
+
+    // --- Single：永远首位 ---
+    let mut sched = PathScheduler::new();
+    let single_always_best = (0..10u64).all(|flow| {
+        (0..5u64).all(|seq| {
+            sched
+                .select(MultipathStrategy::Single, &egresses, flow, seq)
+                .map(|e| e.id())
+                == Some("mesh-direct")
+        })
+    });
+
+    // --- PerFlow：确定性 + 分布性 ---
+    let perflow_stable = [0u64, 1, 42, 999].iter().all(|&flow| {
+        let first = sched
+            .select(MultipathStrategy::PerFlow, &egresses, flow, 0)
+            .map(|e| e.id().to_string());
+        (1..100u64).all(|seq| {
+            sched
+                .select(MultipathStrategy::PerFlow, &egresses, flow, seq)
+                .map(|e| e.id().to_string())
+                == first
+        })
+    });
+    let mut seen = HashSet::new();
+    for flow in 0..64u64 {
+        if let Some(e) = sched.select(MultipathStrategy::PerFlow, &egresses, flow, 0) {
+            seen.insert(e.id().to_string());
+        }
+    }
+    let perflow_distributed = seen.len() == 3;
+
+    // --- PerPacket：轮询 ---
+    sched.reset();
+    let ids: Vec<String> = (0..6u64)
+        .map(|seq| {
+            sched
+                .select(MultipathStrategy::PerPacket, &egresses, 0, seq)
+                .map(|e| e.id().to_string())
+                .unwrap_or_default()
+        })
+        .collect();
+    let perpacket_round_robin = ids
+        == vec![
+            "mesh-direct",
+            "proxy",
+            "turn",
+            "mesh-direct",
+            "proxy",
+            "turn",
+        ];
+
+    // --- ReorderBuffer：乱序重排 + 有界 ---
+    let mut rb = ReorderBuffer::new(64);
+    for seq in [3u64, 1, 2, 5, 4] {
+        rb.push(seq, vec![seq as u8]);
+    }
+    // 缺 seq 0 → 吐不出。
+    let empty_before_zero = rb.pop_in_order().is_empty();
+    rb.push(0, vec![0]);
+    let out = rb.pop_in_order();
+    let seqs: Vec<u64> = out.iter().map(|(s, _)| *s).collect();
+    let reorder_in_order = empty_before_zero && seqs == vec![0, 1, 2, 3, 4, 5];
+
+    // 超限有界。
+    let mut rb2 = ReorderBuffer::new(64);
+    for seq in 0..100u64 {
+        rb2.push(seq, vec![seq as u8]);
+    }
+    let reorder_bounded = rb2.len() <= 64 && rb2.dropped_overflow() == 36;
+
+    let ok = single_always_best
+        && perflow_stable
+        && perflow_distributed
+        && perpacket_round_robin
+        && reorder_in_order
+        && reorder_bounded;
+
+    let extra = vec![
+        (
+            "single".to_string(),
+            json!({ "always_best": single_always_best }),
+        ),
+        (
+            "perflow".to_string(),
+            json!({ "stable": perflow_stable, "distributed": perflow_distributed }),
+        ),
+        (
+            "perpacket".to_string(),
+            json!({ "round_robin": perpacket_round_robin, "sequence": ids }),
+        ),
+        (
+            "reorder".to_string(),
+            json!({ "in_order": reorder_in_order, "bounded": reorder_bounded }),
+        ),
+    ];
+
+    if ok {
+        (
+            "PASS".to_string(),
+            "multipath: three strategies + reorder buffer verified".to_string(),
+            extra,
+        )
+    } else {
+        (
+            "FAIL".to_string(),
+            format!(
+                "multipath: invariants failed (single={single_always_best}, \
+                 perflow_stable={perflow_stable}, perflow_dist={perflow_distributed}, \
+                 perpacket={perpacket_round_robin}, reorder={reorder_in_order}, \
+                 bounded={reorder_bounded})"
             ),
             extra,
         )

@@ -16,6 +16,7 @@ pub mod boost;
 pub mod classifier;
 pub mod dns;
 pub mod egress;
+pub mod multipath;
 pub mod path_link;
 pub mod process;
 pub mod routing;
