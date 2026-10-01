@@ -1,0 +1,35 @@
+schema_version = 1
+id = "platform.win-procattr"
+title = "Windows 进程归因（iphlpapi 五元组 → 进程名）"
+evidence_strength = "E4"
+requirement = "crates/nexus-projection/MODULE.md#S26"
+
+[given]
+platform = "windows"
+module = "nexus-projection::process::WindowsProcessAttributor"
+
+# E4：win-pc 真机验证。
+# 1. 本机建一条 TCP 回环连接（listener + client）。
+# 2. 用 PlatformAttributor::attribute(client_addr, server_addr, Tcp) 查进程名。
+# 3. 期望查到当前测试进程自己的 exe 名（非 None）。
+# 4. UDP 同理（connected UDP socket）。
+# 5. 测性能：100 次归因的中位延迟（诚实边界：查表开销）。
+
+[when]
+command = "cargo test --quiet -p nexus-projection --target x86_64-pc-windows-msvc process::tests::windows_attribute_own"
+
+[[expect]]
+field = "tcp_process_name"
+equals = "self_exe_name"
+
+[[expect]]
+field = "udp_process_name"
+equals = "self_exe_name"
+
+[[expect]]
+field = "unknown_tuple"
+equals = "none"
+
+[[expect]]
+field = "no_panic_on_failure"
+equals = true
