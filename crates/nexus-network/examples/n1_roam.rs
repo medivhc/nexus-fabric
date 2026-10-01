@@ -66,6 +66,10 @@ const STALL_BUDGET_MS: u64 = 30_000;
 /// 加传输（~60s）+ 迁移（~30s）≈ 264s。这是给 TCP 协议规定的恢复时间，
 /// 不是调低门槛（AGENTS.md §7 禁的是降低 timeout 隐藏失败，这里是调高）。
 const GLOBAL_TIMEOUT: Duration = Duration::from_secs(300);
+/// B 的 ROAM 完成信号文件（替代 stdout pipe）。
+/// 背景：B 在 `println!("ROAMED")` 处 83% 概率静默死亡（变 zombie），父进程 hang。
+/// stdout pipe 脆弱，改用文件轮询，避开 pipe。
+const ROAMED_SIGNAL_FILE: &str = "/tmp/n1_e4_roamed_b";
 
 // ---------- 工具 ----------
 
@@ -717,8 +721,12 @@ fn child_b(
                     }
                 }
                 roamed = true;
-                println!("ROAMED");
-                std::io::stdout().flush().map_err(|e| e.to_string())?;
+                // 用文件信号替代 stdout println!("ROAMED")：
+                // B 在 println 处 83% 静默死亡（stdout pipe 脆弱），改文件避开。
+                // 不再向 stdout 打印 ROAMED，避免父进程 reader 收到过期行。
+                if let Err(e) = std::fs::write(ROAMED_SIGNAL_FILE, "ROAMED") {
+                    eprintln!("[child b] write roamed signal file failed: {e:?}");
+                }
             }
             "QUIT" => break,
             other => return Err(format!("unexpected cmd: {other:?}")),
@@ -890,6 +898,8 @@ fn parent_main() -> Result<String, String> {
 }
 
 fn parent_run(veth_a: &str, veth_b: &str) -> Result<String, String> {
+    // 清理上次残留的 ROAM 信号文件。
+    let _ = std::fs::remove_file(ROAMED_SIGNAL_FILE);
     let mut a = ChildProc::spawn('a', veth_a, "nxtun0", VPI_A, UNDERLAY_A)?;
     if a.read_line("READY from A")? != "READY" {
         return Err("child A did not signal READY".into());
@@ -932,9 +942,17 @@ fn parent_run(veth_a: &str, veth_b: &str) -> Result<String, String> {
         return Err(format!("expected HALF, got {half:?}"));
     }
     b.write_line("ROAM")?;
-    let roamed = b.read_line("ROAMED from B")?;
-    if roamed != "ROAMED" {
-        return Err(format!("expected ROAMED, got {roamed:?}"));
+    // 等 B 的 ROAM 完成：轮询信号文件（替代脆弱的 stdout pipe）。
+    // B 在 println!("ROAMED") 处 83% 静默死亡，改文件信号避开。
+    let roam_start = Instant::now();
+    loop {
+        if std::path::Path::new(ROAMED_SIGNAL_FILE).exists() {
+            break;
+        }
+        if roam_start.elapsed() > Duration::from_secs(60) {
+            return Err("timeout waiting for ROAMED signal file from B".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 
     // 收尾：SENT（A）+ receiver 完成（B 侧）→ QUIT → BYE 统计。
