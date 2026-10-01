@@ -28,6 +28,19 @@
 
 #![forbid(unsafe_code)]
 
+// T4：tun_enabled 状态供 LocalAPI 查询（no-tun 模式可观测）。
+static TUN_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// 发布 tun_enabled 状态（daemon 启动时调用一次）。
+fn publish_tun_enabled(enabled: bool) {
+    let _ = TUN_ENABLED.set(enabled);
+}
+
+/// 读取 tun_enabled 状态（默认 true，保持向后兼容）。
+fn tun_enabled() -> bool {
+    *TUN_ENABLED.get().unwrap_or(&true)
+}
+
 mod config;
 mod watcher;
 
@@ -135,11 +148,12 @@ fn build_dataplane_config(loaded: &LoadedConfig) -> nexusd::dataplane::Dataplane
 }
 
 /// 数据面线程主循环：创建 TUN → 处理包 → 出错时退出线程（daemon 继续服务 LocalAPI）。
-fn run_dataplane(config: nexusd::dataplane::DataplaneConfig) {
+fn run_dataplane(config: nexusd::dataplane::DataplaneConfig, tun_name: &str, tun_mtu: u32) {
     use nexus_projection::TunDevice;
-    // D1：创建单个 TUN（Linux）。
+    // D1：创建单个 TUN（Linux）。设备名与 MTU 来自 [tun] 配置（T1）。
+    let tun_pattern = format!("{tun_name}%d");
     let tun: Box<dyn nexus_projection::TunDevice> =
-        match nexus_projection::tun_rs_device::TunRsDevice::create("nexus%d", 1500) {
+        match nexus_projection::tun_rs_device::TunRsDevice::create(&tun_pattern, tun_mtu) {
             Ok(dev) => {
                 eprintln!("[nexusd] dataplane: TUN {} created", dev.name());
                 Box::new(dev)
@@ -203,15 +217,34 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     };
     log_enabled_subsystems(&loaded);
 
+    // T3：缺 proxy.yaml 且缺 network.toml → 拒绝启动（无意义）。
+    if loaded.proxy_yaml.is_none() && loaded.network_toml.is_none() {
+        eprintln!(
+            "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"CONFIG\",\"message\":\"no subsystem configured: need proxy.yaml and/or network.toml\"}}}}"
+        );
+        return ExitCode::from(1);
+    }
+
+    // T4：发布 tun_enabled 状态供 LocalAPI 查询。
+    let tun_enabled = loaded.daemon.tun.enabled;
+    publish_tun_enabled(tun_enabled);
+
     // 2. 统一数据面（后台线程；TUN 创建失败时降级为无数据面，记日志）。
     //    D1：单个 TUN 由 nexusd 持有。
-    let dataplane_config = build_dataplane_config(&loaded);
-    std::thread::Builder::new()
-        .name("nexusd-dataplane".to_string())
-        .spawn(move || {
-            run_dataplane(dataplane_config);
-        })
-        .expect("spawn dataplane thread");
+    //    T2：[tun].enabled=false 时跳过 TUN/数据面（no-tun 模式）。
+    if tun_enabled {
+        let dataplane_config = build_dataplane_config(&loaded);
+        let tun_name = loaded.daemon.tun.name.clone();
+        let tun_mtu = loaded.daemon.tun.mtu;
+        std::thread::Builder::new()
+            .name("nexusd-dataplane".to_string())
+            .spawn(move || {
+                run_dataplane(dataplane_config, &tun_name, tun_mtu);
+            })
+            .expect("spawn dataplane thread");
+    } else {
+        eprintln!("[nexusd] tun disabled; dataplane not started (no-tun mode)");
+    }
 
     // 3. LocalAPI（后台线程；沿用既有 serve 逻辑）。
     let localapi_addr = loaded.daemon.localapi_addr.clone();
@@ -461,9 +494,11 @@ fn handle_localapi_request(stream: &mut dyn LocalIo) -> Result<(), String> {
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
         "/localapi/v0/dataplane/stats" => {
             // B1：统一数据面统计（D6 可观测）。
+            // T4：包含 tun_enabled 状态（no-tun 模式可观测）。
             let s = nexusd::dataplane::dataplane_stats_snapshot();
             Ok(json!({
                 "verdict": "PASS",
+                "tun_enabled": tun_enabled(),
                 "dataplane": {
                     "mesh_forwarded": s.mesh_forwarded,
                     "proxy_forwarded": s.proxy_forwarded,

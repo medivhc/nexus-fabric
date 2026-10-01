@@ -65,6 +65,32 @@ pub struct DaemonConfig {
     pub localapi_addr: String,
     /// `[qos]` 小节：CAKE-like QoS 开关与整形参数（默认禁用，零开销）。
     pub qos: QosSection,
+    /// `[tun]` 小节：TUN 设备开关与参数（默认启用）。
+    pub tun: TunSection,
+}
+
+/// `daemon.toml` 的 `[tun]` 小节（no-tun 模式，`docs/WINDOWS_TUN_DESIGN.md` §1）。
+///
+/// 全部可选；`enabled = false` 时不创建 TUN（no-tun 模式：纯 N1 节点/显式代理）。
+/// 热加载分类：任一字段变化 → `NeedsRestart`（TUN 设备启停需重建）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunSection {
+    /// 是否创建 TUN 设备（默认 true）。
+    pub enabled: bool,
+    /// TUN 设备名（默认 "nexus"；Linux）。
+    pub name: String,
+    /// MTU（默认 1500，合法范围 [1280, 9000]）。
+    pub mtu: u32,
+}
+
+impl Default for TunSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            name: "nexus".to_string(),
+            mtu: 1500,
+        }
+    }
 }
 
 /// `daemon.toml` 的 `[qos]` 小节（CAKE-like QoS，`docs/DAEMON_ARCHITECTURE.md` §11）。
@@ -152,6 +178,7 @@ pub fn load(dir: &ConfigDir) -> Result<LoadedConfig, String> {
         daemon: DaemonConfig {
             localapi_addr: DaemonConfig::default_addr(),
             qos: QosSection::default(),
+            tun: TunSection::default(),
         },
         ..Default::default()
     };
@@ -209,6 +236,7 @@ fn parse_daemon_toml(text: &str) -> Result<DaemonConfig, String> {
     let mut cfg = DaemonConfig {
         localapi_addr: DaemonConfig::default_addr(),
         qos: QosSection::default(),
+        tun: TunSection::default(),
     };
     // 支持 `localapi_addr = "..."` 或 `[localapi] addr = "..."`
     if let Some(s) = v.get("localapi_addr").and_then(|x| x.as_str()) {
@@ -229,7 +257,49 @@ fn parse_daemon_toml(text: &str) -> Result<DaemonConfig, String> {
     if let Some(t) = v.get("qos") {
         cfg.qos = parse_qos_section(t)?;
     }
+    // [tun] 小节（可选；缺失则用默认值=启用）
+    if let Some(t) = v.get("tun") {
+        cfg.tun = parse_tun_section(t)?;
+    }
     Ok(cfg)
+}
+
+/// 解析 `daemon.toml` 的 `[tun]` 小节（T1）。
+///
+/// 接受 `enabled`（bool，默认 true）、`name`（非空字符串，默认 "nexus"）、
+/// `mtu`（整数，需在 [1280, 9000] 内，默认 1500）。
+fn parse_tun_section(t: &toml::Value) -> Result<TunSection, String> {
+    let enabled = t.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true);
+    let name = match t.get("name") {
+        None => "nexus".to_string(),
+        Some(x) => {
+            let s = x
+                .as_str()
+                .ok_or_else(|| format!("{DAEMON_TOML}: [tun].name must be a string"))?;
+            if s.is_empty() {
+                return Err(format!("{DAEMON_TOML}: [tun].name must not be empty"));
+            }
+            s.to_string()
+        }
+    };
+    let mtu = match t.get("mtu") {
+        None => 1500,
+        Some(x) => {
+            let n = x
+                .as_integer()
+                .and_then(|i| u32::try_from(i).ok())
+                .ok_or_else(|| {
+                    format!("{DAEMON_TOML}: [tun].mtu must be an integer in [1280, 9000]")
+                })?;
+            if !(1280..=9000).contains(&n) {
+                return Err(format!(
+                    "{DAEMON_TOML}: [tun].mtu must be in [1280, 9000] (got {n})"
+                ));
+            }
+            n
+        }
+    };
+    Ok(TunSection { enabled, name, mtu })
 }
 
 /// 解析 `daemon.toml` 的 `[qos]` 小节。
@@ -340,6 +410,10 @@ pub fn classify_change(old: &LoadedConfig, new: &LoadedConfig) -> ChangeKind {
     }
     // daemon.toml：[qos] 小节变化需重启
     if old.daemon.qos != new.daemon.qos {
+        return ChangeKind::NeedsRestart;
+    }
+    // daemon.toml：[tun] 小节变化需重启（T4：TUN 设备启停需重建）
+    if old.daemon.tun != new.daemon.tun {
         return ChangeKind::NeedsRestart;
     }
     // 任一文件的增删 → 需重启（子系统启停）
