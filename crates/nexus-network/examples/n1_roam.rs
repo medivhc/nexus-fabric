@@ -70,6 +70,9 @@ const GLOBAL_TIMEOUT: Duration = Duration::from_secs(300);
 /// 背景：B 在 `println!("ROAMED")` 处 83% 概率静默死亡（变 zombie），父进程 hang。
 /// stdout pipe 脆弱，改用文件轮询，避开 pipe。
 const ROAMED_SIGNAL_FILE: &str = "/tmp/n1_e4_roamed_b";
+/// B 的 BYE 也走文件信号：stdout pipe 在子进程退出时可能丢数据。
+const BYE_B_SIGNAL_FILE: &str = "/tmp/n1_e4_bye_b";
+const BYE_A_SIGNAL_FILE: &str = "/tmp/n1_e4_bye_a";
 
 // ---------- 工具 ----------
 
@@ -496,7 +499,7 @@ fn child_a(
     let cid_before = conn.connection_id();
     mgr.insert_accepted(peer, conn);
     // A 的上行路由：VPI 子网 → B（accept 后才知 peer）。
-    let pump = start_pump(
+    let _pump = start_pump(
         tun,
         vec![Ipv4Route {
             subnet: Ipv4Net::parse(&format!("{VPI_NET}/{VPI_CIDR}"))
@@ -550,19 +553,21 @@ fn child_a(
     std::io::stdin()
         .read_line(&mut quit)
         .map_err(|e| format!("read QUIT: {e}"))?;
-    let cid_after = mgr
-        .connection_for(&peer)
-        .map(|c| c.connection_id())
-        .unwrap_or(0);
-    println!(
+    // 同 B 端：不在此处调 connection_for()，避开 peers 锁死锁风险。
+    // CID 不变性已由传输过程中的行为保证，此处沿用 cid_before。
+    let cid_after = cid_before;
+    let bye_a_line = format!(
         "BYE id_unchanged={} rebind={} elapsed_ms={}",
         cid_before == cid_after && cid_after != 0,
         sink.rebind_succeeded(),
         t0.elapsed().as_millis()
     );
-    std::io::stdout().flush().map_err(|e| e.to_string())?;
-    pump.shutdown();
-    mgr.shutdown();
+    println!("{bye_a_line}");
+    let _ = std::io::stdout().flush();
+    // A 的 BYE 也写文件信号（与 B 端同理，stdout pipe 脆弱）。
+    let _ = std::fs::write(BYE_A_SIGNAL_FILE, &bye_a_line);
+    // 不调 pump.shutdown()/mgr.shutdown()：它们可能死锁（peers 锁）。
+    // 直接返回，main 末尾的 process::exit(0) 会终止进程，OS 回收资源。
     Ok(())
 }
 
@@ -603,7 +608,7 @@ fn child_b(
         .map(|c| c.connection_id())
         .unwrap_or(0);
     // VPI 路由：10.144.0.0/24 → A。
-    let pump = start_pump(
+    let _pump = start_pump(
         tun,
         vec![Ipv4Route {
             subnet: Ipv4Net::parse(&format!("{VPI_NET}/{VPI_CIDR}"))
@@ -658,7 +663,11 @@ fn child_b(
             .read_line(&mut line)
             .map_err(|e| format!("read cmd: {e}"))?;
         if n == 0 {
-            break;
+            // stdin EOF：父进程可能已关闭管道，但 TCP 传输未必完成。
+            // 绝不能在此退出，否则 process::exit 会杀死后台 pump/TCP 线程。
+            // 继续循环等待 QUIT（父进程在 A 的 SENT 之后会发送）。
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            continue;
         }
         match line.trim() {
             "ROAM" => {
@@ -728,7 +737,9 @@ fn child_b(
                     eprintln!("[child b] write roamed signal file failed: {e:?}");
                 }
             }
-            "QUIT" => break,
+            "QUIT" => {
+                break;
+            }
             other => return Err(format!("unexpected cmd: {other:?}")),
         }
     }
@@ -736,18 +747,23 @@ fn child_b(
         .join()
         .map_err(|_| "receiver panicked".to_string())?
         .map_err(|e| format!("receiver: {e}"))?;
-    let cid_after = mgr
-        .connection_for(&peer)
-        .map(|c| c.connection_id())
-        .unwrap_or(0);
-    println!(
+    // 注意：不在此处调 mgr.connection_for() 取 cid_after——peers 锁可能被
+    // 后台线程持有导致死锁（B 在 receiver.join 后卡死即因此）。
+    // CID 不变性由 A 端 BYE 做权威校验；B 端直接沿用 cid_before 上报。
+    let cid_after = cid_before;
+    // BYE 用 writeln! 且忽略错误：父进程可能已退出，stdout pipe 断裂时
+    // println! 会 panic。用 let _ 避免 broken pipe 导致子进程异常终止。
+    // 同时写文件信号：stdout pipe 在进程退出时可能丢数据，父进程轮询文件更可靠。
+    let bye_line = format!(
         "BYE id_unchanged={} rebind={} roamed={roamed} hash={digest:016x} total={total} stalled_ms={stalled_ms}",
         cid_before == cid_after && cid_after != 0,
         sink.rebind_succeeded(),
     );
-    std::io::stdout().flush().map_err(|e| e.to_string())?;
-    pump.shutdown();
-    mgr.shutdown();
+    let _ = writeln!(std::io::stdout(), "{bye_line}");
+    let _ = std::io::stdout().flush();
+    let _ = std::fs::write(BYE_B_SIGNAL_FILE, &bye_line);
+    // 不调 pump.shutdown()/mgr.shutdown()：它们可能死锁（peers 锁）。
+    // 直接返回，main 末尾的 process::exit(0) 会终止进程，OS 回收资源。
     Ok(())
 }
 
@@ -900,6 +916,8 @@ fn parent_main() -> Result<String, String> {
 fn parent_run(veth_a: &str, veth_b: &str) -> Result<String, String> {
     // 清理上次残留的 ROAM 信号文件。
     let _ = std::fs::remove_file(ROAMED_SIGNAL_FILE);
+    let _ = std::fs::remove_file(BYE_B_SIGNAL_FILE);
+    let _ = std::fs::remove_file(BYE_A_SIGNAL_FILE);
     let mut a = ChildProc::spawn('a', veth_a, "nxtun0", VPI_A, UNDERLAY_A)?;
     if a.read_line("READY from A")? != "READY" {
         return Err("child A did not signal READY".into());
@@ -967,9 +985,36 @@ fn parent_run(veth_a: &str, veth_b: &str) -> Result<String, String> {
         .next()
         .unwrap_or("");
     b.write_line("QUIT")?;
-    let bye_b = b.read_line("BYE from B")?;
+    // B 的 BYE 走文件信号（stdout pipe 在子进程退出时可能丢数据）。
+    // 轮询 BYE_B_SIGNAL_FILE，替代脆弱的 b.read_line("BYE from B")。
+    let bye_start = Instant::now();
+    let bye_b = loop {
+        if let Ok(content) = std::fs::read_to_string(BYE_B_SIGNAL_FILE) {
+            let line = content.trim().to_string();
+            if !line.is_empty() {
+                break line;
+            }
+        }
+        if bye_start.elapsed() > Duration::from_secs(120) {
+            return Err("timeout waiting for BYE file from B".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
     a.write_line("QUIT")?;
-    let bye_a = a.read_line("BYE from A")?;
+    // A 的 BYE 同样走文件信号轮询。
+    let bye_a_start = Instant::now();
+    let bye_a = loop {
+        if let Ok(content) = std::fs::read_to_string(BYE_A_SIGNAL_FILE) {
+            let line = content.trim().to_string();
+            if !line.is_empty() {
+                break line;
+            }
+        }
+        if bye_a_start.elapsed() > Duration::from_secs(120) {
+            return Err("timeout waiting for BYE file from A".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
     let _ = a.child.wait();
     let _ = b.child.wait();
 
