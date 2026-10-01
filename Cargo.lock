@@ -759,6 +759,7 @@ dependencies = [
  "nexus-domain",
  "nexus-platform",
  "nexus-registry",
+ "ring",
 ]
 
 [[package]]

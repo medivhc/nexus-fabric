@@ -68,6 +68,8 @@ nexus — Nexus 统一 Resource Fabric 控制面 CLI（瘦客户端）
   proxy run|host|relay ...                数据面组合根（进程内 SDK）
   system-proxy <status|set|clear|e2e>     系统代理控制（进程内 SDK，PRODUCT §13）
   autostart <install|remove|status>       开机自启（进程内 SDK，PRODUCT §13）
+  pair invite|join|list|remove --dir <config-dir>
+                                        设备配对（D7；带外配对码 + ed25519 签名）
   help / --help                           显示本帮助
 
 前置条件:
@@ -191,6 +193,10 @@ fn run(args: &[String]) -> i32 {
     // 配置文件夹管理（本地文件操作，不经过 daemon；daemon 热加载）。
     if args[0].as_str() == "config" {
         return run_config(&args[1..]);
+    }
+    // 设备配对（D7；本地文件 + 前台 TCP，不经过 daemon；daemon 热加载 peers/）。
+    if args[0].as_str() == "pair" {
+        return nexus::pair_cli::run_pair(&args[1..]);
     }
 
     let command = match parse_command(&args) {

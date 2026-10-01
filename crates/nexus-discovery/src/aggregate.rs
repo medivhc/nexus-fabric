@@ -1,4 +1,4 @@
-//! 聚合发现（DESIGN §8.2 D5）：多源合并去重 + 优先级 + 可观测。
+//! 聚合发现（DESIGN §8.2 D5/D7）：多源合并去重 + 优先级 + 可观测。
 //!
 //! Portable Core：零 I/O、零第三方依赖。
 
@@ -7,14 +7,16 @@ use std::net::SocketAddr;
 
 use super::lsa::{LsaDiscovery, Lsdb};
 use super::mdns::MdnsDiscovery;
+use super::paired::PairedDiscovery;
 use super::{Discovery, DiscoveryMetrics, DiscoverySource, PeerId, ResolvedAddr, StaticDiscovery};
 
-/// 聚合发现：静态 > LSA > mDNS 按优先级合并去重。
+/// 聚合发现：配对 > 静态 > LSA > mDNS 按优先级合并去重。
 ///
 /// `LsaDiscovery` 借用 `Lsdb`，故本类型带生命周期 `'a`。
-/// 每次 [`Discovery::resolve`] 调用更新 [`DiscoveryMetrics`]（D6）。
+/// 每次 [`Discovery::resolve`] 调用更新 [`DiscoveryMetrics`]（D6/D7）。
 #[derive(Debug)]
 pub struct AggregateDiscovery<'a> {
+    paired_src: Option<PairedDiscovery>,
     static_src: StaticDiscovery,
     lsa_src: LsaDiscovery<'a>,
     mdns_src: MdnsDiscovery,
@@ -22,9 +24,10 @@ pub struct AggregateDiscovery<'a> {
 }
 
 impl<'a> AggregateDiscovery<'a> {
-    /// 组合三源构造聚合器。
+    /// 组合三源构造聚合器（D5 冻结签名；配对源用 `with_paired` 接入）。
     pub fn new(static_src: StaticDiscovery, lsdb: &'a Lsdb, mdns_src: MdnsDiscovery) -> Self {
         Self {
+            paired_src: None,
             static_src,
             lsa_src: LsaDiscovery::new(lsdb),
             mdns_src,
@@ -32,12 +35,28 @@ impl<'a> AggregateDiscovery<'a> {
         }
     }
 
+    /// 接入配对源（D7；builder 加法，不破坏 D5 冻结的 `new` 签名）。
+    pub fn with_paired(mut self, paired: PairedDiscovery) -> Self {
+        self.paired_src = Some(paired);
+        self
+    }
+
     /// 按优先级解析，返回带来源标注的地址（同地址去重，保留最高优先级）。
     #[must_use]
     pub fn resolve_with_sources(&self, peer: &PeerId) -> Vec<ResolvedAddr> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
-        // 变体声明顺序即优先级（DiscoverySource::Static < Lsa < Mdns 的数值序）。
+        // 优先级：Paired > Static > Lsa > Mdns（变体声明顺序）。
+        if let Some(paired) = &self.paired_src {
+            for addr in Discovery::resolve(paired, peer) {
+                if seen.insert(addr) {
+                    out.push(ResolvedAddr {
+                        addr,
+                        source: DiscoverySource::Paired,
+                    });
+                }
+            }
+        }
         let sources: [(DiscoverySource, Vec<SocketAddr>); 3] = [
             (
                 DiscoverySource::Static,
@@ -73,12 +92,20 @@ impl<'a> AggregateDiscovery<'a> {
 }
 
 impl Discovery for AggregateDiscovery<'_> {
-    /// 聚合解析（只返回地址）；更新 D6 计数器：
+    /// 聚合解析（只返回地址）；更新 D6/D7 计数器：
     /// 有产出的源 `hits_{source}++`，全空则 `miss++`。
     fn resolve(&self, peer: &PeerId) -> Vec<SocketAddr> {
+        let paired_addrs = self
+            .paired_src
+            .as_ref()
+            .map(|p| Discovery::resolve(p, peer))
+            .unwrap_or_default();
         let static_addrs = Discovery::resolve(&self.static_src, peer);
         let lsa_addrs = self.lsa_src.resolve(peer);
         let mdns_addrs = Discovery::resolve(&self.mdns_src, peer);
+        if !paired_addrs.is_empty() {
+            self.metrics.hits_paired();
+        }
         if !static_addrs.is_empty() {
             self.metrics.hits_static();
         }
@@ -90,7 +117,12 @@ impl Discovery for AggregateDiscovery<'_> {
         }
         let mut seen = HashSet::new();
         let mut out = Vec::new();
-        for addr in static_addrs.into_iter().chain(lsa_addrs).chain(mdns_addrs) {
+        for addr in paired_addrs
+            .into_iter()
+            .chain(static_addrs)
+            .chain(lsa_addrs)
+            .chain(mdns_addrs)
+        {
             if seen.insert(addr) {
                 out.push(addr);
             }
@@ -203,5 +235,53 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].addr, addr("127.0.0.1:9999"));
         assert_eq!(r[0].source, DiscoverySource::Mdns);
+    }
+
+    #[test]
+    fn paired_source_highest_priority() {
+        use crate::paired::{PairedDiscovery, PairedPeer};
+        // 配对源的地址优先于静态源（D7：Paired > Static > Lsa > Mdns）。
+        let mut paired = PairedDiscovery::new();
+        // 注意：PairedDiscovery 内部用 PeerId(hex(pubkey)) 做键。
+        let peer_hex = "ab".repeat(32); // 64 hex chars = 32 bytes
+        let peer_id_bytes = crate::paired::hex_decode(&peer_hex).unwrap();
+        let mut pid = [0u8; 32];
+        pid.copy_from_slice(&peer_id_bytes);
+        let pp = PairedPeer {
+            peer_id: pid,
+            name: "test".to_string(),
+            addresses: vec![addr("10.9.9.9:9999")],
+            paired_at: 0,
+        };
+        paired.insert(&pp);
+        let peer_key = peer(peer_hex.as_str());
+        let static_src = StaticDiscovery::new([(peer_key.clone(), addr("10.0.0.1:1111"))]);
+        let db = lsdb_with(&[(peer_hex.as_str(), Some("udp://10.0.0.2:2222"))]);
+        let agg = AggregateDiscovery::new(static_src, &db, mdns("self")).with_paired(paired);
+        let r = agg.resolve_with_sources(&peer_key);
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[0].source, DiscoverySource::Paired);
+        assert_eq!(r[0].addr, addr("10.9.9.9:9999"));
+        assert_eq!(r[1].source, DiscoverySource::Static);
+        assert_eq!(r[2].source, DiscoverySource::Lsa);
+        // metrics 计数配对命中
+        let v = Discovery::resolve(&agg, &peer_key);
+        assert_eq!(v.len(), 3);
+        let snap = agg.metrics().snapshot();
+        assert_eq!(snap.hits_paired, 1);
+        assert_eq!(snap.hits_static, 1);
+    }
+
+    #[test]
+    fn without_paired_behaves_as_before() {
+        // 未调用 with_paired 时，行为与 D5 冻结时一致（向后兼容）。
+        let static_src = StaticDiscovery::new([(peer("n1"), addr("10.0.0.1:1111"))]);
+        let db = Lsdb::new(peer("self"));
+        let agg = AggregateDiscovery::new(static_src, &db, mdns("self"));
+        let r = agg.resolve_with_sources(&peer("n1"));
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].source, DiscoverySource::Static);
+        let snap = agg.metrics().snapshot();
+        assert_eq!(snap.hits_paired, 0);
     }
 }

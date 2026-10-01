@@ -12,9 +12,15 @@
 pub mod aggregate;
 pub mod lsa;
 pub mod mdns;
+pub mod paired;
 pub mod routing;
 
 pub use aggregate::AggregateDiscovery;
+pub use paired::{
+    NodeIdentity, PairedDiscovery, PairedPeer, PairingCode, PairingError, PairingFrame,
+    decode_pairing_frame, decode_peer_file, encode_pairing_frame, encode_peer_file, hex_decode,
+    hex_encode, pairing_sign_msg,
+};
 
 use std::collections::HashMap;
 use std::fmt;
@@ -117,10 +123,14 @@ impl Discovery for StaticDiscovery {
     }
 }
 
-/// 发现源（D5；变体声明顺序即聚合优先级：静态 > LSA > mDNS）。
+/// 发现源（D5；变体声明顺序即聚合优先级：配对 > 静态 > LSA > mDNS）。
+///
+/// D7 新增 `Paired`（用户显式配对信任，优先级最高）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DiscoverySource {
-    /// 显式静态配置（最可信）。
+    /// 显式配对信任（D7；最高优先级）。
+    Paired,
+    /// 显式静态配置。
     Static,
     /// LSA 泛洪携带的 locator。
     Lsa,
@@ -133,6 +143,7 @@ impl DiscoverySource {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Paired => "paired",
             Self::Static => "static",
             Self::Lsa => "lsa",
             Self::Mdns => "mdns",
@@ -158,9 +169,10 @@ pub struct ResolvedAddr {
 /// 发现可观测计数器（D6；`&self` 可更新，供 `AggregateDiscovery` 用）。
 ///
 /// Prometheus 命名约定（导出是组合根职责）：
-/// `discovery_hits{source="static|lsa|mdns"}`、`discovery_miss`。
+/// `discovery_hits{source="paired|static|lsa|mdns"}`、`discovery_miss`。
 #[derive(Debug, Default)]
 pub struct DiscoveryMetrics {
+    hits_paired: std::sync::atomic::AtomicU64,
     hits_static: std::sync::atomic::AtomicU64,
     hits_lsa: std::sync::atomic::AtomicU64,
     hits_mdns: std::sync::atomic::AtomicU64,
@@ -170,6 +182,8 @@ pub struct DiscoveryMetrics {
 /// [`DiscoveryMetrics`] 的快照。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DiscoveryMetricsSnapshot {
+    /// 有 ≥1 地址产出的配对源解析次数（D7）。
+    pub hits_paired: u64,
     /// 有 ≥1 地址产出的静态源解析次数。
     pub hits_static: u64,
     /// 有 ≥1 地址产出的 LSA 源解析次数。
@@ -181,6 +195,12 @@ pub struct DiscoveryMetricsSnapshot {
 }
 
 impl DiscoveryMetrics {
+    /// 记录一次配对源命中（D7；`&self`，原子更新）。
+    pub fn hits_paired(&self) {
+        self.hits_paired
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// 记录一次静态源命中（`&self`，原子更新）。
     pub fn hits_static(&self) {
         self.hits_static
@@ -209,6 +229,7 @@ impl DiscoveryMetrics {
     pub fn snapshot(&self) -> DiscoveryMetricsSnapshot {
         let load = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
         DiscoveryMetricsSnapshot {
+            hits_paired: load(&self.hits_paired),
             hits_static: load(&self.hits_static),
             hits_lsa: load(&self.hits_lsa),
             hits_mdns: load(&self.hits_mdns),

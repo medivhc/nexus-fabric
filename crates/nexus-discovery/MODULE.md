@@ -394,3 +394,65 @@ disjoint）零改动。
   协议手写可控、可确定性单测；③ 组合根 socket 装配批准新增 `socket2`
   （safe、MIT/Apache-2.0、传递闭包仅 libc/windows-sys），**仅限 apps/nexus**
   （组合根），`nexus-discovery` 保持零第三方依赖、零 I/O。
+
+### 冻结契约（配对 D7，`.agents/plans/pairing-plan.md`，scenarios/product/pairing.toml）
+
+设备间信任建立（pairing）：带外配对码 + ed25519 签名认证。配对 ≠ 建连
+（配对只建信任，不建立 Connectivity）；Identity（ed25519 公钥）≠ Locator
+（地址）；配对是一次性仪式，发现是持续查询。
+
+新模块 `paired`（portable：零 I/O；`ring` 0.17 用于 ed25519，workspace 已用）：
+
+- **配对码**：`pub struct PairingCode { pub peer_id: [u8; 32], pub token: [u8; 16] }`
+  - `pub fn generate(peer_id: [u8; 32]) -> (Self, [u8; 16])`：生成 128-bit 随机 token
+    （`ring::rand`）。
+  - `pub fn encode(&self) -> String`：`nexus-pair:v1:<base64url_nopad(pubkey)>:<base64url_nopad(token)>`
+    （base64url 手写，零新依赖；总长 ~79 字符）。
+  - `pub fn decode(s: &str) -> Result<Self, PairingError>`：版本校验、前缀校验、
+    长度校验；失败返回结构化错误（不 panic）。
+  - 有效期由调用方管理（`invite` 命令 5 分钟超时；token 单次有效）。
+
+- **配对帧**：`pub enum PairingFrame { PairRequest { peer_id: [u8; 32], token: [u8; 16], name: String }, PairAccept { peer_id: [u8; 32], name: String, signature: [u8; 64] }, PairReject { reason: String } }`
+  - `pub fn encode_pairing_frame / decode_pairing_frame`：type tag u8
+    （21/22/23，避开 DiscoveryFrame 1–4 和 AutoDiscoveryFrame 11–14）；
+    定长字段直接拼接（peer_id 32 / token 16 / signature 64）；
+    字符串 = u16 BE 长度前缀 + UTF-8（复用 lib.rs `put_str`/`get_str`）。
+  - 签名内容：`token || peer_id_B`（48 字节）；`ring::signature` ed25519。
+  - 截断/未知 tag/非法 utf8 → `PairingError::Decode`（不 panic）。
+
+- **身份**：`pub struct NodeIdentity { pub peer_id: [u8; 32], secret: [u8; 32] }`
+  （secret 为 ed25519 seed，零化内存——本期 `Zeroize` 手写清零，`Drop` 时清零）。
+  - `pub fn generate() -> Self`（`ring::rand`）。
+  - `pub fn sign(&self, msg: &[u8]) -> [u8; 64]`。
+  - `pub fn verify(peer_id: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool`。
+
+- **配对设备存储**：`pub struct PairedPeer { pub peer_id: [u8; 32], pub name: String, pub addresses: Vec<SocketAddr>, pub paired_at: u64 }`
+  （`paired_at` 为 unix 秒，由调用方注入，便于确定性测试）。
+  - `pub fn encode_peer_file(&PairedPeer) -> String` / `pub fn decode_peer_file(&str) -> Result<PairedPeer, PairingError>`：
+    TOML 子集手写（`peer_id = "<hex>"` / `name = "..."` / `addresses = [...]` / `paired_at = N`），
+    零新依赖。
+  - `pub fn peer_filename(peer_id: &[u8; 32]) -> String`：`<hex>.toml`（64 hex 字符）。
+
+- **PairedDiscovery**：`pub struct PairedDiscovery { peers: HashMap<PeerId, Vec<SocketAddr>> }`
+  - `pub fn new() -> Self`；`pub fn insert(&mut self, peer: PairedPeer)`（peer_id 转 `PeerId(hex)`）；
+    `pub fn remove(&mut self, peer_id: &[u8; 32]) -> bool`。
+  - `impl Discovery for PairedDiscovery`：查表返回地址（空 → 空 Vec，不报错）。
+
+- **D7-D5 集成**：`pub enum DiscoverySource` 新增变体 `Paired`（置于首位，优先级最高）；
+  现有 `Static/Lsa/Mdns` 相对顺序不变。`DiscoveryMetrics` 新增 `hits_paired` 计数器
+  （`AtomicU64` + snapshot 字段）。
+  - `AggregateDiscovery::with_paired(self, paired: PairedDiscovery) -> Self`（builder 加法；
+    D5 冻结的 `new(static, lsdb, mdns)` 签名不变）。
+  - `resolve_with_sources` 按 `Paired > Static > Lsa > Mdns` 查询去重。
+
+- **错误**：`pub enum PairingError { InvalidCode(String), Decode(String), Crypto(String), Expired, TokenMismatch, Io(String) }`
+  （`Display` + `Error`；不暴露内部细节给对端——`PairReject.reason` 用通用文案）。
+
+冻结语义：配对协议只做信任建立，不发起 Connectivity（Pairing ≠ Connectivity Establishment）；
+token 单次有效、5 分钟过期；签名验证失败 → 拒绝配对（不保存）；`invite` 为一次性前台命令
+（非 daemon，符合"nexus 是瘦客户端"）；私钥文件权限 600（`identity.toml`），公钥文件 644
+（`peers/*.toml`）——权限设置是组合根（apps/nexus）职责，`nexus-discovery` 只负责格式。
+
+Deletion Test：配对是"信任建立"的独立维度（发现是"地址查询"，两者正交）；
+删除后无法安全地将新设备加入网络（只能手动复制公钥，无 MITM 防护）。
+不同于"为优雅而抽象"。
