@@ -13,3 +13,4 @@ workspace = true
 serde_json = { version = "1", default-features = false, features = ["std"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 nexus-connectivity = { path = "../../crates/nexus-connectivity" }
+nexus-dns = { path = "../../crates/nexus-dns" }

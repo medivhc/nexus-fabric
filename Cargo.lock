@@ -788,6 +788,7 @@ name = "nexus-harness"
 version = "0.1.0"
 dependencies = [
  "nexus-connectivity",
+ "nexus-dns",
  "serde_json",
  "toml",
 ]
