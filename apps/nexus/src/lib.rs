@@ -19,6 +19,9 @@ pub mod geoip_sources;
 pub mod localapi_client;
 /// Auto-Mesh 自动挡组网编排器（Phase 1：自动打洞 + 断线重连）。
 pub mod mesh;
+/// `nexus network` 命令族（M6）：N1 Universal Connectivity 前台装配
+///（Composition Root：n1 portable core + fabric/path/discovery/platform-linux）。
+pub mod network;
 /// §9 可观察性命令（status / plan explain / session watch / connectivity status /
 /// dns status / dns cache / platform capabilities），见 PRODUCT.md#9-observability。
 pub mod observability;

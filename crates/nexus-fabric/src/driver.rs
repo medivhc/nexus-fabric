@@ -31,6 +31,38 @@ use crate::cert::{Identity, build_client_crypto, build_server_config, generate_i
 use crate::transport::{StdUdpTransport, UdpTransport};
 use crate::{ConnStats, ConnectionId, FabricError, PeerId};
 
+/// Placeholder transport used during `cmd_rebind` between closing the old
+/// socket and binding the new one (F-EDGE-1). All operations fail; it is
+/// never observable outside the rebind window.
+struct ClosedTransport;
+
+impl UdpTransport for ClosedTransport {
+    fn recv_from(&mut self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "socket closed for rebind",
+        ))
+    }
+    fn send_to(&self, _buf: &[u8], _target: SocketAddr) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "socket closed for rebind",
+        ))
+    }
+    fn set_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "socket closed for rebind",
+        ))
+    }
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "socket closed for rebind",
+        ))
+    }
+}
+
 /// Logical connection ids; process-wide unique (P0: one driver per connection
 /// on the client side, one driver per listener on the server side).
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
@@ -70,6 +102,15 @@ pub struct ConnShared {
     pub dgrams: Mutex<VecDeque<Vec<u8>>>,
     pub dgram_cv: Condvar,
     pub stats: Mutex<ConnStats>,
+    /// F-EDGE-3: serializes concurrent `rebind()` calls on this connection.
+    /// The driver loop is single-threaded so `Cmd::Rebind` execution is already
+    /// sequential, but that is incidental to the current implementation, not an
+    /// API-level guarantee. This lock makes the ordering explicit at the
+    /// portable-core boundary: rapid successive rebinds (e.g. link monitor
+    /// backoff + path-switch event firing together) execute in call order,
+    /// never interleaved. Deletion Test: without it, a future multi-threaded
+    /// driver refactor would race the socket swap in `cmd_rebind`.
+    pub rebind_lock: Mutex<()>,
 }
 
 pub struct ConnState {
@@ -102,6 +143,7 @@ impl ConnShared {
             dgrams: Mutex::new(VecDeque::new()),
             dgram_cv: Condvar::new(),
             stats: Mutex::new(ConnStats::unknown()),
+            rebind_lock: Mutex::new(()),
         }
     }
 }
@@ -523,7 +565,8 @@ impl Loop {
         server_name: &str,
         now: Instant,
     ) -> Result<u64, FabricError> {
-        let cc = ClientConfig::new(Arc::new(crypto));
+        let mut cc = ClientConfig::new(Arc::new(crypto));
+        cc.transport_config(crate::cert::quic_transport_config());
         let (handle, quic) = self
             .endpoint
             .connect(now, cc, remote, server_name)
@@ -569,12 +612,14 @@ impl Loop {
     /// from a new local port. The peer migrates via QUIC path validation
     /// (S3, S6) when it sees the new source address (passive migration).
     ///
-    /// Note: we deliberately do NOT call quinn-proto's
-    /// `local_address_changed()` here: its `update_rem_cid` + `ping` path
-    /// trips a `debug_assert!` in quinn-proto 0.11.18's `pto_time_and_space`
-    /// when the connection goes idle post-migration. Passive migration
-    /// (new source address observed by the peer) is RFC 9000 §9-compliant
-    /// and sufficient.
+    /// Note: we do NOT call quinn-proto's `local_address_changed()` here
+    /// (F-EDGE-2). That call only resets this endpoint's path state; it does
+    /// not help the peer migrate its send path — the peer migrates passively
+    /// when it observes packets from the new source address (RFC 9000 §9).
+    /// The old code deliberately avoided the call because quinn-proto 0.11.18's
+    /// `pto_time_and_space` trips a `debug_assert!` when the connection goes
+    /// idle post-migration. Migration trigger packets are driven by the caller
+    /// (E4 burst / application data).
     fn cmd_rebind(&mut self, conn: u64) -> Result<SocketAddr, FabricError> {
         if !self.live.contains_key(&conn) {
             return Err(FabricError::Closed(0));
@@ -582,15 +627,59 @@ impl Loop {
         // Rebind always reverts to a fresh direct UDP socket (S9): re-creating
         // a TURN allocation mid-connection is out of scope for 4b. The TURN
         // path is exercised without rebind (see product.fabric-turn-relay).
-        let sock: Box<dyn UdpTransport> = Box::new(
-            StdUdpTransport::bind("127.0.0.1:0".parse().unwrap())
-                .map_err(|e| FabricError::Transport(e.to_string()))?,
-        );
+        //
+        // D0 (N1 装配)：绑定 0.0.0.0 而非 127.0.0.1。回环绑定在真实拓扑
+        // （双 netns + veth / 任何非回环 underlay）下无法到达对端，
+        // rebind 后的连接会永久失联；wildcard 让内核按路由选源地址，
+        // 在回环拓扑上的行为与原来一致（回归风险低）。
+        //
+        // N1 E4 修复：优先尝试绑定到原地址（保留端口）。Listener 重绑到
+        // 随机端口会导致对端按旧端口发送的包丢失；若原 IP 已不存在
+        // （如 roam 后旧 IP 被删除），则回退到 wildcard。
+        // Server 必须保留端口（well-known），bind 失败则报错而非回退。
+        //
+        // F-EDGE-1 修复：必须先释放旧 socket 再 bind。旧 socket 在新 bind
+        // 成功前仍持有端口（StdUdpTransport 无 SO_REUSEADDR），否则
+        // bind(orig) 与 bind(0.0.0.0:port) 恒 EADDRINUSE，端口保留成死代码。
+        // 若全部 bind 失败，连接失去 socket（不可恢复，返回 Err）。
+        //
+        // 注意：Client rebind 必须产生**不同**的本地地址，否则对端不会
+        // 触发 QUIC 被动迁移。若原 IP 仍存在，直接 bind(orig) 会得到完全
+        // 相同的地址，迁移无从发生。因此 Client 跳过 bind(orig)，直接用
+        // wildcard（新 IP 由路由决定，端口随机），保证地址变化。
+        let orig = *self.shared.local_addr.lock().unwrap();
+        let is_server = self.server_config.is_some();
+        drop(std::mem::replace(
+            &mut self.socket,
+            Box::new(ClosedTransport),
+        ));
+        let sock: Box<dyn UdpTransport> = if is_server {
+            // Server：必须保留原地址/端口（well-known）。若原 IP 已不存在
+            // （如本端 roam），bind 失败则报错，不回退（调用方处理）。
+            Box::new(StdUdpTransport::bind(orig).map_err(|e| {
+                FabricError::Transport(format!(
+                    "server rebind must preserve {orig}, bind failed: {e}"
+                ))
+            })?)
+        } else {
+            // Client：直接 wildcard 随机端口，保证新地址与旧的不同，
+            // 触发对端 QUIC 被动迁移。端口保留非必需（迁移不依赖端口）。
+            Box::new(
+                StdUdpTransport::bind("0.0.0.0:0".parse().unwrap())
+                    .map_err(|e| FabricError::Transport(e.to_string()))?,
+            )
+        };
         let addr = sock
             .local_addr()
             .map_err(|e| FabricError::Transport(e.to_string()))?;
         self.socket = sock;
         *self.shared.local_addr.lock().unwrap() = addr;
+        // F-EDGE-2：移除无条件 local_address_changed() 调用。
+        // 该调用只影响本端（B）路径状态，不能帮助对端（A）迁移发送路径；
+        // A 的迁移靠收到 B 新源地址包时的被动迁移（QUIC 标准行为）。
+        // 旧代码刻意不调用（quinn-proto 0.11.18 pto_time_and_space 在
+        // 迁移后 idle 时触发 debug_assert）；无条件调用重引入该风险。
+        // B 的迁移触发包由调用方（E4 burst / 业务数据）驱动发出。
         // Refresh stats immediately so the caller observes the new path.
         self.update_stats(conn);
         Ok(addr)

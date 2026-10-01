@@ -58,6 +58,8 @@ nexus — Nexus 统一 Resource Fabric 控制面 CLI（瘦客户端）
   diagnose                                统一诊断
   platform capabilities                   平台能力清单
   run <resource>                          执行远程资源访问（进程内 SDK）
+  network up --config <toml>              N1 装配前台运行（建 TUN→dial→包泵，Ctrl-C 退出）
+  network status [--config <toml>]        N1 装配状态（无 daemon 时诚实标注）
   subnet up|status|leave|punch            虚拟子网命令族（进程内 SDK，PRODUCT §12.28）
   schedule at|every|list|cancel|tick      计划任务命令族（进程内 SDK，PRODUCT §14）
   proxy [--addr <ip:port>] [--config <path>] [--tun]
@@ -214,6 +216,14 @@ fn run(args: &[String]) -> i32 {
                 0
             }
         };
+    }
+
+    // N1 装配命令族走进程内 Composition Root（M6；无 daemon 路由）。
+    if matches!(
+        command,
+        ControlCommand::NetworkUp { .. } | ControlCommand::NetworkStatus
+    ) {
+        return nexus::network::dispatch(&command, &args, json_mode);
     }
 
     // 有 daemon 路由 → 裸 HTTP GET；无路由 → 本地合成 UNSUPPORTED。
@@ -611,6 +621,23 @@ fn parse_command(args: &[String]) -> Result<ControlCommand, String> {
                 resource: resource.clone(),
             }),
             None => Err("usage: nexus run <resource>".into()),
+        },
+        "network" => match args.get(1).map(String::as_str) {
+            Some("up") => {
+                let config_path = args
+                    .windows(2)
+                    .find(|w| w[0] == "--config")
+                    .map(|w| w[1].clone())
+                    .ok_or("usage: nexus network up --config <toml>")?;
+                let text = std::fs::read_to_string(&config_path)
+                    .map_err(|e| format!("cannot read {config_path}: {e}"))?;
+                Ok(ControlCommand::NetworkUp { config: text })
+            }
+            Some("status") => Ok(ControlCommand::NetworkStatus),
+            _ => Err(
+                "usage: nexus network up --config <toml> | nexus network status [--config <toml>]"
+                    .into(),
+            ),
         },
         other => Err(format!("unknown command: {other}")),
     }

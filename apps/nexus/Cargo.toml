@@ -28,6 +28,9 @@ nexus-transport = { path = "../../crates/nexus-transport" }
 nexus-auth = { path = "../../crates/nexus-auth" }
 nexus-service = { path = "../../crates/nexus-service" }
 nexus-network = { path = "../../crates/nexus-network" }
+# N1 装配（M6）：Composition Root 经注入 trait 消费 fabric/path。
+nexus-fabric = { path = "../../crates/nexus-fabric" }
+nexus-path = { path = "../../crates/nexus-path" }
 nexus-compute = { path = "../../crates/nexus-compute" }
 nexus-workspace = { path = "../../crates/nexus-workspace" }
 nexus-dns = { path = "../../crates/nexus-dns" }

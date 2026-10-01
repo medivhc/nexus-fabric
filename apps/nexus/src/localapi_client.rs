@@ -68,6 +68,8 @@ pub fn route_for(command: &ControlCommand) -> Option<&'static str> {
         | ControlCommand::Diagnose => None,
         // Run 保持进程内 SDK 路径（LocalAPI 无对应路由）。
         ControlCommand::Run { .. } => None,
+        // N1 装配命令由 CLI 进程内 Composition Root 直接执行（M6；无 daemon 路由）。
+        ControlCommand::NetworkUp { .. } | ControlCommand::NetworkStatus => None,
     }
 }
 
@@ -93,6 +95,8 @@ pub fn command_name(command: &ControlCommand) -> &'static str {
         ControlCommand::Diagnose => "diagnose",
         ControlCommand::PlatformCapabilities => "platform capabilities",
         ControlCommand::Run { .. } => "run",
+        ControlCommand::NetworkUp { .. } => "network up",
+        ControlCommand::NetworkStatus => "network status",
     }
 }
 

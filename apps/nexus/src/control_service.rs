@@ -1,6 +1,6 @@
 //! CLI 前端 `ControlService` 实现。
 //!
-//! 把 `nexus-control-api` 的全部 17 个 `ControlCommand` 变体路由到
+//! 把 `nexus-control-api` 的全部 19 个 `ControlCommand` 变体路由到
 //! `crate::observability` 快照（与 nexusd 同源，不复制领域逻辑）。
 //!
 //! 同时提供 CLI 双输出所需的纯函数投影：
@@ -12,8 +12,10 @@
 use nexus_control_api::{ControlCommand, ControlOutput, ControlService, NexusError, StatusView};
 use serde_json::Value;
 
-/// Composition Root 的 `ControlService`：全部 17 个 §9 观察命令接线到
-/// `crate::observability` 快照（与 nexusd 同源）。无领域状态，可自由复制。
+/// Composition Root 的 `ControlService`：17 个 §9 观察命令接线到
+/// `crate::observability` 快照（与 nexusd 同源）；2 个 N1 装配命令
+/// （`NetworkUp`/`NetworkStatus`）由 `run()` 直接分发到进程内 Composition
+/// Root（`crate::network`），此处仅提供诚实占位。无领域状态，可自由复制。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ControlServiceImpl;
 
@@ -46,6 +48,13 @@ impl ControlServiceImpl {
             ControlCommand::Diagnose => crate::observability::diagnose()?,
             ControlCommand::PlatformCapabilities => crate::observability::platform_capabilities()?,
             ControlCommand::Run { resource } => crate::run_resource(resource)?,
+            // N1 装配命令由 run() 直接分发到进程内 Composition Root（M6），
+            // 不走快照；此处仅为穷尽匹配提供诚实占位。
+            ControlCommand::NetworkUp { .. } => serde_json::json!({
+                "verdict": "FAIL",
+                "detail": "network up is a foreground command; use `nexus network up --config <toml>`",
+            }),
+            ControlCommand::NetworkStatus => crate::network::status_json(None),
         };
         Ok(json)
     }
