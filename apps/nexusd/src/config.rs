@@ -364,6 +364,58 @@ mod tests {
     }
 
     #[test]
+    fn tun_section_defaults_when_absent() {
+        // 无 [tun] 小节 → enabled=true, name="nexus", mtu=1500（T1）。
+        let cfg = parse_daemon_toml("[localapi]\naddr = \"127.0.0.1:18080\"\n").unwrap();
+        assert!(cfg.tun.enabled);
+        assert_eq!(cfg.tun.name, "nexus");
+        assert_eq!(cfg.tun.mtu, 1500);
+    }
+
+    #[test]
+    fn tun_section_parses_canonical_snippet() {
+        // 与 docs/WINDOWS_TUN_DESIGN.md §1 的 wire format 对齐（T1）。
+        let text = "[tun]\nenabled = false\nname = \"nexus-test\"\nmtu = 9000\n";
+        let cfg = parse_daemon_toml(text).unwrap();
+        assert!(!cfg.tun.enabled);
+        assert_eq!(cfg.tun.name, "nexus-test");
+        assert_eq!(cfg.tun.mtu, 9000);
+    }
+
+    #[test]
+    fn tun_section_rejects_bad_mtu() {
+        // mtu 非法 → 拒绝加载（T1）。
+        assert!(parse_daemon_toml("[tun]\nmtu = 1279\n").is_err());
+        assert!(parse_daemon_toml("[tun]\nmtu = 9001\n").is_err());
+        assert!(parse_daemon_toml("[tun]\nmtu = -1\n").is_err());
+        assert!(parse_daemon_toml("[tun]\nmtu = \"big\"\n").is_err());
+        // 边界值合法。
+        assert!(parse_daemon_toml("[tun]\nmtu = 1280\n").is_ok());
+        assert!(parse_daemon_toml("[tun]\nmtu = 9000\n").is_ok());
+    }
+
+    #[test]
+    fn tun_section_rejects_empty_name() {
+        // 空设备名 → 拒绝加载（T1）。
+        assert!(parse_daemon_toml("[tun]\nname = \"\"\n").is_err());
+    }
+
+    #[test]
+    fn tun_change_needs_restart() {
+        // [tun] 字段变更 → NeedsRestart（T4）。
+        let d = std::env::temp_dir().join("nexusd-cfg-test-tun");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        write(&d, DAEMON_TOML, "[tun]\nenabled = true\n");
+        let dir = ConfigDir::new(&d).unwrap();
+        let old = load(&dir).unwrap();
+        write(&d, DAEMON_TOML, "[tun]\nenabled = false\n");
+        let new = load(&dir).unwrap();
+        assert_eq!(classify_change(&old, &new), ChangeKind::NeedsRestart);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn empty_dir_loads_defaults() {
         let d = std::env::temp_dir().join("nexusd-cfg-test-empty");
         let _ = std::fs::remove_dir_all(&d);

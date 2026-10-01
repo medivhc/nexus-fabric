@@ -146,6 +146,23 @@
 - 不变量：单 TUN（D1）；分类器唯一入口（S29）；N1 发送失败不阻塞其他分类
   （Proxy/Direct 照常）；`mesh_dropped_no_n1` 语义不变（无 N1 或发送失败都计数）。
 
+### `[tun]` no-tun 模式（T1-T4，2026-10-01 冻结）
+
+- **T1（`[tun]` 配置）**：`daemon.toml` 的 `[tun]` 小节（全部可选，有默认值）：
+  - `enabled`（bool，默认 `true`）：`false` = no-tun 模式，不创建 TUN；
+  - `name`（string，默认 `"nexus"`）：TUN 设备名（Linux），避开 `"Mihomo"` 等；
+  - `mtu`（整数，默认 1500，合法范围 [1280, 9000]，非法则拒绝加载）。
+- **T2（no-tun 行为）**：`[tun].enabled=false` 时：
+  - 跳过 TUN 创建，不启动 dataplane 线程（记日志 `"[nexusd] tun disabled; dataplane not started"`）；
+  - N1/proxy 子系统照常（由 `network.toml` / `proxy.yaml` 存在性决定，与 TUN 无关）；
+  - LocalAPI 照常服务；stats 标注 `tun_enabled=false`。
+- **T3（空配置拒绝）**：缺 `proxy.yaml` **且**缺 `network.toml` 时，daemon 拒绝启动
+  （exit 1，stderr 说明 `"no subsystem configured: need proxy.yaml and/or network.toml"`）。
+  有任一文件即启动（纯代理 / 纯组网 / 统一三模式，见 `docs/WINDOWS_TUN_DESIGN.md` §1）。
+- **T4（热加载分类）**：`[tun]` 任一字段变化 → `NeedsRestart`（TUN 设备启停需重建）。
+- 不变量：`enabled=true` 时行为与 D1 完全一致（零回归）；no-tun 时不创建任何
+  TUN 设备（`tun0`/系统 TUN 不受影响）；空配置拒绝先于 TUN 创建（快速失败）。
+
 ### 常规要求
 
 - 默认最小 surface：`private -> pub(crate) -> pub`。
