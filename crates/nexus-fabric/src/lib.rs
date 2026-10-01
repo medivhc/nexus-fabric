@@ -27,6 +27,13 @@ use std::time::Duration;
 use driver::{Cmd, ConnShared, Driver, StreamShared};
 pub use transport::{StdUdpTransport, UdpTransport};
 
+/// QSEQ (GAP-2): length of the big-endian sequence header prepended by
+/// `send_datagram_seqed`.
+pub const SEQ_HEADER_LEN: usize = 8;
+/// QSEQ (GAP-2): max user payload for `send_datagram_seqed`
+/// (1200-byte datagram cap minus the 8-byte header).
+pub const MAX_SEQED_PAYLOAD: usize = 1192;
+
 /// Node identity: ed25519 public key (cf. iroh's EndpointId).
 ///
 /// Distinct from the X25519 link-encryption identity in `nexus-connectivity`:
@@ -164,6 +171,58 @@ impl FabricConn {
             })
             .map_err(|_| FabricError::Closed(0))?;
         rx.recv().map_err(|_| FabricError::Closed(0))?
+    }
+
+    /// QSEQ (GAP-2): send a datagram with a fabric-layer sequence number.
+    ///
+    /// Atomically assigns the next per-connection sequence number (Q1, Q4),
+    /// prepends it as an 8-byte big-endian header, and sends via the normal
+    /// datagram path. Returns the assigned sequence number.
+    ///
+    /// This is NOT the QUIC wire packet number (inaccessible via quinn-proto's
+    /// public API; also semantically wrong for reordering due to retransmit
+    /// renumbering — see MODULE.md QSEQ). It is a per-connection datagram
+    /// identity sequence assigned at the QUIC send boundary.
+    ///
+    /// `data.len()` must be `<= 1192` (1200 cap minus 8-byte header).
+    pub fn send_datagram_seqed(&self, data: &[u8]) -> Result<u64, FabricError> {
+        if data.len() > MAX_SEQED_PAYLOAD {
+            return Err(FabricError::Transport(
+                "seqed datagram too large (1192 byte cap after 8-byte seq header)".into(),
+            ));
+        }
+        // Q4: fetch_add is atomic; the header is prepended and handed to the
+        // driver in the same call, so there is no "assigned but not sent" window
+        // visible to the caller. (Transmission order may still differ from
+        // assignment order under concurrency; the receiver's ReorderBuffer
+        // handles out-of-order delivery — that is its job.)
+        let seq = self
+            .inner
+            .datagram_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut buf = Vec::with_capacity(SEQ_HEADER_LEN + data.len());
+        buf.extend_from_slice(&seq.to_be_bytes());
+        buf.extend_from_slice(data);
+        self.send_datagram(&buf)?;
+        Ok(seq)
+    }
+
+    /// QSEQ (GAP-2): receive a datagram sent with [`FabricConn::send_datagram_seqed`].
+    ///
+    /// Strips the 8-byte big-endian sequence header and returns
+    /// `(seq, payload)`. Datagrams shorter than 8 bytes are rejected with
+    /// `FabricError::Transport` (Q3).
+    pub fn recv_datagram_seqed(&self) -> Result<(u64, Vec<u8>), FabricError> {
+        let raw = self.recv_datagram()?;
+        if raw.len() < SEQ_HEADER_LEN {
+            return Err(FabricError::Transport(
+                "datagram too short for seq header".into(),
+            ));
+        }
+        let mut hdr = [0u8; SEQ_HEADER_LEN];
+        hdr.copy_from_slice(&raw[..SEQ_HEADER_LEN]);
+        let seq = u64::from_be_bytes(hdr);
+        Ok((seq, raw[SEQ_HEADER_LEN..].to_vec()))
     }
 
     /// Receive an unreliable datagram (blocking).

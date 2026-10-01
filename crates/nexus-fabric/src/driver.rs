@@ -102,6 +102,10 @@ pub struct ConnShared {
     pub dgrams: Mutex<VecDeque<Vec<u8>>>,
     pub dgram_cv: Condvar,
     pub stats: Mutex<ConnStats>,
+    /// QSEQ (GAP-2): per-connection datagram sequence counter for
+    /// `send_datagram_seqed`. Monotonic `u64`, wraps via `fetch_add`.
+    /// `send_datagram` (non-seqed) does not touch this counter (Q1).
+    pub datagram_seq: AtomicU64,
     /// F-EDGE-3: serializes concurrent `rebind()` calls on this connection.
     /// The driver loop is single-threaded so `Cmd::Rebind` execution is already
     /// sequential, but that is incidental to the current implementation, not an
@@ -143,6 +147,7 @@ impl ConnShared {
             dgrams: Mutex::new(VecDeque::new()),
             dgram_cv: Condvar::new(),
             stats: Mutex::new(ConnStats::unknown()),
+            datagram_seq: AtomicU64::new(0),
             rebind_lock: Mutex::new(()),
         }
     }
