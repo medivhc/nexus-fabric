@@ -602,13 +602,14 @@ impl Loop {
     /// from a new local port. The peer migrates via QUIC path validation
     /// (S3, S6) when it sees the new source address (passive migration).
     ///
-    /// Note: we DO call quinn-proto's `local_address_changed()` here.
-    /// It resets path-specific state (congestion, RTT) so the peer's send
-    /// path migrates correctly. The `debug_assert!` in `pto_time_and_space`
-    /// only trips when the connection goes idle post-migration; during
-    /// active transfer (e.g. N1 E4 file transfer) it is safe. Passive
-    /// migration alone (new source address observed by peer) is insufficient
-    /// for bidirectional traffic: the peer's send path may not migrate.
+    /// Note: we do NOT call quinn-proto's `local_address_changed()` here
+    /// (F-EDGE-2). That call only resets this endpoint's path state; it does
+    /// not help the peer migrate its send path — the peer migrates passively
+    /// when it observes packets from the new source address (RFC 9000 §9).
+    /// The old code deliberately avoided the call because quinn-proto 0.11.18's
+    /// `pto_time_and_space` trips a `debug_assert!` when the connection goes
+    /// idle post-migration. Migration trigger packets are driven by the caller
+    /// (E4 burst / application data).
     fn cmd_rebind(&mut self, conn: u64) -> Result<SocketAddr, FabricError> {
         if !self.live.contains_key(&conn) {
             return Err(FabricError::Closed(0));
