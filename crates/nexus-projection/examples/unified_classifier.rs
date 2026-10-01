@@ -101,25 +101,33 @@ fn main() {
     check(inet_name == "Proxy");
 
     // --- S30: EWMA 选路 ---
-    let (ewma_best, _) = match &mesh {
-        Classification::Mesh { path: Some(p) } if *p == direct.remote_addr => ("direct", true),
+    let (ewma_best, ewma_degraded) = match &mesh {
+        Classification::Mesh {
+            path: Some(p),
+            degraded,
+        } if *p == direct.remote_addr => ("direct", *degraded),
         Classification::Mesh { .. } => ("other", false),
         _ => ("none", false),
     };
     check(matches!(
         &mesh,
         Classification::Mesh {
-            path: Some(p)
+            path: Some(p),
+            degraded: false,
         } if *p == direct.remote_addr
     ));
-    // 分数高于阈值 → degraded == false（select_best 内部；此处路径非空即通过）。
-    let ewma_degraded = false;
 
     // 全 unknown 回落。
     let m2 = PathManager::new(PathConfig::default());
     let clf2 = PacketClassifier::new(vec!["10.0.0.0/8".parse().unwrap()], vec![], &m2, &[], 50.0);
     let fallback = clf2.classify(&v4_packet([10, 9, 9, 9]));
-    let unknown_fallback = matches!(fallback, Classification::Mesh { path: None });
+    let unknown_fallback = matches!(
+        fallback,
+        Classification::Mesh {
+            path: None,
+            degraded: false
+        }
+    );
     check(unknown_fallback);
 
     // --- S31: FlowContext ---

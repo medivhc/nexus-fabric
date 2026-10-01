@@ -27,7 +27,11 @@ fn fake_ip_cidr() -> Cidr {
 pub enum Classification {
     /// Mesh：N1 转发。`path` 为 EWMA 选出的最优路径对端地址（S30）；
     /// 全 unknown 时为 `None`（回落默认 mesh 转发，不阻塞）。
-    Mesh { path: Option<std::net::SocketAddr> },
+    /// `degraded` 为 true 时表示最优路径分数低于阈值（已打 warn，不自动切 proxy）。
+    Mesh {
+        path: Option<std::net::SocketAddr>,
+        degraded: bool,
+    },
     /// 代理：送 proxy 规则引擎。
     Proxy,
     /// 直连：bypass/白名单。
@@ -110,10 +114,14 @@ impl<'a> PacketClassifier<'a> {
                 }
                 Classification::Mesh {
                     path: sel.best.map(|c| c.remote_addr),
+                    degraded: sel.degraded,
                 }
             }
             // 全 unknown → 路径 None，回落默认转发，不阻塞。
-            None => Classification::Mesh { path: None },
+            None => Classification::Mesh {
+                path: None,
+                degraded: false,
+            },
         }
     }
 
@@ -147,18 +155,6 @@ impl<'a> PacketClassifier<'a> {
             destination,
             profile: profile.to_string(),
         })
-    }
-
-    /// 目的 IP 是否在 fake-IP 池内（供外部调用方复用）。
-    pub fn is_fake_ip(ip: Ipv4Addr) -> bool {
-        let raw = u32::from(ip);
-        fake_ip_cidr().contains(raw)
-    }
-
-    /// 目的 IP 是否在 mesh 网段内（供外部调用方复用）。
-    pub fn is_mesh_ip(&self, ip: Ipv4Addr) -> bool {
-        let raw = u32::from(ip);
-        self.mesh_cidrs.iter().any(|c| c.contains(raw))
     }
 }
 
@@ -196,7 +192,10 @@ mod tests {
         // 全 unknown → Mesh { path: None }，不阻塞。
         assert_eq!(
             c.classify(&v4_packet([10, 1, 2, 3])),
-            Classification::Mesh { path: None }
+            Classification::Mesh {
+                path: None,
+                degraded: false
+            }
         );
     }
 
@@ -294,7 +293,10 @@ mod tests {
         let c = classifier(&m, &candidates);
         assert_eq!(
             c.classify(&v4_packet([10, 1, 2, 3])),
-            Classification::Mesh { path: None }
+            Classification::Mesh {
+                path: None,
+                degraded: false
+            }
         );
 
         // 喂 stats：c0 好（rtt 20ms），c1 差（rtt 200ms + 丢包）。
@@ -320,18 +322,51 @@ mod tests {
         assert_eq!(
             c.classify(&v4_packet([10, 1, 2, 3])),
             Classification::Mesh {
-                path: Some(c0.remote_addr)
+                path: Some(c0.remote_addr),
+                degraded: false,
             }
         );
     }
 
     #[test]
-    fn fake_ip_helpers() {
-        assert!(PacketClassifier::is_fake_ip(Ipv4Addr::new(198, 18, 0, 1)));
-        assert!(PacketClassifier::is_fake_ip(Ipv4Addr::new(
-            198, 19, 255, 255
-        )));
-        assert!(!PacketClassifier::is_fake_ip(Ipv4Addr::new(198, 20, 0, 1)));
-        assert!(!PacketClassifier::is_fake_ip(Ipv4Addr::new(8, 8, 8, 8)));
+    fn s30_degraded_still_mesh() {
+        // 劣化路径：分数低于阈值时仍选 Mesh（不自动切 proxy），degraded=true。
+        use nexus_path::{PathConfig, PathKind, PathStats};
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let mut m = PathManager::new(PathConfig::default());
+        let mk = |ip: [u8; 4]| CandidatePath {
+            kind: PathKind::Direct,
+            local_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 0),
+            remote_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), 443),
+            cost: 0.0,
+        };
+        let c0 = mk([10, 0, 0, 2]);
+        m.add_candidate(c0.clone());
+        let candidates = vec![c0.clone()];
+        // 喂极差 stats（高延迟+高丢包），分数必然低于阈值 50。
+        m.on_stats(
+            &c0.remote_addr,
+            PathStats {
+                rtt_ms: Some(5000),
+                loss_rate: Some(0.9),
+                throughput_bps: Some(1000),
+            },
+        );
+        // 阈值设得很高，确保 degraded。
+        let c = PacketClassifier::new(
+            vec!["10.0.0.0/8".parse().unwrap()],
+            vec![],
+            &m,
+            &candidates,
+            1e9, // 极高阈值，任何真实分数都低于它
+        );
+        match c.classify(&v4_packet([10, 1, 2, 3])) {
+            Classification::Mesh {
+                path: Some(p),
+                degraded: true,
+            } => assert_eq!(p, c0.remote_addr),
+            other => panic!("expected degraded Mesh, got {:?}", other),
+        }
     }
 }
