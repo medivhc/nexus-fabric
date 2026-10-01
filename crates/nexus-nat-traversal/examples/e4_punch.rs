@@ -240,7 +240,7 @@ fn initiator(args: &[String]) {
             socket,
             Arc::new(NoopPredictor),
         );
-        return finish(s.run(), s.phase(), &expect);
+        finish(s.run(), s.phase(), &expect);
     };
 
     // empty-candidates：不需要网络
