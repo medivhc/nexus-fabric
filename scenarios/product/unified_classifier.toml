@@ -14,7 +14,7 @@ config = "mesh_cidrs=[10.0.0.0/8], fake_ip=198.18.0.0/15, bypass=[192.168.0.0/16
 # 3. fake-IP 包（dst 198.18.0.5）→ Proxy。
 # 4. bypass 包（dst 192.168.1.1）→ Direct。
 # 5. 互联网包（dst 8.8.8.8）→ 规则引擎 → Proxy。
-# 6. 每个分类生成 FlowContext（origin=Tun，destination/resource 按分类）。
+# 6. 每个分类生成 FlowContext（origin=VirtualPacketInterface，destination/resource 按分类）。
 # 7. EWMA 全 unknown → Mesh 路径为 None（不阻塞）+ degraded 时 warn。
 # 8. 非 IPv4 包 → Drop（不生成 FlowContext）。
 [when]
@@ -57,7 +57,7 @@ equals = true
 # S31：FlowContext 生成。
 [[expect]]
 field = "flowctx.mesh.origin"
-equals = "Tun"
+equals = "VirtualPacketInterface"
 
 [[expect]]
 field = "flowctx.proxy.destination"

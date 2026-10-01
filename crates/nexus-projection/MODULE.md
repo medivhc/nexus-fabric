@@ -248,7 +248,7 @@ accept 线程，sync，零 tokio）把 SOCKS5/HTTP 显式代理映射为 fabric 
 
 **S31（FlowContext 生成，2026-10-01 冻结）**：分类后生成统一 `FlowContext`
 （`nexus-domain`），供 QoS/调度器使用：
-- `origin = FlowOrigin::Tun`；
+- `origin = FlowOrigin::VirtualPacketInterface`（TUN/VPI 来源）；
 - `destination` = 目的 IP 字符串（mesh/fake-ip）或域名（DNS 嗅探命中时）；
 - `resource` = 按分类映射（Mesh → mesh resource，Proxy → proxy resource，Direct → direct resource）；
 - `profile` = 调用方传入的使用画像（透传，不解析）。
