@@ -1,27 +1,41 @@
-//! QUIC over SOCKS5 CONNECT (DESIGN §3.5, P1).
+//! QUIC over proxy CONNECT transports (DESIGN §3.5).
 //!
-//! Per-link proxy transport: SOCKS5 handshake → connected `TcpStream` →
-//! 2-byte big-endian length-prefix framing → [`ProxyTransport`] implements
-//! [`nexus_fabric::UdpTransport`]. The QUIC driver needs zero changes;
-//! plug a `ProxyTransport` into [`nexus_fabric::FabricConn::connect_with_transport`].
+//! Per-link proxy transports: handshake → connected `TcpStream` → 2-byte
+//! big-endian length-prefix framing → [`nexus_fabric::UdpTransport`].
+//! The QUIC driver needs zero changes; plug a transport into
+//! [`nexus_fabric::FabricConn::connect_with_transport`].
+//!
+//! Three handshakes share one framing core ([`FramedTransport`], T4):
+//! - SOCKS5 CONNECT (RFC 1928) — [`ProxyTransport`] (X1–X6, frozen).
+//! - Shadowsocks session (AEAD) — [`SsTransport`] (T1; crypto reused from
+//!   `nexus-outbound-shadowsocks`, never reimplemented here).
+//! - Trojan (plaintext handshake this phase) — [`TrojanTransport`] (T2;
+//!   handshake reused from `nexus-outbound-trojan`; TLS postponed).
 //!
 //! This is the **transport** (per-link, path-layer decision), not the
 //! **egress** (per-flow, rule-engine decision — already built in 3b).
 //! Double encryption is intentional: the proxy layer provides obfuscation,
 //! E2E encryption stays the trust boundary (fabric S1 — the proxy only
-//! sees ciphertext).
+//! sees ciphertext payloads).
 //!
-//! Contract: `MODULE.md` (X1–X6). Protected after freeze.
+//! Contract: `MODULE.md` (X1–X6 frozen; T1–T6 frozen). Protected after freeze.
 
 mod framed;
+mod shadowsocks;
 mod socks5;
+mod trojan;
 
-pub use framed::{Counters, ProxyTransport};
+pub use framed::{Counters, FramedTransport, ProxyTransport};
+pub use nexus_outbound_shadowsocks::SsMethod; // T3: reuse, don't redefine
+pub use shadowsocks::{SsProxyConfig, SsTransport};
 pub use socks5::socks5_connect;
+pub use trojan::{trojan_connect, TrojanProxyConfig, TrojanTransport};
 
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
+
+use nexus_outbound_shadowsocks::OutboundCipherError;
 
 /// SOCKS5 proxy server configuration.
 ///
@@ -61,7 +75,7 @@ pub struct Socks5Auth {
     pub password: String,
 }
 
-/// Typed errors for the SOCKS5 handshake and framing layer.
+/// Typed errors for the proxy handshakes and framing layer.
 #[derive(Debug)]
 pub enum ProxyError {
     /// Underlying I/O failure.
@@ -74,10 +88,18 @@ pub enum ProxyError {
     ConnectRejected(u8),
     /// Malformed server reply (bad version, truncated, unknown ATYP…).
     BadReply(&'static str),
-    /// Frame length prefix exceeds [`MAX_DATAGRAM`] (X1).
+    /// Frame length prefix exceeds the accepted wire bound (X1/T4).
     FrameTooLarge(usize),
     /// Received frame does not fit the caller's buffer.
     FrameOverflow { frame: usize, buf: usize },
+    /// `TryFrom<&OutboundConfig>` failed (T4): kind/locator/method/password
+    /// problem — fix the config and retry.
+    BadConfig(String),
+    /// Shadowsocks AEAD failure (T1/T3): wrong password, corrupt record…
+    SsCrypto(OutboundCipherError),
+    /// Dial target not representable in the protocol's ATYP subset
+    /// (IPv6 this phase; postponed, not silently mapped).
+    UnsupportedTarget(&'static str),
 }
 
 impl std::fmt::Display for ProxyError {
@@ -92,6 +114,9 @@ impl std::fmt::Display for ProxyError {
             Self::FrameOverflow { frame, buf } => {
                 write!(f, "proxy: frame ({frame}B) exceeds buffer ({buf}B)")
             }
+            Self::BadConfig(what) => write!(f, "proxy: bad config ({what})"),
+            Self::SsCrypto(e) => write!(f, "proxy: ss crypto: {e}"),
+            Self::UnsupportedTarget(what) => write!(f, "proxy: unsupported target ({what})"),
         }
     }
 }
@@ -100,6 +125,7 @@ impl std::error::Error for ProxyError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
+            Self::SsCrypto(e) => Some(e),
             _ => None,
         }
     }
@@ -131,7 +157,16 @@ impl From<ProxyError> for io::Error {
 }
 
 /// Maximum QUIC datagram carried in one frame (fabric S5, pre-PMTUD).
+/// Applies to the *plaintext* datagram for every transport (X1, T1).
 pub const MAX_DATAGRAM: usize = 1200;
+
+/// AEAD seal overhead per datagram on the ss data path:
+/// 12B nonce || ciphertext+16B tag (must match `SsStream::seal`'s output
+/// format in `nexus-outbound-shadowsocks`; guarded by unit test).
+pub const SS_SEAL_OVERHEAD: usize = 12 + 16;
+
+/// Largest accepted wire frame on the ss path (T4).
+pub const MAX_SEALED_FRAME: usize = MAX_DATAGRAM + SS_SEAL_OVERHEAD;
 
 /// Length-prefix width in bytes (big-endian u16).
 pub const FRAME_HEADER_LEN: usize = 2;

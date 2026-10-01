@@ -24,9 +24,13 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 mod ewma;
+mod fallback;
 mod race;
 
 pub use ewma::Ewma;
+pub use fallback::{
+    FallbackChain, FallbackConfig, ProxyEndpoint, TurnEndpoint, connect_with_fallback,
+};
 pub use race::{PathConnector, RaceBudget, RaceOutcome, race_connect};
 
 // ---------------------------------------------------------------------------

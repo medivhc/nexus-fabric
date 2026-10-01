@@ -62,24 +62,11 @@ pub struct RaceOutcome {
     pub elapsed_ms: u64,
 }
 
-/// Sort key for stagger order: preferred kind first, then lower cost.
-fn stagger_order(candidates: &[CandidatePath]) -> Vec<CandidatePath> {
-    let mut sorted = candidates.to_vec();
-    sorted.sort_by(|a, b| {
-        (a.kind, a.cost)
-            .partial_cmp(&(b.kind, b.cost))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    sorted
-}
-
-// Note: PathKind derives Ord (Direct < Mesh < Turn < Proxy), so tuple
-// comparison gives kind-major, cost-minor ordering. NaN cost falls back
-// to Equal (stable, no panic).
-
 /// Race to establish connectivity over the candidate paths (R1).
 ///
-/// Candidates are tried in stagger order (see [`stagger_order`]). The first
+/// Candidates are attempted in the caller-provided order (R1, 2026-09-30
+/// requirement-change: no internal re-sorting; "in which order to try" is
+/// the caller's product semantic, e.g. the fallback chain F1). The first
 /// candidate starts immediately; if it hasn't succeeded within
 /// `stagger_delay_ms`, the next starts, up to `max_parallel` concurrent
 /// attempts. The first `Ok` wins; all other attempts are cancelled via the
@@ -102,7 +89,9 @@ pub fn race_connect(
         ));
     }
 
-    let ordered = stagger_order(candidates);
+    // Caller-provided order (R1 requirement-change). The caller owns the
+    // preference order; race_connect must not silently re-sort.
+    let ordered: Vec<CandidatePath> = candidates.to_vec();
     let start = Instant::now();
     let deadline = start + Duration::from_millis(budget.total_timeout_ms);
     let cancel = Arc::new(AtomicBool::new(false));
@@ -306,15 +295,42 @@ mod tests {
     }
 
     #[test]
-    fn stagger_order_prefers_kind_then_cost() {
-        let turn_cheap = path(PathKind::Turn, 9002, 1.0);
-        let direct_expensive = path(PathKind::Direct, 9001, 9.0);
-        let direct_cheap = path(PathKind::Direct, 9003, 0.5);
-        let ordered = stagger_order(&[turn_cheap, direct_expensive, direct_cheap]);
-        // Direct (kind) before Turn, regardless of cost; then cost ascending.
-        assert_eq!(ordered[0].remote_addr.port(), 9003);
-        assert_eq!(ordered[1].remote_addr.port(), 9001);
-        assert_eq!(ordered[2].remote_addr.port(), 9002);
+    fn caller_order_respected_not_kind_sorted() {
+        // Requirement-change (2026-09-30, R1): race_connect attempts
+        // candidates in caller-provided order. Direct fails fast; Proxy must
+        // be attempted before Turn even though PathKind orders Turn < Proxy.
+        // RED: fails on the old kind-major sort (winner would be Turn).
+        struct FailDirect;
+        impl PathConnector for FailDirect {
+            fn connect(&self, path: &CandidatePath, cancel: &AtomicBool) -> io::Result<u64> {
+                if path.kind == PathKind::Direct {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "direct blocked",
+                    ));
+                }
+                if cancel.load(Ordering::SeqCst) {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+                }
+                Ok(100)
+            }
+        }
+        let candidates = vec![
+            path(PathKind::Direct, 9001, 0.0),
+            path(PathKind::Proxy, 9003, 8.0),
+            path(PathKind::Turn, 9002, 5.0),
+        ];
+        let budget = RaceBudget {
+            stagger_delay_ms: 50,
+            max_parallel: 2,
+            total_timeout_ms: 5000,
+        };
+        let outcome = race_connect(&candidates, &FailDirect, &budget).unwrap();
+        assert_eq!(
+            outcome.winner.kind,
+            PathKind::Proxy,
+            "R1 requirement-change: caller order [Direct, Proxy, Turn] must be respected"
+        );
     }
 
     #[test]
