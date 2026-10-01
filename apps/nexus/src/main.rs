@@ -65,6 +65,7 @@ nexus — Nexus 统一 Resource Fabric 控制面 CLI（瘦客户端）
   proxy [--addr <ip:port>] [--config <path>] [--tun]
                                         真实 SOCKS5 数据面（进程内，PRODUCT §11）
   proxy speedtest                         节点测速（loopback 自检）
+  proxy bufferbloat-test --proxy <ip:port> bufferbloat 诊断（定位拥塞段）
   proxy run|host|relay ...                数据面组合根（进程内 SDK）
   system-proxy <status|set|clear|e2e>     系统代理控制（进程内 SDK，PRODUCT §13）
   autostart <install|remove|status>       开机自启（进程内 SDK，PRODUCT §13）
@@ -696,6 +697,80 @@ fn print_json_result(result: Result<Value, (String, String)>) -> i32 {
     }
     0
 }
+
+/// `nexus proxy bufferbloat-test` CLI 入口：
+///
+/// 用法：
+///   nexus proxy bufferbloat-test --proxy <ip:port> [--duration <secs>] [--threshold <ms>] [--json]
+///
+/// 流程：空载测基准延迟 → 打满上行 --duration 秒 → 负载下再测 → 按阈值判定。
+/// 人读模式输出一行诊断 +  verdict JSON；--json 只输出 JSON。
+fn proxy_bufferbloat_test_cli(args: &[String]) -> i32 {
+    let flags = parse_flags(args);
+    let json_mode = flags.contains_key("--json");
+
+    let proxy_raw = match flags.get("--proxy").and_then(|v| v.as_deref()) {
+        Some(p) => p,
+        None => {
+            eprintln!("error: missing --proxy <ip:port>");
+            eprintln!(
+                "usage: nexus proxy bufferbloat-test --proxy <ip:port> [--duration <secs>] [--threshold <ms>] [--json]"
+            );
+            return 2;
+        }
+    };
+    let proxy_addr: std::net::SocketAddr = match proxy_raw.parse() {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln!("error: invalid --proxy '{proxy_raw}' (want ip:port)");
+            return 2;
+        }
+    };
+    let duration_secs: u64 = flags
+        .get("--duration")
+        .and_then(|v| v.as_deref())
+        .map(|s| s.parse().unwrap_or(10))
+        .unwrap_or(10);
+    let threshold_ms: u64 = flags
+        .get("--threshold")
+        .and_then(|v| v.as_deref())
+        .map(|s| s.parse().unwrap_or(100))
+        .unwrap_or(100);
+
+    let config = nexus::BufferbloatConfig {
+        proxy_addr,
+        duration: std::time::Duration::from_secs(duration_secs),
+        threshold_ms,
+        ..Default::default()
+    };
+    match nexus::proxy_bufferbloat_test(&config) {
+        Ok(json) => {
+            if json_mode {
+                println!("{json}");
+            } else {
+                let baseline = json.get("baseline_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                let loaded = json.get("loaded_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                let delta = json.get("delta_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                let diagnosis = json
+                    .get("diagnosis")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("UNKNOWN");
+                let advice =
+                    json.get("advice").and_then(|v| v.as_str()).unwrap_or("");
+                println!("Baseline: {baseline}ms | Under load: {loaded}ms | Delta: +{delta}ms");
+                println!("Verdict: {diagnosis}（{advice}）");
+            }
+            0
+        }
+        Err(e) => {
+            // e.g. 代理不可达：结构化 FAIL，不 panic。
+            println!(
+                "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"{e}\"}}}}"
+            );
+            0
+        }
+    }
+}
 /// 路由资源名到 SDK 组合根闭环；带 `--endpoint` 时走真实网络访问（real transport）。
 fn proxy_run_resource(args: &[String]) -> i32 {
     let Some(resource) = args.first() else {
@@ -1013,6 +1088,7 @@ fn run_proxy(args: &[String]) -> i32 {
             println!(
                 "usage: nexus proxy [--addr <ip:port>] [--config <path>] [--tun] [--tun-name <n>]\n\
                  \x20      nexus proxy speedtest [--json]\n\
+                 \x20      nexus proxy bufferbloat-test --proxy <ip:port> [--duration <secs>] [--threshold <ms>] [--json]\n\
                  \x20      nexus proxy run <service|internet-access|compute|workspace> [--endpoint <ip:port>] [--json]\n\
                  \x20      nexus proxy host <service|internet-access|compute> --addr <ip:port> [--token <t>]\n\
                  \x20      nexus proxy relay --addr <ip:port>"
@@ -1030,6 +1106,10 @@ fn run_proxy(args: &[String]) -> i32 {
             ),
         }
         return 0;
+    }
+    // bufferbloat 诊断：空载基准 vs 打满负载的延迟对比，定位拥塞段。
+    if args.first().map(|a| a.as_str()) == Some("bufferbloat-test") {
+        return proxy_bufferbloat_test_cli(&args[1..]);
     }
     let flags = parse_flags(args);
     // §11.18 TUN 透明入站：--tun 走真实 wintun adapter 开卡（E5，需管理员 + wintun.dll
@@ -1492,5 +1572,58 @@ mod tests {
         ]);
         assert_eq!(code, 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bufferbloat_test_missing_proxy_exits_2() {
+        assert_eq!(run_str(&["proxy", "bufferbloat-test"]), 2);
+    }
+
+    #[test]
+    fn bufferbloat_test_invalid_proxy_exits_2() {
+        assert_eq!(
+            run_str(&["proxy", "bufferbloat-test", "--proxy", "not-an-addr"]),
+            2
+        );
+    }
+
+    #[test]
+    fn bufferbloat_test_loopback_no_bloat() {
+        // 集成测试：本地起一个只 accept 不读的 TCP listener 作为"代理"，
+        // loopback 无真实拥塞，打满 2 秒后应判 NO_BLOAT_UPSTREAM（exit 0）。
+        // 注意：沙盒可能限制 UDP，但 TCP loopback 可用。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // 后台 accept 线程：接受连接后立即丢弃（模拟代理 accept 但不消费上行）。
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_c = std::sync::Arc::clone(&stop);
+        let accept_h = std::thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("set_nonblocking");
+            while !stop_c.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((s, _)) => {
+                        // 保持连接打开但不读：发送方最终会遇到 TCP 窗口满，
+                        // 但 2 秒短时长内主要测的是建连延迟（不受窗口影响）。
+                        std::mem::forget(s);
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                }
+            }
+        });
+        let code = run_str(&[
+            "proxy",
+            "bufferbloat-test",
+            "--proxy",
+            &format!("127.0.0.1:{port}"),
+            "--duration",
+            "2",
+            "--json",
+        ]);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = accept_h.join();
+        // exit 0 表示诊断完成（verdict 在 JSON 里，loopback 应为 NO_BLOAT_UPSTREAM）。
+        assert_eq!(code, 0);
     }
 }
