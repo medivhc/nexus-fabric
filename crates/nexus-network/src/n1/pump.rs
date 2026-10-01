@@ -3,12 +3,20 @@
 //! - 上行：VPI 阻塞读 → IPv4 解析 → 静态路由 → `send_datagram`；
 //! - 下行：每 peer 一线程，`recv_datagram` 阻塞 → VPI 写。
 //!
-//! 线程模型（D1）：`Arc<Mutex<Box<dyn VirtualPacketInterface>>>` 在上行线程
-//! 与下行线程间共享；每次调用只短暂持锁，无死锁。Owner 为 `PumpHandle`：
-//! `shutdown()` 置位并关闭全部连接（打断下行阻塞读），再回收线程。
+//! 线程模型（D1，修 1）：`Arc<Mutex<Box<dyn VirtualPacketInterface>>>` 在上行线程
+//! 与下行线程间共享；每次调用只短暂持锁，无死锁。VPI 锁 poison 时恢复而非
+//! panic（修 2，防级联死亡）。Owner 为 `PumpHandle`：`shutdown()` 置位并关闭
+//! 全部连接（打断下行阻塞读），再回收两个 supervisor。
 //!
-//! 已知限制：上行线程阻塞在 VPI `receive()` 中时无法被可移植地打断
-//! （portable trait 无超时语义）；`shutdown()` 对上行线程用有界等待，
+//! - 上行：`n1-pump-upsup` supervisor 维持单个 `n1-pump-up` worker；worker 死亡
+//!   （panic/静默退出）则重启并计数（`PumpStats::uplink_restarts`）。
+//! - 下行：`n1-pump-sup` supervisor 为每对端维持 `n1-pump-dn-<peer>` worker。
+//! - supervisor 自身 panic 防护：每轮迭代包 `catch_unwind`，迭代内 panic 只记日志。
+//! - panic hook（修 3）：`start()` 安装进程级 hook，`n1-pump*` 线程 panic 时打
+//!   结构化日志（线程名、payload、时间），链式保留默认 hook 行为。
+//!
+//! 已知限制：上行 worker 阻塞在 VPI `receive()` 中时无法被可移植地打断
+//! （portable trait 无超时语义）；上行 supervisor 退出前对 worker 有界等待 2s，
 //! 超时则分离（detach）——进程退出时由 OS 回收。前台进程
 //! （E4 / `nexus network up`）的生命周期内此限制无影响。
 
@@ -114,12 +122,71 @@ pub struct PumpStats {
     pub uplink_forwarded: AtomicU64,
     /// 上行：丢弃（无路由/非 IPv4/超限/发送失败）。
     pub uplink_dropped: AtomicU64,
+    /// 上行：worker 被 supervisor 重启的次数（正常应为 0；>0 说明发生过线程死亡）。
+    pub uplink_restarts: AtomicU64,
     /// 下行：从对端收到的包数。
     pub downlink_rx: AtomicU64,
     /// 下行：成功写入 VPI 的包数。
     pub downlink_delivered: AtomicU64,
     /// 下行：VPI 写失败。
     pub downlink_vpi_err: AtomicU64,
+}
+
+/// VPI 锁：poison 时恢复而非 panic（修 2）。
+///
+/// 若某线程持锁期间 panic，Mutex 会被 poison；另一线程若用 `unwrap()` 会级联
+/// panic（静默死亡的候选机制之一）。此处取回内部值继续工作；触发 poison 的
+/// panic 本身由 panic hook 记录（修 3）。
+fn lock_vpi(
+    vpi: &Arc<Mutex<Box<dyn VirtualPacketInterface>>>,
+) -> std::sync::MutexGuard<'_, Box<dyn VirtualPacketInterface>> {
+    vpi.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 为 pump 线程安装结构化 panic hook（修 3，进程级，仅一次）。
+///
+/// 只记录线程名以 `n1-pump` 开头的线程（线程名、panic payload、时间戳），然后
+/// 链式调用之前的 hook（保留默认行为）。用于定位 pump 线程静默死亡的触发点。
+fn install_pump_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info: &std::panic::PanicHookInfo<'_>| {
+            let current = std::thread::current();
+            let name = current.name().unwrap_or("<unnamed>");
+            if name.starts_with("n1-pump") {
+                let payload = sanitize_panic_payload(info);
+                let ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                eprintln!("[n1-panic] thread=\"{name}\" time_unix_ms={ms} payload=\"{payload}\"");
+            }
+            prev(info);
+        }));
+    });
+}
+
+/// 提取并清洗 panic payload（截断 + 转义换行，保证单行结构化日志）。
+fn sanitize_panic_payload(info: &std::panic::PanicHookInfo<'_>) -> String {
+    let raw: String = {
+        let p = info.payload();
+        if let Some(s) = p.downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = p.downcast_ref::<String>() {
+            s.clone()
+        } else if let Some(loc) = info.location() {
+            format!("<non-string payload at {}:{}>", loc.file(), loc.line())
+        } else {
+            "<non-string payload>".to_string()
+        }
+    };
+    let mut s: String = raw.chars().take(500).collect();
+    s = s
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('"', "'");
+    s
 }
 
 /// VPI 包泵：拥有 VPI 句柄、静态路由、查表器。
@@ -160,18 +227,19 @@ impl VpiPump {
             .map(|r| r.peer)
     }
 
-    /// 启动上行/下行线程，返回 Owner 句柄。
+    /// 启动上行/下行线程，返回 Owner 句柄（修 1：上行线程由 supervisor 维持）。
     pub fn start(self) -> PumpHandle {
+        install_pump_panic_hook();
         let stop = Arc::new(AtomicBool::new(false));
         let this = Arc::new(self);
 
-        // 上行：VPI 阻塞读 → 路由 → send_datagram。
+        // 上行 supervisor：维持 `n1-pump-up` 线程；线程死亡（panic/静默退出）则重启。
         let up = Arc::clone(&this);
         let up_stop = Arc::clone(&stop);
-        let uplink = thread::Builder::new()
-            .name("n1-pump-up".into())
-            .spawn(move || up.uplink_loop(&up_stop))
-            .expect("pump uplink thread spawn");
+        let up_supervisor = thread::Builder::new()
+            .name("n1-pump-upsup".into())
+            .spawn(move || Self::uplink_supervisor(up, up_stop))
+            .expect("pump uplink supervisor spawn");
 
         // 下行 supervisor：按需为每个对端增补下行线程。
         let down = Arc::clone(&this);
@@ -184,9 +252,71 @@ impl VpiPump {
         PumpHandle {
             pump: this,
             stop,
-            uplink: Some(uplink),
+            up_supervisor: Some(up_supervisor),
             supervisor: Some(supervisor),
         }
+    }
+
+    /// 上行 supervisor 主循环：维持单个 `n1-pump-up` worker，死亡则重启。
+    ///
+    /// supervisor 自身的 panic 防护：每轮迭代包 `catch_unwind`（`AssertUnwindSafe`），
+    /// 迭代内 panic（如查表器 panic）只记日志，不杀死 supervisor。
+    fn uplink_supervisor(this: Arc<Self>, stop: Arc<AtomicBool>) {
+        let mut worker: Option<JoinHandle<()>> = None;
+        while !stop.load(Ordering::SeqCst) {
+            let iter = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Self::uplink_supervisor_iter(&this, &stop, &mut worker);
+            }));
+            if iter.is_err() {
+                // panic 已由 panic hook 记录结构化日志；supervisor 继续下一轮。
+                eprintln!("[n1-pump] uplink supervisor iteration panicked; continuing");
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+        // 退出前回收 worker；worker 可能阻塞在 VPI `receive()`（见模块头已知限制），
+        // 有界等待 2s 后分离（进程退出时由 OS 回收）。
+        if let Some(t) = worker.take() {
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            thread::spawn(move || {
+                let _ = t.join();
+                let _ = tx.send(());
+            });
+            let _ = rx.recv_timeout(Duration::from_secs(2));
+        }
+    }
+
+    /// 上行 supervisor 单轮：worker 已死则回收并重启；首次启动不计入 restarts。
+    fn uplink_supervisor_iter(
+        this: &Arc<Self>,
+        stop: &Arc<AtomicBool>,
+        worker: &mut Option<JoinHandle<()>>,
+    ) {
+        let dead = worker.as_ref().map(|t| t.is_finished()).unwrap_or(true);
+        if !dead {
+            return;
+        }
+        // 回收已死句柄（消费 join 结果；panic 已由 hook 记录）。
+        let was_running = worker
+            .take()
+            .map(|t| {
+                let _ = t.join();
+                true
+            })
+            .unwrap_or(false);
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        if was_running {
+            let n = this.stats.uplink_restarts.fetch_add(1, Ordering::Relaxed) + 1;
+            eprintln!("[n1-pump] uplink worker exited unexpectedly; restarting (#{n})");
+        }
+        let w = Arc::clone(this);
+        let s = Arc::clone(stop);
+        let t = thread::Builder::new()
+            .name("n1-pump-up".into())
+            .spawn(move || w.uplink_loop(&s))
+            .expect("pump uplink worker spawn");
+        *worker = Some(t);
     }
 
     /// 上行循环。Ok(0) 表示 VPI 暂无包（非阻塞实现，如 Linux TUN fd），
@@ -195,8 +325,9 @@ impl VpiPump {
         let mut buf = vec![0u8; 4096];
         while !stop.load(Ordering::SeqCst) {
             // 短暂持锁：阻塞在 receive() 期间持有 guard（见模块头已知限制）。
+            // lock_vpi：poison 时恢复而非 panic（修 2）。
             let n = {
-                let mut vpi = self.vpi.lock().unwrap();
+                let mut vpi = lock_vpi(&self.vpi);
                 match vpi.receive(&mut buf) {
                     Ok(0) => {
                         drop(vpi);
@@ -237,16 +368,33 @@ impl VpiPump {
             };
             if pkt.len() > DATAGRAM_CAP {
                 // 超限：调用方计数后丢弃（N1Connection::send_datagram 契约）。
+                // TEMP-DIAG: 记录超限包长度；E4 通过后删除。
+                eprintln!("[diag-pump-drop] reason=oversize len={}", pkt.len());
                 self.stats.uplink_dropped.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             match conn.send_datagram(pkt) {
                 Ok(()) => {
                     self.stats.uplink_forwarded.fetch_add(1, Ordering::Relaxed);
+                    // TEMP-DIAG: N1 E4 丢包调查；通过后删除。
+                    if let Some((src, seq, ack, flags, win, len)) = tcp_diag(pkt) {
+                        let n = self.stats.uplink_forwarded.load(Ordering::Relaxed);
+                        // 只记录前 1800 个和之后每 100 个（控制日志量）
+                        if n <= 1800 || n % 100 == 0 {
+                            eprintln!(
+                                "[tcp-up] n={n} src={src} seq={seq} ack={ack} flags={flags:#04x} win={win} len={len}"
+                            );
+                        }
+                    }
                 }
-                Err(_) => {
+                Err(e) => {
                     // 注意：fabric 吞掉了 UDP send_to 错误，此处 Err 仅为
                     // 通道级错误；Link 观测走心跳，不在此触发（D3）。
+                    // TEMP-DIAG: 记录发送失败原因；E4 通过后删除。
+                    eprintln!(
+                        "[diag-pump-drop] reason=send_err len={} err={e:?}",
+                        pkt.len()
+                    );
                     self.stats.uplink_dropped.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -255,26 +403,18 @@ impl VpiPump {
 
     /// 下行 supervisor：为每个对端维持一个下行线程；线程随连接关闭而退出，
     /// 退出后从运行集摘除（对端重连后会起新线程）。
+    ///
+    /// supervisor 自身的 panic 防护：每轮迭代包 `catch_unwind`，迭代内 panic 只记
+    /// 日志，不杀死 supervisor（与上行 supervisor 同模式）。
     fn downlink_supervisor(this: Arc<Self>, stop: &AtomicBool) {
         let mut workers: Vec<(N1PeerId, JoinHandle<()>)> = vec![];
         while !stop.load(Ordering::SeqCst) {
-            // 回收已退出的 worker。
-            workers.retain(|(_, t)| !t.is_finished());
-            let running: HashSet<N1PeerId> = workers.iter().map(|(p, _)| *p).collect();
-            for peer in this.lookup.all_peers() {
-                if running.contains(&peer) {
-                    continue;
-                }
-                let Some(conn) = this.lookup.connection_for(&peer) else {
-                    continue;
-                };
-                let w = Arc::clone(&this);
-                let name = format!("n1-pump-dn-{}", &peer.to_hex()[..8]);
-                let t = thread::Builder::new()
-                    .name(name)
-                    .spawn(move || Self::downlink_worker(w, conn))
-                    .expect("pump downlink worker spawn");
-                workers.push((peer, t));
+            let iter = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Self::downlink_supervisor_iter(&this, &mut workers);
+            }));
+            if iter.is_err() {
+                // panic 已由 panic hook 记录结构化日志；supervisor 继续下一轮。
+                eprintln!("[n1-pump] downlink supervisor iteration panicked; continuing");
             }
             thread::sleep(Duration::from_millis(500));
         }
@@ -282,6 +422,28 @@ impl VpiPump {
         // recv_datagram 返回 Closed 后退出）。
         for (_, t) in workers {
             let _ = t.join();
+        }
+    }
+
+    /// 下行 supervisor 单轮：回收已退出 worker，为缺失对端增补下行线程。
+    fn downlink_supervisor_iter(this: &Arc<Self>, workers: &mut Vec<(N1PeerId, JoinHandle<()>)>) {
+        // 回收已退出的 worker。
+        workers.retain(|(_, t)| !t.is_finished());
+        let running: HashSet<N1PeerId> = workers.iter().map(|(p, _)| *p).collect();
+        for peer in this.lookup.all_peers() {
+            if running.contains(&peer) {
+                continue;
+            }
+            let Some(conn) = this.lookup.connection_for(&peer) else {
+                continue;
+            };
+            let w = Arc::clone(this);
+            let name = format!("n1-pump-dn-{}", &peer.to_hex()[..8]);
+            let t = thread::Builder::new()
+                .name(name)
+                .spawn(move || Self::downlink_worker(w, conn))
+                .expect("pump downlink worker spawn");
+            workers.push((peer, t));
         }
     }
 
@@ -294,12 +456,32 @@ impl VpiPump {
             match conn.recv_datagram() {
                 Ok(pkt) => {
                     this.stats.downlink_rx.fetch_add(1, Ordering::Relaxed);
-                    let mut vpi = this.vpi.lock().unwrap();
+                    let mut vpi = lock_vpi(&this.vpi);
                     match vpi.send(&pkt) {
                         Ok(()) => {
                             this.stats
                                 .downlink_delivered
                                 .fetch_add(1, Ordering::Relaxed);
+                            // TEMP-DIAG: N1 E4 丢包调查；通过后删除。
+                            if let Some((src, seq, ack, flags, win, len)) = tcp_diag(&pkt) {
+                                let n = this.stats.downlink_delivered.load(Ordering::Relaxed);
+                                if n <= 1800 || n % 100 == 0 {
+                                    eprintln!(
+                                        "[tcp-dn] n={n} src={src} seq={seq} ack={ack} flags={flags:#04x} win={win} len={len}"
+                                    );
+                                }
+                                // 每 500 个同步一次内核 TUN RX 计数
+                                if n % 500 == 0 {
+                                    if let Ok(dev) = std::fs::read_to_string("/proc/self/net/dev") {
+                                        for line in dev.lines() {
+                                            if line.contains("nxtun") {
+                                                let trimmed = line.trim();
+                                                eprintln!("[tun-rx] n={n} {trimmed}");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                         Err(_) => {
                             this.stats.downlink_vpi_err.fetch_add(1, Ordering::Relaxed);
@@ -320,29 +502,23 @@ impl VpiPump {
 pub struct PumpHandle {
     pump: Arc<VpiPump>,
     stop: Arc<AtomicBool>,
-    uplink: Option<JoinHandle<()>>,
+    up_supervisor: Option<JoinHandle<()>>,
     supervisor: Option<JoinHandle<()>>,
 }
 
 impl PumpHandle {
-    /// 停止包泵：置位、关闭全部连接（打断下行阻塞读）、回收线程。
+    /// 停止包泵：置位、关闭全部连接（打断下行阻塞读）、回收两个 supervisor。
     ///
-    /// 上行线程若阻塞在 VPI `receive()` 中，有界等待 2s 后分离
-    /// （见模块头"已知限制"）。
+    /// 上行 supervisor 退出前对 worker 做有界等待 2s（worker 若阻塞在 VPI
+    /// `receive()` 中则分离，见模块头"已知限制"）。
     pub fn shutdown(mut self) {
         self.stop.store(true, Ordering::SeqCst);
         self.pump.lookup.close_all();
         if let Some(t) = self.supervisor.take() {
             let _ = t.join();
         }
-        if let Some(t) = self.uplink.take() {
-            // 有界等待：VPI 阻塞读不可打断，超时则分离（进程退出时由 OS 回收）。
-            let (tx, rx) = std::sync::mpsc::channel::<()>();
-            thread::spawn(move || {
-                let _ = t.join();
-                let _ = tx.send(());
-            });
-            let _ = rx.recv_timeout(Duration::from_secs(2));
+        if let Some(t) = self.up_supervisor.take() {
+            let _ = t.join();
         }
     }
 
@@ -367,6 +543,28 @@ fn ipv4_dst(pkt: &[u8]) -> Option<Ipv4Addr> {
         return None;
     }
     Some(Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]))
+}
+
+// TEMP-DIAG: N1 E4 丢包调查；通过后删除。
+/// 解析 TCP 头（src/seq/ack/flags/win/len），非 TCP 返回 None。
+fn tcp_diag(pkt: &[u8]) -> Option<(Ipv4Addr, u32, u32, u8, u16, usize)> {
+    if pkt.len() < 20 || pkt[0] >> 4 != 4 {
+        return None;
+    }
+    if pkt[9] != 6 {
+        return None; // 非 TCP
+    }
+    let ihl = usize::from(pkt[0] & 0x0f) * 4;
+    if pkt.len() < ihl + 20 {
+        return None;
+    }
+    let src = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
+    let t = &pkt[ihl..];
+    let seq = u32::from_be_bytes([t[4], t[5], t[6], t[7]]);
+    let ack = u32::from_be_bytes([t[8], t[9], t[10], t[11]]);
+    let flags = t[13];
+    let win = u16::from_be_bytes([t[14], t[15]]);
+    Some((src, seq, ack, flags, win, pkt.len()))
 }
 
 #[cfg(test)]

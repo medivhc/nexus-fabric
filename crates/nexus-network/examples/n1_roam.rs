@@ -36,6 +36,7 @@ use nexus_platform_linux::TunVpi;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -453,16 +454,34 @@ fn build_manager(
 }
 
 fn start_pump(
+    role: char, // TEMP-DIAG: 区分 A/B 的 stats 上报；E4 通过后删除
     tun: TunVpi,
     routes: Vec<Ipv4Route>,
     lookup: Arc<ManagerLookup>,
 ) -> nexus_network::n1::pump::PumpHandle {
     let vpi: Arc<Mutex<Box<dyn VirtualPacketInterface>>> = Arc::new(Mutex::new(Box::new(tun)));
-    VpiPump::new(vpi, routes, lookup).start()
+    let handle = VpiPump::new(vpi, routes, lookup).start();
+    // TEMP-DIAG: 周期性上报包泵计数器，定位丢包层级；E4 通过后删除。
+    let stats = handle.stats();
+    let _ = std::thread::Builder::new()
+        .name(format!("pump-stats-{role}"))
+        .spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(15));
+            eprintln!(
+                "[pump-stats-{role}] up_rx={} up_fwd={} up_drop={} dn_rx={} dn_del={} dn_verr={}",
+                stats.uplink_rx.load(Ordering::Relaxed),
+                stats.uplink_forwarded.load(Ordering::Relaxed),
+                stats.uplink_dropped.load(Ordering::Relaxed),
+                stats.downlink_rx.load(Ordering::Relaxed),
+                stats.downlink_delivered.load(Ordering::Relaxed),
+                stats.downlink_vpi_err.load(Ordering::Relaxed),
+            );
+        });
+    handle
 }
 
 fn child_a(
-    _cfg: ChildCfg,
+    cfg: ChildCfg,
     tun: TunVpi,
     sink: Arc<CollectSink>,
     link_cfg: LinkConfig,
@@ -489,6 +508,7 @@ fn child_a(
     mgr.insert_accepted(peer, conn);
     // A 的上行路由：VPI 子网 → B（accept 后才知 peer）。
     let pump = start_pump(
+        cfg.role,
         tun,
         vec![Ipv4Route {
             subnet: Ipv4Net::parse(&format!("{VPI_NET}/{VPI_CIDR}"))
@@ -596,6 +616,7 @@ fn child_b(
         .unwrap_or(0);
     // VPI 路由：10.144.0.0/24 → A。
     let pump = start_pump(
+        cfg.role,
         tun,
         vec![Ipv4Route {
             subnet: Ipv4Net::parse(&format!("{VPI_NET}/{VPI_CIDR}"))
@@ -671,46 +692,53 @@ fn child_b(
                 ])?;
                 // 主动 rebind（模拟 OS 网络变更通知）：不等 3s 心跳超时，
                 // 避免 QUIC 在长死链路后难以恢复。
+                // TEMP-DIAG: N1_SKIP_REBIND=1 时跳过，用于对照实验；通过后删除。
+                let skip_rebind = std::env::var("N1_SKIP_REBIND").is_ok();
+                if skip_rebind {
+                    eprintln!("[child b] SKIP rebind (N1_SKIP_REBIND set)");
+                }
                 if let Some(conn) = mgr.connection_for(&peer) {
-                    match conn.rebind() {
-                        Ok(()) => {
-                            eprintln!("[child b] proactive rebind ok");
-                            // 手动上报事件（watcher 未触发，故无自动事件）。
-                            sink.emit(nexus_network::n1::N1Event {
-                                peer,
-                                connection_id: conn.connection_id(),
-                                kind: nexus_network::n1::N1EventKind::RebindSucceeded,
-                                disposition: nexus_network::n1::N1Disposition::Retry,
-                            });
-                            // 迁移触发：rebind 后立即从新地址发包，让 A 的 QUIC
-                            // 被动迁移到新路径。否则 A 持续向旧地址发包，传输卡死。
-                            // B 的 watcher 已禁用（enable_watcher=false），故此处手动触发。
-                            // 用开流+写数据（确保驱动 QUIC 发包；datagram 可能只排队）。
-                            // 迁移触发：循环发 keepalive 帧，持续驱动 B 的 QUIC，
-                            // 确保 A 收到新地址包并完成被动迁移。单次发送可能因
-                            // driver 未驱动而滞留队列。
-                            for i in 0..10u64 {
-                                match conn.open_keepalive() {
-                                    Ok(mut s) => {
-                                        let mut frame = [0u8; 16];
-                                        frame[..8].copy_from_slice(b"N1KALIVE");
-                                        frame[8..].copy_from_slice(&i.to_be_bytes());
-                                        let _ = s.write_all(&frame);
-                                        let _ = s.finish();
+                    if !skip_rebind {
+                        match conn.rebind() {
+                            Ok(()) => {
+                                eprintln!("[child b] proactive rebind ok");
+                                // 手动上报事件（watcher 未触发，故无自动事件）。
+                                sink.emit(nexus_network::n1::N1Event {
+                                    peer,
+                                    connection_id: conn.connection_id(),
+                                    kind: nexus_network::n1::N1EventKind::RebindSucceeded,
+                                    disposition: nexus_network::n1::N1Disposition::Retry,
+                                });
+                                // 迁移触发：rebind 后立即从新地址发包，让 A 的 QUIC
+                                // 被动迁移到新路径。否则 A 持续向旧地址发包，传输卡死。
+                                // B 的 watcher 已禁用（enable_watcher=false），故此处手动触发。
+                                // 用开流+写数据（确保驱动 QUIC 发包；datagram 可能只排队）。
+                                // 迁移触发：循环发 keepalive 帧，持续驱动 B 的 QUIC，
+                                // 确保 A 收到新地址包并完成被动迁移。单次发送可能因
+                                // driver 未驱动而滞留队列。
+                                for i in 0..10u64 {
+                                    match conn.open_keepalive() {
+                                        Ok(mut s) => {
+                                            let mut frame = [0u8; 16];
+                                            frame[..8].copy_from_slice(b"N1KALIVE");
+                                            frame[8..].copy_from_slice(&i.to_be_bytes());
+                                            let _ = s.write_all(&frame);
+                                            let _ = s.finish();
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "[child b] migration trigger {i} open failed: {e:?}"
+                                            );
+                                            break;
+                                        }
                                     }
-                                    Err(e) => {
-                                        eprintln!(
-                                            "[child b] migration trigger {i} open failed: {e:?}"
-                                        );
-                                        break;
-                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(200));
                                 }
-                                std::thread::sleep(std::time::Duration::from_millis(200));
+                                eprintln!("[child b] migration trigger burst done");
                             }
-                            eprintln!("[child b] migration trigger burst done");
+                            Err(e) => eprintln!("[child b] proactive rebind failed: {e:?}"),
                         }
-                        Err(e) => eprintln!("[child b] proactive rebind failed: {e:?}"),
-                    }
+                    } // TEMP-DIAG: skip_rebind
                 }
                 roamed = true;
                 println!("ROAMED");

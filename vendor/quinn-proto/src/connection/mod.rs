@@ -3712,6 +3712,22 @@ impl Connection {
         self.path.total_recvd
     }
 
+    // TEMP-DIAG: N1 E4 丢包调查；通过后删除。
+    /// (validated, total_sent, total_recvd) for the current path.
+    pub fn diag_path_state(&self) -> (bool, u64, u64) {
+        (
+            self.path.validated,
+            self.path.total_sent,
+            self.path.total_recvd,
+        )
+    }
+
+    // TEMP-DIAG: N1 E4 丢包调查；通过后删除。
+    /// Current path MTU.
+    pub fn diag_current_mtu(&self) -> u16 {
+        self.path.current_mtu()
+    }
+
     #[cfg(test)]
     pub(crate) fn active_local_cid_seq(&self) -> (u64, u64) {
         self.local_cid_state.active_seq()
