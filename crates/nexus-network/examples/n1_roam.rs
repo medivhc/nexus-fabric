@@ -1050,7 +1050,6 @@ fn main() {
     }
     // 子进程成功完成后强制退出：后台线程（pump worker、fabric driver）
     // 可能未完全停止，显式 exit 确保进程终止，父进程的 wait() 能返回。
-    // 这是测试 harness，不是生产代码，强制退出可接受。
     if is_child.is_some() && pass {
         std::process::exit(0);
     }
