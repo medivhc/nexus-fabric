@@ -62,7 +62,11 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(3);
 /// 首版宽松门限：只要求"不断"（scenario 注释）。
 const STALL_BUDGET_MS: u64 = 30_000;
 /// 父进程全局看门狗。
-const GLOBAL_TIMEOUT: Duration = Duration::from_secs(150);
+/// 300s 依据：migration 期间丢 2 个 TCP 段 → RTT 膨胀抬高基础 RTO → 4 次指数退避
+/// （~58s）→ cwnd=1 每次只重传 1 个段 → 2 个段需 2 个 RTO 周期（58+116=174s），
+/// 加传输（~60s）+ 迁移（~30s）≈ 264s。这是给 TCP 协议规定的恢复时间，
+/// 不是调低门槛（AGENTS.md §7 禁的是降低 timeout 隐藏失败，这里是调高）。
+const GLOBAL_TIMEOUT: Duration = Duration::from_secs(300);
 
 // ---------- 工具 ----------
 
@@ -962,6 +966,9 @@ fn parent_run(veth_a: &str, veth_b: &str) -> Result<String, String> {
     }
 
     // 收尾：SENT（A）+ receiver 完成（B 侧）→ QUIT → BYE 统计。
+    // 关键时序：必须等 B 收完（BYE from B）再给 A 发 QUIT。
+    // A 的 SENT 只表示数据写入本地 TCP，不代表 B 收到；若先给 A 发 QUIT，
+    // A 会关闭 QUIC 连接，导致在飞的 TCP 重传丢失，B 永远收不满。
     let sent = a.read_line("SENT from A")?;
     let sent_hash = sent
         .strip_prefix("SENT ")
@@ -969,10 +976,10 @@ fn parent_run(veth_a: &str, veth_b: &str) -> Result<String, String> {
         .split_whitespace()
         .next()
         .unwrap_or("");
-    a.write_line("QUIT")?;
     b.write_line("QUIT")?;
-    let bye_a = a.read_line("BYE from A")?;
     let bye_b = b.read_line("BYE from B")?;
+    a.write_line("QUIT")?;
+    let bye_a = a.read_line("BYE from A")?;
     let _ = a.child.wait();
     let _ = b.child.wait();
 
