@@ -1,0 +1,68 @@
+schema_version = 1
+id = "product.unified-classifier"
+title = "统一包分类器：mesh/proxy/bypass 三路分类 + EWMA 选路 + FlowContext 生成"
+evidence_strength = "E4"
+requirement = "docs/DAEMON_ARCHITECTURE.md#12.5"
+
+[given]
+topology = "loopback; 纯内存包分类，无真实 TUN"
+config = "mesh_cidrs=[10.0.0.0/8], fake_ip=198.18.0.0/15, bypass=[192.168.0.0/16]"
+
+# 可执行 E4：example 走生产路径。
+# 1. 构造 PacketClassifier（mesh CIDR + fake-IP 池 + bypass 规则 + 规则引擎）。
+# 2. mesh 包（dst 10.1.2.3）→ Mesh；EWMA 选最优路径（direct 好 / proxy 差 → 选 direct）。
+# 3. fake-IP 包（dst 198.18.0.5）→ Proxy。
+# 4. bypass 包（dst 192.168.1.1）→ Direct。
+# 5. 互联网包（dst 8.8.8.8）→ 规则引擎 → Proxy。
+# 6. 每个分类生成 FlowContext（origin=Tun，destination/resource 按分类）。
+# 7. EWMA 全 unknown → Mesh 路径为 None（不阻塞）+ degraded 时 warn。
+# 8. 非 IPv4 包 → Drop（不生成 FlowContext）。
+[when]
+command = "cargo run --quiet -p nexus-projection --example unified_classifier -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+# S29：三路分类。
+[[expect]]
+field = "mesh.dst_10_1_2_3"
+equals = "Mesh"
+
+[[expect]]
+field = "proxy.dst_198_18_0_5"
+equals = "Proxy"
+
+[[expect]]
+field = "direct.dst_192_168_1_1"
+equals = "Direct"
+
+[[expect]]
+field = "proxy.dst_8_8_8_8"
+equals = "Proxy"
+
+# S30：EWMA 选路。
+[[expect]]
+field = "ewma.best_path"
+equals = "direct"
+
+[[expect]]
+field = "ewma.degraded"
+equals = false
+
+[[expect]]
+field = "ewma.unknown_fallback"
+equals = true
+
+# S31：FlowContext 生成。
+[[expect]]
+field = "flowctx.mesh.origin"
+equals = "Tun"
+
+[[expect]]
+field = "flowctx.proxy.destination"
+equals = "198.18.0.5"
+
+[[expect]]
+field = "drop.non_ipv4"
+equals = "Drop"
