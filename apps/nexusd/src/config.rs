@@ -329,12 +329,12 @@ fn parse_port_list(v: &toml::Value) -> Result<Vec<u16>, String> {
 /// - TOML 语法错误；
 /// - `fake_ip_range` 非法 CIDR；
 /// - `hosts` 中 IP 非法。
+///
 /// 调用方按 §13.6 处理：解析失败 → daemon 启动失败 exit 1。
 pub fn parse_dns_toml(text: &str) -> Result<nexus_dns::DnsUnifiedConfig, String> {
-    use nexus_dns::{DnsUnifiedConfig, DEFAULT_FAKE_IP_RANGE, DEFAULT_MESH_SUFFIX};
+    use nexus_dns::{DEFAULT_FAKE_IP_RANGE, DEFAULT_MESH_SUFFIX, DnsUnifiedConfig};
 
-    let v: toml::Value =
-        toml::from_str(text).map_err(|e| format!("{}: {e}", DNS_TOML))?;
+    let v: toml::Value = toml::from_str(text).map_err(|e| format!("{}: {e}", DNS_TOML))?;
     // [dns] 小节优先，否则读根级。
     let t = v.get("dns").unwrap_or(&v);
 
@@ -375,9 +375,9 @@ pub fn parse_dns_toml(text: &str) -> Result<nexus_dns::DnsUnifiedConfig, String>
     let mut hosts = Vec::new();
     if let Some(table) = t.get("hosts").and_then(|x| x.as_table()) {
         for (name, ip_v) in table {
-            let ip_s = ip_v.as_str().ok_or_else(|| {
-                format!("{DNS_TOML}: hosts.{name} must be an IP string")
-            })?;
+            let ip_s = ip_v
+                .as_str()
+                .ok_or_else(|| format!("{DNS_TOML}: hosts.{name} must be an IP string"))?;
             let ip: std::net::IpAddr = ip_s
                 .parse()
                 .map_err(|_| format!("{DNS_TOML}: hosts.{name} bad IP '{ip_s}'"))?;

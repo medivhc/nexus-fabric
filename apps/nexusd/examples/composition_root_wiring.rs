@@ -35,11 +35,7 @@ fn write_config_dir() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join("nexusd-composition-root-e4");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("network.toml"),
-        network_toml_good(),
-    )
-    .unwrap();
+    std::fs::write(dir.join("network.toml"), network_toml_good()).unwrap();
     std::fs::write(
         dir.join("dns.toml"),
         "[dns]\n\
@@ -74,9 +70,7 @@ fn run() -> serde_json::Value {
     // R2：mesh CIDR 来自 [vpi.routes]，不再硬编码。
     let dp_config = assembly::build_dataplane_config(&loaded).expect("build_dataplane_config");
     let mesh_cidrs_ok = dp_config.mesh_cidrs == vec!["10.200.0.0/24".to_string()];
-    let hardcoded_absent = !dp_config
-        .mesh_cidrs
-        .contains(&"10.0.0.0/8".to_string());
+    let hardcoded_absent = !dp_config.mesh_cidrs.contains(&"10.0.0.0/8".to_string());
 
     // R3：dns.toml 解析。
     let dns = dp_config.dns_config.as_ref().expect("dns_config");

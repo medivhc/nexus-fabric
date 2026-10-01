@@ -12,19 +12,19 @@
 
 use nexus_control_api::ControlCommand;
 use nexus_discovery::{
-    AggregateDiscovery, Discovery, PeerId as DiscoveryPeerId, StaticDiscovery, lsa::Lsdb,
-    mdns::MdnsDiscovery,
+    lsa::Lsdb, mdns::MdnsDiscovery, AggregateDiscovery, Discovery, PeerId as DiscoveryPeerId,
+    StaticDiscovery,
 };
 use nexus_fabric::{
     ConnConfig, FabricConn, FabricError, PeerId as FabricPeerId, RecvStream, SendStream,
     StdUdpTransport, UdpTransport,
 };
 use nexus_network::n1::{
-    N1Connection, N1Dialer, N1Discovery, N1Error, N1Event, N1EventSink, N1KeepaliveIo,
-    N1KeepaliveStream, N1PeerId,
     config::N1Config,
     pump::{Ipv4Route, PeerConnLookup, VpiPump},
     session::N1SessionManager,
+    N1Connection, N1Dialer, N1Discovery, N1Error, N1Event, N1EventSink, N1KeepaliveIo,
+    N1KeepaliveStream, N1PeerId,
 };
 use nexus_path::{CandidatePath, FallbackChain, FallbackConfig, PathKind};
 use nexus_platform::VirtualPacketInterface;
@@ -256,9 +256,10 @@ pub fn build_session_manager(
             .map(|p| {
                 (
                     p.id,
-                    p.addrs.first().copied().unwrap_or_else(|| {
-                        "0.0.0.0:0".parse().expect("0.0.0.0:0 parses")
-                    }),
+                    p.addrs
+                        .first()
+                        .copied()
+                        .unwrap_or_else(|| "0.0.0.0:0".parse().expect("0.0.0.0:0 parses")),
                 )
             })
             .collect(),

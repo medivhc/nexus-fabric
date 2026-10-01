@@ -31,9 +31,9 @@
 mod watcher;
 
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -178,27 +178,32 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     let dataplane_config = match assembly::build_dataplane_config(&loaded) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"CONFIG\",\"message\":\"{e}\"}}}}");
+            eprintln!(
+                "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"CONFIG\",\"message\":\"{e}\"}}}}"
+            );
             return ExitCode::from(1);
         }
     };
 
     // 3. R1：装配 N1 网桥（失败 → 降级，dataplane 照常跑）。
-    let n1_bridge: Option<Arc<nexus_network::n1::bridge::N1MeshBridge>> =
-        match loaded.network_toml.as_deref() {
-            Some(text) => match assembly::assemble_n1(text) {
-                Ok(bridge) => Some(bridge),
-                Err(e) => {
-                    eprintln!(
-                        "[nexusd] WARN: N1 assembly failed ({e}); degraded (mesh packets counted, not sent)"
-                    );
-                    None
-                }
-            },
-            None => None,
-        };
-    let n1_sender: Option<Arc<dyn nexus_network::n1::bridge::N1Sender>> =
-        n1_bridge.clone().map(|b| b as Arc<dyn nexus_network::n1::bridge::N1Sender>);
+    let n1_bridge: Option<Arc<nexus_network::n1::bridge::N1MeshBridge>> = match loaded
+        .network_toml
+        .as_deref()
+    {
+        Some(text) => match assembly::assemble_n1(text) {
+            Ok(bridge) => Some(bridge),
+            Err(e) => {
+                eprintln!(
+                    "[nexusd] WARN: N1 assembly failed ({e}); degraded (mesh packets counted, not sent)"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let n1_sender: Option<Arc<dyn nexus_network::n1::bridge::N1Sender>> = n1_bridge
+        .clone()
+        .map(|b| b as Arc<dyn nexus_network::n1::bridge::N1Sender>);
 
     // 4. 统一数据面线程（D1：单个 TUN 由 nexusd 持有；TUN 创建失败则线程内降级）。
     let dp_shutdown = Arc::clone(&shutdown);
@@ -303,11 +308,7 @@ fn shutdown_sequence(
 }
 
 /// 带超时的 join；超时后记 warn 并继续（不杀线程，进程退出时回收）。
-fn join_with_timeout(
-    handle: std::thread::JoinHandle<()>,
-    timeout: Duration,
-    name: &str,
-) {
+fn join_with_timeout(handle: std::thread::JoinHandle<()>, timeout: Duration, name: &str) {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
         let _ = handle.join();
@@ -315,9 +316,9 @@ fn join_with_timeout(
     });
     match rx.recv_timeout(timeout) {
         Ok(_) => eprintln!("[nexusd] shutdown: {name} stopped"),
-        Err(_) => eprintln!(
-            "[nexusd] WARN: shutdown: {name} did not stop in {timeout:?}, continuing"
-        ),
+        Err(_) => {
+            eprintln!("[nexusd] WARN: shutdown: {name} did not stop in {timeout:?}, continuing")
+        }
     }
 }
 

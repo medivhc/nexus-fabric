@@ -66,11 +66,7 @@ pub fn mesh_bypass_overlap(mesh: &[String], bypass: &[String]) -> Vec<String> {
     };
     let bypass_nets: Vec<(u32, u8)> = bypass.iter().filter_map(|s| parse(s)).collect();
     mesh.iter()
-        .filter(|m| {
-            parse(m).map_or(false, |mn| {
-                bypass_nets.iter().any(|&bn| overlaps(mn, bn))
-            })
-        })
+        .filter(|m| parse(m).is_some_and(|mn| bypass_nets.iter().any(|&bn| overlaps(mn, bn))))
         .cloned()
         .collect()
 }
@@ -85,6 +81,7 @@ pub fn mesh_bypass_overlap(mesh: &[String], bypass: &[String]) -> Vec<String> {
 /// # Errors
 /// - 配置解析失败；
 /// - SessionManager 构造失败。
+///
 /// 调用方按 §13.3 降级：不调 `set_n1_sender`，dataplane 照常跑。
 pub fn assemble_n1(network_toml: &str) -> Result<Arc<N1MeshBridge>, String> {
     let (config, mgr) = nexus::network::build_session_manager(network_toml)?;
@@ -114,9 +111,7 @@ pub fn assemble_n1(network_toml: &str) -> Result<Arc<N1MeshBridge>, String> {
 ///
 /// # Errors
 /// - `dns.toml` 语义解析失败。
-pub fn build_dataplane_config(
-    loaded: &LoadedConfig,
-) -> Result<DataplaneConfig, String> {
+pub fn build_dataplane_config(loaded: &LoadedConfig) -> Result<DataplaneConfig, String> {
     use super::config::parse_dns_toml;
 
     // R2：mesh CIDR 配置化。
@@ -136,9 +131,7 @@ pub fn build_dataplane_config(
     // R2：重叠检测（warn，mesh 优先）。
     let overlapped = mesh_bypass_overlap(&mesh_cidrs, &bypass_cidrs);
     if !overlapped.is_empty() {
-        eprintln!(
-            "[nexusd] WARN: mesh CIDRs overlap bypass: {overlapped:?} (mesh wins)"
-        );
+        eprintln!("[nexusd] WARN: mesh CIDRs overlap bypass: {overlapped:?} (mesh wins)");
     }
 
     // QoS：从 daemon.toml [qos] 映射。
