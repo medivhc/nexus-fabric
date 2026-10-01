@@ -41,7 +41,6 @@ fn tun_enabled() -> bool {
     *TUN_ENABLED.get().unwrap_or(&true)
 }
 
-mod config;
 mod watcher;
 
 use std::process::ExitCode;
