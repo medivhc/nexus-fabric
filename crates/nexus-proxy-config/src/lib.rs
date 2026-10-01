@@ -84,7 +84,7 @@ pub struct InboundConfig {
     pub listen: String,
 }
 
-/// 规则类型（P0 冻结为四类）。
+/// 规则类型（P0 冻结为四类；2026-10-01 新增端口/进程三类）。
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum RuleKind {
     /// 目的域名等于或以 `.` 拼接规则后缀结尾。
@@ -99,6 +99,12 @@ pub enum RuleKind {
     GeoSite,
     /// 引用 rule-providers 规则集（数据注入，§11.11）。
     RuleSet,
+    /// 源端口匹配（单端口 `8080` 或范围 `8000-9000`）。
+    SrcPort,
+    /// 目的端口匹配（单端口 `443` 或范围 `8000-9000`）。
+    DstPort,
+    /// 进程名匹配（精确 `chrome` 或前缀通配 `chrome*`）。
+    ProcessName,
     /// 兜底规则（匹配一切未命中流量）。
     Match,
 }
@@ -114,6 +120,9 @@ impl RuleKind {
             Self::GeoIp => "geoip",
             Self::GeoSite => "geosite",
             Self::RuleSet => "rule_set",
+            Self::SrcPort => "src_port",
+            Self::DstPort => "dst_port",
+            Self::ProcessName => "process_name",
             Self::Match => "match",
         }
     }
@@ -127,6 +136,9 @@ impl RuleKind {
             "geoip" => Ok(Self::GeoIp),
             "geosite" => Ok(Self::GeoSite),
             "rule_set" => Ok(Self::RuleSet),
+            "src_port" => Ok(Self::SrcPort),
+            "dst_port" => Ok(Self::DstPort),
+            "process_name" => Ok(Self::ProcessName),
             "match" => Ok(Self::Match),
             other => Err(ConfigError::new(
                 "kind",
@@ -1918,5 +1930,41 @@ mod subscription_online_tests {
         assert!(!ev.ok);
         assert_eq!(ev.node_count_after, 2);
         assert_eq!(rt.effective_node_count(), 2);
+    }
+
+    // ---- 2026-10-01 新增：新规则类型解析 ----
+    #[test]
+    fn rule_kind_parse_new_kinds() {
+        assert_eq!(RuleKind::parse("src_port").unwrap(), RuleKind::SrcPort);
+        assert_eq!(RuleKind::parse("dst_port").unwrap(), RuleKind::DstPort);
+        assert_eq!(
+            RuleKind::parse("process_name").unwrap(),
+            RuleKind::ProcessName
+        );
+    }
+
+    #[test]
+    fn rule_kind_as_str_new_kinds() {
+        assert_eq!(RuleKind::SrcPort.as_str(), "src_port");
+        assert_eq!(RuleKind::DstPort.as_str(), "dst_port");
+        assert_eq!(RuleKind::ProcessName.as_str(), "process_name");
+    }
+
+    #[test]
+    fn rule_kind_parse_roundtrip() {
+        for kind in [
+            RuleKind::DomainSuffix,
+            RuleKind::Domain,
+            RuleKind::IpCidr,
+            RuleKind::GeoIp,
+            RuleKind::GeoSite,
+            RuleKind::RuleSet,
+            RuleKind::SrcPort,
+            RuleKind::DstPort,
+            RuleKind::ProcessName,
+            RuleKind::Match,
+        ] {
+            assert_eq!(RuleKind::parse(kind.as_str()).unwrap(), kind);
+        }
     }
 }

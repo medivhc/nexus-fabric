@@ -17,52 +17,7 @@ use nexus_ingress::{Socks5Handshake, Socks5State};
 use nexus_proxy::{FlowTarget, RuleEngine};
 use nexus_proxy_config::parse;
 
-const CONFIG: &str = "\
-schema_version: 1\n\
-inbounds:\n\
-  - tag: socks5-in\n\
-    kind: socks5\n\
-    listen: 127.0.0.1:1080\n\
-rules:\n\
-  - tag: rule-dst-port\n\
-    kind: dst_port\n\
-    match: \"8080\"\n\
-    action:\n\
-      - kind: select_outbound\n\
-        tag: proxy-a\n\
-  - tag: rule-src-port\n\
-    kind: src_port\n\
-    match: \"9000-9100\"\n\
-    action:\n\
-      - kind: select_outbound\n\
-        tag: proxy-b\n\
-  - tag: rule-process\n\
-    kind: process_name\n\
-    match: \"chrome*\"\n\
-    action:\n\
-      - kind: select_outbound\n\
-        tag: proxy-c\n\
-  - tag: rule-match\n\
-    kind: match\n\
-    match: \"\"\n\
-    action:\n\
-      - kind: select_outbound\n\
-        tag: fallback-outbound\n\
-groups: []\n\
-outbounds:\n\
-  - tag: proxy-a\n\
-    kind: direct\n\
-    locator: \"\"\n\
-  - tag: proxy-b\n\
-    kind: direct\n\
-    locator: \"\"\n\
-  - tag: proxy-c\n\
-    kind: direct\n\
-    locator: \"\"\n\
-  - tag: fallback-outbound\n\
-    kind: direct\n\
-    locator: \"\"\n\
-";
+const CONFIG: &str = "schema_version: 1\ninbounds:\n  - tag: socks5-in\n    kind: socks5\n    listen: 127.0.0.1:1080\nrules:\n  - tag: rule-dst-port\n    kind: dst_port\n    match: \"8080\"\n    action:\n      - kind: select_outbound\n        tag: proxy-a\n  - tag: rule-src-port\n    kind: src_port\n    match: \"9000-9100\"\n    action:\n      - kind: select_outbound\n        tag: proxy-b\n  - tag: rule-process\n    kind: process_name\n    match: \"chrome*\"\n    action:\n      - kind: select_outbound\n        tag: proxy-c\n  - tag: rule-match\n    kind: match\n    match: \"\"\n    action:\n      - kind: select_outbound\n        tag: fallback-outbound\ngroups: []\noutbounds:\n  - tag: proxy-a\n    kind: direct\n  - tag: proxy-b\n    kind: direct\n  - tag: proxy-c\n    kind: direct\n  - tag: fallback-outbound\n    kind: direct\n";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
