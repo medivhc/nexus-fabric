@@ -236,19 +236,24 @@ accept 线程，sync，零 tokio）把 SOCKS5/HTTP 显式代理映射为 fabric 
   `PerFlow`（按流哈希固定 egress，流内有序）/ `PerPacket`（按包加权轮询）。
 - `MultipathConfig { strategy, reorder_buffer }`：纯数据；`strategy` 默认
   `Single`，`reorder_buffer` 默认 64（per-packet 接收端重排上限）。
-- `PathScheduler::select(egresses, flow_id, seq) -> EgressId`：
+- `PathScheduler::select(strategy, egresses, flow_id, seq) -> Option<&EgressDescriptor>`：
   - `Single`：返回调用方排序首位的可用 egress（等价当前单路径行为）；
-  - `PerFlow`：`hash(flow_id) % n`，同一 `flow_id` 在 egress 集合不变时
-    永远选中同一 egress（确定性，流内有序）；
-  - `PerPacket`：加权轮询（权重来自 `EgressDescriptor.weight`，默认 1）。
+  - `PerFlow`：`flow_id % n`（`flow_id` 为调用方传入的 u64 流标识，通常是
+    5 元组哈希；`flow_id_of` 辅助用 FNV-1a 计算），同一 `flow_id` 在 egress
+    集合不变时永远选中同一 egress（确定性，流内有序）；
+  - `PerPacket`：加权轮询（权重来自 `EgressDescriptor::weight()`，恒 `>= 1`）。
+  - `select` 取 `&mut self`（`PerPacket` 的轮询游标是有状态的；`Single`/
+    `PerFlow` 分支不修改状态）。
 - `ReorderBuffer`（per-packet 接收端）：按 `seq` 缓冲乱序包，按序吐出；
-  容量上限 `reorder_buffer`，超限丢弃最小 seq 并计数 `reorder_dropped`；
-  内存有界（`O(reorder_buffer)`）。
+  容量上限 `reorder_buffer`，超限丢弃最小 seq 并计数 `dropped_overflow()`，
+  重复 seq 计数 `dropped_duplicate()`；内存有界（`O(reorder_buffer)`）。
+- `EgressDescriptor` 字段私有，必须经 `new()` 构造（`weight=0` 钳位到 1）；
+  F1 教训：公有字段允许结构体字面量绕过钳位，导致 `PerPacket` 除零 panic。
 - 不变量：
   - `Single` 模式与无调度器行为一致（零回归）；
   - `PerFlow` 选择确定性：egress 集合与 `flow_id` 不变时结果不变；
-  - 纯内存、纯同步、零真实网络；TUN/QUIC 接入点预留（`EgressDescriptor`
-    含 `kind` 字段供未来映射到真实 egress）；
+  - 纯内存、纯同步、零真实网络；TUN/QUIC 接入点预留（`EgressKind`
+    字段供未来映射到真实 egress）；
   - 不修改 `nexus-path` 的 S1（单活跃路径是路径层的 per-peer 不变量；
     本调度器工作在统一数据面 egress 选择层，是不同层级）。
 - Deletion Test：若删除调度器抽象，让调用方手写 `match strategy` 分发，

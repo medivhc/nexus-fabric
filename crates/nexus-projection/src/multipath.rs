@@ -80,14 +80,17 @@ impl MultipathConfig {
 ///
 /// 纯数据；`kind` 供未来映射到真实 egress（N1 mesh / proxy / TURN），
 /// 当前阶段仅做标识（TUN 接入点预留）。
+///
+/// 字段私有：必须经 `new()` 构造，保证 `weight >= 1`（F1：防止结构体
+/// 字面量绕过钳位构造 `weight=0` 导致 `PerPacket` 除零 panic）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EgressDescriptor {
     /// Egress 唯一标识（如 "mesh-direct" / "proxy" / "turn"）。
-    pub id: String,
+    id: String,
     /// 调度类别（展示/未来映射用）。
-    pub kind: EgressKind,
-    /// 加权轮询权重（`PerPacket` 用），必须 >= 1。
-    pub weight: u32,
+    kind: EgressKind,
+    /// 加权轮询权重（`PerPacket` 用），恒 `>= 1`。
+    weight: u32,
 }
 
 /// Egress 类别。
@@ -112,12 +115,28 @@ impl EgressDescriptor {
             weight: weight.max(1),
         }
     }
+
+    /// Egress 唯一标识。
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// 调度类别。
+    pub fn kind(&self) -> EgressKind {
+        self.kind
+    }
+
+    /// 加权轮询权重（恒 `>= 1`）。
+    pub fn weight(&self) -> u32 {
+        self.weight
+    }
 }
 
-/// 路径调度器（无状态；egress 集合由调用方持有并传入）。
+/// 路径调度器（`PerPacket` 有轮询游标状态；`Single`/`PerFlow` 分支不修改状态）。
 ///
-/// `select` 为纯函数（`&self` 只读）：相同输入 → 相同输出（`PerFlow`
-/// 确定性不变量）；`Single` 模式等价于无调度器（零回归）。
+/// `select` 的 `Single`/`PerFlow` 分支是纯函数语义：相同输入 → 相同输出
+/// （`PerFlow` 确定性不变量）；`Single` 模式等价于无调度器（零回归）。
+/// egress 集合由调用方持有并传入（调度器不拥有）。
 #[derive(Debug, Default)]
 pub struct PathScheduler {
     /// 加权轮询游标（`PerPacket` 用；`Single`/`PerFlow` 不用）。
@@ -157,13 +176,13 @@ impl PathScheduler {
             MultipathStrategy::PerPacket => {
                 // 加权轮询：按 weight 展开的虚拟槽位上轮转。
                 // 总权重为 0 不可能（EgressDescriptor::new 钳位 >= 1）。
-                let total_weight: u64 = egresses.iter().map(|e| e.weight as u64).sum();
+                let total_weight: u64 = egresses.iter().map(|e| e.weight() as u64).sum();
                 debug_assert!(total_weight > 0);
                 let slot = self.rr_cursor % total_weight;
                 self.rr_cursor = self.rr_cursor.wrapping_add(1);
                 let mut acc: u64 = 0;
                 for e in egresses {
-                    acc += e.weight as u64;
+                    acc += e.weight() as u64;
                     if slot < acc {
                         return Some(e);
                     }
@@ -376,7 +395,9 @@ mod tests {
     #[test]
     fn egress_weight_zero_clamped() {
         let e = EgressDescriptor::new("x", EgressKind::Other, 0);
-        assert_eq!(e.weight, 1);
+        assert_eq!(e.weight(), 1);
+        // F1 回归：字段私有后，结构体字面量无法绕过 new() 构造 weight=0。
+        // （编译期保证：EgressDescriptor { id: .., kind: .., weight: 0 } 已无法编译。）
     }
 
     #[test]
@@ -388,7 +409,7 @@ mod tests {
                 let got = sched
                     .select(MultipathStrategy::Single, &eg, flow, seq)
                     .unwrap();
-                assert_eq!(got.id, "mesh-direct");
+                assert_eq!(got.id(), "mesh-direct");
             }
         }
     }
@@ -423,13 +444,13 @@ mod tests {
             let first = sched
                 .select(MultipathStrategy::PerFlow, &eg, flow, 0)
                 .unwrap()
-                .id
-                .clone();
+                .id()
+                .to_string();
             for seq in 1..100u64 {
                 let got = sched
                     .select(MultipathStrategy::PerFlow, &eg, flow, seq)
                     .unwrap();
-                assert_eq!(got.id, first, "flow {flow} seq {seq} 不稳定");
+                assert_eq!(got.id(), first, "flow {flow} seq {seq} 不稳定");
             }
         }
     }
@@ -443,7 +464,7 @@ mod tests {
             let got = sched
                 .select(MultipathStrategy::PerFlow, &eg, flow, 0)
                 .unwrap();
-            seen.insert(got.id.clone());
+            seen.insert(got.id().to_string());
         }
         assert_eq!(seen.len(), 3, "64 个流应覆盖 3 个 egress，实际 {seen:?}");
     }
@@ -457,8 +478,8 @@ mod tests {
                 sched
                     .select(MultipathStrategy::PerPacket, &eg, 0, seq)
                     .unwrap()
-                    .id
-                    .clone()
+                    .id()
+                    .to_string()
             })
             .collect();
         assert_eq!(
@@ -486,8 +507,8 @@ mod tests {
                 sched
                     .select(MultipathStrategy::PerPacket, &eg, 0, seq)
                     .unwrap()
-                    .id
-                    .clone()
+                    .id()
+                    .to_string()
             })
             .collect();
         // 权重 2:1 → a,a,b,a,a,b。

@@ -977,7 +977,7 @@ fn run_multipath() -> Outcome {
         (0..5u64).all(|seq| {
             sched
                 .select(MultipathStrategy::Single, &egresses, flow, seq)
-                .map(|e| e.id.as_str())
+                .map(|e| e.id())
                 == Some("mesh-direct")
         })
     });
@@ -986,18 +986,18 @@ fn run_multipath() -> Outcome {
     let perflow_stable = [0u64, 1, 42, 999].iter().all(|&flow| {
         let first = sched
             .select(MultipathStrategy::PerFlow, &egresses, flow, 0)
-            .map(|e| e.id.clone());
+            .map(|e| e.id().to_string());
         (1..100u64).all(|seq| {
             sched
                 .select(MultipathStrategy::PerFlow, &egresses, flow, seq)
-                .map(|e| e.id.clone())
+                .map(|e| e.id().to_string())
                 == first
         })
     });
     let mut seen = HashSet::new();
     for flow in 0..64u64 {
         if let Some(e) = sched.select(MultipathStrategy::PerFlow, &egresses, flow, 0) {
-            seen.insert(e.id.clone());
+            seen.insert(e.id().to_string());
         }
     }
     let perflow_distributed = seen.len() == 3;
@@ -1008,7 +1008,7 @@ fn run_multipath() -> Outcome {
         .map(|seq| {
             sched
                 .select(MultipathStrategy::PerPacket, &egresses, 0, seq)
-                .map(|e| e.id.clone())
+                .map(|e| e.id().to_string())
                 .unwrap_or_default()
         })
         .collect();
