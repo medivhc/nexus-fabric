@@ -166,6 +166,13 @@ pub fn build_dataplane_config(loaded: &LoadedConfig) -> Result<DataplaneConfig, 
         };
         if rate_bps > 0 {
             // burst 默认为 1 秒的量。
+            // GAP-3：burst < 2×MTU (3028) 会静默拉低实际速率，打 WARN 日志。
+            if rate_bps < 3028 {
+                eprintln!(
+                    "[nexusd] WARN: QoS burst_size={} < 3028 (2×MTU); actual rate will be silently lower than configured. Suggest burst >= 15140 (10×MTU).",
+                    rate_bps
+                );
+            }
             if let Ok(limit) = nexus_connectivity::qos::BandwidthLimit::new(rate_bps, rate_bps) {
                 qos_config.rate_limit = Some(limit);
             }
