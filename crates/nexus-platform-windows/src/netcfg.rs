@@ -51,35 +51,78 @@ fn parse_cidr(cidr: &str) -> Result<(String, String), PlatformError> {
     Ok((net.to_string(), mask))
 }
 
-/// 构造 `assign_ip` 的 netsh 命令参数（纯函数，可单元测试）。
+/// 构造 `assign_ip` 的 argv（单一真相源；执行与展示都用它）。
 ///
-/// 返回完整的命令行字符串（用于测试断言），实际执行用 `assign_ip`。
-#[must_use]
-pub fn build_assign_ip_cmd(iface: &str, ip: [u8; 4], prefix_len: u8) -> Option<String> {
+/// 返回 `None` 当 prefix_len 非法。
+fn assign_ip_argv(iface: &str, ip: [u8; 4], prefix_len: u8) -> Option<Vec<String>> {
     let mask = prefix_to_mask(prefix_len).ok()?;
     let ip_str = format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
-    Some(format!(
-        "netsh interface ip set address \"{iface}\" static {ip_str} {mask}"
-    ))
+    Some(vec![
+        "interface".to_string(),
+        "ip".to_string(),
+        "set".to_string(),
+        "address".to_string(),
+        iface.to_string(),
+        "static".to_string(),
+        ip_str,
+        mask,
+    ])
 }
 
-/// 构造 `add_route` 的 route 命令参数（纯函数，可单元测试）。
+/// 构造 `assign_ip` 的展示命令字符串（纯函数，可单元测试）。
+///
+/// 由 [`assign_ip_argv`] 派生，保证与真实执行一致。
 #[must_use]
-pub fn build_add_route_cmd(cidr: &str, gateway: &str, metric: u32) -> Option<String> {
+#[cfg(test)]
+fn build_assign_ip_cmd(iface: &str, ip: [u8; 4], prefix_len: u8) -> Option<String> {
+    let argv = assign_ip_argv(iface, ip, prefix_len)?;
+    Some(format!("netsh {}", argv.join(" ")))
+}
+
+/// 构造 `add_route` 的 argv（单一真相源）。
+fn add_route_argv(cidr: &str, gateway: &str, metric: u32) -> Option<Vec<String>> {
     let (network, mask) = parse_cidr(cidr).ok()?;
-    Some(format!(
-        "route add {network} mask {mask} {gateway} metric {metric}"
-    ))
+    Some(vec![
+        "add".to_string(),
+        network,
+        "mask".to_string(),
+        mask,
+        gateway.to_string(),
+        "metric".to_string(),
+        metric.to_string(),
+    ])
 }
 
-/// 构造 `exclude_ip` 的 route 命令（/32，metric=1）。
+/// 构造 `add_route` 的展示命令字符串（纯函数，可单元测试）。
 #[must_use]
-pub fn build_exclude_ip_cmd(ip: [u8; 4], gateway: &str) -> String {
-    let ip_str = format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
-    format!("route add {ip_str} mask 255.255.255.255 {gateway} metric 1")
+#[cfg(test)]
+fn build_add_route_cmd(cidr: &str, gateway: &str, metric: u32) -> Option<String> {
+    let argv = add_route_argv(cidr, gateway, metric)?;
+    Some(format!("route {}", argv.join(" ")))
 }
 
-/// 执行一个命令（经 cmd /c），返回 stdout。失败时映射为 PlatformError::Io。
+/// 构造 `exclude_ip` 的 argv（/32，metric=1）。
+fn exclude_ip_argv(ip: [u8; 4], gateway: &str) -> Vec<String> {
+    let ip_str = format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+    vec![
+        "add".to_string(),
+        ip_str,
+        "mask".to_string(),
+        "255.255.255.255".to_string(),
+        gateway.to_string(),
+        "metric".to_string(),
+        "1".to_string(),
+    ]
+}
+
+/// 构造 `exclude_ip` 的展示命令（/32，metric=1）。
+#[must_use]
+#[cfg(test)]
+fn build_exclude_ip_cmd(ip: [u8; 4], gateway: &str) -> String {
+    format!("route {}", exclude_ip_argv(ip, gateway).join(" "))
+}
+
+/// 执行一个命令，返回 stdout。失败时映射为 PlatformError::Io。
 fn run_cmd(program: &str, args: &[&str], operation: &str) -> Result<(), PlatformError> {
     let output = Command::new(program)
         .args(args)
@@ -103,23 +146,11 @@ fn run_cmd(program: &str, args: &[&str], operation: &str) -> Result<(), Platform
 ///
 /// 等价：`netsh interface ip set address "<iface>" static <ip> <mask>`
 pub fn assign_ip(iface: &str, ip: [u8; 4], prefix_len: u8) -> Result<(), PlatformError> {
-    let mask = prefix_to_mask(prefix_len)?;
-    let ip_str = format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
-    // netsh interface ip set address "<iface>" static <ip> <mask>
-    run_cmd(
-        "netsh",
-        &[
-            "interface",
-            "ip",
-            "set",
-            "address",
-            iface,
-            "static",
-            &ip_str,
-            &mask,
-        ],
-        "assign_ip",
-    )
+    let argv = assign_ip_argv(iface, ip, prefix_len).ok_or_else(|| PlatformError::Invalid {
+        message: format!("prefix_len must be <= 32 (got {prefix_len})"),
+    })?;
+    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+    run_cmd("netsh", &args, "assign_ip")
 }
 
 /// 删除 TUN 接口的 IPv4 地址。
@@ -138,21 +169,11 @@ pub fn remove_ip(iface: &str, ip: [u8; 4]) -> Result<(), PlatformError> {
 ///
 /// 等价：`route add <network> mask <netmask> <gateway> metric <metric>`
 pub fn add_route(cidr: &str, gateway: &str, metric: u32) -> Result<(), PlatformError> {
-    let (network, mask) = parse_cidr(cidr)?;
-    let metric_str = metric.to_string();
-    run_cmd(
-        "route",
-        &[
-            "add",
-            &network,
-            "mask",
-            &mask,
-            gateway,
-            "metric",
-            &metric_str,
-        ],
-        "add_route",
-    )
+    let argv = add_route_argv(cidr, gateway, metric).ok_or_else(|| PlatformError::Invalid {
+        message: format!("invalid cidr (got {cidr})"),
+    })?;
+    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+    run_cmd("route", &args, "add_route")
 }
 
 /// 删除路由（不存在时视为成功，幂等）。
@@ -171,20 +192,9 @@ pub fn delete_route(cidr: &str) -> Result<(), PlatformError> {
 ///
 /// 等价：`route add <ip> mask 255.255.255.255 <gateway> metric 1`
 pub fn exclude_ip(ip: [u8; 4], gateway: &str) -> Result<(), PlatformError> {
-    let ip_str = format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
-    run_cmd(
-        "route",
-        &[
-            "add",
-            &ip_str,
-            "mask",
-            "255.255.255.255",
-            gateway,
-            "metric",
-            "1",
-        ],
-        "exclude_ip",
-    )
+    let argv = exclude_ip_argv(ip, gateway);
+    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+    run_cmd("route", &args, "exclude_ip")
 }
 
 #[cfg(test)]
@@ -221,7 +231,7 @@ mod tests {
         let cmd = build_assign_ip_cmd("nexus", [10, 200, 0, 5], 24).unwrap();
         assert_eq!(
             cmd,
-            "netsh interface ip set address \"nexus\" static 10.200.0.5 255.255.255.0"
+            "netsh interface ip set address nexus static 10.200.0.5 255.255.255.0"
         );
     }
 
