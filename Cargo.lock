@@ -940,6 +940,7 @@ dependencies = [
  "nexus-domain",
  "nexus-fabric",
  "nexus-ingress",
+ "nexus-network",
  "nexus-path",
  "smoltcp",
  "tun-rs",

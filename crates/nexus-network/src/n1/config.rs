@@ -66,6 +66,68 @@ pub struct N1Config {
     pub vpi: N1VpiConfig,
     /// Link 观测。
     pub link: LinkConfig,
+    /// Boost v1 配置（`[boost]` 缺失时为 `BoostConfig::default()`）。
+    pub boost: BoostConfig,
+}
+
+/// Network Boost v1 配置（`network.toml [boost]` 小节，可选）。
+///
+/// 全部字段可选；`[boost]` 小节缺失时整体取 `Default`
+///（`enabled = false`，即选路行为与 boost 之前完全一致，B4）。
+#[derive(Debug, Clone)]
+pub struct BoostConfig {
+    /// 是否启用 boost（激进切路参数）。
+    pub enabled: bool,
+    /// 激进 hysteresis（相对比例）；默认 0.10，必须在 `(0, 1]`。
+    pub hysteresis_pct: f64,
+    /// 激进保持时间（毫秒）；默认 1000，必须 `> 0`。
+    pub switch_hold_ms: u64,
+    /// 建连时是否 staggered 竞速。
+    pub race_on_connect: bool,
+}
+
+impl Default for BoostConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hysteresis_pct: 0.10,
+            switch_hold_ms: 1000,
+            race_on_connect: true,
+        }
+    }
+}
+
+/// 生效后的选路参数（纯数据；`nexus-network` 无 `nexus-path` 依赖边，
+/// 故不直接构造 `PathConfig`，由消费方映射，B2/B3）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoostPathParams {
+    /// 生效的 hysteresis（相对比例）。
+    pub hysteresis_pct: f64,
+    /// 生效的保持时间（毫秒）。
+    pub switch_hold_ms: u64,
+    /// 建连时是否竞速。
+    pub race_on_connect: bool,
+}
+
+impl BoostConfig {
+    /// B2：映射为生效参数。
+    /// - `enabled = true` → 取配置值；
+    /// - `enabled = false` → 20% / 3s（与 `nexus-path` `PathConfig::default()` 一致）。
+    pub fn path_params(&self) -> BoostPathParams {
+        if self.enabled {
+            BoostPathParams {
+                hysteresis_pct: self.hysteresis_pct,
+                switch_hold_ms: self.switch_hold_ms,
+                race_on_connect: self.race_on_connect,
+            }
+        } else {
+            BoostPathParams {
+                hysteresis_pct: 0.20,
+                switch_hold_ms: 3000,
+                race_on_connect: self.race_on_connect,
+            }
+        }
+    }
 }
 
 impl N1Config {
@@ -84,6 +146,7 @@ enum Table {
     Vpi,
     VpiRoutes,
     Link,
+    Boost,
 }
 
 struct PartialPeer {
@@ -105,6 +168,10 @@ struct Parser {
     routes: Vec<PartialRoute>,
     probe_interval_ms: Option<u64>,
     heartbeat_timeout_ms: Option<u64>,
+    boost_enabled: Option<bool>,
+    boost_hysteresis_pct: Option<f64>,
+    boost_switch_hold_ms: Option<u64>,
+    boost_race_on_connect: Option<bool>,
 }
 
 impl Parser {
@@ -118,6 +185,10 @@ impl Parser {
             routes: vec![],
             probe_interval_ms: None,
             heartbeat_timeout_ms: None,
+            boost_enabled: None,
+            boost_hysteresis_pct: None,
+            boost_switch_hold_ms: None,
+            boost_race_on_connect: None,
         };
         let mut table = Table::Root;
         for (idx, line) in logical_lines(text).into_iter().enumerate() {
@@ -144,10 +215,13 @@ impl Parser {
                         Table::VpiRoutes
                     }
                     "link" => Table::Link,
+                    "boost" => Table::Boost,
                     _ => {
                         return Err(Self::err(
                             lineno,
-                            &format!("unknown table [{name}] (expected peers/vpi/vpi.routes/link)"),
+                            &format!(
+                                "unknown table [{name}] (expected peers/vpi/vpi.routes/link/boost)"
+                            ),
                         ));
                     }
                 };
@@ -280,6 +354,41 @@ impl Parser {
                 }
                 _ => Err(Self::err(lineno, &format!("unknown [link] key: {key}"))),
             },
+            Table::Boost => match key {
+                "enabled" => {
+                    self.boost_enabled = Some(parse_bool(val).ok_or_else(|| {
+                        Self::err(lineno, "bad boost.enabled (true/false expected)")
+                    })?);
+                    Ok(())
+                }
+                "hysteresis_pct" => {
+                    let v: f64 = val.parse().map_err(|_| {
+                        Self::err(lineno, "bad boost.hysteresis_pct (float expected)")
+                    })?;
+                    if !(v > 0.0 && v <= 1.0) {
+                        return Err(Self::err(lineno, "boost.hysteresis_pct must be in (0, 1]"));
+                    }
+                    self.boost_hysteresis_pct = Some(v);
+                    Ok(())
+                }
+                "switch_hold_ms" => {
+                    let v: u64 = val.parse().map_err(|_| {
+                        Self::err(lineno, "bad boost.switch_hold_ms (integer expected)")
+                    })?;
+                    if v == 0 {
+                        return Err(Self::err(lineno, "boost.switch_hold_ms must be > 0"));
+                    }
+                    self.boost_switch_hold_ms = Some(v);
+                    Ok(())
+                }
+                "race_on_connect" => {
+                    self.boost_race_on_connect = Some(parse_bool(val).ok_or_else(|| {
+                        Self::err(lineno, "bad boost.race_on_connect (true/false expected)")
+                    })?);
+                    Ok(())
+                }
+                _ => Err(Self::err(lineno, &format!("unknown [boost] key: {key}"))),
+            },
         }
     }
 
@@ -331,6 +440,12 @@ impl Parser {
                 ),
                 enable_rebind: true,
                 enable_watcher: true,
+            },
+            boost: BoostConfig {
+                enabled: self.boost_enabled.unwrap_or(false),
+                hysteresis_pct: self.boost_hysteresis_pct.unwrap_or(0.10),
+                switch_hold_ms: self.boost_switch_hold_ms.unwrap_or(1000),
+                race_on_connect: self.boost_race_on_connect.unwrap_or(true),
             },
         })
     }
@@ -425,6 +540,15 @@ fn table_header(line: &str) -> Option<&str> {
 fn split_kv(line: &str) -> Option<(&str, &str)> {
     let (k, v) = line.split_once('=')?;
     Some((k.trim(), v.trim()))
+}
+
+/// 解析 `true` / `false`（大小写不敏感，前后空白容忍）。
+fn parse_bool(val: &str) -> Option<bool> {
+    match val.trim().to_ascii_lowercase().as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
 }
 
 /// 解析 `"..."` 字符串（支持 `\"` / `\\` 转义）。
@@ -591,5 +715,73 @@ heartbeat_timeout_ms = 3000
     fn comment_inside_string_survives() {
         let toml = "peer_id = \"aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899\" # 注释\n[vpi] # 表注释\ninterface = \"n0\"\naddress = \"10.0.0.1\"\n";
         assert!(N1Config::parse_toml(toml).is_ok());
+    }
+
+    // ---------- Boost v1 (B1/B2) ----------
+
+    const MINIMAL: &str = "peer_id = \"aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899\"\n[vpi]\ninterface = \"n0\"\naddress = \"10.0.0.1\"\n";
+
+    #[test]
+    fn boost_absent_gives_defaults() {
+        // B1: 无 [boost] → default（enabled=false）；B2: 映射回落 20%/3s。
+        let c = N1Config::parse_toml(MINIMAL).unwrap();
+        assert!(!c.boost.enabled);
+        assert_eq!(c.boost.hysteresis_pct, 0.10);
+        assert_eq!(c.boost.switch_hold_ms, 1000);
+        assert!(c.boost.race_on_connect);
+        let p = c.boost.path_params();
+        assert_eq!(p.hysteresis_pct, 0.20);
+        assert_eq!(p.switch_hold_ms, 3000);
+        assert!(p.race_on_connect);
+    }
+
+    #[test]
+    fn boost_enabled_maps_aggressive_params() {
+        // B1+B2: enabled=true → 取配置值（激进 10%/1s）。
+        let toml = format!(
+            "{MINIMAL}[boost]\nenabled = true\nhysteresis_pct = 0.10\nswitch_hold_ms = 1000\nrace_on_connect = true\n"
+        );
+        let c = N1Config::parse_toml(&toml).unwrap();
+        assert!(c.boost.enabled);
+        let p = c.boost.path_params();
+        assert_eq!(p.hysteresis_pct, 0.10);
+        assert_eq!(p.switch_hold_ms, 1000);
+        assert!(p.race_on_connect);
+    }
+
+    #[test]
+    fn boost_custom_values_and_race_off() {
+        let toml = format!(
+            "{MINIMAL}[boost]\nenabled = true\nhysteresis_pct = 0.05\nswitch_hold_ms = 500\nrace_on_connect = false\n"
+        );
+        let c = N1Config::parse_toml(&toml).unwrap();
+        let p = c.boost.path_params();
+        assert_eq!(p.hysteresis_pct, 0.05);
+        assert_eq!(p.switch_hold_ms, 500);
+        assert!(!p.race_on_connect);
+    }
+
+    #[test]
+    fn boost_rejects_bad_values() {
+        // hysteresis_pct 超出 (0, 1]。
+        for bad in ["0", "-0.1", "1.5"] {
+            let toml = format!("{MINIMAL}[boost]\nenabled = true\nhysteresis_pct = {bad}\n");
+            let e = N1Config::parse_toml(&toml).unwrap_err();
+            assert!(e.to_string().contains("hysteresis_pct"), "unexpected: {e}");
+        }
+        // switch_hold_ms 为 0。
+        let toml = format!("{MINIMAL}[boost]\nswitch_hold_ms = 0\n");
+        let e = N1Config::parse_toml(&toml).unwrap_err();
+        assert!(e.to_string().contains("switch_hold_ms"), "unexpected: {e}");
+        // 非法 bool。
+        let toml = format!("{MINIMAL}[boost]\nenabled = yes\n");
+        assert!(N1Config::parse_toml(&toml).is_err());
+        // 未知键。
+        let toml = format!("{MINIMAL}[boost]\nnope = 1\n");
+        let e = N1Config::parse_toml(&toml).unwrap_err();
+        assert!(
+            e.to_string().contains("unknown [boost] key"),
+            "unexpected: {e}"
+        );
     }
 }
