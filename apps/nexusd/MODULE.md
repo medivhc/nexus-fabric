@@ -146,6 +146,44 @@
 - 不变量：单 TUN（D1）；分类器唯一入口（S29）；N1 发送失败不阻塞其他分类
   （Proxy/Direct 照常）；`mesh_dropped_no_n1` 语义不变（无 N1 或发送失败都计数）。
 
+### Composition Root 接线（R1-R5，scenarios/product/composition_root.toml，2026-10-01 冻结）
+
+- **R1（N1 桥接线）**：`network.toml` 存在时，Composition Root 按 §13.3 步骤 5
+  装配 N1：
+  - `N1Config::parse_toml` 解析失败 → 记 error 日志，降级（不调
+    `set_n1_sender`，dataplane 照常跑，Mesh 包计数 `mesh_dropped_no_n1`）；
+  - 解析成功 → 经 `nexus::network::build_session_manager` 构造
+    `N1SessionManager`，由 `vpi.routes` 构造 `N1MeshBridge`，各 peer
+    `dial()` 尽力而为（单 peer 失败记 warn，不中断）；
+  - 成功后调 `dataplane.set_n1_sender(bridge)`；`n1_bridge_ready()` 为 true
+    当且仅当 sender 已注入。
+  - 不变量：M1-M7 冻结行为不动（只新增装配胶水）；N1 失败不影响
+    Proxy/Direct 分类（W1 不变量延续）。
+- **R2（mesh CIDR 配置化）**：`DataplaneConfig.mesh_cidrs` 不再硬编码
+  `10.0.0.0/8`，而是取自 `network.toml [vpi.routes]` 的 subnet 列表
+ （`"A.B.C.D/N"` 字符串）；`network.toml` 缺失 → 空列表；
+  解析失败 → 空列表 + warn（降级，不阻断 dataplane）；
+  与 bypass CIDR 重叠 → 启动时 warn 日志，mesh 优先（分类器 S29 顺序不变）。
+- **R3（dns.toml 解析）**：`dns.toml` 解析为 `DnsUnifiedConfig` 并传入
+  `DataplaneConfig.dns_config`：
+  - 缺失 → `None`（Dataplane 用默认配置，行为不变）；
+  - 格式错误（TOML 语法错 / fake_ip_range 非法 CIDR / hosts 非法 IP）→
+    daemon 启动失败，exit 1，`{"code":"CONFIG"}`（§13.6）；
+  - 字段（`[dns]` 小节，不存在时读根级键）：`upstream`（字符串数组）、
+    `fake_ip_enabled`（bool，默认 true）、`fake_ip_range`（CIDR，
+    默认 `198.18.0.0/15`）、`mesh_suffix`（字符串，默认 `"mesh"`）、
+    `fake_ip_ttl_secs`（整数，默认 300）、`hosts`（表，域名→IP）。
+- **R4（关闭顺序）**：Unix SIGTERM/SIGINT → 按 §13.4 反向关闭：
+  LocalAPI 停收新查询 → dataplane 线程停（join 1s 超时）→
+  `N1SessionManager::shutdown()`（join 5s 超时）→ TUN 随 dataplane
+  线程退出关闭 → exit 0；任一步超时 → warn 日志后强制继续，不无限等。
+  （ProxyEngine 尚无独立运行时，步骤为 no-op，记 info。）
+- **R5（热加载分类）**：`network.toml` 内容变更 → `NeedsRestart`
+  （mesh CIDR 属重启类，§13.6）；`dns.toml` 内容变更 → `Hot`
+  （上游变更热生效）；`dns.toml` 增删 → `NeedsRestart`（子系统启停）。
+- 不变量：TUN 失败仍致命（D1）；N1/DNS/Proxy 失败可降级（§13.3 原则）；
+  关闭必达 exit（不 hang）；`mesh_dropped_no_n1` 语义不变。
+
 ### 常规要求
 
 - 默认最小 surface：`private -> pub(crate) -> pub`。
