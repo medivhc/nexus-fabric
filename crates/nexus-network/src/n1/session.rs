@@ -164,15 +164,19 @@ impl N1SessionManager {
         self.peers.lock().unwrap().get(peer).map(|p| p.phase)
     }
 
-    /// 移除对端：`Draining`（停 watcher、关连接）→ `Disposed` → 摘除。
+    /// 移除对端：`Draining`（关连接、停 watcher）→ `Disposed` → 摘除。
+    ///
+    /// 顺序关键（E-3）：必须先 `conn.close()` 再 `watcher.shutdown()`。
+    /// watcher 线程可能阻塞在 `open_keepalive()`，只有 close 连接能打断它
+    /// （使其收到 Closed 后退出）；若先 join watcher 会死锁。
     pub fn remove(&self, peer: &N1PeerId) {
         let entry = self.peers.lock().unwrap().remove(peer);
         if let Some(mut p) = entry {
             p.phase = N1PeerPhase::Draining;
+            p.conn.close();
             if let Some(w) = p.watcher.take() {
                 w.shutdown();
             }
-            p.conn.close();
             p.phase = N1PeerPhase::Disposed;
         }
     }
