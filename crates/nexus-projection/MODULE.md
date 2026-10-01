@@ -230,6 +230,33 @@ accept 线程，sync，零 tokio）把 SOCKS5/HTTP 显式代理映射为 fabric 
 - 不变量：`select_best` 不触发切换（只读不决策，切换仍走 `PathManager` +
   S4/R3 hysteresis + S9 事件）；`boost_connect` 不改变 `RaceOutcome` 语义（R4）。
 
+**S29（统一包分类器，2026-10-01 冻结）**：`classifier.rs` 是单个 TUN 的唯一包分类入口
+（文档 §6/§11.2 数据面位置）。分类顺序：
+1. 目的 IP 在 mesh CIDR 内 → `Mesh { path }`（N1；S10 fast path，规则引擎不介入）；
+2. 目的 IP 在 fake-IP 池（`198.18.0.0/15`，见 nexus-dns S-unified）→ `Proxy`（送 proxy 规则引擎）；
+3. 命中 bypass/白名单规则 → `Direct`（直连）；
+4. 其余 → 规则引擎决策（`Proxy` / `Direct` / `Drop`）。
+- 非 IPv4 或截断包 → `Drop`（S12 可见性不变）。
+- 确定性：同一 5 元组在规则/路径状态不变时分类一致（类 S9）。
+- **MVP 说明**：当前实现中第 4 步回落为恒 `Proxy`（完整规则引擎由调用方在外层接入，
+  见 `classify` 注释）；`UnifiedRouter`（`routing.rs`）仍是带完整规则引擎的分类器，
+  两者后续收敛。
+
+**S30（EWMA 驱动 mesh 选路，2026-10-01 冻结）**：mesh 分类命中时，调用
+`boost::select_best(manager, candidates, degrade_threshold)` 选 EWMA 最高分路径
+（文档 §12.5）。**只读**：`&PathManager`，不修改任何状态（single writer 仍在
+`nexus-path`，S7/S28 不变）。全 unknown → 路径为 `None`（回落默认 mesh 转发，
+不阻塞）。`degraded == true` 时打 `warn` 日志（"mesh 路径质量劣化"），不自动切 proxy
+（切路决策权在调用方/Boost）。
+
+**S31（FlowContext 生成，2026-10-01 冻结）**：分类后生成统一 `FlowContext`
+（`nexus-domain`），供 QoS/调度器使用：
+- `origin = FlowOrigin::VirtualPacketInterface`（TUN/VPI 来源）；
+- `destination` = 目的 IP 字符串（mesh/fake-ip）或域名（DNS 嗅探命中时）；
+- `resource` = 按分类映射（Mesh → mesh resource，Proxy → proxy resource，Direct → direct resource）；
+- `profile` = 调用方传入的使用画像（透传，不解析）。
+- 纯函数，无副作用；`Drop` 分类不生成 FlowContext（调用方计数丢弃）。
+
 ## Side Effects
 
 - TUN 设备读写（`TunDevice::read` / `write`）。
@@ -352,6 +379,10 @@ fabric 传输（E4 验证封装逻辑）；与 fabric 的真实接线是下一�
 
 - `TunStats` 可查询。
 - `dropped_oversize` 单独计数（MTU 问题诊断）。
+- S30 degraded warn（`classifier.rs`）：`[classifier] warn: mesh 路径质量劣化
+  (score={:?} < threshold={})`，经 `eprintln!` 输出。触发条件：mesh 分类命中且
+  EWMA 最优分数低于 `degrade_threshold`。频率：仅 degraded 状态的每次分类时触发
+  （非每包；正常路径无输出）。后续可迁移到结构化日志（当前 crate 无 log facade）。
 
 ## Recovery Semantics
 

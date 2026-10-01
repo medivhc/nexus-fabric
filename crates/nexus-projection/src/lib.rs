@@ -13,6 +13,7 @@
 //! `nexus-fabric::FabricConn` peers (3b-2).
 
 pub mod boost;
+pub mod classifier;
 pub mod dns;
 pub mod egress;
 pub mod path_link;
