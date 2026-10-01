@@ -474,7 +474,113 @@ reorder_buffer = 64
 
 ---
 
-## 13. 验证状态
+## 13. Composition Root 详细设计
+
+> 状态：**设计**（2026-10-01）。遵循 v9 §4-5 的 Composition Root 原则，
+> 补全 v9 未规定的具体行为：生命周期、线程模型、失败降级、配置校验。
+
+### 13.1 v9 约束（已满足，无需重设计）
+
+| v9 要求 | 现状 |
+|---------|------|
+| Root = `nexusd`，组装 domain runtimes + ingress + platform | ✅ `apps/nexusd` 是组装点 |
+| `nexus-network` 不依赖 `nexus-ingress` | ✅ 无此依赖边 |
+| Portable Core 不直调 OS API，trait 注入 | ✅ 平台能力经 trait |
+| Deletion Test | ✅ 新抽象均通过 |
+
+### 13.2 子系统清单与所有权
+
+```
+nexusd (Composition Root)
+├── ConfigLoader（配置目录 → LoadedConfig）
+├── Dataplane（TUN + 分类器 + DNS + QoS）
+│   └── 持有：TunDevice, PacketClassifier, UnifiedDns, CakeScheduler
+├── N1MeshBridge（N1 会话 + 路由）
+│   └── 持有：N1SessionManager（独立线程）
+├── ProxyEngine（代理出站）
+└── LocalAPI（状态查询）
+```
+
+**所有权规则**：
+- Root 拥有所有子系统；子系统之间不直接持有对方
+- Dataplane 经 `N1Sender` trait 用 N1（依赖反转，不拥有）
+- N1 的 session 线程由 `N1MeshBridge` 拥有，Root 只发 shutdown 信号
+
+### 13.3 启动顺序
+
+```
+1. 加载配置（ConfigLoader）
+   ↓ 失败 → 退出（exit 1，打日志）
+2. 校验配置（见 §13.6）
+   ↓ 失败 → 退出（exit 1）
+3. 创建 TUN
+   ↓ 失败 → 退出（TUN 是数据面根基，无降级）
+4. 创建 Dataplane（分类器/DNS/QoS）
+5. 创建 N1MeshBridge（如果 network.toml 有 N1 配置）
+   ↓ 失败 → 降级：dataplane 照常跑，Mesh 包计数丢弃（mesh_dropped_no_n1）
+6. 创建 ProxyEngine（如果 proxy.yaml 存在）
+   ↓ 失败 → 降级：Proxy 包计数丢弃
+7. 启动 LocalAPI
+8. 进入主循环（信号处理 + 热加载轮询）
+```
+
+**原则**：TUN 失败是致命的（无 TUN 无数据面）；N1/Proxy 失败是可降级的（对应分类计数，不影响其他路径）。
+
+### 13.4 关闭顺序（反向）
+
+```
+1. 收到 SIGTERM/SIGINT
+2. 停 LocalAPI（不再接受新查询）
+3. 停 Dataplane（不再从 TUN 读包）
+   - 等待 in-flight 包处理完（最多 1s，超时强制停）
+4. 发 shutdown 给 N1MeshBridge
+   - 等待 session 线程退出（最多 5s）
+5. 发 shutdown 给 ProxyEngine
+6. 关闭 TUN
+7. 退出（exit 0）
+```
+
+**原则**：反向关闭；每个子系统有超时，超时后强制继续（不无限等）。
+
+### 13.5 线程模型
+
+| 线程 | 职责 | 关闭方式 |
+|------|------|----------|
+| main | 信号 + 热加载轮询 + 协调关闭 | 自然退出 |
+| dataplane | TUN 读包 → 分类 → QoS → 转发 | `shutdown()` + join（1s 超时） |
+| n1-session | N1 peer 连接、QUIC 收发 | `shutdown()` + join（5s 超时） |
+| n1-downlink | N1 收包 → 写回 TUN（后置） | 同上 |
+| localapi | HTTP 状态查询 | 先停（无 join 需求） |
+
+**规则**：
+- 跨线程只经 `Arc<Mutex<>>` 共享状态（stats）或 channel 发包
+- 不允许 dataplane 线程直接调用 N1 的阻塞 API（经 `N1Sender` trait，内部非阻塞）
+
+### 13.6 配置校验
+
+**启动时校验**（失败则退出）：
+- mesh CIDR 必须合法；与 bypass CIDR 重叠 → **警告**（不退出，mesh 优先）
+- `daemon.toml [qos]` 的 quantum 范围 [64, 65536]，非法 → 退出
+- `dns.toml` 缺失 → 用默认（不退出）；格式错误 → 退出
+
+**热加载时**（`nexus config set`）：
+| 配置项 | 变更行为 |
+|--------|----------|
+| mesh CIDR | `NeedsRestart`（正在飞的包路由会乱） |
+| bypass 规则 | 热生效（`Applied`） |
+| DNS 上游 | 热生效（新查询用新的） |
+| QoS 速率 | 热生效 |
+| Boost 开关 | 热生效 |
+
+### 13.7 诚实边界
+
+- N1 下行线程（`inject_from_n1` 的生产者）尚未实现
+- `network.toml` → `N1SessionManager` 的完整装配未做（`set_n1_sender` 接口已留）
+- 关闭超时的具体值（1s/5s）为初值，需实测调优
+
+---
+
+## 14. 验证状态
 
 - **单测**：`cargo test -p nexusd` 10/10 通过（含热加载 Applied/Rejected/NeedsRestart 三路径）
 - **功能验证**（2026-10-01）：启动、改文件热加载、坏 YAML 拒绝且进程存活、`nexus config` 三命令，全部通过
