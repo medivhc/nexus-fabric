@@ -4,8 +4,9 @@
 //!
 //! - `MultipathStrategy`：`Single`（只用最优 egress，默认）/ `PerFlow`
 //!   （按流哈希固定 egress）/ `PerPacket`（按包加权轮询）。
-//! - `PathScheduler::select`：按策略选 egress。纯函数（`&self` 只读），
-//!   不持有 egress 状态（egress 集合由调用方管理）。
+//! - `PathScheduler::select`：按策略选 egress。`Single`/`PerFlow` 分支不修改
+//!   状态（纯函数语义）；`PerPacket` 有轮询游标（`&mut self`）。egress 集合
+//!   由调用方管理。
 //! - `ReorderBuffer`：per-packet 接收端重排。按 `seq` 缓冲乱序包，按序吐出；
 //!   容量有界（`O(reorder_buffer)`），超限丢弃最小 seq 并计数。
 //!
