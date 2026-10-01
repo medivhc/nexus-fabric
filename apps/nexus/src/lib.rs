@@ -4263,7 +4263,7 @@ fn split_host_port(dest: &str) -> Result<(String, u16), NexusError> {
 
 /// 初始化混淆插件（P4）：注册 builtin（plain/xor）到全局注册表。
 ///
-/// 幂等；`nexusd proxy` 在服务循环前调用一次。`dial_with_obfs`/`wrap_stream`
+/// 幂等；`nexus proxy` 在服务循环前调用一次。`dial_with_obfs`/`wrap_stream`
 /// 内部也有懒初始化，此处显式调用是为了"进程启动时注册"的确定性语义。
 pub fn init_obfs_plugins() {
     nexus_plugin::init_builtin_plugins();
@@ -4271,7 +4271,7 @@ pub fn init_obfs_plugins() {
 
 /// 真实 SOCKS5 代理单会话闭环。
 ///
-/// 调用方（`nexusd proxy`）应在服务循环前调一次 [`init_obfs_plugins`]（P4）。
+/// 调用方（`nexus proxy`）应在服务循环前调一次 [`init_obfs_plugins`]（P4）。
 pub fn proxy_serve_once(
     listener: &std::net::TcpListener,
     config_yaml: &str,
@@ -5039,7 +5039,7 @@ pub fn proxy_speedtest_with(
     }))
 }
 
-/// `nexusd proxy speedtest --json` 入口：loopback 自检（真实 TcpStream 路径，
+/// `nexus proxy speedtest --json` 入口：loopback 自检（真实 TcpStream 路径，
 /// 离线确定性；公网 generate_204 测速由 E5 脚手架覆盖）。
 pub fn proxy_speedtest() -> Result<Value, NexusError> {
     let listener =

@@ -6,7 +6,7 @@
 //! cargo run --quiet -p nexus --example subnet_daemon -- --json
 //! ```
 //!
-//! 进程内 spawn `nexusd subnet up --foreground` 子进程（daemon 组合根常驻持有
+//! 进程内 spawn `nexus subnet up --foreground` 子进程（daemon 组合根常驻持有
 //! 隧道），验证：up 就绪 → status 读回 → 状态文件加密 magic → leave（删状态
 //! 文件）→ 子进程优雅退出 → status DOWN 的完整生命周期闭环。
 
@@ -35,7 +35,7 @@ fn main() {
     }
 }
 
-/// P3.5 E4 闭环：nexusd 常驻持有隧道 → leave 信号 → 优雅退出。
+/// P3.5 E4 闭环：nexus 常驻持有隧道 → leave 信号 → 优雅退出。
 fn subnet_daemon_flow() -> Result<Value, String> {
     let dir = std::env::temp_dir().join(format!(
         "nexus-b3-{}-{}",
@@ -68,25 +68,19 @@ locator = "udp://127.0.0.1:42002"
     )
     .map_err(|e| e.to_string())?;
 
-    // 定位 nexusd 可执行文件（与 example 同 target 目录）。
+    // 定位 nexus 可执行文件（与 example 同 target 目录）。
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let nexusd = exe
+    let nexus_bin = exe
         .parent()
         .and_then(|p| p.parent())
-        .map(|p| {
-            p.join(if cfg!(windows) {
-                "nexusd.exe"
-            } else {
-                "nexusd"
-            })
-        })
-        .ok_or_else(|| "cannot resolve nexusd path".to_string())?;
-    if !nexusd.exists() {
-        return Err(format!("nexusd not found at {}", nexusd.display()));
+        .map(|p| p.join(if cfg!(windows) { "nexus.exe" } else { "nexus" }))
+        .ok_or_else(|| "cannot resolve nexus path".to_string())?;
+    if !nexus_bin.exists() {
+        return Err(format!("nexus not found at {}", nexus_bin.display()));
     }
 
     // 1) spawn 常驻 daemon（--foreground）。
-    let mut child = Command::new(&nexusd)
+    let mut child = Command::new(&nexus_bin)
         .args([
             "subnet",
             "up",
@@ -101,7 +95,7 @@ locator = "udp://127.0.0.1:42002"
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("spawn nexusd: {e}"))?;
+        .map_err(|e| format!("spawn nexus: {e}"))?;
 
     // 2) 读第一行 stdout = up JSON（daemon 打印后进入常驻循环）。
     let stdout = child.stdout.take().ok_or("no stdout")?;
@@ -110,7 +104,7 @@ locator = "udp://127.0.0.1:42002"
         .next()
         .transpose()
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "nexusd up produced no stdout".to_string())?;
+        .ok_or_else(|| "nexus up produced no stdout".to_string())?;
     let up_json: Value =
         serde_json::from_str(&up_line).map_err(|e| format!("up output not JSON: {e}"))?;
     let up_ok = up_json
@@ -124,7 +118,7 @@ locator = "udp://127.0.0.1:42002"
     let file_encrypted = enc_bytes.starts_with(b"NEXSEC1") || enc_bytes.starts_with(b"NEXDP1");
 
     // 4) 独立 status 命令读回加密状态。
-    let status_out = Command::new(&nexusd)
+    let status_out = Command::new(&nexus_bin)
         .args([
             "subnet",
             "status",
@@ -153,7 +147,7 @@ locator = "udp://127.0.0.1:42002"
     let proc_exited = wait_exit(&mut child, Duration::from_millis(6000))?;
 
     // 6) 退出后 status → DOWN。
-    let after_out = Command::new(&nexusd)
+    let after_out = Command::new(&nexus_bin)
         .args([
             "subnet",
             "status",

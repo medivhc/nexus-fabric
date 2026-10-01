@@ -6,8 +6,8 @@ requirement = "PRODUCT.md#12-subnet-daemon"
 
 [given]
 # 可执行 E4（example subnet_daemon --json，进程内 spawn nexusd 子进程）：
-# - daemon.up_ok：nexusd subnet up --foreground 装配成功且常驻（子进程存活）；
-# - daemon.status_read_back_vip / peer_count：nexusd subnet status 读回字段一致；
+# - daemon.up_ok：nexus subnet up --foreground 装配成功且常驻（子进程存活）；
+# - daemon.status_read_back_vip / peer_count：nexus subnet status 读回字段一致；
 # - daemon.file_encrypted：--encrypt-state 状态文件含格式 magic（NEXSEC1/NEXDP1）；
 # - daemon.up_after_leave：leave（删状态文件）后子进程退出且 status → DOWN；
 # - daemon.proc_exited：常驻子进程在 leave 后正常退出（exit code 0）。

@@ -6,7 +6,7 @@
 //! cargo run --quiet -p nexus --example daemon_tun_daemon -- --json
 //! ```
 //!
-//! 进程内 spawn `nexusd subnet up --foreground --tun` 子进程，验证 daemon 常驻
+//! 进程内 spawn `nexus subnet up --foreground --tun` 子进程，验证 daemon 常驻
 //! 真实数据面（wintun/tun + UDP）的两条确定性路径：
 //!
 //! - **无权限 / 无驱动环境**（本机常态）：第一行 stdout 为结构化 `TUN_ERROR`，
@@ -73,25 +73,19 @@ locator = "udp://127.0.0.1:42002"
     )
     .map_err(|e| e.to_string())?;
 
-    // 定位 nexusd 可执行文件（与 example 同 target 目录）。
+    // 定位 nexus 可执行文件（与 example 同 target 目录）。
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let nexusd = exe
+    let nexus_bin = exe
         .parent()
         .and_then(|p| p.parent())
-        .map(|p| {
-            p.join(if cfg!(windows) {
-                "nexusd.exe"
-            } else {
-                "nexusd"
-            })
-        })
-        .ok_or_else(|| "cannot resolve nexusd path".to_string())?;
-    if !nexusd.exists() {
-        return Err(format!("nexusd not found at {}", nexusd.display()));
+        .map(|p| p.join(if cfg!(windows) { "nexus.exe" } else { "nexus" }))
+        .ok_or_else(|| "cannot resolve nexus path".to_string())?;
+    if !nexus_bin.exists() {
+        return Err(format!("nexus not found at {}", nexus_bin.display()));
     }
 
     // 1) spawn 常驻 daemon（--foreground --tun）。
-    let mut child = Command::new(&nexusd)
+    let mut child = Command::new(&nexus_bin)
         .args([
             "subnet",
             "up",
@@ -106,7 +100,7 @@ locator = "udp://127.0.0.1:42002"
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("spawn nexusd: {e}"))?;
+        .map_err(|e| format!("spawn nexus: {e}"))?;
 
     // 2) 读第一行 stdout（成功 = up JSON；失败 = TUN_ERROR JSON）。
     let stdout = child.stdout.take().ok_or("no stdout")?;
@@ -115,7 +109,7 @@ locator = "udp://127.0.0.1:42002"
         .next()
         .transpose()
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "nexusd --tun produced no stdout".to_string())?;
+        .ok_or_else(|| "nexus --tun produced no stdout".to_string())?;
     let first_json: Value = serde_json::from_str(&first_line)
         .map_err(|e| format!("first output not JSON: {e}: {first_line}"))?;
     let verdict = first_json
@@ -139,7 +133,7 @@ locator = "udp://127.0.0.1:42002"
             std::fs::remove_file(&state).map_err(|e| e.to_string())?;
             let exited_ok = wait_exit(&mut child, Duration::from_millis(6000))?;
             // 退出后 status → DOWN。
-            let after_out = Command::new(&nexusd)
+            let after_out = Command::new(&nexus_bin)
                 .args([
                     "subnet",
                     "status",
@@ -205,7 +199,7 @@ fn wait_exit(child: &mut Child, timeout: Duration) -> Result<bool, String> {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err("nexusd --tun --foreground did not exit in time".to_string());
+                    return Err("nexus --tun --foreground did not exit in time".to_string());
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
