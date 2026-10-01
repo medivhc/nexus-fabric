@@ -60,8 +60,12 @@
 - P0 冻结接口骨架（实现阶段填充）：
   - `ProxyConfig`：typed root struct（`inbounds` / `rules` / `groups` / `outbounds` / `speedtest`）；
   - `InboundConfig`：`{ tag, kind: "socks5", listen }`；
-  - `RuleConfig`：`{ kind: "domain_suffix"|"domain"|"ip_cidr"|"geoip"|"geosite"|"rule_set"|"match", match: String,
+  - `RuleConfig`：`{ kind: "domain_suffix"|"domain"|"ip_cidr"|"geoip"|"geosite"|"rule_set"|"src_port"|"dst_port"|"process_name"|"match", match: String,
     action: ActionChainConfig, no_resolve: bool（默认 false）}`；
+    - `src_port` / `dst_port`：`match` 为单端口 `"8080"` 或范围 `"8000-9000"`（闭区间）；
+      非法格式 → `CONFIG_INVALID`；
+    - `process_name`：`match` 为精确进程名 `"chrome"` 或前缀通配 `"chrome*"`
+     （仅尾部 `*`）；空 pattern → `CONFIG_INVALID`；
   - `ActionChainConfig`：有序动作列表；P0 首动作为 `{ kind: "select_outbound",
     tag: String }`；
   - `GroupConfig`：`{ tag, kind: "selector"|"urltest", candidates: Vec<String>,
