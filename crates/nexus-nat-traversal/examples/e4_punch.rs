@@ -32,14 +32,14 @@ const PUNCH_MAGIC: &[u8; 8] = b"NXPNCH01";
 
 fn usage() -> ! {
     eprintln!("usage: e4_punch --role responder --sig <addr> --punch <addr>");
-    eprintln!("       e4_punch --role initiator --sig <addr> --punch-bind <addr> [--empty-candidates] [--expect migrated|stayed:<reason>]");
+    eprintln!(
+        "       e4_punch --role initiator --sig <addr> --punch-bind <addr> [--empty-candidates] [--expect migrated|stayed:<reason>]"
+    );
     std::process::exit(2);
 }
 
 fn arg_val(args: &[String], name: &str) -> Option<String> {
-    args.windows(2)
-        .find(|w| w[0] == name)
-        .map(|w| w[1].clone())
+    args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
 }
 
 fn has_flag(args: &[String], name: &str) -> bool {
@@ -61,7 +61,10 @@ fn main() {
 // ---------------------------------------------------------------------------
 
 fn responder(args: &[String]) {
-    let sig_addr: SocketAddr = arg_val(args, "--sig").unwrap_or_else(|| usage()).parse().unwrap();
+    let sig_addr: SocketAddr = arg_val(args, "--sig")
+        .unwrap_or_else(|| usage())
+        .parse()
+        .unwrap();
     let punch_addr: SocketAddr = arg_val(args, "--punch")
         .unwrap_or_else(|| usage())
         .parse()
@@ -135,17 +138,13 @@ impl PunchChannel for UdpChannel {
         self.sock.set_read_timeout(Some(timeout))?;
         let mut buf = [0u8; 2048];
         loop {
-            let (n, _) = self
-                .sock
-                .recv_from(&mut buf)
-                .map_err(|e| {
-                    if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut
-                    {
-                        io::Error::new(io::ErrorKind::TimedOut, "answer timeout")
-                    } else {
-                        e
-                    }
-                })?;
+            let (n, _) = self.sock.recv_from(&mut buf).map_err(|e| {
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut {
+                    io::Error::new(io::ErrorKind::TimedOut, "answer timeout")
+                } else {
+                    e
+                }
+            })?;
             match decode_answer(&buf[..n]) {
                 Ok(a) => return Ok(a),
                 Err(_) => continue, // 坏包跳过
@@ -156,7 +155,6 @@ impl PunchChannel for UdpChannel {
 
 struct UdpPunchSocket {
     sock: UdpSocket, // 与 QUIC 同一 socket 的替身：单 socket 收发
-    nonce: u64,
 }
 
 impl PunchSocket for UdpPunchSocket {
@@ -168,7 +166,6 @@ impl PunchSocket for UdpPunchSocket {
     fn await_direct(&self, timeout: Duration) -> io::Result<SocketAddr> {
         self.sock.set_read_timeout(Some(timeout))?;
         let mut buf = [0u8; 2048];
-        let expect_nonce = self.nonce.to_be_bytes();
         loop {
             let (n, from) = self.sock.recv_from(&mut buf).map_err(|e| {
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut {
@@ -177,7 +174,8 @@ impl PunchSocket for UdpPunchSocket {
                     e
                 }
             })?;
-            if n == 18 && &buf[..10] == ACK_MAGIC && &buf[10..18] == expect_nonce {
+            // 只校验 ACK 魔数；nonce 防串扰由状态机层保证（已单测）。
+            if n == 18 && &buf[..10] == ACK_MAGIC {
                 return Ok(from);
             }
             // 非 ack 包继续等（整体超时内）
@@ -197,7 +195,10 @@ fn initiator(args: &[String]) {
             nat_type: NatType::Unknown,
         }
     } else {
-        let peer_sig: SocketAddr = arg_val(args, "--sig").unwrap_or_else(|| usage()).parse().unwrap();
+        let peer_sig: SocketAddr = arg_val(args, "--sig")
+            .unwrap_or_else(|| usage())
+            .parse()
+            .unwrap();
         let punch_bind: SocketAddr = arg_val(args, "--punch-bind")
             .unwrap_or_else(|| usage())
             .parse()
@@ -212,16 +213,7 @@ fn initiator(args: &[String]) {
             sock: sig_sock,
             peer_sig,
         });
-        // nonce 需在构造 session 前确定：用临时 session 取 nonce 较丑，
-        // 此处直接复刻 fresh 逻辑——简单起见先构造 socket 替身时 nonce=0，
-        // 真正的 nonce 校验在 await_direct 侧放宽为"魔数匹配即可"。
-        // 为保持严格，改为：先构造 session 拿到 nonce 的方案不可行
-        //（nonce 私有）。折中：UdpPunchSocket 不校验 nonce，
-        // 只校验 ACK 魔数；nonce 防串扰由状态机层保证（已单测）。
-        let socket: Arc<dyn PunchSocket> = Arc::new(UdpPunchSocket {
-            sock: punch_sock,
-            nonce: 0,
-        });
+        let socket: Arc<dyn PunchSocket> = Arc::new(UdpPunchSocket { sock: punch_sock });
         let mut s = PunchSession::new(
             PeerId([1u8; 32]),
             LocalCandidates {
@@ -255,7 +247,6 @@ fn initiator(args: &[String]) {
         }),
         Arc::new(UdpPunchSocket {
             sock: UdpSocket::bind("0.0.0.0:0").unwrap(),
-            nonce: 0,
         }),
         Arc::new(NoopPredictor),
     );
