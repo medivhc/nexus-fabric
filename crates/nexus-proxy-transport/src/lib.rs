@@ -24,12 +24,14 @@ mod framed;
 mod shadowsocks;
 mod socks5;
 mod trojan;
+mod trojan_tls;
 
 pub use framed::{Counters, FramedTransport, ProxyTransport};
 pub use nexus_outbound_shadowsocks::SsMethod; // T3: reuse, don't redefine
 pub use shadowsocks::{SsProxyConfig, SsTransport};
 pub use socks5::socks5_connect;
 pub use trojan::{trojan_connect, TrojanProxyConfig, TrojanTransport};
+pub use trojan_tls::{trojan_tls_connect, TlsTrojanTransport, TrojanTlsConfig};
 
 use std::io;
 use std::net::SocketAddr;
@@ -100,6 +102,8 @@ pub enum ProxyError {
     /// Dial target not representable in the protocol's ATYP subset
     /// (IPv6 this phase; postponed, not silently mapped).
     UnsupportedTarget(&'static str),
+    /// TLS failure (T7): config build, handshake, or I/O inside TLS.
+    Tls(String),
 }
 
 impl std::fmt::Display for ProxyError {
@@ -117,6 +121,7 @@ impl std::fmt::Display for ProxyError {
             Self::BadConfig(what) => write!(f, "proxy: bad config ({what})"),
             Self::SsCrypto(e) => write!(f, "proxy: ss crypto: {e}"),
             Self::UnsupportedTarget(what) => write!(f, "proxy: unsupported target ({what})"),
+            Self::Tls(what) => write!(f, "proxy: TLS failure ({what})"),
         }
     }
 }

@@ -46,6 +46,11 @@ impl Counters {
             self.framed_bytes.load(Ordering::Relaxed),
         )
     }
+
+    /// Mark handshake success (T6; T7 reuses for TLS trojan).
+    pub(crate) fn set_handshake_ok(&self) {
+        self.handshake_ok.store(1, Ordering::Relaxed);
+    }
 }
 
 /// Shared length-prefix framing core (T4).
