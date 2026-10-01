@@ -186,6 +186,10 @@ fn run(args: &[String]) -> i32 {
     if args[0].as_str() == "autostart" {
         return dispatch_autostart(&args[1..]);
     }
+    // 配置文件夹管理（本地文件操作，不经过 daemon；daemon 热加载）。
+    if args[0].as_str() == "config" {
+        return run_config(&args[1..]);
+    }
 
     let command = match parse_command(&args) {
         Ok(cmd) => cmd,
@@ -837,6 +841,130 @@ fn proxy_relay_resource(args: &[String]) -> i32 {
         }
         json
     }))
+}
+
+/// 配置文件夹管理（本地文件操作；daemon 侧热加载）。
+///
+/// 用法：
+///   nexus config get --dir <config-dir> <file>    打印文件内容（stdout）
+///   nexus config set --dir <config-dir> <file>    从 stdin 读，原子写入（临时文件 + rename）
+///   nexus config list --dir <config-dir>          列出已知配置文件及存在性
+///
+/// 已知文件名：daemon.toml / network.toml / proxy.yaml / dns.toml。
+/// `set` 用原子写入避免 daemon 读到半截文件（与 watcher 的 mtime 检测配合）。
+fn run_config(args: &[String]) -> i32 {
+    let flags = parse_flags(args);
+    let dir = match flags.get("--dir").and_then(|v| v.as_deref()) {
+        Some(d) => d.to_string(),
+        None => {
+            eprintln!("error: missing --dir <config-dir>");
+            eprintln!("usage: nexus config get|set|list --dir <config-dir> [file]");
+            return 2;
+        }
+    };
+    let dir_path = std::path::Path::new(&dir);
+    if !dir_path.is_dir() {
+        eprintln!("error: not a directory: {dir}");
+        return 1;
+    }
+    const KNOWN: &[&str] = &["daemon.toml", "network.toml", "proxy.yaml", "dns.toml"];
+    // 找到子命令后的第一个非 flag 参数（文件名），跳过 --dir 及其值。
+    let file_arg = {
+        let mut iter = args.iter().skip(1).peekable();
+        let mut result = None;
+        while let Some(s) = iter.next() {
+            if s == "--dir" {
+                iter.next(); // 跳过 --dir 的值
+                continue;
+            }
+            if s.starts_with("--") {
+                continue;
+            }
+            result = Some(s.clone());
+            break;
+        }
+        result
+    };
+    match args.first().map(String::as_str) {
+        Some("get") => {
+            let file = match file_arg {
+                Some(f) => f,
+                None => {
+                    eprintln!("usage: nexus config get --dir <dir> <file>");
+                    return 2;
+                }
+            };
+            if !KNOWN.contains(&file.as_str()) {
+                eprintln!(
+                    "error: unknown config file '{file}' (known: {})",
+                    KNOWN.join(", ")
+                );
+                return 2;
+            }
+            let path = dir_path.join(file);
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    print!("{text}");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("error: read {}: {e}", path.display());
+                    1
+                }
+            }
+        }
+        Some("set") => {
+            let file = match file_arg {
+                Some(f) => f,
+                None => {
+                    eprintln!("usage: nexus config set --dir <dir> <file>  (reads stdin)");
+                    return 2;
+                }
+            };
+            if !KNOWN.contains(&file.as_str()) {
+                eprintln!(
+                    "error: unknown config file '{file}' (known: {})",
+                    KNOWN.join(", ")
+                );
+                return 2;
+            }
+            // 从 stdin 读全部内容。
+            use std::io::Read;
+            let mut content = String::new();
+            if let Err(e) = std::io::stdin().read_to_string(&mut content) {
+                eprintln!("error: read stdin: {e}");
+                return 1;
+            }
+            // 原子写入：临时文件 + rename（避免 watcher 读到半截）。
+            let path = dir_path.join(&file);
+            let tmp = dir_path.join(format!(".{file}.tmp"));
+            if let Err(e) = std::fs::write(&tmp, &content) {
+                eprintln!("error: write temp: {e}");
+                return 1;
+            }
+            if let Err(e) = std::fs::rename(&tmp, &path) {
+                let _ = std::fs::remove_file(&tmp);
+                eprintln!("error: rename: {e}");
+                return 1;
+            }
+            println!(
+                "{}",
+                serde_json::json!({"verdict":"PASS","config":{"file":file,"dir":dir}})
+            );
+            0
+        }
+        Some("list") => {
+            for f in KNOWN {
+                let exists = dir_path.join(f).is_file();
+                println!("{f}: {}", if exists { "present" } else { "absent" });
+            }
+            0
+        }
+        _ => {
+            eprintln!("usage: nexus config get|set|list --dir <config-dir> [file]");
+            2
+        }
+    }
 }
 
 /// 真实 SOCKS5 数据面入口：监听后逐会话完成握手 → 规则路由 → Session →

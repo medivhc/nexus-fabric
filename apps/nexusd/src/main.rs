@@ -1,42 +1,209 @@
+//! nexusd：Nexus Daemon（用户愿景架构）。
+//!
+//! 用法：
+//!   nexusd <config-folder>     -> 启动 daemon，唯一参数为配置文件夹（如 `nexusd /etc/nexus/`）
+//!
+//! 配置文件夹结构（缺失文件 = 对应子系统不启用）：
+//! ```text
+//! /etc/nexus/
+//! ├── daemon.toml    # daemon 自身：LocalAPI 地址等（可选）
+//! ├── network.toml   # N1 mesh（可选）
+//! ├── proxy.yaml     # Clash 风格代理（可选）
+//! └── dns.toml       # DNS（可选）
+//! ```
+//!
+//! 架构（用户愿景）：
+//! - `nexusd <config-folder>` 启动 daemon，盯文件夹，配置热加载。
+//! - `nexus ...` 为瘦客户端：改配置（`nexus config set`）、看状态（`nexus status`）。
+//! - 配置变更 2 秒内热生效（轮询）；校验失败拒绝应用，不 crash。
+//!
+//! v9 术语：`nexus` 为正式 CLI；`nexusd` 为 Composition Root / daemon 进程。
+//! 本文件只承担 CLI 解析与装配；领域逻辑复用 `nexus` SDK，不复制。
+//!
+//! 诚实边界：
+//! - 本 daemon 负责配置加载/校验/热加载 + LocalAPI。各子系统（mesh/proxy/dns）的
+//!   实际长驻运行时装配为后续工作；当前 `status` 如实报告"已配置/未配置"，
+//!   不虚构"运行中"。
+//! - `serve` 子命令保留作内部 LocalAPI 实现（历史兼容），用户入口为 config-folder。
+
 #![forbid(unsafe_code)]
 
+mod config;
+mod watcher;
+
 use std::process::ExitCode;
+use std::sync::mpsc::channel;
 
 use serde_json::{Value, json};
 
-/// nexusd：桌面/服务端主 Runtime Composition Root（内部 daemon 入口）。
-///
-/// 用法：
-///   nexusd serve [--addr <ip:port> | --socket <path>]  -> 常驻 daemon，提供 HTTP LocalAPI
-///
-/// 用户命令已统一迁移到 `nexus`（refactor: CLI 统一，见 v9 规范"正式 CLI 是 `nexus`"）：
-///   nexus proxy ...         <- 原 nexusd proxy
-///   nexus proxy run/host/relay ... <- 原 nexusd run/host/relay
-///   nexus system-proxy ...  <- 原 nexusd system-proxy
-///   nexus autostart ...     <- 原 nexusd autostart
-///   nexus status/dns/...    <- 瘦客户端（需 daemon 运行）
-///
-/// 语义：本 app 只承担 CLI 解析与装配（MODULE.md 冻结契约）；全部闭环与快照复用
-/// `nexus` SDK 组合根函数，不复制领域逻辑。无效 CLI 用法 exit 非 0。
+use config::{ConfigDir, LoadedConfig};
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        // 新入口：nexusd <config-folder>
+        Some(path) if !path.starts_with('-') && path != "serve" => {
+            if args.len() != 1 {
+                eprintln!("usage: nexusd <config-folder>\n  e.g. nexusd /etc/nexus/");
+                return ExitCode::from(2);
+            }
+            run_daemon(path)
+        }
+        // 内部/历史：nexusd serve（LocalAPI），保留兼容
         Some("serve") => serve_resource(&args[1..]),
         _ => {
             eprintln!(
-                "usage: nexusd serve [--addr <ip:port> | --socket <path>]\n\
+                "usage: nexusd <config-folder>\n\
                  \n\
-                 用户命令已迁移到 `nexus`：\n\
-                 \x20 nexus proxy [--addr <ip:port>] [--config <path>] [--tun]\n\
-                 \x20 nexus proxy speedtest\n\
-                 \x20 nexus proxy run|host|relay ...\n\
-                 \x20 nexus system-proxy <status|set|clear|e2e>\n\
-                 \x20 nexus autostart <install|remove|status>"
+                 启动 daemon，唯一参数为配置文件夹：\n\
+                 \x20 nexusd /etc/nexus/\n\
+                 \n\
+                 配置文件夹内（缺失 = 不启用）：\n\
+                 \x20 daemon.toml    LocalAPI 地址等（可选）\n\
+                 \x20 network.toml   N1 mesh（可选）\n\
+                 \x20 proxy.yaml     Clash 风格代理（可选）\n\
+                 \x20 dns.toml       DNS（可选）\n\
+                 \n\
+                 瘦客户端：\n\
+                 \x20 nexus config get --dir <dir> <file>\n\
+                 \x20 nexus config set --dir <dir> <file>  （从 stdin 读，原子写入）\n\
+                 \x20 nexus status"
             );
             ExitCode::from(2)
         }
     }
 }
+
+/// Daemon 主流程：加载配置 → 启动 LocalAPI → 启动 watcher → 事件循环。
+fn run_daemon(config_dir: &str) -> ExitCode {
+    let dir = match ConfigDir::new(std::path::Path::new(config_dir)) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!(
+                "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"CONFIG\",\"message\":\"{e}\"}}}}"
+            );
+            return ExitCode::from(1);
+        }
+    };
+
+    // 1. 启动时加载全部配置（校验失败则拒绝启动）。
+    let loaded = match config::load(&dir) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"CONFIG\",\"message\":\"{e}\"}}}}"
+            );
+            return ExitCode::from(1);
+        }
+    };
+    log_enabled_subsystems(&loaded);
+
+    // 2. LocalAPI（后台线程；沿用既有 serve 逻辑）。
+    let localapi_addr = loaded.daemon.localapi_addr.clone();
+    let (ready_tx, ready_rx) = channel();
+    std::thread::Builder::new()
+        .name("nexusd-localapi".to_string())
+        .spawn(move || {
+            serve_localapi(&localapi_addr, ready_tx);
+        })
+        .expect("spawn localapi thread");
+    // 等 LocalAPI 就绪（最多 5 秒）。
+    match ready_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(addr) => println!(
+            "{{\"verdict\":\"READY\",\"daemon\":{{\"entry\":\"nexusd\",\"config_dir\":\"{config_dir}\",\"localapi\":\"{addr}\"}}}}"
+        ),
+        Err(_) => {
+            eprintln!(
+                "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"localapi did not start\"}}}}"
+            );
+            return ExitCode::from(1);
+        }
+    }
+
+    // 3. 配置 watcher（后台线程；主线程拥有 JoinHandle，不直接改共享状态）。
+    let (ev_tx, ev_rx) = channel();
+    let _watcher = watcher::spawn(dir.clone(), loaded, ev_tx);
+
+    // 4. 主事件循环：处理重载事件（single writer 原则）。
+    //    注意：当前实现下热加载仅更新"已加载配置快照"并记日志；
+    //    各子系统运行时的实际重装配为后续工作（见模块文档诚实边界）。
+    loop {
+        match ev_rx.recv() {
+            Ok(watcher::ReloadEvent::Applied { files }) => {
+                eprintln!("[nexusd] config hot-reloaded: {files:?}");
+            }
+            Ok(watcher::ReloadEvent::NeedsRestart { reason }) => {
+                eprintln!("[nexusd] WARN: {reason}");
+            }
+            Ok(watcher::ReloadEvent::Rejected { error }) => {
+                eprintln!("[nexusd] ERROR: config reload rejected: {error} (keeping old config)");
+            }
+            Err(_) => {
+                // watcher 线程退出（不应发生）；记日志并继续（LocalAPI 仍服务）。
+                eprintln!("[nexusd] WARN: config watcher channel closed");
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            }
+        }
+    }
+}
+
+/// 启动时日志：哪些子系统被配置启用。
+fn log_enabled_subsystems(cfg: &LoadedConfig) {
+    let mut enabled: Vec<&str> = Vec::new();
+    if cfg.network_toml.is_some() {
+        enabled.push("network (N1 mesh)");
+    }
+    if cfg.proxy_yaml.is_some() {
+        enabled.push("proxy");
+    }
+    if cfg.dns_toml.is_some() {
+        enabled.push("dns");
+    }
+    if enabled.is_empty() {
+        eprintln!("[nexusd] no subsystem configured (empty config dir); LocalAPI only");
+    } else {
+        eprintln!("[nexusd] subsystems configured: {}", enabled.join(", "));
+    }
+    eprintln!("[nexusd] localapi_addr={}", cfg.daemon.localapi_addr);
+}
+
+/// LocalAPI 服务（后台线程版；复用既有 serve 逻辑，READY 经 channel 上报）。
+fn serve_localapi(addr_raw: &str, ready_tx: std::sync::mpsc::Sender<String>) {
+    let addr: std::net::SocketAddr = match addr_raw.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("[nexusd] invalid localapi addr {addr_raw}: {e}");
+            return;
+        }
+    };
+    let listener = match std::net::TcpListener::bind(addr) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[nexusd] bind localapi {addr}: {e}");
+            return;
+        }
+    };
+    let actual = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+    let _ = ready_tx.send(actual);
+    for stream in listener.incoming() {
+        match stream {
+            Ok(mut s) => {
+                if let Err(e) = handle_localapi_request(&mut s) {
+                    eprintln!("[nexusd] localapi error: {e}");
+                }
+            }
+            Err(e) => {
+                eprintln!("[nexusd] localapi accept error: {e}");
+                break;
+            }
+        }
+    }
+}
+
+// ===== 以下为既有 serve 逻辑（内部实现，保留） =====
 
 /// 解析 `--flag <value>` / `--flag`（布尔）形式；非 flag token 忽略。
 fn parse_flags(args: &[String]) -> std::collections::HashMap<String, Option<String>> {
@@ -57,27 +224,9 @@ fn parse_flags(args: &[String]) -> std::collections::HashMap<String, Option<Stri
     map
 }
 
-/// serve 子命令：常驻 daemon，提供 HTTP LocalAPI，CLI 通过 socket 查询状态。
-///
-/// 用法：
-///   nexusd serve --addr <ip:port>      -> TCP loopback（默认 127.0.0.1:0）
-///   nexusd serve --socket <path>       -> 平台 socket（Unix: Unix domain socket；
-///                                         Windows: named pipe，当前未实现 -> UNSUPPORTED）
-///
-/// 优先级：`--addr` 显式给出时走 TCP（即便同时给了 `--socket`）；仅给 `--socket`
-/// 时走 socket；二者都不给时走 TCP 默认。
-///
-/// 路由：
-///   GET /localapi/v0/status             → 总览快照
-///   GET /localapi/v0/dns/status         → DNS 状态
-///   GET /localapi/v0/dns/cache          → DNS 正/负缓存
-///   GET /localapi/v0/session/watch      → Session 双轨状态
-///   GET /localapi/v0/plan/explain       → Plan + DecisionTrace
-///   GET /localapi/v0/connectivity/status → 建连状态
-///   GET /localapi/v0/platform/capabilities → 平台能力
+/// serve 子命令（内部/历史兼容）：常驻 LocalAPI。
 fn serve_resource(args: &[String]) -> ExitCode {
     let flags = parse_flags(args);
-    // --addr 显式优先；否则 --socket；否则 TCP 默认。
     match flags.get("--addr").and_then(|v| v.as_deref()) {
         Some(raw) => serve_over_tcp(raw),
         None => match flags.get("--socket").and_then(|v| v.as_deref()) {
@@ -87,7 +236,7 @@ fn serve_resource(args: &[String]) -> ExitCode {
     }
 }
 
-/// TCP loopback 监听 + 服务循环（既有行为，READY 报告 `addr`）。
+/// TCP loopback 监听 + 服务循环（既有行为）。
 fn serve_over_tcp(addr_raw: &str) -> ExitCode {
     let addr: std::net::SocketAddr = match addr_raw.parse() {
         Ok(a) => a,
@@ -111,7 +260,6 @@ fn serve_over_tcp(addr_raw: &str) -> ExitCode {
     println!(
         "{{\"verdict\":\"READY\",\"daemon\":{{\"entry\":\"nexusd\",\"command\":\"serve\",\"addr\":\"{actual_addr}\"}}}}"
     );
-    // 服务循环：逐连接 accept，解析 HTTP 请求行，路由到 observability 函数。
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
@@ -128,11 +276,9 @@ fn serve_over_tcp(addr_raw: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Unix domain socket 监听 + 服务循环（READY 报告 `socket` 路径）。
 #[cfg(unix)]
 fn serve_over_socket(path: &str) -> ExitCode {
     use std::os::unix::net::UnixListener;
-    // 幂等清理可能残留的同名 socket 文件（崩溃后重启）。
     let _ = std::fs::remove_file(path);
     let listener = match UnixListener::bind(path) {
         Ok(l) => l,
@@ -162,48 +308,20 @@ fn serve_over_socket(path: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Windows named-pipe 监听：当前未实现。
-///
-/// std 不提供 named-pipe server；按 AGENTS.md §11/§18，平台专有 I/O 应收敛到
-/// `nexus-platform-windows`（集中 `unsafe` + 每处 Safety Invariant），经 capability
-/// adapter 注入，而非在 composition root 里散落 Win32 FFI。当前先按 PRODUCT §9
-/// 「领域未就绪」模式显式返回 UNSUPPORTED，不静默降级；`--addr` TCP loopback 仍可用。
 #[cfg(windows)]
 fn serve_over_socket(path: &str) -> ExitCode {
-    let pipe = derive_named_pipe_name(path);
     println!(
-        "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"UNSUPPORTED\",\"message\":\"named-pipe transport not yet implemented on Windows (would listen at {pipe}); use --addr TCP loopback\"}}}}"
+        "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"UNSUPPORTED\",\"message\":\"named-pipe not implemented; use --addr\"}}}}"
     );
+    let _ = path;
     ExitCode::SUCCESS
 }
 
-/// 把 `--socket <path>` 推导为 Windows named pipe 全名（`\\.\pipe\<name>`）。
-/// 路径中的目录分隔符与 `.` 段被剥离，只保留最后一个文件名段作为 pipe 名。
-#[cfg(windows)]
-fn derive_named_pipe_name(path: &str) -> String {
-    let name = path
-        .rsplit(['/', '\\'])
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("nexusd");
-    format!(r"\\.\pipe\{name}")
-}
-
-/// 已接受连接的双向字节流抽象（TCP / Unix domain socket 统一）。
-///
-/// Rust 不允许 `dyn Read + Write` 这种多 trait 对象组合，故定义一个空 marker trait
-/// 同时继承二者；TcpStream / UnixStream 经 blanket impl 自动满足。
 trait LocalIo: std::io::Read + std::io::Write {}
 impl<T: std::io::Read + std::io::Write> LocalIo for T {}
 
-/// 处理单个 LocalAPI HTTP 请求：读请求行，路由，写 JSON 响应。
-///
-/// 流类型抽象为 `&mut dyn LocalIo`，使同一 HTTP 处理逻辑同时服务于
-/// TCP 与 Unix domain socket 连接（Windows named pipe 落地后亦复用）。
 fn handle_localapi_request(stream: &mut dyn LocalIo) -> Result<(), String> {
     use std::io::BufRead;
-    // 读请求行（GET /localapi/v0/status HTTP/1.1）。BufReader 仅在块内借用 stream，
-    // 出块即释放可变借用，随后可直接写响应。
     let request_line: String = {
         let mut reader = std::io::BufReader::new(&mut *stream);
         let mut line = String::new();
@@ -223,7 +341,6 @@ fn handle_localapi_request(stream: &mut dyn LocalIo) -> Result<(), String> {
         return Ok(());
     }
     let path = parts[1].to_string();
-    // 路由
     let result: Result<Value, (String, String)> = match path.as_str() {
         "/localapi/v0/status" => nexus::observability::status()
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
@@ -257,7 +374,6 @@ fn handle_localapi_request(stream: &mut dyn LocalIo) -> Result<(), String> {
     Ok(())
 }
 
-/// 写一个 JSON HTTP 响应（流类型抽象为 `&mut dyn Write`）。
 fn write_http_json(
     stream: &mut dyn std::io::Write,
     status: u16,
@@ -277,10 +393,4 @@ fn write_http_json(
     stream.write_all(response.as_bytes())?;
     stream.flush()?;
     Ok(())
-}
-
-/// 把 `SystemProxyState` 转成 JSON（cfg(windows) 实现类型可见）。
-#[cfg(windows)]
-fn proxy_state_json(s: &nexus_platform::SystemProxyState) -> Value {
-    json!({"enabled": s.enabled, "server": s.server})
 }

@@ -1039,10 +1039,12 @@ dependencies = [
  "nexus-network",
  "nexus-platform",
  "nexus-platform-windows",
+ "nexus-proxy-config",
  "nexus-registry",
  "nexus-service",
  "nexus-workspace",
  "serde_json",
+ "toml",
 ]
 
 [[package]]
