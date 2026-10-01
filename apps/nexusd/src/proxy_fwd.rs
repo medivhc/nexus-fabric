@@ -119,6 +119,9 @@ impl ProxyEngine {
     ///
     /// - TCP → TcpForwarder；UDP → UdpForwarder；其他 → (vec![], false)。
     /// - 返回的包由 dataplane 写回 TUN（D1 不变量）。
+    /// - bool 语义（P1）：UDP 返回真实发送结果；TCP 恒返回 false——
+    ///   dial 是异步的，SYN 到达时转发尚未确认，TCP 的真实计数由
+    ///   dataplane 经 `stats().tcp_dials_ok/failed` 的增量驱动。
     pub fn handle_packet(&mut self, packet: &[u8]) -> (Vec<Vec<u8>>, bool) {
         if packet.len() < 20 {
             return (vec![], false);
@@ -127,9 +130,10 @@ impl ProxyEngine {
             6 => {
                 // TCP
                 let tun_pkts = self.tcp.handle_packet(packet);
-                // 是否转发由统计判断：这里简化为 true（包已交 engine）。
-                // 精确的 forwarded/dropped 由 poll_stats 区分。
-                (tun_pkts, true)
+                // P1：dial 是异步的（worker 线程），SYN 到达时转发尚未确认，
+                // 此时返回 false；真实计数由 dataplane 经
+                // engine.stats().tcp_dials_ok/failed 的增量驱动。
+                (tun_pkts, false)
             }
             17 => {
                 // UDP（DNS 已在 D3 短路，这里的 UDP 是业务流量）。
