@@ -53,6 +53,12 @@
 - 规则匹配为纯函数（零 I/O）：相同 `FlowContext` + 相同 `ProxyConfig` 永远产出
   同一个 `RoutingDecision`。
 - 首匹配即终止（first-match）；`MATCH` 规则必须在表尾。
+- 端口/进程规则（2026-10-01 新增）：
+  - `src_port` / `dst_port`：`FlowTarget` 中对应端口为 `None` 时不命中（不 panic）；
+    端口范围为闭区间 `[start, end]`，`start > end` 的 pattern 在编译期拒绝；
+  - `process_name`：`FlowTarget.process_name` 为 `None` 时不命中；匹配大小写敏感
+    （进程名来自 OS，如实比对）；通配仅支持尾部 `*` 前缀匹配；
+  - 三类规则在 classical provider 行中同样可用（与 domain_suffix/ip_cidr 一致）。
 - `rule_action` 动作链的第一动作必须是 `SELECT_OUTBOUND <tag>`；后续动作为
   P1+ 扩展口，P0 不实现也不触发。
 - 策略组解析：
@@ -115,6 +121,9 @@
     启用完整能力（§11.11，编译期展开，决策零 I/O）；
   - `RuleEngine::route(&self, flow: &FlowContext) -> RoutingDecision`：
     对单个 FlowContext 执行顺序匹配，返回动作链首动作 + 出站 tag；
+  - `FlowTarget`：分流目标 `{ domain, ip, src_port, dst_port, process_name }`
+   （后三者 2026-10-01 新增，均为 `Option`；`from_destination` 从 `host:port`
+    解析 `dst_port`，`src_port`/`process_name` 由调用方设置，缺失为 `None`）；
   - `SelectorGroup::new(candidates, initial)` / `select(&self) -> &str` /
     `switch_to(&mut self, tag)`：手动选择组；
   - `UrltestGroup::new(candidates)` / `select(&self, measurements: &MeasurementSource)
