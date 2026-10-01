@@ -85,9 +85,8 @@ fn run() -> serde_json::Value {
         }
     }
 
-    let stats = dp.stats().clone();
-    // DNS 响应验证：需要从 TUN 取出写入的包。由于 Dataplane 拥有 TUN，
-    // MVP 通过 dns_answered 计数验证；完整包检查后置。
+    let stats = dp.stats();
+    // DNS 响应验证：tun_written 证明响应包确实写入了 TUN（非同义反复）。
     json!({
         "verdict": if processed == 5 { "PASS" } else { "FAIL" },
         "dataplane": {
@@ -96,7 +95,7 @@ fn run() -> serde_json::Value {
             "direct_forwarded": stats.direct_forwarded,
             "dropped": stats.dropped,
             "dns_answered": stats.dns_answered,
-            "dns_response_received": stats.dns_answered == 1,
+            "dns_response_received": stats.tun_written == 1,
             "qos_bypassed": dp.qos_bypassed(),
             "processed": processed,
         }

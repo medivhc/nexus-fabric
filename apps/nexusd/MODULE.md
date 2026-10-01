@@ -34,6 +34,7 @@
 - `nexus-projection`（统一数据面：TUN/分类器/多路径/Boost）
 - `nexus-connectivity`（统一数据面：CAKE-like QoS）
 - `nexus-dns`（统一数据面：UnifiedDns）
+- `nexus-path`（统一数据面：PathManager/EWMA 选路，Boost 联动）
 
 ## Forbidden Dependencies
 

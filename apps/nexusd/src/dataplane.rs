@@ -10,8 +10,8 @@
 //! - DNS：UDP dport 53 短路到 `UnifiedDns`，响应写回 TUN。
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use nexus_connectivity::cake::{CakeConfig, CakeScheduler, EnqueueDecision, FiveTuple};
 use nexus_dns::{DnsQuery, DnsType, DnsUnifiedConfig, UnifiedDns};
@@ -31,6 +31,8 @@ pub struct DataplaneStats {
     pub qos_dropped: u64,
     pub mesh_dropped_no_n1: u64,
     pub proxy_dropped_no_proxy: u64,
+    /// 写入 TUN 的包数（DNS 响应等；E4 验证用）。
+    pub tun_written: u64,
 }
 
 /// 数据面配置（从 daemon.toml / network.toml / dns.toml 组装）。
@@ -65,9 +67,11 @@ pub struct Dataplane {
     bypass_cidrs: Vec<Cidr>,
     dns: Option<UnifiedDns>,
     qos: Option<CakeScheduler>,
-    stats: DataplaneStats,
+    stats: Arc<Mutex<DataplaneStats>>,
     config: DataplaneConfig,
     buf: Vec<u8>,
+    /// QoS 时钟起点（单调；避免 Duration::ZERO 冻结导致队列永不满溢回收）。
+    qos_start: std::time::Instant,
 }
 
 impl Dataplane {
@@ -131,10 +135,27 @@ impl Dataplane {
             bypass_cidrs,
             dns,
             qos,
-            stats: DataplaneStats::default(),
+            stats: Arc::new(Mutex::new(DataplaneStats::default())),
             config,
             buf: vec![0u8; 65535],
+            qos_start: std::time::Instant::now(),
         })
+    }
+
+    /// 获取统计的共享句柄（供 LocalAPI 线程读取，B1）。
+    #[must_use]
+    pub fn stats_handle(&self) -> Arc<Mutex<DataplaneStats>> {
+        Arc::clone(&self.stats)
+    }
+
+    /// 内部：锁定统计并执行更新。
+    fn with_stats<F>(&self, f: F)
+    where
+        F: FnOnce(&mut DataplaneStats),
+    {
+        if let Ok(mut stats) = self.stats.lock() {
+            f(&mut stats);
+        }
     }
 
     /// 处理单个包（非阻塞；无包时返回 `Ok(false)`）。
@@ -155,48 +176,65 @@ impl Dataplane {
         }
 
         // D2：分类。
+        // D6：boost_enabled 时分类器经 PathManager 做 EWMA 只读选路（S30）；
+        // 禁用时 candidates 为空（回落默认转发）。
+        let candidates: &[CandidatePath] = if self.config.boost_enabled {
+            &self.candidates
+        } else {
+            &[]
+        };
         let classifier = PacketClassifier::new(
             self.mesh_cidrs.clone(),
             self.bypass_cidrs.clone(),
             &self.manager,
-            &self.candidates,
+            candidates,
             0.0, // degrade_threshold：MVP 用 0（不触发 degraded）
         );
         let classification = classifier.classify(&packet);
 
         // D4：QoS 整形（启用时）。
-        let now = Duration::from_secs(0); // MVP：零时钟（单测注入真实时钟）
+        // 使用单调时钟（非冻结），避免队列永不回收。
+        let now = self.qos_start.elapsed();
         if let Some(qos) = &mut self.qos {
             if let Some(tuple) = five_tuple_of(&packet) {
                 let decision = qos.enqueue(&tuple, packet.len() as u64, now);
                 if !matches!(decision, EnqueueDecision::Admitted { .. }) {
-                    self.stats.qos_dropped += 1;
+                    self.with_stats(|s| s.qos_dropped += 1);
                     return Ok(true);
                 }
             }
+            // 排空已准入包（MVP：计数转发，不实际发送；防止队列无限增长）。
+            // 上限 64 避免单包处理时长时间占用。
+            for _ in 0..64 {
+                if qos.dequeue(now).is_none() {
+                    break;
+                }
+            }
+            // 回收超时流。
+            qos.reap(now);
         }
 
         // D2：按分类计数转发（MVP：计数；实际 N1/proxy 发送后置）。
         match classification {
             Classification::Mesh { .. } => {
                 if self.config.n1_configured {
-                    self.stats.mesh_forwarded += 1;
+                    self.with_stats(|s| s.mesh_forwarded += 1);
                 } else {
-                    self.stats.mesh_dropped_no_n1 += 1;
+                    self.with_stats(|s| s.mesh_dropped_no_n1 += 1);
                 }
             }
             Classification::Proxy => {
                 if self.config.proxy_configured {
-                    self.stats.proxy_forwarded += 1;
+                    self.with_stats(|s| s.proxy_forwarded += 1);
                 } else {
-                    self.stats.proxy_dropped_no_proxy += 1;
+                    self.with_stats(|s| s.proxy_dropped_no_proxy += 1);
                 }
             }
             Classification::Direct => {
-                self.stats.direct_forwarded += 1;
+                self.with_stats(|s| s.direct_forwarded += 1);
             }
             Classification::Drop => {
-                self.stats.dropped += 1;
+                self.with_stats(|s| s.dropped += 1);
             }
         }
         Ok(true)
@@ -212,7 +250,7 @@ impl Dataplane {
         let (query_name, query_id) = match parse_dns_query(packet) {
             Some((name, id)) => (name, id),
             None => {
-                self.stats.dropped += 1;
+                self.with_stats(|s| s.dropped += 1);
                 return;
             }
         };
@@ -230,21 +268,25 @@ impl Dataplane {
                     IpAddr::V6(_) => None,
                 }) {
                     if let Some(response) = build_dns_response(packet, query_id, &query_name, ip) {
-                        let _ = self.tun.write(&response);
-                        self.stats.dns_answered += 1;
+                        if self.tun.write(&response).is_ok() {
+                            self.with_stats(|s| {
+                                s.dns_answered += 1;
+                                s.tun_written += 1;
+                            });
+                        }
                     }
                 }
             }
             Err(_) => {
-                self.stats.dropped += 1;
+                self.with_stats(|s| s.dropped += 1);
             }
         }
     }
 
     /// 获取统计快照（D6 可观测）。
     #[must_use]
-    pub fn stats(&self) -> &DataplaneStats {
-        &self.stats
+    pub fn stats(&self) -> DataplaneStats {
+        self.stats.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
     /// QoS 是否旁路（D4 可观测：禁用时为 true）。
@@ -319,6 +361,8 @@ fn five_tuple_of(packet: &[u8]) -> Option<FiveTuple> {
 }
 
 /// 最小 DNS 查询解析：返回 (查询名, 事务 ID)。
+///
+/// B2 修复：严格校验 QTYPE/QCLASS 存在，截断包返回 None（不 panic）。
 fn parse_dns_query(packet: &[u8]) -> Option<(String, u16)> {
     if packet.len() < 28 {
         return None;
@@ -340,6 +384,7 @@ fn parse_dns_query(packet: &[u8]) -> Option<(String, u16)> {
         }
         let len = dns[pos] as usize;
         if len == 0 {
+            pos += 1;
             break;
         }
         if len & 0xC0 != 0 {
@@ -354,6 +399,10 @@ fn parse_dns_query(packet: &[u8]) -> Option<(String, u16)> {
         pos += len;
     }
     if labels.is_empty() {
+        return None;
+    }
+    // B2：校验 QTYPE(2) + QCLASS(2) 存在。
+    if pos + 4 > dns.len() {
         return None;
     }
     Some((labels.join("."), txid))
@@ -398,8 +447,12 @@ fn build_dns_response(
     dns_resp.extend_from_slice(&[0x00, 0x00]); // NSCOUNT=0
     dns_resp.extend_from_slice(&[0x00, 0x00]); // ARCOUNT=0
     // Question（复制原查询的 QNAME+QTYPE+QCLASS）。
+    // B2：边界校验，防止截断包导致切片越界 panic。
     let qname_end = find_qname_end(&query_packet[dns_start..])?;
     let q_section_len = qname_end + 4; // QNAME + QTYPE(2) + QCLASS(2)
+    if dns_start + q_section_len > query_packet.len() {
+        return None;
+    }
     dns_resp.extend_from_slice(&query_packet[dns_start..dns_start + q_section_len]);
     // Answer：NAME(指针), TYPE=A, CLASS=IN, TTL=300, RDLENGTH=4, RDATA=IP。
     dns_resp.extend_from_slice(&[0xC0, 0x0C]); // 指向 QNAME 的压缩指针
@@ -475,6 +528,26 @@ fn ip_checksum(header: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+// ===== B1：全局 stats 句柄（供 LocalAPI 线程读取） =====
+
+/// 全局数据面统计句柄（dataplane 线程发布，LocalAPI 线程读取）。
+static STATS_HANDLE: OnceLock<Arc<Mutex<DataplaneStats>>> = OnceLock::new();
+
+/// 发布 stats 句柄（由 dataplane 线程在启动时调用一次）。
+pub fn publish_stats_handle(handle: Arc<Mutex<DataplaneStats>>) {
+    let _ = STATS_HANDLE.set(handle);
+}
+
+/// 获取已发布的 stats 快照（LocalAPI 用；未发布时返回默认零值）。
+#[must_use]
+pub fn dataplane_stats_snapshot() -> DataplaneStats {
+    STATS_HANDLE
+        .get()
+        .and_then(|h| h.lock().ok())
+        .map(|s| s.clone())
+        .unwrap_or_default()
+}
+
 // ===== Stub 实现（MVP：E4 可测；真实解析器由子系统接入） =====
 
 struct StubMeshResolver;
@@ -500,6 +573,4 @@ impl nexus_dns::Resolver for StubUpstreamResolver {
     }
 }
 
-// 抑制未使用警告（SocketAddr 在未来 N1 转发用）。
-#[allow(dead_code)]
-fn _use_socket_addr(_: SocketAddr) {}
+// ===== 全局 stats 句柄结束 =====

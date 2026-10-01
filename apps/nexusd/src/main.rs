@@ -149,6 +149,9 @@ fn run_dataplane(config: nexusd::dataplane::DataplaneConfig) {
         }
     };
 
+    // B1：发布 stats 句柄供 LocalAPI 读取。
+    nexusd::dataplane::publish_stats_handle(dp.stats_handle());
+
     eprintln!("[nexusd] dataplane: running");
     loop {
         match dp.process_one() {
@@ -445,6 +448,23 @@ fn handle_localapi_request(stream: &mut dyn LocalIo) -> Result<(), String> {
     let result: Result<Value, (String, String)> = match path.as_str() {
         "/localapi/v0/status" => nexus::observability::status()
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
+        "/localapi/v0/dataplane/stats" => {
+            // B1：统一数据面统计（D6 可观测）。
+            let s = nexusd::dataplane::dataplane_stats_snapshot();
+            Ok(json!({
+                "verdict": "PASS",
+                "dataplane": {
+                    "mesh_forwarded": s.mesh_forwarded,
+                    "proxy_forwarded": s.proxy_forwarded,
+                    "direct_forwarded": s.direct_forwarded,
+                    "dropped": s.dropped,
+                    "dns_answered": s.dns_answered,
+                    "qos_dropped": s.qos_dropped,
+                    "mesh_dropped_no_n1": s.mesh_dropped_no_n1,
+                    "proxy_dropped_no_proxy": s.proxy_dropped_no_proxy,
+                }
+            }))
+        }
         "/localapi/v0/dns/status" => nexus::observability::dns_status()
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
         "/localapi/v0/dns/cache" => nexus::observability::dns_cache()
