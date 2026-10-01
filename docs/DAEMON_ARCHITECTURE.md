@@ -353,12 +353,25 @@ high_priority_ports = "22,53,3389"
 
 ---
 
-## 12. 多路径/竞速/预测与统一数据面的集成
+## 12. Network Boost 与高级选项
 
 > 状态：**设计**（2026-10-01）。竞速/预测代码已存在（`crates/nexus-path/`，已合入 master）；
-> 与统一 daemon 的集成、多路径调度器为新设计，未实现。
+> boost 开关集成、多路径调度器为新设计，未实现。
 
-### 12.1 现有能力（已合入 master）
+### 12.1 设计原则
+
+**Boost 开关 v1** 只放开销小、普遍受益的：
+- **预测（EWMA）**：持续跟踪路径质量，劣化时主动切换
+- **竞速**：建连时并行拨号选最快，降低首包延迟
+- **激进切路**：boost 模式下更低的 hysteresis 门限
+
+**独立高级选项**（不进 boost 开关）：
+- **QoS**（§11）：只有链路拥塞时有用，空闲时是纯开销
+- **多路径**（§12.4）：复杂度最高，瓶颈在代理服务器端时无效
+
+> 原因：用户开了 boost 没感觉会觉得是假的。QoS/多路径效果看场景，单独开关更诚实。
+
+### 12.2 现有能力（已合入 master）
 
 | 模块 | 文件 | 能力 |
 |------|------|------|
@@ -366,7 +379,21 @@ high_priority_ports = "22,53,3389"
 | 质量预测 | `crates/nexus-path/src/ewma.rs` | per-path EWMA，20% 相对 hysteresis + 3s 保持 |
 | 路径回退 | `crates/nexus-path/src/fallback.rs` | Direct → Proxy → Turn，`FallbackChain` |
 
-### 12.2 在统一数据面中的位置
+### 12.3 Boost 开关配置
+
+```toml
+# network.toml
+[boost]
+enabled = true
+# 激进切路：boost 模式下的 hysteresis（默认 20% → 10%）
+hysteresis_pct = 0.10
+# 保持时间（默认 3s → 1s）
+switch_hold_ms = 1000
+# 建连时是否竞速
+race_on_connect = true
+```
+
+### 12.4 在统一数据面中的位置
 
 ```
                     ┌─ 竞速/预测（建连时，control plane）─┐
@@ -375,19 +402,17 @@ high_priority_ports = "22,53,3389"
                     └──────────────────┬──────────────────┘
                                        ↓ 建连完成
 TUN 捕获 → [包分类器] → [QoS: DRR+整形] → [路径调度器] → 转发
-              §6          §11              本节（多路径时）
+              §6       §11（独立开关）    §12.6（独立开关）
                                        ↓
                               N1 / Proxy egress
 ```
 
 **分工**：
-- **竞速/预测**：连接建立时选路。`race_connect` 并发拨多条路径，EWMA 持续打分。
-- **QoS**（§11）：连接建立后，包调度时做流间公平，与底下是哪条路无关。
-- **路径调度器**（多路径时）：在 QoS 之下，按包或按流选择 egress 路径。
+- **竞速/预测**（boost）：连接建立时选路。`race_connect` 并发拨多条路径，EWMA 持续打分。
+- **QoS**（§11，独立开关）：连接建立后，包调度时做流间公平。
+- **路径调度器**（多路径，独立开关）：在 QoS 之下，按包或按流选择 egress 路径。
 
-三者正交：竞速决定"建哪条"，EWMA 决定"哪条好"，QoS 决定"包怎么排"，调度器决定"包走哪条"。
-
-### 12.3 EWMA 驱动统一分类器
+### 12.5 EWMA 驱动统一分类器
 
 EWMA 的 per-path 分数可输入包分类器（§6），实现动态调整：
 
@@ -405,10 +430,10 @@ EWMA 的 per-path 分数可输入包分类器（§6），实现动态调整：
       forward(bypass)
 ```
 
-- hysteresis（20% + 3s）防止路径乒乓
+- hysteresis（boost 模式 10% + 1s）防止路径乒乓
 - 分类器只读 EWMA 分数，不修改（single writer 仍在 `nexus-path`）
 
-### 12.4 多路径扩展设计
+### 12.6 多路径扩展设计（独立高级选项）
 
 **目标**：单流可同时用多条路径（如 mesh 直连 + proxy 并发），提升吞吐/可靠性。
 
@@ -431,23 +456,21 @@ EWMA 的 per-path 分数可输入包分类器（§6），实现动态调整：
 - 包头加 sequence number（复用 QUIC 的包号机制，避免新协议）
 - 接收端按序重组，乱序包缓冲（上限可配置，防内存爆炸）
 
-### 12.5 配置（`network.toml` 扩展）
-
+**配置**（`network.toml`）：
 ```toml
 [multipath]
 # 调度策略：single | per-flow | per-packet
 strategy = "single"
 # per-packet 模式的重排缓冲上限（包数）
 reorder_buffer = 64
-# 是否启用 EWMA 驱动的动态分类（§12.3）
-ewma_driven_classifier = true
 ```
 
-### 12.6 诚实边界
+### 12.7 诚实边界
 
-- 竞速/预测代码已实现并合入，但**尚未与统一 daemon 的分类器集成**（§12.3 为设计）
+- 竞速/预测代码已实现并合入，但**尚未与统一 daemon 的分类器集成**（§12.5 为设计）
 - 多路径调度器未实现；per-packet 模式的接收端重排未设计细节
 - EWMA 参数（20%/3s）来自路径层场景，mesh 场景下的最优值需实测
+- boost 的激进参数（10%/1s）为初值，需真机调优
 
 ---
 
