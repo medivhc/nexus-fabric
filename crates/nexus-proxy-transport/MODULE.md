@@ -146,12 +146,35 @@ crates 的公开原语；本 crate 不准出现 `ChaCha20Poly1305`/`Hkdf`/`Sha22
 ss 的 `handshake_ok=1` 要求 ack 确认帧校验通过；trojan 的
 `handshake_ok=1` 表示请求头已完整写出（无确认帧是协议语义）。
 
+**T7（Trojan over TLS，2026-10-01 冻结）**：在 T2 明文 trojan 之上叠加标准
+TLS，兼容真实 trojan 服务器：
+- 建连顺序：TCP connect → TLS 握手（rustls 0.23 + ring）→ 在 TLS 隧道内
+  写 `encode_request(password, target)`（T2 握手字节不变）→ 2 字节成帧
+  （T4，帧在 TLS 内明文，与标准 trojan 一致）；
+- `TrojanTlsConfig { server: SocketAddr, password: String, sni: String,
+  skip_cert_verify: bool, alpn: Vec<Vec<u8>>, connect_timeout,
+  handshake_timeout }`；
+  - `sni`：TLS SNI（通常为服务器域名；IP 直连时可用 IP 字符串）；
+  - `skip_cert_verify = false`（默认）：用系统根证书校验（rustls
+    `with_native_roots`）；`= true`：跳过证书链/主机名校验（仍校验
+    握手签名，复用 `nexus-outbound-trojan::client_config_dangerous_skip_verify`），
+    仅用于自签/内网节点；
+  - `alpn`：下发 ALPN 列表（trojan 标准为 `["h2"]` 或空；可配置）；
+- `tls = false` 时回落到 T2 明文模式（`TrojanTransport` 行为零变化）；
+- 密码学不重写（T3 延续）：TLS 配置构造只调用
+  `nexus-outbound-trojan` 的 `client_config_dangerous_skip_verify` 等公开原语；
+- 可观测（T6 延续）：`TlsTrojanTransport` 独立 `Counters`；
+  `handshake_ok=1` 表示 TLS 握手 + 请求头写出完成；
+- 同步 std（T5 延续）：rustls `Stream` 同步 API，无 tokio。
+
 ### T 期诚实边界
 
-- trojan over TLS 后置（本期明文握手+明文成帧，E4 与文档明说）；
+- ~~trojan over TLS 后置（本期明文握手+明文成帧，E4 与文档明说）；~~
+  T7 已实现 trojan over TLS；T2 明文模式保留用于测试/内网。
   UDP ASSOCIATE 后置。
 - ss 会话无随机 salt（复用 `SsStream` 固定计数器 nonce 设计），线格式与
-  公网 ss 不兼容；**与公网 ss/trojan 服务的互操作未验证，不得宣称**。
+  公网 ss 不兼容；**与公网 ss 服务的互操作未验证，不得宣称**。
+  trojan over TLS（T7）与真实 trojan 服务器的互操作需 E4 验证后方可宣称。
 - trojan 2 字节长度前缀明文（与 SOCKS5 期一致），载荷 AEAD 仅 ss 有；
   长度隐藏后置。
 - E4 只在 xc-pc-linux 真机（Linux）；沙箱 TCP 需 per-destination 审批。
