@@ -84,7 +84,7 @@ quinn-proto driver runs on its own std threads (the repository is tokio-free).
 
 ## QSEQ：Fabric 层数据报序号（GAP-2 冻结契约）
 
-**Contract hash**：待计算（实现阶段冻结后填入）
+**Contract hash**：`16df4f6106f0459e5974f180f28521e018324662`
 
 ### 背景与诚实边界
 

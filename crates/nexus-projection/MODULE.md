@@ -288,7 +288,7 @@ accept 线程，sync，零 tokio）把 SOCKS5/HTTP 显式代理映射为 fabric 
 
 **S33（包序号回绕，2026-10-01 冻结，GAP-2）**：`multipath.rs` 的序号语义升级。
 
-**Contract hash**：待计算（实现阶段冻结后填入）
+**Contract hash**：`16df4f6106f0459e5974f180f28521e018324662`
 
 ### 背景
 
