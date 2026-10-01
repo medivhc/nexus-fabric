@@ -97,6 +97,13 @@ impl N1MeshBridge {
     pub fn route_count(&self) -> usize {
         self.routes.len()
     }
+
+    /// Shutdown all peer sessions (Composition Root §13.4 step 4).
+    ///
+    /// Additive; does not change M1-M7 behavior.
+    pub fn shutdown(&self) {
+        self.sessions.shutdown();
+    }
 }
 
 impl N1Sender for N1MeshBridge {

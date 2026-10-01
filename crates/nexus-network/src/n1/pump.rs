@@ -84,6 +84,12 @@ impl Ipv4Net {
     pub fn prefix_len(&self) -> u8 {
         self.prefix
     }
+
+    /// 网络地址（Composition Root 由路由派生 mesh CIDR 用）。
+    #[must_use]
+    pub fn network_addr(&self) -> std::net::Ipv4Addr {
+        self.network
+    }
 }
 
 impl std::fmt::Display for Ipv4Net {

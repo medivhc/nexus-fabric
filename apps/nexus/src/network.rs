@@ -12,19 +12,19 @@
 
 use nexus_control_api::ControlCommand;
 use nexus_discovery::{
-    AggregateDiscovery, Discovery, PeerId as DiscoveryPeerId, StaticDiscovery, lsa::Lsdb,
-    mdns::MdnsDiscovery,
+    lsa::Lsdb, mdns::MdnsDiscovery, AggregateDiscovery, Discovery, PeerId as DiscoveryPeerId,
+    StaticDiscovery,
 };
 use nexus_fabric::{
     ConnConfig, FabricConn, FabricError, PeerId as FabricPeerId, RecvStream, SendStream,
     StdUdpTransport, UdpTransport,
 };
 use nexus_network::n1::{
-    N1Connection, N1Dialer, N1Discovery, N1Error, N1Event, N1EventSink, N1KeepaliveIo,
-    N1KeepaliveStream, N1PeerId,
     config::N1Config,
     pump::{Ipv4Route, PeerConnLookup, VpiPump},
     session::N1SessionManager,
+    N1Connection, N1Dialer, N1Discovery, N1Error, N1Event, N1EventSink, N1KeepaliveIo,
+    N1KeepaliveStream, N1PeerId,
 };
 use nexus_path::{CandidatePath, FallbackChain, FallbackConfig, PathKind};
 use nexus_platform::VirtualPacketInterface;
@@ -234,6 +234,48 @@ impl PeerConnLookup for ManagerLookup {
 }
 
 // ---------- 命令分发 ----------
+
+/// Composition Root 装配器：从 `network.toml` 文本构造 N1 会话管理器。
+///
+/// 供 `nexusd`（统一 Composition Root）复用，不复制装配逻辑。
+/// 只做构造 + 返回解析后的 `N1Config`；不建 TUN、不 dial（调用方按需 dial）。
+///
+/// # Errors
+/// - `network.toml` 解析失败 → `Err(String)`。
+pub fn build_session_manager(
+    config_text: &str,
+) -> Result<(N1Config, Arc<N1SessionManager>), String> {
+    let config =
+        N1Config::parse_toml(config_text).map_err(|e| format!("parse network.toml: {e:?}"))?;
+    let sink = Arc::new(LogSink);
+    let discovery = Arc::new(DiscoveryAdapter::new(
+        config.peer_id,
+        config
+            .peers
+            .iter()
+            .map(|p| {
+                (
+                    p.id,
+                    p.addrs
+                        .first()
+                        .copied()
+                        .unwrap_or_else(|| "0.0.0.0:0".parse().expect("0.0.0.0:0 parses")),
+                )
+            })
+            .collect(),
+    ));
+    let dialer = Arc::new(FabricDialer {
+        local_bind: "0.0.0.0:0".parse().expect("0.0.0.0:0 parses"),
+        handshake_timeout: Duration::from_secs(10),
+    });
+    let mgr = Arc::new(N1SessionManager::new(
+        dialer,
+        discovery,
+        sink,
+        config.link.clone(),
+    ));
+    Ok((config, mgr))
+}
 
 /// `network` 命令族分发（经 Application API 的 ControlCommand）。
 pub fn dispatch(command: &ControlCommand, raw_args: &[String], json_mode: bool) -> i32 {

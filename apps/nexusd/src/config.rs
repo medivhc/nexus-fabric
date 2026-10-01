@@ -384,6 +384,110 @@ fn parse_port_list(v: &toml::Value) -> Result<Vec<u16>, String> {
     ))
 }
 
+/// 解析 `dns.toml` 为 `DnsUnifiedConfig`（R3）。
+///
+/// 字段从 `[dns]` 小节读取；小节缺失时读根级键；全缺失时取默认值。
+/// 字段：
+/// - `upstream`：字符串数组（默认空）；
+/// - `fake_ip_enabled`：bool（默认 true）；
+/// - `fake_ip_range`：CIDR 字符串（默认 `198.18.0.0/15`）；
+/// - `mesh_suffix`：字符串（默认 `"mesh"`）；
+/// - `fake_ip_ttl_secs`：整数秒（默认 300）；
+/// - `hosts`：表，域名 → IP 字符串。
+///
+/// # Errors
+/// - TOML 语法错误；
+/// - `fake_ip_range` 非法 CIDR；
+/// - `hosts` 中 IP 非法。
+///
+/// 调用方按 §13.6 处理：解析失败 → daemon 启动失败 exit 1。
+pub fn parse_dns_toml(text: &str) -> Result<nexus_dns::DnsUnifiedConfig, String> {
+    use nexus_dns::{DEFAULT_FAKE_IP_RANGE, DEFAULT_MESH_SUFFIX, DnsUnifiedConfig};
+
+    let v: toml::Value = toml::from_str(text).map_err(|e| format!("{}: {e}", DNS_TOML))?;
+    // [dns] 小节优先，否则读根级。
+    let t = v.get("dns").unwrap_or(&v);
+
+    let upstream: Vec<String> = t
+        .get("upstream")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|i| i.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let fake_ip_enabled = t
+        .get("fake_ip_enabled")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(true);
+
+    let fake_ip_range = t
+        .get("fake_ip_range")
+        .and_then(|x| x.as_str())
+        .unwrap_or(DEFAULT_FAKE_IP_RANGE);
+    let (fake_ip_network, fake_ip_prefix) =
+        parse_cidr_v4(fake_ip_range).map_err(|e| format!("{DNS_TOML}: bad fake_ip_range: {e}"))?;
+
+    let mesh_suffix = t
+        .get("mesh_suffix")
+        .and_then(|x| x.as_str())
+        .unwrap_or(DEFAULT_MESH_SUFFIX)
+        .to_string();
+
+    let fake_ip_ttl_secs = t
+        .get("fake_ip_ttl_secs")
+        .and_then(|x| x.as_integer())
+        .and_then(|i| u64::try_from(i).ok())
+        .unwrap_or(300);
+
+    let mut hosts = Vec::new();
+    if let Some(table) = t.get("hosts").and_then(|x| x.as_table()) {
+        for (name, ip_v) in table {
+            let ip_s = ip_v
+                .as_str()
+                .ok_or_else(|| format!("{DNS_TOML}: hosts.{name} must be an IP string"))?;
+            let ip: std::net::IpAddr = ip_s
+                .parse()
+                .map_err(|_| format!("{DNS_TOML}: hosts.{name} bad IP '{ip_s}'"))?;
+            hosts.push((name.clone(), ip));
+        }
+    }
+
+    Ok(DnsUnifiedConfig {
+        upstream,
+        fake_ip_enabled,
+        fake_ip_network,
+        fake_ip_prefix,
+        mesh_suffix,
+        fake_ip_ttl_secs,
+        hosts,
+    })
+}
+
+/// 解析 IPv4 CIDR（`"A.B.C.D/N"`）→ `(网络地址 u32, 前缀长度)`。
+fn parse_cidr_v4(s: &str) -> Result<(u32, u8), String> {
+    let (addr_s, prefix_s) = s
+        .split_once('/')
+        .ok_or_else(|| format!("expected A.B.C.D/N, got '{s}'"))?;
+    let addr: std::net::Ipv4Addr = addr_s
+        .parse()
+        .map_err(|_| format!("bad IPv4 address '{addr_s}'"))?;
+    let prefix: u8 = prefix_s
+        .parse()
+        .map_err(|_| format!("bad prefix '{prefix_s}'"))?;
+    if prefix > 32 {
+        return Err(format!("prefix out of range: {prefix}"));
+    }
+    let mask = if prefix == 0 {
+        0u32
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    Ok((u32::from(addr) & mask, prefix))
+}
+
 /// 热加载变更分类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeKind {
@@ -397,9 +501,9 @@ pub enum ChangeKind {
 /// 对比新旧配置，判断变更类型。
 ///
 /// 保守策略：目前仅做文件级判断——
-/// - `proxy.yaml` / `dns.toml` 内容变更 → Hot（规则/记录类数据）
-/// - `network.toml` 内容变更 → Hot（peer 列表等；若含监听端口变更则 NeedsRestart，
-///   当前未做字段级 diff，一律按 Hot 处理并记 info，端口类变更由 N1 侧自行决定）
+/// - `proxy.yaml` 内容变更 → Hot（规则类数据）
+/// - `dns.toml` 内容变更 → Hot（上游变更热生效，R5）
+/// - `network.toml` 内容变更 → NeedsRestart（mesh CIDR 属重启类，R5/§13.6）
 /// - `daemon.toml` 的 `localapi_addr` 变更 → NeedsRestart
 /// - `daemon.toml` 的 `[qos]` 小节变更 → NeedsRestart（子系统启停/重配）
 /// - 文件新增/删除 → NeedsRestart（子系统启停需重新装配）
@@ -414,6 +518,10 @@ pub fn classify_change(old: &LoadedConfig, new: &LoadedConfig) -> ChangeKind {
     }
     // daemon.toml：[tun] 小节变化需重启（T4：TUN 设备启停需重建）
     if old.daemon.tun != new.daemon.tun {
+        return ChangeKind::NeedsRestart;
+    }
+    // R5：network.toml 内容变更 → NeedsRestart（mesh CIDR 可能变化）。
+    if old.network_toml != new.network_toml {
         return ChangeKind::NeedsRestart;
     }
     // 任一文件的增删 → 需重启（子系统启停）
@@ -624,5 +732,36 @@ mod tests {
         let same = load(&dir).unwrap();
         assert_eq!(classify_change(&new, &same), ChangeKind::Hot);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn dns_toml_empty_uses_defaults() {
+        let cfg = parse_dns_toml("").unwrap();
+        assert_eq!(cfg.mesh_suffix.as_str(), "mesh");
+        assert!(cfg.upstream.is_empty());
+        assert!(cfg.hosts.is_empty());
+    }
+
+    #[test]
+    fn dns_toml_section_and_root_level() {
+        // [dns] 节。
+        let cfg = parse_dns_toml("[dns]\nmesh_suffix = \"lan\"\n").unwrap();
+        assert_eq!(cfg.mesh_suffix.as_str(), "lan");
+        // 根级字段。
+        let cfg = parse_dns_toml("upstream = [\"9.9.9.9\"]\n").unwrap();
+        assert_eq!(cfg.upstream, vec!["9.9.9.9"]);
+    }
+
+    #[test]
+    fn dns_toml_hosts_parsed() {
+        let cfg = parse_dns_toml("[dns.hosts]\nprinter = \"192.168.1.50\"\n").unwrap();
+        assert_eq!(cfg.hosts.len(), 1);
+    }
+
+    #[test]
+    fn dns_toml_bad_rejected() {
+        assert!(parse_dns_toml("not toml [[[").is_err());
+        assert!(parse_dns_toml("[dns]\nfake_ip_range = \"999.1.1.0/24\"\n").is_err());
+        assert!(parse_dns_toml("[dns.hosts]\nbad = \"not-an-ip\"\n").is_err());
     }
 }
