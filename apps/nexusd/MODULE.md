@@ -129,6 +129,23 @@
 - 不变量：单 TUN（D1）；分类器是唯一分类入口（S29）；DNS 不泄露 mesh 内名
   （nexus-dns S-unified）；QoS 禁用时零开销（D4）。
 
+### N1 组网接入（W1-W4，scenarios/product/n1_wireup.toml，2026-10-01 冻结）
+
+- **W1（N1 发送）**：`Classification::Mesh{..}` 且 `n1_configured=true` 时，
+  dataplane 调用 N1 发送接口真发（不再仅计数）：
+  - 发送成功 → `mesh_forwarded += 1`；
+  - 发送失败（无路由/无连接/超限）→ `mesh_dropped_no_n1 += 1`（D2 可观测性不变）。
+- **W2（N1 接收）**：N1 对端发来的包经下行路径写回 TUN（`tun_written += 1`）；
+  写 TUN 失败 → 计数丢弃（不 panic）。
+- **W3（接口边界）**：`nexus-network` 新增 `N1MeshBridge`（`n1/bridge.rs`）：
+  - 持有 `N1SessionManager`（连接表）+ `Ipv4Route` 路由表（复用 pump.rs 逻辑）；
+  - `send_to_mesh(dst: Ipv4Addr, packet: &[u8]) -> Result<(), N1Error>`；
+  - **不修改** M1-M7 冻结行为（`VpiPump`、`N1SessionManager` 核心逻辑不动）。
+- **W4（配置）**：`network.toml` 的 N1 配置（peer 列表、mesh CIDR）经
+  `DataplaneConfig` 传给 dataplane；未配置 N1 时保持 D2 计数行为。
+- 不变量：单 TUN（D1）；分类器唯一入口（S29）；N1 发送失败不阻塞其他分类
+  （Proxy/Direct 照常）；`mesh_dropped_no_n1` 语义不变（无 N1 或发送失败都计数）。
+
 ### 常规要求
 
 - 默认最小 surface：`private -> pub(crate) -> pub`。
