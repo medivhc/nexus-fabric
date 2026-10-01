@@ -49,11 +49,11 @@ pub const PROTO_UDP: u8 = 17;
 pub const PROTO_ICMP: u8 = 1;
 
 /// `quantum` 下限（字节）：过小会导致大包需要过多累积轮次。
-pub const MIN_QUANTUM: u32 = 64;
+pub(crate) const MIN_QUANTUM: u32 = 64;
 /// `quantum` 上限（字节）。
-pub const MAX_QUANTUM: u32 = 65536;
+pub(crate) const MAX_QUANTUM: u32 = 65536;
 /// `max_packet_bytes` 上限（16MB）：控制 DRR 累积轮次上界与 deficit 范围。
-pub const MAX_PACKET_BYTES_LIMIT: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_PACKET_BYTES_LIMIT: u64 = 16 * 1024 * 1024;
 
 // ---------- 五元组 / 流 / 优先级 ----------
 
@@ -100,7 +100,7 @@ pub enum Priority {
 impl Priority {
     /// 在统计数组 / active 队列数组中的下标（High=0, Medium=1, Low=2）。
     #[must_use]
-    pub const fn index(self) -> usize {
+    pub(crate) const fn index(self) -> usize {
         self as usize
     }
 }
@@ -283,17 +283,20 @@ impl CakeScheduler {
     }
 
     /// 按端口/协议规则为五元组定级（新流创建时调用）。
-    fn classify(&self, tuple: &FiveTuple) -> Priority {
+    ///
+    /// 关联函数（取 `&CakeConfig` 而非 `&self`），以便在 `self.flows` 可变借用
+    /// 的同时调用，无借用冲突。
+    fn classify(config: &CakeConfig, tuple: &FiveTuple) -> Priority {
         if tuple.proto == PROTO_ICMP {
             return Priority::High;
         }
-        if self.config.high_priority_ports.contains(&tuple.src_port)
-            || self.config.high_priority_ports.contains(&tuple.dst_port)
+        if config.high_priority_ports.contains(&tuple.src_port)
+            || config.high_priority_ports.contains(&tuple.dst_port)
         {
             return Priority::High;
         }
-        if self.config.low_priority_ports.contains(&tuple.src_port)
-            || self.config.low_priority_ports.contains(&tuple.dst_port)
+        if config.low_priority_ports.contains(&tuple.src_port)
+            || config.low_priority_ports.contains(&tuple.dst_port)
         {
             return Priority::Low;
         }
@@ -309,15 +312,18 @@ impl CakeScheduler {
             return EnqueueDecision::DroppedOversize;
         }
         let fid = tuple.flow_id();
-        if !self.flows.contains_key(&fid) {
-            let p = self.classify(tuple);
-            self.flows.insert(fid, FlowState::new(p, now));
-        } else if let Some(flow) = self.flows.get_mut(&fid) {
-            flow.last_seen = now;
-        }
-        let priority = self.flows.get(&fid).expect("flow just ensured").priority;
-        let flow = self.flows.get_mut(&fid).expect("flow just ensured");
-        if flow.queue.len() >= self.config.max_queue_packets {
+        // 新流按规则定级：先读后写，无借用冲突（classify 只读 config）。
+        let priority = match self.flows.get(&fid) {
+            Some(flow) => flow.priority,
+            None => Self::classify(&self.config, tuple),
+        };
+        let flow = self
+            .flows
+            .entry(fid)
+            .or_insert_with(|| FlowState::new(priority, now));
+        flow.last_seen = now;
+        let max_q = self.config.max_queue_packets;
+        if flow.queue.len() >= max_q {
             self.packets_dropped += 1;
             return EnqueueDecision::DroppedQueueFull;
         }
@@ -365,15 +371,20 @@ impl CakeScheduler {
                 let mut shaped_block = false;
                 let mut sent: Option<(FlowId, u64)> = None;
                 for _ in 0..n {
-                    let fid = self.active[pi].pop_front().expect("active len checked");
+                    let Some(fid) = self.active[pi].pop_front() else {
+                        break; // 防御性：计数内正常不应为空
+                    };
                     // 步骤 1：累积 deficit 并读取队首（借用在此作用域结束）。
+                    // active 与流表不一致时跳过该条目（自愈，不 panic）。
                     enum Step {
                         Send(u64),
                         Wait,
                         Gone,
                     }
                     let step = {
-                        let flow = self.flows.get_mut(&fid).expect("active flow exists");
+                        let Some(flow) = self.flows.get_mut(&fid) else {
+                            continue;
+                        };
                         flow.deficit += self.config.quantum as i64;
                         match flow.queue.front().copied() {
                             Some(len) if flow.deficit >= 0 && (flow.deficit as u64) >= len => {
@@ -388,18 +399,22 @@ impl CakeScheduler {
                             // 步骤 2：整形门控。
                             if !self.try_shape(len, now) {
                                 // 令牌不足：回滚本轮 deficit，流放回队首，直接返回。
-                                let flow = self.flows.get_mut(&fid).expect("active flow exists");
-                                flow.deficit -= self.config.quantum as i64;
+                                if let Some(flow) = self.flows.get_mut(&fid) {
+                                    flow.deficit -= self.config.quantum as i64;
+                                }
                                 self.active[pi].push_front(fid);
                                 shaped_block = true;
                                 break;
                             }
                             // 步骤 3：出队。
-                            let still_backlogged = {
-                                let flow = self.flows.get_mut(&fid).expect("active flow exists");
-                                flow.queue.pop_front();
-                                flow.deficit -= len as i64;
-                                !flow.queue.is_empty()
+                            let still_backlogged = match self.flows.get_mut(&fid) {
+                                Some(flow) => {
+                                    flow.queue.pop_front();
+                                    flow.deficit -= len as i64;
+                                    !flow.queue.is_empty()
+                                }
+                                // 防御性：流已消失则视为排空
+                                None => false,
                             };
                             if still_backlogged {
                                 self.active[pi].push_back(fid);

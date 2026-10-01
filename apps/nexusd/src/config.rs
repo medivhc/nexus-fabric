@@ -248,16 +248,25 @@ fn parse_qos_section(t: &toml::Value) -> Result<QosSection, String> {
             .and_then(|i| u64::try_from(i).ok())
             .unwrap_or(0)
     };
-    let quantum = t
-        .get("quantum")
-        .and_then(|x| x.as_integer())
-        .and_then(|i| u32::try_from(i).ok())
-        .unwrap_or(1514);
-    if !(64..=65536).contains(&quantum) {
-        return Err(format!(
-            "{DAEMON_TOML}: [qos].quantum must be in [64, 65536] (got {quantum})"
-        ));
-    }
+    let quantum = match t.get("quantum") {
+        // 缺失 → 默认 1514
+        None => 1514,
+        // 存在 → 必须为 [64, 65536] 内整数，否则拒绝加载（不静默取默认）
+        Some(x) => {
+            let n = x
+                .as_integer()
+                .and_then(|i| u32::try_from(i).ok())
+                .ok_or_else(|| {
+                    format!("{DAEMON_TOML}: [qos].quantum must be an integer in [64, 65536]")
+                })?;
+            if !(64..=65536).contains(&n) {
+                return Err(format!(
+                    "{DAEMON_TOML}: [qos].quantum must be in [64, 65536] (got {n})"
+                ));
+            }
+            n
+        }
+    };
     let high_priority_ports = match t.get("high_priority_ports") {
         Some(v) => parse_port_list(v)?,
         None => vec![22, 53, 3389],
