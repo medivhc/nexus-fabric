@@ -466,6 +466,12 @@ mod tests {
         assert!(parse_daemon_toml(bad_q).is_err());
         let bad_q2 = "[qos]\nquantum = 70000\n";
         assert!(parse_daemon_toml(bad_q2).is_err());
+        // 负数 quantum：拒绝加载（不静默取默认）。
+        let bad_q3 = "[qos]\nquantum = -5\n";
+        assert!(parse_daemon_toml(bad_q3).is_err());
+        // 非整数 quantum：拒绝加载。
+        let bad_q4 = "[qos]\nquantum = \"fast\"\n";
+        assert!(parse_daemon_toml(bad_q4).is_err());
         let bad_p = "[qos]\nhigh_priority_ports = \"22,abc\"\n";
         assert!(parse_daemon_toml(bad_p).is_err());
         let bad_p2 = "[qos]\nhigh_priority_ports = [99999]\n";

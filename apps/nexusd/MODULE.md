@@ -91,7 +91,8 @@
 ### `daemon.toml [qos]` 小节（CAKE-like QoS，scenarios/product/qos_cake.toml (e)）
 
 - 字段（全部可选）：`enabled`（默认 false；别名 `enable` 亦接受）、
-  `mesh_upload_mbps` / `proxy_upload_mbps`（整数 Mbps，0=不限，默认 0）、
+  `mesh_upload_mbps` / `proxy_upload_mbps`（整数 Mbps，0=不限，默认 0；
+  负数按 0 处理，即不限）、
   `quantum`（整数，需在 [64, 65536] 内，默认 1514，非法则拒绝加载）、
   `high_priority_ports`（逗号分隔字符串 `"22,53,3389"` 或整数数组，
   默认 `[22, 53, 3389]`）。
