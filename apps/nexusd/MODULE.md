@@ -202,6 +202,60 @@
 - 不变量：TUN 失败仍致命（D1）；N1/DNS/Proxy 失败可降级（§13.3 原则）；
   关闭必达 exit（不 hang）；`mesh_dropped_no_n1` 语义不变。
 
+### TCP 终结接线（S1-S11，scenarios/product/tcp_termination_wireup.toml，2026-10-01 冻结）
+
+- **S1（终结范围）**：IPv4 + proto 6 的包，且 `PacketClassifier` 分类为
+  `Mesh{..}` 或 `Proxy` 时，进入 smoltcp 终结
+  （`nexus_projection::tcp::TcpTerminator::handle_uplink(packet, peer)`），
+  不再走 D2/W1 的 raw-datagram 路径。`peer` 参数：Mesh 取分类 `path` 的
+  socket addr 字符串（`None` 时用目的 IP 字符串）；Proxy 用 `"proxy"`。
+- **S2（TUN 回写）**：`handle_uplink` 返回的 TUN 包（SYN-ACK/ACK/重传）全部
+  写回 TUN；`tun_written += n`；单包写失败 → `dropped += 1`
+  （不 panic，不中断后续包）。
+- **S3（事件轮询）**：`process_one()` 处理完 TCP 包后调用
+  `terminator.poll()` 收获 `TcpEvent`，按 S4–S7 分发。非 TCP 包不触发
+  poll（零回归）。
+- **S4（Syn 事件）**：`TcpEvent::Syn{stream_id, dst, peer}`：
+  - dataplane 记录 `stream_id → (orig_dst: SocketAddrV4, proxy: bool)`；
+  - Mesh：`encode_stream_frame(stream_id, STREAM_SYN,
+    &encode_syn_payload(dst_ip_str, dst_port))` 经
+    `N1Sender::send_to_mesh(orig_dst_ip, frame)` 发送；成功 →
+    `mesh_tcp_frames += 1`，失败 → `mesh_dropped_no_n1 += 1`（W1 语义复用）；
+  - Proxy：`proxy_tcp_streams += 1`（proxy 传输接线 = GAP-1，本契约只计数）；
+  - 两类都计 `tcp_handshakes += 1`。
+- **S5（Data 事件）**：`TcpEvent::Data{stream_id, peer, bytes}`：
+  - Mesh：STREAM DATA 帧经 N1 发送；成功 →
+    `mesh_tcp_frames += 1; mesh_tcp_bytes += bytes.len()`，失败 →
+    `mesh_dropped_no_n1 += 1`；
+  - Proxy：`proxy_tcp_bytes += bytes.len()`。
+- **S6（Closed 事件）**：`TcpEvent::Closed{stream_id, peer, reset}`：
+  - Mesh：STREAM FIN（`reset=false`）或 RST（`reset=true`）帧经 N1 发送；
+    失败 → `mesh_dropped_no_n1 += 1`；
+  - Proxy：删除流记录，无额外计数（S4 已计）；
+  - 两类都删除 `stream_id` 记录（防泄漏）。
+- **S7（TunPacket 事件）**：写回 TUN（同 S2 计数规则）。
+- **S8（非 TCP 零回归）**：UDP/ICMP/非 IPv4 → 现有 D2/D3/W1 路径；
+  `Direct`/`Drop` 分类的 TCP → 现有计数路径，永不进终结器。
+- **S9（下行 STREAM 帧）**：新增
+  `Dataplane::inject_stream_frame_from_n1(peer: &str, frame: &[u8])`：
+  `decode_stream_frame` →
+  `terminator.handle_originator_frame(stream_id, flags, payload)` →
+  产生的 TUN 包写回 TUN（S2 规则）。`inject_from_n1` 的 raw 语义不变。
+- **S10（可观测）**：`DataplaneStats` 新增 `tcp_handshakes`、
+  `mesh_tcp_frames`、`mesh_tcp_bytes`、`proxy_tcp_streams`、
+  `proxy_tcp_bytes: u64`；新增
+  `Dataplane::tcp_term_stats() -> TcpTermStats`。LocalAPI stats 自动包含新字段。
+- **S11（性能基线）**：实测并记录（无硬门限，供回归对比）：
+  (1) `TcpTerminator` 单流吞吐（Mbps）；
+  (2) dataplane TCP 包处理速率（pps）。
+  记录于 `.evidence/`。
+- 不变量：Direct 分类永不进终结器（S8）；终结器内部按 nexus-projection
+  S21–S23 语义（表满/半开超时）处理，dataplane 不新增丢弃路径；
+  跨平台同一套代码（TUN 经 `Box<dyn TunDevice>`，VirtualPacketInterface
+  抽象）；UDP 分片/重组后置。
+- 诚实边界：Proxy 方向只计数到 `proxy_tcp_*`（传输接线 = GAP-1）；
+  Mesh 方向 STREAM 帧经 N1 datagram 承载（egress 侧 `TcpRelay` 接线不在本契约）。
+
 ### 常规要求
 
 - 默认最小 surface：`private -> pub(crate) -> pub`。
