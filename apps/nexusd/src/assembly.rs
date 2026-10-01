@@ -76,7 +76,8 @@ pub fn mesh_bypass_overlap(mesh: &[String], bypass: &[String]) -> Vec<String> {
 /// - 解析 `network.toml` → 构造 `N1SessionManager`（复用 `nexus::network`
 ///   的装配器，不复制 dial/discovery 逻辑）；
 /// - 由 `vpi.routes` 构造 `N1MeshBridge`；
-/// - 各 peer `dial()` 尽力而为：单 peer 失败记 warn，不中断（降级语义）。
+/// - 各 peer `dial()` 在后台线程尽力而为（不阻塞 daemon 启动；单 peer
+///   失败记 warn，不中断，降级语义）。
 ///
 /// # Errors
 /// - 配置解析失败；
@@ -85,20 +86,34 @@ pub fn mesh_bypass_overlap(mesh: &[String], bypass: &[String]) -> Vec<String> {
 /// 调用方按 §13.3 降级：不调 `set_n1_sender`，dataplane 照常跑。
 pub fn assemble_n1(network_toml: &str) -> Result<Arc<N1MeshBridge>, String> {
     let (config, mgr) = nexus::network::build_session_manager(network_toml)?;
-    for peer in &config.peers {
-        if let Err(e) = mgr.dial(&peer.id) {
-            eprintln!(
-                "[nexusd] WARN: N1 dial peer {} failed: {e:?} (degraded, continuing)",
-                &peer.id.to_hex()[..8.min(peer.id.to_hex().len())]
-            );
-        }
-    }
-    let bridge = N1MeshBridge::new(mgr, config.vpi.routes.clone());
+    // Arc 共享：bridge 持有 mgr 做路由，dial 线程持有 mgr 做尽力拨号。
+    // dial 线程有界（N peers × 10s 握手超时），随进程退出而终止，无需显式回收。
+    let mgr = Arc::new(mgr);
+    let bridge = Arc::new(N1MeshBridge::new(
+        Arc::clone(&mgr),
+        config.vpi.routes.clone(),
+    ));
     eprintln!(
         "[nexusd] N1 bridge assembled: {} routes",
         bridge.route_count()
     );
-    Ok(Arc::new(bridge))
+    // 后台 dial：不阻塞启动；失败记 warn（降级）。
+    let peers: Vec<_> = config.peers.iter().map(|p| p.id).collect();
+    std::thread::Builder::new()
+        .name("nexusd-n1-dial".to_string())
+        .spawn(move || {
+            for peer_id in peers {
+                if let Err(e) = mgr.dial(&peer_id) {
+                    let hex = peer_id.to_hex();
+                    eprintln!(
+                        "[nexusd] WARN: N1 dial peer {} failed: {e:?} (degraded, continuing)",
+                        &hex[..8.min(hex.len())]
+                    );
+                }
+            }
+        })
+        .map_err(|e| format!("spawn n1 dial thread: {e}"))?;
+    Ok(bridge)
 }
 
 /// 从 `LoadedConfig` 组装 `DataplaneConfig`（R2/R3；原 main.rs 逻辑下沉）。
@@ -186,6 +201,32 @@ pub fn build_dataplane_config(loaded: &LoadedConfig) -> Result<DataplaneConfig, 
     })
 }
 
+/// 带超时的 join（R4 关闭顺序用；§13.4）。
+///
+/// 超时后记 warn 并继续（不杀线程，进程退出时回收）。
+/// 返回 `true` 表示线程在超时内结束，`false` 表示超时。
+pub fn join_with_timeout(
+    handle: std::thread::JoinHandle<()>,
+    timeout: std::time::Duration,
+    name: &str,
+) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = handle.join();
+        let _ = tx.send(());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(_) => {
+            eprintln!("[nexusd] shutdown: {name} stopped");
+            true
+        }
+        Err(_) => {
+            eprintln!("[nexusd] WARN: shutdown: {name} did not stop in {timeout:?}, continuing");
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +285,78 @@ mod tests {
     fn assemble_n1_bad_config_is_err() {
         // R1 降级路径：非法配置 → Err（调用方降级，不调 set_n1_sender）。
         assert!(assemble_n1("[[[unclosed").is_err());
+    }
+
+    fn loaded_with(network_toml: Option<&str>, qos: bool) -> LoadedConfig {
+        LoadedConfig {
+            daemon: crate::config::DaemonConfig {
+                qos: crate::config::QosSection {
+                    enabled: qos,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            network_toml: network_toml.map(|s| s.to_string()),
+            dns_toml: None,
+            proxy_yaml: None,
+            meta: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn dataplane_config_no_network_toml() {
+        // network.toml 缺失 → mesh_cidrs 空（降级），不 Err。
+        let cfg = build_dataplane_config(&loaded_with(None, false)).unwrap();
+        assert!(cfg.mesh_cidrs.is_empty());
+    }
+
+    #[test]
+    fn dataplane_config_bad_network_toml_degrades() {
+        // network.toml 非法 → mesh_cidrs 空（降级），不 Err。
+        let cfg = build_dataplane_config(&loaded_with(Some("[[[unclosed"), false)).unwrap();
+        assert!(cfg.mesh_cidrs.is_empty());
+    }
+
+    #[test]
+    fn dataplane_config_qos_mapping() {
+        // QoS 开启 → quantum/ports 透传。
+        let mut loaded = loaded_with(None, true);
+        loaded.daemon.qos.quantum = 9000;
+        loaded.daemon.qos.high_priority_ports = vec![443];
+        let cfg = build_dataplane_config(&loaded).unwrap();
+        assert!(cfg.qos_enabled);
+        assert_eq!(cfg.qos_config.quantum, 9000);
+        assert_eq!(cfg.qos_config.high_priority_ports, vec![443]);
+        // QoS 关闭 → 默认值。
+        let cfg = build_dataplane_config(&loaded_with(None, false)).unwrap();
+        assert!(!cfg.qos_enabled);
+        assert_eq!(
+            cfg.qos_config.quantum,
+            nexus_connectivity::cake::CakeConfig::default().quantum
+        );
+    }
+
+    #[test]
+    fn join_with_timeout_fast_thread() {
+        // 快速结束的线程 → true。
+        let h = std::thread::spawn(|| {});
+        assert!(join_with_timeout(
+            h,
+            std::time::Duration::from_secs(5),
+            "test"
+        ));
+    }
+
+    #[test]
+    fn join_with_timeout_slow_thread() {
+        // 睡眠线程 → 超时返回 false（不阻塞）。
+        let h = std::thread::spawn(|| std::thread::sleep(std::time::Duration::from_secs(30)));
+        let start = std::time::Instant::now();
+        assert!(!join_with_timeout(
+            h,
+            std::time::Duration::from_millis(100),
+            "test"
+        ));
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 }

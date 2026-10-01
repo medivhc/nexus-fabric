@@ -607,4 +607,35 @@ mod tests {
         assert_eq!(classify_change(&new, &same), ChangeKind::Hot);
         let _ = std::fs::remove_dir_all(&d);
     }
+
+    #[test]
+    fn dns_toml_empty_uses_defaults() {
+        let cfg = parse_dns_toml("").unwrap();
+        assert_eq!(cfg.mesh_suffix.as_str(), "mesh");
+        assert!(cfg.upstream.is_empty());
+        assert!(cfg.hosts.is_empty());
+    }
+
+    #[test]
+    fn dns_toml_section_and_root_level() {
+        // [dns] 节。
+        let cfg = parse_dns_toml("[dns]\nmesh_suffix = \"lan\"\n").unwrap();
+        assert_eq!(cfg.mesh_suffix.as_str(), "lan");
+        // 根级字段。
+        let cfg = parse_dns_toml("upstream = [\"9.9.9.9\"]\n").unwrap();
+        assert_eq!(cfg.upstream, vec!["9.9.9.9"]);
+    }
+
+    #[test]
+    fn dns_toml_hosts_parsed() {
+        let cfg = parse_dns_toml("[dns.hosts]\nprinter = \"192.168.1.50\"\n").unwrap();
+        assert_eq!(cfg.hosts.len(), 1);
+    }
+
+    #[test]
+    fn dns_toml_bad_rejected() {
+        assert!(parse_dns_toml("not toml [[[").is_err());
+        assert!(parse_dns_toml("[dns]\nfake_ip_range = \"999.1.1.0/24\"\n").is_err());
+        assert!(parse_dns_toml("[dns.hosts]\nbad = \"not-an-ip\"\n").is_err());
+    }
 }

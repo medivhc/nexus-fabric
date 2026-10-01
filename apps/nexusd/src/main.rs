@@ -194,7 +194,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
             Ok(bridge) => Some(bridge),
             Err(e) => {
                 eprintln!(
-                    "[nexusd] WARN: N1 assembly failed ({e}); degraded (mesh packets counted, not sent)"
+                    "[nexusd] ERROR: N1 assembly failed ({e}); degraded (mesh packets counted, not sent)"
                 );
                 None
             }
@@ -279,10 +279,10 @@ fn shutdown_sequence(
 ) {
     eprintln!("[nexusd] shutdown: stopping LocalAPI");
     // LocalAPI 线程已通过 shutdown 标志退出 accept 循环；join 确认。
-    join_with_timeout(localapi_handle, Duration::from_secs(2), "localapi");
+    assembly::join_with_timeout(localapi_handle, Duration::from_secs(2), "localapi");
 
     eprintln!("[nexusd] shutdown: stopping dataplane");
-    join_with_timeout(dataplane_handle, Duration::from_secs(1), "dataplane");
+    assembly::join_with_timeout(dataplane_handle, Duration::from_secs(1), "dataplane");
 
     if let Some(bridge) = n1_bridge {
         eprintln!("[nexusd] shutdown: stopping N1");
@@ -305,21 +305,6 @@ fn shutdown_sequence(
     eprintln!("[nexusd] shutdown: proxy engine not yet a separate runtime, skipping");
     // TUN 随 dataplane 线程退出而关闭（Dataplane drop）。
     eprintln!("[nexusd] shutdown: complete");
-}
-
-/// 带超时的 join；超时后记 warn 并继续（不杀线程，进程退出时回收）。
-fn join_with_timeout(handle: std::thread::JoinHandle<()>, timeout: Duration, name: &str) {
-    let (tx, rx) = channel();
-    std::thread::spawn(move || {
-        let _ = handle.join();
-        let _ = tx.send(());
-    });
-    match rx.recv_timeout(timeout) {
-        Ok(_) => eprintln!("[nexusd] shutdown: {name} stopped"),
-        Err(_) => {
-            eprintln!("[nexusd] WARN: shutdown: {name} did not stop in {timeout:?}, continuing")
-        }
-    }
 }
 
 /// R4：注册 Unix 信号处理（SIGTERM/SIGINT → 置位关闭标志）。
