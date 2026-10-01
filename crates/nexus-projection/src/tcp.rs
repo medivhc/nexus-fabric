@@ -320,6 +320,33 @@ pub fn rewrite_dst(packet: &[u8], new_dst: [u8; 4]) -> Option<Vec<u8>> {
     Some(p)
 }
 
+/// Rewrite the IPv4 source and fix IP + TCP checksums (GAP-5).
+///
+/// Used by `TcpTerminator::fixup_tun_packet` to restore the original
+/// destination as source for real-TUN outbound packets.
+pub fn rewrite_src(packet: &[u8], new_src: [u8; 4]) -> Option<Vec<u8>> {
+    let mut p = packet.to_vec();
+    if p.len() < 20 || p[0] >> 4 != 4 {
+        return None;
+    }
+    let ihl = ((p[0] & 0x0F) as usize) * 4;
+    p[12..16].copy_from_slice(&new_src);
+    p[10] = 0;
+    p[11] = 0;
+    let c = ip_checksum(&p[..ihl]);
+    p[10..12].copy_from_slice(&c.to_be_bytes());
+    if p[9] == 6 && p.len() >= ihl + 20 {
+        // TCP checksum covers the pseudo-header; zero it first.
+        p[ihl + 16] = 0;
+        p[ihl + 17] = 0;
+        let mut dst = [0u8; 4];
+        dst.copy_from_slice(&p[16..20]);
+        let tc = tcp_checksum(new_src, dst, &p[ihl..]);
+        p[ihl + 16..ihl + 18].copy_from_slice(&tc.to_be_bytes());
+    }
+    Some(p)
+}
+
 // ---------------------------------------------------------------------------
 // QueueDevice: smoltcp Device backed by in-memory queues.
 // ---------------------------------------------------------------------------
@@ -755,6 +782,31 @@ impl TcpTerminator {
 
     fn drain_tx(&mut self) -> Vec<Vec<u8>> {
         self.device.tx.drain(..).collect()
+    }
+
+    /// GAP-5: 重写出站 TUN 包的源 IP。
+    ///
+    /// smoltcp 发出的包源 IP 为 `SMOLTCP_IFACE_IP`（10.254.0.1）；真实 TUN
+    /// 场景下内核期望看到原始目的 IP（如 10.200.0.5），否则丢弃。
+    /// 本方法按 (client_ip, client_port, server_port) 查找连接，
+    /// 将源 IP 改回 `orig_dst`，并修复 IP/TCP 校验和。
+    ///
+    /// 包不匹配已知连接 → 返回 `None`（调用方计数丢弃）。
+    pub fn fixup_tun_packet(&self, pkt: &[u8]) -> Option<Vec<u8>> {
+        let (src_ip, dst_ip, src_port, dst_port, _flags, _off) = parse_tcp(pkt)?;
+        if src_ip != SMOLTCP_IFACE_IP {
+            return None;
+        }
+        // 按客户端 (dst_ip, dst_port) + 服务端端口 (src_port) 查找。
+        let orig = self
+            .conns
+            .values()
+            .filter_map(|c| self.by_id.get(&c.stream_id).map(|k| (c, k)))
+            .find(|(_, k)| {
+                k.src_ip == dst_ip && k.src_port == dst_port && k.dst_port == src_port
+            })
+            .map(|(_, k)| k.dst_ip)?;
+        rewrite_src(pkt, orig)
     }
 
     /// Drive timers / retransmissions; harvest socket events.

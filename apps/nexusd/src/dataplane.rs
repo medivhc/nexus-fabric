@@ -333,13 +333,24 @@ impl Dataplane {
     }
 
     /// S2/S7：TUN 包批量写回；写失败计数 `dropped`（不 panic）。
+    ///
+    /// GAP-5：TCP 终结器产出的包先经 `fixup_tun_packet` 将源 IP 从
+    /// `SMOLTCP_IFACE_IP` 改回原始目的（真实 TUN 需要；MockTun 同样受益）。
+    /// 无法匹配连接的包 → 计数 `dropped`，不写 TUN。
     fn write_tun_packets(&mut self, pkts: Vec<Vec<u8>>) {
         let mut written = 0u64;
         for pkt in &pkts {
-            if self.tun.write(pkt).is_err() {
-                self.with_stats(|s| s.dropped += 1);
-            } else {
-                written += 1;
+            match self.tcp.fixup_tun_packet(pkt) {
+                Some(fixed) => {
+                    if self.tun.write(&fixed).is_err() {
+                        self.with_stats(|s| s.dropped += 1);
+                    } else {
+                        written += 1;
+                    }
+                }
+                None => {
+                    self.with_stats(|s| s.dropped += 1);
+                }
             }
         }
         if written > 0 {
