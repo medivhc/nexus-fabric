@@ -368,33 +368,16 @@ impl VpiPump {
             };
             if pkt.len() > DATAGRAM_CAP {
                 // 超限：调用方计数后丢弃（N1Connection::send_datagram 契约）。
-                // TEMP-DIAG: 记录超限包长度；E4 通过后删除。
-                eprintln!("[diag-pump-drop] reason=oversize len={}", pkt.len());
                 self.stats.uplink_dropped.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             match conn.send_datagram(pkt) {
                 Ok(()) => {
                     self.stats.uplink_forwarded.fetch_add(1, Ordering::Relaxed);
-                    // TEMP-DIAG: N1 E4 丢包调查；通过后删除。
-                    if let Some((src, seq, ack, flags, win, len)) = tcp_diag(pkt) {
-                        let n = self.stats.uplink_forwarded.load(Ordering::Relaxed);
-                        // 只记录前 1800 个和之后每 100 个（控制日志量）
-                        if n <= 1800 || n % 100 == 0 {
-                            eprintln!(
-                                "[tcp-up] n={n} src={src} seq={seq} ack={ack} flags={flags:#04x} win={win} len={len}"
-                            );
-                        }
-                    }
                 }
-                Err(e) => {
+                Err(_) => {
                     // 注意：fabric 吞掉了 UDP send_to 错误，此处 Err 仅为
                     // 通道级错误；Link 观测走心跳，不在此触发（D3）。
-                    // TEMP-DIAG: 记录发送失败原因；E4 通过后删除。
-                    eprintln!(
-                        "[diag-pump-drop] reason=send_err len={} err={e:?}",
-                        pkt.len()
-                    );
                     self.stats.uplink_dropped.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -462,26 +445,6 @@ impl VpiPump {
                             this.stats
                                 .downlink_delivered
                                 .fetch_add(1, Ordering::Relaxed);
-                            // TEMP-DIAG: N1 E4 丢包调查；通过后删除。
-                            if let Some((src, seq, ack, flags, win, len)) = tcp_diag(&pkt) {
-                                let n = this.stats.downlink_delivered.load(Ordering::Relaxed);
-                                if n <= 1800 || n % 100 == 0 {
-                                    eprintln!(
-                                        "[tcp-dn] n={n} src={src} seq={seq} ack={ack} flags={flags:#04x} win={win} len={len}"
-                                    );
-                                }
-                                // 每 500 个同步一次内核 TUN RX 计数
-                                if n % 500 == 0 {
-                                    if let Ok(dev) = std::fs::read_to_string("/proc/self/net/dev") {
-                                        for line in dev.lines() {
-                                            if line.contains("nxtun") {
-                                                let trimmed = line.trim();
-                                                eprintln!("[tun-rx] n={n} {trimmed}");
-                                            }
-                                        }
-                                    }
-                                }
-                            }
                         }
                         Err(_) => {
                             this.stats.downlink_vpi_err.fetch_add(1, Ordering::Relaxed);
@@ -543,28 +506,6 @@ fn ipv4_dst(pkt: &[u8]) -> Option<Ipv4Addr> {
         return None;
     }
     Some(Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]))
-}
-
-// TEMP-DIAG: N1 E4 丢包调查；通过后删除。
-/// 解析 TCP 头（src/seq/ack/flags/win/len），非 TCP 返回 None。
-fn tcp_diag(pkt: &[u8]) -> Option<(Ipv4Addr, u32, u32, u8, u16, usize)> {
-    if pkt.len() < 20 || pkt[0] >> 4 != 4 {
-        return None;
-    }
-    if pkt[9] != 6 {
-        return None; // 非 TCP
-    }
-    let ihl = usize::from(pkt[0] & 0x0f) * 4;
-    if pkt.len() < ihl + 20 {
-        return None;
-    }
-    let src = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
-    let t = &pkt[ihl..];
-    let seq = u32::from_be_bytes([t[4], t[5], t[6], t[7]]);
-    let ack = u32::from_be_bytes([t[8], t[9], t[10], t[11]]);
-    let flags = t[13];
-    let win = u16::from_be_bytes([t[14], t[15]]);
-    Some((src, seq, ack, flags, win, pkt.len()))
 }
 
 #[cfg(test)]

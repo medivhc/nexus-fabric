@@ -144,13 +144,6 @@ impl DatagramState {
         let was_empty = self.incoming.is_empty();
         while self.incoming.memory_used() + size_with_overhead > window {
             debug!("dropping stale datagram");
-            // TEMP-DIAG: N1 E4 丢包调查；通过后删除。
-            eprintln!(
-                "[quinn-diag-drop] stale incoming drop: mem_used={} size={} window={}",
-                self.incoming.memory_used(),
-                size_with_overhead,
-                window
-            );
             self.recv();
         }
 
@@ -164,13 +157,6 @@ impl DatagramState {
                 break;
             };
             trace!(len = prev.data.len(), "dropping outgoing datagram");
-            // TEMP-DIAG: N1 E4 丢包调查；通过后删除。
-            eprintln!(
-                "[quinn-diag-drop] evict outgoing: len={} mem_used={} buf={}",
-                prev.data.len(),
-                self.outgoing.memory_used(),
-                send_buffer_size
-            );
         }
     }
 

@@ -436,9 +436,6 @@ struct LiveConn {
     dgram_tx_q: VecDeque<Vec<u8>>,
     bytes_sent: u64,
     bytes_recv: u64,
-    // TEMP-DIAG: N1 E4 丢包调查；通过后删除。
-    diag_ticks: u64,
-    diag_last_dst: Option<std::net::SocketAddr>,
 }
 
 struct Loop {
@@ -576,8 +573,6 @@ impl Loop {
                 streams: HashMap::new(),
                 dgram_tx_q: VecDeque::new(),
                 bytes_sent: 0,
-                diag_ticks: 0,
-                diag_last_dst: None,
                 bytes_recv: 0,
             },
         );
@@ -734,8 +729,6 @@ impl Loop {
                         dgram_tx_q: VecDeque::new(),
                         bytes_sent: 0,
                         bytes_recv: 0,
-                        diag_ticks: 0,
-                        diag_last_dst: None,
                     },
                 );
                 self.shared.conns.lock().unwrap().insert(id, shared);
@@ -807,15 +800,7 @@ impl Loop {
                         break;
                     }
                     // Best-effort drop (S5).
-                    // TEMP-DIAG: 记录静默丢弃的原因/长度/max_size；E4 通过后删除。
-                    Err(e) => {
-                        eprintln!(
-                            "[diag-drop] len={} max_size={:?} err={:?}",
-                            len,
-                            lc.quic.datagrams().max_size(),
-                            e
-                        );
-                    }
+                    Err(_) => {}
                 }
             }
             let shared = lc.shared.clone();
@@ -831,34 +816,7 @@ impl Loop {
         }
         // Transmit.
         if let Some(lc) = self.live.get_mut(&id) {
-            // TEMP-DIAG: N1 E4 丢包调查；通过后删除。
-            lc.diag_ticks += 1;
-            if lc.diag_ticks % 500 == 0 {
-                let s = lc.quic.stats();
-                let (validated, total_sent, total_recvd) = lc.quic.diag_path_state();
-                let mtu = lc.quic.diag_current_mtu();
-                eprintln!(
-                    "[quinn-stats] ftx_dgram={} frx_dgram={} udp_tx={} udp_rx={} txq={} cwnd={} lost_pkts={} validated={} sent/recvd={}/{} mtu={} dst={:?}",
-                    s.frame_tx.datagram,
-                    s.frame_rx.datagram,
-                    s.udp_tx.datagrams,
-                    s.udp_rx.datagrams,
-                    lc.dgram_tx_q.len(),
-                    s.path.cwnd,
-                    s.path.lost_packets,
-                    validated,
-                    total_sent,
-                    total_recvd,
-                    mtu,
-                    lc.diag_last_dst,
-                );
-            }
             while let Some(t) = lc.quic.poll_transmit(now, 1, &mut self.out) {
-                // TEMP-DIAG: N1 E4 丢包调查；通过后删除。
-                if Some(t.destination) != lc.diag_last_dst {
-                    eprintln!("[quinn-dst] changed to {:?}", t.destination);
-                    lc.diag_last_dst = Some(t.destination);
-                }
                 let pkt = self.out[..t.size].to_vec();
                 let _ = self.socket.send_to(&pkt, t.destination);
                 self.out.clear();
