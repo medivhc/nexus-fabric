@@ -212,6 +212,24 @@ accept 线程，sync，零 tokio）把 SOCKS5/HTTP 显式代理映射为 fabric 
 - E4 必须走生产 `pump()` 路径（教训：`2026-09-30-e4-must-use-production-path`），
   禁止手动调 `rebind()` 冒充联动。
 
+**S28（Boost v1 胶水，2026-10-01 冻结）**：`boost.rs` 是 boost 配置到
+`nexus-path` 的组合胶水（依赖倒置：`nexus-network` 只产出纯数据
+`BoostPathParams`，本模块完成到 `PathConfig` 的映射与选路/建连策略）：
+- `path_config_for_boost(hysteresis_pct, switch_hold_ms) -> PathConfig`：
+  用给定参数构造 `PathConfig`（其余字段取 `Default`）。纯函数。
+- `select_best(manager: &PathManager, candidates: &[CandidatePath], degrade_threshold: f64) -> Option<BoostSelection>`：
+  EWMA 驱动选路（文档 §12.5）。**只读**：`&PathManager`，不修改任何状态
+  （single writer 仍在 `nexus-path`，S7 不变）。选 `score()` 最高者；
+  全 unknown（`None`）→ 返回 `None`。`BoostSelection { best, score, degraded }`，
+  其中 `degraded = score < degrade_threshold`（阈值由调用方定，分数非归一化，
+  见 nexus-path 打分公式注释）。
+- `boost_connect(chain, connector, budget, race_on_connect) -> io::Result<RaceOutcome>`：
+  `race_on_connect = true` → 调 `connect_with_fallback`（staggered 竞速，R1）；
+  `= false` → 按候选顺序依次直连（首个成功即返回，无 staggering）。
+  实际 dial 由注入的 `PathConnector` 完成（F2 语义不变）。
+- 不变量：`select_best` 不触发切换（只读不决策，切换仍走 `PathManager` +
+  S4/R3 hysteresis + S9 事件）；`boost_connect` 不改变 `RaceOutcome` 语义（R4）。
+
 ## Side Effects
 
 - TUN 设备读写（`TunDevice::read` / `write`）。

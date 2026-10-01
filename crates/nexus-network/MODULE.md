@@ -233,3 +233,75 @@ N1 装配新增：
   Red Evidence（旧实现上 BLOCKED）→ contract hash 冻结。
 - 实现阶段：E4 `product.n1-connectivity-roam` 在 xc-pc-linux 真机（netns 双节点）PASS；
   独立 8 维 Review；full verify。
+
+## Boost v1（B1–B4，2026-10-01 冻结）
+
+> 范围：`network.toml [boost]` 配置解析 + 参数映射。不含 QoS 数据面（§11 独立开关）、
+> 不含多路径调度器（§12.6 独立开关）。不修改 M1–M7 已冻结条款。
+
+**B1（`[boost]` 配置解析）**：`N1Config::parse_toml` 接受可选 `[boost]` 小节。
+字段全可选，有默认值：
+
+| 字段 | 类型 | 默认 | 校验 |
+|------|------|------|------|
+| `enabled` | bool | `false` | — |
+| `hysteresis_pct` | float | `0.10` | 必须在 `(0, 1]`，否则 `InvalidConfig` |
+| `switch_hold_ms` | int | `1000` | 必须 `> 0`，否则 `InvalidConfig` |
+| `race_on_connect` | bool | `true` | — |
+
+- 无 `[boost]` 小节 → `BoostConfig::default()`（`enabled = false`）。
+- `[boost]` 内未知键 → `InvalidConfig`（含行号，fail-fast，与既有 parser 一致）。
+- 非法值 → `InvalidConfig`（含行号与原因）。
+
+**B2（参数映射）**：`BoostConfig::path_params() -> BoostPathParams`：
+- `enabled = true` → `{ hysteresis_pct, switch_hold_ms }` 取配置值，`race_on_connect` 透传。
+- `enabled = false` → `{ hysteresis_pct: 0.20, switch_hold_ms: 3000 }`（与
+  `nexus-path` `PathConfig::default()` 一致，保证零回归）。
+- `BoostPathParams` 为纯数据 struct（`hysteresis_pct: f64`、`switch_hold_ms: u64`、
+  `race_on_connect: bool`），不依赖 `nexus-path` 类型（本 crate 无此依赖边，
+  见 Allowed Dependencies）。
+
+**B3（选路参数来源）**：组合根用 `BoostPathParams` 构造 `nexus-path` 的 `PathConfig`
+（`hysteresis_pct` / `switch_hold_ms` 字段）。`nexus-network` 不直接构造
+`PathConfig`（无依赖边），映射逻辑由消费方（`nexus-projection::boost`）完成。
+
+**B4（不变量）**：
+- `[boost]` 缺失或 `enabled = false` 时，选路行为与 boost 之前完全一致
+  （20% + 3s，`F6` 零回归语义的扩展）。
+- `hysteresis_pct` / `switch_hold_ms` 只影响 `PathManager` 的切换门限，
+  不改变打分公式（R2）、竞速语义（R1）、S1–S9。
+
+## Public API（Boost v1 新增）
+
+```rust
+/// network.toml [boost] 小节（可选）。
+#[derive(Debug, Clone)]
+pub struct BoostConfig {
+    pub enabled: bool,          // default false
+    pub hysteresis_pct: f64,    // default 0.10, must be in (0, 1]
+    pub switch_hold_ms: u64,    // default 1000, must be > 0
+    pub race_on_connect: bool,  // default true
+}
+
+/// 生效后的选路参数（纯数据，无 nexus-path 依赖）。
+#[derive(Debug, Clone, Copy)]
+pub struct BoostPathParams {
+    pub hysteresis_pct: f64,
+    pub switch_hold_ms: u64,
+    pub race_on_connect: bool,
+}
+
+impl BoostConfig {
+    /// 默认值（[boost] 缺失时）。
+    pub fn default() -> Self;
+    /// B2：映射为生效参数。enabled=false → 20%/3s 默认。
+    pub fn path_params(&self) -> BoostPathParams;
+}
+
+// N1Config 新增字段：
+pub struct N1Config {
+    // ... existing fields ...
+    /// Boost v1 配置（[boost] 缺失时为 default）。
+    pub boost: BoostConfig,
+}
+```
