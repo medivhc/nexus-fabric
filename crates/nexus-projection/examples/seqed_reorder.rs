@@ -64,9 +64,11 @@ fn run() -> Result<(String, bool), String> {
     });
 
     // Client: connect, send DATAGRAMS seqed datagrams, record assigned seqes.
-    let mut cfg = ConnConfig::default();
-    cfg.addrs = vec![server_addr];
-    cfg.handshake_timeout = Duration::from_secs(10);
+    let cfg = ConnConfig {
+        addrs: vec![server_addr],
+        handshake_timeout: Duration::from_secs(10),
+        ..ConnConfig::default()
+    };
     let conn = FabricConn::connect(server_peer, &cfg).map_err(|e| format!("connect: {e}"))?;
 
     let mut assigned = Vec::with_capacity(DATAGRAMS);
