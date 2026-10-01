@@ -230,6 +230,31 @@ accept 线程，sync，零 tokio）把 SOCKS5/HTTP 显式代理映射为 fabric 
 - 不变量：`select_best` 不触发切换（只读不决策，切换仍走 `PathManager` +
   S4/R3 hysteresis + S9 事件）；`boost_connect` 不改变 `RaceOutcome` 语义（R4）。
 
+**S29（多路径调度，2026-10-01 冻结）**：`multipath.rs` 是统一数据面的路径
+调度胶水（文档 §12.6，独立高级选项，不进 boost 开关）：
+- `MultipathStrategy`：`Single`（只用最优 egress，默认，零行为变化）/
+  `PerFlow`（按流哈希固定 egress，流内有序）/ `PerPacket`（按包加权轮询）。
+- `MultipathConfig { strategy, reorder_buffer }`：纯数据；`strategy` 默认
+  `Single`，`reorder_buffer` 默认 64（per-packet 接收端重排上限）。
+- `PathScheduler::select(egresses, flow_id, seq) -> EgressId`：
+  - `Single`：返回调用方排序首位的可用 egress（等价当前单路径行为）；
+  - `PerFlow`：`hash(flow_id) % n`，同一 `flow_id` 在 egress 集合不变时
+    永远选中同一 egress（确定性，流内有序）；
+  - `PerPacket`：加权轮询（权重来自 `EgressDescriptor.weight`，默认 1）。
+- `ReorderBuffer`（per-packet 接收端）：按 `seq` 缓冲乱序包，按序吐出；
+  容量上限 `reorder_buffer`，超限丢弃最小 seq 并计数 `reorder_dropped`；
+  内存有界（`O(reorder_buffer)`）。
+- 不变量：
+  - `Single` 模式与无调度器行为一致（零回归）；
+  - `PerFlow` 选择确定性：egress 集合与 `flow_id` 不变时结果不变；
+  - 纯内存、纯同步、零真实网络；TUN/QUIC 接入点预留（`EgressDescriptor`
+    含 `kind` 字段供未来映射到真实 egress）；
+  - 不修改 `nexus-path` 的 S1（单活跃路径是路径层的 per-peer 不变量；
+    本调度器工作在统一数据面 egress 选择层，是不同层级）。
+- Deletion Test：若删除调度器抽象，让调用方手写 `match strategy` 分发，
+  则三种策略的切换逻辑与重排缓冲泄漏到每个调用点；策略新增（如
+  `PerPacketWeighted`）将要求改动所有调用方。抽象成立。
+
 ## Side Effects
 
 - TUN 设备读写（`TunDevice::read` / `write`）。
