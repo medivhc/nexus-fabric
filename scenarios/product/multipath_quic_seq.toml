@@ -13,7 +13,7 @@ payload_datagram = "seqed datagrams with 8-byte BE header, sent in deliberate ou
 # 接收端用 recv_datagram_seqed 收包 -> 喂入 ReorderBuffer（回绕感知）->
 # 按序吐出并校验序号连续、载荷完整 -> 输出 JSON。
 [when]
-command = "cargo run --quiet -p nexus-fabric --example seqed_reorder -- --json"
+command = "cargo run --quiet -p nexus-projection --example seqed_reorder -- --json"
 
 # 冻结期望（Q1-Q6/P1-P5）。
 [[expect]]
