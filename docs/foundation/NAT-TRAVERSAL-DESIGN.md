@@ -131,13 +131,39 @@ A ◄──TURN relay──► B          ① 中继建连（现有 4b + fallbac
 
 ### 4.4 路径迁移（Migration）
 
-- 复用 QUIC 连接迁移：路径验证通过后，把连接的发送路径切到
-  直连地址。**CID 不变，连接不重建**，上层零感知。
-  driver 已有被动迁移支持（S3/S6，`cmd_rebind` 注释确认 peer 侧
-  经路径验证被动迁移）。
-- TURN 分配在迁移后**保留为 warm backup**（refresh 保活），
-  而不是立即释放——NAT 映射老化/地址变化导致直连断时可秒回中继。
-  是否释放由策略配置（默认保留，成本是 TURN 带宽占用为 0，仅保活）。
+> **2026-10-02 修正（合并阶段实测 quinn-proto 0.11.18 源码结论）**：
+> quinn-proto 的被动迁移只在 **server 侧**生效
+> （`connection/mod.rs:1134`：client 收到未知来源包直接丢弃，
+> `remote_may_migrate()` 对 Client 恒返回 false，`migrate()` 是私有方法）。
+> 而 NAT 打洞会同时改变**两端**的 UDP 地址（之前都走中继），
+> 因此"同一连接内迁移、CID 不变"的原方案**不可行**
+> ——client 侧的收包路径会断。
+>
+> **修正后方案**：打洞 = 在**同一 UDP socket** 上新建直连 QUIC 连接
+> （复用现有 `Driver::connect(peer, reflexive_addr)`，双向同时发起
+> 即 simultaneous punch），会话层按 §4.5 竞速结果选路，
+> 中继连接保留为 warm backup。CID 会变化，但选路发生在会话层，
+> 对上层透明。此方案零 quinn-proto 改动，且 spray 天然映射为
+> "对预测端口做 `race_connect` 建连竞速"（复用 `nexus-path`）。
+>
+> - 双向同时建连可能产生两条直连（A→B 与 B→A 都成功）：
+>   确定性 tie-break——保留 PeerId 较大者发起的那条，关闭另一条。
+> - 服务端接受未知地址的 Initial 是标准行为（本就是 server endpoint）；
+>   握手本身经 PeerId 绑定证书认证，spoof 无法完成握手；
+>   放大攻击由 quinn 的 anti-amplification/retry 兜底。
+> - TURN 分配在迁移后**保留为 warm backup**（refresh 保活），
+>   而不是立即释放——NAT 映射老化/地址变化导致直连断时可秒回中继。
+>   是否释放由策略配置（默认保留，成本是 TURN 带宽占用为 0，仅保活）。
+
+### 4.4.1 接线映射（composition root 实现）
+
+| 合同 trait | 接线实现 |
+|---|---|
+| `PunchChannel` | 中继 FabricConn 上开一条 bidirectional stream，走 P2 编解码收发 Offer/Answer |
+| `PunchSocket::send_punch` | 后台 `Driver::connect(peer, target)`（同一 socket） |
+| `PunchSocket::await_direct` | 等待首个握手成功，返回其地址；spray 时对多个预测端口扇出，first-wins |
+| `PunchSession → Migrated{addr}` | 把直连加入会话层，经 `PunchRaceFeed` 登记为 `DirectP2P` 候选 |
+| `select_path` | 按 §4.5 三类竞速决策切换/保留 |
 
 ### 4.5 成功后：切换 vs 多路径
 
