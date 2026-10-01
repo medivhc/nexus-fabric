@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use nexus_connectivity::cake::{CakeConfig, CakeScheduler, EnqueueDecision, FiveTuple};
 use nexus_dns::{DnsQuery, DnsType, DnsUnifiedConfig, UnifiedDns};
+use nexus_network::n1::bridge::N1Sender;
 use nexus_path::{CandidatePath, PathConfig, PathManager};
 use nexus_projection::TunDevice;
 use nexus_projection::classifier::{Classification, PacketClassifier};
@@ -67,6 +68,8 @@ pub struct Dataplane {
     bypass_cidrs: Vec<Cidr>,
     dns: Option<UnifiedDns>,
     qos: Option<CakeScheduler>,
+    /// N1 发送桥（W1/W3）；`None` 时 Mesh 包走 D2 计数路径。
+    n1_sender: Option<std::sync::Arc<dyn N1Sender>>,
     stats: Arc<Mutex<DataplaneStats>>,
     config: DataplaneConfig,
     buf: Vec<u8>,
@@ -135,11 +138,17 @@ impl Dataplane {
             bypass_cidrs,
             dns,
             qos,
+            n1_sender: None,
             stats: Arc::new(Mutex::new(DataplaneStats::default())),
             config,
             buf: vec![0u8; 65535],
             qos_start: std::time::Instant::now(),
         })
+    }
+
+    /// 注入 N1 发送器（W1/W3；由 Composition Root 在 N1 就绪后调用）。
+    pub fn set_n1_sender(&mut self, sender: std::sync::Arc<dyn N1Sender>) {
+        self.n1_sender = Some(sender);
     }
 
     /// 获取统计的共享句柄（供 LocalAPI 线程读取，B1）。
@@ -214,11 +223,20 @@ impl Dataplane {
             qos.reap(now);
         }
 
-        // D2：按分类计数转发（MVP：计数；实际 N1/proxy 发送后置）。
+        // D2/W1：按分类转发。
         match classification {
             Classification::Mesh { .. } => {
                 if self.config.n1_configured {
-                    self.with_stats(|s| s.mesh_forwarded += 1);
+                    // W1：N1 真发（发送器已注入时）；失败则计数 mesh_dropped_no_n1。
+                    let sent = match (&self.n1_sender, ipv4_dst_of(&packet)) {
+                        (Some(sender), Some(dst)) => sender.send_to_mesh(dst, &packet).is_ok(),
+                        _ => false,
+                    };
+                    if sent {
+                        self.with_stats(|s| s.mesh_forwarded += 1);
+                    } else {
+                        self.with_stats(|s| s.mesh_dropped_no_n1 += 1);
+                    }
                 } else {
                     self.with_stats(|s| s.mesh_dropped_no_n1 += 1);
                 }
@@ -294,6 +312,23 @@ impl Dataplane {
     pub fn qos_bypassed(&self) -> bool {
         self.qos.is_none()
     }
+
+    /// W2：将 N1 收到的包写回 TUN（下行路径；由 N1 接收线程调用）。
+    ///
+    /// 写失败 → 计数 `dropped`（不 panic）。
+    pub fn inject_from_n1(&mut self, packet: &[u8]) {
+        if self.tun.write(packet).is_ok() {
+            self.with_stats(|s| s.tun_written += 1);
+        } else {
+            self.with_stats(|s| s.dropped += 1);
+        }
+    }
+
+    /// N1 发送器是否已注入（W1 可观测）。
+    #[must_use]
+    pub fn n1_bridge_ready(&self) -> bool {
+        self.n1_sender.is_some()
+    }
 }
 
 /// 解析 CIDR 字符串（如 "10.0.0.0/8"）为 `Cidr`。
@@ -310,6 +345,16 @@ fn parse_cidr(s: &str) -> Result<Cidr, String> {
         .map_err(|_| format!("invalid CIDR prefix: {s}"))?;
     let bits = u32::from(ip);
     Cidr::new(bits, prefix).ok_or_else(|| format!("invalid CIDR {s}"))
+}
+
+/// 从 IPv4 包提取目的地址。
+fn ipv4_dst_of(packet: &[u8]) -> Option<Ipv4Addr> {
+    if packet.len() < 20 || packet[0] >> 4 != 4 {
+        return None;
+    }
+    Some(Ipv4Addr::new(
+        packet[16], packet[17], packet[18], packet[19],
+    ))
 }
 
 /// 判断是否为 DNS 查询（IPv4 + UDP + 目的端口 53）。

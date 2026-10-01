@@ -12,6 +12,7 @@
 //! 术语注意（M4）：这里的"会话/连接"是"Session 中实际建立的传输实例"
 //! （v9 §9），不是白皮书 Session（某次实际资源使用的上下文）的替代。
 
+pub mod bridge;
 pub mod config;
 pub mod link;
 pub mod pump;
