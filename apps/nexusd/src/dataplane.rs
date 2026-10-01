@@ -70,6 +70,8 @@ pub struct Dataplane {
     qos: Option<CakeScheduler>,
     /// N1 发送桥（W1/W3）；`None` 时 Mesh 包走 D2 计数路径。
     n1_sender: Option<std::sync::Arc<dyn N1Sender>>,
+    /// Proxy 转发引擎（P1-P5）；`None` 时 Proxy 包走 D2 计数路径。
+    proxy_engine: Option<crate::proxy_fwd::ProxyEngine>,
     stats: Arc<Mutex<DataplaneStats>>,
     config: DataplaneConfig,
     buf: Vec<u8>,
@@ -139,6 +141,7 @@ impl Dataplane {
             dns,
             qos,
             n1_sender: None,
+            proxy_engine: None,
             stats: Arc::new(Mutex::new(DataplaneStats::default())),
             config,
             buf: vec![0u8; 65535],
@@ -149,6 +152,17 @@ impl Dataplane {
     /// 注入 N1 发送器（W1/W3；由 Composition Root 在 N1 就绪后调用）。
     pub fn set_n1_sender(&mut self, sender: std::sync::Arc<dyn N1Sender>) {
         self.n1_sender = Some(sender);
+    }
+
+    /// 注入 Proxy 转发引擎（P1-P5；由 Composition Root 在 proxy.yaml 解析后调用）。
+    pub fn set_proxy_engine(&mut self, engine: crate::proxy_fwd::ProxyEngine) {
+        self.proxy_engine = Some(engine);
+    }
+
+    /// Proxy 引擎是否已注入（P1 可观测）。
+    #[must_use]
+    pub fn proxy_engine_ready(&self) -> bool {
+        self.proxy_engine.is_some()
     }
 
     /// 获取统计的共享句柄（供 LocalAPI 线程读取，B1）。
@@ -242,10 +256,42 @@ impl Dataplane {
                 }
             }
             Classification::Proxy => {
-                if self.config.proxy_configured {
-                    self.with_stats(|s| s.proxy_forwarded += 1);
-                } else {
-                    self.with_stats(|s| s.proxy_dropped_no_proxy += 1);
+                // P1-P5：engine 已注入 → 真实转发；否则走 D2 计数路径。
+                // 先取出 engine 处理结果（避免 borrow 冲突）。
+                let engine_outcome: Option<(Vec<Vec<u8>>, bool)> =
+                    self.proxy_engine.as_mut().map(|e| e.handle_packet(&packet));
+                match engine_outcome {
+                    Some((tun_pkts, forwarded)) => {
+                        for pkt in tun_pkts {
+                            if self.tun.write(&pkt).is_ok() {
+                                self.with_stats(|s| s.tun_written += 1);
+                            } else {
+                                self.with_stats(|s| s.dropped += 1);
+                            }
+                        }
+                        // 驱动 engine（回包/重传/事件）。
+                        let more: Vec<Vec<u8>> =
+                            self.proxy_engine.as_mut().map(|e| e.poll()).unwrap_or_default();
+                        for pkt in more {
+                            if self.tun.write(&pkt).is_ok() {
+                                self.with_stats(|s| s.tun_written += 1);
+                            } else {
+                                self.with_stats(|s| s.dropped += 1);
+                            }
+                        }
+                        if forwarded {
+                            self.with_stats(|s| s.proxy_forwarded += 1);
+                        } else {
+                            self.with_stats(|s| s.proxy_dropped_no_proxy += 1);
+                        }
+                    }
+                    None if self.config.proxy_configured => {
+                        // 兼容：已配置但 engine 未注入（旧计数行为）。
+                        self.with_stats(|s| s.proxy_forwarded += 1);
+                    }
+                    None => {
+                        self.with_stats(|s| s.proxy_dropped_no_proxy += 1);
+                    }
                 }
             }
             Classification::Direct => {

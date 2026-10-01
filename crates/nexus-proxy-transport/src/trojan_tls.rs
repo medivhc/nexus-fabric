@@ -146,7 +146,8 @@ fn build_client_config(config: &TrojanTlsConfig) -> Result<rustls::ClientConfig,
 }
 
 /// TLS stream type: owns both the rustls connection and the TCP socket.
-type TlsStream = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
+/// Public for ProxyEngine relay (P1): the relay pumps bytes through it.
+pub type TlsStream = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
 
 /// Perform the TLS handshake then the trojan handshake inside it.
 /// Returns the established TLS stream.

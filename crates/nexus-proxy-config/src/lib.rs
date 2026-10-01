@@ -317,6 +317,8 @@ pub enum OutboundKind {
     Vmess,
     /// Trojan TLS 出站（§11.9；nexus-outbound-trojan）。
     Trojan,
+    /// SOCKS5 出站（RFC 1928；P3 新增，用于 ProxyEngine TCP/UDP 转发）。
+    Socks5,
 }
 
 impl OutboundKind {
@@ -329,6 +331,7 @@ impl OutboundKind {
             Self::Shadowsocks => "shadowsocks",
             Self::Vmess => "vmess",
             Self::Trojan => "trojan",
+            Self::Socks5 => "socks5",
         }
     }
 
@@ -339,10 +342,11 @@ impl OutboundKind {
             "shadowsocks" => Ok(Self::Shadowsocks),
             "vmess" => Ok(Self::Vmess),
             "trojan" => Ok(Self::Trojan),
+            "socks5" => Ok(Self::Socks5),
             other => Err(ConfigError::new(
                 "kind",
                 format!(
-                    "unknown outbound kind '{other}' (supports direct/relay/shadowsocks/vmess/trojan)"
+                    "unknown outbound kind '{other}' (supports direct/relay/shadowsocks/vmess/trojan/socks5)"
                 ),
             )),
         }

@@ -31,7 +31,7 @@ pub use nexus_outbound_shadowsocks::SsMethod; // T3: reuse, don't redefine
 pub use shadowsocks::{SsProxyConfig, SsTransport};
 pub use socks5::socks5_connect;
 pub use trojan::{trojan_connect, TrojanProxyConfig, TrojanTransport};
-pub use trojan_tls::{trojan_tls_connect, TlsTrojanTransport, TrojanTlsConfig};
+pub use trojan_tls::{trojan_tls_connect, TlsStream, TlsTrojanTransport, TrojanTlsConfig};
 
 use std::io;
 use std::net::SocketAddr;

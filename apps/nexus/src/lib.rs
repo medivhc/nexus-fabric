@@ -4842,6 +4842,12 @@ pub fn proxy_serve_once(
                 reason: "vmess outbound data-plane not in this batch: nexus-outbound-vmess currently provides only self-consistent AEAD encrypt/decrypt roundtrip; missing VMess request-header encoder, AEAD chunk wire framing, and session-key derivation required for a real node tunnel (deferred)".into(),
             });
         }
+        nexus_proxy_config::OutboundKind::Socks5 => {
+            return Err(NexusError::ConnectivityEstablishmentFailed {
+                provider: ProviderId(decision.selected_outbound_tag.clone()),
+                reason: "socks5 outbound data-plane tunnel via nexus app deferred; use nexusd ProxyEngine (P1-P5)".into(),
+            });
+        }
     };
 
     // 6) Session 终态。
