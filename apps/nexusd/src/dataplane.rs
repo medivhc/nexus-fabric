@@ -70,6 +70,12 @@ pub struct Dataplane {
     qos: Option<CakeScheduler>,
     /// N1 发送桥（W1/W3）；`None` 时 Mesh 包走 D2 计数路径。
     n1_sender: Option<std::sync::Arc<dyn N1Sender>>,
+    /// Proxy 转发引擎（P1-P5）；`None` 时 Proxy 包走 D2 计数路径。
+    proxy_engine: Option<crate::proxy_fwd::ProxyEngine>,
+    /// 上次同步的 TCP dial 成功计数（P1：proxy_forwarded 由 dial 结果增量驱动）。
+    last_tcp_dials_ok: u64,
+    /// 上次同步的 TCP dial 失败计数。
+    last_tcp_dials_failed: u64,
     stats: Arc<Mutex<DataplaneStats>>,
     config: DataplaneConfig,
     buf: Vec<u8>,
@@ -139,6 +145,9 @@ impl Dataplane {
             dns,
             qos,
             n1_sender: None,
+            proxy_engine: None,
+            last_tcp_dials_ok: 0,
+            last_tcp_dials_failed: 0,
             stats: Arc::new(Mutex::new(DataplaneStats::default())),
             config,
             buf: vec![0u8; 65535],
@@ -149,6 +158,17 @@ impl Dataplane {
     /// 注入 N1 发送器（W1/W3；由 Composition Root 在 N1 就绪后调用）。
     pub fn set_n1_sender(&mut self, sender: std::sync::Arc<dyn N1Sender>) {
         self.n1_sender = Some(sender);
+    }
+
+    /// 注入 Proxy 转发引擎（P1-P5；由 Composition Root 在 proxy.yaml 解析后调用）。
+    pub fn set_proxy_engine(&mut self, engine: crate::proxy_fwd::ProxyEngine) {
+        self.proxy_engine = Some(engine);
+    }
+
+    /// Proxy 引擎是否已注入（P1 可观测）。
+    #[must_use]
+    pub fn proxy_engine_ready(&self) -> bool {
+        self.proxy_engine.is_some()
     }
 
     /// 获取统计的共享句柄（供 LocalAPI 线程读取，B1）。
@@ -242,10 +262,67 @@ impl Dataplane {
                 }
             }
             Classification::Proxy => {
-                if self.config.proxy_configured {
-                    self.with_stats(|s| s.proxy_forwarded += 1);
-                } else {
-                    self.with_stats(|s| s.proxy_dropped_no_proxy += 1);
+                // P1-P5：engine 已注入 → 真实转发；否则走 D2 计数路径。
+                // 先取出 engine 处理结果（避免 borrow 冲突）。
+                let engine_outcome: Option<(Vec<Vec<u8>>, bool)> =
+                    self.proxy_engine.as_mut().map(|e| e.handle_packet(&packet));
+                match engine_outcome {
+                    Some((tun_pkts, forwarded)) => {
+                        for pkt in tun_pkts {
+                            if self.tun.write(&pkt).is_ok() {
+                                self.with_stats(|s| s.tun_written += 1);
+                            } else {
+                                self.with_stats(|s| s.dropped += 1);
+                            }
+                        }
+                        // 驱动 engine（回包/重传/事件）。
+                        let more: Vec<Vec<u8>> =
+                            self.proxy_engine.as_mut().map(|e| e.poll()).unwrap_or_default();
+                        for pkt in more {
+                            if self.tun.write(&pkt).is_ok() {
+                                self.with_stats(|s| s.tun_written += 1);
+                            } else {
+                                self.with_stats(|s| s.dropped += 1);
+                            }
+                        }
+                        // P1：proxy_forwarded 仅在真实转发发生时计数。
+                        // - UDP：handle_packet 返回真实发送结果 → 按包计数。
+                        // - TCP：dial 异步，转发尚未确认；计数由下方
+                        //   engine.stats() 的 tcp_dials_ok/failed 增量驱动，
+                        //   此处不按包计数。
+                        if packet.get(9) == Some(&17) {
+                            if forwarded {
+                                self.with_stats(|s| s.proxy_forwarded += 1);
+                            } else {
+                                self.with_stats(|s| s.proxy_dropped_no_proxy += 1);
+                            }
+                        }
+                        // P1：同步 TCP dial 结果增量（dial 成功 → proxy_forwarded；
+                        // dial 失败 → proxy_dropped_no_proxy）。
+                        let eng_stats = self
+                            .proxy_engine
+                            .as_ref()
+                            .map(|e| e.stats())
+                            .unwrap_or_default();
+                        let ok_delta = eng_stats
+                            .tcp_dials_ok
+                            .saturating_sub(self.last_tcp_dials_ok);
+                        let fail_delta = eng_stats
+                            .tcp_dials_failed
+                            .saturating_sub(self.last_tcp_dials_failed);
+                        self.last_tcp_dials_ok = eng_stats.tcp_dials_ok;
+                        self.last_tcp_dials_failed = eng_stats.tcp_dials_failed;
+                        self.with_stats(|s| {
+                            s.proxy_forwarded += ok_delta;
+                            s.proxy_dropped_no_proxy += fail_delta;
+                        });
+                    }
+                    // P3：engine 未注入（无可用出站或未配置）→
+                    // proxy_dropped_no_proxy。旧"兼容"分支（计 proxy_forwarded）
+                    // 已删除：那是契约废除的纯分类计数。
+                    None => {
+                        self.with_stats(|s| s.proxy_dropped_no_proxy += 1);
+                    }
                 }
             }
             Classification::Direct => {

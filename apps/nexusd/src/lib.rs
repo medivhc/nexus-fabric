@@ -5,3 +5,4 @@
 pub mod assembly;
 pub mod config;
 pub mod dataplane;
+pub mod proxy_fwd;

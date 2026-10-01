@@ -218,6 +218,34 @@ cargo clippy -p nexusd --all-targets -- -D warnings
 
 如果该模块影响产品行为，还必须映射 Integration/Scenario Evidence。
 
+### Proxy 生产转发（P1-P5，scenarios/product/proxy_fwd.toml，2026-10-01 冻结）
+
+- **P1（TCP 转发）**：`Classification::Proxy` 的 TCP 包 → `ProxyEngine`：
+  - 经 `TcpTerminator`（smoltcp）在用户态终结：SYN → SYN-ACK → ACK；
+  - 握手完成（`TcpEvent::Syn{stream_id, dst}`）→ worker 线程经代理协议
+    dial 目标（ss / trojan / socks5，P3 选路）；
+  - dial 成功 → `proxy_forwarded += 1`，启动中继线程双向泵字节
+    （proxy→`handle_fabric_data`→TUN；TUN→proxy stream）；
+  - dial 失败 → `handle_fabric_rst(stream_id)`，`proxy_dropped_no_proxy += 1`；
+  - 对端关闭 → `handle_fabric_fin/rst`；本地关闭 → 关 proxy 连接。
+- **P2（UDP 转发）**：`Classification::Proxy` 的 UDP 包 → `ProxyEngine`：
+  - 解析 IP/UDP 头 → 按 P3 选定协议的 UDP 中继发送；
+  - SOCKS5：UDP ASSOCIATE；ss：AEAD UDP 中继；trojan：TCP 上的 UDP；
+  - 回包经后台线程解包 → 重构 IP/UDP 包 → 写回 TUN（`tun_written += 1`）；
+  - 发送失败 → `proxy_dropped_no_proxy += 1`。
+- **P3（出站选择）**：解析 `proxy.yaml` 的 `outbounds`，选首个可用
+  `kind ∈ {shadowsocks, trojan, socks5}`（跳过 direct/relay/vmess）；
+  - 无可用出站 → 等价未配置（`proxy_dropped_no_proxy`）；
+  - `OutboundKind` 新增 `Socks5`（ additive；`locator` 为 `host:port`）。
+- **P4（失败语义）**：任何 dial/中继失败 → 计数丢弃，不 panic、不崩
+  dataplane 线程；`proxy_dropped_no_proxy` 语义扩展为"无可用代理或转发失败"。
+- **P5（资源边界）**：TCP 最大连接数复用 `TcpTerminator::MAX_TCP_CONNS`；
+  UDP 流表上限 1024，60s 无活动回收；worker 线程 per-dial 创建、
+  完成后退出（有界）；关闭时 join 超时 1s（R4 延续）。
+- 不变量：单 TUN（D1）；分类器唯一入口（S29）；TUN 所有权仍在 dataplane
+  （engine 只返回待写包，不直接写 TUN）；`proxy_forwarded` 仅在真实转发
+  发生时计数（不再是纯分类计数）。
+
 ## Performance Budget
 
 未定义性能预算的路径不得宣称“性能完成”。进入 hot path 后必须在 Contract 中增加 baseline、noise tolerance、warning threshold 与 blocking threshold。

@@ -16,6 +16,8 @@ nexus-discovery = { path = "../../crates/nexus-discovery" }
 nexus-ingress = { path = "../../crates/nexus-ingress" }
 nexus-network = { path = "../../crates/nexus-network" }
 nexus-proxy-config = { path = "../../crates/nexus-proxy-config" }
+nexus-proxy-transport = { path = "../../crates/nexus-proxy-transport" }
+nexus-outbound-trojan = { path = "../../crates/nexus-outbound-trojan" }
 nexus-projection = { path = "../../crates/nexus-projection" }
 nexus-connectivity = { path = "../../crates/nexus-connectivity" }
 nexus-dns = { path = "../../crates/nexus-dns" }
@@ -30,6 +32,11 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 # R4：Unix 信号处理（SIGTERM/SIGINT → 优雅关闭，§13.4）。
 # MIT/Apache-2.0；纯 Rust + libc；default-features = false（最小 surface）。
 signal-hook = { version = "0.3", default-features = false }
+# P1-P5 ProxyEngine：标准 ss AEAD（TCP/UDP）需要的密码学原语。
+# chacha20poly1305/hkdf/sha1 均为纯 Rust（RustCrypto），与 nexus-outbound-shadowsocks 一致。
+chacha20poly1305 = { version = "0.10.1", default-features = false }
+hkdf = { version = "0.12.4", default-features = false }
+sha1 = { version = "0.10", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 nexus-platform-windows = { path = "../../crates/nexus-platform-windows" }

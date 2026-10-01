@@ -95,6 +95,8 @@ fn main() -> ExitCode {
 ///
 /// R1：`n1_sender` 为 Some 时注入 dataplane（`set_n1_sender`），Mesh 包真发；
 /// 为 None 时保持 D2 计数降级。
+/// P1-P5：`proxy_yaml` 为 Some 且含可用出站时注入 `ProxyEngine`，Proxy 包真发；
+/// 否则 D2 计数降级。
 /// R4：每次循环检查 `shutdown` 标志，置位后退出（join 1s 超时由调用方执行）。
 fn run_dataplane(
     config: nexusd::dataplane::DataplaneConfig,
@@ -102,6 +104,7 @@ fn run_dataplane(
     n1_sender: Option<Arc<dyn nexus_network::n1::bridge::N1Sender>>,
     tun_name: &str,
     tun_mtu: u32,
+    proxy_yaml: Option<String>,
 ) {
     use nexus_projection::TunDevice;
     // D1：创建单个 TUN（Linux）。设备名与 MTU 来自 [tun] 配置（T1）。
@@ -135,6 +138,21 @@ fn run_dataplane(
     if let Some(sender) = n1_sender {
         dp.set_n1_sender(sender);
         eprintln!("[nexusd] dataplane: N1 sender wired (n1_bridge_ready=true)");
+    }
+
+    // P1-P5：注入 Proxy 转发引擎（有可用出站则真发，无则 D2 计数降级）。
+    if let Some(yaml) = proxy_yaml.as_deref() {
+        match nexusd::proxy_fwd::ProxyEngine::new(yaml) {
+            Some(engine) => {
+                dp.set_proxy_engine(engine);
+                eprintln!("[nexusd] dataplane: ProxyEngine wired (proxy_engine_ready=true)");
+            }
+            None => {
+                eprintln!(
+                    "[nexusd] dataplane: proxy.yaml has no usable outbound; proxy packets counted"
+                );
+            }
+        }
     }
 
     eprintln!("[nexusd] dataplane: running");
@@ -237,13 +255,21 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     //    T2：[tun].enabled=false 时跳过 TUN/数据面（no-tun 模式）。
     let tun_name = loaded.daemon.tun.name.clone();
     let tun_mtu = loaded.daemon.tun.mtu;
+    let proxy_yaml = loaded.proxy_yaml.clone();
     let dataplane_handle = if tun_enabled() {
         let dp_shutdown = Arc::clone(&shutdown);
         Some(
             std::thread::Builder::new()
                 .name("nexusd-dataplane".to_string())
                 .spawn(move || {
-                    run_dataplane(dataplane_config, dp_shutdown, n1_sender, &tun_name, tun_mtu);
+                    run_dataplane(
+                        dataplane_config,
+                        dp_shutdown,
+                        n1_sender,
+                        &tun_name,
+                        tun_mtu,
+                        proxy_yaml,
+                    );
                 })
                 .expect("spawn dataplane thread"),
         )
