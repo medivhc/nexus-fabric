@@ -88,6 +88,18 @@
   输出 `{"verdict":"FAIL","error":{"code":"UNSUPPORTED","command":"<name>"}}`，exit 0。
 - 无效 CLI 用法仍 exit 非 0。
 
+### `daemon.toml [qos]` 小节（CAKE-like QoS，scenarios/product/qos_cake.toml (e)）
+
+- 字段（全部可选）：`enabled`（默认 false；别名 `enable` 亦接受）、
+  `mesh_upload_mbps` / `proxy_upload_mbps`（整数 Mbps，0=不限，默认 0）、
+  `quantum`（整数，需在 [64, 65536] 内，默认 1514，非法则拒绝加载）、
+  `high_priority_ports`（逗号分隔字符串 `"22,53,3389"` 或整数数组，
+  默认 `[22, 53, 3389]`）。
+- 映射：`mesh_upload_mbps` ×1e6/8 → mesh egress 整形字节/秒（`None`=不限）；
+  proxy 同理。`enabled=false` 时调度器不实例化（零开销）。
+- 热加载：`[qos]` 任一字段变化 → `NeedsRestart`（子系统启停/重配）；
+  无变化时沿用既有分类。
+
 ### 常规要求
 
 - 默认最小 surface：`private -> pub(crate) -> pub`。
