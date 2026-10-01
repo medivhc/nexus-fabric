@@ -134,6 +134,7 @@ pub struct PunchManager {
     feed: Arc<LoggingFeed>,
     direct: Mutex<HashMap<FabricPeerId, DirectConn>>,
     sockets: Mutex<HashMap<FabricPeerId, Arc<DriverPunchSocket>>>,
+    config: Mutex<PunchConfig>,
 }
 
 impl PunchManager {
@@ -154,7 +155,13 @@ impl PunchManager {
             feed: Arc::new(LoggingFeed::default()),
             direct: Mutex::new(HashMap::new()),
             sockets: Mutex::new(HashMap::new()),
+            config: Mutex::new(PunchConfig::default()),
         })
+    }
+
+    /// Punch parameters shared by initiator and responder paths.
+    pub fn set_config(&self, config: PunchConfig) {
+        *self.config.lock().unwrap() = config;
     }
 
     /// Local candidates + STUN port samples (drives the predictor).
@@ -212,6 +219,8 @@ impl PunchManager {
         remote_nat: NatType,
         config: PunchConfig,
     ) -> PunchResult {
+        // 发起方配置即 manager 配置：responder 路径（handle_offer）共用，保证两侧对称。
+        self.set_config(config);
         let channel = match FabricPunchChannel::open(relay_conn) {
             Ok(c) => Arc::new(c),
             Err(e) => {
@@ -354,8 +363,8 @@ impl PunchManager {
         };
         channel::write_msg(&stream, &encode_answer(&answer))?;
 
-        // Dedup: an active session for this peer already punches.
-        if this.active.lock().unwrap().contains(&peer) {
+        // Dedup (atomic insert): an active session for this peer already punches.
+        if !this.active.lock().unwrap().insert(peer) {
             return Ok(());
         }
 
@@ -375,9 +384,9 @@ impl PunchManager {
             .unwrap()
             .insert(peer, Arc::clone(&socket));
         let predictor = Arc::new(SeededPredictor::new(this.samples_snapshot()));
-        let config = PunchConfig::default();
+        // 与发起方对称：用 manager 上最近一次配置（未配置则为 default）。
+        let config = *this.config.lock().unwrap();
         let remote_nat = offer.nat_type;
-        this.active.lock().unwrap().insert(peer);
         let punch_start = Instant::now();
         let sock2 = socket.clone();
         let this2 = this.clone();

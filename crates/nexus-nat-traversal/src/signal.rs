@@ -134,7 +134,7 @@ pub fn decode_answer(b: &[u8]) -> Result<PunchAnswer, SignalError> {
 // --- 内部 ---
 
 fn encode_candidates(cands: &[PunchCandidate], out: &mut Vec<u8>) {
-    // encode 不截断：超限由 decode 拒绝（encode 签名无 Result）。
+    // u8 长度前缀：最多编码 255 个；合同的 16 上限由 decode 侧以 TooMany 拒绝。
     let n = cands.len().min(255);
     out.push(n as u8);
     for c in cands.iter().take(n) {
