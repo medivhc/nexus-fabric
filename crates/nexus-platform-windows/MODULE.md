@@ -115,3 +115,41 @@ wintun 驱动自动回收会话（内核对象），无持久状态需 reconcile
 
 平台专有代码只允许存在于 `nexus-platform-*` 或 Composition Root。Portable
 crate 必须通过相应 portability gate。
+
+## Windows IP 配置与路由（W-IPR，2026-10-01 冻结）
+
+**模块**：`netcfg.rs`（新建）
+
+**职责**：Windows 上 TUN 设备的 IP 配置与路由管理，对标 Linux 的
+`addr.rs`/`route.rs`。经 `netsh`/`route` 命令实现（`std::process::Command`，
+无 unsafe，类比 `autostart.rs` 的 `schtasks.exe` 模式）。
+
+**公开 API**：
+- `assign_ip(iface: &str, ip: [u8; 4], prefix_len: u8) -> Result<(), PlatformError>`
+  - `netsh interface ip set address "<iface>" static <ip> <mask>`
+  - mask 由 prefix_len 计算（如 24 → 255.255.255.0）
+- `remove_ip(iface: &str, ip: [u8; 4]) -> Result<(), PlatformError>`
+  - `netsh interface ip delete address "<iface>" <ip>`
+- `add_route(cidr: &str, gateway: &str, metric: u32) -> Result<(), PlatformError>`
+  - `route add <network> mask <netmask> <gateway> metric <metric>`
+  - cidr 解析：如 "10.200.0.0/24" → network=10.200.0.0, mask=255.255.255.0
+- `delete_route(cidr: &str) -> Result<(), PlatformError>`
+  - `route delete <network>`
+- `exclude_ip(ip: [u8; 4], gateway: &str) -> Result<(), PlatformError>`
+  - 防回环：给代理服务器 IP 加 /32 路由，走物理网关，metric=1
+  - 等价 `add_route("<ip>/32", gateway, 1)`
+
+**不变量**：
+- 所有命令经 `std::process::Command` 执行，不拼接 shell（防注入）
+- 接口名含空格时正确引用（如 `"nexus-test"`）
+- `prefix_len` 范围 [0, 32]，非法返回 `PlatformError::Invalid`
+- `metric` 为 u32，直接传给 route 命令
+- 幂等：`assign_ip` 已存在时覆盖；`delete_route` 不存在时视为成功（检查 stderr 忽略 "not found"）
+- 错误映射：命令 exit 非零 → `PlatformError::Io`（含 stderr 前 200 字符）
+
+**Deletion Test**：若删除 `netcfg` 抽象，让调用方直接拼 `netsh`/`route`
+命令字符串，则命令构造逻辑泄漏到每个调用点；新增操作（如 IPv6）需改所有
+调用方。抽象成立（类比 Linux 的 `addr.rs`/`route.rs` 分离）。
+
+**E4**：`scenarios/platform/win_ip_route.toml`（命令构造单元测试，mock
+执行器；真机执行在 win-pc 上独立验证，不进 harness 门禁）。

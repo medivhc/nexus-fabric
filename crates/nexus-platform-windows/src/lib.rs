@@ -11,6 +11,7 @@
 
 pub mod autostart;
 pub mod dpapi;
+pub mod netcfg;
 pub mod secure_store;
 pub mod vpi;
 pub mod wininet_proxy;
