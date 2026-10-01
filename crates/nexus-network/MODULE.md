@@ -145,7 +145,9 @@ Out of scope：广播/组播、DNS 劫持、系统代理（后置，不在本契
 
 ### M5 漫游与重规划（Connectivity Evaluation ≠ Establishment）
 
-- Link State 观测：socket 错误 + 周期重探测（默认 5s，可配置）→ `discovery.resolve` → `rebind()`。
+- Link State 观测：keepalive 心跳超时（主；可靠双向流上的 ping/pong，见 `n1/link.rs`）+
+  keepalive 流错误（辅）→ `discovery.resolve` → `rebind()`。
+  （requirement-change C-3：原"socket 错误 + 周期重探测"措辞与实现不符，按实际触发器修正；行为未变。）
 - 平台网络变更通知（Android/桌面）后置。
 - 持续建连失败**只报告事实**，由 Session Runtime 反馈 Core Planner 生成替代 Plan（v9 §8.2）；
   本层不自行替换业务 Provider、不自建第二套 Planner。
@@ -195,7 +197,7 @@ N1 装配新增：
 - `TunVpi`（LinuxTunAdapter）：已存在（`nexus-platform-linux`），**复用**，不新增。
 - N1 会话/连接表（`PeerId → Connection` + 生命周期）：若删除，Session 生命周期语义与裸连接 map 混杂，
   "建连失败反馈 Planner"失去唯一 Owner；独立变化维度成立，允许新增（确切名称实现阶段冻结）。
-- Link 观测器（错误触发 + 周期重探测 → `rebind`）：若删除，观测逻辑散落，"观测 vs 执行"边界消失；
+- Link 观测器（keepalive 心跳超时主 + 流错误辅 → `rebind`）：若删除，观测逻辑散落，"观测 vs 执行"边界消失；
   允许新增（实现阶段冻结）。
 - 注入 trait（Transport / Establishment / Discovery 三件）：理由 = 依赖反转（AGENTS.md §12 明确允许），
   避免 `nexus-network` 反向依赖 delivery 层以下的具体实现。
@@ -207,7 +209,7 @@ N1 装配新增：
 - 新增（最小 surface，`pub` 前必须过 API 面评审）：
   - N1 会话/连接表：按 `PeerId` 索引的单 Connection 管理；`dial` 走注入的 Establishment；
     `inbound` 走 `FabricListener`。
-  - Link 观测器：`notify_link_error` / 周期 `probe` → `rebind`；失败事件结构化上报
+  - Link 观测器：keepalive 心跳超时（主）/ 流错误（辅）→ `rebind`；失败事件结构化上报
     （携带 `connection_id`/`peer_id`，不以日志文本代替错误类型）。
 - 冻结语义：`rebind()` 不改变 `ConnectionId`（沿用 nexus-fabric S2/S3）；建连失败事件必须保留可诊断原因，
   支持 `Retry`/`Fallback`/`Abort`/`Escalate` 四类处置判定。

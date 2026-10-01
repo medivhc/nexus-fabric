@@ -8,7 +8,7 @@ requirement = "v9 §1/§8/§10/§12 N1 Universal Connectivity；白皮书 §6；
 topology = "xc-pc-linux 真机；example 内双节点，各自 unshare(CLONE_NEWNET) 隔离 netns；新 netns 第一件事拉起 lo（教训 os-assemble-lo-unshare），再建 TUN（LinuxTunAdapter/TunVpi）、配 VPI 子网 IP、加路由"
 peers = "静态配置：PeerId（ed25519）+ 已知 locator（M3 首期；mDNS/LSA 后置）；Identity≠Locator"
 bearer = "IP 包走 FabricConn unreliable datagram（M2）；Link 保活走可靠双向流；每对端一个 Connection，按 PeerId 索引，与地址解耦（M4）"
-roam = "文件传输中途修改 B 端 underlay 地址（模拟手机关闭 WiFi 切网）；Link State 观测（socket 错误 + 周期重探测）触发 resolve → rebind()（M5）"
+roam = "文件传输中途修改 B 端 underlay 地址（模拟手机关闭 WiFi 切网）；Link State 观测（keepalive 心跳超时主 + 流错误辅）触发 resolve → rebind()（M5；C-3 requirement-change 修正措辞）"
 driver_discipline = "example 只做外部可观察操作（发包、等统计、读 JSON）；禁止直接调内部函数补状态（教训 e4-must-use-production-path）"
 
 # 可执行 E4：A→B 经 VPI 子网 TCP 传确定性文件 -> 中途改 B underlay 地址
