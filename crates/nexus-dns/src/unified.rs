@@ -23,7 +23,8 @@ pub const DEFAULT_FAKE_IP_TTL_SECS: u64 = 300;
 /// 统一 DNS 配置（对应 `dns.toml [dns]`）。
 #[derive(Debug, Clone)]
 pub struct DnsUnifiedConfig {
-    /// 上游 DNS（bypass/直连查询走这里；传输由注入的 `Resolver` 实现）。
+    /// 上游 DNS 地址（`dns.toml` 声明；由 Composition Root 读取并据此构造
+    /// 注入 `UnifiedDns` 的上游 `Resolver`，本 struct 内不直接使用）。
     pub upstream: Vec<String>,
     /// fake-ip 开关；关闭时代理类域名走上游解析。
     pub fake_ip_enabled: bool,
@@ -175,10 +176,21 @@ pub struct FakeIpPool {
 impl FakeIpPool {
     /// 构造分配池；`prefix > 30` 时可用地址不足，返回 `InvalidQuery`。
     ///
+    /// 非规范 CIDR（如 `198.18.1.7/15`）会被掩码归一化到网络地址，保证
+    /// 分配的地址恒落在声明范围内。
+    ///
     /// # Errors
     ///
-    /// 前缀过大（可用主机地址 < 2）时返回 `DnsError::InvalidQuery`。
+    /// 前缀过大（可用主机地址 < 2）时返回 `DnsError::InvalidQuery`.
     pub fn new(network: u32, prefix: u8, ttl_secs: u64) -> Result<Self, DnsError> {
+        let mask = if prefix == 0 {
+            0u32
+        } else if prefix >= 32 {
+            u32::MAX
+        } else {
+            u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0)
+        };
+        let network = network & mask;
         let size = if prefix >= 32 {
             1u32
         } else {
@@ -704,5 +716,16 @@ mod tests {
     #[test]
     fn pool_rejects_tiny_range() {
         assert!(FakeIpPool::new(0xC612_0000, 31, 300).is_err());
+    }
+
+    #[test]
+    fn pool_normalizes_non_canonical_cidr() {
+        // 非规范 CIDR 198.18.1.7/15 → 归一化到 198.18.0.0/15；
+        // 分配的地址必须落在声明范围内。
+        let mut pool = FakeIpPool::new(0xC612_0107, 15, 300).expect("pool");
+        let ip = pool.allocate("x.test", 1000).unwrap();
+        assert!(pool.contains(ip));
+        let v = u32::from_be_bytes(ip.octets());
+        assert_eq!(v & 0xFFFE_0000, 0xC612_0000);
     }
 }

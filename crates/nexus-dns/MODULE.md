@@ -166,10 +166,11 @@ Public API 变更必须保持结构化、可版本化并有调用方验证。
 
 ### 组件
 
-- `DnsUnifiedConfig`：`upstream: Vec<String>`、`fake_ip_enabled: bool`、
-  `fake_ip_range: Ipv4Net`（默认 `198.18.0.0/15`）、`mesh_suffix: String`
-  （默认 `"mesh"`）、`fake_ip_ttl_secs: u64`、`hosts: Vec<(String, IpAddr)>`
-  （自定义 hosts，最高优先级）。
+- `DnsUnifiedConfig`：`upstream: Vec<String>`（dns.toml 声明，由 Composition Root
+  消费以构造注入的上游 `Resolver`）、`fake_ip_enabled: bool`、
+  `fake_ip_network: u32` + `fake_ip_prefix: u8`（默认 `198.18.0.0/15`，构造时
+  掩码归一化）、`mesh_suffix: String`（默认 `"mesh"`）、
+  `fake_ip_ttl_secs: u64`、`hosts: Vec<(String, IpAddr)>`（自定义 hosts，最高优先级）。
 - `FakeIpPool`：fake-ip 分配池。`allocate(domain, now_secs) -> Ipv4Addr`；
   `lookup(ip) -> Option<String>` 反查域名；`reclaim_expired(now_secs)` 回收
   TTL 过期的映射；同一域名在 TTL 内重复分配返回同一 IP。
@@ -188,8 +189,8 @@ Public API 变更必须保持结构化、可版本化并有调用方验证。
   `MeshNameResolver`）> `ProxyClassifier::is_proxied` 为真 → fake-ip >
   否则上游 `Resolver`。
 - Fake-IP 范围：分配的地址必须落在 `fake_ip_range` 内（默认
-  `198.18.0.0/15`）；`fake_ip_enabled = false` 时代理类域名走上游解析
-  （不分配 fake-ip）。
+  `198.18.0.0/15`）；`FakeIpPool::new` 对非规范 CIDR 做掩码归一化；
+  `fake_ip_enabled = false` 时代理类域名走上游解析（不分配 fake-ip）。
 - 分配确定性：同一 `(domain, qtype=A)` 在 TTL 窗口内重复查询返回同一
   fake-ip，不消耗新地址；AAAA 查询不分配 fake-ip（返回空应答）。
 - 反查一致性：`lookup(allocate(d)) == Some(d)`；过期回收后 `lookup` 返回
@@ -205,13 +206,15 @@ Public API 变更必须保持结构化、可版本化并有调用方验证。
 ### Public API（新增）
 
 ```text
-struct DnsUnifiedConfig { upstream, fake_ip_enabled, fake_ip_range, mesh_suffix, fake_ip_ttl_secs, hosts }
-struct FakeIpPool { allocate(domain, now_secs), lookup(ip), reclaim_expired(now_secs), len() }
+struct DnsUnifiedConfig { upstream, fake_ip_enabled, fake_ip_network, fake_ip_prefix, mesh_suffix, fake_ip_ttl_secs, hosts }
+struct FakeIpPool { new(network, prefix, ttl_secs), allocate(domain, now_secs), lookup(ip), reclaim_expired(now_secs), contains(ip), len(), capacity() }
 trait MeshNameResolver { resolve_mesh(name) -> Option<IpAddr> }
 trait ProxyClassifier { is_proxied(domain) -> bool }
-enum DnsClass { Hosts, Mesh, FakeIp, Upstream }
+enum DnsClass { Hosts, Mesh, FakeIp, Upstream }  // as_str() 稳定表达
 struct UnifiedAnswer { name, class: DnsClass, records: Vec<IpAddr>, from_cache: bool }
-struct UnifiedDns { new(config, mesh, classifier, upstream), resolve(query, now_secs), classify(name) }
+struct UnifiedDns { new(config, mesh, classifier, upstream), resolve(query, now_secs), classify(name),
+                    reverse_lookup(ip), reclaim_expired(now_secs),
+                    upstream_call_count(), fake_ip_count() }
 ```
 
 ### Verification（新增）
