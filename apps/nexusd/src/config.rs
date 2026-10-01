@@ -63,6 +63,39 @@ impl ConfigDir {
 pub struct DaemonConfig {
     /// LocalAPI 监听地址（默认 `127.0.0.1:18080`）。
     pub localapi_addr: String,
+    /// `[qos]` 小节：CAKE-like QoS 开关与整形参数（默认禁用，零开销）。
+    pub qos: QosSection,
+}
+
+/// `daemon.toml` 的 `[qos]` 小节（CAKE-like QoS，`docs/DAEMON_ARCHITECTURE.md` §11）。
+///
+/// 全部可选；`enabled = false`（默认）时调度器不实例化。
+/// 热加载分类：任一字段变化 → `NeedsRestart`（子系统启停/重配；MVP 尚无运行中
+/// 调度器可热应用，保守处理）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QosSection {
+    /// 是否启用 QoS 调度器（默认 false）。
+    pub enabled: bool,
+    /// mesh egress 上行整形（Mbps；0 = 不限，默认 0）。
+    pub mesh_upload_mbps: u64,
+    /// proxy egress 上行整形（Mbps；0 = 不限，默认 0）。
+    pub proxy_upload_mbps: u64,
+    /// DRR quantum（字节；默认 1514，合法范围 [64, 65536]）。
+    pub quantum: u32,
+    /// 高优先级端口（默认 [22, 53, 3389]）。
+    pub high_priority_ports: Vec<u16>,
+}
+
+impl Default for QosSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mesh_upload_mbps: 0,
+            proxy_upload_mbps: 0,
+            quantum: 1514,
+            high_priority_ports: vec![22, 53, 3389],
+        }
+    }
 }
 
 impl DaemonConfig {
@@ -118,6 +151,7 @@ pub fn load(dir: &ConfigDir) -> Result<LoadedConfig, String> {
     let mut cfg = LoadedConfig {
         daemon: DaemonConfig {
             localapi_addr: DaemonConfig::default_addr(),
+            qos: QosSection::default(),
         },
         ..Default::default()
     };
@@ -174,6 +208,7 @@ fn parse_daemon_toml(text: &str) -> Result<DaemonConfig, String> {
     let v: toml::Value = toml::from_str(text).map_err(|e| format!("parse {DAEMON_TOML}: {e}"))?;
     let mut cfg = DaemonConfig {
         localapi_addr: DaemonConfig::default_addr(),
+        qos: QosSection::default(),
     };
     // 支持 `localapi_addr = "..."` 或 `[localapi] addr = "..."`
     if let Some(s) = v.get("localapi_addr").and_then(|x| x.as_str()) {
@@ -190,7 +225,93 @@ fn parse_daemon_toml(text: &str) -> Result<DaemonConfig, String> {
     cfg.localapi_addr
         .parse::<std::net::SocketAddr>()
         .map_err(|e| format!("{DAEMON_TOML}: invalid localapi addr: {e}"))?;
+    // [qos] 小节（可选；缺失则用默认值=禁用）
+    if let Some(t) = v.get("qos") {
+        cfg.qos = parse_qos_section(t)?;
+    }
     Ok(cfg)
+}
+
+/// 解析 `daemon.toml` 的 `[qos]` 小节。
+///
+/// 接受 `enabled`（或别名 `enable`）、`mesh_upload_mbps` / `proxy_upload_mbps`
+/// （整数 Mbps，0=不限）、`quantum`（整数，需在 [64, 65536] 内）、
+/// `high_priority_ports`（逗号分隔字符串 `"22,53,3389"` 或整数数组）。
+fn parse_qos_section(t: &toml::Value) -> Result<QosSection, String> {
+    let get_bool = |k: &str| t.get(k).and_then(|x| x.as_bool());
+    let enabled = get_bool("enabled")
+        .or_else(|| get_bool("enable"))
+        .unwrap_or(false);
+    let get_mbps = |k: &str| {
+        t.get(k)
+            .and_then(|x| x.as_integer())
+            .and_then(|i| u64::try_from(i).ok())
+            .unwrap_or(0)
+    };
+    let quantum = match t.get("quantum") {
+        // 缺失 → 默认 1514
+        None => 1514,
+        // 存在 → 必须为 [64, 65536] 内整数，否则拒绝加载（不静默取默认）
+        Some(x) => {
+            let n = x
+                .as_integer()
+                .and_then(|i| u32::try_from(i).ok())
+                .ok_or_else(|| {
+                    format!("{DAEMON_TOML}: [qos].quantum must be an integer in [64, 65536]")
+                })?;
+            if !(64..=65536).contains(&n) {
+                return Err(format!(
+                    "{DAEMON_TOML}: [qos].quantum must be in [64, 65536] (got {n})"
+                ));
+            }
+            n
+        }
+    };
+    let high_priority_ports = match t.get("high_priority_ports") {
+        Some(v) => parse_port_list(v)?,
+        None => vec![22, 53, 3389],
+    };
+    Ok(QosSection {
+        enabled,
+        mesh_upload_mbps: get_mbps("mesh_upload_mbps"),
+        proxy_upload_mbps: get_mbps("proxy_upload_mbps"),
+        quantum,
+        high_priority_ports,
+    })
+}
+
+/// 解析端口列表：逗号分隔字符串或整数数组。
+fn parse_port_list(v: &toml::Value) -> Result<Vec<u16>, String> {
+    if let Some(s) = v.as_str() {
+        let mut ports = Vec::new();
+        for part in s.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let p: u16 = part.parse().map_err(|_| {
+                format!("{DAEMON_TOML}: [qos].high_priority_ports: invalid port '{part}'")
+            })?;
+            ports.push(p);
+        }
+        return Ok(ports);
+    }
+    if let Some(arr) = v.as_array() {
+        let mut ports = Vec::new();
+        for item in arr {
+            let p = item
+                .as_integer()
+                .and_then(|i| u16::try_from(i).ok())
+                .ok_or_else(|| {
+                    format!("{DAEMON_TOML}: [qos].high_priority_ports: ports must be 0..=65535")
+                })?;
+            ports.push(p);
+        }
+        return Ok(ports);
+    }
+    Err(format!(
+        "{DAEMON_TOML}: [qos].high_priority_ports: expected comma-separated string or integer array"
+    ))
 }
 
 /// 热加载变更分类。
@@ -210,10 +331,15 @@ pub enum ChangeKind {
 /// - `network.toml` 内容变更 → Hot（peer 列表等；若含监听端口变更则 NeedsRestart，
 ///   当前未做字段级 diff，一律按 Hot 处理并记 info，端口类变更由 N1 侧自行决定）
 /// - `daemon.toml` 的 `localapi_addr` 变更 → NeedsRestart
+/// - `daemon.toml` 的 `[qos]` 小节变更 → NeedsRestart（子系统启停/重配）
 /// - 文件新增/删除 → NeedsRestart（子系统启停需重新装配）
 pub fn classify_change(old: &LoadedConfig, new: &LoadedConfig) -> ChangeKind {
     // daemon.toml：localapi 地址变化需重启
     if old.daemon.localapi_addr != new.daemon.localapi_addr {
+        return ChangeKind::NeedsRestart;
+    }
+    // daemon.toml：[qos] 小节变化需重启
+    if old.daemon.qos != new.daemon.qos {
         return ChangeKind::NeedsRestart;
     }
     // 任一文件的增删 → 需重启（子系统启停）
@@ -301,5 +427,76 @@ mod tests {
         let d = std::env::temp_dir().join("nexusd-cfg-test-missing-xyz");
         let _ = std::fs::remove_dir_all(&d);
         assert!(ConfigDir::new(&d).is_err());
+    }
+
+    #[test]
+    fn qos_section_defaults_when_absent() {
+        // 无 [qos] 小节 → 禁用，零开销。
+        let cfg = parse_daemon_toml("[localapi]\naddr = \"127.0.0.1:18080\"\n").unwrap();
+        assert!(!cfg.qos.enabled);
+        assert_eq!(cfg.qos.mesh_upload_mbps, 0);
+        assert_eq!(cfg.qos.proxy_upload_mbps, 0);
+        assert_eq!(cfg.qos.quantum, 1514);
+        assert_eq!(cfg.qos.high_priority_ports, vec![22, 53, 3389]);
+    }
+
+    #[test]
+    fn qos_section_parses_canonical_snippet() {
+        // 与 scenarios/product/qos_cake.toml (e) 的 wire format 对齐。
+        let text = "[qos]\nenabled = true\nmesh_upload_mbps = 100\nproxy_upload_mbps = 50\nquantum = 1514\nhigh_priority_ports = \"22,53,3389\"\n";
+        let cfg = parse_daemon_toml(text).unwrap();
+        assert!(cfg.qos.enabled);
+        assert_eq!(cfg.qos.mesh_upload_mbps, 100);
+        assert_eq!(cfg.qos.proxy_upload_mbps, 50);
+        assert_eq!(cfg.qos.quantum, 1514);
+        assert_eq!(cfg.qos.high_priority_ports, vec![22, 53, 3389]);
+    }
+
+    #[test]
+    fn qos_section_accepts_enable_alias_and_array_ports() {
+        let text = "[qos]\nenable = true\nhigh_priority_ports = [22, 53]\n";
+        let cfg = parse_daemon_toml(text).unwrap();
+        assert!(cfg.qos.enabled);
+        assert_eq!(cfg.qos.high_priority_ports, vec![22, 53]);
+    }
+
+    #[test]
+    fn qos_section_rejects_bad_quantum_and_ports() {
+        let bad_q = "[qos]\nquantum = 63\n";
+        assert!(parse_daemon_toml(bad_q).is_err());
+        let bad_q2 = "[qos]\nquantum = 70000\n";
+        assert!(parse_daemon_toml(bad_q2).is_err());
+        // 负数 quantum：拒绝加载（不静默取默认）。
+        let bad_q3 = "[qos]\nquantum = -5\n";
+        assert!(parse_daemon_toml(bad_q3).is_err());
+        // 非整数 quantum：拒绝加载。
+        let bad_q4 = "[qos]\nquantum = \"fast\"\n";
+        assert!(parse_daemon_toml(bad_q4).is_err());
+        let bad_p = "[qos]\nhigh_priority_ports = \"22,abc\"\n";
+        assert!(parse_daemon_toml(bad_p).is_err());
+        let bad_p2 = "[qos]\nhigh_priority_ports = [99999]\n";
+        assert!(parse_daemon_toml(bad_p2).is_err());
+    }
+
+    #[test]
+    fn qos_change_needs_restart() {
+        let d = std::env::temp_dir().join("nexusd-cfg-test-qos");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        write(&d, DAEMON_TOML, "[qos]\nenabled = false\n");
+        let dir = ConfigDir::new(&d).unwrap();
+        let old = load(&dir).unwrap();
+        // [qos] 字段变更 → NeedsRestart。
+        write(
+            &d,
+            DAEMON_TOML,
+            "[qos]\nenabled = true\nmesh_upload_mbps = 100\n",
+        );
+        let new = load(&dir).unwrap();
+        assert_eq!(classify_change(&old, &new), ChangeKind::NeedsRestart);
+        // 无变化 → Hot（沿用既有保守规则）。
+        let same = load(&dir).unwrap();
+        assert_eq!(classify_change(&new, &same), ChangeKind::Hot);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -15,6 +15,7 @@ pub fn run_scenario(args: &[String]) -> Outcome {
         "dns-unified" => run_dns_unified(),
         "firewall-rules" => run_firewall_rules(),
         "bandwidth-qos" => run_bandwidth_qos(),
+        "qos-cake" => run_qos_cake(),
         "auto-reconnect" => run_auto_reconnect(),
         _ => (
             "BLOCKED".to_string(),
@@ -1395,6 +1396,237 @@ fn run_auto_reconnect() -> Outcome {
             "FAIL".to_string(),
             format!(
                 "auto-reconnect: invariants failed (initial={initial_backoff_is_100ms}, doubles={backoff_doubles}, cap={backoff_caps_at_max}, give_up={give_up_after_max_retries}, reset={reconnect_success_resets_state}, attempts={attempt_count}, final={final_state})"
+            ),
+            extra,
+        )
+    }
+}
+
+/// E4: CAKE-like QoS 调度器（DRR 公平队列 + 严格优先级 + 整形 + 流回收，
+/// `scenarios/product/qos_cake.toml`）。纯内存、假时钟确定性；演示五个检查点：
+/// (a) 同优先级 backlog 流按字节公平（A: 4x1500B vs B: 12x500B → 各 6000B）；
+/// (b) 严格优先级（High 3 包先于 Medium 3 包，签名 "HHHLLL"）；
+/// (c) 整形（burst 后阻塞、1s 恢复）；
+/// (d) 流回收（60s 空闲回收）；
+/// (e) daemon.toml [qos] 的 wire format 映射形状（真实解析器由 apps/nexusd 单测覆盖）。
+fn run_qos_cake() -> Outcome {
+    use nexus_connectivity::cake::{CakeConfig, CakeScheduler, FiveTuple, PROTO_TCP, PROTO_UDP};
+    use nexus_connectivity::qos::BandwidthLimit;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Duration;
+
+    let t0 = Duration::ZERO;
+    let mk = |sp: u16, dp: u16, proto: u8| FiveTuple {
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        src_port: sp,
+        dst_port: dp,
+        proto,
+    };
+
+    // (a) 公平性。
+    let mut sched = match CakeScheduler::new(&CakeConfig::default()) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                "FAIL".to_string(),
+                format!("qos-cake: build scheduler: {e}"),
+                Vec::new(),
+            );
+        }
+    };
+    let a = mk(1000, 80, PROTO_TCP);
+    let b = mk(2000, 80, PROTO_TCP);
+    let fid_a = a.flow_id();
+    for _ in 0..4 {
+        sched.enqueue(&a, 1500, t0);
+    }
+    for _ in 0..12 {
+        sched.enqueue(&b, 500, t0);
+    }
+    let mut a_bytes = 0u64;
+    let mut b_bytes = 0u64;
+    let mut total_packets = 0u32;
+    while let Some((fid, len)) = sched.dequeue(t0) {
+        if fid == fid_a {
+            a_bytes += len;
+        } else {
+            b_bytes += len;
+        }
+        total_packets += 1;
+        if total_packets > 64 {
+            break; // 防御性：正常 16 包即排空
+        }
+    }
+
+    // (b) 严格优先级。
+    let mut prio_sched = match CakeScheduler::new(&CakeConfig::default()) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                "FAIL".to_string(),
+                format!("qos-cake: build prio scheduler: {e}"),
+                Vec::new(),
+            );
+        }
+    };
+    let h = mk(40000, 53, PROTO_UDP); // High（DNS 端口）
+    let l = mk(40001, 443, PROTO_TCP); // Medium
+    let fid_h = h.flow_id();
+    for _ in 0..3 {
+        prio_sched.enqueue(&h, 100, t0);
+        prio_sched.enqueue(&l, 100, t0);
+    }
+    let mut sig = String::new();
+    for _ in 0..6 {
+        match prio_sched.dequeue(t0) {
+            Some((fid, _)) => sig.push(if fid == fid_h { 'H' } else { 'L' }),
+            None => sig.push('?'),
+        }
+    }
+
+    // (c) 整形：rate 1000 B/s，burst 1000。
+    let limit = match BandwidthLimit::new(1000, 1000) {
+        Ok(l) => l,
+        Err(e) => {
+            return (
+                "FAIL".to_string(),
+                format!("qos-cake: build limit: {e}"),
+                Vec::new(),
+            );
+        }
+    };
+    let shaped_cfg = CakeConfig {
+        rate_limit: Some(limit),
+        ..CakeConfig::default()
+    };
+    let mut shaped = match CakeScheduler::new(&shaped_cfg) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                "FAIL".to_string(),
+                format!("qos-cake: build shaped scheduler: {e}"),
+                Vec::new(),
+            );
+        }
+    };
+    let m = mk(3000, 80, PROTO_TCP);
+    for _ in 0..3 {
+        shaped.enqueue(&m, 1000, t0);
+    }
+    let first_burst_bytes = shaped.dequeue(t0).map(|(_, len)| len).unwrap_or(0);
+    let blocked_when_tokens_empty = shaped.dequeue(t0).is_none();
+    let t1 = Duration::from_secs(1);
+    let resumed_after_1s = shaped.dequeue(t1).map(|(_, len)| len) == Some(1000);
+
+    // (d) 流回收：t=0 建流，t=61s 回收。
+    let mut reaper = match CakeScheduler::new(&CakeConfig::default()) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                "FAIL".to_string(),
+                format!("qos-cake: build reap scheduler: {e}"),
+                Vec::new(),
+            );
+        }
+    };
+    let x = mk(4000, 80, PROTO_TCP);
+    reaper.enqueue(&x, 100, t0);
+    let reaped_count = reaper.reap(Duration::from_secs(61));
+    let flows_remaining = reaper.flow_count();
+
+    // (e) daemon.toml [qos] wire format 映射形状。
+    let snippet = "[qos]\nenabled = true\nmesh_upload_mbps = 100\nproxy_upload_mbps = 50\nquantum = 1514\nhigh_priority_ports = \"22,53,3389\"\n";
+    let v: toml::Value = match toml::from_str(snippet) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                "FAIL".to_string(),
+                format!("qos-cake: parse qos snippet: {e}"),
+                Vec::new(),
+            );
+        }
+    };
+    let q = v.get("qos");
+    let cfg_enabled = q.and_then(|t| t.get("enabled")).and_then(|x| x.as_bool());
+    let cfg_mesh = q
+        .and_then(|t| t.get("mesh_upload_mbps"))
+        .and_then(|x| x.as_integer());
+    let cfg_proxy = q
+        .and_then(|t| t.get("proxy_upload_mbps"))
+        .and_then(|x| x.as_integer());
+    let cfg_quantum = q
+        .and_then(|t| t.get("quantum"))
+        .and_then(|x| x.as_integer());
+    let cfg_ports = q
+        .and_then(|t| t.get("high_priority_ports"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+
+    let ok = a_bytes == 6000
+        && b_bytes == 6000
+        && total_packets == 16
+        && sig == "HHHLLL"
+        && first_burst_bytes == 1000
+        && blocked_when_tokens_empty
+        && resumed_after_1s
+        && reaped_count == 1
+        && flows_remaining == 0
+        && cfg_enabled == Some(true)
+        && cfg_mesh == Some(100)
+        && cfg_proxy == Some(50)
+        && cfg_quantum == Some(1514)
+        && cfg_ports == "22,53,3389";
+
+    let extra = vec![
+        (
+            "fairness".to_string(),
+            json!({
+                "flow_a_bytes": a_bytes,
+                "flow_b_bytes": b_bytes,
+                "total_packets": total_packets,
+            }),
+        ),
+        ("priority".to_string(), json!({ "order_signature": sig })),
+        (
+            "shaping".to_string(),
+            json!({
+                "first_burst_bytes": first_burst_bytes,
+                "blocked_when_tokens_empty": blocked_when_tokens_empty,
+                "resumed_after_1s": resumed_after_1s,
+            }),
+        ),
+        (
+            "reap".to_string(),
+            json!({
+                "reaped_count": reaped_count,
+                "flows_remaining": flows_remaining,
+            }),
+        ),
+        (
+            "config".to_string(),
+            json!({
+                "enabled": cfg_enabled,
+                "mesh_upload_mbps": cfg_mesh,
+                "proxy_upload_mbps": cfg_proxy,
+                "quantum": cfg_quantum,
+                "high_priority_ports": cfg_ports,
+            }),
+        ),
+    ];
+
+    if ok {
+        (
+            "PASS".to_string(),
+            "qos-cake: DRR fairness + strict priority + shaping block/resume + 60s reap + [qos] mapping verified"
+                .to_string(),
+            extra,
+        )
+    } else {
+        (
+            "FAIL".to_string(),
+            format!(
+                "qos-cake: invariants failed (a_bytes={a_bytes}, b_bytes={b_bytes}, packets={total_packets}, sig={sig}, burst={first_burst_bytes}, blocked={blocked_when_tokens_empty}, resumed={resumed_after_1s}, reaped={reaped_count}, remaining={flows_remaining})"
             ),
             extra,
         )

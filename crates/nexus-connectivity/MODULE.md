@@ -407,6 +407,65 @@ NAT/中继场景的物理建连（组合根 transport::connect）发生在激活
 仅 std（`std::time::{Duration, Instant}`）；无 `unsafe`、库代码不 panic/unwrap/expect；
 整形排队、优先级/公平排队、per-flow 分流、真实数据面挂接留 TODO。
 
+### 冻结契约（CAKE-like QoS 调度器：DRR 公平队列 + 整形，scenarios/product/qos_cake.toml）
+
+用户态 CAKE-like 调度器（MVP）：per-flow DRR 公平队列 + 三级严格优先级 +
+per-egress 令牌桶整形。纯内存、纯同步；不接真实 TUN/socket（留接入点）；
+`qos.rs` 的令牌桶冻结契约保持不动（本模块复用 `BandwidthLimit` / `TokenBucket`）。
+
+- `FiveTuple { src_ip: IpAddr, dst_ip: IpAddr, src_port: u16, dst_port: u16, proto: u8 }`：
+  `flow_id() -> FlowId(u64)` 为同进程内确定性哈希（`DefaultHasher`，不持久化）；
+  `proto`：6=TCP / 17=UDP / 1=ICMP。
+- `Priority { High, Medium, Low }`：`Ord` 为 High < Medium < Low（值越小越优先）。
+- `CakeConfig`：
+  - 字段：`quantum: u32`（默认 1514）、`flow_timeout: Duration`（默认 60s）、
+    `max_queue_packets: usize`（默认 64，单流队列上限）、
+    `max_packet_bytes: u64`（默认 65535，超限整包丢弃）、
+    `high_priority_ports: Vec<u16>`（默认 `[22, 53, 3389]`）、
+    `low_priority_ports: Vec<u16>`（默认空）、
+    `rate_limit: Option<BandwidthLimit>`（per-egress 整形；`None` = 不整形）。
+  - `validate() -> Result<(), QosError>`：`quantum` ∈ [64, 65536]、
+    `flow_timeout` > 0、`max_queue_packets` >= 1、
+    `max_packet_bytes` ∈ [1, 16MB]，否则 `QosError::InvalidLimit`；
+    high/low 端口交集非空同样拒绝（复用 `InvalidLimit`，message 说明原因，
+    不新增错误变体以保持冻结错误面）。
+- `CakeScheduler`：
+  - `new(&CakeConfig) -> Result<Self, QosError>`（先 `validate`）。
+  - `enqueue(&FiveTuple, bytes: u64, now: Duration) -> EnqueueDecision`：
+    `Admitted { flow: FlowId, priority: Priority }` /
+    `DroppedQueueFull`（该流队列已达 `max_queue_packets`）/
+    `DroppedOversize`（`bytes > max_packet_bytes`）；dropped 记入统计。
+    新流按端口规则定优先级：`proto == 1`（ICMP）恒 High；源/目的任一端口命中
+    high 列表 → High；命中 low 列表 → Low；否则 Medium。流优先级在流生命周期内不变。
+  - `dequeue(now: Duration) -> Option<(FlowId, u64)>`：类间严格优先级
+    （High 类有 active 流时不看 Medium/Low）；类内 DRR（每流每访问
+    `deficit += quantum`，队首包 `len <= deficit` 则发送并 `deficit -= len`；
+    单包 > quantum 时 deficit 跨轮累积直到能发）；整形门控：发送前
+    `try_consume(len, now)`，令牌不足则**不**出队、**不**扣 deficit、
+    **不**跳过找更小的包，直接返回 `None`（调用方稍后重试）；
+    每次调用最多出一包。
+  - `reap(now: Duration) -> usize`：回收 `now - last_seen >= flow_timeout`
+    的流（队内残包计入 dropped），返回回收流数。
+  - `flow_count() -> usize` / `snapshot() -> CakeStats`。
+  - `CakeStats { packets_enqueued, packets_dequeued, packets_dropped, bytes_dequeued,
+    per_priority_dequeued: [u64; 3], flows_current, flows_reaped }`：
+    `per_priority_dequeued` 下标按 `High=0, Medium=1, Low=2`。
+- 不变量：
+  - 同优先级、持续 backlog 的流，出队字节数之差有界（DRR 公平；quantum 相同）；
+  - High 类有 backlog 时 Medium/Low 不出包（严格优先级）；
+  - 整形开启时，任意 1 秒窗口出队字节 ≤ rate + burst（令牌桶语义）；
+  - `dequeue` 返回 `None` 当且仅当：全部 active 为空，或整形令牌不足；
+  - 纯内存、纯同步；时钟由调用方 `now: Duration` 显式传入；无 `unsafe`；
+    库代码不 panic/unwrap/expect（`new` 失败走 `Result`）。
+- `daemon.toml [qos]` 映射（`apps/nexusd` 解析；热加载分类见该 crate 契约）：
+  `enabled`（默认 false）、`mesh_upload_mbps` / `proxy_upload_mbps`
+  （默认 0 = 不限）、`quantum`（默认 1514）、`high_priority_ports`
+  （默认 `"22,53,3389"`）。`enabled = false` 时调度器不实例化（零开销）。
+
+冻结语义：不接真实 TUN/socket；不做多路径；IPv4/IPv6 五元组均支持（`IpAddr`）；
+TUN 接入点 = 调用方把包映射为 `(FiveTuple, bytes)` 入队、出队后按 `(FlowId, bytes)`
+取回包缓冲（包缓冲所有权在调用方，调度器只处理流 ID 与字节数）。
+
 ### 冻结契约（数据面真实挂接 dataplane-pipeline，PRODUCT §12.41，scenarios/product/pipeline_*.toml）
 
 把 firewall / QoS / compression / fragmentation 六个骨架真实挂进 `VirtualSubnetTunnel`

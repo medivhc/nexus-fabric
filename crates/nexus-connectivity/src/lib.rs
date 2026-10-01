@@ -70,6 +70,10 @@ pub mod firewall;
 
 pub mod qos;
 
+// ---------- CAKE-like QoS 调度器（DRR 公平队列 + 严格优先级 + 整形，E4：product.qos-cake） ----------
+
+pub mod cake;
+
 // ---------- 自动断线重连（指数退避状态机，E4：product.auto-reconnect） ----------
 
 pub mod reconnect;
