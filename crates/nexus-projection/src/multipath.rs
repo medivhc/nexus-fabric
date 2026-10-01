@@ -675,8 +675,8 @@ mod tests {
         assert!(PacketSeq::less(u64::MAX, 1));
         assert!(!PacketSeq::less(0, u64::MAX));
         assert!(!PacketSeq::less(1, u64::MAX));
-        // 朴素比较在回绕点会错：u64::MAX < 0 为 false（正确应为 true）。
-        assert!(!(u64::MAX < 0));
+        // 注：朴素 `u64::MAX < 0` 恒为 false（clippy unused_comparisons 会告警），
+        // 而回绕语义下 MAX 应早于 0 —— 这正是 PacketSeq::less 要修复的。
     }
 
     #[test]
