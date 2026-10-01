@@ -221,7 +221,139 @@ nexus proxy run|host|relay ...        # 数据面组合根
 
 ---
 
-## 9. 验证状态
+## 10. DNS 统一设计
+
+> 状态：**设计**（2026-10-01，用户要求统一）。未实现。
+
+### 10.1 问题
+
+三套 DNS 各管各的：
+- **Clash DNS**：fake-ip 模式、劫持 53 端口、按规则分流上游
+- **Mesh**：peer 主机名、mesh 域名需要解析到虚拟网 IP
+- **系统 DNS**：被 TUN 劫持后，查询不知道给谁
+
+### 10.2 统一架构
+
+`nexusd` 只起**一个** DNS 服务器（`0.0.0.0:53`），TUN 的 `dns-hijack` 把所有 53 端口流量导入：
+
+```
+应用 DNS 查询
+    ↓ (TUN dns-hijack: any:53)
+nexusd DNS (0.0.0.0:53)
+    ↓ 查询分类器
+    ├── mesh 域名 → Mesh 解析器 → 真实 mesh IP
+    │   (如 *.mesh、peer 主机名 → 10.144.144.x)
+    │
+    ├── 命中代理规则 → Fake-IP 池 → 返回 fake-ip
+    │   (198.18.0.0/15，Clash 兼容范围)
+    │   后续到 fake-ip 的 TCP/UDP 被 TUN 捕获 → 走 proxy 规则引擎
+    │
+    └── 直连/bypass → 上游 DNS（系统配置或 dns.toml 指定）
+```
+
+### 10.3 关键设计点
+
+| 项目 | 设计 |
+|------|------|
+| Fake-IP 池 | `198.18.0.0/15`（RFC 2544 benchmarking，与 Clash 兼容） |
+| Mesh 域名后缀 | `.mesh`（如 `xc-pc-linux.mesh` → `10.144.144.6`）；可配置 |
+| 查询分类顺序 | mesh 域名 > 代理规则（fake-ip）> 直连上游 |
+| 缓存 | 按查询类型分别缓存；fake-ip 映射表常驻内存（随 daemon 生命周期） |
+| `dns.toml` | 上游 DNS、fake-ip 开关、mesh 后缀、自定义 hosts |
+
+### 10.4 与 TUN 的配合
+
+- TUN 的 `dns-hijack: any:53` 确保所有 DNS 查询进入我们的服务器，不泄露
+- Fake-IP 返回后，应用发起的 TCP 连接目标是 fake-ip，被 TUN 捕获
+- TUN 的包分类器识别 fake-ip → 送入 proxy 规则引擎（见 §6）
+- Mesh 域名返回真实 IP，TUN 分类器识别 mesh 网段 → 送入 N1
+
+---
+
+## 11. 用户态 QoS 设计（CAKE-like）
+
+> 状态：**设计**（2026-10-01，用户想法）。未实现。
+> 目标：在用户态实现类似 Linux CAKE qdisc 的公平队列 + 流量整形。
+
+### 11.1 为什么用户态
+
+- **跨平台**：Windows/macOS 没有 CAKE；用户态一套代码全平台跑
+- **与分类器集成**：QoS 决策需要应用层信息（proxy 规则、mesh 优先级），内核 qdisc 拿不到
+- **可观测**：每流统计天然可导出给 `nexus status`
+
+### 11.2 在数据面的位置
+
+```
+TUN 捕获
+    ↓
+[包分类器] (§6: mesh / proxy / bypass)
+    ↓
+[QoS 层：本节] ← 按 egress 分实例
+    ├── mesh egress 实例（整形 mesh 上行）
+    └── proxy egress 实例（整形代理上行）
+    ↓
+转发（N1 / proxy 规则引擎）
+```
+
+每个 egress 一个独立实例，避免 mesh 和 proxy 互相抢带宽。
+
+### 11.3 核心组件
+
+#### 流识别
+- **5 元组** → flow ID：`hash(src_ip, dst_ip, src_port, dst_port, proto)`
+- 流表：`HashMap<FlowId, FlowState>`（分片锁或 lock-free，防热点）
+- 流超时：60s 无包则回收（避免内存泄漏）
+
+#### 优先级分级（类 CAKE diffserv）
+| 优先级 | DSCP 对标 | 典型流量 | 识别方式 |
+|--------|-----------|----------|----------|
+| 高 | CS6/EF | SSH、DNS、ICMP、游戏 | 端口/协议规则，可配置 |
+| 中 | 默认 | 网页、API | 默认 |
+| 低 | CS1 | 下载、备份 | 端口/规则，可配置 |
+
+#### 公平队列（DRR，Deficit Round Robin）
+- 每个流一个队列 + `deficit` 计数器
+- 调度轮询：`deficit += quantum`；包大小 ≤ deficit 则发送，`deficit -= 包大小`
+- `quantum` 默认 1514（以太网 MTU），可配置
+- 保证：大象流不饿死老鼠流（CAKE 的核心公平性）
+
+#### 整形（Token Bucket）
+- 每个优先级一个 token bucket，或全局一个
+- 速率可配置（如 `upload_mbps: 100`）
+- 高精度定时器：Linux `timerfd` / Windows `CreateTimerQueueTimer`，精度目标 <1ms
+
+### 11.4 用户态挑战与对策
+
+| 挑战 | 对策 |
+|------|------|
+| 定时器精度 | 平台相关高精度定时器；整形允许 ±1ms 抖动 |
+| per-packet 开销 | 流表分片；热路径避免分配；batch dequeue |
+| CPU 占用 | 空闲时 park 线程；backpressure 传导（队列满则 drop，TCP 自适应） |
+| 与 async 集成 | QoS 层跑独立线程（OS thread），与 tokio 运行时通过 channel 通信，避免阻塞 |
+
+### 11.5 配置（`daemon.toml` 扩展）
+
+```toml
+[qos]
+enable = true
+# 上行整形（Mbps，0 = 不限速）
+mesh_upload_mbps = 100
+proxy_upload_mbps = 200
+# DRR quantum（字节）
+quantum = 1514
+# 高优先级端口（逗号分隔）
+high_priority_ports = "22,53,3389"
+```
+
+### 11.6 诚实边界
+
+- 本设计未实现、无测试、无性能数据
+- 用户态 QoS 的 CPU 开销 vs 内核 qdisc 尚未量化
+- Windows 高精度定时器行为需实测
+
+---
+
+## 12. 验证状态
 
 - **单测**：`cargo test -p nexusd` 10/10 通过（含热加载 Applied/Rejected/NeedsRestart 三路径）
 - **功能验证**（2026-10-01）：启动、改文件热加载、坏 YAML 拒绝且进程存活、`nexus config` 三命令，全部通过
