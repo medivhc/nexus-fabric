@@ -67,7 +67,6 @@ fn run() -> Result<(String, bool), String> {
     let cfg = ConnConfig {
         addrs: vec![server_addr],
         handshake_timeout: Duration::from_secs(10),
-        ..ConnConfig::default()
     };
     let conn = FabricConn::connect(server_peer, &cfg).map_err(|e| format!("connect: {e}"))?;
 
