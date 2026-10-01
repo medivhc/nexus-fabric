@@ -74,7 +74,9 @@ pub(crate) enum SynTarget {
 /// 按冻结的线兼容规则把 6 字节无条件读作 3b-5 旧格式（IPv4+port）——根本
 /// 歧义，egress 会静默连错主机。因此 2 字符域名用 FQDN trailing-dot 形式
 ///（`"ab"` → `"ab."`，7 字节），解析器视两者等价。
-pub(crate) fn encode_syn_payload(host: &str, port: u16) -> Vec<u8> {
+///
+/// GAP-5：dataplane（`nexusd`）构造 STREAM SYN 帧需要此函数，故为 `pub`。
+pub fn encode_syn_payload(host: &str, port: u16) -> Vec<u8> {
     if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
         let mut out = Vec::with_capacity(7);
         out.push(0x01);
