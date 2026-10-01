@@ -132,7 +132,8 @@ fn main() {
     pm.on_stats(&good.remote_addr, stats(20));
     pm.on_stats(&bad.remote_addr, stats(200));
     let arr = [good.clone(), bad.clone()];
-    let sel = select_best(&pm, &arr, 1.0);
+    let sel = select_best(&pm, &arr, 1.0)
+        .unwrap_or_else(|| fail_json("select_best returned None (all scores unknown)"));
     let best_kind = sel.best.map(|c| kind_name(c.kind)).unwrap_or("none");
 
     // --- 4. Racing connect (production path: boost_connect → connect_with_fallback). ---

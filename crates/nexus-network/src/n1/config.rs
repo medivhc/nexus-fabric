@@ -784,4 +784,24 @@ heartbeat_timeout_ms = 3000
             "unexpected: {e}"
         );
     }
+
+    #[test]
+    fn boost_accepts_upper_bound_and_partial_section() {
+        // hysteresis_pct = 1.0 是上边界，应被接受（(0, 1] 闭区间右端）。
+        let toml = format!("{MINIMAL}[boost]\nenabled = true\nhysteresis_pct = 1.0\n");
+        let c = N1Config::parse_toml(&toml).unwrap();
+        assert_eq!(c.boost.hysteresis_pct, 1.0);
+        // 部分 [boost] 小节：未给字段取默认值。
+        let toml = format!("{MINIMAL}[boost]\nenabled = true\n");
+        let c = N1Config::parse_toml(&toml).unwrap();
+        assert!(c.boost.enabled);
+        assert_eq!(c.boost.hysteresis_pct, 0.10);
+        assert_eq!(c.boost.switch_hold_ms, 1000);
+        assert!(c.boost.race_on_connect);
+        // bool 大小写不敏感。
+        let toml = format!("{MINIMAL}[boost]\nenabled = TRUE\nrace_on_connect = False\n");
+        let c = N1Config::parse_toml(&toml).unwrap();
+        assert!(c.boost.enabled);
+        assert!(!c.boost.race_on_connect);
+    }
 }

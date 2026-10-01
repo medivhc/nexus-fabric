@@ -48,13 +48,13 @@ pub fn path_config_for_boost(hysteresis_pct: f64, switch_hold_ms: u64) -> PathCo
 ///
 /// - 只读：`manager: &PathManager`，不修改任何状态；
 /// - `candidates` 由调用方持有（`PathManager` 不暴露候选列表）；
-/// - 全 unknown → `best = None`；
+/// - 全 unknown → 返回 `None`（S7）；
 /// - `degraded = best_score < degrade_threshold`（阈值调用方定）。
 pub fn select_best<'a>(
     manager: &PathManager,
     candidates: &'a [CandidatePath],
     degrade_threshold: f64,
-) -> BoostSelection<'a> {
+) -> Option<BoostSelection<'a>> {
     let mut best: Option<&'a CandidatePath> = None;
     let mut best_score: Option<f64> = None;
     for c in candidates {
@@ -66,12 +66,12 @@ pub fn select_best<'a>(
             _ => {}
         }
     }
-    let degraded = best_score.is_some_and(|s| s < degrade_threshold);
-    BoostSelection {
+    let score = best_score?;
+    Some(BoostSelection {
         best,
-        score: best_score,
-        degraded,
-    }
+        score: Some(score),
+        degraded: score < degrade_threshold,
+    })
 }
 
 /// Boost 建连分发。
@@ -93,6 +93,7 @@ pub fn boost_connect(
     }
     let cancel = AtomicBool::new(false);
     let mut last_err: Option<io::Error> = None;
+    let start = std::time::Instant::now();
     for (idx, c) in chain.candidates().iter().enumerate() {
         let attempts = idx as u32 + 1;
         match connector.connect(c, &cancel) {
@@ -101,13 +102,14 @@ pub fn boost_connect(
                     winner: c.clone(),
                     attempts,
                     wasted_bytes: 0,
-                    elapsed_ms: 0,
+                    elapsed_ms: start.elapsed().as_millis() as u64,
                 });
             }
             Err(e) => last_err = Some(e),
         }
     }
     // 顺序直连不统计浪费字节（诚实省略；竞速路径的 R4 语义由 connect_with_fallback 保持）。
+    // elapsed_ms 用 Instant 实测（含全部尝试耗时）。
     Err(last_err
         .unwrap_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty candidate list")))
 }
@@ -171,14 +173,13 @@ mod tests {
         pm.on_stats(&bad.remote_addr, stats(200));
         // 推进一次探测轮次以外的同步：on_stats 直接更新 EWMA，无需等待。
         let arr = [good.clone(), bad.clone()];
-        let sel = select_best(&pm, &arr, 1.0);
-        assert!(sel.best.is_some());
+        let sel = select_best(&pm, &arr, 1.0).expect("good path has a score");
         assert_eq!(sel.best.unwrap().remote_addr, good.remote_addr);
         assert!(sel.score.is_some());
         assert!(!sel.degraded, "好路径分数应高于阈值 1.0");
 
         // 阈值抬高 → degraded。
-        let sel2 = select_best(&pm, &arr, 1e9);
+        let sel2 = select_best(&pm, &arr, 1e9).expect("good path has a score");
         assert!(sel2.degraded);
     }
 
@@ -186,12 +187,9 @@ mod tests {
     fn select_best_all_unknown_returns_none() {
         let pm = PathManager::new(PathConfig::default());
         let c = candidate(PathKind::Direct, 9001);
-        // 未喂任何 stats → score() 为 None（S7）。
+        // 未喂任何 stats → score() 为 None（S7）→ select_best 返回 None。
         let arr = [c];
-        let sel = select_best(&pm, &arr, 1.0);
-        assert!(sel.best.is_none());
-        assert!(sel.score.is_none());
-        assert!(!sel.degraded);
+        assert!(select_best(&pm, &arr, 1.0).is_none());
     }
 
     #[test]
@@ -208,10 +206,12 @@ mod tests {
         let c = candidate(PathKind::Direct, 9001);
         pm.add_candidate(c.clone());
         pm.on_stats(&c.remote_addr, stats(20));
-        let before = pm.score(&c.remote_addr);
+        let before_score = pm.score(&c.remote_addr);
+        let before_current = pm.current_path().map(|p| p.remote_addr);
         let arr = [c];
         let _ = select_best(&pm, &arr, 1.0);
-        assert_eq!(pm.score(&arr[0].remote_addr), before);
+        assert_eq!(pm.score(&arr[0].remote_addr), before_score);
+        assert_eq!(pm.current_path().map(|p| p.remote_addr), before_current);
     }
 
     /// Fake connector：按预设延迟成功。
@@ -296,5 +296,39 @@ mod tests {
         let budget = RaceBudget::default();
         let err = boost_connect(&mut chain, &FailConnector, &budget, false).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+    }
+
+    /// 首个候选失败 → 第二个成功：attempts == 2，winner 为第二个。
+    struct FailThenOk {
+        fail_port: u16,
+    }
+
+    impl PathConnector for FailThenOk {
+        fn connect(&self, path: &CandidatePath, _cancel: &AtomicBool) -> io::Result<u64> {
+            if path.remote_addr.port() == self.fail_port {
+                return Err(io::Error::new(io::ErrorKind::ConnectionRefused, "refused"));
+            }
+            Ok(64)
+        }
+    }
+
+    #[test]
+    fn boost_connect_race_off_failover() {
+        use nexus_path::{FallbackConfig, ProxyEndpoint};
+        let mut chain = FallbackChain::expand(
+            &FallbackConfig {
+                proxy: Some(ProxyEndpoint { server: addr(9002) }),
+                turn: None,
+            },
+            addr(8000),
+            addr(9001),
+        );
+        assert_eq!(chain.candidates().len(), 2);
+        let budget = RaceBudget::default();
+        // Direct (9001) 失败 → Proxy (9002) 成功。
+        let out =
+            boost_connect(&mut chain, &FailThenOk { fail_port: 9001 }, &budget, false).unwrap();
+        assert_eq!(out.winner.kind, PathKind::Proxy);
+        assert_eq!(out.attempts, 2);
     }
 }
