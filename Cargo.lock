@@ -975,6 +975,8 @@ dependencies = [
  "nexus-outbound-shadowsocks",
  "nexus-outbound-trojan",
  "nexus-proxy-config",
+ "rustls",
+ "rustls-native-certs",
 ]
 
 [[package]]
@@ -1048,13 +1050,17 @@ version = "0.1.0"
 dependencies = [
  "nexus",
  "nexus-compute",
+ "nexus-connectivity",
  "nexus-control-api",
  "nexus-diagnostics",
  "nexus-discovery",
+ "nexus-dns",
  "nexus-ingress",
  "nexus-network",
+ "nexus-path",
  "nexus-platform",
  "nexus-platform-windows",
+ "nexus-projection",
  "nexus-proxy-config",
  "nexus-registry",
  "nexus-service",

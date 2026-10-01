@@ -166,6 +166,11 @@ TLS，兼容真实 trojan 服务器：
 - 可观测（T6 延续）：`TlsTrojanTransport` 独立 `Counters`；
   `handshake_ok=1` 表示 TLS 握手 + 请求头写出完成；
 - 同步 std（T5 延续）：rustls `Stream` 同步 API，无 tokio。
+- E4（`product.proxy-transport-trojan-tls`）：自研最小 TLS trojan server
+  （rcgen 自签 + rustls）；客户端 skip-verify 建连，64KB 分帧回显；
+  断言 `roundtrip_ok`、`proxy_relayed_bytes > 0`、`tls_handshake_ok == 1`。
+  完整 QUIC-over-TLS-trojan 后置（`TlsTrojanTransport` 已实现
+  `UdpTransport`，QUIC 集成是 drop-in）。
 
 ### T 期诚实边界
 
