@@ -19,9 +19,10 @@ use crate::auth::{derive_key, stamp_integrity, verify_integrity};
 use crate::stun::{
     self, is_channel_data, is_stun_message, valid_channel, Attribute, StunMessage,
     ALLOCATE_REQUEST, ALLOCATE_SUCCESS, ATTR_DATA, ATTR_ERROR_CODE, ATTR_LIFETIME, ATTR_NONCE,
-    ATTR_REALM, ATTR_XOR_PEER_ADDRESS, ATTR_XOR_RELAYED_ADDRESS, CHANNEL_BIND_REQUEST,
-    CHANNEL_BIND_SUCCESS, CREATE_PERMISSION_FAILURE, CREATE_PERMISSION_REQUEST,
-    CREATE_PERMISSION_SUCCESS, DATA_INDICATION, REFRESH_REQUEST, REFRESH_SUCCESS, SEND_INDICATION,
+    ATTR_REALM, ATTR_XOR_MAPPED_ADDRESS, ATTR_XOR_PEER_ADDRESS, ATTR_XOR_RELAYED_ADDRESS,
+    CHANNEL_BIND_REQUEST, CHANNEL_BIND_SUCCESS, CREATE_PERMISSION_FAILURE,
+    CREATE_PERMISSION_REQUEST, CREATE_PERMISSION_SUCCESS, DATA_INDICATION, REFRESH_REQUEST,
+    REFRESH_SUCCESS, SEND_INDICATION,
 };
 
 /// TURN 长效认证凭证。
@@ -74,6 +75,9 @@ struct ClientInner {
     key: [u8; 16],
     nonce: Option<String>,
     relayed: SocketAddr,
+    /// 服务器观察到的本端 reflexive 地址（Allocate 响应的 XOR-MAPPED-ADDRESS，
+    /// 打洞候选地址来源；NAT 后的真实出口）。
+    mapped: Option<SocketAddr>,
     expires_at: Instant,
     permissions: HashSet<SocketAddr>,
     channels: HashMap<SocketAddr, u16>,
@@ -110,6 +114,7 @@ impl TurnClient {
                 key,
                 nonce: None,
                 relayed: "127.0.0.1:0".parse().unwrap(),
+                mapped: None,
                 expires_at: Instant::now(),
                 permissions: HashSet::new(),
                 channels: HashMap::new(),
@@ -163,6 +168,10 @@ impl TurnClient {
             _ => DEFAULT_LIFETIME,
         };
         inner.relayed = relayed;
+        inner.mapped = match resp.get(ATTR_XOR_MAPPED_ADDRESS) {
+            Some(Attribute::XorMappedAddress(a)) => Some(*a),
+            _ => None,
+        };
         inner.expires_at = Instant::now() + lifetime;
         inner.stats.allocations.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -252,6 +261,12 @@ impl TurnClient {
         self.lock()
             .map(|g| g.relayed)
             .unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap())
+    }
+
+    /// 服务器观察到的本端 reflexive 地址（打洞候选）。
+    /// 无映射信息时返回 `None`（直连/旧服务端）。
+    pub fn mapped_addr(&self) -> Option<SocketAddr> {
+        self.lock().map(|g| g.mapped).unwrap_or(None)
     }
 
     /// 计数器快照。
@@ -560,6 +575,7 @@ mod tests {
             key: derive_key("u", "r", "p"),
             nonce: Some("n".into()),
             relayed: "127.0.0.1:0".parse().unwrap(),
+            mapped: None,
             expires_at: Instant::now() + DEFAULT_LIFETIME,
             permissions: HashSet::new(),
             channels: HashMap::new(),
@@ -589,6 +605,7 @@ mod tests {
                 key: [0u8; 16],
                 nonce: None,
                 relayed: "127.0.0.1:9999".parse().unwrap(),
+                mapped: None,
                 expires_at: Instant::now() + DEFAULT_LIFETIME,
                 permissions: HashSet::new(),
                 channels: HashMap::new(),
