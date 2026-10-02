@@ -217,7 +217,7 @@ fn run() -> Result<String, String> {
         .remote_addr;
 
     // --- PathLink: production linkage under test ---
-    let mut link = PathLink::new(pm);
+    let mut link = PathLink::new(Arc::new(Mutex::new(pm)));
     link.add_conn("b", conn_a.clone());
     link.map_peer_addr("b", addr(9001));
     link.map_peer_addr("b", addr(9002));
@@ -259,7 +259,10 @@ fn run() -> Result<String, String> {
             // Production path only: remove_candidate -> Switched -> pump() -> rebind().
             // (E4 must-use-production-path: no manual rebind() here.)
             received_at_switch = b_state.lock().unwrap().received;
-            link.manager_mut().remove_candidate(&active_addr);
+            link.manager()
+                .lock()
+                .unwrap()
+                .remove_candidate(&active_addr);
             link.pump();
             switched = true;
         }

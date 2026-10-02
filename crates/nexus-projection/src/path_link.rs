@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use nexus_fabric::{ConnShared, FabricConn};
 use nexus_path::{CandidatePath, PathEvent, PathKind, PathManager};
@@ -74,8 +74,14 @@ pub struct PeerConns {
 
 /// Owns a [`PathManager`] and drives [`FabricConn::rebind()`] on path
 /// switches (S27), plus NAT per-peer active-connection switching (D1).
+///
+/// The manager is shared (`Arc<Mutex<>>`) with the quality monitor
+/// (`nexus-nat-quality::QualityMonitor`), which supplies `on_stats` and —
+/// in production — is the sole drainer of [`PathManager::poll_event`]
+/// (see [`pump`](Self::pump)). Sharing by `Arc` (not `&mut`) is what lets
+/// the monitor thread and the composition root use the same manager.
 pub struct PathLink {
-    manager: PathManager,
+    manager: Arc<Mutex<PathManager>>,
     conns: HashMap<String, FabricConn>,
     /// NAT peers: peer name → multi-connection state (D1).
     nat_conns: HashMap<String, PeerConns>,
@@ -85,8 +91,10 @@ pub struct PathLink {
 }
 
 impl PathLink {
-    /// Create a link around an existing path manager.
-    pub fn new(manager: PathManager) -> Self {
+    /// Create a link around a shared path manager. The same `Arc` is handed
+    /// to `QualityMonitor::new` so supply (monitor) and selection (link)
+    /// operate on one manager.
+    pub fn new(manager: Arc<Mutex<PathManager>>) -> Self {
         Self {
             manager,
             conns: HashMap::new(),
@@ -119,7 +127,7 @@ impl PathLink {
             matches!(kind, PathKind::Turn | PathKind::Mesh),
             "relay candidate kind must be Turn or Mesh, got {kind:?}"
         );
-        self.manager.add_candidate(CandidatePath {
+        self.manager.lock().unwrap().add_candidate(CandidatePath {
             kind,
             local_addr: local,
             remote_addr: remote,
@@ -148,7 +156,7 @@ impl PathLink {
         local: SocketAddr,
         remote: SocketAddr,
     ) {
-        self.manager.add_candidate(CandidatePath {
+        self.manager.lock().unwrap().add_candidate(CandidatePath {
             kind: PathKind::Direct,
             local_addr: local,
             remote_addr: remote,
@@ -181,9 +189,10 @@ impl PathLink {
         self.addr_to_peer.insert(remote, peer.to_string());
     }
 
-    /// Access the owned path manager (to add/remove candidates, feed stats).
-    pub fn manager_mut(&mut self) -> &mut PathManager {
-        &mut self.manager
+    /// Access the shared path manager (to add/remove candidates, feed stats).
+    /// The composition root clones this `Arc` into `QualityMonitor::new`.
+    pub fn manager(&self) -> Arc<Mutex<PathManager>> {
+        Arc::clone(&self.manager)
     }
 
     /// Linkage counters (S27).
@@ -191,24 +200,31 @@ impl PathLink {
         &self.stats
     }
 
-    /// Stats supply contract (for the measurement layer / composition root):
+    /// Stats supply + event drain contract (T1↔T2 alignment, 2026-10-02):
     ///
-    /// - **Caller**: background measurement loop (Track 2), one tick per peer.
-    /// - **Frequency**: every `probe_interval_ms` (default 5s), or on-demand
-    ///   when a significant change is observed.
-    /// - **What**: for each candidate remote addr registered via
+    /// - **Supply**: `nexus-nat-quality::QualityMonitor` owns one probe
+    ///   endpoint per path; every tick it calls `on_stats(&addr, stats)`
+    ///   on the shared manager (`rtt_ms` = quinn real RTT, `loss_rate` =
+    ///   probe sliding window). A candidate with no stats has unknown score
+    ///   (S7) and never participates in selection — so a freshly punched
+    ///   direct path does NOT cause a switch until measured (frozen: punch
+    ///   only grants candidacy).
+    /// - **Candidate registration** happens in
     ///   [`register_nat_relay`](Self::register_nat_relay) /
-    ///   [`register_nat_direct`](Self::register_nat_direct), call
-    ///   `manager_mut().on_stats(&addr, stats)` with:
-    ///   - direct candidate: `rtt_ms` from the direct conn's QUIC RTT
-    ///     (Track 2 supplies `loss_rate`; until then the candidate stays
-    ///     unscored and never wins — S7).
-    ///   - relay candidate: same from the relay conn.
-    /// - A candidate with no stats has unknown score (S7) and never
-    ///   participates in selection — so a freshly punched direct path does
-    ///   NOT cause a switch until measured (frozen: punch only grants candidacy).
+    ///   [`register_nat_direct`](Self::register_nat_direct); the monitor's
+    ///   `add_path` re-registers the same key, which is idempotent
+    ///   (`PathManager::add_candidate` keeps `added_at`; the EWMA reset is
+    ///   harmless because production calls both back-to-back before any
+    ///   stats arrive).
+    /// - **Single drainer**: in production the monitor's tick drains
+    ///   `poll_event()` and forwards to its `PathEventSink`; the sink (built
+    ///   by the composition root, holding `Arc<Mutex<PathLink>>`) delegates
+    ///   to [`handle_event`](Self::handle_event). Do NOT call `pump()` when
+    ///   a monitor is attached — two drainers would race for events.
+    ///   `pump()` remains for contexts without a monitor (unit tests,
+    ///   legacy manual driving).
     ///
-    /// Drain `poll_event()`; on `Switched{to, ..}`:
+    /// On `Switched{to, ..}` ([`handle_event`](Self::handle_event)):
     /// - NAT peer (in `nat_conns`): flip the active connection —
     ///   [`PathKind::Direct`] → Direct (if registered), [`PathKind::Turn`] |
     ///   [`PathKind::Mesh`] → Relay. [`PathKind::Proxy`] is ignored (NAT
@@ -218,45 +234,57 @@ impl PathLink {
     ///   Failures are counted and the old connection is kept usable;
     ///   unmapped peers are counted and ignored.
     pub fn pump(&mut self) {
-        while let Some(event) = self.manager.poll_event() {
-            let PathEvent::Switched { to, .. } = event;
-            let peer = match self.addr_to_peer.get(&to.remote_addr) {
-                Some(peer) => peer.clone(),
-                None => {
-                    self.stats.path_rebind_no_conn += 1;
-                    continue;
-                }
-            };
-            // D1: NAT peer -> flip active connection, never rebind.
-            if let Some(conns) = self.nat_conns.get_mut(&peer) {
-                match to.kind {
-                    PathKind::Direct => {
-                        if conns.direct.is_some() {
-                            conns.active = ActiveConn::Direct;
-                            self.stats.path_active_switches += 1;
-                        } else {
-                            // Defensive: candidate raced ahead of conn handoff.
-                            self.stats.path_active_switch_no_direct += 1;
-                        }
-                    }
-                    PathKind::Turn | PathKind::Mesh => {
-                        conns.active = ActiveConn::Relay;
+        loop {
+            let event = self.manager.lock().unwrap().poll_event();
+            match event {
+                Some(e) => self.handle_event(e),
+                None => break,
+            }
+        }
+    }
+
+    /// Handle one [`PathEvent::Switched`] (shared by [`pump`](Self::pump)
+    /// and the production monitor sink). `pub` so the composition root's
+    /// `PathEventSink` impl can delegate without reimplementing the
+    /// NAT-flip / legacy-rebind policy.
+    pub fn handle_event(&mut self, event: PathEvent) {
+        let PathEvent::Switched { to, .. } = event;
+        let peer = match self.addr_to_peer.get(&to.remote_addr) {
+            Some(peer) => peer.clone(),
+            None => {
+                self.stats.path_rebind_no_conn += 1;
+                return;
+            }
+        };
+        // D1: NAT peer -> flip active connection, never rebind.
+        if let Some(conns) = self.nat_conns.get_mut(&peer) {
+            match to.kind {
+                PathKind::Direct => {
+                    if conns.direct.is_some() {
+                        conns.active = ActiveConn::Direct;
                         self.stats.path_active_switches += 1;
-                    }
-                    PathKind::Proxy => {
-                        // NAT never registers proxy candidates; ignore.
+                    } else {
+                        // Defensive: candidate raced ahead of conn handoff.
+                        self.stats.path_active_switch_no_direct += 1;
                     }
                 }
-                continue;
+                PathKind::Turn | PathKind::Mesh => {
+                    conns.active = ActiveConn::Relay;
+                    self.stats.path_active_switches += 1;
+                }
+                PathKind::Proxy => {
+                    // NAT never registers proxy candidates; ignore.
+                }
             }
-            // S27: legacy single-connection peer -> rebind.
-            match self.conns.get(&peer) {
-                Some(conn) => match conn.rebind() {
-                    Ok(()) => self.stats.path_rebinds += 1,
-                    Err(_) => self.stats.path_rebind_errors += 1,
-                },
-                None => self.stats.path_rebind_no_conn += 1,
-            }
+            return;
+        }
+        // S27: legacy single-connection peer -> rebind.
+        match self.conns.get(&peer) {
+            Some(conn) => match conn.rebind() {
+                Ok(()) => self.stats.path_rebinds += 1,
+                Err(_) => self.stats.path_rebind_errors += 1,
+            },
+            None => self.stats.path_rebind_no_conn += 1,
         }
     }
 }
@@ -370,11 +398,11 @@ mod tests {
         }
         let (conn_a, _conn_b) = quic_pair().expect("real QUIC pair");
         let (pm, active) = manager_two_paths();
-        let mut link = PathLink::new(pm);
+        let mut link = PathLink::new(Arc::new(Mutex::new(pm)));
         link.add_conn("b", conn_a);
         link.map_peer_addr("b", addr(9001));
         link.map_peer_addr("b", addr(9002));
-        link.manager_mut().remove_candidate(&active);
+        link.manager().lock().unwrap().remove_candidate(&active);
         link.pump();
         assert_eq!(link.stats().path_rebinds, 1);
         assert_eq!(link.stats().path_rebind_errors, 0);
@@ -405,11 +433,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         let (pm, active) = manager_two_paths();
-        let mut link = PathLink::new(pm);
+        let mut link = PathLink::new(Arc::new(Mutex::new(pm)));
         link.add_conn("b", conn_a);
         link.map_peer_addr("b", addr(9001));
         link.map_peer_addr("b", addr(9002));
-        link.manager_mut().remove_candidate(&active);
+        link.manager().lock().unwrap().remove_candidate(&active);
         link.pump();
         assert_eq!(link.stats().path_rebinds, 0);
         assert_eq!(link.stats().path_rebind_errors, 1);
@@ -419,9 +447,9 @@ mod tests {
     fn unmapped_peer_ignored_and_counted() {
         // S27: Switched for a peer with no conn mapping -> counted, ignored.
         let (pm, active) = manager_two_paths();
-        let mut link = PathLink::new(pm);
+        let mut link = PathLink::new(Arc::new(Mutex::new(pm)));
         // Deliberately no add_conn / map_peer_addr.
-        link.manager_mut().remove_candidate(&active);
+        link.manager().lock().unwrap().remove_candidate(&active);
         link.pump();
         assert_eq!(link.stats().path_rebind_no_conn, 1);
         assert_eq!(link.stats().path_rebinds, 0);
@@ -434,7 +462,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     use nexus_fabric::{ConnShared, Driver};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     /// Real Arc<ConnShared> pair over UDP loopback (Driver-level, bypasses
     /// FabricConn which does not expose its inner Arc).
@@ -462,11 +490,11 @@ mod tests {
             Some(p) => p,
             None => return,
         };
-        let mut link = PathLink::new(PathManager::new(test_config()));
+        let mut link = PathLink::new(Arc::new(Mutex::new(PathManager::new(test_config()))));
         link.register_nat_relay("peer-a", relay, PathKind::Turn, addr(8000), addr(9001));
         assert_eq!(link.nat_active("peer-a"), Some(ActiveConn::Relay));
         // Direct not yet registered: no Direct candidate.
-        assert!(link.manager_mut().score(&addr(9002)).is_none());
+        assert!(link.manager().lock().unwrap().score(&addr(9002)).is_none());
         link.register_nat_direct("peer-a", direct, addr(8000), addr(9002));
         // Both candidates exist; relay still active until stats + switch.
         assert_eq!(link.nat_active("peer-a"), Some(ActiveConn::Relay));
@@ -479,11 +507,11 @@ mod tests {
             Some(p) => p,
             None => return,
         };
-        let mut link = PathLink::new(PathManager::new(test_config()));
+        let mut link = PathLink::new(Arc::new(Mutex::new(PathManager::new(test_config()))));
         link.register_nat_relay("peer-a", relay, PathKind::Turn, addr(8000), addr(9001));
         link.register_nat_direct("peer-a", direct, addr(8000), addr(9002));
         // Score direct much better than TURN; drain setup events.
-        link.manager_mut().on_stats(
+        link.manager().lock().unwrap().on_stats(
             &addr(9001),
             PathStats {
                 rtt_ms: Some(300),
@@ -491,7 +519,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        link.manager_mut().on_stats(
+        link.manager().lock().unwrap().on_stats(
             &addr(9002),
             PathStats {
                 rtt_ms: Some(50),
@@ -499,10 +527,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        while link.manager_mut().poll_event().is_some() {}
+        while link.manager().lock().unwrap().poll_event().is_some() {}
         // Degrade TURN hard -> Switched to Direct.
         for _ in 0..5 {
-            link.manager_mut().on_stats(
+            link.manager().lock().unwrap().on_stats(
                 &addr(9001),
                 PathStats {
                     rtt_ms: Some(2000),
@@ -510,7 +538,7 @@ mod tests {
                     ..Default::default()
                 },
             );
-            link.manager_mut().on_stats(
+            link.manager().lock().unwrap().on_stats(
                 &addr(9002),
                 PathStats {
                     rtt_ms: Some(50),
@@ -533,11 +561,11 @@ mod tests {
             Some(p) => p,
             None => return,
         };
-        let mut link = PathLink::new(PathManager::new(test_config()));
+        let mut link = PathLink::new(Arc::new(Mutex::new(PathManager::new(test_config()))));
         link.register_nat_relay("peer-a", relay, PathKind::Turn, addr(8000), addr(9001));
         link.register_nat_direct("peer-a", direct, addr(8000), addr(9002));
         // Direct active first.
-        link.manager_mut().on_stats(
+        link.manager().lock().unwrap().on_stats(
             &addr(9001),
             PathStats {
                 rtt_ms: Some(300),
@@ -545,7 +573,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        link.manager_mut().on_stats(
+        link.manager().lock().unwrap().on_stats(
             &addr(9002),
             PathStats {
                 rtt_ms: Some(50),
@@ -553,9 +581,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        while link.manager_mut().poll_event().is_some() {}
+        while link.manager().lock().unwrap().poll_event().is_some() {}
         for _ in 0..5 {
-            link.manager_mut().on_stats(
+            link.manager().lock().unwrap().on_stats(
                 &addr(9001),
                 PathStats {
                     rtt_ms: Some(2000),
@@ -567,9 +595,9 @@ mod tests {
         link.pump();
         assert_eq!(link.nat_active("peer-a"), Some(ActiveConn::Direct));
         // Now degrade direct -> back to relay.
-        while link.manager_mut().poll_event().is_some() {}
+        while link.manager().lock().unwrap().poll_event().is_some() {}
         for _ in 0..5 {
-            link.manager_mut().on_stats(
+            link.manager().lock().unwrap().on_stats(
                 &addr(9002),
                 PathStats {
                     rtt_ms: Some(2000),
@@ -577,7 +605,7 @@ mod tests {
                     ..Default::default()
                 },
             );
-            link.manager_mut().on_stats(
+            link.manager().lock().unwrap().on_stats(
                 &addr(9001),
                 PathStats {
                     rtt_ms: Some(300),
@@ -599,18 +627,18 @@ mod tests {
             Some(p) => p,
             None => return,
         };
-        let mut link = PathLink::new(PathManager::new(test_config()));
+        let mut link = PathLink::new(Arc::new(Mutex::new(PathManager::new(test_config()))));
         link.register_nat_relay("peer-a", relay, PathKind::Turn, addr(8000), addr(9001));
         // Manually add a Direct candidate with no direct conn (simulates
         // a race between candidate registration and conn handoff).
-        link.manager_mut().add_candidate(CandidatePath {
+        link.manager().lock().unwrap().add_candidate(CandidatePath {
             kind: PathKind::Direct,
             local_addr: addr(8000),
             remote_addr: addr(9002),
             cost: 0.0,
         });
         link.map_peer_addr("peer-a", addr(9002));
-        link.manager_mut().on_stats(
+        link.manager().lock().unwrap().on_stats(
             &addr(9001),
             PathStats {
                 rtt_ms: Some(2000),
@@ -618,7 +646,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        link.manager_mut().on_stats(
+        link.manager().lock().unwrap().on_stats(
             &addr(9002),
             PathStats {
                 rtt_ms: Some(50),
