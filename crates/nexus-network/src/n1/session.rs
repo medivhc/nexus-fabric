@@ -195,7 +195,10 @@ mod tests {
     use super::*;
     use crate::n1::link::LinkConfig;
     use std::net::SocketAddr;
+    use std::sync::Condvar;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::Duration;
 
     struct FakeConn {
         peer: N1PeerId,
@@ -363,5 +366,135 @@ mod tests {
         let p = peer_id(5);
         assert_eq!(m.dial(&p), Err(N1Error::PeerUnknown));
         assert!(m.peers().is_empty());
+    }
+
+    /// E-3 回归：watcher 阻塞在 `open_keepalive()` 时，`remove()` 必须先
+    /// `conn.close()` 打断阻塞再 join。旧顺序（先 `w.shutdown()` join、后
+    /// `conn.close()`）在此测试下永久 hang：主线程等 watcher 退出，
+    /// watcher 等 close 打断阻塞，形成 join/close 循环等待。
+    ///
+    /// 替身忠实复现真实语义：`open_keepalive` 阻塞直到 `close()`（trait 契约：
+    /// "关闭连接；阻塞中的调用必须随之返回 Closed"）。
+    struct HangingKeepaliveConn {
+        peer: N1PeerId,
+        id: u64,
+        closed: Mutex<bool>,
+        cv: Condvar,
+        entered: Arc<AtomicBool>,
+    }
+
+    impl HangingKeepaliveConn {
+        fn new(peer: N1PeerId, id: u64, entered: Arc<AtomicBool>) -> Self {
+            Self {
+                peer,
+                id,
+                closed: Mutex::new(false),
+                cv: Condvar::new(),
+                entered,
+            }
+        }
+    }
+
+    impl N1Connection for HangingKeepaliveConn {
+        fn send_datagram(&self, _data: &[u8]) -> Result<(), N1Error> {
+            Ok(())
+        }
+        fn recv_datagram(&self) -> Result<Vec<u8>, N1Error> {
+            Err(N1Error::Closed)
+        }
+        fn open_keepalive(&self) -> Result<super::super::N1KeepaliveStream, N1Error> {
+            // watcher 进入阻塞点的确定性信号：测试等它置位后再调 remove，
+            // 否则旧顺序可能因"watcher 还没跑到阻塞点"而偶然通过。
+            self.entered.store(true, Ordering::SeqCst);
+            let guard = self.closed.lock().unwrap();
+            let _guard = self.cv.wait_while(guard, |c| !*c).unwrap();
+            Err(N1Error::Closed)
+        }
+        fn accept_keepalive(&self) -> Result<super::super::N1KeepaliveStream, N1Error> {
+            // responder 线程用：立即 Closed 让它快速退出，不干扰回归判定。
+            Err(N1Error::Closed)
+        }
+        fn rebind(&self) -> Result<(), N1Error> {
+            Ok(())
+        }
+        fn connection_id(&self) -> u64 {
+            self.id
+        }
+        fn peer(&self) -> N1PeerId {
+            self.peer
+        }
+        fn close(&self) {
+            *self.closed.lock().unwrap() = true;
+            self.cv.notify_all();
+        }
+    }
+
+    struct HangingDialer {
+        entered: Arc<AtomicBool>,
+    }
+
+    impl N1Dialer for HangingDialer {
+        fn dial(
+            &self,
+            peer: &N1PeerId,
+            addrs: &[SocketAddr],
+        ) -> Result<Box<dyn N1Connection>, N1Error> {
+            if addrs.is_empty() {
+                return Err(N1Error::PeerUnknown);
+            }
+            Ok(Box::new(HangingKeepaliveConn::new(
+                *peer,
+                1,
+                Arc::clone(&self.entered),
+            )))
+        }
+    }
+
+    #[test]
+    fn remove_wakes_watcher_blocked_in_open_keepalive() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let m = Arc::new(N1SessionManager::new(
+            Arc::new(HangingDialer {
+                entered: Arc::clone(&entered),
+            }),
+            Arc::new(FakeDiscovery),
+            Arc::new(NullSink),
+            LinkConfig {
+                probe_interval: Duration::from_secs(3600),
+                heartbeat_timeout: Duration::from_secs(3600),
+                enable_rebind: false,
+                enable_watcher: true,
+            },
+        ));
+        let p = peer_id(5);
+        m.dial(&p).unwrap();
+        // 确定性等待：watcher 已进入 open_keepalive 阻塞，再调 remove。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !entered.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            entered.load(Ordering::SeqCst),
+            "watcher 未进入 open_keepalive 阻塞，测试前置条件不成立"
+        );
+
+        // watchdog：hang 翻译成测试失败，而不是把整个 test 二进制卡死。
+        let done = Arc::new(AtomicBool::new(false));
+        let done_c = Arc::clone(&done);
+        let m_c = Arc::clone(&m);
+        let handle = thread::spawn(move || {
+            m_c.remove(&p);
+            done_c.store(true, Ordering::SeqCst);
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            done.load(Ordering::SeqCst),
+            "E-3: remove() hung with watcher blocked in open_keepalive"
+        );
+        handle.join().unwrap();
+        assert!(m.connection_for(&p).is_none());
     }
 }
