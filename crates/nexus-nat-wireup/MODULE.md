@@ -29,6 +29,11 @@
 ## Forbidden Dependencies
 第三方新依赖；tokio；`nexus-path` 的写入式接入（只读登记）。
 
+> 范围澄清（2026-10-02）：以上禁令约束 `src/` 实现。`examples/e4_prod_switch.rs`
+> 作为 E4 验证，为接线完整切换栈（PathLink + QualityMonitor）可依赖
+> `nexus-nat-quality` / `nexus-path` / `nexus-projection`（dev-dependencies），
+> 实现代码仍不许触碰。
+
 ## Invariants
 - 打洞包永远从 punch driver 的同一 UDP socket 发出。
 - `run()` 的 `Migrated` 语义：直连 QUIC 握手已完成（`Driver::connect`

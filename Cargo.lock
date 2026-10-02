@@ -839,7 +839,10 @@ version = "0.1.0"
 dependencies = [
  "nexus-connectivity",
  "nexus-fabric",
+ "nexus-nat-quality",
  "nexus-nat-traversal",
+ "nexus-path",
+ "nexus-projection",
  "nexus-turn",
 ]
 
