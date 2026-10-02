@@ -850,4 +850,97 @@ mod tests {
         assert!(pm.current_path().is_none());
         assert_eq!(pm.score(&addr(9999)), None);
     }
+
+    // ------------------------------------------------------------------
+    // NAT frozen contract regression (D2): PathManager is the single
+    // racing implementation. These tests are the rewritten equivalents
+    // of nexus-nat-traversal/src/race.rs's contract tests (race.rs
+    // retired; kind mapping DirectP2P->Direct, TurnRelay->Turn,
+    // PeerRelay->Mesh). Frozen: 20% threshold + hold; punch success only
+    // grants candidacy.
+    // ------------------------------------------------------------------
+
+    /// Frozen 20% threshold (contract 6ab671a04d061b16); hold accelerated
+    /// for test speed (threshold is the asserted semantic, not the hold).
+    fn nat_config() -> PathConfig {
+        PathConfig {
+            hysteresis_pct: 0.20,
+            switch_hold_ms: 100,
+            probe_interval_ms: 60_000,
+            ewma_alpha: 1.0,
+            max_missed_probes: 3,
+            race_budget: RaceBudget::default(),
+        }
+    }
+
+    /// User-required semantic (was race.rs `peer_relay_beats_direct`):
+    /// a successful punch only makes direct *a candidate*. Direct scores
+    /// ~8.3% better than the current peer-relay (Mesh) path — below the
+    /// 20% threshold — so we must NOT switch.
+    #[test]
+    fn nat_peer_relay_beats_direct() {
+        let mut pm = PathManager::new(nat_config());
+        pm.add_candidate(candidate(PathKind::Mesh, 9001, 2.0)); // peer relay
+        pm.add_candidate(candidate(PathKind::Direct, 9002, 0.0)); // punched
+        pm.on_stats(&addr(9001), stats(60, 0.0));
+        assert_eq!(pm.current_path().unwrap().kind, PathKind::Mesh);
+        // Direct ~8.3% better by PathManager score: hold elapses, still
+        // below threshold -> pinned.
+        pm.on_stats(&addr(9002), stats(45, 0.0));
+        thread::sleep(Duration::from_millis(150));
+        pm.on_stats(&addr(9002), stats(45, 0.0));
+        pm.on_stats(&addr(9001), stats(60, 0.0));
+        assert_eq!(
+            pm.current_path().unwrap().kind,
+            PathKind::Mesh,
+            "frozen contract violated: switched to direct on a sub-threshold (8.3%) margin"
+        );
+        assert!(pm.poll_event().is_none());
+    }
+
+    /// Was race.rs `direct_wins_when_much_better`: a much-better direct
+    /// path wins once threshold + hold pass.
+    #[test]
+    fn nat_direct_wins_when_much_better() {
+        let mut pm = PathManager::new(nat_config());
+        pm.add_candidate(candidate(PathKind::Turn, 9001, 5.0)); // TURN relay
+        pm.add_candidate(candidate(PathKind::Direct, 9002, 0.0)); // punched
+        pm.on_stats(&addr(9001), stats(300, 0.01));
+        pm.on_stats(&addr(9002), stats(50, 0.0));
+        assert_eq!(pm.current_path().unwrap().kind, PathKind::Turn);
+        // ~30% better: hold, then switch.
+        thread::sleep(Duration::from_millis(150));
+        pm.on_stats(&addr(9002), stats(50, 0.0));
+        pm.on_stats(&addr(9001), stats(300, 0.01));
+        assert_eq!(
+            pm.current_path().unwrap().kind,
+            PathKind::Direct,
+            "direct should win once 20% + hold are satisfied"
+        );
+        match pm.poll_event() {
+            Some(PathEvent::Switched { to, .. }) => {
+                assert_eq!(to.kind, PathKind::Direct);
+            }
+            other => panic!("expected Switched to Direct, got {other:?}"),
+        }
+    }
+
+    /// Was race.rs `no_switch_within_hysteresis`: margin met but hold not
+    /// elapsed -> still pinned.
+    #[test]
+    fn nat_no_switch_before_hold_elapses() {
+        let mut cfg = nat_config();
+        cfg.switch_hold_ms = 10_000; // long hold
+        let mut pm = PathManager::new(cfg);
+        pm.add_candidate(candidate(PathKind::Turn, 9001, 5.0));
+        pm.add_candidate(candidate(PathKind::Direct, 9002, 0.0));
+        pm.on_stats(&addr(9001), stats(300, 0.01));
+        pm.on_stats(&addr(9002), stats(50, 0.0)); // ~30% better, hold starts
+        pm.on_stats(&addr(9001), stats(300, 0.01));
+        assert_eq!(
+            pm.current_path().unwrap().kind,
+            PathKind::Turn,
+            "frozen contract violated: switched before hold elapsed"
+        );
+    }
 }

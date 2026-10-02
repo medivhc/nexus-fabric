@@ -45,6 +45,7 @@ members = [
   "crates/nexus-turn",
   "crates/nexus-nat-traversal",
   "crates/nexus-nat-wireup",
+  "crates/nexus-nat-quality",
   "engineering/nexus-harness",
 ]
 

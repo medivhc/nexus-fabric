@@ -819,6 +819,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-nat-quality"
+version = "0.1.0"
+dependencies = [
+ "nexus-fabric",
+ "nexus-path",
+]
+
+[[package]]
 name = "nexus-nat-traversal"
 version = "0.1.0"
 dependencies = [
@@ -831,7 +839,10 @@ version = "0.1.0"
 dependencies = [
  "nexus-connectivity",
  "nexus-fabric",
+ "nexus-nat-quality",
  "nexus-nat-traversal",
+ "nexus-path",
+ "nexus-projection",
  "nexus-turn",
 ]
 
@@ -1084,7 +1095,11 @@ dependencies = [
  "nexus-diagnostics",
  "nexus-discovery",
  "nexus-dns",
+ "nexus-fabric",
  "nexus-ingress",
+ "nexus-nat-quality",
+ "nexus-nat-traversal",
+ "nexus-nat-wireup",
  "nexus-network",
  "nexus-outbound-trojan",
  "nexus-path",
