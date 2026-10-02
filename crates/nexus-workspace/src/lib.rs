@@ -2403,6 +2403,43 @@ impl<S: ContentStore> Workspace<S> {
                 fetched_objects += 1;
             }
         }
+        // C2-P3：拉取 manifest 引用的文件对象（manifest 已到手后，按需请求缺失的）。
+        // 稀疏模式下只拉 path_wanted 的（replica_policy 已更新）。
+        let mut want_files: Vec<String> = Vec::new();
+        for c in self.commits.values() {
+            if let Ok(manifest) = self.load_manifest(&c.root_manifest_id) {
+                for (path, oid) in &manifest.entries {
+                    if !opts.sparse_paths.is_empty()
+                        && !opts.sparse_paths.iter().any(|p| path.starts_with(p))
+                    {
+                        continue;
+                    }
+                    let oid_str = oid.0.clone();
+                    if self
+                        .store
+                        .contains(oid)
+                        .map_err(|reason| WorkspaceError::StoreFailure { reason })?
+                    {
+                        continue;
+                    }
+                    if !want_files.contains(&oid_str) {
+                        want_files.push(oid_str);
+                    }
+                }
+            }
+        }
+        if !want_files.is_empty() {
+            transport.send_frame(format!("WANT-OBJECTS:{}", want_files.join(",")).as_bytes())?;
+            let n = Self::recv_count(transport, "OBJECTS:")?;
+            for _ in 0..n {
+                let (id, bytes) = Self::recv_object_chunks(transport)?;
+                self.store
+                    .put(&bytes)
+                    .map_err(|reason| WorkspaceError::StoreFailure { reason })?;
+                let _ = id;
+                fetched_objects += 1;
+            }
+        }
         // C2-P5/D7：conflict 状态交换（在 merge 之前，让 D7 规则先收敛）。
         let remote_conflicts = Self::exchange_conflicts(transport)?;
         let adopted = self.apply_remote_resolutions(&remote_conflicts)?;
@@ -3653,7 +3690,8 @@ mod sync_transport_tests {
         // B（空）从 A 拉取。
         let (report, b) = run_sync(&mut b, a);
         assert!(report.fetched_commits >= 1, "report: {report:?}");
-        assert_eq!(report.fetched_objects, 1);
+        // C2-P3：manifest + 文件对象都拉取（2 个）。
+        assert_eq!(report.fetched_objects, 2, "report: {report:?}");
         // B 拿到了 H_A。
         assert!(b.commit(&h_a).is_some(), "B should have H_A");
         // manifest 字节完整（分块重组正确）。
