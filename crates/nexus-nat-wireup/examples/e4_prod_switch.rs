@@ -252,14 +252,28 @@ fn xfer_write(s: &Arc<StreamShared>, data: &[u8]) -> io::Result<()> {
 }
 
 fn xfer_read(s: &Arc<StreamShared>) -> io::Result<Vec<u8>> {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    xfer_read_deadline(s, Duration::from_secs(30))
+}
+
+fn xfer_read_deadline(s: &Arc<StreamShared>, timeout: Duration) -> io::Result<Vec<u8>> {
+    let deadline = Instant::now() + timeout;
     let mut lenb = [0u8; 4];
     nexus_nat_wireup::channel::read_exact_deadline(s, &mut lenb, deadline)?;
     let len = u32::from_be_bytes(lenb) as usize;
+    if len > 4 * 1024 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chunk too large",
+        ));
+    }
     let mut buf = vec![0u8; len];
     nexus_nat_wireup::channel::read_exact_deadline(s, &mut buf, deadline)?;
     Ok(buf)
 }
+
+/// Transfer magic: distinguishes production chunks from punch/BIND streams
+/// that share the direct conn.
+const XFER_MAGIC: &[u8; 4] = b"NXTF";
 
 /// Signal end-of-stream so the QUIC stream slot is retired (both sides must
 /// FIN; otherwise the 100-stream concurrent limit is hit).
@@ -727,8 +741,9 @@ fn run_transfer(stack_a: &Arc<Stack>, id_b: FabricPeerId, relay_id: u64) -> Xfer
         for i in 0..CHUNKS_PER_BATCH {
             let seq = (b * CHUNKS_PER_BATCH + i) as u64;
             let mut payload = vec![0u8; CHUNK_SIZE];
-            payload[..8].copy_from_slice(&seq.to_be_bytes());
-            for (j, x) in payload[8..].iter_mut().enumerate() {
+            payload[..4].copy_from_slice(XFER_MAGIC);
+            payload[4..12].copy_from_slice(&seq.to_be_bytes());
+            for (j, x) in payload[12..].iter_mut().enumerate() {
                 *x = ((seq as usize + j) % 251) as u8;
             }
             if xfer_write(&s, &payload).is_err() {
