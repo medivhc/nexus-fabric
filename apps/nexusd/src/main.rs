@@ -261,26 +261,6 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         .clone()
         .map(|b| b as Arc<dyn nexus_network::n1::bridge::N1Sender>);
 
-    // 3.5. C1：Workspace 生产接线（Linux only）。workspace.toml 存在即启用；
-    // 缺失 → 跳过（D1）；挂载失败 → 拒绝启动（fail-fast，诚实）。
-    #[cfg(target_os = "linux")]
-    if let Some(text) = loaded.workspace_toml.as_deref() {
-        match nexusd::workspace::WorkspaceManager::start(std::path::Path::new(config_dir), text) {
-            Ok(mgr) => {
-                if !mgr.fuse_available {
-                    eprintln!("[nexusd] workspace subsystem disabled (no /dev/fuse)");
-                }
-                let _ = WORKSPACE_MGR.set(std::sync::Mutex::new(Some(mgr)));
-            }
-            Err(e) => {
-                eprintln!(
-                    "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"WORKSPACE\",\"message\":\"workspace mount failed: {e}\"}}}}"
-                );
-                return ExitCode::from(1);
-            }
-        }
-    }
-
     // 4. 统一数据面线程（D1：单个 TUN 由 nexusd 持有；TUN 创建失败则线程内降级）。
     //    T2：[tun].enabled=false 时跳过 TUN/数据面（no-tun 模式）。
     let tun_name = loaded.daemon.tun.name.clone();
@@ -328,6 +308,28 @@ fn run_daemon(config_dir: &str) -> ExitCode {
                 "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"localapi did not start\"}}}}"
             );
             return ExitCode::from(1);
+        }
+    }
+
+    // 5.5. C1：Workspace 生产接线（Linux only）。放在 LocalAPI 就绪之后：
+    // F7：同配置双启动时，第二个 daemon 在 LocalAPI 端口冲突处先失败退出，
+    // 不会走到这里 unmount 第一个 daemon 的活挂载。workspace.toml 缺失 → 跳过（D1）；
+    // 挂载失败 → 拒绝启动（fail-fast，诚实）。
+    #[cfg(target_os = "linux")]
+    if let Some(text) = loaded.workspace_toml.as_deref() {
+        match nexusd::workspace::WorkspaceManager::start(std::path::Path::new(config_dir), text) {
+            Ok(mgr) => {
+                if !mgr.fuse_available {
+                    eprintln!("[nexusd] workspace subsystem disabled (no /dev/fuse)");
+                }
+                let _ = WORKSPACE_MGR.set(std::sync::Mutex::new(Some(mgr)));
+            }
+            Err(e) => {
+                eprintln!(
+                    "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"WORKSPACE\",\"message\":\"workspace mount failed: {e}\"}}}}"
+                );
+                return ExitCode::from(1);
+            }
         }
     }
 

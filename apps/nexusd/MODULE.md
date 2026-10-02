@@ -315,6 +315,8 @@ cargo clippy -p nexusd --all-targets -- -D warnings
 - **D5（提交语义）**：不自动提交；`nexus workspace commit <id>` 经 LocalAPI
   `GET /localapi/v0/workspace/commit/<id>`；可选定时自动提交（默认关）。
   unmount/shutdown 时 WorkingSet 脏 → warn，**不静默提交**。
+  R3：未 commit 的 WorkingSet 数据 daemon 重启即丢——写进挂载点 ≠ 持久化，
+  只有 commit 后的数据才 crash-safe。
 - **D6（orphan 清理）**：启动时每个挂载点先 `fusermount -u` 幂等清理；
   仍挂载（busy）则 `-uz`（lazy）。T4 合入后收敛进统一 `boot_reconcile`。
 - **D7（关闭顺序）**：LocalAPI → Workspace unmount → Dataplane → N1 → TUN。

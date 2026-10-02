@@ -727,6 +727,9 @@ pub fn cleanup_orphan_mount(mountpoint: &Path) {
 }
 
 /// True if `mountpoint` appears in `/proc/mounts`.
+///
+/// F6：`/proc/mounts` 对挂载点中的特殊字符做转义（空格→`\040` 等）；
+/// 比较前做反转义，否则含空格的显式 mountpoint 会误判。
 pub fn is_mounted(mountpoint: &Path) -> bool {
     let target = mountpoint.to_string_lossy();
     std::fs::read_to_string("/proc/mounts")
@@ -734,11 +737,18 @@ pub fn is_mounted(mountpoint: &Path) -> bool {
             text.lines().any(|line| {
                 line.split_whitespace()
                     .nth(1)
-                    .map(|mp| mp == target)
+                    .map(|mp| unescape_mount(mp) == target)
                     .unwrap_or(false)
             })
         })
         .unwrap_or(false)
+}
+
+/// 反转义 `/proc/mounts` 的挂载点字段（`\040` 空格、`\012` 换行、`\134` 反斜杠）。
+fn unescape_mount(s: &str) -> String {
+    s.replace("\\040", " ")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
 }
 
 #[cfg(test)]

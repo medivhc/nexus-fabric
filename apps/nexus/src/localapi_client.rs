@@ -295,6 +295,25 @@ mod tests {
     }
 
     #[test]
+    fn workspace_commit_has_dynamic_route() {
+        // F12：CLI `nexus workspace commit <id>` 的动态路由映射（单元层；
+        // 端到端走 E4 的 LocalAPI HTTP 路径）。
+        assert_eq!(
+            route_for_dynamic(&ControlCommand::WorkspaceCommit {
+                workspace: "ws1".into()
+            }),
+            Some("/localapi/v0/workspace/commit/ws1".to_string())
+        );
+        assert_eq!(
+            route_for(&ControlCommand::WorkspaceCommit {
+                workspace: "ws1".into()
+            }),
+            None
+        );
+        assert_eq!(route_for_dynamic(&ControlCommand::Status), None);
+    }
+
+    #[test]
     fn run_has_no_route_stays_inprocess() {
         assert!(
             route_for(&ControlCommand::Run {

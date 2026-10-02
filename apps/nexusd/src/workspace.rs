@@ -126,19 +126,31 @@ fn atomic_write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 /// 单个已挂载 workspace 的可共享句柄（commit 路径；`FuseWorkspaceFs` 内部已有锁）。
+///
+/// F3：`commit_mu` 串行化"commit → 写锚文件"两步，防止 LocalAPI commit 线程与
+/// auto-commit 线程交错导致锚点回退（T1 写 H2 锚点覆盖 T2 的 H3 锚点）。
 #[derive(Clone)]
 struct WorkspaceHandle {
     fs: FuseWorkspaceFs,
     state_root_path: PathBuf,
+    commit_mu: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 impl WorkspaceHandle {
-    /// 提交暂存变更 → 更新 state_root 锚文件 → 返回新 head。
     fn commit(&self) -> Result<String, String> {
+        let _guard = self
+            .commit_mu
+            .lock()
+            .map_err(|_| "workspace commit lock poisoned".to_string())?;
         let new_head = self
             .fs
             .commit()
             .map_err(|e| format!("workspace commit: {e:?}"))?;
+        // F4（crash 窗口，文档化）：fs.commit() 已把 DurableState fsync 进 CAS，
+        // 锚文件随后更新。若 crash 恰好落在这两步之间，锚点指向旧 state_root，
+        // 重启后 head 回退（新 commit 对象仍在 CAS 中但不可达）。
+        // 缓解：HTTP 响应在锚点写完后才发送 → 已 ack 的 commit 不会丢；
+        // 未 ack 的提交客户端可重试（暂存已清空，重试 commit 返回当前 head 收敛）。
         if let Some(sr) = self.fs.state_root() {
             atomic_write_file(&self.state_root_path, sr.as_bytes())?;
         }
@@ -162,7 +174,8 @@ struct AutoCommitThread {
 }
 
 impl AutoCommitThread {
-    fn spawn(id: String, handle: WorkspaceHandle, interval_secs: u64) -> Self {
+    /// F10：线程创建失败走 Result（daemon fail-fast），不用 expect panic。
+    fn spawn(id: String, handle: WorkspaceHandle, interval_secs: u64) -> Result<Self, String> {
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
         let thread = std::thread::Builder::new()
             .name(format!("nexusd-ws-autocommit-{id}"))
@@ -185,17 +198,30 @@ impl AutoCommitThread {
                     }
                 }
             })
-            .expect("spawn workspace auto-commit thread");
-        Self {
+            .map_err(|e| format!("spawn workspace auto-commit thread: {e}"))?;
+        Ok(Self {
             shutdown_tx,
             thread: Some(thread),
-        }
+        })
     }
 
+    /// F8：join 10s 超时（R4“任一步超时 → warn 后强制继续”），不无限等。
     fn shutdown(&mut self) {
         let _ = self.shutdown_tx.send(());
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            let (tx, rx) = mpsc::channel::<()>();
+            std::thread::Builder::new()
+                .name("nexusd-ws-autocommit-join".to_string())
+                .spawn(move || {
+                    let _ = t.join();
+                    let _ = tx.send(());
+                })
+                .ok();
+            if rx.recv_timeout(Duration::from_secs(10)).is_err() {
+                eprintln!(
+                    "[nexusd] WARN: workspace auto-commit thread did not stop in 10s, continuing shutdown"
+                );
+            }
         }
     }
 }
@@ -244,6 +270,37 @@ impl WorkspaceManager {
             .map_err(|e| format!("create {}: {e}", cas_dir.display()))?;
         std::fs::create_dir_all(&mounts_dir)
             .map_err(|e| format!("create {}: {e}", mounts_dir.display()))?;
+
+        // F5：挂载点冲突校验（补全）。显式 mountpoint 不得：
+        // - 与另一条目的显式/默认挂载点重复（parse 时已查显式-显式）；
+        // - 落在 daemon 数据目录内（cas/、workspaces/、mounts/），避免 stacked
+        //   mount 静默遮蔽或把 FUSE 挂到 CAS 上。
+        {
+            let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+            for e in &entries {
+                let mp = e
+                    .mountpoint
+                    .clone()
+                    .unwrap_or_else(|| mounts_dir.join(&e.id));
+                if !seen.insert(mp.clone()) {
+                    return Err(format!(
+                        "workspace {}: duplicate mountpoint {}",
+                        e.id,
+                        mp.display()
+                    ));
+                }
+                for reserved in [&cas_dir, &ws_base, &mounts_dir] {
+                    if mp == *reserved || mp.starts_with(reserved) {
+                        return Err(format!(
+                            "workspace {}: mountpoint {} collides with daemon data dir {}",
+                            e.id,
+                            mp.display(),
+                            reserved.display()
+                        ));
+                    }
+                }
+            }
+        }
 
         let mut mounts = Vec::with_capacity(entries.len());
         for e in entries {
@@ -298,13 +355,13 @@ impl WorkspaceManager {
             let handle = WorkspaceHandle {
                 fs,
                 state_root_path,
+                commit_mu: std::sync::Arc::new(std::sync::Mutex::new(())),
             };
             let auto_commit = if e.auto_commit_secs > 0 {
-                Some(AutoCommitThread::spawn(
-                    e.id.clone(),
-                    handle.clone(),
-                    e.auto_commit_secs,
-                ))
+                Some(
+                    AutoCommitThread::spawn(e.id.clone(), handle.clone(), e.auto_commit_secs)
+                        .map_err(|err| format!("workspace {}: {err}", e.id))?,
+                )
             } else {
                 None
             };
@@ -435,5 +492,40 @@ mod tests {
         assert!(!mgr.fuse_available);
         assert!(mgr.is_empty());
         std::fs::remove_dir_all(d.join("data")).ok();
+    }
+
+    /// F11：auto-commit 线程端到端（需 /dev/fuse；沙盒跳过）。
+    /// 写文件 → 等待 → 定时提交触发 → head 前进且无脏数据。
+    #[test]
+    fn auto_commit_fires_on_schedule() {
+        if !Path::new("/dev/fuse").exists() {
+            return;
+        }
+        let d =
+            std::env::temp_dir().join(format!("nexusd-ws-autocommit-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let toml = "[[workspace]]\nid = \"ws-auto\"\nauto_commit_secs = 1\n";
+        let mgr = WorkspaceManager::start(&d, toml).expect("manager start");
+        assert!(mgr.fuse_available);
+        let mp = d.join("data").join("mounts").join("ws-auto");
+
+        let head_before = mgr.mounts_status()[0].head.clone();
+        std::fs::write(mp.join("auto.txt"), b"auto-commit-me").expect("kernel write");
+        // 等待 auto-commit 触发（1s 间隔 + 裕量）。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let committed = loop {
+            let st = mgr.mounts_status()[0].clone();
+            if !st.has_uncommitted_changes && st.head != head_before {
+                break true;
+            }
+            if std::time::Instant::now() > deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        };
+        // 先 shutdown（unmount），再断言，避免失败时残留挂载。
+        mgr.shutdown();
+        assert!(committed, "auto-commit did not fire within 10s");
+        std::fs::remove_dir_all(&d).ok();
     }
 }
