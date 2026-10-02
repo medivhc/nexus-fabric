@@ -1107,6 +1107,13 @@ pub fn remote_internet_access_flow() -> Result<Value, NexusError> {
             "placement": planned.plan.placement,
             "path": planned.plan.path,
         },
+        "trace": {
+            "considered": planned.trace.considered.iter().map(|c| json!({
+                "provider": c.provider.0,
+                "rejected_reason": c.rejected_reason.as_ref().map(|r| r.label()),
+            })).collect::<Vec<_>>(),
+            "selected": planned.trace.selected.0,
+        },
         "session": {
             "id": owner.id().0,
             "phase": phase_name(&status.phase),
