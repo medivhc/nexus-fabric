@@ -36,6 +36,14 @@
 - tie-break 确定性：PeerId 大者发起的连接保留；小者关闭自己的
   发起连接。两端独立计算，无需协商。
 - 中继连接在 Migrated 后不关闭。
+- Stream 类型前缀（D5）：wireup 的 stream 帧为 `u8 type | u32 BE len |
+  payload`；`0x01`=punch 信令，`0x02`=bind。responder 只 peek 类型，
+  非 punch 流一律 stash 到 `unclaimed`（字节完好），永不误解为 offer。
+- Nonce 绑定（D4）：tie-break 败方 adopt 直连前，必须在候选连接上做
+  挑战-应答——对端须回显一个本 peer 信令交换中的 nonce；
+  对不上则丢弃（中继保留）。per-peer nonce 集合，多 peer 并发不误认。
+  不动 `nexus-fabric`（server 侧 peer 零值问题由 fabric client auth
+  专项解决）。
 
 ## Side Effects
 - 后台线程：connect 扇出（自限时）、responder accept 循环。
@@ -48,9 +56,10 @@
 `SeededPredictor`、`LoggingFeed`。
 
 ## Verification
-- 单测：framing 往返、tie-break 规则、first-wins、preanswered nonce。
+- 单测：类型前缀 framing 往返、bind 编解码、per-peer nonce 验证、
+  tie-break 规则、first-wins、preanswered nonce。
 - E4（真机）：relay-first / symmetric-spray / unpredictable-fallback，
-  经 userspace NAT 模拟器的真实丢包/映射语义。
+  经 userspace NAT 模拟器的真实丢包/映射语义；生产流量切换不断流。
 
 ## Performance Budget
 - spray 扇出 ≤ 2K+1（K≤32）个并发握手；每个自带 handshake timeout。

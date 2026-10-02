@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use nexus_connectivity::nat::NatType;
 use nexus_nat_traversal::PunchChannel;
 use nexus_nat_traversal::{CandidateKind, PunchCandidate};
-use nexus_nat_wireup::channel::{deframe, frame_msg};
+use nexus_nat_wireup::channel::{STREAM_TYPE_PUNCH, deframe, frame_msg};
 use nexus_nat_wireup::responder::PreAnsweredChannel;
 use nexus_nat_wireup::socket::first_finished;
 use nexus_nat_wireup::tie_break_keep_local;
@@ -16,16 +16,17 @@ fn addr(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
 }
 
-/// Framing round-trips, and deframe rejects truncated input.
+/// Framing round-trips (type + payload), and deframe rejects truncated input.
 #[test]
 fn frame_roundtrip() {
     let payload = b"punch-offer-bytes";
-    let framed = frame_msg(payload);
-    let (out, consumed) = deframe(&framed).expect("complete frame must parse");
+    let framed = frame_msg(STREAM_TYPE_PUNCH, payload);
+    let (ty, out, consumed) = deframe(&framed).expect("complete frame must parse");
+    assert_eq!(ty, STREAM_TYPE_PUNCH);
     assert_eq!(out, payload);
     assert_eq!(consumed, framed.len());
     // Truncated: no frame.
-    assert!(deframe(&framed[..3]).is_none());
+    assert!(deframe(&framed[..4]).is_none());
     assert!(deframe(&[]).is_none());
 }
 
