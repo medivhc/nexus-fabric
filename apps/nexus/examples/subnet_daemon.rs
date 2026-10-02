@@ -6,9 +6,9 @@
 //! cargo run --quiet -p nexus --example subnet_daemon -- --json
 //! ```
 //!
-//! 进程内 spawn `nexus subnet up --foreground` 子进程（daemon 组合根常驻持有
-//! 隧道），验证：up 就绪 → status 读回 → 状态文件加密 magic → leave（删状态
-//! 文件）→ 子进程优雅退出 → status DOWN 的完整生命周期闭环。
+//! 进程内 spawn `nexus subnet up` 子进程（新 CLI 为一次性命令：装配成功后
+//! 打印 JSON 即退出），验证：up 就绪 → status 读回 → 状态文件加密 magic →
+//! leave（删状态文件）→ 子进程已正常退出 → status DOWN 的完整生命周期闭环。
 
 #![forbid(unsafe_code)]
 
@@ -79,7 +79,8 @@ locator = "udp://127.0.0.1:42002"
         return Err(format!("nexus not found at {}", nexus_bin.display()));
     }
 
-    // 1) spawn 常驻 daemon（--foreground）。
+    // 1) spawn 一次性 daemon（新 CLI：nexus subnet up 为一次性命令，打完 JSON 即退出；
+    //    旧 --foreground 常驻语义在 CLI 统一重构中已删除）。
     let mut child = Command::new(&nexus_bin)
         .args([
             "subnet",
@@ -89,7 +90,6 @@ locator = "udp://127.0.0.1:42002"
             "--state",
             state.to_str().ok_or("state path")?,
             "--encrypt-state",
-            "--foreground",
             "--json",
         ])
         .stdout(Stdio::piped())
@@ -192,7 +192,7 @@ fn wait_exit(child: &mut Child, timeout: Duration) -> Result<bool, String> {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err("nexusd --foreground did not exit after leave".to_string());
+                    return Err("nexus subnet up did not exit".to_string());
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }

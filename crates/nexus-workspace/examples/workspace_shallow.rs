@@ -9,10 +9,10 @@
 //! 流程（v9 §20）：
 //!
 //! ```text
-//! 远端建 5 提交（C0..C4）
-//!   -> shallow clone（depth=2）：只取 C3、C4
+//! 远端建 5 提交（genesis + 4；W3 内容哈希 CommitId）
+//!   -> shallow clone（depth=2）：只取最近 2 代
 //!   -> 老提交本地缺失（预期状态）
-//!   -> deepen(C2)：按需拉取缺失祖先，CommitId 不变
+//!   -> deepen：按需拉取缺失祖先，CommitId 不变
 //!   -> sparse clone（sparse_paths=["docs/"]）：只持有 docs 对象
 //! ```
 //!
@@ -75,12 +75,15 @@ fn build_remote() -> Result<FakeRemote, String> {
     )
     .map_err(|e| e.to_string())?;
     let mut head = remote.heads().heads[0].clone();
+    let genesis = head.clone();
     let files = [
         ("f1.txt", "content-1"),
         ("f2.txt", "content-2"),
         ("f3.txt", "content-3"),
         ("docs/guide.txt", "guide-content"),
     ];
+    // W3：CommitId 为内容哈希，不再是 C{seq}；记录 commit_changes 返回的真实 id。
+    let mut ids = vec![genesis];
     for (path, content) in files {
         head = remote
             .commit_changes(
@@ -91,24 +94,25 @@ fn build_remote() -> Result<FakeRemote, String> {
                 }],
             )
             .map_err(|e| e.to_string())?;
+        ids.push(head.clone());
     }
-    // C0..C4
+    // ids = [C0(genesis), C1, C2, C3, C4]（内容哈希 id）。
     let mut commits = HashMap::new();
-    for i in 0..=4 {
-        let id = CommitId(format!("C{i}"));
+    for id in &ids {
         let c = remote
-            .commit(&id)
+            .commit(id)
             .cloned()
             .ok_or_else(|| format!("remote missing {id:?}"))?;
-        commits.insert(id, c);
+        commits.insert(id.clone(), c);
     }
     let store = remote.into_store();
-    Ok(FakeRemote { commits, store })
+    Ok((FakeRemote { commits, store }, ids))
 }
 
 fn run_flow() -> Result<String, String> {
-    let mut fetcher = build_remote()?;
-    let head_c4 = CommitId("C4".into());
+    let (mut fetcher, ids) = build_remote()?;
+    // ids = [C0(genesis), C1, C2, C3, C4]（内容哈希）。
+    let head_c4 = ids[4].clone();
 
     // ---- shallow clone（depth=2）：只取 C3、C4 ----
     let policy = ReplicaPolicy {
@@ -131,7 +135,7 @@ fn run_flow() -> Result<String, String> {
         Ok(ReadOutcome::Found(b)) if b == b"guide-content"
     );
     // C2 不在本地 DAG：预期缺失（不是损坏）。
-    let c2 = CommitId("C2".into());
+    let c2 = ids[2].clone();
     let old_file_missing_before_deepen = shallow.commit(&c2).is_none();
 
     // ---- deepen(C2)：按需拉取缺失祖先 ----
