@@ -542,7 +542,13 @@ cargo clippy -p nexus-connectivity --all-targets -- -D warnings
 
 ## Recovery Semantics
 
-任何持久状态或长期任务都必须定义 crash 后的 reconcile 行为。无持久状态的纯模块应保持可重建。
+v9 §15.2/§15.3（Connectivity link 范围，`feature/crash-recovery`）：
+
+- Durable 状态：`LinkMarker { link_id, kind, locator, established_at_unix, stale }`。
+  文件实现由 Composition Root 注入（`LinkMarkerStore` trait）。
+- 诚实语义：进程死亡 = socket 死亡。冷启动 `reconcile_link_markers` 把未 stale 的
+  marker 标为 stale（触发重建），不许假装链路还活着；已 stale → 跳过；幂等。
+- 本函数只标记不建连；重建是 connectivity 建立路径的职责。
 
 ## Platform Constraints
 

@@ -209,6 +209,21 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     };
     log_enabled_subsystems(&loaded);
 
+    // 0. 开机 reconcile（v9 §15.3）：先恢复 durable state，再接受新工作。
+    //    位置在 T3 校验之前——reconcile 不依赖子系统配置，只依赖 config dir。
+    let state_dir = nexusd::recovery::state_dir(&dir.root);
+    let boot_report = nexusd::recovery::boot_reconcile(&state_dir);
+    println!("{}", boot_report.to_json());
+    // stdout 管道下是块缓冲：启动期的机器可读行必须立即 flush，
+    // 否则编排器（如 E4）在进程退出前永远看不到（2026-10-02 真机踩坑）。
+    {
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+    }
+    for e in &boot_report.errors {
+        eprintln!("[nexusd] boot-reconcile error: {e}");
+    }
+
     // T3：缺 proxy.yaml 且缺 network.toml → 拒绝启动（无意义）。
     if loaded.proxy_yaml.is_none() && loaded.network_toml.is_none() {
         eprintln!(
@@ -290,9 +305,16 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         .expect("spawn localapi thread");
     // 等 LocalAPI 就绪（最多 5 秒）。
     match ready_rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(addr) => println!(
-            "{{\"verdict\":\"READY\",\"daemon\":{{\"entry\":\"nexusd\",\"config_dir\":\"{config_dir}\",\"localapi\":\"{addr}\"}}}}"
-        ),
+        Ok(addr) => {
+            println!(
+                "{{\"verdict\":\"READY\",\"daemon\":{{\"entry\":\"nexusd\",\"config_dir\":\"{config_dir}\",\"localapi\":\"{addr}\"}}}}"
+            );
+            // 同上：READY 行必须立即 flush（块缓冲坑）。
+            {
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+            }
+        }
         Err(_) => {
             eprintln!(
                 "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"localapi did not start\"}}}}"
@@ -328,7 +350,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     }
 
     // 8. R4：优雅关闭（§13.4 反向顺序，超时强制继续）。
-    shutdown_sequence(localapi_handle, dataplane_handle, n1_bridge);
+    shutdown_sequence(localapi_handle, dataplane_handle, n1_bridge, &state_dir);
     ExitCode::from(0)
 }
 
@@ -340,6 +362,7 @@ fn shutdown_sequence(
     localapi_handle: std::thread::JoinHandle<()>,
     dataplane_handle: Option<std::thread::JoinHandle<()>>,
     n1_bridge: Option<Arc<nexus_network::n1::bridge::N1MeshBridge>>,
+    state_dir: &std::path::Path,
 ) {
     eprintln!("[nexusd] shutdown: stopping LocalAPI");
     // LocalAPI 线程已通过 shutdown 标志退出 accept 循环；join 确认。
@@ -373,6 +396,10 @@ fn shutdown_sequence(
     eprintln!("[nexusd] shutdown: proxy engine not yet a separate runtime, skipping");
     // TUN 随 dataplane 线程退出而关闭（Dataplane drop）。
     eprintln!("[nexusd] shutdown: complete");
+    // 干净关闭：清除 run marker，下次启动 crashed_before=false（v9 §15.2）。
+    if let Err(e) = nexusd::recovery::clear_run_marker(state_dir) {
+        eprintln!("[nexusd] WARN: shutdown: clear run marker failed: {e}");
+    }
 }
 
 /// R4：注册 Unix 信号处理（SIGTERM/SIGINT → 置位关闭标志）。

@@ -25,6 +25,8 @@ nexus-path = { path = "../../crates/nexus-path" }
 nexus-nat-traversal = { path = "../../crates/nexus-nat-traversal" }
 nexus-nat-wireup = { path = "../../crates/nexus-nat-wireup" }
 nexus-nat-quality = { path = "../../crates/nexus-nat-quality" }
+nexus-session = { path = "../../crates/nexus-session" }
+nexus-domain = { path = "../../crates/nexus-domain" }
 nexus-fabric = { path = "../../crates/nexus-fabric" }
 toml = "0.8"
 nexus-service = { path = "../../crates/nexus-service" }

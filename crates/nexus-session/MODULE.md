@@ -76,7 +76,15 @@ cargo clippy -p nexus-session --all-targets -- -D warnings
 
 ## Recovery Semantics
 
-任何持久状态或长期任务都必须定义 crash 后的 reconcile 行为。无持久状态的纯模块应保持可重建。
+v9 §15.2/§15.3（Session 范围，`feature/crash-recovery`）：
+
+- Durable 状态：`SessionRecord { session, phase, outcome }`（轻量 marker）。
+  文件实现由 Composition Root 注入（`SessionRecordStore` trait；见 `nexusd::recovery::FileSessionRecordStore`）。
+- 保真度契约：durable 记录只保留分类 + 失败原因字符串；`Failed` 的完整类型化
+  `NexusError` 不持久化（load 时重建为 `Internal{message}`）。
+- 冷启动 `reconcile_session_records`：已终态 → 跳过；未终态 → 孤儿 →
+  经 `SessionOwner` 恰一次提交 `Failed` 并清理到 `Disposed`，回写记录；幂等。
+- Journal：不需要。所有写都是单文件原子替换；reconcile 幂等。
 
 ## Platform Constraints
 

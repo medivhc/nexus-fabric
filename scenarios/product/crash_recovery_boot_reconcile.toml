@@ -1,0 +1,69 @@
+schema_version = 1
+id = "product.crash-recovery-boot-reconcile"
+title = "kill -9 后重启：孤儿 session 判 Failed，link 标记 stale，不静默丢状态（v9 §15.2/§15.3）"
+evidence_strength = "E4"
+requirement = "v9 §15.2/§15.3"
+
+# 冻结语义（2026-10-02）：
+# - 正确性不依赖 Graceful Shutdown；关键状态用轻量 Durable Marker 持久化（§15.2）。
+# - kill -9 后重启：未达终态的 session 记录必须被分类为孤儿并恰一次提交 Failed
+#   （TerminalOutcome 唯一写入者仍是 SessionOwner，不静默丢弃）；已建立的 link
+#   标记必须被标为 stale（进程死亡 = socket 死亡，不许"复用"假装还活着）。
+# - 所有 reconcile 必须幂等：第二次启动不再重复分类。
+# - 干净关闭（SIGTERM）必须清除 run marker；下次启动 crashed_before=false。
+# - 范围：只覆盖 Session + Connectivity；Workspace/Compute 的恢复是 Phase 2/3，不在本场景。
+
+[given]
+victim = "crash_probe：向 <config-dir>/state 写 1 条 Active/Unfinished session 记录 + 1 条 established link marker + run marker，然后 sleep（模拟运行中的 daemon）"
+crash = "kill -9 victim（模拟 SIGKILL / OOM kill / 掉电，写一半的状态必须可恢复或明确失败）"
+reboot = "nexusd <config-dir> 启动；state dir = <config-dir>/state；启动时先执行 boot reconcile 再接受新工作"
+
+# 可执行 E4：example 自己编排 victim → kill -9 → 两次 nexusd 启动 → 输出 JSON。
+[when]
+command = "cargo run --quiet -p nexusd --example crash_recovery_e4 -- --json"
+
+# 冻结期望：第一次启动（crash 后）的 reconcile 结果。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "reconcile.crashed_before"
+equals = true
+
+[[expect]]
+field = "reconcile.orphans_classified"
+equals = 1
+
+[[expect]]
+field = "reconcile.orphan_outcome"
+equals = "Failed"
+
+[[expect]]
+field = "reconcile.links_staled"
+equals = 1
+
+# 冻结期望：SIGTERM 干净关闭后 run marker 被清除。
+[[expect]]
+field = "clean_shutdown_cleared_marker"
+equals = true
+
+# 冻结期望：第二次启动（干净）幂等，不重复分类。
+[[expect]]
+field = "idempotent.crashed_before"
+equals = false
+
+[[expect]]
+field = "idempotent.orphans_classified"
+equals = 0
+
+[[expect]]
+field = "idempotent.links_staled"
+equals = 0
+
+# 诚实边界：
+# - link marker 的 stale 不是"恢复连接"，而是显式标记死亡、触发重建；
+#   本场景不断言自动重连（重连是 connectivity 建立路径的职责）。
+# - session 记录只保留分类 + 原因字符串，不保留完整类型化 NexusError
+#   （durable 记录的保真度契约，见 nexusd recovery.rs 文档）。
+# - Red Evidence：在实现不存在的基线上运行本命令 → BLOCKED（无 example 目标）。
