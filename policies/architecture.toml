@@ -237,6 +237,12 @@ portable = false
 layer = "delivery"
 
 [[crate]]
+name = "nexus-nat-quality"
+allowed_internal_dependencies = ["nexus-fabric", "nexus-path"]
+portable = false
+layer = "delivery"
+
+[[crate]]
 name = "nexus-turn"
   allowed_internal_dependencies = ["nexus-fabric"]
   portable = false
