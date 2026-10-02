@@ -383,14 +383,15 @@ fn run_resume() {
         let (send, recv) = nexus_fabric::split_stream(sh);
         let mut t =
             FabricSyncTransport::from_accepted(send, recv, &client_peer_, DEFAULT_RECV_DEADLINE);
-        let outcome = serve_sync_authorized(&mut a, &mut t, &auth).expect("serve1");
+        // 第一次 serve 可能因客户端中断而失败（预期行为，忽略错误）。
+        let _ = serve_sync_authorized(&mut a, &mut t, &auth);
         // 第二次 serve（resume 用新流）。
         let sh2 = server_conn.accept_stream().expect("accept2");
         let (send2, recv2) = nexus_fabric::split_stream(sh2);
         let mut t2 =
             FabricSyncTransport::from_accepted(send2, recv2, &client_peer_, DEFAULT_RECV_DEADLINE);
         let outcome2 = serve_sync_authorized(&mut a, &mut t2, &auth).expect("serve2");
-        (a, outcome, outcome2)
+        (a, outcome2)
     });
 
     // 第一次 sync：5 帧后中断（HEADS/CONFLICTS/COMMITS 完成，对象传输中）。
@@ -414,7 +415,7 @@ fn run_resume() {
     let report2 = b.sync_with_remote(&mut t2).expect("resume sync ok");
     t2.finish().ok();
 
-    let (a_served, _o1, _o2) = serve_handle.join().expect("serve thread");
+    let (a_served, _o2) = serve_handle.join().expect("serve thread");
 
     // 验证：对象字节完整，manifest 哈希一致。
     let b_head = b.heads().heads[0].clone();
