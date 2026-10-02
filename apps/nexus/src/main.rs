@@ -54,6 +54,7 @@ nexus — Nexus 统一 Resource Fabric 控制面 CLI（瘦客户端）
   workspace heads <workspace>             Workspace Head Set
   workspace conflicts <workspace>         未合并冲突
   workspace cache <workspace>             Workspace 缓存状态
+  workspace commit <workspace>            提交 Workspace 暂存变更（经 daemon）
   compute jobs                            Compute 任务
   diagnose                                统一诊断
   platform capabilities                   平台能力清单
@@ -236,10 +237,14 @@ fn run(args: &[String]) -> i32 {
     // 有 daemon 路由 → 裸 HTTP GET；无路由 → 本地合成 UNSUPPORTED。
     match localapi_client::route_for(&command) {
         Some(path) => query_daemon(&addr, path, json_mode),
-        None => {
-            let json = localapi_client::unsupported_json(&command);
-            render_and_exit(&json, json_mode)
-        }
+        None => match localapi_client::route_for_dynamic(&command) {
+            // C1：动态路由（`workspace commit <id>`）。
+            Some(path) => query_daemon(&addr, path.as_str(), json_mode),
+            None => {
+                let json = localapi_client::unsupported_json(&command);
+                render_and_exit(&json, json_mode)
+            }
+        },
     }
 }
 
@@ -612,7 +617,10 @@ fn parse_command(args: &[String]) -> Result<ControlCommand, String> {
             Some("cache") => Ok(ControlCommand::WorkspaceCache {
                 workspace: need(2, "<workspace>")?,
             }),
-            _ => Err("usage: nexus workspace heads|conflicts|cache <workspace>".into()),
+            Some("commit") => Ok(ControlCommand::WorkspaceCommit {
+                workspace: need(2, "<workspace>")?,
+            }),
+            _ => Err("usage: nexus workspace heads|conflicts|cache|commit <workspace>".into()),
         },
         "compute" => match args.get(1).map(String::as_str) {
             Some("jobs") => Ok(ControlCommand::ComputeJobs),

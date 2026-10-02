@@ -69,6 +69,7 @@ fn watch_loop(dir: ConfigDir, mut current: LoadedConfig, tx: Sender<ReloadEvent>
         config::NETWORK_TOML,
         config::PROXY_YAML,
         config::DNS_TOML,
+        config::WORKSPACE_TOML,
     ];
     loop {
         std::thread::sleep(POLL_INTERVAL);

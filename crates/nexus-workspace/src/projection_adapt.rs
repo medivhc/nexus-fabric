@@ -82,6 +82,10 @@ impl<A: WorkspaceAccess + Send> ProjectedWorkspace for WorkspaceProjection<A> {
     fn head(&self) -> Option<String> {
         self.0.head().map(|id| id.0.clone())
     }
+
+    fn state_root(&self) -> Option<String> {
+        self.0.state_root()
+    }
 }
 
 #[cfg(test)]

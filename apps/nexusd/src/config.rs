@@ -6,7 +6,8 @@
 //! ├── daemon.toml    # daemon 自身：LocalAPI 监听地址、PID 文件、日志（可选）
 //! ├── network.toml   # N1 mesh 网络（可选；存在即启用 mesh）
 //! ├── proxy.yaml     # Clash 风格代理（可选；存在即启用 proxy；YAML 格式沿用现有）
-//! └── dns.toml       # DNS（可选；存在即启用自定义 DNS）
+//! ├── dns.toml       # DNS（可选；存在即启用自定义 DNS）
+//! └── workspace.toml # Workspace 生产接线（可选；存在即启用 workspace FUSE 挂载，C1）
 //! ```
 //!
 //! 热加载分级（见 `watcher.rs`）：
@@ -22,6 +23,8 @@ pub const DAEMON_TOML: &str = "daemon.toml";
 pub const NETWORK_TOML: &str = "network.toml";
 pub const PROXY_YAML: &str = "proxy.yaml";
 pub const DNS_TOML: &str = "dns.toml";
+/// Workspace 生产接线（C1/D1）：`[[workspace]]` 数组；缺失文件 = workspace 子系统不启用。
+pub const WORKSPACE_TOML: &str = "workspace.toml";
 
 /// 配置文件夹的抽象。
 #[derive(Debug, Clone)]
@@ -141,6 +144,8 @@ pub struct LoadedConfig {
     pub proxy_yaml: Option<String>,
     /// DNS 配置原文（`dns.toml` 存在时为 Some）。
     pub dns_toml: Option<String>,
+    /// Workspace 配置原文（`workspace.toml` 存在时为 Some；C1/D1）。
+    pub workspace_toml: Option<String>,
     /// 各文件的元信息（用于热加载变更检测）。
     pub meta: HashMap<String, FileMeta>,
 }
@@ -224,6 +229,17 @@ pub fn load(dir: &ConfigDir) -> Result<LoadedConfig, String> {
         cfg.dns_toml = Some(text);
         if let Some(m) = FileMeta::of(&dir.file(DNS_TOML)) {
             cfg.meta.insert(DNS_TOML.to_string(), m);
+        }
+    }
+
+    // workspace.toml（可选；C1/D1。基础 TOML 语法校验，深层语义由 workspace manager 校验）
+    if dir.has(WORKSPACE_TOML) {
+        let text = std::fs::read_to_string(dir.file(WORKSPACE_TOML))
+            .map_err(|e| format!("read {}: {e}", WORKSPACE_TOML))?;
+        toml::from_str::<toml::Value>(&text).map_err(|e| format!("parse {WORKSPACE_TOML}: {e}"))?;
+        cfg.workspace_toml = Some(text);
+        if let Some(m) = FileMeta::of(&dir.file(WORKSPACE_TOML)) {
+            cfg.meta.insert(WORKSPACE_TOML.to_string(), m);
         }
     }
 
@@ -524,8 +540,18 @@ pub fn classify_change(old: &LoadedConfig, new: &LoadedConfig) -> ChangeKind {
     if old.network_toml != new.network_toml {
         return ChangeKind::NeedsRestart;
     }
+    // C1/D1：workspace.toml 内容变更 → NeedsRestart（挂载点/工作区集合变化需重新装配）。
+    if old.workspace_toml != new.workspace_toml {
+        return ChangeKind::NeedsRestart;
+    }
     // 任一文件的增删 → 需重启（子系统启停）
-    let files = [NETWORK_TOML, PROXY_YAML, DNS_TOML, DAEMON_TOML];
+    let files = [
+        NETWORK_TOML,
+        PROXY_YAML,
+        DNS_TOML,
+        DAEMON_TOML,
+        WORKSPACE_TOML,
+    ];
     for f in files {
         let o = old.meta.get(f);
         let n = new.meta.get(f);

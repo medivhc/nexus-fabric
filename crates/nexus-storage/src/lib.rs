@@ -11,6 +11,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+pub mod fs;
+pub use fs::FsContentStore;
+
 /// 内容寻址的对象标识。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ObjectId(pub String);

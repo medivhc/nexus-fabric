@@ -24,11 +24,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use fuser::{
-    BackgroundSession, BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
-    Generation, INodeNo, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
-    WriteFlags,
+    BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
+    INodeNo, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
+
+/// Re-export: FUSE background session handle (drop → unmount).
+/// C1: daemon 持有它维持挂载。
+pub use fuser::BackgroundSession;
 use nexus_platform::{PlatformError, ProjectedDirEntry, ProjectedWorkspace};
 
 const TTL: Duration = Duration::from_secs(1);
@@ -69,6 +72,10 @@ struct FuseInner {
     explicit_dirs: HashSet<String>,
     open: HashMap<u64, OpenFile>,
     next_fh: u64,
+    /// C1/D5: true if writes/deletes were staged since the last commit.
+    /// Used by the daemon to warn on unmount with uncommitted data
+    /// (never silently committed).
+    staged_dirty: bool,
 }
 
 /// FUSE filesystem projecting a [`ProjectedWorkspace`].
@@ -105,25 +112,35 @@ impl FuseWorkspaceFs {
                 explicit_dirs: HashSet::new(),
                 open: HashMap::new(),
                 next_fh: 1,
+                staged_dirty: false,
             })),
         }
     }
 
     /// Commit staged workspace changes; returns the new commit id.
     pub fn commit(&self) -> Result<String, PlatformError> {
-        self.inner
-            .lock()
-            .map_err(|_| PlatformError::Io {
-                operation: "commit".to_string(),
-                message: "fuse inner lock poisoned".to_string(),
-            })?
-            .ws
-            .commit()
+        let mut inner = self.inner.lock().map_err(|_| PlatformError::Io {
+            operation: "commit".to_string(),
+            message: "fuse inner lock poisoned".to_string(),
+        })?;
+        let id = inner.ws.commit()?;
+        inner.staged_dirty = false;
+        Ok(id)
     }
 
     /// Current workspace head.
     pub fn head(&self) -> Option<String> {
         self.inner.lock().ok()?.ws.head()
+    }
+
+    /// Current durable state root (C1/D4), if the channel tracks one.
+    pub fn state_root(&self) -> Option<String> {
+        self.inner.lock().ok()?.ws.state_root()
+    }
+
+    /// C1/D5: true if writes/deletes were staged since the last commit.
+    pub fn has_uncommitted_changes(&self) -> bool {
+        self.inner.lock().map(|i| i.staged_dirty).unwrap_or(false)
     }
 
     fn with_inner<T>(
@@ -420,6 +437,7 @@ impl Filesystem for FuseWorkspaceFs {
             let f = inner.open.remove(&fh.0).ok_or(Errno::EBADF)?;
             if f.dirty {
                 inner.ws.write_file(&f.path, &f.buf).map_err(map_err_ws)?;
+                inner.staged_dirty = true;
             }
             if let Some(ino) = inner.ino_by_path.get(&f.path).copied() {
                 if let Some(e) = inner.inodes.get_mut(&ino) {
@@ -507,6 +525,7 @@ impl Filesystem for FuseWorkspaceFs {
                 }
             }
             inner.ws.delete(&child).map_err(map_err_ws)?;
+            inner.staged_dirty = true;
             if let Some(ino) = inner.ino_by_path.remove(&child) {
                 inner.inodes.remove(&ino);
             }
@@ -630,6 +649,7 @@ impl Filesystem for FuseWorkspaceFs {
                     let mut data = inner.ws.read_file(&path).map_err(map_err_ws)?;
                     data.resize(new_size, 0);
                     inner.ws.write_file(&path, &data).map_err(map_err_ws)?;
+                    inner.staged_dirty = true;
                 }
                 if let Some(e) = inner.inodes.get_mut(&ino.0) {
                     e.size = new_size as u64;
@@ -681,6 +701,44 @@ pub fn unmount_projected_workspace(mountpoint: &Path) {
             .arg(mountpoint)
             .output();
     }
+}
+
+/// C1/D6: idempotent orphan-mount cleanup at daemon startup.
+/// Tries `fusermount -u`; if the mountpoint is still mounted afterwards
+/// (busy), falls back to lazy unmount (`-uz`). Never fails.
+pub fn cleanup_orphan_mount(mountpoint: &Path) {
+    if !is_mounted(mountpoint) {
+        return;
+    }
+    for bin in ["fusermount", "fusermount3"] {
+        let _ = std::process::Command::new(bin)
+            .arg("-u")
+            .arg(mountpoint)
+            .output();
+    }
+    if is_mounted(mountpoint) {
+        for bin in ["fusermount", "fusermount3"] {
+            let _ = std::process::Command::new(bin)
+                .arg("-uz")
+                .arg(mountpoint)
+                .output();
+        }
+    }
+}
+
+/// True if `mountpoint` appears in `/proc/mounts`.
+pub fn is_mounted(mountpoint: &Path) -> bool {
+    let target = mountpoint.to_string_lossy();
+    std::fs::read_to_string("/proc/mounts")
+        .map(|text| {
+            text.lines().any(|line| {
+                line.split_whitespace()
+                    .nth(1)
+                    .map(|mp| mp == target)
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

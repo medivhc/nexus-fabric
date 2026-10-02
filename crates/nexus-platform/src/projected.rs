@@ -44,4 +44,13 @@ pub trait ProjectedWorkspace: Send {
     fn commit(&mut self) -> Result<String, PlatformError>;
     /// Current head commit id, if any.
     fn head(&self) -> Option<String>;
+    /// Current durable state root object id, if the access channel tracks one.
+    ///
+    /// Default: `None` (channels without durable state). Added for daemon
+    /// lifecycle (C1/D4): the composition root needs the latest state root
+    /// after each commit to update its `state_root` anchor file for `open`
+    /// on restart. This is observability metadata, not file semantics.
+    fn state_root(&self) -> Option<String> {
+        None
+    }
 }

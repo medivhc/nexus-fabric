@@ -192,13 +192,14 @@
     默认 `198.18.0.0/15`）、`mesh_suffix`（字符串，默认 `"mesh"`）、
     `fake_ip_ttl_secs`（整数，默认 300）、`hosts`（表，域名→IP）。
 - **R4（关闭顺序）**：Unix SIGTERM/SIGINT → 按 §13.4 反向关闭：
-  LocalAPI 停收新查询 → dataplane 线程停（join 1s 超时）→
-  `N1SessionManager::shutdown()`（join 5s 超时）→ TUN 随 dataplane
-  线程退出关闭 → exit 0；任一步超时 → warn 日志后强制继续，不无限等。
+  LocalAPI 停收新查询 → **Workspace unmount（C1/D7）** → dataplane 线程停
+  （join 1s 超时）→ `N1SessionManager::shutdown()`（join 5s 超时）→ TUN 随
+  dataplane 线程退出关闭 → exit 0；任一步超时 → warn 日志后强制继续，不无限等。
   （ProxyEngine 尚无独立运行时，步骤为 no-op，记 info。）
 - **R5（热加载分类）**：`network.toml` 内容变更 → `NeedsRestart`
   （mesh CIDR 属重启类，§13.6）；`dns.toml` 内容变更 → `Hot`
-  （上游变更热生效）；`dns.toml` 增删 → `NeedsRestart`（子系统启停）。
+  （上游变更热生效）；`dns.toml` 增删 → `NeedsRestart`（子系统启停）；
+  `workspace.toml` 内容变更/增删 → `NeedsRestart`（挂载集合变化需重新装配，C1/D1）。
 - 不变量：TUN 失败仍致命（D1）；N1/DNS/Proxy 失败可降级（§13.3 原则）；
   关闭必达 exit（不 hang）；`mesh_dropped_no_n1` 语义不变。
 
@@ -299,6 +300,33 @@ cargo clippy -p nexusd --all-targets -- -D warnings
 - 不变量：单 TUN（D1）；分类器唯一入口（S29）；TUN 所有权仍在 dataplane
   （engine 只返回待写包，不直接写 TUN）；`proxy_forwarded` 仅在真实转发
   发生时计数（不再是纯分类计数）。
+
+### Workspace 生产接线（C1/D1-D9，scenarios/product/daemon_workspace_mount.toml，2026-10-02 冻结）
+
+- **D1（配置）**：config dir 新增 `workspace.toml`，`[[workspace]]` 数组
+  （`id`/`mountpoint?`/`author?`/`auto_commit_secs?`）；缺失文件 = workspace
+  子系统不启用。内容变更/增删 → `NeedsRestart`。
+- **D2（挂载点）**：显式 `mountpoint` 优先；缺省 `<data-dir>/mounts/<id>`；
+  `data-dir` 派生为 `<config-dir>/data`（v1 不可配）。
+- **D3（持久化）**：各 workspace 共享 `FsContentStore`（`<data-dir>/cas/`）；
+  `InMemoryContentStore` 只留测试。
+- **D4（state_root 锚）**：`<data-dir>/workspaces/<id>/state_root` 原子写；
+  启动时 `open` 用；每次 commit 后更新。
+- **D5（提交语义）**：不自动提交；`nexus workspace commit <id>` 经 LocalAPI
+  `GET /localapi/v0/workspace/commit/<id>`；可选定时自动提交（默认关）。
+  unmount/shutdown 时 WorkingSet 脏 → warn，**不静默提交**。
+- **D6（orphan 清理）**：启动时每个挂载点先 `fusermount -u` 幂等清理；
+  仍挂载（busy）则 `-uz`（lazy）。T4 合入后收敛进统一 `boot_reconcile`。
+- **D7（关闭顺序）**：LocalAPI → Workspace unmount → Dataplane → N1 → TUN。
+- **D8（降级）**：无 `/dev/fuse` → warn + workspace 子系统不启用，不静默 fallback。
+- **D9（依赖边）**：nexusd（Composition Root）→ `nexus-platform-linux`；
+  `nexus-platform-linux` 不反向依赖 `nexus-workspace`（只消费 portable
+  `ProjectedWorkspace` trait）。
+- **LocalAPI**：`GET /localapi/v0/workspace/mounts`（状态快照）；
+  `GET /localapi/v0/workspace/commit/<id>`（显式提交）。
+- 不变量：`ProjectedWorkspace::state_root()`（默认 `None` 的加法）是 daemon
+  更新锚文件的唯一通道；FUSE 脏追踪（`has_uncommitted_changes`）只用于
+  warn，不触发提交。
 
 ## Performance Budget
 

@@ -402,6 +402,12 @@ pub trait WorkspaceAccess {
 
     /// 获取当前访问通道类型
     fn provider_type(&self) -> WorkspaceAccessProvider;
+
+    /// 当前持久状态根对象 id（C1/D4：daemon 在每次 commit 后更新 state_root 锚文件）。
+    /// 默认 `None`（无持久状态的通道）。
+    fn state_root(&self) -> Option<String> {
+        None
+    }
 }
 
 /// 原生 API 通道（纯结构化读写，不经文件系统投影）
@@ -605,6 +611,10 @@ impl<S: ContentStore> WorkspaceAccess for NativeApiWorkspaceAccess<S> {
 
     fn provider_type(&self) -> WorkspaceAccessProvider {
         self.provider
+    }
+
+    fn state_root(&self) -> Option<String> {
+        Some(self.workspace.state_root().0.clone())
     }
 }
 

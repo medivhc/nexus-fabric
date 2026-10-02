@@ -306,6 +306,7 @@ mod tests {
             network_toml: network_toml.map(|s| s.to_string()),
             dns_toml: None,
             proxy_yaml: None,
+            workspace_toml: None,
             meta: std::collections::HashMap::new(),
         }
     }
