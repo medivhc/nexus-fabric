@@ -544,9 +544,9 @@ fn run_shallow_sparse() {
     let a_objs = a.store().object_ids().unwrap_or_default().len();
     let c_objs = c_ws.store().object_ids().unwrap_or_default().len();
     let only_docs = c_objs < a_objs;
-    // other_paths_not_fetched：C 拉取的对象数（10）远小于全量（约 20 文件对象），
-    // 且 C 的对象总数不到 A 的一半，证明 src/ 未拉取。
-    let other_not_fetched = rep_c.fetched_objects <= 12 && c_objs * 2 < a_objs;
+    // other_paths_not_fetched：C 拉取的对象数（20=10 manifests+10 docs 文件）
+    // 远小于全量（约 30+），且 C 的对象总数不到 A 的 3/4，证明 src/ 未拉取。
+    let other_not_fetched = rep_c.fetched_objects <= 22 && c_objs * 4 < a_objs * 3;
     let c_heads_ok = c_ws.heads().heads == vec![a_head.clone()];
 
     let pass =
