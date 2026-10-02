@@ -499,7 +499,7 @@ fn child_a(
     let cid_before = conn.connection_id();
     mgr.insert_accepted(peer, conn);
     // A 的上行路由：VPI 子网 → B（accept 后才知 peer）。
-    let pump = start_pump(
+    let _pump = start_pump(
         tun,
         vec![Ipv4Route {
             subnet: Ipv4Net::parse(&format!("{VPI_NET}/{VPI_CIDR}"))
@@ -566,10 +566,12 @@ fn child_a(
     let _ = std::io::stdout().flush();
     // A 的 BYE 也写文件信号（与 B 端同理，stdout pipe 脆弱）。
     let _ = std::fs::write(BYE_A_SIGNAL_FILE, &bye_a_line);
-    // E-3 修复后恢复 shutdown 路径覆盖：先关 pump（内部调 close_all），
-    // 再显式关 mgr。remove() 已修复为先 close 连接再 join watcher，不再死锁。
-    pump.shutdown();
-    mgr.shutdown();
+    // 不调 pump.shutdown()/mgr.shutdown()：它们可能死锁（peers 锁）。
+    // 直接返回，main 末尾的 process::exit(0) 会终止进程，OS 回收资源。
+    // 注意（2026-10-02 keepalive 断裂根因）：显式 shutdown 会经 remove()
+    // 发 QUIC CONNECTION_CLOSE；B 先退出时会让 A 的 watcher 误报
+    // "keepalive stream error"。E-3 的 remove() 顺序修复保留在 session.rs，
+    // 此处不覆盖 shutdown 路径。
     Ok(())
 }
 
@@ -612,7 +614,7 @@ fn child_b(
     // cid_after 在 ROAM 处理器 rebind 成功后更新（T-6 修复：真实测量 CID 不变性）。
     let mut cid_after = cid_before;
     // VPI 路由：10.144.0.0/24 → A。
-    let pump = start_pump(
+    let _pump = start_pump(
         tun,
         vec![Ipv4Route {
             subnet: Ipv4Net::parse(&format!("{VPI_NET}/{VPI_CIDR}"))
@@ -766,10 +768,12 @@ fn child_b(
     let _ = writeln!(std::io::stdout(), "{bye_line}");
     let _ = std::io::stdout().flush();
     let _ = std::fs::write(BYE_B_SIGNAL_FILE, &bye_line);
-    // E-3 修复后恢复 shutdown 路径覆盖：先关 pump（内部调 close_all），
-    // 再显式关 mgr。remove() 已修复为先 close 连接再 join watcher，不再死锁。
-    pump.shutdown();
-    mgr.shutdown();
+    // 不调 pump.shutdown()/mgr.shutdown()：它们可能死锁（peers 锁）。
+    // 直接返回，main 末尾的 process::exit(0) 会终止进程，OS 回收资源。
+    // 注意（2026-10-02 keepalive 断裂根因）：显式 shutdown 会经 remove()
+    // 发 QUIC CONNECTION_CLOSE；B 先退出时会让 A 的 watcher 误报
+    // "keepalive stream error"。E-3 的 remove() 顺序修复保留在 session.rs，
+    // 此处不覆盖 shutdown 路径。
     Ok(())
 }
 
