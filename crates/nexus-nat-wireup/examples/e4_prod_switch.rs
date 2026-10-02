@@ -667,24 +667,40 @@ const CHUNKS_PER_BATCH: usize = 35;
 const CHUNK_SIZE: usize = 1024;
 
 /// B side: echo loop on one conn. Detached; dies with the process.
-fn spawn_echo(conn: Arc<ConnShared>, tag: &'static str) {
+/// If `check_magic`, the first message must carry XFER_MAGIC (used on the
+/// direct conn, which also sees the punch BIND stream); otherwise every
+/// accepted stream is echoed (the xfer relay conn never carries punch streams).
+fn spawn_echo(conn: Arc<ConnShared>, tag: &'static str, check_magic: bool) {
     thread::spawn(move || {
         loop {
             let s = match accept_stream_timeout(&conn, Duration::from_secs(60)) {
                 Ok(s) => s,
                 Err(_) => break,
             };
-            match xfer_read(&s) {
-                Ok(buf) => {
-                    if xfer_write(&s, &buf).is_err() {
-                        break;
+            if check_magic {
+                match xfer_read_deadline(&s, Duration::from_secs(3)) {
+                    Ok(b) if b.len() >= 4 && &b[..4] == XFER_MAGIC => {
+                        if xfer_write(&s, &b).is_err() {
+                            continue;
+                        }
+                    }
+                    _ => {
+                        eprintln!("[e4] echo {tag}: skipping non-transfer stream");
+                        continue;
                     }
                 }
-                Err(e) => {
-                    eprintln!("[e4] echo {tag} read: {e}");
-                    break;
+            }
+            loop {
+                match xfer_read(&s) {
+                    Ok(buf) => {
+                        if xfer_write(&s, &buf).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
                 }
             }
+            finish_stream(&s);
         }
     });
 }
@@ -699,7 +715,7 @@ fn spawn_direct_echo(stack_b: Arc<Stack>, id_a: FabricPeerId) {
             thread::sleep(Duration::from_millis(200));
         };
         println!("[e4] B: direct conn available, echoing on it");
-        spawn_echo(d.conn, "direct");
+        spawn_echo(d.conn, "direct", true);
     });
 }
 
@@ -839,7 +855,7 @@ fn scenario_switch_to_direct() -> bool {
     stack_b.add_production_relay(id_a, &ctx.relay_xfer_b, local_b, ctx.ra);
 
     // B echoes on relay immediately; on direct once punched.
-    spawn_echo(ctx.relay_xfer_b.clone(), "relay");
+    spawn_echo(ctx.relay_xfer_b.clone(), "relay", false);
     spawn_direct_echo(stack_b.clone(), id_a);
     // Register direct candidates as soon as the punch lands (both sides).
     spawn_direct_registrar(stack_a.clone(), id_b, local_a);
@@ -902,7 +918,7 @@ fn scenario_direct_loses() -> bool {
     stack_a.add_production_relay(id_b, &ctx.relay_xfer_a, local_a, ctx.rb);
     stack_b.add_production_relay(id_a, &ctx.relay_xfer_b, local_b, ctx.ra);
 
-    spawn_echo(ctx.relay_xfer_b.clone(), "relay");
+    spawn_echo(ctx.relay_xfer_b.clone(), "relay", false);
     spawn_direct_echo(stack_b.clone(), id_a);
     spawn_direct_registrar(stack_a.clone(), id_b, local_a);
     spawn_direct_registrar(stack_b.clone(), id_a, local_b);
