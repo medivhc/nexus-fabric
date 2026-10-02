@@ -11,6 +11,9 @@
 //!
 //! 求解模型（吸收开源标杆 kube-scheduler 的 Scheduling Framework）：
 //! - **Filter 硬谓词短路**（K2）：不满足硬约束的候选被拒绝，绝不进入评分阶段；
+//! - **Connectivity Feasibility 门控**（v9 §8.1）：`PlanningSnapshot.connectivity`
+//!   携带的评估中，无任何可行路径的候选被拒绝（`NoFeasibleConnectivityPath`），
+//!   无评估的候选保持旧行为；DecisionTrace 记录每个候选的评估；
 //! - **Score 归一化加权**（K3）：只对可行候选评分，归一化到 [0, 10_000] 整数；
 //! - **规划快照**（K5）：一次规划使用一致的 candidates + constraints 视图；
 //! - **结构化拒绝原因**（K4）：DecisionTrace 记录结构化枚举，而非自由文本。
@@ -21,8 +24,8 @@
 #![forbid(unsafe_code)]
 
 use nexus_domain::{
-    Constraint, Intent, NetworkPlanExtension, NexusError, Plan, PlanExtension, ProviderId,
-    ResourceId,
+    ConnectivityEvaluation, Constraint, Intent, NetworkPlanExtension, NexusError, Plan,
+    PlanExtension, ProviderId, ResourceId,
 };
 use nexus_measurement::LinkMeasurement;
 use nexus_registry::ProviderRecord;
@@ -63,6 +66,8 @@ pub enum RejectReason {
         /// 约束值。
         value: String,
     },
+    /// 无可行连通路径（Connectivity Evaluation：direct/punch/relay/existing 全不可行）。
+    NoFeasibleConnectivityPath,
 }
 
 impl RejectReason {
@@ -73,6 +78,7 @@ impl RejectReason {
             Self::NotPresent => "not_present",
             Self::MissingCapability { .. } => "missing_capability",
             Self::ExcludedByConstraint { .. } => "excluded_by_constraint",
+            Self::NoFeasibleConnectivityPath => "no_feasible_connectivity_path",
         }
     }
 }
@@ -88,6 +94,8 @@ pub struct PlanningSnapshot {
     pub candidates: Vec<ProviderRecord>,
     /// 冻结的硬约束。
     pub constraints: Vec<Constraint>,
+    /// per-provider Connectivity Evaluation（v9 §8.1）；空 = 未评估（保持旧行为）。
+    pub connectivity: Vec<(ProviderId, ConnectivityEvaluation)>,
 }
 
 impl PlanningSnapshot {
@@ -97,7 +105,18 @@ impl PlanningSnapshot {
         Self {
             candidates,
             constraints,
+            connectivity: Vec::new(),
         }
+    }
+
+    /// 附上 Connectivity Evaluation（builder；`connectivity_gate` 的输入）。
+    #[must_use]
+    pub fn with_connectivity(
+        mut self,
+        connectivity: Vec<(ProviderId, ConnectivityEvaluation)>,
+    ) -> Self {
+        self.connectivity = connectivity;
+        self
     }
 }
 
@@ -128,6 +147,9 @@ pub struct ConsideredCandidate {
     pub provider: ProviderId,
     /// 被拒绝原因；`None` 表示可行。
     pub rejected_reason: Option<RejectReason>,
+    /// 该候选的 Connectivity Evaluation（快照携带时；`None` = 未评估）。
+    /// 让 DecisionTrace 可见 evaluation 对决策的贡献（v9 §8.1）。
+    pub connectivity: Option<ConnectivityEvaluation>,
 }
 
 /// 决策轨迹：记录全部候选、拒绝原因与最终选择，支持 explain / replay。
@@ -153,6 +175,26 @@ fn constraint_value<'a>(constraints: &'a [Constraint], key: &str) -> Option<&'a 
         .iter()
         .find(|c| c.key == key)
         .map(|c| c.value.as_str())
+}
+
+// ---------- Connectivity Feasibility 门控（v9 §8.1） ----------
+
+/// 基于 [`PlanningSnapshot`] 中 Connectivity Evaluation 的可行性门控。
+///
+/// 对每个携带评估的候选：若评估显示无任何可行路径（direct/punch/relay/
+/// existing 全不可行），返回 `(provider, RejectReason::NoFeasibleConnectivityPath)`。
+/// 无评估的候选不受影响（未知 ≠ 不可行，保持旧行为）。
+///
+/// 纯函数，确定性；`plan_from_snapshot` 在 Filter 之后应用此门控（硬谓词语义，
+/// 但不覆盖已有的拒绝原因——先被拒绝者保留原原因）。
+#[must_use]
+pub fn connectivity_gate(snapshot: &PlanningSnapshot) -> Vec<(ProviderId, RejectReason)> {
+    snapshot
+        .connectivity
+        .iter()
+        .filter(|(_, ev)| !ev.has_feasible_path())
+        .map(|(id, _)| (id.clone(), RejectReason::NoFeasibleConnectivityPath))
+        .collect()
 }
 
 /// 阶段一：硬谓词过滤（K2）。
@@ -271,12 +313,31 @@ where
     let exit_dns = constraint_value(&snapshot.constraints, "exit-dns");
 
     // 阶段一：Filter（硬谓词短路）。
-    let filtered = filter_candidates(&snapshot.constraints, &snapshot.candidates);
+    let gated = connectivity_gate(snapshot);
+    let filtered: Vec<FilteredCandidate> =
+        filter_candidates(&snapshot.constraints, &snapshot.candidates)
+            .into_iter()
+            .map(|mut f| {
+                // Connectivity 门控：仅对尚未被拒绝的候选生效（先被拒绝者保留原原因）。
+                if f.reason.is_none() && gated.iter().any(|(id, _)| *id == f.record.id) {
+                    f.reason = Some(RejectReason::NoFeasibleConnectivityPath);
+                }
+                f
+            })
+            .collect();
+    let evaluation_of = |id: &ProviderId| {
+        snapshot
+            .connectivity
+            .iter()
+            .find(|(pid, _)| pid == id)
+            .map(|(_, ev)| ev.clone())
+    };
     let considered: Vec<ConsideredCandidate> = filtered
         .iter()
         .map(|f| ConsideredCandidate {
             provider: f.record.id.clone(),
             rejected_reason: f.reason.clone(),
+            connectivity: evaluation_of(&f.record.id),
         })
         .collect();
     let feasible: Vec<ProviderRecord> = filtered
@@ -567,5 +628,124 @@ mod tests {
             .label(),
             "excluded_by_constraint"
         );
+        assert_eq!(
+            RejectReason::NoFeasibleConnectivityPath.label(),
+            "no_feasible_connectivity_path"
+        );
+    }
+
+    // ---- Connectivity Feasibility 门控（v9 §8.1） ----
+
+    fn evaluation(feasible: bool) -> ConnectivityEvaluation {
+        ConnectivityEvaluation {
+            version: ConnectivityEvaluation::VERSION,
+            direct_likely: feasible,
+            punching_likely: false,
+            relay_available: false,
+            existing_link_available: false,
+            estimated_setup_cost_ms: feasible.then_some(100),
+            confidence_percent: 100,
+        }
+    }
+
+    #[test]
+    fn connectivity_gate_rejects_only_infeasible() {
+        let cands = vec![
+            candidate("good", "g", &["internet-access"], true),
+            candidate("bad", "b", &["internet-access"], true),
+            candidate("unevaluated", "u", &["internet-access"], true),
+        ];
+        let snapshot = PlanningSnapshot::new(cands, constraints()).with_connectivity(vec![
+            (ProviderId("good".into()), evaluation(true)),
+            (ProviderId("bad".into()), evaluation(false)),
+        ]);
+        let gate = connectivity_gate(&snapshot);
+        assert_eq!(gate.len(), 1);
+        assert_eq!(gate[0].0, ProviderId("bad".into()));
+        assert_eq!(gate[0].1, RejectReason::NoFeasibleConnectivityPath);
+    }
+
+    #[test]
+    fn plan_rejects_infeasible_candidate_but_keeps_feasible() {
+        let cands = vec![
+            candidate("bad", "b", &["internet-access"], true),
+            candidate("good", "g", &["internet-access"], true),
+        ];
+        let snapshot = PlanningSnapshot::new(cands, constraints()).with_connectivity(vec![
+            (ProviderId("good".into()), evaluation(true)),
+            (ProviderId("bad".into()), evaluation(false)),
+        ]);
+        let out = plan_from_snapshot(&resource(), &snapshot, &intent(), |_| None).unwrap();
+        // 可行者被选中；不可行者在 trace 中带精确拒绝原因 + 评估。
+        assert_eq!(out.plan.provider_id, ProviderId("good".into()));
+        let bad = out
+            .trace
+            .considered
+            .iter()
+            .find(|c| c.provider.0 == "bad")
+            .unwrap();
+        assert_eq!(
+            bad.rejected_reason,
+            Some(RejectReason::NoFeasibleConnectivityPath)
+        );
+        assert_eq!(bad.connectivity, Some(evaluation(false)));
+        let good = out
+            .trace
+            .considered
+            .iter()
+            .find(|c| c.provider.0 == "good")
+            .unwrap();
+        assert_eq!(good.rejected_reason, None);
+        assert_eq!(good.connectivity, Some(evaluation(true)));
+    }
+
+    #[test]
+    fn all_infeasible_is_constraint_unsatisfied() {
+        let cands = vec![candidate("bad", "b", &["internet-access"], true)];
+        let snapshot = PlanningSnapshot::new(cands, constraints())
+            .with_connectivity(vec![(ProviderId("bad".into()), evaluation(false))]);
+        let err = plan_from_snapshot(&resource(), &snapshot, &intent(), |_| None).unwrap_err();
+        assert!(matches!(err, NexusError::ConstraintUnsatisfied { .. }));
+    }
+
+    #[test]
+    fn no_evaluation_keeps_legacy_behavior() {
+        // 无评估 → 门控不生效，旧行为（未知 RTT 按 id 字典序）。
+        let cands = vec![
+            candidate("zeta", "z", &["internet-access"], true),
+            candidate("alpha", "a", &["internet-access"], true),
+        ];
+        let snapshot = PlanningSnapshot::new(cands, constraints());
+        assert!(connectivity_gate(&snapshot).is_empty());
+        let out = plan_from_snapshot(&resource(), &snapshot, &intent(), |_| None).unwrap();
+        assert_eq!(out.plan.provider_id, ProviderId("alpha".into()));
+        assert!(
+            out.trace
+                .considered
+                .iter()
+                .all(|c| c.connectivity.is_none())
+        );
+    }
+
+    #[test]
+    fn gate_does_not_override_existing_rejection() {
+        // 已因 NotPresent 被拒的候选，即使评估也无可行路径，保留原拒绝原因。
+        let cands = vec![
+            candidate("down", "d", &["internet-access"], false),
+            candidate("up", "u", &["internet-access"], true),
+        ];
+        let snapshot = PlanningSnapshot::new(cands, constraints()).with_connectivity(vec![
+            (ProviderId("down".into()), evaluation(false)),
+            (ProviderId("up".into()), evaluation(true)),
+        ]);
+        let out = plan_from_snapshot(&resource(), &snapshot, &intent(), |_| None).unwrap();
+        assert_eq!(out.plan.provider_id, ProviderId("up".into()));
+        let down = out
+            .trace
+            .considered
+            .iter()
+            .find(|c| c.provider.0 == "down")
+            .unwrap();
+        assert_eq!(down.rejected_reason, Some(RejectReason::NotPresent));
     }
 }

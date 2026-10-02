@@ -208,6 +208,53 @@ pub struct Plan {
     pub extension: Option<PlanExtension>,
 }
 
+// ---------- Connectivity Evaluation（v9 §8.1） ----------
+
+/// Connectivity Evaluation 输出：规划期连通性可行性（DTO，版本化）。
+///
+/// 由 Connectivity Evaluation 纯函数（`nexus-connectivity::evaluation`）产生，
+/// 作为 Core Planner 的 Connectivity Feasibility 输入。只表达"能否建连"的
+/// 可行性判断，不建立业务 Link，不含业务评分权重（Measurement ≠ Score）。
+///
+/// 字段语义（v9 §8.1）：
+/// - `direct_likely`：无需 NAT 穿透即可直连；
+/// - `punching_likely`：NAT 穿透可能成功；
+/// - `relay_available`：中继可用（TURN / peer-relay）；
+/// - `existing_link_available`：已有链路可复用；
+/// - `estimated_setup_cost_ms`：预估建连成本（毫秒），`None` = 无可行路径；
+/// - `confidence_percent`：输入完备度 0..=100（不是业务分数）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectivityEvaluation {
+    /// DTO 版本（当前为 1）。
+    pub version: u32,
+    /// 直连可能。
+    pub direct_likely: bool,
+    /// 打洞可能。
+    pub punching_likely: bool,
+    /// 中继可用。
+    pub relay_available: bool,
+    /// 已有链路可复用。
+    pub existing_link_available: bool,
+    /// 预估建连成本（毫秒）；`None` 表示无可行路径。
+    pub estimated_setup_cost_ms: Option<u32>,
+    /// 置信度 0..=100。
+    pub confidence_percent: u8,
+}
+
+impl ConnectivityEvaluation {
+    /// 当前 DTO 版本。
+    pub const VERSION: u32 = 1;
+
+    /// 是否至少有一条可行路径（任一建连方式可行）。
+    #[must_use]
+    pub fn has_feasible_path(&self) -> bool {
+        self.direct_likely
+            || self.punching_likely
+            || self.relay_available
+            || self.existing_link_available
+    }
+}
+
 // ---------- Session 双轨状态 ----------
 
 /// 生命周期阶段（资源分配/激活/排空/释放的物理状态）。

@@ -734,6 +734,8 @@ dependencies = [
  "flate2",
  "lz4_flex",
  "nexus-delivery",
+ "nexus-domain",
+ "nexus-measurement",
  "nexus-platform",
  "rand 0.8.8",
  "ring",

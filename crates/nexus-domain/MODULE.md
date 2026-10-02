@@ -51,6 +51,12 @@
 - `PlanExtension` 类型化领域扩展：`NetworkPlanExtension` / `WorkspacePlanExtension` / `ComputePlanExtension` / `ServicePlanExtension`，各带 `version` 字段；`Plan.extension: Option<PlanExtension>`（替代原 `domain_extension_type: Option<String>`）。
 - `NexusError` 结构化失败枚举（PRODUCT §2 七类失败 + `Unsupported` / `Internal`）与 `FailureDisposition`（Retry/Fallback/Abort/Escalate）。
 - `TerminalOutcome` 改造：`Failed(NexusError)` 携带结构化错误；`Cancelled` 无 payload（原因经 Session 事件记录）。
+- `ConnectivityEvaluation`（v9 §8.1）：规划期连通性可行性 DTO（版本化，`VERSION=1`）——
+  `direct_likely` / `punching_likely` / `relay_available` / `existing_link_available` /
+  `estimated_setup_cost_ms: Option<u32>`（`None` = 无可行路径）/
+  `confidence_percent: u8`；`has_feasible_path()` 任一路径可行即 true。
+  由 `nexus-connectivity::evaluation::evaluate_connectivity` 纯函数产生，
+  作为 Core Planner 的 Connectivity Feasibility 输入。
 
 ## Verification
 

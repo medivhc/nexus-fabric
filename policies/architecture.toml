@@ -40,7 +40,7 @@ layer = "portable-core"
 
 [[crate]]
 name = "nexus-connectivity"
-allowed_internal_dependencies = ["nexus-delivery", "nexus-platform"]
+allowed_internal_dependencies = ["nexus-delivery", "nexus-platform", "nexus-domain", "nexus-measurement"]
 portable = false
 layer = "delivery"
 

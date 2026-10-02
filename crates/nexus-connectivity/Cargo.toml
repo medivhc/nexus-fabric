@@ -11,6 +11,11 @@ workspace = true
 [dependencies]
 nexus-delivery = { path = "../nexus-delivery" }
 nexus-platform = { path = "../nexus-platform" }
+# v9 §8.1 Connectivity Evaluation：输出 DTO（nexus-domain 共享词汇）+
+# 最近测量输入（nexus-measurement 事实测量）。均为 DTO/事实依赖，
+# 不引入业务逻辑层依赖（见 MODULE.md Allowed Dependencies）。
+nexus-domain = { path = "../nexus-domain" }
+nexus-measurement = { path = "../nexus-measurement" }
 # 链路加密基元（X25519 身份密钥 / HKDF-SHA256 / ChaCha20Poly1305 AEAD）。
 # P4.1 §12.39：ring 0.17 不公开私钥序列化，长期身份密钥改用 x25519-dalek
 # （纯 Rust、no_std 兼容、Apache-2.0/MIT，WireGuard/Noise 生态标准实现）；

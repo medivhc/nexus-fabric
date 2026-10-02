@@ -22,6 +22,8 @@
 
 - `nexus-delivery`
 - `nexus-platform`
+- `nexus-domain`（仅 `evaluation` 模块：`ConnectivityEvaluation` DTO 输出词汇）
+- `nexus-measurement`（仅 `evaluation` 模块：`LinkMeasurement` 事实输入）
 
 ## Forbidden Dependencies
 
@@ -700,3 +702,24 @@ Protected，不得改动**；以下为 additive 新增。
 - Deletion Test：六个新接缝对应六个独立的"真实 I/O 落地"维度（定时器/事件消费/
   执行循环/真实句柄/线格式+drain/文件轮询），各自可独立替换实现；不引入第二套
   系统级 Plan，不改 virtual_subnet/relay/lib（片1 所有）。
+
+### 冻结契约（Connectivity Evaluation v9 §8.1，scenarios/product/connectivity_evaluation.toml）
+
+- `evaluation::PlatformNetworkCapability { udp_supported, ipv6_supported }`：平台网络能力（最小集合）。
+- `evaluation::EvaluationInput`：Known Locators、本端/对端 NAT 观测、历史打洞成功率
+  （万分比）、最近链路测量（`LinkMeasurement`）、中继可用性、已有链路、平台能力。
+  由 Composition Root 采集；函数只做纯计算。
+- `evaluation::evaluate_connectivity(&EvaluationInput) -> nexus_domain::ConnectivityEvaluation`：
+  确定性纯函数（零 I/O、无隐藏状态），输出 v9 §8.1 五元组 + Confidence。
+- 判定语义（保守优先）：
+  - `DirectLikely`：有候选 Locator + UDP 可用 + 本端 FullCone + 对端非 Symmetric；
+  - `PunchingLikely`：复用冻结 NAT 合同可达性——cone–cone、cone–symmetric 可达，
+    symmetric–symmetric 不可达；任一端未知时退到历史成功率（≥50% 判 likely，
+    无历史则 false）；
+  - `EstimatedSetupCost`：可用路径最小估计（existing 0ms / direct 取实测 RTT 或
+    100ms / punch 3000ms=有界预测 3s 时间盒 / relay 500ms）；无可行路径时 `None`；
+  - `Confidence`：100 起扣（本端未知 -25、对端未知 -25、无历史 -10、无测量 -10、
+    无 Locator -15），饱和减。
+- 数值全整数（无浮点）；`has_feasible_path()` 任一路径可行即 true。
+- 依赖说明：`nexus-domain` 仅为 `ConnectivityEvaluation` DTO 词汇，
+  `nexus-measurement` 仅为 `LinkMeasurement` 事实输入；不引入业务逻辑层依赖。
