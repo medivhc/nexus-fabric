@@ -22,6 +22,14 @@ use std::path::PathBuf;
 
 use nexus_storage::{ContentStore, ObjectId};
 
+/// Workspace object cache (v9 §22): score-based eviction with pin iron rule.
+pub mod cache;
+
+/// Adapter: `WorkspaceAccess` → `nexus_platform::ProjectedWorkspace`
+/// (portable projection contract consumed by `nexus-platform-*`).
+pub mod projection_adapt;
+pub use projection_adapt::WorkspaceProjection;
+
 /// 合并事件：已找到合并基（Common Ancestor）。
 pub const EV_COMMON_ANCESTOR_FOUND: &str = "common_ancestor_found";
 /// 合并事件：已创建 Merge Commit。
