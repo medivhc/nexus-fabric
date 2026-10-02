@@ -18,11 +18,13 @@
 
 use nexus::control_service::{ControlServiceImpl, render_text};
 use nexus::localapi_client::{self, DEFAULT_LOCALAPI_ADDR};
+use nexus::mesh::AutoMeshController;
 use nexus::schedule_cli::{
     default_state_path as schedule_state_path, error_json as schedule_error_json, schedule_at,
     schedule_cancel, schedule_every, schedule_list, schedule_tick, unix_now_secs,
 };
 use nexus::subnet_cli::{
+    assemble_default_tunnel, assemble_real_tunnel_for_daemon, classify_tun_error,
     default_state_path, subnet_leave, subnet_status, subnet_up, subnet_up_tun,
 };
 use nexus_control_api::{ControlCommand, ResourceId, SessionId};
@@ -296,6 +298,7 @@ fn run_subnet(args: &[String], json_mode: bool) -> i32 {
     let mut config: Option<PathBuf> = None;
     let mut state: Option<PathBuf> = None;
     let mut tun = false;
+    let mut foreground = false;
     let mut tun_name: Option<String> = None;
     let mut listen: Option<String> = None;
     let mut encrypt_state = false;
@@ -328,6 +331,12 @@ fn run_subnet(args: &[String], json_mode: bool) -> i32 {
             }
             "--tun" => {
                 tun = true;
+                i += 1;
+            }
+            "--foreground" => {
+                // §12.38 bugfix：01e5114 迁移丢失的常驻 flag（前台持有隧道，
+                // 轮询状态文件等 leave → 优雅退出）。
+                foreground = true;
                 i += 1;
             }
             "--tun-name" => {
@@ -389,6 +398,10 @@ fn run_subnet(args: &[String], json_mode: bool) -> i32 {
                 eprintln!("error: subnet up requires --config <path>");
                 return 2;
             };
+            if foreground {
+                // 常驻：装配并持有隧道，直到 leave 信号（状态文件删除）→ 优雅退出 0。
+                return subnet_foreground(&cfg, &state_path, encrypt_state, tun, tun_name, listen);
+            }
             if tun {
                 let name = tun_name.unwrap_or_else(|| "nexus0".to_string());
                 let lsn = listen.unwrap_or_else(|| "udp://0.0.0.0:0".to_string());
@@ -446,6 +459,104 @@ fn run_subnet(args: &[String], json_mode: bool) -> i32 {
         }
     };
     render_and_exit(&json, json_mode)
+}
+
+/// P3.5 常驻运行循环（§12.38 bugfix：恢复 01e5114 迁移丢失的 `--foreground`）：
+/// 持有隧道（进程为 Owner，随 drop 清理），轮询 leave 信号（状态文件被删除）
+/// → 优雅退出 0。`--tun` 时走真实数据面（wintun/tun + UDP），否则走默认隧道。
+fn subnet_foreground(
+    cfg: &std::path::Path,
+    state_path: &std::path::Path,
+    encrypt: bool,
+    use_tun: bool,
+    tun_name: Option<String>,
+    listen: Option<String>,
+) -> i32 {
+    let result: Result<u8, (String, String)> = if use_tun {
+        let name = tun_name.unwrap_or_else(|| "nexus0".to_string());
+        let lsn = listen.unwrap_or_else(|| "udp://0.0.0.0:0".to_string());
+        subnet_foreground_real(cfg, state_path, encrypt, &name, &lsn)
+    } else {
+        (|| {
+            let tunnel =
+                assemble_default_tunnel(cfg).map_err(|e| ("CONFIG_ERROR".to_string(), e))?;
+            let up =
+                subnet_up(cfg, state_path, encrypt).map_err(|e| ("CONFIG_ERROR".to_string(), e))?;
+            println!("{up}");
+            // Auto-Mesh 自动挡：自动打洞 + 断线自动重连。
+            let mut mesh = AutoMeshController::new(tunnel, 500);
+
+            // crash 恢复：从磁盘加载已发现的 peer
+            let mesh_state = state_path.with_extension("mesh.json");
+            mesh.load_state(&mesh_state);
+
+            let state_path_owned = state_path.to_path_buf();
+            let mesh_state_clone = mesh_state.clone();
+            mesh.run_with_save(move || !state_path_owned.exists(), Some(mesh_state_clone));
+            Ok(0)
+        })()
+    };
+    match result {
+        Ok(code) => code as i32,
+        Err((verdict, msg)) => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "verdict": verdict,
+                    "command": "subnet up",
+                    "error": msg,
+                })
+            );
+            0
+        }
+    }
+}
+
+/// P3.8（§12.38）真实数据面常驻：wintun/tun + UDP 承载，隧道由进程持有。
+///
+/// 成功：装配真实隧道 → 写状态文件 → up JSON 含 `local_locator` → 进入
+/// Auto-Mesh 常驻循环（leave 轮询：状态文件删除即停）；leave → 优雅退出 0，
+/// 函数返回时 drop 清理 wintun/tun 适配器与 UDP socket。
+///
+/// 失败（udp bind / wintun or tun create 失败）：**不写状态文件、不进入常驻循环、
+/// 绝不静默降级 mock**，输出 `TUN_ERROR` 结构化（exit 0）。tun 名校验等其它
+/// 配置错误 → `CONFIG_ERROR`（exit 0）。
+fn subnet_foreground_real(
+    cfg: &std::path::Path,
+    state_path: &std::path::Path,
+    encrypt: bool,
+    tun_name: &str,
+    listen: &str,
+) -> Result<u8, (String, String)> {
+    let (tunnel, local_locator) = match assemble_real_tunnel_for_daemon(cfg, tun_name, listen) {
+        Ok(v) => v,
+        Err(e) => {
+            if e.starts_with("TUN_ERROR") {
+                // 结构化 TUN_ERROR：Ok 语义（verdict=TUN_ERROR, exit 0），不降级。
+                println!("{}", classify_tun_error(&e));
+                return Ok(0);
+            }
+            return Err(("CONFIG_ERROR".to_string(), e));
+        }
+    };
+    let mut up =
+        subnet_up(cfg, state_path, encrypt).map_err(|e| ("CONFIG_ERROR".to_string(), e))?;
+    if let Some(obj) = up.as_object_mut() {
+        obj.insert("local_locator".into(), serde_json::json!(local_locator));
+    }
+    println!("{up}");
+    // Auto-Mesh 自动挡：自动打洞 + 断线自动重连。
+    // 持有真实隧道直到函数返回（drop 清理 wintun/tun 适配器与 UDP socket）。
+    let mut mesh = AutoMeshController::new(tunnel, 500);
+
+    // crash 恢复：从磁盘加载已发现的 peer
+    let mesh_state = state_path.with_extension("mesh.json");
+    mesh.load_state(&mesh_state);
+
+    let state_path_owned = state_path.to_path_buf();
+    let mesh_state_clone = mesh_state.clone();
+    mesh.run_with_save(move || !state_path_owned.exists(), Some(mesh_state_clone));
+    Ok(0)
 }
 
 /// `schedule at|every|list|cancel|tick`：进程内 SDK（LocalAPI 无 schedule 路由，
