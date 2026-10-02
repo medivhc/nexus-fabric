@@ -182,5 +182,13 @@
   "module": "nexus-projection",
   "category": "implementation-pitfall",
   "summary": "语义同构的签名偏离仍算契约偏离：MODULE 冻结 select_best -> Option<BoostSelection>，实现返回裸 BoostSelection（零行为影响）仍被判 WARN；Review 须逐字 diff 签名"
+ },
+ {
+  "id": "nat-quality-crate-placement",
+  "file": "entries/2026-10-02-nat-quality-crate-placement.md",
+  "date": "2026-10-02",
+  "module": "nexus-nat-quality",
+  "category": "architecture-decision",
+  "summary": "新 crate 选址：MODULE 禁止项（wireup 禁写 nexus-path）优先于任务建议位置，新建 nexus-nat-quality"
  }
 ]
