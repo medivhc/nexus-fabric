@@ -103,6 +103,15 @@ socket，`nexus-fabric` 的被动迁移保证流不中断。
 **R3（hysteresis 相对门限）**：见 S4（2026-09-30 起为相对 20% + 持续 3s，
 均可配置）。防抖动；连接级粘性（S5）不变。
 
+**R7（NAT 三类竞速唯一实现，D2，2026-10-02）**：`PathManager` 是 NAT
+打洞后生产流量切换的唯一竞速实现（`nexus-nat-traversal/src/race.rs`
+的 `select_path` 已退役删除）。Kind 映射（冻结）：
+`DirectP2P`→`Direct`、`TurnRelay`→`Turn`、`PeerRelay`→`Mesh`。
+冻结语义（contract `6ab671a04d061b16`）：20% 相对门限 + 3s 保持；
+打洞成功只让 direct 获得参赛资格（S7：无 stats 前不参选）。
+回归测试：`nat_peer_relay_beats_direct`、`nat_direct_wins_when_much_better`、
+`nat_no_switch_before_hold_elapses`（由 `race.rs` 合同测试改写）。
+
 **R4（竞速可观测）**：`RaceOutcome` 携带 `attempts: u32`（实际启动的尝试数，
 `≤ max_parallel`）与 `wasted_bytes: u64`（非获胜路径上已完成尝试所消耗的
 字节数；胜出时刻仍在进行的尝试不计入——无法观测其最终字节数，诚实省略）。

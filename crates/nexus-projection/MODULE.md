@@ -224,6 +224,22 @@ accept 线程，sync，零 tokio）把 SOCKS5/HTTP 显式代理映射为 fabric 
 - E4 必须走生产 `pump()` 路径（教训：`2026-09-30-e4-must-use-production-path`），
   禁止手动调 `rebind()` 冒充联动。
 
+**S27b（NAT 多连接选 active，D1，2026-10-02）**：NAT peer 在 `PathLink`
+中另有 `peer→PeerConns` 映射（`relay: Arc<ConnShared>` +
+`direct: Option<Arc<ConnShared>>` + `active` 标记）：
+- `register_nat_relay`：登记中继连接 + 注册 `Turn`/`Mesh` 候选（D2 映射）；
+  `active` 初始为 `Relay`。
+- `register_nat_direct`：打洞成功后登记直连 + 注册 `Direct` 候选；
+  **不立即切换**（冻结：打洞只授予参赛资格）。
+- `pump()` 对 NAT peer 的 `Switched` 事件：`to.kind == Direct` → `active = Direct`
+ （无直连时计数 `path_active_switch_no_direct` 并保持 `Relay`）；
+  `to.kind == Turn|Mesh` → `active = Relay`；`Proxy` 忽略。
+  成功切换计数 `path_active_switches`。**永不调用 `rebind()`**
+  （两个是不同 QUIC 连接，CID 不同，地址迁移不适用）。
+- Stats 供给约定：调用方（Track 2 测量循环）每 `probe_interval_ms`
+  对每个候选 `remote_addr` 调 `manager_mut().on_stats(&addr, stats)`；
+  无 stats 的候选分数未知（S7），不参选。
+
 **S28（Boost v1 胶水，2026-10-01 冻结）**：`boost.rs` 是 boost 配置到
 `nexus-path` 的组合胶水（依赖倒置：`nexus-network` 只产出纯数据
 `BoostPathParams`，本模块完成到 `PathConfig` 的映射与选路/建连策略）：

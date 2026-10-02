@@ -10,12 +10,10 @@
 
 pub mod candidate;
 pub mod predict;
-pub mod race;
 pub mod signal;
 
 pub use candidate::{CandidateKind, LocalCandidates, PunchCandidate, punch_targets};
 pub use predict::DefaultPredictor;
-pub use race::{path_score, select_path};
 pub use signal::{
     MAX_CANDIDATES, PunchAnswer, PunchOffer, SIGNAL_VERSION, SignalError, decode_answer,
     decode_offer, encode_answer, encode_offer,
@@ -183,24 +181,27 @@ impl PunchPredictor for NoopPredictor {
 }
 
 // ---------------------------------------------------------------------------
-// P5 三类路径竞速（类型由 Track A 定义，实现由 Track C 提供）
+// P5 三类路径竞速（类型由 Track A 定义，实现由 Track C 提供；
+// 2026-10-02 D2 退役：`race::select_path` 实现已删除，
+// `nexus-path::PathManager` 为唯一竞速实现）
 // ---------------------------------------------------------------------------
 
 /// 路径类别（冻结）。
+///
+/// D2 kind 映射（`nexus-path::PathKind`）：
+/// - `DirectP2P` → `PathKind::Direct`（打洞成功的直连候选）
+/// - `TurnRelay` → `PathKind::Turn`（TURN 中继候选）
+/// - `PeerRelay` → `PathKind::Mesh`（经对端 FIB 的中继候选）
+///
+/// 冻结语义（contract `6ab671a04d061b16`）由 `PathManager` 实现：
+/// 20% 相对门限 + 3s 保持；打洞成功只授予参赛资格。
+/// 回归测试见 `nexus-path` 的 `nat_*` 测试（由 `race.rs` 的
+/// `peer_relay_beats_direct` 等改写）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RaceClass {
     DirectP2P,
     TurnRelay,
     PeerRelay,
-}
-
-/// 带打分的路径候选。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ScoredPath {
-    pub class: RaceClass,
-    pub rtt_ms: u64,
-    /// 0.0–1.0。
-    pub loss_01: f64,
 }
 
 /// 打洞成功后向路径层登记 direct 候选（Track C 实现；
