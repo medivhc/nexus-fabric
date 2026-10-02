@@ -319,10 +319,17 @@ impl Filesystem for FuseWorkspaceFs {
         reply.ok();
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let res = self.with_inner(|inner| {
             let path = inner.inodes.get(&ino.0).ok_or(Errno::ENOENT)?.path.clone();
-            let data = inner.ws.read_file(&path).map_err(map_err_ws)?;
+            // O_TRUNC (0o1000): the kernel expects the filesystem to truncate
+            // on open; without this, a truncated write leaves stale tail bytes.
+            let trunc = (flags.0 & 0o1000) != 0;
+            let data = if trunc {
+                Vec::new()
+            } else {
+                inner.ws.read_file(&path).map_err(map_err_ws)?
+            };
             let fh = inner.next_fh;
             inner.next_fh += 1;
             inner.open.insert(
@@ -330,7 +337,8 @@ impl Filesystem for FuseWorkspaceFs {
                 OpenFile {
                     path,
                     buf: data,
-                    dirty: false,
+                    // Truncated opens must flush even with no subsequent write.
+                    dirty: trunc,
                 },
             );
             Ok(fh)
