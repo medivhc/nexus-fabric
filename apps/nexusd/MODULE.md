@@ -317,8 +317,10 @@ cargo clippy -p nexusd --all-targets -- -D warnings
   unmount/shutdown 时 WorkingSet 脏 → warn，**不静默提交**。
   R3：未 commit 的 WorkingSet 数据 daemon 重启即丢——写进挂载点 ≠ 持久化，
   只有 commit 后的数据才 crash-safe。
-- **D6（orphan 清理）**：启动时每个挂载点先 `fusermount -u` 幂等清理；
-  仍挂载（busy）则 `-uz`（lazy）。T4 合入后收敛进统一 `boot_reconcile`。
+- **D6（orphan 清理）**：`boot_reconcile` 的 orphan OS resources 步骤对
+  `workspace.toml` 的挂载点做幂等 `fusermount -u` 清理（busy 则 `-uz`），
+  结果记入 reconcile 报告 `orphan_mounts_cleaned`（F1 收敛，2026-10-02）；
+  `WorkspaceManager::start` 保留同样的幂等清理作兜底（自保护，双重清理无害）。
 - **D7（关闭顺序）**：LocalAPI → Workspace unmount → Dataplane → N1 → TUN。
 - **D8（降级）**：无 `/dev/fuse` → warn + workspace 子系统不启用，不静默 fallback。
 - **D9（依赖边）**：nexusd（Composition Root）→ `nexus-platform-linux`；

@@ -315,6 +315,37 @@ impl WorkspaceManager {
         config_dir.join("data")
     }
 
+    /// 解析 workspace.toml → 校验 → 每个条目的最终挂载点（D2 缺省规则）。
+    ///
+    /// F1：`boot_reconcile` 在 WorkspaceManager 启动之前做 orphan mount
+    /// 清理，需要先知道挂载点集合；与 `start` 共用同一函数，保证两处
+    /// 看到的挂载点一致（单源）。
+    pub fn resolve_mountpoints(config_dir: &Path, toml_text: &str) -> Result<Vec<PathBuf>, String> {
+        let entries = parse_workspace_toml(toml_text)?;
+        Self::mountpoints_of(&entries, config_dir)
+    }
+
+    /// 条目 → 最终挂载点（含 F5 冲突校验；纯路径逻辑，不碰文件系统）。
+    fn mountpoints_of(
+        entries: &[WorkspaceEntry],
+        config_dir: &Path,
+    ) -> Result<Vec<PathBuf>, String> {
+        let data_dir = Self::data_dir(config_dir);
+        let cas_dir = data_dir.join("cas");
+        let mounts_dir = data_dir.join("mounts");
+        let ws_base = data_dir.join("workspaces");
+        // F5：挂载点冲突校验（纯函数，可单测）。
+        validate_mountpoints(entries, &data_dir, &cas_dir, &mounts_dir, &ws_base)?;
+        Ok(entries
+            .iter()
+            .map(|e| {
+                e.mountpoint
+                    .clone()
+                    .unwrap_or_else(|| mounts_dir.join(&e.id))
+            })
+            .collect())
+    }
+
     /// 启动：解析 → orphan 清理 → open-or-create → 挂载。
     ///
     /// D8：无 `/dev/fuse` → warn + 返回 disabled manager（mounts 为空），不报错。
@@ -333,21 +364,21 @@ impl WorkspaceManager {
         let cas_dir = data_dir.join("cas");
         let mounts_dir = data_dir.join("mounts");
         let ws_base = data_dir.join("workspaces");
+        // 挂载点解析与校验（F5）走 resolve_mountpoints 同一路径，保证与
+        // boot_reconcile 的 orphan 清理看到一致的挂载点集合。
+        let mountpoints = Self::mountpoints_of(&entries, config_dir)?;
         std::fs::create_dir_all(&cas_dir)
             .map_err(|e| format!("create {}: {e}", cas_dir.display()))?;
         std::fs::create_dir_all(&mounts_dir)
             .map_err(|e| format!("create {}: {e}", mounts_dir.display()))?;
 
-        // F5：挂载点冲突校验（补全）。纯函数，可单测。
-        validate_mountpoints(&entries, &data_dir, &cas_dir, &mounts_dir, &ws_base)?;
-
         let mut mounts = Vec::with_capacity(entries.len());
-        for e in entries {
-            let mountpoint = e
-                .mountpoint
-                .clone()
-                .unwrap_or_else(|| mounts_dir.join(&e.id));
-            // D6：幂等清理 orphan mount。
+        for (e, mountpoint) in entries.iter().zip(mountpoints) {
+            // D6/F1：幂等清理 orphan mount（兜底）。boot_reconcile 已在启动
+            // 早期对同一挂载点集合做过一次清理并统一上报；此处保留是因为
+            // WorkspaceManager 必须自保护——即使绕过 boot_reconcile 直接
+            // start，也不能在残留内核挂载上叠挂。双重清理无害：
+            // cleanup_orphan_mount 未挂载时直接返回。
             cleanup_orphan_mount(&mountpoint);
             std::fs::create_dir_all(&mountpoint)
                 .map_err(|e| format!("create mountpoint {}: {e}", mountpoint.display()))?;
@@ -405,7 +436,7 @@ impl WorkspaceManager {
                 None
             };
             mounts.push(MountedWorkspace {
-                id: e.id,
+                id: e.id.clone(),
                 mountpoint,
                 handle,
                 _session: session,

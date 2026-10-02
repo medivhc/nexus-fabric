@@ -359,6 +359,9 @@ pub struct BootReconcileReport {
     pub links_staled: usize,
     /// 是否隔离了损坏的存储文件（取证保留，不静默丢弃）。
     pub store_corrupt_quarantined: bool,
+    /// F1：清理掉的 orphan FUSE 挂载点（Linux；workspace.toml 配置的
+    /// mountpoint 中 kill -9 后残留在内核的挂载）。加法字段。
+    pub orphan_mounts_cleaned: Vec<String>,
     /// reconcile 中遇到的非致命错误（boot 不因此中断，如实上报）。
     pub errors: Vec<String>,
 }
@@ -375,6 +378,7 @@ impl BootReconcileReport {
             "links_checked": self.links_checked,
             "links_staled": self.links_staled,
             "store_corrupt_quarantined": self.store_corrupt_quarantined,
+            "orphan_mounts_cleaned": self.orphan_mounts_cleaned,
             "errors": self.errors,
         })
     }
@@ -406,18 +410,51 @@ fn quarantine_corrupt(state_dir: &Path, file: &str) -> Result<bool, String> {
     Ok(true)
 }
 
+/// orphan FUSE 挂载清理（F1；仅 Linux）：对 workspace.toml 配置的挂载点做
+/// 幂等 `fusermount -u` 清理（busy 则 lazy）。
+///
+/// 幂等：未挂载的路径直接跳过，不报错；清理后仍挂载的记入 errors。
+/// 返回 `(实际清理掉的挂载点, 错误)`，调用方记入 reconcile 报告。
+#[cfg(target_os = "linux")]
+fn reconcile_orphan_mounts(mountpoints: &[PathBuf]) -> (Vec<String>, Vec<String>) {
+    use nexus_platform_linux::fuse_ws::{cleanup_orphan_mount, is_mounted};
+    let mut cleaned = Vec::new();
+    let mut errors = Vec::new();
+    for mp in mountpoints {
+        if !is_mounted(mp) {
+            continue;
+        }
+        cleanup_orphan_mount(mp);
+        if is_mounted(mp) {
+            errors.push(format!(
+                "orphan mount still mounted after cleanup: {}",
+                mp.display()
+            ));
+        } else {
+            cleaned.push(mp.to_string_lossy().into_owned());
+        }
+    }
+    (cleaned, errors)
+}
+
 /// 冷启动 reconcile（v9 §15.3，幂等）：
 ///
 /// ```text
 /// 建 state dir → 读 run marker（上次是否 crash）
 ///   → 隔离损坏文件（取证保留） → reconcile session 记录（孤儿 → Failed）
-///   → reconcile link marker（未 stale → stale） → 写新的 run marker
+///   → reconcile link marker（未 stale → stale）
+///   → 清理 orphan FUSE 挂载（F1；仅 Linux，workspace.toml 的 mountpoint）
+///   → 写新的 run marker
 /// ```
+///
+/// `orphan_mountpoints`：workspace.toml 解析出的挂载点（`WorkspaceManager::`
+/// `resolve_mountpoints`）；非 Linux 传空即可（清理步骤仅 Linux 编译）。
 ///
 /// 不 panic：存储错误记入报告 `errors`，boot 继续（daemon 不因 reconcile 失败而拒绝启动；
 /// 孤儿分类失败的记录下次启动会再次尝试——幂等）。
 #[must_use]
-pub fn boot_reconcile(state_dir: &Path) -> BootReconcileReport {
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+pub fn boot_reconcile(state_dir: &Path, orphan_mountpoints: &[PathBuf]) -> BootReconcileReport {
     let mut report = BootReconcileReport::default();
 
     if let Err(e) = fs::create_dir_all(state_dir) {
@@ -459,6 +496,16 @@ pub fn boot_reconcile(state_dir: &Path) -> BootReconcileReport {
             report.links_staled = marked_stale;
         }
         Err(e) => report.errors.push(format!("link reconcile: {e}")),
+    }
+
+    // F1：orphan OS resources——清理残留的 FUSE 挂载（仅 Linux 编译）。
+    // WorkspaceManager::start 里保留了同样的幂等清理作兜底（自保护）；
+    // 双重清理无害（未挂载时直接返回）。
+    #[cfg(target_os = "linux")]
+    {
+        let (cleaned, errors) = reconcile_orphan_mounts(orphan_mountpoints);
+        report.orphan_mounts_cleaned = cleaned;
+        report.errors.extend(errors);
     }
 
     if let Err(e) = write_run_marker(state_dir) {
@@ -597,7 +644,7 @@ mod tests {
             .unwrap();
         write_run_marker(&state).unwrap();
 
-        let report = boot_reconcile(&state);
+        let report = boot_reconcile(&state, &[]);
         assert!(report.crashed_before);
         assert_eq!(report.orphans_classified, 1);
         assert_eq!(report.links_staled, 1);
@@ -611,7 +658,7 @@ mod tests {
         assert!(links.load().unwrap()[0].stale);
 
         // 幂等：第二次 reconcile 不再重复分类
-        let report2 = boot_reconcile(&state);
+        let report2 = boot_reconcile(&state, &[]);
         assert_eq!(report2.orphans_classified, 0);
         assert_eq!(report2.links_staled, 0);
         let _ = fs::remove_dir_all(&dir);
@@ -624,7 +671,7 @@ mod tests {
         fs::create_dir_all(&state).unwrap();
         fs::write(state.join(SESSIONS_FILE), "garbage{{{").unwrap();
 
-        let report = boot_reconcile(&state);
+        let report = boot_reconcile(&state, &[]);
         assert!(report.store_corrupt_quarantined);
         // 隔离文件保留取证
         let quarantined: Vec<_> = fs::read_dir(&state)
@@ -637,6 +684,36 @@ mod tests {
         // boot 继续，不中断
         assert!(report.errors.is_empty());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn boot_reconcile_orphan_mount_noop_when_not_mounted() {
+        // F1 幂等：未挂载的路径清理不得让 boot 失败；报告保持空。
+        let dir = temp_state_dir("boot-orphan-noop");
+        let state = state_dir(&dir);
+        fs::create_dir_all(&state).unwrap();
+        let bogus = dir.join("definitely-not-a-mountpoint");
+        let report = boot_reconcile(&state, std::slice::from_ref(&bogus));
+        assert!(report.orphan_mounts_cleaned.is_empty());
+        assert!(report.errors.is_empty());
+        // 二次启动零清理（幂等）。
+        let report2 = boot_reconcile(&state, std::slice::from_ref(&bogus));
+        assert!(report2.orphan_mounts_cleaned.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn boot_reconcile_report_json_has_orphan_mounts_cleaned() {
+        // 报告 JSON 加法字段：默认空数组，老字段语义不变。
+        let report = BootReconcileReport::default();
+        let v = report.to_json();
+        assert_eq!(v["event"], "boot-reconcile");
+        assert!(v["orphan_mounts_cleaned"].is_array());
+        assert_eq!(v["orphan_mounts_cleaned"].as_array().unwrap().len(), 0);
+        // 老字段仍在。
+        assert!(v.get("orphans_classified").is_some());
+        assert!(v.get("links_staled").is_some());
+        assert!(v.get("crashed_before").is_some());
     }
 
     #[test]

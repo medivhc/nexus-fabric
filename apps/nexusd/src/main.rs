@@ -216,10 +216,35 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     };
     log_enabled_subsystems(&loaded);
 
+    // F1：orphan FUSE 挂载收敛进 boot_reconcile 统一报告。挂载点在 reconcile
+    // 之前解析，与 WorkspaceManager::start 共用 resolve_mountpoints，保证一致。
+    // 解析失败 → warn + 空集合（WorkspaceManager::start 稍后会以相同的
+    // fail-fast 语义退出，保持现有行为不变）。
+    #[cfg(target_os = "linux")]
+    let orphan_mountpoints: Vec<std::path::PathBuf> = match loaded.workspace_toml.as_deref() {
+        Some(text) => {
+            match nexusd::workspace::WorkspaceManager::resolve_mountpoints(
+                std::path::Path::new(config_dir),
+                text,
+            ) {
+                Ok(mps) => mps,
+                Err(e) => {
+                    eprintln!(
+                        "[nexusd] WARN: workspace config parse failed before reconcile ({e}); orphan mount cleanup skipped"
+                    );
+                    Vec::new()
+                }
+            }
+        }
+        None => Vec::new(),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let orphan_mountpoints: Vec<std::path::PathBuf> = Vec::new();
+
     // 0. 开机 reconcile（v9 §15.3）：先恢复 durable state，再接受新工作。
     //    位置在 T3 校验之前——reconcile 不依赖子系统配置，只依赖 config dir。
     let state_dir = nexusd::recovery::state_dir(&dir.root);
-    let boot_report = nexusd::recovery::boot_reconcile(&state_dir);
+    let boot_report = nexusd::recovery::boot_reconcile(&state_dir, &orphan_mountpoints);
     println!("{}", boot_report.to_json());
     // stdout 管道下是块缓冲：启动期的机器可读行必须立即 flush，
     // 否则编排器（如 E4）在进程退出前永远看不到（2026-10-02 真机踩坑）。
