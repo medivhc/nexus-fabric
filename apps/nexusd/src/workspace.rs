@@ -242,6 +242,73 @@ pub struct WorkspaceManager {
     pub fuse_available: bool,
 }
 
+/// F5：挂载点冲突校验（纯函数）。显式 mountpoint 不得：
+/// - 与另一条目的显式/默认挂载点重复（parse 时已查显式-显式）；
+/// - 落在 daemon 数据目录内（cas/、workspaces/、mounts/），避免 stacked
+///   mount 静默遮蔽或把 FUSE 挂到 CAS 上；
+/// - 是 data_dir 本体或其祖先；路径组件不得含 `..`（防词法绕过）。
+fn validate_mountpoints(
+    entries: &[WorkspaceEntry],
+    data_dir: &Path,
+    cas_dir: &Path,
+    mounts_dir: &Path,
+    ws_base: &Path,
+) -> Result<(), String> {
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for e in entries {
+        let mp = e
+            .mountpoint
+            .clone()
+            .unwrap_or_else(|| mounts_dir.join(&e.id));
+        if !seen.insert(mp.clone()) {
+            return Err(format!(
+                "workspace {}: duplicate mountpoint {}",
+                e.id,
+                mp.display()
+            ));
+        }
+        for reserved in [cas_dir, ws_base] {
+            if mp == *reserved || mp.starts_with(reserved) {
+                return Err(format!(
+                    "workspace {}: mountpoint {} collides with daemon data dir {}",
+                    e.id,
+                    mp.display(),
+                    reserved.display()
+                ));
+            }
+        }
+        // mounts/ 本体不能被挂载（会遮蔽全部默认挂载点）；其子目录是默认
+        // 挂载点的合法位置。
+        if mp == *mounts_dir {
+            return Err(format!(
+                "workspace {}: mountpoint {} must not be the mounts dir itself",
+                e.id,
+                mp.display()
+            ));
+        }
+        // Round-2 残留：挂载点不得是 data_dir 本体或其祖先（词法检查会被
+        // 含 `..` 的绝对路径绕过），且路径组件不得含 `..`。
+        if mp == data_dir || data_dir.starts_with(&mp) {
+            return Err(format!(
+                "workspace {}: mountpoint {} must not be the data dir or its ancestor",
+                e.id,
+                mp.display()
+            ));
+        }
+        if mp
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!(
+                "workspace {}: mountpoint {} must not contain `..`",
+                e.id,
+                mp.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl WorkspaceManager {
     /// daemon 数据目录（派生，不可配；v1 约定）。
     pub fn data_dir(config_dir: &Path) -> PathBuf {
@@ -271,36 +338,8 @@ impl WorkspaceManager {
         std::fs::create_dir_all(&mounts_dir)
             .map_err(|e| format!("create {}: {e}", mounts_dir.display()))?;
 
-        // F5：挂载点冲突校验（补全）。显式 mountpoint 不得：
-        // - 与另一条目的显式/默认挂载点重复（parse 时已查显式-显式）；
-        // - 落在 daemon 数据目录内（cas/、workspaces/、mounts/），避免 stacked
-        //   mount 静默遮蔽或把 FUSE 挂到 CAS 上。
-        {
-            let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-            for e in &entries {
-                let mp = e
-                    .mountpoint
-                    .clone()
-                    .unwrap_or_else(|| mounts_dir.join(&e.id));
-                if !seen.insert(mp.clone()) {
-                    return Err(format!(
-                        "workspace {}: duplicate mountpoint {}",
-                        e.id,
-                        mp.display()
-                    ));
-                }
-                for reserved in [&cas_dir, &ws_base, &mounts_dir] {
-                    if mp == *reserved || mp.starts_with(reserved) {
-                        return Err(format!(
-                            "workspace {}: mountpoint {} collides with daemon data dir {}",
-                            e.id,
-                            mp.display(),
-                            reserved.display()
-                        ));
-                    }
-                }
-            }
-        }
+        // F5：挂载点冲突校验（补全）。纯函数，可单测。
+        validate_mountpoints(&entries, &data_dir, &cas_dir, &mounts_dir, &ws_base)?;
 
         let mut mounts = Vec::with_capacity(entries.len());
         for e in entries {
@@ -492,6 +531,87 @@ mod tests {
         assert!(!mgr.fuse_available);
         assert!(mgr.is_empty());
         std::fs::remove_dir_all(d.join("data")).ok();
+    }
+
+    /// F5：挂载点冲突校验的纯函数单测（沙盒无 /dev/fuse 也可跑）。
+    #[test]
+    fn validate_mountpoints_rejects_collisions() {
+        let data = Path::new("/cfg/data");
+        let cas = data.join("cas");
+        let mounts = data.join("mounts");
+        let ws = data.join("workspaces");
+        let entry = |id: &str, mp: Option<&str>| WorkspaceEntry {
+            id: id.to_string(),
+            mountpoint: mp.map(PathBuf::from),
+            author: id.to_string(),
+            auto_commit_secs: 0,
+        };
+
+        // 合法：默认挂载点
+        assert!(validate_mountpoints(&[entry("a", None)], data, &cas, &mounts, &ws).is_ok());
+        // 重复挂载点
+        assert!(
+            validate_mountpoints(
+                &[entry("a", Some("/mnt/x")), entry("b", Some("/mnt/x"))],
+                data,
+                &cas,
+                &mounts,
+                &ws
+            )
+            .is_err()
+        );
+        // 显式挂载点撞上另一条目的默认挂载点
+        assert!(
+            validate_mountpoints(
+                &[entry("a", None), entry("b", Some("/cfg/data/mounts/a"))],
+                data,
+                &cas,
+                &mounts,
+                &ws
+            )
+            .is_err()
+        );
+        // 落在 cas/ 内
+        assert!(
+            validate_mountpoints(
+                &[entry("a", Some("/cfg/data/cas/x"))],
+                data,
+                &cas,
+                &mounts,
+                &ws
+            )
+            .is_err()
+        );
+        // mounts/ 本体
+        assert!(
+            validate_mountpoints(
+                &[entry("a", Some("/cfg/data/mounts"))],
+                data,
+                &cas,
+                &mounts,
+                &ws
+            )
+            .is_err()
+        );
+        // data_dir 本体 / 祖先
+        assert!(
+            validate_mountpoints(&[entry("a", Some("/cfg/data"))], data, &cas, &mounts, &ws)
+                .is_err()
+        );
+        assert!(
+            validate_mountpoints(&[entry("a", Some("/cfg"))], data, &cas, &mounts, &ws).is_err()
+        );
+        // 含 `..`
+        assert!(
+            validate_mountpoints(
+                &[entry("a", Some("/cfg/data/../evil"))],
+                data,
+                &cas,
+                &mounts,
+                &ws
+            )
+            .is_err()
+        );
     }
 
     /// F11：auto-commit 线程端到端（需 /dev/fuse；沙盒跳过）。
