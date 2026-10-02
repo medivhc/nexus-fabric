@@ -105,13 +105,17 @@ fn wait_victim_ready(child: &mut Child) {
 }
 
 /// 启动一次 nexusd，等待 boot-reconcile 行 + READY 行，返回 reconcile JSON。
-fn boot_nexusd(root: &Path, config_dir: &Path) -> (Child, serde_json::Value) {
+/// stderr 落到 `<config-dir>/nexusd-boot-<tag>.stderr.log`，失败时可取证。
+fn boot_nexusd(root: &Path, config_dir: &Path, tag: &str) -> (Child, serde_json::Value) {
+    let stderr_path = config_dir.join(format!("nexusd-boot-{tag}.stderr.log"));
+    let stderr_file = fs::File::create(&stderr_path)
+        .unwrap_or_else(|e| fail_json(&format!("create stderr log: {e}")));
     let mut child = Command::new("cargo")
         .args(["run", "--quiet", "-p", "nexusd", "--bin", "nexusd", "--"])
         .arg(config_dir)
         .current_dir(root)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(stderr_file)
         .spawn()
         .unwrap_or_else(|e| fail_json(&format!("spawn nexusd: {e}")));
 
@@ -128,7 +132,17 @@ fn boot_nexusd(root: &Path, config_dir: &Path) -> (Child, serde_json::Value) {
         }
         line.clear();
         match reader.read_line(&mut line) {
-            Ok(0) => fail_json("nexusd exited before READY"),
+            Ok(0) => {
+                let tail =
+                    fs::read_to_string(config_dir.join(format!("nexusd-boot-{tag}.stderr.log")))
+                        .map(|s| {
+                            let lines: Vec<&str> = s.lines().collect();
+                            let n = lines.len();
+                            lines[n.saturating_sub(8)..].join("\n")
+                        })
+                        .unwrap_or_default();
+                fail_json(&format!("nexusd exited before READY; stderr tail:\n{tail}"));
+            }
             Ok(_) => {
                 let t = line.trim();
                 if t.starts_with("{\"event\":\"boot-reconcile\"") {
@@ -186,7 +200,7 @@ fn main() {
     let _ = victim_child.wait();
 
     // 3. 第一次启动：crash 后的 reconcile。
-    let (mut boot1, rec1) = boot_nexusd(&root, &config_dir);
+    let (mut boot1, rec1) = boot_nexusd(&root, &config_dir, "1");
     let boot1_pid = boot1.id();
     // SIGTERM 干净关闭，run marker 应被清除。
     kill(boot1_pid, "-TERM");
@@ -197,7 +211,7 @@ fn main() {
     let marker_gone = !recovery::previous_crashed(&state_dir);
 
     // 4. 第二次启动：幂等验证。
-    let (mut boot2, rec2) = boot_nexusd(&root, &config_dir);
+    let (mut boot2, rec2) = boot_nexusd(&root, &config_dir, "2");
     kill(boot2.id(), "-TERM");
     if !boot2.wait_timeout_or_kill(Duration::from_secs(15)) {
         fail_json("nexusd (2nd boot) did not exit on SIGTERM in 15s");
