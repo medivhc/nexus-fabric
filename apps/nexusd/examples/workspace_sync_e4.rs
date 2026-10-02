@@ -42,11 +42,13 @@ fn fabric_pair() -> FabricPair {
     let server_addr = *server_driver.shared().local_addr.lock().unwrap();
     let server_peer = server_driver.shared().peer_id.expect("server identity");
     let client_driver = Driver::new_client().expect("client driver");
+    // P0 服务端无 client auth（server_conn.peer 为 zeroed）；
+    // E4 从 client driver 取真实 client peer ID，用于 serve 端 authz。
+    let client_peer = client_driver.shared().peer_id.expect("client identity");
     let client_conn = client_driver
         .connect(server_peer, server_addr, Duration::from_secs(5))
         .expect("client connect");
     let server_conn = server_driver.accept_conn().expect("server accept");
-    let client_peer = server_conn.peer;
     FabricPair {
         _server_driver: server_driver,
         _client_driver: client_driver,
@@ -104,12 +106,13 @@ fn run_basic() {
     members.insert(_client_peer_hex.clone());
     let auth = SyncAuthorizer::new(members);
     let server_conn = pair.server_conn.clone();
-    let server_peer = pair.server_peer;
+    let _server_peer = pair.server_peer;
+    let client_peer_ = pair.client_peer;
     let serve_handle = std::thread::spawn(move || {
         let sh = server_conn.accept_stream().expect("accept stream");
         let (send, recv) = nexus_fabric::split_stream(sh);
         let mut transport =
-            FabricSyncTransport::from_accepted(send, recv, &server_peer, DEFAULT_RECV_DEADLINE);
+            FabricSyncTransport::from_accepted(send, recv, &client_peer_, DEFAULT_RECV_DEADLINE);
         // 首帧 type 校验由 transport 内部完成（read_frame 验 0x03）。
         let outcome = serve_sync_authorized(&mut b, &mut transport, &auth).expect("serve");
         let _ = server_peer_hex;
@@ -173,18 +176,18 @@ fn run_race_path() {
     let auth = SyncAuthorizer::new(members);
 
     // B 端 serve 线程：依次在两条连接上 serve。
-    let serve = |server_conn: Arc<ConnShared>, server_peer: PeerId, auth: SyncAuthorizer| {
+    let serve = |server_conn: Arc<ConnShared>, client_peer: PeerId, auth: SyncAuthorizer| {
         std::thread::spawn(move || {
             let sh = server_conn.accept_stream().expect("accept");
             let (send, recv) = nexus_fabric::split_stream(sh);
             let mut t =
-                FabricSyncTransport::from_accepted(send, recv, &server_peer, DEFAULT_RECV_DEADLINE);
+                FabricSyncTransport::from_accepted(send, recv, &client_peer, DEFAULT_RECV_DEADLINE);
             let mut bb = new_workspace("ws-b", "author-b");
             let o = serve_sync_authorized(&mut bb, &mut t, &auth).expect("serve");
             (bb, o)
         })
     };
-    let h1 = serve(pair1.server_conn.clone(), pair1.server_peer, auth.clone());
+    let h1 = serve(pair1.server_conn.clone(), pair1.client_peer, auth.clone());
 
     // A 在 conn1 上开始 sync，中途"切换路径"：丢弃 transport，换 conn2 重跑。
     let t1 = FabricSyncTransport::open(&pair1.client_conn, DEFAULT_RECV_DEADLINE).expect("open1");
@@ -193,7 +196,7 @@ fn run_race_path() {
     let _ = h1.join();
 
     // 重跑：换到 conn2（模拟 active_conn 已切换为 direct）。
-    let h2 = serve(pair2.server_conn.clone(), pair2.server_peer, auth);
+    let h2 = serve(pair2.server_conn.clone(), pair2.client_peer, auth);
     let mut t2 =
         FabricSyncTransport::open(&pair2.client_conn, DEFAULT_RECV_DEADLINE).expect("open2");
     let report = b.sync_with_remote(&mut t2).expect("resync");
@@ -241,12 +244,13 @@ fn run_authz() {
     // E 尝试 sync → 被拒绝。
     let auth_e = auth.clone();
     let server_conn_e = pair_e.server_conn.clone();
-    let server_peer_e = pair_e.server_peer;
+    let _server_peer_e = pair_e.server_peer;
+    let client_peer_e = pair_e.client_peer;
     let h_e = std::thread::spawn(move || {
         let sh = server_conn_e.accept_stream().expect("accept");
         let (send, recv) = nexus_fabric::split_stream(sh);
         let mut t =
-            FabricSyncTransport::from_accepted(send, recv, &server_peer_e, DEFAULT_RECV_DEADLINE);
+            FabricSyncTransport::from_accepted(send, recv, &client_peer_e, DEFAULT_RECV_DEADLINE);
         let mut bb = new_workspace("ws-b", "author-b");
         serve_sync_authorized(&mut bb, &mut t, &auth_e).expect("serve")
     });
@@ -273,12 +277,13 @@ fn run_authz() {
 
     // A 正常 sync → 通过（对照组）。
     let server_conn_a = pair_a.server_conn.clone();
-    let server_peer_a = pair_a.server_peer;
+    let _server_peer_a = pair_a.server_peer;
+    let client_peer_a = pair_a.client_peer;
     let h_a = std::thread::spawn(move || {
         let sh = server_conn_a.accept_stream().expect("accept");
         let (send, recv) = nexus_fabric::split_stream(sh);
         let mut t =
-            FabricSyncTransport::from_accepted(send, recv, &server_peer_a, DEFAULT_RECV_DEADLINE);
+            FabricSyncTransport::from_accepted(send, recv, &client_peer_a, DEFAULT_RECV_DEADLINE);
         serve_sync_authorized(&mut b, &mut t, &auth).expect("serve")
     });
     let mut ta =
@@ -345,19 +350,20 @@ fn run_resume() {
 
     // B 端 serve（成员）。
     let server_conn = pair.server_conn.clone();
-    let server_peer = pair.server_peer;
+    let _server_peer = pair.server_peer;
+    let client_peer_ = pair.client_peer;
     let serve_handle = std::thread::spawn(move || {
         let sh = server_conn.accept_stream().expect("accept");
         let (send, recv) = nexus_fabric::split_stream(sh);
         let mut t =
-            FabricSyncTransport::from_accepted(send, recv, &server_peer, DEFAULT_RECV_DEADLINE);
+            FabricSyncTransport::from_accepted(send, recv, &client_peer_, DEFAULT_RECV_DEADLINE);
         let mut b = new_workspace("ws-b", "author-b");
         let outcome = serve_sync_authorized(&mut b, &mut t, &auth).expect("serve1");
         // 第二次 serve（resume 用新流）。
         let sh2 = server_conn.accept_stream().expect("accept2");
         let (send2, recv2) = nexus_fabric::split_stream(sh2);
         let mut t2 =
-            FabricSyncTransport::from_accepted(send2, recv2, &server_peer, DEFAULT_RECV_DEADLINE);
+            FabricSyncTransport::from_accepted(send2, recv2, &client_peer_, DEFAULT_RECV_DEADLINE);
         let outcome2 = serve_sync_authorized(&mut b, &mut t2, &auth).expect("serve2");
         (b, outcome, outcome2)
     });
@@ -450,12 +456,13 @@ fn run_shallow_sparse() {
     members.insert(client_hex_b);
     let auth = SyncAuthorizer::new(members);
     let server_conn_b = pair_b.server_conn.clone();
-    let server_peer_b = pair_b.server_peer;
+    let _server_peer_b = pair_b.server_peer;
+    let client_peer_b = pair_b.client_peer;
     let serve_b = std::thread::spawn(move || {
         let sh = server_conn_b.accept_stream().expect("accept");
         let (send, recv) = nexus_fabric::split_stream(sh);
         let mut t =
-            FabricSyncTransport::from_accepted(send, recv, &server_peer_b, DEFAULT_RECV_DEADLINE);
+            FabricSyncTransport::from_accepted(send, recv, &client_peer_b, DEFAULT_RECV_DEADLINE);
         let mut b = new_workspace("ws-b", "author-b");
         let r = serve_sync_authorized(&mut b, &mut t, &auth).expect("serve b");
         (b, r)
@@ -486,7 +493,8 @@ fn run_shallow_sparse() {
     members_c.insert(client_hex_c);
     let auth_c = SyncAuthorizer::new(members_c);
     let server_conn_c = pair_c.server_conn.clone();
-    let server_peer_c = pair_c.server_peer;
+    let _server_peer_c = pair_c.server_peer;
+    let client_peer_c = pair_c.client_peer;
     let serve_c = std::thread::spawn(move || {
         let mut a2 = new_workspace("ws-a", "author-a");
         for i in 0..10 {
@@ -509,7 +517,7 @@ fn run_shallow_sparse() {
         let sh = server_conn_c.accept_stream().expect("accept");
         let (send, recv) = nexus_fabric::split_stream(sh);
         let mut t =
-            FabricSyncTransport::from_accepted(send, recv, &server_peer_c, DEFAULT_RECV_DEADLINE);
+            FabricSyncTransport::from_accepted(send, recv, &client_peer_c, DEFAULT_RECV_DEADLINE);
         let r = serve_sync_authorized(&mut a2, &mut t, &auth_c).expect("serve c");
         (a2, r)
     });
