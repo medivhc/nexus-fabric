@@ -102,15 +102,29 @@ fn http_get(addr: &str, path: &str) -> Result<String, String> {
             Ok(mut s) => {
                 s.set_read_timeout(Some(Duration::from_secs(10)))
                     .map_err(|e| e.to_string())?;
-                write!(s, "GET {path} HTTP/1.0\r\nHost: {addr}\r\n\r\n")
-                    .map_err(|e| format!("write: {e}"))?;
+                if let Err(e) = write!(s, "GET {path} HTTP/1.0\r\nHost: {addr}\r\n\r\n") {
+                    if Instant::now() >= deadline {
+                        return Err(format!("write: {e}"));
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
                 let mut resp = String::new();
-                s.read_to_string(&mut resp)
-                    .map_err(|e| format!("read: {e}"))?;
-                return resp
-                    .split_once("\r\n\r\n")
-                    .map(|(_, b)| b.to_string())
-                    .ok_or_else(|| format!("no body in response: {resp}"));
+                match s.read_to_string(&mut resp) {
+                    Ok(_) => {
+                        return resp
+                            .split_once("\r\n\r\n")
+                            .map(|(_, b)| b.to_string())
+                            .ok_or_else(|| format!("no body in response: {resp}"));
+                    }
+                    // daemon 启动瞬间的偶发 RST：重试而非直接失败。
+                    Err(e) => {
+                        if Instant::now() >= deadline {
+                            return Err(format!("read: {e}"));
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
             }
             Err(e) => {
                 if Instant::now() >= deadline {

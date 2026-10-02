@@ -9,7 +9,9 @@ dual_track = "LifecyclePhase + TerminalOutcome"
 sessions = "sess-1(active/completed) sess-2(disposed/failed) sess-3(allocating/unfinished)"
 
 [when]
-command = "cargo run --quiet -p nexusd -- session watch --json"
+# CLI 统一重构（01e5114）后观察命令走 daemon LocalAPI；harness 不负责起 daemon，
+# 故用 localapi_probe 自包含起临时 daemon 查一次（等价于旧 `nexusd <cmd> --json` 进程内快照）。
+command = "cargo run --quiet -p nexusd --example localapi_probe -- --path /localapi/v0/session/watch"
 
 [[expect]]
 field = "verdict"
