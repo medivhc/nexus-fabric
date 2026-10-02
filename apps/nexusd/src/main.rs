@@ -214,6 +214,12 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     let state_dir = nexusd::recovery::state_dir(&dir.root);
     let boot_report = nexusd::recovery::boot_reconcile(&state_dir);
     println!("{}", boot_report.to_json());
+    // stdout 管道下是块缓冲：启动期的机器可读行必须立即 flush，
+    // 否则编排器（如 E4）在进程退出前永远看不到（2026-10-02 真机踩坑）。
+    {
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+    }
     for e in &boot_report.errors {
         eprintln!("[nexusd] boot-reconcile error: {e}");
     }
@@ -299,9 +305,16 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         .expect("spawn localapi thread");
     // 等 LocalAPI 就绪（最多 5 秒）。
     match ready_rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(addr) => println!(
-            "{{\"verdict\":\"READY\",\"daemon\":{{\"entry\":\"nexusd\",\"config_dir\":\"{config_dir}\",\"localapi\":\"{addr}\"}}}}"
-        ),
+        Ok(addr) => {
+            println!(
+                "{{\"verdict\":\"READY\",\"daemon\":{{\"entry\":\"nexusd\",\"config_dir\":\"{config_dir}\",\"localapi\":\"{addr}\"}}}}"
+            );
+            // 同上：READY 行必须立即 flush（块缓冲坑）。
+            {
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+            }
+        }
         Err(_) => {
             eprintln!(
                 "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"localapi did not start\"}}}}"
