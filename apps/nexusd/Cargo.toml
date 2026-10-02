@@ -22,6 +22,10 @@ nexus-projection = { path = "../../crates/nexus-projection" }
 nexus-connectivity = { path = "../../crates/nexus-connectivity" }
 nexus-dns = { path = "../../crates/nexus-dns" }
 nexus-path = { path = "../../crates/nexus-path" }
+nexus-nat-traversal = { path = "../../crates/nexus-nat-traversal" }
+nexus-nat-wireup = { path = "../../crates/nexus-nat-wireup" }
+nexus-nat-quality = { path = "../../crates/nexus-nat-quality" }
+nexus-fabric = { path = "../../crates/nexus-fabric" }
 toml = "0.8"
 nexus-service = { path = "../../crates/nexus-service" }
 nexus-workspace = { path = "../../crates/nexus-workspace" }

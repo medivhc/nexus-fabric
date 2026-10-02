@@ -42,3 +42,53 @@ impl DatagramTransport for Arc<nexus_fabric::FabricConn> {
         self.stats().rtt_ms
     }
 }
+
+/// Driver-level transport: [`DatagramTransport`] over a shared connection
+/// handle.
+///
+/// `PunchManager` hands out `Arc<ConnShared>`, not `FabricConn` (which also
+/// anchors the driver thread). The probe logic is identical to the
+/// `Arc<FabricConn>` impl above — same `Cmd::SendDatagram` path, same
+/// `dgrams` queue, same `stats().rtt_ms`. This is what the production
+/// composition root and the E4 use.
+impl DatagramTransport for Arc<nexus_fabric::ConnShared> {
+    type Error = nexus_fabric::FabricError;
+
+    fn send_dgram(&self, data: &[u8]) -> Result<(), Self::Error> {
+        if data.len() > 1200 {
+            return Err(nexus_fabric::FabricError::Transport(
+                "datagram too large (S5: 1200 byte cap)".into(),
+            ));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(nexus_fabric::Cmd::SendDatagram {
+                conn: self.id.0,
+                data: data.to_vec(),
+                reply: tx,
+            })
+            .map_err(|_| nexus_fabric::FabricError::Closed(0))?;
+        rx.recv()
+            .map_err(|_| nexus_fabric::FabricError::Closed(0))?
+    }
+
+    fn recv_dgram(&self) -> Result<Vec<u8>, Self::Error> {
+        let mut q = self.dgrams.lock().unwrap();
+        loop {
+            if let Some(d) = q.pop_front() {
+                return Ok(d);
+            }
+            if let Some(e) = self.state.lock().unwrap().closed.clone() {
+                return Err(e);
+            }
+            q = self
+                .dgram_cv
+                .wait(q)
+                .map_err(|_| nexus_fabric::FabricError::Transport("lock poisoned".into()))?;
+        }
+    }
+
+    fn rtt_ms(&self) -> Option<u64> {
+        self.stats.lock().unwrap().rtt_ms
+    }
+}
