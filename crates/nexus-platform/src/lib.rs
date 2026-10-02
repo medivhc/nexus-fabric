@@ -108,6 +108,14 @@ pub use udp_carrier::UdpCarrier;
 /// SecureStore 平台无关核心（machine-id 解析 / NEXSEC1 格式 / AEAD 记录）。
 pub mod secure_store;
 
+/// Workspace filesystem projection contract (v9 §22, portable).
+///
+/// Platform adapters (`nexus-platform-*`) consume this trait; workspace
+/// access channels implement it (adapted in `nexus-workspace`). See the
+/// module docs for the Deletion Test.
+pub mod projected;
+pub use projected::{ProjectedDirEntry, ProjectedWorkspace};
+
 /// 当前用户 WinINET 系统代理快照（PRODUCT §13）。
 ///
 /// `server` 对应注册表 `ProxyServer`（如 `127.0.0.1:7898`）；未设置为 `None`。

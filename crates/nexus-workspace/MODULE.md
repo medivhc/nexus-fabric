@@ -117,6 +117,24 @@ Merge/Commit/持久化路径必须返回结构化 `WorkspaceError`，不得 pani
   `crates/nexus-workspace/examples/workspace_projection_fallback.rs` 驱动，经
   harness 的 `product-scenarios` gate 求值。
 
+### 冻结契约（W4：CacheManager + ProjectedWorkspace 适配，v9 §22）
+
+- `pub mod cache`：`CacheManager`（确定性内存对象缓存，逻辑时钟）。
+  - `pub enum CachePin`：铁律集合 { DirtyJournal, UniqueReplica,
+    ComputeSnapshot, PendingArtifact, UnreplicatedCommit, ConflictState,
+    Explicit }——被 pin 的条目永不被普通驱逐/`remove`。
+  - 驱逐评分：`utility = (hits+1)*(1+ws_prob)*(1+centrality)*(1+refetch_cost)
+    / (size*(1+age))`，从低到高驱逐；`ws_prob`/`centrality` 是可选信号
+    （W2），永不做正确性依赖。
+  - Cache Eviction ≠ CAS GC：只丢缓存副本，不删 CAS 对象；pin 分类与
+    §20 Protected Roots 同口径（W1 对齐）。
+- `pub struct WorkspaceProjection<A: WorkspaceAccess + Send>`：
+  `nexus_platform::ProjectedWorkspace` 的 workspace 侧适配（错误映射
+  WorkspaceError → PlatformError）。新增依赖 `nexus-platform`
+ （domain → portable trait 方向，已有先例，已在 architecture.toml 声明）。
+- 场景映射：`scenarios/product/workspace_cache_eviction.toml` 由
+  `crates/nexus-workspace/examples/cache_eviction.rs` 驱动。
+
 ## Verification
 
 最低：

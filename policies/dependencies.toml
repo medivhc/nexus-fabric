@@ -288,3 +288,20 @@ os_transitive_deps = "none"
 approved = true
 approved_date = "2026-09-30"
 review_basis = "2026-09-30 4b TURN contract T1: RFC 5766 key = MD5(username:realm:password); zero-dependency crate"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-platform-linux"
+crate = "fuser"
+version = "0.18"
+default_features = false
+features = []
+architecture_layer = "platform-adapter (Linux FUSE filesystem projection, v9 §22); pure-Rust FUSE protocol, no libfuse link"
+feature_scope = "default features; mount via fusermount(1) or /dev/fuse"
+license = "MIT (allowlisted; check via cargo-deny gate)"
+security = "no known advisories; re-check at implementation time via harness gate"
+portability = "Linux-only by design (this crate is nexus-platform-linux); not in portable_core"
+supply_chain = "version pinned by Cargo.lock (lockfile_required); transitive: libc, log, memchr, etc. (standard)"
+os_transitive_deps = "libc (accepted); no C build (pure Rust, no cc)"
+approved = true
+approved_date = "2026-10-02"
+review_basis = "2026-10-02 W4: v9 §22 D4=A (portable trait + Linux FUSE first); tun-rs precedent for platform crates"
