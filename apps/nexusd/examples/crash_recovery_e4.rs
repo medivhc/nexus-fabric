@@ -9,7 +9,7 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -66,16 +66,6 @@ fn victim(state_dir: &Path) -> ! {
     }
 }
 
-fn workspace_root() -> PathBuf {
-    // <root>/target/debug/examples/crash_recovery_e4 → <root>
-    let exe = std::env::current_exe().expect("current_exe");
-    exe.parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .expect("workspace root")
-        .to_path_buf()
-}
-
 fn kill(pid: u32, sig: &str) {
     let _ = Command::new("kill").args([sig, &pid.to_string()]).status();
 }
@@ -106,14 +96,16 @@ fn wait_victim_ready(child: &mut Child) {
 
 /// 启动一次 nexusd，等待 boot-reconcile 行 + READY 行，返回 reconcile JSON。
 /// stderr 落到 `<config-dir>/nexusd-boot-<tag>.stderr.log`，失败时可取证。
-fn boot_nexusd(root: &Path, config_dir: &Path, tag: &str) -> (Child, serde_json::Value) {
+fn boot_nexusd(config_dir: &Path, tag: &str) -> (Child, serde_json::Value) {
     let stderr_path = config_dir.join(format!("nexusd-boot-{tag}.stderr.log"));
     let stderr_file = fs::File::create(&stderr_path)
         .unwrap_or_else(|e| fail_json(&format!("create stderr log: {e}")));
     let mut child = Command::new("cargo")
         .args(["run", "--quiet", "-p", "nexusd", "--bin", "nexusd", "--"])
         .arg(config_dir)
-        .current_dir(root)
+        // 注意：不设置 current_dir——scenario 命令要求调用方 cwd 即 workspace 根
+        // （外层 `cargo run -p` 本就依赖这点）；内层 cargo 继承即可。
+        // 曾尝试从 current_exe 反推 root，但在 CARGO_TARGET_DIR 共享时失效。
         .stdout(Stdio::piped())
         .stderr(stderr_file)
         .spawn()
@@ -171,7 +163,6 @@ fn main() {
         std::process::exit(2);
     }
 
-    let root = workspace_root();
     let tmp = std::env::temp_dir().join(format!("crash-e4-{}", std::process::id()));
     let config_dir = tmp.join("cfg");
     let state_dir = config_dir.join("state");
@@ -200,7 +191,7 @@ fn main() {
     let _ = victim_child.wait();
 
     // 3. 第一次启动：crash 后的 reconcile。
-    let (mut boot1, rec1) = boot_nexusd(&root, &config_dir, "1");
+    let (mut boot1, rec1) = boot_nexusd(&config_dir, "1");
     let boot1_pid = boot1.id();
     // SIGTERM 干净关闭，run marker 应被清除。
     kill(boot1_pid, "-TERM");
@@ -211,7 +202,7 @@ fn main() {
     let marker_gone = !recovery::previous_crashed(&state_dir);
 
     // 4. 第二次启动：幂等验证。
-    let (mut boot2, rec2) = boot_nexusd(&root, &config_dir, "2");
+    let (mut boot2, rec2) = boot_nexusd(&config_dir, "2");
     kill(boot2.id(), "-TERM");
     if !boot2.wait_timeout_or_kill(Duration::from_secs(15)) {
         fail_json("nexusd (2nd boot) did not exit on SIGTERM in 15s");
