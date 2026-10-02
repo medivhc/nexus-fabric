@@ -42,9 +42,26 @@ fn fabric_pair() -> FabricPair {
     let server_addr = *server_driver.shared().local_addr.lock().unwrap();
     let server_peer = server_driver.shared().peer_id.expect("server identity");
     let client_driver = Driver::new_client().expect("client driver");
-    // P0 服务端无 client auth（server_conn.peer 为 zeroed）；
-    // E4 从 client driver 取真实 client peer ID，用于 serve 端 authz。
-    let client_peer = client_driver.shared().peer_id.expect("client identity");
+    // P0：client 无身份（peer_id=None），服务端无 client auth。
+    // E4 的 authz 测试需要 client 身份：生成随机测试 ID，仅用于 SyncAuthorizer 成员列表
+    // 与 serve 端 transport.peer_hex() 的比对（不参与 QUIC 握手）。
+    let client_peer = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let mut h = DefaultHasher::new();
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            .hash(&mut h);
+        std::thread::current().id().hash(&mut h);
+        let mut bytes = [0u8; 32];
+        let v = h.finish();
+        bytes[0..8].copy_from_slice(&v.to_le_bytes());
+        bytes[8..16].copy_from_slice(&(!v).to_le_bytes());
+        PeerId(bytes)
+    };
     let client_conn = client_driver
         .connect(server_peer, server_addr, Duration::from_secs(5))
         .expect("client connect");
