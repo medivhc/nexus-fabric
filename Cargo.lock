@@ -817,6 +817,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-flow-session"
+version = "0.1.0"
+dependencies = [
+ "nexus-domain",
+ "nexus-measurement",
+ "nexus-network",
+ "nexus-planner",
+ "nexus-policy",
+ "nexus-registry",
+ "nexus-session",
+]
+
+[[package]]
 name = "nexus-harness"
 version = "0.1.0"
 dependencies = [
@@ -1137,6 +1150,7 @@ dependencies = [
  "nexus-dns",
  "nexus-domain",
  "nexus-fabric",
+ "nexus-flow-session",
  "nexus-ingress",
  "nexus-nat-quality",
  "nexus-nat-traversal",
@@ -1144,9 +1158,11 @@ dependencies = [
  "nexus-network",
  "nexus-outbound-trojan",
  "nexus-path",
+ "nexus-planner",
  "nexus-platform",
  "nexus-platform-linux",
  "nexus-platform-windows",
+ "nexus-policy",
  "nexus-projection",
  "nexus-proxy-config",
  "nexus-proxy-transport",

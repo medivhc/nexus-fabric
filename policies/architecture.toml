@@ -129,6 +129,12 @@ portable = false
 layer = "domain-runtime"
 
 [[crate]]
+name = "nexus-flow-session"
+allowed_internal_dependencies = ["nexus-domain", "nexus-measurement", "nexus-policy", "nexus-planner", "nexus-session", "nexus-network"]
+portable = false
+layer = "domain-runtime"
+
+[[crate]]
 name = "nexus-workspace"
 allowed_internal_dependencies = ["nexus-domain", "nexus-session", "nexus-delivery", "nexus-storage", "nexus-platform"]
 portable = false

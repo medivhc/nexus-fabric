@@ -771,10 +771,21 @@ impl TcpTerminator {
             Some(k) => *k,
             None => return vec![],
         };
-        if let Some(c) = self.conns.remove(&key) {
+        self.reset_by_key(&key)
+    }
+
+    /// Abort by four-tuple (flow-session: session establish failed before
+    /// handshake completed, no stream_id bound yet).
+    pub fn reset_by_tuple(&mut self, four: &FourTuple) -> Vec<Vec<u8>> {
+        self.reset_by_key(four)
+    }
+
+    fn reset_by_key(&mut self, key: &FourTuple) -> Vec<Vec<u8>> {
+        if let Some(c) = self.conns.remove(key) {
             self.sockets.get_mut::<tcp::Socket>(c.sock).abort();
             self.sockets.remove(c.sock);
-            self.by_id.remove(&stream_id);
+            // 清理反向索引（若已绑定）。
+            self.by_id.retain(|_, k| k != key);
         }
         self.poll_iface();
         self.drain_tx()

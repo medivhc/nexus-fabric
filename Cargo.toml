@@ -23,6 +23,7 @@ members = [
   "crates/nexus-transport",
   "crates/nexus-network",
   "crates/nexus-service",
+  "crates/nexus-flow-session",
   "crates/nexus-workspace",
   "crates/nexus-compute",
   "crates/nexus-storage",

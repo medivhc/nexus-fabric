@@ -60,6 +60,19 @@ PLATFORM_CAPABILITY_UNAVAILABLE
 SESSION_FAILED
 ```
 
+### 2.1 TUN Ingress 会话链 {#tun-ingress-session-chain}
+
+（2026-10-02 requirement-change 冻结；场景 `product.flow-session-mapping`）
+
+nexusd 生产 TUN 数据面必须经"流→会话映射"接入 §10 链，而非逐包直转：
+
+- TUN 产生的每个新流（5 元组 key）首包触发：FlowContext（origin=PacketCapture）→ Policy → Core Planner → SessionOwner 创建 §10 Session → 后台异步建连。
+- 首包可观察语义：TCP 本地握手照常完成，早期数据由 smoltcp 缓冲，会话 Active 后 flush；UDP 首包触发建会话，有界缓冲（32 包/64KB），超 bound 丢弃并计数；建连失败 → TCP 发 RST、UDP 丢包（不静默黑洞）。
+- 已建流走快路径：后续包不再调用 Planner（调用计数器可证）；DNS 短路与 QoS 整形保留在逐包快路径，不进会话链。
+- 空闲超时流进 Draining，会话数回落，无泄漏。
+- NAT 路径竞速（direct/TURN/peer-relay）对流映射层透明：只订阅 session 级事件（connectivity established/failed → 触发重 plan）。
+- 本次 requirement-change 修订了老场景"逐包即时转发"的期望（首包异步化改变可观察语义）。
+
 ## 3. Service
 
 Service 是 Resource。
