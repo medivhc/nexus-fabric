@@ -865,7 +865,9 @@ fn spawn_direct_registrar(stack: Arc<Stack>, peer: FabricPeerId, local: SocketAd
 /// mid-transfer; every byte verified; relay stays warm.
 fn scenario_switch_to_direct() -> bool {
     println!("=== S1 switch-to-direct ===");
-    let ctx = setup(Duration::from_millis(40), Duration::ZERO);
+    // Relay RTT ~500ms (250ms each way) vs direct ~2ms: score gap >20% to
+    // trigger the frozen 20%+3s hysteresis. 40ms was not enough (only ~11%).
+    let ctx = setup(Duration::from_millis(250), Duration::ZERO);
     let id_a = ctx.node_a.my_id;
     let id_b = ctx.node_b.my_id;
 
