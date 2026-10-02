@@ -1,6 +1,6 @@
 schema_version = 1
 id = "product.observability-dns-providers"
-title = "§9 可观察性：dns providers 输出 DNS 提供方快照"
+title = "§9 可观察性：nexus CLI thin-client 下 dns providers 无路由 → 显式 UNSUPPORTED"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#9-observability"
 
@@ -8,27 +8,22 @@ requirement = "PRODUCT.md#9-observability"
 domain_state = "dns providers ready (upstream addrs + exit rules + server routing)"
 observability = "provider list snapshot via DnsRuntime/MultiServerDns/DnsRouter"
 
+# requirement-change 2026-10-02（用户已批准）：2026-10-01 CLI 统一（01e5114）后 nexus
+# 是 thin-client，不再在进程内执行观察命令；dns providers 暂无 LocalAPI 路由，
+# CLI 本地合成显式 UNSUPPORTED（PRODUCT §9 禁止静默降级）。
+# 与 2026-09-20 冻结的 cli_dns_providers.toml 合同一致。
 [when]
-command = "cargo run --quiet -p nexusd -- dns providers --json"
+command = "cargo run --quiet -p nexus -- dns providers --json"
 
-# 冻结期望：输出上游地址集合、Exit 规则表与服务器路由清单
-# （requirement-change：2026-09-18，由 UNSUPPORTED 转为真实实现）。
+# 冻结期望（2026-10-02）：无路由命令输出结构化 UNSUPPORTED FAIL JSON。
 [[expect]]
 field = "verdict"
-equals = "PASS"
+equals = "FAIL"
 
 [[expect]]
-field = "command"
+field = "error.code"
+equals = "UNSUPPORTED"
+
+[[expect]]
+field = "error.command"
 equals = "dns providers"
-
-[[expect]]
-field = "upstream_addrs.0"
-non_empty = true
-
-[[expect]]
-field = "exit_rules.0"
-non_empty = true
-
-[[expect]]
-field = "servers.0"
-non_empty = true

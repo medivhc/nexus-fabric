@@ -1,6 +1,6 @@
 schema_version = 1
 id = "product.observability-workspace-conflicts"
-title = "§9 可观察性：workspace conflicts 输出三方合并冲突快照（同路径冲突可观察）"
+title = "§9 可观察性：nexus CLI thin-client 下 workspace conflicts 无路由 → 显式 UNSUPPORTED"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#9-observability"
 
@@ -8,33 +8,22 @@ requirement = "PRODUCT.md#9-observability"
 domain_state = "workspace dag ready (two heads diverge on same path)"
 observability = "merge conflict snapshot via nexus-workspace merge_heads"
 
+# requirement-change 2026-10-02（用户已批准）：2026-10-01 CLI 统一（01e5114）后 nexus
+# 是 thin-client，不再在进程内执行观察命令；workspace conflicts 暂无 LocalAPI 路由，
+# CLI 本地合成显式 UNSUPPORTED（PRODUCT §9 禁止静默降级）。
+# 与 2026-09-20 冻结的 cli_workspace_conflicts.toml 合同一致。
 [when]
-command = "cargo run --quiet -p nexusd -- workspace conflicts --json"
+command = "cargo run --quiet -p nexus -- workspace conflicts ws1 --json"
 
-# 冻结期望：同 base 双 Head 对同一路径 a.txt 写不同内容 -> merge_heads
-# 返回 Ok + 持久化 ConflictObject；命令以 PASS 输出冲突快照
-# （requirement-change：2026-09-18，由 UNSUPPORTED 转为真实实现；
-#  requirement-change workspace-authority-v2：冲突不再以 Err 返回）。
+# 冻结期望（2026-10-02）：无路由命令输出结构化 UNSUPPORTED FAIL JSON。
 [[expect]]
 field = "verdict"
-equals = "PASS"
+equals = "FAIL"
 
 [[expect]]
-field = "command"
+field = "error.code"
+equals = "UNSUPPORTED"
+
+[[expect]]
+field = "error.command"
 equals = "workspace conflicts"
-
-[[expect]]
-field = "conflict_count"
-equals = 1
-
-[[expect]]
-field = "conflict_paths.0"
-equals = "a.txt"
-
-[[expect]]
-field = "head_count"
-equals = 2
-
-[[expect]]
-field = "disposition"
-equals = "Diverged"

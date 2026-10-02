@@ -1,6 +1,6 @@
 schema_version = 1
 id = "product.daemon-run-remote-service-flow"
-title = "nexusd daemon 单次执行入口装配 SDK 远程服务闭环"
+title = "nexus thin-client run service：进程内 SDK 执行远程服务闭环"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#remote"
 
@@ -10,94 +10,33 @@ resource = "service"
 auth = "pre-shared-token"
 transport = "tcp-length-prefix-frame"
 
-# 可执行 E4：daemon 进程真实运行，装配 SDK 组合根远程闭环并输出单个 JSON 对象。
-# 这是 SDK+example 之外的第二种交付形态（PRODUCT §6：SDK 组合根函数 / daemon 入口）。
+# 可执行 E4：`nexus run service --json` 经 thin wrapper 调进程内 SDK 执行，
+# 输出单个 JSON 对象。
+# requirement-change 2026-10-02（用户已批准）：2026-10-01 CLI 统一（01e5114）删除了
+# `nexusd run` 的完整演示事件链（remote_provider_resolved… 等）；新 `nexus run service`
+# 是 thin wrapper，只输出精简的执行摘要。旧事件链期望已失效，以新 CLI 真实行为为准。
 [when]
-command = "cargo run --quiet -p nexusd -- run service --json"
+command = "cargo run --quiet -p nexus -- run service --json"
 
-# 冻结期望：daemon 装配的闭环与 SDK 语义一致（同一冻结事件链），并携带 daemon 入口标识。
+# 冻结期望（2026-10-02）：thin wrapper 执行摘要——verdict=PASS，
+# run.resource=service，run.outcome=Completed，connectivity Connected，
+# session_id 非空（每次运行随机生成，只断言非空）。
 [[expect]]
 field = "verdict"
 equals = "PASS"
 
 [[expect]]
-field = "daemon.entry"
-equals = "nexusd"
-
-[[expect]]
-field = "daemon.resource"
+field = "run.resource"
 equals = "service"
 
 [[expect]]
-field = "events.0"
-equals = "remote_provider_resolved"
-
-[[expect]]
-field = "events.1"
-equals = "plan_selected"
-
-[[expect]]
-field = "events.2"
-equals = "session_created"
-
-[[expect]]
-field = "events.3"
-equals = "connectivity_established"
-
-[[expect]]
-field = "events.4"
-equals = "service_connected"
-
-[[expect]]
-field = "events.5"
-equals = "remote_access_completed"
-
-# 静态发现解析出 Node B 的 Endpoint（Identity != Locator）。
-[[expect]]
-field = "discovery.peer_id"
-equals = "node-b"
-
-[[expect]]
-field = "discovery.endpoint"
-non_empty = true
-
-[[expect]]
-field = "transport.kind"
-equals = "tcp-frame"
-
-# 认证门控在业务帧前通过（预共享 Token 校验成功，产出 Principal）。
-[[expect]]
-field = "auth.gate"
-equals = "token_verified"
-
-[[expect]]
-field = "auth.principal"
-non_empty = true
-
-# Planner 真实决策：Provider = Node B（远程提供方）。
-[[expect]]
-field = "plan.provider_id"
-equals = "node-b"
-
-# Session 双轨：业务完成后 Owner 唯一提交 Completed，物理排空到 Disposed。
-[[expect]]
-field = "session.phase"
-equals = "Disposed"
-
-[[expect]]
-field = "session.outcome"
+field = "run.outcome"
 equals = "Completed"
 
 [[expect]]
-field = "terminal_outcome_commit_count"
-equals = 1
+field = "run.connectivity.status"
+equals = "Connected"
 
-# 服务会话：握手（CONNECT -> READY）后 Active。
 [[expect]]
-field = "service.phase"
-equals = "Active"
-
-# 架构不变量：nexus-network 不依赖 nexus-ingress（ARCHITECTURE §3 禁止边）。
-[[expect]]
-field = "architecture.network_depends_on_ingress"
-equals = false
+field = "run.session_id"
+non_empty = true

@@ -1,6 +1,6 @@
 schema_version = 1
 id = "product.daemon-run-workspace-flow"
-title = "nexusd daemon 单次执行入口装配 SDK 远程 Workspace 提交闭环"
+title = "nexus run workspace 暂无路由 → 显式 UNSUPPORTED"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#remote"
 
@@ -10,100 +10,24 @@ resource = "workspace"
 auth = "pre-shared-token"
 transport = "tcp-length-prefix-frame"
 
-# 可执行 E4：daemon 进程真实运行，装配 SDK 组合根远程 Workspace 提交闭环并输出单个
-# JSON 对象。这是 SDK+example 之外的第二种交付形态（PRODUCT §6：首批四类资源
-# Service/InternetAccess/Compute/Workspace；daemon `run <resource> --json`）。
+# 可执行 E4：`nexus run workspace --json` 暂无执行路由，输出结构化拒绝 JSON。
+# requirement-change 2026-10-02（用户已批准）：2026-10-01 CLI 统一（01e5114）删除了
+# `nexusd run` 的完整演示事件链（workspace_commit_applied 等）；新 `nexus run` 是
+# thin wrapper，workspace 资源暂无路由，直接返回结构化 UNSUPPORTED（exit 0）。
+# 旧事件链期望已失效，以新 CLI 真实行为为准。
 [when]
-command = "cargo run --quiet -p nexusd -- run workspace --json"
+command = "cargo run --quiet -p nexus -- run workspace --json"
 
-# 冻结期望：daemon 装配的闭环与 SDK 语义一致（同一冻结事件链），并携带 daemon 入口标识。
+# 冻结期望（2026-10-02）：无路由资源显式拒绝——verdict=FAIL +
+# error.code=UNSUPPORTED，error.message 明确指出不支持的资源（禁止静默降级）。
 [[expect]]
 field = "verdict"
-equals = "PASS"
+equals = "FAIL"
 
 [[expect]]
-field = "daemon.entry"
-equals = "nexusd"
+field = "error.code"
+equals = "UNSUPPORTED"
 
 [[expect]]
-field = "daemon.resource"
-equals = "workspace"
-
-[[expect]]
-field = "events.0"
-equals = "remote_provider_resolved"
-
-[[expect]]
-field = "events.1"
-equals = "plan_selected"
-
-[[expect]]
-field = "events.2"
-equals = "session_created"
-
-[[expect]]
-field = "events.3"
-equals = "connectivity_established"
-
-[[expect]]
-field = "events.4"
-equals = "workspace_commit_applied"
-
-[[expect]]
-field = "events.5"
-equals = "remote_access_completed"
-
-# 静态发现解析出 Node B 的 Endpoint（Identity != Locator）。
-[[expect]]
-field = "discovery.peer_id"
-equals = "node-b"
-
-[[expect]]
-field = "discovery.endpoint"
-non_empty = true
-
-[[expect]]
-field = "transport.kind"
-equals = "tcp-frame"
-
-# 认证门控在业务帧前通过（预共享 Token 校验成功，产出 Principal）。
-[[expect]]
-field = "auth.gate"
-equals = "token_verified"
-
-[[expect]]
-field = "auth.principal"
-non_empty = true
-
-# Planner 真实决策：Provider = Node B（远程提供方）。
-[[expect]]
-field = "plan.provider_id"
-equals = "node-b"
-
-# Session 双轨：业务完成后 Owner 唯一提交 Completed，物理排空到 Disposed。
-[[expect]]
-field = "session.phase"
-equals = "Disposed"
-
-[[expect]]
-field = "session.outcome"
-equals = "Completed"
-
-[[expect]]
-field = "terminal_outcome_commit_count"
-equals = 1
-
-# Workspace 远程提交：新 Head 由响应带回（非空、基于 C0）。
-[[expect]]
-field = "workspace.head"
-non_empty = true
-
-# requirement-change workspace-authority-v2：CommitId 改为内容哈希，不再是 C{seq}。
-[[expect]]
-field = "workspace.parent"
-non_empty = true
-
-# 架构不变量：nexus-network 不依赖 nexus-ingress（ARCHITECTURE §3 禁止边）。
-[[expect]]
-field = "architecture.network_depends_on_ingress"
-equals = false
+field = "error.message"
+equals = "unsupported feature: run workspace"
