@@ -1150,6 +1150,7 @@ dependencies = [
  "nexus-proxy-transport",
  "nexus-registry",
  "nexus-service",
+ "nexus-storage",
  "nexus-workspace",
  "serde_json",
  "sha1",

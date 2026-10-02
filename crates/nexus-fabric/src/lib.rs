@@ -22,7 +22,7 @@ pub mod transport;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Driver-level handles for NAT punch-through wiring (`nexus-nat-wireup`).
 ///
@@ -288,7 +288,10 @@ impl FabricConn {
     }
 }
 
-fn split_stream(sh: Arc<StreamShared>) -> (SendStream, RecvStream) {
+/// Split a shared stream into its send/recv halves (C2: lets the sync
+/// transport adapter accept `Arc<StreamShared>` from `take_unclaimed`
+/// and from `open_bi`/`accept_bi` uniformly).
+pub fn split_stream(sh: Arc<StreamShared>) -> (SendStream, RecvStream) {
     (SendStream { shared: sh.clone() }, RecvStream { shared: sh })
 }
 
@@ -404,6 +407,46 @@ impl RecvStream {
                 .cv
                 .wait(ss)
                 .map_err(|_| FabricError::Transport("lock poisoned".into()))?;
+        }
+    }
+
+    /// Read with an absolute deadline (C2 sync transport requirement:
+    /// `RecvStream::read` has no timeout; a hung peer would block the sync
+    /// thread forever). Returns `FabricError::Timeout` on deadline expiry.
+    pub fn read_deadline(
+        &mut self,
+        buf: &mut [u8],
+        deadline: Instant,
+    ) -> Result<usize, FabricError> {
+        let mut ss = self.shared.state.lock().unwrap();
+        loop {
+            if let Some(e) = ss.error.clone() {
+                return Err(e);
+            }
+            if !ss.recv_buf.is_empty() {
+                let n = ss.recv_buf.len().min(buf.len());
+                for (i, b) in ss.recv_buf.drain(..n).enumerate() {
+                    buf[i] = b;
+                }
+                return Ok(n);
+            }
+            if ss.recv_eof {
+                return Ok(0);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(FabricError::Timeout);
+            }
+            let timeout = deadline - now;
+            let (g, r) = self
+                .shared
+                .cv
+                .wait_timeout(ss, timeout)
+                .map_err(|_| FabricError::Transport("lock poisoned".into()))?;
+            ss = g;
+            if r.timed_out() {
+                return Err(FabricError::Timeout);
+            }
         }
     }
 }

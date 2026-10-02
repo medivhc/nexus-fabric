@@ -36,8 +36,8 @@ use nexus_nat_traversal::{
 };
 
 pub use channel::{
-    FabricPunchChannel, STREAM_TYPE_BIND, STREAM_TYPE_PUNCH, decode_bind_response,
-    encode_bind_response, frame_msg, peek_stream_type, verify_bind,
+    FabricPunchChannel, STREAM_TYPE_BIND, STREAM_TYPE_PUNCH, STREAM_TYPE_WORKSPACE_SYNC,
+    decode_bind_response, encode_bind_response, frame_msg, peek_stream_type, verify_bind,
 };
 pub use responder::PreAnsweredChannel;
 pub use socket::DriverPunchSocket;

@@ -92,12 +92,16 @@ pub fn conflict_id_of(
 ) -> String {
     let mut sorted = paths.to_vec();
     sorted.sort();
+    // C2-P5/D7：local/remote 排序后哈希，使双端（local/remote 互换）算出同一 id。
+    let (first, second) = if local.0 <= remote.0 {
+        (&local.0, &remote.0)
+    } else {
+        (&remote.0, &local.0)
+    };
     let mut buf = String::from("nexus-conflict-v1\n");
     buf.push_str(&format!(
-        "base:{}\nlocal:{}\nremote:{}\npaths:{}\n",
+        "base:{}\nlocal:{first}\nremote:{second}\npaths:{}\n",
         base.0,
-        local.0,
-        remote.0,
         sorted.join(",")
     ));
     object_id_of(buf.as_bytes()).0
@@ -290,6 +294,12 @@ pub enum WorkspaceError {
     NotFound { path: String },
     /// 路径越界（尝试访问物化目录外的文件）。
     PathTraversal { path: String },
+    /// Shallow sync 遇到本地已有提交（C2-P4：shallow 只用于全新 clone，
+    /// 不静默丢弃本地数据）。
+    ShallowWithLocalChanges {
+        local_commits: usize,
+        local_heads: usize,
+    },
 }
 
 impl fmt::Display for WorkspaceError {
@@ -315,6 +325,13 @@ impl fmt::Display for WorkspaceError {
             }
             Self::NotFound { path } => write!(f, "path not found: {path}"),
             Self::PathTraversal { path } => write!(f, "path traversal blocked: {path}"),
+            Self::ShallowWithLocalChanges {
+                local_commits,
+                local_heads,
+            } => write!(
+                f,
+                "shallow sync with local changes ({local_commits} commits, {local_heads} heads): refusing to discard"
+            ),
         }
     }
 }
@@ -1343,6 +1360,41 @@ pub struct Workspace<S: ContentStore> {
     conflicts: HashMap<String, ConflictObject>,
 }
 
+/// C2-P4：sync 选项（shallow/sparse）。
+///
+/// 对应 `ReplicaPolicy`；`sync_with_remote` 默认使用 workspace 自身的
+/// `replica_policy`，`sync_with_remote_opts` 允许覆盖。
+#[derive(Debug, Clone, Default)]
+pub struct SyncOptions {
+    /// Shallow：只拉取最近 N 代（None = 全量）。
+    pub max_depth: Option<u32>,
+    /// Sparse：只关注这些路径前缀（空 = 全量）。
+    pub sparse_paths: Vec<String>,
+}
+
+impl From<&ReplicaPolicy> for SyncOptions {
+    fn from(p: &ReplicaPolicy) -> Self {
+        Self {
+            max_depth: p.max_depth,
+            sparse_paths: p.sparse_paths.clone(),
+        }
+    }
+}
+
+impl SyncOptions {
+    /// 编码为 HEADS 帧扩展：`HEADS:{ids}[;depth=N][;sparse=p1,p2]`。
+    fn heads_frame(&self, ids: &str) -> Vec<u8> {
+        let mut s = format!("HEADS:{ids}");
+        if let Some(d) = self.max_depth {
+            s.push_str(&format!(";depth={d}"));
+        }
+        if !self.sparse_paths.is_empty() {
+            s.push_str(&format!(";sparse={}", self.sparse_paths.join(",")));
+        }
+        s.into_bytes()
+    }
+}
+
 impl<S: ContentStore> Workspace<S> {
     /// 当前 unix 秒（逻辑元数据；提交 ID 哈希输入的一部分）。
     fn now_unix() -> u64 {
@@ -1462,6 +1514,12 @@ impl<S: ContentStore> Workspace<S> {
     #[must_use]
     pub fn heads(&self) -> &HeadSet {
         &self.heads
+    }
+
+    /// 本地提交数（含 genesis；C2-P4 E4 观察 shallow 深度）。
+    #[must_use]
+    pub fn commit_count(&self) -> usize {
+        self.commits.len()
     }
 
     /// 当前持久状态对象 id（供冷启动 `open` 恢复）。
@@ -2092,17 +2150,30 @@ impl<S: ContentStore> Workspace<S> {
         &self,
         transport: &mut dyn WorkspaceTransport,
     ) -> Result<HeadExchangeReport, WorkspaceError> {
+        self.exchange_heads_inner_opts(transport, &SyncOptions::default())
+    }
+
+    fn exchange_heads_inner_opts(
+        &self,
+        transport: &mut dyn WorkspaceTransport,
+        opts: &SyncOptions,
+    ) -> Result<HeadExchangeReport, WorkspaceError> {
         let local_heads = self.heads.heads.clone();
         let ids = local_heads
             .iter()
             .map(|h| h.0.as_str())
             .collect::<Vec<_>>()
             .join(",");
-        transport.send_frame(format!("HEADS:{ids}").as_bytes())?;
+        transport.send_frame(&opts.heads_frame(&ids))?;
         let ack = transport.recv_frame()?;
         let text = String::from_utf8(ack).map_err(|_| WorkspaceError::RemoteProtocol {
             frame: "<non-utf8>".into(),
         })?;
+        // C2-D4：被动端成员授权拒绝（serve 前置检查）。
+        if let Some(reason) = text.strip_prefix("REJECTED") {
+            let reason = reason.trim_start_matches(':').trim().to_string();
+            return Err(WorkspaceError::RemoteRejected { reason });
+        }
         let rest =
             text.strip_prefix("HEADS-ACK:")
                 .ok_or_else(|| WorkspaceError::RemoteProtocol {
@@ -2119,6 +2190,97 @@ impl<S: ContentStore> Workspace<S> {
         })
     }
 
+    /// C2-P5/D7：conflict 状态交换。
+    /// `CONFLICTS:` → `CONFLICTS-ACK:{n}` + n×`CONFLICT` 帧。
+    fn exchange_conflicts(
+        transport: &mut dyn WorkspaceTransport,
+    ) -> Result<Vec<ConflictObject>, WorkspaceError> {
+        transport.send_frame(b"CONFLICTS:")?;
+        let n = Self::recv_count(transport, "CONFLICTS-ACK:")?;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let frame = transport.recv_frame()?;
+            out.push(Self::parse_conflict_frame(&frame)?);
+        }
+        Ok(out)
+    }
+
+    /// C2-P5/D7："先 resolve 者赢"（实际语义：incoming wins，保证收敛）。
+    ///
+    /// 对每个远端已解决的 conflict：
+    /// - 本地未解决 → 直接采用 M（M 的 parents 为 [local, remote]，fast-forward 收敛到单 head）；
+    /// - 本地已用 M' 解决（M' != M）→ 放弃 M'，采用 M。
+    ///
+    /// 采用时校验 M 在本地 DAG 中且 parents 覆盖冲突三元组；heads 更新为 M。
+    /// 返回是否采用了远端 resolution（用于 SyncReport）。
+    fn apply_remote_resolutions(
+        &mut self,
+        remote_conflicts: &[ConflictObject],
+    ) -> Result<bool, WorkspaceError> {
+        let mut adopted = false;
+        for rc in remote_conflicts {
+            let ConflictState::Resolved { merge_commit: m } = &rc.state else {
+                continue;
+            };
+            let Some(local) = self.conflicts.get(&rc.id) else {
+                continue;
+            };
+            // 三元组必须一致（id 已保证 base 与 {local,remote} 集合；防御性再验，顺序无关）。
+            let mut l_pair = [local.local.clone(), local.remote.clone()];
+            let mut r_pair = [rc.local.clone(), rc.remote.clone()];
+            l_pair.sort_by(|a, b| a.0.cmp(&b.0));
+            r_pair.sort_by(|a, b| a.0.cmp(&b.0));
+            if local.base != rc.base || l_pair != r_pair {
+                continue;
+            }
+            let should_adopt = match &local.state {
+                ConflictState::Unresolved => true,
+                ConflictState::Resolved {
+                    merge_commit: local_m,
+                } => local_m != m,
+            };
+            if !should_adopt {
+                continue;
+            }
+            // 校验 M：在 DAG 中，parents 覆盖冲突三元组（集合相等，顺序无关）。
+            let m_commit = self
+                .commits
+                .get(m)
+                .ok_or_else(|| WorkspaceError::CorruptState {
+                    reason: format!("resolution commit {m:?} not in local DAG"),
+                })?;
+            let mut got = m_commit.parents.clone();
+            let mut want = vec![local.local.clone(), local.remote.clone()];
+            got.sort_by(|a, b| a.0.cmp(&b.0));
+            want.sort_by(|a, b| a.0.cmp(&b.0));
+            if got != want {
+                return Err(WorkspaceError::CorruptState {
+                    reason: format!(
+                        "resolution commit {m:?} parents {:?} do not cover conflict triple",
+                        m_commit.parents
+                    ),
+                });
+            }
+            // Heads：去掉被 M 覆盖的（local/remote 及已解决的旧 M'），加上 M。
+            self.heads.heads.retain(|h| {
+                h != &local.local && h != &local.remote
+                    && !matches!(&local.state, ConflictState::Resolved { merge_commit: lm } if h == lm)
+            });
+            if !self.heads.heads.contains(m) {
+                self.heads.heads.push(m.clone());
+            }
+            // Conflict 标记为已解决（采用 M）。
+            if let Some(entry) = self.conflicts.get_mut(&rc.id) {
+                entry.state = ConflictState::Resolved {
+                    merge_commit: m.clone(),
+                };
+            }
+            self.persist_state()?;
+            adopted = true;
+        }
+        Ok(adopted)
+    }
+
     /// 主动同步：交换 Head → 拉取缺失提交（含 manifest）→ 逐对 merge_heads 收敛。
     ///
     /// 收到的提交逐个校验 `id == hash(content)`，不通过则拒绝（`CorruptState`）。
@@ -2126,16 +2288,40 @@ impl<S: ContentStore> Workspace<S> {
         &mut self,
         transport: &mut dyn WorkspaceTransport,
     ) -> Result<SyncReport, WorkspaceError> {
-        let exchange = self.exchange_heads_inner(transport)?;
+        let opts = SyncOptions::from(&self.replica_policy);
+        self.sync_with_remote_opts(transport, &opts)
+    }
+
+    /// 带选项的主动同步（C2-P4：shallow/sparse）。
+    pub fn sync_with_remote_opts(
+        &mut self,
+        transport: &mut dyn WorkspaceTransport,
+        opts: &SyncOptions,
+    ) -> Result<SyncReport, WorkspaceError> {
+        // C2-P4 shallow 守卫：shallow 只用于全新 clone；本地已有提交时
+        // 不静默丢弃，明确报错（检查放在 fetch 之前）。
+        if opts.max_depth.is_some() {
+            let local_commits = self.commits.len();
+            let local_heads = self.heads.heads.len();
+            if local_commits > 1 || local_heads != 1 {
+                return Err(WorkspaceError::ShallowWithLocalChanges {
+                    local_commits,
+                    local_heads,
+                });
+            }
+        }
+        let exchange = self.exchange_heads_inner_opts(transport, opts)?;
         // 拉取缺失提交：BFS 自远端 head，排除本地已有，迭代至闭包。
+        // C2-P4：shallow 截断——(commit, depth)，超 max_depth 的父提交
+        // 记入 shallow_frontier 而不拉取。
         let mut fetched_commits = 0usize;
-        let mut want: Vec<CommitId> = exchange
+        let mut want: Vec<(CommitId, u32)> = exchange
             .remote_heads
             .iter()
             .filter(|h| !self.commits.contains_key(h))
-            .cloned()
+            .map(|h| (h.clone(), 1))
             .collect();
-        let mut want_ids: Vec<String> = want.iter().map(|c| c.0.clone()).collect();
+        let mut want_ids: Vec<String> = want.iter().map(|(c, _)| c.0.clone()).collect();
         while !want_ids.is_empty() {
             transport.send_frame(format!("WANT-COMMITS:{}", want_ids.join(",")).as_bytes())?;
             let n = Self::recv_count(transport, "COMMITS:")?;
@@ -2156,21 +2342,36 @@ impl<S: ContentStore> Workspace<S> {
                         ),
                     });
                 }
+                let depth = want
+                    .iter()
+                    .find(|(c, _)| c == &commit.id)
+                    .map(|(_, d)| *d)
+                    .unwrap_or(0);
                 for p in &commit.parents {
-                    if !self.commits.contains_key(p)
-                        && !want.iter().any(|w| w == p)
-                        && !want_ids.iter().any(|w| w == &p.0)
-                    {
-                        want.push(p.clone());
+                    if self.commits.contains_key(p) || want.iter().any(|(w, _)| w == p) {
+                        continue;
                     }
+                    let parent_depth = depth + 1;
+                    if let Some(max) = opts.max_depth {
+                        if parent_depth > max {
+                            // Shallow 截断：父提交记入 frontier（v9 §20）。
+                            if !self.shallow_frontier.contains(p) {
+                                self.shallow_frontier.push(p.clone());
+                            }
+                            continue;
+                        }
+                    }
+                    want.push((p.clone(), parent_depth));
                 }
                 self.commits.insert(commit.id.clone(), commit);
                 fetched_commits += 1;
             }
+            // C2-D6：每批 commits 落一次 persist（中断可续，重跑 BFS 跳过已有）。
+            self.persist_state()?;
             want_ids = want
                 .iter()
-                .filter(|c| !self.commits.contains_key(c))
-                .map(|c| c.0.clone())
+                .filter(|(c, _)| !self.commits.contains_key(c))
+                .map(|(c, _)| c.0.clone())
                 .collect();
         }
         // 拉取新提交的 manifest（blob 按需，读时再取）。
@@ -2193,8 +2394,8 @@ impl<S: ContentStore> Workspace<S> {
             transport.send_frame(format!("WANT-OBJECTS:{}", want_objs.join(",")).as_bytes())?;
             let n = Self::recv_count(transport, "OBJECTS:")?;
             for _ in 0..n {
-                let frame = transport.recv_frame()?;
-                let (id, bytes) = Self::parse_object_frame(&frame)?;
+                // C2-D5：二进制分块重组。
+                let (id, bytes) = Self::recv_object_chunks(transport)?;
                 self.store
                     .put(&bytes)
                     .map_err(|reason| WorkspaceError::StoreFailure { reason })?;
@@ -2202,6 +2403,9 @@ impl<S: ContentStore> Workspace<S> {
                 fetched_objects += 1;
             }
         }
+        // C2-P5/D7：conflict 状态交换（在 merge 之前，让 D7 规则先收敛）。
+        let remote_conflicts = Self::exchange_conflicts(transport)?;
+        let adopted = self.apply_remote_resolutions(&remote_conflicts)?;
         transport.send_frame(b"SYNC-DONE")?;
 
         // 逐对合并：每个远端 head 与本地首个 head 配对。
@@ -2209,27 +2413,45 @@ impl<S: ContentStore> Workspace<S> {
         let mut common_ancestor = None;
         let mut conflict = None;
         let mut merge_commit = None;
-        for rhead in &exchange.remote_heads {
-            if self.heads.contains(rhead) {
-                continue;
+        // C2-P4 shallow：历史被截断，无共同祖先，不做 merge；
+        // 全新 workspace（守卫已在函数开头检查）直接采用远端 heads。
+        if opts.max_depth.is_some() {
+            for rhead in &exchange.remote_heads {
+                if !self.commits.contains_key(rhead) {
+                    return Err(WorkspaceError::CorruptState {
+                        reason: format!("shallow sync missing remote head {rhead:?}"),
+                    });
+                }
             }
-            let lhead =
-                self.heads
-                    .heads
-                    .first()
-                    .cloned()
-                    .ok_or_else(|| WorkspaceError::CorruptState {
+            self.heads.heads = exchange.remote_heads.clone();
+            disposition = MergeDisposition::FastForward;
+        } else {
+            for rhead in &exchange.remote_heads {
+                if self.heads.contains(rhead) {
+                    continue;
+                }
+                let lhead = self.heads.heads.first().cloned().ok_or_else(|| {
+                    WorkspaceError::CorruptState {
                         reason: "no local head to merge with".into(),
-                    })?;
-            common_ancestor = self.find_common_ancestor(&lhead, rhead)?;
-            let report = self.merge_heads(&lhead, rhead)?;
-            disposition = report.disposition.clone();
-            if report.conflict.is_some() {
-                conflict = report.conflict.clone();
+                    }
+                })?;
+                common_ancestor = self.find_common_ancestor(&lhead, rhead)?;
+                let report = self.merge_heads(&lhead, rhead)?;
+                disposition = report.disposition.clone();
+                if report.conflict.is_some() {
+                    conflict = report.conflict.clone();
+                }
+                if report.merge_commit.is_some() {
+                    merge_commit = report.merge_commit.clone();
+                }
             }
-            if report.merge_commit.is_some() {
-                merge_commit = report.merge_commit.clone();
-            }
+        }
+        // C2-P4：sparse filter 落到本地 replica_policy（后续按需拉取 gated by path_wanted）。
+        if !opts.sparse_paths.is_empty() {
+            self.replica_policy.sparse_paths = opts.sparse_paths.clone();
+        }
+        if let Some(d) = opts.max_depth {
+            self.replica_policy.max_depth = Some(d);
         }
         Ok(SyncReport {
             remote_heads: exchange.remote_heads,
@@ -2239,9 +2461,9 @@ impl<S: ContentStore> Workspace<S> {
             common_ancestor,
             conflict,
             merge_commit,
+            adopted_remote_resolution: adopted,
         })
     }
-
     /// 被动端：应答一次完整同步会话（HEADS/WANT-COMMITS/WANT-OBJECTS），收到
     /// SYNC-DONE 后返回。本端不主动合并（由主动端发起下一轮或本地 merge_heads）。
     pub fn serve_sync(
@@ -2256,7 +2478,10 @@ impl<S: ContentStore> Workspace<S> {
                 frame: "<non-utf8>".into(),
             })?;
             if let Some(rest) = text.strip_prefix("HEADS:") {
-                let _ = rest;
+                // C2-P4：HEADS 可带 `;depth=N;sparse=p1,p2` 扩展；被动端解析 ids，
+                // 未知扩展忽略（前向兼容）。扩展语义见 SyncOptions。
+                let ids_part = rest.split(';').next().unwrap_or("");
+                let _ = ids_part;
                 let ids = self
                     .heads
                     .heads
@@ -2288,12 +2513,28 @@ impl<S: ContentStore> Workspace<S> {
                         .ok_or_else(|| WorkspaceError::MissingObject {
                             id: ObjectId(id.to_string()),
                         })?;
-                    transport
-                        .send_frame(format!("OBJECT-DATA:{id}:{}", hex_bytes(&bytes)).as_bytes())?;
+                    // C2-D5：二进制分块（去 hex）。
+                    // `OBJECT-CHUNK:{id}:{offset}:{total}\n<raw bytes>` + `OBJECT-END:{id}`。
+                    let total = bytes.len();
+                    for (i, chunk) in bytes.chunks(SYNC_CHUNK_SIZE).enumerate() {
+                        let offset = i * SYNC_CHUNK_SIZE;
+                        let mut frame =
+                            format!("OBJECT-CHUNK:{id}:{offset}:{total}\n").into_bytes();
+                        frame.extend_from_slice(chunk);
+                        transport.send_frame(&frame)?;
+                    }
+                    transport.send_frame(format!("OBJECT-END:{id}").as_bytes())?;
                     served_objects += 1;
                 }
             } else if text == "SYNC-DONE" {
                 break;
+            } else if text == "CONFLICTS:" || text.starts_with("CONFLICTS:") {
+                // C2-P5/D7：发送本地 conflict 状态。
+                let conflicts: Vec<&ConflictObject> = self.conflicts.values().collect();
+                transport.send_frame(format!("CONFLICTS-ACK:{}", conflicts.len()).as_bytes())?;
+                for c in conflicts {
+                    transport.send_frame(&Self::conflict_to_frame(c))?;
+                }
             } else {
                 return Err(WorkspaceError::RemoteProtocol { frame: text });
             }
@@ -2332,6 +2573,89 @@ impl<S: ContentStore> Workspace<S> {
             commit.id.0, commit.root_manifest_id.0, commit.author.0, commit.created_at_unix
         )
         .into_bytes()
+    }
+
+    /// C2-P5/D7：conflict 帧编码。
+    /// `CONFLICT:{id}:{base}:{local}:{remote}:{paths}:{state}`
+    /// paths 为逗号分隔，state 为 `unresolved` 或 `resolved:{merge_commit}`。
+    fn conflict_to_frame(c: &ConflictObject) -> Vec<u8> {
+        let state = match &c.state {
+            ConflictState::Unresolved => "unresolved".to_string(),
+            ConflictState::Resolved { merge_commit } => format!("resolved:{}", merge_commit.0),
+        };
+        format!(
+            "CONFLICT:{}:{}:{}:{}:{}:{state}",
+            c.id,
+            c.base.0,
+            c.local.0,
+            c.remote.0,
+            c.paths.join(","),
+        )
+        .into_bytes()
+    }
+
+    /// C2-P5/D7：conflict 帧解码（cas_object_id 置空，打开时按需重算）。
+    fn parse_conflict_frame(frame: &[u8]) -> Result<ConflictObject, WorkspaceError> {
+        let text =
+            String::from_utf8(frame.to_vec()).map_err(|_| WorkspaceError::RemoteProtocol {
+                frame: "<non-utf8>".into(),
+            })?;
+        let rest =
+            text.strip_prefix("CONFLICT:")
+                .ok_or_else(|| WorkspaceError::RemoteProtocol {
+                    frame: text.clone(),
+                })?;
+        // id:base:local:remote:paths:state — paths 本身含逗号，从两头解析。
+        let mut parts = rest.split(':');
+        let id = parts.next().ok_or_else(|| WorkspaceError::RemoteProtocol {
+            frame: text.clone(),
+        })?;
+        let base = parts.next().ok_or_else(|| WorkspaceError::RemoteProtocol {
+            frame: text.clone(),
+        })?;
+        let local = parts.next().ok_or_else(|| WorkspaceError::RemoteProtocol {
+            frame: text.clone(),
+        })?;
+        let remote = parts.next().ok_or_else(|| WorkspaceError::RemoteProtocol {
+            frame: text.clone(),
+        })?;
+        // 剩余部分：paths(逗号分隔) + state。以 "unresolved"/"resolved:" 切分。
+        let rest2: Vec<&str> = parts.collect();
+        let rest2 = rest2.join(":");
+        let (paths_str, state_str) = if let Some(idx) = rest2.rfind(":unresolved") {
+            (&rest2[..idx], "unresolved")
+        } else if let Some(idx) = rest2.rfind(":resolved:") {
+            (&rest2[..idx], &rest2[idx + 1..])
+        } else {
+            return Err(WorkspaceError::RemoteProtocol {
+                frame: text.clone(),
+            });
+        };
+        let paths: Vec<String> = paths_str
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        let state = if state_str == "unresolved" {
+            ConflictState::Unresolved
+        } else if let Some(mid) = state_str.strip_prefix("resolved:") {
+            ConflictState::Resolved {
+                merge_commit: CommitId(mid.to_string()),
+            }
+        } else {
+            return Err(WorkspaceError::RemoteProtocol {
+                frame: text.clone(),
+            });
+        };
+        Ok(ConflictObject {
+            id: id.to_string(),
+            base: CommitId(base.to_string()),
+            local: CommitId(local.to_string()),
+            remote: CommitId(remote.to_string()),
+            paths,
+            state,
+            cas_object_id: ObjectId(String::new()),
+        })
     }
 
     fn parse_commit_frame(frame: &[u8]) -> Result<WorkspaceCommit, WorkspaceError> {
@@ -2384,25 +2708,72 @@ impl<S: ContentStore> Workspace<S> {
         })
     }
 
-    fn parse_object_frame(frame: &[u8]) -> Result<(String, Vec<u8>), WorkspaceError> {
-        let text =
-            String::from_utf8(frame.to_vec()).map_err(|_| WorkspaceError::RemoteProtocol {
-                frame: "<non-utf8>".into(),
-            })?;
-        let rest =
-            text.strip_prefix("OBJECT-DATA:")
-                .ok_or_else(|| WorkspaceError::RemoteProtocol {
-                    frame: text.clone(),
-                })?;
-        let (id, hex) = rest
-            .split_once(':')
-            .ok_or_else(|| WorkspaceError::RemoteProtocol {
-                frame: text.clone(),
-            })?;
-        Ok((
-            id.to_string(),
-            unhex_bytes(hex).ok_or(WorkspaceError::RemoteProtocol { frame: text })?,
-        ))
+    /// C2-D5：接收一个对象的二进制分块并重组。
+    ///
+    /// 帧（binary-safe，header 与 body 以首个 `\n` 分隔）：
+    /// - `OBJECT-CHUNK:{id}:{offset}:{total}\n<raw bytes>`（可多个，需 offset 连续）
+    /// - `OBJECT-END:{id}`（结束；`body.len() == total` 才接受）
+    fn recv_object_chunks(
+        transport: &mut dyn WorkspaceTransport,
+    ) -> Result<(String, Vec<u8>), WorkspaceError> {
+        let proto = |frame: &[u8]| WorkspaceError::RemoteProtocol {
+            frame: String::from_utf8_lossy(&frame[..frame.len().min(64)]).into_owned(),
+        };
+        let mut id: Option<String> = None;
+        let mut total: Option<usize> = None;
+        let mut buf = Vec::new();
+        loop {
+            let frame = transport.recv_frame()?;
+            // OBJECT-END 无 body（无 `\n`）；OBJECT-CHUNK 的 header 与 body 以首个 `\n` 分隔。
+            // 先做 UTF-8 header 嗅探（body 可能是任意二进制）。
+            let header_end = frame
+                .iter()
+                .position(|&b| b == b'\n')
+                .unwrap_or(frame.len());
+            let header = std::str::from_utf8(&frame[..header_end]).map_err(|_| proto(&frame))?;
+            if let Some(rest) = header.strip_prefix("OBJECT-CHUNK:") {
+                let body = if header_end < frame.len() {
+                    &frame[header_end + 1..]
+                } else {
+                    &[][..]
+                };
+                let mut parts = rest.split(':');
+                let cid = parts.next().ok_or_else(|| proto(&frame))?;
+                let offset: usize = parts
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| proto(&frame))?;
+                let tot: usize = parts
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| proto(&frame))?;
+                match (&id, &total) {
+                    (None, None) => {
+                        id = Some(cid.to_string());
+                        total = Some(tot);
+                    }
+                    (Some(eid), Some(etot)) if eid == cid && *etot == tot => {}
+                    _ => return Err(proto(&frame)),
+                }
+                // offset 必须连续（串行 chunk，不支持乱序）。
+                if offset != buf.len() {
+                    return Err(proto(&frame));
+                }
+                if buf.len() + body.len() > total.unwrap_or(usize::MAX) {
+                    return Err(proto(&frame));
+                }
+                buf.extend_from_slice(body);
+            } else if let Some(rest) = header.strip_prefix("OBJECT-END:") {
+                let eid = id.as_deref().ok_or_else(|| proto(&frame))?;
+                let etot = total.ok_or_else(|| proto(&frame))?;
+                if rest != eid || buf.len() != etot {
+                    return Err(proto(&frame));
+                }
+                return Ok((eid.to_string(), buf));
+            } else {
+                return Err(proto(&frame));
+            }
+        }
     }
 }
 
@@ -2423,6 +2794,8 @@ pub struct SyncReport {
     pub common_ancestor: Option<CommitId>,
     pub conflict: Option<String>,
     pub merge_commit: Option<CommitId>,
+    /// C2-P5/D7：是否采用了远端的 conflict resolution。
+    pub adopted_remote_resolution: bool,
 }
 
 /// 被动 serve 报告。
@@ -2430,30 +2803,6 @@ pub struct SyncReport {
 pub struct SyncServedReport {
     pub served_commits: usize,
     pub served_objects: usize,
-}
-
-/// 字节转 hex（帧编码，无新依赖）。
-fn hex_bytes(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
-        s.push(char::from_digit((b & 0xf) as u32, 16).unwrap_or('0'));
-    }
-    s
-}
-
-fn unhex_bytes(hex: &str) -> Option<Vec<u8>> {
-    if hex.len() % 2 != 0 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(hex.len() / 2);
-    let chars: Vec<char> = hex.chars().collect();
-    for pair in chars.chunks(2) {
-        let hi = pair[0].to_digit(16)?;
-        let lo = pair[1].to_digit(16)?;
-        out.push((hi * 16 + lo) as u8);
-    }
-    Some(out)
 }
 
 #[cfg(test)]
@@ -2763,6 +3112,9 @@ impl fmt::Display for WorkspaceRemotePhase {
         }
     }
 }
+
+/// C2-D5：sync 二进制分块大小（< 64KB 帧上限，留 header 余量）。
+pub const SYNC_CHUNK_SIZE: usize = 60 * 1024;
 
 /// 注入的远程帧通道（MODULE.md 冻结契约：避免 workspace -> transport 依赖边）。
 ///
@@ -3133,5 +3485,415 @@ mod workspace_access_tests {
             .expect("subdir entry");
         assert!(subdir_entry.is_dir);
         let _ = dir;
+    }
+}
+
+#[cfg(test)]
+mod sync_transport_tests {
+    //! C2 sync 协议层单测（内存 Pipe，不依赖 fabric/UDP，沙盒可跑）。
+    //!
+    //! 覆盖：P3 二进制分块重组、P2 REJECTED 处理、D6 每批 persist。
+
+    use super::*;
+    use nexus_storage::InMemoryContentStore;
+    use std::collections::VecDeque;
+    use std::sync::mpsc::{self, Receiver, Sender};
+
+    /// 阻塞式双向帧管道（A<->B）。
+    pub(crate) struct PipeEnd {
+        tx: Sender<Vec<u8>>,
+        rx: Receiver<Vec<u8>>,
+    }
+
+    impl PipeEnd {
+        pub(crate) fn pair() -> (Self, Self) {
+            let (a_tx, a_rx) = mpsc::channel();
+            let (b_tx, b_rx) = mpsc::channel();
+            (Self { tx: a_tx, rx: b_rx }, Self { tx: b_tx, rx: a_rx })
+        }
+    }
+
+    impl WorkspaceTransport for PipeEnd {
+        fn send_frame(&mut self, payload: &[u8]) -> Result<(), WorkspaceError> {
+            self.tx
+                .send(payload.to_vec())
+                .map_err(|_| WorkspaceError::Transport {
+                    reason: "pipe closed".into(),
+                })
+        }
+
+        fn recv_frame(&mut self) -> Result<Vec<u8>, WorkspaceError> {
+            self.rx.recv().map_err(|_| WorkspaceError::Transport {
+                reason: "pipe closed".into(),
+            })
+        }
+    }
+
+    pub(crate) fn new_ws(id: &str) -> Workspace<InMemoryContentStore> {
+        Workspace::init(
+            WorkspaceId(id.into()),
+            InMemoryContentStore::new(),
+            AuthorId("test".into()),
+        )
+        .unwrap()
+    }
+
+    /// 运行一次完整 sync：`active` 主动拉取，`passive` 被动服务（线程分别跑）。
+    /// 返回 (report, 更新后的 passive)。
+    pub(crate) fn run_sync(
+        active: &mut Workspace<InMemoryContentStore>,
+        passive: Workspace<InMemoryContentStore>,
+    ) -> (SyncReport, Workspace<InMemoryContentStore>) {
+        let (a_end, b_end) = PipeEnd::pair();
+        let mut a_end = a_end;
+        let mut b_end = b_end;
+        let b_handle = std::thread::spawn(move || {
+            let mut bb = passive;
+            let r = bb.serve_sync(&mut b_end);
+            (bb, r)
+        });
+        let report = active.sync_with_remote(&mut a_end).expect("sync ok");
+        let (b_back, r) = b_handle.join().expect("serve done");
+        r.expect("serve ok");
+        (report, b_back)
+    }
+
+    #[test]
+    fn chunked_object_roundtrip() {
+        let mut a = new_ws("ws-a");
+        // 大对象：> SYNC_CHUNK_SIZE，确保多分块。
+        let big: Vec<u8> = (0..SYNC_CHUNK_SIZE * 2 + 1234)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let head = a.heads().heads[0].clone();
+        let h_a = a
+            .commit_changes(
+                &head,
+                &[Change {
+                    path: "big.bin".into(),
+                    content: big.clone(),
+                }],
+            )
+            .unwrap();
+        // A 的 manifest 字节（sync 后 B 应原样拿到）。
+        let manifest_id = a.commit(&h_a).unwrap().root_manifest_id.clone();
+        let manifest_bytes = a
+            .store
+            .get(&manifest_id)
+            .unwrap()
+            .expect("manifest present");
+
+        let mut b = new_ws("ws-b");
+        // B（空）从 A 拉取。
+        let (report, b) = run_sync(&mut b, a);
+        assert!(report.fetched_commits >= 1, "report: {report:?}");
+        assert_eq!(report.fetched_objects, 1);
+        // B 拿到了 H_A。
+        assert!(b.commit(&h_a).is_some(), "B should have H_A");
+        // manifest 字节完整（分块重组正确）。
+        let got = b.store.get(&manifest_id).unwrap().expect("manifest synced");
+        assert_eq!(got, manifest_bytes);
+    }
+
+    #[test]
+    fn rejected_frame_maps_to_remote_rejected() {
+        struct RejectTransport;
+        impl WorkspaceTransport for RejectTransport {
+            fn send_frame(&mut self, _payload: &[u8]) -> Result<(), WorkspaceError> {
+                Ok(())
+            }
+            fn recv_frame(&mut self) -> Result<Vec<u8>, WorkspaceError> {
+                Ok(b"REJECTED:not-a-member".to_vec())
+            }
+        }
+        let mut a = new_ws("ws-a");
+        let mut t = RejectTransport;
+        let err = a.sync_with_remote(&mut t).expect_err("must reject");
+        assert!(
+            matches!(
+                err,
+                WorkspaceError::RemoteRejected { ref reason } if reason == "not-a-member"
+            ),
+            "unexpected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn chunk_offset_mismatch_is_protocol_error() {
+        // 构造乱序 chunk，验证被拒绝。
+        struct BadChunkTransport {
+            frames: VecDeque<Vec<u8>>,
+        }
+        impl WorkspaceTransport for BadChunkTransport {
+            fn send_frame(&mut self, _payload: &[u8]) -> Result<(), WorkspaceError> {
+                Ok(())
+            }
+            fn recv_frame(&mut self) -> Result<Vec<u8>, WorkspaceError> {
+                self.frames
+                    .pop_front()
+                    .ok_or_else(|| WorkspaceError::Transport {
+                        reason: "empty".into(),
+                    })
+            }
+        }
+        // 模拟 serve 端行为：直接测 recv_object_chunks。
+        let mut t = BadChunkTransport {
+            frames: VecDeque::from([
+                b"OBJECT-CHUNK:obj1:60:notanumber\n".to_vec(),
+                b"OBJECT-END:obj1".to_vec(),
+            ]),
+        };
+        let err =
+            Workspace::<InMemoryContentStore>::recv_object_chunks(&mut t).expect_err("bad offset");
+        assert!(matches!(err, WorkspaceError::RemoteProtocol { .. }));
+    }
+}
+
+#[cfg(test)]
+mod sync_shallow_tests {
+    //! C2-P4 shallow/sparse 单测（内存 Pipe）。
+
+    use super::sync_transport_tests::{PipeEnd, new_ws};
+    use super::*;
+
+    #[test]
+    fn shallow_truncates_bfs_at_max_depth() {
+        let mut a = new_ws("ws-a");
+        // 10 层线性历史。
+        let mut head = a.heads().heads[0].clone();
+        for i in 0..10 {
+            head = a
+                .commit_changes(
+                    &head,
+                    &[Change {
+                        path: format!("f{i}.txt"),
+                        content: format!("c{i}").into_bytes(),
+                    }],
+                )
+                .unwrap();
+        }
+        let a_head = head.clone();
+
+        let mut b = new_ws("ws-b");
+        let opts = SyncOptions {
+            max_depth: Some(3),
+            sparse_paths: vec![],
+        };
+        let (b_end, a_end) = PipeEnd::pair();
+        let mut b_end = b_end;
+        let mut a_end = a_end;
+        let a_handle = std::thread::spawn(move || a.serve_sync(&mut a_end));
+        let report = b
+            .sync_with_remote_opts(&mut b_end, &opts)
+            .expect("shallow sync ok");
+        a_handle.join().expect("serve done").expect("serve ok");
+
+        // B 拿到了 A 的 head，但只拉了 3 层（depth=3，head 为第 1 层）。
+        assert!(b.commit(&a_head).is_some(), "B should have A's head");
+        // depth=3：3 层 commits（+ B 自身 genesis）= 4 个。
+        let b_commits = b.commits.len();
+        assert_eq!(
+            b_commits, 4,
+            "shallow depth=3 should fetch exactly 3 commits from A, B has {b_commits}"
+        );
+        // 截断处的父提交进入 shallow_frontier。
+        assert!(
+            !b.shallow_frontier.is_empty(),
+            "frontier should be non-empty after truncation"
+        );
+        // replica_policy 被更新。
+        assert_eq!(b.replica_policy.max_depth, Some(3));
+        assert_eq!(report.fetched_commits, 3, "report: {report:?}");
+    }
+
+    #[test]
+    fn sparse_paths_propagate_to_replica_policy() {
+        let mut a = new_ws("ws-a");
+        let head = a.heads().heads[0].clone();
+        a.commit_changes(
+            &head,
+            &[Change {
+                path: "docs/guide.txt".into(),
+                content: b"guide".to_vec(),
+            }],
+        )
+        .unwrap();
+
+        let mut b = new_ws("ws-b");
+        let opts = SyncOptions {
+            max_depth: None,
+            sparse_paths: vec!["docs/".to_string()],
+        };
+        let (b_end, a_end) = PipeEnd::pair();
+        let mut b_end = b_end;
+        let mut a_end = a_end;
+        let a_handle = std::thread::spawn(move || a.serve_sync(&mut a_end));
+        b.sync_with_remote_opts(&mut b_end, &opts)
+            .expect("sparse sync ok");
+        a_handle.join().expect("serve done").expect("serve ok");
+
+        assert_eq!(b.replica_policy.sparse_paths, vec!["docs/".to_string()]);
+        assert!(b.replica_policy.path_wanted("docs/guide.txt"));
+        assert!(!b.replica_policy.path_wanted("src/main.rs"));
+    }
+}
+
+#[cfg(test)]
+mod sync_conflict_tests {
+    //! C2-P5/D7 冲突收敛单测（内存 Pipe，thread::scope）。
+
+    use super::sync_transport_tests::{PipeEnd, new_ws};
+    use super::*;
+    use nexus_storage::InMemoryContentStore;
+
+    /// B 从 A 同步。
+    fn sync_b_from_a(
+        a: &mut Workspace<InMemoryContentStore>,
+        b: &mut Workspace<InMemoryContentStore>,
+    ) -> SyncReport {
+        let (b_end, a_end) = PipeEnd::pair();
+        let mut b_end = b_end;
+        let mut a_end = a_end;
+        std::thread::scope(|s| {
+            let ha = s.spawn(move || a.serve_sync(&mut a_end));
+            let rep = b.sync_with_remote(&mut b_end).expect("sync ok");
+            ha.join().expect("serve").expect("serve ok");
+            rep
+        })
+    }
+
+    /// A 从 B 同步。
+    fn sync_a_from_b(
+        a: &mut Workspace<InMemoryContentStore>,
+        b: &mut Workspace<InMemoryContentStore>,
+    ) -> SyncReport {
+        let (a_end, b_end) = PipeEnd::pair();
+        let mut a_end = a_end;
+        let mut b_end = b_end;
+        std::thread::scope(|s| {
+            let hb = s.spawn(move || b.serve_sync(&mut b_end));
+            let rep = a.sync_with_remote(&mut a_end).expect("sync ok");
+            hb.join().expect("serve").expect("serve ok");
+            rep
+        })
+    }
+
+    /// 构造分叉并让双端各产生 ConflictObject。返回 conflict id。
+    fn make_conflict(
+        a: &mut Workspace<InMemoryContentStore>,
+        b: &mut Workspace<InMemoryContentStore>,
+    ) -> String {
+        // A 建 base，B 同步。
+        let ah = a.heads().heads[0].clone();
+        a.commit_changes(
+            &ah,
+            &[Change {
+                path: "base.txt".into(),
+                content: b"base".to_vec(),
+            }],
+        )
+        .unwrap();
+        sync_b_from_a(a, b);
+        assert_eq!(a.heads().heads, b.heads().heads);
+
+        // 离线分叉。
+        let ah = a.heads().heads[0].clone();
+        a.commit_changes(
+            &ah,
+            &[Change {
+                path: "conflict.txt".into(),
+                content: b"A version".to_vec(),
+            }],
+        )
+        .unwrap();
+        let bh = b.heads().heads[0].clone();
+        b.commit_changes(
+            &bh,
+            &[Change {
+                path: "conflict.txt".into(),
+                content: b"B version".to_vec(),
+            }],
+        )
+        .unwrap();
+
+        // A sync B → A 产生 conflict。
+        let rep_a = sync_a_from_b(a, b);
+        let cid = rep_a.conflict.clone().expect("A conflict");
+        // B sync A → B 产生 conflict（B 合并 H_B 与 H_A）。
+        let rep_b = sync_b_from_a(a, b);
+        let cid_b = rep_b.conflict.clone().expect("B conflict");
+        assert_eq!(cid, cid_b, "deterministic conflict id");
+        cid
+    }
+
+    #[test]
+    fn first_resolver_wins_converges() {
+        let mut a = new_ws("ws-a");
+        let mut b = new_ws("ws-b");
+        let cid = make_conflict(&mut a, &mut b);
+
+        // 双端各解（A 先，B 后）→ 不同 merge commit。
+        let ra = a
+            .resolve_conflict(
+                &cid,
+                &[("conflict.txt".to_string(), ConflictResolution::TakeLocal)],
+            )
+            .unwrap();
+        let rb = b
+            .resolve_conflict(
+                &cid,
+                &[("conflict.txt".to_string(), ConflictResolution::TakeLocal)],
+            )
+            .unwrap();
+        assert_ne!(ra, rb);
+        assert_eq!(a.heads().heads, vec![ra.clone()]);
+        assert_eq!(b.heads().heads, vec![rb.clone()]);
+
+        // B sync A：B 收到 M_A，本地已用 M_B 解决 → 放弃 M_B，采用 M_A。
+        let rep = sync_b_from_a(&mut a, &mut b);
+        assert!(rep.adopted_remote_resolution, "B should adopt A's M");
+        assert_eq!(b.heads().heads, vec![ra.clone()]);
+        let bc = b.conflicts.get(&cid).expect("conflict");
+        assert_eq!(
+            bc.state,
+            ConflictState::Resolved {
+                merge_commit: ra.clone()
+            }
+        );
+
+        // A sync B：双端都是 M_A，无变化，无 conflict-of-conflict。
+        let rep2 = sync_a_from_b(&mut a, &mut b);
+        assert!(!rep2.adopted_remote_resolution);
+        assert_eq!(a.heads().heads, vec![ra.clone()]);
+        assert_eq!(b.heads().heads, vec![ra.clone()]);
+        // B 的 commits 里有 M_B（历史），但 heads 只有 M_A。
+        assert!(b.commit(&rb).is_some());
+    }
+
+    #[test]
+    fn unresolved_local_adopts_remote_resolution() {
+        let mut a = new_ws("ws-a");
+        let mut b = new_ws("ws-b");
+        let cid = make_conflict(&mut a, &mut b);
+
+        // 只有 A resolve。
+        let ra = a
+            .resolve_conflict(
+                &cid,
+                &[("conflict.txt".to_string(), ConflictResolution::TakeLocal)],
+            )
+            .unwrap();
+
+        // B sync A：B 本地未解决 → 直接采用 M_A。
+        let rep = sync_b_from_a(&mut a, &mut b);
+        assert!(rep.adopted_remote_resolution);
+        assert_eq!(b.heads().heads, vec![ra.clone()]);
+        let bc = b.conflicts.get(&cid).expect("conflict");
+        assert_eq!(
+            bc.state,
+            ConflictState::Resolved {
+                merge_commit: ra.clone()
+            }
+        );
     }
 }

@@ -6,7 +6,8 @@
 //! not part of the frozen P2 contract.
 //!
 //! Stream types: `0x01` = punch signaling (offer/answer), `0x02` = direct-
-//! connection nonce bind (challenge/response). Other values are reserved;
+//! connection nonce bind (challenge/response), `0x03` = workspace sync
+//! (C2; the responder routes by this type to `serve_sync`). Other values are reserved;
 //! the responder must NOT consume non-punch streams (see `PunchManager`
 //! stream routing): unknown streams are stashed, never mis-decoded.
 
@@ -22,6 +23,8 @@ use nexus_nat_traversal::{PunchAnswer, PunchChannel, PunchOffer, decode_answer, 
 pub const STREAM_TYPE_PUNCH: u8 = 0x01;
 /// Stream type: nonce bind challenge/response on a direct connection.
 pub const STREAM_TYPE_BIND: u8 = 0x02;
+/// Stream type: workspace sync frames (C2; `serve_sync` on the passive side).
+pub const STREAM_TYPE_WORKSPACE_SYNC: u8 = 0x03;
 
 /// Max single frame (64KB — offers/answers are tiny; this is a sanity cap).
 pub const MAX_FRAME: usize = 65536;
