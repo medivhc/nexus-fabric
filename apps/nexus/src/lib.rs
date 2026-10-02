@@ -1673,9 +1673,9 @@ pub fn remote_compute_rejected_rollback() -> Result<Value, NexusError> {
 /// Node A 通过真实 TCP 长度前缀帧流完成远程提交。确定性、可重放。
 pub fn remote_workspace_commit_flow() -> Result<Value, NexusError> {
     let mut events: Vec<&'static str> = Vec::new();
-    const PARENT: &str = "C0";
 
-    // 0) Node B（提供方）：绑定回环端口，后台线程内运行真实 Workspace 并应用远程提交。
+    // 0) Node B（提供方）：绑定回环端口，后台线程内运行真实 Workspace；
+    //    处理 HEAD? 查询与 ChangeSet 提交（v2：parent 必须为真实内容哈希 ID）。
     let listener =
         std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| NexusError::Internal {
             message: format!("cannot bind node-b listener: {e}"),
@@ -1685,28 +1685,44 @@ pub fn remote_workspace_commit_flow() -> Result<Value, NexusError> {
     })?;
     let node_b_server = std::thread::spawn(move || {
         if let Ok(mut fs) = nexus_transport::accept(&listener) {
-            if let Ok(frame) = fs.recv_frame() {
-                // ChangeSet 帧格式：<parent>\n<path>\n<content>
+            let ws = nexus_workspace::Workspace::init(
+                nexus_workspace::WorkspaceId("ws-b".into()),
+                nexus_storage::InMemoryContentStore::new(),
+                nexus_workspace::AuthorId("node-b".into()),
+            );
+            let mut ws = match ws {
+                Ok(ws) => ws,
+                Err(e) => {
+                    let _ = fs.send_frame(format!("REJECTED:{e}").as_bytes());
+                    return;
+                }
+            };
+            while let Ok(frame) = fs.recv_frame() {
+                // ChangeSet 帧格式：<parent>\n<path>\n<content>；HEAD? 为头查询。
                 let text = String::from_utf8_lossy(&frame);
+                if text == "HEAD?" {
+                    let head = ws
+                        .heads()
+                        .heads
+                        .first()
+                        .map(|h| h.0.clone())
+                        .unwrap_or_default();
+                    let _ = fs.send_frame(format!("OK:HEAD:{head}").as_bytes());
+                    continue;
+                }
                 let mut parts = text.splitn(3, '\n');
                 let parent = parts.next().unwrap_or_default().to_string();
                 let path = parts.next().unwrap_or_default().to_string();
                 let content = parts.next().unwrap_or_default().as_bytes().to_vec();
-                let ws = nexus_workspace::Workspace::init(
-                    nexus_workspace::WorkspaceId("ws-b".into()),
-                    nexus_storage::InMemoryContentStore::new(),
-                );
-                let response = match ws {
-                    Ok(mut ws) => match ws.commit_changes(
-                        &nexus_workspace::CommitId(parent),
-                        &[nexus_workspace::Change { path, content }],
-                    ) {
-                        Ok(head) => format!("OK:HEAD:{}", head.0),
-                        Err(e) => format!("REJECTED:{e}"),
-                    },
+                let response = match ws.commit_changes(
+                    &nexus_workspace::CommitId(parent),
+                    &[nexus_workspace::Change { path, content }],
+                ) {
+                    Ok(head) => format!("OK:HEAD:{}", head.0),
                     Err(e) => format!("REJECTED:{e}"),
                 };
                 let _ = fs.send_frame(response.as_bytes());
+                break;
             }
         }
     });
@@ -1781,18 +1797,41 @@ pub fn remote_workspace_commit_flow() -> Result<Value, NexusError> {
         }
     })?;
 
-    // 7) Workspace：远程提交（ChangeSet 帧 -> OK:HEAD:<id>，取回新 Head）。
-    let change_set = format!("{PARENT}\nremote.txt\nremote-content");
-    let ws_session = nexus_workspace::RemoteWorkspaceSession::commit(
-        Box::new(FrameStreamAdapter {
-            inner: frame_stream,
-        }),
-        change_set.as_bytes(),
-    )
-    .map_err(|e| NexusError::SessionFailed {
-        session: owner.id().clone(),
-        reason: e.to_string(),
-    })?;
+    // 7) Workspace：先 HEAD? 查询 Node B 当前 Head（v2 内容哈希 ID），再远程提交
+    //   （ChangeSet 帧 -> OK:HEAD:<id>，取回新 Head）。
+    let mut adapter = FrameStreamAdapter {
+        inner: frame_stream,
+    };
+    let parent = {
+        use nexus_workspace::WorkspaceTransport;
+        adapter
+            .send_frame(b"HEAD?")
+            .map_err(|e| NexusError::SessionFailed {
+                session: owner.id().clone(),
+                reason: e.to_string(),
+            })?;
+        let head_frame = adapter
+            .recv_frame()
+            .map_err(|e| NexusError::SessionFailed {
+                session: owner.id().clone(),
+                reason: e.to_string(),
+            })?;
+        let head_text = String::from_utf8_lossy(&head_frame);
+        head_text
+            .strip_prefix("OK:HEAD:")
+            .ok_or_else(|| NexusError::SessionFailed {
+                session: owner.id().clone(),
+                reason: format!("unexpected HEAD? response: {head_text}"),
+            })?
+            .to_string()
+    };
+    let change_set = format!("{parent}\nremote.txt\nremote-content");
+    let ws_session =
+        nexus_workspace::RemoteWorkspaceSession::commit(Box::new(adapter), change_set.as_bytes())
+            .map_err(|e| NexusError::SessionFailed {
+            session: owner.id().clone(),
+            reason: e.to_string(),
+        })?;
     events.push(EV_WORKSPACE_COMMIT_APPLIED);
 
     // 8) Owner 唯一提交 Completed；终态后 cleanup 推进到 Disposed。
@@ -1850,7 +1889,7 @@ pub fn remote_workspace_commit_flow() -> Result<Value, NexusError> {
         "workspace": {
             "phase": ws_session.phase().to_string(),
             "head": ws_session.head().map(|h| h.0.clone()).unwrap_or_default(),
-            "parent": PARENT,
+            "parent": parent,
         },
         "architecture": {
             "network_depends_on_ingress": arch_violation,
@@ -1885,6 +1924,7 @@ pub fn remote_workspace_rejected_rollback() -> Result<Value, NexusError> {
                 let ws = nexus_workspace::Workspace::init(
                     nexus_workspace::WorkspaceId("ws-b-rejected".into()),
                     nexus_storage::InMemoryContentStore::new(),
+                    nexus_workspace::AuthorId("node-b".into()),
                 );
                 let response = match ws {
                     Ok(mut ws) => match ws.commit_changes(

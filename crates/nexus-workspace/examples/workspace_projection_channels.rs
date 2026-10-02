@@ -13,8 +13,8 @@
 
 use nexus_storage::InMemoryContentStore;
 use nexus_workspace::{
-    Change, MaterializedDirectoryAccess, NativeApiWorkspaceAccess, Workspace, WorkspaceAccess,
-    WorkspaceError, WorkspaceId,
+    AuthorId, Change, MaterializedDirectoryAccess, NativeApiWorkspaceAccess, Workspace,
+    WorkspaceAccess, WorkspaceError, WorkspaceId,
 };
 
 fn main() {
@@ -51,8 +51,12 @@ fn run_channels() -> Result<String, String> {
 /// 真正验证产品语义：DAG 可追溯、Head 前进、Manifest 包含写入路径。
 fn verify_product_semantics() -> Result<bool, String> {
     let store = InMemoryContentStore::new();
-    let mut ws =
-        Workspace::init(WorkspaceId("ws-semantics".into()), store).map_err(|e| e.to_string())?;
+    let mut ws = Workspace::init(
+        WorkspaceId("ws-semantics".into()),
+        store,
+        AuthorId("node-local".into()),
+    )
+    .map_err(|e| e.to_string())?;
     let base_head = ws.heads().heads.first().cloned().expect("base head");
 
     // 写入并提交。
@@ -89,8 +93,12 @@ fn verify_product_semantics() -> Result<bool, String> {
 
 fn run_native_api() -> Result<String, String> {
     let store = InMemoryContentStore::new();
-    let ws =
-        Workspace::init(WorkspaceId("ws-native-api".into()), store).map_err(|e| e.to_string())?;
+    let ws = Workspace::init(
+        WorkspaceId("ws-native-api".into()),
+        store,
+        AuthorId("node-local".into()),
+    )
+    .map_err(|e| e.to_string())?;
     let base_head = ws.heads().heads.first().cloned().expect("base head");
 
     let mut access = NativeApiWorkspaceAccess::new(ws);
@@ -125,8 +133,13 @@ fn run_native_api() -> Result<String, String> {
     let state_root = ws_back.state_root().clone();
     let store_back = ws_back.into_store();
 
-    let restored = Workspace::open(WorkspaceId("ws-native-api".into()), store_back, &state_root)
-        .map_err(|e| format!("open restored: {e}"))?;
+    let restored = Workspace::open(
+        WorkspaceId("ws-native-api".into()),
+        store_back,
+        &state_root,
+        AuthorId("node-local".into()),
+    )
+    .map_err(|e| format!("open restored: {e}"))?;
     let restored_access = NativeApiWorkspaceAccess::new(restored);
 
     let recovered = restored_access
@@ -159,8 +172,12 @@ fn run_native_api() -> Result<String, String> {
 
 fn run_materialized() -> Result<String, String> {
     let store = InMemoryContentStore::new();
-    let mut ws =
-        Workspace::init(WorkspaceId("ws-materialized".into()), store).map_err(|e| e.to_string())?;
+    let mut ws = Workspace::init(
+        WorkspaceId("ws-materialized".into()),
+        store,
+        AuthorId("node-local".into()),
+    )
+    .map_err(|e| e.to_string())?;
 
     let base_head = ws.heads().heads.first().cloned().expect("base head");
     let c1 = ws
