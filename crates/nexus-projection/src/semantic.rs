@@ -51,7 +51,7 @@ const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Connect timeout for `Egress{self}` local upstream.
 const LOCAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Wait for the peer's FIN/RST after we send FIN.
-const FIN_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const FIN_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // Stats
@@ -97,6 +97,10 @@ pub struct SemanticDeps {
     pub transport: Arc<Mutex<Arc<dyn DatagramTransport>>>,
     /// MTU for STREAM datagrams.
     pub mtu: usize,
+    /// FIN-wait grace window for `relay_stream` (S35): the peer's tail
+    /// data is still relayed for this long after we send FIN. Production
+    /// uses `FIN_WAIT_TIMEOUT`; tests use a shorter window.
+    pub fin_wait_timeout: Duration,
     /// Process attributor for accept-time labeling (S26).
     pub attributor: Arc<dyn ProcessAttributor>,
     /// Process-name → QoS class mapping (S26).
@@ -659,7 +663,10 @@ fn relay_stream(
     let mut buf = [0u8; 16384];
     let mut idle_since = Instant::now();
     let mut fin_sent = false;
-    let fin_deadline = Instant::now() + FIN_WAIT_TIMEOUT;
+    // S35: the grace window starts when FIN is sent, not when the relay
+    // started — otherwise long-lived connections get a zero window and
+    // in-flight tail data is truncated.
+    let mut fin_deadline = Instant::now() + deps.fin_wait_timeout;
     loop {
         if shutdown.load(Ordering::Relaxed) {
             emit_stream(deps, peer, stream_id, STREAM_RST, &[]);
@@ -694,6 +701,8 @@ fn relay_stream(
             Ok(0) => {
                 emit_stream(deps, peer, stream_id, STREAM_FIN, &[]);
                 fin_sent = true;
+                // S35: restart the grace window at FIN-send time.
+                fin_deadline = Instant::now() + deps.fin_wait_timeout;
             }
             Ok(n) => {
                 idle_since = Instant::now();
@@ -762,6 +771,7 @@ mod tests {
             mtu: 1400,
             attributor: Arc::new(crate::PlatformAttributor),
             qos: QosConfig::default(),
+            fin_wait_timeout: Duration::from_millis(500),
         };
         (deps, stats)
     }
@@ -962,6 +972,7 @@ mod tests {
             mtu: 1400,
             attributor: Arc::new(crate::PlatformAttributor),
             qos: QosConfig::default(),
+            fin_wait_timeout: Duration::from_millis(500),
         };
         let mut ing = SemanticIngress::bind("127.0.0.1:0".parse().unwrap(), deps).unwrap();
         let addr = ing.local_addr();
@@ -1090,5 +1101,60 @@ mod tests {
         tcp.semantic_deregister("B", 42);
         assert_eq!(tcp.semantic_stream_count(), 0);
         assert!(tcp.semantic_lookup("B", 42).is_none());
+    }
+
+    #[test]
+    fn s35_fin_grace_window_starts_at_fin_send() {
+        // S35: the FIN-wait grace window must start when FIN is sent, not
+        // when the relay started. A relay older than the grace window that
+        // then half-closes must still forward the peer's tail data.
+        let transport: Arc<dyn DatagramTransport> = Arc::new(crate::MockTransport::new("test"));
+        let stats = Arc::new(Mutex::new(SemanticStats::default()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let grace = Duration::from_millis(500);
+        let deps = SemanticDeps {
+            router: drop_router(),
+            tcp_egress: Arc::new(Mutex::new(None)),
+            transport: Arc::new(Mutex::new(transport)),
+            mtu: 1400,
+            attributor: Arc::new(crate::PlatformAttributor),
+            qos: QosConfig::default(),
+            fin_wait_timeout: grace,
+        };
+        let (tx, rx) = mpsc::channel::<(u8, Vec<u8>)>();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(true).unwrap();
+            relay_stream(&stream, &deps, "peer", 7, rx, &stats, &shutdown);
+        });
+
+        let mut app = TcpStream::connect(addr).unwrap();
+        app.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        // Let the relay live LONGER than the hardcoded FIN_WAIT_TIMEOUT
+        // (5s) before FIN — the "long-lived connection" case: the old code
+        // anchored the grace deadline at relay start, so FIN sent after 5s
+        // got a zero grace window and the peer's tail data was truncated.
+        thread::sleep(Duration::from_secs(5) + Duration::from_millis(300));
+        // App half-closes → relay sends FIN, grace window (re)starts.
+        app.shutdown(std::net::Shutdown::Write).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        // Peer tail data arrives during the grace window. On the buggy
+        // code the relay has already exited (rx dropped) — a failed send is
+        // itself the truncation; read_exact then surfaces it clearly.
+        let _ = tx.send((0, b"tail-data".to_vec()));
+        let mut buf = [0u8; 9];
+        app.read_exact(&mut buf)
+            .expect("S35: peer tail data must arrive inside the grace window");
+        assert_eq!(&buf, b"tail-data");
+        // The worker exits on its own once the grace window elapses.
+        let done = Instant::now();
+        worker.join().expect("relay worker joins");
+        assert!(
+            done.elapsed() < grace + Duration::from_secs(3),
+            "relay worker must exit after the grace window"
+        );
     }
 }

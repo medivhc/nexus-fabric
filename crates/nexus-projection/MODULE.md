@@ -351,6 +351,35 @@ S32 的 `ReorderBuffer` 用朴素 `u64` 比较（`seq < next_seq`）判断迟到
   `[next_seq, next_seq + capacity)` 前向窗口内（回绕意义下）。
 - 容量有界：`len() <= capacity` 恒成立（含回绕场景）。
 
+**S34（自环 TCP 帧分派按方向，2026-10-03 冻结）**：`tcp_poll_once` 的
+`peer == "self"` 回环分派按事件的**来源方向**，不用
+`is_originator_frame(sid, "self")` 判定：terminator 发出的事件
+（SYN/DATA/CLOSED）→ `relay.handle_frame`（SYN 触发本地拨号）；
+relay 发出的事件 → terminator（`handle_originator_frame`，等价
+`handle_relay_event_loopback`）。原因：terminator 为 self 发起的流恒有
+`terminator.peer_for(sid) == Some("self")`，旧分派把 SYN 喂回 terminator
+丢弃计数、DATA 塞回自己的 smoltcp 缓冲自回显，relay 永不执行。触发场景：
+`0.0.0.0/0 → Egress{self}` + `with_tcp_egress` 且本地主动建连。
+
+**S35（半关闭宽限从 FIN 发送起算，2026-10-03 冻结）**：`relay_stream`
+的 `FIN_WAIT_TIMEOUT` 宽限窗口从 FIN 发送时刻起算：`fin_sent` 置位时重设
+`fin_deadline = now + FIN_WAIT_TIMEOUT`。旧行为在 relay 启动时算死，
+存活超 5s 的连接半关闭宽限为 0，尾部数据被截断。
+
+**S36（TCP STREAM 数据分帧，2026-10-03 冻结）**：`TcpEvent::Data` /
+`RelayEvent::Data` 的载荷按 `mtu - 6`（5 字节帧头 + 1 字节意图位）切分为
+多个 STREAM 帧发射，每帧总长 ≤ mtu；禁止整帧丢弃。S5 的"不分片"仅针对
+L3 IP 包路径；TCP 字节流分帧不是 IP 分片。旧行为：8192 字节整帧 →
+`send_with_intent` oversize 丢弃，而字节已向应用 ACK → 永久静默丢数据。
+对照实现：`semantic.rs` 的 `relay_stream` 已按 mtu 切分。
+
+**S37（DNS 响应 TXID 校验，2026-10-03 冻结）**：DNS 响应采信要求 TXID
+命中未决查询：`DnsSniffer` 维护 TXID→(qname, 插入时间) 未决表；
+`Sniffed::Query` / `Sniffed::Response` 携带 TXID；响应 TXID 未命中时视为
+`NotDns`（不写入缓存，按普通包走 IP 规则，S15），并计入 `sniff_failed`。
+未决表有界 4096 项（满时驱逐最早插入），条目 60s 过期。IP 键覆盖语义保持
+（最小改动）：同一 IP 的新记录覆盖旧域名。
+
 ## Side Effects
 
 - TUN 设备读写（`TunDevice::read` / `write`）。

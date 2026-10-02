@@ -8,9 +8,14 @@
 //! truncated packet, bad compression pointers) yields "not DNS" and the
 //! packet is routed by ordinary IP rules — never dropped. `sniff_failed` is
 //! a debug-only counter, not an error metric.
+//!
+//! S37: responses are only trusted when their TXID matches a query this
+//! sniffer actually saw (pending-query table, bounded + expiring). This
+//! keeps stray/spoofed port-53 traffic out of the resolution cache.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -20,13 +25,26 @@ pub const DNS_CACHE_TTL_CAP: Duration = Duration::from_secs(300);
 /// Max cached domain→IP mappings (S17).
 pub const DEFAULT_DNS_CACHE_ENTRIES: usize = 4096;
 
+/// Max pending DNS queries tracked for TXID validation (S37).
+pub const DNS_PENDING_CAP: usize = 4096;
+
+/// Age after which a pending query no longer validates a response (S37).
+/// Real resolutions complete in milliseconds; 60s is generous headroom.
+pub const DNS_PENDING_TTL: Duration = Duration::from_secs(60);
+
 /// Result of sniffing one IP packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Sniffed {
-    /// DNS query: the (lowercased, trailing-dot-stripped) QNAME.
-    Query(String),
-    /// DNS response: extracted (domain, ip, ttl_secs) A/AAAA records.
-    Response(Vec<(String, IpAddr, u32)>),
+    /// DNS query: the (lowercased, trailing-dot-stripped) QNAME plus the
+    /// message TXID (S37: recorded in the pending table).
+    Query { txid: u16, qname: String },
+    /// DNS response: message TXID plus extracted (domain, ip, ttl_secs)
+    /// A/AAAA records. Only produced when the TXID matches a pending
+    /// query (S37); otherwise the packet is `NotDns`.
+    Response {
+        txid: u16,
+        records: Vec<(String, IpAddr, u32)>,
+    },
     /// Not a DNS packet (or sniffing failed — S15: route normally).
     NotDns,
 }
@@ -216,15 +234,46 @@ fn udp_payload(packet: &[u8]) -> Option<(u16, u16, &[u8])> {
 
 /// DNS sniffer: classifies IP packets without modifying them (S15).
 ///
-/// Stateless wire parsing; only the debug counter `sniff_failed` is kept.
+/// S37: stateful — tracks pending queries (TXID → qname) so that only
+/// responses to queries we actually saw are trusted for cache learning.
+/// The wire parsing itself stays pure; only the TXID correlation table is
+/// kept, bounded and expiring.
 pub struct DnsSniffer {
     sniff_failed: AtomicU64,
+    pending: Mutex<HashMap<u16, (String, Instant)>>,
 }
 
 impl DnsSniffer {
     pub fn new() -> Self {
         Self {
             sniff_failed: AtomicU64::new(0),
+            pending: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Record an outbound query's TXID (S37). Opportunistically expires
+    /// stale entries and bounds the table.
+    fn note_query(&self, txid: u16, qname: String) {
+        let mut p = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        p.retain(|_, (_, t)| now.duration_since(*t) <= DNS_PENDING_TTL);
+        if p.len() >= DNS_PENDING_CAP {
+            if let Some(oldest) = p.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| *k) {
+                p.remove(&oldest);
+            }
+        }
+        p.insert(txid, (qname, now));
+    }
+
+    /// Consume the pending query for `txid` (S37). Returns the qname iff a
+    /// live (unexpired) query was recorded.
+    fn take_query(&self, txid: u16) -> Option<String> {
+        let mut p = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let (qname, t) = p.remove(&txid)?;
+        if Instant::now().duration_since(t) > DNS_PENDING_TTL {
+            None
+        } else {
+            Some(qname)
         }
     }
 
@@ -235,22 +284,45 @@ impl DnsSniffer {
             None => return Sniffed::NotDns,
         };
         if dport == 53 {
+            let txid = match read_u16(payload, 0) {
+                Some(t) => t,
+                None => {
+                    self.sniff_failed.fetch_add(1, Ordering::Relaxed);
+                    return Sniffed::NotDns;
+                }
+            };
             match parse_dns_query(payload) {
-                Some(qname) => Sniffed::Query(qname),
+                Some(qname) => {
+                    self.note_query(txid, qname.clone());
+                    Sniffed::Query { txid, qname }
+                }
                 None => {
                     self.sniff_failed.fetch_add(1, Ordering::Relaxed);
                     Sniffed::NotDns
                 }
             }
         } else if sport == 53 {
+            let txid = match read_u16(payload, 0) {
+                Some(t) => t,
+                None => {
+                    self.sniff_failed.fetch_add(1, Ordering::Relaxed);
+                    return Sniffed::NotDns;
+                }
+            };
             let records = parse_dns_response(payload);
             if records.is_empty() {
                 // Either not DNS or no A/AAAA records (e.g. NXDOMAIN):
                 // nothing to learn; debug-count it (S15).
                 self.sniff_failed.fetch_add(1, Ordering::Relaxed);
                 Sniffed::NotDns
+            } else if self.take_query(txid).is_none() {
+                // S37: no pending query with this TXID — the response is
+                // untrusted (stray/spoofed). Don't learn from it; the packet
+                // itself is routed by ordinary IP rules (S15).
+                self.sniff_failed.fetch_add(1, Ordering::Relaxed);
+                Sniffed::NotDns
             } else {
-                Sniffed::Response(records)
+                Sniffed::Response { txid, records }
             }
         } else {
             Sniffed::NotDns
@@ -552,16 +624,20 @@ mod tests {
         let pkt = udp_ip_packet(40000, 53, &q);
         assert_eq!(
             s.sniff_packet(&pkt),
-            Sniffed::Query("www.blocked.example".to_string())
+            Sniffed::Query {
+                txid: 0x1234,
+                qname: "www.blocked.example".to_string()
+            }
         );
         // Response: sport 53.
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         let r = response_msg(0x1234, "www.blocked.example", &[(ip, 60)]);
         let pkt = udp_ip_packet(53, 40000, &r);
         match s.sniff_packet(&pkt) {
-            Sniffed::Response(recs) => {
-                assert_eq!(recs.len(), 1);
-                assert_eq!(recs[0].1, ip);
+            Sniffed::Response { txid, records } => {
+                assert_eq!(txid, 0x1234);
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].1, ip);
             }
             other => panic!("expected Response, got {other:?}"),
         }
@@ -660,5 +736,82 @@ mod tests {
         assert_eq!(c.inserted(), 2);
         assert_eq!(c.lookup(&ip4), Some("www.example.com".to_string()));
         assert_eq!(c.lookup(&ip6), Some("www.example.com".to_string()));
+    }
+
+    // S37 Red tests: DNS responses must be validated against pending queries.
+    #[test]
+    fn sniffer_response_without_pending_query_is_not_dns() {
+        // A well-formed response whose TXID was never queried: untrusted.
+        let s = DnsSniffer::new();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let r = response_msg(0xBEEF, "evil.example", &[(ip, 60)]);
+        let pkt = udp_ip_packet(53, 40000, &r);
+        assert_eq!(s.sniff_packet(&pkt), Sniffed::NotDns);
+        assert_eq!(s.sniff_failed(), 1);
+    }
+
+    #[test]
+    fn sniffer_response_txid_mismatch_is_not_dns() {
+        // Query with TXID A, response with TXID B: the response is not ours.
+        let s = DnsSniffer::new();
+        let q = query_msg(0x1111, "www.example.com");
+        let qpkt = udp_ip_packet(40000, 53, &q);
+        assert!(matches!(s.sniff_packet(&qpkt), Sniffed::Query { .. }));
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let r = response_msg(0x2222, "www.example.com", &[(ip, 60)]);
+        let rpkt = udp_ip_packet(53, 40000, &r);
+        assert_eq!(s.sniff_packet(&rpkt), Sniffed::NotDns);
+    }
+
+    #[test]
+    fn sniffer_response_matching_txid_is_trusted_once() {
+        let s = DnsSniffer::new();
+        let q = query_msg(0x1234, "www.example.com");
+        let qpkt = udp_ip_packet(40000, 53, &q);
+        match s.sniff_packet(&qpkt) {
+            Sniffed::Query { txid, qname } => {
+                assert_eq!(txid, 0x1234);
+                assert_eq!(qname, "www.example.com");
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+        // Matching TXID → trusted.
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let r = response_msg(0x1234, "www.example.com", &[(ip, 60)]);
+        let rpkt = udp_ip_packet(53, 40000, &r);
+        match s.sniff_packet(&rpkt) {
+            Sniffed::Response { txid, records } => {
+                assert_eq!(txid, 0x1234);
+                assert_eq!(records.len(), 1);
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+        // The pending entry is consumed: a replayed response is untrusted.
+        let rpkt2 = udp_ip_packet(53, 40000, &r);
+        assert_eq!(s.sniff_packet(&rpkt2), Sniffed::NotDns);
+    }
+
+    #[test]
+    fn sniffer_query_response_roundtrip_feeds_cache() {
+        // End-to-end through the router: only the TXID-matched response
+        // populates the resolution cache.
+        use crate::{RouteTarget, Router, Rule, SimpleRuleEngine, UnifiedRouter};
+        let engine = SimpleRuleEngine::new(vec![Rule {
+            cidr: "0.0.0.0/0".parse().unwrap(),
+            target: RouteTarget::Drop,
+        }]);
+        let router = UnifiedRouter::new(vec![], Box::new(engine));
+        let ip: IpAddr = "9.9.9.9".parse().unwrap();
+        // Spoofed response first (no pending query): not learned.
+        let r = response_msg(0x7777, "spoofed.example", &[(ip, 60)]);
+        let rpkt = udp_ip_packet(53, 40000, &r);
+        router.route_packet(&rpkt);
+        assert_eq!(router.dns_stats().cache_inserted, 0);
+        // Real query → response: learned.
+        let q = query_msg(0x1234, "real.example");
+        router.route_packet(&udp_ip_packet(40000, 53, &q));
+        let r2 = response_msg(0x1234, "real.example", &[(ip, 60)]);
+        router.route_packet(&udp_ip_packet(53, 40000, &r2));
+        assert_eq!(router.dns_stats().cache_inserted, 1);
     }
 }

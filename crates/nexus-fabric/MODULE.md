@@ -53,6 +53,18 @@ quinn-proto driver runs on its own std threads (the repository is tokio-free).
   `connect_with_transport` / `bind_with_transport` 接受
   `Box<dyn UdpTransport>`（如 `nexus-turn::TurnSocket`）。`nexus-fabric`
   不依赖 `nexus-turn`（依赖倒置：trait 在 fabric，实现在外）。
+- S10（驱动连接表回收，2026-10-03 冻结）：reaper 从 `live` /
+  `handle_map` 摘除关闭连接时，同步从 `shared.conns` 摘除；关闭连接的
+  `accepted` / `dgrams` 缓冲随最后一个 `Arc<ConnShared>` 释放，不永久冻结。
+  `accept_conn` 跳过已摘除的 id——死连接不再被 accept 命中。调用方持有的
+  `Arc<ConnShared>` 仍可读 `stats()`；"keep shared state for late stats()"
+  的旧注释不再适用。
+- S11（connect 单一超时预算，2026-10-03 冻结）：`Driver::connect` 的总
+  超时为单一 `handshake_timeout` 预算，贯穿"命令应答"与"握手完成"两阶段
+  （`deadline = 调用时刻 + handshake_timeout`）。任一阶段超时都清理已创建
+  的连接：第二段超时发 `Cmd::Close`（已有）；第一段超时（命令尚未执行）
+  置取消标志，迟执行的 `Cmd::Connect` 不得创建孤儿连接（命令携带取消标志，
+  执行前检查）。
 - FabricConn != nexus-session Session。
 
 ## Deletion Test（§12 新抽象论证）
