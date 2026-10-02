@@ -2472,6 +2472,8 @@ impl<S: ContentStore> Workspace<S> {
     ) -> Result<SyncServedReport, WorkspaceError> {
         let mut served_commits = 0usize;
         let mut served_objects = 0usize;
+        // C2-P4：HEADS 的 sparse filter（被动端解析，用于 WANT-OBJECTS 过滤）。
+        let mut sparse_filter: Vec<String> = Vec::new();
         loop {
             let frame = transport.recv_frame()?;
             let text = String::from_utf8(frame).map_err(|_| WorkspaceError::RemoteProtocol {
@@ -2479,7 +2481,17 @@ impl<S: ContentStore> Workspace<S> {
             })?;
             if let Some(rest) = text.strip_prefix("HEADS:") {
                 // C2-P4：HEADS 可带 `;depth=N;sparse=p1,p2` 扩展；被动端解析 ids，
+                // sparse filter 存入 serve 作用域变量，用于 WANT-OBJECTS 过滤。
                 // 未知扩展忽略（前向兼容）。扩展语义见 SyncOptions。
+                for ext in rest.split(';').skip(1) {
+                    if let Some(paths) = ext.strip_prefix("sparse=") {
+                        sparse_filter = paths
+                            .split(',')
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string())
+                            .collect();
+                    }
+                }
                 let ids_part = rest.split(';').next().unwrap_or("");
                 let _ = ids_part;
                 let ids = self
@@ -2504,8 +2516,45 @@ impl<S: ContentStore> Workspace<S> {
                 }
             } else if let Some(rest) = text.strip_prefix("WANT-OBJECTS:") {
                 let ids: Vec<&str> = rest.split(',').filter(|s| !s.is_empty()).collect();
-                transport.send_frame(format!("OBJECTS:{}", ids.len()).as_bytes())?;
-                for id in ids {
+                // C2-P4 sparse：过滤掉不需要的对象。
+                // Manifest 对象始终发送（对端需要 manifest 做结构）；
+                // 文件对象按 path 是否匹配 sparse_filter 决定。
+                let mut to_serve: Vec<&str> = Vec::new();
+                if sparse_filter.is_empty() {
+                    to_serve = ids;
+                } else {
+                    // 建 object_id → path 映射（扫所有 commits 的 manifest）。
+                    let mut obj_paths: std::collections::HashMap<String, String> =
+                        std::collections::HashMap::new();
+                    let mut manifest_ids: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for commit in self.commits.values() {
+                        manifest_ids.insert(commit.root_manifest_id.0.clone());
+                        if let Ok(manifest) = self.load_manifest(&commit.root_manifest_id) {
+                            for (path, oid) in &manifest.entries {
+                                obj_paths.insert(oid.0.clone(), path.clone());
+                            }
+                        }
+                    }
+                    for id in ids {
+                        // Manifest 始终发送。
+                        if manifest_ids.contains(id) {
+                            to_serve.push(id);
+                            continue;
+                        }
+                        // 文件对象：path 匹配 sparse filter 才发送。
+                        if let Some(path) = obj_paths.get(id) {
+                            if sparse_filter.iter().any(|p| path.starts_with(p)) {
+                                to_serve.push(id);
+                            }
+                        } else {
+                            // 未知对象（不在 manifest 中）：保守发送（避免误杀）。
+                            to_serve.push(id);
+                        }
+                    }
+                }
+                transport.send_frame(format!("OBJECTS:{}", to_serve.len()).as_bytes())?;
+                for id in to_serve {
                     let bytes = self
                         .store
                         .get(&ObjectId(id.to_string()))
