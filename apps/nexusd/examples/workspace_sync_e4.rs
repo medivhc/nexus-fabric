@@ -393,12 +393,12 @@ fn run_resume() {
         (a, outcome, outcome2)
     });
 
-    // 第一次 sync：10 帧后中断（commits 已拉完，对象分块传输中）。
+    // 第一次 sync：5 帧后中断（HEADS/CONFLICTS/COMMITS 完成，对象传输中）。
     let mut b = new_workspace("ws-b", "author-b");
     let t1 = FabricSyncTransport::open(&pair.client_conn, DEFAULT_RECV_DEADLINE).expect("open1");
     let mut failing = FailAfterTransport {
         inner: t1,
-        remaining: 10,
+        remaining: 5,
     };
     let err = b
         .sync_with_remote(&mut failing)
