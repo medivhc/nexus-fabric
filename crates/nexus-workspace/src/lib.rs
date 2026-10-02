@@ -22,6 +22,16 @@ use std::path::PathBuf;
 
 use nexus_storage::{ContentStore, ObjectId};
 
+pub mod gc;
+
+pub use gc::{
+    AlwaysRun, DEFAULT_GC_INTERVAL_SECS, DEFAULT_MAX_SWEEP_PER_RUN, DEFAULT_RETENTION_SECS,
+    DeepenReport, GcConfig, GcHandle, GcPlan, GcReason, GcReport, GcRoots, GcRunPolicy,
+    GcScheduler, GcSchedulerConfig, InFlightGuard, InFlightSet, NoopQuotaHandler, ObjectFetcher,
+    PackReport, QuotaHandler, QuotaPolicy, QuotaPressure, ReadOutcome, ReplicaPolicy,
+    ShallowReport, Tombstone,
+};
+
 /// 合并事件：已找到合并基（Common Ancestor）。
 pub const EV_COMMON_ANCESTOR_FOUND: &str = "common_ancestor_found";
 /// 合并事件：已创建 Merge Commit。
@@ -844,10 +854,14 @@ struct DurableState {
     commits: Vec<WorkspaceCommit>,
     heads: Vec<CommitId>,
     journal: Vec<JournalEntry>,
+    tombstones: Vec<Tombstone>,
+    retained: Vec<CommitId>,
+    holds: Vec<ObjectId>,
+    shallow_frontier: Vec<CommitId>,
 }
 
 impl DurableState {
-    const HEADER: &'static str = "nexus-workspace-state v1";
+    const HEADER: &'static str = "nexus-workspace-state v2";
     const HEADER_TOKEN: &'static str = "nexus-workspace-state";
 
     fn to_bytes(&self) -> Vec<u8> {
@@ -886,6 +900,23 @@ impl DurableState {
                 e.commit_id.0, e.root_manifest_id.0
             ));
         }
+        for t in &self.tombstones {
+            out.push_str(&format!(
+                "tombstone {} {} {}\n",
+                t.object_id.0,
+                t.tombstoned_at_unix,
+                t.reason.as_str()
+            ));
+        }
+        for r in &self.retained {
+            out.push_str(&format!("retain {}\n", r.0));
+        }
+        for h in &self.holds {
+            out.push_str(&format!("hold {}\n", h.0));
+        }
+        for f in &self.shallow_frontier {
+            out.push_str(&format!("shallow {}\n", f.0));
+        }
         out.into_bytes()
     }
 
@@ -899,6 +930,10 @@ impl DurableState {
         let mut commits = Vec::new();
         let mut heads = Vec::new();
         let mut journal = Vec::new();
+        let mut tombstones = Vec::new();
+        let mut retained = Vec::new();
+        let mut holds = Vec::new();
+        let mut shallow_frontier = Vec::new();
         for line in text.lines() {
             let mut t = line.split_whitespace();
             match t.next() {
@@ -968,6 +1003,51 @@ impl DurableState {
                     });
                 }
                 Some(line) if line == Self::HEADER_TOKEN => {}
+                Some("tombstone") => {
+                    let raw_id = t.next().ok_or_else(|| WorkspaceError::CorruptState {
+                        reason: "tombstone line lacks object id".into(),
+                    })?;
+                    let raw_ts = t.next().ok_or_else(|| WorkspaceError::CorruptState {
+                        reason: "tombstone line lacks timestamp".into(),
+                    })?;
+                    let raw_reason = t.next().ok_or_else(|| WorkspaceError::CorruptState {
+                        reason: "tombstone line lacks reason".into(),
+                    })?;
+                    let tombstoned_at_unix =
+                        raw_ts
+                            .parse::<u64>()
+                            .map_err(|_| WorkspaceError::CorruptState {
+                                reason: format!("tombstone has bad timestamp {raw_ts}"),
+                            })?;
+                    let reason = GcReason::parse(raw_reason).ok_or_else(|| {
+                        WorkspaceError::CorruptState {
+                            reason: format!("tombstone has bad reason {raw_reason}"),
+                        }
+                    })?;
+                    tombstones.push(Tombstone {
+                        object_id: ObjectId(raw_id.to_string()),
+                        tombstoned_at_unix,
+                        reason,
+                    });
+                }
+                Some("retain") => {
+                    let raw = t.next().ok_or_else(|| WorkspaceError::CorruptState {
+                        reason: "retain line lacks commit id".into(),
+                    })?;
+                    retained.push(CommitId(raw.to_string()));
+                }
+                Some("hold") => {
+                    let raw = t.next().ok_or_else(|| WorkspaceError::CorruptState {
+                        reason: "hold line lacks object id".into(),
+                    })?;
+                    holds.push(ObjectId(raw.to_string()));
+                }
+                Some("shallow") => {
+                    let raw = t.next().ok_or_else(|| WorkspaceError::CorruptState {
+                        reason: "shallow line lacks commit id".into(),
+                    })?;
+                    shallow_frontier.push(CommitId(raw.to_string()));
+                }
                 Some(other) => {
                     return Err(WorkspaceError::CorruptState {
                         reason: format!("unexpected line kind {other}"),
@@ -989,6 +1069,10 @@ impl DurableState {
             commits,
             heads,
             journal,
+            tombstones,
+            retained,
+            holds,
+            shallow_frontier,
         })
     }
 }
@@ -1005,6 +1089,18 @@ pub struct Workspace<S: ContentStore> {
     state_root: ObjectId,
     /// 写前日志（未确认的 pending 提交 marker）。
     journal: Vec<JournalEntry>,
+    /// GC Tombstone / Deletion Intent（v9 §20，持久态）。
+    tombstones: Vec<Tombstone>,
+    /// 显式保留的 Snapshot（GC Protected Root，持久态）。
+    retained: Vec<CommitId>,
+    /// Legal / user hold（GC Protected Root，持久态）。
+    holds: Vec<ObjectId>,
+    /// Active pin（内存态，进程持有）。
+    pins: HashSet<ObjectId>,
+    /// 本地 Replica 策略（shallow/sparse）。
+    replica_policy: ReplicaPolicy,
+    /// 未持有的父提交（shallow ancestry frontier）。
+    shallow_frontier: Vec<CommitId>,
 }
 
 /// 从提交 id 解析序号（`C0` -> 0）；无法解析返回 `None`。
@@ -1033,6 +1129,12 @@ impl<S: ContentStore> Workspace<S> {
             next_seq: 1,
             state_root: ObjectId(String::new()),
             journal: Vec::new(),
+            tombstones: Vec::new(),
+            retained: Vec::new(),
+            holds: Vec::new(),
+            pins: HashSet::new(),
+            replica_policy: ReplicaPolicy::default(),
+            shallow_frontier: Vec::new(),
         };
         ws.commits.insert(base.id.clone(), base.clone());
         ws.heads.add(base.id.clone());
@@ -1079,6 +1181,12 @@ impl<S: ContentStore> Workspace<S> {
             next_seq,
             state_root: state_root.clone(),
             journal: state.journal,
+            tombstones: state.tombstones,
+            retained: state.retained,
+            holds: state.holds,
+            pins: HashSet::new(),
+            replica_policy: ReplicaPolicy::default(),
+            shallow_frontier: state.shallow_frontier,
         })
     }
 
@@ -1112,15 +1220,27 @@ impl<S: ContentStore> Workspace<S> {
         self.commits.get(id)
     }
 
-    /// 把当前内存状态（DAG + Heads + Journal）持久化为单个 CAS 对象。
+    /// 把当前内存状态（DAG + Heads + Journal + GC 状态）持久化为单个 CAS 对象。
     fn persist_state(&mut self) -> Result<ObjectId, WorkspaceError> {
         let mut commits: Vec<WorkspaceCommit> = self.commits.values().cloned().collect();
         commits.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        let mut tombstones = self.tombstones.clone();
+        tombstones.sort_by(|a, b| a.object_id.0.cmp(&b.object_id.0));
+        let mut retained = self.retained.clone();
+        retained.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut holds = self.holds.clone();
+        holds.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut shallow_frontier = self.shallow_frontier.clone();
+        shallow_frontier.sort_by(|a, b| a.0.cmp(&b.0));
         let state = DurableState {
             id: self.id.clone(),
             commits,
             heads: self.heads.heads.clone(),
             journal: self.journal.clone(),
+            tombstones,
+            retained,
+            holds,
+            shallow_frontier,
         };
         let oid = self
             .store

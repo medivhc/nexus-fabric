@@ -128,7 +128,7 @@ cargo clippy -p nexus-workspace --all-targets -- -D warnings
 
 如果该模块影响产品行为，还必须映射 Integration/Scenario Evidence。
 
-本模块映射三个 E4 场景：
+本模块映射五个 E4 场景：
 
 - `scenarios/product/workspace_offline_merge.toml`：由
   `crates/nexus-workspace/examples/workspace_offline_merge.rs` 驱动，经 harness 的
@@ -138,7 +138,40 @@ cargo clippy -p nexus-workspace --all-targets -- -D warnings
   reconcile），经 harness 的 `regression` gate 求值；
 - `scenarios/platform/workspace_projection_channels.toml`：由
   `crates/nexus-workspace/examples/workspace_projection_channels.rs` 驱动，经
-  harness 的 `product-scenarios` gate 求值。
+  harness 的 `product-scenarios` gate 求值；
+- `scenarios/product/workspace_gc.toml`（v9 §20）：由
+  `crates/nexus-workspace/examples/workspace_gc.rs` 驱动，经 harness 的
+  `product-scenarios` gate 求值；
+- `scenarios/product/workspace_shallow_sparse.toml`（v9 §20）：由
+  `crates/nexus-workspace/examples/workspace_shallow.rs` 驱动，经 harness 的
+  `product-scenarios` gate 求值。
+
+### 冻结契约（v9 §20 存储治理，`src/gc.rs`）
+
+- 两阶段 GC：`plan_gc`（纯规划，可达闭包）→ `apply_tombstones`
+  （Tombstone/Deletion Intent 持久化）→ `sweep`（保留期后物理删除）。
+  `sweep` 前重验可达性：tombstone 期间复活的对象撤销 tombstone，不删除。
+- Protected Roots：当前 Heads、显式保留 Snapshot（`retain_snapshot`）、未合并分支、
+  Conflict 相关提交（W3 扩展点）、journal pending 的 manifest、当前 `state_root`、
+  active pin（内存态）、legal/user hold（持久态）。
+- `sweep` 跳过 in-flight fetch 的对象；超 `max_sweep_per_run` 限速；pin/hold
+  阻止删除并计数。
+- 默认保留期 `DEFAULT_RETENTION_SECS` = 14 天（v9 §20 移动端默认值）。
+- DurableState 格式 v2（向前兼容 v1 解析）：新增 `tombstone` / `retain` /
+  `hold` / `shallow` 行；tombstone/retain/hold/shallow_frontier 持久化。
+- Shallow/Sparse：`ReplicaPolicy { max_depth, sparse_paths }`；
+  `shallow_clone` 按老→新导入并做内容寻址校验（id 不匹配 → `CorruptState`）；
+  `deepen` 按需拉取缺失祖先，不改变 CommitId；`read_at_commit` 返回三态
+  `ReadOutcome`（`NotHeldLocally` 是预期状态，不是损坏）。
+- `ObjectFetcher` 由 Composition Root 适配传输实现；portable-core 只定义形状。
+- 后台调度器 `GcScheduler`（§15 Structured Concurrency：Owner + AtomicBool
+  取消 + join 回收）：soft 配额压力触发 GC，hard 压力经 `QuotaHandler`
+  通知（W2/W4 扩展点）；`GcRunPolicy::can_run_now` 预留移动端"仅 WiFi/充电"策略。
+- 配额：`QuotaPolicy { soft_bytes: 10GiB, hard_bytes: 20GiB }` 默认值；
+  `pressure()` 边界取高等级。
+- `compact()`：清理目标已不存在的 tombstone 记录并重写 state，不改变 CommitId。
+- Stop Condition：任何情况下不删除仍可达或未合并的数据；`delete_object`
+  是 `ReachabilityGc` 的 GC 专用原语，`ContentStore` 本身只读/写。
 
 ## Performance Budget
 
