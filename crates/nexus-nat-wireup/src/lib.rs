@@ -23,7 +23,7 @@ pub mod socket;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -151,6 +151,38 @@ pub struct PunchManager {
     unclaimed: Mutex<VecDeque<(u8, Arc<StreamShared>)>>,
 }
 
+/// Routing decision for one inbound relay stream, from the responder's peek
+/// outcome. Pure: this is the D5 demux table, directly unit-tested.
+///
+/// The responder is the SOLE stream acceptor on relay connections registered
+/// via [`PunchManager::register_relay`]; the session layer must NOT call
+/// `accept_bi` on those connections (it would race the responder on the
+/// shared `accepted` queue). Non-punch streams are handed over via
+/// [`PunchManager::take_unclaimed`] with bytes untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundRoute {
+    /// Punch signaling: consumed by the offer handler.
+    Punch,
+    /// Anything else: stashed to `unclaimed` for the session layer.
+    /// The first-frame type byte is preserved (peek never pops).
+    StashUnclaimed(u8),
+    /// Idle stream, no bytes yet: pushed back so a slow writer isn't killed.
+    PushBack,
+    /// Dead stream (EOF / error): dropped.
+    Drop,
+}
+
+/// Classify an inbound relay stream from the responder's type peek.
+/// See [`InboundRoute`] for the contract.
+fn route_inbound(peek: &io::Result<u8>) -> InboundRoute {
+    match peek {
+        Ok(ty) if *ty == STREAM_TYPE_PUNCH => InboundRoute::Punch,
+        Ok(ty) => InboundRoute::StashUnclaimed(*ty),
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => InboundRoute::PushBack,
+        Err(_) => InboundRoute::Drop,
+    }
+}
+
 impl PunchManager {
     pub fn new(driver: Arc<Driver>, my_id: FabricPeerId) -> Arc<Self> {
         Arc::new(Self {
@@ -203,7 +235,20 @@ impl PunchManager {
     }
 
     /// Take a stashed non-punch stream, if any: `(stream type, stream)`.
-    /// Bytes are intact (the responder only peeked the type).
+    ///
+    /// Demux handoff contract (D5, WARN-2):
+    /// - [`PunchManager::register_relay`] makes the wireup responder loop the
+    ///   SOLE stream acceptor on that relay connection. The session layer
+    ///   must NOT call `accept_bi` (or pop `ConnShared.accepted`) on a
+    ///   punch-registered relay conn — it would race the responder on the
+    ///   shared accept queue.
+    /// - The responder routes by the first frame's type byte (see
+    ///   [`route_inbound`]): punch streams are consumed as signaling; every
+    ///   other stream is stashed here with bytes untouched.
+    /// - The session layer takes non-punch streams from THIS queue. Bytes
+    ///   are intact: the responder only PEEKED the type byte, never popped
+    ///   it (`peek_stream_type` leaves `recv_buf` whole).
+    /// - FIFO order; `None` when no unclaimed stream is waiting.
     pub fn take_unclaimed(&self) -> Option<(u8, Arc<StreamShared>)> {
         self.unclaimed.lock().ok()?.pop_front()
     }
@@ -385,27 +430,28 @@ impl PunchManager {
                     continue;
                 }
             };
-            match peek_stream_type(&stream, Instant::now() + Duration::from_secs(2)) {
-                Ok(ty) if ty == STREAM_TYPE_PUNCH => {
+            let peeked = peek_stream_type(&stream, Instant::now() + Duration::from_secs(2));
+            match route_inbound(&peeked) {
+                InboundRoute::Punch => {
                     if let Err(e) = Self::handle_offer(&self, conn_id, stream) {
                         eprintln!("[wireup] offer handling failed: {e}");
                     }
                 }
-                Ok(ty) => {
+                InboundRoute::StashUnclaimed(ty) => {
                     eprintln!(
                         "[wireup] non-punch stream (type {ty:#04x}) stashed unclaimed, not consumed"
                     );
                     self.stash_unclaimed(ty, stream);
                 }
-                Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                InboundRoute::PushBack => {
                     // Idle stream, no bytes yet: put it back so a slow
                     // writer isn't killed. Peek consumed nothing; the 2s
                     // wait bounds the retry spin.
                     push_back_accepted(&relay_conn, stream);
                 }
-                Err(e) => {
+                InboundRoute::Drop => {
                     // EOF / error: dead stream, drop it.
-                    eprintln!("[wireup] dropping dead inbound stream: {e}");
+                    eprintln!("[wireup] dropping dead inbound stream: {peeked:?}");
                 }
             }
         }
@@ -549,6 +595,11 @@ impl PunchManager {
     /// could misidentify the peer when several punches run concurrently.
     /// Returns `None` (relay remains the path) when no candidate proves
     /// knowledge of a signaling nonce within `timeout`.
+    ///
+    /// Concurrency (WARN-1): several adopts may run at once (A punching B
+    /// and C, losing both tie-breaks). Drained candidate ids are never
+    /// silently dropped — rejected / unprocessed / retryable ids are
+    /// requeued — so one adopt cannot swallow another peer's connection.
     fn adopt_verified_direct(
         &self,
         peer: FabricPeerId,
@@ -568,33 +619,25 @@ impl PunchManager {
         let deadline = Instant::now() + timeout;
         let shared = self.driver.shared();
         // Connection ids already definitively rejected (wrong nonce).
-        // Timeouts are retried: the winner's bind responder may not be up yet,
-        // so retryable candidates are kept across rounds (accept_q is drained,
-        // not peeked — popped ids would otherwise be lost).
+        // Timeouts are retried: the winner's bind responder may not be up yet.
         let mut pending: Vec<Arc<ConnShared>> = Vec::new();
         let mut rejected: HashSet<u64> = HashSet::new();
         while Instant::now() < deadline {
-            // Drain new accepts into pending.
-            {
-                let mut q = shared.accept_q.lock().ok()?;
-                while let Some(id) = q.pop_front() {
-                    if rejected.contains(&id) || pending.iter().any(|c| c.id.0 == id) {
-                        continue;
-                    }
-                    if let Some(c) = shared.conns.lock().ok()?.get(&id).cloned() {
-                        let open = c
-                            .state
-                            .lock()
-                            .map(|st| st.closed.is_none())
-                            .unwrap_or(false);
-                        if open {
-                            pending.push(c);
-                        }
-                    }
-                }
-            }
+            drain_candidates(
+                &shared.accept_q,
+                &shared.accept_cv,
+                &shared.conns,
+                &rejected,
+                &mut pending,
+            );
             let mut still_pending = Vec::new();
+            let mut verified: Option<Arc<ConnShared>> = None;
             for conn in pending.drain(..) {
+                if verified.is_some() {
+                    // Already adopted one; requeue the rest for other adopts.
+                    requeue_accept_id(&shared.accept_q, &shared.accept_cv, conn.id.0);
+                    continue;
+                }
                 // Drop closed conns instead of retrying them forever.
                 let open = conn
                     .state
@@ -605,12 +648,20 @@ impl PunchManager {
                     continue;
                 }
                 match self.try_bind_challenge(&conn, &expected, deadline) {
-                    BindOutcome::Verified => return Some(conn),
+                    BindOutcome::Verified => verified = Some(conn),
                     BindOutcome::Rejected => {
+                        // Not ours — but it may be another peer's concurrent
+                        // punch. Requeue the id; the per-round `rejected`
+                        // set keeps this adopt from challenging it again
+                        // (no spin).
+                        requeue_accept_id(&shared.accept_q, &shared.accept_cv, conn.id.0);
                         rejected.insert(conn.id.0);
                     }
                     BindOutcome::Retryable => still_pending.push(conn),
                 }
+            }
+            if let Some(conn) = verified {
+                return Some(conn);
             }
             pending = still_pending;
             // Wait for new accepts (or deadline).
@@ -620,6 +671,11 @@ impl PunchManager {
                     .accept_cv
                     .wait_timeout(q, remaining.min(Duration::from_millis(200)));
             }
+        }
+        // Timeout: requeue retryable candidates instead of dropping them, so
+        // a concurrent (or later) adopt for another peer can still find them.
+        for conn in pending.drain(..) {
+            requeue_accept_id(&shared.accept_q, &shared.accept_cv, conn.id.0);
         }
         None
     }
@@ -652,6 +708,66 @@ impl PunchManager {
             Err(e) if e.kind() == io::ErrorKind::TimedOut => BindOutcome::Retryable,
             Err(_) => BindOutcome::Retryable,
         }
+    }
+}
+
+/// Push a candidate connection id back onto the driver's accept-queue tail
+/// and wake waiters.
+///
+/// Drained ids must never be silently dropped: `accept_q` is pop-only, so a
+/// dropped id is invisible to every other in-flight adopt (WARN-1: A punching
+/// B and C concurrently must not swallow C's direct connection).
+fn requeue_accept_id(accept_q: &Mutex<VecDeque<u64>>, accept_cv: &Condvar, id: u64) {
+    if let Ok(mut q) = accept_q.lock() {
+        q.push_back(id);
+    }
+    accept_cv.notify_one();
+}
+
+/// Drain newly accepted connection ids into `pending`.
+///
+/// Ids this adopt already rejected (or already has pending) are REQUEUED,
+/// never dropped, so a concurrent adopt for another peer can still find
+/// them. Unknown or closed ids are consumed (dropped): they can never
+/// verify for anyone.
+fn drain_candidates(
+    accept_q: &Mutex<VecDeque<u64>>,
+    accept_cv: &Condvar,
+    conns: &Mutex<HashMap<u64, Arc<ConnShared>>>,
+    rejected: &HashSet<u64>,
+    pending: &mut Vec<Arc<ConnShared>>,
+) {
+    let mut q = match accept_q.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let mut deferred = Vec::new();
+    while let Some(id) = q.pop_front() {
+        if rejected.contains(&id) || pending.iter().any(|c| c.id.0 == id) {
+            // Seen this round already: put it back for other adopts
+            // instead of swallowing it (WARN-1).
+            deferred.push(id);
+            continue;
+        }
+        let conn = conns.lock().ok().and_then(|m| m.get(&id).cloned());
+        match conn {
+            Some(c)
+                if c.state
+                    .lock()
+                    .map(|st| st.closed.is_none())
+                    .unwrap_or(false) =>
+            {
+                pending.push(c)
+            }
+            _ => {}
+        }
+    }
+    let had_deferred = !deferred.is_empty();
+    for id in deferred {
+        q.push_back(id);
+    }
+    if had_deferred {
+        accept_cv.notify_one();
     }
 }
 
@@ -790,5 +906,77 @@ mod tests {
         assert_eq!(ty, STREAM_TYPE_BIND);
         let back = decode_bind_response(&out).unwrap();
         assert_eq!(back, nonces);
+    }
+
+    /// WARN-1 Red: A punches B and C concurrently and loses both tie-breaks.
+    /// B's adopt drains C's connection id (7) and rejects it (foreign nonce).
+    /// The id must be REQUEUED — not dropped — so C's adopt can still find it.
+    /// (Old code: the drain popped every id and silently dropped the ones it
+    /// didn't adopt; C fell back to relay despite a healthy direct conn.)
+    #[test]
+    fn drain_requeues_rejected_ids_instead_of_dropping() {
+        use std::sync::Condvar;
+        let accept_q = Mutex::new(VecDeque::from([7u64, 9u64]));
+        let accept_cv = Condvar::new();
+        // No conns resolve: 9 is an unknown id (consumed); 7 was rejected
+        // by this adopt round (foreign nonce) and must survive.
+        let conns: Mutex<HashMap<u64, Arc<ConnShared>>> = Mutex::new(HashMap::new());
+        let rejected = HashSet::from([7u64]);
+        let mut pending = Vec::new();
+
+        drain_candidates(&accept_q, &accept_cv, &conns, &rejected, &mut pending);
+
+        let q = accept_q.lock().unwrap();
+        assert!(
+            q.contains(&7),
+            "rejected candidate id must survive in accept_q for the other peer's adopt"
+        );
+        assert!(!q.contains(&9), "unknown ids are consumed");
+        assert!(pending.is_empty());
+    }
+
+    /// WARN-1: requeueing wakes a waiter, so the other peer's adopt need not
+    /// burn its whole deadline before noticing the returned candidate.
+    #[test]
+    fn requeue_accept_id_pushes_back_and_notifies() {
+        use std::sync::Condvar;
+        let accept_q = Mutex::new(VecDeque::new());
+        let accept_cv = Condvar::new();
+        requeue_accept_id(&accept_q, &accept_cv, 42);
+        let q = accept_q.lock().unwrap();
+        assert_eq!(q.iter().collect::<Vec<_>>(), [&42u64]);
+    }
+
+    /// WARN-2 Red: the D5 demux routing table. A non-punch stream must be
+    /// stashed to unclaimed (bytes untouched) — never consumed as an offer;
+    /// punch streams go to the offer handler; idle streams are pushed back
+    /// so a slow writer isn't killed; dead streams are dropped.
+    #[test]
+    fn inbound_routing_table() {
+        // Punch signaling -> offer handler.
+        assert_eq!(route_inbound(&Ok(STREAM_TYPE_PUNCH)), InboundRoute::Punch);
+        // Non-punch (e.g. transfer) -> stashed unclaimed, bytes intact.
+        assert_eq!(route_inbound(&Ok(0x7F)), InboundRoute::StashUnclaimed(0x7F));
+        assert_eq!(
+            route_inbound(&Ok(STREAM_TYPE_BIND)),
+            InboundRoute::StashUnclaimed(STREAM_TYPE_BIND)
+        );
+        // Idle stream (peek timed out, no bytes yet) -> push back.
+        assert_eq!(
+            route_inbound(&Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "peek timeout"
+            ))),
+            InboundRoute::PushBack
+        );
+        // Dead stream (EOF / error) -> drop.
+        assert_eq!(
+            route_inbound(&Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed"))),
+            InboundRoute::Drop
+        );
+        assert_eq!(
+            route_inbound(&Err(io::Error::other("broken"))),
+            InboundRoute::Drop
+        );
     }
 }
