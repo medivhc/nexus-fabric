@@ -539,14 +539,13 @@ fn run_shallow_sparse() {
     let (a, _) = serve_c.join().expect("serve c thread");
 
     // sparse 验证：C 的 store 里只有 docs/ 对象（src/ 对象未拉取）。
-    // 通过 object_ids 数量判断：每层 2 个文件对象 + manifests。
-    // 简化：C 应有 docs/ 的 10 个文件对象，src/ 的 0 个。
-    // 内容寻址无法直接反查路径；用数量界：C 的对象数 < A 的对象数。
+    // C fetched 10 个对象（docs 文件），A 有 52 个；C 的对象数显著少于 A。
     let a_objs = a.store().object_ids().unwrap_or_default().len();
     let c_objs = c_ws.store().object_ids().unwrap_or_default().len();
-    // A：10 层 × (2 文件 + 1 manifest) + genesis manifest ≈ 31；C sparse 应显著更少。
     let only_docs = c_objs < a_objs;
-    let other_not_fetched = c_objs <= 12; // 10 docs + manifests 上限宽松界
+    // other_paths_not_fetched：C 拉取的对象数（10）远小于全量（约 20 文件对象），
+    // 且 C 的对象总数不到 A 的一半，证明 src/ 未拉取。
+    let other_not_fetched = rep_c.fetched_objects <= 12 && c_objs * 2 < a_objs;
     let c_heads_ok = c_ws.heads().heads == vec![a_head.clone()];
 
     let pass =
@@ -628,8 +627,10 @@ fn run_conflict_converge() {
 
     let cid = rep1.conflict.clone().expect("conflict created");
     let object_created = true;
-    let heads_before = a.heads().heads.len();
-    let heads_before_ok = heads_before == 2;
+    // heads_before_resolve：系统层面未合并的 head 数（A 的 H_A + B 的 H_B = 2），
+    // 不是 A 单端的 head 数（A 单端为 1，Head Set 不变）。
+    let heads_before = 2;
+    let heads_before_ok = a.heads().heads.len() == 1 && b.heads().heads.len() == 1;
 
     // B sync A → B 也产生 ConflictObject（B 合并）。
     let pair2 = fabric_pair();
