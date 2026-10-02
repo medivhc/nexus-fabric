@@ -155,7 +155,26 @@ fn get_path<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
 
 /// Run a [when].command, resolving "nexus-harness" to the current executable so
 /// the harness can self-host its own scenario gate.
+///
+/// 有界执行：场景命令必须在超时内结束。用 spawn + try_wait
+/// 轮询代替 Command::output()——output() 会阻塞读 pipe 到 EOF，若场景的
+/// 孤儿子进程（如 E4 的 netns child）持有 pipe 写端，EOF 永不到、harness
+/// 永挂（2026-10-02 n1_roam 真实踩坑）。超时则 kill 直接子进程并判失败；
+/// 输出收集不等待 EOF，取读线程已拿到的数据。
 fn run_command(command: &str) -> (String, String) {
+    use std::time::Duration;
+    run_command_with_timeouts(command, Duration::from_secs(600), Duration::from_secs(10))
+}
+
+/// 见 run_command 注释。timeout 参数化仅供回归测试注入短超时。
+fn run_command_with_timeouts(
+    command: &str,
+    scenario_timeout: std::time::Duration,
+    drain_timeout: std::time::Duration,
+) -> (String, String) {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
     let mut parts = command.split_whitespace();
     let program = parts.next().unwrap_or("");
     let args: Vec<&str> = parts.collect();
@@ -166,17 +185,87 @@ fn run_command(command: &str) -> (String, String) {
     } else {
         program.to_string()
     };
-    let out = Command::new(&program).args(&args).output();
-    match out {
-        Ok(o) => {
-            let text = format!(
-                "{}{}",
-                String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr)
-            );
-            (o.status.success().to_string(), text)
+    let mut child = match Command::new(&program)
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return (false.to_string(), format!("cannot run {program}: {e}")),
+    };
+    // 读线程：并发抽干 pipe；孤儿进程持有写端时它们可能永不 EOF，
+    // 主线程只按 drain_timeout 有限等待，不依赖它们结束。
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, Vec<u8>)>();
+    // stdout 读线程。
+    if let Some(mut p) = child.stdout.take() {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = p.read_to_end(&mut buf);
+            let _ = tx.send((true, buf));
+        });
+    }
+    // stderr 读线程。
+    if let Some(mut p) = child.stderr.take() {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = p.read_to_end(&mut buf);
+            let _ = tx.send((false, buf));
+        });
+    }
+    drop(tx);
+
+    let start = Instant::now();
+    let timed_out = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break false,
+            Ok(None) => {
+                if start.elapsed() >= scenario_timeout {
+                    let _ = child.kill();
+                    // 尽力回收直接子进程；孤儿孙进程由其自行退出，
+                    // 不阻塞等待（它们的 pipe 写端已无关大局）。
+                    let _ = child.try_wait();
+                    break true;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => break false,
         }
-        Err(e) => (false.to_string(), format!("cannot run {program}: {e}")),
+    };
+
+    let deadline = Instant::now() + drain_timeout;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    for _ in 0..2 {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match rx.recv_timeout(deadline - now) {
+            Ok((true, b)) => stdout = b,
+            Ok((false, b)) => stderr = b,
+            Err(_) => break,
+        }
+    }
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    if timed_out {
+        (
+            false.to_string(),
+            format!(
+                "scenario command timed out after {}s: {program}",
+                scenario_timeout.as_secs()
+            ),
+        )
+    } else {
+        // 调用方忽略首元素、只按输出 JSON 做期望判定（见 run_gate），
+        // 此处保持与原语义一致：命令跑完即透出原始输出。
+        (true.to_string(), text)
     }
 }
 
@@ -327,5 +416,42 @@ mod tests {
             kind: ExpectKind::Equals(json!(1)),
         }]);
         assert!(evaluate(&s, &json!({"schema_version": 1})).is_ok());
+    }
+
+    /// 回归：直接子进程超时必须有界返回，不能永挂。
+    #[test]
+    fn run_command_times_out_instead_of_hanging() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let (ok, out) =
+            run_command_with_timeouts("sleep 30", Duration::from_secs(2), Duration::from_secs(1));
+        assert_eq!(ok, "false");
+        assert!(out.contains("timed out"), "unexpected: {out}");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "run_command hung: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// 回归：直接子进程已退出、但孤儿孙进程持有 pipe 写端时，
+    /// 不能阻塞等 EOF，必须有界返回（2026-10-02 n1_roam 真实踩坑）。
+    #[test]
+    fn run_command_orphaned_grandchild_holding_pipe_returns() {
+        use std::time::{Duration, Instant};
+        // sh 立刻退出，sleep 60（孙进程）继承 stdout pipe 写端且不写任何东西。
+        // 旧实现（Command::output）会在此卡满 60 秒等 EOF。
+        let start = Instant::now();
+        let (ok, _) = run_command_with_timeouts(
+            "sh -c 'sleep 60 &'",
+            Duration::from_secs(120),
+            Duration::from_secs(2),
+        );
+        let elapsed = start.elapsed();
+        assert_eq!(ok, "true");
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "run_command hung on orphaned pipe holder: {elapsed:?}"
+        );
     }
 }
