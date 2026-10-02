@@ -58,9 +58,9 @@ fn load_file(path: &PathBuf) -> Option<Scenario> {
                 .filter_map(|e| {
                     let path = e.get("field")?.as_str()?.to_string();
                     let kind = if let Some(x) = e.get("equals") {
-                        ExpectKind::Equals(toml_scalar_to_json(x))
+                        ExpectKind::Equals(toml_value_to_json(x))
                     } else if let Some(list) = e.get("one_of").and_then(toml::Value::as_array) {
-                        ExpectKind::OneOf(list.iter().map(toml_scalar_to_json).collect())
+                        ExpectKind::OneOf(list.iter().map(toml_value_to_json).collect())
                     } else if e.get("non_empty").and_then(toml::Value::as_bool) == Some(true) {
                         ExpectKind::NonEmpty
                     } else {
@@ -79,13 +79,25 @@ fn load_file(path: &PathBuf) -> Option<Scenario> {
     })
 }
 
-fn toml_scalar_to_json(v: &toml::Value) -> Value {
+/// TOML 期望值 → JSON 期望值。数组递归转换；标量逐一映射。
+///
+/// 曾用名 toml_scalar_to_json，对 Array/Datetime/Table 一律返回 Value::Null，
+/// 导致数组 equals 期望永远判 FAIL（2026-10-02 workspace-authority-v2 真实踩坑）。
+/// toml::Value 的 7 种变体在此全部穷举，不再有静默兜底：未知形状宁可显式
+/// 转换失败，也不要悄悄变成 Null（Null 与实际 Null 相等时会误判 PASS）。
+fn toml_value_to_json(v: &toml::Value) -> Value {
     match v {
         toml::Value::String(s) => Value::String(s.clone()),
         toml::Value::Integer(i) => Value::from(*i),
         toml::Value::Float(f) => Value::from(*f),
         toml::Value::Boolean(b) => Value::from(*b),
-        _ => Value::Null,
+        toml::Value::Datetime(d) => Value::String(d.to_string()),
+        toml::Value::Array(a) => Value::Array(a.iter().map(toml_value_to_json).collect()),
+        toml::Value::Table(t) => Value::Object(
+            t.iter()
+                .map(|(k, v)| (k.clone(), toml_value_to_json(v)))
+                .collect(),
+        ),
     }
 }
 
@@ -141,16 +153,36 @@ fn evaluate(scenario: &Scenario, output: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// 在 JSON 输出中按 path 查找期望字段。
+///
+/// 歧义决策（2026-10-02 proxy-fwd 真实踩坑）：example 的机器输出有两种形状——
+/// 扁平点分键（如顶层 `"tcp.http_ok": true`）和嵌套对象（如 `{"tcp": {"http_ok": true}}`）。
+/// 扁平键本身可含 '.'，只看 path 字符串无法区分两种形状。
+/// 规则：**在当前对象上先尝试完整 path 精确匹配，命中则直接返回；否则再按 '.'
+/// 切分第一段逐层查找**（对象按段名、数组按数字下标）。扁平键与嵌套路径同名
+/// 时，扁平键优先——这是有意为之的确切语义，不是巧合。
 fn get_path<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
-    let mut cur = v;
-    for part in path.split('.') {
-        cur = match cur {
-            Value::Object(o) => o.get(part)?,
-            Value::Array(a) => a.get(part.parse::<usize>().ok()?)?,
-            _ => return None,
-        };
+    match v {
+        Value::Object(o) => {
+            // 扁平点分键：完整 path 直接命中。
+            if let Some(hit) = o.get(path) {
+                return Some(hit);
+            }
+            // 嵌套形状：按 '.' 切分第一段后递归。
+            let (head, rest) = path.split_once('.')?;
+            get_path(o.get(head)?, rest)
+        }
+        Value::Array(a) => {
+            // 叶子下标：递归到数组时 path 剩余部分可能整体就是数字（如 "a.b.1"）。
+            if let Ok(idx) = path.parse::<usize>() {
+                return a.get(idx);
+            }
+            let (head, rest) = path.split_once('.')?;
+            let idx = head.parse::<usize>().ok()?;
+            get_path(a.get(idx)?, rest)
+        }
+        _ => None,
     }
-    Some(cur)
 }
 
 /// Run a [when].command, resolving "nexus-harness" to the current executable so
@@ -375,6 +407,40 @@ mod tests {
         assert_eq!(get_path(&v, "missing"), None);
     }
 
+    /// 回归：example 输出扁平点分键（proxy-fwd 的 "tcp.http_ok"）时，
+    /// 完整键精确匹配必须命中，不能报 <missing>。
+    #[test]
+    fn get_path_flat_dotted_key() {
+        let v = json!({"tcp.http_ok": true, "verdict": "PASS"});
+        assert_eq!(get_path(&v, "tcp.http_ok"), Some(&json!(true)));
+        assert_eq!(get_path(&v, "verdict"), Some(&json!("PASS")));
+        assert_eq!(get_path(&v, "tcp.missing"), None);
+    }
+
+    /// 嵌套形状保持原有语义：逐层查找仍然可用。
+    #[test]
+    fn get_path_nested_still_works() {
+        let v = json!({"tcp": {"http_ok": true}});
+        assert_eq!(get_path(&v, "tcp.http_ok"), Some(&json!(true)));
+        assert_eq!(get_path(&v, "tcp"), Some(&json!({"http_ok": true})));
+    }
+
+    /// 歧义优先级：扁平键与嵌套路径同名时，扁平键精确匹配优先。
+    #[test]
+    fn get_path_flat_key_wins_over_nested() {
+        let v = json!({"a.b": 1, "a": {"b": 2}});
+        assert_eq!(get_path(&v, "a.b"), Some(&json!(1)));
+    }
+
+    /// 数组下标在递归末端：单段数字 path 在数组上直接按下标取。
+    #[test]
+    fn get_path_array_leaf_index() {
+        let v = json!({"items": ["x", "y"]});
+        assert_eq!(get_path(&v, "items.0"), Some(&json!("x")));
+        assert_eq!(get_path(&v, "items.1"), Some(&json!("y")));
+        assert_eq!(get_path(&v, "items.2"), None);
+    }
+
     #[test]
     fn evaluate_equals() {
         let s = scenario(vec![ScenarioExpect {
@@ -416,6 +482,46 @@ mod tests {
             kind: ExpectKind::Equals(json!(1)),
         }]);
         assert!(evaluate(&s, &json!({"schema_version": 1})).is_ok());
+    }
+
+    /// 回归：数组 equals 期望必须按数组比较，不能静默变成 Null 永远判 FAIL
+    ///（2026-10-02 workspace-authority-v2 的 conflict.paths 真实踩坑）。
+    #[test]
+    fn evaluate_array_equals() {
+        let toml_expect: toml::Value = toml::from_str(r#"equals = ["conflict.txt"]"#)
+            .map(|v: toml::Value| v["equals"].clone())
+            .unwrap();
+        let expected = toml_value_to_json(&toml_expect);
+        assert_eq!(expected, json!(["conflict.txt"]));
+        let s = scenario(vec![ScenarioExpect {
+            path: "conflict.paths".to_string(),
+            kind: ExpectKind::Equals(expected),
+        }]);
+        assert!(evaluate(&s, &json!({"conflict": {"paths": ["conflict.txt"]}})).is_ok());
+        assert!(evaluate(&s, &json!({"conflict": {"paths": ["other.txt"]}})).is_err());
+        assert!(evaluate(&s, &json!({"conflict": {}})).is_err());
+    }
+
+    #[test]
+    fn toml_value_to_json_covers_all_shapes() {
+        // 标量
+        assert_eq!(
+            toml_value_to_json(&toml::Value::String("a".into())),
+            json!("a")
+        );
+        assert_eq!(toml_value_to_json(&toml::Value::Integer(3)), json!(3));
+        assert_eq!(toml_value_to_json(&toml::Value::Float(1.5)), json!(1.5));
+        assert_eq!(toml_value_to_json(&toml::Value::Boolean(true)), json!(true));
+        // 嵌套数组递归转换
+        let arr: toml::Value = toml::from_str(r#"x = [1, ["a", "b"], 2.5]"#)
+            .map(|v: toml::Value| v["x"].clone())
+            .unwrap();
+        assert_eq!(toml_value_to_json(&arr), json!([1, ["a", "b"], 2.5]));
+        // table 递归成 object
+        let tbl: toml::Value = toml::from_str("[x]\ny = 1\n")
+            .map(|v: toml::Value| v["x"].clone())
+            .unwrap();
+        assert_eq!(toml_value_to_json(&tbl), json!({"y": 1}));
     }
 
     /// 回归：直接子进程超时必须有界返回，不能永挂。
