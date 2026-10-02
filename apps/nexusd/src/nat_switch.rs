@@ -64,13 +64,26 @@ impl PathEventSink for LinkSink {
         let Some(sw) = self.inner.upgrade() else {
             return;
         };
-        let PathEvent::Switched { from, to, .. } = &event;
-        eprintln!(
-            "[nat-switch] path switched: {} ({:?}) -> {} ({:?})",
-            from.remote_addr, from.kind, to.remote_addr, to.kind
-        );
-        sw.monitor.set_role(&to.remote_addr, ProbeRole::Active);
-        sw.monitor.set_role(&from.remote_addr, ProbeRole::Backup);
+        // T1 (2026-10-03): `PathEvent::Adopted` (nexus-path D4) added; the
+        // adoption has no previous path to demote. Minimal compile-safe
+        // handling — the NAT-flip/rebind policy stays in `handle_event`.
+        match &event {
+            PathEvent::Switched { from, to, .. } => {
+                eprintln!(
+                    "[nat-switch] path switched: {} ({:?}) -> {} ({:?})",
+                    from.remote_addr, from.kind, to.remote_addr, to.kind
+                );
+                sw.monitor.set_role(&to.remote_addr, ProbeRole::Active);
+                sw.monitor.set_role(&from.remote_addr, ProbeRole::Backup);
+            }
+            PathEvent::Adopted { to } => {
+                eprintln!(
+                    "[nat-switch] path adopted: {} ({:?})",
+                    to.remote_addr, to.kind
+                );
+                sw.monitor.set_role(&to.remote_addr, ProbeRole::Active);
+            }
+        }
         sw.link.lock().unwrap().handle_event(event);
     }
 }

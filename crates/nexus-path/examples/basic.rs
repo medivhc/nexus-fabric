@@ -107,7 +107,12 @@ fn main() {
         pm.on_stats(&direct, degraded_direct());
         pm.on_stats(&turn, healthy_turn());
         while let Some(ev) = pm.poll_event() {
-            let PathEvent::Switched { to, reason: r, .. } = ev;
+            // T1 (2026-10-03): `PathEvent::Adopted` (nexus-path D4) added;
+            // this E4 only cares about switches to Turn.
+            let (to, r) = match ev {
+                PathEvent::Switched { to, reason: r, .. } => (to, r),
+                PathEvent::Adopted { .. } => continue,
+            };
             if to.kind == PathKind::Turn {
                 switched = true;
                 reason = reason_name(&r).to_string();
@@ -121,7 +126,11 @@ fn main() {
     }
     // Drain any straggler events for the reason field.
     while let Some(ev) = pm.poll_event() {
-        let PathEvent::Switched { reason: r, .. } = ev;
+        // T1 (2026-10-03): `PathEvent::Adopted` (nexus-path D4) added;
+        // adoptions carry no switch reason.
+        let PathEvent::Switched { reason: r, .. } = ev else {
+            continue;
+        };
         if reason.is_empty() {
             reason = reason_name(&r).to_string();
         }

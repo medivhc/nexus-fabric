@@ -135,6 +135,10 @@ pub enum PathEvent {
         to: CandidatePath,
         reason: SwitchReason,
     },
+    /// The manager adopted a candidate as the active path when there was no
+    /// active path before (D4, 2026-10-03). Not a switch: there is no `from`.
+    /// Fields are isomorphic to [`PathEvent::Switched`]'s `to`.
+    Adopted { to: CandidatePath },
 }
 
 /// Per-candidate runtime state.
@@ -196,11 +200,18 @@ fn instant_score(stats: &PathStats, cost: f64) -> Option<f64> {
 
 /// Pick the highest-scored known candidate, optionally excluding one address.
 /// Tie-break: lower cost, then PathKind order. Returns the remote address.
+///
+/// A candidate whose `missed_probes` reached `max_missed_probes` is declared
+/// failed (S6) and excluded until a fresh valid report resets its counter —
+/// its stale EWMA score must not win it back (flap prevention).
 fn best_candidate(state: &State, exclude: Option<&SocketAddr>) -> Option<SocketAddr> {
+    let max_missed = state.config.max_missed_probes;
     state
         .candidates
         .iter()
-        .filter(|(addr, e)| e.ewma.value().is_some() && Some(*addr) != exclude)
+        .filter(|(addr, e)| {
+            e.ewma.value().is_some() && e.missed_probes < max_missed && Some(*addr) != exclude
+        })
         .max_by(|a, b| {
             let sa = a.1.ewma.value().unwrap();
             let sb = b.1.ewma.value().unwrap();
@@ -250,10 +261,16 @@ impl Inner {
             Some(a) => a,
             None => {
                 // No active path: adopt the best known one immediately.
-                // Not a "switch" (no `from`), so no event is emitted.
+                // D4: this IS observable — emit `Adopted` (not a switch,
+                // there is no `from`) so the session layer rebinds.
                 if let Some(best) = best_candidate(state, None) {
                     state.active = Some(best);
                     state.active_selected_at = now;
+                    let to = state.candidates[&best].path.clone();
+                    self.events
+                        .lock()
+                        .unwrap()
+                        .push_back(PathEvent::Adopted { to });
                 }
                 state.pending = None;
                 return;
@@ -404,26 +421,32 @@ impl PathManager {
     /// score (S7) and never becomes active before its first stats report.
     /// Adding alone never preempts the active path; a new candidate must earn
     /// the switch via scored hysteresis (S4) once stats arrive.
+    ///
+    /// Re-announcing an already-known remote only replaces the path
+    /// descriptor (kind/addrs/cost); the accumulated observations (`ewma`,
+    /// `missed_probes`) and the original `added_at` are preserved, so a
+    /// re-announcement can neither fake newness (PathAdded vs BetterScore)
+    /// nor wipe the score history / miss counter.
     pub fn add_candidate(&mut self, path: CandidatePath) {
         let mut state = self.inner.state.lock().unwrap();
         let remote = path.remote_addr;
-        // Re-adding resets observations, but keeps the original add time so
-        // "newness" (PathAdded vs BetterScore) isn't faked by re-announcement.
-        let added_at = state
-            .candidates
-            .get(&remote)
-            .map(|e| e.added_at)
-            .unwrap_or_else(Instant::now);
-        let alpha = state.config.ewma_alpha;
-        state.candidates.insert(
-            remote,
-            PathEntry {
-                path,
-                ewma: Ewma::new(alpha),
-                missed_probes: 0,
-                added_at,
-            },
-        );
+        match state.candidates.get_mut(&remote) {
+            Some(entry) => {
+                entry.path = path;
+            }
+            None => {
+                let alpha = state.config.ewma_alpha;
+                state.candidates.insert(
+                    remote,
+                    PathEntry {
+                        path,
+                        ewma: Ewma::new(alpha),
+                        missed_probes: 0,
+                        added_at: Instant::now(),
+                    },
+                );
+            }
+        }
     }
 
     /// Remove a candidate. If it was the active path, the best remaining one
@@ -664,6 +687,7 @@ mod tests {
         pm.add_candidate(candidate(PathKind::Mesh, 9003, 0.05)); // -0.1 pts vs direct
         pm.on_stats(&addr(9001), stats(10, 0.0)); // direct active, ~190.9
         assert_eq!(pm.current_path().unwrap().kind, PathKind::Direct);
+        while pm.poll_event().is_some() {} // drain setup Adopted event (D4)
         // Mesh scores ~190.8: margin 0.1 < hysteresis 1.0.
         for _ in 0..5 {
             pm.on_stats(&addr(9003), stats(10, 0.0));
@@ -687,6 +711,7 @@ mod tests {
         pm.on_stats(&addr(9001), stats(10, 0.0));
         pm.on_stats(&addr(9002), stats(50, 0.0));
         assert_eq!(pm.current_path().unwrap().kind, PathKind::Direct);
+        while pm.poll_event().is_some() {} // drain setup Adopted event (D4)
         // Degrade direct hard: instant score collapses below turn's.
         for _ in 0..10 {
             pm.on_stats(&addr(9001), stats(2000, 0.5));
@@ -736,6 +761,7 @@ mod tests {
         pm.on_stats(&addr(9001), stats(10, 0.0));
         pm.on_stats(&addr(9002), stats(50, 0.0));
         assert_eq!(pm.current_path().unwrap().kind, PathKind::Direct);
+        while pm.poll_event().is_some() {} // drain setup Adopted event (D4)
         let missed = || PathStats {
             rtt_ms: None,
             loss_rate: Some(1.0),
@@ -884,6 +910,7 @@ mod tests {
         pm.add_candidate(candidate(PathKind::Direct, 9002, 0.0)); // punched
         pm.on_stats(&addr(9001), stats(60, 0.0));
         assert_eq!(pm.current_path().unwrap().kind, PathKind::Mesh);
+        while pm.poll_event().is_some() {} // drain setup Adopted event (D4)
         // Direct ~8.3% better by PathManager score: hold elapses, still
         // below threshold -> pinned.
         pm.on_stats(&addr(9002), stats(45, 0.0));
@@ -908,6 +935,7 @@ mod tests {
         pm.on_stats(&addr(9001), stats(300, 0.01));
         pm.on_stats(&addr(9002), stats(50, 0.0));
         assert_eq!(pm.current_path().unwrap().kind, PathKind::Turn);
+        while pm.poll_event().is_some() {} // drain setup Adopted event (D4)
         // ~30% better: hold, then switch.
         thread::sleep(Duration::from_millis(150));
         pm.on_stats(&addr(9002), stats(50, 0.0));
@@ -941,6 +969,137 @@ mod tests {
             pm.current_path().unwrap().kind,
             PathKind::Turn,
             "frozen contract violated: switched before hold elapsed"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // P0 bugfix regression (2026-10-03, T1): D4 Adopted event, re-announce
+    // preserves observations, dead paths excluded from selection.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn adopt_emits_adopted_event() {
+        // D4: active=None -> adopt best known candidate: must emit
+        // `PathEvent::Adopted` (was: silent adoption, "Not a switch, no event").
+        let mut pm = PathManager::new(fast_config());
+        pm.add_candidate(candidate(PathKind::Direct, 9001, 0.0));
+        assert!(pm.poll_event().is_none());
+        pm.on_stats(&addr(9001), stats(20, 0.0));
+        assert_eq!(pm.current_path().unwrap().kind, PathKind::Direct);
+        match pm.poll_event() {
+            Some(PathEvent::Adopted { to }) => {
+                assert_eq!(to.kind, PathKind::Direct);
+                assert_eq!(to.remote_addr, addr(9001));
+            }
+            other => panic!("expected Adopted event on first adoption, got {other:?}"),
+        }
+        assert!(pm.poll_event().is_none());
+    }
+
+    #[test]
+    fn reannounce_keeps_ewma() {
+        // 重申已存在 candidate 不得清掉 EWMA 观测（旧代码重建 PathEntry，
+        // score() 回到 None，随后 evaluate 的未知分分支绕过 hysteresis 直接切换）。
+        let mut pm = PathManager::new(fast_config());
+        pm.add_candidate(candidate(PathKind::Direct, 9001, 0.0));
+        pm.on_stats(&addr(9001), stats(20, 0.0));
+        let before = pm.score(&addr(9001)).unwrap();
+        // Re-announce the same remote (e.g. re-discovered with updated cost).
+        pm.add_candidate(candidate(PathKind::Direct, 9001, 1.0));
+        assert_eq!(
+            pm.score(&addr(9001)),
+            Some(before),
+            "re-announcement must preserve EWMA observations"
+        );
+        // Path descriptor itself is updated.
+        assert_eq!(pm.current_path().unwrap().cost, 1.0);
+    }
+
+    #[test]
+    fn reannounce_keeps_missed_probes() {
+        // missed_probes 计数同样不得因重申清零，否则 S6 failover 可被
+        // 无限推迟（每次重申都把连续 miss 计数归零）。
+        let mut pm = PathManager::new(fast_config()); // max_missed_probes = 3
+        pm.add_candidate(candidate(PathKind::Direct, 9001, 0.0));
+        pm.add_candidate(candidate(PathKind::Turn, 9002, 5.0));
+        pm.on_stats(&addr(9001), stats(20, 0.0));
+        pm.on_stats(&addr(9002), stats(50, 0.0));
+        assert_eq!(pm.current_path().unwrap().kind, PathKind::Direct);
+        while pm.poll_event().is_some() {} // drain setup Adopted event
+        let missed = || PathStats {
+            rtt_ms: None,
+            loss_rate: Some(1.0),
+            throughput_bps: None,
+        };
+        pm.on_stats(&addr(9001), missed());
+        pm.on_stats(&addr(9001), missed());
+        // Re-announce must not reset the consecutive-miss counter.
+        pm.add_candidate(candidate(PathKind::Direct, 9001, 0.0));
+        pm.on_stats(&addr(9001), missed()); // 3rd consecutive miss -> S6 failover
+        assert_eq!(
+            pm.current_path().unwrap().kind,
+            PathKind::Turn,
+            "missed_probes must survive re-announcement (S6)"
+        );
+        // …and it must be a real S6 failover (PathFailed), not the unknown-score
+        // branch firing because re-announcement wiped the EWMA.
+        match pm.poll_event() {
+            Some(PathEvent::Switched { reason, .. }) => assert_eq!(
+                reason,
+                SwitchReason::PathFailed,
+                "3rd consecutive miss must fail over via S6, not a score switch"
+            ),
+            other => panic!("expected PathFailed switch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dead_path_not_reselected_on_stale_score() {
+        // missed_probes >= max_missed_probes 的路径已判失败：在收到新的有效
+        // 观测前不得参与选优。旧代码只看 ewma 分数，死路径凭陈旧高分在 hold
+        // 走完后被选回，造成 flap。
+        let mut pm = PathManager::new(fast_config()); // max_missed_probes = 3, hold 50ms
+        pm.add_candidate(candidate(PathKind::Direct, 9001, 0.0));
+        pm.add_candidate(candidate(PathKind::Turn, 9002, 5.0));
+        pm.on_stats(&addr(9001), stats(10, 0.0)); // direct: high score, adopted
+        pm.on_stats(&addr(9002), stats(200, 0.0)); // turn: low but known score
+        assert_eq!(pm.current_path().unwrap().kind, PathKind::Direct);
+        // Direct dies -> S6 immediate failover to turn.
+        let missed = || PathStats {
+            rtt_ms: None,
+            loss_rate: Some(1.0),
+            throughput_bps: None,
+        };
+        for _ in 0..3 {
+            pm.on_stats(&addr(9001), missed());
+        }
+        assert_eq!(pm.current_path().unwrap().kind, PathKind::Turn);
+        // Drain events; then let the hold window pass while only turn reports.
+        while pm.poll_event().is_some() {}
+        for _ in 0..6 {
+            pm.on_stats(&addr(9002), stats(200, 0.0));
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            pm.current_path().unwrap().kind,
+            PathKind::Turn,
+            "dead path must not be re-selected on its stale score"
+        );
+        // Recovery: one valid report resets the miss counter; direct becomes
+        // eligible again and wins back on merit after the hold.
+        pm.on_stats(&addr(9001), stats(10, 0.0));
+        for _ in 0..6 {
+            pm.on_stats(&addr(9002), stats(200, 0.0));
+            pm.on_stats(&addr(9001), stats(10, 0.0));
+            thread::sleep(Duration::from_millis(20));
+            if pm.current_path().unwrap().kind == PathKind::Direct {
+                break;
+            }
+        }
+        assert_eq!(
+            pm.current_path().unwrap().kind,
+            PathKind::Direct,
+            "recovered path must become eligible again"
         );
     }
 }
