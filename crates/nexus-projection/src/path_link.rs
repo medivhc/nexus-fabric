@@ -275,20 +275,27 @@ impl PathLink {
             }
         };
         // D1: NAT peer -> flip active connection, never rebind.
+        // Only count path_active_switches when the flip actually changes
+        // the active connection: a no-op flip (e.g. Adopted{Relay} while
+        // already on Relay) is not a switch.
         if let Some(conns) = self.nat_conns.get_mut(&peer) {
             match to.kind {
                 PathKind::Direct => {
                     if conns.direct.is_some() {
-                        conns.active = ActiveConn::Direct;
-                        self.stats.path_active_switches += 1;
+                        if conns.active != ActiveConn::Direct {
+                            conns.active = ActiveConn::Direct;
+                            self.stats.path_active_switches += 1;
+                        }
                     } else {
                         // Defensive: candidate raced ahead of conn handoff.
                         self.stats.path_active_switch_no_direct += 1;
                     }
                 }
                 PathKind::Turn | PathKind::Mesh => {
-                    conns.active = ActiveConn::Relay;
-                    self.stats.path_active_switches += 1;
+                    if conns.active != ActiveConn::Relay {
+                        conns.active = ActiveConn::Relay;
+                        self.stats.path_active_switches += 1;
+                    }
                 }
                 PathKind::Proxy => {
                     // NAT never registers proxy candidates; ignore.
