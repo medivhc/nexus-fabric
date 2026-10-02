@@ -34,6 +34,11 @@ impl PreAnsweredChannel {
             nonce: Mutex::new(None),
         }
     }
+
+    /// Nonce captured from the session's offer (for bind identity).
+    pub fn captured_nonce(&self) -> Option<u64> {
+        self.nonce.lock().ok().and_then(|g| *g)
+    }
 }
 
 impl PunchChannel for PreAnsweredChannel {
