@@ -190,9 +190,13 @@ impl WorkspaceTransport for FabricSyncTransport {
 
 /// 静态成员列表（D4 第一版；后续接正式成员服务）。
 ///
-/// fabric 握手已做 ed25519 PeerId 绑定（认证）；本检查回答授权
-/// （"他有没有资格读这个 Workspace"）。白皮书要求每个 Workspace
-/// 有明确的成员与策略权威来源；纯 Relay 转发不自动获得成员身份。
+/// P0 诚实声明：fabric 当前仅做单向认证（client 验证 server），**server 侧拿不到
+/// client 的 PeerId**（`ConnShared::peer` 在 P0 为 zeroed，见 nexus-fabric driver）。
+/// 因此生产环境被动端的 peer 身份不可信；`SyncAuthorizer` 当前为"机制就绪、
+/// 强制执行待 client-auth"状态。E4 用显式注入的测试 ID 验证机制正确性，
+/// 不代表生产安全属性已成立。client-auth 补齐后，本检查即转为强制执行。
+/// （"他有没有资格读这个 Workspace"；白皮书要求每个 Workspace 有明确的成员与
+/// 策略权威来源；纯 Relay 转发不自动获得成员身份。）
 #[derive(Debug, Clone, Default)]
 pub struct SyncAuthorizer {
     members: HashSet<String>,

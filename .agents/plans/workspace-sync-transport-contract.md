@@ -1,9 +1,12 @@
 # Contract：C2 workspace sync over fabric transport
 
-- Contract hash：`9aceea8ef2359341`（6 个场景 toml 全集 git hash-object 前 16 位）
+- Contract hash：`d8890ffb4510befb`（6 个场景 toml 全集 git hash-object 前 16 位）
 - Red Evidence：`.evidence/red-evidence-c2-sync/RED.md`（6/6 BLOCKED）
 - 冻结日期：2026-10-02
 - 基座：0785939（W3 合并后本地 master）
+- requirement-change 2026-10-02（Review F2）：`workspace_sync_basic.toml` 的
+  `sync.fetched_commits` 1→2（genesis 按 author 区分，fresh peer 需拉取对端 genesis）。
+  旧 hash `9aceea8ef2359341` 作废。
 
 ## 冻结的场景
 

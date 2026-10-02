@@ -2323,8 +2323,10 @@ impl<S: ContentStore> Workspace<S> {
             .collect();
         let mut want_ids: Vec<String> = want.iter().map(|(c, _)| c.0.clone()).collect();
         while !want_ids.is_empty() {
+            let want_before = want_ids.len();
             transport.send_frame(format!("WANT-COMMITS:{}", want_ids.join(",")).as_bytes())?;
             let n = Self::recv_count(transport, "COMMITS:")?;
+            let mut progressed = 0usize;
             for _ in 0..n {
                 let frame = transport.recv_frame()?;
                 let commit = Self::parse_commit_frame(&frame)?;
@@ -2365,6 +2367,7 @@ impl<S: ContentStore> Workspace<S> {
                 }
                 self.commits.insert(commit.id.clone(), commit);
                 fetched_commits += 1;
+                progressed += 1;
             }
             // C2-D6：每批 commits 落一次 persist（中断可续，重跑 BFS 跳过已有）。
             self.persist_state()?;
@@ -2373,6 +2376,13 @@ impl<S: ContentStore> Workspace<S> {
                 .filter(|(c, _)| !self.commits.contains_key(c))
                 .map(|(c, _)| c.0.clone())
                 .collect();
+            // F3（Review）：若一轮 want 非空但零进展（对端返回空/重复/未请求），
+            // 报 RemoteProtocol 避免 livelock（不对端诚实性做假设）。
+            if !want_ids.is_empty() && progressed == 0 {
+                return Err(WorkspaceError::RemoteProtocol {
+                    frame: format!("WANT-COMMITS no progress (want {want_before}, got 0 new)"),
+                });
+            }
         }
         // 拉取新提交的 manifest（blob 按需，读时再取）。
         let mut want_objs: Vec<String> = Vec::new();

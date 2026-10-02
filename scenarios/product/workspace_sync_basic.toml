@@ -17,6 +17,9 @@ command = "cargo run --quiet -p nexusd --example workspace_sync_e4 -- --scenario
 # - 双端 heads 收敛一致；
 # - 拉取的提交 id == hash(content) 校验通过；
 # - SyncReport 计数正确（fetched_commits / fetched_objects）。
+# requirement-change 2026-10-02（Review F2）：fetched_commits 1→2。
+# genesis 按 author 区分内容哈希（Workspace::init），双端独立建仓时 genesis
+# 必然不同；B 从 A 拉取时需同时拉取 hello commit 与对端 genesis，故为 2。
 [[expect]]
 field = "verdict"
 equals = "PASS"
@@ -43,7 +46,7 @@ equals = true
 
 [[expect]]
 field = "sync.fetched_commits"
-equals = 1
+equals = 2
 
 [[expect]]
 field = "sync.disposition"
