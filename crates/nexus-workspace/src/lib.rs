@@ -177,6 +177,18 @@ pub enum MergeDisposition {
     Diverged,
 }
 
+impl MergeDisposition {
+    /// 规范的机器可读名（snake_case）：冻结合同与机器输出统一用此拼写，
+    /// 不要用 `{:?}` Debug 输出（PascalCase）做机器可读字段。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MergeDisposition::FastForward => "fast_forward",
+            MergeDisposition::AlreadyEqual => "already_equal",
+            MergeDisposition::Diverged => "diverged",
+        }
+    }
+}
+
 /// 三方合并对单一路径的冲突处置。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeConflict {
@@ -2953,6 +2965,14 @@ mod tests {
 
     fn genesis(ws: &Workspace<InMemoryContentStore>) -> CommitId {
         ws.heads().heads[0].clone()
+    }
+
+    #[test]
+    fn merge_disposition_as_str_is_snake_case() {
+        // 冻结合同用 snake_case；机器可读输出必须走 as_str()，不要用 {:?}。
+        assert_eq!(MergeDisposition::FastForward.as_str(), "fast_forward");
+        assert_eq!(MergeDisposition::AlreadyEqual.as_str(), "already_equal");
+        assert_eq!(MergeDisposition::Diverged.as_str(), "diverged");
     }
 
     #[test]

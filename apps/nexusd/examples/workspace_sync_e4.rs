@@ -159,7 +159,7 @@ fn run_basic() {
             "id_hash_verified": true,
             "fetched_commits": report.fetched_commits,
             "fetched_objects": report.fetched_objects,
-            "disposition": format!("{:?}", report.disposition),
+            "disposition": report.disposition.as_str(),
             "served_commits": served.served_commits,
         },
     }));
