@@ -43,6 +43,13 @@ impl MockFabricConn {
         self.path_switches += 1;
     }
 
+    /// Called by the path layer on `PathEvent::Adopted` (D4, 2026-10-03):
+    /// the session layer must rebind to the adopted path, but an adoption
+    /// is not a switch and is not counted as one.
+    fn on_path_adopted(&mut self, to: SocketAddr) {
+        self.active_remote = to;
+    }
+
     fn send(&mut self, chunk: &[u8]) {
         // Mock transport: bytes are "sent" over whatever path is active.
         // Because the CID never resets, no byte is lost or duplicated across
@@ -165,16 +172,19 @@ fn main() {
             }
             // Drain switch events and notify the (mock) session layer.
             while let Some(ev) = pm.poll_event() {
-                // T1 (2026-10-03): `PathEvent::Adopted` (nexus-path D4) added;
-                // the mock session layer treats it like a switch-to.
-                let (from_kind, to) = match ev {
-                    PathEvent::Switched { from, to, .. } => (Some(from.kind), to),
-                    PathEvent::Adopted { to } => (None, to),
-                };
-                failed_kind = from_kind.map(kind_name).unwrap_or("none").to_string();
-                new_kind = kind_name(to.kind).to_string();
-                fabric.on_path_switched(to.remote_addr);
-                switched = true;
+                match ev {
+                    PathEvent::Switched { from, to, .. } => {
+                        failed_kind = kind_name(from.kind).to_string();
+                        new_kind = kind_name(to.kind).to_string();
+                        fabric.on_path_switched(to.remote_addr);
+                        switched = true;
+                    }
+                    // D4: the initial adoption also rebinds the session layer
+                    // (that is the bug-2 fix), but it is not a switch.
+                    PathEvent::Adopted { to } => {
+                        fabric.on_path_adopted(to.remote_addr);
+                    }
+                }
             }
         }
     }
