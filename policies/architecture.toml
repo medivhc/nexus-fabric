@@ -225,6 +225,18 @@ portable = false
 layer = "delivery"
 
 [[crate]]
+name = "nexus-nat-traversal"
+allowed_internal_dependencies = ["nexus-connectivity"]
+portable = false
+layer = "delivery"
+
+[[crate]]
+name = "nexus-nat-wireup"
+allowed_internal_dependencies = ["nexus-fabric", "nexus-nat-traversal", "nexus-connectivity"]
+portable = false
+layer = "delivery"
+
+[[crate]]
 name = "nexus-turn"
   allowed_internal_dependencies = ["nexus-fabric"]
   portable = false
