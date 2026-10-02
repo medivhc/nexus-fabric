@@ -15,7 +15,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::{
     Arc, Condvar, Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc,
 };
 use std::thread::{self, JoinHandle};
@@ -239,6 +239,10 @@ pub enum Cmd {
         peer: PeerId,
         server_name: String,
         reply: mpsc::Sender<Result<u64, FabricError>>,
+        /// S11: set by `Driver::connect` if it stops waiting for the reply.
+        /// The driver must not create an orphan connection from a
+        /// cancelled command.
+        cancel: Arc<AtomicBool>,
     },
     OpenBi {
         conn: u64,
@@ -392,6 +396,11 @@ impl Driver {
         remote: SocketAddr,
         handshake_timeout: Duration,
     ) -> Result<Arc<ConnShared>, FabricError> {
+        // S11: a single total deadline spans both phases (command reply +
+        // QUIC handshake) — the caller never observes ~2x the timeout.
+        let start = Instant::now();
+        let deadline = start + handshake_timeout;
+        let cancel = Arc::new(AtomicBool::new(false));
         let crypto = build_client_crypto(peer)?;
         let (tx, rx) = mpsc::channel();
         self.send(Cmd::Connect {
@@ -400,10 +409,25 @@ impl Driver {
             peer,
             server_name: "nexus-fabric".to_string(),
             reply: tx,
+            cancel: cancel.clone(),
         });
-        let conn_id = rx
-            .recv_timeout(handshake_timeout)
-            .map_err(|_| FabricError::Timeout)??;
+        let conn_id = match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(r) => r?,
+            Err(_) => {
+                // S11: phase-1 timeout. The driver may still run the
+                // command later — cancel it so no orphan connection is
+                // created, and drain a reply that raced the timeout.
+                cancel.store(true, Ordering::Relaxed);
+                if let Ok(Ok(id)) = rx.try_recv() {
+                    self.send(Cmd::Close {
+                        conn: id,
+                        code: 0,
+                        reason: b"connect timeout".to_vec(),
+                    });
+                }
+                return Err(FabricError::Timeout);
+            }
+        };
         let shared = self
             .shared
             .conns
@@ -412,8 +436,7 @@ impl Driver {
             .get(&conn_id)
             .cloned()
             .ok_or(FabricError::Closed(0))?;
-        // Wait for handshake completion (or failure).
-        let deadline = Instant::now() + handshake_timeout;
+        // Wait for handshake completion (or failure) — same total deadline.
         let mut st = shared.state.lock().unwrap();
         loop {
             if st.connected {
@@ -447,14 +470,13 @@ impl Driver {
         let mut q = self.shared.accept_q.lock().unwrap();
         loop {
             if let Some(id) = q.pop_front() {
-                return self
-                    .shared
-                    .conns
-                    .lock()
-                    .unwrap()
-                    .get(&id)
-                    .cloned()
-                    .ok_or(FabricError::Closed(0));
+                // S10: the accept queue can hold ids whose connections were
+                // already reaped — skip them instead of handing out (or
+                // erroring on) dead connections.
+                if let Some(shared) = self.shared.conns.lock().unwrap().get(&id).cloned() {
+                    return Ok(shared);
+                }
+                continue;
             }
             q = self
                 .shared
@@ -568,8 +590,9 @@ impl Loop {
                 peer,
                 server_name,
                 reply,
+                cancel,
             } => {
-                let r = self.cmd_connect(remote, crypto, peer, &server_name, now);
+                let r = self.cmd_connect(remote, crypto, peer, &server_name, now, &cancel);
                 let _ = reply.send(r);
             }
             Cmd::OpenBi { conn, reply } => {
@@ -604,7 +627,12 @@ impl Loop {
         peer: PeerId,
         server_name: &str,
         now: Instant,
+        cancel: &AtomicBool,
     ) -> Result<u64, FabricError> {
+        // S11: connect() stopped waiting — don't create an orphan.
+        if cancel.load(Ordering::Relaxed) {
+            return Err(FabricError::Timeout);
+        }
         let mut cc = ClientConfig::new(Arc::new(crypto));
         cc.transport_config(crate::cert::quic_transport_config());
         let (handle, quic) = self
@@ -627,6 +655,17 @@ impl Loop {
             },
         );
         self.shared.conns.lock().unwrap().insert(id, shared);
+        // S11: cancelled while creating — close immediately instead of
+        // leaving an orphan; the reaper removes it on the next pump.
+        if cancel.load(Ordering::Relaxed) {
+            if let Some(lc) = self.live.get_mut(&id) {
+                lc.quic.close(
+                    now,
+                    VarInt::from_u32(0),
+                    Bytes::from_static(b"connect cancelled"),
+                );
+            }
+        }
         Ok(id)
     }
 
@@ -874,7 +913,10 @@ impl Loop {
             }
         }
         self.update_stats(id);
-        // Reap fully-closed connections (keep shared state for late stats()).
+        // Reap fully-closed connections. S10: also remove from
+        // `shared.conns` — otherwise closed connections (and their
+        // `accepted`/`dgrams` buffers) accumulate forever and `accept()`
+        // can hand out dead connections.
         let reaped = match self.live.get_mut(&id) {
             Some(lc) => {
                 lc.quic.poll_timeout().is_none() && lc.shared.state.lock().unwrap().closed.is_some()
@@ -885,6 +927,7 @@ impl Loop {
             if let Some(lc) = self.live.remove(&id) {
                 self.handle_map.remove(&lc.handle);
             }
+            self.shared.conns.lock().unwrap().remove(&id);
         }
     }
 
@@ -1052,6 +1095,7 @@ fn map_close_reason(reason: &quinn_proto::ConnectionError) -> FabricError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
     #[test]
@@ -1066,6 +1110,40 @@ mod tests {
         assert_eq!(
             min_poll_timeout(Duration::from_secs(10)),
             Duration::from_secs(10)
+        );
+    }
+
+    /// S11: a `Cmd::Connect` cancelled before the driver runs it must not
+    /// create an orphan connection. This is what `Driver::connect` relies
+    /// on when its phase-1 wait times out.
+    #[test]
+    fn s11_cancelled_connect_creates_no_orphan() {
+        let driver = Driver::new_client().expect("driver spawns");
+        let peer = PeerId([7u8; 32]);
+        let crypto = build_client_crypto(peer).expect("client crypto");
+        let (tx, rx) = mpsc::channel();
+        // Pre-cancelled: simulates connect() timing out before the driver
+        // thread picks the command up.
+        let cancel = Arc::new(AtomicBool::new(true));
+        driver.send(Cmd::Connect {
+            remote: "127.0.0.1:9".parse().unwrap(),
+            crypto,
+            peer,
+            server_name: "nexus-fabric".to_string(),
+            reply: tx,
+            cancel,
+        });
+        let r = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reply arrives");
+        assert!(
+            r.is_err(),
+            "S11: cancelled connect must not produce a connection id"
+        );
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            driver.shared().conns.lock().unwrap().is_empty(),
+            "S11: cancelled connect must not leave an orphan in shared.conns"
         );
     }
 }

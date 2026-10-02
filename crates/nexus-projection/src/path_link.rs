@@ -28,15 +28,15 @@ use nexus_path::{CandidatePath, PathEvent, PathKind, PathManager};
 /// real connections).
 #[derive(Debug, Default, Clone)]
 pub struct PathLinkStats {
-    /// Successful `rebind()` calls driven by `Switched` events.
+    /// Successful `rebind()` calls driven by `Switched`/`Adopted` events.
     pub path_rebinds: u64,
     /// Failed `rebind()` calls; the old connection is left untouched (S2).
     pub path_rebind_errors: u64,
-    /// `Switched` events with no mapped peer/conn; ignored, never panics.
+    /// `Switched`/`Adopted` events with no mapped peer/conn; ignored, never panics.
     pub path_rebind_no_conn: u64,
     /// Successful active-connection switches for NAT peers (D1).
     pub path_active_switches: u64,
-    /// `Switched` to Direct with no direct conn registered; active stays
+    /// `Switched`/`Adopted` to Direct with no direct conn registered; active stays
     /// on Relay (defensive; should not happen in production).
     pub path_active_switch_no_direct: u64,
 }
@@ -224,7 +224,7 @@ impl PathLink {
     ///   `pump()` remains for contexts without a monitor (unit tests,
     ///   legacy manual driving).
     ///
-    /// On `Switched{to, ..}` ([`handle_event`](Self::handle_event)):
+    /// On `Switched{to, ..}` / `Adopted{to}` ([`handle_event`](Self::handle_event)):
     /// - NAT peer (in `nat_conns`): flip the active connection —
     ///   [`PathKind::Direct`] → Direct (if registered), [`PathKind::Turn`] |
     ///   [`PathKind::Mesh`] → Relay. [`PathKind::Proxy`] is ignored (NAT
@@ -243,15 +243,25 @@ impl PathLink {
         }
     }
 
-    /// Handle one [`PathEvent::Switched`] (shared by [`pump`](Self::pump)
-    /// and the production monitor sink). `pub` so the composition root's
+    /// Handle one [`PathEvent`] (shared by [`pump`](Self::pump) and the
+    /// production monitor sink). `pub` so the composition root's
     /// `PathEventSink` impl can delegate without reimplementing the
     /// NAT-flip / legacy-rebind policy.
     ///
-    /// TEMPORARY (T1, 2026-10-03): `PathEvent::Adopted` (nexus-path D4) is
-    /// destructured here only so the workspace compiles; the `to`-side is
-    /// handled identically to `Switched`. T3 owns the real Adopted policy
-    /// (flip vs rebind) and will refine this on rebase.
+    /// `Switched` and `Adopted` share one flip-vs-rebind policy, driven by
+    /// the event's `to` path (D4, 2026-10-03: `Adopted{to}` is isomorphic to
+    /// `Switched`'s `to`; it fires when the manager had no active path, so
+    /// the session layer must still converge onto the adopted path):
+    /// - NAT peer (in `nat_conns`): flip the active connection, never
+    ///   rebind — [`PathKind::Direct`] → Direct when a direct conn is
+    ///   registered (else counted via `path_active_switch_no_direct`),
+    ///   [`PathKind::Turn`] | [`PathKind::Mesh`] → Relay.
+    ///   [`PathKind::Proxy`] is ignored (NAT never registers proxy
+    ///   candidates).
+    /// - Legacy peer (in `conns`): `rebind()` the mapped [`FabricConn`]
+    ///   (S27; blocking until the new path is active, CID unchanged).
+    ///   Failures are counted and the old connection is kept usable;
+    ///   unmapped peers are counted and ignored.
     pub fn handle_event(&mut self, event: PathEvent) {
         let to: CandidatePath = match event {
             PathEvent::Switched { to, .. } => to,
@@ -265,20 +275,27 @@ impl PathLink {
             }
         };
         // D1: NAT peer -> flip active connection, never rebind.
+        // Only count path_active_switches when the flip actually changes
+        // the active connection: a no-op flip (e.g. Adopted{Relay} while
+        // already on Relay) is not a switch.
         if let Some(conns) = self.nat_conns.get_mut(&peer) {
             match to.kind {
                 PathKind::Direct => {
                     if conns.direct.is_some() {
-                        conns.active = ActiveConn::Direct;
-                        self.stats.path_active_switches += 1;
+                        if conns.active != ActiveConn::Direct {
+                            conns.active = ActiveConn::Direct;
+                            self.stats.path_active_switches += 1;
+                        }
                     } else {
                         // Defensive: candidate raced ahead of conn handoff.
                         self.stats.path_active_switch_no_direct += 1;
                     }
                 }
                 PathKind::Turn | PathKind::Mesh => {
-                    conns.active = ActiveConn::Relay;
-                    self.stats.path_active_switches += 1;
+                    if conns.active != ActiveConn::Relay {
+                        conns.active = ActiveConn::Relay;
+                        self.stats.path_active_switches += 1;
+                    }
                 }
                 PathKind::Proxy => {
                     // NAT never registers proxy candidates; ignore.
@@ -305,7 +322,9 @@ mod tests {
     use super::ActiveConn;
     use super::PathLink;
     use nexus_fabric::{ConnConfig, FabricConn, FabricListener};
-    use nexus_path::{CandidatePath, PathConfig, PathKind, PathManager, PathStats, RaceBudget};
+    use nexus_path::{
+        CandidatePath, PathConfig, PathEvent, PathKind, PathManager, PathStats, RaceBudget,
+    };
     use std::net::SocketAddr;
     use std::time::Duration;
 
@@ -463,6 +482,28 @@ mod tests {
         assert_eq!(link.stats().path_rebinds, 0);
     }
 
+    #[test]
+    fn adopted_drives_rebind_like_switched() {
+        // D4: Adopted{to} (manager had no active path) drives the same
+        // legacy rebind policy as Switched — the session layer must still
+        // converge onto the adopted path.
+        if !udp_loopback_available() {
+            return; // sandbox: UDP blocked, true verification on xc-pc-linux
+        }
+        let (conn_a, _conn_b) = quic_pair().expect("real QUIC pair");
+        let (pm, _active) = manager_two_paths();
+        let mut link = PathLink::new(Arc::new(Mutex::new(pm)));
+        link.add_conn("b", conn_a);
+        link.map_peer_addr("b", addr(9001));
+        link.map_peer_addr("b", addr(9002));
+        link.handle_event(PathEvent::Adopted {
+            to: candidate(9002),
+        });
+        assert_eq!(link.stats().path_rebinds, 1);
+        assert_eq!(link.stats().path_rebind_errors, 0);
+        assert_eq!(link.stats().path_rebind_no_conn, 0);
+    }
+
     // ------------------------------------------------------------------
     // NAT production switching (D1): per-peer multi-connection active
     // selection. RED: these tests target the new PeerConns API, which
@@ -565,6 +606,26 @@ mod tests {
         assert_eq!(link.nat_active("peer-a"), Some(ActiveConn::Direct));
         assert_eq!(link.stats().path_active_switches, 1);
         // Legacy rebind path untouched.
+        assert_eq!(link.stats().path_rebinds, 0);
+    }
+
+    /// D4: Adopted{to: Direct} flips a NAT peer's active connection to
+    /// Direct, exactly like Switched — no rebind, counted as a switch.
+    #[test]
+    fn adopted_flips_nat_direct() {
+        let (relay, direct) = match conn_shared_pair() {
+            Some(p) => p,
+            None => return,
+        };
+        let mut link = PathLink::new(Arc::new(Mutex::new(PathManager::new(test_config()))));
+        link.register_nat_relay("peer-a", relay, PathKind::Turn, addr(8000), addr(9001));
+        link.register_nat_direct("peer-a", direct, addr(8000), addr(9002));
+        assert_eq!(link.nat_active("peer-a"), Some(ActiveConn::Relay));
+        link.handle_event(PathEvent::Adopted {
+            to: candidate(9002),
+        });
+        assert_eq!(link.nat_active("peer-a"), Some(ActiveConn::Direct));
+        assert_eq!(link.stats().path_active_switches, 1);
         assert_eq!(link.stats().path_rebinds, 0);
     }
 

@@ -272,6 +272,10 @@ fn send_with_intent(
     }
 }
 
+/// Wire overhead of one STREAM frame inside a fabric datagram (S36):
+/// 5-byte stream header (stream_id u32be + flags u8) + 1 intent byte (S2).
+const STREAM_FRAME_OVERHEAD: usize = 6;
+
 /// One tcp-poll iteration (3b-5, S21/S22/S23).
 ///
 /// Drives the terminator (harvests `TcpEvent`s) and the relay (harvests
@@ -288,13 +292,16 @@ fn tcp_poll_once(
     use tcp::{STREAM_FIN, STREAM_RST, STREAM_SYN, decode_stream_frame, encode_stream_frame};
 
     // Helper: emit a STREAM frame to `peer` ("self" = local loopback).
+    // `from_terminator` records which side produced the event — the self
+    // loopback dispatch keys on it (S34), never on `is_originator_frame`.
     let emit = |tcp: &Arc<Mutex<TcpEgress>>,
                 transport_slot: &Arc<Mutex<Arc<dyn DatagramTransport>>>,
                 stats: &Arc<Mutex<TunStats>>,
                 peer: &str,
                 stream_id: u32,
                 flags: u8,
-                payload: &[u8]| {
+                payload: &[u8],
+                from_terminator: bool| {
         if peer == "self" {
             // Local loopback: feed directly to the other side.
             let frame = encode_stream_frame(stream_id, flags, payload);
@@ -311,11 +318,26 @@ fn tcp_poll_once(
                 let _ = tx.try_send((fl, pl.to_vec()));
                 return;
             }
-            // F1: dispatch by (stream_id, from_peer), not by id alone.
-            if t.is_originator_frame(sid, "self") {
-                // Originator side (frame came from our own relay). SYN
-                // frames are dropped+counted inside (W-new), never injected
-                // as application data.
+            // S34: dispatch by the event's true direction. A frame the
+            // terminator emitted (SYN/DATA/CLOSED) goes to our own relay
+            // (SYN dials the target); only relay-side events go back to
+            // the terminator. `is_originator_frame(sid, "self")` is always
+            // true for terminator-originated self flows
+            // (`peer_for(sid) == Some("self")`), so it cannot tell the two
+            // directions apart — the old code fed SYNs back into the
+            // terminator (dropped+counted) and DATA into its own smoltcp
+            // buffer (self-echo), and the relay never ran.
+            if from_terminator {
+                let evs = t.relay.handle_frame(sid, fl, pl, "self");
+                drop(t);
+                // Relay events loop back to the terminator directly.
+                for e in evs {
+                    handle_relay_event_loopback(tcp, tun, stats, e);
+                }
+            } else {
+                // Relay-side event for our originated stream. SYN flags
+                // here mean misrouting and are dropped+counted inside
+                // (W-new), never injected as application data.
                 let pkts = t.terminator.handle_originator_frame(sid, fl, pl);
                 drop(t);
                 let mut tun = lock(tun);
@@ -326,14 +348,27 @@ fn tcp_poll_once(
                         s.bytes_in += p.len() as u64;
                     }
                 }
-            } else {
-                // Egress side.
-                let evs = t.relay.handle_frame(sid, fl, pl, "self");
-                drop(t);
-                // Relay events loop back to the terminator directly.
-                for e in evs {
-                    handle_relay_event_loopback(tcp, tun, stats, e);
-                }
+            }
+            return;
+        }
+        // S36: DATA payloads are chunked so every STREAM frame fits the mtu
+        // (5-byte stream header + 1 intent byte overhead). S5's
+        // no-fragmentation rule covers L3 IP packets, not TCP byte streams:
+        // dropping a whole frame here would silently lose bytes the stack
+        // already ACKed to the application.
+        if flags == 0 && payload.len() + STREAM_FRAME_OVERHEAD > mtu {
+            let max_chunk = mtu.saturating_sub(STREAM_FRAME_OVERHEAD).max(1);
+            let transport = lock(transport_slot).clone();
+            for chunk in payload.chunks(max_chunk) {
+                let frame = encode_stream_frame(stream_id, flags, chunk);
+                send_with_intent(
+                    &transport,
+                    stats,
+                    peer,
+                    &frame,
+                    mtu,
+                    encode_intent_kind(INTENT_STREAM, 0),
+                );
             }
             return;
         }
@@ -368,6 +403,7 @@ fn tcp_poll_once(
                     stream_id,
                     STREAM_SYN,
                     &payload,
+                    true,
                 );
             }
             tcp::TcpEvent::Data {
@@ -375,7 +411,16 @@ fn tcp_poll_once(
                 peer,
                 bytes,
             } => {
-                emit(tcp, transport_slot, stats, &peer, stream_id, 0, &bytes);
+                emit(
+                    tcp,
+                    transport_slot,
+                    stats,
+                    &peer,
+                    stream_id,
+                    0,
+                    &bytes,
+                    true,
+                );
             }
             tcp::TcpEvent::Closed {
                 stream_id,
@@ -383,7 +428,16 @@ fn tcp_poll_once(
                 reset,
             } => {
                 let flags = if reset { STREAM_RST } else { STREAM_FIN };
-                emit(tcp, transport_slot, stats, &peer, stream_id, flags, &[]);
+                emit(
+                    tcp,
+                    transport_slot,
+                    stats,
+                    &peer,
+                    stream_id,
+                    flags,
+                    &[],
+                    true,
+                );
             }
             tcp::TcpEvent::TunPacket(pkt) => {
                 let mut tun = lock(tun);
@@ -405,7 +459,16 @@ fn tcp_poll_once(
                 peer,
                 bytes,
             } => {
-                emit(tcp, transport_slot, stats, &peer, stream_id, 0, &bytes);
+                emit(
+                    tcp,
+                    transport_slot,
+                    stats,
+                    &peer,
+                    stream_id,
+                    0,
+                    &bytes,
+                    false,
+                );
             }
             tcp::RelayEvent::Closed {
                 stream_id,
@@ -413,7 +476,16 @@ fn tcp_poll_once(
                 reset,
             } => {
                 let flags = if reset { STREAM_RST } else { STREAM_FIN };
-                emit(tcp, transport_slot, stats, &peer, stream_id, flags, &[]);
+                emit(
+                    tcp,
+                    transport_slot,
+                    stats,
+                    &peer,
+                    stream_id,
+                    flags,
+                    &[],
+                    false,
+                );
             }
         }
     }
@@ -1078,6 +1150,7 @@ impl Projection {
             mtu: self.config.mtu,
             attributor: Arc::new(PlatformAttributor),
             qos: self.config.qos.clone(),
+            fin_wait_timeout: semantic::FIN_WAIT_TIMEOUT,
         })
     }
 
@@ -1383,6 +1456,7 @@ impl Drop for Projection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn mock_tun_separate_queues() {
@@ -1800,5 +1874,230 @@ mod tests {
         assert_eq!(labels.process_name.as_deref(), Some(comm.as_str()));
         assert_eq!(labels.qos_class, QosClass::Background);
         p.close();
+    }
+
+    // -----------------------------------------------------------------------
+    // S34/S36 regression tests: tcp_poll_once self-loopback dispatch +
+    // STREAM DATA chunking. Drive `tcp_poll_once` directly (thread-less)
+    // with a hand-rolled TCP client handshake through the smoltcp
+    // terminator.
+    // -----------------------------------------------------------------------
+
+    /// Build an IPv4/TCP packet with correct checksums (mirrors the
+    /// `egress_tcp` E4 example's crafter).
+    #[allow(clippy::too_many_arguments)]
+    fn craft_tcp(
+        src_ip: [u8; 4],
+        dst_ip: [u8; 4],
+        src_port: u16,
+        dst_port: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut pkt = vec![0u8; 20 + 20 + payload.len()];
+        pkt[0] = 0x45;
+        let tot = (40 + payload.len()) as u16;
+        pkt[2..4].copy_from_slice(&tot.to_be_bytes());
+        pkt[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 6;
+        pkt[12..16].copy_from_slice(&src_ip);
+        pkt[16..20].copy_from_slice(&dst_ip);
+        let c = tcp::ip_checksum(&pkt[..20]);
+        pkt[10..12].copy_from_slice(&c.to_be_bytes());
+        pkt[20..22].copy_from_slice(&src_port.to_be_bytes());
+        pkt[22..24].copy_from_slice(&dst_port.to_be_bytes());
+        pkt[24..28].copy_from_slice(&seq.to_be_bytes());
+        pkt[28..32].copy_from_slice(&ack.to_be_bytes());
+        pkt[32] = 0x50;
+        pkt[33] = flags;
+        pkt[34..36].copy_from_slice(&8192u16.to_be_bytes());
+        pkt[40..].copy_from_slice(payload);
+        let tc = tcp::tcp_checksum(src_ip, dst_ip, &pkt[20..]);
+        pkt[36..38].copy_from_slice(&tc.to_be_bytes());
+        pkt
+    }
+
+    /// Server sequence number from a SYN-ACK packet, if it is one.
+    fn syn_ack_seq(pkt: &[u8]) -> Option<u32> {
+        if pkt.len() < 44 || pkt[9] != 6 {
+            return None;
+        }
+        if pkt[33] & 0x12 != 0x12 {
+            return None;
+        }
+        Some(u32::from_be_bytes([pkt[24], pkt[25], pkt[26], pkt[27]]))
+    }
+
+    /// Drive a local TCP client handshake through the smoltcp terminator
+    /// for `peer`. Returns (stream_id, server_seq) once Established.
+    fn tcp_handshake(
+        tcp: &Arc<Mutex<TcpEgress>>,
+        peer: &str,
+        server_ip: [u8; 4],
+        server_port: u16,
+    ) -> (u32, u32) {
+        let client_ip = [10, 0, 0, 2];
+        let client_port = 40000u16;
+        let syn = craft_tcp(
+            client_ip,
+            server_ip,
+            client_port,
+            server_port,
+            1000,
+            0,
+            0x02,
+            &[],
+        );
+        let tun_pkts = lock(tcp).terminator.handle_uplink(&syn, peer);
+        let srv_seq = tun_pkts
+            .iter()
+            .filter_map(|p| syn_ack_seq(p))
+            .next()
+            .expect("terminator must answer SYN with SYN-ACK");
+        let ack = craft_tcp(
+            client_ip,
+            server_ip,
+            client_port,
+            server_port,
+            1001,
+            srv_seq + 1,
+            0x10,
+            &[],
+        );
+        lock(tcp).terminator.handle_uplink(&ack, peer);
+        let ids = lock(tcp).terminator.stream_ids();
+        assert_eq!(ids.len(), 1, "exactly one terminated stream");
+        (ids[0], srv_seq)
+    }
+
+    /// Spawn a local TCP echo server; returns its port.
+    fn echo_server() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    use std::io::{Read, Write};
+                    let mut s = conn;
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match s.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if s.write_all(&buf[..n]).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn s34_self_loopback_syn_reaches_relay() {
+        // S34: 0.0.0.0/0 -> Egress{self} + with_tcp_egress + local active
+        // connect. The terminator's SYN event must reach the relay (which
+        // dials the target), not loop back into the terminator where the
+        // SYN is dropped+counted and DATA self-echoes.
+        let echo_port = echo_server();
+
+        let tcp = Arc::new(Mutex::new(TcpEgress::new()));
+        let transport: Arc<dyn DatagramTransport> = Arc::new(MockTransport::new("t"));
+        let transport_slot = Arc::new(Mutex::new(transport));
+        let tun: Arc<Mutex<Box<dyn TunDevice>>> = Arc::new(Mutex::new(Box::new(MockTun::new("t"))));
+        let stats = Arc::new(Mutex::new(TunStats::default()));
+
+        let (sid, _srv_seq) = tcp_handshake(&tcp, "self", [127, 0, 0, 1], echo_port);
+
+        // Drive tcp_poll_once: the SYN event (peer "self") must be
+        // delivered to the relay, whose worker dials the echo server.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut dialed = false;
+        while Instant::now() < deadline {
+            tcp_poll_once(&tcp, &transport_slot, &tun, &stats, 1400);
+            if lock(&tcp).relay.has("self", sid) {
+                dialed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(dialed, "S34: relay never dialed for self-loopback SYN");
+        assert_eq!(
+            lock(&tcp)
+                .terminator
+                .stats()
+                .stream_syn_to_originator_dropped,
+            0,
+            "S34: SYN must not loop back into the terminator"
+        );
+    }
+
+    #[test]
+    fn s36_terminator_data_chunked_to_mtu() {
+        // S36: a TcpEvent::Data larger than the mtu must be emitted as
+        // multiple STREAM frames, never dropped whole (the bytes were
+        // already ACKed to the application — a whole-frame drop is silent,
+        // permanent data loss).
+        let tcp = Arc::new(Mutex::new(TcpEgress::new()));
+        let mt = Arc::new(MockTransport::new("t"));
+        // "B" delivers into our own inbox so the test can read what emit sent.
+        mt.link_peer("B", mt.inbox_sender());
+        let transport_slot: Arc<Mutex<Arc<dyn DatagramTransport>>> =
+            Arc::new(Mutex::new(mt.clone()));
+        let tun: Arc<Mutex<Box<dyn TunDevice>>> = Arc::new(Mutex::new(Box::new(MockTun::new("t"))));
+        let stats = Arc::new(Mutex::new(TunStats::default()));
+        let mtu = 1400usize;
+
+        let (sid, srv_seq) = tcp_handshake(&tcp, "B", [127, 0, 0, 1], 9999);
+
+        // One 5000-byte PSH: the terminator ACKs it, then emits one Data event.
+        let big = vec![0xABu8; 5000];
+        let psh = craft_tcp(
+            [10, 0, 0, 2],
+            [127, 0, 0, 1],
+            40000,
+            9999,
+            1001,
+            srv_seq + 1,
+            0x18,
+            &big,
+        );
+        lock(&tcp).terminator.handle_uplink(&psh, "B");
+        for _ in 0..20 {
+            tcp_poll_once(&tcp, &transport_slot, &tun, &stats, mtu);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Collect what emit sent: every datagram must fit the mtu, and the
+        // DATA payloads must reassemble to the original 5000 bytes.
+        let mut data_bytes = Vec::new();
+        let mut data_frames = 0u32;
+        while let Some((_from, dg)) = mt.recv() {
+            assert!(dg.len() <= mtu, "S36: STREAM frame exceeds mtu");
+            let (intent, body) = dg.split_first().expect("non-empty datagram");
+            assert_eq!(decode_intent_kind(*intent).0, INTENT_STREAM);
+            let (fsid, flags, payload) = tcp::decode_stream_frame(body).expect("frame decodes");
+            assert_eq!(fsid, sid);
+            if flags == 0 {
+                data_frames += 1;
+                data_bytes.extend_from_slice(payload);
+            }
+        }
+        assert!(
+            data_frames > 1,
+            "S36: 5000-byte DATA must be split into multiple frames"
+        );
+        assert_eq!(data_bytes, big, "S36: chunked DATA must reassemble exactly");
+        assert_eq!(
+            lock(&stats).dropped_oversize,
+            0,
+            "S36: no whole-frame oversize drop"
+        );
     }
 }

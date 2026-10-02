@@ -204,10 +204,10 @@ impl Router for UnifiedRouter {
         {
             let mut cache = lock(&self.dns_cache);
             match self.sniffer.sniff_packet(packet) {
-                Sniffed::Query(qname) => {
+                Sniffed::Query { qname, .. } => {
                     domain = Some(qname);
                 }
-                Sniffed::Response(records) => {
+                Sniffed::Response { records, .. } => {
                     // S17: learn domain→IP, and decide the response itself
                     // by the queried domain (query/response path consistency).
                     domain = records.first().map(|(name, _, _)| name.clone());
@@ -432,6 +432,11 @@ mod tests {
     #[test]
     fn s17_response_learns_cache_and_later_packets_inherit() {
         let r = domain_router();
+        // S37: the query must be seen first so the response TXID (0x1234)
+        // matches a pending query; otherwise the response is untrusted.
+        let q = dns_query_msg("www.blocked.example");
+        let qpkt = udp_payload_packet(40000, 53, &q);
+        let _ = r.route_packet(&qpkt);
         // Feed the DNS response (sport 53): learns 1.2.3.4 → www.blocked.example.
         let resp = dns_response_msg("www.blocked.example", [1, 2, 3, 4]);
         // Response packet: src=8.8.8.8:53, dst=10.0.0.1.
