@@ -52,6 +52,13 @@
   - `PlanningSnapshot`（规划周期一致视图）；
   - `plan_from_snapshot` / `plan`（K2→K3→确定性选优组装）；
   - `Planned { plan, trace }` / `DecisionTrace` / `ConsideredCandidate`。
+- 已实现（v9 §8.1 Connectivity Feasibility，scenarios/product/connectivity_evaluation.toml）：
+  - `PlanningSnapshot.connectivity: Vec<(ProviderId, ConnectivityEvaluation)>` +
+    `with_connectivity` builder（空 = 未评估，保持旧行为）；
+  - `RejectReason::NoFeasibleConnectivityPath`（label `no_feasible_connectivity_path`）；
+  - `connectivity_gate(&PlanningSnapshot) -> Vec<(ProviderId, RejectReason)>` 纯函数；
+  - `plan_from_snapshot` 在 Filter 后应用门控（不覆盖已有拒绝原因）；
+  - `ConsideredCandidate.connectivity: Option<ConnectivityEvaluation>`（trace 可见评估贡献）。
 
 ## Verification
 

@@ -4,8 +4,10 @@
 //! Assisted/Relay Fallback 与 Link State。
 //!
 //! 本 crate 是 **delivery 层共享底座**（ARCHITECTURE §11 Delivery Infrastructure）：
-//! - 保持领域中立：不依赖 `nexus-domain`，不持有 Plan/Session/Provider 等业务对象，
-//!   只处理 locator / endpoint / 认证门控等传输语义；
+//! - 保持领域中立：不持有 Plan/Session/Provider 等业务对象，不依赖
+//!   Planner/Session/Workspace 等业务逻辑层，只处理 locator / endpoint /
+//!   认证门控等传输语义；`evaluation` 模块为输出 DTO 而依赖 `nexus-domain`
+//!   的共享词汇（`ConnectivityEvaluation`），属于 DTO 依赖而非业务依赖；
 //! - 拒绝反向依赖 Workspace / Compute / Service 业务逻辑；
 //! - 规划（Plan）由 Planner 产出，本层只负责"按 locator 建连"并返回状态机结果。
 //!
@@ -32,6 +34,14 @@ pub const NEXUS_CONNECTIVITY_MODULE: &str = "nexus-connectivity";
 pub const fn module_summary() -> &'static str {
     "提供 Connectivity Evaluation、Link Establishment、NAT Traversal、Hole Punching、Assisted/Relay Fallback 与 Link State。"
 }
+
+// ---------- Connectivity Evaluation（v9 §8.1） ----------
+///
+/// 规划期低成本连通性评估：纯函数 `evaluate_connectivity`，输出
+/// `nexus_domain::ConnectivityEvaluation` DTO 供 Core Planner 消费。
+/// 本模块依赖 `nexus-domain` 仅为共享 DTO 词汇；不依赖 Planner/Session/
+/// Workspace 等业务逻辑层（领域中立原则保持）.
+pub mod evaluation;
 
 // ---------- 虚拟子网组网（Virtual Subnet Networking） ----------
 
