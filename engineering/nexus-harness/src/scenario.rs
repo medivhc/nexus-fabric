@@ -237,7 +237,6 @@ fn run_command_with_timeouts(
 
     let deadline = Instant::now() + drain_timeout;
     let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
     for _ in 0..2 {
         let now = Instant::now();
         if now >= deadline {
@@ -245,15 +244,15 @@ fn run_command_with_timeouts(
         }
         match rx.recv_timeout(deadline - now) {
             Ok((true, b)) => stdout = b,
-            Ok((false, b)) => stderr = b,
+            // stderr 照常抽干（避免 pipe 背压阻塞子进程），但不参与机器判定：
+            // 场景命令的机器可读输出必须是纯 stdout JSON，人类可读日志走 stderr。
+            // 历史教训：曾经把 stderr 拼进判定文本，导致 eprintln! 的日志行
+            // 破坏 JSON 解析（2026-10-02 full verify composition-root / workspace-sync-authz 误判）。
+            Ok((false, _)) => {}
             Err(_) => break,
         }
     }
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&stdout),
-        String::from_utf8_lossy(&stderr)
-    );
+    let text = String::from_utf8_lossy(&stdout).into_owned();
     if timed_out {
         (
             false.to_string(),
@@ -416,6 +415,33 @@ mod tests {
             kind: ExpectKind::Equals(json!(1)),
         }]);
         assert!(evaluate(&s, &json!({"schema_version": 1})).is_ok());
+    }
+
+    /// 回归：stderr 的人类可读日志不得污染场景 JSON 判定。
+    /// 2026-10-02 full verify 误判：composition-root / workspace-sync-authz 的
+    /// eprintln! 日志被拼进判定文本导致 "output not JSON"。产品侧本就正确
+    /// （日志走 stderr），修的是 harness：只按 stdout 做 JSON 判定。
+    #[test]
+    fn run_command_ignores_stderr_for_scenario_json() {
+        use std::time::Duration;
+        // run_command 按空白切分命令，不支持 shell 引号；用临时脚本文件。
+        let dir = std::env::temp_dir().join(format!("harness-stderr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let script = dir.join("emit.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho '{\"verdict\":\"PASS\"}'\necho '[nexusd] human log' >&2\n",
+        )
+        .expect("write script");
+        let (ok, out) = run_command_with_timeouts(
+            &format!("sh {}", script.to_str().expect("utf8 path")),
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(ok, "true");
+        assert_eq!(out.trim(), "{\"verdict\":\"PASS\"}");
+        assert!(serde_json::from_str::<serde_json::Value>(&out).is_ok());
     }
 
     /// 回归：直接子进程超时必须有界返回，不能永挂。
