@@ -110,6 +110,28 @@ fn main() {
     let _ = id_a;
     println!("[iso] relay conn up");
 
+    // Add QualityMonitor like the full E4 (but no punch, no PathLink switch).
+    use nexus_nat_quality::{MeasuredPath, ProbeRole, QualityMonitor};
+    use nexus_path::{PathConfig, PathKind, PathManager};
+    use std::sync::Mutex;
+    struct NoopSink;
+    impl nexus_nat_quality::PathEventSink for NoopSink {
+        fn on_path_event(&self, _e: nexus_path::PathEvent) {}
+    }
+    let pm = Arc::new(Mutex::new(PathManager::new(PathConfig::default())));
+    let mon = QualityMonitor::new(pm, Arc::new(NoopSink));
+    mon.add_path(MeasuredPath {
+        addr: rb,
+        kind: PathKind::Turn,
+        local_addr: "127.0.0.1:0".parse().unwrap(),
+        cost: 5.0,
+        transport: conn_a.clone(),
+        role: ProbeRole::Active,
+        forward: None,
+    });
+    mon.start();
+    println!("[iso] monitor started");
+
     // B: echo batches.
     thread::spawn(move || {
         loop {
