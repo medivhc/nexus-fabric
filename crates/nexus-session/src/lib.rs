@@ -268,12 +268,23 @@ impl SessionOwner {
     /// 记录协作取消请求（只记事件，不直接提交 Outcome；
     /// 提交 `Cancelled` 由 Owner 决策并调用 `commit_outcome`）。
     ///
+    /// 门控（B1 amendment 2026-10-03）：已提交终态或 phase 已到 `Disposed` 后拒绝记录；
+    /// Disposed 是终点 lifecycle phase，之后事件历史不可再变。
+    /// `AlreadyTerminated` 在此复用"生命周期已终结"语义：`{phase: Disposed, outcome: Unfinished}`
+    /// 时其 `outcome` 字段填 `TerminalOutcome::Unfinished`。
+    ///
     /// 返回 `Ok(true)` 表示本次是首次取消请求。
     pub fn request_cancellation(&mut self, reason: String) -> Result<bool, SessionError> {
         if self.outcome.is_some() {
             return Err(SessionError::AlreadyTerminated {
                 session: self.id.clone(),
                 outcome: self.outcome.clone().expect("checked some"),
+            });
+        }
+        if self.phase == LifecyclePhase::Disposed {
+            return Err(SessionError::AlreadyTerminated {
+                session: self.id.clone(),
+                outcome: TerminalOutcome::Unfinished,
             });
         }
         let already_requested = self
@@ -291,12 +302,19 @@ impl SessionOwner {
 
     /// 记录 Connectivity 链路建立成功（Worker 上报事件；不写 Outcome）。
     ///
-    /// 已提交终态后拒绝记录（Owner 状态不可再变）。
+    /// 已提交终态或 phase 已到 `Disposed` 后拒绝记录（Owner 状态不可再变；
+    /// 门控语义见 `request_cancellation` 的 B1 amendment 注释）。
     pub fn record_connectivity_established(&mut self, locator: String) -> Result<(), SessionError> {
         if self.outcome.is_some() {
             return Err(SessionError::AlreadyTerminated {
                 session: self.id.clone(),
                 outcome: self.outcome.clone().expect("checked some"),
+            });
+        }
+        if self.phase == LifecyclePhase::Disposed {
+            return Err(SessionError::AlreadyTerminated {
+                session: self.id.clone(),
+                outcome: TerminalOutcome::Unfinished,
             });
         }
         self.events.push(SessionEvent::ConnectivityEstablished {
@@ -307,6 +325,8 @@ impl SessionOwner {
     }
 
     /// 记录 Connectivity 链路建立失败（Worker 上报事件；终态由 Owner 决策提交）。
+    ///
+    /// 门控同 `record_connectivity_established`（B1 amendment 2026-10-03）。
     pub fn record_connectivity_failed(
         &mut self,
         locator: String,
@@ -318,12 +338,33 @@ impl SessionOwner {
                 outcome: self.outcome.clone().expect("checked some"),
             });
         }
+        if self.phase == LifecyclePhase::Disposed {
+            return Err(SessionError::AlreadyTerminated {
+                session: self.id.clone(),
+                outcome: TerminalOutcome::Unfinished,
+            });
+        }
         self.events.push(SessionEvent::ConnectivityFailed {
             session: self.id.clone(),
             locator,
             reason,
         });
         Ok(())
+    }
+
+    /// 从持久记录重建 Owner（仅 `reconcile_session_records` 内部使用）：
+    /// 恢复 phase 与已提交 outcome，不产生 `Started` 事件；
+    /// 后续 `transition_phase` 调用仍受迁移表权威校验。
+    fn from_record(record: &SessionRecord) -> Self {
+        Self {
+            id: record.session.clone(),
+            phase: record.phase.clone(),
+            outcome: match &record.outcome {
+                TerminalOutcome::Unfinished => None,
+                committed => Some(committed.clone()),
+            },
+            events: Vec::new(),
+        }
     }
 }
 
@@ -407,11 +448,15 @@ impl From<SessionError> for SessionReconcileError {
 
 /// 冷启动 reconcile 会话记录（AGENTS.md §15 Crash Consistency：幂等、孤儿分类）。
 ///
-/// 规则：
-/// - 已提交终态（Completed/Failed/Cancelled）→ 无需处置；
+/// 规则（B2 amendment 2026-10-03，phase 感知）：
+/// - `phase == Disposed` → 跳过（cleanup 已完成；含 `{Disposed, Unfinished}` 不可达路径，
+///   B1 amendment：永不判为孤儿、永不覆盖重写）；
+/// - 已提交终态但 `phase != Disposed`（进程在 `commit_outcome` 之后、
+///   `transition_phase(Disposed)` 之前崩溃）→ 重放 cleanup 迁移到 `Disposed` 并回写，
+///   outcome 原样保留，**不重新 commit**（Owner 唯一写入者原则不变），不计入孤儿；
 /// - 未达终态且进程存活 → 会话可继续，不分类；
-/// - 未达终态且进程死亡 → 孤儿会话：经 `SessionOwner` 恰一次提交 `Failed`，
-///   清理到 `Disposed`，并回写记录（再次 reconcile 幂等，不会重复提交）。
+/// - 未达终态、进程死亡且 `phase != Disposed` → 孤儿会话：经 `SessionOwner` 恰一次提交
+///   `Failed`，清理到 `Disposed`，并回写记录（再次 reconcile 幂等，不会重复提交）。
 pub fn reconcile_session_records<S: SessionRecordStore>(
     store: &mut S,
     process_alive: bool,
@@ -424,11 +469,41 @@ pub fn reconcile_session_records<S: SessionRecordStore>(
         orphans_classified: 0,
     };
     for record in records {
+        // B1 连带：phase 已到 Disposed 的记录无需任何处置。
+        if record.phase == LifecyclePhase::Disposed {
+            continue;
+        }
         let terminal = matches!(
             &record.outcome,
             TerminalOutcome::Completed | TerminalOutcome::Failed(_) | TerminalOutcome::Cancelled
         );
-        if terminal || process_alive {
+        if terminal {
+            // B2：终态但 phase 未到 Disposed → 重放 cleanup 迁移到 Disposed 并回写；
+            // outcome 已终态，不重新 commit。
+            let mut owner = SessionOwner::from_record(&record);
+            let cleanup: &[LifecyclePhase] = match record.phase {
+                LifecyclePhase::Allocating => &[LifecyclePhase::Disposed],
+                LifecyclePhase::Active => &[LifecyclePhase::Draining, LifecyclePhase::Disposed],
+                LifecyclePhase::Draining => &[LifecyclePhase::Disposed],
+                // 上方已对 Disposed continue；此分支不可达，留空保穷尽匹配。
+                LifecyclePhase::Disposed => &[],
+            };
+            for next in cleanup {
+                owner
+                    .transition_phase(next.clone())
+                    .map_err(SessionReconcileError::from)?;
+            }
+            debug_assert_eq!(owner.phase(), LifecyclePhase::Disposed);
+            store
+                .save(&SessionRecord {
+                    session: record.session,
+                    phase: LifecyclePhase::Disposed,
+                    outcome: record.outcome,
+                })
+                .map_err(|reason| SessionReconcileError::Store { reason })?;
+            continue;
+        }
+        if process_alive {
             continue;
         }
         // 孤儿：恰一次提交 Failed，清理到 Disposed（Owner 是 Outcome 唯一写入者）。
@@ -698,5 +773,138 @@ mod tests {
         let report = reconcile_session_records(&mut store, false).unwrap();
         assert_eq!(report.orphans_classified, 0);
         assert_eq!(store.records[0].outcome, TerminalOutcome::Completed);
+    }
+
+    // ---------- B1: Disposed phase 拒绝追加事件（Red Evidence，先失败后修） ----------
+
+    #[test]
+    fn disposed_phase_rejects_event_recording() {
+        let mut s = session();
+        // Allocating -> Disposed 直接迁移，outcome 仍为 None。
+        s.transition_phase(LifecyclePhase::Disposed).unwrap();
+        assert_eq!(s.phase(), LifecyclePhase::Disposed);
+        assert_eq!(s.committed_outcome(), None);
+
+        let err = s.request_cancellation("late".into());
+        assert!(
+            matches!(err, Err(SessionError::AlreadyTerminated { .. })),
+            "request_cancellation after Disposed must fail, got {err:?}"
+        );
+        let err = s.record_connectivity_established("edge-a.exit".into());
+        assert!(
+            matches!(err, Err(SessionError::AlreadyTerminated { .. })),
+            "record_connectivity_established after Disposed must fail, got {err:?}"
+        );
+        let err = s.record_connectivity_failed("edge-a.exit".into(), "late".into());
+        assert!(
+            matches!(err, Err(SessionError::AlreadyTerminated { .. })),
+            "record_connectivity_failed after Disposed must fail, got {err:?}"
+        );
+        // Disposed 之后事件历史冻结：只有 Started + PhaseChanged。
+        assert_eq!(s.events().len(), 2);
+    }
+
+    #[test]
+    fn disposed_with_terminal_outcome_reports_real_outcome() {
+        let mut s = session();
+        s.transition_phase(LifecyclePhase::Active).unwrap();
+        s.commit_outcome(TerminalOutcome::Completed).unwrap();
+        s.transition_phase(LifecyclePhase::Disposed).unwrap();
+        // outcome 门控先触发，携带真实 outcome。
+        let err = s.request_cancellation("late".into());
+        assert!(
+            matches!(
+                err,
+                Err(SessionError::AlreadyTerminated {
+                    outcome: TerminalOutcome::Completed,
+                    ..
+                })
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reconcile_skips_disposed_unfinished_record_without_overwrite() {
+        // {phase: Disposed, outcome: Unfinished}：修复后的 Owner API 已无法产生；
+        // reconcile 不得再把它判为孤儿并覆盖重写为 Failed。
+        let mut store = MemRecordStore {
+            records: vec![SessionRecord {
+                session: SessionId("s-disposed-unfinished".into()),
+                phase: LifecyclePhase::Disposed,
+                outcome: TerminalOutcome::Unfinished,
+            }],
+        };
+        let report = reconcile_session_records(&mut store, false).unwrap();
+        assert_eq!(report.orphans_classified, 0);
+        assert_eq!(store.records[0].phase, LifecyclePhase::Disposed);
+        assert_eq!(store.records[0].outcome, TerminalOutcome::Unfinished);
+    }
+
+    // ---------- B2: 终态但 phase≠Disposed 的 reconcile 重放 cleanup ----------
+
+    #[test]
+    fn reconcile_replays_cleanup_for_terminal_not_disposed() {
+        let mut store = MemRecordStore {
+            records: vec![
+                SessionRecord {
+                    session: SessionId("s-active".into()),
+                    phase: LifecyclePhase::Active,
+                    outcome: TerminalOutcome::Completed,
+                },
+                SessionRecord {
+                    session: SessionId("s-draining".into()),
+                    phase: LifecyclePhase::Draining,
+                    outcome: TerminalOutcome::Cancelled,
+                },
+                SessionRecord {
+                    session: SessionId("s-alloc".into()),
+                    phase: LifecyclePhase::Allocating,
+                    outcome: TerminalOutcome::Failed(NexusError::Internal {
+                        message: "boom".into(),
+                    }),
+                },
+            ],
+        };
+        let report = reconcile_session_records(&mut store, false).unwrap();
+        assert_eq!(report.records_checked, 3);
+        // 终态记录不是孤儿：不计入 orphans_classified。
+        assert_eq!(report.orphans_classified, 0);
+        for rec in &store.records {
+            assert_eq!(
+                rec.phase,
+                LifecyclePhase::Disposed,
+                "terminal record {:?} must converge to Disposed",
+                rec.session.0
+            );
+        }
+        // outcome 原样保留：Owner 唯一写入者原则。
+        assert_eq!(store.records[0].outcome, TerminalOutcome::Completed);
+        assert_eq!(store.records[1].outcome, TerminalOutcome::Cancelled);
+        assert!(matches!(
+            store.records[2].outcome,
+            TerminalOutcome::Failed(NexusError::Internal { .. })
+        ));
+    }
+
+    #[test]
+    fn reconcile_terminal_cleanup_is_idempotent() {
+        let mut store = MemRecordStore {
+            records: vec![SessionRecord {
+                session: SessionId("s-t".into()),
+                phase: LifecyclePhase::Active,
+                outcome: TerminalOutcome::Completed,
+            }],
+        };
+        let r1 = reconcile_session_records(&mut store, false).unwrap();
+        assert_eq!(r1.orphans_classified, 0);
+        assert_eq!(store.records[0].phase, LifecyclePhase::Disposed);
+        let snapshot = store.records.clone();
+        let r2 = reconcile_session_records(&mut store, false).unwrap();
+        assert_eq!(r2.orphans_classified, 0);
+        assert_eq!(
+            store.records, snapshot,
+            "second reconcile must not touch anything"
+        );
     }
 }
