@@ -247,8 +247,16 @@ impl PathLink {
     /// and the production monitor sink). `pub` so the composition root's
     /// `PathEventSink` impl can delegate without reimplementing the
     /// NAT-flip / legacy-rebind policy.
+    ///
+    /// TEMPORARY (T1, 2026-10-03): `PathEvent::Adopted` (nexus-path D4) is
+    /// destructured here only so the workspace compiles; the `to`-side is
+    /// handled identically to `Switched`. T3 owns the real Adopted policy
+    /// (flip vs rebind) and will refine this on rebase.
     pub fn handle_event(&mut self, event: PathEvent) {
-        let PathEvent::Switched { to, .. } = event;
+        let to: CandidatePath = match event {
+            PathEvent::Switched { to, .. } => to,
+            PathEvent::Adopted { to } => to,
+        };
         let peer = match self.addr_to_peer.get(&to.remote_addr) {
             Some(peer) => peer.clone(),
             None => {

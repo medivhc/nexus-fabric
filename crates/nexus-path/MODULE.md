@@ -32,6 +32,8 @@
 
 - 当前最优路径：`current_path() -> Option<CandidatePath>`
 - 路径切换事件：`PathEvent::Switched { from, to, reason }`
+- 路径收养事件：`PathEvent::Adopted { to }`（此前无活跃路径时收养最优已知候选；
+  不是 switch，无 `from`；D4，2026-10-03）
 - 路径分数：`score(path) -> f64`（供诊断）
 
 ## Allowed Dependencies
@@ -71,6 +73,10 @@ socket，`nexus-fabric` 的被动迁移保证流不中断。
 **S6（失效切换）**：活跃路径连续 `max_missed_probes` 次探测无响应，立即切换
 到次优路径，不等待 hysteresis。
 
+**S6 补充（2026-10-03）**：已判失败的路径（`missed_probes >= max_missed_probes`）
+在收到新的有效观测（清零 miss 计数）之前不参与选优；`best_candidate` 将其排除，
+防止死路径凭陈旧高分被选回造成 flap。
+
 **S7（诚实分数）**：没有探测数据的路径分数标记为 `unknown`，不参与选优；
 不编造分数。
 
@@ -82,6 +88,12 @@ socket，`nexus-fabric` 的被动迁移保证流不中断。
 见 Allowed Dependencies）。应用层必须排空 `poll_event()` 并驱动会话层
 执行切换；不排空则切换不生效。`remove_candidate` 移除活跃路径时，
 若有备选候选，必须发出 `Switched`（S6 的事件形式）。
+
+**S9 补充（D4，2026-10-03）**：`active == None` 时收养最优已知候选为活跃路径，
+发射 `PathEvent::Adopted { to }`（不是 switch，无 `from`）。`Switched` 仍是
+from→to 切换的唯一信号；`Adopted` 覆盖 None→active 的收养。
+应用层/pump 必须排空两种事件并驱动会话层执行 rebind/切换；
+`PathLink::pump` 对 `Adopted` 的处理由 T3 轨道完成。
 
 **R1（staggered 竞速）**：`race_connect(candidates, connector, budget)` 按**调用方给定
 的候选顺序**依次尝试建连（2026-09-30 requirement-change：删除内部 `(PathKind, cost)`
@@ -195,7 +207,12 @@ pub struct PathStats {
     pub loss_rate: Option<f64>,
     pub throughput_bps: Option<u64>,
 }
-pub enum PathEvent { Switched { from: CandidatePath, to: CandidatePath, reason: SwitchReason } }
+pub enum PathEvent {
+    Switched { from: CandidatePath, to: CandidatePath, reason: SwitchReason },
+    /// D4 (2026-10-03): emitted when the manager adopts a candidate as the
+    /// active path with no previous active path. Not a switch: no `from`.
+    Adopted { to: CandidatePath },
+}
 
 // --- Racing (R1/R4/R5) ---
 pub struct RaceBudget {

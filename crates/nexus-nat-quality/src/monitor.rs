@@ -295,11 +295,15 @@ mod tests {
     }
     impl PathEventSink for VecSink {
         fn on_path_event(&self, event: PathEvent) {
-            let PathEvent::Switched { from, to, .. } = &event;
-            self.events.lock().unwrap().push(format!(
-                "switched {} -> {}",
-                from.remote_addr, to.remote_addr
-            ));
+            // T1 (2026-10-03): `PathEvent::Adopted` (nexus-path D4) added;
+            // test sink records both variants.
+            let line = match &event {
+                PathEvent::Switched { from, to, .. } => {
+                    format!("switched {} -> {}", from.remote_addr, to.remote_addr)
+                }
+                PathEvent::Adopted { to } => format!("adopted {}", to.remote_addr),
+            };
+            self.events.lock().unwrap().push(line);
         }
     }
 
@@ -398,13 +402,20 @@ mod tests {
         let pm = Arc::new(Mutex::new(PathManager::new(cfg)));
         let (mon, sink) = monitor_with(pm.clone());
 
-        // a1 (relay, rtt 200) added first and adopted as active (no event).
+        // a1 (relay, rtt 200) added first and adopted as active
+        // (D4: adoption emits `Adopted`; it is not a switch).
         add_mock_path(&mon, a1, PathKind::Turn, Some(200), true);
         mon.tick(1000);
         thread::sleep(Duration::from_millis(50));
         mon.tick(2000);
         thread::sleep(Duration::from_millis(50));
-        assert!(sink.events.lock().unwrap().is_empty());
+        {
+            let pre = sink.events.lock().unwrap();
+            assert!(
+                !pre.is_empty() && pre.iter().all(|e| e.starts_with("adopted")),
+                "before the switch only the adoption event is expected, got {pre:?}"
+            );
+        }
 
         // a2 (direct, rtt 20) joins: strictly better, 0 hysteresis/hold
         // -> Switched event must reach the sink.

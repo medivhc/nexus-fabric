@@ -236,6 +236,9 @@ pub fn filter_candidates(
 ///
 /// 只对通过 Filter 的候选评分；RTT 越小分越高，归一化到 [0, 10_000]。
 /// 未知 RTT 得 0 分（显式"未知"不是最优）；同分按 ProviderId 字典序稳定排序。
+///
+/// D3（2026-10-03）：未知 RTT **严格**排在所有已测候选之后（排序键显式区分
+/// 已知/未知，与分数无关）。`max_rtt == 0`（全未知）时保持旧行为。
 #[must_use]
 pub fn score_candidates<F>(feasible: &[ProviderRecord], measure: F) -> Vec<ScoredCandidate>
 where
@@ -247,30 +250,34 @@ where
         .max()
         .unwrap_or(0);
 
-    let mut scored: Vec<ScoredCandidate> = feasible
+    let mut scored: Vec<(ScoredCandidate, bool)> = feasible
         .iter()
         .map(|c| {
-            let score = measure(&c.id)
+            let rtt = measure(&c.id)
                 .and_then(|m| m.rtt_ms)
-                .filter(|_| max_rtt > 0)
-                .map_or(0, |ms| {
-                    let scaled = (max_rtt.saturating_sub(ms)) as u64 * SCORE_SCALE / max_rtt as u64;
-                    scaled as u32
-                });
-            ScoredCandidate {
-                record: c.clone(),
-                score,
-            }
+                .filter(|_| max_rtt > 0);
+            let score = rtt.map_or(0, |ms| {
+                let scaled = (max_rtt.saturating_sub(ms)) as u64 * SCORE_SCALE / max_rtt as u64;
+                scaled as u32
+            });
+            (
+                ScoredCandidate {
+                    record: c.clone(),
+                    score,
+                },
+                rtt.is_some(),
+            )
         })
         .collect();
 
-    // 降序：最高分最优；同分按 id 字典序（确定性 tie-break）。
+    // 降序：最高分最优；但已知 RTT 恒先于未知（D3）；同类内同分按 id 字典序
+    //（确定性 tie-break）。max_rtt == 0 时全为未知，退化为旧行为。
     scored.sort_by(|a, b| {
-        b.score
-            .cmp(&a.score)
-            .then_with(|| a.record.id.0.cmp(&b.record.id.0))
+        b.1.cmp(&a.1)
+            .then_with(|| b.0.score.cmp(&a.0.score))
+            .then_with(|| a.0.record.id.0.cmp(&b.0.record.id.0))
     });
-    scored
+    scored.into_iter().map(|(s, _)| s).collect()
 }
 
 /// 在约束下对候选做确定性规划（K2→K3→选优组装）。
@@ -588,6 +595,30 @@ mod tests {
         assert_eq!(scored[0].record.id, ProviderId("measured".into()));
         assert_eq!(scored[1].record.id, ProviderId("unknown".into()));
         assert_eq!(scored[1].score, 0);
+    }
+
+    #[test]
+    fn unknown_rtt_strictly_sorts_last() {
+        // D3 (2026-10-03)：未知 RTT 必须严格排在所有已测候选之后，
+        // 与 ProviderId 字典序无关（旧代码按同分 tie-break，id 更小的
+        // 未知候选会排到已测候选前面）。
+        let feasible = vec![
+            candidate("aaa-unknown", "a", &["internet-access"], true),
+            candidate("zzz-measured", "z", &["internet-access"], true),
+        ];
+        let scored = score_candidates(&feasible, |p| match p.0.as_str() {
+            "zzz-measured" => Some(LinkMeasurement {
+                rtt_ms: Some(50),
+                ..Default::default()
+            }),
+            _ => None,
+        });
+        assert_eq!(
+            scored[0].record.id,
+            ProviderId("zzz-measured".into()),
+            "measured candidate must sort strictly before unknown, regardless of id order"
+        );
+        assert_eq!(scored[1].record.id, ProviderId("aaa-unknown".into()));
     }
 
     #[test]
