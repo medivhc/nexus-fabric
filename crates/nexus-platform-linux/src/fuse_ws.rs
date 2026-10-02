@@ -604,7 +604,7 @@ impl Filesystem for FuseWorkspaceFs {
         _atime: Option<TimeOrNow>,
         _mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
-        fh: Option<FileHandle>,
+        _fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
@@ -615,16 +615,21 @@ impl Filesystem for FuseWorkspaceFs {
             let path = inner.inodes.get(&ino.0).ok_or(Errno::ENOENT)?.path.clone();
             if let Some(new_size) = size {
                 let new_size = new_size as usize;
-                match fh.and_then(|h| inner.open.get_mut(&h.0)) {
-                    Some(f) => {
+                // Truncate applies to live open buffers first: a setattr
+                // without fh (e.g. O_TRUNC via do_truncate) must not diverge
+                // from buffers that release() will flush later.
+                let mut any_open = false;
+                for f in inner.open.values_mut() {
+                    if f.path == path {
                         f.buf.resize(new_size, 0);
                         f.dirty = true;
+                        any_open = true;
                     }
-                    None => {
-                        let mut data = inner.ws.read_file(&path).map_err(map_err_ws)?;
-                        data.resize(new_size, 0);
-                        inner.ws.write_file(&path, &data).map_err(map_err_ws)?;
-                    }
+                }
+                if !any_open {
+                    let mut data = inner.ws.read_file(&path).map_err(map_err_ws)?;
+                    data.resize(new_size, 0);
+                    inner.ws.write_file(&path, &data).map_err(map_err_ws)?;
                 }
                 if let Some(e) = inner.inodes.get_mut(&ino.0) {
                     e.size = new_size as u64;
