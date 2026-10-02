@@ -51,6 +51,24 @@ Ingress / User Request
 
 Ingress 是系统级 Driver。`nexus-ingress` 只生成中立 FlowContext，并提交给 SessionManager/Application Layer；它不直接调用 Planner，也不是 `nexus-network` 的私有子件。
 
+### 2.1 TUN Ingress 接入 {#tun-ingress}
+
+（2026-10-02 requirement-change 冻结；场景 `product.flow-session-mapping`）
+
+nexusd 的 TUN 数据面经 `nexus-flow-session`（Application 层新 crate）接入上链：
+
+```text
+TUN packet
+  ==> FlowTable (5-tuple key; DNS 短路/QoS 仍在逐包快路径)
+  ==> 新流首包：FlowContext(origin=PacketCapture) → Policy → Core Planner
+  ==> SessionManager (Owner) 创建 Session → 后台线程异步 Establish Connectivity
+  ==> 会话 Active 后：流表项绑定 session，快路径转发（不再调 Planner）
+```
+
+- `nexus-flow-session` 依赖方向：`{nexus-domain, nexus-policy, nexus-planner, nexus-session, nexus-network}`；`nexus-network` 不得反向依赖它（ARCHITECTURE §3 禁止边）。
+- `process_one()` 永不阻塞：Policy/Planner 是同步纯函数可在包线程调，建连异步经 channel 回填流表项 `Allocating→Active`。
+- smoltcp 本地 TCP 会话（传输终结）与 §10 资源 Session（资源使用上下文）是两层"会话"，MODULE 必须写清映射关系。
+
 ## 3. 编译依赖
 
 `A --> B` 表示 A 在编译期依赖 B。

@@ -817,6 +817,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-flow-session"
+version = "0.1.0"
+dependencies = [
+ "nexus-domain",
+ "nexus-measurement",
+ "nexus-network",
+ "nexus-planner",
+ "nexus-policy",
+ "nexus-registry",
+ "nexus-session",
+]
+
+[[package]]
 name = "nexus-harness"
 version = "0.1.0"
 dependencies = [

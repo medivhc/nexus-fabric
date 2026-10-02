@@ -1308,4 +1308,35 @@ mod tests {
         dp.inject_stream_frame_from_n1("x", &[0x00, 0x01]);
         assert_eq!(dp.stats().dropped, dropped_before + 1);
     }
+
+    /// 性能基线（R4）：`process_one()` 现状每包成本。
+    ///
+    /// `#[ignore]`：`cargo test -p nexusd -- --ignored --nocapture perf_baseline_process_one` 手动跑。
+    #[test]
+    #[ignore]
+    fn perf_baseline_process_one() {
+        use std::time::Instant;
+        let (mut dp, mock) = test_dataplane();
+        // Direct 分类包（bypass 路径，最简转发）。
+        // 注意 test_dataplane 的 bypass 为默认；用目的 192.168.1.1（默认 bypass 覆盖）。
+        const N: usize = 5_000;
+        for i in 0..N {
+            let mut pkt = vec![0x45u8, 0, 0, 40, 0, 0, 0, 0, 64, 6, 0, 0];
+            pkt.extend_from_slice(&[10, 200, 0, 2, 192, 168, 1, 1]);
+            pkt.extend_from_slice(&(40000u16 + (i % 1000) as u16).to_be_bytes());
+            pkt.extend_from_slice(&80u16.to_be_bytes());
+            pkt.extend_from_slice(&[0u8; 20]);
+            mock.lock().unwrap().inject(pkt);
+        }
+        let mut times = Vec::with_capacity(N);
+        for _ in 0..N {
+            let t = Instant::now();
+            let _ = dp.process_one().expect("process_one");
+            times.push(t.elapsed());
+        }
+        times.sort();
+        let p50 = times[N / 2].as_nanos();
+        let p99 = times[N * 99 / 100].as_nanos();
+        println!("process_one (direct path): p50={p50}ns p99={p99}ns over {N} packets");
+    }
 }
