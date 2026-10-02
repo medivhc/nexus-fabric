@@ -976,6 +976,8 @@ struct DurableState {
 
 impl DurableState {
     const HEADER: &'static str = "nexus-workspace-state v2";
+    /// W1 旧状态兼容垫片：W1 写入的状态在 HEADER 后带此行，只读不写；
+    /// from_bytes 遇到时跳过（v9 §17/§18 authority-v2 requirement-change 后不再写入）。
     const HEADER_TOKEN: &'static str = "nexus-workspace-state";
 
     fn to_bytes(&self) -> Vec<u8> {
