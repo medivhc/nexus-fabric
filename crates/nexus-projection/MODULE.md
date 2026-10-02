@@ -231,10 +231,12 @@ accept 线程，sync，零 tokio）把 SOCKS5/HTTP 显式代理映射为 fabric 
   `active` 初始为 `Relay`。
 - `register_nat_direct`：打洞成功后登记直连 + 注册 `Direct` 候选；
   **不立即切换**（冻结：打洞只授予参赛资格）。
-- `pump()` 对 NAT peer 的 `Switched` 事件：`to.kind == Direct` → `active = Direct`
+- `pump()` 对 NAT peer 的 `Switched`/`Adopted` 事件（D4：两者共享
+  flip-vs-rebind 策略，2026-10-03 冻结）：`to.kind == Direct` → `active = Direct`
  （无直连时计数 `path_active_switch_no_direct` 并保持 `Relay`）；
   `to.kind == Turn|Mesh` → `active = Relay`；`Proxy` 忽略。
-  成功切换计数 `path_active_switches`。**永不调用 `rebind()`**
+  成功切换计数 `path_active_switches`，**仅在 active 真正变化时计数**
+  （no-op flip 如已是 Relay 时收到 `Adopted{Relay}` 不计数）。**永不调用 `rebind()`**
   （两个是不同 QUIC 连接，CID 不同，地址迁移不适用）。
 - Stats 供给约定：调用方（Track 2 测量循环）每 `probe_interval_ms`
   对每个候选 `remote_addr` 调 `manager_mut().on_stats(&addr, stats)`；
