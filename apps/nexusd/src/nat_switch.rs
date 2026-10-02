@@ -9,7 +9,7 @@
 //! ```text
 //! let sw = NatSwitching::new(driver, my_id, local, samples);
 //! // 每次中继建连成功后（TURN / peer relay）：
-//! sw.on_relay_connected(&peer, &relay_conn, PathKind::Turn, local, remote, remote_nat);
+//! sw.on_relay_connected(RelayInfo { peer, relay: relay_conn, kind: PathKind::Turn, local, remote, remote_nat, auto_punch: true });
 //! // 生产流量走：
 //! let conn = sw.active_conn(&peer_name).unwrap();
 //! // 退出时：
@@ -75,6 +75,18 @@ impl PathEventSink for LinkSink {
     }
 }
 
+/// Parameters for registering a relay connection that should participate
+/// in NAT direct-path racing.
+pub struct RelayInfo {
+    pub peer: FabricPeerId,
+    pub relay: Arc<ConnShared>,
+    pub kind: PathKind,
+    pub local: SocketAddr,
+    pub remote: SocketAddr,
+    pub remote_nat: NatType,
+    pub auto_punch: bool,
+}
+
 impl NatSwitching {
     /// Build the stack and start the quality monitor.
     ///
@@ -127,22 +139,22 @@ impl NatSwitching {
     /// On `Migrated`, the direct conn is registered as a Direct candidate;
     /// the [`PathManager`] promotes it only if it beats the relay by the
     /// frozen 20%+3s hysteresis (punch success alone never switches).
-    pub fn on_relay_connected(
-        self: &Arc<Self>,
-        peer: FabricPeerId,
-        relay: &Arc<ConnShared>,
-        kind: PathKind,
-        local: SocketAddr,
-        remote: SocketAddr,
-        remote_nat: NatType,
-        auto_punch: bool,
-    ) {
+    pub fn on_relay_connected(self: &Arc<Self>, info: RelayInfo) {
+        let RelayInfo {
+            peer,
+            relay,
+            kind,
+            local,
+            remote,
+            remote_nat,
+            auto_punch,
+        } = info;
         debug_assert!(
             matches!(kind, PathKind::Turn | PathKind::Mesh),
             "relay kind must be Turn or Mesh"
         );
         let name = peer_name(&peer);
-        self.punch.register_relay(relay, peer);
+        self.punch.register_relay(&relay, peer);
         self.link
             .lock()
             .unwrap()
