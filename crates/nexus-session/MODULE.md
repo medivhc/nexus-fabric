@@ -48,12 +48,12 @@
 
 已实现（revision f8c7113+）：
 
-- `SessionOwner`：Owner 状态机，`commit_outcome` 为 `TerminalOutcome` 唯一写入入口（commit-once 守卫），`transition_phase` 执行合法迁移校验，`request_cancellation` 仅记录取消事件。
+- `SessionOwner`：Owner 状态机，`commit_outcome` 为 `TerminalOutcome` 唯一写入入口（commit-once 守卫），`transition_phase` 执行合法迁移校验，`request_cancellation` 仅记录取消事件（已终态或 phase=`Disposed` 后拒绝记录，`AlreadyTerminated`）。
 - `SessionEvent`：Worker 上报事件（Started/PhaseChanged/Progress/CancellationRequested/ConnectivityEstablished/ConnectivityFailed/OutcomeCommitted）。
-- `record_connectivity_established` / `record_connectivity_failed`：Worker 上报 Connectivity 事件（不写 Outcome；已终态拒绝记录）。
+- `record_connectivity_established` / `record_connectivity_failed`：Worker 上报 Connectivity 事件（不写 Outcome；已终态或 phase=`Disposed` 后拒绝记录，`AlreadyTerminated`）。
 - `CancelToken` 与 `AbortOnDropHandle`：std 实现的协作取消原语（Portable，无 tokio 依赖）；JoinSet/Reaper 运行时接线由 domain-runtime 层完成。
 - `SessionError`：结构化会话错误，`From<SessionError> for NexusError` 转换。
-- `SessionRecord` / `SessionRecordStore` / `reconcile_session_records`：冷启动会话记录 reconcile（幂等、孤儿分类，AGENTS.md §15）。
+- `SessionRecord` / `SessionRecordStore` / `reconcile_session_records`：冷启动会话记录 reconcile（幂等、孤儿分类，AGENTS.md §15；phase 感知：`Disposed` 直接跳过，终态但未 `Disposed` 重放 cleanup 到 `Disposed` 且不重写 outcome）。
 
 ## Verification
 
@@ -82,8 +82,12 @@ v9 §15.2/§15.3（Session 范围，`feature/crash-recovery`）：
   文件实现由 Composition Root 注入（`SessionRecordStore` trait；见 `nexusd::recovery::FileSessionRecordStore`）。
 - 保真度契约：durable 记录只保留分类 + 失败原因字符串；`Failed` 的完整类型化
   `NexusError` 不持久化（load 时重建为 `Internal{message}`）。
-- 冷启动 `reconcile_session_records`：已终态 → 跳过；未终态 → 孤儿 →
-  经 `SessionOwner` 恰一次提交 `Failed` 并清理到 `Disposed`，回写记录；幂等。
+- 冷启动 `reconcile_session_records`（phase 感知，amendment B1/B2 2026-10-03）：
+  `phase == Disposed` → 跳过（含 `{Disposed, Unfinished}` 不可达路径，永不判为孤儿）；
+  已终态但 `phase != Disposed` → 重放 cleanup 迁移（`Allocating→Disposed` /
+  `Active→Draining→Disposed` / `Draining→Disposed`，经 `SessionOwner::transition_phase`
+  校验）到 `Disposed` 并回写，**不重新 commit outcome**；未终态且进程死亡 →
+  孤儿 → 经 `SessionOwner` 恰一次提交 `Failed` 并清理到 `Disposed`，回写记录；幂等。
 - Journal：不需要。所有写都是单文件原子替换；reconcile 幂等。
 
 ## Platform Constraints
