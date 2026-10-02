@@ -173,12 +173,29 @@ fn stun_helper(port: u16) {
 // Controlled delay injection creates the quality gap the race needs.
 // ---------------------------------------------------------------------------
 
+// Simple deterministic PRNG for loss simulation (xorshift64).
+fn rand_below(p: f64) -> bool {
+    use std::cell::Cell;
+    thread_local! {
+        static SEED: Cell<u64> = Cell::new(0x1234_5678_9abc_def0);
+    }
+    SEED.with(|s| {
+        let mut x = s.get();
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        s.set(x);
+        (x as f64 / u64::MAX as f64) < p
+    })
+}
+
 struct MuxTransport {
     turn: TurnSocket,
     sim_link: UdpSocket,
     sim_int: SocketAddr,
     relay_targets: HashSet<SocketAddr>,
     relay_delay: Duration,
+    relay_loss: f64,
     direct_delay: Duration,
 }
 
@@ -187,6 +204,10 @@ impl nexus_fabric::transport::UdpTransport for MuxTransport {
         if self.relay_targets.contains(&target) {
             if !self.relay_delay.is_zero() {
                 thread::sleep(self.relay_delay);
+            }
+            // Simulate relay packet loss (affects probe loss measurement).
+            if self.relay_loss > 0.0 && rand_below(self.relay_loss) {
+                return Ok(buf.len());
             }
             return self.turn.send_to(buf, target);
         }
@@ -301,6 +322,7 @@ struct NodeCfg {
     sim_int: SocketAddr,
     stun_helpers: Vec<SocketAddr>,
     relay_delay: Duration,
+    relay_loss: f64,
     direct_delay: Duration,
 }
 
@@ -371,6 +393,7 @@ fn build_node(cfg: &NodeCfg, client: TurnClient, peer_relayed: SocketAddr) -> io
         sim_int: cfg.sim_int,
         relay_targets,
         relay_delay: cfg.relay_delay,
+        relay_loss: cfg.relay_loss,
         direct_delay: cfg.direct_delay,
     };
     // set_nonblocking for sim_link (MuxTransport::new did this in e4_nat_punch)
@@ -602,7 +625,7 @@ fn start_infra() -> SocketAddr {
     turn_addr
 }
 
-fn setup(relay_delay: Duration, direct_delay: Duration) -> Ctx {
+fn setup(relay_delay: Duration, relay_loss: f64, direct_delay: Duration) -> Ctx {
     let turn_addr = start_infra();
     let v4 = Ipv4Addr::LOCALHOST;
     let stun_helpers = vec![
@@ -615,6 +638,7 @@ fn setup(relay_delay: Duration, direct_delay: Duration) -> Ctx {
         sim_int: SocketAddr::new(IpAddr::V4(v4), SIM_A_INT),
         stun_helpers: stun_helpers.clone(),
         relay_delay,
+        relay_loss,
         direct_delay,
     };
     let cfg_b = NodeCfg {
@@ -622,6 +646,7 @@ fn setup(relay_delay: Duration, direct_delay: Duration) -> Ctx {
         sim_int: SocketAddr::new(IpAddr::V4(v4), SIM_B_INT),
         stun_helpers,
         relay_delay,
+        relay_loss,
         direct_delay,
     };
     let creds = || TurnCredentials {
@@ -865,9 +890,9 @@ fn spawn_direct_registrar(stack: Arc<Stack>, peer: FabricPeerId, local: SocketAd
 /// mid-transfer; every byte verified; relay stays warm.
 fn scenario_switch_to_direct() -> bool {
     println!("=== S1 switch-to-direct ===");
-    // Relay RTT ~500ms (250ms each way) vs direct ~2ms: score gap >20% to
-    // trigger the frozen 20%+3s hysteresis. 40ms was not enough (only ~11%).
-    let ctx = setup(Duration::from_millis(250), Duration::ZERO);
+    // Relay: 40ms delay + 10% loss vs direct ~2ms/0%: loss drops the relay
+    // score enough to clear the frozen 20%+3s hysteresis (pure RTT never does).
+    let ctx = setup(Duration::from_millis(40), 0.10, Duration::ZERO);
     let id_a = ctx.node_a.my_id;
     let id_b = ctx.node_b.my_id;
 
@@ -945,7 +970,7 @@ fn scenario_switch_to_direct() -> bool {
 /// race -> all traffic stays on relay ("打洞成功≠最优").
 fn scenario_direct_loses() -> bool {
     println!("=== S2 direct-loses ===");
-    let ctx = setup(Duration::ZERO, Duration::from_millis(30));
+    let ctx = setup(Duration::ZERO, 0.0, Duration::from_millis(30));
     let id_a = ctx.node_a.my_id;
     let id_b = ctx.node_b.my_id;
 
