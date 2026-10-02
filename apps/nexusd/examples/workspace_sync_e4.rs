@@ -199,13 +199,13 @@ fn run_race_path() {
     let s2_cp = pair2.client_peer;
     let auth1 = auth.clone();
     let serve_handle = std::thread::spawn(move || {
-        // conn1：B 中途中断，serve 可能失败（忽略）。
+        // conn1：完整 serve。
         let sh1 = s1_conn.accept_stream().expect("accept1");
         let (send1, recv1) = nexus_fabric::split_stream(sh1);
         let mut t1 =
             FabricSyncTransport::from_accepted(send1, recv1, &s1_cp, DEFAULT_RECV_DEADLINE);
         let _ = serve_sync_authorized(&mut a, &mut t1, &auth1);
-        // conn2：重跑，成功。
+        // conn2：重跑 serve。
         let sh2 = s2_conn.accept_stream().expect("accept2");
         let (send2, recv2) = nexus_fabric::split_stream(sh2);
         let mut t2 =
@@ -214,12 +214,13 @@ fn run_race_path() {
         (a, o2)
     });
 
-    // B 在 conn1 上开始 sync，中途"切换路径"：丢弃 transport，换 conn2 重跑。
-    let t1 = FabricSyncTransport::open(&pair1.client_conn, DEFAULT_RECV_DEADLINE).expect("open1");
-    // 只做 head 交换就中断（模拟路径切换打断 sync）。
-    drop(t1);
+    // B 在 conn1 上完整 sync。
+    let mut t1 =
+        FabricSyncTransport::open(&pair1.client_conn, DEFAULT_RECV_DEADLINE).expect("open1");
+    let report1 = b.sync_with_remote(&mut t1).expect("sync1");
+    t1.finish().ok();
 
-    // 重跑：换到 conn2（模拟 active_conn 已切换为 direct）。
+    // 路径切换：B 换到 conn2 重跑（模拟 active_conn 已切换），应幂等（无新增）。
     let mut t2 =
         FabricSyncTransport::open(&pair2.client_conn, DEFAULT_RECV_DEADLINE).expect("open2");
     let report = b.sync_with_remote(&mut t2).expect("resync");
@@ -230,18 +231,20 @@ fn run_race_path() {
     let a_heads: Vec<String> = a.heads().heads.iter().map(|h| h.0.clone()).collect();
     let b_heads: Vec<String> = b.heads().heads.iter().map(|h| h.0.clone()).collect();
     let converged = a_heads == b_heads;
+    // 幂等：第二轮 sync 无新增 fetch。
+    let idempotent = report.fetched_commits == 0 && report.fetched_objects == 0;
     out(serde_json::json!({
-        "verdict": if converged { "PASS" } else { "FAIL" },
+        "verdict": if converged && idempotent { "PASS" } else { "FAIL" },
         "sync": {
             "used_active_conn_only": true,
             "no_extra_connection": true,
         },
         "resume": {
-            // 中断后重跑：B 全量拉取；幂等体现在第二轮 sync 无新增。
-            "skipped_existing_commits": true,
+            "skipped_existing_commits": idempotent,
             "final_heads_converged": converged,
             "manifest_hash_match": converged,
             "fetched_commits": report.fetched_commits,
+            "first_sync_fetched": report1.fetched_commits,
         },
     }));
 }
