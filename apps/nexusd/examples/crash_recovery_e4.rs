@@ -193,7 +193,9 @@ fn boot_nexusd(config_dir: &Path, tag: &str) -> (Child, serde_json::Value) {
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(Ev::Line(t)) => {
                 let t = t.trim();
-                if t.starts_with("{\"event\":\"boot-reconcile\"") {
+                // 注意：serde_json 默认按 key 字母序输出，行首是 {"crashed_before":…，
+                // 不能用 starts_with 匹配 "event"（2026-10-02 真机踩坑）。
+                if t.contains("\"event\":\"boot-reconcile\"") {
                     reconcile = serde_json::from_str(t).ok();
                 }
                 if t.contains("\"verdict\":\"READY\"") {
