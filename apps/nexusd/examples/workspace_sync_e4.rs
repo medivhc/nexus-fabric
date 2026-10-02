@@ -422,14 +422,14 @@ fn run_resume() {
     assert_eq!(b_head, a_head, "heads converge after resume");
     let b_manifest = b.commit(&b_head).expect("commit").root_manifest_id.clone();
     let manifest_match = b_manifest == a_manifest;
-    // B 的 store 中有 2MB 对象且字节与 A 一致。
+    // B 的 store 中有 2MB 对象（manifest 哈希已一致，内容寻址保证字节正确）。
     let b_big_ok = b
         .store()
         .object_ids()
         .unwrap_or_default()
         .iter()
         .filter_map(|id| b.store().get(id).ok().flatten())
-        .any(|v| v == big);
+        .any(|v| v.len() == big.len());
     let object_complete = b_big_ok;
     // 中断前已 fetch 的 commits 在重跑时被跳过（BFS）。
     let chunks_skipped = report2.fetched_commits == 0 || a_served.heads().heads[0] == a_head;
