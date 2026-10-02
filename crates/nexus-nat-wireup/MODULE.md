@@ -49,14 +49,26 @@
   对不上则丢弃（中继保留）。per-peer nonce 集合，多 peer 并发不误认。
   不动 `nexus-fabric`（server 侧 peer 零值问题由 fabric client auth
   专项解决）。
+- 并发 adopt 不丢连接（WARN-1，2026-10-02）：`accept_q` 是 pop-only，
+  adopt 排空的候选 id 永不静默丢弃——Rejected 的放回队尾（本轮
+  `rejected` 集合防自旋）、Verified 时未处理的放回、超时退出时
+  retryable 的放回。drain 时已拒绝的 id 留在队里（defer 回队尾），
+  不 pop 丢弃。A 并发打洞 B、C 时，一方的 adopt 不能吞掉另一方的直连。
+- Stream 分流契约（D5，WARN-2，2026-10-02）：`register_relay` 后，
+  wireup 的 responder_loop 是该中继连接上唯一的 stream acceptor；
+  session 层不许对这类连接调 `accept_bi`（会和 responder 在
+  `ConnShared.accepted` 上竞速）。非 punch 流按首帧类型进
+  `unclaimed` 队列（字节完好，peek 永不 pop），session 层经
+  `take_unclaimed` 取走。当前 nexusd 尚未消费，API+契约为接线形态，
+  不硬造消费者。
 
 ## Side Effects
 - 后台线程：connect 扇出（自限时）、responder accept 循环。
 - 度量：`PunchStats`（尝试/迁移/失败计数）、drop 计数（E4 sim）。
 
 ## Public API
-`PunchManager::{new, set_local, register_relay, punch_peer, direct_conn, stats}`、
-`punch_peer(driver, my_id, relay_conn, peer, local, remote_nat, config)`、
+`PunchManager::{new, set_local, register_relay, punch_peer, direct_conn, stats,
+take_unclaimed}`、`punch_peer(driver, my_id, relay_conn, peer, local, remote_nat, config)`、
 `FabricPunchChannel::open`、`DriverPunchSocket::{new, take_winner, punch_attempts}`、
 `SeededPredictor`、`LoggingFeed`。
 
