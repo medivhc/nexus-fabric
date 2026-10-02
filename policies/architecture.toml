@@ -135,6 +135,12 @@ portable = false
 layer = "domain-runtime"
 
 [[crate]]
+name = "nexus-workspace-intel"
+allowed_internal_dependencies = ["nexus-domain", "nexus-workspace", "nexus-planner", "nexus-registry", "nexus-storage"]
+portable = false
+layer = "domain-runtime"
+
+[[crate]]
 name = "nexus-compute"
 allowed_internal_dependencies = ["nexus-domain", "nexus-session", "nexus-delivery", "nexus-workspace"]
 portable = false

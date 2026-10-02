@@ -110,6 +110,50 @@ impl Default for NetworkPlanExtension {
     }
 }
 
+// ---------- Resource Delivery Request（v9 §21） ----------
+
+/// 资源交付请求：缺失 Object/Chunk 进入 Core Planner 的标准 DTO（版本化）。
+///
+/// v9 §21："任何缺失 Object/Chunk 都转换为标准 Resource Delivery Request，
+/// 再进入 Core Planner"。由 `nexus-workspace-intel` 的 PrefetchScheduler 产生，
+/// Composition Root 转换为 `PlanningSnapshot` 后调用 Core Planner。
+/// 本 DTO 只表达"要什么"，不表达"从哪取"（Provider/Path 选择是 Planner 的事）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceDeliveryRequest {
+    /// DTO 版本（当前为 1）。
+    pub version: u32,
+    /// 缺失的资源（workspace 对象/块，如 `ws:<id>/obj:<object-id>`）。
+    pub resource: ResourceId,
+    /// 取回意图（profile 如 `workspace-object-fetch`）。
+    pub intent: Intent,
+    /// 硬约束（必须含 capability 约束，Planner 要求）。
+    pub constraints: Vec<Constraint>,
+    /// 已知持有副本的 Provider（按 Identity，不含 Locator 推导）。
+    pub providers: Vec<ProviderId>,
+}
+
+impl ResourceDeliveryRequest {
+    /// 当前 DTO 版本。
+    pub const VERSION: u32 = 1;
+
+    /// 构造交付请求。
+    #[must_use]
+    pub fn new(
+        resource: ResourceId,
+        intent: Intent,
+        constraints: Vec<Constraint>,
+        providers: Vec<ProviderId>,
+    ) -> Self {
+        Self {
+            version: Self::VERSION,
+            resource,
+            intent,
+            constraints,
+            providers,
+        }
+    }
+}
+
 /// Workspace 领域扩展：执行前固定的 Commit/Snapshot、WorkingSet 覆盖等。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspacePlanExtension {

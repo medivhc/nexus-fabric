@@ -33,6 +33,7 @@ nexus-fabric = { path = "../../crates/nexus-fabric" }
 nexus-path = { path = "../../crates/nexus-path" }
 nexus-compute = { path = "../../crates/nexus-compute" }
 nexus-workspace = { path = "../../crates/nexus-workspace" }
+nexus-workspace-intel = { path = "../../crates/nexus-workspace-intel" }
 nexus-dns = { path = "../../crates/nexus-dns" }
 nexus-outbound-shadowsocks = { path = "../../crates/nexus-outbound-shadowsocks" }
 nexus-outbound-vmess = { path = "../../crates/nexus-outbound-vmess" }
