@@ -55,7 +55,7 @@ impl Fail {
     fn skip(reason: impl Into<String>) -> Self {
         Fail::Skip(reason.into())
     }
-    fn fail(detail: impl Into<String>) -> Self {
+    fn failure(detail: impl Into<String>) -> Self {
         Fail::Fail(detail.into())
     }
     #[allow(dead_code)]
@@ -74,30 +74,30 @@ fn check(cond: bool, msg: &str) -> R<()> {
     if cond {
         Ok(())
     } else {
-        Err(Fail::fail(msg))
+        Err(Fail::failure(msg))
     }
 }
 
 /// 最小 HTTP GET（裸 TcpStream；只取 body）。
 fn http_get(path: &str) -> R<String> {
     let mut s = std::net::TcpStream::connect(LOCALAPI_ADDR)
-        .map_err(|e| Fail::fail(format!("localapi connect: {e}")))?;
+        .map_err(|e| Fail::failure(format!("localapi connect: {e}")))?;
     s.set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| Fail::fail(format!("set timeout: {e}")))?;
+        .map_err(|e| Fail::failure(format!("set timeout: {e}")))?;
     write!(s, "GET {path} HTTP/1.1\r\nHost: x\r\n\r\n")
-        .map_err(|e| Fail::fail(format!("http write: {e}")))?;
+        .map_err(|e| Fail::failure(format!("http write: {e}")))?;
     let mut buf = Vec::new();
     s.read_to_end(&mut buf)
-        .map_err(|e| Fail::fail(format!("http read: {e}")))?;
+        .map_err(|e| Fail::failure(format!("http read: {e}")))?;
     let text = String::from_utf8_lossy(&buf).into_owned();
     text.split_once("\r\n\r\n")
         .map(|(_, body)| body.to_string())
-        .ok_or_else(|| Fail::fail(format!("bad http response: {text:?}")))
+        .ok_or_else(|| Fail::failure(format!("bad http response: {text:?}")))
 }
 
 fn http_get_json(path: &str) -> R<serde_json::Value> {
     let body = http_get(path)?;
-    serde_json::from_str(&body).map_err(|e| Fail::fail(format!("bad json from {path}: {e}")))
+    serde_json::from_str(&body).map_err(|e| Fail::failure(format!("bad json from {path}: {e}")))
 }
 
 fn is_mounted(mountpoint: &Path) -> bool {
@@ -135,16 +135,16 @@ fn nexusd_bin() -> R<PathBuf> {
         .arg("nexusd")
         .current_dir(&root)
         .status()
-        .map_err(|e| Fail::fail(format!("cargo build nexusd: {e}")))?;
-    check(
-        st.success(),
-        "cargo build -p nexusd --bin nexusd failed",
-    )?;
+        .map_err(|e| Fail::failure(format!("cargo build nexusd: {e}")))?;
+    check(st.success(), "cargo build -p nexusd --bin nexusd failed")?;
     let target_dir = std::env::var("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| root.join("target"));
     let bin = target_dir.join("debug").join("nexusd");
-    check(bin.is_file(), &format!("nexusd binary missing: {}", bin.display()))?;
+    check(
+        bin.is_file(),
+        &format!("nexusd binary missing: {}", bin.display()),
+    )?;
     Ok(bin)
 }
 
@@ -156,13 +156,13 @@ struct Daemon {
 impl Daemon {
     fn spawn(bin: &Path, config_dir: &Path, stderr_path: PathBuf) -> R<Self> {
         let err_file = std::fs::File::create(&stderr_path)
-            .map_err(|e| Fail::fail(format!("create stderr file: {e}")))?;
+            .map_err(|e| Fail::failure(format!("create stderr file: {e}")))?;
         let child = Command::new(bin)
             .arg(config_dir)
             .stdout(Stdio::null())
             .stderr(Stdio::from(err_file))
             .spawn()
-            .map_err(|e| Fail::fail(format!("spawn nexusd: {e}")))?;
+            .map_err(|e| Fail::failure(format!("spawn nexusd: {e}")))?;
         Ok(Self { child, stderr_path })
     }
 
@@ -176,13 +176,13 @@ impl Daemon {
         loop {
             match self.child.try_wait() {
                 Ok(Some(status)) => {
-                    return Err(Fail::fail(format!(
+                    return Err(Fail::failure(format!(
                         "daemon exited early: {status}; stderr: {}",
                         self.stderr_text().chars().take(2000).collect::<String>()
-                    )))
+                    )));
                 }
                 Ok(None) => {}
-                Err(e) => return Err(Fail::fail(format!("try_wait: {e}"))),
+                Err(e) => return Err(Fail::failure(format!("try_wait: {e}"))),
             }
             if let Ok(v) = http_get_json("/localapi/v0/workspace/mounts") {
                 let n = v
@@ -195,7 +195,7 @@ impl Daemon {
                 }
             }
             if Instant::now() > deadline {
-                return Err(Fail::fail(format!(
+                return Err(Fail::failure(format!(
                     "timeout waiting for daemon LocalAPI/mounts; stderr: {}",
                     self.stderr_text().chars().take(2000).collect::<String>()
                 )));
@@ -227,11 +227,11 @@ impl Daemon {
                 Ok(Some(_)) => return Ok(()),
                 Ok(None) => {
                     if Instant::now() > deadline {
-                        return Err(Fail::fail("timeout waiting for daemon exit"));
+                        return Err(Fail::failure("timeout waiting for daemon exit"));
                     }
                     std::thread::sleep(Duration::from_millis(200));
                 }
-                Err(e) => return Err(Fail::fail(format!("try_wait: {e}"))),
+                Err(e) => return Err(Fail::failure(format!("try_wait: {e}"))),
             }
         }
     }
@@ -251,13 +251,13 @@ fn run_e4() -> Result<String, Fail> {
     let base = std::env::temp_dir().join(format!("daemon-ws-e4-{}", std::process::id()));
     let config_dir = base.join("config");
     let mountpoint = base.join("mnt");
-    std::fs::create_dir_all(&config_dir).map_err(|e| Fail::fail(format!("mkdir: {e}")))?;
+    std::fs::create_dir_all(&config_dir).map_err(|e| Fail::failure(format!("mkdir: {e}")))?;
     // 隔离：C1 专用端口 + no-tun（本 E4 不需要网络面）。
     std::fs::write(
         config_dir.join("daemon.toml"),
         "localapi_addr = \"127.0.0.1:18081\"\n[tun]\nenabled = false\n",
     )
-    .map_err(|e| Fail::fail(format!("write daemon.toml: {e}")))?;
+    .map_err(|e| Fail::failure(format!("write daemon.toml: {e}")))?;
     std::fs::write(
         config_dir.join("workspace.toml"),
         format!(
@@ -265,7 +265,7 @@ fn run_e4() -> Result<String, Fail> {
             mountpoint.display()
         ),
     )
-    .map_err(|e| Fail::fail(format!("write workspace.toml: {e}")))?;
+    .map_err(|e| Fail::failure(format!("write workspace.toml: {e}")))?;
 
     // 清理守卫：杀残留子进程、卸挂载、删临时目录。
     struct Guard {
@@ -275,10 +275,7 @@ fn run_e4() -> Result<String, Fail> {
     impl Drop for Guard {
         fn drop(&mut self) {
             for bin in ["fusermount", "fusermount3"] {
-                let _ = Command::new(bin)
-                    .arg("-u")
-                    .arg(&self.mountpoint)
-                    .output();
+                let _ = Command::new(bin).arg("-u").arg(&self.mountpoint).output();
             }
             std::fs::remove_dir_all(&self.base).ok();
         }
@@ -298,10 +295,13 @@ fn run_e4() -> Result<String, Fail> {
 
     // ---- 内核读写 ----
     let f1 = mountpoint.join("f1.txt");
-    std::fs::write(&f1, b"hello-workspace").map_err(|e| Fail::fail(format!("kernel write: {e}")))?;
-    let back =
-        std::fs::read(&f1).map_err(|e| Fail::fail(format!("kernel read: {e}")))?;
-    check(back == b"hello-workspace", "kernel_write_read_ok: bytes mismatch")?;
+    std::fs::write(&f1, b"hello-workspace")
+        .map_err(|e| Fail::failure(format!("kernel write: {e}")))?;
+    let back = std::fs::read(&f1).map_err(|e| Fail::failure(format!("kernel read: {e}")))?;
+    check(
+        back == b"hello-workspace",
+        "kernel_write_read_ok: bytes mismatch",
+    )?;
 
     // ---- commit 前进 Head ----
     let head_before = http_get_json("/localapi/v0/workspace/mounts")?
@@ -311,14 +311,14 @@ fn run_e4() -> Result<String, Fail> {
         .and_then(|m| m.get("head"))
         .and_then(|h| h.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| Fail::fail("no head in mounts status"))?;
+        .ok_or_else(|| Fail::failure("no head in mounts status"))?;
     std::fs::write(mountpoint.join("f2.txt"), b"second")
-        .map_err(|e| Fail::fail(format!("write f2: {e}")))?;
+        .map_err(|e| Fail::failure(format!("write f2: {e}")))?;
     let commit_resp = http_get_json(&format!("/localapi/v0/workspace/commit/{WS_ID}"))?;
     let head_after = commit_resp
         .get("head")
         .and_then(|h| h.as_str())
-        .ok_or_else(|| Fail::fail(format!("commit bad response: {commit_resp}")))?;
+        .ok_or_else(|| Fail::failure(format!("commit bad response: {commit_resp}")))?;
     check(
         head_after != head_before,
         "commit_advances_head: head did not advance",
@@ -339,7 +339,7 @@ fn run_e4() -> Result<String, Fail> {
 
     // ---- D5：写脏数据但不提交，然后 SIGTERM ----
     std::fs::write(mountpoint.join("f3-dirty.txt"), b"dirty")
-        .map_err(|e| Fail::fail(format!("write f3: {e}")))?;
+        .map_err(|e| Fail::failure(format!("write f3: {e}")))?;
     d1.term()?;
     d1.wait_exit(Duration::from_secs(20))?;
     check(
@@ -370,8 +370,10 @@ fn run_e4() -> Result<String, Fail> {
         &format!("no_implicit_commit: head changed across restart ({head_after} -> {head2})"),
     )?;
     // 持久化验证：f1/f2 可读（FsContentStore + state_root）。
-    let r1 = std::fs::read(mountpoint.join("f1.txt")).map_err(|e| Fail::fail(format!("reopen read f1: {e}")))?;
-    let r2 = std::fs::read(mountpoint.join("f2.txt")).map_err(|e| Fail::fail(format!("reopen read f2: {e}")))?;
+    let r1 = std::fs::read(mountpoint.join("f1.txt"))
+        .map_err(|e| Fail::failure(format!("reopen read f1: {e}")))?;
+    let r2 = std::fs::read(mountpoint.join("f2.txt"))
+        .map_err(|e| Fail::failure(format!("reopen read f2: {e}")))?;
     check(
         r1 == b"hello-workspace" && r2 == b"second",
         "restart_reopens_workspace: file bytes mismatch after reopen",
@@ -393,7 +395,12 @@ fn run_e4() -> Result<String, Fail> {
     let count = std::fs::read_to_string("/proc/mounts")
         .map(|t| {
             t.lines()
-                .filter(|l| l.split_whitespace().nth(1).map(|m| m == target).unwrap_or(false))
+                .filter(|l| {
+                    l.split_whitespace()
+                        .nth(1)
+                        .map(|m| m == target)
+                        .unwrap_or(false)
+                })
                 .count()
         })
         .unwrap_or(0);
