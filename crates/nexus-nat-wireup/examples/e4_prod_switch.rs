@@ -261,6 +261,15 @@ fn xfer_read(s: &Arc<StreamShared>) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Signal end-of-stream so the QUIC stream slot is retired (both sides must
+/// FIN; otherwise the 100-stream concurrent limit is hit).
+fn finish_stream(s: &Arc<StreamShared>) {
+    if let Ok(mut st) = s.state.lock() {
+        st.send_fin = true;
+    }
+    let _ = s.tx.send(Cmd::Pump { conn: s.conn_id });
+}
+
 // ---------------------------------------------------------------------------
 // Node assembly
 // ---------------------------------------------------------------------------
@@ -738,6 +747,7 @@ fn run_transfer(stack_a: &Arc<Stack>, id_b: FabricPeerId, relay_id: u64) -> Xfer
                 };
             }
         }
+        finish_stream(&s);
         if is_direct {
             via_direct += 1;
         } else {
