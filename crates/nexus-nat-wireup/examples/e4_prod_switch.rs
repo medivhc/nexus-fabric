@@ -756,8 +756,22 @@ fn run_transfer(stack_a: &Arc<Stack>, id_b: FabricPeerId, relay_id: u64) -> Xfer
             }
             match xfer_read(&s) {
                 Ok(echo) if echo == payload => {}
-                _ => {
-                    eprintln!("[e4] batch {b} chunk {i} echo mismatch");
+                Ok(echo) => {
+                    eprintln!(
+                        "[e4] batch {b} chunk {i} echo mismatch: len exp={} got={}, head exp={:02x?} got={:02x?}",
+                        payload.len(),
+                        echo.len(),
+                        &payload[..16.min(payload.len())],
+                        &echo[..16.min(echo.len())],
+                    );
+                    return XferStats {
+                        ok: false,
+                        via_relay,
+                        via_direct,
+                    };
+                }
+                Err(e) => {
+                    eprintln!("[e4] batch {b} chunk {i} echo read err: {e}");
                     return XferStats {
                         ok: false,
                         via_relay,
