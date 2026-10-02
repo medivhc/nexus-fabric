@@ -5214,6 +5214,9 @@ fn saturate_worker(
                 }
             };
         let _ = stream.set_nodelay(true);
+        // 写超时：对端不读时 write_all 不能无限阻塞，否则 stop 信号
+        // 永远检查不到、join 永久 hang（2026-10-02 修）。
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
         // 持续发送直到对端关闭或收到停止信号。
         while !stop.load(std::sync::atomic::Ordering::Relaxed) {
             match stream.write_all(&block) {
