@@ -177,7 +177,7 @@ fn stun_helper(port: u16) {
 fn rand_below(p: f64) -> bool {
     use std::cell::Cell;
     thread_local! {
-        static SEED: Cell<u64> = Cell::new(0x1234_5678_9abc_def0);
+        static SEED: Cell<u64> = const { Cell::new(0x1234_5678_9abc_def0) };
     }
     SEED.with(|s| {
         let mut x = s.get();
