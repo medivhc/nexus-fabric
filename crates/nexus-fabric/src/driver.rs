@@ -151,6 +151,41 @@ impl ConnShared {
             rebind_lock: Mutex::new(()),
         }
     }
+
+    /// Open a bidirectional stream on this connection (C2 sync transport).
+    ///
+    /// Sends `Cmd::OpenBi` and waits for the driver's reply.
+    /// Prefer the higher-level `FabricConn::open_bi` when you hold a `FabricConn`.
+    pub fn open_stream(&self) -> Result<Arc<StreamShared>, FabricError> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(Cmd::OpenBi {
+                conn: self.id.0,
+                reply: tx,
+            })
+            .map_err(|_| FabricError::Closed(0))?;
+        rx.recv().map_err(|_| FabricError::Closed(0))?
+    }
+
+    /// Accept a remotely-initiated bidirectional stream (blocking, C2).
+    ///
+    /// Pops from the shared `accepted` queue. Prefer `FabricConn::accept_bi`
+    /// when you hold a `FabricConn`.
+    pub fn accept_stream(&self) -> Result<Arc<StreamShared>, FabricError> {
+        let mut q = self.accepted.lock().unwrap();
+        loop {
+            if let Some(sh) = q.pop_front() {
+                return Ok(sh);
+            }
+            if let Some(e) = self.state.lock().unwrap().closed.clone() {
+                return Err(e);
+            }
+            q = self
+                .accepted_cv
+                .wait(q)
+                .map_err(|_| FabricError::Transport("lock poisoned".into()))?;
+        }
+    }
 }
 
 /// Per-stream state shared with the public API.

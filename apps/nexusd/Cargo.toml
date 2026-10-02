@@ -30,6 +30,7 @@ nexus-domain = { path = "../../crates/nexus-domain" }
 nexus-fabric = { path = "../../crates/nexus-fabric" }
 toml = "0.8"
 nexus-service = { path = "../../crates/nexus-service" }
+nexus-storage = { path = "../../crates/nexus-storage" }
 nexus-workspace = { path = "../../crates/nexus-workspace" }
 nexus-compute = { path = "../../crates/nexus-compute" }
 nexus-diagnostics = { path = "../../crates/nexus-diagnostics" }
