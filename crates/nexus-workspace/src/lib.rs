@@ -2435,6 +2435,16 @@ impl<S: ContentStore> Workspace<S> {
                         reason: "no local head to merge with".into(),
                     }
                 })?;
+                // 全新 workspace（仅 genesis，无用户提交）与远端无共同祖先：
+                // 直接采用远端 heads（clone 语义）。genesis 无用户数据，丢弃安全（§16）。
+                let is_fresh = self.commits.len() == 1 && self.heads.heads.len() == 1;
+                if is_fresh && self.find_common_ancestor(&lhead, rhead)?.is_none() {
+                    self.commits.remove(&lhead);
+                    self.heads.heads = vec![rhead.clone()];
+                    self.persist_state()?;
+                    disposition = MergeDisposition::FastForward;
+                    continue;
+                }
                 common_ancestor = self.find_common_ancestor(&lhead, rhead)?;
                 let report = self.merge_heads(&lhead, rhead)?;
                 disposition = report.disposition.clone();
