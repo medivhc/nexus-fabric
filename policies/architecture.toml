@@ -130,7 +130,7 @@ layer = "domain-runtime"
 
 [[crate]]
 name = "nexus-workspace"
-allowed_internal_dependencies = ["nexus-domain", "nexus-session", "nexus-delivery", "nexus-storage"]
+allowed_internal_dependencies = ["nexus-domain", "nexus-session", "nexus-delivery", "nexus-storage", "nexus-platform"]
 portable = false
 layer = "domain-runtime"
 

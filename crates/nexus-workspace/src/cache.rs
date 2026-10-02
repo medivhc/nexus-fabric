@@ -191,7 +191,10 @@ impl CacheManager {
                 hits,
                 insert_tick: self.tick,
                 refetch_cost: signals.refetch_cost,
-                ws_prob: signals.workingset_probability.unwrap_or(0.0).clamp(0.0, 1.0),
+                ws_prob: signals
+                    .workingset_probability
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0),
                 centrality: signals.graph_centrality.unwrap_or(0.0).clamp(0.0, 1.0),
                 pins,
             },
@@ -215,7 +218,7 @@ impl CacheManager {
                     a.0.partial_cmp(&b.0)
                         .unwrap_or(std::cmp::Ordering::Equal)
                         .then_with(|| a.1.cmp(&b.1))
-                        .then_with(|| a.2 .0.cmp(&b.2 .0))
+                        .then_with(|| a.2.0.cmp(&b.2.0))
                 })
                 .map(|(_, _, k)| k);
             match victim {
@@ -274,7 +277,10 @@ impl CacheManager {
 
     /// Whether any pin is held on this key.
     pub fn is_pinned(&self, key: &ObjectId) -> bool {
-        self.entries.get(key).map(|e| !e.pins.is_empty()).unwrap_or(false)
+        self.entries
+            .get(key)
+            .map(|e| !e.pins.is_empty())
+            .unwrap_or(false)
     }
 
     /// Optional W2 signal: WorkingSet probability. Clamped to 0.0..=1.0.

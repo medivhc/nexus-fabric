@@ -51,7 +51,8 @@ fn run_e4() -> Result<String, String> {
     let projected = WorkspaceProjection::new(access);
 
     // 2. Mount into an isolated temp dir.
-    let mountpoint: PathBuf = std::env::temp_dir().join(format!("nexus-fuse-e4-{}", std::process::id()));
+    let mountpoint: PathBuf =
+        std::env::temp_dir().join(format!("nexus-fuse-e4-{}", std::process::id()));
     if mountpoint.exists() {
         std::fs::remove_dir_all(&mountpoint).map_err(|e| format!("rmdir: {e}"))?;
     }

@@ -8,11 +8,6 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
-/// TUN 接口 IP 地址装配（幂等）。
-/// Linux FUSE adapter projecting a workspace as a filesystem (v9 §22).
-/// Consumes the portable `nexus_platform::ProjectedWorkspace` trait; owns
-/// no replica selection / path planning / cache policy / commit semantics.
-pub mod fuse_ws;
 pub mod addr;
 /// OS 装配顶层编排（`OsAssemble` 生产 API）。
 pub mod assemble;
@@ -20,6 +15,11 @@ pub mod assemble;
 pub mod daemon;
 /// 内置 DNS server（只服务 TUN 网段，不碰 /etc/resolv.conf）。
 pub mod dns;
+/// TUN 接口 IP 地址装配（幂等）。
+/// Linux FUSE adapter projecting a workspace as a filesystem (v9 §22).
+/// Consumes the portable `nexus_platform::ProjectedWorkspace` trait; owns
+/// no replica selection / path planning / cache policy / commit semantics.
+pub mod fuse_ws;
 /// netlink 窄绑定（socket + RTM_NEWADDR/GETADDR/NEWROUTE/DELROUTE/GETROUTE）。
 pub mod netlink;
 /// OS 装配操作日志（O6）。

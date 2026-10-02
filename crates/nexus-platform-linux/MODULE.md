@@ -58,6 +58,19 @@
 - Public API 变更必须保持结构化、可版本化并有调用方验证。
 - 本骨架只提供最小编译锚点；业务 API 在实现阶段增量添加。
 
+已实现（W4，v9 §22）：
+
+- `pub mod fuse_ws`：Linux FUSE 适配器，消费 portable
+  `nexus_platform::ProjectedWorkspace`（fuser 0.18，无 libfuse 链接）。
+  `FuseWorkspaceFs`（`Clone` 共享，`commit()`/`head()`）、
+  `mount_projected_workspace()`（后台线程挂载，drop 即卸载）。
+  语义：写操作 stage 进 WorkingSet，`commit()` 才落盘；inode 号会话内有效；
+  `mkdir` 是内存 overlay（不提交）；正确性优先 v1，无 readdir 缓存。
+  不拥有 replica selection / path planning / cache policy / commit 语义。
+- 场景映射：`scenarios/platform/workspace_fuse_projection.toml` 由
+  `crates/nexus-platform-linux/examples/workspace_fuse_e4.rs` 驱动
+  （`platform = "linux"`，无 /dev/fuse 时 verdict=SKIP）。
+
 ## Verification
 
 最低：

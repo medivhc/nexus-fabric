@@ -24,12 +24,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use fuser::{
-    BackgroundSession, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow, WriteFlags,
-    BsdFileFlags,
+    BackgroundSession, BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
+    Generation, INodeNo, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    WriteFlags,
 };
-use nexus_platform::{PlatformError, ProjectedWorkspace};
+use nexus_platform::{PlatformError, ProjectedDirEntry, ProjectedWorkspace};
 
 const TTL: Duration = Duration::from_secs(1);
 /// FUSE protocol root inode (stable ABI value).
@@ -126,7 +126,10 @@ impl FuseWorkspaceFs {
         self.inner.lock().ok()?.ws.head()
     }
 
-    fn with_inner<T>(&self, f: impl FnOnce(&mut FuseInner) -> Result<T, Errno>) -> Result<T, Errno> {
+    fn with_inner<T>(
+        &self,
+        f: impl FnOnce(&mut FuseInner) -> Result<T, Errno>,
+    ) -> Result<T, Errno> {
         let mut guard = self.inner.lock().map_err(|_| Errno::EIO)?;
         f(&mut guard)
     }
@@ -249,7 +252,14 @@ impl Filesystem for FuseWorkspaceFs {
         }
     }
 
-    fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
+    fn readdir(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectory,
+    ) {
         let entries: Vec<(u64, FileType, String)> = (|| {
             let mut inner = self.inner.lock().ok()?;
             let e = inner.inodes.get(&ino.0)?;
@@ -277,10 +287,8 @@ impl Filesystem for FuseWorkspaceFs {
                 })
                 .collect();
             overlay.sort();
-            let mut ws_entries = match inner.ws.list_dir(&path) {
-                Ok(v) => v,
-                Err(_) => Vec::new(),
-            };
+            let mut ws_entries: Vec<ProjectedDirEntry> =
+                inner.ws.list_dir(&path).unwrap_or_default();
             ws_entries.sort_by(|a, b| a.name.cmp(&b.name));
             for name in overlay {
                 let child = join(&path, &name);
@@ -458,7 +466,13 @@ impl Filesystem for FuseWorkspaceFs {
             Ok((attr, fh))
         });
         match res {
-            Ok((attr, fh)) => reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty()),
+            Ok((attr, fh)) => reply.created(
+                &TTL,
+                &attr,
+                Generation(0),
+                FileHandle(fh),
+                FopenFlags::empty(),
+            ),
             Err(errno) => reply.error(errno),
         }
     }
@@ -472,7 +486,12 @@ impl Filesystem for FuseWorkspaceFs {
             }
         };
         let res = self.with_inner(|inner| {
-            let parent_path = inner.inodes.get(&parent.0).ok_or(Errno::ENOENT)?.path.clone();
+            let parent_path = inner
+                .inodes
+                .get(&parent.0)
+                .ok_or(Errno::ENOENT)?
+                .path
+                .clone();
             let child = join(&parent_path, &name);
             if let Ok(entries) = inner.ws.list_dir(&parent_path) {
                 if entries.iter().any(|e| e.name == name && e.is_dir) {
@@ -491,7 +510,15 @@ impl Filesystem for FuseWorkspaceFs {
         }
     }
 
-    fn mkdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
+    fn mkdir(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
         let name = match name.to_str() {
             Some(n) => n.to_string(),
             None => {
@@ -500,7 +527,12 @@ impl Filesystem for FuseWorkspaceFs {
             }
         };
         let res = self.with_inner(|inner| {
-            let parent_path = inner.inodes.get(&parent.0).ok_or(Errno::ENOENT)?.path.clone();
+            let parent_path = inner
+                .inodes
+                .get(&parent.0)
+                .ok_or(Errno::ENOENT)?
+                .path
+                .clone();
             let child = join(&parent_path, &name);
             // Ephemeral overlay: workspace has no empty-dir concept.
             inner.explicit_dirs.insert(child.clone());
@@ -522,7 +554,12 @@ impl Filesystem for FuseWorkspaceFs {
             }
         };
         let res = self.with_inner(|inner| {
-            let parent_path = inner.inodes.get(&parent.0).ok_or(Errno::ENOENT)?.path.clone();
+            let parent_path = inner
+                .inodes
+                .get(&parent.0)
+                .ok_or(Errno::ENOENT)?
+                .path
+                .clone();
             let child = join(&parent_path, &name);
             let ws_empty = inner
                 .ws
@@ -647,9 +684,12 @@ mod tests {
 
     impl ProjectedWorkspace for FakeWs {
         fn read_file(&self, path: &str) -> Result<Vec<u8>, PlatformError> {
-            self.files.get(path).cloned().ok_or(PlatformError::NotFound {
-                key: path.to_string(),
-            })
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or(PlatformError::NotFound {
+                    key: path.to_string(),
+                })
         }
         fn write_file(&mut self, path: &str, content: &[u8]) -> Result<(), PlatformError> {
             self.files.insert(path.to_string(), content.to_vec());
@@ -669,11 +709,12 @@ mod tests {
                     }
                     match rest.find('/') {
                         Some(i) => {
-                            out.entry(rest[..i].to_string()).or_insert(ProjectedDirEntry {
-                                name: rest[..i].to_string(),
-                                is_dir: true,
-                                size: None,
-                            });
+                            out.entry(rest[..i].to_string())
+                                .or_insert(ProjectedDirEntry {
+                                    name: rest[..i].to_string(),
+                                    is_dir: true,
+                                    size: None,
+                                });
                         }
                         None => {
                             out.insert(
@@ -693,9 +734,12 @@ mod tests {
             Ok(vec)
         }
         fn delete(&mut self, path: &str) -> Result<(), PlatformError> {
-            self.files.remove(path).map(|_| ()).ok_or(PlatformError::NotFound {
-                key: path.to_string(),
-            })
+            self.files
+                .remove(path)
+                .map(|_| ())
+                .ok_or(PlatformError::NotFound {
+                    key: path.to_string(),
+                })
         }
         fn commit(&mut self) -> Result<String, PlatformError> {
             self.commits += 1;
@@ -748,7 +792,12 @@ mod tests {
             Errno::ENOENT
         );
         assert_eq!(
-            map_err("op", PlatformError::Invalid { message: "m".into() }),
+            map_err(
+                "op",
+                PlatformError::Invalid {
+                    message: "m".into()
+                }
+            ),
             Errno::EINVAL
         );
         assert_eq!(
