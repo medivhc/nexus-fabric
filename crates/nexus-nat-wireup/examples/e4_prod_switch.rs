@@ -706,6 +706,9 @@ fn spawn_echo(conn: Arc<ConnShared>, tag: &'static str, check_magic: bool) {
 }
 
 /// B side: wait for the direct conn, then echo on it.
+/// Delayed past the BIND window (T3's adopt_verified_direct has a 10s
+/// timeout): the winner's bind responder and this echo both accept on the
+/// direct conn, and the echo must not steal the BIND stream.
 fn spawn_direct_echo(stack_b: Arc<Stack>, id_a: FabricPeerId) {
     thread::spawn(move || {
         let d = loop {
@@ -714,7 +717,9 @@ fn spawn_direct_echo(stack_b: Arc<Stack>, id_a: FabricPeerId) {
             }
             thread::sleep(Duration::from_millis(200));
         };
-        println!("[e4] B: direct conn available, echoing on it");
+        println!("[e4] B: direct conn available, waiting out BIND window");
+        thread::sleep(Duration::from_secs(12));
+        println!("[e4] B: echoing on direct");
         spawn_echo(d.conn, "direct", true);
     });
 }
