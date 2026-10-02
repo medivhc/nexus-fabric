@@ -12,18 +12,26 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 use nexus_connectivity::cake::{CakeConfig, CakeScheduler, EnqueueDecision, FiveTuple};
 use nexus_dns::{DnsQuery, DnsType, DnsUnifiedConfig, UnifiedDns};
+use nexus_domain::SessionId;
+use nexus_flow_session::{
+    ChainDeps, ConnectivityEstablisher, FlowDecision, FlowKey, FlowSignal, IpProto, SessionManager,
+    SessionManagerConfig,
+};
 use nexus_network::n1::bridge::N1Sender;
 use nexus_path::{CandidatePath, PathConfig, PathManager};
 use nexus_projection::TunDevice;
 use nexus_projection::classifier::{Classification, PacketClassifier};
 use nexus_projection::routing::Cidr;
 use nexus_projection::tcp::{
-    STREAM_FIN, STREAM_RST, STREAM_SYN, TcpEvent, TcpTermStats, TcpTerminator, decode_stream_frame,
-    encode_stream_frame, encode_syn_payload,
+    FourTuple, STREAM_FIN, STREAM_RST, STREAM_SYN, TcpEvent, TcpTermStats, TcpTerminator,
+    decode_stream_frame, encode_stream_frame, encode_syn_payload,
 };
 
 /// 数据面统计（D6 可观测）。
@@ -85,6 +93,37 @@ pub struct DataplaneConfig {
 }
 
 /// 统一数据面：单个 TUN 的完整处理管线。
+/// 上游可用性标志（建连器用；`set_n1_sender`/proxy 注入时更新）。
+#[derive(Debug, Default)]
+struct UpstreamFlags {
+    n1: AtomicBool,
+    proxy: AtomicBool,
+}
+
+/// nexusd 的建连器：检查规划选出的上游是否真实可用。
+///
+/// - 有任一上游（N1 mesh / proxy engine）→ Ok（会话 Active = 流被接纳到该路径）；
+/// - 无上游 → Err（会话失败 → TCP 发 RST，不静默黑洞）。
+struct NexusdEstablisher {
+    upstream: Arc<UpstreamFlags>,
+}
+
+impl ConnectivityEstablisher for NexusdEstablisher {
+    fn establish(
+        &mut self,
+        _session_id: &SessionId,
+        _planned: &nexus_flow_session::Planned,
+    ) -> Result<String, String> {
+        if self.upstream.n1.load(Ordering::Relaxed) {
+            return Ok("mesh".into());
+        }
+        if self.upstream.proxy.load(Ordering::Relaxed) {
+            return Ok("proxy".into());
+        }
+        Err("no upstream path available (n1 and proxy both unset)".into())
+    }
+}
+
 pub struct Dataplane {
     tun: Box<dyn TunDevice>,
     manager: PathManager,
@@ -110,6 +149,22 @@ pub struct Dataplane {
     tcp: TcpTerminator,
     /// S4: stream_id → 流信息（事件分发：Mesh 经 N1 发帧 / Proxy 计数）。
     tcp_streams: HashMap<u32, TcpStreamInfo>,
+    /// Phase B：流→会话映射（`None` = 未启用，保持旧行为；渐进式改造 D3）。
+    flow_mgr: Option<SessionManager>,
+    /// Phase B：首包链依赖（flow_mgr 启用时构造）。
+    flow_chain_deps: Option<ChainDeps>,
+    /// Phase B：stream_id → SessionId（smoltcp 终结流绑定 §10 Session）。
+    flow_tcp_streams: HashMap<u32, SessionId>,
+    /// Phase B：FlowKey → stream_id（信号处理反向查）。
+    flow_key_to_stream: HashMap<FlowKey, u32>,
+    /// Phase B：stream_id → FlowKey（Data 门控反向查）。
+    flow_stream_to_key: HashMap<u32, FlowKey>,
+    /// Phase B：建连期缓冲的上行数据（stream_id → 待 flush 字节）。
+    flow_pending_data: HashMap<u32, Vec<Vec<u8>>>,
+    /// Phase B：待绑定（SYN 包已建会话，待 TcpEvent::Syn 到达）。
+    flow_pending: HashMap<FourTuple, SessionId>,
+    /// Phase B：上游可用性（建连器用）。
+    flow_upstream: Arc<UpstreamFlags>,
 }
 
 impl Dataplane {
@@ -183,17 +238,160 @@ impl Dataplane {
             qos_start: std::time::Instant::now(),
             tcp: TcpTerminator::new(),
             tcp_streams: HashMap::new(),
+            flow_mgr: None,
+            flow_chain_deps: None,
+            flow_tcp_streams: HashMap::new(),
+            flow_key_to_stream: HashMap::new(),
+            flow_stream_to_key: HashMap::new(),
+            flow_pending_data: HashMap::new(),
+            flow_pending: HashMap::new(),
+            flow_upstream: Arc::new(UpstreamFlags::default()),
         })
+    }
+
+    /// Phase B：启用流→会话映射（E4/生产按需调用；默认关闭保持旧行为）。
+    pub fn enable_flow_sessions(&mut self) {
+        let upstream = Arc::clone(&self.flow_upstream);
+        // 上游可用性初值：按当前注入状态。
+        upstream
+            .n1
+            .store(self.n1_sender.is_some(), Ordering::Relaxed);
+        upstream
+            .proxy
+            .store(self.proxy_engine.is_some(), Ordering::Relaxed);
+
+        let establisher = NexusdEstablisher { upstream };
+        self.enable_flow_sessions_with_establisher(Box::new(establisher));
+    }
+
+    /// 测试钩子：注入自定义建连器（E4 用阻塞版保证确定性）。
+    pub fn enable_flow_sessions_with_establisher(
+        &mut self,
+        establisher: Box<dyn nexus_flow_session::ConnectivityEstablisher>,
+    ) {
+        use nexus_domain::{FlowContext, ProviderId};
+        use nexus_planner::PlanningSnapshot;
+        use nexus_policy::PolicyEngine;
+        use nexus_registry::{ProviderRecord, Registry};
+
+        let chain_deps = ChainDeps {
+            policy: PolicyEngine::default_network(),
+            build_snapshot: Box::new(|flow: &FlowContext| {
+                let mut registry = Registry::new();
+                registry.register(ProviderRecord {
+                    id: ProviderId("provider-edge-a".into()),
+                    resource: flow.resource.clone(),
+                    placement: "local-edge".into(),
+                    locator: "edge-a.exit".into(),
+                    capabilities: vec!["internet-access".into()],
+                    present: true,
+                });
+                registry.register(ProviderRecord {
+                    id: ProviderId("provider-relay-b".into()),
+                    resource: flow.resource.clone(),
+                    placement: "regional-relay".into(),
+                    locator: "relay-b.exit".into(),
+                    capabilities: vec!["internet-access".into()],
+                    present: true,
+                });
+                let probe = PolicyEngine::default_network().evaluate(flow);
+                PlanningSnapshot::new(
+                    registry.candidates(&flow.resource),
+                    probe.decision.constraints,
+                )
+            }),
+            measure: Box::new(|_| None),
+        };
+        self.flow_chain_deps = Some(chain_deps);
+        self.flow_mgr = Some(SessionManager::new(
+            SessionManagerConfig::default(),
+            establisher,
+        ));
     }
 
     /// 注入 N1 发送器（W1/W3；由 Composition Root 在 N1 就绪后调用）。
     pub fn set_n1_sender(&mut self, sender: std::sync::Arc<dyn N1Sender>) {
         self.n1_sender = Some(sender);
+        self.flow_upstream.n1.store(true, Ordering::Relaxed);
     }
 
     /// 注入 Proxy 转发引擎（P1-P5；由 Composition Root 在 proxy.yaml 解析后调用）。
     pub fn set_proxy_engine(&mut self, engine: crate::proxy_fwd::ProxyEngine) {
         self.proxy_engine = Some(engine);
+        self.flow_upstream.proxy.store(true, Ordering::Relaxed);
+    }
+
+    // ---------- Phase B/C：E4 可观测接口 ----------
+
+    /// 流会话数（`None` = 未启用流映射时返回 0）。
+    #[must_use]
+    pub fn flow_session_count(&self) -> usize {
+        self.flow_mgr
+            .as_ref()
+            .map(|m| m.session_count())
+            .unwrap_or(0)
+    }
+
+    /// 首包链总运行次数（E4 `no_planner_in_hot_path` 证明）。
+    #[must_use]
+    pub fn flow_planner_calls(&self) -> u64 {
+        self.flow_mgr.as_ref().map(|m| m.planner_calls).unwrap_or(0)
+    }
+
+    /// 某流的 phase。
+    #[must_use]
+    pub fn flow_phase(&self, key: &FlowKey) -> Option<nexus_flow_session::FlowPhase> {
+        self.flow_mgr.as_ref()?.get_phase(key)
+    }
+
+    /// 某流绑定的 session id。
+    #[must_use]
+    pub fn flow_session_for_key(&self, key: &FlowKey) -> Option<SessionId> {
+        self.flow_mgr.as_ref()?.session_for_key(key)
+    }
+
+    /// 某会话的首包链 policy trace 长度。
+    #[must_use]
+    pub fn flow_policy_trace_len(&self, session_id: &SessionId) -> usize {
+        self.flow_mgr
+            .as_ref()
+            .map(|m| m.policy_trace_len(session_id))
+            .unwrap_or(0)
+    }
+
+    /// 某流的 UDP 超 bound 丢弃计数。
+    #[must_use]
+    pub fn flow_udp_dropped(&self, key: &FlowKey) -> u64 {
+        self.flow_mgr
+            .as_ref()
+            .map(|m| m.udp_dropped(key))
+            .unwrap_or(0)
+    }
+
+    /// 触发空闲扫描（E4 用；生产由定时器调）。
+    pub fn flow_sweep_idle(&mut self) -> usize {
+        self.flow_mgr.as_mut().map(|m| m.sweep_idle()).unwrap_or(0)
+    }
+
+    /// 设置流空闲超时（E4 用）。
+    pub fn set_flow_idle_timeout(&mut self, timeout: std::time::Duration) {
+        if let Some(mgr) = self.flow_mgr.as_mut() {
+            mgr.set_idle_timeout(timeout);
+        }
+    }
+
+    /// 当前流表项数。
+    #[must_use]
+    pub fn flow_count(&self) -> usize {
+        self.flow_mgr.as_ref().map(|m| m.flow_count()).unwrap_or(0)
+    }
+
+    /// 路径切换事件（D6，E4 用）：会话记录新 locator，流不断。
+    pub fn flow_on_path_switch(&mut self, session_id: &SessionId, new_locator: String) -> bool {
+        self.flow_mgr
+            .as_mut()
+            .map(|m| m.on_path_switch(session_id, new_locator))
+            .unwrap_or(false)
     }
 
     /// Proxy 引擎是否已注入（P1 可观测）。
@@ -223,6 +421,8 @@ impl Dataplane {
     /// 管线：读 TUN → DNS 短路（UDP dport 53）→ 分类 → [S1: TCP 终结] →
     /// QoS → 计数转发。
     pub fn process_one(&mut self) -> io::Result<bool> {
+        // Phase B/C：每轮先回填建连事件（即使无包，保证 Allocating→Active 推进）。
+        self.flow_pump();
         let n = match self.tun.read(&mut self.buf) {
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
@@ -263,13 +463,33 @@ impl Dataplane {
             if !self.qos_admit(&packet) {
                 return Ok(true);
             }
+            // Phase B：流→会话映射（启用时）。首包走 §10 链，会话建好前
+            // TCP 本地握手照常（smoltcp 缓冲早期数据，D4）。
+            if self.flow_mgr.is_some() && !self.flow_handle_tcp_packet(&packet) {
+                return Ok(true);
+            }
             self.handle_tcp_terminated(&packet, &classification);
             self.dispatch_tcp_events();
+            self.flow_pump();
             return Ok(true);
         }
 
         // D4：QoS 整形（启用时）。
         if !self.qos_admit(&packet) {
+            return Ok(true);
+        }
+
+        // Phase C：UDP + Mesh/Proxy → 流→会话映射（启用时）。
+        // Direct/Bypass 不建会话（不消耗 Nexus 资源）；DNS 已在前面短路。
+        if self.flow_mgr.is_some()
+            && is_udp_packet(&packet)
+            && matches!(
+                classification,
+                Classification::Mesh { .. } | Classification::Proxy
+            )
+            && !self.flow_handle_udp_packet(&packet)
+        {
+            self.flow_pump();
             return Ok(true);
         }
 
@@ -398,6 +618,288 @@ impl Dataplane {
     }
 
     /// S1/S2：TCP 包送终结器；产生的 TUN 包写回。
+    /// Phase C：UDP 包的流→会话映射。
+    ///
+    /// 返回 true = 继续现有转发路径；false = 包已处理（缓冲/丢弃），不继续。
+    fn flow_handle_udp_packet(&mut self, packet: &[u8]) -> bool {
+        let (mgr, deps) = match (self.flow_mgr.as_mut(), self.flow_chain_deps.as_ref()) {
+            (Some(m), Some(d)) => (m, d),
+            _ => return true,
+        };
+        let key = match FlowKey::parse_ipv4(packet) {
+            Some(k) => k,
+            None => return true,
+        };
+        debug_assert_eq!(key.proto, IpProto::Udp);
+        match mgr.on_packet(key, packet, false, deps) {
+            FlowDecision::NewSession { .. } | FlowDecision::Buffered { .. } => {
+                // 已入 SessionManager 有界缓冲，暂不转发（Active 后 flush）。
+                false
+            }
+            FlowDecision::Forward { .. } => true,
+            FlowDecision::Drop { .. } => {
+                self.with_stats(|s| s.dropped += 1);
+                false
+            }
+        }
+    }
+
+    /// Phase C：转发 Active 后 flush 的 UDP 缓冲包（重分类后按 Mesh/Proxy 转发）。
+    fn forward_buffered_udp(&mut self, packet: &[u8]) {
+        let candidates: &[CandidatePath] = if self.config.boost_enabled {
+            &self.candidates
+        } else {
+            &[]
+        };
+        let classifier = PacketClassifier::new(
+            self.mesh_cidrs.clone(),
+            self.bypass_cidrs.clone(),
+            &self.manager,
+            candidates,
+            0.0,
+        );
+        match classifier.classify(packet) {
+            Classification::Mesh { .. } => {
+                if self.config.n1_configured {
+                    let sent = match (&self.n1_sender, ipv4_dst_of(packet)) {
+                        (Some(sender), Some(dst)) => sender.send_to_mesh(dst, packet).is_ok(),
+                        _ => false,
+                    };
+                    if sent {
+                        self.with_stats(|s| s.mesh_forwarded += 1);
+                    } else {
+                        self.with_stats(|s| s.mesh_dropped_no_n1 += 1);
+                    }
+                } else {
+                    self.with_stats(|s| s.mesh_dropped_no_n1 += 1);
+                }
+            }
+            Classification::Proxy => {
+                if let Some(engine) = self.proxy_engine.as_mut() {
+                    let (tun_pkts, forwarded) = engine.handle_packet(packet);
+                    for pkt in tun_pkts {
+                        if self.tun.write(&pkt).is_ok() {
+                            self.with_stats(|s| s.tun_written += 1);
+                        }
+                    }
+                    if forwarded {
+                        self.with_stats(|s| s.proxy_forwarded += 1);
+                    }
+                } else {
+                    self.with_stats(|s| s.proxy_dropped_no_proxy += 1);
+                }
+            }
+            _ => {
+                self.with_stats(|s| s.dropped += 1);
+            }
+        }
+    }
+
+    /// Phase B：TCP 包的流→会话映射。
+    ///
+    /// 返回 true = 继续现有 smoltcp 终结路径；false = 包已处理（丢弃），不继续。
+    fn flow_handle_tcp_packet(&mut self, packet: &[u8]) -> bool {
+        let (mgr, deps) = match (self.flow_mgr.as_mut(), self.flow_chain_deps.as_ref()) {
+            (Some(m), Some(d)) => (m, d),
+            _ => return true,
+        };
+        let key = match FlowKey::parse_ipv4(packet) {
+            Some(k) => k,
+            None => return true, // 解析失败走旧路径（防御）。
+        };
+        debug_assert_eq!(key.proto, IpProto::Tcp);
+        let is_syn = is_tcp_syn(packet);
+        match mgr.on_packet(key, packet, is_syn, deps) {
+            FlowDecision::NewSession { session_id } => {
+                // 待 TcpEvent::Syn 到达时绑定 stream_id。
+                let four = FourTuple {
+                    src_ip: key.src_ip,
+                    src_port: key.src_port,
+                    dst_ip: key.dst_ip,
+                    dst_port: key.dst_port,
+                };
+                self.flow_pending.insert(four, session_id);
+                true
+            }
+            FlowDecision::Forward { .. } => true,
+            FlowDecision::Buffered { .. } => true, // TCP 不应缓冲；防御性继续。
+            FlowDecision::Drop { .. } => {
+                self.with_stats(|s| s.dropped += 1);
+                false
+            }
+        }
+    }
+
+    /// Phase B：回填建连事件并执行信号（RST/拆除）。
+    /// Phase B：该流的会话是否还在 Allocating（是则缓冲上行数据）。
+    fn flow_should_buffer_data(&self, stream_id: u32) -> bool {
+        let mgr = match self.flow_mgr.as_ref() {
+            Some(m) => m,
+            None => return false,
+        };
+        let key = match self.flow_stream_to_key.get(&stream_id) {
+            Some(k) => k,
+            None => return false, // 未绑定会话的流走旧路径。
+        };
+        matches!(
+            mgr.get_phase(key),
+            Some(nexus_flow_session::FlowPhase::Allocating)
+        )
+    }
+
+    /// Phase B：转发 TCP 上行数据（原 S5 逻辑抽出，供门控/flush 复用）。
+    fn forward_tcp_data(&mut self, stream_id: u32, bytes: &[u8]) {
+        match self.tcp_streams.get(&stream_id).copied() {
+            Some(info) if !info.proxy => {
+                // S5-Mesh：STREAM DATA 帧经 N1 发送。
+                let frame = encode_stream_frame(stream_id, 0x00, bytes);
+                let n = bytes.len() as u64;
+                if self.send_mesh_tcp_frame(*info.dst.ip(), &frame) {
+                    self.with_stats(|s| s.mesh_tcp_bytes += n);
+                }
+            }
+            Some(_) => {
+                // S5-Proxy：GAP-1 前只计数。
+                let n = bytes.len() as u64;
+                self.with_stats(|s| s.proxy_tcp_bytes += n);
+            }
+            None => {
+                // 防御：未知流的数据（不应发生）。
+                self.with_stats(|s| s.dropped += 1);
+            }
+        }
+    }
+
+    fn flow_pump(&mut self) {
+        // 作用域隔离 mgr 借用：pump + 收集 Active 流 + 取信号；flush/转发在外层做。
+        let (active_streams, signals) = match self.flow_mgr.as_mut() {
+            Some(mgr) => {
+                mgr.pump();
+                let pairs: Vec<(u32, FlowKey)> = self
+                    .flow_stream_to_key
+                    .iter()
+                    .map(|(sid, key)| (*sid, *key))
+                    .collect();
+                let active: Vec<u32> = pairs
+                    .into_iter()
+                    .filter(|(sid, key)| {
+                        self.flow_pending_data.contains_key(sid)
+                            && matches!(
+                                mgr.get_phase(key),
+                                Some(nexus_flow_session::FlowPhase::Active)
+                            )
+                    })
+                    .map(|(sid, _)| sid)
+                    .collect();
+                let signals = mgr.drain_signals();
+                (active, signals)
+            }
+            None => return,
+        };
+        // Active 后 flush 建连期缓冲的上行数据（D4）。
+        for stream_id in active_streams {
+            if let Some(batches) = self.flow_pending_data.remove(&stream_id) {
+                for bytes in batches {
+                    self.forward_tcp_data(stream_id, &bytes);
+                }
+            }
+        }
+        // Phase C：Active 后 flush UDP 有界缓冲。
+        // 在上面作用域内已 pump；这里重新借 mgr 取缓冲。
+        let udp_flushes: Vec<(FlowKey, Vec<Vec<u8>>)> = match self.flow_mgr.as_mut() {
+            Some(mgr) => mgr.take_udp_buffers_for_active(),
+            None => Vec::new(),
+        };
+        for (key, packets) in udp_flushes {
+            let _ = key; // 分类由包内容决定（重分类）。
+            for pkt in packets {
+                self.forward_buffered_udp(&pkt);
+            }
+        }
+        for signal in signals {
+            match signal {
+                FlowSignal::TcpReset { key } => {
+                    // 找该流的 smoltcp 连接，发 RST（不静默黑洞，D4）。
+                    // 优先用已绑定的 stream_id；握手未完成时按 FourTuple 直接重置。
+                    // 若 smoltcp 未产生 RST 包，直接构造一个（E4 可观察性）。
+                    let four = FourTuple {
+                        src_ip: key.src_ip,
+                        src_port: key.src_port,
+                        dst_ip: key.dst_ip,
+                        dst_port: key.dst_port,
+                    };
+                    let rst_pkts = match self.flow_stream_id_for_key(&key) {
+                        Some(sid) => {
+                            let pkts = self.tcp.handle_fabric_rst(sid);
+                            self.flow_tcp_streams.remove(&sid);
+                            pkts
+                        }
+                        None => self.tcp.reset_by_tuple(&four),
+                    };
+                    // 确保有 RST 包；没有则构造。
+                    let has_rst = rst_pkts.iter().any(|p| {
+                        if p.len() < 34 {
+                            return false;
+                        }
+                        let ihl = usize::from(p[0] & 0x0f) * 4;
+                        p.len() >= ihl + 14 && p[ihl + 13] & 0x04 != 0
+                    });
+                    if !has_rst {
+                        // 直接写 TUN（不经过 fixup_tun_packet，后者只认 smoltcp iface IP）。
+                        let rst = Self::craft_rst(&key);
+                        let _ = self.tun.write(&rst);
+                        self.with_stats(|s| s.tun_written += 1);
+                    }
+                    self.write_tun_packets(rst_pkts);
+                    if let Some(mgr) = self.flow_mgr.as_mut() {
+                        mgr.dispose_flow(&key);
+                    }
+                    self.with_stats(|s| s.dropped += 1);
+                }
+                FlowSignal::TearDown { key, .. } => {
+                    if let Some(sid) = self.flow_stream_id_for_key(&key) {
+                        let fin_pkts = self.tcp.handle_fabric_rst(sid);
+                        self.write_tun_packets(fin_pkts);
+                        self.flow_tcp_streams.remove(&sid);
+                    }
+                    // dataplane 已执行拆除 → 流进 Disposed 并 GC。
+                    if let Some(mgr) = self.flow_mgr.as_mut() {
+                        mgr.dispose_flow(&key);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Phase B：FlowKey → smoltcp stream_id（经已绑定的映射）。
+    fn flow_stream_id_for_key(&self, key: &FlowKey) -> Option<u32> {
+        self.flow_key_to_stream.get(key).copied()
+    }
+
+    /// 构造 TCP RST 包（回退路径；src/dst 互换）。
+    fn craft_rst(key: &FlowKey) -> Vec<u8> {
+        use nexus_projection::tcp::{ip_checksum, tcp_checksum};
+        let mut pkt = vec![0u8; 40]; // 20 IP + 20 TCP
+        pkt[0] = 0x45;
+        pkt[2] = 0;
+        pkt[3] = 40;
+        pkt[6] = 0x40;
+        pkt[8] = 64;
+        pkt[9] = 6;
+        pkt[12..16].copy_from_slice(&key.dst_ip); // src = server
+        pkt[16..20].copy_from_slice(&key.src_ip); // dst = client
+        pkt[20..22].copy_from_slice(&key.dst_port.to_be_bytes());
+        pkt[22..24].copy_from_slice(&key.src_port.to_be_bytes());
+        // seq/ack = 0；flags = RST|ACK.
+        pkt[32] = 0x50;
+        pkt[33] = 0x14;
+        let c = ip_checksum(&pkt[..20]);
+        pkt[10..12].copy_from_slice(&c.to_be_bytes());
+        let c2 = tcp_checksum(key.dst_ip, key.src_ip, &pkt[20..]);
+        pkt[36..38].copy_from_slice(&c2.to_be_bytes());
+        pkt
+    }
+
     fn handle_tcp_terminated(&mut self, packet: &[u8], classification: &Classification) {
         let peer = match classification {
             Classification::Mesh { path: Some(p), .. } => p.to_string(),
@@ -451,6 +953,21 @@ impl Dataplane {
                     let proxy = peer == "proxy";
                     self.tcp_streams
                         .insert(stream_id, TcpStreamInfo { dst, proxy });
+                    // Phase B：绑定 §10 Session（SYN 包建会话时已记入 flow_pending）。
+                    if let Some(four) = self.tcp.lookup_id(stream_id) {
+                        if let Some(session_id) = self.flow_pending.remove(&four) {
+                            let key = FlowKey {
+                                src_ip: four.src_ip,
+                                src_port: four.src_port,
+                                dst_ip: four.dst_ip,
+                                dst_port: four.dst_port,
+                                proto: IpProto::Tcp,
+                            };
+                            self.flow_tcp_streams.insert(stream_id, session_id);
+                            self.flow_key_to_stream.insert(key, stream_id);
+                            self.flow_stream_to_key.insert(stream_id, key);
+                        }
+                    }
                     self.with_stats(|s| s.tcp_handshakes += 1);
                     if proxy {
                         // S4-Proxy：GAP-1 前只计数。
@@ -466,31 +983,30 @@ impl Dataplane {
                     stream_id,
                     peer: _,
                     bytes,
-                } => match self.tcp_streams.get(&stream_id).copied() {
-                    Some(info) if !info.proxy => {
-                        // S5-Mesh：STREAM DATA 帧经 N1 发送。
-                        let frame = encode_stream_frame(stream_id, 0x00, &bytes);
-                        let n = bytes.len() as u64;
-                        if self.send_mesh_tcp_frame(*info.dst.ip(), &frame) {
-                            self.with_stats(|s| s.mesh_tcp_bytes += n);
-                        }
+                } => {
+                    // Phase B：会话 Allocating 期，上行数据缓冲（Active 后 flush，D4）。
+                    if self.flow_should_buffer_data(stream_id) {
+                        self.flow_pending_data
+                            .entry(stream_id)
+                            .or_default()
+                            .push(bytes);
+                    } else {
+                        self.forward_tcp_data(stream_id, &bytes);
                     }
-                    Some(_) => {
-                        // S5-Proxy：GAP-1 前只计数。
-                        let n = bytes.len() as u64;
-                        self.with_stats(|s| s.proxy_tcp_bytes += n);
-                    }
-                    None => {
-                        // 防御：未知流的数据（不应发生）。
-                        self.with_stats(|s| s.dropped += 1);
-                    }
-                },
+                }
                 TcpEvent::Closed {
                     stream_id,
                     peer: _,
                     reset,
                 } => {
                     let info = self.tcp_streams.remove(&stream_id);
+                    // Phase B：解绑 §10 Session 映射。
+                    if let Some(session_id) = self.flow_tcp_streams.remove(&stream_id) {
+                        let _ = session_id;
+                        self.flow_key_to_stream.retain(|_, sid| *sid != stream_id);
+                        self.flow_stream_to_key.remove(&stream_id);
+                        self.flow_pending_data.remove(&stream_id);
+                    }
                     if let Some(info) = info {
                         if !info.proxy {
                             // S6-Mesh：STREAM FIN/RST 帧经 N1 发送。
@@ -650,6 +1166,25 @@ fn ipv4_dst_of(packet: &[u8]) -> Option<Ipv4Addr> {
 /// 判断是否为 TCP 包（IPv4 + proto 6；S1 终结范围判定）。
 fn is_tcp_packet(packet: &[u8]) -> bool {
     packet.len() >= 20 && packet[0] >> 4 == 4 && packet[9] == 6
+}
+
+/// Phase B：是否为 TCP SYN 包（新流触发首包链）。
+fn is_tcp_syn(packet: &[u8]) -> bool {
+    if !is_tcp_packet(packet) {
+        return false;
+    }
+    let ihl = usize::from(packet[0] & 0x0f) * 4;
+    if packet.len() < ihl + 14 {
+        return false;
+    }
+    let flags = packet[ihl + 13];
+    // SYN 置位且 ACK 未置位（不把重传/握手中的包当新流）。
+    flags & 0x02 != 0 && flags & 0x10 == 0
+}
+
+/// Phase C：是否为 UDP 包。
+fn is_udp_packet(packet: &[u8]) -> bool {
+    packet.len() >= 20 && packet[0] >> 4 == 4 && packet[9] == 17
 }
 
 /// 判断是否为 DNS 查询（IPv4 + UDP + 目的端口 53）。

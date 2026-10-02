@@ -31,3 +31,6 @@ pub use flow::{FlowDecision, FlowEntry, FlowKey, FlowPhase, FlowTable, IpProto};
 pub use manager::{
     ConnectivityEstablisher, EstablishEvent, FlowSignal, SessionManager, SessionManagerConfig,
 };
+// 建连器 trait 签名需要；重导出避免调用方另引 nexus-planner / nexus-domain。
+pub use nexus_domain::SessionId;
+pub use nexus_planner::Planned;

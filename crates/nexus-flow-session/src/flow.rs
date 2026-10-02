@@ -196,6 +196,23 @@ impl FlowTable {
             .retain(|_, e| !matches!(e.phase, FlowPhase::Disposed));
         before - self.inner.len()
     }
+
+    /// 取出所有 Active 流的 UDP 缓冲（flush 用）；返回 (key, packets)。
+    /// 只取 Active 的；Allocating 的继续缓冲。
+    pub fn drain_udp_buffers_for_active(&mut self) -> Vec<(FlowKey, Vec<Vec<u8>>)> {
+        let mut out = Vec::new();
+        for entry in self.inner.values_mut() {
+            if entry.phase == FlowPhase::Active {
+                if let Some(buf) = entry.udp_buffer.as_mut() {
+                    let packets = buf.drain();
+                    if !packets.is_empty() {
+                        out.push((entry.key, packets));
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]

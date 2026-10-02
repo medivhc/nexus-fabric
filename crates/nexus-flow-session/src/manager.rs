@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use nexus_domain::{FlowContext, FlowOrigin, LifecyclePhase, ResourceId, SessionId};
 use nexus_planner::Planned;
+use nexus_policy::PolicyTraceEntry;
 use nexus_session::{CancelToken, SessionOwner};
 
 use crate::chain::{ChainDeps, ChainError, run_first_packet_chain};
@@ -70,6 +71,8 @@ pub struct SessionManager {
     sessions: HashMap<SessionId, SessionOwner>,
     plans: HashMap<SessionId, Planned>,
     session_to_key: HashMap<SessionId, FlowKey>,
+    /// 每个会话的首包链 policy trace（E4 `decision_trace_non_empty` 证明）。
+    policy_traces: HashMap<SessionId, Vec<PolicyTraceEntry>>,
     cancel: CancelToken,
     event_tx: mpsc::Sender<EstablishEvent>,
     event_rx: mpsc::Receiver<EstablishEvent>,
@@ -95,6 +98,7 @@ impl SessionManager {
             sessions: HashMap::new(),
             plans: HashMap::new(),
             session_to_key: HashMap::new(),
+            policy_traces: HashMap::new(),
             cancel: CancelToken::new(),
             event_tx,
             event_rx,
@@ -209,6 +213,8 @@ impl SessionManager {
         self.sessions.insert(session_id.clone(), owner);
         self.plans
             .insert(session_id.clone(), outcome.planned.clone());
+        self.policy_traces
+            .insert(session_id.clone(), outcome.policy_trace);
 
         // 流表项（幂等：重传 SYN 走上面的快路径，不会重复建）。
         let entry = self.table.insert(key, session_id.clone());
@@ -312,6 +318,14 @@ impl SessionManager {
 
     /// dataplane 执行完 TearDown 后调用：流进 Disposed。
     pub fn dispose_flow(&mut self, key: &FlowKey) {
+        // 找到 session_id，清理所有相关 map。
+        let session_id = self.table.get(key).map(|e| e.session_id.clone());
+        if let Some(sid) = session_id {
+            self.sessions.remove(&sid);
+            self.plans.remove(&sid);
+            self.session_to_key.remove(&sid);
+            self.policy_traces.remove(&sid);
+        }
         if let Some(entry) = self.table.get_mut(key) {
             entry.phase = FlowPhase::Disposed;
         }
@@ -327,6 +341,11 @@ impl SessionManager {
             .unwrap_or_default()
     }
 
+    /// 取出所有 Active 流的 UDP 缓冲（dataplane flush 用）。
+    pub fn take_udp_buffers_for_active(&mut self) -> Vec<(FlowKey, Vec<Vec<u8>>)> {
+        self.table.drain_udp_buffers_for_active()
+    }
+
     #[must_use]
     pub fn udp_dropped(&self, key: &FlowKey) -> u64 {
         self.table
@@ -334,6 +353,37 @@ impl SessionManager {
             .and_then(|e| e.udp_buffer.as_ref())
             .map(|b| b.dropped_over_bound())
             .unwrap_or(0)
+    }
+
+    /// 该会话的首包链 policy trace 长度（E4 证明用）。
+    #[must_use]
+    pub fn policy_trace_len(&self, session_id: &SessionId) -> usize {
+        self.policy_traces
+            .get(session_id)
+            .map(|t| t.len())
+            .unwrap_or(0)
+    }
+
+    /// 流绑定的 session id（dataplane 门控用）。
+    #[must_use]
+    pub fn session_for_key(&self, key: &FlowKey) -> Option<SessionId> {
+        self.table.get(key).map(|e| e.session_id.clone())
+    }
+
+    /// 设置空闲超时（E4/测试用）。
+    pub fn set_idle_timeout(&mut self, timeout: Duration) {
+        self.config.idle_timeout = timeout;
+    }
+
+    /// 路径切换事件（D6）：底层 direct→relay 切换时，会话记录新 locator，
+    /// 流表项不变、不断流、不重跑 Planner。
+    ///
+    /// 返回 false = 会话不存在。
+    pub fn on_path_switch(&mut self, session_id: &SessionId, new_locator: String) -> bool {
+        match self.sessions.get_mut(session_id) {
+            Some(owner) => owner.record_connectivity_established(new_locator).is_ok(),
+            None => false,
+        }
     }
 
     fn alloc_session_id(&mut self) -> SessionId {
