@@ -526,29 +526,6 @@ impl Stack {
         self.link.lock().unwrap().stats().path_active_switches
     }
 
-    /// Diagnostic: log scores and loss for relay vs direct.
-    fn log_scores(
-        &self,
-        peer: &FabricPeerId,
-        relay_addr: SocketAddr,
-        direct_addr: SocketAddr,
-        tag: &str,
-    ) {
-        let link = self.link.lock().unwrap();
-        let pm = link.manager();
-        let pmg = pm.lock().unwrap();
-        let relay_score = pmg.score(&relay_addr);
-        let direct_score = pmg.score(&direct_addr);
-        drop(pmg);
-        let loss_r = self.monitor.path_loss(&relay_addr);
-        let loss_d = self.monitor.path_loss(&direct_addr);
-        // Also read raw rtt from the conns for diagnosis.
-        eprintln!(
-            "[e4] {tag} scores: relay={relay_score:?} (loss={loss_r:?}) direct={direct_score:?} (loss={loss_d:?}) active_direct={}",
-            self.active_is_direct(peer),
-        );
-    }
-
     fn shutdown(&self) {
         self.monitor.shutdown();
     }
@@ -888,21 +865,6 @@ fn scenario_switch_to_direct() -> bool {
     // Register direct candidates as soon as the punch lands (both sides).
     spawn_direct_registrar(stack_a.clone(), id_b, local_a);
     spawn_direct_registrar(stack_b.clone(), id_a, local_b);
-
-    // Diagnostic: log scores every 3s.
-    {
-        let st = stack_a.clone();
-        thread::spawn(move || {
-            for i in 0..30 {
-                thread::sleep(Duration::from_secs(3));
-                if let Some(d) = st.punch.direct_conn(&id_b) {
-                    st.log_scores(&id_b, ctx.rb, d.addr, &format!("t={}", (i + 1) * 3));
-                } else {
-                    eprintln!("[e4] t={} no direct conn yet", (i + 1) * 3);
-                }
-            }
-        });
-    }
 
     // Transfer starts on relay (direct doesn't exist yet).
     let relay_id = ctx.relay_xfer_a.id.0;
