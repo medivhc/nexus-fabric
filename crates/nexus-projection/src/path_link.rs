@@ -510,7 +510,10 @@ mod tests {
         let mut link = PathLink::new(Arc::new(Mutex::new(PathManager::new(test_config()))));
         link.register_nat_relay("peer-a", relay, PathKind::Turn, addr(8000), addr(9001));
         link.register_nat_direct("peer-a", direct, addr(8000), addr(9002));
-        // Score direct much better than TURN; drain setup events.
+        // Direct scores much better than TURN: feed stats and drive the
+        // normal event pipeline (pump -> handle_event). The manager emits
+        // Switched{to: Direct} during setup; discarding it with a bare
+        // poll_event() drain would leave PathLink stuck on Relay.
         link.manager().lock().unwrap().on_stats(
             &addr(9001),
             PathStats {
@@ -527,8 +530,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        while link.manager().lock().unwrap().poll_event().is_some() {}
-        // Degrade TURN hard -> Switched to Direct.
+        link.pump();
+        assert_eq!(link.nat_active("peer-a"), Some(ActiveConn::Direct));
+        assert_eq!(link.stats().path_active_switches, 1);
+        // Degrading the (already inactive) relay further must not move
+        // active away from Direct and must not emit new switch events.
         for _ in 0..5 {
             link.manager().lock().unwrap().on_stats(
                 &addr(9001),
@@ -564,7 +570,8 @@ mod tests {
         let mut link = PathLink::new(Arc::new(Mutex::new(PathManager::new(test_config()))));
         link.register_nat_relay("peer-a", relay, PathKind::Turn, addr(8000), addr(9001));
         link.register_nat_direct("peer-a", direct, addr(8000), addr(9002));
-        // Direct active first.
+        // Direct active first: feed stats and drive the normal event
+        // pipeline (pump -> handle_event), not a bare poll_event() drain.
         link.manager().lock().unwrap().on_stats(
             &addr(9001),
             PathStats {
@@ -581,21 +588,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        while link.manager().lock().unwrap().poll_event().is_some() {}
-        for _ in 0..5 {
-            link.manager().lock().unwrap().on_stats(
-                &addr(9001),
-                PathStats {
-                    rtt_ms: Some(2000),
-                    loss_rate: Some(0.5),
-                    ..Default::default()
-                },
-            );
-        }
         link.pump();
         assert_eq!(link.nat_active("peer-a"), Some(ActiveConn::Direct));
+        assert_eq!(link.stats().path_active_switches, 1);
         // Now degrade direct -> back to relay.
-        while link.manager().lock().unwrap().poll_event().is_some() {}
         for _ in 0..5 {
             link.manager().lock().unwrap().on_stats(
                 &addr(9002),
