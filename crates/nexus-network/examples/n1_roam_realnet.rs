@@ -1046,7 +1046,53 @@ fn parent_run() -> Result<String, String> {
 
 // ---------- 入口 ----------
 
+/// E4 特权自举（2026-10-02）：`cargo run` 重建二进制会丢 file caps，
+/// 导致 unshare/TUN 报 EPERM。启动时检查有效 caps，缺失则经
+/// `sudo -n setcap` 补上并 re-exec（file caps 只在 exec 时生效）。
+/// 用环境变量防重入死循环。
+fn ensure_file_caps(caps_csv: &str, need_bits: u64) {
+    if std::env::var_os("NEXUS_E4_REEXECED").is_some() || has_cap_bits(need_bits) {
+        return;
+    }
+    let exe = std::env::current_exe().expect("current_exe");
+    let exe_s = exe.to_string_lossy().to_string();
+    let ok = std::process::Command::new("sudo")
+        .args(["-n", "setcap", &format!("{caps_csv}+ep"), &exe_s])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("E4 需要 file caps ({caps_csv})，sudo -n setcap 失败，无法继续");
+        std::process::exit(1);
+    }
+    // SAFETY: 单线程启动期，仅标记防重入。
+    unsafe { std::env::set_var("NEXUS_E4_REEXECED", "1") };
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let code = std::process::Command::new(&exe)
+        .args(&args)
+        .status()
+        .map(|s| s.code().unwrap_or(1))
+        .unwrap_or(1);
+    std::process::exit(code);
+}
+
+/// 读 /proc/self/status CapEff 检查是否有所需 caps。
+fn has_cap_bits(need: u64) -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("CapEff:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|h| u64::from_str_radix(h, 16).ok())
+        })
+        .map(|eff| eff & need == need)
+        .unwrap_or(false)
+}
+
 fn main() {
+    // CAP_NET_ADMIN=12 (TUN/路由)
+    ensure_file_caps("cap_net_admin", 1u64 << 12);
     let args: Vec<String> = std::env::args().collect();
     let is_child = args.iter().find(|a| a.starts_with("--child="));
     let want_json = args.iter().any(|a| a == "--json");
