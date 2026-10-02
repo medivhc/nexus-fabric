@@ -31,6 +31,12 @@
 // T4：tun_enabled 状态供 LocalAPI 查询（no-tun 模式可观测）。
 static TUN_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
+/// C1：daemon 的 workspace 子系统（Linux only；LocalAPI 路由与关闭序列共享）。
+#[cfg(target_os = "linux")]
+static WORKSPACE_MGR: std::sync::OnceLock<
+    std::sync::Mutex<Option<nexusd::workspace::WorkspaceManager>>,
+> = std::sync::OnceLock::new();
+
 /// 发布 tun_enabled 状态（daemon 启动时调用一次）。
 fn publish_tun_enabled(enabled: bool) {
     let _ = TUN_ENABLED.set(enabled);
@@ -79,6 +85,7 @@ fn main() -> ExitCode {
                  \x20 network.toml   N1 mesh（可选）\n\
                  \x20 proxy.yaml     Clash 风格代理（可选）\n\
                  \x20 dns.toml       DNS（可选）\n\
+                 \x20 workspace.toml Workspace FUSE 挂载（可选，C1）\n\
                  \n\
                  瘦客户端：\n\
                  \x20 nexus config get --dir <dir> <file>\n\
@@ -180,7 +187,7 @@ fn run_dataplane(
 ///
 /// 启动顺序（§13.3）：配置加载 → 校验 → TUN（致命）→ Dataplane → N1（可降级）
 /// → Proxy（可降级）→ LocalAPI → 主循环。
-/// 关闭顺序（§13.4/R4）：SIGTERM/SIGINT → LocalAPI → Dataplane（1s 超时）
+/// 关闭顺序（§13.4/R4/D7）：SIGTERM/SIGINT → LocalAPI → Workspace unmount → Dataplane（1s 超时）
 /// → N1（5s 超时）→ TUN（随线程退出）→ exit 0。
 fn run_daemon(config_dir: &str) -> ExitCode {
     let dir = match ConfigDir::new(std::path::Path::new(config_dir)) {
@@ -224,10 +231,13 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         eprintln!("[nexusd] boot-reconcile error: {e}");
     }
 
-    // T3：缺 proxy.yaml 且缺 network.toml → 拒绝启动（无意义）。
-    if loaded.proxy_yaml.is_none() && loaded.network_toml.is_none() {
+    // T3：缺 proxy.yaml 且缺 network.toml 且缺 workspace.toml → 拒绝启动（无意义）。
+    if loaded.proxy_yaml.is_none()
+        && loaded.network_toml.is_none()
+        && loaded.workspace_toml.is_none()
+    {
         eprintln!(
-            "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"CONFIG\",\"message\":\"no subsystem configured: need proxy.yaml and/or network.toml\"}}}}"
+            "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"CONFIG\",\"message\":\"no subsystem configured: need proxy.yaml and/or network.toml and/or workspace.toml\"}}}}"
         );
         return ExitCode::from(1);
     }
@@ -323,6 +333,28 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         }
     }
 
+    // 5.5. C1：Workspace 生产接线（Linux only）。放在 LocalAPI 就绪之后：
+    // F7：同配置双启动时，第二个 daemon 在 LocalAPI 端口冲突处先失败退出，
+    // 不会走到这里 unmount 第一个 daemon 的活挂载。workspace.toml 缺失 → 跳过（D1）；
+    // 挂载失败 → 拒绝启动（fail-fast，诚实）。
+    #[cfg(target_os = "linux")]
+    if let Some(text) = loaded.workspace_toml.as_deref() {
+        match nexusd::workspace::WorkspaceManager::start(std::path::Path::new(config_dir), text) {
+            Ok(mgr) => {
+                if !mgr.fuse_available {
+                    eprintln!("[nexusd] workspace subsystem disabled (no /dev/fuse)");
+                }
+                let _ = WORKSPACE_MGR.set(std::sync::Mutex::new(Some(mgr)));
+            }
+            Err(e) => {
+                eprintln!(
+                    "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"WORKSPACE\",\"message\":\"workspace mount failed: {e}\"}}}}"
+                );
+                return ExitCode::from(1);
+            }
+        }
+    }
+
     // 6. 配置 watcher（后台线程；主线程拥有 JoinHandle，不直接改共享状态）。
     let (ev_tx, ev_rx) = channel();
     let _watcher = watcher::spawn(dir.clone(), loaded, ev_tx);
@@ -356,7 +388,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
 
 /// R4：优雅关闭序列（§13.4）。
 ///
-/// 顺序：LocalAPI → Dataplane（1s）→ N1（5s）→ TUN（随 dataplane 线程退出）。
+/// 顺序：LocalAPI → Workspace unmount（D7）→ Dataplane（1s）→ N1（5s）→ TUN（随 dataplane 线程退出）。
 /// 任一步超时 → warn 日志后强制继续，不无限等。
 fn shutdown_sequence(
     localapi_handle: std::thread::JoinHandle<()>,
@@ -367,6 +399,18 @@ fn shutdown_sequence(
     eprintln!("[nexusd] shutdown: stopping LocalAPI");
     // LocalAPI 线程已通过 shutdown 标志退出 accept 循环；join 确认。
     assembly::join_with_timeout(localapi_handle, Duration::from_secs(2), "localapi");
+
+    // D7（C1）：Workspace unmount 在 LocalAPI 之后、Dataplane 之前。
+    #[cfg(target_os = "linux")]
+    {
+        let mgr = WORKSPACE_MGR
+            .get()
+            .and_then(|m| m.lock().ok().and_then(|mut g| g.take()));
+        if let Some(mgr) = mgr {
+            eprintln!("[nexusd] shutdown: unmounting workspaces");
+            mgr.shutdown();
+        }
+    }
 
     eprintln!("[nexusd] shutdown: stopping dataplane");
     if let Some(handle) = dataplane_handle {
@@ -610,6 +654,50 @@ fn serve_over_socket(path: &str) -> ExitCode {
 trait LocalIo: std::io::Read + std::io::Write {}
 impl<T: std::io::Read + std::io::Write> LocalIo for T {}
 
+/// C1：`GET /localapi/v0/workspace/mounts` — 已挂载 workspace 状态快照。
+#[cfg(target_os = "linux")]
+fn workspace_mounts_status() -> Value {
+    let guard = WORKSPACE_MGR.get().and_then(|m| m.lock().ok());
+    let (fuse_available, mounts) = match guard.as_deref() {
+        Some(Some(mgr)) => (mgr.fuse_available, mgr.mounts_status()),
+        _ => (false, Vec::new()),
+    };
+    json!({
+        "verdict": "PASS",
+        "fuse_available": fuse_available,
+        "mounts": mounts.iter().map(|s| json!({
+            "id": s.id,
+            "mountpoint": s.mountpoint,
+            "head": s.head,
+            "has_uncommitted_changes": s.has_uncommitted_changes,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// C1：`GET /localapi/v0/workspace/commit/<id>` — 显式提交（D5）。
+#[cfg(target_os = "linux")]
+fn workspace_commit(id: &str) -> Result<Value, (String, String)> {
+    let mgr_guard = WORKSPACE_MGR
+        .get()
+        .and_then(|m| m.lock().ok())
+        .ok_or_else(|| {
+            (
+                "WORKSPACE_DISABLED".to_string(),
+                "workspace subsystem not enabled".to_string(),
+            )
+        })?;
+    let mgr = mgr_guard.as_ref().ok_or_else(|| {
+        (
+            "WORKSPACE_DISABLED".to_string(),
+            "workspace subsystem not enabled".to_string(),
+        )
+    })?;
+    match mgr.commit(id) {
+        Ok(head) => Ok(json!({"verdict": "PASS", "id": id, "head": head})),
+        Err(e) => Err(("WORKSPACE_COMMIT".to_string(), e)),
+    }
+}
+
 fn handle_localapi_request(stream: &mut dyn LocalIo) -> Result<(), String> {
     use std::io::BufRead;
     let request_line: String = {
@@ -631,6 +719,18 @@ fn handle_localapi_request(stream: &mut dyn LocalIo) -> Result<(), String> {
         return Ok(());
     }
     let path = parts[1].to_string();
+    // C1：workspace commit 走 GET（本 LocalAPI 为最小 GET-only 控制面；变更语义由路径表达）。
+    // id 字符集已在 workspace.toml 解析时校验（字母数字/-/_），无注入风险。
+    #[cfg(target_os = "linux")]
+    if let Some(id) = path.strip_prefix("/localapi/v0/workspace/commit/") {
+        let result = workspace_commit(id);
+        let body = match result {
+            Ok(v) => v,
+            Err((code, msg)) => json!({"verdict":"FAIL","error":{"code":code,"message":msg}}),
+        };
+        write_http_json(stream, 200, &body).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
     let result: Result<Value, (String, String)> = match path.as_str() {
         "/localapi/v0/status" => nexus::observability::status()
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
@@ -665,6 +765,8 @@ fn handle_localapi_request(stream: &mut dyn LocalIo) -> Result<(), String> {
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
         "/localapi/v0/platform/capabilities" => nexus::observability::platform_capabilities()
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
+        #[cfg(target_os = "linux")]
+        "/localapi/v0/workspace/mounts" => Ok(workspace_mounts_status()),
         _ => {
             write_http_json(
                 stream,

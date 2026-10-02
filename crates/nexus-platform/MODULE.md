@@ -71,6 +71,9 @@
   Deletion Test：删掉它、`nexus-platform-linux` 直连 `nexus-workspace::WorkspaceAccess`
   会破坏 v9 §4 "platform adapters -X-> higher-level domain runtimes" 不变量，
   且每个未来平台要各写一份私有耦合——它是唯一的 portable 契约。
+- `ProjectedWorkspace::state_root`（C1，加法，带默认实现 `None`）：当前持久
+  状态根对象 id（daemon 生命周期用：每次 commit 后更新 state_root 锚文件，
+  重启 `open` 用）。纯观测元数据，不改变文件语义；旧实现者无需改动。
 
 ## Verification
 

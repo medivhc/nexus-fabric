@@ -46,3 +46,9 @@ sha1 = { version = "0.10", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 nexus-platform-windows = { path = "../../crates/nexus-platform-windows" }
+
+# C1/D9：Workspace FUSE 生产接线（仅 Linux；platform-linux 不反向依赖 workspace，
+# 装配发生在 nexusd 这个 Composition Root）。
+[target.'cfg(target_os = "linux")'.dependencies]
+nexus-platform-linux = { path = "../../crates/nexus-platform-linux" }
+nexus-storage = { path = "../../crates/nexus-storage" }

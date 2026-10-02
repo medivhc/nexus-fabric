@@ -1,0 +1,42 @@
+schema_version = 1
+id = "product.daemon-workspace-mount"
+title = "nexusd Workspace 生产接线：workspace.toml → FsContentStore → FUSE 挂载 → LocalAPI commit → 优雅关闭/重启/orphan 清理"
+evidence_strength = "E4"
+requirement = "v9#22"
+
+[given]
+# 可执行 E4（example daemon_workspace_mount_e4 --json，拉起真实 nexusd 子进程）：
+# - 隔离临时目录：config_dir（含 workspace.toml）+ data_dir；挂载点用隔离临时目录
+# - 无 /dev/fuse 时 example 输出 verdict=SKIP（D8：记 warn 不启用，不静默 fallback）
+# - harness 对 expects 独立求值、无 SKIP 短路，故本 scenario 只断言 verdict（PASS/SKIP）；
+#   7 个冻结期望由 example 内部求值（全满足才 PASS），并由 xc-pc-linux 真机独立 E4 验证，见 Evidence。
+#
+# 冻结期望（7 个，example 内部断言）：
+# 1. mount_ok：daemon 按 workspace.toml 启动，workspace 挂载成功
+# 2. kernel_write_read_ok：经内核写文件 → 读回字节一致
+# 3. commit_advances_head：经 LocalAPI commit 后 Head 前进，与 FUSE 侧 head() 一致
+# 4. graceful_shutdown_unmounted：SIGTERM 优雅关闭后 mountpoint 已卸载
+# 5. restart_reopens_workspace：重启 daemon，同一 workspace open 成功、Head 与关闭前一致、文件可读
+#    （验证 FsContentStore + state_root 持久化）
+# 6. orphan_mount_cleaned：kill -9 后重启，残留 orphan mount 被清理并重新挂载成功
+# 7. no_implicit_commit（D5）：unmount/shutdown 时 WorkingSet 脏数据只记 warn，不静默提交
+#
+# 语义锚点（拍板决定）：
+# - D1：workspace.toml 缺失 = workspace 子系统不启用
+# - D3：FsContentStore 落盘 <data-dir>/cas/（前置阻塞）；InMemory 只留测试
+# - D4：<data-dir>/workspaces/<id>/state_root 原子写，启动 open 用
+# - D5：不自动提交；nexus workspace commit <id> 经 LocalAPI；脏数据不静默提交
+# - D6：启动先 fusermount -u 幂等清理 orphan mount（busy 则 -uz）
+# - D7：关闭顺序 LocalAPI → Workspace unmount → Dataplane → N1 → TUN
+# - D8：无 /dev/fuse 记 warn 不启用，不静默 fallback
+#
+# Red Evidence：在旧实现上跑 → BLOCKED（无 daemon_workspace_mount_e4 example target）。
+# Contract Hash：scenarios 全集 git hash-object 前 16 位：
+#   cat $(git ls-files 'scenarios/**/*.toml' | sort) | git hash-object --stdin | cut -c1-16
+
+[when]
+command = "cargo run --quiet -p nexusd --example daemon_workspace_mount_e4 -- --json"
+
+[[expect]]
+field = "verdict"
+one_of = ["PASS", "SKIP"]

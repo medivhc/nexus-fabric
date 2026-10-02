@@ -44,6 +44,12 @@ impl ControlServiceImpl {
                 crate::observability::workspace_conflicts()?
             }
             ControlCommand::WorkspaceCache { .. } => crate::observability::workspace_cache()?,
+            // C1：正常路径走 daemon LocalAPI（main.rs 先分流）；进程内 snapshot 不可达。
+            ControlCommand::WorkspaceCommit { .. } => {
+                return Err(NexusError::Internal {
+                    message: "workspace commit must go through daemon LocalAPI".into(),
+                });
+            }
             ControlCommand::ComputeJobs => crate::observability::compute_jobs()?,
             ControlCommand::Diagnose => crate::observability::diagnose()?,
             ControlCommand::PlatformCapabilities => crate::observability::platform_capabilities()?,

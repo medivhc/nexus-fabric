@@ -44,6 +44,10 @@
 - 默认最小 surface：`private -> pub(crate) -> pub`。
 - Public API 变更必须保持结构化、可版本化并有调用方验证。
 - 本骨架只提供最小编译锚点；业务 API 在实现阶段增量添加。
+- `FsContentStore`（C1，`fs.rs`）：落盘 CAS（`<dir>/<object-id>` 扁平布局；
+  temp+fsync+rename 原子写，crash-consistent）；`stored_at` 取文件 mtime，
+  供 `ReachabilityGc::sweep_older_than` 保留期使用；`delete_object` 语义与
+  `InMemoryContentStore` 一致（两阶段 GC 由调用方保证）。
 
 ## Verification
 

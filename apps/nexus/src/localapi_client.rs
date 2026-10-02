@@ -66,10 +66,26 @@ pub fn route_for(command: &ControlCommand) -> Option<&'static str> {
         | ControlCommand::WorkspaceCache { .. }
         | ControlCommand::ComputeJobs
         | ControlCommand::Diagnose => None,
+        // C1：workspace commit 走动态路由（route_for_dynamic），静态路由无。
+        ControlCommand::WorkspaceCommit { .. } => None,
         // Run 保持进程内 SDK 路径（LocalAPI 无对应路由）。
         ControlCommand::Run { .. } => None,
         // N1 装配命令由 CLI 进程内 Composition Root 直接执行（M6；无 daemon 路由）。
         ControlCommand::NetworkUp { .. } | ControlCommand::NetworkStatus => None,
+    }
+}
+
+/// 把 [`ControlCommand`] 映射到 daemon LocalAPI 路由路径（动态路径段版本）。
+///
+/// `route_for` 只能表达静态路径；`workspace commit <id>` 的 id 是动态的，
+/// 走这个函数。返回 `None` 表示该命令无动态路由。
+#[must_use]
+pub fn route_for_dynamic(command: &ControlCommand) -> Option<String> {
+    match command {
+        ControlCommand::WorkspaceCommit { workspace } => {
+            Some(format!("/localapi/v0/workspace/commit/{workspace}"))
+        }
+        _ => None,
     }
 }
 
@@ -91,6 +107,7 @@ pub fn command_name(command: &ControlCommand) -> &'static str {
         ControlCommand::WorkspaceHeads { .. } => "workspace heads",
         ControlCommand::WorkspaceConflicts { .. } => "workspace conflicts",
         ControlCommand::WorkspaceCache { .. } => "workspace cache",
+        ControlCommand::WorkspaceCommit { .. } => "workspace commit",
         ControlCommand::ComputeJobs => "compute jobs",
         ControlCommand::Diagnose => "diagnose",
         ControlCommand::PlatformCapabilities => "platform capabilities",
@@ -267,11 +284,33 @@ mod tests {
             ControlCommand::WorkspaceCache {
                 workspace: "ws1".into(),
             },
+            ControlCommand::WorkspaceCommit {
+                workspace: "ws1".into(),
+            },
             ControlCommand::ComputeJobs,
             ControlCommand::Diagnose,
         ] {
             assert!(route_for(&cmd).is_none(), "{cmd:?} should have no route");
         }
+    }
+
+    #[test]
+    fn workspace_commit_has_dynamic_route() {
+        // F12：CLI `nexus workspace commit <id>` 的动态路由映射（单元层；
+        // 端到端走 E4 的 LocalAPI HTTP 路径）。
+        assert_eq!(
+            route_for_dynamic(&ControlCommand::WorkspaceCommit {
+                workspace: "ws1".into()
+            }),
+            Some("/localapi/v0/workspace/commit/ws1".to_string())
+        );
+        assert_eq!(
+            route_for(&ControlCommand::WorkspaceCommit {
+                workspace: "ws1".into()
+            }),
+            None
+        );
+        assert_eq!(route_for_dynamic(&ControlCommand::Status), None);
     }
 
     #[test]

@@ -8,3 +8,6 @@ pub mod dataplane;
 pub mod nat_switch;
 pub mod proxy_fwd;
 pub mod recovery;
+/// nexusd Workspace 生产接线（C1；仅 Linux：FUSE 挂载）。
+#[cfg(target_os = "linux")]
+pub mod workspace;

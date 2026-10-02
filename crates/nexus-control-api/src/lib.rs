@@ -52,6 +52,8 @@ pub enum ControlCommand {
     WorkspaceConflicts { workspace: String },
     /// `workspace cache`：Workspace 缓存状态。
     WorkspaceCache { workspace: String },
+    /// `workspace commit`：显式提交 workspace 暂存变更（C1/D5；经 LocalAPI）。
+    WorkspaceCommit { workspace: String },
     /// `compute jobs`：Compute 任务。
     ComputeJobs,
     /// `diagnose`：统一诊断。
