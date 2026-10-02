@@ -261,6 +261,7 @@ fn xfer_read_deadline(s: &Arc<StreamShared>, timeout: Duration) -> io::Result<Ve
     nexus_nat_wireup::channel::read_exact_deadline(s, &mut lenb, deadline)?;
     let len = u32::from_be_bytes(lenb) as usize;
     if len > 4 * 1024 * 1024 {
+        eprintln!("[e4] WARN: corrupt length prefix: {len} (bytes={lenb:02x?})");
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "chunk too large",
