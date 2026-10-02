@@ -647,9 +647,9 @@ fn conn_open(conn: &Arc<ConnShared>) -> bool {
 // Transfer: chunked echo over the CURRENT active conn (production pattern)
 // ---------------------------------------------------------------------------
 
-const CHUNKS: usize = 700;
+const BATCHES: usize = 12;
+const CHUNKS_PER_BATCH: usize = 35;
 const CHUNK_SIZE: usize = 1024;
-const PACE_MS: u64 = 25;
 
 /// B side: echo loop on one conn. Detached; dies with the process.
 fn spawn_echo(conn: Arc<ConnShared>, tag: &'static str) {
@@ -694,16 +694,17 @@ struct XferStats {
     via_direct: usize,
 }
 
-/// A side: send CHUNKS chunks, each on the current active conn, verify echo.
-/// Returns per-path chunk counts (proves the switch moved traffic).
+/// A side: send BATCHES batches; each batch opens ONE stream on the current
+/// active conn, sends CHUNKS_PER_BATCH verified chunks, then closes it.
+/// Returns per-path batch counts (proves the switch moved traffic).
 fn run_transfer(stack_a: &Arc<Stack>, id_b: FabricPeerId, relay_id: u64) -> XferStats {
     let mut via_relay = 0usize;
     let mut via_direct = 0usize;
-    for i in 0..CHUNKS {
+    for b in 0..BATCHES {
         let conn = match stack_a.active_conn(&id_b) {
             Some(c) => c,
             None => {
-                eprintln!("[e4] no active conn at chunk {i}");
+                eprintln!("[e4] no active conn at batch {b}");
                 return XferStats {
                     ok: false,
                     via_relay,
@@ -715,7 +716,7 @@ fn run_transfer(stack_a: &Arc<Stack>, id_b: FabricPeerId, relay_id: u64) -> Xfer
         let s = match open_stream(&conn) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[e4] chunk {i} open_stream: {e}");
+                eprintln!("[e4] batch {b} open_stream: {e}");
                 return XferStats {
                     ok: false,
                     via_relay,
@@ -723,28 +724,31 @@ fn run_transfer(stack_a: &Arc<Stack>, id_b: FabricPeerId, relay_id: u64) -> Xfer
                 };
             }
         };
-        let mut payload = vec![0u8; CHUNK_SIZE];
-        payload[..8].copy_from_slice(&(i as u64).to_be_bytes());
-        for (j, b) in payload[8..].iter_mut().enumerate() {
-            *b = ((i + j) % 251) as u8;
-        }
-        if xfer_write(&s, &payload).is_err() {
-            eprintln!("[e4] chunk {i} write failed");
-            return XferStats {
-                ok: false,
-                via_relay,
-                via_direct,
-            };
-        }
-        match xfer_read(&s) {
-            Ok(echo) if echo == payload => {}
-            _ => {
-                eprintln!("[e4] chunk {i} echo mismatch");
+        for i in 0..CHUNKS_PER_BATCH {
+            let seq = (b * CHUNKS_PER_BATCH + i) as u64;
+            let mut payload = vec![0u8; CHUNK_SIZE];
+            payload[..8].copy_from_slice(&seq.to_be_bytes());
+            for (j, x) in payload[8..].iter_mut().enumerate() {
+                *x = ((seq as usize + j) % 251) as u8;
+            }
+            if xfer_write(&s, &payload).is_err() {
+                eprintln!("[e4] batch {b} chunk {i} write failed");
                 return XferStats {
                     ok: false,
                     via_relay,
                     via_direct,
                 };
+            }
+            match xfer_read(&s) {
+                Ok(echo) if echo == payload => {}
+                _ => {
+                    eprintln!("[e4] batch {b} chunk {i} echo mismatch");
+                    return XferStats {
+                        ok: false,
+                        via_relay,
+                        via_direct,
+                    };
+                }
             }
         }
         finish_stream(&s);
@@ -753,13 +757,10 @@ fn run_transfer(stack_a: &Arc<Stack>, id_b: FabricPeerId, relay_id: u64) -> Xfer
         } else {
             via_relay += 1;
         }
-        if i % 100 == 0 {
-            println!(
-                "[e4] chunk {i}/{CHUNKS} active_direct={} (relay={via_relay} direct={via_direct})",
-                stack_a.active_is_direct(&id_b),
-            );
-        }
-        thread::sleep(Duration::from_millis(PACE_MS));
+        println!(
+            "[e4] batch {b}/{BATCHES} active_direct={} (relay={via_relay} direct={via_direct})",
+            stack_a.active_is_direct(&id_b),
+        );
     }
     XferStats {
         ok: true,
