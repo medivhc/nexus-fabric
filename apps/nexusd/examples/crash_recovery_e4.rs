@@ -9,7 +9,7 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -94,49 +94,105 @@ fn wait_victim_ready(child: &mut Child) {
     }
 }
 
+/// 定位预编译的 nexusd binary：与本 example 同一 target dir 下。
+/// （`current_exe` 反推在共享 CARGO_TARGET_DIR 下对 workspace 无效，
+/// 但对"同一 target dir 下的 binary"有效——example 和 binary 总是在同一 target 里。）
+fn nexusd_bin() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let debug_dir = exe.parent()?.parent()?;
+    let cand = debug_dir.join("nexusd");
+    if cand.exists() {
+        return Some(cand);
+    }
+    let rel = debug_dir.parent()?.join("release").join("nexusd");
+    rel.exists().then_some(rel)
+}
+
 /// 启动一次 nexusd，等待 boot-reconcile 行 + READY 行，返回 reconcile JSON。
 /// stderr 落到 `<config-dir>/nexusd-boot-<tag>.stderr.log`，失败时可取证。
+///
+/// 超时用 reader 线程 + `recv_timeout` 实现（直接 `read_line` 会在 cargo 编译期
+/// 无输出时永久阻塞，deadline 检查不到——2026-10-02 真机踩坑）。
 fn boot_nexusd(config_dir: &Path, tag: &str) -> (Child, serde_json::Value) {
     let stderr_path = config_dir.join(format!("nexusd-boot-{tag}.stderr.log"));
     let stderr_file = fs::File::create(&stderr_path)
         .unwrap_or_else(|e| fail_json(&format!("create stderr log: {e}")));
-    let mut child = Command::new("cargo")
-        .args(["run", "--quiet", "-p", "nexusd", "--bin", "nexusd", "--"])
-        .arg(config_dir)
-        // 注意：不设置 current_dir——scenario 命令要求调用方 cwd 即 workspace 根
-        // （外层 `cargo run -p` 本就依赖这点）；内层 cargo 继承即可。
-        // 曾尝试从 current_exe 反推 root，但在 CARGO_TARGET_DIR 共享时失效。
+
+    let mut cmd = match nexusd_bin() {
+        Some(bin) => {
+            let mut c = Command::new(bin);
+            c.arg(config_dir);
+            c
+        }
+        None => {
+            // 回退：cargo 现场编译（慢，但自包含）。
+            let mut c = Command::new("cargo");
+            c.args(["run", "--quiet", "-p", "nexusd", "--bin", "nexusd", "--"])
+                .arg(config_dir);
+            c
+        }
+    };
+    let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(stderr_file)
         .spawn()
         .unwrap_or_else(|e| fail_json(&format!("spawn nexusd: {e}")));
 
+    // reader 线程：行 → channel；主线程用 recv_timeout 驱动 deadline。
+    enum Ev {
+        Line(String),
+        Eof,
+    }
     let stdout = child.stdout.take().expect("nexusd stdout piped");
-    let mut reader = BufReader::new(stdout);
-    let deadline = Instant::now() + Duration::from_secs(90);
+    let (tx, rx) = std::sync::mpsc::channel::<Ev>();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    let _ = tx.send(Ev::Eof);
+                    break;
+                }
+                Ok(_) => {
+                    if tx.send(Ev::Line(line.clone())).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    let _ = tx.send(Ev::Eof);
+                    break;
+                }
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(300);
     let mut reconcile: Option<serde_json::Value> = None;
     let mut ready = false;
-    let mut line = String::new();
     loop {
         if Instant::now() > deadline {
             let _ = child.kill();
-            fail_json("nexusd did not print boot-reconcile + READY in 90s");
+            let _ = child.wait();
+            fail_json("nexusd did not print boot-reconcile + READY in 300s");
         }
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => {
-                let tail =
-                    fs::read_to_string(config_dir.join(format!("nexusd-boot-{tag}.stderr.log")))
-                        .map(|s| {
-                            let lines: Vec<&str> = s.lines().collect();
-                            let n = lines.len();
-                            lines[n.saturating_sub(8)..].join("\n")
-                        })
-                        .unwrap_or_default();
-                fail_json(&format!("nexusd exited before READY; stderr tail:\n{tail}"));
-            }
-            Ok(_) => {
-                let t = line.trim();
+        // 子进程已退出但还没 READY → 失败（带 stderr 尾巴）。
+        if let Ok(Some(_)) = child.try_wait() {
+            // 排空剩余行（只为完整性；解析已在主循环完成）
+            while rx.try_recv().is_ok() {}
+            let tail = fs::read_to_string(&stderr_path)
+                .map(|s| {
+                    let lines: Vec<&str> = s.lines().collect();
+                    let n = lines.len();
+                    lines[n.saturating_sub(10)..].join("\n")
+                })
+                .unwrap_or_default();
+            fail_json(&format!("nexusd exited before READY; stderr tail:\n{tail}"));
+        }
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(Ev::Line(t)) => {
+                let t = t.trim();
                 if t.starts_with("{\"event\":\"boot-reconcile\"") {
                     reconcile = serde_json::from_str(t).ok();
                 }
@@ -147,7 +203,9 @@ fn boot_nexusd(config_dir: &Path, tag: &str) -> (Child, serde_json::Value) {
                     break;
                 }
             }
-            Err(e) => fail_json(&format!("nexusd stdout read: {e}")),
+            Ok(Ev::Eof) => continue, // try_wait 分支会处理退出
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => continue,
         }
     }
     (child, reconcile.unwrap())
