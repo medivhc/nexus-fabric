@@ -736,14 +736,9 @@ fn spawn_echo(conn: Arc<ConnShared>, tag: &'static str, check_magic: bool) {
                     }
                 }
             }
-            loop {
-                match xfer_read(&s) {
-                    Ok(buf) => {
-                        if xfer_write(&s, &buf).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+            while let Ok(buf) = xfer_read(&s) {
+                if xfer_write(&s, &buf).is_err() {
+                    break;
                 }
             }
             finish_stream(&s);
