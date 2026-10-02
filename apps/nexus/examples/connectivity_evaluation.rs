@@ -7,14 +7,14 @@
 use std::net::SocketAddr;
 
 use nexus_connectivity::evaluation::{
-    evaluate_connectivity, EvaluationInput, PlatformNetworkCapability,
+    EvaluationInput, PlatformNetworkCapability, evaluate_connectivity,
 };
 use nexus_connectivity::nat::NatType;
 use nexus_domain::{ConnectivityEvaluation, Constraint, Intent, ProviderId, ResourceId};
 use nexus_measurement::LinkMeasurement;
-use nexus_planner::{connectivity_gate, plan_from_snapshot, PlanningSnapshot};
+use nexus_planner::{PlanningSnapshot, connectivity_gate, plan_from_snapshot};
 use nexus_registry::ProviderRecord;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 fn locator() -> SocketAddr {
     "203.0.113.7:54321".parse().unwrap()
@@ -97,10 +97,7 @@ fn planner_rejected(id: &str, eval: &ConnectivityEvaluation, ok: &mut bool) -> S
     let planned = plan_from_snapshot(&resource(), &snapshot, &intent(), |_| None);
 
     // 门控与规划结果必须一致：被 gate 拒绝 ⇔ plan 失败；未被拒 ⇔ plan 成功。
-    let consistent = match (&gate_reason, &planned) {
-        (Some(_), Err(_)) | (None, Ok(_)) => true,
-        _ => false,
-    };
+    let consistent = matches!((&gate_reason, &planned), (Some(_), Err(_)) | (None, Ok(_)));
     if !consistent {
         *ok = false;
     }
@@ -130,14 +127,8 @@ fn case(
         Value::Bool(eval.has_feasible_path()),
     );
     obj.insert("direct_likely".into(), Value::Bool(eval.direct_likely));
-    obj.insert(
-        "punching_likely".into(),
-        Value::Bool(eval.punching_likely),
-    );
-    obj.insert(
-        "relay_available".into(),
-        Value::Bool(eval.relay_available),
-    );
+    obj.insert("punching_likely".into(), Value::Bool(eval.punching_likely));
+    obj.insert("relay_available".into(), Value::Bool(eval.relay_available));
     obj.insert(
         "confidence_percent".into(),
         Value::from(eval.confidence_percent),
@@ -203,7 +194,13 @@ fn main() {
     if label != "no_feasible_connectivity_path" {
         ok = false;
     }
-    let (k, v) = case("symmetric_symmetric_no_relay", &ev, label, Map::new(), &mut ok);
+    let (k, v) = case(
+        "symmetric_symmetric_no_relay",
+        &ev,
+        label,
+        Map::new(),
+        &mut ok,
+    );
     cases.insert(k, v);
 
     // Case 3: symmetric–symmetric 但有中继 → relay 可用，Planner 保留。
