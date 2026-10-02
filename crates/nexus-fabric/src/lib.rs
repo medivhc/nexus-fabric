@@ -24,7 +24,14 @@ use std::net::SocketAddr;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-use driver::{Cmd, ConnShared, Driver, StreamShared};
+/// Driver-level handles for NAT punch-through wiring (`nexus-nat-wireup`).
+///
+/// Additive re-export (no logic change): the punch orchestrator needs
+/// `Driver::connect` on a shared punch driver (same UDP socket for all
+/// candidates — a fresh `FabricConn::connect` per target would open a new
+/// socket per candidate and break NAT mapping stability) and `Cmd::OpenBi`
+/// / `StreamShared` for the signal channel on the relayed connection.
+pub use driver::{Cmd, ConnShared, Driver, StreamShared};
 pub use transport::{StdUdpTransport, UdpTransport};
 
 /// QSEQ (GAP-2): length of the big-endian sequence header prepended by

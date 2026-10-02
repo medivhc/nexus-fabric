@@ -819,6 +819,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-nat-traversal"
+version = "0.1.0"
+dependencies = [
+ "nexus-connectivity",
+]
+
+[[package]]
+name = "nexus-nat-wireup"
+version = "0.1.0"
+dependencies = [
+ "nexus-connectivity",
+ "nexus-fabric",
+ "nexus-nat-traversal",
+ "nexus-turn",
+]
+
+[[package]]
 name = "nexus-network"
 version = "0.1.0"
 dependencies = [
