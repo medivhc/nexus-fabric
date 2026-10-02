@@ -526,6 +526,27 @@ impl Stack {
         self.link.lock().unwrap().stats().path_active_switches
     }
 
+    /// Lock-safe diagnostic: never holds LINK while locking PM.
+    fn diag(&self, peer: &FabricPeerId, relay_addr: SocketAddr) {
+        let peer_h = peer_hex(peer);
+        let active = self.link.lock().unwrap().nat_active(&peer_h);
+        let pm = self.link.lock().unwrap().manager();
+        let direct_addr = self.punch.direct_conn(peer).map(|d| d.addr);
+        let (rs, ds) = {
+            let pmg = pm.lock().unwrap();
+            let rs = pmg.score(&relay_addr);
+            let ds = direct_addr.and_then(|a| pmg.score(&a));
+            (rs, ds)
+        };
+        let (rl, dl) = (
+            self.monitor.path_loss(&relay_addr),
+            direct_addr.and_then(|a| self.monitor.path_loss(&a)),
+        );
+        eprintln!(
+            "[e4] diag active={active:?} relay_score={rs:?} (loss={rl:?}) direct_score={ds:?} (loss={dl:?})"
+        );
+    }
+
     fn shutdown(&self) {
         self.monitor.shutdown();
     }
@@ -865,6 +886,19 @@ fn scenario_switch_to_direct() -> bool {
     // Register direct candidates as soon as the punch lands (both sides).
     spawn_direct_registrar(stack_a.clone(), id_b, local_a);
     spawn_direct_registrar(stack_b.clone(), id_a, local_b);
+
+    // Diagnostic: lock-safe score/loss logging every 10s.
+    {
+        let st = stack_a.clone();
+        let relay = ctx.rb;
+        thread::spawn(move || {
+            for i in 1..=6 {
+                thread::sleep(Duration::from_secs(10));
+                eprintln!("[e4] --- t={}s ---", i * 10);
+                st.diag(&id_b, relay);
+            }
+        });
+    }
 
     // Transfer starts on relay (direct doesn't exist yet).
     let relay_id = ctx.relay_xfer_a.id.0;
