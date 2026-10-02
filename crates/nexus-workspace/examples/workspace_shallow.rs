@@ -67,7 +67,7 @@ fn main() {
     }
 }
 
-fn build_remote() -> Result<FakeRemote, String> {
+fn build_remote() -> Result<(FakeRemote, Vec<CommitId>), String> {
     let mut remote = Workspace::init(
         WorkspaceId("ws-remote".into()),
         InMemoryContentStore::new(),
