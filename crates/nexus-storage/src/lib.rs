@@ -68,7 +68,7 @@ struct StoredObject {
 }
 
 /// 内存内容寻址存储（确定性、可重放；用于 portable-core 测试与 E4 场景）。
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct InMemoryContentStore {
     objects: HashMap<ObjectId, StoredObject>,
     protected: HashSet<ObjectId>,

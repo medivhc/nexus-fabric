@@ -98,9 +98,10 @@ equals = 1
 field = "workspace.head"
 non_empty = true
 
+# requirement-change workspace-authority-v2：CommitId 改为内容哈希，不再是 C{seq}。
 [[expect]]
 field = "workspace.parent"
-equals = "C0"
+non_empty = true
 
 # 架构不变量：nexus-network 不依赖 nexus-ingress（ARCHITECTURE §3 禁止边）。
 [[expect]]

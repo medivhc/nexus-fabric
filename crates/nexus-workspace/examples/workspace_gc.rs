@@ -23,7 +23,7 @@
 
 use nexus_storage::{ContentStore, InMemoryContentStore, ObjectId};
 use nexus_workspace::{
-    Change, GcConfig, InFlightSet, QuotaPolicy, ReadOutcome, Workspace, WorkspaceId,
+    AuthorId, Change, GcConfig, InFlightSet, QuotaPolicy, ReadOutcome, Workspace, WorkspaceId,
 };
 
 fn main() {
@@ -50,8 +50,12 @@ fn run_flow() -> Result<String, String> {
     let pinned_orphan = store.put(b"orphan-pinned-blob")?;
 
     // 2. init + 两次提交。
-    let mut ws =
-        Workspace::init(WorkspaceId("ws-gc-1".into()), store).map_err(|e| e.to_string())?;
+    let mut ws = Workspace::init(
+        WorkspaceId("ws-gc-1".into()),
+        store,
+        AuthorId("example".into()),
+    )
+    .map_err(|e| e.to_string())?;
     let base = ws.heads().heads[0].clone();
     let c1 = ws
         .commit_changes(

@@ -21,7 +21,7 @@
 #![forbid(unsafe_code)]
 
 use nexus_storage::InMemoryContentStore;
-use nexus_workspace::{Change, MergeDisposition, MergeReport, Workspace, WorkspaceId};
+use nexus_workspace::{AuthorId, Change, MergeDisposition, MergeReport, Workspace, WorkspaceId};
 
 fn main() {
     let as_json = std::env::args().skip(1).any(|a| a == "--json");
@@ -45,6 +45,7 @@ fn run_flow() -> Result<MergeReport, String> {
     let mut ws = Workspace::init(
         WorkspaceId("ws-offline-merge-1".into()),
         InMemoryContentStore::new(),
+        AuthorId("node-local".into()),
     )
     .map_err(|e| e.to_string())?;
     let base = ws.heads().heads[0].clone();

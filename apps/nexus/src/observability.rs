@@ -407,11 +407,12 @@ pub fn status() -> Result<Value, NexusError> {
 /// 快照（挂 nexus-workspace DAG：init -> 两次离线提交 -> HeadSet 分叉）。
 pub fn workspace_heads() -> Result<Value, NexusError> {
     use nexus_storage::InMemoryContentStore;
-    use nexus_workspace::{Change, Workspace, WorkspaceId};
+    use nexus_workspace::{AuthorId, Change, Workspace, WorkspaceId};
 
     let mut ws = Workspace::init(
         WorkspaceId("ws-observability-1".into()),
         InMemoryContentStore::new(),
+        AuthorId("node-local".into()),
     )
     .map_err(|e| NexusError::Internal {
         message: format!("workspace init failed: {e}"),
@@ -487,11 +488,12 @@ pub fn workspace_heads() -> Result<Value, NexusError> {
 /// 捕获 `MergeConflict::ConflictingPath`，输出冲突快照（挂 nexus-workspace DAG）。
 pub fn workspace_conflicts() -> Result<Value, NexusError> {
     use nexus_storage::InMemoryContentStore;
-    use nexus_workspace::{Change, MergeConflict, Workspace, WorkspaceError, WorkspaceId};
+    use nexus_workspace::{AuthorId, Change, Workspace, WorkspaceId};
 
     let mut ws = Workspace::init(
         WorkspaceId("ws-observability-2".into()),
         InMemoryContentStore::new(),
+        AuthorId("node-local".into()),
     )
     .map_err(|e| NexusError::Internal {
         message: format!("workspace init failed: {e}"),
@@ -531,17 +533,18 @@ pub fn workspace_conflicts() -> Result<Value, NexusError> {
             message: format!("commit remote failed: {e}"),
         })?;
 
-    // 三方合并：同一路径冲突 -> MergeConflict::ConflictingPath{path}。
-    let conflict_paths: Vec<String> = match ws.merge_heads(&local, &remote) {
-        Ok(_) => Vec::new(),
-        Err(WorkspaceError::MergeConflict(MergeConflict::ConflictingPath { path })) => {
-            vec![path]
-        }
-        Err(e) => {
-            return Err(NexusError::Internal {
-                message: format!("workspace merge failed: {e}"),
-            });
-        }
+    // 三方合并：同一路径冲突 -> v2 返回 Ok + 持久化 ConflictObject。
+    let report = ws
+        .merge_heads(&local, &remote)
+        .map_err(|e| NexusError::Internal {
+            message: format!("workspace merge failed: {e}"),
+        })?;
+    let conflict_paths: Vec<String> = match report.conflict {
+        Some(id) => ws
+            .get_conflict(&id)
+            .map(|c| c.paths.clone())
+            .unwrap_or_default(),
+        None => Vec::new(),
     };
 
     let heads = ws.heads();

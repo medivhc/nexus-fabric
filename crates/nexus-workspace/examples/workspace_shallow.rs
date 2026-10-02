@@ -24,8 +24,8 @@ use std::collections::HashMap;
 
 use nexus_storage::{ContentStore, InMemoryContentStore, ObjectId};
 use nexus_workspace::{
-    Change, CommitId, ObjectFetcher, ReadOutcome, ReplicaPolicy, Workspace, WorkspaceCommit,
-    WorkspaceError, WorkspaceId,
+    AuthorId, Change, CommitId, ObjectFetcher, ReadOutcome, ReplicaPolicy, Workspace,
+    WorkspaceCommit, WorkspaceError, WorkspaceId,
 };
 
 /// 内存远端：从另一个 Workspace 的 store + DAG 提供对象/提交。
@@ -68,8 +68,12 @@ fn main() {
 }
 
 fn build_remote() -> Result<FakeRemote, String> {
-    let mut remote = Workspace::init(WorkspaceId("ws-remote".into()), InMemoryContentStore::new())
-        .map_err(|e| e.to_string())?;
+    let mut remote = Workspace::init(
+        WorkspaceId("ws-remote".into()),
+        InMemoryContentStore::new(),
+        AuthorId("remote".into()),
+    )
+    .map_err(|e| e.to_string())?;
     let mut head = remote.heads().heads[0].clone();
     let files = [
         ("f1.txt", "content-1"),
@@ -114,6 +118,7 @@ fn run_flow() -> Result<String, String> {
     let (mut shallow, shallow_report) = Workspace::shallow_clone(
         WorkspaceId("ws-shallow".into()),
         InMemoryContentStore::new(),
+        AuthorId("shallow".into()),
         &head_c4,
         &policy,
         &mut fetcher,
@@ -148,6 +153,7 @@ fn run_flow() -> Result<String, String> {
     let (sparse, _) = Workspace::shallow_clone(
         WorkspaceId("ws-sparse".into()),
         InMemoryContentStore::new(),
+        AuthorId("sparse".into()),
         &head_c4,
         &sparse_policy,
         &mut fetcher,

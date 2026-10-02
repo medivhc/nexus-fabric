@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use nexus_platform_linux::fuse_ws::mount_projected_workspace;
 use nexus_storage::InMemoryContentStore;
 use nexus_workspace::{
-    NativeApiWorkspaceAccess, Workspace, WorkspaceAccess, WorkspaceId, WorkspaceProjection,
+    AuthorId, NativeApiWorkspaceAccess, Workspace, WorkspaceAccess, WorkspaceId,
+    WorkspaceProjection,
 };
 
 fn skip(reason: &str) {
@@ -45,7 +46,12 @@ fn main() {
 fn run_e4() -> Result<String, String> {
     // 1. Workspace + projection adapter.
     let store = InMemoryContentStore::new();
-    let ws = Workspace::init(WorkspaceId("fuse-e4".into()), store).map_err(|e| format!("{e:?}"))?;
+    let ws = Workspace::init(
+        WorkspaceId("fuse-e4".into()),
+        store,
+        AuthorId("fuse-e4".into()),
+    )
+    .map_err(|e| format!("{e:?}"))?;
     let access = NativeApiWorkspaceAccess::new(ws);
     let head_before = access.head().cloned().map(|c| c.0.clone());
     let projected = WorkspaceProjection::new(access);

@@ -87,12 +87,16 @@ impl<A: WorkspaceAccess + Send> ProjectedWorkspace for WorkspaceProjection<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{NativeApiWorkspaceAccess, Workspace, WorkspaceId};
+    use crate::{AuthorId, NativeApiWorkspaceAccess, Workspace, WorkspaceId};
     use nexus_storage::InMemoryContentStore;
 
     fn setup() -> WorkspaceProjection<NativeApiWorkspaceAccess<InMemoryContentStore>> {
-        let ws = Workspace::init(WorkspaceId("proj-test".into()), InMemoryContentStore::new())
-            .expect("init");
+        let ws = Workspace::init(
+            WorkspaceId("proj-test".into()),
+            InMemoryContentStore::new(),
+            AuthorId("test-author".into()),
+        )
+        .expect("init");
         WorkspaceProjection::new(NativeApiWorkspaceAccess::new(ws))
     }
 

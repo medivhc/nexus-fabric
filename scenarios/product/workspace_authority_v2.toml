@@ -1,0 +1,66 @@
+schema_version = 1
+id = "product.workspace-authority-v2"
+title = "Workspace 权威模型 v2：内容哈希 CommitId + Conflict 持久化 + Head 交换"
+evidence_strength = "E4"
+requirement = "v9 §17/§18 + requirement-change workspace-authority-v2"
+
+[given]
+description = "双端独立建仓；内容哈希决定 CommitId（无序列号）；离线分叉后 Head 交换判定 Diverged；同路径冲突落持久化 ConflictObject；resolve 后 Merge Commit（双 parent）；跨端同一提交对象 ID 一致"
+
+[when]
+command = "cargo run --quiet -p nexus-workspace --example workspace_authority_v2 -- --json"
+
+# 冻结期望（语义来源：v9 §17/§18 + requirement-change workspace-authority-v2）：
+# - 纯函数 commit_id_of：同输入同输出，异内容异输出；
+# - 输出中不得出现 C{seq} 形序列 ID（no_sequence_ids）；
+# - 双端交换 Head 后判定为 diverged 并找到 common ancestor；
+# - 冲突路径落盘为 ConflictObject（CAS 可查，state=unresolved）；
+# - resolve 后 merge commit 有 2 个 parent，conflict 标记 resolved，Heads 收敛为 1；
+# - A 的提交被 B 拉取后，B 算出的 ID 与 A 一致（跨端对账）。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "content_hash.same_input_same_id"
+equals = true
+
+[[expect]]
+field = "content_hash.different_content_different_id"
+equals = true
+
+[[expect]]
+field = "content_hash.no_sequence_ids"
+equals = true
+
+[[expect]]
+field = "head_exchange.disposition"
+equals = "diverged"
+
+[[expect]]
+field = "head_exchange.common_ancestor_found"
+equals = true
+
+[[expect]]
+field = "conflict.persisted_in_cas"
+equals = true
+
+[[expect]]
+field = "conflict.paths"
+equals = ["conflict.txt"]
+
+[[expect]]
+field = "conflict.resolved"
+equals = true
+
+[[expect]]
+field = "conflict.merge_commit_parents"
+equals = 2
+
+[[expect]]
+field = "conflict.heads_after_resolve"
+equals = 1
+
+[[expect]]
+field = "cross_node.id_match_after_fetch"
+equals = true

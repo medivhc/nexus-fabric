@@ -44,7 +44,13 @@ Merge/Commit/持久化路径必须返回结构化 `WorkspaceError`，不得 pani
 ## Invariants
 
 - 权威版本使用不可变 Commit DAG + Head Set。
+- **CommitId 是内容哈希**（`hex16(fnv1a_64)`，与 CAS 的 `object_id_of` 同一哈希语义；
+  输入：排序后的 Parent CommitIds + RootManifestId + Author/NodeId + 逻辑元数据）。
+  标量序列号永不作为版本权威；`DurableState` header `v2`，拒绝 `v1`。
 - 离线分叉不得丢弃本地提交。
+- 冲突落为持久化 Conflict Object（进 CAS，含 Base/Local/Remote 与 Resolution State），
+  是 Workspace 状态的一部分；解决后才产生 Merge Commit。
+- Head 交换后收到的提交必须校验 `id == hash(content)`，不通过则拒绝。
 - WorkspaceGraph/WorkingSet/Cache 不是权威内容。
 - GC 只能删除不再被 protected roots 可达且过安全保留期的对象。
 
@@ -134,6 +140,26 @@ Merge/Commit/持久化路径必须返回结构化 `WorkspaceError`，不得 pani
  （domain → portable trait 方向，已有先例，已在 architecture.toml 声明）。
 - 场景映射：`scenarios/product/workspace_cache_eviction.toml` 由
   `crates/nexus-workspace/examples/cache_eviction.rs` 驱动。
+
+### 冻结契约（requirement-change：workspace-authority-v2）
+
+- `pub struct AuthorId(pub String)`：提交作者/节点的不透明标识（v9 §17）。
+- `pub struct WorkspaceCommit { id: CommitId, parents: Vec<CommitId>, root_manifest_id: ObjectId, author: AuthorId, created_at_unix: u64 }`。
+- `pub fn commit_id_of(parents: &[CommitId], root: &ObjectId, author: &AuthorId, created_at_unix: u64) -> CommitId`：
+  纯函数、确定性；同一提交对象在所有节点算出同一 ID。
+- `pub struct ConflictObject { id: String, base: CommitId, local: CommitId, remote: CommitId, paths: Vec<String>, state: ConflictState }`；
+  `pub enum ConflictState { Unresolved, Resolved { merge_commit: CommitId } }`；
+  `pub enum ConflictResolution { TakeLocal, TakeRemote, Custom(Vec<u8>) }`。
+- `merge_heads` 冲突时不再返回 `Err(MergeConflict)`：持久化 ConflictObject（字节进 CAS，
+  索引进 `DurableState v2`），返回 `MergeReport { conflict: Some(id), merge_commit: None, .. }`，Head 集不变。
+- `pub fn resolve_conflict(&mut self, conflict_id: &str, resolutions: &[(String, ConflictResolution)]) -> Result<CommitId, WorkspaceError>`：
+  生成 Merge Commit（内容哈希 ID，双 parent），标记 Resolved，Heads 收敛。
+- Head 交换（基于已冻结 `WorkspaceTransport`）：
+  `pub fn exchange_heads(&mut self, transport: &mut dyn WorkspaceTransport) -> Result<HeadExchangeReport, WorkspaceError>`；
+  `pub fn sync_with_remote(&mut self, transport: &mut dyn WorkspaceTransport) -> Result<SyncReport, WorkspaceError>`
+  （交换 Head → 拉取缺失提交（含 manifest/blob）→ 逐对 merge_heads 收敛）。
+- 场景映射：`scenarios/product/workspace_authority_v2.toml` 由
+  `crates/nexus-workspace/examples/workspace_authority_v2.rs` 驱动。
 
 ## Verification
 

@@ -83,9 +83,16 @@ Replica Set
 
 必须满足：
 
+- 每个 Commit 使用**内容哈希**作为 CommitId（哈希输入：排序后的 Parent CommitIds、
+  RootManifestId、Author/NodeId、逻辑元数据；同一提交对象在所有节点算出同一 ID，
+  跨端对账的基础）。标量序列号永不作为版本权威。
 - 离线写允许创建本地 Commit。
 - 多端并发写允许形成多个 Head。
 - 网络恢复后支持 fast-forward、three-way merge 或显式 Conflict Resolution。
+- 冲突产生**持久化 Conflict Object**（含 Base、Local、Remote 冲突路径与 Resolution State，
+  进 CAS），Conflict 是 Workspace 状态的一部分；解决后才产生 Merge Commit。
+- 联网后双端交换 Head Set（Same Head / Fast-forward / Diverged 判定），缺失提交按需拉取，
+  收到的提交必须校验 `id == hash(content)`。
 - 不得因为远端 Head 变化丢弃已经成功本地提交的数据。
 - 支持 WorkingSet、Profile、WorkspaceGraph 与 Prefetch，但这些不是权威内容。
 - 支持 Reachability GC、Storage Quota、Shallow Sync 与 Sparse Replica。

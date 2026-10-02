@@ -9,7 +9,7 @@ use nexus_domain::{Constraint, Intent, ProviderId, ResourceId};
 use nexus_planner::plan_from_snapshot;
 use nexus_registry::ProviderRecord;
 use nexus_storage::InMemoryContentStore;
-use nexus_workspace::{Change, Workspace, WorkspaceId};
+use nexus_workspace::{AuthorId, Change, Workspace, WorkspaceId};
 use nexus_workspace_intel::{
     AccessTrace, CacheState, EstimatorInput, PrefetchBudget, PrefetchScheduler, Profile,
     ResourceDeliveryRequest, TaskContext, WorkingSetEstimator, WorkspaceGraph, to_snapshot,
@@ -64,7 +64,12 @@ const COLD: &str = "README.md";
 fn run() -> Report {
     // 1. 建工作区并写入文件（含大小，供 prefetch 预算）。
     let store = InMemoryContentStore::default();
-    let mut ws = Workspace::init(WorkspaceId("ws-intel-e4".into()), store).unwrap();
+    let mut ws = Workspace::init(
+        WorkspaceId("ws-intel-e4".into()),
+        store,
+        AuthorId("intel-e4".into()),
+    )
+    .unwrap();
     let files: Vec<(&str, usize)> = vec![
         ("src/main.rs", 20_000),
         ("src/lib.rs", 30_000),

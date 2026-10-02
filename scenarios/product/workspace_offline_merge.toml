@@ -5,9 +5,7 @@ evidence_strength = "E4"
 requirement = "PRODUCT.md#workspace"
 
 [given]
-base_commit = "C0"
-local_changes = ["a.txt"]
-remote_changes = ["b.txt"]
+description = "双端离线分叉后 HeadSet 为 2；重连三方合并事件有序出现；合并后本地提交零丢失（v2：CommitId 为内容哈希，不再使用 C{seq} 序列号）"
 network = "offline-then-online"
 
 # 可执行 E4：nexus-workspace 的 example 按 Base + Local + Remote -> 分叉 -> 重连合并

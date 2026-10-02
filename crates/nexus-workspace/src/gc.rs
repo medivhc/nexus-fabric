@@ -21,7 +21,7 @@ use std::time::Duration;
 use nexus_storage::{ContentStore, ObjectId, ReachabilityGc, StorageStats};
 
 use super::{
-    CommitId, HeadSet, Manifest, Workspace, WorkspaceCommit, WorkspaceError, WorkspaceId, seq_of,
+    AuthorId, CommitId, HeadSet, Manifest, Workspace, WorkspaceCommit, WorkspaceError, WorkspaceId,
 };
 
 /// 默认安全保留期：14 天（v9 §20 移动端默认值；桌面/服务端可配更长）。
@@ -533,13 +533,13 @@ impl<S: ContentStore> Workspace<S> {
     }
 
     /// 空 Workspace（shallow clone / sync 导入的起点；调用方负责 `import_commits`）。
-    pub fn empty(id: WorkspaceId, store: S) -> Self {
+    pub fn empty(id: WorkspaceId, store: S, author: AuthorId) -> Self {
         Self {
             id,
+            author,
             commits: HashMap::new(),
             heads: HeadSet::default(),
             store,
-            next_seq: 1,
             state_root: ObjectId(String::new()),
             journal: Vec::new(),
             tombstones: Vec::new(),
@@ -548,6 +548,7 @@ impl<S: ContentStore> Workspace<S> {
             pins: HashSet::new(),
             replica_policy: ReplicaPolicy::default(),
             shallow_frontier: Vec::new(),
+            conflicts: HashMap::new(),
         }
     }
 
@@ -580,7 +581,6 @@ impl<S: ContentStore> Workspace<S> {
                 }
                 continue;
             }
-            self.next_seq = self.next_seq.max(seq_of(&c.id).map(|s| s + 1).unwrap_or(1));
             self.commits.insert(c.id.clone(), c);
         }
         for h in heads {
@@ -870,6 +870,7 @@ impl<S: ContentStore + ReachabilityGc + StorageStats> Workspace<S> {
     pub fn shallow_clone(
         id: WorkspaceId,
         store: S,
+        author: AuthorId,
         head: &CommitId,
         policy: &ReplicaPolicy,
         fetcher: &mut dyn ObjectFetcher,
@@ -893,7 +894,7 @@ impl<S: ContentStore + ReachabilityGc + StorageStats> Workspace<S> {
         if chain.is_empty() {
             return Err(WorkspaceError::UnknownCommit { id: head.clone() });
         }
-        let mut ws = Self::empty(id, store);
+        let mut ws = Self::empty(id, store, author);
         ws.set_replica_policy(policy.clone());
         let mut objects_fetched = 0u64;
         for commit in chain.iter().rev() {
@@ -1018,6 +1019,7 @@ mod gc_tests {
         let mut ws = Workspace::init(
             WorkspaceId("ws-gc-test".into()),
             InMemoryContentStore::new(),
+            AuthorId("test-author".into()),
         )
         .expect("init ok");
         let base = ws.heads().heads[0].clone();
@@ -1137,8 +1139,13 @@ mod gc_tests {
         let state_root = ws.state_root().clone();
         let store = ws.into_store();
         // 冷启动恢复
-        let ws2 =
-            Workspace::open(WorkspaceId("ws-gc-test".into()), store, &state_root).expect("open ok");
+        let ws2 = Workspace::open(
+            WorkspaceId("ws-gc-test".into()),
+            store,
+            &state_root,
+            AuthorId("test-author".into()),
+        )
+        .expect("open ok");
         // tombstone 持久化了：同样配置下 sweep 仍不删除
         let mut ws2 = ws2;
         let report = ws2.sweep(&cfg, &InFlightSet::new()).expect("sweep ok");
@@ -1155,16 +1162,23 @@ mod gc_tests {
     }
 
     #[test]
-    fn v1_state_still_opens() {
-        // v1 格式（无 tombstone/retain/hold/shallow 行）必须能打开。
+    fn v1_state_is_rejected() {
+        // v1 格式（`C{seq}` 序列号 CommitId）必须被拒绝，不能静默迁移：
+        // requirement-change 933b96ee672f621894006f3d42b764384a0e2c04
+        // 将 CommitId 改为内容哈希，旧 ID 语义已变，自动迁移会造出错误 ID。
         let v1 = "nexus-workspace-state v1\nid ws-v1\ncommit C0 abcdef0123456789 \nhead C0\n";
-        // 直接走 DurableState 解析路径：用 open 需要 store 里有该对象。
         let mut store = InMemoryContentStore::new();
         let oid = store.put(v1.as_bytes()).expect("put ok");
-        // 注意：v1 的 manifest id 是假的，open 会校验 commits 非空/head 非空然后成功；
-        // 这里只验证解析不报错（CorruptState）。
-        let ws = Workspace::open(WorkspaceId("ws-v1".into()), store, &oid);
-        assert!(ws.is_ok(), "v1 state 应向前兼容打开：{ws:?}");
+        let ws = Workspace::open(
+            WorkspaceId("ws-v1".into()),
+            store,
+            &oid,
+            AuthorId("test-author".into()),
+        );
+        assert!(
+            matches!(ws, Err(WorkspaceError::CorruptState { .. })),
+            "v1 state 必须被拒绝（不自动迁移）：{ws:?}"
+        );
     }
 
     #[test]
