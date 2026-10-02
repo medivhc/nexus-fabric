@@ -701,6 +701,7 @@ dependencies = [
  "nexus-storage",
  "nexus-transport",
  "nexus-workspace",
+ "nexus-workspace-intel",
  "rcgen",
  "rustls",
  "rustls-native-certs",
@@ -1082,6 +1083,19 @@ dependencies = [
  "nexus-domain",
  "nexus-session",
  "nexus-storage",
+]
+
+[[package]]
+name = "nexus-workspace-intel"
+version = "0.1.0"
+dependencies = [
+ "nexus-domain",
+ "nexus-planner",
+ "nexus-registry",
+ "nexus-storage",
+ "nexus-workspace",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

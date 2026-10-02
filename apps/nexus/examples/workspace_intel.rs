@@ -109,7 +109,11 @@ fn run() -> Report {
 
     // 3. 建图 → 估计 WorkingSet。
     let graph = WorkspaceGraph::build(&paths, &trace);
-    let profile = Profile::declare("morning-review", vec!["src/main.rs".into(), "docs/guide.md".into()], 1.0);
+    let profile = Profile::declare(
+        "morning-review",
+        vec!["src/main.rs".into(), "docs/guide.md".into()],
+        1.0,
+    );
     let estimator = WorkingSetEstimator::new();
     let cache = CacheState::default();
     let ranked = estimator.estimate(&EstimatorInput {
