@@ -899,6 +899,112 @@ fn is_specialized_branch(code_line: &str, variants: &[String]) -> bool {
         || ((code_line.contains("if ") || code_line.contains("while "))
             && (code_line.contains("==") || code_line.contains("!=")))
 }
+
+/// 逻辑行拼接的续行上限（P1-6②）：防止把整个文件粘成一条。
+const MAX_LOGICAL_JOIN: usize = 8;
+
+/// 当前行以"续行标点"结尾 → 该语句还没写完。
+fn ends_continued(s: &str) -> bool {
+    s.trim_end().chars().next_back().is_some_and(|c| {
+        matches!(
+            c,
+            ',' | '('
+                | '['
+                | '='
+                | '<'
+                | '>'
+                | '&'
+                | '|'
+                | '+'
+                | '-'
+                | '*'
+                | '/'
+                | '%'
+                | '.'
+                | ':'
+                | '!'
+        )
+    })
+}
+
+/// 下一行以续行标点/运算符开头 → 接上当前行（如 `if kind` 换行后 `== V`）。
+fn starts_continued(s: &str) -> bool {
+    let t = s.trim_start();
+    t.starts_with("=>")
+        || t.starts_with("==")
+        || t.starts_with("!=")
+        || t.starts_with("&&")
+        || t.starts_with("||")
+        || t.starts_with("::")
+        || t.starts_with('?')
+        || t.starts_with(',')
+        || t.starts_with(')')
+        || t.starts_with(']')
+        || t.starts_with('}')
+        || t.starts_with('.')
+        || t.starts_with('+')
+        || t.starts_with('-')
+        || t.starts_with('*')
+        || t.starts_with('/')
+        || t.starts_with('%')
+        || t.starts_with('=')
+        || t.starts_with('<')
+        || t.starts_with('>')
+        || t.starts_with('|')
+        || t.starts_with('&')
+}
+
+/// 逻辑行拼接（P1-6②）：把被拆到多行的语句合成一条，并返回首行号（1-based）。
+///
+/// `matches!(kind,\n ResourceKind::Service)` 这类拆行写法会绕过逐行判定；
+/// 本函数在剥离注释/字符串后按"续行标点"把相邻**非空**代码行粘成逻辑行。
+///
+/// 一旦逻辑行已经构成"资源类型专属分支"就立即收口 —— 使拼接不会把整个
+/// `match` 的所有分支并成一条，从而让 allow 仍按接近单行的粒度生效
+///（否则一条 allow 会连带放行整块 match）。
+fn logical_lines(codes: &[String], variants: &[String]) -> Vec<(usize, String)> {
+    let idxs: Vec<usize> = (0..codes.len())
+        .filter(|&i| !codes[i].trim().is_empty())
+        .collect();
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut start = 0usize;
+    let mut n = 0usize;
+    for (k, &i) in idxs.iter().enumerate() {
+        if buf.is_empty() {
+            start = i;
+        }
+        if !buf.is_empty() {
+            buf.push(' ');
+        }
+        buf.push_str(codes[i].trim());
+        n += 1;
+        if is_specialized_branch(&buf, variants) {
+            out.push((start + 1, std::mem::take(&mut buf)));
+            n = 0;
+            continue;
+        }
+        if n >= MAX_LOGICAL_JOIN {
+            out.push((start + 1, std::mem::take(&mut buf)));
+            n = 0;
+            continue;
+        }
+        let next = idxs.get(k + 1).map(|&j| codes[j].as_str());
+        let cont = match next {
+            Some(next_code) => ends_continued(&buf) || starts_continued(next_code),
+            None => false,
+        };
+        if cont {
+            continue;
+        }
+        out.push((start + 1, std::mem::take(&mut buf)));
+        n = 0;
+    }
+    if !buf.is_empty() {
+        out.push((start + 1, buf));
+    }
+    out
+}
 /// N2 资源类型中立门禁（P0-6，完成标志 #6）：四 crate 零资源类型专属分支。
 ///
 /// 扫描 `policies/architecture.toml [resource_kind_neutrality]` 声明的 crate 的
@@ -945,26 +1051,47 @@ pub fn resource_kind_neutrality_gate(config: &Config) -> Gate {
             "[resource_kind_neutrality] must declare non-empty crates + variants (fail-closed)",
         );
     }
-    let allows: Vec<(String, String)> = section
-        .get("allow")
-        .and_then(toml::Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|e| {
-                    let file = e.get("file")?.as_str()?.to_string();
-                    let contains = e.get("contains")?.as_str()?.to_string();
-                    Some((file, contains))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    // allow 解析 fail-closed：字段缺失/空值不再被静默丢弃（P1-6③）。
+    let mut allows: Vec<(String, String, String)> = Vec::new();
+    if let Some(arr) = section.get("allow").and_then(toml::Value::as_array) {
+        for (idx, e) in arr.iter().enumerate() {
+            let get = |k: &str| {
+                e.get(k)
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            };
+            let (file, contains, reason) = (get("file"), get("contains"), get("reason"));
+            if file.is_empty() || contains.is_empty() || reason.is_empty() {
+                let msg = format!(
+                    "allow entry #{idx} must declare non-empty file + contains + reason (fail-closed)"
+                );
+                return Gate::fail(GATE, &msg);
+            }
+            allows.push((file, contains, reason));
+        }
+    }
     let repo_root = config.policies_dir.parent().unwrap_or(&config.policies_dir);
 
     let mut violations: Vec<String> = Vec::new();
     let mut scanned_files = 0usize;
+    let mut allow_hits = 0usize;
     for krate in &crates {
-        for f in rs_files_under(&config.crates_dir.join(krate).join("src")) {
+        // crate 目录缺失/无源文件 = 扫了个寂寞（P1-6①：写错 crate 名得 0 文件
+        // 仍报 PASS），与自称的 fail-closed 相反 → 判 FAIL。
+        let src_dir = config.crates_dir.join(krate).join("src");
+        if !src_dir.is_dir() {
+            violations.push(format!(
+                "crate `{krate}`: source dir {} does not exist (fail-closed)",
+                src_dir.display()
+            ));
+            continue;
+        }
+        let mut crate_files = 0usize;
+        for f in rs_files_under(&src_dir) {
             scanned_files += 1;
+            crate_files += 1;
             let text = match std::fs::read_to_string(&f) {
                 Ok(t) => t,
                 Err(e) => {
@@ -977,26 +1104,38 @@ pub fn resource_kind_neutrality_gate(config: &Config) -> Gate {
                 .map(|p| p.to_string_lossy().replace('\\', "/"))
                 .unwrap_or_else(|_| f.display().to_string());
             let mut block_depth = 0usize;
-            for (idx, line) in text.lines().enumerate() {
-                let code = strip_line_code(line, &mut block_depth);
+            let codes: Vec<String> = text
+                .lines()
+                .map(|l| strip_line_code(l, &mut block_depth))
+                .collect();
+            for (lineno, code) in logical_lines(&codes, &variants) {
                 if !is_specialized_branch(&code, &variants) {
                     continue;
                 }
                 let allowed = allows
                     .iter()
-                    .any(|(file, contains)| *file == rel && code.contains(contains));
-                if !allowed {
-                    violations.push(format!("{rel}:{}: {}", idx + 1, code.trim()));
+                    .any(|(file, contains, _)| *file == rel && code.contains(contains));
+                if allowed {
+                    allow_hits += 1;
+                    continue;
                 }
+                violations.push(format!("{rel}:{lineno}: {}", code.trim()));
             }
+        }
+        if crate_files == 0 {
+            violations.push(format!(
+                "crate `{krate}`: no *.rs under {} (fail-closed)",
+                src_dir.display()
+            ));
         }
     }
     if violations.is_empty() {
         Gate::ok(
             GATE,
             &format!(
-                "{} crate(s), {scanned_files} file(s): no resource-type-specialized branches",
-                crates.len()
+                "{} crate(s) [{}], {scanned_files} file(s), {allow_hits} allow(s): no resource-type-specialized branches",
+                crates.len(),
+                crates.join(",")
             ),
         )
     } else {
@@ -1170,11 +1309,112 @@ mod tests {
 
     #[test]
     fn resource_kind_neutrality_gate_passes_on_current_tree() {
-        // 当前四 crate 无资源类型专属分支（仅 as_str 规范序列化，已 allow）。
+        // 契约四 crate（registry/planner/session/auth）零资源类型专属分支。
         let repo = crate::env::Repo::discover().expect("repo must be discoverable");
         let config = crate::config::Config::load(&repo).expect("config must load");
         let g = resource_kind_neutrality_gate(&config);
         assert_eq!(g.verdict, "PASS", "gate failed: {}", g.detail);
         assert!(g.detail.contains("4 crate(s)"), "{}", g.detail);
+        // P1-5：不只验数量，还要验**具体集合**（写错 crate 名得 0 文件的旧洞）。
+        for k in [
+            "nexus-registry",
+            "nexus-planner",
+            "nexus-session",
+            "nexus-auth",
+        ] {
+            assert!(g.detail.contains(k), "missing {k} in {}", g.detail);
+        }
+        assert!(!g.detail.contains("nexus-domain"), "{}", g.detail);
+        assert!(
+            !g.detail.contains(", 0 file(s)"),
+            "must scan real files: {}",
+            g.detail
+        );
+    }
+
+    /// P1-5：`policies/architecture.toml` 的 crate 集合必须与
+    /// `PRODUCT.md` §16.4-6 字面列出的"四 crate"一致（policy↔契约同源）。
+    #[test]
+    fn policy_crates_match_product_contract() {
+        let repo = Repo::discover().expect("repo must be discoverable");
+        let config = Config::load(&repo).expect("config must load");
+        let text = std::fs::read_to_string(config.policies_dir.join("architecture.toml")).unwrap();
+        let v: toml::Value = toml::from_str(&text).expect("architecture.toml parses");
+        let policy_crates: Vec<String> = v["resource_kind_neutrality"]["crates"]
+            .as_array()
+            .expect("crates declared")
+            .iter()
+            .map(|x| x.as_str().expect("crate is string").to_string())
+            .collect();
+
+        let product = std::fs::read_to_string(repo.resolve("PRODUCT.md")).unwrap();
+        let at = product
+            .find("四 crate 架构门禁通过")
+            .expect("PRODUCT.md §16.4-6 anchor present");
+        let seg = &product[at..];
+        let end = seg
+            .find("源码零资源类型专属分支")
+            .expect("PRODUCT.md §16.4-6 end anchor present");
+        let contract: Vec<String> = seg[..end]
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|s| s.starts_with("nexus-"))
+            .map(str::to_string)
+            .collect();
+
+        assert_eq!(
+            policy_crates, contract,
+            "policy crates must equal the PRODUCT.md §16.4-6 contract set"
+        );
+        assert_eq!(contract.len(), 4, "contract says exactly four crates");
+    }
+
+    /// P1-6②：拆行写法必须仍被 flag，且行号落在逻辑行首行。
+    #[test]
+    fn multi_line_specialized_branch_is_flagged() {
+        let variants: Vec<String> = ["Network", "Service", "Workspace", "Compute", "Device"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let raw = "let x = matches!(kind,\n    ResourceKind::Service\n);\nlet y = if kind\n    == ResourceKind::Service\n{ 1 } else { 0 };\n";
+        let mut depth = 0usize;
+        let codes: Vec<String> = raw
+            .lines()
+            .map(|l| strip_line_code(l, &mut depth))
+            .collect();
+        let lines = logical_lines(&codes, &variants);
+        let hits: Vec<(usize, &str)> = lines
+            .iter()
+            .filter(|(_, c)| is_specialized_branch(c, &variants))
+            .map(|(n, c)| (*n, c.as_str()))
+            .collect();
+        assert!(
+            !hits.is_empty(),
+            "split matches!/if must be flagged; got {:?}",
+            lines
+        );
+        assert!(
+            hits.iter().any(|(n, _)| *n == 1),
+            "matches! case must report line 1: {hits:?}"
+        );
+        assert!(
+            hits.iter().any(|(n, _)| *n == 4),
+            "if case must report line 4: {hits:?}"
+        );
+    }
+
+    /// P1-6①：crate 源码目录缺失 / 零源文件 → FAIL，不再报 0 文件 PASS。
+    #[test]
+    fn missing_crate_directory_is_fail_closed() {
+        let repo = Repo::discover().expect("repo must be discoverable");
+        let mut config = Config::load(&repo).expect("config must load");
+        config.crates_dir = std::env::temp_dir().join(format!(
+            "nexus-harness-no-such-crates-{}",
+            std::process::id()
+        ));
+        let g = resource_kind_neutrality_gate(&config);
+        assert_eq!(g.verdict, "FAIL", "must not pass silently: {}", g.detail);
+        assert!(g.detail.contains("does not exist"), "{}", g.detail);
     }
 }
