@@ -9,5 +9,4 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-nexus-delivery = { path = "../nexus-delivery" }
 nexus-platform = { path = "../nexus-platform" }

@@ -11,4 +11,3 @@ workspace = true
 [dependencies]
 nexus-domain = { path = "../nexus-domain" }
 nexus-session = { path = "../nexus-session" }
-nexus-delivery = { path = "../nexus-delivery" }

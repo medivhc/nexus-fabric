@@ -206,5 +206,13 @@
     "module": "nexus-network",
     "category": "implementation-pitfall",
     "summary": "watcher 误报对端优雅关闭为链路故障：N1Error 新增 PeerClosed(u32) 保留关闭码，pinger 透出终止错误，PeerClosed(0) 静默退出不触发 rebind（B2 深层根治）"
+  },
+  {
+    "id": "arch-cleanup-dead-code-2026-10-03",
+    "file": "entries/2026-10-03-arch-cleanup-dead-code.md",
+    "date": "2026-10-03",
+    "module": "workspace",
+    "category": "architecture-decision",
+    "summary": "架构清理：删除23个module_summary()+24个NEXUS_*_MODULE常量+8条空Cargo依赖边（proto/diagnostics/delivery占位crate保留）；删前二次grep确认零引用"
   }
 ]

@@ -12,15 +12,6 @@
 
 use nexus_domain::ProviderId;
 
-/// 稳定模块标识；业务实现应通过公开类型/trait 增量加入，而不是扩大隐式全局状态。
-pub const NEXUS_MEASUREMENT_MODULE: &str = "nexus-measurement";
-
-/// 返回模块的人类可读职责摘要。
-#[must_use]
-pub const fn module_summary() -> &'static str {
-    "定义并维护 RTT/Loss/Jitter/Throughput 等事实 Measurement（不含业务评分）。"
-}
-
 /// 单条链路事实测量快照。缺失字段为 `None`（显式未知，禁止伪造默认值）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LinkMeasurement {

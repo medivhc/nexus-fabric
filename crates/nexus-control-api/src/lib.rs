@@ -10,15 +10,6 @@
 // 前端统一入口重导出：CLI/GUI/Agent 只依赖 nexus-control-api，即可获得领域核心类型。
 pub use nexus_domain::{NexusError, ResourceId, SessionId};
 
-/// 稳定模块标识；业务实现应通过公开类型/trait 增量加入，而不是扩大隐式全局状态。
-pub const NEXUS_CONTROL_API_MODULE: &str = "nexus-control-api";
-
-/// 返回模块的人类可读职责摘要。
-#[must_use]
-pub const fn module_summary() -> &'static str {
-    "定义 CLI/GUI/Agent Client/SDK 使用的 Application Service 契约与稳定 DTO。"
-}
-
 // ---------- 控制面命令（PRODUCT §8 可观察性命令） ----------
 
 /// 控制面命令：产品 CLI/GUI/Agent 的统一入口命令。

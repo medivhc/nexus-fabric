@@ -34,11 +34,3 @@ pub mod tun_vpi;
 pub use assemble::{CleanupReport, OsAssemble, OsAssembleConfig};
 pub use secure_store::FileSecureStore;
 pub use tun_vpi::TunVpi;
-
-pub const NEXUS_PLATFORM_LINUX_MODULE: &str = "nexus-platform-linux";
-
-/// 返回模块的人类可读职责摘要。
-#[must_use]
-pub const fn module_summary() -> &'static str {
-    "实现 Linux 平台 Capability Adapter，包括 TUN、透明拦截、Mount/Filesystem、Service/Privilege 等宿主桥接。"
-}

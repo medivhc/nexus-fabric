@@ -13,7 +13,6 @@ nexus-domain = { path = "../nexus-domain" }
 nexus-policy = { path = "../nexus-policy" }
 nexus-planner = { path = "../nexus-planner" }
 nexus-session = { path = "../nexus-session" }
-nexus-delivery = { path = "../nexus-delivery" }
 nexus-dns = { path = "../nexus-dns" }
 # N1 装配：仅复用 VirtualPacketInterface trait（MODULE.md 增补边，
 # policies/architecture.toml 已同步声明）。

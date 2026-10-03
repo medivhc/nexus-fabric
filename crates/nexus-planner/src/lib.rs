@@ -30,15 +30,6 @@ use nexus_domain::{
 use nexus_measurement::LinkMeasurement;
 use nexus_registry::ProviderRecord;
 
-/// 稳定模块标识；业务实现应通过公开类型/trait 增量加入，而不是扩大隐式全局状态。
-pub const NEXUS_PLANNER_MODULE: &str = "nexus-planner";
-
-/// 返回模块的人类可读职责摘要。
-#[must_use]
-pub const fn module_summary() -> &'static str {
-    "唯一系统级 Planner：决定 Provider/Placement/Path/ExecutionStrategy 并产出 DecisionTrace。"
-}
-
 /// 能力约束键（与 nexus-policy 的 CONSTRAINT_CAPABILITY 同值；planner 不依赖 policy crate）。
 const CONSTRAINT_CAPABILITY: &str = "capability";
 
