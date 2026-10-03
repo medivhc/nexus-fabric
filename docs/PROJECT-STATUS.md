@@ -31,21 +31,21 @@ Nexus 是一个 clean-room 实现的 Rust 网络 substrate + 分布式工作空�
   `be361f9` 真机 full verify：第一轮 2 时序 flake，重跑后 **22 gate 全 PASS**，
   Evidence `3d8046e2d8da` —— **Final PASS 可宣称**
 
-### N2 P0：实现完成，评审修复中
+### N2 P0：实现完成，P0 已修复合入，P1 评审修复中
 
 - P0-0 → P0-6 全部合入 master（`84861b5`），每阶段走完
   实现 → E4 真机验证 → 独立评审 → 合 master
 - 7 条完成标志达成 6 条；第 7 条在 E4 双机环境 11/11 PASS，
   bare 单机 full verify 241/247（6 个需双机的 n2 场景失败，环境限制非代码问题）
 - **免费模型横评 Round 4**（mimo-v2.6 + space-bunny 独立评审，逐条验真）：
-  P0 必修 6 条、P1 21 条、P2 17 条 —— 修复进行中（见下）
+  P0 必修 6 条已修完合入 master；P1 21 条、P2 17 条 —— 修复进行中（见下）
 - 完整评审报告：`~/workspace/n2-p0-review-round4.md`（工作区，未入仓）
 
-当前修复轨道（`84861b5` 之后，未合 master）：
+当前修复轨道（`84861b5` 之后；P0 分支已合 master）：
 
 | 轨道 | 范围 | worktree |
 |---|---|---|
-| P0 修复（我方） | 6 条 P0（含服务端身份校验安全项） | `track-n2-p0fix` → `n2/p0-fix` |
+| P0 修复（我方） | 6 条 P0（含服务端身份校验安全项） | 已合 master（`0d46486`） |
 | P1 修复（mimo） | 21 条 P1 | `track-n2-p1-mimo` → `n2/p1-fix-mimo` |
 | P1 修复（bunny） | 21 条 P1（独立，用于对比修复质量） | `track-n2-p1-bunny` → `n2/p1-fix-bunny` |
 
