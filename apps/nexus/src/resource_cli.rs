@@ -34,9 +34,10 @@ fn now_secs() -> u64 {
     now_unix_pub()
 }
 
-fn render(out: &Value, _json_mode: bool) {
+fn render(out: &Value, _json_mode: bool) -> i32 {
     // v1: 人读输出与 JSON 同形（`--json` 语义的最小实现）。
     println!("{out}");
+    crate::verdict_exit_code(out)
 }
 
 fn store_fail(e: String) -> Value {
@@ -81,8 +82,7 @@ fn run_list(json_mode: bool) -> i32 {
     let directory = match N2Directory::open(&node_dir, now) {
         Ok(d) => d,
         Err(e) => {
-            render(&store_fail(e), json_mode);
-            return 0;
+            return render(&store_fail(e), json_mode);
         }
     };
     // 按资源聚合广告（目录视图；P0 展示全部未过期广告，可见性过滤在
@@ -115,8 +115,7 @@ fn run_list(json_mode: bool) -> i32 {
             "resources": resources,
         }),
         json_mode,
-    );
-    0
+    )
 }
 
 /// `nexus resource show <name>`：资源详情。
@@ -126,14 +125,13 @@ fn run_show(name: &str, json_mode: bool) -> i32 {
     let directory = match N2Directory::open(&node_dir, now) {
         Ok(d) => d,
         Err(e) => {
-            render(&store_fail(e), json_mode);
-            return 0;
+            return render(&store_fail(e), json_mode);
         }
     };
     let (rref, rid) = match directory.resolve(name) {
         Ok(v) => v,
         Err(e) => {
-            render(
+            return render(
                 &json!({
                     "verdict": "FAIL",
                     "error": {
@@ -143,13 +141,12 @@ fn run_show(name: &str, json_mode: bool) -> i32 {
                 }),
                 json_mode,
             );
-            return 0;
         }
     };
     let kind = directory.kind_of(name).unwrap_or(ResourceKind::Service);
     let ads = directory.registry().lookup_ads(&rid, now);
     if ads.is_empty() {
-        render(
+        return render(
             &json!({
                 "verdict": "FAIL",
                 "error": {
@@ -159,7 +156,6 @@ fn run_show(name: &str, json_mode: bool) -> i32 {
             }),
             json_mode,
         );
-        return 0;
     }
     // 首个可用广告的 provider 为"当前提供方"（`n2-resource-show` 冻结字段）。
     let primary = ads
@@ -184,8 +180,7 @@ fn run_show(name: &str, json_mode: bool) -> i32 {
             .map(|ad| ad_json(name, kind, ad))
             .collect::<Vec<_>>()
     );
-    render(&out, json_mode);
-    0
+    render(&out, json_mode)
 }
 
 /// kind 参数解析（`--kind service|network|workspace|compute|device`）。
@@ -278,11 +273,10 @@ fn run_publish(args: &[String], json_mode: bool) -> i32 {
     }
     // P1-13：有 locator 时必须至少含一个数据面端点（准入端点不能当 Service 入口）。
     if let Err(e) = validate_locators(&locators) {
-        render(
+        return render(
             &json!({"verdict":"FAIL","error":{"code":"INVALID_LOCATOR","message":e}}),
             json_mode,
         );
-        return 0;
     }
     let (Some(name), Some(kind_s)) = (name, kind) else {
         eprintln!("error: resource publish requires --name and --kind");
@@ -299,11 +293,10 @@ fn run_publish(args: &[String], json_mode: bool) -> i32 {
     let parsed_name = match ResourceName::new(&name) {
         Ok(n) => n,
         Err(e) => {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code":"INVALID_NAME","message":format!("{e:?}")}}),
                 json_mode,
             );
-            return 0;
         }
     };
 
@@ -312,19 +305,17 @@ fn run_publish(args: &[String], json_mode: bool) -> i32 {
     let store = match N2Store::open(&node_dir) {
         Ok(s) => s,
         Err(e) => {
-            render(&store_fail(e), json_mode);
-            return 0;
+            return render(&store_fail(e), json_mode);
         }
     };
     // 提供方身份：本地节点（`nexus node init` 的 NodeId；未初始化则明确报错）。
     let provider_id = match local_actor(&node_dir) {
         id if !id.is_empty() => format!("prov-{id}"),
         _ => {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code":"NO_IDENTITY","message":"node not initialized; run `nexus node init` first"}}),
                 json_mode,
             );
-            return 0;
         }
     };
     // 不透明 ResourceId（D2；`res-<name>` 确定性派生，非定位）。
@@ -347,23 +338,20 @@ fn run_publish(args: &[String], json_mode: bool) -> i32 {
     {
         let mut registry = nexus_registry::Registry::new();
         if let Err(e) = registry.publish_ad(ad.clone(), now) {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code":"PUBLISH","message":e.to_string()}}),
                 json_mode,
             );
-            return 0;
         }
     }
     if let Err(e) = store.save_ad(&ad) {
-        render(&store_fail(e), json_mode);
-        return 0;
+        return render(&store_fail(e), json_mode);
     }
     // 名字表：加载已持久化的＋本次新增合并后全量写回（`save_names` 为全量覆盖语义）。
     let mut names = match store.load_names() {
         Ok(n) => n,
         Err(e) => {
-            render(&store_fail(e), json_mode);
-            return 0;
+            return render(&store_fail(e), json_mode);
         }
     };
     names.retain(|e| !(e.workspace == rref.workspace && e.name == rref.name));
@@ -374,8 +362,7 @@ fn run_publish(args: &[String], json_mode: bool) -> i32 {
         kind: Some(kind),
     });
     if let Err(e) = store.save_names(&names) {
-        render(&store_fail(e), json_mode);
-        return 0;
+        return render(&store_fail(e), json_mode);
     }
     // 重新发布清除撤销 tombstone（幂等）。
 
@@ -403,8 +390,7 @@ fn run_publish(args: &[String], json_mode: bool) -> i32 {
             },
         }),
         json_mode,
-    );
-    0
+    )
 }
 
 /// `nexus resource revoke <name>`：撤销发布。
@@ -414,16 +400,14 @@ fn run_revoke(name: &str, json_mode: bool) -> i32 {
     let store = match N2Store::open(&node_dir) {
         Ok(s) => s,
         Err(e) => {
-            render(&store_fail(e), json_mode);
-            return 0;
+            return render(&store_fail(e), json_mode);
         }
     };
     // 先解析（撤销不存在的资源 → 明确 NOT_FOUND，不静默成功）。
     let directory = match N2Directory::open_with_store(&store, now) {
         Ok(d) => d,
         Err(e) => {
-            render(&store_fail(e), json_mode);
-            return 0;
+            return render(&store_fail(e), json_mode);
         }
     };
     // 注意：已撤销的资源 resolve 会失败；revoke 幂等——再次 revoke 仍返回
@@ -435,11 +419,10 @@ fn run_revoke(name: &str, json_mode: bool) -> i32 {
             let parsed = match ResourceName::new(name) {
                 Ok(n) => n,
                 Err(e) => {
-                    render(
+                    return render(
                         &json!({"verdict":"FAIL","error":{"code":"INVALID_NAME","message":format!("{e:?}")}}),
                         json_mode,
                     );
-                    return 0;
                 }
             };
             let rref = ResourceRef::new(WorkspaceId::new(DEFAULT_WORKSPACE), parsed);
@@ -453,8 +436,7 @@ fn run_revoke(name: &str, json_mode: bool) -> i32 {
     let (_pubkey, principal) = match ensure_auth_identity(&store) {
         Ok(v) => v,
         Err(e) => {
-            render(&store_fail(e), json_mode);
-            return 0;
+            return render(&store_fail(e), json_mode);
         }
     };
     let frame = ControlFrame::AuthRevoke {
@@ -464,11 +446,10 @@ fn run_revoke(name: &str, json_mode: bool) -> i32 {
     let frame_bytes = match encode_control_frame(&frame) {
         Ok(b) => b,
         Err(e) => {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code":"FRAME","message":e.to_string()}}),
                 json_mode,
             );
-            return 0;
         }
     };
     // 自检：编码可 roundtrip（帧格式正确性的机器证据）。
@@ -479,13 +460,11 @@ fn run_revoke(name: &str, json_mode: bool) -> i32 {
     let seq = match store.outbox_next_seq() {
         Ok(s) => s,
         Err(e) => {
-            render(&store_fail(e), json_mode);
-            return 0;
+            return render(&store_fail(e), json_mode);
         }
     };
     if let Err(e) = store.outbox_push(seq, &frame_bytes) {
-        render(&store_fail(e), json_mode);
-        return 0;
+        return render(&store_fail(e), json_mode);
     }
 
     // 2. 本地 withdraw：删除持久化广告＋tombstone（撤销后目录不可见）。
@@ -519,8 +498,7 @@ fn run_revoke(name: &str, json_mode: bool) -> i32 {
             },
         }),
         json_mode,
-    );
-    0
+    )
 }
 
 /// `nexus resource export <name> [--file <path>]`: 导出资源的持久化广告＋名字映射
@@ -563,25 +541,22 @@ fn run_export(args: &[String], json_mode: bool) -> i32 {
     let store = match N2Store::open(&node_dir) {
         Ok(s) => s,
         Err(e) => {
-            render(&store_fail(e), json_mode);
-            return 0;
+            return render(&store_fail(e), json_mode);
         }
     };
     let directory = match N2Directory::open_with_store(&store, now) {
         Ok(d) => d,
         Err(e) => {
-            render(&store_fail(e), json_mode);
-            return 0;
+            return render(&store_fail(e), json_mode);
         }
     };
     let (rref, resource_id) = match directory.resolve(&name) {
         Ok(v) => v,
         Err(e) => {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code": crate::error_code(&e), "message": e.to_string()}}),
                 json_mode,
             );
-            return 0;
         }
     };
     let kind = directory.kind_of(&name).unwrap_or(ResourceKind::Service);
@@ -594,11 +569,10 @@ fn run_export(args: &[String], json_mode: bool) -> i32 {
         .map(|ad| crate::n2_store::encode_ad(&ad))
         .collect();
     if ads.is_empty() {
-        render(
+        return render(
             &json!({"verdict":"FAIL","error":{"code":"NOT_PUBLISHED","message": format!("no persisted advertisement for '{name}'; publish it first")}}),
             json_mode,
         );
-        return 0;
     }
     let doc = json!({
         "v": 1,
@@ -612,11 +586,10 @@ fn run_export(args: &[String], json_mode: bool) -> i32 {
     let text = serde_json::to_string_pretty(&doc).unwrap_or_default();
     if let Some(path) = file {
         if let Err(e) = std::fs::write(&path, &text) {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code":"IO","message": format!("write {path}: {e}")}}),
                 json_mode,
             );
-            return 0;
         }
         render(
             &json!({"verdict":"PASS","command":"resource export","resource": name, "file": path, "ads": ads.len()}),
@@ -653,22 +626,20 @@ fn run_import(args: &[String], json_mode: bool) -> i32 {
         Some(path) => match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) => {
-                render(
+                return render(
                     &json!({"verdict":"FAIL","error":{"code":"IO","message": format!("read {path}: {e}")}}),
                     json_mode,
                 );
-                return 0;
             }
         },
         None => {
             use std::io::Read;
             let mut buf = String::new();
             if std::io::stdin().read_to_string(&mut buf).is_err() {
-                render(
+                return render(
                     &json!({"verdict":"FAIL","error":{"code":"IO","message": "read stdin"}}),
                     json_mode,
                 );
-                return 0;
             }
             buf
         }
@@ -676,21 +647,19 @@ fn run_import(args: &[String], json_mode: bool) -> i32 {
     let doc: Value = match serde_json::from_str(&text) {
         Ok(v) => v,
         Err(e) => {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code":"BAD_DOC","message": format!("parse: {e}")}}),
                 json_mode,
             );
-            return 0;
         }
     };
     let ok_kind = doc.get("kind").and_then(Value::as_str) == Some("n2-resource-export");
     let version_ok = doc.get("v").and_then(Value::as_u64) == Some(1);
     if !ok_kind || !version_ok {
-        render(
+        return render(
             &json!({"verdict":"FAIL","error":{"code":"BAD_DOC","message": "not an n2-resource-export v1 document"}}),
             json_mode,
         );
-        return 0;
     }
     let workspace = doc
         .get("workspace")
@@ -699,21 +668,19 @@ fn run_import(args: &[String], json_mode: bool) -> i32 {
     let name_s = match doc.get("name").and_then(Value::as_str) {
         Some(n) => n,
         None => {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code":"BAD_DOC","message": "missing 'name'"}}),
                 json_mode,
             );
-            return 0;
         }
     };
     let name = match ResourceName::new(name_s) {
         Ok(n) => n,
         Err(e) => {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code":"INVALID_NAME","message": format!("{e:?}")}}),
                 json_mode,
             );
-            return 0;
         }
     };
     let kind = doc
@@ -724,29 +691,26 @@ fn run_import(args: &[String], json_mode: bool) -> i32 {
     let resource_id = match doc.get("resource_id").and_then(Value::as_str) {
         Some(id) => nexus_domain::ResourceId(id.to_string()),
         None => {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code":"BAD_DOC","message": "missing 'resource_id'"}}),
                 json_mode,
             );
-            return 0;
         }
     };
     let ads_v = match doc.get("ads").and_then(Value::as_array) {
         Some(a) if !a.is_empty() => a,
         _ => {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code":"BAD_DOC","message": "missing/empty 'ads'"}}),
                 json_mode,
             );
-            return 0;
         }
     };
     let node_dir = crate::node_cli::node_dir();
     let store = match N2Store::open(&node_dir) {
         Ok(s) => s,
         Err(e) => {
-            render(&store_fail(e), json_mode);
-            return 0;
+            return render(&store_fail(e), json_mode);
         }
     };
     let mut imported = 0;
@@ -754,24 +718,21 @@ fn run_import(args: &[String], json_mode: bool) -> i32 {
         let ad = match crate::n2_store::parse_ad(ad_v) {
             Ok(a) => a,
             Err(e) => {
-                render(
+                return render(
                     &json!({"verdict":"FAIL","error":{"code":"BAD_DOC","message": format!("bad ad: {e}")}}),
                     json_mode,
                 );
-                return 0;
             }
         };
         // 一致性：广告的资源必须与文档声明一致（防错配）。
         if ad.resource != resource_id {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code":"BAD_DOC","message": "ad resource mismatch"}}),
                 json_mode,
             );
-            return 0;
         }
         if let Err(e) = store.save_ad(&ad) {
-            render(&store_fail(e), json_mode);
-            return 0;
+            return render(&store_fail(e), json_mode);
         }
         imported += 1;
     }
@@ -781,14 +742,12 @@ fn run_import(args: &[String], json_mode: bool) -> i32 {
         resource_id: resource_id.clone(),
         kind: Some(kind),
     }]) {
-        render(&store_fail(e), json_mode);
-        return 0;
+        return render(&store_fail(e), json_mode);
     }
     render(
         &json!({"verdict":"PASS","command":"resource import","resource": name_s, "ads": imported}),
         json_mode,
-    );
-    0
+    )
 }
 
 /// `nexus resource` 命令族入口。

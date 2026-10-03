@@ -17,9 +17,10 @@ use serde_json::{Value, json};
 use crate::n2_directory::{DEFAULT_WORKSPACE, N2Directory};
 use crate::n2_store::{N2Store, now_unix_pub};
 
-fn render(out: &Value, _json_mode: bool) {
+fn render(out: &Value, _json_mode: bool) -> i32 {
     // v1: 人读输出与 JSON 同形（`--json` 语义的最小实现；与 resource_cli 一致）。
     println!("{out}");
+    crate::verdict_exit_code(out)
 }
 
 fn store_fail(e: String) -> Value {
@@ -124,14 +125,8 @@ fn run_add(args: &[String], json_mode: bool) -> i32 {
     };
     let node_dir = crate::node_cli::node_dir();
     match add_grant_to(&node_dir, &name, &principal_s, &op_s, not_after) {
-        Ok(out) => {
-            render(&out, json_mode);
-            0
-        }
-        Err(fail) => {
-            render(&fail, json_mode);
-            0
-        }
+        Ok(out) => render(&out, json_mode),
+        Err(fail) => render(&fail, json_mode),
     }
 }
 
@@ -190,14 +185,8 @@ fn run_del(args: &[String], json_mode: bool) -> i32 {
     };
     let node_dir = crate::node_cli::node_dir();
     match del_grant_from(&node_dir, &name, &principal_s) {
-        Ok(out) => {
-            render(&out, json_mode);
-            0
-        }
-        Err(fail) => {
-            render(&fail, json_mode);
-            0
-        }
+        Ok(out) => render(&out, json_mode),
+        Err(fail) => render(&fail, json_mode),
     }
 }
 
@@ -224,15 +213,13 @@ fn run_list(args: &[String], json_mode: bool) -> i32 {
     let store = match N2Store::open(&node_dir) {
         Ok(s) => s,
         Err(e) => {
-            render(&store_fail(e), json_mode);
-            return 0;
+            return render(&store_fail(e), json_mode);
         }
     };
     let grants = match store.load_grants() {
         Ok(g) => g,
         Err(e) => {
-            render(&store_fail(e), json_mode);
-            return 0;
+            return render(&store_fail(e), json_mode);
         }
     };
     let items: Vec<Value> = grants
@@ -256,8 +243,7 @@ fn run_list(args: &[String], json_mode: bool) -> i32 {
     render(
         &json!({"verdict":"PASS","command":"grant list","grants": items}),
         json_mode,
-    );
-    0
+    )
 }
 
 /// `nexus grant` 命令族入口。

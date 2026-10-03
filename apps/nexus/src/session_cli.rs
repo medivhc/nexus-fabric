@@ -106,9 +106,10 @@ fn manager_error_json(e: SessionManagerError) -> Value {
     }
 }
 
-fn render(out: &Value, _json_mode: bool) {
+fn render(out: &Value, _json_mode: bool) -> i32 {
     // v1: 人读输出与 JSON 同形（`--json` 语义的最小实现）。
     println!("{out}");
+    crate::verdict_exit_code(out)
 }
 
 /// `nexus session list`。
@@ -118,11 +119,10 @@ fn run_list(json_mode: bool) -> i32 {
     let directory = match N2Directory::open(&node_dir, now) {
         Ok(d) => d,
         Err(e) => {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code":"STORE","message":e}}),
                 json_mode,
             );
-            return 0;
         }
     };
     match open_manager(&node_dir) {
@@ -139,13 +139,9 @@ fn run_list(json_mode: bool) -> i32 {
                     "sessions": sessions,
                 }),
                 json_mode,
-            );
-            0
+            )
         }
-        Err(fail) => {
-            render(&fail, json_mode);
-            0
-        }
+        Err(fail) => render(&fail, json_mode),
     }
 }
 
@@ -156,38 +152,28 @@ fn run_watch(id: &str, json_mode: bool) -> i32 {
     let directory = match N2Directory::open(&node_dir, now) {
         Ok(d) => d,
         Err(e) => {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code":"STORE","message":e}}),
                 json_mode,
             );
-            return 0;
         }
     };
     match open_manager(&node_dir) {
         Ok((_store, manager)) => {
             let sid = SessionId(id.to_string());
             match manager.attach(&sid) {
-                Ok(view) => {
-                    render(
-                        &json!({
-                            "verdict": "PASS",
-                            "command": "session watch",
-                            "session": view_json(&view, &directory),
-                        }),
-                        json_mode,
-                    );
-                    0
-                }
-                Err(e) => {
-                    render(&manager_error_json(e), json_mode);
-                    0
-                }
+                Ok(view) => render(
+                    &json!({
+                        "verdict": "PASS",
+                        "command": "session watch",
+                        "session": view_json(&view, &directory),
+                    }),
+                    json_mode,
+                ),
+                Err(e) => render(&manager_error_json(e), json_mode),
             }
         }
-        Err(fail) => {
-            render(&fail, json_mode);
-            0
-        }
+        Err(fail) => render(&fail, json_mode),
     }
 }
 
@@ -198,38 +184,28 @@ fn run_close(id: &str, json_mode: bool) -> i32 {
     let directory = match N2Directory::open(&node_dir, now) {
         Ok(d) => d,
         Err(e) => {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code":"STORE","message":e}}),
                 json_mode,
             );
-            return 0;
         }
     };
     match open_manager(&node_dir) {
         Ok((_store, mut manager)) => {
             let sid = SessionId(id.to_string());
             match manager.close(&sid, "session close: user requested") {
-                Ok(view) => {
-                    render(
-                        &json!({
-                            "verdict": "PASS",
-                            "command": "session close",
-                            "session": view_json(&view, &directory),
-                        }),
-                        json_mode,
-                    );
-                    0
-                }
-                Err(e) => {
-                    render(&manager_error_json(e), json_mode);
-                    0
-                }
+                Ok(view) => render(
+                    &json!({
+                        "verdict": "PASS",
+                        "command": "session close",
+                        "session": view_json(&view, &directory),
+                    }),
+                    json_mode,
+                ),
+                Err(e) => render(&manager_error_json(e), json_mode),
             }
         }
-        Err(fail) => {
-            render(&fail, json_mode);
-            0
-        }
+        Err(fail) => render(&fail, json_mode),
     }
 }
 
@@ -247,29 +223,22 @@ fn run_seed(id: &str, json_mode: bool) -> i32 {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
         let fail = json!({"verdict":"FAIL","error":{"code":"BAD_SESSION_ID","message":"session id must be non-empty [A-Za-z0-9_-]"}});
-        render(&fail, json_mode);
-        return 0;
+        return render(&fail, json_mode);
     }
     let node_dir = crate::node_cli::node_dir();
     match seed_session_at(&node_dir, id) {
-        Ok(()) => {
-            render(
-                &json!({
-                    "verdict": "PASS",
-                    "command": "session seed",
-                    "session": {"id": id, "phase": "active", "outcome": "Unfinished"},
-                }),
-                json_mode,
-            );
-            0
-        }
-        Err(e) => {
-            render(
-                &json!({"verdict":"FAIL","error":{"code":"STORE","message":format!("seed session: {e}")}}),
-                json_mode,
-            );
-            0
-        }
+        Ok(()) => render(
+            &json!({
+                "verdict": "PASS",
+                "command": "session seed",
+                "session": {"id": id, "phase": "active", "outcome": "Unfinished"},
+            }),
+            json_mode,
+        ),
+        Err(e) => render(
+            &json!({"verdict":"FAIL","error":{"code":"STORE","message":format!("seed session: {e}")}}),
+            json_mode,
+        ),
     }
 }
 

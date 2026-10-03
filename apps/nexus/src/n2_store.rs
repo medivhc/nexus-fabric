@@ -1173,6 +1173,51 @@ impl N2Store {
 }
 
 // ============================================================================
+// 租约过期回收（P1-21）
+// ============================================================================
+
+const LEASE_PREFIX: &str = "n2/lease/";
+
+impl N2Store {
+    /// 过期租约回收（P1-21）：删除 `expires_at_unix <= now` 的租约记录，返回
+    /// 回收条数。幂等；无该字段或记录损坏的条目跳过（不阻塞其余回收）。
+    ///
+    /// P0 事实：Session 同步 establish 后即 `Completed`，不存在需要续约的
+    /// 长连接，因此 `LEASE_RENEW` 帧在 P0 无生产者。本方法负责另一半语义
+    /// ——`n2/lease/*` 不再"只写不删"，长期运行的 provider 通过 boot/
+    /// 周期回收收敛其无界增长。
+    pub fn prune_expired_leases(&self, now: u64) -> Result<usize, String> {
+        let keys = self.kv.list().map_err(|e| format!("list leases: {e}"))?;
+        let mut pruned = 0usize;
+        for key in keys {
+            let Some(session) = key.strip_prefix(LEASE_PREFIX) else {
+                continue;
+            };
+            if session.is_empty() {
+                continue;
+            }
+            let Some(bytes) = self.kv.get(&key).map_err(|e| format!("get lease: {e}"))? else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
+                continue;
+            };
+            let expired = v
+                .get("expires_at_unix")
+                .and_then(Value::as_u64)
+                .is_some_and(|t| t <= now);
+            if expired {
+                self.kv
+                    .delete(&key)
+                    .map_err(|e| format!("delete lease: {e}"))?;
+                pruned += 1;
+            }
+        }
+        Ok(pruned)
+    }
+}
+
+// ============================================================================
 // 控制帧 outbox（revoke 触发的 AUTH_REVOKE 先落盘排队）
 // ============================================================================
 
@@ -1495,6 +1540,57 @@ mod tests {
         let items = store.outbox_list().unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0], (0, b"frame-0".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_expired_leases_removes_only_expired() {
+        // P1-21：租约不再"只写不删"——只回收 `expires_at_unix <= now` 的记录，
+        // 未过期/缺字段/非租约键全部保留（幂等）。
+        let dir = temp_dir("leaseprune");
+        let store = N2Store::open(&dir).unwrap();
+        let put = |key: &str, body: &str| {
+            store.kv().put(key, body.as_bytes()).unwrap();
+        };
+        put(
+            "n2/lease/sess-old",
+            r#"{"session":"sess-old","expires_at_unix":100}"#,
+        );
+        put(
+            "n2/lease/sess-live",
+            r#"{"session":"sess-live","expires_at_unix":9000}"#,
+        );
+        put(
+            "n2/lease/sess-missing-expiry",
+            r#"{"session":"sess-missing-expiry"}"#,
+        );
+        put("n2/lease/", "not-a-record");
+        put("n2/outbox/00000000000000000000", "outbox-frame");
+        assert_eq!(store.prune_expired_leases(1000).unwrap(), 1);
+        assert!(store.kv().get("n2/lease/sess-old").unwrap().is_none());
+        assert!(store.kv().get("n2/lease/sess-live").unwrap().is_some());
+        assert!(
+            store
+                .kv()
+                .get("n2/lease/sess-missing-expiry")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .kv()
+                .get("n2/outbox/00000000000000000000")
+                .unwrap()
+                .is_some()
+        );
+        // 幂等：重复回收无过期项 → 0。
+        assert_eq!(store.prune_expired_leases(1000).unwrap(), 0);
+        // 边界：`<= now` 到期。
+        put(
+            "n2/lease/sess-edge",
+            r#"{"session":"sess-edge","expires_at_unix":1000}"#,
+        );
+        assert_eq!(store.prune_expired_leases(1000).unwrap(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

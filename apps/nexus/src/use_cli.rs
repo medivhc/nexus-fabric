@@ -19,6 +19,10 @@
 //!   （`n2-provider-offline`，E5 真跨机时完整成立；P0 本地以前置检查覆盖形状）；
 //! - 未知资源 → `FAIL` / `NOT_FOUND`。
 //!
+//! 退出码（P1-20）：`0` = 命令已执行且 `verdict` 非 FAIL；`1` = 业务
+//! `verdict=FAIL`；`2` = 用法错误（参数不合法，不产出 JSON）。机器可读权威
+//! 始终是 `verdict` 字段，退出码只是把它如实暴露给 shell（`$?` / `set -e`）。
+//!
 //! D1 提供方侧 admission＋租约：
 //! - 本地路径（P0-4）：本命令在本地同时扮演请求方与提供方；授权通过后写入租约
 //!   记录（`n2/lease/<session-id>`）；
@@ -38,7 +42,7 @@ use nexus_registry::UnavailabilityReason;
 use nexus_session::{DEFAULT_ATTACH_WINDOW_SECS, SessionManager};
 use serde_json::{Value, json};
 
-use crate::n2_admission::{AdmissionVerdict, AdmitError, admit_session, control_locator_of};
+use crate::n2_admission::{AdmissionVerdict, admit_session, control_locator_of};
 use crate::n2_directory::{DIRECTORY_TAG, N2Directory};
 use crate::n2_identity::ensure_auth_identity;
 use crate::n2_store::{N2Store, now_unix_pub};
@@ -77,7 +81,7 @@ fn fail_json(code: &str, detail: Value) -> Value {
     })
 }
 
-fn render(out: &Value, json_mode: bool) {
+fn render(out: &Value, json_mode: bool) -> i32 {
     if json_mode {
         println!("{out}");
     } else if let Some(use_obj) = out.get("use") {
@@ -95,6 +99,7 @@ fn render(out: &Value, json_mode: bool) {
     } else {
         println!("{out}");
     }
+    crate::verdict_exit_code(out)
 }
 
 /// 四步闭环的可测试内核（`node_dir` 注入；`now_secs` 注入）。
@@ -112,6 +117,10 @@ pub fn use_resource(
     // ---- 1. resolve（D2：名字本地解析） ----
     let store = N2Store::open(node_dir)
         .map_err(|e| fail_json("STORE", json!({"message": format!("open n2 store: {e}")})))?;
+    // P1-21：`n2/lease/*` 不再"只写不删"——进入资源访问前先回收过期租约。
+    if let Err(e) = store.prune_expired_leases(now) {
+        eprintln!("nexus use: lease prune failed: {e}");
+    }
     let directory = N2Directory::open_with_store(&store, now).map_err(|e| {
         fail_json(
             "STORE",
@@ -323,9 +332,11 @@ fn use_remote(
                 }),
             ))
         }
-        Err(AdmitError::Connect(e)) => {
-            // 结构化不可达（`n2-provider-offline`）：拨号失败 → 标记广告
-            // ProviderOffline（后续 `use` 在 plan 侧即走结构化失败），非静默失败。
+        // P1-12：按语义归一——拨号不通、握手中途 RST/超时/对端提前关闭都是
+        // 同一个"provider 下线"事实：同一个 `PROVIDER_UNREACHABLE` 码 ＋ 同样
+        // 落离线状态。密码学失败、协议语义不匹配（版本/格式）与本地故障保留
+        // 独立的 `CONNECT_FAILED`（它们不代表对端下线）。
+        Err(e) if e.is_provider_unreachable() => {
             mark_provider_offline(store, provider_id, resource_id, now);
             close_attempt(manager, "provider-offline");
             Err(fail_json(
@@ -387,6 +398,28 @@ fn save_lease(store: &N2Store, lease: &SessionLease) -> Result<(), String> {
     Ok(())
 }
 
+/// 端点连通性探测（P1-9）：宣告 `access.endpoint` 前至少做一次 TCP 探测。
+///
+/// `endpoint` 形如 `127.0.0.1:8080` / `tcp://10.0.0.1:8080`（剥离 scheme 后
+/// 必须是 `SocketAddr`）。返回 `(是否可达, 不可达原因)`。
+///
+/// 结果**不**参与判定：`n2-use-loop` 冻结契约要求 `verdict=PASS`，而"会话已
+/// 建立"（准入裁定）与"数据面端点此刻可连通"是两件事——把后者作为
+/// `access.reachable` 显式暴露，PASS 不再隐含未经验证的真实访问。
+/// 探测有界（<1s），拨号失败为本机立即拒绝，不引入长挂起。
+fn probe_endpoint(endpoint: &str) -> (bool, Option<String>) {
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+    let bare = endpoint.rsplit("://").next().unwrap_or(endpoint);
+    let Ok(addr) = bare.parse::<SocketAddr>() else {
+        return (false, Some(format!("unparseable endpoint '{endpoint}'")));
+    };
+    match TcpStream::connect_timeout(&addr, Duration::from_millis(800)) {
+        Ok(_) => (true, None),
+        Err(e) => (false, Some(format!("{addr}: {e}"))),
+    }
+}
+
 /// `nexus use` 命令族入口。
 pub fn run_use(args: &[String], json_mode: bool) -> i32 {
     const USAGE: &str = "usage: nexus use <resource>";
@@ -401,8 +434,7 @@ pub fn run_use(args: &[String], json_mode: bool) -> i32 {
                 "message": "nexus use does not execute commands: command execution (`use -- <command>`) is an N3 capability; N2 `use` only establishes resource access",
             },
         });
-        render(&out, json_mode);
-        return 0;
+        return render(&out, json_mode);
     }
     let Some(name) = args.first() else {
         eprintln!("error: missing argument for use");
@@ -418,6 +450,14 @@ pub fn run_use(args: &[String], json_mode: bool) -> i32 {
     let node_dir = crate::node_cli::node_dir();
     match use_resource(&node_dir, name, now_secs()) {
         Ok((session_id, snapshot, endpoint)) => {
+            // P1-9：宣告访问入口前先探一跳（判定仍 PASS，见 `probe_endpoint`）。
+            let (reachable, probe_error) = probe_endpoint(&endpoint);
+            let mut access = serde_json::Map::new();
+            access.insert("endpoint".to_string(), json!(endpoint));
+            access.insert("reachable".to_string(), json!(reachable));
+            if let Some(e) = probe_error {
+                access.insert("probe_error".to_string(), json!(e));
+            }
             let out = json!({
                 "verdict": "PASS",
                 "command": "use",
@@ -428,18 +468,12 @@ pub fn run_use(args: &[String], json_mode: bool) -> i32 {
                     "plan_id": snapshot.plan_id.as_str(),
                     "outcome": "Completed",
                     "provider": snapshot.plan.provider_id.0,
-                    "access": {
-                        "endpoint": endpoint,
-                    },
+                    "access": Value::Object(access),
                 },
             });
-            render(&out, json_mode);
-            0
+            render(&out, json_mode)
         }
-        Err(fail) => {
-            render(&fail, json_mode);
-            0
-        }
+        Err(fail) => render(&fail, json_mode),
     }
 }
 
@@ -548,11 +582,21 @@ mod tests {
     #[test]
     fn use_with_ddash_is_unsupported() {
         // D4：`use -- <cmd>` 诚实拒绝（N3 语义）。
+        // P1-20：业务 FAIL 的退出码为 1（用法错误才是 2），`$?` 可判失败。
         let code = run_use(
             &["dev-svc".to_string(), "--".to_string(), "ls".to_string()],
             true,
         );
-        assert_eq!(code, 0);
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn verdict_exit_code_maps_fail_to_nonzero() {
+        // P1-20：`verdict` 是机器可读权威，退出码与之对齐。
+        assert_eq!(crate::verdict_exit_code(&json!({"verdict": "FAIL"})), 1);
+        assert_eq!(crate::verdict_exit_code(&json!({"verdict": "PASS"})), 0);
+        assert_eq!(crate::verdict_exit_code(&json!({"verdict": "UNKNOWN"})), 0);
+        assert_eq!(crate::verdict_exit_code(&json!({"other": 1})), 0);
     }
 
     #[test]
@@ -588,5 +632,28 @@ mod tests {
         assert_eq!(principal, Principal::from_ed25519_public_key(&pubkey));
         assert!(principal.0.starts_with("ed25519:"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_endpoint_rejects_unparseable_and_reports_refusal() {
+        // P1-9：不可解析的入口必须显式报不可达（含原因），不得静默 PASS 隐含。
+        let (ok, err) = probe_endpoint("not-an-endpoint");
+        assert!(!ok);
+        assert!(
+            err.as_deref().unwrap_or("").contains("unparseable"),
+            "{err:?}"
+        );
+        // 剥离 scheme 后按 SocketAddr 解析。
+        let (ok, _) = probe_endpoint("tcp://127.0.0.1:9999");
+        assert!(!ok);
+        // 本机未监听端口 → 拨号被拒（立即返回，非超时）。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (ok, err) = probe_endpoint(&addr.to_string());
+        assert!(ok, "{err:?}");
+        drop(listener);
+        let (ok, err) = probe_endpoint(&format!("tcp://{addr}"));
+        assert!(!ok, "端口已关闭必须报不可达");
+        assert!(err.is_some());
     }
 }

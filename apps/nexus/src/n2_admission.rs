@@ -77,9 +77,33 @@ pub enum AdmissionVerdict {
 pub enum AdmitError {
     /// 连接失败（对端下线/不可达 → 调用方映射为 ProviderOffline）。
     Connect(String),
+    /// 传输层读写失败（超时/复位/对端提前关闭 → 同样是"对端不在了"）。
     Io(String),
+    /// 协议层失败：`read …`/`write …` 前缀的是握手中断（传输），
+    /// `json:`/`bad frame len:`/`unknown verdict` 之类是协议语义不匹配。
     Protocol(String),
+    /// 密码学失败（身份/签名/密钥）——与对端是否在线无关。
     Crypto(String),
+    /// 本地故障（store/磁盘等）——与对端是否在线无关，
+    /// 绝不能据此把远端 provider 标成 ProviderOffline。
+    Local(String),
+}
+
+impl AdmitError {
+    /// P1-12：同一"provider 下线"事实的语义归一。
+    ///
+    /// 无论对端是拨号不通（`Connect`）、握手中途 RST/超时（`Io`、
+    /// `Protocol("read …")`），请求方都必须给出同一个
+    /// `PROVIDER_UNREACHABLE`＋落离线；只有密码学失败、协议语义不匹配
+    /// （版本/格式）与本地故障保留独立的 `CONNECT_FAILED`。
+    #[must_use]
+    pub fn is_provider_unreachable(&self) -> bool {
+        match self {
+            AdmitError::Connect(_) | AdmitError::Io(_) => true,
+            AdmitError::Protocol(m) => m.starts_with("read ") || m.starts_with("write "),
+            AdmitError::Crypto(_) | AdmitError::Local(_) => false,
+        }
+    }
 }
 
 impl std::fmt::Display for AdmitError {
@@ -89,6 +113,7 @@ impl std::fmt::Display for AdmitError {
             AdmitError::Io(e) => write!(f, "io: {e}"),
             AdmitError::Protocol(e) => write!(f, "protocol: {e}"),
             AdmitError::Crypto(e) => write!(f, "crypto: {e}"),
+            AdmitError::Local(e) => write!(f, "local: {e}"),
         }
     }
 }
@@ -401,8 +426,22 @@ fn write_provider_lease(
     Ok(())
 }
 
-/// 在 `bind` 上监听并顺序处理准入连接（`nexus provider serve` 用；`--once`
-/// 则只处理一条连接后返回，便于测试）。
+/// 回收过期租约（P1-21）；失败只记 stderr，不阻塞准入服务。
+fn prune_leases_now(node_dir: &std::path::Path, when: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match crate::n2_store::N2Store::open(node_dir).and_then(|store| store.prune_expired_leases(now))
+    {
+        Ok(n) if n > 0 => eprintln!("n2-admission: pruned {n} expired lease(s) at {when}"),
+        Ok(_) => {}
+        Err(e) => eprintln!("n2-admission: lease prune failed at {when}: {e}"),
+    }
+}
+
+/// 在 `bind` 上监听并处理准入连接（`nexus provider serve` 用；`--once`
+/// 则只处理一条连接后返回，便于测试）。P1-19：非 `--once` 走有界并发。
 pub fn serve_forever(bind: &str, node_dir: &std::path::Path, once: bool) -> Result<(), String> {
     let addr: SocketAddr = bind
         .parse()
@@ -421,13 +460,49 @@ pub fn serve_forever(bind: &str, node_dir: &std::path::Path, once: bool) -> Resu
         "n2-admission: serving on {bound} (node_dir={})",
         node_dir.display()
     );
+    // P1-21：§15 冷启动先 reconcile 再接受新工作——boot 即回收过期租约。
+    prune_leases_now(node_dir, "boot");
+    let mut accepted: u64 = 0;
+    // P1-19：并发处理 + 有界背压 + accept 错误退避重试。
+    // - 每连接一线程：`set_read_timeout(10s)` 的慢连接不再阻塞 accept，
+    //   否则连上不发数据即可把整个 provider 控制面拖死；
+    // - `MAX_CONCURRENT_CONN` 上满时阻塞等待最旧 worker 结束（有界，不 OOM）；
+    // - 瞬时 accept 错误（EMFILE/ECONNABORTED…）退避重试，
+    //   而不是 `?` 让整个 provider 进程退出。
+    const MAX_CONCURRENT_CONN: usize = 64;
+    let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     loop {
-        let (mut stream, _) = listener.accept().map_err(|e| format!("accept: {e}"))?;
-        let summary = serve_one_connection(&mut stream, node_dir);
-        eprintln!("{summary}");
-        if once {
-            break;
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                if once {
+                    let summary = serve_one_connection(&mut stream, node_dir);
+                    eprintln!("{summary}");
+                    break;
+                }
+                // P1-21：周期回收，长期运行不无界堆积。
+                accepted = accepted.wrapping_add(1);
+                if accepted % 64 == 0 {
+                    prune_leases_now(node_dir, "periodic");
+                }
+                workers.retain(|h| !h.is_finished());
+                if workers.len() >= MAX_CONCURRENT_CONN {
+                    let oldest = workers.remove(0);
+                    let _ = oldest.join();
+                }
+                let node_dir = node_dir.to_path_buf();
+                workers.push(std::thread::spawn(move || {
+                    let summary = serve_one_connection(&mut stream, &node_dir);
+                    eprintln!("{summary}");
+                }));
+            }
+            Err(e) => {
+                eprintln!("n2-admission: accept error: {e}; retrying in 50ms");
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
+    }
+    for w in workers {
+        let _ = w.join();
     }
     Ok(())
 }
@@ -460,7 +535,8 @@ pub fn admit_session(
         .read_exact(&mut challenge)
         .map_err(|e| AdmitError::Protocol(format!("read challenge: {e}")))?;
     // 2. 以本节点 ed25519 身份签名。
-    let store = N2Store::open(node_dir).map_err(|e| AdmitError::Io(format!("store: {e}")))?;
+    // 本地 store 故障 ≠ 对端下线（P1-12）：不得让远端被标成 ProviderOffline。
+    let store = N2Store::open(node_dir).map_err(|e| AdmitError::Local(format!("store: {e}")))?;
     let (pubkey, _) =
         ensure_auth_identity(&store).map_err(|e| AdmitError::Crypto(format!("identity: {e}")))?;
     let keypair = auth_keypair(&store).map_err(AdmitError::Crypto)?;
@@ -778,5 +854,36 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, AdmitError::Connect(_)), "{err}");
         let _ = std::fs::remove_dir_all(&dir_a);
+    }
+
+    #[test]
+    fn unreachable_classification_is_one_fact_many_surfaces() {
+        // P1-12：同一"provider 下线"事实（拨号不通、握手中途 RST/超时/对端
+        // 提前关闭）必须归一 → 调用方映射为 PROVIDER_UNREACHABLE＋落离线。
+        let unreachable = [
+            AdmitError::Connect("connection refused".into()),
+            AdmitError::Io("connection reset".into()),
+            AdmitError::Protocol("read frame len: connection reset".into()),
+            AdmitError::Protocol("read frame body: unexpected eof".into()),
+            AdmitError::Protocol("write frame: broken pipe".into()),
+            AdmitError::Protocol("read challenge: timed out".into()),
+        ];
+        for e in unreachable {
+            assert!(e.is_provider_unreachable(), "{e}");
+        }
+        // 密码学失败 / 协议语义不匹配 / 本地故障 = 三个不同事实。
+        let local_only = [
+            AdmitError::Crypto("bad signature".into()),
+            AdmitError::Protocol("bad frame len: 99999999".into()),
+            AdmitError::Protocol("json: missing field".into()),
+            AdmitError::Protocol("unknown verdict".into()),
+            AdmitError::Local("store: disk full".into()),
+        ];
+        for e in local_only {
+            assert!(!e.is_provider_unreachable(), "{e}");
+        }
+        // 本地 store 故障不得被误标为 ProviderOffline（P1-12 关键回归）。
+        let local = AdmitError::Local("store: /read-only".into());
+        assert_eq!(format!("{local}"), "local: store: /read-only");
     }
 }

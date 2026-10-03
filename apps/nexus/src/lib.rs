@@ -4194,6 +4194,18 @@ pub fn remote_host_serve_loop(
     }
 }
 
+/// 业务退出码（P1-20）：`verdict=FAIL` → 1；其余（含 PASS/UNKNOWN）→ 0。
+///
+/// 机器可读权威仍然是 `verdict` 字段（场景判定只读它，不读 `$?`）；本函数
+/// 只是让 shell 侧 `set -e` / `$?` 也能诚实反映业务失败。用法错误由各命令
+/// 自行返回 2（参数不合法，连 JSON 都不产出）。
+pub fn verdict_exit_code(out: &serde_json::Value) -> i32 {
+    match out.get("verdict").and_then(serde_json::Value::as_str) {
+        Some("FAIL") => 1,
+        _ => 0,
+    }
+}
+
 /// 把 `NexusError` 映射为稳定的 CLI 错误码（UI 层序列化用，禁止泄漏内部细节）。
 pub fn error_code(err: &NexusError) -> &'static str {
     match err {
