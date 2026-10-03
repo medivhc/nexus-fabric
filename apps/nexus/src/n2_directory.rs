@@ -493,10 +493,7 @@ mod tests {
                 provider: ProviderId("prov-loc".into()),
                 resource: ResourceId("res-loc-svc".into()),
                 capabilities: vec!["service".into()],
-                locators: vec![
-                    "n2adm://10.0.0.2:9443".into(),
-                    "tcp://10.0.0.2:8080".into(),
-                ],
+                locators: vec!["n2adm://10.0.0.2:9443".into(), "tcp://10.0.0.2:8080".into()],
                 discoverable_by: Discoverability::Public,
                 use_grants: Vec::new(),
                 unavailable: None,

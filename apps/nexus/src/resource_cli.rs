@@ -852,16 +852,20 @@ mod tests {
         // P1-13：空列表合法（静态种子 / 本机发布，场景契约）。
         assert!(validate_locators(&[]).is_ok());
         // 有数据面端点（无论顺序）→ 合法。
-        assert!(validate_locators(&[
-            "tcp://127.0.0.1:8080".to_string(),
-            "n2adm://10.0.0.2:9443".to_string(),
-        ])
-        .is_ok());
-        assert!(validate_locators(&[
-            "n2adm://10.0.0.2:9443".to_string(),
-            "tcp://127.0.0.1:8080".to_string(),
-        ])
-        .is_ok());
+        assert!(
+            validate_locators(&[
+                "tcp://127.0.0.1:8080".to_string(),
+                "n2adm://10.0.0.2:9443".to_string(),
+            ])
+            .is_ok()
+        );
+        assert!(
+            validate_locators(&[
+                "n2adm://10.0.0.2:9443".to_string(),
+                "tcp://127.0.0.1:8080".to_string(),
+            ])
+            .is_ok()
+        );
         // 只给准入端点 → 拒绝（准入端点不能当 Service 入口）。
         assert!(
             validate_locators(&["n2adm://10.0.0.2:9443".to_string()]).is_err(),

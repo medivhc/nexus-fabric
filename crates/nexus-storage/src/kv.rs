@@ -99,7 +99,14 @@ impl FileKvStore {
     ///
     /// `max_bytes` 为 0 视作未设上限。
     pub fn open_with_journal_limit(dir: &Path, max_bytes: u64) -> Result<Self, StorageError> {
-        Self::open_inner(dir, if max_bytes == 0 { None } else { Some(max_bytes) })
+        Self::open_inner(
+            dir,
+            if max_bytes == 0 {
+                None
+            } else {
+                Some(max_bytes)
+            },
+        )
     }
 
     fn open_inner(dir: &Path, journal_limit: Option<u64>) -> Result<Self, StorageError> {
@@ -128,8 +135,10 @@ impl FileKvStore {
     fn next_tmp_name(&self, tag: &str) -> PathBuf {
         let seq = self.tmp_seq.fetch_add(1, Ordering::Relaxed);
         let salt = self.tmp_salt ^ seq.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        self.dir
-            .join(format!("{TMP_PREFIX}{tag}-{}-{seq}-{salt:016x}", std::process::id()))
+        self.dir.join(format!(
+            "{TMP_PREFIX}{tag}-{}-{seq}-{salt:016x}",
+            std::process::id()
+        ))
     }
 
     /// KV 根目录。
@@ -326,10 +335,7 @@ impl FileKvStore {
             let _ = f.sync_all();
             return Err(StorageError::Io {
                 path,
-                message: format!(
-                    "partial journal write: {written}/{} bytes",
-                    record.len()
-                ),
+                message: format!("partial journal write: {written}/{} bytes", record.len()),
             });
         }
         f.sync_all().map_err(|e| StorageError::Io {
