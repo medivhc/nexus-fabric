@@ -3120,7 +3120,7 @@ TerminalOutcome（Completed/Failed/Cancelled）最多提交一次，由 Owner �
 - **D5 P0 范围**：纵深选 Service（真跨机，不许 loopback 模拟）；
   横向地基（Resource 实体、租约目录、授权/撤销、Plan/Session 持久化）一次做对；
   用架构门禁（16.4-6）而非"多做一种资源"证明泛化性。
-- **D6 认证模型**：P0 用双向身份（X25519，复用 `IdentityManager::peer_id_of`
+- **D6 认证模型**：P0 用双向身份（ed25519，复用 `IdentityManager::peer_id_of`
   内容派生 NodeId，不引入注册中心）＋本地 grant 表；
   结构化 `Deny{NoSuchGrant/WrongWorkspace/OperationNotGranted/Expired/Revoked}`，
   每次判定写审计记录；principal 由握手密钥派生、不接受请求方自称；
