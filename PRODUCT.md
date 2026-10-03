@@ -3158,5 +3158,5 @@ gRPC/tonic；DHT；OIDC；mDNS/LSA 的 Provider 广播（static 先行）；
 
 **冻结边界**：P0-1 之后的业务代码一律不在本节实现；`nexus run` 诚实化是
 唯一已批准的 requirement-change（D4，单独提交、可回滚）。
-**契约 hash**：`e5a98fb8e7109928bb044ad10e411b09992a730ab6bc0818f1aabf63425ec2e3`（计算方法：SHA-256 over §16 节文本自
-`## 16.` 至本行之前，排除本行）。
+**契约 hash**：`46c78633409b17eeb26dd3edb1e443aaf914b1bd2c8c3d1497a092de1c90b92f`（计算方法：SHA-256 over §16 节文本自
+`## 16.` 至本行起始偏移减 1，即不含本行及其前的换行；起点/终点均按 UTF-8 字节偏移，排除本行与后续所有行）。
