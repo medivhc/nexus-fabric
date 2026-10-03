@@ -10,18 +10,15 @@
 //! 全部进程内 N2 存储操作，不经过 daemon。
 
 use nexus_auth::{Grant, Principal};
-use nexus_domain::{ResourceName, ResourceOperation, ResourceRef, WorkspaceId};
+use nexus_domain::{ResourceName, ResourceOperation, ResourceRef};
 use serde_json::{Value, json};
 
 use crate::n2_directory::{DEFAULT_WORKSPACE, N2Directory};
 use crate::n2_store::{N2Store, now_unix_pub};
 
-fn render(out: &Value, json_mode: bool) {
-    if json_mode {
-        println!("{out}");
-    } else {
-        println!("{out}");
-    }
+fn render(out: &Value, _json_mode: bool) {
+    // v1: 人读输出与 JSON 同形（`--json` 语义的最小实现；与 resource_cli 一致）。
+    println!("{out}");
 }
 
 fn store_fail(e: String) -> Value {
@@ -37,7 +34,7 @@ fn parse_op(s: &str) -> Option<ResourceOperation> {
 }
 
 fn resolve_rref(store: &N2Store, name: &str, now: u64) -> Result<ResourceRef, Value> {
-    let directory = N2Directory::open_with_store(store, now).map_err(|e| store_fail(e))?;
+    let directory = N2Directory::open_with_store(store, now).map_err(store_fail)?;
     let (rref, _) = directory.resolve(name).map_err(|e| {
         json!({"verdict":"FAIL","error":{"code": crate::error_code(&e), "message": e.to_string()}})
     })?;
@@ -281,7 +278,7 @@ pub fn run_grant(args: &[String], json_mode: bool) -> i32 {
 mod tests {
     use super::*;
     use crate::n2_store::NameEntry;
-    use nexus_domain::{ProviderId, ResourceId};
+    use nexus_domain::{ProviderId, ResourceId, WorkspaceId};
     use nexus_registry::{Discoverability, ProviderAdvertisement};
 
     fn temp_node_dir(tag: &str) -> std::path::PathBuf {

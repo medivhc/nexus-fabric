@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use nexus_auth::{AuthRequest, GrantTable, Principal};
-use nexus_domain::{ProviderId, ResourceId, ResourceOperation, ResourceRef, WorkspaceId};
+use nexus_domain::{ResourceId, ResourceOperation, ResourceRef, WorkspaceId};
 use nexus_registry::ProviderAdvertisement;
 use ring::signature::UnparsedPublicKey;
 
@@ -519,7 +519,7 @@ pub fn local_provider_id(node_dir: &std::path::Path) -> String {
 mod tests {
     use super::*;
     use nexus_auth::{Grant, Principal};
-    use nexus_domain::{ResourceName, WorkspaceId};
+    use nexus_domain::{ProviderId, ResourceName, WorkspaceId};
     use std::sync::mpsc;
 
     fn temp_node_dir(tag: &str) -> std::path::PathBuf {
