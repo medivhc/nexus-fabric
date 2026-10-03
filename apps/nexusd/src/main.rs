@@ -60,7 +60,6 @@ fn publish_tun_enabled(enabled: bool) {
 }
 
 /// 周期性子线程：提交断开超窗会话的终态（P1-2 / D7：断开≠Failed，窗口外→Cancelled）。
-///
 /// §13 结构化并发：Owner 是 `N2_SESSION_MANAGER` 里的唯一 SessionManager；
 /// 子线程只调用 `sweep_detached`（Owner 状态机写入），`shutdown` 置位后退出。
 fn spawn_n2_session_sweeper(shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
@@ -100,6 +99,30 @@ fn spawn_n2_session_sweeper(shutdown: &std::sync::Arc<std::sync::atomic::AtomicB
         })
         .map(|_| ())
         .unwrap_or_else(|e| eprintln!("[nexusd] WARN: N2 session sweeper spawn failed: {e}"));
+}
+
+/// 幂等地装配 daemon 内唯一 N2 SessionManager（P1-1）。
+///
+/// `OnceLock::set` 只成功一次，因此 `run_daemon` 与 `serve` 两条入口都调用
+/// 它也不会出现第二个 manager——这正是 D1 要求的"唯一"。
+fn ensure_n2_session_manager() {
+    if N2_SESSION_MANAGER.get().is_some() {
+        return;
+    }
+    let root = nexus::node_cli::node_dir();
+    match assembly::assemble_n2_session_manager(&root) {
+        Ok(mgr) => {
+            eprintln!(
+                "[nexusd] N2 SessionManager assembled ({} sessions loaded)",
+                mgr.len()
+            );
+            let _ = N2_SESSION_MANAGER.set(std::sync::Mutex::new(Some(mgr)));
+        }
+        Err(e) => {
+            eprintln!("[nexusd] WARN: N2 SessionManager assembly failed: {e} (degraded)");
+            let _ = N2_SESSION_MANAGER.set(std::sync::Mutex::new(None));
+        }
+    }
 }
 
 /// 当前 unix 秒（daemon 侧时钟；reconcile/sweep 用）。
@@ -420,21 +443,9 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     // 不再一律判 Failed）→ 接受新工作。SessionManager 是 Session 生命周期的
     // 唯一 Owner（§13 结构化并发）；提供方侧只做 admission＋租约，不做第二个
     // 领域 Session。
-    match assembly::assemble_n2_session_manager(&dir.root) {
-        Ok(mgr) => {
-            eprintln!(
-                "[nexusd] N2 SessionManager assembled ({} sessions loaded)",
-                mgr.len()
-            );
-            // 真正持有实例（D1 落地）＋周期性 sweep_detached（P1-2）。
-            let _ = N2_SESSION_MANAGER.set(std::sync::Mutex::new(Some(mgr)));
-            spawn_n2_session_sweeper(&shutdown);
-        }
-        Err(e) => {
-            eprintln!("[nexusd] WARN: N2 SessionManager assembly failed: {e} (degraded)");
-            let _ = N2_SESSION_MANAGER.set(std::sync::Mutex::new(None));
-        }
-    }
+    // 真正持有实例（D1 落地）＋周期性 sweep_detached（P1-2）。
+    ensure_n2_session_manager();
+    spawn_n2_session_sweeper(&shutdown);
 
     // T3：缺 proxy.yaml 且缺 network.toml 且缺 workspace.toml → 拒绝启动（无意义）。
     if loaded.proxy_yaml.is_none()
@@ -779,6 +790,10 @@ fn parse_flags(args: &[String]) -> std::collections::HashMap<String, Option<Stri
 /// serve 子命令（内部/历史兼容）：常驻 LocalAPI。
 fn serve_resource(args: &[String]) -> ExitCode {
     let flags = parse_flags(args);
+    // P1-1：`serve` 形态也必须持有 daemon 内唯一的 N2 SessionManager，否则
+    // `/localapi/v0/n2/session/*` 会报 N2_UNAVAILABLE（D1 只在 `run_daemon`
+    // 路径装配）。token 与 N2 存储同源于 node_dir，这里沿用同一口径。
+    ensure_n2_session_manager();
     match flags.get("--addr").and_then(|v| v.as_deref()) {
         Some(raw) => serve_over_tcp(raw),
         None => match flags.get("--socket").and_then(|v| v.as_deref()) {
