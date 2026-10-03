@@ -47,9 +47,11 @@ fn view_json(view: &SessionView, dir: &N2Directory) -> Value {
         obj["failure"] = json!(format!("{e:?}"));
     }
     // 历史 DecisionTrace（完成标志 #3；内嵌快照，非重算）。
+    // `plan_snapshot.decision_trace` 为场景契约字段路径（n2-session-watch）；
+    // `trace` 保留作兼容。
     if let Some(snap) = &view.plan_snapshot {
         obj["plan_id"] = json!(snap.plan_id.as_str());
-        obj["trace"] = json!({
+        let trace = json!({
             "selected": snap.decision_trace.selected.0,
             "considered": snap.decision_trace.considered.iter().map(|c| json!({
                 "provider": c.provider.0,
@@ -57,6 +59,11 @@ fn view_json(view: &SessionView, dir: &N2Directory) -> Value {
                 "score": c.score,
             })).collect::<Vec<_>>(),
         });
+        obj["plan_snapshot"] = json!({
+            "plan_id": snap.plan_id.as_str(),
+            "decision_trace": trace,
+        });
+        obj["trace"] = trace;
     }
     obj
 }
