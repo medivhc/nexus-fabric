@@ -170,7 +170,9 @@ pub struct AuditRecord {
 /// ——P0-4 经 `FileKvStore::journal_append` 落盘，为两个独立变化维度）。
 pub trait AuditSink {
     /// 记录一次判定（exactly-once；实现必须同步落盘或同步入队）。
-    fn record(&mut self, record: AuditRecord);
+    ///
+    /// P0-5：返回落盘结果，调用方必须据此设置 `audit_written`（禁硬编码 true）。
+    fn record(&mut self, record: AuditRecord) -> Result<(), String>;
 }
 
 /// 内存审计槽（测试 / 嵌入式调用方）。
@@ -187,8 +189,9 @@ impl VecAuditSink {
 }
 
 impl AuditSink for VecAuditSink {
-    fn record(&mut self, record: AuditRecord) {
+    fn record(&mut self, record: AuditRecord) -> Result<(), String> {
         self.records.push(record);
+        Ok(())
     }
 }
 
@@ -196,6 +199,14 @@ impl AuditSink for VecAuditSink {
 #[derive(Debug, Default)]
 pub struct GrantTable {
     grants: Vec<Grant>,
+}
+
+/// 授权判定结果＋审计落盘状态（P0-5：`audit_written` 必须反映真实落盘，
+/// 禁硬编码 true）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthOutcome {
+    pub decision: AuthorizationDecision,
+    pub audit_written: bool,
 }
 
 impl GrantTable {
@@ -241,23 +252,29 @@ impl GrantTable {
     /// 5. operation ∉ grant.operations → `OperationNotGranted`；
     /// 6. 否则 `Allow`。
     ///
-    /// 无论 Allow/Deny 都向 `sink` 写 exactly-once 审计记录。
+    /// 无论 Allow/Deny 都向 `sink` 写 exactly-once 审计记录；`audit_written`
+    /// 为该记录的真实落盘结果（P0-5）。
     pub fn authorize(
         &self,
         req: &AuthRequest,
         now_unix: u64,
         sink: &mut dyn AuditSink,
-    ) -> AuthorizationDecision {
+    ) -> AuthOutcome {
         let decision = self.decide(req, now_unix);
-        sink.record(AuditRecord {
-            at_unix: now_unix,
-            workspace: req.workspace.clone(),
-            resource: req.resource.clone(),
-            principal: req.principal.clone(),
-            operation: req.operation,
-            decision: decision.clone(),
-        });
-        decision
+        let audit_written = sink
+            .record(AuditRecord {
+                at_unix: now_unix,
+                workspace: req.workspace.clone(),
+                resource: req.resource.clone(),
+                principal: req.principal.clone(),
+                operation: req.operation,
+                decision: decision.clone(),
+            })
+            .is_ok();
+        AuthOutcome {
+            decision,
+            audit_written,
+        }
     }
 
     fn decide(&self, req: &AuthRequest, now_unix: u64) -> AuthorizationDecision {
@@ -333,6 +350,18 @@ impl TrustStore {
     pub fn trust(&mut self, node_id: NodeId, public_key: Vec<u8>) {
         self.peers.insert(node_id.0, public_key);
     }
+
+    /// 导出全部信任记录（持久化用；P0-4）。
+    #[must_use]
+    pub fn peers(&self) -> &HashMap<String, Vec<u8>> {
+        &self.peers
+    }
+
+    /// 从持久化数据恢复（P0-4；空 map = 新建）。
+    #[must_use]
+    pub fn from_peers(peers: HashMap<String, Vec<u8>>) -> Self {
+        Self { peers }
+    }
 }
 
 #[cfg(test)]
@@ -384,12 +413,12 @@ mod tests {
             None,
         ));
         let mut sink = VecAuditSink::new();
-        let d = table.authorize(
+        let outcome = table.authorize(
             &req("default", "svc", p.clone(), ResourceOperation::Use),
             1000,
             &mut sink,
         );
-        assert_eq!(d, AuthorizationDecision::Allow);
+        assert_eq!(outcome.decision, AuthorizationDecision::Allow);
         assert_eq!(sink.records.len(), 1);
         let rec = &sink.records[0];
         assert_eq!(rec.decision, AuthorizationDecision::Allow);
@@ -401,12 +430,15 @@ mod tests {
     fn authorize_no_such_grant() {
         let table = GrantTable::new();
         let mut sink = VecAuditSink::new();
-        let d = table.authorize(
+        let outcome = table.authorize(
             &req("default", "svc", principal(9), ResourceOperation::Use),
             1000,
             &mut sink,
         );
-        assert_eq!(d, AuthorizationDecision::Deny(DenyReason::NoSuchGrant));
+        assert_eq!(
+            outcome.decision,
+            AuthorizationDecision::Deny(DenyReason::NoSuchGrant)
+        );
         assert_eq!(sink.records.len(), 1);
         assert_eq!(
             sink.records[0].decision,
@@ -428,9 +460,9 @@ mod tests {
         // 请求 workspace 与 grant 的 workspace 不一致。
         let mut r = req("ws-a", "svc", p, ResourceOperation::Use);
         r.workspace = wid("ws-b");
-        let d = table.authorize(&r, 1000, &mut sink);
+        let outcome = table.authorize(&r, 1000, &mut sink);
         assert!(matches!(
-            d,
+            outcome.decision,
             AuthorizationDecision::Deny(DenyReason::WrongWorkspace { .. })
         ));
         assert_eq!(sink.records.len(), 1);
@@ -447,30 +479,33 @@ mod tests {
             Some(100),
         ));
         let mut sink = VecAuditSink::new();
-        let d = table.authorize(
+        let outcome = table.authorize(
             &req("default", "svc", p.clone(), ResourceOperation::Use),
             200,
             &mut sink,
         );
         assert!(matches!(
-            d,
+            outcome.decision,
             AuthorizationDecision::Deny(DenyReason::Expired { .. })
         ));
         // 未过期则放行。
-        let d = table.authorize(
+        let outcome = table.authorize(
             &req("default", "svc", p.clone(), ResourceOperation::Use),
             50,
             &mut sink,
         );
-        assert_eq!(d, AuthorizationDecision::Allow);
+        assert_eq!(outcome.decision, AuthorizationDecision::Allow);
         // 显式撤销后为 Revoked（非 NoSuchGrant）。
         assert!(table.revoke(&rref("default", "svc"), &p));
-        let d = table.authorize(
+        let outcome = table.authorize(
             &req("default", "svc", p, ResourceOperation::Use),
             50,
             &mut sink,
         );
-        assert_eq!(d, AuthorizationDecision::Deny(DenyReason::Revoked));
+        assert_eq!(
+            outcome.decision,
+            AuthorizationDecision::Deny(DenyReason::Revoked)
+        );
         assert_eq!(sink.records.len(), 3);
     }
 
@@ -485,13 +520,13 @@ mod tests {
             None,
         ));
         let mut sink = VecAuditSink::new();
-        let d = table.authorize(
+        let outcome = table.authorize(
             &req("default", "svc", p, ResourceOperation::Manage),
             1000,
             &mut sink,
         );
         assert_eq!(
-            d,
+            outcome.decision,
             AuthorizationDecision::Deny(DenyReason::OperationNotGranted {
                 operation: ResourceOperation::Manage
             })
@@ -516,13 +551,13 @@ mod tests {
         ));
         let mut sink = VecAuditSink::new();
         // 旧 operations 被覆盖：Use 不再被授予。
-        let d = table.authorize(
+        let outcome = table.authorize(
             &req("default", "svc", p, ResourceOperation::Use),
             1000,
             &mut sink,
         );
         assert!(matches!(
-            d,
+            outcome.decision,
             AuthorizationDecision::Deny(DenyReason::OperationNotGranted { .. })
         ));
     }

@@ -82,6 +82,12 @@ pub(crate) fn add_grant_to(
     }))
 }
 
+/// 解析 `--not-after`（P0-6）：非法值必须报错，禁静默降级为永不过期。
+fn parse_not_after(s: &str) -> Result<u64, String> {
+    s.parse::<u64>()
+        .map_err(|_| format!("bad --not-after '{s}': expected unix timestamp (u64)"))
+}
+
 /// `nexus grant add --resource <name> --principal <p> --op <op> [--not-after <unix>]`
 fn run_add(args: &[String], json_mode: bool) -> i32 {
     const USAGE: &str = "usage: nexus grant add --resource <name> --principal <ed25519:...> --op <Use|Manage> [--not-after <unix>]";
@@ -106,7 +112,28 @@ fn run_add(args: &[String], json_mode: bool) -> i32 {
             }
             "--not-after" => {
                 i += 1;
-                not_after = args.get(i).and_then(|s| s.parse::<u64>().ok());
+                match args.get(i) {
+                    // P0-6 修：解析失败必须报错退出，禁 `.ok()` 静默降级为
+                    // `None`（= 永不过期）：笔误会把限时授权变成永久授权。
+                    Some(s) => match parse_not_after(s) {
+                        Ok(ts) => not_after = Some(ts),
+                        Err(msg) => {
+                            if json_mode {
+                                println!(
+                                    "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INVALID_TIMESTAMP\",\"message\":\"{msg}\"}}}}"
+                                );
+                            } else {
+                                eprintln!("error: {msg}");
+                            }
+                            return 0;
+                        }
+                    },
+                    None => {
+                        eprintln!("error: --not-after requires a value");
+                        eprintln!("{USAGE}");
+                        return 2;
+                    }
+                }
             }
             other => {
                 eprintln!("error: unexpected argument for grant add: {other}");
@@ -349,5 +376,17 @@ mod tests {
         let err = add_grant_to(&dir, "svc-g", "ed25519:abc", "Execute", None).unwrap_err();
         assert_eq!(err["error"]["code"], json!("INVALID_OP"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn not_after_invalid_is_rejected_not_permanent() {
+        // P0-6 回归：`--not-after` 非法值必须报错，禁静默降级为永不过期。
+        assert!(parse_not_after("tomorrow").is_err());
+        assert!(parse_not_after("2026-10-04").is_err());
+        assert!(parse_not_after("-1").is_err());
+        assert!(parse_not_after("").is_err());
+        assert!(parse_not_after("12.5").is_err());
+        assert_eq!(parse_not_after("1893456000").unwrap(), 1893456000);
+        assert_eq!(parse_not_after("0").unwrap(), 0);
     }
 }

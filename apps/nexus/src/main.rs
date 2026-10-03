@@ -83,6 +83,8 @@ nexus — Nexus 统一 Resource Fabric 控制面 CLI（瘦客户端）
   pair invite|join|list|remove --dir <config-dir>
                                         设备配对（D7；带外配对码 + ed25519 签名）
   node init [--force]                   生成本节点 X25519 身份（NodeId 内容派生，N2 P0-1）
+  node trust --provider <id> --pubkey <hex>
+                                        显式信任提供方 ed25519 身份（D6 TOFU，N2 P0-4）
   help / --help                           显示本帮助
 
 前置条件:

@@ -324,26 +324,21 @@ fn run_publish(args: &[String], json_mode: bool) -> i32 {
         render(&store_fail(e), json_mode);
         return 0;
     }
-    // 名字表：加载已持久化的＋本次新增合并后全量写回（`save_names` 为全量覆盖语义）。
-    let mut names = match store.load_names() {
-        Ok(n) => n,
-        Err(e) => {
-            render(&store_fail(e), json_mode);
-            return 0;
-        }
-    };
-    names.retain(|e| !(e.workspace == rref.workspace && e.name == rref.name));
-    names.push(NameEntry {
+    // 名字表 upsert（P0-1：`save_names` 为全量覆盖语义，走 load→合并→写回）。
+    if let Err(e) = store.upsert_name(NameEntry {
         workspace: rref.workspace.clone(),
         name: rref.name.clone(),
         resource_id: resource_id.clone(),
         kind: Some(kind),
-    });
-    if let Err(e) = store.save_names(&names) {
+    }) {
         render(&store_fail(e), json_mode);
         return 0;
     }
-    // 重新发布清除撤销 tombstone（幂等）。
+    // 重新发布清除撤销 tombstone（幂等；P0-3）。
+    if let Err(e) = store.clear_revoked(&rref.workspace.0, rref.name.as_str()) {
+        render(&store_fail(e), json_mode);
+        return 0;
+    }
 
     // 目录审计（P0-2 评审遗留）。
     record_directory_audit(
@@ -454,14 +449,36 @@ fn run_revoke(name: &str, json_mode: bool) -> i32 {
         return 0;
     }
 
-    // 2. 本地 withdraw：删除持久化广告＋tombstone（撤销后目录不可见）。
+    // 2. 本地 withdraw：删除持久化广告＋名字表条目＋tombstone（P0-3 修：
+    // 之前只删广告：静态种子在内存 Registry 每次 open 重现，且输出恒
+    // revoked=true；现在 tombstone 让撤销真实生效）。
     let mut withdrawn_any = false;
     for ad in directory.registry().lookup_ads(&resource_id, now) {
         if store.delete_ad(&ad.provider, &resource_id).unwrap_or(false) {
             withdrawn_any = true;
         }
     }
-    // 从持久化名字表/广告删除（静态种子如有则自然重现，无需 tombstone）。
+    // P0-3 修：之前漏删持久化名字表（resolve 仍命中）。
+    let names = match store.load_names() {
+        Ok(n) => n,
+        Err(e) => {
+            render(&store_fail(e), json_mode);
+            return 0;
+        }
+    };
+    let kept: Vec<NameEntry> = names
+        .into_iter()
+        .filter(|e| !(e.workspace.0 == DEFAULT_WORKSPACE && e.name.as_str() == name))
+        .collect();
+    if let Err(e) = store.save_names(&kept) {
+        render(&store_fail(e), json_mode);
+        return 0;
+    }
+    // P0-3 修：写撤销 tombstone（静态种子不再"自然重现"；重 publish 可清除）。
+    if let Err(e) = store.mark_revoked(DEFAULT_WORKSPACE, name) {
+        render(&store_fail(e), json_mode);
+        return 0;
+    }
 
     // 3. 目录审计（P0-2 评审遗留）。
     record_directory_audit(
@@ -475,13 +492,18 @@ fn run_revoke(name: &str, json_mode: bool) -> i32 {
             detail: format!("revoke {name} (withdrawn_ads={withdrawn_any}, outbox_seq={seq})"),
         },
     );
+    // P0-3 修：`revoked` 反映真实状态——重新打开目录确认该名字已不可解析。
+    // （tombstone 生效时种子也不再重现；若仍可解析则为实现 bug，诚实上报。）
+    let actually_gone = N2Directory::open_with_store(&store, now)
+        .map(|d| d.resolve(name).is_err())
+        .unwrap_or(false);
     render(
         &json!({
-            "verdict": "PASS",
+            "verdict": if actually_gone { "PASS" } else { "FAIL" },
             "command": "resource revoke",
             "resource": {
                 "name": name,
-                "revoked": true,
+                "revoked": actually_gone,
             },
         }),
         json_mode,
@@ -741,12 +763,13 @@ fn run_import(args: &[String], json_mode: bool) -> i32 {
         }
         imported += 1;
     }
-    if let Err(e) = store.save_names(&[NameEntry {
+    // P0-1 修：经 `upsert_name`（load→合并→写回），禁止直接 save 单条。
+    if let Err(e) = store.upsert_name(NameEntry {
         workspace: WorkspaceId::new(workspace),
         name: name.clone(),
         resource_id: resource_id.clone(),
         kind: Some(kind),
-    }]) {
+    }) {
         render(&store_fail(e), json_mode);
         return 0;
     }

@@ -16,7 +16,10 @@ use std::path::PathBuf;
 
 use nexus_connectivity::encryption::KeyPair;
 use nexus_connectivity::identity::IdentityManager;
+use nexus_domain::NodeId;
 use nexus_storage::FileKvStore;
+
+use crate::n2_store::N2Store;
 
 /// 节点身份记录键（FileKvStore）。
 const IDENTITY_KEY: &str = "node/identity";
@@ -52,8 +55,11 @@ fn now_unix() -> u64 {
 pub fn run_node(args: &[String], json_mode: bool) -> i32 {
     match args.first().map(String::as_str) {
         Some("init") => node_init(&args[1..], json_mode),
+        Some("trust") => node_trust(&args[1..], json_mode),
         _ => {
-            eprintln!("error: unknown node subcommand (expected: init [--force])");
+            eprintln!(
+                "error: unknown node subcommand (expected: init [--force] | trust --provider <id> --pubkey <hex>)"
+            );
             2
         }
     }
@@ -91,6 +97,107 @@ fn node_init(args: &[String], json_mode: bool) -> i32 {
 /// 生成/加载节点身份。返回 `(node_id, fresh)`，`fresh=false` 表示已存在（幂等）。
 fn init_node(force: bool) -> Result<(String, bool), String> {
     init_node_at(&node_dir(), force)
+}
+
+/// `nexus node trust --provider <provider-id> --pubkey <hex64>`（P0-4）。
+///
+/// 显式信任提供方身份（D6 TOFU 显式化）：把 `provider_id → ed25519 公钥`
+/// 记入信任表。`nexus use` 跨机准入时校验服务端身份就查这张表；
+/// 未信任的提供方在 `--json` 下直接 `UNTRUSTED_PROVIDER` 失败，
+/// 交互模式下提示用户确认指纹。
+fn node_trust(args: &[String], json_mode: bool) -> i32 {
+    const USAGE: &str = "usage: nexus node trust --provider <provider-id> --pubkey <hex64>";
+    let mut provider: Option<String> = None;
+    let mut pubkey_hex: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--provider" => {
+                i += 1;
+                provider = args.get(i).cloned();
+            }
+            "--pubkey" => {
+                i += 1;
+                pubkey_hex = args.get(i).cloned();
+            }
+            other => {
+                eprintln!("error: unexpected argument for node trust: {other}");
+                eprintln!("{USAGE}");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+    let (Some(provider), Some(pubkey_hex)) = (provider, pubkey_hex) else {
+        eprintln!("error: node trust requires --provider and --pubkey");
+        eprintln!("{USAGE}");
+        return 2;
+    };
+    // 校验公钥格式（64 hex 字符＝32 字节 ed25519 公钥）。
+    let pk: Vec<u8> = if pubkey_hex.len() == 64 && pubkey_hex.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        (0..32)
+            .map(|j| u8::from_str_radix(&pubkey_hex[j * 2..j * 2 + 2], 16).unwrap_or(0))
+            .collect()
+    } else {
+        let msg = "bad --pubkey: expected 64 hex chars (ed25519 public key)";
+        if json_mode {
+            println!(
+                "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"BAD_PUBKEY\",\"message\":\"{msg}\"}}}}"
+            );
+        } else {
+            eprintln!("error: {msg}");
+        }
+        return 0;
+    };
+    let store = match N2Store::open(&node_dir()) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("open n2 store: {e}");
+            if json_mode {
+                println!(
+                    "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"STORE\",\"message\":\"{msg}\"}}}}"
+                );
+            } else {
+                eprintln!("error: {msg}");
+            }
+            return 0;
+        }
+    };
+    let mut ts = match store.load_trust_store() {
+        Ok(t) => t,
+        Err(e) => {
+            let msg = format!("load trust store: {e}");
+            if json_mode {
+                println!(
+                    "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"STORE\",\"message\":\"{msg}\"}}}}"
+                );
+            } else {
+                eprintln!("error: {msg}");
+            }
+            return 0;
+        }
+    };
+    ts.trust(NodeId(provider.clone()), pk);
+    if let Err(e) = store.save_trust_store(&ts) {
+        let msg = format!("save trust store: {e}");
+        if json_mode {
+            println!(
+                "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"STORE\",\"message\":\"{msg}\"}}}}"
+            );
+        } else {
+            eprintln!("error: {msg}");
+        }
+        return 0;
+    }
+    if json_mode {
+        println!(
+            "{{\"verdict\":\"PASS\",\"command\":\"node trust\",\"provider\":\"{provider}\",\"trusted\":true}}"
+        );
+    } else {
+        println!("trusted provider {provider}");
+    }
+    0
 }
 
 /// `init_node` 的可测试内核：目录由调用方注入（测试不碰进程环境）。
