@@ -27,7 +27,9 @@ pub const TUN_DEVICE: &str = "/dev/net/tun";
 pub const IFNAMSIZ: usize = 16;
 
 unsafe extern "C" {
-    fn open(pathname: *const c_char, flags: c_int) -> c_int;
+    // `open(2)` 实为 variadic（`int open(const char *, int, ...)`）；
+    // 声明需带 `...` 以匹配标准符号签名（rustc 1.99 `invalid_runtime_symbol_definitions`）。
+    fn open(pathname: *const c_char, flags: c_int, ...) -> c_int;
     fn close(fd: c_int) -> c_int;
     fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
     fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
