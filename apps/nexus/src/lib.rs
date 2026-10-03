@@ -8160,7 +8160,7 @@ pub fn tun_proxy_flow() -> Result<Value, NexusError> {
         let mut buf = [0u8; 2048];
         // drain：MemoryVpi 一次读回已注入的整包（真实 wintun 亦一包一收）。
         loop {
-            let n = vpi.receive(&mut buf).map_err(&internal_err)?;
+            let n = vpi.receive(&mut buf).map_err(internal_err)?;
             if n == 0 {
                 break;
             }
