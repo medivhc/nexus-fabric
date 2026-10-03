@@ -22,6 +22,8 @@ pub mod mesh;
 /// `nexus network` 命令族（M6）：N1 Universal Connectivity 前台装配
 ///（Composition Root：n1 portable core + fabric/path/discovery/platform-linux）。
 pub mod network;
+/// `nexus node` 命令族（N2 P0-1）：节点身份管理（X25519 + NodeId 内容派生）。
+pub mod node_cli;
 /// §9 可观察性命令（status / plan explain / session watch / connectivity status /
 /// dns status / dns cache / platform capabilities），见 PRODUCT.md#9-observability。
 pub mod observability;
@@ -4182,6 +4184,9 @@ pub fn error_code(err: &NexusError) -> &'static str {
         NexusError::WorkspaceCommitRejected { .. } => "WORKSPACE_REJECTED",
         NexusError::PlatformCapabilityUnavailable { .. } => "CAPABILITY_UNAVAILABLE",
         NexusError::SessionFailed { .. } => "SESSION_FAILED",
+        NexusError::NotFound { .. } => "NOT_FOUND",
+        NexusError::NodeIdentityUnavailable { .. } => "NODE_IDENTITY_UNAVAILABLE",
+        NexusError::PersistenceFailed { .. } => "PERSISTENCE_FAILED",
         NexusError::Unsupported { .. } => "UNSUPPORTED",
         NexusError::Internal { .. } => "INTERNAL",
     }

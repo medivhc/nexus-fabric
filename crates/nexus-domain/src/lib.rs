@@ -23,6 +23,255 @@ pub struct ProviderId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionId(pub String);
 
+/// Workspace 标识（N2 §16.1：资源引用的命名空间维度）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WorkspaceId(pub String);
+
+impl WorkspaceId {
+    /// 构造（非空校验由调用方保证；空串视为未命名 workspace 由上层拒绝）。
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+}
+
+impl fmt::Display for WorkspaceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Node 标识（N2 §16.1：节点身份）。
+///
+/// 内容派生：`IdentityManager::peer_id_of`（`nexus-connectivity::identity`），即
+/// `hex(SHA-256(X25519 static 公钥)[..16])`；不引入注册中心（D6）。
+/// NodeId 是身份（Identity），不是定位（Locator）：同一节点换地址 NodeId 不变。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NodeId(pub String);
+
+impl NodeId {
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+}
+
+impl fmt::Display for NodeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// 资源名校验失败。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceNameError {
+    /// 空名。
+    Empty,
+    /// 含非法字符（只允许 ASCII 字母数字 / `-` / `_`）。
+    InvalidChar(char),
+    /// 超长（> 128）。
+    TooLong,
+}
+
+impl fmt::Display for ResourceNameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("resource name is empty"),
+            Self::InvalidChar(c) => write!(f, "resource name contains invalid char {c:?}"),
+            Self::TooLong => f.write_str("resource name too long (max 128)"),
+        }
+    }
+}
+
+/// 资源人类可读名（如 `dev-web`）；只做本地解析，名字≠定位（D2）。
+///
+/// 字符集：ASCII 字母数字 / `-` / `_`（与 workspace id 既有约定一致）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ResourceName(String);
+
+impl ResourceName {
+    /// 校验并构造。
+    pub fn new(name: impl Into<String>) -> Result<Self, ResourceNameError> {
+        let name = name.into();
+        if name.is_empty() {
+            return Err(ResourceNameError::Empty);
+        }
+        if name.len() > 128 {
+            return Err(ResourceNameError::TooLong);
+        }
+        if let Some(c) = name
+            .chars()
+            .find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_'))
+        {
+            return Err(ResourceNameError::InvalidChar(c));
+        }
+        Ok(Self(name))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ResourceName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// 资源引用（N2 §16.1 D2）：`{workspace, name}` 两段式寻址。
+///
+/// kind 不进地址：资源类型是目录属性（`ResourceKind`），不是地址的一部分。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ResourceRef {
+    pub workspace: WorkspaceId,
+    pub name: ResourceName,
+}
+
+impl ResourceRef {
+    #[must_use]
+    pub fn new(workspace: WorkspaceId, name: ResourceName) -> Self {
+        Self { workspace, name }
+    }
+}
+
+impl fmt::Display for ResourceRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.workspace, self.name)
+    }
+}
+
+/// 资源类型：目录属性，不进地址（D2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResourceKind {
+    Network,
+    Service,
+    Workspace,
+    Compute,
+    Device,
+}
+
+impl ResourceKind {
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Network => "network",
+            Self::Service => "service",
+            Self::Workspace => "workspace",
+            Self::Compute => "compute",
+            Self::Device => "device",
+        }
+    }
+}
+
+impl fmt::Display for ResourceKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// 资源操作（grant 表 `operations` 的闭集合；扩展需走 requirement-change）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResourceOperation {
+    /// 建立 Session 并使用资源（`nexus use`）。
+    Use,
+    /// 管理资源注册与授权（publish / revoke / grant 管理）。
+    Manage,
+}
+
+impl ResourceOperation {
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Use => "use",
+            Self::Manage => "manage",
+        }
+    }
+}
+
+impl fmt::Display for ResourceOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// 结构化拒绝原因（D6：`Deny{NoSuchGrant/WrongWorkspace/OperationNotGranted/Expired/Revoked}`）。
+///
+/// 授权判定在 provider 侧每次建 Session 时执行；"目录返回≠有权限"。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DenyReason {
+    /// 该 principal 对该资源没有任何 grant。
+    NoSuchGrant,
+    /// grant 的 workspace 与请求 workspace 不一致。
+    WrongWorkspace {
+        expected: WorkspaceId,
+        actual: WorkspaceId,
+    },
+    /// grant 存在，但未授予该操作。
+    OperationNotGranted { operation: ResourceOperation },
+    /// grant 已过期（`not_after`）。
+    Expired { not_after: u64, now: u64 },
+    /// grant 已被显式撤销。
+    Revoked,
+}
+
+impl DenyReason {
+    /// 机器可读判别名（审计 / JSON `error.deny`）。
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NoSuchGrant => "NoSuchGrant",
+            Self::WrongWorkspace { .. } => "WrongWorkspace",
+            Self::OperationNotGranted { .. } => "OperationNotGranted",
+            Self::Expired { .. } => "Expired",
+            Self::Revoked => "Revoked",
+        }
+    }
+}
+
+impl fmt::Display for DenyReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoSuchGrant => f.write_str("no grant for this principal and resource"),
+            Self::WrongWorkspace { expected, actual } => write!(
+                f,
+                "grant is for workspace {expected}, request is for workspace {actual}"
+            ),
+            Self::OperationNotGranted { operation } => {
+                write!(f, "operation {operation} not granted")
+            }
+            Self::Expired { not_after, now } => {
+                write!(f, "grant expired at {not_after} (now {now})")
+            }
+            Self::Revoked => f.write_str("grant was revoked"),
+        }
+    }
+}
+
+/// 授权判定结果（D6；由 `nexus-auth` 的 grant 表判定产生）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthorizationDecision {
+    Allow,
+    Deny(DenyReason),
+}
+
+impl AuthorizationDecision {
+    #[must_use]
+    pub fn is_allow(&self) -> bool {
+        matches!(self, Self::Allow)
+    }
+}
+
+impl fmt::Display for AuthorizationDecision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Allow => f.write_str("allow"),
+            Self::Deny(reason) => write!(f, "deny({})", reason.code()),
+        }
+    }
+}
+
 // ---------- Intent / Constraint ----------
 
 /// 用户意图：要使用什么资源、以什么 profile 使用。
@@ -377,6 +626,12 @@ pub enum NexusError {
     PlatformCapabilityUnavailable { capability: String },
     /// Session 运行失败。
     SessionFailed { session: SessionId, reason: String },
+    /// 查找 miss：某类领域对象不存在（N2 P0-1：session / resource 参数过滤）。
+    NotFound { kind: String, id: String },
+    /// 节点身份不可用：未执行 `nexus node init` 或身份记录损坏。
+    NodeIdentityUnavailable { reason: String },
+    /// 持久化写失败（FileKvStore 原子写 / journal 落盘失败）。
+    PersistenceFailed { path: String, reason: String },
     /// 请求的能力尚未实现。
     Unsupported { feature: String },
     /// 内部错误（不应泄漏给终端用户）。
@@ -395,9 +650,13 @@ impl NexusError {
             Self::AuthorizationDenied { .. }
             | Self::DnsResolutionFailed { .. }
             | Self::SessionFailed { .. }
+            | Self::NotFound { .. }
+            | Self::NodeIdentityUnavailable { .. }
             | Self::ComputeJobRejected { .. }
             | Self::WorkspaceCommitRejected { .. } => FailureDisposition::Abort,
-            Self::Unsupported { .. } | Self::Internal { .. } => FailureDisposition::Escalate,
+            Self::Unsupported { .. } | Self::Internal { .. } | Self::PersistenceFailed { .. } => {
+                FailureDisposition::Escalate
+            }
         }
     }
 }
@@ -444,6 +703,15 @@ impl fmt::Display for NexusError {
             }
             Self::SessionFailed { session, reason } => {
                 write!(f, "session {session:?} failed: {reason}")
+            }
+            Self::NotFound { kind, id } => {
+                write!(f, "{kind} not found: {id}")
+            }
+            Self::NodeIdentityUnavailable { reason } => {
+                write!(f, "node identity unavailable: {reason}")
+            }
+            Self::PersistenceFailed { path, reason } => {
+                write!(f, "persistence failed for {path}: {reason}")
             }
             Self::Unsupported { feature } => {
                 write!(f, "unsupported feature: {feature}")
@@ -573,5 +841,77 @@ mod tests {
             outcome,
             TerminalOutcome::Failed(NexusError::DnsResolutionFailed { .. })
         ));
+    }
+
+    // ---------- N2 P0-1：持久基座＋身份 ----------
+
+    #[test]
+    fn resource_name_validation() {
+        assert!(ResourceName::new("dev-web_1").is_ok());
+        assert_eq!(ResourceName::new(""), Err(ResourceNameError::Empty));
+        assert_eq!(
+            ResourceName::new("bad name"),
+            Err(ResourceNameError::InvalidChar(' '))
+        );
+        assert_eq!(
+            ResourceName::new("a/b"),
+            Err(ResourceNameError::InvalidChar('/'))
+        );
+        assert_eq!(
+            ResourceName::new("x".repeat(129)),
+            Err(ResourceNameError::TooLong)
+        );
+        assert_eq!(ResourceName::new("ws1").unwrap().as_str(), "ws1");
+    }
+
+    #[test]
+    fn resource_ref_display_kind_not_in_address() {
+        // D2：kind 不进地址（目录属性）；地址只有 workspace/name。
+        let r = ResourceRef::new(
+            WorkspaceId::new("default"),
+            ResourceName::new("dev-web").unwrap(),
+        );
+        assert_eq!(r.to_string(), "default/dev-web");
+        assert_eq!(ResourceKind::Service.as_str(), "service");
+    }
+
+    #[test]
+    fn deny_reason_codes_are_stable() {
+        // 审计 / JSON error.deny 的机器可读名冻结。
+        assert_eq!(DenyReason::NoSuchGrant.code(), "NoSuchGrant");
+        assert_eq!(DenyReason::Revoked.code(), "Revoked");
+        assert_eq!(
+            DenyReason::Expired {
+                not_after: 100,
+                now: 200
+            }
+            .code(),
+            "Expired"
+        );
+        let d = AuthorizationDecision::Deny(DenyReason::NoSuchGrant);
+        assert!(!d.is_allow());
+        assert_eq!(d.to_string(), "deny(NoSuchGrant)");
+        assert!(AuthorizationDecision::Allow.is_allow());
+    }
+
+    #[test]
+    fn new_nexus_error_variants_dispositions() {
+        let err = NexusError::NotFound {
+            kind: "session".into(),
+            id: "s9".into(),
+        };
+        assert_eq!(err.disposition(), FailureDisposition::Abort);
+        assert_eq!(err.to_string(), "session not found: s9");
+
+        let err = NexusError::NodeIdentityUnavailable {
+            reason: "run `nexus node init` first".into(),
+        };
+        assert_eq!(err.disposition(), FailureDisposition::Abort);
+
+        let err = NexusError::PersistenceFailed {
+            path: "/x/grants".into(),
+            reason: "io error".into(),
+        };
+        assert_eq!(err.disposition(), FailureDisposition::Escalate);
     }
 }

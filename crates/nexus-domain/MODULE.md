@@ -58,6 +58,18 @@
   由 `nexus-connectivity::evaluation::evaluate_connectivity` 纯函数产生，
   作为 Core Planner 的 Connectivity Feasibility 输入。
 
+已实现（N2 P0-1，2026-10-03）：
+
+- 身份/寻址类型：`WorkspaceId` / `NodeId`（内容派生，`IdentityManager::peer_id_of`，
+  Identity≠Locator）/ `ResourceName`（校验：ASCII 字母数字/`-`/`_`，≤128）/
+  `ResourceRef{workspace, name}`（kind 不进地址，D2）/ `ResourceKind`
+  （Network/Service/Workspace/Compute/Device，目录属性）/
+  `ResourceOperation{Use, Manage}`。
+- 授权词汇：`DenyReason{NoSuchGrant/WrongWorkspace/OperationNotGranted/Expired/Revoked}`
+  （`code()` 为审计/JSON 稳定判别名）/ `AuthorizationDecision{Allow, Deny}`。
+- `NexusError` 新增：`NotFound{kind, id}`（Abort）、`NodeIdentityUnavailable{reason}`
+  （Abort）、`PersistenceFailed{path, reason}`（Escalate）。
+
 ## Verification
 
 最低：

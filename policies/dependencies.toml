@@ -305,3 +305,37 @@ os_transitive_deps = "libc (accepted); no C build (pure Rust, no cc)"
 approved = true
 approved_date = "2026-10-02"
 review_basis = "2026-10-02 W4: v9 §22 D4=A (portable trait + Linux FUSE first); tun-rs precedent for platform crates"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-auth"
+crate = "sha2"
+version = "0.10"
+default_features = false
+features = []
+architecture_layer = "portable-core crypto primitive (D6: Principal content-derivation from ed25519 pubkey); no new architecture edge (nexus-auth keeps allowed_internal_dependencies=[nexus-domain])"
+feature_scope = "no default features; only sha2::Sha256 digest interface (no oid/std extras)"
+license = "MIT OR Apache-2.0 (allowlisted; check via cargo-deny gate)"
+security = "no known advisories; re-check at push time via harness dependency-governance gate"
+portability = "pure Rust, no_std-compatible; portable_core WASI check unaffected"
+supply_chain = "version pinned by Cargo.lock (lockfile_required); already present as transitive dep (0.10.9); transitive: digest, cpufeatures, cfg-if (standard RustCrypto)"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-03"
+review_basis = "N2 P0-1 D6: Principal::from_ed25519_public_key needs SHA-256; alternatives considered: ring (heavier, AEAD/HKDF unneeded) rejected, hand-rolled SHA-256 rejected (never hand-roll crypto)"
+
+[[dependency_reviews.direct]]
+consumer = "apps/nexus"
+crate = "getrandom"
+version = "0.2"
+default_features = false
+features = []
+architecture_layer = "composition-root app host (D8: LocalAPI bearer token generation only); not a crates/ member, portable-core untouched"
+feature_scope = "no default features; only getrandom::getrandom(&mut [u8]) for 32-byte token"
+license = "MIT OR Apache-2.0 (allowlisted; check via cargo-deny gate)"
+security = "no known advisories; re-check at push time via harness dependency-governance gate"
+portability = "OS-backed entropy; Linux/Windows/macOS supported (getrandom 0.2 platform matrix)"
+supply_chain = "version pinned by Cargo.lock (lockfile_required); already present as transitive dep (0.2.17); transitive: cfg-if, libc/wasi (platform)"
+os_transitive_deps = "libc (accepted, standard)"
+approved = true
+approved_date = "2026-10-03"
+review_basis = "N2 P0-1 D8: bearer token for LocalAPI auth needs OS CSPRNG; alternatives: /dev/urandom read (unix-only, rejected), ring::rand (heavier dep, rejected)"

@@ -49,6 +49,30 @@
   使用常量时间比较；失败结构化返回。
 - `pub enum AuthError { Unauthorized }`
 
+> 范围声明（N2 P0-1，D6）：`verify_token` 仅服务于冻结的 N1 remote-host
+> 场景（`daemon-real-host-*`）；**N2 资源授权路径拒绝 PSK**，
+> 只接受握手派生的 `Principal`。
+
+### N2 P0-1（D6，PRODUCT §16.5）：ed25519 双向身份＋本地 grant 表
+
+- `Principal::from_ed25519_public_key(&[u8; 32]) -> Principal`：
+  `ed25519:<hex(SHA-256(pubkey)[..16])>`（与 `IdentityManager::peer_id_of` 同构）；
+  调用方必须传入握手已验证的公钥，不接受请求方自称。
+- `pub struct Grant { resource: ResourceRef, principal: Principal, operations: Vec<ResourceOperation>, not_after: Option<u64>, revoked: bool }`
+- `pub struct GrantTable`：`upsert` / `revoke`（tombstone）/
+  `authorize(&AuthRequest, now_unix, &mut dyn AuditSink) -> AuthorizationDecision`。
+  判定顺序：NoSuchGrant → WrongWorkspace → Revoked → Expired → OperationNotGranted → Allow；
+  每次判定 exactly-once 写审计记录。
+- `pub struct AuthRequest { workspace, resource, principal, operation }`；
+  `pub struct AuditRecord { at_unix, workspace, resource, principal, operation, decision }`；
+  `pub trait AuditSink { fn record(&mut self, record: AuditRecord) }`（`VecAuditSink` 为测试实现；
+  daemon 落盘实现在 P0-4 经 `FileKvStore::journal_append`）。
+- `pub struct TrustStore` / `pub enum TrustVerdict{Trusted, UnknownFirstSeen, IdentityChanged}`：
+  显式 TOFU——`check` 永不自动学习，未知节点返回 `UnknownFirstSeen` 由调用方
+  提示用户确认后再 `trust`（与 N1 `IdentityManager::verify_peer` 的静默 TOFU 区分）。
+- 结构化拒绝：`nexus-domain::{DenyReason, AuthorizationDecision}`。
+- 本模块保持 portable、无 I/O（WASI check 覆盖）；持久化由组合根负责。
+
 冻结语义：认证门控发生在业务帧转发之前（W7：未认证帧不得进入业务处理）；本模块纯校验、无 I/O、保持 portable（WASI check 覆盖）。
 
 ### 常规要求

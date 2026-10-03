@@ -540,6 +540,13 @@ fn serve_localapi(
         .map(|a| a.to_string())
         .unwrap_or_default();
     let _ = ready_tx.send(actual);
+    let token = match nexus::localapi_client::load_or_create_bearer_token() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[nexusd] localapi bearer token unavailable: {e}");
+            return;
+        }
+    };
     loop {
         if shutdown.load(Ordering::Relaxed) {
             eprintln!("[nexusd] localapi: shutdown signal, exiting");
@@ -547,7 +554,7 @@ fn serve_localapi(
         }
         match listener.accept() {
             Ok((mut s, _)) => {
-                if let Err(e) = handle_localapi_request(&mut s) {
+                if let Err(e) = handle_localapi_request(&mut s, &token) {
                     eprintln!("[nexusd] localapi error: {e}");
                 }
             }
@@ -590,13 +597,34 @@ fn serve_resource(args: &[String]) -> ExitCode {
         Some(raw) => serve_over_tcp(raw),
         None => match flags.get("--socket").and_then(|v| v.as_deref()) {
             Some(path) => serve_over_socket(path),
+            // D8（N2 P0-1）：默认 unix socket（与 CLI `default_socket_path` 一致）。
+            #[cfg(unix)]
+            None => {
+                let sock = nexus::localapi_client::default_socket_path();
+                serve_over_socket(&sock.display().to_string())
+            }
+            #[cfg(not(unix))]
             None => serve_over_tcp("127.0.0.1:0"),
         },
     }
 }
 
+/// 加载 LocalAPI bearer token；失败则打印结构化 FAIL 并返回 Err(ExitCode)。
+fn localapi_bearer_token() -> Result<String, ExitCode> {
+    nexus::localapi_client::load_or_create_bearer_token().map_err(|e| {
+        println!(
+            "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"TOKEN_SETUP\",\"message\":\"bearer token: {e}\"}}}}"
+        );
+        ExitCode::SUCCESS
+    })
+}
+
 /// TCP loopback 监听 + 服务循环（既有行为）。
 fn serve_over_tcp(addr_raw: &str) -> ExitCode {
+    let token = match localapi_bearer_token() {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
     let addr: std::net::SocketAddr = match addr_raw.parse() {
         Ok(a) => a,
         Err(_) => {
@@ -622,7 +650,7 @@ fn serve_over_tcp(addr_raw: &str) -> ExitCode {
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
-                if let Err(e) = handle_localapi_request(&mut stream) {
+                if let Err(e) = handle_localapi_request(&mut stream, &token) {
                     eprintln!("serve connection error: {e}");
                 }
             }
@@ -638,6 +666,10 @@ fn serve_over_tcp(addr_raw: &str) -> ExitCode {
 #[cfg(unix)]
 fn serve_over_socket(path: &str) -> ExitCode {
     use std::os::unix::net::UnixListener;
+    let token = match localapi_bearer_token() {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
     let _ = std::fs::remove_file(path);
     let listener = match UnixListener::bind(path) {
         Ok(l) => l,
@@ -654,7 +686,7 @@ fn serve_over_socket(path: &str) -> ExitCode {
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
-                if let Err(e) = handle_localapi_request(&mut stream) {
+                if let Err(e) = handle_localapi_request(&mut stream, &token) {
                     eprintln!("serve connection error: {e}");
                 }
             }
@@ -723,15 +755,27 @@ fn workspace_commit(id: &str) -> Result<Value, (String, String)> {
     }
 }
 
-fn handle_localapi_request(stream: &mut dyn LocalIo) -> Result<(), String> {
+fn handle_localapi_request(stream: &mut dyn LocalIo, expected_token: &str) -> Result<(), String> {
     use std::io::BufRead;
-    let request_line: String = {
+    let (request_line, headers): (String, Vec<String>) = {
         let mut reader = std::io::BufReader::new(&mut *stream);
         let mut line = String::new();
         reader
             .read_line(&mut line)
             .map_err(|e| format!("read request line: {e}"))?;
-        line
+        let mut headers = Vec::new();
+        loop {
+            let mut h = String::new();
+            reader
+                .read_line(&mut h)
+                .map_err(|e| format!("read header: {e}"))?;
+            let h = h.trim_end_matches(['\r', '\n']);
+            if h.is_empty() {
+                break;
+            }
+            headers.push(h.to_string());
+        }
+        (line, headers)
     };
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 2 || parts[0] != "GET" {
@@ -743,7 +787,29 @@ fn handle_localapi_request(stream: &mut dyn LocalIo) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
         return Ok(());
     }
-    let path = parts[1].to_string();
+    // D8（N2 P0-1）：bearer token 鉴权（两种传输无条件执行）。
+    if !bearer_authorized(&headers, expected_token) {
+        write_http_json(
+            &mut *stream,
+            401,
+            &json!({"verdict":"FAIL","error":{"code":"UNAUTHORIZED","message":"missing or invalid bearer token"}}),
+        )
+        .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    // N2 P0-1 bugfix：解析 query string（此前精确路径匹配，`?k=v` 直接 404）。
+    let target = parts[1];
+    let (path, query) = match target.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (target, ""),
+    };
+    let params = parse_query(query);
+    let qp = |name: &str| {
+        params
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
     // C1：workspace commit 走 GET（本 LocalAPI 为最小 GET-only 控制面；变更语义由路径表达）。
     // id 字符集已在 workspace.toml 解析时校验（字母数字/-/_），无注入风险。
     #[cfg(target_os = "linux")]
@@ -756,7 +822,7 @@ fn handle_localapi_request(stream: &mut dyn LocalIo) -> Result<(), String> {
         write_http_json(stream, 200, &body).map_err(|e| e.to_string())?;
         return Ok(());
     }
-    let result: Result<Value, (String, String)> = match path.as_str() {
+    let result: Result<Value, (String, String)> = match path {
         "/localapi/v0/status" => nexus::observability::status()
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
         "/localapi/v0/dataplane/stats" => {
@@ -782,9 +848,9 @@ fn handle_localapi_request(stream: &mut dyn LocalIo) -> Result<(), String> {
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
         "/localapi/v0/dns/cache" => nexus::observability::dns_cache()
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
-        "/localapi/v0/session/watch" => nexus::observability::session_watch()
+        "/localapi/v0/session/watch" => nexus::observability::session_watch(qp("session"))
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
-        "/localapi/v0/plan/explain" => nexus::observability::plan_explain()
+        "/localapi/v0/plan/explain" => nexus::observability::plan_explain(qp("resource"))
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
         "/localapi/v0/connectivity/status" => nexus::observability::connectivity_status()
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
@@ -810,6 +876,78 @@ fn handle_localapi_request(stream: &mut dyn LocalIo) -> Result<(), String> {
     Ok(())
 }
 
+/// bearer 鉴权（D8）：`Authorization: Bearer <token>` 常量时间比较。
+///
+/// token 缺失 / 格式错误 / 不匹配一律拒绝（fail-closed）。
+fn bearer_authorized(headers: &[String], expected_token: &str) -> bool {
+    let presented = headers.iter().find_map(|h| {
+        let (name, value) = h.split_once(':')?;
+        if name.trim().eq_ignore_ascii_case("authorization") {
+            value.trim().strip_prefix("Bearer ").map(str::trim)
+        } else {
+            None
+        }
+    });
+    match presented {
+        Some(token) => constant_time_eq(token.as_bytes(), expected_token.as_bytes()),
+        None => false,
+    }
+}
+
+/// 常量时间字节比较（防时序侧信道；与 `nexus-auth::verify_token` 同构）。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        diff |= usize::from(a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0));
+    }
+    diff == 0
+}
+
+/// 解析 query string 为 `(key, pct-decoded value)` 列表（N2 P0-1 bugfix：
+/// daemon 此前完全不解析 query string）。
+fn parse_query(query: &str) -> Vec<(String, String)> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    query
+        .split('&')
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            Some((pct_decode(k)?, pct_decode(v)?))
+        })
+        .collect()
+}
+
+/// `%XX` 解码；非法序列 → `None`（该 pair 被丢弃）。
+fn pct_decode(s: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(s.len());
+    let raw = s.as_bytes();
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i] {
+            b'%' => {
+                if i + 2 >= raw.len() {
+                    return None;
+                }
+                let hi = char::from(raw[i + 1]).to_digit(16)?;
+                let lo = char::from(raw[i + 2]).to_digit(16)?;
+                bytes.push((hi * 16 + lo) as u8);
+                i += 3;
+            }
+            b'+' => {
+                bytes.push(b' ');
+                i += 1;
+            }
+            b => {
+                bytes.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
 fn write_http_json(
     stream: &mut dyn std::io::Write,
     status: u16,
@@ -818,6 +956,7 @@ fn write_http_json(
     let body_str = serde_json::to_string(body)?;
     let status_text = match status {
         200 => "OK",
+        401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
         _ => "Internal Server Error",

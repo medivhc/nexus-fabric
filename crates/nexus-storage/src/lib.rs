@@ -13,6 +13,8 @@ use std::fmt;
 
 pub mod fs;
 pub use fs::FsContentStore;
+pub mod kv;
+pub use kv::{FileKvStore, StorageError};
 
 /// 内容寻址的对象标识。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]

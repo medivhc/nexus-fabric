@@ -17,7 +17,7 @@
 #![forbid(unsafe_code)]
 
 use nexus::control_service::{ControlServiceImpl, render_text};
-use nexus::localapi_client::{self, DEFAULT_LOCALAPI_ADDR};
+use nexus::localapi_client::{self};
 use nexus::mesh::AutoMeshController;
 use nexus::schedule_cli::{
     default_state_path as schedule_state_path, error_json as schedule_error_json, schedule_at,
@@ -39,7 +39,8 @@ nexus — Nexus 统一 Resource Fabric 控制面 CLI（瘦客户端）
 
 全局选项:
   --json        原样打印 daemon 返回 JSON（机器可读，stderr 静默）。
-  --addr <host:port>   nexusd serve LocalAPI 地址（默认 127.0.0.1:18080）。
+  --addr <host:port>   nexusd serve LocalAPI 地址（TCP loopback；默认走 unix socket）。
+  --socket <path>      nexusd serve LocalAPI socket 路径（默认见下）。
 
 命令:
   status                                  总体状态
@@ -76,18 +77,20 @@ nexus — Nexus 统一 Resource Fabric 控制面 CLI（瘦客户端）
   autostart <install|remove|status>       开机自启（进程内 SDK，PRODUCT §13）
   pair invite|join|list|remove --dir <config-dir>
                                         设备配对（D7；带外配对码 + ed25519 签名）
+  node init [--force]                   生成本节点 X25519 身份（NodeId 内容派生，N2 P0-1）
   help / --help                           显示本帮助
 
 前置条件:
-  观察命令需要先在另一个终端启动 `nexusd serve --addr <ip:port>`。
+  观察命令需要先在另一个终端启动 `nexusd serve`（默认 unix socket；
+  `~/.config/nexus/localapi.token` 为共享 bearer token，0600）。
   daemon 未运行时，CLI 输出 DAEMON_UNREACHABLE FAIL JSON（exit 0）。
 
 输出:
   --json        原样打印 observability 快照 JSON（机器可读，stderr 静默）。
   默认          渲染人读文本视图（JSON 的字段投影）。
   --socket <path> / --addr <ip:port>
-                thin-client 远程传输目标（--addr 为 TCP loopback；
-                --socket 暂仅服务端监听支持，CLI 建连待落地）。
+                thin-client 远程传输目标（默认 unix socket：
+                $XDG_RUNTIME_DIR/nexus-localapi.sock；--addr 切 TCP loopback）。
 
 exit 语义（对齐 nexusd）:
   0             业务结果（含 verdict=FAIL / daemon 不可达，请求已被处理）。
@@ -110,10 +113,8 @@ fn split_json_flag(args: &[String]) -> (bool, Vec<String>) {
 
 /// thin-client 远程传输目标：Unix domain socket 或 TCP loopback 地址。
 ///
-/// CLI 端当前仅支持 TCP loopback（`--addr`）；`--socket` 服务端监听已支持，
-/// CLI 建连待落地。
+/// D8（N2 P0-1）：默认 unix socket；`--addr` 显式切到 TCP loopback。
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // Socket variant reserved for future CLI socket transport; extract() returns Err on --socket.
 enum RemoteTarget {
     /// `--socket <path>`（Unix: unix socket；Windows: named pipe）。
     Socket(String),
@@ -121,10 +122,33 @@ enum RemoteTarget {
     Tcp(String),
 }
 
-/// 从参数中剥离全局 `--addr <ip:port>`；遇 `--socket` 报错。
+impl RemoteTarget {
+    /// 转为 localapi_client 的传输目标。
+    fn to_client_target(&self) -> localapi_client::LocalApiTarget {
+        match self {
+            RemoteTarget::Socket(p) => {
+                localapi_client::LocalApiTarget::Socket(std::path::PathBuf::from(p))
+            }
+            RemoteTarget::Tcp(a) => localapi_client::LocalApiTarget::Tcp(a.clone()),
+        }
+    }
+
+    /// 人读/JSON 展示用标签。
+    fn label(&self) -> String {
+        match self {
+            RemoteTarget::Socket(p) => format!("socket:{p}"),
+            RemoteTarget::Tcp(a) => a.clone(),
+        }
+    }
+}
+
+/// 从参数中剥离全局 `--addr <ip:port>` / `--socket <path>`（D8：默认 unix socket）。
 /// 返回 (remote, 剩余 args)。
 fn extract_remote_target(args: &[String]) -> Result<(RemoteTarget, Vec<String>), String> {
-    let mut remote = RemoteTarget::Tcp(DEFAULT_LOCALAPI_ADDR.to_string());
+    let mut remote = match localapi_client::default_target() {
+        localapi_client::LocalApiTarget::Socket(p) => RemoteTarget::Socket(p.display().to_string()),
+        localapi_client::LocalApiTarget::Tcp(a) => RemoteTarget::Tcp(a),
+    };
     let mut rest = Vec::with_capacity(args.len());
     let mut i = 0;
     while i < args.len() {
@@ -138,10 +162,12 @@ fn extract_remote_target(args: &[String]) -> Result<(RemoteTarget, Vec<String>),
                 i += 2;
             }
             "--socket" => {
-                return Err(
-                    "--socket transport is not available in this build; use --addr <ip:port> (TCP loopback)"
-                        .to_string(),
-                );
+                let value = args
+                    .get(i + 1)
+                    .filter(|v| !v.starts_with("--"))
+                    .ok_or_else(|| "missing value for --socket".to_string())?;
+                remote = RemoteTarget::Socket(value.clone());
+                i += 2;
             }
             other => {
                 rest.push(other.to_string());
@@ -157,14 +183,6 @@ fn run(args: &[String]) -> i32 {
         Ok(v) => v,
         Err(msg) => {
             eprintln!("error: {msg}");
-            eprint!("{USAGE}");
-            return 2;
-        }
-    };
-    let addr = match target {
-        RemoteTarget::Tcp(a) => a,
-        RemoteTarget::Socket(_) => {
-            eprintln!("error: --socket not supported in CLI client build");
             eprint!("{USAGE}");
             return 2;
         }
@@ -212,6 +230,10 @@ fn run(args: &[String]) -> i32 {
     if args[0].as_str() == "pair" {
         return nexus::pair_cli::run_pair(&args[1..]);
     }
+    // 节点身份（N2 P0-1；本地文件操作，不经过 daemon）。
+    if args[0].as_str() == "node" {
+        return nexus::node_cli::run_node(&args[1..], json_mode);
+    }
 
     let command = match parse_command(&args) {
         Ok(cmd) => cmd,
@@ -246,12 +268,13 @@ fn run(args: &[String]) -> i32 {
         return nexus::network::dispatch(&command, &args, json_mode);
     }
 
-    // 有 daemon 路由 → 裸 HTTP GET；无路由 → 本地合成 UNSUPPORTED。
-    match localapi_client::route_for(&command) {
-        Some(path) => query_daemon(&addr, path, json_mode),
-        None => match localapi_client::route_for_dynamic(&command) {
-            // C1：动态路由（`workspace commit <id>`）。
-            Some(path) => query_daemon(&addr, path.as_str(), json_mode),
+    // 有 daemon 路由 → HTTP GET；无路由 → 本地合成 UNSUPPORTED。
+    // N2 P0-1：动态路由优先（带参数命令经 query string，不再丢参数）。
+    match localapi_client::route_for_dynamic(&command) {
+        // 动态路由（`workspace commit <id>` / `session watch <id>` / `plan explain <resource>`）。
+        Some(path) => query_daemon(&target, path.as_str(), json_mode),
+        None => match localapi_client::route_for(&command) {
+            Some(path) => query_daemon(&target, path, json_mode),
             None => {
                 let json = localapi_client::unsupported_json(&command);
                 render_and_exit(&json, json_mode)
@@ -285,20 +308,21 @@ fn run_with_command_rejected(args: &[String], json_mode: bool) -> i32 {
 }
 
 /// 向 daemon 发一次 GET，解析 body JSON，按模式渲染。
-fn query_daemon(addr: &str, path: &str, json_mode: bool) -> i32 {
-    match localapi_client::http_get(addr, path) {
+fn query_daemon(target: &RemoteTarget, path: &str, json_mode: bool) -> i32 {
+    let label = target.label();
+    match localapi_client::http_get(&target.to_client_target(), path) {
         Ok(body) => match serde_json::from_str::<Value>(&body) {
             Ok(json) => render_and_exit(&json, json_mode),
             Err(e) => {
                 // daemon 返回了无法解析为 JSON 的 body：结构化 FAIL（exit 0）。
-                let json = localapi_client::bad_response_json(addr, &e.to_string());
+                let json = localapi_client::bad_response_json(&label, &e.to_string());
                 render_and_exit(&json, json_mode)
             }
         },
         Err(e) => {
             // 连接失败：--json 打结构化 FAIL JSON 到 stdout（exit 0）；人读打 stderr。
             if json_mode {
-                let json = localapi_client::unreachable_json(addr, &e.to_string());
+                let json = localapi_client::unreachable_json(&label, &e.to_string());
                 println!("{json}");
             } else {
                 eprintln!("error: {e}");
@@ -1650,26 +1674,38 @@ mod tests {
     }
 
     #[test]
-    fn addr_defaults_to_loopback() {
+    fn addr_defaults_to_unix_socket() {
+        // D8（N2 P0-1）：默认 unix socket，不再是 TCP loopback。
         let args = vec!["status".to_string()];
         let (target, rest) = extract_remote_target(&args).unwrap();
-        assert_eq!(target, RemoteTarget::Tcp(DEFAULT_LOCALAPI_ADDR.into()));
+        #[cfg(unix)]
+        assert!(matches!(target, RemoteTarget::Socket(_)));
+        #[cfg(not(unix))]
+        assert_eq!(
+            target,
+            RemoteTarget::Tcp(localapi_client::DEFAULT_LOCALAPI_ADDR.into())
+        );
         assert_eq!(rest, vec!["status".to_string()]);
     }
 
     #[test]
-    fn socket_flag_is_rejected() {
+    fn socket_flag_is_accepted() {
         let args = vec!["--socket".to_string(), "/tmp/nexusd.sock".to_string()];
-        let err = extract_remote_target(&args).unwrap_err();
-        assert!(err.contains("--socket"));
-        // 端到端：--socket 必须 exit 2（用法错误），且不触网。
-        assert_eq!(run_str(&["--socket", "/tmp/nexusd.sock", "status"]), 2);
+        let (target, rest) = extract_remote_target(&args).unwrap();
+        assert_eq!(target, RemoteTarget::Socket("/tmp/nexusd.sock".into()));
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn socket_flag_missing_value_is_usage_error() {
+        let args = vec!["--socket".to_string()];
+        assert!(extract_remote_target(&args).is_err());
     }
 
     #[test]
     fn status_with_no_daemon_exits_0_with_fail_json() {
-        // 没有 daemon 在 18080 上：--json 模式输出 DAEMON_UNREACHABLE FAIL JSON 到 stdout，
-        // exit 0（请求已被处理，只是连不上）。
+        // 没有 daemon（默认 unix socket 文件不存在）：--json 模式输出
+        // DAEMON_UNREACHABLE FAIL JSON 到 stdout，exit 0（请求已被处理，只是连不上）。
         let code = run_str(&["--json", "status"]);
         assert_eq!(code, 0);
     }

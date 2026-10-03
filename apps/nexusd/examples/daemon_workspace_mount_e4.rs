@@ -80,12 +80,18 @@ fn check(cond: bool, msg: &str) -> R<()> {
 
 /// 最小 HTTP GET（裸 TcpStream；只取 body）。
 fn http_get(path: &str) -> R<String> {
+    // D8（N2 P0-1）：LocalAPI 要求 bearer token；与 daemon 共享 token 文件。
+    let token = nexus::localapi_client::load_or_create_bearer_token()
+        .map_err(|e| Fail::failure(format!("bearer token: {e}")))?;
     let mut s = std::net::TcpStream::connect(LOCALAPI_ADDR)
         .map_err(|e| Fail::failure(format!("localapi connect: {e}")))?;
     s.set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| Fail::failure(format!("set timeout: {e}")))?;
-    write!(s, "GET {path} HTTP/1.1\r\nHost: x\r\n\r\n")
-        .map_err(|e| Fail::failure(format!("http write: {e}")))?;
+    write!(
+        s,
+        "GET {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\r\n"
+    )
+    .map_err(|e| Fail::failure(format!("http write: {e}")))?;
     let mut buf = Vec::new();
     s.read_to_end(&mut buf)
         .map_err(|e| Fail::failure(format!("http read: {e}")))?;

@@ -59,6 +59,9 @@ fn run(args: &[String]) -> Result<(), String> {
 
     let mut child = Command::new(&nexusd_bin)
         .arg("serve")
+        // 显式 TCP（probe 走 TCP 直连；daemon 默认已切 unix socket，D8）。
+        .arg("--addr")
+        .arg("127.0.0.1:0")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -96,13 +99,19 @@ fn parse_ready_addr(line: &str) -> Result<String, String> {
 }
 
 fn http_get(addr: &str, path: &str) -> Result<String, String> {
+    // D8（N2 P0-1）：LocalAPI 要求 bearer token；与 daemon 共享 token 文件。
+    let token = nexus::localapi_client::load_or_create_bearer_token()
+        .map_err(|e| format!("bearer token: {e}"))?;
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         match TcpStream::connect(addr) {
             Ok(mut s) => {
                 s.set_read_timeout(Some(Duration::from_secs(10)))
                     .map_err(|e| e.to_string())?;
-                if let Err(e) = write!(s, "GET {path} HTTP/1.0\r\nHost: {addr}\r\n\r\n") {
+                if let Err(e) = write!(
+                    s,
+                    "GET {path} HTTP/1.0\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\n\r\n"
+                ) {
                     if Instant::now() >= deadline {
                         return Err(format!("write: {e}"));
                     }

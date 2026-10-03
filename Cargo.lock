@@ -691,6 +691,7 @@ dependencies = [
 name = "nexus"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.2.17",
  "nexus-auth",
  "nexus-compute",
  "nexus-connectivity",
@@ -736,6 +737,7 @@ name = "nexus-auth"
 version = "0.1.0"
 dependencies = [
  "nexus-domain",
+ "sha2",
 ]
 
 [[package]]

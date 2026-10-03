@@ -22,13 +22,17 @@ pub struct ControlServiceImpl;
 impl ControlServiceImpl {
     /// 路由命令到其 observability 快照（原始 JSON）。
     ///
-    /// 命令携带的位置参数（resource/session/target/name/workspace）是观察快照的
-    /// 选择器占位；当前快照为确定性演示状态，函数内部不读取这些参数。
+    /// 命令携带的位置参数（resource/session）透传给快照函数做过滤
+    ///（N2 P0-1：`plan explain` / `session watch` 的参数不再丢弃）。
     pub fn snapshot(&self, command: &ControlCommand) -> Result<Value, NexusError> {
         let json = match command {
             ControlCommand::Status => crate::observability::status()?,
-            ControlCommand::PlanExplain { .. } => crate::observability::plan_explain()?,
-            ControlCommand::SessionWatch { .. } => crate::observability::session_watch()?,
+            ControlCommand::PlanExplain { resource } => {
+                crate::observability::plan_explain(Some(&resource.0))?
+            }
+            ControlCommand::SessionWatch { session } => {
+                crate::observability::session_watch(Some(&session.0))?
+            }
             ControlCommand::ConnectivityStatus => crate::observability::connectivity_status()?,
             ControlCommand::ConnectivityCandidates => {
                 crate::observability::connectivity_candidates()?
@@ -154,7 +158,7 @@ mod tests {
         vec![
             ControlCommand::Status,
             ControlCommand::PlanExplain {
-                resource: ResourceId("net".into()),
+                resource: ResourceId("internet-access".into()),
             },
             ControlCommand::SessionWatch {
                 session: SessionId("sess-1".into()),
