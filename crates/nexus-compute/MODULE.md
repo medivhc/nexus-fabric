@@ -66,6 +66,18 @@
 
 ## Verification
 
+### N3 契约增补（待实现）
+
+负责提供方 TaskOwner、单次执行接受/幂等/状态约束、Artifact 登记与交付语义；
+请求方镜像不写权威 TaskOutcome。一个 Task 可关联多个 Session，仍只有一个真实命令启动。
+Outcome、execution、delivery、取消请求及观察新鲜度分别记录；上传中断不能重跑命令。
+accepted 前持久发布 Task/幂等 key/pin intent；StartIntent 崩溃窗口必须核实，未知不 spawn。
+输入快照委托 Workspace；存储与受隔离进程/传输由组合根注入，不新增 storage/platform 依赖。
+旧 ComputeJobSession/OK 帧往返不代表 N3 Task；保持其冻结行为。
+规范：PRODUCT §17、`docs/N3-MODEL-CONTRACT.md`、N3 JSON schema。
+验收：`scenarios/product/n3-*.toml`，未来 verifier 为 nexusd 的 `n3_task_e4` example，
+必须编排真实产品边界，禁止合成成功结果。
+
 最低：
 
 ```text

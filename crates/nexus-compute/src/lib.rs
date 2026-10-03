@@ -6,6 +6,9 @@
 
 #![forbid(unsafe_code)]
 
+/// N3 provider-owned durable acceptance; separate from legacy job sessions.
+pub mod task;
+
 /// 计算作业会话阶段（冻结契约，scenarios/product/remote_compute_job_flow.toml）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComputePhase {

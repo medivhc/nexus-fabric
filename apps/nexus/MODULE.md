@@ -96,6 +96,16 @@
 
 ## Verification
 
+### N3 CLI 契约增补（待实现）
+
+新增 task submit --request / show / logs / cancel / artifacts、artifact get。
+参数与 JSON envelope 见 `docs/N3-MODEL-CONTRACT.md` §7；操作经 daemon 的统一
+Application Service，不在 CLI 创建 TaskOwner 或直接 spawn 工作负载。
+用法 exit 2、结构化业务响应 exit 0，工作结果从 TaskOutcome 读取。
+artifact get 默认拒绝覆盖，下载完整性验证后原子发布。
+现有 run-with-command 的 UNSUPPORTED 场景保持有效；便捷 run 接线单独 requirement-change。
+验收：`scenarios/product/n3-submit.toml` 及未来 n3_task_e4 产品编排。
+
 最低：
 
 ```text

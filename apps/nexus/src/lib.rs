@@ -30,6 +30,8 @@ pub mod n2_identity;
 /// N2 P0-4：FileKvStore-backed 的 Session / Grant / Registry / 审计持久层
 ///（组合根装配点，被 CLI 与 nexusd 共用）。
 pub mod n2_store;
+/// N3-1 composition adapters; not connected to product commands yet.
+pub mod n3_acceptance;
 /// `nexus network` 命令族（M6）：N1 Universal Connectivity 前台装配
 ///（Composition Root：n1 portable core + fabric/path/discovery/platform-linux）。
 pub mod network;

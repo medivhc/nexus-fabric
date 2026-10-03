@@ -1,0 +1,36 @@
+schema_version = 1
+id = "product.n3-artifact-integrity"
+title = "损坏下载及已有输出文件不能被发布或覆盖"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#17-n3-task"
+
+# N3 contract-first: future verifier, not a delivered runtime.
+# Modules: nexus-domain nexus-compute nexus-workspace nexus-storage
+# nexus-session nexus-control-api apps/nexus apps/nexusd
+
+[given]
+topology = "separate requester/provider processes; local E4, not Windows/Linux E5"
+steps = "在传输适配器注入下载坏字节，另一次下载目标预先存在；经 artifact get 观察两次拒绝。"
+
+[when]
+command = "cargo run --locked --quiet -p nexusd --example n3_task_e4 -- artifact-integrity"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "corrupt.error.code"
+equals = "ARTIFACT_INTEGRITY_FAILED"
+
+[[expect]]
+field = "existing.error.code"
+equals = "OUTPUT_EXISTS"
+
+[[expect]]
+field = "observed.corrupt_file_published"
+equals = false
+
+[[expect]]
+field = "observed.existing_file_unchanged"
+equals = true

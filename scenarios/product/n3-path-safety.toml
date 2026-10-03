@@ -1,0 +1,36 @@
+schema_version = 1
+id = "product.n3-path-safety"
+title = "输入及产物路径越界不能访问主机文件"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#17-n3-task"
+
+# N3 contract-first: future verifier, not a delivered runtime.
+# Modules: nexus-domain nexus-compute nexus-workspace nexus-storage
+# nexus-session nexus-control-api apps/nexus apps/nexusd
+
+[given]
+topology = "separate requester/provider processes; local E4, not Windows/Linux E5"
+steps = "经产品入口分别提交 ../ 路径和 symlink 文件，产物收集也注入 symlink，检查主机哨兵文件。"
+
+[when]
+command = "cargo run --locked --quiet -p nexusd --example n3_task_e4 -- path-safety"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "input.error.code"
+equals = "INVALID_PATH"
+
+[[expect]]
+field = "output.error.code"
+equals = "INVALID_PATH"
+
+[[expect]]
+field = "observed.host_sentinel_unchanged"
+equals = true
+
+[[expect]]
+field = "observed.escaped_bytes_transferred"
+equals = 0

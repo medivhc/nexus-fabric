@@ -49,10 +49,17 @@ Nexus 是一个 clean-room 实现的 Rust 网络 substrate + 分布式工作空�
 | P1 修复（mimo） | 21 条 P1 | `track-n2-p1-mimo` → `n2/p1-fix-mimo` |
 | P1 修复（bunny） | 21 条 P1（独立，用于对比修复质量） | `track-n2-p1-bunny` → `n2/p1-fix-bunny` |
 
-### N3：规划中，未开工
+### N3：模型与契约阶段，运行实现未开工
 
-- 前置：N3 规划 + D 决定（已知坑：v9 核心对象清单里没有 Task，需先定模型位置）
-- 目标：Task / Snapshot / Artifact，白皮书 §16.1 的 N3 完成标志
+- 首期范围：指定可信 Linux Provider 执行 Windows 用户/Agent 的固定项目输入，
+  交付真实日志、退出码和 Artifact；先用 Linux 请求方 E4，再做 Windows→Linux E5。
+- 模型：TaskOwner 归 Compute，Snapshot 归 Workspace，Artifact 登记归 Compute；
+  标识符/版本化 DTO 归 Domain，现有 SessionManager 保持唯一 Session Owner。
+- 契约入口：PRODUCT §17、ARCHITECTURE §12、`docs/N3-MODEL-CONTRACT.md`、
+  `docs/contracts/n3-task-v1.schema.json`、22 个 `scenarios/product/n3-*.toml`。
+- 本阶段不包含 Task 执行器或 E4 verifier；旧实现上的 Red / 冻结清单见
+  `.evidence/red-n3-model-v1/`。N2 安全收口、真实隔离/配额和全套 E4/E5 为后续前置。
+- **不得宣称 N3 已可用**；快速静态门禁通过不代表任务闭环 PASS。
 
 ## 诚实边界（verified vs sketched）
 

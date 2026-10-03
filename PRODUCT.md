@@ -3160,3 +3160,61 @@ gRPC/tonic；DHT；OIDC；mDNS/LSA 的 Provider 广播（static 先行）；
 唯一已批准的 requirement-change（D4，单独提交、可回滚）。
 **契约 hash**：`e5a98fb8e7109928bb044ad10e411b09992a730ab6bc0818f1aabf63425ec2e3`（计算方法：SHA-256 over §16 节文本自
 `## 16.` 至本行之前，排除本行）。
+
+## 17. N3 分布式任务（模型与契约，2026-10-03） {#17-n3-task}
+
+本节为新 feature 的契约阶段，尚未实现。首期交付白皮书 §16.2：Windows 用户或
+Agent 在指定可信 Linux Compute Provider 上执行固定项目输入的构建/测试，
+恢复查询日志、真实退出码与已登记产物。规范细节见 `docs/N3-MODEL-CONTRACT.md`；
+结构化提交 schema 见 `docs/contracts/n3-task-v1.schema.json`。
+
+### 17.1 对象与授权
+
+- Task 是持久的工作记录；Task ≠ Session ≠ Connection。Task 关联资源 Session，
+  Session 的断开/关闭/孤儿回收不直接决定 Task 终态。
+- Snapshot 固定 `WorkspaceId + CommitId + RootManifestId` 与文件选择、SHA-256 清单；
+  接受后本地新修改不改变运行输入。既有 FNV ID 不作为 N3 完整性安全边界。
+- Artifact 是 Task 产生并登记的输出，绑定 Snapshot、真实环境、内容校验与访问授权。
+- Provider 侧派生 authenticated principal，核实 Use grant、Workspace、输入/输出范围；
+  提供方身份经双向认证保密通道确认。N2 当前独立明文准入不足以承载 N3。
+- 首期指定 Provider、固定容器环境、硬配额、network=none；不支持所需能力即明确拒绝，
+  不悄悄换节点、不退回裸主机、不自动重新执行命令。
+
+### 17.2 接受、生命周期与结果
+
+- 接受请求返回持久 TaskId 和执行契约摘要；ack 前必须原子保护 Task、幂等索引与输入 pin。
+- 幂等作用域为 Workspace＋已认证主体＋Provider＋key；未过期的同请求返回同 TaskId，
+  不同请求返回 IDEMPOTENCY_CONFLICT；并发和崩溃恢复后保持去重。
+- 提供方 TaskOwner 唯一写入 TaskOutcome；TaskPhase 与 Outcome 分离。
+  `Waiting / Preparing / Running / Finalizing / Finished` 为处理阶段；
+  `Unfinished / Completed / Failed / Cancelled` 为恰一次持久终态。
+- 命令退出与结果交付分开：真实 exit_code、workload_succeeded、result_confirmed 独立记录；
+  成功必须符合 accepted success_exit_codes，日志与 required Artifact 已登记且可授权获取。
+  非零退出码可作为完整交付的测试结果，不伪造执行成功。
+- 上传暂时失败保持 Finalizing/Unfinished，可补交；确定缺少必需文件或交付期限届满明确失败。
+  补传、日志续读、重连不得重复执行命令。
+- 断线或崩溃窗口只产生 observation=PendingVerification；没有执行侧证据不擅自失败、
+  取消、重跑。StartIntent 与 OS spawn 的间隙必须核实原进程身份，防 PID 复用。
+- cancel 先记 Requested；执行侧核实从未开始或已停止全部子进程并 reap 后才 Confirmed/
+  Cancelled。不可达时先持久排队请求方取消 intent，显示 CancelPending；
+  `cancel_request=Queued` 与提供方权威 `cancellation` 分开，不能伪造 Requested 事件。
+  超时停止确认后 Failed(Timeout)。
+  自然退出先于取消生效返回 TooLate，不覆盖真实退出或既有终态。
+- 冷启动先恢复 Task、幂等记录、输入/输出 protected roots，再接收新工作及运行 GC。
+  损坏记录明确 STATE_CORRUPT 并保留取证，不静默丢失后重新执行。
+
+### 17.3 统一入口与验收
+
+新增 `nexus task submit --request <json-file>`、`task show/logs/cancel/artifacts` 与
+`artifact get`，均经 daemon 的统一 Application Service；schema_version=1、双输出和
+CLI exit 语义遵循 §9.1。查询 envelope 的 PASS 不能代替 TaskOutcome。
+`artifact get` 默认拒绝覆盖文件，下载内容经 SHA-256 校验后原子发布。
+本期不修改 §16 的 `run ... -- <command>` UNSUPPORTED 期望，便捷 run 接线需另行
+requirement-change；不自动接通 schedule 或 write-back。
+
+`scenarios/product/n3-*.toml` 为冻结 E4 契约，覆盖固定输入、提交去重、环境/授权拒绝、
+真实退出、重附着、取消、超时、产物补传、完整性、存储保护和崩溃核实。
+本机多进程 E4 不证明跨机及平台兼容；最终须追加真实 Windows→Linux E5，
+记录环境、任务输入、日志、退出码和取回产物的独立观察。
+Red Evidence 与冻结文件摘要见 `.evidence/red-n3-model-v1/`；验收 verifier 缺失时明确
+BLOCKED，不把文件存在、静态 schema 通过或 mock 往返当作 N3 产品 PASS。

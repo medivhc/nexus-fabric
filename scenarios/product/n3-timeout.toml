@@ -1,0 +1,40 @@
+schema_version = 1
+id = "product.n3-timeout"
+title = "执行预算超时后确认停止及回收"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#17-n3-task"
+
+# N3 contract-first: future verifier, not a delivered runtime.
+# Modules: nexus-domain nexus-compute nexus-workspace nexus-storage
+# nexus-session nexus-control-api apps/nexus apps/nexusd
+
+[given]
+topology = "separate requester/provider processes; local E4, not Windows/Linux E5"
+steps = "真实进程及子进程超出已接受 timeout，检查单调计时与执行侧停止记录。"
+
+[when]
+command = "cargo run --locked --quiet -p nexusd --example n3_task_e4 -- timeout"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "task.outcome"
+equals = "Failed"
+
+[[expect]]
+field = "task.error.code"
+equals = "Timeout"
+
+[[expect]]
+field = "task.execution.state"
+equals = "Stopped"
+
+[[expect]]
+field = "observed.live_child_processes"
+equals = 0
+
+[[expect]]
+field = "observed.terminal_commit_count"
+equals = 1
