@@ -837,6 +837,7 @@ dependencies = [
  "nexus-dns",
  "nexus-projection",
  "serde_json",
+ "sha2",
  "toml",
 ]
 

@@ -38,7 +38,8 @@ command = "cargo run --quiet -p nexus -- use dev-svc --json"
 #   非 thin wrapper 伪造；CLI 退出重进可按此 id 查询，P0 完成标志 3）
 # - use.plan_id 非空（确定性摘要，D3）
 # - use.outcome=Completed（Owner 唯一提交的 TerminalOutcome）
-# - use.access.endpoint 非空（暴露的访问入口，可撤销）
+# - use.access.endpoint 非空（暴露的访问入口，可撤销；N2 P1-9 起同字段还带
+#   reachable/probe，如实回报连通性探测结果）
 [[expect]]
 field = "verdict"
 equals = "PASS"

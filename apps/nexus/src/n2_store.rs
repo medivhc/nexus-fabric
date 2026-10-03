@@ -40,10 +40,6 @@ use serde_json::{Map, Value, json};
 /// N2 存储目录名（node_dir 下）。
 pub const N2_DIR_NAME: &str = "n2";
 
-/// journal 轮转上限（P1-11）：超过则把当前 journal 归档为 `journal.log.1`
-/// （覆盖上一代），retained 上界 = 2 × 上限，消除无界增长。
-const JOURNAL_LIMIT_BYTES: u64 = 8 * 1024 * 1024;
-
 /// N2 存储目录：`<node_dir>/n2/`。
 #[must_use]
 pub fn n2_dir(node_dir: &Path) -> PathBuf {
@@ -67,7 +63,7 @@ impl N2Store {
     /// 打开（不存在则创建）`<node_dir>/n2/`。
     pub fn open(node_dir: &Path) -> Result<Self, String> {
         let dir = n2_dir(node_dir);
-        let kv = FileKvStore::open_with_journal_limit(&dir, JOURNAL_LIMIT_BYTES)
+        let kv = FileKvStore::open(&dir)
             .map_err(|e| format!("open n2 store: {e}"))?;
         Ok(Self { kv: Arc::new(kv) })
     }
@@ -103,32 +99,6 @@ impl N2Store {
             .map_err(|e| format!("replay n2 journal: {e}"))
     }
 
-    /// boot 重放（P1-11：生产恢复入口）。
-    ///
-    /// 与 [`Self::replay_journal`] 的区别：crash 在 append 中途留下的撕裂尾部
-    /// 在 boot 路径上**显式丢弃并返回标记**（fail-loud，由调用方打日志留痕），
-    /// 让 daemon 能继续启动；非撕裂的 `Corrupt`/`Io` 仍然报错。
-    /// 返回 `(完整记录, 是否丢弃过撕裂尾部)`。
-    pub fn replay_journal_at_boot(&self) -> Result<(Vec<Vec<u8>>, bool), String> {
-        match self.kv.journal_replay() {
-            Ok(records) => Ok((records, false)),
-            Err(nexus_storage::StorageError::TornJournalTail { path }) => {
-                self.kv
-                    .journal_discard_torn_tail()
-                    .map_err(|e| format!("discard torn n2 journal tail: {e}"))?;
-                eprintln!(
-                    "[n2] WARN: torn journal tail discarded at boot ({})",
-                    path.display()
-                );
-                let records = self
-                    .kv
-                    .journal_replay()
-                    .map_err(|e| format!("replay n2 journal after discard: {e}"))?;
-                Ok((records, true))
-            }
-            Err(e) => Err(format!("replay n2 journal: {e}")),
-        }
-    }
 }
 
 // ============================================================================
@@ -509,7 +479,8 @@ fn parse_plan_snapshot(v: &Value) -> Result<PlanSnapshot, String> {
     })
 }
 
-/// SessionRecord → JSON（durable v1；`plan_snapshot` 全量内嵌，D3）。
+/// SessionRecord → JSON（durable v1；`plan_snapshot` 全量内嵌，D3；
+/// `detached_at_unix` 为 P1-3 新增的可选字段）。
 fn encode_session_record(r: &SessionRecord) -> Value {
     let (outcome, reason) = outcome_to_json(&r.outcome);
     let mut obj = Map::new();
@@ -603,6 +574,25 @@ impl SessionRecordStore for KvSessionRecordStore {
     }
 
     fn save(&mut self, record: &SessionRecord) -> Result<(), String> {
+        // P1-1：终态 CAS（§14 Exactly-One Terminal Outcome 跨进程）。
+        // 无 CAS 时两个进程先后 `commit_outcome` 会互相覆盖——先到的终态被
+        // 后到的改写，"谁先提交"不可证。规则：**先到的终态获胜**：
+        // - 已有记录无终态 → 允许（首次提交 / 未终态推进）；
+        // - 已有记录有终态且与来件不同 → 拒绝（冲突，fail-closed）；
+        // - 已有记录有终态且与来件相同 → 允许（幂等重放，如 reconcile 的
+        //   cleanup 回写、reconnect 后的重复 persist）。
+        if let Some(existing) = self.current_record(&record.session)? {
+            let existing_terminal = terminal_outcome_code(&existing.outcome);
+            let incoming_terminal = terminal_outcome_code(&record.outcome);
+            if let (Some(have), Some(want)) = (existing_terminal, incoming_terminal) {
+                if have != want {
+                    return Err(format!(
+                        "terminal outcome conflict for {}: already committed '{have}', refusing to overwrite with '{want}'",
+                        record.session.0
+                    ));
+                }
+            }
+        }
         let data = serde_json::to_string(&encode_session_record(record))
             .map_err(|e| format!("encode session record: {e}"))?;
         let key = session_key(&record.session);
@@ -616,6 +606,37 @@ impl SessionRecordStore for KvSessionRecordStore {
             .journal_append(&payload)
             .map_err(|e| format!("journal session {}: {e}", record.session.0))?;
         Ok(())
+    }
+}
+
+impl KvSessionRecordStore {
+    /// 读取某会话的当前持久记录（CAS 读口；不存在 → `None`）。
+    fn current_record(&self, id: &SessionId) -> Result<Option<SessionRecord>, String> {
+        let key = session_key(id);
+        let Some(bytes) = self
+            .kv
+            .get(&key)
+            .map_err(|e| format!("read session {} for cas: {e}", id.0))?
+        else {
+            return Ok(None);
+        };
+        let text =
+            String::from_utf8(bytes).map_err(|e| format!("session {} not utf-8: {e}", id.0))?;
+        let v: Value =
+            serde_json::from_str(&text).map_err(|e| format!("parse session {}: {e}", id.0))?;
+        decode_session_record(&v).map(Some)
+    }
+}
+
+/// 终态判定结果的稳定标签（`None` = 未达终态）。
+///
+/// P1-1 CAS 用：同一 session 的两个不同终态标签 → 冲突。
+fn terminal_outcome_code(outcome: &nexus_domain::TerminalOutcome) -> Option<&'static str> {
+    match outcome {
+        nexus_domain::TerminalOutcome::Unfinished => None,
+        nexus_domain::TerminalOutcome::Completed => Some("completed"),
+        nexus_domain::TerminalOutcome::Cancelled => Some("cancelled"),
+        nexus_domain::TerminalOutcome::Failed(_) => Some("failed"),
     }
 }
 
@@ -826,6 +847,42 @@ impl N2Store {
             .put(&key, data.as_bytes())
             .map_err(|e| format!("put revoked grant: {e}"))?;
         Ok(true)
+    }
+
+    /// 物理删除一条 grant（`nexus grant del` 的 purge 路径，P1-14）。
+    pub fn delete_grant(
+        &self,
+        resource: &nexus_domain::ResourceRef,
+        principal: &nexus_auth::Principal,
+    ) -> Result<bool, String> {
+        let key = grant_key(resource, principal);
+        let existed = self
+            .kv
+            .get(&key)
+            .map_err(|e| format!("read grant for delete: {e}"))?
+            .is_some();
+        self.kv
+            .delete(&key)
+            .map_err(|e| format!("delete grant: {e}"))?;
+        Ok(existed)
+    }
+
+    /// 撤销某资源的全部 grant（`resource revoke` 的授权侧后果，P1-14）。
+    ///
+    /// 返回被撤销的条数。资源撤销后，对该资源的所有已授权主体都必须立刻重新判定，
+    /// 否则"撤销资源"只撤广告、grant 仍在——下一跳仍然可用。
+    pub fn revoke_all_grants_for(
+        &self,
+        resource: &nexus_domain::ResourceRef,
+    ) -> Result<usize, String> {
+        let mut revoked = 0usize;
+        for grant in self.load_grants()? {
+            if &grant.resource == resource && !grant.revoked {
+                self.revoke_grant(&grant.resource, &grant.principal)?;
+                revoked += 1;
+            }
+        }
+        Ok(revoked)
     }
 
     /// 加载全部 grant。
@@ -1231,7 +1288,6 @@ impl N2Store {
 // ============================================================================
 
 const OUTBOX_PREFIX: &str = "n2/outbox/";
-
 impl N2Store {
     /// 控制帧入队（`seq` 由调用方单调递增；P0-5 发送后删除）。
     pub fn outbox_push(&self, seq: u64, frame_bytes: &[u8]) -> Result<(), String> {

@@ -23,8 +23,7 @@
 
 use nexus_domain::{LifecyclePhase, SessionId, TerminalOutcome};
 use nexus_session::{
-    ReconcilePolicy, SessionReconcileError, SessionRecord, SessionRecordStore,
-    reconcile_session_records,
+    SessionReconcileError, SessionRecord, SessionRecordStore, reconcile_session_records,
 };
 use nexus_storage::{InMemoryContentStore, ObjectId};
 use nexus_workspace::{AuthorId, Change, JournalReconcileReport, Workspace, WorkspaceId};
@@ -96,11 +95,11 @@ fn run_flow() -> Result<FlowReport, String> {
     // 1) 持久会话记录：Active + Unfinished（进程强杀时未达终态）。
     let mut rec_store = InMemorySessionRecordStore::default();
     rec_store.records.push(SessionRecord {
-        detached_at_unix: None,
         session: session_id.clone(),
         phase: LifecyclePhase::Active,
         outcome: TerminalOutcome::Unfinished,
         plan_snapshot: None,
+        detached_at_unix: None,
     });
 
     // 2) Workspace 写前日志：登记提交 C1（a.txt），随后“进程崩溃”，C1 未落 DAG。
@@ -135,9 +134,8 @@ fn run_flow() -> Result<FlowReport, String> {
     events.push(EV_WORKSPACE_JOURNAL_RECONCILED);
 
     // 4) 会话记录 reconcile：进程死亡 + 未达终态 -> 孤儿分类（恰一次 Failed）。
-    let session_report =
-        reconcile_session_records(&mut rec_store, ReconcilePolicy::process_dead(0))
-            .map_err(|e: SessionReconcileError| e.to_string())?;
+    let session_report = reconcile_session_records(&mut rec_store, false)
+        .map_err(|e: SessionReconcileError| e.to_string())?;
     if session_report.orphans_classified > 0 {
         events.push(EV_ORPHAN_SESSION_CLASSIFIED);
     }

@@ -19,7 +19,8 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use nexus_auth::{AuthRequest, GrantTable, Principal};
@@ -46,6 +47,15 @@ pub const CONTROL_LOCATOR_SCHEME: &str = "n2adm://";
 
 /// 提供方租约 TTL（秒；与 `use_cli::LEASE_TTL_SECS` 一致，P0 固定 1 小时）。
 pub const ADMISSION_LEASE_TTL_SECS: u64 = 3600;
+
+/// 提供方并发准入连接上限（P1-19：串行 accept 可被"连上不发数据"拖死）。
+///
+/// 每连接 10s 读超时；串行叠加即 DoS。超过上限时**拒绝新连接**（fail-closed，
+/// 附 `BUSY`），不排队无界增长。
+pub const MAX_CONCURRENT_ADMISSIONS: usize = 64;
+
+/// 连续瞬时 `accept` 错误多少次后退避（P1-19）。
+const ACCEPT_ERROR_BACKOFF_LIMIT: u32 = 8;
 
 /// 准入请求（请求方 → 提供方，JSON）。
 #[derive(Debug)]
@@ -106,6 +116,23 @@ impl AdmitError {
             AdmitError::Crypto(_) | AdmitError::Local(_) => false,
         }
     }
+    /// P1-9/P1-12：错误的机器可读码（use_cli 的 fail_json 用）。
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        if self.is_provider_unreachable() {
+            "PROVIDER_UNREACHABLE"
+        } else {
+            match self {
+                AdmitError::Protocol(_) => "ADMISSION_PROTOCOL_FAILED",
+                AdmitError::Crypto(_) => "ADMISSION_CRYPTO_FAILED",
+                AdmitError::Local(_) => "ADMISSION_LOCAL_FAILED",
+                AdmitError::Connect(_) | AdmitError::Io(_) => {
+                    unreachable!("is_provider_unreachable handled above")
+                }
+            }
+        }
+    }
+
 }
 
 impl std::fmt::Display for AdmitError {
@@ -541,8 +568,14 @@ fn prune_leases_now(node_dir: &std::path::Path, when: &str) {
     }
 }
 
-/// 在 `bind` 上监听并处理准入连接（`nexus provider serve` 用；`--once`
-/// 则只处理一条连接后返回，便于测试）。P1-19：非 `--once` 走有界并发。
+/// 在 `bind` 上监听并**并发**处理准入连接（`nexus provider serve` 用；`--once`
+/// 则只处理一条连接后返回，便于测试）。
+///
+/// P1-19：此前是 `loop { accept → serve_one_connection }` 串行——一个"连上不发
+/// 数据"的客户端就占住 10s 读超时，串行叠加即 DoS；且一次瞬时 `accept` 错误
+/// （`?`）会让整个 provider 进程退出。现在：
+/// - 每连接一个线程，并发上限 [`MAX_CONCURRENT_ADMISSIONS`]（超限直接拒绝）；
+/// - `accept` 瞬时错误（`Interrupted`/`WouldBlock`）重试，连续错误只记录不退出。
 pub fn serve_forever(bind: &str, node_dir: &std::path::Path, once: bool) -> Result<(), String> {
     let addr: SocketAddr = bind
         .parse()
@@ -558,52 +591,78 @@ pub fn serve_forever(bind: &str, node_dir: &std::path::Path, once: bool) -> Resu
         serde_json::json!({"verdict":"PASS","command":"provider serve","provider":{"control": bound}})
     );
     eprintln!(
-        "n2-admission: serving on {bound} (node_dir={})",
+        "n2-admission: serving on {bound} (node_dir={}, max_concurrent={MAX_CONCURRENT_ADMISSIONS})",
         node_dir.display()
     );
     // P1-21：§15 冷启动先 reconcile 再接受新工作——boot 即回收过期租约。
     prune_leases_now(node_dir, "boot");
-    let mut accepted: u64 = 0;
-    // P1-19：并发处理 + 有界背压 + accept 错误退避重试。
-    // - 每连接一线程：`set_read_timeout(10s)` 的慢连接不再阻塞 accept，
-    //   否则连上不发数据即可把整个 provider 控制面拖死；
-    // - `MAX_CONCURRENT_CONN` 上满时阻塞等待最旧 worker 结束（有界，不 OOM）；
-    // - 瞬时 accept 错误（EMFILE/ECONNABORTED…）退避重试，
-    //   而不是 `?` 让整个 provider 进程退出。
-    const MAX_CONCURRENT_CONN: usize = 64;
-    let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
-    loop {
+    serve_connections(&listener, node_dir, if once { Some(1) } else { None })
+}
+
+/// 并发准入 accept 循环（`serve_forever` 的内核，可单测）。
+///
+/// `max_connections = Some(n)` 时处理 n 条连接后返回（`--once` 用 `Some(1)`）。
+/// P1-19：每连接一个线程 ＋ 并发闸门；`accept` 瞬时错误重试、连续错误退避，
+/// 单个坏连接不得终止 provider。
+fn serve_connections(
+    listener: &TcpListener,
+    node_dir: &std::path::Path,
+    max_connections: Option<usize>,
+) -> Result<(), String> {
+    let inflight = Arc::new(AtomicUsize::new(0));
+    let mut consecutive_errors = 0u32;
+    let mut served = 0usize;
+    while max_connections.is_none_or(|max| served < max) {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                if once {
-                    let summary = serve_one_connection(&mut stream, node_dir);
-                    eprintln!("{summary}");
-                    break;
-                }
+                consecutive_errors = 0;
+                served += 1;
                 // P1-21：周期回收，长期运行不无界堆积。
-                accepted = accepted.wrapping_add(1);
-                if accepted % 64 == 0 {
+                if served % 64 == 0 {
                     prune_leases_now(node_dir, "periodic");
                 }
-                workers.retain(|h| !h.is_finished());
-                if workers.len() >= MAX_CONCURRENT_CONN {
-                    let oldest = workers.remove(0);
-                    let _ = oldest.join();
+                // 并发闸门：超限立即拒绝（不排队，避免无界内存增长）。
+                if inflight.load(Ordering::Relaxed) >= MAX_CONCURRENT_ADMISSIONS {
+                    eprintln!(
+                        "n2-admission: refusing connection ({} in flight >= cap {MAX_CONCURRENT_ADMISSIONS})",
+                        inflight.load(Ordering::Relaxed)
+                    );
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    continue;
                 }
-                let node_dir = node_dir.to_path_buf();
-                workers.push(std::thread::spawn(move || {
-                    let summary = serve_one_connection(&mut stream, &node_dir);
+                inflight.fetch_add(1, Ordering::Relaxed);
+                let counter = inflight.clone();
+                let dir = node_dir.to_path_buf();
+                // P1-19：每连接一线程；线程内完成握手后回收计数。
+                let spawned = std::thread::Builder::new().spawn(move || {
+                    let summary = serve_one_connection(&mut stream, &dir);
                     eprintln!("{summary}");
-                }));
+                    counter.fetch_sub(1, Ordering::Relaxed);
+                });
+                if let Err(e) = spawned {
+                    inflight.fetch_sub(1, Ordering::Relaxed);
+                    eprintln!("n2-admission: spawn handler failed: {e}");
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::Interrupted
+                    || e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                // 瞬时错误：重试，不退出（P1-19：此前一次瞬时错误即进程退出）。
+                consecutive_errors += 1;
+                if consecutive_errors > ACCEPT_ERROR_BACKOFF_LIMIT {
+                    eprintln!("n2-admission: too many transient accept errors; backing off");
+                    std::thread::sleep(Duration::from_millis(200));
+                    consecutive_errors = 0;
+                }
             }
             Err(e) => {
-                eprintln!("n2-admission: accept error: {e}; retrying in 50ms");
-                std::thread::sleep(Duration::from_millis(50));
+                // 非瞬时错误：记录并继续服务（单个坏连接不得终止 provider）。
+                consecutive_errors += 1;
+                eprintln!("n2-admission: accept error: {e} (continuing)");
+                std::thread::sleep(Duration::from_millis(100));
             }
         }
-    }
-    for w in workers {
-        let _ = w.join();
     }
     Ok(())
 }
@@ -1190,5 +1249,62 @@ mod tests {
         // 本地 store 故障不得被误标为 ProviderOffline（P1-12 关键回归）。
         let local = AdmitError::Local("store: /read-only".into());
         assert_eq!(format!("{local}"), "local: store: /read-only");
+    }
+
+    // ---- P1-19：并发准入 ----
+
+    #[test]
+    fn serve_connections_handles_idle_client_without_blocking_others() {
+        // 回归（P1-19）：串行 accept 时一个"连上不发数据"的客户端就把服务占死
+        // （每连接 10s 读超时，串行叠加即 DoS）。并发处理后，空闲连接不影响
+        // 后续连接的正常握手。
+        let dir = temp_node_dir("conc");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                serve_connections(&listener, &dir, Some(2)).expect("serve loop");
+            })
+        };
+        // 第一条连接：连上但不发任何数据（最坏情况占满读超时）。
+        let idle = TcpStream::connect(addr).unwrap();
+        // 第二条连接：必须立刻被处理完，而不是等第一条的 10s 超时。
+        let started = std::time::Instant::now();
+        let verdict = admit_session(
+            &addr.to_string(),
+            &dir,
+            "sess-conc-1",
+            &ResourceId("res-unknown".into()),
+        );
+        let elapsed = started.elapsed();
+        assert_eq!(verdict.unwrap(), AdmissionVerdict::NotFound);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "idle client must not stall the provider (took {elapsed:?})"
+        );
+        drop(idle);
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serve_connections_stops_after_max_connections() {
+        // `--once` 语义：处理一条连接后循环退出（loopback E4 前置依赖）。
+        let dir = temp_node_dir("once");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let done = std::thread::spawn({
+            let dir = dir.clone();
+            move || serve_connections(&listener, &dir, Some(1)).map(|_| ())
+        });
+        let _ = admit_session(
+            &addr.to_string(),
+            &dir,
+            "sess-once-1",
+            &ResourceId("res-unknown".into()),
+        );
+        let _ = done.join();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

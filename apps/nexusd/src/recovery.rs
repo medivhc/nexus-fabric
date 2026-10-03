@@ -33,8 +33,7 @@ use nexus_connectivity::{
 };
 use nexus_domain::{LifecyclePhase, NexusError, SessionId, TerminalOutcome};
 use nexus_session::{
-    ReconcilePolicy, SessionReconcileReport, SessionRecord, SessionRecordStore,
-    reconcile_session_records,
+    SessionReconcileReport, SessionRecord, SessionRecordStore, reconcile_session_records,
 };
 use serde_json::{Value, json};
 
@@ -485,17 +484,10 @@ pub fn boot_reconcile(state_dir: &Path, orphan_mountpoints: &[PathBuf]) -> BootR
     }
 
     let mut sess_store = FileSessionRecordStore::new(state_dir);
-    // P1-1：boot 时上一个进程必然已死；带当前时刻让 attach window 生效
-    // （已断开但仍在窗口内的记录不分类，超窗的判 `Cancelled(ClientDetached)`）。
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    match reconcile_session_records(&mut sess_store, ReconcilePolicy::process_dead(now)) {
+    match reconcile_session_records(&mut sess_store, false) {
         Ok(SessionReconcileReport {
             records_checked,
             orphans_classified,
-            ..
         }) => {
             report.sessions_checked = records_checked;
             report.orphans_classified = orphans_classified;
@@ -566,21 +558,21 @@ mod tests {
         store.save(&active_unfinished("s-1")).unwrap();
         store
             .save(&SessionRecord {
-                detached_at_unix: None,
                 session: SessionId("s-2".into()),
                 phase: LifecyclePhase::Disposed,
                 outcome: TerminalOutcome::Completed,
                 plan_snapshot: None,
+                detached_at_unix: None,
             })
             .unwrap();
         // upsert 同 id
         store
             .save(&SessionRecord {
-                detached_at_unix: None,
                 session: SessionId("s-1".into()),
                 phase: LifecyclePhase::Disposed,
                 outcome: TerminalOutcome::Cancelled,
                 plan_snapshot: None,
+                detached_at_unix: None,
             })
             .unwrap();
         let records = store.load().unwrap();

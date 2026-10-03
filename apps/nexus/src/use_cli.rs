@@ -106,11 +106,7 @@ fn render(out: &Value, json_mode: bool) -> i32 {
 ///
 /// 返回 `(session_id, plan_snapshot, endpoint)`；错误为结构化 `Value`
 ///（`verdict: FAIL` 的 JSON body）。
-pub fn use_resource(
-    node_dir: &std::path::Path,
-    name: &str,
-    now: u64,
-) -> Result<(String, PlanSnapshot, String), Value> {
+pub fn use_resource(node_dir: &std::path::Path, name: &str, now: u64) -> Result<UseOutcome, Value> {
     // ---- 0. `--` 后命令诚实拒绝（D4；`use` 不执行命令，那是 N3） ----
     // （参数层已拦截；此处为内核级二次保护。）
 
@@ -235,7 +231,7 @@ pub fn use_resource(
     // ---- 3b. 提供方侧租约（D1：admission 通过后记录租约） ----
     // （租约键 `n2/lease/<session-id>`；session_id 在 establish 后确定，
     //  此处先占位——实际写入在 establish 后。）
-
+    //
     // ---- 4. establish（D1：SessionManager 创建＋持久化；PlanSnapshot 内嵌） ----
     // （manager 已在 2b 预加载。）
     let session_id = manager
@@ -257,7 +253,17 @@ pub fn use_resource(
         .complete(&session_id)
         .map_err(|e| fail_json("SESSION", json!({"message": e.to_string()})))?;
     debug_assert_eq!(view.outcome, nexus_domain::TerminalOutcome::Completed);
-    Ok((session_id.0, snapshot, endpoint))
+    // P1-9：对"暴露的访问入口"做一次真实连通性探测。种子/演示地址不在本次
+    // 判定内改变 `verdict`（`n2-use-loop` 的冻结期望以静态种子为准），但探测
+    // 结果必须如实出现在输出里，不再"未经确认就宣告可访问"。
+    let probe = probe_endpoint(&endpoint);
+    Ok(UseOutcome {
+        session_id: session_id.0,
+        snapshot,
+        endpoint,
+        probe,
+        cross_machine: false,
+    })
 }
 
 /// 跨机路径（P0-5）：选中 provider 为远端（广告含 `n2adm://` 准入端点）。
@@ -278,7 +284,7 @@ fn use_remote(
     endpoint: &str,
     control: &str,
     now: u64,
-) -> Result<(String, PlanSnapshot, String), Value> {
+) -> Result<UseOutcome, Value> {
     let session_id = manager
         .open(resource_id.clone(), provider_id.clone(), snapshot.clone())
         .map_err(|e| fail_json("SESSION", json!({"message": e.to_string()})))?;
@@ -296,11 +302,36 @@ fn use_remote(
             } else {
                 adm_endpoint
             };
+            // P1-9：跨机路径的入口由提供方**在准入响应中背书**（不是本地
+            // 缓存的静态种子），因此必须连得通才宣告成功——连不上即结构化失败，
+            // 而不是"输出一个从没验证过的入口 + PASS"。
+            let probe = probe_endpoint(&ep);
+            if !probe.reachable {
+                close_attempt(manager, "service-endpoint-unreachable");
+                return Err(fail_json(
+                    "ENDPOINT_UNREACHABLE",
+                    json!({
+                        "provider": provider_id.0,
+                        "endpoint": ep,
+                        "detail": probe.detail,
+                        "message": format!(
+                            "provider {} admitted the session but its service endpoint {ep} is unreachable: {}",
+                            provider_id.0, probe.detail
+                        ),
+                    }),
+                ));
+            }
             let view = manager
                 .complete(&session_id)
                 .map_err(|e| fail_json("SESSION", json!({"message": e.to_string()})))?;
             debug_assert_eq!(view.outcome, nexus_domain::TerminalOutcome::Completed);
-            Ok((session_id.0, snapshot.clone(), ep))
+            Ok(UseOutcome {
+                session_id: session_id.0,
+                snapshot: snapshot.clone(),
+                endpoint: ep,
+                probe,
+                cross_machine: true,
+            })
         }
         Ok(AdmissionVerdict::Denied { deny }) => {
             close_attempt(manager, &format!("admission-denied:{deny}"));
@@ -351,15 +382,76 @@ fn use_remote(
         Err(e) => {
             close_attempt(manager, "admission-error");
             Err(fail_json(
-                "CONNECT_FAILED",
+                e.code(),
                 json!({
                     "provider": provider_id.0,
+                    "detail": e.code(),
                     "message": format!("admission to {} failed: {e}", provider_id.0),
                 }),
             ))
         }
     }
 }
+
+/// 端点连通性探测结果（§16.4-1"建立真实访问"）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointProbe {
+    /// 声明的访问入口（原样）。
+    pub endpoint: String,
+    /// 是否真的连得上（TCP）。
+    pub reachable: bool,
+    /// 不可达原因（`reachable == true` 时为空）。
+    pub detail: String,
+}
+
+/// `use` 成功路径的产物（四步闭环结果 ＋ 端点探测事实）。
+#[derive(Debug, Clone)]
+pub struct UseOutcome {
+    pub session_id: String,
+    pub snapshot: PlanSnapshot,
+    /// 宣告的访问入口。
+    pub endpoint: String,
+    /// 该入口的真实连通性（`use` 不再"未经确认就宣告可访问"）。
+    pub probe: EndpointProbe,
+    /// 入口是否来自远端提供方的准入响应（跨机路径）。
+    pub cross_machine: bool,
+}
+
+/// 探测 `access.endpoint` 的 TCP 连通性（P1-9）。
+///
+/// locator 可能带 scheme（`tcp://host:port`）也可能是不带（`127.0.0.1:8080`）；
+/// 先剥 scheme 再解析 `SocketAddr`。无法解析形状时诚实报"未知"（不猜）。
+pub fn probe_endpoint(endpoint: &str) -> EndpointProbe {
+    let hostport = endpoint
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(endpoint);
+    let Ok(addr) = hostport.parse::<std::net::SocketAddr>() else {
+        return EndpointProbe {
+            endpoint: endpoint.to_string(),
+            reachable: false,
+            detail: format!("unparsable endpoint shape: {hostport}"),
+        };
+    };
+    match std::net::TcpStream::connect_timeout(&addr, ENDPOINT_PROBE_TIMEOUT) {
+        Ok(s) => {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+            EndpointProbe {
+                endpoint: endpoint.to_string(),
+                reachable: true,
+                detail: "connected".to_string(),
+            }
+        }
+        Err(e) => EndpointProbe {
+            endpoint: endpoint.to_string(),
+            reachable: false,
+            detail: format!("connect {addr}: {e}"),
+        },
+    }
+}
+
+/// 端点探测超时（秒）。
+pub const ENDPOINT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// 把持久化广告标记为 ProviderOffline（`n2-provider-offline` 的状态沉淀）。
 fn mark_provider_offline(
@@ -401,26 +493,15 @@ fn save_lease(store: &N2Store, lease: &SessionLease) -> Result<(), String> {
 /// 端点连通性探测（P1-9）：宣告 `access.endpoint` 前至少做一次 TCP 探测。
 ///
 /// `endpoint` 形如 `127.0.0.1:8080` / `tcp://10.0.0.1:8080`（剥离 scheme 后
-/// 必须是 `SocketAddr`）。返回 `(是否可达, 不可达原因)`。
-///
-/// 结果**不**参与判定：`n2-use-loop` 冻结契约要求 `verdict=PASS`，而"会话已
-/// 建立"（准入裁定）与"数据面端点此刻可连通"是两件事——把后者作为
-/// `access.reachable` 显式暴露，PASS 不再隐含未经验证的真实访问。
-/// 探测有界（<1s），拨号失败为本机立即拒绝，不引入长挂起。
-fn probe_endpoint(endpoint: &str) -> (bool, Option<String>) {
-    use std::net::{SocketAddr, TcpStream};
-    use std::time::Duration;
-    let bare = endpoint.rsplit("://").next().unwrap_or(endpoint);
-    let Ok(addr) = bare.parse::<SocketAddr>() else {
-        return (false, Some(format!("unparseable endpoint '{endpoint}'")));
-    };
-    match TcpStream::connect_timeout(&addr, Duration::from_millis(800)) {
-        Ok(_) => (true, None),
-        Err(e) => (false, Some(format!("{addr}: {e}"))),
-    }
-}
-
 /// `nexus use` 命令族入口。
+///
+/// 退出码约定（P1-20）：
+/// - `0` = `verdict: PASS`；
+/// - `1` = `verdict: FAIL`（业务失败：授权拒绝 / 提供方不可达 / 端点不可达 …）；
+/// - `2` = 用法错误（缺参数 / 多余参数）。
+///
+/// 此前业务 FAIL 也返回 0，`$?` 无法判失败；场景判定只看 JSON 的 `verdict`，
+/// 因此本改动不影响任何冻结期望。
 pub fn run_use(args: &[String], json_mode: bool) -> i32 {
     const USAGE: &str = "usage: nexus use <resource>";
     // `--` 后命令：D4 诚实拒绝（那是 N3 任务语义）。
@@ -449,14 +530,20 @@ pub fn run_use(args: &[String], json_mode: bool) -> i32 {
 
     let node_dir = crate::node_cli::node_dir();
     match use_resource(&node_dir, name, now_secs()) {
-        Ok((session_id, snapshot, endpoint)) => {
-            // P1-9：宣告访问入口前先探一跳（判定仍 PASS，见 `probe_endpoint`）。
-            let (reachable, probe_error) = probe_endpoint(&endpoint);
-            let mut access = serde_json::Map::new();
-            access.insert("endpoint".to_string(), json!(endpoint));
-            access.insert("reachable".to_string(), json!(reachable));
-            if let Some(e) = probe_error {
-                access.insert("probe_error".to_string(), json!(e));
+        Ok(outcome) => {
+            let snapshot = outcome.snapshot;
+            let mut access = json!({
+                "endpoint": outcome.endpoint,
+                // P1-9：访问入口的真实连通性（探测结果，不隐藏）。
+                "reachable": outcome.probe.reachable,
+                "probe": outcome.probe.detail,
+                "cross_machine": outcome.cross_machine,
+            });
+            if !outcome.probe.reachable {
+                access["warning"] = json!(format!(
+                    "endpoint {} could not be reached during use: {}",
+                    outcome.probe.endpoint, outcome.probe.detail
+                ));
             }
             let out = json!({
                 "verdict": "PASS",
@@ -464,11 +551,11 @@ pub fn run_use(args: &[String], json_mode: bool) -> i32 {
                 "directory": DIRECTORY_TAG,
                 "use": {
                     "resource": name,
-                    "session_id": session_id,
+                    "session_id": outcome.session_id,
                     "plan_id": snapshot.plan_id.as_str(),
                     "outcome": "Completed",
                     "provider": snapshot.plan.provider_id.0,
-                    "access": Value::Object(access),
+                    "access": access,
                 },
             });
             render(&out, json_mode)
@@ -512,11 +599,16 @@ mod tests {
         // 四步闭环（E2）：grant 存在 → PASS，真实 session_id / plan_id / endpoint。
         let dir = temp_node_dir("four-steps");
         grant_for(&dir, "dev-svc");
-        let (session_id, snapshot, endpoint) = use_resource(&dir, "dev-svc", 1000).unwrap();
-        assert!(session_id.starts_with("sess-"));
+        let outcome = use_resource(&dir, "dev-svc", 1000).unwrap();
+        assert!(outcome.session_id.starts_with("sess-"));
+        let snapshot = &outcome.snapshot;
         assert!(!snapshot.plan_id.as_str().is_empty());
         assert_eq!(snapshot.plan.provider_id.0, "local-dev-1");
-        assert_eq!(endpoint, "127.0.0.1:8080");
+        assert_eq!(outcome.endpoint, "127.0.0.1:8080");
+        // P1-9：入口连通性被如实探测并回报（不隐藏结果）。
+        assert_eq!(outcome.probe.endpoint, outcome.endpoint);
+        assert!(!outcome.probe.detail.is_empty());
+        assert!(!outcome.cross_machine);
         // PlanSnapshot 内嵌非重算：plan_id 与 planner 产物一致。
         assert_eq!(
             snapshot.plan_id,
@@ -530,7 +622,8 @@ mod tests {
         // establish 持久化：CLI 退出重进可按 session_id 查到＋历史 trace。
         let dir = temp_node_dir("persist");
         grant_for(&dir, "dev-svc");
-        let (session_id, snapshot, _) = use_resource(&dir, "dev-svc", 1000).unwrap();
+        let outcome = use_resource(&dir, "dev-svc", 1000).unwrap();
+        let (session_id, snapshot) = (outcome.session_id, outcome.snapshot);
         // 新 manager 从同一 store 加载（模拟重进）。
         let store = N2Store::open(&dir).unwrap();
         let mut manager =
@@ -604,7 +697,7 @@ mod tests {
         // D1 提供方侧租约：authorize 通过后落盘。
         let dir = temp_node_dir("lease");
         grant_for(&dir, "dev-svc");
-        let (session_id, _, _) = use_resource(&dir, "dev-svc", 1000).unwrap();
+        let session_id = use_resource(&dir, "dev-svc", 1000).unwrap().session_id;
         let store = N2Store::open(&dir).unwrap();
         let bytes = store
             .kv()
@@ -634,26 +727,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ---- P1-9：访问入口连通性探测 ----
+
     #[test]
-    fn probe_endpoint_rejects_unparseable_and_reports_refusal() {
-        // P1-9：不可解析的入口必须显式报不可达（含原因），不得静默 PASS 隐含。
-        let (ok, err) = probe_endpoint("not-an-endpoint");
-        assert!(!ok);
-        assert!(
-            err.as_deref().unwrap_or("").contains("unparseable"),
-            "{err:?}"
-        );
-        // 剥离 scheme 后按 SocketAddr 解析。
-        let (ok, _) = probe_endpoint("tcp://127.0.0.1:9999");
-        assert!(!ok);
-        // 本机未监听端口 → 拨号被拒（立即返回，非超时）。
+    fn probe_endpoint_reports_unreachable_on_closed_port() {
+        // 找一个确定没人监听的端口（bind 后立刻 drop）。
+        let probe_free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe_free.local_addr().unwrap();
+        drop(probe_free);
+        let p = probe_endpoint(&addr.to_string());
+        assert!(!p.reachable, "{p:?}");
+        assert!(p.detail.contains("connect"));
+        assert_eq!(p.endpoint, addr.to_string());
+    }
+
+    #[test]
+    fn probe_endpoint_reports_reachable_on_listening_port() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let (ok, err) = probe_endpoint(&addr.to_string());
-        assert!(ok, "{err:?}");
+        let p = probe_endpoint(&addr.to_string());
+        assert!(p.reachable, "{p:?}");
+        assert_eq!(p.detail, "connected");
         drop(listener);
-        let (ok, err) = probe_endpoint(&format!("tcp://{addr}"));
-        assert!(!ok, "端口已关闭必须报不可达");
-        assert!(err.is_some());
     }
+
+    #[test]
+    fn probe_endpoint_strips_locator_scheme() {
+        // locator 可能带 scheme：`tcp://host:port` 与裸 `host:port` 等价。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        assert!(probe_endpoint(&format!("tcp://{addr}")).reachable);
+        drop(listener);
+    }
+
+    #[test]
+    fn probe_endpoint_refuses_to_invent_reachability_for_unparsable_shape() {
+        // 形状不认识就诚实报未知，不猜"可达"。
+        let p = probe_endpoint("not-an-endpoint");
+        assert!(!p.reachable);
+        assert!(p.detail.contains("unparsable"), "{}", p.detail);
+    }
+
+
+    // ---- P1-20：退出码 ----
+
+    #[test]
+    fn business_fail_exits_nonzero_and_usage_errors_exit_2() {
+        assert_eq!(run_use(&[], true), 2);
+        assert_eq!(run_use(&["a".to_string(), "b".to_string()], true), 2);
+        assert_eq!(run_use(&["-x".to_string()], true), 2);
+        // 业务 FAIL（`--` 诚实拒绝）→ 1，不再是 0。
+        assert_eq!(
+            run_use(
+                &["dev-svc".to_string(), "--".to_string(), "ls".to_string()],
+                true
+            ),
+            1
+        );
+    }
+
+    // ---- P1-21：过期租约回收 ----
+
+
 }

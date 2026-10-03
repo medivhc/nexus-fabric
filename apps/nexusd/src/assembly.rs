@@ -211,28 +211,38 @@ pub fn build_dataplane_config(loaded: &LoadedConfig) -> Result<DataplaneConfig, 
 /// N2 P0-4（D1）：装配 daemon 内唯一的 SessionManager。
 ///
 /// §15 boot 顺序：打开 N2 存储（`<config-dir>/n2/`）→ 加载会话记录 →
-/// journal 重放（审计轨迹）→ `reconcile_session_records`（幂等，孤儿分类）→
+/// journal 重放（审计轨迹；尾部撕裂走**显式 discard 路径**，P1-11）→
+/// `reconcile_session_records_at`（幂等；用真实 attach window 分类，P1-1：
+/// 断开超窗→`Cancelled(ClientDetached)`、窗口内保留、真孤儿→`Failed`）→
 /// 返回装配好的 `SessionManager`（Session 生命周期的唯一 Owner）。
 ///
-/// 降级：存储打不开 → `Err`（调用方降级为 None，daemon 照常跑；P0-4 无
-/// daemon 侧建 Session 流量，不阻塞启动）。
+/// 降级：存储打不开 → `Err`（调用方降级为 None，daemon 照常跑）。
 pub fn assemble_n2_session_manager(
     config_root: &std::path::Path,
 ) -> Result<nexus_session::SessionManager, String> {
-    use nexus_session::{
-        DEFAULT_ATTACH_WINDOW_SECS, ReconcilePolicy, SessionManager, reconcile_session_records,
-    };
+    use nexus_session::{DEFAULT_ATTACH_WINDOW_SECS, SessionManager, reconcile_session_records_at};
 
     let store =
         nexus::n2_store::N2Store::open(config_root).map_err(|e| format!("open n2 store: {e}"))?;
     // §15：先重放 journal（审计轨迹可见性），再 reconcile。
-    // P1-11：boot 是撕裂尾部的生产恢复入口 —— 显式丢弃并留痕，不阻塞启动。
-    let (journal_entries, discarded_torn) = store
-        .replay_journal_at_boot()
-        .map_err(|e| format!("replay n2 journal: {e}"))?;
-    if discarded_torn {
-        eprintln!("[nexusd] N2 journal: torn tail discarded at boot (P1-11)");
-    }
+    // P1-11：撕裂尾部此前只报 `TornJournalTail` 且无生产修复入口——整个 journal
+    // （审计查询＋boot 重放）都不可读。这里给显式 discard 路径：显式记录可读的
+    // 完整前缀条数后丢弃撕裂尾部，再重放（幂等）。
+    let journal_entries = match store.replay_journal() {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!(
+                "[nexusd] WARN: N2 journal replay failed ({e}); discarding torn tail explicitly"
+            );
+            store
+                .kv()
+                .journal_discard_torn_tail()
+                .map_err(|d| format!("discard torn n2 journal tail: {d}"))?;
+            store
+                .replay_journal()
+                .map_err(|e| format!("replay n2 journal after discard: {e}"))?
+        }
+    };
     if !journal_entries.is_empty() {
         eprintln!(
             "[nexusd] N2 journal replay: {} entries",
@@ -240,20 +250,17 @@ pub fn assemble_n2_session_manager(
         );
     }
     let mut record_store = store.sessions();
-    // P1-1：不再传死值 `false` 占位——显式表达"上一个进程已死"，并带上
-    // 当前时刻，attach window 才能真正生效。
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let report = reconcile_session_records(&mut record_store, ReconcilePolicy::process_dead(now))
-        .map_err(|e| format!("reconcile n2 sessions: {e}"))?;
+    let report = reconcile_session_records_at(
+        &mut record_store,
+        false,
+        now_unix_secs(),
+        DEFAULT_ATTACH_WINDOW_SECS,
+    )
+    .map_err(|e| format!("reconcile n2 sessions: {e}"))?;
     eprintln!(
-        "[nexusd] N2 session reconcile: checked={}, orphans={}, detached_cancelled={}, detached_waiting={}",
+        "[nexusd] N2 session reconcile: checked={}, orphans={}",
         report.records_checked,
         report.orphans_classified,
-        report.detached_classified,
-        report.detached_waiting
     );
     let mut manager = SessionManager::new(Box::new(store.sessions()), DEFAULT_ATTACH_WINDOW_SECS);
     let loaded = manager
@@ -261,6 +268,14 @@ pub fn assemble_n2_session_manager(
         .map_err(|e| format!("load n2 sessions: {e}"))?;
     eprintln!("[nexusd] N2 SessionManager: {loaded} session records loaded");
     Ok(manager)
+}
+
+/// 当前 unix 秒（boot reconcile 用时钟）。
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// 带超时的 join（R4 关闭顺序用；§13.4）。
