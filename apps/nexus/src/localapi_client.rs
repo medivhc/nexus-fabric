@@ -43,10 +43,30 @@ pub enum LocalApiTarget {
 /// 注意与 `nexusd serve`（无 `--addr`/`--socket` 时）保持一致。
 #[must_use]
 pub fn default_socket_path() -> PathBuf {
-    if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(rt).join("nexus-localapi.sock");
+    runtime_socket_path().unwrap_or_else(|| std::env::temp_dir().join("nexus-localapi.sock"))
+}
+
+/// 只在 `$XDG_RUNTIME_DIR` 已设置时给出 unix socket 路径（P1-15）。
+///
+/// **daemon 侧必须用这个**：未设置 `XDG_RUNTIME_DIR` 时回落到
+/// `temp_dir()/nexus-localapi.sock` 是可预测＋世界可写的路径——同机其他用户
+/// 可以抢占或替换该路径（socket 劫持）。daemon 因此拒绝该回退，改用 TCP
+/// loopback 并告警（见 `nexusd serve`）；bearer token 是剩下的唯一屏障。
+#[must_use]
+pub fn runtime_socket_path() -> Option<PathBuf> {
+    runtime_socket_path_in(std::env::var_os("XDG_RUNTIME_DIR"))
+}
+
+/// [`runtime_socket_path`] 的纯函数内核（`xdg = $XDG_RUNTIME_DIR` 的取值）。
+///
+/// 未设置 / 空串 → `None`（调用方必须拒绝可预测的 `/tmp` 回落）。
+#[must_use]
+pub fn runtime_socket_path_in(xdg: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let rt = xdg?;
+    if rt.is_empty() {
+        return None;
     }
-    std::env::temp_dir().join("nexus-localapi.sock")
+    Some(PathBuf::from(rt).join("nexus-localapi.sock"))
 }
 
 /// 默认传输目标（unix 上为 socket；Windows 上 named pipe 未实现，退 TCP）。
@@ -615,5 +635,25 @@ mod tests {
         assert!(matches!(default_target(), LocalApiTarget::Socket(_)));
         #[cfg(not(unix))]
         assert!(matches!(default_target(), LocalApiTarget::Tcp(_)));
+    }
+
+    #[test]
+    fn runtime_socket_path_requires_xdg_runtime_dir() {
+        // P1-15：daemon 不得回落到可预测的 /tmp 路径（可被同机他人抢占）。
+        assert_eq!(runtime_socket_path_in(None), None);
+        assert_eq!(runtime_socket_path_in(Some(std::ffi::OsString::new())), None);
+        assert_eq!(
+            runtime_socket_path_in(Some(std::ffi::OsString::from("/run/user/1000"))),
+            Some(PathBuf::from("/run/user/1000").join("nexus-localapi.sock"))
+        );
+    }
+
+    #[test]
+    fn default_socket_path_is_never_outside_xdg_when_set() {
+        // 兼容入口：有 XDG 时与 runtime_socket_path 一致。
+        let expected = runtime_socket_path_in(std::env::var_os("XDG_RUNTIME_DIR"));
+        if let Some(exp) = expected {
+            assert_eq!(default_socket_path(), exp);
+        }
     }
 }

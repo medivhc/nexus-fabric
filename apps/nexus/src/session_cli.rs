@@ -11,6 +11,14 @@
 //! N2 语义的 `session` 命令族走进程内 N2 存储（与 `plan` 同模式），daemon 的
 //! `/localapi/v0/session/watch` 保留其 §9 冻结行为（`observability_session_watch`
 //! 场景不经过本模块）。
+//!
+//! D1（N2 P1-1）：**终态的唯一写入者**是 daemon 内唯一的 `SessionManager`
+//! （`apps/nexusd` 的 `N2_SESSION_MANAGER` + 周期性 `sweep_detached`），它对外
+//! 暴露 `/localapi/v0/n2/session/list` 与 `/attach`。本模块的 `list` / `watch`
+//! 是**纯读口**——直接读同一份持久化记录，因此与 daemon 看到的会话状态一致；
+//! `close` 是写操作，走进程内 manager，但持久记录层的终态 CAS
+//! （`KvSessionRecordStore::save` 先到终态获胜）保证它不会覆盖 daemon 已提交的
+//! 终态（冲突时报错而非静默改写）。
 
 use nexus_domain::{SessionId, TerminalOutcome};
 use nexus_session::{DEFAULT_ATTACH_WINDOW_SECS, SessionManager, SessionManagerError, SessionView};

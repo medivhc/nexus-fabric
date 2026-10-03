@@ -37,9 +37,163 @@ static WORKSPACE_MGR: std::sync::OnceLock<
     std::sync::Mutex<Option<nexusd::workspace::WorkspaceManager>>,
 > = std::sync::OnceLock::new();
 
+/// D1（N2）：daemon 内**全系统唯一**的 N2 `SessionManager`（N2 P1-1）。
+///
+/// 此前装配完即被 drop（`let _n2_session_manager = ...`），daemon 从不持有实例，
+/// 于是"daemon 内唯一 SessionManager"只是纸面声明；Session 生命周期实际由每个
+/// CLI 进程各建一个 manager。现在实例真正被持有：
+/// - LocalAPI 的 N2 会话读口（`/localapi/v0/n2/session/list`、`/attach`）从这里读；
+/// - [`spawn_n2_session_sweeper`] 的周期性 `sweep_detached` 在这里提交终态。
+///
+/// `None` = 装配失败（degraded：daemon 照常跑，LocalAPI 返回结构化 FAIL）。
+static N2_SESSION_MANAGER: std::sync::OnceLock<std::sync::Mutex<Option<nexus_session::SessionManager>>> =
+    std::sync::OnceLock::new();
+
+/// N2 会话清扫周期（秒）：断开超 attach window 的会话由 daemon 收敛为
+/// `Cancelled(ClientDetached)`（P1-2：`sweep_detached` 生产可达）。
+const N2_SESSION_SWEEP_INTERVAL_SECS: u64 = 30;
+
 /// 发布 tun_enabled 状态（daemon 启动时调用一次）。
 fn publish_tun_enabled(enabled: bool) {
     let _ = TUN_ENABLED.set(enabled);
+}
+
+/// 周期性子线程：提交断开超窗会话的终态（P1-2 / D7：断开≠Failed，窗口外→Cancelled）。
+///
+/// §13 结构化并发：Owner 是 `N2_SESSION_MANAGER` 里的唯一 SessionManager；
+/// 子线程只调用 `sweep_detached`（Owner 状态机写入），`shutdown` 置位后退出。
+fn spawn_n2_session_sweeper(shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    let flag = shutdown.clone();
+    std::thread::Builder::new()
+        .name("n2-session-sweeper".to_string())
+        .spawn(move || loop {
+            for _ in 0..N2_SESSION_SWEEP_INTERVAL_SECS {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let swept = {
+                let Some(cell) = N2_SESSION_MANAGER.get() else {
+                    continue;
+                };
+                let Ok(mut guard) = cell.lock() else {
+                    eprintln!("[nexusd] WARN: N2 session sweeper: manager lock poisoned");
+                    return;
+                };
+                let Some(mgr) = guard.as_mut() else {
+                    continue;
+                };
+                mgr.sweep_detached(now_unix())
+            };
+            for id in swept {
+                eprintln!("[nexusd] N2 session detached beyond attach window -> Cancelled: {id:?}");
+            }
+        })
+        .map(|_| ())
+        .unwrap_or_else(|e| eprintln!("[nexusd] WARN: N2 session sweeper spawn failed: {e}"));
+}
+
+/// 当前 unix 秒（daemon 侧时钟；reconcile/sweep 用）。
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// N2 会话视图 → LocalAPI JSON（daemon 内唯一 SessionManager 的读口）。
+fn n2_session_view_json(view: &nexus_session::SessionView) -> Value {
+    json!({
+        "id": view.id.0,
+        "resource": view.resource.0,
+        "provider": view.provider.0,
+        "phase": format!("{:?}", view.phase),
+        "outcome": outcome_label(&view.outcome),
+        "cancel_reason": view.cancel_reason.as_ref().map(|r| r.as_str()),
+        "reattachable": view.reattachable,
+        "plan_id": view.plan_snapshot.as_ref().map(|s| s.plan_id.0.clone()),
+    })
+}
+
+fn outcome_label(outcome: &nexus_domain::TerminalOutcome) -> &'static str {
+    use nexus_domain::TerminalOutcome;
+    match outcome {
+        TerminalOutcome::Unfinished => "Unfinished",
+        TerminalOutcome::Completed => "Completed",
+        TerminalOutcome::Cancelled => "Cancelled",
+        TerminalOutcome::Failed(_) => "Failed",
+    }
+}
+
+/// `GET /localapi/v0/n2/session/list` — daemon 内唯一 SessionManager 的会话列表（D1）。
+fn n2_session_list() -> Result<Value, (String, String)> {
+    let Some(cell) = N2_SESSION_MANAGER.get() else {
+        return Err((
+            "N2_UNAVAILABLE".to_string(),
+            "N2 session manager not assembled".to_string(),
+        ));
+    };
+    let guard = cell
+        .lock()
+        .map_err(|_| {
+            (
+                "N2_UNAVAILABLE".to_string(),
+                "N2 session manager lock poisoned".to_string(),
+            )
+        })?;
+    let mgr = guard.as_ref().ok_or_else(|| {
+        (
+            "N2_UNAVAILABLE".to_string(),
+            "N2 session manager assembly degraded".to_string(),
+        )
+    })?;
+    Ok(json!({
+        "verdict": "PASS",
+        "owner": "daemon",
+        "sessions": mgr.list().iter().map(n2_session_view_json).collect::<Vec<_>>(),
+    }))
+}
+
+/// `GET /localapi/v0/n2/session/attach?session=<id>` — 重附着查询（完成标志 3）。
+fn n2_session_attach(id: Option<&str>) -> Result<Value, (String, String)> {
+    let Some(cell) = N2_SESSION_MANAGER.get() else {
+        return Err((
+            "N2_UNAVAILABLE".to_string(),
+            "N2 session manager not assembled".to_string(),
+        ));
+    };
+    let guard = cell
+        .lock()
+        .map_err(|_| {
+            (
+                "N2_UNAVAILABLE".to_string(),
+                "N2 session manager lock poisoned".to_string(),
+            )
+        })?;
+    let mgr = guard.as_ref().ok_or_else(|| {
+        (
+            "N2_UNAVAILABLE".to_string(),
+            "N2 session manager assembly degraded".to_string(),
+        )
+    })?;
+    let Some(id) = id.filter(|s| !s.is_empty()) else {
+        return Err((
+            "BAD_REQUEST".to_string(),
+            "missing 'session' query parameter".to_string(),
+        ));
+    };
+    match mgr.attach(&nexus_domain::SessionId(id.to_string())) {
+        Ok(view) => Ok(json!({"verdict": "PASS", "owner": "daemon", "session": n2_session_view_json(&view)})),
+        Err(_) => Ok(json!({
+            "verdict": "FAIL",
+            "owner": "daemon",
+            "error": {"code": "NOT_FOUND", "session": id},
+        })),
+    }
 }
 
 /// 读取 tun_enabled 状态（默认 true，保持向后兼容）。
@@ -259,23 +413,25 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     // N2 P0-4（D1）：装配 daemon 内唯一的 SessionManager。
     //
     // §15 顺序：N2 会话存储（`<config-dir>/n2/`）加载 → journal 重放 →
-    // `reconcile_session_records`（幂等）→ 接受新工作。SessionManager 是
-    // Session 生命周期的唯一 Owner（§13 结构化并发）；提供方侧只做
-    // admission＋租约，不做第二个领域 Session。P0-4 中 daemon 侧尚无
-    // 跨机建 Session 流量（P0-5），此处装配＋持有实例，boot reconcile 先行。
-    let _n2_session_manager = match assembly::assemble_n2_session_manager(&dir.root) {
+    // `reconcile_session_records_at`（幂等；用真实 attach window 分类，P1-1：
+    // 不再一律判 Failed）→ 接受新工作。SessionManager 是 Session 生命周期的
+    // 唯一 Owner（§13 结构化并发）；提供方侧只做 admission＋租约，不做第二个
+    // 领域 Session。
+    match assembly::assemble_n2_session_manager(&dir.root) {
         Ok(mgr) => {
             eprintln!(
                 "[nexusd] N2 SessionManager assembled ({} sessions loaded)",
                 mgr.len()
             );
-            Some(Box::new(mgr))
+            // 真正持有实例（D1 落地）＋周期性 sweep_detached（P1-2）。
+            let _ = N2_SESSION_MANAGER.set(std::sync::Mutex::new(Some(mgr)));
+            spawn_n2_session_sweeper(&shutdown);
         }
         Err(e) => {
             eprintln!("[nexusd] WARN: N2 SessionManager assembly failed: {e} (degraded)");
-            None
+            let _ = N2_SESSION_MANAGER.set(std::sync::Mutex::new(None));
         }
-    };
+    }
 
     // T3：缺 proxy.yaml 且缺 network.toml 且缺 workspace.toml → 拒绝启动（无意义）。
     if loaded.proxy_yaml.is_none()
@@ -625,11 +781,19 @@ fn serve_resource(args: &[String]) -> ExitCode {
         None => match flags.get("--socket").and_then(|v| v.as_deref()) {
             Some(path) => serve_over_socket(path),
             // D8（N2 P0-1）：默认 unix socket（与 CLI `default_socket_path` 一致）。
+            // P1-15：socket 路径必须来自 `$XDG_RUNTIME_DIR`（0700、per-user、
+            // 不可预测）；未设置时**不**回落到可预测的 `/tmp` 路径，改用 TCP
+            // loopback 并告警（bearer token 仍是唯一屏障）。
             #[cfg(unix)]
-            None => {
-                let sock = nexus::localapi_client::default_socket_path();
-                serve_over_socket(&sock.display().to_string())
-            }
+            None => match nexus::localapi_client::runtime_socket_path() {
+                Some(sock) => serve_over_socket(&sock.display().to_string()),
+                None => {
+                    eprintln!(
+                        "[nexusd] WARN: XDG_RUNTIME_DIR unset; refusing predictable /tmp socket path — falling back to TCP loopback"
+                    );
+                    serve_over_tcp(nexus::localapi_client::DEFAULT_LOCALAPI_ADDR)
+                }
+            },
             #[cfg(not(unix))]
             None => serve_over_tcp("127.0.0.1:0"),
         },
@@ -645,6 +809,12 @@ fn localapi_bearer_token() -> Result<String, ExitCode> {
         ExitCode::SUCCESS
     })
 }
+
+/// LocalAPI 每连接读写超时（P1-15）。
+///
+/// 控制面是单线程顺序服务：一个"连上不发换行"的客户端会永久占住它，
+/// 连带阻塞所有有副作用的路由（如 `workspace commit`）。
+const LOCALAPI_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// TCP loopback 监听 + 服务循环（既有行为）。
 fn serve_over_tcp(addr_raw: &str) -> ExitCode {
@@ -677,6 +847,9 @@ fn serve_over_tcp(addr_raw: &str) -> ExitCode {
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
+                // P1-15：每连接读写超时（与 unix socket 传输同）。
+                let _ = stream.set_read_timeout(Some(LOCALAPI_IO_TIMEOUT));
+                let _ = stream.set_write_timeout(Some(LOCALAPI_IO_TIMEOUT));
                 if let Err(e) = handle_localapi_request(&mut stream, &token) {
                     eprintln!("serve connection error: {e}");
                 }
@@ -688,6 +861,24 @@ fn serve_over_tcp(addr_raw: &str) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// LocalAPI unix socket 的权限收紧（P1-15）：bind 后立即 `chmod 0600`。
+///
+/// bind 之前 socket 文件的权限受 umask 影响，可能是 0755/0777——同机其他用户
+/// 可连上控制面。0600 与 bearer token 双保险。返回是否收紧成功。
+///
+/// 独立函数便于单测（`serve_over_socket` 内联无法单测）。
+#[cfg(unix)]
+fn harden_localapi_socket(path: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("[nexusd] ERROR: chmod 0600 {path} failed: {e}; continuing (bearer token still required)");
+            false
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -707,12 +898,17 @@ fn serve_over_socket(path: &str) -> ExitCode {
             return ExitCode::SUCCESS;
         }
     };
+    harden_localapi_socket(path);
     println!(
         "{{\"verdict\":\"READY\",\"daemon\":{{\"entry\":\"nexusd\",\"command\":\"serve\",\"socket\":\"{path}\"}}}}"
     );
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
+                // P1-15：每连接读写超时——连上不发换行的客户端不得永久占住
+                // 控制面（`/workspace/commit/<id>` 等有副作用的路由在其后）。
+                let _ = stream.set_read_timeout(Some(LOCALAPI_IO_TIMEOUT));
+                let _ = stream.set_write_timeout(Some(LOCALAPI_IO_TIMEOUT));
                 if let Err(e) = handle_localapi_request(&mut stream, &token) {
                     eprintln!("serve connection error: {e}");
                 }
@@ -877,6 +1073,9 @@ fn handle_localapi_request(stream: &mut dyn LocalIo, expected_token: &str) -> Re
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
         "/localapi/v0/session/watch" => nexus::observability::session_watch(qp("session"))
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
+        // D1（P1-1）：daemon 内唯一 SessionManager 的会话读口。
+        "/localapi/v0/n2/session/list" => n2_session_list(),
+        "/localapi/v0/n2/session/attach" => n2_session_attach(qp("session")),
         "/localapi/v0/plan/explain" => nexus::observability::plan_explain(qp("resource"))
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
         "/localapi/v0/connectivity/status" => nexus::observability::connectivity_status()
@@ -999,7 +1198,9 @@ fn write_http_json(
 
 #[cfg(test)]
 mod parse_flags_tests {
-    use super::parse_flags;
+    use super::{
+        LOCALAPI_IO_TIMEOUT, N2_SESSION_SWEEP_INTERVAL_SECS, harden_localapi_socket, parse_flags,
+    };
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -1035,5 +1236,37 @@ mod parse_flags_tests {
     fn equals_form_with_empty_value() {
         let m = parse_flags(&args(&["--addr="]));
         assert_eq!(m.get("--addr").and_then(|v| v.as_deref()), Some(""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn localapi_socket_is_hardened_to_0600_after_bind() {
+        // P1-15 回归：bind 后未 chmod 时 socket 权限受 umask 影响，可能世界可写。
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("nexusd-sock-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("localapi.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        // 人为放宽权限模拟"umask 宽松"的危险起点。
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(harden_localapi_socket(&path.to_string_lossy()));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "socket must be owner-only after bind");
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn localapi_io_timeout_is_bounded() {
+        // P1-15：读请求行/头必须有超时，否则一个不发换行的客户端永久占住控制面。
+        assert!(LOCALAPI_IO_TIMEOUT.as_secs() > 0);
+        assert!(LOCALAPI_IO_TIMEOUT <= std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn n2_session_sweep_interval_is_bounded() {
+        assert!(N2_SESSION_SWEEP_INTERVAL_SECS > 0);
     }
 }

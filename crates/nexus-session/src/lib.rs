@@ -412,7 +412,10 @@ pub struct SessionRecord {
 
 /// 会话记录存储契约（Portable；由 Composition Root 注入实现，
 /// 如内存/文件/安全存储，参见 `nexus-storage` 的 ContentStore 注入模式）。
-pub trait SessionRecordStore {
+///
+/// `Send`：D1 要求 daemon 内唯一的 `SessionManager` 被后台终态清扫线程
+/// （`sweep_detached`）与 LocalAPI 请求线程共享，实现必须可跨线程移动。
+pub trait SessionRecordStore: Send {
     fn load(&self) -> Result<Vec<SessionRecord>, String>;
     fn save(&mut self, record: &SessionRecord) -> Result<(), String>;
 }
