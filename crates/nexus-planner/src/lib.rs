@@ -14,9 +14,20 @@
 //! - **Connectivity Feasibility 门控**（v9 §8.1）：`PlanningSnapshot.connectivity`
 //!   携带的评估中，无任何可行路径的候选被拒绝（`NoFeasibleConnectivityPath`），
 //!   无评估的候选保持旧行为；DecisionTrace 记录每个候选的评估；
-//! - **Score 归一化加权**（K3）：只对可行候选评分，归一化到 [0, 10_000] 整数；
+//! - **Score 归一化加权**（K3）：只对可行候选评分；打分明细
+//!   （`ScoreComponent`：`rtt` 分量 + `locality` 分量）写入 DecisionTrace，
+//!   各分量之和恒等于总分；
+//! - **本地优先**（白皮书原则 #4）：`PlanningSnapshot.local_provider` 指定的
+//!   本地 Provider 得 `LOCALITY_BONUS` 加成（默认偏好，非绝对优先——
+//!   未知 RTT 仍严格排在已测候选之后）；
 //! - **规划快照**（K5）：一次规划使用一致的 candidates + constraints 视图；
 //! - **结构化拒绝原因**（K4）：DecisionTrace 记录结构化枚举，而非自由文本。
+//!
+//! v9 §7 红线（P0-3 显式约束）：领域 Estimator **不能**生成第二套系统级 Plan。
+//! compute 等领域的代价估计只能作为 Planner 的**输入**
+//! （`ComputePlanExtension` 的 `queue_delay_ms` / `execution_estimate_ms` 等字段），
+//! Planner 永不调用 Estimator、永不把估计结果当作另一套 Plan 执行。
+//! 见 `plan_from_snapshot` 中 extension 处理处的注释。
 //!
 //! 本 crate 是 Portable Core：纯计算、零 I/O，可编译到 WASI。
 //! 详细边界见同目录 `MODULE.md`。
@@ -24,8 +35,9 @@
 #![forbid(unsafe_code)]
 
 use nexus_domain::{
-    ConnectivityEvaluation, Constraint, Intent, NetworkPlanExtension, NexusError, Plan,
-    PlanExtension, ProviderId, ResourceId,
+    ConnectivityEvaluation, ConsideredCandidate, Constraint, DecisionTrace, Intent,
+    MeasurementSnapshot, NetworkPlanExtension, NexusError, Plan, PlanExtension, PlanId,
+    PlanSnapshot, ProviderId, RejectReason, ResourceId, ScoreComponent, SessionId, plan_id_of,
 };
 use nexus_measurement::LinkMeasurement;
 use nexus_registry::ProviderRecord;
@@ -36,43 +48,17 @@ const CONSTRAINT_CAPABILITY: &str = "capability";
 /// 归一化评分满分（万分比整数，避免浮点不确定性）。
 const SCORE_SCALE: u64 = 10_000;
 
-// ---------- 结构化拒绝原因（吸收点 K4） ----------
-
-/// 结构化拒绝原因：候选被 Filter 拒绝的机器可读原因。
+/// 本地优先加成（白皮书原则 #4"本地优先是一项默认偏好"）。
 ///
-/// 取代自由文本 `String`，保证 DecisionTrace 可被 explain / 自动化消费。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RejectReason {
-    /// Provider 未广告 Presence（不可达/不在线）。
-    NotPresent,
-    /// Provider 缺少规划所需能力。
-    MissingCapability {
-        /// 缺失的能力名。
-        required: String,
-    },
-    /// 被某条硬约束排除。
-    ExcludedByConstraint {
-        /// 约束键。
-        key: String,
-        /// 约束值。
-        value: String,
-    },
-    /// 无可行连通路径（Connectivity Evaluation：direct/punch/relay/existing 全不可行）。
-    NoFeasibleConnectivityPath,
-}
+/// 加在归一化 RTT 分之上的固定整数项（记入 score breakdown 的 `locality` 分量）；
+/// 总分区间为 [0, SCORE_SCALE + LOCALITY_BONUS]。数值是策略选择（默认偏好强度），
+/// 不是物理量；调参需同步更新 DecisionTrace 的 explain 文案。
+pub const LOCALITY_BONUS: u32 = 1_000;
 
-impl RejectReason {
-    /// 稳定的机器可读标签（供 DecisionTrace 序列化 / explain 使用）。
-    #[must_use]
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::NotPresent => "not_present",
-            Self::MissingCapability { .. } => "missing_capability",
-            Self::ExcludedByConstraint { .. } => "excluded_by_constraint",
-            Self::NoFeasibleConnectivityPath => "no_feasible_connectivity_path",
-        }
-    }
-}
+/// 打分分量名：RTT 归一化分量。
+pub const SCORE_TERM_RTT: &str = "rtt";
+/// 打分分量名：本地优先分量。
+pub const SCORE_TERM_LOCALITY: &str = "locality";
 
 // ---------- 规划快照（吸收点 K5） ----------
 
@@ -87,6 +73,8 @@ pub struct PlanningSnapshot {
     pub constraints: Vec<Constraint>,
     /// per-provider Connectivity Evaluation（v9 §8.1）；空 = 未评估（保持旧行为）。
     pub connectivity: Vec<(ProviderId, ConnectivityEvaluation)>,
+    /// 本地 Provider（白皮书原则 #4 本地优先；`None` = 不应用本地偏好）。
+    pub local_provider: Option<ProviderId>,
 }
 
 impl PlanningSnapshot {
@@ -97,6 +85,7 @@ impl PlanningSnapshot {
             candidates,
             constraints,
             connectivity: Vec::new(),
+            local_provider: None,
         }
     }
 
@@ -107,6 +96,13 @@ impl PlanningSnapshot {
         connectivity: Vec<(ProviderId, ConnectivityEvaluation)>,
     ) -> Self {
         self.connectivity = connectivity;
+        self
+    }
+
+    /// 指定本地 Provider（builder；本地优先加成的对象）。
+    #[must_use]
+    pub fn with_local_provider(mut self, local: ProviderId) -> Self {
+        self.local_provider = Some(local);
         self
     }
 }
@@ -122,34 +118,29 @@ pub struct FilteredCandidate {
     pub reason: Option<RejectReason>,
 }
 
-/// Score 阶段输出：可行候选 + 归一化分数（[0, 10_000]，越高越优）。
+/// Score 阶段输出：可行候选 + 归一化分数 + 打分明细。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScoredCandidate {
     /// 可行候选 Provider 事实记录。
     pub record: ProviderRecord,
-    /// 归一化加权分（确定性，整数）。
+    /// 总分（`rtt` 分量 + `locality` 分量之和；区间 [0, SCORE_SCALE + LOCALITY_BONUS]）。
     pub score: u32,
+    /// 打分明细（D3 加厚）；各项 `contribution` 之和恒等于 `score`。
+    pub breakdown: Vec<ScoreComponent>,
 }
 
-/// 单个候选的评估记录（DecisionTrace 节点）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConsideredCandidate {
-    /// 候选 Provider。
-    pub provider: ProviderId,
-    /// 被拒绝原因；`None` 表示可行。
-    pub rejected_reason: Option<RejectReason>,
-    /// 该候选的 Connectivity Evaluation（快照携带时；`None` = 未评估）。
-    /// 让 DecisionTrace 可见 evaluation 对决策的贡献（v9 §8.1）。
-    pub connectivity: Option<ConnectivityEvaluation>,
-}
-
-/// 决策轨迹：记录全部候选、拒绝原因与最终选择，支持 explain / replay。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DecisionTrace {
-    /// 按输入顺序记录的候选评估。
-    pub considered: Vec<ConsideredCandidate>,
-    /// 最终选中的 Provider。
-    pub selected: ProviderId,
+/// `LinkMeasurement` → 领域侧快照（`MeasurementSnapshot`）的显式转换。
+///
+/// 放在 planner 而非 `From` impl：orphan 规则禁止为两个外部类型实现外部 trait；
+/// 普通函数同样表达"决策时拷贝"的快照语义。
+fn snapshot_measurement(m: &LinkMeasurement) -> MeasurementSnapshot {
+    MeasurementSnapshot {
+        rtt_ms: m.rtt_ms,
+        loss_permyriad: m.loss_permyriad,
+        jitter_ms: m.jitter_ms,
+        throughput_kbps: m.throughput_kbps,
+        confidence_percent: m.confidence_percent,
+    }
 }
 
 /// Planner 的决策产物：领域中立 Plan + 决策轨迹。
@@ -223,15 +214,23 @@ pub fn filter_candidates(
         .collect()
 }
 
-/// 阶段二：软评分（K2/K3）。
+/// 阶段二：软评分（K2/K3）+ 本地优先（白皮书原则 #4）。
 ///
-/// 只对通过 Filter 的候选评分；RTT 越小分越高，归一化到 [0, 10_000]。
-/// 未知 RTT 得 0 分（显式"未知"不是最优）；同分按 ProviderId 字典序稳定排序。
+/// 只对通过 Filter 的候选评分。打分明细（`ScoredCandidate.breakdown`）：
+/// - `rtt`：RTT 越小分越高，归一化到 [0, 10_000]；未知 RTT 得 0 分
+///   （显式"未知"不是最优）；
+/// - `locality`：`local` 命中的本地 Provider 得 `LOCALITY_BONUS` 加成，
+///   其余为 0（加项恒记录，explain 可见"为什么没加成"）。
 ///
-/// D3（2026-10-03）：未知 RTT **严格**排在所有已测候选之后（排序键显式区分
-/// 已知/未知，与分数无关）。`max_rtt == 0`（全未知）时保持旧行为。
+/// 总分 = 各分量之和（单测锁定该不变量）。排序：已知 RTT 恒先于未知
+/// （D3：未知严格排最后，与分数/本地偏好无关）→ 总分降序 → ProviderId
+/// 字典序（确定性 tie-break）。`max_rtt == 0`（全未知）时保持旧行为。
 #[must_use]
-pub fn score_candidates<F>(feasible: &[ProviderRecord], measure: F) -> Vec<ScoredCandidate>
+pub fn score_candidates<F>(
+    feasible: &[ProviderRecord],
+    measure: F,
+    local: Option<&ProviderId>,
+) -> Vec<ScoredCandidate>
 where
     F: Fn(&ProviderId) -> Option<LinkMeasurement>,
 {
@@ -244,17 +243,37 @@ where
     let mut scored: Vec<(ScoredCandidate, bool)> = feasible
         .iter()
         .map(|c| {
-            let rtt = measure(&c.id)
+            let measurement = measure(&c.id);
+            let rtt = measurement
+                .as_ref()
                 .and_then(|m| m.rtt_ms)
                 .filter(|_| max_rtt > 0);
-            let score = rtt.map_or(0, |ms| {
+            let rtt_term = rtt.map_or(0, |ms| {
                 let scaled = (max_rtt.saturating_sub(ms)) as u64 * SCORE_SCALE / max_rtt as u64;
                 scaled as u32
             });
+            let is_local = local == Some(&c.id);
+            let locality_term = if is_local { LOCALITY_BONUS } else { 0 };
+            let breakdown = vec![
+                ScoreComponent {
+                    name: SCORE_TERM_RTT,
+                    contribution: rtt_term,
+                    detail: Some(match rtt {
+                        Some(ms) => format!("rtt_ms={ms}"),
+                        None => "unknown_rtt".to_string(),
+                    }),
+                },
+                ScoreComponent {
+                    name: SCORE_TERM_LOCALITY,
+                    contribution: locality_term,
+                    detail: is_local.then(|| "local".to_string()),
+                },
+            ];
             (
                 ScoredCandidate {
                     record: c.clone(),
-                    score,
+                    score: rtt_term + locality_term,
+                    breakdown,
                 },
                 rtt.is_some(),
             )
@@ -276,8 +295,16 @@ where
 /// `measure` 把 Provider 映射到其事实测量（未观测返回 None）。选择规则：
 /// 1. 无候选 → `NoProvider`；
 /// 2. 没有任何候选满足能力约束 → `ConstraintUnsatisfied`；
-/// 3. Filter 拒绝者不进 Score；可行者按归一化分选优，未知 RTT 排最后
-///    （不把"未观测"当作"最优"），同分按 ProviderId 字典序，从而保证确定性与可重放。
+/// 3. Filter 拒绝者不进 Score；可行者按"RTT 归一化分 + 本地优先加成"选优，
+///    未知 RTT 排最后（不把"未观测"当作"最优"），同分按 ProviderId 字典序，
+///    从而保证确定性与可重放；
+/// 4. DecisionTrace 为每个候选记录：拒绝原因 / Connectivity Evaluation /
+///    Measurement 快照 / 分数与打分明细（D3 加厚）。
+///
+/// v9 §7 红线：领域 Estimator 不能生成第二套系统级 Plan。此处组装的 extension
+/// 只读取调用方传入的输入（含 `ComputePlanExtension` 的代价估计字段，
+/// 如 `queue_delay_ms` / `execution_estimate_ms`——那是 Planner 的**输入**，
+/// 不是另一套 Plan）；Planner 永不调用 Estimator，也永不把估计结果单独成 Plan。
 pub fn plan_from_snapshot<F>(
     resource: &ResourceId,
     snapshot: &PlanningSnapshot,
@@ -330,14 +357,6 @@ where
             .find(|(pid, _)| pid == id)
             .map(|(_, ev)| ev.clone())
     };
-    let considered: Vec<ConsideredCandidate> = filtered
-        .iter()
-        .map(|f| ConsideredCandidate {
-            provider: f.record.id.clone(),
-            rejected_reason: f.reason.clone(),
-            connectivity: evaluation_of(&f.record.id),
-        })
-        .collect();
     let feasible: Vec<ProviderRecord> = filtered
         .iter()
         .filter(|f| f.reason.is_none())
@@ -350,10 +369,31 @@ where
         });
     }
 
-    // 阶段二：Score（归一化加权）+ 确定性选优。
-    let scored = score_candidates(&feasible, measure);
+    // 阶段二：Score（归一化加权 + 本地优先）+ 确定性选优。
+    // 注意：`measure` 在此处被调用——返回的值即"决策时的测量值"，
+    // 下面原样写入 DecisionTrace 的 Measurement 快照（可重放）。
+    let scored = score_candidates(&feasible, &measure, snapshot.local_provider.as_ref());
+    let score_of = |id: &ProviderId| scored.iter().find(|s| s.record.id == *id);
+    let considered: Vec<ConsideredCandidate> = filtered
+        .iter()
+        .map(|f| {
+            let scored_hit = score_of(&f.record.id);
+            ConsideredCandidate {
+                provider: f.record.id.clone(),
+                rejected_reason: f.reason.clone(),
+                connectivity: evaluation_of(&f.record.id),
+                // D3 加厚：决策时的测量快照（`None` = 决策时无测量，显式未知）。
+                measurement: measure(&f.record.id).as_ref().map(snapshot_measurement),
+                score: scored_hit.map(|s| s.score),
+                score_breakdown: scored_hit.map(|s| s.breakdown.clone()),
+            }
+        })
+        .collect();
     let chosen = &scored[0].record;
 
+    // v9 §7 红线（见本函数文档）：extension 只承载调用方传入的领域输入；
+    // 即使未来此处处理 `ComputePlanExtension`，其代价估计字段也只是 Planner
+    // 输入——Planner 不调用 Estimator，不产生第二套系统级 Plan。
     let plan = Plan {
         resource_id: resource.clone(),
         provider_id: chosen.id.clone(),
@@ -389,6 +429,108 @@ where
 {
     let snapshot = PlanningSnapshot::new(candidates.to_vec(), constraints.to_vec());
     plan_from_snapshot(resource, &snapshot, intent, measure)
+}
+
+// ---------- plan explain 双模式（D3 / mimo 独立规划建议） ----------
+
+/// `plan explain` 双模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplainMode {
+    /// 读历史真实记录：`<session-id>` 命中 Session 内嵌的 PlanSnapshot。
+    History,
+    /// 按当前快照重算：输出必须显式标注"估算非承诺"。
+    Estimate,
+}
+
+impl ExplainMode {
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::History => "history",
+            Self::Estimate => "estimate",
+        }
+    }
+
+    /// 模式对应的承诺声明（`plan explain` 输出的必填字段）。
+    #[must_use]
+    pub fn commitment_note(&self) -> &'static str {
+        match self {
+            Self::History => "历史真实记录：该 Session 建连时内嵌的 PlanSnapshot，非事后重算。",
+            Self::Estimate => {
+                "估算非承诺：按当前快照重算的预览，不是对未来的承诺；实际建连时的决策以 Session 内嵌快照为准。"
+            }
+        }
+    }
+}
+
+/// SessionId 的形状约定：`nexus use` 产生的会话 id 使用 `sess-` 前缀
+///（见 nexus-session 用例与 n2 场景 `sess-n2-e4-1`）。
+/// `plan explain` 据此外形区分双模式；不以此前缀开头的参数一律按资源名处理。
+pub const SESSION_ID_PREFIX: &str = "sess-";
+
+/// 把 `plan explain <arg>` 分类为双模式之一（纯函数，可单测）。
+#[must_use]
+pub fn classify_explain_arg(arg: &str) -> ExplainMode {
+    if arg.starts_with(SESSION_ID_PREFIX) {
+        ExplainMode::History
+    } else {
+        ExplainMode::Estimate
+    }
+}
+
+/// PlanSnapshot 历史查询（`plan explain <session-id>` 的读口）。
+///
+/// P0-3 只定义读契约：Session 持久化在 P0-4 落地（SessionManager 负责写
+/// `SessionRecord.plan_snapshot`）。调用方在查无记录时返回结构化
+/// `SESSION_HISTORY_NOT_FOUND`，**不得**回退为"按资源重算"（那会伪造历史）。
+pub trait PlanHistory {
+    /// 按 SessionId 查历史 PlanSnapshot；无记录返回 `None`。
+    fn lookup(&self, session: &SessionId) -> Option<PlanSnapshot>;
+}
+
+/// 一次 explain 输出的领域数据（渲染层再转 JSON/文本）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplainedPlan {
+    pub mode: ExplainMode,
+    pub snapshot: PlanSnapshot,
+}
+
+impl ExplainedPlan {
+    /// 历史模式：快照必须来自 `PlanHistory`（真实记录）。
+    #[must_use]
+    pub fn history(snapshot: PlanSnapshot) -> Self {
+        Self {
+            mode: ExplainMode::History,
+            snapshot,
+        }
+    }
+
+    /// 估算模式：快照为当前重算（调用方必须向用户展示 `commitment_note`）。
+    #[must_use]
+    pub fn estimate(snapshot: PlanSnapshot) -> Self {
+        Self {
+            mode: ExplainMode::Estimate,
+            snapshot,
+        }
+    }
+
+    /// 该模式的承诺声明（`plan explain` 输出的必填字段）。
+    #[must_use]
+    pub fn commitment_note(&self) -> &'static str {
+        self.mode.commitment_note()
+    }
+
+    /// PlanId（内容确定性派生；历史/估算模式通用）。
+    #[must_use]
+    pub fn plan_id(&self) -> &PlanId {
+        &self.snapshot.plan_id
+    }
+
+    /// 引用 `plan_id_of`，保证"同一决策同一 Id"在 explain 路径同样成立。
+    #[must_use]
+    pub fn verify_plan_id(&self) -> bool {
+        plan_id_of(&self.snapshot.plan, &self.snapshot.decision_trace) == self.snapshot.plan_id
+    }
 }
 
 #[cfg(test)]
@@ -562,7 +704,11 @@ mod tests {
             candidate("slow", "w", &["internet-access"], true),
             candidate("fast", "e", &["internet-access"], true),
         ];
-        let scored = score_candidates(&feasible, |p| rtt(p, if p.0 == "fast" { 20 } else { 80 }));
+        let scored = score_candidates(
+            &feasible,
+            |p| rtt(p, if p.0 == "fast" { 20 } else { 80 }),
+            None,
+        );
         assert_eq!(scored.len(), 2);
         assert_eq!(scored[0].record.id, ProviderId("fast".into()));
         // 归一化：fast = (80-20)*10000/80 = 7500；slow = 0。
@@ -576,13 +722,17 @@ mod tests {
             candidate("measured", "m", &["internet-access"], true),
             candidate("unknown", "u", &["internet-access"], true),
         ];
-        let scored = score_candidates(&feasible, |p| match p.0.as_str() {
-            "measured" => Some(LinkMeasurement {
-                rtt_ms: Some(50),
-                ..Default::default()
-            }),
-            _ => None,
-        });
+        let scored = score_candidates(
+            &feasible,
+            |p| match p.0.as_str() {
+                "measured" => Some(LinkMeasurement {
+                    rtt_ms: Some(50),
+                    ..Default::default()
+                }),
+                _ => None,
+            },
+            None,
+        );
         assert_eq!(scored[0].record.id, ProviderId("measured".into()));
         assert_eq!(scored[1].record.id, ProviderId("unknown".into()));
         assert_eq!(scored[1].score, 0);
@@ -597,13 +747,17 @@ mod tests {
             candidate("aaa-unknown", "a", &["internet-access"], true),
             candidate("zzz-measured", "z", &["internet-access"], true),
         ];
-        let scored = score_candidates(&feasible, |p| match p.0.as_str() {
-            "zzz-measured" => Some(LinkMeasurement {
-                rtt_ms: Some(50),
-                ..Default::default()
-            }),
-            _ => None,
-        });
+        let scored = score_candidates(
+            &feasible,
+            |p| match p.0.as_str() {
+                "zzz-measured" => Some(LinkMeasurement {
+                    rtt_ms: Some(50),
+                    ..Default::default()
+                }),
+                _ => None,
+            },
+            None,
+        );
         assert_eq!(
             scored[0].record.id,
             ProviderId("zzz-measured".into()),
@@ -618,7 +772,7 @@ mod tests {
             candidate("zeta", "z", &["internet-access"], true),
             candidate("alpha", "a", &["internet-access"], true),
         ];
-        let scored = score_candidates(&feasible, |_| None);
+        let scored = score_candidates(&feasible, |_| None, None);
         assert_eq!(scored[0].record.id, ProviderId("alpha".into()));
         assert_eq!(scored[1].record.id, ProviderId("zeta".into()));
         assert_eq!(scored[0].score, scored[1].score);
@@ -632,29 +786,8 @@ mod tests {
         assert_eq!(out.plan.provider_id, ProviderId("fast".into()));
     }
 
-    #[test]
-    fn reject_reason_labels_are_stable() {
-        assert_eq!(RejectReason::NotPresent.label(), "not_present");
-        assert_eq!(
-            RejectReason::MissingCapability {
-                required: "x".into()
-            }
-            .label(),
-            "missing_capability"
-        );
-        assert_eq!(
-            RejectReason::ExcludedByConstraint {
-                key: "k".into(),
-                value: "v".into()
-            }
-            .label(),
-            "excluded_by_constraint"
-        );
-        assert_eq!(
-            RejectReason::NoFeasibleConnectivityPath.label(),
-            "no_feasible_connectivity_path"
-        );
-    }
+    // 注：`RejectReason::label()` 稳定性单测已随类型迁移到 nexus-domain
+    //（`reject_reason_labels_are_stable`），此处不重复。
 
     // ---- Connectivity Feasibility 门控（v9 §8.1） ----
 
@@ -769,5 +902,213 @@ mod tests {
             .find(|c| c.provider.0 == "down")
             .unwrap();
         assert_eq!(down.rejected_reason, Some(RejectReason::NotPresent));
+    }
+
+    // ---- D3 加厚：score breakdown / Measurement 快照 / 本地优先 ----
+
+    #[test]
+    fn score_breakdown_sums_to_total() {
+        // 不变量：各分量 contribution 之和恒等于总分。
+        let feasible = vec![
+            candidate("fast", "e", &["internet-access"], true),
+            candidate("slow", "w", &["internet-access"], true),
+        ];
+        let scored = score_candidates(
+            &feasible,
+            |p| rtt(p, if p.0 == "fast" { 20 } else { 80 }),
+            None,
+        );
+        for s in &scored {
+            let sum: u32 = s.breakdown.iter().map(|t| t.contribution).sum();
+            assert_eq!(sum, s.score, "breakdown must sum to score");
+            assert_eq!(s.breakdown.len(), 2);
+            assert_eq!(s.breakdown[0].name, SCORE_TERM_RTT);
+            assert_eq!(s.breakdown[1].name, SCORE_TERM_LOCALITY);
+        }
+        // 无本地偏好时 locality 分量为 0（显式记录"没加成"）。
+        assert!(scored.iter().all(|s| s.breakdown[1].contribution == 0));
+        assert_eq!(scored[0].score, 7_500);
+    }
+
+    #[test]
+    fn locality_bonus_prefers_local_provider() {
+        // 白皮书原则 #4：同等条件下本地优先；加成记入 breakdown。
+        let feasible = vec![
+            candidate("remote", "r", &["internet-access"], true),
+            candidate("local", "l", &["internet-access"], true),
+        ];
+        let local = ProviderId("local".into());
+        let scored = score_candidates(&feasible, |p| rtt(p, 40), Some(&local));
+        // 同 RTT：本地 0 + 1000 > 远端 0。
+        assert_eq!(scored[0].record.id, local);
+        assert_eq!(scored[0].score, LOCALITY_BONUS);
+        assert_eq!(scored[0].breakdown[1].contribution, LOCALITY_BONUS);
+        assert_eq!(scored[0].breakdown[1].detail.as_deref(), Some("local"));
+        assert_eq!(scored[1].score, 0);
+    }
+
+    #[test]
+    fn unknown_rtt_still_sorts_after_measured_despite_locality() {
+        // D3 排序键优先级：已知/未知 > 分数（含本地加成）> id。
+        let feasible = vec![
+            candidate("local-unknown", "l", &["internet-access"], true),
+            candidate("remote-measured", "r", &["internet-access"], true),
+        ];
+        let local = ProviderId("local-unknown".into());
+        let scored = score_candidates(
+            &feasible,
+            |p| match p.0.as_str() {
+                "remote-measured" => Some(LinkMeasurement {
+                    rtt_ms: Some(50),
+                    ..Default::default()
+                }),
+                _ => None,
+            },
+            Some(&local),
+        );
+        assert_eq!(scored[0].record.id, ProviderId("remote-measured".into()));
+        assert_eq!(scored[1].record.id, local);
+    }
+
+    #[test]
+    fn trace_carries_measurement_snapshot_and_breakdown() {
+        // D3 加厚：trace 记录决策时的测量快照 + 分数 + 打分明细；
+        // 被拒绝者三者皆为 None（从未进入评分）。
+        let cands = vec![
+            candidate("down", "d", &["internet-access"], false),
+            candidate("up", "u", &["internet-access"], true),
+        ];
+        let snapshot = PlanningSnapshot::new(cands, constraints());
+        let out = plan_from_snapshot(&resource(), &snapshot, &intent(), |p| {
+            if p.0 == "up" {
+                Some(LinkMeasurement {
+                    rtt_ms: Some(25),
+                    loss_permyriad: Some(7),
+                    confidence_percent: 90,
+                    ..Default::default()
+                })
+            } else {
+                None
+            }
+        })
+        .unwrap();
+        let up = out
+            .trace
+            .considered
+            .iter()
+            .find(|c| c.provider.0 == "up")
+            .unwrap();
+        assert_eq!(up.rejected_reason, None);
+        let m = up.measurement.as_ref().expect("measurement snapshot");
+        assert_eq!(m.rtt_ms, Some(25));
+        assert_eq!(m.loss_permyriad, Some(7));
+        assert_eq!(m.confidence_percent, 90);
+        let score = up.score.expect("score");
+        let bd = up.score_breakdown.as_ref().expect("breakdown");
+        assert_eq!(bd.iter().map(|t| t.contribution).sum::<u32>(), score);
+
+        let down = out
+            .trace
+            .considered
+            .iter()
+            .find(|c| c.provider.0 == "down")
+            .unwrap();
+        assert_eq!(down.rejected_reason, Some(RejectReason::NotPresent));
+        assert_eq!(down.score, None);
+        assert_eq!(down.score_breakdown, None);
+        // 被拒绝者的测量仍记录（决策时可见的事实），分数为空。
+        assert_eq!(down.measurement, None);
+    }
+
+    #[test]
+    fn plan_selects_local_when_snapshot_marks_it() {
+        // PlanningSnapshot.local_provider → plan_from_snapshot 应用本地优先。
+        let cands = vec![
+            candidate("remote", "r", &["internet-access"], true),
+            candidate("local", "l", &["internet-access"], true),
+        ];
+        let snapshot = PlanningSnapshot::new(cands, constraints())
+            .with_local_provider(ProviderId("local".into()));
+        let out = plan_from_snapshot(&resource(), &snapshot, &intent(), |_| None).unwrap();
+        assert_eq!(out.plan.provider_id, ProviderId("local".into()));
+        assert_eq!(out.trace.selected, ProviderId("local".into()));
+    }
+
+    // ---- plan explain 双模式 ----
+
+    #[test]
+    fn classify_explain_arg_routes_by_shape() {
+        assert_eq!(classify_explain_arg("sess-n2-e4-1"), ExplainMode::History);
+        assert_eq!(classify_explain_arg("sess-abc"), ExplainMode::History);
+        assert_eq!(classify_explain_arg("dev-svc"), ExplainMode::Estimate);
+        assert_eq!(
+            classify_explain_arg("internet-access"),
+            ExplainMode::Estimate
+        );
+        assert_eq!(classify_explain_arg(""), ExplainMode::Estimate);
+    }
+
+    #[test]
+    fn explain_modes_carry_commitment_notes() {
+        assert_eq!(ExplainMode::History.as_str(), "history");
+        assert_eq!(ExplainMode::Estimate.as_str(), "estimate");
+        assert!(
+            ExplainMode::History
+                .commitment_note()
+                .contains("历史真实记录")
+        );
+        // 估算模式必须显式标注"估算非承诺"（mimo 双模式要求）。
+        assert!(
+            ExplainMode::Estimate
+                .commitment_note()
+                .contains("估算非承诺")
+        );
+    }
+
+    struct MemHistory {
+        snapshots: Vec<(SessionId, PlanSnapshot)>,
+    }
+    impl PlanHistory for MemHistory {
+        fn lookup(&self, session: &SessionId) -> Option<PlanSnapshot> {
+            self.snapshots
+                .iter()
+                .find(|(id, _)| id == session)
+                .map(|(_, s)| s.clone())
+        }
+    }
+
+    #[test]
+    fn explain_history_reads_recorded_snapshot_not_recompute() {
+        // `<session-id>` 读历史真实记录：返回当时内嵌的快照（含 PlanId）。
+        let cands = vec![candidate("up", "u", &["internet-access"], true)];
+        let snapshot = PlanningSnapshot::new(cands, constraints());
+        let planned = plan_from_snapshot(&resource(), &snapshot, &intent(), |_| None).unwrap();
+        let recorded = PlanSnapshot::from_planned(planned.plan.clone(), planned.trace.clone());
+        let history = MemHistory {
+            snapshots: vec![(SessionId("sess-n2-e4-1".into()), recorded.clone())],
+        };
+        assert_eq!(classify_explain_arg("sess-n2-e4-1"), ExplainMode::History);
+        let found = history
+            .lookup(&SessionId("sess-n2-e4-1".into()))
+            .expect("history hit");
+        let explained = ExplainedPlan::history(found);
+        assert_eq!(explained.snapshot, recorded);
+        assert!(explained.verify_plan_id());
+        assert!(explained.commitment_note().contains("历史真实记录"));
+        // 查无记录 → None（调用方报 SESSION_HISTORY_NOT_FOUND，不得回退重算）。
+        assert!(history.lookup(&SessionId("sess-missing".into())).is_none());
+    }
+
+    #[test]
+    fn explain_estimate_labels_non_commitment() {
+        // `<resource>` 显式标注"估算非承诺"。
+        let cands = vec![candidate("up", "u", &["internet-access"], true)];
+        let snapshot = PlanningSnapshot::new(cands, constraints());
+        let planned = plan_from_snapshot(&resource(), &snapshot, &intent(), |_| None).unwrap();
+        let explained =
+            ExplainedPlan::estimate(PlanSnapshot::from_planned(planned.plan, planned.trace));
+        assert_eq!(explained.mode, ExplainMode::Estimate);
+        assert!(explained.commitment_note().contains("估算非承诺"));
+        assert!(explained.verify_plan_id());
     }
 }

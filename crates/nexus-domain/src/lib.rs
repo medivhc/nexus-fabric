@@ -548,6 +548,305 @@ impl ConnectivityEvaluation {
     }
 }
 
+// ---------- 规划决策轨迹 DTO（N2 D3；P0-3 加厚） ----------
+//
+// 这些类型是纯数据 DTO（无求解逻辑），从 `nexus-planner` 迁移至此：
+// - Session 记录内嵌 `PlanSnapshot{plan, decision_trace}`（D3：Plan 可重算、
+//   不独立持久化），而 `nexus-session` 只允许依赖 `nexus-domain`
+//  （policies/architecture.toml），DTO 必须落在此处；
+// - 求解逻辑（filter/score/选优）仍在 `nexus-planner`，Planner != 领域数据。
+
+/// 结构化拒绝原因：候选被 Filter 拒绝的机器可读原因。
+///
+/// "为什么这个 Provider 没被选"的唯一出口（mimo 独立规划建议；D3 采纳）；
+/// 取代自由文本，保证 DecisionTrace 可被 explain / 自动化消费。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RejectReason {
+    /// Provider 未广告 Presence（不可达/不在线）。
+    NotPresent,
+    /// Provider 缺少规划所需能力。
+    MissingCapability {
+        /// 缺失的能力名。
+        required: String,
+    },
+    /// 被某条硬约束排除。
+    ExcludedByConstraint {
+        /// 约束键。
+        key: String,
+        /// 约束值。
+        value: String,
+    },
+    /// 无可行连通路径（Connectivity Evaluation：direct/punch/relay/existing 全不可行）。
+    NoFeasibleConnectivityPath,
+}
+
+impl RejectReason {
+    /// 稳定的机器可读标签（供 DecisionTrace 序列化 / explain 使用）。
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::NotPresent => "not_present",
+            Self::MissingCapability { .. } => "missing_capability",
+            Self::ExcludedByConstraint { .. } => "excluded_by_constraint",
+            Self::NoFeasibleConnectivityPath => "no_feasible_connectivity_path",
+        }
+    }
+
+    /// 完整编码（含负载），供 PlanId 确定性摘要使用。
+    /// 与 `label()` 不同：两个仅负载不同的拒绝原因必须产生不同编码，
+    /// 否则不同决策轨迹会得到同一 PlanId（review-n2-p03 WARN-1）。
+    #[must_use]
+    pub fn encode_full(&self) -> String {
+        match self {
+            Self::NotPresent => "not_present".to_string(),
+            Self::MissingCapability { required } => {
+                format!("missing_capability:required={required}")
+            }
+            Self::ExcludedByConstraint { key, value } => {
+                format!("excluded_by_constraint:key={key},value={value}")
+            }
+            Self::NoFeasibleConnectivityPath => "no_feasible_connectivity_path".to_string(),
+        }
+    }
+}
+
+/// 打分明细项（D3 DecisionTrace 加厚四件套之一：score breakdown）。
+///
+/// 每项记录打分算法中的一个可解释分量；`contribution` 之和恒等于候选总分
+/// （整数，万分比尺度；`nexus-planner` 单测锁定该不变量）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScoreComponent {
+    /// 分量名（固定词表：`rtt` / `locality`；扩展需同步更新 explain 渲染）。
+    pub name: &'static str,
+    /// 该分量对总分的整数贡献（可为 0，如未知 RTT / 非本地候选）。
+    pub contribution: u32,
+    /// 人读细节（如 `rtt_ms=20` / `unknown_rtt` / `local`），可为 None。
+    pub detail: Option<String>,
+}
+
+/// Measurement 快照（D3 加厚四件套之一：决策时的测量值）。
+///
+/// 决策时刻 `LinkMeasurement` 的值拷贝（`nexus-measurement` 的事实类型在此处
+/// 的领域侧镜像；`nexus-planner` 经 `From<&LinkMeasurement>` 转换填充）。
+/// 快照语义：记录"决策时看到的值"，不随后续测量更新而改变，保证 explain 可重放。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MeasurementSnapshot {
+    /// 往返时延（毫秒）；None = 决策时未知。
+    pub rtt_ms: Option<u32>,
+    /// 丢包率（万分比，0..=10000）。
+    pub loss_permyriad: Option<u32>,
+    /// 抖动（毫秒）。
+    pub jitter_ms: Option<u32>,
+    /// 吞吐（kbps）。
+    pub throughput_kbps: Option<u64>,
+    /// 置信度（百分比 0..=100）：该测量的可信程度，不是业务分数。
+    pub confidence_percent: u8,
+}
+
+/// 单个候选的评估记录（DecisionTrace 节点；D3 加厚后）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsideredCandidate {
+    /// 候选 Provider。
+    pub provider: ProviderId,
+    /// 被拒绝原因；`None` 表示可行（进入 Score 阶段）。
+    pub rejected_reason: Option<RejectReason>,
+    /// 该候选的 Connectivity Evaluation（快照携带时；`None` = 未评估）。
+    /// 让 DecisionTrace 可见 evaluation 对决策的贡献（v9 §8.1）。
+    pub connectivity: Option<ConnectivityEvaluation>,
+    /// 决策时的 Measurement 快照；`None` = 决策时无测量（显式未知）。
+    pub measurement: Option<MeasurementSnapshot>,
+    /// 归一化总分；被拒绝的候选为 `None`（从未进入评分）。
+    pub score: Option<u32>,
+    /// 打分明细；被拒绝的候选为 `None`。
+    pub score_breakdown: Option<Vec<ScoreComponent>>,
+}
+
+/// 决策轨迹：记录全部候选、拒绝原因与最终选择，支持 explain / replay。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionTrace {
+    /// 按输入顺序记录的候选评估。
+    pub considered: Vec<ConsideredCandidate>,
+    /// 最终选中的 Provider。
+    pub selected: ProviderId,
+}
+
+/// Plan 标识符：确定性非密码学摘要（D3）。
+///
+/// FNV-1a 64 位的十六进制（16 字符）；只作标识符，**不做安全边界**
+/// （不可伪造性/抗碰撞不作承诺）。同一规划输入（含决策轨迹）恒产生同一 PlanId，
+/// 跨进程/跨运行一致（FNV 无随机种子）；输入任一字段变化则 Id 变化。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PlanId(pub String);
+
+impl PlanId {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl core::fmt::Display for PlanId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// FNV-1a 64 位哈希（非密码学；仅用于 PlanId 等标识符摘要）。
+#[must_use]
+pub fn fnv1a_64_hex(input: &[u8]) -> String {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET;
+    for b in input {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{hash:016x}")
+}
+
+/// 对一次规划决策（Plan + DecisionTrace）计算确定性 PlanId（D3）。
+///
+/// 规范编码：字段按固定顺序、以 `len:bytes;` 形式拼接（消除歧义），全部整数
+/// 以十进制写入；浮点数永不进入编码（确定性要求）。
+/// 覆盖全部决策相关字段：Plan 的 resource/provider/placement/path/strategy/
+/// extension，以及轨迹中每个候选的拒绝原因/分数/打分明细/测量快照/连通性评估。
+/// 同一输入 → 同一 PlanId（跨运行一致）；任一字段变化 → Id 变化。
+#[must_use]
+pub fn plan_id_of(plan: &Plan, trace: &DecisionTrace) -> PlanId {
+    fn field(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(s.len().to_string().as_bytes());
+        out.push(b':');
+        out.extend_from_slice(s.as_bytes());
+        out.push(b';');
+    }
+    fn opt_u32(out: &mut Vec<u8>, v: Option<u32>) {
+        field(out, &v.map_or_else(|| "-".to_string(), |x| x.to_string()));
+    }
+    fn opt_u64(out: &mut Vec<u8>, v: Option<u64>) {
+        field(out, &v.map_or_else(|| "-".to_string(), |x| x.to_string()));
+    }
+
+    let mut buf = Vec::new();
+    field(&mut buf, "planid/v1");
+    field(&mut buf, &plan.resource_id.0);
+    field(&mut buf, &plan.provider_id.0);
+    field(&mut buf, &plan.placement);
+    field(&mut buf, &plan.path.len().to_string());
+    for p in &plan.path {
+        field(&mut buf, p);
+    }
+    field(&mut buf, &plan.execution_strategy);
+    match &plan.extension {
+        None => field(&mut buf, "ext:none"),
+        Some(PlanExtension::Network(n)) => {
+            field(&mut buf, "ext:network");
+            field(&mut buf, &n.version.to_string());
+            field(&mut buf, n.exit_dns_binding.as_deref().unwrap_or("-"));
+            field(&mut buf, n.preferred_transport.as_deref().unwrap_or("-"));
+        }
+        Some(PlanExtension::Workspace(w)) => {
+            field(&mut buf, "ext:workspace");
+            field(&mut buf, &w.version.to_string());
+            field(&mut buf, w.pinned_commit.as_deref().unwrap_or("-"));
+            field(&mut buf, &w.working_set.len().to_string());
+            for ws in &w.working_set {
+                field(&mut buf, ws);
+            }
+        }
+        Some(PlanExtension::Compute(c)) => {
+            field(&mut buf, "ext:compute");
+            field(&mut buf, &c.version.to_string());
+            field(&mut buf, c.pinned_snapshot.as_deref().unwrap_or("-"));
+            opt_u64(&mut buf, c.queue_delay_ms);
+            opt_u64(&mut buf, c.execution_estimate_ms);
+            field(&mut buf, &c.cache_hints.len().to_string());
+            for h in &c.cache_hints {
+                field(&mut buf, h);
+            }
+        }
+        Some(PlanExtension::Service(s)) => {
+            field(&mut buf, "ext:service");
+            field(&mut buf, &s.version.to_string());
+            field(&mut buf, s.listen.as_deref().unwrap_or("-"));
+            field(&mut buf, &s.loopback_authorization_required.to_string());
+        }
+    }
+    field(&mut buf, &trace.selected.0);
+    field(&mut buf, &trace.considered.len().to_string());
+    for c in &trace.considered {
+        field(&mut buf, &c.provider.0);
+        field(
+            &mut buf,
+            &c.rejected_reason
+                .as_ref()
+                .map_or("-".to_string(), |r| r.encode_full()),
+        );
+        opt_u32(&mut buf, c.score);
+        match &c.score_breakdown {
+            None => field(&mut buf, "bd:-"),
+            Some(bd) => {
+                field(&mut buf, &bd.len().to_string());
+                for term in bd {
+                    field(&mut buf, term.name);
+                    field(&mut buf, &term.contribution.to_string());
+                    field(&mut buf, term.detail.as_deref().unwrap_or("-"));
+                }
+            }
+        }
+        match &c.measurement {
+            None => field(&mut buf, "m:-"),
+            Some(m) => {
+                opt_u32(&mut buf, m.rtt_ms);
+                opt_u32(&mut buf, m.loss_permyriad);
+                opt_u32(&mut buf, m.jitter_ms);
+                opt_u64(&mut buf, m.throughput_kbps);
+                field(&mut buf, &m.confidence_percent.to_string());
+            }
+        }
+        match &c.connectivity {
+            None => field(&mut buf, "ce:-"),
+            Some(e) => {
+                field(&mut buf, &e.version.to_string());
+                field(&mut buf, &e.direct_likely.to_string());
+                field(&mut buf, &e.punching_likely.to_string());
+                field(&mut buf, &e.relay_available.to_string());
+                field(&mut buf, &e.existing_link_available.to_string());
+                opt_u32(&mut buf, e.estimated_setup_cost_ms);
+                field(&mut buf, &e.confidence_percent.to_string());
+            }
+        }
+    }
+    PlanId(fnv1a_64_hex(&buf))
+}
+
+/// Plan 快照（D3）：一次规划决策的不透明记录。
+///
+/// Plan 可重算、不独立持久化（bunny 方案）；Session 记录内嵌本快照
+/// （`nexus-session::SessionRecord.plan_snapshot`），`plan explain <session-id>`
+/// 读此快照返回"历史真实记录"（而非事后重算）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanSnapshot {
+    /// 该次决策的确定性标识（`plan_id_of`）。
+    pub plan_id: PlanId,
+    /// 决策产物。
+    pub plan: Plan,
+    /// 加厚决策轨迹。
+    pub decision_trace: DecisionTrace,
+}
+
+impl PlanSnapshot {
+    /// 从一次规划产物组装快照（PlanId 由内容确定性派生）。
+    #[must_use]
+    pub fn from_planned(plan: Plan, decision_trace: DecisionTrace) -> Self {
+        let plan_id = plan_id_of(&plan, &decision_trace);
+        Self {
+            plan_id,
+            plan,
+            decision_trace,
+        }
+    }
+}
+
 // ---------- Session 双轨状态 ----------
 
 /// 生命周期阶段（资源分配/激活/排空/释放的物理状态）。
@@ -771,6 +1070,146 @@ pub trait RuleEngine: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_plan() -> Plan {
+        Plan {
+            resource_id: ResourceId("dev-svc".into()),
+            provider_id: ProviderId("local-dev-1".into()),
+            placement: "local".into(),
+            path: vec!["127.0.0.1:8080".into()],
+            execution_strategy: "direct".into(),
+            extension: Some(PlanExtension::Service(ServicePlanExtension {
+                version: ServicePlanExtension::VERSION,
+                listen: None,
+                loopback_authorization_required: true,
+            })),
+        }
+    }
+
+    fn sample_trace() -> DecisionTrace {
+        DecisionTrace {
+            considered: vec![
+                ConsideredCandidate {
+                    provider: ProviderId("local-dev-1".into()),
+                    rejected_reason: None,
+                    connectivity: None,
+                    measurement: Some(MeasurementSnapshot {
+                        rtt_ms: Some(12),
+                        confidence_percent: 100,
+                        ..Default::default()
+                    }),
+                    score: Some(10_000),
+                    score_breakdown: Some(vec![
+                        ScoreComponent {
+                            name: "rtt",
+                            contribution: 9_000,
+                            detail: Some("rtt_ms=12".into()),
+                        },
+                        ScoreComponent {
+                            name: "locality",
+                            contribution: 1_000,
+                            detail: Some("local".into()),
+                        },
+                    ]),
+                },
+                ConsideredCandidate {
+                    provider: ProviderId("down-dev-1".into()),
+                    rejected_reason: Some(RejectReason::NotPresent),
+                    connectivity: None,
+                    measurement: None,
+                    score: None,
+                    score_breakdown: None,
+                },
+            ],
+            selected: ProviderId("local-dev-1".into()),
+        }
+    }
+
+    #[test]
+    fn plan_id_is_deterministic_across_calls() {
+        // D3：确定性摘要——同一输入多次计算结果一致（FNV 无随机种子，跨运行一致）。
+        let plan = sample_plan();
+        let trace = sample_trace();
+        let a = plan_id_of(&plan, &trace);
+        let b = plan_id_of(&plan, &trace);
+        assert_eq!(a, b);
+        assert_eq!(a.as_str().len(), 16);
+        assert!(a.as_str().chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn plan_id_changes_when_decision_changes() {
+        let plan = sample_plan();
+        let trace = sample_trace();
+        let base = plan_id_of(&plan, &trace);
+        // provider 变化 → Id 变化。
+        let mut plan2 = plan.clone();
+        plan2.provider_id = ProviderId("remote-dev-1".into());
+        assert_ne!(plan_id_of(&plan2, &trace), base);
+        // 轨迹变化（拒绝原因）→ Id 变化。
+        let mut trace2 = trace.clone();
+        trace2.considered[1].rejected_reason = Some(RejectReason::MissingCapability {
+            required: "service".into(),
+        });
+        assert_ne!(plan_id_of(&plan, &trace2), base);
+    }
+
+    #[test]
+    fn plan_id_distinguishes_reject_reason_payloads() {
+        // review-n2-p03 WARN-1 回归：仅负载不同的两个拒绝原因（同变体、不同
+        // required/key-value）必须产生不同 PlanId。旧编码只用 label()
+        // （变体名）时此测试会失败。
+        let plan = sample_plan();
+        let trace = sample_trace();
+        let mut t1 = trace.clone();
+        t1.considered[1].rejected_reason = Some(RejectReason::MissingCapability {
+            required: "service".into(),
+        });
+        let mut t2 = trace.clone();
+        t2.considered[1].rejected_reason = Some(RejectReason::MissingCapability {
+            required: "relay".into(),
+        });
+        assert_ne!(plan_id_of(&plan, &t1), plan_id_of(&plan, &t2));
+
+        let mut t3 = trace.clone();
+        t3.considered[1].rejected_reason = Some(RejectReason::ExcludedByConstraint {
+            key: "region".into(),
+            value: "eu".into(),
+        });
+        let mut t4 = trace.clone();
+        t4.considered[1].rejected_reason = Some(RejectReason::ExcludedByConstraint {
+            key: "region".into(),
+            value: "us".into(),
+        });
+        assert_ne!(plan_id_of(&plan, &t3), plan_id_of(&plan, &t4));
+    }
+
+    #[test]
+    fn plan_snapshot_derives_plan_id_from_content() {
+        let plan = sample_plan();
+        let trace = sample_trace();
+        let snapshot = PlanSnapshot::from_planned(plan.clone(), trace.clone());
+        assert_eq!(snapshot.plan_id, plan_id_of(&plan, &trace));
+        assert_eq!(snapshot.plan, plan);
+        assert_eq!(snapshot.decision_trace, trace);
+    }
+
+    #[test]
+    fn reject_reason_labels_are_stable() {
+        assert_eq!(RejectReason::NotPresent.label(), "not_present");
+        assert_eq!(
+            RejectReason::ExcludedByConstraint {
+                key: "k".into(),
+                value: "v".into()
+            }
+            .label(),
+            "excluded_by_constraint"
+        );
+        assert_eq!(
+            RejectReason::NoFeasibleConnectivityPath.label(),
+            "no_feasible_connectivity_path"
+        );
+    }
 
     #[test]
     fn plan_extension_is_typed_and_versioned() {

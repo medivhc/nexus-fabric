@@ -28,6 +28,8 @@ pub mod node_cli;
 /// dns status / dns cache / platform capabilities），见 PRODUCT.md#9-observability。
 pub mod observability;
 pub mod pair_cli;
+/// N2 P0-3：`nexus plan` 只读预览 + `plan explain` 双模式（进程内，无 I/O）。
+pub mod plan_cli;
 pub mod provider_fetcher;
 pub mod schedule_cli;
 pub mod strategy_watcher;

@@ -153,6 +153,9 @@ fn decode_sessions(v: &Value) -> Result<Vec<SessionRecord>, String> {
                 session: SessionId(session.to_string()),
                 phase: parse_phase(phase)?,
                 outcome: parse_outcome(outcome, reason)?,
+                // N2 P0-3：sessions.json 暂无 plan_snapshot 字段（P0-4 SessionManager
+                // 落地后写入）；旧记录按 None 读入，不伪造。
+                plan_snapshot: None,
             })
         })
         .collect()
@@ -536,6 +539,7 @@ mod tests {
             session: SessionId(id.to_string()),
             phase: LifecyclePhase::Active,
             outcome: TerminalOutcome::Unfinished,
+            plan_snapshot: None,
         }
     }
 
@@ -550,6 +554,7 @@ mod tests {
                 session: SessionId("s-2".into()),
                 phase: LifecyclePhase::Disposed,
                 outcome: TerminalOutcome::Completed,
+                plan_snapshot: None,
             })
             .unwrap();
         // upsert 同 id
@@ -558,6 +563,7 @@ mod tests {
                 session: SessionId("s-1".into()),
                 phase: LifecyclePhase::Disposed,
                 outcome: TerminalOutcome::Cancelled,
+                plan_snapshot: None,
             })
             .unwrap();
         let records = store.load().unwrap();
@@ -580,6 +586,7 @@ mod tests {
                     session: SessionId("s-f".into()),
                     reason: "boom".into(),
                 }),
+                plan_snapshot: None,
             })
             .unwrap();
         let records = store.load().unwrap();

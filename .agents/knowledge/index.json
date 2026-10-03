@@ -214,5 +214,13 @@
     "module": "workspace",
     "category": "architecture-decision",
     "summary": "架构清理：删除23个module_summary()+24个NEXUS_*_MODULE常量+8条空Cargo依赖边（proto/diagnostics/delivery占位crate保留）；删前二次grep确认零引用"
+  },
+  {
+    "id": "2026-10-03-n2-p03-planner-thicken",
+    "file": "entries/2026-10-03-n2-p03-planner-thicken.md",
+    "date": "2026-10-03",
+    "module": "nexus-planner",
+    "category": "architecture-decision",
+    "summary": "N2 P0-3 DecisionTrace 加厚/PlanId/plan 双模式的五个选址决定：trace DTO 迁 domain、MeasurementSnapshot 镜像、本地优先作 score 分量、plan 走进程内命令族、静态目录编译内置诚实标注"
   }
 ]

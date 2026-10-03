@@ -98,6 +98,7 @@ fn run_flow() -> Result<FlowReport, String> {
         session: session_id.clone(),
         phase: LifecyclePhase::Active,
         outcome: TerminalOutcome::Unfinished,
+        plan_snapshot: None,
     });
 
     // 2) Workspace 写前日志：登记提交 C1（a.txt），随后“进程崩溃”，C1 未落 DAG。

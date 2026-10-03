@@ -44,7 +44,8 @@ nexus — Nexus 统一 Resource Fabric 控制面 CLI（瘦客户端）
 
 命令:
   status                                  总体状态
-  plan explain <resource>                 展示 Plan 决策
+  plan <resource>                       只读规划预览（resolve＋filter＋score，不建连）
+  plan explain <resource|session-id>     Plan 决策解释（双模式：历史记录 / 估算非承诺）
   session watch <session-id>              观察 Session 状态
   connectivity status                     连接状态
   connectivity candidates                 候选 Provider
@@ -233,6 +234,10 @@ fn run(args: &[String]) -> i32 {
     // 节点身份（N2 P0-1；本地文件操作，不经过 daemon）。
     if args[0].as_str() == "node" {
         return nexus::node_cli::run_node(&args[1..], json_mode);
+    }
+    // 规划预览（N2 P0-3；纯本地 resolve＋filter＋score，不建连，不经过 daemon）。
+    if args[0].as_str() == "plan" {
+        return nexus::plan_cli::run_plan(&args[1..], json_mode);
     }
 
     let command = match parse_command(&args) {

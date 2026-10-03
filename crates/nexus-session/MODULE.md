@@ -54,6 +54,9 @@
 - `CancelToken` 与 `AbortOnDropHandle`：std 实现的协作取消原语（Portable，无 tokio 依赖）；JoinSet/Reaper 运行时接线由 domain-runtime 层完成。
 - `SessionError`：结构化会话错误，`From<SessionError> for NexusError` 转换。
 - `SessionRecord` / `SessionRecordStore` / `reconcile_session_records`：冷启动会话记录 reconcile（幂等、孤儿分类，AGENTS.md §15；phase 感知：`Disposed` 直接跳过，终态但未 `Disposed` 重放 cleanup 到 `Disposed` 且不重写 outcome）。
+- `SessionRecord.plan_snapshot: Option<PlanSnapshot>`（N2 P0-3 D3）：Session 内嵌
+  `PlanSnapshot{plan, decision_trace}`；Plan 可重算、不独立持久化；reconcile 回写时
+  原样搬运、不重算；P0-4 的 SessionManager 在建 Session 时填充（`None` = 旧记录）。
 
 ## Verification
 

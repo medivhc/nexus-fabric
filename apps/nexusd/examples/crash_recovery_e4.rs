@@ -43,6 +43,7 @@ fn victim(state_dir: &Path) -> ! {
         session: SessionId("s-crash-1".into()),
         phase: LifecyclePhase::Active,
         outcome: TerminalOutcome::Unfinished,
+        plan_snapshot: None,
     }) {
         fail_json(&format!("victim: save session: {e}"));
     }

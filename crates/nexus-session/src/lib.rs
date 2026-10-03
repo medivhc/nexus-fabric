@@ -13,7 +13,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use nexus_domain::{LifecyclePhase, NexusError, SessionId, SessionStatus, TerminalOutcome};
+use nexus_domain::{
+    LifecyclePhase, NexusError, PlanSnapshot, SessionId, SessionStatus, TerminalOutcome,
+};
 
 // ---------- 事件（Worker 只发事件，Owner 消费） ----------
 
@@ -393,6 +395,12 @@ pub struct SessionRecord {
     pub session: SessionId,
     pub phase: LifecyclePhase,
     pub outcome: TerminalOutcome,
+    /// D3（N2 P0-3）：Session 内嵌 `PlanSnapshot{plan, decision_trace}`。
+    /// Plan 可重算、不独立持久化；快照随 Session 记录保存，供
+    /// `plan explain <session-id>` 返回"历史真实记录"。
+    /// P0-4 的 SessionManager 在建 Session 时填充；`None` = 建连时未做规划
+    /// （如 P0-3 之前的旧记录）。
+    pub plan_snapshot: Option<PlanSnapshot>,
 }
 
 /// 会话记录存储契约（Portable；由 Composition Root 注入实现，
@@ -490,6 +498,8 @@ pub fn reconcile_session_records<S: SessionRecordStore>(
                     session: record.session,
                     phase: LifecyclePhase::Disposed,
                     outcome: record.outcome,
+                    // 快照随记录回写（reconcile 不重算 Plan，只搬运）。
+                    plan_snapshot: record.plan_snapshot,
                 })
                 .map_err(|reason| SessionReconcileError::Store { reason })?;
             continue;
@@ -519,6 +529,7 @@ pub fn reconcile_session_records<S: SessionRecordStore>(
                 session: record.session,
                 phase: status.phase,
                 outcome: status.outcome,
+                plan_snapshot: record.plan_snapshot,
             })
             .map_err(|reason| SessionReconcileError::Store { reason })?;
         report.orphans_classified += 1;
@@ -716,6 +727,7 @@ mod tests {
             session: SessionId(session.into()),
             phase: LifecyclePhase::Active,
             outcome: TerminalOutcome::Unfinished,
+            plan_snapshot: None,
         }
     }
 
@@ -759,6 +771,7 @@ mod tests {
                 session: SessionId("s-done".into()),
                 phase: LifecyclePhase::Disposed,
                 outcome: TerminalOutcome::Completed,
+                plan_snapshot: None,
             }],
         };
         let report = reconcile_session_records(&mut store, false).unwrap();
@@ -824,6 +837,7 @@ mod tests {
                 session: SessionId("s-disposed-unfinished".into()),
                 phase: LifecyclePhase::Disposed,
                 outcome: TerminalOutcome::Unfinished,
+                plan_snapshot: None,
             }],
         };
         let report = reconcile_session_records(&mut store, false).unwrap();
@@ -842,11 +856,13 @@ mod tests {
                     session: SessionId("s-active".into()),
                     phase: LifecyclePhase::Active,
                     outcome: TerminalOutcome::Completed,
+                    plan_snapshot: None,
                 },
                 SessionRecord {
                     session: SessionId("s-draining".into()),
                     phase: LifecyclePhase::Draining,
                     outcome: TerminalOutcome::Cancelled,
+                    plan_snapshot: None,
                 },
                 SessionRecord {
                     session: SessionId("s-alloc".into()),
@@ -854,6 +870,7 @@ mod tests {
                     outcome: TerminalOutcome::Failed(NexusError::Internal {
                         message: "boom".into(),
                     }),
+                    plan_snapshot: None,
                 },
             ],
         };
@@ -885,6 +902,7 @@ mod tests {
                 session: SessionId("s-t".into()),
                 phase: LifecyclePhase::Active,
                 outcome: TerminalOutcome::Completed,
+                plan_snapshot: None,
             }],
         };
         let r1 = reconcile_session_records(&mut store, false).unwrap();
@@ -897,5 +915,48 @@ mod tests {
             store.records, snapshot,
             "second reconcile must not touch anything"
         );
+    }
+
+    #[test]
+    fn plan_snapshot_is_carried_not_recomputed() {
+        // D3：Session 记录内嵌 PlanSnapshot；reconcile 回写时原样搬运、不重算。
+        use nexus_domain::{
+            ConsideredCandidate, DecisionTrace, Plan, PlanId, ProviderId, ResourceId,
+        };
+        let snapshot = PlanSnapshot {
+            plan_id: PlanId("deadbeef00112233".into()),
+            plan: Plan {
+                resource_id: ResourceId("dev-svc".into()),
+                provider_id: ProviderId("local-dev-1".into()),
+                placement: "local".into(),
+                path: vec!["127.0.0.1:8080".into()],
+                execution_strategy: "direct".into(),
+                extension: None,
+            },
+            decision_trace: DecisionTrace {
+                considered: vec![ConsideredCandidate {
+                    provider: ProviderId("local-dev-1".into()),
+                    rejected_reason: None,
+                    connectivity: None,
+                    measurement: None,
+                    score: Some(1_000),
+                    score_breakdown: None,
+                }],
+                selected: ProviderId("local-dev-1".into()),
+            },
+        };
+        let mut store = MemRecordStore {
+            records: vec![SessionRecord {
+                session: SessionId("sess-n2-e4-1".into()),
+                phase: LifecyclePhase::Active,
+                outcome: TerminalOutcome::Completed,
+                plan_snapshot: Some(snapshot.clone()),
+            }],
+        };
+        let report = reconcile_session_records(&mut store, false).unwrap();
+        assert_eq!(report.orphans_classified, 0);
+        // 终态重放 cleanup 后快照仍在（搬运，非重算）。
+        assert_eq!(store.records[0].plan_snapshot, Some(snapshot));
+        assert_eq!(store.records[0].phase, LifecyclePhase::Disposed);
     }
 }

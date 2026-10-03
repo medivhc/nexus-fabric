@@ -70,6 +70,24 @@
 - `NexusError` 新增：`NotFound{kind, id}`（Abort）、`NodeIdentityUnavailable{reason}`
   （Abort）、`PersistenceFailed{path, reason}`（Escalate）。
 
+已实现（N2 P0-3，2026-10-03）：
+
+- 规划决策轨迹 DTO（从 `nexus-planner` 迁移至此；`nexus-session` 只允许依赖
+  `nexus-domain`，Session 内嵌快照需要零依赖的 DTO 位置）：
+  `RejectReason`（结构化拒绝原因，稳定 `label()`；"为什么没被选"的唯一出口）/
+  `ScoreComponent{name, contribution, detail}`（打分明细项；各项之和恒等于总分）/
+  `ConsideredCandidate`（加厚：`rejected_reason` / `connectivity` /
+  `measurement: Option<MeasurementSnapshot>` / `score` / `score_breakdown`）/
+  `DecisionTrace{considered, selected}`。
+- `MeasurementSnapshot`：决策时 `LinkMeasurement` 的领域侧值拷贝（快照语义，
+  不随后续测量更新；`nexus-planner` 负责填充）。
+- `PlanId(pub String)`：FNV-1a 64 位十六进制确定性摘要（非密码学，只作标识符，
+  不做安全边界）；`plan_id_of(&Plan, &DecisionTrace)` 规范编码全部决策字段，
+  同一输入跨运行恒得同一 Id；`fnv1a_64_hex` 为底层原语。
+- `PlanSnapshot{plan_id, plan, decision_trace}`：一次规划决策的不透明记录
+  （D3：Plan 可重算、不独立持久化；Session 记录内嵌本快照）；
+  `PlanSnapshot::from_planned` 由内容派生 `plan_id`。
+
 ## Verification
 
 最低：
