@@ -592,13 +592,19 @@ fn serve_localapi(
 
 // ===== 以下为既有 serve 逻辑（内部实现，保留） =====
 
-/// 解析 `--flag <value>` / `--flag`（布尔）形式；非 flag token 忽略。
+/// 解析 `--flag <value>` / `--flag=value` / `--flag`（布尔）形式；非 flag token 忽略。
 fn parse_flags(args: &[String]) -> std::collections::HashMap<String, Option<String>> {
     let mut map = std::collections::HashMap::new();
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
         if arg.starts_with("--") {
+            // `--key=value` 形式：直接拆分（serve_localapi_e2e 用此形式传 --addr）。
+            if let Some((key, value)) = arg.split_once('=') {
+                map.insert(key.to_string(), Some(value.to_string()));
+                i += 1;
+                continue;
+            }
             if let Some(value) = args.get(i + 1).filter(|v| !v.starts_with("--")) {
                 map.insert(arg.clone(), Some(value.clone()));
                 i += 2;
@@ -989,4 +995,45 @@ fn write_http_json(
     stream.write_all(response.as_bytes())?;
     stream.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod parse_flags_tests {
+    use super::parse_flags;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parses_equals_form() {
+        // 回归：serve_localapi_e2e 用 `--addr=127.0.0.1:0` 形式；
+        // 旧实现把整个 `--addr=...` 当 key，导致 --addr 查不到而回落到 unix socket。
+        let m = parse_flags(&args(&["--addr=127.0.0.1:0"]));
+        assert_eq!(
+            m.get("--addr").and_then(|v| v.as_deref()),
+            Some("127.0.0.1:0")
+        );
+    }
+
+    #[test]
+    fn parses_space_separated_form() {
+        let m = parse_flags(&args(&["--addr", "127.0.0.1:8080"]));
+        assert_eq!(
+            m.get("--addr").and_then(|v| v.as_deref()),
+            Some("127.0.0.1:8080")
+        );
+    }
+
+    #[test]
+    fn parses_boolean_flag() {
+        let m = parse_flags(&args(&["--verbose"]));
+        assert_eq!(m.get("--verbose"), Some(&None));
+    }
+
+    #[test]
+    fn equals_form_with_empty_value() {
+        let m = parse_flags(&args(&["--addr="]));
+        assert_eq!(m.get("--addr").and_then(|v| v.as_deref()), Some(""));
+    }
 }
