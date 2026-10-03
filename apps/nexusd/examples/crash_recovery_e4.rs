@@ -44,6 +44,7 @@ fn victim(state_dir: &Path) -> ! {
         phase: LifecyclePhase::Active,
         outcome: TerminalOutcome::Unfinished,
         plan_snapshot: None,
+        detached_at_unix: None,
     }) {
         fail_json(&format!("victim: save session: {e}"));
     }

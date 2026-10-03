@@ -472,7 +472,8 @@ fn parse_plan_snapshot(v: &Value) -> Result<PlanSnapshot, String> {
     })
 }
 
-/// SessionRecord → JSON（durable v1；`plan_snapshot` 全量内嵌，D3）。
+/// SessionRecord → JSON（durable v1；`plan_snapshot` 全量内嵌，D3；
+/// `detached_at_unix` 为 P1-3 新增的可选字段）。
 fn encode_session_record(r: &SessionRecord) -> Value {
     let (outcome, reason) = outcome_to_json(&r.outcome);
     let mut obj = Map::new();
@@ -490,6 +491,9 @@ fn encode_session_record(r: &SessionRecord) -> Value {
             .map(encode_plan_snapshot)
             .unwrap_or(Value::Null),
     );
+    if let Some(detached_at) = r.detached_at_unix {
+        obj.insert("detached_at_unix".into(), json!(detached_at));
+    }
     Value::Object(obj)
 }
 
@@ -512,6 +516,8 @@ fn decode_session_record(v: &Value) -> Result<SessionRecord, String> {
             .filter(|x| !x.is_null())
             .map(parse_plan_snapshot)
             .transpose()?,
+        // P1-3：字段缺失（v1 旧记录）按未断开处理，向后兼容。
+        detached_at_unix: v.get("detached_at_unix").and_then(Value::as_u64),
     })
 }
 
@@ -560,6 +566,25 @@ impl SessionRecordStore for KvSessionRecordStore {
     }
 
     fn save(&mut self, record: &SessionRecord) -> Result<(), String> {
+        // P1-1：终态 CAS（§14 Exactly-One Terminal Outcome 跨进程）。
+        // 无 CAS 时两个进程先后 `commit_outcome` 会互相覆盖——先到的终态被
+        // 后到的改写，"谁先提交"不可证。规则：**先到的终态获胜**：
+        // - 已有记录无终态 → 允许（首次提交 / 未终态推进）；
+        // - 已有记录有终态且与来件不同 → 拒绝（冲突，fail-closed）；
+        // - 已有记录有终态且与来件相同 → 允许（幂等重放，如 reconcile 的
+        //   cleanup 回写、reconnect 后的重复 persist）。
+        if let Some(existing) = self.current_record(&record.session)? {
+            let existing_terminal = terminal_outcome_code(&existing.outcome);
+            let incoming_terminal = terminal_outcome_code(&record.outcome);
+            if let (Some(have), Some(want)) = (existing_terminal, incoming_terminal) {
+                if have != want {
+                    return Err(format!(
+                        "terminal outcome conflict for {}: already committed '{have}', refusing to overwrite with '{want}'",
+                        record.session.0
+                    ));
+                }
+            }
+        }
         let data = serde_json::to_string(&encode_session_record(record))
             .map_err(|e| format!("encode session record: {e}"))?;
         let key = session_key(&record.session);
@@ -573,6 +598,37 @@ impl SessionRecordStore for KvSessionRecordStore {
             .journal_append(&payload)
             .map_err(|e| format!("journal session {}: {e}", record.session.0))?;
         Ok(())
+    }
+}
+
+impl KvSessionRecordStore {
+    /// 读取某会话的当前持久记录（CAS 读口；不存在 → `None`）。
+    fn current_record(&self, id: &SessionId) -> Result<Option<SessionRecord>, String> {
+        let key = session_key(id);
+        let Some(bytes) = self
+            .kv
+            .get(&key)
+            .map_err(|e| format!("read session {} for cas: {e}", id.0))?
+        else {
+            return Ok(None);
+        };
+        let text = String::from_utf8(bytes)
+            .map_err(|e| format!("session {} not utf-8: {e}", id.0))?;
+        let v: Value =
+            serde_json::from_str(&text).map_err(|e| format!("parse session {}: {e}", id.0))?;
+        decode_session_record(&v).map(Some)
+    }
+}
+
+/// 终态判定结果的稳定标签（`None` = 未达终态）。
+///
+/// P1-1 CAS 用：同一 session 的两个不同终态标签 → 冲突。
+fn terminal_outcome_code(outcome: &nexus_domain::TerminalOutcome) -> Option<&'static str> {
+    match outcome {
+        nexus_domain::TerminalOutcome::Unfinished => None,
+        nexus_domain::TerminalOutcome::Completed => Some("completed"),
+        nexus_domain::TerminalOutcome::Cancelled => Some("cancelled"),
+        nexus_domain::TerminalOutcome::Failed(_) => Some("failed"),
     }
 }
 
@@ -1261,6 +1317,7 @@ mod tests {
             phase: LifecyclePhase::Active,
             outcome: TerminalOutcome::Unfinished,
             plan_snapshot: Some(sample_snapshot()),
+            detached_at_unix: None,
         };
         sessions.save(&record).unwrap();
         let loaded = sessions.load().unwrap();
@@ -1284,6 +1341,7 @@ mod tests {
                 phase: LifecyclePhase::Active,
                 outcome: TerminalOutcome::Unfinished,
                 plan_snapshot: None,
+                detached_at_unix: None,
             })
             .unwrap();
         let entries = replay_audit_entries(store.kv()).unwrap();

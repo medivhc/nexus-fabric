@@ -156,6 +156,7 @@ fn decode_sessions(v: &Value) -> Result<Vec<SessionRecord>, String> {
                 // N2 P0-3：sessions.json 暂无 plan_snapshot 字段（P0-4 SessionManager
                 // 落地后写入）；旧记录按 None 读入，不伪造。
                 plan_snapshot: None,
+                detached_at_unix: None,
             })
         })
         .collect()
@@ -540,6 +541,7 @@ mod tests {
             phase: LifecyclePhase::Active,
             outcome: TerminalOutcome::Unfinished,
             plan_snapshot: None,
+            detached_at_unix: None,
         }
     }
 
@@ -555,6 +557,7 @@ mod tests {
                 phase: LifecyclePhase::Disposed,
                 outcome: TerminalOutcome::Completed,
                 plan_snapshot: None,
+                detached_at_unix: None,
             })
             .unwrap();
         // upsert 同 id
@@ -564,6 +567,7 @@ mod tests {
                 phase: LifecyclePhase::Disposed,
                 outcome: TerminalOutcome::Cancelled,
                 plan_snapshot: None,
+                detached_at_unix: None,
             })
             .unwrap();
         let records = store.load().unwrap();
@@ -587,6 +591,7 @@ mod tests {
                     reason: "boom".into(),
                 }),
                 plan_snapshot: None,
+                detached_at_unix: None,
             })
             .unwrap();
         let records = store.load().unwrap();

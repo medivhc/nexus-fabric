@@ -281,6 +281,7 @@ fn seed_session_at(node_dir: &std::path::Path, id: &str) -> Result<(), String> {
         phase: nexus_domain::LifecyclePhase::Active,
         outcome: TerminalOutcome::Unfinished,
         plan_snapshot: Some(seed_plan_snapshot(id)),
+        detached_at_unix: None,
     };
     let mut sessions = store.sessions();
     use nexus_session::SessionRecordStore as _;
@@ -405,6 +406,7 @@ mod tests {
                 phase,
                 outcome,
                 plan_snapshot: Some(PlanSnapshotForTest::snapshot()),
+                detached_at_unix: None,
             })
             .unwrap();
     }

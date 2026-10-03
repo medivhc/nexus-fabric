@@ -260,12 +260,21 @@ impl GrantTable {
         decision
     }
 
+    /// 判定内核（纯函数，无 I/O）。
     fn decide(&self, req: &AuthRequest, now_unix: u64) -> AuthorizationDecision {
-        let grant = match self
-            .grants
-            .iter()
-            .find(|g| g.resource == req.resource && g.principal == req.principal)
-        {
+        // P1-17：`ResourceRef` 的 `PartialEq` 含 workspace，若直接按
+        // `g.resource == req.resource` 查找，跨 workspace 请求会在 find 阶段
+        // 就落成 `NoSuchGrant`，`WrongWorkspace` 变成死路径。先按
+        // `(name, principal)` 找，同名不同 workspace 显式比出 `WrongWorkspace`；
+        // 存在精确匹配时行为与旧实现完全一致（按 `(resource, principal)` 命中优先）。
+        let exact = self.grants.iter().find(|g| {
+            g.resource == req.resource && g.principal == req.principal
+        });
+        let grant = match exact.or_else(|| {
+            self.grants.iter().find(|g| {
+                g.resource.name == req.resource.name && g.principal == req.principal
+            })
+        }) {
             Some(g) => g,
             None => return AuthorizationDecision::Deny(DenyReason::NoSuchGrant),
         };
@@ -434,6 +443,123 @@ mod tests {
             AuthorizationDecision::Deny(DenyReason::WrongWorkspace { .. })
         ));
         assert_eq!(sink.records.len(), 1);
+    }
+
+    #[test]
+    fn wrong_workspace_is_reachable_when_resource_ref_differs_in_workspace() {
+        // P1-17 回归：`ResourceRef` 的 `PartialEq` 含 workspace，旧实现用
+        // `g.resource == req.resource` 查找 → 跨 workspace 请求在 find 阶段
+        // 就落成 NoSuchGrant，`WrongWorkspace` 是死路径。这里请求的
+        // `req.resource.workspace` 与 `req.workspace` 都不同于 grant，验证
+        // 生产可达的分支。
+        let mut table = GrantTable::new();
+        let p = principal(21);
+        table.upsert(Grant::new(
+            rref("ws-a", "svc"),
+            p.clone(),
+            vec![ResourceOperation::Use],
+            None,
+        ));
+        let mut sink = VecAuditSink::new();
+        let r = AuthRequest {
+            workspace: wid("ws-b"),
+            resource: rref("ws-b", "svc"),
+            principal: p,
+            operation: ResourceOperation::Use,
+        };
+        let d = table.authorize(&r, 1000, &mut sink);
+        match d {
+            AuthorizationDecision::Deny(DenyReason::WrongWorkspace {
+                expected,
+                actual,
+            }) => {
+                assert_eq!(expected, wid("ws-a"));
+                assert_eq!(actual, wid("ws-b"));
+            }
+            other => panic!("expected WrongWorkspace, got {other:?}"),
+        }
+        assert_eq!(sink.records.len(), 1);
+    }
+
+    #[test]
+    fn exact_workspace_match_still_wins_over_cross_workspace_grant() {
+        // P1-17：精确匹配优先——同名同 principal 在两个 workspace 各有一条时，
+        // 请求哪个就用哪个，不被另一条挤成 WrongWorkspace。
+        let mut table = GrantTable::new();
+        let p = principal(22);
+        table.upsert(Grant::new(
+            rref("ws-a", "svc"),
+            p.clone(),
+            vec![ResourceOperation::Manage],
+            None,
+        ));
+        table.upsert(Grant::new(
+            rref("ws-b", "svc"),
+            p.clone(),
+            vec![ResourceOperation::Use],
+            None,
+        ));
+        let mut sink = VecAuditSink::new();
+        assert_eq!(
+            table.authorize(
+                &req("ws-a", "svc", p.clone(), ResourceOperation::Manage),
+                1000,
+                &mut sink
+            ),
+            AuthorizationDecision::Allow
+        );
+        assert_eq!(
+            table.authorize(
+                &req("ws-b", "svc", p, ResourceOperation::Use),
+                1000,
+                &mut sink
+            ),
+            AuthorizationDecision::Allow
+        );
+        // 第三个 workspace：存在同名同 principal 的 grant 但不在该 workspace →
+        // WrongWorkspace（而非 NoSuchGrant）。
+        let r = AuthRequest {
+            workspace: wid("ws-c"),
+            resource: rref("ws-c", "svc"),
+            principal: principal(22),
+            operation: ResourceOperation::Use,
+        };
+        assert!(matches!(
+            table.authorize(&r, 1000, &mut sink),
+            AuthorizationDecision::Deny(DenyReason::WrongWorkspace {
+                expected,
+                ..
+            }) if expected == wid("ws-a")
+        ));
+    }
+
+    #[test]
+    fn revoked_is_produced_after_explicit_revoke() {
+        // P1-14：`Grant.revoked` tombstone 是 `DenyReason::Revoked` 的唯一
+        // 生产来源（`nexus grant revoke`）。撤销后判定必须是 Revoked 而非
+        // NoSuchGrant——否则审计里"撤销"与"从未授权"不可区分。
+        let mut table = GrantTable::new();
+        let p = principal(31);
+        table.upsert(Grant::new(
+            rref("default", "svc"),
+            p.clone(),
+            vec![ResourceOperation::Use],
+            None,
+        ));
+        let mut sink = VecAuditSink::new();
+        assert!(table.revoke(&rref("default", "svc"), &p));
+        assert_eq!(
+            table.authorize(
+                &req("default", "svc", p, ResourceOperation::Use),
+                1000,
+                &mut sink
+            ),
+            AuthorizationDecision::Deny(DenyReason::Revoked)
+        );
+        assert_eq!(
+            sink.records[0].decision,
+            AuthorizationDecision::Deny(DenyReason::Revoked)
+        );
     }
 
     #[test]

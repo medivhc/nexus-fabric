@@ -430,6 +430,7 @@ mod tests {
                 phase: nexus_domain::LifecyclePhase::Active,
                 outcome: nexus_domain::TerminalOutcome::Completed,
                 plan_snapshot: Some(snapshot),
+                detached_at_unix: None,
             })
             .unwrap();
         let found = N2PlanHistory { store: &store }
