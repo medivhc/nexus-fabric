@@ -4,6 +4,11 @@
 //! P0-4 只在测试替身里写 grant，本命令族给真机运维（B 机为 A 机 principal 授权）。
 //!
 //! - `nexus grant add --resource <name> --principal <ed25519:...> --op <Use|Manage> [--not-after <unix>]`
+//! - `nexus grant add --resource <name> --self --op <Use|Manage>`：把**本机**身份
+//!   （`ensure_auth_identity` 派生的 ed25519 principal）写进 grant 表。仍是一条
+//!   显式、可审计的 grant 记录（D6 不变：目录可见≠有权限），只是不再需要先
+//!   用带外方式读出 principal——E4 夹具无 shell、无法把 `identity show` 的输出
+//!   管道进 `--principal`（P1-8）。`--principal` 与 `--self` 互斥。
 //! - `nexus grant del --resource <name> --principal <ed25519:...>`（P1-14：撤销
 //!   tombstone，后续判定 `Deny(Revoked)` 而非 `NoSuchGrant`）
 //! - `nexus grant list [--resource <name>]`
@@ -84,11 +89,15 @@ pub(crate) fn add_grant_to(
     }))
 }
 
-/// `nexus grant add --resource <name> --principal <p> --op <op> [--not-after <unix>]`
+/// `nexus grant add --resource <name> (--principal <p> | --self) --op <op> [--not-after <unix>]`
+///
+/// P1-8：`--self` 把本机身份写进 grant 表，让 E4 夹具（无 shell、无法取
+/// principal 字符串）可以在干净配置目录里自洽地准备 `use` 前置。
 fn run_add(args: &[String], json_mode: bool) -> i32 {
-    const USAGE: &str = "usage: nexus grant add --resource <name> --principal <ed25519:...> --op <Use|Manage> [--not-after <unix>]";
+    const USAGE: &str = "usage: nexus grant add --resource <name> --principal <ed25519:...> | --self --op <Use|Manage> [--not-after <unix>]";
     let mut resource: Option<String> = None;
     let mut principal: Option<String> = None;
+    let mut self_grant = false;
     let mut op: Option<String> = None;
     let mut not_after: Option<u64> = None;
     let mut i = 0;
@@ -101,6 +110,9 @@ fn run_add(args: &[String], json_mode: bool) -> i32 {
             "--principal" => {
                 i += 1;
                 principal = args.get(i).cloned();
+            }
+            "--self" => {
+                self_grant = true;
             }
             "--op" => {
                 i += 1;
@@ -118,16 +130,42 @@ fn run_add(args: &[String], json_mode: bool) -> i32 {
         }
         i += 1;
     }
-    let (Some(name), Some(principal_s), Some(op_s)) = (resource, principal, op) else {
-        eprintln!("error: grant add requires --resource, --principal and --op");
+    let (Some(name), Some(op_s)) = (resource, op) else {
+        eprintln!("error: grant add requires --resource, --op and (--principal or --self)");
         eprintln!("{USAGE}");
         return 2;
     };
+    if self_grant && principal.is_some() {
+        eprintln!("error: --principal and --self are mutually exclusive");
+        eprintln!("{USAGE}");
+        return 2;
+    }
+    if !self_grant && principal.is_none() {
+        eprintln!("error: grant add requires --principal or --self");
+        eprintln!("{USAGE}");
+        return 2;
+    }
     let node_dir = crate::node_cli::node_dir();
+    let principal_s = if self_grant {
+        match self_principal(&node_dir) {
+            Ok(p) => p,
+            Err(fail) => return render(&fail, json_mode),
+        }
+    } else {
+        principal.unwrap_or_default()
+    };
     match add_grant_to(&node_dir, &name, &principal_s, &op_s, not_after) {
         Ok(out) => render(&out, json_mode),
         Err(fail) => render(&fail, json_mode),
     }
+}
+
+/// `--self`：解析本机身份（`ensure_auth_identity` 派生；未初始化则先创建）。
+fn self_principal(node_dir: &std::path::Path) -> Result<String, Value> {
+    let store = N2Store::open(node_dir).map_err(store_fail)?;
+    crate::n2_identity::ensure_auth_identity(&store)
+        .map(|(_, p)| p.0)
+        .map_err(|e| json!({"verdict":"FAIL","error":{"code":"IDENTITY","message": e}}))
 }
 
 /// `nexus grant del` 的可测试内核（`node_dir` 注入）。
@@ -303,6 +341,27 @@ mod tests {
                 kind: Some(nexus_domain::ResourceKind::Service),
             }])
             .unwrap();
+    }
+
+    #[test]
+    fn self_principal_is_ed25519_derived_and_stable() {
+        // P1-8：`--self` 解析出的 principal 必须与 `use` 侧 authorize 用的是
+        // 同一个 ed25519 派生身份，且在同一 node_dir 上幂等。
+        let dir = temp_node_dir("self");
+        let p1 = self_principal(&dir).unwrap();
+        let p2 = self_principal(&dir).unwrap();
+        assert!(p1.starts_with("ed25519:"));
+        assert_eq!(p1, p2);
+        let store = N2Store::open(&dir).unwrap();
+        let (_, derived) = crate::n2_identity::ensure_auth_identity(&store).unwrap();
+        assert_eq!(p1, derived.0);
+        // 写进 grant 表后，授权判定按同一 principal 命中。
+        publish(&dir, "svc-self");
+        add_grant_to(&dir, "svc-self", &p1, "Use", None).unwrap();
+        let grants = store.load_grants().unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].principal.0, p1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
