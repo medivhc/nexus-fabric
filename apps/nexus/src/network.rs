@@ -37,7 +37,11 @@ use std::time::Duration;
 
 fn map_fabric_err(e: FabricError) -> N1Error {
     match e {
-        FabricError::Closed(_) => N1Error::Closed,
+        // B2 根因修复（2026-10-03 W1）：保留关闭码，让 watcher 能区分
+        // 对端优雅关闭（application close, code 0）与传输层故障。
+        // 注意 `LocallyClosed` 也映射到 `Closed(0)`；watcher 侧本地关闭
+        // 恒有 stop 标志位保护，把它当优雅关闭静默退出同样正确（不误报）。
+        FabricError::Closed(code) => N1Error::PeerClosed(code),
         FabricError::Timeout => N1Error::Timeout,
         FabricError::PathUnreachable => N1Error::PeerUnknown,
         FabricError::HandshakeFailed(s) => N1Error::Transport(format!("handshake: {s}")),

@@ -457,7 +457,7 @@ impl VpiPump {
                         }
                     }
                 }
-                Err(N1Error::Closed) => break,
+                Err(N1Error::Closed) | Err(N1Error::PeerClosed(_)) => break,
                 Err(_) => {
                     // 通道级瞬时错误：继续阻塞收（Link 观测走心跳，不在此触发）。
                     continue;

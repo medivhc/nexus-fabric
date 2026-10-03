@@ -95,6 +95,10 @@ pub enum N1Error {
     PeerUnknown,
     /// 连接/监听已关闭。
     Closed,
+    /// 对端主动关闭了连接（QUIC application close），携带关闭码。
+    /// 码 0 = 优雅关闭（`close(0, …)` 约定，如 `remove()` 的 `"n1 shutdown"`）；
+    /// watcher 收到后不得误报为链路故障（B2 根因 2026-10-02）。
+    PeerClosed(u32),
     /// 操作超时（心跳超时、握手超时等）。
     Timeout,
     /// 数据报超限（>1200B，调用方计数后丢弃）。
@@ -109,6 +113,7 @@ impl fmt::Display for N1Error {
             Self::Transport(e) => write!(f, "n1 transport failure: {e}"),
             Self::PeerUnknown => write!(f, "n1 peer unknown"),
             Self::Closed => write!(f, "n1 connection closed"),
+            Self::PeerClosed(code) => write!(f, "n1 peer closed connection (code {code})"),
             Self::Timeout => write!(f, "n1 operation timed out"),
             Self::OversizeDatagram(n) => write!(f, "n1 datagram too large: {n} bytes"),
             Self::InvalidConfig(e) => write!(f, "n1 invalid config: {e}"),

@@ -148,7 +148,9 @@ impl LinkStateWatcher {
                         self.ping_watch(stream, &stop);
                     }
                     Err(e) => {
-                        if matches!(e, N1Error::Closed) || stop.load(Ordering::SeqCst) {
+                        if matches!(e, N1Error::Closed | N1Error::PeerClosed(_))
+                            || stop.load(Ordering::SeqCst)
+                        {
                             break;
                         }
                         // 流暂时打不开（对端响应器未就绪等）：退避重试，不热循环。
@@ -168,7 +170,7 @@ impl LinkStateWatcher {
     fn ping_watch(&self, stream: N1KeepaliveStream, stop: &Arc<AtomicBool>) {
         let last_pong = Arc::new(Mutex::new(Instant::now()));
         let last_pong_c = Arc::clone(&last_pong);
-        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<N1Error>();
         let peer = self.peer;
         let pinger = thread::Builder::new()
             .name(format!("n1-kaping-{}", &peer.to_hex()[..8]))
@@ -178,8 +180,31 @@ impl LinkStateWatcher {
         let poll = Duration::from_millis(200).min(self.config.probe_interval);
         loop {
             match done_rx.recv_timeout(poll) {
-                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    // pinger 退出 = 流错误（辅触发器）：上报并重开流。
+                Ok(err) => {
+                    // pinger 退出：先看 stop，再看是不是对端优雅关闭。
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    match err {
+                        N1Error::PeerClosed(0) => {
+                            // 对端优雅关闭（QUIC application close, code 0）：
+                            // 不是链路故障，不上报 LinkFailed、不触发 rebind，
+                            // 静默退出，由 watch() 重开流或随连接关闭而结束。
+                            // B2 根因（2026-10-02）：remove() 的 conn.close()
+                            // 发 CONNECTION_CLOSE，曾被误报为
+                            // "keepalive stream error" → "discovery returned
+                            // no locators" → 300s 全局超时。
+                            break;
+                        }
+                        _ => {
+                            // 流错误（辅触发器）：上报并重开流。
+                            self.recover("keepalive stream error");
+                            break;
+                        }
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // pinger 线程异常退出（panic 等）：保守按流错误处理。
                     if stop.load(Ordering::SeqCst) {
                         break;
                     }
@@ -298,20 +323,22 @@ impl LinkStateWatcher {
     }
 }
 
-/// pinger：写 ping → 阻塞读 pong → 更新 `last_pong`；流结束时发 done 信号。
+/// pinger：写 ping → 阻塞读 pong → 更新 `last_pong`；流结束时把终止
+/// 错误发给 `ping_watch`（B2 根因修复：不再丢弃错误，watcher 需区分
+/// 对端优雅关闭与链路故障）。
 fn pinger_loop(
     mut stream: N1KeepaliveStream,
     last_pong: Arc<Mutex<Instant>>,
-    done_tx: mpsc::Sender<()>,
+    done_tx: mpsc::Sender<N1Error>,
 ) {
     let mut seq: u64 = 0;
     let mut frame = [0u8; KEEPALIVE_FRAME_LEN];
-    loop {
+    let terminal: N1Error = loop {
         seq = seq.wrapping_add(1);
         frame[..8].copy_from_slice(&KEEPALIVE_MAGIC);
         frame[8..].copy_from_slice(&seq.to_be_bytes());
-        if stream.write_all(&frame).is_err() {
-            break;
+        if let Err(e) = stream.write_all(&frame) {
+            break e;
         }
         let mut pong = [0u8; KEEPALIVE_FRAME_LEN];
         match stream.read_exact(&mut pong) {
@@ -320,10 +347,10 @@ fn pinger_loop(
                     *last_pong.lock().unwrap() = Instant::now();
                 }
             }
-            Err(_) => break,
+            Err(e) => break e,
         }
-    }
-    let _ = done_tx.send(());
+    };
+    let _ = done_tx.send(terminal);
 }
 
 /// keepalive 响应器：阻塞接受对端 keepalive 流，读 ping 回 pong。
@@ -370,6 +397,8 @@ mod tests {
         Hang,
         /// write 直接失败（模拟流错误）。
         WriteErr,
+        /// read 返回对端优雅关闭（B2 根因：`remove()` 的 `conn.close()`）。
+        PeerGracefulClose,
     }
 
     /// 可编程的测试替身 keepalive 流。
@@ -399,6 +428,12 @@ mod tests {
                     Ok(())
                 }
                 Some(KaAction::WriteErr) => Err(N1Error::Transport("fake write err".into())),
+                Some(KaAction::PeerGracefulClose) => {
+                    // 放回：read_exact 依据 front()==PeerGracefulClose 返回优雅关闭
+                    //（真实场景：pinger 阻塞在读时对端发 CONNECTION_CLOSE）。
+                    self.script.push_front(KaAction::PeerGracefulClose);
+                    Ok(())
+                }
             }
         }
         fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), N1Error> {
@@ -416,6 +451,10 @@ mod tests {
                         thread::sleep(Duration::from_millis(10));
                     }
                     Err(N1Error::Closed)
+                }
+                Some(KaAction::PeerGracefulClose) => {
+                    self.script.pop_front();
+                    Err(N1Error::PeerClosed(0))
                 }
                 _ => Err(N1Error::Closed),
             }
@@ -587,6 +626,52 @@ mod tests {
                 N1EventKind::LinkFailed { reason: ref r } if r.contains("keepalive stream error")
             )),
             "stream-error LinkFailed expected, got {events:?}"
+        );
+        handle.shutdown();
+    }
+
+    /// B2 深层根治回归（2026-10-03 W1）：对端优雅关闭（`remove()` 的
+    /// `conn.close()` 发 QUIC application close, code 0）不得被误报为
+    /// LinkFailed。旧行为：pinger 读失败 → `recover("keepalive stream error")`
+    /// → `discovery returned no locators` → 300s 全局超时。
+    #[test]
+    fn graceful_peer_close_does_not_emit_link_failed() {
+        let peer = N1PeerId([7u8; 32]);
+        let conn = Arc::new(FakeConn {
+            peer,
+            id: 45,
+            closed: Arc::new(AtomicBool::new(false)),
+            rebinds: AtomicUsize::new(0),
+            streams: Mutex::new(vec![vec![KaAction::PeerGracefulClose]].into()),
+        });
+        let sink = Arc::new(VecSink {
+            events: Mutex::new(vec![]),
+        });
+        let handle = LinkStateWatcher::start(
+            peer,
+            conn.clone(),
+            Arc::new(FakeDiscovery),
+            sink.clone(),
+            LinkConfig {
+                probe_interval: Duration::from_millis(50),
+                heartbeat_timeout: Duration::from_secs(30),
+                enable_rebind: true,
+                enable_watcher: true,
+            },
+        );
+        // pinger 首次读即遇到优雅关闭；800ms 足够走完"静默退出"路径。
+        thread::sleep(Duration::from_millis(800));
+        assert_eq!(
+            conn.rebinds.load(Ordering::SeqCst),
+            0,
+            "graceful peer close must not trigger rebind"
+        );
+        let events = sink.events.lock().unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e.kind, N1EventKind::LinkFailed { .. })),
+            "graceful peer close must not emit LinkFailed, got {events:?}"
         );
         handle.shutdown();
     }
