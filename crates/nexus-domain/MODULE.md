@@ -90,6 +90,16 @@
 
 ## Verification
 
+### N3 契约增补（待实现）
+
+PRODUCT §17 与 `docs/N3-MODEL-CONTRACT.md` 定义 N3 类型区：TaskId / SnapshotId /
+ArtifactId、SnapshotRef、SubmitTaskRequest、TaskView、ArtifactRecord 和版本化错误/状态 DTO。
+标识符及跨模块 DTO 在本 crate，TaskOwner/存储/命令执行不在本 crate。
+TaskPhase 与 TaskOutcome、execution/delivery/cancellation/observation 分离；
+Task 不增加 Core Plan 固定字段，Session != Task。
+JSON 形状由 `docs/contracts/n3-task-v1.schema.json` 冻结；Rust API 在实现阶段补充。
+关联场景：`scenarios/product/n3-*.toml`；现有 API 语义保持不变。
+
 最低：
 
 ```text

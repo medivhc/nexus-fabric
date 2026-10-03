@@ -1,0 +1,32 @@
+schema_version = 1
+id = "product.n3-input-integrity"
+title = "输入对象损坏不得执行"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#17-n3-task"
+
+# N3 contract-first: future verifier, not a delivered runtime.
+# Modules: nexus-domain nexus-compute nexus-workspace nexus-storage
+# nexus-session nexus-control-api apps/nexus apps/nexusd
+
+[given]
+topology = "separate requester/provider processes; local E4, not Windows/Linux E5"
+steps = "接受已认证快照描述，改变目标端待物化文件字节；从产品边界查询完整性拒绝。"
+
+[when]
+command = "cargo run --locked --quiet -p nexusd --example n3_task_e4 -- input-integrity"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "task.outcome"
+equals = "Failed"
+
+[[expect]]
+field = "task.error.code"
+equals = "INPUT_INTEGRITY_FAILED"
+
+[[expect]]
+field = "observed.command_start_count"
+equals = 0

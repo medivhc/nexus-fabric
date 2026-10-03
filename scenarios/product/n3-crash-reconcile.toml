@@ -1,0 +1,40 @@
+schema_version = 1
+id = "product.n3-crash-reconcile"
+title = "StartIntent 崩溃间隙核实而不重复启动"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#17-n3-task"
+
+# N3 contract-first: future verifier, not a delivered runtime.
+# Modules: nexus-domain nexus-compute nexus-workspace nexus-storage
+# nexus-session nexus-control-api apps/nexus apps/nexusd
+
+[given]
+topology = "separate requester/provider processes; local E4, not Windows/Linux E5"
+steps = "在 StartIntent durable 后至 Started durable 前分别注入崩溃，重启后先阻断执行句柄核实，再恢复。"
+
+[when]
+command = "cargo run --locked --quiet -p nexusd --example n3_task_e4 -- crash-reconcile"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "before.observation"
+equals = "PendingVerification"
+
+[[expect]]
+field = "observed.second_spawn_while_unknown"
+equals = 0
+
+[[expect]]
+field = "observed.max_command_start_count_per_task"
+equals = 1
+
+[[expect]]
+field = "observed.pid_reuse_rejected"
+equals = true
+
+[[expect]]
+field = "observed.reconcile_idempotent"
+equals = true

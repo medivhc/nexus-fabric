@@ -163,6 +163,16 @@ Merge/Commit/持久化路径必须返回结构化 `WorkspaceError`，不得 pani
 
 ## Verification
 
+### N3 Snapshot 契约增补（待实现）
+
+固定唯一 Commit 与所选文件清单，产生 SnapshotRef；接受后不跟随 Head/工作目录变动。
+N3 文件/清单的 SHA-256 与长度在物化前核实；既有 FNV Commit/ObjectId 不作安全校验。
+规则、路径规范、symlink 拒绝和目标平台名称碰撞见 `docs/N3-MODEL-CONTRACT.md` §4。
+Task durable pin、Pending Artifact、Pending Delivery 为 GC protected roots；
+冷启动恢复 roots 后才可 GC，Task 释放 pin 不解除其他合法保留根。
+仅管理 Snapshot/物化及 roots，不执行命令、不拥有 TaskOutcome、不自行挑 Provider。
+验收：`n3-snapshot-immutable`、`n3-input-integrity`、`n3-gc-roots`；PRODUCT §17。
+
 最低：
 
 ```text

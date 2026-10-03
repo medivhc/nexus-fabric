@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "note": "Hand-specified expected canonical bytes; SHA-256 over those exact bytes, independent of future runtime encoder. DTO semantic limits still apply.",
+  "vectors": [
+    {
+      "name": "escapes-and-negative-zero",
+      "input_json": " { \"z\": -0, \"a\": \"\\u0008\\u0009\\u000a\\u000c\\u000d\\u0022\\u005c\\/\" }",
+      "canonical_utf8_hex": "7b2261223a225c625c745c6e5c665c725c225c5c2f222c227a223a307d",
+      "sha256": "b05211bac12fb158f6c8338b7929316c27f5d6c8cc6bd38daab663fae506e069"
+    },
+    {
+      "name": "unicode-and-slash",
+      "input_json": "{\"z\":1,\"é\":\"\\u4e2d\\/文\",\"a\":\"\\u2028\"}",
+      "canonical_utf8_hex": "7b2261223a22e280a8222c227a223a312c22c3a9223a22e4b8ad2fe69687227d",
+      "sha256": "365faade91c089cb19a77fcb441b26982c9ebbcb982d708a253db7309acfd129"
+    },
+    {
+      "name": "utf8-key-order",
+      "input_json": "{\"\\ud83d\\ude00\":2,\"\\ue000\":1}",
+      "canonical_utf8_hex": "7b22ee8080223a312c22f09f9880223a327d",
+      "sha256": "871954531859c7572c6279f90eb83a594ddc3a289e8bdc28d2a84ffb8c1a1703"
+    },
+    {
+      "name": "integer-upper-bound",
+      "input_json": "{\"n\":9007199254740991,\"zero\":-0}",
+      "canonical_utf8_hex": "7b226e223a393030373139393235343734303939312c227a65726f223a307d",
+      "sha256": "a7090873bbbee9ac1699c6e7c8ee834cfe0cb77c4a279c1320258fa2687fcfa2"
+    }
+  ]
+}

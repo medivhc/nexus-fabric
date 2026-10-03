@@ -1,0 +1,36 @@
+schema_version = 1
+id = "product.n3-idempotency-expiry"
+title = "幂等过期语义明确且重交不续期"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#17-n3-task"
+
+# N3 contract-first: future verifier, not a delivered runtime.
+# Modules: nexus-domain nexus-compute nexus-workspace nexus-storage
+# nexus-session nexus-control-api apps/nexus apps/nexusd
+
+[given]
+topology = "separate requester/provider processes; local E4, not Windows/Linux E5"
+steps = "注入可控时钟：TTL 内重交同键，确认原到期时间；超过 TTL 后再次显式提交并生成新 Task。"
+
+[when]
+command = "cargo run --locked --quiet -p nexusd --example n3_task_e4 -- idempotency-expiry"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "observed.within_ttl_same_task"
+equals = true
+
+[[expect]]
+field = "observed.repeat_extended_expiry"
+equals = false
+
+[[expect]]
+field = "observed.after_ttl_new_task"
+equals = true
+
+[[expect]]
+field = "observed.accepted_task_count"
+equals = 2

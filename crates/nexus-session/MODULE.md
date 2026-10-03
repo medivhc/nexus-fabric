@@ -80,6 +80,14 @@ N2 P0-4 增补（SessionManager，D1/D4/D7）：
 
 ## Verification
 
+### N3 边界增补（待实现）
+
+SessionManager 仍是资源 Session 的唯一 Owner；TaskOwner 在 nexus-compute，
+不得为了 N3 在本 crate 增加 compute 依赖或第二个 SessionManager。
+客户端重连可创建新的资源 Session，关联到原 TaskId；不重建执行契约或重新 spawn。
+现有 orphan Session reconcile 的 Failed 仅表示该 Session，不证明远端 Task 的结局。
+验收：`n3-client-reattach`、`n3-crash-reconcile`；PRODUCT §17。
+
 最低：
 
 ```text

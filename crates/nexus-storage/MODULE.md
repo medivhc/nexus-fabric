@@ -59,6 +59,16 @@
 
 ## Verification
 
+### N3 持久与内容契约增补（待实现）
+
+Task/幂等索引/pin intent 的 atomic publish 或 journal 事务由组合根通过存储适配器实现；
+只有持久提交后才能 ack accepted。保留现有 torn-tail fail-closed 语义。
+N3 Snapshot/Artifact 使用版本化 SHA-256 命名空间/映射，验证内容摘要和长度后发布，
+不同 SHA-256 内容不能因既有 FNV ID 相同而覆盖。旧 CAS/Commit 格式保持不变。
+TaskOutcome 与 pin 生命周期决策分别归 Compute/Workspace，storage 不反向依赖它们。
+规范：`docs/N3-MODEL-CONTRACT.md` §3/4/6；场景 `n3-idempotency`、
+`n3-artifact-resume`、`n3-gc-roots`、`n3-crash-reconcile`。
+
 最低：
 
 ```text

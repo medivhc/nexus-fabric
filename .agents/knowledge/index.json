@@ -238,5 +238,13 @@
     "module": "nexus-session, apps/nexus, policies",
     "category": "implementation-pitfall",
     "summary": "第1轮独立评审2个FAIL的修复：apps/nexus ring 0.17 依赖评审条目补录；load_from_store 从 plan_snapshot 回填 resource/provider；pre-commit/pre-push Review Evidence 门禁与§19.1迭代闭环的先有鸡/先有蛋及 --no-verify 显式绕过记录"
+  },
+  {
+    "id": "n3-accept-atomic",
+    "file": "entries/2026-10-03-n3-durable-acceptance.md",
+    "date": "2026-10-03",
+    "module": "nexus-domain, nexus-compute, apps/nexus, apps/nexusd",
+    "category": "implementation-pattern",
+    "summary": "N3 原子接受：固定 inode 跨进程锁、Task/index/pin 单镜像、严格目录 fsync、ambiguous commit 重试和损坏 fail-closed"
   }
 ]

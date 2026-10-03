@@ -6,6 +6,9 @@
 
 #![forbid(unsafe_code)]
 
+/// N3 Task/Snapshot/Artifact DTOs, separate from stable Core Plan.
+pub mod task;
+
 use core::fmt;
 
 // ---------- Identity / Resource ----------
