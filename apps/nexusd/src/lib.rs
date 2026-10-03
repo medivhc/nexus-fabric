@@ -14,5 +14,6 @@ pub mod sync_transport;
 #[cfg(target_os = "linux")]
 pub mod workspace;
 
+pub mod snapshot_store;
 /// N3-1 acceptance persistence, not yet connected to daemon product routes.
 pub mod task_store;

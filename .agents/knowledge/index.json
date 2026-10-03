@@ -246,5 +246,13 @@
     "module": "nexus-domain, nexus-compute, apps/nexus, apps/nexusd",
     "category": "implementation-pattern",
     "summary": "N3 原子接受：固定 inode 跨进程锁、Task/index/pin 单镜像、严格目录 fsync、ambiguous commit 重试和损坏 fail-closed"
+  },
+  {
+    "id": "n3-snapshot-roots",
+    "file": "entries/2026-10-03-n3-snapshot-roots.md",
+    "date": "2026-10-03",
+    "module": "nexus-workspace / nexus-storage / apps/nexusd",
+    "category": "implementation-pattern",
+    "summary": "SHA-256 内容空间使用接受记录驱动的持久根，GC 与接受共享锁；初始化后缺失根索引 fail closed。"
   }
 ]

@@ -16,6 +16,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod snapshot;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;

@@ -14,6 +14,7 @@ use std::fmt;
 pub mod fs;
 pub use fs::FsContentStore;
 pub mod kv;
+pub mod strong;
 pub use kv::{FileKvStore, StorageError};
 
 /// 内容寻址的对象标识。

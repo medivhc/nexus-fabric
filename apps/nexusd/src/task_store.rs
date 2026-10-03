@@ -24,6 +24,18 @@ pub struct FileTaskAcceptanceStore {
     root: PathBuf,
 }
 impl FileTaskAcceptanceStore {
+    /// Composition-root operations on N3 content/roots share the acceptance
+    /// lock. GC cannot race a newly published Task pin or scoped key reuse.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_locked_ledger<R>(
+        &self,
+        operation: impl FnOnce(&Path, &AcceptanceLedger) -> Result<R, TaskError>,
+    ) -> Result<R, TaskError> {
+        let _lock = self.lock()?;
+        let ledger = self.load()?;
+        sync_directory(&self.root)?;
+        operation(&self.root, &ledger)
+    }
     pub fn open(root: &Path) -> Result<Self, TaskError> {
         #[cfg(not(target_os = "linux"))]
         {
@@ -70,9 +82,97 @@ impl FileTaskAcceptanceStore {
             parent_sync(parent)?;
         }
         let _lock = store.lock()?;
+        store.initialize()?;
         store.load()?;
         sync_directory(&store.root)?;
         Ok(store)
+    }
+    #[cfg(target_os = "linux")]
+    fn initialize(&self) -> Result<(), TaskError> {
+        use std::{
+            fs,
+            io::{Read, Write},
+            os::unix::fs::OpenOptionsExt,
+        };
+        const RECEIPT: &[u8] = b"n3-acceptance-initialized-v1\n";
+        let receipt = self.root.join("acceptance-initialized-v1");
+        let initialized = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x20000 | 0x800)
+            .open(&receipt)
+        {
+            Ok(mut file) => {
+                if !file
+                    .metadata()
+                    .map_err(|e| io_error(&receipt, e))?
+                    .is_file()
+                {
+                    return Err(TaskError::new(
+                        TaskErrorCode::StateCorrupt,
+                        "acceptance initialization receipt is not regular",
+                        false,
+                    ));
+                }
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)
+                    .map_err(|e| io_error(&receipt, e))?;
+                if bytes != RECEIPT {
+                    return Err(TaskError::new(
+                        TaskErrorCode::StateCorrupt,
+                        "corrupt acceptance initialization receipt",
+                        false,
+                    ));
+                }
+                file.sync_all().map_err(|e| io_error(&receipt, e))?;
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(io_error(&receipt, e)),
+        };
+        let image = self.root.join("acceptance-v1.json");
+        match fs::symlink_metadata(&image) {
+            Ok(_) => {
+                self.load()?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Initialize a fresh empty image before exposing any handle. A
+                // published receipt or N3 content namespace proves prior state;
+                // missing authority there is corruption, never a new provider.
+                let content = self.root.join("content-sha256-v1");
+                let has_content = match fs::symlink_metadata(&content) {
+                    Ok(_) => true,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(e) => return Err(io_error(&content, e)),
+                };
+                if initialized || has_content {
+                    return Err(TaskError::new(
+                        TaskErrorCode::StateCorrupt,
+                        "initialized acceptance image is missing",
+                        false,
+                    ));
+                }
+                self.publish(&AcceptanceLedger::default())?;
+            }
+            Err(e) => return Err(io_error(&image, e)),
+        }
+        if !initialized {
+            // Existing N3-1 images migrate without changing their bytes/schema.
+            // The receipt is itself atomic; a crash before its publication can
+            // safely retry using the already durable, validated image.
+            let tmp = self
+                .root
+                .join(format!(".initialized-{}.tmp", new_task_id()?.as_str()));
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)
+                .map_err(|e| io_error(&tmp, e))?;
+            file.write_all(RECEIPT).map_err(|e| io_error(&tmp, e))?;
+            file.sync_all().map_err(|e| io_error(&tmp, e))?;
+            fs::rename(&tmp, &receipt).map_err(|e| io_error(&receipt, e))?;
+        }
+        sync_directory(&self.root)
     }
     #[cfg(target_os = "linux")]
     fn lock(&self) -> Result<std::fs::File, TaskError> {
@@ -84,9 +184,16 @@ impl FileTaskAcceptanceStore {
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .custom_flags(0x20000)
+            .custom_flags(0x20000 | 0x800)
             .open(&path)
             .map_err(|e| io_error(&path, e))?;
+        if !file.metadata().map_err(|e| io_error(&path, e))?.is_file() {
+            return Err(TaskError::new(
+                TaskErrorCode::StateCorrupt,
+                "acceptance lock is not regular",
+                false,
+            ));
+        }
         // Linux flock is process-independent and released when this File is dropped.
         // The lock inode is never renamed/deleted, including on cold restart.
         unsafe extern "C" {
@@ -111,15 +218,26 @@ impl FileTaskAcceptanceStore {
         let path = self.root.join("acceptance-v1.json");
         let mut file = match std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(0x20000)
+            .custom_flags(0x20000 | 0x800)
             .open(&path)
         {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(AcceptanceLedger::default());
+                return Err(TaskError::new(
+                    TaskErrorCode::StateCorrupt,
+                    "durable acceptance image is missing",
+                    false,
+                ));
             }
             Err(e) => return Err(io_error(&path, e)),
         };
+        if !file.metadata().map_err(|e| io_error(&path, e))?.is_file() {
+            return Err(TaskError::new(
+                TaskErrorCode::StateCorrupt,
+                "acceptance image is not regular",
+                false,
+            ));
+        }
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
             .map_err(|e| io_error(&path, e))?;
