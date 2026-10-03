@@ -3038,3 +3038,125 @@ example 内部 unshare(CLONE_NEWNET) 进隔离 netns（**绝不动真机主网�
 
 冻结边界：Windows/macOS/Android/iOS 后置；不改 `/etc/resolv.conf`；
 不做 split-DNS 策略（后置）；netns E4 验证机制正确性，非生产拓扑。
+
+## 16. N2 通用资源访问（Universal Resource Access，2026-10-03）{#16-n2-resource-access}
+
+N2 回答白皮书 §16.1 的产品问题："用户如何按资源名称访问设备能力？"；
+完成标志："资源具有稳定身份，发现、授权、访问和撤销构成完整闭环"。
+连接服务于资源使用（白皮书 §6.1）：N1 提供可达状态/质量/失败原因与恢复事件，
+资源层据此判断能否执行。
+
+### 16.1 术语（锚定白皮书）
+
+- **Resource（资源）**：用户实际调用的对象（白皮书 §4.4），如构建环境、Web 服务、
+  数据库端点；区别于 Provider 的能力描述（CPU 架构、内存、OS、工具链版本），
+  后者只是调度的判断条件。
+- **ResourceId**：不透明稳定标识；人类可读名（如 `dev-web`）只做本地解析，
+  名字≠定位（Identity≠Locator）。
+- **ResourceRef{workspace, name}**：资源引用；kind 不进地址，是目录属性。
+- **Provider**：提供资源的节点；Resource ≠ Provider ≠ Node（§9 核心领域不变量）。
+- **Session**：一次 Resource 使用（started/running/finished/cancel＋状态查询），
+  不是"一次连接"；Plan ≠ Session。
+- **use**：N2 资源访问入口（`nexus use <resource>`）：
+  resolve→plan→session→establish→authorize→暴露访问入口→可撤销。
+- **grant**：本地授权表条目 `{resource, principal, operations, not_after}`；
+  capability token 为 P1 演进方向，grant 表即未来的签发输入。
+- **Discovery / Advertisement（广告）**：名字解析与广告传输分离；广告经控制面
+  信封交换，请求方缓存＋TTL 刷新；过期广告不得使用
+  （白皮书 §7.1："过期的能力信息和健康信息不能继续被当作有效的调度依据"）。
+
+### 16.2 N2/N3 分界
+
+Task / Snapshot / Artifact 全部归 N3；N2 只交付 Session。
+判据："凡需固定输入版本或登记输出产物的是 N3；
+只需身份＋授权＋可用连接＋结果的是 N2。"
+白皮书 A.1 的 `run --resource … -- <cmd>`（固定输入、退出码、产物）是任务提交语义，
+归 N3；`nexus run` 在 N2 只做诚实化（见 16.5 D4），其任务语义归 N3。
+journal / reconcile 持久化底座在 N2 一次做对（Crash Consistency，§15），
+不因"归 N3"而推迟。
+
+### 16.3 终态语义（断开≠Failed）
+
+客户端断开重附着窗口内 → 仍 Active（可重附着）；
+窗口外 → `Cancelled(ClientDetached)`；
+provider 消失 → `Failed(ProviderLost)`；
+授权撤销 → `Cancelled(Revoked)`。
+断开误判 Failed 会污染结果确认率（白皮书 §17.2）。
+TerminalOutcome（Completed/Failed/Cancelled）最多提交一次，由 Owner 唯一提交；
+两侧（请求方 Session / 提供方 admission＋租约）各自独立提交，不做分布式共识。
+
+### 16.4 P0 完成标志（真机可测，对标白皮书 §16.1）
+
+1. B 机注册 Service 资源，A 机 `nexus use <name>` 建立真实访问并可撤销
+   （真跨机，非 loopback）。
+2. B 机下线后 A 机看到结构化不可达（ProviderOffline 等），非静默失败。
+3. A 机 CLI 退出重进，可按 SessionId 查到状态＋历史 DecisionTrace。
+4. `nexus plan <resource>` 不产生 Provider 侧连接（只读预览断言）。
+5. 无 grant 时 provider 侧拒绝建 Session 并写审计记录；
+   "目录可见≠有权限"被用例覆盖。
+6. 四 crate 架构门禁通过（`nexus-registry` / `nexus-planner` /
+   `nexus-session` / `nexus-auth` 源码零资源类型专属分支，CI 静态检查）。
+7. 全部 E4/E5 场景 PASS，Evidence 落盘可引用。
+
+### 16.5 D1–D8 决定摘要（2026-10-03 已拍板）
+
+- **D1 Session 归属**：daemon 内全系统唯一的 SessionManager 持有全部资源
+  Session 生命周期；提供方侧只做 admission＋租约记录，不做第二个领域 Session。
+- **D2 寻址/发现**：复用 Discovery＋不透明 ResourceId，P0 static；
+  Registry 契约三件套：`discoverable_by` vs `use_grants` 双层授权字段、
+  三种不可用原因（ProviderOffline / HealthDegraded / NotAcceptingWork）的
+  结构化区分、过期广告拒绝（`AdvertisementExpired`）。
+- **D3 Plan 位置**：Plan 可重算、不独立持久化；Session 内嵌
+  `PlanSnapshot{plan, decision_trace}`；`nexus plan <resource>` 纯只读预览；
+  `plan explain` 双模式（`<session-id>` 读历史真实记录 vs `<resource>`
+  显式标注"估算非承诺"）；DecisionTrace 加厚四件套
+  （score breakdown、Measurement 快照、Connectivity Feasibility、
+  结构化拒绝原因）；PlanId 用确定性非密码学摘要（FNV/xxhash）作标识符，
+  不做安全边界。
+- **D4 `nexus run` 定位**：N2 新建 `nexus use`；`run` 只做诚实化——
+  普通 `run <resource>` 返回真实 session_id/plan_id/outcome，
+  带 `--` 命令的调用返回结构化
+  `UNSUPPORTED{feature:"run-with-command", layer:"N3"}` 而非假执行。
+- **D5 P0 范围**：纵深选 Service（真跨机，不许 loopback 模拟）；
+  横向地基（Resource 实体、租约目录、授权/撤销、Plan/Session 持久化）一次做对；
+  用架构门禁（16.4-6）而非"多做一种资源"证明泛化性。
+- **D6 认证模型**：P0 用双向身份（X25519，复用 `IdentityManager::peer_id_of`
+  内容派生 NodeId，不引入注册中心）＋本地 grant 表；
+  结构化 `Deny{NoSuchGrant/WrongWorkspace/OperationNotGranted/Expired/Revoked}`，
+  每次判定写审计记录；principal 由握手密钥派生、不接受请求方自称；
+  授权判定在 provider 侧每次建 Session 时执行；TOFU 显式化
+  （首次见未知节点提示用户确认，不静默）；拒绝 PSK 扩展。
+- **D7**：见 16.2、16.3。
+- **D8 控制面传输**：拒绝 gRPC/tonic（P0 红线，污染 portable core）；
+  双轨——本机 HTTP/1.1＋JSON（token 鉴权、默认 unix socket，
+  修 `route_for` 丢参数＋daemon 不解析 query string 两个真 bug）；
+  跨节点复用 FrameStream 新增帧类型
+  （RESOURCE_ANNOUNCE / RESOURCE_QUERY / AUTH_GRANT / AUTH_REVOKE / LEASE_RENEW）；
+  N2 控制协议传输无关（流类型前缀）；Session 绑定 PeerId 而非 Connection；
+  P0 不假设 Provider 与请求方同子网（白皮书 §2.1）；
+  QUIC 复用为演进方向。
+
+### 16.6 P0 明确不做（P0 红线）
+
+gRPC/tonic；DHT；OIDC；mDNS/LSA 的 Provider 广播（static 先行）；
+多 Provider 打分/容量/负载均衡；Snapshot/Artifact/attempts；
+`nexus open/expose` 对外受众；Android VPN / VMess。
+
+### 16.7 E4/E5 映射
+
+`scenarios/product/n2-*.toml`（P0-0 契约冻结，Red Evidence 见
+`.evidence/red-n2-p0-0/RED-EVIDENCE.md`）：
+
+| 场景 | 覆盖 |
+|---|---|
+| `n2-use-loop` | `nexus use` 闭环（P0-4 实现；完成标志 1/3） |
+| `n2-plan-preview` | `nexus plan` 只读预览（P0-3；完成标志 4） |
+| `n2-resource-list/show/publish/revoke` | 资源目录四件套（P0-2/P0-4） |
+| `n2-session-list/watch/close` | 会话查询与关闭（P0-4；完成标志 3） |
+| `n2-grant-deny-audit` | grant 拒绝审计（P0-1/P0-4；完成标志 5） |
+| `n2-provider-offline`（E5） | Provider 下线结构化不可达（P0-2/P0-5；完成标志 2） |
+
+**冻结边界**：P0-1 之后的业务代码一律不在本节实现；`nexus run` 诚实化是
+唯一已批准的 requirement-change（D4，单独提交、可回滚）。
+**契约 hash**：`e5a98fb8e7109928bb044ad10e411b09992a730ab6bc0818f1aabf63425ec2e3`（计算方法：SHA-256 over §16 节文本自
+`## 16.` 至本行之前，排除本行）。
