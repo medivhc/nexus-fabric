@@ -14,9 +14,20 @@ requirement = "PRODUCT.md#16-n2-resource-access"
 # Session＝"一次 Resource 使用"而非"一次连接"；
 # D2：人类可读名（如 dev-svc）本地解析为不透明 ResourceId，名字≠定位；
 # D6：provider 侧每次建 Session 执行 grant 判定（目录可见≠有权限）。
+#
+# E4 前置（N2 P1-8 场景自洽性修复）：本场景在**干净配置目录**下也必须能通过。
+# 此前 `use` 的本地路径要求 grant 表里存在本机 principal 的 Use 记录，而 P0
+# 没有任何生产路径写入它——依赖带外手工前置状态，不可独立复现。
+# 修法（评审方向之一）：publish 时为本机 principal 自授该资源的 Use，
+# 因此这里补 fixture：`node init`（幂等）→ `resource publish`（自授本机 Use）。
+# 冻结期望未动——fixture 只准备 E4 环境（同 n2-resource-publish / n2-session-close）。
 peer = "node-b"
 resource_name = "dev-svc"
 resource_kind = "service"
+fixture = [
+  "cargo run --quiet -p nexus -- node init --json",
+  "cargo run --quiet -p nexus -- resource publish --name dev-svc --kind service --json",
+]
 
 [when]
 command = "cargo run --quiet -p nexus -- use dev-svc --json"
@@ -27,7 +38,8 @@ command = "cargo run --quiet -p nexus -- use dev-svc --json"
 #   非 thin wrapper 伪造；CLI 退出重进可按此 id 查询，P0 完成标志 3）
 # - use.plan_id 非空（确定性摘要，D3）
 # - use.outcome=Completed（Owner 唯一提交的 TerminalOutcome）
-# - use.access.endpoint 非空（暴露的访问入口，可撤销）
+# - use.access.endpoint 非空（暴露的访问入口，可撤销；N2 P1-9 起同字段还带
+#   reachable/probe，如实回报连通性探测结果）
 [[expect]]
 field = "verdict"
 equals = "PASS"

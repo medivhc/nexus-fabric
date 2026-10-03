@@ -4,7 +4,10 @@
 //! P0-4 只在测试替身里写 grant，本命令族给真机运维（B 机为 A 机 principal 授权）。
 //!
 //! - `nexus grant add --resource <name> --principal <ed25519:...> --op <Use|Manage> [--not-after <unix>]`
-//! - `nexus grant del --resource <name> --principal <ed25519:...>`
+//! - `nexus grant revoke --resource <name> --principal <ed25519:...>`（tombstone 撤销，
+//!   判定落 `DenyReason::Revoked`，记录保留供取证——P1-14）
+//! - `nexus grant del --resource <name> --principal <ed25519:...>`（**物理删除**＝purge；
+//!   记录与审计线索一并消失，仅用于明确要求"抹掉"的场景）
 //! - `nexus grant list [--resource <name>]`
 //!
 //! 全部进程内 N2 存储操作，不经过 daemon。
@@ -135,6 +138,9 @@ fn run_add(args: &[String], json_mode: bool) -> i32 {
 }
 
 /// `nexus grant del` 的可测试内核（`node_dir` 注入）。
+///
+/// P1-14：`del` 是**物理删除**（purge 语义）——记录连同审计线索一起消失。
+/// 日常"撤销"请用 `nexus grant revoke`（tombstone，判定落 `DenyReason::Revoked`）。
 pub(crate) fn del_grant_from(
     node_dir: &std::path::Path,
     name: &str,
@@ -153,7 +159,77 @@ pub(crate) fn del_grant_from(
     }))
 }
 
-/// `nexus grant del --resource <name> --principal <p>`（物理删除 → 后续判定为 `NoSuchGrant`）。
+/// `nexus grant revoke` 的可测试内核（P1-14：tombstone 撤销）。
+///
+/// 记录保留（可取证：`grant list` 仍能看出该主体曾被授权、何时被撤销），
+/// 判定结果为 `DenyReason::Revoked` 而非 `NoSuchGrant`。
+pub(crate) fn revoke_grant_in(
+    node_dir: &std::path::Path,
+    name: &str,
+    principal_s: &str,
+) -> Result<Value, Value> {
+    let now = now_unix_pub();
+    let store = N2Store::open(node_dir).map_err(store_fail)?;
+    let rref = resolve_rref(&store, name, now)?;
+    let revoked = store
+        .revoke_grant(&rref, &Principal(principal_s.to_string()))
+        .map_err(store_fail)?;
+    Ok(json!({
+        "verdict": "PASS",
+        "command": "grant revoke",
+        "grant": {
+            "resource": name,
+            "workspace": rref.workspace.0,
+            "principal": principal_s,
+            "revoked": revoked,
+            "note": "tombstone: grant record kept for audit; authorization now denies with Revoked",
+        },
+    }))
+}
+
+/// `nexus grant revoke --resource <name> --principal <p>`（tombstone 撤销）。
+fn run_revoke(args: &[String], json_mode: bool) -> i32 {
+    const USAGE: &str = "usage: nexus grant revoke --resource <name> --principal <ed25519:...>";
+    let mut resource: Option<String> = None;
+    let mut principal: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--resource" => {
+                i += 1;
+                resource = args.get(i).cloned();
+            }
+            "--principal" => {
+                i += 1;
+                principal = args.get(i).cloned();
+            }
+            other => {
+                eprintln!("error: unexpected argument for grant revoke: {other}");
+                eprintln!("{USAGE}");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+    let (Some(name), Some(principal_s)) = (resource, principal) else {
+        eprintln!("error: grant revoke requires --resource and --principal");
+        eprintln!("{USAGE}");
+        return 2;
+    };
+    let node_dir = crate::node_cli::node_dir();
+    match revoke_grant_in(&node_dir, &name, &principal_s) {
+        Ok(out) => {
+            render(&out, json_mode);
+            0
+        }
+        Err(fail) => {
+            render(&fail, json_mode);
+            1
+        }
+    }
+}
+
+/// `nexus grant del --resource <name> --principal <p>`（**物理删除** = purge）。
 fn run_del(args: &[String], json_mode: bool) -> i32 {
     const USAGE: &str = "usage: nexus grant del --resource <name> --principal <ed25519:...>";
     let mut resource: Option<String> = None;
@@ -256,7 +332,7 @@ fn run_list(args: &[String], json_mode: bool) -> i32 {
 
 /// `nexus grant` 命令族入口。
 pub fn run_grant(args: &[String], json_mode: bool) -> i32 {
-    const USAGE: &str = "usage: nexus grant <add|del|list> ...";
+    const USAGE: &str = "usage: nexus grant <add|revoke|del|list> ...";
     let Some(sub) = args.first() else {
         eprintln!("error: missing subcommand for grant");
         eprintln!("{USAGE}");
@@ -264,6 +340,8 @@ pub fn run_grant(args: &[String], json_mode: bool) -> i32 {
     };
     match sub.as_str() {
         "add" => run_add(&args[1..], json_mode),
+        // P1-14：撤销 = tombstone（判定 Revoked，记录保留）；del = 物理 purge。
+        "revoke" => run_revoke(&args[1..], json_mode),
         "del" => run_del(&args[1..], json_mode),
         "list" => run_list(&args[1..], json_mode),
         other => {
@@ -303,14 +381,16 @@ mod tests {
                 ttl_secs: 0,
             })
             .unwrap();
-        store
-            .save_names(&[NameEntry {
-                workspace: WorkspaceId::new(DEFAULT_WORKSPACE),
-                name: ResourceName::new(name).unwrap(),
-                resource_id: ResourceId(format!("res-{name}")),
-                kind: Some(nexus_domain::ResourceKind::Service),
-            }])
-            .unwrap();
+        // `save_names` 是全量覆盖语义：load → merge → save（与 run_publish 一致）。
+        let mut names = store.load_names().unwrap();
+        names.retain(|e| e.name.as_str() != name);
+        names.push(NameEntry {
+            workspace: WorkspaceId::new(DEFAULT_WORKSPACE),
+            name: ResourceName::new(name).unwrap(),
+            resource_id: ResourceId(format!("res-{name}")),
+            kind: Some(nexus_domain::ResourceKind::Service),
+        });
+        store.save_names(&names).unwrap();
     }
 
     #[test]
@@ -348,6 +428,113 @@ mod tests {
         publish(&dir, "svc-g");
         let err = add_grant_to(&dir, "svc-g", "ed25519:abc", "Execute", None).unwrap_err();
         assert_eq!(err["error"]["code"], json!("INVALID_OP"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revoke_is_tombstone_and_produces_revoked_deny() {
+        // P1-14 回归：`del` 物理删除 → 后续判定是 NoSuchGrant，"曾授权后被撤销"
+        // 与"从未授权"在审计里不可区分。`revoke` 打 tombstone → 判定 Revoked，
+        // 且记录保留可取证。
+        let dir = temp_node_dir("revoke-tombstone");
+        publish(&dir, "svc-g");
+        add_grant_to(&dir, "svc-g", "ed25519:abc", "Use", None).unwrap();
+        let store = N2Store::open(&dir).unwrap();
+        let table = store.load_grant_table().unwrap();
+        let req = nexus_auth::AuthRequest {
+            workspace: WorkspaceId::new(DEFAULT_WORKSPACE),
+            resource: nexus_domain::ResourceRef::new(
+                WorkspaceId::new(DEFAULT_WORKSPACE),
+                ResourceName::new("svc-g").unwrap(),
+            ),
+            principal: nexus_auth::Principal("ed25519:abc".into()),
+            operation: ResourceOperation::Use,
+        };
+        let mut sink = nexus_auth::VecAuditSink::new();
+        assert_eq!(
+            table.authorize(&req, 100, &mut sink),
+            nexus_domain::AuthorizationDecision::Allow
+        );
+
+        let out = revoke_grant_in(&dir, "svc-g", "ed25519:abc").unwrap();
+        assert_eq!(out["verdict"], json!("PASS"));
+        assert_eq!(out["grant"]["revoked"], json!(true));
+        // 记录仍在（可取证）。
+        let grants = store.load_grants().unwrap();
+        assert_eq!(grants.len(), 1);
+        assert!(grants[0].revoked);
+        // 判定落 Revoked（非 NoSuchGrant）。
+        let table = store.load_grant_table().unwrap();
+        assert_eq!(
+            table.authorize(&req, 100, &mut sink),
+            nexus_domain::AuthorizationDecision::Deny(nexus_domain::DenyReason::Revoked)
+        );
+        // 幂等：再撤一次仍成功、状态不变。
+        assert_eq!(
+            revoke_grant_in(&dir, "svc-g", "ed25519:abc").unwrap()["grant"]["revoked"],
+            json!(true)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revoke_unknown_grant_reports_false_not_failure() {
+        let dir = temp_node_dir("revoke-missing");
+        publish(&dir, "svc-g");
+        let out = revoke_grant_in(&dir, "svc-g", "ed25519:nobody").unwrap();
+        assert_eq!(out["grant"]["revoked"], json!(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resource_revoke_tombstones_its_grants() {
+        // P1-14：resource revoke 只删广告不撤 grant 是不够的。
+        let dir = temp_node_dir("resource-revoke-grants");
+        publish(&dir, "svc-g");
+        add_grant_to(&dir, "svc-g", "ed25519:abc", "Use", None).unwrap();
+        let store = N2Store::open(&dir).unwrap();
+        let rref = nexus_domain::ResourceRef::new(
+            WorkspaceId::new(DEFAULT_WORKSPACE),
+            ResourceName::new("svc-g").unwrap(),
+        );
+        assert_eq!(store.revoke_all_grants_for(&rref).unwrap(), 1);
+        let table = store.load_grant_table().unwrap();
+        let req = nexus_auth::AuthRequest {
+            workspace: WorkspaceId::new(DEFAULT_WORKSPACE),
+            resource: rref.clone(),
+            principal: nexus_auth::Principal("ed25519:abc".into()),
+            operation: ResourceOperation::Use,
+        };
+        let mut sink = nexus_auth::VecAuditSink::new();
+        assert_eq!(
+            table.authorize(&req, 100, &mut sink),
+            nexus_domain::AuthorizationDecision::Deny(nexus_domain::DenyReason::Revoked)
+        );
+        // 幂等。
+        assert_eq!(store.revoke_all_grants_for(&rref).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revoke_all_grants_skips_other_resources() {
+        let dir = temp_node_dir("revoke-scope");
+        publish(&dir, "svc-a");
+        publish(&dir, "svc-b");
+        add_grant_to(&dir, "svc-a", "ed25519:abc", "Use", None).unwrap();
+        add_grant_to(&dir, "svc-b", "ed25519:abc", "Use", None).unwrap();
+        let store = N2Store::open(&dir).unwrap();
+        let rref = nexus_domain::ResourceRef::new(
+            WorkspaceId::new(DEFAULT_WORKSPACE),
+            ResourceName::new("svc-a").unwrap(),
+        );
+        assert_eq!(store.revoke_all_grants_for(&rref).unwrap(), 1);
+        let revoked: Vec<bool> = store
+            .load_grants()
+            .unwrap()
+            .iter()
+            .map(|g| g.revoked)
+            .collect();
+        assert_eq!(revoked, vec![true, false]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -358,6 +358,27 @@ fn run_publish(args: &[String], json_mode: bool) -> i32 {
         render(&store_fail(e), json_mode);
         return 0;
     }
+
+    // 自授本机 Use（P1-8：E4 场景自洽性）。
+    //
+    // 问题：`use` 的本地路径要求 grant 表里存在本机 principal 的 Use 记录，
+    // 而 P0 没有任何生产路径写入它——干净配置目录下 `nexus use <自己发布的资源>`
+    // 必然 `AUTH_DENIED/NoSuchGrant`。E4 的 `n2-use-loop` 因此依赖带外手工
+    // 前置状态才能 PASS，不可独立复现。
+    //
+    // 修法（评审给的三选一之一）：publish 时为本机 principal 自授该资源的 Use。
+    // 作用域严格限定"本节点自己发布的资源 ＋ 本节点自己的 principal"——
+    // 它不扩大任何其他主体（远端主体仍必须由运维显式 `grant add`），
+    // 也不影响 `restricted-svc` 等未发布的种子资源（`n2-grant-deny-audit`
+    // 的 NoSuchGrant 路径不受影响）。
+    let self_granted = match self_grant_local_use(&store, &rref) {
+        Ok(granted) => granted,
+        Err(e) => {
+            eprintln!("[n2] WARN: self-grant local Use for {name} failed: {e}");
+            false
+        }
+    };
+
     // 重新发布清除撤销 tombstone（幂等）。
 
     // 目录审计（P0-2 评审遗留）。
@@ -381,11 +402,36 @@ fn run_publish(args: &[String], json_mode: bool) -> i32 {
                 "kind": kind.as_str(),
                 "resource_id": resource_id.0,
                 "published": true,
+                // 本机 principal 是否被自授 Use（P1-8；可见、不隐藏）。
+                "self_granted_use": self_granted,
             },
         }),
         json_mode,
     );
     0
+}
+
+/// 本机 principal 自授该资源的 `Use`（P1-8）。
+///
+/// 幂等：已存在同样的 grant 则不重复写。返回是否发生了写入。
+fn self_grant_local_use(store: &N2Store, rref: &ResourceRef) -> Result<bool, String> {
+    let (_pubkey, principal) = ensure_auth_identity(store)
+        .map_err(|e| format!("resolve local principal: {e}"))?;
+    let grant = nexus_auth::Grant::new(
+        rref.clone(),
+        principal,
+        vec![nexus_domain::ResourceOperation::Use],
+        None,
+    );
+    if store
+        .load_grants()?
+        .iter()
+        .any(|g| g.resource == *rref && g.operations == grant.operations && !g.revoked)
+    {
+        return Ok(false);
+    }
+    store.save_grant(&grant)?;
+    Ok(true)
 }
 
 /// `nexus resource revoke <name>`：撤销发布。
@@ -478,6 +524,14 @@ fn run_revoke(name: &str, json_mode: bool) -> i32 {
     }
     // 从持久化名字表/广告删除（静态种子如有则自然重现，无需 tombstone）。
 
+    // 2b. 授权侧撤销（P1-14）：只删广告不撤 grant 是不够的——被授权主体仍能在
+    // 下一跳拿到 `Revoked` 之外的路径（目录可见≠可撤销生效）。对该资源的全部
+    // grant 打 tombstone，使后续判定落 `DenyReason::Revoked` 且保留记录。
+    let revoked_grants = store.revoke_all_grants_for(&rref).unwrap_or_else(|e| {
+        eprintln!("[n2] WARN: revoke grants for {name} failed: {e}");
+        0
+    });
+
     // 3. 目录审计（P0-2 评审遗留）。
     record_directory_audit(
         store.kv(),
@@ -487,7 +541,9 @@ fn run_revoke(name: &str, json_mode: bool) -> i32 {
             action: "revoke",
             resource: rref,
             provider: None,
-            detail: format!("revoke {name} (withdrawn_ads={withdrawn_any}, outbox_seq={seq})"),
+            detail: format!(
+                "revoke {name} (withdrawn_ads={withdrawn_any}, revoked_grants={revoked_grants}, outbox_seq={seq})"
+            ),
         },
     );
     render(
