@@ -25,6 +25,10 @@ pub enum ExpectKind {
 pub struct Scenario {
     pub id: String,
     pub platform: Option<String>,
+    /// E4 夹具命令（P0-6）：harness 在执行 `[when].command` 之前按序执行，
+    /// 全部 exit 0 才继续；任一失败则场景判 FAIL（夹具是场景 E4 环境声明的
+    /// 一部分，不是独立的测试）。声明于 `[given].fixture`（字符串数组）。
+    pub fixtures: Vec<String>,
     pub command: Option<String>,
     pub expects: Vec<ScenarioExpect>,
 }
@@ -45,6 +49,18 @@ fn load_file(path: &PathBuf) -> Option<Scenario> {
         .and_then(|g| g.get("platform"))
         .and_then(toml::Value::as_str)
         .map(str::to_string);
+    // E4 夹具声明（P0-6）：`[given].fixture = ["cmd1", "cmd2"]`。
+    let fixtures: Vec<String> = v
+        .get("given")
+        .and_then(|g| g.get("fixture"))
+        .and_then(toml::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     let command = v
         .get("when")?
         .get("command")
@@ -74,6 +90,7 @@ fn load_file(path: &PathBuf) -> Option<Scenario> {
     Some(Scenario {
         id,
         platform,
+        fixtures,
         command,
         expects,
     })
@@ -195,15 +212,41 @@ fn get_path<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
 /// 输出收集不等待 EOF，取读线程已拿到的数据。
 fn run_command(command: &str) -> (String, String) {
     use std::time::Duration;
-    run_command_with_timeouts(command, Duration::from_secs(600), Duration::from_secs(10))
+    let (_outcome, stdout, _stderr) =
+        run_checked_with_timeouts(command, Duration::from_secs(600), Duration::from_secs(10));
+    // 调用方忽略首元素、只按输出 JSON 做期望判定（见 run_gate），
+    // 此处保持与原语义一致：命令跑完即透出原始输出。
+    (true.to_string(), stdout)
+}
+
+/// 带退出码的命令执行（E4 夹具用）：返回 `(exit_ok, stdout, stderr_tail)`。
+///
+/// 语义与 `run_command` 相同（有界执行、stdout/stderr 分开抽干、孤儿进程不
+/// 阻塞），区别是透出进程退出码：夹具命令必须 exit 0 才算成功。
+fn run_command_checked(command: &str) -> (bool, String, String) {
+    use std::time::Duration;
+    let (outcome, stdout, stderr_tail) =
+        run_checked_with_timeouts(command, Duration::from_secs(600), Duration::from_secs(10));
+    (outcome == RunOutcome::Exited(true), stdout, stderr_tail)
 }
 
 /// 见 run_command 注释。timeout 参数化仅供回归测试注入短超时。
-fn run_command_with_timeouts(
+/// 返回 `(outcome, stdout, stderr_tail)`。
+#[derive(Debug, PartialEq, Eq)]
+enum RunOutcome {
+    /// 进程正常退出；bool = 退出码是否为 0。
+    Exited(bool),
+    /// 超时被 kill。
+    TimedOut,
+    /// spawn 失败（命令不存在等）。
+    SpawnFailed,
+}
+
+fn run_checked_with_timeouts(
     command: &str,
     scenario_timeout: std::time::Duration,
     drain_timeout: std::time::Duration,
-) -> (String, String) {
+) -> (RunOutcome, String, String) {
     use std::io::Read;
     use std::time::{Duration, Instant};
 
@@ -224,7 +267,13 @@ fn run_command_with_timeouts(
         .spawn()
     {
         Ok(c) => c,
-        Err(e) => return (false.to_string(), format!("cannot run {program}: {e}")),
+        Err(e) => {
+            return (
+                RunOutcome::SpawnFailed,
+                String::new(),
+                format!("cannot run {program}: {e}"),
+            );
+        }
     };
     // 读线程：并发抽干 pipe；孤儿进程持有写端时它们可能永不 EOF，
     // 主线程只按 drain_timeout 有限等待，不依赖它们结束。
@@ -250,25 +299,26 @@ fn run_command_with_timeouts(
     drop(tx);
 
     let start = Instant::now();
-    let timed_out = loop {
+    let outcome = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break false,
+            Ok(Some(status)) => break RunOutcome::Exited(status.success()),
             Ok(None) => {
                 if start.elapsed() >= scenario_timeout {
                     let _ = child.kill();
                     // 尽力回收直接子进程；孤儿孙进程由其自行退出，
                     // 不阻塞等待（它们的 pipe 写端已无关大局）。
                     let _ = child.try_wait();
-                    break true;
+                    break RunOutcome::TimedOut;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            Err(_) => break false,
+            Err(_) => break RunOutcome::Exited(false),
         }
     };
 
     let deadline = Instant::now() + drain_timeout;
     let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
     for _ in 0..2 {
         let now = Instant::now();
         if now >= deadline {
@@ -276,27 +326,45 @@ fn run_command_with_timeouts(
         }
         match rx.recv_timeout(deadline - now) {
             Ok((true, b)) => stdout = b,
-            // stderr 照常抽干（避免 pipe 背压阻塞子进程），但不参与机器判定：
-            // 场景命令的机器可读输出必须是纯 stdout JSON，人类可读日志走 stderr。
-            // 历史教训：曾经把 stderr 拼进判定文本，导致 eprintln! 的日志行
-            // 破坏 JSON 解析（2026-10-02 full verify composition-root / workspace-sync-authz 误判）。
-            Ok((false, _)) => {}
+            // stderr 照常抽干（避免 pipe 背压阻塞子进程）；场景判定不用它，
+            // 但夹具失败时取尾部作诊断。
+            Ok((false, b)) => stderr = b,
             Err(_) => break,
         }
     }
     let text = String::from_utf8_lossy(&stdout).into_owned();
-    if timed_out {
-        (
-            false.to_string(),
+    let err_text = String::from_utf8_lossy(&stderr).into_owned();
+    match outcome {
+        RunOutcome::TimedOut => (
+            RunOutcome::TimedOut,
+            text,
             format!(
                 "scenario command timed out after {}s: {program}",
                 scenario_timeout.as_secs()
             ),
-        )
-    } else {
-        // 调用方忽略首元素、只按输出 JSON 做期望判定（见 run_gate），
-        // 此处保持与原语义一致：命令跑完即透出原始输出。
-        (true.to_string(), text)
+        ),
+        _ => {
+            let tail: Vec<&str> = err_text.lines().rev().take(8).collect();
+            let tail = tail.iter().rev().cloned().collect::<Vec<_>>().join("\n");
+            (outcome, text, tail)
+        }
+    }
+}
+
+/// 旧入口（回归测试用）：保持原语义——spawn 失败/timeout 返回 "false"＋诊断，
+/// 正常跑完返回 "true"＋stdout（退出码信息在此丢弃，场景判定只看 JSON）。
+#[allow(dead_code)]
+fn run_command_with_timeouts(
+    command: &str,
+    scenario_timeout: std::time::Duration,
+    drain_timeout: std::time::Duration,
+) -> (String, String) {
+    let (outcome, stdout, stderr_tail) =
+        run_checked_with_timeouts(command, scenario_timeout, drain_timeout);
+    match outcome {
+        RunOutcome::Exited(_) => (true.to_string(), stdout),
+        // timeout / spawn 失败：诊断文本在 stderr_tail（与旧实现一致）。
+        _ => (false.to_string(), stderr_tail),
     }
 }
 
@@ -340,6 +408,26 @@ pub fn run_gate(config: &Config, gate_name: &str, subdirs: &[&str]) -> (Vec<Scen
                     .to_string(),
             }),
             Some(cmd) => {
+                // E4 夹具（P0-6）：先按序跑 `[given].fixture`，全部 exit 0 才跑
+                // 场景命令；任一夹具失败 → 场景 FAIL（夹具是 E4 环境声明）。
+                let mut fixture_failed: Option<String> = None;
+                for fixture in &s.fixtures {
+                    let (ok, _out, err_tail) = run_command_checked(fixture);
+                    if !ok {
+                        fixture_failed =
+                            Some(format!("fixture failed: {fixture} (stderr: {err_tail})"));
+                        break;
+                    }
+                }
+                if let Some(detail) = fixture_failed {
+                    failed = true;
+                    results.push(ScenarioResult {
+                        id: s.id.clone(),
+                        verdict: "FAIL".to_string(),
+                        detail,
+                    });
+                    continue;
+                }
                 let (_, out) = run_command(cmd);
                 match serde_json::from_str::<Value>(&out) {
                     Ok(json) => match evaluate(s, &json) {
@@ -393,6 +481,7 @@ mod tests {
         Scenario {
             id: "t".to_string(),
             platform: None,
+            fixtures: Vec::new(),
             command: None,
             expects,
         }
@@ -585,5 +674,67 @@ mod tests {
             elapsed < Duration::from_secs(15),
             "run_command hung on orphaned pipe holder: {elapsed:?}"
         );
+    }
+
+    /// E4 夹具（P0-6）：`[given].fixture` 字符串数组被解析进 Scenario。
+    #[test]
+    fn fixture_parsed_from_given() {
+        let dir = std::env::temp_dir().join(format!("harness-fixture-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        std::fs::write(
+            dir.join("s.toml"),
+            "schema_version = 1\nid = \"t.fixture\"\n[given]\nfixture = [\"echo one\", \"echo two\"]\n[when]\ncommand = \"echo hi\"\n",
+        )
+        .expect("write toml");
+        let scenarios = load_all(&dir, &[""]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(scenarios.len(), 1);
+        assert_eq!(
+            scenarios[0].fixtures,
+            vec!["echo one".to_string(), "echo two".to_string()]
+        );
+    }
+
+    /// E4 夹具（P0-6）：无 fixture 声明 → 空 vec（旧场景不受影响）。
+    #[test]
+    fn fixture_absent_is_empty() {
+        let dir = std::env::temp_dir().join(format!("harness-nofixture-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        std::fs::write(
+            dir.join("s.toml"),
+            "schema_version = 1\nid = \"t.nofixture\"\n[given]\n[when]\ncommand = \"echo hi\"\n",
+        )
+        .expect("write toml");
+        let scenarios = load_all(&dir, &[""]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(scenarios.len(), 1);
+        assert!(scenarios[0].fixtures.is_empty());
+    }
+
+    /// E4 夹具（P0-6）：run_command_checked 透出退出码（夹具成败判据）。
+    #[test]
+    fn run_command_checked_reports_exit_status() {
+        let (ok, _, _) = run_command_checked("true");
+        assert!(ok, "exit 0 must be ok");
+        let (ok, _, err) = run_command_checked("false");
+        assert!(!ok, "exit 1 must not be ok: {err}");
+        let (ok, _, err) = run_command_checked("definitely-not-a-real-command-xyz");
+        assert!(!ok, "spawn failure must not be ok: {err}");
+    }
+
+    /// E4 夹具（P0-6）：非字符串 fixture 条目被忽略（不炸解析）。
+    #[test]
+    fn fixture_non_string_entries_ignored() {
+        let dir = std::env::temp_dir().join(format!("harness-fixture2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        std::fs::write(
+            dir.join("s.toml"),
+            "schema_version = 1\nid = \"t.fixture2\"\n[given]\nfixture = [\"echo ok\", 42]\n[when]\ncommand = \"echo hi\"\n",
+        )
+        .expect("write toml");
+        let scenarios = load_all(&dir, &[""]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(scenarios.len(), 1);
+        assert_eq!(scenarios[0].fixtures, vec!["echo ok".to_string()]);
     }
 }

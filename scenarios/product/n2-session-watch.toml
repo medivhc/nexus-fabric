@@ -16,7 +16,12 @@ requirement = "PRODUCT.md#16-n2-resource-access"
 # 授权撤销→Cancelled(Revoked)。断开≠Failed。
 # D3：`plan explain <session-id>` 读 Session 内嵌的历史 PlanSnapshot＋DecisionTrace。
 # P0 完成标志 3：CLI 退出重进，可按 SessionId 查到状态＋历史 DecisionTrace。
-# E4 前置：daemon 内存在 Session sess-n2-e4-1（P0-4 E4 播种）。
+# E4 夹具（P0-6）：harness 在执行 [when].command 前按序跑 fixture（幂等）；
+# `session seed` 播种固定 id 会话（Active/Unfinished＋最小 PlanSnapshot）。
+# 冻结期望未动——夹具只准备 E4 环境。
+fixture = [
+  "cargo run --quiet -p nexus -- session seed sess-n2-e4-1 --json",
+]
 session_id = "sess-n2-e4-1"
 
 [when]

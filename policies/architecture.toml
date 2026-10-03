@@ -283,3 +283,48 @@ name = "nexus-plugin"
 allowed_internal_dependencies = []
 portable = false
 layer = "delivery"
+
+# ---------------------------------------------------------------------------
+# N2 资源类型中立门禁（P0-6，完成标志 #6；综合规划 D5 bunny 架构门禁）
+#
+# nexus-domain / nexus-registry / nexus-planner / nexus-session 四个核心 crate
+# 不得出现资源类型（service/network/workspace/compute/device）专属分支：
+# 禁止按资源类型分叉行为的 match 分支 / 条件逻辑。类型化 extension 字段本身
+# （如 ServicePlanExtension）允许——禁的是"按类型分叉行为"，不是"提到类型"。
+#
+# 机器检查：harness gate `resource-type-neutrality`（verify --fast 可跑）；
+# 扫描四 crate `src/**/*.rs`，flag 同时含"变体引用"（`ResourceKind::V` /
+# `Self::V`）与"分支 token"（`=>` / `matches!` / `if`＋`==`/`!=`）的代码行；
+# 命中 [[resource_kind_neutrality.allow]] 的除外。
+# fail-closed：本节缺失 / allow 条目缺失 → FAIL，不静默放过。
+# ---------------------------------------------------------------------------
+[resource_kind_neutrality]
+crates = ["nexus-domain", "nexus-registry", "nexus-planner", "nexus-session"]
+variants = ["Network", "Service", "Workspace", "Compute", "Device"]
+
+# 允许的特化点（穷举；新增需评审＋更新本 policy）：
+# 类型自身的定义/规范序列化——各变体行为一致（均返回静态字符串），非行为分叉。
+[[resource_kind_neutrality.allow]]
+file = "crates/nexus-domain/src/lib.rs"
+contains = "Self::Network =>"
+reason = "ResourceKind::as_str 规范序列化（类型自身定义）"
+
+[[resource_kind_neutrality.allow]]
+file = "crates/nexus-domain/src/lib.rs"
+contains = "Self::Service =>"
+reason = "ResourceKind::as_str 规范序列化（类型自身定义）"
+
+[[resource_kind_neutrality.allow]]
+file = "crates/nexus-domain/src/lib.rs"
+contains = "Self::Workspace =>"
+reason = "ResourceKind::as_str 规范序列化（类型自身定义）"
+
+[[resource_kind_neutrality.allow]]
+file = "crates/nexus-domain/src/lib.rs"
+contains = "Self::Compute =>"
+reason = "ResourceKind::as_str 规范序列化（类型自身定义）"
+
+[[resource_kind_neutrality.allow]]
+file = "crates/nexus-domain/src/lib.rs"
+contains = "Self::Device =>"
+reason = "ResourceKind::as_str 规范序列化（类型自身定义）"

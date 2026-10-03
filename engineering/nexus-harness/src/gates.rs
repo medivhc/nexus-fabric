@@ -771,6 +771,246 @@ pub fn unimplemented(name: &str) -> Gate {
     )
 }
 
+// ---------------------------------------------------------------------------
+// N2 资源类型中立门禁（P0-6，完成标志 #6；综合规划 D5 bunny 架构门禁）
+// ---------------------------------------------------------------------------
+
+/// 词边界感知：`hay` 中是否出现 `prefix::Variant` 且其后不是标识符字符
+///（避免 `Self::ComputeJobRejected` 误命中 `Self::Compute`）。
+fn contains_variant_ref(hay: &str, prefix: &str, variant: &str) -> bool {
+    let needle = format!("{prefix}::{variant}");
+    let mut start = 0;
+    while let Some(pos) = hay[start..].find(&needle) {
+        let end = start + pos + needle.len();
+        let next = hay[end..].chars().next();
+        if !next.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return true;
+        }
+        start = end;
+    }
+    false
+}
+
+/// 剥离行注释/块注释/字符串字面量，返回代码部分。
+///
+/// Rust 块注释可嵌套；字符串含转义；raw string 支持 `r"..."` / `r#"..."#` /
+/// `r##"..."##`；字符字面量 `'c'` / `'\n'` 按字面量跳过（其余 `'` 如生命周期
+/// 不影响判定——`'` 内不可能出现 `//` 或变体引用）。
+/// 这是策略扫描器不是解析器：极限情况可能误判，误判走 allow 列表显式声明。
+fn strip_line_code(line: &str, block_depth: &mut usize) -> String {
+    let mut out = String::with_capacity(line.len());
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if *block_depth > 0 {
+            if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                *block_depth += 1;
+                i += 2;
+            } else if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                *block_depth -= 1;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        let b = bytes[i];
+        // 行注释。
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            break;
+        }
+        // 块注释开始。
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            *block_depth = 1;
+            i += 2;
+            continue;
+        }
+        // raw string：r"..." / r#"..."# / r##"..."##。
+        if b == b'r' {
+            let mut j = i + 1;
+            let mut hashes = 0;
+            while j < bytes.len() && bytes[j] == b'#' {
+                hashes += 1;
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'"' {
+                j += 1;
+                let closer: Vec<u8> = std::iter::once(b'"')
+                    .chain(std::iter::repeat_n(b'#', hashes))
+                    .collect();
+                let mut k = j;
+                let mut found = false;
+                while k + closer.len() <= bytes.len() {
+                    if &bytes[k..k + closer.len()] == closer.as_slice() {
+                        found = true;
+                        break;
+                    }
+                    k += 1;
+                }
+                i = if found { k + closer.len() } else { bytes.len() };
+                continue;
+            }
+        }
+        // 普通字符串 / 字节字符串。
+        if b == b'"' || (b == b'b' && i + 1 < bytes.len() && bytes[i + 1] == b'"') {
+            if b == b'b' {
+                i += 1;
+            }
+            i += 1; // 跳过开引号
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                } else if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // 字符字面量 'c' / '\n'（两格或转义四格形式）。
+        if b == b'\'' {
+            let is_char_lit = (i + 2 < bytes.len() && bytes[i + 2] == b'\'')
+                || (i + 3 < bytes.len() && bytes[i + 1] == b'\\' && bytes[i + 3] == b'\'');
+            if is_char_lit {
+                i += if bytes[i + 1] == b'\\' { 4 } else { 3 };
+                continue;
+            }
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    out
+}
+
+/// 单行判定（纯函数，可单测）：剥离注释/字符串后的代码行是否为
+/// "资源类型专属分支"——同时含变体引用与分支 token。
+fn is_specialized_branch(code_line: &str, variants: &[String]) -> bool {
+    let has_variant = variants.iter().any(|var| {
+        contains_variant_ref(code_line, "ResourceKind", var)
+            || contains_variant_ref(code_line, "Self", var)
+    });
+    if !has_variant {
+        return false;
+    }
+    code_line.contains("=>")
+        || code_line.contains("matches!")
+        || ((code_line.contains("if ") || code_line.contains("while "))
+            && (code_line.contains("==") || code_line.contains("!=")))
+}
+/// N2 资源类型中立门禁（P0-6，完成标志 #6）：四 crate 零资源类型专属分支。
+///
+/// 扫描 `policies/architecture.toml [resource_kind_neutrality]` 声明的 crate 的
+/// `src/**/*.rs`；flag 同时含"变体引用"（`ResourceKind::V` / `Self::V`，词边界）
+/// 与"分支 token"（`=>` / `matches!` / `if`+`==`/`!=`）的代码行；命中 allow
+/// 列表的除外。fail-closed：policy 缺失/字段缺失 → FAIL。
+pub fn resource_kind_neutrality_gate(config: &Config) -> Gate {
+    const GATE: &str = "resource-type-neutrality";
+    let policy = config.policies_dir.join("architecture.toml");
+    let text = match std::fs::read_to_string(&policy) {
+        Ok(t) => t,
+        Err(e) => return Gate::fail(GATE, &format!("read failed: {e}")),
+    };
+    let v: toml::Value = match toml::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => return Gate::fail(GATE, &format!("parse failed: {e}")),
+    };
+    let section = match v.get("resource_kind_neutrality") {
+        Some(s) => s,
+        None => {
+            return Gate::fail(
+                GATE,
+                "missing [resource_kind_neutrality] in policies/architecture.toml (fail-closed)",
+            );
+        }
+    };
+    let str_list = |key: &str| -> Vec<String> {
+        section
+            .get(key)
+            .and_then(toml::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let crates = str_list("crates");
+    let variants = str_list("variants");
+    if crates.is_empty() || variants.is_empty() {
+        return Gate::fail(
+            GATE,
+            "[resource_kind_neutrality] must declare non-empty crates + variants (fail-closed)",
+        );
+    }
+    let allows: Vec<(String, String)> = section
+        .get("allow")
+        .and_then(toml::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| {
+                    let file = e.get("file")?.as_str()?.to_string();
+                    let contains = e.get("contains")?.as_str()?.to_string();
+                    Some((file, contains))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let repo_root = config.policies_dir.parent().unwrap_or(&config.policies_dir);
+
+    let mut violations: Vec<String> = Vec::new();
+    let mut scanned_files = 0usize;
+    for krate in &crates {
+        for f in rs_files_under(&config.crates_dir.join(krate).join("src")) {
+            scanned_files += 1;
+            let text = match std::fs::read_to_string(&f) {
+                Ok(t) => t,
+                Err(e) => {
+                    violations.push(format!("{}: read failed: {e}", f.display()));
+                    continue;
+                }
+            };
+            let rel = f
+                .strip_prefix(repo_root)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| f.display().to_string());
+            let mut block_depth = 0usize;
+            for (idx, line) in text.lines().enumerate() {
+                let code = strip_line_code(line, &mut block_depth);
+                if !is_specialized_branch(&code, &variants) {
+                    continue;
+                }
+                let allowed = allows
+                    .iter()
+                    .any(|(file, contains)| *file == rel && code.contains(contains));
+                if !allowed {
+                    violations.push(format!("{rel}:{}: {}", idx + 1, code.trim()));
+                }
+            }
+        }
+    }
+    if violations.is_empty() {
+        Gate::ok(
+            GATE,
+            &format!(
+                "{} crate(s), {scanned_files} file(s): no resource-type-specialized branches",
+                crates.len()
+            ),
+        )
+    } else {
+        Gate::fail(
+            GATE,
+            &format!(
+                "{} violation(s):\n{}",
+                violations.len(),
+                violations.join("\n")
+            ),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,5 +1077,104 @@ mod tests {
             g.verdict, "UNKNOWN",
             "unparseable output must not pass silently"
         );
+    }
+
+    // --- resource-type-neutrality (P0-6) ---------------------------------
+
+    #[test]
+    fn variant_ref_needs_word_boundary() {
+        // `Self::ComputeJobRejected` 不得误命中 `Self::Compute`。
+        assert!(contains_variant_ref(
+            "Self::Compute => x",
+            "Self",
+            "Compute"
+        ));
+        assert!(!contains_variant_ref(
+            "Self::ComputeJobRejected { .. } => x",
+            "Self",
+            "Compute"
+        ));
+        assert!(contains_variant_ref(
+            "if k == ResourceKind::Service {",
+            "ResourceKind",
+            "Service"
+        ));
+        assert!(!contains_variant_ref(
+            "let k = ResourceKind::Services;",
+            "ResourceKind",
+            "Service"
+        ));
+    }
+
+    #[test]
+    fn strip_line_code_removes_comments_and_strings() {
+        let mut depth = 0usize;
+        // 行注释里的变体引用必须剥离。
+        assert_eq!(
+            strip_line_code("let x = 1; // ResourceKind::Service => foo", &mut depth).trim(),
+            "let x = 1;"
+        );
+        // 字符串里的 `=>` 与变体引用必须剥离。
+        let code = strip_line_code(r#"format!("ResourceKind::Service => {}", 1)"#, &mut depth);
+        assert!(!code.contains("ResourceKind"), "{code}");
+        // 块注释（含多行）剥离。
+        let a = strip_line_code("/* ResourceKind::Service =>", &mut depth);
+        assert_eq!(depth, 1);
+        assert!(a.trim().is_empty());
+        let b = strip_line_code(
+            "still comment */ let y = ResourceKind::Service;",
+            &mut depth,
+        );
+        assert_eq!(depth, 0);
+        assert!(b.contains("ResourceKind::Service"), "{b}");
+    }
+
+    #[test]
+    fn is_specialized_branch_positive_and_negative() {
+        let variants: Vec<String> = ["Network", "Service", "Workspace", "Compute", "Device"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // 正：match 分支 / 条件 / matches! 宏。
+        assert!(is_specialized_branch(
+            "ResourceKind::Service => do_svc(),",
+            &variants
+        ));
+        assert!(is_specialized_branch(
+            "if kind == ResourceKind::Network {",
+            &variants
+        ));
+        assert!(is_specialized_branch(
+            "matches!(kind, Self::Device)",
+            &variants
+        ));
+        assert!(is_specialized_branch(
+            "ResourceKind::Service | ResourceKind::Compute => x,",
+            &variants
+        ));
+        // 负：纯构造（非分支）、规范序列化调用、前缀陷阱。
+        assert!(!is_specialized_branch(
+            "let k = ResourceKind::Service;",
+            &variants
+        ));
+        assert!(!is_specialized_branch(
+            "assert_eq!(ResourceKind::Service.as_str(), \"service\");",
+            &variants
+        ));
+        assert!(!is_specialized_branch(
+            "Self::ComputeJobRejected { .. } => abort,",
+            &variants
+        ));
+        assert!(!is_specialized_branch("let x = 1;", &variants));
+    }
+
+    #[test]
+    fn resource_kind_neutrality_gate_passes_on_current_tree() {
+        // 当前四 crate 无资源类型专属分支（仅 as_str 规范序列化，已 allow）。
+        let repo = crate::env::Repo::discover().expect("repo must be discoverable");
+        let config = crate::config::Config::load(&repo).expect("config must load");
+        let g = resource_kind_neutrality_gate(&config);
+        assert_eq!(g.verdict, "PASS", "gate failed: {}", g.detail);
+        assert!(g.detail.contains("4 crate(s)"), "{}", g.detail);
     }
 }

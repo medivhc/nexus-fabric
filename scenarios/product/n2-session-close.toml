@@ -12,7 +12,12 @@ requirement = "PRODUCT.md#16-n2-resource-access"
 # 终态语义（D7 修正）：用户主动关闭 → Cancelled（Owner 唯一提交）；
 # TerminalOutcome（Completed/Failed/Cancelled）最多提交一次；
 # Outcome 确定后仍可继续 cleanup，物理生命周期最终到 Disposed。
-# E4 前置：daemon 内存在 Active 的 Session sess-n2-e4-2。
+# E4 夹具（P0-6）：harness 在执行 [when].command 前按序跑 fixture（幂等）；
+# 播种 Active 的固定 id 会话，close 后终态为 Cancelled。
+# 冻结期望未动——夹具只准备 E4 环境。
+fixture = [
+  "cargo run --quiet -p nexus -- session seed sess-n2-e4-2 --json",
+]
 session_id = "sess-n2-e4-2"
 
 [when]

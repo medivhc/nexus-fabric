@@ -12,6 +12,11 @@ requirement = "PRODUCT.md#16-n2-resource-access"
 # D2：名字解析与广告传输分离；广告经控制面信封交换，请求方缓存＋TTL 刷新；
 # P0 只用 static 子集。白皮书 §7.3：资源发布默认 Workspace 内部范围；
 # 发布入口必须能够撤销，并显示其当前生效状态。
+# E4 前置条件（P0-6 明确）：`nexus node init`（无身份则 publish 报 NO_IDENTITY）。
+# 声明为 fixture（幂等：已初始化则直接通过），即 E4 环境声明的机器可读形式。
+fixture = [
+  "cargo run --quiet -p nexus -- node init --json",
+]
 [when]
 command = "cargo run --quiet -p nexus -- resource publish --name dev-svc --kind service --json"
 

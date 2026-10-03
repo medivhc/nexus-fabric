@@ -92,14 +92,11 @@ impl std::fmt::Display for AdmitError {
     }
 }
 
-/// 连接计数（可观测：`nexus plan` 只读断言用——plan 期间本计数不得变化）。
+/// 已处理的准入连接序号（仅 B 侧 stderr 结构化日志 `conn #N` 用；
+/// review-n2-p05 WARN-3：原 `pub fn connection_count()` 零调用者且注释误导
+/// （跨进程的 `nexus plan` 只读断言不可能用它），已删除。plan 只读性的真实
+/// 观测通道是 B 侧日志，见 P0-5 E5 报告 #4）。
 static CONNECTION_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// 当前已处理的准入连接数。
-#[must_use]
-pub fn connection_count() -> u64 {
-    CONNECTION_COUNT.load(Ordering::Relaxed)
-}
 
 /// 从广告 locator 列表中提取准入控制端点（`n2adm://host:port` → `host:port`）。
 #[must_use]
@@ -242,10 +239,18 @@ fn handle_admission(stream: &mut TcpStream, node_dir: &std::path::Path) -> Strin
         let _ = write_frame(stream, body.as_bytes());
         return format!("unknown resource {}", req.resource_id);
     };
-    let rref = ResourceRef::new(
-        WorkspaceId::new(DEFAULT_WORKSPACE),
-        nexus_domain::ResourceName::new(&name).expect("stored name valid"),
-    );
+    let rref = match nexus_domain::ResourceName::new(&name) {
+        Ok(n) => ResourceRef::new(WorkspaceId::new(DEFAULT_WORKSPACE), n),
+        // review-n2-p05 WARN-1：生产路径不得 panic；本地存储损坏走结构化错误，
+        // 不崩整个 provider serve 进程。
+        Err(e) => {
+            return error_response(
+                stream,
+                &format!("bad stored resource name: {e}"),
+                "store failure",
+            );
+        }
+    };
     // 5. 提供方侧 grant 判定（D6：每次建 Session 执行；每次判定写审计）。
     let table: GrantTable = match store.load_grant_table() {
         Ok(t) => t,
