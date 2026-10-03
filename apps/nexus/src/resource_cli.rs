@@ -23,6 +23,7 @@ use nexus_registry::{
 };
 use serde_json::{Value, json};
 
+use crate::n2_admission::CONTROL_LOCATOR_SCHEME;
 use crate::n2_directory::{DEFAULT_WORKSPACE, DIRECTORY_TAG, N2Directory};
 use crate::n2_identity::ensure_auth_identity;
 use crate::n2_store::{
@@ -296,19 +297,33 @@ fn run_publish(args: &[String], json_mode: bool) -> i32 {
     // 不透明 ResourceId（D2；`res-<name>` 确定性派生，非定位）。
     let resource_id = nexus_domain::ResourceId(format!("res-{name}"));
     let rref = ResourceRef::new(WorkspaceId::new(DEFAULT_WORKSPACE), parsed_name);
-    let ad = ProviderAdvertisement {
+    // P1-13：`--locator` 顺序必须合法——首条即数据面（Service）入口。
+    // 约定（`n2_admission::CONTROL_LOCATOR_SCHEME`）：`n2adm://host:port` 是准入
+    // 控制端点，其余是数据面入口，判定统一走 registry 层的
+    // `ProviderAdvertisement::service_locator`。把 `n2adm://` 写在前面会让下游
+    // 把控制端点当成 Service 入口——直接拒绝，而不是静默产出错误入口。
+    let ad_probe = ProviderAdvertisement {
         provider: nexus_domain::ProviderId(provider_id.clone()),
         resource: resource_id.clone(),
         capabilities: vec![default_capability(kind).to_string()],
-        locators,
-        // 白皮书 §7.3：发布默认 Workspace 内部范围（Public 在此语境下
-        // 即"本 Workspace 内可见"；跨 Workspace 可见性为 P1）。
+        locators: locators.clone(),
         discoverable_by: Discoverability::Public,
         use_grants: Vec::new(),
         unavailable: None,
         issued_at_secs: now,
         ttl_secs: 0,
     };
+    if !ad_probe.has_valid_locator_order() {
+        render(
+            &json!({"verdict":"FAIL","error":{"code":"BAD_LOCATOR_ORDER","message":format!(
+                "--locator order invalid: the first locator must be the Service data-plane endpoint (non-'{}'); control locators must come after it",
+                CONTROL_LOCATOR_SCHEME
+            )}}),
+            json_mode,
+        );
+        return 2;
+    }
+    let ad = ad_probe;
     // 走 P0-2 的 publish_ad（内存 registry 语义）＋落盘。
     {
         let mut registry = nexus_registry::Registry::new();

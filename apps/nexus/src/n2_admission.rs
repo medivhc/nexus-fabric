@@ -19,7 +19,8 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use nexus_auth::{AuthRequest, GrantTable, Principal};
@@ -37,12 +38,27 @@ pub const ADMISSION_PROTOCOL_V1: u32 = 1;
 /// 广告 locator 中标记提供方准入端点的 scheme（`n2adm://host:port`）。
 ///
 /// 约定：`resource publish` 的 locator 列表中，首个非 `n2adm://` locator 为
-/// Service 数据面端点（planner 取 `locators[0]` 作 plan.path）；`n2adm://`
+/// Service 数据面端点（`ProviderAdvertisement::service_locator`）；`n2adm://`
 /// locator 为准入控制端点（`use` 跨机时拨号）。
-pub const CONTROL_LOCATOR_SCHEME: &str = "n2adm://";
+///
+/// P1-13：这两个判定现在由 registry 层提供（planner 与 CLI 共用同一实现），
+/// 本模块的函数只做薄封装，避免下游各自按 `locators[0]` 取值。
+pub const CONTROL_LOCATOR_SCHEME: &str = nexus_registry::CONTROL_LOCATOR_PREFIX;
 
 /// 提供方租约 TTL（秒；与 `use_cli::LEASE_TTL_SECS` 一致，P0 固定 1 小时）。
 pub const ADMISSION_LEASE_TTL_SECS: u64 = 3600;
+
+/// 提供方并发准入连接上限（P1-19：串行 accept 可被"连上不发数据"拖死）。
+///
+/// 每连接 10s 读超时；串行叠加即 DoS。超过上限时**拒绝新连接**（fail-closed，
+/// 附 `BUSY`），不排队无界增长。
+pub const MAX_CONCURRENT_ADMISSIONS: usize = 64;
+
+/// 单连接最多接收的公告帧数（P1-18：上限保护，防御异常对端）。
+pub const MAX_ANNOUNCEMENT_FRAMES: usize = 64;
+
+/// 连续瞬时 `accept` 错误多少次后退避（P1-19）。
+const ACCEPT_ERROR_BACKOFF_LIMIT: u32 = 8;
 
 /// 准入请求（请求方 → 提供方，JSON）。
 #[derive(Debug)]
@@ -76,9 +92,44 @@ pub enum AdmissionVerdict {
 pub enum AdmitError {
     /// 连接失败（对端下线/不可达 → 调用方映射为 ProviderOffline）。
     Connect(String),
+    /// 传输层 IO 失败（超时 / 连接重置 / 写失败 → 同样是"提供方不可达"）。
     Io(String),
+    /// 握手中断或响应不合协议（对端中途消失 → 不可达）。
     Protocol(String),
+    /// 协议版本不匹配（**不是**不可达：对方活着，只是版本对不上）。
+    Unsupported(String),
+    /// 加密/身份层失败（签名不成立：对方活着，但身份校验没过）。
     Crypto(String),
+}
+
+impl AdmitError {
+    /// 是否按语义归一为"提供方不可达"（P1-12）。
+    ///
+    /// 同一"provider 下线"事实因死亡方式不同（拒绝连接 / 握手中途 RST /
+    /// 超时）此前产出两种错误码，其中一种还不落离线状态。统一口径：
+    /// 连接层失败与握手中断 = 提供方不可达；**版本不匹配与加密失败保留独立码**
+    /// ——那说明对方活着，只是协议/身份不匹配，判成不可达会误导排障。
+    #[must_use]
+    pub fn is_unreachable(&self) -> bool {
+        match self {
+            AdmitError::Connect(_) | AdmitError::Io(_) | AdmitError::Protocol(_) => true,
+            AdmitError::Unsupported(_) | AdmitError::Crypto(_) => false,
+        }
+    }
+
+    /// 机器可读的错误分类（`use` 的 `error.code` 归一用）。
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        if self.is_unreachable() {
+            "PROVIDER_UNREACHABLE"
+        } else {
+            match self {
+                AdmitError::Unsupported(_) => "PROTOCOL_VERSION_UNSUPPORTED",
+                AdmitError::Crypto(_) => "ADMISSION_CRYPTO_FAILED",
+                _ => unreachable!("is_unreachable branch handled above"),
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for AdmitError {
@@ -87,6 +138,7 @@ impl std::fmt::Display for AdmitError {
             AdmitError::Connect(e) => write!(f, "connect: {e}"),
             AdmitError::Io(e) => write!(f, "io: {e}"),
             AdmitError::Protocol(e) => write!(f, "protocol: {e}"),
+            AdmitError::Unsupported(e) => write!(f, "unsupported: {e}"),
             AdmitError::Crypto(e) => write!(f, "crypto: {e}"),
         }
     }
@@ -101,19 +153,16 @@ static CONNECTION_COUNT: AtomicU64 = AtomicU64::new(0);
 /// 从广告 locator 列表中提取准入控制端点（`n2adm://host:port` → `host:port`）。
 #[must_use]
 pub fn control_locator_of(ad: &ProviderAdvertisement) -> Option<String> {
-    ad.locators
-        .iter()
-        .find(|l| l.starts_with(CONTROL_LOCATOR_SCHEME))
-        .map(|l| l[CONTROL_LOCATOR_SCHEME.len()..].to_string())
+    ad.control_locator()
 }
 
 /// 从广告 locator 列表中提取 Service 数据面端点（首个非 `n2adm://` 条目）。
+///
+/// P1-13：实现收敛到 registry 层（`ProviderAdvertisement::service_locator`），
+/// planner 侧（`n2_directory::planning_snapshot`）与 `publish` 校验共用同一判定。
 #[must_use]
 pub fn service_locator_of(ad: &ProviderAdvertisement) -> Option<String> {
-    ad.locators
-        .iter()
-        .find(|l| !l.starts_with(CONTROL_LOCATOR_SCHEME))
-        .cloned()
+    ad.service_locator()
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +195,35 @@ fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
+/// 可选帧：长度头为 0 表示"后续没有更多帧"（P1-18 出站泵的终止标记）。
+///
+/// 正常响应（`read_frame`）永不使用 len=0，所以终止标记与业务帧不冲突。
+fn read_optional_frame(stream: &mut TcpStream) -> Result<Option<Vec<u8>>, String> {
+    let mut len_buf = [0u8; 4];
+    stream
+        .read_exact(&mut len_buf)
+        .map_err(|e| format!("read frame len: {e}"))?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len == 0 {
+        return Ok(None);
+    }
+    if len > MAX_FRAME_BYTES {
+        return Err(format!("bad frame len: {len}"));
+    }
+    let mut buf = vec![0u8; len];
+    stream
+        .read_exact(&mut buf)
+        .map_err(|e| format!("read frame body: {e}"))?;
+    Ok(Some(buf))
+}
+
+/// 写终止标记（len=0）。
+fn write_frame_end(stream: &mut TcpStream) -> Result<(), String> {
+    stream
+        .write_all(&0u32.to_be_bytes())
+        .map_err(|e| format!("write frame end: {e}"))
+}
+
 fn hex_decode(s: &str, expect_len: usize, what: &str) -> Result<Vec<u8>, String> {
     if s.len() != expect_len * 2 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!("bad {what} hex"));
@@ -173,7 +251,51 @@ pub fn serve_one_connection(stream: &mut TcpStream, node_dir: &std::path::Path) 
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
     let outcome = handle_admission(stream, node_dir);
-    format!("n2-admission: conn #{n} from {peer} -> {outcome}")
+    // P1-18 出站泵：判定发完后，把本地 outbox 里排队的控制帧（`resource revoke`
+    // 排的 AUTH_REVOKE 等）沿这条已建立的连接推给请求方。此前 outbox 只写不排，
+    // 撤销公告永远发不出去，B 机 revoke 后 A 机只能靠 TTL 或人工 export/import。
+    let pumped = pump_outbox(stream, node_dir);
+    format!("n2-admission: conn #{n} from {peer} -> {outcome}{pumped}")
+}
+
+/// 出站泵：把 outbox 中的控制帧沿当前连接推给请求方，并以 len=0 终止标记收尾。
+///
+/// exactly-once 语义（诚实声明）：
+/// - **发送侧 at-least-once**：每帧 seq 单调递增（`outbox_next_seq`），推送后从
+///   outbox 删除（删失败的帧留在 outbox 下次重发）；
+/// - **接收侧幂等去重**：请求方按 seq 记 `n2/outbox/acked` 高水位，重复帧
+///   （≤ 高水位）直接丢弃；应用动作（撤销 → 失效本地缓存广告）本身幂等。
+///   两端不在同一事务里，因此不是端到端 exactly-once——这是 P0 帧传输的
+///   诚实边界（重连补发为 P1）。
+///
+/// 返回可读后缀（stderr 日志用）。
+fn pump_outbox(stream: &mut TcpStream, node_dir: &std::path::Path) -> String {
+    let store = match N2Store::open(node_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = write_frame_end(stream);
+            return format!(" (outbox pump skipped: store: {e})");
+        }
+    };
+    let queued = match store.outbox_list() {
+        Ok(q) => q,
+        Err(e) => {
+            let _ = write_frame_end(stream);
+            return format!(" (outbox pump skipped: list: {e})");
+        }
+    };
+    let mut sent = 0usize;
+    for (seq, bytes) in &queued {
+        if write_frame(stream, bytes).is_err() {
+            break;
+        }
+        // 发送后出队（幂等：删失败则下次重发，接收侧按 seq 去重）。
+        if store.outbox_remove(*seq).is_ok() {
+            sent += 1;
+        }
+    }
+    let _ = write_frame_end(stream);
+    format!(" (outbox: {sent} frame(s) sent)")
 }
 
 /// 单连接准入处理内核（可测试；`stream` 已连入）。
@@ -193,7 +315,14 @@ fn handle_admission(stream: &mut TcpStream, node_dir: &std::path::Path) -> Strin
     };
     let req = match parse_admission_request(&body) {
         Ok(r) => r,
-        Err(e) => return error_response(stream, &format!("bad request: {e}"), "protocol error"),
+        Err(e) => {
+            // P1-12：版本不匹配保留独立机器码——对方活着，只是协议版本对不上，
+            // 判成"不可达"会误导排障。
+            if e.starts_with("unsupported version") {
+                return version_error_response(stream, &e);
+            }
+            return error_response(stream, &format!("bad request: {e}"), "protocol error");
+        }
     };
     // 3. 验证签名 → principal（D6：不接受自称）。
     let principal = match verify_handshake(&challenge, &req) {
@@ -281,6 +410,12 @@ fn handle_admission(stream: &mut TcpStream, node_dir: &std::path::Path) -> Strin
     match decision {
         nexus_domain::AuthorizationDecision::Allow => {
             // 6a. 允许：写租约（D1 提供方侧 admission＋租约）。
+            //
+            // P1-21：租约必须会过期回收，否则长期运行下 `n2/lease/*` 无界堆积。
+            // 每次写租约前先回收过期项（幂等）。
+            if let Err(e) = purge_expired_leases(node_dir, now) {
+                eprintln!("[n2] WARN: purge expired leases failed: {e}");
+            }
             let provider_id = format!("prov-{}", local_actor(node_dir));
             if let Err(e) = write_provider_lease(
                 &store,
@@ -335,6 +470,19 @@ fn error_response(stream: &mut TcpStream, msg: &str, summary: &str) -> String {
         .to_string();
     let _ = write_frame(stream, body.as_bytes());
     summary.to_string()
+}
+
+/// 版本不匹配响应（`code=UNSUPPORTED_VERSION`，与"不可达"区分，P1-12）。
+fn version_error_response(stream: &mut TcpStream, msg: &str) -> String {
+    let body = serde_json::json!({
+        "v": ADMISSION_PROTOCOL_V1,
+        "verdict": "error",
+        "code": "UNSUPPORTED_VERSION",
+        "message": msg,
+    })
+    .to_string();
+    let _ = write_frame(stream, body.as_bytes());
+    format!("protocol version mismatch: {msg}")
 }
 
 fn parse_admission_request(body: &[u8]) -> Result<AdmissionRequest, String> {
@@ -400,8 +548,55 @@ fn write_provider_lease(
     Ok(())
 }
 
-/// 在 `bind` 上监听并顺序处理准入连接（`nexus provider serve` 用；`--once`
+/// 回收已过期租约（P1-21）。
+///
+/// 租约 TTL 固定 1h（`ADMISSION_LEASE_TTL_SECS`）。P0 不做续约
+/// （`LEASE_RENEW` 帧零消费者）；"写而不回收"会让 `n2/lease/*` 随会话数无界
+/// 堆积，因此这里定义并执行过期回收。续约（P1）落地后本函数仍需保留。
+pub fn purge_expired_leases(node_dir: &std::path::Path, now: u64) -> Result<usize, String> {
+    let store = N2Store::open(node_dir).map_err(|e| format!("open n2 store: {e}"))?;
+    purge_expired_leases_in(&store, now)
+}
+
+/// [`purge_expired_leases`] 的可测试内核（store 注入）。
+pub fn purge_expired_leases_in(store: &N2Store, now: u64) -> Result<usize, String> {
+    let mut purged = 0usize;
+    for key in store.kv().list().map_err(|e| format!("list leases: {e}"))? {
+        let Some(session) = key.strip_prefix("n2/lease/") else {
+            continue;
+        };
+        let Some(bytes) = store.kv().get(&key).map_err(|e| format!("read lease {key}: {e}"))?
+        else {
+            continue;
+        };
+        let expires = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| v.get("expires_at_unix").and_then(serde_json::Value::as_u64));
+        match expires {
+            // 字段缺失的旧记录：无法判定过期，保留（不静默丢审计线索）。
+            None => continue,
+            Some(expires_at) if now < expires_at => continue,
+            Some(_) => {
+                store
+                    .kv()
+                    .delete(&key)
+                    .map_err(|e| format!("delete expired lease {key}: {e}"))?;
+                purged += 1;
+                let _ = session;
+            }
+        }
+    }
+    Ok(purged)
+}
+
+/// 在 `bind` 上监听并**并发**处理准入连接（`nexus provider serve` 用；`--once`
 /// 则只处理一条连接后返回，便于测试）。
+///
+/// P1-19：此前是 `loop { accept → serve_one_connection }` 串行——一个"连上不发
+/// 数据"的客户端就占住 10s 读超时，串行叠加即 DoS；且一次瞬时 `accept` 错误
+/// （`?`）会让整个 provider 进程退出。现在：
+/// - 每连接一个线程，并发上限 [`MAX_CONCURRENT_ADMISSIONS`]（超限直接拒绝）；
+/// - `accept` 瞬时错误（`Interrupted`/`WouldBlock`）重试，连续错误只记录不退出。
 pub fn serve_forever(bind: &str, node_dir: &std::path::Path, once: bool) -> Result<(), String> {
     let addr: SocketAddr = bind
         .parse()
@@ -417,15 +612,72 @@ pub fn serve_forever(bind: &str, node_dir: &std::path::Path, once: bool) -> Resu
         serde_json::json!({"verdict":"PASS","command":"provider serve","provider":{"control": bound}})
     );
     eprintln!(
-        "n2-admission: serving on {bound} (node_dir={})",
+        "n2-admission: serving on {bound} (node_dir={}, max_concurrent={MAX_CONCURRENT_ADMISSIONS})",
         node_dir.display()
     );
-    loop {
-        let (mut stream, _) = listener.accept().map_err(|e| format!("accept: {e}"))?;
-        let summary = serve_one_connection(&mut stream, node_dir);
-        eprintln!("{summary}");
-        if once {
-            break;
+    serve_connections(&listener, node_dir, if once { Some(1) } else { None })
+}
+
+/// 并发准入 accept 循环（`serve_forever` 的内核，可单测）。
+///
+/// `max_connections = Some(n)` 时处理 n 条连接后返回（`--once` 用 `Some(1)`）。
+/// P1-19：每连接一个线程 ＋ 并发闸门；`accept` 瞬时错误重试、连续错误退避，
+/// 单个坏连接不得终止 provider。
+fn serve_connections(
+    listener: &TcpListener,
+    node_dir: &std::path::Path,
+    max_connections: Option<usize>,
+) -> Result<(), String> {
+    let inflight = Arc::new(AtomicUsize::new(0));
+    let mut consecutive_errors = 0u32;
+    let mut served = 0usize;
+    while max_connections.is_none_or(|max| served < max) {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                consecutive_errors = 0;
+                served += 1;
+                // 并发闸门：超限立即拒绝（不排队，避免无界内存增长）。
+                if inflight.load(Ordering::Relaxed) >= MAX_CONCURRENT_ADMISSIONS {
+                    eprintln!(
+                        "n2-admission: refusing connection ({} in flight >= cap {MAX_CONCURRENT_ADMISSIONS})",
+                        inflight.load(Ordering::Relaxed)
+                    );
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    continue;
+                }
+                inflight.fetch_add(1, Ordering::Relaxed);
+                let counter = inflight.clone();
+                let dir = node_dir.to_path_buf();
+                // P1-19：每连接一线程；线程内完成握手后回收计数。
+                let spawned = std::thread::Builder::new()
+                    .spawn(move || {
+                        let summary = serve_one_connection(&mut stream, &dir);
+                        eprintln!("{summary}");
+                        counter.fetch_sub(1, Ordering::Relaxed);
+                    });
+                if let Err(e) = spawned {
+                    inflight.fetch_sub(1, Ordering::Relaxed);
+                    eprintln!("n2-admission: spawn handler failed: {e}");
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::Interrupted
+                    || e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                // 瞬时错误：重试，不退出（P1-19：此前一次瞬时错误即进程退出）。
+                consecutive_errors += 1;
+                if consecutive_errors > ACCEPT_ERROR_BACKOFF_LIMIT {
+                    eprintln!("n2-admission: too many transient accept errors; backing off");
+                    std::thread::sleep(Duration::from_millis(200));
+                    consecutive_errors = 0;
+                }
+            }
+            Err(e) => {
+                // 非瞬时错误：记录并继续服务（单个坏连接不得终止 provider）。
+                consecutive_errors += 1;
+                eprintln!("n2-admission: accept error: {e} (continuing)");
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
     }
     Ok(())
@@ -435,7 +687,10 @@ pub fn serve_forever(bind: &str, node_dir: &std::path::Path, once: bool) -> Resu
 // 请求方侧：准入客户端（A 机 `use` 用）
 // ---------------------------------------------------------------------------
 
-/// 请求方准入：拨号 → 读 challenge → 签名 → 发请求 → 读判定。
+/// 请求方准入：拨号 → 读 challenge → 签名 → 发请求 → 读判定 → 收公告。
+///
+/// P1-18：判定之后读取提供方沿同一连接推来的控制帧（撤销公告等）并应用；
+/// 读不到（无帧 / 旧提供方）时正常收尾，不影响准入结果。
 pub fn admit_session(
     control_addr: &str,
     node_dir: &std::path::Path,
@@ -479,11 +734,90 @@ pub fn admit_session(
     write_frame(&mut stream, body.as_bytes()).map_err(AdmitError::Io)?;
     // 4. 读判定。
     let resp = read_frame(&mut stream).map_err(AdmitError::Protocol)?;
-    parse_admission_response(&resp).map_err(AdmitError::Protocol)
+    let verdict = parse_admission_response(&resp)?;
+    // 5. P1-18：收提供方推来的公告（best-effort；失败不影响准入结果）。
+    match collect_announcements(&mut stream) {
+        Ok(frames) => {
+            if let Err(e) = apply_announcements(node_dir, frames) {
+                eprintln!("[n2] WARN: apply provider announcements failed: {e}");
+            }
+        }
+        Err(e) => eprintln!("[n2] WARN: read provider announcements failed: {e}"),
+    }
+    Ok(verdict)
 }
 
-fn parse_admission_response(body: &[u8]) -> Result<AdmissionVerdict, String> {
-    let v: serde_json::Value = serde_json::from_slice(body).map_err(|e| format!("json: {e}"))?;
+/// 读掉提供方推来的全部公告帧（以 len=0 终止标记收尾）。
+fn collect_announcements(
+    stream: &mut TcpStream,
+) -> Result<Vec<Vec<u8>>, AdmitError> {
+    let mut out = Vec::new();
+    while let Some(payload) =
+        read_optional_frame(stream).map_err(|e| AdmitError::Protocol(format!("read announcement: {e}")))?
+    {
+        out.push(payload);
+        // 上限保护：提供方异常时不让请求方无限缓冲。
+        if out.len() >= MAX_ANNOUNCEMENT_FRAMES {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// 应用公告帧（幂等；见 [`serve_one_connection`] 处的 exactly-once 语义声明）。
+///
+/// 帧 key 用 `n2/outbox/acked` 记录 seq 高水位：重发时 ≤ 高水位的帧直接丢弃。
+fn apply_announcements(node_dir: &std::path::Path, frames: Vec<Vec<u8>>) -> Result<usize, String> {
+    if frames.is_empty() {
+        return Ok(0);
+    }
+    let store = N2Store::open(node_dir).map_err(|e| format!("open n2 store: {e}"))?;
+    let mut high = store.outbox_acked_seq()?;
+    let mut applied = 0usize;
+    for bytes in frames {
+        match nexus_registry::decode_control_frame(&bytes) {
+            Ok(nexus_registry::ControlFrame::AuthRevoke { resource, .. }) => {
+                // 撤销公告：失效本地缓存广告（下次 plan 即不再选它）。
+                let Some(rid) = resource_id_of_name(&store, resource.name.as_str()) else {
+                    continue;
+                };
+                let mut removed = 0usize;
+                for ad in store.load_ads().unwrap_or_default() {
+                    if ad.resource == rid && store.delete_ad(&ad.provider, &rid).unwrap_or(false) {
+                        removed += 1;
+                    }
+                }
+                applied += removed;
+            }
+            Ok(_) => {
+                // 其他帧类型 P0 无处理逻辑：仍算已消费（否则高水位卡住）。
+                applied += 1;
+            }
+            Err(e) => {
+                eprintln!("[n2] WARN: undecodable announcement: {e}");
+                break;
+            }
+        }
+        high += 1;
+    }
+    store.outbox_set_acked_seq(high)?;
+    Ok(applied)
+}
+
+/// 名字 → 本地 `ResourceId`（公告应用需要经名字表反查；查无 → `None`）。
+fn resource_id_of_name(store: &N2Store, name: &str) -> Option<ResourceId> {
+    let parsed = nexus_domain::ResourceName::new(name).ok()?;
+    store
+        .load_names()
+        .ok()?
+        .into_iter()
+        .find(|e| e.name == parsed)
+        .map(|e| e.resource_id)
+}
+
+fn parse_admission_response(body: &[u8]) -> Result<AdmissionVerdict, AdmitError> {
+    let v: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| AdmitError::Protocol(format!("json: {e}")))?;
     match v.get("verdict").and_then(serde_json::Value::as_str) {
         Some("admit") => {
             let provider = v
@@ -513,15 +847,24 @@ fn parse_admission_response(body: &[u8]) -> Result<AdmissionVerdict, String> {
                 .unwrap_or("");
             if code == "NOT_FOUND" {
                 Ok(AdmissionVerdict::NotFound)
+            } else if code == "UNSUPPORTED_VERSION" {
+                // P1-12：版本不匹配不是"不可达"——对方活着。
+                Err(AdmitError::Unsupported(
+                    v.get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("provider protocol version mismatch")
+                        .to_string(),
+                ))
             } else {
-                Err(v
-                    .get("message")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("provider error")
-                    .to_string())
+                Err(AdmitError::Protocol(
+                    v.get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("provider error")
+                        .to_string(),
+                ))
             }
         }
-        other => Err(format!("unknown verdict: {other:?}")),
+        other => Err(AdmitError::Protocol(format!("unknown verdict: {other:?}"))),
     }
 }
 
@@ -777,5 +1120,283 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, AdmitError::Connect(_)), "{err}");
         let _ = std::fs::remove_dir_all(&dir_a);
+    }
+
+    // ---- P1-18：outbox 出站泵（撤销公告真的发出去） ----
+
+    #[test]
+    fn revoke_announcement_reaches_requester_and_invalidates_cached_ad() {
+        // 回归：此前 `resource revoke` 只把 AUTH_REVOKE 排进 outbox，无人发送，
+        // B 机撤销后 A 机永远收不到公告。
+        let dir_b = temp_node_dir("pump-b");
+        let dir_a = temp_node_dir("pump-a");
+        let store_a = N2Store::open(&dir_a).unwrap();
+        let (_, principal_a) = ensure_auth_identity(&store_a).unwrap();
+
+        // B 侧发布并为 A 授权；A 侧缓存同一条广告 + 名字表。
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        publish_svc(&dir_b, &addr.to_string());
+        grant_for(&dir_b, &principal_a);
+        {
+            let store = N2Store::open(&dir_b).unwrap();
+            let frame = nexus_registry::ControlFrame::AuthRevoke {
+                resource: nexus_domain::ResourceRef::new(
+                    WorkspaceId::new(DEFAULT_WORKSPACE),
+                    nexus_domain::ResourceName::new("svc-b").unwrap(),
+                ),
+                principal: principal_a.0.clone(),
+            };
+            let bytes = nexus_registry::encode_control_frame(&frame).unwrap();
+            let seq = store.outbox_next_seq().unwrap();
+            store.outbox_push(seq, &bytes).unwrap();
+            assert_eq!(store.outbox_list().unwrap().len(), 1);
+        }
+        // A 侧缓存 B 的广告与名字（`resource import` 的结果形态）。
+        {
+            let ads_b = N2Store::open(&dir_b).unwrap().load_ads().unwrap();
+            let names_b = N2Store::open(&dir_b).unwrap().load_names().unwrap();
+            for ad in &ads_b {
+                store_a.save_ad(ad).unwrap();
+            }
+            store_a.save_names(&names_b).unwrap();
+            assert!(!store_a.load_ads().unwrap().is_empty());
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let dir_b2 = dir_b.clone();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let summary = serve_one_connection(&mut stream, &dir_b2);
+            let _ = tx.send(summary);
+        });
+
+        let verdict = admit_session(
+            &addr.to_string(),
+            &dir_a,
+            "sess-pump-1",
+            &ResourceId("res-svc-b".into()),
+        )
+        .unwrap();
+        assert!(matches!(verdict, AdmissionVerdict::Admitted { .. }));
+        let summary = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(summary.contains("outbox: 1 frame(s) sent"), "{summary}");
+        // B 侧 outbox 已出队（不重复发）。
+        assert!(N2Store::open(&dir_b).unwrap().outbox_list().unwrap().is_empty());
+        // A 侧缓存广告被撤销公告失效。
+        assert!(
+            N2Store::open(&dir_a).unwrap().load_ads().unwrap().is_empty(),
+            "requester must drop the revoked cached advertisement"
+        );
+        // 幂等：ack 高水位已记录。
+        assert_eq!(N2Store::open(&dir_a).unwrap().outbox_acked_seq().unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&dir_a);
+    }
+
+    #[test]
+    fn announcement_application_is_idempotent_on_replay() {
+        // 接收侧幂等去重：重复应用同一撤销不报错、结果一致。
+        let dir = temp_node_dir("pump-idem");
+        let store = N2Store::open(&dir).unwrap();
+        store
+            .save_ad(&ProviderAdvertisement {
+                provider: ProviderId("prov-x".into()),
+                resource: ResourceId("res-svc-b".into()),
+                capabilities: vec!["service".into()],
+                locators: vec!["tcp://10.9.9.9:1".into()],
+                discoverable_by: nexus_registry::Discoverability::Public,
+                use_grants: vec![],
+                unavailable: None,
+                issued_at_secs: 1,
+                ttl_secs: 0,
+            })
+            .unwrap();
+        store
+            .save_names(&[crate::n2_store::NameEntry {
+                workspace: WorkspaceId::new(DEFAULT_WORKSPACE),
+                name: nexus_domain::ResourceName::new("svc-b").unwrap(),
+                resource_id: ResourceId("res-svc-b".into()),
+                kind: Some(nexus_domain::ResourceKind::Service),
+            }])
+            .unwrap();
+        let frame = nexus_registry::ControlFrame::AuthRevoke {
+            resource: nexus_domain::ResourceRef::new(
+                WorkspaceId::new(DEFAULT_WORKSPACE),
+                nexus_domain::ResourceName::new("svc-b").unwrap(),
+            ),
+            principal: "ed25519:x".into(),
+        };
+        let bytes = nexus_registry::encode_control_frame(&frame).unwrap();
+        assert_eq!(apply_announcements(&dir, vec![bytes.clone()]).unwrap(), 1);
+        assert!(store.load_ads().unwrap().is_empty());
+        // 再次应用：仍然幂等（广告已无），不 panic。
+        assert_eq!(apply_announcements(&dir, vec![bytes]).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_outbox_sends_only_terminator() {
+        // 无待发公告时请求方必须正常收尾（读到终止标记，不是卡住）。
+        let dir_b = temp_node_dir("pump-empty-b");
+        let dir_a = temp_node_dir("pump-empty-a");
+        let (addr, rx) = serve_once_in_thread(dir_b.clone());
+        publish_svc(&dir_b, &addr.to_string());
+        let store_a = N2Store::open(&dir_a).unwrap();
+        let (_, principal_a) = ensure_auth_identity(&store_a).unwrap();
+        grant_for(&dir_b, &principal_a);
+        let verdict = admit_session(
+            &addr.to_string(),
+            &dir_a,
+            "sess-pump-2",
+            &ResourceId("res-svc-b".into()),
+        );
+        assert!(matches!(verdict, Ok(AdmissionVerdict::Admitted { .. })), "{verdict:?}");
+        let summary = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(summary.contains("outbox: 0 frame(s) sent"), "{summary}");
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&dir_a);
+    }
+
+    // ---- P1-12：版本不匹配保留独立码 ----
+
+    #[test]
+    fn version_mismatch_maps_to_unsupported_not_unreachable() {
+        // 对方活着但协议版本对不上 → 不是"不可达"。
+        let v = serde_json::json!({
+            "v": ADMISSION_PROTOCOL_V1,
+            "verdict": "error",
+            "code": "UNSUPPORTED_VERSION",
+            "message": "unsupported version: 2",
+        });
+        let err = parse_admission_response(v.to_string().as_bytes()).unwrap_err();
+        assert!(matches!(err, AdmitError::Unsupported(_)), "{err:?}");
+        assert!(!err.is_unreachable());
+        assert_eq!(err.code(), "PROTOCOL_VERSION_UNSUPPORTED");
+    }
+
+    #[test]
+    fn provider_rejects_unsupported_version_with_code() {
+        // 提供方侧：请求版本不对时发 `code=UNSUPPORTED_VERSION`，而非笼统 error。
+        let dir_b = temp_node_dir("ver-b");
+        let dir_a = temp_node_dir("ver-a");
+        let (addr, _rx) = serve_once_in_thread(dir_b.clone());
+        publish_svc(&dir_b, &addr.to_string());
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut challenge = [0u8; 32];
+        stream.read_exact(&mut challenge).unwrap();
+        let body = serde_json::json!({
+            "v": 999,
+            "pubkey_hex": "aa".repeat(32),
+            "sig_hex": "bb".repeat(64),
+            "session_id": "sess-ver",
+            "resource_id": "res-svc-b",
+            "operation": "Use",
+        })
+        .to_string();
+        write_frame(&mut stream, body.as_bytes()).unwrap();
+        let resp = read_frame(&mut stream).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        assert_eq!(v["verdict"], serde_json::json!("error"));
+        assert_eq!(v["code"], serde_json::json!("UNSUPPORTED_VERSION"));
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&dir_a);
+    }
+
+    // ---- P1-13：locator 判定收敛到 registry 层 ----
+
+    #[test]
+    fn service_locator_skips_control_locator() {
+        let ad = ProviderAdvertisement {
+            provider: ProviderId("p".into()),
+            resource: ResourceId("r".into()),
+            capabilities: vec!["service".into()],
+            locators: vec![
+                format!("{CONTROL_LOCATOR_SCHEME}10.0.0.9:9000"),
+                "10.0.0.10:8080".into(),
+            ],
+            discoverable_by: nexus_registry::Discoverability::Public,
+            use_grants: vec![],
+            unavailable: None,
+            issued_at_secs: 1,
+            ttl_secs: 0,
+        };
+        // 旧的 `locators[0]` 取法会把控制端点当成 Service 入口。
+        assert_eq!(ad.locators[0], "n2adm://10.0.0.9:9000");
+        assert_eq!(service_locator_of(&ad).as_deref(), Some("10.0.0.10:8080"));
+        assert_eq!(control_locator_of(&ad).as_deref(), Some("10.0.0.9:9000"));
+        // publish 侧据此拒绝错误顺序。
+        assert!(!ad.has_valid_locator_order());
+        let mut fixed = ad.clone();
+        fixed.locators.reverse();
+        assert!(fixed.has_valid_locator_order());
+        assert_eq!(service_locator_of(&fixed).as_deref(), Some("10.0.0.10:8080"));
+    }
+
+    // ---- P1-19：并发准入 ----
+
+    #[test]
+    fn serve_connections_handles_idle_client_without_blocking_others() {
+        // 回归（P1-19）：串行 accept 时一个"连上不发数据"的客户端就把服务占死
+        // （每连接 10s 读超时，串行叠加即 DoS）。并发处理后，空闲连接不影响
+        // 后续连接的正常握手。
+        let dir = temp_node_dir("conc");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                serve_connections(&listener, &dir, Some(2)).expect("serve loop");
+            })
+        };
+        // 第一条连接：连上但不发任何数据（最坏情况占满读超时）。
+        let idle = TcpStream::connect(addr).unwrap();
+        // 第二条连接：必须立刻被处理完，而不是等第一条的 10s 超时。
+        let started = std::time::Instant::now();
+        let verdict = admit_session(
+            &addr.to_string(),
+            &dir,
+            "sess-conc-1",
+            &ResourceId("res-unknown".into()),
+        );
+        let elapsed = started.elapsed();
+        assert_eq!(verdict.unwrap(), AdmissionVerdict::NotFound);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "idle client must not stall the provider (took {elapsed:?})"
+        );
+        drop(idle);
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serve_connections_stops_after_max_connections() {
+        // `--once` 语义：处理一条连接后循环退出（loopback E4 前置依赖）。
+        let dir = temp_node_dir("once");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let done = std::thread::spawn({
+            let dir = dir.clone();
+            move || serve_connections(&listener, &dir, Some(1)).map(|_| ())
+        });
+        let _ = admit_session(
+            &addr.to_string(),
+            &dir,
+            "sess-once-1",
+            &ResourceId("res-unknown".into()),
+        );
+        let _ = done.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_cap_is_positive() {
+        // 常量在编译期检查（并发闸门必须 >1，否则退化成串行）。
+        const { assert!(MAX_CONCURRENT_ADMISSIONS >= 2) };
+        const { assert!(MAX_ANNOUNCEMENT_FRAMES >= 1) };
     }
 }

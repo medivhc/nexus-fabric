@@ -290,7 +290,13 @@ impl N2Directory {
                     .get(&ad.provider.0)
                     .cloned()
                     .unwrap_or_default(),
-                locator: ad.locators.first().cloned().unwrap_or_default(),
+                // P1-13：数据面端点取"首个非 `n2adm://` locator"（registry 层
+                // 唯一实现），不再直接取 `locators[0]`——运维把 `n2adm://` 写在
+                // 前面时，准入控制端点不会被当成 Service 入口输出。
+                locator: ad
+                    .service_locator()
+                    .or_else(|| ad.locators.first().cloned())
+                    .unwrap_or_default(),
                 capabilities: ad.capabilities.clone(),
                 present: matches!(
                     ad.unavailable,

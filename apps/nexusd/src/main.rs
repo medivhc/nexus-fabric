@@ -1267,6 +1267,6 @@ mod parse_flags_tests {
 
     #[test]
     fn n2_session_sweep_interval_is_bounded() {
-        assert!(N2_SESSION_SWEEP_INTERVAL_SECS > 0);
+        const { assert!(N2_SESSION_SWEEP_INTERVAL_SECS > 0) };
     }
 }

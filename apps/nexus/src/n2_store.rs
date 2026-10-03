@@ -1185,6 +1185,8 @@ impl N2Store {
 // ============================================================================
 
 const OUTBOX_PREFIX: &str = "n2/outbox/";
+/// 已消费公告的 seq 高水位键（P1-18 接收侧幂等去重）。
+const OUTBOX_ACKED_KEY: &str = "n2/outbox/acked";
 
 impl N2Store {
     /// 控制帧入队（`seq` 由调用方单调递增；P0-5 发送后删除）。
@@ -1221,6 +1223,46 @@ impl N2Store {
     /// outbox 下一条 seq（当前最大＋1）。
     pub fn outbox_next_seq(&self) -> Result<u64, String> {
         Ok(self.outbox_list()?.last().map(|(s, _)| s + 1).unwrap_or(0))
+    }
+
+    /// outbox 出队（P1-18 出站泵：帧成功发出后删除；删失败的帧下次重发）。
+    pub fn outbox_remove(&self, seq: u64) -> Result<bool, String> {
+        let key = format!("{OUTBOX_PREFIX}{seq:020}");
+        let existed = self
+            .kv
+            .get(&key)
+            .map_err(|e| format!("read outbox {seq}: {e}"))?
+            .is_some();
+        self.kv
+            .delete(&key)
+            .map_err(|e| format!("delete outbox {seq}: {e}"))?;
+        Ok(existed)
+    }
+
+    /// 已消费公告的 seq 高水位（P1-18 接收侧幂等去重；缺失 = 0）。
+    pub fn outbox_acked_seq(&self) -> Result<u64, String> {
+        match self
+            .kv
+            .get(OUTBOX_ACKED_KEY)
+            .map_err(|e| format!("read outbox acked: {e}"))?
+        {
+            Some(bytes) => {
+                let text = String::from_utf8(bytes)
+                    .map_err(|e| format!("outbox acked not utf-8: {e}"))?;
+                Ok(text.trim().parse::<u64>().unwrap_or(0))
+            }
+            None => Ok(0),
+        }
+    }
+
+    /// 记录已消费公告的 seq 高水位（单调；不前进则不写）。
+    pub fn outbox_set_acked_seq(&self, seq: u64) -> Result<(), String> {
+        if seq <= self.outbox_acked_seq()? {
+            return Ok(());
+        }
+        self.kv
+            .put(OUTBOX_ACKED_KEY, seq.to_string().as_bytes())
+            .map_err(|e| format!("put outbox acked: {e}"))
     }
 }
 
