@@ -1,0 +1,661 @@
+//! `nexus resource` 命令族（N2 P0-4）：`list` / `show` / `publish` / `revoke`。
+//!
+//! - `nexus resource list`：目录列出有权发现的资源（`n2-resource-list`；
+//!   可发现≠可使用，D2 双层授权字段）；
+//! - `nexus resource show <name>`：资源详情（含双层授权字段与可用状态，
+//!   `n2-resource-show`）；
+//! - `nexus resource publish --name <n> --kind <k>`：发布资源（`n2-resource-publish`；
+//!   走 P0-2 的 `publish_ad`，默认 Workspace 内部范围，白皮书 §7.3）；
+//! - `nexus resource revoke <name>`：撤销发布（`n2-resource-revoke`；
+//!   触发 AUTH_REVOKE 帧→outbox 排队＋本地 withdraw＋tombstone＋目录审计）。
+//!
+//! 目录变更补结构化审计事件（P0-2 评审遗留）：publish/revoke/withdraw 经
+//! `record_directory_audit` 落盘 journal。
+
+use nexus_domain::{ResourceKind, ResourceName, ResourceRef, WorkspaceId};
+use nexus_registry::{
+    ControlFrame, Discoverability, ProviderAdvertisement, UnavailabilityReason,
+    decode_control_frame, encode_control_frame,
+};
+use serde_json::{Value, json};
+
+use crate::n2_directory::{DEFAULT_WORKSPACE, DIRECTORY_TAG, N2Directory};
+use crate::n2_identity::ensure_auth_identity;
+use crate::n2_store::{
+    DirectoryAuditEvent, N2Store, NameEntry, local_actor, now_unix_pub, record_directory_audit,
+};
+
+/// 当前 unix 时间（秒）。
+fn now_secs() -> u64 {
+    now_unix_pub()
+}
+
+fn render(out: &Value, _json_mode: bool) {
+    // v1: 人读输出与 JSON 同形（`--json` 语义的最小实现）。
+    println!("{out}");
+}
+
+fn store_fail(e: String) -> Value {
+    json!({"verdict":"FAIL","error":{"code":"STORE","message":e}})
+}
+
+/// 广告 → JSON（`resource list/show` 用）。
+fn ad_json(name: &str, kind: ResourceKind, ad: &ProviderAdvertisement) -> Value {
+    let discoverable_by = match &ad.discoverable_by {
+        Discoverability::Public => json!("public"),
+        Discoverability::Restricted { principals } => json!({
+            "restricted": principals,
+        }),
+    };
+    json!({
+        "name": name,
+        "kind": kind.as_str(),
+        "resource_id": ad.resource.0,
+        "provider": ad.provider.0,
+        "capabilities": ad.capabilities,
+        "locators": ad.locators,
+        "discoverable_by": discoverable_by,
+        "use_grants": ad.use_grants.iter().map(|g| json!({
+            "principal": g.principal,
+            "operations": g.operations.iter().map(|o| o.as_str()).collect::<Vec<_>>(),
+            "not_after_secs": g.not_after_secs,
+        })).collect::<Vec<_>>(),
+        "unavailable": ad.unavailable.as_ref().map(|u| match u {
+            UnavailabilityReason::ProviderOffline => json!("ProviderOffline"),
+            UnavailabilityReason::HealthDegraded { detail } => json!({"HealthDegraded": detail}),
+            UnavailabilityReason::NotAcceptingWork { reason } => json!({"NotAcceptingWork": reason}),
+        }),
+        "issued_at_secs": ad.issued_at_secs,
+        "ttl_secs": ad.ttl_secs,
+    })
+}
+
+/// `nexus resource list`：目录列出有权发现的资源。
+fn run_list(json_mode: bool) -> i32 {
+    let node_dir = crate::node_cli::node_dir();
+    let now = now_secs();
+    let directory = match N2Directory::open(&node_dir, now) {
+        Ok(d) => d,
+        Err(e) => {
+            render(&store_fail(e), json_mode);
+            return 0;
+        }
+    };
+    // 按资源聚合广告（目录视图；P0 展示全部未过期广告，可见性过滤在
+    // provider 侧响应查询时做——`lookup_visible_ads`，此处为本地管理视图）。
+    let mut resources: Vec<Value> = Vec::new();
+    // 遍历名字表已知的全部资源（kinds 的 key 即名字集合；撤销的 resolve 已剔除）。
+    for name in directory.resource_names() {
+        let Ok((_rref, rid)) = directory.resolve(&name) else {
+            continue;
+        };
+        let kind = directory.kind_of(&name).unwrap_or(ResourceKind::Service);
+        let ads = directory.registry().lookup_ads(&rid, now);
+        if ads.is_empty() {
+            continue;
+        }
+        let providers: Vec<Value> = ads.iter().map(|ad| ad_json(&name, kind, ad)).collect();
+        resources.push(json!({
+            "name": name,
+            "kind": kind.as_str(),
+            "resource_id": rid.0,
+            "providers": providers,
+        }));
+    }
+    resources.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    render(
+        &json!({
+            "verdict": "PASS",
+            "command": "resource list",
+            "directory": DIRECTORY_TAG,
+            "resources": resources,
+        }),
+        json_mode,
+    );
+    0
+}
+
+/// `nexus resource show <name>`：资源详情。
+fn run_show(name: &str, json_mode: bool) -> i32 {
+    let node_dir = crate::node_cli::node_dir();
+    let now = now_secs();
+    let directory = match N2Directory::open(&node_dir, now) {
+        Ok(d) => d,
+        Err(e) => {
+            render(&store_fail(e), json_mode);
+            return 0;
+        }
+    };
+    let (rref, rid) = match directory.resolve(name) {
+        Ok(v) => v,
+        Err(e) => {
+            render(
+                &json!({
+                    "verdict": "FAIL",
+                    "error": {
+                        "code": crate::error_code(&e),
+                        "message": e.to_string(),
+                    },
+                }),
+                json_mode,
+            );
+            return 0;
+        }
+    };
+    let kind = directory.kind_of(name).unwrap_or(ResourceKind::Service);
+    let ads = directory.registry().lookup_ads(&rid, now);
+    if ads.is_empty() {
+        render(
+            &json!({
+                "verdict": "FAIL",
+                "error": {
+                    "code": "NOT_FOUND",
+                    "message": format!("resource '{name}' has no live advertisements"),
+                },
+            }),
+            json_mode,
+        );
+        return 0;
+    }
+    // 首个可用广告的 provider 为"当前提供方"（`n2-resource-show` 冻结字段）。
+    let primary = ads
+        .iter()
+        .find(|ad| ad.unavailable.is_none())
+        .or(ads.first())
+        .expect("non-empty");
+    let mut out = json!({
+        "verdict": "PASS",
+        "command": "resource show",
+        "directory": DIRECTORY_TAG,
+        "resource": {
+            "name": name,
+            "workspace": rref.workspace.0,
+            "kind": kind.as_str(),
+            "resource_id": rid.0,
+            "provider": primary.provider.0,
+        },
+    });
+    out["resource"]["advertisements"] = json!(
+        ads.iter()
+            .map(|ad| ad_json(name, kind, ad))
+            .collect::<Vec<_>>()
+    );
+    render(&out, json_mode);
+    0
+}
+
+/// kind 参数解析（`--kind service|network|workspace|compute|device`）。
+fn parse_kind(s: &str) -> Option<ResourceKind> {
+    match s {
+        "service" => Some(ResourceKind::Service),
+        "network" => Some(ResourceKind::Network),
+        "workspace" => Some(ResourceKind::Workspace),
+        "compute" => Some(ResourceKind::Compute),
+        "device" => Some(ResourceKind::Device),
+        _ => None,
+    }
+}
+
+/// kind → 默认能力（publish 时）。
+fn default_capability(kind: ResourceKind) -> &'static str {
+    match kind {
+        ResourceKind::Service => "service",
+        ResourceKind::Network => "internet-access",
+        ResourceKind::Workspace => "workspace",
+        ResourceKind::Compute => "compute",
+        ResourceKind::Device => "device",
+    }
+}
+
+/// `nexus resource publish --name <n> --kind <k> [--locator <l>]`。
+fn run_publish(args: &[String], json_mode: bool) -> i32 {
+    const USAGE: &str = "usage: nexus resource publish --name <name> --kind <service|network|workspace|compute|device> [--locator <locator>]";
+    let mut name: Option<String> = None;
+    let mut kind: Option<String> = None;
+    let mut locator: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--name" => {
+                i += 1;
+                name = args.get(i).cloned();
+            }
+            "--kind" => {
+                i += 1;
+                kind = args.get(i).cloned();
+            }
+            "--locator" => {
+                i += 1;
+                locator = args.get(i).cloned();
+            }
+            other => {
+                eprintln!("error: unexpected argument for resource publish: {other}");
+                eprintln!("{USAGE}");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+    let (Some(name), Some(kind_s)) = (name, kind) else {
+        eprintln!("error: resource publish requires --name and --kind");
+        eprintln!("{USAGE}");
+        return 2;
+    };
+    let Some(kind) = parse_kind(&kind_s) else {
+        eprintln!(
+            "error: unknown kind '{kind_s}' (expected: service|network|workspace|compute|device)"
+        );
+        eprintln!("{USAGE}");
+        return 2;
+    };
+    let parsed_name = match ResourceName::new(&name) {
+        Ok(n) => n,
+        Err(e) => {
+            render(
+                &json!({"verdict":"FAIL","error":{"code":"INVALID_NAME","message":format!("{e:?}")}}),
+                json_mode,
+            );
+            return 0;
+        }
+    };
+
+    let node_dir = crate::node_cli::node_dir();
+    let now = now_secs();
+    let store = match N2Store::open(&node_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            render(&store_fail(e), json_mode);
+            return 0;
+        }
+    };
+    // 提供方身份：本地节点（`nexus node init` 的 NodeId；未初始化则明确报错）。
+    let provider_id = match local_actor(&node_dir) {
+        id if !id.is_empty() => format!("prov-{id}"),
+        _ => {
+            render(
+                &json!({"verdict":"FAIL","error":{"code":"NO_IDENTITY","message":"node not initialized; run `nexus node init` first"}}),
+                json_mode,
+            );
+            return 0;
+        }
+    };
+    // 不透明 ResourceId（D2；`res-<name>` 确定性派生，非定位）。
+    let resource_id = nexus_domain::ResourceId(format!("res-{name}"));
+    let rref = ResourceRef::new(WorkspaceId::new(DEFAULT_WORKSPACE), parsed_name);
+    let ad = ProviderAdvertisement {
+        provider: nexus_domain::ProviderId(provider_id.clone()),
+        resource: resource_id.clone(),
+        capabilities: vec![default_capability(kind).to_string()],
+        locators: locator.into_iter().collect(),
+        // 白皮书 §7.3：发布默认 Workspace 内部范围（Public 在此语境下
+        // 即"本 Workspace 内可见"；跨 Workspace 可见性为 P1）。
+        discoverable_by: Discoverability::Public,
+        use_grants: Vec::new(),
+        unavailable: None,
+        issued_at_secs: now,
+        ttl_secs: 0,
+    };
+    // 走 P0-2 的 publish_ad（内存 registry 语义）＋落盘。
+    {
+        let mut registry = nexus_registry::Registry::new();
+        if let Err(e) = registry.publish_ad(ad.clone(), now) {
+            render(
+                &json!({"verdict":"FAIL","error":{"code":"PUBLISH","message":e.to_string()}}),
+                json_mode,
+            );
+            return 0;
+        }
+    }
+    if let Err(e) = store.save_ad(&ad) {
+        render(&store_fail(e), json_mode);
+        return 0;
+    }
+    // 名字表：加载已持久化的＋本次新增合并后全量写回（`save_names` 为全量覆盖语义）。
+    let mut names = match store.load_names() {
+        Ok(n) => n,
+        Err(e) => {
+            render(&store_fail(e), json_mode);
+            return 0;
+        }
+    };
+    names.retain(|e| !(e.workspace == rref.workspace && e.name == rref.name));
+    names.push(NameEntry {
+        workspace: rref.workspace.clone(),
+        name: rref.name.clone(),
+        resource_id: resource_id.clone(),
+        kind: Some(kind),
+    });
+    if let Err(e) = store.save_names(&names) {
+        render(&store_fail(e), json_mode);
+        return 0;
+    }
+    // 重新发布清除撤销 tombstone（幂等）。
+    if let Err(e) = store.clear_withdrawn(&resource_id) {
+        render(&store_fail(e), json_mode);
+        return 0;
+    }
+    // 目录审计（P0-2 评审遗留）。
+    record_directory_audit(
+        store.kv(),
+        &DirectoryAuditEvent {
+            at_unix: now,
+            actor: local_actor(&node_dir),
+            action: "publish",
+            resource: rref,
+            provider: Some(nexus_domain::ProviderId(provider_id)),
+            detail: format!("publish --name {name} --kind {kind_s}"),
+        },
+    );
+    render(
+        &json!({
+            "verdict": "PASS",
+            "command": "resource publish",
+            "resource": {
+                "name": name,
+                "kind": kind.as_str(),
+                "resource_id": resource_id.0,
+                "published": true,
+            },
+        }),
+        json_mode,
+    );
+    0
+}
+
+/// `nexus resource revoke <name>`：撤销发布。
+fn run_revoke(name: &str, json_mode: bool) -> i32 {
+    let node_dir = crate::node_cli::node_dir();
+    let now = now_secs();
+    let store = match N2Store::open(&node_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            render(&store_fail(e), json_mode);
+            return 0;
+        }
+    };
+    // 先解析（撤销不存在的资源 → 明确 NOT_FOUND，不静默成功）。
+    let directory = match N2Directory::open_with_store(&store, now) {
+        Ok(d) => d,
+        Err(e) => {
+            render(&store_fail(e), json_mode);
+            return 0;
+        }
+    };
+    // 注意：已撤销的资源 resolve 会失败；revoke 幂等——再次 revoke 仍返回
+    // revoked=true（白皮书 §7.3"发布入口必须能够撤销，并显示其当前生效状态"）。
+    let (rref, resource_id) = match directory.resolve(name) {
+        Ok(v) => v,
+        Err(_) => {
+            // 可能已撤销：按名字构造 ResourceRef 重试 tombstone 路径。
+            let parsed = match ResourceName::new(name) {
+                Ok(n) => n,
+                Err(e) => {
+                    render(
+                        &json!({"verdict":"FAIL","error":{"code":"INVALID_NAME","message":format!("{e:?}")}}),
+                        json_mode,
+                    );
+                    return 0;
+                }
+            };
+            let rref = ResourceRef::new(WorkspaceId::new(DEFAULT_WORKSPACE), parsed);
+            let rid = nexus_domain::ResourceId(format!("res-{name}"));
+            (rref, rid)
+        }
+    };
+
+    // 1. 触发 AUTH_REVOKE 帧（D8 控制面）：编码＋outbox 落盘排队
+    //    （P0-5 真跨机时实际发送；P0 本地先证明帧格式正确）。
+    let (_pubkey, principal) = match ensure_auth_identity(&store) {
+        Ok(v) => v,
+        Err(e) => {
+            render(&store_fail(e), json_mode);
+            return 0;
+        }
+    };
+    let frame = ControlFrame::AuthRevoke {
+        resource: rref.clone(),
+        principal: principal.0.clone(),
+    };
+    let frame_bytes = match encode_control_frame(&frame) {
+        Ok(b) => b,
+        Err(e) => {
+            render(
+                &json!({"verdict":"FAIL","error":{"code":"FRAME","message":e.to_string()}}),
+                json_mode,
+            );
+            return 0;
+        }
+    };
+    // 自检：编码可 roundtrip（帧格式正确性的机器证据）。
+    debug_assert!(matches!(
+        decode_control_frame(&frame_bytes),
+        Ok(ControlFrame::AuthRevoke { .. })
+    ));
+    let seq = match store.outbox_next_seq() {
+        Ok(s) => s,
+        Err(e) => {
+            render(&store_fail(e), json_mode);
+            return 0;
+        }
+    };
+    if let Err(e) = store.outbox_push(seq, &frame_bytes) {
+        render(&store_fail(e), json_mode);
+        return 0;
+    }
+
+    // 2. 本地 withdraw：删除持久化广告＋tombstone（撤销后目录不可见）。
+    let mut withdrawn_any = false;
+    for ad in directory.registry().lookup_ads(&resource_id, now) {
+        if store.delete_ad(&ad.provider, &resource_id).unwrap_or(false) {
+            withdrawn_any = true;
+        }
+    }
+    if let Err(e) = store.mark_withdrawn(&resource_id) {
+        render(&store_fail(e), json_mode);
+        return 0;
+    }
+
+    // 3. 目录审计（P0-2 评审遗留）。
+    record_directory_audit(
+        store.kv(),
+        &DirectoryAuditEvent {
+            at_unix: now,
+            actor: local_actor(&node_dir),
+            action: "revoke",
+            resource: rref,
+            provider: None,
+            detail: format!("revoke {name} (withdrawn_ads={withdrawn_any}, outbox_seq={seq})"),
+        },
+    );
+    render(
+        &json!({
+            "verdict": "PASS",
+            "command": "resource revoke",
+            "resource": {
+                "name": name,
+                "revoked": true,
+            },
+        }),
+        json_mode,
+    );
+    0
+}
+
+/// `nexus resource` 命令族入口。
+pub fn run_resource(args: &[String], json_mode: bool) -> i32 {
+    const USAGE: &str = "usage: nexus resource list | nexus resource show <name> | nexus resource publish --name <name> --kind <kind> [--locator <locator>] | nexus resource revoke <name>";
+    match args.first().map(String::as_str) {
+        Some("list") if args.len() == 1 => run_list(json_mode),
+        Some("show") => {
+            let Some(name) = args.get(1) else {
+                eprintln!("error: missing argument: <name>");
+                eprintln!("{USAGE}");
+                return 2;
+            };
+            if args.len() > 2 {
+                eprintln!("error: too many arguments for resource show");
+                eprintln!("{USAGE}");
+                return 2;
+            }
+            run_show(name, json_mode)
+        }
+        Some("publish") => run_publish(&args[1..], json_mode),
+        Some("revoke") => {
+            let Some(name) = args.get(1) else {
+                eprintln!("error: missing argument: <name>");
+                eprintln!("{USAGE}");
+                return 2;
+            };
+            if args.len() > 2 {
+                eprintln!("error: too many arguments for resource revoke");
+                eprintln!("{USAGE}");
+                return 2;
+            }
+            run_revoke(name, json_mode)
+        }
+        _ => {
+            eprintln!("error: unknown resource subcommand");
+            eprintln!("{USAGE}");
+            2
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nexus_registry::UsageGrant;
+
+    fn temp_node_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("resource-cli-test-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn list_shows_seed_resources() {
+        // n2-resource-list 形状：resources 非空（含 dev-svc）。
+        // 直接验证目录装配（run_list 的内核逻辑），不碰进程环境变量。
+        let dir = temp_node_dir("list");
+        let directory = N2Directory::open(&dir, now_secs()).unwrap();
+        let mut names: Vec<String> = Vec::new();
+        for name in directory.resource_names() {
+            if directory.resolve(&name).is_ok() {
+                names.push(name);
+            }
+        }
+        assert!(names.contains(&"dev-svc".to_string()));
+        assert!(names.contains(&"internet-access".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revoke_marks_withdrawn_and_queues_frame() {
+        // n2-resource-revoke 形状：revoked=true；outbox 有 AUTH_REVOKE 帧；
+        // 目录审计落盘；撤销后 list 不再列出。
+        let dir = temp_node_dir("revoke");
+        let node_dir = dir.clone();
+        // 直接调内核逻辑：用 store 构造等价路径。
+        let store = N2Store::open(&node_dir).unwrap();
+        let now = now_secs();
+        let directory = N2Directory::open_with_store(&store, now).unwrap();
+        let (rref, rid) = directory.resolve("dev-svc").unwrap();
+        assert_eq!(rid.0, "res-dev-svc");
+
+        // 编码 AUTH_REVOKE 帧（与 run_revoke 同逻辑）。
+        let frame = ControlFrame::AuthRevoke {
+            resource: rref.clone(),
+            principal: "ed25519:test".to_string(),
+        };
+        let bytes = encode_control_frame(&frame).unwrap();
+        assert!(matches!(
+            decode_control_frame(&bytes),
+            Ok(ControlFrame::AuthRevoke { .. })
+        ));
+        let seq = store.outbox_next_seq().unwrap();
+        store.outbox_push(seq, &bytes).unwrap();
+        store.mark_withdrawn(&rid).unwrap();
+        record_directory_audit(
+            store.kv(),
+            &DirectoryAuditEvent {
+                at_unix: now,
+                actor: "test".into(),
+                action: "revoke",
+                resource: rref,
+                provider: None,
+                detail: "test revoke".into(),
+            },
+        );
+        // 撤销后：resolve 失败（目录不可见），list 跳过。
+        let directory2 = N2Directory::open_with_store(&store, now).unwrap();
+        assert!(directory2.resolve("dev-svc").is_err());
+        assert!(directory2.name_of_resource(&rid).is_none());
+        // 审计落盘。
+        let entries = crate::n2_store::replay_audit_entries(store.kv()).unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|(t, b)| t == "directory" && b.contains("\"action\":\"revoke\""))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revoke_is_idempotent() {
+        // 幂等：对已撤销资源再次 revoke 不报错（仍 revoked=true）。
+        let dir = temp_node_dir("revoke-idem");
+        let store = N2Store::open(&dir).unwrap();
+        let rid = nexus_domain::ResourceId("res-dev-svc".into());
+        store.mark_withdrawn(&rid).unwrap();
+        store.mark_withdrawn(&rid).unwrap(); // 不 panic
+        assert!(store.is_withdrawn(&rid).unwrap());
+        // 重新 publish 清除 tombstone。
+        store.clear_withdrawn(&rid).unwrap();
+        assert!(!store.is_withdrawn(&rid).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_kind_table() {
+        assert_eq!(parse_kind("service"), Some(ResourceKind::Service));
+        assert_eq!(parse_kind("network"), Some(ResourceKind::Network));
+        assert_eq!(parse_kind("bogus"), None);
+    }
+
+    #[test]
+    fn run_resource_usage_errors_exit_2() {
+        assert_eq!(run_resource(&[], true), 2);
+        assert_eq!(run_resource(&["bogus".to_string()], true), 2);
+        assert_eq!(run_resource(&["show".to_string()], true), 2);
+    }
+
+    #[test]
+    fn ad_json_carries_dual_auth_fields() {
+        // D2 三件套：discoverable_by / use_grants / unavailable 全量渲染。
+        let ad = ProviderAdvertisement {
+            provider: nexus_domain::ProviderId("p1".into()),
+            resource: nexus_domain::ResourceId("res-x".into()),
+            capabilities: vec!["service".into()],
+            locators: vec!["tcp://10.0.0.2:9000".into()],
+            discoverable_by: Discoverability::Restricted {
+                principals: vec!["ed25519:a".into()],
+            },
+            use_grants: vec![UsageGrant {
+                principal: "ed25519:a".into(),
+                operations: vec![nexus_domain::ResourceOperation::Use],
+                not_after_secs: None,
+            }],
+            unavailable: None,
+            issued_at_secs: 1,
+            ttl_secs: 0,
+        };
+        let v = ad_json("dev-svc", ResourceKind::Service, &ad);
+        assert_eq!(v["name"], json!("dev-svc"));
+        assert_eq!(v["kind"], json!("service"));
+        assert_eq!(v["provider"], json!("p1"));
+        assert!(v["discoverable_by"]["restricted"].is_array());
+        assert_eq!(v["use_grants"][0]["principal"], json!("ed25519:a"));
+    }
+}

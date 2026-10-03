@@ -14,7 +14,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use nexus_domain::{
-    LifecyclePhase, NexusError, PlanSnapshot, SessionId, SessionStatus, TerminalOutcome,
+    LifecyclePhase, NexusError, PlanSnapshot, ProviderId, ResourceId, SessionId, SessionStatus,
+    TerminalOutcome,
 };
 
 // ---------- 事件（Worker 只发事件，Owner 消费） ----------
@@ -958,5 +959,776 @@ mod tests {
         // 终态重放 cleanup 后快照仍在（搬运，非重算）。
         assert_eq!(store.records[0].plan_snapshot, Some(snapshot));
         assert_eq!(store.records[0].phase, LifecyclePhase::Disposed);
+    }
+}
+
+// ============================================================================
+// SessionManager（N2 P0-4，D1）：daemon 内唯一的 Session 生命周期 Owner
+// ============================================================================
+//
+// D1 裁决：daemon 内全系统唯一的 SessionManager 持有全部资源 Session 生命周期；
+// Session＝"一次 Resource 使用"而非"一次连接"；提供方侧只做 admission＋租约，
+// 不做第二个领域 Session（两侧各自独立提交 TerminalOutcome，不做分布式共识）。
+//
+// 结构化并发（AGENTS.md §13）：SessionManager 是 Owner；每个 Session 持有一个
+// `CancelToken`（`close()` 触发协作取消）；`TerminalOutcome` 唯一写入者仍是
+// 每个 Session 的 `SessionOwner`（`commit_outcome` 唯一入口），SessionManager
+// 只做编排、不直接写 outcome（§14 Exactly-One Terminal Outcome）。
+//
+// 终态语义（PRODUCT §16.3，D7 修正）：断开≠Failed。
+// - 客户端断开 attach window 内 → 仍 Active（可重附着），outcome 保持 Unfinished；
+// - 窗口外 → `Cancelled`（cancel reason `ClientDetached`）；
+// - provider 消失 → `Failed(ProviderLost)`（明确失败才 Failed）；
+// - 授权撤销 → `Cancelled`（cancel reason `Revoked`）。
+// 连接丢失永不直接变为 Failed；只有明确失败才提交 Failed。
+
+use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
+
+/// 默认重附着窗口（秒）：客户端断开后可重附着的时间。
+/// P0 取值（风险项，见 synth §6）：P0-5 真机验证后调优。
+pub const DEFAULT_ATTACH_WINDOW_SECS: u64 = 300;
+
+/// 取消原因（`Cancelled` 的机器可读注解；`TerminalOutcome::Cancelled` 本身
+/// 为 unit 变体，原因记在事件与视图中，不进 outcome 判别）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelReason {
+    /// 用户/管理面主动关闭（`session close`）。
+    UserClosed,
+    /// 客户端断开超过重附着窗口。
+    ClientDetached,
+    /// 授权被撤销。
+    Revoked,
+}
+
+impl CancelReason {
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UserClosed => "UserClosed",
+            Self::ClientDetached => "ClientDetached",
+            Self::Revoked => "Revoked",
+        }
+    }
+}
+
+/// SessionManager 的结构化错误。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionManagerError {
+    /// 会话不存在。
+    NotFound { session: SessionId },
+    /// 会话已达终态（幂等关闭/重复提交时返回）。
+    AlreadyTerminated {
+        session: SessionId,
+        outcome: TerminalOutcome,
+    },
+    /// 底层记录存储失败。
+    Store { reason: String },
+    /// 会话状态机失败。
+    Session(SessionError),
+}
+
+impl core::fmt::Display for SessionManagerError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotFound { session } => write!(f, "session not found: {session:?}"),
+            Self::AlreadyTerminated { session, outcome } => {
+                write!(f, "session {session:?} already terminated: {outcome:?}")
+            }
+            Self::Store { reason } => write!(f, "session record store failure: {reason}"),
+            Self::Session(err) => write!(f, "session error: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for SessionManagerError {}
+
+impl From<SessionError> for SessionManagerError {
+    fn from(value: SessionError) -> Self {
+        Self::Session(value)
+    }
+}
+
+/// Session 的可观察视图（`session list/watch` 与重附着的读口）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionView {
+    pub id: SessionId,
+    pub resource: ResourceId,
+    pub provider: ProviderId,
+    pub phase: LifecyclePhase,
+    pub outcome: TerminalOutcome,
+    /// 取消原因（仅 `outcome == Cancelled` 时有意义）。
+    pub cancel_reason: Option<CancelReason>,
+    /// 是否可重附着（`Active` 且未达终态）。
+    pub reattachable: bool,
+    /// 内嵌的历史 PlanSnapshot（D3；`None` = 建连时未做规划）。
+    pub plan_snapshot: Option<PlanSnapshot>,
+}
+
+/// SessionManager：Session 生命周期的唯一 Owner（D1）。
+///
+/// - `open`：创建 Session（`Allocating→Active`），内嵌调用方传入的
+///   `PlanSnapshot`（D3：快照在建 Session 时填充、不重算），持久化记录；
+/// - `close`：协作取消＋提交 `Cancelled`＋清理到 `Disposed`＋持久化；
+/// - 终态语义：`note_client_detached` / `sweep_detached` /
+///   `note_provider_lost` / `note_revoked`（PRODUCT §16.3）；
+/// - `attach`：按 SessionId 重附着查询（完成标志 #3）。
+///
+/// 本类型无 I/O、无时钟：时间以参数传入（portable）；持久化经
+/// `SessionRecordStore` 注入。
+pub struct SessionManager {
+    store: Box<dyn SessionRecordStore>,
+    owners: HashMap<String, SessionOwner>,
+    meta: HashMap<String, SessionMeta>,
+    tokens: HashMap<String, CancelToken>,
+    attach_window_secs: u64,
+    id_counter: AtomicU64,
+}
+
+/// SessionManager 持有的非状态机元数据（不进 `SessionOwner`）。
+#[derive(Debug, Clone)]
+struct SessionMeta {
+    resource: ResourceId,
+    provider: ProviderId,
+    plan_snapshot: Option<PlanSnapshot>,
+    cancel_reason: Option<CancelReason>,
+    /// 客户端断开时间（unix 秒）；`None` = 未断开/已重附着。
+    detached_at_unix: Option<u64>,
+}
+
+impl SessionManager {
+    /// 新建（空内存态；`load_from_store` 从持久层恢复）。
+    #[must_use]
+    pub fn new(store: Box<dyn SessionRecordStore>, attach_window_secs: u64) -> Self {
+        Self {
+            store,
+            owners: HashMap::new(),
+            meta: HashMap::new(),
+            tokens: HashMap::new(),
+            attach_window_secs,
+            id_counter: AtomicU64::new(0),
+        }
+    }
+
+    /// 重附着窗口（秒）。
+    #[must_use]
+    pub fn attach_window_secs(&self) -> u64 {
+        self.attach_window_secs
+    }
+
+    /// 从持久层加载全部记录并重建内存态（boot / CLI 每次调用入口）。
+    ///
+    /// 已终态的记录重建 Owner（含 outcome）；未终态的重建为可继续态。
+    /// 加载后调用方应先跑 `reconcile_session_records`（§15）再接受新工作；
+    /// 本方法只做"加载"，不做孤儿分类（分类是 reconcile 的职责）。
+    pub fn load_from_store(&mut self) -> Result<usize, SessionManagerError> {
+        let records = self
+            .store
+            .load()
+            .map_err(|reason| SessionManagerError::Store { reason })?;
+        let count = records.len();
+        for record in records {
+            let key = record.session.0.clone();
+            // P0-4：SessionRecord 未携带 resource/provider（历史记录无此字段）；
+            // 重建时以未知占位，`open` 创建的新记录恒带真实值。
+            let meta = SessionMeta {
+                resource: ResourceId(String::new()),
+                provider: ProviderId(String::new()),
+                plan_snapshot: record.plan_snapshot.clone(),
+                cancel_reason: None,
+                detached_at_unix: None,
+            };
+            let owner = SessionOwner::from_record(&record);
+            self.owners.insert(key.clone(), owner);
+            self.meta.insert(key.clone(), meta);
+            self.tokens.insert(key, CancelToken::new());
+        }
+        Ok(count)
+    }
+
+    /// 当前持有会话数（内存态）。
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.owners.len()
+    }
+
+    /// 是否为空。
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.owners.is_empty()
+    }
+
+    /// 生成新的 SessionId（`sess-<unix秒>-<pid>-<计数>`；跨进程唯一靠 pid，
+    /// 进程内唯一靠计数器）。
+    fn next_session_id(&self) -> SessionId {
+        let n = self.id_counter.fetch_add(1, Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        SessionId(format!("sess-{now}-{}-{n}", std::process::id()))
+    }
+
+    /// 创建 Session（四步闭环之 establish；resolve/plan/authorize 由调用方完成
+    /// 后传入）：`Allocating→Active`，内嵌 `PlanSnapshot`，持久化记录。
+    ///
+    /// 返回新 Session 的真实 Id（`nexus use` 输出此 Id）。
+    pub fn open(
+        &mut self,
+        resource: ResourceId,
+        provider: ProviderId,
+        plan_snapshot: PlanSnapshot,
+    ) -> Result<SessionId, SessionManagerError> {
+        let id = self.next_session_id();
+        let mut owner = SessionOwner::new(id.clone());
+        owner.transition_phase(LifecyclePhase::Active)?;
+        let record = SessionRecord {
+            session: id.clone(),
+            phase: LifecyclePhase::Active,
+            outcome: TerminalOutcome::Unfinished,
+            plan_snapshot: Some(plan_snapshot.clone()),
+        };
+        self.store
+            .save(&record)
+            .map_err(|reason| SessionManagerError::Store { reason })?;
+        let key = id.0.clone();
+        self.owners.insert(key.clone(), owner);
+        self.meta.insert(
+            key.clone(),
+            SessionMeta {
+                resource,
+                provider,
+                plan_snapshot: Some(plan_snapshot),
+                cancel_reason: None,
+                detached_at_unix: None,
+            },
+        );
+        self.tokens.insert(key, CancelToken::new());
+        Ok(id)
+    }
+
+    /// 按 Id 查询视图（`session watch` / 重附着的读口；含历史 PlanSnapshot）。
+    #[must_use]
+    pub fn get(&self, id: &SessionId) -> Option<SessionView> {
+        let key = &id.0;
+        let owner = self.owners.get(key)?;
+        let meta = self.meta.get(key)?;
+        let status = owner.status();
+        let reattachable =
+            status.phase == LifecyclePhase::Active && status.outcome == TerminalOutcome::Unfinished;
+        Some(SessionView {
+            id: id.clone(),
+            resource: meta.resource.clone(),
+            provider: meta.provider.clone(),
+            phase: status.phase,
+            outcome: status.outcome,
+            cancel_reason: meta.cancel_reason.clone(),
+            reattachable,
+            plan_snapshot: meta.plan_snapshot.clone(),
+        })
+    }
+
+    /// 列出全部会话（`session list`）。
+    #[must_use]
+    pub fn list(&self) -> Vec<SessionView> {
+        let mut views: Vec<SessionView> = self
+            .owners
+            .keys()
+            .filter_map(|k| self.get(&SessionId(k.clone())))
+            .collect();
+        views.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        views
+    }
+
+    /// 重附着：按 SessionId 查询（完成标志 #3）；会话不存在 → `NotFound`。
+    ///
+    /// 语义：只要记录存在即可查询（含终态会话的历史）；"可重附着"
+    /// 由视图的 `reattachable` 表达（Active 且未达终态）。
+    pub fn attach(&self, id: &SessionId) -> Result<SessionView, SessionManagerError> {
+        self.get(id).ok_or_else(|| SessionManagerError::NotFound {
+            session: id.clone(),
+        })
+    }
+
+    /// 持久化指定会话的当前状态（内存 → store）。
+    fn persist(&mut self, id: &SessionId) -> Result<(), SessionManagerError> {
+        let key = &id.0;
+        let owner = self
+            .owners
+            .get(key)
+            .ok_or_else(|| SessionManagerError::NotFound {
+                session: id.clone(),
+            })?;
+        let meta = self
+            .meta
+            .get(key)
+            .ok_or_else(|| SessionManagerError::NotFound {
+                session: id.clone(),
+            })?;
+        let status = owner.status();
+        let record = SessionRecord {
+            session: id.clone(),
+            phase: status.phase,
+            outcome: status.outcome,
+            // 快照搬运、不重算（D3）。
+            plan_snapshot: meta.plan_snapshot.clone(),
+        };
+        self.store
+            .save(&record)
+            .map_err(|reason| SessionManagerError::Store { reason })?;
+        Ok(())
+    }
+
+    /// 内部：提交终态（Owner 唯一写入通道；SessionManager 只做编排）。
+    fn commit_terminal(
+        &mut self,
+        id: &SessionId,
+        outcome: TerminalOutcome,
+        cancel_reason: Option<CancelReason>,
+    ) -> Result<SessionView, SessionManagerError> {
+        let key = id.0.clone();
+        let owner = self
+            .owners
+            .get_mut(&key)
+            .ok_or_else(|| SessionManagerError::NotFound {
+                session: id.clone(),
+            })?;
+        match owner.commit_outcome(outcome) {
+            Ok(()) => {}
+            Err(SessionError::AlreadyTerminated { outcome, .. }) => {
+                return Err(SessionManagerError::AlreadyTerminated {
+                    session: id.clone(),
+                    outcome,
+                });
+            }
+            Err(e) => return Err(SessionManagerError::Session(e)),
+        }
+        if let Some(meta) = self.meta.get_mut(&key) {
+            meta.cancel_reason = cancel_reason;
+            meta.detached_at_unix = None;
+        }
+        // Outcome 确定后仍可 cleanup 到 Disposed（§14）。
+        let owner = self.owners.get_mut(&key).expect("just inserted");
+        match owner.phase() {
+            LifecyclePhase::Active => {
+                owner.transition_phase(LifecyclePhase::Draining)?;
+                owner.transition_phase(LifecyclePhase::Disposed)?;
+            }
+            LifecyclePhase::Allocating | LifecyclePhase::Draining => {
+                owner.transition_phase(LifecyclePhase::Disposed)?;
+            }
+            LifecyclePhase::Disposed => {}
+        }
+        self.persist(id)?;
+        Ok(self.get(id).expect("just persisted"))
+    }
+
+    /// 用户/管理面主动关闭：协作取消＋提交 `Cancelled(UserClosed)`。
+    ///
+    /// 已终态 → `AlreadyTerminated`（幂等语义由调用方决定）。
+    pub fn close(
+        &mut self,
+        id: &SessionId,
+        reason: &str,
+    ) -> Result<SessionView, SessionManagerError> {
+        let key = &id.0;
+        let owner = self
+            .owners
+            .get(key)
+            .ok_or_else(|| SessionManagerError::NotFound {
+                session: id.clone(),
+            })?;
+        if owner.committed_outcome().is_some() {
+            return Err(SessionManagerError::AlreadyTerminated {
+                session: id.clone(),
+                outcome: owner.committed_outcome().expect("checked some"),
+            });
+        }
+        // 结构化并发：先请求协作取消（Worker 侧可观测），再由 Owner 提交终态。
+        if let Some(token) = self.tokens.get(key) {
+            token.cancel();
+        }
+        let _ = self
+            .owners
+            .get_mut(key)
+            .expect("checked")
+            .request_cancellation(reason.to_string());
+        self.commit_terminal(
+            id,
+            TerminalOutcome::Cancelled,
+            Some(CancelReason::UserClosed),
+        )
+    }
+
+    /// 客户端断开（PRODUCT §16.3）：记录断开时间，会话**保持 Active**、
+    /// outcome 保持 `Unfinished`（可重附着）。断开≠Failed。
+    ///
+    /// 返回 `true` 表示仍在重附着窗口内（可重附着）。
+    pub fn note_client_detached(
+        &mut self,
+        id: &SessionId,
+        now_unix: u64,
+    ) -> Result<bool, SessionManagerError> {
+        let key = id.0.clone();
+        let owner = self
+            .owners
+            .get(&key)
+            .ok_or_else(|| SessionManagerError::NotFound {
+                session: id.clone(),
+            })?;
+        if owner.committed_outcome().is_some() {
+            return Err(SessionManagerError::AlreadyTerminated {
+                session: id.clone(),
+                outcome: owner.committed_outcome().expect("checked some"),
+            });
+        }
+        if let Some(meta) = self.meta.get_mut(&key) {
+            meta.detached_at_unix = Some(now_unix);
+        }
+        // 关键：不断开即判 Failed；outcome 保持 Unfinished，phase 保持 Active。
+        Ok(true)
+    }
+
+    /// 扫描断开超窗的会话 → 提交 `Cancelled(ClientDetached)`。
+    ///
+    /// 返回本次提交终态的会话 Id 列表（幂等：已终态的不再处理）。
+    pub fn sweep_detached(&mut self, now_unix: u64) -> Vec<SessionId> {
+        let expired: Vec<String> = self
+            .meta
+            .iter()
+            .filter_map(|(k, m)| match m.detached_at_unix {
+                Some(t) if now_unix.saturating_sub(t) >= self.attach_window_secs => Some(k.clone()),
+                _ => None,
+            })
+            .filter(|k| {
+                self.owners
+                    .get(k)
+                    .is_some_and(|o| o.committed_outcome().is_none())
+            })
+            .collect();
+        let mut done = Vec::new();
+        for key in expired {
+            let id = SessionId(key);
+            if self
+                .commit_terminal(
+                    &id,
+                    TerminalOutcome::Cancelled,
+                    Some(CancelReason::ClientDetached),
+                )
+                .is_ok()
+            {
+                done.push(id);
+            }
+        }
+        done
+    }
+
+    /// Provider 消失（PRODUCT §16.3）：明确失败 → 提交 `Failed(ProviderLost)`。
+    ///
+    /// 只有明确失败才 Failed；单纯的连接丢失走 `note_client_detached`
+    ///（保持 Unfinished），不进此方法。
+    pub fn note_provider_lost(
+        &mut self,
+        id: &SessionId,
+        provider: &ProviderId,
+    ) -> Result<SessionView, SessionManagerError> {
+        let view = self.commit_terminal(
+            id,
+            TerminalOutcome::Failed(NexusError::SessionFailed {
+                session: id.clone(),
+                reason: format!("provider lost: {}", provider.0),
+            }),
+            None,
+        )?;
+        Ok(view)
+    }
+
+    /// 授权被撤销（PRODUCT §16.3）：提交 `Cancelled(Revoked)`。
+    pub fn note_revoked(&mut self, id: &SessionId) -> Result<SessionView, SessionManagerError> {
+        self.commit_terminal(id, TerminalOutcome::Cancelled, Some(CancelReason::Revoked))
+    }
+
+    /// `use` 成功路径：提交 `Completed`（Owner 唯一提交）＋清理到 `Disposed`。
+    pub fn complete(&mut self, id: &SessionId) -> Result<SessionView, SessionManagerError> {
+        self.commit_terminal(id, TerminalOutcome::Completed, None)
+    }
+}
+
+#[cfg(test)]
+mod manager_tests {
+    use super::*;
+    use nexus_domain::{ConsideredCandidate, DecisionTrace, Plan, PlanId};
+
+    /// 测试用内存记录存储（与上一个 tests 模块的同名类型独立）。
+    #[derive(Debug, Default)]
+    struct MemStore {
+        records: Vec<SessionRecord>,
+    }
+
+    impl SessionRecordStore for MemStore {
+        fn load(&self) -> Result<Vec<SessionRecord>, String> {
+            Ok(self.records.clone())
+        }
+
+        fn save(&mut self, record: &SessionRecord) -> Result<(), String> {
+            if let Some(slot) = self
+                .records
+                .iter_mut()
+                .find(|r| r.session == record.session)
+            {
+                *slot = record.clone();
+            } else {
+                self.records.push(record.clone());
+            }
+            Ok(())
+        }
+    }
+
+    fn snapshot() -> PlanSnapshot {
+        PlanSnapshot {
+            plan_id: PlanId("abcd1234abcd1234".into()),
+            plan: Plan {
+                resource_id: ResourceId("dev-svc".into()),
+                provider_id: ProviderId("local-dev-1".into()),
+                placement: "local".into(),
+                path: vec!["127.0.0.1:8080".into()],
+                execution_strategy: "direct".into(),
+                extension: None,
+            },
+            decision_trace: DecisionTrace {
+                considered: vec![ConsideredCandidate {
+                    provider: ProviderId("local-dev-1".into()),
+                    rejected_reason: None,
+                    connectivity: None,
+                    measurement: None,
+                    score: Some(1000),
+                    score_breakdown: None,
+                }],
+                selected: ProviderId("local-dev-1".into()),
+            },
+        }
+    }
+
+    fn manager() -> SessionManager {
+        SessionManager::new(Box::new(MemStore::default()), DEFAULT_ATTACH_WINDOW_SECS)
+    }
+
+    fn open_one(mgr: &mut SessionManager) -> SessionId {
+        mgr.open(
+            ResourceId("dev-svc".into()),
+            ProviderId("local-dev-1".into()),
+            snapshot(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn open_embeds_plan_snapshot_and_persists() {
+        let mut mgr = manager();
+        let id = open_one(&mut mgr);
+        assert!(id.0.starts_with("sess-"));
+        // 视图含内嵌快照（D3：建 Session 时填充）。
+        let view = mgr.get(&id).unwrap();
+        assert_eq!(view.phase, LifecyclePhase::Active);
+        assert_eq!(view.outcome, TerminalOutcome::Unfinished);
+        assert_eq!(view.plan_snapshot, Some(snapshot()));
+        assert!(view.reattachable);
+        // 持久化了（store 里有一条 Active/Unfinished 记录）。
+        assert_eq!(mgr.len(), 1);
+    }
+
+    #[test]
+    fn open_generates_unique_ids() {
+        let mut mgr = manager();
+        let a = open_one(&mut mgr);
+        let b = open_one(&mut mgr);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn complete_commits_completed_exactly_once() {
+        let mut mgr = manager();
+        let id = open_one(&mut mgr);
+        let view = mgr.complete(&id).unwrap();
+        assert_eq!(view.outcome, TerminalOutcome::Completed);
+        assert_eq!(view.phase, LifecyclePhase::Disposed);
+        // 第二次提交 → AlreadyTerminated（§14 exactly-once）。
+        let err = mgr.complete(&id);
+        assert!(matches!(
+            err,
+            Err(SessionManagerError::AlreadyTerminated { .. })
+        ));
+    }
+
+    #[test]
+    fn close_commits_cancelled_with_user_reason() {
+        let mut mgr = manager();
+        let id = open_one(&mut mgr);
+        let view = mgr.close(&id, "user requested").unwrap();
+        assert_eq!(view.outcome, TerminalOutcome::Cancelled);
+        assert_eq!(view.cancel_reason, Some(CancelReason::UserClosed));
+        assert_eq!(view.phase, LifecyclePhase::Disposed);
+        // 已终态再 close → AlreadyTerminated（非静默成功）。
+        let err = mgr.close(&id, "again");
+        assert!(matches!(
+            err,
+            Err(SessionManagerError::AlreadyTerminated { .. })
+        ));
+    }
+
+    #[test]
+    fn close_unknown_session_is_not_found() {
+        let mut mgr = manager();
+        let err = mgr.close(&SessionId("sess-nope".into()), "x");
+        assert!(matches!(err, Err(SessionManagerError::NotFound { .. })));
+    }
+
+    #[test]
+    fn client_detach_keeps_session_unfinished_within_window() {
+        // D7 终态语义核心：断开≠Failed——窗口内仍 Active/Unfinished（可重附着）。
+        let mut mgr = manager();
+        let id = open_one(&mut mgr);
+        let still = mgr.note_client_detached(&id, 1000).unwrap();
+        assert!(still);
+        let view = mgr.get(&id).unwrap();
+        assert_eq!(view.phase, LifecyclePhase::Active);
+        assert_eq!(
+            view.outcome,
+            TerminalOutcome::Unfinished,
+            "disconnect must NOT become Failed"
+        );
+        assert!(view.reattachable);
+        // 窗口内 sweep 不提交。
+        assert!(
+            mgr.sweep_detached(1000 + DEFAULT_ATTACH_WINDOW_SECS - 1)
+                .is_empty()
+        );
+        assert_eq!(mgr.get(&id).unwrap().outcome, TerminalOutcome::Unfinished);
+    }
+
+    #[test]
+    fn detach_beyond_window_becomes_cancelled_not_failed() {
+        let mut mgr = manager();
+        let id = open_one(&mut mgr);
+        mgr.note_client_detached(&id, 1000).unwrap();
+        let swept = mgr.sweep_detached(1000 + DEFAULT_ATTACH_WINDOW_SECS);
+        assert_eq!(swept, vec![id.clone()]);
+        let view = mgr.get(&id).unwrap();
+        assert_eq!(view.outcome, TerminalOutcome::Cancelled);
+        assert_eq!(view.cancel_reason, Some(CancelReason::ClientDetached));
+        assert!(!view.reattachable);
+        // 幂等：再次 sweep 不重复。
+        assert!(
+            mgr.sweep_detached(1000 + DEFAULT_ATTACH_WINDOW_SECS + 999)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn provider_lost_commits_failed_with_reason() {
+        // 只有明确失败才 Failed（provider 消失是明确失败）。
+        let mut mgr = manager();
+        let id = open_one(&mut mgr);
+        let view = mgr
+            .note_provider_lost(&id, &ProviderId("local-dev-1".into()))
+            .unwrap();
+        assert!(matches!(view.outcome, TerminalOutcome::Failed(_)));
+        if let TerminalOutcome::Failed(NexusError::SessionFailed { reason, .. }) = view.outcome {
+            assert!(reason.contains("provider lost"));
+        } else {
+            panic!("expected Failed(SessionFailed)");
+        }
+    }
+
+    #[test]
+    fn revoked_commits_cancelled_with_revoked_reason() {
+        let mut mgr = manager();
+        let id = open_one(&mut mgr);
+        let view = mgr.note_revoked(&id).unwrap();
+        assert_eq!(view.outcome, TerminalOutcome::Cancelled);
+        assert_eq!(view.cancel_reason, Some(CancelReason::Revoked));
+    }
+
+    #[test]
+    fn attach_returns_view_with_history_after_close() {
+        // 完成标志 #3：CLI 退出重进按 SessionId 查询状态＋历史 DecisionTrace。
+        // （此处模拟"重进"：新 manager 从同一 store 加载。）
+        let store = MemStore::default();
+        let mut mgr = SessionManager::new(Box::new(store), DEFAULT_ATTACH_WINDOW_SECS);
+        let id = open_one(&mut mgr);
+        mgr.complete(&id).unwrap();
+        // 把 store 交给新 manager（模拟进程重启）。
+        let store2 = std::mem::replace(
+            &mut mgr.store,
+            Box::new(MemStore::default()) as Box<dyn SessionRecordStore>,
+        );
+        let mut mgr2 = SessionManager::new(store2, DEFAULT_ATTACH_WINDOW_SECS);
+        mgr2.load_from_store().unwrap();
+        let view = mgr2.attach(&id).unwrap();
+        assert_eq!(view.outcome, TerminalOutcome::Completed);
+        // 历史 DecisionTrace 可读（非重算：与建连时内嵌的一致）。
+        let trace = &view.plan_snapshot.as_ref().unwrap().decision_trace;
+        assert_eq!(trace.selected.0, "local-dev-1");
+        assert_eq!(trace.considered.len(), 1);
+    }
+
+    #[test]
+    fn attach_unknown_is_not_found() {
+        let mgr = manager();
+        let err = mgr.attach(&SessionId("sess-missing".into()));
+        assert!(matches!(err, Err(SessionManagerError::NotFound { .. })));
+    }
+
+    #[test]
+    fn list_returns_all_sorted() {
+        let mut mgr = manager();
+        let a = open_one(&mut mgr);
+        let b = open_one(&mut mgr);
+        mgr.complete(&a).unwrap();
+        let views = mgr.list();
+        assert_eq!(views.len(), 2);
+        let ids: Vec<&str> = views.iter().map(|v| v.id.0.as_str()).collect();
+        assert!(ids.contains(&a.0.as_str()) && ids.contains(&b.0.as_str()));
+        // 有序（确定性）。
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted);
+    }
+
+    #[test]
+    fn plan_snapshot_carried_not_recomputed_on_persist() {
+        // D3：persist 回写搬运快照；快照内容恒为 open 时传入的值。
+        let mut mgr = manager();
+        let id = open_one(&mut mgr);
+        mgr.note_client_detached(&id, 500).unwrap();
+        // detach 不碰 store；close 会 persist。
+        mgr.close(&id, "test").unwrap();
+        let view = mgr.get(&id).unwrap();
+        assert_eq!(view.plan_snapshot, Some(snapshot()));
+        assert_eq!(
+            view.plan_snapshot.as_ref().unwrap().plan_id.0,
+            "abcd1234abcd1234"
+        );
+    }
+
+    #[test]
+    fn terminal_outcome_has_single_owner() {
+        // §14：Worker 不直接写 outcome；所有提交经 SessionManager 编排 →
+        // SessionOwner::commit_outcome。验证路径：note_provider_lost 后
+        // close 必须 AlreadyTerminated（outcome 已被占）。
+        let mut mgr = manager();
+        let id = open_one(&mut mgr);
+        mgr.note_provider_lost(&id, &ProviderId("p".into()))
+            .unwrap();
+        let err = mgr.close(&id, "late close");
+        assert!(matches!(
+            err,
+            Err(SessionManagerError::AlreadyTerminated { .. })
+        ));
+        // outcome 保持第一次提交的 Failed（不被覆盖）。
+        assert!(matches!(
+            mgr.get(&id).unwrap().outcome,
+            TerminalOutcome::Failed(_)
+        ));
     }
 }

@@ -256,6 +256,27 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         eprintln!("[nexusd] boot-reconcile error: {e}");
     }
 
+    // N2 P0-4（D1）：装配 daemon 内唯一的 SessionManager。
+    //
+    // §15 顺序：N2 会话存储（`<config-dir>/n2/`）加载 → journal 重放 →
+    // `reconcile_session_records`（幂等）→ 接受新工作。SessionManager 是
+    // Session 生命周期的唯一 Owner（§13 结构化并发）；提供方侧只做
+    // admission＋租约，不做第二个领域 Session。P0-4 中 daemon 侧尚无
+    // 跨机建 Session 流量（P0-5），此处装配＋持有实例，boot reconcile 先行。
+    let _n2_session_manager = match assembly::assemble_n2_session_manager(&dir.root) {
+        Ok(mgr) => {
+            eprintln!(
+                "[nexusd] N2 SessionManager assembled ({} sessions loaded)",
+                mgr.len()
+            );
+            Some(Box::new(mgr))
+        }
+        Err(e) => {
+            eprintln!("[nexusd] WARN: N2 SessionManager assembly failed: {e} (degraded)");
+            None
+        }
+    };
+
     // T3：缺 proxy.yaml 且缺 network.toml 且缺 workspace.toml → 拒绝启动（无意义）。
     if loaded.proxy_yaml.is_none()
         && loaded.network_toml.is_none()

@@ -1,187 +1,40 @@
-//! `nexus plan` 命令族（N2 P0-3）：只读规划预览 + `plan explain` 双模式。
+//! `nexus plan` 命令族（N2 P0-3/P0-4）：只读规划预览 + `plan explain` 双模式。
 //!
-//! - `nexus plan <resource>`：resolve＋filter＋score 的纯本地计算，**不建连**。
-//!   本模块零网络 I/O：只调用 `nexus_planner::plan_from_snapshot` 纯函数，
-//!   不开 socket、不调 daemon；"Provider 侧连接计数不变"由构造保证
-//!   （`n2-plan-preview` 场景断言）。
+//! - `nexus plan <resource>`：resolve＋filter＋score 的本地计算，**不建连**。
+//!   P0-4 起目录为 registry-backed（`n2_directory::N2Directory`：静态种子经
+//!   `import_static`＋持久化广告叠加；Presence 语义对齐见该模块）；规划本身仍是
+//!   纯函数（`plan_from_snapshot`），不开 socket、不调 daemon、不建连。
 //! - `nexus plan explain <arg>`：双模式（D3）——
-//!   - `sess-` 前缀：按 SessionId 查历史 PlanSnapshot（真实记录）；
-//!     P0-3 只定义读契约（`nexus_planner::PlanHistory`），Session 持久化在
-//!     P0-4 落地前查无记录 → 结构化 `NOT_FOUND`，**不回退重算**（不伪造历史）；
+//!   - `sess-` 前缀：按 SessionId 查历史 PlanSnapshot（真实记录，读 N2 会话存储）；
+//!     查无 → 结构化 `NOT_FOUND`，**不回退重算**（不伪造历史）；
 //!   - 其他：按资源名做估算，输出显式标注"估算非承诺"。
 //!
-//! P0-3 静态目录：编译内置的演示候选表（D2"P0 static 配置先行"的退化形式；
-//! P0-4 替换为 registry-backed 解析）。本模块不伪装成真实目录：
-//! 输出标注 `directory: "static-demo"`，未知资源名返回结构化 `NotFound`。
+//! 本模块不伪装成真实目录：输出标注 `directory`（见 `n2_directory::DIRECTORY_TAG`），
+//! 未知资源名返回结构化 `NotFound`。
 
-use nexus_domain::{
-    Constraint, Intent, NexusError, PlanSnapshot, ProviderId, ResourceId, ResourceKind,
-    ResourceName,
-};
-use nexus_planner::{
-    ExplainMode, ExplainedPlan, PlanHistory, PlanningSnapshot, classify_explain_arg,
-    plan_from_snapshot,
-};
-use nexus_registry::ProviderRecord;
+use nexus_domain::{NexusError, PlanSnapshot, ResourceId, ResourceKind};
+use nexus_planner::{ExplainMode, ExplainedPlan, PlanHistory, classify_explain_arg};
 use serde_json::{Value, json};
 
-/// 静态目录标记（输出自述，防误解为真实目录）。
-const DIRECTORY_TAG: &str = "static-demo";
+use crate::n2_directory::{DIRECTORY_TAG, N2Directory};
+use crate::n2_store::N2Store;
+use nexus_session::SessionRecordStore as _;
 
-/// 静态候选（编译内置；P0-4 由 registry-backed 解析替换）。
-#[derive(Debug)]
-struct StaticProvider {
-    id: &'static str,
-    placement: &'static str,
-    locator: &'static str,
-    capabilities: &'static [&'static str],
-    present: bool,
-    /// 是否为请求方本地节点（白皮书原则 #4 本地优先的加成对象）。
-    local: bool,
-}
-
-/// 静态资源条目：资源名 → kind（目录属性）＋规划能力约束＋候选。
-#[derive(Debug)]
-struct StaticEntry {
-    name: &'static str,
-    kind: ResourceKind,
-    capability: &'static str,
-    providers: &'static [StaticProvider],
-}
-
-const DIRECTORY: &[StaticEntry] = &[
-    StaticEntry {
-        name: "dev-svc",
-        kind: ResourceKind::Service,
-        capability: "service",
-        providers: &[
-            StaticProvider {
-                id: "local-dev-1",
-                placement: "local",
-                locator: "127.0.0.1:8080",
-                capabilities: &["service"],
-                present: true,
-                local: true,
-            },
-            StaticProvider {
-                id: "remote-dev-1",
-                placement: "region-a",
-                locator: "203.0.113.10:8080",
-                capabilities: &["service"],
-                present: true,
-                local: false,
-            },
-            // 下面两个纯为 DecisionTrace 演示结构化拒绝原因而设。
-            StaticProvider {
-                id: "down-dev-1",
-                placement: "region-b",
-                locator: "203.0.113.11:8080",
-                capabilities: &["service"],
-                present: false,
-                local: false,
-            },
-            StaticProvider {
-                id: "nocap-dev-1",
-                placement: "region-a",
-                locator: "203.0.113.12:8080",
-                capabilities: &["metrics"],
-                present: true,
-                local: false,
-            },
-        ],
-    },
-    StaticEntry {
-        name: "internet-access",
-        kind: ResourceKind::Network,
-        capability: "internet-access",
-        providers: &[
-            StaticProvider {
-                id: "p1",
-                placement: "us-east",
-                locator: "203.0.113.1:51820",
-                capabilities: &["internet-access"],
-                present: true,
-                local: true,
-            },
-            StaticProvider {
-                id: "p2",
-                placement: "eu-west",
-                locator: "203.0.113.2:51820",
-                capabilities: &[],
-                present: true,
-                local: false,
-            },
-        ],
-    },
-];
-
-fn lookup_entry(name: &str) -> Option<&'static StaticEntry> {
-    DIRECTORY.iter().find(|e| e.name == name)
-}
-
-/// resolve：资源名 → (ResourceId, 静态条目)。
+/// 只读规划：registry-backed resolve＋filter＋score，不建连。
 ///
-/// D2：名字本地解析（`ResourceName` 校验），名字≠定位；P0-3 只认识静态目录，
-/// 未知名字 → `NotFound`（P0-4 registry 落地后扩展）。
-fn resolve(name: &str) -> Result<(ResourceId, &'static StaticEntry), NexusError> {
-    let parsed = ResourceName::new(name).map_err(|e| NexusError::NotFound {
-        kind: "resource".to_string(),
-        id: format!("{name} (invalid name: {e:?})"),
-    })?;
-    let entry = lookup_entry(parsed.as_str()).ok_or_else(|| NexusError::NotFound {
-        kind: "resource".to_string(),
-        id: format!(
-            "{name} (no static providers; P0-3 directory is '{DIRECTORY_TAG}', registry-backed resolution lands in P0-4)"
-        ),
-    })?;
-    Ok((ResourceId(parsed.as_str().to_string()), entry))
-}
-
-/// 为静态条目组装规划快照。
-///
-/// P0-3：候选直接由静态表构造为 `ProviderRecord`（含 `present=false` 的离线
-/// 条目——`Registry::candidates()` 按契约只返回在线候选，会吞掉 `not_present`
-/// 的解释价值；P0-4 改为从 Registry 查询时再对齐 Presence 过滤语义）。
-fn snapshot_for(entry: &'static StaticEntry, resource: &ResourceId) -> PlanningSnapshot {
-    let candidates: Vec<ProviderRecord> = entry
-        .providers
-        .iter()
-        .map(|p| ProviderRecord {
-            id: ProviderId(p.id.to_string()),
-            resource: resource.clone(),
-            placement: p.placement.to_string(),
-            locator: p.locator.to_string(),
-            capabilities: p.capabilities.iter().map(|s| (*s).to_string()).collect(),
-            present: p.present,
-        })
-        .collect();
-    let constraints = vec![Constraint {
-        key: "capability".to_string(),
-        value: entry.capability.to_string(),
-    }];
-    let snapshot = PlanningSnapshot::new(candidates, constraints);
-    match entry.providers.iter().find(|p| p.local) {
-        Some(local) => snapshot.with_local_provider(ProviderId(local.id.to_string())),
-        None => snapshot,
-    }
-}
-
-/// 只读规划：resolve＋filter＋score，不建连（纯函数，无 I/O）。
+/// `node_dir` 注入（测试不碰进程环境）；`now_secs` 由调用方时钟提供。
 fn preview_snapshot(
+    node_dir: &std::path::Path,
     name: &str,
-) -> Result<(ResourceId, &'static StaticEntry, PlanSnapshot), NexusError> {
-    let (resource, entry) = resolve(name)?;
-    let snapshot = snapshot_for(entry, &resource);
-    let intent = Intent {
-        profile: "preview".to_string(),
-    };
-    // P0-3 预览无事实测量（不伪造数据；`None` = 显式未知，排序/打分按确定性规则）。
-    let planned = plan_from_snapshot(&resource, &snapshot, &intent, |_| None)?;
-    Ok((
-        resource,
-        entry,
-        PlanSnapshot::from_planned(planned.plan, planned.trace),
-    ))
+    now_secs: u64,
+) -> Result<(ResourceId, ResourceKind, PlanSnapshot), NexusError> {
+    let dir = N2Directory::open(node_dir, now_secs).map_err(|e| NexusError::PersistenceFailed {
+        path: node_dir.display().to_string(),
+        reason: e,
+    })?;
+    let (_rref, resource, snapshot) = dir.preview(name, now_secs)?;
+    let kind = dir.kind_of(name).unwrap_or(ResourceKind::Service);
+    Ok((resource, kind, snapshot))
 }
 
 /// DecisionTrace → JSON（加厚四件套全量渲染）。
@@ -225,16 +78,18 @@ fn trace_json(snapshot: &PlanSnapshot) -> Value {
 }
 
 /// PlanSnapshot → `plan` JSON 对象（`n2-plan-preview` 冻结字段：resource /
-/// plan_id / provider / read_only）。
+/// plan_id / provider / read_only）。`display_name` 为人类可读名（D2：
+///
+/// 不透明 ResourceId 不直接展示给用户）。
 fn plan_json(
-    resource: &ResourceId,
+    display_name: &str,
     kind: ResourceKind,
     snapshot: &PlanSnapshot,
     read_only: bool,
 ) -> Value {
     let plan = &snapshot.plan;
     json!({
-        "resource": resource.0,
+        "resource": display_name,
         "kind": kind.as_str(),
         "plan_id": snapshot.plan_id.as_str(),
         "provider": plan.provider_id.0,
@@ -255,30 +110,43 @@ fn fail_json(err: &NexusError) -> Value {
     })
 }
 
-/// P0-3 的 `PlanHistory` 读口：Session 持久化未落地（P0-4），恒返回 `None`。
-///
-/// 命名并保留此类型：读契约（key 形如 `plan-history/<session-id>`、查无→None）
-/// 已冻结，P0-4 的 SessionManager 只需实现写口；CLI 的双模式分发逻辑现在
-/// 就可以被单测锁定。
-struct P03PlanHistory;
+/// P0-4 的 `PlanHistory` 读口：从 N2 会话存储读 `SessionRecord.plan_snapshot`
+///（真实历史记录；查无 → `None`，不回退重算）。
+struct N2PlanHistory<'a> {
+    store: &'a N2Store,
+}
 
-impl PlanHistory for P03PlanHistory {
-    fn lookup(&self, _session: &nexus_domain::SessionId) -> Option<PlanSnapshot> {
-        // P0-3：无 Session 持久化，无历史可读。P0-4 写入 `SessionRecord.plan_snapshot` 后替换。
-        None
+impl PlanHistory for N2PlanHistory<'_> {
+    fn lookup(&self, session: &nexus_domain::SessionId) -> Option<PlanSnapshot> {
+        let sessions = self.store.sessions();
+        sessions
+            .load()
+            .ok()?
+            .into_iter()
+            .find(|r| r.session == *session)
+            .and_then(|r| r.plan_snapshot)
     }
+}
+
+/// 当前 unix 时间（秒）。
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// `nexus plan <resource>`：只读预览（resolve＋filter＋score，不建连）。
 fn run_preview(name: &str, json_mode: bool) -> i32 {
-    match preview_snapshot(name) {
-        Ok((resource, entry, snapshot)) => {
+    let node_dir = crate::node_cli::node_dir();
+    match preview_snapshot(&node_dir, name, now_secs()) {
+        Ok((_resource, kind, snapshot)) => {
             let out = json!({
                 "verdict": "PASS",
                 "command": "plan",
                 "directory": DIRECTORY_TAG,
                 "read_only": true,
-                "plan": plan_json(&resource, entry.kind, &snapshot, true),
+                "plan": plan_json(name, kind, &snapshot, true),
                 "trace": trace_json(&snapshot),
             });
             render(&out, json_mode);
@@ -293,21 +161,33 @@ fn run_preview(name: &str, json_mode: bool) -> i32 {
 
 /// `nexus plan explain <arg>`：双模式。
 fn run_explain(arg: &str, json_mode: bool) -> i32 {
+    let node_dir = crate::node_cli::node_dir();
     match classify_explain_arg(arg) {
         ExplainMode::History => {
-            // 历史模式：读真实记录；查无 → 结构化 NOT_FOUND，不回退重算。
-            let session = nexus_domain::SessionId(arg.to_string());
-            match P03PlanHistory.lookup(&session) {
+            // 历史模式：读 N2 会话存储的真实记录；查无 → 结构化 NOT_FOUND，不回退重算。
+            let history = match N2Store::open(&node_dir) {
+                Ok(store) => N2PlanHistory { store: &store }
+                    .lookup(&nexus_domain::SessionId(arg.to_string())),
+                Err(_) => None,
+            };
+            match history {
                 Some(snapshot) => {
                     let explained = ExplainedPlan::history(snapshot);
-                    render(&explain_json(&explained, None), json_mode);
+                    // 历史快照的 resource_id 为不透明 Id；反查人类可读名用于展示。
+                    let display = N2Directory::open(&node_dir, now_secs())
+                        .ok()
+                        .and_then(|d| d.name_of_resource(&explained.snapshot.plan.resource_id));
+                    render(
+                        &explain_json(&explained, None, display.as_deref()),
+                        json_mode,
+                    );
                     0
                 }
                 None => {
                     let err = NexusError::NotFound {
                         kind: "session-history".to_string(),
                         id: format!(
-                            "{arg} (no plan history recorded; session persistence lands in P0-4, refusing to fabricate history)"
+                            "{arg} (no plan history recorded for this session; refusing to fabricate history)"
                         ),
                     };
                     render(&fail_json(&err), json_mode);
@@ -317,13 +197,13 @@ fn run_explain(arg: &str, json_mode: bool) -> i32 {
         }
         ExplainMode::Estimate => {
             // 估算模式：按当前快照重算，显式标注"估算非承诺"。
-            match preview_snapshot(arg) {
-                Ok((resource, entry, snapshot)) => {
+            match preview_snapshot(&node_dir, arg, now_secs()) {
+                Ok((resource, kind, snapshot)) => {
                     let explained = ExplainedPlan::estimate(snapshot);
-                    let mut out = explain_json(&explained, Some(entry.kind));
+                    let mut out = explain_json(&explained, Some(kind), Some(arg));
                     if let Some(obj) = out.as_object_mut() {
                         obj.insert("resource".to_string(), json!(resource.0));
-                        obj.insert("kind".to_string(), json!(entry.kind.as_str()));
+                        obj.insert("kind".to_string(), json!(kind.as_str()));
                         obj.insert("directory".to_string(), json!(DIRECTORY_TAG));
                     }
                     render(&out, json_mode);
@@ -338,7 +218,11 @@ fn run_explain(arg: &str, json_mode: bool) -> i32 {
     }
 }
 
-fn explain_json(explained: &ExplainedPlan, entry_kind: Option<ResourceKind>) -> Value {
+fn explain_json(
+    explained: &ExplainedPlan,
+    entry_kind: Option<ResourceKind>,
+    display_name: Option<&str>,
+) -> Value {
     // kind 展示：优先使用目录条目的权威 kind（估算模式，与外层 kind 一致）；
     // 历史模式无目录条目时从 plan extension 反推（仅展示）。
     let kind = match entry_kind {
@@ -351,18 +235,18 @@ fn explain_json(explained: &ExplainedPlan, entry_kind: Option<ResourceKind>) -> 
             None => ResourceKind::Device,
         },
     };
+    // 展示名：调用方传入（估算模式为用户输入名；历史模式为反查名），
+    // 缺省回退到不透明 Id（不伪造映射）。
+    let display = display_name
+        .map(String::from)
+        .unwrap_or_else(|| explained.snapshot.plan.resource_id.0.clone());
     json!({
         "verdict": "PASS",
         "command": "plan explain",
         "mode": explained.mode.as_str(),
         "commitment": explained.commitment_note(),
         "plan_id": explained.plan_id().as_str(),
-        "plan": plan_json(
-            &explained.snapshot.plan.resource_id,
-            kind,
-            &explained.snapshot,
-            true,
-        ),
+        "plan": plan_json(&display, kind, &explained.snapshot, true),
         "trace": trace_json(&explained.snapshot),
     })
 }
@@ -428,13 +312,24 @@ pub fn run_plan(args: &[String], json_mode: bool) -> i32 {
 mod tests {
     use super::*;
 
+    fn temp_node_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("plan-cli-test-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn preview_dev_svc_selects_local_and_is_read_only() {
-        let (resource, entry, snapshot) = preview_snapshot("dev-svc").unwrap();
-        assert_eq!(resource.0, "dev-svc");
+        let dir = temp_node_dir("preview");
+        let (resource, kind, snapshot) = preview_snapshot(&dir, "dev-svc", 1000).unwrap();
+        // 不透明 Id（D2）；展示用人类可读名。
+        assert_eq!(resource.0, "res-dev-svc");
+        assert_eq!(kind, ResourceKind::Service);
         // 本地优先：local-dev-1（locality +1000）胜过 remote-dev-1。
         assert_eq!(snapshot.plan.provider_id.0, "local-dev-1");
-        let plan = plan_json(&resource, entry.kind, &snapshot, true);
+        let plan = plan_json("dev-svc", kind, &snapshot, true);
         assert_eq!(plan["resource"], json!("dev-svc"));
         assert_eq!(plan["read_only"], json!(true));
         assert!(!plan["plan_id"].as_str().unwrap().is_empty());
@@ -461,8 +356,9 @@ mod tests {
     #[test]
     fn preview_plan_id_is_stable_across_calls() {
         // D3：同一输入 → 同一 PlanId（跨调用一致；FNV 无随机种子，跨运行亦一致）。
-        let (_, _, a) = preview_snapshot("dev-svc").unwrap();
-        let (_, _, b) = preview_snapshot("dev-svc").unwrap();
+        let dir = temp_node_dir("planid");
+        let (_, _, a) = preview_snapshot(&dir, "dev-svc", 1000).unwrap();
+        let (_, _, b) = preview_snapshot(&dir, "dev-svc", 1000).unwrap();
         assert_eq!(a.plan_id, b.plan_id);
         assert_eq!(
             a.plan_id,
@@ -472,7 +368,8 @@ mod tests {
 
     #[test]
     fn preview_unknown_resource_is_not_found() {
-        let err = preview_snapshot("no-such-resource").unwrap_err();
+        let dir = temp_node_dir("notfound");
+        let err = preview_snapshot(&dir, "no-such-resource", 1000).unwrap_err();
         assert!(matches!(err, NexusError::NotFound { .. }));
         let v = fail_json(&err);
         assert_eq!(v["verdict"], json!("FAIL"));
@@ -482,7 +379,8 @@ mod tests {
     #[test]
     fn preview_invalid_name_is_rejected() {
         // 名字含非法字符 → NotFound（不 panic）。
-        assert!(preview_snapshot("foo/bar").is_err());
+        let dir = temp_node_dir("badname");
+        assert!(preview_snapshot(&dir, "foo/bar", 1000).is_err());
     }
 
     #[test]
@@ -494,24 +392,71 @@ mod tests {
 
     #[test]
     fn explain_session_id_without_history_is_not_found_not_fabricated() {
-        // P0-3：`plan explain <session-id>` 查无历史 → NOT_FOUND，不回退重算。
+        // `plan explain <session-id>` 查无历史 → NOT_FOUND，不回退重算。
+        let dir = temp_node_dir("nohistory");
+        let store = N2Store::open(&dir).unwrap();
         let session = nexus_domain::SessionId("sess-n2-e4-1".to_string());
-        assert!(P03PlanHistory.lookup(&session).is_none());
+        assert!(N2PlanHistory { store: &store }.lookup(&session).is_none());
         assert_eq!(classify_explain_arg("sess-n2-e4-1"), ExplainMode::History);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explain_history_reads_real_snapshot() {
+        // P0-4：写入一条会话记录后，`plan explain <session-id>` 读到真实历史。
+        use nexus_domain::{DecisionTrace, Plan};
+        use nexus_session::SessionRecord;
+        let dir = temp_node_dir("history");
+        let store = N2Store::open(&dir).unwrap();
+        let snapshot = PlanSnapshot {
+            plan_id: nexus_domain::PlanId("hist001hist001hist".into()),
+            plan: Plan {
+                resource_id: ResourceId("res-dev-svc".into()),
+                provider_id: nexus_domain::ProviderId("local-dev-1".into()),
+                placement: "local".into(),
+                path: vec!["127.0.0.1:8080".into()],
+                execution_strategy: "direct".into(),
+                extension: None,
+            },
+            decision_trace: DecisionTrace {
+                considered: vec![],
+                selected: nexus_domain::ProviderId("local-dev-1".into()),
+            },
+        };
+        let mut sessions = store.sessions();
+        sessions
+            .save(&SessionRecord {
+                session: nexus_domain::SessionId("sess-hist-1".into()),
+                phase: nexus_domain::LifecyclePhase::Active,
+                outcome: nexus_domain::TerminalOutcome::Completed,
+                plan_snapshot: Some(snapshot),
+            })
+            .unwrap();
+        let found = N2PlanHistory { store: &store }
+            .lookup(&nexus_domain::SessionId("sess-hist-1".into()))
+            .expect("history must be found");
+        // 历史真实记录：plan_id 与写入一致（非重算）。
+        assert_eq!(found.plan_id.0, "hist001hist001hist");
+        let explained = ExplainedPlan::history(found);
+        assert_eq!(explained.mode, ExplainMode::History);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn explain_json_carries_mode_and_commitment() {
-        let (_, entry, snapshot) = preview_snapshot("dev-svc").unwrap();
+        let dir = temp_node_dir("explainjson");
+        let (_, kind, snapshot) = preview_snapshot(&dir, "dev-svc", 1000).unwrap();
         let explained = ExplainedPlan::estimate(snapshot);
-        let v = explain_json(&explained, Some(entry.kind));
+        let v = explain_json(&explained, Some(kind), Some("dev-svc"));
         assert_eq!(v["mode"], json!("estimate"));
         assert!(v["commitment"].as_str().unwrap().contains("估算非承诺"));
         assert_eq!(v["plan_id"], json!(explained.plan_id().as_str()));
         // review-n2-p03 WARN-2：explain 也是只读（不建连），read_only 必须为 true；
         // 内层 plan.kind 必须与外层 kind 一致（都来自目录条目）。
         assert_eq!(v["plan"]["read_only"], json!(true));
-        assert_eq!(v["plan"]["kind"], json!(entry.kind.as_str()));
+        assert_eq!(v["plan"]["kind"], json!(kind.as_str()));
+        assert_eq!(v["plan"]["resource"], json!("dev-svc"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

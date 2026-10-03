@@ -19,6 +19,13 @@ pub mod geoip_sources;
 pub mod localapi_client;
 /// Auto-Mesh 自动挡组网编排器（Phase 1：自动打洞 + 断线重连）。
 pub mod mesh;
+/// N2 P0-4：registry-backed 资源目录（静态种子＋持久化广告；Presence 语义对齐）。
+pub mod n2_directory;
+/// N2 P0-4 D6：本节点 ed25519 授权身份（Principal 派生源）。
+pub mod n2_identity;
+/// N2 P0-4：FileKvStore-backed 的 Session / Grant / Registry / 审计持久层
+///（组合根装配点，被 CLI 与 nexusd 共用）。
+pub mod n2_store;
 /// `nexus network` 命令族（M6）：N1 Universal Connectivity 前台装配
 ///（Composition Root：n1 portable core + fabric/path/discovery/platform-linux）。
 pub mod network;
@@ -31,11 +38,17 @@ pub mod pair_cli;
 /// N2 P0-3：`nexus plan` 只读预览 + `plan explain` 双模式（进程内，无 I/O）。
 pub mod plan_cli;
 pub mod provider_fetcher;
+/// `nexus resource` 命令族（N2 P0-4）：list / show / publish / revoke。
+pub mod resource_cli;
 pub mod schedule_cli;
+/// `nexus session` 命令族（N2 P0-4）：list / watch / close（重附着）。
+pub mod session_cli;
 pub mod strategy_watcher;
 pub mod subnet_cli;
 /// §11.17 订阅节点在线更新拉取器（HTTP 拉取 + 解析合并 + 热生效 + 结构化并发 Owner）。
 pub mod subscription_updater;
+/// `nexus use` 命令族（N2 P0-4，D4）：四步闭环（resolve→plan→authorize→establish）。
+pub mod use_cli;
 
 use nexus_domain::{
     LifecyclePhase, NexusError, ProviderId, ResourceId, SessionId, TerminalOutcome,

@@ -51,6 +51,18 @@ const OP_MANAGE: u8 = 1;
 /// 字段与 `Grant{resource, principal, operations, not_after}` 一一对应
 /// （`principal` 在 registry 侧以字符串承载，避免 registry → auth 依赖边）；
 /// 权威的授权判定仍在提供方侧 grant 表，**公告 ≠ 授权**。
+///
+/// D2 例外（P0-4 复核，见 MODULE.md"契約張力裁决"）：`resource` 为
+/// `ResourceRef{workspace, name}`（人类可读名进传输）。
+/// 这**不是** D2"人类可读名不出传输层"的违反——该规则约束的是**寻址/查询路径**
+/// （请求方不得把人类可读名当地址发出去做解析；`ResourceQuery` 因此只带不透明
+/// `ResourceId`）。而 AUTH_GRANT/AUTH_REVOKE 是**提供方→请求方**的授权状态公告，
+/// 其中的 `ResourceRef` 是提供方**自己命名空间**内的 grant 表键
+/// （`{workspace, name}`，人类可运维），不是地址解析键；请求方收到后
+/// 用自己本地解析的 `ResourceId`（经广告通道已持有的映射）做关联，
+/// 永不把收到的名字当地址用。改用 `ResourceId` 的替代方案被否决：
+/// 提供方 grant 表本就以 `ResourceRef` 为键，强行换 Id 需要提供方维护
+/// 一套它没有的反向映射，且会把人类可运维的 grant 管理与线上传告割裂。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantAnnouncement {
     /// 授权目标资源（提供方本地命名）。
@@ -80,11 +92,18 @@ pub enum ControlFrame {
         resource: ResourceId,
     },
     /// 提供方 → 请求方：授权授予公告（grant 表变更推送）。
+    ///
+    /// D2 例外（P0-4 复核）：`announcement.resource` 为提供方命名空间内的
+    /// `ResourceRef`（见 `GrantAnnouncement` 文档）；请求方只做本地关联，
+    /// 不做地址解析。
     AuthGrant {
         /// 授权公告。
         announcement: GrantAnnouncement,
     },
     /// 提供方 → 请求方：授权撤销公告。
+    ///
+    /// D2 例外（P0-4 复核）：`resource` 为提供方命名空间内的 `ResourceRef`
+    ///（同 `AuthGrant`）；请求方只做本地关联，不做地址解析。
     AuthRevoke {
         /// 撤销目标资源（提供方本地命名）。
         resource: ResourceRef,
@@ -849,6 +868,40 @@ mod tests {
             "人类可读名不得出现在传输字节里"
         );
         assert!(as_lossy.contains("res-9f2"), "不透明 Id 在传输字节里");
+    }
+
+    #[test]
+    fn auth_revoke_carries_provider_namespaced_ref_exception() {
+        // P0-4 D2 例外：AUTH_REVOKE 的 ResourceRef 是提供方命名空间内的
+        // grant 表键（人类可运维），不是地址解析键——名字在此帧是合法的。
+        // 与 human_readable_name_never_goes_on_wire 的边界：QUERY 不得带名
+        //（寻址路径），REVOKE 可带名（授权公告路径，请求方只做本地关联）。
+        let frame = ControlFrame::AuthRevoke {
+            resource: name_ref(),
+            principal: "ed25519:abc".into(),
+        };
+        let bytes = encode_control_frame(&frame).unwrap();
+        let as_lossy = String::from_utf8_lossy(&bytes);
+        // name_ref() 的 workspace/name 出现在字节里（例外，非违反）。
+        assert!(
+            as_lossy.contains("ws1"),
+            "provider 命名空间 workspace 在帧里"
+        );
+        assert!(
+            as_lossy.contains("dev-web"),
+            "provider 命名空间 name 在帧里"
+        );
+        // roundtrip：解码回的仍是 ResourceRef（非不透明 Id）。
+        match decode_control_frame(&bytes).unwrap() {
+            ControlFrame::AuthRevoke {
+                resource,
+                principal,
+            } => {
+                assert_eq!(resource, name_ref());
+                assert_eq!(principal, "ed25519:abc");
+            }
+            other => panic!("expected AuthRevoke, got {other:?}"),
+        }
     }
 
     // ---------- 内存双工通道（测试替身；portable crate 内无 I/O） ----------

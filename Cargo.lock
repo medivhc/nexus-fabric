@@ -724,6 +724,7 @@ dependencies = [
  "nexus-workspace",
  "nexus-workspace-intel",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-native-certs",
  "serde",

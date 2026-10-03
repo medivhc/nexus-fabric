@@ -58,6 +58,26 @@
   `PlanSnapshot{plan, decision_trace}`；Plan 可重算、不独立持久化；reconcile 回写时
   原样搬运、不重算；P0-4 的 SessionManager 在建 Session 时填充（`None` = 旧记录）。
 
+N2 P0-4 增补（SessionManager，D1/D4/D7）：
+
+- `SessionManager`：Session 生命周期的**唯一 Owner**（§13 结构化并发，daemon
+  组合根装配唯一实例；提供方侧只做 admission＋租约，不另建领域 Session）。
+  `open`（PlanSnapshot 内嵌＋持久化）/ `get` / `list` / `attach` /
+  `close`（→Cancelled）/ `complete` / `note_client_detached` /
+  `sweep_detached`（attach window 外→Cancelled(ClientDetached)）/
+  `note_provider_lost`（→Failed）/ `note_revoked`（→Cancelled(Revoked)）。
+- 终态语义（D7）：断开 ≠ Failed——连接丢失的 Session 终态为 **Unfinished**
+  （可重连；attach window 内保持 Active/Unfinished），只有明确失败才 Failed；
+  `TerminalOutcome` 唯一 Owner（§14，`SessionManager` 经 `commit_outcome`）。
+- Attach window：默认 `DEFAULT_ATTACH_WINDOW_SECS = 300`；CLI 退出重进后
+  可按 `SessionId` `attach` 查询状态＋历史 `DecisionTrace`（`nexus session list/watch`）。
+- `SessionRecordStore` 持久化由 Composition Root 注入
+  （`apps/nexus` 的 `KvSessionRecordStore`：FileKvStore 落盘）。
+- Deletion Test（AGENTS.md §12）：SessionManager 过了——它是 §13 要求的
+  Owner 语义（Cancellation/Join/Reap 归属）＋ §14 的 Outcome 唯一写入者的
+  具象化；删掉它改"直接操作 SessionRecordStore"，会失去 Outcome 唯一写入点
+  和 attach window 状态机的独立变化维度。
+
 ## Verification
 
 最低：

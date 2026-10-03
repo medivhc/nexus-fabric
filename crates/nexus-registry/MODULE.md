@@ -74,6 +74,17 @@ N2 P0-2 增补（`contract: e02ef53829a39d4cada00266afa46ee87f6539364185b177888a
   `nexus_transport::FrameStream` 适配）、`AuthenticatedPeer`、
   `ControlChannel::established`（构造即要求已认证对端）、`ChannelError`。
 
+N2 P0-4 增补（契约张力裁决：AUTH_GRANT/AUTH_REVOKE 的 `ResourceRef`）：
+- 决议：**契约文本补例外**（不改帧为 `ResourceId`）。
+- D2"人类可读名不出传输层"约束的是**寻址/查询路径**（请求方不得把人类可读名
+  当地址发送；`ResourceQuery` 只带不透明 `ResourceId`，`human_readable_name_never_goes_on_wire`
+  测试锁定）。`AuthGrant`/`AuthRevoke` 是**提供方→请求方**的授权状态公告，
+  其 `ResourceRef` 为提供方命名空间内的 grant 表键（人类可运维），非地址解析键；
+  请求方只做本地关联（经广告通道已持有的 `ResourceId` 映射），不做地址解析。
+- 否决"改用 `ResourceId`"的理由：提供方 grant 表本就以 `ResourceRef` 为键，
+  强行换 Id 需提供方维护其没有的反向映射，且割裂人类可运维的 grant 管理与线上传告。
+- 详见 `control_frame.rs` 中 `GrantAnnouncement` 的 D2 例外文档。
+
 ## Verification
 
 最低：

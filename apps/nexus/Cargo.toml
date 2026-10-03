@@ -47,6 +47,9 @@ serde = { version = "1", default-features = false, features = ["derive", "std"] 
 serde_json = { version = "1", default-features = false, features = ["std"] }
 # D8：LocalAPI bearer token 生成（32 随机字节）；纯随机源，无其他用途。
 getrandom = { version = "0.2", default-features = false }
+# N2 P0-4 D6：ed25519 授权身份密钥对（ring 已在树内：nexus-discovery 配对协议、
+# nexus-fabric PeerId-pinning 在用；此处仅用 Ed25519KeyPair::from_seed_unchecked）。
+ring = { version = "0.17", default-features = false }
 toml = "0.8"
 # mDNS 组合根 socket 装配（bind 5353 + SO_REUSEADDR + 加入组播组）；
 # std 无法设置 SO_REUSEADDR。D-D-1 评审批准，仅限组合根（apps/nexus）使用，

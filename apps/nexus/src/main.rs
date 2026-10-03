@@ -46,7 +46,11 @@ nexus — Nexus 统一 Resource Fabric 控制面 CLI（瘦客户端）
   status                                  总体状态
   plan <resource>                       只读规划预览（resolve＋filter＋score，不建连）
   plan explain <resource|session-id>     Plan 决策解释（双模式：历史记录 / 估算非承诺）
-  session watch <session-id>              观察 Session 状态
+  use <resource>                          N2 资源访问入口（resolve→plan→authorize→establish）
+  session list|watch <id>|close <id>      会话管理（状态查询＋历史 DecisionTrace＋关闭）
+  resource list|show <name>               资源目录（list / show）
+  resource publish|revoke                 资源发布 / 撤销发布
+  session watch <session-id>              观察 Session 状态（N2 语义；§9 daemon 路由保留）
   connectivity status                     连接状态
   connectivity candidates                 候选 Provider
   connectivity probe <target>             探测目标可达性
@@ -238,6 +242,19 @@ fn run(args: &[String]) -> i32 {
     // 规划预览（N2 P0-3；纯本地 resolve＋filter＋score，不建连，不经过 daemon）。
     if args[0].as_str() == "plan" {
         return nexus::plan_cli::run_plan(&args[1..], json_mode);
+    }
+    // 资源访问四步闭环（N2 P0-4，D4；进程内 N2 存储，不经过 daemon）。
+    if args[0].as_str() == "use" {
+        return nexus::use_cli::run_use(&args[1..], json_mode);
+    }
+    // 会话管理（N2 P0-4；进程内 N2 存储；`session watch` 的 N2 语义在此，
+    // daemon 的 /localapi/v0/session/watch 保留 §9 冻结行为）。
+    if args[0].as_str() == "session" {
+        return nexus::session_cli::run_session(&args[1..], json_mode);
+    }
+    // 资源目录管理（N2 P0-4；进程内 N2 存储，不经过 daemon）。
+    if args[0].as_str() == "resource" {
+        return nexus::resource_cli::run_resource(&args[1..], json_mode);
     }
 
     let command = match parse_command(&args) {
