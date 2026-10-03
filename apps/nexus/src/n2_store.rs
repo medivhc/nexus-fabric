@@ -1148,58 +1148,6 @@ impl N2Store {
     }
 }
 
-// ============================================================================
-// 撤销 tombstone（`resource revoke` 后目录不再列出；静态种子重导入时跳过）
-// ============================================================================
-
-const WITHDRAWN_PREFIX: &str = "n2/withdrawn/";
-
-impl N2Store {
-    fn withdrawn_key(resource: &ResourceId) -> String {
-        format!("{WITHDRAWN_PREFIX}{}", resource.0)
-    }
-
-    /// 标记资源已撤销（tombstone；幂等）。
-    pub fn mark_withdrawn(&self, resource: &ResourceId) -> Result<(), String> {
-        self.kv
-            .put(
-                &Self::withdrawn_key(resource),
-                now_unix().to_string().as_bytes(),
-            )
-            .map_err(|e| format!("mark withdrawn: {e}"))?;
-        Ok(())
-    }
-
-    /// 清除撤销标记（重新 publish 时）。
-    pub fn clear_withdrawn(&self, resource: &ResourceId) -> Result<(), String> {
-        self.kv
-            .delete(&Self::withdrawn_key(resource))
-            .map_err(|e| format!("clear withdrawn: {e}"))?;
-        Ok(())
-    }
-
-    /// 资源是否被撤销。
-    pub fn is_withdrawn(&self, resource: &ResourceId) -> Result<bool, String> {
-        Ok(self
-            .kv
-            .get(&Self::withdrawn_key(resource))
-            .map_err(|e| format!("check withdrawn: {e}"))?
-            .is_some())
-    }
-
-    /// 列出全部已撤销资源。
-    pub fn load_withdrawn(&self) -> Result<Vec<ResourceId>, String> {
-        let mut out = Vec::new();
-        let keys = self.kv.list().map_err(|e| format!("list withdrawn: {e}"))?;
-        for key in keys {
-            if let Some(id_part) = key.strip_prefix(WITHDRAWN_PREFIX) {
-                out.push(ResourceId(id_part.to_string()));
-            }
-        }
-        Ok(out)
-    }
-}
-
 /// 本地 actor 标识（审计用；节点未初始化时为空串，不伪造）。
 pub fn local_actor(node_dir: &Path) -> String {
     let kv = match FileKvStore::open(node_dir) {

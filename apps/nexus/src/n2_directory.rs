@@ -148,7 +148,6 @@ pub struct N2Directory {
     capabilities: HashMap<String, String>,
     placements: HashMap<String, String>,
     local_providers: HashMap<String, ProviderId>,
-    withdrawn: Vec<ResourceId>,
 }
 
 impl N2Directory {
@@ -233,13 +232,8 @@ impl N2Directory {
             );
         }
 
-        // 4. 撤销 tombstone：已撤销资源不再列出（静态种子重导入后剔除）。
-        let withdrawn = store.load_withdrawn()?;
-        for w in &withdrawn {
-            for ad in registry.lookup_ads(w, now_secs) {
-                registry.withdraw_ad(&ad.provider, w);
-            }
-        }
+        // 注：revoke 直接从持久化名字表/广告删除（`resource_cli::run_revoke`），
+        // 此处无需 tombstone——静态种子是另一 provider 的广告，revoke 后自然重现。
 
         Ok(Self {
             registry,
@@ -248,7 +242,6 @@ impl N2Directory {
             capabilities,
             placements,
             local_providers,
-            withdrawn,
         })
     }
 
@@ -267,12 +260,6 @@ impl N2Directory {
                 kind: "resource".to_string(),
                 id: format!("{name} (not in N2 directory '{DIRECTORY_TAG}')"),
             })?;
-        if self.withdrawn.contains(&id) {
-            return Err(NexusError::NotFound {
-                kind: "resource".to_string(),
-                id: format!("{name} (revoked; no longer listed)"),
-            });
-        }
         Ok((rref, id))
     }
 
@@ -367,9 +354,6 @@ impl N2Directory {
     /// （条目少，P0 可接受）。
     #[must_use]
     pub fn name_of_resource(&self, id: &ResourceId) -> Option<String> {
-        if self.withdrawn.contains(id) {
-            return None;
-        }
         self.kinds
             .keys()
             .find(|n| {

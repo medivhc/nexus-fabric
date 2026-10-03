@@ -330,10 +330,7 @@ fn run_publish(args: &[String], json_mode: bool) -> i32 {
         return 0;
     }
     // 重新发布清除撤销 tombstone（幂等）。
-    if let Err(e) = store.clear_withdrawn(&resource_id) {
-        render(&store_fail(e), json_mode);
-        return 0;
-    }
+
     // 目录审计（P0-2 评审遗留）。
     record_directory_audit(
         store.kv(),
@@ -450,10 +447,7 @@ fn run_revoke(name: &str, json_mode: bool) -> i32 {
             withdrawn_any = true;
         }
     }
-    if let Err(e) = store.mark_withdrawn(&resource_id) {
-        render(&store_fail(e), json_mode);
-        return 0;
-    }
+    // 从持久化名字表/广告删除（静态种子如有则自然重现，无需 tombstone）。
 
     // 3. 目录审计（P0-2 评审遗留）。
     record_directory_audit(
@@ -524,6 +518,7 @@ pub fn run_resource(args: &[String], json_mode: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nexus_domain::ResourceId;
     use nexus_registry::UsageGrant;
 
     fn temp_node_dir(tag: &str) -> std::path::PathBuf {
@@ -552,17 +547,29 @@ mod tests {
     }
 
     #[test]
-    fn revoke_marks_withdrawn_and_queues_frame() {
+    fn revoke_removes_published_ad_and_queues_frame() {
         // n2-resource-revoke 形状：revoked=true；outbox 有 AUTH_REVOKE 帧；
-        // 目录审计落盘；撤销后 list 不再列出。
+        // 目录审计落盘；撤销后发布的广告移除（静态种子如有则重现）。
         let dir = temp_node_dir("revoke");
         let node_dir = dir.clone();
-        // 直接调内核逻辑：用 store 构造等价路径。
         let store = N2Store::open(&node_dir).unwrap();
         let now = now_secs();
+        // 先发布一个新资源（不在静态种子中）。
+        let rref = ResourceRef::new(
+            WorkspaceId::new(DEFAULT_WORKSPACE),
+            ResourceName::new("tmp-svc").unwrap(),
+        );
+        let rid = ResourceId("res-tmp-svc".into());
+        store
+            .save_names(&[NameEntry {
+                workspace: rref.workspace.clone(),
+                name: rref.name.clone(),
+                resource_id: rid.clone(),
+                kind: Some(nexus_domain::ResourceKind::Service),
+            }])
+            .unwrap();
         let directory = N2Directory::open_with_store(&store, now).unwrap();
-        let (rref, rid) = directory.resolve("dev-svc").unwrap();
-        assert_eq!(rid.0, "res-dev-svc");
+        assert!(directory.resolve("tmp-svc").is_ok());
 
         // 编码 AUTH_REVOKE 帧（与 run_revoke 同逻辑）。
         let frame = ControlFrame::AuthRevoke {
@@ -576,7 +583,13 @@ mod tests {
         ));
         let seq = store.outbox_next_seq().unwrap();
         store.outbox_push(seq, &bytes).unwrap();
-        store.mark_withdrawn(&rid).unwrap();
+        // 从持久化名字表删除（run_revoke 的内核逻辑）。
+        let names = store.load_names().unwrap();
+        let names: Vec<NameEntry> = names
+            .into_iter()
+            .filter(|e| !(e.workspace == rref.workspace && e.name == rref.name))
+            .collect();
+        store.save_names(&names).unwrap();
         record_directory_audit(
             store.kv(),
             &DirectoryAuditEvent {
@@ -588,10 +601,11 @@ mod tests {
                 detail: "test revoke".into(),
             },
         );
-        // 撤销后：resolve 失败（目录不可见），list 跳过。
+        // 撤销后：新资源 resolve 失败（目录不可见）。
         let directory2 = N2Directory::open_with_store(&store, now).unwrap();
-        assert!(directory2.resolve("dev-svc").is_err());
-        assert!(directory2.name_of_resource(&rid).is_none());
+        assert!(directory2.resolve("tmp-svc").is_err());
+        // 静态种子的 dev-svc 不受影响。
+        assert!(directory2.resolve("dev-svc").is_ok());
         // 审计落盘。
         let entries = crate::n2_store::replay_audit_entries(store.kv()).unwrap();
         assert!(
@@ -599,21 +613,6 @@ mod tests {
                 .iter()
                 .any(|(t, b)| t == "directory" && b.contains("\"action\":\"revoke\""))
         );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn revoke_is_idempotent() {
-        // 幂等：对已撤销资源再次 revoke 不报错（仍 revoked=true）。
-        let dir = temp_node_dir("revoke-idem");
-        let store = N2Store::open(&dir).unwrap();
-        let rid = nexus_domain::ResourceId("res-dev-svc".into());
-        store.mark_withdrawn(&rid).unwrap();
-        store.mark_withdrawn(&rid).unwrap(); // 不 panic
-        assert!(store.is_withdrawn(&rid).unwrap());
-        // 重新 publish 清除 tombstone。
-        store.clear_withdrawn(&rid).unwrap();
-        assert!(!store.is_withdrawn(&rid).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
