@@ -339,3 +339,20 @@ os_transitive_deps = "libc (accepted, standard)"
 approved = true
 approved_date = "2026-10-03"
 review_basis = "N2 P0-1 D8: bearer token for LocalAPI auth needs OS CSPRNG; alternatives: /dev/urandom read (unix-only, rejected), ring::rand (heavier dep, rejected)"
+
+[[dependency_reviews.direct]]
+consumer = "apps/nexus"
+crate = "ring"
+version = "0.17"
+default_features = false
+features = []
+architecture_layer = "composition-root app host (N2 P0-4 D6: ed25519 auth identity keypair); not a crates/ member, portable-core untouched"
+feature_scope = "no default features, no extra features; only ring::signature::{Ed25519KeyPair, KeyPair} (from_seed_unchecked/public_key)"
+license = "Apache-2.0 AND ISC (allowlisted; same crate/version already reviewed for crates/nexus-connectivity and crates/nexus-platform)"
+security = "no known advisories; re-check at push time via harness dependency-governance gate"
+portability = "crate portable=false; BoringSSL C code already built on all supported host targets (same as nexus-connectivity/nexus-platform entries)"
+supply_chain = "0.17.14 already pinned by Cargo.lock (lockfile_required); already present in tree via nexus-discovery/nexus-connectivity"
+os_transitive_deps = "none (pure compile-time crypto; RNG comes from getrandom crate, separately reviewed)"
+approved = true
+approved_date = "2026-10-03"
+review_basis = "N2 P0-4 D6: ed25519 授权身份密钥对（apps/nexus/src/n2_identity.rs）; alternatives: ed25519-dalek (new dep, rejected), ring already in tree"

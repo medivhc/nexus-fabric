@@ -1129,11 +1129,20 @@ impl SessionManager {
         let count = records.len();
         for record in records {
             let key = record.session.0.clone();
-            // P0-4：SessionRecord 未携带 resource/provider（历史记录无此字段）；
-            // 重建时以未知占位，`open` 创建的新记录恒带真实值。
+            // review-n2-p04（observability FAIL）：SessionRecord 不携带
+            // resource/provider（持久化格式不变），重建时从
+            // plan_snapshot.plan.resource_id/provider_id 回填；plan_snapshot 为
+            // None 的旧记录保持空字符串（诚实：信息确实不存在）。
+            let (resource, provider) = match &record.plan_snapshot {
+                Some(snapshot) => (
+                    snapshot.plan.resource_id.clone(),
+                    snapshot.plan.provider_id.clone(),
+                ),
+                None => (ResourceId(String::new()), ProviderId(String::new())),
+            };
             let meta = SessionMeta {
-                resource: ResourceId(String::new()),
-                provider: ProviderId(String::new()),
+                resource,
+                provider,
                 plan_snapshot: record.plan_snapshot.clone(),
                 cancel_reason: None,
                 detached_at_unix: None,
@@ -1670,6 +1679,44 @@ mod manager_tests {
         let trace = &view.plan_snapshot.as_ref().unwrap().decision_trace;
         assert_eq!(trace.selected.0, "local-dev-1");
         assert_eq!(trace.considered.len(), 1);
+    }
+
+    #[test]
+    fn load_backfills_resource_provider_from_plan_snapshot() {
+        // review-n2-p04（observability）：`session list/watch` 的唯一生产读路径
+        // 走 load_from_store；SessionRecord 不携带 resource/provider，必须从
+        // plan_snapshot.plan.resource_id/provider_id 回填；plan_snapshot 为
+        // None 的旧记录诚实保持空字符串（信息确实不存在，不伪造）。
+        let mut mgr = manager();
+        let with_snap = open_one(&mut mgr);
+        // 手工塞一条无 plan_snapshot 的旧记录（持久化格式无此字段的真实旧数据）。
+        let legacy = SessionId("sess-legacy-1".into());
+        mgr.store
+            .save(&SessionRecord {
+                session: legacy.clone(),
+                phase: LifecyclePhase::Active,
+                outcome: TerminalOutcome::Unfinished,
+                plan_snapshot: None,
+            })
+            .unwrap();
+        // 模拟进程重启：新 manager 从同一 store 加载（CLI 每次调用的重建路径）。
+        let store2 = std::mem::replace(
+            &mut mgr.store,
+            Box::new(MemStore::default()) as Box<dyn SessionRecordStore>,
+        );
+        let mut mgr2 = SessionManager::new(store2, DEFAULT_ATTACH_WINDOW_SECS);
+        mgr2.load_from_store().unwrap();
+        let list = mgr2.list();
+        let views: std::collections::HashMap<&str, &SessionView> =
+            list.iter().map(|v| (v.id.0.as_str(), v)).collect();
+        let v = views[with_snap.0.as_str()];
+        assert_eq!(v.resource.0, "dev-svc");
+        assert_eq!(v.provider.0, "local-dev-1");
+        assert!(v.plan_snapshot.is_some());
+        let lv = views["sess-legacy-1"];
+        assert_eq!(lv.resource.0, "");
+        assert_eq!(lv.provider.0, "");
+        assert!(lv.plan_snapshot.is_none());
     }
 
     #[test]

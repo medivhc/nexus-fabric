@@ -343,6 +343,12 @@ mod tests {
         assert_eq!(v["outcome"], json!("Completed"));
         assert_eq!(v["plan_id"], json!("e4seed00e4seed00"));
         assert_eq!(v["trace"]["selected"], json!("local-dev-1"));
+        // review-n2-p04（observability 回归）：生产读路径 list/watch 必须回填
+        // resource/provider——持久化记录无这两个字段，重建时从
+        // plan_snapshot.plan.resource_id/provider_id 回填；空字符串即 FAIL。
+        assert_eq!(v["resource"], json!("dev-svc"));
+        assert_eq!(v["resource_id"], json!("res-dev-svc"));
+        assert_eq!(v["provider"], json!("local-dev-1"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
