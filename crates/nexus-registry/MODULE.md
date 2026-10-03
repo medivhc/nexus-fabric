@@ -4,6 +4,19 @@
 
 维护 Resource、Provider、Node、Presence、Capability 与 Locator 的可查询注册视图。
 
+N2 P0-2 增补：
+- Provider 广告（`ProviderAdvertisement`）的发布 / 查询 / TTL / 可见性
+  （D2 契约三件套：双层授权字段 `discoverable_by` vs `use_grants`、
+  三种不可用原因 `UnavailabilityReason`、过期广告拒绝 `AdvertisementExpired`）；
+- N2 控制面 5 种帧（`ControlFrame`：RESOURCE_ANNOUNCE / RESOURCE_QUERY /
+  AUTH_GRANT / AUTH_REVOKE / LEASE_RENEW）的 wire 编解码（显式 u8 类型前缀，
+  不靠首字节猜）与已认证通道（`ControlChannel`；认证走既有门控，
+  本模块不另起第二套认证路径）；
+- 本地资源名字表（`LocalNameTable`：`ResourceRef{workspace, name}` 本地解析为
+  不透明 `ResourceId`；名字不进广告传输）；
+- 静态 Provider 配置导入（`StaticProviderEntry` → 广告；P0 static 先行，
+  mDNS/LSA 的 Provider 广播是 P0 红线，不做）。
+
 ## Non-Responsibilities
 
 不执行 Bootstrap 网络发现，不负责 Planner 评分，不建立 Link。
@@ -44,6 +57,22 @@
 - 默认最小 surface：`private -> pub(crate) -> pub`。
 - Public API 变更必须保持结构化、可版本化并有调用方验证。
 - 本骨架只提供最小编译锚点；业务 API 在实现阶段增量添加。
+
+N2 P0-2 增补（`contract: e02ef53829a39d4cada00266afa46ee87f6539364185b177888a43a4a2c9949f`）：
+- `advertisement`：`ProviderAdvertisement`（v9 §6 最小字段集＋D2 三件套）、
+  `Discoverability::{Public, Restricted}`、`UsageGrant`、
+  `UnavailabilityReason::{ProviderOffline, HealthDegraded, NotAcceptingWork}`
+  （`as_str()` 拼写与 `n2-provider-offline` 冻结期望一致）、
+  `RegistryError::AdvertisementExpired`、`LocalNameTable`、
+  `StaticProviderEntry`；
+- `Registry` 新增：`publish_ad`（过期拒绝）/ `withdraw_ad` /
+  `lookup_ads` / `lookup_visible_ads` / `purge_expired_ads` /
+  `advertisement_count` / `import_static`；
+- `control_frame`：`ControlFrame`（5 种）、`GrantAnnouncement`、
+  `encode_control_frame` / `decode_control_frame`（u8 显式类型前缀）、
+  `FrameCodecError`（类型化）、`ControlTransport`（组合根以
+  `nexus_transport::FrameStream` 适配）、`AuthenticatedPeer`、
+  `ControlChannel::established`（构造即要求已认证对端）、`ChannelError`。
 
 ## Verification
 

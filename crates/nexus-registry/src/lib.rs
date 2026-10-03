@@ -4,11 +4,29 @@
 //! 只保存事实与广告，不做业务评分（Measurement != Score），不负责 Bootstrap 网络发现，
 //! 也不建立 Link；Node Identity 与 Locator 严格分离。
 //!
+//! N2 P0-2：`advertisement` 模块提供 Provider 广告类型（D2 契约三件套：
+//! 双层授权字段 / 三种不可用原因 / 过期拒绝）与本地名字表；
+//! `control_frame` 模块提供经 FrameStream 交换的 5 种 N2 控制帧的
+//! wire 编解码与已认证通道（认证走既有门控，本模块不另起一套）。
+//!
 //! 本 crate 是 Portable Core：纯内存、零 I/O、零第三方依赖，可编译到 WASI。
 //! 详细边界见同目录 `MODULE.md`。
 
 #![forbid(unsafe_code)]
 
+pub mod advertisement;
+pub mod control_frame;
+
+pub use advertisement::{
+    Discoverability, LocalNameTable, ProviderAdvertisement, RegistryError, StaticProviderEntry,
+    UnavailabilityReason, UsageGrant,
+};
+pub use control_frame::{
+    AuthenticatedPeer, ChannelError, ControlChannel, ControlFrame, ControlTransport,
+    FrameCodecError, GrantAnnouncement, decode_control_frame, encode_control_frame,
+};
+
+use advertisement::ProviderAdvertisement as Advertisement;
 use nexus_domain::{ProviderId, ResourceId};
 
 /// 一条 Provider 注册记录（事实，不含评分）。
@@ -45,6 +63,7 @@ impl ProviderRecord {
 #[derive(Debug, Clone, Default)]
 pub struct Registry {
     records: Vec<ProviderRecord>,
+    pub(crate) ads: Vec<Advertisement>,
 }
 
 impl Registry {
