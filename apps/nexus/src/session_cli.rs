@@ -246,6 +246,7 @@ fn run_seed(id: &str, json_mode: bool) -> i32 {
 fn seed_session_at(node_dir: &std::path::Path, id: &str) -> Result<(), String> {
     let store = N2Store::open(node_dir).map_err(|e| format!("open n2 store: {e}"))?;
     let record = nexus_session::SessionRecord {
+        detached_at_unix: None,
         session: SessionId(id.to_string()),
         phase: nexus_domain::LifecyclePhase::Active,
         outcome: TerminalOutcome::Unfinished,
@@ -370,6 +371,7 @@ mod tests {
         let mut sessions = store.sessions();
         sessions
             .save(&SessionRecord {
+                detached_at_unix: None,
                 session: SessionId(id.to_string()),
                 phase,
                 outcome,

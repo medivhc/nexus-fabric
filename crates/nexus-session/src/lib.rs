@@ -402,11 +402,19 @@ pub struct SessionRecord {
     /// P0-4 的 SessionManager 在建 Session 时填充；`None` = 建连时未做规划
     /// （如 P0-3 之前的旧记录）。
     pub plan_snapshot: Option<PlanSnapshot>,
+    /// 客户端断开时刻（unix 秒）。P1-3：detach 只存内存会让冷启动后
+    /// `sweep_detached` 的 filter 永不命中（会话泄漏且永不收敛），故随
+    /// record 落盘。`None` = 未断开/已重附着/终态（与旧记录向后兼容）。
+    pub detached_at_unix: Option<u64>,
 }
 
 /// 会话记录存储契约（Portable；由 Composition Root 注入实现，
 /// 如内存/文件/安全存储，参见 `nexus-storage` 的 ContentStore 注入模式）。
-pub trait SessionRecordStore {
+///
+/// `Send`（P1-1）：`SessionManager` 持有该 store，且必须能整体移动到
+/// daemon 的 sweeper 线程（§13 结构化并发：Owner 可被创建线程之外的
+/// 拥有者持有/回收）。无界 `dyn` 超出此超trait 就无法跨线程移交。
+pub trait SessionRecordStore: Send {
     fn load(&self) -> Result<Vec<SessionRecord>, String>;
     fn save(&mut self, record: &SessionRecord) -> Result<(), String>;
 }
@@ -416,8 +424,47 @@ pub trait SessionRecordStore {
 pub struct SessionReconcileReport {
     /// 检查的记录数。
     pub records_checked: usize,
-    /// 分类为孤儿的会话数（进程死亡且未达终态）。
+    /// 分类为孤儿的会话数（进程死亡、未断开且未达终态 → `Failed`）。
     pub orphans_classified: usize,
+    /// 分类为"客户端已断开超窗"的会话数（→ `Cancelled(ClientDetached)`；
+    /// D7 断开≠Failed）。
+    pub detached_classified: usize,
+    /// 窗口内仍可重附着、刻意不分类的会话数（记录原样保留）。
+    pub detached_waiting: usize,
+}
+
+/// 冷启动 reconcile 的分类策略（P1-1：不再传死值 `false` 占位）。
+///
+/// - `process_alive`：持有会话的上一个进程是否仍存活。`true` → 未达终态的
+///   记录不分类（会话可继续）；`false` → 按下方 attach window 规则分类。
+/// - `now_unix` / `attach_window_secs`：客户端断开后多久未重附着算超窗。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconcilePolicy {
+    pub process_alive: bool,
+    pub now_unix: u64,
+    pub attach_window_secs: u64,
+}
+
+impl ReconcilePolicy {
+    /// 上一个持有会话的进程已死亡（daemon 冷启动用）。
+    #[must_use]
+    pub fn process_dead(now_unix: u64) -> Self {
+        Self {
+            process_alive: false,
+            now_unix,
+            attach_window_secs: DEFAULT_ATTACH_WINDOW_SECS,
+        }
+    }
+
+    /// 上一个持有会话的进程仍存活（同进程内 reconcile 用）。
+    #[must_use]
+    pub fn process_alive() -> Self {
+        Self {
+            process_alive: true,
+            now_unix: 0,
+            attach_window_secs: DEFAULT_ATTACH_WINDOW_SECS,
+        }
+    }
 }
 
 /// 会话记录 reconcile 的结构化失败（MODULE.md：不以日志文本代替错误类型）。
@@ -455,11 +502,16 @@ impl From<SessionError> for SessionReconcileError {
 ///   `transition_phase(Disposed)` 之前崩溃）→ 重放 cleanup 迁移到 `Disposed` 并回写，
 ///   outcome 原样保留，**不重新 commit**（Owner 唯一写入者原则不变），不计入孤儿；
 /// - 未达终态且进程存活 → 会话可继续，不分类；
-/// - 未达终态、进程死亡且 `phase != Disposed` → 孤儿会话：经 `SessionOwner` 恰一次提交
-///   `Failed`，清理到 `Disposed`，并回写记录（再次 reconcile 幂等，不会重复提交）。
+/// - 未达终态、进程死亡且客户端**从未断开**（`detached_at_unix == None`）
+///   且 `phase != Disposed` → 孤儿会话：经 `SessionOwner` 恰一次提交
+///   `Failed`，清理到 `Disposed`，并回写记录（再次 reconcile 幂等，不重复提交）；
+/// - 未达终态、进程死亡、客户端**已断开且超窗** → `Cancelled(ClientDetached)`
+///   清理到 `Disposed`（D7 断开≠Failed；P1-1）；
+/// - 未达终态、进程死亡、客户端已断开但**仍在 attach window 内** → 不分类，
+///   记录原样保留给重附着（P1-1/P1-3）。
 pub fn reconcile_session_records<S: SessionRecordStore>(
     store: &mut S,
-    process_alive: bool,
+    policy: ReconcilePolicy,
 ) -> Result<SessionReconcileReport, SessionReconcileError> {
     let records = store
         .load()
@@ -467,6 +519,8 @@ pub fn reconcile_session_records<S: SessionRecordStore>(
     let mut report = SessionReconcileReport {
         records_checked: records.len(),
         orphans_classified: 0,
+        detached_classified: 0,
+        detached_waiting: 0,
     };
     for record in records {
         // B1 连带：phase 已到 Disposed 的记录无需任何处置。
@@ -496,6 +550,7 @@ pub fn reconcile_session_records<S: SessionRecordStore>(
             debug_assert_eq!(owner.phase(), LifecyclePhase::Disposed);
             store
                 .save(&SessionRecord {
+                    detached_at_unix: None,
                     session: record.session,
                     phase: LifecyclePhase::Disposed,
                     outcome: record.outcome,
@@ -505,7 +560,41 @@ pub fn reconcile_session_records<S: SessionRecordStore>(
                 .map_err(|reason| SessionReconcileError::Store { reason })?;
             continue;
         }
-        if process_alive {
+        if policy.process_alive {
+            continue;
+        }
+        // D7（P1-1）：断开≠Failed。客户端在本进程死亡前已断开的会话不是
+        // "崩溃时正在使用"的会话，而是客户端早已离开的会话——先看窗口。
+        if let Some(detached_at) = record.detached_at_unix {
+            if policy.now_unix.saturating_sub(detached_at) < policy.attach_window_secs {
+                // 仍在重附着窗口内：记录原样保留，供新进程的 manager 载入后重附着。
+                report.detached_waiting += 1;
+                continue;
+            }
+            let mut owner = SessionOwner::new(record.session.clone());
+            owner
+                .transition_phase(LifecyclePhase::Active)
+                .map_err(SessionReconcileError::from)?;
+            owner
+                .commit_outcome(TerminalOutcome::Cancelled)
+                .map_err(SessionReconcileError::from)?;
+            owner
+                .transition_phase(LifecyclePhase::Draining)
+                .map_err(SessionReconcileError::from)?;
+            owner
+                .transition_phase(LifecyclePhase::Disposed)
+                .map_err(SessionReconcileError::from)?;
+            let status = owner.status();
+            store
+                .save(&SessionRecord {
+                    session: record.session,
+                    phase: status.phase,
+                    outcome: status.outcome,
+                    plan_snapshot: record.plan_snapshot,
+                    detached_at_unix: None,
+                })
+                .map_err(|reason| SessionReconcileError::Store { reason })?;
+            report.detached_classified += 1;
             continue;
         }
         // 孤儿：恰一次提交 Failed，清理到 Disposed（Owner 是 Outcome 唯一写入者）。
@@ -527,6 +616,7 @@ pub fn reconcile_session_records<S: SessionRecordStore>(
         let status = owner.status();
         store
             .save(&SessionRecord {
+                detached_at_unix: None,
                 session: record.session,
                 phase: status.phase,
                 outcome: status.outcome,
@@ -729,7 +819,61 @@ mod tests {
             phase: LifecyclePhase::Active,
             outcome: TerminalOutcome::Unfinished,
             plan_snapshot: None,
+            detached_at_unix: None,
         }
+    }
+
+    /// P1-1/P1-3：客户端已断开的 Active/Unfinished 记录（detach 时刻已落盘）。
+    fn detached_session(session: &str, detached_at_unix: u64) -> SessionRecord {
+        SessionRecord {
+            detached_at_unix: Some(detached_at_unix),
+            ..active_unfinished(session)
+        }
+    }
+
+    #[test]
+    fn reconcile_detached_beyond_window_is_cancelled_not_failed() {
+        // D7：断开≠Failed。超窗的已断开会话必须走 `Cancelled(ClientDetached)`，
+        // 不是 `Failed("process crashed")`。
+        let mut store = MemRecordStore {
+            records: vec![detached_session("s-det", 1000)],
+        };
+        let policy = ReconcilePolicy {
+            process_alive: false,
+            now_unix: 1000 + DEFAULT_ATTACH_WINDOW_SECS,
+            attach_window_secs: DEFAULT_ATTACH_WINDOW_SECS,
+        };
+        let report = reconcile_session_records(&mut store, policy).unwrap();
+        assert_eq!(report.detached_classified, 1);
+        assert_eq!(report.orphans_classified, 0);
+        assert_eq!(store.records[0].outcome, TerminalOutcome::Cancelled);
+        assert_eq!(store.records[0].phase, LifecyclePhase::Disposed);
+        assert_eq!(store.records[0].detached_at_unix, None);
+        // 幂等：再次 reconcile 不重复分类（phase 已 Disposed → 跳过）。
+        let again = reconcile_session_records(&mut store, policy).unwrap();
+        assert_eq!(again.records_checked, 1);
+        assert_eq!(again.detached_classified, 0);
+        assert_eq!(again.orphans_classified, 0);
+    }
+
+    #[test]
+    fn reconcile_keeps_detached_session_inside_attach_window() {
+        // 窗口内：记录原样保留（可重附着），既不 Failed 也不 Cancelled。
+        let mut store = MemRecordStore {
+            records: vec![detached_session("s-wait", 1000)],
+        };
+        let policy = ReconcilePolicy {
+            process_alive: false,
+            now_unix: 1000 + DEFAULT_ATTACH_WINDOW_SECS - 1,
+            attach_window_secs: DEFAULT_ATTACH_WINDOW_SECS,
+        };
+        let report = reconcile_session_records(&mut store, policy).unwrap();
+        assert_eq!(report.detached_waiting, 1);
+        assert_eq!(report.detached_classified, 0);
+        assert_eq!(report.orphans_classified, 0);
+        assert_eq!(store.records[0].outcome, TerminalOutcome::Unfinished);
+        assert_eq!(store.records[0].phase, LifecyclePhase::Active);
+        assert_eq!(store.records[0].detached_at_unix, Some(1000));
     }
 
     #[test]
@@ -737,7 +881,8 @@ mod tests {
         let mut store = MemRecordStore {
             records: vec![active_unfinished("s-orphan")],
         };
-        let report = reconcile_session_records(&mut store, false).unwrap();
+        let report =
+            reconcile_session_records(&mut store, ReconcilePolicy::process_dead(0)).unwrap();
         assert_eq!(report.records_checked, 1);
         assert_eq!(report.orphans_classified, 1);
 
@@ -746,7 +891,8 @@ mod tests {
         assert!(matches!(rec.outcome, TerminalOutcome::Failed(_)));
 
         // 幂等：再次 reconcile 不再分类、不重复提交。
-        let report2 = reconcile_session_records(&mut store, false).unwrap();
+        let report2 =
+            reconcile_session_records(&mut store, ReconcilePolicy::process_dead(0)).unwrap();
         assert_eq!(report2.orphans_classified, 0);
         assert!(matches!(
             store.records[0].outcome,
@@ -759,7 +905,8 @@ mod tests {
         let mut store = MemRecordStore {
             records: vec![active_unfinished("s-alive")],
         };
-        let report = reconcile_session_records(&mut store, true).unwrap();
+        let report =
+            reconcile_session_records(&mut store, ReconcilePolicy::process_alive()).unwrap();
         assert_eq!(report.orphans_classified, 0);
         assert_eq!(store.records[0].phase, LifecyclePhase::Active);
         assert_eq!(store.records[0].outcome, TerminalOutcome::Unfinished);
@@ -769,13 +916,15 @@ mod tests {
     fn already_terminal_record_is_skipped() {
         let mut store = MemRecordStore {
             records: vec![SessionRecord {
+                detached_at_unix: None,
                 session: SessionId("s-done".into()),
                 phase: LifecyclePhase::Disposed,
                 outcome: TerminalOutcome::Completed,
                 plan_snapshot: None,
             }],
         };
-        let report = reconcile_session_records(&mut store, false).unwrap();
+        let report =
+            reconcile_session_records(&mut store, ReconcilePolicy::process_dead(0)).unwrap();
         assert_eq!(report.orphans_classified, 0);
         assert_eq!(store.records[0].outcome, TerminalOutcome::Completed);
     }
@@ -835,13 +984,15 @@ mod tests {
         // reconcile 不得再把它判为孤儿并覆盖重写为 Failed。
         let mut store = MemRecordStore {
             records: vec![SessionRecord {
+                detached_at_unix: None,
                 session: SessionId("s-disposed-unfinished".into()),
                 phase: LifecyclePhase::Disposed,
                 outcome: TerminalOutcome::Unfinished,
                 plan_snapshot: None,
             }],
         };
-        let report = reconcile_session_records(&mut store, false).unwrap();
+        let report =
+            reconcile_session_records(&mut store, ReconcilePolicy::process_dead(0)).unwrap();
         assert_eq!(report.orphans_classified, 0);
         assert_eq!(store.records[0].phase, LifecyclePhase::Disposed);
         assert_eq!(store.records[0].outcome, TerminalOutcome::Unfinished);
@@ -854,18 +1005,21 @@ mod tests {
         let mut store = MemRecordStore {
             records: vec![
                 SessionRecord {
+                    detached_at_unix: None,
                     session: SessionId("s-active".into()),
                     phase: LifecyclePhase::Active,
                     outcome: TerminalOutcome::Completed,
                     plan_snapshot: None,
                 },
                 SessionRecord {
+                    detached_at_unix: None,
                     session: SessionId("s-draining".into()),
                     phase: LifecyclePhase::Draining,
                     outcome: TerminalOutcome::Cancelled,
                     plan_snapshot: None,
                 },
                 SessionRecord {
+                    detached_at_unix: None,
                     session: SessionId("s-alloc".into()),
                     phase: LifecyclePhase::Allocating,
                     outcome: TerminalOutcome::Failed(NexusError::Internal {
@@ -875,7 +1029,8 @@ mod tests {
                 },
             ],
         };
-        let report = reconcile_session_records(&mut store, false).unwrap();
+        let report =
+            reconcile_session_records(&mut store, ReconcilePolicy::process_dead(0)).unwrap();
         assert_eq!(report.records_checked, 3);
         // 终态记录不是孤儿：不计入 orphans_classified。
         assert_eq!(report.orphans_classified, 0);
@@ -900,17 +1055,18 @@ mod tests {
     fn reconcile_terminal_cleanup_is_idempotent() {
         let mut store = MemRecordStore {
             records: vec![SessionRecord {
+                detached_at_unix: None,
                 session: SessionId("s-t".into()),
                 phase: LifecyclePhase::Active,
                 outcome: TerminalOutcome::Completed,
                 plan_snapshot: None,
             }],
         };
-        let r1 = reconcile_session_records(&mut store, false).unwrap();
+        let r1 = reconcile_session_records(&mut store, ReconcilePolicy::process_dead(0)).unwrap();
         assert_eq!(r1.orphans_classified, 0);
         assert_eq!(store.records[0].phase, LifecyclePhase::Disposed);
         let snapshot = store.records.clone();
-        let r2 = reconcile_session_records(&mut store, false).unwrap();
+        let r2 = reconcile_session_records(&mut store, ReconcilePolicy::process_dead(0)).unwrap();
         assert_eq!(r2.orphans_classified, 0);
         assert_eq!(
             store.records, snapshot,
@@ -948,13 +1104,15 @@ mod tests {
         };
         let mut store = MemRecordStore {
             records: vec![SessionRecord {
+                detached_at_unix: None,
                 session: SessionId("sess-n2-e4-1".into()),
                 phase: LifecyclePhase::Active,
                 outcome: TerminalOutcome::Completed,
                 plan_snapshot: Some(snapshot.clone()),
             }],
         };
-        let report = reconcile_session_records(&mut store, false).unwrap();
+        let report =
+            reconcile_session_records(&mut store, ReconcilePolicy::process_dead(0)).unwrap();
         assert_eq!(report.orphans_classified, 0);
         // 终态重放 cleanup 后快照仍在（搬运，非重算）。
         assert_eq!(store.records[0].plan_snapshot, Some(snapshot));
@@ -1145,7 +1303,8 @@ impl SessionManager {
                 provider,
                 plan_snapshot: record.plan_snapshot.clone(),
                 cancel_reason: None,
-                detached_at_unix: None,
+                // P1-3：断开时刻必须跨重启存活，否则 attach window 永不生效。
+                detached_at_unix: record.detached_at_unix,
             };
             let owner = SessionOwner::from_record(&record);
             self.owners.insert(key.clone(), owner);
@@ -1192,6 +1351,7 @@ impl SessionManager {
         let mut owner = SessionOwner::new(id.clone());
         owner.transition_phase(LifecyclePhase::Active)?;
         let record = SessionRecord {
+            detached_at_unix: None,
             session: id.clone(),
             phase: LifecyclePhase::Active,
             outcome: TerminalOutcome::Unfinished,
@@ -1281,6 +1441,8 @@ impl SessionManager {
             outcome: status.outcome,
             // 快照搬运、不重算（D3）。
             plan_snapshot: meta.plan_snapshot.clone(),
+            // P1-3：detach 时刻随 record 落盘（`note_client_detached` 后 persist）。
+            detached_at_unix: meta.detached_at_unix,
         };
         self.store
             .save(&record)
@@ -1372,7 +1534,10 @@ impl SessionManager {
     /// 客户端断开（PRODUCT §16.3）：记录断开时间，会话**保持 Active**、
     /// outcome 保持 `Unfinished`（可重附着）。断开≠Failed。
     ///
-    /// 返回 `true` 表示仍在重附着窗口内（可重附着）。
+    /// 返回 `true` 表示仍在重附着窗口内（可重附着）；`false` 表示
+    /// `now_unix` 已超出窗口（调用方应立即 `sweep_detached` 收敛为
+    /// `Cancelled(ClientDetached)`）。P1-2：不再无条件 `Ok(true)`——返回值
+    /// 必须是真实窗口判定。断开时刻随后随 record 落盘（P1-3）。
     pub fn note_client_detached(
         &mut self,
         id: &SessionId,
@@ -1391,11 +1556,18 @@ impl SessionManager {
                 outcome: owner.committed_outcome().expect("checked some"),
             });
         }
+        let known = self.meta.contains_key(&key);
         if let Some(meta) = self.meta.get_mut(&key) {
             meta.detached_at_unix = Some(now_unix);
         }
+        // P1-3：detach 时刻落盘，冷启动后 `sweep_detached` 仍能判定超窗。
+        if known {
+            self.persist(id)?;
+        }
+        // 断开瞬间必然在窗口内（`>= attach_window` 才算超窗）。
+        let in_window = self.attach_window_secs > 0;
         // 关键：不断开即判 Failed；outcome 保持 Unfinished，phase 保持 Active。
-        Ok(true)
+        Ok(in_window)
     }
 
     /// 扫描断开超窗的会话 → 提交 `Cancelled(ClientDetached)`。
@@ -1547,6 +1719,62 @@ mod manager_tests {
     }
 
     #[test]
+    fn detached_at_unix_survives_restart_and_window_is_honored() {
+        // P1-2：返回值是真实窗口判定（刚断开 → true）。
+        // P1-3：detach 时刻必须跨重启存活，否则 sweep 的 filter 永不命中。
+        let mut mgr = manager();
+        let id = open_one(&mut mgr);
+        assert!(mgr.note_client_detached(&id, 1000).unwrap());
+        // 模拟重启：同一个 store 移交给新 manager（CLI/daemon 的重建路径）。
+        let store = std::mem::replace(
+            &mut mgr.store,
+            Box::new(MemStore::default()) as Box<dyn SessionRecordStore>,
+        );
+        let mut mgr2 = SessionManager::new(store, DEFAULT_ATTACH_WINDOW_SECS);
+        mgr2.load_from_store().unwrap();
+        // 窗口内 sweep → 保持 Unfinished（可重附着）。
+        assert!(
+            mgr2.sweep_detached(1000 + DEFAULT_ATTACH_WINDOW_SECS - 1)
+                .is_empty()
+        );
+        assert_eq!(mgr2.get(&id).unwrap().outcome, TerminalOutcome::Unfinished);
+        // 超窗 sweep → Cancelled(ClientDetached)（§16.3）。
+        let swept = mgr2.sweep_detached(1000 + DEFAULT_ATTACH_WINDOW_SECS);
+        assert_eq!(swept, vec![id.clone()]);
+        let view = mgr2.get(&id).unwrap();
+        assert_eq!(view.outcome, TerminalOutcome::Cancelled);
+        assert_eq!(view.cancel_reason, Some(CancelReason::ClientDetached));
+        // 幂等：重复 sweep 不再命中。
+        assert!(
+            mgr2.sweep_detached(1000 + DEFAULT_ATTACH_WINDOW_SECS)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn note_client_detached_reports_real_window_membership() {
+        // P1-2：返回值必须是真实窗口判定，不再无条件 `Ok(true)`。
+        let mut mgr = manager();
+        let id = open_one(&mut mgr);
+        // 断开即刻：`now - detached = 0 < attach_window` → 仍在窗口内。
+        assert!(mgr.note_client_detached(&id, 1000).unwrap());
+        // 禁用重附着窗口（0 秒）→ 立即 false（旧实现无条件 true）。
+        let mut strict = SessionManager::new(Box::new(MemStore::default()), 0);
+        let sid = strict
+            .open(
+                ResourceId("dev-svc".into()),
+                ProviderId("local-dev-1".into()),
+                snapshot(),
+            )
+            .unwrap();
+        assert!(!strict.note_client_detached(&sid, 1000).unwrap());
+        // 仍保持 Active/Unfinished（断开≠Failed；由 sweep 负责收敛）。
+        let view = strict.get(&sid).unwrap();
+        assert_eq!(view.phase, LifecyclePhase::Active);
+        assert_eq!(view.outcome, TerminalOutcome::Unfinished);
+    }
+
+    #[test]
     fn open_generates_unique_ids() {
         let mut mgr = manager();
         let a = open_one(&mut mgr);
@@ -1693,6 +1921,7 @@ mod manager_tests {
         let legacy = SessionId("sess-legacy-1".into());
         mgr.store
             .save(&SessionRecord {
+                detached_at_unix: None,
                 session: legacy.clone(),
                 phase: LifecyclePhase::Active,
                 outcome: TerminalOutcome::Unfinished,

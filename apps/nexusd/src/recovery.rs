@@ -33,7 +33,8 @@ use nexus_connectivity::{
 };
 use nexus_domain::{LifecyclePhase, NexusError, SessionId, TerminalOutcome};
 use nexus_session::{
-    SessionReconcileReport, SessionRecord, SessionRecordStore, reconcile_session_records,
+    ReconcilePolicy, SessionReconcileReport, SessionRecord, SessionRecordStore,
+    reconcile_session_records,
 };
 use serde_json::{Value, json};
 
@@ -126,6 +127,10 @@ fn encode_sessions(records: &[SessionRecord]) -> Value {
                 if let Some(reason) = reason {
                     obj.insert("reason".into(), Value::String(reason));
                 }
+                // P1-3：detach 时刻随 record 落盘（缺席 = 未断开）。
+                if let Some(t) = r.detached_at_unix {
+                    obj.insert("detached_at_unix".into(), Value::from(t));
+                }
                 Value::Object(obj)
             })
             .collect(),
@@ -156,6 +161,8 @@ fn decode_sessions(v: &Value) -> Result<Vec<SessionRecord>, String> {
                 // N2 P0-3：sessions.json 暂无 plan_snapshot 字段（P0-4 SessionManager
                 // 落地后写入）；旧记录按 None 读入，不伪造。
                 plan_snapshot: None,
+                // P1-3：旧记录无该字段 → None（向后兼容）。
+                detached_at_unix: item.get("detached_at_unix").and_then(Value::as_u64),
             })
         })
         .collect()
@@ -478,10 +485,17 @@ pub fn boot_reconcile(state_dir: &Path, orphan_mountpoints: &[PathBuf]) -> BootR
     }
 
     let mut sess_store = FileSessionRecordStore::new(state_dir);
-    match reconcile_session_records(&mut sess_store, false) {
+    // P1-1：boot 时上一个进程必然已死；带当前时刻让 attach window 生效
+    // （已断开但仍在窗口内的记录不分类，超窗的判 `Cancelled(ClientDetached)`）。
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match reconcile_session_records(&mut sess_store, ReconcilePolicy::process_dead(now)) {
         Ok(SessionReconcileReport {
             records_checked,
             orphans_classified,
+            ..
         }) => {
             report.sessions_checked = records_checked;
             report.orphans_classified = orphans_classified;
@@ -540,6 +554,7 @@ mod tests {
             phase: LifecyclePhase::Active,
             outcome: TerminalOutcome::Unfinished,
             plan_snapshot: None,
+            detached_at_unix: None,
         }
     }
 
@@ -551,6 +566,7 @@ mod tests {
         store.save(&active_unfinished("s-1")).unwrap();
         store
             .save(&SessionRecord {
+                detached_at_unix: None,
                 session: SessionId("s-2".into()),
                 phase: LifecyclePhase::Disposed,
                 outcome: TerminalOutcome::Completed,
@@ -560,6 +576,7 @@ mod tests {
         // upsert 同 id
         store
             .save(&SessionRecord {
+                detached_at_unix: None,
                 session: SessionId("s-1".into()),
                 phase: LifecyclePhase::Disposed,
                 outcome: TerminalOutcome::Cancelled,
@@ -580,6 +597,7 @@ mod tests {
         let mut store = FileSessionRecordStore::new(&dir);
         store
             .save(&SessionRecord {
+                detached_at_unix: None,
                 session: SessionId("s-f".into()),
                 phase: LifecyclePhase::Active,
                 outcome: TerminalOutcome::Failed(NexusError::SessionFailed {

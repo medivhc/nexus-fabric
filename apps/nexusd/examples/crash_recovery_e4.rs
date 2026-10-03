@@ -40,6 +40,7 @@ fn victim(state_dir: &Path) -> ! {
     }
     let mut sess = FileSessionRecordStore::new(state_dir);
     if let Err(e) = sess.save(&SessionRecord {
+        detached_at_unix: None,
         session: SessionId("s-crash-1".into()),
         phase: LifecyclePhase::Active,
         outcome: TerminalOutcome::Unfinished,

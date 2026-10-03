@@ -219,7 +219,9 @@ pub fn build_dataplane_config(loaded: &LoadedConfig) -> Result<DataplaneConfig, 
 pub fn assemble_n2_session_manager(
     config_root: &std::path::Path,
 ) -> Result<nexus_session::SessionManager, String> {
-    use nexus_session::{DEFAULT_ATTACH_WINDOW_SECS, SessionManager, reconcile_session_records};
+    use nexus_session::{
+        DEFAULT_ATTACH_WINDOW_SECS, ReconcilePolicy, SessionManager, reconcile_session_records,
+    };
 
     let store =
         nexus::n2_store::N2Store::open(config_root).map_err(|e| format!("open n2 store: {e}"))?;
@@ -238,11 +240,20 @@ pub fn assemble_n2_session_manager(
         );
     }
     let mut record_store = store.sessions();
-    let report = reconcile_session_records(&mut record_store, false)
+    // P1-1：不再传死值 `false` 占位——显式表达"上一个进程已死"，并带上
+    // 当前时刻，attach window 才能真正生效。
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let report = reconcile_session_records(&mut record_store, ReconcilePolicy::process_dead(now))
         .map_err(|e| format!("reconcile n2 sessions: {e}"))?;
     eprintln!(
-        "[nexusd] N2 session reconcile: checked={}, orphans={}",
-        report.records_checked, report.orphans_classified
+        "[nexusd] N2 session reconcile: checked={}, orphans={}, detached_cancelled={}, detached_waiting={}",
+        report.records_checked,
+        report.orphans_classified,
+        report.detached_classified,
+        report.detached_waiting
     );
     let mut manager = SessionManager::new(Box::new(store.sessions()), DEFAULT_ATTACH_WINDOW_SECS);
     let loaded = manager

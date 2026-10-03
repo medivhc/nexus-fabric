@@ -261,15 +261,25 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     // §15 顺序：N2 会话存储（`<config-dir>/n2/`）加载 → journal 重放 →
     // `reconcile_session_records`（幂等）→ 接受新工作。SessionManager 是
     // Session 生命周期的唯一 Owner（§13 结构化并发）；提供方侧只做
-    // admission＋租约，不做第二个领域 Session。P0-4 中 daemon 侧尚无
-    // 跨机建 Session 流量（P0-5），此处装配＋持有实例，boot reconcile 先行。
-    let _n2_session_manager = match assembly::assemble_n2_session_manager(&dir.root) {
+    // admission＋租约，不做第二个领域 Session。
+    //
+    // P1-1：实例不能"装配即弃"——它由下面的 sweeper 线程**持有并服务**
+    // （谁创建/谁拥有/谁取消/谁回收/谁记录结果），JoinHandle 交给主事件
+    // 循环并在 `shutdown_sequence` 中 join（§13.4）。
+    // P1-2：该线程周期性 `sweep_detached`，attach window 真正生效。
+    let n2_sweeper_handle = match assembly::assemble_n2_session_manager(&dir.root) {
         Ok(mgr) => {
             eprintln!(
                 "[nexusd] N2 SessionManager assembled ({} sessions loaded)",
                 mgr.len()
             );
-            Some(Box::new(mgr))
+            let sweeper_shutdown = Arc::clone(&shutdown);
+            Some(
+                std::thread::Builder::new()
+                    .name("nexusd-n2-session".to_string())
+                    .spawn(move || sweep_n2_sessions(mgr, sweeper_shutdown))
+                    .expect("spawn n2 session sweeper"),
+            )
         }
         Err(e) => {
             eprintln!("[nexusd] WARN: N2 SessionManager assembly failed: {e} (degraded)");
@@ -428,8 +438,51 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     }
 
     // 8. R4：优雅关闭（§13.4 反向顺序，超时强制继续）。
-    shutdown_sequence(localapi_handle, dataplane_handle, n1_bridge, &state_dir);
+    shutdown_sequence(
+        localapi_handle,
+        dataplane_handle,
+        n1_bridge,
+        n2_sweeper_handle,
+        &state_dir,
+    );
     ExitCode::from(0)
+}
+
+/// N2 SessionManager 的持有者/维护循环（P1-1 唯一 Owner、P1-2 周期 sweep）。
+///
+/// §13 结构化并发：线程由本函数创建并拥有，`shutdown` 标志协作式停止，
+/// JoinHandle 交给主事件循环 → `shutdown_sequence` join 确认结束，不泄漏。
+/// 每秒醒一次（保证 shutdown 响应 ≤1s），每 30 次 tick 做一次 detach 扫描。
+fn sweep_n2_sessions(mut mgr: nexus_session::SessionManager, shutdown: Arc<AtomicBool>) {
+    const SWEEP_TICKS: u32 = 30;
+    let mut ticks: u32 = 0;
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        ticks = ticks.wrapping_add(1);
+        if ticks % SWEEP_TICKS != 0 {
+            continue;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let swept = mgr.sweep_detached(now);
+        if !swept.is_empty() {
+            // 结构化可观测（§22）：关联字段带 session_id。
+            let ids: Vec<&str> = swept.iter().map(|s| s.0.as_str()).collect();
+            eprintln!(
+                "[nexusd] N2 session sweep: {} session(s) -> Cancelled(ClientDetached): {ids:?}",
+                swept.len()
+            );
+        }
+    }
+    eprintln!("[nexusd] N2 session sweeper: shutdown");
 }
 
 /// R4：优雅关闭序列（§13.4）。
@@ -440,11 +493,17 @@ fn shutdown_sequence(
     localapi_handle: std::thread::JoinHandle<()>,
     dataplane_handle: Option<std::thread::JoinHandle<()>>,
     n1_bridge: Option<Arc<nexus_network::n1::bridge::N1MeshBridge>>,
+    n2_sweeper_handle: Option<std::thread::JoinHandle<()>>,
     state_dir: &std::path::Path,
 ) {
     eprintln!("[nexusd] shutdown: stopping LocalAPI");
     // LocalAPI 线程已通过 shutdown 标志退出 accept 循环；join 确认。
     assembly::join_with_timeout(localapi_handle, Duration::from_secs(2), "localapi");
+
+    // P1-1：N2 SessionManager 的唯一持有者（sweeper 线程）确认结束。
+    if let Some(handle) = n2_sweeper_handle {
+        assembly::join_with_timeout(handle, Duration::from_secs(2), "n2-session-sweeper");
+    }
 
     // D7（C1）：Workspace unmount 在 LocalAPI 之后、Dataplane 之前。
     #[cfg(target_os = "linux")]

@@ -524,6 +524,10 @@ fn encode_session_record(r: &SessionRecord) -> Value {
             .map(encode_plan_snapshot)
             .unwrap_or(Value::Null),
     );
+    // P1-3：detach 时刻必须跨重启存活（缺席 = 未断开，向后兼容旧记录）。
+    if let Some(t) = r.detached_at_unix {
+        obj.insert("detached_at_unix".into(), json!(t));
+    }
     Value::Object(obj)
 }
 
@@ -546,6 +550,8 @@ fn decode_session_record(v: &Value) -> Result<SessionRecord, String> {
             .filter(|x| !x.is_null())
             .map(parse_plan_snapshot)
             .transpose()?,
+        // 旧记录无该字段 → None（向后兼容，不伪造断开时刻）。
+        detached_at_unix: v.get("detached_at_unix").and_then(Value::as_u64),
     })
 }
 
@@ -1350,6 +1356,7 @@ mod tests {
         let store = N2Store::open(&dir).unwrap();
         let mut sessions = store.sessions();
         let record = SessionRecord {
+            detached_at_unix: None,
             session: SessionId("sess-abc".into()),
             phase: LifecyclePhase::Active,
             outcome: TerminalOutcome::Unfinished,
@@ -1367,12 +1374,44 @@ mod tests {
     }
 
     #[test]
+    fn session_record_roundtrips_detached_at_unix() {
+        // P1-3：detach 时刻必须跨重启存活，否则冷启动 sweep 永不命中。
+        let dir = temp_dir("sess-det");
+        let store = N2Store::open(&dir).unwrap();
+        let mut sessions = store.sessions();
+        sessions
+            .save(&SessionRecord {
+                session: SessionId("sess-det-1".into()),
+                phase: LifecyclePhase::Active,
+                outcome: TerminalOutcome::Unfinished,
+                plan_snapshot: None,
+                detached_at_unix: Some(1_700_000_000),
+            })
+            .unwrap();
+        let loaded = sessions.load().unwrap();
+        assert_eq!(loaded[0].detached_at_unix, Some(1_700_000_000));
+        // 旧记录（无该字段）→ None（向后兼容，不伪造断开时刻）。
+        store
+            .kv()
+            .put(
+                "n2/session/sess-legacy-1",
+                br#"{"version":1,"session":"sess-legacy-1","phase":"Active","outcome":"Unfinished","plan_snapshot":null}"#,
+            )
+            .unwrap();
+        let all = sessions.load().unwrap();
+        let legacy = all.iter().find(|r| r.session.0 == "sess-legacy-1").unwrap();
+        assert_eq!(legacy.detached_at_unix, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn session_save_appends_journal() {
         let dir = temp_dir("sess-j");
         let store = N2Store::open(&dir).unwrap();
         let mut sessions = store.sessions();
         sessions
             .save(&SessionRecord {
+                detached_at_unix: None,
                 session: SessionId("sess-j1".into()),
                 phase: LifecyclePhase::Active,
                 outcome: TerminalOutcome::Unfinished,

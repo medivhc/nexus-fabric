@@ -417,6 +417,7 @@ mod tests {
         let mut sessions = store.sessions();
         sessions
             .save(&SessionRecord {
+                detached_at_unix: None,
                 session: nexus_domain::SessionId("sess-hist-1".into()),
                 phase: nexus_domain::LifecyclePhase::Active,
                 outcome: nexus_domain::TerminalOutcome::Completed,
