@@ -295,6 +295,10 @@ fn use_remote(
         }
         Ok(AdmissionVerdict::Denied { deny }) => {
             close_attempt(manager, &format!("admission-denied:{deny}"));
+            // 带上请求方自身 principal（运维据此在 B 机 `grant add`）。
+            let principal = ensure_auth_identity(store)
+                .map(|(_, p)| p.0)
+                .unwrap_or_default();
             Err(fail_json(
                 "AUTH_DENIED",
                 json!({
@@ -302,6 +306,7 @@ fn use_remote(
                     "audit_written": true,
                     "resource": name,
                     "provider": provider_id.0,
+                    "principal": principal,
                     "message": format!("provider {} denied session for '{name}': {deny}", provider_id.0),
                 }),
             ))
