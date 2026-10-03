@@ -415,8 +415,8 @@ fn run_publish(args: &[String], json_mode: bool) -> i32 {
 ///
 /// 幂等：已存在同样的 grant 则不重复写。返回是否发生了写入。
 fn self_grant_local_use(store: &N2Store, rref: &ResourceRef) -> Result<bool, String> {
-    let (_pubkey, principal) = ensure_auth_identity(store)
-        .map_err(|e| format!("resolve local principal: {e}"))?;
+    let (_pubkey, principal) =
+        ensure_auth_identity(store).map_err(|e| format!("resolve local principal: {e}"))?;
     let grant = nexus_auth::Grant::new(
         rref.clone(),
         principal,

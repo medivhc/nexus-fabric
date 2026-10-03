@@ -612,8 +612,8 @@ impl KvSessionRecordStore {
         else {
             return Ok(None);
         };
-        let text = String::from_utf8(bytes)
-            .map_err(|e| format!("session {} not utf-8: {e}", id.0))?;
+        let text =
+            String::from_utf8(bytes).map_err(|e| format!("session {} not utf-8: {e}", id.0))?;
         let v: Value =
             serde_json::from_str(&text).map_err(|e| format!("parse session {}: {e}", id.0))?;
         decode_session_record(&v).map(Some)
@@ -828,56 +828,56 @@ impl N2Store {
     }
 
     /// 标记一条 grant 已撤销（tombstone；`nexus grant revoke`）。
-///
-/// P1-14：此前 `grant del` 物理删除条目，后续判定落成 `NoSuchGrant`——审计里
-/// "曾授权后被撤销"与"从未授权"不可区分，`DenyReason::Revoked` 无生产写入者。
-/// tombstone 保留记录（可取证）并让判定落到 `Revoked`。
-/// 幂等：不存在 → `Ok(false)`；已撤销 → `Ok(true)` 且不再改写。
-pub fn revoke_grant(
-    &self,
-    resource: &nexus_domain::ResourceRef,
-    principal: &nexus_auth::Principal,
-) -> Result<bool, String> {
-    let key = grant_key(resource, principal);
-    let Some(bytes) = self
-        .kv
-        .get(&key)
-        .map_err(|e| format!("read grant for revoke: {e}"))?
-    else {
-        return Ok(false);
-    };
-    let text = String::from_utf8(bytes).map_err(|e| format!("grant not utf-8: {e}"))?;
-    let mut v: Value = serde_json::from_str(&text).map_err(|e| format!("parse grant: {e}"))?;
-    if v.get("revoked").and_then(Value::as_bool) == Some(true) {
-        return Ok(true);
-    }
-    v["revoked"] = Value::Bool(true);
-    let data = serde_json::to_string(&v).map_err(|e| format!("encode grant: {e}"))?;
-    self.kv
-        .put(&key, data.as_bytes())
-        .map_err(|e| format!("put revoked grant: {e}"))?;
-    Ok(true)
-}
-
-/// 撤销某资源的全部 grant（`resource revoke` 的授权侧后果，P1-14）。
-///
-/// 返回被撤销的条数。资源撤销后，对该资源的所有已授权主体都必须立刻重新判定，
-/// 否则"撤销资源"只撤广告、grant 仍在——下一跳仍然可用。
-pub fn revoke_all_grants_for(
-    &self,
-    resource: &nexus_domain::ResourceRef,
-) -> Result<usize, String> {
-    let mut revoked = 0usize;
-    for grant in self.load_grants()? {
-        if &grant.resource == resource && !grant.revoked {
-            self.revoke_grant(&grant.resource, &grant.principal)?;
-            revoked += 1;
+    ///
+    /// P1-14：此前 `grant del` 物理删除条目，后续判定落成 `NoSuchGrant`——审计里
+    /// "曾授权后被撤销"与"从未授权"不可区分，`DenyReason::Revoked` 无生产写入者。
+    /// tombstone 保留记录（可取证）并让判定落到 `Revoked`。
+    /// 幂等：不存在 → `Ok(false)`；已撤销 → `Ok(true)` 且不再改写。
+    pub fn revoke_grant(
+        &self,
+        resource: &nexus_domain::ResourceRef,
+        principal: &nexus_auth::Principal,
+    ) -> Result<bool, String> {
+        let key = grant_key(resource, principal);
+        let Some(bytes) = self
+            .kv
+            .get(&key)
+            .map_err(|e| format!("read grant for revoke: {e}"))?
+        else {
+            return Ok(false);
+        };
+        let text = String::from_utf8(bytes).map_err(|e| format!("grant not utf-8: {e}"))?;
+        let mut v: Value = serde_json::from_str(&text).map_err(|e| format!("parse grant: {e}"))?;
+        if v.get("revoked").and_then(Value::as_bool) == Some(true) {
+            return Ok(true);
         }
+        v["revoked"] = Value::Bool(true);
+        let data = serde_json::to_string(&v).map_err(|e| format!("encode grant: {e}"))?;
+        self.kv
+            .put(&key, data.as_bytes())
+            .map_err(|e| format!("put revoked grant: {e}"))?;
+        Ok(true)
     }
-    Ok(revoked)
-}
 
-/// 加载全部 grant。
+    /// 撤销某资源的全部 grant（`resource revoke` 的授权侧后果，P1-14）。
+    ///
+    /// 返回被撤销的条数。资源撤销后，对该资源的所有已授权主体都必须立刻重新判定，
+    /// 否则"撤销资源"只撤广告、grant 仍在——下一跳仍然可用。
+    pub fn revoke_all_grants_for(
+        &self,
+        resource: &nexus_domain::ResourceRef,
+    ) -> Result<usize, String> {
+        let mut revoked = 0usize;
+        for grant in self.load_grants()? {
+            if &grant.resource == resource && !grant.revoked {
+                self.revoke_grant(&grant.resource, &grant.principal)?;
+                revoked += 1;
+            }
+        }
+        Ok(revoked)
+    }
+
+    /// 加载全部 grant。
     pub fn load_grants(&self) -> Result<Vec<nexus_auth::Grant>, String> {
         let mut out = Vec::new();
         let keys = self
@@ -1297,8 +1297,8 @@ impl N2Store {
             .map_err(|e| format!("read outbox acked: {e}"))?
         {
             Some(bytes) => {
-                let text = String::from_utf8(bytes)
-                    .map_err(|e| format!("outbox acked not utf-8: {e}"))?;
+                let text =
+                    String::from_utf8(bytes).map_err(|e| format!("outbox acked not utf-8: {e}"))?;
                 Ok(text.trim().parse::<u64>().unwrap_or(0))
             }
             None => Ok(0),

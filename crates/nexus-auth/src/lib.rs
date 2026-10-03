@@ -267,13 +267,14 @@ impl GrantTable {
         // 就落成 `NoSuchGrant`，`WrongWorkspace` 变成死路径。先按
         // `(name, principal)` 找，同名不同 workspace 显式比出 `WrongWorkspace`；
         // 存在精确匹配时行为与旧实现完全一致（按 `(resource, principal)` 命中优先）。
-        let exact = self.grants.iter().find(|g| {
-            g.resource == req.resource && g.principal == req.principal
-        });
+        let exact = self
+            .grants
+            .iter()
+            .find(|g| g.resource == req.resource && g.principal == req.principal);
         let grant = match exact.or_else(|| {
-            self.grants.iter().find(|g| {
-                g.resource.name == req.resource.name && g.principal == req.principal
-            })
+            self.grants
+                .iter()
+                .find(|g| g.resource.name == req.resource.name && g.principal == req.principal)
         }) {
             Some(g) => g,
             None => return AuthorizationDecision::Deny(DenyReason::NoSuchGrant),
@@ -469,10 +470,7 @@ mod tests {
         };
         let d = table.authorize(&r, 1000, &mut sink);
         match d {
-            AuthorizationDecision::Deny(DenyReason::WrongWorkspace {
-                expected,
-                actual,
-            }) => {
+            AuthorizationDecision::Deny(DenyReason::WrongWorkspace { expected, actual }) => {
                 assert_eq!(expected, wid("ws-a"));
                 assert_eq!(actual, wid("ws-b"));
             }

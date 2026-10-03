@@ -220,9 +220,7 @@ pub fn build_dataplane_config(loaded: &LoadedConfig) -> Result<DataplaneConfig, 
 pub fn assemble_n2_session_manager(
     config_root: &std::path::Path,
 ) -> Result<nexus_session::SessionManager, String> {
-    use nexus_session::{
-        DEFAULT_ATTACH_WINDOW_SECS, SessionManager, reconcile_session_records_at,
-    };
+    use nexus_session::{DEFAULT_ATTACH_WINDOW_SECS, SessionManager, reconcile_session_records_at};
 
     let store =
         nexus::n2_store::N2Store::open(config_root).map_err(|e| format!("open n2 store: {e}"))?;
@@ -233,7 +231,9 @@ pub fn assemble_n2_session_manager(
     let journal_entries = match store.replay_journal() {
         Ok(entries) => entries,
         Err(e) => {
-            eprintln!("[nexusd] WARN: N2 journal replay failed ({e}); discarding torn tail explicitly");
+            eprintln!(
+                "[nexusd] WARN: N2 journal replay failed ({e}); discarding torn tail explicitly"
+            );
             store
                 .kv()
                 .journal_discard_torn_tail()

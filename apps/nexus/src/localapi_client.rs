@@ -641,7 +641,10 @@ mod tests {
     fn runtime_socket_path_requires_xdg_runtime_dir() {
         // P1-15：daemon 不得回落到可预测的 /tmp 路径（可被同机他人抢占）。
         assert_eq!(runtime_socket_path_in(None), None);
-        assert_eq!(runtime_socket_path_in(Some(std::ffi::OsString::new())), None);
+        assert_eq!(
+            runtime_socket_path_in(Some(std::ffi::OsString::new())),
+            None
+        );
         assert_eq!(
             runtime_socket_path_in(Some(std::ffi::OsString::from("/run/user/1000"))),
             Some(PathBuf::from("/run/user/1000").join("nexus-localapi.sock"))

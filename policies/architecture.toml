@@ -287,44 +287,57 @@ layer = "delivery"
 # ---------------------------------------------------------------------------
 # N2 资源类型中立门禁（P0-6，完成标志 #6；综合规划 D5 bunny 架构门禁）
 #
-# nexus-domain / nexus-registry / nexus-planner / nexus-session 四个核心 crate
-# 不得出现资源类型（service/network/workspace/compute/device）专属分支：
-# 禁止按资源类型分叉行为的 match 分支 / 条件逻辑。类型化 extension 字段本身
-# （如 ServicePlanExtension）允许——禁的是"按类型分叉行为"，不是"提到类型"。
+# PRODUCT §16.4-6 规定的四 crate：`nexus-registry` / `nexus-planner` /
+# `nexus-session` / `nexus-auth` 不得出现资源类型（service/network/workspace/
+# compute/device）专属分支：禁止按资源类型分叉行为的 match 分支 / 条件逻辑。
+# 类型化 extension 字段本身（如 ServicePlanExtension）允许——禁的是"按类型分叉
+# 行为"，不是"提到类型"。
+#
+# N2 P1-5：此前本节声明的是 `nexus-domain` 而非契约要求的 `nexus-auth`
+# （四 crate 集合与 PRODUCT §16.4-6 不一致，`nexus-auth` 侥幸无命中）；
+# 现已与契约对齐。
 #
 # 机器检查：harness gate `resource-type-neutrality`（verify --fast 可跑）；
 # 扫描四 crate `src/**/*.rs`，flag 同时含"变体引用"（`ResourceKind::V` /
-# `Self::V`）与"分支 token"（`=>` / `matches!` / `if`＋`==`/`!=`）的代码行；
-# 命中 [[resource_kind_neutrality.allow]] 的除外。
-# fail-closed：本节缺失 / allow 条目缺失 → FAIL，不静默放过。
+# `Self::V`）与"分支 token"（`=>` / `matches!` / `if`＋`==`/`!=`）的**逻辑行**
+# （跨行拼接的 `matches!(kind,\n ResourceKind::Service)` 同样命中——N2 P1-6）；
+# 命中 [[resource_kind_neutrality.allow]] 的除外（allow 必须精确到行号＋内容）。
+# fail-closed：目录缺失 / 零 .rs 文件 / policy 缺失 → FAIL，不静默放过。
 # ---------------------------------------------------------------------------
 [resource_kind_neutrality]
-crates = ["nexus-domain", "nexus-registry", "nexus-planner", "nexus-session"]
+crates = ["nexus-registry", "nexus-planner", "nexus-session", "nexus-auth"]
 variants = ["Network", "Service", "Workspace", "Compute", "Device"]
 
 # 允许的特化点（穷举；新增需评审＋更新本 policy）：
 # 类型自身的定义/规范序列化——各变体行为一致（均返回静态字符串），非行为分叉。
+# N2 P1-6：`line` 把 allow 钉到具体行——"文件＋子串"会让同一文件里新增的
+# 行为分叉被静默放行（子串相同的第二条分支也一起放行）。
 [[resource_kind_neutrality.allow]]
 file = "crates/nexus-domain/src/lib.rs"
+line = 159
 contains = "Self::Network =>"
 reason = "ResourceKind::as_str 规范序列化（类型自身定义）"
 
 [[resource_kind_neutrality.allow]]
 file = "crates/nexus-domain/src/lib.rs"
+line = 160
 contains = "Self::Service =>"
 reason = "ResourceKind::as_str 规范序列化（类型自身定义）"
 
 [[resource_kind_neutrality.allow]]
 file = "crates/nexus-domain/src/lib.rs"
+line = 161
 contains = "Self::Workspace =>"
 reason = "ResourceKind::as_str 规范序列化（类型自身定义）"
 
 [[resource_kind_neutrality.allow]]
 file = "crates/nexus-domain/src/lib.rs"
+line = 162
 contains = "Self::Compute =>"
 reason = "ResourceKind::as_str 规范序列化（类型自身定义）"
 
 [[resource_kind_neutrality.allow]]
 file = "crates/nexus-domain/src/lib.rs"
+line = 163
 contains = "Self::Device =>"
 reason = "ResourceKind::as_str 规范序列化（类型自身定义）"

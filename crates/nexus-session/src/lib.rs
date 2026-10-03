@@ -869,13 +869,9 @@ mod tests {
         assert_eq!(rec.outcome, TerminalOutcome::Cancelled);
         assert_eq!(rec.phase, LifecyclePhase::Disposed);
         // 幂等。
-        let again = reconcile_session_records_at(
-            &mut store,
-            false,
-            9999,
-            DEFAULT_ATTACH_WINDOW_SECS,
-        )
-        .unwrap();
+        let again =
+            reconcile_session_records_at(&mut store, false, 9999, DEFAULT_ATTACH_WINDOW_SECS)
+                .unwrap();
         assert_eq!(again.orphans_classified, 0);
         assert_eq!(store.records[0].outcome, TerminalOutcome::Cancelled);
     }
@@ -890,7 +886,10 @@ mod tests {
             reconcile_session_records_at(&mut store, false, 5000, DEFAULT_ATTACH_WINDOW_SECS)
                 .unwrap();
         assert_eq!(report.orphans_classified, 1);
-        assert!(matches!(store.records[0].outcome, TerminalOutcome::Failed(_)));
+        assert!(matches!(
+            store.records[0].outcome,
+            TerminalOutcome::Failed(_)
+        ));
     }
 
     #[test]
@@ -911,7 +910,10 @@ mod tests {
         // 纯函数分类矩阵（顺序无关的穷举）。
         use UnfinishedClass::{DetachedCancelled, KeepAlive, OrphanFailed};
         // 无断开标记：无存活 Owner → 孤儿；有 → 保留。
-        assert_eq!(classify_unfinished(None, false, Some((0, 10))), OrphanFailed);
+        assert_eq!(
+            classify_unfinished(None, false, Some((0, 10))),
+            OrphanFailed
+        );
         assert_eq!(classify_unfinished(None, true, Some((0, 10))), KeepAlive);
         // 有断开标记：窗口内保留、超窗 Cancelled。
         assert_eq!(
@@ -1653,10 +1655,9 @@ impl SessionManager {
         };
         meta.detached_at_unix = None;
         self.persist(id)?;
-        self.get(id)
-            .ok_or_else(|| SessionManagerError::NotFound {
-                session: id.clone(),
-            })
+        self.get(id).ok_or_else(|| SessionManagerError::NotFound {
+            session: id.clone(),
+        })
     }
 
     /// 扫描断开超窗的会话 → 提交 `Cancelled(ClientDetached)`。
@@ -2075,15 +2076,13 @@ mod manager_tests {
         // 模拟进程重启：新 manager 从同一 store 加载。
         let mut mgr2 = restart(&mut mgr);
         assert_eq!(
-            mgr2
-                .get(&id)
+            mgr2.get(&id)
                 .map(|v| v.outcome == TerminalOutcome::Unfinished),
             Some(true)
         );
         // 窗口内不 sweep。
         assert!(
-            mgr2
-                .sweep_detached(1000 + DEFAULT_ATTACH_WINDOW_SECS - 1)
+            mgr2.sweep_detached(1000 + DEFAULT_ATTACH_WINDOW_SECS - 1)
                 .is_empty()
         );
         // 窗口外 sweep 命中（重启后仍收敛）。
@@ -2108,8 +2107,7 @@ mod manager_tests {
         );
         // 超出窗口后再 detach → false（真实判定）。
         assert!(
-            !mgr
-                .note_client_detached(&id, 1000 + 2 * DEFAULT_ATTACH_WINDOW_SECS)
+            !mgr.note_client_detached(&id, 1000 + 2 * DEFAULT_ATTACH_WINDOW_SECS)
                 .unwrap()
         );
     }

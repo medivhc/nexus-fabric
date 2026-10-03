@@ -101,11 +101,7 @@ fn render(out: &Value, json_mode: bool) {
 ///
 /// 返回 `(session_id, plan_snapshot, endpoint)`；错误为结构化 `Value`
 ///（`verdict: FAIL` 的 JSON body）。
-pub fn use_resource(
-    node_dir: &std::path::Path,
-    name: &str,
-    now: u64,
-) -> Result<UseOutcome, Value> {
+pub fn use_resource(node_dir: &std::path::Path, name: &str, now: u64) -> Result<UseOutcome, Value> {
     // ---- 0. `--` 后命令诚实拒绝（D4；`use` 不执行命令，那是 N3） ----
     // （参数层已拦截；此处为内核级二次保护。）
 
@@ -864,8 +860,7 @@ mod tests {
             .put("n2/lease/sess-legacy", b"{\"session\":\"sess-legacy\"}")
             .unwrap();
         assert_eq!(
-            crate::n2_admission::purge_expired_leases_in(&store, 999_999)
-                .unwrap(),
+            crate::n2_admission::purge_expired_leases_in(&store, 999_999).unwrap(),
             0
         );
         assert!(store.kv().get("n2/lease/sess-legacy").unwrap().is_some());

@@ -251,7 +251,10 @@ fn placement_reason(c: &ProviderRecord, required: Option<&str>) -> Option<Reject
 /// "trace 快照 ≠ 打分值"，`plan explain` 不可重放。真实测量源（主动探测）
 /// 下重复调用还意味着成本三倍。
 #[must_use]
-fn measure_all<F>(candidates: &[ProviderRecord], measure: &F) -> HashMap<ProviderId, LinkMeasurement>
+fn measure_all<F>(
+    candidates: &[ProviderRecord],
+    measure: &F,
+) -> HashMap<ProviderId, LinkMeasurement>
 where
     F: Fn(&ProviderId) -> Option<LinkMeasurement>,
 {
@@ -291,9 +294,7 @@ pub fn score_candidates_with(
         .iter()
         .map(|c| {
             let measurement = measurements.get(&c.id);
-            let rtt = measurement
-                .and_then(|m| m.rtt_ms)
-                .filter(|_| max_rtt > 0);
+            let rtt = measurement.and_then(|m| m.rtt_ms).filter(|_| max_rtt > 0);
             let rtt_term = rtt.map_or(0, |ms| {
                 let scaled = (max_rtt.saturating_sub(ms)) as u64 * SCORE_SCALE / max_rtt as u64;
                 scaled as u32
@@ -436,11 +437,7 @@ where
     // Measurement 快照共用同一份值——trace 快照恒等于打分所用值（explain 可重放），
     // 且真实测量源的成本不再三倍。
     let measurements = measure_all(&snapshot.candidates, &measure);
-    let scored = score_candidates_with(
-        &feasible,
-        &measurements,
-        snapshot.local_provider.as_ref(),
-    );
+    let scored = score_candidates_with(&feasible, &measurements, snapshot.local_provider.as_ref());
     let score_of = |id: &ProviderId| scored.iter().find(|s| s.record.id == *id);
     let considered: Vec<ConsideredCandidate> = filtered
         .iter()

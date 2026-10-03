@@ -565,7 +565,10 @@ pub fn purge_expired_leases_in(store: &N2Store, now: u64) -> Result<usize, Strin
         let Some(session) = key.strip_prefix("n2/lease/") else {
             continue;
         };
-        let Some(bytes) = store.kv().get(&key).map_err(|e| format!("read lease {key}: {e}"))?
+        let Some(bytes) = store
+            .kv()
+            .get(&key)
+            .map_err(|e| format!("read lease {key}: {e}"))?
         else {
             continue;
         };
@@ -649,12 +652,11 @@ fn serve_connections(
                 let counter = inflight.clone();
                 let dir = node_dir.to_path_buf();
                 // P1-19：每连接一线程；线程内完成握手后回收计数。
-                let spawned = std::thread::Builder::new()
-                    .spawn(move || {
-                        let summary = serve_one_connection(&mut stream, &dir);
-                        eprintln!("{summary}");
-                        counter.fetch_sub(1, Ordering::Relaxed);
-                    });
+                let spawned = std::thread::Builder::new().spawn(move || {
+                    let summary = serve_one_connection(&mut stream, &dir);
+                    eprintln!("{summary}");
+                    counter.fetch_sub(1, Ordering::Relaxed);
+                });
                 if let Err(e) = spawned {
                     inflight.fetch_sub(1, Ordering::Relaxed);
                     eprintln!("n2-admission: spawn handler failed: {e}");
@@ -748,12 +750,10 @@ pub fn admit_session(
 }
 
 /// 读掉提供方推来的全部公告帧（以 len=0 终止标记收尾）。
-fn collect_announcements(
-    stream: &mut TcpStream,
-) -> Result<Vec<Vec<u8>>, AdmitError> {
+fn collect_announcements(stream: &mut TcpStream) -> Result<Vec<Vec<u8>>, AdmitError> {
     let mut out = Vec::new();
-    while let Some(payload) =
-        read_optional_frame(stream).map_err(|e| AdmitError::Protocol(format!("read announcement: {e}")))?
+    while let Some(payload) = read_optional_frame(stream)
+        .map_err(|e| AdmitError::Protocol(format!("read announcement: {e}")))?
     {
         out.push(payload);
         // 上限保护：提供方异常时不让请求方无限缓冲。
@@ -816,8 +816,8 @@ fn resource_id_of_name(store: &N2Store, name: &str) -> Option<ResourceId> {
 }
 
 fn parse_admission_response(body: &[u8]) -> Result<AdmissionVerdict, AdmitError> {
-    let v: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|e| AdmitError::Protocol(format!("json: {e}")))?;
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| AdmitError::Protocol(format!("json: {e}")))?;
     match v.get("verdict").and_then(serde_json::Value::as_str) {
         Some("admit") => {
             let provider = v
@@ -1182,14 +1182,27 @@ mod tests {
         let summary = rx.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(summary.contains("outbox: 1 frame(s) sent"), "{summary}");
         // B 侧 outbox 已出队（不重复发）。
-        assert!(N2Store::open(&dir_b).unwrap().outbox_list().unwrap().is_empty());
+        assert!(
+            N2Store::open(&dir_b)
+                .unwrap()
+                .outbox_list()
+                .unwrap()
+                .is_empty()
+        );
         // A 侧缓存广告被撤销公告失效。
         assert!(
-            N2Store::open(&dir_a).unwrap().load_ads().unwrap().is_empty(),
+            N2Store::open(&dir_a)
+                .unwrap()
+                .load_ads()
+                .unwrap()
+                .is_empty(),
             "requester must drop the revoked cached advertisement"
         );
         // 幂等：ack 高水位已记录。
-        assert_eq!(N2Store::open(&dir_a).unwrap().outbox_acked_seq().unwrap(), 1);
+        assert_eq!(
+            N2Store::open(&dir_a).unwrap().outbox_acked_seq().unwrap(),
+            1
+        );
         let _ = std::fs::remove_dir_all(&dir_b);
         let _ = std::fs::remove_dir_all(&dir_a);
     }
@@ -1251,7 +1264,10 @@ mod tests {
             "sess-pump-2",
             &ResourceId("res-svc-b".into()),
         );
-        assert!(matches!(verdict, Ok(AdmissionVerdict::Admitted { .. })), "{verdict:?}");
+        assert!(
+            matches!(verdict, Ok(AdmissionVerdict::Admitted { .. })),
+            "{verdict:?}"
+        );
         let summary = rx.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(summary.contains("outbox: 0 frame(s) sent"), "{summary}");
         let _ = std::fs::remove_dir_all(&dir_b);
@@ -1333,7 +1349,10 @@ mod tests {
         let mut fixed = ad.clone();
         fixed.locators.reverse();
         assert!(fixed.has_valid_locator_order());
-        assert_eq!(service_locator_of(&fixed).as_deref(), Some("10.0.0.10:8080"));
+        assert_eq!(
+            service_locator_of(&fixed).as_deref(),
+            Some("10.0.0.10:8080")
+        );
     }
 
     // ---- P1-19：并发准入 ----

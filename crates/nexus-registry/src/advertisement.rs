@@ -138,7 +138,7 @@ pub struct ProviderAdvertisement {
 pub const CONTROL_LOCATOR_PREFIX: &str = "n2adm://";
 
 impl ProviderAdvertisement {
-/// 数据面（Service）入口 locator（首个非 `n2adm://` 条目）；无则 `None`。
+    /// 数据面（Service）入口 locator（首个非 `n2adm://` 条目）；无则 `None`。
     ///
     /// 冻结顺序：**首个非控制端点**，不是 `locators[0]`。
     #[must_use]

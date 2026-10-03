@@ -46,8 +46,9 @@ static WORKSPACE_MGR: std::sync::OnceLock<
 /// - [`spawn_n2_session_sweeper`] 的周期性 `sweep_detached` 在这里提交终态。
 ///
 /// `None` = 装配失败（degraded：daemon 照常跑，LocalAPI 返回结构化 FAIL）。
-static N2_SESSION_MANAGER: std::sync::OnceLock<std::sync::Mutex<Option<nexus_session::SessionManager>>> =
-    std::sync::OnceLock::new();
+static N2_SESSION_MANAGER: std::sync::OnceLock<
+    std::sync::Mutex<Option<nexus_session::SessionManager>>,
+> = std::sync::OnceLock::new();
 
 /// N2 会话清扫周期（秒）：断开超 attach window 的会话由 daemon 收敛为
 /// `Cancelled(ClientDetached)`（P1-2：`sweep_detached` 生产可达）。
@@ -66,31 +67,35 @@ fn spawn_n2_session_sweeper(shutdown: &std::sync::Arc<std::sync::atomic::AtomicB
     let flag = shutdown.clone();
     std::thread::Builder::new()
         .name("n2-session-sweeper".to_string())
-        .spawn(move || loop {
-            for _ in 0..N2_SESSION_SWEEP_INTERVAL_SECS {
+        .spawn(move || {
+            loop {
+                for _ in 0..N2_SESSION_SWEEP_INTERVAL_SECS {
+                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
                 if flag.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            }
-            if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                return;
-            }
-            let swept = {
-                let Some(cell) = N2_SESSION_MANAGER.get() else {
-                    continue;
+                let swept = {
+                    let Some(cell) = N2_SESSION_MANAGER.get() else {
+                        continue;
+                    };
+                    let Ok(mut guard) = cell.lock() else {
+                        eprintln!("[nexusd] WARN: N2 session sweeper: manager lock poisoned");
+                        return;
+                    };
+                    let Some(mgr) = guard.as_mut() else {
+                        continue;
+                    };
+                    mgr.sweep_detached(now_unix())
                 };
-                let Ok(mut guard) = cell.lock() else {
-                    eprintln!("[nexusd] WARN: N2 session sweeper: manager lock poisoned");
-                    return;
-                };
-                let Some(mgr) = guard.as_mut() else {
-                    continue;
-                };
-                mgr.sweep_detached(now_unix())
-            };
-            for id in swept {
-                eprintln!("[nexusd] N2 session detached beyond attach window -> Cancelled: {id:?}");
+                for id in swept {
+                    eprintln!(
+                        "[nexusd] N2 session detached beyond attach window -> Cancelled: {id:?}"
+                    );
+                }
             }
         })
         .map(|_| ())
@@ -137,14 +142,12 @@ fn n2_session_list() -> Result<Value, (String, String)> {
             "N2 session manager not assembled".to_string(),
         ));
     };
-    let guard = cell
-        .lock()
-        .map_err(|_| {
-            (
-                "N2_UNAVAILABLE".to_string(),
-                "N2 session manager lock poisoned".to_string(),
-            )
-        })?;
+    let guard = cell.lock().map_err(|_| {
+        (
+            "N2_UNAVAILABLE".to_string(),
+            "N2 session manager lock poisoned".to_string(),
+        )
+    })?;
     let mgr = guard.as_ref().ok_or_else(|| {
         (
             "N2_UNAVAILABLE".to_string(),
@@ -166,14 +169,12 @@ fn n2_session_attach(id: Option<&str>) -> Result<Value, (String, String)> {
             "N2 session manager not assembled".to_string(),
         ));
     };
-    let guard = cell
-        .lock()
-        .map_err(|_| {
-            (
-                "N2_UNAVAILABLE".to_string(),
-                "N2 session manager lock poisoned".to_string(),
-            )
-        })?;
+    let guard = cell.lock().map_err(|_| {
+        (
+            "N2_UNAVAILABLE".to_string(),
+            "N2 session manager lock poisoned".to_string(),
+        )
+    })?;
     let mgr = guard.as_ref().ok_or_else(|| {
         (
             "N2_UNAVAILABLE".to_string(),
@@ -187,7 +188,9 @@ fn n2_session_attach(id: Option<&str>) -> Result<Value, (String, String)> {
         ));
     };
     match mgr.attach(&nexus_domain::SessionId(id.to_string())) {
-        Ok(view) => Ok(json!({"verdict": "PASS", "owner": "daemon", "session": n2_session_view_json(&view)})),
+        Ok(view) => Ok(
+            json!({"verdict": "PASS", "owner": "daemon", "session": n2_session_view_json(&view)}),
+        ),
         Err(_) => Ok(json!({
             "verdict": "FAIL",
             "owner": "daemon",
@@ -875,7 +878,9 @@ fn harden_localapi_socket(path: &str) -> bool {
     match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
         Ok(()) => true,
         Err(e) => {
-            eprintln!("[nexusd] ERROR: chmod 0600 {path} failed: {e}; continuing (bearer token still required)");
+            eprintln!(
+                "[nexusd] ERROR: chmod 0600 {path} failed: {e}; continuing (bearer token still required)"
+            );
             false
         }
     }
