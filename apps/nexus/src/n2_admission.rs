@@ -226,6 +226,17 @@ fn handle_admission(stream: &mut TcpStream, node_dir: &std::path::Path) -> Strin
         Err(e) => return error_response(stream, &format!("directory: {e}"), "store failure"),
     };
     let resource_id = ResourceId(req.resource_id.clone());
+    // 必须查 live 广告而非仅 name 映射：`resource revoke` 删广告（withdraw），
+    // 名字映射是本地别名，撤销后残留不代表仍在提供。
+    if directory
+        .registry()
+        .lookup_ads(&resource_id, now)
+        .is_empty()
+    {
+        let body = serde_json::json!({"v": ADMISSION_PROTOCOL_V1, "verdict": "error", "code": "NOT_FOUND"}).to_string();
+        let _ = write_frame(stream, body.as_bytes());
+        return format!("unknown or withdrawn resource {}", req.resource_id);
+    }
     let Some(name) = directory.name_of_resource(&resource_id) else {
         let body = serde_json::json!({"v": ADMISSION_PROTOCOL_V1, "verdict": "error", "code": "NOT_FOUND"}).to_string();
         let _ = write_frame(stream, body.as_bytes());
@@ -671,6 +682,36 @@ mod tests {
             &dir_a,
             "sess-test-3",
             &ResourceId("res-nope".into()),
+        )
+        .unwrap();
+        assert_eq!(verdict, AdmissionVerdict::NotFound);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&dir_a);
+    }
+
+    #[test]
+    fn withdrawn_resource_is_not_found() {
+        // revoke（删广告）后提供方必须拒绝建 Session：live 广告为空 → NOT_FOUND，
+        // 即使 name 映射残留（revoke 只删广告不删本地别名）。
+        let dir_b = temp_node_dir("b5");
+        let dir_a = temp_node_dir("a5");
+        let (addr, _rx) = serve_once_in_thread(dir_b.clone());
+        publish_svc(&dir_b, &addr.to_string());
+        // 模拟 `resource revoke`：删广告（名字映射保留）。
+        {
+            let store = N2Store::open(&dir_b).unwrap();
+            let provider = ProviderId(local_provider_id(&dir_b));
+            assert!(
+                store
+                    .delete_ad(&provider, &ResourceId("res-svc-b".into()))
+                    .unwrap()
+            );
+        }
+        let verdict = admit_session(
+            &addr.to_string(),
+            &dir_a,
+            "sess-test-5",
+            &ResourceId("res-svc-b".into()),
         )
         .unwrap();
         assert_eq!(verdict, AdmissionVerdict::NotFound);
