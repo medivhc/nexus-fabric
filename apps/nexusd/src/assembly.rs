@@ -224,9 +224,13 @@ pub fn assemble_n2_session_manager(
     let store =
         nexus::n2_store::N2Store::open(config_root).map_err(|e| format!("open n2 store: {e}"))?;
     // §15：先重放 journal（审计轨迹可见性），再 reconcile。
-    let journal_entries = store
-        .replay_journal()
+    // P1-11：boot 是撕裂尾部的生产恢复入口 —— 显式丢弃并留痕，不阻塞启动。
+    let (journal_entries, discarded_torn) = store
+        .replay_journal_at_boot()
         .map_err(|e| format!("replay n2 journal: {e}"))?;
+    if discarded_torn {
+        eprintln!("[nexusd] N2 journal: torn tail discarded at boot (P1-11)");
+    }
     if !journal_entries.is_empty() {
         eprintln!(
             "[nexusd] N2 journal replay: {} entries",

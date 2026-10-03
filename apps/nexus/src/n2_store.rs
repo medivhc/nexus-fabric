@@ -37,6 +37,10 @@ use serde_json::{Map, Value, json};
 /// N2 存储目录名（node_dir 下）。
 pub const N2_DIR_NAME: &str = "n2";
 
+/// journal 轮转上限（P1-11）：超过则把当前 journal 归档为 `journal.log.1`
+/// （覆盖上一代），retained 上界 = 2 × 上限，消除无界增长。
+const JOURNAL_LIMIT_BYTES: u64 = 8 * 1024 * 1024;
+
 /// N2 存储目录：`<node_dir>/n2/`。
 #[must_use]
 pub fn n2_dir(node_dir: &Path) -> PathBuf {
@@ -60,7 +64,8 @@ impl N2Store {
     /// 打开（不存在则创建）`<node_dir>/n2/`。
     pub fn open(node_dir: &Path) -> Result<Self, String> {
         let dir = n2_dir(node_dir);
-        let kv = FileKvStore::open(&dir).map_err(|e| format!("open n2 store: {e}"))?;
+        let kv = FileKvStore::open_with_journal_limit(&dir, JOURNAL_LIMIT_BYTES)
+            .map_err(|e| format!("open n2 store: {e}"))?;
         Ok(Self { kv: Arc::new(kv) })
     }
 
@@ -87,10 +92,39 @@ impl N2Store {
     }
 
     /// journal 重放（§15：审计轨迹；返回原始 payload）。
+    ///
+    /// 撕裂尾部保持 fail-closed（查询/取证路径不应静默丢数据）。
     pub fn replay_journal(&self) -> Result<Vec<Vec<u8>>, String> {
         self.kv
             .journal_replay()
             .map_err(|e| format!("replay n2 journal: {e}"))
+    }
+
+    /// boot 重放（P1-11：生产恢复入口）。
+    ///
+    /// 与 [`Self::replay_journal`] 的区别：crash 在 append 中途留下的撕裂尾部
+    /// 在 boot 路径上**显式丢弃并返回标记**（fail-loud，由调用方打日志留痕），
+    /// 让 daemon 能继续启动；非撕裂的 `Corrupt`/`Io` 仍然报错。
+    /// 返回 `(完整记录, 是否丢弃过撕裂尾部)`。
+    pub fn replay_journal_at_boot(&self) -> Result<(Vec<Vec<u8>>, bool), String> {
+        match self.kv.journal_replay() {
+            Ok(records) => Ok((records, false)),
+            Err(nexus_storage::StorageError::TornJournalTail { path }) => {
+                self.kv
+                    .journal_discard_torn_tail()
+                    .map_err(|e| format!("discard torn n2 journal tail: {e}"))?;
+                eprintln!(
+                    "[n2] WARN: torn journal tail discarded at boot ({})",
+                    path.display()
+                );
+                let records = self
+                    .kv
+                    .journal_replay()
+                    .map_err(|e| format!("replay n2 journal after discard: {e}"))?;
+                Ok((records, true))
+            }
+            Err(e) => Err(format!("replay n2 journal: {e}")),
+        }
     }
 }
 

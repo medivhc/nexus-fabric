@@ -7,11 +7,19 @@
 //! 在此加强为 tmp + fsync(file) + rename + fsync(dir)）：
 //! - `put`：同目录临时文件（`create_new`，防并发覆盖）→ 写全 → `sync_all`
 //!   → 原子 `rename` → 目录 `sync_all`。进程中途崩溃只留下孤儿 tmp 文件，
-//!   不留下截断的目标文件（下次 `open`/`put` 可清理孤儿 tmp）。
-//! - `journal_append`：write-ahead 日志，`[len:u32 LE][payload]` 追加 + fsync，
-//!   返回单调 seq。boot 时 `journal_replay` 按序重放；尾部撕裂（crash 写一半）
+//!   不留下截断的目标文件。tmp 名含进程级随机 salt（P1-10：pid 复用时孤儿
+//!   `.tmp-{pid}-{seq}` 会让 `create_new` 永久 `AlreadyExists`）；`create_new`
+//!   冲突还会重试换名；`open` 清理超过宽限期的孤儿 `.tmp-*`。
+//! - `journal_append`：write-ahead 日志，`[len:u32 LE][payload]` —— header 与
+//!   payload 先拼进同一缓冲区再**单次 `write`**（P1-11：两次 `write_all` 在并发
+//!   追加者之间可能交错，撕裂尾部会让整条 journal 不可读）；部分写出则回退到
+//!   写入前长度，保证 journal 始终是完整记录的前缀。写完 fsync，返回单调 seq。
+//!   boot 时 `journal_replay` 按序重放（含轮转归档）；尾部撕裂（crash 写一半）
 //!   直接报错 `TornJournalTail`（fail-closed，不静默丢弃），调用方显式
 //!   `journal_discard_torn_tail` 后才能继续。
+//! - journal 轮转：`open_with_journal_limit` 设上限后，`journal_append` 超限时把
+//!   当前 journal 归档为 `journal.log.1`（覆盖上一代），retained 上界 = 2×limit，
+//!   消除无界增长；`journal_replay` 先读归档再读当前，重放顺序即追加顺序。
 //!
 //! 键编码：文件名安全子集 `[A-Za-z0-9._-]` 原样保留，其余字节 `%XX` 转义
 //! （大写 hex），可逆；`list` 返回解码后的原始键。空键 / >256 字节拒绝。
@@ -25,6 +33,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const TMP_PREFIX: &str = ".tmp-";
 /// journal 文件名。
 const JOURNAL_NAME: &str = "journal.log";
+/// journal 轮转归档文件名（单代；归档顺序 = 追加顺序的前段）。
+const JOURNAL_ARCHIVE_NAME: &str = "journal.log.1";
+/// 孤儿 tmp 清理宽限期（秒）：只删 mtime 早于该值的 `.tmp-*`，
+/// 避免误删并发写者仍在使用的在途临时文件。
+const TMP_ORPHAN_GRACE_SECS: u64 = 300;
 /// 键最大字节数。
 const MAX_KEY_BYTES: usize = 256;
 
@@ -67,6 +80,10 @@ impl std::error::Error for StorageError {}
 pub struct FileKvStore {
     dir: PathBuf,
     tmp_seq: AtomicU64,
+    /// tmp 名进程级随机 salt（P1-10：跨进程 pid 复用时区分孤儿）。
+    tmp_salt: u64,
+    /// journal 轮转上限（字节）；`None` = 不轮转。
+    journal_limit: Option<u64>,
 }
 
 impl FileKvStore {
@@ -75,14 +92,44 @@ impl FileKvStore {
     /// 目录权限由调用方按需收紧（如节点身份目录 0700；本 crate 为 portable-core
     /// 仅 std，不做平台权限调用）。
     pub fn open(dir: &Path) -> Result<Self, StorageError> {
+        Self::open_inner(dir, None)
+    }
+
+    /// 打开并启用 journal 轮转上限（超过则归档为 `journal.log.1`）。
+    ///
+    /// `max_bytes` 为 0 视作未设上限。
+    pub fn open_with_journal_limit(dir: &Path, max_bytes: u64) -> Result<Self, StorageError> {
+        Self::open_inner(dir, if max_bytes == 0 { None } else { Some(max_bytes) })
+    }
+
+    fn open_inner(dir: &Path, journal_limit: Option<u64>) -> Result<Self, StorageError> {
         std::fs::create_dir_all(dir).map_err(|e| StorageError::Io {
             path: dir.to_path_buf(),
             message: format!("create kv dir: {e}"),
         })?;
+        // P1-10：清理超过宽限期的孤儿 `.tmp-*`（文档承诺的 open 时清理）。
+        clean_orphan_tmp(dir)?;
         Ok(Self {
             dir: dir.to_path_buf(),
             tmp_seq: AtomicU64::new(0),
+            tmp_salt: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+                ^ (u64::from(std::process::id()) << 32),
+            journal_limit,
         })
+    }
+
+    /// 下一个候选 tmp 路径：`{TMP_PREFIX}{tag}-{pid}-{seq}-{salt}`。
+    ///
+    /// salt 由 `open` 时刻的纳秒与 pid 派生，`seq` 进程内单调 —— 单靠 pid 复用
+    /// 不再能撞名；仍撞名由 `put` 换名重试兜底。
+    fn next_tmp_name(&self, tag: &str) -> PathBuf {
+        let seq = self.tmp_seq.fetch_add(1, Ordering::Relaxed);
+        let salt = self.tmp_salt ^ seq.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.dir
+            .join(format!("{TMP_PREFIX}{tag}-{}-{seq}-{salt:016x}", std::process::id()))
     }
 
     /// KV 根目录。
@@ -110,19 +157,28 @@ impl FileKvStore {
         let target = self
             .path_of(key)
             .ok_or_else(|| StorageError::InvalidKey(key.to_string()))?;
-        let seq = self.tmp_seq.fetch_add(1, Ordering::Relaxed);
-        let tmp = self
-            .dir
-            .join(format!("{TMP_PREFIX}{}-{seq}", std::process::id()));
+        // P1-10：孤儿 tmp 撞名（pid 复用）不再永久失败 —— 换名重试。
+        const MAX_ATTEMPTS: u8 = 8;
+        let mut attempt = 0u8;
+        let (tmp, mut f) = loop {
+            let cand = self.next_tmp_name("put");
+            match OpenOptions::new().write(true).create_new(true).open(&cand) {
+                Ok(f) => break (cand, f),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AlreadyExists
+                        && attempt + 1 < MAX_ATTEMPTS =>
+                {
+                    attempt += 1;
+                }
+                Err(e) => {
+                    return Err(StorageError::Io {
+                        path: cand,
+                        message: format!("create tmp file: {e}"),
+                    });
+                }
+            }
+        };
         {
-            let mut f = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)
-                .map_err(|e| StorageError::Io {
-                    path: tmp.clone(),
-                    message: format!("create tmp file: {e}"),
-                })?;
             f.write_all(value).map_err(|e| StorageError::Io {
                 path: tmp.clone(),
                 message: format!("write tmp file: {e}"),
@@ -190,7 +246,8 @@ impl FileKvStore {
             })?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with(TMP_PREFIX) || name == JOURNAL_NAME {
+            if name.starts_with(TMP_PREFIX) || name == JOURNAL_NAME || name == JOURNAL_ARCHIVE_NAME
+            {
                 continue;
             }
             if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
@@ -208,8 +265,34 @@ impl FileKvStore {
         self.dir.join(JOURNAL_NAME)
     }
 
-    /// write-ahead 追加：`[len:u32 LE][payload]` + fsync，返回单调 seq
-    /// （seq = 记录在文件中的起始偏移；重放顺序即追加顺序）。
+    /// journal 轮转归档路径。
+    fn journal_archive_path(&self) -> PathBuf {
+        self.dir.join(JOURNAL_ARCHIVE_NAME)
+    }
+
+    /// 当前 journal 字节数（不存在 → 0）。
+    fn journal_size(&self) -> Result<u64, StorageError> {
+        match std::fs::metadata(self.journal_path()) {
+            Ok(m) => Ok(m.len()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(e) => Err(StorageError::Io {
+                path: self.journal_path(),
+                message: format!("stat journal: {e}"),
+            }),
+        }
+    }
+
+    /// write-ahead 追加：`[len:u32 LE][payload]` —— header 与 payload 先拼进
+    /// 同一缓冲区再**单次 `write`**（P1-11：并发追加者之间不会交错出撕裂记录），
+    /// 然后 fsync，返回单调 seq（seq = 记录在文件中的起始偏移；重放顺序即
+    /// 追加顺序）。
+    ///
+    /// 部分写出 / 写失败 → 回退到写入前长度，保证 journal 始终是完整记录的前缀
+    /// （不留下半条记录让后续 replay 全盘失败）。
+    ///
+    /// 若 `open_with_journal_limit` 设了上限且超限，追加成功后把当前 journal
+    /// 归档为 `journal.log.1`（覆盖上一代），消除无界增长；归档失败只告警，
+    /// 不影响已落盘的这条记录。
     pub fn journal_append(&self, payload: &[u8]) -> Result<u64, StorageError> {
         let path = self.journal_path();
         let mut f = OpenOptions::new()
@@ -229,59 +312,120 @@ impl FileKvStore {
         let len = u32::try_from(payload.len()).map_err(|_| {
             StorageError::InvalidKey(format!("journal payload too large: {}", payload.len()))
         })?;
-        f.write_all(&len.to_le_bytes())
-            .map_err(|e| StorageError::Io {
-                path: path.clone(),
-                message: format!("write journal len: {e}"),
-            })?;
-        f.write_all(payload).map_err(|e| StorageError::Io {
+        // 单条记录一次性写入（header + payload 同缓冲）。
+        let mut record = Vec::with_capacity(4 + payload.len());
+        record.extend_from_slice(&len.to_le_bytes());
+        record.extend_from_slice(payload);
+        let written = f.write(&record).map_err(|e| StorageError::Io {
             path: path.clone(),
-            message: format!("write journal payload: {e}"),
+            message: format!("write journal record: {e}"),
         })?;
+        if written < record.len() {
+            // 部分写出：截断回追加前长度，journal 仍是完整记录的前缀。
+            let _ = f.set_len(seq);
+            let _ = f.sync_all();
+            return Err(StorageError::Io {
+                path,
+                message: format!(
+                    "partial journal write: {written}/{} bytes",
+                    record.len()
+                ),
+            });
+        }
         f.sync_all().map_err(|e| StorageError::Io {
             path: path.clone(),
             message: format!("fsync journal: {e}"),
         })?;
+        if let Some(limit) = self.journal_limit {
+            if self.journal_size()? >= limit {
+                if let Err(e) = self.rotate_journal() {
+                    eprintln!("[nexus-storage] WARN: journal rotate failed: {e}");
+                }
+            }
+        }
         Ok(seq)
     }
 
-    /// boot 重放：按序返回全部完整记录。
+    /// 轮转当前 journal 到 `journal.log.1`（覆盖上一代；原子 rename + 目录 fsync）。
+    ///
+    /// 返回 `true` 表示确实发生了轮转。
+    fn rotate_journal(&self) -> Result<bool, StorageError> {
+        let path = self.journal_path();
+        if self.journal_size()? == 0 {
+            return Ok(false);
+        }
+        let archive = self.journal_archive_path();
+        std::fs::rename(&path, &archive).map_err(|e| StorageError::Io {
+            path: archive.clone(),
+            message: format!("rotate journal: {e}"),
+        })?;
+        if let Ok(dir_fd) = OpenOptions::new().read(true).open(&self.dir) {
+            let _ = dir_fd.sync_all();
+        }
+        Ok(true)
+    }
+
+    /// boot 重放：按序返回全部完整记录（先归档 `journal.log.1`，再当前
+    /// `journal.log` —— 顺序即追加顺序）。
     ///
     /// 尾部撕裂（长度头不完整 / payload 不足）→ `Err(TornJournalTail)`，
     /// fail-closed；调用方检查后可用 `journal_discard_torn_tail` 显式丢弃。
     pub fn journal_replay(&self) -> Result<Vec<Vec<u8>>, StorageError> {
-        let path = self.journal_path();
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => {
-                return Err(StorageError::Io {
-                    path,
-                    message: format!("read journal: {e}"),
-                });
-            }
-        };
         let mut out = Vec::new();
+        // 归档段在前（更早追加的记录）。
+        let archive = self.journal_archive_path();
+        if let Some(bytes) = self.read_journal_file(&archive)? {
+            Self::decode_journal(&archive, &bytes, &mut out)?;
+        }
+        let current = self.journal_path();
+        if let Some(bytes) = self.read_journal_file(&current)? {
+            Self::decode_journal(&current, &bytes, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// 读 journal 文件；不存在 → `Ok(None)`。
+    fn read_journal_file(&self, path: &Path) -> Result<Option<Vec<u8>>, StorageError> {
+        match std::fs::read(path) {
+            Ok(b) => Ok(Some(b)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(StorageError::Io {
+                path: path.to_path_buf(),
+                message: format!("read journal: {e}"),
+            }),
+        }
+    }
+
+    /// 解码单个 journal 文件的完整记录，追加到 `out`。
+    fn decode_journal(
+        path: &Path,
+        bytes: &[u8],
+        out: &mut Vec<Vec<u8>>,
+    ) -> Result<(), StorageError> {
         let mut off = 0usize;
         while off < bytes.len() {
             let rest = &bytes[off..];
             if rest.len() < 4 {
-                return Err(StorageError::TornJournalTail { path });
+                return Err(StorageError::TornJournalTail {
+                    path: path.to_path_buf(),
+                });
             }
             let len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
             if len > 64 * 1024 * 1024 {
                 return Err(StorageError::Corrupt {
-                    path,
+                    path: path.to_path_buf(),
                     reason: format!("journal record len out of range: {len}"),
                 });
             }
             if rest.len() < 4 + len {
-                return Err(StorageError::TornJournalTail { path });
+                return Err(StorageError::TornJournalTail {
+                    path: path.to_path_buf(),
+                });
             }
             out.push(rest[4..4 + len].to_vec());
             off += 4 + len;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// 显式丢弃撕裂尾部（reconciliation 路径调用；审计留痕由调用方负责）。
@@ -313,9 +457,7 @@ impl FileKvStore {
             return Ok(()); // 无撕裂，无事可做。
         }
         // 截断到最后一条完整记录（原子：tmp + fsync + rename）。
-        let tmp = self
-            .dir
-            .join(format!("{TMP_PREFIX}journal-{}", std::process::id()));
+        let tmp = self.next_tmp_name("journal");
         {
             let mut f = OpenOptions::new()
                 .write(true)
@@ -348,16 +490,23 @@ impl FileKvStore {
     }
 
     /// 清空 journal（调用方已把记录应用到状态之后；幂等）。
+    ///
+    /// 同时删除轮转归档 `journal.log.1`：两者都是"已被应用"的轨迹，
+    /// 只清当前会留下归档段在重放时复活。
     pub fn journal_truncate(&self) -> Result<(), StorageError> {
-        let path = self.journal_path();
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(StorageError::Io {
-                path,
-                message: format!("truncate journal: {e}"),
-            }),
+        for path in [self.journal_path(), self.journal_archive_path()] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(StorageError::Io {
+                        path,
+                        message: format!("truncate journal: {e}"),
+                    });
+                }
+            }
         }
+        Ok(())
     }
 }
 
@@ -411,6 +560,47 @@ fn decode_key(encoded: &str) -> Option<String> {
         }
     }
     String::from_utf8(bytes).ok()
+}
+
+/// 清理孤儿临时文件（`open` 时调用，P1-10）。
+///
+/// 只删 mtime 早于 [`TMP_ORPHAN_GRACE_SECS`] 的 `.tmp-*`：宽限期内的文件可能
+/// 属于仍在写入的并发进程（同目录的另一个 `FileKvStore`），不能动。
+/// 删除失败（被并发进程抢先删掉等）一律忽略 —— 清理是尽力而为的卫生动作。
+fn clean_orphan_tmp(dir: &Path) -> Result<(), StorageError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(StorageError::Io {
+                path: dir.to_path_buf(),
+                message: format!("scan tmp dir: {e}"),
+            });
+        }
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with(TMP_PREFIX) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let age = now.duration_since(modified).unwrap_or_default().as_secs();
+        if age < TMP_ORPHAN_GRACE_SECS {
+            continue;
+        }
+        let _ = std::fs::remove_file(entry.path());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -535,6 +725,92 @@ mod tests {
         }
         let kv = FileKvStore::open(&dir).unwrap();
         assert_eq!(kv.journal_replay().unwrap(), vec![b"audit-1".to_vec()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 把文件 mtime 改到 `secs` 之前（模拟"很久以前崩溃留下的孤儿"）。
+    fn backdate(path: &Path, secs: u64) {
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        f.set_times(std::fs::FileTimes::new().set_modified(t))
+            .unwrap();
+    }
+
+    /// P1-10：`open` 清理超宽限期的孤儿 tmp，但放过仍在宽限期内的在途 tmp。
+    #[test]
+    fn open_cleans_expired_orphan_tmp_but_spares_fresh_ones() {
+        let dir = tmpdir("orphanclean");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = dir.join(format!("{TMP_PREFIX}12345-0"));
+        std::fs::write(&stale, b"stale").unwrap();
+        backdate(&stale, TMP_ORPHAN_GRACE_SECS + 60);
+        let inflight = dir.join(format!("{TMP_PREFIX}99999-0"));
+        std::fs::write(&inflight, b"inflight").unwrap();
+
+        FileKvStore::open(&dir).unwrap();
+        assert!(!stale.exists(), "expired orphan tmp must be cleaned");
+        assert!(inflight.exists(), "fresh tmp may belong to a live writer");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1-10：tmp 名撞车（pid 复用留下的同名孤儿）时 `put` 换名重试，
+    /// 不再永久 `AlreadyExists`。
+    #[test]
+    fn put_retries_instead_of_failing_forever_on_tmp_collision() {
+        let dir = tmpdir("tmpcollision");
+        let kv = FileKvStore::open(&dir).unwrap();
+        // 预先占掉下一个 tmp 名，等价于 pid 复用时撞上历史孤儿。
+        let blocked = kv.next_tmp_name("put");
+        std::fs::write(&blocked, b"orphan").unwrap();
+
+        kv.put("k", b"v").unwrap();
+        assert_eq!(kv.get("k").unwrap(), Some(b"v".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1-11：journal 轮转上限生效，且归档段 + 当前段的重放顺序 == 追加顺序。
+    #[test]
+    fn journal_rotation_bounds_growth_and_preserves_replay_order() {
+        let dir = tmpdir("rotate");
+        // 上限 64B；每条记录 4 + 20 = 24B。
+        let kv = FileKvStore::open_with_journal_limit(&dir, 64).unwrap();
+        let rec = [b'x'; 20];
+        for _ in 0..3 {
+            kv.journal_append(&rec).unwrap();
+        }
+        // 第 3 条追加后 journal 达 72B ≥ 64B → 已归档。
+        assert!(dir.join(JOURNAL_ARCHIVE_NAME).exists());
+
+        kv.journal_append(&rec).unwrap();
+        assert_eq!(kv.journal_replay().unwrap().len(), 4, "order preserved");
+
+        // 再追加两条触发第二次轮转：上一代归档被覆盖，retained 有界。
+        kv.journal_append(&rec).unwrap();
+        kv.journal_append(&rec).unwrap();
+        assert_eq!(kv.journal_replay().unwrap().len(), 3);
+        let archive_len = std::fs::metadata(dir.join(JOURNAL_ARCHIVE_NAME))
+            .unwrap()
+            .len();
+        assert!(
+            archive_len <= 72,
+            "rotation must bound growth, got {archive_len}B"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1-11：`journal_truncate` 同时清掉归档段，避免已应用记录在重放中复活。
+    #[test]
+    fn journal_truncate_also_drops_archive() {
+        let dir = tmpdir("truncate-archive");
+        let kv = FileKvStore::open_with_journal_limit(&dir, 64).unwrap();
+        let rec = [b'x'; 20];
+        for _ in 0..3 {
+            kv.journal_append(&rec).unwrap();
+        }
+        assert!(dir.join(JOURNAL_ARCHIVE_NAME).exists());
+        kv.journal_append(&rec).unwrap();
+        kv.journal_truncate().unwrap();
+        assert!(kv.journal_replay().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
