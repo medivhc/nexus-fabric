@@ -751,6 +751,26 @@ impl N2Store {
         Ok(())
     }
 
+    /// 删除一条 grant（物理删除；删除后判定为 `NoSuchGrant`）。
+    ///
+    /// 幂等：不存在 → `Ok(false)`。
+    pub fn delete_grant(
+        &self,
+        resource: &nexus_domain::ResourceRef,
+        principal: &nexus_auth::Principal,
+    ) -> Result<bool, String> {
+        let key = grant_key(resource, principal);
+        let existed = self
+            .kv
+            .get(&key)
+            .map_err(|e| format!("read grant for delete: {e}"))?
+            .is_some();
+        self.kv
+            .delete(&key)
+            .map_err(|e| format!("delete grant: {e}"))?;
+        Ok(existed)
+    }
+
     /// 加载全部 grant。
     pub fn load_grants(&self) -> Result<Vec<nexus_auth::Grant>, String> {
         let mut out = Vec::new();
@@ -867,7 +887,7 @@ fn parse_unavailability(v: &Value) -> Result<UnavailabilityReason, String> {
     }
 }
 
-fn encode_ad(ad: &ProviderAdvertisement) -> Value {
+pub(crate) fn encode_ad(ad: &ProviderAdvertisement) -> Value {
     json!({
         "provider": ad.provider.0,
         "resource": ad.resource.0,
@@ -885,7 +905,7 @@ fn encode_ad(ad: &ProviderAdvertisement) -> Value {
     })
 }
 
-fn parse_ad(v: &Value) -> Result<ProviderAdvertisement, String> {
+pub(crate) fn parse_ad(v: &Value) -> Result<ProviderAdvertisement, String> {
     let req_str = |k: &str| {
         v.get(k)
             .and_then(Value::as_str)

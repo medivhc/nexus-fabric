@@ -1,13 +1,17 @@
-//! `nexus resource` 命令族（N2 P0-4）：`list` / `show` / `publish` / `revoke`。
+//! `nexus resource` 命令族（N2 P0-4/P0-5）：`list` / `show` / `publish` / `revoke` /
+//! `export` / `import`。
 //!
 //! - `nexus resource list`：目录列出有权发现的资源（`n2-resource-list`；
 //!   可发现≠可使用，D2 双层授权字段）；
 //! - `nexus resource show <name>`：资源详情（含双层授权字段与可用状态，
 //!   `n2-resource-show`）；
-//! - `nexus resource publish --name <n> --kind <k>`：发布资源（`n2-resource-publish`；
-//!   走 P0-2 的 `publish_ad`，默认 Workspace 内部范围，白皮书 §7.3）；
+//! - `nexus resource publish --name <n> --kind <k> [--locator <l> ...]`：发布资源
+//!   （`n2-resource-publish`；走 P0-2 的 `publish_ad`，默认 Workspace 内部范围，
+//!   白皮书 §7.3）；`--locator` 可重复，`n2adm://host:port` 标记跨机准入端点（P0-5）；
 //! - `nexus resource revoke <name>`：撤销发布（`n2-resource-revoke`；
-//!   触发 AUTH_REVOKE 帧→outbox 排队＋本地 withdraw＋tombstone＋目录审计）。
+//!   触发 AUTH_REVOKE 帧→outbox 排队＋本地 withdraw＋tombstone＋目录审计）；
+//! - `nexus resource export <name>` / `nexus resource import`：跨机广告交换
+//!   （P0-5；D8 FrameStream 公告传输的演进前形态——文件交换，语义等价）。
 //!
 //! 目录变更补结构化审计事件（P0-2 评审遗留）：publish/revoke/withdraw 经
 //! `record_directory_audit` 落盘 journal。
@@ -209,10 +213,13 @@ fn default_capability(kind: ResourceKind) -> &'static str {
 
 /// `nexus resource publish --name <n> --kind <k> [--locator <l>]`。
 fn run_publish(args: &[String], json_mode: bool) -> i32 {
-    const USAGE: &str = "usage: nexus resource publish --name <name> --kind <service|network|workspace|compute|device> [--locator <locator>]";
+    const USAGE: &str = "usage: nexus resource publish --name <name> --kind <service|network|workspace|compute|device> [--locator <locator> ...]";
     let mut name: Option<String> = None;
     let mut kind: Option<String> = None;
-    let mut locator: Option<String> = None;
+    // P0-5：`--locator` 可重复。约定：首个非 `n2adm://` locator 为 Service
+    // 数据面端点（planner 取 `locators[0]`）；`n2adm://host:port` 为跨机准入
+    // 控制端点（`n2_admission::CONTROL_LOCATOR_SCHEME`）。
+    let mut locators: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -226,7 +233,14 @@ fn run_publish(args: &[String], json_mode: bool) -> i32 {
             }
             "--locator" => {
                 i += 1;
-                locator = args.get(i).cloned();
+                match args.get(i).cloned() {
+                    Some(l) => locators.push(l),
+                    None => {
+                        eprintln!("error: --locator requires a value");
+                        eprintln!("{USAGE}");
+                        return 2;
+                    }
+                }
             }
             other => {
                 eprintln!("error: unexpected argument for resource publish: {other}");
@@ -286,7 +300,7 @@ fn run_publish(args: &[String], json_mode: bool) -> i32 {
         provider: nexus_domain::ProviderId(provider_id.clone()),
         resource: resource_id.clone(),
         capabilities: vec![default_capability(kind).to_string()],
-        locators: locator.into_iter().collect(),
+        locators,
         // 白皮书 §7.3：发布默认 Workspace 内部范围（Public 在此语境下
         // 即"本 Workspace 内可见"；跨 Workspace 可见性为 P1）。
         discoverable_by: Discoverability::Public,
@@ -475,9 +489,277 @@ fn run_revoke(name: &str, json_mode: bool) -> i32 {
     0
 }
 
+/// `nexus resource export <name> [--file <path>]`: 导出资源的持久化广告＋名字映射
+/// （P0-5 跨机：B 机发布后导出，经带外通道传给 A 机 `resource import`；D8 的
+/// FrameStream 公告传输为演进方向，P0 用文件交换——语义等价：广告内容不变）。
+fn run_export(args: &[String], json_mode: bool) -> i32 {
+    const USAGE: &str = "usage: nexus resource export <name> [--file <path>]";
+    let mut name: Option<String> = None;
+    let mut file: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--file" => {
+                i += 1;
+                file = args.get(i).cloned();
+            }
+            other if other.starts_with('-') => {
+                eprintln!("error: unexpected argument for resource export: {other}");
+                eprintln!("{USAGE}");
+                return 2;
+            }
+            other => {
+                if name.is_some() {
+                    eprintln!("error: too many arguments for resource export");
+                    eprintln!("{USAGE}");
+                    return 2;
+                }
+                name = Some(other.to_string());
+            }
+        }
+        i += 1;
+    }
+    let Some(name) = name else {
+        eprintln!("error: missing argument: <name>");
+        eprintln!("{USAGE}");
+        return 2;
+    };
+    let node_dir = crate::node_cli::node_dir();
+    let now = now_secs();
+    let store = match N2Store::open(&node_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            render(&store_fail(e), json_mode);
+            return 0;
+        }
+    };
+    let directory = match N2Directory::open_with_store(&store, now) {
+        Ok(d) => d,
+        Err(e) => {
+            render(&store_fail(e), json_mode);
+            return 0;
+        }
+    };
+    let (rref, resource_id) = match directory.resolve(&name) {
+        Ok(v) => v,
+        Err(e) => {
+            render(
+                &json!({"verdict":"FAIL","error":{"code": crate::error_code(&e), "message": e.to_string()}}),
+                json_mode,
+            );
+            return 0;
+        }
+    };
+    let kind = directory.kind_of(&name).unwrap_or(ResourceKind::Service);
+    // 只导出持久化广告（本节点发布的；静态种子不导出——对端有自己的种子）。
+    let ads: Vec<Value> = store
+        .load_ads()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|ad| ad.resource == resource_id)
+        .map(|ad| crate::n2_store::encode_ad(&ad))
+        .collect();
+    if ads.is_empty() {
+        render(
+            &json!({"verdict":"FAIL","error":{"code":"NOT_PUBLISHED","message": format!("no persisted advertisement for '{name}'; publish it first")}}),
+            json_mode,
+        );
+        return 0;
+    }
+    let doc = json!({
+        "v": 1,
+        "kind": "n2-resource-export",
+        "workspace": rref.workspace.0,
+        "name": name,
+        "resource_kind": kind.as_str(),
+        "resource_id": resource_id.0,
+        "ads": ads,
+    });
+    let text = serde_json::to_string_pretty(&doc).unwrap_or_default();
+    if let Some(path) = file {
+        if let Err(e) = std::fs::write(&path, &text) {
+            render(
+                &json!({"verdict":"FAIL","error":{"code":"IO","message": format!("write {path}: {e}")}}),
+                json_mode,
+            );
+            return 0;
+        }
+        render(
+            &json!({"verdict":"PASS","command":"resource export","resource": name, "file": path, "ads": ads.len()}),
+            json_mode,
+        );
+    } else {
+        // 无 --file：文档打 stdout（调用方重定向保存）。
+        println!("{text}");
+    }
+    0
+}
+
+/// `nexus resource import [--file <path>]`: 导入 `resource export` 的文档
+/// （广告落盘＋名字表登记；TTL 语义与本地 publish 一致）。
+fn run_import(args: &[String], json_mode: bool) -> i32 {
+    const USAGE: &str = "usage: nexus resource import [--file <path>]  (no --file: read stdin)";
+    let mut file: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--file" => {
+                i += 1;
+                file = args.get(i).cloned();
+            }
+            other => {
+                eprintln!("error: unexpected argument for resource import: {other}");
+                eprintln!("{USAGE}");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+    let text = match file {
+        Some(path) => match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                render(
+                    &json!({"verdict":"FAIL","error":{"code":"IO","message": format!("read {path}: {e}")}}),
+                    json_mode,
+                );
+                return 0;
+            }
+        },
+        None => {
+            use std::io::Read;
+            let mut buf = String::new();
+            if std::io::stdin().read_to_string(&mut buf).is_err() {
+                render(
+                    &json!({"verdict":"FAIL","error":{"code":"IO","message": "read stdin"}}),
+                    json_mode,
+                );
+                return 0;
+            }
+            buf
+        }
+    };
+    let doc: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            render(
+                &json!({"verdict":"FAIL","error":{"code":"BAD_DOC","message": format!("parse: {e}")}}),
+                json_mode,
+            );
+            return 0;
+        }
+    };
+    let ok_kind = doc.get("kind").and_then(Value::as_str) == Some("n2-resource-export");
+    let version_ok = doc.get("v").and_then(Value::as_u64) == Some(1);
+    if !ok_kind || !version_ok {
+        render(
+            &json!({"verdict":"FAIL","error":{"code":"BAD_DOC","message": "not an n2-resource-export v1 document"}}),
+            json_mode,
+        );
+        return 0;
+    }
+    let workspace = doc
+        .get("workspace")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_WORKSPACE);
+    let name_s = match doc.get("name").and_then(Value::as_str) {
+        Some(n) => n,
+        None => {
+            render(
+                &json!({"verdict":"FAIL","error":{"code":"BAD_DOC","message": "missing 'name'"}}),
+                json_mode,
+            );
+            return 0;
+        }
+    };
+    let name = match ResourceName::new(name_s) {
+        Ok(n) => n,
+        Err(e) => {
+            render(
+                &json!({"verdict":"FAIL","error":{"code":"INVALID_NAME","message": format!("{e:?}")}}),
+                json_mode,
+            );
+            return 0;
+        }
+    };
+    let kind = doc
+        .get("resource_kind")
+        .and_then(Value::as_str)
+        .and_then(parse_kind)
+        .unwrap_or(ResourceKind::Service);
+    let resource_id = match doc.get("resource_id").and_then(Value::as_str) {
+        Some(id) => nexus_domain::ResourceId(id.to_string()),
+        None => {
+            render(
+                &json!({"verdict":"FAIL","error":{"code":"BAD_DOC","message": "missing 'resource_id'"}}),
+                json_mode,
+            );
+            return 0;
+        }
+    };
+    let ads_v = match doc.get("ads").and_then(Value::as_array) {
+        Some(a) if !a.is_empty() => a,
+        _ => {
+            render(
+                &json!({"verdict":"FAIL","error":{"code":"BAD_DOC","message": "missing/empty 'ads'"}}),
+                json_mode,
+            );
+            return 0;
+        }
+    };
+    let node_dir = crate::node_cli::node_dir();
+    let store = match N2Store::open(&node_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            render(&store_fail(e), json_mode);
+            return 0;
+        }
+    };
+    let mut imported = 0;
+    for ad_v in ads_v {
+        let ad = match crate::n2_store::parse_ad(ad_v) {
+            Ok(a) => a,
+            Err(e) => {
+                render(
+                    &json!({"verdict":"FAIL","error":{"code":"BAD_DOC","message": format!("bad ad: {e}")}}),
+                    json_mode,
+                );
+                return 0;
+            }
+        };
+        // 一致性：广告的资源必须与文档声明一致（防错配）。
+        if ad.resource != resource_id {
+            render(
+                &json!({"verdict":"FAIL","error":{"code":"BAD_DOC","message": "ad resource mismatch"}}),
+                json_mode,
+            );
+            return 0;
+        }
+        if let Err(e) = store.save_ad(&ad) {
+            render(&store_fail(e), json_mode);
+            return 0;
+        }
+        imported += 1;
+    }
+    if let Err(e) = store.save_names(&[NameEntry {
+        workspace: WorkspaceId::new(workspace),
+        name: name.clone(),
+        resource_id: resource_id.clone(),
+        kind: Some(kind),
+    }]) {
+        render(&store_fail(e), json_mode);
+        return 0;
+    }
+    render(
+        &json!({"verdict":"PASS","command":"resource import","resource": name_s, "ads": imported}),
+        json_mode,
+    );
+    0
+}
+
 /// `nexus resource` 命令族入口。
 pub fn run_resource(args: &[String], json_mode: bool) -> i32 {
-    const USAGE: &str = "usage: nexus resource list | nexus resource show <name> | nexus resource publish --name <name> --kind <kind> [--locator <locator>] | nexus resource revoke <name>";
+    const USAGE: &str = "usage: nexus resource list | nexus resource show <name> | nexus resource publish --name <name> --kind <kind> [--locator <locator> ...] | nexus resource revoke <name> | nexus resource export <name> [--file <path>] | nexus resource import [--file <path>]";
     match args.first().map(String::as_str) {
         Some("list") if args.len() == 1 => run_list(json_mode),
         Some("show") => {
@@ -494,6 +776,8 @@ pub fn run_resource(args: &[String], json_mode: bool) -> i32 {
             run_show(name, json_mode)
         }
         Some("publish") => run_publish(&args[1..], json_mode),
+        Some("export") => run_export(&args[1..], json_mode),
+        Some("import") => run_import(&args[1..], json_mode),
         Some("revoke") => {
             let Some(name) = args.get(1) else {
                 eprintln!("error: missing argument: <name>");

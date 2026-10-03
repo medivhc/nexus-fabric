@@ -15,10 +15,14 @@
 /// CLI 前端 ControlService（17 命令接线 + --json 双输出 + exit 语义）。
 pub mod control_service;
 pub mod geoip_sources;
+/// `nexus grant` 命令族（N2 P0-5，D6）：本地 grant 表管理。
+pub mod grant_cli;
 /// nexusd serve LocalAPI 瘦客户端（裸 TCP HTTP GET，CLI 不再进程内装配 SDK）。
 pub mod localapi_client;
 /// Auto-Mesh 自动挡组网编排器（Phase 1：自动打洞 + 断线重连）。
 pub mod mesh;
+/// N2 P0-5：跨机准入协议（挑战-应答握手＋提供方侧 grant 判定＋租约）。
+pub mod n2_admission;
 /// N2 P0-4：registry-backed 资源目录（静态种子＋持久化广告；Presence 语义对齐）。
 pub mod n2_directory;
 /// N2 P0-4 D6：本节点 ed25519 授权身份（Principal 派生源）。
@@ -37,8 +41,11 @@ pub mod observability;
 pub mod pair_cli;
 /// N2 P0-3：`nexus plan` 只读预览 + `plan explain` 双模式（进程内，无 I/O）。
 pub mod plan_cli;
+/// `nexus provider` 命令族（N2 P0-5）：提供方侧常驻准入服务。
+pub mod provider_cli;
 pub mod provider_fetcher;
-/// `nexus resource` 命令族（N2 P0-4）：list / show / publish / revoke。
+/// `nexus resource` 命令族（N2 P0-4/P0-5）：list / show / publish / revoke /
+/// export / import。
 pub mod resource_cli;
 pub mod schedule_cli;
 /// `nexus session` 命令族（N2 P0-4）：list / watch / close（重附着）。

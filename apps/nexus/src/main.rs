@@ -252,9 +252,17 @@ fn run(args: &[String]) -> i32 {
     if args[0].as_str() == "session" {
         return nexus::session_cli::run_session(&args[1..], json_mode);
     }
-    // 资源目录管理（N2 P0-4；进程内 N2 存储，不经过 daemon）。
+    // 资源目录管理（N2 P0-4/P0-5；进程内 N2 存储，不经过 daemon）。
     if args[0].as_str() == "resource" {
         return nexus::resource_cli::run_resource(&args[1..], json_mode);
+    }
+    // 授权表管理（N2 P0-5，D6；进程内 N2 存储，不经过 daemon）。
+    if args[0].as_str() == "grant" {
+        return nexus::grant_cli::run_grant(&args[1..], json_mode);
+    }
+    // 提供方侧准入服务（N2 P0-5；B 机常驻进程）。
+    if args[0].as_str() == "provider" {
+        return nexus::provider_cli::run_provider(&args[1..], json_mode);
     }
 
     let command = match parse_command(&args) {

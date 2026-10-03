@@ -1,4 +1,4 @@
-//! `nexus use <name>`（N2 P0-4，D4）：N2 资源访问入口四步闭环。
+//! `nexus use <name>`（N2 P0-4/P0-5，D4）：N2 资源访问入口四步闭环。
 //!
 //! 闭环（PRODUCT §16.1）：
 //! ```text
@@ -19,9 +19,13 @@
 //!   （`n2-provider-offline`，E5 真跨机时完整成立；P0 本地以前置检查覆盖形状）；
 //! - 未知资源 → `FAIL` / `NOT_FOUND`。
 //!
-//! D1 提供方侧 admission＋租约：本命令在本地同时扮演请求方与提供方；
-//! 授权通过后写入租约记录（`n2/lease/<session-id>`），P0-5 跨机时提供方侧
-//! 独立建租约（两侧各自独立提交 TerminalOutcome，不做分布式共识）。
+//! D1 提供方侧 admission＋租约：
+//! - 本地路径（P0-4）：本命令在本地同时扮演请求方与提供方；授权通过后写入租约
+//!   记录（`n2/lease/<session-id>`）；
+//! - 跨机路径（P0-5）：选中 provider 的广告含 `n2adm://` 准入端点时，拨号 B 机
+//!   `nexus provider serve` 做挑战-应答握手＋B 机侧 grant 判定＋审计＋租约
+//!   （`n2_admission`）；A 机侧只建 Session（请求方 SessionManager），
+//!   不做第二个领域 Session（D1）；两侧各自独立提交 TerminalOutcome。
 //!
 //! `--` 后命令在 P0 按 D4 只做诚实化（P0-0 已落地，保持）：`use` 不接受 `--`
 //! 后命令（那是 N3 任务语义），遇到直接结构化拒绝。
@@ -30,9 +34,11 @@ use nexus_auth::{AuthRequest, GrantTable};
 use nexus_domain::{
     AuthorizationDecision, NexusError, PlanSnapshot, ProviderId, ResourceId, ResourceOperation,
 };
+use nexus_registry::UnavailabilityReason;
 use nexus_session::{DEFAULT_ATTACH_WINDOW_SECS, SessionManager};
 use serde_json::{Value, json};
 
+use crate::n2_admission::{AdmissionVerdict, AdmitError, admit_session, control_locator_of};
 use crate::n2_directory::{DIRECTORY_TAG, N2Directory};
 use crate::n2_identity::ensure_auth_identity;
 use crate::n2_store::{N2Store, now_unix_pub};
@@ -150,7 +156,39 @@ pub fn use_resource(
     let provider_id = snapshot.plan.provider_id.clone();
     let endpoint = snapshot.plan.path.first().cloned().unwrap_or_default();
 
+    // ---- 2b. 提供方定位：本地 vs 跨机（P0-5） ----
+    // 选中 provider 的广告含 `n2adm://` 准入端点 → 跨机路径（B 机侧判定）；
+    // 否则本地路径（P0-4 原语义：本地同时扮演请求方与提供方）。
+    let control_addr = directory
+        .registry()
+        .lookup_ads(&resource_id, now)
+        .into_iter()
+        .find(|ad| ad.provider == provider_id)
+        .and_then(|ad| control_locator_of(&ad));
+
+    // SessionManager 预加载（远端路径先 open 拿 id 再准入；本地路径保持原顺序）。
+    let mut manager = SessionManager::new(Box::new(store.sessions()), DEFAULT_ATTACH_WINDOW_SECS);
+    manager
+        .load_from_store()
+        .map_err(|e| fail_json("STORE", json!({"message": format!("load sessions: {e}")})))?;
+
+    if let Some(control) = control_addr {
+        return use_remote(
+            node_dir,
+            &store,
+            &mut manager,
+            name,
+            &resource_id,
+            &provider_id,
+            &snapshot,
+            &endpoint,
+            &control,
+            now,
+        );
+    }
+
     // ---- 3. authorize（D6：provider 侧 grant 表检查；目录可见≠有权限） ----
+    // （本地路径：本节点即 provider，查本地表；跨机路径由 B 机侧执行，见 use_remote。）
     let (_pubkey, principal) =
         ensure_auth_identity(&store).map_err(|e| fail_json("IDENTITY", json!({"message": e})))?;
     let table: GrantTable = store.load_grant_table().map_err(|e| {
@@ -190,10 +228,7 @@ pub fn use_resource(
     //  此处先占位——实际写入在 establish 后。）
 
     // ---- 4. establish（D1：SessionManager 创建＋持久化；PlanSnapshot 内嵌） ----
-    let mut manager = SessionManager::new(Box::new(store.sessions()), DEFAULT_ATTACH_WINDOW_SECS);
-    manager
-        .load_from_store()
-        .map_err(|e| fail_json("STORE", json!({"message": format!("load sessions: {e}")})))?;
+    // （manager 已在 2b 预加载。）
     let session_id = manager
         .open(resource_id.clone(), provider_id.clone(), snapshot.clone())
         .map_err(|e| fail_json("SESSION", json!({"message": e.to_string()})))?;
@@ -214,6 +249,119 @@ pub fn use_resource(
         .map_err(|e| fail_json("SESSION", json!({"message": e.to_string()})))?;
     debug_assert_eq!(view.outcome, nexus_domain::TerminalOutcome::Completed);
     Ok((session_id.0, snapshot, endpoint))
+}
+
+/// 跨机路径（P0-5）：选中 provider 为远端（广告含 `n2adm://` 准入端点）。
+///
+/// 顺序：open（Active/Unfinished，拿 session_id）→ B 机准入（挑战-应答握手＋
+/// B 机侧 grant 判定＋审计＋租约，`n2_admission`）→ admit 则 complete，
+/// 否则 close（Cancelled）并返回结构化失败。A 机侧**不**查本地 grant 表
+/// （D6：判定在 provider 侧执行），**不**写本地租约（B 机侧写，D1）。
+#[allow(clippy::too_many_arguments)]
+fn use_remote(
+    node_dir: &std::path::Path,
+    store: &N2Store,
+    manager: &mut SessionManager,
+    name: &str,
+    resource_id: &ResourceId,
+    provider_id: &ProviderId,
+    snapshot: &PlanSnapshot,
+    endpoint: &str,
+    control: &str,
+    now: u64,
+) -> Result<(String, PlanSnapshot, String), Value> {
+    let session_id = manager
+        .open(resource_id.clone(), provider_id.clone(), snapshot.clone())
+        .map_err(|e| fail_json("SESSION", json!({"message": e.to_string()})))?;
+    // 准入失败时关闭会话（Cancelled；尝试记录保留，可观测）。
+    let close_attempt = |manager: &mut SessionManager, reason: &str| {
+        let _ = manager.close(&session_id, reason);
+    };
+    match admit_session(control, node_dir, &session_id.0, resource_id) {
+        Ok(AdmissionVerdict::Admitted {
+            provider: _,
+            endpoint: adm_endpoint,
+        }) => {
+            let ep = if adm_endpoint.is_empty() {
+                endpoint.to_string()
+            } else {
+                adm_endpoint
+            };
+            let view = manager
+                .complete(&session_id)
+                .map_err(|e| fail_json("SESSION", json!({"message": e.to_string()})))?;
+            debug_assert_eq!(view.outcome, nexus_domain::TerminalOutcome::Completed);
+            Ok((session_id.0, snapshot.clone(), ep))
+        }
+        Ok(AdmissionVerdict::Denied { deny }) => {
+            close_attempt(manager, &format!("admission-denied:{deny}"));
+            Err(fail_json(
+                "AUTH_DENIED",
+                json!({
+                    "deny": deny,
+                    "audit_written": true,
+                    "resource": name,
+                    "provider": provider_id.0,
+                    "message": format!("provider {} denied session for '{name}': {deny}", provider_id.0),
+                }),
+            ))
+        }
+        Ok(AdmissionVerdict::NotFound) => {
+            // 提供方已撤销/withdraw：失效本地缓存广告，后续 resolve 走干净 NOT_FOUND。
+            let _ = store.delete_ad(provider_id, resource_id);
+            close_attempt(manager, "provider-resource-gone");
+            Err(fail_json(
+                "NOT_FOUND",
+                json!({
+                    "provider": provider_id.0,
+                    "message": format!("resource '{name}' no longer available on provider {}", provider_id.0),
+                }),
+            ))
+        }
+        Err(AdmitError::Connect(e)) => {
+            // 结构化不可达（`n2-provider-offline`）：拨号失败 → 标记广告
+            // ProviderOffline（后续 `use` 在 plan 侧即走结构化失败），非静默失败。
+            mark_provider_offline(store, provider_id, resource_id, now);
+            close_attempt(manager, "provider-offline");
+            Err(fail_json(
+                "PROVIDER_UNREACHABLE",
+                json!({
+                    "reason": "ProviderOffline",
+                    "provider": provider_id.0,
+                    "message": format!("provider {} unreachable at {control}: {e}", provider_id.0),
+                }),
+            ))
+        }
+        Err(e) => {
+            close_attempt(manager, "admission-error");
+            Err(fail_json(
+                "CONNECT_FAILED",
+                json!({
+                    "provider": provider_id.0,
+                    "message": format!("admission to {} failed: {e}", provider_id.0),
+                }),
+            ))
+        }
+    }
+}
+
+/// 把持久化广告标记为 ProviderOffline（`n2-provider-offline` 的状态沉淀）。
+fn mark_provider_offline(
+    store: &N2Store,
+    provider_id: &ProviderId,
+    resource_id: &ResourceId,
+    now: u64,
+) {
+    let mut ads = store.load_ads().unwrap_or_default();
+    if let Some(ad) = ads
+        .iter_mut()
+        .find(|ad| ad.provider == *provider_id && ad.resource == *resource_id)
+    {
+        ad.unavailable = Some(UnavailabilityReason::ProviderOffline);
+        // 刷新 issued_at：离线标记本身是新鲜观测，不被 TTL 误杀。
+        ad.issued_at_secs = now;
+        let _ = store.save_ad(ad);
+    }
 }
 
 /// 租约持久化（`n2/lease/<session-id>`）。

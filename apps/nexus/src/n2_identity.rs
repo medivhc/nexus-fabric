@@ -60,6 +60,19 @@ pub fn ensure_auth_identity(store: &N2Store) -> Result<([u8; 32], Principal), St
 /// 裸 ed25519 身份密钥对（公钥，私钥）。
 type RawKeyPair = ([u8; 32], [u8; 32]);
 
+/// 加载本节点 ed25519 签名密钥对（P0-5 跨机握手：对 challenge 签名用）。
+///
+/// 不存在则先 `ensure_auth_identity` 生成；`pub(crate)` 仅组合根可用。
+pub(crate) fn auth_keypair(store: &N2Store) -> Result<Ed25519KeyPair, String> {
+    if load_auth_identity(store)?.is_none() {
+        ensure_auth_identity(store)?;
+    }
+    let Some((_, seed)) = load_auth_identity(store)? else {
+        return Err("auth identity missing after ensure".to_string());
+    };
+    Ed25519KeyPair::from_seed_unchecked(&seed).map_err(|e| format!("ed25519 keypair: {e:?}"))
+}
+
 /// 加载已存在的授权身份（不存在 → `Ok(None)`；损坏 → 明确报错）。
 fn load_auth_identity(store: &N2Store) -> Result<Option<RawKeyPair>, String> {
     let Some(bytes) = store
