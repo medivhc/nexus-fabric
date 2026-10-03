@@ -12,6 +12,8 @@
 //! - `unavailable == None` / `HealthDegraded` → `present = true`；
 //! - `ProviderOffline` / `NotAcceptingWork` → `present = false`
 //!  （Planner 以 `NotPresent` 解释；完整原因由 `resource show` 展示）。
+//! - `ProviderOffline` 但离线观测已过期（`offline_mark_stale`，P0-2）→
+//!   `present = true`，允许再次握手探测（观测是带 TTL 的，不是永久判决）。
 //! 静态种子中 `down-dev-1` 的离线态即用 `ProviderOffline` 表达（P0-3 的
 //! `present=false` 在此语义下精确对应）。
 
@@ -34,6 +36,24 @@ pub const DEFAULT_WORKSPACE: &str = "default";
 
 /// 目录标记（输出自述；P0-3 的 `static-demo` 在此被 registry 形态取代）。
 pub const DIRECTORY_TAG: &str = "registry(static-seed)";
+
+/// ProviderOffline 离线观测的有效期（秒；P0-2 修）。
+///
+/// 离线标记是"某时刻拨号失败"的观测，不是永久判决：`mark_provider_offline`
+/// 把观测时刻写入 `issued_at_secs`；此处判定观测是否过期。过期后 planner
+/// 重新把该 provider 视为 present（允许再次握手探测）：若仍不可达，
+/// 下一次 `use` 会重新标记并刷新观测时刻；若已恢复，握手成功即清标记。
+pub const OFFLINE_MARK_TTL_SECS: u64 = 300;
+
+/// 判断广告上的 ProviderOffline 标记是否已过期（P0-2 修）。
+///
+/// 非 ProviderOffline 广告恒返回 false。观测时刻取 `issued_at_secs`
+///（`mark_provider_offline` 在标记时刷新）。
+#[must_use]
+pub fn offline_mark_stale(ad: &ProviderAdvertisement, now_secs: u64) -> bool {
+    matches!(ad.unavailable, Some(UnavailabilityReason::ProviderOffline))
+        && now_secs.saturating_sub(ad.issued_at_secs) > OFFLINE_MARK_TTL_SECS
+}
 
 /// 静态种子条目（P0 static 先行；P0-3 `plan_cli::DIRECTORY` 的 registry 形态）。
 struct SeedProvider {
@@ -165,9 +185,16 @@ impl N2Directory {
         let mut capabilities = HashMap::new();
         let mut placements = HashMap::new();
         let mut local_providers = HashMap::new();
+        // P0-3：撤销 tombstone（"workspace:name" 集合）；已撤销的种子/持久化条目不再重现。
+        let revoked: std::collections::HashSet<String> = store.revoked_set()?.into_iter().collect();
+        let is_revoked =
+            |workspace: &str, name: &str| revoked.contains(&format!("{workspace}:{name}"));
 
         // 1. 静态种子 → Registry（P0 static 先行）。
         for entry in SEED {
+            if is_revoked(DEFAULT_WORKSPACE, entry.name) {
+                continue; // P0-3：已撤销的种子不再重现。
+            }
             let resource = ResourceId(entry.resource_id.to_string());
             let static_entries = entry.providers.iter().map(|p| StaticProviderEntry {
                 provider: ProviderId(p.id.to_string()),
@@ -210,20 +237,34 @@ impl N2Directory {
         }
 
         // 2. 持久化广告叠加（`resource publish` 落盘的）。
+        // P0-3：tombstone 过滤——已撤销名字的广告不再重现。
+        let persisted_names = store.load_names()?;
+        let tombstoned_rids: std::collections::HashSet<String> = persisted_names
+            .iter()
+            .filter(|e| is_revoked(&e.workspace.0, e.name.as_str()))
+            .map(|e| e.resource_id.0.clone())
+            .collect();
         for ad in store.load_ads()? {
+            if tombstoned_rids.contains(&ad.resource.0) {
+                continue;
+            }
             registry
                 .publish_ad(ad, now_secs)
                 .map_err(|e| format!("load persisted ad: {e}"))?;
         }
 
         // 3. 持久化名字表叠加（`resource publish` 登记的）。
+        // P0-3：tombstone 过滤——已撤销的名字不再重现。
         for NameEntry {
             workspace,
             name,
             resource_id,
             kind: entry_kind,
-        } in store.load_names()?
+        } in persisted_names
         {
+            if is_revoked(&workspace.0, name.as_str()) {
+                continue;
+            }
             names.insert(ResourceRef::new(workspace, name.clone()), resource_id);
             // publish 时指定的 kind（`--kind`）持久化在名字表条目里。
             kinds.insert(
@@ -231,9 +272,6 @@ impl N2Directory {
                 entry_kind.unwrap_or(ResourceKind::Service),
             );
         }
-
-        // 注：revoke 直接从持久化名字表/广告删除（`resource_cli::run_revoke`），
-        // 此处无需 tombstone——静态种子是另一 provider 的广告，revoke 后自然重现。
 
         Ok(Self {
             registry,
@@ -292,10 +330,12 @@ impl N2Directory {
                     .unwrap_or_default(),
                 locator: ad.locators.first().cloned().unwrap_or_default(),
                 capabilities: ad.capabilities.clone(),
+                // P0-2 修：过期的离线观测视为 present（允许重新探测握手），
+                // 避免一次瞬时失败把 provider 永久判死。
                 present: matches!(
                     ad.unavailable,
                     None | Some(UnavailabilityReason::HealthDegraded { .. })
-                ),
+                ) || offline_mark_stale(ad, now_secs),
             })
             .collect();
         let capability = self
@@ -439,6 +479,69 @@ mod tests {
         let (_, id) = d.resolve("restricted-svc").unwrap();
         assert_eq!(id.0, "res-restricted-svc");
         assert_eq!(d.kind_of("restricted-svc"), Some(ResourceKind::Service));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn offline_mark_expires_and_reprobes() {
+        // P0-2 回归：ProviderOffline 是带 TTL 的观测，不是永久判决。
+        // 新鲜标记 → present=false；过期标记 → present=true（允许再次握手探测）。
+        let dir = temp_node_dir("offline-ttl");
+        let store = N2Store::open(&dir).unwrap();
+        let ad = |issued: u64| ProviderAdvertisement {
+            provider: ProviderId("remote-b".into()),
+            resource: ResourceId("res-dev-svc".into()),
+            capabilities: vec!["service".into()],
+            locators: vec!["n2adm://10.99.99.99:9002".into()],
+            discoverable_by: Discoverability::Public,
+            use_grants: vec![],
+            unavailable: Some(UnavailabilityReason::ProviderOffline),
+            issued_at_secs: issued,
+            ttl_secs: 0,
+        };
+        store.save_ad(&ad(1000)).unwrap();
+        // 观测新鲜（now=1100，age=100 < 300）→ present=false。
+        let d = N2Directory::open_with_store(&store, 1100).unwrap();
+        let snap = d.planning_snapshot("dev-svc", &ResourceId("res-dev-svc".into()), 1100);
+        let cand = snap
+            .candidates
+            .iter()
+            .find(|c| c.id.0 == "remote-b")
+            .unwrap();
+        assert!(!cand.present, "fresh offline mark must map to not present");
+        assert!(!offline_mark_stale(&store.load_ads().unwrap()[0], 1100));
+        // 观测过期（now=1400，age=400 > 300）→ present=true，可重新探测。
+        let d2 = N2Directory::open_with_store(&store, 1400).unwrap();
+        let snap2 = d2.planning_snapshot("dev-svc", &ResourceId("res-dev-svc".into()), 1400);
+        let cand2 = snap2
+            .candidates
+            .iter()
+            .find(|c| c.id.0 == "remote-b")
+            .unwrap();
+        assert!(cand2.present, "stale offline mark must allow re-probe");
+        assert!(offline_mark_stale(&store.load_ads().unwrap()[0], 1400));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revoked_seed_does_not_reappear() {
+        // P0-3 回归：revoke 写 tombstone 后，静态种子不再"自然重现"；
+        // 重新 publish（clear）后恢复。
+        let dir = temp_node_dir("revoke-seed");
+        let store = N2Store::open(&dir).unwrap();
+        let d = N2Directory::open_with_store(&store, 1000).unwrap();
+        assert!(d.resolve("dev-svc").is_ok());
+        store.mark_revoked(DEFAULT_WORKSPACE, "dev-svc").unwrap();
+        assert!(store.is_revoked(DEFAULT_WORKSPACE, "dev-svc").unwrap());
+        let d2 = N2Directory::open_with_store(&store, 1000).unwrap();
+        assert!(
+            d2.resolve("dev-svc").is_err(),
+            "revoked seed must not reappear"
+        );
+        store.clear_revoked(DEFAULT_WORKSPACE, "dev-svc").unwrap();
+        assert!(!store.is_revoked(DEFAULT_WORKSPACE, "dev-svc").unwrap());
+        let d3 = N2Directory::open_with_store(&store, 1000).unwrap();
+        assert!(d3.resolve("dev-svc").is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

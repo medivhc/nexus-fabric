@@ -38,7 +38,9 @@ use nexus_registry::UnavailabilityReason;
 use nexus_session::{DEFAULT_ATTACH_WINDOW_SECS, SessionManager};
 use serde_json::{Value, json};
 
-use crate::n2_admission::{AdmissionVerdict, AdmitError, admit_session, control_locator_of};
+use crate::n2_admission::{
+    AdmissionVerdict, AdmitError, TrustPolicy, admit_session, control_locator_of,
+};
 use crate::n2_directory::{DIRECTORY_TAG, N2Directory};
 use crate::n2_identity::ensure_auth_identity;
 use crate::n2_store::{N2Store, now_unix_pub};
@@ -101,10 +103,13 @@ fn render(out: &Value, json_mode: bool) {
 ///
 /// 返回 `(session_id, plan_snapshot, endpoint)`；错误为结构化 `Value`
 ///（`verdict: FAIL` 的 JSON body）。
+///
+/// `trust`：跨机准入时的服务端身份确认策略（P0-4；本地路径不使用）。
 pub fn use_resource(
     node_dir: &std::path::Path,
     name: &str,
     now: u64,
+    trust: TrustPolicy,
 ) -> Result<(String, PlanSnapshot, String), Value> {
     // ---- 0. `--` 后命令诚实拒绝（D4；`use` 不执行命令，那是 N3） ----
     // （参数层已拦截；此处为内核级二次保护。）
@@ -135,7 +140,7 @@ pub fn use_resource(
                     matches!(
                         ad.unavailable,
                         Some(nexus_registry::UnavailabilityReason::ProviderOffline)
-                    )
+                    ) && !crate::n2_directory::offline_mark_stale(ad, now)
                 })
                 .map(|ad| ad.provider.0.clone());
             if let Some(provider) = offline_provider {
@@ -184,6 +189,7 @@ pub fn use_resource(
             &endpoint,
             &control,
             now,
+            trust,
         );
     }
 
@@ -198,7 +204,8 @@ pub fn use_resource(
         )
     })?;
     let mut sink = store.audit_sink();
-    let decision = table.authorize(
+    // P0-5：`audit_written` 取自真实落盘结果（禁硬编码 true）。
+    let outcome = table.authorize(
         &AuthRequest {
             workspace: rref.workspace.clone(),
             resource: rref.clone(),
@@ -208,8 +215,19 @@ pub fn use_resource(
         now,
         &mut sink,
     );
-    // audit_written：判定已 exactly-once 落盘（KvAuditSink 同步 journal_append）。
-    let audit_written = true;
+    let decision = outcome.decision;
+    let audit_written = outcome.audit_written;
+    // P0-5：审计落盘失败 → fail-loud（verdict 降级，不静默继续）。
+    if !audit_written {
+        return Err(fail_json(
+            "AUDIT_UNAVAILABLE",
+            json!({
+                "resource": name,
+                "principal": principal.0,
+                "message": "authorization audit record could not be persisted; refusing to proceed without audit trail",
+            }),
+        ));
+    }
     if let AuthorizationDecision::Deny(reason) = &decision {
         return Err(fail_json(
             "AUTH_DENIED",
@@ -269,6 +287,7 @@ fn use_remote(
     endpoint: &str,
     control: &str,
     now: u64,
+    trust: TrustPolicy,
 ) -> Result<(String, PlanSnapshot, String), Value> {
     let session_id = manager
         .open(resource_id.clone(), provider_id.clone(), snapshot.clone())
@@ -277,11 +296,21 @@ fn use_remote(
     let close_attempt = |manager: &mut SessionManager, reason: &str| {
         let _ = manager.close(&session_id, reason);
     };
-    match admit_session(control, node_dir, &session_id.0, resource_id) {
+    // P0-4：传入提供方身份＋信任策略（双向身份校验；失败则拒绝建 Session）。
+    match admit_session(
+        control,
+        node_dir,
+        &provider_id.0,
+        &session_id.0,
+        resource_id,
+        trust,
+    ) {
         Ok(AdmissionVerdict::Admitted {
             provider: _,
             endpoint: adm_endpoint,
         }) => {
+            // P0-2 修：握手成功 → 清除离线观测标记（provider 已恢复）。
+            clear_provider_offline(store, provider_id, resource_id);
             let ep = if adm_endpoint.is_empty() {
                 endpoint.to_string()
             } else {
@@ -293,17 +322,21 @@ fn use_remote(
             debug_assert_eq!(view.outcome, nexus_domain::TerminalOutcome::Completed);
             Ok((session_id.0, snapshot.clone(), ep))
         }
-        Ok(AdmissionVerdict::Denied { deny }) => {
+        Ok(AdmissionVerdict::Denied {
+            deny,
+            audit_written,
+        }) => {
             close_attempt(manager, &format!("admission-denied:{deny}"));
             // 带上请求方自身 principal（运维据此在 B 机 `grant add`）。
             let principal = ensure_auth_identity(store)
                 .map(|(_, p)| p.0)
                 .unwrap_or_default();
+            // P0-5：`audit_written` 取 B 侧返回的真实值（禁硬编码 true）。
             Err(fail_json(
                 "AUTH_DENIED",
                 json!({
                     "deny": deny,
-                    "audit_written": true,
+                    "audit_written": audit_written,
                     "resource": name,
                     "provider": provider_id.0,
                     "principal": principal,
@@ -337,6 +370,18 @@ fn use_remote(
                 }),
             ))
         }
+        // P0-4：服务端身份未被信任 → 结构化 UNTRUSTED_PROVIDER（非 CONNECT_FAILED），
+        // 拒绝建 Session（D6 双向身份硬约束）。
+        Err(AdmitError::UntrustedProvider(msg)) => {
+            close_attempt(manager, "untrusted-provider");
+            Err(fail_json(
+                "UNTRUSTED_PROVIDER",
+                json!({
+                    "provider": provider_id.0,
+                    "message": msg,
+                }),
+            ))
+        }
         Err(e) => {
             close_attempt(manager, "admission-error");
             Err(fail_json(
@@ -351,6 +396,10 @@ fn use_remote(
 }
 
 /// 把持久化广告标记为 ProviderOffline（`n2-provider-offline` 的状态沉淀）。
+///
+/// P0-2 修：该标记是**带 TTL 的观测**，不是永久判决。`issued_at_secs` 在此
+/// 刷新，兼作观测时刻（`offline_mark_stale` 判定过期）；过期后 planner 重新
+/// 视为 present 并允许再次握手探测。握手成功由 `clear_provider_offline` 清标记。
 fn mark_provider_offline(
     store: &N2Store,
     provider_id: &ProviderId,
@@ -363,9 +412,23 @@ fn mark_provider_offline(
         .find(|ad| ad.provider == *provider_id && ad.resource == *resource_id)
     {
         ad.unavailable = Some(UnavailabilityReason::ProviderOffline);
-        // 刷新 issued_at：离线标记本身是新鲜观测，不被 TTL 误杀。
+        // 刷新 issued_at：记录离线观测时刻（供 `offline_mark_stale` 判定过期）。
         ad.issued_at_secs = now;
         let _ = store.save_ad(ad);
+    }
+}
+
+/// 清除 ProviderOffline 离线观测标记（握手成功 → provider 已恢复，P0-2 修）。
+fn clear_provider_offline(store: &N2Store, provider_id: &ProviderId, resource_id: &ResourceId) {
+    let mut ads = store.load_ads().unwrap_or_default();
+    if let Some(ad) = ads
+        .iter_mut()
+        .find(|ad| ad.provider == *provider_id && ad.resource == *resource_id)
+    {
+        if matches!(ad.unavailable, Some(UnavailabilityReason::ProviderOffline)) {
+            ad.unavailable = None;
+            let _ = store.save_ad(ad);
+        }
     }
 }
 
@@ -416,7 +479,14 @@ pub fn run_use(args: &[String], json_mode: bool) -> i32 {
     }
 
     let node_dir = crate::node_cli::node_dir();
-    match use_resource(&node_dir, name, now_secs()) {
+    // P0-4：信任策略——`--json` 非交互走 Strict（未知提供方直接失败）；
+    // 交互模式走 Prompt（TOFU 指纹确认）。
+    let trust = if json_mode {
+        TrustPolicy::Strict
+    } else {
+        TrustPolicy::Prompt
+    };
+    match use_resource(&node_dir, name, now_secs(), trust) {
         Ok((session_id, snapshot, endpoint)) => {
             let out = json!({
                 "verdict": "PASS",
@@ -478,7 +548,8 @@ mod tests {
         // 四步闭环（E2）：grant 存在 → PASS，真实 session_id / plan_id / endpoint。
         let dir = temp_node_dir("four-steps");
         grant_for(&dir, "dev-svc");
-        let (session_id, snapshot, endpoint) = use_resource(&dir, "dev-svc", 1000).unwrap();
+        let (session_id, snapshot, endpoint) =
+            use_resource(&dir, "dev-svc", 1000, TrustPolicy::Strict).unwrap();
         assert!(session_id.starts_with("sess-"));
         assert!(!snapshot.plan_id.as_str().is_empty());
         assert_eq!(snapshot.plan.provider_id.0, "local-dev-1");
@@ -496,7 +567,8 @@ mod tests {
         // establish 持久化：CLI 退出重进可按 session_id 查到＋历史 trace。
         let dir = temp_node_dir("persist");
         grant_for(&dir, "dev-svc");
-        let (session_id, snapshot, _) = use_resource(&dir, "dev-svc", 1000).unwrap();
+        let (session_id, snapshot, _) =
+            use_resource(&dir, "dev-svc", 1000, TrustPolicy::Strict).unwrap();
         // 新 manager 从同一 store 加载（模拟重进）。
         let store = N2Store::open(&dir).unwrap();
         let mut manager =
@@ -517,7 +589,7 @@ mod tests {
     fn use_without_grant_is_structured_deny_with_audit() {
         // Deny 审计（E2）：无 grant → AUTH_DENIED / NoSuchGrant / audit_written。
         let dir = temp_node_dir("deny");
-        let err = use_resource(&dir, "restricted-svc", 1000).unwrap_err();
+        let err = use_resource(&dir, "restricted-svc", 1000, TrustPolicy::Strict).unwrap_err();
         assert_eq!(err["verdict"], json!("FAIL"));
         assert_eq!(err["error"]["code"], json!("AUTH_DENIED"));
         assert_eq!(err["error"]["deny"], json!("NoSuchGrant"));
@@ -539,7 +611,7 @@ mod tests {
     #[test]
     fn use_unknown_resource_is_not_found() {
         let dir = temp_node_dir("notfound");
-        let err = use_resource(&dir, "no-such", 1000).unwrap_err();
+        let err = use_resource(&dir, "no-such", 1000, TrustPolicy::Strict).unwrap_err();
         assert_eq!(err["verdict"], json!("FAIL"));
         assert_eq!(err["error"]["code"], json!("NOT_FOUND"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -560,7 +632,7 @@ mod tests {
         // D1 提供方侧租约：authorize 通过后落盘。
         let dir = temp_node_dir("lease");
         grant_for(&dir, "dev-svc");
-        let (session_id, _, _) = use_resource(&dir, "dev-svc", 1000).unwrap();
+        let (session_id, _, _) = use_resource(&dir, "dev-svc", 1000, TrustPolicy::Strict).unwrap();
         let store = N2Store::open(&dir).unwrap();
         let bytes = store
             .kv()

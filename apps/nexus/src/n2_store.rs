@@ -608,15 +608,17 @@ pub struct KvAuditSink {
 }
 
 impl AuditSink for KvAuditSink {
-    fn record(&mut self, record: AuditRecord) {
+    fn record(&mut self, record: AuditRecord) -> Result<(), String> {
         let data = serde_json::to_string(&encode_audit_record(&record))
             .unwrap_or_else(|_| "{\"encode_error\":true}".to_string());
         let mut payload = TAG_AUTH_AUDIT.to_vec();
         payload.extend_from_slice(data.as_bytes());
-        // 审计不得静默丢失：落盘失败记 stderr（调用方已做判定，不回滚）。
-        if let Err(e) = self.kv.journal_append(&payload) {
-            eprintln!("[n2] WARN: audit journal append failed: {e}");
-        }
+        // P0-5：落盘结果返回给调用方（禁静默丢弃＋硬编码 true）；
+        // 仍记 stderr 便于运维即时发现。
+        self.kv
+            .journal_append(&payload)
+            .map(|_| ())
+            .map_err(|e| format!("audit journal append failed: {e}"))
     }
 }
 
@@ -1007,6 +1009,94 @@ impl N2Store {
         Ok(existed)
     }
 
+    /// 撤销 tombstone 键（`n2/revoked_names`：JSON 数组，元素为 `"workspace:name"`）。
+    ///
+    /// P0-3 修：`resource revoke` 必须让撤销真实生效——静态种子只存在于内存
+    /// Registry，每次 open 都会重现；tombstone 让已撤销的种子不再重现。
+    /// 重新 `publish` 同名资源时清除（幂等恢复）。
+    pub fn mark_revoked(&self, workspace: &str, name: &str) -> Result<(), String> {
+        let mut set = self.revoked_set()?;
+        let key = format!("{workspace}:{name}");
+        if !set.contains(&key) {
+            set.push(key);
+            self.save_revoked(&set)?;
+        }
+        Ok(())
+    }
+
+    /// 清除撤销标记（重新 publish 同名资源时调用；幂等）。
+    pub fn clear_revoked(&self, workspace: &str, name: &str) -> Result<(), String> {
+        let mut set = self.revoked_set()?;
+        let key = format!("{workspace}:{name}");
+        let before = set.len();
+        set.retain(|k| k != &key);
+        if set.len() != before {
+            self.save_revoked(&set)?;
+        }
+        Ok(())
+    }
+
+    /// 判断 (workspace, name) 是否被撤销标记。
+    pub fn is_revoked(&self, workspace: &str, name: &str) -> Result<bool, String> {
+        Ok(self
+            .revoked_set()?
+            .iter()
+            .any(|k| k == &format!("{workspace}:{name}")))
+    }
+
+    /// 加载撤销集合（`"workspace:name"` 字符串数组；不存在 → 空）。
+    pub fn revoked_set(&self) -> Result<Vec<String>, String> {
+        let Some(bytes) = self
+            .kv
+            .get(REVOKED_KEY)
+            .map_err(|e| format!("read revoked: {e}"))?
+        else {
+            return Ok(Vec::new());
+        };
+        serde_json::from_slice(&bytes).map_err(|e| format!("decode revoked: {e}"))
+    }
+
+    fn save_revoked(&self, set: &[String]) -> Result<(), String> {
+        let data = serde_json::to_string(set).map_err(|e| format!("encode revoked: {e}"))?;
+        self.kv
+            .put(REVOKED_KEY, data.as_bytes())
+            .map_err(|e| format!("put revoked: {e}"))?;
+        Ok(())
+    }
+
+    /// 加载提供方信任表（P0-4：D6 双向身份的请求方侧；不存在 → 空表）。
+    pub fn load_trust_store(&self) -> Result<nexus_auth::TrustStore, String> {
+        let Some(bytes) = self
+            .kv
+            .get(TRUST_KEY)
+            .map_err(|e| format!("read trust: {e}"))?
+        else {
+            return Ok(nexus_auth::TrustStore::new());
+        };
+        let map: std::collections::HashMap<String, String> =
+            serde_json::from_slice(&bytes).map_err(|e| format!("decode trust: {e}"))?;
+        let mut peers = std::collections::HashMap::new();
+        for (id, hex) in map {
+            let pk = hex_decode_bytes(&hex, 32, "trusted pubkey")?;
+            peers.insert(id, pk);
+        }
+        Ok(nexus_auth::TrustStore::from_peers(peers))
+    }
+
+    /// 保存提供方信任表（P0-4）。
+    pub fn save_trust_store(&self, ts: &nexus_auth::TrustStore) -> Result<(), String> {
+        let map: std::collections::HashMap<String, String> = ts
+            .peers()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.iter().map(|b| format!("{b:02x}")).collect()))
+            .collect();
+        let data = serde_json::to_string(&map).map_err(|e| format!("encode trust: {e}"))?;
+        self.kv
+            .put(TRUST_KEY, data.as_bytes())
+            .map_err(|e| format!("put trust: {e}"))?;
+        Ok(())
+    }
+
     /// 加载全部持久化广告。
     pub fn load_ads(&self) -> Result<Vec<ProviderAdvertisement>, String> {
         let mut out = Vec::new();
@@ -1037,6 +1127,10 @@ impl N2Store {
 // ============================================================================
 
 const NAMES_KEY: &str = "n2/names";
+/// 撤销 tombstone 键（P0-3）。
+const REVOKED_KEY: &str = "n2/revoked_names";
+/// 提供方信任表键（P0-4）：JSON map，provider_id → ed25519 pubkey hex。
+const TRUST_KEY: &str = "n2/trusted_peers";
 
 /// 名字表条目（`ResourceRef{workspace,name}` → 不透明 `ResourceId`＋kind）。
 #[derive(Debug, Clone)]
@@ -1080,6 +1174,15 @@ impl N2Store {
             .put(NAMES_KEY, data.as_bytes())
             .map_err(|e| format!("put names: {e}"))?;
         Ok(())
+    }
+
+    // P0-1 修：`save_names` 为全量覆盖语义，名字表 upsert 必须走 load→合并→写回，
+    // 禁止直接写单条（否则抹掉本地其他资源）。
+    pub fn upsert_name(&self, entry: NameEntry) -> Result<(), String> {
+        let mut names = self.load_names()?;
+        names.retain(|e| !(e.workspace == entry.workspace && e.name == entry.name));
+        names.push(entry);
+        self.save_names(&names)
     }
 
     /// 加载名字表（不存在 → 空）。
@@ -1127,6 +1230,18 @@ impl N2Store {
 // ============================================================================
 // 控制帧 outbox（revoke 触发的 AUTH_REVOKE 先落盘排队）
 // ============================================================================
+
+/// hex 字符串 → 字节（`expect_len` 字节；P0-4 信任表用）。
+fn hex_decode_bytes(s: &str, expect_len: usize, what: &str) -> Result<Vec<u8>, String> {
+    if s.len() != expect_len * 2 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("bad {what} hex"));
+    }
+    (0..expect_len)
+        .map(|i| {
+            u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|e| format!("{what} hex: {e}"))
+        })
+        .collect()
+}
 
 const OUTBOX_PREFIX: &str = "n2/outbox/";
 
@@ -1200,6 +1315,7 @@ pub fn now_unix_pub() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::n2_directory::DEFAULT_WORKSPACE;
     use nexus_auth::Grant;
     use nexus_domain::{DecisionTrace, DenyReason, Plan};
     use nexus_session::SessionRecordStore;
@@ -1338,9 +1454,13 @@ mod tests {
         };
         // 空表 → NoSuchGrant；判定本身写内存槽，文件槽单独验证。
         let mut mem = VecAuditSink::new();
-        let d = table.authorize(&req, 1000, &mut mem);
-        assert_eq!(d, AuthorizationDecision::Deny(DenyReason::NoSuchGrant));
-        sink.record(mem.records[0].clone());
+        let outcome = table.authorize(&req, 1000, &mut mem);
+        assert_eq!(
+            outcome.decision,
+            AuthorizationDecision::Deny(DenyReason::NoSuchGrant)
+        );
+        assert!(outcome.audit_written);
+        sink.record(mem.records[0].clone()).unwrap();
         let entries = replay_audit_entries(store.kv()).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "auth");
@@ -1447,6 +1567,33 @@ mod tests {
         let items = store.outbox_list().unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0], (0, b"frame-0".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upsert_name_merges_without_dropping_others() {
+        // P0-1 回归：upsert 必须 load→合并→写回；import 单条后本地其他资源不得丢失。
+        let dir = temp_dir("upsert");
+        let store = N2Store::open(&dir).unwrap();
+        let entry = |n: &str| NameEntry {
+            workspace: WorkspaceId::new(DEFAULT_WORKSPACE),
+            name: ResourceName::new(n).unwrap(),
+            resource_id: ResourceId(format!("res-{n}")),
+            kind: Some(nexus_domain::ResourceKind::Service),
+        };
+        store.upsert_name(entry("a")).unwrap();
+        store.upsert_name(entry("b")).unwrap();
+        // 模拟 import：只 upsert 导入项。
+        store.upsert_name(entry("from-b")).unwrap();
+        let names = store.load_names().unwrap();
+        let got: Vec<&str> = names.iter().map(|e| e.name.as_str()).collect();
+        assert!(got.contains(&"a"), "a must survive import, got {got:?}");
+        assert!(got.contains(&"b"), "b must survive import, got {got:?}");
+        assert!(got.contains(&"from-b"));
+        // 同名重复 upsert 只保留一条（去重）。
+        store.upsert_name(entry("a")).unwrap();
+        let names = store.load_names().unwrap();
+        assert_eq!(names.iter().filter(|e| e.name.as_str() == "a").count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
