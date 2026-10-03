@@ -588,6 +588,22 @@ fn log_enabled_subsystems(cfg: &LoadedConfig) {
     eprintln!("[nexusd] localapi_addr={}", cfg.daemon.localapi_addr);
 }
 
+/// P1-15：单连接读写超时。`handle_localapi_request` 逐行读 request line /
+/// headers，旧行为下"连上不发换行"的客户端会永久占住控制面（TCP 与 unix
+/// socket 都中招）。设置失败只告警——超时机制本身不阻断服务。
+const LOCALAPI_IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+macro_rules! apply_localapi_io_timeouts {
+    ($stream:expr) => {{
+        if let Err(e) = $stream.set_read_timeout(Some(LOCALAPI_IO_TIMEOUT)) {
+            eprintln!("[nexusd] localapi set_read_timeout: {e}");
+        }
+        if let Err(e) = $stream.set_write_timeout(Some(LOCALAPI_IO_TIMEOUT)) {
+            eprintln!("[nexusd] localapi set_write_timeout: {e}");
+        }
+    }};
+}
+
 /// LocalAPI 服务（后台线程版；复用既有 serve 逻辑，READY 经 channel 上报）。
 /// LocalAPI 服务（后台线程版；R4：经 shutdown 标志可停止）。
 ///
@@ -634,6 +650,7 @@ fn serve_localapi(
         }
         match listener.accept() {
             Ok((mut s, _)) => {
+                apply_localapi_io_timeouts!(s);
                 if let Err(e) = handle_localapi_request(&mut s, &token) {
                     eprintln!("[nexusd] localapi error: {e}");
                 }
@@ -685,10 +702,18 @@ fn serve_resource(args: &[String]) -> ExitCode {
             Some(path) => serve_over_socket(path),
             // D8（N2 P0-1）：默认 unix socket（与 CLI `default_socket_path` 一致）。
             #[cfg(unix)]
-            None => {
-                let sock = nexus::localapi_client::default_socket_path();
-                serve_over_socket(&sock.display().to_string())
-            }
+            None => match nexus::localapi_client::default_socket_path() {
+                Some(sock) => serve_over_socket(&sock.display().to_string()),
+                // P1-15：无安全的 socket 目录 → 回退 TCP loopback（而不是
+                // 落到世界可写、可被抢占的 temp socket）。
+                None => {
+                    eprintln!(
+                        "[nexusd] WARN: no safe unix socket dir; falling back to TCP loopback {}",
+                        nexus::localapi_client::DEFAULT_LOCALAPI_ADDR
+                    );
+                    serve_over_tcp(nexus::localapi_client::DEFAULT_LOCALAPI_ADDR)
+                }
+            },
             #[cfg(not(unix))]
             None => serve_over_tcp("127.0.0.1:0"),
         },
@@ -736,6 +761,7 @@ fn serve_over_tcp(addr_raw: &str) -> ExitCode {
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
+                apply_localapi_io_timeouts!(stream);
                 if let Err(e) = handle_localapi_request(&mut stream, &token) {
                     eprintln!("serve connection error: {e}");
                 }
@@ -766,12 +792,23 @@ fn serve_over_socket(path: &str) -> ExitCode {
             return ExitCode::SUCCESS;
         }
     };
+    // P1-15：socket 建成后立刻收紧为 0600（umask 只能做减法，默认往往
+    // 落在 0755/0777——同机其他用户就能连上拿 bearer token）。失败即
+    // fail-closed：宁可不提供控制面，也不留一个可被冒充的 socket。
+    if let Err(e) = harden_socket_permissions(path) {
+        println!(
+            "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"INTERNAL\",\"message\":\"{e}\"}}}}"
+        );
+        let _ = std::fs::remove_file(path);
+        return ExitCode::SUCCESS;
+    }
     println!(
         "{{\"verdict\":\"READY\",\"daemon\":{{\"entry\":\"nexusd\",\"command\":\"serve\",\"socket\":\"{path}\"}}}}"
     );
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
+                apply_localapi_io_timeouts!(stream);
                 if let Err(e) = handle_localapi_request(&mut stream, &token) {
                     eprintln!("serve connection error: {e}");
                 }
@@ -783,6 +820,15 @@ fn serve_over_socket(path: &str) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// P1-15：把 unix socket 文件收紧为仅属主可读写（0600）。
+#[cfg(unix)]
+fn harden_socket_permissions(path: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("chmod 0600 socket {path}: {e}"))
 }
 
 #[cfg(windows)]
@@ -1094,5 +1140,45 @@ mod parse_flags_tests {
     fn equals_form_with_empty_value() {
         let m = parse_flags(&args(&["--addr="]));
         assert_eq!(m.get("--addr").and_then(|v| v.as_deref()), Some(""));
+    }
+}
+
+/// P1-15：控制面加固回归。
+#[cfg(all(test, unix))]
+mod p1_15_localapi_hardening_tests {
+    use super::{LOCALAPI_IO_TIMEOUT, harden_socket_permissions};
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    #[test]
+    fn socket_hardening_tightens_mode_to_owner_only() {
+        // bind 后必须 0600：umask 只做减法，默认常落在 0755/0777，
+        // 同机其他用户就能连上拿 bearer token。
+        let path = std::env::temp_dir().join(format!("nexusd-sock-hard-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        harden_socket_permissions(path.to_str().unwrap()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        // 失败路径：不存在的文件 → Err（调用方据此 fail-closed）。
+        assert!(
+            harden_socket_permissions("/nonexistent/nexus-sock").is_err(),
+            "missing socket must fail closed, not silently succeed"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn localapi_io_timeout_is_bounded() {
+        // "连上不发换行"不得永久挂住控制面：超时必须有限。
+        assert!(LOCALAPI_IO_TIMEOUT > Duration::ZERO);
+        assert!(
+            LOCALAPI_IO_TIMEOUT <= Duration::from_secs(30),
+            "must be a real bound, got {:?}",
+            LOCALAPI_IO_TIMEOUT
+        );
     }
 }
