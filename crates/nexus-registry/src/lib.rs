@@ -11,15 +11,6 @@
 
 use nexus_domain::{ProviderId, ResourceId};
 
-/// 稳定模块标识；业务实现应通过公开类型/trait 增量加入，而不是扩大隐式全局状态。
-pub const NEXUS_REGISTRY_MODULE: &str = "nexus-registry";
-
-/// 返回模块的人类可读职责摘要。
-#[must_use]
-pub const fn module_summary() -> &'static str {
-    "维护 Resource/Provider/Node/Presence/Capability/Locator 的可查询注册视图。"
-}
-
 /// 一条 Provider 注册记录（事实，不含评分）。
 ///
 /// 不变量：

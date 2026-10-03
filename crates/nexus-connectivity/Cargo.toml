@@ -9,7 +9,6 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-nexus-delivery = { path = "../nexus-delivery" }
 nexus-platform = { path = "../nexus-platform" }
 # v9 §8.1 Connectivity Evaluation：输出 DTO（nexus-domain 共享词汇）+
 # 最近测量输入（nexus-measurement 事实测量）。均为 DTO/事实依赖，

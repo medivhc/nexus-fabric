@@ -198,5 +198,13 @@
     "module": "scenarios",
     "category": "architecture-decision",
     "summary": "CLI 统一后 stale 场景 requirement-change 重写模式：以真机实测的新 nexus 行为为准（UNSUPPORTED 形状/run service 摘要/exit 2 缺口）"
+  },
+  {
+    "id": "arch-cleanup-dead-code-2026-10-03",
+    "file": "entries/2026-10-03-arch-cleanup-dead-code.md",
+    "date": "2026-10-03",
+    "module": "workspace",
+    "category": "architecture-decision",
+    "summary": "架构清理：删除23个module_summary()+24个NEXUS_*_MODULE常量+8条空Cargo依赖边（proto/diagnostics/delivery占位crate保留）；删前二次grep确认零引用"
   }
 ]

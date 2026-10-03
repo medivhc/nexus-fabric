@@ -16,9 +16,6 @@
 
 use std::net::Ipv4Addr;
 
-/// 稳定模块标识。
-pub const NEXUS_COORD_MODULE: &str = "nexus-connectivity::coord";
-
 /// 协调错误（全部结构化，无 panic 路径）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoordError {

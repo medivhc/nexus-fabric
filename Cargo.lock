@@ -742,7 +742,6 @@ dependencies = [
 name = "nexus-compute"
 version = "0.1.0"
 dependencies = [
- "nexus-delivery",
  "nexus-domain",
  "nexus-session",
  "nexus-workspace",
@@ -754,7 +753,6 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "lz4_flex",
- "nexus-delivery",
  "nexus-domain",
  "nexus-measurement",
  "nexus-platform",
@@ -768,7 +766,6 @@ name = "nexus-control-api"
 version = "0.1.0"
 dependencies = [
  "nexus-domain",
- "nexus-proto",
 ]
 
 [[package]]
@@ -887,7 +884,6 @@ name = "nexus-network"
 version = "0.1.0"
 dependencies = [
  "libc",
- "nexus-delivery",
  "nexus-discovery",
  "nexus-dns",
  "nexus-domain",
@@ -1074,7 +1070,6 @@ dependencies = [
 name = "nexus-service"
 version = "0.1.0"
 dependencies = [
- "nexus-delivery",
  "nexus-domain",
  "nexus-session",
 ]
@@ -1097,7 +1092,6 @@ dependencies = [
 name = "nexus-transport"
 version = "0.1.0"
 dependencies = [
- "nexus-delivery",
  "nexus-platform",
 ]
 
@@ -1115,7 +1109,6 @@ dependencies = [
 name = "nexus-workspace"
 version = "0.1.0"
 dependencies = [
- "nexus-delivery",
  "nexus-domain",
  "nexus-platform",
  "nexus-session",
@@ -1145,7 +1138,6 @@ dependencies = [
  "nexus-compute",
  "nexus-connectivity",
  "nexus-control-api",
- "nexus-diagnostics",
  "nexus-discovery",
  "nexus-dns",
  "nexus-domain",

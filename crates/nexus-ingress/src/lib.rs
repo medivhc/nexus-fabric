@@ -18,17 +18,8 @@ use nexus_domain::{FlowContext, FlowOrigin, ResourceId};
 /// §11.18 TUN 透明入站：原始 IPv4 包纯函数解码（零 I/O）。
 pub mod ip_packet;
 
-/// 稳定模块标识；业务实现应通过公开类型/trait 增量加入，而不是扩大隐式全局状态。
-pub const NEXUS_INGRESS_MODULE: &str = "nexus-ingress";
-
 /// InternetAccess 对应的 Network Resource 标识。
 pub const INTERNET_ACCESS_RESOURCE: &str = "internet-access";
-
-/// 返回模块的人类可读职责摘要。
-#[must_use]
-pub const fn module_summary() -> &'static str {
-    "便携 Flow Classification 与中立 FlowContext 构造（不调用 Planner、不做平台拦截）。"
-}
 
 /// 由指定来源构造一个中立 FlowContext（内部统一构造点，保证字段一致）。
 #[must_use]
