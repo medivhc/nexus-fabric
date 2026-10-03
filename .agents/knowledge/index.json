@@ -198,5 +198,13 @@
     "module": "scenarios",
     "category": "architecture-decision",
     "summary": "CLI 统一后 stale 场景 requirement-change 重写模式：以真机实测的新 nexus 行为为准（UNSUPPORTED 形状/run service 摘要/exit 2 缺口）"
+  },
+  {
+    "id": "n1-watcher-graceful-close-001",
+    "file": "entries/2026-10-03-n1-watcher-graceful-close.md",
+    "date": "2026-10-03",
+    "module": "nexus-network",
+    "category": "implementation-pitfall",
+    "summary": "watcher 误报对端优雅关闭为链路故障：N1Error 新增 PeerClosed(u32) 保留关闭码，pinger 透出终止错误，PeerClosed(0) 静默退出不触发 rebind（B2 深层根治）"
   }
 ]
