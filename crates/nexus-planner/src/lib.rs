@@ -406,7 +406,7 @@ where
     let cached_measure = |id: &ProviderId| measurements.get(id).cloned().flatten();
 
     // 阶段二：Score（归一化加权 + 本地优先）+ 确定性选优。
-    let scored = score_candidates(&feasible, &cached_measure, snapshot.local_provider.as_ref());
+    let scored = score_candidates(&feasible, cached_measure, snapshot.local_provider.as_ref());
     let score_of = |id: &ProviderId| scored.iter().find(|s| s.record.id == *id);
     let considered: Vec<ConsideredCandidate> = filtered
         .iter()
