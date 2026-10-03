@@ -290,7 +290,11 @@ impl N2Directory {
                     .get(&ad.provider.0)
                     .cloned()
                     .unwrap_or_default(),
-                locator: ad.locators.first().cloned().unwrap_or_default(),
+                // P1-13：数据面端点必须取"首个非 `n2adm://` locator"
+                //（`service_locator_of`，与准入端点提取同一规则），不能
+                // 无条件取 `locators[0]` —— 运维把准入端点写前面时，
+                // 准入端点会被当成 Service 入口输出。
+                locator: crate::n2_admission::service_locator_of(ad).unwrap_or_default(),
                 capabilities: ad.capabilities.clone(),
                 present: matches!(
                     ad.unavailable,
@@ -474,6 +478,53 @@ mod tests {
         assert_eq!(id.0, "res-pub-svc");
         // 静态种子不受影响。
         assert!(d.resolve("dev-svc").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn planning_snapshot_uses_data_plane_locator_not_admission_locator() {
+        // P1-13：`n2adm://` 写在前面时，`ProviderRecord.locator`（即 plan.path）
+        // 必须仍是数据面端点 —— 准入端点不能被当成 Service 入口输出。
+        use crate::n2_store::N2Store;
+        let dir = temp_node_dir("dataplane-locator");
+        let store = N2Store::open(&dir).unwrap();
+        store
+            .save_ad(&ProviderAdvertisement {
+                provider: ProviderId("prov-loc".into()),
+                resource: ResourceId("res-loc-svc".into()),
+                capabilities: vec!["service".into()],
+                locators: vec![
+                    "n2adm://10.0.0.2:9443".into(),
+                    "tcp://10.0.0.2:8080".into(),
+                ],
+                discoverable_by: Discoverability::Public,
+                use_grants: Vec::new(),
+                unavailable: None,
+                issued_at_secs: 1000,
+                ttl_secs: 0,
+            })
+            .unwrap();
+        store
+            .save_names(&[NameEntry {
+                workspace: WorkspaceId::new(DEFAULT_WORKSPACE),
+                name: ResourceName::new("loc-svc").unwrap(),
+                resource_id: ResourceId("res-loc-svc".into()),
+                kind: Some(nexus_domain::ResourceKind::Service),
+            }])
+            .unwrap();
+
+        let d = N2Directory::open_with_store(&store, 1000).unwrap();
+        let (_, rid) = d.resolve("loc-svc").unwrap();
+        let snapshot = d.planning_snapshot("loc-svc", &rid, 1000);
+        let rec = snapshot
+            .candidates
+            .iter()
+            .find(|c| c.id.0 == "prov-loc")
+            .expect("candidate present");
+        assert_eq!(
+            rec.locator, "tcp://10.0.0.2:8080",
+            "must skip the n2adm:// admission locator"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

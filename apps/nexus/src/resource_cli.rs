@@ -211,14 +211,40 @@ fn default_capability(kind: ResourceKind) -> &'static str {
     }
 }
 
+/// P1-13：`--locator` 列表校验。
+///
+/// 约定：首个非 `n2adm://` locator 是 Service 数据面端点（`n2_admission::
+/// service_locator_of` 提取）；`n2adm://host:port` 是跨机准入控制端点。
+/// 一旦给了 locator，就必须至少有一个数据面端点 —— 只给准入端点会让
+/// Service 入口无法解析（此前 publish 对顺序/构成零校验，运维把
+/// `n2adm://` 写前面即产出不可用的广告）。
+///
+/// 空列表合法（静态种子 / 本机发布，`n2-resource-publish` 场景契约）。
+fn validate_locators(locators: &[String]) -> Result<(), String> {
+    if locators.is_empty() {
+        return Ok(());
+    }
+    let has_dataplane = locators
+        .iter()
+        .any(|l| !l.starts_with(crate::n2_admission::CONTROL_LOCATOR_SCHEME));
+    if has_dataplane {
+        return Ok(());
+    }
+    Err(
+        "at least one non-`n2adm://` data-plane locator is required when --locator is given"
+            .to_string(),
+    )
+}
+
 /// `nexus resource publish --name <n> --kind <k> [--locator <l>]`。
 fn run_publish(args: &[String], json_mode: bool) -> i32 {
     const USAGE: &str = "usage: nexus resource publish --name <name> --kind <service|network|workspace|compute|device> [--locator <locator> ...]";
     let mut name: Option<String> = None;
     let mut kind: Option<String> = None;
     // P0-5：`--locator` 可重复。约定：首个非 `n2adm://` locator 为 Service
-    // 数据面端点（planner 取 `locators[0]`）；`n2adm://host:port` 为跨机准入
-    // 控制端点（`n2_admission::CONTROL_LOCATOR_SCHEME`）。
+    // 数据面端点（P1-13：统一由 `n2_admission::service_locator_of` 提取，
+    // 不再取 `locators[0]`）；`n2adm://host:port` 为跨机准入控制端点
+    // （`n2_admission::CONTROL_LOCATOR_SCHEME`）。
     let mut locators: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -249,6 +275,14 @@ fn run_publish(args: &[String], json_mode: bool) -> i32 {
             }
         }
         i += 1;
+    }
+    // P1-13：有 locator 时必须至少含一个数据面端点（准入端点不能当 Service 入口）。
+    if let Err(e) = validate_locators(&locators) {
+        render(
+            &json!({"verdict":"FAIL","error":{"code":"INVALID_LOCATOR","message":e}}),
+            json_mode,
+        );
+        return 0;
     }
     let (Some(name), Some(kind_s)) = (name, kind) else {
         eprintln!("error: resource publish requires --name and --kind");
@@ -811,6 +845,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn publish_locator_validation_requires_a_data_plane_endpoint() {
+        // P1-13：空列表合法（静态种子 / 本机发布，场景契约）。
+        assert!(validate_locators(&[]).is_ok());
+        // 有数据面端点（无论顺序）→ 合法。
+        assert!(validate_locators(&[
+            "tcp://127.0.0.1:8080".to_string(),
+            "n2adm://10.0.0.2:9443".to_string(),
+        ])
+        .is_ok());
+        assert!(validate_locators(&[
+            "n2adm://10.0.0.2:9443".to_string(),
+            "tcp://127.0.0.1:8080".to_string(),
+        ])
+        .is_ok());
+        // 只给准入端点 → 拒绝（准入端点不能当 Service 入口）。
+        assert!(
+            validate_locators(&["n2adm://10.0.0.2:9443".to_string()]).is_err(),
+            "admission-only locator must be rejected"
+        );
     }
 
     #[test]

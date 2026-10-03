@@ -37,8 +37,9 @@ pub const ADMISSION_PROTOCOL_V1: u32 = 1;
 /// 广告 locator 中标记提供方准入端点的 scheme（`n2adm://host:port`）。
 ///
 /// 约定：`resource publish` 的 locator 列表中，首个非 `n2adm://` locator 为
-/// Service 数据面端点（planner 取 `locators[0]` 作 plan.path）；`n2adm://`
-/// locator 为准入控制端点（`use` 跨机时拨号）。
+/// Service 数据面端点（`service_locator_of` 提取，写入 `ProviderRecord.locator`
+/// 作 plan.path；P1-13：不再无条件取 `locators[0]`）；`n2adm://` locator 为
+/// 准入控制端点（`use` 跨机时拨号，见 `control_locator_of`）。
 pub const CONTROL_LOCATOR_SCHEME: &str = "n2adm://";
 
 /// 提供方租约 TTL（秒；与 `use_cli::LEASE_TTL_SECS` 一致，P0 固定 1 小时）。

@@ -44,6 +44,12 @@ use nexus_registry::ProviderRecord;
 
 /// 能力约束键（与 nexus-policy 的 CONSTRAINT_CAPABILITY 同值；planner 不依赖 policy crate）。
 const CONSTRAINT_CAPABILITY: &str = "capability";
+/// Placement 硬约束键：候选的 `ProviderRecord.placement` 必须等于约束值
+///（与 `ProviderRecord.placement` 同语义；planner 不依赖 policy crate）。
+///
+/// 这是 `capability` 之外唯一的候选级硬约束，`filter_candidates` 对它产出
+/// [`RejectReason::ExcludedByConstraint`]（D3："为什么没被选"的结构化出口）。
+const CONSTRAINT_PLACEMENT: &str = "placement";
 
 /// 归一化评分满分（万分比整数，避免浮点不确定性）。
 const SCORE_SCALE: u64 = 10_000;
@@ -183,29 +189,49 @@ pub fn connectivity_gate(snapshot: &PlanningSnapshot) -> Vec<(ProviderId, Reject
 ///
 /// 短路语义：返回的每个候选要么带结构化拒绝原因，要么可行（`reason: None`）；
 /// 被拒候选**绝不进入评分阶段**。
+///
+/// 判定优先级（先命中先拒绝，后续检查不再覆盖原原因）：
+/// 1. `present == false` → `NotPresent`；
+/// 2. 能力约束不满足 → `MissingCapability { required }`；
+/// 3. placement 硬约束不满足 → `ExcludedByConstraint { key, value }`
+///    （P1-16：D3 要求"非能力类硬约束被拒"必须给出结构化 reason，
+///    此前该变体全仓无生产者，explain 里只剩"已实现"的错觉）。
+///
+/// 未声明的约束键不参与候选过滤（未知 ≠ 排除）。
 #[must_use]
 pub fn filter_candidates(
     constraints: &[Constraint],
     candidates: &[ProviderRecord],
 ) -> Vec<FilteredCandidate> {
     let required = constraint_value(constraints, CONSTRAINT_CAPABILITY);
+    let placement = constraint_value(constraints, CONSTRAINT_PLACEMENT);
     candidates
         .iter()
         .map(|c| {
-            let reason = if !c.present {
-                Some(RejectReason::NotPresent)
-            } else if let Some(cap) = required {
-                if c.has_capability(cap) {
-                    None
-                } else {
-                    Some(RejectReason::MissingCapability {
-                        required: cap.to_string(),
-                    })
-                }
-            } else {
-                // 无能力约束：不按能力过滤（保持 present 者可行）。
+            let mut reason = if c.present {
                 None
+            } else {
+                Some(RejectReason::NotPresent)
             };
+            if reason.is_none() {
+                if let Some(cap) = required {
+                    if !c.has_capability(cap) {
+                        reason = Some(RejectReason::MissingCapability {
+                            required: cap.to_string(),
+                        });
+                    }
+                }
+            }
+            if reason.is_none() {
+                if let Some(want) = placement {
+                    if c.placement != want {
+                        reason = Some(RejectReason::ExcludedByConstraint {
+                            key: CONSTRAINT_PLACEMENT.to_string(),
+                            value: want.to_string(),
+                        });
+                    }
+                }
+            }
             FilteredCandidate {
                 record: c.clone(),
                 reason,
@@ -369,10 +395,22 @@ where
         });
     }
 
+    // P1-4：每个候选只测量一次并缓存 —— max_rtt 归一化、打分、DecisionTrace
+    // 的 Measurement 快照共用同一份值（D3：trace 快照 == 打分所用值，可重放）。
+    // 此前对每个候选调 `measure` 三次，真实测量源下成本三倍且快照可能失真。
+    let measurements: std::collections::HashMap<ProviderId, Option<LinkMeasurement>> = snapshot
+        .candidates
+        .iter()
+        .map(|c| (c.id.clone(), measure(&c.id)))
+        .collect();
+    let cached_measure = |id: &ProviderId| measurements.get(id).cloned().flatten();
+
     // 阶段二：Score（归一化加权 + 本地优先）+ 确定性选优。
-    // 注意：`measure` 在此处被调用——返回的值即"决策时的测量值"，
-    // 下面原样写入 DecisionTrace 的 Measurement 快照（可重放）。
-    let scored = score_candidates(&feasible, &measure, snapshot.local_provider.as_ref());
+    let scored = score_candidates(
+        &feasible,
+        &cached_measure,
+        snapshot.local_provider.as_ref(),
+    );
     let score_of = |id: &ProviderId| scored.iter().find(|s| s.record.id == *id);
     let considered: Vec<ConsideredCandidate> = filtered
         .iter()
@@ -383,7 +421,10 @@ where
                 rejected_reason: f.reason.clone(),
                 connectivity: evaluation_of(&f.record.id),
                 // D3 加厚：决策时的测量快照（`None` = 决策时无测量，显式未知）。
-                measurement: measure(&f.record.id).as_ref().map(snapshot_measurement),
+                measurement: measurements
+                    .get(&f.record.id)
+                    .and_then(|m| m.as_ref())
+                    .map(snapshot_measurement),
                 score: scored_hit.map(|s| s.score),
                 score_breakdown: scored_hit.map(|s| s.breakdown.clone()),
             }
@@ -680,6 +721,85 @@ mod tests {
             })
         );
         assert_eq!(filtered[2].reason, None);
+    }
+
+    /// P1-16：非能力类硬约束（placement）被拒时必须给出结构化
+    /// `ExcludedByConstraint`，而不是静默无 reason。
+    #[test]
+    fn placement_constraint_produces_excluded_by_constraint() {
+        let mut cs = constraints();
+        cs.push(Constraint {
+            key: "placement".into(),
+            value: "east".into(),
+        });
+        let cands = vec![
+            candidate("east-1", "east", &["internet-access"], true),
+            candidate("west-1", "west", &["internet-access"], true),
+        ];
+        let filtered = filter_candidates(&cs, &cands);
+        let reason_of = |id: &str| {
+            filtered
+                .iter()
+                .find(|f| f.record.id.0 == id)
+                .unwrap()
+                .reason
+                .clone()
+        };
+        assert_eq!(reason_of("east-1"), None);
+        assert_eq!(
+            reason_of("west-1"),
+            Some(RejectReason::ExcludedByConstraint {
+                key: "placement".into(),
+                value: "east".into(),
+            })
+        );
+        // 端到端：结构化 reason 一路进 DecisionTrace（D3 explain 可消费）。
+        let out = plan(&resource(), &intent(), &cs, &cands, |_| None).unwrap();
+        let west = out
+            .trace
+            .considered
+            .iter()
+            .find(|c| c.provider.0 == "west-1")
+            .unwrap();
+        assert_eq!(
+            west.rejected_reason.as_ref().map(|r| r.label()),
+            Some("excluded_by_constraint")
+        );
+        assert_eq!(out.trace.selected, ProviderId("east-1".into()));
+    }
+
+    /// P1-4：`measure` 对每个候选只调一次 —— max_rtt 归一化、打分、
+    /// DecisionTrace 的 Measurement 快照共用同一份值。
+    #[test]
+    fn measure_is_called_exactly_once_per_candidate() {
+        use std::cell::Cell;
+        let cands = vec![
+            candidate("fast", "east", &["internet-access"], true),
+            candidate("slow", "west", &["internet-access"], true),
+            candidate("down", "d", &["internet-access"], false),
+        ];
+        let calls: Cell<u32> = Cell::new(0);
+        let out = plan(&resource(), &intent(), &constraints(), &cands, |p| {
+            calls.set(calls.get() + 1);
+            Some(LinkMeasurement {
+                rtt_ms: Some(if p.0 == "fast" { 20 } else { 80 }),
+                ..Default::default()
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            calls.get(),
+            cands.len() as u32,
+            "each candidate must be measured exactly once"
+        );
+        // 所有候选（含被拒的）都带 Measurement 快照，且与打分同源。
+        for c in &out.trace.considered {
+            let m = c.measurement.as_ref().expect("measurement snapshot");
+            assert_eq!(
+                m.rtt_ms,
+                Some(if c.provider.0 == "fast" { 20 } else { 80 })
+            );
+        }
     }
 
     #[test]
