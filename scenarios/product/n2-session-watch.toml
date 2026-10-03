@@ -1,0 +1,38 @@
+schema_version = 1
+id = "product.n2-session-watch"
+title = "nexus session watch <id>：按 SessionId 查询状态＋历史 DecisionTrace"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#16-n2-resource-access"
+
+[given]
+# P0-0 契约冻结（2026-10-03）：`nexus session watch` 的 N2 语义在 P0-4 实现，
+# 此处先冻结期望。
+# requirement-change 注释：本场景为新契约（contract-first）；当前 `session watch`
+# 走 daemon LocalAPI（/localapi/v0/session/watch），无 daemon 时返回结构化
+# 不可达 FAIL，预期 Red（FAIL）。
+# D1/D7：Session＝一次 Resource 使用；N2 交付 started/running/finished/cancel＋状态查询；
+# 终态语义修正：客户端断开窗口内→仍 Active（可重附着）；窗口外→
+# Cancelled(ClientDetached)；provider 消失→Failed(ProviderLost)；
+# 授权撤销→Cancelled(Revoked)。断开≠Failed。
+# D3：`plan explain <session-id>` 读 Session 内嵌的历史 PlanSnapshot＋DecisionTrace。
+# P0 完成标志 3：CLI 退出重进，可按 SessionId 查到状态＋历史 DecisionTrace。
+# E4 前置：daemon 内存在 Session sess-n2-e4-1（P0-4 E4 播种）。
+session_id = "sess-n2-e4-1"
+
+[when]
+command = "cargo run --quiet -p nexus -- session watch sess-n2-e4-1 --json"
+
+# 冻结期望（实现后必须满足）：
+# - verdict=PASS；session.id 精确回显所查 id
+# - session.outcome 为合法 TerminalOutcome 之一（Unfinished/Completed/Failed/Cancelled）
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "session.id"
+equals = "sess-n2-e4-1"
+
+[[expect]]
+field = "session.outcome"
+one_of = ["Unfinished", "Completed", "Failed", "Cancelled"]

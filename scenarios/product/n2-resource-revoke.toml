@@ -1,0 +1,32 @@
+schema_version = 1
+id = "product.n2-resource-revoke"
+title = "nexus resource revoke：撤销资源发布（撤销后目录不可见）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#16-n2-resource-access"
+
+[given]
+# P0-0 契约冻结（2026-10-03）：`nexus resource revoke` 在 P0-2/P0-4 实现，
+# 此处先冻结期望。
+# requirement-change 注释：本场景为新契约（contract-first）；当前实现尚无
+# `resource` 子命令，预期 Red（FAIL：unknown command，exit 2，无 JSON 输出）。
+# 白皮书 §7.3：发布入口必须能够撤销，并显示其当前生效状态。
+# D6 关联：撤销是 grant 判定输入之一（Deny{Revoked}）；短 TTL＋租约到期＋
+# 撤销列表在恢复连接后拉取。
+# E4 前置：dev-svc 已发布。
+[when]
+command = "cargo run --quiet -p nexus -- resource revoke dev-svc --json"
+
+# 冻结期望（实现后必须满足）：
+# - verdict=PASS；resource.name=dev-svc；resource.revoked=true
+#   （撤销生效的显式标记；撤销后 `resource list` 不得再列出它）
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "resource.name"
+equals = "dev-svc"
+
+[[expect]]
+field = "resource.revoked"
+equals = true
