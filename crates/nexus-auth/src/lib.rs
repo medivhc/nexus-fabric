@@ -234,11 +234,16 @@ impl GrantTable {
     /// 授权判定（D6）：provider 侧每次建 Session 时调用。
     ///
     /// 判定顺序固定（拒绝原因精确化）：
-    /// 1. 无 `(resource, principal)` grant → `NoSuchGrant`；
-    /// 2. grant.workspace ≠ 请求 workspace → `WrongWorkspace`；
+    /// 1. 无 `(resource.name, principal)` grant → `NoSuchGrant`；
+    /// 2. 命中 grant 的 workspace ≠ 请求 workspace → `WrongWorkspace`
+    ///    （P1-17：查找键只用资源名，workspace 差异显式比对，
+    ///    否则 `ResourceRef` 的 `PartialEq` 含 workspace 会让 `find`
+    ///    先失败、永远落到 `NoSuchGrant`，`WrongWorkspace` 成死路径）；
     /// 3. grant 被撤销 → `Revoked`；
     /// 4. `not_after` 已过 → `Expired`；
-    /// 5. operation ∉ grant.operations → `OperationNotGranted`；
+    /// 5. operation ∉ grant.operations → `OperationNotGranted`
+    ///    （`Manage` 蕴含 `Use`：管理权是更宽的权限，持 Manage 即可 Use；
+    ///    反向不成立 —— 只有 Use 不得 Manage）；
     /// 6. 否则 `Allow`。
     ///
     /// 无论 Allow/Deny 都向 `sink` 写 exactly-once 审计记录。
@@ -261,14 +266,24 @@ impl GrantTable {
     }
 
     fn decide(&self, req: &AuthRequest, now_unix: u64) -> AuthorizationDecision {
-        let grant = match self
+        // 按资源名 + principal 收集候选（可能横跨多个 workspace）。
+        let mut candidates = self
             .grants
             .iter()
-            .find(|g| g.resource == req.resource && g.principal == req.principal)
-        {
-            Some(g) => g,
-            None => return AuthorizationDecision::Deny(DenyReason::NoSuchGrant),
-        };
+            .filter(|g| g.resource.name == req.resource.name && g.principal == req.principal)
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return AuthorizationDecision::Deny(DenyReason::NoSuchGrant);
+        }
+        // 优先取请求 workspace 的那条；没有则取第一条用于报 WrongWorkspace。
+        let grant = candidates
+            .iter()
+            .find(|g| g.resource.workspace == req.workspace)
+            .copied()
+            .unwrap_or_else(|| {
+                candidates.sort_by(|a, b| a.resource.workspace.0.cmp(&b.resource.workspace.0));
+                candidates.remove(0)
+            });
         if grant.resource.workspace != req.workspace {
             return AuthorizationDecision::Deny(DenyReason::WrongWorkspace {
                 expected: grant.resource.workspace.clone(),
@@ -286,7 +301,10 @@ impl GrantTable {
                 });
             }
         }
-        if !grant.operations.contains(&req.operation) {
+        let granted = grant.operations.contains(&req.operation)
+            || (req.operation == ResourceOperation::Use
+                && grant.operations.contains(&ResourceOperation::Manage));
+        if !granted {
             return AuthorizationDecision::Deny(DenyReason::OperationNotGranted {
                 operation: req.operation,
             });
@@ -436,6 +454,126 @@ mod tests {
         assert_eq!(sink.records.len(), 1);
     }
 
+    /// P1-17：生产调用方同时改 `req.workspace` 与 `req.resource`（两者同源），
+    /// 查找键必须只用资源名，否则 `ResourceRef` 的 `PartialEq` 含 workspace
+    /// 会让 `find` 先失败、永远落到 `NoSuchGrant`。
+    #[test]
+    fn authorize_wrong_workspace_reachable_when_resource_ref_follows_request() {
+        let mut table = GrantTable::new();
+        let p = principal(17);
+        table.upsert(Grant::new(
+            rref("ws-a", "svc"),
+            p.clone(),
+            vec![ResourceOperation::Use],
+            None,
+        ));
+        let mut sink = VecAuditSink::new();
+        // 生产形状：workspace 上下文与 resource 引用一起改成 ws-b。
+        let r = req("ws-b", "svc", p, ResourceOperation::Use);
+        let d = table.authorize(&r, 1000, &mut sink);
+        assert!(
+            matches!(
+                d,
+                AuthorizationDecision::Deny(DenyReason::WrongWorkspace {
+                    ref expected,
+                    ref actual
+                }) if expected.0 == "ws-a" && actual.0 == "ws-b"
+            ),
+            "expected WrongWorkspace, got {d:?}"
+        );
+        assert_eq!(sink.records.len(), 1);
+    }
+
+    /// P1-17：同一 (name, principal) 在两个 workspace 各有一条 grant 时，
+    /// 请求命中的必须是请求 workspace 的那条，不误报 WrongWorkspace。
+    #[test]
+    fn authorize_picks_grant_matching_request_workspace() {
+        let mut table = GrantTable::new();
+        let p = principal(18);
+        table.upsert(Grant::new(
+            rref("ws-a", "svc"),
+            p.clone(),
+            vec![ResourceOperation::Manage],
+            None,
+        ));
+        table.upsert(Grant::new(
+            rref("ws-b", "svc"),
+            p.clone(),
+            vec![ResourceOperation::Use],
+            None,
+        ));
+        let mut sink = VecAuditSink::new();
+        let d = table.authorize(
+            &req("ws-b", "svc", p, ResourceOperation::Use),
+            1000,
+            &mut sink,
+        );
+        assert_eq!(d, AuthorizationDecision::Allow);
+    }
+
+    /// P1-14：`Manage` 不再是装饰性操作码 —— 持 Manage 即可 Use；
+    /// 反向不成立（只给 Use 不能 Manage）。
+    #[test]
+    fn manage_grant_covers_use_but_not_the_other_way() {
+        let mut table = GrantTable::new();
+        let p = principal(19);
+        table.upsert(Grant::new(
+            rref("default", "svc"),
+            p.clone(),
+            vec![ResourceOperation::Manage],
+            None,
+        ));
+        let mut sink = VecAuditSink::new();
+        let d = table.authorize(
+            &req("default", "svc", p.clone(), ResourceOperation::Use),
+            1000,
+            &mut sink,
+        );
+        assert_eq!(d, AuthorizationDecision::Allow, "Manage must imply Use");
+
+        let mut only_use = GrantTable::new();
+        only_use.upsert(Grant::new(
+            rref("default", "svc"),
+            p.clone(),
+            vec![ResourceOperation::Use],
+            None,
+        ));
+        let d = only_use.authorize(
+            &req("default", "svc", p, ResourceOperation::Manage),
+            1000,
+            &mut sink,
+        );
+        assert_eq!(
+            d,
+            AuthorizationDecision::Deny(DenyReason::OperationNotGranted {
+                operation: ResourceOperation::Manage
+            }),
+            "Use must not imply Manage"
+        );
+    }
+
+    /// P1-14：tombstone（`revoked=true`）优先于操作码判定 —— 撤销的 grant
+    /// 即便列出 Manage 也只能得到 `Revoked`，不是 Allow。
+    #[test]
+    fn revoked_manage_grant_is_still_revoked() {
+        let mut table = GrantTable::new();
+        let p = principal(20);
+        table.upsert(Grant::new(
+            rref("default", "svc"),
+            p.clone(),
+            vec![ResourceOperation::Manage],
+            None,
+        ));
+        assert!(table.revoke(&rref("default", "svc"), &p));
+        let mut sink = VecAuditSink::new();
+        let d = table.authorize(
+            &req("default", "svc", p, ResourceOperation::Use),
+            1000,
+            &mut sink,
+        );
+        assert_eq!(d, AuthorizationDecision::Deny(DenyReason::Revoked));
+    }
+
     #[test]
     fn authorize_expired_and_revoked() {
         let mut table = GrantTable::new();
@@ -505,19 +643,19 @@ mod tests {
         table.upsert(Grant::new(
             rref("default", "svc"),
             p.clone(),
-            vec![ResourceOperation::Use],
+            vec![ResourceOperation::Manage],
             None,
         ));
         table.upsert(Grant::new(
             rref("default", "svc"),
             p.clone(),
-            vec![ResourceOperation::Manage],
+            vec![ResourceOperation::Use],
             None,
         ));
         let mut sink = VecAuditSink::new();
-        // 旧 operations 被覆盖：Use 不再被授予。
+        // 旧 operations 被覆盖：Manage 不再被授予（Use 不蕴含 Manage）。
         let d = table.authorize(
-            &req("default", "svc", p, ResourceOperation::Use),
+            &req("default", "svc", p, ResourceOperation::Manage),
             1000,
             &mut sink,
         );

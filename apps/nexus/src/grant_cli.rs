@@ -4,7 +4,8 @@
 //! P0-4 只在测试替身里写 grant，本命令族给真机运维（B 机为 A 机 principal 授权）。
 //!
 //! - `nexus grant add --resource <name> --principal <ed25519:...> --op <Use|Manage> [--not-after <unix>]`
-//! - `nexus grant del --resource <name> --principal <ed25519:...>`
+//! - `nexus grant del --resource <name> --principal <ed25519:...>`（P1-14：撤销
+//!   tombstone，后续判定 `Deny(Revoked)` 而非 `NoSuchGrant`）
 //! - `nexus grant list [--resource <name>]`
 //!
 //! 全部进程内 N2 存储操作，不经过 daemon。
@@ -135,6 +136,10 @@ fn run_add(args: &[String], json_mode: bool) -> i32 {
 }
 
 /// `nexus grant del` 的可测试内核（`node_dir` 注入）。
+///
+/// P1-14：`del` 是**撤销（tombstone）**而非物理删除 —— 条目保留并置
+/// `revoked=true`，后续授权判定得到 `Deny(Revoked)`，审计可区分
+/// "撤销过"与"从未授权"。
 pub(crate) fn del_grant_from(
     node_dir: &std::path::Path,
     name: &str,
@@ -143,17 +148,18 @@ pub(crate) fn del_grant_from(
     let now = now_unix_pub();
     let store = N2Store::open(node_dir).map_err(store_fail)?;
     let rref = resolve_rref(&store, name, now)?;
-    let deleted = store
-        .delete_grant(&rref, &Principal(principal_s.to_string()))
+    let revoked = store
+        .revoke_grant(&rref, &Principal(principal_s.to_string()))
         .map_err(store_fail)?;
     Ok(json!({
         "verdict": "PASS",
         "command": "grant del",
-        "grant": {"resource": name, "principal": principal_s, "deleted": deleted},
+        "grant": {"resource": name, "principal": principal_s, "revoked": revoked},
     }))
 }
 
-/// `nexus grant del --resource <name> --principal <p>`（物理删除 → 后续判定为 `NoSuchGrant`）。
+/// `nexus grant del --resource <name> --principal <p>`（撤销 grant；
+/// 后续判定为 `Deny(Revoked)` 而非 `NoSuchGrant`）。
 fn run_del(args: &[String], json_mode: bool) -> i32 {
     const USAGE: &str = "usage: nexus grant del --resource <name> --principal <ed25519:...>";
     let mut resource: Option<String> = None;
@@ -324,12 +330,23 @@ mod tests {
         let grants = store.load_grants().unwrap();
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].principal.0, "ed25519:abc");
+        // P1-14：`grant del` 是 tombstone —— 条目保留、标 revoked，
+        // 授权判定得到 Deny(Revoked) 而非 NoSuchGrant。
         let out = del_grant_from(&dir, "svc-g", "ed25519:abc").unwrap();
-        assert_eq!(out["grant"]["deleted"], json!(true));
-        assert!(store.load_grants().unwrap().is_empty());
-        // 幂等：再删一次 → deleted=false。
+        assert_eq!(out["grant"]["revoked"], json!(true));
+        let grants = store.load_grants().unwrap();
+        assert_eq!(grants.len(), 1, "tombstone must stay in the table");
+        assert!(grants[0].revoked);
+        // 幂等：再删一次仍报 revoked=true。
         let out = del_grant_from(&dir, "svc-g", "ed25519:abc").unwrap();
-        assert_eq!(out["grant"]["deleted"], json!(false));
+        assert_eq!(out["grant"]["revoked"], json!(true));
+        assert!(store.load_grants().unwrap()[0].revoked);
+        // 重新 add 解除撤销（upsert 覆盖 revoked 标记）。
+        add_grant_to(&dir, "svc-g", "ed25519:abc", "Use", None).unwrap();
+        assert!(!store.load_grants().unwrap()[0].revoked);
+        // 不存在的 grant → revoked=false（幂等，不报错）。
+        let out = del_grant_from(&dir, "svc-g", "ed25519:missing").unwrap();
+        assert_eq!(out["grant"]["revoked"], json!(false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

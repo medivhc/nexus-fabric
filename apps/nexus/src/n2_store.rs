@@ -785,24 +785,38 @@ impl N2Store {
         Ok(())
     }
 
-    /// 删除一条 grant（物理删除；删除后判定为 `NoSuchGrant`）。
+    /// 显式撤销一条 grant（tombstone；P1-14）。
     ///
-    /// 幂等：不存在 → `Ok(false)`。
-    pub fn delete_grant(
+    /// 不物理删除：保留条目并置 `revoked=true`，后续授权判定得到
+    /// `Deny(Revoked)` 而非 `NoSuchGrant` —— 审计里"撤销过"与"从未授权"
+    /// 必须可区分（D6 结构化 Deny 集合）。
+    ///
+    /// 幂等：不存在 → `Ok(false)`；已撤销 → `Ok(true)`（不再改写）。
+    pub fn revoke_grant(
         &self,
         resource: &nexus_domain::ResourceRef,
         principal: &nexus_auth::Principal,
     ) -> Result<bool, String> {
         let key = grant_key(resource, principal);
-        let existed = self
+        let Some(bytes) = self
             .kv
             .get(&key)
-            .map_err(|e| format!("read grant for delete: {e}"))?
-            .is_some();
+            .map_err(|e| format!("read grant for revoke: {e}"))?
+        else {
+            return Ok(false);
+        };
+        let text = String::from_utf8(bytes).map_err(|e| format!("grant not utf-8: {e}"))?;
+        let mut value: Value =
+            serde_json::from_str(&text).map_err(|e| format!("parse grant: {e}"))?;
+        if value.get("revoked").and_then(Value::as_bool) == Some(true) {
+            return Ok(true);
+        }
+        value["revoked"] = Value::Bool(true);
+        let data = serde_json::to_string(&value).map_err(|e| format!("encode grant: {e}"))?;
         self.kv
-            .delete(&key)
-            .map_err(|e| format!("delete grant: {e}"))?;
-        Ok(existed)
+            .put(&key, data.as_bytes())
+            .map_err(|e| format!("put revoked grant: {e}"))?;
+        Ok(true)
     }
 
     /// 加载全部 grant。
