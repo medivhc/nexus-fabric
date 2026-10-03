@@ -13,3 +13,6 @@ pub mod sync_transport;
 /// nexusd Workspace 生产接线（C1；仅 Linux：FUSE 挂载）。
 #[cfg(target_os = "linux")]
 pub mod workspace;
+
+/// N3-1 acceptance persistence, not yet connected to daemon product routes.
+pub mod task_store;

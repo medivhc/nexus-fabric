@@ -264,6 +264,18 @@
 
 ## Verification
 
+### N3 装配契约增补（待实现）
+
+装配 Compute TaskOwner、唯一 SessionManager、Snapshot/Artifact 存储与认证传输，
+以及具硬配额/隔离的 Linux executor；平台不支持时显式拒绝，不退回裸主机。
+所有任务进程/子树、日志 drain、取消、Join/Reap 和清理均有 Owner。
+冷启动先对账 Task/幂等/pins/执行标签，再接受任务和运行 GC；未知 StartIntent 不再 spawn。
+请求方 daemon 持久管理 cancel intent/outbox，确认落盘后才显示 Queued/CancelPending；
+恢复后幂等转发，视图中与提供方 cancellation/TaskOutcome 明确分离，不写权威终态。
+API/日志视图来自真实领域记录，不能从现有演示 ComputeJobSession 合成 N3 完成。
+未来 `examples/n3_task_e4.rs` 是独立产品边界 verifier，不建立另一套业务状态机，
+case 与断言由 `scenarios/product/n3-*.toml` 冻结，规范见 PRODUCT §17 与 N3 模型契约。
+
 最低：
 
 ```text

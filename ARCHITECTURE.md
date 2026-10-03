@@ -261,3 +261,30 @@ SOCKS5 Ingress（nexus-ingress Socks5Handshake）
   Composition Root / `nexus-platform-*` 注入。
 - `nexus-proxy` 不反向依赖 `nexus-network` / `nexus-service` / `nexus-workspace`
   / `nexus-compute`；代理内核产品线与远程资源访问闭环共享底座但不互相调用业务逻辑。
+
+## 12. N3 Task / Snapshot / Artifact（契约阶段）
+
+N3 是 Compute/Workspace 的类型化领域扩展；`Task != Session != Connection`。
+稳定核心 Plan 固定字段不增加 Task、Sandbox 或 Artifact 信息；使用版本化
+ComputePlanExtension/WorkspacePlanExtension，不产生第二个系统级 Planner。
+
+- `nexus-domain`：N3 标识符及跨模块版本化 DTO、纯状态词汇；零 I/O。
+- `nexus-compute`：TaskOwner、接受/幂等语义、执行结局与交付、Artifact 登记；
+  提供方是权威，请求方是经事件序号恢复的只读镜像。
+- `nexus-workspace`：固定输入、清单、SHA-256 校验、Snapshot protected roots。
+- `nexus-storage`：注入的 durable record/journal 与版本化 SHA-256 内容命名空间；
+  不解释 TaskOutcome，不迁移既有 FNV CAS。
+- `nexus-session`：保持现有 SessionManager 唯一 Session Owner；不拥有 Task，
+  不把 Session 的孤儿 Failed 传播为尚未核实的 Task 失败。
+- `nexus-control-api`：Submit/Get/ReadLogs/Cancel/ListArtifacts/GetArtifact 的
+  Application Service DTO；不依赖 compute/workspace/storage 实现。
+- `nexusd`：装配唯一 SessionManager 和提供方 TaskOwner，注入存储、认证传输、
+  Linux 执行适配器、日志 drain、取消/Join/Reap；执行平台能力在平台层或组合根实现。
+- `nexus`：CLI 参数/渲染，任务操作访问 daemon，不另持 TaskOwner。
+
+本阶段仅冻结上述归属，不新增 crate、Cargo/Policy 依赖边或预先新增 trait。
+Compute 不直接依赖 storage/platform/network；持久记录、进程执行、认证通道通过
+组合根注入，未来新增 abstraction 必须通过 Deletion Test。
+提供方 durable StartIntent/执行句柄用于核实崩溃窗口，未知时不自动再 spawn。
+TaskOutcome 与 Session TerminalOutcome 分别恰一次提交，不要求两侧共识。
+细节与冻结范围见 `docs/N3-MODEL-CONTRACT.md`；产品入口见 PRODUCT §17。

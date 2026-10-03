@@ -1,0 +1,36 @@
+schema_version = 1
+id = "product.n3-acceptance-crash"
+title = "接受窗口崩溃保持 Task/幂等索引/pin 的原子发布"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#17-n3-task"
+
+# N3 contract-first: future verifier, not a delivered runtime.
+# Modules: nexus-domain nexus-compute nexus-workspace nexus-storage
+# nexus-session nexus-control-api apps/nexus apps/nexusd
+
+[given]
+topology = "separate requester/provider processes; local E4, not Windows/Linux E5"
+steps = "在接受事务提交前后及 ack 前后注入崩溃，以同键恢复请求，重启后查询 roots 与任务计数。"
+
+[when]
+command = "cargo run --locked --quiet -p nexusd --example n3_task_e4 -- acceptance-crash"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "observed.acked_task_lost_count"
+equals = 0
+
+[[expect]]
+field = "observed.accepted_task_count_per_key"
+equals = 1
+
+[[expect]]
+field = "observed.accepted_snapshot_pin_restored"
+equals = true
+
+[[expect]]
+field = "observed.max_command_start_count_per_task"
+equals = 1
