@@ -76,6 +76,9 @@ pub(crate) fn add_grant_to(
         not_after,
     );
     store.save_grant(&grant).map_err(store_fail)?;
+    // P1-18：AUTH_GRANT 公告（与 revoke 对称的出站泵生产者）——排进 outbox，
+    // 由 `provider serve` 在该主体下次准入往返时投递（写成功后出队）。
+    store.queue_auth_grant(&grant).map_err(store_fail)?;
     Ok(json!({
         "verdict": "PASS",
         "command": "grant add",
@@ -181,9 +184,19 @@ pub(crate) fn del_grant_from(
     let now = now_unix_pub();
     let store = N2Store::open(node_dir).map_err(store_fail)?;
     let rref = resolve_rref(&store, name, now)?;
-    let revoked = store
-        .revoke_grant(&rref, &Principal(principal_s.to_string()))
-        .map_err(store_fail)?;
+    let principal = Principal(principal_s.to_string());
+    let now_revoked = store
+        .load_grants()
+        .map_err(store_fail)?
+        .iter()
+        .any(|g| g.resource == rref && g.principal == principal && g.revoked);
+    let revoked = store.revoke_grant(&rref, &principal).map_err(store_fail)?;
+    // P1-18：只在**状态真的翻转**时公告（重复 `del` 幂等，不再重复播报）。
+    if revoked && !now_revoked {
+        store
+            .queue_auth_revoke(&rref, principal_s)
+            .map_err(store_fail)?;
+    }
     Ok(json!({
         "verdict": "PASS",
         "command": "grant del",
@@ -361,6 +374,43 @@ mod tests {
         let grants = store.load_grants().unwrap();
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].principal.0, p1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1-18：`grant add` / `grant del` 各排一条**可投递**公告
+    /// （AUTH_GRANT / AUTH_REVOKE），主体是被授权方而非本节点；
+    /// 重复 `del` 幂等，不再重复播报。
+    #[test]
+    fn grant_add_and_del_enqueue_addressed_announcements() {
+        use nexus_registry::{ControlFrame, decode_control_frame};
+
+        let dir = temp_node_dir("announce");
+        publish(&dir, "svc-a");
+        add_grant_to(&dir, "svc-a", "ed25519:target", "Use", None).unwrap();
+        let store = N2Store::open(&dir).unwrap();
+        let items = store.outbox_list().unwrap();
+        assert_eq!(items.len(), 1, "grant add must queue one AUTH_GRANT");
+        assert!(matches!(
+            decode_control_frame(&items[0].1),
+            Ok(ControlFrame::AuthGrant { ref announcement })
+                if announcement.principal == "ed25519:target"
+        ));
+
+        del_grant_from(&dir, "svc-a", "ed25519:target").unwrap();
+        let items = store.outbox_list().unwrap();
+        assert_eq!(items.len(), 2, "grant del must queue one AUTH_REVOKE");
+        assert!(matches!(
+            decode_control_frame(&items[1].1),
+            Ok(ControlFrame::AuthRevoke { ref principal, .. })
+                if principal == "ed25519:target"
+        ));
+
+        del_grant_from(&dir, "svc-a", "ed25519:target").unwrap();
+        assert_eq!(
+            store.outbox_list().unwrap().len(),
+            2,
+            "idempotent repeat del must not re-announce"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

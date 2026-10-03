@@ -17,10 +17,7 @@
 //! `record_directory_audit` 落盘 journal。
 
 use nexus_domain::{ResourceKind, ResourceName, ResourceRef, WorkspaceId};
-use nexus_registry::{
-    ControlFrame, Discoverability, ProviderAdvertisement, UnavailabilityReason,
-    decode_control_frame, encode_control_frame,
-};
+use nexus_registry::{Discoverability, ProviderAdvertisement, UnavailabilityReason};
 use serde_json::{Value, json};
 
 use crate::n2_directory::{DEFAULT_WORKSPACE, DIRECTORY_TAG, N2Directory};
@@ -393,6 +390,24 @@ fn run_publish(args: &[String], json_mode: bool) -> i32 {
     )
 }
 
+/// `AUTH_REVOKE` 公告的目标主体：该资源在 grant 表里的全部 principal
+/// （去重、升序）。P1-18：公告主体来自 grant 表——旧实现填的是本节点自身，
+/// 自地址帧永远投不到被撤销方，出站泵等于空转。
+fn grantees_of(store: &N2Store, rref: &ResourceRef) -> Vec<String> {
+    let mut ps: Vec<String> = store
+        .load_grants()
+        .map(|gs| {
+            gs.into_iter()
+                .filter(|g| g.resource == *rref)
+                .map(|g| g.principal.0)
+                .collect()
+        })
+        .unwrap_or_default();
+    ps.sort();
+    ps.dedup();
+    ps
+}
+
 /// `nexus resource revoke <name>`：撤销发布。
 fn run_revoke(name: &str, json_mode: bool) -> i32 {
     let node_dir = crate::node_cli::node_dir();
@@ -431,40 +446,27 @@ fn run_revoke(name: &str, json_mode: bool) -> i32 {
         }
     };
 
-    // 1. 触发 AUTH_REVOKE 帧（D8 控制面）：编码＋outbox 落盘排队
-    //    （P0-5 真跨机时实际发送；P0 本地先证明帧格式正确）。
-    let (_pubkey, principal) = match ensure_auth_identity(&store) {
-        Ok(v) => v,
-        Err(e) => {
-            return render(&store_fail(e), json_mode);
+    // 本机身份：公告主体已改由 grant 表给出，但保留旧实现"revoke 时确保
+    // 本机身份已建立"的副作用，使审计 actor 与旧行为一致（不改变输出形状）。
+    let _ = ensure_auth_identity(&store);
+
+    // 1. AUTH_REVOKE 公告（D8 提供方→请求方）：为该资源的**每个被授权主体**
+    //    各排一条进 outbox，由出站泵在该主体下次准入往返时投递（P1-18）。
+    //    P1-18 修正：原实现把 `principal` 填成本节点自身——公告按主体过滤，
+    //    自地址帧永远投不到被撤销方，等价于"只写不排"。
+    let mut outbox_seqs: Vec<u64> = Vec::new();
+    let mut enqueue_err: Option<String> = None;
+    for grantee in grantees_of(&store, &rref) {
+        match store.queue_auth_revoke(&rref, &grantee) {
+            Ok(seq) => outbox_seqs.push(seq),
+            Err(e) => enqueue_err = Some(e),
         }
-    };
-    let frame = ControlFrame::AuthRevoke {
-        resource: rref.clone(),
-        principal: principal.0.clone(),
-    };
-    let frame_bytes = match encode_control_frame(&frame) {
-        Ok(b) => b,
-        Err(e) => {
-            return render(
-                &json!({"verdict":"FAIL","error":{"code":"FRAME","message":e.to_string()}}),
-                json_mode,
-            );
-        }
-    };
-    // 自检：编码可 roundtrip（帧格式正确性的机器证据）。
-    debug_assert!(matches!(
-        decode_control_frame(&frame_bytes),
-        Ok(ControlFrame::AuthRevoke { .. })
-    ));
-    let seq = match store.outbox_next_seq() {
-        Ok(s) => s,
-        Err(e) => {
-            return render(&store_fail(e), json_mode);
-        }
-    };
-    if let Err(e) = store.outbox_push(seq, &frame_bytes) {
-        return render(&store_fail(e), json_mode);
+    }
+    if let Some(e) = enqueue_err {
+        return render(
+            &json!({"verdict":"FAIL","error":{"code":"OUTBOX","message":e}}),
+            json_mode,
+        );
     }
 
     // 2. 本地 withdraw：删除持久化广告＋tombstone（撤销后目录不可见）。
@@ -485,7 +487,9 @@ fn run_revoke(name: &str, json_mode: bool) -> i32 {
             action: "revoke",
             resource: rref,
             provider: None,
-            detail: format!("revoke {name} (withdrawn_ads={withdrawn_any}, outbox_seq={seq})"),
+            detail: format!(
+                "revoke {name} (withdrawn_ads={withdrawn_any}, outbox_seqs={outbox_seqs:?})"
+            ),
         },
     );
     render(
@@ -796,7 +800,7 @@ pub fn run_resource(args: &[String], json_mode: bool) -> i32 {
 mod tests {
     use super::*;
     use nexus_domain::ResourceId;
-    use nexus_registry::UsageGrant;
+    use nexus_registry::{ControlFrame, UsageGrant, decode_control_frame, encode_control_frame};
 
     fn temp_node_dir(tag: &str) -> std::path::PathBuf {
         let dir =
@@ -846,6 +850,59 @@ mod tests {
         }
         assert!(names.contains(&"dev-svc".to_string()));
         assert!(names.contains(&"internet-access".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1-18：`AUTH_REVOKE` 公告的目标主体来自 grant 表（该资源的全部
+    /// grantee，去重排序），而不是本节点自身——自地址帧永远投不出去。
+    #[test]
+    fn revoke_announcement_targets_come_from_grant_table() {
+        use nexus_auth::{Grant, Principal};
+        use nexus_domain::ResourceOperation;
+
+        let dir = temp_node_dir("grantees");
+        let store = N2Store::open(&dir).unwrap();
+        let rref = ResourceRef::new(
+            WorkspaceId::new(DEFAULT_WORKSPACE),
+            ResourceName::new("svc-x").unwrap(),
+        );
+        let other = ResourceRef::new(
+            WorkspaceId::new(DEFAULT_WORKSPACE),
+            ResourceName::new("svc-y").unwrap(),
+        );
+        let grant = |r: ResourceRef, p: &str, op: ResourceOperation| {
+            Grant::new(r, Principal(p.to_string()), vec![op], None)
+        };
+        store
+            .save_grant(&grant(rref.clone(), "ed25519:b", ResourceOperation::Use))
+            .unwrap();
+        store
+            .save_grant(&grant(rref.clone(), "ed25519:a", ResourceOperation::Use))
+            .unwrap();
+        // 同一主体第二次授权（upsert）→ 去重后只出现一次。
+        store
+            .save_grant(&grant(rref.clone(), "ed25519:a", ResourceOperation::Manage))
+            .unwrap();
+        // 另一资源的 grantee 不得被牵连。
+        store
+            .save_grant(&grant(other.clone(), "ed25519:c", ResourceOperation::Use))
+            .unwrap();
+
+        assert_eq!(
+            grantees_of(&store, &rref),
+            vec!["ed25519:a".to_string(), "ed25519:b".to_string()]
+        );
+        assert_eq!(grantees_of(&store, &other), vec!["ed25519:c".to_string()]);
+
+        // 入队后 outbox 里是**可解码**、且主体正确的帧。
+        let seq = store.queue_auth_revoke(&rref, "ed25519:a").unwrap();
+        let items = store.outbox_list().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0, seq);
+        assert!(matches!(
+            decode_control_frame(&items[0].1),
+            Ok(ControlFrame::AuthRevoke { ref principal, .. }) if principal == "ed25519:a"
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

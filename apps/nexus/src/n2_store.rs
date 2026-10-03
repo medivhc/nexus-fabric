@@ -29,7 +29,10 @@ use nexus_domain::{
     ProviderId, ResourceId, ResourceKind, ResourceName, ResourceOperation, ResourceRef,
     ScoreComponent, SessionId, TerminalOutcome, WorkspaceId,
 };
-use nexus_registry::{Discoverability, ProviderAdvertisement, UnavailabilityReason, UsageGrant};
+use nexus_registry::{
+    ControlFrame, Discoverability, ProviderAdvertisement, UnavailabilityReason, UsageGrant,
+    decode_control_frame, encode_control_frame,
+};
 use nexus_session::{SessionRecord, SessionRecordStore};
 use nexus_storage::FileKvStore;
 use serde_json::{Map, Value, json};
@@ -1265,6 +1268,62 @@ impl N2Store {
     pub fn outbox_next_seq(&self) -> Result<u64, String> {
         Ok(self.outbox_list()?.last().map(|(s, _)| s + 1).unwrap_or(0))
     }
+
+    /// 出队（P1-18：帧**已成功写出**后由出站泵调用）。
+    ///
+    /// 只在投递写成功后调用，因此语义是 at-least-once：写成功但进程在删除前
+    /// 崩溃 → 下次连接重投同一帧（公告本身幂等，重复投递无害）。
+    /// 广播语义的 exactly-once 需要请求方回执，P0 无该往返，故不虚构。
+    pub fn outbox_delete(&self, seq: u64) -> Result<(), String> {
+        let key = format!("{OUTBOX_PREFIX}{seq:020}");
+        self.kv
+            .delete(&key)
+            .map_err(|e| format!("outbox delete {seq}: {e}"))
+    }
+
+    /// 入队一条控制帧（P1-18 出站泵的唯一生产入口）。
+    ///
+    /// 入队前做一次编解码 roundtrip 自检：队列里只允许出现**可投递**的帧，
+    /// 否则出站泵会永远跳过它（重新变成"只写不排"）。
+    fn queue_frame(&self, frame: &ControlFrame) -> Result<u64, String> {
+        let bytes = encode_control_frame(frame).map_err(|e| format!("encode frame: {e}"))?;
+        let back = decode_control_frame(&bytes).map_err(|e| format!("decode frame: {e}"))?;
+        if std::mem::discriminant(&back) != std::mem::discriminant(frame) {
+            return Err("frame roundtrip mismatch".to_string());
+        }
+        let seq = self.outbox_next_seq()?;
+        self.outbox_push(seq, &bytes)?;
+        Ok(seq)
+    }
+
+    /// 排队一条 `AUTH_REVOKE` 公告（D8 提供方→请求方；P1-18 生产者：
+    /// `resource revoke` 逐 grantee、`grant del` 逐被撤销主体）。返回 seq。
+    pub fn queue_auth_revoke(
+        &self,
+        resource: &ResourceRef,
+        principal: &str,
+    ) -> Result<u64, String> {
+        self.queue_frame(&ControlFrame::AuthRevoke {
+            resource: resource.clone(),
+            principal: principal.to_string(),
+        })
+    }
+
+    /// 排队一条 `AUTH_GRANT` 公告（`grant add`；与 `queue_auth_revoke` 对称，
+    /// 修掉评审 P1-18"AUTH_GRANT 帧类型零发送"）。返回 seq。
+    pub fn queue_auth_grant(&self, grant: &nexus_auth::Grant) -> Result<u64, String> {
+        self.queue_frame(&ControlFrame::AuthGrant {
+            announcement: nexus_registry::GrantAnnouncement {
+                resource: grant.resource.clone(),
+                principal: grant.principal.0.clone(),
+                grant: nexus_registry::UsageGrant {
+                    principal: grant.principal.0.clone(),
+                    operations: grant.operations.clone(),
+                    not_after_secs: grant.not_after,
+                },
+            },
+        })
+    }
 }
 
 /// 本地 actor 标识（审计用；节点未初始化时为空串，不伪造）。
@@ -1579,6 +1638,22 @@ mod tests {
         let items = store.outbox_list().unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0], (0, b"frame-0".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn outbox_delete_drains_only_targeted_frame() {
+        // P1-18：投递成功后按 seq 出队；删不存在的 seq 幂等，不影响其余帧。
+        let dir = temp_dir("outbox-del");
+        let store = N2Store::open(&dir).unwrap();
+        store.outbox_push(0, b"frame-0").unwrap();
+        store.outbox_push(1, b"frame-1").unwrap();
+        store.outbox_delete(0).unwrap();
+        let items = store.outbox_list().unwrap();
+        assert_eq!(items, vec![(1, b"frame-1".to_vec())]);
+        store.outbox_delete(0).unwrap(); // 幂等
+        store.outbox_delete(9).unwrap(); // 不存在 → 同样无副作用
+        assert_eq!(store.outbox_list().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

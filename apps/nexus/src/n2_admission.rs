@@ -23,13 +23,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use nexus_auth::{AuthRequest, GrantTable, Principal};
-use nexus_domain::{ResourceId, ResourceOperation, ResourceRef, WorkspaceId};
-use nexus_registry::ProviderAdvertisement;
+use nexus_domain::{ResourceId, ResourceName, ResourceOperation, ResourceRef, WorkspaceId};
+use nexus_registry::{ControlFrame, ProviderAdvertisement, decode_control_frame};
 use ring::signature::UnparsedPublicKey;
 
 use crate::n2_directory::{DEFAULT_WORKSPACE, N2Directory};
 use crate::n2_identity::{auth_keypair, ensure_auth_identity};
-use crate::n2_store::{N2Store, local_actor, now_unix_pub};
+use crate::n2_store::{
+    DirectoryAuditEvent, N2Store, local_actor, now_unix_pub, record_directory_audit,
+};
 
 /// 准入流协议版本。
 pub const ADMISSION_PROTOCOL_V1: u32 = 1;
@@ -187,6 +189,85 @@ fn hex_decode(s: &str, expect_len: usize, what: &str) -> Result<Vec<u8>, String>
 // 提供方侧：admission 服务
 // ---------------------------------------------------------------------------
 
+/// 出站泵（P1-18）：取出 outbox 中投递给 `principal` 的待发公告。
+///
+/// 返回 `(待出队 seq, 附进响应的 JSON 视图)`。
+///
+/// - 只投递**主体可寻址**的帧（`AuthRevoke.principal` / `AuthGrant.principal`）；
+///   无主体字段的 `ResourceAnnounce`/`LeaseRenew` 不向任意连接方广播
+///   （会泄露给不相关主体），继续排队等待各自的投递路径；
+/// - 解码失败的帧留在 outbox 并打日志，不静默丢弃（fail-loud）。
+///
+/// 载体是准入流的 JSON（该流是独立流类型，模块头已声明"不复用 0x21–0x25
+/// 控制帧"）；outbox 里落盘的仍是 D8 冻结的帧字节，本函数只做呈现转换。
+fn pending_announcements(store: &N2Store, principal: &str) -> (Vec<u64>, Vec<serde_json::Value>) {
+    let items = match store.outbox_list() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("n2-admission: outbox list failed: {e}");
+            return (Vec::new(), Vec::new());
+        }
+    };
+    let mut seqs = Vec::new();
+    let mut views = Vec::new();
+    for (seq, bytes) in items {
+        let frame = match decode_control_frame(&bytes) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("n2-admission: outbox {seq}: undecodable frame kept queued: {e}");
+                continue;
+            }
+        };
+        let view = match frame {
+            ControlFrame::AuthRevoke {
+                ref resource,
+                principal: ref target,
+            } if target.as_str() == principal => Some(serde_json::json!({
+                "kind": "auth_revoke",
+                "resource": resource.to_string(),
+                "principal": target,
+            })),
+            ControlFrame::AuthGrant { ref announcement } if announcement.principal == principal => {
+                Some(serde_json::json!({
+                    "kind": "auth_grant",
+                    "resource": announcement.resource.to_string(),
+                    "principal": announcement.principal,
+                }))
+            }
+            _ => None,
+        };
+        if let Some(view) = view {
+            seqs.push(seq);
+            views.push(view);
+        }
+    }
+    (seqs, views)
+}
+
+/// 写准入响应；**写成功后**才把已投递帧出队（P1-18 at-least-once）。
+///
+/// 写失败 → 帧留在 outbox，下次连接重投。
+fn write_response_flushing(
+    stream: &mut TcpStream,
+    store: &N2Store,
+    pending: &[u64],
+    announcements: &[serde_json::Value],
+    mut body: serde_json::Value,
+) {
+    if !announcements.is_empty() {
+        body["announcements"] = serde_json::Value::Array(announcements.to_vec());
+    }
+    let payload = body.to_string();
+    if write_frame(stream, payload.as_bytes()).is_err() {
+        return;
+    }
+    for seq in pending {
+        if let Err(e) = store.outbox_delete(*seq) {
+            eprintln!("n2-admission: outbox delete {seq}: {e}");
+        }
+    }
+}
+
 /// 处理一条准入连接（B 机侧；阻塞式，P0 顺序处理）。
 ///
 /// 返回人类可读的判定摘要（stderr 日志用）。
@@ -243,6 +324,8 @@ fn handle_admission(stream: &mut TcpStream, node_dir: &std::path::Path) -> Strin
         Ok(s) => s,
         Err(e) => return error_response(stream, &format!("store: {e}"), "store failure"),
     };
+    // P1-18：出站泵——本连接要投递给该主体的 pending 公告（AUTH_*）。
+    let (pending, announcements) = pending_announcements(&store, &principal.0);
     let now = now_unix_pub();
     let directory = match N2Directory::open_with_store(&store, now) {
         Ok(d) => d,
@@ -256,13 +339,23 @@ fn handle_admission(stream: &mut TcpStream, node_dir: &std::path::Path) -> Strin
         .lookup_ads(&resource_id, now)
         .is_empty()
     {
-        let body = serde_json::json!({"v": ADMISSION_PROTOCOL_V1, "verdict": "error", "code": "NOT_FOUND"}).to_string();
-        let _ = write_frame(stream, body.as_bytes());
+        write_response_flushing(
+            stream,
+            &store,
+            &pending,
+            &announcements,
+            serde_json::json!({"v": ADMISSION_PROTOCOL_V1, "verdict": "error", "code": "NOT_FOUND"}),
+        );
         return format!("unknown or withdrawn resource {}", req.resource_id);
     }
     let Some(name) = directory.name_of_resource(&resource_id) else {
-        let body = serde_json::json!({"v": ADMISSION_PROTOCOL_V1, "verdict": "error", "code": "NOT_FOUND"}).to_string();
-        let _ = write_frame(stream, body.as_bytes());
+        write_response_flushing(
+            stream,
+            &store,
+            &pending,
+            &announcements,
+            serde_json::json!({"v": ADMISSION_PROTOCOL_V1, "verdict": "error", "code": "NOT_FOUND"}),
+        );
         return format!("unknown resource {}", req.resource_id);
     };
     let rref = match nexus_domain::ResourceName::new(&name) {
@@ -325,26 +418,34 @@ fn handle_admission(stream: &mut TcpStream, node_dir: &std::path::Path) -> Strin
                 .find(|ad| ad.provider.0 == provider_id)
                 .and_then(|ad| service_locator_of(&ad))
                 .unwrap_or_default();
-            let body = serde_json::json!({
-                "v": ADMISSION_PROTOCOL_V1,
-                "verdict": "admit",
-                "provider": provider_id,
-                "endpoint": endpoint,
-            })
-            .to_string();
-            let _ = write_frame(stream, body.as_bytes());
+            write_response_flushing(
+                stream,
+                &store,
+                &pending,
+                &announcements,
+                serde_json::json!({
+                    "v": ADMISSION_PROTOCOL_V1,
+                    "verdict": "admit",
+                    "provider": provider_id,
+                    "endpoint": endpoint,
+                }),
+            );
             format!("admit session={} principal={}", req.session_id, principal.0)
         }
         nexus_domain::AuthorizationDecision::Deny(reason) => {
             // 6b. 拒绝：结构化 Deny＋审计已写（`audit_written=true`）。
-            let body = serde_json::json!({
-                "v": ADMISSION_PROTOCOL_V1,
-                "verdict": "deny",
-                "deny": reason.code(),
-                "audit_written": true,
-            })
-            .to_string();
-            let _ = write_frame(stream, body.as_bytes());
+            write_response_flushing(
+                stream,
+                &store,
+                &pending,
+                &announcements,
+                serde_json::json!({
+                    "v": ADMISSION_PROTOCOL_V1,
+                    "verdict": "deny",
+                    "deny": reason.code(),
+                    "audit_written": true,
+                }),
+            );
             format!(
                 "deny session={} principal={} reason={}",
                 req.session_id,
@@ -537,7 +638,7 @@ pub fn admit_session(
     // 2. 以本节点 ed25519 身份签名。
     // 本地 store 故障 ≠ 对端下线（P1-12）：不得让远端被标成 ProviderOffline。
     let store = N2Store::open(node_dir).map_err(|e| AdmitError::Local(format!("store: {e}")))?;
-    let (pubkey, _) =
+    let (pubkey, principal) =
         ensure_auth_identity(&store).map_err(|e| AdmitError::Crypto(format!("identity: {e}")))?;
     let keypair = auth_keypair(&store).map_err(AdmitError::Crypto)?;
     let sig = keypair.sign(&challenge);
@@ -556,7 +657,81 @@ pub fn admit_session(
     write_frame(&mut stream, body.as_bytes()).map_err(AdmitError::Io)?;
     // 4. 读判定。
     let resp = read_frame(&mut stream).map_err(AdmitError::Protocol)?;
+    // P1-18：请求方侧回执——把提供方经准入响应送达的 AUTH_* 公告落成本地
+    // 审计（D8"撤销走 AUTH_REVOKE"的可 replay 取证端）。回执失败不改变判定。
+    apply_announcements(&store, &principal.0, &resp);
     parse_admission_response(&resp).map_err(AdmitError::Protocol)
+}
+
+/// 把响应里的公告写入本地审计 journal（P1-18 请求方侧回执）。
+///
+/// 只接收**发给本主体**的 `auth_revoke`/`auth_grant`；其余丢弃（提供方本就不
+/// 会广播，此处是第二道过滤）。返回落盘条数。
+///
+/// P0 边界（诚实声明）：请求方**不**据此删本地缓存广告——公告里的
+/// `ResourceRef` 属提供方命名空间，与请求方本地命名可能同名不同物，
+/// 缺 provider 关联时删除有误伤风险；广告失效路径已有 `NOT_FOUND` 分支
+/// （`use_cli` 撤广告）。这里只保证"公告确实送达且可取证"。
+fn apply_announcements(store: &N2Store, my_principal: &str, resp: &[u8]) -> usize {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(resp) else {
+        return 0;
+    };
+    let Some(items) = v.get("announcements").and_then(serde_json::Value::as_array) else {
+        return 0;
+    };
+    let kv = store.kv();
+    let now = now_unix_pub();
+    let mut applied = 0usize;
+    for item in items {
+        let Some(kind) = item.get("kind").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if kind != "auth_revoke" && kind != "auth_grant" {
+            continue;
+        }
+        let Some(target) = item.get("principal").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if target != my_principal {
+            continue;
+        }
+        let Some(resource) = item.get("resource").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(rref) = parse_resource_ref(resource) else {
+            eprintln!("n2-admission: announcement with bad resource '{resource}' skipped");
+            continue;
+        };
+        record_directory_audit(
+            kv,
+            &DirectoryAuditEvent {
+                at_unix: now,
+                actor: my_principal.to_string(),
+                action: if kind == "auth_revoke" {
+                    "announce_revoke"
+                } else {
+                    "announce_grant"
+                },
+                resource: rref,
+                provider: None,
+                detail: format!("{kind} announcement delivered by provider (D8)"),
+            },
+        );
+        applied += 1;
+    }
+    applied
+}
+
+/// `workspace/name` → [`ResourceRef`]（公告里的提供方命名空间引用）。
+fn parse_resource_ref(s: &str) -> Option<ResourceRef> {
+    let (ws, name) = s.split_once('/')?;
+    if ws.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some(ResourceRef::new(
+        WorkspaceId::new(ws),
+        ResourceName::new(name).ok()?,
+    ))
 }
 
 fn parse_admission_response(body: &[u8]) -> Result<AdmissionVerdict, String> {
@@ -749,6 +924,136 @@ mod tests {
         let entries = crate::n2_store::replay_audit_entries(store_b.kv()).unwrap();
         assert_eq!(entries.len(), 1);
         assert!(entries[0].1.contains("NoSuchGrant"), "{}", entries[0].1);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&dir_a);
+    }
+
+    /// P1-18 出站泵：outbox 里的 AUTH_REVOKE 在一次准入往返中投递给请求方，
+    /// 提供方在**写成功后**出队（at-least-once）；投递给其他主体的帧不广播、
+    /// 不出队；请求方落可 replay 的回执审计。
+    #[test]
+    fn outbox_flush_delivers_revoke_and_drains_only_matching_frames() {
+        use nexus_registry::{ControlFrame, encode_control_frame};
+
+        let dir_b = temp_node_dir("b-flush");
+        let dir_a = temp_node_dir("a-flush");
+        let (addr, rx) = serve_once_in_thread(dir_b.clone());
+        publish_svc(&dir_b, &addr.to_string());
+        let store_a = N2Store::open(&dir_a).unwrap();
+        let (_pk, principal_a) = ensure_auth_identity(&store_a).unwrap();
+        // 本用例走 deny 路径（真实 revoke 后的形态：grant 已不在）。
+
+        let svc_ref = || {
+            ResourceRef::new(
+                WorkspaceId::new(DEFAULT_WORKSPACE),
+                ResourceName::new("svc-b").unwrap(),
+            )
+        };
+        let store_b = N2Store::open(&dir_b).unwrap();
+        let mine = store_b.outbox_next_seq().unwrap();
+        store_b
+            .outbox_push(
+                mine,
+                &encode_control_frame(&ControlFrame::AuthRevoke {
+                    resource: svc_ref(),
+                    principal: principal_a.0.clone(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        // 另一条给别的主体：不得被广播，也不得随本次连接出队。
+        let theirs = mine + 1;
+        store_b
+            .outbox_push(
+                theirs,
+                &encode_control_frame(&ControlFrame::AuthRevoke {
+                    resource: svc_ref(),
+                    principal: "ed25519:other-principal".into(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+
+        let verdict = admit_session(
+            &addr.to_string(),
+            &dir_a,
+            "sess-flush",
+            &ResourceId("res-svc-b".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            verdict,
+            AdmissionVerdict::Denied {
+                deny: "NoSuchGrant".to_string()
+            }
+        );
+        let summary = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(summary.contains("deny"), "{summary}");
+
+        // 提供方：只有投递给 A 的那条出队，他人的仍在队列。
+        let left = N2Store::open(&dir_b).unwrap().outbox_list().unwrap();
+        assert_eq!(left.len(), 1, "only the other principal's frame stays");
+        assert_eq!(left[0].0, theirs);
+
+        // 请求方：收到并落回执（可 replay 取证）。
+        let entries = crate::n2_store::replay_audit_entries(store_a.kv()).unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|(_, j)| j.contains("announce_revoke") && j.contains("svc-b")),
+            "announcement receipt not recorded: {entries:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&dir_a);
+    }
+
+    /// P1-18 admit 路径同样投递（公告与判定解耦：允许时也带出站泵）。
+    #[test]
+    fn outbox_flush_on_admit_path() {
+        use nexus_registry::{ControlFrame, encode_control_frame};
+
+        let dir_b = temp_node_dir("b-flush2");
+        let dir_a = temp_node_dir("a-flush2");
+        let (addr, _rx) = serve_once_in_thread(dir_b.clone());
+        publish_svc(&dir_b, &addr.to_string());
+        let store_a = N2Store::open(&dir_a).unwrap();
+        let (_pk, principal_a) = ensure_auth_identity(&store_a).unwrap();
+        grant_for(&dir_b, &principal_a);
+
+        let store_b = N2Store::open(&dir_b).unwrap();
+        let seq = store_b.outbox_next_seq().unwrap();
+        store_b
+            .outbox_push(
+                seq,
+                &encode_control_frame(&ControlFrame::AuthRevoke {
+                    resource: ResourceRef::new(
+                        WorkspaceId::new(DEFAULT_WORKSPACE),
+                        ResourceName::new("svc-b").unwrap(),
+                    ),
+                    principal: principal_a.0.clone(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+
+        let verdict = admit_session(
+            &addr.to_string(),
+            &dir_a,
+            "sess-flush2",
+            &ResourceId("res-svc-b".into()),
+        )
+        .unwrap();
+        assert!(matches!(verdict, AdmissionVerdict::Admitted { .. }));
+        assert!(
+            N2Store::open(&dir_b)
+                .unwrap()
+                .outbox_list()
+                .unwrap()
+                .is_empty(),
+            "outbox must drain after a successful flush"
+        );
+        let entries = crate::n2_store::replay_audit_entries(store_a.kv()).unwrap();
+        assert!(entries.iter().any(|(_, j)| j.contains("announce_revoke")));
         let _ = std::fs::remove_dir_all(&dir_b);
         let _ = std::fs::remove_dir_all(&dir_a);
     }
