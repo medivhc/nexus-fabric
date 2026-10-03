@@ -5353,69 +5353,98 @@ pub fn proxy_bufferbloat_test(config: &BufferbloatConfig) -> Result<serde_json::
 ///
 /// This is the CLI entry point for executing resource access flows.
 /// Currently supports: service, compute, internet-access.
+/// `nexus run <resource>`：进程内 SDK 演示闭环（thin wrapper）。
+///
+/// D4 诚实化（2026-10-03，requirement-change）：不再伪造 session_id。
+/// 返回的 session_id / plan_id / outcome 全部取自底层 flow 报告的真实值：
+/// - `session_id`：flow 内 SessionOwner 的真实 id（`report["session"]["id"]`），
+///   不再是每次随机生成的 `sess-{nanos}` mock；
+/// - `outcome`：Owner 唯一提交的 TerminalOutcome（`report["session"]["outcome"]`）；
+/// - `plan_id`：由 flow 报告的 plan 内容（provider_id/placement/path）经 FNV-1a
+///   确定性派生（D3 方向：PlanId 为确定性非密码学摘要，只做标识符；
+///   P0-3 正式 PlanId 落地前，此处为展示用派生值）；
+/// - `connectivity.status`：flow 只有真实建连成功才返回 Ok，故为 Connected。
+///
+/// P0-4 的 daemon 内 SessionManager 落地后，`nexus use` 成为正式入口（PRODUCT §16）。
 pub fn run_resource(resource: &str) -> Result<serde_json::Value, NexusError> {
-    // Generate a mock session ID for now
-    // TODO: extract real session_id from the flow report when available
-    let session_id = format!("sess-{}", uuid_like());
-
-    match resource {
-        "service" => {
-            // Use the existing remote_service_access_flow SDK function
-            let _report = remote_service_access_flow()?;
-            Ok(serde_json::json!({
-                "verdict": "PASS",
-                "run": {
-                    "resource": "service",
-                    "session_id": session_id,
-                    "connectivity": {
-                        "status": "Connected"
-                    },
-                    "outcome": "Completed"
-                }
-            }))
+    let report = match resource {
+        "service" => remote_service_access_flow()?,
+        "compute" => remote_compute_job_flow()?,
+        "internet-access" => remote_internet_access_flow()?,
+        other => {
+            return Err(NexusError::Unsupported {
+                feature: format!("run {other}"),
+            });
         }
-        "compute" => {
-            let _report = remote_compute_job_flow()?;
-            Ok(serde_json::json!({
-                "verdict": "PASS",
-                "run": {
-                    "resource": "compute",
-                    "session_id": session_id,
-                    "connectivity": {
-                        "status": "Connected"
-                    },
-                    "outcome": "Completed"
-                }
-            }))
+    };
+    let session_id = report
+        .pointer("/session/id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| NexusError::Internal {
+            message: format!("run {resource}: flow report missing session.id"),
+        })?;
+    let outcome = report
+        .pointer("/session/outcome")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| NexusError::Internal {
+            message: format!("run {resource}: flow report missing session.outcome"),
+        })?;
+    let plan_id = plan_id_from_report(&report);
+    Ok(serde_json::json!({
+        "verdict": "PASS",
+        "run": {
+            "resource": resource,
+            "session_id": session_id,
+            "plan_id": plan_id,
+            "outcome": outcome,
+            "connectivity": {
+                "status": "Connected"
+            },
         }
-        "internet-access" => {
-            let _report = remote_internet_access_flow()?;
-            Ok(serde_json::json!({
-                "verdict": "PASS",
-                "run": {
-                    "resource": "internet-access",
-                    "session_id": session_id,
-                    "connectivity": {
-                        "status": "Connected"
-                    },
-                    "outcome": "Completed"
-                }
-            }))
-        }
-        other => Err(NexusError::Unsupported {
-            feature: format!("run {other}"),
-        }),
-    }
+    }))
 }
 
-/// Generate a simple pseudo-unique ID (for demo purposes).
-fn uuid_like() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{:016x}", nanos)
+/// 由 flow 报告的 plan 内容确定性派生 plan_id（FNV-1a 64，hex）。
+///
+/// D3 方向：PlanId 是确定性非密码学摘要，只做标识符、不做安全边界。
+/// 输入为报告中 plan 节的 provider_id / placement / path；同一 plan 内容
+/// 在多次运行间得到同一 plan_id（可复现、可断言）。
+fn plan_id_from_report(report: &serde_json::Value) -> String {
+    let provider_id = report
+        .pointer("/plan/provider_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let placement = report
+        .pointer("/plan/placement")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let path = report
+        .pointer("/plan/path")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let mut input = String::new();
+    input.push_str(provider_id);
+    input.push('|');
+    input.push_str(placement);
+    input.push('|');
+    input.push_str(&path);
+    format!("{:016x}", fnv1a_64(input.as_bytes()))
+}
+
+/// FNV-1a 64 位哈希（非密码学，仅作确定性标识）。
+fn fnv1a_64(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in data {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 /// E4 `product.link-encryption` 的离线确定性切片：全内存 mock 驱动

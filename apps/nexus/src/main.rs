@@ -61,6 +61,8 @@ nexus — Nexus 统一 Resource Fabric 控制面 CLI（瘦客户端）
   diagnose                                统一诊断
   platform capabilities                   平台能力清单
   run <resource>                          执行远程资源访问（进程内 SDK）
+                                          注：`run -- <cmd>` 为 N3 任务语义，N2 诚实拒绝
+                                          （UNSUPPORTED run-with-command；资源访问请用 `nexus use`）
   network up --config <toml>              N1 装配前台运行（建 TUN→dial→包泵，Ctrl-C 退出）
   network status [--config <toml>]        N1 装配状态（无 daemon 时诚实标注）
   subnet up|status|leave|punch            虚拟子网命令族（进程内 SDK，PRODUCT §12.28）
@@ -174,6 +176,14 @@ fn run(args: &[String]) -> i32 {
         return 0;
     }
 
+    // D4（2026-10-03，requirement-change）：`nexus run <resource> -- <cmd...>`
+    // 为 N3 任务提交语义（白皮书 A.1），在 N2 永远不是可执行命令——在解析层
+    // 直接诚实拒绝，不进入 ControlCommand 分发、不假执行。
+    // `--json` 已在 split_json_flag 剥离，此处不会误伤。
+    if args[0].as_str() == "run" && args.iter().any(|a| a == "--") {
+        return run_with_command_rejected(&args, json_mode);
+    }
+
     // 子网命令族走进程内 SDK（PRODUCT §12.16）。
     if args[0].as_str() == "subnet" {
         return run_subnet(&args[1..], json_mode);
@@ -248,6 +258,30 @@ fn run(args: &[String]) -> i32 {
             }
         },
     }
+}
+
+/// D4 诚实拒绝：`nexus run <resource> -- <cmd...>` 返回结构化
+/// `UNSUPPORTED{feature:"run-with-command", layer:"N3"}`。
+///
+/// 任务提交语义归 N3（白皮书 A.1）；N2 的资源访问入口为 `nexus use`
+/// （P0-4，PRODUCT §16）。exit 0（请求已被处理，机器消费者看 verdict）。
+fn run_with_command_rejected(args: &[String], json_mode: bool) -> i32 {
+    let resource = args
+        .get(1)
+        .filter(|r| r.as_str() != "--")
+        .cloned()
+        .unwrap_or_default();
+    let json = serde_json::json!({
+        "verdict": "FAIL",
+        "error": {
+            "code": "UNSUPPORTED",
+            "feature": "run-with-command",
+            "layer": "N3",
+            "resource": resource,
+            "message": "nexus run does not execute commands: task submission (`run -- <command>`) is an N3 capability (whitepaper A.1); for N2 resource access use `nexus use <resource>` (PRODUCT.md#16-n2-resource-access)",
+        },
+    });
+    render_and_exit(&json, json_mode)
 }
 
 /// 向 daemon 发一次 GET，解析 body JSON，按模式渲染。
