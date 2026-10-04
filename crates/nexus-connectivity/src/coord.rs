@@ -144,6 +144,18 @@ impl Coordinator {
     pub fn is_announced(&self, peer: &str) -> bool {
         self.presences.iter().any(|p| p.peer == peer)
     }
+
+    /// 摘除并返回所有已过期 peer 的名称（按注册顺序；供 bootstrap 服务端随后
+    /// `release` 其 VIP）。顺带修掉 presence vec 只增不减的内存增长问题（v2 §6.3）。
+    pub fn prune_expired(&mut self, now_secs: u64) -> Vec<String> {
+        let (expired, alive): (Vec<PresenceEntry>, Vec<PresenceEntry>) = self
+            .presences
+            .clone()
+            .into_iter()
+            .partition(|p| p.expired(now_secs));
+        self.presences = alive;
+        expired.into_iter().map(|p| p.peer).collect()
+    }
 }
 
 /// 一条虚拟 IP 租约：peer ↔ 地址。
@@ -293,6 +305,52 @@ impl VirtualIpAllocator {
             .iter()
             .find(|l| l.peer == peer)
             .map(|l| l.virtual_ip.to_string())
+    }
+
+    /// 校验一个候选 VIP 可在本网段分配：可解析、落在 CIDR 内、且不是网络/广播
+    /// 地址（v2 §5.4：`allocate_specific` 只 parse+查重，不做此校验，调用方自补）。
+    /// 越界 -> `InvalidCidr`。
+    pub fn check_vip(&self, vip: &str) -> Result<Ipv4Addr, CoordError> {
+        let ip: Ipv4Addr = vip
+            .parse()
+            .map_err(|_| CoordError::InvalidCidr(vip.to_string()))?;
+        let base = u32::from(self.network);
+        let host_mask = if self.prefix_len == 0 {
+            u32::MAX
+        } else {
+            (1u32 << (32 - u32::from(self.prefix_len))) - 1
+        };
+        let ipv = u32::from(ip);
+        // 必须在本网段内。
+        if ipv & !host_mask != base {
+            return Err(CoordError::InvalidCidr(format!(
+                "{vip} not in {}",
+                self.cidr
+            )));
+        }
+        // 排除网络地址与广播地址。
+        if ipv == base {
+            return Err(CoordError::InvalidCidr(format!(
+                "{vip} is network address in {}",
+                self.cidr
+            )));
+        }
+        if ipv == base | host_mask {
+            return Err(CoordError::InvalidCidr(format!(
+                "{vip} is broadcast address in {}",
+                self.cidr
+            )));
+        }
+        Ok(ip)
+    }
+
+    /// 当前全部 (peer, vip) 租约快照（bootstrap 持久化落盘内容，v2 §6.6）。
+    #[must_use]
+    pub fn leases_snapshot(&self) -> Vec<(String, String)> {
+        self.leases
+            .iter()
+            .map(|l| (l.peer.clone(), l.virtual_ip.to_string()))
+            .collect()
     }
 
     /// 当前租约数。
@@ -655,6 +713,44 @@ mod tests {
         // heartbeat 刷新过期 peer
         c.heartbeat(10, "peer-a", 10).unwrap();
         assert_eq!(c.resolve_locator(15, "peer-a").unwrap(), "udp://1.1.1.1:1");
+    }
+
+    #[test]
+    fn prune_expired_removes_only_dead_and_returns_names() {
+        let mut c = Coordinator::new();
+        c.announce(0, "peer-a", "udp://a:1", 10).unwrap();
+        c.announce(0, "peer-b", "udp://b:1", 100).unwrap();
+        // t=10：peer-a 过期，peer-b 存活。
+        let expired = c.prune_expired(10);
+        assert_eq!(expired, vec!["peer-a".to_string()]);
+        // peer-a 已摘除；peer-b 仍在。
+        assert!(!c.is_announced("peer-a"));
+        assert!(c.is_announced("peer-b"));
+        // 再推进到 peer-b 也过期。
+        let expired2 = c.prune_expired(101);
+        assert_eq!(expired2, vec!["peer-b".to_string()]);
+        assert!(!c.is_announced("peer-b"));
+    }
+
+    #[test]
+    fn allocator_check_vip_rejects_network_broadcast_and_out_of_cidr() {
+        let a = VirtualIpAllocator::new("10.99.0.0/24").unwrap();
+        // 网内可用地址 OK。
+        assert!(a.check_vip("10.99.0.5").is_ok());
+        // 网络地址拒绝。
+        assert!(a.check_vip("10.99.0.0").is_err());
+        // 广播地址拒绝。
+        assert!(a.check_vip("10.99.0.255").is_err());
+        // 网段外拒绝。
+        assert!(a.check_vip("10.98.0.5").is_err());
+        assert!(a.check_vip("10.99.1.5").is_err());
+        // 非法 IP 拒绝。
+        assert!(a.check_vip("not-an-ip").is_err());
+        // leases_snapshot 记录 (peer, vip)。
+        let mut b = VirtualIpAllocator::new("10.99.0.0/24").unwrap();
+        b.allocate(0, "peer-x").unwrap();
+        let snap = b.leases_snapshot();
+        assert_eq!(snap, vec![("peer-x".to_string(), "10.99.0.1".to_string())]);
     }
 
     #[test]

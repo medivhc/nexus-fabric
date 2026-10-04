@@ -18,6 +18,8 @@ pub mod artifact_download;
 #[cfg(target_os = "linux")]
 mod artifact_download_fs;
 
+/// Bootstrap 帧编解码组合根适配（connectivity 解耦类型 <-> discovery 字节，v2 §5.5）。
+pub mod bootstrap_codec;
 /// CLI 前端 ControlService（17 命令接线 + --json 双输出 + exit 语义）。
 pub mod control_service;
 pub mod geoip_sources;
