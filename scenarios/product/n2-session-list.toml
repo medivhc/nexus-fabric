@@ -13,6 +13,11 @@ requirement = "PRODUCT.md#16-n2-resource-access"
 # D7：N2 只交付 Session（一次资源使用的 started/running/finished/cancel＋状态查询）。
 # E4 前置：daemon 内 SessionManager 至少持有一条 Session
 # （P0-4 E4 可先调 `nexus use` 建一条）。
+# E4 夹具：播种一条会话，使 list 返回非空（场景隔离后每个场景从空目录开始）。
+fixture = [
+  "cargo run --quiet -p nexus -- session seed sess-n2-list-1 --json",
+]
+
 [when]
 command = "cargo run --quiet -p nexus -- session list --json"
 
