@@ -48,8 +48,17 @@ fi
 code_staged="$(git diff --cached --name-only --diff-filter=ACMRD -- 'crates/*.rs' | head -1 || true)"
 
 if [ -n "$code_staged" ]; then
-  # Find latest Review Evidence in .evidence/
-  review_dir="$(ls -1d "$ROOT/.evidence"/review-* 2>/dev/null | sort | tail -1 || true)"
+  # Find latest Review Evidence for this agent (fall back to any review for
+  # legacy pre-namespaced evidence; multi-agent repos MUST name reviews
+  # `review-<scope>-<agent>-r<n>` so one agent's review never satisfies
+  # another agent's commit).
+  AGENT="${NEXUS_AGENT:-}"
+  if [ -n "$AGENT" ]; then
+    review_dir="$(ls -1d "$ROOT/.evidence"/review-*-${AGENT}-* 2>/dev/null | sort | tail -1 || true)"
+    [ -z "$review_dir" ] && review_dir="$(ls -1d "$ROOT/.evidence"/review-* 2>/dev/null | sort | tail -1 || true)"
+  else
+    review_dir="$(ls -1d "$ROOT/.evidence"/review-* 2>/dev/null | sort | tail -1 || true)"
+  fi
 
   if [ -z "$review_dir" ]; then
     log_error "staged changes modify Rust code but no Review Evidence found in .evidence/"

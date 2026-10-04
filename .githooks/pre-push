@@ -38,8 +38,22 @@ else
 fi
 
 # --- 2. stale evidence scan ------------------------------------------------------
+# Multi-agent: only the current agent's STALE tombstones block; other agents'
+# evidence is out of scope (harness marks STALE within an agent scope only).
+AGENT="${NEXUS_AGENT:-}"
 if [ -d "$ROOT/.evidence" ]; then
-  stale="$(grep -rl '"verdict"[[:space:]]*:[[:space:]]*"STALE"' "$ROOT/.evidence" 2>/dev/null || true)"
+  if [ -n "$AGENT" ]; then
+    stale=""
+    for f in "$ROOT/.evidence"/verify-${AGENT}-*/summary.json; do
+      [ -f "$f" ] || continue
+      if grep -q '"verdict"[[:space:]]*:[[:space:]]*"STALE"' "$f"; then
+        stale="$stale
+$f"
+      fi
+    done
+  else
+    stale="$(grep -rl '"verdict"[[:space:]]*:[[:space:]]*"STALE"' "$ROOT/.evidence" 2>/dev/null || true)"
+  fi
   if [ -n "$stale" ]; then
     log_error "STALE evidence found; refresh with 'nexus-harness verify --full' before pushing:"
     printf '%s\n' "$stale" | sed 's/^/    /'
@@ -67,8 +81,16 @@ if [ -n "$remote_sha" ] && [ "$remote_sha" != "000000000000000000000000000000000
   code_changed="$(git diff --name-only "$range" -- 'crates/*.rs' 2>/dev/null | head -1 || true)"
 
   if [ -n "$code_changed" ]; then
-    # Find latest Review Evidence
-    review_dir="$(ls -1d "$ROOT/.evidence"/review-* 2>/dev/null | sort | tail -1 || true)"
+    # Find latest Review Evidence for this agent (fall back to any review for
+    # legacy pre-namespaced evidence; multi-agent repos MUST name reviews
+    # `review-<scope>-<agent>-r<n>` so one agent's review never satisfies
+    # another agent's push).
+    if [ -n "$AGENT" ]; then
+      review_dir="$(ls -1d "$ROOT/.evidence"/review-*-${AGENT}-* 2>/dev/null | sort | tail -1 || true)"
+      [ -z "$review_dir" ] && review_dir="$(ls -1d "$ROOT/.evidence"/review-* 2>/dev/null | sort | tail -1 || true)"
+    else
+      review_dir="$(ls -1d "$ROOT/.evidence"/review-* 2>/dev/null | sort | tail -1 || true)"
+    fi
 
     if [ -z "$review_dir" ]; then
       log_error "pushed range modifies Rust code but no Review Evidence found in .evidence/"
