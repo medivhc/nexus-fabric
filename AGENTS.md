@@ -2102,3 +2102,55 @@ nexus-evidence        证据强度 E0–E5、绑定与 STALE 规则、Candidate 
 ```
 
 技能索引见 `harness.toml [skills]` 与 `.agents/skills/README.md`。
+
+## 29. 多 Agent 协作约定（Multi-Agent Collaboration）
+
+多个 Agent（豆包会话、CI、远端流程）并行修改同一仓库时的冲突治理。核心：
+**域隔离降冲突概率，命名空间消除证据互踩，rebase 让冲突只在同步时刻暴露一次。**
+
+### 29.1 crate 归属（ownership）
+
+每个 Agent 固定负责域，避免并行任务触碰同一 crate 的文件；`apps/nexus/src/lib.rs` 与
+`MODULE.md` 类共享文件视为高冲突区，改动前先同步。
+
+| 归属域 | 路径 | 说明 |
+|---|---|---|
+| Agent A | `crates/nexus-registry/`、`crates/nexus-auth/`、`crates/nexus-domain/` | 目录/发现/授权/领域模型 |
+| Agent B | `crates/nexus-session/`、`crates/nexus-planner/`、`crates/nexus-connectivity/` | 会话/规划/连接 |
+| Agent C | `apps/nexus/`、`apps/nexusd/`、`crates/nexus-storage/`、`crates/nexus-platform-*` | CLI/daemon/持久层/平台层 |
+| 工具链 | `engineering/`、`.githooks/`、`.agents/` | harness/hooks/skills（低冲突） |
+| 共享 | `scenarios/`、`policies/`、`*.MODULE.md`、`PRODUCT.md` | 契约文件：冻结先行，改动走 requirement-change + contract marker（§7） |
+
+### 29.2 Evidence 命名空间（NEXUS_AGENT）
+
+- 每个 Agent 设置环境变量 `NEXUS_AGENT=<name>`（`[A-Za-z0-9_-]`，≤32 字符）。
+- verify 证据目录：`verify-<agent>-<hash>`；review 证据目录：
+  `review-<scope>-<agent>-r<n>`。
+- harness 的 STALE 标记只作用于**同 agent** 的证据；跨 agent 证据互不干扰
+  （Agent B 的 verify 不会把 Agent A 的证据标 STALE）。
+- hooks（pre-commit/pre-push）的 STALE 扫描与 Review 检查按当前 `NEXUS_AGENT`
+  限定范围；未设置时兼容单 Agent / CI（扫描全部）。
+- 未设置 `NEXUS_AGENT` 视为单 Agent 模式（行为与历史一致）。
+
+### 29.3 同步与推送（nexus-sync）
+
+每个 Agent push 前固定执行（脚本 `./nexus-sync.sh` / `nexus-sync.ps1`）：
+
+```
+git fetch origin
+git rebase origin/master      # 线性历史；冲突在此显式解决（§17：FF/3-way/显式冲突，已提交数据不静默丢弃）
+nexus-harness verify --fast   # 在最新 base 上生成绑定当前 revision 的证据
+git push origin master        # pre-push 门禁（verify PASS / 无 STALE / Review Evidence）
+```
+
+规则：
+- 统一用 rebase 而非 merge（线性历史，冲突一次解决）。
+- 冲突解决是显式协议，不是自动丢弃；rebase 中断时禁止 `--abort` 以外的破坏性操作。
+- 小步单主题提交；一个逻辑变更一个 commit，避免长分支。
+- 契约文件（29.1 共享列）改动必须携带 contract marker 并由 owner 评审后合入。
+
+### 29.4 CI 建议
+
+master 启用 branch protection：required status check（CI 跑 `verify --fast`）、
+linear history（禁 merge commit）、require up-to-date。CI 的 evidence 由远端生成，
+本地证据不再成为推送阻塞；本地 `NEXUS_AGENT` 用于区分各 Agent 的证据命名空间。
