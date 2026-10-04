@@ -725,7 +725,11 @@ pub fn subnet_punch(
     for _ in 0..attempts {
         used += 1;
         // 收对端帧（ph/pa 处理在 tunnel 内部完成）。
-        if let Err(e) = tunnel.recv_and_deliver(&mut buf) {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Err(e) = tunnel.recv_and_deliver(&mut buf, now_secs) {
             eprintln!("recv_and_deliver: {e}");
         }
         if tunnel.peer_state(peer_vip) == Some(TunnelState::Connected) {

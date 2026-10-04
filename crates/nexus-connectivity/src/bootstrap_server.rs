@@ -223,6 +223,10 @@ pub trait BootstrapFrameCodec {
     ) -> Result<Vec<u8>, BootstrapServerError>;
     /// 判别外层 payload（已剥 magic）：Secured 密文 / JoinInit / 其它。
     fn split_outer<'a>(&self, payload: &'a [u8]) -> Result<OuterKind<'a>, BootstrapServerError>;
+    /// 编码外层明文 JoinInit（客户端上行；不含 magic）。客户端方向，与 `decode_join_init` 互逆。
+    fn encode_join_init(&self, req: &JoinInitReq) -> Result<Vec<u8>, BootstrapServerError>;
+    /// 解码外层明文 JoinReply（客户端下行；payload 已剥 magic）。与 `encode_join_reply` 互逆。
+    fn decode_join_reply(&self, body: &[u8]) -> Result<JoinReplyResp, BootstrapServerError>;
 }
 
 /// Bootstrap 服务端配置。
@@ -849,6 +853,9 @@ mod tests {
         }
 
         fn decode(&self, b: &[u8]) -> Result<BootstrapCtrl, BootstrapServerError> {
+            if b.is_empty() {
+                return Err(BootstrapServerError::Malformed("empty ctrl".into()));
+            }
             let tag = b[0];
             let mut pos = 1usize;
             match tag {
@@ -858,6 +865,9 @@ mod tests {
                     locator: get_s(b, &mut pos)?,
                 }),
                 15 => {
+                    if b.len() < 6 {
+                        return Err(BootstrapServerError::Malformed("short ack".into()));
+                    }
                     let accepted = b[1] != 0;
                     let mut t = [0u8; 4];
                     t.copy_from_slice(&b[2..6]);
@@ -870,6 +880,9 @@ mod tests {
                     node_id: get_s(b, &mut pos)?,
                 }),
                 13 => {
+                    if b.len() < 3 {
+                        return Err(BootstrapServerError::Malformed("short peerlist".into()));
+                    }
                     let n = u16::from_be_bytes([b[1], b[2]]) as usize;
                     pos = 3;
                     let mut peers = Vec::new();
@@ -899,6 +912,9 @@ mod tests {
         }
 
         fn decode_join_init(&self, payload: &[u8]) -> Result<JoinInitReq, BootstrapServerError> {
+            if payload.len() < 1 + 32 + 32 + 1 + 8 {
+                return Err(BootstrapServerError::Malformed("short join init".into()));
+            }
             if payload[0] != 0x10 {
                 return Err(BootstrapServerError::Malformed("not join init".into()));
             }
@@ -965,6 +981,58 @@ mod tests {
                 0x10 => Ok(OuterKind::JoinInit(self.decode_join_init(payload)?)),
                 _ => Ok(OuterKind::OtherPlain),
             }
+        }
+
+        fn encode_join_init(&self, req: &JoinInitReq) -> Result<Vec<u8>, BootstrapServerError> {
+            let mut out = Vec::new();
+            out.push(0x10);
+            out.extend_from_slice(&req.eph_pub);
+            out.extend_from_slice(&req.static_pub);
+            match &req.requested_vip {
+                None => out.push(0),
+                Some(v) => {
+                    out.push(1);
+                    put_s(&mut out, v);
+                }
+            }
+            out.extend_from_slice(&req.client_nonce.to_be_bytes());
+            Ok(out)
+        }
+
+        fn decode_join_reply(&self, body: &[u8]) -> Result<JoinReplyResp, BootstrapServerError> {
+            if body.len() < 1 + 32 + 32 + 2 + 4 + 4 + 4 + 8 {
+                return Err(BootstrapServerError::Malformed("short join reply".into()));
+            }
+            if body[0] != 0x11 {
+                return Err(BootstrapServerError::Malformed("not join reply".into()));
+            }
+            let mut pos = 1;
+            let mut eph_pub = [0u8; 32];
+            eph_pub.copy_from_slice(&body[pos..pos + 32]);
+            pos += 32;
+            let mut static_pub = [0u8; 32];
+            static_pub.copy_from_slice(&body[pos..pos + 32]);
+            pos += 32;
+            let assigned_vip = get_s(body, &mut pos)?;
+            let mut take = |n: usize| -> Result<Vec<u8>, BootstrapServerError> {
+                let s: Vec<u8> = body[pos..pos + n].to_vec();
+                pos += n;
+                Ok(s)
+            };
+            let lease = u32::from_be_bytes(take(4)?.try_into().unwrap());
+            let hb = u32::from_be_bytes(take(4)?.try_into().unwrap());
+            let rf = u32::from_be_bytes(take(4)?.try_into().unwrap());
+            let mut n = [0u8; 8];
+            n.copy_from_slice(&body[pos..pos + 8]);
+            Ok(JoinReplyResp {
+                eph_pub,
+                static_pub,
+                assigned_vip,
+                lease_secs: lease,
+                hb_interval_ms: hb,
+                refresh_interval_ms: rf,
+                server_nonce: u64::from_be_bytes(n),
+            })
         }
     }
 

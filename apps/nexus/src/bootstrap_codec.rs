@@ -173,6 +173,39 @@ impl BootstrapFrameCodec for DiscoveryBootstrapCodec {
             nexus_discovery::bootstrap_join::OuterFrame::Plain(_) => Ok(OuterKind::OtherPlain),
         }
     }
+
+    fn encode_join_init(&self, req: &JoinInitReq) -> Result<Vec<u8>, BootstrapServerError> {
+        let frame = BootstrapJoinFrame::JoinInit {
+            eph_pub: req.eph_pub,
+            static_pub: req.static_pub,
+            requested_vip: req.requested_vip.clone(),
+            client_nonce: req.client_nonce,
+        };
+        encode_join_frame(&frame).map_err(Self::map_err)
+    }
+
+    fn decode_join_reply(&self, body: &[u8]) -> Result<JoinReplyResp, BootstrapServerError> {
+        match decode_join_frame(body).map_err(Self::map_err)? {
+            BootstrapJoinFrame::JoinReply {
+                eph_pub,
+                static_pub,
+                assigned_vip,
+                lease_secs,
+                hb_interval_ms,
+                refresh_interval_ms,
+                server_nonce,
+            } => Ok(JoinReplyResp {
+                eph_pub,
+                static_pub,
+                assigned_vip,
+                lease_secs,
+                hb_interval_ms,
+                refresh_interval_ms,
+                server_nonce,
+            }),
+            _ => Err(BootstrapServerError::Malformed("not a JoinReply".into())),
+        }
+    }
 }
 
 #[cfg(test)]

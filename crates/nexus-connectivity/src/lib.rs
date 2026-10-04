@@ -44,6 +44,7 @@ pub mod virtual_subnet;
 
 // ---------- Bootstrap 自动入网（服务端纯逻辑 + codec 解耦；v2 §5.5/§6） ----------
 
+pub mod bootstrap_joiner;
 pub mod bootstrap_server;
 
 // ---------- 中继通道（Relay Fallback Channel） ----------

@@ -68,7 +68,7 @@ fn main() -> ExitCode {
     let comp = vec![0xAB; 4096];
     let wire_before = ta.pipeline_stats().wire_bytes_sent;
     ta.send_ip_packet("10.0.0.2", &comp).unwrap();
-    tb.recv_and_deliver(&mut buf).unwrap();
+    tb.recv_and_deliver(&mut buf, 1000).unwrap();
     let got_comp = delivered(&tb);
     let compressible_roundtrip_ok = got_comp == comp;
     let wire_delta = ta.pipeline_stats().wire_bytes_sent - wire_before;
@@ -78,7 +78,7 @@ fn main() -> ExitCode {
     // 不可压缩负载（高熵）。
     let incomp = incompressible(4096);
     ta.send_ip_packet("10.0.0.2", &incomp).unwrap();
-    tb.recv_and_deliver(&mut buf).unwrap();
+    tb.recv_and_deliver(&mut buf, 1000).unwrap();
     let got_incomp = delivered(&tb);
     let incompressible_roundtrip_ok = got_incomp == incomp;
 

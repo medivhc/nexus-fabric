@@ -71,7 +71,7 @@ fn run_virtual_subnet_tunnel() -> Outcome {
     // 2. B 从 carrier 接收并解封装
     let mut recv_buf = [0u8; 2048];
     let recv_result = tunnel_b
-        .recv_and_deliver(&mut recv_buf)
+        .recv_and_deliver(&mut recv_buf, 1000)
         .expect("B receive and deliver");
 
     let b_received = recv_result.is_some();
@@ -90,7 +90,7 @@ fn run_virtual_subnet_tunnel() -> Outcome {
 
     // 4. A 从 carrier 接收回包
     let recv_result = tunnel_a
-        .recv_and_deliver(&mut recv_buf)
+        .recv_and_deliver(&mut recv_buf, 1000)
         .expect("A receive reply");
 
     let a_received_reply = recv_result.is_some();
@@ -217,13 +217,13 @@ fn run_virtual_subnet_mesh() -> Outcome {
     // B receives frame, forwards to C
     let mut buf = [0u8; 2048];
     let b_delivered = tunnel_b
-        .recv_and_deliver(&mut buf)
+        .recv_and_deliver(&mut buf, 1000)
         .expect("B recv and forward")
         .is_some();
 
     // C receives forwarded frame, delivers to VPI
     let c_recv = tunnel_c
-        .recv_and_deliver(&mut buf)
+        .recv_and_deliver(&mut buf, 1000)
         .expect("C recv and deliver");
     let c_delivered = c_recv.is_some();
     let c_payload_len = c_recv.map(|(_, n)| n).unwrap_or(0);

@@ -219,8 +219,12 @@ impl AutoMeshController {
         let save_interval_ticks = (10_000 / self.tick_interval.as_millis() as u64).max(1); // 每 10 秒保存一次
 
         while !self.stopped && !should_stop() {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
             // 1. 轮询收包（非阻塞）
-            match self.tunnel.recv_and_deliver(&mut buf) {
+            match self.tunnel.recv_and_deliver(&mut buf, now_secs) {
                 Ok(Some((src, n))) => {
                     // 收到数据，对应 peer 是活跃的
                     if let Some(peer) = self.peers.get_mut(&src) {

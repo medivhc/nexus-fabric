@@ -51,7 +51,7 @@ fn main() -> ExitCode {
     let mut got: Vec<u8> = Vec::new();
     // 逐片喂给 B；前 N-1 片 NeedMore（不投递），最后一片重组投递。
     for _ in 0..fragments_sent.max(10) {
-        match tb.recv_and_deliver(&mut buf) {
+        match tb.recv_and_deliver(&mut buf, 1000) {
             Ok(Some((_, n))) => {
                 // 重组完成：VPI 应已收到完整载荷。
                 let mut v = vpi_b_sent.lock().unwrap();

@@ -60,18 +60,19 @@ fn main() -> ExitCode {
     ta.set_dataplane_clock(Duration::ZERO);
     ta.send_ip_packet("10.0.0.2", &[0x11; 1000 - HEADER])
         .unwrap();
-    let first_send_allowed = tb.recv_and_deliver(&mut buf).is_ok() && drained();
+    let first_send_allowed = tb.recv_and_deliver(&mut buf, 1000).is_ok() && drained();
 
     // t=0：再发 inner=200（payload 178），令牌耗尽 -> 丢弃，B 收不到。
     ta.send_ip_packet("10.0.0.2", &[0x22; 200 - HEADER])
         .unwrap();
-    let overflow_send_dropped = tb.recv_and_deliver(&mut buf).unwrap().is_none() && !drained();
+    let overflow_send_dropped =
+        tb.recv_and_deliver(&mut buf, 1000).unwrap().is_none() && !drained();
 
     // t=1s：补满 1000 令牌，再发 inner=500（payload 478）放行。
     ta.set_dataplane_clock(Duration::from_secs(1));
     ta.send_ip_packet("10.0.0.2", &[0x33; 500 - HEADER])
         .unwrap();
-    let after_refill_allowed = tb.recv_and_deliver(&mut buf).is_ok() && drained();
+    let after_refill_allowed = tb.recv_and_deliver(&mut buf, 1000).is_ok() && drained();
 
     let qos_dropped_bytes = ta.pipeline_stats().qos_dropped;
 

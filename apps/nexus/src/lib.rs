@@ -6574,12 +6574,12 @@ pub fn identity_auto_exchange_flow() -> Result<Value, NexusError> {
             message: format!("begin_handshake: {e}"),
         })?;
     tunnel_b
-        .recv_and_deliver(&mut buf)
+        .recv_and_deliver(&mut buf, 1000)
         .map_err(|e| NexusError::Internal {
             message: format!("b accept: {e}"),
         })?;
     tunnel_a
-        .recv_and_deliver(&mut buf)
+        .recv_and_deliver(&mut buf, 1000)
         .map_err(|e| NexusError::Internal {
             message: format!("a complete: {e}"),
         })?;
@@ -6620,7 +6620,7 @@ pub fn identity_auto_exchange_flow() -> Result<Value, NexusError> {
             message: format!("send: {e}"),
         })?;
     if tunnel_b
-        .recv_and_deliver(&mut buf)
+        .recv_and_deliver(&mut buf, 1000)
         .map_err(|e| NexusError::Internal {
             message: format!("b recv: {e}"),
         })?
@@ -6639,12 +6639,12 @@ pub fn identity_auto_exchange_flow() -> Result<Value, NexusError> {
             message: format!("re-begin: {e}"),
         })?;
     tunnel_b
-        .recv_and_deliver(&mut buf)
+        .recv_and_deliver(&mut buf, 1000)
         .map_err(|e| NexusError::Internal {
             message: format!("re-b accept: {e}"),
         })?;
     tunnel_a
-        .recv_and_deliver(&mut buf)
+        .recv_and_deliver(&mut buf, 1000)
         .map_err(|e| NexusError::Internal {
             message: format!("re-a complete: {e}"),
         })?;
@@ -6674,7 +6674,7 @@ pub fn identity_auto_exchange_flow() -> Result<Value, NexusError> {
             message: format!("c begin to A: {e}"),
         })?;
     // A 侧 accept 时 TOFU 校验失败 -> IdentityRejected（不发送 RESP）。
-    let mismatch_rejected = match tunnel_a.recv_and_deliver(&mut buf) {
+    let mismatch_rejected = match tunnel_a.recv_and_deliver(&mut buf, 1000) {
         Err(nexus_connectivity::ConnectivityError::IdentityRejected { .. }) => true,
         other => {
             return Err(NexusError::Internal {
@@ -6788,12 +6788,12 @@ pub fn virtual_subnet_encrypted_3node_flow() -> Result<Value, NexusError> {
         })?;
     let mut buf = [0u8; 4096];
     let _ = tunnel_b
-        .recv_and_deliver(&mut buf)
+        .recv_and_deliver(&mut buf, 1000)
         .map_err(|e| NexusError::Internal {
             message: format!("b accept: {e}"),
         })?;
     let _ = tunnel_a
-        .recv_and_deliver(&mut buf)
+        .recv_and_deliver(&mut buf, 1000)
         .map_err(|e| NexusError::Internal {
             message: format!("a complete: {e}"),
         })?;
@@ -6805,12 +6805,12 @@ pub fn virtual_subnet_encrypted_3node_flow() -> Result<Value, NexusError> {
             message: format!("begin_handshake: {e}"),
         })?;
     let _ = tunnel_c
-        .recv_and_deliver(&mut buf)
+        .recv_and_deliver(&mut buf, 1000)
         .map_err(|e| NexusError::Internal {
             message: format!("c accept: {e}"),
         })?;
     let _ = tunnel_b
-        .recv_and_deliver(&mut buf)
+        .recv_and_deliver(&mut buf, 1000)
         .map_err(|e| NexusError::Internal {
             message: format!("b complete: {e}"),
         })?;
@@ -6845,11 +6845,12 @@ pub fn virtual_subnet_encrypted_3node_flow() -> Result<Value, NexusError> {
         || wire_ab.windows(2).any(|w| w == b"->");
 
     // B 收（解密 seq0，转发给 C 时重加密）
-    let b_delivered = tunnel_b
-        .recv_and_deliver(&mut buf)
-        .map_err(|e| NexusError::Internal {
-            message: format!("b recv: {e}"),
-        })?;
+    let b_delivered =
+        tunnel_b
+            .recv_and_deliver(&mut buf, 1000)
+            .map_err(|e| NexusError::Internal {
+                message: format!("b recv: {e}"),
+            })?;
     if b_delivered.is_none() {
         return Err(NexusError::Internal {
             message: "B did not receive A frame".to_string(),
@@ -6861,11 +6862,12 @@ pub fn virtual_subnet_encrypted_3node_flow() -> Result<Value, NexusError> {
         .unwrap_or(0);
 
     // C 收（解密，写 VPI）
-    let c_delivered = tunnel_c
-        .recv_and_deliver(&mut buf)
-        .map_err(|e| NexusError::Internal {
-            message: format!("c recv: {e}"),
-        })?;
+    let c_delivered =
+        tunnel_c
+            .recv_and_deliver(&mut buf, 1000)
+            .map_err(|e| NexusError::Internal {
+                message: format!("c recv: {e}"),
+            })?;
     let c_vpi_len = c_delivered.map(|(_, l)| l).unwrap_or(0);
     let c_vpi_payload = String::from_utf8_lossy(&c_vpi_sent.lock().unwrap()).to_string();
     if c_vpi_payload != "ping-from-a-to-c" {
@@ -6876,7 +6878,7 @@ pub fn virtual_subnet_encrypted_3node_flow() -> Result<Value, NexusError> {
 
     // 防重放：重放 A→B 同一密文帧 → B 拒绝（REPLAY_REJECTED）
     b_recv.lock().unwrap().extend_from_slice(&wire_ab);
-    let replay_err = tunnel_b.recv_and_deliver(&mut buf);
+    let replay_err = tunnel_b.recv_and_deliver(&mut buf, 1000);
     let replay_rejected = matches!(
         replay_err,
         Err(nexus_connectivity::ConnectivityError::Invalid { ref message })
@@ -8243,7 +8245,7 @@ pub fn coord_join_loopback_flow() -> Result<Value, NexusError> {
             message: format!("a send: {e}"),
         })?;
     let mut buf = [0u8; 4096];
-    let a_to_b_delivered = match tunnel_b.recv_and_deliver(&mut buf) {
+    let a_to_b_delivered = match tunnel_b.recv_and_deliver(&mut buf, 1000) {
         Ok(Some((sender, len))) => sender == b_learned_peer_a_vip && len == b"ping-a-to-b".len(),
         other => {
             return Err(NexusError::Internal {
@@ -8258,7 +8260,7 @@ pub fn coord_join_loopback_flow() -> Result<Value, NexusError> {
         .map_err(|e| NexusError::Internal {
             message: format!("b send: {e}"),
         })?;
-    let b_to_a_delivered = match tunnel_a.recv_and_deliver(&mut buf) {
+    let b_to_a_delivered = match tunnel_a.recv_and_deliver(&mut buf, 1000) {
         Ok(Some((sender, len))) => sender == a_learned_peer_b_vip && len == b"ping-b-to-a".len(),
         other => {
             return Err(NexusError::Internal {
@@ -8404,7 +8406,7 @@ pub fn cross_subnet_flow() -> Result<Value, NexusError> {
             message: format!("office send: {e}"),
         })?;
     let mut buf = [0u8; 4096];
-    let office_delivered = match tunnel_b.recv_and_deliver(&mut buf) {
+    let office_delivered = match tunnel_b.recv_and_deliver(&mut buf, 1000) {
         Ok(Some((sender, len))) => sender == "10.99.0.1" && len == b"office-packet".len(),
         other => {
             return Err(NexusError::Internal {
@@ -8423,7 +8425,7 @@ pub fn cross_subnet_flow() -> Result<Value, NexusError> {
         .map_err(|e| NexusError::Internal {
             message: format!("egress send: {e}"),
         })?;
-    let egress_delivered = match tunnel_b.recv_and_deliver(&mut buf) {
+    let egress_delivered = match tunnel_b.recv_and_deliver(&mut buf, 1000) {
         Ok(Some((sender, len))) => sender == "10.99.0.1" && len == b"egress-packet".len(),
         other => {
             return Err(NexusError::Internal {
