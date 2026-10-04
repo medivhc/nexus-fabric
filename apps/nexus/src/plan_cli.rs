@@ -375,11 +375,24 @@ mod tests {
     }
 
     #[test]
-    fn explain_estimate_labels_non_commitment() {
-        // `plan explain <resource>`：估算模式 + "估算非承诺"标注。
+    fn explain_unknown_resource_exits_1() {
         // P1-20：资源不存在是业务 FAIL → exit 1（此前为 0）。
-        let code = run_plan(&["explain".to_string(), "dev-svc".to_string()], true);
+        // 注意：不能用 `dev-svc` 断言本用例——它是 registry 静态种子，始终存在
+        // （见 explain_known_resource_is_estimate_and_exits_0）。
+        let code = run_plan(
+            &["explain".to_string(), "no-such-resource".to_string()],
+            true,
+        );
         assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn explain_known_resource_is_estimate_and_exits_0() {
+        // 静态种子的 dev-svc 存在 → explain 走 estimate 模式成功，exit 0。
+        // 与 E4 场景 product.observability-plan-explain（期望 verdict=PASS）一致。
+        // "估算非承诺"标注与 JSON 形状由 explain_json_carries_mode_and_commitment 覆盖。
+        let code = run_plan(&["explain".to_string(), "dev-svc".to_string()], true);
+        assert_eq!(code, 0);
     }
 
     #[test]
