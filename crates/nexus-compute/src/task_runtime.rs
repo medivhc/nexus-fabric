@@ -53,6 +53,11 @@ pub enum RuntimeAction {
         paths: Vec<String>,
     },
     ObservationLost,
+    /// Adapter has revalidated the same original completed execution identity.
+    /// Never confirms a running or ambiguous StartIntent, nor writes Outcome.
+    ObservationConfirmed {
+        handle: String,
+    },
 }
 /// Sequence is contiguous and local to one Task. Same sequence/action replay is
 /// idempotent; conflicting, stale or skipped events are rejected.
@@ -200,7 +205,9 @@ fn apply(state: &mut RuntimeState, event: &RuntimeEvent, hash: DigestFn) -> Resu
     if v.outcome != TaskOutcome::Unfinished
         && !matches!(
             event.action,
-            RuntimeAction::ObservationLost | RuntimeAction::Cancel { .. }
+            RuntimeAction::ObservationLost
+                | RuntimeAction::ObservationConfirmed { .. }
+                | RuntimeAction::Cancel { .. }
         )
     {
         return Err(TaskError::invalid(
@@ -480,6 +487,18 @@ fn apply(state: &mut RuntimeState, event: &RuntimeEvent, hash: DigestFn) -> Resu
         RuntimeAction::ObservationLost => {
             v.observation = Observation::PendingVerification;
         }
+        RuntimeAction::ObservationConfirmed { handle } => {
+            require(
+                state.execution_handle.as_ref() == Some(handle)
+                    && matches!(
+                        v.execution.state,
+                        ExecutionState::Exited | ExecutionState::Stopped
+                    )
+                    && v.execution.result_confirmed,
+                "observation confirmation requires the original completed execution",
+            )?;
+            v.observation = Observation::Confirmed;
+        }
     }
     v.last_event_seq = event.sequence;
     validate_provider_transition(&previous, v)
@@ -558,6 +577,9 @@ impl CanonicalDto for RuntimeAction {
                 ("ArtifactsMissing", vec![("paths", paths.to_value())])
             }
             Self::ObservationLost => ("ObservationLost", vec![]),
+            Self::ObservationConfirmed { handle } => {
+                ("ObservationConfirmed", vec![("handle", handle.to_value())])
+            }
         };
         let mut fields: BTreeMap<_, _> =
             extra.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
@@ -610,6 +632,9 @@ impl CanonicalDto for RuntimeAction {
                 paths: take(&mut f, "paths")?,
             },
             "ObservationLost" => Self::ObservationLost,
+            "ObservationConfirmed" => Self::ObservationConfirmed {
+                handle: take(&mut f, "handle")?,
+            },
             _ => return Err(TaskError::invalid("unknown runtime action")),
         };
         require(f.is_empty(), "unknown runtime action field")?;

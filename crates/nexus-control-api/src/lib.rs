@@ -149,3 +149,6 @@ pub trait ControlService: Send + Sync {
     /// 执行控制面命令。
     fn execute(&self, command: ControlCommand) -> Result<ControlOutput, NexusError>;
 }
+
+/// Versioned N3 Application Service contracts; no transport or TaskOwner.
+pub mod task;

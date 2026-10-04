@@ -10,6 +10,8 @@
 pub mod task;
 /// Portable Artifact registration checks and log registration facts.
 pub mod task_artifact;
+/// Read-only requester mirrors and cancellation delivery intents.
+pub mod task_requester;
 /// Provider execution facts replayed from durable events; no OS calls.
 pub mod task_runtime;
 

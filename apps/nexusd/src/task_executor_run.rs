@@ -5,11 +5,12 @@ impl LinuxTaskExecutor {
         &self,
         id: &TaskId,
         contract: &AcceptedContract,
-        input: &Path,
-        frozen: &nexus_workspace::snapshot::FrozenSnapshot,
+        inputs: (&Path, &nexus_workspace::snapshot::FrozenSnapshot),
         logs: &Logs,
+        owner_lease: &File,
         verify_start: &mut dyn FnMut(&AcceptedContract) -> Result<(), TaskError>,
     ) -> Result<RuntimeState, TaskError> {
+        let (input, frozen) = inputs;
         let digest = self.owner.runtime(id)?.view.contract_digest;
         let limits = &contract.request.limits;
         let name = format!(
@@ -85,6 +86,7 @@ impl LinuxTaskExecutor {
         let exec =
             self.docker
                 .exec_create(&container, &contract.request.command, "65534:65534", &cwd)?;
+        logs.check_lock("owner.lock", owner_lease)?;
         let sequence = self.owner.runtime(id)?.view.last_event_seq + 1;
         let start = self.owner.record_event(
             id,
@@ -135,6 +137,7 @@ impl LinuxTaskExecutor {
                 let mut stopped_reason: Option<String> = None;
                 let mut ended: Option<Instant> = None;
                 loop {
+                    logs.check_lock("owner.lock", owner_lease)?;
                     match receive.try_recv() {
                         Ok(result) => {
                             result?;
@@ -156,6 +159,8 @@ impl LinuxTaskExecutor {
                             "started-v1.json",
                             json!({"schema_version":1,"task_id":id.as_str(),"contract_digest":digest.as_str(),"container":container,"exec":exec,"boot_id":fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(io_error)?.trim(),"confirmed_monotonic_ns":monotonic_ns()?,"at_unix":at_unix,"timeout_seconds":limits.timeout_seconds}),
                         )?;
+                        #[cfg(test)]
+                        recovery::checkpoint(logs, "before_started_event")?;
                         self.record(id, RuntimeAction::Started { at_unix })?;
                         started = Some(instant);
                     }
@@ -191,6 +196,8 @@ impl LinuxTaskExecutor {
                         }
                         if eof {
                             logs.seal()?;
+                            #[cfg(test)]
+                            recovery::checkpoint(logs, "before_exit_event")?;
                             let state = if let Some(reason) = stopped_reason {
                                 self.record(
                                     id,

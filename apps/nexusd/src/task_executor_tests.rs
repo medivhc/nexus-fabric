@@ -1,4 +1,6 @@
 use super::*;
+#[path = "task_executor_recovery_tests.rs"]
+mod recovery_tests;
 use nexus_compute::task::AcceptanceContext;
 use nexus_storage::InMemoryContentStore;
 use nexus_workspace::{AuthorId, Change, Workspace, WorkspaceId, snapshot::SnapshotSelection};

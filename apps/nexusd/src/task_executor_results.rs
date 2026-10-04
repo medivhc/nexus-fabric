@@ -24,6 +24,22 @@ pub(crate) fn sealed_results(
         v.accepted_contract.request.limits.log_bytes,
     )?;
     let _lease = logs.lock("owner.lock", true)?;
+    sealed_results_with_lease(root, state, &_lease)
+}
+/// Private to the executor: reconciliation already owns the original lease.
+pub(super) fn sealed_results_with_lease(
+    root: &Path,
+    state: &RuntimeState,
+    lease: &File,
+) -> Result<SealedResults, TaskError> {
+    let v = &state.view;
+    let logs = Logs::open(
+        root,
+        &v.task_id,
+        &v.contract_digest,
+        v.accepted_contract.request.limits.log_bytes,
+    )?;
+    logs.check_lock("owner.lock", lease)?;
     if !logs.sealed()? {
         return Err(corrupt("execution logs are not sealed"));
     }

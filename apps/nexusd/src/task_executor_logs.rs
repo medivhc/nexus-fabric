@@ -1,7 +1,10 @@
 //! Provider-private append files and checksummed progress. Never reset on reopen.
 use super::*;
 use std::io::{Seek, SeekFrom};
-use std::os::unix::{fs::OpenOptionsExt, io::AsRawFd};
+use std::os::unix::{
+    fs::{MetadataExt, OpenOptionsExt},
+    io::AsRawFd,
+};
 
 pub(super) struct Logs {
     pub(super) directory: PathBuf,
@@ -43,6 +46,16 @@ impl Logs {
                 .map_err(io_error)?;
         }
         result.save(&json!({"schema_version":1,"task_id":result.task,"contract_digest":result.contract,"limit":limit,"sizes":[0,0],"truncated":[false,false],"sealed":false}))?;
+        let owner = checked_file(&result.directory.join("owner.lock"), true)?
+            .metadata()
+            .map_err(io_error)?;
+        // Decimal strings preserve full u64 OS identities outside JSON's exact
+        // integer range. No old authority is migrated or rebound on reopen.
+        proof(
+            &result,
+            "owner-lease-v1.json",
+            json!({"schema_version":1,"task_id":result.task,"contract_digest":result.contract,"device":owner.dev().to_string(),"inode":owner.ino().to_string()}),
+        )?;
         Ok(result)
     }
     fn location(root: &Path, task: &TaskId, contract: &Sha256Digest, limit: u64) -> Self {
@@ -76,6 +89,7 @@ impl Logs {
         loop {
             // SAFETY: live owned fd, LOCK_EX (+ LOCK_NB) have no pointer argument.
             if unsafe { flock(file.as_raw_fd(), if nonblocking { 6 } else { 2 }) } == 0 {
+                self.check_lock(name, &file)?;
                 return Ok(file);
             }
             let e = std::io::Error::last_os_error();
@@ -95,6 +109,47 @@ impl Logs {
                 true,
             ));
         }
+    }
+    /// A held fd must still be the stable private lock at this path.
+    pub(super) fn check_lock(&self, name: &str, file: &File) -> Result<(), TaskError> {
+        check_dir(
+            self.directory
+                .parent()
+                .ok_or_else(|| corrupt("execution parent missing"))?,
+        )?;
+        check_dir(&self.directory)?;
+        let current = checked_file(&self.directory.join(name), true)?
+            .metadata()
+            .map_err(io_error)?;
+        let owned = file.metadata().map_err(io_error)?;
+        if current.dev() != owned.dev() || current.ino() != owned.ino() || owned.nlink() != 1 {
+            return Err(corrupt("execution lease identity changed"));
+        }
+        if name == "owner.lock" {
+            let path = self.directory.join("owner-lease-v1.json");
+            if !path.try_exists().map_err(io_error)? {
+                return Err(unsupported(
+                    "owner lease binding missing; legacy or damaged execution authority cannot be claimed",
+                ));
+            }
+            let binding = crate::artifact_fs::load(&path)?;
+            if binding.as_object().map(|m| m.len()) != Some(5)
+                || binding["schema_version"] != 1
+                || binding["task_id"] != self.task
+                || binding["contract_digest"] != self.contract
+                || binding["device"]
+                    .as_str()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    != Some(owned.dev())
+                || binding["inode"]
+                    .as_str()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    != Some(owned.ino())
+            {
+                return Err(corrupt("original owner lease binding differs"));
+            }
+        }
+        Ok(())
     }
     fn load(&self) -> Result<Json, TaskError> {
         let mut file = checked_file(&self.directory.join("logs-v1.json"), false)?;
@@ -255,7 +310,7 @@ pub(super) fn checked_file(path: &Path, write: bool) -> Result<File, TaskError> 
         .open(path)
         .map_err(|_| corrupt("missing or inaccessible log authority"))?;
     let meta = file.metadata().map_err(io_error)?;
-    if !meta.is_file() || meta.permissions().mode() & 0o077 != 0 {
+    if !meta.is_file() || meta.permissions().mode() & 0o077 != 0 || meta.nlink() != 1 {
         return Err(corrupt("log authority must be private regular file"));
     }
     Ok(file)

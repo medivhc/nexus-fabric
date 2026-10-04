@@ -21,6 +21,8 @@ mod archive;
 mod docker;
 #[path = "task_executor_logs.rs"]
 mod logs;
+#[path = "task_executor_recovery.rs"]
+mod recovery;
 #[path = "task_executor_results.rs"]
 mod results;
 #[path = "task_executor_run.rs"]
@@ -194,9 +196,9 @@ impl LinuxTaskExecutor {
         let result = self.execute(
             id,
             &contract,
-            &prepared.directory,
-            &frozen,
+            (&prepared.directory, &frozen),
             &logs,
+            &_lease,
             verify_start,
         );
         if result.is_err() {
@@ -246,7 +248,12 @@ impl LinuxTaskExecutor {
             if id == requested {
                 return Err(corrupt("existing execution authority cannot be reset"));
             }
-            if !logs.sealed()? || state.view.execution.state == ExecutionState::Running {
+            if state.view.execution.state == ExecutionState::Stopped {
+                recovery::verify_stopped(self, &state, &logs)?;
+            }
+            if (!logs.sealed()? && state.view.execution.state != ExecutionState::Stopped)
+                || state.view.execution.state == ExecutionState::Running
+            {
                 match logs.lock("owner.lock", true) {
                     Err(e) if e.code == TaskErrorCode::CapacityUnavailable => {}
                     Ok(_) => {
@@ -285,7 +292,9 @@ impl LinuxTaskExecutor {
                 &state.view.contract_digest,
                 state.view.accepted_contract.request.limits.log_bytes,
             )?;
-            if !logs.sealed()? || state.view.execution.state == ExecutionState::Running {
+            if (!logs.sealed()? && state.view.execution.state != ExecutionState::Stopped)
+                || state.view.execution.state == ExecutionState::Running
+            {
                 match logs.lock("owner.lock", true) {
                     Err(e) if e.code == TaskErrorCode::CapacityUnavailable => {}
                     Ok(_lease) if state.view.observation == Observation::Confirmed => {

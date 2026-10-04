@@ -31,3 +31,7 @@ mod artifact_fs;
 /// Provider-private Artifact publication and authorized byte reads.
 #[cfg(target_os = "linux")]
 pub mod task_artifacts;
+
+/// Linux requester cache and durable cancellation outbox.
+#[cfg(target_os = "linux")]
+pub mod task_requester_store;

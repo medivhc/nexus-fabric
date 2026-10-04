@@ -278,5 +278,13 @@
     "module": "nexus-compute / apps/nexusd",
     "category": "implementation-pitfall",
     "summary": "Artifact Catalog 与 TaskOwner 交付事件绑定；未知旧状态不重建，receiver lease 防第二 owner，Publishing intent + 同 inode no-replace 发布与 SIGKILL 恢复。"
+  },
+  {
+    "id": "n3-requester-recovery-boundaries",
+    "file": "entries/2026-10-04-n3-requester-scope-and-recovery-lease.md",
+    "date": "2026-10-04",
+    "module": "nexus-compute / apps/nexusd / apps/nexus",
+    "category": "implementation-pitfall",
+    "summary": "Requester镜像按Provider+TaskId区分，ack不确认停止；固定inode receipt保护原执行owner；CLI请求文件需非阻塞打开及fd类型复查，避免FIFO阻塞。"
   }
 ]
