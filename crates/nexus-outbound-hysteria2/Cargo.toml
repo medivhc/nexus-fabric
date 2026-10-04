@@ -1,0 +1,18 @@
+[package]
+name = "nexus-outbound-hysteria2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Hysteria2 outbound adapter: QUIC-based TCP/UDP proxy (clean-room)"
+
+[lints]
+workspace = true
+
+[dependencies]
+nexus-connectivity = { path = "../nexus-connectivity" }
+# quinn-proto 0.11: same QUIC stack as nexus-fabric (workspace patch applies
+# vendored fix for quinn-rs/quinn#2658). default-features disabled per policy.
+quinn-proto = { version = "0.11", default-features = false, features = ["rustls", "ring"] }
+bytes = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
