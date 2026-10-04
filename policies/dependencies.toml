@@ -390,3 +390,138 @@ os_transitive_deps = "none"
 approved = true
 approved_date = "2026-10-04"
 review_basis = "AnyTLS 协议语义 §3.4/§4.1: padding-md5 = MD5(小写 hex) of padding scheme 原始字节; same crate+version already allowlisted 2026-09-30 for crates/nexus-turn"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-outbound-hysteria2"
+crate = "quinn-proto"
+version = "0.11"
+default_features = false
+features = ["rustls", "ring"]
+architecture_layer = "outbound (Hysteria2): QUIC sans-IO 建连/握手/stream/datagram (RFC 9000 + RFC 9221); no async runtime, no tokio (repo is std-only)"
+feature_scope = "rustls+ring only; platform-verifier and runtime-tokio explicitly disabled"
+license = "MIT OR Apache-2.0 (allowlisted; cargo-deny PASS on 2026-09-30 for nexus-fabric entry, 57 third-party pkgs)"
+security = "RustSec DB fetch failed on 2026-09-30 (network); re-check at push time via harness gate"
+portability = "sans-IO, no socket code; crate marked portable = false (QUIC/rustls)"
+supply_chain = "0.11.18 pinned by Cargo.lock (lockfile_required); same vendored source as nexus-fabric ([patch.crates-io] vendor/quinn-proto + Nexus patch for quinn-rs/quinn#2658)"
+os_transitive_deps = "none beyond ring's cc (already accepted)"
+approved = true
+approved_date = "2026-10-04"
+review_basis = "Hysteria2 协议语义 §1/§2.1: QUIC + DATAGRAM 传输; nexus-fabric Driver 旋钮不足（SNI/ALPN/证书三选一/传输参数均不可配），故直接用 quinn-proto 手写最小 client handshake; quiche 明确不引入（见 crate MODULE.md QUIC 选型结论）"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-outbound-hysteria2"
+crate = "rustls"
+version = "0.23"
+default_features = false
+features = ["ring", "std"]
+architecture_layer = "outbound (Hysteria2): QUIC TLS 1.3 握手 (ALPN h3, pin-sha256/insecure/系统根三选一 verifier)"
+feature_scope = "ring+std only; aws-lc-rs/tls12 explicitly off (QUIC requires TLS 1.3)"
+license = "Apache-2.0 OR ISC OR MIT (allowlisted; same version already in tree via quinn-proto/nexus-fabric)"
+security = "no known advisories; re-check at push time via harness dependency-governance gate"
+portability = "pure Rust + ring cc build (already accepted in tree); crate marked portable = false"
+supply_chain = "0.23.45 pinned by Cargo.lock (lockfile_required); already in tree via quinn-proto"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-04"
+review_basis = "Hysteria2 协议语义 §2.1(2)(3): QUIC 握手需要 TLS 1.3 + ALPN h3 + 证书校验三选一；与 nexus-outbound-trojan/anytls 同版本同 feature 集"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-outbound-hysteria2"
+crate = "rustls-native-certs"
+version = "0.8"
+default_features = false
+features = []
+architecture_layer = "outbound (Hysteria2): 证书校验三选一之系统根证书加载"
+feature_scope = "no features; only load_native_certs()"
+license = "Apache-2.0 OR ISC OR MIT (allowlisted; check via cargo-deny gate)"
+security = "loads platform trust store only; no network; no known advisories; re-check at push time via harness gate"
+portability = "platform trust store (Linux: /etc/ssl/certs or SSL_CERT_* env); crate marked portable = false"
+supply_chain = "0.8.4 pinned by Cargo.lock (lockfile_required); transitive: openssl-probe, rustls-pki-types, schannel/security-framework (platform-gated)"
+os_transitive_deps = "none on Linux (openssl-probe reads /etc/ssl, no link)"
+approved = true
+approved_date = "2026-10-04"
+review_basis = "Hysteria2 协议语义 §2.1(3): 证书校验三选一含系统根证书链校验；alternatives: webpki-roots (static Mozilla bundle, new dep, rejected)"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-outbound-hysteria2"
+crate = "ring"
+version = "0.17"
+default_features = false
+features = []
+architecture_layer = "outbound (Hysteria2): rustls crypto provider (ring) + 系统 RNG (Salamander salt / padding) + TLS 握手签名校验"
+feature_scope = "no default features, no extra features; only crypto provider + rand::SystemRandom + signature verification"
+license = "Apache-2.0 AND ISC (allowlisted; same crate/version already reviewed for crates/nexus-connectivity and apps/nexus)"
+security = "no known advisories; re-check at push time via harness dependency-governance gate"
+portability = "BoringSSL C code already built on all supported host targets; crate marked portable = false"
+supply_chain = "0.17.14 pinned by Cargo.lock (lockfile_required); already in tree via quinn-proto/rustls"
+os_transitive_deps = "none (pure compile-time crypto)"
+approved = true
+approved_date = "2026-10-04"
+review_basis = "Hysteria2 需要 CSPRNG (salt/padding) 与 rustls crypto provider；ring 已在树内（quinn-proto/rustls 的 provider），不新增编译负担"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-outbound-hysteria2"
+crate = "rcgen"
+version = "0.13"
+default_features = false
+features = []
+architecture_layer = "outbound (Hysteria2): 仅测试用最小 server 的自签证书生成 (CN/SAN=localhost)"
+feature_scope = "no default features; only generate_simple_self_signed"
+license = "MIT OR Apache-2.0 (allowlisted; same crate/version already reviewed for crates/nexus-fabric)"
+security = "test-only usage; no known advisories; re-check at push time via harness gate"
+portability = "pure Rust; test-only"
+supply_chain = "0.13.2 pinned by Cargo.lock (lockfile_required); already in tree via nexus-fabric/nexus-outbound-trojan"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-04"
+review_basis = "Hysteria2 loopback E4 需要 server 证书；沿用 nexus-outbound-trojan 的 rcgen 自签做法（离线、确定性）"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-outbound-hysteria2"
+crate = "sha2"
+version = "0.10"
+default_features = false
+features = []
+architecture_layer = "outbound (Hysteria2): pin-sha256 证书校验（叶子 DER 的 SHA-256）"
+feature_scope = "no default features; only sha2::Sha256 digest interface"
+license = "MIT OR Apache-2.0 (allowlisted; check via cargo-deny gate)"
+security = "no known advisories; re-check at push time via harness dependency-governance gate"
+portability = "pure Rust; crate marked portable = false (QUIC/rustls)"
+supply_chain = "0.10.9 pinned by Cargo.lock (lockfile_required); already in tree via nexus-outbound-anytls"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-04"
+review_basis = "Hysteria2 协议语义 §2.1(3)/§4: pin-sha256 = 叶子证书 DER 的 SHA-256；alternatives: hand-rolled SHA-256 rejected (never hand-roll crypto)"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-outbound-hysteria2"
+crate = "blake2"
+version = "0.10"
+default_features = false
+features = []
+architecture_layer = "outbound (Hysteria2): Salamander 混淆的 BLAKE2b-256(key||salt) 密钥流; no async runtime"
+feature_scope = "no default features; only Blake2b<U32> digest interface (new/update/finalize)"
+license = "MIT OR Apache-2.0 (allowlisted; check via cargo-deny gate)"
+security = "RustCrypto maintained; used as obfuscation keystream PRF (not password hashing, not collision-sensitive); no known advisories; re-check at push time via harness gate"
+portability = "pure Rust; crate marked portable = false (QUIC/rustls)"
+supply_chain = "0.10.6 pinned by Cargo.lock (lockfile_required); transitive: digest 0.10 (already in tree)"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-04"
+review_basis = "Hysteria2 协议语义 §2.4: Salamander = payload XOR BLAKE2b-256(key||salt) 循环密钥流；alternatives considered: hand-rolled BLAKE2b rejected (never hand-roll crypto), blake3 (wrong algorithm — Salamander 指定 BLAKE2b, rejected)"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-outbound-hysteria2"
+crate = "bytes"
+version = "1"
+default_features = false
+features = []
+architecture_layer = "outbound (Hysteria2): quinn-proto sans-IO API 的 buffer 类型 (Bytes/BytesMut)"
+feature_scope = "no features enabled; Bytes/BytesMut only"
+license = "MIT (allowlisted)"
+security = "no known advisories in allowlist; cargo-deny recommended for CI"
+portability = "pure Rust, no OS-specific API"
+supply_chain = "pinned by Cargo.lock (lockfile_required); already in tree via quinn-proto"
+approved = true
+approved_date = "2026-10-04"
+review_basis = "quinn-proto sans-IO API (Endpoint::handle / poll_transmit / datagrams) 需要 bytes 类型；与 nexus-fabric 同"

@@ -4,15 +4,20 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Hysteria2 outbound adapter: QUIC-based TCP/UDP proxy (clean-room)"
+description = "Hysteria2 outbound adapter: QUIC (quinn-proto sans-IO) + minimal HTTP/3 auth + TCP/UDP proxy frames + Salamander obfuscation (clean-room)"
 
 [lints]
 workspace = true
 
 [dependencies]
 nexus-connectivity = { path = "../nexus-connectivity" }
-# quinn-proto 0.11: same QUIC stack as nexus-fabric (workspace patch applies
-# vendored fix for quinn-rs/quinn#2658). default-features disabled per policy.
+# QUIC：复用 workspace 已有的 quinn-proto 0.11（vendor patch），sans-IO + 自写同步 driver；
+# 不引入 quiche（见 MODULE.md QUIC 选型结论）。
 quinn-proto = { version = "0.11", default-features = false, features = ["rustls", "ring"] }
-bytes = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-native-certs = "0.8"
+ring = "0.17"
+rcgen = "0.13"
+sha2 = "0.10.9"
+blake2 = { version = "0.10", default-features = false }
+bytes = "1"

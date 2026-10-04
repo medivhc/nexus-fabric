@@ -1,99 +1,118 @@
 # nexus-outbound-hysteria2
 
-> 出站层 crate（`layer = "outbound"`）。clean-room 实现，不拷贝任何既有代码。
-> 协议语义：`docs/protocols/hysteria2.md`；官方规范：https://github.com/apernet/hysteria/blob/master/PROTOCOL.md
+> 出站层 crate（`layer = "outbound"`, `portable = false`）。
+> 协议语义：`docs/protocols/hysteria2.md`（clean-room 实现）。
 
 ## Responsibility
 
 实现 `nexus_connectivity::OutboundAdapter` 的 **Hysteria2** 出站实现：
-基于 QUIC（RFC 9000）+ DATAGRAM（RFC 9221）的 TCP/UDP 代理协议。
+QUIC（RFC 9000）+ 不可靠数据报扩展（RFC 9221）上的 TCP/UDP 代理。
 
 提供：
 
-- QUIC varint 编解码（RFC 9000 §16）：`encode_varint` / `decode_varint`；
-- TCP 中继帧：`TcpRequest`（`0x401 | varint地址长 | 地址文本 | varint pad长 | pad`）
-  与 `TcpResponse`（`status(1) | varint消息长 | 消息 | varint pad长 | pad`）编解码；
-- UDP 中继帧：`UdpMessage`（`session_id u32BE | packet_id u16BE | frag_id | frag_count |
-  varint地址长 | 地址文本 | 载荷`）编解码；
-- 最小 QPACK 编码器（literal field line，不用动态表）：`qpack_encode_headers`；
-- HTTP/3 认证：空 SETTINGS 帧构造（控制流 stream 2）、HEADERS 帧构造（stream 0，
-  `:method/:scheme/:authority/:path` + `Hysteria-Auth` + `Hysteria-CC-RX` +
-  `Hysteria-Padding`）、响应解析（`:status == 233`、`Hysteria-UDP`、`Hysteria-CC-RX`）；
-- QUIC 传输配置：`build_quic_client_config` 生成 quinn-proto `ClientConfig`
- （ALPN `h3`、禁用 grease、启用 DATAGRAM、流/连接窗口、空闲超时）；
-- 配置门禁：`Hysteria2Config::validate`（必填项、端口范围、obfs 门禁、
-  hop ports 解析、hop-interval 钳制）；
-- 结构化错误 `Hysteria2Error`（不以日志文本代替类型；错误展示绝不回显 password）。
+- QUIC 建连（`client.rs` + `driver.rs`）：SNI（`sni` 为空则用 server host）、
+  ALPN `h3`、**禁用 QUIC bit greasing**、DATAGRAM 收发、流接收窗口 8MB /
+  连接接收窗口 20MB / 最大空闲超时 30s / 最大并发双向+单向流各 1024、
+  10s keep-alive（ack-eliciting）；证书校验三选一（`tls.rs`）：
+  `pin-sha256`（叶子 DER 的 SHA-256，**替代**链校验+主机名校验，mihomo
+  行为，允许自签名）/ `insecure`（仍校验 TLS 握手签名）/ 系统根证书
+  （`rustls-native-certs`）；
+- 最小 HTTP/3 认证（`auth.rs` + `qpack.rs`，文档 §2.1/§3.1/§5 坑 #1）：
+  单向控制流（stream 2）发空 SETTINGS `[0x00, 0x04, 0x00]`（QPACK 动态表
+  保持禁用）；stream 0 发 HEADERS 帧（`0x01` + varint 长度 + QPACK 块），
+  7 个头（`:method/:scheme/:authority/:path` + `hysteria-auth` /
+  `hysteria-cc-rx` / `hysteria-padding`，全小写线格式，字面量永不索引编码）；
+  响应校验 `:status == 233`（其他一律认证失败断开），解析 `hysteria-udp`
+  与 `hysteria-cc-rx`；拒绝 DATA 先于 HEADERS、拒绝 QPACK 动态表引用；
+- `TCPRequest` / `TCPResponse` 帧编解码（`frames.rs`，varint `0x401`、地址文本
+  `host:port`、padding）；fast-open 语义（请求发出后不等响应即返回，
+  **读侧始终先剥离 `TCPResponse`**）；
+- `UDPMessage` 编解码（`frames.rs`；`session u32BE | packet u16BE | frag_id |
+  frag_count | varint 地址长 | 地址文本 | 载荷`）；UDP session id 本地从 0
+  递增分配，无显式关闭；超上限的包直接丢弃（`DatagramTooLarge`，不分片）；
+- Salamander 混淆（`obfs.rs`）：`salt(8) + (payload XOR BLAKE2b-256(key||salt))`
+  的加/解，发生在 QUIC 包之下的 driver 收发处；`obfs = "gecko"` 配置即拒绝；
+- QPACK 静态表（RFC 9204 Appendix A 全表，`qpack.rs`）：解码支持静态表索引
+  引用与静态表名引用；Huffman（`H` 位）不在最小子集内，遇到返回 `InvalidFrame`；
+- 最小 sans-IO QUIC 驱动（`driver.rs`，同步阻塞 API）：UDP 收发、定时器、
+  端点事件路由、stream 读写原语（`write_all` / `read_exact` / `read_some` /
+  `read_varint`）、DATAGRAM 收发；client 与测试用 server 共用；
+- 测试用最小 server（`test_server.rs`，**仅测试**）：rcgen 自签证书、
+  密码校验、`:status: 233` 响应、TCP 回显、UDP 回显；
+- 结构化错误 `Hysteria2Error`（不以日志文本代替类型；`Display`/ `Debug`
+  绝不回显密码；`Hysteria2Target` 的 `Debug` 对密码脱敏）。
+
+## QUIC 选型结论（`Driver` vs `quinn-proto` 直接）
+
+**直接使用 `quinn-proto` 0.11（workspace 已有 `[patch.crates-io]` 的 vendor
+版本），不复用 `nexus-fabric` 的 `Driver`。** 原因：
+
+- `Driver::connect` 硬编码 `server_name = "nexus-fabric"`（SNI 不可配）；
+- 客户端 TLS 是 Nexus 自有的 PeerId-pinned ed25519 verifier，不支持
+  `pin-sha256` / `insecure` / 系统根证书三选一；
+- `ConnConfig` 只有 `addrs` + `handshake_timeout`，无 ALPN / 窗口 / 空闲超时 /
+  DATAGRAM 缓冲 / greasing 等传输旋钮；
+- 其 TLS 身份模型（PeerId 绑定自签证书）与 Hysteria2 的服务器证书模型不兼容。
+
+`quinn-proto` 的 sans-IO `Endpoint`（`Endpoint::new` 不持有 socket，
+`poll_transmit` / `handle` / `poll_timeout` 由调用方驱动）满足全部需求，
+且 `EndpointConfig::grease_quic_bit(false)` 直接支持禁用 greasing——
+无需引入 `quiche` 新依赖。
 
 ## Non-Responsibilities
 
-- **Salamander 混淆的完整实现**：线格式（`salt(8) | payload XOR BLAKE2b-256(key||salt)`）
-  已在文档中定义，`Salamander` 结构提供接口占位；BLAKE2b 需新增第三方依赖，
-  按依赖政策需走评审，本 crate v1 不引入，配置中启用时返回
-  `Hysteria2Error::SalamanderNotImplemented`（fail-closed）；
-- **端口跳跃运行时**：`HopPorts::parse` 解析端口集合，`hop_interval` 钳制；
-  实际的定时轮换与源地址归一化由上层 driver 完成；
-- **Brutal CC**：`rx_bps` 只放进 `Hysteria-CC-RX` 请求头，不实现固定速率发送；
-  拥塞控制用 quinn-proto 默认；
-- **完整 QUIC I/O driver**（UDP socket + 事件循环 + 保活）：由上层装配；
-  本 crate 提供传输参数与协议帧，`quinn-proto` 为 sans-IO；
-- session 复用池 / 断线重连 / 选路 / 策略组（由上层装配）；
-- `nexus-proxy` / 选路 / 策略组不依赖本 crate（组合根装配）。
+- **Brutal CC** 固定速率拥塞控制：只收发 `Hysteria-CC-RX` 协商字段
+  （`0`=无限制 / `"auto"`=用 CC 自适应 / 具体数值），拥塞算法用
+  quinn-proto 默认（Cubic，`TransportConfig` 默认值）；
+- **端口跳跃**（`ports` / `hop-interval` 定时轮换 + 源地址归一化）：列为后续；
+- **完整 HTTP/3 连接**：只做认证所需的最小子集（SETTINGS 空帧 + 一次
+  QPACK HEADERS）；server 的 SETTINGS / QPACK 动态表 / 其他 H3 帧不处理；
+- **server 侧产品实现**：只有测试用最小 server；
+- UDP 分片重组（超上限直接丢弃）、session 复用池 / 心跳定时器 /
+  断线重连（由上层装配）；
+- `nexus-proxy` / 选路 / 策略组不依赖本 crate（组合根装配）；
+- 不做第二套系统级 Plan。
+
+## 与文档的出入 / 未确认点
+
+- `:authority` 头的值按文档取字面量 `"hysteria"`（非 server host）；
+  头字段名在线上用全小写（HTTP/3 要求），文档表格的大小写为逻辑名；
+- `Hysteria-Padding` 随机串：文档只给 256~2048 字节 `[a-zA-Z0-9]` 范围，
+  具体长度分布未规定——本实现用系统 RNG 在该区间均匀取值；
+- `TCPRequest` 的 padding 长度文档未规定——本实现取 16 字节随机；
+- 认证响应缺 `hysteria-cc-rx` 时视为 `Auto`（// 未确认：文档未明确缺省语义，
+  按最接近的 "auto" 处理）；缺 `hysteria-udp` 时视为非法响应（文档 §3.1
+  要求至少包含该头）；
+- DATAGRAM 收发缓冲：文档"收发队列各 1024"指包数，quinn-proto 以字节计，
+  按 1350 字节/包折算为 `1024*1350` 字节；
+- QPACK 解码遇到 Huffman 编码（`H` 位）返回 `InvalidFrame`（最小子集不覆盖；
+  真实 server 互联时需补）；
+- quinn-proto 默认拥塞控制为 Cubic（`TransportConfig` 默认值，源码确认）；
+- // 未确认：`max_datagram_frame_size` 的对端通告值未经真实 server 验证，
+  loopback 测试中 client/server 均为本实现。
 
 ## Inputs
 
-- 配置：`tag`、服务端 `server`/`port`、`password`（`Hysteria-Auth`）、`sni`、
-  `skip_cert_verify`、`pin_sha256`、`up_mbps`/`down_mbps`、`obfs`（`salamander`
-  占位）、`obfs_password`、`ports`（跳跃端口集合）、`hop_interval`、
-  `fast_open`、`udp` 开关；
-- 运行时：quinn-proto `Endpoint`（由上层 driver 提供）。
+- 配置：`tag`、服务端 `server`/`port`、认证 `password`、`sni`（可选）、
+  证书校验模式（`pin-sha256` / `insecure` / 系统根）、`cc_rx_bps`
+  （`Hysteria-CC-RX`）、`obfs`（`none` / `salamander` + `obfs-password`）、
+  `fast-open`（默认 true）、`udp`（默认 true）、`handshake_timeout`；
+- 运行时：`Hysteria2Adapter::connect()` 自行建 UDP socket 并完成 QUIC 握手与认证
+  （阻塞）。
 
 ## Outputs
 
 - `OutboundAdapter::handoff` → `OutboundHandoff { kind = "hysteria2", tag, locator }`；
-- 协议帧字节流；结构化错误。
+- `Hysteria2Client`：`open_tcp` / `stream_read` / `stream_write` /
+  `stream_finish`、`alloc_udp_session` / `send_udp` / `recv_udp`；
+- 认证/帧/地址字节流；结构化错误。
 
 ## Allowed Dependencies
 
 - `nexus-connectivity`（OutboundAdapter 接缝）；
-- `quinn-proto` 0.11（与 nexus-fabric 同版本，workspace patch 生效）；
-- `bytes`（quinn-proto sans-IO API）；
-- `rustls` 0.23（TLS 客户端配置）；
-- 标准库。
-
-## Forbidden Dependencies
-
-- `quiche` / 其他 QUIC 栈（统一用 quinn-proto）；
-- tokio / 异步运行时；
-- `nexus-proxy` / 选路 / 策略组。
-
-## Invariants
-
-- `outbound_kind() == "hysteria2"`（稳定标签）；
-- QUIC varint 编码遵循 RFC 9000 §16（首字节高 2 位定长度）；
-- TCPRequest 地址为**文本** `host:port`（区别于 SOCKS5/VLESS 二进制地址）；
-- 认证响应 `:status` 必须为 233，否则 fail-closed；
-- `obfs: gecko` 直接拒绝（仅 salamander 占位）；
-- 错误展示绝不回显 password / obfs_password；
-- 离线确定性：同一份配置+输入永远产生同一字节流；不连公网。
-
-## Side Effects
-
-- 无。纯离线编解码；单测不打开 socket、不连公网。
-
-## Verification
-
-- crate 内单测：varint 编解码（1/2/4/8 字节边界）、TCPRequest/TCPResponse
-  roundtrip、UDPMessage roundtrip（含分片字段）、QPACK 编码（伪头顺序、
-  literal 不索引）、SETTINGS 帧字节、认证请求头构造（字段齐全）、认证响应
-  解析（233 通过、非 233 拒绝、Hysteria-UDP 解析、CC-RX 解析）、配置校验
-  （必填项缺失、端口越界、gecko 拒绝、hop ports 解析、hop-interval 钳制）、
-  adapter kind/tag/handoff。
-
-## Portability
-
-纯 Rust，无 C/asm 依赖（quinn-proto 的 ring 为 Rust 汇编混合，已在 nexus-fabric 验证）。
-
-## Unsafe
-
-本 crate `#![forbid(unsafe_code)]`。
+- 已评审入仓第三方：`quinn-proto 0.11`（vendor patch，`rustls`+`ring`
+  features；与 `nexus-fabric` 同源）、`rustls 0.23`（`ring`+`std`）、
+  `rustls-native-certs 0.8`（系统根证书）、`ring 0.17`（系统 RNG +
+  握手签名校验）、`rcgen 0.13`（测试用自签证书）、`sha2 0.10`
+  （`pin-sha256` 计算）、`blake2 0.10`（Salamander `BLAKE2b-256`）、
+  `bytes 1`（quinn-proto sans-IO buffer 类型）。
