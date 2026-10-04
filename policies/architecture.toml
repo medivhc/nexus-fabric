@@ -287,44 +287,32 @@ layer = "delivery"
 # ---------------------------------------------------------------------------
 # N2 资源类型中立门禁（P0-6，完成标志 #6；综合规划 D5 bunny 架构门禁）
 #
-# nexus-domain / nexus-registry / nexus-planner / nexus-session 四个核心 crate
-# 不得出现资源类型（service/network/workspace/compute/device）专属分支：
-# 禁止按资源类型分叉行为的 match 分支 / 条件逻辑。类型化 extension 字段本身
-# （如 ServicePlanExtension）允许——禁的是"按类型分叉行为"，不是"提到类型"。
+# PRODUCT §16.4-6 规定的四 crate：`nexus-registry` / `nexus-planner` /
+# `nexus-session` / `nexus-auth` 不得出现资源类型（service/network/workspace/
+# compute/device）专属分支：禁止按资源类型分叉行为的 match 分支 / 条件逻辑。
+# 类型化 extension 字段本身（如 ServicePlanExtension）允许——禁的是"按类型分叉
+# 行为"，不是"提到类型"。
+#
+# N2 P1-5：此前本节声明的是 `nexus-domain` 而非契约要求的 `nexus-auth`
+# （四 crate 集合与 PRODUCT §16.4-6 不一致，`nexus-auth` 侥幸无命中）；
+# 现已与契约对齐。
+#
+# 集合与 PRODUCT.md §16.4-6 的"四 crate"契约一致（policy↔PRODUCT 一致性由
+# `nexus-harness` 单测 `policy_crates_match_product_contract` 机器校验）。
 #
 # 机器检查：harness gate `resource-type-neutrality`（verify --fast 可跑）；
 # 扫描四 crate `src/**/*.rs`，flag 同时含"变体引用"（`ResourceKind::V` /
-# `Self::V`）与"分支 token"（`=>` / `matches!` / `if`＋`==`/`!=`）的代码行；
-# 命中 [[resource_kind_neutrality.allow]] 的除外。
-# fail-closed：本节缺失 / allow 条目缺失 → FAIL，不静默放过。
+# `Self::V`）与"分支 token"（`=>` / `matches!` / `if`＋`==`/`!=`）的**逻辑行**
+# （跨行拼接的逻辑行同样命中——N2 P1-6）；
+# 命中 [[resource_kind_neutrality.allow]] 的除外（allow 必须精确到 file/line/contains/reason，
+# 缺字段即 gate FAIL；P1-6：line 把 allow 钉到具体行，文件+子串会让同子串新分支被静默放行）。
+# fail-closed：本节缺失 / allow 条目缺字段 / crate 源码目录不存在 / crate 下
+# 零 *.rs → FAIL，不静默放过。
 # ---------------------------------------------------------------------------
 [resource_kind_neutrality]
-crates = ["nexus-domain", "nexus-registry", "nexus-planner", "nexus-session"]
+crates = ["nexus-registry", "nexus-planner", "nexus-session", "nexus-auth"]
 variants = ["Network", "Service", "Workspace", "Compute", "Device"]
 
-# 允许的特化点（穷举；新增需评审＋更新本 policy）：
-# 类型自身的定义/规范序列化——各变体行为一致（均返回静态字符串），非行为分叉。
-[[resource_kind_neutrality.allow]]
-file = "crates/nexus-domain/src/lib.rs"
-contains = "Self::Network =>"
-reason = "ResourceKind::as_str 规范序列化（类型自身定义）"
-
-[[resource_kind_neutrality.allow]]
-file = "crates/nexus-domain/src/lib.rs"
-contains = "Self::Service =>"
-reason = "ResourceKind::as_str 规范序列化（类型自身定义）"
-
-[[resource_kind_neutrality.allow]]
-file = "crates/nexus-domain/src/lib.rs"
-contains = "Self::Workspace =>"
-reason = "ResourceKind::as_str 规范序列化（类型自身定义）"
-
-[[resource_kind_neutrality.allow]]
-file = "crates/nexus-domain/src/lib.rs"
-contains = "Self::Compute =>"
-reason = "ResourceKind::as_str 规范序列化（类型自身定义）"
-
-[[resource_kind_neutrality.allow]]
-file = "crates/nexus-domain/src/lib.rs"
-contains = "Self::Device =>"
-reason = "ResourceKind::as_str 规范序列化（类型自身定义）"
+# 允许的特化点（穷举；当前为空 = 四 crate 零豁免，P1-5 已删除此前指向
+# nexus-domain 的 5 条死 allow）。新增需评审＋更新本 policy，且条目必须同时
+# 给出 file / line / contains / reason（P1-6），缺字段即 gate FAIL。

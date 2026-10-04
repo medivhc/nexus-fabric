@@ -3126,6 +3126,15 @@ TerminalOutcome（Completed/Failed/Cancelled）最多提交一次，由 Owner �
   每次判定写审计记录；principal 由握手密钥派生、不接受请求方自称；
   授权判定在 provider 侧每次建 Session 时执行；TOFU 显式化
   （首次见未知节点提示用户确认，不静默）；拒绝 PSK 扩展。
+  **P0 显式降级（2026-10-04，N2 P1-14 评审）**：`ResourceOperation::Manage`
+  在 P0 **不保护任何本地管理动作**（`resource publish/revoke`、`grant *`
+  均为本机单管理员操作，D6 判定面只覆盖 `Use` 路径）。操作码保留是为了让
+  grant 表与 P1 的管理面鉴权有稳定形状；把它当成"管理动作已受 Manage
+  保护"的凭证是错误的。P1 启用 Manage 时须同步删除本降级说明。
+  **P0 撤销语义（2026-10-04，N2 P1-14）**：`nexus grant revoke` 是 tombstone
+  撤销（记录保留供取证，判定落 `DenyReason::Revoked`）；`nexus grant del` 是
+  物理 purge（记录与审计线索一并消失）。`nexus resource revoke` 同时 tombstone
+  该资源的全部 grant——撤销只删广告不撤 grant 不算撤销生效。
 - **D7**：见 16.2、16.3。
 - **D8 控制面传输**：拒绝 gRPC/tonic（P0 红线，污染 portable core）；
   双轨——本机 HTTP/1.1＋JSON（token 鉴权、默认 unix socket，
@@ -3158,7 +3167,7 @@ gRPC/tonic；DHT；OIDC；mDNS/LSA 的 Provider 广播（static 先行）；
 
 **冻结边界**：P0-1 之后的业务代码一律不在本节实现；`nexus run` 诚实化是
 唯一已批准的 requirement-change（D4，单独提交、可回滚）。
-**契约 hash**：`e5a98fb8e7109928bb044ad10e411b09992a730ab6bc0818f1aabf63425ec2e3`（计算方法：SHA-256 over §16 节文本自
+**契约 hash**：`49d631937bc7883bc2b0ed721bae93d8ca955a3557b7e9f5006eeb071005cef5`（计算方法：SHA-256 over §16 节文本自
 `## 16.` 至本行之前，排除本行）。
 
 ## 17. N3 分布式任务（模型与契约，2026-10-03） {#17-n3-task}

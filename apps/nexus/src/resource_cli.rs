@@ -17,12 +17,10 @@
 //! `record_directory_audit` 落盘 journal。
 
 use nexus_domain::{ResourceKind, ResourceName, ResourceRef, WorkspaceId};
-use nexus_registry::{
-    ControlFrame, Discoverability, ProviderAdvertisement, UnavailabilityReason,
-    decode_control_frame, encode_control_frame,
-};
+use nexus_registry::{Discoverability, ProviderAdvertisement, UnavailabilityReason};
 use serde_json::{Value, json};
 
+use crate::n2_admission::CONTROL_LOCATOR_SCHEME;
 use crate::n2_directory::{DEFAULT_WORKSPACE, DIRECTORY_TAG, N2Directory};
 use crate::n2_identity::ensure_auth_identity;
 use crate::n2_store::{
@@ -34,9 +32,10 @@ fn now_secs() -> u64 {
     now_unix_pub()
 }
 
-fn render(out: &Value, _json_mode: bool) {
+fn render(out: &Value, _json_mode: bool) -> i32 {
     // v1: 人读输出与 JSON 同形（`--json` 语义的最小实现）。
     println!("{out}");
+    crate::verdict_exit_code(out)
 }
 
 fn store_fail(e: String) -> Value {
@@ -81,8 +80,7 @@ fn run_list(json_mode: bool) -> i32 {
     let directory = match N2Directory::open(&node_dir, now) {
         Ok(d) => d,
         Err(e) => {
-            render(&store_fail(e), json_mode);
-            return 0;
+            return render(&store_fail(e), json_mode);
         }
     };
     // 按资源聚合广告（目录视图；P0 展示全部未过期广告，可见性过滤在
@@ -115,8 +113,7 @@ fn run_list(json_mode: bool) -> i32 {
             "resources": resources,
         }),
         json_mode,
-    );
-    0
+    )
 }
 
 /// `nexus resource show <name>`：资源详情。
@@ -126,14 +123,13 @@ fn run_show(name: &str, json_mode: bool) -> i32 {
     let directory = match N2Directory::open(&node_dir, now) {
         Ok(d) => d,
         Err(e) => {
-            render(&store_fail(e), json_mode);
-            return 0;
+            return render(&store_fail(e), json_mode);
         }
     };
     let (rref, rid) = match directory.resolve(name) {
         Ok(v) => v,
         Err(e) => {
-            render(
+            return render(
                 &json!({
                     "verdict": "FAIL",
                     "error": {
@@ -143,13 +139,12 @@ fn run_show(name: &str, json_mode: bool) -> i32 {
                 }),
                 json_mode,
             );
-            return 0;
         }
     };
     let kind = directory.kind_of(name).unwrap_or(ResourceKind::Service);
     let ads = directory.registry().lookup_ads(&rid, now);
     if ads.is_empty() {
-        render(
+        return render(
             &json!({
                 "verdict": "FAIL",
                 "error": {
@@ -159,7 +154,6 @@ fn run_show(name: &str, json_mode: bool) -> i32 {
             }),
             json_mode,
         );
-        return 0;
     }
     // 首个可用广告的 provider 为"当前提供方"（`n2-resource-show` 冻结字段）。
     let primary = ads
@@ -184,8 +178,7 @@ fn run_show(name: &str, json_mode: bool) -> i32 {
             .map(|ad| ad_json(name, kind, ad))
             .collect::<Vec<_>>()
     );
-    render(&out, json_mode);
-    0
+    render(&out, json_mode)
 }
 
 /// kind 参数解析（`--kind service|network|workspace|compute|device`）。
@@ -211,14 +204,40 @@ fn default_capability(kind: ResourceKind) -> &'static str {
     }
 }
 
+/// P1-13：`--locator` 列表校验。
+///
+/// 约定：首个非 `n2adm://` locator 是 Service 数据面端点（`n2_admission::
+/// service_locator_of` 提取）；`n2adm://host:port` 是跨机准入控制端点。
+/// 一旦给了 locator，就必须至少有一个数据面端点 —— 只给准入端点会让
+/// Service 入口无法解析（此前 publish 对顺序/构成零校验，运维把
+/// `n2adm://` 写前面即产出不可用的广告）。
+///
+/// 空列表合法（静态种子 / 本机发布，`n2-resource-publish` 场景契约）。
+fn validate_locators(locators: &[String]) -> Result<(), String> {
+    if locators.is_empty() {
+        return Ok(());
+    }
+    let has_dataplane = locators
+        .iter()
+        .any(|l| !l.starts_with(crate::n2_admission::CONTROL_LOCATOR_SCHEME));
+    if has_dataplane {
+        return Ok(());
+    }
+    Err(
+        "at least one non-`n2adm://` data-plane locator is required when --locator is given"
+            .to_string(),
+    )
+}
+
 /// `nexus resource publish --name <n> --kind <k> [--locator <l>]`。
 fn run_publish(args: &[String], json_mode: bool) -> i32 {
     const USAGE: &str = "usage: nexus resource publish --name <name> --kind <service|network|workspace|compute|device> [--locator <locator> ...]";
     let mut name: Option<String> = None;
     let mut kind: Option<String> = None;
     // P0-5：`--locator` 可重复。约定：首个非 `n2adm://` locator 为 Service
-    // 数据面端点（planner 取 `locators[0]`）；`n2adm://host:port` 为跨机准入
-    // 控制端点（`n2_admission::CONTROL_LOCATOR_SCHEME`）。
+    // 数据面端点（P1-13：统一由 `n2_admission::service_locator_of` 提取，
+    // 不再取 `locators[0]`）；`n2adm://host:port` 为跨机准入控制端点
+    // （`n2_admission::CONTROL_LOCATOR_SCHEME`）。
     let mut locators: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -250,6 +269,13 @@ fn run_publish(args: &[String], json_mode: bool) -> i32 {
         }
         i += 1;
     }
+    // P1-13：有 locator 时必须至少含一个数据面端点（准入端点不能当 Service 入口）。
+    if let Err(e) = validate_locators(&locators) {
+        return render(
+            &json!({"verdict":"FAIL","error":{"code":"INVALID_LOCATOR","message":e}}),
+            json_mode,
+        );
+    }
     let (Some(name), Some(kind_s)) = (name, kind) else {
         eprintln!("error: resource publish requires --name and --kind");
         eprintln!("{USAGE}");
@@ -265,11 +291,10 @@ fn run_publish(args: &[String], json_mode: bool) -> i32 {
     let parsed_name = match ResourceName::new(&name) {
         Ok(n) => n,
         Err(e) => {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code":"INVALID_NAME","message":format!("{e:?}")}}),
                 json_mode,
             );
-            return 0;
         }
     };
 
@@ -278,51 +303,61 @@ fn run_publish(args: &[String], json_mode: bool) -> i32 {
     let store = match N2Store::open(&node_dir) {
         Ok(s) => s,
         Err(e) => {
-            render(&store_fail(e), json_mode);
-            return 0;
+            return render(&store_fail(e), json_mode);
         }
     };
     // 提供方身份：本地节点（`nexus node init` 的 NodeId；未初始化则明确报错）。
     let provider_id = match local_actor(&node_dir) {
         id if !id.is_empty() => format!("prov-{id}"),
         _ => {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code":"NO_IDENTITY","message":"node not initialized; run `nexus node init` first"}}),
                 json_mode,
             );
-            return 0;
         }
     };
     // 不透明 ResourceId（D2；`res-<name>` 确定性派生，非定位）。
     let resource_id = nexus_domain::ResourceId(format!("res-{name}"));
     let rref = ResourceRef::new(WorkspaceId::new(DEFAULT_WORKSPACE), parsed_name);
-    let ad = ProviderAdvertisement {
+    // P1-13：`--locator` 顺序必须合法——首条即数据面（Service）入口。
+    // 约定（`n2_admission::CONTROL_LOCATOR_SCHEME`）：`n2adm://host:port` 是准入
+    // 控制端点，其余是数据面入口，判定统一走 registry 层的
+    // `ProviderAdvertisement::service_locator`。把 `n2adm://` 写在前面会让下游
+    // 把控制端点当成 Service 入口——直接拒绝，而不是静默产出错误入口。
+    let ad_probe = ProviderAdvertisement {
         provider: nexus_domain::ProviderId(provider_id.clone()),
         resource: resource_id.clone(),
         capabilities: vec![default_capability(kind).to_string()],
-        locators,
-        // 白皮书 §7.3：发布默认 Workspace 内部范围（Public 在此语境下
-        // 即"本 Workspace 内可见"；跨 Workspace 可见性为 P1）。
+        locators: locators.clone(),
         discoverable_by: Discoverability::Public,
         use_grants: Vec::new(),
         unavailable: None,
         issued_at_secs: now,
         ttl_secs: 0,
     };
+    if !ad_probe.has_valid_locator_order() {
+        render(
+            &json!({"verdict":"FAIL","error":{"code":"BAD_LOCATOR_ORDER","message":format!(
+                "--locator order invalid: the first locator must be the Service data-plane endpoint (non-'{}'); control locators must come after it",
+                CONTROL_LOCATOR_SCHEME
+            )}}),
+            json_mode,
+        );
+        return 2;
+    }
+    let ad = ad_probe;
     // 走 P0-2 的 publish_ad（内存 registry 语义）＋落盘。
     {
         let mut registry = nexus_registry::Registry::new();
         if let Err(e) = registry.publish_ad(ad.clone(), now) {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code":"PUBLISH","message":e.to_string()}}),
                 json_mode,
             );
-            return 0;
         }
     }
     if let Err(e) = store.save_ad(&ad) {
-        render(&store_fail(e), json_mode);
-        return 0;
+        return render(&store_fail(e), json_mode);
     }
     // 名字表 upsert（P0-1：`save_names` 为全量覆盖语义，走 load→合并→写回）。
     if let Err(e) = store.upsert_name(NameEntry {
@@ -334,6 +369,27 @@ fn run_publish(args: &[String], json_mode: bool) -> i32 {
         render(&store_fail(e), json_mode);
         return 0;
     }
+
+    // 自授本机 Use（P1-8：E4 场景自洽性）。
+    //
+    // 问题：`use` 的本地路径要求 grant 表里存在本机 principal 的 Use 记录，
+    // 而 P0 没有任何生产路径写入它——干净配置目录下 `nexus use <自己发布的资源>`
+    // 必然 `AUTH_DENIED/NoSuchGrant`。E4 的 `n2-use-loop` 因此依赖带外手工
+    // 前置状态才能 PASS，不可独立复现。
+    //
+    // 修法（评审给的三选一之一）：publish 时为本机 principal 自授该资源的 Use。
+    // 作用域严格限定"本节点自己发布的资源 ＋ 本节点自己的 principal"——
+    // 它不扩大任何其他主体（远端主体仍必须由运维显式 `grant add`），
+    // 也不影响 `restricted-svc` 等未发布的种子资源（`n2-grant-deny-audit`
+    // 的 NoSuchGrant 路径不受影响）。
+    let self_granted = match self_grant_local_use(&store, &rref) {
+        Ok(granted) => granted,
+        Err(e) => {
+            eprintln!("[n2] WARN: self-grant local Use for {name} failed: {e}");
+            false
+        }
+    };
+
     // 重新发布清除撤销 tombstone（幂等；P0-3）。
     if let Err(e) = store.clear_revoked(&rref.workspace.0, rref.name.as_str()) {
         render(&store_fail(e), json_mode);
@@ -361,11 +417,53 @@ fn run_publish(args: &[String], json_mode: bool) -> i32 {
                 "kind": kind.as_str(),
                 "resource_id": resource_id.0,
                 "published": true,
+                // 本机 principal 是否被自授 Use（P1-8；可见、不隐藏）。
+                "self_granted_use": self_granted,
             },
         }),
         json_mode,
+    )
+}
+
+/// `AUTH_REVOKE` 公告的目标主体：该资源在 grant 表里的全部 principal
+/// （去重、升序）。P1-18：公告主体来自 grant 表——旧实现填的是本节点自身，
+/// 自地址帧永远投不到被撤销方，出站泵等于空转。
+fn grantees_of(store: &N2Store, rref: &ResourceRef) -> Vec<String> {
+    let mut ps: Vec<String> = store
+        .load_grants()
+        .map(|gs| {
+            gs.into_iter()
+                .filter(|g| g.resource == *rref)
+                .map(|g| g.principal.0)
+                .collect()
+        })
+        .unwrap_or_default();
+    ps.sort();
+    ps.dedup();
+    ps
+}
+
+/// 本机 principal 自授该资源的 `Use`（P1-8）。
+///
+/// 幂等：已存在同样的 grant 则不重复写。返回是否发生了写入。
+fn self_grant_local_use(store: &N2Store, rref: &ResourceRef) -> Result<bool, String> {
+    let (_pubkey, principal) =
+        ensure_auth_identity(store).map_err(|e| format!("resolve local principal: {e}"))?;
+    let grant = nexus_auth::Grant::new(
+        rref.clone(),
+        principal,
+        vec![nexus_domain::ResourceOperation::Use],
+        None,
     );
-    0
+    if store
+        .load_grants()?
+        .iter()
+        .any(|g| g.resource == *rref && g.operations == grant.operations && !g.revoked)
+    {
+        return Ok(false);
+    }
+    store.save_grant(&grant)?;
+    Ok(true)
 }
 
 /// `nexus resource revoke <name>`：撤销发布。
@@ -375,16 +473,14 @@ fn run_revoke(name: &str, json_mode: bool) -> i32 {
     let store = match N2Store::open(&node_dir) {
         Ok(s) => s,
         Err(e) => {
-            render(&store_fail(e), json_mode);
-            return 0;
+            return render(&store_fail(e), json_mode);
         }
     };
     // 先解析（撤销不存在的资源 → 明确 NOT_FOUND，不静默成功）。
     let directory = match N2Directory::open_with_store(&store, now) {
         Ok(d) => d,
         Err(e) => {
-            render(&store_fail(e), json_mode);
-            return 0;
+            return render(&store_fail(e), json_mode);
         }
     };
     // 注意：已撤销的资源 resolve 会失败；revoke 幂等——再次 revoke 仍返回
@@ -396,11 +492,10 @@ fn run_revoke(name: &str, json_mode: bool) -> i32 {
             let parsed = match ResourceName::new(name) {
                 Ok(n) => n,
                 Err(e) => {
-                    render(
+                    return render(
                         &json!({"verdict":"FAIL","error":{"code":"INVALID_NAME","message":format!("{e:?}")}}),
                         json_mode,
                     );
-                    return 0;
                 }
             };
             let rref = ResourceRef::new(WorkspaceId::new(DEFAULT_WORKSPACE), parsed);
@@ -409,44 +504,27 @@ fn run_revoke(name: &str, json_mode: bool) -> i32 {
         }
     };
 
-    // 1. 触发 AUTH_REVOKE 帧（D8 控制面）：编码＋outbox 落盘排队
-    //    （P0-5 真跨机时实际发送；P0 本地先证明帧格式正确）。
-    let (_pubkey, principal) = match ensure_auth_identity(&store) {
-        Ok(v) => v,
-        Err(e) => {
-            render(&store_fail(e), json_mode);
-            return 0;
+    // 本机身份：公告主体已改由 grant 表给出，但保留旧实现"revoke 时确保
+    // 本机身份已建立"的副作用，使审计 actor 与旧行为一致（不改变输出形状）。
+    let _ = ensure_auth_identity(&store);
+
+    // 1. AUTH_REVOKE 公告（D8 提供方→请求方）：为该资源的**每个被授权主体**
+    //    各排一条进 outbox，由出站泵在该主体下次准入往返时投递（P1-18）。
+    //    P1-18 修正：原实现把 `principal` 填成本节点自身——公告按主体过滤，
+    //    自地址帧永远投不到被撤销方，等价于"只写不排"。
+    let mut outbox_seqs: Vec<u64> = Vec::new();
+    let mut enqueue_err: Option<String> = None;
+    for grantee in grantees_of(&store, &rref) {
+        match store.queue_auth_revoke(&rref, &grantee) {
+            Ok(seq) => outbox_seqs.push(seq),
+            Err(e) => enqueue_err = Some(e),
         }
-    };
-    let frame = ControlFrame::AuthRevoke {
-        resource: rref.clone(),
-        principal: principal.0.clone(),
-    };
-    let frame_bytes = match encode_control_frame(&frame) {
-        Ok(b) => b,
-        Err(e) => {
-            render(
-                &json!({"verdict":"FAIL","error":{"code":"FRAME","message":e.to_string()}}),
-                json_mode,
-            );
-            return 0;
-        }
-    };
-    // 自检：编码可 roundtrip（帧格式正确性的机器证据）。
-    debug_assert!(matches!(
-        decode_control_frame(&frame_bytes),
-        Ok(ControlFrame::AuthRevoke { .. })
-    ));
-    let seq = match store.outbox_next_seq() {
-        Ok(s) => s,
-        Err(e) => {
-            render(&store_fail(e), json_mode);
-            return 0;
-        }
-    };
-    if let Err(e) = store.outbox_push(seq, &frame_bytes) {
-        render(&store_fail(e), json_mode);
-        return 0;
+    }
+    if let Some(e) = enqueue_err {
+        return render(
+            &json!({"verdict":"FAIL","error":{"code":"OUTBOX","message":e}}),
+            json_mode,
+        );
     }
 
     // 2. 本地 withdraw：删除持久化广告＋名字表条目＋tombstone（P0-3 修：
@@ -480,6 +558,14 @@ fn run_revoke(name: &str, json_mode: bool) -> i32 {
         return 0;
     }
 
+    // 2b. 授权侧撤销（P1-14）：只删广告不撤 grant 是不够的——被授权主体仍能在
+    // 下一跳拿到 `Revoked` 之外的路径（目录可见≠可撤销生效）。对该资源的全部
+    // grant 打 tombstone，使后续判定落 `DenyReason::Revoked` 且保留记录。
+    let revoked_grants = store.revoke_all_grants_for(&rref).unwrap_or_else(|e| {
+        eprintln!("[n2] WARN: revoke grants for {name} failed: {e}");
+        0
+    });
+
     // 3. 目录审计（P0-2 评审遗留）。
     record_directory_audit(
         store.kv(),
@@ -489,7 +575,9 @@ fn run_revoke(name: &str, json_mode: bool) -> i32 {
             action: "revoke",
             resource: rref,
             provider: None,
-            detail: format!("revoke {name} (withdrawn_ads={withdrawn_any}, outbox_seq={seq})"),
+            detail: format!(
+                "revoke {name} (withdrawn_ads={withdrawn_any}, revoked_grants={revoked_grants}, outbox_seqs={outbox_seqs:?})"
+            ),
         },
     );
     // P0-3 修：`revoked` 反映真实状态——重新打开目录确认该名字已不可解析。
@@ -507,8 +595,7 @@ fn run_revoke(name: &str, json_mode: bool) -> i32 {
             },
         }),
         json_mode,
-    );
-    0
+    )
 }
 
 /// `nexus resource export <name> [--file <path>]`: 导出资源的持久化广告＋名字映射
@@ -551,25 +638,22 @@ fn run_export(args: &[String], json_mode: bool) -> i32 {
     let store = match N2Store::open(&node_dir) {
         Ok(s) => s,
         Err(e) => {
-            render(&store_fail(e), json_mode);
-            return 0;
+            return render(&store_fail(e), json_mode);
         }
     };
     let directory = match N2Directory::open_with_store(&store, now) {
         Ok(d) => d,
         Err(e) => {
-            render(&store_fail(e), json_mode);
-            return 0;
+            return render(&store_fail(e), json_mode);
         }
     };
     let (rref, resource_id) = match directory.resolve(&name) {
         Ok(v) => v,
         Err(e) => {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code": crate::error_code(&e), "message": e.to_string()}}),
                 json_mode,
             );
-            return 0;
         }
     };
     let kind = directory.kind_of(&name).unwrap_or(ResourceKind::Service);
@@ -582,11 +666,10 @@ fn run_export(args: &[String], json_mode: bool) -> i32 {
         .map(|ad| crate::n2_store::encode_ad(&ad))
         .collect();
     if ads.is_empty() {
-        render(
+        return render(
             &json!({"verdict":"FAIL","error":{"code":"NOT_PUBLISHED","message": format!("no persisted advertisement for '{name}'; publish it first")}}),
             json_mode,
         );
-        return 0;
     }
     let doc = json!({
         "v": 1,
@@ -600,11 +683,10 @@ fn run_export(args: &[String], json_mode: bool) -> i32 {
     let text = serde_json::to_string_pretty(&doc).unwrap_or_default();
     if let Some(path) = file {
         if let Err(e) = std::fs::write(&path, &text) {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code":"IO","message": format!("write {path}: {e}")}}),
                 json_mode,
             );
-            return 0;
         }
         render(
             &json!({"verdict":"PASS","command":"resource export","resource": name, "file": path, "ads": ads.len()}),
@@ -641,22 +723,20 @@ fn run_import(args: &[String], json_mode: bool) -> i32 {
         Some(path) => match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) => {
-                render(
+                return render(
                     &json!({"verdict":"FAIL","error":{"code":"IO","message": format!("read {path}: {e}")}}),
                     json_mode,
                 );
-                return 0;
             }
         },
         None => {
             use std::io::Read;
             let mut buf = String::new();
             if std::io::stdin().read_to_string(&mut buf).is_err() {
-                render(
+                return render(
                     &json!({"verdict":"FAIL","error":{"code":"IO","message": "read stdin"}}),
                     json_mode,
                 );
-                return 0;
             }
             buf
         }
@@ -664,21 +744,19 @@ fn run_import(args: &[String], json_mode: bool) -> i32 {
     let doc: Value = match serde_json::from_str(&text) {
         Ok(v) => v,
         Err(e) => {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code":"BAD_DOC","message": format!("parse: {e}")}}),
                 json_mode,
             );
-            return 0;
         }
     };
     let ok_kind = doc.get("kind").and_then(Value::as_str) == Some("n2-resource-export");
     let version_ok = doc.get("v").and_then(Value::as_u64) == Some(1);
     if !ok_kind || !version_ok {
-        render(
+        return render(
             &json!({"verdict":"FAIL","error":{"code":"BAD_DOC","message": "not an n2-resource-export v1 document"}}),
             json_mode,
         );
-        return 0;
     }
     let workspace = doc
         .get("workspace")
@@ -687,21 +765,19 @@ fn run_import(args: &[String], json_mode: bool) -> i32 {
     let name_s = match doc.get("name").and_then(Value::as_str) {
         Some(n) => n,
         None => {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code":"BAD_DOC","message": "missing 'name'"}}),
                 json_mode,
             );
-            return 0;
         }
     };
     let name = match ResourceName::new(name_s) {
         Ok(n) => n,
         Err(e) => {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code":"INVALID_NAME","message": format!("{e:?}")}}),
                 json_mode,
             );
-            return 0;
         }
     };
     let kind = doc
@@ -712,29 +788,26 @@ fn run_import(args: &[String], json_mode: bool) -> i32 {
     let resource_id = match doc.get("resource_id").and_then(Value::as_str) {
         Some(id) => nexus_domain::ResourceId(id.to_string()),
         None => {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code":"BAD_DOC","message": "missing 'resource_id'"}}),
                 json_mode,
             );
-            return 0;
         }
     };
     let ads_v = match doc.get("ads").and_then(Value::as_array) {
         Some(a) if !a.is_empty() => a,
         _ => {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code":"BAD_DOC","message": "missing/empty 'ads'"}}),
                 json_mode,
             );
-            return 0;
         }
     };
     let node_dir = crate::node_cli::node_dir();
     let store = match N2Store::open(&node_dir) {
         Ok(s) => s,
         Err(e) => {
-            render(&store_fail(e), json_mode);
-            return 0;
+            return render(&store_fail(e), json_mode);
         }
     };
     let mut imported = 0;
@@ -742,24 +815,21 @@ fn run_import(args: &[String], json_mode: bool) -> i32 {
         let ad = match crate::n2_store::parse_ad(ad_v) {
             Ok(a) => a,
             Err(e) => {
-                render(
+                return render(
                     &json!({"verdict":"FAIL","error":{"code":"BAD_DOC","message": format!("bad ad: {e}")}}),
                     json_mode,
                 );
-                return 0;
             }
         };
         // 一致性：广告的资源必须与文档声明一致（防错配）。
         if ad.resource != resource_id {
-            render(
+            return render(
                 &json!({"verdict":"FAIL","error":{"code":"BAD_DOC","message": "ad resource mismatch"}}),
                 json_mode,
             );
-            return 0;
         }
         if let Err(e) = store.save_ad(&ad) {
-            render(&store_fail(e), json_mode);
-            return 0;
+            return render(&store_fail(e), json_mode);
         }
         imported += 1;
     }
@@ -770,14 +840,12 @@ fn run_import(args: &[String], json_mode: bool) -> i32 {
         resource_id: resource_id.clone(),
         kind: Some(kind),
     }) {
-        render(&store_fail(e), json_mode);
-        return 0;
+        return render(&store_fail(e), json_mode);
     }
     render(
         &json!({"verdict":"PASS","command":"resource import","resource": name_s, "ads": imported}),
         json_mode,
-    );
-    0
+    )
 }
 
 /// `nexus resource` 命令族入口。
@@ -826,7 +894,7 @@ pub fn run_resource(args: &[String], json_mode: bool) -> i32 {
 mod tests {
     use super::*;
     use nexus_domain::ResourceId;
-    use nexus_registry::UsageGrant;
+    use nexus_registry::{ControlFrame, UsageGrant, decode_control_frame, encode_control_frame};
 
     fn temp_node_dir(tag: &str) -> std::path::PathBuf {
         let dir =
@@ -834,6 +902,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn publish_locator_validation_requires_a_data_plane_endpoint() {
+        // P1-13：空列表合法（静态种子 / 本机发布，场景契约）。
+        assert!(validate_locators(&[]).is_ok());
+        // 有数据面端点（无论顺序）→ 合法。
+        assert!(
+            validate_locators(&[
+                "tcp://127.0.0.1:8080".to_string(),
+                "n2adm://10.0.0.2:9443".to_string(),
+            ])
+            .is_ok()
+        );
+        assert!(
+            validate_locators(&[
+                "n2adm://10.0.0.2:9443".to_string(),
+                "tcp://127.0.0.1:8080".to_string(),
+            ])
+            .is_ok()
+        );
+        // 只给准入端点 → 拒绝（准入端点不能当 Service 入口）。
+        assert!(
+            validate_locators(&["n2adm://10.0.0.2:9443".to_string()]).is_err(),
+            "admission-only locator must be rejected"
+        );
     }
 
     #[test]
@@ -850,6 +944,59 @@ mod tests {
         }
         assert!(names.contains(&"dev-svc".to_string()));
         assert!(names.contains(&"internet-access".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1-18：`AUTH_REVOKE` 公告的目标主体来自 grant 表（该资源的全部
+    /// grantee，去重排序），而不是本节点自身——自地址帧永远投不出去。
+    #[test]
+    fn revoke_announcement_targets_come_from_grant_table() {
+        use nexus_auth::{Grant, Principal};
+        use nexus_domain::ResourceOperation;
+
+        let dir = temp_node_dir("grantees");
+        let store = N2Store::open(&dir).unwrap();
+        let rref = ResourceRef::new(
+            WorkspaceId::new(DEFAULT_WORKSPACE),
+            ResourceName::new("svc-x").unwrap(),
+        );
+        let other = ResourceRef::new(
+            WorkspaceId::new(DEFAULT_WORKSPACE),
+            ResourceName::new("svc-y").unwrap(),
+        );
+        let grant = |r: ResourceRef, p: &str, op: ResourceOperation| {
+            Grant::new(r, Principal(p.to_string()), vec![op], None)
+        };
+        store
+            .save_grant(&grant(rref.clone(), "ed25519:b", ResourceOperation::Use))
+            .unwrap();
+        store
+            .save_grant(&grant(rref.clone(), "ed25519:a", ResourceOperation::Use))
+            .unwrap();
+        // 同一主体第二次授权（upsert）→ 去重后只出现一次。
+        store
+            .save_grant(&grant(rref.clone(), "ed25519:a", ResourceOperation::Manage))
+            .unwrap();
+        // 另一资源的 grantee 不得被牵连。
+        store
+            .save_grant(&grant(other.clone(), "ed25519:c", ResourceOperation::Use))
+            .unwrap();
+
+        assert_eq!(
+            grantees_of(&store, &rref),
+            vec!["ed25519:a".to_string(), "ed25519:b".to_string()]
+        );
+        assert_eq!(grantees_of(&store, &other), vec!["ed25519:c".to_string()]);
+
+        // 入队后 outbox 里是**可解码**、且主体正确的帧。
+        let seq = store.queue_auth_revoke(&rref, "ed25519:a").unwrap();
+        let items = store.outbox_list().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0, seq);
+        assert!(matches!(
+            decode_control_frame(&items[0].1),
+            Ok(ControlFrame::AuthRevoke { ref principal, .. }) if principal == "ed25519:a"
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

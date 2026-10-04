@@ -3,10 +3,10 @@
 //! CLI 不再在进程内装配 SDK 来回答 §9 观察命令；而是通过 LocalAPI 向
 //! `nexusd serve` 发起最小 HTTP/1.1 GET，把 daemon 返回的 JSON 原文渲染出来。
 //!
-//! 传输（D8，N2 P0-1）：默认 unix socket（`default_socket_path`）；`--addr`
-//! 切到 TCP loopback。两种传输都要求 bearer token 鉴权
-//!（`Authorization: Bearer <token>`，token 由 daemon/CLI 共享
-//! `token_file_path`，0600）。
+//! 传输（D8，N2 P0-1；P1-15）：默认 unix socket（[`default_socket_path`]），
+//! 该路径无法安全建立时回退 TCP loopback；`--addr` 显式切 TCP。两种传输
+//! 都要求 bearer token 鉴权（`Authorization: Bearer <token>`，token 由
+//! daemon/CLI 共享 `token_file_path`，0600）。
 //!
 //! 职责：
 //! - 把 [`ControlCommand`] 映射到 daemon LocalAPI 路由（无路由则本地合成 UNSUPPORTED）；
@@ -38,15 +38,78 @@ pub enum LocalApiTarget {
     Tcp(String),
 }
 
-/// 默认 unix socket 路径：`$XDG_RUNTIME_DIR/nexus-localapi.sock`，
-/// 未设置时退到 `temp_dir()/nexus-localapi.sock`。
-/// 注意与 `nexusd serve`（无 `--addr`/`--socket` 时）保持一致。
+/// 默认 socket 文件名（daemon 与 CLI 共用；两侧必须一致）。
+const SOCKET_FILE_NAME: &str = "nexus-localapi.sock";
+
+/// 默认 unix socket 路径（P1-15）。`None` = 无法安全建立本机 socket 目标，
+/// 调用方回退 TCP loopback 并打告警（daemon 与 CLI 共用本函数，决策一致）。
+///
+/// - `$XDG_RUNTIME_DIR/nexus-localapi.sock`：XDG 规范运行目录（用户私有）；
+/// - 未设 `XDG_RUNTIME_DIR` 时**不再**退回 `temp_dir()/nexus-localapi.sock`：
+///   该路径可预测且目录世界可写，他人可抢先 bind；CLI 随后连上去就会把
+///   bearer token 发给攻击者的 socket（评审 P1-15）；
+/// - 改为按 uid 分隔的私有目录 `temp_dir()/nexus-<uid>/nexus-localapi.sock`，
+///   目录 0700；若该目录已被他人抢占或无法收紧为 0700 → `None`。
 #[must_use]
-pub fn default_socket_path() -> PathBuf {
-    if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(rt).join("nexus-localapi.sock");
+pub fn default_socket_path() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
+            return Some(PathBuf::from(rt).join(SOCKET_FILE_NAME));
+        }
+        private_runtime_socket_dir().map(|d| d.join(SOCKET_FILE_NAME))
     }
-    std::env::temp_dir().join("nexus-localapi.sock")
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// P1-15：`XDG_RUNTIME_DIR` 缺失时的私有 socket 目录（0700，按 uid 分隔）。
+///
+/// 权限收紧失败即视为"目录不归本用户所有"（chmod 只有 owner 能成功），
+/// 返回 `None`——绝不在他人可控的目录里放 socket。
+#[cfg(unix)]
+fn private_runtime_socket_dir() -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let uid = current_uid()?;
+    let dir = std::env::temp_dir().join(format!("nexus-{uid}"));
+    match std::fs::create_dir(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            eprintln!(
+                "[nexus] WARN: cannot create private socket dir {}: {e}",
+                dir.display()
+            );
+            return None;
+        }
+    }
+    if let Err(e) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
+        eprintln!(
+            "[nexus] WARN: private socket dir {} is not ours (refusing): {e}",
+            dir.display()
+        );
+        return None;
+    }
+    let meta = std::fs::symlink_metadata(&dir).ok()?;
+    if !meta.is_dir() {
+        return None;
+    }
+    Some(dir)
+}
+
+/// 本进程 uid（unix）；取不到则不建立私有目录（宁可退 TCP）。
+#[cfg(unix)]
+fn current_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+
+    let probe = std::env::temp_dir().join(format!(".nexus-uid-{}", std::process::id()));
+    std::fs::write(&probe, b"uid").ok()?;
+    let uid = std::fs::metadata(&probe).ok().map(|m| m.uid());
+    let _ = std::fs::remove_file(&probe);
+    uid
 }
 
 /// 默认传输目标（unix 上为 socket；Windows 上 named pipe 未实现，退 TCP）。
@@ -54,7 +117,10 @@ pub fn default_socket_path() -> PathBuf {
 pub fn default_target() -> LocalApiTarget {
     #[cfg(unix)]
     {
-        LocalApiTarget::Socket(default_socket_path())
+        match default_socket_path() {
+            Some(path) => LocalApiTarget::Socket(path),
+            None => LocalApiTarget::Tcp(DEFAULT_LOCALAPI_ADDR.to_string()),
+        }
     }
     #[cfg(not(unix))]
     {
@@ -615,5 +681,51 @@ mod tests {
         assert!(matches!(default_target(), LocalApiTarget::Socket(_)));
         #[cfg(not(unix))]
         assert!(matches!(default_target(), LocalApiTarget::Tcp(_)));
+    }
+
+    /// P1-15：`XDG_RUNTIME_DIR` 缺失时的回退目录必须 0700 且按 uid 分隔，
+    /// 绝不能回到世界可写、路径可预测的 `temp_dir()/nexus-localapi.sock`
+    /// （他人可抢先 bind，CLI 会把 bearer token 发给攻击者）。
+    #[cfg(unix)]
+    #[test]
+    fn fallback_socket_dir_is_owner_only_and_uid_scoped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = private_runtime_socket_dir().expect("private dir must be establishable");
+        let meta = std::fs::metadata(&dir).unwrap();
+        assert!(meta.is_dir());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        assert!(
+            name.starts_with("nexus-"),
+            "expected uid-scoped dir, got {name}"
+        );
+
+        // uid 探测必须自洽（能取到 uid 才谈得上"按 uid 分隔"）。
+        assert!(current_uid().is_some());
+    }
+
+    /// P1-15：`default_socket_path` 的目标永远在安全命名空间内，
+    /// 且永不返回那个可预测的共享 temp 路径。
+    #[cfg(unix)]
+    #[test]
+    fn socket_path_is_namespaced_and_not_the_shared_temp_socket() {
+        let path = default_socket_path().expect("unix must yield a socket target");
+        assert_eq!(path.file_name().unwrap(), SOCKET_FILE_NAME);
+        assert_ne!(
+            path,
+            std::env::temp_dir().join(SOCKET_FILE_NAME),
+            "must not fall back to the world-writable shared temp socket"
+        );
+        if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
+            assert_eq!(path, PathBuf::from(rt).join(SOCKET_FILE_NAME));
+        } else {
+            assert_eq!(
+                path,
+                private_runtime_socket_dir()
+                    .expect("private dir")
+                    .join(SOCKET_FILE_NAME)
+            );
+        }
     }
 }

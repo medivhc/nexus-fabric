@@ -18,8 +18,8 @@ pub mod advertisement;
 pub mod control_frame;
 
 pub use advertisement::{
-    Discoverability, LocalNameTable, ProviderAdvertisement, RegistryError, StaticProviderEntry,
-    UnavailabilityReason, UsageGrant,
+    CONTROL_LOCATOR_PREFIX, Discoverability, LocalNameTable, ProviderAdvertisement, RegistryError,
+    StaticProviderEntry, UnavailabilityReason, UsageGrant,
 };
 pub use control_frame::{
     AuthenticatedPeer, ChannelError, ControlChannel, ControlFrame, ControlTransport,
