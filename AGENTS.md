@@ -2110,14 +2110,19 @@ nexus-evidence        证据强度 E0–E5、绑定与 STALE 规则、Candidate 
 
 ### 29.1 crate 归属（ownership）
 
-每个 Agent 固定负责域，避免并行任务触碰同一 crate 的文件；`apps/nexus/src/lib.rs` 与
-`MODULE.md` 类共享文件视为高冲突区，改动前先同步。
+每个 Agent 固定负责一个（或多个）域，避免并行任务触碰同一 crate 的文件；`apps/nexus/src/lib.rs`
+与 `MODULE.md` 类共享文件视为高冲突区，改动前先同步。owner 列给出推荐的
+`NEXUS_AGENT` 值（部署时各 Agent 按此设置环境变量即可对齐）；未分配 Agent 的
+crate 一律先归入其依赖关系最近域的 owner，并在表中补记。
 
-| 归属域 | 路径 | 说明 |
+| 归属域（推荐 NEXUS_AGENT） | 路径 | 说明 |
 |---|---|---|
-| Agent A | `crates/nexus-registry/`、`crates/nexus-auth/`、`crates/nexus-domain/` | 目录/发现/授权/领域模型 |
-| Agent B | `crates/nexus-session/`、`crates/nexus-planner/`、`crates/nexus-connectivity/` | 会话/规划/连接 |
-| Agent C | `apps/nexus/`、`apps/nexusd/`、`crates/nexus-storage/`、`crates/nexus-platform-*` | CLI/daemon/持久层/平台层 |
+| 身份与领域（`agent-a`） | `crates/nexus-auth/`、`nexus-registry/`、`nexus-domain/`、`nexus-discovery/`、`nexus-policy/`、`nexus-plugin/`、`nexus-storage/` | 授权/目录/领域模型/发现/策略/插件/持久层 |
+| 会话与调度（`agent-b`） | `crates/nexus-session/`、`nexus-planner/`、`nexus-flow-session/`、`nexus-scheduler/`、`nexus-service/`、`nexus-diagnostics/`、`nexus-connectivity/` | 会话/规划/流会话/调度/服务/诊断/连接管理 |
+| 代理栈（`agent-c`） | `crates/nexus-proxy/`、`nexus-proxy-config/`、`nexus-proxy-transport/`、`nexus-network/`、`nexus-path/`、`nexus-ingress/`、`nexus-dns/`、`nexus-delivery/`、`nexus-projection/`、`nexus-compute/`、`nexus-control-api/`、`nexus-measurement/` | 代理/配置/路由/入口/解析/投递/投影/计算/控制面 |
+| 传输与穿透（`agent-d`） | `crates/nexus-transport/`、`nexus-nat-traversal/`、`nexus-nat-wireup/`、`nexus-nat-quality/`、`nexus-turn/`、`nexus-outbound-shadowsocks/`、`nexus-outbound-trojan/`、`nexus-outbound-vmess/`、`nexus-proto/` | 传输/内网穿透/中继/出站协议/Proto |
+| 平台与基础设施（`agent-e`） | `crates/nexus-platform/`、`nexus-platform-android/`、`nexus-platform-ios/`、`nexus-platform-linux/`、`nexus-platform-macos/`、`nexus-platform-windows/`、`nexus-workspace/`、`nexus-workspace-intel/`、`nexus-fabric/` | 平台适配/工作区/仓储自身 |
+| 组装层（`agent-c`） | `apps/nexus/`、`apps/nexusd/`、`apps/nexus-platform-host/` | CLI/daemon/平台宿主：改动最易冲突，先同步再改 |
 | 工具链 | `engineering/`、`.githooks/`、`.agents/` | harness/hooks/skills（低冲突） |
 | 共享 | `scenarios/`、`policies/`、`*.MODULE.md`、`PRODUCT.md` | 契约文件：冻结先行，改动走 requirement-change + contract marker（§7） |
 
