@@ -101,15 +101,40 @@ fn private_runtime_socket_dir() -> Option<PathBuf> {
 }
 
 /// 本进程 uid（unix）；取不到则不建立私有目录（宁可退 TCP）。
+///
+/// probe 文件名必须"每调用唯一"：此前以 pid 命名，多线程并发首次调用时各线程
+/// 共用同一路径，A 写入后 B 可能先删除，A 的 `metadata` 随即 ENOENT → uid 探测
+/// 偶发失败 → `default_socket_path()` 返回 None → 静默退化为 TCP loopback，
+/// 误触发 P1-15 本意为"无法安全建立 socket"才走的回退分支（且 daemon / CLI
+/// 两侧可能得出不同决策）。加进程内原子序号即可消除该竞态。
 #[cfg(unix)]
 fn current_uid() -> Option<u32> {
     use std::os::unix::fs::MetadataExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    let probe = std::env::temp_dir().join(format!(".nexus-uid-{}", std::process::id()));
-    std::fs::write(&probe, b"uid").ok()?;
-    let uid = std::fs::metadata(&probe).ok().map(|m| m.uid());
+    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let probe = std::env::temp_dir().join(format!(".nexus-uid-{}-{seq}", std::process::id()));
+    // 探测失败必须可诊断（MODULE: Observability）：此前完全静默，回退 TCP 的原因不可见。
+    if let Err(e) = std::fs::write(&probe, b"uid") {
+        eprintln!(
+            "[nexus] WARN: uid probe failed (cannot write {}): {e}",
+            probe.display()
+        );
+        return None;
+    }
+    let uid = match std::fs::metadata(&probe) {
+        Ok(m) => m.uid(),
+        Err(e) => {
+            eprintln!(
+                "[nexus] WARN: uid probe failed (cannot stat {}): {e}",
+                probe.display()
+            );
+            return None;
+        }
+    };
     let _ = std::fs::remove_file(&probe);
-    uid
+    Some(uid)
 }
 
 /// 默认传输目标（unix 上为 socket；Windows 上 named pipe 未实现，退 TCP）。
@@ -681,6 +706,30 @@ mod tests {
         assert!(matches!(default_target(), LocalApiTarget::Socket(_)));
         #[cfg(not(unix))]
         assert!(matches!(default_target(), LocalApiTarget::Tcp(_)));
+    }
+
+    /// 回归：并发 uid 探测不得互相踩 probe 文件。
+    /// 修复前 probe 以 pid 命名，多线程同时调用会互相删除 → uid 探测偶发失败 →
+    /// `default_socket_path()` 返回 None → 误退 TCP loopback（P1-15 回退被误触发）。
+    ///
+    /// 直接并发调用 `current_uid()`：若改为断言 `default_socket_path()`，桌面 /CI
+    /// 环境通常已设 `XDG_RUNTIME_DIR`（本文件 :57 提前返回），根本进不到被修复的
+    /// 路径——测试会静默空转。并断言值全等（不只 Some），确保探测结果一致。
+    #[cfg(unix)]
+    #[test]
+    fn current_uid_is_stable_under_concurrent_probe() {
+        let expected = current_uid().expect("uid must be resolvable on unix");
+        let handles: Vec<_> = (0..8).map(|_| std::thread::spawn(current_uid)).collect();
+        for (i, h) in handles.into_iter().enumerate() {
+            let uid = h.join().expect("probe thread panicked");
+            assert_eq!(
+                uid,
+                Some(expected),
+                "concurrent uid probe failed on thread {i}"
+            );
+        }
+        // 端到端：并发探测下默认目标仍是 unix socket，不误退 TCP。
+        assert!(matches!(default_target(), LocalApiTarget::Socket(_)));
     }
 
     /// P1-15：`XDG_RUNTIME_DIR` 缺失时的回退目录必须 0700 且按 uid 分隔，
