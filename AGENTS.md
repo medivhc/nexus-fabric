@@ -2108,14 +2108,19 @@ nexus-evidence        证据强度 E0–E5、绑定与 STALE 规则、Candidate 
 多个 Agent（豆包会话、CI、远端流程）并行修改同一仓库时的冲突治理。核心：
 **域隔离降冲突概率，命名空间消除证据互踩，rebase 让冲突只在同步时刻暴露一次。**
 
+> 本节的 ownership 表、身份值、同步节奏均为**默认分工建议，不是权限约束**。
+> 机器门禁（§28）不检查"谁改了什么域"；单 Agent 场景可完全忽略本节，
+> 多 Agent 并发的价值在于减少 rebase 冲突，而非限制改动。
+
 ### 29.1 crate 归属（ownership）
 
-每个 Agent 固定负责一个（或多个）域，避免并行任务触碰同一 crate 的文件；`apps/nexus/src/lib.rs`
-与 `MODULE.md` 类共享文件视为高冲突区，改动前先同步。owner 列给出推荐的
-`NEXUS_AGENT` 值（部署时各 Agent 按此设置环境变量即可对齐）；未分配 Agent 的
-crate 一律先归入其依赖关系最近域的 owner，并在表中补记。
+为降低并行冲突概率的默认分工建议：每个 Agent 建议固定负责一个（或多个）域，
+避免并行任务触碰同一 crate 的文件；`apps/nexus/src/lib.rs` 与 `MODULE.md` 类共享
+文件视为高冲突区，改动前先同步。**跨域改动无需申请**，只需留意同步节奏（29.3）。
+owner 列给出推荐的身份值（见 29.2），未分配 Agent 的 crate 先归入其依赖关系
+最近域的 owner，并在表中补记。
 
-| 归属域（推荐 NEXUS_AGENT） | 路径 | 说明 |
+| 归属域（推荐身份值） | 路径 | 说明 |
 |---|---|---|
 | 身份与领域（`agent-a`） | `crates/nexus-auth/`、`nexus-registry/`、`nexus-domain/`、`nexus-discovery/`、`nexus-policy/`、`nexus-plugin/`、`nexus-storage/` | 授权/目录/领域模型/发现/策略/插件/持久层 |
 | 会话与调度（`agent-b`） | `crates/nexus-session/`、`nexus-planner/`、`nexus-flow-session/`、`nexus-scheduler/`、`nexus-service/`、`nexus-diagnostics/`、`nexus-connectivity/` | 会话/规划/流会话/调度/服务/诊断/连接管理 |
@@ -2128,6 +2133,12 @@ crate 一律先归入其依赖关系最近域的 owner，并在表中补记。
 
 ### 29.2 Evidence 命名空间（NEXUS_AGENT）
 
+- 身份值**可任意设置**（`[A-Za-z0-9_-]`，≤32 字符），不必须来自 29.1 表；
+  表的推荐值只是省得想名字。唯一硬约束是**并发时不撞名**（同一时间一个值只
+  被一个运行中的 Agent 使用；撞名会导致证据目录互相覆盖）。
+- 长期协作的 Agent 建议固定一个身份值用到底（可取自表，也可自定后登记入表）；
+  临时并发 Agent 建议用唯一可识别的名字（如 `agent-review-r2`）。
+- 换域不换身份；换身份的唯一理由是撞名或弃用。
 - 每个 Agent 设置环境变量 `NEXUS_AGENT=<name>`（`[A-Za-z0-9_-]`，≤32 字符）。
 - verify 证据目录：`verify-<agent>-<hash>`；review 证据目录：
   `review-<scope>-<agent>-r<n>`。
@@ -2178,7 +2189,7 @@ git worktree add -b feat/c-proxy    ../ws-c     # Agent C
 | 项 | 做法 | 效果 |
 |---|---|---|
 | 目录 | 自己的 worktree（`ws-a` / `ws-b` / …） | 并行编辑不冲突 |
-| 身份 | `export NEXUS_AGENT=<29.1 表中的值>` | 证据写入 `verify-<agent>-*`，互不覆盖、互不误标 STALE |
+| 身份 | `export NEXUS_AGENT=<唯一值>`（推荐取 29.1 表值，也可自定） | 证据写入 `verify-<agent>-*`，互不覆盖、互不误标 STALE |
 | 构建 | `export CARGO_TARGET_DIR=$PWD/target`（每 worktree 独立） | 并行 cargo 无锁等待、不挤同一磁盘 |
 | 凭证 | 每 Agent 独立 PAT，`git -c url."https://oauth2:<token>@github.com/".insteadOf=...` 单命令注入，用后即删 | remote 永不落盘凭据，token 泄露不牵连他人 |
 
