@@ -126,6 +126,10 @@ fn encode_sessions(records: &[SessionRecord]) -> Value {
                 if let Some(reason) = reason {
                     obj.insert("reason".into(), Value::String(reason));
                 }
+                // P1-3：detach 时刻随 record 落盘（缺席 = 未断开）。
+                if let Some(t) = r.detached_at_unix {
+                    obj.insert("detached_at_unix".into(), Value::from(t));
+                }
                 Value::Object(obj)
             })
             .collect(),
@@ -156,6 +160,8 @@ fn decode_sessions(v: &Value) -> Result<Vec<SessionRecord>, String> {
                 // N2 P0-3：sessions.json 暂无 plan_snapshot 字段（P0-4 SessionManager
                 // 落地后写入）；旧记录按 None 读入，不伪造。
                 plan_snapshot: None,
+                // P1-3：旧记录无该字段 → None（向后兼容）。
+                detached_at_unix: item.get("detached_at_unix").and_then(Value::as_u64),
             })
         })
         .collect()
@@ -540,6 +546,7 @@ mod tests {
             phase: LifecyclePhase::Active,
             outcome: TerminalOutcome::Unfinished,
             plan_snapshot: None,
+            detached_at_unix: None,
         }
     }
 
@@ -555,6 +562,7 @@ mod tests {
                 phase: LifecyclePhase::Disposed,
                 outcome: TerminalOutcome::Completed,
                 plan_snapshot: None,
+                detached_at_unix: None,
             })
             .unwrap();
         // upsert 同 id
@@ -564,6 +572,7 @@ mod tests {
                 phase: LifecyclePhase::Disposed,
                 outcome: TerminalOutcome::Cancelled,
                 plan_snapshot: None,
+                detached_at_unix: None,
             })
             .unwrap();
         let records = store.load().unwrap();
@@ -580,6 +589,7 @@ mod tests {
         let mut store = FileSessionRecordStore::new(&dir);
         store
             .save(&SessionRecord {
+                detached_at_unix: None,
                 session: SessionId("s-f".into()),
                 phase: LifecyclePhase::Active,
                 outcome: TerminalOutcome::Failed(NexusError::SessionFailed {

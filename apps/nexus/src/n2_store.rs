@@ -29,7 +29,10 @@ use nexus_domain::{
     ProviderId, ResourceId, ResourceKind, ResourceName, ResourceOperation, ResourceRef,
     ScoreComponent, SessionId, TerminalOutcome, WorkspaceId,
 };
-use nexus_registry::{Discoverability, ProviderAdvertisement, UnavailabilityReason, UsageGrant};
+use nexus_registry::{
+    ControlFrame, Discoverability, ProviderAdvertisement, UnavailabilityReason, UsageGrant,
+    decode_control_frame, encode_control_frame,
+};
 use nexus_session::{SessionRecord, SessionRecordStore};
 use nexus_storage::FileKvStore;
 use serde_json::{Map, Value, json};
@@ -87,6 +90,8 @@ impl N2Store {
     }
 
     /// journal 重放（§15：审计轨迹；返回原始 payload）。
+    ///
+    /// 撕裂尾部保持 fail-closed（查询/取证路径不应静默丢数据）。
     pub fn replay_journal(&self) -> Result<Vec<Vec<u8>>, String> {
         self.kv
             .journal_replay()
@@ -472,7 +477,8 @@ fn parse_plan_snapshot(v: &Value) -> Result<PlanSnapshot, String> {
     })
 }
 
-/// SessionRecord → JSON（durable v1；`plan_snapshot` 全量内嵌，D3）。
+/// SessionRecord → JSON（durable v1；`plan_snapshot` 全量内嵌，D3；
+/// `detached_at_unix` 为 P1-3 新增的可选字段）。
 fn encode_session_record(r: &SessionRecord) -> Value {
     let (outcome, reason) = outcome_to_json(&r.outcome);
     let mut obj = Map::new();
@@ -490,6 +496,10 @@ fn encode_session_record(r: &SessionRecord) -> Value {
             .map(encode_plan_snapshot)
             .unwrap_or(Value::Null),
     );
+    // P1-3：detach 时刻必须跨重启存活（缺席 = 未断开，向后兼容旧记录）。
+    if let Some(t) = r.detached_at_unix {
+        obj.insert("detached_at_unix".into(), json!(t));
+    }
     Value::Object(obj)
 }
 
@@ -512,6 +522,8 @@ fn decode_session_record(v: &Value) -> Result<SessionRecord, String> {
             .filter(|x| !x.is_null())
             .map(parse_plan_snapshot)
             .transpose()?,
+        // 旧记录无该字段 → None（向后兼容，不伪造断开时刻）。
+        detached_at_unix: v.get("detached_at_unix").and_then(Value::as_u64),
     })
 }
 
@@ -560,6 +572,36 @@ impl SessionRecordStore for KvSessionRecordStore {
     }
 
     fn save(&mut self, record: &SessionRecord) -> Result<(), String> {
+        // P1-1：终态 CAS（§14 Exactly-One Terminal Outcome 跨进程）。
+        // 无 CAS 时两个进程先后 `commit_outcome` 会互相覆盖——先到的终态被
+        // 后到的改写，"谁先提交"不可证。规则：**先到的终态获胜**：
+        // - 已有记录无终态 → 允许（首次提交 / 未终态推进）；
+        // - 已有记录有终态且与来件不同 → 拒绝（冲突，fail-closed）；
+        // - 已有记录有终态且与来件相同 → 允许（幂等重放，如 reconcile 的
+        //   cleanup 回写、reconnect 后的重复 persist）。
+        // - F2: 已有记录有终态、来件无终态 → 拒绝（`session seed` 复活攻击：
+        //   已 Completed/Failed/Cancelled 的会话不能被静默改回 Active）。
+        if let Some(existing) = self.current_record(&record.session)? {
+            let existing_terminal = terminal_outcome_code(&existing.outcome);
+            let incoming_terminal = terminal_outcome_code(&record.outcome);
+            if let Some(have) = existing_terminal {
+                match incoming_terminal {
+                    Some(want) if want == have => {} // 幂等重放
+                    Some(want) => {
+                        return Err(format!(
+                            "terminal outcome conflict for {}: already committed '{have}', refusing to overwrite with '{want}'",
+                            record.session.0
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "terminal outcome already committed for {}: '{have}', refusing to resurrect as non-terminal",
+                            record.session.0
+                        ));
+                    }
+                }
+            }
+        }
         let data = serde_json::to_string(&encode_session_record(record))
             .map_err(|e| format!("encode session record: {e}"))?;
         let key = session_key(&record.session);
@@ -573,6 +615,37 @@ impl SessionRecordStore for KvSessionRecordStore {
             .journal_append(&payload)
             .map_err(|e| format!("journal session {}: {e}", record.session.0))?;
         Ok(())
+    }
+}
+
+impl KvSessionRecordStore {
+    /// 读取某会话的当前持久记录（CAS 读口；不存在 → `None`）。
+    fn current_record(&self, id: &SessionId) -> Result<Option<SessionRecord>, String> {
+        let key = session_key(id);
+        let Some(bytes) = self
+            .kv
+            .get(&key)
+            .map_err(|e| format!("read session {} for cas: {e}", id.0))?
+        else {
+            return Ok(None);
+        };
+        let text =
+            String::from_utf8(bytes).map_err(|e| format!("session {} not utf-8: {e}", id.0))?;
+        let v: Value =
+            serde_json::from_str(&text).map_err(|e| format!("parse session {}: {e}", id.0))?;
+        decode_session_record(&v).map(Some)
+    }
+}
+
+/// 终态判定结果的稳定标签（`None` = 未达终态）。
+///
+/// P1-1 CAS 用：同一 session 的两个不同终态标签 → 冲突。
+fn terminal_outcome_code(outcome: &nexus_domain::TerminalOutcome) -> Option<&'static str> {
+    match outcome {
+        nexus_domain::TerminalOutcome::Unfinished => None,
+        nexus_domain::TerminalOutcome::Completed => Some("completed"),
+        nexus_domain::TerminalOutcome::Cancelled => Some("cancelled"),
+        nexus_domain::TerminalOutcome::Failed(_) => Some("failed"),
     }
 }
 
@@ -753,9 +826,41 @@ impl N2Store {
         Ok(())
     }
 
-    /// 删除一条 grant（物理删除；删除后判定为 `NoSuchGrant`）。
+    /// 显式撤销一条 grant（tombstone；P1-14）。
     ///
-    /// 幂等：不存在 → `Ok(false)`。
+    /// 不物理删除：保留条目并置 `revoked=true`，后续授权判定得到
+    /// `Deny(Revoked)` 而非 `NoSuchGrant` —— 审计里"撤销过"与"从未授权"
+    /// 必须可区分（D6 结构化 Deny 集合）。
+    ///
+    /// 幂等：不存在 → `Ok(false)`；已撤销 → `Ok(true)`（不再改写）。
+    pub fn revoke_grant(
+        &self,
+        resource: &nexus_domain::ResourceRef,
+        principal: &nexus_auth::Principal,
+    ) -> Result<bool, String> {
+        let key = grant_key(resource, principal);
+        let Some(bytes) = self
+            .kv
+            .get(&key)
+            .map_err(|e| format!("read grant for revoke: {e}"))?
+        else {
+            return Ok(false);
+        };
+        let text = String::from_utf8(bytes).map_err(|e| format!("grant not utf-8: {e}"))?;
+        let mut value: Value =
+            serde_json::from_str(&text).map_err(|e| format!("parse grant: {e}"))?;
+        if value.get("revoked").and_then(Value::as_bool) == Some(true) {
+            return Ok(true);
+        }
+        value["revoked"] = Value::Bool(true);
+        let data = serde_json::to_string(&value).map_err(|e| format!("encode grant: {e}"))?;
+        self.kv
+            .put(&key, data.as_bytes())
+            .map_err(|e| format!("put revoked grant: {e}"))?;
+        Ok(true)
+    }
+
+    /// 物理删除一条 grant（`nexus grant del` 的 purge 路径，P1-14）。
     pub fn delete_grant(
         &self,
         resource: &nexus_domain::ResourceRef,
@@ -771,6 +876,24 @@ impl N2Store {
             .delete(&key)
             .map_err(|e| format!("delete grant: {e}"))?;
         Ok(existed)
+    }
+
+    /// 撤销某资源的全部 grant（`resource revoke` 的授权侧后果，P1-14）。
+    ///
+    /// 返回被撤销的条数。资源撤销后，对该资源的所有已授权主体都必须立刻重新判定，
+    /// 否则"撤销资源"只撤广告、grant 仍在——下一跳仍然可用。
+    pub fn revoke_all_grants_for(
+        &self,
+        resource: &nexus_domain::ResourceRef,
+    ) -> Result<usize, String> {
+        let mut revoked = 0usize;
+        for grant in self.load_grants()? {
+            if &grant.resource == resource && !grant.revoked {
+                self.revoke_grant(&grant.resource, &grant.principal)?;
+                revoked += 1;
+            }
+        }
+        Ok(revoked)
     }
 
     /// 加载全部 grant。
@@ -1228,6 +1351,51 @@ impl N2Store {
 }
 
 // ============================================================================
+// 租约过期回收（P1-21）
+// ============================================================================
+
+const LEASE_PREFIX: &str = "n2/lease/";
+
+impl N2Store {
+    /// 过期租约回收（P1-21）：删除 `expires_at_unix <= now` 的租约记录，返回
+    /// 回收条数。幂等；无该字段或记录损坏的条目跳过（不阻塞其余回收）。
+    ///
+    /// P0 事实：Session 同步 establish 后即 `Completed`，不存在需要续约的
+    /// 长连接，因此 `LEASE_RENEW` 帧在 P0 无生产者。本方法负责另一半语义
+    /// ——`n2/lease/*` 不再"只写不删"，长期运行的 provider 通过 boot/
+    /// 周期回收收敛其无界增长。
+    pub fn prune_expired_leases(&self, now: u64) -> Result<usize, String> {
+        let keys = self.kv.list().map_err(|e| format!("list leases: {e}"))?;
+        let mut pruned = 0usize;
+        for key in keys {
+            let Some(session) = key.strip_prefix(LEASE_PREFIX) else {
+                continue;
+            };
+            if session.is_empty() {
+                continue;
+            }
+            let Some(bytes) = self.kv.get(&key).map_err(|e| format!("get lease: {e}"))? else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
+                continue;
+            };
+            let expired = v
+                .get("expires_at_unix")
+                .and_then(Value::as_u64)
+                .is_some_and(|t| t <= now);
+            if expired {
+                self.kv
+                    .delete(&key)
+                    .map_err(|e| format!("delete lease: {e}"))?;
+                pruned += 1;
+            }
+        }
+        Ok(pruned)
+    }
+}
+
+// ============================================================================
 // 控制帧 outbox（revoke 触发的 AUTH_REVOKE 先落盘排队）
 // ============================================================================
 
@@ -1244,7 +1412,6 @@ fn hex_decode_bytes(s: &str, expect_len: usize, what: &str) -> Result<Vec<u8>, S
 }
 
 const OUTBOX_PREFIX: &str = "n2/outbox/";
-
 impl N2Store {
     /// 控制帧入队（`seq` 由调用方单调递增；P0-5 发送后删除）。
     pub fn outbox_push(&self, seq: u64, frame_bytes: &[u8]) -> Result<(), String> {
@@ -1280,6 +1447,62 @@ impl N2Store {
     /// outbox 下一条 seq（当前最大＋1）。
     pub fn outbox_next_seq(&self) -> Result<u64, String> {
         Ok(self.outbox_list()?.last().map(|(s, _)| s + 1).unwrap_or(0))
+    }
+
+    /// 出队（P1-18：帧**已成功写出**后由出站泵调用）。
+    ///
+    /// 只在投递写成功后调用，因此语义是 at-least-once：写成功但进程在删除前
+    /// 崩溃 → 下次连接重投同一帧（公告本身幂等，重复投递无害）。
+    /// 广播语义的 exactly-once 需要请求方回执，P0 无该往返，故不虚构。
+    pub fn outbox_delete(&self, seq: u64) -> Result<(), String> {
+        let key = format!("{OUTBOX_PREFIX}{seq:020}");
+        self.kv
+            .delete(&key)
+            .map_err(|e| format!("outbox delete {seq}: {e}"))
+    }
+
+    /// 入队一条控制帧（P1-18 出站泵的唯一生产入口）。
+    ///
+    /// 入队前做一次编解码 roundtrip 自检：队列里只允许出现**可投递**的帧，
+    /// 否则出站泵会永远跳过它（重新变成"只写不排"）。
+    fn queue_frame(&self, frame: &ControlFrame) -> Result<u64, String> {
+        let bytes = encode_control_frame(frame).map_err(|e| format!("encode frame: {e}"))?;
+        let back = decode_control_frame(&bytes).map_err(|e| format!("decode frame: {e}"))?;
+        if std::mem::discriminant(&back) != std::mem::discriminant(frame) {
+            return Err("frame roundtrip mismatch".to_string());
+        }
+        let seq = self.outbox_next_seq()?;
+        self.outbox_push(seq, &bytes)?;
+        Ok(seq)
+    }
+
+    /// 排队一条 `AUTH_REVOKE` 公告（D8 提供方→请求方；P1-18 生产者：
+    /// `resource revoke` 逐 grantee、`grant del` 逐被撤销主体）。返回 seq。
+    pub fn queue_auth_revoke(
+        &self,
+        resource: &ResourceRef,
+        principal: &str,
+    ) -> Result<u64, String> {
+        self.queue_frame(&ControlFrame::AuthRevoke {
+            resource: resource.clone(),
+            principal: principal.to_string(),
+        })
+    }
+
+    /// 排队一条 `AUTH_GRANT` 公告（`grant add`；与 `queue_auth_revoke` 对称，
+    /// 修掉评审 P1-18"AUTH_GRANT 帧类型零发送"）。返回 seq。
+    pub fn queue_auth_grant(&self, grant: &nexus_auth::Grant) -> Result<u64, String> {
+        self.queue_frame(&ControlFrame::AuthGrant {
+            announcement: nexus_registry::GrantAnnouncement {
+                resource: grant.resource.clone(),
+                principal: grant.principal.0.clone(),
+                grant: nexus_registry::UsageGrant {
+                    principal: grant.principal.0.clone(),
+                    operations: grant.operations.clone(),
+                    not_after_secs: grant.not_after,
+                },
+            },
+        })
     }
 }
 
@@ -1373,6 +1596,7 @@ mod tests {
         let store = N2Store::open(&dir).unwrap();
         let mut sessions = store.sessions();
         let record = SessionRecord {
+            detached_at_unix: None,
             session: SessionId("sess-abc".into()),
             phase: LifecyclePhase::Active,
             outcome: TerminalOutcome::Unfinished,
@@ -1390,12 +1614,44 @@ mod tests {
     }
 
     #[test]
+    fn session_record_roundtrips_detached_at_unix() {
+        // P1-3：detach 时刻必须跨重启存活，否则冷启动 sweep 永不命中。
+        let dir = temp_dir("sess-det");
+        let store = N2Store::open(&dir).unwrap();
+        let mut sessions = store.sessions();
+        sessions
+            .save(&SessionRecord {
+                session: SessionId("sess-det-1".into()),
+                phase: LifecyclePhase::Active,
+                outcome: TerminalOutcome::Unfinished,
+                plan_snapshot: None,
+                detached_at_unix: Some(1_700_000_000),
+            })
+            .unwrap();
+        let loaded = sessions.load().unwrap();
+        assert_eq!(loaded[0].detached_at_unix, Some(1_700_000_000));
+        // 旧记录（无该字段）→ None（向后兼容，不伪造断开时刻）。
+        store
+            .kv()
+            .put(
+                "n2/session/sess-legacy-1",
+                br#"{"version":1,"session":"sess-legacy-1","phase":"Active","outcome":"Unfinished","plan_snapshot":null}"#,
+            )
+            .unwrap();
+        let all = sessions.load().unwrap();
+        let legacy = all.iter().find(|r| r.session.0 == "sess-legacy-1").unwrap();
+        assert_eq!(legacy.detached_at_unix, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn session_save_appends_journal() {
         let dir = temp_dir("sess-j");
         let store = N2Store::open(&dir).unwrap();
         let mut sessions = store.sessions();
         sessions
             .save(&SessionRecord {
+                detached_at_unix: None,
                 session: SessionId("sess-j1".into()),
                 phase: LifecyclePhase::Active,
                 outcome: TerminalOutcome::Unfinished,
@@ -1594,6 +1850,73 @@ mod tests {
         store.upsert_name(entry("a")).unwrap();
         let names = store.load_names().unwrap();
         assert_eq!(names.iter().filter(|e| e.name.as_str() == "a").count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn outbox_delete_drains_only_targeted_frame() {
+        // P1-18：投递成功后按 seq 出队；删不存在的 seq 幂等，不影响其余帧。
+        let dir = temp_dir("outbox-del");
+        let store = N2Store::open(&dir).unwrap();
+        store.outbox_push(0, b"frame-0").unwrap();
+        store.outbox_push(1, b"frame-1").unwrap();
+        store.outbox_delete(0).unwrap();
+        let items = store.outbox_list().unwrap();
+        assert_eq!(items, vec![(1, b"frame-1".to_vec())]);
+        store.outbox_delete(0).unwrap(); // 幂等
+        store.outbox_delete(9).unwrap(); // 不存在 → 同样无副作用
+        assert_eq!(store.outbox_list().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_expired_leases_removes_only_expired() {
+        // P1-21：租约不再"只写不删"——只回收 `expires_at_unix <= now` 的记录，
+        // 未过期/缺字段/非租约键全部保留（幂等）。
+        let dir = temp_dir("leaseprune");
+        let store = N2Store::open(&dir).unwrap();
+        let put = |key: &str, body: &str| {
+            store.kv().put(key, body.as_bytes()).unwrap();
+        };
+        put(
+            "n2/lease/sess-old",
+            r#"{"session":"sess-old","expires_at_unix":100}"#,
+        );
+        put(
+            "n2/lease/sess-live",
+            r#"{"session":"sess-live","expires_at_unix":9000}"#,
+        );
+        put(
+            "n2/lease/sess-missing-expiry",
+            r#"{"session":"sess-missing-expiry"}"#,
+        );
+        put("n2/lease/", "not-a-record");
+        put("n2/outbox/00000000000000000000", "outbox-frame");
+        assert_eq!(store.prune_expired_leases(1000).unwrap(), 1);
+        assert!(store.kv().get("n2/lease/sess-old").unwrap().is_none());
+        assert!(store.kv().get("n2/lease/sess-live").unwrap().is_some());
+        assert!(
+            store
+                .kv()
+                .get("n2/lease/sess-missing-expiry")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .kv()
+                .get("n2/outbox/00000000000000000000")
+                .unwrap()
+                .is_some()
+        );
+        // 幂等：重复回收无过期项 → 0。
+        assert_eq!(store.prune_expired_leases(1000).unwrap(), 0);
+        // 边界：`<= now` 到期。
+        put(
+            "n2/lease/sess-edge",
+            r#"{"session":"sess-edge","expires_at_unix":1000}"#,
+        );
+        assert_eq!(store.prune_expired_leases(1000).unwrap(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

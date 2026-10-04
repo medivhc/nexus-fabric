@@ -15,6 +15,17 @@ requirement = "PRODUCT.md#16-n2-resource-access"
 # E5 说明：本场景需双真机（xc-pc-linux → NU-SH-1217）；B 机下线为独立外部
 # 动作，A 机侧的观察即为外部观察。E4 前置可在 P0-5 用本机 fake-provider
 # 先行验证形状，本文件冻结的是真机语义。
+# E4 夹具（P0-6 / P1-8）：harness 在执行 [when].command 前按序跑 fixture（幂等，
+# 全部 exit 0 才跑场景命令）。`svc-on-b` 不在 SEED 中，干净目录下 resolve 阶段
+# 即 NOT_FOUND，到不了 PROVIDER_UNREACHABLE。此处发布该资源并把准入端点
+# 指向一个必然拨号不通的地址（127.0.0.1:1），在本机复现"B 机下线"这一事实；
+# `error.reason=ProviderOffline` 的语义与真机一致。E5 真跨机路径仍以下方
+# topology 描述为准（B 机下线为独立外部动作）。
+# 冻结期望未动——夹具只准备 E4 环境。
+fixture = [
+  "cargo run --quiet -p nexus -- node init --json",
+  "cargo run --quiet -p nexus -- resource publish --name svc-on-b --kind service --locator 127.0.0.1:8080 --locator n2adm://127.0.0.1:1 --json",
+]
 topology = "xc-pc-linux（请求方 A）→ NU-SH-1217（提供方 B，真跨机，非 loopback）"
 provider = "node-b"
 provider_state = "offline（B 机 nexusd 已停 / 网络不可达）"

@@ -886,6 +886,10 @@ fn strip_line_code(line: &str, block_depth: &mut usize) -> String {
 
 /// 单行判定（纯函数，可单测）：剥离注释/字符串后的代码行是否为
 /// "资源类型专属分支"——同时含变体引用与分支 token。
+///
+/// N2 P1-6：判定输入是**逻辑行**（跨行拼接后的整条语句），不是物理行——
+/// `matches!(kind,\n ResourceKind::Service)` 与 `if let Some(x) = ...\n { k == ResourceKind::Service }`
+/// 按物理行逐行判定会漏掉（`matches!` 与变体引用不在同一行）。
 fn is_specialized_branch(code_line: &str, variants: &[String]) -> bool {
     let has_variant = variants.iter().any(|var| {
         contains_variant_ref(code_line, "ResourceKind", var)
@@ -899,12 +903,103 @@ fn is_specialized_branch(code_line: &str, variants: &[String]) -> bool {
         || ((code_line.contains("if ") || code_line.contains("while "))
             && (code_line.contains("==") || code_line.contains("!=")))
 }
-/// N2 资源类型中立门禁（P0-6，完成标志 #6）：四 crate 零资源类型专属分支。
+
+/// 逻辑行聚合：把跨行的 Rust 语句拼成一条（括号/花括号未闭合则继续拼接）。
+///
+/// N1-p03 回归：原实现逐物理行判定，`matches!(kind,\n ResourceKind::Service)`
+/// 这类写法两个 token 分处两行 → 判定漏掉（门禁可被绕过）。这里按分隔符配平
+/// 把语句拼起来再判定。上限 `MAX_LOGICAL_LINE` 防病态输入。
+const MAX_LOGICAL_LINE: usize = 8 * 1024;
+
+/// 语句分隔符增量表（成对闭合；只统计代码部分，字符串/注释已在剥离时处理）。
+fn logical_line_balance(fragment: &str) -> i64 {
+    let mut depth = 0i64;
+    for c in fragment.chars() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+    }
+    depth
+}
+
+/// 一个逻辑行覆盖的物理行区间（1-based，闭区间）。
+///
+/// 变体引用与分支 token 可能分处区间内不同行（`matches!(kind,` +
+/// `ResourceKind::Service)`），因此 allow 的行号匹配按**区间**判定，
+/// 而不是只看起始行。
+type LineSpan = (usize, usize);
+
+/// 把已剥离注释/字符串的代码行聚合为逻辑行（纯函数，可单测）。
+///
+/// 切分规则（N2 P1-6）：一行在"语句结束"时切出——以 `;` / `}` 收尾，或以
+/// `,` / `{` 收尾且该行没有打开新的括号层。分号行立即切出，因此行号归属与
+/// 物理行一致（allow 才能钉到行号）；只有"未闭合的跨行语句"（如
+/// `matches!(kind,`）才会与后续行拼接——那正是原实现漏判的形态。
+///
+/// 返回 `(行区间, 拼接后的代码)`。
+fn logical_lines<'a>(code_lines: impl IntoIterator<Item = &'a str>) -> Vec<(LineSpan, String)> {
+    let mut out: Vec<(LineSpan, String)> = Vec::new();
+    let mut start_line = 0usize;
+    let mut buffer = String::new();
+    for (idx, line) in code_lines.into_iter().enumerate() {
+        let trimmed = line.trim();
+        if buffer.is_empty() {
+            if trimmed.is_empty() {
+                continue;
+            }
+            start_line = idx + 1;
+        } else {
+            buffer.push(' ');
+        }
+        buffer.push_str(trimmed);
+        // F1 fix: balance must be computed on the accumulated buffer, not the
+        // current physical line. Otherwise rustfmt's one-arg-per-line style
+        // (e.g. `matches!(\n kind,\n ResourceKind::Service,\n);`) gets split
+        // into separate logical lines, and the `matches!`/variant pairing is
+        // never seen together -> bypass.
+        let closes = logical_line_balance(&buffer) <= 0;
+        let ends = trimmed.ends_with(';')
+            || trimmed.ends_with('}')
+            || (closes && (trimmed.ends_with(',') || trimmed.ends_with('{')));
+        if ends || buffer.len() > MAX_LOGICAL_LINE {
+            out.push(((start_line, idx + 1), std::mem::take(&mut buffer)));
+        }
+    }
+    if !buffer.is_empty() {
+        out.push(((start_line, usize::MAX), buffer));
+    }
+    out
+}
+
+/// 允许条目（`file` ＋ 精确 `line` ＋ `contains`；N2 P1-6）。
+///
+/// `line` 必填——只有"文件＋子串"的 allow 会静默放行同一文件里新增的同子串
+/// 行为分叉（例如在 `Self::Service =>` 旁边再加一个 `Self::Service =>` 分支）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AllowEntry {
+    file: String,
+    line: usize,
+    contains: String,
+}
+
+/// 判定某条违规是否被 allow 覆盖（行号落在逻辑行区间内 ＋ 内容匹配）。
+fn allow_covers(allow: &[AllowEntry], file: &str, span: LineSpan, code: &str) -> bool {
+    allow.iter().any(|a| {
+        a.file == file && a.line >= span.0 && a.line <= span.1 && code.contains(&a.contains)
+    })
+}
+
+/// N2 资源类型中立门禁（P0-6，完成标志 #6；N2 P1-5/P1-6）。
 ///
 /// 扫描 `policies/architecture.toml [resource_kind_neutrality]` 声明的 crate 的
 /// `src/**/*.rs`；flag 同时含"变体引用"（`ResourceKind::V` / `Self::V`，词边界）
-/// 与"分支 token"（`=>` / `matches!` / `if`+`==`/`!=`）的代码行；命中 allow
-/// 列表的除外。fail-closed：policy 缺失/字段缺失 → FAIL。
+/// 与"分支 token"（`=>` / `matches!` / `if`+`==`/`!=`）的**逻辑行**；命中 allow
+/// 列表（精确到行号）的除外。
+///
+/// fail-closed：policy 缺失/字段缺失 → FAIL；**crate 目录不存在或零 `.rs`
+/// 文件 → FAIL**（P1-6：写错 crate 名曾得到"4 crate(s), 0 file(s): PASS"）。
 pub fn resource_kind_neutrality_gate(config: &Config) -> Gate {
     const GATE: &str = "resource-type-neutrality";
     let policy = config.policies_dir.join("architecture.toml");
@@ -945,7 +1040,8 @@ pub fn resource_kind_neutrality_gate(config: &Config) -> Gate {
             "[resource_kind_neutrality] must declare non-empty crates + variants (fail-closed)",
         );
     }
-    let allows: Vec<(String, String)> = section
+    let mut allow_errors: Vec<String> = Vec::new();
+    let allows: Vec<AllowEntry> = section
         .get("allow")
         .and_then(toml::Value::as_array)
         .map(|a| {
@@ -953,17 +1049,46 @@ pub fn resource_kind_neutrality_gate(config: &Config) -> Gate {
                 .filter_map(|e| {
                     let file = e.get("file")?.as_str()?.to_string();
                     let contains = e.get("contains")?.as_str()?.to_string();
-                    Some((file, contains))
+                    // P1-6：`line` 必填（缺失即 fail-closed）。
+                    let Some(line) = e.get("line").and_then(toml::Value::as_integer) else {
+                        allow_errors.push(format!(
+                            "allow entry for {file} ({contains}) is missing 'line'; sub-string-only allow silently permits new branches (P1-6)"
+                        ));
+                        return None;
+                    };
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    Some(AllowEntry {
+                        file,
+                        line: line as usize,
+                        contains,
+                    })
                 })
                 .collect()
         })
         .unwrap_or_default();
+    if !allow_errors.is_empty() {
+        return Gate::fail(
+            GATE,
+            &format!(
+                "allow list invalid (fail-closed):\n{}",
+                allow_errors.join("\n")
+            ),
+        );
+    }
     let repo_root = config.policies_dir.parent().unwrap_or(&config.policies_dir);
 
     let mut violations: Vec<String> = Vec::new();
+    let mut missing_crates: Vec<String> = Vec::new();
     let mut scanned_files = 0usize;
     for krate in &crates {
-        for f in rs_files_under(&config.crates_dir.join(krate).join("src")) {
+        let src_dir = config.crates_dir.join(krate).join("src");
+        let files = rs_files_under(&src_dir);
+        // P1-6：crate 名写错 / 目录缺失 → FAIL，绝不"0 file(s): PASS"。
+        if files.is_empty() {
+            missing_crates.push(format!("{krate} (no .rs under {})", src_dir.display()));
+            continue;
+        }
+        for f in files {
             scanned_files += 1;
             let text = match std::fs::read_to_string(&f) {
                 Ok(t) => t,
@@ -977,25 +1102,40 @@ pub fn resource_kind_neutrality_gate(config: &Config) -> Gate {
                 .map(|p| p.to_string_lossy().replace('\\', "/"))
                 .unwrap_or_else(|_| f.display().to_string());
             let mut block_depth = 0usize;
-            for (idx, line) in text.lines().enumerate() {
-                let code = strip_line_code(line, &mut block_depth);
-                if !is_specialized_branch(&code, &variants) {
+            let stripped: Vec<String> = text
+                .lines()
+                .map(|line| strip_line_code(line, &mut block_depth))
+                .collect();
+            for (span, logical) in logical_lines(stripped.iter().map(String::as_str)) {
+                if !is_specialized_branch(&logical, &variants) {
                     continue;
                 }
-                let allowed = allows
-                    .iter()
-                    .any(|(file, contains)| *file == rel && code.contains(contains));
-                if !allowed {
-                    violations.push(format!("{rel}:{}: {}", idx + 1, code.trim()));
+                if allow_covers(&allows, &rel, span, &logical) {
+                    continue;
                 }
+                let where_ = if span.0 == span.1 {
+                    format!("{}", span.0)
+                } else {
+                    format!("{}-{}", span.0, span.1)
+                };
+                violations.push(format!("{rel}:{where_}: {logical}"));
             }
         }
+    }
+    if !missing_crates.is_empty() {
+        return Gate::fail(
+            GATE,
+            &format!(
+                "fail-closed: declared crate(s) have no scannable src/**/*.rs: {}",
+                missing_crates.join(", ")
+            ),
+        );
     }
     if violations.is_empty() {
         Gate::ok(
             GATE,
             &format!(
-                "{} crate(s), {scanned_files} file(s): no resource-type-specialized branches",
+                "{} crate(s) [{crates:?}], {scanned_files} file(s): no resource-type-specialized branches",
                 crates.len()
             ),
         )
@@ -1170,11 +1310,286 @@ mod tests {
 
     #[test]
     fn resource_kind_neutrality_gate_passes_on_current_tree() {
-        // 当前四 crate 无资源类型专属分支（仅 as_str 规范序列化，已 allow）。
+        // 当前契约四 crate 无资源类型专属分支（仅 as_str 规范序列化，已 allow）。
         let repo = crate::env::Repo::discover().expect("repo must be discoverable");
         let config = crate::config::Config::load(&repo).expect("config must load");
         let g = resource_kind_neutrality_gate(&config);
         assert_eq!(g.verdict, "PASS", "gate failed: {}", g.detail);
-        assert!(g.detail.contains("4 crate(s)"), "{}", g.detail);
+        // P1-5：断言具体 crate 名（只验数量＝侥幸通过）。
+        for expected in [
+            "nexus-registry",
+            "nexus-planner",
+            "nexus-session",
+            "nexus-auth",
+        ] {
+            assert!(
+                g.detail.contains(expected),
+                "gate must prove coverage of {expected}: {}",
+                g.detail
+            );
+        }
+        assert!(!g.detail.contains("0 file(s)"), "{}", g.detail);
+    }
+
+    /// P1-5：`policies/architecture.toml` 的 crate 集合必须与
+    /// `PRODUCT.md` §16.4-6 字面列出的"四 crate"一致（policy↔契约同源）。
+    #[test]
+    fn policy_crates_match_product_contract() {
+        let repo = Repo::discover().expect("repo must be discoverable");
+        let config = Config::load(&repo).expect("config must load");
+        let text = std::fs::read_to_string(config.policies_dir.join("architecture.toml")).unwrap();
+        let v: toml::Value = toml::from_str(&text).expect("architecture.toml parses");
+        let policy_crates: Vec<String> = v["resource_kind_neutrality"]["crates"]
+            .as_array()
+            .expect("crates declared")
+            .iter()
+            .map(|x| x.as_str().expect("crate is string").to_string())
+            .collect();
+
+        let product = std::fs::read_to_string(repo.resolve("PRODUCT.md")).unwrap();
+        let at = product
+            .find("四 crate 架构门禁通过")
+            .expect("PRODUCT.md §16.4-6 anchor present");
+        let seg = &product[at..];
+        let end = seg
+            .find("源码零资源类型专属分支")
+            .expect("PRODUCT.md §16.4-6 end anchor present");
+        let contract: Vec<String> = seg[..end]
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|s| s.starts_with("nexus-"))
+            .map(str::to_string)
+            .collect();
+
+        assert_eq!(
+            policy_crates, contract,
+            "policy crates must equal the PRODUCT.md §16.4-6 contract set"
+        );
+        assert_eq!(contract.len(), 4, "contract says exactly four crates");
+    }
+
+    // --- N2 P1-6：已知绕过样例必须被 flag（元测试） ---
+
+    /// 判定"逻辑行"上的分支（复用门禁内网，纯函数）。
+    fn flagged(lines: &[&str], variants: &[String]) -> Vec<String> {
+        logical_lines(lines.iter().copied())
+            .into_iter()
+            .filter(|(_, l)| is_specialized_branch(l, variants))
+            .map(|(span, l)| format!("{}-{}: {l}", span.0, span.1))
+            .collect()
+    }
+
+    fn n2_variants() -> Vec<String> {
+        ["Network", "Service", "Workspace", "Compute", "Device"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn known_bypass_samples_are_flagged() {
+        // 元测试（P1-6）：这些写法在"逐物理行"实现下全部漏过，逻辑行实现必须 flag。
+        let variants = n2_variants();
+        let bypasses: Vec<Vec<&str>> = vec![
+            // `matches!` 与变体引用分处两行。
+            vec!["let b = matches!(kind,", "    ResourceKind::Service);"],
+            // match 分支跨行。
+            vec![
+                "match kind {",
+                "    ResourceKind::Compute => do_it(),",
+                "    _ => {}",
+                "}",
+            ],
+            // `if` 条件跨行。
+            vec!["if kind", "    == ResourceKind::Network", "{ do_it(); }"],
+            // 同一文件新增的第二条同子串分支（非 allow 行）。
+            vec!["        Self::Service => \"other\","],
+            // F1: rustfmt 逐行参数风格（每行一个参数）。
+            vec![
+                "let b = matches!(",
+                "    kind,",
+                "    ResourceKind::Service,",
+                ");",
+            ],
+        ];
+        for sample in bypasses {
+            assert!(
+                !flagged(&sample, &variants).is_empty(),
+                "bypass sample must be flagged: {sample:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn logical_lines_join_and_report_physical_span() {
+        let joined = logical_lines([
+            "fn f() {",
+            "    match kind {",
+            "        ResourceKind::Service => 1,",
+            "        _ => 0,",
+            "    }",
+            "}",
+        ]);
+        // 含变体引用 + `=>` 的逻辑行，区间覆盖第 3 行（allow 行号按区间匹配）。
+        assert!(
+            joined.iter().any(|(span, l)| span.0 <= 3
+                && span.1 >= 3
+                && l.contains("ResourceKind::Service")
+                && l.contains("=>")),
+            "{joined:?}"
+        );
+        // 分号行立即切出：区间就是它自己（行号归属与物理行一致）。
+        let single = logical_lines(["let k = ResourceKind::Service;"]);
+        assert_eq!(single[0].0, (1, 1));
+        assert!(!is_specialized_branch(&single[0].1, &n2_variants()));
+    }
+
+    #[test]
+    fn allow_entries_must_be_line_pinned() {
+        // P1-6：allow 精确到行号——同一文件里新增的同子串分支不会被放行。
+        let allow = [AllowEntry {
+            file: "a.rs".into(),
+            line: 10,
+            contains: "Self::Service =>".into(),
+        }];
+        assert!(allow_covers(
+            &allow,
+            "a.rs",
+            (10, 10),
+            "Self::Service => \"svc\","
+        ));
+        // 区间内（含）→ 覆盖：变体引用所在行在逻辑行区间内。
+        assert!(allow_covers(
+            &allow,
+            "a.rs",
+            (8, 10),
+            "match self { Self::Service => \"svc\","
+        ));
+        // 行号在区间外 → 不覆盖（新增的第二条分支会 flag）。
+        assert!(!allow_covers(
+            &allow,
+            "a.rs",
+            (11, 11),
+            "Self::Service => \"svc\","
+        ));
+        // 文件不同 → 不覆盖。
+        assert!(!allow_covers(
+            &allow,
+            "b.rs",
+            (10, 10),
+            "Self::Service => \"svc\","
+        ));
+    }
+
+    #[test]
+    fn gate_fails_closed_when_declared_crate_dir_missing() {
+        // P1-6：crate 名写错 → "0 file(s): PASS" 是伪 fail-closed。构造一个指向
+        // 不存在 crate 的 policy，gate 必须 FAIL。
+        let repo = crate::env::Repo::discover().expect("repo must be discoverable");
+        let config = crate::config::Config::load(&repo).expect("config must load");
+        let tmp = std::env::temp_dir().join(format!("harness-rkn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let policy = tmp.join("architecture.toml");
+        std::fs::write(
+            &policy,
+            "[resource_kind_neutrality]\n\
+             crates = [\"nexus-registry\", \"nexus-planner\", \"nexus-session\", \"nexus-auth\", \"nexus-typo\"]\n\
+             variants = [\"Network\", \"Service\", \"Workspace\", \"Compute\", \"Device\"]\n",
+        )
+        .unwrap();
+        let cfg = crate::config::Config {
+            policies_dir: tmp.clone(),
+            ..config
+        };
+        let g = resource_kind_neutrality_gate(&cfg);
+        assert_eq!(
+            g.verdict, "FAIL",
+            "missing crate dir must fail: {}",
+            g.detail
+        );
+        assert!(g.detail.contains("nexus-typo"), "{}", g.detail);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn gate_fails_closed_when_allow_entry_has_no_line() {
+        // P1-6：allow 条目缺 `line` → fail-closed（不再"文件＋子串"宽放行）。
+        let repo = crate::env::Repo::discover().expect("repo must be discoverable");
+        let config = crate::config::Config::load(&repo).expect("config must load");
+        let tmp = std::env::temp_dir().join(format!("harness-rkn-allow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("architecture.toml"),
+            "[resource_kind_neutrality]\n\
+             crates = [\"nexus-registry\", \"nexus-planner\", \"nexus-session\", \"nexus-auth\"]\n\
+             variants = [\"Network\", \"Service\", \"Workspace\", \"Compute\", \"Device\"]\n\
+             [[resource_kind_neutrality.allow]]\n\
+             file = \"crates/nexus-domain/src/lib.rs\"\n\
+             contains = \"Self::Service =>\"\n",
+        )
+        .unwrap();
+        let cfg = crate::config::Config {
+            policies_dir: tmp.clone(),
+            ..config
+        };
+        let g = resource_kind_neutrality_gate(&cfg);
+        assert_eq!(g.verdict, "FAIL", "{}", g.detail);
+        assert!(g.detail.contains("missing 'line'"), "{}", g.detail);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // --- N2 P1-7：PRODUCT §16 契约 hash 必须可复现 ---
+
+    #[test]
+    fn product_section16_contract_hash_is_reproducible() {
+        // P1-7 回归：文档里的 hash 值与"自 `## 16.` 至 hash 行之前、按 `\\n` 连接
+        // 并补一个换行"的算法不一致——冻结边界防篡改机制形同虚设。
+        // §12.58 声明了同一算法且可复现，用它做算法基准。
+        let repo = crate::env::Repo::discover().expect("repo must be discoverable");
+        let text = std::fs::read_to_string(repo.root.join("PRODUCT.md")).expect("PRODUCT.md");
+        let lines: Vec<&str> = text.split('\n').collect();
+
+        let hash_of =
+            |start_pred: &dyn Fn(&str) -> bool, start: usize| -> Option<(String, usize)> {
+                let i = start_pred;
+                let start_idx = (start..lines.len()).find(|k| i(lines[*k]))?;
+                let end_idx = (start_idx..lines.len()).find(|k| lines[*k].contains("契约 hash"))?;
+                let body = lines[start_idx..end_idx].join("\n") + "\n";
+                Some((sha256_hex(body.as_bytes()), end_idx))
+            };
+        // sha256（无外部依赖：harness 是 portable-core 工具，不引入依赖树）。
+        fn sha256_hex(data: &[u8]) -> String {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(data);
+            hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        }
+
+        let (h1258, _) = hash_of(&|l: &str| l.starts_with("### §12.58"), 0)
+            .expect("§12.58 must exist with a contract hash");
+        let stored_1258 = lines
+            .iter()
+            .find(|l| l.contains(&h1258))
+            .map(|l| l.contains("契约 hash"))
+            .unwrap_or(false);
+        assert!(
+            stored_1258,
+            "§12.58 hash must be reproducible with the documented method (got {h1258})"
+        );
+
+        let (h16, idx16) = hash_of(&|l: &str| l.starts_with("## 16."), 0)
+            .expect("§16 must exist with a contract hash");
+        assert!(
+            lines[idx16].contains(&h16),
+            "PRODUCT §16 contract hash is not reproducible: documented {} but computed {h16}",
+            lines[idx16]
+        );
     }
 }

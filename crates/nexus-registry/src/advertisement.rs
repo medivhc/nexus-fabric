@@ -129,7 +129,47 @@ pub struct ProviderAdvertisement {
     pub ttl_secs: u64,
 }
 
+/// Locator 列表中标记"提供方准入控制端点"的 scheme 前缀。
+///
+/// 约定（D2 Identity≠Locator 的落地）：`locators` 中首个**非**该前缀的条目是
+/// 数据面（Service）入口；带该前缀的条目是准入控制端点。P1-13：此前 planner
+/// 直接取 `locators[0]`，运维把 `n2adm://` 写在前面就会把控制端点当成
+/// Service 入口输出——判定必须收敛到这一个函数（registry 层，planner 与 CLI 共用）。
+pub const CONTROL_LOCATOR_PREFIX: &str = "n2adm://";
+
 impl ProviderAdvertisement {
+    /// 数据面（Service）入口 locator（首个非 `n2adm://` 条目）；无则 `None`。
+    ///
+    /// 冻结顺序：**首个非控制端点**，不是 `locators[0]`。
+    #[must_use]
+    pub fn service_locator(&self) -> Option<String> {
+        self.locators
+            .iter()
+            .find(|l| !l.starts_with(CONTROL_LOCATOR_PREFIX))
+            .cloned()
+    }
+
+    /// 准入控制端点（首个 `n2adm://host:port` → `host:port`）；无则 `None`。
+    #[must_use]
+    pub fn control_locator(&self) -> Option<String> {
+        self.locators
+            .iter()
+            .find(|l| l.starts_with(CONTROL_LOCATOR_PREFIX))
+            .map(|l| l[CONTROL_LOCATOR_PREFIX.len()..].to_string())
+    }
+
+    /// locator 顺序是否合法（`resource publish` 的入参校验，P1-13）。
+    ///
+    /// 合法 = 首条 locator 就是数据面入口（非 `n2adm://`）。空列表合法
+    /// （纯控制端点发布 / 未指定入口）。`n2adm://` 排在前面会让下游把控制端点
+    /// 当成 Service 入口——直接拒绝，而不是静默产出错误入口。
+    #[must_use]
+    pub fn has_valid_locator_order(&self) -> bool {
+        self.locators
+            .first()
+            .is_none_or(|l| !l.starts_with(CONTROL_LOCATOR_PREFIX))
+    }
+
     /// 广告是否已过期（TTL 语义）。
     ///
     /// `ttl_secs == 0` 永不过期；否则 `now_secs >= issued_at_secs + ttl_secs`

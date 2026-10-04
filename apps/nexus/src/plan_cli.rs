@@ -149,13 +149,9 @@ fn run_preview(name: &str, json_mode: bool) -> i32 {
                 "plan": plan_json(name, kind, &snapshot, true),
                 "trace": trace_json(&snapshot),
             });
-            render(&out, json_mode);
-            0
+            render(&out, json_mode)
         }
-        Err(err) => {
-            render(&fail_json(&err), json_mode);
-            0
-        }
+        Err(err) => render(&fail_json(&err), json_mode),
     }
 }
 
@@ -180,8 +176,7 @@ fn run_explain(arg: &str, json_mode: bool) -> i32 {
                     render(
                         &explain_json(&explained, None, display.as_deref()),
                         json_mode,
-                    );
-                    0
+                    )
                 }
                 None => {
                     let err = NexusError::NotFound {
@@ -190,8 +185,7 @@ fn run_explain(arg: &str, json_mode: bool) -> i32 {
                             "{arg} (no plan history recorded for this session; refusing to fabricate history)"
                         ),
                     };
-                    render(&fail_json(&err), json_mode);
-                    0
+                    render(&fail_json(&err), json_mode)
                 }
             }
         }
@@ -206,13 +200,9 @@ fn run_explain(arg: &str, json_mode: bool) -> i32 {
                         obj.insert("kind".to_string(), json!(kind.as_str()));
                         obj.insert("directory".to_string(), json!(DIRECTORY_TAG));
                     }
-                    render(&out, json_mode);
-                    0
+                    render(&out, json_mode)
                 }
-                Err(err) => {
-                    render(&fail_json(&err), json_mode);
-                    0
-                }
+                Err(err) => render(&fail_json(&err), json_mode),
             }
         }
     }
@@ -251,7 +241,7 @@ fn explain_json(
     })
 }
 
-fn render(out: &Value, json_mode: bool) {
+fn render(out: &Value, json_mode: bool) -> i32 {
     if json_mode {
         println!("{out}");
     } else {
@@ -272,6 +262,7 @@ fn render(out: &Value, json_mode: bool) {
         }
         println!("{out}");
     }
+    crate::verdict_exit_code(out)
 }
 
 /// `plan` 命令族入口（`run()` 在 `parse_command` 之前分流到此）。
@@ -386,8 +377,9 @@ mod tests {
     #[test]
     fn explain_estimate_labels_non_commitment() {
         // `plan explain <resource>`：估算模式 + "估算非承诺"标注。
+        // P1-20：资源不存在是业务 FAIL → exit 1（此前为 0）。
         let code = run_plan(&["explain".to_string(), "dev-svc".to_string()], true);
-        assert_eq!(code, 0);
+        assert_eq!(code, 1);
     }
 
     #[test]
@@ -426,6 +418,7 @@ mod tests {
         let mut sessions = store.sessions();
         sessions
             .save(&SessionRecord {
+                detached_at_unix: None,
                 session: nexus_domain::SessionId("sess-hist-1".into()),
                 phase: nexus_domain::LifecyclePhase::Active,
                 outcome: nexus_domain::TerminalOutcome::Completed,
