@@ -2159,3 +2159,35 @@ git push origin master        # pre-push 门禁（verify PASS / 无 STALE / Revi
 master 启用 branch protection：required status check（CI 跑 `verify --fast`）、
 linear history（禁 merge commit）、require up-to-date。CI 的 evidence 由远端生成，
 本地证据不再成为推送阻塞；本地 `NEXUS_AGENT` 用于区分各 Agent 的证据命名空间。
+
+### 29.5 沙箱并行工作区建议（worktree 模式）
+
+多个 Agent 在同一沙箱机器上并行开发同一仓库时的推荐布局：**每个 Agent 一个
+独立 worktree + 独立分支**，文件系统级隔离，编辑/构建/测试互不阻塞
+（共享同一 `.git` 对象库，磁盘只存一份历史）：
+
+```
+cd nexus-fabric
+git worktree add -b feat/a-registry ../ws-a     # Agent A：只碰 29.1 表中自己的域
+git worktree add -b feat/b-session  ../ws-b     # Agent B
+git worktree add -b feat/c-proxy    ../ws-c     # Agent C
+```
+
+每个 worktree 的启动配方（四步）：
+
+| 项 | 做法 | 效果 |
+|---|---|---|
+| 目录 | 自己的 worktree（`ws-a` / `ws-b` / …） | 并行编辑不冲突 |
+| 身份 | `export NEXUS_AGENT=<29.1 表中的值>` | 证据写入 `verify-<agent>-*`，互不覆盖、互不误标 STALE |
+| 构建 | `export CARGO_TARGET_DIR=$PWD/target`（每 worktree 独立） | 并行 cargo 无锁等待、不挤同一磁盘 |
+| 凭证 | 每 Agent 独立 PAT，`git -c url."https://oauth2:<token>@github.com/".insteadOf=...` 单命令注入，用后即删 | remote 永不落盘凭据，token 泄露不牵连他人 |
+
+节奏：并行开发期间各 Agent 互不相见，唯一汇合点即各自 push 前的
+`nexus-sync`（29.3）；ownership 域隔离使 rebase 大概率无事发生，
+冲突只在同步时刻暴露并显式解决。
+
+已知缺口（需另行约定，尚未机器化）：
+- 跨沙箱 Review 证据不互通：`.evidence/` 为 gitignore 的本地目录，独立 Review
+  （§19.1）的产物只存在于评审方沙箱，提交方 push 时看不到。建议约定评审结论以
+  marker 形式进 commit 正文（如 `review: <id>`）并由 hook 校验，或由 CI 存档评审产物。
+- branch protection（29.4）需在 GitHub 仓库设置页开启，沙箱 CLI 无权代开。
