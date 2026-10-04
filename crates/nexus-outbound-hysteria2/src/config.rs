@@ -6,8 +6,8 @@
 use std::fmt;
 use std::time::Duration;
 
-use super::tls::CertVerify;
 use super::Hysteria2Error;
+use super::tls::CertVerify;
 
 /// 默认握手超时（QUIC 握手 + H3 认证总计）。
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -154,7 +154,9 @@ impl Hysteria2Target {
             return Err(Hysteria2Error::InvalidConfig("server is empty".to_string()));
         }
         if self.password.is_empty() {
-            return Err(Hysteria2Error::InvalidConfig("password is empty".to_string()));
+            return Err(Hysteria2Error::InvalidConfig(
+                "password is empty".to_string(),
+            ));
         }
         Ok(())
     }

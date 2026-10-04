@@ -73,7 +73,8 @@ fn random_padding() -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut len_bytes = [0u8; 8];
     ring_rand_fill(&mut len_bytes);
-    let len = PADDING_MIN + (u64::from_le_bytes(len_bytes) as usize % (PADDING_MAX - PADDING_MIN + 1));
+    let len =
+        PADDING_MIN + (u64::from_le_bytes(len_bytes) as usize % (PADDING_MAX - PADDING_MIN + 1));
     let mut raw = vec![0u8; len];
     ring_rand_fill(&mut raw);
     raw.iter()
@@ -83,9 +84,7 @@ fn random_padding() -> String {
 
 fn ring_rand_fill(buf: &mut [u8]) {
     use ring::rand::{SecureRandom, SystemRandom};
-    SystemRandom::new()
-        .fill(buf)
-        .expect("system RNG failure");
+    SystemRandom::new().fill(buf).expect("system RNG failure");
 }
 
 /// 构造认证请求：HEADERS 帧（`0x01` + varint 长度 + QPACK 块），含文档列出的
@@ -210,9 +209,7 @@ mod tests {
         let padding = get("hysteria-padding").unwrap();
         assert!((PADDING_MIN..=PADDING_MAX).contains(&padding.len()));
         assert!(
-            padding
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric()),
+            padding.bytes().all(|b| b.is_ascii_alphanumeric()),
             "padding must be [a-zA-Z0-9]"
         );
     }

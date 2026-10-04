@@ -215,10 +215,7 @@ mod tests {
     fn tcp_request_wrong_id_rejected() {
         let mut bad = Vec::new();
         varint::encode(0x402, &mut bad); // 不是 0x401
-        assert_eq!(
-            TcpRequest::decode(&bad),
-            Err(Hysteria2Error::InvalidFrame)
-        );
+        assert_eq!(TcpRequest::decode(&bad), Err(Hysteria2Error::InvalidFrame));
     }
 
     #[test]
@@ -272,7 +269,10 @@ mod tests {
         };
         let wire = msg.encode();
         // 头部字节序：u32BE session, u16BE packet, frag_id, frag_count。
-        assert_eq!(&wire[..8], &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x02, 0x05]);
+        assert_eq!(
+            &wire[..8],
+            &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x02, 0x05]
+        );
         let back = UdpMessage::decode(&wire).unwrap();
         assert_eq!(back, msg);
     }

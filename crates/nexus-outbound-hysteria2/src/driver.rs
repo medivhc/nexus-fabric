@@ -92,7 +92,12 @@ impl Driver {
             .map_err(|e| Hysteria2Error::Io(e.to_string()))?;
         Ok(Self {
             socket,
-            endpoint: Endpoint::new(Arc::new(hysteria_endpoint_config()), server_config, false, None),
+            endpoint: Endpoint::new(
+                Arc::new(hysteria_endpoint_config()),
+                server_config,
+                false,
+                None,
+            ),
             // 注意：tx_buf 必须为空 Vec（poll_transmit 向 buf 尾部追加写包；
             // 预填充会导致写偏移错误甚至减法溢出）。
             tx_buf: Vec::new(),
@@ -186,9 +191,14 @@ impl Driver {
         };
         let local_ip: Option<IpAddr> = self.socket.local_addr().ok().map(|a| a.ip());
         let data = BytesMut::from(&plain[..]);
-        let ev = self
-            .endpoint
-            .handle(Instant::now(), remote, local_ip, None, data, &mut self.tx_buf);
+        let ev = self.endpoint.handle(
+            Instant::now(),
+            remote,
+            local_ip,
+            None,
+            data,
+            &mut self.tx_buf,
+        );
         match ev {
             None => false,
             Some(DatagramEvent::Response(t)) => {
@@ -495,7 +505,13 @@ impl Driver {
     }
 
     /// 关闭连接（发送 CONNECTION_CLOSE，尽力）。
-    pub fn close(&mut self, handle: ConnectionHandle, conn: &mut Connection, code: u64, reason: &[u8]) {
+    pub fn close(
+        &mut self,
+        handle: ConnectionHandle,
+        conn: &mut Connection,
+        code: u64,
+        reason: &[u8],
+    ) {
         let code = VarInt::from_u64(code.min((1 << 62) - 1)).unwrap_or(VarInt::MAX);
         conn.close(Instant::now(), code, Bytes::copy_from_slice(reason));
         self.pump(handle, conn);
@@ -532,9 +548,14 @@ impl Driver {
             };
             let local_ip: Option<IpAddr> = self.socket.local_addr().ok().map(|a| a.ip());
             let data = BytesMut::from(&plain[..]);
-            let ev = self
-                .endpoint
-                .handle(Instant::now(), remote, local_ip, None, data, &mut self.tx_buf);
+            let ev = self.endpoint.handle(
+                Instant::now(),
+                remote,
+                local_ip,
+                None,
+                data,
+                &mut self.tx_buf,
+            );
             match ev {
                 Some(DatagramEvent::Response(t)) => {
                     let pkt = self.tx_buf[..t.size].to_vec();

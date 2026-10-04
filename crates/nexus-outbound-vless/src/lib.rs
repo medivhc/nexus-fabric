@@ -435,7 +435,8 @@ pub fn decode_request(buf: &[u8]) -> Result<(VlessRequest, usize), VlessError> {
         0x02 => {
             let len = take(&mut pos, 1)?[0] as usize;
             let bytes = take(&mut pos, len)?;
-            let domain = String::from_utf8(bytes.to_vec()).map_err(|_| VlessError::InvalidDomain)?;
+            let domain =
+                String::from_utf8(bytes.to_vec()).map_err(|_| VlessError::InvalidDomain)?;
             if domain.is_empty() {
                 return Err(VlessError::InvalidDomain);
             }
@@ -493,9 +494,7 @@ pub fn read_response<R: Read>(r: &mut R) -> Result<VlessResponse, VlessError> {
     let mut head = [0u8; 2];
     r.read_exact(&mut head)?;
     if head[0] != VLESS_VERSION {
-        return Err(VlessError::InvalidVersion {
-            version: head[0],
-        });
+        return Err(VlessError::InvalidVersion { version: head[0] });
     }
     let mut addon = vec![0u8; head[1] as usize];
     r.read_exact(&mut addon)?;
@@ -553,9 +552,8 @@ impl<S: Read + Write> VlessConn<S> {
 impl<S: Read> Read for VlessConn<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.response_pending {
-            read_response(&mut self.inner).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-            })?;
+            read_response(&mut self.inner)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
             self.response_pending = false;
         }
         self.inner.read(buf)
@@ -673,7 +671,11 @@ pub fn encode_vision_frame(
     content: &[u8],
     padding_len: usize,
 ) -> Vec<u8> {
-    let header_len = if first { VISION_FIRST_HEADER_LEN } else { VISION_HEADER_LEN };
+    let header_len = if first {
+        VISION_FIRST_HEADER_LEN
+    } else {
+        VISION_HEADER_LEN
+    };
     let mut out = Vec::with_capacity(header_len + content.len() + padding_len);
     if first {
         out.extend_from_slice(uuid);
@@ -1117,7 +1119,10 @@ mod tests {
     #[test]
     fn uuid_invalid_inputs_rejected() {
         // 长度不对
-        assert_eq!(VlessError::InvalidUuid, VlessUuid::parse("123e4567").unwrap_err());
+        assert_eq!(
+            VlessError::InvalidUuid,
+            VlessUuid::parse("123e4567").unwrap_err()
+        );
         // 非法 hex 字符
         assert_eq!(
             VlessError::InvalidUuid,
@@ -1129,7 +1134,9 @@ mod tests {
             VlessUuid::parse("123e4567e89b-12d3-a456-426614174000").unwrap_err()
         );
         // 错误信息不回显输入
-        let err = VlessUuid::parse("secret-uuid-input").unwrap_err().to_string();
+        let err = VlessUuid::parse("secret-uuid-input")
+            .unwrap_err()
+            .to_string();
         assert!(!err.contains("secret"));
     }
 
@@ -1435,9 +1442,15 @@ mod tests {
         stream.extend_from_slice(&next);
         let mut cursor = std::io::Cursor::new(stream);
         let (cmd1, c1) = reader.read_frame(&mut cursor, &uuid).unwrap();
-        assert_eq!((cmd1, c1.as_slice()), (VisionCommand::Continue, &content[..]));
+        assert_eq!(
+            (cmd1, c1.as_slice()),
+            (VisionCommand::Continue, &content[..])
+        );
         let (cmd2, c2) = reader.read_frame(&mut cursor, &uuid).unwrap();
-        assert_eq!((cmd2, c2.as_slice()), (VisionCommand::Continue, &content[..]));
+        assert_eq!(
+            (cmd2, c2.as_slice()),
+            (VisionCommand::Continue, &content[..])
+        );
         assert!(!reader.is_ended());
     }
 
@@ -1711,10 +1724,7 @@ mod tests {
             tls: false,
             vision_direct: false,
         };
-        assert_eq!(
-            VlessError::VisionRequiresTls,
-            cfg.validate().unwrap_err()
-        );
+        assert_eq!(VlessError::VisionRequiresTls, cfg.validate().unwrap_err());
         let cfg_tls = VlessConfig { tls: true, ..cfg };
         assert!(cfg_tls.validate().is_ok());
     }

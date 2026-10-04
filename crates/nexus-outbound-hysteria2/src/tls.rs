@@ -166,8 +166,8 @@ pub fn build_quic_server_config(
 ///
 /// 生成失败 → [`Hysteria2Error::Tls`]。
 pub fn generate_test_identity() -> Result<(Vec<u8>, Vec<u8>), Hysteria2Error> {
-    let certified =
-        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).map_err(|_| Hysteria2Error::Tls)?;
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .map_err(|_| Hysteria2Error::Tls)?;
     Ok((
         certified.cert.der().to_vec(),
         certified.key_pair.serialize_der(),

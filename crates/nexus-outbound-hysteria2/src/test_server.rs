@@ -21,12 +21,12 @@ use std::time::{Duration, Instant};
 use quinn_proto::{Connection, ConnectionHandle, Dir, StreamId};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
+use super::Hysteria2Error;
 use super::auth;
 use super::driver::{self, Driver};
 use super::frames::{TcpResponse, UdpMessage};
 use super::qpack;
 use super::tls;
-use super::Hysteria2Error;
 
 /// 测试 server 句柄。
 pub struct TestServer {
@@ -163,11 +163,11 @@ fn run_server(
     let Some(auth_stream) = accept_bidi(&mut driver, handle, &mut conn, auth_deadline) else {
         return;
     };
-    let headers = match read_auth_request(&mut driver, handle, &mut conn, auth_stream, auth_deadline)
-    {
-        Ok(h) => h,
-        Err(_) => return,
-    };
+    let headers =
+        match read_auth_request(&mut driver, handle, &mut conn, auth_stream, auth_deadline) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
     let authed = headers
         .iter()
         .any(|(k, v)| k == "hysteria-auth" && v == expected_password);
@@ -199,19 +199,16 @@ fn run_server(
                 let addr_len =
                     usize::try_from(addr_len).map_err(|_| Hysteria2Error::InvalidFrame)?;
                 let addr = driver.read_exact(handle, &mut conn, id, addr_len, stream_deadline)?;
-                let target =
-                    String::from_utf8(addr).map_err(|_| Hysteria2Error::InvalidFrame)?;
+                let target = String::from_utf8(addr).map_err(|_| Hysteria2Error::InvalidFrame)?;
                 let pad_len = driver.read_varint(handle, &mut conn, id, stream_deadline)?;
-                let pad_len =
-                    usize::try_from(pad_len).map_err(|_| Hysteria2Error::InvalidFrame)?;
+                let pad_len = usize::try_from(pad_len).map_err(|_| Hysteria2Error::InvalidFrame)?;
                 let _ = driver.read_exact(handle, &mut conn, id, pad_len, stream_deadline)?;
                 Ok(target)
             })();
             match req_ok {
                 Ok(_target) => {
                     let resp = TcpResponse::encode(true, "", &[]);
-                    let _ =
-                        driver.write_all(handle, &mut conn, id, &resp, stream_deadline);
+                    let _ = driver.write_all(handle, &mut conn, id, &resp, stream_deadline);
                     // 回显直到对端 FIN。
                     loop {
                         match driver.read_some(

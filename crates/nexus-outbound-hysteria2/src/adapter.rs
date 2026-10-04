@@ -6,9 +6,9 @@
 
 use nexus_connectivity::{ConnectivityError, OutboundAdapter, OutboundHandoff};
 
+use super::Hysteria2Error;
 use super::client::Hysteria2Client;
 use super::config::Hysteria2Target;
-use super::Hysteria2Error;
 
 /// Hysteria2 出站 adapter（`OutboundAdapter` 实现，`kind = "hysteria2"`）。
 pub struct Hysteria2Adapter {
@@ -109,10 +109,7 @@ mod tests {
         let mut target = test_target(&server);
         target.password = "wrong-password".to_string();
         let adapter = Hysteria2Adapter::new("hy2", target);
-        assert!(matches!(
-            adapter.connect(),
-            Err(Hysteria2Error::AuthFailed)
-        ));
+        assert!(matches!(adapter.connect(), Err(Hysteria2Error::AuthFailed)));
     }
 
     #[test]
@@ -172,7 +169,9 @@ mod tests {
         assert_eq!(session, 0);
         let session2 = client.alloc_udp_session();
         assert_eq!(session2, 1);
-        client.send_udp(session, "8.8.8.8:53", b"dns-query").unwrap();
+        client
+            .send_udp(session, "8.8.8.8:53", b"dns-query")
+            .unwrap();
         let msg = client.recv_udp(Duration::from_secs(5)).unwrap();
         assert_eq!(msg.session_id, session);
         assert_eq!(msg.target, "8.8.8.8:53");

@@ -20,12 +20,12 @@ use std::time::{Duration, Instant};
 
 use quinn_proto::{ClientConfig, Connection, ConnectionHandle, StreamId};
 
-use super::auth::{self, AuthResponse, CcRx};
-use super::config::{Hysteria2Target, DEFAULT_AUTHORITY};
-use super::driver::{self, Driver};
-use super::frames::{TcpRequest, TcpResponse, UdpMessage, MAX_UDP_PAYLOAD};
-use super::tls;
 use super::Hysteria2Error;
+use super::auth::{self, AuthResponse, CcRx};
+use super::config::{DEFAULT_AUTHORITY, Hysteria2Target};
+use super::driver::{self, Driver};
+use super::frames::{MAX_UDP_PAYLOAD, TcpRequest, TcpResponse, UdpMessage};
+use super::tls;
 
 /// TCP stream 操作的默认超时。
 const STREAM_TIMEOUT: Duration = Duration::from_secs(10);
@@ -90,14 +90,14 @@ impl Hysteria2Client {
         // HEADERS 认证请求（stream 0）。
         let bidi0 = driver.open_bi(handle, &mut conn)?;
         debug_assert_eq!(bidi0.index(), 0, "first client bidi stream must be id 0");
-        let request = auth::build_auth_request(&target.password, target.cc_rx_bps, DEFAULT_AUTHORITY);
+        let request =
+            auth::build_auth_request(&target.password, target.cc_rx_bps, DEFAULT_AUTHORITY);
         driver.write_all(handle, &mut conn, bidi0, &request, deadline)?;
 
         // 读响应 HEADERS 帧：1 字节类型 + varint 长度 + QPACK 块。
         let frame_type = driver.read_exact(handle, &mut conn, bidi0, 1, deadline)?;
         let body_len = driver.read_varint(handle, &mut conn, bidi0, deadline)?;
-        let body_len =
-            usize::try_from(body_len).map_err(|_| Hysteria2Error::InvalidFrame)?;
+        let body_len = usize::try_from(body_len).map_err(|_| Hysteria2Error::InvalidFrame)?;
         let body = driver.read_exact(handle, &mut conn, bidi0, body_len, deadline)?;
         let mut frame = frame_type;
         super::varint::encode(body_len as u64, &mut frame);
@@ -281,7 +281,8 @@ impl Hysteria2Client {
                 return Err(Hysteria2Error::DatagramTooLarge { len: bytes.len() });
             }
         }
-        self.driver.send_datagram(self.handle, &mut self.conn, &bytes)
+        self.driver
+            .send_datagram(self.handle, &mut self.conn, &bytes)
     }
 
     /// 接收一个 UDP 包（阻塞至多 `timeout`），返回解码后的 [`UdpMessage`]。
@@ -296,9 +297,9 @@ impl Hysteria2Client {
         }
         let deadline = Instant::now() + timeout;
         loop {
-            if let Some(d) = self
-                .driver
-                .recv_datagram(self.handle, &mut self.conn, Duration::from_millis(50))
+            if let Some(d) =
+                self.driver
+                    .recv_datagram(self.handle, &mut self.conn, Duration::from_millis(50))
             {
                 return UdpMessage::decode(&d);
             }

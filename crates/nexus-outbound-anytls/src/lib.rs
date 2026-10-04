@@ -385,7 +385,10 @@ pub fn encode_settings(client: &str, padding_md5_hex: &str) -> Result<Vec<u8>, A
     if client.contains('\n') || client.contains('\r') {
         return Err(AnyTlsError::InvalidSettings);
     }
-    Ok(format!("v={PROTOCOL_VERSION}\nclient={client}\npadding-md5={padding_md5_hex}").into_bytes())
+    Ok(
+        format!("v={PROTOCOL_VERSION}\nclient={client}\npadding-md5={padding_md5_hex}")
+            .into_bytes(),
+    )
 }
 
 /// 编码 server Settings 文本：`v=2`。
@@ -963,7 +966,11 @@ pub struct AnyTlsAdapter {
 impl AnyTlsAdapter {
     /// 构造 adapter（`client_name` 取默认 `CLIENT_IDENT`）。
     #[must_use]
-    pub fn new(tag: impl Into<String>, locator: impl Into<String>, password: impl Into<String>) -> Self {
+    pub fn new(
+        tag: impl Into<String>,
+        locator: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
         Self {
             tag: tag.into(),
             locator: locator.into(),
@@ -1045,9 +1052,11 @@ pub struct LoopbackIdentity {
 /// rcgen 生成失败返回 `Tls`。
 pub fn generate_loopback_identity() -> Result<LoopbackIdentity, AnyTlsError> {
     let key_pair = rcgen::KeyPair::generate().map_err(|_| AnyTlsError::Tls)?;
-    let params =
-        rcgen::CertificateParams::new(vec!["localhost".to_string()]).map_err(|_| AnyTlsError::Tls)?;
-    let cert = params.self_signed(&key_pair).map_err(|_| AnyTlsError::Tls)?;
+    let params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .map_err(|_| AnyTlsError::Tls)?;
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|_| AnyTlsError::Tls)?;
     let key_der = key_pair.serialize_der();
     let cert_der = cert.der().to_vec();
     Ok(LoopbackIdentity { cert_der, key_der })
@@ -1125,10 +1134,7 @@ mod tests {
 
     #[test]
     fn auth_truncated_or_oversized_is_invalid_frame() {
-        assert_eq!(
-            parse_auth("pw", &[0u8; 10]),
-            Err(AnyTlsError::InvalidFrame)
-        );
+        assert_eq!(parse_auth("pw", &[0u8; 10]), Err(AnyTlsError::InvalidFrame));
         let mut buf = encode_auth("pw", 3);
         buf.push(0x00); // 多出一字节
         assert_eq!(parse_auth("pw", &buf), Err(AnyTlsError::InvalidFrame));
@@ -1188,7 +1194,10 @@ mod tests {
 
     #[test]
     fn frame_short_buffer_rejected() {
-        assert_eq!(decode_frame_bytes(&[1, 2, 3]), Err(AnyTlsError::InvalidFrame));
+        assert_eq!(
+            decode_frame_bytes(&[1, 2, 3]),
+            Err(AnyTlsError::InvalidFrame)
+        );
         let mut raw = encode_frame(AnyTlsCommand::Psh, 9, b"hello").unwrap();
         raw.truncate(raw.len() - 2); // data 被截断
         assert_eq!(decode_frame_bytes(&raw), Err(AnyTlsError::InvalidFrame));
@@ -1200,7 +1209,10 @@ mod tests {
     fn settings_roundtrip() {
         let md5 = padding_md5_hex(DEFAULT_PADDING_SCHEME);
         let raw = encode_settings("nexus-anytls/0.1.0", &md5).unwrap();
-        assert_eq!(raw, format!("v=2\nclient=nexus-anytls/0.1.0\npadding-md5={md5}").into_bytes());
+        assert_eq!(
+            raw,
+            format!("v=2\nclient=nexus-anytls/0.1.0\npadding-md5={md5}").into_bytes()
+        );
         let s = parse_settings(&raw).unwrap();
         assert_eq!(s.v, 2);
         assert_eq!(s.client.as_deref(), Some("nexus-anytls/0.1.0"));
@@ -1214,10 +1226,19 @@ mod tests {
 
     #[test]
     fn settings_malformed_rejected() {
-        assert_eq!(parse_settings(b"no-equals-here"), Err(AnyTlsError::InvalidSettings));
+        assert_eq!(
+            parse_settings(b"no-equals-here"),
+            Err(AnyTlsError::InvalidSettings)
+        );
         assert_eq!(parse_settings(b"v=abc"), Err(AnyTlsError::InvalidSettings));
-        assert_eq!(parse_settings(b"client=x"), Err(AnyTlsError::InvalidSettings)); // 缺 v
-        assert_eq!(parse_settings(&[0xff, 0xfe]), Err(AnyTlsError::InvalidSettings)); // 非 UTF-8
+        assert_eq!(
+            parse_settings(b"client=x"),
+            Err(AnyTlsError::InvalidSettings)
+        ); // 缺 v
+        assert_eq!(
+            parse_settings(&[0xff, 0xfe]),
+            Err(AnyTlsError::InvalidSettings)
+        ); // 非 UTF-8
         assert!(encode_settings("bad\nname", "abc").is_err());
     }
 
@@ -1261,7 +1282,10 @@ mod tests {
         let b = padding_md5_hex(DEFAULT_PADDING_SCHEME);
         assert_eq!(a, b);
         assert_eq!(a.len(), 32);
-        assert!(a.bytes().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            a.bytes()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
         let c = padding_md5_hex("stop=1\n0=1-1");
         assert_ne!(a, c);
     }
@@ -1273,7 +1297,9 @@ mod tests {
         let targets = [
             AnyTlsTarget::Ipv4([192, 168, 1, 7], 443),
             AnyTlsTarget::Ipv6(
-                [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01],
+                [
+                    0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+                ],
                 80,
             ),
             AnyTlsTarget::Domain("example.internal".to_string(), 8443),
@@ -1295,14 +1321,23 @@ mod tests {
 
     #[test]
     fn socks5_addr_atyp_bytes() {
-        assert_eq!(encode_socks5_addr(&AnyTlsTarget::Ipv4([1, 2, 3, 4], 0x1234)).unwrap()[0], 0x01);
-        assert_eq!(encode_socks5_addr(&AnyTlsTarget::Domain("h".into(), 1)).unwrap()[0], 0x03);
+        assert_eq!(
+            encode_socks5_addr(&AnyTlsTarget::Ipv4([1, 2, 3, 4], 0x1234)).unwrap()[0],
+            0x01
+        );
+        assert_eq!(
+            encode_socks5_addr(&AnyTlsTarget::Domain("h".into(), 1)).unwrap()[0],
+            0x03
+        );
         let long = "x".repeat(256);
         assert_eq!(
             encode_socks5_addr(&AnyTlsTarget::Domain(long, 1)),
             Err(AnyTlsError::InvalidAddress)
         );
-        assert_eq!(decode_socks5_addr(&[0x02, 0, 0]), Err(AnyTlsError::InvalidAddress));
+        assert_eq!(
+            decode_socks5_addr(&[0x02, 0, 0]),
+            Err(AnyTlsError::InvalidAddress)
+        );
         assert_eq!(decode_socks5_addr(&[]), Err(AnyTlsError::InvalidAddress));
     }
 
@@ -1331,8 +1366,14 @@ mod tests {
             vec![b"query-bytes".to_vec(), b"".to_vec()]
         );
         assert!(decode_uot_datagrams(&[]).unwrap().is_empty());
-        assert_eq!(decode_uot_datagrams(&[0x00]), Err(AnyTlsError::InvalidFrame));
-        assert_eq!(decode_uot_datagrams(&[0x00, 0x05, 0x01]), Err(AnyTlsError::InvalidFrame));
+        assert_eq!(
+            decode_uot_datagrams(&[0x00]),
+            Err(AnyTlsError::InvalidFrame)
+        );
+        assert_eq!(
+            decode_uot_datagrams(&[0x00, 0x05, 0x01]),
+            Err(AnyTlsError::InvalidFrame)
+        );
     }
 
     // ---------- loopback TLS 握手 ----------
@@ -1348,14 +1389,16 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || {
             let (sock, _) = listener.accept().unwrap();
-            sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
             let conn = rustls::ServerConnection::new(server_cfg).unwrap();
             let mut tls = rustls::StreamOwned::new(conn, sock);
             let res = server_handshake(&mut tls, "test-password", DEFAULT_PADDING_SCHEME);
             tx.send(res).unwrap();
         });
         let sock = TcpStream::connect(addr).unwrap();
-        sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
         let conn = rustls::ClientConnection::new(client_cfg, server_name).unwrap();
         let mut tls = rustls::StreamOwned::new(conn, sock);
@@ -1379,14 +1422,16 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || {
             let (sock, _) = listener.accept().unwrap();
-            sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
             let conn = rustls::ServerConnection::new(server_cfg).unwrap();
             let mut tls = rustls::StreamOwned::new(conn, sock);
             let res = server_handshake(&mut tls, "server-secret", DEFAULT_PADDING_SCHEME);
             tx.send(res).unwrap();
         });
         let sock = TcpStream::connect(addr).unwrap();
-        sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
         let conn = rustls::ClientConnection::new(client_cfg, server_name).unwrap();
         let mut tls = rustls::StreamOwned::new(conn, sock);
@@ -1409,14 +1454,16 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || {
             let (sock, _) = listener.accept().unwrap();
-            sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
             let conn = rustls::ServerConnection::new(server_cfg).unwrap();
             let mut tls = rustls::StreamOwned::new(conn, sock);
             let res = server_handshake(&mut tls, "pw", DEFAULT_PADDING_SCHEME);
             tx.send(res).unwrap();
         });
         let sock = TcpStream::connect(addr).unwrap();
-        sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
         let conn = rustls::ClientConnection::new(client_cfg, server_name).unwrap();
         let mut tls = rustls::StreamOwned::new(conn, sock);
@@ -1444,7 +1491,8 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || {
             let (sock, _) = listener.accept().unwrap();
-            sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
             let conn = rustls::ServerConnection::new(server_cfg).unwrap();
             let mut tls = rustls::StreamOwned::new(conn, sock);
             server_handshake(&mut tls, "pw", DEFAULT_PADDING_SCHEME).unwrap();
@@ -1468,7 +1516,8 @@ mod tests {
             tx.send((target, psh_data.data)).unwrap();
         });
         let sock = TcpStream::connect(addr).unwrap();
-        sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
         let conn = rustls::ClientConnection::new(client_cfg, server_name).unwrap();
         let mut tls = rustls::StreamOwned::new(conn, sock);
@@ -1497,14 +1546,16 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || {
             let (sock, _) = listener.accept().unwrap();
-            sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
             let conn = rustls::ServerConnection::new(server_cfg).unwrap();
             let mut tls = rustls::StreamOwned::new(conn, sock);
             let res = server_handshake(&mut tls, "pw", DEFAULT_PADDING_SCHEME);
             tx.send(res).unwrap();
         });
         let sock = TcpStream::connect(addr).unwrap();
-        sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
         let conn = rustls::ClientConnection::new(client_cfg, server_name).unwrap();
         let mut tls = rustls::StreamOwned::new(conn, sock);
@@ -1538,7 +1589,8 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || {
             let (sock, _) = listener.accept().unwrap();
-            sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
             let conn = rustls::ServerConnection::new(server_cfg).unwrap();
             let mut tls = rustls::StreamOwned::new(conn, sock);
             server_handshake(&mut tls, "pw", DEFAULT_PADDING_SCHEME).unwrap();
@@ -1560,7 +1612,8 @@ mod tests {
             tx.send((magic_target, real_target, datagrams)).unwrap();
         });
         let sock = TcpStream::connect(addr).unwrap();
-        sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
         let conn = rustls::ClientConnection::new(client_cfg, server_name).unwrap();
         let mut tls = rustls::StreamOwned::new(conn, sock);
@@ -1575,7 +1628,8 @@ mod tests {
             &encode_uot_datagram(b"dns-query").unwrap(),
         )
         .unwrap();
-        let (magic_target, real_target, datagrams) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (magic_target, real_target, datagrams) =
+            rx.recv_timeout(Duration::from_secs(10)).unwrap();
         assert_eq!(magic_target, uot_magic_target());
         assert_eq!(real_target, dst);
         assert_eq!(datagrams, vec![b"dns-query".to_vec()]);

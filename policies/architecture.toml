@@ -225,6 +225,24 @@ portable = false
 layer = "outbound"
 
 [[crate]]
+name = "nexus-outbound-anytls"
+allowed_internal_dependencies = ["nexus-connectivity", "nexus-plugin"]
+portable = false
+layer = "outbound"
+
+[[crate]]
+name = "nexus-outbound-vless"
+allowed_internal_dependencies = ["nexus-connectivity", "nexus-plugin"]
+portable = false
+layer = "outbound"
+
+[[crate]]
+name = "nexus-outbound-hysteria2"
+allowed_internal_dependencies = ["nexus-connectivity", "nexus-fabric", "nexus-plugin"]
+portable = false
+layer = "outbound"
+
+[[crate]]
 name = "nexus-harness"
 allowed_internal_dependencies = ["nexus-connectivity", "nexus-dns", "nexus-domain", "nexus-platform", "nexus-projection"]
 portable = false

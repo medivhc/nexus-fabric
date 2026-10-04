@@ -344,10 +344,7 @@ mod tests {
         encoded.push(0x03); // 值长度 3（H=0）
         encoded.extend_from_slice(b"xyz");
         let decoded = decode_field_section(&encoded).unwrap();
-        assert_eq!(
-            decoded,
-            [("if-none-match".to_string(), "xyz".to_string())]
-        );
+        assert_eq!(decoded, [("if-none-match".to_string(), "xyz".to_string())]);
     }
 
     #[test]
@@ -376,7 +373,10 @@ mod tests {
 
     #[test]
     fn truncated_section_rejected() {
-        assert_eq!(decode_field_section(&[0x00]), Err(Hysteria2Error::InvalidFrame));
+        assert_eq!(
+            decode_field_section(&[0x00]),
+            Err(Hysteria2Error::InvalidFrame)
+        );
         assert_eq!(decode_field_section(&[]), Err(Hysteria2Error::InvalidFrame));
         // 名字长度宣称 5，实际只剩 2 字节。
         assert_eq!(
