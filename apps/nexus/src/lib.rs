@@ -651,12 +651,11 @@ fn forward_bytes(r: &mut std::net::TcpStream, w: &mut std::net::TcpStream) {
 /// 生成一个"已释放端口"地址（bind 后立即 drop）——用于模拟 NAT 后不可直连
 /// 的 Direct 候选（连接必然被拒，与真实 NAT 外部探测失败同构）。
 fn freed_port_addr() -> std::net::SocketAddr {
-    let tmp = std::net::TcpListener::bind("127.0.0.1:0")
+    // 端口在返回后立即释放（drop 自动发生），后续 connect 将得到 ConnectionRefused。
+    std::net::TcpListener::bind("127.0.0.1:0")
         .expect("bind temp listener")
         .local_addr()
-        .expect("local addr");
-    // drop(tmp) 自动发生：端口释放，后续 connect 将得到 ConnectionRefused。
-    tmp
+        .expect("local addr")
 }
 
 pub fn remote_service_access_flow() -> Result<Value, NexusError> {
