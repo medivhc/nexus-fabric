@@ -901,6 +901,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-outbound-anytls"
+version = "0.1.0"
+dependencies = [
+ "md5",
+ "nexus-connectivity",
+ "rcgen",
+ "rustls",
+ "sha2",
+]
+
+[[package]]
 name = "nexus-outbound-shadowsocks"
 version = "0.1.0"
 dependencies = [

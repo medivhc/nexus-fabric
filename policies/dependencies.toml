@@ -356,3 +356,37 @@ os_transitive_deps = "none (pure compile-time crypto; RNG comes from getrandom c
 approved = true
 approved_date = "2026-10-03"
 review_basis = "N2 P0-4 D6: ed25519 授权身份密钥对（apps/nexus/src/n2_identity.rs）; alternatives: ed25519-dalek (new dep, rejected), ring already in tree"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-outbound-anytls"
+crate = "sha2"
+version = "0.10"
+default_features = false
+features = []
+architecture_layer = "outbound (AnyTLS): SHA-256(password) 认证帧构造; no async runtime"
+feature_scope = "no default features; only sha2::Sha256 digest interface"
+license = "MIT OR Apache-2.0 (allowlisted; check via cargo-deny gate)"
+security = "no known advisories; re-check at push time via harness dependency-governance gate"
+portability = "pure Rust; crate marked portable = false due to rustls/ring (same as nexus-outbound-trojan)"
+supply_chain = "version pinned by Cargo.lock (lockfile_required); already present in tree as nexus-outbound-trojan dep (0.10.9)"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-04"
+review_basis = "AnyTLS 协议语义 §3.1: 认证帧首 32 字节为 SHA-256(password); alternatives considered: hand-rolled SHA-256 rejected (never hand-roll crypto)"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-outbound-anytls"
+crate = "md5"
+version = "0.7"
+default_features = false
+features = []
+architecture_layer = "outbound (AnyTLS): Settings padding-md5 指纹计算; no async runtime"
+feature_scope = "no features exist; zero transitive deps"
+license = "Apache-2.0 OR MIT (allowlisted; crates.io 2026-09-30)"
+security = "MD5 used only for the padding-scheme consistency fingerprint (not security-critical hashing); RustSec DB checked via harness gate"
+portability = "pure Rust, zero deps"
+supply_chain = "version pinned by Cargo.lock (lockfile_required); already present in tree as nexus-turn dep (0.7.0)"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-04"
+review_basis = "AnyTLS 协议语义 §3.4/§4.1: padding-md5 = MD5(小写 hex) of padding scheme 原始字节; same crate+version already allowlisted 2026-09-30 for crates/nexus-turn"
