@@ -122,7 +122,10 @@ impl FileTaskAcceptanceStore {
                 let mut bytes = Vec::new();
                 file.read_to_end(&mut bytes)
                     .map_err(|e| io_error(&receipt, e))?;
-                if bytes != RECEIPT && bytes != RUNTIME_AUTHORITY_RECEIPT {
+                if bytes != RECEIPT
+                    && bytes != RUNTIME_AUTHORITY_RECEIPT
+                    && bytes != crate::task_artifacts::AUTHORITY_RECEIPT
+                {
                     return Err(TaskError::new(
                         TaskErrorCode::StateCorrupt,
                         "corrupt acceptance initialization receipt",
@@ -149,6 +152,9 @@ impl FileTaskAcceptanceStore {
                     "content-sha256-v1",
                     "task-runtime-v1.json",
                     "task-runtime-initialized-v1",
+                    "artifacts-v1.json",
+                    "artifacts-initialized-v1",
+                    "artifact-content-sha256-v1",
                 ] {
                     let path = self.root.join(name);
                     match fs::symlink_metadata(&path) {
@@ -172,6 +178,24 @@ impl FileTaskAcceptanceStore {
             Err(e) => return Err(io_error(&image, e)),
         }
         if !initialized {
+            for name in [
+                "artifacts-v1.json",
+                "artifacts-initialized-v1",
+                "artifact-content-sha256-v1",
+                "artifact-audit-v1",
+            ] {
+                match fs::symlink_metadata(self.root.join(name)) {
+                    Ok(_) => {
+                        return Err(TaskError::new(
+                            TaskErrorCode::StateCorrupt,
+                            "acceptance receipt missing beside existing Artifact authority",
+                            false,
+                        ));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(io_error(&receipt, e)),
+                }
+            }
             // Existing N3-1 images migrate without changing their bytes/schema.
             // The receipt is itself atomic; a crash before its publication can
             // safely retry using the already durable, validated image.

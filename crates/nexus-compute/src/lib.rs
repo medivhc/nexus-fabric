@@ -8,6 +8,8 @@
 
 /// N3 provider-owned durable acceptance; separate from legacy job sessions.
 pub mod task;
+/// Portable Artifact registration checks and log registration facts.
+pub mod task_artifact;
 /// Provider execution facts replayed from durable events; no OS calls.
 pub mod task_runtime;
 

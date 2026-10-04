@@ -912,15 +912,19 @@ fn independent_handles_stage_and_gc_share_one_acceptance_lock() {
     let dir = TestDir::new();
     let root = dir.root();
     let store = FileSnapshotStore::open(&root).unwrap();
-    let s = stage(&store);
+    // Compare the same frozen Commit, whose identity includes its timestamp.
+    let (ws, commit) = workspace();
+    let ws = std::sync::Arc::new(ws);
+    let s = store.stage_snapshot(ws.as_ref(), &commit, &selection()).unwrap();
     accept(&root, &s.reference, 100);
     let threads = (0..8)
         .map(|i| {
             let root = root.clone();
+            let ws = std::sync::Arc::clone(&ws);
+            let commit = commit.clone();
             std::thread::spawn(move || {
                 let store = FileSnapshotStore::open(&root).unwrap();
-                let (ws, c) = workspace();
-                let s = store.stage_snapshot(&ws, &c, &selection()).unwrap();
+                let s = store.stage_snapshot(ws.as_ref(), &commit, &selection()).unwrap();
                 assert_eq!(store.collect_garbage(1000 + i, 0).unwrap().deleted, 0);
                 store.release_preview(&s.reference.snapshot_id).unwrap();
                 store

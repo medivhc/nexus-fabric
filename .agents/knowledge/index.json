@@ -270,5 +270,13 @@
     "module": "apps/nexusd",
     "category": "implementation-pitfall",
     "summary": "Docker tmpfs 真实数据与归档视图、私有输入的 UID/umask、大输出控制/drain 死锁；非 root 传递、受控归档、owner lease 和 SIGKILL 后阻断重跑。"
+  },
+  {
+    "id": "n3-artifact-publication-authority",
+    "file": "entries/2026-10-04-n3-artifact-publication-authority.md",
+    "date": "2026-10-04",
+    "module": "nexus-compute / apps/nexusd",
+    "category": "implementation-pitfall",
+    "summary": "Artifact Catalog 与 TaskOwner 交付事件绑定；未知旧状态不重建，receiver lease 防第二 owner，Publishing intent + 同 inode no-replace 发布与 SIGKILL 恢复。"
   }
 ]

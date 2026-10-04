@@ -24,7 +24,7 @@ const RECEIPT_BYTES: &[u8] = b"n3-task-runtime-initialized-v1\n";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuntimeImage {
     schema_version: u64,
-    journals: Vec<RuntimeJournal>,
+    pub(crate) journals: Vec<RuntimeJournal>,
 }
 // Local envelope codec; this is not a public wire DTO.
 impl CanonicalDto for RuntimeImage {
@@ -87,7 +87,9 @@ fn find<'a>(ledger: &'a AcceptanceLedger, id: &TaskId) -> Result<&'a AcceptedTas
 pub(crate) fn initialize(root: &Path, accepted: &AcceptanceLedger) -> Result<(), TaskError> {
     let receipt = read_private(&root.join(RECEIPT), false)?;
     let required = read_private(&root.join("acceptance-initialized-v1"), true)?.as_deref()
-        == Some(crate::task_store::RUNTIME_AUTHORITY_RECEIPT);
+        == Some(crate::task_store::RUNTIME_AUTHORITY_RECEIPT)
+        || read_private(&root.join("acceptance-initialized-v1"), true)?.as_deref()
+            == Some(crate::task_artifacts::AUTHORITY_RECEIPT);
     if required && receipt.is_none() {
         return Err(corrupt(
             "required runtime initialization receipt is missing",
@@ -144,7 +146,9 @@ pub(crate) fn load_and_validate(
     }
     let bytes =
         read_private(&root.join(IMAGE), true)?.ok_or_else(|| corrupt("missing runtime image"))?;
-    decode(&bytes, accepted)
+    let image = decode(&bytes, accepted)?;
+    crate::task_artifacts::validate_runtime(root, accepted, &image)?;
+    Ok(image)
 }
 fn decode(bytes: &[u8], accepted: &AcceptanceLedger) -> Result<RuntimeImage, TaskError> {
     let decode = || {
@@ -302,6 +306,7 @@ impl TaskRuntimeStore for FileTaskAcceptanceStore {
                 return Err(corrupt("runtime history cannot be removed or rewritten"));
             }
             image.validate(accepted)?;
+            crate::task_artifacts::validate_runtime(root, accepted, &image)?;
             if result.state != image.journals[index].replay(task, sha256)? {
                 return Err(corrupt("runtime transaction result differs from journal"));
             }

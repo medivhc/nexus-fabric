@@ -41,6 +41,17 @@ pub enum RuntimeAction {
     DeliveryDeadline {
         now_unix: u64,
     },
+    DeliveryReady {
+        artifacts: Vec<ArtifactRecord>,
+        logs: Vec<crate::task_artifact::RegisteredLog>,
+        at_unix: u64,
+    },
+    DeliveryPending {
+        error: TaskError,
+    },
+    ArtifactsMissing {
+        paths: Vec<String>,
+    },
     ObservationLost,
 }
 /// Sequence is contiguous and local to one Task. Same sequence/action replay is
@@ -133,7 +144,7 @@ impl RuntimeJournal {
                 execution_handle: None,
             };
             for event in &self.events {
-                apply(&mut state, event)?;
+                apply(&mut state, event, hash)?;
             }
             Ok(state)
         };
@@ -164,7 +175,7 @@ impl<S: TaskRuntimeStore> TaskOwner<S> {
                     applied: false,
                 });
             }
-            apply(&mut state, &event)?;
+            apply(&mut state, &event, self.hash)?;
             journal.events.push(event.clone());
             journal.replay(accepted, self.hash)?;
             Ok(RuntimeUpdate {
@@ -174,7 +185,7 @@ impl<S: TaskRuntimeStore> TaskOwner<S> {
         })
     }
 }
-fn apply(state: &mut RuntimeState, event: &RuntimeEvent) -> Result<(), TaskError> {
+fn apply(state: &mut RuntimeState, event: &RuntimeEvent, hash: DigestFn) -> Result<(), TaskError> {
     if event.sequence > MAX_INTEGER
         || state.view.last_event_seq.checked_add(1) != Some(event.sequence)
     {
@@ -381,6 +392,91 @@ fn apply(state: &mut RuntimeState, event: &RuntimeEvent) -> Result<(), TaskError
                 error: Some(error),
             };
         }
+        RuntimeAction::DeliveryReady {
+            artifacts,
+            logs,
+            at_unix,
+        } => {
+            require(
+                v.execution.state == ExecutionState::Exited
+                    && v.observation == Observation::Confirmed,
+                "delivery completion requires confirmed natural exit",
+            )?;
+            require(
+                *at_unix >= v.accepted_contract.accepted_at_unix
+                    && *at_unix < v.accepted_contract.delivery_deadline_unix
+                    && *at_unix <= MAX_INTEGER,
+                "delivery completion exceeded its accepted deadline",
+            )?;
+            crate::task_artifact::validate_registration(v, artifacts, logs, hash)?;
+            v.artifact_ids = artifacts.iter().map(|a| a.artifact_id.clone()).collect();
+            v.delivery = TaskDelivery {
+                state: DeliveryState::Complete,
+                error: None,
+            };
+            v.phase = TaskPhase::Finished;
+            if v.execution.workload_succeeded == Some(true) {
+                v.outcome = TaskOutcome::Completed;
+                v.error = None;
+            } else {
+                v.outcome = TaskOutcome::Failed;
+                v.error = Some(TaskError::new(
+                    TaskErrorCode::WorkloadExit,
+                    "confirmed workload exit is outside success_exit_codes",
+                    false,
+                ));
+            }
+        }
+        RuntimeAction::DeliveryPending { error } => {
+            require(
+                v.execution.state == ExecutionState::Exited
+                    && error.retryable
+                    && matches!(
+                        error.code,
+                        TaskErrorCode::PersistenceFailed
+                            | TaskErrorCode::ArtifactUnavailable
+                            | TaskErrorCode::ProviderUnreachable
+                            | TaskErrorCode::CapacityUnavailable
+                    ),
+                "delivery retry requires a retryable transport/storage error",
+            )?;
+            v.delivery = TaskDelivery {
+                state: DeliveryState::Pending,
+                error: Some(error.clone()),
+            };
+        }
+        RuntimeAction::ArtifactsMissing { paths } => {
+            require(
+                v.execution.state == ExecutionState::Exited
+                    && v.observation == Observation::Confirmed
+                    && !paths.is_empty(),
+                "missing outputs require confirmed natural exit",
+            )?;
+            let mut unique = std::collections::BTreeSet::new();
+            require(
+                paths.iter().all(|p| {
+                    unique.insert(p)
+                        && v.accepted_contract
+                            .request
+                            .outputs
+                            .iter()
+                            .any(|o| o.required && &o.path == p)
+                }),
+                "missing paths must be unique required outputs",
+            )?;
+            let error = TaskError::new(
+                TaskErrorCode::ArtifactMissing,
+                format!("required outputs unavailable: {}", paths.join(", ")),
+                false,
+            );
+            v.phase = TaskPhase::Finished;
+            v.outcome = TaskOutcome::Failed;
+            v.error = Some(error.clone());
+            v.delivery = TaskDelivery {
+                state: DeliveryState::Failed,
+                error: Some(error),
+            };
+        }
         RuntimeAction::ObservationLost => {
             v.observation = Observation::PendingVerification;
         }
@@ -443,6 +539,24 @@ impl CanonicalDto for RuntimeAction {
             Self::DeliveryDeadline { now_unix } => {
                 ("DeliveryDeadline", vec![("now_unix", now_unix.to_value())])
             }
+            Self::DeliveryReady {
+                artifacts,
+                logs,
+                at_unix,
+            } => (
+                "DeliveryReady",
+                vec![
+                    ("artifacts", artifacts.to_value()),
+                    ("logs", logs.to_value()),
+                    ("at_unix", at_unix.to_value()),
+                ],
+            ),
+            Self::DeliveryPending { error } => {
+                ("DeliveryPending", vec![("error", error.to_value())])
+            }
+            Self::ArtifactsMissing { paths } => {
+                ("ArtifactsMissing", vec![("paths", paths.to_value())])
+            }
             Self::ObservationLost => ("ObservationLost", vec![]),
         };
         let mut fields: BTreeMap<_, _> =
@@ -483,6 +597,17 @@ impl CanonicalDto for RuntimeAction {
             },
             "DeliveryDeadline" => Self::DeliveryDeadline {
                 now_unix: take(&mut f, "now_unix")?,
+            },
+            "DeliveryReady" => Self::DeliveryReady {
+                artifacts: take(&mut f, "artifacts")?,
+                logs: take(&mut f, "logs")?,
+                at_unix: take(&mut f, "at_unix")?,
+            },
+            "DeliveryPending" => Self::DeliveryPending {
+                error: take(&mut f, "error")?,
+            },
+            "ArtifactsMissing" => Self::ArtifactsMissing {
+                paths: take(&mut f, "paths")?,
             },
             "ObservationLost" => Self::ObservationLost,
             _ => return Err(TaskError::invalid("unknown runtime action")),

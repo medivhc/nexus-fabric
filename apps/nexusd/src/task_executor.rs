@@ -21,10 +21,15 @@ mod archive;
 mod docker;
 #[path = "task_executor_logs.rs"]
 mod logs;
+#[path = "task_executor_results.rs"]
+mod results;
 #[path = "task_executor_run.rs"]
 mod run;
 use docker::{Docker, Frames};
 use logs::{Logs, publish};
+pub(crate) use results::sealed_results;
+#[cfg(test)]
+pub(crate) use results::stage_fixture;
 
 /// Provider-private byte stream selector; external reads need service authorization.
 #[derive(Clone, Copy)]

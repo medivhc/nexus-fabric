@@ -22,3 +22,12 @@ pub mod task_executor;
 mod task_runtime_store;
 /// N3-1 acceptance persistence, not yet connected to daemon product routes.
 pub mod task_store;
+
+/// Local receiver: resumable verified publication without overwriting outputs.
+#[cfg(target_os = "linux")]
+pub mod artifact_download;
+#[cfg(target_os = "linux")]
+mod artifact_fs;
+/// Provider-private Artifact publication and authorized byte reads.
+#[cfg(target_os = "linux")]
+pub mod task_artifacts;

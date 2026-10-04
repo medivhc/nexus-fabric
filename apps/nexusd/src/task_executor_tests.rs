@@ -686,3 +686,177 @@ fn executor_process_fixture() {
         .run(&id, &mut |_| Ok(()))
         .unwrap();
 }
+
+#[test]
+#[ignore = "requires qualified local Engine and fixed NEXUS_N3_TEST_IMAGE_ID"]
+fn container_artifact_publishes_and_resumes_real_output_without_reexecution() {
+    use crate::{
+        artifact_download::ArtifactDownload,
+        task_artifacts::{ArtifactAccess, FileTaskArtifacts},
+    };
+    let fixture = Fixture::new(
+        &[
+            "/bin/sh",
+            "-c",
+            "dd if=/dev/zero of=result.txt bs=4096 count=25 2>/dev/null; echo real-logs; sleep 0.1",
+        ],
+        |r| r.outputs[0].required = true,
+    );
+    let result = fixture.executor.run(&fixture.id, &mut |_| Ok(())).unwrap();
+    assert_eq!(result.view.outcome, TaskOutcome::Unfinished);
+    let artifacts = FileTaskArtifacts::open(&fixture.root).unwrap();
+    let result = artifacts.publish(&fixture.id, 3600).unwrap();
+    assert_eq!(result.view.outcome, TaskOutcome::Completed);
+    let access = ArtifactAccess {
+        principal: &fixture.contract.authenticated_principal,
+        workspace: &fixture.contract.request.workspace,
+    };
+    let records = artifacts
+        .list(&fixture.id, access, &mut |_| Ok(()))
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    let dest = fixture.dir.0.join("downloaded");
+    let mut receiver = ArtifactDownload::open(record, &dest).unwrap();
+    let first = artifacts
+        .get(&record.artifact_id, access, 0, 32768, &mut |_| Ok(()))
+        .unwrap();
+    receiver.append(0, &first.bytes).unwrap();
+    assert!(!dest.exists());
+    drop(receiver);
+    let mut receiver = ArtifactDownload::open(record, &dest).unwrap();
+    assert_eq!(receiver.offset(), 32768);
+    loop {
+        let offset = receiver.offset();
+        let page = artifacts
+            .get(&record.artifact_id, access, offset, 32768, &mut |_| Ok(()))
+            .unwrap();
+        if !page.bytes.is_empty() {
+            receiver.append(offset, &page.bytes).unwrap();
+        }
+        if page.eof {
+            break;
+        }
+    }
+    receiver.finish().unwrap();
+    let bytes = fs::read(&dest).unwrap();
+    assert_eq!(bytes.len(), 102400);
+    assert_eq!(sha256(&bytes), record.content_sha256);
+    let store = FileTaskAcceptanceStore::open(&fixture.root).unwrap();
+    use nexus_compute::task_runtime::TaskRuntimeStore;
+    let (_, journal) = store.runtime_read(&fixture.id).unwrap();
+    assert_eq!(
+        journal
+            .events
+            .iter()
+            .filter(|e| matches!(e.action, RuntimeAction::StartIntent { .. }))
+            .count(),
+        1
+    );
+    assert!(fixture.executor.run(&fixture.id, &mut |_| Ok(())).is_err());
+}
+#[test]
+#[ignore = "requires qualified local Engine and fixed NEXUS_N3_TEST_IMAGE_ID"]
+fn container_artifact_missing_and_linked_required_outputs_fail_after_real_exit() {
+    use crate::task_artifacts::FileTaskArtifacts;
+    for command in ["sleep 0.1", "ln -s /etc/passwd result.txt; sleep 0.1"] {
+        let fixture = Fixture::new(&["/bin/sh", "-c", command], |r| {
+            r.outputs[0].required = true
+        });
+        fixture.executor.run(&fixture.id, &mut |_| Ok(())).unwrap();
+        let artifacts = FileTaskArtifacts::open(&fixture.root).unwrap();
+        let state = artifacts.publish(&fixture.id, 3600).unwrap();
+        assert_eq!(state.view.outcome, TaskOutcome::Failed);
+        assert_eq!(state.view.execution.exit_code, Some(0));
+        assert_eq!(
+            state.view.error.unwrap().code,
+            TaskErrorCode::ArtifactMissing
+        );
+        assert_eq!(state.view.delivery.state, DeliveryState::Failed);
+    }
+}
+#[test]
+#[ignore = "requires qualified local Engine and fixed NEXUS_N3_TEST_IMAGE_ID"]
+fn container_artifact_real_nonzero_results_preserve_allowed_exit_semantics() {
+    use crate::task_artifacts::FileTaskArtifacts;
+    for (allow, outcome) in [(false, TaskOutcome::Failed), (true, TaskOutcome::Completed)] {
+        let fixture = Fixture::new(
+            &[
+                "/bin/sh",
+                "-c",
+                "echo result >result.txt; sleep 0.1; exit 42",
+            ],
+            |r| {
+                r.outputs[0].required = true;
+                if allow {
+                    r.success_exit_codes.push(42);
+                }
+            },
+        );
+        fixture.executor.run(&fixture.id, &mut |_| Ok(())).unwrap();
+        let state = FileTaskArtifacts::open(&fixture.root)
+            .unwrap()
+            .publish(&fixture.id, 3600)
+            .unwrap();
+        assert_eq!(state.view.execution.exit_code, Some(42));
+        assert_eq!(state.view.outcome, outcome);
+        assert_eq!(state.view.delivery.state, DeliveryState::Complete);
+        if !allow {
+            assert_eq!(state.view.error.unwrap().code, TaskErrorCode::WorkloadExit);
+        }
+    }
+}
+#[test]
+#[ignore = "requires qualified local Engine and fixed NEXUS_N3_TEST_IMAGE_ID"]
+fn container_artifact_real_bytes_require_current_authorization_and_verified_download() {
+    use crate::{
+        artifact_download::ArtifactDownload,
+        task_artifacts::{ArtifactAccess, FileTaskArtifacts},
+    };
+    let fixture = Fixture::new(
+        &["/bin/sh", "-c", "printf correct >result.txt; sleep 0.1"],
+        |r| r.outputs[0].required = true,
+    );
+    fixture.executor.run(&fixture.id, &mut |_| Ok(())).unwrap();
+    let artifacts = FileTaskArtifacts::open(&fixture.root).unwrap();
+    artifacts.publish(&fixture.id, 3600).unwrap();
+    let access = ArtifactAccess {
+        principal: &fixture.contract.authenticated_principal,
+        workspace: &fixture.contract.request.workspace,
+    };
+    let record = artifacts
+        .list(&fixture.id, access, &mut |_| Ok(()))
+        .unwrap()
+        .remove(0);
+    let first = artifacts
+        .get(&record.artifact_id, access, 0, 7, &mut |_| Ok(()))
+        .unwrap();
+    assert_eq!(first.bytes, b"correct");
+    assert_eq!(
+        artifacts
+            .get(&record.artifact_id, access, 0, 7, &mut |_| Err(
+                TaskError::new(TaskErrorCode::AuthDenied, "revoked", false)
+            ))
+            .unwrap_err()
+            .code,
+        TaskErrorCode::AuthDenied
+    );
+    let dest = fixture.dir.0.join("corrupt-download");
+    let mut receiver = ArtifactDownload::open(&record, &dest).unwrap();
+    receiver.append(0, b"corrupt").unwrap();
+    assert_eq!(
+        receiver.finish().unwrap_err().code,
+        TaskErrorCode::ArtifactIntegrityFailed
+    );
+    assert!(!dest.exists());
+    let existing = fixture.dir.0.join("existing");
+    fs::write(&existing, b"keep existing").unwrap();
+    assert_eq!(
+        ArtifactDownload::open(&record, &existing)
+            .err()
+            .unwrap()
+            .code,
+        TaskErrorCode::OutputExists
+    );
+    assert_eq!(fs::read(existing).unwrap(), b"keep existing");
+}
