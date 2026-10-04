@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 /// candidates — a fresh `FabricConn::connect` per target would open a new
 /// socket per candidate and break NAT mapping stability) and `Cmd::OpenBi`
 /// / `StreamShared` for the signal channel on the relayed connection.
+pub use cert::FabricIdentity;
 pub use driver::{Cmd, ConnShared, Driver, StreamShared};
 pub use transport::{StdUdpTransport, UdpTransport};
 
@@ -119,8 +120,30 @@ impl FabricConn {
         Ok(Self { inner, driver })
     }
 
+    /// Connect with mandatory TLS1.3 client authentication and server-key pinning.
+    /// The single handshake budget includes peer acceptance (QUIC HANDSHAKE_DONE).
+    pub fn connect_mtls(
+        peer: PeerId,
+        identity: &FabricIdentity,
+        config: &ConnConfig,
+    ) -> Result<Self, FabricError> {
+        let remote = *config.addrs.first().ok_or(FabricError::PathUnreachable)?;
+        let start = Instant::now();
+        let crypto = cert::build_mtls_client_crypto(peer, identity)?;
+        let driver = Driver::new_mtls_client()?;
+        let budget = config.handshake_timeout.saturating_sub(start.elapsed());
+        let inner = driver.connect_with_crypto(peer, remote, budget, crypto)?;
+        Ok(Self { inner, driver })
+    }
+
+    /// Verified mutual-TLS identity, never a legacy anonymous/single-pin claim.
+    pub fn mutually_authenticated_peer(&self) -> Option<PeerId> {
+        self.inner.state.lock().ok()?.mutual_peer
+    }
+
     pub fn peer(&self) -> PeerId {
-        self.inner.peer
+        self.mutually_authenticated_peer()
+            .unwrap_or(self.inner.peer)
     }
 
     pub fn id(&self) -> ConnectionId {
@@ -314,6 +337,27 @@ impl FabricListener {
     pub fn bind_with_transport(transport: Box<dyn UdpTransport>) -> Result<Self, FabricError> {
         Ok(Self {
             driver: Driver::new_server_with_transport(transport)?,
+        })
+    }
+
+    /// TLS1.3 listener requiring a verified client key from the explicit allowlist.
+    /// An empty allowlist rejects every client; no identity is learned implicitly.
+    pub fn bind_mtls(
+        addr: SocketAddr,
+        identity: &FabricIdentity,
+        allowed: &[PeerId],
+    ) -> Result<Self, FabricError> {
+        Ok(Self {
+            driver: Driver::new_mtls_server(addr, identity, allowed)?,
+        })
+    }
+
+    /// Bounded accept for connection owners and admission observers.
+    pub fn accept_timeout(&self, timeout: Duration) -> Result<FabricConn, FabricError> {
+        let inner = self.driver.accept_conn_timeout(timeout)?;
+        Ok(FabricConn {
+            inner,
+            driver: self.driver.clone(),
         })
     }
 

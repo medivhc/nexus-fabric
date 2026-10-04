@@ -171,3 +171,12 @@ cargo clippy -p nexus-fabric --all-targets -- -D warnings
 
 - Portable crate 不得直接调用平台 API；UDP socket 经 `std::net`（本 crate 不在 `portable_core` 清单）。
 - 平台透明拦截不在本 crate（属 `nexus-platform-*`）。
+
+### N3-6 显式双向 TLS 模式增补
+
+沿用旧 API，新增 opt-in TLS1.3 双向证书身份认证：client pin server PeerId，
+server 强制认证证书签名与显式 requester allowlist；认证未完成不得 publish
+accepted/应用 stream/datagram。明确 mutual-authenticated peer accessor 区分旧
+匿名/占位连接；私钥不进入 Debug/日志。单一握手预算与现有 owner/reaper保留。
+细节见 docs/N3-6-LOCALAPI-SECURITY-CONTRACT.md；产品边界
+scenarios/product/fabric-mutual-auth.toml。不实现 Task RPC/领域算法。

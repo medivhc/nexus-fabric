@@ -61,14 +61,39 @@ impl FileTaskAcceptanceStore {
         root: &Path,
         mut parent_sync: impl FnMut(&Path) -> Result<(), TaskError>,
     ) -> Result<Self, TaskError> {
+        Self::open_mode(root, &mut parent_sync, true)
+    }
+    /// Query composition must never initialize or migrate a missing authority.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_existing(root: &Path) -> Result<Self, TaskError> {
+        Self::open_mode(root, &mut sync_directory, false)
+    }
+    #[cfg(target_os = "linux")]
+    fn open_mode(
+        root: &Path,
+        parent_sync: &mut impl FnMut(&Path) -> Result<(), TaskError>,
+        allow_new: bool,
+    ) -> Result<Self, TaskError> {
         use std::fs;
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        match fs::DirBuilder::new().mode(0o700).create(root) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(io_error(root, e)),
+        if allow_new {
+            match fs::DirBuilder::new().mode(0o700).create(root) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(io_error(root, e)),
+            }
         }
-        let meta = fs::symlink_metadata(root).map_err(|e| io_error(root, e))?;
+        let meta = fs::symlink_metadata(root).map_err(|e| {
+            if !allow_new && e.kind() == std::io::ErrorKind::NotFound {
+                TaskError::new(
+                    TaskErrorCode::StateCorrupt,
+                    "existing Task authority root is missing",
+                    false,
+                )
+            } else {
+                io_error(root, e)
+            }
+        })?;
         if !meta.is_dir() || meta.file_type().is_symlink() || meta.permissions().mode() & 0o077 != 0
         {
             return Err(TaskError::new(
@@ -86,15 +111,19 @@ impl FileTaskAcceptanceStore {
         for parent in store.root.ancestors().skip(1) {
             parent_sync(parent)?;
         }
-        let _lock = store.lock()?;
-        store.initialize()?;
+        let _lock = store.lock_with_create(allow_new)?;
+        store.initialize(allow_new)?;
         let ledger = store.load()?;
-        crate::task_runtime_store::initialize(&store.root, &ledger)?;
+        if allow_new {
+            crate::task_runtime_store::initialize(&store.root, &ledger)?;
+        } else {
+            crate::task_runtime_store::load_and_validate(&store.root, &ledger)?;
+        }
         sync_directory(&store.root)?;
         Ok(store)
     }
     #[cfg(target_os = "linux")]
-    fn initialize(&self) -> Result<(), TaskError> {
+    fn initialize(&self, allow_new: bool) -> Result<(), TaskError> {
         use std::{
             fs,
             io::{Read, Write},
@@ -138,6 +167,13 @@ impl FileTaskAcceptanceStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => return Err(io_error(&receipt, e)),
         };
+        if !allow_new && !initialized {
+            return Err(TaskError::new(
+                TaskErrorCode::StateCorrupt,
+                "existing acceptance initialization receipt is missing",
+                false,
+            ));
+        }
         let image = self.root.join("acceptance-v1.json");
         match fs::symlink_metadata(&image) {
             Ok(_) => {
@@ -216,17 +252,31 @@ impl FileTaskAcceptanceStore {
     }
     #[cfg(target_os = "linux")]
     fn lock(&self) -> Result<std::fs::File, TaskError> {
+        self.lock_with_create(true)
+    }
+    #[cfg(target_os = "linux")]
+    fn lock_with_create(&self, allow_new: bool) -> Result<std::fs::File, TaskError> {
         use std::os::unix::{fs::OpenOptionsExt, io::AsRawFd};
         let path = self.root.join("acceptance.lock");
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
+            .create(allow_new)
             .truncate(false)
             .mode(0o600)
             .custom_flags(0x20000 | 0x800)
             .open(&path)
-            .map_err(|e| io_error(&path, e))?;
+            .map_err(|e| {
+                if !allow_new && e.kind() == std::io::ErrorKind::NotFound {
+                    TaskError::new(
+                        TaskErrorCode::StateCorrupt,
+                        "existing acceptance lock is missing",
+                        false,
+                    )
+                } else {
+                    io_error(&path, e)
+                }
+            })?;
         if !file.metadata().map_err(|e| io_error(&path, e))?.is_file() {
             return Err(TaskError::new(
                 TaskErrorCode::StateCorrupt,

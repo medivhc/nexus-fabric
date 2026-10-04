@@ -35,3 +35,8 @@ pub mod task_artifacts;
 /// Linux requester cache and durable cancellation outbox.
 #[cfg(target_os = "linux")]
 pub mod task_requester_store;
+
+/// Bounded versioned LocalAPI protocol.
+pub mod task_http;
+/// Optional N3 local provider application service.
+pub mod task_service;

@@ -63,10 +63,10 @@ nexus — Nexus 统一 Resource Fabric 控制面 CLI（瘦客户端）
   workspace conflicts <workspace>         未合并冲突
   workspace cache <workspace>             Workspace 缓存状态
   workspace commit <workspace>            提交 Workspace 暂存变更（经 daemon）
-  task submit --request <json-file>       N3 提交（当前服务未装配）
-  task show|cancel|artifacts <id>          N3 查询或取消
+  task submit --request <json-file>       N3 提交（完整执行接线尚未装配）
+  task show|cancel|artifacts <id>          查询或取消本地提供方任务
   task logs <id> --stream <stdout|stderr> --offset <n>
-  artifact get <id> --output <path>        N3 产物下载（默认拒绝覆盖）
+  artifact get <id> --output <path>        N3 完整下载尚未装配（不修改输出）
   compute jobs                            Compute 任务
   diagnose                                统一诊断
   platform capabilities                   平台能力清单
@@ -205,10 +205,9 @@ fn run(args: &[String]) -> i32 {
         return 0;
     }
 
-    // N3 has no contracted LocalAPI route or authenticated service adapter yet.
-    // Parse the frozen syntax, then return a versioned capability failure.
+    // N3 is a thin client of the authenticated, versioned daemon service.
     if matches!(args[0].as_str(), "task" | "artifact") {
-        return match nexus::task_cli::run_unavailable(&args, json_mode) {
+        return match nexus::task_cli::run(&args, json_mode, &target.to_client_target()) {
             Ok(output) => {
                 println!("{output}");
                 0

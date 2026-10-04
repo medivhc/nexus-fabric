@@ -130,3 +130,11 @@ cargo clippy -p nexus --all-targets -- -D warnings
 ## Platform Constraints
 
 平台专有代码只允许存在于 `nexus-platform-*` 或 Composition Root。Portable crate 必须通过相应 portability gate。
+
+### N3-6 CLI 与授权组装增补
+
+N3 CLI 使用 POST /localapi/v1/task 获取真实 TaskEnvelope；不可达显式拒绝，
+不回退演示路径。下载 receiver 未装配时不触碰 output，legacy run 契约保留。
+本组装层授权 facade 复用真实 N2 当前 Use grant/持久 audit，按接受 resource/
+workspace 检查，不依赖 default Workspace；错配/审计失败拒绝。协议、容量、
+错误映射、FIFO/相关性边界见 docs/N3-6-LOCALAPI-SECURITY-CONTRACT.md。

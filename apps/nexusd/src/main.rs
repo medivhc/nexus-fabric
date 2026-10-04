@@ -526,12 +526,13 @@ fn run_daemon(config_dir: &str) -> ExitCode {
 
     // 5. LocalAPI 线程（R4：可经 shutdown 标志停止）。
     let localapi_addr = loaded.daemon.localapi_addr.clone();
+    let task_config_root = dir.root.clone();
     let (ready_tx, ready_rx) = channel();
     let api_shutdown = Arc::clone(&shutdown);
     let localapi_handle = std::thread::Builder::new()
         .name("nexusd-localapi".to_string())
         .spawn(move || {
-            serve_localapi(&localapi_addr, ready_tx, api_shutdown);
+            serve_localapi(&localapi_addr, ready_tx, api_shutdown, &task_config_root);
         })
         .expect("spawn localapi thread");
     // 等 LocalAPI 就绪（最多 5 秒）。
@@ -740,7 +741,9 @@ fn serve_localapi(
     addr_raw: &str,
     ready_tx: std::sync::mpsc::Sender<String>,
     shutdown: Arc<AtomicBool>,
+    config_root: &std::path::Path,
 ) {
+    let tasks = nexusd::task_service::LocalTaskService::open(config_root);
     let addr: std::net::SocketAddr = match addr_raw.parse() {
         Ok(a) => a,
         Err(e) => {
@@ -771,6 +774,7 @@ fn serve_localapi(
             return;
         }
     };
+    let token_authority = nexusd::task_http::TokenAuthority::open(&token);
     loop {
         if shutdown.load(Ordering::Relaxed) {
             eprintln!("[nexusd] localapi: shutdown signal, exiting");
@@ -779,7 +783,13 @@ fn serve_localapi(
         match listener.accept() {
             Ok((mut s, _)) => {
                 apply_localapi_io_timeouts!(s);
-                if let Err(e) = handle_localapi_request(&mut s, &token) {
+                if let Err(e) = handle_localapi_request(
+                    &mut s,
+                    &token,
+                    addr.ip().is_loopback(),
+                    &tasks,
+                    &token_authority,
+                ) {
                     eprintln!("[nexusd] localapi error: {e}");
                 }
             }
@@ -867,6 +877,7 @@ fn localapi_bearer_token() -> Result<String, ExitCode> {
 
 /// TCP loopback 监听 + 服务循环（既有行为）。
 fn serve_over_tcp(addr_raw: &str) -> ExitCode {
+    let tasks = nexusd::task_service::LocalTaskService::open(&task_config_root());
     let token = match localapi_bearer_token() {
         Ok(t) => t,
         Err(code) => return code,
@@ -893,11 +904,18 @@ fn serve_over_tcp(addr_raw: &str) -> ExitCode {
     println!(
         "{{\"verdict\":\"READY\",\"daemon\":{{\"entry\":\"nexusd\",\"command\":\"serve\",\"addr\":\"{actual_addr}\"}}}}"
     );
+    let token_authority = nexusd::task_http::TokenAuthority::open(&token);
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
                 apply_localapi_io_timeouts!(stream);
-                if let Err(e) = handle_localapi_request(&mut stream, &token) {
+                if let Err(e) = handle_localapi_request(
+                    &mut stream,
+                    &token,
+                    addr.ip().is_loopback(),
+                    &tasks,
+                    &token_authority,
+                ) {
                     eprintln!("serve connection error: {e}");
                 }
             }
@@ -912,7 +930,14 @@ fn serve_over_tcp(addr_raw: &str) -> ExitCode {
 
 #[cfg(unix)]
 fn serve_over_socket(path: &str) -> ExitCode {
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+    let tasks = nexusd::task_service::LocalTaskService::open(&task_config_root());
+    let private_parent = std::path::Path::new(path)
+        .parent()
+        .and_then(|p| std::fs::symlink_metadata(p).ok())
+        .is_some_and(|m| {
+            m.is_dir() && !m.file_type().is_symlink() && m.permissions().mode() & 0o077 == 0
+        });
     let token = match localapi_bearer_token() {
         Ok(t) => t,
         Err(code) => return code,
@@ -940,11 +965,18 @@ fn serve_over_socket(path: &str) -> ExitCode {
     println!(
         "{{\"verdict\":\"READY\",\"daemon\":{{\"entry\":\"nexusd\",\"command\":\"serve\",\"socket\":\"{path}\"}}}}"
     );
+    let token_authority = nexusd::task_http::TokenAuthority::open(&token);
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
                 apply_localapi_io_timeouts!(stream);
-                if let Err(e) = handle_localapi_request(&mut stream, &token) {
+                if let Err(e) = handle_localapi_request(
+                    &mut stream,
+                    &token,
+                    private_parent,
+                    &tasks,
+                    &token_authority,
+                ) {
                     eprintln!("serve connection error: {e}");
                 }
             }
@@ -975,8 +1007,13 @@ fn serve_over_socket(path: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-trait LocalIo: std::io::Read + std::io::Write {}
-impl<T: std::io::Read + std::io::Write> LocalIo for T {}
+use nexusd::task_http::HttpIo as LocalIo;
+
+fn task_config_root() -> std::path::PathBuf {
+    std::env::var_os("NEXUS_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/etc/nexus"))
+}
 
 /// C1：`GET /localapi/v0/workspace/mounts` — 已挂载 workspace 状态快照。
 #[cfg(target_os = "linux")]
@@ -1022,28 +1059,25 @@ fn workspace_commit(id: &str) -> Result<Value, (String, String)> {
     }
 }
 
-fn handle_localapi_request(stream: &mut dyn LocalIo, expected_token: &str) -> Result<(), String> {
-    use std::io::BufRead;
-    let (request_line, headers): (String, Vec<String>) = {
-        let mut reader = std::io::BufReader::new(&mut *stream);
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .map_err(|e| format!("read request line: {e}"))?;
-        let mut headers = Vec::new();
-        loop {
-            let mut h = String::new();
-            reader
-                .read_line(&mut h)
-                .map_err(|e| format!("read header: {e}"))?;
-            let h = h.trim_end_matches(['\r', '\n']);
-            if h.is_empty() {
-                break;
-            }
-            headers.push(h.to_string());
-        }
-        (line, headers)
+fn handle_localapi_request(
+    stream: &mut dyn LocalIo,
+    expected_token: &str,
+    local_transport: bool,
+    tasks: &nexusd::task_service::LocalTaskService,
+    token_authority: &nexusd::task_http::TokenAuthority,
+) -> Result<(), String> {
+    let Some(head) = nexusd::task_http::dispatch(
+        stream,
+        expected_token,
+        local_transport,
+        tasks,
+        token_authority,
+    )?
+    else {
+        return Ok(());
     };
+    let request_line = head.request_line;
+    let headers = head.headers;
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 2 || parts[0] != "GET" {
         write_http_json(

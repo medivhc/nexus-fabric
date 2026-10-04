@@ -134,9 +134,73 @@ impl TaskCliCommand {
         }
     }
 }
+/// Execute the frozen command through the real local daemon. Download stays
+/// unsupported until the existing verified receiver has a shared adapter.
+pub fn run(
+    args: &[String],
+    json: bool,
+    target: &crate::localapi_client::LocalApiTarget,
+) -> Result<String, String> {
+    let command = parse(args)?;
+    let output = if matches!(command, TaskCliCommand::Download { .. }) {
+        TaskEnvelope::Error {
+            error: TaskError::new(
+                TaskErrorCode::UnsupportedCapability,
+                "N3 verified ArtifactDownload receiver adapter is not installed",
+                false,
+            ),
+            task_id: None,
+        }
+    } else {
+        match command.prepare() {
+            Ok(request) => {
+                crate::task_localapi::execute(target, &request).unwrap_or_else(|error| {
+                    TaskEnvelope::Error {
+                        error,
+                        task_id: request.task_id().cloned(),
+                    }
+                })
+            }
+            Err(error) => TaskEnvelope::Error {
+                error,
+                task_id: None,
+            },
+        }
+    };
+    render(output, json)
+}
+fn render(output: TaskEnvelope, json: bool) -> Result<String, String> {
+    if json {
+        String::from_utf8(output.to_value().canonical_bytes()).map_err(|e| e.to_string())
+    } else {
+        match output {
+            TaskEnvelope::Error { error, task_id } => Ok(format!(
+                "FAIL {}{}: {}",
+                error.code.as_str(),
+                task_id.map_or_else(String::new, |id| format!(" task_id={}", id.as_str())),
+                error.reason
+            )),
+            TaskEnvelope::Success(nexus_control_api::task::TaskResponse::Task(view)) => {
+                Ok(format!(
+                    "PASS task_id={} phase={} outcome={} cancellation={} cancel_request={} observation={}",
+                    view.task_id.as_str(),
+                    view.phase.as_str(),
+                    view.outcome.as_str(),
+                    view.cancellation.state.as_str(),
+                    view.cancel_request.state.as_str(),
+                    view.observation.as_str()
+                ))
+            }
+            TaskEnvelope::Success(response) => {
+                String::from_utf8(TaskEnvelope::Success(response).to_value().canonical_bytes())
+                    .map_err(|e| e.to_string())
+            }
+        }
+    }
+}
 // Check before opening so a known FIFO/device is never opened. The fd check
 // remains authoritative because the path may change after this check.
-fn open_request_file(path: &std::path::Path) -> Result<std::fs::File, TaskError> {
+pub(crate) fn open_request_file(path: &std::path::Path) -> Result<std::fs::File, TaskError> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|e| TaskError::invalid(format!("cannot inspect request file: {e}")))?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -178,8 +242,9 @@ fn open_checked_request_file(path: &std::path::Path) -> Result<std::fs::File, Ta
 ))]
 fn configure_safe_request_open(options: &mut std::fs::OpenOptions) -> Result<(), TaskError> {
     use std::os::unix::fs::OpenOptionsExt;
-    // These Linux ABIs use 0x0800. Do not reuse it on MIPS/Alpha or unknown ABIs.
-    options.custom_flags(nexus_platform_linux::tun::O_NONBLOCK);
+    // These Linux ABIs use O_NONBLOCK=0x0800 and O_NOFOLLOW=0x20000.
+    // Do not reuse these on MIPS/Alpha or unknown ABIs.
+    options.custom_flags(nexus_platform_linux::tun::O_NONBLOCK | 0x0002_0000);
     Ok(())
 }
 #[cfg(any(
@@ -192,8 +257,8 @@ fn configure_safe_request_open(options: &mut std::fs::OpenOptions) -> Result<(),
 ))]
 fn configure_safe_request_open(options: &mut std::fs::OpenOptions) -> Result<(), TaskError> {
     use std::os::unix::fs::OpenOptionsExt;
-    // BSD/Darwin open(2) ABI: O_NONBLOCK = 0x0004; isolated composition code.
-    options.custom_flags(0x0004);
+    // BSD/Darwin open(2): O_NONBLOCK=0x0004, O_NOFOLLOW=0x0100.
+    options.custom_flags(0x0004 | 0x0100);
     Ok(())
 }
 #[cfg(windows)]

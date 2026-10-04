@@ -286,5 +286,13 @@
     "module": "nexus-compute / apps/nexusd / apps/nexus",
     "category": "implementation-pitfall",
     "summary": "Requester镜像按Provider+TaskId区分，ack不确认停止；固定inode receipt保护原执行owner；CLI请求文件需非阻塞打开及fd类型复查，避免FIFO阻塞。"
+  },
+  {
+    "id": "n3-localapi-mutual-auth-boundaries",
+    "file": "entries/2026-10-04-n3-localapi-and-mutual-auth-boundaries.md",
+    "date": "2026-10-04",
+    "module": "apps/nexus / apps/nexusd / nexus-fabric",
+    "category": "implementation-pitfall",
+    "summary": "LocalAPI真实grant与原authority、token FIFO/换行/私有权限边界；mTLS身份必须绑定实际SPKI和CertificateVerify，客户端等待HANDSHAKE_DONE，E4不代表完整Task RPC。"
   }
 ]

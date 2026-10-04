@@ -3227,3 +3227,12 @@ requirement-change；不自动接通 schedule 或 write-back。
 记录环境、任务输入、日志、退出码和取回产物的独立观察。
 Red Evidence 与冻结文件摘要见 `.evidence/red-n3-model-v1/`；验收 verifier 缺失时明确
 BLOCKED，不把文件存在、静态 schema 通过或 mock 往返当作 N3 产品 PASS。
+
+### 17.4 N3-6 本地协议与安全前置增补
+
+POST /localapi/v1/task 的版本化任务协议与真实本地提供方查询/取消，在
+docs/N3-6-LOCALAPI-SECURITY-CONTRACT.md 冻结。LocalAPI 认证和逐次当前 Use
+grant 检查不可由 DTO 主体、目录可见或 storage_ref 替代。CLI 不可达明确拒绝。
+Fabric 新增显式双向 TLS1.3 模式并通过真实独立进程验证，但未据此装配跨节点
+Task 输入/容量/Session 接受或 CLI 完整下载；相关能力保持明确拒绝。
+本批新增协议/安全前置的边界场景，不替代 §17.3 的 22 个 N3 E4 及真实两机 E5。

@@ -1,6 +1,6 @@
 //! Actual CLI process boundaries (E3 capability behavior, not N3 execution E4).
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT: AtomicU64 = AtomicU64::new(0);
 fn temp_path() -> PathBuf {
@@ -11,10 +11,93 @@ fn temp_path() -> PathBuf {
     ))
 }
 fn cli(args: &[&str]) -> Output {
+    // Keep the capability assertions while exercising the installed adapter:
+    // a real daemon without task-api.toml explicitly lacks Task service.
+    // Build nexusd before standalone nexus tests, or point the fixture at its
+    // binary. Never launch Cargo inside a running Cargo test process.
+    let daemon = DisabledDaemon::start();
     Command::new(env!("CARGO_BIN_EXE_nexus"))
         .args(args)
+        .args(["--addr", &daemon.addr])
+        .env(
+            "NEXUS_LOCALAPI_TOKEN_FILE",
+            daemon.root.join("localapi.token"),
+        )
+        .env("NEXUS_CONFIG_DIR", &daemon.root)
         .output()
         .unwrap()
+}
+struct DisabledDaemon {
+    child: Child,
+    root: PathBuf,
+    addr: String,
+}
+impl Drop for DisabledDaemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+impl DisabledDaemon {
+    fn start() -> Self {
+        use std::io::{BufRead, BufReader};
+        let default_bin =
+            PathBuf::from(env!("CARGO_BIN_EXE_nexus")).with_file_name(if cfg!(windows) {
+                "nexusd.exe"
+            } else {
+                "nexusd"
+            });
+        let binary = std::env::var_os("NEXUS_N3_TEST_DAEMON_BIN")
+            .map(PathBuf::from)
+            .unwrap_or(default_bin);
+        let root = temp_path();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&root)
+                .unwrap();
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir(&root).unwrap();
+        let child = Command::new(&binary)
+            .args(["serve", "--addr=127.0.0.1:0"])
+            .env("NEXUS_LOCALAPI_TOKEN_FILE", root.join("localapi.token"))
+            .env("NEXUS_CONFIG_DIR", &root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| {
+                let _ = std::fs::remove_dir_all(&root);
+                panic!("build nexusd fixture before standalone CLI test ({binary:?}): {e}")
+            });
+        let mut daemon = Self {
+            child,
+            root,
+            addr: String::new(),
+        };
+        let stdout = daemon.child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut line = String::new();
+            let result = BufReader::new(stdout).read_line(&mut line);
+            let _ = tx.send((result, line));
+        });
+        let ready = rx.recv_timeout(std::time::Duration::from_secs(3));
+        if ready.is_err() {
+            let _ = daemon.child.kill();
+            let _ = daemon.child.wait();
+        }
+        reader.join().unwrap();
+        let (result, line) = ready.expect("daemon READY bounded by three seconds");
+        assert!(result.unwrap() > 0, "daemon exited before READY");
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["verdict"], "READY", "{value}");
+        daemon.addr = value["daemon"]["addr"].as_str().unwrap().to_owned();
+        daemon
+    }
 }
 fn business(args: &[&str]) -> serde_json::Value {
     let output = cli(args);

@@ -350,6 +350,19 @@ impl FileTaskArtifacts {
                 .unwrap_or_default())
         })
     }
+    /// Composition-root routing only; validates authority without masking a
+    /// missing published catalog as ordinary not-yet-registered logs.
+    pub(crate) fn logs_registered(&self, id: &TaskId) -> Result<bool, TaskError> {
+        self.store.with_locked_ledger(|root, ledger| {
+            let image =
+                load(root, ledger)?.ok_or_else(|| disk::corrupt("missing Artifact catalog"))?;
+            Ok(image
+                .publications
+                .iter()
+                .find(|p| &p.task_id == id)
+                .is_some_and(|p| p.logs_published))
+        })
+    }
     /// Published immutable logs have the same two independent byte offsets.
     pub fn logs(
         &self,

@@ -359,3 +359,12 @@ cargo clippy -p nexusd --all-targets -- -D warnings
 ## Platform Constraints
 
 平台专有代码只允许存在于 `nexus-platform-*` 或 Composition Root。Portable crate 必须通过相应 portability gate。
+
+### N3-6 本地提供方 Task Service 增补
+
+可选 task-api.toml 的 provider/workspace 配置启用真实 Get/ReadLogs/Cancel/
+ListArtifacts/GetArtifact；authority 根固定 config-dir/data/n3/tasks。token
+认证后由本地 N2 身份派生调用主体，启动先核实 authority/原 owner/Engine。
+Submit 未具真实容量、唯一 SessionManager 和完整传输时拒绝，不构造占位接受。
+协议及权限、错误、恢复、审计和 localhost 边界见
+docs/N3-6-LOCALAPI-SECURITY-CONTRACT.md；不能把本批局部服务称为完整 N3。

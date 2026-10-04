@@ -90,3 +90,10 @@ cargo clippy -p nexus-control-api --all-targets -- -D warnings
 ## Platform Constraints
 
 平台专有代码只允许存在于 `nexus-platform-*` 或 Composition Root。Portable crate 必须通过相应 portability gate。
+
+### N3-6 LocalAPI 协议增补
+
+TaskRequest/TaskEnvelope 作为 POST /localapi/v1/task 的 schema1 线协议；认证 context
+由 daemon token/本地身份/配置作用域构造，不反序列化任意主体。HTTP framing、
+容量、错误与相关性按 docs/N3-6-LOCALAPI-SECURITY-CONTRACT.md 冻结；本 crate
+仍无 OS/Transport/存储副作用，六类 DTO 不变。

@@ -10871,3 +10871,7 @@ mod bufferbloat_tests {
 
 /// N3 task front-end parsing; service adapter remains unavailable.
 pub mod task_cli;
+
+mod task_localapi;
+
+pub mod task_authorization;

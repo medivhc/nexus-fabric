@@ -27,7 +27,10 @@ use quinn_proto::{
     StreamId, VarInt, crypto::rustls::QuicClientConfig,
 };
 
-use crate::cert::{Identity, build_client_crypto, build_server_config, generate_identity};
+use crate::cert::{
+    FabricIdentity, Identity, build_client_crypto, build_mtls_server_config, build_server_config,
+    generate_identity, verified_connection_peer,
+};
 use crate::transport::{StdUdpTransport, UdpTransport};
 use crate::{ConnStats, ConnectionId, FabricError, PeerId};
 
@@ -120,6 +123,7 @@ pub struct ConnShared {
 pub struct ConnState {
     pub connected: bool,
     pub closed: Option<FabricError>,
+    pub(crate) mutual_peer: Option<PeerId>,
 }
 
 impl std::fmt::Debug for ConnShared {
@@ -140,6 +144,7 @@ impl ConnShared {
             state: Mutex::new(ConnState {
                 connected: false,
                 closed: None,
+                mutual_peer: None,
             }),
             state_cv: Condvar::new(),
             accepted: Mutex::new(VecDeque::new()),
@@ -308,6 +313,14 @@ impl Driver {
         transport: Box<dyn UdpTransport>,
         server: Option<(ServerConfig, Identity)>,
     ) -> Result<Arc<Self>, FabricError> {
+        Self::spawn_mode(transport, server, false)
+    }
+
+    fn spawn_mode(
+        transport: Box<dyn UdpTransport>,
+        server: Option<(ServerConfig, Identity)>,
+        mutual_auth: bool,
+    ) -> Result<Arc<Self>, FabricError> {
         let local_addr = transport
             .local_addr()
             .map_err(|e| FabricError::Transport(e.to_string()))?;
@@ -336,6 +349,7 @@ impl Driver {
             socket: transport,
             endpoint,
             server_config,
+            mutual_auth,
             live: HashMap::new(),
             handle_map: HashMap::new(),
             buf: vec![0u8; RECV_BUF],
@@ -381,6 +395,29 @@ impl Driver {
         Self::spawn_with_transport(transport, Some((cfg, id)))
     }
 
+    pub(crate) fn new_mtls_client() -> Result<Arc<Self>, FabricError> {
+        let transport = StdUdpTransport::bind("0.0.0.0:0".parse().unwrap())
+            .map_err(|e| FabricError::Transport(e.to_string()))?;
+        Self::spawn_mode(Box::new(transport), None, true)
+    }
+
+    pub(crate) fn new_mtls_server(
+        addr: SocketAddr,
+        identity: &FabricIdentity,
+        allowed: &[PeerId],
+    ) -> Result<Arc<Self>, FabricError> {
+        let config = build_mtls_server_config(identity, allowed)?;
+        // Driver needs only the public endpoint identity after TLS config construction.
+        let id = Identity {
+            peer_id: identity.peer_id(),
+            cert_der: Vec::new(),
+            key_der: Vec::new(),
+        };
+        let transport =
+            StdUdpTransport::bind(addr).map_err(|e| FabricError::Transport(e.to_string()))?;
+        Self::spawn_mode(Box::new(transport), Some((config, id)), true)
+    }
+
     pub fn shared(&self) -> &Arc<DriverShared> {
         &self.shared
     }
@@ -396,12 +433,24 @@ impl Driver {
         remote: SocketAddr,
         handshake_timeout: Duration,
     ) -> Result<Arc<ConnShared>, FabricError> {
+        let crypto = build_client_crypto(peer)?;
+        self.connect_with_crypto(peer, remote, handshake_timeout, crypto)
+    }
+
+    pub(crate) fn connect_with_crypto(
+        self: &Arc<Self>,
+        peer: PeerId,
+        remote: SocketAddr,
+        handshake_timeout: Duration,
+        crypto: QuicClientConfig,
+    ) -> Result<Arc<ConnShared>, FabricError> {
         // S11: a single total deadline spans both phases (command reply +
         // QUIC handshake) — the caller never observes ~2x the timeout.
         let start = Instant::now();
-        let deadline = start + handshake_timeout;
+        let deadline = start
+            .checked_add(handshake_timeout)
+            .ok_or(FabricError::Timeout)?;
         let cancel = Arc::new(AtomicBool::new(false));
-        let crypto = build_client_crypto(peer)?;
         let (tx, rx) = mpsc::channel();
         self.send(Cmd::Connect {
             remote,
@@ -465,6 +514,52 @@ impl Driver {
         Ok(shared)
     }
 
+    pub(crate) fn accept_conn_timeout(
+        self: &Arc<Self>,
+        timeout: Duration,
+    ) -> Result<Arc<ConnShared>, FabricError> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(FabricError::Timeout)?;
+        let mut queue = self
+            .shared
+            .accept_q
+            .lock()
+            .map_err(|_| FabricError::Transport("lock poisoned".into()))?;
+        loop {
+            while let Some(id) = queue.pop_front() {
+                if let Some(conn) = self
+                    .shared
+                    .conns
+                    .lock()
+                    .map_err(|_| FabricError::Transport("lock poisoned".into()))?
+                    .get(&id)
+                    .cloned()
+                {
+                    if conn
+                        .state
+                        .lock()
+                        .map_err(|_| FabricError::Transport("lock poisoned".into()))?
+                        .closed
+                        .is_none()
+                    {
+                        return Ok(conn);
+                    }
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(FabricError::Timeout);
+            }
+            queue = self
+                .shared
+                .accept_cv
+                .wait_timeout(queue, deadline - now)
+                .map_err(|_| FabricError::Transport("lock poisoned".into()))?
+                .0;
+        }
+    }
+
     /// Accept the next incoming connection (blocks).
     pub fn accept_conn(self: &Arc<Self>) -> Result<Arc<ConnShared>, FabricError> {
         let mut q = self.shared.accept_q.lock().unwrap();
@@ -517,6 +612,7 @@ struct Loop {
     socket: Box<dyn UdpTransport>,
     endpoint: Endpoint,
     server_config: Option<Arc<ServerConfig>>,
+    mutual_auth: bool,
     live: HashMap<u64, LiveConn>,
     handle_map: HashMap<ConnectionHandle, u64>,
     buf: Vec<u8>,
@@ -671,6 +767,20 @@ impl Loop {
 
     fn cmd_open_bi(&mut self, conn: u64) -> Result<Arc<StreamShared>, FabricError> {
         let lc = self.live.get_mut(&conn).ok_or(FabricError::Closed(0))?;
+        if self.mutual_auth {
+            if lc.quic.is_closed() {
+                return Err(FabricError::Closed(0));
+            }
+            let state = lc.shared.state.lock().unwrap();
+            if let Some(error) = &state.closed {
+                return Err(error.clone());
+            }
+            if state.mutual_peer.is_none() {
+                return Err(FabricError::HandshakeFailed(
+                    "mutual authentication incomplete".into(),
+                ));
+            }
+        }
         let qid = lc
             .quic
             .streams()
@@ -683,6 +793,20 @@ impl Loop {
 
     fn cmd_send_datagram(&mut self, conn: u64, data: Vec<u8>) -> Result<(), FabricError> {
         let lc = self.live.get_mut(&conn).ok_or(FabricError::Closed(0))?;
+        if self.mutual_auth {
+            if lc.quic.is_closed() {
+                return Err(FabricError::Closed(0));
+            }
+            let state = lc.shared.state.lock().unwrap();
+            if let Some(error) = &state.closed {
+                return Err(error.clone());
+            }
+            if state.mutual_peer.is_none() {
+                return Err(FabricError::HandshakeFailed(
+                    "mutual authentication incomplete".into(),
+                ));
+            }
+        }
         lc.dgram_tx_q.push_back(data);
         Ok(())
     }
@@ -822,8 +946,10 @@ impl Loop {
                     },
                 );
                 self.shared.conns.lock().unwrap().insert(id, shared);
-                self.shared.accept_q.lock().unwrap().push_back(id);
-                self.shared.accept_cv.notify_one();
+                if !self.mutual_auth {
+                    self.shared.accept_q.lock().unwrap().push_back(id);
+                    self.shared.accept_cv.notify_one();
+                }
             }
             Err(e) => {
                 if let Some(t) = e.response {
@@ -869,6 +995,21 @@ impl Loop {
         for ev in evs {
             self.on_conn_event(id, ev);
         }
+        self.publish_mutual_connection(id);
+        // An Opened event can precede client handshake confirmation. Keep the
+        // QUIC accept queue private until authenticated, then drain it here.
+        if self.mutual_auth {
+            if let Some(lc) = self.live.get_mut(&id) {
+                if lc.shared.state.lock().unwrap().mutual_peer.is_some() {
+                    while let Some(qid) = lc.quic.streams().accept(Dir::Bi) {
+                        let sh = Arc::new(StreamShared::new(id, self.tx.clone()));
+                        lc.streams.insert(qid, sh.clone());
+                        lc.shared.accepted.lock().unwrap().push_back(sh);
+                        lc.shared.accepted_cv.notify_all();
+                    }
+                }
+            }
+        }
         // Streams.
         let qids: Vec<StreamId> = match self.live.get(&id) {
             Some(lc) => lc.streams.keys().copied().collect(),
@@ -897,8 +1038,10 @@ impl Loop {
             let mut got = false;
             while let Some(b) = lc.quic.datagrams().recv() {
                 lc.bytes_recv += b.len() as u64;
-                shared.dgrams.lock().unwrap().push_back(b.to_vec());
-                got = true;
+                if !self.mutual_auth || shared.state.lock().unwrap().mutual_peer.is_some() {
+                    shared.dgrams.lock().unwrap().push_back(b.to_vec());
+                    got = true;
+                }
             }
             if got {
                 shared.dgram_cv.notify_all();
@@ -1013,13 +1156,59 @@ impl Loop {
         }
     }
 
+    /// TLS client Connected precedes the server's client-certificate verdict.
+    /// HANDSHAKE_DONE is authenticated confirmation from that server; wait for it
+    /// before releasing the client handle. Server Connected already validates
+    /// mandatory CertificateVerify and the allowlist.
+    fn publish_mutual_connection(&mut self, id: u64) {
+        if !self.mutual_auth {
+            return;
+        }
+        let Some(lc) = self.live.get_mut(&id) else {
+            return;
+        };
+        if lc.quic.is_handshaking()
+            || lc.shared.state.lock().unwrap().closed.is_some()
+            || lc.shared.state.lock().unwrap().mutual_peer.is_some()
+        {
+            return;
+        }
+        if lc.quic.side().is_client() && lc.quic.stats().frame_rx.handshake_done == 0 {
+            return;
+        }
+        match verified_connection_peer(&lc.quic) {
+            Ok(peer) => {
+                let mut state = lc.shared.state.lock().unwrap();
+                state.mutual_peer = Some(peer);
+                state.connected = true;
+                drop(state);
+                lc.shared.state_cv.notify_all();
+                if !lc.quic.side().is_client() {
+                    self.shared.accept_q.lock().unwrap().push_back(id);
+                    self.shared.accept_cv.notify_one();
+                }
+            }
+            Err(error) => {
+                lc.shared.state.lock().unwrap().closed = Some(error);
+                lc.shared.state_cv.notify_all();
+                lc.quic.close(
+                    Instant::now(),
+                    VarInt::from_u32(1),
+                    Bytes::from_static(b"mutual authentication failed"),
+                );
+            }
+        }
+    }
+
     fn on_conn_event(&mut self, id: u64, ev: quinn_proto::Event) {
         match ev {
             quinn_proto::Event::HandshakeDataReady => {}
             quinn_proto::Event::Connected => {
                 if let Some(lc) = self.live.get(&id) {
-                    lc.shared.state.lock().unwrap().connected = true;
-                    lc.shared.state_cv.notify_all();
+                    if !self.mutual_auth {
+                        lc.shared.state.lock().unwrap().connected = true;
+                        lc.shared.state_cv.notify_all();
+                    }
                 }
             }
             quinn_proto::Event::ConnectionLost { reason } => {
@@ -1037,6 +1226,9 @@ impl Loop {
                 }
             }
             quinn_proto::Event::Stream(quinn_proto::StreamEvent::Opened { dir: Dir::Bi }) => {
+                if self.mutual_auth {
+                    return;
+                }
                 let sh = match self.live.get_mut(&id) {
                     Some(lc) => match lc.quic.streams().accept(Dir::Bi) {
                         Some(qid) => {
