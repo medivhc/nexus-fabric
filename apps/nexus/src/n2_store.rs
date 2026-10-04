@@ -579,15 +579,26 @@ impl SessionRecordStore for KvSessionRecordStore {
         // - 已有记录有终态且与来件不同 → 拒绝（冲突，fail-closed）；
         // - 已有记录有终态且与来件相同 → 允许（幂等重放，如 reconcile 的
         //   cleanup 回写、reconnect 后的重复 persist）。
+        // - F2: 已有记录有终态、来件无终态 → 拒绝（`session seed` 复活攻击：
+        //   已 Completed/Failed/Cancelled 的会话不能被静默改回 Active）。
         if let Some(existing) = self.current_record(&record.session)? {
             let existing_terminal = terminal_outcome_code(&existing.outcome);
             let incoming_terminal = terminal_outcome_code(&record.outcome);
-            if let (Some(have), Some(want)) = (existing_terminal, incoming_terminal) {
-                if have != want {
-                    return Err(format!(
-                        "terminal outcome conflict for {}: already committed '{have}', refusing to overwrite with '{want}'",
-                        record.session.0
-                    ));
+            if let Some(have) = existing_terminal {
+                match incoming_terminal {
+                    Some(want) if want == have => {} // 幂等重放
+                    Some(want) => {
+                        return Err(format!(
+                            "terminal outcome conflict for {}: already committed '{have}', refusing to overwrite with '{want}'",
+                            record.session.0
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "terminal outcome already committed for {}: '{have}', refusing to resurrect as non-terminal",
+                            record.session.0
+                        ));
+                    }
                 }
             }
         }

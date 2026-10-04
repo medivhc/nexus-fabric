@@ -954,7 +954,12 @@ fn logical_lines<'a>(code_lines: impl IntoIterator<Item = &'a str>) -> Vec<(Line
             buffer.push(' ');
         }
         buffer.push_str(trimmed);
-        let closes = logical_line_balance(trimmed) <= 0;
+        // F1 fix: balance must be computed on the accumulated buffer, not the
+        // current physical line. Otherwise rustfmt's one-arg-per-line style
+        // (e.g. `matches!(\n kind,\n ResourceKind::Service,\n);`) gets split
+        // into separate logical lines, and the `matches!`/variant pairing is
+        // never seen together -> bypass.
+        let closes = logical_line_balance(&buffer) <= 0;
         let ends = trimmed.ends_with(';')
             || trimmed.ends_with('}')
             || (closes && (trimmed.ends_with(',') || trimmed.ends_with('{')));
@@ -1400,6 +1405,13 @@ mod tests {
             vec!["if kind", "    == ResourceKind::Network", "{ do_it(); }"],
             // 同一文件新增的第二条同子串分支（非 allow 行）。
             vec!["        Self::Service => \"other\","],
+            // F1: rustfmt 逐行参数风格（每行一个参数）。
+            vec![
+                "let b = matches!(",
+                "    kind,",
+                "    ResourceKind::Service,",
+                ");",
+            ],
         ];
         for sample in bypasses {
             assert!(

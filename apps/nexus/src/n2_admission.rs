@@ -810,10 +810,10 @@ pub fn admit_session(
         .map_err(|e| AdmitError::Connect(format!("{control_addr}: {e}")))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
-        .map_err(|e| AdmitError::Io(e.to_string()))?;
+        .map_err(|e| AdmitError::Local(format!("set read timeout: {e}")))?;
     stream
         .set_write_timeout(Some(Duration::from_secs(10)))
-        .map_err(|e| AdmitError::Io(e.to_string()))?;
+        .map_err(|e| AdmitError::Local(format!("set write timeout: {e}")))?;
     // 本地 store 故障 ≠ 对端下线（P1-12）：不得让远端被标成 ProviderOffline。
     let store = N2Store::open(node_dir).map_err(|e| AdmitError::Local(format!("store: {e}")))?;
     // 1. 读问候帧（v2）：challenge_b＋B 公钥。
@@ -900,7 +900,7 @@ fn verify_provider_trust(
 ) -> Result<(), AdmitError> {
     let mut ts: TrustStore = store
         .load_trust_store()
-        .map_err(|e| AdmitError::Io(format!("trust store: {e}")))?;
+        .map_err(|e| AdmitError::Local(format!("trust store: {e}")))?;
     match ts.check(&NodeId(provider_id.to_string()), pubkey) {
         TrustVerdict::Trusted => Ok(()),
         TrustVerdict::IdentityChanged => Err(AdmitError::UntrustedProvider(format!(
@@ -918,7 +918,7 @@ fn verify_provider_trust(
                     ts.trust(NodeId(provider_id.to_string()), pubkey.to_vec());
                     store
                         .save_trust_store(&ts)
-                        .map_err(|e| AdmitError::Io(format!("trust store: {e}")))?;
+                        .map_err(|e| AdmitError::Local(format!("trust store: {e}")))?;
                     Ok(())
                 } else {
                     Err(AdmitError::UntrustedProvider(format!(

@@ -24,7 +24,7 @@ requirement = "PRODUCT.md#16-n2-resource-access"
 # 冻结期望未动——夹具只准备 E4 环境。
 fixture = [
   "cargo run --quiet -p nexus -- node init --json",
-  "cargo run --quiet -p nexus -- resource publish --name svc-on-b --kind service --locator n2adm://127.0.0.1:1 --locator 127.0.0.1:8080 --json",
+  "cargo run --quiet -p nexus -- resource publish --name svc-on-b --kind service --locator 127.0.0.1:8080 --locator n2adm://127.0.0.1:1 --json",
 ]
 topology = "xc-pc-linux（请求方 A）→ NU-SH-1217（提供方 B，真跨机，非 loopback）"
 provider = "node-b"
