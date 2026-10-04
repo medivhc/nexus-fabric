@@ -448,7 +448,8 @@ mod tests {
         // (Local close() alone does not reap: the driver keeps the conn in
         // live; probed 2026-09-30.)
         conn_b.close(0, b"test");
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        // 30s: under verify --full load the driver reaps slower; 10s was flaky
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             if conn_a.rebind().is_err() {
                 break;
