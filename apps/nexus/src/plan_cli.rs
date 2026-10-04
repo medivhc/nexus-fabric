@@ -377,8 +377,9 @@ mod tests {
     #[test]
     fn explain_estimate_labels_non_commitment() {
         // `plan explain <resource>`：估算模式 + "估算非承诺"标注。
+        // P1-20：资源不存在是业务 FAIL → exit 1（此前为 0）。
         let code = run_plan(&["explain".to_string(), "dev-svc".to_string()], true);
-        assert_eq!(code, 0);
+        assert_eq!(code, 1);
     }
 
     #[test]
