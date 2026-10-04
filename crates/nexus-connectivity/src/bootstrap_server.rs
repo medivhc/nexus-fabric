@@ -296,7 +296,7 @@ pub struct BootstrapServer {
     /// 每 src JoinInit 速率窗口（时间戳列表）。
     rate: HashMap<String, Vec<u64>>,
     cfg: BootstrapServerConfig,
-    codec: Box<dyn BootstrapFrameCodec>,
+    codec: Box<dyn BootstrapFrameCodec + Send>,
 }
 
 impl BootstrapServer {
@@ -305,7 +305,7 @@ impl BootstrapServer {
         identity: KeyPair,
         psk: Vec<u8>,
         cfg: BootstrapServerConfig,
-        codec: Box<dyn BootstrapFrameCodec>,
+        codec: Box<dyn BootstrapFrameCodec + Send>,
         persisted: Option<Vec<(String, String)>>,
     ) -> Result<Self, BootstrapServerError> {
         let mut vip = VirtualIpAllocator::new(&cfg.cidr)?;
@@ -758,6 +758,266 @@ fn wire_with_magic(body: &[u8]) -> Vec<u8> {
     out.extend_from_slice(NXB_MAGIC);
     out.extend_from_slice(body);
     out
+}
+
+// ---------------------------------------------------------------------------
+// pub 内存 codec：与 discovery bootstrap_join 字节格式对齐，供 harness E2E 复用
+// （server 与 client 共用同一 codec 完成真实握手往返）。
+// ---------------------------------------------------------------------------
+
+/// 本地内存线格式 codec（test/harness seam；与 discovery 帧格式对齐）。
+#[derive(Default)]
+pub struct MemCodec;
+
+fn mem_put_s(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u16).to_be_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn mem_get_s(b: &[u8], pos: &mut usize) -> Result<String, BootstrapServerError> {
+    if b.len() < *pos + 2 {
+        return Err(BootstrapServerError::Malformed("short string len".into()));
+    }
+    let len = u16::from_be_bytes([b[*pos], b[*pos + 1]]) as usize;
+    *pos += 2;
+    if b.len() < *pos + len {
+        return Err(BootstrapServerError::Malformed("short string body".into()));
+    }
+    let s = std::str::from_utf8(&b[*pos..*pos + len])
+        .map_err(|_| BootstrapServerError::Malformed("utf8".into()))?;
+    *pos += len;
+    Ok(s.to_string())
+}
+
+impl BootstrapFrameCodec for MemCodec {
+    fn encode(&self, f: &BootstrapCtrl) -> Result<Vec<u8>, BootstrapServerError> {
+        let mut out = Vec::new();
+        match f {
+            BootstrapCtrl::Register {
+                node_id,
+                virtual_ip,
+                locator,
+            } => {
+                out.push(11);
+                mem_put_s(&mut out, node_id);
+                mem_put_s(&mut out, virtual_ip);
+                mem_put_s(&mut out, locator);
+            }
+            BootstrapCtrl::RegisterAck { accepted, ttl_secs } => {
+                out.push(15);
+                out.push(u8::from(*accepted));
+                out.extend_from_slice(&ttl_secs.to_be_bytes());
+            }
+            BootstrapCtrl::GetPeers { node_id } => {
+                out.push(12);
+                mem_put_s(&mut out, node_id);
+            }
+            BootstrapCtrl::PeerList { peers } => {
+                out.push(13);
+                out.extend_from_slice(&(peers.len() as u16).to_be_bytes());
+                for p in peers {
+                    mem_put_s(&mut out, &p.node_id);
+                    mem_put_s(&mut out, &p.virtual_ip);
+                    mem_put_s(&mut out, &p.locator);
+                }
+            }
+            BootstrapCtrl::Heartbeat { node_id, now } => {
+                out.push(14);
+                mem_put_s(&mut out, node_id);
+                out.extend_from_slice(&now.to_be_bytes());
+            }
+        }
+        Ok(out)
+    }
+
+    fn decode(&self, b: &[u8]) -> Result<BootstrapCtrl, BootstrapServerError> {
+        if b.is_empty() {
+            return Err(BootstrapServerError::Malformed("empty ctrl".into()));
+        }
+        let tag = b[0];
+        let mut pos = 1usize;
+        match tag {
+            11 => Ok(BootstrapCtrl::Register {
+                node_id: mem_get_s(b, &mut pos)?,
+                virtual_ip: mem_get_s(b, &mut pos)?,
+                locator: mem_get_s(b, &mut pos)?,
+            }),
+            15 => {
+                if b.len() < 6 {
+                    return Err(BootstrapServerError::Malformed("short ack".into()));
+                }
+                let accepted = b[1] != 0;
+                let mut t = [0u8; 4];
+                t.copy_from_slice(&b[2..6]);
+                Ok(BootstrapCtrl::RegisterAck {
+                    accepted,
+                    ttl_secs: u32::from_be_bytes(t),
+                })
+            }
+            12 => Ok(BootstrapCtrl::GetPeers {
+                node_id: mem_get_s(b, &mut pos)?,
+            }),
+            13 => {
+                if b.len() < 3 {
+                    return Err(BootstrapServerError::Malformed("short peerlist".into()));
+                }
+                let n = u16::from_be_bytes([b[1], b[2]]) as usize;
+                pos = 3;
+                let mut peers = Vec::new();
+                for _ in 0..n {
+                    let node_id = mem_get_s(b, &mut pos)?;
+                    let virtual_ip = mem_get_s(b, &mut pos)?;
+                    let locator = mem_get_s(b, &mut pos)?;
+                    peers.push(BootstrapPeer {
+                        node_id,
+                        virtual_ip,
+                        locator,
+                    });
+                }
+                Ok(BootstrapCtrl::PeerList { peers })
+            }
+            14 => {
+                let node_id = mem_get_s(b, &mut pos)?;
+                if b.len() < pos + 8 {
+                    return Err(BootstrapServerError::Malformed("short heartbeat".into()));
+                }
+                let mut t = [0u8; 8];
+                t.copy_from_slice(&b[pos..pos + 8]);
+                Ok(BootstrapCtrl::Heartbeat {
+                    node_id,
+                    now: u64::from_be_bytes(t),
+                })
+            }
+            _ => Err(BootstrapServerError::Malformed("tag".into())),
+        }
+    }
+
+    fn decode_join_init(&self, payload: &[u8]) -> Result<JoinInitReq, BootstrapServerError> {
+        if payload.len() < 1 + 32 + 32 + 1 + 8 {
+            return Err(BootstrapServerError::Malformed("short join init".into()));
+        }
+        if payload[0] != 0x10 {
+            return Err(BootstrapServerError::Malformed("not join init".into()));
+        }
+        let mut pos = 1;
+        let mut eph_pub = [0u8; 32];
+        eph_pub.copy_from_slice(&payload[pos..pos + 32]);
+        pos += 32;
+        let mut static_pub = [0u8; 32];
+        static_pub.copy_from_slice(&payload[pos..pos + 32]);
+        pos += 32;
+        let presence = payload[pos];
+        pos += 1;
+        let requested_vip = if presence == 0 {
+            None
+        } else {
+            Some(mem_get_s(payload, &mut pos)?)
+        };
+        if pos + 8 > payload.len() {
+            return Err(BootstrapServerError::Malformed("short client_nonce".into()));
+        }
+        let mut n = [0u8; 8];
+        n.copy_from_slice(&payload[pos..pos + 8]);
+        Ok(JoinInitReq {
+            eph_pub,
+            static_pub,
+            requested_vip,
+            client_nonce: u64::from_be_bytes(n),
+        })
+    }
+
+    fn encode_join_reply(&self, r: &JoinReplyResp) -> Result<Vec<u8>, BootstrapServerError> {
+        let mut out = Vec::new();
+        out.push(0x11);
+        out.extend_from_slice(&r.eph_pub);
+        out.extend_from_slice(&r.static_pub);
+        mem_put_s(&mut out, &r.assigned_vip);
+        out.extend_from_slice(&r.lease_secs.to_be_bytes());
+        out.extend_from_slice(&r.hb_interval_ms.to_be_bytes());
+        out.extend_from_slice(&r.refresh_interval_ms.to_be_bytes());
+        out.extend_from_slice(&r.server_nonce.to_be_bytes());
+        Ok(out)
+    }
+
+    fn encode_error(
+        &self,
+        code: BootstrapOuterCode,
+        message: &str,
+    ) -> Result<Vec<u8>, BootstrapServerError> {
+        let mut out = Vec::new();
+        out.push(0x12);
+        out.push(code as u8);
+        mem_put_s(&mut out, message);
+        Ok(out)
+    }
+
+    fn split_outer<'a>(&self, payload: &'a [u8]) -> Result<OuterKind<'a>, BootstrapServerError> {
+        if payload.is_empty() {
+            return Err(BootstrapServerError::Malformed("empty".into()));
+        }
+        if payload[0] == 0x01 && payload.len() >= 38 {
+            return Ok(OuterKind::Secured(payload));
+        }
+        match payload[0] {
+            0x10 => Ok(OuterKind::JoinInit(self.decode_join_init(payload)?)),
+            _ => Ok(OuterKind::OtherPlain),
+        }
+    }
+
+    fn encode_join_init(&self, req: &JoinInitReq) -> Result<Vec<u8>, BootstrapServerError> {
+        let mut out = Vec::new();
+        out.push(0x10);
+        out.extend_from_slice(&req.eph_pub);
+        out.extend_from_slice(&req.static_pub);
+        match &req.requested_vip {
+            None => out.push(0),
+            Some(v) => {
+                out.push(1);
+                mem_put_s(&mut out, v);
+            }
+        }
+        out.extend_from_slice(&req.client_nonce.to_be_bytes());
+        Ok(out)
+    }
+
+    fn decode_join_reply(&self, body: &[u8]) -> Result<JoinReplyResp, BootstrapServerError> {
+        if body.len() < 1 + 32 + 32 + 2 + 4 + 4 + 4 + 8 {
+            return Err(BootstrapServerError::Malformed("short join reply".into()));
+        }
+        if body[0] != 0x11 {
+            return Err(BootstrapServerError::Malformed("not join reply".into()));
+        }
+        let mut pos = 1;
+        let mut eph_pub = [0u8; 32];
+        eph_pub.copy_from_slice(&body[pos..pos + 32]);
+        pos += 32;
+        let mut static_pub = [0u8; 32];
+        static_pub.copy_from_slice(&body[pos..pos + 32]);
+        pos += 32;
+        let assigned_vip = mem_get_s(body, &mut pos)?;
+        let mut take = |n: usize| -> Result<Vec<u8>, BootstrapServerError> {
+            if body.len() < pos + n {
+                return Err(BootstrapServerError::Malformed("short fixed field".into()));
+            }
+            let s: Vec<u8> = body[pos..pos + n].to_vec();
+            pos += n;
+            Ok(s)
+        };
+        let lease = u32::from_be_bytes(take(4)?.try_into().unwrap());
+        let hb = u32::from_be_bytes(take(4)?.try_into().unwrap());
+        let rf = u32::from_be_bytes(take(4)?.try_into().unwrap());
+        let mut n = [0u8; 8];
+        n.copy_from_slice(&body[pos..pos + 8]);
+        Ok(JoinReplyResp {
+            eph_pub,
+            static_pub,
+            assigned_vip,
+            lease_secs: lease,
+            hb_interval_ms: hb,
+            refresh_interval_ms: rf,
+            server_nonce: u64::from_be_bytes(n),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

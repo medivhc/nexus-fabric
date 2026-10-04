@@ -8732,10 +8732,10 @@ locator = "udp://127.0.0.1:42001"
     .map_err(|e| NexusError::Internal { message: e })?;
 
     // up（首次）
-    let up_json =
-        subnet_up(&cfg_ok, &state, false).map_err(|e| NexusError::Internal { message: e })?;
+    let up_json = subnet_up(&cfg_ok, &state, false, false)
+        .map_err(|e| NexusError::Internal { message: e })?;
     // up 幂等（同 vip 覆盖，仍成功）
-    subnet_up(&cfg_ok, &state, false).map_err(|e| NexusError::Internal { message: e })?;
+    subnet_up(&cfg_ok, &state, false, false).map_err(|e| NexusError::Internal { message: e })?;
     let up = up_json.get("subnet").cloned().unwrap_or_default();
 
     // status（读回）
@@ -8770,8 +8770,8 @@ locator = "udp://127.0.0.1:42001"
 
     // ---- P3.4 加密状态（§12.31）：--encrypt-state 加密落盘 + status 解密读回 ----
     let state_sec = dir.join("subnet-state-secure.json");
-    let enc_up_json =
-        subnet_up(&cfg_ok, &state_sec, true).map_err(|e| NexusError::Internal { message: e })?;
+    let enc_up_json = subnet_up(&cfg_ok, &state_sec, true, false)
+        .map_err(|e| NexusError::Internal { message: e })?;
     let enc_up_ok = enc_up_json
         .get("subnet")
         .and_then(|s| s.get("up"))
@@ -8830,7 +8830,7 @@ locator = "udp://127.0.0.1:42001"
 
     // 四类非法配置
     let classify = |path: &PathBuf| -> String {
-        match subnet_up(path, &state, false) {
+        match subnet_up(path, &state, false, false) {
             Err(_) => "CONFIG_ERROR".to_string(),
             Ok(_) => "ACCEPTED".to_string(),
         }
@@ -9485,7 +9485,7 @@ encryption = true
 address = "udp://203.0.113.10:11010"
 "#,
     )?;
-    let psk_required_err = match subnet_up(&cfg_no_psk, &state, false) {
+    let psk_required_err = match subnet_up(&cfg_no_psk, &state, false, false) {
         Err(e) if e.contains("PSK_REQUIRED") => "PSK_REQUIRED",
         Err(e) => {
             return Err(NexusError::Internal {
@@ -9514,7 +9514,7 @@ network_psk = "test-psk-001"
 address = "udp://203.0.113.10:11010"
 "#,
     )?;
-    subnet_up(&cfg_psk, &state, false).map_err(|e| NexusError::Internal {
+    subnet_up(&cfg_psk, &state, false, false).map_err(|e| NexusError::Internal {
         message: format!("decentralized join: bootstrap+psk rejected: {e}"),
     })?;
     events.push("bootstrap_psk_ok");
@@ -9533,7 +9533,7 @@ virtual_ip = "10.99.0.2"
 locator = "udp://127.0.0.1:42001"
 "#,
     )?;
-    subnet_up(&cfg_legacy, &state, false).map_err(|e| NexusError::Internal {
+    subnet_up(&cfg_legacy, &state, false, false).map_err(|e| NexusError::Internal {
         message: format!("decentralized join: legacy config rejected: {e}"),
     })?;
     events.push("legacy_config_unchanged");

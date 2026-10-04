@@ -476,6 +476,11 @@ pub trait BootstrapHook {
 
     /// 每 tick 调用：返回待发数据报与 peer 增删（心跳/刷新/服务端 sweep）。
     fn periodic(&mut self, now: u64) -> BootstrapTick;
+
+    /// 服务端权威分配的本端 VIP（bootstrap 入网后；未入网为 None）。
+    fn assigned_vip(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// 一次 tick 产出的 bootstrap 出站数据报与 peer 增删（v2 §6.4）。
@@ -487,6 +492,8 @@ pub struct BootstrapTick {
     pub peers_added: Vec<crate::bootstrap_server::BootstrapPeer>,
     /// 降级 peer（不删，仅标记）。
     pub peers_gone: Vec<String>,
+    /// 结构化可观测事件（本 tick 取出，避免无界增长）。
+    pub events: Vec<String>,
 }
 
 impl VirtualSubnetTunnel {
@@ -593,8 +600,6 @@ impl VirtualSubnetTunnel {
     }
 
     /// Bootstrap 内部发出口（v2 §6.4）：薄封装 carrier.send_to，供常驻 tick 发心跳/刷新/sweep 回执。
-    /// P3-b 的 mesh tick 接线会调用；此前临时 allow（避免 dead-code gate）。
-    #[allow(dead_code)]
     pub(crate) fn send_raw(
         &mut self,
         locator: &str,
@@ -606,6 +611,23 @@ impl VirtualSubnetTunnel {
                 operation: "bootstrap send_raw".to_string(),
                 message: e.to_string(),
             })
+    }
+
+    /// 驱动挂载的 Bootstrap 钩子周期性 tick（v2 §6.4）：心跳/刷新/sweep 出站数据报
+    /// 统一经 [`Self::send_raw`] 发出；返回 peer 增删供 mesh 层接管打洞。
+    pub fn bootstrap_tick(&mut self, now: u64) -> BootstrapTick {
+        match self.bootstrap.as_mut() {
+            Some(hook) => {
+                let tick = hook.periodic(now);
+                for (dst, bytes) in &tick.datagrams {
+                    if self.send_raw(dst, bytes).is_err() {
+                        break;
+                    }
+                }
+                tick
+            }
+            None => BootstrapTick::default(),
+        }
     }
 
     pub fn add_route(

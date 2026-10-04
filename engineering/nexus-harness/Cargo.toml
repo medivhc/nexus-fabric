@@ -13,6 +13,7 @@ workspace = true
 serde_json = { version = "1", default-features = false, features = ["std"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 nexus-connectivity = { path = "../../crates/nexus-connectivity" }
+nexus-platform = { path = "../../crates/nexus-platform" }
 nexus-dns = { path = "../../crates/nexus-dns" }
 nexus-projection = { path = "../../crates/nexus-projection" }
 # dev-dependencies（仅单测；不进二进制）

@@ -257,6 +257,20 @@ impl AutoMeshController {
                 }
             }
 
+            // 2c. Bootstrap 常驻会话 tick（v2 §6.4）：心跳/刷新/sweep 出站经隧道 send_raw，
+            //     新发现 peer 交回打洞。未挂载 hook 时为 no-op。
+            let bt = self.tunnel.bootstrap_tick(now_secs);
+            for p in bt.peers_added {
+                self.add_discovered_peer(&p.virtual_ip, &p.locator);
+            }
+            // W-GONE：peer 从最新 PeerList 消失 → 降级（不删除隧道 peer）。
+            for gone in bt.peers_gone {
+                eprintln!("bootstrap: peer {gone} degraded (absent from PeerList)");
+            }
+            for ev in bt.events {
+                eprintln!("bootstrap: {ev}");
+            }
+
             // 3. 检查所有 peer，自动打洞
             self.drive_punches();
 

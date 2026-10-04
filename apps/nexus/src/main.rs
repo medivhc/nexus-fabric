@@ -558,7 +558,7 @@ fn run_subnet(args: &[String], json_mode: bool) -> i32 {
                     Err(e) => nexus::subnet_cli::classify_tun_error(&e),
                 }
             } else {
-                match subnet_up(&cfg, &state_path, encrypt_state) {
+                match subnet_up(&cfg, &state_path, encrypt_state, false) {
                     Ok(v) => v,
                     Err(e) => serde_json::json!({
                         "verdict": "CONFIG_ERROR",
@@ -628,8 +628,8 @@ fn subnet_foreground(
         (|| {
             let tunnel =
                 assemble_default_tunnel(cfg).map_err(|e| ("CONFIG_ERROR".to_string(), e))?;
-            let up =
-                subnet_up(cfg, state_path, encrypt).map_err(|e| ("CONFIG_ERROR".to_string(), e))?;
+            let up = subnet_up(cfg, state_path, encrypt, false)
+                .map_err(|e| ("CONFIG_ERROR".to_string(), e))?;
             println!("{up}");
             // Auto-Mesh 自动挡：自动打洞 + 断线自动重连。
             let mut mesh = AutoMeshController::new(tunnel, 500);
@@ -688,7 +688,7 @@ fn subnet_foreground_real(
         }
     };
     let mut up =
-        subnet_up(cfg, state_path, encrypt).map_err(|e| ("CONFIG_ERROR".to_string(), e))?;
+        subnet_up(cfg, state_path, encrypt, true).map_err(|e| ("CONFIG_ERROR".to_string(), e))?;
     if let Some(obj) = up.as_object_mut() {
         obj.insert("local_locator".into(), serde_json::json!(local_locator));
     }

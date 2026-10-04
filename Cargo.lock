@@ -848,6 +848,7 @@ version = "0.1.0"
 dependencies = [
  "nexus-connectivity",
  "nexus-dns",
+ "nexus-platform",
  "nexus-projection",
  "serde_json",
  "sha2",

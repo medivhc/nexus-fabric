@@ -54,6 +54,8 @@ pub struct BootstrapSession {
     pub last_hb_at: u64,
     /// 最近一次刷新时刻。
     pub last_refresh_at: u64,
+    /// 可观测性事件（结构化，最小）。
+    pub events: Vec<String>,
     /// 客户端随机 nonce（与 server_nonce 绑定进 AEAD 明文前缀）。
     client_nonce: u64,
     /// 服务端随机 nonce。
@@ -244,9 +246,16 @@ impl<'a> BootstrapJoiner<'a> {
             .ok_or(BootstrapJoinError::NotBootstrap)?;
         // 只接受来自当前配置服务器的回包（W5：防伪造源触发切节点）。
         self.check_source(&ep.server_locator)?;
-        // 0x12 Error 帧 -> 视为认证/可达性失败，切下一端。
+        // 0x12 Error 帧：按内码分流（R1）——RateLimited→切下一端；BadVip/VipConflict→致命；
+        // 其余（含无内码）→ 视为认证/可达性失败切下一端。
         if payload.first() == Some(&0x12) {
-            return Err(BootstrapJoinError::AuthFailed(String::new()));
+            return match payload.get(1).copied() {
+                Some(5) => Err(BootstrapJoinError::Timeout),
+                Some(2) | Some(3) => Err(BootstrapJoinError::BadVip(
+                    "server rejected requested vip".into(),
+                )),
+                _ => Err(BootstrapJoinError::AuthFailed(String::new())),
+            };
         }
         let resp = self.codec.decode_join_reply(payload)?;
 
@@ -310,6 +319,7 @@ impl<'a> BootstrapJoiner<'a> {
             refresh_interval_ms: resp.refresh_interval_ms,
             last_hb_at: now,
             last_refresh_at: now,
+            events: Vec::new(),
             client_nonce,
             server_nonce: resp.server_nonce,
         };
@@ -467,15 +477,40 @@ impl<'a> BootstrapJoiner<'a> {
         }
     }
 
-    /// 校验最近一帧来源 locator 与所连服务器一致（W5）。
+    /// 校验最近一帧来源与所连服务器属于同一端点（R3：按 host:port 归一，
+    /// 容忍 DNS 解析后 carrier 回报 IP:port 与配置 hostname:port 的差异）。
     fn check_source(&self, expected: &str) -> Result<(), BootstrapJoinError> {
-        match self.carrier.last_peer_locator() {
-            Some(got) if got == expected => Ok(()),
-            Some(got) => Err(BootstrapJoinError::MalformedFrame(format!(
-                "reply from unexpected source {got}"
-            ))),
-            None => Ok(()), // 测试桩无来源信息时放行。
+        let Some(got) = self.carrier.last_peer_locator() else {
+            return Ok(()); // 测试桩无来源信息时放行。
+        };
+        let norm = |l: &str| {
+            let l = l.strip_prefix("udp://").unwrap_or(l);
+            l.trim_end_matches('/').to_ascii_lowercase()
+        };
+        let split = |l: &str| -> (String, Option<u16>) {
+            match l.rsplit_once(':') {
+                Some((h, p)) => (h.to_string(), p.parse::<u16>().ok()),
+                None => (l.to_string(), None),
+            }
+        };
+        let (got_h, got_p) = split(&norm(&got));
+        let (exp_h, exp_p) = split(&norm(expected));
+        // T2：端口必须匹配；host 仅在「expected 与 actual 均为 IP 字面量且不等」时才拒。
+        // expected host 为域名时跳过 host 相等判定（帧真实性由 PSK/AEAD 保证，而非源地址）。
+        if let (Some(gp), Some(ep)) = (got_p, exp_p) {
+            if gp != ep {
+                return Err(BootstrapJoinError::MalformedFrame(format!(
+                    "reply port {gp} != expected {ep}"
+                )));
+            }
         }
+        let is_ip = |h: &str| h.parse::<std::net::IpAddr>().is_ok();
+        if is_ip(&exp_h) && is_ip(&got_h) && exp_h != got_h {
+            return Err(BootstrapJoinError::MalformedFrame(format!(
+                "reply from unexpected ip {got_h} (want {exp_h})"
+            )));
+        }
+        Ok(())
     }
 
     fn strip<'b>(&self, wire: &'b [u8]) -> Result<&'b [u8], BootstrapJoinError> {
@@ -502,6 +537,158 @@ impl<'a> BootstrapJoiner<'a> {
 impl From<crate::encryption::EncryptionError> for BootstrapJoinError {
     fn from(e: crate::encryption::EncryptionError) -> Self {
         Self::Crypto(e.to_string())
+    }
+}
+
+/// 客户端常驻 Bootstrap 钩子（v2 §6.4，S5）：挂在隧道上，持有已建立会话。
+///
+/// **不持有 carrier**——出站数据报放进 [`crate::virtual_subnet::BootstrapTick`]，
+/// 由隧道 `send_raw` 代发；入站 secured 控制帧在 `on_control_datagram` 内解密处理。
+pub struct ClientBootstrapHook {
+    session: BootstrapSession,
+    codec: Box<dyn BootstrapFrameCodec + Send>,
+    /// 已知 peer（node_id -> peer）。
+    known: std::collections::HashMap<String, BootstrapPeer>,
+    /// 最近 PeerList 中消失、待本 tick 降级（不删除）的 node_id。
+    pending_gone: Vec<String>,
+}
+
+impl ClientBootstrapHook {
+    /// 入网成功后包装会话为常驻钩子。
+    #[must_use]
+    pub fn new(
+        session: BootstrapSession,
+        codec: Box<dyn BootstrapFrameCodec + Send>,
+        initial_peers: Vec<BootstrapPeer>,
+    ) -> Self {
+        let mut known = std::collections::HashMap::new();
+        for p in initial_peers {
+            known.insert(p.node_id.clone(), p);
+        }
+        Self {
+            session,
+            codec,
+            known,
+            pending_gone: Vec::new(),
+        }
+    }
+
+    /// 本端权威 VIP（供装配层写状态/打洞）。
+    #[must_use]
+    pub fn assigned_vip(&self) -> Option<&str> {
+        Some(&self.session.assigned_vip)
+    }
+
+    /// 把一条已认证控制帧序列化成 nxb: 线（nonce 前缀 + AEAD）。
+    fn build_wire(&mut self, ctrl: &BootstrapCtrl) -> Result<Vec<u8>, BootstrapJoinError> {
+        let inner = self.codec.encode(ctrl)?;
+        let mut plain = Vec::with_capacity(16 + inner.len());
+        plain.extend_from_slice(&self.session.client_nonce.to_be_bytes());
+        plain.extend_from_slice(&self.session.server_nonce.to_be_bytes());
+        plain.extend(inner);
+        let seq = self.session.tx_seq;
+        self.session.tx_seq += 1;
+        let blob = encrypt_frame(&self.session.keys.tx, seq, &plain)
+            .map_err(|e| BootstrapJoinError::Crypto(e.to_string()))?;
+        let mut wire = Vec::with_capacity(NXB_MAGIC.len() + blob.len());
+        wire.extend_from_slice(NXB_MAGIC);
+        wire.extend_from_slice(&blob);
+        Ok(wire)
+    }
+}
+
+impl crate::virtual_subnet::BootstrapHook for ClientBootstrapHook {
+    fn on_control_datagram(
+        &mut self,
+        _src: Option<&str>,
+        payload: &[u8],
+        _now: u64,
+    ) -> Option<(String, Vec<u8>)> {
+        // 仅处理 AEAD secured 帧（首字节 0x01）。
+        if payload.first() != Some(&0x01) {
+            return None;
+        }
+        let (seq, plain) = decrypt_frame(&self.session.keys.rx, payload).ok()?;
+        self.session.rx_replay.check_and_accept(seq).ok()?;
+        if plain.len() < 16
+            || plain[0..8] != self.session.client_nonce.to_be_bytes()[..]
+            || plain[8..16] != self.session.server_nonce.to_be_bytes()[..]
+        {
+            return None;
+        }
+        let inner = &plain[16..];
+        match self.codec.decode(inner).ok()? {
+            BootstrapCtrl::PeerList { peers } => {
+                // W-GONE：用最新 PeerList 全量替换 known；缺失的旧 node_id 填 pending_gone
+                // （仅降级，不删隧道 peer）。
+                let new_ids: std::collections::HashSet<String> =
+                    peers.iter().map(|p| p.node_id.clone()).collect();
+                for old in self.known.keys() {
+                    if !new_ids.contains(old) {
+                        self.pending_gone.push(old.clone());
+                    }
+                }
+                self.known.clear();
+                for p in peers {
+                    self.known.insert(p.node_id.clone(), p);
+                }
+                None
+            }
+            // RegisterAck / Heartbeat 响应： solicited，无需回包。
+            _ => None,
+        }
+    }
+
+    fn periodic(&mut self, now: u64) -> crate::virtual_subnet::BootstrapTick {
+        // W-GONE：上一 PeerList 缺失节点，本 tick 降级（不删）。
+        let peers_gone = std::mem::take(&mut self.pending_gone);
+        // T4：取出累积事件返回，避免无界增长。
+        let events = std::mem::take(&mut self.session.events);
+        let mut tick = crate::virtual_subnet::BootstrapTick {
+            peers_gone,
+            events,
+            ..Default::default()
+        };
+        let hb_secs = self.session.hb_interval_ms as u64 / 1000;
+        let rf_secs = self.session.refresh_interval_ms as u64 / 1000;
+        // 心跳到期。
+        if now.saturating_sub(self.session.last_hb_at) >= hb_secs.max(1) {
+            let ctrl = BootstrapCtrl::Heartbeat {
+                node_id: String::new(),
+                now,
+            };
+            match self.build_wire(&ctrl) {
+                Ok(wire) => {
+                    tick.datagrams
+                        .push((self.session.server_locator.clone(), wire));
+                    self.session.last_hb_at = now;
+                }
+                Err(e) => self
+                    .session
+                    .events
+                    .push(format!("bootstrap.hb_encode_failed: {e}")),
+            }
+        }
+        // PeerList 刷新到期。
+        if now.saturating_sub(self.session.last_refresh_at) >= rf_secs.max(1) {
+            let ctrl = BootstrapCtrl::GetPeers {
+                node_id: String::new(),
+            };
+            match self.build_wire(&ctrl) {
+                Ok(wire) => {
+                    tick.datagrams
+                        .push((self.session.server_locator.clone(), wire));
+                    self.session.last_refresh_at = now;
+                    // 新发现节点（尚未在隧道 peer 表）交回 mesh 打洞。
+                    tick.peers_added = self.known.values().cloned().collect();
+                }
+                Err(e) => self
+                    .session
+                    .events
+                    .push(format!("bootstrap.refresh_encode_failed: {e}")),
+            }
+        }
+        tick
     }
 }
 
@@ -685,5 +872,41 @@ mod tests {
         assert!(matches!(err, BootstrapJoinError::PskRequired));
         // 空 PSK 守卫在发任何帧之前。
         assert!(carrier.sent.is_empty());
+    }
+    #[test]
+    fn t2_check_source_domain_expected_ip_actual_is_allowed() {
+        let mut carrier = MemCarrier {
+            inbox: std::collections::VecDeque::new(),
+            drained_first: 0,
+            drained_target: 0,
+            sent: Vec::new(),
+            // carrier 回报解析后的 IP:port；配置为域名。
+            last_src: Some("udp://203.0.113.9:11010".into()),
+        };
+        let identity = KeyPair::from_seed(&[1u8; 32]);
+        let joiner = BootstrapJoiner::new(&mut carrier, &identity, b"psk", &JCodec);
+        // expected host 为域名 → 跳过 host 相等判定，仅校验端口。
+        assert!(
+            joiner
+                .check_source("udp://bootstrap.example.internal:11010")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn t2_check_source_ip_literal_mismatch_is_rejected() {
+        let mut carrier = MemCarrier {
+            inbox: std::collections::VecDeque::new(),
+            drained_first: 0,
+            drained_target: 0,
+            sent: Vec::new(),
+            last_src: Some("udp://203.0.113.9:11010".into()),
+        };
+        let identity = KeyPair::from_seed(&[1u8; 32]);
+        let joiner = BootstrapJoiner::new(&mut carrier, &identity, b"psk", &JCodec);
+        // 两端都是 IP 字面量且不等 → 拒绝。
+        assert!(joiner.check_source("udp://198.51.100.7:11010").is_err());
+        // 端口不等也拒。
+        assert!(joiner.check_source("udp://203.0.113.9:9999").is_err());
     }
 }

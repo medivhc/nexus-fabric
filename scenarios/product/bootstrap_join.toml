@@ -1,0 +1,22 @@
+schema_version = 1
+id = "product.bootstrap-join"
+title = "Bootstrap 自动入网：PSK 全握手 E2E（JoinInit→JoinReply→Register→Ack→GetPeers→PeerList）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#bootstrap-join"
+
+[given]
+
+[when]
+command = "cargo run --quiet -p nexus-harness -- run bootstrap-join --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "assigned_vip"
+non_empty = true
+
+[[expect]]
+field = "peer_count"
+one_of = [1]

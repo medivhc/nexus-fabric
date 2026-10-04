@@ -17,7 +17,7 @@ use nexus_discovery::bootstrap_join::{
 };
 
 /// 组合根 codec：connectivity 解耦类型 <-> discovery 字节。
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct DiscoveryBootstrapCodec;
 
 impl DiscoveryBootstrapCodec {

@@ -7,12 +7,15 @@
 
 use std::path::{Path, PathBuf};
 
+use nexus_connectivity::bootstrap_joiner::{
+    BootstrapEndpoint, BootstrapJoiner, ClientBootstrapHook,
+};
 use nexus_connectivity::cidr::{cidr_contains, parse_cidr};
 use nexus_connectivity::coord::derive_vip;
 use nexus_connectivity::encryption::{EncryptionConfig, KeyPair};
 use nexus_connectivity::virtual_subnet::{
-    MemoryVpi, MeshCarrier, TunnelPeer, TunnelState, VirtualSubnetConfig, VirtualSubnetEvent,
-    VirtualSubnetTunnel,
+    BootstrapHook, MemoryVpi, MeshCarrier, TunnelPeer, TunnelState, VirtualSubnetConfig,
+    VirtualSubnetEvent, VirtualSubnetTunnel,
 };
 use nexus_platform::{PacketCarrier, UdpCarrier, VirtualPacketInterface};
 use serde::{Deserialize, Serialize};
@@ -323,25 +326,77 @@ fn load_network_psk(s: &SubnetSection) -> Result<Option<Vec<u8>>, String> {
     Ok(None)
 }
 
+/// 回读 `node init` 持久化的 x25519 seed（§12.39），重建长期身份（v2 P3：
+/// 替换一次性 generate，使 node_id/VIP 在重启后稳定）。无持久身份时 Err（调用方 fallback）。
+fn load_node_identity() -> Result<KeyPair, String> {
+    let path = crate::node_cli::node_dir().join("identity");
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| format!("read identity {path:?}: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("parse identity: {e}"))?;
+    let hex = v
+        .get("x25519_seed_hex")
+        .and_then(Value::as_str)
+        .ok_or("identity missing x25519_seed_hex")?;
+    let bytes = decode_hex(hex)?;
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "seed must be 32 bytes".to_string())?;
+    Ok(KeyPair::from_seed(&arr))
+}
+
+/// 最小 hex 解码（避免新增依赖）。
+fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
+    let b: Vec<u8> = s
+        .as_bytes()
+        .chunks(2)
+        .map(|c| {
+            let hi = hex_nibble(c[0])?;
+            let lo = hex_nibble(c.get(1).copied().ok_or("odd hex len")?)?;
+            Ok(hi << 4 | lo)
+        })
+        .collect::<Result<Vec<u8>, String>>()?;
+    Ok(b)
+}
+
+fn hex_nibble(c: u8) -> Result<u8, String> {
+    match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        b'A'..=b'F' => Ok(c - b'A' + 10),
+        _ => Err(format!("bad hex digit {c}")),
+    }
+}
+
 /// `subnet up --config <path>`：校验 → 装配 → 写状态文件（`--encrypt-state` 加密落盘）。
 pub fn subnet_up(
     config_path: &Path,
     state_path: &Path,
     encrypt_state: bool,
+    foreground: bool,
 ) -> Result<Value, String> {
     let config = parse_config(config_path)?;
+    // v2 §7.2/S6：bootstrap 入网需要常驻前台心跳/刷新循环；一次性 `subnet up`（非前台）
+    // 不提供该循环，fail-closed。前台 daemon（subnet_foreground_real）传 foreground=true 越过。
+    if !foreground && !config.subnet.bootstrap.is_empty() {
+        return Err(
+            "BOOTSTRAP_REQUIRES_FOREGROUND: bootstrap join needs the persistent foreground daemon"
+                .into(),
+        );
+    }
     // §12.43：PSK 文件权限等在装配前校验（fail-closed）。
     let _psk = load_network_psk(&config.subnet)?;
-    // §12.43：virtual_ip 缺省 → 确定性派生。
-    // E4/mock 路径用临时身份；生产 daemon 必须用 §12.39 持久身份（secure-store），见 Feature 2。
+    // T3：身份全程只获取一次（load_node_identity，缺失才 generate 一次），
+    // VIP 派生、状态写与 join/assemble_with 共用同一把 KeyPair。
+    let identity =
+        load_node_identity().or_else(|_| KeyPair::generate().map_err(|e| e.to_string()))?;
+    // §12.43：virtual_ip 缺省 → 由同一身份公钥确定性派生。
     let virtual_ip = match &config.subnet.virtual_ip {
         Some(vip) => vip.clone(),
-        None => {
-            let eph_id = KeyPair::generate().map_err(|e| format!("DERIVE_VIP_IDENTITY: {e:?}"))?;
-            derive_vip(eph_id.public_key_bytes(), &config.subnet.cidr, 0)
-                .map_err(|e| format!("DERIVE_VIP: {e:?}"))?
-                .to_string()
-        }
+        None => derive_vip(identity.public_key_bytes(), &config.subnet.cidr, 0)
+            .map_err(|e| format!("DERIVE_VIP: {e:?}"))?
+            .to_string(),
     };
     let mut config = config;
     config.subnet.virtual_ip = Some(virtual_ip.clone());
@@ -349,6 +404,7 @@ pub fn subnet_up(
         &config,
         Box::new(MemoryVpi::new()),
         Box::new(MeshCarrier::new()),
+        &identity,
     )?;
     let s = &config.subnet;
     let state = SubnetState {
@@ -531,10 +587,40 @@ pub fn classify_tun_error(err: &str) -> Value {
 }
 
 /// 按已校验配置装配隧道（可指定 VPI 与 carrier，P3.2 真实数据面）。
+/// v2 §7.2：bootstrap 入网 + 构造常驻 hook。`section.bootstrap` 为空 → `Ok(None)`；
+/// 非空 → 经 DiscoveryBootstrapCodec 在 `&mut carrier` 上完成 PSK 入网，返回
+/// `ClientBootstrapHook`（装箱，供 `tunnel.set_bootstrap_hook`）。抽成独立函数便于离线单测。
+fn bootstrap_join_and_make_hook(
+    carrier: &mut dyn PacketCarrier,
+    identity: &KeyPair,
+    section: &SubnetSection,
+    now: u64,
+) -> Result<Option<Box<dyn BootstrapHook>>, String> {
+    if section.bootstrap.is_empty() {
+        return Ok(None);
+    }
+    let psk = load_network_psk(section)?.ok_or("BOOTSTRAP_PSK_REQUIRED")?;
+    let codec = crate::bootstrap_codec::DiscoveryBootstrapCodec::new();
+    let eps: Vec<BootstrapEndpoint> = section
+        .bootstrap
+        .iter()
+        .map(|b| BootstrapEndpoint {
+            server_locator: b.address.clone(),
+        })
+        .collect();
+    let mut joiner = BootstrapJoiner::new(carrier, identity, &psk, &codec);
+    let (session, peers) = joiner
+        .join(&eps, section.virtual_ip.as_deref(), now, 5_000)
+        .map_err(|e| format!("BOOTSTRAP_JOIN: {e}"))?;
+    let hook = ClientBootstrapHook::new(session, Box::new(codec), peers);
+    Ok(Some(Box::new(hook)))
+}
+
 fn assemble_with(
     config: &SubnetConfig,
     vpi: Box<dyn VirtualPacketInterface>,
     carrier: Box<dyn PacketCarrier>,
+    identity: &KeyPair,
 ) -> Result<VirtualSubnetTunnel, String> {
     let s = &config.subnet;
     // §12.43：调用方（subnet_up）须先解析 virtual_ip；此处防御性校验。
@@ -542,11 +628,29 @@ fn assemble_with(
         .virtual_ip
         .as_deref()
         .ok_or("VIRTUAL_IP_UNRESOLVED: virtual_ip must be resolved before assemble")?;
+    // v2 §7.2：bootstrap 非空 → 在 carrier move 进隧道前，借 &mut carrier 完成 PSK 入网，
+    // 得到常驻 hook；建隧道后 set_bootstrap_hook。carrier move 顺序：join(&mut carrier) → tunnel::new。
+    // T3：identity 由调用方全程只获取一次传入（与 VIP 派生同一把 KeyPair）。
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut carrier = carrier;
+    let hook = bootstrap_join_and_make_hook(&mut *carrier, identity, s, now)?;
+    // W-VIP：bootstrap 入网成功后，隧道本地 VIP 改用服务端权威租约 assigned_vip，
+    // 保证本端地址与服务端分配一致（而非配置/派生的 static VIP）。
+    let local_vip = hook
+        .as_ref()
+        .and_then(|h| h.assigned_vip().map(str::to_string))
+        .unwrap_or_else(|| vip.to_string());
     let mut tunnel = VirtualSubnetTunnel::new(
-        VirtualSubnetConfig::new(s.cidr.clone(), vip.to_string()),
+        VirtualSubnetConfig::new(s.cidr.clone(), local_vip),
         vpi,
         carrier,
     );
+    if let Some(h) = hook {
+        tunnel.set_bootstrap_hook(Some(h));
+    }
     for peer in &s.peers {
         tunnel
             .add_peer(TunnelPeer::new(
@@ -582,10 +686,13 @@ fn assemble_with(
 /// 返回隧道对象供 nexusd 常驻持有（进程为 Owner，随 drop 清理）。
 pub fn assemble_default_tunnel(config_path: &Path) -> Result<VirtualSubnetTunnel, String> {
     let config = parse_config(config_path)?;
+    let identity =
+        load_node_identity().or_else(|_| KeyPair::generate().map_err(|e| e.to_string()))?;
     assemble_with(
         &config,
         Box::new(MemoryVpi::new()),
         Box::new(MeshCarrier::new()),
+        &identity,
     )
 }
 
@@ -606,7 +713,9 @@ fn assemble_real_tunnel(
         .map_err(|e| format!("TUN_ERROR: udp bind: {e}"))?;
     let vpi = nexus_platform_windows::WintunVpiAdapter::create(tun_name, "Nexus")
         .map_err(|e| format!("TUN_ERROR: wintun create: {e}"))?;
-    let tunnel = assemble_with(config, Box::new(vpi), Box::new(carrier))?;
+    let identity =
+        load_node_identity().or_else(|_| KeyPair::generate().map_err(|e| e.to_string()))?;
+    let tunnel = assemble_with(config, Box::new(vpi), Box::new(carrier), &identity)?;
     Ok((tunnel, bound))
 }
 
@@ -623,7 +732,9 @@ fn assemble_real_tunnel(
         .map_err(|e| format!("TUN_ERROR: udp bind: {e}"))?;
     let vpi = nexus_platform_linux::TunVpi::create(tun_name)
         .map_err(|e| format!("TUN_ERROR: tun create: {e}"))?;
-    let tunnel = assemble_with(config, Box::new(vpi), Box::new(carrier))?;
+    let identity =
+        load_node_identity().or_else(|_| KeyPair::generate().map_err(|e| e.to_string()))?;
+    let tunnel = assemble_with(config, Box::new(vpi), Box::new(carrier), &identity)?;
     Ok((tunnel, bound))
 }
 
@@ -641,7 +752,7 @@ pub fn subnet_up_tun(
     validate_tun_name(tun_name)?;
     let config = parse_config(config_path)?;
     let (_tunnel, bound) = assemble_real_tunnel(&config, tun_name, listen)?;
-    let mut out = subnet_up(config_path, state_path, false)?;
+    let mut out = subnet_up(config_path, state_path, false, false)?;
     if let Some(obj) = out.as_object_mut() {
         obj.insert("local_locator".into(), serde_json::json!(bound));
     }
@@ -659,7 +770,7 @@ pub fn subnet_up_tun(
     validate_tun_name(tun_name)?;
     let config = parse_config(config_path)?;
     let (_tunnel, bound) = assemble_real_tunnel(&config, tun_name, listen)?;
-    let mut out = subnet_up(config_path, state_path, false)?;
+    let mut out = subnet_up(config_path, state_path, false, false)?;
     if let Some(obj) = out.as_object_mut() {
         obj.insert("local_locator".into(), serde_json::json!(bound));
     }
@@ -712,7 +823,14 @@ pub fn subnet_punch(
     let bound = carrier
         .bind(listen)
         .map_err(|e| format!("PUNCH_BIND_FAILED: {e}"))?;
-    let mut tunnel = assemble_with(&config, Box::new(MemoryVpi::new()), Box::new(carrier))?;
+    let identity =
+        load_node_identity().or_else(|_| KeyPair::generate().map_err(|e| e.to_string()))?;
+    let mut tunnel = assemble_with(
+        &config,
+        Box::new(MemoryVpi::new()),
+        Box::new(carrier),
+        &identity,
+    )?;
     tunnel
         .add_peer(TunnelPeer::new(peer_vip, targets[0].clone()))
         .map_err(|e| e.to_string())?;
@@ -808,4 +926,173 @@ fn update_state_punch(state_path: &Path, punch: PunchRecord) -> Result<(), Strin
         json.into_bytes()
     };
     std::fs::write(state_path, enc).map_err(|e| format!("STATE_WRITE: {e}"))
+}
+
+#[cfg(test)]
+mod bootstrap_wire_tests {
+    use super::*;
+    use nexus_connectivity::bootstrap_server::{BootstrapServer, BootstrapServerConfig};
+    use nexus_connectivity::encryption::KeyPair;
+    use nexus_connectivity::virtual_subnet::MemoryCarrier;
+    use nexus_platform::PacketCarrier;
+
+    fn section_with_bootstrap(addr: &str, psk: &str) -> SubnetSection {
+        SubnetSection {
+            cidr: "10.144.144.0/24".into(),
+            virtual_ip: None,
+            encryption: false,
+            network_psk: Some(psk.into()),
+            network_psk_file: None,
+            bootstrap: vec![BootstrapConfig {
+                address: addr.into(),
+                name: None,
+            }],
+            peers: Vec::new(),
+            routes: Vec::new(),
+            prefix_routes: Vec::new(),
+            local_prefixes: Vec::new(),
+            egress: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn bootstrap_join_and_make_hook_offline_e2e() {
+        let server_identity = KeyPair::from_seed(&[9u8; 32]);
+        let client_identity = KeyPair::from_seed(&[1u8; 32]);
+        let (server_carrier, client_carrier) = MemoryCarrier::connected_pair();
+
+        let cfg = BootstrapServerConfig {
+            cidr: "10.144.144.0/24".into(),
+            lease_secs: 60,
+            hb_interval_ms: 20_000,
+            refresh_interval_ms: 60_000,
+            server_vip: "10.144.144.1".into(),
+            server_locator: "udp://bootstrap:11010".into(),
+            max_pending_per_src: 4,
+        };
+        let mut server = BootstrapServer::new(
+            server_identity,
+            b"shared-psk".to_vec(),
+            cfg,
+            Box::new(crate::bootstrap_codec::DiscoveryBootstrapCodec::new()),
+            None,
+        )
+        .unwrap();
+        server.upsert_self_entry(1000);
+
+        let mut sc = server_carrier;
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                match sc.receive_into(&mut buf) {
+                    Ok(0) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                    Ok(n) => {
+                        if let Some((dst, bytes)) =
+                            server.handle_datagram("udp://client:1", &buf[..n], 1000)
+                        {
+                            let _ = sc.send_to(&dst, &bytes);
+                        }
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                }
+            }
+        });
+
+        let section = section_with_bootstrap("udp://bootstrap:11010", "shared-psk");
+        let mut cc = client_carrier;
+        let mut hook = bootstrap_join_and_make_hook(&mut cc, &client_identity, &section, 1000)
+            .expect("join ok")
+            .expect("hook present");
+        // 推进到刷新间隔之后：periodic 应产出刷新/心跳 datagrams。
+        let tick = hook.periodic(61_000);
+        assert!(
+            !tick.datagrams.is_empty(),
+            "periodic should emit heartbeat/refresh"
+        );
+        assert!(
+            tick.peers_added
+                .iter()
+                .any(|p| p.virtual_ip == "10.144.144.1")
+        );
+    }
+
+    #[test]
+    fn bootstrap_wrong_psk_returns_typed_err_no_hook() {
+        let server_identity = KeyPair::from_seed(&[9u8; 32]);
+        let client_identity = KeyPair::from_seed(&[1u8; 32]);
+        let (server_carrier, client_carrier) = MemoryCarrier::connected_pair();
+        let cfg = BootstrapServerConfig {
+            cidr: "10.144.144.0/24".into(),
+            lease_secs: 60,
+            hb_interval_ms: 20_000,
+            refresh_interval_ms: 60_000,
+            server_vip: "10.144.144.1".into(),
+            server_locator: "udp://bootstrap:11010".into(),
+            max_pending_per_src: 4,
+        };
+        let mut server = BootstrapServer::new(
+            server_identity,
+            b"right-psk".to_vec(),
+            cfg,
+            Box::new(crate::bootstrap_codec::DiscoveryBootstrapCodec::new()),
+            None,
+        )
+        .unwrap();
+        server.upsert_self_entry(1000);
+        let mut sc = server_carrier;
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                match sc.receive_into(&mut buf) {
+                    Ok(0) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                    Ok(n) => {
+                        if let Some((dst, bytes)) =
+                            server.handle_datagram("udp://client:1", &buf[..n], 1000)
+                        {
+                            let _ = sc.send_to(&dst, &bytes);
+                        }
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                }
+            }
+        });
+        let section = section_with_bootstrap("udp://bootstrap:11010", "wrong-psk");
+        let mut cc = client_carrier;
+        let err = match bootstrap_join_and_make_hook(&mut cc, &client_identity, &section, 1000) {
+            Err(e) => e,
+            Ok(_) => panic!("wrong psk must not succeed"),
+        };
+        assert!(err.contains("BOOTSTRAP_JOIN"));
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_guard_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_config(dir: &std::path::Path, toml: &str) -> std::path::PathBuf {
+        let p = dir.join("subnet.toml");
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(toml.as_bytes()).unwrap();
+        p
+    }
+
+    #[test]
+    fn non_foreground_with_bootstrap_is_rejected() {
+        let dir = std::path::PathBuf::from("/tmp/nxb_guard_dbg");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = r#"[subnet]
+cidr = "10.144.144.0/24"
+network_psk = "shared-psk"
+[[subnet.bootstrap]]
+address = "udp://bootstrap:11010"
+"#;
+        let cp = write_config(&dir, cfg);
+        let sp = dir.join("state.json");
+        let err = subnet_up(&cp, &sp, false, false).unwrap_err();
+        assert!(err.contains("BOOTSTRAP_REQUIRES_FOREGROUND"), "got {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
