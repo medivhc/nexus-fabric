@@ -1,0 +1,40 @@
+schema_version = 1
+id = "product.path-race"
+title = "路径层建连竞速：staggered 并行尝试，延迟注入的慢路径 vs 快路径，选中快路径"
+evidence_strength = "E4"
+requirement = "docs/foundation/DESIGN.md#4.4"
+
+[given]
+topology = "loopback, fake PathConnector with injected latency (slow 800ms vs fast 50ms)"
+candidates = "direct (slow, 800ms injected) + turn (fast, 50ms injected); stagger order prefers direct first"
+budget = "stagger_delay 200ms, max_parallel 2, total_timeout 5s"
+
+# 可执行 E4：example 用 fake connector（延迟注入）跑 race_connect。
+# - 直连先发（stagger 排序），800ms 延迟；200ms 后 turn 并行启动，50ms 成功。
+# - 断言：胜出者是 turn（快路径），attempts <= max_parallel(2)。
+# - 预算硬上限：总耗时 < total_timeout。
+[when]
+command = "cargo run --quiet -p nexus-path --example path_race -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+# 快路径胜出（staggered 竞速的核心断言）。
+[[expect]]
+field = "race.winner_kind"
+equals = "turn"
+
+# 预算：启动尝试数不超过 max_parallel。
+[[expect]]
+field = "race.attempts_within_budget"
+equals = true
+
+# 可观测：尝试计数与浪费字节数非空（R4）。
+[[expect]]
+field = "race.attempts"
+non_empty = true
+
+[[expect]]
+field = "race.wasted_bytes"
+non_empty = true

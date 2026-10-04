@@ -1,0 +1,20 @@
+schema_version = 1
+id = "platform.workspace-fuse-projection"
+title = "Linux FUSE 投影：挂载 → 内核读写 → 提交 → Head 前进"
+evidence_strength = "E4"
+requirement = "v9#22"
+
+[given]
+platform = "linux"
+# E4 安全红线：只挂载到隔离临时目录（mkdtemp），测完卸载并清理。
+# 无 /dev/fuse 时 example 输出 verdict=SKIP，不判 FAIL（沙盒无 FUSE）。
+# 注意：harness 对 expects 独立求值、无 SKIP 短路，故本 scenario 只断言
+# verdict（PASS/SKIP）。详细字段（write/read/commit/head）由独立 E4 在
+# xc-pc-linux 真机验证，见 Evidence。
+
+[when]
+command = "cargo run --quiet -p nexus-platform-linux --example workspace_fuse_e4 -- --json"
+
+[[expect]]
+field = "verdict"
+one_of = ["PASS", "SKIP"]

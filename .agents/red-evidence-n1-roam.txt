@@ -1,0 +1,12 @@
+# Red Evidence — N1 Universal Connectivity 装配契约（Contract 阶段）
+# Scenario: scenarios/product/n1_connectivity_roam.toml (product.n1-connectivity-roam)
+# 在旧实现（origin/master @ dbc0fdb）上执行，期望 BLOCKED。
+
+$ cargo run --quiet -p nexus-network --example n1_roam -- --json
+error: no example target named `n1_roam` in `nexus-network` package
+EXIT: 101
+
+结论：BLOCKED。N1 装配能力（VPI 包泵、N1 会话/连接表、Link 观测器、
+`nexus network` CLI）在旧实现上不存在，场景无法执行。
+旧实现仅有 InternetAccess 的 NetworkSession（remote P0 冻结契约），
+与 M1–M7 无交集。满足 Contract-First 阶段 A 的 Red Evidence 要求。

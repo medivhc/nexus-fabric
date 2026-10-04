@@ -1,0 +1,31 @@
+# Red Evidence: D7 配对（pairing）
+
+> 日期：2026-10-01
+> 任务类型：feature
+> 契约：crates/nexus-discovery/MODULE.md D7 条款
+> 场景：scenarios/product/pairing.toml
+
+## 旧实现上的执行结果
+
+```bash
+$ ls apps/nexus/examples/ | grep -i pair
+# （无输出，exit 1）
+```
+
+**Verdict: FAIL** —— `pairing_flow` example 不存在，`nexus pair` 命令不存在。
+
+## 冻结的期望
+
+实现完成后，以下必须成立（由 `pairing_flow` example 内部断言）：
+
+- `verdict` = `"PASS"`
+- `code_format_valid` = true（配对码格式 `nexus-pair:v1:...` 可解析）
+- `pairing_completed` = true（双节点配对流程走通）
+- `a_has_b_peer_file` = true（A 的 `peers/` 有 B 的文件）
+- `b_has_a_peer_file` = true（B 的 `peers/` 有 A 的文件）
+- `signature_verified` = true（ed25519 签名验证通过）
+- `wrong_token_rejected` = true（错误 token 被拒绝）
+
+## Contract Hash
+
+待实现完成后生成。

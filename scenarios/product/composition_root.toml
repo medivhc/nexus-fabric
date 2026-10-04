@@ -1,0 +1,74 @@
+schema_version = 1
+id = "product.composition-root"
+title = "Composition Root 接线：N1/DNS/配置装配进 nexusd（E4）"
+evidence_strength = "E4"
+requirement = "DAEMON_ARCHITECTURE.md#13"
+
+[given]
+# 可执行 E4（example composition_root_wiring --json，进程内闭环，无需特权）：
+# - mesh_cidr_from_config：network.toml [vpi.routes] 含 10.200.0.0/24 →
+#   build_dataplane_config 产出 mesh_cidrs == ["10.200.0.0/24"]（不再硬编码 10.0.0.0/8）；
+# - mesh_bypass_overlap_warn：mesh 10.200.0.0/24 与 bypass 无重叠 → overlap 为空；
+#   另测 172.16.5.0/24 mesh 与 172.16.0.0/12 bypass → overlap 非空（纯函数单测覆盖，
+#   此处仅断言主路径）；
+# - dns_toml_parsed：dns.toml [dns] upstream/mesh_suffix/hosts/fake_ip_range →
+#   DnsUnifiedConfig 字段一致；
+# - dns_toml_missing：缺失 dns.toml → dns_config 为 None（默认行为）；
+# - dns_toml_bad：fake_ip_range 非法 → 解析返回 Err；
+# - n1_assemble_ok：合法 network.toml（含 1 peer + 1 route）→
+#   assemble_n1 成功，bridge route_count == 1（dial 尽力而为，无真实对端时 warn
+#   不失败）；
+# - n1_assemble_bad：非法 network.toml → assemble_n1 返回 Err（降级路径）；
+# - hot_reload_classify：network.toml 内容变更 → NeedsRestart；
+#   dns.toml 内容变更 → Hot。
+
+[when]
+command = "cargo run --quiet -p nexusd --example composition_root_wiring -- --json"
+
+[[expect]]
+field = "wiring.mesh_cidrs"
+equals = "10.200.0.0/24"
+
+[[expect]]
+field = "wiring.mesh_cidrs_hardcoded_absent"
+equals = true
+
+[[expect]]
+field = "wiring.dns_upstream"
+equals = "8.8.8.8,1.1.1.1"
+
+[[expect]]
+field = "wiring.dns_mesh_suffix"
+equals = "mesh"
+
+[[expect]]
+field = "wiring.dns_hosts_count"
+equals = 1
+
+[[expect]]
+field = "wiring.dns_missing_is_none"
+equals = true
+
+[[expect]]
+field = "wiring.dns_bad_is_err"
+equals = true
+
+[[expect]]
+field = "wiring.n1_assemble_ok"
+equals = true
+
+[[expect]]
+field = "wiring.n1_route_count"
+equals = 1
+
+[[expect]]
+field = "wiring.n1_assemble_bad_is_err"
+equals = true
+
+[[expect]]
+field = "wiring.hot_network_is_restart"
+equals = true
+
+[[expect]]
+field = "wiring.hot_dns_is_hot"
+equals = true

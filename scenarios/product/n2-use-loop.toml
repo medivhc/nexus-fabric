@@ -1,0 +1,65 @@
+schema_version = 1
+id = "product.n2-use-loop"
+title = "nexus use <name>：N2 资源访问闭环（resolve→plan→session→establish→authorize→可撤销）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#16-n2-resource-access"
+
+[given]
+# P0-0 契约冻结（2026-10-03）：`nexus use` 在 P0-4 实现，此处先冻结期望。
+# requirement-change 注释：本场景为新契约（contract-first）；当前实现尚无
+# `use` 子命令，预期 Red（FAIL：unknown command，exit 2，无 JSON 输出）。
+# D4：N2 新建 `nexus use <resource>` 作为资源访问入口
+# （resolve→plan→session→establish→authorize→暴露访问入口→可撤销）；
+# D1：daemon 内单一 SessionManager 持有全部资源 Session 生命周期，
+# Session＝"一次 Resource 使用"而非"一次连接"；
+# D2：人类可读名（如 dev-svc）本地解析为不透明 ResourceId，名字≠定位；
+# D6：provider 侧每次建 Session 执行 grant 判定（目录可见≠有权限）。
+# E4 夹具（P0-6 / P1-8）：harness 在执行 [when].command 前按序跑 fixture（幂等，
+# 全部 exit 0 才跑场景命令）。干净配置目录下 `use dev-svc` 依次需要：
+# 身份（node init）→ 目录条目（resource publish）→ provider 侧 grant
+# （D6：目录可见≠有权限，`grant add --self` 写入本机 ed25519 principal）。
+# 夹具无 shell、无法把 `identity show` 的输出管道进 `--principal`，故用 `--self`。
+# 冻结期望未动——夹具只准备 E4 环境。
+fixture = [
+  "cargo run --quiet -p nexus -- node init --json",
+  "cargo run --quiet -p nexus -- resource publish --name dev-svc --kind service --locator 127.0.0.1:8080 --json",
+  "cargo run --quiet -p nexus -- grant add --resource dev-svc --self --op Use --json",
+]
+peer = "node-b"
+resource_name = "dev-svc"
+resource_kind = "service"
+
+[when]
+command = "cargo run --quiet -p nexus -- use dev-svc --json"
+
+# 冻结期望（P0-4 实现后必须满足）：
+# - verdict=PASS；use.resource=dev-svc（人类可读名）
+# - use.session_id 非空（daemon 内 SessionManager 创建的真实 Session，
+#   非 thin wrapper 伪造；CLI 退出重进可按此 id 查询，P0 完成标志 3）
+# - use.plan_id 非空（确定性摘要，D3）
+# - use.outcome=Completed（Owner 唯一提交的 TerminalOutcome）
+# - use.access.endpoint 非空（暴露的访问入口，可撤销；N2 P1-9 起同字段还带
+#   reachable/probe，如实回报连通性探测结果）
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "use.resource"
+equals = "dev-svc"
+
+[[expect]]
+field = "use.session_id"
+non_empty = true
+
+[[expect]]
+field = "use.plan_id"
+non_empty = true
+
+[[expect]]
+field = "use.outcome"
+equals = "Completed"
+
+[[expect]]
+field = "use.access.endpoint"
+non_empty = true

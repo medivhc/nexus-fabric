@@ -1,6 +1,6 @@
 schema_version = 1
 id = "product.observability-connectivity-probe"
-title = "§9 可观察性：connectivity probe 输出候选探测快照"
+title = "§9 可观察性：nexus CLI thin-client 下 connectivity probe 无路由 → 显式 UNSUPPORTED"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#9-observability"
 
@@ -8,31 +8,22 @@ requirement = "PRODUCT.md#9-observability"
 domain_state = "link probe ready (in-memory LinkProbe, direct ok / relay mixed)"
 observability = "per-candidate probe result snapshot via nexus-connectivity"
 
+# requirement-change 2026-10-02（用户已批准）：2026-10-01 CLI 统一（01e5114）后 nexus
+# 是 thin-client，不再在进程内执行观察命令；connectivity probe 暂无 LocalAPI 路由，
+# CLI 本地合成显式 UNSUPPORTED（PRODUCT §9 禁止静默降级）。
+# 与 2026-09-20 冻结的 cli_connectivity_probe.toml 合同一致（probe 需 <target> 参数）。
 [when]
-command = "cargo run --quiet -p nexusd -- connectivity probe --json"
+command = "cargo run --quiet -p nexus -- connectivity probe 8.8.8.8 --json"
 
-# 冻结期望：对候选逐个执行 LinkProbe，输出每候选 ok/fail 与激活选择
-# （requirement-change：2026-09-18，由 UNSUPPORTED 转为真实实现）。
+# 冻结期望（2026-10-02）：无路由命令输出结构化 UNSUPPORTED FAIL JSON。
 [[expect]]
 field = "verdict"
-equals = "PASS"
+equals = "FAIL"
 
 [[expect]]
-field = "command"
+field = "error.code"
+equals = "UNSUPPORTED"
+
+[[expect]]
+field = "error.command"
 equals = "connectivity probe"
-
-[[expect]]
-field = "probed_count"
-equals = 4
-
-[[expect]]
-field = "results.0.candidate"
-non_empty = true
-
-[[expect]]
-field = "results.0.ok"
-equals = true
-
-[[expect]]
-field = "selected"
-non_empty = true

@@ -1,0 +1,37 @@
+schema_version = 1
+id = "product.fabric-conn-roam"
+title = "地址变更不断连：传输中 rebind socket，流不中断、数据不重不漏"
+evidence_strength = "E4"
+requirement = "docs/foundation/DESIGN.md#3"
+
+[given]
+topology = "loopback UDP; client rebinds to a new local port mid-transfer"
+payload_stream = "4 MiB deterministic bytes, verified by hash"
+
+# 可执行 E4：建连 -> 开始 4 MiB 流传输 -> 中途客户端 rebind 新本地端口
+# （模拟 WiFi 关闭切蜂窝）-> 传输完成 -> 校验哈希/CID/停顿/路径统计。
+[when]
+command = "cargo run --quiet -p nexus-fabric --example roam -- --json"
+
+# 冻结期望（S2/S3/S6/S8）。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "stream.hash_match"
+equals = true
+
+[[expect]]
+field = "connection.id_unchanged"
+equals = true
+
+# 首版宽松门限：只要求"不断"，恢复速度后续收紧。
+# harness 不支持 max，故 example 输出布尔值（stalled_ms 仍作为诊断字段输出）。
+[[expect]]
+field = "stream.stalled_within_budget"
+equals = true
+
+[[expect]]
+field = "stats.active_path_changed"
+equals = true

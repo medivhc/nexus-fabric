@@ -1,0 +1,40 @@
+schema_version = 1
+id = "product.workspace-sync-shallow-sparse"
+title = "shallow/sparse sync：按 depth 截断 + 按路径过滤"
+evidence_strength = "E4"
+requirement = "v9 §20 + C2-P4（HEADS 携带 replica policy/depth/sparse filter；WANT-COMMITS 按 depth 截断 BFS；sparse 只拉指定路径对象）"
+
+[given]
+description = "A 有 10 层提交历史；B 以 depth=3 发起 shallow sync；C 以 sparse_paths=[docs/] 发起 sparse sync"
+
+[when]
+command = "cargo run --quiet -p nexusd --example workspace_sync_e4 -- --scenario shallow-sparse --json"
+
+# 冻结期望：
+# - shallow 端本地 commits 层数 ≤3；
+# - 截断处的父提交进入 shallow_frontier（非空）；
+# - sparse 端只含 docs/ 路径的对象，其他路径对象未拉取；
+# - shallow/sparse 端的 heads 与 A 的对应 head 一致（内容寻址 ID 相同）。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "shallow.local_depth"
+equals = 3
+
+[[expect]]
+field = "shallow.frontier_nonempty"
+equals = true
+
+[[expect]]
+field = "sparse.only_docs_objects"
+equals = true
+
+[[expect]]
+field = "sparse.other_paths_not_fetched"
+equals = true
+
+[[expect]]
+field = "sync.heads_match_source"
+equals = true

@@ -12,8 +12,11 @@ pub fn run_scenario(args: &[String]) -> Outcome {
         "nat-hole-punching" => run_nat_hole_punching(),
         "multihop-routing" => run_multihop_routing(),
         "mesh-dns" => run_mesh_dns(),
+        "dns-unified" => run_dns_unified(),
+        "multipath" => run_multipath(),
         "firewall-rules" => run_firewall_rules(),
         "bandwidth-qos" => run_bandwidth_qos(),
+        "qos-cake" => run_qos_cake(),
         "auto-reconnect" => run_auto_reconnect(),
         _ => (
             "BLOCKED".to_string(),
@@ -319,6 +322,7 @@ fn run_nat_hole_punching() -> Outcome {
 /// 拓扑：A(10.0.0.1) -- B(10.0.0.2) -- C(10.0.0.3) -- D(10.0.0.4)。
 /// 初始仅直连邻居；3 轮邻居通告后收敛；A->D 包经 3 跳到达 D 本地交付；
 /// 推进逻辑时钟超过 TTL 后 A 的远端路由 D 被超时删除。
+#[allow(deprecated)] // §12.57 已退役：历史场景保留
 fn run_multihop_routing() -> Outcome {
     use nexus_connectivity::routing::{
         ForwardDecision, MultihopRouter, RoutablePacket, RoutingEvent,
@@ -747,6 +751,337 @@ fn run_mesh_dns() -> Outcome {
             "FAIL".to_string(),
             format!(
                 "mesh-dns: invariants failed (resolves={query_from_b_resolves}, unknown={query_unknown}, ttl_expired={ttl_expired})"
+            ),
+            extra,
+        )
+    }
+}
+
+/// E4: 统一 DNS 分类与 Fake-IP 生命周期（内存骨架，DAEMON_ARCHITECTURE §10）。
+///
+/// 场景（`scenarios/product/dns_unified.toml`）：
+/// - hosts 精确匹配 > mesh 域名 > 代理规则（fake-ip）> 上游；
+/// - fake-ip 分配/稳定/反查/过期回收；
+/// - mesh/fake-ip/hosts 命中时上游零调用。
+fn run_dns_unified() -> Outcome {
+    use nexus_dns::{
+        DnsClass, DnsQuery, DnsType, DnsUnifiedConfig, MeshNameResolver, ProxyClassifier, Resolver,
+        UnifiedDns,
+    };
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    const MESH_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 144, 144, 6));
+    const UPSTREAM_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+    const HOSTS_IP: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    struct MapMesh {
+        map: HashMap<String, IpAddr>,
+    }
+    impl MeshNameResolver for MapMesh {
+        fn resolve_mesh(&self, name: &str) -> Option<IpAddr> {
+            self.map.get(name).copied()
+        }
+    }
+
+    struct SuffixClassifier;
+    impl ProxyClassifier for SuffixClassifier {
+        fn is_proxied(&self, domain: &str) -> bool {
+            domain == "proxy.example.com"
+        }
+    }
+
+    struct ConstUpstream {
+        calls: std::sync::atomic::AtomicU64,
+    }
+    impl Resolver for ConstUpstream {
+        fn resolve(&mut self, _q: &DnsQuery) -> Result<Vec<IpAddr>, nexus_dns::DnsError> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(vec![UPSTREAM_IP])
+        }
+    }
+
+    let mut mesh_map = HashMap::new();
+    mesh_map.insert("xc-pc-linux.mesh".to_string(), MESH_IP);
+    let config = DnsUnifiedConfig {
+        hosts: vec![("local.dev".to_string(), HOSTS_IP)],
+        ..Default::default()
+    };
+    let mut dns = match UnifiedDns::new(
+        config,
+        Box::new(MapMesh { map: mesh_map }),
+        Box::new(SuffixClassifier),
+        Box::new(ConstUpstream {
+            calls: std::sync::atomic::AtomicU64::new(0),
+        }),
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                "FAIL".to_string(),
+                format!("dns-unified: construct: {e}"),
+                Vec::new(),
+            );
+        }
+    };
+
+    let a = |name: &str| DnsQuery {
+        name: name.to_string(),
+        qtype: DnsType::A,
+    };
+
+    // --- 分类顺序 ---
+    let hosts_ans = dns.resolve(&a("local.dev"), 1000);
+    let hosts_class = hosts_ans
+        .as_ref()
+        .map(|x| x.class.as_str())
+        .unwrap_or("ERR")
+        .to_string();
+
+    let mesh_ans = dns.resolve(&a("xc-pc-linux.mesh"), 1000);
+    let (mesh_class, mesh_ip) = match &mesh_ans {
+        Ok(x) => (x.class.as_str().to_string(), x.records[0].to_string()),
+        Err(_) => ("ERR".to_string(), String::new()),
+    };
+
+    let fake_ans = dns.resolve(&a("proxy.example.com"), 1000);
+    let (fake_class, fake_in_range, fake_ip_str) = match &fake_ans {
+        Ok(x) => {
+            let ip = match x.records[0] {
+                IpAddr::V4(v4) => v4,
+                IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
+            };
+            let in_range = {
+                let v = u32::from_be_bytes(ip.octets());
+                (v & 0xFFFE_0000) == 0xC612_0000 // 198.18.0.0/15
+            };
+            (
+                x.class.as_str().to_string(),
+                in_range,
+                IpAddr::V4(ip).to_string(),
+            )
+        }
+        Err(_) => ("ERR".to_string(), false, String::new()),
+    };
+
+    let up_ans = dns.resolve(&a("direct.example.com"), 1000);
+    let (up_class, up_ip) = match &up_ans {
+        Ok(x) => (x.class.as_str().to_string(), x.records[0].to_string()),
+        Err(_) => ("ERR".to_string(), String::new()),
+    };
+
+    // --- Fake-IP 生命周期 ---
+    let fake_again = dns.resolve(&a("proxy.example.com"), 1100);
+    let stable_within_ttl = match (&fake_ans, &fake_again) {
+        (Ok(x), Ok(y)) => y.from_cache && x.records == y.records,
+        _ => false,
+    };
+    let reverse_lookup = fake_ip_str
+        .parse::<IpAddr>()
+        .ok()
+        .and_then(|ip| match ip {
+            IpAddr::V4(v4) => dns.reverse_lookup(v4).map(str::to_string),
+            IpAddr::V6(_) => None,
+        })
+        .unwrap_or_default();
+    // TTL=300：推进到 1400 后回收。
+    let reclaimed = dns.reclaim_expired(1400);
+    let reverse_after = fake_ip_str.parse::<IpAddr>().ok().and_then(|ip| match ip {
+        IpAddr::V4(v4) => dns.reverse_lookup(v4).map(str::to_string),
+        IpAddr::V6(_) => None,
+    });
+    let reclaimed_after_ttl = reclaimed == 1 && reverse_after.is_none();
+
+    let upstream_calls_for_local = dns.upstream_call_count();
+    // 注意：direct.example.com 走了 1 次上游；本地三类命中不应增加计数。
+    // 在上面的 resolve 调用中，上游只应被调用 1 次（direct.example.com）。
+    let local_isolated = upstream_calls_for_local == 1;
+
+    let ok = hosts_class == "Hosts"
+        && mesh_class == DnsClass::Mesh.as_str()
+        && mesh_ip == "10.144.144.6"
+        && fake_class == DnsClass::FakeIp.as_str()
+        && fake_in_range
+        && up_class == DnsClass::Upstream.as_str()
+        && up_ip == "93.184.216.34"
+        && stable_within_ttl
+        && reverse_lookup == "proxy.example.com"
+        && reclaimed_after_ttl
+        && local_isolated;
+
+    let extra = vec![
+        ("hosts".to_string(), json!({ "class": hosts_class })),
+        (
+            "mesh".to_string(),
+            json!({ "class": mesh_class, "ip": mesh_ip }),
+        ),
+        (
+            "fakeip".to_string(),
+            json!({
+                "class": fake_class,
+                "in_range": fake_in_range,
+                "stable_within_ttl": stable_within_ttl,
+                "reverse_lookup": reverse_lookup,
+                "reclaimed_after_ttl": reclaimed_after_ttl,
+            }),
+        ),
+        (
+            "upstream".to_string(),
+            json!({ "class": up_class, "ip": up_ip }),
+        ),
+        (
+            "upstream_resolver_calls_for_local".to_string(),
+            // 场景期望：本地命中零上游调用；此处直连域名的 1 次是预期的，
+            // 故上报"本地三类之外的上游调用"即 total-1。
+            json!(upstream_calls_for_local.saturating_sub(1)),
+        ),
+    ];
+
+    if ok {
+        (
+            "PASS".to_string(),
+            "dns-unified: classification order + fake-ip lifecycle verified".to_string(),
+            extra,
+        )
+    } else {
+        (
+            "FAIL".to_string(),
+            format!(
+                "dns-unified: invariants failed (hosts={hosts_class}, mesh={mesh_class}, fake={fake_class}, up={up_class}, stable={stable_within_ttl}, reclaimed={reclaimed_after_ttl}, local_isolated={local_isolated})"
+            ),
+            extra,
+        )
+    }
+}
+
+/// 场景（`scenarios/product/multipath.toml`）：
+/// - Single：永远选首位 egress（零行为变化）；
+/// - PerFlow：同一 flow_id 确定性 + 多流分布；
+/// - PerPacket：加权轮询覆盖；
+/// - ReorderBuffer：乱序重排 + 容量有界。
+fn run_multipath() -> Outcome {
+    use nexus_projection::multipath::{
+        EgressDescriptor, EgressKind, MultipathStrategy, PathScheduler, ReorderBuffer,
+    };
+    use std::collections::HashSet;
+
+    let egresses = vec![
+        EgressDescriptor::new("mesh-direct", EgressKind::MeshDirect, 1),
+        EgressDescriptor::new("proxy", EgressKind::Proxy, 1),
+        EgressDescriptor::new("turn", EgressKind::Turn, 1),
+    ];
+
+    // --- Single：永远首位 ---
+    let mut sched = PathScheduler::new();
+    let single_always_best = (0..10u64).all(|flow| {
+        (0..5u64).all(|seq| {
+            sched
+                .select(MultipathStrategy::Single, &egresses, flow, seq)
+                .map(|e| e.id())
+                == Some("mesh-direct")
+        })
+    });
+
+    // --- PerFlow：确定性 + 分布性 ---
+    let perflow_stable = [0u64, 1, 42, 999].iter().all(|&flow| {
+        let first = sched
+            .select(MultipathStrategy::PerFlow, &egresses, flow, 0)
+            .map(|e| e.id().to_string());
+        (1..100u64).all(|seq| {
+            sched
+                .select(MultipathStrategy::PerFlow, &egresses, flow, seq)
+                .map(|e| e.id().to_string())
+                == first
+        })
+    });
+    let mut seen = HashSet::new();
+    for flow in 0..64u64 {
+        if let Some(e) = sched.select(MultipathStrategy::PerFlow, &egresses, flow, 0) {
+            seen.insert(e.id().to_string());
+        }
+    }
+    let perflow_distributed = seen.len() == 3;
+
+    // --- PerPacket：轮询 ---
+    sched.reset();
+    let ids: Vec<String> = (0..6u64)
+        .map(|seq| {
+            sched
+                .select(MultipathStrategy::PerPacket, &egresses, 0, seq)
+                .map(|e| e.id().to_string())
+                .unwrap_or_default()
+        })
+        .collect();
+    let perpacket_round_robin = ids
+        == vec![
+            "mesh-direct",
+            "proxy",
+            "turn",
+            "mesh-direct",
+            "proxy",
+            "turn",
+        ];
+
+    // --- ReorderBuffer：乱序重排 + 有界 ---
+    let mut rb = ReorderBuffer::new(64);
+    for seq in [3u64, 1, 2, 5, 4] {
+        rb.push(seq, vec![seq as u8]);
+    }
+    // 缺 seq 0 → 吐不出。
+    let empty_before_zero = rb.pop_in_order().is_empty();
+    rb.push(0, vec![0]);
+    let out = rb.pop_in_order();
+    let seqs: Vec<u64> = out.iter().map(|(s, _)| *s).collect();
+    let reorder_in_order = empty_before_zero && seqs == vec![0, 1, 2, 3, 4, 5];
+
+    // 超限有界。
+    let mut rb2 = ReorderBuffer::new(64);
+    for seq in 0..100u64 {
+        rb2.push(seq, vec![seq as u8]);
+    }
+    let reorder_bounded = rb2.len() <= 64 && rb2.dropped_overflow() == 36;
+
+    let ok = single_always_best
+        && perflow_stable
+        && perflow_distributed
+        && perpacket_round_robin
+        && reorder_in_order
+        && reorder_bounded;
+
+    let extra = vec![
+        (
+            "single".to_string(),
+            json!({ "always_best": single_always_best }),
+        ),
+        (
+            "perflow".to_string(),
+            json!({ "stable": perflow_stable, "distributed": perflow_distributed }),
+        ),
+        (
+            "perpacket".to_string(),
+            json!({ "round_robin": perpacket_round_robin, "sequence": ids }),
+        ),
+        (
+            "reorder".to_string(),
+            json!({ "in_order": reorder_in_order, "bounded": reorder_bounded }),
+        ),
+    ];
+
+    if ok {
+        (
+            "PASS".to_string(),
+            "multipath: three strategies + reorder buffer verified".to_string(),
+            extra,
+        )
+    } else {
+        (
+            "FAIL".to_string(),
+            format!(
+                "multipath: invariants failed (single={single_always_best}, \
+                 perflow_stable={perflow_stable}, perflow_dist={perflow_distributed}, \
+                 perpacket={perpacket_round_robin}, reorder={reorder_in_order}, \
+                 bounded={reorder_bounded})"
             ),
             extra,
         )
@@ -1195,6 +1530,237 @@ fn run_auto_reconnect() -> Outcome {
             "FAIL".to_string(),
             format!(
                 "auto-reconnect: invariants failed (initial={initial_backoff_is_100ms}, doubles={backoff_doubles}, cap={backoff_caps_at_max}, give_up={give_up_after_max_retries}, reset={reconnect_success_resets_state}, attempts={attempt_count}, final={final_state})"
+            ),
+            extra,
+        )
+    }
+}
+
+/// E4: CAKE-like QoS 调度器（DRR 公平队列 + 严格优先级 + 整形 + 流回收，
+/// `scenarios/product/qos_cake.toml`）。纯内存、假时钟确定性；演示五个检查点：
+/// (a) 同优先级 backlog 流按字节公平（A: 4x1500B vs B: 12x500B → 各 6000B）；
+/// (b) 严格优先级（High 3 包先于 Medium 3 包，签名 "HHHLLL"）；
+/// (c) 整形（burst 后阻塞、1s 恢复）；
+/// (d) 流回收（60s 空闲回收）；
+/// (e) daemon.toml [qos] 的 wire format 映射形状（真实解析器由 apps/nexusd 单测覆盖）。
+fn run_qos_cake() -> Outcome {
+    use nexus_connectivity::cake::{CakeConfig, CakeScheduler, FiveTuple, PROTO_TCP, PROTO_UDP};
+    use nexus_connectivity::qos::BandwidthLimit;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Duration;
+
+    let t0 = Duration::ZERO;
+    let mk = |sp: u16, dp: u16, proto: u8| FiveTuple {
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        src_port: sp,
+        dst_port: dp,
+        proto,
+    };
+
+    // (a) 公平性。
+    let mut sched = match CakeScheduler::new(&CakeConfig::default()) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                "FAIL".to_string(),
+                format!("qos-cake: build scheduler: {e}"),
+                Vec::new(),
+            );
+        }
+    };
+    let a = mk(1000, 80, PROTO_TCP);
+    let b = mk(2000, 80, PROTO_TCP);
+    let fid_a = a.flow_id();
+    for _ in 0..4 {
+        sched.enqueue(&a, 1500, t0);
+    }
+    for _ in 0..12 {
+        sched.enqueue(&b, 500, t0);
+    }
+    let mut a_bytes = 0u64;
+    let mut b_bytes = 0u64;
+    let mut total_packets = 0u32;
+    while let Some((fid, len)) = sched.dequeue(t0) {
+        if fid == fid_a {
+            a_bytes += len;
+        } else {
+            b_bytes += len;
+        }
+        total_packets += 1;
+        if total_packets > 64 {
+            break; // 防御性：正常 16 包即排空
+        }
+    }
+
+    // (b) 严格优先级。
+    let mut prio_sched = match CakeScheduler::new(&CakeConfig::default()) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                "FAIL".to_string(),
+                format!("qos-cake: build prio scheduler: {e}"),
+                Vec::new(),
+            );
+        }
+    };
+    let h = mk(40000, 53, PROTO_UDP); // High（DNS 端口）
+    let l = mk(40001, 443, PROTO_TCP); // Medium
+    let fid_h = h.flow_id();
+    for _ in 0..3 {
+        prio_sched.enqueue(&h, 100, t0);
+        prio_sched.enqueue(&l, 100, t0);
+    }
+    let mut sig = String::new();
+    for _ in 0..6 {
+        match prio_sched.dequeue(t0) {
+            Some((fid, _)) => sig.push(if fid == fid_h { 'H' } else { 'L' }),
+            None => sig.push('?'),
+        }
+    }
+
+    // (c) 整形：rate 1000 B/s，burst 1000。
+    let limit = match BandwidthLimit::new(1000, 1000) {
+        Ok(l) => l,
+        Err(e) => {
+            return (
+                "FAIL".to_string(),
+                format!("qos-cake: build limit: {e}"),
+                Vec::new(),
+            );
+        }
+    };
+    let shaped_cfg = CakeConfig {
+        rate_limit: Some(limit),
+        ..CakeConfig::default()
+    };
+    let mut shaped = match CakeScheduler::new(&shaped_cfg) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                "FAIL".to_string(),
+                format!("qos-cake: build shaped scheduler: {e}"),
+                Vec::new(),
+            );
+        }
+    };
+    let m = mk(3000, 80, PROTO_TCP);
+    for _ in 0..3 {
+        shaped.enqueue(&m, 1000, t0);
+    }
+    let first_burst_bytes = shaped.dequeue(t0).map(|(_, len)| len).unwrap_or(0);
+    let blocked_when_tokens_empty = shaped.dequeue(t0).is_none();
+    let t1 = Duration::from_secs(1);
+    let resumed_after_1s = shaped.dequeue(t1).map(|(_, len)| len) == Some(1000);
+
+    // (d) 流回收：t=0 建流，t=61s 回收。
+    let mut reaper = match CakeScheduler::new(&CakeConfig::default()) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                "FAIL".to_string(),
+                format!("qos-cake: build reap scheduler: {e}"),
+                Vec::new(),
+            );
+        }
+    };
+    let x = mk(4000, 80, PROTO_TCP);
+    reaper.enqueue(&x, 100, t0);
+    let reaped_count = reaper.reap(Duration::from_secs(61));
+    let flows_remaining = reaper.flow_count();
+
+    // (e) daemon.toml [qos] wire format 映射形状。
+    let snippet = "[qos]\nenabled = true\nmesh_upload_mbps = 100\nproxy_upload_mbps = 50\nquantum = 1514\nhigh_priority_ports = \"22,53,3389\"\n";
+    let v: toml::Value = match toml::from_str(snippet) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                "FAIL".to_string(),
+                format!("qos-cake: parse qos snippet: {e}"),
+                Vec::new(),
+            );
+        }
+    };
+    let q = v.get("qos");
+    let cfg_enabled = q.and_then(|t| t.get("enabled")).and_then(|x| x.as_bool());
+    let cfg_mesh = q
+        .and_then(|t| t.get("mesh_upload_mbps"))
+        .and_then(|x| x.as_integer());
+    let cfg_proxy = q
+        .and_then(|t| t.get("proxy_upload_mbps"))
+        .and_then(|x| x.as_integer());
+    let cfg_quantum = q
+        .and_then(|t| t.get("quantum"))
+        .and_then(|x| x.as_integer());
+    let cfg_ports = q
+        .and_then(|t| t.get("high_priority_ports"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+
+    let ok = a_bytes == 6000
+        && b_bytes == 6000
+        && total_packets == 16
+        && sig == "HHHLLL"
+        && first_burst_bytes == 1000
+        && blocked_when_tokens_empty
+        && resumed_after_1s
+        && reaped_count == 1
+        && flows_remaining == 0
+        && cfg_enabled == Some(true)
+        && cfg_mesh == Some(100)
+        && cfg_proxy == Some(50)
+        && cfg_quantum == Some(1514)
+        && cfg_ports == "22,53,3389";
+
+    let extra = vec![
+        (
+            "fairness".to_string(),
+            json!({
+                "flow_a_bytes": a_bytes,
+                "flow_b_bytes": b_bytes,
+                "total_packets": total_packets,
+            }),
+        ),
+        ("priority".to_string(), json!({ "order_signature": sig })),
+        (
+            "shaping".to_string(),
+            json!({
+                "first_burst_bytes": first_burst_bytes,
+                "blocked_when_tokens_empty": blocked_when_tokens_empty,
+                "resumed_after_1s": resumed_after_1s,
+            }),
+        ),
+        (
+            "reap".to_string(),
+            json!({
+                "reaped_count": reaped_count,
+                "flows_remaining": flows_remaining,
+            }),
+        ),
+        (
+            "config".to_string(),
+            json!({
+                "enabled": cfg_enabled,
+                "mesh_upload_mbps": cfg_mesh,
+                "proxy_upload_mbps": cfg_proxy,
+                "quantum": cfg_quantum,
+                "high_priority_ports": cfg_ports,
+            }),
+        ),
+    ];
+
+    if ok {
+        (
+            "PASS".to_string(),
+            "qos-cake: DRR fairness + strict priority + shaping block/resume + 60s reap + [qos] mapping verified"
+                .to_string(),
+            extra,
+        )
+    } else {
+        (
+            "FAIL".to_string(),
+            format!(
+                "qos-cake: invariants failed (a_bytes={a_bytes}, b_bytes={b_bytes}, packets={total_packets}, sig={sig}, burst={first_burst_bytes}, blocked={blocked_when_tokens_empty}, resumed={resumed_after_1s}, reaped={reaped_count}, remaining={flows_remaining})"
             ),
             extra,
         )

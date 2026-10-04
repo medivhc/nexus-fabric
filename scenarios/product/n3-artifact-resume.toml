@@ -1,0 +1,52 @@
+schema_version = 1
+id = "product.n3-artifact-resume"
+title = "命令完成后补传产物且不重执行"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#17-n3-task"
+
+# N3 contract-first: future verifier, not a delivered runtime.
+# Modules: nexus-domain nexus-compute nexus-workspace nexus-storage
+# nexus-session nexus-control-api apps/nexus apps/nexusd
+
+[given]
+topology = "separate requester/provider processes; local E4, not Windows/Linux E5"
+steps = "命令退出并产生必需文件，故障注入中断传输；恢复后获取并校验真实字节。"
+
+[when]
+command = "cargo run --locked --quiet -p nexusd --example n3_task_e4 -- artifact-resume"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "before.phase"
+equals = "Finalizing"
+
+[[expect]]
+field = "before.outcome"
+equals = "Unfinished"
+
+[[expect]]
+field = "before.execution.exit_code"
+equals = 0
+
+[[expect]]
+field = "before.delivery.state"
+equals = "Pending"
+
+[[expect]]
+field = "after.outcome"
+equals = "Completed"
+
+[[expect]]
+field = "after.delivery.state"
+equals = "Complete"
+
+[[expect]]
+field = "observed.command_start_count"
+equals = 1
+
+[[expect]]
+field = "observed.downloaded_digest_matches"
+equals = true

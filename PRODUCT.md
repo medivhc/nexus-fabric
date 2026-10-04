@@ -60,6 +60,19 @@ PLATFORM_CAPABILITY_UNAVAILABLE
 SESSION_FAILED
 ```
 
+### 2.1 TUN Ingress 会话链 {#tun-ingress-session-chain}
+
+（2026-10-02 requirement-change 冻结；场景 `product.flow-session-mapping`）
+
+nexusd 生产 TUN 数据面必须经"流→会话映射"接入 §10 链，而非逐包直转：
+
+- TUN 产生的每个新流（5 元组 key）首包触发：FlowContext（origin=PacketCapture）→ Policy → Core Planner → SessionOwner 创建 §10 Session → 后台异步建连。
+- 首包可观察语义：TCP 本地握手照常完成，早期数据由 smoltcp 缓冲，会话 Active 后 flush；UDP 首包触发建会话，有界缓冲（32 包/64KB），超 bound 丢弃并计数；建连失败 → TCP 发 RST、UDP 丢包（不静默黑洞）。
+- 已建流走快路径：后续包不再调用 Planner（调用计数器可证）；DNS 短路与 QoS 整形保留在逐包快路径，不进会话链。
+- 空闲超时流进 Draining，会话数回落，无泄漏。
+- NAT 路径竞速（direct/TURN/peer-relay）对流映射层透明：只订阅 session 级事件（connectivity established/failed → 触发重 plan）。
+- 本次 requirement-change 修订了老场景"逐包即时转发"的期望（首包异步化改变可观察语义）。
+
 ## 3. Service
 
 Service 是 Resource。
@@ -83,9 +96,16 @@ Replica Set
 
 必须满足：
 
+- 每个 Commit 使用**内容哈希**作为 CommitId（哈希输入：排序后的 Parent CommitIds、
+  RootManifestId、Author/NodeId、逻辑元数据；同一提交对象在所有节点算出同一 ID，
+  跨端对账的基础）。标量序列号永不作为版本权威。
 - 离线写允许创建本地 Commit。
 - 多端并发写允许形成多个 Head。
 - 网络恢复后支持 fast-forward、three-way merge 或显式 Conflict Resolution。
+- 冲突产生**持久化 Conflict Object**（含 Base、Local、Remote 冲突路径与 Resolution State，
+  进 CAS），Conflict 是 Workspace 状态的一部分；解决后才产生 Merge Commit。
+- 联网后双端交换 Head Set（Same Head / Fast-forward / Diverged 判定），缺失提交按需拉取，
+  收到的提交必须校验 `id == hash(content)`。
 - 不得因为远端 Head 变化丢弃已经成功本地提交的数据。
 - 支持 WorkingSet、Profile、WorkspaceGraph 与 Prefetch，但这些不是权威内容。
 - 支持 Reachability GC、Storage Quota、Shallow Sync 与 Sparse Replica。
@@ -1135,6 +1155,10 @@ DECAPSULATION_ERROR         包解封装失败
 - 冻结边界（P1 不做）：动态路由协议、最短路径算法、跨子网、加密、真实 TUN。
 
 ### 12.6 P1.1 多跳动态路由（距离矢量，2026-09-20）{#12-multihop-routing}
+
+> **已退役（§12.57，2026-09-29）**：本节的距离矢量实现（`MultihopRouter`/`RoutingTable`）
+> 已被 `nexus-discovery` FIB 取代，标记 `#[deprecated]`。代码与测试保留为历史证据，
+> 新代码请勿使用。
 
 §12.5 在冻结边界中明确"动态路由协议、最短路径算法"为 P1 不做项。
 本节作为 **requirement-change** 突破该边界，冻结 P1.1 的最小动态路由闭环：
@@ -2320,6 +2344,115 @@ crate 内 policy 逻辑保持零真实 socket；真实 TCP / 线程定时器 / �
 - 冻结边界（本项不做）：管线与加密会话共存（当前仅明文数据面激活管线，加密会话 wire 不变）、
   真实 IP 头解析/conntrack、排队缓冲、生产时钟、relay 分片、规则热更新。
 
+### 12.42 P5 PSK 网络准入：握手 PSK 绑定（2026-09-29）{#12-psk-admission}
+
+接 §12.39（三重 DH 已提供**双向身份认证**：完成握手需知晓与所声明 `static_public`
+对应的 static 私钥；TOFU 做身份持久化与替换拒绝）。本项补的是另一块：
+**网络准入控制（admission control）**——§12.39 下任何自生成密钥对的节点都能完成
+握手（TOFU 自动学习），网络成员实质开放；PSK 绑定后，PSK 即"网络"的定义，
+只有持相同 PSK 的节点能派生出可用的会话密钥（WireGuard PSK 同款语义）。
+
+- **机制**：network PSK 混入 `derive_base_authed` 的 HKDF-SHA256 salt
+ （`salt = b"nexus-link-encryption-v2" ∥ psk`；无 PSK 时沿用原固定 salt，
+  既有行为逐字节不变）。base 是全部会话密钥的根，PSK 不同 → base 不同 →
+  方向子密钥全部不同。
+- **可观察语义**：
+  - 双方相同 PSK → 握手完成，数据帧正常加解密（与无 PSK 模式行为一致）；
+  - PSK 不同 / 一方有 PSK 一方无 → 握手消息交换本身不受影响（65B 明文），
+    但派生密钥不同，**首个 AEAD 数据帧解密失败**（`DecryptionFailed`）→ 建连失败。
+    失败点在数据面是该握手模式的标准行为（与 WireGuard PSK 一致）。
+- **机制与策略分离**：crypto 层（portable core）同时支持 `Some(psk)` / `None`
+  两种模式；fail-closed 策略（未配置 PSK 拒绝组网）在装配层（`subnet up`，Phase 1
+  去中心化组网时交付），不在 crypto 层硬编码。
+- **PSK 处理要求**：内存零化（zeroize）；日志永不打印 PSK 或其哈希；
+  推荐经文件注入（`network_psk_file` + 0600 权限检查，装配层实现）。
+- **API**：新增 `derive_authed_keys_with_psk(..., psk: &[u8])`；
+  既有 `derive_authed_keys` 保持签名与行为不变（= `psk=None`），既有全部 E4 场景 Protected。
+- E4 场景 `psk_handshake_admission.toml`（id=`product.psk-handshake-admission`，
+  example `psk_handshake_admission --json`，零真实网络）：断言
+  `psk_handshake_completed`（同 PSK 建连）、`psk_data_frame_decrypted`（同 PSK 数据往返）、
+  `psk_mismatch_rejected`（异 PSK 解密失败）、`psk_absent_rejected`（单边无 PSK 解密失败）
+  与 `verdict=PASS`。
+- 冻结边界（本项不做）：PSK 在线轮换协议、Ed25519 身份签名、CLI/TOML 装配与
+  fail-closed（Phase 1）、`virtual_subnet.rs` 握手路径的 PSK 穿透（Phase 1）。
+
+### 12.43 P5 去中心化组网配置层：确定性 VIP + PSK 装配 + bootstrap 列表（2026-09-29）{#12-decentralized-join-config}
+
+接 §12.42（PSK 网络准入的 crypto 机制）。本项交付去中心化组网的**配置层**：
+节点只需 CIDR + PSK + bootstrap 列表即可入网，不再手写全网静态 peer 列表。
+网络协议（Hello/Welcome、LSA 泛洪/LSDB）为后续 feature，本项只做配置与派生。
+
+- **确定性 VIP 派生**：`derive_vip(static_public, cidr, nonce)`（`nexus-connectivity`，
+  portable core，零 I/O）：
+  `h = fnv1a64(static_public ∥ nonce_be64)`，`vip = network + 1 + (h mod usable)`，
+  其中 `usable = 2^host_bits - 2`，跳过网络地址与广播地址。
+  同一公钥 + CIDR + nonce → 同一 VIP；nonce 递增用于冲突重派（冲突解决协议为后续
+  feature，本项只交付派生函数）。
+  注：`subnet up` 的 E4/mock 路径用临时身份派生（同一节点每次运行 VIP 不同）；
+  生产 daemon 必须用 §12.39 持久身份（secure-store），见后续 feature。
+- **配置变更**（`apps/nexus/src/subnet_cli.rs`，`[subnet]` 段）：
+  - `virtual_ip` 改为可选；缺省 → 从本端身份公钥（§12.39 `IdentityKeyPair`）确定性派生；
+    显式填写 → 手动覆盖（兼容既有部署，覆盖优先于派生）。
+  - 新增 `network_psk`（内联字符串，按 UTF-8 字节；二进制 PSK 请用文件方式）
+    / `network_psk_file`（文件路径），二者互斥；
+    `network_psk_file` 要求 Unix 权限 0600（过松则拒绝启动）。
+  - 新增 `[[subnet.bootstrap]]` 列表：`{ address = "udp://host:port", name? }`（name 仅日志用）。
+- **fail-closed 边界**（不破坏既有契约）：
+  - `[[bootstrap]]` 非空 **且** 未配置 PSK → `subnet up` 拒绝启动，
+    结构化错误 `PSK_REQUIRED`（exit 0，CONFIG_ERROR 语义）。
+  - 既有 legacy 配置（`virtual_ip` + `[[subnet.peers]]`，无 bootstrap、无 PSK）
+    **行为不变**（`product.cli-subnet` 场景 Protected）——fail-closed 仅作用于新路径。
+  - `network_psk` 与 `network_psk_file` 同时设置 → `PSK_CONFLICT` 错误。
+- **IPv4 范围**：本项 `derive_vip` 与既有 `cidr.rs` 一致，仅支持 IPv4；
+  IPv6 派生为冻结边界（后续 feature）。
+- E4 场景 `decentralized_join_config.toml`（id=`product.decentralized-join-config`，
+  example `decentralized_join_config --json`，零真实网络）：断言
+  `vip_derived_deterministic`（同公钥同 CIDR → 同 VIP）、`vip_in_cidr`、
+  `vip_nonce_changes`（nonce 递增 → 不同 VIP）、`bootstrap_psk_required`
+ （有 bootstrap 无 PSK → `PSK_REQUIRED`）、`bootstrap_psk_ok`（有 PSK → 通过）、
+  `legacy_config_unchanged`（无 bootstrap 无 PSK 的 legacy 配置 → 通过）
+  与 `verdict=PASS`。
+- 冻结边界（本项不做）：Hello/Welcome 入网协议、LSA 泛洪/LSDB、VIP 冲突解决协议、
+  IPv6、PSK 在线轮换。
+
+### 12.44 P5 去中心化发现：Hello/Welcome 入网 + LSA 泛洪/LSDB（2026-09-29）{#12-lsa-discovery}
+
+接 §12.43（配置层）。本项交付去中心化发现的**协议与状态机**（portable core，
+零 I/O）：新节点经 bootstrap 入网（Hello/Welcome），全网经 LSA 泛洪收敛到一致的
+链路状态数据库（LSDB）。本项 LSA **只负责发现**（peer 集合）；选路（Dijkstra）
+与转发表为后续 feature，现有距离矢量路由（§12.6）保留。
+
+- **LSA 帧格式**（`nexus-discovery::lsa`，版本化）：
+  `[version: u8=1][tag: u8][fields...]`；未知 tag → `Transport` 错误（不静默忽略，
+  由调用方决定断开或计数）。
+  - `Hello { node_id, vip, capabilities: u32, incarnation: u64 }`：新节点 → bootstrap。
+  - `Welcome { lsas: Vec<Lsa> }`：bootstrap → 新节点，全量 LSA 快照（仅入网时一次）。
+  - `LsaAdvert { lsa: Lsa }`：邻居间泛洪。
+  - `Lsa { node_id, vip, incarnation: u64, seq: u64, capabilities: u32,
+    locator: Option<String>, neighbors: Vec<LinkAdvert> }`。
+    `neighbors` 本项为空（发现不需链路信息），字段保留供选路 feature 用。
+  - 字符串 = `u16 BE` 长度前缀 + UTF-8；整数 = BE；`Option<String>` = `u8` 存在位 + 字符串。
+- **LSDB**（`Lsdb`）：
+  - `update(lsa) -> UpdateOutcome`（`New` / `Updated` / `Stale` / `SelfIgnored`）：
+    以 `(incarnation, seq)` 二元组比新旧；本端 LSA 永不被覆盖（`SelfIgnored`）。
+  - `get(node_id)`、`all()`、`len()` 只读视图。
+- **泛洪语义**（纯决策逻辑，发送由装配层执行）：
+  - `SeenCache::should_flood(node_id, incarnation, seq) -> bool`：未见过的
+    `(node_id, incarnation, seq)` → 泛洪；见过 → 丢弃。`SeenCache` 为有界 FIFO
+    （`new(capacity)` 指定容量，防内存无限增长；FIFO 在此是正确选择——淘汰旧条目
+    仅导致可能的重复泛洪，不影响正确性）。
+  - 接收方更新 LSDB 成功（`New`/`Updated`）→ 向除来源外的所有邻居转发。
+- **入网流程**：`Hello` → `Welcome`（全量快照种子 LSDB）→ `LsaAdvert` 增量收敛。
+  （协议序列；`JoinState` 状态机为后续装配层实现，本项 E4 由 flow 手动驱动。）
+- E4 场景 `lsa_discovery.toml`（id=`product.lsa-discovery`，
+  example `lsa_discovery --json`，三节点进程内）：断言
+  `hello_welcome_completed`（A 经 B 入网，LSDB 有 A+B）、`lsa_flood_converged`
+  （C 经 B 入网后，A 经泛洪学到 C，三节点 LSDB 一致）、`lsa_stale_rejected`
+  （旧 seq 的 LSA 被拒绝）、`lsa_self_ignored`（本端 LSA 不被覆盖）
+  与 `verdict=PASS`。
+- 冻结边界（本项不做）：真实 UDP 传输装配、Dijkstra 选路、FIB 多下一跳、
+  incarnation 持久化（本项内存）、VIP 冲突解决协议、gossip 反熵优化。
+
 ## 13. Windows 系统代理接管与常驻自启（system-proxy + autostart，2026-09-24）{#13-system-proxy}
 
 桌面/Windows 场景下，nexusd 作为本地入口把系统 WinINET 代理指向本地数据面，
@@ -2503,3 +2636,594 @@ accept new work
 - 统一的 daemon 级冷启动对账执行器（把 §15.2 全步骤接入 nexusd serve 启动路径）
   为后续工作，不在本期冻结 expectation 内；本小节是产品语义声明，不新增命令、
   不修改既有场景 expectation。
+
+### 12.45 P5 去中心化选路：Dijkstra 最短路 + FIB（2026-09-29）{#12-dijkstra-fib}
+
+接 §12.44（LSA/LSDB）。本项交付基于 LSDB 的**选路计算**（portable core，零 I/O）：
+LSDB → 只读拓扑视图（`TopoView`）→ 算路抽象（`PathComputer`）→ 转发表（`FIB`）。
+现有距离矢量路由（§12.6）保留不动；本项不接真实转发面（数据面挂接为后续 feature）。
+
+- **LSA 携带链路**：节点在本端 LSA 的 `neighbors` 中通告链路（`LinkAdvert{neighbor, metrics}`）；
+  §12.44 的"neighbors 为空"是发现阶段的临时状态，本项起节点填充真实邻接。
+- **TopoView**：`TopoView::from_lsdb(&Lsdb)` 构建只读图；链路按通告方向建边
+  （A 通告 B 即有 A→B 边，不要求对称——与链路状态语义一致）。
+- **PathComputer trait**：`fn name(&self) -> &'static str; fn compute(&self, topo: &TopoView, src: &PeerId, dst: &PeerId) -> Option<Path>`；
+  `Path{nodes: Vec<PeerId>（含 src/dst）, cost: u64}`。
+  本项实现 `ShortestPath`（Dijkstra）；ECMP / K-shortest / Disjoint / Constrained 为后续
+  feature（只加新 impl，不动 LSDB/FIB/协议）。
+- **链路代价**：`cost = max(latency_ms, 1)`（u64；用 LSA 结构化度量中的延迟字段）。
+- **FIB**：从第一天就是 `dst vip → Vec<NextHop>` 形状；
+  `NextHop{peer: PeerId, weight: u32（本期恒 1）, path_id: u32（本期恒 0）}`。
+  本项每 dst 只填 1 条 next_hop（最短路的第二跳）；未来多路径只加条目，不改形状。
+- **原子更新**：`Fib::compute(lsdb, self_id, computer, generation)` 单次 Dijkstra
+  （O(E log V)）算出全目的地最短路后整体替换（代际版本号，RCU 风格）；
+  不用逐条改，避免半新半旧。
+- E4 场景 `dijkstra_fib.toml`（id=`product.dijkstra-fib`，
+  `cargo run --quiet -p nexus --example dijkstra_fib -- --json`）：
+  四节点拓扑（A-B 10ms、B-D 10ms、A-C 50ms、C-D 10ms、B-C 10ms）；
+  期望 `verdict=PASS`，`a_to_c_via=node-b`（20ms 间接优于 50ms 直连）、
+  `a_to_d_via=node-b`、`entry_shape=vec_single`、`generation` 递增。
+- 冻结边界：真实转发面挂接；距离矢量退役（迁移为后续 feature，本项不动 §12.6 代码）；
+  按流哈希选路（转发面，后续）；增量算路（本项全量重算，O(E log V)）。
+- 契约 hash 冻结（verify 时写入）。
+
+### 12.46 P5 去中心化选路：ECMP 等代价多路径（2026-09-29）{#12-ecmp}
+
+接 §12.45（Dijkstra/FIB）。本项交付等代价多路径（portable core，零 I/O）：
+新增 `PathComputer` 实现 `Ecmp`，FIB 的 `Vec<NextHop>` 从本项起真正填多条。
+LSDB/LSA/泛洪协议零改动（设计文档既定映射）。
+
+- **`Ecmp`**：`name()=="ecmp"`；Dijkstra 保留所有等代价前驱，枚举所有等代价
+  最短路；`compute()` 返回其中一条（第一条），`compute_paths()` 返回全部。
+- **`PathComputer::compute_paths`**（trait 新增，有默认实现）：`fn compute_paths(&self, topo: &TopoView, src: &PeerId, dst: &PeerId) -> Vec<Path>`；
+  默认退化为 `compute()` 的单路径；`Ecmp` 覆盖为多路径。
+- **FIB 多下一跳**：`Fib::compute` 改用 `compute_all_paths`（批量版），按去重后的第二跳
+  生成 `NextHop`（`weight` 本期恒 1，`path_id` 为排序后的去重序号）；单路径时行为与 §12.45 一致。
+- E4 场景 `ecmp.toml`（id=`product.ecmp`，
+  `cargo run --quiet -p nexus --example ecmp -- --json`）：
+  菱形拓扑（A-B 10ms、B-D 10ms、A-C 10ms、C-D 10ms；A→D 两条 20ms 等代价路径）；
+  期望 `verdict=PASS`，`a_to_d_next_hops=2`（B 和 C），`a_to_d_via` 含 node-b/node-c，
+  `entry_shape=vec_multi`。
+- 冻结边界：按流哈希选下一跳（转发面，后续）；K-shortest/Disjoint/Constrained
+  （后续 `PathComputer` impl）；`[routing] strategy` 配置装配（后续）。
+- 契约 hash 冻结（verify 时写入）。
+
+### 12.47 P5 去中心化选路：按流哈希选择 FIB 下一跳（2026-09-29）{#12-flow-hash}
+
+接 §12.46（ECMP 多下一跳）。本项交付按流哈希的下一跳选择（portable core，
+零 I/O、零第三方依赖）：FIB 的 `Vec<NextHop>` 有多条时，按 5 元组流哈希
+确定性选一条；同一流恒选同一条（避免 TCP 重排序/跨路径抖动），不同流
+在各下一跳间分散。
+
+- **`FlowKey`**：5 元组 `FlowKey { src_ip: IpAddr, dst_ip: IpAddr,
+  src_port: u16, dst_port: u16, protocol: u8 }`（protocol 为 IP 协议号，
+  6=TCP/17=UDP）；`Clone + Copy + PartialEq + Eq + Hash + Debug`。
+- **流哈希**：FNV-1a 64（portable core 手写实现，零依赖）；输入为 5 元组
+  字段的确定性字节序（IP 按 16 字节展开，IPv4 用 `::ffff:` 映射形式；
+  端口 BE；协议号占单字节）；跨平台、跨运行、跨节点结果一致。
+- **`Fib::select_next_hop`**：
+  `fn select_next_hop(&self, vip: &str, flow: &FlowKey) -> Option<&NextHop>`；
+  未知/不可达 VIP → `None`；单下一跳直接返回该条；多下一跳按
+  `hash(flow) % n` 取索引（FIB 条目内已按 peer 排序，索引跨节点一致）。
+- **反向流一致性**：同一双向流的两个方向（src/dst 互换）不要求选同一条
+  下一跳（各方向独立按其 5 元组哈希；对称选路是后续转发面的事）。
+- E4 场景 `flow_hash.toml`（id=`product.flow-hash`，
+  `cargo run --quiet -p nexus --example flow_hash -- --json`）：
+  菱形拓扑（同 §12.46，A→D 两条 20ms 等代价路径，FIB 有 2 条 NextHop）；
+  期望 `verdict=PASS`，事件：
+  - `flow_stable`：同一 `FlowKey` 连续选择 100 次结果恒定；
+  - `flows_spread`：1000 个不同流分散到 2 条下一跳（每条 ≥ 30%）；
+  - `single_path_stable`：单下一跳 dst（A→B）选择恒为该条；
+  - `unknown_vip_none`：未知 VIP 返回 `None`。
+- 冻结边界：真实转发面挂接（后续）；加权选择（`weight` 非 1 时，后续）；
+  一致性哈希/最小重映射（后续如有需求）；`[routing] strategy` 配置装配（后续）。
+- 契约 hash：`16252a20211d2b498355a829a7517788229ec922`（verify 时写入）。
+
+### 12.48 P5 去中心化选路：`[routing] strategy` 配置装配（2026-09-29）{#12-routing-strategy}
+
+接 §12.47（流哈希选择）。本项交付选路策略的配置化装配（portable core，
+零 I/O、零第三方依赖）：`[routing] strategy` 配置项决定使用哪种 `PathComputer`，
+`RoutingStrategy` 枚举本身实现 `PathComputer`（静态分发，无堆分配），
+调用方无需 hardcode 具体算法。
+
+- **`RoutingStrategy`**（`nexus-discovery::routing`）：
+  `enum RoutingStrategy { Shortest, Ecmp }`；
+  `Clone + Copy + PartialEq + Eq + Debug`。
+- **`RoutingStrategy::parse(s: &str)`**：解析配置字符串（大小写不敏感，
+  前后空白忽略）；`"shortest"` → `Shortest`，`"ecmp"` → `Ecmp`；
+  未知字符串 → `Err(StrategyParseError::Unknown)`（保留原字符串）。
+- **`impl PathComputer for RoutingStrategy`**：各方法直接委托给对应变体
+  （`ShortestPath` / `Ecmp`）；`name()` 返回 `"shortest"` / `"ecmp"`，
+  与直接使用具体类型的行为一致。
+- **配置**（`apps/nexus/src/subnet_cli.rs`，subnet TOML 新增顶层 `[routing]` 段）：
+  ```toml
+  [routing]
+  strategy = "ecmp"  # 可选，默认 "shortest"（向后兼容）；未知值 → CONFIG_ERROR
+  ```
+  缺省 `[routing]` 段或缺省 `strategy` 字段 → `Shortest`（行为与既有部署一致）。
+- E4 场景 `routing_strategy.toml`（id=`product.routing-strategy`，
+  `cargo run --quiet -p nexus --example routing_strategy -- --json`）：
+  - `parse_ok`：`"ecmp"`/`"ECMP"`/`" shortest "` 解析正确；
+  - `parse_err`：`"k-shortest"` 返回 `Err`；
+  - `strategy_computes`：`RoutingStrategy::Ecmp` 在菱形拓扑上算出 2 条等代价路径，
+    `Fib::compute` 得 2 条 NextHop；
+  - `strategy_default`：缺省配置 → `Shortest`，A→D 只有 1 条 NextHop；
+  - `config_toml`：含 `[routing] strategy="ecmp"` 的 TOML 解析出 `Ecmp`。
+  期望 `verdict=PASS`。
+- 冻结边界：K-shortest/Disjoint 等新策略（后续 `PathComputer` impl + 新变体）；
+  真实转发面挂接（后续）；策略热切换（后续）。
+- 契约 hash：`e5a663d8a5c1c12da2d8c8fcb3a9b050881dc589`（verify 时写入）。
+
+### 12.49 P5 去中心化选路：K-shortest 路径（Yen 算法，主备）（2026-09-29）{#12-k-shortest}
+
+接 §12.48（策略装配）。本项交付 K-shortest 路径算法（portable core，
+零 I/O、零第三方依赖）：新增 `PathComputer` 实现 `KShortest`，
+用 Yen 算法求 src→dst 的前 K 条无环最短路（代价可不同，不限于等代价）。
+用于主备路径：首条为主用，其余为备用。
+
+- **`KShortest`**：`KShortest::new(k)`，`k >= 1`；`k == 0` → 构造时 panic
+  （fail-fast，编程错误）；`name()=="k-shortest"`。
+- **Yen 算法**：P1 = Dijkstra 最短路；P(k) 经"spur node"枚举：
+  对 P(k-1) 的每个中间节点为 spur，root path 为其前缀，临时删除
+  会形成环的边/节点后 Dijkstra 求 spur path，候选中最短者为 P(k)。
+  无环保证：spur 计算时删除 root path 上的节点（spur 自身除外）。
+- **`compute_paths`** 返回至多 K 条（按代价升序）；不足 K 条时返回实际条数；
+  不可达 → 空 Vec。`compute()` 返回第一条（最短）。
+- **复杂度**：O(K·V·(E log V))；百节点 K≤3 无压力。K 大时调用方自负。
+- **`RoutingStrategy` 暂不加 `KShortest` 变体**（冻结边界）：策略枚举的
+  变体需要配置字符串映射；K 为参数化（非常量），装配方式待后续设计。
+  本项只交付算法，调用方直接构造 `KShortest::new(k)`。
+- E4 场景 `k_shortest.toml`（id=`product.k-shortest`，
+  `cargo run --quiet -p nexus --example k_shortest -- --json`）：
+  拓扑 A-B(10)-D、A-C(10)-D、A-D(35)（直连 35ms）：
+  - `k_paths_found`：K=3 时 A→D 得 3 条（20ms 经 B、20ms 经 C、35ms 直连）；
+  - `k_ordered`：按代价升序；
+  - `k_truncated`：K=2 时只返回 2 条；
+  - `k_unreachable`：孤立节点返回空。
+  期望 `verdict=PASS`。
+- 冻结边界：`RoutingStrategy` 集成（待参数化策略设计）；Disjoint
+  （边/点不交）路径（后续）；真实转发面挂接（后续）。
+- 契约 hash：`d28e3c0a52b8308c2d3d3b9a40d18651556141b1`（verify 时写入）。
+
+### 12.50 P5 去中心化选路：FIB 管理器（LSDB 指纹触发重算）（2026-09-29）{#12-fib-manager}
+
+接 §12.49（K-shortest）。本项交付 FIB 的生产级管理器（portable core，
+零 I/O、零第三方依赖）：`FibManager` 持有算路器与当前 FIB，
+跟踪 LSDB 指纹，仅在拓扑变化时重算并递增代际；调用方经管理器
+做下一跳选择，无需手写"LSDB 变了没"的判断。
+
+- **`FibManager<C: PathComputer>`**（`nexus-discovery::routing`）：
+  - `new(self_id, computer, lsdb)`：初始计算 FIB（generation=1）。
+  - `maybe_recompute(&mut self, lsdb) -> bool`：计算 LSDB 指纹；
+    若与上次不同 → 重算 FIB、generation+1、返回 `true`；
+    否则返回 `false`（FIB 不变）。
+  - `fib(&self) -> &Fib`、`generation(&self) -> u64`。
+  - `select(&self, vip, flow) -> Option<&NextHop>`：经当前 FIB 按流哈希选择。
+- **LSDB 指纹**：FNV-1a 64 over 全部 LSA 的
+  `(node_id, incarnation BE, seq BE, neighbor 列表)`；
+  任一 LSA 新增/更新 → 指纹变化。指纹碰撞概率可忽略（64 位）。
+- **代际语义**：`new` 后 generation=1；每次实际重算 +1；
+  `maybe_recompute` 返回 `false` 时 generation 不变。
+- E4 场景 `fib_manager.toml`（id=`product.fib-manager`，
+  `cargo run --quiet -p nexus --example fib_manager -- --json`）：
+  - `initial_computed`：`new` 后 FIB 可用（A→D 有下一跳），generation=1；
+  - `no_change_no_recompute`：无变化时 `maybe_recompute` 返回 `false`，
+    generation 不变；
+  - `topo_change_recomputes`：新增节点 E 后 `maybe_recompute` 返回 `true`，
+    generation=2，FIB 含 E；
+  - `select_via_manager`：经 `select` 按流哈希选下一跳成功。
+  期望 `verdict=PASS`。
+- 冻结边界：多线程共享（`Arc<RwLock>` 包装为后续，按需）；
+  真实转发面挂接（后续）；指纹算法更换（后续如有需求）。
+- 契约 hash：`334cb6f424acd248c98a4fc27c79dc163273bc7d`（verify 时写入）。
+
+### 12.51 P5 去中心化选路：Disjoint 不交路径（Suurballe，主备）（2026-09-29）{#12-disjoint}
+
+接 §12.50（FIB 管理器）。本项交付边不交路径算法（portable core，
+零 I/O、零第三方依赖）：新增 `PathComputer` 实现 `Disjoint`，
+用 Suurballe 算法求 src→dst 的 2 条边不交最短路（总代价最小）。
+用于高可靠主备：单链路故障不影响备用路径。
+
+- **`Disjoint`**：`Disjoint::new()`；`name()=="disjoint"`。
+- **Suurballe 算法**：
+  1. Dijkstra 求 dist1（src 为源）；
+  2. 变换边权 `w'(u,v) = w(u,v) + dist1[u] - dist1[v]`（非负）；
+  3. 在 w' 上 Dijkstra 求 dist2/prev2；
+  4. P1 = prev1 的 src→dst 路径，P2 = prev2 的 src→dst 路径；
+  5. 合并 P1/P2，删除重叠边（正反抵消），得 2 条边不交路径。
+- **`compute_paths`** 返回 0/1/2 条：不可达 → 空；只有 1 条不交路 → 1 条；
+  2 条不交 → 2 条（按代价升序）。`compute()` 返回第一条。
+- **边不交定义**：两条路径无共享有向边（无向边视为两条有向边；
+  共享节点允许，仅边不交）。
+- E4 场景 `disjoint.toml`（id=`product.disjoint`，
+  `cargo run --quiet -p nexus --example disjoint -- --json`）：
+  拓扑 A-B(10)-D、A-C(10)-D、B-C(5)：
+  - `disjoint_found`：A→D 得 2 条边不交（A-B-D 与 A-C-D）；
+  - `disjoint_no_shared_edge`：两条无共享边；
+  - `single_when_bridge`：桥接拓扑（A-B-D 唯一）只返回 1 条；
+  - `unreachable_empty`：不可达返回空。
+  期望 `verdict=PASS`。
+- 冻结边界：点不交（后续）；K>2 不交（后续）；`RoutingStrategy` 集成（后续）；
+  真实转发面挂接（后续）。
+- 契约 hash：`3ca1ac1483577a481cb3a27c94654cfca8b03d29`（verify 时写入）。
+
+### §12.52 P5 去中心化选路：加权选择（Weighted Selection）
+
+**状态**：候选。
+**范围**：`Fib::select_next_hop` 支持按 `NextHop.weight` 加权选择；权重
+按路径代价反比分配（代价越小权重越大），权重全 1 时退化为均分。
+**设计**：
+- `Fib::compute` 为每条下一跳按路径代价分配权重：
+  `weight = max_cost - path_cost + 1`（最低代价得最高权重）。
+- `select_next_hop` 改为加权：`h = hash % total_weight`，落到权重区间。
+- 权重全 1 时行为与之前一致（均分）。
+**非目标**：动态权重调整；带宽感知权重；真实转发面挂接。
+**E4**：`scenarios/product/weighted_selection.toml`
+（`id=product.weighted-selection`），不同代价路径按权重比例分散。
+**冻结边界**：动态权重（后续）；`RoutingStrategy` 集成（后续）；
+真实转发面挂接（后续）。
+**契约 hash**：`fbc78159233e22718c67d540cdebc0d6fa245a463fbc0442e72b4424c5c1f565`（verify 时写入）。
+
+### §12.53 P5 去中心化选路：策略集成 KShortest/Disjoint
+
+**状态**：候选。
+**范围**：`RoutingStrategy` 新增参数化变体 `KShortest { k }`、`Disjoint`，
+配置字符串支持 `"k-shortest:3"`、`"disjoint"`。
+**设计**：
+- `RoutingStrategy::KShortest { k: usize }` 委托 `KShortest::new(k)`。
+- `RoutingStrategy::Disjoint` 委托 `Disjoint::new()`。
+- `parse` 大小写不敏感；`"k-shortest"` 无参数时默认 k=2；
+  非法 k（如 0、非数字）→ `Err(InvalidParameter)`。
+- `name()` 返回 `"k-shortest"` / `"disjoint"`。
+**非目标**：策略热切换；动态 k 调整；真实转发面挂接。
+**E4**：`scenarios/product/strategy_extended.toml`
+（`id=product.strategy-extended`），解析 + 装配 + 算路验证。
+**冻结边界**：策略热切换（后续）；真实转发面挂接（后续）。
+**契约 hash**：`37f092680ee72cc69f41a47a797b2333f50a02b646a468198a983a01405a218b`（verify 时写入）。
+
+### §12.54 P5 去中心化选路：FibManager 多线程共享
+
+**状态**：候选。
+**范围**：`SharedFibManager<C>` 包装 `Arc<RwLock<FibManager<C>>>`，
+支持多线程并发读 + 独占写触发重算。
+**设计**：
+- `SharedFibManager::new(self_id, computer, lsdb)` 创建；`clone()` 共享所有权。
+- `read()` 返回 `RwLockReadGuard`（并发读 FIB）。
+- `maybe_recompute()` 需写锁（独占）。
+- 仅用 `std::sync`，保持 portable core（无第三方依赖）。
+- `C: PathComputer` 需 `Send + Sync`（`RwLock` 要求）。
+**非目标**：异步接口；真实转发面挂接。
+**E4**：`scenarios/product/fib_manager_shared.toml`
+（`id=product.fib-manager-shared`），多线程并发读 + 写触发重算。
+**冻结边界**：真实转发面挂接（后续）。
+**契约 hash**：`9c95b8a3a4bb273c04b1cc85da148f79cd3d917ca1915348b003bab0f35dad34`（verify 时写入）。
+
+### §12.55 P5 去中心化选路：点不交路径（Node-Disjoint）
+
+**状态**：候选。
+**范围**：`NodeDisjoint` 算路器，两条除 src/dst 外无共享节点的路径。
+**设计**：
+- 节点分裂法：每节点 v（除 src/dst）分裂为 v_in → v_out，
+  内部边容量 1（代价 0），原边接到分裂节点上。
+- 在分裂图上运行 Suurballe（边不交），映射回原图即点不交。
+- 不可达时返回 0 条；桥接（唯一路径）时返回 1 条（与 §12.51 一致）。
+**非目标**：K>2 点不交；真实转发面挂接。
+**E4**：`scenarios/product/node_disjoint.toml`
+（`id=product.node-disjoint`），验证两条路径无共享中间节点。
+**冻结边界**：K>2 点不交（后续）；真实转发面挂接（后续）。
+**契约 hash**：`94923b114b458611ecc1b9f866d61234b3aff4e7026d11b7b6cb5f1414f387dc`（verify 时写入）。
+
+### §12.56 P5 去中心化选路：转发面挂接 FIB
+
+**状态**：候选。
+**范围**：`VirtualSubnet::resolve_next_hop` 集成 FIB 查询，替代静态路由。
+**设计**：
+- `nexus-connectivity` 新增 `FibResolver` trait（不依赖 `nexus-discovery`）：
+  `fn resolve(&self, dst_vip: &str, flow: &FlowKeyView) -> Option<String>`
+  返回下一跳 VIP；`None` 表示无 FIB 条目，回退原有逻辑。
+- `FlowKeyView`：精简流标识（src/dst IP u32 + 端口 u16 + 协议 u8），
+  由 IP 包解析得到；解析失败 → 回退静态路由。
+  （不提供 `hash()`：实际流哈希由 discovery 侧 `Fib::select_next_hop` 完成，
+  避免两套实现分叉。）
+- `VirtualSubnet` 新增 `fib_resolver: Option<Arc<dyn FibResolver>>`；
+  `resolve_next_hop` 优先级：直连 peer > FIB > 静态 routes > 前缀 > 出口。
+- `apps/nexus` 实现 `DiscoveryFibResolver`：
+  `SharedFibManager` + `PeerId→VIP` 映射（`sync_peer_map` 手动同步；
+  LSDB 变化后调用方负责同步，映射陈旧时 resolve 返回 None 回退静态路由）+
+  加权流哈希选择（复用 §12.52 语义，经 discovery `Fib::select_next_hop`）。
+**非目标**：IPv6 流解析（仅 IPv4）；真实 TUN 数据面（已有 §11.18）。
+**E4**：`scenarios/product/fib_forwarding.toml`
+（`id=product.fib-forwarding`），3 节点经 FIB 转发验证。
+**冻结边界**：距离矢量退役（§12.57）；策略热切换（§12.58）。
+**契约 hash**：`b64bfb98327b48afde28c9bccfc9747697b5d4472fc0e6f1a8aebbf931dd0fb4`（verify 时写入）。
+### §12.57 P5 去中心化选路：距离矢量退役
+
+**状态**：候选。
+**范围**：`nexus-connectivity::routing`（§12.6 距离矢量）标记为已退役。
+**设计**：
+- `MultihopRouter`、`RoutingTable` 等加 `#[deprecated]`（指路 `nexus-discovery` FIB）。
+- MODULE.md 更新：标记"已退役"，说明替代方案。
+- 保留代码与测试（历史证据），不删除。
+- PRODUCT §12.6 加退役注记。
+- 外部消费者（`nexus-harness` 的 `run_multihop_routing`、
+  `apps/nexus/examples/multihop_routing.rs`）加 `#[allow(deprecated)]`
+  保留历史场景。
+**非目标**：删除代码；迁移调用方（生产零引用）。
+**E4**：`cargo check --workspace` 通过（deprecated 不破坏构建）。
+**冻结边界**：策略热切换（§12.58）。
+**契约 hash**：`650706bfc4a03bf0ca0e4107f3ad78617a17a4637952406f0c8cc57ba0dca68e`（verify 时写入）。
+
+### §12.58 P5 去中心化选路：策略热切换
+
+**状态**：候选。
+**范围**：运行时切换 `[routing] strategy` 无需重启。
+**设计**：
+- `SharedFibManager<RoutingStrategy>` 新增 `set_strategy()`：
+  原子替换 `computer` 字段并强制重算 FIB（指纹不变但策略变）。
+- 切换语义：新策略解析失败 → 保持旧策略（fail-closed）；
+  切换期间正在转发的包不受影响（`Arc<RwLock>` RCU 风格）。
+- `apps/nexus` 提供 `strategy_hot_reload_flow` E4 驱动（模拟配置变更）。
+**设计**（watcher，2026-09-29 补）：
+- `apps/nexus::strategy_watcher::StrategyWatcher`：轮询 TOML 配置文件，
+  监听 `[routing] strategy` 变化并热应用。
+  - **位置理由**：配置文件归属 app 层（`subnet_cli::SubnetConfig` 拥有
+    TOML 解析）；`nexus-discovery` 是可移植纯库，不做文件 I/O、不 spawn
+    线程、不引入 TOML 依赖。watcher 是 app 层装配逻辑。
+- **变化检测**：mtime + 内容哈希（FNV-1a 64，手写零依赖）双重确认；
+  mtime 不变 → 静默跳过；mtime 变但哈希不变 → 静默跳过，不记录事件。
+- **变更流程**：读文件 → `toml::from_str::<SubnetConfig>` →
+  `routing_strategy()` → `RoutingStrategy::parse` → 与上次应用策略比较。
+  - 任一步失败 → 记录 `ParseFailed{reason}` / `ReadFailed{reason}` 事件，
+    绝不调用 `set_strategy()`，旧策略与旧 FIB 原样保留（fail-closed）。
+  - 解析成功但策略与上次相同 → 记录 `Unchanged` 事件，不触发重算。
+  - 解析成功且策略不同 → `set_strategy()` 原子切换并强制重算，
+    记录 `Applied{strategy, generation}` 事件。
+  - 加锁顺序：lsdb 读锁 → fib 写锁；应用层不得在持有 fib 读锁时再取
+    lsdb 写锁（避免与 watcher 交叉死锁）。
+- **Owner 与生命周期**：
+  - `StrategyWatcher` handle 拥有工作线程 `JoinHandle<()>`、
+    `Arc<AtomicBool>` 停止信号、
+    `Arc<Mutex<VecDeque<ReloadEvent>>>` 有界事件缓冲；
+    归属启动它的组件（daemon/CLI），不使用全局单例。
+  - `stop(&mut self)`：置停止标志 → join 工作线程 → 返回；
+    停止延迟 ≤ 1 个轮询间隔（内部按 ≤100ms 切片 sleep 保证响应性）。
+  - `Drop` 语义（文档化）：置停止标志；若当前线程不是 watcher 线程
+    自身则 join（避免自 join 死锁）；推荐显式调用 `stop()` 以便观察
+    join 结果。watcher 线程内 drop handle 不会死锁（跳过 join，
+    线程因停止位自行退出）。
+- **结果记录**：有界环形缓冲（默认 64 条，`WatcherConfig.max_events`
+  可配）；`ReloadEvent { seq, timestamp_ms, kind }`，`seq` 单调递增；
+  `events()` 返回快照，可查询。kind ∈ `Applied` / `Unchanged` /
+  `ParseFailed` / `ReadFailed`。
+- **Deletion Test**：不启动 watcher 时系统退化为"无热加载"——手动
+  `set_strategy()` 仍可用，无 panic、无挂起、无泄漏线程。
+**非目标**：inotify 真实文件监听（用轮询）；其他配置项热切换。
+**E4**：`scenarios/product/strategy_hot_reload.toml`
+（`id=product.strategy-hot-reload`），shortest→ecmp 切换验证 FIB 重算；
+`scenarios/product/strategy_watcher.toml`
+（`id=product.strategy-watcher`），真实临时 TOML 文件 → watcher 检测
+`[routing]` 变更 → FIB 重算（generation+1）→ 非法内容保持旧策略 →
+`stop()` join 回收验证。
+**冻结边界**：无（B 层最后一块）。
+**契约 hash**：`c2d7d1d1bbdfbb9357a24e880eb172621b05080134b487d5b784beca8709389e`（verify 时写入；计算方法：SHA-256 over §12.58 节文本自 `### §12.58` 至文件末，排除本行）。
+
+### 12.59 P3.x Linux OS 装配：IP/路由/DNS/daemon（2026-09-30）{#12-os-assemble}
+
+接 §12.29 冻结边界解冻（P3.2 只验证建设备/读写帧，本期补 OS 集成）：
+TUN 设备从"能收发包"到"系统真正走它"。首期只 Linux
+（Windows/macOS 后置）。
+
+- **IP 地址**（`addr.rs`）：给 TUN 设备配地址（如 10.99.0.1/24），netlink；
+  幂等（重复 apply 不产生重复地址）。
+- **路由表**（`route.rs`）：虚拟子网路由必做 + 可选默认路由；
+  **事务性** apply：apply 前拍快照（地址+路由），任一步失败自动 rollback
+  到快照；rollback 本身失败 → 类型化错误 + 告警（不静默）。
+- **DNS**（`dns.rs`）：复用投影层内置 DNS server（DESIGN P1）；
+  **不改** `/etc/resolv.conf` 全局文件；只服务 TUN 网段查询。
+- **daemon**（`daemon.rs`）：自研 daemon（PID 文件防 pkill 误杀、信号处理、
+  退出清理）；正常退出 / SIGTERM / SIGINT → 清理本进程创建的地址和路由；
+  kill -9 无法清理（文档明说）；systemd unit 后置。
+- **SSH 保护**：默认不开 default-route；开启需显式双标志
+  `--default-route --yes-i-know`。
+- **干跑**：`--dry-run` 下零 netlink 写操作，只输出计划。
+- **可观测**：操作日志（`os_assemble.log`）+ 计数器。
+
+E4 场景 `scenarios/platform/os_assemble.toml`（`id=platform.os-assemble`，
+`platform = "linux"`）：
+example 内部 unshare(CLONE_NEWNET) 进隔离 netns（**绝不动真机主网络**），
+建 TUN → apply（配 IP + 加子网路由）→ UDP 回显 → 断言幂等（无重复地址/路由）
+→ `--dry-run` 断言零 netlink 写 → 退出 → 断言地址/路由清理干净；
+无 CAP_SYS_ADMIN 时输出 SKIP（harness 判 UNKNOWN）。
+期望 `verdict=PASS`。
+
+冻结边界：Windows/macOS/Android/iOS 后置；不改 `/etc/resolv.conf`；
+不做 split-DNS 策略（后置）；netns E4 验证机制正确性，非生产拓扑。
+
+## 16. N2 通用资源访问（Universal Resource Access，2026-10-03）{#16-n2-resource-access}
+
+N2 回答白皮书 §16.1 的产品问题："用户如何按资源名称访问设备能力？"；
+完成标志："资源具有稳定身份，发现、授权、访问和撤销构成完整闭环"。
+连接服务于资源使用（白皮书 §6.1）：N1 提供可达状态/质量/失败原因与恢复事件，
+资源层据此判断能否执行。
+
+### 16.1 术语（锚定白皮书）
+
+- **Resource（资源）**：用户实际调用的对象（白皮书 §4.4），如构建环境、Web 服务、
+  数据库端点；区别于 Provider 的能力描述（CPU 架构、内存、OS、工具链版本），
+  后者只是调度的判断条件。
+- **ResourceId**：不透明稳定标识；人类可读名（如 `dev-web`）只做本地解析，
+  名字≠定位（Identity≠Locator）。
+- **ResourceRef{workspace, name}**：资源引用；kind 不进地址，是目录属性。
+- **Provider**：提供资源的节点；Resource ≠ Provider ≠ Node（§9 核心领域不变量）。
+- **Session**：一次 Resource 使用（started/running/finished/cancel＋状态查询），
+  不是"一次连接"；Plan ≠ Session。
+- **use**：N2 资源访问入口（`nexus use <resource>`）：
+  resolve→plan→session→establish→authorize→暴露访问入口→可撤销。
+- **grant**：本地授权表条目 `{resource, principal, operations, not_after}`；
+  capability token 为 P1 演进方向，grant 表即未来的签发输入。
+- **Discovery / Advertisement（广告）**：名字解析与广告传输分离；广告经控制面
+  信封交换，请求方缓存＋TTL 刷新；过期广告不得使用
+  （白皮书 §7.1："过期的能力信息和健康信息不能继续被当作有效的调度依据"）。
+
+### 16.2 N2/N3 分界
+
+Task / Snapshot / Artifact 全部归 N3；N2 只交付 Session。
+判据："凡需固定输入版本或登记输出产物的是 N3；
+只需身份＋授权＋可用连接＋结果的是 N2。"
+白皮书 A.1 的 `run --resource … -- <cmd>`（固定输入、退出码、产物）是任务提交语义，
+归 N3；`nexus run` 在 N2 只做诚实化（见 16.5 D4），其任务语义归 N3。
+journal / reconcile 持久化底座在 N2 一次做对（Crash Consistency，§15），
+不因"归 N3"而推迟。
+
+### 16.3 终态语义（断开≠Failed）
+
+客户端断开重附着窗口内 → 仍 Active（可重附着）；
+窗口外 → `Cancelled(ClientDetached)`；
+provider 消失 → `Failed(ProviderLost)`；
+授权撤销 → `Cancelled(Revoked)`。
+断开误判 Failed 会污染结果确认率（白皮书 §17.2）。
+TerminalOutcome（Completed/Failed/Cancelled）最多提交一次，由 Owner 唯一提交；
+两侧（请求方 Session / 提供方 admission＋租约）各自独立提交，不做分布式共识。
+
+### 16.4 P0 完成标志（真机可测，对标白皮书 §16.1）
+
+1. B 机注册 Service 资源，A 机 `nexus use <name>` 建立真实访问并可撤销
+   （真跨机，非 loopback）。
+2. B 机下线后 A 机看到结构化不可达（ProviderOffline 等），非静默失败。
+3. A 机 CLI 退出重进，可按 SessionId 查到状态＋历史 DecisionTrace。
+4. `nexus plan <resource>` 不产生 Provider 侧连接（只读预览断言）。
+5. 无 grant 时 provider 侧拒绝建 Session 并写审计记录；
+   "目录可见≠有权限"被用例覆盖。
+6. 四 crate 架构门禁通过（`nexus-registry` / `nexus-planner` /
+   `nexus-session` / `nexus-auth` 源码零资源类型专属分支，CI 静态检查）。
+7. 全部 E4/E5 场景 PASS，Evidence 落盘可引用。
+
+### 16.5 D1–D8 决定摘要（2026-10-03 已拍板）
+
+- **D1 Session 归属**：daemon 内全系统唯一的 SessionManager 持有全部资源
+  Session 生命周期；提供方侧只做 admission＋租约记录，不做第二个领域 Session。
+- **D2 寻址/发现**：复用 Discovery＋不透明 ResourceId，P0 static；
+  Registry 契约三件套：`discoverable_by` vs `use_grants` 双层授权字段、
+  三种不可用原因（ProviderOffline / HealthDegraded / NotAcceptingWork）的
+  结构化区分、过期广告拒绝（`AdvertisementExpired`）。
+- **D3 Plan 位置**：Plan 可重算、不独立持久化；Session 内嵌
+  `PlanSnapshot{plan, decision_trace}`；`nexus plan <resource>` 纯只读预览；
+  `plan explain` 双模式（`<session-id>` 读历史真实记录 vs `<resource>`
+  显式标注"估算非承诺"）；DecisionTrace 加厚四件套
+  （score breakdown、Measurement 快照、Connectivity Feasibility、
+  结构化拒绝原因）；PlanId 用确定性非密码学摘要（FNV/xxhash）作标识符，
+  不做安全边界。
+- **D4 `nexus run` 定位**：N2 新建 `nexus use`；`run` 只做诚实化——
+  普通 `run <resource>` 返回真实 session_id/plan_id/outcome，
+  带 `--` 命令的调用返回结构化
+  `UNSUPPORTED{feature:"run-with-command", layer:"N3"}` 而非假执行。
+- **D5 P0 范围**：纵深选 Service（真跨机，不许 loopback 模拟）；
+  横向地基（Resource 实体、租约目录、授权/撤销、Plan/Session 持久化）一次做对；
+  用架构门禁（16.4-6）而非"多做一种资源"证明泛化性。
+- **D6 认证模型**：P0 用双向身份（ed25519，复用 `IdentityManager::peer_id_of`
+  内容派生 NodeId，不引入注册中心）＋本地 grant 表；
+  结构化 `Deny{NoSuchGrant/WrongWorkspace/OperationNotGranted/Expired/Revoked}`，
+  每次判定写审计记录；principal 由握手密钥派生、不接受请求方自称；
+  授权判定在 provider 侧每次建 Session 时执行；TOFU 显式化
+  （首次见未知节点提示用户确认，不静默）；拒绝 PSK 扩展。
+  **P0 显式降级（2026-10-04，N2 P1-14 评审）**：`ResourceOperation::Manage`
+  在 P0 **不保护任何本地管理动作**（`resource publish/revoke`、`grant *`
+  均为本机单管理员操作，D6 判定面只覆盖 `Use` 路径）。操作码保留是为了让
+  grant 表与 P1 的管理面鉴权有稳定形状；把它当成"管理动作已受 Manage
+  保护"的凭证是错误的。P1 启用 Manage 时须同步删除本降级说明。
+  **P0 撤销语义（2026-10-04，N2 P1-14）**：`nexus grant revoke` 是 tombstone
+  撤销（记录保留供取证，判定落 `DenyReason::Revoked`）；`nexus grant del` 是
+  物理 purge（记录与审计线索一并消失）。`nexus resource revoke` 同时 tombstone
+  该资源的全部 grant——撤销只删广告不撤 grant 不算撤销生效。
+- **D7**：见 16.2、16.3。
+- **D8 控制面传输**：拒绝 gRPC/tonic（P0 红线，污染 portable core）；
+  双轨——本机 HTTP/1.1＋JSON（token 鉴权、默认 unix socket，
+  修 `route_for` 丢参数＋daemon 不解析 query string 两个真 bug）；
+  跨节点复用 FrameStream 新增帧类型
+  （RESOURCE_ANNOUNCE / RESOURCE_QUERY / AUTH_GRANT / AUTH_REVOKE / LEASE_RENEW）；
+  N2 控制协议传输无关（流类型前缀）；Session 绑定 PeerId 而非 Connection；
+  P0 不假设 Provider 与请求方同子网（白皮书 §2.1）；
+  QUIC 复用为演进方向。
+
+### 16.6 P0 明确不做（P0 红线）
+
+gRPC/tonic；DHT；OIDC；mDNS/LSA 的 Provider 广播（static 先行）；
+多 Provider 打分/容量/负载均衡；Snapshot/Artifact/attempts；
+`nexus open/expose` 对外受众；Android VPN / VMess。
+
+### 16.7 E4/E5 映射
+
+`scenarios/product/n2-*.toml`（P0-0 契约冻结，Red Evidence 见
+`.evidence/red-n2-p0-0/RED-EVIDENCE.md`）：
+
+| 场景 | 覆盖 |
+|---|---|
+| `n2-use-loop` | `nexus use` 闭环（P0-4 实现；完成标志 1/3） |
+| `n2-plan-preview` | `nexus plan` 只读预览（P0-3；完成标志 4） |
+| `n2-resource-list/show/publish/revoke` | 资源目录四件套（P0-2/P0-4） |
+| `n2-session-list/watch/close` | 会话查询与关闭（P0-4；完成标志 3） |
+| `n2-grant-deny-audit` | grant 拒绝审计（P0-1/P0-4；完成标志 5） |
+| `n2-provider-offline`（E5） | Provider 下线结构化不可达（P0-2/P0-5；完成标志 2） |
+
+**冻结边界**：P0-1 之后的业务代码一律不在本节实现；`nexus run` 诚实化是
+唯一已批准的 requirement-change（D4，单独提交、可回滚）。
+**契约 hash**：`49d631937bc7883bc2b0ed721bae93d8ca955a3557b7e9f5006eeb071005cef5`（计算方法：SHA-256 over §16 节文本自
+`## 16.` 至本行之前，排除本行）。
+
+## 17. N3 分布式任务（模型与契约，2026-10-03） {#17-n3-task}
+
+本节为新 feature 的契约阶段，尚未实现。首期交付白皮书 §16.2：Windows 用户或
+Agent 在指定可信 Linux Compute Provider 上执行固定项目输入的构建/测试，
+恢复查询日志、真实退出码与已登记产物。规范细节见 `docs/N3-MODEL-CONTRACT.md`；
+结构化提交 schema 见 `docs/contracts/n3-task-v1.schema.json`。
+
+### 17.1 对象与授权
+
+- Task 是持久的工作记录；Task ≠ Session ≠ Connection。Task 关联资源 Session，
+  Session 的断开/关闭/孤儿回收不直接决定 Task 终态。
+- Snapshot 固定 `WorkspaceId + CommitId + RootManifestId` 与文件选择、SHA-256 清单；
+  接受后本地新修改不改变运行输入。既有 FNV ID 不作为 N3 完整性安全边界。
+- Artifact 是 Task 产生并登记的输出，绑定 Snapshot、真实环境、内容校验与访问授权。
+- Provider 侧派生 authenticated principal，核实 Use grant、Workspace、输入/输出范围；
+  提供方身份经双向认证保密通道确认。N2 当前独立明文准入不足以承载 N3。
+- 首期指定 Provider、固定容器环境、硬配额、network=none；不支持所需能力即明确拒绝，
+  不悄悄换节点、不退回裸主机、不自动重新执行命令。
+
+### 17.2 接受、生命周期与结果
+
+- 接受请求返回持久 TaskId 和执行契约摘要；ack 前必须原子保护 Task、幂等索引与输入 pin。
+- 幂等作用域为 Workspace＋已认证主体＋Provider＋key；未过期的同请求返回同 TaskId，
+  不同请求返回 IDEMPOTENCY_CONFLICT；并发和崩溃恢复后保持去重。
+- 提供方 TaskOwner 唯一写入 TaskOutcome；TaskPhase 与 Outcome 分离。
+  `Waiting / Preparing / Running / Finalizing / Finished` 为处理阶段；
+  `Unfinished / Completed / Failed / Cancelled` 为恰一次持久终态。
+- 命令退出与结果交付分开：真实 exit_code、workload_succeeded、result_confirmed 独立记录；
+  成功必须符合 accepted success_exit_codes，日志与 required Artifact 已登记且可授权获取。
+  非零退出码可作为完整交付的测试结果，不伪造执行成功。
+- 上传暂时失败保持 Finalizing/Unfinished，可补交；确定缺少必需文件或交付期限届满明确失败。
+  补传、日志续读、重连不得重复执行命令。
+- 断线或崩溃窗口只产生 observation=PendingVerification；没有执行侧证据不擅自失败、
+  取消、重跑。StartIntent 与 OS spawn 的间隙必须核实原进程身份，防 PID 复用。
+- cancel 先记 Requested；执行侧核实从未开始或已停止全部子进程并 reap 后才 Confirmed/
+  Cancelled。不可达时先持久排队请求方取消 intent，显示 CancelPending；
+  `cancel_request=Queued` 与提供方权威 `cancellation` 分开，不能伪造 Requested 事件。
+  超时停止确认后 Failed(Timeout)。
+  自然退出先于取消生效返回 TooLate，不覆盖真实退出或既有终态。
+- 冷启动先恢复 Task、幂等记录、输入/输出 protected roots，再接收新工作及运行 GC。
+  损坏记录明确 STATE_CORRUPT 并保留取证，不静默丢失后重新执行。
+
+### 17.3 统一入口与验收
+
+新增 `nexus task submit --request <json-file>`、`task show/logs/cancel/artifacts` 与
+`artifact get`，均经 daemon 的统一 Application Service；schema_version=1、双输出和
+CLI exit 语义遵循 §9.1。查询 envelope 的 PASS 不能代替 TaskOutcome。
+`artifact get` 默认拒绝覆盖文件，下载内容经 SHA-256 校验后原子发布。
+本期不修改 §16 的 `run ... -- <command>` UNSUPPORTED 期望，便捷 run 接线需另行
+requirement-change；不自动接通 schedule 或 write-back。
+
+`scenarios/product/n3-*.toml` 为冻结 E4 契约，覆盖固定输入、提交去重、环境/授权拒绝、
+真实退出、重附着、取消、超时、产物补传、完整性、存储保护和崩溃核实。
+本机多进程 E4 不证明跨机及平台兼容；最终须追加真实 Windows→Linux E5，
+记录环境、任务输入、日志、退出码和取回产物的独立观察。
+Red Evidence 与冻结文件摘要见 `.evidence/red-n3-model-v1/`；验收 verifier 缺失时明确
+BLOCKED，不把文件存在、静态 schema 通过或 mock 往返当作 N3 产品 PASS。

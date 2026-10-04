@@ -1,0 +1,18 @@
+[package]
+name = "nexus-fabric"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "QUIC-like session layer for the Nexus foundation: FabricConn (reliable streams, datagrams, E2E encryption, address-decoupled connections)"
+
+[dependencies]
+quinn-proto = { version = "0.11", default-features = false, features = ["rustls", "ring"] }
+# bytes: BytesMut/Bytes for the quinn-proto sans-IO API (already in tree via quinn-proto)
+bytes = "1"
+# rcgen: self-signed ed25519 certs binding PeerId (already in tree via nexus-outbound-trojan)
+rcgen = "0.13"
+# ring: ed25519 signature verification in the PeerId-pinning TLS verifier (already in tree)
+ring = "0.17"
+
+[dev-dependencies]

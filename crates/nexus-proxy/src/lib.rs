@@ -68,6 +68,10 @@ pub enum ProxyError {
     UnknownRuleProvider { name: String },
     /// rule-provider 规则行非法（classical 语法 / 嵌套数据规则 / CIDR 非法）。
     InvalidProviderRule { line: String },
+    /// 端口规则参数非法（非数字 / 范围起点大于终点 / 空）。
+    InvalidPortRange { pattern: String },
+    /// 进程名规则参数非法（空 pattern）。
+    InvalidProcessPattern { pattern: String },
     /// 出站激活失败（来自注入的 Connectivity 层）。
     Connectivity(String),
     /// 配置层错误透传。
@@ -89,6 +93,10 @@ impl core::fmt::Display for ProxyError {
             Self::UnknownGeoSite { category } => write!(f, "GEOSITE_UNKNOWN_CATEGORY: {category}"),
             Self::UnknownRuleProvider { name } => write!(f, "RULE_PROVIDER_UNKNOWN: {name}"),
             Self::InvalidProviderRule { line } => write!(f, "RULE_PROVIDER_INVALID_RULE: {line}"),
+            Self::InvalidPortRange { pattern } => write!(f, "INVALID_PORT_RANGE: {pattern}"),
+            Self::InvalidProcessPattern { pattern } => {
+                write!(f, "INVALID_PROCESS_PATTERN: {pattern}")
+            }
             Self::Connectivity(msg) => write!(f, "CONNECTIVITY: {msg}"),
             Self::Config(e) => write!(f, "CONFIG_INVALID: {e}"),
         }
@@ -173,41 +181,58 @@ fn compile_provider(
                     .map_err(|_| ProxyError::InvalidProviderRule { line: c.clone() })
             })
             .collect(),
-        ProviderBehavior::Classical => lines
-            .iter()
-            .map(|line| {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    return Err(ProxyError::InvalidProviderRule {
-                        line: line.to_string(),
-                    });
-                }
-                let mut parts = line.splitn(2, ',');
-                let kind_s = parts.next().unwrap_or_default().trim();
-                let pattern = parts.next().unwrap_or_default().trim();
-                let kind =
-                    RuleKind::parse(kind_s).map_err(|_| ProxyError::InvalidProviderRule {
-                        line: line.to_string(),
-                    })?;
-                match kind {
-                    RuleKind::DomainSuffix => Ok(Matcher::DomainSuffix(pattern.to_string())),
-                    RuleKind::Domain => Ok(Matcher::Domain(pattern.to_string())),
-                    RuleKind::IpCidr => {
-                        IpPrefix::parse(pattern).map(Matcher::IpCidr).map_err(|_| {
-                            ProxyError::InvalidProviderRule {
-                                line: line.to_string(),
-                            }
-                        })
-                    }
-                    RuleKind::Match => Ok(Matcher::Match),
-                    RuleKind::GeoIp | RuleKind::GeoSite | RuleKind::RuleSet => {
-                        Err(ProxyError::InvalidProviderRule {
+        ProviderBehavior::Classical => {
+            lines
+                .iter()
+                .map(|line| {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        return Err(ProxyError::InvalidProviderRule {
                             line: line.to_string(),
-                        })
+                        });
                     }
-                }
-            })
-            .collect(),
+                    let mut parts = line.splitn(2, ',');
+                    let kind_s = parts.next().unwrap_or_default().trim();
+                    let pattern = parts.next().unwrap_or_default().trim();
+                    let kind =
+                        RuleKind::parse(kind_s).map_err(|_| ProxyError::InvalidProviderRule {
+                            line: line.to_string(),
+                        })?;
+                    match kind {
+                        RuleKind::DomainSuffix => Ok(Matcher::DomainSuffix(pattern.to_string())),
+                        RuleKind::Domain => Ok(Matcher::Domain(pattern.to_string())),
+                        RuleKind::IpCidr => {
+                            IpPrefix::parse(pattern).map(Matcher::IpCidr).map_err(|_| {
+                                ProxyError::InvalidProviderRule {
+                                    line: line.to_string(),
+                                }
+                            })
+                        }
+                        RuleKind::SrcPort => PortRange::parse(pattern)
+                            .map(Matcher::SrcPort)
+                            .map_err(|_| ProxyError::InvalidProviderRule {
+                                line: line.to_string(),
+                            }),
+                        RuleKind::DstPort => PortRange::parse(pattern)
+                            .map(Matcher::DstPort)
+                            .map_err(|_| ProxyError::InvalidProviderRule {
+                                line: line.to_string(),
+                            }),
+                        RuleKind::ProcessName => ProcessPattern::parse(pattern)
+                            .map(Matcher::ProcessName)
+                            .map_err(|_| ProxyError::InvalidProviderRule {
+                                line: line.to_string(),
+                            }),
+                        RuleKind::Match => Ok(Matcher::Match),
+                        RuleKind::GeoIp | RuleKind::GeoSite | RuleKind::RuleSet => {
+                            Err(ProxyError::InvalidProviderRule {
+                                line: line.to_string(),
+                            })
+                        }
+                    }
+                })
+                .collect()
+        }
     }
 }
 
@@ -218,10 +243,19 @@ pub struct FlowTarget {
     pub domain: Option<String>,
     /// 目的 IP literal（若是）。
     pub ip: Option<IpAddr>,
+    /// 源端口（TUN 路径由调用方设置；SOCKS5 路径为 None）。
+    pub src_port: Option<u16>,
+    /// 目的端口（从 `destination` 的 `host:port` 解析）。
+    pub dst_port: Option<u16>,
+    /// 进程名（由调用方经 3e ProcessAttributor 设置；缺失为 None）。
+    pub process_name: Option<String>,
 }
 
 impl FlowTarget {
     /// 从 `host:port` / `[ipv6]:port` 目的地派生分流目标（纯函数）。
+    ///
+    /// 目的端口从 `destination` 字符串解析；`src_port` 与 `process_name`
+    /// 由调用方在返回后设置（字段为 `pub`）。
     ///
     /// # Errors
     ///
@@ -234,14 +268,21 @@ impl FlowTarget {
                 target: dest.to_string(),
             });
         }
+        let dst_port = port_from_destination(dest);
         match host.parse::<IpAddr>() {
             Ok(ip) => Ok(Self {
                 domain: None,
                 ip: Some(ip),
+                src_port: None,
+                dst_port,
+                process_name: None,
             }),
             Err(_) => Ok(Self {
                 domain: Some(host),
                 ip: None,
+                src_port: None,
+                dst_port,
+                process_name: None,
             }),
         }
     }
@@ -259,6 +300,25 @@ fn host_from_destination(dest: &str) -> Result<String, ProxyError> {
         Some(idx) => Ok(dest[..idx].to_string()),
         None => Ok(dest.to_string()),
     }
+}
+
+/// 从 `host:port` / `[ipv6]:port` 提取目的端口；无端口或非法时返回 `None`
+/// （调用方按"无端口信息"处理，不报错）。
+fn port_from_destination(dest: &str) -> Option<u16> {
+    if let Some(rest) = dest.strip_prefix('[') {
+        // [ipv6]:port
+        let close = rest.find(']')?;
+        let after = rest[close + 1..].strip_prefix(':')?;
+        return after.parse::<u16>().ok();
+    }
+    // host:port（rfind 取最后一个冒号，避免 IPv6 裸地址误判）
+    let idx = dest.rfind(':')?;
+    let port_s = &dest[idx + 1..];
+    // 裸 IPv6 地址含多个冒号，端口段非纯数字时视为无端口
+    if dest[..idx].contains(':') {
+        return None;
+    }
+    port_s.parse::<u16>().ok()
 }
 
 /// `FlowOrigin` 的稳定机器可读标签（JSON `flow_origin`）。
@@ -343,6 +403,118 @@ const fn ipv6_mask(len: u8) -> u128 {
 }
 
 // ---------------------------------------------------------------------------
+// 端口范围与进程名模式（2026-10-01 新增规则类型）
+// ---------------------------------------------------------------------------
+
+/// 端口范围（闭区间 `[start, end]`）。
+///
+/// 从规则 `match` 字段解析：单端口 `"8080"` 或范围 `"8000-9000"`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortRange {
+    /// 范围起点（含）。
+    pub start: u16,
+    /// 范围终点（含），恒 `>= start`。
+    pub end: u16,
+}
+
+impl PortRange {
+    /// 解析端口模式。
+    ///
+    /// # Errors
+    ///
+    /// 空字符串、非数字、范围起点大于终点时返回 `InvalidPortRange`。
+    pub fn parse(s: &str) -> Result<Self, ProxyError> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err(ProxyError::InvalidPortRange {
+                pattern: s.to_string(),
+            });
+        }
+        if let Some((lo, hi)) = s.split_once('-') {
+            let start: u16 = lo
+                .trim()
+                .parse()
+                .map_err(|_| ProxyError::InvalidPortRange {
+                    pattern: s.to_string(),
+                })?;
+            let end: u16 = hi
+                .trim()
+                .parse()
+                .map_err(|_| ProxyError::InvalidPortRange {
+                    pattern: s.to_string(),
+                })?;
+            if start > end {
+                return Err(ProxyError::InvalidPortRange {
+                    pattern: s.to_string(),
+                });
+            }
+            Ok(Self { start, end })
+        } else {
+            let port: u16 = s.parse().map_err(|_| ProxyError::InvalidPortRange {
+                pattern: s.to_string(),
+            })?;
+            Ok(Self {
+                start: port,
+                end: port,
+            })
+        }
+    }
+
+    /// 端口是否落在范围内（含端点）。
+    #[must_use]
+    pub fn contains(self, port: u16) -> bool {
+        port >= self.start && port <= self.end
+    }
+}
+
+/// 进程名匹配模式：精确匹配或前缀通配（尾部 `*`）。
+///
+/// - `"chrome"`：精确匹配（大小写敏感）；
+/// - `"chrome*"`：前缀匹配（大小写敏感）；
+/// - `"*"`：匹配任意非空进程名。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessPattern {
+    prefix: String,
+    is_wildcard: bool,
+}
+
+impl ProcessPattern {
+    /// 解析进程名模式。
+    ///
+    /// # Errors
+    ///
+    /// 空 pattern 时返回 `InvalidProcessPattern`。
+    pub fn parse(s: &str) -> Result<Self, ProxyError> {
+        if s.is_empty() {
+            return Err(ProxyError::InvalidProcessPattern {
+                pattern: s.to_string(),
+            });
+        }
+        if let Some(prefix) = s.strip_suffix('*') {
+            Ok(Self {
+                prefix: prefix.to_string(),
+                is_wildcard: true,
+            })
+        } else {
+            Ok(Self {
+                prefix: s.to_string(),
+                is_wildcard: false,
+            })
+        }
+    }
+
+    /// 进程名是否匹配（大小写敏感；`None` 恒为 false，由调用方保证）。
+    #[must_use]
+    pub fn matches(&self, name: &str) -> bool {
+        if self.is_wildcard {
+            name.starts_with(&self.prefix)
+        } else {
+            name == self.prefix
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 规则匹配器（纯函数，零 I/O）
 // ---------------------------------------------------------------------------
 
@@ -353,6 +525,9 @@ enum Matcher {
     GeoIp(Vec<IpPrefix>),
     GeoSite(Vec<String>),
     RuleSet(Box<[Matcher]>),
+    SrcPort(PortRange),
+    DstPort(PortRange),
+    ProcessName(ProcessPattern),
     Match,
 }
 
@@ -379,6 +554,18 @@ impl Matcher {
                 None => false,
             },
             Self::RuleSet(inner) => inner.iter().any(|m| m.matches(target)),
+            Self::SrcPort(range) => match target.src_port {
+                Some(p) => range.contains(p),
+                None => false,
+            },
+            Self::DstPort(range) => match target.dst_port {
+                Some(p) => range.contains(p),
+                None => false,
+            },
+            Self::ProcessName(pattern) => match &target.process_name {
+                Some(name) => pattern.matches(name),
+                None => false,
+            },
             Self::Match => true,
         }
     }
@@ -502,6 +689,9 @@ impl RuleEngine {
                     let inner = compile_provider(*behavior, lines)?;
                     Matcher::RuleSet(inner.into_boxed_slice())
                 }
+                RuleKind::SrcPort => Matcher::SrcPort(PortRange::parse(&r.pattern)?),
+                RuleKind::DstPort => Matcher::DstPort(PortRange::parse(&r.pattern)?),
+                RuleKind::ProcessName => Matcher::ProcessName(ProcessPattern::parse(&r.pattern)?),
                 RuleKind::Match => Matcher::Match,
             };
             let action = r
@@ -897,9 +1087,12 @@ impl ProxyService {
         let direct = LinkCandidate::new(LinkKind::Direct, locator.clone(), 0);
         let relay = match record.kind {
             OutboundKind::Relay => Some(LinkCandidate::new(LinkKind::Relay, locator, 0)),
-            // Shadowsocks / VMess 出站不经 LinkActivator 探测；其链路由对应
+            // Shadowsocks / VMess / SOCKS5 出站不经 LinkActivator 探测；其链路由对应
             // nexus-outbound-* adapter 在 Composition Root 承接（§11.6/§11.7）。
-            OutboundKind::Direct | OutboundKind::Shadowsocks | OutboundKind::Vmess => None,
+            OutboundKind::Direct
+            | OutboundKind::Shadowsocks
+            | OutboundKind::Vmess
+            | OutboundKind::Socks5 => None,
             // Trojan 出站不经 LinkActivator 探测；由 nexus-outbound-trojan adapter 在
             // Composition Root 承接（§11.9）。
             OutboundKind::Trojan => None,
@@ -1073,5 +1266,200 @@ groups:
             destination: dest.to_string(),
             profile: String::new(),
         }
+    }
+
+    // ---- 2026-10-01 新增：端口范围解析 ----
+    #[test]
+    fn port_range_single() {
+        let r = PortRange::parse("8080").unwrap();
+        assert_eq!((r.start, r.end), (8080, 8080));
+        assert!(r.contains(8080));
+        assert!(!r.contains(8081));
+    }
+
+    #[test]
+    fn port_range_span() {
+        let r = PortRange::parse("8000-9000").unwrap();
+        assert_eq!((r.start, r.end), (8000, 9000));
+        assert!(r.contains(8000));
+        assert!(r.contains(8500));
+        assert!(r.contains(9000));
+        assert!(!r.contains(7999));
+        assert!(!r.contains(9001));
+    }
+
+    #[test]
+    fn port_range_invalid() {
+        assert!(PortRange::parse("").is_err());
+        assert!(PortRange::parse("abc").is_err());
+        assert!(PortRange::parse("9000-8000").is_err()); // start > end
+        assert!(PortRange::parse("0-99999").is_err()); // out of u16
+        assert!(PortRange::parse("80-").is_err());
+    }
+
+    #[test]
+    fn port_range_boundary() {
+        let r = PortRange::parse("1-65535").unwrap();
+        assert!(r.contains(1));
+        assert!(r.contains(65535));
+        let r0 = PortRange::parse("0").unwrap();
+        assert!(r0.contains(0));
+    }
+
+    // ---- 2026-10-01 新增：进程名模式 ----
+    #[test]
+    fn process_pattern_exact() {
+        let p = ProcessPattern::parse("chrome").unwrap();
+        assert!(p.matches("chrome"));
+        assert!(!p.matches("chrome_renderer"));
+        assert!(!p.matches("Chrome")); // 大小写敏感
+    }
+
+    #[test]
+    fn process_pattern_wildcard() {
+        let p = ProcessPattern::parse("chrome*").unwrap();
+        assert!(p.matches("chrome"));
+        assert!(p.matches("chrome_renderer"));
+        assert!(!p.matches("firefox"));
+        assert!(!p.matches("Chrome")); // 大小写敏感
+    }
+
+    #[test]
+    fn process_pattern_star_only() {
+        let p = ProcessPattern::parse("*").unwrap();
+        assert!(p.matches("anything"));
+        assert!(p.matches(""));
+    }
+
+    #[test]
+    fn process_pattern_invalid() {
+        assert!(ProcessPattern::parse("").is_err());
+    }
+
+    // ---- 2026-10-01 新增：destination 端口解析 ----
+    #[test]
+    fn port_from_destination_cases() {
+        assert_eq!(port_from_destination("example.com:8080"), Some(8080));
+        assert_eq!(port_from_destination("10.1.2.3:443"), Some(443));
+        assert_eq!(port_from_destination("[::1]:8080"), Some(8080));
+        assert_eq!(port_from_destination("example.com"), None);
+        assert_eq!(port_from_destination("10.1.2.3"), None);
+        // 裸 IPv6 无端口
+        assert_eq!(port_from_destination("::1"), None);
+    }
+
+    #[test]
+    fn flow_target_parses_dst_port() {
+        let t = FlowTarget::from_destination("example.com:8080").unwrap();
+        assert_eq!(t.dst_port, Some(8080));
+        assert_eq!(t.src_port, None);
+        assert_eq!(t.process_name, None);
+
+        let t2 = FlowTarget::from_destination("10.1.2.3:443").unwrap();
+        assert_eq!(t2.dst_port, Some(443));
+        assert!(t2.ip.is_some());
+    }
+
+    // ---- 2026-10-01 新增：新 Matcher 匹配 ----
+    fn target_with_ports(src: Option<u16>, dst: Option<u16>) -> FlowTarget {
+        FlowTarget {
+            domain: Some("example.com".to_string()),
+            ip: None,
+            src_port: src,
+            dst_port: dst,
+            process_name: None,
+        }
+    }
+
+    #[test]
+    fn matcher_src_port() {
+        let m = Matcher::SrcPort(PortRange::parse("9000-9100").unwrap());
+        assert!(m.matches(&target_with_ports(Some(9050), None)));
+        assert!(m.matches(&target_with_ports(Some(9000), None)));
+        assert!(m.matches(&target_with_ports(Some(9100), None)));
+        assert!(!m.matches(&target_with_ports(Some(8999), None)));
+        assert!(!m.matches(&target_with_ports(None, None))); // None 不命中
+    }
+
+    #[test]
+    fn matcher_dst_port() {
+        let m = Matcher::DstPort(PortRange::parse("8080").unwrap());
+        assert!(m.matches(&target_with_ports(None, Some(8080))));
+        assert!(!m.matches(&target_with_ports(None, Some(8081))));
+        assert!(!m.matches(&target_with_ports(None, None))); // None 不命中
+    }
+
+    #[test]
+    fn matcher_process_name() {
+        let m = Matcher::ProcessName(ProcessPattern::parse("chrome*").unwrap());
+        let mut t = target_with_ports(None, None);
+        t.process_name = Some("chrome_renderer".to_string());
+        assert!(m.matches(&t));
+        t.process_name = Some("firefox".to_string());
+        assert!(!m.matches(&t));
+        t.process_name = None;
+        assert!(!m.matches(&t)); // None 不命中
+    }
+
+    // ---- 2026-10-01 新增：RuleEngine 端到端 ----
+    const EXTENDED: &str = "schema_version: 1\nrules:\n  - tag: rule-dst-port\n    kind: dst_port\n    match: \"8080\"\n    action:\n      - kind: select_outbound\n        tag: direct\n  - tag: rule-src-port\n    kind: src_port\n    match: \"9000-9100\"\n    action:\n      - kind: select_outbound\n        tag: direct\n  - tag: rule-process\n    kind: process_name\n    match: \"chrome*\"\n    action:\n      - kind: select_outbound\n        tag: direct\n  - tag: rule-match\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: direct\noutbounds:\n  - tag: direct\n    kind: direct\n";
+
+    #[test]
+    fn engine_routes_dst_port() {
+        let engine = RuleEngine::new(&cfg(EXTENDED)).unwrap();
+        let t = FlowTarget::from_destination("example.com:8080").unwrap();
+        let out = engine.route(&t).unwrap();
+        assert_eq!(out.matched_rule, "rule-dst-port");
+        assert_eq!(out.rule_kind, RuleKind::DstPort);
+    }
+
+    #[test]
+    fn engine_routes_src_port() {
+        let engine = RuleEngine::new(&cfg(EXTENDED)).unwrap();
+        let mut t = FlowTarget::from_destination("example.com:443").unwrap();
+        t.src_port = Some(9050);
+        let out = engine.route(&t).unwrap();
+        assert_eq!(out.matched_rule, "rule-src-port");
+        assert_eq!(out.rule_kind, RuleKind::SrcPort);
+    }
+
+    #[test]
+    fn engine_routes_process_name() {
+        let engine = RuleEngine::new(&cfg(EXTENDED)).unwrap();
+        let mut t = FlowTarget::from_destination("example.com:443").unwrap();
+        t.process_name = Some("chrome_renderer".to_string());
+        let out = engine.route(&t).unwrap();
+        assert_eq!(out.matched_rule, "rule-process");
+        assert_eq!(out.rule_kind, RuleKind::ProcessName);
+    }
+
+    #[test]
+    fn engine_falls_through_on_missing_fields() {
+        let engine = RuleEngine::new(&cfg(EXTENDED)).unwrap();
+        // 无端口无进程名 -> 三个新规则都不命中 -> MATCH 兜底
+        let t = FlowTarget::from_destination("example.com:443").unwrap();
+        let out = engine.route(&t).unwrap();
+        assert_eq!(out.matched_rule, "rule-match");
+        assert_eq!(out.rule_kind, RuleKind::Match);
+    }
+
+    #[test]
+    fn engine_rejects_bad_port_pattern() {
+        const BAD: &str = "schema_version: 1\nrules:\n  - tag: bad\n    kind: dst_port\n    match: \"9000-8000\"\n    action:\n      - kind: select_outbound\n        tag: direct\n  - tag: rule-match\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: direct\noutbounds:\n  - tag: direct\n    kind: direct\n";
+        let err = match RuleEngine::new(&cfg(BAD)) {
+            Ok(_) => panic!("expected InvalidPortRange"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, ProxyError::InvalidPortRange { .. }));
+    }
+
+    #[test]
+    fn engine_rejects_empty_process_pattern() {
+        const BAD: &str = "schema_version: 1\nrules:\n  - tag: bad\n    kind: process_name\n    match: \"\"\n    action:\n      - kind: select_outbound\n        tag: direct\n  - tag: rule-match\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: direct\noutbounds:\n  - tag: direct\n    kind: direct\n";
+        let err = match RuleEngine::new(&cfg(BAD)) {
+            Ok(_) => panic!("expected InvalidProcessPattern"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, ProxyError::InvalidProcessPattern { .. }));
     }
 }

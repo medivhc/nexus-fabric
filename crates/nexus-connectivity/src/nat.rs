@@ -219,6 +219,7 @@ impl HolePuncher {
     }
 
     /// 执行打洞：向目标地址发包，尝试打通 NAT
+    #[deprecated(note = "use nexus-nat-traversal PunchSession instead")]
     pub fn punch(&mut self, target: SocketAddr) -> Result<bool, NatError> {
         let start = Instant::now();
         let hello = b"punch-hello";
@@ -260,6 +261,7 @@ impl HolePuncher {
     }
 
     /// 响应打洞请求
+    #[deprecated(note = "use nexus-nat-traversal PunchSession instead")]
     pub fn respond_punch(&self, target: SocketAddr) -> Result<(), NatError> {
         let ack = b"punch-hello-ack";
         self.socket.send_to(ack, target)?;
@@ -267,6 +269,7 @@ impl HolePuncher {
     }
 
     /// 测量 RTT
+    #[deprecated(note = "use nexus-nat-traversal PunchSession instead")]
     pub fn measure_rtt(&self, target: SocketAddr) -> Result<Duration, NatError> {
         let start = Instant::now();
         let ping = b"ping";
@@ -449,6 +452,7 @@ pub fn codec_self_test() -> Result<(usize, SocketAddr), NatError> {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 

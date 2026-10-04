@@ -84,7 +84,7 @@ cargo build --workspace
 
 | 二进制                   | 角色                             | 命令示例                                          |
 | --------------------- | ------------------------------ | --------------------------------------------- |
-| `nexusd`              | 进程内组合根（run /host/relay /proxy） | `nexusd run internet-access --json`           |
+| `nexusd`              | 进程内组合根（run /host/relay /proxy） | `nexus proxy run internet-access --json`           |
 | `nexusd serve`        | 常驻 daemon：HTTP LocalAPI 提供方    | `nexusd serve --addr 127.0.0.1:18080`         |
 | `nexus`               | 控制面 CLI 前端（thin-client）        | `nexus status --json`                         |
 | `nexus-platform-host` | 平台宿主（能力声明）                     | `nexus-platform-host vpi-capabilities --json` |
@@ -93,7 +93,7 @@ cargo build --workspace
 
 
 
-* **进程内闭环**：`nexusd run/host/relay/proxy` 直接装配 SDK 组合根执行，输出结构化 JSON（exit 0 = 请求已被处理，拒绝也是处理结果）。
+* **进程内闭环**：`nexus proxy run/host/relay/proxy` 直接装配 SDK 组合根执行，输出结构化 JSON（exit 0 = 请求已被处理，拒绝也是处理结果）。
 
 * **常驻 daemon + 瘦客户端**：先启动 `nexusd serve --addr <ip:port>`（HTTP LocalAPI，默认监听 `127.0.0.1:0` 随机端口），再由 `nexus` CLI 经 `--addr`（默认 `127.0.0.1:18080`）查询。**CLI 的 7 个观察命令依赖 daemon**：daemon 未运行时返回结构化 `DAEMON_UNREACHABLE`（exit 0）；其余 10 个观察命令无 LocalAPI 路由，CLI 本地合成显式 `UNSUPPORTED`（PRODUCT §9 禁止静默降级，不回落进程内 observability）。
 
@@ -112,12 +112,12 @@ cargo build --workspace
 | 5  | DNS 子系统与 Exit-DNS Binding                               | `product.dns-exit-binding` (8)                                                                                                                                                              | example                                                     |
 | 6  | DNS 多 server 规则路由 + IP-CIDR                             | `product.dns-rule-server-selection` (5) / `product.dns-ipcidr-rule` (5)                                                                                                                     | example                                                     |
 | 7  | Service 资源生命周期                                          | `product.resource-session-lifecycle` (9)                                                                                                                                                    | example / SDK                                               |
-| 8  | daemon 运行远程服务闭环                                         | `product.daemon-run-remote-service-flow` (20)                                                                                                                                               | `nexusd run service --json`                                 |
+| 8  | daemon 运行远程服务闭环                                         | `product.daemon-run-remote-service-flow` (20)                                                                                                                                               | `nexus proxy run service --json`                                 |
 | 9  | 远程 Service 访问                                           | `product.remote-service-access-flow` (20)                                                                                                                                                   | example / SDK                                               |
-| 10 | 远程 Internet 出口                                          | `product.remote-internet-access-flow` (21)                                                                                                                                                  | example / SDK / `nexusd run internet-access`                |
+| 10 | 远程 Internet 出口                                          | `product.remote-internet-access-flow` (21)                                                                                                                                                  | example / SDK / `nexus proxy run internet-access`                |
 | 11 | 远程建连失败回滚                                                | `product.remote-connectivity-failure-rollback` (12)                                                                                                                                         | example                                                     |
 | 12 | 远程认证门控拒绝                                                | `product.remote-network-auth-rejected-rollback` (12)                                                                                                                                        | example                                                     |
-| 13 | 远程计算作业                                                  | `product.remote-compute-job-flow` (22)                                                                                                                                                      | example / SDK / `nexusd run compute`                        |
+| 13 | 远程计算作业                                                  | `product.remote-compute-job-flow` (22)                                                                                                                                                      | example / SDK / `nexus proxy run compute`                        |
 | 14 | 远程计算拒绝回滚                                                | `product.remote-compute-rejected-rollback` (12)                                                                                                                                             | example                                                     |
 | 15 | 远程 Workspace 提交                                         | `product.remote-workspace-commit-flow` (20)                                                                                                                                                 | example                                                     |
 | 16 | 远程 Workspace 拒绝回滚                                       | `product.remote-workspace-rejected-rollback` (15)                                                                                                                                           | example                                                     |
@@ -129,7 +129,7 @@ cargo build --workspace
 | 22 | Workspace 离线三方合并                                        | `product.workspace-offline-merge` (4)                                                                                                                                                       | example / SDK                                               |
 | 23 | 崩溃恢复（冷启动 Reconciliation）                                | `regression.crash-recovery` (4)                                                                                                                                                             | example / SDK                                               |
 | 24 | 终态恰一次提交                                                 | `regression.session-outcome-exactly-once` (2)                                                                                                                                               | example / SDK                                               |
-| 25 | 未知资源结构化拒绝                                               | `product.daemon-rejects-unknown-resource` (4)                                                                                                                                               | `nexusd run <unknown> --json`                               |
+| 25 | 未知资源结构化拒绝                                               | `product.daemon-rejects-unknown-resource` (4)                                                                                                                                               | `nexus proxy run <unknown> --json`                               |
 | 26 | Observability 总览                                        | `product.observability-status` (4)                                                                                                                                                          | `nexusd status --json`                                      |
 | 27 | Observability: plan explain                             | `product.observability-plan-explain` (4)                                                                                                                                                    | `nexusd plan explain --json`                                |
 | 28 | Observability: session watch                            | `product.observability-session-watch` (4)                                                                                                                                                   | `nexusd session watch --json`                               |
@@ -140,21 +140,21 @@ cargo build --workspace
 | 33 | 虚拟子网隧道（Virtual Subnet）                                  | `product.virtual-subnet-tunnel` (7)                                                                                                                                                         | example / SDK                                               |
 | 34 | 三节点虚拟子网静态路由（mesh）                                       | `product.virtual-subnet-mesh-3node` (9)                                                                                                                                                     | harness run / SDK                                           |
 | 35 | NAT 打洞（STUN + UDP 打洞）                                   | `product.nat-hole-punching` (6)                                                                                                                                                       | example / SDK                                               |
-| 36 | Proxy 节点测速（tcp /http204）                                | `proxy-speedtest` (8) / `proxy-speedtest-loopback` (6) / `proxy-speedtest-http204` (8) / `proxy-speedtest-http204-bad-status` (5) / `proxy-speedtest-http204-loopback` (6)                  | `nexusd proxy speedtest --json` / example                   |
-| 37 | Proxy 规则路由内核                                            | `proxy-*` 场景族（见 §4.1.10）                                                                                                                                                                    | `nexusd proxy --addr <ip:port> [--config <path>]` / example |
+| 36 | Proxy 节点测速（tcp /http204）                                | `proxy-speedtest` (8) / `proxy-speedtest-loopback` (6) / `proxy-speedtest-http204` (8) / `proxy-speedtest-http204-bad-status` (5) / `proxy-speedtest-http204-loopback` (6)                  | `nexus proxy speedtest --json` / example                   |
+| 37 | Proxy 规则路由内核                                            | `proxy-*` 场景族（见 §4.1.10）                                                                                                                                                                    | `nexus proxy --addr <ip:port> [--config <path>]` / example |
 | 38 | 出站适配器（SS / VMess / Trojan）                              | `proxy-*-adapter` 等 8 场景（见 §4.1.10）                                                                                                                                                         | example                                                     |
 | 39 | 规则数据注入（geoip.nex/geosite.nex/rule-providers / Clash 订阅） | `geoip-nex-roundtrip` (8) / `geosite-nex-roundtrip` (8) / `proxy-rule-provider-fetch` (11) / `proxy-clash-subscription-parse` (9)                                                           | example / 配置                                                |
 | 40 | Workspace Projection 访问通道                               | `platform.workspace-projection-fallback` (4) / `platform.workspace-projection-channels` (16)                                                                                                | example / SDK                                               |
 | 41 | nexusd serve 常驻 daemon（HTTP LocalAPI）                   | 集成测试 E3（`apps/nexusd/tests/serve_localapi_e2e.rs`，4 用例）                                                                                                                                     | `nexusd serve --addr <ip:port>`                             |
 | 42 | nexus CLI thin-client + run                             | `product.cli-run-command` (5)                                                                                                                                                               | `nexus run service --json` / `nexus status --json`          |
-| 43 | 真实节点数据面（host /relay/ SOCKS5）                            | `daemon-real-host-flow` (9) / `daemon-real-relay-flow` (9) / `daemon-real-socks-proxy-flow` (11) / `daemon-real-host-auth-denied` (5)                                                       | \`nexusd host                                               |
+| 43 | 真实节点数据面（host /relay/ SOCKS5）                            | `daemon-real-host-flow` (9) / `daemon-real-relay-flow` (9) / `daemon-real-socks-proxy-flow` (11) / `daemon-real-host-auth-denied` (5)                                                       | \`nexus proxy host                                               |
 | 44 | 独立 Review + 动态知识库                                       | （工程方法论，非用户功能）                                                                                                                                                                               | `.agents/skills/` + `.agents/knowledge/`                    |
 | 45 | 计划任务 CLI（PRODUCT §14）                                 | `product.schedule-cli` (10) / `product.schedule-cli-reachable` (1)                                                                                                                                        | `nexus schedule at\|every\|list\|cancel\|tick`            |
 | 46 | nexus CLI 虚拟子网命令族                                        | `product.virtual-subnet-tunnel` (7) / `product.virtual-subnet-mesh-3node` (9)（进程内 SDK 入口）                                                                                                            | `nexus subnet up\|status\|leave\|punch`                  |
 | 47 | nexusd 托管 subnet（daemon 组合根）                               | 实测 E5（PRODUCT §12.32 / §12.38；`--tun` 须与 `--foreground` 同用）                                                                                                                                | `nexusd subnet up\|status\|leave [--config] [--foreground] [--tun]` |
-| 48 | TUN 透明入站数据面（wintun）                                       | 实测 E5（需管理员 + wintun.dll 与 exe 同目录；PRODUCT §11.18 / §12.38）                                                                                                                                 | `nexusd proxy --tun` / `nexus subnet up --tun`            |
-| 49 | 系统代理控制（WinInet）                                          | 实测 E5（PRODUCT §8 / §13；`e2e` 自清理闭环）                                                                                                                                                | `nexusd system-proxy status\|set\|clear\|e2e`          |
-| 50 | 开机自启注册（Task Scheduler ONLOGON）                             | 实测 E5（PRODUCT §13.2）                                                                                                                                                                          | `nexusd autostart install\|remove\|status`              |
+| 48 | TUN 透明入站数据面（wintun）                                       | 实测 E5（需管理员 + wintun.dll 与 exe 同目录；PRODUCT §11.18 / §12.38）                                                                                                                                 | `nexus proxy --tun` / `nexus subnet up --tun`            |
+| 49 | 系统代理控制（WinInet）                                          | 实测 E5（PRODUCT §8 / §13；`e2e` 自清理闭环）                                                                                                                                                | `nexus system-proxy status\|set\|clear\|e2e`          |
+| 50 | 开机自启注册（Task Scheduler ONLOGON）                             | 实测 E5（PRODUCT §13.2）                                                                                                                                                                          | `nexus autostart install\|remove\|status`              |
 
 
 
@@ -299,7 +299,7 @@ cargo build --workspace
 * **用户用法**：
 
 
-  * daemon：`nexusd proxy speedtest --json`（loopback 自检，tcp）
+  * daemon：`nexus proxy speedtest --json`（loopback 自检，tcp）
 
   * example：`cargo run --quiet -p nexus --example proxy_speedtest -- --json`（tcp 离线 mock）、`proxy_speedtest_loopback`（tcp 真 TCP）、`proxy_speedtest_http204`（http204 离线 mock）、`proxy_speedtest_http204_loopback`（http204 真 HTTP/204 服务）、`proxy_speedtest_http204_bad_status`（500 → unreachable）
 
@@ -313,14 +313,14 @@ cargo build --workspace
 
 
 
-* **能力**：规则路由代理内核 ——Clash 风格配置解析（订阅节点解析）、规则匹配（DOMAIN / GEOSITE / GEOIP / IP-CIDR / MATCH / 端口）、规则集与 rule-providers（含在线 URL 拉取）、分组策略（selector /url-test/load-balance /relay）。真实数据面：`nexusd proxy --addr <ip:port> [--config <path>]` 提供真实 SOCKS5 监听，逐会话完成握手 → 规则路由 → Session → 真实出站 → 双向字节中继。
+* **能力**：规则路由代理内核 ——Clash 风格配置解析（订阅节点解析）、规则匹配（DOMAIN / GEOSITE / GEOIP / IP-CIDR / MATCH / 端口）、规则集与 rule-providers（含在线 URL 拉取）、分组策略（selector /url-test/load-balance /relay）。真实数据面：`nexus proxy --addr <ip:port> [--config <path>]` 提供真实 SOCKS5 监听，逐会话完成握手 → 规则路由 → Session → 真实出站 → 双向字节中继。
 
 * **出站适配器**：Shadowsocks（真实 TCP 会话）、VMess（线格式）、Trojan（TLS + 认证 + Standard/Singbox 头格式 + SNI/ALPN/skip-verify 参数）。适配器经 `OutboundAdapter` trait 注入（MODULE.md 冻结契约）。
 
 * **用户用法**：
 
 
-  * 数据面：`nexusd proxy --addr 127.0.0.1:1080 --config <path>`
+  * 数据面：`nexus proxy --addr 127.0.0.1:1080 --config <path>`
 
   * example：`proxy_default_match` / `proxy_rule_set` / `proxy_geoip_rule` / `proxy_geosite_rule` / `proxy_ipcidr_rule` / `proxy_selector_group` / `proxy_urltest_group` / `proxy_loadbalance_group` / `proxy_relay_group` / `proxy_socks5_domain_rule` / `proxy_rule_invalid` / `proxy_shadowsocks_adapter` / `proxy_shadowsocks_real_tcp` / `proxy_vmess_adapter` / `proxy_trojan_adapter`（含 `--scenario rejected` 反例）/ `proxy_clash_subscription_parse` / `proxy_rule_provider_fetch`
 
@@ -383,7 +383,7 @@ cargo build --workspace
 
 * **能力**：Node A 经远程闭环访问 Node B 的 InternetAccess 出口，HTTP 请求 / 响应帧往返成功。
 
-* **用户用法**：example `cargo run --quiet -p nexus --example remote_internet_access_flow -- --json`；SDK `nexus::remote_internet_access_flow()`（`apps/nexus/src/lib.rs:949`）；`nexusd run internet-access --json`
+* **用户用法**：example `cargo run --quiet -p nexus --example remote_internet_access_flow -- --json`；SDK `nexus::remote_internet_access_flow()`（`apps/nexus/src/lib.rs:949`）；`nexus proxy run internet-access --json`
 
 * **代码级校验**：场景 `product.remote-internet-access-flow`（21 期望）→ PASS
 
@@ -413,7 +413,7 @@ cargo build --workspace
 
 * **能力**：Node A 向 Node B 提交计算作业并取回结果帧（提交 / 结果往返）。
 
-* **用户用法**：example `cargo run --quiet -p nexus --example remote_compute_job_flow -- --json`；SDK `nexus::remote_compute_job_flow()`（`apps/nexus/src/lib.rs:1289`）；`nexusd run compute --json`
+* **用户用法**：example `cargo run --quiet -p nexus --example remote_compute_job_flow -- --json`；SDK `nexus::remote_compute_job_flow()`（`apps/nexus/src/lib.rs:1289`）；`nexus proxy run compute --json`
 
 * **代码级校验**：场景 `product.remote-compute-job-flow`（22 期望）→ PASS
 
@@ -569,7 +569,7 @@ cargo build --workspace
 
 
 
-* **能力**：`nexusd run <unknown> --json` 返回结构化拒绝 `UNKNOWN_RESOURCE`（exit 0 = 请求已被处理，拒绝也是处理结果），禁止静默忽略。
+* **能力**：`nexus proxy run <unknown> --json` 返回结构化拒绝 `UNKNOWN_RESOURCE`（exit 0 = 请求已被处理，拒绝也是处理结果），禁止静默忽略。
 
 * **用户用法**：`cargo run --quiet -p nexusd -- run frobnicate --json`
 
@@ -598,9 +598,9 @@ cargo build --workspace
 
 
 
-* **能力**：真实网络入口 ——`nexusd host <resource> --addr <ip:port> [--token <t>]` 提供方持续监听（每连接 AUTH 门控 + 业务闭环）；`nexusd relay --addr <ip:port>` DIAL + 双向字节中继；`nexusd proxy --addr <ip:port> [--config <path>]` 真实 SOCKS5 数据面（握手 → 规则路由 → Session → 真实出站 → 字节中继）。
+* **能力**：真实网络入口 ——`nexus proxy host <resource> --addr <ip:port> [--token <t>]` 提供方持续监听（每连接 AUTH 门控 + 业务闭环）；`nexus proxy relay --addr <ip:port>` DIAL + 双向字节中继；`nexus proxy --addr <ip:port> [--config <path>]` 真实 SOCKS5 数据面（握手 → 规则路由 → Session → 真实出站 → 字节中继）。
 
-* **用户用法**：`nexusd host service --addr 127.0.0.1:8787 --token <t>`；`nexusd relay --addr 127.0.0.1:8788`；`nexusd proxy --addr 127.0.0.1:1080`
+* **用户用法**：`nexus proxy host service --addr 127.0.0.1:8787 --token <t>`；`nexus proxy relay --addr 127.0.0.1:8788`；`nexus proxy --addr 127.0.0.1:1080`
 
 * **代码级校验**：`product.daemon-real-host-flow` (9) / `daemon-real-host-auth-denied` (5) / `daemon-real-relay-flow` (9) / `daemon-real-socks-proxy-flow` (11) → 全部 PASS；错误 token 透传 `AUTH_DENIED`，host 为持续服务循环
 

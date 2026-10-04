@@ -275,6 +275,7 @@ pub fn verify(sub: &str) -> Outcome {
             "clippy" => gates::clippy_gate(&repo),
             "architecture-delta" => gates::architecture_gate(&config),
             "dependency-delta" => gates::dependency_gate(&repo, &config),
+            "resource-type-neutrality" => gates::resource_kind_neutrality_gate(&config),
             "affected-tests" => gates::affected_tests_gate(&repo, &config),
             "selected-properties" => gates::selected_properties_gate(&repo),
             other => gates::unimplemented(other),

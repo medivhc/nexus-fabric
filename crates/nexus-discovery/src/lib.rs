@@ -9,18 +9,22 @@
 
 #![forbid(unsafe_code)]
 
+pub mod aggregate;
+pub mod lsa;
+pub mod mdns;
+pub mod paired;
+pub mod routing;
+
+pub use aggregate::AggregateDiscovery;
+pub use paired::{
+    NodeIdentity, PairedDiscovery, PairedPeer, PairingCode, PairingError, PairingFrame,
+    decode_pairing_frame, decode_peer_file, encode_pairing_frame, encode_peer_file, hex_decode,
+    hex_encode, pairing_sign_msg,
+};
+
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
-
-/// 稳定模块标识；业务实现应通过公开类型/trait 增量加入，而不是扩大隐式全局状态。
-pub const NEXUS_DISCOVERY_MODULE: &str = "nexus-discovery";
-
-/// 返回模块的人类可读职责摘要。
-#[must_use]
-pub const fn module_summary() -> &'static str {
-    "执行 Bootstrap、Peer Discovery、Endpoint/Candidate Exchange 与 Presence 建立。"
-}
 
 /// 提供方节点标识。Identity != Locator：Peer 不携带 Endpoint 本身。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -83,6 +87,145 @@ impl StaticDiscovery {
     /// 不改动冻结契约中的任何签名）。
     pub fn register(&mut self, peer: PeerId, addr: SocketAddr) {
         self.peers.insert(peer, addr);
+    }
+}
+
+// ---------- 三源发现 D1/D2/D5/D6（DESIGN §8.2） ----------
+
+/// 统一发现 trait（D1，对标 iroh Discovery，sync）。
+///
+/// 只做查询，不发起网络 I/O、不建立 Connectivity
+/// （Discovery != Connectivity Establishment）；未知 peer 返回空 Vec。
+///
+/// 注意：`StaticDiscovery` 另有 inherent
+/// `resolve(&self, peer: &PeerId) -> Result<SocketAddr, DiscoveryError>`
+/// （remote P0 冻结）；方法调用语法中 inherent 优先，本 trait 方法须经 UFCS
+/// （`Discovery::resolve(&x, &peer)`）或泛型界调用。
+pub trait Discovery {
+    /// 解析 peer 当前已知的可达地址（可能为空）。
+    fn resolve(&self, peer: &PeerId) -> Vec<SocketAddr>;
+}
+
+impl Discovery for StaticDiscovery {
+    /// D2：`Ok(addr) -> vec![addr]`，`Err(_) -> vec![]`（无条目 → 空，不报错）。
+    fn resolve(&self, peer: &PeerId) -> Vec<SocketAddr> {
+        // 显式调用 inherent（Result 版）冻结方法，再映射到 trait 的 Vec 语义。
+        StaticDiscovery::resolve(self, peer).into_iter().collect()
+    }
+}
+
+/// 发现源（D5；变体声明顺序即聚合优先级：配对 > 静态 > LSA > mDNS）。
+///
+/// D7 新增 `Paired`（用户显式配对信任，优先级最高）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DiscoverySource {
+    /// 显式配对信任（D7；最高优先级）。
+    Paired,
+    /// 显式静态配置。
+    Static,
+    /// LSA 泛洪携带的 locator。
+    Lsa,
+    /// 局域网 mDNS。
+    Mdns,
+}
+
+impl DiscoverySource {
+    /// 来源名称（可观测标签用）。
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Paired => "paired",
+            Self::Static => "static",
+            Self::Lsa => "lsa",
+            Self::Mdns => "mdns",
+        }
+    }
+}
+
+impl std::fmt::Display for DiscoverySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// 带来源标注的解析结果（D5）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAddr {
+    /// 可达地址。
+    pub addr: SocketAddr,
+    /// 该地址的来源（去重后保留最高优先级）。
+    pub source: DiscoverySource,
+}
+
+/// 发现可观测计数器（D6；`&self` 可更新，供 `AggregateDiscovery` 用）。
+///
+/// Prometheus 命名约定（导出是组合根职责）：
+/// `discovery_hits{source="paired|static|lsa|mdns"}`、`discovery_miss`。
+#[derive(Debug, Default)]
+pub struct DiscoveryMetrics {
+    hits_paired: std::sync::atomic::AtomicU64,
+    hits_static: std::sync::atomic::AtomicU64,
+    hits_lsa: std::sync::atomic::AtomicU64,
+    hits_mdns: std::sync::atomic::AtomicU64,
+    miss: std::sync::atomic::AtomicU64,
+}
+
+/// [`DiscoveryMetrics`] 的快照。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DiscoveryMetricsSnapshot {
+    /// 有 ≥1 地址产出的配对源解析次数（D7）。
+    pub hits_paired: u64,
+    /// 有 ≥1 地址产出的静态源解析次数。
+    pub hits_static: u64,
+    /// 有 ≥1 地址产出的 LSA 源解析次数。
+    pub hits_lsa: u64,
+    /// 有 ≥1 地址产出的 mDNS 源解析次数。
+    pub hits_mdns: u64,
+    /// 全源无地址的解析次数。
+    pub miss: u64,
+}
+
+impl DiscoveryMetrics {
+    /// 记录一次配对源命中（D7；`&self`，原子更新）。
+    pub fn hits_paired(&self) {
+        self.hits_paired
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 记录一次静态源命中（`&self`，原子更新）。
+    pub fn hits_static(&self) {
+        self.hits_static
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 记录一次 LSA 源命中。
+    pub fn hits_lsa(&self) {
+        self.hits_lsa
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 记录一次 mDNS 源命中。
+    pub fn hits_mdns(&self) {
+        self.hits_mdns
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 记录一次全源未命中。
+    pub fn miss(&self) {
+        self.miss.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 读取当前计数快照。
+    #[must_use]
+    pub fn snapshot(&self) -> DiscoveryMetricsSnapshot {
+        let load = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+        DiscoveryMetricsSnapshot {
+            hits_paired: load(&self.hits_paired),
+            hits_static: load(&self.hits_static),
+            hits_lsa: load(&self.hits_lsa),
+            hits_mdns: load(&self.hits_mdns),
+            miss: load(&self.miss),
+        }
     }
 }
 

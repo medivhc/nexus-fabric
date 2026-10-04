@@ -11,6 +11,11 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+pub mod fs;
+pub use fs::FsContentStore;
+pub mod kv;
+pub use kv::{FileKvStore, StorageError};
+
 /// 内容寻址的对象标识。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ObjectId(pub String);
@@ -42,12 +47,23 @@ pub trait ContentStore {
     fn contains(&self, id: &ObjectId) -> Result<bool, String>;
     fn get(&self, id: &ObjectId) -> Result<Option<Vec<u8>>, String>;
     fn put(&mut self, bytes: &[u8]) -> Result<ObjectId, String>;
+    /// 所有对象 id（GC 候选枚举；实现可按需分页）。
+    fn object_ids(&self) -> Result<Vec<ObjectId>, String>;
+}
+
+/// 存储用量统计（配额门限触发 GC / 驱逐）。
+pub trait StorageStats {
+    /// 当前已用字节数（对象字节之和，不含索引开销）。
+    fn usage_bytes(&self) -> Result<u64, String>;
 }
 
 /// 可达性 GC 契约：只允许回收不再被 protected roots 可达且超过安全保留期的对象。
 pub trait ReachabilityGc {
     fn mark_roots(&mut self, roots: &[ObjectId]) -> Result<(), String>;
     fn sweep_older_than(&mut self, retention_seconds: u64) -> Result<u64, String>;
+    /// GC 专用删除：只有走完 tombstone 两阶段的回收才允许调用。
+    /// 返回 true 表示实际删除了一个对象。
+    fn delete_object(&mut self, id: &ObjectId) -> Result<bool, String>;
 }
 
 #[derive(Debug, Clone)]
@@ -57,7 +73,7 @@ struct StoredObject {
 }
 
 /// 内存内容寻址存储（确定性、可重放；用于 portable-core 测试与 E4 场景）。
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct InMemoryContentStore {
     objects: HashMap<ObjectId, StoredObject>,
     protected: HashSet<ObjectId>,
@@ -117,6 +133,16 @@ impl ContentStore for InMemoryContentStore {
         });
         Ok(id)
     }
+
+    fn object_ids(&self) -> Result<Vec<ObjectId>, String> {
+        Ok(self.objects.keys().cloned().collect())
+    }
+}
+
+impl StorageStats for InMemoryContentStore {
+    fn usage_bytes(&self) -> Result<u64, String> {
+        Ok(self.objects.values().map(|o| o.bytes.len() as u64).sum())
+    }
 }
 
 impl ReachabilityGc for InMemoryContentStore {
@@ -138,6 +164,14 @@ impl ReachabilityGc for InMemoryContentStore {
             keep
         });
         Ok(removed)
+    }
+
+    fn delete_object(&mut self, id: &ObjectId) -> Result<bool, String> {
+        // 注意：protected 集合是显式 mark 的根；tombstone 流程由调用方
+        // （nexus-workspace 的两阶段 GC）保证只删除已过保留期的候选。
+        // 这里不二次检查 protected，避免与 workspace 层的可达闭包语义冲突；
+        // 调用方必须在删除前重新验证可达性（Stop Condition）。
+        Ok(self.objects.remove(id).is_some())
     }
 }
 

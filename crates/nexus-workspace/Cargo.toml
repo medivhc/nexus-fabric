@@ -11,5 +11,8 @@ workspace = true
 [dependencies]
 nexus-domain = { path = "../nexus-domain" }
 nexus-session = { path = "../nexus-session" }
-nexus-delivery = { path = "../nexus-delivery" }
 nexus-storage = { path = "../nexus-storage" }
+# Portable projection contract (v9 §22): the WorkspaceProjection adapter
+# implements nexus-platform's ProjectedWorkspace trait. Domain -> portable
+# platform-trait direction (precedent: other domain crates -> nexus-platform).
+nexus-platform = { path = "../nexus-platform" }

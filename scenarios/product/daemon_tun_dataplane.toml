@@ -5,7 +5,7 @@ evidence_strength = "E4"
 requirement = "PRODUCT.md#12-daemon-tun-dataplane"
 
 [given]
-# 可执行 E4（example daemon_tun_daemon --json，进程内 spawn `nexusd subnet up
+# 可执行 E4（example daemon_tun_daemon --json，进程内 spawn `nexus subnet up
 # --foreground --tun` 子进程）：
 # - 非管理员 / 无 wintun.dll / 无 /dev/net/tun 环境：第一行 stdout 为
 #   {verdict:"TUN_ERROR",...}，子进程自行退出（exit 0），不写状态文件，

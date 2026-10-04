@@ -1,0 +1,45 @@
+schema_version = 1
+id = "product.n2-grant-deny-audit"
+title = "无 grant 时 provider 侧拒绝建 Session 并写审计记录（目录可见≠有权限）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#16-n2-resource-access"
+
+[given]
+# P0-0 契约冻结（2026-10-03）：grant 判定与审计在 P0-1（nexus-auth）/P0-4 实现，
+# 此处先冻结期望。
+# requirement-change 注释：本场景为新契约（contract-first）；当前实现无
+# `use` 入口、无 grant 表，预期 Red（FAIL：unknown command）。
+# D6：P0 用双向身份（X25519，principal 由握手密钥派生、不接受请求方自称）
+# ＋本地 grant 表（{resource, principal, operations, not_after}）；
+# 结构化 Deny{NoSuchGrant/WrongWorkspace/OperationNotGranted/Expired/Revoked}；
+# 每次判定写审计记录；授权判定在 provider 侧每次建 Session 时执行，
+# "目录返回≠有权限"。
+# P0 完成标志 5 的直接覆盖。
+# E4 前置：node-b 注册了 Service 资源 restricted-svc；请求方 principal
+# 无对应 grant（NoSuchGrant）。
+peer = "node-b"
+resource_name = "restricted-svc"
+
+[when]
+command = "cargo run --quiet -p nexus -- use restricted-svc --json"
+
+# 冻结期望（实现后必须满足）：
+# - verdict=FAIL（显式拒绝，非静默失败）
+# - error.code=AUTH_DENIED（结构化拒绝码）
+# - error.deny=NoSuchGrant（结构化拒绝原因，D6 五种之一）
+# - error.audit_written=true（每次判定写审计记录的可观测证据）
+[[expect]]
+field = "verdict"
+equals = "FAIL"
+
+[[expect]]
+field = "error.code"
+equals = "AUTH_DENIED"
+
+[[expect]]
+field = "error.deny"
+equals = "NoSuchGrant"
+
+[[expect]]
+field = "error.audit_written"
+equals = true

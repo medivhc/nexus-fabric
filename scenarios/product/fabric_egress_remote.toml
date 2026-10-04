@@ -1,0 +1,46 @@
+schema_version = 1
+id = "product.fabric-egress-remote"
+title = "统一路由跨节点出口：TUN 包走 Egress{peer} 经对端 NAT，回包经 fabric 返回"
+evidence_strength = "E4"
+requirement = "docs/foundation/DESIGN.md#6.4"
+
+[given]
+topology = "two Projections (A + B) with MockTun, mock peer link (example binary)"
+rules = "A: 1.2.3.0/24 -> Egress{peer=B}; B: 0.0.0.0/0 -> Egress{self}"
+packets = "30 x UDP packets from A to 1.2.3.4:80, deterministic"
+
+# 可执行 E4：A 的规则把 1.2.3.0/24 指到 Egress{B} ->
+# A 封装（意图位=egress）-> mock fabric -> B 解封装 ->
+# B 的 NAT 出口 -> mock 回包 -> B 封装回包 -> A 解封装注入 TUN ->
+# 验证 A 的 TUN 收到正确回包 -> 输出 JSON。
+[when]
+command = "cargo run --quiet -p nexus-projection --example egress_remote -- --json"
+
+# 冻结期望。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+# A 侧 30 个包全部路由到 Egress{B}。
+[[expect]]
+field = "a.route.egress_remote"
+equals = 30
+
+# B 侧 NAT 处理 30 个包。
+[[expect]]
+field = "b.nat.egress_handled"
+equals = 30
+
+# A 侧收到 30 个正确回包。
+[[expect]]
+field = "a.nat.reply_received"
+equals = 30
+
+[[expect]]
+field = "a.nat.reply_bytes_match"
+equals = true
+
+# 意图位正确（egress vs mesh）。
+[[expect]]
+field = "intent.egress_bit_set"
+equals = true

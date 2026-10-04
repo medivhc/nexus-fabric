@@ -8,7 +8,8 @@
 use std::path::{Path, PathBuf};
 
 use nexus_connectivity::cidr::{cidr_contains, parse_cidr};
-use nexus_connectivity::encryption::EncryptionConfig;
+use nexus_connectivity::coord::derive_vip;
+use nexus_connectivity::encryption::{EncryptionConfig, KeyPair};
 use nexus_connectivity::virtual_subnet::{
     MemoryVpi, MeshCarrier, TunnelPeer, TunnelState, VirtualSubnetConfig, VirtualSubnetEvent,
     VirtualSubnetTunnel,
@@ -28,6 +29,39 @@ pub const MAX_TUN_NAME_BYTES: usize = 15;
 pub struct SubnetConfig {
     /// `[subnet]` 表。
     pub subnet: SubnetSection,
+    /// `[routing]` 表（§12.48，可选；缺省 → 默认策略）。
+    #[serde(default)]
+    pub routing: RoutingSection,
+}
+
+/// `[routing]` 配置段（§12.48）：选路策略。
+#[derive(Debug, Clone, Deserialize)]
+pub struct RoutingSection {
+    /// 选路策略（`"shortest"` / `"ecmp"`）；缺省 → `"shortest"`（向后兼容）。
+    #[serde(default = "default_routing_strategy")]
+    pub strategy: String,
+}
+
+fn default_routing_strategy() -> String {
+    "shortest".to_string()
+}
+
+impl Default for RoutingSection {
+    fn default() -> Self {
+        Self {
+            strategy: default_routing_strategy(),
+        }
+    }
+}
+
+impl SubnetConfig {
+    /// 解析 `[routing] strategy` 为 `RoutingStrategy`（§12.48）。
+    ///
+    /// 未知策略 → `Err("ROUTING_STRATEGY: ...")`（CONFIG_ERROR 语义，fail-closed）。
+    pub fn routing_strategy(&self) -> Result<nexus_discovery::routing::RoutingStrategy, String> {
+        nexus_discovery::routing::RoutingStrategy::parse(&self.routing.strategy)
+            .map_err(|e| format!("ROUTING_STRATEGY: {e} (want 'shortest' or 'ecmp')"))
+    }
 }
 
 /// `[subnet]` 配置段。
@@ -35,12 +69,22 @@ pub struct SubnetConfig {
 pub struct SubnetSection {
     /// 子网 CIDR（如 "10.99.0.0/24"）。
     pub cidr: String,
-    /// 本节点虚拟 IP（须在 cidr 内）。
-    pub virtual_ip: String,
+    /// 本节点虚拟 IP（须在 cidr 内）；`None` → 从身份公钥确定性派生（§12.43）。
+    #[serde(default)]
+    pub virtual_ip: Option<String>,
     /// 是否开启隧道加密（P2-1 §12.7），默认关。
     #[serde(default)]
     pub encryption: bool,
-    /// 对端节点列表。
+    /// 网络 PSK（§12.42/§12.43）；与 `network_psk_file` 互斥，按 UTF-8 字节。
+    #[serde(default)]
+    pub network_psk: Option<String>,
+    /// 网络 PSK 文件路径（§12.43）；与 `network_psk` 互斥；要求 0600 权限。
+    #[serde(default)]
+    pub network_psk_file: Option<String>,
+    /// Bootstrap 节点列表（§12.43 去中心化入网）；非空时 PSK 必填（fail-closed）。
+    #[serde(default)]
+    pub bootstrap: Vec<BootstrapConfig>,
+    /// 对端节点列表（legacy 静态配置）。
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
     /// 精确静态路由（§12.5）。
@@ -55,6 +99,16 @@ pub struct SubnetSection {
     /// 出口节点（§12.14，必须是 peers 中的 virtual_ip）。
     #[serde(default)]
     pub egress: Vec<String>,
+}
+
+/// Bootstrap 节点（§12.43）：去中心化入网的已知入口。
+#[derive(Debug, Clone, Deserialize)]
+pub struct BootstrapConfig {
+    /// Bootstrap 地址（如 "udp://203.0.113.10:11010"）。
+    pub address: String,
+    /// 节点名（可选，仅日志/显示用）。
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// 对端节点。
@@ -155,8 +209,39 @@ fn parse_config(path: &Path) -> Result<SubnetConfig, String> {
 fn validate(config: &SubnetConfig) -> Result<(), String> {
     let s = &config.subnet;
     let prefix = parse_cidr(&s.cidr).map_err(|e| format!("CIDR: {e}"))?;
-    if !cidr_contains(&prefix, &s.virtual_ip) {
-        return Err("VIRTUAL_IP_OUTSIDE_SUBNET: virtual_ip not in cidr".into());
+    // §12.43：virtual_ip 可选；显式填写时须在 cidr 内，缺省时由调用方派生。
+    if let Some(vip) = &s.virtual_ip {
+        if !cidr_contains(&prefix, vip) {
+            return Err("VIRTUAL_IP_OUTSIDE_SUBNET: virtual_ip not in cidr".into());
+        }
+    }
+    // §12.43：network_psk 与 network_psk_file 互斥。
+    if s.network_psk.is_some() && s.network_psk_file.is_some() {
+        return Err("PSK_CONFLICT: network_psk and network_psk_file are mutually exclusive".into());
+    }
+    // §12.43：bootstrap 非空时 PSK 必填（fail-closed，仅新路径；legacy 不受影响）。
+    if !s.bootstrap.is_empty() && s.network_psk.is_none() && s.network_psk_file.is_none() {
+        return Err("PSK_REQUIRED: bootstrap join requires network_psk or network_psk_file".into());
+    }
+    // §12.43：bootstrap 地址格式校验（udp://host:port，host 非空）。
+    for b in &s.bootstrap {
+        if !b.address.starts_with("udp://") {
+            return Err(format!(
+                "BOOTSTRAP_ADDRESS: unsupported scheme in '{}' (want udp://host:port)",
+                b.address
+            ));
+        }
+        let rest = &b.address["udp://".len()..];
+        let valid = match rest.rsplit_once(':') {
+            Some((host, port)) => !host.is_empty() && port.parse::<u16>().is_ok(),
+            None => false,
+        };
+        if !valid {
+            return Err(format!(
+                "BOOTSTRAP_ADDRESS: invalid udp address '{}'",
+                b.address
+            ));
+        }
     }
     let peer_vips: Vec<&str> = s.peers.iter().map(|p| p.virtual_ip.as_str()).collect();
     for peer in &s.peers {
@@ -195,6 +280,49 @@ fn validate(config: &SubnetConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// 加载 network PSK（§12.43）。
+///
+/// - `network_psk`：内联字符串，按 UTF-8 字节（空字符串 → `PSK_EMPTY` 错误）；
+/// - `network_psk_file`：读文件（去首尾空白），Unix 下要求 0600 权限，过松则拒绝；
+/// - 均未配置 → `Ok(None)`（调用方按 fail-closed 规则决定是否拒绝）。
+///
+/// # Errors
+///
+/// 两者同时配置 → `PSK_CONFLICT`；文件不可读 → `PSK_FILE`；权限过松 → `PSK_FILE_PERM`。
+fn load_network_psk(s: &SubnetSection) -> Result<Option<Vec<u8>>, String> {
+    if s.network_psk.is_some() && s.network_psk_file.is_some() {
+        return Err("PSK_CONFLICT: network_psk and network_psk_file are mutually exclusive".into());
+    }
+    if let Some(psk) = &s.network_psk {
+        if psk.is_empty() {
+            return Err("PSK_EMPTY: network_psk must not be empty".into());
+        }
+        return Ok(Some(psk.as_bytes().to_vec()));
+    }
+    if let Some(path) = &s.network_psk_file {
+        let path = Path::new(path);
+        // Unix 权限检查：要求 0600（owner 可读写，无组/其他权限）。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(path).map_err(|e| format!("PSK_FILE: {e}"))?;
+            let mode = meta.permissions().mode() & 0o777;
+            if mode != 0o600 {
+                return Err(format!(
+                    "PSK_FILE_PERM: {path:?} mode is {mode:o}, want 600"
+                ));
+            }
+        }
+        let text = std::fs::read_to_string(path).map_err(|e| format!("PSK_FILE: {e}"))?;
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Err("PSK_FILE: empty psk file".into());
+        }
+        return Ok(Some(trimmed.as_bytes().to_vec()));
+    }
+    Ok(None)
+}
+
 /// `subnet up --config <path>`：校验 → 装配 → 写状态文件（`--encrypt-state` 加密落盘）。
 pub fn subnet_up(
     config_path: &Path,
@@ -202,6 +330,21 @@ pub fn subnet_up(
     encrypt_state: bool,
 ) -> Result<Value, String> {
     let config = parse_config(config_path)?;
+    // §12.43：PSK 文件权限等在装配前校验（fail-closed）。
+    let _psk = load_network_psk(&config.subnet)?;
+    // §12.43：virtual_ip 缺省 → 确定性派生。
+    // E4/mock 路径用临时身份；生产 daemon 必须用 §12.39 持久身份（secure-store），见 Feature 2。
+    let virtual_ip = match &config.subnet.virtual_ip {
+        Some(vip) => vip.clone(),
+        None => {
+            let eph_id = KeyPair::generate().map_err(|e| format!("DERIVE_VIP_IDENTITY: {e:?}"))?;
+            derive_vip(eph_id.public_key_bytes(), &config.subnet.cidr, 0)
+                .map_err(|e| format!("DERIVE_VIP: {e:?}"))?
+                .to_string()
+        }
+    };
+    let mut config = config;
+    config.subnet.virtual_ip = Some(virtual_ip.clone());
     let _tunnel = assemble_with(
         &config,
         Box::new(MemoryVpi::new()),
@@ -210,8 +353,8 @@ pub fn subnet_up(
     let s = &config.subnet;
     let state = SubnetState {
         up: true,
-        tunnel_id: format!("tunnel-{}", s.virtual_ip),
-        virtual_ip: s.virtual_ip.clone(),
+        tunnel_id: format!("tunnel-{virtual_ip}"),
+        virtual_ip: virtual_ip.clone(),
         cidr: s.cidr.clone(),
         peer_count: s.peers.len(),
         egress_peer_count: s.egress.len(),
@@ -394,8 +537,13 @@ fn assemble_with(
     carrier: Box<dyn PacketCarrier>,
 ) -> Result<VirtualSubnetTunnel, String> {
     let s = &config.subnet;
+    // §12.43：调用方（subnet_up）须先解析 virtual_ip；此处防御性校验。
+    let vip = s
+        .virtual_ip
+        .as_deref()
+        .ok_or("VIRTUAL_IP_UNRESOLVED: virtual_ip must be resolved before assemble")?;
     let mut tunnel = VirtualSubnetTunnel::new(
-        VirtualSubnetConfig::new(s.cidr.clone(), s.virtual_ip.clone()),
+        VirtualSubnetConfig::new(s.cidr.clone(), vip.to_string()),
         vpi,
         carrier,
     );

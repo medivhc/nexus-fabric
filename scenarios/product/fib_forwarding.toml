@@ -1,0 +1,37 @@
+schema_version = 1
+id = "product.fib-forwarding"
+title = "转发面挂接 FIB：经 FIB 选出下一跳"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12.56-fib-forwarding"
+
+[given]
+topology = "chain: A(10.99.0.1)-B(10.99.0.2)-C(10.99.0.3), A-C not directly connected"
+fib = "SharedFibManager<RoutingStrategy::Shortest>; A->C has 1 next-hop (B)"
+resolver = "DiscoveryFibResolver: FIB lookup + weighted flow-hash + PeerId->VIP"
+
+# 可执行 E4：FIB 转发验证
+#   fib_computed       A->C 的 FIB 有 1 条下一跳
+#   resolver_selects_b 按流哈希选出 B（10.99.0.2）
+#   subnet_integration 适配器装配验证
+[when]
+command = "cargo run --quiet -p nexus --example fib_forwarding -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "events.0"
+equals = "fib_computed"
+
+[[expect]]
+field = "events.1"
+equals = "resolver_selects_b"
+
+[[expect]]
+field = "events.2"
+equals = "subnet_integration"
+
+[[expect]]
+field = "fib_forwarding.next_hop"
+equals = "10.99.0.2"

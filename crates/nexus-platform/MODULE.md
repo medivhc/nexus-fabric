@@ -64,6 +64,16 @@
   系统代理（WinINET）状态；具体注册表/WinINET 通知在 `nexus-platform-windows`。
 - `AutostartRegistrar`（PRODUCT §13）：install/remove/status 当前用户登录自启
   条目；具体计划任务操作在 `nexus-platform-windows`。
+- `ProjectedWorkspace`（v9 §22，`projected.rs`）：workspace-as-filesystem
+  portable 契约（read/write/list/delete/commit/head），平台投影适配器
+  （Linux FUSE、Windows/macOS 文件系统适配、移动端 File Provider）消费它；
+  适配器不得拥有 replica selection / path planning / cache policy / commit 语义。
+  Deletion Test：删掉它、`nexus-platform-linux` 直连 `nexus-workspace::WorkspaceAccess`
+  会破坏 v9 §4 "platform adapters -X-> higher-level domain runtimes" 不变量，
+  且每个未来平台要各写一份私有耦合——它是唯一的 portable 契约。
+- `ProjectedWorkspace::state_root`（C1，加法，带默认实现 `None`）：当前持久
+  状态根对象 id（daemon 生命周期用：每次 commit 后更新 state_root 锚文件，
+  重启 `open` 用）。纯观测元数据，不改变文件语义；旧实现者无需改动。
 
 ## Verification
 

@@ -1,0 +1,94 @@
+[
+  {
+    "id": "product.n2-grant-deny-audit",
+    "verdict": "FAIL",
+    "detail": "stdout is not JSON (command failed or unknown subcommand)",
+    "stdout_head": "",
+    "expects": []
+  },
+  {
+    "id": "product.n2-plan-preview",
+    "verdict": "FAIL",
+    "detail": "stdout is not JSON (command failed or unknown subcommand)",
+    "stdout_head": "",
+    "expects": []
+  },
+  {
+    "id": "product.n2-provider-offline",
+    "verdict": "FAIL",
+    "detail": "stdout is not JSON (command failed or unknown subcommand)",
+    "stdout_head": "",
+    "expects": []
+  },
+  {
+    "id": "product.n2-resource-list",
+    "verdict": "FAIL",
+    "detail": "stdout is not JSON (command failed or unknown subcommand)",
+    "stdout_head": "",
+    "expects": []
+  },
+  {
+    "id": "product.n2-resource-publish",
+    "verdict": "FAIL",
+    "detail": "stdout is not JSON (command failed or unknown subcommand)",
+    "stdout_head": "",
+    "expects": []
+  },
+  {
+    "id": "product.n2-resource-revoke",
+    "verdict": "FAIL",
+    "detail": "stdout is not JSON (command failed or unknown subcommand)",
+    "stdout_head": "",
+    "expects": []
+  },
+  {
+    "id": "product.n2-resource-show",
+    "verdict": "FAIL",
+    "detail": "stdout is not JSON (command failed or unknown subcommand)",
+    "stdout_head": "",
+    "expects": []
+  },
+  {
+    "id": "product.n2-session-close",
+    "verdict": "FAIL",
+    "detail": "stdout is not JSON (command failed or unknown subcommand)",
+    "stdout_head": "",
+    "expects": []
+  },
+  {
+    "id": "product.n2-session-list",
+    "verdict": "FAIL",
+    "detail": "stdout is not JSON (command failed or unknown subcommand)",
+    "stdout_head": "",
+    "expects": []
+  },
+  {
+    "id": "product.n2-session-watch",
+    "verdict": "FAIL",
+    "detail": "expect product.n2-session-watch.verdict failed (actual: 'FAIL')",
+    "expects": [
+      {
+        "field": "verdict",
+        "ok": false,
+        "actual": "'FAIL'"
+      },
+      {
+        "field": "session.id",
+        "ok": false,
+        "actual": "None"
+      },
+      {
+        "field": "session.outcome",
+        "ok": false,
+        "actual": "None"
+      }
+    ]
+  },
+  {
+    "id": "product.n2-use-loop",
+    "verdict": "FAIL",
+    "detail": "stdout is not JSON (command failed or unknown subcommand)",
+    "stdout_head": "",
+    "expects": []
+  }
+]

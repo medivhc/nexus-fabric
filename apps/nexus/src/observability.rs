@@ -194,7 +194,11 @@ fn outcome_label(o: &TerminalOutcome) -> &'static str {
 }
 
 /// `session watch`：Session 双轨状态列表（phase / outcome / 是否已提交终态）。
-pub fn session_watch() -> Result<Value, NexusError> {
+///
+/// `session` 为 `Some(id)` 时只返回该 Session（N2 P0-1 bugfix：此前 CLI 的
+/// `route_for` 丢弃了 session 参数）；未知 id → `NotFound`；`None` 保持
+/// 旧行为（返回全部，供冻结场景 `observability-session-watch`）。
+pub fn session_watch(session: Option<&str>) -> Result<Value, NexusError> {
     let mut s1 = SessionOwner::new(SessionId("sess-1".into()));
     let _ = s1.transition_phase(LifecyclePhase::Active);
     let _ = s1.commit_outcome(TerminalOutcome::Completed);
@@ -209,7 +213,24 @@ pub fn session_watch() -> Result<Value, NexusError> {
 
     let s3 = SessionOwner::new(SessionId("sess-3".into()));
 
-    let sessions: Vec<Value> = [s1, s2, s3]
+    let mut owners = vec![s1, s2, s3];
+    if let Some(want) = session {
+        let pos = owners.iter().position(|s| s.id().0 == want);
+        match pos {
+            Some(i) => {
+                let only = owners.swap_remove(i);
+                owners = vec![only];
+            }
+            None => {
+                return Err(NexusError::NotFound {
+                    kind: "session".to_string(),
+                    id: want.to_string(),
+                });
+            }
+        }
+    }
+
+    let sessions: Vec<Value> = owners
         .into_iter()
         .map(|s| {
             let status = s.status();
@@ -281,7 +302,19 @@ pub fn connectivity_status() -> Result<Value, NexusError> {
 // ---------- 命令：plan explain ----------
 
 /// `plan explain`：Planner 决策解释（Provider/Placement/Path/Strategy + DecisionTrace 拒绝原因）。
-pub fn plan_explain() -> Result<Value, NexusError> {
+///
+/// `resource` 为 `Some(name)` 时只解释该资源（N2 P0-1 bugfix：此前 CLI 的
+/// `route_for` 丢弃了 resource 参数）；演示快照只认识 `internet-access`，
+/// 其他名字 → `NotFound`；`None` 保持旧行为（冻结场景 `observability-plan-explain`）。
+pub fn plan_explain(resource: Option<&str>) -> Result<Value, NexusError> {
+    if let Some(name) = resource {
+        if name != "internet-access" {
+            return Err(NexusError::NotFound {
+                kind: "resource".to_string(),
+                id: name.to_string(),
+            });
+        }
+    }
     let resource = ResourceId("internet-access".into());
     let snapshot = PlanningSnapshot::new(
         vec![
@@ -383,7 +416,7 @@ pub fn platform_capabilities() -> Result<Value, NexusError> {
 pub fn status() -> Result<Value, NexusError> {
     let dns = dns_status()?;
     let conn = connectivity_status()?;
-    let plan = plan_explain()?;
+    let plan = plan_explain(None)?;
     let caps = platform_capabilities()?;
     Ok(json!({
         "verdict": "PASS",
@@ -407,11 +440,12 @@ pub fn status() -> Result<Value, NexusError> {
 /// 快照（挂 nexus-workspace DAG：init -> 两次离线提交 -> HeadSet 分叉）。
 pub fn workspace_heads() -> Result<Value, NexusError> {
     use nexus_storage::InMemoryContentStore;
-    use nexus_workspace::{Change, Workspace, WorkspaceId};
+    use nexus_workspace::{AuthorId, Change, Workspace, WorkspaceId};
 
     let mut ws = Workspace::init(
         WorkspaceId("ws-observability-1".into()),
         InMemoryContentStore::new(),
+        AuthorId("node-local".into()),
     )
     .map_err(|e| NexusError::Internal {
         message: format!("workspace init failed: {e}"),
@@ -487,11 +521,12 @@ pub fn workspace_heads() -> Result<Value, NexusError> {
 /// 捕获 `MergeConflict::ConflictingPath`，输出冲突快照（挂 nexus-workspace DAG）。
 pub fn workspace_conflicts() -> Result<Value, NexusError> {
     use nexus_storage::InMemoryContentStore;
-    use nexus_workspace::{Change, MergeConflict, Workspace, WorkspaceError, WorkspaceId};
+    use nexus_workspace::{AuthorId, Change, Workspace, WorkspaceId};
 
     let mut ws = Workspace::init(
         WorkspaceId("ws-observability-2".into()),
         InMemoryContentStore::new(),
+        AuthorId("node-local".into()),
     )
     .map_err(|e| NexusError::Internal {
         message: format!("workspace init failed: {e}"),
@@ -531,17 +566,18 @@ pub fn workspace_conflicts() -> Result<Value, NexusError> {
             message: format!("commit remote failed: {e}"),
         })?;
 
-    // 三方合并：同一路径冲突 -> MergeConflict::ConflictingPath{path}。
-    let conflict_paths: Vec<String> = match ws.merge_heads(&local, &remote) {
-        Ok(_) => Vec::new(),
-        Err(WorkspaceError::MergeConflict(MergeConflict::ConflictingPath { path })) => {
-            vec![path]
-        }
-        Err(e) => {
-            return Err(NexusError::Internal {
-                message: format!("workspace merge failed: {e}"),
-            });
-        }
+    // 三方合并：同一路径冲突 -> v2 返回 Ok + 持久化 ConflictObject。
+    let report = ws
+        .merge_heads(&local, &remote)
+        .map_err(|e| NexusError::Internal {
+            message: format!("workspace merge failed: {e}"),
+        })?;
+    let conflict_paths: Vec<String> = match report.conflict {
+        Some(id) => ws
+            .get_conflict(&id)
+            .map(|c| c.paths.clone())
+            .unwrap_or_default(),
+        None => Vec::new(),
     };
 
     let heads = ws.heads();
@@ -618,8 +654,8 @@ pub fn compute_jobs() -> Result<Value, NexusError> {
 pub fn diagnose() -> Result<Value, NexusError> {
     let dns = dns_status()?;
     let conn = connectivity_status()?;
-    let plan = plan_explain()?;
-    let session = session_watch()?;
+    let plan = plan_explain(None)?;
+    let session = session_watch(None)?;
     let ws = workspace_heads()?;
     let caps = platform_capabilities()?;
 
@@ -944,5 +980,41 @@ mod tests {
             "cache hit must not increment resolver_call_count"
         );
         assert!(calls_after_first >= calls_before, "resolve observed");
+    }
+
+    /// N2 P0-1 bugfix：`session watch <id>` 参数过滤（此前被丢弃）。
+    #[test]
+    fn session_watch_filters_by_id() {
+        // 无参数：全部三个（冻结场景行为不变）。
+        let all = session_watch(None).expect("no filter");
+        assert_eq!(all["sessions"].as_array().unwrap().len(), 3);
+        // 有参数：只返回命中的。
+        let one = session_watch(Some("sess-2")).expect("filter sess-2");
+        let arr = one["sessions"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["session"], "sess-2");
+        // 未知 id：结构化 NotFound（非静默空列表）。
+        let err = session_watch(Some("nope")).unwrap_err();
+        assert!(matches!(
+            err,
+            NexusError::NotFound { kind, .. } if kind == "session"
+        ));
+    }
+
+    /// N2 P0-1 bugfix：`plan explain <resource>` 参数过滤（此前被丢弃）。
+    #[test]
+    fn plan_explain_filters_by_resource() {
+        // 无参数：演示快照（冻结场景行为不变）。
+        let v = plan_explain(None).expect("no filter");
+        assert_eq!(v["plan"]["provider"], "p1");
+        // 演示快照认识的资源：同结果。
+        let v = plan_explain(Some("internet-access")).expect("known resource");
+        assert_eq!(v["plan"]["provider"], "p1");
+        // 未知资源：结构化 NotFound（不撒谎返回别人的 Plan）。
+        let err = plan_explain(Some("nope")).unwrap_err();
+        assert!(matches!(
+            err,
+            NexusError::NotFound { kind, .. } if kind == "resource"
+        ));
     }
 }

@@ -1,0 +1,46 @@
+RED EVIDENCE — Phase 3d Semantic Ingress (feature/semantic-ingress)
+================================================================
+Date: 2026-09-30
+Contract: S25 (语义入口：SOCKS5/HTTP CONNECT → 统一路由 → fabric STREAM)
+
+## Scenario: product.fabric-semantic-ingress → BLOCKED
+
+$ cargo run -p nexus-projection --example semantic_ingress
+Result: BLOCKED — example `semantic_ingress` 不存在：
+
+error: no example target named `semantic_ingress` in `nexus-projection`
+
+## Unit tests (TDD Red): 以下测试在实现前全部 FAIL（编译失败/缺失）
+
+1. `semantic::tests::socks5_connect_routes_to_egress_peer` (S25)
+   → FAIL: `SemanticIngress` 不存在
+
+2. `semantic::tests::http_connect_routes_to_egress_peer` (S25)
+   → FAIL: 同上
+
+3. `semantic::tests::drop_target_rejected_with_protocol_error` (S25)
+   → FAIL: 同上
+
+4. `semantic::tests::syn_domain_form_roundtrip` (S25, wire 兼容)
+   → FAIL: typed SYN 载荷编解码不存在
+
+5. `semantic::tests::handshake_failure_counted_and_closed` (S25)
+   → FAIL: 同上
+
+## 契约要点（S25，已冻结）
+
+- 复用 `nexus-ingress` 的 `Socks5Handshake` / HTTP 代理状态机（零 I/O 纯函数），
+  不重写解析器；`nexus-ingress` 加入 MODULE.md Allowed Dependencies。
+- 首字节嗅探：0x05 → SOCKS5，否则 HTTP；BIND / UDP ASSOCIATE /
+  plain HTTP absolute-form 显式拒绝（P0 只做 CONNECT）。
+- 握手成功 → 同一条 `UnifiedRouter` 决策链：
+  Egress{self} → 本地 TcpStream；Egress{peer} → STREAM 意图 0x02；
+  Drop → SOCKS5 0x02 / HTTP 403 + 计数。
+- SYN 载荷扩展（S22 兼容扩展）：首字节 addr-type（0x01=IPv4 / 0x03=域名），
+  尾 2 字节 port；len==6 按 3b-5 旧格式解析。域名不在 originator 本地解析。
+- egress 侧域名 SYN → 解析（S17 缓存）→ TcpStream → 复用 S22 中继。
+
+## Contract Hash (frozen, 2026-09-30)
+
+场景文件: scenarios/product/fabric_semantic_ingress.toml (新建)
+MODULE.md: S25 已写入 + nexus-ingress 加入 Allowed Dependencies

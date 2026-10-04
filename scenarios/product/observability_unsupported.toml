@@ -1,16 +1,27 @@
 schema_version = 1
 id = "product.observability-unsupported"
-title = "§9 可观察性：领域未就绪命令显式 UNSUPPORTED（禁止静默降级）"
+title = "§9 可观察性：领域未就绪命令显式拒绝（禁止静默降级）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#9-observability"
 
 [given]
 domain_state = "connectivity trace not ready"
-no_silent_degradation = "explicit UNSUPPORTED error, exit 0"
+no_silent_degradation = "explicit rejection, exit 0 for known-unrouted commands"
 
+# requirement-change 2026-10-02（用户已批准）：2026-10-01 CLI 统一（01e5114）后，
+# 未就绪/未知命令的拒绝分为两种深思熟虑的机制（真机实测）：
+# 1. 已知但暂无 LocalAPI 路由的命令（如 diagnose）→ 结构化 UNSUPPORTED FAIL JSON，
+#    exit 0（本场景断言此机制，harness 可观测）；
+# 2. 解析器未知的子命令（如 connectivity trace，不在
+#    connectivity status|candidates|probe <target>|links 之列）→ exit 2 + usage 文本。
+#    这是深思熟虑的新行为，但 nexus-harness 只接受 stdout JSON 且不支持断言 exit 码
+#    （ExpectKind 仅 Equals/OneOf/NonEmpty），故机制 2 暂无 harness 可表达的 E4 形式——
+#    为 harness 能力缺口，见轨道报告。
 [when]
-command = "cargo run --quiet -p nexusd -- connectivity trace --json"
+command = "cargo run --quiet -p nexus -- diagnose --json"
 
+# 冻结期望（2026-10-02）：未就绪命令必须显式拒绝，禁止静默降级——verdict=FAIL +
+# error.code=UNSUPPORTED + error.command 指明被拒绝的命令。
 [[expect]]
 field = "verdict"
 equals = "FAIL"
@@ -21,4 +32,4 @@ equals = "UNSUPPORTED"
 
 [[expect]]
 field = "error.command"
-equals = "connectivity trace"
+equals = "diagnose"

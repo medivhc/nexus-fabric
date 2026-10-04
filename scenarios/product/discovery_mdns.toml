@@ -1,0 +1,19 @@
+schema_version = 1
+id = "product.discovery-mdns"
+title = "mDNS 局域网互发现：双节点 PTR/SRV/TXT/A 完整往返"
+evidence_strength = "E4"
+requirement = "DESIGN.md#8.2"
+
+[given]
+network = "同子网组播 224.0.0.251:5353；单进程双节点（SO_REUSEADDR），经 loopback 组播互发现"
+service = "_nexus._udp.local；实例名 nx-<peerid>；TXT 携带 peer=<PeerId>；mDNS 只做发现不做认证"
+environment = "沙箱无组播能力时 example 诚实输出 SKIP（逻辑错误必须 FAIL，不得用 SKIP 掩盖）"
+
+[when]
+command = "cargo run --quiet -p nexus --example discovery_mdns -- --json"
+
+# 冻结期望（D3）：双向互发现成功为 PASS；环境无组播能力时 SKIP；
+# verdict 只断言（os-assemble 先例：harness 无 SKIP 短路，example 自带 SKIP 语义）。
+[[expect]]
+field = "verdict"
+one_of = ["PASS", "SKIP"]

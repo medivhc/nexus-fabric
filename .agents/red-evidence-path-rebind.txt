@@ -1,0 +1,42 @@
+RED EVIDENCE — Phase 4a Path Rebind (feature/path-rebind)
+================================================================
+Date: 2026-09-30
+Contract: S9 (nexus-path) + S27 (nexus-projection)
+
+## Scenario: product.fabric-path-rebind → BLOCKED
+
+$ cargo run -p nexus-projection --example path_rebind
+Result: BLOCKED — example `path_rebind` 不存在：
+
+error: no example target named `path_rebind` in `nexus-projection`
+
+## Unit tests (TDD Red): 以下测试在实现前全部 FAIL（编译失败/缺失）
+
+1. `path_link::tests::pump_drives_rebind_on_switch` (S27)
+   → FAIL: `PathLink` 不存在
+
+2. `path_link::tests::rebind_failure_keeps_connection` (S27)
+   → FAIL: 同上
+
+3. `path_link::tests::unmapped_peer_ignored_and_counted` (S27)
+   → FAIL: 同上
+
+4. nexus-path: `remove_candidate` 移除活跃路径发出 `Switched` (S9)
+   → 现有单测 `remove_candidate` 行 738 附近只断言 current_path，
+     未断言事件；需补事件断言（实现时确认）
+
+## 契约要点（已冻结）
+
+- 依赖倒置：nexus-path 只发 `PathEvent::Switched`（S9），保持对
+  nexus-fabric 零实现依赖；联动胶水 `PathLink` 在 nexus-projection（S27），
+  nexus-path 加入其 Allowed Dependencies + Cargo.toml。
+- `PathLink::pump()` 排空 `poll_event()`，`Switched` → 对应 peer 的
+  `FabricConn::rebind()`（阻塞至生效）；成功计数 `path_rebinds`，
+  失败计数 `path_rebind_errors` 且不断开旧连接（S2）。
+- E4 必须走生产 `pump()`（教训 2026-09-30-e4-must-use-production-path）。
+- TURN 真实实现后置为 4b；本期只验证直连路径切换。
+
+## Contract Hash (frozen, 2026-09-30)
+
+场景文件: scenarios/product/fabric_path_rebind.toml (新建)
+MODULE.md: nexus-path S9 + nexus-projection S27 已写入

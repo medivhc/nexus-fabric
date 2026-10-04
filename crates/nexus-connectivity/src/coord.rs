@@ -16,9 +16,6 @@
 
 use std::net::Ipv4Addr;
 
-/// 稳定模块标识。
-pub const NEXUS_COORD_MODULE: &str = "nexus-connectivity::coord";
-
 /// 协调错误（全部结构化，无 panic 路径）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoordError {
@@ -560,6 +557,35 @@ pub fn peer_id_from_public_key(public_key: &[u8; 32]) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+/// 从 static 公钥确定性派生 VIP（P5 §12.43 去中心化组网）。
+///
+/// `h = fnv1a64(static_public ∥ nonce_be64)`，`vip = network + 1 + (h mod usable)`，
+/// 其中 `usable = 2^host_bits - 2`（跳过网络地址与广播地址）。
+/// 同一公钥 + CIDR + nonce → 同一 VIP；nonce 递增用于冲突重派。
+/// IPv4 only（与 `CidrInfo` 一致；IPv6 为冻结边界）。
+///
+/// # Errors
+///
+/// CIDR 非法 → `CoordError::InvalidCidr`。
+pub fn derive_vip(
+    static_public: &[u8; 32],
+    cidr: &str,
+    nonce: u64,
+) -> Result<Ipv4Addr, CoordError> {
+    let info = parse_cidr(cidr)?;
+    let host_bits = 32 - u32::from(info.prefix_len);
+    // prefix_len ∈ 2..=30（parse_cidr 保证），usable ≥ 2。
+    let usable = (1u64 << host_bits) - 2;
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in static_public.iter().chain(nonce.to_be_bytes().iter()) {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let offset = (hash % usable) as u32 + 1; // 1..=usable，跳过网络地址
+    let vip = u32::from(info.network).wrapping_add(offset);
+    Ok(Ipv4Addr::from(vip))
 }
 
 #[cfg(test)]

@@ -51,8 +51,54 @@
 - `PlanExtension` 类型化领域扩展：`NetworkPlanExtension` / `WorkspacePlanExtension` / `ComputePlanExtension` / `ServicePlanExtension`，各带 `version` 字段；`Plan.extension: Option<PlanExtension>`（替代原 `domain_extension_type: Option<String>`）。
 - `NexusError` 结构化失败枚举（PRODUCT §2 七类失败 + `Unsupported` / `Internal`）与 `FailureDisposition`（Retry/Fallback/Abort/Escalate）。
 - `TerminalOutcome` 改造：`Failed(NexusError)` 携带结构化错误；`Cancelled` 无 payload（原因经 Session 事件记录）。
+- `ConnectivityEvaluation`（v9 §8.1）：规划期连通性可行性 DTO（版本化，`VERSION=1`）——
+  `direct_likely` / `punching_likely` / `relay_available` / `existing_link_available` /
+  `estimated_setup_cost_ms: Option<u32>`（`None` = 无可行路径）/
+  `confidence_percent: u8`；`has_feasible_path()` 任一路径可行即 true。
+  由 `nexus-connectivity::evaluation::evaluate_connectivity` 纯函数产生，
+  作为 Core Planner 的 Connectivity Feasibility 输入。
+
+已实现（N2 P0-1，2026-10-03）：
+
+- 身份/寻址类型：`WorkspaceId` / `NodeId`（内容派生，`IdentityManager::peer_id_of`，
+  Identity≠Locator）/ `ResourceName`（校验：ASCII 字母数字/`-`/`_`，≤128）/
+  `ResourceRef{workspace, name}`（kind 不进地址，D2）/ `ResourceKind`
+  （Network/Service/Workspace/Compute/Device，目录属性）/
+  `ResourceOperation{Use, Manage}`。
+- 授权词汇：`DenyReason{NoSuchGrant/WrongWorkspace/OperationNotGranted/Expired/Revoked}`
+  （`code()` 为审计/JSON 稳定判别名）/ `AuthorizationDecision{Allow, Deny}`。
+- `NexusError` 新增：`NotFound{kind, id}`（Abort）、`NodeIdentityUnavailable{reason}`
+  （Abort）、`PersistenceFailed{path, reason}`（Escalate）。
+
+已实现（N2 P0-3，2026-10-03）：
+
+- 规划决策轨迹 DTO（从 `nexus-planner` 迁移至此；`nexus-session` 只允许依赖
+  `nexus-domain`，Session 内嵌快照需要零依赖的 DTO 位置）：
+  `RejectReason`（结构化拒绝原因，稳定 `label()`；"为什么没被选"的唯一出口）/
+  `ScoreComponent{name, contribution, detail}`（打分明细项；各项之和恒等于总分）/
+  `ConsideredCandidate`（加厚：`rejected_reason` / `connectivity` /
+  `measurement: Option<MeasurementSnapshot>` / `score` / `score_breakdown`）/
+  `DecisionTrace{considered, selected}`。
+- `MeasurementSnapshot`：决策时 `LinkMeasurement` 的领域侧值拷贝（快照语义，
+  不随后续测量更新；`nexus-planner` 负责填充）。
+- `PlanId(pub String)`：FNV-1a 64 位十六进制确定性摘要（非密码学，只作标识符，
+  不做安全边界）；`plan_id_of(&Plan, &DecisionTrace)` 规范编码全部决策字段，
+  同一输入跨运行恒得同一 Id；`fnv1a_64_hex` 为底层原语。
+- `PlanSnapshot{plan_id, plan, decision_trace}`：一次规划决策的不透明记录
+  （D3：Plan 可重算、不独立持久化；Session 记录内嵌本快照）；
+  `PlanSnapshot::from_planned` 由内容派生 `plan_id`。
 
 ## Verification
+
+### N3 契约增补（待实现）
+
+PRODUCT §17 与 `docs/N3-MODEL-CONTRACT.md` 定义 N3 类型区：TaskId / SnapshotId /
+ArtifactId、SnapshotRef、SubmitTaskRequest、TaskView、ArtifactRecord 和版本化错误/状态 DTO。
+标识符及跨模块 DTO 在本 crate，TaskOwner/存储/命令执行不在本 crate。
+TaskPhase 与 TaskOutcome、execution/delivery/cancellation/observation 分离；
+Task 不增加 Core Plan 固定字段，Session != Task。
+JSON 形状由 `docs/contracts/n3-task-v1.schema.json` 冻结；Rust API 在实现阶段补充。
+关联场景：`scenarios/product/n3-*.toml`；现有 API 语义保持不变。
 
 最低：
 

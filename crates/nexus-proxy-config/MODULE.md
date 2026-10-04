@@ -60,8 +60,12 @@
 - P0 冻结接口骨架（实现阶段填充）：
   - `ProxyConfig`：typed root struct（`inbounds` / `rules` / `groups` / `outbounds` / `speedtest`）；
   - `InboundConfig`：`{ tag, kind: "socks5", listen }`；
-  - `RuleConfig`：`{ kind: "domain_suffix"|"domain"|"ip_cidr"|"geoip"|"geosite"|"rule_set"|"match", match: String,
+  - `RuleConfig`：`{ kind: "domain_suffix"|"domain"|"ip_cidr"|"geoip"|"geosite"|"rule_set"|"src_port"|"dst_port"|"process_name"|"match", match: String,
     action: ActionChainConfig, no_resolve: bool（默认 false）}`；
+    - `src_port` / `dst_port`：`match` 为单端口 `"8080"` 或范围 `"8000-9000"`（闭区间）；
+      非法格式 → `CONFIG_INVALID`；
+    - `process_name`：`match` 为精确进程名 `"chrome"` 或前缀通配 `"chrome*"`
+     （仅尾部 `*`）；空 pattern → `CONFIG_INVALID`；
   - `ActionChainConfig`：有序动作列表；P0 首动作为 `{ kind: "select_outbound",
     tag: String }`；
   - `GroupConfig`：`{ tag, kind: "selector"|"urltest", candidates: Vec<String>,
@@ -81,6 +85,10 @@
   - Trojan 出站（§11.9.3）：`kind: "trojan"` 时 `locator` 形如 `host:port` 且 `password` 必填非空；
     可选 `alpn: Vec<String>`、`skip_cert_verify: bool`、`header_format: "standard"|"singbox"`
     （缺省 `standard`）；`header_format` 非法 / `password` 或 `locator` 缺失 → `CONFIG_INVALID`。
+  - 混淆插件（§7.3，二期）：任意 TCP 出站（ss/trojan）可选 `obfs: String`（插件名，
+    如 `"xor"`；缺省/空 = plain 直通）与 `obfs_key: String`（插件参数 key，如 xor 的
+    key 材料）；`obfs` 指向未知插件名 → dial 时直接失败（硬校验，不静默回退明文）。
+    vmess 本期无真实 dial，字段保留前向兼容。
   - `parse_clash_subscription(text: &str) -> Result<SubscriptionParse, ConfigError>`（§11.8）：
     解码 base64 订阅、逐行解析节点 URI，产出 `outbounds: Vec<OutboundConfig>` 与
     `rejected: Vec<RejectedEntry>`（未知协议行及原因）；

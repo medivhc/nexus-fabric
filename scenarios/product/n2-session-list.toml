@@ -1,0 +1,32 @@
+schema_version = 1
+id = "product.n2-session-list"
+title = "nexus session list：列出 daemon 内 SessionManager 持有的资源会话"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#16-n2-resource-access"
+
+[given]
+# P0-0 契约冻结（2026-10-03）：`nexus session list` 在 P0-4 实现，此处先冻结期望。
+# requirement-change 注释：本场景为新契约（contract-first）；当前实现只有
+# `session watch <id>`（且走 daemon LocalAPI），`session list` 为 unknown
+# command，预期 Red（FAIL）。
+# D1：daemon 内全系统唯一的 SessionManager 持有全部资源 Session 生命周期；
+# D7：N2 只交付 Session（一次资源使用的 started/running/finished/cancel＋状态查询）。
+# E4 前置：daemon 内 SessionManager 至少持有一条 Session
+# （P0-4 E4 可先调 `nexus use` 建一条）。
+# E4 夹具：播种一条会话，使 list 返回非空（场景隔离后每个场景从空目录开始）。
+fixture = [
+  "cargo run --quiet -p nexus -- session seed sess-n2-list-1 --json",
+]
+
+[when]
+command = "cargo run --quiet -p nexus -- session list --json"
+
+# 冻结期望（实现后必须满足）：
+# - verdict=PASS；sessions 为非空数组
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "sessions"
+non_empty = true

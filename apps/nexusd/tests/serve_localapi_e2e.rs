@@ -35,9 +35,13 @@ impl Drop for DaemonGuard {
 /// "先 bind 再 drop 再让 daemon bind" 的 TOCTOU 竞态。
 fn spawn_serve() -> (DaemonGuard, String) {
     let exe = env!("CARGO_BIN_EXE_nexusd");
+    // 测试隔离：用临时 token 文件，避免与开发者真实 token 互相污染；
+    // 通过环境变量显式传给子进程（不用 set_var，forbid(unsafe_code)）。
+    let token_file = test_token_file();
     let mut child = Command::new(exe)
         .arg("serve")
         .arg("--addr=127.0.0.1:0")
+        .env("NEXUS_LOCALAPI_TOKEN_FILE", &token_file)
         .stdout(Stdio::piped())
         // stderr 继承到测试进程，便于 --nocapture 下排查；不管道化避免写满阻塞 daemon。
         .spawn()
@@ -97,12 +101,29 @@ fn spawn_serve() -> (DaemonGuard, String) {
 ///
 /// 不解析完整 header 集，只切出 status line 和 \r\n\r\n 之后的 body。
 /// daemon 响应固定带 Content-Length + Connection: close，读至 EOF 即可。
+/// 测试用 token 文件路径（与 spawn_serve 一致；按线程隔离避免并行冲突）。
+fn test_token_file() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "nexus-test-localapi-{:?}-{}.token",
+        std::thread::current().id(),
+        std::process::id()
+    ))
+}
+
 fn http_get(addr: &str, path: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(addr).expect("connect to daemon");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("set read timeout");
-    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    // D8（N2 P0-1）：LocalAPI 要求 Bearer <redacted> 鉴权；从测试 token 文件读取
+    // （daemon 启动时已创建，子进程与测试用同一文件）。
+    let token = std::fs::read_to_string(test_token_file())
+        .expect("read test bearer token")
+        .trim()
+        .to_string();
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
     stream.write_all(req.as_bytes()).expect("write request");
 
     let mut buf = Vec::new();

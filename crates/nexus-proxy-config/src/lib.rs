@@ -84,7 +84,7 @@ pub struct InboundConfig {
     pub listen: String,
 }
 
-/// 规则类型（P0 冻结为四类）。
+/// 规则类型（P0 冻结为四类；2026-10-01 新增端口/进程三类）。
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum RuleKind {
     /// 目的域名等于或以 `.` 拼接规则后缀结尾。
@@ -99,6 +99,12 @@ pub enum RuleKind {
     GeoSite,
     /// 引用 rule-providers 规则集（数据注入，§11.11）。
     RuleSet,
+    /// 源端口匹配（单端口 `8080` 或范围 `8000-9000`）。
+    SrcPort,
+    /// 目的端口匹配（单端口 `443` 或范围 `8000-9000`）。
+    DstPort,
+    /// 进程名匹配（精确 `chrome` 或前缀通配 `chrome*`）。
+    ProcessName,
     /// 兜底规则（匹配一切未命中流量）。
     Match,
 }
@@ -114,6 +120,9 @@ impl RuleKind {
             Self::GeoIp => "geoip",
             Self::GeoSite => "geosite",
             Self::RuleSet => "rule_set",
+            Self::SrcPort => "src_port",
+            Self::DstPort => "dst_port",
+            Self::ProcessName => "process_name",
             Self::Match => "match",
         }
     }
@@ -127,6 +136,9 @@ impl RuleKind {
             "geoip" => Ok(Self::GeoIp),
             "geosite" => Ok(Self::GeoSite),
             "rule_set" => Ok(Self::RuleSet),
+            "src_port" => Ok(Self::SrcPort),
+            "dst_port" => Ok(Self::DstPort),
+            "process_name" => Ok(Self::ProcessName),
             "match" => Ok(Self::Match),
             other => Err(ConfigError::new(
                 "kind",
@@ -305,6 +317,8 @@ pub enum OutboundKind {
     Vmess,
     /// Trojan TLS 出站（§11.9；nexus-outbound-trojan）。
     Trojan,
+    /// SOCKS5 出站（RFC 1928；P3 新增，用于 ProxyEngine TCP/UDP 转发）。
+    Socks5,
 }
 
 impl OutboundKind {
@@ -317,6 +331,7 @@ impl OutboundKind {
             Self::Shadowsocks => "shadowsocks",
             Self::Vmess => "vmess",
             Self::Trojan => "trojan",
+            Self::Socks5 => "socks5",
         }
     }
 
@@ -327,10 +342,11 @@ impl OutboundKind {
             "shadowsocks" => Ok(Self::Shadowsocks),
             "vmess" => Ok(Self::Vmess),
             "trojan" => Ok(Self::Trojan),
+            "socks5" => Ok(Self::Socks5),
             other => Err(ConfigError::new(
                 "kind",
                 format!(
-                    "unknown outbound kind '{other}' (supports direct/relay/shadowsocks/vmess/trojan)"
+                    "unknown outbound kind '{other}' (supports direct/relay/shadowsocks/vmess/trojan/socks5)"
                 ),
             )),
         }
@@ -354,6 +370,10 @@ pub struct OutboundConfig {
     pub skip_cert_verify: Option<bool>,
     /// trojan 请求头格式（§11.9.2）："standard" | "singbox"，缺省 standard。
     pub header_format: Option<String>,
+    /// 混淆插件名（§7.3 二期；None = plain 直通；未知名 → dial 硬失败）。
+    pub obfs: Option<String>,
+    /// 混淆插件参数 key（如 xor 的 key 材料；None/空 → 需 key 的插件 wrap 失败）。
+    pub obfs_key: Option<String>,
 }
 
 /// DNS 多 server 路由配置（PRODUCT §11.5）。
@@ -715,6 +735,8 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
             let alpn = opt_str_seq(item, "alpn");
             let skip_cert_verify = opt_bool(item, "skip_cert_verify");
             let header_format = opt_str(item, "header_format");
+            let obfs = opt_str(item, "obfs");
+            let obfs_key = opt_str(item, "obfs_key");
             outbounds.push(OutboundConfig {
                 tag,
                 kind,
@@ -724,6 +746,8 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
                 alpn,
                 skip_cert_verify,
                 header_format,
+                obfs,
+                obfs_key,
             });
         }
     }
@@ -1240,6 +1264,8 @@ fn parse_node_line(line: &str) -> Result<OutboundConfig, (String, RejectedEntry)
                 alpn: None,
                 skip_cert_verify: None,
                 header_format: None,
+                obfs: None,
+                obfs_key: None,
             })
         }
         "vmess" => Ok(OutboundConfig {
@@ -1251,6 +1277,8 @@ fn parse_node_line(line: &str) -> Result<OutboundConfig, (String, RejectedEntry)
             alpn: None,
             skip_cert_verify: None,
             header_format: None,
+            obfs: None,
+            obfs_key: None,
         }),
         other => Err((
             line.to_string(),
@@ -1687,6 +1715,40 @@ outbounds:
     }
 
     #[test]
+    fn parses_obfs_plugin_config() {
+        // P2：obfs/obfs_key 从 YAML 解析；缺省为 None（plain 直通）。
+        let yaml = "\
+schema_version: 1
+rules:
+  - tag: m
+    kind: match
+    action:
+      - kind: select_outbound
+        tag: ss-a
+outbounds:
+  - tag: ss-a
+    kind: shadowsocks
+    locator: 127.0.0.1:8388
+    method: chacha20-ietf-poly1305
+    password: demo-password-123
+    obfs: xor
+    obfs_key: test-key-123
+  - tag: ss-b
+    kind: shadowsocks
+    locator: 127.0.0.1:8389
+    method: chacha20-ietf-poly1305
+    password: demo-password-123
+";
+        let cfg = parse(yaml).expect("ok");
+        assert_eq!(cfg.outbounds.len(), 2);
+        assert_eq!(cfg.outbounds[0].obfs.as_deref(), Some("xor"));
+        assert_eq!(cfg.outbounds[0].obfs_key.as_deref(), Some("test-key-123"));
+        // 未配置 → None = plain（P6）。
+        assert_eq!(cfg.outbounds[1].obfs, None);
+        assert_eq!(cfg.outbounds[1].obfs_key, None);
+    }
+
+    #[test]
     fn trojan_missing_password_is_config_invalid() {
         let yaml = "\
 schema_version: 1
@@ -1787,6 +1849,8 @@ mod subscription_online_tests {
             alpn: None,
             skip_cert_verify: None,
             header_format: None,
+            obfs: None,
+            obfs_key: None,
         }]
     }
 
@@ -1870,5 +1934,41 @@ mod subscription_online_tests {
         assert!(!ev.ok);
         assert_eq!(ev.node_count_after, 2);
         assert_eq!(rt.effective_node_count(), 2);
+    }
+
+    // ---- 2026-10-01 新增：新规则类型解析 ----
+    #[test]
+    fn rule_kind_parse_new_kinds() {
+        assert_eq!(RuleKind::parse("src_port").unwrap(), RuleKind::SrcPort);
+        assert_eq!(RuleKind::parse("dst_port").unwrap(), RuleKind::DstPort);
+        assert_eq!(
+            RuleKind::parse("process_name").unwrap(),
+            RuleKind::ProcessName
+        );
+    }
+
+    #[test]
+    fn rule_kind_as_str_new_kinds() {
+        assert_eq!(RuleKind::SrcPort.as_str(), "src_port");
+        assert_eq!(RuleKind::DstPort.as_str(), "dst_port");
+        assert_eq!(RuleKind::ProcessName.as_str(), "process_name");
+    }
+
+    #[test]
+    fn rule_kind_parse_roundtrip() {
+        for kind in [
+            RuleKind::DomainSuffix,
+            RuleKind::Domain,
+            RuleKind::IpCidr,
+            RuleKind::GeoIp,
+            RuleKind::GeoSite,
+            RuleKind::RuleSet,
+            RuleKind::SrcPort,
+            RuleKind::DstPort,
+            RuleKind::ProcessName,
+            RuleKind::Match,
+        ] {
+            assert_eq!(RuleKind::parse(kind.as_str()).unwrap(), kind);
+        }
     }
 }

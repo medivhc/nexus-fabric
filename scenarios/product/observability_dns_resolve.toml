@@ -1,6 +1,6 @@
 schema_version = 1
 id = "product.observability-dns-resolve"
-title = "§9 可观察性：dns resolve 输出解析快照"
+title = "§9 可观察性：nexus CLI thin-client 下 dns resolve 无路由 → 显式 UNSUPPORTED"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#9-observability"
 
@@ -8,31 +8,22 @@ requirement = "PRODUCT.md#9-observability"
 domain_state = "dns runtime ready (demo resolver, example.com v6+v4)"
 observability = "resolution snapshot with addresses/ttl/exit binding"
 
+# requirement-change 2026-10-02（用户已批准）：2026-10-01 CLI 统一（01e5114）后 nexus
+# 是 thin-client，不再在进程内执行观察命令；dns resolve 暂无 LocalAPI 路由，CLI
+# 本地合成显式 UNSUPPORTED（PRODUCT §9 禁止静默降级）。
+# 与 2026-09-20 冻结的 cli_dns_resolve.toml 合同一致。
 [when]
-command = "cargo run --quiet -p nexusd -- dns resolve --json"
+command = "cargo run --quiet -p nexus -- dns resolve example.com --json"
 
-# 冻结期望：经 DnsRuntime 解析 example.com，输出地址列表、TTL 与 Exit-DNS
-# Binding（requirement-change：2026-09-18，由 UNSUPPORTED 转为真实实现）。
+# 冻结期望（2026-10-02）：无路由命令输出结构化 UNSUPPORTED FAIL JSON。
 [[expect]]
 field = "verdict"
-equals = "PASS"
+equals = "FAIL"
 
 [[expect]]
-field = "command"
+field = "error.code"
+equals = "UNSUPPORTED"
+
+[[expect]]
+field = "error.command"
 equals = "dns resolve"
-
-[[expect]]
-field = "name"
-equals = "example.com"
-
-[[expect]]
-field = "addresses.0"
-non_empty = true
-
-[[expect]]
-field = "addresses.1"
-non_empty = true
-
-[[expect]]
-field = "exit_binding"
-non_empty = true

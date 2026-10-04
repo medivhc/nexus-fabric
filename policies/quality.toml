@@ -22,6 +22,7 @@ gates = [
   "clippy",
   "architecture-delta",
   "dependency-delta",
+  "resource-type-neutrality",
   "affected-tests",
   "selected-properties"
 ]

@@ -1,0 +1,53 @@
+RED EVIDENCE — Phase 3c Cross-platform TUN (feature/tun-rs-device)
+================================================================
+Date: 2026-09-30
+Contract: S24 (真实 TUN 设备，tun-rs v2)
+
+## Scenario: product.fabric-tun-device → BLOCKED
+
+$ nexus-harness verify --scenario product.fabric-tun-device
+Result: BLOCKED — usage: nexus-harness verify [--fast|--full]
+(单场景调用不受支持；等价 Red：example 不存在)
+
+$ cargo run -p nexus-projection --example tun_device
+Result: BLOCKED — example `tun_device` 不存在：
+
+error: no example target named `tun_device` in `nexus-projection`
+
+## Unit tests (TDD Red): 以下测试在实现前全部 FAIL（编译失败/缺失）
+
+1. `tun_rs_device::tests::create_and_name` (S24)
+   → FAIL: `TunRsDevice` 不存在
+
+2. `tun_rs_device::tests::write_packet_accepted` (S24)
+   → FAIL: 同上（需特权，真机验证；沙箱预期 SKIP）
+
+3. `tun_rs_device::tests::drop_removes_device` (S24)
+   → FAIL: 同上
+
+## 依赖评审（先决，已完成 2026-09-30）
+
+tun-rs 2.8.11（Apache-2.0，crates.io，2026-09-17 更新，55万+ downloads）：
+- architecture：projection 层 TUN 设备实现；sync API；`default-features = false`
+ （不启用 async/async_io/async_std/async_framed），仓库保持 std-only 无 tokio
+- feature_scope：仅 sync；TAP 不启用（P0 只需 TUN）
+- license：Apache-2.0（allowlisted；cargo-deny 在实现时确认）
+- security：RustSec DB 在实现时经 harness gate 确认
+- portability：Windows/Linux/macOS/BSD/Android/OpenHarmony/iOS/tvOS；
+  Windows 需 wintun.dll 随二进制分发（后续打包任务）；iOS/Android 用
+  `SyncDevice::from_fd` 接管系统 fd（后续任务）
+- supply_chain：Cargo.lock 锁定；默认依赖 tree：byteorder/bytes/getifaddrs/
+  ipnet/libc/log（均为 MIT/Apache-2.0 生态，无 async）
+- 明确拒绝：`tun2`（WTFPL 许可证，不可接受）
+
+## 范围（P0）
+
+- `TunRsDevice` 实现 `TunDevice`（create/read/write/name）
+- `MockTun` 保留（E4 无特权环境）
+- 不在范围：IP 地址分配、路由表、DNS 配置（P3.x 后置，2026-09-29 冻结决策）
+
+## Contract Hash (frozen, 2026-09-30)
+
+场景文件: scenarios/product/fabric_tun_device.toml (新建)
+MODULE.md: S24 已写入
+policies/dependencies.toml: tun-rs 评审条目待加（实现时）

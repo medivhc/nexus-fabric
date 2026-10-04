@@ -46,5 +46,205 @@
     "module": "apps/nexus",
     "category": "implementation-pitfall",
     "summary": "TCP pump_bytes 半双工 EOF 缺少双向 shutdown 导致场景执行死锁挂起 >1 小时；harness 加载 scenario 缺少 given.platform 过滤导致跨平台误报"
+  },
+  {
+    "id": "psk-empty-001",
+    "file": "entries/2026-09-29-psk-empty-secret-semantics.md",
+    "date": "2026-09-29",
+    "module": "nexus-connectivity",
+    "category": "implementation-pitfall",
+    "summary": "可选密钥参数(&[u8])必须显式定义空值语义：PSK 为空字节串时 salt 塌缩为无 PSK，静默降级准入控制；契约应二选一（文档化退化或 fail-closed 拒绝）并配断言"
+  },
+  {
+    "id": "lsa-codec-alloc-001",
+    "file": "entries/2026-09-29-lsa-codec-alloc-guard.md",
+    "date": "2026-09-29",
+    "module": "nexus-discovery",
+    "category": "implementation-pattern",
+    "summary": "解码不可信长度前缀时用 Vec::with_capacity(n.min(CAP)) 防过度分配；min 仅为容量提示非截断，Review 时需区分"
+  },
+  {
+    "id": "dijkstra-fib-001",
+    "file": "entries/2026-09-29-dijkstra-single-source.md",
+    "date": "2026-09-29",
+    "module": "nexus-discovery",
+    "category": "implementation-pitfall",
+    "summary": "FIB 构建时不要对每个目的地跑一次 Dijkstra——单源运行已给出全目的地最短路；文档需区分单次调用与批量场景复杂度"
+  },
+  {
+    "id": "ecmp-review-001",
+    "file": "entries/2026-09-29-ecmp-predecessor-completeness.md",
+    "date": "2026-09-29",
+    "module": "nexus-discovery",
+    "category": "implementation-pattern",
+    "summary": "ECMP 等代价前驱表完备性证明（代价≥1→前驱先弹出）、路径枚举指数爆炸风险、HashMap 迭代导致多路径顺序跨运行不确定（未来流哈希风险）"
+  },
+  {
+    "id": "flow-hash-selection",
+    "file": "entries/2026-09-29-flow-hash-selection.md",
+    "date": "2026-09-29",
+    "module": "nexus-discovery",
+    "category": "implementation-pattern",
+    "summary": "按流哈希选择 FIB 下一跳：FlowKey 5 元组 + 手写 FNV-1a 64 + hash % n；IPv4 映射 IPv6 保证写法一致；反向流不要求同选"
+  },
+  {
+    "id": "routing-strategy-assembly",
+    "file": "entries/2026-09-29-routing-strategy-assembly.md",
+    "date": "2026-09-29",
+    "module": "nexus-discovery",
+    "category": "implementation-pattern",
+    "summary": "[routing] strategy 配置装配：RoutingStrategy 枚举直接实现 PathComputer（静态分发）；覆盖全部默认方法避免丢失批量优化"
+  },
+  {
+    "id": "kshortest-yen-implementation",
+    "file": "entries/2026-09-29-kshortest-yen-implementation.md",
+    "date": "2026-09-29",
+    "module": "nexus-discovery",
+    "category": "implementation-pattern",
+    "summary": "K-shortest 路径 Yen 算法：dijkstra_excluding 带排除集；spur 区间三处易错点；K=1 退化断言"
+  },
+  {
+    "id": "fib-manager-fingerprint",
+    "file": "entries/2026-09-29-fib-manager-fingerprint.md",
+    "date": "2026-09-29",
+    "module": "nexus-discovery",
+    "category": "implementation-pattern",
+    "summary": "FIB 管理器：LSDB 指纹（FNV-1a）触发按需重算；单测需手动 seq=2、双向建边；borrow 冲突用局部变量"
+  },
+  {
+    "id": "disjoint-suurballe-implementation",
+    "file": "entries/2026-09-29-disjoint-suurballe-implementation.md",
+    "date": "2026-09-29",
+    "module": "nexus-discovery",
+    "category": "implementation-pattern",
+    "summary": "Disjoint 不交路径 Suurballe：P1 边反向不可省；反向边权为 0 的原理；KShortest::path_cost 复用"
+  },
+  {
+    "id": "os-assemble-netlink-decision",
+    "file": "entries/2026-09-30-os-assemble-netlink-decision.md",
+    "date": "2026-09-30",
+    "module": "nexus-platform-linux",
+    "category": "architecture-decision",
+    "summary": "OS 装配 netlink 选型：手写窄 netlink（netlink.rs），零新依赖；rtnetlink 因 tokio 出局，neli 太重；仿 tun.rs 窄 FFI 纪律"
+  },
+  {
+    "id": "os-assemble-lo-unshare",
+    "file": "entries/2026-09-30-os-assemble-lo-unshare.md",
+    "date": "2026-09-30",
+    "module": "nexus-platform-linux",
+    "category": "implementation-pitfall",
+    "summary": "unshare(CLONE_NEWNET) 后必须拉起 lo，否则 TUN 自身地址的 UDP 本地交付超时（send 成功 recv 超时）"
+  },
+  {
+    "id": "unwrap-or-eager-001",
+    "file": "entries/2026-09-30-unwrap-or-eager-eval.md",
+    "date": "2026-09-30",
+    "module": "nexus-discovery",
+    "category": "implementation-pitfall",
+    "summary": "Option::unwrap_or 参数立即求值：decode_name 压缩指针跳转后 p<*pos，`p - *pos` 下溢 panic；改 unwrap_or_else。ok_or 同理"
+  },
+  {
+    "id": "inherent-trait-ufcs-001",
+    "file": "entries/2026-09-30-inherent-trait-ufcs.md",
+    "date": "2026-09-30",
+    "module": "nexus-discovery",
+    "category": "implementation-pitfall",
+    "summary": "trait 方法与 inherent 方法同名时方法解析优先 inherent，必须用 UFCS 或泛型界调用 trait 版本（D1 Discovery::resolve 调和）"
+  },
+  {
+    "id": "shared-target-dir-stale-rmeta",
+    "file": "entries/2026-09-30-shared-target-dir-stale-rmeta.md",
+    "date": "2026-09-30",
+    "module": "engineering",
+    "category": "implementation-pitfall",
+    "summary": "多 worktree 共享 CARGO_TARGET_DIR 导致陈旧 rmeta 幻影编译错误（看到别的 worktree 的类型定义）；每 worktree 配独立 target dir，怀疑时 touch 相关 lib.rs 强制重建验证"
+  },
+  {
+    "id": "enum-discriminant-index",
+    "file": "entries/2026-09-30-enum-discriminant-index.md",
+    "date": "2026-09-30",
+    "module": "nexus-path",
+    "category": "implementation-pitfall",
+    "summary": "Review 发现：enum 判别值 as usize 强转做数组索引是潜伏 panic（debug_assert 在 release 被编译掉）；改用 exhaustive match 让加 variant 变成编译错误"
+  },
+  {
+    "id": "coverage-run-flaky-timing-test",
+    "file": "entries/2026-09-30-coverage-run-flaky-timing-test.md",
+    "date": "2026-09-30",
+    "module": "nexus-projection",
+    "category": "environment-pitfall",
+    "summary": "llvm-cov 插桩运行放大时序敏感测试 flakiness：rebind_failure_keeps_connection 在 coverage 下挂、单独跑 3/3 过；coverage-summary UNKNOWN 不阻塞，整体 PASS"
+  },
+  {
+    "id": "frozen-signature-isomorphic-deviation",
+    "file": "entries/2026-10-01-frozen-signature-isomorphic-deviation.md",
+    "date": "2026-10-01",
+    "module": "nexus-projection",
+    "category": "implementation-pitfall",
+    "summary": "语义同构的签名偏离仍算契约偏离：MODULE 冻结 select_best -> Option<BoostSelection>，实现返回裸 BoostSelection（零行为影响）仍被判 WARN；Review 须逐字 diff 签名"
+  },
+  {
+    "id": "nat-quality-crate-placement",
+    "file": "entries/2026-10-02-nat-quality-crate-placement.md",
+    "date": "2026-10-02",
+    "module": "nexus-nat-quality",
+    "category": "architecture-decision",
+    "summary": "新 crate 选址：MODULE 禁止项（wireup 禁写 nexus-path）优先于任务建议位置，新建 nexus-nat-quality"
+  },
+  {
+    "id": "cli-unify-scenario-requirement-change-pattern",
+    "file": "entries/2026-10-02-cli-unify-scenario-requirement-change.md",
+    "date": "2026-10-02",
+    "module": "scenarios",
+    "category": "architecture-decision",
+    "summary": "CLI 统一后 stale 场景 requirement-change 重写模式：以真机实测的新 nexus 行为为准（UNSUPPORTED 形状/run service 摘要/exit 2 缺口）"
+  },
+  {
+    "id": "n1-watcher-graceful-close-001",
+    "file": "entries/2026-10-03-n1-watcher-graceful-close.md",
+    "date": "2026-10-03",
+    "module": "nexus-network",
+    "category": "implementation-pitfall",
+    "summary": "watcher 误报对端优雅关闭为链路故障：N1Error 新增 PeerClosed(u32) 保留关闭码，pinger 透出终止错误，PeerClosed(0) 静默退出不触发 rebind（B2 深层根治）"
+  },
+  {
+    "id": "arch-cleanup-dead-code-2026-10-03",
+    "file": "entries/2026-10-03-arch-cleanup-dead-code.md",
+    "date": "2026-10-03",
+    "module": "workspace",
+    "category": "architecture-decision",
+    "summary": "架构清理：删除23个module_summary()+24个NEXUS_*_MODULE常量+8条空Cargo依赖边（proto/diagnostics/delivery占位crate保留）；删前二次grep确认零引用"
+  },
+  {
+    "id": "2026-10-03-n2-p03-planner-thicken",
+    "file": "entries/2026-10-03-n2-p03-planner-thicken.md",
+    "date": "2026-10-03",
+    "module": "nexus-planner",
+    "category": "architecture-decision",
+    "summary": "N2 P0-3 DecisionTrace 加厚/PlanId/plan 双模式的五个选址决定：trace DTO 迁 domain、MeasurementSnapshot 镜像、本地优先作 score 分量、plan 走进程内命令族、静态目录编译内置诚实标注"
+  },
+  {
+    "id": "n2-p04-session-use",
+    "file": "entries/2026-10-03-n2-p04-session-use.md",
+    "date": "2026-10-03",
+    "module": "nexus-session, nexus (apps)",
+    "category": "implementation-pattern",
+    "summary": "N2 P0-4：SessionManager Owner 模型 + nexus use 四步闭环；Arc<FileKvStore> 装 trait object；D2 例外（AUTH_GRANT/REVOKE ResourceRef）；Unfinished vs Failed 终态语义"
+  },
+  {
+    "id": "n2-p04-review-fix",
+    "file": "entries/2026-10-03-n2-p04-review-fix.md",
+    "date": "2026-10-03",
+    "module": "nexus-session, apps/nexus, policies",
+    "category": "implementation-pitfall",
+    "summary": "第1轮独立评审2个FAIL的修复：apps/nexus ring 0.17 依赖评审条目补录；load_from_store 从 plan_snapshot 回填 resource/provider；pre-commit/pre-push Review Evidence 门禁与§19.1迭代闭环的先有鸡/先有蛋及 --no-verify 显式绕过记录"
+  },
+  {
+    "id": "n3-accept-atomic",
+    "file": "entries/2026-10-03-n3-durable-acceptance.md",
+    "date": "2026-10-03",
+    "module": "nexus-domain, nexus-compute, apps/nexus, apps/nexusd",
+    "category": "implementation-pattern",
+    "summary": "N3 原子接受：固定 inode 跨进程锁、Task/index/pin 单镜像、严格目录 fsync、ambiguous commit 重试和损坏 fail-closed"
   }
 ]

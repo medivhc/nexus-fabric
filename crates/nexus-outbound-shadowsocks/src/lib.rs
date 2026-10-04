@@ -180,7 +180,6 @@ impl OutboundAdapter for ShadowsocksAdapter {
 // ---------- 真实 TCP 会话层（§11.6.1） ----------
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
 
 /// 会话方向角色：决定 c2s / s2c 哪把 key 用于发送。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,20 +346,26 @@ impl SsStream {
 
 /// 写一条记录帧：`u32 BE length || record`。
 ///
+/// 泛型化以支持插件 wrapped 流（`Box<dyn ObfuscatedStream>`）；对 `TcpStream`
+/// 的既有调用保持兼容（P6）。
+///
 /// # Errors
 ///
 /// 底层 I/O 错误透传为 `std::io::Error`。
-pub fn write_record(stream: &mut TcpStream, record: &[u8]) -> std::io::Result<()> {
+pub fn write_record<W: Write + ?Sized>(stream: &mut W, record: &[u8]) -> std::io::Result<()> {
     stream.write_all(&u32::to_be_bytes(record.len() as u32))?;
     stream.write_all(record)
 }
 
 /// 读一条记录帧：先读 `u32 BE length`，再读对应字节。
 ///
+/// 泛型化以支持插件 wrapped 流（`Box<dyn ObfuscatedStream>`）；对 `TcpStream`
+/// 的既有调用保持兼容（P6）。
+///
 /// # Errors
 ///
 /// 连接过早关闭或长度非法时返回 `std::io::Error`。
-pub fn read_record(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+pub fn read_record<R: Read + ?Sized>(stream: &mut R) -> std::io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf) as usize;

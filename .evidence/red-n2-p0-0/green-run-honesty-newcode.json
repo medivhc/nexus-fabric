@@ -1,0 +1,120 @@
+[
+  {
+    "id": "product.daemon-run-remote-service-flow",
+    "verdict": "PASS",
+    "detail": "all expects passed",
+    "expects": [
+      {
+        "field": "verdict",
+        "ok": true,
+        "actual": "PASS"
+      },
+      {
+        "field": "run.resource",
+        "ok": true,
+        "actual": "service"
+      },
+      {
+        "field": "run.session_id",
+        "ok": true,
+        "actual": "sess-remote-service-1"
+      },
+      {
+        "field": "run.plan_id",
+        "ok": true,
+        "actual": "acdc6605a0789fbc"
+      },
+      {
+        "field": "run.outcome",
+        "ok": true,
+        "actual": "Completed"
+      },
+      {
+        "field": "run.connectivity.status",
+        "ok": true,
+        "actual": "Connected"
+      }
+    ]
+  },
+  {
+    "id": "product.daemon-run-with-command",
+    "verdict": "PASS",
+    "detail": "all expects passed",
+    "expects": [
+      {
+        "field": "verdict",
+        "ok": true,
+        "actual": "FAIL"
+      },
+      {
+        "field": "error.code",
+        "ok": true,
+        "actual": "UNSUPPORTED"
+      },
+      {
+        "field": "error.feature",
+        "ok": true,
+        "actual": "run-with-command"
+      },
+      {
+        "field": "error.layer",
+        "ok": true,
+        "actual": "N3"
+      }
+    ]
+  },
+  {
+    "id": "product.daemon-run-workspace-flow",
+    "verdict": "PASS",
+    "detail": "all expects passed",
+    "expects": [
+      {
+        "field": "verdict",
+        "ok": true,
+        "actual": "FAIL"
+      },
+      {
+        "field": "error.code",
+        "ok": true,
+        "actual": "UNSUPPORTED"
+      },
+      {
+        "field": "error.message",
+        "ok": true,
+        "actual": "unsupported feature: run workspace"
+      }
+    ]
+  },
+  {
+    "id": "product.cli-run-command",
+    "verdict": "PASS",
+    "detail": "all expects passed",
+    "expects": [
+      {
+        "field": "verdict",
+        "ok": true,
+        "actual": "PASS"
+      },
+      {
+        "field": "run.resource",
+        "ok": true,
+        "actual": "service"
+      },
+      {
+        "field": "run.session_id",
+        "ok": true,
+        "actual": "sess-remote-service-1"
+      },
+      {
+        "field": "run.connectivity.status",
+        "ok": true,
+        "actual": "Connected"
+      },
+      {
+        "field": "run.outcome",
+        "ok": true,
+        "actual": "Completed"
+      }
+    ]
+  }
+]

@@ -1,0 +1,51 @@
+schema_version = 1
+id = "product.multipath"
+title = "多路径调度：三种策略 + 接收端重排缓冲"
+evidence_strength = "E4"
+requirement = "docs/DAEMON_ARCHITECTURE.md#12.6"
+
+[given]
+topology = "纯内存；3 个 mock egress（mesh/proxy/turn，权重默认 1）；harness 直接调用 nexus-projection::multipath"
+config = "[multipath] strategy 轮流测 single/per-flow/per-packet；reorder_buffer=64"
+
+# 可执行 E4：harness run 子命令走生产路径（nexus-projection::multipath）。
+# 1. Single：10 次 select → 永远返回首位 egress（零行为变化）。
+# 2. PerFlow：同一 flow_id 100 次 select → 同一 egress（确定性）；
+#    64 个不同 flow_id → 覆盖全部 3 个 egress（分布性）。
+# 3. PerPacket：6 次 select → 轮询覆盖 mesh,proxy,turn,mesh,proxy,turn。
+# 4. ReorderBuffer：按 seq 乱序喂入 [3,1,2,5,4] → 按序吐出 [1,2,3,4,5]；
+#    超限（65 个包，上限 64）→ dropped 计数 > 0 且内存有界。
+[when]
+command = "nexus-harness run multipath --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+# S29：Single 零行为变化。
+[[expect]]
+field = "single.always_best"
+equals = true
+
+# S29：PerFlow 确定性 + 分布性。
+[[expect]]
+field = "perflow.stable"
+equals = true
+
+[[expect]]
+field = "perflow.distributed"
+equals = true
+
+# S29：PerPacket 轮询。
+[[expect]]
+field = "perpacket.round_robin"
+equals = true
+
+# S29：重排按序 + 有界。
+[[expect]]
+field = "reorder.in_order"
+equals = true
+
+[[expect]]
+field = "reorder.bounded"
+equals = true

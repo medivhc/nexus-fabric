@@ -1,6 +1,6 @@
 schema_version = 1
 id = "product.daemon-rejects-unknown-resource"
-title = "nexusd 对未知资源返回结构化拒绝（UNKNOWN_RESOURCE）"
+title = "nexus 对未知资源返回结构化拒绝（UNSUPPORTED）"
 evidence_strength = "E4"
 requirement = "PRODUCT.md#remote"
 
@@ -9,24 +9,23 @@ daemon = "nexusd"
 resource = "unknown"
 expectation = "structured-rejection"
 
-# 可执行 E4：daemon 输入校验——未知资源不进入闭环，输出结构化拒绝 JSON，
-# exit 0 表示请求已被 daemon 处理（拒绝也是处理结果；无效 CLI 用法仍 exit 非 0）。
+# 可执行 E4：未知资源不进入闭环，输出结构化拒绝 JSON。
+# requirement-change 2026-10-02（用户已批准）：2026-10-01 CLI 统一（01e5114）后，
+# `nexusd run` 入口已删除，`nexus run` 是 thin wrapper；未知资源直接返回结构化
+# UNSUPPORTED（exit 0），不再是旧的 REJECTED/UNKNOWN_RESOURCE 语义。
 [when]
-command = "cargo run --quiet -p nexusd -- run frobnicate --json"
+command = "cargo run --quiet -p nexus -- run frobnicate --json"
 
-# 冻结期望：拒绝语义（REJECTED）与错误码（UNKNOWN_RESOURCE）结构化输出。
+# 冻结期望（2026-10-02）：未知资源显式拒绝——verdict=FAIL + error.code=UNSUPPORTED，
+# error.message 明确指出不支持的资源（禁止静默降级/静默成功）。
 [[expect]]
 field = "verdict"
-equals = "REJECTED"
+equals = "FAIL"
 
 [[expect]]
 field = "error.code"
-equals = "UNKNOWN_RESOURCE"
+equals = "UNSUPPORTED"
 
 [[expect]]
-field = "error.resource"
-equals = "frobnicate"
-
-[[expect]]
-field = "daemon.entry"
-equals = "nexusd"
+field = "error.message"
+equals = "unsupported feature: run frobnicate"

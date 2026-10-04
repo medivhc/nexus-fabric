@@ -10,15 +10,6 @@
 // 前端统一入口重导出：CLI/GUI/Agent 只依赖 nexus-control-api，即可获得领域核心类型。
 pub use nexus_domain::{NexusError, ResourceId, SessionId};
 
-/// 稳定模块标识；业务实现应通过公开类型/trait 增量加入，而不是扩大隐式全局状态。
-pub const NEXUS_CONTROL_API_MODULE: &str = "nexus-control-api";
-
-/// 返回模块的人类可读职责摘要。
-#[must_use]
-pub const fn module_summary() -> &'static str {
-    "定义 CLI/GUI/Agent Client/SDK 使用的 Application Service 契约与稳定 DTO。"
-}
-
 // ---------- 控制面命令（PRODUCT §8 可观察性命令） ----------
 
 /// 控制面命令：产品 CLI/GUI/Agent 的统一入口命令。
@@ -52,6 +43,8 @@ pub enum ControlCommand {
     WorkspaceConflicts { workspace: String },
     /// `workspace cache`：Workspace 缓存状态。
     WorkspaceCache { workspace: String },
+    /// `workspace commit`：显式提交 workspace 暂存变更（C1/D5；经 LocalAPI）。
+    WorkspaceCommit { workspace: String },
     /// `compute jobs`：Compute 任务。
     ComputeJobs,
     /// `diagnose`：统一诊断。
@@ -60,6 +53,16 @@ pub enum ControlCommand {
     PlatformCapabilities,
     /// `run <resource>`：执行远程资源访问。
     Run { resource: String },
+    /// `network up --config <toml>`：前台装配 N1 Universal Connectivity
+    ///（建 TUN → dial 静态 peers → 起包泵；Ctrl-C 退出）。
+    ///
+    /// M6：经 Application API；由 Composition Root（apps/nexus）实现装配逻辑。
+    NetworkUp {
+        /// N1 配置文件内容（TOML）。
+        config: String,
+    },
+    /// `network status`：N1 装配状态（无 daemon 时诚实标注）。
+    NetworkStatus,
 }
 
 // ---------- 结构化输出 DTO（机器接口，版本化） ----------

@@ -44,7 +44,13 @@ Merge/Commit/持久化路径必须返回结构化 `WorkspaceError`，不得 pani
 ## Invariants
 
 - 权威版本使用不可变 Commit DAG + Head Set。
+- **CommitId 是内容哈希**（`hex16(fnv1a_64)`，与 CAS 的 `object_id_of` 同一哈希语义；
+  输入：排序后的 Parent CommitIds + RootManifestId + Author/NodeId + 逻辑元数据）。
+  标量序列号永不作为版本权威；`DurableState` header `v2`，拒绝 `v1`。
 - 离线分叉不得丢弃本地提交。
+- 冲突落为持久化 Conflict Object（进 CAS，含 Base/Local/Remote 与 Resolution State），
+  是 Workspace 状态的一部分；解决后才产生 Merge Commit。
+- Head 交换后收到的提交必须校验 `id == hash(content)`，不通过则拒绝。
 - WorkspaceGraph/WorkingSet/Cache 不是权威内容。
 - GC 只能删除不再被 protected roots 可达且过安全保留期的对象。
 
@@ -117,7 +123,55 @@ Merge/Commit/持久化路径必须返回结构化 `WorkspaceError`，不得 pani
   `crates/nexus-workspace/examples/workspace_projection_fallback.rs` 驱动，经
   harness 的 `product-scenarios` gate 求值。
 
+### 冻结契约（W4：CacheManager + ProjectedWorkspace 适配，v9 §22）
+
+- `pub mod cache`：`CacheManager`（确定性内存对象缓存，逻辑时钟）。
+  - `pub enum CachePin`：铁律集合 { DirtyJournal, UniqueReplica,
+    ComputeSnapshot, PendingArtifact, UnreplicatedCommit, ConflictState,
+    Explicit }——被 pin 的条目永不被普通驱逐/`remove`。
+  - 驱逐评分：`utility = (hits+1)*(1+ws_prob)*(1+centrality)*(1+refetch_cost)
+    / (size*(1+age))`，从低到高驱逐；`ws_prob`/`centrality` 是可选信号
+    （W2），永不做正确性依赖。
+  - Cache Eviction ≠ CAS GC：只丢缓存副本，不删 CAS 对象；pin 分类与
+    §20 Protected Roots 同口径（W1 对齐）。
+- `pub struct WorkspaceProjection<A: WorkspaceAccess + Send>`：
+  `nexus_platform::ProjectedWorkspace` 的 workspace 侧适配（错误映射
+  WorkspaceError → PlatformError）。新增依赖 `nexus-platform`
+ （domain → portable trait 方向，已有先例，已在 architecture.toml 声明）。
+- 场景映射：`scenarios/product/workspace_cache_eviction.toml` 由
+  `crates/nexus-workspace/examples/cache_eviction.rs` 驱动。
+
+### 冻结契约（requirement-change：workspace-authority-v2）
+
+- `pub struct AuthorId(pub String)`：提交作者/节点的不透明标识（v9 §17）。
+- `pub struct WorkspaceCommit { id: CommitId, parents: Vec<CommitId>, root_manifest_id: ObjectId, author: AuthorId, created_at_unix: u64 }`。
+- `pub fn commit_id_of(parents: &[CommitId], root: &ObjectId, author: &AuthorId, created_at_unix: u64) -> CommitId`：
+  纯函数、确定性；同一提交对象在所有节点算出同一 ID。
+- `pub struct ConflictObject { id: String, base: CommitId, local: CommitId, remote: CommitId, paths: Vec<String>, state: ConflictState }`；
+  `pub enum ConflictState { Unresolved, Resolved { merge_commit: CommitId } }`；
+  `pub enum ConflictResolution { TakeLocal, TakeRemote, Custom(Vec<u8>) }`。
+- `merge_heads` 冲突时不再返回 `Err(MergeConflict)`：持久化 ConflictObject（字节进 CAS，
+  索引进 `DurableState v2`），返回 `MergeReport { conflict: Some(id), merge_commit: None, .. }`，Head 集不变。
+- `pub fn resolve_conflict(&mut self, conflict_id: &str, resolutions: &[(String, ConflictResolution)]) -> Result<CommitId, WorkspaceError>`：
+  生成 Merge Commit（内容哈希 ID，双 parent），标记 Resolved，Heads 收敛。
+- Head 交换（基于已冻结 `WorkspaceTransport`）：
+  `pub fn exchange_heads(&mut self, transport: &mut dyn WorkspaceTransport) -> Result<HeadExchangeReport, WorkspaceError>`；
+  `pub fn sync_with_remote(&mut self, transport: &mut dyn WorkspaceTransport) -> Result<SyncReport, WorkspaceError>`
+  （交换 Head → 拉取缺失提交（含 manifest/blob）→ 逐对 merge_heads 收敛）。
+- 场景映射：`scenarios/product/workspace_authority_v2.toml` 由
+  `crates/nexus-workspace/examples/workspace_authority_v2.rs` 驱动。
+
 ## Verification
+
+### N3 Snapshot 契约增补（待实现）
+
+固定唯一 Commit 与所选文件清单，产生 SnapshotRef；接受后不跟随 Head/工作目录变动。
+N3 文件/清单的 SHA-256 与长度在物化前核实；既有 FNV Commit/ObjectId 不作安全校验。
+规则、路径规范、symlink 拒绝和目标平台名称碰撞见 `docs/N3-MODEL-CONTRACT.md` §4。
+Task durable pin、Pending Artifact、Pending Delivery 为 GC protected roots；
+冷启动恢复 roots 后才可 GC，Task 释放 pin 不解除其他合法保留根。
+仅管理 Snapshot/物化及 roots，不执行命令、不拥有 TaskOutcome、不自行挑 Provider。
+验收：`n3-snapshot-immutable`、`n3-input-integrity`、`n3-gc-roots`；PRODUCT §17。
 
 最低：
 
@@ -128,7 +182,7 @@ cargo clippy -p nexus-workspace --all-targets -- -D warnings
 
 如果该模块影响产品行为，还必须映射 Integration/Scenario Evidence。
 
-本模块映射三个 E4 场景：
+本模块映射五个 E4 场景：
 
 - `scenarios/product/workspace_offline_merge.toml`：由
   `crates/nexus-workspace/examples/workspace_offline_merge.rs` 驱动，经 harness 的
@@ -138,7 +192,40 @@ cargo clippy -p nexus-workspace --all-targets -- -D warnings
   reconcile），经 harness 的 `regression` gate 求值；
 - `scenarios/platform/workspace_projection_channels.toml`：由
   `crates/nexus-workspace/examples/workspace_projection_channels.rs` 驱动，经
-  harness 的 `product-scenarios` gate 求值。
+  harness 的 `product-scenarios` gate 求值；
+- `scenarios/product/workspace_gc.toml`（v9 §20）：由
+  `crates/nexus-workspace/examples/workspace_gc.rs` 驱动，经 harness 的
+  `product-scenarios` gate 求值；
+- `scenarios/product/workspace_shallow_sparse.toml`（v9 §20）：由
+  `crates/nexus-workspace/examples/workspace_shallow.rs` 驱动，经 harness 的
+  `product-scenarios` gate 求值。
+
+### 冻结契约（v9 §20 存储治理，`src/gc.rs`）
+
+- 两阶段 GC：`plan_gc`（纯规划，可达闭包）→ `apply_tombstones`
+  （Tombstone/Deletion Intent 持久化）→ `sweep`（保留期后物理删除）。
+  `sweep` 前重验可达性：tombstone 期间复活的对象撤销 tombstone，不删除。
+- Protected Roots：当前 Heads、显式保留 Snapshot（`retain_snapshot`）、未合并分支、
+  Conflict 相关提交（W3 扩展点）、journal pending 的 manifest、当前 `state_root`、
+  active pin（内存态）、legal/user hold（持久态）。
+- `sweep` 跳过 in-flight fetch 的对象；超 `max_sweep_per_run` 限速；pin/hold
+  阻止删除并计数。
+- 默认保留期 `DEFAULT_RETENTION_SECS` = 14 天（v9 §20 移动端默认值）。
+- DurableState 格式 v2（向前兼容 v1 解析）：新增 `tombstone` / `retain` /
+  `hold` / `shallow` 行；tombstone/retain/hold/shallow_frontier 持久化。
+- Shallow/Sparse：`ReplicaPolicy { max_depth, sparse_paths }`；
+  `shallow_clone` 按老→新导入并做内容寻址校验（id 不匹配 → `CorruptState`）；
+  `deepen` 按需拉取缺失祖先，不改变 CommitId；`read_at_commit` 返回三态
+  `ReadOutcome`（`NotHeldLocally` 是预期状态，不是损坏）。
+- `ObjectFetcher` 由 Composition Root 适配传输实现；portable-core 只定义形状。
+- 后台调度器 `GcScheduler`（§15 Structured Concurrency：Owner + AtomicBool
+  取消 + join 回收）：soft 配额压力触发 GC，hard 压力经 `QuotaHandler`
+  通知（W2/W4 扩展点）；`GcRunPolicy::can_run_now` 预留移动端"仅 WiFi/充电"策略。
+- 配额：`QuotaPolicy { soft_bytes: 10GiB, hard_bytes: 20GiB }` 默认值；
+  `pressure()` 边界取高等级。
+- `compact()`：清理目标已不存在的 tombstone 记录并重写 state，不改变 CommitId。
+- Stop Condition：任何情况下不删除仍可达或未合并的数据；`delete_object`
+  是 `ReachabilityGc` 的 GC 专用原语，`ContentStore` 本身只读/写。
 
 ## Performance Budget
 

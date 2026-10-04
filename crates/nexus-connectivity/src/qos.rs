@@ -102,6 +102,12 @@ pub struct BandwidthLimit {
 
 impl BandwidthLimit {
     /// 构造一个带宽限制；速率为 0 或 burst 为 0 返回 `InvalidLimit`。
+    ///
+    /// # Burst 配置警告（GAP-3 实测）
+    ///
+    /// `burst_size` 必须 ≥ 2×MTU（3028 字节，MTU=1514）。当 `burst < 2×MTU` 时，
+    /// 令牌桶永远攒不够连续发包，实际速率会被**静默拉低**（实测：配置 1000KB/s、
+    /// burst=1500 时实际只跑出 750KB/s）。建议 burst ≥ 10×MTU（15140 字节）。
     pub fn new(max_bytes_per_sec: u64, burst_size: u64) -> Result<Self, QosError> {
         if max_bytes_per_sec == 0 {
             return Err(QosError::InvalidLimit {

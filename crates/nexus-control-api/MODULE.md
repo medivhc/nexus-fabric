@@ -54,6 +54,18 @@
 
 ## Verification
 
+### N3 Application Service 契约增补（待实现）
+
+版本化操作为 SubmitTask / GetTask / ReadTaskLogs / CancelTask / ListTaskArtifacts /
+GetArtifact；统一返回 task/logs/artifact DTO 或结构化 error，不承载 TaskOwner 算法。
+SubmitTaskRequest JSON 形状见 `docs/contracts/n3-task-v1.schema.json`。
+principal 来自已认证调用上下文，不能由请求 DTO 自填；查询和产物获取分别鉴权。
+操作 PASS 仅指正确处理请求，不表示 task.outcome=Completed；取消待确认明确输出。
+TaskView.cancel_request 为来源显式的请求方 durable intent 视图；provider cancellation
+只来自提供方事件，未送达取消不能改写权威状态。嵌套 DTO 继承顶层 schema_version。
+任务 CLI/API 同源，LocalAPI 路由在实现批次另补契约，旧 ControlCommand 不在此删除。
+规范及场景：PRODUCT §17、`docs/N3-MODEL-CONTRACT.md`、`n3-*.toml`。
+
 最低：
 
 ```text

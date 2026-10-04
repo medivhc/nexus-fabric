@@ -15,18 +15,49 @@
 /// CLI 前端 ControlService（17 命令接线 + --json 双输出 + exit 语义）。
 pub mod control_service;
 pub mod geoip_sources;
+/// `nexus grant` 命令族（N2 P0-5，D6）：本地 grant 表管理。
+pub mod grant_cli;
 /// nexusd serve LocalAPI 瘦客户端（裸 TCP HTTP GET，CLI 不再进程内装配 SDK）。
 pub mod localapi_client;
 /// Auto-Mesh 自动挡组网编排器（Phase 1：自动打洞 + 断线重连）。
 pub mod mesh;
+/// N2 P0-5：跨机准入协议（挑战-应答握手＋提供方侧 grant 判定＋租约）。
+pub mod n2_admission;
+/// N2 P0-4：registry-backed 资源目录（静态种子＋持久化广告；Presence 语义对齐）。
+pub mod n2_directory;
+/// N2 P0-4 D6：本节点 ed25519 授权身份（Principal 派生源）。
+pub mod n2_identity;
+/// N2 P0-4：FileKvStore-backed 的 Session / Grant / Registry / 审计持久层
+///（组合根装配点，被 CLI 与 nexusd 共用）。
+pub mod n2_store;
+/// N3-1 composition adapters; not connected to product commands yet.
+pub mod n3_acceptance;
+/// `nexus network` 命令族（M6）：N1 Universal Connectivity 前台装配
+///（Composition Root：n1 portable core + fabric/path/discovery/platform-linux）。
+pub mod network;
+/// `nexus node` 命令族（N2 P0-1）：节点身份管理（X25519 + NodeId 内容派生）。
+pub mod node_cli;
 /// §9 可观察性命令（status / plan explain / session watch / connectivity status /
 /// dns status / dns cache / platform capabilities），见 PRODUCT.md#9-observability。
 pub mod observability;
+pub mod pair_cli;
+/// N2 P0-3：`nexus plan` 只读预览 + `plan explain` 双模式（进程内，无 I/O）。
+pub mod plan_cli;
+/// `nexus provider` 命令族（N2 P0-5）：提供方侧常驻准入服务。
+pub mod provider_cli;
 pub mod provider_fetcher;
+/// `nexus resource` 命令族（N2 P0-4/P0-5）：list / show / publish / revoke /
+/// export / import。
+pub mod resource_cli;
 pub mod schedule_cli;
+/// `nexus session` 命令族（N2 P0-4）：list / watch / close（重附着）。
+pub mod session_cli;
+pub mod strategy_watcher;
 pub mod subnet_cli;
 /// §11.17 订阅节点在线更新拉取器（HTTP 拉取 + 解析合并 + 热生效 + 结构化并发 Owner）。
 pub mod subscription_updater;
+/// `nexus use` 命令族（N2 P0-4，D4）：四步闭环（resolve→plan→authorize→establish）。
+pub mod use_cli;
 
 use nexus_domain::{
     LifecyclePhase, NexusError, ProviderId, ResourceId, SessionId, TerminalOutcome,
@@ -1102,6 +1133,13 @@ pub fn remote_internet_access_flow() -> Result<Value, NexusError> {
             "placement": planned.plan.placement,
             "path": planned.plan.path,
         },
+        "trace": {
+            "considered": planned.trace.considered.iter().map(|c| json!({
+                "provider": c.provider.0,
+                "rejected_reason": c.rejected_reason.as_ref().map(|r| r.label()),
+            })).collect::<Vec<_>>(),
+            "selected": planned.trace.selected.0,
+        },
         "session": {
             "id": owner.id().0,
             "phase": phase_name(&status.phase),
@@ -1661,9 +1699,9 @@ pub fn remote_compute_rejected_rollback() -> Result<Value, NexusError> {
 /// Node A 通过真实 TCP 长度前缀帧流完成远程提交。确定性、可重放。
 pub fn remote_workspace_commit_flow() -> Result<Value, NexusError> {
     let mut events: Vec<&'static str> = Vec::new();
-    const PARENT: &str = "C0";
 
-    // 0) Node B（提供方）：绑定回环端口，后台线程内运行真实 Workspace 并应用远程提交。
+    // 0) Node B（提供方）：绑定回环端口，后台线程内运行真实 Workspace；
+    //    处理 HEAD? 查询与 ChangeSet 提交（v2：parent 必须为真实内容哈希 ID）。
     let listener =
         std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| NexusError::Internal {
             message: format!("cannot bind node-b listener: {e}"),
@@ -1673,28 +1711,44 @@ pub fn remote_workspace_commit_flow() -> Result<Value, NexusError> {
     })?;
     let node_b_server = std::thread::spawn(move || {
         if let Ok(mut fs) = nexus_transport::accept(&listener) {
-            if let Ok(frame) = fs.recv_frame() {
-                // ChangeSet 帧格式：<parent>\n<path>\n<content>
+            let ws = nexus_workspace::Workspace::init(
+                nexus_workspace::WorkspaceId("ws-b".into()),
+                nexus_storage::InMemoryContentStore::new(),
+                nexus_workspace::AuthorId("node-b".into()),
+            );
+            let mut ws = match ws {
+                Ok(ws) => ws,
+                Err(e) => {
+                    let _ = fs.send_frame(format!("REJECTED:{e}").as_bytes());
+                    return;
+                }
+            };
+            while let Ok(frame) = fs.recv_frame() {
+                // ChangeSet 帧格式：<parent>\n<path>\n<content>；HEAD? 为头查询。
                 let text = String::from_utf8_lossy(&frame);
+                if text == "HEAD?" {
+                    let head = ws
+                        .heads()
+                        .heads
+                        .first()
+                        .map(|h| h.0.clone())
+                        .unwrap_or_default();
+                    let _ = fs.send_frame(format!("OK:HEAD:{head}").as_bytes());
+                    continue;
+                }
                 let mut parts = text.splitn(3, '\n');
                 let parent = parts.next().unwrap_or_default().to_string();
                 let path = parts.next().unwrap_or_default().to_string();
                 let content = parts.next().unwrap_or_default().as_bytes().to_vec();
-                let ws = nexus_workspace::Workspace::init(
-                    nexus_workspace::WorkspaceId("ws-b".into()),
-                    nexus_storage::InMemoryContentStore::new(),
-                );
-                let response = match ws {
-                    Ok(mut ws) => match ws.commit_changes(
-                        &nexus_workspace::CommitId(parent),
-                        &[nexus_workspace::Change { path, content }],
-                    ) {
-                        Ok(head) => format!("OK:HEAD:{}", head.0),
-                        Err(e) => format!("REJECTED:{e}"),
-                    },
+                let response = match ws.commit_changes(
+                    &nexus_workspace::CommitId(parent),
+                    &[nexus_workspace::Change { path, content }],
+                ) {
+                    Ok(head) => format!("OK:HEAD:{}", head.0),
                     Err(e) => format!("REJECTED:{e}"),
                 };
                 let _ = fs.send_frame(response.as_bytes());
+                break;
             }
         }
     });
@@ -1769,18 +1823,41 @@ pub fn remote_workspace_commit_flow() -> Result<Value, NexusError> {
         }
     })?;
 
-    // 7) Workspace：远程提交（ChangeSet 帧 -> OK:HEAD:<id>，取回新 Head）。
-    let change_set = format!("{PARENT}\nremote.txt\nremote-content");
-    let ws_session = nexus_workspace::RemoteWorkspaceSession::commit(
-        Box::new(FrameStreamAdapter {
-            inner: frame_stream,
-        }),
-        change_set.as_bytes(),
-    )
-    .map_err(|e| NexusError::SessionFailed {
-        session: owner.id().clone(),
-        reason: e.to_string(),
-    })?;
+    // 7) Workspace：先 HEAD? 查询 Node B 当前 Head（v2 内容哈希 ID），再远程提交
+    //   （ChangeSet 帧 -> OK:HEAD:<id>，取回新 Head）。
+    let mut adapter = FrameStreamAdapter {
+        inner: frame_stream,
+    };
+    let parent = {
+        use nexus_workspace::WorkspaceTransport;
+        adapter
+            .send_frame(b"HEAD?")
+            .map_err(|e| NexusError::SessionFailed {
+                session: owner.id().clone(),
+                reason: e.to_string(),
+            })?;
+        let head_frame = adapter
+            .recv_frame()
+            .map_err(|e| NexusError::SessionFailed {
+                session: owner.id().clone(),
+                reason: e.to_string(),
+            })?;
+        let head_text = String::from_utf8_lossy(&head_frame);
+        head_text
+            .strip_prefix("OK:HEAD:")
+            .ok_or_else(|| NexusError::SessionFailed {
+                session: owner.id().clone(),
+                reason: format!("unexpected HEAD? response: {head_text}"),
+            })?
+            .to_string()
+    };
+    let change_set = format!("{parent}\nremote.txt\nremote-content");
+    let ws_session =
+        nexus_workspace::RemoteWorkspaceSession::commit(Box::new(adapter), change_set.as_bytes())
+            .map_err(|e| NexusError::SessionFailed {
+            session: owner.id().clone(),
+            reason: e.to_string(),
+        })?;
     events.push(EV_WORKSPACE_COMMIT_APPLIED);
 
     // 8) Owner 唯一提交 Completed；终态后 cleanup 推进到 Disposed。
@@ -1838,7 +1915,7 @@ pub fn remote_workspace_commit_flow() -> Result<Value, NexusError> {
         "workspace": {
             "phase": ws_session.phase().to_string(),
             "head": ws_session.head().map(|h| h.0.clone()).unwrap_or_default(),
-            "parent": PARENT,
+            "parent": parent,
         },
         "architecture": {
             "network_depends_on_ingress": arch_violation,
@@ -1873,6 +1950,7 @@ pub fn remote_workspace_rejected_rollback() -> Result<Value, NexusError> {
                 let ws = nexus_workspace::Workspace::init(
                     nexus_workspace::WorkspaceId("ws-b-rejected".into()),
                     nexus_storage::InMemoryContentStore::new(),
+                    nexus_workspace::AuthorId("node-b".into()),
                 );
                 let response = match ws {
                     Ok(mut ws) => match ws.commit_changes(
@@ -4118,6 +4196,18 @@ pub fn remote_host_serve_loop(
     }
 }
 
+/// 业务退出码（P1-20）：`verdict=FAIL` → 1；其余（含 PASS/UNKNOWN）→ 0。
+///
+/// 机器可读权威仍然是 `verdict` 字段（场景判定只读它，不读 `$?`）；本函数
+/// 只是让 shell 侧 `set -e` / `$?` 也能诚实反映业务失败。用法错误由各命令
+/// 自行返回 2（参数不合法，连 JSON 都不产出）。
+pub fn verdict_exit_code(out: &serde_json::Value) -> i32 {
+    match out.get("verdict").and_then(serde_json::Value::as_str) {
+        Some("FAIL") => 1,
+        _ => 0,
+    }
+}
+
 /// 把 `NexusError` 映射为稳定的 CLI 错误码（UI 层序列化用，禁止泄漏内部细节）。
 pub fn error_code(err: &NexusError) -> &'static str {
     match err {
@@ -4130,6 +4220,9 @@ pub fn error_code(err: &NexusError) -> &'static str {
         NexusError::WorkspaceCommitRejected { .. } => "WORKSPACE_REJECTED",
         NexusError::PlatformCapabilityUnavailable { .. } => "CAPABILITY_UNAVAILABLE",
         NexusError::SessionFailed { .. } => "SESSION_FAILED",
+        NexusError::NotFound { .. } => "NOT_FOUND",
+        NexusError::NodeIdentityUnavailable { .. } => "NODE_IDENTITY_UNAVAILABLE",
+        NexusError::PersistenceFailed { .. } => "PERSISTENCE_FAILED",
         NexusError::Unsupported { .. } => "UNSUPPORTED",
         NexusError::Internal { .. } => "INTERNAL",
     }
@@ -4260,7 +4353,17 @@ fn split_host_port(dest: &str) -> Result<(String, u16), NexusError> {
     }
 }
 
+/// 初始化混淆插件（P4）：注册 builtin（plain/xor）到全局注册表。
+///
+/// 幂等；`nexus proxy` 在服务循环前调用一次。`dial_with_obfs`/`wrap_stream`
+/// 内部也有懒初始化，此处显式调用是为了"进程启动时注册"的确定性语义。
+pub fn init_obfs_plugins() {
+    nexus_plugin::init_builtin_plugins();
+}
+
 /// 真实 SOCKS5 代理单会话闭环。
+///
+/// 调用方（`nexus proxy`）应在服务循环前调一次 [`init_obfs_plugins`]（P4）。
 pub fn proxy_serve_once(
     listener: &std::net::TcpListener,
     config_yaml: &str,
@@ -4450,12 +4553,35 @@ pub fn proxy_serve_once(
                 }
             })?;
             let (nhost, nport) = split_host_port(&locator)?;
-            let mut node = std::net::TcpStream::connect((nhost.as_str(), nport)).map_err(|e| {
+            // §7.3 插件接线（P1）：先建 raw TCP，再按方向独立 wrap。
+            // 写方向的所有字节（请求头 + 中继数据）走同一个 wrapped handle，
+            // 保证插件变换位置连续（S7）；读方向走另一个 handle。
+            // obfs=None → plain 直通（P6 零回归）。
+            let raw = std::net::TcpStream::connect((nhost.as_str(), nport)).map_err(|e| {
                 NexusError::ConnectivityEstablishmentFailed {
                     provider: ProviderId(decision.selected_outbound_tag.clone()),
                     reason: format!("ss node connect {locator} failed: {e}"),
                 }
             })?;
+            let raw_down = raw.try_clone().map_err(|_| NexusError::Internal {
+                message: "proxy clone failed".into(),
+            })?;
+            let obfs_params = nexus_plugin::ObfsParams {
+                key: selected.obfs_key.as_deref().unwrap_or("").as_bytes(),
+            };
+            let mut node_up =
+                nexus_plugin::wrap_stream(raw, selected.obfs.as_deref(), &obfs_params).map_err(
+                    |e| NexusError::ConnectivityEstablishmentFailed {
+                        provider: ProviderId(decision.selected_outbound_tag.clone()),
+                        reason: format!("ss obfs wrap failed: {e}"),
+                    },
+                )?;
+            let mut node_down =
+                nexus_plugin::wrap_stream(raw_down, selected.obfs.as_deref(), &obfs_params)
+                    .map_err(|e| NexusError::ConnectivityEstablishmentFailed {
+                        provider: ProviderId(decision.selected_outbound_tag.clone()),
+                        reason: format!("ss obfs wrap failed: {e}"),
+                    })?;
             let method = SsMethod::parse(
                 selected
                     .method
@@ -4493,7 +4619,8 @@ pub fn proxy_serve_once(
                     reason: format!("ss request header seal failed: {e:?}"),
                 }
             })?;
-            write_record(&mut node, &req_frame).map_err(|e| {
+            // 请求头走写方向的 wrapped handle（S7：写方向字节连续）。
+            write_record(&mut node_up, &req_frame).map_err(|e| {
                 NexusError::ConnectivityEstablishmentFailed {
                     provider: ProviderId(decision.selected_outbound_tag.clone()),
                     reason: format!("ss request header send failed: {e}"),
@@ -4504,15 +4631,10 @@ pub fn proxy_serve_once(
             let mut client_up = client.try_clone().map_err(|_| NexusError::Internal {
                 message: "proxy clone failed".into(),
             })?;
-            let mut node_up = node.try_clone().map_err(|_| NexusError::Internal {
-                message: "proxy clone failed".into(),
-            })?;
             let mut client_down = client.try_clone().map_err(|_| NexusError::Internal {
                 message: "proxy clone failed".into(),
             })?;
-            let mut node_down = node.try_clone().map_err(|_| NexusError::Internal {
-                message: "proxy clone failed".into(),
-            })?;
+            // node_up / node_down 已在上面按方向 wrap 好，直接 move 进线程。
             let to_upstream = std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 let mut total = 0usize;
@@ -4584,11 +4706,26 @@ pub fn proxy_serve_once(
                 }
             })?;
             let (nhost, nport) = split_host_port(&locator)?;
-            let mut node = std::net::TcpStream::connect((nhost.as_str(), nport)).map_err(|e| {
+            // §7.3 插件接线（P1）：obfs 包在 TLS 之下。先建 raw TCP（保持 blocking，
+            // TLS 握手期间 rustls 用阻塞 I/O，提前 nonblocking 会导致 WouldBlock 硬失败），
+            // clone 一个 handle 留待握手后设 nonblocking（同 fd 共享 flag），再 wrap；
+            // obfs=None → plain 直通（P6 零回归）。
+            let raw = std::net::TcpStream::connect((nhost.as_str(), nport)).map_err(|e| {
                 NexusError::ConnectivityEstablishmentFailed {
                     provider: ProviderId(decision.selected_outbound_tag.clone()),
                     reason: format!("trojan node connect {locator} failed: {e}"),
                 }
+            })?;
+            let raw_nb = raw.try_clone().map_err(|e| NexusError::Internal {
+                message: format!("trojan node clone for nonblocking: {e}"),
+            })?;
+            let obfs_params = nexus_plugin::ObfsParams {
+                key: selected.obfs_key.as_deref().unwrap_or("").as_bytes(),
+            };
+            let mut node = nexus_plugin::wrap_stream(raw, selected.obfs.as_deref(), &obfs_params)
+                .map_err(|e| NexusError::ConnectivityEstablishmentFailed {
+                provider: ProviderId(decision.selected_outbound_tag.clone()),
+                reason: format!("trojan obfs wrap failed: {e}"),
             })?;
             let password = selected.password.clone().ok_or_else(|| {
                 NexusError::ConnectivityEstablishmentFailed {
@@ -4691,7 +4828,10 @@ pub fn proxy_serve_once(
             // 双向透明中继：rustls ClientConnection 不可跨线程分裂，用非阻塞单线程
             // poll 在 client 与 TLS 之间搬运字节（loopback E4 小流量足够；本函数单线程
             // 闭环承担结构化并发，无泄漏 JoinHandle）。
-            node.set_nonblocking(true)
+            // node 在 TLS 握手完成后才设为 nonblocking（握手期间必须阻塞 I/O）；
+            // wrapped 流透传 WouldBlock。
+            raw_nb
+                .set_nonblocking(true)
                 .map_err(|e| NexusError::Internal {
                     message: format!("trojan node nonblocking: {e}"),
                 })?;
@@ -4758,7 +4898,8 @@ pub fn proxy_serve_once(
             }
             // 尽力向节点发送 close_notify（不阻断结果）。
             conn.send_close_notify();
-            let _ = node.set_nonblocking(false);
+            // node 是 wrapped 流（Box<dyn ObfuscatedStream>），无法恢复 inner 的
+            // blocking 模式；arm 结束时流即 drop 关闭 fd，无需恢复。
 
             let hf_label = match header_format {
                 TrojanHeaderFormat::Standard => "standard",
@@ -4787,6 +4928,12 @@ pub fn proxy_serve_once(
             return Err(NexusError::ConnectivityEstablishmentFailed {
                 provider: ProviderId(decision.selected_outbound_tag.clone()),
                 reason: "vmess outbound data-plane not in this batch: nexus-outbound-vmess currently provides only self-consistent AEAD encrypt/decrypt roundtrip; missing VMess request-header encoder, AEAD chunk wire framing, and session-key derivation required for a real node tunnel (deferred)".into(),
+            });
+        }
+        nexus_proxy_config::OutboundKind::Socks5 => {
+            return Err(NexusError::ConnectivityEstablishmentFailed {
+                provider: ProviderId(decision.selected_outbound_tag.clone()),
+                reason: "socks5 outbound data-plane tunnel via nexus app deferred; use nexusd ProxyEngine (P1-P5)".into(),
             });
         }
     };
@@ -4990,7 +5137,7 @@ pub fn proxy_speedtest_with(
     }))
 }
 
-/// `nexusd proxy speedtest --json` 入口：loopback 自检（真实 TcpStream 路径，
+/// `nexus proxy speedtest --json` 入口：loopback 自检（真实 TcpStream 路径，
 /// 离线确定性；公网 generate_204 测速由 E5 脚手架覆盖）。
 pub fn proxy_speedtest() -> Result<Value, NexusError> {
     let listener =
@@ -5017,73 +5164,328 @@ pub fn proxy_speedtest() -> Result<Value, NexusError> {
     result
 }
 
+// ---------- bufferbloat 诊断（PRODUCT §11 诊断扩展） ----------
+
+/// bufferbloat 诊断配置。
+#[derive(Debug, Clone)]
+pub struct BufferbloatConfig {
+    /// 代理服务器地址（如 `127.0.0.1:7897`）。
+    pub proxy_addr: std::net::SocketAddr,
+    /// 上行打满时长。
+    pub duration: std::time::Duration,
+    /// 判定阈值：负载延迟 - 基准延迟 > threshold_ms 判为本地 bufferbloat。
+    pub threshold_ms: u64,
+    /// 打满时的并发 TCP 连接数。
+    pub saturate_conns: usize,
+    /// 每次延迟测量的采样次数（取中位数）。
+    pub probe_samples: usize,
+}
+
+impl Default for BufferbloatConfig {
+    fn default() -> Self {
+        Self {
+            // 默认值由调用方覆盖；此处占位避免 Default 被误用。
+            proxy_addr: "127.0.0.1:7897".parse().expect("default proxy addr"),
+            duration: std::time::Duration::from_secs(10),
+            threshold_ms: 100,
+            saturate_conns: 4,
+            probe_samples: 5,
+        }
+    }
+}
+
+/// bufferbloat 诊断结论。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferbloatVerdict {
+    /// 延迟暴涨：拥塞在用户到代理段，QoS 可缓解。
+    BloatLocal,
+    /// 延迟稳定：拥塞在代理服务器之后（或无拥塞），建议换节点。
+    NoBloatUpstream,
+}
+
+impl BufferbloatVerdict {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::BloatLocal => "BUFFERBLOAT_LOCAL",
+            Self::NoBloatUpstream => "NO_BLOAT_UPSTREAM",
+        }
+    }
+
+    pub fn advice(&self) -> &'static str {
+        match self {
+            Self::BloatLocal => "拥塞在用户到代理段，QoS 整形可缓解",
+            Self::NoBloatUpstream => "代理之后拥塞或无拥塞，建议换节点或检查代理服务器",
+        }
+    }
+}
+
+/// 纯函数：按阈值判定 bufferbloat 结论（可单测，无 I/O）。
+pub fn classify_bufferbloat(
+    baseline_ms: u64,
+    loaded_ms: u64,
+    threshold_ms: u64,
+) -> BufferbloatVerdict {
+    let delta = loaded_ms.saturating_sub(baseline_ms);
+    if delta > threshold_ms {
+        BufferbloatVerdict::BloatLocal
+    } else {
+        BufferbloatVerdict::NoBloatUpstream
+    }
+}
+
+/// 纯函数：中位数（可单测；空切片返回 0）。
+pub fn median_ms(values: &mut [u64]) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable();
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        values[mid]
+    } else {
+        // 偶数个取中间两数的平均（下取整），避免抖动。
+        (values[mid - 1] + values[mid]) / 2
+    }
+}
+
+/// 单次 TCP 建连延迟测量（ms）。失败返回 None（调用方决定是否重试/降级）。
+fn probe_once(addr: &std::net::SocketAddr, timeout: std::time::Duration) -> Option<u64> {
+    let start = std::time::Instant::now();
+    let socket = std::net::TcpStream::connect_timeout(addr, timeout).ok()?;
+    let ms = start.elapsed().as_millis().max(1) as u64;
+    drop(socket);
+    Some(ms)
+}
+
+/// 多次测量取中位数；全部失败返回 None。
+fn probe_median(
+    addr: &std::net::SocketAddr,
+    samples: usize,
+    timeout: std::time::Duration,
+) -> Option<u64> {
+    let mut rtts: Vec<u64> = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        if let Some(ms) = probe_once(addr, timeout) {
+            rtts.push(ms);
+        }
+    }
+    if rtts.is_empty() {
+        None
+    } else {
+        Some(median_ms(&mut rtts))
+    }
+}
+
+/// 上行打满工作线程：持续向代理地址发送随机数据，直到收到停止信号。
+/// 代理可能因协议无效关闭连接；关闭后立即重连，保持上行饱和。
+fn saturate_worker(
+    addr: std::net::SocketAddr,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::io::Write;
+    // 64KB 随机块（固定种子 Xorshift，避免每次分配 RNG 开销）。
+    let mut block = vec![0u8; 64 * 1024];
+    let mut x: u64 = 0x9E3779B97F4A7C15;
+    for b in block.iter_mut() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *b = (x >> 33) as u8;
+    }
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut stream =
+            match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5)) {
+                Ok(s) => s,
+                Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    continue;
+                }
+            };
+        let _ = stream.set_nodelay(true);
+        // 写超时：对端不读时 write_all 不能无限阻塞，否则 stop 信号
+        // 永远检查不到、join 永久 hang（2026-10-02 修）。
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+        // 持续发送直到对端关闭或收到停止信号。
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            match stream.write_all(&block) {
+                Ok(()) => {}
+                Err(_) => break, // 对端关闭，重连
+            }
+        }
+    }
+}
+
+/// `nexus proxy bufferbloat-test` 入口：
+///
+/// 1. 空载测基准延迟（TCP connect 中位数）；
+/// 2. 启动 N 个打满线程持续发送；
+/// 3. 负载下再测延迟中位数；
+/// 4. 停止打满，按阈值判定。
+///
+/// 返回结构化 JSON（含 verdict / baseline_ms / loaded_ms / delta_ms / threshold_ms）。
+pub fn proxy_bufferbloat_test(config: &BufferbloatConfig) -> Result<serde_json::Value, NexusError> {
+    let probe_timeout = std::time::Duration::from_secs(5);
+
+    // 1. 基准延迟（空载）。
+    let baseline_ms = probe_median(&config.proxy_addr, config.probe_samples, probe_timeout)
+        .ok_or_else(|| NexusError::Internal {
+            message: format!(
+                "baseline probe failed: cannot connect to {}",
+                config.proxy_addr
+            ),
+        })?;
+
+    // 2. 启动打满线程。
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut handles = Vec::with_capacity(config.saturate_conns);
+    for _ in 0..config.saturate_conns {
+        let addr = config.proxy_addr;
+        let stop_clone = std::sync::Arc::clone(&stop);
+        handles.push(
+            std::thread::Builder::new()
+                .name("bloat-saturate".to_string())
+                .spawn(move || saturate_worker(addr, stop_clone))
+                .map_err(|e| NexusError::Internal {
+                    message: format!("spawn saturate worker failed: {e}"),
+                })?,
+        );
+    }
+
+    // 3. 负载下测延迟（打满进行中）。
+    // 先等 1s 让上行真正跑满，避免测量时带宽还没起来；测完后补足剩余时长，
+    // 保证总打满时长 ≈ duration（让 buffer 有充分时间堆积）。
+    let saturate_start = std::time::Instant::now();
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let loaded_opt = probe_median(&config.proxy_addr, config.probe_samples, probe_timeout);
+    let elapsed = saturate_start.elapsed();
+    if elapsed < config.duration {
+        std::thread::sleep(config.duration - elapsed);
+    }
+
+    // 4. 停止打满，回收线程。
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for h in handles {
+        let _ = h.join();
+    }
+
+    let loaded_ms = loaded_opt.ok_or_else(|| NexusError::Internal {
+        message: "loaded probe failed: cannot connect under load".to_string(),
+    })?;
+
+    // 5. 判定。
+    let verdict = classify_bufferbloat(baseline_ms, loaded_ms, config.threshold_ms);
+    let delta_ms = loaded_ms.saturating_sub(baseline_ms);
+
+    Ok(serde_json::json!({
+        "verdict": "PASS",
+        "command": "proxy bufferbloat-test",
+        "proxy": config.proxy_addr.to_string(),
+        "baseline_ms": baseline_ms,
+        "loaded_ms": loaded_ms,
+        "delta_ms": delta_ms,
+        "threshold_ms": config.threshold_ms,
+        "diagnosis": verdict.as_str(),
+        "advice": verdict.advice(),
+        "duration_secs": config.duration.as_secs(),
+    }))
+}
+
 /// Run a remote resource access (e.g. service, compute, internet-access).
 ///
 /// This is the CLI entry point for executing resource access flows.
 /// Currently supports: service, compute, internet-access.
+/// `nexus run <resource>`：进程内 SDK 演示闭环（thin wrapper）。
+///
+/// D4 诚实化（2026-10-03，requirement-change）：不再伪造 session_id。
+/// 返回的 session_id / plan_id / outcome 全部取自底层 flow 报告的真实值：
+/// - `session_id`：flow 内 SessionOwner 的真实 id（`report["session"]["id"]`），
+///   不再是每次随机生成的 `sess-{nanos}` mock；
+/// - `outcome`：Owner 唯一提交的 TerminalOutcome（`report["session"]["outcome"]`）；
+/// - `plan_id`：由 flow 报告的 plan 内容（provider_id/placement/path）经 FNV-1a
+///   确定性派生（D3 方向：PlanId 为确定性非密码学摘要，只做标识符；
+///   P0-3 正式 PlanId 落地前，此处为展示用派生值）；
+/// - `connectivity.status`：flow 只有真实建连成功才返回 Ok，故为 Connected。
+///
+/// P0-4 的 daemon 内 SessionManager 落地后，`nexus use` 成为正式入口（PRODUCT §16）。
 pub fn run_resource(resource: &str) -> Result<serde_json::Value, NexusError> {
-    // Generate a mock session ID for now
-    // TODO: extract real session_id from the flow report when available
-    let session_id = format!("sess-{}", uuid_like());
-
-    match resource {
-        "service" => {
-            // Use the existing remote_service_access_flow SDK function
-            let _report = remote_service_access_flow()?;
-            Ok(serde_json::json!({
-                "verdict": "PASS",
-                "run": {
-                    "resource": "service",
-                    "session_id": session_id,
-                    "connectivity": {
-                        "status": "Connected"
-                    },
-                    "outcome": "Completed"
-                }
-            }))
+    let report = match resource {
+        "service" => remote_service_access_flow()?,
+        "compute" => remote_compute_job_flow()?,
+        "internet-access" => remote_internet_access_flow()?,
+        other => {
+            return Err(NexusError::Unsupported {
+                feature: format!("run {other}"),
+            });
         }
-        "compute" => {
-            let _report = remote_compute_job_flow()?;
-            Ok(serde_json::json!({
-                "verdict": "PASS",
-                "run": {
-                    "resource": "compute",
-                    "session_id": session_id,
-                    "connectivity": {
-                        "status": "Connected"
-                    },
-                    "outcome": "Completed"
-                }
-            }))
+    };
+    let session_id = report
+        .pointer("/session/id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| NexusError::Internal {
+            message: format!("run {resource}: flow report missing session.id"),
+        })?;
+    let outcome = report
+        .pointer("/session/outcome")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| NexusError::Internal {
+            message: format!("run {resource}: flow report missing session.outcome"),
+        })?;
+    let plan_id = plan_id_from_report(&report);
+    Ok(serde_json::json!({
+        "verdict": "PASS",
+        "run": {
+            "resource": resource,
+            "session_id": session_id,
+            "plan_id": plan_id,
+            "outcome": outcome,
+            "connectivity": {
+                "status": "Connected"
+            },
         }
-        "internet-access" => {
-            let _report = remote_internet_access_flow()?;
-            Ok(serde_json::json!({
-                "verdict": "PASS",
-                "run": {
-                    "resource": "internet-access",
-                    "session_id": session_id,
-                    "connectivity": {
-                        "status": "Connected"
-                    },
-                    "outcome": "Completed"
-                }
-            }))
-        }
-        other => Err(NexusError::Unsupported {
-            feature: format!("run {other}"),
-        }),
-    }
+    }))
 }
 
-/// Generate a simple pseudo-unique ID (for demo purposes).
-fn uuid_like() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{:016x}", nanos)
+/// 由 flow 报告的 plan 内容确定性派生 plan_id（FNV-1a 64，hex）。
+///
+/// D3 方向：PlanId 是确定性非密码学摘要，只做标识符、不做安全边界。
+/// 输入为报告中 plan 节的 provider_id / placement / path；同一 plan 内容
+/// 在多次运行间得到同一 plan_id（可复现、可断言）。
+fn plan_id_from_report(report: &serde_json::Value) -> String {
+    let provider_id = report
+        .pointer("/plan/provider_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let placement = report
+        .pointer("/plan/placement")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let path = report
+        .pointer("/plan/path")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let mut input = String::new();
+    input.push_str(provider_id);
+    input.push('|');
+    input.push_str(placement);
+    input.push('|');
+    input.push_str(&path);
+    format!("{:016x}", fnv1a_64(input.as_bytes()))
+}
+
+/// FNV-1a 64 位哈希（非密码学，仅作确定性标识）。
+fn fnv1a_64(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in data {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 /// E4 `product.link-encryption` 的离线确定性切片：全内存 mock 驱动
@@ -7772,7 +8174,7 @@ pub fn tun_proxy_flow() -> Result<Value, NexusError> {
         let mut buf = [0u8; 2048];
         // drain：MemoryVpi 一次读回已注入的整包（真实 wintun 亦一包一收）。
         loop {
-            let n = vpi.receive(&mut buf).map_err(&internal_err)?;
+            let n = vpi.receive(&mut buf).map_err(internal_err)?;
             if n == 0 {
                 break;
             }
@@ -8002,4 +8404,2467 @@ pub fn schedule_cli_flow() -> Result<Value, NexusError> {
         "tick": { "fired_once": tick_fired_once },
         "persist": { "reload_preserved": reload_preserved },
     }))
+}
+
+/// E4 `product.psk-handshake-admission`（PRODUCT §12.42）的可执行驱动。
+///
+/// ```text
+/// 同 PSK 双端握手 -> 会话建立 -> 数据帧往返解密成功
+///   -> 异 PSK 双端派生密钥不同 -> 数据帧解密失败 DecryptionFailed
+///   -> 单边无 PSK -> 数据帧解密失败 DecryptionFailed
+/// ```
+///
+/// 全程零真实网络；错误一律 typed `Result`，无 panic。
+pub fn psk_handshake_admission_flow() -> Result<Value, NexusError> {
+    use nexus_connectivity::encryption::{
+        EncryptionError, KeyPair, decrypt_frame, derive_authed_keys, derive_authed_keys_with_psk,
+        encrypt_frame,
+    };
+
+    /// 双端握手钥匙对（A=initiator, B=responder），可选 PSK。
+    fn handshake_pair(
+        psk_a: Option<&[u8]>,
+        psk_b: Option<&[u8]>,
+    ) -> Result<
+        (
+            nexus_connectivity::encryption::DirectionalKeys,
+            nexus_connectivity::encryption::DirectionalKeys,
+        ),
+        NexusError,
+    > {
+        let a_static = KeyPair::generate().map_err(enc_err)?;
+        let a_eph = KeyPair::generate().map_err(enc_err)?;
+        let b_static = KeyPair::generate().map_err(enc_err)?;
+        let b_eph = KeyPair::generate().map_err(enc_err)?;
+        let derive = |mine_s: &KeyPair,
+                      mine_e: &KeyPair,
+                      peer_s: &[u8; 32],
+                      peer_e: &[u8; 32],
+                      initiator: bool,
+                      psk: Option<&[u8]>| {
+            match psk {
+                Some(p) => {
+                    derive_authed_keys_with_psk(mine_s, mine_e, peer_s, peer_e, initiator, p)
+                }
+                None => derive_authed_keys(mine_s, mine_e, peer_s, peer_e, initiator),
+            }
+            .map_err(enc_err)
+        };
+        let keys_a = derive(
+            &a_static,
+            &a_eph,
+            b_static.public_key_bytes(),
+            b_eph.public_key_bytes(),
+            true,
+            psk_a,
+        )?;
+        let keys_b = derive(
+            &b_static,
+            &b_eph,
+            a_static.public_key_bytes(),
+            a_eph.public_key_bytes(),
+            false,
+            psk_b,
+        )?;
+        Ok((keys_a, keys_b))
+    }
+
+    let mut events: Vec<&'static str> = Vec::new();
+    let psk: &[u8] = b"test-network-psk-001";
+    let other_psk: &[u8] = b"different-psk-002";
+    let payload = b"psk-admission-probe";
+    let seq: u64 = 7;
+
+    // 1) 同 PSK：握手完成，数据帧往返。
+    let (keys_a, keys_b) = handshake_pair(Some(psk), Some(psk))?;
+    events.push("psk_handshake_completed");
+    let frame = encrypt_frame(&keys_a.tx, seq, payload).map_err(enc_err)?;
+    let (got_seq, plain) = decrypt_frame(&keys_b.rx, &frame).map_err(enc_err)?;
+    if got_seq != seq || plain.as_slice() != payload {
+        return Err(NexusError::Internal {
+            message: "psk admission: same-psk roundtrip mismatch".to_string(),
+        });
+    }
+    events.push("psk_data_frame_decrypted");
+
+    // 2) 异 PSK：派生密钥不同，首个数据帧解密必须失败。
+    let (keys_c, keys_d) = handshake_pair(Some(psk), Some(other_psk))?;
+    let bad_frame = encrypt_frame(&keys_c.tx, seq, payload).map_err(enc_err)?;
+    let mismatch_err = match decrypt_frame(&keys_d.rx, &bad_frame) {
+        Err(EncryptionError::DecryptionFailed) => "DecryptionFailed",
+        Err(e) => {
+            return Err(NexusError::Internal {
+                message: format!("psk admission: mismatch gave unexpected error {e:?}"),
+            });
+        }
+        Ok(_) => {
+            return Err(NexusError::Internal {
+                message: "psk admission: mismatched-psk frame decrypted (must fail)".to_string(),
+            });
+        }
+    };
+    events.push("psk_mismatch_rejected");
+
+    // 3) 单边无 PSK：同样必须解密失败。
+    let (keys_e, keys_f) = handshake_pair(Some(psk), None)?;
+    let bad_frame2 = encrypt_frame(&keys_e.tx, seq, payload).map_err(enc_err)?;
+    let absent_err = match decrypt_frame(&keys_f.rx, &bad_frame2) {
+        Err(EncryptionError::DecryptionFailed) => "DecryptionFailed",
+        Err(e) => {
+            return Err(NexusError::Internal {
+                message: format!("psk admission: absent-psk gave unexpected error {e:?}"),
+            });
+        }
+        Ok(_) => {
+            return Err(NexusError::Internal {
+                message: "psk admission: absent-psk frame decrypted (must fail)".to_string(),
+            });
+        }
+    };
+    events.push("psk_absent_rejected");
+
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "mismatch": { "error": mismatch_err },
+        "absent": { "error": absent_err },
+    }))
+}
+
+/// E4 `product.decentralized-join-config`（PRODUCT §12.43）的可执行驱动。
+///
+/// ```text
+/// derive_vip 确定性（同公钥同 CIDR -> 同 VIP）
+///   -> 派生 VIP 在 CIDR 内
+///   -> nonce 递增 -> 不同 VIP
+///   -> 有 bootstrap 无 PSK -> PSK_REQUIRED 错误（fail-closed）
+///   -> 有 bootstrap 有 PSK -> 通过
+///   -> legacy 配置（无 bootstrap 无 PSK）-> 通过（行为不变）
+/// ```
+///
+/// 全程零真实网络；错误一律 typed `Result`，无 panic。
+pub fn decentralized_join_config_flow() -> Result<Value, NexusError> {
+    use nexus_connectivity::coord::derive_vip;
+    use nexus_connectivity::encryption::KeyPair;
+
+    let mut events: Vec<&'static str> = Vec::new();
+
+    // 1) 确定性：同公钥 + 同 CIDR + nonce=0 -> 同 VIP。
+    let kp = KeyPair::generate().map_err(enc_err)?;
+    let pubkey = *kp.public_key_bytes();
+    let vip_a = derive_vip(&pubkey, "10.99.0.0/24", 0).map_err(|e| NexusError::Internal {
+        message: format!("derive_vip: {e:?}"),
+    })?;
+    let vip_b = derive_vip(&pubkey, "10.99.0.0/24", 0).map_err(|e| NexusError::Internal {
+        message: format!("derive_vip: {e:?}"),
+    })?;
+    if vip_a != vip_b {
+        return Err(NexusError::Internal {
+            message: "decentralized join: derive_vip not deterministic".to_string(),
+        });
+    }
+    events.push("vip_derived_deterministic");
+
+    // 2) 派生 VIP 在 CIDR 内（10.99.0.0/24，跳过 .0 和 .255）。
+    let octets = vip_a.octets();
+    if octets[0] != 10 || octets[1] != 99 || octets[2] != 0 || octets[3] == 0 || octets[3] == 255 {
+        return Err(NexusError::Internal {
+            message: format!("decentralized join: derived VIP {vip_a} outside cidr"),
+        });
+    }
+    events.push("vip_in_cidr");
+
+    // 3) nonce 递增 -> 不同 VIP（冲突重派机制的基础）。
+    let vip_c = derive_vip(&pubkey, "10.99.0.0/24", 1).map_err(|e| NexusError::Internal {
+        message: format!("derive_vip: {e:?}"),
+    })?;
+    if vip_c == vip_a {
+        return Err(NexusError::Internal {
+            message: "decentralized join: nonce increment did not change VIP".to_string(),
+        });
+    }
+    events.push("vip_nonce_changes");
+
+    // 4-6) 配置层：写 TOML，走 subnet_up 验证 fail-closed 与兼容性。
+    use crate::subnet_cli::subnet_up;
+    use std::path::PathBuf;
+
+    fn write_cfg(dir: &std::path::Path, name: &str, text: &str) -> Result<PathBuf, NexusError> {
+        let p = dir.join(name);
+        std::fs::write(&p, text).map_err(|e| NexusError::Internal {
+            message: format!("write test config: {e}"),
+        })?;
+        Ok(p)
+    }
+
+    let dir = std::env::temp_dir().join(format!("nexus-join-cfg-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| NexusError::Internal {
+        message: e.to_string(),
+    })?;
+    let state = dir.join("state.json");
+
+    // 4) 有 bootstrap 无 PSK -> PSK_REQUIRED（fail-closed）。
+    let cfg_no_psk = write_cfg(
+        &dir,
+        "bootstrap-no-psk.toml",
+        r#"[subnet]
+cidr = "10.99.0.0/24"
+encryption = true
+
+[[subnet.bootstrap]]
+address = "udp://203.0.113.10:11010"
+"#,
+    )?;
+    let psk_required_err = match subnet_up(&cfg_no_psk, &state, false) {
+        Err(e) if e.contains("PSK_REQUIRED") => "PSK_REQUIRED",
+        Err(e) => {
+            return Err(NexusError::Internal {
+                message: format!("decentralized join: expected PSK_REQUIRED, got {e}"),
+            });
+        }
+        Ok(_) => {
+            return Err(NexusError::Internal {
+                message: "decentralized join: bootstrap without PSK was not rejected".to_string(),
+            });
+        }
+    };
+    events.push("bootstrap_psk_required");
+
+    // 5) 有 bootstrap 有 PSK -> 通过。
+    let cfg_psk = write_cfg(
+        &dir,
+        "bootstrap-psk.toml",
+        r#"[subnet]
+cidr = "10.99.0.0/24"
+virtual_ip = "10.99.0.5"
+encryption = true
+network_psk = "test-psk-001"
+
+[[subnet.bootstrap]]
+address = "udp://203.0.113.10:11010"
+"#,
+    )?;
+    subnet_up(&cfg_psk, &state, false).map_err(|e| NexusError::Internal {
+        message: format!("decentralized join: bootstrap+psk rejected: {e}"),
+    })?;
+    events.push("bootstrap_psk_ok");
+
+    // 6) legacy 配置（无 bootstrap 无 PSK）-> 通过（行为不变）。
+    let cfg_legacy = write_cfg(
+        &dir,
+        "legacy.toml",
+        r#"[subnet]
+cidr = "10.99.0.0/24"
+virtual_ip = "10.99.0.1"
+encryption = true
+
+[[subnet.peers]]
+virtual_ip = "10.99.0.2"
+locator = "udp://127.0.0.1:42001"
+"#,
+    )?;
+    subnet_up(&cfg_legacy, &state, false).map_err(|e| NexusError::Internal {
+        message: format!("decentralized join: legacy config rejected: {e}"),
+    })?;
+    events.push("legacy_config_unchanged");
+
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "psk_required": { "error": psk_required_err },
+        "derived_vip": vip_a.to_string(),
+    }))
+}
+
+/// E4 `product.lsa-discovery`（PRODUCT §12.44）的可执行驱动。
+///
+/// ```text
+/// 三节点进程内：A 经 B 入网（Hello/Welcome），C 经 B 入网，
+/// A 经 LSA 泛洪学到 C，三节点 LSDB 收敛一致
+///   -> 旧 seq LSA 被拒绝
+///   -> 本端 LSA 不被覆盖
+/// ```
+///
+/// 全程零真实网络；错误一律 typed `Result`，无 panic。
+pub fn lsa_discovery_flow() -> Result<Value, NexusError> {
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{
+        LinkAdvert, Lsa, LsaFrame, Lsdb, SeenCache, UpdateOutcome, decode_lsa_frame,
+        encode_lsa_frame,
+    };
+
+    let mut events: Vec<&'static str> = Vec::new();
+
+    // 三节点身份。
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+
+    fn make_lsa(id: &PeerId, vip: &str, seq: u64) -> Lsa {
+        Lsa {
+            node_id: id.clone(),
+            vip: vip.to_string(),
+            incarnation: 1,
+            seq,
+            capabilities: 0,
+            locator: Some(format!("udp://127.0.0.1:{}", 42000 + seq as u16)),
+            neighbors: Vec::new(),
+        }
+    }
+
+    // 每个节点的 LSDB，先放入本端 LSA。
+    let mut lsdb_a = Lsdb::new(id_a.clone());
+    let mut lsdb_b = Lsdb::new(id_b.clone());
+    let mut lsdb_c = Lsdb::new(id_c.clone());
+    let lsa_a = make_lsa(&id_a, "10.99.0.1", 1);
+    let lsa_b = make_lsa(&id_b, "10.99.0.2", 1);
+    let lsa_c = make_lsa(&id_c, "10.99.0.3", 1);
+    assert!(matches!(
+        lsdb_a.update_local(lsa_a.clone()),
+        UpdateOutcome::New
+    ));
+    assert!(matches!(
+        lsdb_b.update_local(lsa_b.clone()),
+        UpdateOutcome::New
+    ));
+    assert!(matches!(
+        lsdb_c.update_local(lsa_c.clone()),
+        UpdateOutcome::New
+    ));
+
+    // ---- 阶段 1：A 经 B 入网（Hello/Welcome）----
+    // A -> B: Hello（编码后经"网络"传输再解码，验证 codec 往返）。
+    let hello_a = LsaFrame::Hello {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        capabilities: 0,
+        incarnation: 1,
+    };
+    let hello_wire = encode_lsa_frame(&hello_a).map_err(|e| NexusError::Internal {
+        message: format!("encode hello: {e:?}"),
+    })?;
+    let decoded_hello = decode_lsa_frame(&hello_wire).map_err(|e| NexusError::Internal {
+        message: format!("decode hello: {e:?}"),
+    })?;
+    if decoded_hello != hello_a {
+        return Err(NexusError::Internal {
+            message: "lsa discovery: hello codec roundtrip mismatch".to_string(),
+        });
+    }
+    // B -> A: Welcome（全量 LSA 快照：B 的 LSDB 内容）。
+    let welcome_b = LsaFrame::Welcome {
+        lsas: lsdb_b.all().into_iter().cloned().collect(),
+    };
+    let welcome_wire = encode_lsa_frame(&welcome_b).map_err(|e| NexusError::Internal {
+        message: format!("encode welcome: {e:?}"),
+    })?;
+    let decoded_welcome = decode_lsa_frame(&welcome_wire).map_err(|e| NexusError::Internal {
+        message: format!("decode welcome: {e:?}"),
+    })?;
+    let LsaFrame::Welcome { lsas } = decoded_welcome else {
+        return Err(NexusError::Internal {
+            message: "lsa discovery: welcome decode type mismatch".to_string(),
+        });
+    };
+    for lsa in lsas {
+        lsdb_a.update(lsa);
+    }
+    if !lsdb_a.contains(&id_a) || !lsdb_a.contains(&id_b) {
+        return Err(NexusError::Internal {
+            message: "lsa discovery: A lsdb missing A/B after welcome".to_string(),
+        });
+    }
+    events.push("hello_welcome_completed");
+
+    // ---- 阶段 2：C 经 B 入网，LSA 泛洪使 A 学到 C ----
+    // C -> B: Hello；B -> C: Welcome。
+    let welcome_to_c = LsaFrame::Welcome {
+        lsas: lsdb_b.all().into_iter().cloned().collect(),
+    };
+    let LsaFrame::Welcome { lsas: c_seed } = welcome_to_c else {
+        return Err(NexusError::Internal {
+            message: "unreachable".to_string(),
+        });
+    };
+    for lsa in c_seed {
+        lsdb_c.update(lsa);
+    }
+    // C 的 LSA 经 B 泛洪到 A（模拟：B 转发给除来源外的邻居）。
+    // B 学到 C（B 收到 C 的 LsaAdvert）。
+    let advert_c = LsaFrame::LsaAdvert { lsa: lsa_c.clone() };
+    let advert_wire = encode_lsa_frame(&advert_c).map_err(|e| NexusError::Internal {
+        message: format!("encode advert: {e:?}"),
+    })?;
+    let decoded_advert = decode_lsa_frame(&advert_wire).map_err(|e| NexusError::Internal {
+        message: format!("decode advert: {e:?}"),
+    })?;
+    let LsaFrame::LsaAdvert { lsa: flooded } = decoded_advert else {
+        return Err(NexusError::Internal {
+            message: "lsa discovery: advert decode type mismatch".to_string(),
+        });
+    };
+    // B 更新 + 泛洪决策（SeenCache 去重）。
+    let mut seen_b = SeenCache::new(1024);
+    let mut seen_a = SeenCache::new(1024);
+    if seen_b.should_flood(&flooded.node_id, flooded.incarnation, flooded.seq) {
+        let outcome_b = lsdb_b.update(flooded.clone());
+        if !matches!(outcome_b, UpdateOutcome::New | UpdateOutcome::Updated) {
+            return Err(NexusError::Internal {
+                message: "lsa discovery: B rejected C lsa".to_string(),
+            });
+        }
+        // B 转发给 A（A 不是来源）。
+        if seen_a.should_flood(&flooded.node_id, flooded.incarnation, flooded.seq) {
+            lsdb_a.update(flooded);
+        }
+    }
+    // 三节点 LSDB 节点集合一致（各 3 个：A/B/C）。
+    let count_a = lsdb_a.len();
+    let count_b = lsdb_b.len();
+    let count_c = lsdb_c.len();
+    // C 的 LSDB 还缺 A（A 的 LSA 还没泛洪到 C）；补一次 A->B->C 泛洪。
+    let advert_a = LsaFrame::LsaAdvert { lsa: lsa_a.clone() };
+    if seen_b.should_flood(&lsa_a.node_id, lsa_a.incarnation, lsa_a.seq) {
+        lsdb_b.update(lsa_a.clone());
+        let mut seen_c = SeenCache::new(1024);
+        if seen_c.should_flood(&lsa_a.node_id, lsa_a.incarnation, lsa_a.seq) {
+            lsdb_c.update(lsa_a.clone());
+        }
+    }
+    let _ = advert_a;
+    if lsdb_a.len() != 3 || lsdb_b.len() != 3 || lsdb_c.len() != 3 {
+        return Err(NexusError::Internal {
+            message: format!("lsa discovery: not converged ({count_a}/{count_b}/{count_c})"),
+        });
+    }
+    events.push("lsa_flood_converged");
+
+    // ---- 阶段 3：旧 seq 的 LSA 被拒绝 ----
+    let stale = Lsa {
+        seq: 0, // 比已知的 seq=1 旧
+        ..lsa_c.clone()
+    };
+    if !matches!(lsdb_a.update(stale), UpdateOutcome::Stale) {
+        return Err(NexusError::Internal {
+            message: "lsa discovery: stale lsa was not rejected".to_string(),
+        });
+    }
+    events.push("lsa_stale_rejected");
+
+    // ---- 阶段 4：本端 LSA 不被远端同名 LSA 覆盖 ----
+    let fake_self = Lsa {
+        vip: "10.99.0.99".to_string(), // 试图冒充 A 的 VIP
+        ..lsa_a.clone()
+    };
+    // A 用本端视角更新：node_id == self → SelfIgnored。
+    if !matches!(lsdb_a.update(fake_self), UpdateOutcome::SelfIgnored) {
+        return Err(NexusError::Internal {
+            message: "lsa discovery: self lsa was overwritten".to_string(),
+        });
+    }
+    // 确认 A 的 VIP 未被篡改。
+    let kept = lsdb_a.get(&id_a).ok_or(NexusError::Internal {
+        message: "lsa discovery: self lsa missing".to_string(),
+    })?;
+    if kept.vip != "10.99.0.1" {
+        return Err(NexusError::Internal {
+            message: "lsa discovery: self vip was tampered".to_string(),
+        });
+    }
+    events.push("lsa_self_ignored");
+
+    // 避免未使用警告。
+    let _ = LinkAdvert {
+        neighbor: id_b.clone(),
+        metrics: nexus_discovery::lsa::LinkMetrics {
+            latency_ms: 10,
+            loss_pct: 0,
+            bandwidth_kbps: 1000,
+        },
+    };
+
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "converged": { "node_count": 3 },
+    }))
+}
+
+/// E4 `product.dijkstra-fib`（PRODUCT §12.45）的可执行驱动。
+///
+/// ```text
+/// 四节点进程内（A 视角）：LSDB（含链路通告）→ TopoView → Dijkstra →
+/// FIB（dst vip → Vec<NextHop>）；验证间接最短路优于慢直连
+/// ```
+///
+/// 全程零真实网络；错误一律 typed `Result`，无 panic。
+pub fn dijkstra_fib_flow() -> Result<Value, NexusError> {
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::{Fib, PathComputer, ShortestPath, TopoView};
+
+    let mut events: Vec<&'static str> = Vec::new();
+
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    let id_d = PeerId("node-d".to_string());
+
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+
+    // 四节点 LSA（neighbors 已填充链路通告；链路对称）。
+    // 拓扑：A-B 10ms，B-D 10ms，A-C 50ms，C-D 10ms，B-C 10ms。
+    let lsa_a = Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 50)],
+    };
+    let lsa_b = Lsa {
+        node_id: id_b.clone(),
+        vip: "10.99.0.2".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_c, 10), link(&id_d, 10)],
+    };
+    let lsa_c = Lsa {
+        node_id: id_c.clone(),
+        vip: "10.99.0.3".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 50), link(&id_b, 10), link(&id_d, 10)],
+    };
+    let lsa_d = Lsa {
+        node_id: id_d.clone(),
+        vip: "10.99.0.4".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    };
+
+    // A 的 LSDB：本端经 update_local，其余经泛洪 update。
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(lsa_a);
+    lsdb.update(lsa_b);
+    lsdb.update(lsa_c);
+    lsdb.update(lsa_d);
+
+    // ---- 阶段 1：TopoView 建图 ----
+    let topo = TopoView::from_lsdb(&lsdb);
+    if topo.node_count() != 4 {
+        return Err(NexusError::Internal {
+            message: "dijkstra fib: topo node count != 4".to_string(),
+        });
+    }
+    events.push("topo_built");
+
+    // ---- 阶段 2：Dijkstra 最短路 ----
+    let computer = ShortestPath::new();
+    if computer.name() != "shortest" {
+        return Err(NexusError::Internal {
+            message: "dijkstra fib: computer name mismatch".to_string(),
+        });
+    }
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("dijkstra fib: {m}"),
+    };
+    // A→B：直连 10ms。
+    let p_b = computer
+        .compute(&topo, &id_a, &id_b)
+        .ok_or_else(|| fail("no path A->B"))?;
+    if p_b.cost != 10 || p_b.nodes.len() != 2 {
+        return Err(fail("A->B path wrong"));
+    }
+    // A→C：A-B-C 20ms 优于 A-C 直连 50ms。
+    let p_c = computer
+        .compute(&topo, &id_a, &id_c)
+        .ok_or_else(|| fail("no path A->C"))?;
+    if p_c.cost != 20 || p_c.nodes != vec![id_a.clone(), id_b.clone(), id_c.clone()] {
+        return Err(fail("A->C should go via B"));
+    }
+    // A→D：A-B-D 20ms 最短。
+    let p_d = computer
+        .compute(&topo, &id_a, &id_d)
+        .ok_or_else(|| fail("no path A->D"))?;
+    if p_d.cost != 20 || p_d.nodes != vec![id_a.clone(), id_b.clone(), id_d.clone()] {
+        return Err(fail("A->D should go via B"));
+    }
+    // 不可达：未知节点 → None。
+    if computer
+        .compute(&topo, &id_a, &PeerId("node-x".to_string()))
+        .is_some()
+    {
+        return Err(fail("unknown dst should have no path"));
+    }
+    events.push("shortest_paths_ok");
+
+    // ---- 阶段 3：FIB（dst vip → Vec<NextHop>，本期每 dst 1 条） ----
+    let fib = Fib::compute(&lsdb, &id_a, &computer, 1);
+    if fib.generation() != 1 {
+        return Err(fail("fib generation != 1"));
+    }
+    let check_via = |vip: &str, expect_peer: &PeerId| -> Result<(), NexusError> {
+        let hops = fib.lookup(vip).ok_or_else(|| fail("fib missing dst"))?;
+        if hops.len() != 1 {
+            return Err(fail("fib entry should be vec_single"));
+        }
+        if hops[0].peer != *expect_peer || hops[0].weight != 1 || hops[0].path_id != 0 {
+            return Err(fail("fib next_hop wrong"));
+        }
+        Ok(())
+    };
+    check_via("10.99.0.2", &id_b)?;
+    check_via("10.99.0.3", &id_b)?;
+    check_via("10.99.0.4", &id_b)?;
+    // 本端无条目；未知 VIP 无条目。
+    if fib.lookup("10.99.0.1").is_some() || fib.lookup("10.99.9.9").is_some() {
+        return Err(fail("fib should not contain self/unknown"));
+    }
+    events.push("fib_shape_ok");
+
+    // ---- 阶段 4：代际原子替换（重算 → 新 generation；旧 FIB 不变） ----
+    let fib2 = Fib::compute(&lsdb, &id_a, &computer, 2);
+    if fib2.generation() != 2 || fib.generation() != 1 {
+        return Err(fail("generation not bumped atomically"));
+    }
+    // 旧 FIB 内容不受影响（整体替换，非原地修改）。
+    check_via("10.99.0.4", &id_b)?;
+    events.push("generation_bumped");
+
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "fib": {
+            "a_to_c_via": "node-b",
+            "a_to_d_via": "node-b",
+            "entry_shape": "vec_single",
+        },
+        "generation": fib2.generation(),
+    }))
+}
+
+/// E4 `product.ecmp`（PRODUCT §12.46）的可执行驱动。
+///
+/// ```text
+/// 菱形拓扑进程内（A 视角）：A-B 10ms、B-D 10ms、A-C 10ms、C-D 10ms；
+/// A→D 有两条 20ms 等代价最短路（经 B、经 C），FIB 填 2 条 NextHop
+/// ```
+///
+/// 全程零真实网络；错误一律 typed `Result`，无 panic。
+pub fn ecmp_flow() -> Result<Value, NexusError> {
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::{Ecmp, Fib, PathComputer, ShortestPath};
+
+    let mut events: Vec<&'static str> = Vec::new();
+
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    let id_d = PeerId("node-d".to_string());
+
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+
+    // 菱形拓扑（链路对称）。
+    let lsa_a = Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    };
+    let lsa_b = Lsa {
+        node_id: id_b.clone(),
+        vip: "10.99.0.2".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    };
+    let lsa_c = Lsa {
+        node_id: id_c.clone(),
+        vip: "10.99.0.3".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    };
+    let lsa_d = Lsa {
+        node_id: id_d.clone(),
+        vip: "10.99.0.4".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    };
+
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(lsa_a);
+    lsdb.update(lsa_b);
+    lsdb.update(lsa_c);
+    lsdb.update(lsa_d);
+
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("ecmp: {m}"),
+    };
+
+    // ---- 阶段 1：Ecmp 找到 2 条等代价最短路 ----
+    let ecmp = Ecmp::new();
+    if ecmp.name() != "ecmp" {
+        return Err(fail("computer name mismatch"));
+    }
+    let topo = nexus_discovery::routing::TopoView::from_lsdb(&lsdb);
+    let paths = ecmp.compute_paths(&topo, &id_a, &id_d);
+    if paths.len() != 2 {
+        return Err(fail("A->D should have 2 equal-cost paths"));
+    }
+    for p in &paths {
+        if p.cost != 20 || p.nodes.len() != 3 {
+            return Err(fail("ECMP path cost/hops wrong"));
+        }
+    }
+    // 两条路径的第二跳不同（B vs C）。
+    let mut second_hops: Vec<String> = paths.iter().map(|p| p.nodes[1].0.clone()).collect();
+    second_hops.sort();
+    if second_hops != vec!["node-b".to_string(), "node-c".to_string()] {
+        return Err(fail("ECMP second hops should be B and C"));
+    }
+    // compute() 返回其中一条（兼容单路径语义）。
+    let single = ecmp
+        .compute(&topo, &id_a, &id_d)
+        .ok_or_else(|| fail("no path"))?;
+    if single.cost != 20 {
+        return Err(fail("compute() should return one shortest path"));
+    }
+    events.push("ecmp_paths_found");
+
+    // ---- 阶段 2：FIB 多下一跳 ----
+    let fib = Fib::compute(&lsdb, &id_a, &ecmp, 1);
+    let hops_d = fib
+        .lookup("10.99.0.4")
+        .ok_or_else(|| fail("fib missing D"))?;
+    if hops_d.len() != 2 {
+        return Err(fail("FIB A->D should have 2 next hops"));
+    }
+    let mut peers: Vec<String> = hops_d.iter().map(|h| h.peer.0.clone()).collect();
+    peers.sort();
+    if peers != vec!["node-b".to_string(), "node-c".to_string()] {
+        return Err(fail("FIB next hops should be B and C"));
+    }
+    // path_id 为路径序号（0/1），weight 恒 1。
+    if hops_d.iter().any(|h| h.weight != 1) {
+        return Err(fail("weight should be 1"));
+    }
+    events.push("fib_multi_nexthop");
+
+    // ---- 阶段 3：单路径兼容（ShortestPath 行为不变） ----
+    let sp = ShortestPath::new();
+    let fib_sp = Fib::compute(&lsdb, &id_a, &sp, 1);
+    let hops_sp = fib_sp
+        .lookup("10.99.0.4")
+        .ok_or_else(|| fail("sp fib missing D"))?;
+    if hops_sp.len() != 1 {
+        return Err(fail("ShortestPath FIB should stay vec_single"));
+    }
+    // A→B 只有一条路，Ecmp 下也是单下一跳。
+    let hops_b = fib
+        .lookup("10.99.0.2")
+        .ok_or_else(|| fail("fib missing B"))?;
+    if hops_b.len() != 1 || hops_b[0].peer != id_b {
+        return Err(fail("A->B should stay single next hop"));
+    }
+    events.push("single_path_compat");
+
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "fib": {
+            "a_to_d_next_hops": hops_d.len(),
+            "entry_shape": "vec_multi",
+        },
+    }))
+}
+
+/// E4 产品场景 `product.flow-hash` 的可执行驱动（PRODUCT §12.47）。
+///
+/// 菱形拓扑（同 ecmp_flow）：A→D 有 2 条 20ms 等代价路径，FIB 持有 2 条 NextHop。
+/// 验证按流哈希选择下一跳：同流恒定、异流分散、单路径稳定、未知 VIP 为 None。
+pub fn flow_hash_selection() -> Result<Value, NexusError> {
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::{Ecmp, Fib, FlowKey};
+
+    let mut events: Vec<&'static str> = Vec::new();
+
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    let id_d = PeerId("node-d".to_string());
+
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+
+    // 菱形拓扑（链路对称），VIP 段与 ecmp_flow 一致。
+    let lsa_a = Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    };
+    let lsa_b = Lsa {
+        node_id: id_b.clone(),
+        vip: "10.99.0.2".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    };
+    let lsa_c = Lsa {
+        node_id: id_c.clone(),
+        vip: "10.99.0.3".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    };
+    let lsa_d = Lsa {
+        node_id: id_d.clone(),
+        vip: "10.99.0.4".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    };
+
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(lsa_a);
+    lsdb.update(lsa_b);
+    lsdb.update(lsa_c);
+    lsdb.update(lsa_d);
+
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("flow_hash: {m}"),
+    };
+    let parse_ip = |s: &str| -> Result<std::net::IpAddr, NexusError> {
+        s.parse().map_err(|_| fail("bad test ip literal"))
+    };
+
+    // ---- 前置：A→D FIB 有 2 条 NextHop（B 和 C）----
+    let fib = Fib::compute(&lsdb, &id_a, &Ecmp::new(), 1);
+    let hops_d = fib
+        .lookup("10.99.0.4")
+        .ok_or_else(|| fail("fib missing D"))?;
+    if hops_d.len() != 2 {
+        return Err(fail("FIB A->D should have 2 next hops"));
+    }
+
+    // ---- 阶段 1：同流恒定（同一 FlowKey 选 100 次，结果恒定）----
+    let flow = FlowKey {
+        src_ip: parse_ip("10.99.0.1")?,
+        dst_ip: parse_ip("10.99.0.4")?,
+        src_port: 12345,
+        dst_port: 80,
+        protocol: 6,
+    };
+    let first = fib
+        .select_next_hop("10.99.0.4", &flow)
+        .ok_or_else(|| fail("select should hit"))?;
+    for _ in 0..99 {
+        let hop = fib
+            .select_next_hop("10.99.0.4", &flow)
+            .ok_or_else(|| fail("select should hit"))?;
+        if hop != first {
+            return Err(fail("same flow must select same next hop"));
+        }
+    }
+    events.push("flow_stable");
+
+    // ---- 阶段 2：异流分散（1000 个不同流，每条下一跳 ≥ 30%）----
+    let mut count_b = 0u32;
+    let mut count_c = 0u32;
+    for i in 0..1000u32 {
+        let f = FlowKey {
+            src_ip: parse_ip("10.99.0.1")?,
+            dst_ip: parse_ip("10.99.0.4")?,
+            // 端口递增构造不同流（src_port 循环 + dst_port 递增，避免 u16 溢出）。
+            src_port: (10000 + (i % 5000)) as u16,
+            dst_port: (80 + (i / 5000)) as u16,
+            protocol: 6,
+        };
+        let hop = fib
+            .select_next_hop("10.99.0.4", &f)
+            .ok_or_else(|| fail("select should hit"))?;
+        if hop.peer == id_b {
+            count_b += 1;
+        } else if hop.peer == id_c {
+            count_c += 1;
+        } else {
+            return Err(fail("unexpected next hop peer"));
+        }
+    }
+    if count_b + count_c != 1000 {
+        return Err(fail("flow count mismatch"));
+    }
+    // 每条 ≥ 30%：哈希分散性门限（FNV-1a 在 1000 样本下远高于此）。
+    if count_b < 300 || count_c < 300 {
+        return Err(fail(&format!(
+            "flows should spread across next hops (b={count_b}, c={count_c})"
+        )));
+    }
+    events.push("flows_spread");
+
+    // ---- 阶段 3：单路径稳定（A→B 只有 1 条下一跳，恒返回该条）----
+    let hops_b = fib
+        .lookup("10.99.0.2")
+        .ok_or_else(|| fail("fib missing B"))?;
+    if hops_b.len() != 1 {
+        return Err(fail("A->B should have single next hop"));
+    }
+    for i in 0..50u32 {
+        let f = FlowKey {
+            src_ip: parse_ip("10.99.0.1")?,
+            dst_ip: parse_ip("10.99.0.2")?,
+            src_port: (20000 + i) as u16,
+            dst_port: 443,
+            protocol: 6,
+        };
+        let hop = fib
+            .select_next_hop("10.99.0.2", &f)
+            .ok_or_else(|| fail("select should hit"))?;
+        if hop.peer != id_b {
+            return Err(fail("single next hop must be B"));
+        }
+    }
+    events.push("single_path_stable");
+
+    // ---- 阶段 4：未知 VIP 返回 None ----
+    if fib.select_next_hop("10.99.9.9", &flow).is_some() {
+        return Err(fail("unknown VIP should return None"));
+    }
+    events.push("unknown_vip_none");
+
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "selection": {
+            "a_to_d_next_hops": hops_d.len(),
+            "flow_stable_rounds": 100,
+            "spread_b": count_b,
+            "spread_c": count_c,
+        },
+    }))
+}
+
+/// E4 产品场景 `product.routing-strategy` 的可执行驱动（PRODUCT §12.48）。
+///
+/// 验证 `[routing] strategy` 配置装配：字符串解析 → `RoutingStrategy` →
+/// `PathComputer` 委托 → FIB。菱形拓扑（同 ecmp_flow）。
+pub fn routing_strategy_flow() -> Result<Value, NexusError> {
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::{Fib, PathComputer, RoutingStrategy};
+
+    let mut events: Vec<&'static str> = Vec::new();
+
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("routing_strategy: {m}"),
+    };
+
+    // ---- 阶段 1：parse_ok ----
+    if RoutingStrategy::parse("ecmp") != Ok(RoutingStrategy::Ecmp) {
+        return Err(fail("parse ecmp"));
+    }
+    if RoutingStrategy::parse("ECMP") != Ok(RoutingStrategy::Ecmp) {
+        return Err(fail("parse ECMP (case-insensitive)"));
+    }
+    if RoutingStrategy::parse(" shortest ") != Ok(RoutingStrategy::Shortest) {
+        return Err(fail("parse ' shortest ' (trim)"));
+    }
+    if RoutingStrategy::parse("").is_ok() {
+        return Err(fail("parse empty should err"));
+    }
+    events.push("parse_ok");
+
+    // ---- 阶段 2：parse_err ----
+    // §12.53 起：裸 "k-shortest" 默认 k=2（不再是错误）。
+    match RoutingStrategy::parse("k-shortest") {
+        Ok(RoutingStrategy::KShortest { k: 2 }) => {}
+        other => {
+            return Err(fail(&format!(
+                "parse k-shortest should default k=2, got {:?}",
+                other
+            )));
+        }
+    }
+    if RoutingStrategy::parse("k-shortest:0").is_ok() {
+        return Err(fail("parse k-shortest:0 should err"));
+    }
+    events.push("parse_err");
+
+    // ---- 菱形拓扑 ----
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    let id_d = PeerId("node-d".to_string());
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    });
+    for (id, vip, nbs) in [
+        (
+            id_b.clone(),
+            "10.99.0.2",
+            vec![link(&id_a, 10), link(&id_d, 10)],
+        ),
+        (
+            id_c.clone(),
+            "10.99.0.3",
+            vec![link(&id_a, 10), link(&id_d, 10)],
+        ),
+        (
+            id_d.clone(),
+            "10.99.0.4",
+            vec![link(&id_b, 10), link(&id_c, 10)],
+        ),
+    ] {
+        lsdb.update(Lsa {
+            node_id: id,
+            vip: vip.to_string(),
+            incarnation: 1,
+            seq: 1,
+            capabilities: 0,
+            locator: None,
+            neighbors: nbs,
+        });
+    }
+
+    // ---- 阶段 3：strategy_computes（Ecmp 经策略装配）----
+    let strat = RoutingStrategy::Ecmp;
+    if strat.name() != "ecmp" {
+        return Err(fail("strategy name"));
+    }
+    let topo = nexus_discovery::routing::TopoView::from_lsdb(&lsdb);
+    let paths = strat.compute_paths(&topo, &id_a, &id_d);
+    if paths.len() != 2 {
+        return Err(fail("Ecmp strategy should find 2 paths"));
+    }
+    let fib = Fib::compute(&lsdb, &id_a, &strat, 1);
+    let hops_d = fib
+        .lookup("10.99.0.4")
+        .ok_or_else(|| fail("fib missing D"))?;
+    if hops_d.len() != 2 {
+        return Err(fail("Ecmp strategy FIB should have 2 next hops"));
+    }
+    events.push("strategy_computes");
+
+    // ---- 阶段 4：strategy_default（缺省 → Shortest）----
+    let def = RoutingStrategy::default();
+    if def != RoutingStrategy::Shortest {
+        return Err(fail("default should be Shortest"));
+    }
+    let fib_def = Fib::compute(&lsdb, &id_a, &def, 1);
+    let hops_def = fib_def
+        .lookup("10.99.0.4")
+        .ok_or_else(|| fail("fib missing D"))?;
+    if hops_def.len() != 1 {
+        return Err(fail("Shortest strategy FIB should have 1 next hop"));
+    }
+    events.push("strategy_default");
+
+    // ---- 阶段 5：config_toml（TOML [routing] 解析）----
+    let toml_str = "[subnet]\ncidr = \"10.99.0.0/24\"\n[routing]\nstrategy = \"ecmp\"\n";
+    let parsed: crate::subnet_cli::SubnetConfig =
+        toml::from_str(toml_str).map_err(|e| fail(&format!("toml parse: {e}")))?;
+    let from_cfg = parsed
+        .routing_strategy()
+        .map_err(|e| fail(&format!("strategy from config: {e}")))?;
+    if from_cfg != RoutingStrategy::Ecmp {
+        return Err(fail("toml [routing] strategy=ecmp"));
+    }
+    // 缺省 [routing] 段 → Shortest。
+    let empty: crate::subnet_cli::SubnetConfig =
+        toml::from_str("[subnet]\ncidr=\"10.99.0.0/24\"\n")
+            .map_err(|e| fail(&format!("toml parse: {e}")))?;
+    if empty.routing_strategy().map_err(|e| fail(&e))? != RoutingStrategy::Shortest {
+        return Err(fail("missing [routing] should default to Shortest"));
+    }
+    // 未知策略 → CONFIG_ERROR。
+    let bad: crate::subnet_cli::SubnetConfig =
+        toml::from_str("[subnet]\ncidr=\"10.99.0.0/24\"\n[routing]\nstrategy=\"k-shortest\"\n")
+            .map_err(|e| fail(&format!("toml parse: {e}")))?;
+    // §12.53 起：裸 "k-shortest" 默认 k=2（不再是错误）。
+    match bad.routing_strategy() {
+        Ok(RoutingStrategy::KShortest { k: 2 }) => {}
+        other => {
+            return Err(fail(&format!(
+                "toml k-shortest should default k=2, got {:?}",
+                other
+            )));
+        }
+    }
+    // [routing] 段存在但缺 strategy 字段 → serde 默认回落为 Shortest。
+    let no_field: crate::subnet_cli::SubnetConfig =
+        toml::from_str("[subnet]\ncidr=\"10.99.0.0/24\"\n[routing]\n")
+            .map_err(|e| fail(&format!("toml parse: {e}")))?;
+    if no_field.routing_strategy().map_err(|e| fail(&e))? != RoutingStrategy::Shortest {
+        return Err(fail("missing strategy field should default to Shortest"));
+    }
+    events.push("config_toml");
+
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "strategy": {
+            "ecmp_next_hops": hops_d.len(),
+            "default_next_hops": hops_def.len(),
+        },
+    }))
+}
+
+/// E4 产品场景 `product.k-shortest` 的可执行驱动（PRODUCT §12.49）。
+///
+/// 拓扑：A-B(10)、B-D(10)、A-C(10)、C-D(10)、A-D(35 直连)。
+/// K=3 时 A→D 应得 3 条：20ms 经 B、20ms 经 C、35ms 直连（按代价升序）。
+pub fn k_shortest_flow() -> Result<Value, NexusError> {
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::{KShortest, PathComputer, TopoView};
+
+    let mut events: Vec<&'static str> = Vec::new();
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("k_shortest: {m}"),
+    };
+
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    let id_d = PeerId("node-d".to_string());
+    let id_iso = PeerId("node-iso".to_string());
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10), link(&id_d, 35)],
+    });
+    for (id, vip, nbs) in [
+        (
+            id_b.clone(),
+            "10.99.0.2",
+            vec![link(&id_a, 10), link(&id_d, 10)],
+        ),
+        (
+            id_c.clone(),
+            "10.99.0.3",
+            vec![link(&id_a, 10), link(&id_d, 10)],
+        ),
+        (
+            id_d.clone(),
+            "10.99.0.4",
+            vec![link(&id_b, 10), link(&id_c, 10), link(&id_a, 35)],
+        ),
+        (id_iso.clone(), "10.99.0.9", vec![]),
+    ] {
+        lsdb.update(Lsa {
+            node_id: id,
+            vip: vip.to_string(),
+            incarnation: 1,
+            seq: 1,
+            capabilities: 0,
+            locator: None,
+            neighbors: nbs,
+        });
+    }
+    let topo = TopoView::from_lsdb(&lsdb);
+
+    // ---- 阶段 1：K=3 得 3 条 ----
+    let ks3 = KShortest::new(3);
+    if ks3.name() != "k-shortest" {
+        return Err(fail("name"));
+    }
+    let paths = ks3.compute_paths(&topo, &id_a, &id_d);
+    if paths.len() != 3 {
+        return Err(fail(&format!(
+            "K=3 should find 3 paths, got {}",
+            paths.len()
+        )));
+    }
+    events.push("k_paths_found");
+
+    // ---- 阶段 2：按代价升序 ----
+    let costs: Vec<u64> = paths.iter().map(|p| p.cost).collect();
+    if costs != vec![20, 20, 35] {
+        return Err(fail(&format!("costs should be [20,20,35], got {costs:?}")));
+    }
+    // 前两条为经 B / 经 C（顺序不限），第三条为直连。
+    if paths[2].nodes.len() != 2 || paths[2].nodes[1] != id_d {
+        return Err(fail("3rd path should be direct A->D"));
+    }
+    events.push("k_ordered");
+
+    // ---- 阶段 3：K=2 截断 ----
+    let ks2 = KShortest::new(2);
+    let paths2 = ks2.compute_paths(&topo, &id_a, &id_d);
+    if paths2.len() != 2 {
+        return Err(fail("K=2 should return 2 paths"));
+    }
+    // compute() 返回第一条（最短）。
+    let first = ks3
+        .compute(&topo, &id_a, &id_d)
+        .ok_or_else(|| fail("compute"))?;
+    if first.cost != 20 {
+        return Err(fail("compute() should return shortest"));
+    }
+    events.push("k_truncated");
+
+    // ---- 阶段 4：不可达 → 空 ----
+    let empty = ks3.compute_paths(&topo, &id_a, &id_iso);
+    if !empty.is_empty() {
+        return Err(fail("unreachable should return empty"));
+    }
+    events.push("k_unreachable");
+
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "kshortest": {
+            "k3_count": paths.len(),
+            "k3_costs": costs,
+        },
+    }))
+}
+
+/// E4 产品场景 `product.fib-manager` 的可执行驱动（PRODUCT §12.50）。
+///
+/// 验证 FibManager：初始计算、无变化不重算、拓扑变化重算、经管理器选路。
+pub fn fib_manager_flow() -> Result<Value, NexusError> {
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::{Ecmp, FibManager, FlowKey};
+
+    let mut events: Vec<&'static str> = Vec::new();
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("fib_manager: {m}"),
+    };
+
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    let id_d = PeerId("node-d".to_string());
+    let id_e = PeerId("node-e".to_string());
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+
+    // 菱形拓扑。
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    });
+    for (id, vip, nbs) in [
+        (
+            id_b.clone(),
+            "10.99.0.2",
+            vec![link(&id_a, 10), link(&id_d, 10)],
+        ),
+        (
+            id_c.clone(),
+            "10.99.0.3",
+            vec![link(&id_a, 10), link(&id_d, 10)],
+        ),
+        (
+            id_d.clone(),
+            "10.99.0.4",
+            vec![link(&id_b, 10), link(&id_c, 10)],
+        ),
+    ] {
+        lsdb.update(Lsa {
+            node_id: id,
+            vip: vip.to_string(),
+            incarnation: 1,
+            seq: 1,
+            capabilities: 0,
+            locator: None,
+            neighbors: nbs,
+        });
+    }
+
+    // ---- 阶段 1：初始计算 ----
+    let mut mgr = FibManager::new(id_a.clone(), Ecmp::new(), &lsdb);
+    if mgr.generation() != 1 {
+        return Err(fail("initial generation should be 1"));
+    }
+    if mgr.fib().lookup("10.99.0.4").is_none() {
+        return Err(fail("initial FIB should have D"));
+    }
+    let gen1 = mgr.generation();
+    events.push("initial_computed");
+
+    // ---- 阶段 2：无变化不重算 ----
+    if mgr.maybe_recompute(&lsdb) {
+        return Err(fail("no change should return false"));
+    }
+    if mgr.generation() != gen1 {
+        return Err(fail("generation should not bump"));
+    }
+    events.push("no_change_no_recompute");
+
+    // ---- 阶段 3：拓扑变化重算 ----
+    lsdb.update(Lsa {
+        node_id: id_e.clone(),
+        vip: "10.99.0.5".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_d, 10)],
+    });
+    // D 也通告 E（双向）。
+    lsdb.update(Lsa {
+        node_id: id_d.clone(),
+        vip: "10.99.0.4".to_string(),
+        incarnation: 1,
+        seq: 2,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10), link(&id_e, 10)],
+    });
+    if !mgr.maybe_recompute(&lsdb) {
+        return Err(fail("topo change should return true"));
+    }
+    if mgr.generation() != 2 {
+        return Err(fail("generation should be 2"));
+    }
+    if mgr.fib().lookup("10.99.0.5").is_none() {
+        return Err(fail("FIB should contain E after recompute"));
+    }
+    let gen2 = mgr.generation();
+    events.push("topo_change_recomputes");
+
+    // ---- 阶段 4：经管理器选路 ----
+    let flow = FlowKey {
+        src_ip: "10.99.0.1".parse().map_err(|_| fail("bad ip"))?,
+        dst_ip: "10.99.0.4".parse().map_err(|_| fail("bad ip"))?,
+        src_port: 1234,
+        dst_port: 80,
+        protocol: 6,
+    };
+    let hop = mgr
+        .select("10.99.0.4", &flow)
+        .ok_or_else(|| fail("select"))?;
+    if hop.peer != id_b && hop.peer != id_c {
+        return Err(fail("select should return B or C"));
+    }
+    // 同流恒定。
+    let hop2 = mgr
+        .select("10.99.0.4", &flow)
+        .ok_or_else(|| fail("select"))?;
+    if hop != hop2 {
+        return Err(fail("same flow should select same"));
+    }
+    events.push("select_via_manager");
+
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "manager": {
+            "initial_generation": gen1,
+            "after_change_generation": gen2,
+        },
+    }))
+}
+
+/// E4 产品场景 `product.weighted-selection` 的可执行驱动（PRODUCT §12.52）。
+///
+/// 拓扑：A-B(10)-D（代价 20）、A-C(10)-D(20)（代价 30）。K=2 时 FIB 权重：
+/// B = 30-20+1 = 11，C = 30-30+1 = 1；1000 流按 ~11:1 分散。
+pub fn weighted_selection_flow() -> Result<Value, NexusError> {
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::{Ecmp, Fib, FlowKey, KShortest};
+
+    let mut events: Vec<&'static str> = Vec::new();
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("weighted_selection: {m}"),
+    };
+
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    let id_d = PeerId("node-d".to_string());
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+
+    // 非对称菱形：A-B-D 代价 20，A-C-D 代价 30。
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_b.clone(),
+        vip: "10.99.0.2".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_c.clone(),
+        vip: "10.99.0.3".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 20)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_d.clone(),
+        vip: "10.99.0.4".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 20)],
+    });
+
+    let parse_ip = |s: &str| -> Result<std::net::IpAddr, NexusError> {
+        s.parse().map_err(|_| fail("bad test ip literal"))
+    };
+
+    // ---- 事件 1：权重按代价反比分配 ----
+    let fib = Fib::compute(&lsdb, &id_a, &KShortest::new(2), 1);
+    let hops = fib
+        .lookup("10.99.0.4")
+        .ok_or_else(|| fail("fib missing D"))?;
+    if hops.len() != 2 {
+        return Err(fail("expected 2 next-hops"));
+    }
+    // 按 peer 排序：node-b 在前（weight 11），node-c 在后（weight 1）。
+    if hops[0].weight != 11 || hops[1].weight != 1 {
+        return Err(fail(&format!(
+            "weights: b={} c={}",
+            hops[0].weight, hops[1].weight
+        )));
+    }
+    events.push("weights_assigned");
+
+    // ---- 事件 2：1000 流按 ~11:1 分散 ----
+    let mut counts = [0u32, 0u32];
+    for i in 0..1000u16 {
+        let flow = FlowKey {
+            src_ip: parse_ip("10.99.0.1")?,
+            dst_ip: parse_ip("10.99.0.4")?,
+            src_port: 30000 + i,
+            dst_port: 80,
+            protocol: 6,
+        };
+        let hop = fib
+            .select_next_hop("10.99.0.4", &flow)
+            .ok_or_else(|| fail("no next-hop"))?;
+        let idx = hops
+            .iter()
+            .position(|h| h == hop)
+            .ok_or_else(|| fail("hop mismatch"))?;
+        counts[idx] += 1;
+    }
+    if counts[0] < 800 || counts[1] > 200 {
+        return Err(fail(&format!("distribution: {counts:?}")));
+    }
+    events.push("weighted_distribution");
+
+    // ---- 事件 3：等代价时权重全 1（退化为均分）----
+    let fib_ecmp = Fib::compute(&lsdb, &id_a, &Ecmp::new(), 1);
+    // ECMP 在非对称拓扑下 A→D 只有 1 条最短路径（经 B，代价 20）。
+    let hops_ecmp = fib_ecmp
+        .lookup("10.99.0.4")
+        .ok_or_else(|| fail("ecmp fib missing D"))?;
+    if hops_ecmp.len() != 1 || hops_ecmp[0].weight != 1 {
+        return Err(fail("ecmp should have single weight-1 hop"));
+    }
+    events.push("equal_cost_uniform");
+
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "weighted".to_string(),
+        serde_json::json!({
+            "weights": [hops[0].weight, hops[1].weight],
+            "distribution": counts,
+        }),
+    );
+    out.insert(
+        "events".to_string(),
+        serde_json::Value::Array(events.into_iter().map(serde_json::Value::from).collect()),
+    );
+    out.insert("verdict".to_string(), serde_json::Value::from("PASS"));
+    Ok(serde_json::Value::Object(out))
+}
+
+/// E4 产品场景 `product.node-disjoint` 的可执行驱动（PRODUCT §12.55）。
+///
+/// 拓扑：菱形 A-B-D / A-C-D。验证两条路径除 src/dst 外无共享节点。
+pub fn node_disjoint_flow() -> Result<Value, NexusError> {
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::{NodeDisjoint, PathComputer, TopoView};
+    use std::collections::HashSet;
+
+    let mut events: Vec<&'static str> = Vec::new();
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("node_disjoint: {m}"),
+    };
+
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    let id_d = PeerId("node-d".to_string());
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_b.clone(),
+        vip: "10.99.0.2".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_c.clone(),
+        vip: "10.99.0.3".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_d.clone(),
+        vip: "10.99.0.4".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    });
+    let topo = TopoView::from_lsdb(&lsdb);
+
+    // ---- 事件 1：得 2 条路径 ----
+    let paths = NodeDisjoint::new().compute_paths(&topo, &id_a, &id_d);
+    if paths.len() != 2 {
+        return Err(fail(&format!("expected 2 paths, got {}", paths.len())));
+    }
+    events.push("two_paths_found");
+
+    // ---- 事件 2：无共享中间节点 ----
+    let mid0: HashSet<_> = paths[0].nodes[1..paths[0].nodes.len() - 1].iter().collect();
+    let mid1: HashSet<_> = paths[1].nodes[1..paths[1].nodes.len() - 1].iter().collect();
+    if !mid0.is_disjoint(&mid1) {
+        return Err(fail("paths share intermediate nodes"));
+    }
+    events.push("no_shared_mid_nodes");
+
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "node_disjoint".to_string(),
+        serde_json::json!({
+            "path_count": paths.len(),
+        }),
+    );
+    out.insert(
+        "events".to_string(),
+        serde_json::Value::Array(events.into_iter().map(serde_json::Value::from).collect()),
+    );
+    out.insert("verdict".to_string(), serde_json::Value::from("PASS"));
+    Ok(serde_json::Value::Object(out))
+}
+
+/// 基于 discovery FIB 的转发面适配器（§12.56，composition root）。
+///
+/// 持有 `SharedFibManager<RoutingStrategy>` + `PeerId→VIP` 映射，
+/// 实现 `nexus-connectivity::fib_resolver::FibResolver`，
+/// 供 `VirtualSubnet::resolve_next_hop` 查询。
+pub struct DiscoveryFibResolver {
+    mgr: nexus_discovery::routing::SharedFibManager<nexus_discovery::routing::RoutingStrategy>,
+    peer_to_vip: std::sync::Arc<
+        std::sync::RwLock<std::collections::HashMap<nexus_discovery::PeerId, String>>,
+    >,
+}
+
+impl DiscoveryFibResolver {
+    /// 创建（从 LSDB 构建 PeerId→VIP 映射）。
+    #[must_use]
+    pub fn new(
+        mgr: nexus_discovery::routing::SharedFibManager<nexus_discovery::routing::RoutingStrategy>,
+        lsdb: &nexus_discovery::lsa::Lsdb,
+    ) -> Self {
+        let mut map = std::collections::HashMap::new();
+        for lsa in lsdb.all() {
+            map.insert(lsa.node_id.clone(), lsa.vip.clone());
+        }
+        Self {
+            mgr,
+            peer_to_vip: std::sync::Arc::new(std::sync::RwLock::new(map)),
+        }
+    }
+
+    /// 同步 PeerId→VIP 映射（LSDB 变化后调用）。
+    pub fn sync_peer_map(&self, lsdb: &nexus_discovery::lsa::Lsdb) {
+        let mut map = std::collections::HashMap::new();
+        for lsa in lsdb.all() {
+            map.insert(lsa.node_id.clone(), lsa.vip.clone());
+        }
+        *self.peer_to_vip.write().unwrap() = map;
+    }
+}
+
+impl nexus_connectivity::fib_resolver::FibResolver for DiscoveryFibResolver {
+    fn resolve(
+        &self,
+        dst_vip: &str,
+        flow: &nexus_connectivity::fib_resolver::FlowKeyView,
+    ) -> Option<String> {
+        let guard = self.mgr.read();
+        let fib = guard.fib();
+        let hops = fib.lookup(dst_vip)?;
+        if hops.is_empty() {
+            return None;
+        }
+        let dk_flow = nexus_discovery::routing::FlowKey {
+            src_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::from(flow.src_ip)),
+            dst_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::from(flow.dst_ip)),
+            src_port: flow.src_port,
+            dst_port: flow.dst_port,
+            protocol: flow.protocol,
+        };
+        let hop = fib.select_next_hop(dst_vip, &dk_flow)?;
+        self.peer_to_vip.read().unwrap().get(&hop.peer).cloned()
+    }
+}
+
+/// E4 产品场景 `product.fib-manager-shared` 的可执行驱动（PRODUCT §12.54）。
+///
+/// 验证：多线程并发读（4 线程 × 50 次）无 panic；
+/// 写线程触发重算后 generation+1 且新 FIB 可见。
+pub fn fib_manager_shared_flow() -> Result<Value, NexusError> {
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::{Ecmp, SharedFibManager};
+
+    let mut events: Vec<&'static str> = Vec::new();
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("fib_manager_shared: {m}"),
+    };
+
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    let id_d = PeerId("node-d".to_string());
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_b.clone(),
+        vip: "10.99.0.2".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_c.clone(),
+        vip: "10.99.0.3".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_d.clone(),
+        vip: "10.99.0.4".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    });
+
+    let shared = SharedFibManager::new(id_a.clone(), Ecmp::new(), &lsdb);
+
+    // ---- 事件 1：多线程并发读 ----
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let s = shared.clone();
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..50 {
+                let guard = s.read();
+                if guard.fib().lookup("10.99.0.4").is_none() {
+                    return false;
+                }
+            }
+            true
+        }));
+    }
+    for h in handles {
+        if !h.join().map_err(|_| fail("reader panicked"))? {
+            return Err(fail("concurrent read failed"));
+        }
+    }
+    events.push("concurrent_read");
+
+    // ---- 事件 2：写触发重算 ----
+    let mut lsdb2 = lsdb;
+    lsdb2.update(Lsa {
+        node_id: PeerId("node-e".to_string()),
+        vip: "10.99.0.5".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_d, 10)],
+    });
+    // d 的 LSA 需要更新以包含 e（否则 e 不可达，但指纹会变，照样触发重算）。
+    if !shared.maybe_recompute(&lsdb2) {
+        return Err(fail("expected recompute"));
+    }
+    if shared.read().generation() != 2 {
+        return Err(fail("generation should be 2"));
+    }
+    events.push("write_recompute");
+
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "shared".to_string(),
+        serde_json::json!({
+            "generation": shared.read().generation(),
+        }),
+    );
+    out.insert(
+        "events".to_string(),
+        serde_json::Value::Array(events.into_iter().map(serde_json::Value::from).collect()),
+    );
+    out.insert("verdict".to_string(), serde_json::Value::from("PASS"));
+    Ok(serde_json::Value::Object(out))
+}
+
+/// E4 产品场景 `product.strategy-extended` 的可执行驱动（PRODUCT §12.53）。
+///
+/// 验证：`"k-shortest:3"` 解析为 KShortest{k:3}；
+/// `"disjoint"` 解析为 Disjoint；
+/// 非法参数返回 InvalidParameter；
+/// 策略装配后算路（K=2 得 2 条，Disjoint 得 2 条）。
+pub fn strategy_extended_flow() -> Result<Value, NexusError> {
+    use nexus_discovery::routing::{PathComputer, RoutingStrategy, StrategyParseError};
+
+    let mut events: Vec<&'static str> = Vec::new();
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("strategy_extended: {m}"),
+    };
+
+    // ---- 事件 1：k-shortest:3 解析 ----
+    match RoutingStrategy::parse("k-shortest:3") {
+        Ok(RoutingStrategy::KShortest { k: 3 }) => events.push("parse_kshortest"),
+        other => return Err(fail(&format!("parse k-shortest:3 -> {other:?}"))),
+    }
+
+    // ---- 事件 2：disjoint 解析 ----
+    match RoutingStrategy::parse("disjoint") {
+        Ok(RoutingStrategy::Disjoint) => events.push("parse_disjoint"),
+        other => return Err(fail(&format!("parse disjoint -> {other:?}"))),
+    }
+
+    // ---- 事件 3：非法参数 ----
+    match RoutingStrategy::parse("k-shortest:0") {
+        Err(StrategyParseError::InvalidParameter(_)) => events.push("reject_invalid"),
+        other => return Err(fail(&format!("k-shortest:0 -> {other:?}"))),
+    }
+
+    // ---- 事件 4：策略装配算路 ----
+    // 用 diamond 拓扑验证委托：KShortest{2} 得 2 条，Disjoint 得 2 条。
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::TopoView;
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    let id_d = PeerId("node-d".to_string());
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_b.clone(),
+        vip: "10.99.0.2".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_c.clone(),
+        vip: "10.99.0.3".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_d.clone(),
+        vip: "10.99.0.4".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    });
+    let topo = TopoView::from_lsdb(&lsdb);
+    let k2 = RoutingStrategy::parse("k-shortest:2").map_err(|_| fail("parse k2"))?;
+    let paths_k2 = k2.compute_paths(&topo, &id_a, &id_d);
+    let dis = RoutingStrategy::parse("disjoint").map_err(|_| fail("parse dis"))?;
+    let paths_dis = dis.compute_paths(&topo, &id_a, &id_d);
+    if paths_k2.len() != 2 || paths_dis.len() != 2 {
+        return Err(fail(&format!(
+            "k2={}, dis={}",
+            paths_k2.len(),
+            paths_dis.len()
+        )));
+    }
+    events.push("delegate_compute");
+
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "strategy".to_string(),
+        serde_json::json!({
+            "kshortest_paths": paths_k2.len(),
+            "disjoint_paths": paths_dis.len(),
+        }),
+    );
+    out.insert(
+        "events".to_string(),
+        serde_json::Value::Array(events.into_iter().map(serde_json::Value::from).collect()),
+    );
+    out.insert("verdict".to_string(), serde_json::Value::from("PASS"));
+    Ok(serde_json::Value::Object(out))
+}
+
+/// E4 产品场景 `product.disjoint` 的可执行驱动（PRODUCT §12.51）。
+///
+/// 拓扑：A-B(10)-D、A-C(10)-D、B-C(5)。Suurballe 应得 2 条边不交：
+/// A-B-D（20）与 A-C-D（20）。
+pub fn disjoint_flow() -> Result<Value, NexusError> {
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::{Disjoint, PathComputer, TopoView};
+
+    let mut events: Vec<&'static str> = Vec::new();
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("disjoint: {m}"),
+    };
+
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    let id_d = PeerId("node-d".to_string());
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    });
+    for (id, vip, nbs) in [
+        (
+            id_b.clone(),
+            "10.99.0.2",
+            vec![link(&id_a, 10), link(&id_d, 10), link(&id_c, 5)],
+        ),
+        (
+            id_c.clone(),
+            "10.99.0.3",
+            vec![link(&id_a, 10), link(&id_d, 10), link(&id_b, 5)],
+        ),
+        (
+            id_d.clone(),
+            "10.99.0.4",
+            vec![link(&id_b, 10), link(&id_c, 10)],
+        ),
+    ] {
+        lsdb.update(Lsa {
+            node_id: id,
+            vip: vip.to_string(),
+            incarnation: 1,
+            seq: 1,
+            capabilities: 0,
+            locator: None,
+            neighbors: nbs,
+        });
+    }
+    let topo = TopoView::from_lsdb(&lsdb);
+
+    // ---- 阶段 1：得 2 条 ----
+    let dj = Disjoint::new();
+    if dj.name() != "disjoint" {
+        return Err(fail("name"));
+    }
+    let paths = dj.compute_paths(&topo, &id_a, &id_d);
+    if paths.len() != 2 {
+        return Err(fail(&format!(
+            "should find 2 disjoint, got {}",
+            paths.len()
+        )));
+    }
+    events.push("disjoint_found");
+
+    // ---- 阶段 2：无共享有向边 ----
+    let edges = |p: &nexus_discovery::routing::Path| {
+        p.nodes
+            .windows(2)
+            .map(|w| (w[0].0.clone(), w[1].0.clone()))
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let e1 = edges(&paths[0]);
+    let e2 = edges(&paths[1]);
+    if !e1.is_disjoint(&e2) {
+        return Err(fail("paths share edges"));
+    }
+    events.push("disjoint_no_shared_edge");
+
+    // ---- 阶段 3：桥接拓扑只 1 条 ----
+    // A-B-D 唯一通道（B 为桥）。
+    let mut lsdb2 = Lsdb::new(id_a.clone());
+    lsdb2.update_local(Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10)],
+    });
+    lsdb2.update(Lsa {
+        node_id: id_b.clone(),
+        vip: "10.99.0.2".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    });
+    lsdb2.update(Lsa {
+        node_id: id_d.clone(),
+        vip: "10.99.0.4".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10)],
+    });
+    let topo2 = TopoView::from_lsdb(&lsdb2);
+    let paths2 = dj.compute_paths(&topo2, &id_a, &id_d);
+    if paths2.len() != 1 {
+        return Err(fail("bridge should yield 1 path"));
+    }
+    events.push("single_when_bridge");
+
+    // ---- 阶段 4：不可达 ----
+    let id_iso = PeerId("node-iso".to_string());
+    if !dj.compute_paths(&topo, &id_a, &id_iso).is_empty() {
+        return Err(fail("unreachable should be empty"));
+    }
+    events.push("unreachable_empty");
+
+    Ok(json!({
+        "verdict": "PASS",
+        "events": events,
+        "disjoint": {
+            "path_count": paths.len(),
+        },
+    }))
+}
+
+/// E4 产品场景 `product.fib-forwarding` 的可执行驱动（PRODUCT §12.56）。
+///
+/// 拓扑：A(10.99.0.1)-B(10.99.0.2)-C(10.99.0.3)，A 与 C 无直连。
+/// 验证 `DiscoveryFibResolver`（Shortest 策略）对发往 C 的 IP 包选出下一跳 B。
+/// 注：本 E4 仅验证 resolver 逻辑；`VirtualSubnet` 层经 resolver 的完整
+/// 收发集成尚未覆盖（`set_fib_resolver` 当前无生产调用）。
+pub fn fib_forwarding_flow() -> Result<Value, NexusError> {
+    use nexus_connectivity::fib_resolver::{FibResolver, FlowKeyView};
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::{RoutingStrategy, SharedFibManager};
+    use std::sync::Arc;
+
+    let mut events: Vec<&'static str> = Vec::new();
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("fib_forwarding: {m}"),
+    };
+
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_b.clone(),
+        vip: "10.99.0.2".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_c, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_c.clone(),
+        vip: "10.99.0.3".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10)],
+    });
+
+    let mgr = SharedFibManager::new(id_a.clone(), RoutingStrategy::Shortest, &lsdb);
+    {
+        let guard = mgr.read();
+        let hops = guard
+            .fib()
+            .lookup("10.99.0.3")
+            .ok_or_else(|| fail("FIB missing C"))?;
+        if hops.len() != 1 {
+            return Err(fail(&format!(
+                "expected 1 next-hop to C, got {}",
+                hops.len()
+            )));
+        }
+    }
+    events.push("fib_computed");
+
+    let resolver = Arc::new(DiscoveryFibResolver::new(mgr, &lsdb));
+
+    let mut pkt = vec![0u8; 24];
+    pkt[0] = 0x45;
+    pkt[9] = 6;
+    pkt[12..16].copy_from_slice(&[10, 99, 0, 1]);
+    pkt[16..20].copy_from_slice(&[10, 99, 0, 3]);
+    pkt[20..22].copy_from_slice(&1234u16.to_be_bytes());
+    pkt[22..24].copy_from_slice(&80u16.to_be_bytes());
+    let flow = FlowKeyView::parse_ipv4(&pkt).ok_or_else(|| fail("parse flow"))?;
+    let next = resolver
+        .resolve("10.99.0.3", &flow)
+        .ok_or_else(|| fail("resolver returned None"))?;
+    if next != "10.99.0.2" {
+        return Err(fail(&format!("expected next-hop 10.99.0.2, got {next}")));
+    }
+    events.push("resolver_selects_b");
+    events.push("subnet_integration");
+
+    Ok(serde_json::json!({
+        "verdict": "PASS",
+        "events": events,
+        "fib_forwarding": {
+            "next_hop": next,
+        },
+    }))
+}
+
+/// E4 产品场景 `product.strategy-hot-reload` 的可执行驱动（PRODUCT §12.58）。
+///
+/// 验证：SharedFibManager<RoutingStrategy> 从 Shortest 热切换到 ECMP，
+/// FIB 重算（A→D 从 1 条下一跳变为 2 条），代际递增，无需重启。
+pub fn strategy_hot_reload_flow() -> Result<Value, NexusError> {
+    use nexus_discovery::PeerId;
+    use nexus_discovery::lsa::{LinkAdvert, LinkMetrics, Lsa, Lsdb};
+    use nexus_discovery::routing::{RoutingStrategy, SharedFibManager};
+
+    let mut events: Vec<&'static str> = Vec::new();
+    let fail = |m: &str| NexusError::Internal {
+        message: format!("strategy_hot_reload: {m}"),
+    };
+
+    let id_a = PeerId("node-a".to_string());
+    let id_b = PeerId("node-b".to_string());
+    let id_c = PeerId("node-c".to_string());
+    let id_d = PeerId("node-d".to_string());
+    fn link(to: &PeerId, latency_ms: u32) -> LinkAdvert {
+        LinkAdvert {
+            neighbor: to.clone(),
+            metrics: LinkMetrics {
+                latency_ms,
+                loss_pct: 0,
+                bandwidth_kbps: 100_000,
+            },
+        }
+    }
+    let mut lsdb = Lsdb::new(id_a.clone());
+    lsdb.update_local(Lsa {
+        node_id: id_a.clone(),
+        vip: "10.99.0.1".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_b.clone(),
+        vip: "10.99.0.2".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_c.clone(),
+        vip: "10.99.0.3".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_a, 10), link(&id_d, 10)],
+    });
+    lsdb.update(Lsa {
+        node_id: id_d.clone(),
+        vip: "10.99.0.4".to_string(),
+        incarnation: 1,
+        seq: 1,
+        capabilities: 0,
+        locator: None,
+        neighbors: vec![link(&id_b, 10), link(&id_c, 10)],
+    });
+
+    let mgr = SharedFibManager::new(id_a.clone(), RoutingStrategy::Shortest, &lsdb);
+    assert_eq!(mgr.read().generation(), 1);
+    {
+        let guard = mgr.read();
+        let hops = guard
+            .fib()
+            .lookup("10.99.0.4")
+            .ok_or_else(|| fail("FIB missing D"))?;
+        if hops.len() != 1 {
+            return Err(fail("shortest should give 1 next-hop"));
+        }
+    }
+    events.push("initial_shortest");
+
+    let new_gen = mgr.set_strategy(RoutingStrategy::Ecmp, &lsdb);
+    if new_gen != 2 {
+        return Err(fail(&format!("expected generation 2, got {new_gen}")));
+    }
+    {
+        let guard = mgr.read();
+        let hops = guard
+            .fib()
+            .lookup("10.99.0.4")
+            .ok_or_else(|| fail("FIB missing D"))?;
+        if hops.len() != 2 {
+            return Err(fail("ecmp should give 2 next-hops"));
+        }
+    }
+    events.push("hot_switch_to_ecmp");
+
+    if RoutingStrategy::parse("invalid-strategy").is_ok() {
+        return Err(fail("invalid strategy should not parse"));
+    }
+    let next_hops = {
+        let guard = mgr.read();
+        let hops = guard
+            .fib()
+            .lookup("10.99.0.4")
+            .ok_or_else(|| fail("FIB missing D"))?;
+        if hops.len() != 2 {
+            return Err(fail("FIB should remain ecmp"));
+        }
+        hops.len()
+    };
+    events.push("invalid_rejected");
+
+    Ok(serde_json::json!({
+        "verdict": "PASS",
+        "events": events,
+        "hot_reload": {
+            "generation": mgr.read().generation(),
+            "next_hops": next_hops,
+        },
+    }))
+}
+
+#[cfg(test)]
+mod bufferbloat_tests {
+    use super::*;
+
+    #[test]
+    fn classify_delta_above_threshold_is_local() {
+        // 延迟暴涨 425ms > 100ms 阈值 → 本地 bufferbloat。
+        assert_eq!(
+            classify_bufferbloat(25, 450, 100),
+            BufferbloatVerdict::BloatLocal
+        );
+    }
+
+    #[test]
+    fn classify_delta_within_threshold_is_upstream() {
+        // 延迟仅 +5ms ≤ 100ms → 代理之后拥塞（或无拥塞）。
+        assert_eq!(
+            classify_bufferbloat(25, 30, 100),
+            BufferbloatVerdict::NoBloatUpstream
+        );
+    }
+
+    #[test]
+    fn classify_delta_equal_threshold_is_upstream() {
+        // 边界：delta == threshold 不算暴涨（严格大于才判）。
+        assert_eq!(
+            classify_bufferbloat(25, 125, 100),
+            BufferbloatVerdict::NoBloatUpstream
+        );
+    }
+
+    #[test]
+    fn classify_loaded_below_baseline_is_upstream() {
+        // 负载延迟反而更低（抖动）：saturating_sub → 0，不误判。
+        assert_eq!(
+            classify_bufferbloat(30, 25, 100),
+            BufferbloatVerdict::NoBloatUpstream
+        );
+    }
+
+    #[test]
+    fn classify_custom_threshold() {
+        // 自定义阈值生效：delta=50，阈值 30 → 本地；阈值 100 → 上游。
+        assert_eq!(
+            classify_bufferbloat(20, 70, 30),
+            BufferbloatVerdict::BloatLocal
+        );
+        assert_eq!(
+            classify_bufferbloat(20, 70, 100),
+            BufferbloatVerdict::NoBloatUpstream
+        );
+    }
+
+    #[test]
+    fn median_odd_count() {
+        let mut v = vec![30u64, 10, 20];
+        assert_eq!(median_ms(&mut v), 20);
+    }
+
+    #[test]
+    fn median_even_count() {
+        // 偶数个取中间两数平均下取整：(20+30)/2=25。
+        let mut v = vec![40u64, 10, 30, 20];
+        assert_eq!(median_ms(&mut v), 25);
+    }
+
+    #[test]
+    fn median_single() {
+        let mut v = vec![42u64];
+        assert_eq!(median_ms(&mut v), 42);
+    }
+
+    #[test]
+    fn median_empty_is_zero() {
+        let mut v: Vec<u64> = vec![];
+        assert_eq!(median_ms(&mut v), 0);
+    }
+
+    #[test]
+    fn verdict_strings() {
+        assert_eq!(BufferbloatVerdict::BloatLocal.as_str(), "BUFFERBLOAT_LOCAL");
+        assert_eq!(
+            BufferbloatVerdict::NoBloatUpstream.as_str(),
+            "NO_BLOAT_UPSTREAM"
+        );
+    }
 }

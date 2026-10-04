@@ -26,7 +26,7 @@ use nexus_session::{
     SessionReconcileError, SessionRecord, SessionRecordStore, reconcile_session_records,
 };
 use nexus_storage::{InMemoryContentStore, ObjectId};
-use nexus_workspace::{Change, CommitId, JournalReconcileReport, Workspace, WorkspaceId};
+use nexus_workspace::{AuthorId, Change, JournalReconcileReport, Workspace, WorkspaceId};
 
 /// 事件常量（与场景 expect 的 events.0..3 一一对应，顺序即被冻结的顺序契约）。
 const EV_RECONCILIATION_STARTED: &str = "reconciliation_started";
@@ -98,14 +98,21 @@ fn run_flow() -> Result<FlowReport, String> {
         session: session_id.clone(),
         phase: LifecyclePhase::Active,
         outcome: TerminalOutcome::Unfinished,
+        plan_snapshot: None,
+        detached_at_unix: None,
     });
 
     // 2) Workspace 写前日志：登记提交 C1（a.txt），随后“进程崩溃”，C1 未落 DAG。
-    let mut ws =
-        Workspace::init(ws_id.clone(), InMemoryContentStore::new()).map_err(|e| e.to_string())?;
+    let mut ws = Workspace::init(
+        ws_id.clone(),
+        InMemoryContentStore::new(),
+        AuthorId("node-local".into()),
+    )
+    .map_err(|e| e.to_string())?;
+    let genesis = ws.heads().heads[0].clone();
     let pending = ws
         .journal_pending(
-            &CommitId("C0".into()),
+            &genesis,
             &[Change {
                 path: "a.txt".into(),
                 content: b"crash-a".to_vec(),
@@ -121,7 +128,8 @@ fn run_flow() -> Result<FlowReport, String> {
     events.push(EV_RECONCILIATION_STARTED);
 
     // 3) 从 durable state 恢复 Workspace，回放写前日志（redo 中断写入）。
-    let mut restored = Workspace::open(ws_id, store, &state_root).map_err(|e| e.to_string())?;
+    let mut restored = Workspace::open(ws_id, store, &state_root, AuthorId("node-local".into()))
+        .map_err(|e| e.to_string())?;
     let journal = restored.reconcile_journal().map_err(|e| e.to_string())?;
     events.push(EV_WORKSPACE_JOURNAL_RECONCILED);
 

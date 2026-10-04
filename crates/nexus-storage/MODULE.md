@@ -44,8 +44,30 @@
 - 默认最小 surface：`private -> pub(crate) -> pub`。
 - Public API 变更必须保持结构化、可版本化并有调用方验证。
 - 本骨架只提供最小编译锚点；业务 API 在实现阶段增量添加。
+- `FsContentStore`（C1，`fs.rs`）：落盘 CAS（`<dir>/<object-id>` 扁平布局；
+  temp+fsync+rename 原子写，crash-consistent）；`stored_at` 取文件 mtime，
+  供 `ReachabilityGc::sweep_older_than` 保留期使用；`delete_object` 语义与
+  `InMemoryContentStore` 一致（两阶段 GC 由调用方保证）。
+- `FileKvStore`（N2 P0-1，`kv.rs`，**新增；不碰 ContentStore/FNV-1a**）：
+  小体量键值状态的 crash-consistent 持久化（节点身份、grant 表快照、审计日志）。
+  `put` 原子写（tmp `create_new` + write + fsync(file) + rename + fsync(dir)，
+  照抄 `fs.rs::atomic_write` 模式）；键文件名转义（`[A-Za-z0-9._-]` 原样、
+  其余 `%XX`，防目录穿越）；`journal_append` write-ahead（`[len:u32 LE][payload]`
+  + fsync，返回单调 seq）/`journal_replay`（boot 重放；尾部撕裂 → fail-closed
+  `TornJournalTail`，需 `journal_discard_torn_tail` 显式丢弃）/`journal_truncate`。
+  本 crate 保持 portable-core（仅 std）：目录权限收紧由调用方在平台侧做。
 
 ## Verification
+
+### N3 持久与内容契约增补（待实现）
+
+Task/幂等索引/pin intent 的 atomic publish 或 journal 事务由组合根通过存储适配器实现；
+只有持久提交后才能 ack accepted。保留现有 torn-tail fail-closed 语义。
+N3 Snapshot/Artifact 使用版本化 SHA-256 命名空间/映射，验证内容摘要和长度后发布，
+不同 SHA-256 内容不能因既有 FNV ID 相同而覆盖。旧 CAS/Commit 格式保持不变。
+TaskOutcome 与 pin 生命周期决策分别归 Compute/Workspace，storage 不反向依赖它们。
+规范：`docs/N3-MODEL-CONTRACT.md` §3/4/6；场景 `n3-idempotency`、
+`n3-artifact-resume`、`n3-gc-roots`、`n3-crash-reconcile`。
 
 最低：
 

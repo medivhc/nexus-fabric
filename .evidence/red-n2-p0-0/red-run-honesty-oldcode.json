@@ -1,0 +1,120 @@
+[
+  {
+    "id": "product.daemon-run-remote-service-flow",
+    "verdict": "FAIL",
+    "detail": "expect product.daemon-run-remote-service-flow.run.session_id failed (actual: 'sess-18daedeb7e2166ae')",
+    "expects": [
+      {
+        "field": "verdict",
+        "ok": true,
+        "actual": "PASS"
+      },
+      {
+        "field": "run.resource",
+        "ok": true,
+        "actual": "service"
+      },
+      {
+        "field": "run.session_id",
+        "ok": false,
+        "actual": "'sess-18daedeb7e2166ae'"
+      },
+      {
+        "field": "run.plan_id",
+        "ok": false,
+        "actual": "None"
+      },
+      {
+        "field": "run.outcome",
+        "ok": true,
+        "actual": "Completed"
+      },
+      {
+        "field": "run.connectivity.status",
+        "ok": true,
+        "actual": "Connected"
+      }
+    ]
+  },
+  {
+    "id": "product.daemon-run-with-command",
+    "verdict": "FAIL",
+    "detail": "expect product.daemon-run-with-command.verdict failed (actual: 'PASS')",
+    "expects": [
+      {
+        "field": "verdict",
+        "ok": false,
+        "actual": "'PASS'"
+      },
+      {
+        "field": "error.code",
+        "ok": false,
+        "actual": "None"
+      },
+      {
+        "field": "error.feature",
+        "ok": false,
+        "actual": "None"
+      },
+      {
+        "field": "error.layer",
+        "ok": false,
+        "actual": "None"
+      }
+    ]
+  },
+  {
+    "id": "product.daemon-run-workspace-flow",
+    "verdict": "PASS",
+    "detail": "all expects passed",
+    "expects": [
+      {
+        "field": "verdict",
+        "ok": true,
+        "actual": "FAIL"
+      },
+      {
+        "field": "error.code",
+        "ok": true,
+        "actual": "UNSUPPORTED"
+      },
+      {
+        "field": "error.message",
+        "ok": true,
+        "actual": "unsupported feature: run workspace"
+      }
+    ]
+  },
+  {
+    "id": "product.cli-run-command",
+    "verdict": "PASS",
+    "detail": "all expects passed",
+    "expects": [
+      {
+        "field": "verdict",
+        "ok": true,
+        "actual": "PASS"
+      },
+      {
+        "field": "run.resource",
+        "ok": true,
+        "actual": "service"
+      },
+      {
+        "field": "run.session_id",
+        "ok": true,
+        "actual": "sess-18daedebb258bc66"
+      },
+      {
+        "field": "run.connectivity.status",
+        "ok": true,
+        "actual": "Connected"
+      },
+      {
+        "field": "run.outcome",
+        "ok": true,
+        "actual": "Completed"
+      }
+    ]
+  }
+]

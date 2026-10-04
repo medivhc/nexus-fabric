@@ -11,7 +11,6 @@
 #![forbid(unsafe_code)]
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
 
 use nexus_connectivity::{ConnectivityError, OutboundAdapter, OutboundHandoff};
 use sha2::{Digest, Sha224};
@@ -419,11 +418,14 @@ pub fn client_config_dangerous_skip_verify(alpn: &[&[u8]]) -> Result<ClientConfi
 
 /// 在已建立的 TLS stream 上写一段字节（flush）。
 ///
+/// 泛型化以支持插件 wrapped 流（TLS 跑在混淆流之上）；对 `TcpStream` 的既有
+/// 调用保持兼容（P6）。
+///
 /// # Errors
 ///
 /// I/O 失败返回 `Io`。
-pub fn tls_write(
-    tls: &mut rustls::Stream<'_, rustls::ClientConnection, TcpStream>,
+pub fn tls_write<T: Read + Write>(
+    tls: &mut rustls::Stream<'_, rustls::ClientConnection, T>,
     buf: &[u8],
 ) -> Result<(), TrojanError> {
     tls.write_all(buf)?;
@@ -433,11 +435,13 @@ pub fn tls_write(
 
 /// 从 TLS stream 读满 `out.len()` 字节。
 ///
+/// 泛型化以支持插件 wrapped 流；对 `TcpStream` 的既有调用保持兼容（P6）。
+///
 /// # Errors
 ///
 /// 连接过早关闭或 I/O 失败返回 `Io`。
-pub fn tls_read_exact(
-    tls: &mut rustls::Stream<'_, rustls::ClientConnection, TcpStream>,
+pub fn tls_read_exact<T: Read + Write>(
+    tls: &mut rustls::Stream<'_, rustls::ClientConnection, T>,
     out: &mut [u8],
 ) -> Result<(), TrojanError> {
     tls.read_exact(out)?;

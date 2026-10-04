@@ -9,7 +9,9 @@ resolver = "memory-mock"
 snapshot_api = "DnsRuntime::cache_snapshot / negative_cache_snapshot"
 
 [when]
-command = "cargo run --quiet -p nexusd -- dns cache --json"
+# CLI 统一重构（01e5114）后观察命令走 daemon LocalAPI；harness 不负责起 daemon，
+# 故用 localapi_probe 自包含起临时 daemon 查一次（等价于旧 `nexusd <cmd> --json` 进程内快照）。
+command = "cargo run --quiet -p nexusd --example localapi_probe -- --path /localapi/v0/dns/cache"
 
 [[expect]]
 field = "verdict"

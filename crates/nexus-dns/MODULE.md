@@ -157,6 +157,73 @@ Public API 变更必须保持结构化、可版本化并有调用方验证。
 - 不变量：跨 server 同名查询不共享缓存；既有单 server `DnsRuntime` 语义与既有 DNS 冻结场景零回归。
 - 离线确定性：缓存由 Composition Root 注入的 mock `Resolver` 产生，本层不发起真实网络。
 
+## 统一 DNS（S-unified，2026-10-01 冻结）
+
+### Responsibility（新增）
+
+`nexusd` 的单一 DNS 服务：对 TUN `dns-hijack` 导入的查询做统一分类，按
+`mesh 域名 > 代理规则（fake-ip）> 直连上游` 顺序应答。
+
+### 组件
+
+- `DnsUnifiedConfig`：`upstream: Vec<String>`（dns.toml 声明，由 Composition Root
+  消费以构造注入的上游 `Resolver`）、`fake_ip_enabled: bool`、
+  `fake_ip_network: u32` + `fake_ip_prefix: u8`（默认 `198.18.0.0/15`，构造时
+  掩码归一化）、`mesh_suffix: String`（默认 `"mesh"`）、
+  `fake_ip_ttl_secs: u64`、`hosts: Vec<(String, IpAddr)>`（自定义 hosts，最高优先级）。
+- `FakeIpPool`：fake-ip 分配池。`allocate(domain, now_secs) -> Ipv4Addr`；
+  `lookup(ip) -> Option<String>` 反查域名；`reclaim_expired(now_secs)` 回收
+  TTL 过期的映射；同一域名在 TTL 内重复分配返回同一 IP。
+- `MeshNameResolver` trait：`resolve_mesh(name) -> Option<IpAddr>`，由
+  Composition Root 注入（peer 主机名 → 虚拟网 IP）。
+- `ProxyClassifier` trait：`is_proxied(domain) -> bool`，由 Composition Root
+  注入（通常包装 `nexus-proxy` 的 `RuleEngine`）。Deletion Test：若删除该
+  trait，`nexus-dns` 将被迫直接依赖 `nexus-proxy`（违反 Forbidden
+  Dependencies），故抽象成立。
+- `UnifiedDns`：`resolve(query, now_secs) -> Result<UnifiedAnswer, DnsError>`；
+  `classify(name) -> DnsClass`（`Hosts | Mesh | FakeIp | Upstream`）。
+
+### Invariants（S-unified）
+
+- 分类顺序：`hosts` 精确匹配 > `*.{mesh_suffix}`（含 peer 主机名经
+  `MeshNameResolver`）> `ProxyClassifier::is_proxied` 为真 → fake-ip >
+  否则上游 `Resolver`。
+- Fake-IP 范围：分配的地址必须落在 `fake_ip_range` 内（默认
+  `198.18.0.0/15`）；`FakeIpPool::new` 对非规范 CIDR 做掩码归一化；
+  `fake_ip_enabled = false` 时代理类域名走上游解析（不分配 fake-ip）。
+- 分配确定性：同一 `(domain, qtype=A)` 在 TTL 窗口内重复查询返回同一
+  fake-ip，不消耗新地址；AAAA 查询不分配 fake-ip（返回空应答）。
+- 反查一致性：`lookup(allocate(d)) == Some(d)`；过期回收后 `lookup` 返回
+  `None`，且该 IP 可被重新分配。
+- 回收：`reclaim_expired(now)` 只回收 `expires_at <= now` 的条目；未过期
+  条目不受影响。
+- 上游隔离：mesh/fake-ip/hosts 命中的查询不得调用上游 `Resolver`
+  （`resolver_call_count() == 0` 可观测）。
+- 时间注入：`now_secs` 由调用方显式传入；不读系统时钟。
+- 离线确定性：`MeshNameResolver` / `ProxyClassifier` / 上游 `Resolver`
+  均由 Composition Root 注入；本层不发起真实网络、不碰 TUN。
+
+### Public API（新增）
+
+```text
+struct DnsUnifiedConfig { upstream, fake_ip_enabled, fake_ip_network, fake_ip_prefix, mesh_suffix, fake_ip_ttl_secs, hosts }
+struct FakeIpPool { new(network, prefix, ttl_secs), allocate(domain, now_secs), lookup(ip), reclaim_expired(now_secs), contains(ip), len(), capacity() }
+trait MeshNameResolver { resolve_mesh(name) -> Option<IpAddr> }
+trait ProxyClassifier { is_proxied(domain) -> bool }
+enum DnsClass { Hosts, Mesh, FakeIp, Upstream }  // as_str() 稳定表达
+struct UnifiedAnswer { name, class: DnsClass, records: Vec<IpAddr>, from_cache: bool }
+struct UnifiedDns { new(config, mesh, classifier, upstream), resolve(query, now_secs), classify(name),
+                    reverse_lookup(ip), reclaim_expired(now_secs),
+                    upstream_call_count(), fake_ip_count() }
+```
+
+### Verification（新增）
+
+```text
+cargo test -p nexus-dns unified
+scenarios/product/dns_unified.toml
+```
+
 ## Verification
 
 最低：

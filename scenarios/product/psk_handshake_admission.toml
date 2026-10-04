@@ -1,0 +1,46 @@
+schema_version = 1
+id = "product.psk-handshake-admission"
+title = "PSK 网络准入：同 PSK 建连 -> 异 PSK/单边无 PSK 建连失败"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-psk-admission"
+
+[given]
+key_derivation = "X25519 triple-DH + HKDF-SHA256, salt = nexus-link-encryption-v2 || psk"
+admission = "same PSK -> working session; different/absent PSK -> first AEAD frame DecryptionFailed"
+
+# 可执行 E4：纯内存双端握手，零真实网络
+# 事件序列（冻结）：
+#   psk_handshake_completed   双方同 PSK -> 握手完成
+#   psk_data_frame_decrypted  同 PSK 会话 -> 数据帧往返解密成功
+#   psk_mismatch_rejected     双方异 PSK -> 数据帧解密失败 DecryptionFailed
+#   psk_absent_rejected       一方有 PSK 一方无 -> 数据帧解密失败 DecryptionFailed
+[when]
+command = "cargo run --quiet -p nexus --example psk_handshake_admission -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "events.0"
+equals = "psk_handshake_completed"
+
+[[expect]]
+field = "events.1"
+equals = "psk_data_frame_decrypted"
+
+[[expect]]
+field = "events.2"
+equals = "psk_mismatch_rejected"
+
+[[expect]]
+field = "events.3"
+equals = "psk_absent_rejected"
+
+[[expect]]
+field = "mismatch.error"
+equals = "DecryptionFailed"
+
+[[expect]]
+field = "absent.error"
+equals = "DecryptionFailed"
