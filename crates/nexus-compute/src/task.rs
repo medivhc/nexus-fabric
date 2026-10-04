@@ -131,6 +131,10 @@ fn scope_of(c: &AcceptedContract) -> IdempotencyScope {
 /// and durably publish the entire image before returning a newly accepted Task.
 /// A failed commit can be ambiguous: the caller retries the same scoped key.
 /// No in-memory-only fallback or automatic task execution is permitted.
+/// Prior accepted records are immutable and retained. A transaction appends one
+/// accepted record with replayed=false, or changes nothing with replayed=true;
+/// its returned record must exist exactly in the image and current scoped index. Any runtime authority
+/// sharing the store must be validated against the updated image before publish.
 pub trait TaskAcceptanceStore {
     fn read(&self) -> Result<AcceptanceLedger, TaskError>;
     fn transact(
@@ -160,8 +164,8 @@ pub struct AcceptanceContext {
 /// Provider acceptance owner. Backend transactions serialize every owner sharing
 /// the store. N3-1 only accepts immutable Waiting records; it cannot spawn work.
 pub struct TaskOwner<S> {
-    store: S,
-    hash: DigestFn,
+    pub(crate) store: S,
+    pub(crate) hash: DigestFn,
     next_id: fn() -> Result<TaskId, TaskError>,
 }
 impl<S: TaskAcceptanceStore> TaskOwner<S> {
@@ -329,6 +333,7 @@ macro_rules! record_codec {
         }
     }
 }
+pub(crate) use record_codec;
 record_codec!(AcceptedTask {
     view: TaskView,
     input_pin_intent: SnapshotRef

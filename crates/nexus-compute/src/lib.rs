@@ -8,6 +8,8 @@
 
 /// N3 provider-owned durable acceptance; separate from legacy job sessions.
 pub mod task;
+/// Provider execution facts replayed from durable events; no OS calls.
+pub mod task_runtime;
 
 /// 计算作业会话阶段（冻结契约，scenarios/product/remote_compute_job_flow.toml）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

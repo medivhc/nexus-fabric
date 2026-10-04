@@ -15,5 +15,10 @@ pub mod sync_transport;
 pub mod workspace;
 
 pub mod snapshot_store;
+/// Provider-internal Linux execution adapter; no public protocol routes.
+#[cfg(target_os = "linux")]
+pub mod task_executor;
+#[cfg(target_os = "linux")]
+mod task_runtime_store;
 /// N3-1 acceptance persistence, not yet connected to daemon product routes.
 pub mod task_store;

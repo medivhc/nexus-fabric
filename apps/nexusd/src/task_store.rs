@@ -14,6 +14,10 @@ use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
 
+#[cfg(target_os = "linux")]
+pub(crate) const RUNTIME_AUTHORITY_RECEIPT: &[u8] =
+    b"n3-acceptance-initialized-v1\nruntime-v1-required\n";
+
 /// Linux provider acceptance store. All handles/processes lock one stable inode.
 /// The parent must already exist; one image atomically publishes Task/index/pin.
 /// Directory sync errors are returned, including after rename (ambiguous commit).
@@ -33,6 +37,7 @@ impl FileTaskAcceptanceStore {
     ) -> Result<R, TaskError> {
         let _lock = self.lock()?;
         let ledger = self.load()?;
+        crate::task_runtime_store::load_and_validate(&self.root, &ledger)?;
         sync_directory(&self.root)?;
         operation(&self.root, &ledger)
     }
@@ -83,7 +88,8 @@ impl FileTaskAcceptanceStore {
         }
         let _lock = store.lock()?;
         store.initialize()?;
-        store.load()?;
+        let ledger = store.load()?;
+        crate::task_runtime_store::initialize(&store.root, &ledger)?;
         sync_directory(&store.root)?;
         Ok(store)
     }
@@ -116,7 +122,7 @@ impl FileTaskAcceptanceStore {
                 let mut bytes = Vec::new();
                 file.read_to_end(&mut bytes)
                     .map_err(|e| io_error(&receipt, e))?;
-                if bytes != RECEIPT {
+                if bytes != RECEIPT && bytes != RUNTIME_AUTHORITY_RECEIPT {
                     return Err(TaskError::new(
                         TaskErrorCode::StateCorrupt,
                         "corrupt acceptance initialization receipt",
@@ -136,15 +142,25 @@ impl FileTaskAcceptanceStore {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Initialize a fresh empty image before exposing any handle. A
-                // published receipt or N3 content namespace proves prior state;
+                // published receipt, N3 content or runtime authority proves prior state;
                 // missing authority there is corruption, never a new provider.
-                let content = self.root.join("content-sha256-v1");
-                let has_content = match fs::symlink_metadata(&content) {
-                    Ok(_) => true,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-                    Err(e) => return Err(io_error(&content, e)),
-                };
-                if initialized || has_content {
+                let mut has_authority = false;
+                for name in [
+                    "content-sha256-v1",
+                    "task-runtime-v1.json",
+                    "task-runtime-initialized-v1",
+                ] {
+                    let path = self.root.join(name);
+                    match fs::symlink_metadata(&path) {
+                        Ok(_) => {
+                            has_authority = true;
+                            break;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(io_error(&path, e)),
+                    }
+                }
+                if initialized || has_authority {
                     return Err(TaskError::new(
                         TaskErrorCode::StateCorrupt,
                         "initialized acceptance image is missing",
@@ -355,6 +371,7 @@ impl TaskAcceptanceStore for FileTaskAcceptanceStore {
         {
             let _lock = self.lock()?;
             let ledger = self.load()?;
+            crate::task_runtime_store::load_and_validate(&self.root, &ledger)?;
             sync_directory(&self.root)?;
             Ok(ledger)
         }
@@ -375,8 +392,44 @@ impl TaskAcceptanceStore for FileTaskAcceptanceStore {
         {
             let _lock = self.lock()?;
             let mut ledger = self.load()?;
+            let runtime = crate::task_runtime_store::load_and_validate(&self.root, &ledger)?;
             let original = ledger.clone();
             let result = update(&mut ledger)?;
+            ledger.validate(sha256)?;
+            let tasks: BTreeMap<_, _> = ledger.tasks.iter().map(|t| (&t.view.task_id, t)).collect();
+            if original
+                .tasks
+                .iter()
+                .any(|t| tasks.get(&t.view.task_id).copied() != Some(t))
+            {
+                return Err(TaskError::new(
+                    TaskErrorCode::StateCorrupt,
+                    "accepted records cannot be removed or replaced",
+                    false,
+                ));
+            }
+            let previously_accepted = original
+                .tasks
+                .iter()
+                .any(|t| t.view.task_id == result.task.view.task_id);
+            if tasks.get(&result.task.view.task_id).copied() != Some(&result.task)
+                || !ledger
+                    .idempotency
+                    .iter()
+                    .any(|entry| entry.task_id == result.task.view.task_id)
+                || result.replayed != previously_accepted
+                || (result.replayed && ledger != original)
+                || (!result.replayed && ledger.tasks.len() != original.tasks.len() + 1)
+            {
+                return Err(TaskError::new(
+                    TaskErrorCode::StateCorrupt,
+                    "acceptance acknowledgment differs from one new record or unchanged replay",
+                    false,
+                ));
+            }
+            // Recheck the coupled authority after the callback, before writing.
+            // The common flock keeps this loaded runtime image stable throughout.
+            runtime.validate(&ledger)?;
             if ledger != original {
                 self.publish(&ledger)?;
             } else {

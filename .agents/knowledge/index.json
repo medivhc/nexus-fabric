@@ -254,5 +254,21 @@
     "module": "nexus-workspace / nexus-storage / apps/nexusd",
     "category": "implementation-pattern",
     "summary": "SHA-256 内容空间使用接受记录驱动的持久根，GC 与接受共享锁；初始化后缺失根索引 fail closed。"
+  },
+  {
+    "id": "n3-runtime-start-authority",
+    "file": "entries/2026-10-04-n3-runtime-start-authority.md",
+    "date": "2026-10-04",
+    "module": "nexus-compute / apps/nexusd",
+    "category": "implementation-pattern",
+    "summary": "运行事件绑定不可变接受摘要，StartIntent 重放不授权重启；日志恢复、接受及 GC 共锁，升级 authority receipt 区分迁移与运行日志丢失。"
+  },
+  {
+    "id": "n3-linux-executor-boundaries",
+    "file": "entries/2026-10-04-n3-linux-executor-boundaries.md",
+    "date": "2026-10-04",
+    "module": "apps/nexusd",
+    "category": "implementation-pitfall",
+    "summary": "Docker tmpfs 真实数据与归档视图、私有输入的 UID/umask、大输出控制/drain 死锁；非 root 传递、受控归档、owner lease 和 SIGKILL 后阻断重跑。"
   }
 ]
