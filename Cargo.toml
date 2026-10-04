@@ -39,6 +39,7 @@ members = [
   "crates/nexus-outbound-vmess",
   "crates/nexus-outbound-trojan",
   "crates/nexus-outbound-anytls",
+  "crates/nexus-outbound-vless",
   "crates/nexus-fabric",
   "crates/nexus-proxy-transport",
   "crates/nexus-path",

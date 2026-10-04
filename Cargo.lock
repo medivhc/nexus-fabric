@@ -934,6 +934,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-outbound-vless"
+version = "0.1.0"
+dependencies = [
+ "nexus-connectivity",
+]
+
+[[package]]
 name = "nexus-outbound-vmess"
 version = "0.1.0"
 dependencies = [
