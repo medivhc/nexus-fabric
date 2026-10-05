@@ -887,6 +887,16 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
                     "hysteria2 outbound requires a locator (host:port)",
                 ));
             }
+            // WARN5: obfs 枚举校验——只允许已知值，拼写错误直接报错，
+            // 防止绕过 salamander 密码必填检查。
+            if let Some(ob) = o.obfs.as_deref() {
+                if !ob.is_empty() && ob != "salamander" {
+                    return Err(ConfigError::new(
+                        format!("outbounds[{}].obfs", o.tag),
+                        format!("hysteria2 unknown obfs '{ob}'; allowed: salamander"),
+                    ));
+                }
+            }
             if let Some(ob) = o.obfs.as_deref() {
                 if ob == "salamander"
                     && o.obfs_password
@@ -2314,5 +2324,28 @@ mod subscription_online_tests {
         ] {
             assert_eq!(RuleKind::parse(kind.as_str()).unwrap(), kind);
         }
+    }
+}
+
+#[cfg(test)]
+mod warn5_obfs_validation_tests {
+    use super::*;
+
+    fn hy2_yaml(obfs: &str) -> String {
+        format!(
+            "schema_version: 1\nrules:\n  - tag: m\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: h\noutbounds:\n  - tag: h\n    kind: hysteria2\n    locator: 127.0.0.1:443\n    password: secret123\n    obfs: {obfs}\n    obfs_password: s3cr3t\n"
+        )
+    }
+
+    // WARN5: obfs 拼写错误直接报错，不绕过 salamander 密码检查。
+    #[test]
+    fn hy2_obfs_typo_rejected() {
+        let err = parse(&hy2_yaml("salamandar")).unwrap_err();
+        assert!(err.reason.contains("unknown obfs"), "got: {}", err.reason);
+    }
+
+    #[test]
+    fn hy2_obfs_salamander_ok() {
+        assert!(parse(&hy2_yaml("salamander")).is_ok());
     }
 }

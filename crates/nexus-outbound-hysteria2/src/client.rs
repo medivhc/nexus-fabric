@@ -318,3 +318,11 @@ impl Hysteria2Client {
             .close(self.handle, &mut self.conn, 0, b"client close");
     }
 }
+
+// WARN4: Drop 保证错误路径也发送 CONNECTION_CLOSE，避免服务端状态残留到 idle 超时。
+// 显式 close() 后再 drop 会发第二次 CLOSE，quinn 侧幂等，无害。
+impl Drop for Hysteria2Client {
+    fn drop(&mut self) {
+        self.close();
+    }
+}

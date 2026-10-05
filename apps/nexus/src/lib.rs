@@ -5276,6 +5276,17 @@ pub fn proxy_serve_once(
                     reason: format!("anytls node connect {locator} failed: {e}"),
                 }
             })?;
+            // WARN1: handshake timeout (10s) -- silent server fail-closed.
+            raw.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .map_err(|e| NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: format!("anytls set read timeout failed: {e}"),
+                })?;
+            raw.set_write_timeout(Some(std::time::Duration::from_secs(10)))
+                .map_err(|e| NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: format!("anytls set write timeout failed: {e}"),
+                })?;
             let raw_nb = raw.try_clone().map_err(|e| NexusError::Internal {
                 message: format!("anytls node clone for nonblocking: {e}"),
             })?;
@@ -5554,6 +5565,17 @@ pub fn proxy_serve_once(
                     reason: format!("vless node connect {locator} failed: {e}"),
                 }
             })?;
+            // WARN1: handshake timeout (10s) -- silent server fail-closed.
+            raw.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .map_err(|e| NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: format!("vless set read timeout failed: {e}"),
+                })?;
+            raw.set_write_timeout(Some(std::time::Duration::from_secs(10)))
+                .map_err(|e| NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: format!("vless set write timeout failed: {e}"),
+                })?;
             let raw_nb = raw.try_clone().map_err(|e| NexusError::Internal {
                 message: format!("vless node clone for nonblocking: {e}"),
             })?;
@@ -5674,8 +5696,8 @@ pub fn proxy_serve_once(
                         message: format!("vless client nonblocking: {e}"),
                     })?;
                 let (up, down) = vless_pump_stream(&mut tls, &mut client);
-                // 尽力向节点发送 close_notify（不阻断结果）。
-                conn.send_close_notify();
+                // WARN3: TLS close_notify 仅排队不发送（无 flush），删掉误导性调用；
+                // 连接由 drop 关闭（TCP FIN），满足 fail-closed。
                 (up, down)
             } else {
                 // 明文 TCP：直接在 wrapped 流上握手 + 中继。

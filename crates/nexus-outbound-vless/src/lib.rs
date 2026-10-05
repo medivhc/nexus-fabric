@@ -1760,3 +1760,27 @@ mod tests {
         assert!(VlessAdapter::from_config(&bad).is_err());
     }
 }
+
+#[cfg(test)]
+mod warn2_failure_path_tests {
+    use super::*;
+
+    // WARN2: 非法 UUID → 握手拒绝（fail-closed，不回显输入）。
+    #[test]
+    fn invalid_uuid_rejected() {
+        for bad in [
+            "",
+            "not-a-uuid",
+            "12345678-1234-1234-1234-12345678901",   // 35 chars
+            "12345678-1234-1234-1234-1234567890123", // 37 chars
+            "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz",  // non-hex
+        ] {
+            let err = VlessUuid::parse(bad).unwrap_err();
+            assert_eq!(err, VlessError::InvalidUuid, "input: {bad}");
+            // 不回显输入原文（空字符串跳过）。
+            if !bad.is_empty() {
+                assert!(!format!("{err}").contains(bad));
+            }
+        }
+    }
+}
