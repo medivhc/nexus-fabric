@@ -4402,6 +4402,116 @@ fn anytls_take_complete_frame(buf: &[u8]) -> Option<(nexus_outbound_anytls::AnyT
     nexus_outbound_anytls::decode_frame_bytes(buf).ok()
 }
 
+// VLESS 握手 + 响应头消费（§11.16 vless 数据面装配 glue；帧编解码仍在
+// nexus-outbound-vless）。
+//
+// 在已建立的字节流（明文 TCP 或外层 TLS）上执行：`VlessConn::handshake` 只写
+// 请求头（UUID + flow addon + TCP 命令 + 目标地址），随后把 `seed_to_upstream`
+// （§11.19 首段字节）一并写出，最后阻塞读一次消费响应头——server 收到请求头
+// 后即回送响应头（请求处理与拨号目标并发，不等待目标首字节），此时阻塞读不会
+// 死锁；必须先消费掉响应头才能开始透明中继，否则响应字节会泄漏进 client 流。
+fn vless_handshake_stream<S: std::io::Read + std::io::Write>(
+    stream: &mut S,
+    req: &nexus_outbound_vless::VlessRequest,
+    seed_to_upstream: &[u8],
+    tag: &str,
+) -> Result<(), NexusError> {
+    use std::io::Write;
+    let mut vc = nexus_outbound_vless::VlessConn::new(stream);
+    vc.handshake(req)
+        .map_err(|e| NexusError::ConnectivityEstablishmentFailed {
+            provider: ProviderId(tag.to_string()),
+            reason: format!("vless handshake failed: {e}"),
+        })?;
+    if !seed_to_upstream.is_empty() {
+        vc.write_all(seed_to_upstream).map_err(|e| {
+            NexusError::ConnectivityEstablishmentFailed {
+                provider: ProviderId(tag.to_string()),
+                reason: format!("vless seed write failed: {e}"),
+            }
+        })?;
+    }
+    vc.flush()
+        .map_err(|e| NexusError::ConnectivityEstablishmentFailed {
+            provider: ProviderId(tag.to_string()),
+            reason: format!("vless handshake flush failed: {e}"),
+        })?;
+    let inner = vc.into_inner();
+    let _resp = nexus_outbound_vless::read_response(inner).map_err(|e| {
+        NexusError::ConnectivityEstablishmentFailed {
+            provider: ProviderId(tag.to_string()),
+            reason: format!("vless response read failed: {e}"),
+        }
+    })?;
+    Ok(())
+}
+
+// VLESS 双向透明中继泵（§11.16 vless 数据面装配 glue）。
+//
+// 单线程 nonblocking poll：rustls ClientConnection 不可跨线程分裂，TLS/明文
+// 两条路径共用此泵（loopback E4 小流量足够；调用方单线程闭环承担结构化并发，
+// 无泄漏 JoinHandle）。返回 `(上行字节, 下行字节)`（仅中继载荷；握手字节不计）。
+fn vless_pump_stream<S: std::io::Read + std::io::Write>(
+    node: &mut S,
+    client: &mut std::net::TcpStream,
+) -> (usize, usize) {
+    use std::io::{Read, Write};
+    let mut up_bytes = 0usize;
+    let mut down_bytes = 0usize;
+    let mut cbuf = [0u8; 8192];
+    let mut sbuf = [0u8; 8192];
+    let mut c_open = true;
+    let mut n_open = true;
+    loop {
+        if !c_open && !n_open {
+            break;
+        }
+        let mut progressed = false;
+        if c_open {
+            match client.read(&mut cbuf) {
+                Ok(0) => c_open = false,
+                Ok(n) => match node.write_all(&cbuf[..n]) {
+                    Ok(()) => match node.flush() {
+                        Ok(()) => {
+                            up_bytes += n;
+                            progressed = true;
+                        }
+                        Err(_) => n_open = false,
+                    },
+                    Err(_) => n_open = false,
+                },
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => c_open = false,
+            }
+        }
+        if n_open && c_open {
+            match node.read(&mut sbuf) {
+                Ok(0) => n_open = false,
+                Ok(n) => match client.write_all(&sbuf[..n]) {
+                    Ok(()) => {
+                        down_bytes += n;
+                        progressed = true;
+                    }
+                    Err(_) => {
+                        // 投递到 client 失败：client 已不可达，隧道整体终止。
+                        c_open = false;
+                        n_open = false;
+                    }
+                },
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => n_open = false,
+            }
+        } else if n_open && !c_open {
+            // client 已断开：直接终止节点侧，避免节点不发关闭信号时空转。
+            n_open = false;
+        }
+        if !progressed {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    (up_bytes, down_bytes)
+}
+
 pub fn proxy_serve_once(
     listener: &std::net::TcpListener,
     config_yaml: &str,
@@ -5248,10 +5358,194 @@ pub fn proxy_serve_once(
             (up_bytes, down_bytes)
         }
         nexus_proxy_config::OutboundKind::Vless => {
-            return Err(NexusError::ConnectivityEstablishmentFailed {
+            // §11.16 vless 数据面：TCP → 可选 rustls TLS（SNI 取配置 servername，
+            // 缺省节点域名；skip-cert-verify 按配置；tls 缺省 false）→ VLESS 握手
+            // （UUID + flow addon + TCP 命令 + 目标地址；响应头随后阻塞读一次消费）
+            // → 双向透明中继 client<->节点。
+            //
+            // 传输：仅 TCP/TLS direct；WS/gRPC 等传输链为后续增强（未实现）。
+            // XTLS-Vision：nexus-outbound-vless 提供 padding 帧编解码与
+            // VisionWriter/VisionReader 状态机，但传输层 splice（DIRECT 后写侧切
+            // 裸 TCP 直通、读侧仍走 TLS）尚未实现——本 arm 对 flow=xtls-rprx-vision
+            // 仅编码握手 addon 并做普通中继（后续增强）。
+            use nexus_outbound_vless::{
+                VlessCommand, VlessFlow, VlessRequest, VlessTarget, VlessUuid,
+            };
+            use rustls::pki_types::ServerName;
+            use std::sync::Arc;
+
+            let locator = selected.locator.clone().ok_or_else(|| {
+                NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: "vless outbound missing locator".into(),
+                }
+            })?;
+            let (nhost, nport) = split_host_port(&locator)?;
+            // §7.3 插件接线（P1）：obfs 包在 TLS 之下。先建 raw TCP（保持 blocking，
+            // TLS 握手期间 rustls 用阻塞 I/O，提前 nonblocking 会导致 WouldBlock 硬失败），
+            // clone 一个 handle 留待握手后设 nonblocking（同 fd 共享 flag），再 wrap；
+            // obfs=None → plain 直通（P6 零回归）。
+            let raw = std::net::TcpStream::connect((nhost.as_str(), nport)).map_err(|e| {
+                NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: format!("vless node connect {locator} failed: {e}"),
+                }
+            })?;
+            let raw_nb = raw.try_clone().map_err(|e| NexusError::Internal {
+                message: format!("vless node clone for nonblocking: {e}"),
+            })?;
+            let obfs_params = nexus_plugin::ObfsParams {
+                key: selected.obfs_key.as_deref().unwrap_or("").as_bytes(),
+            };
+            let mut node = nexus_plugin::wrap_stream(raw, selected.obfs.as_deref(), &obfs_params)
+                .map_err(|e| NexusError::ConnectivityEstablishmentFailed {
                 provider: ProviderId(decision.selected_outbound_tag.clone()),
-                reason: "vless outbound data-plane not in this batch: nexus-outbound-vless provides frame codec and config validation; missing TCP/TLS + VLESS handshake + relay integration in nexus app data-plane (deferred)".into(),
+                reason: format!("vless obfs wrap failed: {e}"),
+            })?;
+            let uuid_text = selected.uuid.clone().ok_or_else(|| {
+                NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: "vless outbound missing uuid".into(),
+                }
+            })?;
+            let uuid = VlessUuid::parse(&uuid_text).map_err(|e| {
+                NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: format!("vless invalid uuid: {e}"),
+                }
+            })?;
+            let flow = VlessFlow::parse(selected.flow.as_deref().unwrap_or("")).map_err(|e| {
+                NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: format!("vless unsupported flow: {e}"),
+                }
+            })?;
+            let use_tls = selected.tls.unwrap_or(false);
+            // Vision 门禁 fail-closed（§5 坑 #3：无外层 TLS 时 splice 无意义）：
+            // flow=xtls-rprx-vision 要求 tls。配置层 validation 已拦截，此处纵深防御。
+            if flow == VlessFlow::XtlsRprxVision && !use_tls {
+                return Err(NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: "vless flow=xtls-rprx-vision requires tls".into(),
+                });
+            }
+            // SNI：配置 servername 优先（vless 专用字段），缺省取 locator host。
+            let sni_host = selected
+                .servername
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| nhost.clone());
+            let skip_verify = selected.skip_cert_verify.unwrap_or(false);
+            let target = match host.parse::<std::net::IpAddr>() {
+                Ok(std::net::IpAddr::V4(v4)) => VlessTarget::Ipv4(v4),
+                Ok(std::net::IpAddr::V6(v6)) => VlessTarget::Ipv6(v6),
+                Err(_) => VlessTarget::Domain(host.clone()),
+            };
+            let req = VlessRequest {
+                uuid,
+                flow,
+                command: VlessCommand::Tcp,
+                port,
+                target: Some(target),
+            };
+
+            let (up_bytes, down_bytes) = if use_tls {
+                // 客户端 TLS 配置：skip-cert-verify（自签/内网节点）或系统信任根。
+                // VLESS 不用 ALPN（空列表）。
+                let tls_cfg: Result<rustls::ClientConfig, NexusError> = if skip_verify {
+                    nexus_outbound_trojan::client_config_dangerous_skip_verify(&[]).map_err(|e| {
+                        NexusError::ConnectivityEstablishmentFailed {
+                            provider: ProviderId(decision.selected_outbound_tag.clone()),
+                            reason: format!("vless client tls config failed: {e}"),
+                        }
+                    })
+                } else {
+                    let mut roots = rustls::RootCertStore::empty();
+                    for c in rustls_native_certs::load_native_certs().certs {
+                        let _ = roots.add(c);
+                    }
+                    let prov = Arc::new(rustls::crypto::ring::default_provider());
+                    let cfg = rustls::ClientConfig::builder_with_provider(prov)
+                        .with_safe_default_protocol_versions()
+                        .map_err(|_| NexusError::Internal {
+                            message: "tls versions".into(),
+                        })?
+                        .with_root_certificates(roots)
+                        .with_no_client_auth();
+                    Ok(cfg)
+                };
+                let tls_cfg = tls_cfg?;
+                let sni = ServerName::try_from(sni_host.clone()).map_err(|_| {
+                    NexusError::ConnectivityEstablishmentFailed {
+                        provider: ProviderId(decision.selected_outbound_tag.clone()),
+                        reason: format!("vless sni invalid: {sni_host}"),
+                    }
+                })?;
+                let mut conn =
+                    rustls::ClientConnection::new(Arc::new(tls_cfg), sni).map_err(|e| {
+                        NexusError::ConnectivityEstablishmentFailed {
+                            provider: ProviderId(decision.selected_outbound_tag.clone()),
+                            reason: format!("vless client connection failed: {e}"),
+                        }
+                    })?;
+                // VLESS 握手（阻塞 I/O；write_all/flush 同时驱动 TLS 握手）。
+                let mut tls = rustls::Stream::new(&mut conn, &mut node);
+                vless_handshake_stream(
+                    &mut tls,
+                    &req,
+                    &seed_to_upstream,
+                    &decision.selected_outbound_tag,
+                )?;
+                // 双向透明中继：rustls ClientConnection 不可跨线程分裂，用非阻塞单线程
+                // poll 在 client 与 TLS 之间搬运字节（见 vless_pump_stream）。
+                // node 在握手完成后才设为 nonblocking（握手期间必须阻塞 I/O）；
+                // wrapped 流透传 WouldBlock。
+                raw_nb
+                    .set_nonblocking(true)
+                    .map_err(|e| NexusError::Internal {
+                        message: format!("vless node nonblocking: {e}"),
+                    })?;
+                client
+                    .set_nonblocking(true)
+                    .map_err(|e| NexusError::Internal {
+                        message: format!("vless client nonblocking: {e}"),
+                    })?;
+                let (up, down) = vless_pump_stream(&mut tls, &mut client);
+                // 尽力向节点发送 close_notify（不阻断结果）。
+                conn.send_close_notify();
+                (up, down)
+            } else {
+                // 明文 TCP：直接在 wrapped 流上握手 + 中继。
+                vless_handshake_stream(
+                    &mut node,
+                    &req,
+                    &seed_to_upstream,
+                    &decision.selected_outbound_tag,
+                )?;
+                raw_nb
+                    .set_nonblocking(true)
+                    .map_err(|e| NexusError::Internal {
+                        message: format!("vless node nonblocking: {e}"),
+                    })?;
+                client
+                    .set_nonblocking(true)
+                    .map_err(|e| NexusError::Internal {
+                        message: format!("vless client nonblocking: {e}"),
+                    })?;
+                vless_pump_stream(&mut node, &mut client)
+            };
+            // node 是 wrapped 流（Box<dyn ObfuscatedStream>），无法恢复 inner 的
+            // blocking 模式；arm 结束时流即 drop 关闭 fd，无需恢复。
+
+            outbound = json!({
+                "kind": "vless",
+                "node_locator": locator,
+                "tls": use_tls,
+                "sni": sni_host,
+                "skip_cert_verify": skip_verify,
+                "flow": flow.as_str(),
             });
+            (up_bytes, down_bytes)
         }
         nexus_proxy_config::OutboundKind::Hysteria2 => {
             return Err(NexusError::ConnectivityEstablishmentFailed {
