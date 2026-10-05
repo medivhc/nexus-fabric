@@ -735,6 +735,7 @@ dependencies = [
  "nexus-transport",
  "nexus-workspace",
  "nexus-workspace-intel",
+ "quinn-proto",
  "rcgen",
  "ring",
  "rustls",

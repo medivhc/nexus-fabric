@@ -4512,6 +4512,169 @@ fn vless_pump_stream<S: std::io::Read + std::io::Write>(
     (up_bytes, down_bytes)
 }
 
+/// Hysteria2 TCP 中继：client（nonblocking TcpStream）<-> QUIC 双向 stream。
+///
+/// 与 `vless_pump_stream` 同构；QUIC 侧用 `stream_read` 短超时（50ms）轮询，
+/// `Timeout` 为瞬态（继续轮询），其他 QUIC 错误视为节点侧关闭。client EOF 时
+/// 先对 stream 发 FIN 再结束双向（优雅半关闭）。
+fn hysteria2_pump_stream(
+    hy2: &mut nexus_outbound_hysteria2::Hysteria2Client,
+    stream: quinn_proto::StreamId,
+    client: &mut std::net::TcpStream,
+) -> (usize, usize) {
+    use nexus_outbound_hysteria2::Hysteria2Error;
+    use std::io::{Read, Write};
+    let mut up_bytes = 0usize;
+    let mut down_bytes = 0usize;
+    let mut cbuf = [0u8; 8192];
+    let mut sbuf = [0u8; 8192];
+    let mut c_open = true;
+    let mut s_open = true;
+    loop {
+        if !c_open && !s_open {
+            break;
+        }
+        let mut progressed = false;
+        if c_open {
+            match client.read(&mut cbuf) {
+                Ok(0) => c_open = false,
+                Ok(n) => match hy2.stream_write(stream, &cbuf[..n]) {
+                    Ok(()) => {
+                        up_bytes += n;
+                        progressed = true;
+                    }
+                    Err(_) => s_open = false,
+                },
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => c_open = false,
+            }
+        }
+        if s_open && c_open {
+            match hy2.stream_read(stream, &mut sbuf, std::time::Duration::from_millis(50)) {
+                Ok(0) => s_open = false,
+                Ok(n) => match client.write_all(&sbuf[..n]) {
+                    Ok(()) => {
+                        down_bytes += n;
+                        progressed = true;
+                    }
+                    Err(_) => {
+                        // 投递到 client 失败：client 已不可达，隧道整体终止。
+                        c_open = false;
+                        s_open = false;
+                    }
+                },
+                Err(Hysteria2Error::Timeout) => {}
+                Err(_) => s_open = false,
+            }
+        } else if s_open && !c_open {
+            // client 已断开：对 stream 发 FIN，避免节点侧空转。
+            hy2.stream_finish(stream);
+            s_open = false;
+        }
+        if !progressed {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    (up_bytes, down_bytes)
+}
+
+/// meow-rs 语义的 hysteria2 带宽解析（`down` → `Hysteria-CC-RX` 字节/秒）：
+/// 纯整数按 Mbps 计；`"100 Mbps"` / `"1 Gbps"` / `"512 Kbps"` 按单位换算
+/// （小写 `b`=bits → /8，大写 `B`=bytes）。缺省/空 → 0（未知）。
+/// 非法输入 fail-closed（配置 bug 应 loud，而非静默按 0 处理）。
+fn parse_hy2_bandwidth_to_bps(text: Option<&str>) -> Result<u64, String> {
+    let s = text.map(str::trim).unwrap_or("");
+    if s.is_empty() || s == "0" {
+        return Ok(0);
+    }
+    if let Ok(mbps) = s.parse::<u64>() {
+        return Ok(mbps.saturating_mul(1_000_000) / 8);
+    }
+    let err = || format!("invalid bandwidth '{s}', expected integer Mbps or e.g. '100 Mbps'");
+    // 手工实现 meow-rs 的 `^(\d+)\s*([KMGTkmgt]?)([Bb])ps$`（apps/nexus 无 regex 依赖）。
+    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return Err(err());
+    }
+    let value: u64 = s[..digits].parse().map_err(|_| err())?;
+    let mut rest = s[digits..].trim_start();
+    let mult: u64 = match rest.chars().next() {
+        Some(c) if "KMGTkmgt".contains(c) => {
+            rest = &rest[c.len_utf8()..];
+            match c.to_ascii_uppercase() {
+                'K' => 1_000,
+                'M' => 1_000_000,
+                'G' => 1_000_000_000,
+                'T' => 1_000_000_000_000,
+                _ => unreachable!("prefix restricted by guard"),
+            }
+        }
+        _ => 1,
+    };
+    let rest = rest.trim_start();
+    let bits = match rest.chars().next() {
+        Some('b') => true,
+        Some('B') => false,
+        _ => return Err(err()),
+    };
+    let rest = &rest['b'.len_utf8()..];
+    if !rest.eq_ignore_ascii_case("ps") {
+        return Err(err());
+    }
+    let total = value
+        .checked_mul(mult)
+        .ok_or_else(|| format!("bandwidth '{s}' overflows u64"))?;
+    Ok(if bits { total / 8 } else { total })
+}
+
+/// Hysteria2 出站配置 → `Hysteria2Target`（纯映射，可单测；meow-rs 语义对齐）。
+///
+/// - locator → server/port；password → 认证口令；
+/// - sni（空 → None，由 `effective_sni` 回退到 server host）；
+/// - skip_cert_verify → `Insecure` / `SystemRoots`；
+/// - obfs：`salamander`（key 取 obfs_password，由 driver 在 QUIC 包之下做整包
+///   XOR）/ 空 / `none`；其余值明确拒绝（hysteria2 的 obfs 字段只支持这两档）；
+/// - down → `Hysteria-CC-RX`（字节/秒；缺省 0=未知）；
+/// - ports（端口跳跃）/ up（Brutal CC）暂不支持，忽略（见 MODULE.md）。
+fn hysteria2_target_from_outbound(
+    selected: &nexus_proxy_config::OutboundConfig,
+    tag: &str,
+) -> Result<nexus_outbound_hysteria2::Hysteria2Target, NexusError> {
+    use nexus_outbound_hysteria2::{CertVerify, Hysteria2Target, Obfs};
+    let fail = |reason: String| NexusError::ConnectivityEstablishmentFailed {
+        provider: ProviderId(tag.to_string()),
+        reason,
+    };
+    let locator = selected
+        .locator
+        .clone()
+        .filter(|l| !l.is_empty())
+        .ok_or_else(|| fail("hysteria2 outbound missing locator".into()))?;
+    let (nhost, nport) = split_host_port(&locator)?;
+    let password = selected
+        .password
+        .clone()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| fail("hysteria2 outbound missing password".into()))?;
+    let obfs = Obfs::parse(
+        selected.obfs.as_deref().unwrap_or(""),
+        selected.obfs_password.as_deref().unwrap_or("").as_bytes(),
+    )
+    .map_err(|e| fail(format!("hysteria2 obfs config invalid: {e}")))?;
+    let cc_rx_bps = parse_hy2_bandwidth_to_bps(selected.down.as_deref())
+        .map_err(|e| fail(format!("hysteria2 down bandwidth invalid: {e}")))?;
+    let mut target = Hysteria2Target::new(nhost, nport, password);
+    target.sni = selected.sni.clone().filter(|s| !s.is_empty());
+    target.verify = if selected.skip_cert_verify.unwrap_or(false) {
+        CertVerify::Insecure
+    } else {
+        CertVerify::SystemRoots
+    };
+    target.obfs = obfs;
+    target.cc_rx_bps = cc_rx_bps;
+    Ok(target)
+}
+
 pub fn proxy_serve_once(
     listener: &std::net::TcpListener,
     config_yaml: &str,
@@ -5548,10 +5711,68 @@ pub fn proxy_serve_once(
             (up_bytes, down_bytes)
         }
         nexus_proxy_config::OutboundKind::Hysteria2 => {
-            return Err(NexusError::ConnectivityEstablishmentFailed {
-                provider: ProviderId(decision.selected_outbound_tag.clone()),
-                reason: "hysteria2 outbound data-plane not in this batch: nexus-outbound-hysteria2 provides QUIC client and frame codec; missing integration with nexus app connection flow (QUIC runtime differs from app's blocking TCP model) (deferred)".into(),
+            // §11.16 hysteria2 数据面：UDP socket → quinn-proto QUIC 建连
+            // （SNI/ALPN h3/证书校验三选一；QUIC bit greasing 禁用）→ 最小
+            // HTTP/3 认证（HEADERS 请求，校验 :status == 233）→ 为本应用连接开
+            // 一条 QUIC 双向 stream（TCPRequest 帧）→ 双向字节中继 →
+            // 优雅关闭（CONNECTION_CLOSE）。
+            //
+            // 未实现（注明）：UDP 中继（UDPMessage over QUIC DATAGRAM 由
+            // Hysteria2Client::{send_udp, recv_udp} 提供，crate 内单测覆盖；
+            // 本 arm 入站是 TCP，待应用侧 UDP 入口接入后再装配）、端口跳跃、
+            // Brutal CC。
+            use nexus_outbound_hysteria2::Hysteria2Client;
+
+            let target = hysteria2_target_from_outbound(selected, &decision.selected_outbound_tag)?;
+            let locator = target.locator();
+            // QUIC 建连 + H3 认证（阻塞至 handshake_timeout；:status != 233 →
+            // Hysteria2Error::AuthFailed，结构化透出）。
+            let mut hy2 = Hysteria2Client::connect(&target).map_err(|e| {
+                NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: format!("hysteria2 connect/auth {locator} failed: {e}"),
+                }
+            })?;
+            let udp_enabled = hy2.udp_enabled();
+            // TCP 代理 stream：fast-open 默认开启（open_tcp 不等 TCPResponse 即返回；
+            // 读侧首次 stream_read 自动剥离 TCPResponse，拒绝则报 TcpRejected）。
+            let target_addr = format!("{host}:{port}");
+            let stream = hy2.open_tcp(&target_addr).map_err(|e| {
+                NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: format!("hysteria2 open tcp {target_addr} failed: {e}"),
+                }
+            })?;
+            // §11.19：握手产出的首段字节必须先写上给上游，再进入双向中继。
+            if !seed_to_upstream.is_empty() {
+                hy2.stream_write(stream, &seed_to_upstream).map_err(|e| {
+                    NexusError::ConnectivityEstablishmentFailed {
+                        provider: ProviderId(decision.selected_outbound_tag.clone()),
+                        reason: format!("hysteria2 seed write failed: {e}"),
+                    }
+                })?;
+            }
+            // 双向中继：client 设 nonblocking（QUIC 侧 stream_read 带短超时轮询）。
+            client
+                .set_nonblocking(true)
+                .map_err(|e| NexusError::Internal {
+                    message: format!("hysteria2 client nonblocking: {e}"),
+                })?;
+            let (up_bytes, down_bytes) = hysteria2_pump_stream(&mut hy2, stream, &mut client);
+            // 优雅关闭：发送 QUIC CONNECTION_CLOSE（尽力）。
+            hy2.close();
+            // client 在 arm 结束时 drop 关闭 fd，无需恢复 blocking 模式。
+
+            outbound = json!({
+                "kind": "hysteria2",
+                "node_locator": locator,
+                "sni": target.effective_sni(),
+                "skip_cert_verify": selected.skip_cert_verify.unwrap_or(false),
+                "obfs": selected.obfs.as_deref().unwrap_or("none"),
+                "udp_enabled": udp_enabled,
+                "cc_rx_bps": target.cc_rx_bps,
             });
+            (up_bytes, down_bytes)
         }
     };
 
@@ -11492,3 +11713,99 @@ pub mod task_cli;
 mod task_localapi;
 
 pub mod task_authorization;
+
+#[cfg(test)]
+mod hysteria2_dataplane_tests {
+    use super::*;
+
+    fn hy2_outbound_yaml(port: u16) -> String {
+        format!(
+            "schema_version: 1\nrules:\n  - tag: m\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: h\noutbounds:\n  - tag: h\n    kind: hysteria2\n    locator: 127.0.0.1:{port}\n    password: secret123\n    down: 100 Mbps\n    skip_cert_verify: true\n"
+        )
+    }
+
+    #[test]
+    fn bandwidth_parser_meow_semantics() {
+        assert_eq!(parse_hy2_bandwidth_to_bps(None).unwrap(), 0);
+        assert_eq!(parse_hy2_bandwidth_to_bps(Some("")).unwrap(), 0);
+        assert_eq!(parse_hy2_bandwidth_to_bps(Some("0")).unwrap(), 0);
+        // 纯整数按 Mbps。
+        assert_eq!(parse_hy2_bandwidth_to_bps(Some("100")).unwrap(), 12_500_000);
+        // "100 Mbps"：100 * 1e6 bits / 8。
+        assert_eq!(
+            parse_hy2_bandwidth_to_bps(Some("100 Mbps")).unwrap(),
+            12_500_000
+        );
+        assert_eq!(
+            parse_hy2_bandwidth_to_bps(Some("1 Gbps")).unwrap(),
+            125_000_000
+        );
+        assert_eq!(
+            parse_hy2_bandwidth_to_bps(Some("512 Kbps")).unwrap(),
+            64_000
+        );
+        // 大写 B = bytes，不除 8。
+        assert_eq!(
+            parse_hy2_bandwidth_to_bps(Some("8 MBps")).unwrap(),
+            8_000_000
+        );
+        // 非法输入 fail-closed。
+        assert!(parse_hy2_bandwidth_to_bps(Some("fast")).is_err());
+        assert!(parse_hy2_bandwidth_to_bps(Some("100 XBPS")).is_err());
+        assert!(parse_hy2_bandwidth_to_bps(Some("100 M")).is_err());
+    }
+
+    #[test]
+    fn target_mapping_fields() {
+        let cfg = nexus_proxy_config::parse(&hy2_outbound_yaml(4443)).unwrap();
+        let selected = cfg.outbounds.iter().find(|o| o.tag == "h").unwrap();
+        let target = hysteria2_target_from_outbound(selected, "h").unwrap();
+        assert_eq!(target.server, "127.0.0.1");
+        assert_eq!(target.port, 4443);
+        assert_eq!(target.password, "secret123");
+        // skip_cert_verify=true → Insecure。
+        assert!(matches!(
+            target.verify,
+            nexus_outbound_hysteria2::CertVerify::Insecure
+        ));
+        // down: 100 Mbps → 12_500_000 B/s。
+        assert_eq!(target.cc_rx_bps, 12_500_000);
+        // sni 缺省 → effective_sni 回退到 server。
+        assert_eq!(target.effective_sni(), "127.0.0.1");
+        assert!(!target.obfs.is_salamander());
+    }
+
+    #[test]
+    fn target_mapping_rejects_bad_obfs() {
+        let yaml = hy2_outbound_yaml(4443).replace("skip_cert_verify: true", "obfs: xor");
+        let cfg = nexus_proxy_config::parse(&yaml).unwrap();
+        let selected = cfg.outbounds.iter().find(|o| o.tag == "h").unwrap();
+        let err = hysteria2_target_from_outbound(selected, "h").unwrap_err();
+        assert!(format!("{err:?}").contains("obfs"), "err: {err:?}");
+    }
+
+    #[test]
+    fn loopback_connect_auth_tcp_relay() {
+        use nexus_outbound_hysteria2::Hysteria2Client;
+        use nexus_outbound_hysteria2::test_server::TestServer;
+        use std::time::Duration;
+
+        let server = TestServer::spawn("secret123", true).unwrap();
+        let cfg = nexus_proxy_config::parse(&hy2_outbound_yaml(server.addr.port())).unwrap();
+        let selected = cfg.outbounds.iter().find(|o| o.tag == "h").unwrap();
+        let target = hysteria2_target_from_outbound(selected, "h").unwrap();
+        // QUIC 握手 + H3 认证（skip_cert_verify → Insecure）。
+        let mut client = Hysteria2Client::connect(&target).unwrap();
+        assert!(client.udp_enabled());
+        // TCP 中继：open stream → 写 → 回显读回。
+        let stream = client.open_tcp("example.com:80").unwrap();
+        client.stream_write(stream, b"hello-hy2").unwrap();
+        let mut buf = [0u8; 64];
+        let n = client
+            .stream_read(stream, &mut buf, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(&buf[..n], b"hello-hy2");
+        client.stream_finish(stream);
+        client.close();
+    }
+}

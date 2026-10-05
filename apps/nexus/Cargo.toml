@@ -41,6 +41,9 @@ nexus-outbound-trojan = { path = "../../crates/nexus-outbound-trojan" }
 nexus-outbound-anytls = { path = "../../crates/nexus-outbound-anytls" }
 nexus-outbound-vless = { path = "../../crates/nexus-outbound-vless" }
 nexus-outbound-hysteria2 = { path = "../../crates/nexus-outbound-hysteria2" }
+# Hysteria2 装配需要 quinn-proto::StreamId（pump helper 签名）；版本与
+# nexus-outbound-hysteria2 一致，走 workspace [patch.crates-io] 的 vendor 版。
+quinn-proto = { version = "0.11", default-features = false, features = ["rustls", "ring"] }
 nexus-plugin = { path = "../../crates/nexus-plugin" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-native-certs = { version = "0.8", default-features = false }
