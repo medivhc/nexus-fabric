@@ -4363,6 +4363,45 @@ pub fn init_obfs_plugins() {
 /// 真实 SOCKS5 代理单会话闭环。
 ///
 /// 调用方（`nexus proxy`）应在服务循环前调一次 [`init_obfs_plugins`]（P4）。
+// 在已建立的 AnyTLS TLS 流上推送一帧（数据面装配 glue；帧编解码仍在
+// nexus-outbound-anytls）。
+//
+// `encode_frame` 为纯函数，一次 `write_all` 把整帧送入 rustls 明文缓冲；`flush`
+// 的 WouldBlock 只表示底层 socket 暂不可写，字节仍在 rustls 内部缓冲排队，下轮
+// read/write 会继续投递（rustls 0.23 `complete_prior_io` 语义），不丢。
+fn anytls_push_frame<S: std::io::Read + std::io::Write>(
+    tls: &mut rustls::Stream<'_, rustls::ClientConnection, S>,
+    stream_id: u32,
+    cmd: nexus_outbound_anytls::AnyTlsCommand,
+    data: &[u8],
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let buf = nexus_outbound_anytls::encode_frame(cmd, stream_id, data).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("anytls frame encode: {e}"),
+        )
+    })?;
+    tls.write_all(&buf)?;
+    tls.flush()
+}
+
+// 从下行明文缓冲取出首个完整 AnyTLS 帧（7 字节头 + data）；不完整返回 `None`。
+//
+// 完整性判断只 peek 头部长度字段，实际解码仍走 nexus-outbound-anytls
+//（`AnyTlsError::Io` 丢弃了底层 io kind，`read_frame` 无法在非阻塞流上区分
+// WouldBlock，故中继循环用此增量组帧）。
+fn anytls_take_complete_frame(buf: &[u8]) -> Option<(nexus_outbound_anytls::AnyTlsFrame, usize)> {
+    if buf.len() < 7 {
+        return None;
+    }
+    let data_len = u16::from_be_bytes([buf[5], buf[6]]) as usize;
+    if buf.len() < 7 + data_len {
+        return None;
+    }
+    nexus_outbound_anytls::decode_frame_bytes(buf).ok()
+}
+
 pub fn proxy_serve_once(
     listener: &std::net::TcpListener,
     config_yaml: &str,
@@ -4936,10 +4975,277 @@ pub fn proxy_serve_once(
             });
         }
         nexus_proxy_config::OutboundKind::Anytls => {
-            return Err(NexusError::ConnectivityEstablishmentFailed {
+            // §11.16 anytls 数据面：TCP → rustls TLS（SNI 取配置 sni，缺省节点域名；
+            // skip-cert-verify 按配置）→ AnyTLS session 握手（auth 一次写 + Settings →
+            // 等 ServerSettings）→ 开 stream（SYN → 首个 PSH 带 SOCKS5 目标地址 →
+            // 等 SYNACK）→ PSH 帧双向中继 client<->TLS。
+            use nexus_outbound_anytls::{
+                AnyTlsCommand, AnyTlsTarget, CLIENT_IDENT, DEFAULT_PADDING_SCHEME,
+                client_handshake, client_open_stream, padding_md5_hex,
+            };
+            use rustls::pki_types::ServerName;
+            use std::sync::Arc;
+
+            let locator = selected.locator.clone().ok_or_else(|| {
+                NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: "anytls outbound missing locator".into(),
+                }
+            })?;
+            let (nhost, nport) = split_host_port(&locator)?;
+            // §7.3 插件接线（P1）：obfs 包在 TLS 之下。先建 raw TCP（保持 blocking，
+            // TLS 握手期间 rustls 用阻塞 I/O，提前 nonblocking 会导致 WouldBlock 硬失败），
+            // clone 一个 handle 留待握手后设 nonblocking（同 fd 共享 flag），再 wrap；
+            // obfs=None → plain 直通（P6 零回归）。
+            let raw = std::net::TcpStream::connect((nhost.as_str(), nport)).map_err(|e| {
+                NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: format!("anytls node connect {locator} failed: {e}"),
+                }
+            })?;
+            let raw_nb = raw.try_clone().map_err(|e| NexusError::Internal {
+                message: format!("anytls node clone for nonblocking: {e}"),
+            })?;
+            let obfs_params = nexus_plugin::ObfsParams {
+                key: selected.obfs_key.as_deref().unwrap_or("").as_bytes(),
+            };
+            let mut node = nexus_plugin::wrap_stream(raw, selected.obfs.as_deref(), &obfs_params)
+                .map_err(|e| NexusError::ConnectivityEstablishmentFailed {
                 provider: ProviderId(decision.selected_outbound_tag.clone()),
-                reason: "anytls outbound data-plane not in this batch: nexus-outbound-anytls provides frame codec and auth primitives; missing TLS handshake + relay integration in nexus app data-plane (deferred)".into(),
+                reason: format!("anytls obfs wrap failed: {e}"),
+            })?;
+            let password = selected.password.clone().ok_or_else(|| {
+                NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: "anytls outbound missing password".into(),
+                }
+            })?;
+
+            // SNI：配置 sni 优先（anytls/hysteria2 SNI），缺省取 locator host。
+            let sni_host = selected
+                .sni
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| nhost.clone());
+            let skip_verify = selected.skip_cert_verify.unwrap_or(false);
+
+            // 客户端 TLS 配置：skip-cert-verify（自签/内网节点）或系统信任根。
+            // AnyTLS 不用 ALPN（空列表）。
+            let tls_cfg: Result<rustls::ClientConfig, NexusError> = if skip_verify {
+                nexus_outbound_trojan::client_config_dangerous_skip_verify(&[]).map_err(|e| {
+                    NexusError::ConnectivityEstablishmentFailed {
+                        provider: ProviderId(decision.selected_outbound_tag.clone()),
+                        reason: format!("anytls client tls config failed: {e}"),
+                    }
+                })
+            } else {
+                let mut roots = rustls::RootCertStore::empty();
+                for c in rustls_native_certs::load_native_certs().certs {
+                    let _ = roots.add(c);
+                }
+                let prov = Arc::new(rustls::crypto::ring::default_provider());
+                let cfg = rustls::ClientConfig::builder_with_provider(prov)
+                    .with_safe_default_protocol_versions()
+                    .map_err(|_| NexusError::Internal {
+                        message: "tls versions".into(),
+                    })?
+                    .with_root_certificates(roots)
+                    .with_no_client_auth();
+                Ok(cfg)
+            };
+            let tls_cfg = tls_cfg?;
+
+            let sni = ServerName::try_from(sni_host.clone()).map_err(|_| {
+                NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: format!("anytls sni invalid: {sni_host}"),
+                }
+            })?;
+            let mut conn = rustls::ClientConnection::new(Arc::new(tls_cfg), sni).map_err(|e| {
+                NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: format!("anytls client connection failed: {e}"),
+                }
+            })?;
+
+            // AnyTLS session 握手（阻塞 I/O；write_all/flush 同时驱动 TLS 握手）：
+            // 认证（SHA256(password)+padding0 拼成一个 buffer 一次写）→ Settings →
+            // 等 ServerSettings。服务器下发 UpdatePaddingScheme（md5 不一致）时
+            // fail-closed（真实节点使用默认 scheme）。
+            let padding_md5 = padding_md5_hex(DEFAULT_PADDING_SCHEME);
+            let mut hs = {
+                let mut tls = rustls::Stream::new(&mut conn, &mut node);
+                client_handshake(&mut tls, &password, 0, CLIENT_IDENT, &padding_md5).map_err(
+                    |e| NexusError::ConnectivityEstablishmentFailed {
+                        provider: ProviderId(decision.selected_outbound_tag.clone()),
+                        reason: format!("anytls session handshake failed: {e}"),
+                    },
+                )?
+            };
+            // 开 stream：SYN → 首个 PSH（SOCKS5 目标地址）→ 等 SYNACK。
+            let target = match host.parse::<std::net::IpAddr>() {
+                Ok(std::net::IpAddr::V4(v4)) => AnyTlsTarget::Ipv4(v4.octets(), port),
+                Ok(std::net::IpAddr::V6(v6)) => AnyTlsTarget::Ipv6(v6.octets(), port),
+                Err(_) => AnyTlsTarget::Domain(host.clone(), port),
+            };
+            let stream_id = {
+                let mut tls = rustls::Stream::new(&mut conn, &mut node);
+                client_open_stream(&mut tls, &mut hs, &target).map_err(|e| {
+                    NexusError::ConnectivityEstablishmentFailed {
+                        provider: ProviderId(decision.selected_outbound_tag.clone()),
+                        reason: format!("anytls open stream failed: {e}"),
+                    }
+                })?
+            };
+            // §11.19：握手首段字节（HTTP 改写后的请求 / SOCKS5 隧道内 pipelined 字节）
+            // 作为 stream 的首个数据 PSH 发给节点（目标地址已在开 stream 的首个 PSH 发出）。
+            if !seed_to_upstream.is_empty() {
+                let mut tls = rustls::Stream::new(&mut conn, &mut node);
+                anytls_push_frame(&mut tls, stream_id, AnyTlsCommand::Psh, &seed_to_upstream)
+                    .map_err(|e| NexusError::ConnectivityEstablishmentFailed {
+                        provider: ProviderId(decision.selected_outbound_tag.clone()),
+                        reason: format!("anytls seed write failed: {e}"),
+                    })?;
+            }
+
+            // 双向 PSH 帧中继：rustls ClientConnection 不可跨线程分裂，用非阻塞单线程
+            // poll 在 client 与 TLS 之间搬运（与 trojan arm 同模型；本函数单线程闭环
+            // 承担结构化并发，无泄漏 JoinHandle）。
+            // node 在握手+开 stream 完成后才设为 nonblocking（握手期间必须阻塞 I/O）；
+            // wrapped 流透传 WouldBlock。
+            // 下行用 tls.read() 原始读 + decode_frame_bytes 增量组帧：AnyTlsError::Io
+            // 丢弃了底层 io kind，read_frame 无法区分 WouldBlock。
+            raw_nb
+                .set_nonblocking(true)
+                .map_err(|e| NexusError::Internal {
+                    message: format!("anytls node nonblocking: {e}"),
+                })?;
+            client
+                .set_nonblocking(true)
+                .map_err(|e| NexusError::Internal {
+                    message: format!("anytls client nonblocking: {e}"),
+                })?;
+            let mut up_bytes = 0usize;
+            let mut down_bytes = 0usize;
+            let mut cbuf = [0u8; 8192];
+            let mut tbuf = [0u8; 8192];
+            let mut pending: Vec<u8> = Vec::new();
+            let mut c_open = true;
+            let mut tls_open = true;
+            {
+                let mut tls = rustls::Stream::new(&mut conn, &mut node);
+                loop {
+                    if !c_open && !tls_open {
+                        break;
+                    }
+                    let mut progressed = false;
+                    // client → node：读明文 → PSH 帧。
+                    // write_all/flush 在 WouldBlock 时字节已暂存 rustls 内部缓冲，
+                    // 下轮 read/write 会继续投递，不丢；仅统计成功投递的字节。
+                    if c_open {
+                        match client.read(&mut cbuf) {
+                            Ok(0) => {
+                                // client EOF：发 Fin 告知对端 stream 结束（尽力）。
+                                let _ =
+                                    anytls_push_frame(&mut tls, stream_id, AnyTlsCommand::Fin, &[]);
+                                c_open = false;
+                            }
+                            Ok(n) => {
+                                match anytls_push_frame(
+                                    &mut tls,
+                                    stream_id,
+                                    AnyTlsCommand::Psh,
+                                    &cbuf[..n],
+                                ) {
+                                    Ok(()) => {
+                                        up_bytes += n;
+                                        progressed = true;
+                                    }
+                                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                                    Err(_) => {
+                                        c_open = false;
+                                        tls_open = false;
+                                    }
+                                }
+                            }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(_) => c_open = false,
+                        }
+                    }
+                    // node → client：TLS 明文读出 → 组帧 → PSH 投递 client；
+                    // Fin/Alert 结束节点侧；HeartRequest 回 HeartResponse。
+                    if tls_open && c_open {
+                        match tls.read(&mut tbuf) {
+                            Ok(0) => tls_open = false,
+                            Ok(n) => {
+                                pending.extend_from_slice(&tbuf[..n]);
+                                progressed = true;
+                                while let Some((frame, consumed)) =
+                                    anytls_take_complete_frame(&pending)
+                                {
+                                    pending.drain(..consumed);
+                                    match frame.cmd {
+                                        AnyTlsCommand::Psh if frame.stream_id == stream_id => {
+                                            match client.write_all(&frame.data) {
+                                                Ok(()) => down_bytes += frame.data.len(),
+                                                Err(_) => {
+                                                    c_open = false;
+                                                    tls_open = false;
+                                                }
+                                            }
+                                        }
+                                        AnyTlsCommand::Fin if frame.stream_id == stream_id => {
+                                            tls_open = false;
+                                        }
+                                        AnyTlsCommand::Alert => {
+                                            tls_open = false;
+                                        }
+                                        AnyTlsCommand::HeartRequest => {
+                                            let _ = anytls_push_frame(
+                                                &mut tls,
+                                                frame.stream_id,
+                                                AnyTlsCommand::HeartResponse,
+                                                &[],
+                                            );
+                                        }
+                                        _ => {} // Waste/无关帧：静默丢弃
+                                    }
+                                    if !c_open || !tls_open {
+                                        break;
+                                    }
+                                }
+                                // 防御：残缺帧缓冲有界（合法不完整帧 < 64KiB+7B；
+                                // 超限说明对端持续发垃圾，终止节点侧）。
+                                if pending.len() > 256 * 1024 {
+                                    tls_open = false;
+                                }
+                            }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(_) => tls_open = false,
+                        }
+                    } else if tls_open && !c_open {
+                        // client 已断开：直接终止节点侧，避免节点不发 Fin 时空转。
+                        tls_open = false;
+                    }
+                    if !progressed {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                }
+            }
+            // 尽力向节点发送 close_notify（不阻断结果）。
+            conn.send_close_notify();
+            // node 是 wrapped 流（Box<dyn ObfuscatedStream>），无法恢复 inner 的
+            // blocking 模式；arm 结束时流即 drop 关闭 fd，无需恢复。
+
+            outbound = json!({
+                "kind": "anytls",
+                "node_locator": locator,
+                "tls": {
+                    "sni": sni_host,
+                    "skip_cert_verify": skip_verify,
+                },
             });
+            (up_bytes, down_bytes)
         }
         nexus_proxy_config::OutboundKind::Vless => {
             return Err(NexusError::ConnectivityEstablishmentFailed {
