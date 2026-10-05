@@ -18,9 +18,15 @@ while read -r _lref lsha _rref rsha; do
 done
 
 # --- 1. harness verify gate ------------------------------------------------------
-if command -v nexus-harness >/dev/null 2>&1; then
-  out="$(nexus-harness verify --fast --json 2>&1 || true)"
-  verdict="$(printf '%s' "$out" | sed -n 's/.*"verdict":"\([^"]*\)".*/\1/p')"
+if command -v cargo >/dev/null 2>&1; then
+  task_exit=0
+  out="$(worktree_cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -p nexus-harness -- verify --fast --json 2>&1)" || task_exit=$?
+  verdict="$(printf '%s' "$out" | sed -n 's/.*"verdict"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  if [ "$task_exit" -ne 0 ]; then
+    log_error "current worktree Harness failed (exit $task_exit):"
+    printf '%s\n' "$out" >&2
+    fail=1
+  fi
   case "$verdict" in
     FAIL|BLOCKED)
       log_error "nexus-harness verify --fast = $verdict; fix before pushing"
@@ -30,11 +36,13 @@ if command -v nexus-harness >/dev/null 2>&1; then
       log_info "nexus-harness verify --fast = PASS"
       ;;
     *)
-      log_warn "nexus-harness verify --fast = ${verdict:-unavailable}; not blocking (skeleton/unimplemented gate)"
+      log_error "nexus-harness verify --fast = ${verdict:-unavailable}; current Fast PASS required"
+      fail=1
       ;;
   esac
 else
-  log_warn "nexus-harness not on PATH; verify gate skipped"
+  log_error "cargo not on PATH; cannot run current worktree Harness"
+  fail=1
 fi
 
 # --- 2. stale evidence scan ------------------------------------------------------

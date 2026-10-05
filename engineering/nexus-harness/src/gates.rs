@@ -62,17 +62,163 @@ fn run_at_full(root: &PathBuf, program: &str, args: &[&str]) -> (bool, String) {
 }
 
 fn cargo(repo: &Repo, args: &[&str]) -> Gate {
-    let (ok, out) = run_at(&repo.root, "cargo", args);
-    if ok {
+    test_cargo(repo, args, None)
+}
+
+/// Current Cargo artifacts, passed only to child test commands (never PATH).
+struct ProductBinaries {
+    cli: PathBuf,
+    daemon: PathBuf,
+}
+
+fn product_binaries(
+    repo: &Repo,
+    meta: &Value,
+    packages: &[String],
+) -> Result<Option<ProductBinaries>, String> {
+    if !packages
+        .iter()
+        .any(|name| name == "nexus" || name == "nexusd")
+    {
+        return Ok(None);
+    }
+    build_product_binaries(repo, meta, "cargo").map(Some)
+}
+
+/// Always ask Cargo to build, even if executables exist: Cargo owns freshness.
+/// Read actual executable paths from artifacts, including custom target dirs.
+fn build_product_binaries(
+    repo: &Repo,
+    meta: &Value,
+    program: &str,
+) -> Result<ProductBinaries, String> {
+    let args = [
+        "build",
+        "-p",
+        "nexus",
+        "--bin",
+        "nexus",
+        "-p",
+        "nexusd",
+        "--bin",
+        "nexusd",
+        "--message-format=json",
+    ];
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(&repo.root)
+        .output()
+        .map_err(|e| format!("current CLI/daemon prebuild: cargo {}: {e}", args.join(" ")))?;
+    if !output.status.success() {
+        return Err(format!(
+            "current CLI/daemon prebuild: cargo {} failed ({}):\n{}{}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ));
+    }
+    binaries_from_artifacts(repo, meta, &output.stdout)
+}
+
+fn binaries_from_artifacts(
+    repo: &Repo,
+    meta: &Value,
+    stdout: &[u8],
+) -> Result<ProductBinaries, String> {
+    let artifacts: Vec<Value> = String::from_utf8_lossy(stdout)
+        .lines()
+        .map(|line| {
+            serde_json::from_str(line).map_err(|e| {
+                format!("current CLI/daemon prebuild: malformed Cargo artifact JSON: {e}")
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    let executable = |name: &str| -> Result<PathBuf, String> {
+        let package = meta["packages"]
+            .as_array()
+            .and_then(|packages| {
+                packages.iter().find(|p| {
+                    p["name"].as_str() == Some(name)
+                        && meta["workspace_members"]
+                            .as_array()
+                            .is_some_and(|members| members.contains(&p["id"]))
+                })
+            })
+            .ok_or_else(|| {
+                format!("current CLI/daemon prebuild: missing workspace package {name}")
+            })?;
+        let mut paths = artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact["reason"] == "compiler-artifact"
+                    && artifact["package_id"] == package["id"]
+                    && artifact["target"]["name"].as_str() == Some(name)
+                    && artifact["target"]["kind"]
+                        .as_array()
+                        .is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin"))
+                    && artifact["profile"]["test"] == false
+            })
+            .filter_map(|artifact| artifact["executable"].as_str());
+        let path = paths.next().ok_or_else(|| {
+            format!("current CLI/daemon prebuild: cargo returned no {name} executable artifact")
+        })?;
+        if paths.next().is_some() {
+            return Err(format!(
+                "current CLI/daemon prebuild: ambiguous {name} executable artifacts"
+            ));
+        }
+        let path = repo.root.join(path);
+        if !path.is_file() {
+            return Err(format!(
+                "current CLI/daemon prebuild: {name} executable missing: {}",
+                path.display()
+            ));
+        }
+        Ok(path)
+    };
+    Ok(ProductBinaries {
+        cli: executable("nexus")?,
+        daemon: executable("nexusd")?,
+    })
+}
+
+fn test_cargo(repo: &Repo, args: &[&str], binaries: Option<&ProductBinaries>) -> Gate {
+    let mut command = Command::new("cargo");
+    command.args(args).current_dir(&repo.root);
+    if let Some(binaries) = binaries {
+        command
+            .env("NEXUS_N3_TEST_CLI_BIN", &binaries.cli)
+            .env("NEXUS_N3_TEST_DAEMON_BIN", &binaries.daemon);
+    }
+    let output = match command.output() {
+        Ok(output) => output,
+        Err(e) => return Gate::fail("", &format!("cargo {}: {e}", args.join(" "))),
+    };
+    if output.status.success() {
         Gate::ok("", "ok")
     } else {
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let tail = text
+            .lines()
+            .rev()
+            .take(12)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
         Gate::fail(
             "",
-            if out.is_empty() {
-                "command failed"
-            } else {
-                &out
-            },
+            &format!(
+                "cargo {} failed ({}):\n{tail}",
+                args.join(" "),
+                output.status
+            ),
         )
     }
 }
@@ -140,7 +286,15 @@ pub fn selected_properties_gate(repo: &Repo) -> Gate {
 }
 
 pub fn workspace_tests_gate(repo: &Repo) -> Gate {
-    let g = cargo(repo, &["test", "--workspace"]);
+    let meta = match cargo_metadata() {
+        Ok(meta) => meta,
+        Err(e) => return Gate::unknown("workspace-tests", &format!("cargo metadata failed: {e}")),
+    };
+    let binaries = match product_binaries(repo, &meta, &member_names(&meta)) {
+        Ok(binaries) => binaries,
+        Err(e) => return Gate::fail("workspace-tests", &e),
+    };
+    let g = test_cargo(repo, &["test", "--workspace"], binaries.as_ref());
     Gate {
         name: "workspace-tests".to_string(),
         ..g
@@ -159,9 +313,13 @@ pub fn affected_tests_gate(repo: &Repo, _config: &Config) -> Gate {
     if affected.is_empty() {
         return Gate::ok("affected-tests", "no affected crates changed");
     }
+    let binaries = match product_binaries(repo, &meta, &affected) {
+        Ok(binaries) => binaries,
+        Err(e) => return Gate::fail("affected-tests", &e),
+    };
     let mut failures: Vec<String> = Vec::new();
     for name in &affected {
-        let g = cargo(repo, &["test", "-p", name]);
+        let g = test_cargo(repo, &["test", "-p", name], binaries.as_ref());
         if g.verdict == "FAIL" {
             failures.push(format!("{name}: {}", g.detail));
         }
@@ -416,32 +574,64 @@ fn cargo_tool_available(repo: &Repo, subcmd: &str) -> bool {
     ok
 }
 
-/// Integration tests: every workspace member's tests/ dir. Runs each via
-/// `cargo test -p <member> --test <name>`; none declared => UNKNOWN.
-pub fn integration_gate(repo: &Repo) -> Gate {
-    let meta = match cargo_metadata() {
-        Ok(m) => m,
-        Err(e) => return Gate::unknown("integration", &format!("cargo metadata failed: {e}")),
-    };
-    let mut targets: Vec<(String, String)> = Vec::new(); // (member, test name)
-    for (name, dir) in member_manifests(&meta) {
-        for f in rs_files_under(&dir.join("tests")) {
-            if let Some(stem) = f.file_stem().map(|s| s.to_string_lossy().to_string()) {
-                targets.push((name.clone(), stem));
+/// Declared Cargo test targets only: helper files are not independent targets.
+fn integration_targets(meta: &Value) -> Vec<(String, String)> {
+    let mut targets = Vec::new();
+    if let (Some(packages), Some(members)) = (
+        meta["packages"].as_array(),
+        meta["workspace_members"].as_array(),
+    ) {
+        for package in packages.iter().filter(|p| members.contains(&p["id"])) {
+            if let (Some(name), Some(tests)) =
+                (package["name"].as_str(), package["targets"].as_array())
+            {
+                for test in tests {
+                    if test["kind"]
+                        .as_array()
+                        .is_some_and(|kinds| kinds.iter().any(|kind| kind == "test"))
+                    {
+                        if let Some(test_name) = test["name"].as_str() {
+                            targets.push((name.to_string(), test_name.to_string()));
+                        }
+                    }
+                }
             }
         }
     }
     targets.sort();
     targets.dedup();
+    targets
+}
+
+/// Runs each real target via `cargo test -p <member> --test <name>`.
+/// None declared => UNKNOWN.
+pub fn integration_gate(repo: &Repo) -> Gate {
+    let meta = match cargo_metadata() {
+        Ok(m) => m,
+        Err(e) => return Gate::unknown("integration", &format!("cargo metadata failed: {e}")),
+    };
+    let targets = integration_targets(&meta);
     if targets.is_empty() {
         return Gate::unknown(
             "integration",
-            "no integration test targets declared (no member has tests/*.rs)",
+            "no integration test targets declared by cargo metadata",
         );
     }
+    let packages = targets
+        .iter()
+        .map(|(member, _)| member.clone())
+        .collect::<Vec<_>>();
+    let binaries = match product_binaries(repo, &meta, &packages) {
+        Ok(binaries) => binaries,
+        Err(e) => return Gate::fail("integration", &e),
+    };
     let mut failures: Vec<String> = Vec::new();
     for (member, test) in &targets {
-        let g = cargo(repo, &["test", "-p", member, "--test", test]);
+        let g = test_cargo(
+            repo,
+            &["test", "-p", member, "--test", test],
+            binaries.as_ref(),
+        );
         if g.verdict == "FAIL" {
             failures.push(format!("{member}::{test}: {}", g.detail));
         }
@@ -1154,6 +1344,64 @@ pub fn resource_kind_neutrality_gate(config: &Config) -> Gate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_targets_include_declared_names_and_exclude_helpers_and_dependencies() {
+        let meta = serde_json::json!({"workspace_members":["workspace"], "packages":[
+            {"id":"workspace","name":"fixture", "targets":[
+                {"name":"declared-custom-name","kind":["test"],"src_path":"tests/nested/entry.rs"},
+                {"name":"lib","kind":["lib"]},
+                {"name":"example","kind":["example"]}]},
+            {"id":"dependency","name":"external", "targets":[{"name":"external-test","kind":["test"]}]}]});
+        assert_eq!(
+            integration_targets(&meta),
+            vec![("fixture".into(), "declared-custom-name".into())]
+        );
+        assert!(integration_targets(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn binary_artifacts_require_current_workspace_non_test_complete_unambiguous_files() {
+        let root = std::env::temp_dir().join(format!("n37-artifacts-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = Repo { root: root.clone() };
+        let meta = serde_json::json!({"workspace_members":["cli-id","daemon-id"], "packages":[
+            {"name":"nexus","id":"cli-id"},{"name":"nexusd","id":"daemon-id"}]});
+        for name in ["nexus", "nexusd"] {
+            std::fs::write(root.join(name), "artifact fixture").unwrap();
+        }
+        let artifact = |id: &str, name: &str| {
+            serde_json::json!({"reason":"compiler-artifact",
+            "package_id":id, "target":{"name":name,"kind":["bin"]}, "profile":{"test":false}, "executable":name})
+        };
+        let cli = artifact("cli-id", "nexus");
+        let daemon = artifact("daemon-id", "nexusd");
+        let parse = |values: &[Value]| {
+            binaries_from_artifacts(
+                &repo,
+                &meta,
+                values
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .as_bytes(),
+            )
+        };
+        let bins = parse(&[cli.clone(), daemon.clone()]).unwrap();
+        assert_eq!(bins.cli, root.join("nexus"));
+        assert_eq!(bins.daemon, root.join("nexusd"));
+        assert!(parse(std::slice::from_ref(&cli)).is_err());
+        assert!(parse(&[artifact("foreign", "nexus"), daemon.clone()]).is_err());
+        let mut test = cli.clone();
+        test["profile"]["test"] = Value::Bool(true);
+        assert!(parse(&[test, daemon.clone()]).is_err());
+        assert!(parse(&[cli.clone(), cli.clone(), daemon.clone()]).is_err());
+        assert!(binaries_from_artifacts(&repo, &meta, b"malformed JSON").is_err());
+        std::fs::remove_file(root.join("nexusd")).unwrap();
+        assert!(parse(&[cli, daemon]).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn member_manifests_only_contains_workspace_members() {

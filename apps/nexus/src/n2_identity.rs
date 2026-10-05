@@ -20,10 +20,21 @@ use crate::n2_store::N2Store;
 const AUTH_IDENTITY_KEY: &str = "n2/auth-identity";
 const AUTH_IDENTITY_VERSION: u32 = 1;
 
+// 同进程首次创建必须只有一个 writer；已有身份的读取不经过此锁。
+// 跨进程共享节点目录的初始化仍需由节点所有者协调。
+static AUTH_IDENTITY_INITIALIZATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 确保本节点 ed25519 授权身份存在（不存在则生成并落盘；幂等）。
 ///
 /// 返回 `(公钥 32 字节, Principal)`。
 pub fn ensure_auth_identity(store: &N2Store) -> Result<([u8; 32], Principal), String> {
+    if let Some((pubkey, _)) = load_auth_identity(store)? {
+        return Ok((pubkey, Principal::from_ed25519_public_key(&pubkey)));
+    }
+    let _initialization = AUTH_IDENTITY_INITIALIZATION
+        .lock()
+        .map_err(|_| "auth identity initialization lock poisoned".to_string())?;
+    // 等待锁时另一个调用者可能已完成创建，不能覆盖其 canonical seed。
     if let Some((pubkey, _)) = load_auth_identity(store)? {
         return Ok((pubkey, Principal::from_ed25519_public_key(&pubkey)));
     }
@@ -116,6 +127,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn concurrent_cold_initialization_returns_one_persisted_identity() {
+        let dir = temp_node_dir("concurrent-cold");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    let store = N2Store::open(&dir).unwrap();
+                    barrier.wait();
+                    ensure_auth_identity(&store).unwrap()
+                })
+            })
+            .collect();
+        let identities: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let store = N2Store::open(&dir).unwrap();
+        let persisted = ensure_auth_identity(&store).unwrap();
+        assert!(
+            identities.iter().all(|identity| identity == &persisted),
+            "all successful callers must receive the persisted canonical identity"
+        );
+        assert_eq!(
+            auth_keypair(&store).unwrap().public_key().as_ref(),
+            persisted.0
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

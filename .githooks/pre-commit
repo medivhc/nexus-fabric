@@ -25,7 +25,7 @@ fi
 if git diff --cached --name-only --diff-filter=ACMRD | grep -q '\.rs$' \
    && [ -f "$ROOT/Cargo.toml" ]; then
   if command -v cargo >/dev/null 2>&1; then
-    if ! (cd "$ROOT" && cargo fmt --check --all >/dev/null 2>&1); then
+    if ! worktree_cargo fmt --check --all >/dev/null 2>&1; then
       log_error "cargo fmt --check failed; run 'cargo fmt' before committing"
       fail=1
     fi

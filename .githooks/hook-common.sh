@@ -46,3 +46,24 @@ is_valid_task_type() {
     *) return 1 ;;
   esac
 }
+
+# Keep the hook's Git/index environment intact. Only validation subprocesses
+# enter the worktree without Git's repository-local variables.
+worktree_cargo() (
+  task_git_vars="$(git rev-parse --local-env-vars)" || exit 1
+  for task_git_var in $task_git_vars; do unset "$task_git_var"; done
+  cd "$ROOT" || exit 1
+  task_main="$(git worktree list --porcelain | sed -n '1s/^worktree //p')" || exit 1
+  task_target="${CARGO_TARGET_DIR:-}"
+  if [ -n "$task_target" ] && [ "$task_main" != "$ROOT" ]; then
+    # Resolve an existing parent, also handling relative paths and spaces.
+    task_parent="$(dirname "$task_target")"
+    task_leaf="$(basename "$task_target")"
+    task_resolved="$(cd "$task_parent" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$task_leaf")" || task_resolved="$task_target"
+    if [ "$task_resolved" = "$task_main/target" ]; then
+      CARGO_TARGET_DIR="$ROOT/target"
+      export CARGO_TARGET_DIR
+    fi
+  fi
+  exec cargo "$@"
+)

@@ -376,23 +376,30 @@ mod tests {
 
     #[test]
     fn explain_unknown_resource_exits_1() {
-        // P1-20：资源不存在是业务 FAIL → exit 1（此前为 0）。
-        // 注意：不能用 `dev-svc` 断言本用例——它是 registry 静态种子，始终存在
-        // （见 explain_known_resource_is_estimate_and_exits_0）。
-        let code = run_plan(
-            &["explain".to_string(), "no-such-resource".to_string()],
-            true,
-        );
+        // P1-20：资源不存在是业务 FAIL → exit 1。
+        // 使用注入的私有目录，避免宿主配置/静态 dev-svc 种子改变测试含义。
+        let dir = temp_node_dir("explain-missing");
+        let err = preview_snapshot(&dir, "missing-explain-resource", 1000).unwrap_err();
+        assert!(matches!(err, NexusError::NotFound { .. }));
+        let out = fail_json(&err);
+        assert_eq!(out["error"]["code"], json!("NOT_FOUND"));
+        let code = render(&out, true);
         assert_eq!(code, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn explain_known_resource_is_estimate_and_exits_0() {
-        // 静态种子的 dev-svc 存在 → explain 走 estimate 模式成功，exit 0。
-        // 与 E4 场景 product.observability-plan-explain（期望 verdict=PASS）一致。
-        // "估算非承诺"标注与 JSON 形状由 explain_json_carries_mode_and_commitment 覆盖。
-        let code = run_plan(&["explain".to_string(), "dev-svc".to_string()], true);
-        assert_eq!(code, 0);
+        let dir = temp_node_dir("explain-estimate");
+        let (_, kind, snapshot) = preview_snapshot(&dir, "dev-svc", 1000).unwrap();
+        let explained = ExplainedPlan::estimate(snapshot);
+        let out = explain_json(&explained, Some(kind), Some("dev-svc"));
+        assert_eq!(out["mode"], json!("estimate"));
+        assert!(out["commitment"].as_str().unwrap().contains("估算非承诺"));
+        assert_eq!(out["plan"]["read_only"], json!(true));
+        assert_eq!(out["plan"]["resource"], json!("dev-svc"));
+        assert_eq!(render(&out, true), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
