@@ -5516,8 +5516,8 @@ pub fn proxy_serve_once(
                     }
                 }
             }
-            // 尽力向节点发送 close_notify（不阻断结果）。
-            conn.send_close_notify();
+            // NEW_WARN_1: TLS close_notify 仅排队不发送（无 flush），删掉误导性调用；
+            // 连接由 drop 关闭（TCP FIN），满足 fail-closed。
             // node 是 wrapped 流（Box<dyn ObfuscatedStream>），无法恢复 inner 的
             // blocking 模式；arm 结束时流即 drop 关闭 fd，无需恢复。
 
@@ -11800,9 +11800,8 @@ mod hysteria2_dataplane_tests {
     #[test]
     fn target_mapping_rejects_bad_obfs() {
         let yaml = hy2_outbound_yaml(4443).replace("skip_cert_verify: true", "obfs: xor");
-        let cfg = nexus_proxy_config::parse(&yaml).unwrap();
-        let selected = cfg.outbounds.iter().find(|o| o.tag == "h").unwrap();
-        let err = hysteria2_target_from_outbound(selected, "h").unwrap_err();
+        // WARN5: 未知 obfs 在配置解析阶段即被拒绝（fail-closed 前移）。
+        let err = nexus_proxy_config::parse(&yaml).unwrap_err();
         assert!(format!("{err:?}").contains("obfs"), "err: {err:?}");
     }
 
