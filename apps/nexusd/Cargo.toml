@@ -18,6 +18,9 @@ nexus-network = { path = "../../crates/nexus-network" }
 nexus-proxy-config = { path = "../../crates/nexus-proxy-config" }
 nexus-proxy-transport = { path = "../../crates/nexus-proxy-transport" }
 nexus-outbound-trojan = { path = "../../crates/nexus-outbound-trojan" }
+nexus-outbound-anytls = { path = "../../crates/nexus-outbound-anytls" }
+nexus-outbound-vless = { path = "../../crates/nexus-outbound-vless" }
+nexus-outbound-hysteria2 = { path = "../../crates/nexus-outbound-hysteria2" }
 nexus-projection = { path = "../../crates/nexus-projection" }
 nexus-connectivity = { path = "../../crates/nexus-connectivity" }
 nexus-dns = { path = "../../crates/nexus-dns" }

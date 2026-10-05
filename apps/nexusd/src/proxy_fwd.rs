@@ -89,7 +89,13 @@ fn dial_config_from_outbound(o: &OutboundConfig) -> Option<ProxyDialConfig> {
             }
         }
         OutboundKind::Socks5 => Some(ProxyDialConfig::Socks5 { server }),
-        OutboundKind::Direct | OutboundKind::Relay | OutboundKind::Vmess => None,
+        // AnyTLS/VLESS/Hysteria2 需要完整 adapter（TLS/QUIC 握手），简单 dial 路径暂不支持。
+        OutboundKind::Direct
+        | OutboundKind::Relay
+        | OutboundKind::Vmess
+        | OutboundKind::Anytls
+        | OutboundKind::Vless
+        | OutboundKind::Hysteria2 => None,
     }
 }
 

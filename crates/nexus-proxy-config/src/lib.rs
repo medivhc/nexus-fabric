@@ -319,6 +319,12 @@ pub enum OutboundKind {
     Trojan,
     /// SOCKS5 出站（RFC 1928；P3 新增，用于 ProxyEngine TCP/UDP 转发）。
     Socks5,
+    /// AnyTLS 出站（nexus-outbound-anytls）。
+    Anytls,
+    /// VLESS 出站（nexus-outbound-vless）。
+    Vless,
+    /// Hysteria2 出站（nexus-outbound-hysteria2）。
+    Hysteria2,
 }
 
 impl OutboundKind {
@@ -332,6 +338,9 @@ impl OutboundKind {
             Self::Vmess => "vmess",
             Self::Trojan => "trojan",
             Self::Socks5 => "socks5",
+            Self::Anytls => "anytls",
+            Self::Vless => "vless",
+            Self::Hysteria2 => "hysteria2",
         }
     }
 
@@ -343,10 +352,13 @@ impl OutboundKind {
             "vmess" => Ok(Self::Vmess),
             "trojan" => Ok(Self::Trojan),
             "socks5" => Ok(Self::Socks5),
+            "anytls" => Ok(Self::Anytls),
+            "vless" => Ok(Self::Vless),
+            "hysteria2" => Ok(Self::Hysteria2),
             other => Err(ConfigError::new(
                 "kind",
                 format!(
-                    "unknown outbound kind '{other}' (supports direct/relay/shadowsocks/vmess/trojan/socks5)"
+                    "unknown outbound kind '{other}' (supports direct/relay/shadowsocks/vmess/trojan/socks5/anytls/vless/hysteria2)"
                 ),
             )),
         }
@@ -374,6 +386,24 @@ pub struct OutboundConfig {
     pub obfs: Option<String>,
     /// 混淆插件参数 key（如 xor 的 key 材料；None/空 → 需 key 的插件 wrap 失败）。
     pub obfs_key: Option<String>,
+    /// vless UUID（仅 vless）。
+    pub uuid: Option<String>,
+    /// vless flow（仅 vless）："xtls-rprx-vision" 或空。
+    pub flow: Option<String>,
+    /// vless 是否启用 TLS（仅 vless；Vision 要求 true）。
+    pub tls: Option<bool>,
+    /// vless servername/SNI（仅 vless；缺省用 locator host）。
+    pub servername: Option<String>,
+    /// anytls/hysteria2 SNI（缺省用 locator host）。
+    pub sni: Option<String>,
+    /// hysteria2 端口跳跃范围（仅 hysteria2）："10000-20000,30000"。
+    pub ports: Option<String>,
+    /// hysteria2 上行带宽（仅 hysteria2）："100 Mbps"。
+    pub up: Option<String>,
+    /// hysteria2 下行带宽（仅 hysteria2）："100 Mbps"。
+    pub down: Option<String>,
+    /// hysteria2 salamander 混淆密码（仅 hysteria2）。
+    pub obfs_password: Option<String>,
 }
 
 /// DNS 多 server 路由配置（PRODUCT §11.5）。
@@ -737,6 +767,15 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
             let header_format = opt_str(item, "header_format");
             let obfs = opt_str(item, "obfs");
             let obfs_key = opt_str(item, "obfs_key");
+            let uuid = opt_str(item, "uuid");
+            let flow = opt_str(item, "flow");
+            let tls = opt_bool(item, "tls");
+            let servername = opt_str(item, "servername");
+            let sni = opt_str(item, "sni");
+            let ports = opt_str(item, "ports");
+            let up = opt_str(item, "up");
+            let down = opt_str(item, "down");
+            let obfs_password = opt_str(item, "obfs_password");
             outbounds.push(OutboundConfig {
                 tag,
                 kind,
@@ -748,6 +787,15 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
                 header_format,
                 obfs,
                 obfs_key,
+                uuid,
+                flow,
+                tls,
+                servername,
+                sni,
+                ports,
+                up,
+                down,
+                obfs_password,
             });
         }
     }
@@ -777,6 +825,84 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
     }
 
     // Trojan 出站（§11.9.3）：password/locator 必填；header_format 仅 standard|singbox。
+    for o in &outbounds {
+        if o.kind == OutboundKind::Anytls {
+            if o.password.as_ref().map(String::is_empty).unwrap_or(true) {
+                return Err(ConfigError::new(
+                    format!("outbounds[{}].password", o.tag),
+                    "anytls outbound requires a non-empty password",
+                ));
+            }
+            if o.locator.as_ref().map(String::is_empty).unwrap_or(true) {
+                return Err(ConfigError::new(
+                    format!("outbounds[{}].locator", o.tag),
+                    "anytls outbound requires a locator (host:port)",
+                ));
+            }
+        }
+    }
+
+    for o in &outbounds {
+        if o.kind == OutboundKind::Vless {
+            if o.uuid.as_ref().map(String::is_empty).unwrap_or(true) {
+                return Err(ConfigError::new(
+                    format!("outbounds[{}].uuid", o.tag),
+                    "vless outbound requires a non-empty uuid",
+                ));
+            }
+            if o.locator.as_ref().map(String::is_empty).unwrap_or(true) {
+                return Err(ConfigError::new(
+                    format!("outbounds[{}].locator", o.tag),
+                    "vless outbound requires a locator (host:port)",
+                ));
+            }
+            if let Some(f) = o.flow.as_deref() {
+                if !f.is_empty() && f != "xtls-rprx-vision" {
+                    return Err(ConfigError::new(
+                        format!("outbounds[{}].flow", o.tag),
+                        format!("vless flow must be '' or 'xtls-rprx-vision', got '{f}'"),
+                    ));
+                }
+                if f == "xtls-rprx-vision" && o.tls != Some(true) {
+                    return Err(ConfigError::new(
+                        format!("outbounds[{}].tls", o.tag),
+                        "vless flow xtls-rprx-vision requires tls: true",
+                    ));
+                }
+            }
+        }
+    }
+
+    for o in &outbounds {
+        if o.kind == OutboundKind::Hysteria2 {
+            if o.password.as_ref().map(String::is_empty).unwrap_or(true) {
+                return Err(ConfigError::new(
+                    format!("outbounds[{}].password", o.tag),
+                    "hysteria2 outbound requires a non-empty password",
+                ));
+            }
+            if o.locator.as_ref().map(String::is_empty).unwrap_or(true) {
+                return Err(ConfigError::new(
+                    format!("outbounds[{}].locator", o.tag),
+                    "hysteria2 outbound requires a locator (host:port)",
+                ));
+            }
+            if let Some(ob) = o.obfs.as_deref() {
+                if ob == "salamander"
+                    && o.obfs_password
+                        .as_ref()
+                        .map(String::is_empty)
+                        .unwrap_or(true)
+                {
+                    return Err(ConfigError::new(
+                        format!("outbounds[{}].obfs_password", o.tag),
+                        "hysteria2 obfs salamander requires obfs_password",
+                    ));
+                }
+            }
+        }
+    }
+
     for o in &outbounds {
         if o.kind == OutboundKind::Trojan {
             if o.password.as_ref().map(String::is_empty).unwrap_or(true) {
@@ -1266,6 +1392,15 @@ fn parse_node_line(line: &str) -> Result<OutboundConfig, (String, RejectedEntry)
                 header_format: None,
                 obfs: None,
                 obfs_key: None,
+                uuid: None,
+                flow: None,
+                tls: None,
+                servername: None,
+                sni: None,
+                ports: None,
+                up: None,
+                down: None,
+                obfs_password: None,
             })
         }
         "vmess" => Ok(OutboundConfig {
@@ -1279,6 +1414,15 @@ fn parse_node_line(line: &str) -> Result<OutboundConfig, (String, RejectedEntry)
             header_format: None,
             obfs: None,
             obfs_key: None,
+            uuid: None,
+            flow: None,
+            tls: None,
+            servername: None,
+            sni: None,
+            ports: None,
+            up: None,
+            down: None,
+            obfs_password: None,
         }),
         other => Err((
             line.to_string(),
@@ -1789,6 +1933,197 @@ outbounds:
     }
 
     #[test]
+    fn anytls_config_parses_all_fields() {
+        let yaml = "\
+schema_version: 1
+rules:
+  - tag: m
+    kind: match
+    action:
+      - kind: select_outbound
+        tag: a
+outbounds:
+  - tag: a
+    kind: anytls
+    locator: example.com:443
+    password: secret123
+    sni: example.com
+    skip_cert_verify: true
+";
+        let cfg = parse(yaml).expect("ok");
+        let o = &cfg.outbounds[0];
+        assert_eq!(o.kind, OutboundKind::Anytls);
+        assert_eq!(o.kind.as_str(), "anytls");
+        assert_eq!(o.locator.as_deref(), Some("example.com:443"));
+        assert_eq!(o.password.as_deref(), Some("secret123"));
+        assert_eq!(o.sni.as_deref(), Some("example.com"));
+        assert_eq!(o.skip_cert_verify, Some(true));
+    }
+
+    #[test]
+    fn anytls_rejects_missing_password() {
+        let yaml = "\
+schema_version: 1
+rules:
+  - tag: m
+    kind: match
+    action:
+      - kind: select_outbound
+        tag: a
+outbounds:
+  - tag: a
+    kind: anytls
+    locator: example.com:443
+";
+        assert!(parse(yaml).is_err());
+    }
+
+    #[test]
+    fn vless_config_parses_all_fields() {
+        let yaml = "\
+schema_version: 1
+rules:
+  - tag: m
+    kind: match
+    action:
+      - kind: select_outbound
+        tag: v
+outbounds:
+  - tag: v
+    kind: vless
+    locator: example.com:443
+    uuid: 123e4567-e89b-12d3-a456-426614174000
+    flow: xtls-rprx-vision
+    tls: true
+    servername: example.com
+";
+        let cfg = parse(yaml).expect("ok");
+        let o = &cfg.outbounds[0];
+        assert_eq!(o.kind, OutboundKind::Vless);
+        assert_eq!(o.kind.as_str(), "vless");
+        assert_eq!(
+            o.uuid.as_deref(),
+            Some("123e4567-e89b-12d3-a456-426614174000")
+        );
+        assert_eq!(o.flow.as_deref(), Some("xtls-rprx-vision"));
+        assert_eq!(o.tls, Some(true));
+        assert_eq!(o.servername.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn vless_vision_requires_tls() {
+        let yaml = "\
+schema_version: 1
+rules:
+  - tag: m
+    kind: match
+    action:
+      - kind: select_outbound
+        tag: v
+outbounds:
+  - tag: v
+    kind: vless
+    locator: example.com:443
+    uuid: 123e4567-e89b-12d3-a456-426614174000
+    flow: xtls-rprx-vision
+";
+        assert!(parse(yaml).is_err());
+    }
+
+    #[test]
+    fn vless_rejects_bad_flow() {
+        let yaml = "\
+schema_version: 1
+rules:
+  - tag: m
+    kind: match
+    action:
+      - kind: select_outbound
+        tag: v
+outbounds:
+  - tag: v
+    kind: vless
+    locator: example.com:443
+    uuid: 123e4567-e89b-12d3-a456-426614174000
+    flow: bogus-flow
+";
+        assert!(parse(yaml).is_err());
+    }
+
+    #[test]
+    fn hysteria2_config_parses_all_fields() {
+        let yaml = "\
+schema_version: 1
+rules:
+  - tag: m
+    kind: match
+    action:
+      - kind: select_outbound
+        tag: h
+outbounds:
+  - tag: h
+    kind: hysteria2
+    locator: example.com:443
+    password: secret123
+    ports: 10000-20000,30000
+    up: 100 Mbps
+    down: 200 Mbps
+    sni: example.com
+    skip_cert_verify: true
+";
+        let cfg = parse(yaml).expect("ok");
+        let o = &cfg.outbounds[0];
+        assert_eq!(o.kind, OutboundKind::Hysteria2);
+        assert_eq!(o.kind.as_str(), "hysteria2");
+        assert_eq!(o.password.as_deref(), Some("secret123"));
+        assert_eq!(o.ports.as_deref(), Some("10000-20000,30000"));
+        assert_eq!(o.up.as_deref(), Some("100 Mbps"));
+        assert_eq!(o.down.as_deref(), Some("200 Mbps"));
+        assert_eq!(o.sni.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn hysteria2_salamander_requires_obfs_password() {
+        let yaml = "\
+schema_version: 1
+rules:
+  - tag: m
+    kind: match
+    action:
+      - kind: select_outbound
+        tag: h
+outbounds:
+  - tag: h
+    kind: hysteria2
+    locator: example.com:443
+    password: secret123
+    obfs: salamander
+";
+        assert!(parse(yaml).is_err());
+    }
+
+    #[test]
+    fn unknown_kind_error_lists_new_protocols() {
+        let yaml = "\
+schema_version: 1
+rules:
+  - tag: m
+    kind: match
+    action:
+      - kind: select_outbound
+        tag: x
+outbounds:
+  - tag: x
+    kind: wireguard
+    locator: example.com:443
+";
+        let err = parse(yaml).unwrap_err().to_string();
+        assert!(err.contains("anytls"), "err: {err}");
+        assert!(err.contains("vless"), "err: {err}");
+        assert!(err.contains("hysteria2"), "err: {err}");
+    }
+
+    #[test]
     fn trojan_default_header_format_is_standard() {
         let yaml = "\
 schema_version: 1
@@ -1851,6 +2186,15 @@ mod subscription_online_tests {
             header_format: None,
             obfs: None,
             obfs_key: None,
+            uuid: None,
+            flow: None,
+            tls: None,
+            servername: None,
+            sni: None,
+            ports: None,
+            up: None,
+            down: None,
+            obfs_password: None,
         }]
     }
 

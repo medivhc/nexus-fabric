@@ -1096,6 +1096,8 @@ impl ProxyService {
             // Trojan 出站不经 LinkActivator 探测；由 nexus-outbound-trojan adapter 在
             // Composition Root 承接（§11.9）。
             OutboundKind::Trojan => None,
+            // AnyTLS/VLESS/Hysteria2 同理：由各自 adapter 在 Composition Root 承接。
+            OutboundKind::Anytls | OutboundKind::Vless | OutboundKind::Hysteria2 => None,
         };
         activator
             .activate(&direct, relay.as_ref(), false, false)

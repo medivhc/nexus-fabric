@@ -53,6 +53,15 @@ fn run() -> Result<String, Outcome> {
         header_format: None,
         obfs: Some("xor".to_string()),
         obfs_key: Some(KEY.to_string()),
+        uuid: None,
+        flow: None,
+        tls: None,
+        servername: None,
+        sni: None,
+        ports: None,
+        up: None,
+        down: None,
+        obfs_password: None,
     };
     let obfs = cfg.obfs.as_deref();
     let params = ObfsParams {

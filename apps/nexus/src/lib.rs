@@ -4935,6 +4935,24 @@ pub fn proxy_serve_once(
                 reason: "socks5 outbound data-plane tunnel via nexus app deferred; use nexusd ProxyEngine (P1-P5)".into(),
             });
         }
+        nexus_proxy_config::OutboundKind::Anytls => {
+            return Err(NexusError::ConnectivityEstablishmentFailed {
+                provider: ProviderId(decision.selected_outbound_tag.clone()),
+                reason: "anytls outbound data-plane not in this batch: nexus-outbound-anytls provides frame codec and auth primitives; missing TLS handshake + relay integration in nexus app data-plane (deferred)".into(),
+            });
+        }
+        nexus_proxy_config::OutboundKind::Vless => {
+            return Err(NexusError::ConnectivityEstablishmentFailed {
+                provider: ProviderId(decision.selected_outbound_tag.clone()),
+                reason: "vless outbound data-plane not in this batch: nexus-outbound-vless provides frame codec and config validation; missing TCP/TLS + VLESS handshake + relay integration in nexus app data-plane (deferred)".into(),
+            });
+        }
+        nexus_proxy_config::OutboundKind::Hysteria2 => {
+            return Err(NexusError::ConnectivityEstablishmentFailed {
+                provider: ProviderId(decision.selected_outbound_tag.clone()),
+                reason: "hysteria2 outbound data-plane not in this batch: nexus-outbound-hysteria2 provides QUIC client and frame codec; missing integration with nexus app connection flow (QUIC runtime differs from app's blocking TCP model) (deferred)".into(),
+            });
+        }
     };
 
     // 6) Session 终态。

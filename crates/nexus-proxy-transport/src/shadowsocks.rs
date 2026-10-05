@@ -286,6 +286,15 @@ mod tests {
             header_format: None,
             obfs: None,
             obfs_key: None,
+            uuid: None,
+            flow: None,
+            tls: None,
+            servername: None,
+            sni: None,
+            ports: None,
+            up: None,
+            down: None,
+            obfs_password: None,
         }
     }
 
