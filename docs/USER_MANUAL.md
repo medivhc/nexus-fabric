@@ -1,22 +1,17 @@
 # Nexus 用户手册
 
-> 版本：基于 master
-> `b6c2a41`
-> （2026-09-26 校验；工作区含未提交无关文件，dirty_state=true）
-> 校验证据：
-> `nexus-harness verify --full`
-> →
-> **22/22 门禁 PASS，0 FAIL，0 unknown**
-> （evidence `verify-4ce69aac9494`，绑定 b6c2a41 /dirty，contract_hash 2384d0f0…）
-> 2026-09-26：计划任务 CLI 接入（PRODUCT §14，`nexus schedule at|every|list|cancel|tick`，
-> 新 E4 场景 `product.schedule-cli` / `product.schedule-cli-reachable`，Red Evidence
-> `.evidence/red-schedcli-20260926/`）；`nexusd` 用法错误 exit 统一为 2、USAGE 补
-> subnet/system-proxy/autostart/proxy speedtest。修复/落地记录见 §6.2。
-> 2026-09-20：NAT 场景 TOML 修复 + 9 个 `cli-*` 场景 thin-client 契约（requirement-change）
-> 后 product-scenarios 转绿；随后 **Workspace Projection 通道落地**（NativeApi WorkingSet +
-> MaterializedDirectory 物化目录，E4 场景 `platform.workspace-projection-channels` 16 期望）
-> 已合并（0a819ed）。
-> 本手册所列每个功能的可机检场景（E4/E3）在本次校验中均 PASS。
+> 版本：基于 master `67a75ff`（2026-10-04 按代码实际实现对齐更新）
+> 本次更新性质：**docs**（依据 `apps/nexus/src/main.rs`、各 `*_cli.rs`、`localapi_client.rs`、
+> `observability.rs` 与 `nexusd/src/main.rs` 的实际命令面重写 CLI / N2 / N3 / network / config 章节；
+> **不改变任何产品行为**，场景期望与 PRODUCT 契约未动）。
+> 旧声明（基于 `b6c2a41`、evidence `verify-4ce69aac9494`、22/22 PASS）已随 revision 前进而 **STALE**：
+> 本手册不再复用该证据，条目均附代码路径与 E4/E3 场景来源，可在目标 revision 上用
+> `nexus-harness verify --full` 重新生成证据复现校验（Final PASS 只由 Harness 产生）。
+> 2026-10-04：补齐此前缺席或误归属的命令面 —— N2 资源访问（`nexus plan|use|session|resource|grant|provider|node|pair`，
+> PRODUCT §16）、N3 任务（`nexus task|artifact`，PRODUCT §17）、`nexus network up|status`、
+> `nexus config get|set|list`、`nexus proxy bufferbloat-test`；修正此前误记为 `nexusd <verb>` 的观察命令
+> （现归 `nexus` CLI 名下，`nexusd` 仅保留 `<config-folder>` 与 `serve`）；修正默认 LocalAPI 传输目标
+> （**unix socket 优先**，非固定 TCP `127.0.0.1:18080`）。
 
 本手册只收录**有完整实现逻辑、用户可达**的功能。每个功能均附代码级校验：可机检场景（E4/E3）在 `verify --full` 中 PASS、可执行驱动（example / CLI 命令 / 集成测试）与来源代码路径。
 
@@ -66,9 +61,10 @@ Resolve Candidate Providers
 
 | 项                  | 要求                                 |
 | ------------------ | ---------------------------------- |
-| Rust               | stable 1.95.0（`rustc` / `cargo`）   |
-| 目标平台               | x86\_64-pc-windows-msvc（本手册校验环境）   |
-| nightly（仅 fuzz 门禁） | `rustup toolchain install nightly` |
+| Rust               | 工作区 `edition = "2024"`、`rust-version = "1.85"`（见 `Cargo.toml`）；CI/沙箱实测 stable 1.92 |
+| 目标平台               | Linux / Windows / macOS（平台专有功能仅在对应平台构建；本手册在 Linux 校验）              |
+| nightly（仅 fuzz 门禁） | `rustup toolchain install nightly`（`cargo +nightly fuzz check`）      |
+| 其它验证工具             | `cargo-deny`、`cargo-llvm-cov`、`wasm32-wasip1` target（`verify --full` 的相应门禁） |
 
 ### 2.2 构建
 
@@ -84,20 +80,53 @@ cargo build --workspace
 
 | 二进制                   | 角色                             | 命令示例                                          |
 | --------------------- | ------------------------------ | --------------------------------------------- |
-| `nexusd`              | 进程内组合根（run /host/relay /proxy） | `nexus proxy run internet-access --json`           |
-| `nexusd serve`        | 常驻 daemon：HTTP LocalAPI 提供方    | `nexusd serve --addr 127.0.0.1:18080`         |
-| `nexus`               | 控制面 CLI 前端（thin-client）        | `nexus status --json`                         |
+| `nexus`               | 用户控制面 CLI：thin-client 观察命令 + 进程内命令族 | `nexus status --json` / `nexus use dev-svc` / `nexus subnet up --config c.toml` |
+| `nexusd`              | 常驻 daemon：配置目录入口 + HTTP LocalAPI 提供方 | `nexusd serve` / `nexusd <config-folder>`      |
 | `nexus-platform-host` | 平台宿主（能力声明）                     | `nexus-platform-host vpi-capabilities --json` |
 
-两种使用形态：
+三种使用形态（详见 §4.9）：
 
 
 
-* **进程内闭环**：`nexus proxy run/host/relay/proxy` 直接装配 SDK 组合根执行，输出结构化 JSON（exit 0 = 请求已被处理，拒绝也是处理结果）。
+* **thin-client 观察命令**：`nexus` 经 `nexusd serve` 的 HTTP LocalAPI 查询 daemon 快照。**8 个命令有 daemon 路由**（静态 5：`status` / `dns status` / `dns cache` / `connectivity status` / `platform capabilities`；动态 3：`workspace commit <ws>` / `session watch <id>` / `plan explain <res>`）；daemon 未运行 → 结构化 `DAEMON_UNREACHABLE`（exit 0）。另有 **10 个观察命令无路由**（`dns resolve|providers`、`connectivity candidates|probe|links`、`workspace heads|conflicts|cache`、`compute jobs`、`diagnose`），CLI 本地合成显式 `UNSUPPORTED`（PRODUCT §9 禁止静默降级）。
 
-* **常驻 daemon + 瘦客户端**：先启动 `nexusd serve --addr <ip:port>`（HTTP LocalAPI，默认监听 `127.0.0.1:0` 随机端口），再由 `nexus` CLI 经 `--addr`（默认 `127.0.0.1:18080`）查询。**CLI 的 7 个观察命令依赖 daemon**：daemon 未运行时返回结构化 `DAEMON_UNREACHABLE`（exit 0）；其余 10 个观察命令无 LocalAPI 路由，CLI 本地合成显式 `UNSUPPORTED`（PRODUCT §9 禁止静默降级，不回落进程内 observability）。
+* **进程内命令族（不经 daemon）**：`nexus plan|use|session|resource|grant|node|pair|network|subnet|schedule|system-proxy|autostart|config|run` 与 `nexus proxy ...` 直接装配 SDK 组合根执行，输出结构化 JSON（exit 0 = 请求已被处理，拒绝也是处理结果）。
+
+* **daemon 任务链（N3）**：`nexus task ...` 为 `nexusd` /localapi/v1/task 的 thin-client（POST）；`nexus artifact get` 当前诚实返回 `UNSUPPORTED_CAPABILITY`（未装配下载适配器）。
+
+传输目标：`nexus` / `nexusd serve` 默认 **unix socket 优先**（`$XDG_RUNTIME_DIR/nexus-localapi.sock`，否则 `temp_dir()/nexus-<uid>/nexus-localapi.sock`，0700；均不可用才回退 TCP `127.0.0.1:18080`）；`--addr <ip:port>` 可显式切 TCP loopback，`--socket <path>` 指定 socket 路径（Windows 构建下 `--socket` 不可用）。
 
 ## 3. 功能总览
+
+### 3.1 命令面总览（按 `nexus` CLI 实际分发，2026-10-04 对齐）
+
+下表为 `apps/nexus/src/main.rs` 分发逻辑中**实际可达**的全部命令。全局选项 `--json` / `--addr <ip:port>` / `--socket <path>` 可在任意位置剥离；exit 语义见 §4.9。
+
+| 命令族 | 语法 | 路由/实现 | 产出 |
+| --- | --- | --- | --- |
+| 观察（thin-client） | `status`；`dns status\|cache`；`connectivity status`；`platform capabilities` | daemon 静态路由（5） | daemon JSON 原样渲染 |
+| 观察（thin-client，带参） | `workspace commit <ws>`；`session watch <id>`；`plan explain <res>` | daemon 动态路由（3） | daemon JSON |
+| 观察（无路由） | `dns resolve\|providers`；`connectivity candidates\|probe\|links`；`workspace heads\|conflicts\|cache`；`compute jobs`；`diagnose` | 本地合成 `UNSUPPORTED`（10） | `{verdict:"FAIL",error:{code:"UNSUPPORTED",command}}` |
+| N2 资源访问（PRODUCT §16） | `plan <res>`；`plan explain <res\|session-id>`；`use <res>` | 进程内（N2 存储） | 规划预览 / 四步闭环 |
+| N2 会话 | `session list`；`session watch <id>`；`session close <id>` | 进程内（`session watch` 另有 daemon 路由） | 会话视图 / 关闭为 `Cancelled` |
+| N2 资源目录 | `resource list`；`resource show <name>`；`resource publish --name <n> --kind <k> [--locator <l>...]`；`resource revoke <name>`；`resource export <name> [--file <p>]`；`resource import [--file <p>]` | 进程内 | 发布/撤销/导入导出 |
+| N2 授权 | `grant add --resource <r> (--principal <p>\|--self) --op <Use\|Manage> [--not-after <n>]`；`grant revoke\|del --resource <r> --principal <p>`；`grant list [--resource <r>]` | 进程内（outbox 广播） | grant 表变更 |
+| N2 身份/信任 | `node init [--force]`；`node trust --provider <id> --pubkey <hex>` | 进程内（本地文件） | NodeId / TOFU 信任 |
+| N2 提供方 | `provider serve --bind <addr:port> [--once]` | 常驻准入服务 | stderr 日志（无 JSON） |
+| 设备配对（D7，§4.9.4） | `pair invite\|join\|list\|remove --dir <config-dir> [...]` | 进程内（本地文件 + 前台 TCP） | 纯文本（无 JSON） |
+| N3 任务（PRODUCT §17） | `task submit --request <file>`；`task show\|cancel\|artifacts <id>`；`task logs <id> --stream <stdout\|stderr> --offset <n>` | thin-client（POST `/localapi/v1/task`） | 版本化任务 envelope |
+| N3 产物 | `artifact get <id> --output <path>` | 未装配 → `UNSUPPORTED_CAPABILITY`（不写输出） | FAIL envelope |
+| N1 装配 | `network up --config <toml>`；`network status [--config <toml>]` | 进程内 Composition Root（仅 Linux） | 建 TUN→dial→包泵 / 诚实状态 |
+| 虚拟子网（PRODUCT §12） | `subnet up\|status\|leave\|punch` | 进程内 SDK | 隧道状态 / 打洞结果 |
+| 计划任务（PRODUCT §14） | `schedule at\|every\|list\|cancel\|tick` | 进程内 SDK | 注册表 JSON |
+| 代理数据面（PRODUCT §11） | `proxy [--addr <ip:port>] [--config <path>] [--tun] [--tun-name <n>]`；`proxy speedtest`；`proxy bufferbloat-test --proxy <ip:port> [--duration <s>] [--threshold <ms>]`；`proxy run\|host\|relay ...` | 进程内（自 `nexusd` 迁移） | SOCKS5 会话 JSON / READY |
+| 平台控制（PRODUCT §13） | `system-proxy status\|set\|clear\|e2e`；`autostart install\|remove\|status` | 进程内 SDK（Windows；非 Windows 返回 `UNSUPPORTED`） | JSON |
+| 配置文件夹 | `config get\|set\|list --dir <config-dir> [file]` | 本地文件（原子写） | 内容 / `PASS` |
+| 资源执行 | `run <resource>`；`run <resource> -- <cmd...>` | 进程内 SDK；后者诚实拒绝 `UNSUPPORTED{feature:"run-with-command",layer:"N3"}` | 运行结果 / FAIL |
+
+`nexusd` 侧仅保留两种形态：`nexusd <config-folder>`（配置目录入口）与 `nexusd serve [--addr <ip:port>] [--socket <path>]`（LocalAPI 提供方）；此前的 `nexusd run/host/relay/proxy/system-proxy/autostart/subnet/schedule` 均已迁移至 `nexus` CLI。
+
+### 3.2 功能—场景对照表
 
 以下 50 项功能均已通过代码级校验（场景 / 集成测试 PASS + 驱动可运行）。括号内为场景 ID 与期望条数；历史遗留限制与本次修复记录见 §6。45–50 为 2026-09-26 实测落地项（schedule CLI 有 E4 场景；其余为 E5 实测 + example 驱动）。
 
@@ -130,12 +159,12 @@ cargo build --workspace
 | 23 | 崩溃恢复（冷启动 Reconciliation）                                | `regression.crash-recovery` (4)                                                                                                                                                             | example / SDK                                               |
 | 24 | 终态恰一次提交                                                 | `regression.session-outcome-exactly-once` (2)                                                                                                                                               | example / SDK                                               |
 | 25 | 未知资源结构化拒绝                                               | `product.daemon-rejects-unknown-resource` (4)                                                                                                                                               | `nexus proxy run <unknown> --json`                               |
-| 26 | Observability 总览                                        | `product.observability-status` (4)                                                                                                                                                          | `nexusd status --json`                                      |
-| 27 | Observability: plan explain                             | `product.observability-plan-explain` (4)                                                                                                                                                    | `nexusd plan explain --json`                                |
-| 28 | Observability: session watch                            | `product.observability-session-watch` (4)                                                                                                                                                   | `nexusd session watch --json`                               |
-| 29 | Observability: dns cache                                | `product.observability-dns-cache` (3)                                                                                                                                                       | `nexusd dns cache --json`                                   |
-| 30 | Observability: 完整命令集                                    | `observability-{dns-resolve,dns-providers,connectivity-candidates,connectivity-probe,connectivity-links,workspace-heads,workspace-conflicts,workspace-cache,compute-jobs,diagnose}`（见 §4.7） | `nexusd <verb> --json`                                      |
-| 31 | 未就绪命令显式 UNSUPPORTED                                     | `product.observability-unsupported` (3)                                                                                                                                                     | `nexusd connectivity trace --json`                          |
+| 26 | Observability 总览                                        | `product.observability-status` (4)                                                                                                                                                          | `nexus status --json`（daemon 路由）                            |
+| 27 | Observability: plan explain                             | `product.observability-plan-explain` (4)                                                                                                                                                    | `nexus plan explain <res> --json`（daemon 动态路由）             |
+| 28 | Observability: session watch                            | `product.observability-session-watch` (4)                                                                                                                                                   | `nexus session watch <id> --json`（daemon 动态路由）             |
+| 29 | Observability: dns cache                                | `product.observability-dns-cache` (3)                                                                                                                                                       | `nexus dns cache --json`（daemon 路由）                         |
+| 30 | Observability: 完整命令集                                    | `observability-{dns-resolve,dns-providers,connectivity-candidates,connectivity-probe,connectivity-links,workspace-heads,workspace-conflicts,workspace-cache,compute-jobs,diagnose}`（见 §4.7） | `nexus <verb> --json`（有 daemon 路由者走 daemon，其余本地 `UNSUPPORTED`） |
+| 31 | 未就绪命令显式 UNSUPPORTED                                     | `product.observability-unsupported` (3)                                                                                                                                                     | `nexus diagnose --json`（无路由 → 本地 `UNSUPPORTED`）             |
 | 32 | Windows VPI 能力声明（wintun）                                | `platform.virtual-packet-interface` (10)                                                                                                                                                    | `nexus-platform-host vpi-capabilities --json`               |
 | 33 | 虚拟子网隧道（Virtual Subnet）                                  | `product.virtual-subnet-tunnel` (7)                                                                                                                                                         | example / SDK                                               |
 | 34 | 三节点虚拟子网静态路由（mesh）                                       | `product.virtual-subnet-mesh-3node` (9)                                                                                                                                                     | harness run / SDK                                           |
