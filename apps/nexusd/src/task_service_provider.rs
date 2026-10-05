@@ -1,7 +1,11 @@
 use super::*;
 use crate::{
     task_artifacts::{ArtifactAccess, FileTaskArtifacts},
+    task_capacity_recovery::{
+        CapacityOwnerGuard, begin_capacity_owner_recovery, finish_capacity_owner_recovery,
+    },
     task_executor::{LinuxTaskExecutor, LogStream},
+    task_sessions::TaskSessionBridge,
     task_store::FileTaskAcceptanceStore,
 };
 use nexus::n3_acceptance::{new_task_id, sha256};
@@ -23,12 +27,17 @@ pub(super) struct ProviderService {
     owner: TaskOwner<FileTaskAcceptanceStore>,
     executor: LinuxTaskExecutor,
     artifacts: FileTaskArtifacts,
+    store: FileTaskAcceptanceStore,
+    sessions: Option<TaskSessionBridge>,
+    // The live capacity-owner lease must outlive every request and adapter.
+    _capacity_owner: Option<CapacityOwnerGuard>,
 }
 impl ProviderService {
     pub(super) fn open(
         config_root: &Path,
         provider: &str,
         workspace: &str,
+        sessions: Option<SharedSessionManager>,
     ) -> Result<Self, TaskError> {
         let metadata = fs::symlink_metadata(config_root).map_err(io)?;
         use std::os::unix::fs::PermissionsExt;
@@ -68,6 +77,11 @@ impl ProviderService {
         // This batch serves previously accepted Tasks. It cannot provision a
         // provider authority or infer a fresh provider from a missing directory.
         let store = FileTaskAcceptanceStore::open_existing(&root)?;
+        let capacity_owner = if sessions.is_some() {
+            begin_capacity_owner_recovery(&store)?
+        } else {
+            None
+        };
         let owner = TaskOwner::new(store.clone(), sha256, new_task_id);
         let artifacts = FileTaskArtifacts::open(&root)?;
         let executor = LinuxTaskExecutor::open(&root, Vec::new())?;
@@ -83,6 +97,15 @@ impl ProviderService {
                 Err(e) => return Err(e),
             }
         }
+        let bridge = match sessions {
+            Some(sessions) => {
+                let bridge = TaskSessionBridge::open(config_root, store.clone(), sessions)?;
+                bridge.reconcile(&owner)?;
+                finish_capacity_owner_recovery(&store, &executor, capacity_owner.as_ref())?;
+                Some(bridge)
+            }
+            None => None,
+        };
         Ok(Self {
             config_root: config_root.to_owned(),
             root,
@@ -91,10 +114,44 @@ impl ProviderService {
             owner,
             executor,
             artifacts,
+            store,
+            sessions: bridge,
+            _capacity_owner: capacity_owner,
         })
     }
     pub(super) fn workspace(&self) -> &str {
         &self.workspace
+    }
+    pub(super) fn prepare_with_existing_session(
+        &self,
+        context: &TaskCallContext,
+        id: &TaskId,
+        session: &nexus_domain::SessionId,
+    ) -> Result<RuntimeState, TaskError> {
+        let result = (|| {
+            let state = self.state(context, id)?;
+            if state.view.outcome != nexus_domain::task::TaskOutcome::Unfinished {
+                return Err(TaskError::invalid(
+                    "terminal Task cannot prepare a resource Session",
+                ));
+            }
+            self.store
+                .verify_capacity_for_start(&state.view.accepted_contract)?;
+            self.sessions
+                .as_ref()
+                .ok_or_else(|| unsupported("resource Session integration is not assembled"))?
+                .bind_existing(&self.owner, id, session)
+        })();
+        if let Err(error) = &result {
+            nexus::task_authorization::audit_refusal(
+                &self.config_root,
+                context.principal(),
+                context.workspace(),
+                Some(id.as_str()),
+                &format!("Task Session preparation refused: {}", error.code.as_str()),
+            )?;
+        }
+        result
     }
     fn authorize(
         &self,
@@ -115,6 +172,9 @@ impl ProviderService {
         match self.owner.runtime(id) {
             Ok(state) => {
                 self.authorize(context, &state.view.accepted_contract, id)?;
+                if let Some(bridge) = &self.sessions {
+                    bridge.close_confirmed(&self.owner, &state)?;
+                }
                 Ok(state)
             }
             Err(error) => {
@@ -175,9 +235,11 @@ impl TaskApplicationService for ProviderService {
             ))),
             TaskRequest::Cancel { task_id } => {
                 self.state(context, &task_id)?;
-                Ok(TaskResponse::Task(Box::new(
-                    self.executor.cancel(&task_id, "User")?.view,
-                )))
+                let state = self.executor.cancel(&task_id, "User")?;
+                if let Some(bridge) = &self.sessions {
+                    bridge.close_confirmed(&self.owner, &state)?;
+                }
+                Ok(TaskResponse::Task(Box::new(state.view)))
             }
             TaskRequest::ReadLogs {
                 task_id,

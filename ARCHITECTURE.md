@@ -288,3 +288,5 @@ Compute 不直接依赖 storage/platform/network；持久记录、进程执行�
 提供方 durable StartIntent/执行句柄用于核实崩溃窗口，未知时不自动再 spawn。
 TaskOutcome 与 Session TerminalOutcome 分别恰一次提交，不要求两侧共识。
 细节与冻结范围见 `docs/N3-MODEL-CONTRACT.md`；产品入口见 PRODUCT §17。
+
+N3-8：组合根的私有 acceptance envelope v2 将容量与接受记录共同持久化；计算核心保持纯 TaskOwner 事件归约。活 capacity owner 持有文件 lease；核实恢复前拒绝新启动/GC。Task 服务注入现有唯一 SessionManager，仅绑定已有 Session 并经 Manager 清理；不添加 wire DTO 或第二套所有者。详见 docs/N3-8-CAPACITY-SESSION-CONTRACT.md。

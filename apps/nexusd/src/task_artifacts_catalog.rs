@@ -62,7 +62,8 @@ pub(super) fn save(root: &Path, image: &Image, ledger: &AcceptanceLedger) -> Res
 }
 pub(super) fn load(root: &Path, ledger: &AcceptanceLedger) -> Result<Option<Image>, TaskError> {
     let authority = disk::read(&root.join("acceptance-initialized-v1"), 1024)?;
-    let required = authority == AUTHORITY_RECEIPT;
+    let required = authority == AUTHORITY_RECEIPT
+        || authority == crate::task_capacity::CAPACITY_ARTIFACT_AUTHORITY_RECEIPT;
     let receipt = match fs::symlink_metadata(root.join(RECEIPT)) {
         Ok(_) => Some(disk::read(&root.join(RECEIPT), 1024)?),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -128,7 +129,15 @@ pub(super) fn initialize(root: &Path, ledger: &AcceptanceLedger) -> Result<(), T
     if !root.join(RECEIPT).exists() {
         disk::atomic(root, RECEIPT, RECEIPT_BYTES)?;
     }
-    disk::atomic(root, "acceptance-initialized-v1", AUTHORITY_RECEIPT)?;
+    let authority = disk::read(&root.join("acceptance-initialized-v1"), 1024)?;
+    let next = if authority == crate::task_capacity::CAPACITY_AUTHORITY_RECEIPT
+        || authority == crate::task_capacity::CAPACITY_ARTIFACT_AUTHORITY_RECEIPT
+    {
+        crate::task_capacity::CAPACITY_ARTIFACT_AUTHORITY_RECEIPT
+    } else {
+        AUTHORITY_RECEIPT
+    };
+    disk::atomic(root, "acceptance-initialized-v1", next)?;
     load(root, ledger)?;
     Ok(())
 }

@@ -86,8 +86,11 @@ fn find<'a>(ledger: &'a AcceptanceLedger, id: &TaskId) -> Result<&'a AcceptedTas
 }
 pub(crate) fn initialize(root: &Path, accepted: &AcceptanceLedger) -> Result<(), TaskError> {
     let receipt = read_private(&root.join(RECEIPT), false)?;
-    let required = read_private(&root.join("acceptance-initialized-v1"), true)?.as_deref()
-        == Some(crate::task_store::RUNTIME_AUTHORITY_RECEIPT)
+    let authority = read_private(&root.join("acceptance-initialized-v1"), true)?;
+    let required = authority
+        .as_deref()
+        .is_some_and(crate::task_capacity::is_capacity_receipt)
+        || authority.as_deref() == Some(crate::task_store::RUNTIME_AUTHORITY_RECEIPT)
         || read_private(&root.join("acceptance-initialized-v1"), true)?.as_deref()
             == Some(crate::task_artifacts::AUTHORITY_RECEIPT);
     if required && receipt.is_none() {
@@ -319,6 +322,14 @@ impl TaskRuntimeStore for FileTaskAcceptanceStore {
                 ));
             }
             if changed {
+                if image.journals[index].events.last().is_some_and(|event| {
+                    matches!(
+                        event.action,
+                        RuntimeAction::Prepare | RuntimeAction::StartIntent { .. }
+                    )
+                }) {
+                    crate::task_capacity::verify_action(root, accepted, id)?;
+                }
                 save(root, &image)?;
             } else {
                 sync(root)?;

@@ -46,9 +46,10 @@ static WORKSPACE_MGR: std::sync::OnceLock<
 /// - [`spawn_n2_session_sweeper`] 的周期性 `sweep_detached` 在这里提交终态。
 ///
 /// `None` = 装配失败（degraded：daemon 照常跑，LocalAPI 返回结构化 FAIL）。
-static N2_SESSION_MANAGER: std::sync::OnceLock<
-    std::sync::Mutex<Option<nexus_session::SessionManager>>,
-> = std::sync::OnceLock::new();
+static N2_SESSION_MANAGER: std::sync::OnceLock<(
+    std::path::PathBuf,
+    nexusd::task_service::SharedSessionManager,
+)> = std::sync::OnceLock::new();
 
 /// N2 会话清扫周期（秒）：断开超 attach window 的会话由 daemon 收敛为
 /// `Cancelled(ClientDetached)`（P1-2：`sweep_detached` 生产可达）。
@@ -80,7 +81,7 @@ fn spawn_n2_session_sweeper(
                     return;
                 }
                 let swept = {
-                    let Some(cell) = N2_SESSION_MANAGER.get() else {
+                    let Some((_, cell)) = N2_SESSION_MANAGER.get() else {
                         continue;
                     };
                     let Ok(mut guard) = cell.lock() else {
@@ -106,28 +107,36 @@ fn spawn_n2_session_sweeper(
         .ok()
 }
 
-/// 幂等地装配 daemon 内唯一 N2 SessionManager（P1-1）。
-///
-/// `OnceLock::set` 只成功一次，因此 `run_daemon` 与 `serve` 两条入口都调用
-/// 它也不会出现第二个 manager——这正是 D1 要求的"唯一"。
-fn ensure_n2_session_manager() {
-    if N2_SESSION_MANAGER.get().is_some() {
-        return;
+/// Assemble once inside the initializer, binding ownership to this entry's root.
+fn ensure_n2_session_manager(
+    config_root: &std::path::Path,
+) -> nexusd::task_service::SharedSessionManager {
+    let root = config_root
+        .canonicalize()
+        .unwrap_or_else(|_| config_root.to_owned());
+    let (owned_root, sessions) = N2_SESSION_MANAGER.get_or_init(|| {
+        let manager = match assembly::assemble_n2_session_manager(&root) {
+            Ok(manager) => {
+                eprintln!(
+                    "[nexusd] N2 SessionManager assembled ({} sessions loaded)",
+                    manager.len()
+                );
+                Some(manager)
+            }
+            Err(error) => {
+                eprintln!("[nexusd] WARN: N2 SessionManager assembly failed: {error} (degraded)");
+                None
+            }
+        };
+        (root.clone(), Arc::new(std::sync::Mutex::new(manager)))
+    });
+    if owned_root != &root {
+        eprintln!(
+            "[nexusd] WARN: N2 SessionManager already owns a different config root; refusing Task integration"
+        );
+        return Arc::new(std::sync::Mutex::new(None));
     }
-    let root = nexus::node_cli::node_dir();
-    match assembly::assemble_n2_session_manager(&root) {
-        Ok(mgr) => {
-            eprintln!(
-                "[nexusd] N2 SessionManager assembled ({} sessions loaded)",
-                mgr.len()
-            );
-            let _ = N2_SESSION_MANAGER.set(std::sync::Mutex::new(Some(mgr)));
-        }
-        Err(e) => {
-            eprintln!("[nexusd] WARN: N2 SessionManager assembly failed: {e} (degraded)");
-            let _ = N2_SESSION_MANAGER.set(std::sync::Mutex::new(None));
-        }
-    }
+    Arc::clone(sessions)
 }
 
 /// 当前 unix 秒（daemon 侧时钟；reconcile/sweep 用）。
@@ -164,7 +173,7 @@ fn outcome_label(outcome: &nexus_domain::TerminalOutcome) -> &'static str {
 
 /// `GET /localapi/v0/n2/session/list` — daemon 内唯一 SessionManager 的会话列表（D1）。
 fn n2_session_list() -> Result<Value, (String, String)> {
-    let Some(cell) = N2_SESSION_MANAGER.get() else {
+    let Some((_, cell)) = N2_SESSION_MANAGER.get() else {
         return Err((
             "N2_UNAVAILABLE".to_string(),
             "N2 session manager not assembled".to_string(),
@@ -191,7 +200,7 @@ fn n2_session_list() -> Result<Value, (String, String)> {
 
 /// `GET /localapi/v0/n2/session/attach?session=<id>` — 重附着查询（完成标志 3）。
 fn n2_session_attach(id: Option<&str>) -> Result<Value, (String, String)> {
-    let Some(cell) = N2_SESSION_MANAGER.get() else {
+    let Some((_, cell)) = N2_SESSION_MANAGER.get() else {
         return Err((
             "N2_UNAVAILABLE".to_string(),
             "N2 session manager not assembled".to_string(),
@@ -449,7 +458,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     // 唯一 Owner（§13 结构化并发）；提供方侧只做 admission＋租约，不做第二个
     // 领域 Session。
     // 真正持有实例（D1 落地）＋周期性 sweep_detached（P1-2）。
-    ensure_n2_session_manager();
+    ensure_n2_session_manager(&dir.root);
     let n2_sweeper_handle = spawn_n2_session_sweeper(&shutdown);
 
     // T3：缺 proxy.yaml 且缺 network.toml 且缺 workspace.toml → 拒绝启动（无意义）。
@@ -743,7 +752,8 @@ fn serve_localapi(
     shutdown: Arc<AtomicBool>,
     config_root: &std::path::Path,
 ) {
-    let tasks = nexusd::task_service::LocalTaskService::open(config_root);
+    let sessions = ensure_n2_session_manager(config_root);
+    let tasks = nexusd::task_service::LocalTaskService::open_with_sessions(config_root, sessions);
     let addr: std::net::SocketAddr = match addr_raw.parse() {
         Ok(a) => a,
         Err(e) => {
@@ -767,14 +777,17 @@ fn serve_localapi(
         .map(|a| a.to_string())
         .unwrap_or_default();
     let _ = ready_tx.send(actual);
-    let token = match nexus::localapi_client::load_or_create_bearer_token() {
+    let token = match assembly::load_localapi_token(config_root) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("[nexusd] localapi bearer token unavailable: {e}");
             return;
         }
     };
-    let token_authority = nexusd::task_http::TokenAuthority::open(&token);
+    let token_authority = nexusd::task_http::TokenAuthority::open_at(
+        &token,
+        assembly::localapi_token_path(config_root),
+    );
     loop {
         if shutdown.load(Ordering::Relaxed) {
             eprintln!("[nexusd] localapi: shutdown signal, exiting");
@@ -837,7 +850,8 @@ fn serve_resource(args: &[String]) -> ExitCode {
     // P1-1：`serve` 形态也必须持有 daemon 内唯一的 N2 SessionManager，否则
     // `/localapi/v0/n2/session/*` 会报 N2_UNAVAILABLE（D1 只在 `run_daemon`
     // 路径装配）。token 与 N2 存储同源于 node_dir，这里沿用同一口径。
-    ensure_n2_session_manager();
+    let config_root = task_config_root();
+    ensure_n2_session_manager(&config_root);
     match flags.get("--addr").and_then(|v| v.as_deref()) {
         Some(raw) => serve_over_tcp(raw),
         None => match flags.get("--socket").and_then(|v| v.as_deref()) {
@@ -866,8 +880,8 @@ fn serve_resource(args: &[String]) -> ExitCode {
 }
 
 /// 加载 LocalAPI bearer token；失败则打印结构化 FAIL 并返回 Err(ExitCode)。
-fn localapi_bearer_token() -> Result<String, ExitCode> {
-    nexus::localapi_client::load_or_create_bearer_token().map_err(|e| {
+fn localapi_bearer_token(config_root: &std::path::Path) -> Result<String, ExitCode> {
+    assembly::load_localapi_token(config_root).map_err(|e| {
         println!(
             "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"TOKEN_SETUP\",\"message\":\"bearer token: {e}\"}}}}"
         );
@@ -877,8 +891,10 @@ fn localapi_bearer_token() -> Result<String, ExitCode> {
 
 /// TCP loopback 监听 + 服务循环（既有行为）。
 fn serve_over_tcp(addr_raw: &str) -> ExitCode {
-    let tasks = nexusd::task_service::LocalTaskService::open(&task_config_root());
-    let token = match localapi_bearer_token() {
+    let config_root = task_config_root();
+    let sessions = ensure_n2_session_manager(&config_root);
+    let tasks = nexusd::task_service::LocalTaskService::open_with_sessions(&config_root, sessions);
+    let token = match localapi_bearer_token(&config_root) {
         Ok(t) => t,
         Err(code) => return code,
     };
@@ -904,7 +920,10 @@ fn serve_over_tcp(addr_raw: &str) -> ExitCode {
     println!(
         "{{\"verdict\":\"READY\",\"daemon\":{{\"entry\":\"nexusd\",\"command\":\"serve\",\"addr\":\"{actual_addr}\"}}}}"
     );
-    let token_authority = nexusd::task_http::TokenAuthority::open(&token);
+    let token_authority = nexusd::task_http::TokenAuthority::open_at(
+        &token,
+        assembly::localapi_token_path(&config_root),
+    );
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
@@ -931,14 +950,16 @@ fn serve_over_tcp(addr_raw: &str) -> ExitCode {
 #[cfg(unix)]
 fn serve_over_socket(path: &str) -> ExitCode {
     use std::os::unix::{fs::PermissionsExt, net::UnixListener};
-    let tasks = nexusd::task_service::LocalTaskService::open(&task_config_root());
+    let config_root = task_config_root();
+    let sessions = ensure_n2_session_manager(&config_root);
+    let tasks = nexusd::task_service::LocalTaskService::open_with_sessions(&config_root, sessions);
     let private_parent = std::path::Path::new(path)
         .parent()
         .and_then(|p| std::fs::symlink_metadata(p).ok())
         .is_some_and(|m| {
             m.is_dir() && !m.file_type().is_symlink() && m.permissions().mode() & 0o077 == 0
         });
-    let token = match localapi_bearer_token() {
+    let token = match localapi_bearer_token(&config_root) {
         Ok(t) => t,
         Err(code) => return code,
     };
@@ -965,7 +986,10 @@ fn serve_over_socket(path: &str) -> ExitCode {
     println!(
         "{{\"verdict\":\"READY\",\"daemon\":{{\"entry\":\"nexusd\",\"command\":\"serve\",\"socket\":\"{path}\"}}}}"
     );
-    let token_authority = nexusd::task_http::TokenAuthority::open(&token);
+    let token_authority = nexusd::task_http::TokenAuthority::open_at(
+        &token,
+        assembly::localapi_token_path(&config_root),
+    );
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
@@ -1010,9 +1034,7 @@ fn serve_over_socket(path: &str) -> ExitCode {
 use nexusd::task_http::HttpIo as LocalIo;
 
 fn task_config_root() -> std::path::PathBuf {
-    std::env::var_os("NEXUS_CONFIG_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("/etc/nexus"))
+    nexus::node_cli::node_dir()
 }
 
 /// C1：`GET /localapi/v0/workspace/mounts` — 已挂载 workspace 状态快照。

@@ -302,5 +302,13 @@
     "module": ".githooks / engineering/nexus-harness",
     "category": "implementation-pitfall",
     "summary": "Git push继承GIT_DIR污染Cargo测试root；中心wrapper覆盖worktree target/PATH；Harness需预构建实际双binary并按Cargo metadata发现test target。"
+  },
+  {
+    "id": "n3-capacity-session-recovery",
+    "file": "entries/2026-10-05-n3-capacity-owner-and-session-recovery.md",
+    "date": "2026-10-05",
+    "module": "apps/nexusd / nexus-compute",
+    "category": "implementation-pattern",
+    "summary": "原子容量镜像、活 owner 门禁、准备/取消竞态与已有 SessionManager 持久补偿"
   }
 ]

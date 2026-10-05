@@ -13,6 +13,11 @@ use std::collections::BTreeMap;
 /// evidence. Stopped means the complete subtree was stopped and reaped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeAction {
+    /// Trusted composition has checked the existing resource Session, its Plan,
+    /// authorization and concrete capacity. This event never owns that Session.
+    SessionAttached {
+        session_id: String,
+    },
     Prepare,
     StartIntent {
         handle: String,
@@ -215,6 +220,16 @@ fn apply(state: &mut RuntimeState, event: &RuntimeEvent, hash: DigestFn) -> Resu
         ));
     }
     match &event.action {
+        RuntimeAction::SessionAttached { session_id } => {
+            TaskId::new(session_id.clone())?;
+            require(
+                v.outcome == TaskOutcome::Unfinished,
+                "terminal Task cannot acquire a resource Session",
+            )?;
+            if !v.session_ids.contains(session_id) {
+                v.session_ids.push(session_id.clone());
+            }
+        }
         RuntimeAction::Prepare => {
             require(
                 v.phase == TaskPhase::Waiting && v.cancellation.state == CancellationState::None,
@@ -533,6 +548,10 @@ fn fail_finished(v: &mut TaskView, error: TaskError) {
 impl CanonicalDto for RuntimeAction {
     fn to_value(&self) -> Value {
         let (kind, extra) = match self {
+            Self::SessionAttached { session_id } => (
+                "SessionAttached",
+                vec![("session_id", session_id.to_value())],
+            ),
             Self::Prepare => ("Prepare", vec![]),
             Self::StartIntent { handle } => ("StartIntent", vec![("handle", handle.to_value())]),
             Self::Started { at_unix } => ("Started", vec![("at_unix", at_unix.to_value())]),
@@ -592,6 +611,9 @@ impl CanonicalDto for RuntimeAction {
         };
         let kind: String = take(&mut f, "kind")?;
         let action = match kind.as_str() {
+            "SessionAttached" => Self::SessionAttached {
+                session_id: take(&mut f, "session_id")?,
+            },
             "Prepare" => Self::Prepare,
             "StartIntent" => Self::StartIntent {
                 handle: take(&mut f, "handle")?,
@@ -652,3 +674,7 @@ record_codec!(RuntimeEvent {
     action: RuntimeAction
 });
 record_codec!(RuntimeJournal { schema_version: u64, task_id: TaskId, contract_digest: Sha256Digest, events: Vec<RuntimeEvent> });
+
+#[cfg(test)]
+#[path = "task_runtime_session_tests.rs"]
+mod session_tests;

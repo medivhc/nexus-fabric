@@ -17,6 +17,8 @@ use std::{
 };
 #[path = "task_executor_archive.rs"]
 mod archive;
+#[path = "task_executor_capacity.rs"]
+mod capacity;
 #[path = "task_executor_docker.rs"]
 mod docker;
 #[path = "task_executor_logs.rs"]
@@ -49,8 +51,8 @@ pub struct LogPage {
 }
 /// Only operator-approved immutable images with POSIX preparation utilities.
 /// Synchronous owner keeps all I/O and kernel resources within one call. The
-/// mandatory callback must recheck current grants and the actual reservation;
-/// this adapter does not infer these facts from AcceptedContract fields.
+/// mandatory callback rechecks current grants. The adapter independently checks
+/// a real held capacity reservation; accepted strings alone cannot authorize spawn.
 pub struct LinuxTaskExecutor {
     root: PathBuf,
     owner: TaskOwner<FileTaskAcceptanceStore>,
@@ -175,24 +177,32 @@ impl LinuxTaskExecutor {
             ));
         }
         let contract = state.view.accepted_contract.clone();
+        FileTaskAcceptanceStore::open(&self.root)?.verify_capacity_for_start(&contract)?;
         verify_start(&contract)?;
         self.verify_environment(&contract.environment_evidence, &contract.request.limits)?;
         let frozen = self
             .snapshots
             .verify_inputs(&contract.request.input_snapshot, &contract.request.cwd)?;
+        // Publish preparation authority under the same lock as runtime release.
+        // A concurrent never-started cancellation cannot free this claim and
+        // then permit a preparation container to appear after that release.
+        let (logs, _lease) =
+            FileTaskAcceptanceStore::open(&self.root)?.with_capacity_start(&contract, || {
+                let logs = Logs::create(
+                    &self.root,
+                    id,
+                    &state.view.contract_digest,
+                    contract.request.limits.log_bytes,
+                )?;
+                let lease = logs.lock("owner.lock", true)?;
+                Ok((logs, lease))
+            })?;
         let prepared = self
             .snapshots
             .prepare_inputs(&contract.request.input_snapshot, &contract.request.cwd)?;
         if state.view.phase == TaskPhase::Waiting {
             self.record(id, RuntimeAction::Prepare)?;
         }
-        let logs = Logs::create(
-            &self.root,
-            id,
-            &state.view.contract_digest,
-            contract.request.limits.log_bytes,
-        )?;
-        let _lease = logs.lock("owner.lock", true)?;
         let result = self.execute(
             id,
             &contract,
@@ -212,7 +222,19 @@ impl LinuxTaskExecutor {
                 let _ = self.record(id, RuntimeAction::ObservationLost);
             }
         }
+        drop(_lease);
+        if result.is_ok() {
+            self.release_capacity_after_confirmation(id)?;
+        }
         result
+    }
+    fn release_capacity_after_confirmation(&self, id: &TaskId) -> Result<(), TaskError> {
+        match self.release_verified_capacity(id) {
+            // A live preparer or unresolved original execution retains its
+            // claim; the Task event itself remains an intact observable fact.
+            Err(error) if error.code == TaskErrorCode::CapacityUnavailable => Ok(()),
+            result => result,
+        }
     }
     fn validate_admission(&self, requested: &TaskId) -> Result<(), TaskError> {
         // A released owner lease is not evidence that its kernel workload
@@ -334,13 +356,17 @@ impl LinuxTaskExecutor {
             .as_ref()
             .map(|logs| logs.lock("start.lock", false))
             .transpose()?;
-        self.record(
+        let cancelled = self.record(
             id,
             RuntimeAction::Cancel {
                 reason: reason.into(),
                 at_unix: now()?,
             },
-        )
+        )?;
+        if cancelled.view.cancellation.state == CancellationState::Confirmed {
+            self.release_capacity_after_confirmation(id)?;
+        }
+        Ok(cancelled)
     }
     /// External reads require the accepted principal/workspace and current grant.
     pub fn logs(

@@ -269,6 +269,77 @@ pub fn assemble_n2_session_manager(
     Ok(manager)
 }
 
+/// The explicit daemon root owns the default token; preserve the operator's
+/// dedicated token-file override without consulting NEXUS_CONFIG_DIR again.
+pub fn localapi_token_path(config_root: &std::path::Path) -> std::path::PathBuf {
+    std::env::var_os("NEXUS_LOCALAPI_TOKEN_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| config_root.join("localapi.token"))
+}
+
+pub fn load_localapi_token(config_root: &std::path::Path) -> Result<String, String> {
+    use std::io::{Read, Write};
+    let path = localapi_token_path(config_root);
+    let read = || -> Result<String, String> {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(0x20000 | 0x800);
+        }
+        let mut file = options.open(&path).map_err(|e| e.to_string())?;
+        if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+            return Err("LocalAPI token must be a regular file".into());
+        }
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take(129)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        let token = String::from_utf8(bytes).map_err(|e| e.to_string())?;
+        let token = token.trim();
+        if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("LocalAPI token is corrupt".into());
+        }
+        Ok(token.to_owned())
+    };
+    if path.try_exists().map_err(|e| e.to_string())? {
+        return read();
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "token parent missing".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    // new_task_id is backed by 32 OS-random bytes, independent of Session IDs.
+    let random = nexus::n3_acceptance::new_task_id().map_err(|e| e.to_string())?;
+    let token = random
+        .as_str()
+        .strip_prefix("task-")
+        .ok_or_else(|| "token randomness format".to_string())?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(&path) {
+        Ok(mut file) => {
+            file.write_all(token.as_bytes())
+                .map_err(|e| e.to_string())?;
+            file.sync_all().map_err(|e| e.to_string())?;
+            #[cfg(unix)]
+            std::fs::File::open(parent)
+                .and_then(|file| file.sync_all())
+                .map_err(|e| e.to_string())?;
+            Ok(token.to_owned())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => read(),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 /// 当前 unix 秒（boot reconcile 用时钟）。
 fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()

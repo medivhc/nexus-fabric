@@ -368,3 +368,7 @@ ListArtifacts/GetArtifact；authority 根固定 config-dir/data/n3/tasks。token
 Submit 未具真实容量、唯一 SessionManager 和完整传输时拒绝，不构造占位接受。
 协议及权限、错误、恢复、审计和 localhost 边界见
 docs/N3-6-LOCALAPI-SECURITY-CONTRACT.md；不能把本批局部服务称为完整 N3。
+
+### N3-8 容量与 Session 不变量
+
+遵循 docs/N3-8-CAPACITY-SESSION-CONTRACT.md：私有接受 envelope v2 原子绑定预算/Task/key/pin；显式空根初始化，receipt 禁止降级重建。活 capacity-owner lease + fresh reconcile epoch 决定 Ready；Prepare/StartIntent/GC 在原 acceptance.lock 内重查。未知执行保留容量，真实 reap 只释放 runtime，disk charge 保留。明确 daemon config root 注入同一个 SharedSessionManager；可信内部绑定核实主体、Use、容量、实际 Session/持久 Plan，确认取消先 durable intent 再 Manager close/重载补偿。平台实现留在组合根，公网 Submit/完整下载能力不扩大。

@@ -102,3 +102,7 @@ cargo clippy -p nexus-compute --all-targets -- -D warnings
 ## Platform Constraints
 
 平台专有代码只允许存在于 `nexus-platform-*` 或 Composition Root。Portable crate 必须通过相应 portability gate。
+
+### N3-8 Session 关联事件
+
+TaskOwner 支持 SessionAttached 事件，合法 ID、去重和连续序号由纯归约验证；接受初始 session_ids 仍为空。可信组合根在关联前核实权限、实际容量及原 SessionManager 的持久 Plan。TaskOutcome 与 SessionOutcome 分别由原 Owner 提交，不从 Session 孤儿 Failed 推断 Task 失败。详见 docs/N3-8-CAPACITY-SESSION-CONTRACT.md。

@@ -197,6 +197,7 @@ struct Fixture {
     id: TaskId,
     executor: LinuxTaskExecutor,
     contract: AcceptedContract,
+    _capacity_owner: crate::task_capacity::CapacityOwnerGuard,
 }
 impl Fixture {
     fn new(argv: &[&str], mutate: impl FnOnce(&mut SubmitTaskRequest)) -> Self {
@@ -204,7 +205,45 @@ impl Fixture {
             .expect("supply operator-qualified immutable image ID");
         let dir = Dir::new();
         let root = dir.0.join("provider");
+        use crate::task_capacity::{
+            CapacityBudget, ExecutorBackendOverhead, ProviderCapacityPolicy,
+        };
+        let policy = ProviderCapacityPolicy {
+            total: CapacityBudget {
+                cpu_millis: 64000,
+                memory_bytes: 64 * 1024 * 1024 * 1024,
+                pids: 32768,
+                runtime_storage_bytes: 4 * 1024 * 1024 * 1024,
+                backend_disk_bytes: 1024 * 1024 * 1024 * 1024,
+                slots: 64,
+            },
+            fixed: CapacityBudget {
+                cpu_millis: 10,
+                memory_bytes: 1024 * 1024,
+                pids: 1,
+                runtime_storage_bytes: 4096,
+                backend_disk_bytes: 1024 * 1024,
+                slots: 1,
+            },
+            overhead: ExecutorBackendOverhead {
+                cpu_millis: 10,
+                memory_bytes: 256 * 1024 * 1024,
+                pids: 8,
+                backend_disk_bytes: 1024 * 1024,
+            },
+        };
+        let store = FileTaskAcceptanceStore::provision_capacity(&root, &policy).unwrap();
+        let capacity_owner = crate::task_capacity_recovery::begin_capacity_owner_recovery(&store)
+            .unwrap()
+            .unwrap();
         let snapshots = FileSnapshotStore::open(&root).unwrap();
+        let initial = LinuxTaskExecutor::open(&root, Vec::new()).unwrap();
+        crate::task_capacity_recovery::finish_capacity_owner_recovery(
+            &store,
+            &initial,
+            Some(&capacity_owner),
+        )
+        .unwrap();
         let mut ws = Workspace::init(
             WorkspaceId("executor-project".into()),
             InMemoryContentStore::new(),
@@ -280,6 +319,7 @@ impl Fixture {
             id: accepted.view.task_id.clone(),
             executor,
             contract: accepted.view.accepted_contract,
+            _capacity_owner: capacity_owner,
         }
     }
     fn run(&self) -> RuntimeState {
@@ -328,7 +368,8 @@ fn container_actual_exit_input_output_and_reexecution_guard() {
         ],
         |_| {},
     );
-    let before = fs::read(f.root.join("acceptance-v1.json")).unwrap();
+    let mut before: Json =
+        serde_json::from_slice(&fs::read(f.root.join("acceptance-v1.json")).unwrap()).unwrap();
     let state = f.run();
     assert_eq!(state.view.execution.exit_code, Some(42));
     assert_eq!(state.view.execution.workload_succeeded, Some(false));
@@ -360,7 +401,20 @@ fn container_actual_exit_input_output_and_reexecution_guard() {
         fs::read(logs.directory.join("outputs-unregistered-v1/result.txt")).unwrap(),
         b"output"
     );
-    assert_eq!(fs::read(f.root.join("acceptance-v1.json")).unwrap(), before);
+    let mut after: Json =
+        serde_json::from_slice(&fs::read(f.root.join("acceptance-v1.json")).unwrap()).unwrap();
+    assert_eq!(before["capacity"]["reservations"][0]["runtime_held"], true);
+    assert_eq!(after["capacity"]["reservations"][0]["runtime_held"], false);
+    // The v2 private envelope permits this verified runtime release. All
+    // acceptance, key, pin, policy and retained disk facts remain identical.
+    before["capacity"]["reservations"][0]["runtime_held"] = false.into();
+    before.as_object_mut().unwrap().remove("payload_sha256");
+    after.as_object_mut().unwrap().remove("payload_sha256");
+    assert_eq!(after, before);
+    FileTaskAcceptanceStore::open(&f.root)
+        .unwrap()
+        .read()
+        .unwrap();
     f.assert_reaped();
     assert_eq!(
         f.executor.run(&f.id, &mut |_| Ok(())).unwrap_err().code,
@@ -565,6 +619,19 @@ fn container_reentrant_prestart_cancel_does_not_deadlock_or_start_command() {
         &sha256(f.id.as_str().as_bytes()).as_str()[7..]
     );
     assert_eq!(Docker.inspect(&name).unwrap()["State"]["Running"], false);
+    let authority: Json =
+        serde_json::from_slice(&fs::read(f.root.join("acceptance-v1.json")).unwrap()).unwrap();
+    assert_eq!(
+        authority["capacity"]["reservations"][0]["runtime_held"],
+        false
+    );
+    assert!(
+        authority["capacity"]["reservations"][0]["demand"]["backend_disk_bytes"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(f.executor.reconcile(&f.id).unwrap(), state);
 }
 #[test]
 #[ignore = "requires qualified local Docker; run explicitly"]
@@ -651,17 +718,27 @@ fn container_owner_crash_blocks_new_work_without_reexecution() {
         prepare_deadline_unix: time + 60,
         delivery_deadline_unix: time + 3600,
     };
-    let next = recovered
-        .owner
-        .accept_verified(request, context)
-        .unwrap()
-        .task;
+    let authority_before = fs::read(f.root.join("acceptance-v1.json")).unwrap();
     assert_eq!(
         recovered
-            .run(&next.view.task_id, &mut |_| Ok(()))
+            .owner
+            .accept_verified(request, context)
             .unwrap_err()
             .code,
-        TaskErrorCode::StateCorrupt
+        TaskErrorCode::CapacityUnavailable
+    );
+    assert_eq!(
+        authority_before,
+        fs::read(f.root.join("acceptance-v1.json")).unwrap()
+    );
+    assert_eq!(
+        FileTaskAcceptanceStore::open(&f.root)
+            .unwrap()
+            .read()
+            .unwrap()
+            .tasks
+            .len(),
+        1
     );
     assert_eq!(
         recovered.run(&f.id, &mut |_| Ok(())).unwrap_err().code,
@@ -861,4 +938,40 @@ fn container_artifact_real_bytes_require_current_authorization_and_verified_down
         TaskErrorCode::OutputExists
     );
     assert_eq!(fs::read(existing).unwrap(), b"keep existing");
+}
+
+#[test]
+fn executor_legacy_capacity_string_and_noop_callback_cannot_authorize_execution() {
+    let directory = Dir::new();
+    let root = directory.0.join("provider");
+    let store = FileTaskAcceptanceStore::open(&root).unwrap();
+    let request: SubmitTaskRequest = nexus::n3_acceptance::decode_dto(include_bytes!(
+        "../../../docs/contracts/n3-submit.example.json"
+    ))
+    .unwrap();
+    let context = AcceptanceContext {
+        authenticated_principal: "fixture".into(),
+        provider: request.provider.clone(),
+        environment_evidence: request.environment.clone(),
+        capacity_reservation_id: "unverified-legacy-string".into(),
+        now_unix: 100,
+        prepare_deadline_unix: 110,
+        delivery_deadline_unix: 200,
+    };
+    let owner = TaskOwner::new(store.clone(), sha256, new_task_id);
+    let accepted = owner.accept_verified(request, context).unwrap().task;
+    let executor = LinuxTaskExecutor::open(&root, Vec::new()).unwrap();
+    let before = owner.runtime(&accepted.view.task_id).unwrap();
+    let mut calls = 0;
+    let error = executor
+        .run(&accepted.view.task_id, &mut |_| {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap_err();
+    assert_eq!(error.code, TaskErrorCode::CapacityUnavailable);
+    assert_eq!(calls, 0);
+    assert_eq!(owner.runtime(&accepted.view.task_id).unwrap(), before);
+    assert!(!root.join("executions-v1").exists());
+    assert_eq!(store.read().unwrap().tasks.len(), 1);
 }

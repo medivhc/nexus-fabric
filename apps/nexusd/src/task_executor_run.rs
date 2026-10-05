@@ -87,6 +87,7 @@ impl LinuxTaskExecutor {
             self.docker
                 .exec_create(&container, &contract.request.command, "65534:65534", &cwd)?;
         logs.check_lock("owner.lock", owner_lease)?;
+        FileTaskAcceptanceStore::open(&self.root)?.verify_capacity_for_start(contract)?;
         let sequence = self.owner.runtime(id)?.view.last_event_seq + 1;
         let start = self.owner.record_event(
             id,

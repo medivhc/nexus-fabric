@@ -2,6 +2,9 @@
 use nexus_control_api::task::{TaskCallContext, TaskEnvelope, TaskRequest, TaskResponse};
 use nexus_domain::task::{TaskError, TaskErrorCode, TaskId};
 use std::path::{Path, PathBuf};
+/// Borrowed by every daemon consumer; only the composition root constructs it.
+pub type SharedSessionManager =
+    std::sync::Arc<std::sync::Mutex<Option<nexus_session::SessionManager>>>;
 #[cfg(target_os = "linux")]
 #[path = "task_service_provider.rs"]
 mod provider;
@@ -17,7 +20,42 @@ impl LocalTaskService {
         Self {
             config_root: config_root.to_owned(),
             #[cfg(target_os = "linux")]
-            provider: load(config_root),
+            provider: load(config_root, None),
+        }
+    }
+    /// Production composition injects the existing sole resource Session owner.
+    pub fn open_with_sessions(config_root: &Path, sessions: SharedSessionManager) -> Self {
+        #[cfg(not(target_os = "linux"))]
+        let _ = sessions;
+        Self {
+            config_root: config_root.to_owned(),
+            #[cfg(target_os = "linux")]
+            provider: load(config_root, Some(sessions)),
+        }
+    }
+    /// Trusted Rust composition entry. No LocalAPI operation calls this method.
+    pub fn prepare_with_existing_session(
+        &self,
+        task_id: &TaskId,
+        session_id: &nexus_domain::SessionId,
+    ) -> Result<nexus_compute::task_runtime::RuntimeState, TaskError> {
+        #[cfg(target_os = "linux")]
+        {
+            let service = self
+                .provider
+                .as_ref()
+                .map_err(Clone::clone)?
+                .as_ref()
+                .ok_or_else(|| unsupported("local Task service disabled"))?;
+            let principal = nexus::task_authorization::authenticated_principal(&self.config_root)?;
+            let context =
+                TaskCallContext::from_authenticated(principal, service.workspace().to_owned())?;
+            service.prepare_with_existing_session(&context, task_id, session_id)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (task_id, session_id);
+            Err(unsupported("local provider Task service requires Linux"))
         }
     }
     pub fn execute(&self, request: TaskRequest) -> TaskEnvelope {
@@ -52,7 +90,10 @@ fn unsupported(reason: &str) -> TaskError {
     TaskError::new(TaskErrorCode::UnsupportedCapability, reason, false)
 }
 #[cfg(target_os = "linux")]
-fn load(config_root: &Path) -> Result<Option<provider::ProviderService>, TaskError> {
+fn load(
+    config_root: &Path,
+    sessions: Option<SharedSessionManager>,
+) -> Result<Option<provider::ProviderService>, TaskError> {
     use std::{fs, io::Read, os::unix::fs::OpenOptionsExt};
     let path = config_root.join("task-api.toml");
     let mut file = match fs::OpenOptions::new()
@@ -97,7 +138,7 @@ fn load(config_root: &Path) -> Result<Option<provider::ProviderService>, TaskErr
         .ok_or_else(|| TaskError::invalid("missing workspace"))?;
     TaskId::new(provider.to_owned())?;
     TaskId::new(workspace.to_owned())?;
-    provider::ProviderService::open(config_root, provider, workspace).map(Some)
+    provider::ProviderService::open(config_root, provider, workspace, sessions).map(Some)
 }
 
 #[cfg(all(test, target_os = "linux"))]

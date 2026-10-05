@@ -27,6 +27,19 @@ impl LinuxTaskExecutor {
         // owner could have committed a final event while this call opened logs.
         let state = self.owner.runtime(id)?;
         let Some(handle) = state.execution_handle.as_ref() else {
+            if state.view.outcome == TaskOutcome::Cancelled
+                && state.view.observation == Observation::Confirmed
+            {
+                match self.capacity_release_witness(id, Some(&lease)) {
+                    Ok(witness) if witness.preparation_reaped() => {
+                        self.release_reaped_capacity(&state, &lease)?;
+                        return Ok(state);
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.code == TaskErrorCode::CapacityUnavailable => {}
+                    Err(error) => return Err(error),
+                }
+            }
             return self.unknown(id, state);
         };
         let engine = disk::load(&logs.directory.join("engine-v1.json"))?;
@@ -81,9 +94,12 @@ impl LinuxTaskExecutor {
             if state.view.execution.state == ExecutionState::Exited
                 && state.view.observation == Observation::Confirmed
             {
+                self.release_reaped_capacity(&state, &lease)?;
                 return Ok(state);
             }
-            return self.record(id, action);
+            let recovered = self.record(id, action)?;
+            self.release_reaped_capacity(&recovered, &lease)?;
+            return Ok(recovered);
         }
         // Absence/unavailability is not proof of ExecutionLost. Engine 404,
         // daemon failure or missing inspect cannot invent a terminal outcome.
@@ -129,15 +145,18 @@ impl LinuxTaskExecutor {
                 ));
             }
             if state.view.observation == Observation::Confirmed {
+                self.release_reaped_capacity(&state, &lease)?;
                 return Ok(state);
             }
             logs.check_lock("owner.lock", &lease)?;
-            return self.record(
+            let recovered = self.record(
                 id,
                 RuntimeAction::ObservationConfirmed {
                     handle: handle.clone(),
                 },
-            );
+            )?;
+            self.release_reaped_capacity(&recovered, &lease)?;
+            return Ok(recovered);
         }
         if state.view.execution.state == ExecutionState::Running
             && state.view.cancellation.state == CancellationState::Requested
@@ -167,13 +186,15 @@ impl LinuxTaskExecutor {
             logs.check_lock("owner.lock", &lease)?;
             #[cfg(test)]
             checkpoint(&logs, "before_stopped_event")?;
-            return self.record(
+            let recovered = self.record(
                 id,
                 RuntimeAction::Stopped {
                     reason,
                     signal: Some("SIGKILL".into()),
                 },
-            );
+            )?;
+            self.release_reaped_capacity(&recovered, &lease)?;
+            return Ok(recovered);
         }
         // Recover a cancellation event gap only from its original durable stop
         // intent AND original stopped Engine namespace, never a wall clock/PID.
@@ -200,13 +221,15 @@ impl LinuxTaskExecutor {
                     json!({"schema_version":1,"task_id":id.as_str(),"contract_digest":state.view.contract_digest.as_str(),"container":container,"exec":exec,"subtree_stopped":true}),
                 )?;
                 logs.check_lock("owner.lock", &lease)?;
-                return self.record(
+                let recovered = self.record(
                     id,
                     RuntimeAction::Stopped {
                         reason,
                         signal: Some("SIGKILL".into()),
                     },
-                );
+                )?;
+                self.release_reaped_capacity(&recovered, &lease)?;
+                return Ok(recovered);
             }
         }
         self.unknown(id, state)

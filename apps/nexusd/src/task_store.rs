@@ -28,6 +28,24 @@ pub struct FileTaskAcceptanceStore {
     root: PathBuf,
 }
 impl FileTaskAcceptanceStore {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn capacity_root(&self) -> &Path {
+        &self.root
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn capacity_handle(root: &Path) -> Self {
+        Self {
+            root: root.to_owned(),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn capacity_acceptance_lock(&self) -> Result<std::fs::File, TaskError> {
+        self.lock()
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_for_capacity_provision(root: &Path) -> Result<Self, TaskError> {
+        Self::open_mode(root, &mut sync_directory, true, true)
+    }
     /// Composition-root operations on N3 content/roots share the acceptance
     /// lock. GC cannot race a newly published Task pin or scoped key reuse.
     #[cfg(target_os = "linux")]
@@ -61,18 +79,19 @@ impl FileTaskAcceptanceStore {
         root: &Path,
         mut parent_sync: impl FnMut(&Path) -> Result<(), TaskError>,
     ) -> Result<Self, TaskError> {
-        Self::open_mode(root, &mut parent_sync, true)
+        Self::open_mode(root, &mut parent_sync, true, false)
     }
     /// Query composition must never initialize or migrate a missing authority.
     #[cfg(target_os = "linux")]
     pub(crate) fn open_existing(root: &Path) -> Result<Self, TaskError> {
-        Self::open_mode(root, &mut sync_directory, false)
+        Self::open_mode(root, &mut sync_directory, false, false)
     }
     #[cfg(target_os = "linux")]
     fn open_mode(
         root: &Path,
         parent_sync: &mut impl FnMut(&Path) -> Result<(), TaskError>,
         allow_new: bool,
+        capacity_provision: bool,
     ) -> Result<Self, TaskError> {
         use std::fs;
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -112,8 +131,8 @@ impl FileTaskAcceptanceStore {
             parent_sync(parent)?;
         }
         let _lock = store.lock_with_create(allow_new)?;
-        store.initialize(allow_new)?;
-        let ledger = store.load()?;
+        store.initialize(allow_new, capacity_provision)?;
+        let (ledger, _) = store.load_authority_mode(capacity_provision)?;
         if allow_new {
             crate::task_runtime_store::initialize(&store.root, &ledger)?;
         } else {
@@ -123,7 +142,7 @@ impl FileTaskAcceptanceStore {
         Ok(store)
     }
     #[cfg(target_os = "linux")]
-    fn initialize(&self, allow_new: bool) -> Result<(), TaskError> {
+    fn initialize(&self, allow_new: bool, capacity_provision: bool) -> Result<(), TaskError> {
         use std::{
             fs,
             io::{Read, Write},
@@ -154,6 +173,7 @@ impl FileTaskAcceptanceStore {
                 if bytes != RECEIPT
                     && bytes != RUNTIME_AUTHORITY_RECEIPT
                     && bytes != crate::task_artifacts::AUTHORITY_RECEIPT
+                    && !crate::task_capacity::is_capacity_receipt(&bytes)
                 {
                     return Err(TaskError::new(
                         TaskErrorCode::StateCorrupt,
@@ -177,7 +197,7 @@ impl FileTaskAcceptanceStore {
         let image = self.root.join("acceptance-v1.json");
         match fs::symlink_metadata(&image) {
             Ok(_) => {
-                self.load()?;
+                self.load_authority_mode(capacity_provision)?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Initialize a fresh empty image before exposing any handle. A
@@ -191,6 +211,8 @@ impl FileTaskAcceptanceStore {
                     "artifacts-v1.json",
                     "artifacts-initialized-v1",
                     "artifact-content-sha256-v1",
+                    "capacity-initialized-v1",
+                    "capacity-owner.lock",
                 ] {
                     let path = self.root.join(name);
                     match fs::symlink_metadata(&path) {
@@ -256,7 +278,7 @@ impl FileTaskAcceptanceStore {
     }
     #[cfg(target_os = "linux")]
     fn lock_with_create(&self, allow_new: bool) -> Result<std::fs::File, TaskError> {
-        use std::os::unix::{fs::OpenOptionsExt, io::AsRawFd};
+        use std::os::unix::fs::OpenOptionsExt;
         let path = self.root.join("acceptance.lock");
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -286,23 +308,48 @@ impl FileTaskAcceptanceStore {
         }
         // Linux flock is process-independent and released when this File is dropped.
         // The lock inode is never renamed/deleted, including on cold restart.
-        unsafe extern "C" {
-            fn flock(fd: std::ffi::c_int, operation: std::ffi::c_int) -> std::ffi::c_int;
-        }
-        loop {
-            // SAFETY: fd is owned/live for this call; LOCK_EX=2 takes no pointer.
-            let result = unsafe { flock(file.as_raw_fd(), 2) };
-            if result == 0 {
-                return Ok(file);
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::Interrupted {
-                return Err(io_error(&path, error));
-            }
-        }
+        lock_fd(&file, false)?;
+        Ok(file)
     }
     #[cfg(target_os = "linux")]
     fn load(&self) -> Result<AcceptanceLedger, TaskError> {
+        self.load_authority_mode(false).map(|(ledger, _)| ledger)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn load_capacity_authority(
+        &self,
+    ) -> Result<
+        (
+            AcceptanceLedger,
+            Option<crate::task_capacity::CapacityImage>,
+        ),
+        TaskError,
+    > {
+        self.load_authority_mode(false)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn load_authority_for_provision(
+        &self,
+    ) -> Result<
+        (
+            AcceptanceLedger,
+            Option<crate::task_capacity::CapacityImage>,
+        ),
+        TaskError,
+    > {
+        self.load_authority_mode(true)
+    }
+    #[cfg(target_os = "linux")]
+    fn load_authority_mode(
+        &self,
+        allow_incomplete: bool,
+    ) -> Result<
+        (
+            AcceptanceLedger,
+            Option<crate::task_capacity::CapacityImage>,
+        ),
+        TaskError,
+    > {
         use std::io::Read;
         use std::os::unix::fs::OpenOptionsExt;
         let path = self.root.join("acceptance-v1.json");
@@ -340,7 +387,7 @@ impl FileTaskAcceptanceStore {
                     .remove("schema_version")
                     .ok_or_else(|| TaskError::invalid("missing envelope version"))?,
             )?;
-            if version != 1 {
+            if version != 1 && version != 2 {
                 return Err(TaskError::invalid(
                     "unsupported acceptance envelope version",
                 ));
@@ -353,12 +400,35 @@ impl FileTaskAcceptanceStore {
             let value = envelope
                 .remove("ledger")
                 .ok_or_else(|| TaskError::invalid("missing acceptance ledger"))?;
-            if !envelope.is_empty() || sha256(&value.canonical_bytes()) != checksum {
+            let capacity = if version == 2 {
+                Some(
+                    envelope
+                        .remove("capacity")
+                        .ok_or_else(|| TaskError::invalid("missing coupled capacity image"))?,
+                )
+            } else {
+                None
+            };
+            let payload = match &capacity {
+                Some(capacity) => Value::Object(BTreeMap::from([
+                    ("ledger".into(), value.clone()),
+                    ("capacity".into(), capacity.clone()),
+                ])),
+                None => value.clone(),
+            };
+            if !envelope.is_empty() || sha256(&payload.canonical_bytes()) != checksum {
                 return Err(TaskError::invalid("corrupt acceptance image/checksum"));
             }
             let ledger = AcceptanceLedger::from_value(value)?;
             ledger.validate(sha256)?;
-            Ok(ledger)
+            let capacity = capacity
+                .map(crate::task_capacity::CapacityImage::from_value)
+                .transpose()?;
+            if let Some(image) = &capacity {
+                image.validate(&ledger)?;
+            }
+            crate::task_capacity::check_receipt(&self.root, capacity.is_some(), allow_incomplete)?;
+            Ok((ledger, capacity))
         };
         decode().map_err(|e: TaskError| {
             TaskError::new(
@@ -379,18 +449,52 @@ impl FileTaskAcceptanceStore {
         ledger: &AcceptanceLedger,
         mut boundary: impl FnMut(&str) -> Result<(), TaskError>,
     ) -> Result<(), TaskError> {
+        self.publish_authority_with(ledger, None, &mut boundary)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn publish_capacity_authority(
+        &self,
+        ledger: &AcceptanceLedger,
+        capacity: &crate::task_capacity::CapacityImage,
+    ) -> Result<(), TaskError> {
+        self.publish_authority_with(ledger, Some(capacity), &mut |_| Ok(()))
+    }
+    #[cfg(target_os = "linux")]
+    fn publish_authority_with(
+        &self,
+        ledger: &AcceptanceLedger,
+        capacity: Option<&crate::task_capacity::CapacityImage>,
+        boundary: &mut dyn FnMut(&str) -> Result<(), TaskError>,
+    ) -> Result<(), TaskError> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         ledger.validate(sha256)?;
         let value = ledger.to_value();
-        let envelope = Value::Object(BTreeMap::from([
-            ("schema_version".into(), Value::Integer(1)),
+        if let Some(image) = capacity {
+            image.validate(ledger)?;
+        }
+        let payload = match capacity {
+            Some(image) => Value::Object(BTreeMap::from([
+                ("ledger".into(), value.clone()),
+                ("capacity".into(), image.to_value()),
+            ])),
+            None => value.clone(),
+        };
+        let mut envelope = BTreeMap::from([
+            (
+                "schema_version".into(),
+                Value::Integer(if capacity.is_some() { 2 } else { 1 }),
+            ),
             (
                 "payload_sha256".into(),
-                sha256(&value.canonical_bytes()).to_value(),
+                sha256(&payload.canonical_bytes()).to_value(),
             ),
             ("ledger".into(), value),
-        ]));
+        ]);
+        if let Some(image) = capacity {
+            envelope.insert("capacity".into(), image.to_value());
+        }
+        let envelope = Value::Object(envelope);
         let tmp = self
             .root
             .join(format!(".acceptance-{}.tmp", new_task_id()?.as_str()));
@@ -423,6 +527,32 @@ impl FileTaskAcceptanceStore {
             }
         }
         result
+    }
+}
+/// Existing Linux flock primitive, shared by stable acceptance and owner leases.
+/// Nonblocking refusal is an observed live lease; no PID inference is made.
+#[cfg(target_os = "linux")]
+pub(crate) fn lock_fd(file: &std::fs::File, nonblocking: bool) -> Result<bool, TaskError> {
+    use std::os::unix::io::AsRawFd;
+    unsafe extern "C" {
+        fn flock(fd: std::ffi::c_int, operation: std::ffi::c_int) -> std::ffi::c_int;
+    }
+    loop {
+        // SAFETY: descriptor is owned/live; Linux LOCK_EX=2/LOCK_NB=4 take no pointers.
+        if unsafe { flock(file.as_raw_fd(), 2 | if nonblocking { 4 } else { 0 }) } == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        if nonblocking && error.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(false);
+        }
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(TaskError::new(
+                TaskErrorCode::PersistenceFailed,
+                error.to_string(),
+                true,
+            ));
+        }
     }
 }
 #[cfg(target_os = "linux")]
@@ -464,52 +594,7 @@ impl TaskAcceptanceStore for FileTaskAcceptanceStore {
     ) -> Result<AcceptanceResult, TaskError> {
         #[cfg(target_os = "linux")]
         {
-            let _lock = self.lock()?;
-            let mut ledger = self.load()?;
-            let runtime = crate::task_runtime_store::load_and_validate(&self.root, &ledger)?;
-            let original = ledger.clone();
-            let result = update(&mut ledger)?;
-            ledger.validate(sha256)?;
-            let tasks: BTreeMap<_, _> = ledger.tasks.iter().map(|t| (&t.view.task_id, t)).collect();
-            if original
-                .tasks
-                .iter()
-                .any(|t| tasks.get(&t.view.task_id).copied() != Some(t))
-            {
-                return Err(TaskError::new(
-                    TaskErrorCode::StateCorrupt,
-                    "accepted records cannot be removed or replaced",
-                    false,
-                ));
-            }
-            let previously_accepted = original
-                .tasks
-                .iter()
-                .any(|t| t.view.task_id == result.task.view.task_id);
-            if tasks.get(&result.task.view.task_id).copied() != Some(&result.task)
-                || !ledger
-                    .idempotency
-                    .iter()
-                    .any(|entry| entry.task_id == result.task.view.task_id)
-                || result.replayed != previously_accepted
-                || (result.replayed && ledger != original)
-                || (!result.replayed && ledger.tasks.len() != original.tasks.len() + 1)
-            {
-                return Err(TaskError::new(
-                    TaskErrorCode::StateCorrupt,
-                    "acceptance acknowledgment differs from one new record or unchanged replay",
-                    false,
-                ));
-            }
-            // Recheck the coupled authority after the callback, before writing.
-            // The common flock keeps this loaded runtime image stable throughout.
-            runtime.validate(&ledger)?;
-            if ledger != original {
-                self.publish(&ledger)?;
-            } else {
-                sync_directory(&self.root)?;
-            }
-            Ok(result)
+            self.transact_with_boundary(update, &mut |_| Ok(()))
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -520,6 +605,69 @@ impl TaskAcceptanceStore for FileTaskAcceptanceStore {
                 false,
             ))
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl FileTaskAcceptanceStore {
+    // Production and boundary-fault tests share the exact transaction path.
+    pub(crate) fn transact_with_boundary(
+        &self,
+        update: &mut dyn FnMut(&mut AcceptanceLedger) -> Result<AcceptanceResult, TaskError>,
+        boundary: &mut dyn FnMut(&str) -> Result<(), TaskError>,
+    ) -> Result<AcceptanceResult, TaskError> {
+        let _lock = self.lock()?;
+        let (mut ledger, mut capacity) = self.load_capacity_authority()?;
+        let runtime = crate::task_runtime_store::load_and_validate(&self.root, &ledger)?;
+        let original = ledger.clone();
+        let result = update(&mut ledger)?;
+        ledger.validate(sha256)?;
+        let tasks: BTreeMap<_, _> = ledger.tasks.iter().map(|t| (&t.view.task_id, t)).collect();
+        if original
+            .tasks
+            .iter()
+            .any(|t| tasks.get(&t.view.task_id).copied() != Some(t))
+        {
+            return Err(TaskError::new(
+                TaskErrorCode::StateCorrupt,
+                "accepted records cannot be removed or replaced",
+                false,
+            ));
+        }
+        let previously_accepted = original
+            .tasks
+            .iter()
+            .any(|t| t.view.task_id == result.task.view.task_id);
+        if tasks.get(&result.task.view.task_id).copied() != Some(&result.task)
+            || !ledger
+                .idempotency
+                .iter()
+                .any(|entry| entry.task_id == result.task.view.task_id)
+            || result.replayed != previously_accepted
+            || (result.replayed && ledger != original)
+            || (!result.replayed && ledger.tasks.len() != original.tasks.len() + 1)
+        {
+            return Err(TaskError::new(
+                TaskErrorCode::StateCorrupt,
+                "acceptance acknowledgment differs from one new record or unchanged replay",
+                false,
+            ));
+        }
+        // Recheck the coupled authority after the callback, before writing.
+        // The common flock keeps this loaded runtime image stable throughout.
+        runtime.validate(&ledger)?;
+        if let Some(image) = &mut capacity {
+            if !result.replayed {
+                image.attach(&self.root, &ledger, &result.task)?;
+            }
+            image.validate(&ledger)?;
+        }
+        if ledger != original {
+            self.publish_authority_with(&ledger, capacity.as_ref(), boundary)?;
+        } else {
+            sync_directory(&self.root)?;
+        }
+        Ok(result)
     }
 }
 

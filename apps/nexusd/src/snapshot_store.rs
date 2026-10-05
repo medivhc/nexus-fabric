@@ -163,6 +163,14 @@ impl FileSnapshotStore {
             Err(unsupported())
         }
     }
+    /// Validate every durable Snapshot root during boot without GC mutation.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn verify_recovery_roots(&self) -> Result<(), TaskError> {
+        self.acceptance.with_locked_ledger(|root, ledger| {
+            linux::recovered_roots(root, ledger, &linux::load_catalog(root)?)?;
+            Ok(())
+        })
+    }
     /// Reconstruct Task + preview + explicit roots under the acceptance lock,
     /// fail closed on incomplete/corrupt root manifests, then tombstone/sweep.
     pub fn collect_garbage(
@@ -171,7 +179,7 @@ impl FileSnapshotStore {
         retention_seconds: u64,
     ) -> Result<SnapshotGcReport, TaskError> {
         #[cfg(target_os = "linux")]
-        return self.acceptance.with_locked_ledger(|root, ledger| {
+        return self.acceptance.with_gc_locked_ledger(|root, ledger| {
             linux::collect(root, ledger, now_unix, retention_seconds)
         });
         #[cfg(not(target_os = "linux"))]
@@ -539,7 +547,7 @@ mod linux {
         frozen.validate(sha256)?;
         Ok(frozen)
     }
-    fn recovered_roots(
+    pub(super) fn recovered_roots(
         root: &Path,
         ledger: &AcceptanceLedger,
         catalog: &Catalog,

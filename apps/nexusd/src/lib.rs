@@ -40,3 +40,11 @@ pub mod task_requester_store;
 pub mod task_http;
 /// Optional N3 local provider application service.
 pub mod task_service;
+
+/// Explicit provider allocations, atomically coupled to accepted Tasks.
+#[cfg(target_os = "linux")]
+pub mod task_capacity;
+#[cfg(target_os = "linux")]
+mod task_capacity_recovery;
+#[cfg(target_os = "linux")]
+mod task_sessions;

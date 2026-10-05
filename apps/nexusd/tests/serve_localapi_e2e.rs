@@ -38,10 +38,16 @@ fn spawn_serve() -> (DaemonGuard, String) {
     // 测试隔离：用临时 token 文件，避免与开发者真实 token 互相污染；
     // 通过环境变量显式传给子进程（不用 set_var，forbid(unsafe_code)）。
     let token_file = test_token_file();
-    let mut child = Command::new(exe)
+    let mut command = Command::new(exe);
+    command
         .arg("serve")
         .arg("--addr=127.0.0.1:0")
-        .env("NEXUS_LOCALAPI_TOKEN_FILE", &token_file)
+        .env("NEXUS_LOCALAPI_TOKEN_FILE", &token_file);
+    spawn_command(command)
+}
+
+fn spawn_command(mut command: Command) -> (DaemonGuard, String) {
+    let mut child = command
         .stdout(Stdio::piped())
         // stderr 继承到测试进程，便于 --nocapture 下排查；不管道化避免写满阻塞 daemon。
         .spawn()
@@ -111,16 +117,20 @@ fn test_token_file() -> std::path::PathBuf {
 }
 
 fn http_get(addr: &str, path: &str) -> (u16, String) {
-    let mut stream = TcpStream::connect(addr).expect("connect to daemon");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("set read timeout");
     // D8（N2 P0-1）：LocalAPI 要求 Bearer <redacted> 鉴权；从测试 token 文件读取
     // （daemon 启动时已创建，子进程与测试用同一文件）。
     let token = std::fs::read_to_string(test_token_file())
         .expect("read test bearer token")
         .trim()
         .to_string();
+    http_get_with_token(addr, path, &token)
+}
+
+fn http_get_with_token(addr: &str, path: &str, token: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(addr).expect("connect to daemon");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
     let req = format!(
         "GET {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
     );
@@ -146,6 +156,46 @@ fn http_get(addr: &str, path: &str) -> (u16, String) {
         .expect("status code parse as u16");
 
     (status_code, body.to_string())
+}
+
+#[test]
+fn default_serve_uses_user_config_for_token_and_n2() {
+    struct ConfigGuard(std::path::PathBuf);
+    impl Drop for ConfigGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let config = ConfigGuard(std::env::temp_dir().join(format!(
+        "nexus-default-serve-{:?}-{}",
+        std::thread::current().id(),
+        std::process::id()
+    )));
+    std::fs::create_dir(&config.0).expect("isolated user config root");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_nexusd"));
+    command
+        .args(["serve", "--addr=127.0.0.1:0"])
+        .env_remove("NEXUS_CONFIG_DIR")
+        .env_remove("NEXUS_LOCALAPI_TOKEN_FILE")
+        .env("XDG_CONFIG_HOME", &config.0);
+    let (_daemon, addr) = spawn_command(command);
+    let root = config.0.join("nexus");
+    let token_path = root.join("localapi.token");
+    let token = std::fs::read_to_string(&token_path).expect("default token in user config");
+    assert!(root.join("n2").is_dir(), "N2 must share the token root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(token_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    let (status, body) = http_get_with_token(&addr, "/localapi/v0/n2/session/list", token.trim());
+    assert_eq!(status, 200, "body: {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["verdict"], "PASS");
+    assert_eq!(value["owner"], "daemon");
 }
 
 #[test]

@@ -295,32 +295,39 @@ pub fn dispatch(
 /// v0 retains its existing token behavior.
 pub struct TokenAuthority {
     expected: String,
+    path: std::path::PathBuf,
     #[cfg(unix)]
     identity: Option<(u64, u64)>,
 }
 impl TokenAuthority {
     pub fn open(expected: &str) -> Self {
+        Self::open_at(expected, nexus::localapi_client::token_file_path())
+    }
+    /// Bind this listener to its explicit token path, keeping legacy open intact.
+    pub fn open_at(expected: &str, path: std::path::PathBuf) -> Self {
         Self {
             expected: expected.to_owned(),
             #[cfg(unix)]
-            identity: private_token(expected).ok(),
+            identity: private_token(&path, expected).ok(),
+            path,
         }
     }
     fn valid(&self) -> bool {
         #[cfg(unix)]
         {
-            self.identity.is_some() && private_token(&self.expected).ok() == self.identity
+            self.identity.is_some()
+                && private_token(&self.path, &self.expected).ok() == self.identity
         }
         #[cfg(not(unix))]
         {
+            let _ = (&self.path, &self.expected);
             false
         }
     }
 }
 #[cfg(unix)]
-fn private_token(expected: &str) -> Result<(u64, u64), ()> {
+fn private_token(path: &std::path::Path, expected: &str) -> Result<(u64, u64), ()> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-    let path = nexus::localapi_client::token_file_path();
     #[cfg(target_os = "linux")]
     let flags = 0x20000 | 0x800;
     #[cfg(target_os = "macos")]
@@ -332,10 +339,10 @@ fn private_token(expected: &str) -> Result<(u64, u64), ()> {
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(flags)
-            .open(&path)
+            .open(path)
             .map_err(|_| ())?;
         let fd = file.metadata().map_err(|_| ())?;
-        let metadata = std::fs::symlink_metadata(&path).map_err(|_| ())?;
+        let metadata = std::fs::symlink_metadata(path).map_err(|_| ())?;
         if !fd.is_file()
             || fd.nlink() != 1
             || fd.permissions().mode() & 0o777 != 0o600
