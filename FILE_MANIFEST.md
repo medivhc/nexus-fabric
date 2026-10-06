@@ -9,6 +9,7 @@
 | `.agents/skills/README.md` | Project-level agent skill index |
 | `.agents/skills/nexus-contract-first/SKILL.md` | Project-level agent skill |
 | `.agents/skills/nexus-evidence/SKILL.md` | Project-level agent skill |
+| `.agents/skills/nexus-multiagent/SKILL.md` | Project-level agent skill |
 | `.agents/skills/nexus-task/SKILL.md` | Project-level agent skill |
 | `.evidence/.gitignore` | Evidence store contract |
 | `.evidence/README.md` | Evidence store contract |

@@ -9,6 +9,7 @@
 | `nexus-review` | 实现完成、fast verify 通过后，提交 Candidate Completion 前的独立代码审查 | §6 不可自证原则 |
 | `nexus-knowledge` | 检索历史工程经验（坑、Review 问题、架构决策），或沉淀新经验到知识库 | §27 决策原则 |
 | `nexus-evidence` | 生成/解读/报告验证证据，判断新鲜度，输出完成报告 | §6, §20, §24, §26 |
+| `nexus-multiagent` | 多个 Agent（不同 Harness/Model）并行向同一仓库贡献代码时的编排：角色分工、评审配对、模型差异的任务分配 | §29（编排层补充，机器化约定以 §29 为准） |
 
 ## 加载方式
 
