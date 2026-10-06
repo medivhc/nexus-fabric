@@ -11742,6 +11742,9 @@ mod task_localapi;
 
 pub mod task_authorization;
 
+/// Local operator commands for existing provider-scoped Use grants.
+pub mod task_provider_grant;
+
 #[cfg(test)]
 mod hysteria2_dataplane_tests {
     use super::*;

@@ -3244,3 +3244,7 @@ Task 输入/容量/Session 接受或 CLI 完整下载；相关能力保持明确
 ### 17.6 N3-9 Artifact CLI 下载
 
 Linux artifact get 接通真实分页服务与已有持久断点接收器：先取得已授权 Published record 才打开 output 接收器，每页核实完整 record，从 durable offset 续传，发布前额外获取当前授权的空 EOF 页。完整 SHA-256/长度验证后原子无覆盖发布；并发锁忙可重试，失败保留前缀而不重置。成功沿用 schema1 空 EOF ArtifactPage envelope。其他平台明确 Unsupported；完整 Submit/输入传输仍待装配。冻结行为、有限真实 daemon/CLI E4 与边界见 docs/N3-9-ARTIFACT-CLI-CONTRACT.md，不替代完整 N3 E4/E5。
+
+### 17.7 N3-10 本地提供方 Use 授权运维
+
+新增 `nexus task-provider grant add|revoke|list --config <absolute-private-config>`，从既存 `task-api.toml` 的 provider/workspace 固定本机授权范围，直接管理该 Workspace 中显式 resource/主体的真实 N2 Use grant。命令不依赖 default Workspace 目录解析，不创建身份、Task、Session 或提供方容量，不改变既有 generic grant CLI 和 Task schema1。list 只读；mutation 保留非 Use 权限与其他 Workspace，先持久审计 intent，再原子更新 grant 并持久 applied。普通 daemon 下一次请求按当前 grant 决定授权；本批不通知远端，不接通 Submit/输入上传。冻结细节、真实 CLI/daemon/Engine E4 与失败语义见 docs/N3-10-OPERATOR-GRANT-CONTRACT.md。

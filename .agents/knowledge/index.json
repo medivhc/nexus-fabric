@@ -318,5 +318,13 @@
     "module": "apps/nexus / apps/nexusd / nexus-platform-linux",
     "category": "implementation-pattern",
     "summary": "真实probe/完整record/durableoffset/额外当前授权EOF；原发布inode与非阻塞lease复用；真实Engine seed与正常daemon READY观察。"
+  },
+  {
+    "id": "n3-scoped-operator-grants",
+    "file": "entries/2026-10-06-n3-scoped-operator-grants.md",
+    "date": "2026-10-06",
+    "module": "apps/nexus",
+    "category": "implementation-pitfall",
+    "summary": "非default Workspace真实Use运维；只读避免KV open副作用；既存身份核实、Use-only字节幂等和intent/applied审计未知状态阻断。"
   }
 ]

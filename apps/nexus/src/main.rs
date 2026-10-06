@@ -66,6 +66,11 @@ nexus — Nexus 统一 Resource Fabric 控制面 CLI（瘦客户端）
   task submit --request <json-file>       N3 提交（完整执行接线尚未装配）
   task show|cancel|artifacts <id>          查询或取消本地提供方任务
   task logs <id> --stream <stdout|stderr> --offset <n>
+  task-provider grant list --config <dir> [--resource <name>]
+                                        本地提供方 Workspace 的授权取证（不读取身份）
+  task-provider grant add|revoke --config <dir> --resource <name> (--self|--principal <p>)
+                                        本地 Use 授权运维（仅 add 允许 --not-after <unix>）
+                                        config 必须为显式绝对路径；不接受 --addr/--socket
   artifact get <id> --output <path>        N3 完整下载尚未装配（不修改输出）
   compute jobs                            Compute 任务
   diagnose                                统一诊断
@@ -190,6 +195,22 @@ fn extract_remote_target(args: &[String]) -> Result<(RemoteTarget, Vec<String>),
 }
 
 fn run(args: &[String]) -> i32 {
+    // Local operator commands must inspect the raw global options before the
+    // remote parser consumes them. This branch never selects a daemon target.
+    if is_task_provider_command(args) {
+        if args.iter().any(|arg| {
+            matches!(arg.as_str(), "--addr" | "--socket")
+                || arg.starts_with("--addr=")
+                || arg.starts_with("--socket=")
+        }) || args.iter().filter(|arg| arg.as_str() == "--json").count() > 1
+        {
+            eprintln!("error: task-provider rejects remote targets and duplicate global options");
+            eprint!("{USAGE}");
+            return 2;
+        }
+        let (json_mode, local_args) = split_json_flag(args);
+        return nexus::task_provider_grant::run(&local_args[1..], json_mode);
+    }
     let (target, args) = match extract_remote_target(args) {
         Ok(v) => v,
         Err(msg) => {
@@ -332,6 +353,24 @@ fn run(args: &[String]) -> i32 {
             }
         },
     }
+}
+
+/// Recognize the command without consuming or consulting any transport target.
+/// Existing commands keep their original global-option parsing behavior.
+fn is_task_provider_command(args: &[String]) -> bool {
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        match arg.as_str() {
+            "--json" => index += 1,
+            "--addr" | "--socket" => {
+                index += 2;
+            }
+            "task-provider" => return true,
+            arg if arg.starts_with("--addr=") || arg.starts_with("--socket=") => index += 1,
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// D4 诚实拒绝：`nexus run <resource> -- <cmd...>` 返回结构化

@@ -757,14 +757,14 @@ pub fn replay_audit_entries(kv: &FileKvStore) -> Result<Vec<(String, String)>, S
 
 const GRANT_KEY_PREFIX: &str = "n2/grant/";
 
-fn grant_key(resource: &ResourceRef, principal: &nexus_auth::Principal) -> String {
+pub(crate) fn grant_key(resource: &ResourceRef, principal: &nexus_auth::Principal) -> String {
     format!(
         "{GRANT_KEY_PREFIX}{}/{}/{}",
         resource.workspace, resource.name, principal.0
     )
 }
 
-fn encode_grant(g: &nexus_auth::Grant) -> Value {
+pub(crate) fn encode_grant(g: &nexus_auth::Grant) -> Value {
     json!({
         "workspace": g.resource.workspace.0,
         "name": g.resource.name.as_str(),

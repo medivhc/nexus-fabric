@@ -142,3 +142,7 @@ workspace 检查，不依赖 default Workspace；错配/审计失败拒绝。协
 ### N3-9 Artifact CLI 接收器
 
 按 docs/N3-9-ARTIFACT-CLI-CONTRACT.md 装配 Linux ArtifactDownload 与私有 IO；先远端 probe，再 durable offset/完整 record 校验，额外当前授权 EOF 后完整 SHA/no-replace 发布。Linux offline 返回 ProviderUnreachable，output/凭证不创建；未启用服务及其他平台 Unsupported。保持 forbid(unsafe_code)，文件锁使用已有 Linux platform 依赖的安全非阻塞 helper。受保护 crash/prefix/lease/inode/no-replace 语义与测试保留，不创建 TaskOwner、不新增 wire DTO/依赖。
+
+### N3-10 提供方范围 Use grant 运维
+
+按 docs/N3-10-OPERATOR-GRANT-CONTRACT.md 分派本地 task-provider grant；配置路径必须显式，不使用环境/default Workspace/daemon目标代替。严格核实既存 scope、私有 N2 身份和真实 grant 编码；list 不创建或清理文件，add/revoke 只改变单个 Use-only grant。专用 Linux lease/审计与原子 IO 由组合根拥有，保持 forbid(unsafe_code)；不创建 Task/Session/identity、无 outbox 或新增依赖。业务失败按 schema1 显式报告 phase/可能已生效，用法错误 exit2。冻结状态未知时拒绝 mutation，读列表仍可取证。

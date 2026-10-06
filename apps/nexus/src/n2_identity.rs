@@ -20,6 +20,54 @@ use crate::n2_store::N2Store;
 const AUTH_IDENTITY_KEY: &str = "n2/auth-identity";
 const AUTH_IDENTITY_VERSION: u32 = 1;
 
+/// Decode an already privately-read identity without touching storage or
+/// generating credentials. The existing N2 ensure path retains its behavior.
+#[cfg(target_os = "linux")]
+pub(crate) fn principal_from_existing_bytes(bytes: &[u8]) -> Result<Principal, String> {
+    let canonical = crate::n3_acceptance::parse_canonical_json(bytes)
+        .map_err(|_| "invalid existing identity JSON")?
+        .canonical_bytes();
+    let value: serde_json::Value =
+        serde_json::from_slice(&canonical).map_err(|_| "invalid existing identity JSON")?;
+    let fields = value.as_object().ok_or("identity must be an object")?;
+    if fields.len() != 4
+        || value["version"].as_u64() != Some(u64::from(AUTH_IDENTITY_VERSION))
+        || !value["created_at_unix"]
+            .as_u64()
+            .is_some_and(|v| v <= nexus_domain::task::MAX_INTEGER)
+    {
+        return Err("invalid existing identity shape or version".into());
+    }
+    let decode = |field: &str| -> Result<[u8; 32], String> {
+        let hex = value[field]
+            .as_str()
+            .ok_or("missing identity hexadecimal field")?;
+        if hex.len() != 64
+            || !hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err("invalid identity hexadecimal field".into());
+        }
+        let mut result = [0; 32];
+        for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+            let digits =
+                std::str::from_utf8(pair).map_err(|_| "invalid identity hexadecimal field")?;
+            result[index] =
+                u8::from_str_radix(digits, 16).map_err(|_| "invalid identity hexadecimal field")?;
+        }
+        Ok(result)
+    };
+    let seed = decode("seed_hex")?;
+    let recorded = decode("public_key_hex")?;
+    let keypair =
+        Ed25519KeyPair::from_seed_unchecked(&seed).map_err(|_| "invalid existing identity seed")?;
+    if keypair.public_key().as_ref() != recorded {
+        return Err("existing identity public key differs from its seed".into());
+    }
+    Ok(Principal::from_ed25519_public_key(&recorded))
+}
+
 // 同进程首次创建必须只有一个 writer；已有身份的读取不经过此锁。
 // 跨进程共享节点目录的初始化仍需由节点所有者协调。
 static AUTH_IDENTITY_INITIALIZATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
