@@ -278,5 +278,13 @@
     "module": "nexus-compute / apps/nexusd",
     "category": "implementation-pitfall",
     "summary": "Artifact Catalog 与 TaskOwner 交付事件绑定；未知旧状态不重建，receiver lease 防第二 owner，Publishing intent + 同 inode no-replace 发布与 SIGKILL 恢复。"
+  },
+  {
+    "id": "skill-mining-method",
+    "file": "entries/2026-10-06-skill-mining-method.md",
+    "date": "2026-10-06",
+    "module": "engineering",
+    "category": "implementation-pattern",
+    "summary": "Skill 挖掘五步法（Lauren Tan/pstack 播客提炼）：记痛点→翻记录找重复→分类（传话筒/反复纠正/重讲背景）→拆分确定性→buffer 再固化；自下而上、自己的刀"
   }
 ]
