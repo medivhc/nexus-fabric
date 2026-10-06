@@ -10,9 +10,25 @@ pub struct Repo {
 
 impl Repo {
     /// Discover the repository root via `git rev-parse --show-toplevel`.
+    ///
+    /// `GIT_DIR` / `GIT_WORK_TREE` 会被显式剥离：git 在执行 hook
+    /// （如 pre-push）时会设置 `GIT_DIR`，此时 `--show-toplevel`
+    /// 返回的是子进程 CWD 而非真正的 worktree 根，导致
+    /// `Repo::discover` 拿到错误的 root（2026-10-06 真实踩坑：
+    /// hook 内 verify --fast 的 selected-properties 门因此 FAIL）。
+    /// discover 的语义是"从 CWD 发现仓库"，必须不受调用方 git 环境污染。
     pub fn discover() -> Result<Repo, String> {
-        let out = Command::new("git")
+        let mut cmd = Command::new("git");
+        Self::discover_in(&mut cmd)
+    }
+
+    /// discover 的可注入版本（测试用）：调用方可先在 cmd 上预置环境变量，
+    /// 再走与 discover() 完全相同的剥离逻辑。
+    fn discover_in(cmd: &mut Command) -> Result<Repo, String> {
+        let out = cmd
             .args(["rev-parse", "--show-toplevel"])
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
             .output()
             .map_err(|e| format!("failed to run git: {e}"))?;
         if !out.status.success() {
@@ -232,5 +248,28 @@ mod tests {
     fn hash_depends_on_input() {
         let repo = Repo::discover().expect("must run inside the nexus repository");
         assert_ne!(repo.hash_stdin("a").unwrap(), repo.hash_stdin("b").unwrap());
+    }
+
+    /// 回归：`Repo::discover` 不受调用方 `GIT_DIR` 污染。
+    /// git 执行 hook（如 pre-push）时会设置 `GIT_DIR`，此时若不剥离，
+    /// `git rev-parse --show-toplevel` 返回子进程 CWD 而非 worktree 根
+    /// （2026-10-06 真实踩坑：hook 内 verify --fast 的 selected-properties
+    /// 门因此 FAIL，push 被门禁拦下）。
+    #[test]
+    fn discover_ignores_caller_git_dir() {
+        // 干净的 worktree 根做断言基准。
+        let expected = Repo::discover()
+            .expect("must run inside the nexus repository")
+            .root
+            .to_string_lossy()
+            .to_string();
+
+        // 模拟 hook 污染：在 Command 上预置 GIT_DIR（指向 worktree gitfile），
+        // 再走与 discover() 完全相同的剥离逻辑；结果必须仍是真正的根。
+        let gitfile = Path::new(&expected).join(".git");
+        let mut cmd = Command::new("git");
+        cmd.env("GIT_DIR", &gitfile);
+        let repo = Repo::discover_in(&mut cmd).expect("discover must succeed under GIT_DIR");
+        assert_eq!(repo.root.to_string_lossy(), expected.as_str());
     }
 }
