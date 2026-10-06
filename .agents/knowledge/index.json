@@ -326,5 +326,13 @@
     "module": "apps/nexus",
     "category": "implementation-pitfall",
     "summary": "非default Workspace真实Use运维；只读避免KV open副作用；既存身份核实、Use-only字节幂等和intent/applied审计未知状态阻断。"
+  },
+  {
+    "id": "skill-mining-method",
+    "file": "entries/2026-10-06-skill-mining-method.md",
+    "date": "2026-10-06",
+    "module": "engineering",
+    "category": "implementation-pattern",
+    "summary": "Skill 挖掘五步法（Lauren Tan/pstack 播客提炼）：记痛点→翻记录找重复→分类（传话筒/反复纠正/重讲背景）→拆分确定性→buffer 再固化；自下而上、自己的刀"
   }
 ]
