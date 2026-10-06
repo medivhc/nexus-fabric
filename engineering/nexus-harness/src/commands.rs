@@ -18,7 +18,7 @@ fn gates_json(gates: &[Gate]) -> Value {
     )
 }
 
-fn setup() -> Result<(Repo, Config), Outcome> {
+pub(crate) fn setup() -> Result<(Repo, Config), Outcome> {
     let repo = Repo::discover().map_err(|e| {
         (
             "BLOCKED".to_string(),

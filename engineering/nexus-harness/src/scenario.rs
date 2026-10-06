@@ -24,6 +24,14 @@ pub enum ExpectKind {
 #[derive(Clone)]
 pub struct Scenario {
     pub id: String,
+    /// toml 所在子目录（product | regression | platform | engineering）。
+    pub subdir: String,
+    /// toml 的 `title` 字段原文（缺省为空字符串）。
+    pub title: String,
+    /// 顶层 `requires_root = true`（缺省 false）。
+    pub requires_root: bool,
+    /// 文件 stem（小写），供 requires 启发式使用。
+    pub file_stem: String,
     pub platform: Option<String>,
     /// E4 夹具命令（P0-6）：harness 在执行 `[when].command` 之前按序执行，
     /// 全部 exit 0 才继续；任一失败则场景判 FAIL（夹具是场景 E4 环境声明的
@@ -40,10 +48,24 @@ pub struct ScenarioResult {
     pub detail: String,
 }
 
-fn load_file(path: &PathBuf) -> Option<Scenario> {
+fn load_file(path: &PathBuf, subdir: &str) -> Option<Scenario> {
     let text = std::fs::read_to_string(path).ok()?;
     let v: toml::Value = toml::from_str(&text).ok()?;
     let id = v.get("id")?.as_str()?.to_string();
+    let title = v
+        .get("title")
+        .and_then(toml::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let requires_root = v
+        .get("requires_root")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
+    let file_stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
     let platform = v
         .get("given")
         .and_then(|g| g.get("platform"))
@@ -89,11 +111,34 @@ fn load_file(path: &PathBuf) -> Option<Scenario> {
         .unwrap_or_default();
     Some(Scenario {
         id,
+        subdir: subdir.to_string(),
+        title,
+        requires_root,
+        file_stem,
         platform,
         fixtures,
         command,
         expects,
     })
+}
+
+/// 单场景的执行环境需求（启发式 v1，见 CONTRACT-scenario-pack.md）。
+///
+/// toml 不可改（Protected），故为推导值：
+/// - `requires_root = true` → "real-device"；
+/// - 文件 stem 或 id 含 `realnet` / `real_net` → "real-device"；
+/// - 其余 → "sandbox"。
+pub fn scenario_requires(s: &Scenario) -> &'static str {
+    if s.requires_root {
+        return "real-device";
+    }
+    if s.file_stem.contains("realnet")
+        || s.file_stem.contains("real_net")
+        || s.id.to_lowercase().contains("realnet")
+    {
+        return "real-device";
+    }
+    "sandbox"
 }
 
 /// TOML 期望值 → JSON 期望值。数组递归转换；标量逐一映射。
@@ -133,7 +178,7 @@ pub fn load_all(scenarios_dir: &Path, subdirs: &[&str]) -> Vec<Scenario> {
             .collect();
         files.sort();
         for f in files {
-            if let Some(s) = load_file(&f) {
+            if let Some(s) = load_file(&f, sub) {
                 out.push(s);
             }
         }
@@ -141,8 +186,17 @@ pub fn load_all(scenarios_dir: &Path, subdirs: &[&str]) -> Vec<Scenario> {
     out
 }
 
+/// 单个 expect 失败的结构化信息（供失败签名使用）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpectFailure {
+    /// 失败的 expect `field` path。
+    pub path: String,
+    /// 实际值（JSON 文本；缺失为 "<missing>"）。
+    pub actual: String,
+}
+
 /// Evaluate a scenario against a command's JSON output.
-fn evaluate(scenario: &Scenario, output: &Value) -> Result<(), String> {
+fn evaluate(scenario: &Scenario, output: &Value) -> Result<(), ExpectFailure> {
     for expect in &scenario.expects {
         let actual = get_path(output, &expect.path);
         let ok = match &expect.kind {
@@ -157,14 +211,12 @@ fn evaluate(scenario: &Scenario, output: &Value) -> Result<(), String> {
             }),
         };
         if !ok {
-            return Err(format!(
-                "expect {}.{} failed (actual: {})",
-                scenario.id,
-                expect.path,
-                actual
+            return Err(ExpectFailure {
+                path: expect.path.clone(),
+                actual: actual
                     .map(|a| a.to_string())
-                    .unwrap_or_else(|| "<missing>".to_string())
-            ));
+                    .unwrap_or_else(|| "<missing>".to_string()),
+            });
         }
     }
     Ok(())
@@ -200,29 +252,6 @@ fn get_path<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
         }
         _ => None,
     }
-}
-
-/// Run a [when].command, resolving "nexus-harness" to the current executable so
-/// the harness can self-host its own scenario gate.
-///
-/// 有界执行：场景命令必须在超时内结束。用 spawn + try_wait
-/// 轮询代替 Command::output()——output() 会阻塞读 pipe 到 EOF，若场景的
-/// 孤儿子进程（如 E4 的 netns child）持有 pipe 写端，EOF 永不到、harness
-/// 永挂（2026-10-02 n1_roam 真实踩坑）。超时则 kill 直接子进程并判失败；
-/// 输出收集不等待 EOF，取读线程已拿到的数据。
-/// `node_dir`: 场景级隔离的节点目录（`NEXUS_CONFIG_DIR`）；`None` 则不设置，
-/// 子进程沿用 ambient 环境（单元测试用）。
-fn run_command(command: &str, node_dir: Option<&std::path::Path>) -> (String, String) {
-    use std::time::Duration;
-    let (_outcome, stdout, _stderr) = run_checked_with_timeouts(
-        command,
-        Duration::from_secs(600),
-        Duration::from_secs(10),
-        node_dir,
-    );
-    // 调用方忽略首元素、只按输出 JSON 做期望判定（见 run_gate），
-    // 此处保持与原语义一致：命令跑完即透出原始输出。
-    (true.to_string(), stdout)
 }
 
 /// 带退出码的命令执行（E4 夹具用）：返回 `(exit_ok, stdout, stderr_tail)`。
@@ -388,8 +417,195 @@ fn run_command_with_timeouts(
     }
 }
 
+/// 单场景执行的结构化报告（机器接口 `scenario run` 的失败签名来源）。
+///
+/// verdict 取值：PASS | FAIL | UNKNOWN | BLOCKED。
+/// - UNKNOWN：平台不匹配 / 静态契约无 `[when].command` / n3 contract-first 未实现。
+///   `scenario run` 机器接口把 UNKNOWN 映射为 BLOCKED；
+///   run_gate 保持原有的 UNKNOWN 记录语义（不阻塞门禁）。
+pub struct ScenarioRunReport {
+    pub verdict: String,
+    /// 失败步骤："" | "fixture" | "command" | "expect" | "parse" | "lookup"。
+    pub failed_step: String,
+    /// 失败断言：fixture 命令原文 / "spawn_failed" / "timed_out" /
+    /// expect field path / ""（parse、lookup、平台不匹配时为说明文本）。
+    pub assertion: String,
+    /// 最近 10 行相关日志（PASS 时为空数组）。
+    pub key_log_lines: Vec<String>,
+    /// 单场景墙钟毫秒数（含 fixture）。
+    pub duration_ms: u64,
+    /// 人类可读明细（与旧 ScenarioResult.detail 同格式）。
+    pub detail: String,
+}
+
+/// 取文本最后至多 n 行。
+fn tail_lines(text: &str, n: usize) -> Vec<String> {
+    text.lines()
+        .rev()
+        .take(n)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(str::to_string)
+        .collect()
+}
+
+fn current_platform() -> &'static str {
+    if cfg!(windows) {
+        "windows"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "other"
+    }
+}
+
+/// 执行单个场景。执行语义与旧 run_gate 逐场景循环完全一致
+/// （fixture 顺序执行、有界超时、场景级 NEXUS_CONFIG_DIR 隔离、
+/// n3 contract-first 的 UNKNOWN 特例），只是把失败信息结构化。
+pub fn run_single(s: &Scenario) -> ScenarioRunReport {
+    use std::time::Instant;
+    let start = Instant::now();
+    let mut rep = run_single_inner(s);
+    rep.duration_ms = start.elapsed().as_millis() as u64;
+    rep
+}
+
+fn unknown_report(failed_step: &str, assertion: String, detail: String) -> ScenarioRunReport {
+    ScenarioRunReport {
+        verdict: "UNKNOWN".to_string(),
+        failed_step: failed_step.to_string(),
+        assertion,
+        key_log_lines: Vec::new(),
+        duration_ms: 0,
+        detail,
+    }
+}
+
+fn run_single_inner(s: &Scenario) -> ScenarioRunReport {
+    use std::time::Duration;
+
+    // 平台门：与旧 run_gate 语义一致（不匹配记 UNKNOWN，不阻塞）。
+    if let Some(plat) = &s.platform {
+        let current_plat = current_platform();
+        if plat != current_plat {
+            let detail = format!("platform contract ({plat} required, host is {current_plat})");
+            return unknown_report("lookup", detail.clone(), detail);
+        }
+    }
+    let cmd = match &s.command {
+        None => {
+            return unknown_report(
+                "lookup",
+                String::new(),
+                "static contract, runtime not exercisable by harness (no [when].command)"
+                    .to_string(),
+            );
+        }
+        Some(c) => c.clone(),
+    };
+    // 场景隔离：每个场景独占一个节点目录（`NEXUS_CONFIG_DIR`），
+    // fixture 与主命令共享同一目录、场景之间互不可见。否则多个
+    // N2 场景共用默认目录、`dev-svc` 等同名资源互相污染
+    // （如 n2-resource-revoke 的撤销影响 n2-use-loop）。
+    let scenario_node_dir = std::env::temp_dir().join(format!(
+        "nexus-scenario-{}-{}",
+        s.id.replace(['/', '\\'], "_"),
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&scenario_node_dir);
+    let node_dir = Some(scenario_node_dir.as_path());
+    // E4 夹具（P0-6）：先按序跑 `[given].fixture`，全部 exit 0 才跑
+    // 场景命令；任一夹具失败 → 场景 FAIL（夹具是 E4 环境声明）。
+    for fixture in &s.fixtures {
+        let (ok, _out, err_tail) = run_command_checked(fixture, node_dir);
+        if !ok {
+            return ScenarioRunReport {
+                verdict: "FAIL".to_string(),
+                failed_step: "fixture".to_string(),
+                assertion: fixture.clone(),
+                key_log_lines: tail_lines(&err_tail, 10),
+                duration_ms: 0,
+                detail: format!("fixture failed: {fixture} (stderr: {err_tail})"),
+            };
+        }
+    }
+    // 主命令：有界执行，透出 RunOutcome 以区分"命令失败"与"输出解析失败"。
+    let (outcome, stdout, stderr_tail) = run_checked_with_timeouts(
+        &cmd,
+        Duration::from_secs(600),
+        Duration::from_secs(10),
+        node_dir,
+    );
+    match outcome {
+        RunOutcome::TimedOut => ScenarioRunReport {
+            verdict: "FAIL".to_string(),
+            failed_step: "command".to_string(),
+            assertion: "timed_out".to_string(),
+            key_log_lines: tail_lines(&format!("{stdout}\n{stderr_tail}"), 10),
+            duration_ms: 0,
+            detail: "scenario command timed out after 600s".to_string(),
+        },
+        RunOutcome::SpawnFailed => ScenarioRunReport {
+            verdict: "FAIL".to_string(),
+            failed_step: "command".to_string(),
+            assertion: "spawn_failed".to_string(),
+            key_log_lines: tail_lines(&stderr_tail, 10),
+            duration_ms: 0,
+            detail: format!("cannot run scenario command: {stderr_tail}"),
+        },
+        RunOutcome::Exited(_) => match serde_json::from_str::<Value>(&stdout) {
+            Ok(json) => match evaluate(s, &json) {
+                Ok(()) => ScenarioRunReport {
+                    verdict: "PASS".to_string(),
+                    failed_step: String::new(),
+                    assertion: String::new(),
+                    key_log_lines: Vec::new(),
+                    duration_ms: 0,
+                    detail: format!("command ran, all {} expectations held", s.expects.len()),
+                },
+                Err(f) => ScenarioRunReport {
+                    verdict: "FAIL".to_string(),
+                    failed_step: "expect".to_string(),
+                    assertion: f.path.clone(),
+                    key_log_lines: tail_lines(&stdout, 10),
+                    duration_ms: 0,
+                    detail: format!("expect {}.{} failed (actual: {})", s.id, f.path, f.actual),
+                },
+            },
+            Err(e) => {
+                // N3 contract-first: n3_task_e4 example 从未交付（master 既有 Red，
+                // 非 P1 回归）。输出为空时标记为 UNKNOWN 而非 FAIL，避免门禁被
+                // 未实现的契约阻塞；冻结的 TOML 期望未动。
+                let is_n3_contract_first =
+                    s.id.starts_with("product.n3-") && stdout.trim().is_empty();
+                if is_n3_contract_first {
+                    unknown_report(
+                        "parse",
+                        String::new(),
+                        "contract-first: n3_task_e4 not implemented (master Red)".to_string(),
+                    )
+                } else {
+                    ScenarioRunReport {
+                        verdict: "FAIL".to_string(),
+                        failed_step: "parse".to_string(),
+                        assertion: String::new(),
+                        key_log_lines: tail_lines(&stdout, 10),
+                        duration_ms: 0,
+                        detail: format!("output not JSON ({e}): {}", stdout.trim()),
+                    }
+                }
+            }
+        },
+    }
+}
+
 /// Run all command-scenarios in the given subdirs; static ones are recorded
 /// UNKNOWN. Returns (results, gate) — gate is FAIL if any scenario FAIL.
+///
+/// 逐场景执行委托给 run_single（单一执行路径）；本函数只做聚合与 Gate 判定。
 pub fn run_gate(config: &Config, gate_name: &str, subdirs: &[&str]) -> (Vec<ScenarioResult>, Gate) {
     let scenarios = load_all(&config.scenarios_dir, subdirs);
     if scenarios.is_empty() {
@@ -401,109 +617,15 @@ pub fn run_gate(config: &Config, gate_name: &str, subdirs: &[&str]) -> (Vec<Scen
     let mut results: Vec<ScenarioResult> = Vec::new();
     let mut failed = false;
     for s in &scenarios {
-        if let Some(plat) = &s.platform {
-            let current_plat = if cfg!(windows) {
-                "windows"
-            } else if cfg!(target_os = "linux") {
-                "linux"
-            } else if cfg!(target_os = "macos") {
-                "macos"
-            } else {
-                "other"
-            };
-            if plat != current_plat {
-                results.push(ScenarioResult {
-                    id: s.id.clone(),
-                    verdict: "UNKNOWN".to_string(),
-                    detail: format!("platform contract ({plat} required, host is {current_plat})"),
-                });
-                continue;
-            }
+        let rep = run_single(s);
+        if rep.verdict == "FAIL" {
+            failed = true;
         }
-        match &s.command {
-            None => results.push(ScenarioResult {
-                id: s.id.clone(),
-                verdict: "UNKNOWN".to_string(),
-                detail: "static contract, runtime not exercisable by harness (no [when].command)"
-                    .to_string(),
-            }),
-            Some(cmd) => {
-                // 场景隔离：每个场景独占一个节点目录（`NEXUS_CONFIG_DIR`），
-                // fixture 与主命令共享同一目录、场景之间互不可见。否则多个
-                // N2 场景共用默认目录、`dev-svc` 等同名资源互相污染
-                // （如 n2-resource-revoke 的撤销影响 n2-use-loop）。
-                let scenario_node_dir = std::env::temp_dir().join(format!(
-                    "nexus-scenario-{}-{}",
-                    s.id.replace(['/', '\\'], "_"),
-                    std::process::id()
-                ));
-                let _ = std::fs::create_dir_all(&scenario_node_dir);
-                let node_dir = Some(scenario_node_dir.as_path());
-                // E4 夹具（P0-6）：先按序跑 `[given].fixture`，全部 exit 0 才跑
-                // 场景命令；任一夹具失败 → 场景 FAIL（夹具是 E4 环境声明）。
-                let mut fixture_failed: Option<String> = None;
-                for fixture in &s.fixtures {
-                    let (ok, _out, err_tail) = run_command_checked(fixture, node_dir);
-                    if !ok {
-                        fixture_failed =
-                            Some(format!("fixture failed: {fixture} (stderr: {err_tail})"));
-                        break;
-                    }
-                }
-                if let Some(detail) = fixture_failed {
-                    failed = true;
-                    results.push(ScenarioResult {
-                        id: s.id.clone(),
-                        verdict: "FAIL".to_string(),
-                        detail,
-                    });
-                    continue;
-                }
-                let (_, out) = run_command(cmd, node_dir);
-                match serde_json::from_str::<Value>(&out) {
-                    Ok(json) => match evaluate(s, &json) {
-                        Ok(()) => results.push(ScenarioResult {
-                            id: s.id.clone(),
-                            verdict: "PASS".to_string(),
-                            detail: format!(
-                                "command ran, all {} expectations held",
-                                s.expects.len()
-                            ),
-                        }),
-                        Err(e) => {
-                            failed = true;
-                            results.push(ScenarioResult {
-                                id: s.id.clone(),
-                                verdict: "FAIL".to_string(),
-                                detail: e,
-                            });
-                        }
-                    },
-                    Err(e) => {
-                        // N3 contract-first: n3_task_e4 example 从未交付（master 既有 Red，
-                        // 非 P1 回归）。输出为空时标记为 UNKNOWN 而非 FAIL，避免门禁被
-                        // 未实现的契约阻塞；冻结的 TOML 期望未动。
-                        let is_n3_contract_first =
-                            s.id.starts_with("product.n3-") && out.trim().is_empty();
-                        if is_n3_contract_first {
-                            results.push(ScenarioResult {
-                                id: s.id.clone(),
-                                verdict: "UNKNOWN".to_string(),
-                                detail: "contract-first: n3_task_e4 not implemented (master Red)"
-                                    .to_string(),
-                            });
-                        } else {
-                            failed = true;
-                            results.push(ScenarioResult {
-                                id: s.id.clone(),
-                                verdict: "FAIL".to_string(),
-                                detail: format!("output not JSON ({e}): {}", out.trim()),
-                            });
-                        }
-                    }
-                }
-            }
-        }
+        results.push(ScenarioResult {
+            id: s.id.clone(),
+            verdict: rep.verdict,
+            detail: rep.detail,
+        });
     }
     let detail: Vec<String> = results
         .iter()
@@ -525,6 +647,10 @@ mod tests {
     fn scenario(expects: Vec<ScenarioExpect>) -> Scenario {
         Scenario {
             id: "t".to_string(),
+            subdir: "product".to_string(),
+            title: "test".to_string(),
+            requires_root: false,
+            file_stem: "t".to_string(),
             platform: None,
             fixtures: Vec::new(),
             command: None,
@@ -787,5 +913,154 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(scenarios.len(), 1);
         assert_eq!(scenarios[0].fixtures, vec!["echo ok".to_string()]);
+    }
+
+    /// 场景包：evaluate 返回结构化失败（path + actual），供失败签名使用。
+    #[test]
+    fn evaluate_structured_failure() {
+        let s = scenario(vec![ScenarioExpect {
+            path: "up.up_ok".to_string(),
+            kind: ExpectKind::Equals(json!(true)),
+        }]);
+        let err = evaluate(&s, &json!({"up": {"up_ok": false}})).expect_err("must fail");
+        assert_eq!(err.path, "up.up_ok");
+        assert_eq!(err.actual, "false");
+        let err = evaluate(&s, &json!({})).expect_err("must fail");
+        assert_eq!(err.path, "up.up_ok");
+        assert_eq!(err.actual, "<missing>");
+    }
+
+    /// 场景包：requires 启发式 v1（CONTRACT-scenario-pack.md 冻结规则）。
+    #[test]
+    fn scenario_requires_heuristic() {
+        let mut s = scenario(vec![]);
+        // 默认 → sandbox。
+        assert_eq!(scenario_requires(&s), "sandbox");
+        // requires_root = true → real-device。
+        s.requires_root = true;
+        assert_eq!(scenario_requires(&s), "real-device");
+        s.requires_root = false;
+        // 文件 stem 含 realnet → real-device。
+        s.file_stem = "n1_connectivity_roam_realnet".to_string();
+        assert_eq!(scenario_requires(&s), "real-device");
+        // id 含 realnet → real-device（大小写不敏感）。
+        s.file_stem = "x".to_string();
+        s.id = "product.n1-connectivity-roam-realnet".to_string();
+        assert_eq!(scenario_requires(&s), "real-device");
+    }
+
+    /// 场景包：title / subdir / requires_root 从 toml 解析。
+    #[test]
+    fn scenario_meta_parsed_from_toml() {
+        let dir = std::env::temp_dir().join(format!("harness-meta-{}", std::process::id()));
+        let sub = dir.join("product");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&sub).expect("tmpdir");
+        std::fs::write(
+            sub.join("m.toml"),
+            "schema_version = 1\nid = \"t.meta\"\ntitle = \"元信息测试\"\nrequires_root = true\n[when]\ncommand = \"echo hi\"\n",
+        )
+        .expect("write toml");
+        let scenarios = load_all(&dir, &["product"]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(scenarios.len(), 1);
+        assert_eq!(scenarios[0].title, "元信息测试");
+        assert_eq!(scenarios[0].subdir, "product");
+        assert!(scenarios[0].requires_root);
+        assert_eq!(scenarios[0].file_stem, "m");
+        assert_eq!(scenario_requires(&scenarios[0]), "real-device");
+    }
+
+    /// 场景包：tail_lines 只取最后 n 行。
+    #[test]
+    fn tail_lines_keeps_last_n() {
+        let text = "a\nb\nc\nd\ne";
+        assert_eq!(tail_lines(text, 3), vec!["c", "d", "e"]);
+        assert_eq!(tail_lines(text, 10), vec!["a", "b", "c", "d", "e"]);
+        assert!(tail_lines("", 10).is_empty());
+    }
+
+    fn synthetic_scenario(id: &str, toml_body: &str) -> (std::path::PathBuf, Vec<Scenario>) {
+        // 目录名带测试 id：同进程内测试并行跑，共享目录会互相污染。
+        let dir = std::env::temp_dir().join(format!("harness-single-{id}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        std::fs::write(dir.join(format!("{id}.toml")), toml_body).expect("write toml");
+        let scenarios = load_all(&dir, &[""]);
+        (dir, scenarios)
+    }
+
+    /// 场景包：run_single 在合成场景上产出结构化失败签名（expect 失败）。
+    #[test]
+    fn run_single_expect_failure_signature() {
+        let (dir, scenarios) = synthetic_scenario(
+            "sig",
+            "schema_version = 1\nid = \"t.sig\"\ntitle = \"签名测试\"\n[when]\ncommand = \"echo {\\\"verdict\\\":\\\"PASS\\\"}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"FAIL\"\n",
+        );
+        assert_eq!(scenarios.len(), 1);
+        let rep = run_single(&scenarios[0]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(rep.verdict, "FAIL");
+        assert_eq!(rep.failed_step, "expect");
+        assert_eq!(rep.assertion, "verdict");
+        assert!(!rep.key_log_lines.is_empty());
+        assert!(rep.duration_ms < 60_000);
+        assert!(rep.detail.contains("t.sig.verdict"));
+    }
+
+    /// 场景包：run_single 的 fixture 失败签名。
+    #[test]
+    fn run_single_fixture_failure_signature() {
+        let (dir, scenarios) = synthetic_scenario(
+            "fx",
+            "schema_version = 1\nid = \"t.fx\"\n[given]\nfixture = [\"false\"]\n[when]\ncommand = \"echo {\\\"verdict\\\":\\\"PASS\\\"}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
+        );
+        let rep = run_single(&scenarios[0]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(rep.verdict, "FAIL");
+        assert_eq!(rep.failed_step, "fixture");
+        assert_eq!(rep.assertion, "false");
+    }
+
+    /// 场景包：run_single 的静态契约（[when] 无 command）→ UNKNOWN（机器接口映射为 BLOCKED）。
+    #[test]
+    fn run_single_static_contract_is_unknown() {
+        let (dir, scenarios) = synthetic_scenario(
+            "st",
+            "schema_version = 1\nid = \"t.st\"\ntitle = \"静态契约\"\n[when]\n",
+        );
+        let rep = run_single(&scenarios[0]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(rep.verdict, "UNKNOWN");
+        assert_eq!(rep.failed_step, "lookup");
+    }
+
+    /// 场景包：run_single 的平台不匹配 → UNKNOWN。
+    #[test]
+    fn run_single_platform_mismatch_is_unknown() {
+        let (dir, scenarios) = synthetic_scenario(
+            "pl",
+            "schema_version = 1\nid = \"t.pl\"\n[given]\nplatform = \"definitely-not-this-os\"\n[when]\ncommand = \"echo hi\"\n",
+        );
+        let rep = run_single(&scenarios[0]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(rep.verdict, "UNKNOWN");
+        assert!(rep.detail.contains("platform contract"));
+    }
+
+    /// 场景包：run_single 的 PASS 路径（duration_ms 有界、签名为空）。
+    #[test]
+    fn run_single_pass_report() {
+        let (dir, scenarios) = synthetic_scenario(
+            "ok",
+            "schema_version = 1\nid = \"t.ok\"\n[when]\ncommand = \"echo {\\\"verdict\\\":\\\"PASS\\\"}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
+        );
+        let rep = run_single(&scenarios[0]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(rep.verdict, "PASS");
+        assert!(rep.failed_step.is_empty());
+        assert!(rep.assertion.is_empty());
+        assert!(rep.key_log_lines.is_empty());
+        assert!(rep.duration_ms < 60_000);
     }
 }
