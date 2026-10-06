@@ -395,7 +395,20 @@ disjoint）零改动。
   （safe、MIT/Apache-2.0、传递闭包仅 libc/windows-sys），**仅限 apps/nexus**
   （组合根），`nexus-discovery` 保持零第三方依赖、零 I/O。
 
-### 冻结契约（配对 D7，`.agents/plans/pairing-plan.md`，scenarios/product/pairing.toml）
+### 冻结契约（配对 D7，`scenarios/product/pairing.toml`）
+
+> 注：原设计文档 `.agents/plans/pairing-plan.md` 已在 P0 文档清理中删除，
+> D7 关键决策并入此处，信息不丢失。
+
+**D7 关键决策**（原 pairing-plan.md §3）：
+
+- `DiscoverySource` 新增 `Paired` 变体，优先级 **`Paired > Static > Lsa > Mdns`**
+  （变体声明顺序即优先级）。理由：Paired 是用户显式走完配对仪式的信任，
+  比手动静态配置更可信（无手误风险）；现有 `Static/Lsa/Mdns` 相对顺序不变。
+- **冻结签名冲突解决**：D5 已冻结 `AggregateDiscovery::new(static_src, lsdb, mdns)`
+  签名，新增参数会破坏冻结契约。采用方案 B（加法）：保留 `new` 签名不变，
+  新增 `AggregateDiscovery::with_paired(self, paired: PairedDiscovery) -> Self`
+  builder 方法接入配对源；未调用 `with_paired` 时行为与 D5 冻结时一致（向后兼容）。
 
 设备间信任建立（pairing）：带外配对码 + ed25519 签名认证。配对 ≠ 建连
 （配对只建信任，不建立 Connectivity）；Identity（ed25519 公钥）≠ Locator
