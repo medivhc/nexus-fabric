@@ -12,6 +12,11 @@
 > `nexus config get|set|list`、`nexus proxy bufferbloat-test`；修正此前误记为 `nexusd <verb>` 的观察命令
 > （现归 `nexus` CLI 名下，`nexusd` 仅保留 `<config-folder>` 与 `serve`）；修正默认 LocalAPI 传输目标
 > （**unix socket 优先**，非固定 TCP `127.0.0.1:18080`）。
+> 2026-10-05：一次"只看本手册执行用户命令"的可用性走查后修订 —— 修正 §2.3 daemon 二进制名
+> （`nexus`→`nexusd`）、补齐**退出码三档语义（0/1/2）**、§4.7 观察表补必填参数、
+> §4.9.2 示例资源名（`net`→`dev-svc`）；并把走查发现的实现缺陷/帮助缺口如实登记进 §6.1
+> （`proxy --addr` 失效、`nexusd --help` 缺 `serve`、`vpi-capabilities` 需 feature 等），
+> **不把产品缺陷曲解为预期行为**。详见 §6.5。
 
 本手册只收录**有完整实现逻辑、用户可达**的功能。每个功能均附代码级校验：可机检场景（E4/E3）在 `verify --full` 中 PASS、可执行驱动（example / CLI 命令 / 集成测试）与来源代码路径。
 
@@ -81,8 +86,8 @@ cargo build --workspace
 | 二进制                   | 角色                             | 命令示例                                          |
 | --------------------- | ------------------------------ | --------------------------------------------- |
 | `nexus`               | 用户控制面 CLI：thin-client 观察命令 + 进程内命令族 | `nexus status --json` / `nexus use dev-svc` / `nexus subnet up --config c.toml` |
-| `nexus`              | 常驻 daemon：配置目录入口 + HTTP LocalAPI 提供方 | `nexus serve` / `nexusd <config-folder>`      |
-| `nexus-platform-host` | 平台宿主（能力声明）                     | `nexus-platform-host vpi-capabilities --json` |
+| `nexusd`             | 常驻 daemon：配置目录入口 + HTTP LocalAPI 提供方 | `nexusd serve` / `nexusd <config-folder>`     |
+| `nexus-platform-host` | 平台宿主（能力声明）                     | `nexus-platform-host vpi-capabilities --json`（需 `--features platform-windows`，否则仅 stub，见 §4.8.1） |
 
 三种使用形态（详见 §4.9）：
 
@@ -90,17 +95,21 @@ cargo build --workspace
 
 * **thin-client 观察命令**：`nexus` 经 `nexusd serve` 的 HTTP LocalAPI 查询 daemon 快照。`localapi_client` 的**路由表定义 8 条**（静态 5：`status` / `dns status` / `dns cache` / `connectivity status` / `platform capabilities`；动态 3：`workspace commit <ws>` / `session watch <id>` / `plan explain <res>`）。**注意**：`nexus plan` 与 `nexus session` 在 `main.rs` 分发时先被 N2 进程内模块接管、不经 daemon，故 CLI 实际经 daemon 的为 **5 静态 + `workspace commit`**；daemon 侧 `/session/watch`、`/plan/explain` 端点仍存在（由 `nexusd` 侧驱动/`localapi_probe` 使用）。daemon 未运行 → 结构化 `DAEMON_UNREACHABLE`（exit 0）。另有 **10 个观察命令无路由**（`dns resolve|providers`、`connectivity candidates|probe|links`、`workspace heads|conflicts|cache`、`compute jobs`、`diagnose`），CLI 本地合成显式 `UNSUPPORTED`（PRODUCT §9 禁止静默降级）。
 
-* **进程内命令族（不经 daemon）**：`nexus plan|use|session|resource|grant|node|pair|network|subnet|schedule|system-proxy|autostart|config|run` 与 `nexus proxy ...` 直接装配 SDK 组合根执行，输出结构化 JSON（exit 0 = 请求已被处理，拒绝也是处理结果）。
+* **进程内命令族（不经 daemon）**：`nexus plan|use|session|resource|grant|node|pair|network|subnet|schedule|system-proxy|autostart|config|run` 与 `nexus proxy ...` 直接装配 SDK 组合根执行，输出结构化 JSON。**退出码不是恒 0**：N2 进程内命令按 `verdict` 决定（`verdict=FAIL` → exit 1，如 `NOT_FOUND` / `AUTH_DENIED` / `ALREADY_TERMINATED`），`run` 则无论成败恒 exit 0；完整三档语义见 §4.9.2。
 
 * **daemon 任务链（N3）**：`nexus task ...` 为 `nexusd` /localapi/v1/task 的 thin-client（POST）；`nexus artifact get` 当前诚实返回 `UNSUPPORTED_CAPABILITY`（未装配下载适配器）。
 
 传输目标：`nexus` / `nexusd serve` 默认 **unix socket 优先**（`$XDG_RUNTIME_DIR/nexus-localapi.sock`，否则 `temp_dir()/nexus-<uid>/nexus-localapi.sock`，0700；均不可用才回退 TCP `127.0.0.1:18080`）；`--addr <ip:port>` 可显式切 TCP loopback，`--socket <path>` 指定 socket 路径（Windows 构建下 `--socket` 不可用）。
 
+**两种 daemon 形态的默认传输不同**：`nexusd serve`（无参）默认 unix socket（同上）；而 `nexusd <config-folder>` 的 LocalAPI 地址取自配置目录内 `daemon.toml` 的 `localapi_addr`，**默认 TCP `127.0.0.1:18080`**（见 `apps/nexusd/src/config.rs`）。由于 `nexus` CLI 默认仍走 unix socket，若只用 `nexusd <config-folder>` 起服务，需 `nexus --addr 127.0.0.1:18080 status --json` 才能命中。
+
+**帮助缺口**：`nexusd --help` / `nexusd -h` 仅打印 `nexusd <config-folder>` 用法（不含 `serve`，exit 2）；且 `nexusd serve --help` **不显示帮助，会直接启动 daemon**（见 §6.1）。
+
 ## 3. 功能总览
 
-### 3.1 命令面总览（按 `nexus` CLI 实际分发，2026-10-04 对齐）
+### 3.1 命令面总览（按 `nexus` CLI 实际分发，2026-10-05 复核）
 
-下表为 `apps/nexus/src/main.rs` 分发逻辑中**实际可达**的全部命令。全局选项 `--json` / `--addr <ip:port>` / `--socket <path>` 可在任意位置剥离；exit 语义见 §4.9。
+下表为 `apps/nexus/src/main.rs` 分发逻辑中**实际可达**的全部命令。全局选项 `--json` / `--addr <ip:port>` / `--socket <path>` 在分发前统一剥离（`--json` 任意位置；`--addr`/`--socket` 亦为全局剥离，**这会与 `proxy` 子命令自己的 `--addr` 冲突，见 §6.1**）；**退出码三档语义见 §4.9.2**。
 
 | 命令族 | 语法 | 路由/实现 | 产出 |
 | --- | --- | --- | --- |
@@ -113,7 +122,7 @@ cargo build --workspace
 | N2 资源目录 | `resource list`；`resource show <name>`；`resource publish --name <n> --kind <k> [--locator <l>...]`；`resource revoke <name>`；`resource export <name> [--file <p>]`；`resource import [--file <p>]` | 进程内 | 发布/撤销/导入导出 |
 | N2 授权 | `grant add --resource <r> (--principal <p>\|--self) --op <Use\|Manage> [--not-after <n>]`；`grant revoke\|del --resource <r> --principal <p>`；`grant list [--resource <r>]` | 进程内（outbox 广播） | grant 表变更 |
 | N2 身份/信任 | `node init [--force]`；`node trust --provider <id> --pubkey <hex>` | 进程内（本地文件） | NodeId / TOFU 信任 |
-| N2 提供方 | `provider serve --bind <addr:port> [--once]` | 常驻准入服务 | stderr 日志（无 JSON） |
+| N2 提供方 | `provider serve --bind <addr:port> [--once]` | 常驻准入服务 | 一条 `PASS` JSON（含 control 地址）+ 服务日志 |
 | 设备配对（D7，§4.9.4） | `pair invite\|join\|list\|remove --dir <config-dir> [...]` | 进程内（本地文件 + 前台 TCP） | 纯文本（无 JSON） |
 | N3 任务（PRODUCT §17） | `task submit --request <file>`；`task show\|cancel\|artifacts <id>`；`task logs <id> --stream <stdout\|stderr> --offset <n>` | thin-client（POST `/localapi/v1/task`） | 版本化任务 envelope |
 | N3 产物 | `artifact get <id> --output <path>` | 未装配 → `UNSUPPORTED_CAPABILITY`（不写输出） | FAIL envelope |
@@ -634,6 +643,8 @@ cargo build --workspace
 
 * **用户用法**：`nexus proxy host service --addr 127.0.0.1:8787 --token <t>`；`nexus proxy relay --addr 127.0.0.1:8788`；`nexus proxy --addr 127.0.0.1:1080`
 
+* **已知缺陷（`--addr` 失效）**：`nexus proxy [host|relay] --addr <ip:port>` 的 `--addr` **当前不生效**——全局选项剥离器（`main.rs::extract_remote_target`）在分发前把 `--addr` 当作 thin-client 目标吞掉，子命令收不到，实际监听**默认端口**（SOCKS5 `1080`、host `8787`；`ss` 实测确认）。上面的示例恰用默认端口，故看似正常；换成别的端口即可复现（监听仍在默认端口）。**不在文档层改写成"预期行为"，已在 §6.1 登记为待修缺陷**；当前规避：只能用默认端口（`proxy` 的 `--config` / `--token` / `--tun` 不受影响）。
+
 * **代码级校验**：`product.daemon-real-host-flow` (9) / `daemon-real-host-auth-denied` (5) / `daemon-real-relay-flow` (9) / `daemon-real-socks-proxy-flow` (11) → 全部 PASS；错误 token 透传 `AUTH_DENIED`，host 为持续服务循环
 
 ### 4.7 Observability（§9）
@@ -647,23 +658,25 @@ cargo build --workspace
 | `nexus status --json`                  | 总览：DNS 快照 + 建连链路 + 规划决策 + 平台能力                             | `product.observability-status` (4)                  |
 | `nexus dns status --json`              | DNS 运行时状态（缓存 / 调用计数 / Exit-DNS Binding）                    | 由 `dns-exit-binding` + status 覆盖                    |
 | `nexus dns cache --json`               | DNS 正 / 负缓存快照                                              | `product.observability-dns-cache` (3)               |
-| `nexus dns resolve --json`             | 解析 [example.com](https://example.com) 输出地址 / TTL / Binding | `product.observability-dns-resolve` (6)             |
+| `nexus dns resolve <name> --json`      | 解析 [example.com](https://example.com) 输出地址 / TTL / Binding | `product.observability-dns-resolve` (6)             |
 | `nexus dns providers --json`           | DNS Provider 列表                                            | `product.observability-dns-providers` (5)           |
-| `nexus session watch --json`           | Session 双轨状态（phase/outcome/committed）                      | `product.observability-session-watch` (4)           |
+| `nexus session watch <id> --json`      | Session 双轨状态（phase/outcome/committed）                      | `product.observability-session-watch` (4)           |
 | `nexus connectivity status --json`     | 建连状态                                                       | 由 `status` 覆盖                                       |
 | `nexus connectivity candidates --json` | 候选 Provider                                                | `product.observability-connectivity-candidates` (5) |
-| `nexus connectivity probe --json`      | 目标可达性探测                                                    | `product.observability-connectivity-probe` (6)      |
+| `nexus connectivity probe <target> --json` | 目标可达性探测                                                | `product.observability-connectivity-probe` (6)      |
 | `nexus connectivity links --json`      | 活动链路                                                       | `product.observability-connectivity-links` (6)      |
-| `nexus plan explain --json`            | Plan + DecisionTrace 结构化拒绝原因                               | `product.observability-plan-explain` (4)            |
+| `nexus plan explain <res\|session-id> --json` | Plan + DecisionTrace 结构化拒绝原因（N2 进程内；见 §4.9.3）            | `product.observability-plan-explain` (4)            |
 | `nexus platform capabilities --json`   | 平台能力清单                                                     | 由 `status` + `platform.virtual-packet-interface` 覆盖 |
-| `nexus workspace heads --json`         | Head Set 快照（离线分叉可观察）                                       | `product.observability-workspace-heads` (6)         |
-| `nexus workspace conflicts --json`     | 未合并冲突                                                      | `product.observability-workspace-conflicts` (6)     |
-| `nexus workspace cache --json`         | 缓存状态 / 保护保留                                                | `product.observability-workspace-cache` (6)         |
+| `nexus workspace heads <ws> --json`    | Head Set 快照（离线分叉可观察）                                       | `product.observability-workspace-heads` (6)         |
+| `nexus workspace conflicts <ws> --json` | 未合并冲突                                                      | `product.observability-workspace-conflicts` (6)     |
+| `nexus workspace cache <ws> --json`    | 缓存状态 / 保护保留                                                | `product.observability-workspace-cache` (6)         |
 | `nexus compute jobs --json`            | 作业阶段 / 结果快照                                                | `product.observability-compute-jobs` (7)            |
 | `nexus diagnose --json`                | 统一诊断                                                       | `product.observability-diagnose` (5)                |
 | `nexus workspace commit <ws> --json`   | 提交 Workspace 暂存变更（daemon 动态路由）                              | 由 `nexusd` Workspace 挂载契约覆盖（C1/D1–D9）                 |
 
 SDK 层：`nexus::observability::{status, dns_status, dns_cache, dns_resolve, dns_providers, session_watch, connectivity_status, connectivity_candidates, connectivity_probe, connectivity_links, plan_explain, platform_capabilities, workspace_heads, workspace_conflicts, workspace_cache, compute_jobs, diagnose}`（`apps/nexus/src/observability.rs`）。
+
+> **必填参数**：上表中带 `<name>` / `<target>` / `<id>` / `<res>` / `<ws>` 的命令，位置参数不可省略——逐字照抄不带参的写法会得到 `error: missing argument`（exit 2）。例如 `nexus dns resolve --json`、`nexus connectivity probe --json`、`nexus session watch --json`、`nexus workspace heads --json` 均缺参失败；须写 `nexus dns resolve example.com --json` 等。
 
 **进程级状态单例**：`nexusd` 的 DNS 运行时为进程级单例（`OnceLock<RwLock<DnsRuntime>>`）。同一进程内多次 `dns status` / `dns cache` 共享同一缓存与调用计数（第二次同名解析 `from_cache=true`）；`nexusd serve` 常驻时，每个 LocalAPI 请求看到同一份累积状态，而非全新快照。
 
@@ -678,6 +691,8 @@ SDK 层：`nexus::observability::{status, dns_status, dns_cache, dns_resolve, dn
 * **能力**：平台宿主声明 Windows Virtual Packet Interface 能力：wintun 窄 FFI 后端、portable consumer（nexus-ingress）、Packet Semantics（MTU 1420、packet ingress/egress、wintun native API）。
 
 * **用户用法**：`cargo run --quiet -p nexus-platform-host --features platform-windows -- vpi-capabilities --json`
+
+* **诚实边界**：必须带 `--features platform-windows`；**不带该 feature 的构建（默认，如 §2.3 的示例）只打印 stub 文本 `nexus-platform-host: repository-contract bootstrap`，不输出任何能力 JSON**。
 
 * **代码级校验**：场景 `platform.virtual-packet-interface`（10 期望）→ PASS；实现 `apps/nexus-platform-host`（`vpi-capabilities` 命令）
 
@@ -697,11 +712,17 @@ SDK 层：`nexus::observability::{status, dns_status, dns_cache, dns_resolve, dn
 
 
 
-* **能力**：观察命令的参数解析（`--json` 任意位置；`--addr <ip:port>` / `--socket <path>`，默认 **unix socket 优先**）；路由表 **8 条**（静态 5 + 动态 3；CLI 实际经 daemon 为 5 静态 + `workspace commit`，`plan` / `session` 先被 N2 进程内模块接管），向 `nexusd serve` 发裸 HTTP GET 并原样渲染 daemon JSON（`--json` 机器可读 / 默认人读投影）；**10 个**无路由命令本地合成 `UNSUPPORTED`；连接失败输出 `DAEMON_UNREACHABLE` FAIL JSON。exit 语义：0 = 业务结果（含 FAIL），2 = 用法 / 解析错误。
+* **能力**：观察命令的参数解析（`--json` 任意位置；`--addr <ip:port>` / `--socket <path>`，默认 **unix socket 优先**）；路由表 **8 条**（静态 5 + 动态 3；CLI 实际经 daemon 为 5 静态 + `workspace commit`，`plan` / `session` 先被 N2 进程内模块接管），向 `nexusd serve` 发裸 HTTP GET 并原样渲染 daemon JSON（`--json` 机器可读 / 默认人读投影）；**10 个**无路由命令本地合成 `UNSUPPORTED`；连接失败输出 `DAEMON_UNREACHABLE` FAIL JSON。
 
-* **用户用法**：先 `nexusd serve`，再 `nexus status --json` / `nexus plan explain net --json` / `nexus dns cache --json`；显式 TCP 目标用 `nexus --addr 127.0.0.1:18080 status --json`
+* **退出码三档（`apps/nexus/src/main.rs` / `verdict_exit_code`，实测）**：
+  * `0` —— 请求已被处理（含 `verdict=FAIL`）：走 daemon 的命令（daemon 返回 FAIL 或 `DAEMON_UNREACHABLE`）、本地合成 `UNSUPPORTED` 的无路由命令、`run <resource>`（无论成败）均为 0。
+  * `1` —— **N2 进程内命令的业务失败**：输出 `verdict=FAIL` 且按 `verdict_exit_code` 返回 1，例如 `plan explain <不存在>`→`NOT_FOUND`、`session watch <不存在>`→`NOT_FOUND`、`session close <已终态>`→`ALREADY_TERMINATED`、`use`（无授权）→`AUTH_DENIED`。
+  * `2` —— 用法 / 解析错误（缺参、未知命令、`--socket` 在本构建不可用）。
+  * **注意**：`run` 是例外——其 FAIL 仍为 exit 0（`main.rs` 的 `Run` 分支恒 0）；而 `plan`/`use`/`session`/`resource`/`grant`/`config` 的 FAIL 为 exit 1。脚本消费时不能只按"0 vs 非 0"判定，须读 `verdict`。
 
-* **代码级校验**：CLI 单元测试（解析 / 剥离 /exit 语义）+ 集成测试 `apps/nexusd/tests/serve_localapi_e2e.rs`；9 个 `cli-*` 场景（E4）冻结 thin-client 契约：无路由命令必须本地合成 `verdict=FAIL, error.code=UNSUPPORTED, error.command=<命令名>`（2026-09-20 requirement-change，见 §6.2 修复记录）
+* **用户用法**：先 `nexusd serve`，再 `nexus status --json` / `nexus plan explain dev-svc --json` / `nexus dns cache --json`（`dev-svc` / `internet-access` 为内建 registry 中存在的资源；不存在的资源名如 `net` → `NOT_FOUND`，exit 1）；显式 TCP 目标用 `nexus --addr 127.0.0.1:18080 status --json`。
+
+* **代码级校验**：CLI 单元测试（解析 / 剥离 / exit 语义）+ 集成测试 `apps/nexusd/tests/serve_localapi_e2e.rs`；9 个 `cli-*` 场景（E4）冻结 thin-client 契约：无路由命令必须本地合成 `verdict=FAIL, error.code=UNSUPPORTED, error.command=<命令名>`（2026-09-20 requirement-change，见 §6.2 修复记录）
 
 #### 4.9.3 N2 资源访问命令族（PRODUCT §16）
 
@@ -712,8 +733,10 @@ SDK 层：`nexus::observability::{status, dns_status, dns_cache, dns_resolve, dn
   * `resource list|show|publish|revoke|export|import`：publish = 建广告（locator 需含非 `n2adm://` 数据面端点）+ 本机自授 Use + 清 tombstone；revoke = 按 grantee 排 `AUTH_REVOKE` + withdraw 广告 + tombstone + 撤 grant。
   * `grant add|revoke|del|list`：`--self` 用 ed25519 principal；revoke = tombstone（`DenyReason::Revoked`）、del = 物理删除；变更经 outbox 广播 `AUTH_GRANT` / `AUTH_REVOKE`。
   * `node init [--force]`：生成 X25519 传输身份，NodeId = `SHA-256(静态公钥)` 前 16 字节（无注册中心，幂等，`--force` 轮换）；`node trust --provider <id> --pubkey <hex>`：显式 TOFU 信任提供方 ed25519 身份。
-  * `provider serve --bind <addr:port> [--once]`：提供方常驻准入服务（每 Session 执行 grant 判定 + 审计 + 租约落盘；无 JSON 输出）。
+  * `provider serve --bind <addr:port> [--once]`：提供方常驻准入服务（每 Session 执行 grant 判定 + 审计 + 租约落盘）；启动时向 stdout 打印一条 `{"verdict":"PASS","command":"provider serve","provider":{"control":...}}`，此后持续服务。`--once` = **处理一条连接后退出**（不是"启动后立即退出"）；不带 `--once` 则一直常驻，需 Ctrl-C 结束。
   * `pair invite|join|list|remove --dir <dir>`：带外配对码 + ed25519 签名握手（`PAIR_PORT=18443`，超时 300s；纯文本输出）。
+
+* **N2 状态存储位置**：`plan` / `use` / `session` / `resource` / `grant` / `node` 等进程内命令的状态写入**节点根目录**，由 `node_cli::node_dir()` 决定：`$NEXUS_CONFIG_DIR` → `$XDG_CONFIG_HOME/nexus` → `~/.config/nexus`（即这些命令**没有** `--dir` 参数；隔离/清理 N2 状态需设 `NEXUS_CONFIG_DIR`）。`pair` / `config` 自带 `--dir`，与之无关。
 
 * **代码级校验**：E4 场景 `product.n2-plan-preview` (5) / `product.n2-use-loop` (6；fixture：`node init` → `resource publish` → `grant add --self`) / `product.n2-resource-list` (2) / `product.n2-resource-show` (4) / `product.n2-resource-publish` (3) / `product.n2-resource-revoke` (3) / `product.n2-grant-deny-audit` (4；FAIL / `AUTH_DENIED` / `NoSuchGrant` / `audit_written=true`) / `product.n2-provider-offline` (4，E5) / `product.pairing` (7) → PASS；实现 `apps/nexus/src/{plan_cli,use_cli,session_cli,resource_cli,grant_cli,provider_cli,node_cli,pair_cli}.rs`。
 
@@ -727,7 +750,7 @@ SDK 层：`nexus::observability::{status, dns_status, dns_cache, dns_resolve, dn
 
 #### 4.9.5 N1 装配、配置与平台控制
 
-* **`nexus network up --config <toml>`**：仅 Linux，前台建 TUN → `ip` 配 addr/mtu/up/route → dial 静态 peers → 起 `VpiPump`（Ctrl-C 退出；无 peer 连接即报错 exit 1）；**`network status [--config <toml>]`**：诚实报告 `daemon:false` / `assembled_by_this_process:false`，带 `--config` 时给出 `would_assemble`。
+* **`nexus network up --config <toml>`**：仅 Linux，前台建 TUN → `ip` 配 addr/mtu/up/route → dial 静态 peers → 起 `VpiPump`（按 Enter 或 Ctrl-C 退出）。**退出码区分**：缺 `--config` / 配置解析失败 → exit 2；建 TUN 失败（缺 `CAP_NET_ADMIN`）或**无 peer 连接** → exit 1；成功装配 → exit 0。**`network status [--config <toml>]`**：诚实报告 `daemon:false` / `assembled_by_this_process:false`；带 `--config` 且可读时给出 `would_assemble`，文件不可读时置 `config_error` 但**仍 exit 0**。
 * **`nexus config get|set|list --dir <config-dir> [file]`**：本地文件操作（已知文件 `daemon.toml` / `network.toml` / `proxy.yaml` / `dns.toml`）；`set` 从 stdin 读并**原子写**（临时文件 + rename），避免 daemon watcher 读到半截。
 * **`nexus system-proxy status|set|clear|e2e`** / **`nexus autostart install|remove|status`**：Windows 平台控制（PRODUCT §13；固定端口 7898；`e2e` 自清理闭环）；非 Windows 返回结构化 `UNSUPPORTED`。
 * **`nexus proxy bufferbloat-test --proxy <ip:port> [--duration <s>] [--threshold <ms>]`**：空载基准 vs 打满负载延迟对比，定位拥塞段（PRODUCT §11）。
@@ -804,6 +827,13 @@ whitespace、format、check、clippy、architecture-policy（fast 侧 delta）�
 | --------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------ |
 | Workspace Projection 通道（NativeApi + MaterializedDirectory） | 已实现 | 三通道选择 + NativeApi WorkingSet 读写/commit + MaterializedDirectory 物化目录均已落地（E4 `platform.workspace-projection-channels` 16 期望 PASS，2026-09-20）；NativeMountDirectory 真实目录挂载仍为 API 声明待落地 |
 | nexus CLI 观察命令                          | thin-client | 路由表 **8 条**（静态 5 + 动态 3；CLI 实际经 daemon 为 5 静态 + `workspace commit`，`plan`/`session` 先被 N2 模块接管）；默认 **unix socket 优先**（TCP `127.0.0.1:18080` 为回退/显式）；其余 10 命令本地显式 UNSUPPORTED；`--socket` 在 Windows 构建不可用 |
+| nexus CLI 退出码                            | 三档          | `0` 已处理（含 daemon FAIL / 本地 UNSUPPORTED / `run`）；`1` N2 进程内 `verdict=FAIL`（NOT_FOUND / AUTH_DENIED / ALREADY_TERMINATED）；`2` 用法错误。**不要只按 0/非 0 判定，须读 `verdict`**（见 §4.9.2） |
+| `nexus proxy [host\|relay] --addr`         | **待修缺陷**   | `--addr` 被全局选项剥离器在分发前吞掉，子命令收不到，实际监听默认端口（SOCKS5 1080 / host 8787）；手册与 CLI 自带帮助均承诺该 flag 生效。规避：只能用默认端口（见 §4.6.3） |
+| `nexusd --help` / `nexusd serve --help`    | 帮助缺口       | `nexusd --help` 只列 `nexusd <config-folder>`，**不含 `serve`**（exit 2）；`nexusd serve --help` **不显示帮助、会直接启动 daemon** |
+| `nexus-platform-host vpi-capabilities`     | 需 feature   | 仅在 `--features platform-windows` 构建下输出能力 JSON；默认构建只打印 stub 文本（见 §4.8.1） |
+| `nexus subnet status` 的 verdict           | 含 `DOWN`    | 无隧道/状态文件缺失或损坏时返回 `verdict:"DOWN"`（并非 PASS/FAIL 二分）；脚本须容忍 `DOWN` / `STORE_ERROR` / `TUN_ERROR` |
+| `nexus plan explain` 人读输出               | 双重输出       | 非 `--json` 时先打印字段投影，**随后又打印整段原始 JSON**，与其他命令"纯投影"不一致（不影响 `--json` 机器消费） |
+| N2 状态目录                                 | 无 `--dir`   | `plan`/`use`/`session`/`resource`/`grant`/`node` 状态固定在 `$NEXUS_CONFIG_DIR` → `$XDG_CONFIG_HOME/nexus` → `~/.config/nexus`；隔离用 `NEXUS_CONFIG_DIR`（见 §4.9.3） |
 | N3 本地 Task 服务                            | 默认未启用       | daemon `LocalTaskService` 需 `task-api.toml` 装配出的 provider；缺失时 `nexus task submit` 返回 `UNSUPPORTED_CAPABILITY`                        |
 | N3 artifact 下载                            | 未装配         | `nexus artifact get` 直接返回 `UNSUPPORTED_CAPABILITY`，**从不创建或覆盖输出文件**                                                                     |
 | nexusd serve `--socket`（Windows）        | UNSUPPORTED | named-pipe transport 未实现（std 无 named-pipe server，平台专有 I/O 应收敛到 nexus-platform-windows）；用 `--addr` TCP loopback                       |
@@ -890,3 +920,28 @@ thin-client 架构下的契约收敛（进程内观察快照仍由 SDK `nexus::o
 
 > 本手册此前的验证证据声明已随 revision 前进而过期（见头部）；功能条目可用
 > `nexus-harness verify --full` 在目标 revision 重新生成证据复现校验，Final PASS 只由 Harness 产生。
+
+### 6.5 更新记录（2026-10-05：docs，手册可用性走查后的准确性修订）
+
+本次同样为**纯文档更新（docs）**，不改变任何产品行为、场景期望或 PRODUCT 契约。修订来自一次
+"只看本手册、逐条执行用户命令"的走查（Linux 沙箱，二进制 `target/debug/{nexus,nexusd,nexus-platform-host}`），
+共执行约 72 条命令；命中差异后按"文档对齐实际行为、缺陷如实登记不曲解"原则修订：
+
+1. **二进制名笔误**：§2.3 daemon 行此前写作 `nexus` / `nexus serve`，实为 **`nexusd` / `nexusd serve`**
+   （`nexus serve` 实测 `unknown command`，exit 2）。
+2. **退出码三档语义**：此前只写 `0 / 2`，漏了 **`1`（N2 进程内 `verdict=FAIL`）**；
+   新增 §4.9.2 三档说明与 §6.1 汇总行。实测：`plan explain net` / `session watch <不存在>` /
+   `use`（无授权）→ exit 1；daemon 路由与本地 `UNSUPPORTED` → exit 0。
+3. **§4.7 观察表补必填参数**：`dns resolve <name>` / `connectivity probe <target>` /
+   `session watch <id>` / `workspace heads <ws>` 等此前漏 `<...>`，逐字照抄会 `missing argument`（exit 2）。
+4. **示例资源名**：§4.9.2 的 `nexus plan explain net` 中 `net` 不在内建 registry（`NOT_FOUND`，exit 1），
+   改为 `dev-svc` / `internet-access`。
+5. **默认传输澄清**：补记 `nexusd <config-folder>` 默认走 `daemon.toml` 的 TCP `127.0.0.1:18080`，
+   与 `nexusd serve` 的 unix socket 默认不同；以及 `nexusd --help` 不含 `serve`、`nexusd serve --help` 会直接启动 daemon。
+6. **诚实边界补录（§6.1）**：`nexus proxy [host|relay] --addr` 失效（全局选项剥离，待修 bugfix）、
+   `vpi-capabilities` 需 `--features platform-windows`（否则 stub）、`subnet status` 会返回 `verdict:"DOWN"`、
+   `plan explain` 人读双重输出、N2 状态目录无 `--dir`。
+7. **`provider serve` 输出修正**：此前记"无 JSON"，实为启动打印一条 `PASS` JSON；并补 `--once` = 处理一条连接后退出。
+
+> 走查中未重跑 `nexus-harness verify --full`，因此本手册**不新增、不复用任何完成证据**；
+> 上述条目均可用对应 CLI 在目标 revision 直接复现。Final PASS 只由 Harness 产生。
