@@ -297,6 +297,34 @@ fn missing_receiver_lock_cannot_create_a_second_owner() {
     );
 }
 
+/// `drop(owner)` 关闭持锁 fd 后，内核从锁表移除该 flock 项与下一次
+/// `flock(LOCK_EX | LOCK_NB)` 之间可能存在微秒级瞬态窗口：此时重试一次即可成功。
+/// 该路径返回的错误按契约标记 `retryable = true`，因此这里遵守契约做有界重试，
+/// 不放宽任何断言（重试预算耗尽仍 panic）。
+fn reopen_after_lease_release(r: &ArtifactRecord, dest: &std::path::Path) -> ArtifactDownload {
+    let budget = [
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+        std::time::Duration::from_micros(200),
+        std::time::Duration::from_millis(1),
+        std::time::Duration::from_millis(5),
+        std::time::Duration::from_millis(20),
+        std::time::Duration::from_millis(100),
+        std::time::Duration::from_millis(400),
+    ];
+    let mut last = None;
+    for wait in budget {
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
+        }
+        match ArtifactDownload::open(r, dest) {
+            Ok(v) => return v,
+            Err(e) => last = Some(e),
+        }
+    }
+    panic!("lease not released within retry budget: {last:?}");
+}
+
 #[test]
 fn independent_same_process_receiver_is_busy_without_mutating_prefix() {
     let dir = Dir::new();
@@ -336,7 +364,7 @@ fn independent_same_process_receiver_is_busy_without_mutating_prefix() {
     );
     assert!(!dest.exists());
     drop(owner);
-    let mut resumed = ArtifactDownload::open(&r, &dest).unwrap();
+    let mut resumed = reopen_after_lease_release(&r, &dest);
     assert_eq!(resumed.offset(), 3);
     resumed.append(3, b"def").unwrap();
     resumed.finish().unwrap();
