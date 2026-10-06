@@ -41,6 +41,9 @@ description: 在 Nexus 仓库中协调多个可推送代码的 Agent（不同 Ha
    - 尽量让评审者与实现者**不是同一个 Model**——不同 Model 的盲区不同，交叉评审更接近真正的"独立"。
    - 遵循 `nexus-review` 的独立性规则与八个检查维度。
 6. **Verdict 门槛**：只有 APPROVED / COMMENTED 能进合并队列；CHANGES_REQUESTED 打回原实现者修复，不得进入合并。
+7. **自修复循环**：执行者验证失败且判定为 Implementation Failure 时，按 `nexus-selfrepair`
+   的有界循环执行（最多 3 轮、每轮换修复策略、同一失败签名第二次出现即结构化升级）。
+   不得无限重试，不得为变绿而改 `scenarios/` 断言；循环终点是独立评审，不是合并。
 
 ## 合并（协调者串行执行）
 
