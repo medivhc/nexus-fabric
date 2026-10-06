@@ -47,9 +47,9 @@ description: 在 Nexus 仓库中协调多个可推送代码的 Agent（不同 Ha
 
 ## 合并（协调者串行执行）
 
-7. **一次合一个**：取分支 → 按 AGENTS.md §29.3 的 `nexus-sync` 流程（fetch → rebase 到最新 master → verify --fast → push）。绝不让两个执行者同时推 master。冲突只在同步时刻暴露并显式解决（§17：FF/3-way/显式冲突，已提交数据不静默丢弃）。
-8. **冲突由协调者解**：不丢给执行者，避免各说各话。
-9. **门禁不可绕过**：任何情况下不得使用 `--no-verify` 或等价手段。门禁 FAIL 先读完整输出、定位真因、修复——合法的 FAIL 不是 hook hang。
+8. **一次合一个**：取分支 → 按 AGENTS.md §29.3 的 `nexus-sync` 流程（fetch → rebase 到最新 master → verify --fast → push）。绝不让两个执行者同时推 master。冲突只在同步时刻暴露并显式解决（§17：FF/3-way/显式冲突，已提交数据不静默丢弃）。
+9. **冲突由协调者解**：不丢给执行者，避免各说各话。
+10. **门禁不可绕过**：任何情况下不得使用 `--no-verify` 或等价手段。门禁 FAIL 先读完整输出、定位真因、修复——合法的 FAIL 不是 hook hang。
 
 ## 模型差异的任务分配
 

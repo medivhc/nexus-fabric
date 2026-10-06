@@ -88,7 +88,9 @@ nexus-harness scenario run <name> --json
 
 ## 升级报告（结构化，给协调者）
 
-停止时必须输出以下 JSON（打印到 stdout 并写入 `.evidence/selfrepair-<loop-id>/escalation.json`）：
+停止时必须输出以下 JSON。**规范通道是 stdout（结构化完成报告）**——`.evidence/`
+是 gitignored 本地目录，跨会话的协调者实际只能看到 stdout；同时写入
+`.evidence/selfrepair-<loop-id>/escalation.json` 仅为本地备份：
 
 ```json
 {
@@ -137,6 +139,20 @@ nexus-harness scenario run <name> --json
 
 ```text
 .agents/knowledge/entries/<yyyy-mm-dd>-selfrepair-buffer.md
+```
+
+与 §19.2 知识库条目规范的关系：buffer 文件是**过程性 raw log，不是正式知识条目**——
+文件顶部加最小 frontmatter 以便识别，但**豁免 `index.json` 登记**；只有被协调者
+沉淀为规则 / 模式后，才按 §19.2 写正式条目并登记 index.json。
+
+```markdown
+---
+id: selfrepair-buffer-<yyyymmdd>
+date: <yyyy-mm-dd>
+module: engineering
+category: process-log
+note: 豁免 index.json 登记；过程性记录，非正式知识条目
+---
 ```
 
 每条记录格式：
