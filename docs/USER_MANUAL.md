@@ -184,7 +184,7 @@ cargo build --workspace
 | 38 | 出站适配器（SS / VMess / Trojan）                              | `proxy-*-adapter` 等 8 场景（见 §4.1.10）                                                                                                                                                         | example                                                     |
 | 39 | 规则数据注入（geoip.nex/geosite.nex/rule-providers / Clash 订阅） | `geoip-nex-roundtrip` (8) / `geosite-nex-roundtrip` (8) / `proxy-rule-provider-fetch` (11) / `proxy-clash-subscription-parse` (9)                                                           | example / 配置                                                |
 | 40 | Workspace Projection 访问通道                               | `platform.workspace-projection-fallback` (4) / `platform.workspace-projection-channels` (16)                                                                                                | example / SDK                                               |
-| 41 | nexusd serve 常驻 daemon（HTTP LocalAPI）                   | 集成测试 E3（`apps/nexusd/tests/serve_localapi_e2e.rs`，4 用例）                                                                                                                                     | `nexus serve --addr <ip:port>`                             |
+| 41 | nexusd serve 常驻 daemon（HTTP LocalAPI）                   | 集成测试 E3（`apps/nexusd/tests/serve_localapi_e2e.rs`，4 用例）                                                                                                                                     | `nexusd serve --addr <ip:port>`                             |
 | 42 | nexus CLI thin-client + run                             | `product.cli-run-command` (5)                                                                                                                                                               | `nexus run service --json` / `nexus status --json`          |
 | 43 | 真实节点数据面（host / relay / SOCKS5）                          | `daemon-real-host-flow` (9) / `daemon-real-relay-flow` (9) / `daemon-real-socks-proxy-flow` (11) / `daemon-real-host-auth-denied` (5)                                                       | `nexus proxy host\|relay\|proxy --addr <ip:port>`            |
 | 44 | 独立 Review + 动态知识库                                       | （工程方法论，非用户功能）                                                                                                                                                                               | `.agents/skills/` + `.agents/knowledge/`                    |
@@ -928,7 +928,7 @@ thin-client 架构下的契约收敛（进程内观察快照仍由 SDK `nexus::o
 共执行约 72 条命令；命中差异后按"文档对齐实际行为、缺陷如实登记不曲解"原则修订：
 
 1. **二进制名笔误**：§2.3 daemon 行此前写作 `nexus` / `nexus serve`，实为 **`nexusd` / `nexusd serve`**
-   （`nexus serve` 实测 `unknown command`，exit 2）。
+   （`nexus serve` 实测 `unknown command`，exit 2）；§3.2 #41 用户入口列的 `nexus serve --addr` 同步修正为 `nexusd serve --addr`。
 2. **退出码三档语义**：此前只写 `0 / 2`，漏了 **`1`（N2 进程内 `verdict=FAIL`）**；
    新增 §4.9.2 三档说明与 §6.1 汇总行。实测：`plan explain net` / `session watch <不存在>` /
    `use`（无授权）→ exit 1；daemon 路由与本地 `UNSUPPORTED` → exit 0。
