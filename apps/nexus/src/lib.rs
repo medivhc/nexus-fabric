@@ -12,6 +12,12 @@
 
 #![forbid(unsafe_code)]
 
+/// Linux durable Artifact receiver shared by the CLI and daemon composition roots.
+#[cfg(target_os = "linux")]
+pub mod artifact_download;
+#[cfg(target_os = "linux")]
+mod artifact_download_fs;
+
 /// CLI 前端 ControlService（17 命令接线 + --json 双输出 + exit 语义）。
 pub mod control_service;
 pub mod geoip_sources;

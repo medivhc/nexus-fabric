@@ -32,6 +32,7 @@
 ## Invariants
 
 - 只实现 nexus-platform capability traits。
+- N3-9 的宿主文件 lease primitive 例外：`file_lease::try_lock_exclusive(&std::fs::File) -> std::io::Result<()>`，仅封装已有 Linux flock 站点、非阻塞返回 WouldBlock/其他 IO 错误，不包含 Task/Artifact/授权策略。调用方持有 File 保持锁；不新增 portable trait 或依赖边。它服务组合根 receiver 并维持其 forbid(unsafe_code) 与 Rust 1.85；具体平台 primitive 不向 portable core 泄漏。契约见 docs/N3-9-ARTIFACT-CLI-CONTRACT.md。
 
 ### OS 装配不变量（O1–O6，feature/os-assemble）
 

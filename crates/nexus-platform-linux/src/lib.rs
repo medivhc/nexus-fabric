@@ -15,6 +15,9 @@ pub mod assemble;
 pub mod daemon;
 /// 内置 DNS server（只服务 TUN 网段，不碰 /etc/resolv.conf）。
 pub mod dns;
+/// Nonblocking Linux file leases; callers retain the owning file descriptor.
+#[cfg(target_os = "linux")]
+pub mod file_lease;
 /// TUN 接口 IP 地址装配（幂等）。
 /// Linux FUSE adapter projecting a workspace as a filesystem (v9 §22).
 /// Consumes the portable `nexus_platform::ProjectedWorkspace` trait; owns

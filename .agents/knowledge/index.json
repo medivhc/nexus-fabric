@@ -310,5 +310,13 @@
     "module": "apps/nexusd / nexus-compute",
     "category": "implementation-pattern",
     "summary": "原子容量镜像、活 owner 门禁、准备/取消竞态与已有 SessionManager 持久补偿"
+  },
+  {
+    "id": "n3-authorized-download-progress",
+    "file": "entries/2026-10-05-n3-authorized-download-progress.md",
+    "date": "2026-10-05",
+    "module": "apps/nexus / apps/nexusd / nexus-platform-linux",
+    "category": "implementation-pattern",
+    "summary": "真实probe/完整record/durableoffset/额外当前授权EOF；原发布inode与非阻塞lease复用；真实Engine seed与正常daemon READY观察。"
   }
 ]

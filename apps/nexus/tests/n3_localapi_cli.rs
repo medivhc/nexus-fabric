@@ -56,16 +56,23 @@ fn real_cli_offline_preserves_task_id_and_reports_local_daemon_without_fake_stat
 }
 #[cfg(unix)]
 #[test]
-fn artifact_get_has_no_io_or_partial_download_when_receiver_is_missing() {
+fn artifact_get_offline_has_no_output_or_credential_io() {
     let root = fixture();
     let output = root.join("out");
     let args = ["artifact", "get", "a", "--output", output.to_str().unwrap()];
-    assert_eq!(cli(&root, &args)["error"]["code"], "UNSUPPORTED_CAPABILITY");
+    let expected = if cfg!(target_os = "linux") {
+        "PROVIDER_UNREACHABLE"
+    } else {
+        "UNSUPPORTED_CAPABILITY"
+    };
+    assert_eq!(cli(&root, &args)["error"]["code"], expected);
     assert!(!output.exists());
     assert!(!root.join("localapi.token").exists());
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
     std::fs::write(&output, b"existing").unwrap();
-    assert_eq!(cli(&root, &args)["error"]["code"], "UNSUPPORTED_CAPABILITY");
+    assert_eq!(cli(&root, &args)["error"]["code"], expected);
     assert_eq!(std::fs::read(&output).unwrap(), b"existing");
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
     std::fs::remove_dir_all(root).unwrap();
 }
 

@@ -14,7 +14,7 @@ pub enum TaskCliCommand {
         request_file: PathBuf,
     },
     Request(TaskRequest),
-    /// Always no-replace: a future receiver must verify SHA-256 and publish
+    /// Always no-replace: the receiver verifies SHA-256 and publishes
     /// atomically without overwriting. There is no overwrite option.
     Download {
         artifact_id: ArtifactId,
@@ -134,23 +134,22 @@ impl TaskCliCommand {
         }
     }
 }
-/// Execute the frozen command through the real local daemon. Download stays
-/// unsupported until the existing verified receiver has a shared adapter.
+/// Execute through the authenticated local daemon and verified local receiver.
 pub fn run(
     args: &[String],
     json: bool,
     target: &crate::localapi_client::LocalApiTarget,
 ) -> Result<String, String> {
     let command = parse(args)?;
-    let output = if matches!(command, TaskCliCommand::Download { .. }) {
-        TaskEnvelope::Error {
-            error: TaskError::new(
-                TaskErrorCode::UnsupportedCapability,
-                "N3 verified ArtifactDownload receiver adapter is not installed",
-                false,
-            ),
+    let output = if let TaskCliCommand::Download {
+        artifact_id,
+        output,
+    } = &command
+    {
+        download(target, artifact_id, output).unwrap_or_else(|error| TaskEnvelope::Error {
+            error,
             task_id: None,
-        }
+        })
     } else {
         match command.prepare() {
             Ok(request) => {
@@ -168,6 +167,90 @@ pub fn run(
         }
     };
     render(output, json)
+}
+
+#[cfg(target_os = "linux")]
+fn download(
+    target: &crate::localapi_client::LocalApiTarget,
+    artifact_id: &ArtifactId,
+    output: &std::path::Path,
+) -> Result<TaskEnvelope, TaskError> {
+    use nexus_control_api::task::TaskResponse;
+    let request = |offset| TaskRequest::GetArtifact {
+        artifact_id: artifact_id.clone(),
+        offset,
+        max_bytes: MAX_PAGE_BYTES,
+    };
+    // Probe before any output IO, including inspection of an existing receiver.
+    let probe = crate::task_localapi::execute(target, &request(0))?;
+    let mut page = match probe {
+        TaskEnvelope::Success(TaskResponse::Artifact(page)) => page,
+        error @ TaskEnvelope::Error { .. } => return Ok(error),
+        _ => {
+            return Err(TaskError::invalid(
+                "Artifact probe returned a different operation",
+            ));
+        }
+    };
+    let record = page.record.clone();
+    let mut receiver = crate::artifact_download::ArtifactDownload::open(&record, output)?;
+    let mut offset = receiver.offset();
+    while offset < record.size_bytes {
+        // Resume requests never rewrite the prefix returned by the mandatory probe.
+        if page.offset != offset {
+            page = match crate::task_localapi::execute(target, &request(offset))? {
+                TaskEnvelope::Success(TaskResponse::Artifact(page)) => page,
+                error @ TaskEnvelope::Error { .. } => return Ok(error),
+                _ => {
+                    return Err(TaskError::invalid(
+                        "Artifact page returned a different operation",
+                    ));
+                }
+            };
+        }
+        if page.record != record || page.bytes.is_empty() || page.next_offset <= offset {
+            return Err(TaskError::invalid(
+                "Artifact record changed or page made no progress",
+            ));
+        }
+        offset = receiver.append(offset, &page.bytes)?;
+        if offset != page.next_offset {
+            return Err(TaskError::invalid(
+                "Artifact page differs from durable receiver offset",
+            ));
+        }
+    }
+    // This fresh remote authorization also applies to empty/complete/published replay.
+    let final_page = crate::task_localapi::execute(target, &request(record.size_bytes))?;
+    match &final_page {
+        TaskEnvelope::Success(TaskResponse::Artifact(page))
+            if page.record == record
+                && page.offset == record.size_bytes
+                && page.next_offset == record.size_bytes
+                && page.bytes.is_empty()
+                && page.eof => {}
+        error @ TaskEnvelope::Error { .. } => return Ok(error.clone()),
+        _ => {
+            return Err(TaskError::invalid(
+                "Artifact final authorization requires the same record and empty EOF",
+            ));
+        }
+    }
+    receiver.finish()?;
+    Ok(final_page)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn download(
+    _target: &crate::localapi_client::LocalApiTarget,
+    _artifact_id: &ArtifactId,
+    _output: &std::path::Path,
+) -> Result<TaskEnvelope, TaskError> {
+    Err(TaskError::new(
+        TaskErrorCode::UnsupportedCapability,
+        "verified Artifact download requires Linux",
+        false,
+    ))
 }
 fn render(output: TaskEnvelope, json: bool) -> Result<String, String> {
     if json {

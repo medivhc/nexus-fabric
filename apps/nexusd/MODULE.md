@@ -372,3 +372,7 @@ docs/N3-6-LOCALAPI-SECURITY-CONTRACT.md；不能把本批局部服务称为完�
 ### N3-8 容量与 Session 不变量
 
 遵循 docs/N3-8-CAPACITY-SESSION-CONTRACT.md：私有接受 envelope v2 原子绑定预算/Task/key/pin；显式空根初始化，receipt 禁止降级重建。活 capacity-owner lease + fresh reconcile epoch 决定 Ready；Prepare/StartIntent/GC 在原 acceptance.lock 内重查。未知执行保留容量，真实 reap 只释放 runtime，disk charge 保留。明确 daemon config root 注入同一个 SharedSessionManager；可信内部绑定核实主体、Use、容量、实际 Session/持久 Plan，确认取消先 durable intent 再 Manager close/重载补偿。平台实现留在组合根，公网 Submit/完整下载能力不扩大。
+
+### N3-9 接收器复用
+
+本地 GetArtifact 继续原有逐页当前 Use、accepted scope、审计与真实内容校验。ArtifactDownload 迁到 nexus 组合根，原 nexusd::artifact_download 路径兼容 re-export；provider 私有 artifact authority IO 不扩大 public surface。验证 example 通过真实现有 Engine/TaskOwner 产生并发布产物，随后由正常 daemon 冷启动复核，禁止 production fixture API 或伪造终态。范围见 docs/N3-9-ARTIFACT-CLI-CONTRACT.md；Submit 仍明确拒绝。

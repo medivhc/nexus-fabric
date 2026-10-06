@@ -1,5 +1,5 @@
 use super::*;
-use nexus::n3_acceptance::new_task_id;
+use crate::n3_acceptance::new_task_id;
 use std::{
     os::unix::fs::symlink,
     process::{Command, Stdio},
@@ -239,7 +239,7 @@ fn real_sigkill_during_atomic_publication_recovers_same_inode() {
 #[test]
 #[ignore = "child fixture invoked by real SIGKILL parent"]
 fn download_process_fixture() {
-    let r: ArtifactRecord = nexus::n3_acceptance::decode_dto(
+    let r: ArtifactRecord = crate::n3_acceptance::decode_dto(
         &fs::read(std::env::var("NEXUS_DOWNLOAD_FIXTURE_RECORD").unwrap()).unwrap(),
     )
     .unwrap();
@@ -295,4 +295,84 @@ fn missing_receiver_lock_cannot_create_a_second_owner() {
         d.append(3, b"def").is_err(),
         "live owner must detect lock authority loss"
     );
+}
+
+#[test]
+fn independent_same_process_receiver_is_busy_without_mutating_prefix() {
+    let dir = Dir::new();
+    let dest = dir.0.join("result");
+    let r = record(b"abcdef");
+    let mut owner = ArtifactDownload::open(&r, &dest).unwrap();
+    owner.append(0, b"abc").unwrap();
+    let private = owner.directory.clone();
+    let metadata = fs::read(private.join("progress-v1.json")).unwrap();
+    let competing_record = r.clone();
+    let competing_destination = dest.clone();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        tx.send(ArtifactDownload::open(
+            &competing_record,
+            &competing_destination,
+        ))
+        .ok();
+    });
+    let error = match rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(result) => result.err().expect("distinct File must compete for lease"),
+        Err(error) => {
+            // Release the original owner before joining, so a blocking-lock
+            // regression reports failure without leaving a detached worker.
+            drop(owner);
+            worker.join().unwrap();
+            panic!("competing receiver waited instead of reporting busy: {error}");
+        }
+    };
+    worker.join().unwrap();
+    assert_eq!(error.code, TaskErrorCode::CapacityUnavailable);
+    assert!(error.retryable);
+    assert_eq!(fs::read(private.join("partial")).unwrap(), b"abc");
+    assert_eq!(
+        fs::read(private.join("progress-v1.json")).unwrap(),
+        metadata
+    );
+    assert!(!dest.exists());
+    drop(owner);
+    let mut resumed = ArtifactDownload::open(&r, &dest).unwrap();
+    assert_eq!(resumed.offset(), 3);
+    resumed.append(3, b"def").unwrap();
+    resumed.finish().unwrap();
+    assert_eq!(fs::read(dest).unwrap(), b"abcdef");
+}
+
+#[test]
+fn replaced_lease_inode_stops_live_owner_without_changing_prefix() {
+    let dir = Dir::new();
+    let dest = dir.0.join("result");
+    let r = record(b"abcdef");
+    let mut owner = ArtifactDownload::open(&r, &dest).unwrap();
+    owner.append(0, b"abc").unwrap();
+    let private = owner.directory.clone();
+    let metadata = fs::read(private.join("progress-v1.json")).unwrap();
+    fs::rename(private.join("receiver.lock"), private.join("old-lock")).unwrap();
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(private.join("receiver.lock"))
+        .unwrap()
+        .sync_all()
+        .unwrap();
+    assert_eq!(
+        owner.append(3, b"def").unwrap_err().code,
+        TaskErrorCode::StateCorrupt
+    );
+    assert_eq!(
+        owner.finish().unwrap_err().code,
+        TaskErrorCode::StateCorrupt
+    );
+    assert_eq!(fs::read(private.join("partial")).unwrap(), b"abc");
+    assert_eq!(
+        fs::read(private.join("progress-v1.json")).unwrap(),
+        metadata
+    );
+    assert!(!dest.exists());
 }

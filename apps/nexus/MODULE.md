@@ -138,3 +138,7 @@ N3 CLI 使用 POST /localapi/v1/task 获取真实 TaskEnvelope；不可达显式
 本组装层授权 facade 复用真实 N2 当前 Use grant/持久 audit，按接受 resource/
 workspace 检查，不依赖 default Workspace；错配/审计失败拒绝。协议、容量、
 错误映射、FIFO/相关性边界见 docs/N3-6-LOCALAPI-SECURITY-CONTRACT.md。
+
+### N3-9 Artifact CLI 接收器
+
+按 docs/N3-9-ARTIFACT-CLI-CONTRACT.md 装配 Linux ArtifactDownload 与私有 IO；先远端 probe，再 durable offset/完整 record 校验，额外当前授权 EOF 后完整 SHA/no-replace 发布。Linux offline 返回 ProviderUnreachable，output/凭证不创建；未启用服务及其他平台 Unsupported。保持 forbid(unsafe_code)，文件锁使用已有 Linux platform 依赖的安全非阻塞 helper。受保护 crash/prefix/lease/inode/no-replace 语义与测试保留，不创建 TaskOwner、不新增 wire DTO/依赖。

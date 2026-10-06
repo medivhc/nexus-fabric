@@ -290,3 +290,5 @@ TaskOutcome 与 Session TerminalOutcome 分别恰一次提交，不要求两侧�
 细节与冻结范围见 `docs/N3-MODEL-CONTRACT.md`；产品入口见 PRODUCT §17。
 
 N3-8：组合根的私有 acceptance envelope v2 将容量与接受记录共同持久化；计算核心保持纯 TaskOwner 事件归约。活 capacity owner 持有文件 lease；核实恢复前拒绝新启动/GC。Task 服务注入现有唯一 SessionManager，仅绑定已有 Session 并经 Manager 清理；不添加 wire DTO 或第二套所有者。详见 docs/N3-8-CAPACITY-SESSION-CONTRACT.md。
+
+N3-9：ArtifactDownload 与接收器专用持久 IO 复用到 nexus 组合根，nexusd 保留兼容 re-export；CLI 逐页调用既有 LocalAPI，不另持 TaskOwner 或执行任务。已有 Linux platform 依赖提供安全非阻塞 File lease primitive，原 flock unsafe 站点归入宿主适配层，CLI forbid(unsafe_code) 保持；无新 crate/依赖边/portable trait/wire DTO。详见 docs/N3-9-ARTIFACT-CLI-CONTRACT.md。

@@ -3240,3 +3240,7 @@ Task 输入/容量/Session 接受或 CLI 完整下载；相关能力保持明确
 ### 17.5 N3-8 容量与已有资源 Session 基础
 
 提供方使用显式配置的真实容量账本，将预算占用与 Task/幂等索引/input pin 原子接受；每次启动和 GC 前要求活 owner 与已核实恢复状态。未知执行保留占用，确认 reap 只释放运行容量，后端持久字节继续计费。daemon 明确配置根拥有唯一 N2 SessionManager；可信内部准备绑定已有真实 Plan 的 Session，确认取消经原 Manager 关闭并持久补偿。Submit/完整下载仍拒绝。范围、迁移和证据边界见 docs/N3-8-CAPACITY-SESSION-CONTRACT.md。
+
+### 17.6 N3-9 Artifact CLI 下载
+
+Linux artifact get 接通真实分页服务与已有持久断点接收器：先取得已授权 Published record 才打开 output 接收器，每页核实完整 record，从 durable offset 续传，发布前额外获取当前授权的空 EOF 页。完整 SHA-256/长度验证后原子无覆盖发布；并发锁忙可重试，失败保留前缀而不重置。成功沿用 schema1 空 EOF ArtifactPage envelope。其他平台明确 Unsupported；完整 Submit/输入传输仍待装配。冻结行为、有限真实 daemon/CLI E4 与边界见 docs/N3-9-ARTIFACT-CLI-CONTRACT.md，不替代完整 N3 E4/E5。
