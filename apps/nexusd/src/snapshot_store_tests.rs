@@ -127,10 +127,14 @@ fn review_regression_restage_release_restarts_full_gc_retention() {
     let dir = TestDir::new();
     let root = dir.root();
     let store = FileSnapshotStore::open(&root).unwrap();
-    let s = stage(&store);
+    // 两次 stage 必须使用同一 (workspace, commit) 输入：CommitId 含 created_at_unix
+    // （crates/nexus-workspace/src/lib.rs now_unix），重新构造 workspace 会跨秒产生
+    // 不同 commit_id，使幂等断言退化为依赖挂钟巧合。与 fixed_commit_selection_* 同法。
+    let (ws, c) = workspace();
+    let s = store.stage_snapshot(&ws, &c, &selection()).unwrap();
     store.release_preview(&s.reference.snapshot_id).unwrap();
     assert_eq!(store.collect_garbage(100, 10).unwrap().marked, 3);
-    assert_eq!(stage(&store), s);
+    assert_eq!(store.stage_snapshot(&ws, &c, &selection()).unwrap(), s);
     drop(store);
     let reopened = FileSnapshotStore::open(&root).unwrap();
     reopened.release_preview(&s.reference.snapshot_id).unwrap();
