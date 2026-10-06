@@ -135,6 +135,7 @@ pub fn scenario_requires(s: &Scenario) -> &'static str {
     if s.file_stem.contains("realnet")
         || s.file_stem.contains("real_net")
         || s.id.to_lowercase().contains("realnet")
+        || s.id.to_lowercase().contains("real_net")
     {
         return "real-device";
     }
@@ -947,6 +948,9 @@ mod tests {
         s.file_stem = "x".to_string();
         s.id = "product.n1-connectivity-roam-realnet".to_string();
         assert_eq!(scenario_requires(&s), "real-device");
+        // id 含 real_net → real-device（评审 WARN：此前实现漏查 id 的 real_net）。
+        s.id = "product.n1-connectivity-roam-real_net".to_string();
+        assert_eq!(scenario_requires(&s), "real-device");
     }
 
     /// 场景包：title / subdir / requires_root 从 toml 解析。
@@ -1062,5 +1066,42 @@ mod tests {
         assert!(rep.assertion.is_empty());
         assert!(rep.key_log_lines.is_empty());
         assert!(rep.duration_ms < 60_000);
+    }
+
+    /// 场景包：run_single 的 parse 失败签名（输出非 JSON）。
+    ///
+    /// 评审 WARN：parse 是自修复循环消费的核心签名之一，此前无直接单测锁定。
+    #[test]
+    fn run_single_parse_failure_signature() {
+        let (dir, scenarios) = synthetic_scenario(
+            "np",
+            "schema_version = 1\nid = \"t.parse\"\n[when]\ncommand = \"echo not-json\"\n",
+        );
+        let rep = run_single(&scenarios[0]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(rep.verdict, "FAIL");
+        assert_eq!(rep.failed_step, "parse");
+        assert!(rep.assertion.is_empty());
+        assert!(!rep.key_log_lines.is_empty());
+        assert!(rep.detail.contains("output not JSON"));
+    }
+
+    /// 场景包：run_single 的 command 失败签名（spawn_failed）。
+    ///
+    /// 评审 WARN：spawn_failed 是自修复循环消费的核心签名之一，此前无直接单测锁定。
+    /// run_checked_with_timeouts 不走 shell，直接 Command::spawn，命令不存在
+    /// 即返回 RunOutcome::SpawnFailed（而非 exit 127）。
+    #[test]
+    fn run_single_spawn_failed_signature() {
+        let (dir, scenarios) = synthetic_scenario(
+            "sf",
+            "schema_version = 1\nid = \"t.spawn\"\n[when]\ncommand = \"nexus-harness-no-such-binary-zzz\"\n",
+        );
+        let rep = run_single(&scenarios[0]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(rep.verdict, "FAIL");
+        assert_eq!(rep.failed_step, "command");
+        assert_eq!(rep.assertion, "spawn_failed");
+        assert!(rep.detail.contains("cannot run scenario command"));
     }
 }

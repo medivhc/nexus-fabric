@@ -89,4 +89,5 @@
 
 ## Contract Hash
 
+哈希算法：**sha256，取 hex 前 16 位**。
 （实现前由协调者/实现者计算本文件哈希并记入 commit message `contract: <hash>`）
