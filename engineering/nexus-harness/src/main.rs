@@ -7,6 +7,7 @@ mod evidence;
 mod gates;
 mod run_scenario;
 mod scenario;
+mod scenario_cmd;
 
 use serde_json::{Value, json};
 use std::process::ExitCode;
@@ -65,6 +66,7 @@ fn dispatch(command: &str, rest: &[String]) -> Outcome {
         "verify" => commands::verify(rest.first().map(String::as_str).unwrap_or("")),
         "explain" => commands::explain(),
         "run" => run_scenario::run_scenario(rest),
+        "scenario" => scenario_cmd::dispatch(rest),
         "bench" => commands::bench(),
         "replay" => (
             "UNKNOWN".to_string(),
@@ -74,7 +76,7 @@ fn dispatch(command: &str, rest: &[String]) -> Outcome {
         ),
         _ => (
             "BLOCKED".to_string(),
-            "supported commands: status, context, check, test, verify, explain, bench, replay"
+            "supported commands: status, context, check, test, verify, explain, bench, replay, scenario"
                 .to_string(),
             Vec::new(),
         ),

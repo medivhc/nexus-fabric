@@ -210,6 +210,70 @@ fn mark_stale_others(
     Ok(())
 }
 
+/// 单场景运行的证据 id：`scenario-<agent>-<hash>`。
+/// hash = hash(revision | scenario_id | configuration | contract) 前 12 hex，
+/// 与 verify 证据同命名空间规则（NEXUS_AGENT），目录即 `.evidence/<id>/`，
+/// 与 `verify-*` 目录互不干扰。
+pub fn scenario_run_id(repo: &Repo, b: &Bindings, scenario_id: &str) -> String {
+    let seed = format!(
+        "{}\n{}\n{}\n{}",
+        b.source_revision, scenario_id, b.configuration_digest, b.contract_hash
+    );
+    let h = repo
+        .hash_stdin(&seed)
+        .unwrap_or_else(|_| "unknown".to_string());
+    let short = if h.len() > 12 { &h[..12] } else { h.as_str() };
+    match agent_tag() {
+        Some(a) => format!("scenario-{a}-{short}"),
+        None => format!("scenario-{short}"),
+    }
+}
+
+/// `write_scenario_evidence` 的参数包（避免函数参数过多 + 调用点可读）。
+pub struct ScenarioEvidence<'a> {
+    pub scenario_id: &'a str,
+    pub verdict: &'a str,
+    pub message: &'a str,
+    pub failure_signature: &'a Value,
+    pub duration_ms: u64,
+}
+
+/// 写单场景运行证据：`.evidence/scenario-<id>/summary.json`。
+///
+/// 场景证据是诊断性记录：**不**参与 STALE 扫荡、**不**写 `latest.json`，
+/// verify 门禁证据不受影响。调用方凭返回的 evidence_id 直接引用。
+pub fn write_scenario_evidence(
+    repo: &Repo,
+    config: &Config,
+    ev: &ScenarioEvidence,
+    bindings: &Bindings,
+) -> Result<String, String> {
+    let id = scenario_run_id(repo, bindings, ev.scenario_id);
+    let dir = config.evidence_dir.join(&id);
+    fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+
+    let summary = json!({
+        "schema_version": 1,
+        "command": "scenario run",
+        "scenario": ev.scenario_id,
+        "verdict": ev.verdict,
+        "message": ev.message,
+        "id": id,
+        "failure_signature": ev.failure_signature,
+        "duration_ms": ev.duration_ms,
+        "bindings": bindings.to_json(),
+    });
+    write_json(&dir.join("summary.json"), &summary)?;
+    write_json(
+        &dir.join("metadata.json"),
+        &json!({"bindings": bindings.to_json(), "env": {
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+        }}),
+    )?;
+    Ok(id)
+}
+
 /// Read .evidence/latest.json (None if absent/unreadable).
 pub fn read_latest(config: &Config) -> Option<Value> {
     let path = config.evidence_dir.join("latest.json");
