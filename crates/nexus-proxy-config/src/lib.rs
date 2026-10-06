@@ -889,11 +889,12 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
             }
             // WARN5: obfs 枚举校验——只允许已知值，拼写错误直接报错，
             // 防止绕过 salamander 密码必填检查。
+            // NEW_COMMENTED_1: 允许 none （与 Obfs::parse 对齐：空串/none 均为无混淆）。
             if let Some(ob) = o.obfs.as_deref() {
-                if !ob.is_empty() && ob != "salamander" {
+                if !ob.is_empty() && ob != "salamander" && ob != "none" {
                     return Err(ConfigError::new(
                         format!("outbounds[{}].obfs", o.tag),
-                        format!("hysteria2 unknown obfs '{ob}'; allowed: salamander"),
+                        format!("hysteria2 unknown obfs '{ob}'; allowed: none, salamander"),
                     ));
                 }
             }
@@ -2347,5 +2348,13 @@ mod warn5_obfs_validation_tests {
     #[test]
     fn hy2_obfs_salamander_ok() {
         assert!(parse(&hy2_yaml("salamander")).is_ok());
+    }
+
+    // NEW_COMMENTED_1: none 与 Obfs::parse 对齐，为无混淆的有效别名。
+    #[test]
+    fn hy2_obfs_none_ok() {
+        assert!(parse(&hy2_yaml("none")).is_ok());
+        // 空串同样表示无混淆（Obfs::parse: "" | "none" => None）。
+        assert!(parse(&hy2_yaml("")).is_ok());
     }
 }
