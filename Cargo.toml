@@ -25,6 +25,7 @@ members = [
   "crates/nexus-service",
   "crates/nexus-flow-session",
   "crates/nexus-workspace",
+  "crates/nexus-workspace-intel",
   "crates/nexus-compute",
   "crates/nexus-storage",
   "crates/nexus-platform",
