@@ -48,8 +48,9 @@ const OP_MANAGE: u8 = 1;
 
 /// 授权公告（wire DTO）：`nexus-auth` Grant 的传输形态。
 ///
-/// 字段与 `Grant{resource, principal, operations, not_after}` 一一对应
-/// （`principal` 在 registry 侧以字符串承载，避免 registry → auth 依赖边）；
+/// 字段与 `Grant{resource, principal, operations, not_after}` 一一对应；
+/// `principal` / `operations` / `not_after` 由内嵌的 `UsageGrant` 承载，
+/// 避免 `principal` 在 wire 上重复序列化；
 /// 权威的授权判定仍在提供方侧 grant 表，**公告 ≠ 授权**。
 ///
 /// D2 例外（P0-4 复核，见 MODULE.md"契約張力裁决"）：`resource` 为
@@ -67,9 +68,8 @@ const OP_MANAGE: u8 = 1;
 pub struct GrantAnnouncement {
     /// 授权目标资源（提供方本地命名）。
     pub resource: ResourceRef,
-    /// 被授权主体（认证层定义的主体字符串）。
-    pub principal: String,
-    /// 授予的操作。
+    /// 授予详情：`principal` / `operations` / `not_after` 由内嵌
+    /// `UsageGrant` 承载（避免 `principal` 在 wire 上重复序列化）。
     pub grant: UsageGrant,
 }
 
@@ -504,7 +504,6 @@ pub fn encode_control_frame(frame: &ControlFrame) -> Result<Vec<u8>, FrameCodecE
         ControlFrame::AuthGrant { announcement } => {
             put_u8(&mut out, FRAME_AUTH_GRANT);
             put_resource_ref(&mut out, &announcement.resource)?;
-            put_str(&mut out, &announcement.principal)?;
             put_grant(&mut out, &announcement.grant)?;
         }
         ControlFrame::AuthRevoke {
@@ -552,14 +551,9 @@ pub fn decode_control_frame(payload: &[u8]) -> Result<ControlFrame, FrameCodecEr
         }
         FRAME_AUTH_GRANT => {
             let resource = get_resource_ref(&mut r)?;
-            let principal = r.get_str()?;
             let grant = get_grant(&mut r)?;
             ControlFrame::AuthGrant {
-                announcement: GrantAnnouncement {
-                    resource,
-                    principal,
-                    grant,
-                },
+                announcement: GrantAnnouncement { resource, grant },
             }
         }
         FRAME_AUTH_REVOKE => {
@@ -742,7 +736,6 @@ mod tests {
             ControlFrame::AuthGrant {
                 announcement: GrantAnnouncement {
                     resource: name_ref(),
-                    principal: "ed25519:cc".into(),
                     grant: UsageGrant {
                         principal: "ed25519:cc".into(),
                         operations: vec![ResourceOperation::Use],
