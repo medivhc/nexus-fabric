@@ -2202,13 +2202,13 @@ git worktree add -b feat/c-proxy    ../ws-c     # Agent C
 - 跨沙箱 Review 证据不互通：`.evidence/` 为 gitignore 的本地目录，独立 Review
   （§19.1）的产物只存在于评审方沙箱，提交方 push 时看不到。建议约定评审结论以
   marker 形式进 commit 正文（如 `review: <id>`）并由 hook 校验，或由 CI 存档评审产物。
-- ~~branch protection 需在 GitHub 仓库设置页开启~~ 已启用（见 §30.3）。
+- branch protection 因私有库 + 非 Pro 账号暂无法开启，见 §30.3 现状说明。
 ***
 
 ## 30. 分支与合并工作流（Trunk-Based，GitHub）
 
 `master` 是唯一长期分支，必须始终保持可构建、可验证。所有变更走短命任务分支 +
-Pull Request 合并；直推 `master` 被 GitHub 分支保护在机械层面禁止（2026-10-08 启用）。
+Pull Request 合并；直推 `master` 是违规行为（目标：GitHub 分支保护，见 §30.3）。
 
 ### 30.1 分支
 
@@ -2237,12 +2237,23 @@ Coordinator：squash merge → 删除任务分支（仓库已开 delete_branch_o
 
 ### 30.3 分支保护（`master`）
 
+目标态（GitHub 分支保护）：
 - Require a pull request before merging：禁止一切直推（含 admin）。
 - Require linear history：rebase / squash 合并，禁 merge commit。
 - 暂不开 required status checks：`verify --fast` 跑在真机（xc-pc-linux /
   NU-SH-1217），不在 GitHub Actions；远期 coordinator 可在真机验证通过后经 API
   回写 check-run，届时再开。
 - 禁止 force push 与分支删除。
+
+现状（2026-10-08）：仓库为私有库、账号未绑支付（非 Pro），GitHub 拒绝为私有库
+开启分支保护（"Upgrade to GitHub Pro or make this repository public"）。在升级或
+公开之前，以下机制代替执行：
+- pre-push 门禁（§28）：verify --fast、STALE 扫描、contract marker、Review Evidence，
+  任何一项不过都推不出去；
+- mirror 侧 pre-receive 钩子：拒绝一切对 `refs/heads/master` 的直接推送；
+- coordinator 经 GitHub API 串行 squash-merge PR，一次一个；
+- 仓库已开 `delete_branch_on_merge`，合并后任务分支自动删除。
+直推 `master` 无论是否成功都是违规。
 
 ### 30.4 例外
 
