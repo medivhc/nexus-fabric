@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::Browser;
-use nexus_web_gateway::config::{GatewayConfig, IceServer, MeshConfig, MeshNodeInfo, SshConfig, TlsConfig};
+use nexus_web_gateway::config::{
+    GatewayConfig, IceServer, MeshConfig, MeshNodeInfo, MeshPeer, SshConfig, TlsConfig,
+};
 use nexus_web_gateway::protocol::{BrowserMessage, NodeMessage, SshAuth};
 use nexus_web_gateway::Gateway;
 
@@ -104,6 +106,14 @@ fn spawn_mock_sshd() -> (SocketAddr, Arc<AtomicUsize>) {
         }
     });
     (addr, auth_count)
+}
+
+/// Reserve a loopback TCP port by binding then releasing a listener.
+fn reserve_port() -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = l.local_addr().expect("local addr").port();
+    drop(l);
+    port
 }
 
 /// Minimal HTTPS GET over rustls pinned to the gateway's self-signed cert.
@@ -406,6 +416,160 @@ fn max_terminals_limit() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn ssh_idle_timeout_closes_terminal() -> TestResult {
+    let (sshd_addr, _) = spawn_mock_sshd();
+    let mut cfg = test_config("node-a", "node-a", "127.0.0.1:0".parse().unwrap(), sshd_addr);
+    cfg.ssh.idle_timeout_secs = 1;
+    let handle = Gateway::start(cfg).expect("start gateway");
+
+    let mut browser =
+        Browser::connect_first(&handle.cert_der, handle.local_addr, "node-a", "sess-idle")
+            .expect("connect first");
+    browser.drive_all(Duration::from_secs(5))?;
+
+    browser.peers[0]
+        .send(&BrowserMessage::SshOpen {
+            session_id: "term-idle".into(),
+            target: "node-a".into(),
+            auth: None,
+        })
+        .expect("send ssh_open");
+    loop {
+        browser.drive_all(Duration::from_millis(100))?;
+        if let Some(NodeMessage::SshOpenAck { status, .. }) =
+            browser.peers[0].take_message(|m| matches!(m, NodeMessage::SshOpenAck { .. }))
+        {
+            assert_eq!(status, "ok");
+            break;
+        }
+    }
+
+    // The bridge is idle; the gateway must close it after ~1s.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        browser.drive_all(Duration::from_millis(100))?;
+        if let Some(NodeMessage::SshClose {
+            session_id,
+            reason,
+        }) = browser.peers[0].take_message(|m| matches!(m, NodeMessage::SshClose { .. }))
+        {
+            assert_eq!(session_id, "term-idle");
+            assert!(reason.contains("idle"), "reason: {reason}");
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            return Err("timed out waiting for idle ssh_close".into());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn wss_mesh_relay_between_two_gateways() -> TestResult {
+    let (sshd_addr, _) = spawn_mock_sshd();
+    let port_a = reserve_port();
+    let port_b = reserve_port();
+    let addr_a: SocketAddr = format!("127.0.0.1:{port_a}").parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{port_b}").parse().unwrap();
+
+    let node_list = vec![
+        MeshNodeInfo {
+            peer_id: "node-a".into(),
+            name: "node-a".into(),
+            addrs: vec![format!("127.0.0.1:{port_a}")],
+            services: vec!["ssh".into()],
+        },
+        MeshNodeInfo {
+            peer_id: "node-b".into(),
+            name: "node-b".into(),
+            addrs: vec![format!("127.0.0.1:{port_b}")],
+            services: vec!["ssh".into()],
+        },
+    ];
+
+    let cfg_a = GatewayConfig {
+        listen_addr: addr_a,
+        node_id: "node-a".into(),
+        node_name: "node-a".into(),
+        node_list: node_list.clone(),
+        ice_servers: vec![],
+        tls: TlsConfig::AutoGenerate {
+            names: vec!["localhost".into()],
+            ips: vec!["127.0.0.1".parse().unwrap()],
+        },
+        ssh: SshConfig {
+            target: sshd_addr,
+            auth_prologue: None,
+            max_terminals: 5,
+            idle_timeout_secs: 600,
+        },
+        mesh: MeshConfig::Wss {
+            token: "token-a".into(),
+            peers: vec![MeshPeer {
+                peer_id: "node-b".into(),
+                url: format!("wss://127.0.0.1:{port_b}/mesh"),
+                token: "token-b".into(),
+            }],
+        },
+    };
+    let cfg_b = GatewayConfig {
+        listen_addr: addr_b,
+        node_id: "node-b".into(),
+        node_name: "node-b".into(),
+        node_list,
+        ice_servers: vec![],
+        tls: TlsConfig::AutoGenerate {
+            names: vec!["localhost".into()],
+            ips: vec!["127.0.0.1".parse().unwrap()],
+        },
+        ssh: SshConfig {
+            target: sshd_addr,
+            auth_prologue: None,
+            max_terminals: 5,
+            idle_timeout_secs: 600,
+        },
+        mesh: MeshConfig::Wss {
+            token: "token-b".into(),
+            peers: vec![MeshPeer {
+                peer_id: "node-a".into(),
+                url: format!("wss://127.0.0.1:{port_a}/mesh"),
+                token: "token-a".into(),
+            }],
+        },
+    };
+
+    let handle_a = Gateway::start(cfg_a)?;
+    let _handle_b = Gateway::start(cfg_b)?;
+
+    let mut browser = Browser::connect_first(
+        &handle_a.cert_der,
+        handle_a.local_addr,
+        "node-a",
+        "sess-wss-mesh",
+    )
+    .expect("connect first");
+    browser.drive_all(Duration::from_secs(5))?;
+
+    browser
+        .connect_node("node-b", "node-b")
+        .expect("connect node-b");
+    browser.drive_all(Duration::from_secs(5))?;
+
+    assert!(browser.peers[0].connected, "peer A should be connected");
+    assert!(browser.peers[1].connected, "peer B should be connected");
+
+    // Node B's gateway also sends HelloAck with the node list.
+    let ack_b = browser.peers[1]
+        .take_message(|m| matches!(m, NodeMessage::HelloAck { .. }))
+        .expect("node-b hello_ack");
+    match ack_b {
+        NodeMessage::HelloAck { node_id, .. } => assert_eq!(node_id, "node-b"),
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
 /// WSS handshake probe: connect to `/ws` and read the 101 response status.
 #[test]
 fn wss_endpoint_upgrades() {
@@ -445,6 +609,82 @@ fn wss_endpoint_upgrades() {
         }
     }
     let head = String::from_utf8_lossy(&resp);
+    assert!(head.starts_with("HTTP/1.1 101"), "got: {head}");
+}
+
+/// Raw WSS upgrade request with an extra header; returns the response head.
+fn wss_upgrade_head(
+    cert_der: &[u8],
+    addr: SocketAddr,
+    path: &str,
+    extra_headers: &[(&str, &str)],
+) -> String {
+    use rustls::pki_types::{CertificateDer, ServerName};
+    let cert = CertificateDer::from(cert_der.to_vec());
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert).expect("add root");
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let tcp = TcpStream::connect(addr).expect("connect");
+    let sni = ServerName::try_from("localhost").expect("sni");
+    let conn = rustls::ClientConnection::new(Arc::new(config), sni).expect("client conn");
+    let mut tls = rustls::StreamOwned::new(conn, tcp);
+    let mut head = format!(
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+    );
+    for (k, v) in extra_headers {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str("\r\n");
+    write!(tls, "{head}").expect("write request");
+    let mut resp = Vec::new();
+    let mut byte = [0u8; 1];
+    while !resp.ends_with(b"\r\n\r\n") {
+        match tls.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => resp.push(byte[0]),
+            Err(e) => panic!("read response: {e}"),
+        }
+    }
+    String::from_utf8_lossy(&resp).to_string()
+}
+
+#[test]
+fn mesh_endpoint_rejects_bad_token() {
+    let (sshd_addr, _) = spawn_mock_sshd();
+    let cfg = test_config("node-a", "node-a", "127.0.0.1:0".parse().unwrap(), sshd_addr);
+    let mut cfg = cfg;
+    cfg.mesh = MeshConfig::Wss {
+        token: "token-a".into(),
+        peers: vec![],
+    };
+    let handle = Gateway::start(cfg).expect("start gateway");
+
+    // Wrong token -> 401.
+    let head = wss_upgrade_head(
+        &handle.cert_der,
+        handle.local_addr,
+        "/mesh",
+        &[("Authorization", "Bearer wrong")],
+    );
+    assert!(head.starts_with("HTTP/1.1 401"), "got: {head}");
+
+    // Missing token -> 401.
+    let head = wss_upgrade_head(&handle.cert_der, handle.local_addr, "/mesh", &[]);
+    assert!(head.starts_with("HTTP/1.1 401"), "got: {head}");
+
+    // Correct token -> 101.
+    let head = wss_upgrade_head(
+        &handle.cert_der,
+        handle.local_addr,
+        "/mesh",
+        &[("Authorization", "Bearer token-a")],
+    );
     assert!(head.starts_with("HTTP/1.1 101"), "got: {head}");
 }
 

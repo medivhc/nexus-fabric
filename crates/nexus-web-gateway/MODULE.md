@@ -24,7 +24,8 @@
 ## Inputs
 
 - `GatewayConfig`：监听地址、节点 PeerId/名称、mesh 节点列表、ICE 服务器、
-  TLS 材料（自动生成本地 CA 或文件）、SSH 目标、mesh 信令后端。
+  TLS 材料（自动生成本地 CA 或文件）、SSH 目标（含空闲超时）、mesh 信令后端
+  （`Wss` 模式含本地 `/mesh` 端点 bearer token 与对端 peer 列表）。
 - 浏览器经 WSS 的 SDP offer / 经 DataChannel 的控制消息（JSON）。
 - 其他网关经 mesh 转发来的 SDP offer。
 
@@ -62,6 +63,10 @@
 **G5（最小 API 面）**：对外只暴露 `Gateway::start` / `GatewayConfig` /
 协议消息类型；内部 `Session`/事件循环为 private。
 **G6（类型化错误）**：业务失败返回 `GatewayError`，不用 panic。
+**G7（mesh 端点鉴权）**：`/mesh` WSS 端点要求 `Authorization: Bearer <token>`，
+本地 token 由 `MeshConfig::Wss.token` 配置；缺失/错误返回 401。
+**G8（空闲终端回收）**：SSH bridge 超过 `SshConfig.idle_timeout_secs` 空闲即断开，
+事件循环周期性扫描并下发 `ssh_close`。
 
 ## Side Effects
 
@@ -81,12 +86,17 @@
 
 ## Verification
 
-- 单元测试：协议消息 roundtrip、SDP payload 转换、配置校验负路径。
+- 单元测试：协议消息 roundtrip、SDP payload 转换、配置校验负路径
+  （空 node_id / 空或重复 node_list / 空 ICE urls / TLS 文件空路径 /
+  mesh WSS 空 token 或空 peer 字段）。
 - 集成测试（`tests/gateway_e2e.rs`）：
   - HTTPS 页面与 `/api/config` 可访问（rustls 客户端 pin 本地 CA）。
   - WSS 信令：浏览器-like str0m 客户端经 WSS 交换 SDP，建立 DataChannel。
   - 双节点：经 in-memory mesh 中继，与第二个节点建立 DataChannel。
-  - SSH 终端：DataChannel → mock sshd（TCP）→ 回显，认证 prologue 生效。
+  - WSS mesh：两个独立 gateway 经 `/mesh` bearer-token 中继 SDP 并建连；
+    错误 token 返回 401。
+  - SSH 终端：DataChannel → mock sshd（TCP）→ 回显，认证 prologue 生效；
+    空闲超时后终端被关闭。
   - 负路径：无节点列表/空 node_id 配置被拒；SSH target 拒绝连接返回错误。
 
 ## Performance Budget

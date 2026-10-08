@@ -111,9 +111,21 @@ pub enum MeshConfig {
     InMemory,
     /// Relay signaling through each peer's gateway over WSS.
     Wss {
+        /// Bearer token the local `/mesh` WSS endpoint requires from peers.
+        token: String,
         #[serde(default)]
         peers: Vec<MeshPeer>,
     },
+}
+
+impl MeshConfig {
+    /// Bearer token required by the local `/mesh` WSS endpoint, if any.
+    pub fn local_token(&self) -> Option<&str> {
+        match self {
+            MeshConfig::Wss { token, .. } => Some(token),
+            MeshConfig::InMemory => None,
+        }
+    }
 }
 
 impl Default for MeshConfig {
@@ -200,6 +212,55 @@ impl GatewayConfig {
             return Err(GatewayError::Config(
                 "node_list must contain an entry matching node_id".into(),
             ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for node in &self.node_list {
+            if node.peer_id.trim().is_empty() {
+                return Err(GatewayError::Config(
+                    "node_list entry has empty peer_id".into(),
+                ));
+            }
+            if !seen.insert(node.peer_id.as_str()) {
+                return Err(GatewayError::Config(format!(
+                    "duplicate peer_id in node_list: {}",
+                    node.peer_id
+                )));
+            }
+        }
+        for ice in &self.ice_servers {
+            if ice.urls.is_empty() {
+                return Err(GatewayError::Config(
+                    "ice_servers entry has empty urls".into(),
+                ));
+            }
+        }
+        if let TlsConfig::Files {
+            cert_path,
+            key_path,
+        } = &self.tls
+        {
+            if cert_path.trim().is_empty() || key_path.trim().is_empty() {
+                return Err(GatewayError::Config(
+                    "tls.files cert_path and key_path must not be empty".into(),
+                ));
+            }
+        }
+        if let MeshConfig::Wss { token, peers } = &self.mesh {
+            if token.trim().is_empty() {
+                return Err(GatewayError::Config(
+                    "mesh.wss.token must not be empty".into(),
+                ));
+            }
+            for peer in peers {
+                if peer.peer_id.trim().is_empty()
+                    || peer.url.trim().is_empty()
+                    || peer.token.trim().is_empty()
+                {
+                    return Err(GatewayError::Config(
+                        "mesh.wss.peers entry needs non-empty peer_id/url/token".into(),
+                    ));
+                }
+            }
         }
         if self.ssh.max_terminals == 0 {
             return Err(GatewayError::Config(
@@ -306,5 +367,98 @@ mod tests {
             GatewayConfig::from_json_str("{not json"),
             Err(GatewayError::Config(_))
         ));
+    }
+
+    #[test]
+    fn node_list_empty_peer_id_rejected() {
+        let mut cfg = valid_config();
+        cfg.node_list[0].peer_id = "".into();
+        assert!(matches!(
+            cfg.validate(),
+            Err(GatewayError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn node_list_duplicate_peer_id_rejected() {
+        let mut cfg = valid_config();
+        cfg.node_list.push(cfg.node_list[0].clone());
+        assert!(matches!(
+            cfg.validate(),
+            Err(GatewayError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn ice_server_empty_urls_rejected() {
+        let mut cfg = valid_config();
+        cfg.ice_servers.push(IceServer {
+            urls: vec![],
+            username: None,
+            credential: None,
+        });
+        assert!(matches!(
+            cfg.validate(),
+            Err(GatewayError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn tls_files_empty_paths_rejected() {
+        let mut cfg = valid_config();
+        cfg.tls = TlsConfig::Files {
+            cert_path: "".into(),
+            key_path: "".into(),
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(GatewayError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn mesh_wss_empty_token_rejected() {
+        let mut cfg = valid_config();
+        cfg.mesh = MeshConfig::Wss {
+            token: "".into(),
+            peers: vec![],
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(GatewayError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn mesh_wss_peer_missing_url_rejected() {
+        let mut cfg = valid_config();
+        cfg.mesh = MeshConfig::Wss {
+            token: "token-a".into(),
+            peers: vec![MeshPeer {
+                peer_id: "node-b".into(),
+                url: "".into(),
+                token: "token-b".into(),
+            }],
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(GatewayError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn mesh_wss_roundtrips() {
+        let mut cfg = valid_config();
+        cfg.mesh = MeshConfig::Wss {
+            token: "token-a".into(),
+            peers: vec![MeshPeer {
+                peer_id: "node-b".into(),
+                url: "wss://127.0.0.1:8444/mesh".into(),
+                token: "token-b".into(),
+            }],
+        };
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let parsed = GatewayConfig::from_json_str(&json).expect("parse");
+        assert_eq!(parsed.mesh, cfg.mesh);
     }
 }

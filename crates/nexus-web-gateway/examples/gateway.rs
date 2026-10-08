@@ -2,7 +2,7 @@
 //!
 //! Usage:
 //! ```text
-//! cargo run -p nexus-web-gateway --example gateway -- ./gateway.json
+//! cargo run -p nexus-web-gateway --example gateway -- ./examples/gateway.example.json
 //! ```
 //!
 //! The process binds the configured `listen_addr`, serves the page over HTTPS

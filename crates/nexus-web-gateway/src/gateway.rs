@@ -146,7 +146,7 @@ impl Gateway {
     pub fn start(cfg: GatewayConfig) -> Result<GatewayHandle, GatewayError> {
         let mesh: Arc<dyn MeshSignaler> = match &cfg.mesh {
             crate::config::MeshConfig::InMemory => Arc::new(InMemoryMeshSignaler::new()),
-            crate::config::MeshConfig::Wss { peers } => Arc::new(WssMeshSignaler::new(
+            crate::config::MeshConfig::Wss { peers, .. } => Arc::new(WssMeshSignaler::new(
                 peers.iter().map(|p| (p.peer_id.clone(), p.url.clone(), p.token.clone())),
             )),
         };
@@ -265,6 +265,20 @@ fn handle_connection(shared: Arc<Shared>, tcp: TcpStream) -> Result<(), GatewayE
 
     // WebSocket upgrade paths.
     if request.is_websocket_upgrade() {
+        // The /mesh endpoint is bearer-token protected; reject unauthorized
+        // peers before upgrading.
+        if request.path.starts_with("/mesh") {
+            if let Some(expected) = shared.cfg.mesh.local_token() {
+                let provided = request
+                    .header("authorization")
+                    .and_then(|v| v.strip_prefix("Bearer "))
+                    .unwrap_or("");
+                if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+                    http::write_http_401(&mut tls).map_err(GatewayError::Io)?;
+                    return Ok(());
+                }
+            }
+        }
         let key = request
             .header("sec-websocket-key")
             .ok_or_else(|| GatewayError::WebSocket("missing Sec-WebSocket-Key".into()))?;
@@ -554,6 +568,9 @@ fn run_event_loop(shared: Arc<Shared>, rx: Receiver<GatewayEvent>) {
                 }
             }
         }
+
+        // Enforce SSH idle timeouts (configured, default 10 minutes).
+        enforce_idle_timeouts(&shared, &mut sessions, Instant::now());
 
         // Clean up dead sessions.
         sessions.retain(|_, sess| sess.rtc.is_alive());
@@ -847,6 +864,40 @@ fn close_ssh_bridge(sess: &mut Session, bridge_id: &str, reason: &str) {
             reason: reason.to_string(),
         });
     }
+}
+
+/// Close SSH bridges that have been idle for longer than the configured
+/// timeout. Called once per event-loop iteration.
+fn enforce_idle_timeouts(
+    shared: &Arc<Shared>,
+    sessions: &mut HashMap<String, Session>,
+    now: Instant,
+) {
+    let timeout = shared.cfg.idle_timeout();
+    for sess in sessions.values_mut() {
+        let idle: Vec<String> = sess
+            .ssh_bridges
+            .iter()
+            .filter(|(_, b)| now.duration_since(b.last_activity) >= timeout)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for bridge_id in idle {
+            tracing::debug!("ssh bridge {bridge_id} idle timeout");
+            close_ssh_bridge(sess, &bridge_id, "idle timeout");
+        }
+    }
+}
+
+/// Constant-time byte comparison for bearer-token checks.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 // ---------------------------------------------------------------------------

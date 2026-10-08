@@ -1,0 +1,50 @@
+{
+  "listen_addr": "0.0.0.0:8443",
+  "node_id": "node-a",
+  "node_name": "node-a",
+  "node_list": [
+    {
+      "peer_id": "node-a",
+      "name": "node-a",
+      "addrs": ["10.144.144.1:8443"],
+      "services": ["ssh"]
+    },
+    {
+      "peer_id": "node-b",
+      "name": "node-b",
+      "addrs": ["10.144.144.2:8443"],
+      "services": ["ssh"]
+    }
+  ],
+  "ice_servers": [
+    {
+      "urls": ["stun:stun.l.google.com:19302"]
+    },
+    {
+      "urls": ["turn:turn.example.com:3478"],
+      "username": "placeholder-user",
+      "credential": "placeholder-pass"
+    }
+  ],
+  "tls": {
+    "mode": "auto_generate",
+    "names": ["localhost"],
+    "ips": ["10.144.144.1"]
+  },
+  "ssh": {
+    "target": "127.0.0.1:22",
+    "max_terminals": 5,
+    "idle_timeout_secs": 600
+  },
+  "mesh": {
+    "mode": "wss",
+    "token": "change-me-local-token",
+    "peers": [
+      {
+        "peer_id": "node-b",
+        "url": "wss://10.144.144.2:8443/mesh",
+        "token": "change-me-node-b-token"
+      }
+    ]
+  }
+}
