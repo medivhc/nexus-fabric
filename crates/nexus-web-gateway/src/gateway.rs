@@ -14,7 +14,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,7 +27,7 @@ use crate::cert;
 use crate::config::GatewayConfig;
 use crate::error::GatewayError;
 use crate::http;
-use crate::mesh::{InMemoryMeshSignaler, MeshSignaler, WssMeshSignaler};
+use crate::mesh::{InMemoryMeshSignaler, MeshDataConnection, MeshSignaler, WssMeshSignaler};
 use crate::protocol::{BrowserMessage, MeshMessage, NodeMessage, SdpPayload, SshAuth};
 
 /// Maximum UDP datagram payload the gateway reads from the shared socket.
@@ -69,6 +69,14 @@ pub(crate) enum GatewayEvent {
         bridge_id: String,
         reason: String,
     },
+    /// Mesh relay reader: the target gateway accepted/rejected a relayed SSH
+    /// terminal.
+    RelaySshOpenAck {
+        session_id: String,
+        bridge_id: String,
+        status: String,
+        error: Option<String>,
+    },
 }
 
 /// Shared, clone-able gateway state.
@@ -89,6 +97,7 @@ struct Session {
     channel: Option<ChannelId>,
     send_queue: VecDeque<Vec<u8>>,
     ssh_bridges: HashMap<String, SshBridge>,
+    ssh_relays: HashMap<String, SshRelay>,
 }
 
 impl Session {
@@ -101,6 +110,7 @@ impl Session {
             channel: None,
             send_queue: VecDeque::new(),
             ssh_bridges: HashMap::new(),
+            ssh_relays: HashMap::new(),
         }
     }
 
@@ -125,6 +135,10 @@ impl Drop for Session {
             bridge.stop.store(true, Ordering::Relaxed);
             let _ = bridge.tcp_write.shutdown(std::net::Shutdown::Both);
         }
+        // Close every relayed terminal's mesh data connection.
+        for (_, relay) in self.ssh_relays.drain() {
+            relay.data.close();
+        }
     }
 }
 
@@ -134,6 +148,15 @@ struct SshBridge {
     tcp_write: TcpStream,
     /// Set when the bridge must close; the reader thread checks it each loop.
     stop: Arc<AtomicBool>,
+    /// Last activity (used for idle timeout).
+    last_activity: Instant,
+}
+
+/// A data-plane peer-relayed SSH terminal: the browser's bytes travel over a
+/// mesh data connection to the target gateway, which opens a local sshd bridge.
+struct SshRelay {
+    /// Persistent bidirectional mesh data connection to the target gateway.
+    data: MeshDataConnection,
     /// Last activity (used for idle timeout).
     last_activity: Instant,
 }
@@ -460,71 +483,270 @@ fn process_offer(
         .map_err(|e| GatewayError::Mesh(format!("offer timeout: {e}")))?
 }
 
+/// A relayed SSH bridge on the target gateway, fed by a peer gateway's mesh
+/// data connection.
+struct RelayBridge {
+    /// Write end of the TCP connection to the local sshd.
+    tcp_write: TcpStream,
+    /// Set when the bridge must close; the reader thread checks it each loop.
+    stop: Arc<AtomicBool>,
+    /// Last activity (used for idle timeout).
+    last_activity: Instant,
+}
+
 fn handle_mesh_connection(
     shared: Arc<Shared>,
-    mut ws: tungstenite::WebSocket<http::TlsStream>,
+    ws: tungstenite::WebSocket<http::TlsStream>,
 ) -> Result<(), GatewayError> {
+    // Very short read timeout so the WebSocket can be shared between the read
+    // loop and relayed-bridge reader threads without deadlocking or starving
+    // concurrent writers.
+    let mut ws = ws;
+    ws.get_mut()
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_millis(1)))
+        .map_err(GatewayError::Io)?;
+    let ws = Arc::new(Mutex::new(ws));
+    let mut bridges: HashMap<String, RelayBridge> = HashMap::new();
+
     loop {
-        let msg = match ws.read() {
+        let read_result = {
+            let mut ws = ws.lock().expect("mesh ws lock");
+            ws.read()
+        };
+        let msg = match read_result {
             Ok(m) => m,
+            Err(tungstenite::Error::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // No message pending: release the lock and yield so bridge
+                // reader threads can send without being starved.
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
             Err(tungstenite::Error::Protocol(_) | tungstenite::Error::ConnectionClosed) => break,
             Err(e) => {
                 tracing::debug!("mesh ws read error: {e}");
                 break;
             }
         };
-        if let tungstenite::Message::Text(text) = msg {
-            let parsed: MeshMessage = match serde_json::from_str(&text) {
-                Ok(m) => m,
-                Err(e) => {
-                    let _ = ws.send(tungstenite::Message::Text(format!(
-                        r#"{{"type":"relay_error","session_id":"","error":"bad mesh message: {e}"}}"#
-                    )));
+        match msg {
+            tungstenite::Message::Text(text) => {
+                let parsed: MeshMessage = match serde_json::from_str(&text) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        let _ = send_mesh(&ws, &MeshMessage::RelayError {
+                            session_id: "".into(),
+                            error: format!("bad mesh message: {e}"),
+                        });
+                        continue;
+                    }
+                };
+                match parsed {
+                    MeshMessage::RelayOffer { session_id, sdp } => {
+                        handle_mesh_relay_offer(&shared, &ws, &session_id, &sdp);
+                    }
+                    MeshMessage::SshOpen { session_id, auth } => {
+                        open_relayed_ssh_bridge(&shared, &ws, &mut bridges, &session_id, auth);
+                    }
+                    MeshMessage::SshData { session_id, data } => {
+                        if let Some(bridge) = bridges.get_mut(&session_id) {
+                            bridge.last_activity = Instant::now();
+                            let Some(bytes) = base64_decode(&data) else {
+                                continue;
+                            };
+                            if bridge.tcp_write.write_all(&bytes).is_err() {
+                                close_relayed_bridge(&ws, &mut bridges, &session_id, "write error");
+                            }
+                        }
+                    }
+                    MeshMessage::SshClose { session_id, reason } => {
+                        close_relayed_bridge(&ws, &mut bridges, &session_id, &reason);
+                    }
+                    _ => {}
+                }
+            }
+            tungstenite::Message::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    // Close all remaining relayed bridges.
+    for (_, bridge) in bridges.drain() {
+        bridge.stop.store(true, Ordering::Relaxed);
+        let _ = bridge.tcp_write.shutdown(std::net::Shutdown::Both);
+    }
+    Ok(())
+}
+
+/// Send a mesh message over the shared mesh WebSocket.
+fn send_mesh(
+    ws: &Arc<Mutex<tungstenite::WebSocket<http::TlsStream>>>,
+    msg: &MeshMessage,
+) -> Result<(), GatewayError> {
+    let mut ws = ws.lock().expect("mesh ws lock");
+    ws.send(tungstenite::Message::Text(
+        serde_json::to_string(msg)
+            .map_err(|e| GatewayError::Protocol(format!("mesh send: {e}")))?,
+    ))
+    .map_err(|e| GatewayError::WebSocket(format!("mesh send: {e}")))
+}
+
+/// Handle a relayed SDP offer on the target gateway.
+fn handle_mesh_relay_offer(
+    shared: &Arc<Shared>,
+    ws: &Arc<Mutex<tungstenite::WebSocket<http::TlsStream>>>,
+    session_id: &str,
+    sdp: &SdpPayload,
+) {
+    let (reply_tx, reply_rx) = sync_channel(1);
+    match shared.event_tx.send(GatewayEvent::MeshOffer {
+        session_id: session_id.to_string(),
+        sdp: sdp.clone(),
+        reply: reply_tx,
+    }) {
+        Ok(()) => match reply_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(Ok(answer)) => {
+                let _ = send_mesh(ws, &MeshMessage::RelayAnswer {
+                    session_id: session_id.to_string(),
+                    sdp: answer,
+                });
+            }
+            Ok(Err(e)) => {
+                let _ = send_mesh(ws, &MeshMessage::RelayError {
+                    session_id: session_id.to_string(),
+                    error: e.to_string(),
+                });
+            }
+            Err(_) => {}
+        },
+        Err(e) => {
+            let _ = send_mesh(ws, &MeshMessage::RelayError {
+                session_id: session_id.to_string(),
+                error: e.to_string(),
+            });
+        }
+    }
+}
+
+/// Open a local sshd bridge for a peer gateway's relayed SSH terminal.
+fn open_relayed_ssh_bridge(
+    shared: &Arc<Shared>,
+    ws: &Arc<Mutex<tungstenite::WebSocket<http::TlsStream>>>,
+    bridges: &mut HashMap<String, RelayBridge>,
+    bridge_id: &str,
+    auth: Option<SshAuth>,
+) {
+    if bridges.contains_key(bridge_id) {
+        let _ = send_mesh(ws, &MeshMessage::SshOpenAck {
+            session_id: bridge_id.to_string(),
+            status: "error".into(),
+            error: Some("bridge already open".into()),
+        });
+        return;
+    }
+
+    let mut tcp = match TcpStream::connect(shared.cfg.ssh.target) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = send_mesh(ws, &MeshMessage::SshOpenAck {
+                session_id: bridge_id.to_string(),
+                status: "error".into(),
+                error: Some(format!("connect to sshd: {e}")),
+            });
+            return;
+        }
+    };
+    tcp.set_read_timeout(Some(Duration::from_millis(500))).ok();
+    let mut read_end = match tcp.try_clone() {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = send_mesh(ws, &MeshMessage::SshOpenAck {
+                session_id: bridge_id.to_string(),
+                status: "error".into(),
+                error: Some(format!("clone tcp: {e}")),
+            });
+            return;
+        }
+    };
+
+    // Optional mock-sshd auth prologue (real sshd uses pure byte forwarding).
+    if let Some(prologue) = &shared.cfg.ssh.auth_prologue {
+        if let Some(line) = format_auth_prologue(prologue, &auth) {
+            let _ = tcp.write_all(line.as_bytes());
+        }
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let bridge = RelayBridge {
+        tcp_write: tcp,
+        stop: stop.clone(),
+        last_activity: Instant::now(),
+    };
+    bridges.insert(bridge_id.to_string(), bridge);
+    let _ = send_mesh(ws, &MeshMessage::SshOpenAck {
+        session_id: bridge_id.to_string(),
+        status: "ok".into(),
+        error: None,
+    });
+
+    // Reader thread: forward local sshd bytes back over the mesh connection.
+    let ws = ws.clone();
+    let bridge_id = bridge_id.to_string();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            match read_end.read(&mut buf) {
+                Ok(0) => {
+                    let _ = send_mesh(&ws, &MeshMessage::SshClose {
+                        session_id: bridge_id.clone(),
+                        reason: "sshd closed connection".into(),
+                    });
+                    break;
+                }
+                Ok(n) => {
+                    let _ = send_mesh(&ws, &MeshMessage::SshData {
+                        session_id: bridge_id.clone(),
+                        data: base64_encode(&buf[..n]),
+                    });
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
                     continue;
                 }
-            };
-            if let MeshMessage::RelayOffer { session_id, sdp } = parsed {
-                let (reply_tx, reply_rx) = sync_channel(1);
-                match shared.event_tx.send(GatewayEvent::MeshOffer {
-                    session_id: session_id.clone(),
-                    sdp: sdp.clone(),
-                    reply: reply_tx,
-                }) {
-                    Ok(()) => match reply_rx.recv_timeout(Duration::from_secs(30)) {
-                        Ok(Ok(answer)) => {
-                            let _ = ws.send(tungstenite::Message::Text(
-                                serde_json::to_string(&MeshMessage::RelayAnswer {
-                                    session_id,
-                                    sdp: answer,
-                                })
-                                .expect("mesh answer serializable"),
-                            ));
-                        }
-                        Ok(Err(e)) => {
-                            let _ = ws.send(tungstenite::Message::Text(
-                                serde_json::to_string(&MeshMessage::RelayError {
-                                    session_id,
-                                    error: e.to_string(),
-                                })
-                                .expect("mesh error serializable"),
-                            ));
-                        }
-                        Err(_) => {}
-                    },
-                    Err(e) => {
-                        let _ = ws.send(tungstenite::Message::Text(
-                            serde_json::to_string(&MeshMessage::RelayError {
-                                session_id,
-                                error: e.to_string(),
-                            })
-                            .expect("mesh error serializable"),
-                        ));
-                    }
+                Err(_) => {
+                    let _ = send_mesh(&ws, &MeshMessage::SshClose {
+                        session_id: bridge_id.clone(),
+                        reason: "sshd read error".into(),
+                    });
+                    break;
                 }
             }
         }
+    });
+}
+
+/// Close a relayed SSH bridge on the target gateway.
+fn close_relayed_bridge(
+    ws: &Arc<Mutex<tungstenite::WebSocket<http::TlsStream>>>,
+    bridges: &mut HashMap<String, RelayBridge>,
+    bridge_id: &str,
+    reason: &str,
+) {
+    if let Some(bridge) = bridges.remove(bridge_id) {
+        bridge.stop.store(true, Ordering::Relaxed);
+        let _ = bridge.tcp_write.shutdown(std::net::Shutdown::Both);
+        let _ = send_mesh(ws, &MeshMessage::SshClose {
+            session_id: bridge_id.to_string(),
+            reason: reason.to_string(),
+        });
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -700,10 +922,14 @@ fn handle_channel_data(shared: &Arc<Shared>, sess: &mut Session, data: &ChannelD
         }
         BrowserMessage::SshOpen {
             session_id,
-            target: _,
+            target,
             auth,
         } => {
-            open_ssh_bridge(shared, sess, &session_id, auth, now);
+            if target.is_empty() || target == shared.cfg.node_id {
+                open_ssh_bridge(shared, sess, &session_id, auth, now);
+            } else {
+                open_ssh_relay(shared, sess, &session_id, &target, auth, now);
+            }
         }
         BrowserMessage::SshData { session_id, data } => {
             if let Some(bridge) = sess.ssh_bridges.get_mut(&session_id) {
@@ -712,12 +938,24 @@ fn handle_channel_data(shared: &Arc<Shared>, sess: &mut Session, data: &ChannelD
                     return;
                 };
                 if bridge.tcp_write.write_all(&bytes).is_err() {
-                    close_ssh_bridge(sess, &session_id, "write error");
+                    close_ssh_terminal(sess, &session_id, "write error");
+                }
+            } else if let Some(relay) = sess.ssh_relays.get_mut(&session_id) {
+                relay.last_activity = now;
+                let Some(bytes) = base64_decode(&data) else {
+                    return;
+                };
+                let mesh_msg = MeshMessage::SshData {
+                    session_id: session_id.clone(),
+                    data: base64_encode(&bytes),
+                };
+                if relay.data.send(&mesh_msg).is_err() {
+                    close_ssh_terminal(sess, &session_id, "write error");
                 }
             }
         }
         BrowserMessage::SshClose { session_id } => {
-            close_ssh_bridge(sess, &session_id, "client closed");
+            close_ssh_terminal(sess, &session_id, "client closed");
         }
     }
 }
@@ -847,6 +1085,121 @@ fn open_ssh_bridge(
     });
 }
 
+fn open_ssh_relay(
+    shared: &Arc<Shared>,
+    sess: &mut Session,
+    bridge_id: &str,
+    target: &str,
+    auth: Option<SshAuth>,
+    now: Instant,
+) {
+    if sess.ssh_bridges.len() + sess.ssh_relays.len() >= shared.cfg.ssh.max_terminals {
+        sess.send(&NodeMessage::SshOpenAck {
+            session_id: bridge_id.to_string(),
+            status: "error".into(),
+            error: Some("max terminals reached".into()),
+        });
+        return;
+    }
+    if sess.ssh_relays.contains_key(bridge_id) {
+        sess.send(&NodeMessage::SshOpenAck {
+            session_id: bridge_id.to_string(),
+            status: "error".into(),
+            error: Some("bridge already open".into()),
+        });
+        return;
+    }
+
+    let data = match shared.mesh.open_data_connection(target) {
+        Ok(d) => d,
+        Err(e) => {
+            sess.send(&NodeMessage::SshOpenAck {
+                session_id: bridge_id.to_string(),
+                status: "error".into(),
+                error: Some(format!("mesh relay to {target}: {e}")),
+            });
+            return;
+        }
+    };
+
+    let mesh_msg = MeshMessage::SshOpen {
+        session_id: bridge_id.to_string(),
+        auth,
+    };
+    if let Err(e) = data.send(&mesh_msg) {
+        data.close();
+        sess.send(&NodeMessage::SshOpenAck {
+            session_id: bridge_id.to_string(),
+            status: "error".into(),
+            error: Some(format!("mesh relay to {target}: {e}")),
+        });
+        return;
+    }
+
+    let relay = SshRelay {
+        data: data.clone(),
+        last_activity: now,
+    };
+    sess.ssh_relays.insert(bridge_id.to_string(), relay);
+
+    // Reader thread: forward target-gateway messages (ack/data/close) to the
+    // browser session via the event loop.
+    let event_tx = shared.event_tx.clone();
+    let session_id = sess.id.clone();
+    let bridge_id = bridge_id.to_string();
+    let target = target.to_string();
+    thread::spawn(move || loop {
+        if data.is_stopped() {
+            break;
+        }
+        match data.read() {
+            Ok(MeshMessage::SshOpenAck {
+                session_id: sid,
+                status,
+                error,
+            }) => {
+                let _ = event_tx.send(GatewayEvent::RelaySshOpenAck {
+                    session_id: session_id.clone(),
+                    bridge_id: sid,
+                    status,
+                    error,
+                });
+            }
+            Ok(MeshMessage::SshData {
+                session_id: sid,
+                data: encoded,
+            }) => {
+                let bytes = base64_decode(&encoded).unwrap_or_default();
+                let _ = event_tx.send(GatewayEvent::SshData {
+                    session_id: session_id.clone(),
+                    bridge_id: sid,
+                    data: bytes,
+                });
+            }
+            Ok(MeshMessage::SshClose {
+                session_id: sid,
+                reason,
+            }) => {
+                let _ = event_tx.send(GatewayEvent::SshClosed {
+                    session_id: session_id.clone(),
+                    bridge_id: sid,
+                    reason,
+                });
+            }
+            Ok(_) => continue,
+            Err(e) => {
+                tracing::debug!("mesh relay reader {target}: {e}");
+                let _ = event_tx.send(GatewayEvent::SshClosed {
+                    session_id: session_id.clone(),
+                    bridge_id: bridge_id.clone(),
+                    reason: format!("mesh relay: {e}"),
+                });
+                break;
+            }
+        }
+    });
+}
+
 fn format_auth_prologue(template: &str, auth: &Option<SshAuth>) -> Option<String> {
     let (username, password, private_key) = match auth {
         Some(SshAuth::Password { username, password }) => {
@@ -877,6 +1230,30 @@ fn close_ssh_bridge(sess: &mut Session, bridge_id: &str, reason: &str) {
     }
 }
 
+fn close_ssh_relay(sess: &mut Session, bridge_id: &str, reason: &str) {
+    if let Some(relay) = sess.ssh_relays.remove(bridge_id) {
+        let _ = relay.data.send(&MeshMessage::SshClose {
+            session_id: bridge_id.to_string(),
+            reason: reason.to_string(),
+        });
+        relay.data.close();
+        sess.send(&NodeMessage::SshClose {
+            session_id: bridge_id.to_string(),
+            reason: reason.to_string(),
+        });
+    }
+}
+
+/// Close an SSH terminal regardless of whether it is a local bridge or a
+/// peer-relayed terminal.
+fn close_ssh_terminal(sess: &mut Session, bridge_id: &str, reason: &str) {
+    if sess.ssh_bridges.contains_key(bridge_id) {
+        close_ssh_bridge(sess, bridge_id, reason);
+    } else if sess.ssh_relays.contains_key(bridge_id) {
+        close_ssh_relay(sess, bridge_id, reason);
+    }
+}
+
 /// Close SSH bridges that have been idle for longer than the configured
 /// timeout. Called once per event-loop iteration.
 fn enforce_idle_timeouts(
@@ -891,10 +1268,16 @@ fn enforce_idle_timeouts(
             .iter()
             .filter(|(_, b)| now.duration_since(b.last_activity) >= timeout)
             .map(|(id, _)| id.clone())
+            .chain(
+                sess.ssh_relays
+                    .iter()
+                    .filter(|(_, b)| now.duration_since(b.last_activity) >= timeout)
+                    .map(|(id, _)| id.clone()),
+            )
             .collect();
         for bridge_id in idle {
-            tracing::debug!("ssh bridge {bridge_id} idle timeout");
-            close_ssh_bridge(sess, &bridge_id, "idle timeout");
+            tracing::debug!("ssh terminal {bridge_id} idle timeout");
+            close_ssh_terminal(sess, &bridge_id, "idle timeout");
         }
     }
 }
@@ -974,6 +1357,8 @@ fn handle_gateway_event(
             if let Some(sess) = sessions.get_mut(&session_id) {
                 if let Some(bridge) = sess.ssh_bridges.get_mut(&bridge_id) {
                     bridge.last_activity = Instant::now();
+                } else if let Some(relay) = sess.ssh_relays.get_mut(&bridge_id) {
+                    relay.last_activity = Instant::now();
                 }
                 sess.send(&NodeMessage::SshData {
                     session_id: bridge_id,
@@ -987,7 +1372,21 @@ fn handle_gateway_event(
             reason,
         } => {
             if let Some(sess) = sessions.get_mut(&session_id) {
-                close_ssh_bridge(sess, &bridge_id, &reason);
+                close_ssh_terminal(sess, &bridge_id, &reason);
+            }
+        }
+        GatewayEvent::RelaySshOpenAck {
+            session_id,
+            bridge_id,
+            status,
+            error,
+        } => {
+            if let Some(sess) = sessions.get_mut(&session_id) {
+                sess.send(&NodeMessage::SshOpenAck {
+                    session_id: bridge_id,
+                    status,
+                    error,
+                });
             }
         }
     }

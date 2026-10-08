@@ -244,7 +244,11 @@ function showTerminal(node) {
 
 function channelFor(node) {
   if (node.peer_id === config.node_id) return controlChannel;
-  return nodeChannels[node.peer_id];
+  const direct = nodeChannels[node.peer_id];
+  if (direct && direct.readyState === 'open') return direct;
+  // No direct DataChannel to this node (hole punching failed): relay the
+  // terminal through the first-touch node's control channel over the mesh.
+  return controlChannel;
 }
 
 function handleSshOpenAck(msg) {

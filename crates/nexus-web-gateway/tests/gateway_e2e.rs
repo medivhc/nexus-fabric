@@ -637,6 +637,164 @@ fn wss_mesh_relay_between_two_gateways() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn wss_mesh_ssh_relay_between_two_gateways() -> TestResult {
+    let (sshd_addr, auth_count, _) = spawn_mock_sshd();
+    let port_a = reserve_port();
+    let port_b = reserve_port();
+    let addr_a: SocketAddr = format!("127.0.0.1:{port_a}").parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{port_b}").parse().unwrap();
+
+    let node_list = vec![
+        MeshNodeInfo {
+            peer_id: "node-a".into(),
+            name: "node-a".into(),
+            addrs: vec![format!("127.0.0.1:{port_a}")],
+            services: vec!["ssh".into()],
+        },
+        MeshNodeInfo {
+            peer_id: "node-b".into(),
+            name: "node-b".into(),
+            addrs: vec![format!("127.0.0.1:{port_b}")],
+            services: vec!["ssh".into()],
+        },
+    ];
+
+    let cfg_a = GatewayConfig {
+        listen_addr: addr_a,
+        node_id: "node-a".into(),
+        node_name: "node-a".into(),
+        node_list: node_list.clone(),
+        ice_servers: vec![],
+        tls: TlsConfig::AutoGenerate {
+            names: vec!["localhost".into()],
+            ips: vec!["127.0.0.1".parse().unwrap()],
+        },
+        ssh: SshConfig {
+            target: sshd_addr,
+            auth_prologue: Some("AUTH {password}\n".into()),
+            max_terminals: 5,
+            idle_timeout_secs: 600,
+        },
+        mesh: MeshConfig::Wss {
+            token: "token-a".into(),
+            peers: vec![MeshPeer {
+                peer_id: "node-b".into(),
+                url: format!("wss://127.0.0.1:{port_b}/mesh"),
+                token: "token-b".into(),
+            }],
+        },
+    };
+    let cfg_b = GatewayConfig {
+        listen_addr: addr_b,
+        node_id: "node-b".into(),
+        node_name: "node-b".into(),
+        node_list,
+        ice_servers: vec![],
+        tls: TlsConfig::AutoGenerate {
+            names: vec!["localhost".into()],
+            ips: vec!["127.0.0.1".parse().unwrap()],
+        },
+        ssh: SshConfig {
+            target: sshd_addr,
+            auth_prologue: Some("AUTH {password}\n".into()),
+            max_terminals: 5,
+            idle_timeout_secs: 600,
+        },
+        mesh: MeshConfig::Wss {
+            token: "token-b".into(),
+            peers: vec![MeshPeer {
+                peer_id: "node-a".into(),
+                url: format!("wss://127.0.0.1:{port_a}/mesh"),
+                token: "token-a".into(),
+            }],
+        },
+    };
+
+    let handle_a = Gateway::start(cfg_a)?;
+    let _handle_b = Gateway::start(cfg_b)?;
+
+    // Browser joins only node-a (no direct DataChannel to node-b).
+    let mut browser = Browser::connect_first(
+        &handle_a.cert_der,
+        handle_a.local_addr,
+        "node-a",
+        "sess-ssh-relay",
+    )
+    .expect("connect first");
+    let t0 = std::time::Instant::now();
+    browser.drive_all(Duration::from_secs(5))?;
+    eprintln!("[timing] connect_first done: {:?}", t0.elapsed());
+
+    // Open an SSH terminal on node-b through the mesh relay.
+    browser.peers[0]
+        .send(&BrowserMessage::SshOpen {
+            session_id: "term-relay".into(),
+            target: "node-b".into(),
+            auth: Some(SshAuth::Password {
+                username: "root".into(),
+                password: TEST_PASSWORD.into(),
+            }),
+        })
+        .expect("send ssh_open");
+
+    let ack = loop {
+        browser.drive_all(Duration::from_millis(100))?;
+        if let Some(NodeMessage::SshOpenAck {
+            session_id,
+            status,
+            ..
+        }) = browser.peers[0].take_message(|m| matches!(m, NodeMessage::SshOpenAck { .. }))
+        {
+            break (session_id, status);
+        }
+    };
+    assert_eq!(ack.0, "term-relay");
+    assert_eq!(ack.1, "ok");
+    assert_eq!(auth_count.load(Ordering::SeqCst), 1, "node-b sshd saw AUTH");
+    eprintln!("[timing] ssh_open ack: {:?}", t0.elapsed());
+
+    // The mock sshd's "AUTH_OK" is relayed back through the mesh.
+    let auth_ok = loop {
+        browser.drive_all(Duration::from_millis(100))?;
+        if let Some(NodeMessage::SshData { data, .. }) =
+            browser.peers[0].take_message(|m| matches!(m, NodeMessage::SshData { .. }))
+        {
+            break data;
+        }
+    };
+    let auth_ok = String::from_utf8(b64decode_for_test(&auth_ok)).expect("utf8");
+    assert!(auth_ok.contains("AUTH_OK"), "got {auth_ok:?}");
+    eprintln!("[timing] auth_ok data: {:?}", t0.elapsed());
+
+    // Terminal input is relayed to node-b's sshd and echoed back.
+    browser.peers[0]
+        .send(&BrowserMessage::SshData {
+            session_id: "term-relay".into(),
+            data: b64encode_for_test(b"echo relayed\n"),
+        })
+        .expect("send ssh_data");
+    let echo = loop {
+        browser.drive_all(Duration::from_millis(100))?;
+        if let Some(NodeMessage::SshData { data, .. }) =
+            browser.peers[0].take_message(|m| matches!(m, NodeMessage::SshData { .. }))
+        {
+            break data;
+        }
+    };
+    let echo = String::from_utf8(b64decode_for_test(&echo)).expect("utf8");
+    assert!(echo.contains("echo relayed"), "got {echo:?}");
+    eprintln!("[timing] echo data: {:?}", t0.elapsed());
+
+    // Close the relayed terminal.
+    browser.peers[0]
+        .send(&BrowserMessage::SshClose {
+            session_id: "term-relay".into(),
+        })
+        .expect("send ssh_close");
+    Ok(())
+}
+
 /// WSS handshake probe: connect to `/ws` and read the 101 response status.
 #[test]
 fn wss_endpoint_upgrades() {
