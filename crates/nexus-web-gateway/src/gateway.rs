@@ -1382,6 +1382,13 @@ fn handle_gateway_event(
             error,
         } => {
             if let Some(sess) = sessions.get_mut(&session_id) {
+                if status != "ok" {
+                    // The target gateway rejected the relayed terminal: drop
+                    // the relay so it does not linger until the idle timeout.
+                    if let Some(relay) = sess.ssh_relays.remove(&bridge_id) {
+                        relay.data.close();
+                    }
+                }
                 sess.send(&NodeMessage::SshOpenAck {
                     session_id: bridge_id,
                     status,
