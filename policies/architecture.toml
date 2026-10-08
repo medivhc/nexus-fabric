@@ -302,6 +302,12 @@ allowed_internal_dependencies = []
 portable = false
 layer = "delivery"
 
+[[crate]]
+name = "nexus-web-gateway"
+allowed_internal_dependencies = []
+portable = false
+layer = "delivery"
+
 # ---------------------------------------------------------------------------
 # N2 资源类型中立门禁（P0-6，完成标志 #6；综合规划 D5 bunny 架构门禁）
 #

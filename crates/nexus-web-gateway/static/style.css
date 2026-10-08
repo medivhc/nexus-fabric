@@ -1,0 +1,42 @@
+:root {
+  --bg: #0f1419;
+  --fg: #e6e6e6;
+  --accent: #4daafc;
+  --muted: #8b949e;
+  --card: #161b22;
+  --border: #30363d;
+  --err: #f85149;
+  --ok: #3fb950;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+}
+header { padding: 12px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 16px; }
+header h1 { font-size: 18px; margin: 0; }
+.status { font-size: 13px; margin: 0; }
+.status.connecting { color: var(--muted); }
+.status.online { color: var(--ok); }
+.status.error { color: var(--err); }
+main { padding: 20px; max-width: 1100px; margin: 0 auto; display: grid; gap: 20px; }
+section { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+h2 { margin-top: 0; font-size: 15px; color: var(--accent); }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+.node-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.node-list li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; }
+.node-list .node-name { font-weight: 600; }
+.node-list .node-meta { color: var(--muted); font-size: 12px; }
+.node-list .conn { font-size: 12px; }
+.node-list .conn.up { color: var(--ok); }
+.node-list .conn.down { color: var(--muted); }
+button { background: var(--accent); color: #04141f; border: 0; border-radius: 6px; padding: 6px 14px; font-weight: 600; cursor: pointer; }
+button:disabled { opacity: 0.5; cursor: default; }
+#auth-form { display: grid; gap: 8px; margin-bottom: 10px; }
+#auth-form label { font-size: 13px; display: grid; gap: 4px; }
+#auth-form input, #auth-form textarea { background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 8px; font-family: inherit; }
+#terminal-container { height: 420px; }
+#terminal-container .xterm { height: 100%; }
+[hidden] { display: none !important; }

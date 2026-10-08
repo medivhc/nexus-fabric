@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nexus Web Gateway</title>
+<link rel="stylesheet" href="/xterm.css">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>Nexus Web Gateway</h1>
+  <p id="status" class="status connecting">Connecting…</p>
+</header>
+
+<main>
+  <section id="join-card">
+    <h2>Join the mesh</h2>
+    <p>Your identity is generated in-memory on this page and is lost when the tab closes.</p>
+    <p class="mono" id="peer-id">peer: (not generated yet)</p>
+  </section>
+
+  <section id="nodes-card" hidden>
+    <h2>Mesh nodes</h2>
+    <ul id="node-list" class="node-list"></ul>
+  </section>
+
+  <section id="terminal-card" hidden>
+    <h2>Terminal <span id="terminal-node" class="mono"></span></h2>
+    <div id="auth-form">
+      <label>Username <input id="ssh-user" type="text" value="root" autocomplete="off"></label>
+      <label>Password or private key
+        <textarea id="ssh-auth" rows="3" placeholder="password or paste an OpenSSH private key"></textarea>
+      </label>
+      <button id="ssh-connect" type="button">Connect SSH</button>
+    </div>
+    <div id="terminal-container"></div>
+  </section>
+</main>
+
+<script src="/xterm.js"></script>
+<script src="/xterm-addon-fit.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
