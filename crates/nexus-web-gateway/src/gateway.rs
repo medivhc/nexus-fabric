@@ -298,7 +298,7 @@ fn handle_connection(shared: Arc<Shared>, tcp: TcpStream) -> Result<(), GatewayE
     } else {
         let result = serve_http(shared, &mut tls, &request);
         // Send TLS close_notify and flush so clients see a clean EOF.
-        let _ = tls.conn.send_close_notify();
+        tls.conn.send_close_notify();
         let _ = tls.flush();
         result
     }
@@ -444,7 +444,6 @@ fn process_offer(
     reply_rx
         .recv_timeout(Duration::from_secs(30))
         .map_err(|e| GatewayError::Mesh(format!("offer timeout: {e}")))?
-        .map_err(GatewayError::from)
 }
 
 fn handle_mesh_connection(
@@ -460,46 +459,34 @@ fn handle_mesh_connection(
                 break;
             }
         };
-        match msg {
-            tungstenite::Message::Text(text) => {
-                let parsed: MeshMessage = match serde_json::from_str(&text) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        let _ = ws.send(tungstenite::Message::Text(format!(
-                            r#"{{"type":"relay_error","session_id":"","error":"bad mesh message: {e}"}}"#
-                        )));
-                        continue;
-                    }
-                };
-                if let MeshMessage::RelayOffer { session_id, sdp } = parsed {
-                    let (reply_tx, reply_rx) = sync_channel(1);
-                    match shared.event_tx.send(GatewayEvent::MeshOffer {
-                        session_id: session_id.clone(),
-                        sdp: sdp.clone(),
-                        reply: reply_tx,
-                    }) {
-                        Ok(()) => match reply_rx.recv_timeout(Duration::from_secs(30)) {
-                            Ok(Ok(answer)) => {
-                                let _ = ws.send(tungstenite::Message::Text(
-                                    serde_json::to_string(&MeshMessage::RelayAnswer {
-                                        session_id,
-                                        sdp: answer,
-                                    })
-                                    .expect("mesh answer serializable"),
-                                ));
-                            }
-                            Ok(Err(e)) => {
-                                let _ = ws.send(tungstenite::Message::Text(
-                                    serde_json::to_string(&MeshMessage::RelayError {
-                                        session_id,
-                                        error: e.to_string(),
-                                    })
-                                    .expect("mesh error serializable"),
-                                ));
-                            }
-                            Err(_) => {}
-                        },
-                        Err(e) => {
+        if let tungstenite::Message::Text(text) = msg {
+            let parsed: MeshMessage = match serde_json::from_str(&text) {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = ws.send(tungstenite::Message::Text(format!(
+                        r#"{{"type":"relay_error","session_id":"","error":"bad mesh message: {e}"}}"#
+                    )));
+                    continue;
+                }
+            };
+            if let MeshMessage::RelayOffer { session_id, sdp } = parsed {
+                let (reply_tx, reply_rx) = sync_channel(1);
+                match shared.event_tx.send(GatewayEvent::MeshOffer {
+                    session_id: session_id.clone(),
+                    sdp: sdp.clone(),
+                    reply: reply_tx,
+                }) {
+                    Ok(()) => match reply_rx.recv_timeout(Duration::from_secs(30)) {
+                        Ok(Ok(answer)) => {
+                            let _ = ws.send(tungstenite::Message::Text(
+                                serde_json::to_string(&MeshMessage::RelayAnswer {
+                                    session_id,
+                                    sdp: answer,
+                                })
+                                .expect("mesh answer serializable"),
+                            ));
+                        }
+                        Ok(Err(e)) => {
                             let _ = ws.send(tungstenite::Message::Text(
                                 serde_json::to_string(&MeshMessage::RelayError {
                                     session_id,
@@ -508,10 +495,19 @@ fn handle_mesh_connection(
                                 .expect("mesh error serializable"),
                             ));
                         }
+                        Err(_) => {}
+                    },
+                    Err(e) => {
+                        let _ = ws.send(tungstenite::Message::Text(
+                            serde_json::to_string(&MeshMessage::RelayError {
+                                session_id,
+                                error: e.to_string(),
+                            })
+                            .expect("mesh error serializable"),
+                        ));
                     }
                 }
             }
-            _ => {}
         }
     }
     Ok(())
@@ -615,10 +611,7 @@ fn flush_send_queue(sess: &mut Session) {
     let Some(cid) = sess.channel else {
         return;
     };
-    loop {
-        let Some(bytes) = sess.send_queue.front().cloned() else {
-            break;
-        };
+    while let Some(bytes) = sess.send_queue.front().cloned() {
         let Some(mut ch) = sess.rtc.channel(cid) else {
             break;
         };
@@ -648,10 +641,8 @@ fn handle_rtc_event(shared: &Arc<Shared>, sess: &mut Session, event: Event, now:
                 sess.rtc.disconnect();
             }
         }
-        Event::ChannelClose(cid) => {
-            if sess.channel == Some(cid) {
-                sess.channel = None;
-            }
+        Event::ChannelClose(cid) if sess.channel == Some(cid) => {
+            sess.channel = None;
         }
         _ => {}
     }

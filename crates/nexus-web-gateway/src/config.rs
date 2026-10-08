@@ -104,10 +104,11 @@ impl Default for SshConfig {
 }
 
 /// Mesh signaling backend configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum MeshConfig {
     /// No external mesh; used by tests that wire gateways in-process.
+    #[default]
     InMemory,
     /// Relay signaling through each peer's gateway over WSS.
     Wss {
@@ -125,12 +126,6 @@ impl MeshConfig {
             MeshConfig::Wss { token, .. } => Some(token),
             MeshConfig::InMemory => None,
         }
-    }
-}
-
-impl Default for MeshConfig {
-    fn default() -> Self {
-        Self::InMemory
     }
 }
 

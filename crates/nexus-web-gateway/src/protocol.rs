@@ -160,6 +160,23 @@ pub enum MeshMessage {
     },
     /// The target node failed to accept the offer.
     RelayError { session_id: String, error: String },
+    /// Open an SSH terminal on the target node (data-plane peer-relay).
+    SshOpen {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<SshAuth>,
+    },
+    /// The target node accepted/rejected the relayed SSH terminal.
+    SshOpenAck {
+        session_id: String,
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Bytes (base64) read from the target node's local sshd.
+    SshData { session_id: String, data: String },
+    /// Close the relayed SSH terminal.
+    SshClose { session_id: String, reason: String },
 }
 
 #[cfg(test)]
@@ -227,5 +244,30 @@ mod tests {
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: MeshMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn mesh_ssh_message_roundtrip() {
+        let msg = MeshMessage::SshOpen {
+            session_id: "term-1".into(),
+            auth: Some(SshAuth::Password {
+                username: "root".into(),
+                password: "hunter2".into(),
+            }),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let back: MeshMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, msg);
+
+        let data = MeshMessage::SshData {
+            session_id: "term-1".into(),
+            data: {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.encode(b"hello")
+            },
+        };
+        let json = serde_json::to_string(&data).expect("serialize");
+        let back: MeshMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, data);
     }
 }

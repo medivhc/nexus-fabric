@@ -179,10 +179,8 @@ impl BrowserPeer {
                 });
             }
             Event::ChannelData(data) => self.handle_channel_data(&data),
-            Event::IceConnectionStateChange(state) => {
-                if state.is_connected() {
-                    self.connected = true;
-                }
+            Event::IceConnectionStateChange(state) if state.is_connected() => {
+                self.connected = true;
             }
             _ => {}
         }

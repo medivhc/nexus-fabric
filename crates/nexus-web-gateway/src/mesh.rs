@@ -11,6 +11,7 @@
 //!   endpoint (bearer-token protected, TLS end-to-end).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -34,6 +35,17 @@ pub trait MeshSignaler: Send + Sync {
         session_id: &str,
         sdp: &SdpPayload,
     ) -> Result<SdpPayload, GatewayError>;
+
+    /// Open a persistent bidirectional data connection to `target` for
+    /// data-plane peer-relay (SSH terminal forwarding).
+    ///
+    /// The default implementation reports that the backend does not support
+    /// data-plane relay; only WSS meshes implement it.
+    fn open_data_connection(&self, _target: &str) -> Result<MeshDataConnection, GatewayError> {
+        Err(GatewayError::Mesh(
+            "this mesh backend does not support data-plane relay".into(),
+        ))
+    }
 
     /// Register the local gateway's offer handler under `peer_id`.
     ///
@@ -98,6 +110,93 @@ impl MeshSignaler for InMemoryMeshSignaler {
     ) -> Result<(), GatewayError> {
         self.register(peer_id, handler);
         Ok(())
+    }
+}
+
+/// A bidirectional data-plane connection over a peer's `/mesh` WSS endpoint.
+///
+/// Used for SSH terminal peer-relay: the originating gateway forwards browser
+/// DataChannel bytes to the target gateway over this connection, and the target
+/// gateway forwards its local sshd's bytes back over the same connection.
+#[derive(Clone)]
+pub struct MeshDataConnection {
+    ws: Arc<Mutex<tungstenite::WebSocket<MeshTlsStream>>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl MeshDataConnection {
+    /// Send a mesh message over the data connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns `GatewayError::WebSocket` on write failure.
+    pub fn send(&self, msg: &MeshMessage) -> Result<(), GatewayError> {
+        let mut ws = self
+            .ws
+            .lock()
+            .expect("mesh data connection lock");
+        ws.send(tungstenite::Message::Text(
+            serde_json::to_string(msg)
+                .map_err(|e| GatewayError::Protocol(format!("mesh data send: {e}")))?,
+        ))
+        .map_err(|e| GatewayError::WebSocket(format!("mesh data send: {e}")))
+    }
+
+    /// Read the next mesh message from the data connection.
+    ///
+    /// The underlying socket has a short read timeout so the connection can be
+    /// shared between a reader thread and a writer without deadlocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns `GatewayError::Mesh` when the peer closes the connection, or
+    /// `GatewayError::WebSocket`/`GatewayError::Protocol` on read/parse errors.
+    pub fn read(&self) -> Result<MeshMessage, GatewayError> {
+        loop {
+            let mut ws = self
+                .ws
+                .lock()
+                .expect("mesh data connection lock");
+            match ws.read() {
+                Ok(tungstenite::Message::Text(text)) => {
+                    return serde_json::from_str(&text).map_err(|e| {
+                        GatewayError::Protocol(format!("mesh data message: {e}"))
+                    });
+                }
+                Ok(tungstenite::Message::Close(_)) => {
+                    return Err(GatewayError::Mesh(
+                        "mesh data connection closed".into(),
+                    ));
+                }
+                Ok(_) => continue,
+                Err(tungstenite::Error::Io(io))
+                    if io.kind() == std::io::ErrorKind::WouldBlock
+                        || io.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    continue;
+                }
+                Err(e) => {
+                    return Err(GatewayError::WebSocket(format!(
+                        "mesh data read: {e}"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Close the data connection and signal any reader thread to stop.
+    pub fn close(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let mut ws = self
+            .ws
+            .lock()
+            .expect("mesh data connection lock");
+        let _ = ws.close(None);
+    }
+
+    /// True once [`MeshDataConnection::close`] has been called.
+    pub fn is_stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
     }
 }
 
@@ -210,7 +309,7 @@ fn connect_mesh_ws(
             .map_err(|e| GatewayError::WebSocket(format!("bad token header: {e}")))?,
     );
 
-    let tcp = TcpStream::connect((host.as_str(), port)).map_err(|e| GatewayError::Io(e))?;
+    let tcp = TcpStream::connect((host.as_str(), port)).map_err(GatewayError::Io)?;
     let sni = TlsServerName::try_from(host.clone())
         .map_err(|e| GatewayError::WebSocket(format!("bad server name {host}: {e}")))?;
     let conn = rustls::ClientConnection::new(
