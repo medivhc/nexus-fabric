@@ -57,11 +57,13 @@ fn test_config(node_id: &str, node_name: &str, listen: SocketAddr, ssh_target: S
     }
 }
 
-fn spawn_mock_sshd() -> (SocketAddr, Arc<AtomicUsize>) {
+fn spawn_mock_sshd() -> (SocketAddr, Arc<AtomicUsize>, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock sshd");
     let addr = listener.local_addr().expect("local addr");
     let auth_count = Arc::new(AtomicUsize::new(0));
+    let active_connections = Arc::new(AtomicUsize::new(0));
     let auth_count2 = auth_count.clone();
+    let active2 = active_connections.clone();
     std::thread::spawn(move || {
         for conn in listener.incoming() {
             let mut tcp = match conn {
@@ -69,34 +71,47 @@ fn spawn_mock_sshd() -> (SocketAddr, Arc<AtomicUsize>) {
                 Err(_) => continue,
             };
             let auth_count = auth_count2.clone();
+            let active = active2.clone();
             std::thread::spawn(move || {
+                active.fetch_add(1, Ordering::SeqCst);
                 let mut buf = [0u8; 1024];
                 let mut line = Vec::new();
                 loop {
                     match tcp.read(&mut buf) {
-                        Ok(0) => return,
+                        Ok(0) => {
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            return;
+                        }
                         Ok(n) => {
                             line.extend_from_slice(&buf[..n]);
                             if line.contains(&b'\n') {
                                 break;
                             }
                         }
-                        Err(_) => return,
+                        Err(_) => {
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            return;
+                        }
                     }
                 }
                 let text = String::from_utf8_lossy(&line);
                 if text.starts_with("AUTH ") {
                     auth_count.fetch_add(1, Ordering::SeqCst);
                     if tcp.write_all(b"AUTH_OK\n").is_err() {
+                        active.fetch_sub(1, Ordering::SeqCst);
                         return;
                     }
                 }
                 // Echo subsequent bytes back (mock shell).
                 loop {
                     match tcp.read(&mut buf) {
-                        Ok(0) | Err(_) => return,
+                        Ok(0) | Err(_) => {
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            return;
+                        }
                         Ok(n) => {
                             if tcp.write_all(&buf[..n]).is_err() {
+                                active.fetch_sub(1, Ordering::SeqCst);
                                 return;
                             }
                         }
@@ -105,7 +120,7 @@ fn spawn_mock_sshd() -> (SocketAddr, Arc<AtomicUsize>) {
             });
         }
     });
-    (addr, auth_count)
+    (addr, auth_count, active_connections)
 }
 
 /// Reserve a loopback TCP port by binding then releasing a listener.
@@ -153,7 +168,7 @@ fn https_get(cert_der: &[u8], addr: SocketAddr, path: &str) -> Result<(u16, Vec<
 
 #[test]
 fn https_serves_page_and_config() {
-    let (sshd_addr, _) = spawn_mock_sshd();
+    let (sshd_addr, _, _) = spawn_mock_sshd();
     let cfg = test_config("node-a", "node-a", "127.0.0.1:0".parse().unwrap(), sshd_addr);
     let handle = Gateway::start(cfg).expect("start gateway");
     let addr = handle.local_addr;
@@ -176,7 +191,7 @@ fn https_serves_page_and_config() {
 
 #[test]
 fn wss_signaling_establishes_data_channel_and_node_list() {
-    let (sshd_addr, _) = spawn_mock_sshd();
+    let (sshd_addr, _, _) = spawn_mock_sshd();
     let cfg = test_config("node-a", "node-a", "127.0.0.1:0".parse().unwrap(), sshd_addr);
     let handle = Gateway::start(cfg).expect("start gateway");
     let addr = handle.local_addr;
@@ -209,7 +224,7 @@ fn wss_signaling_establishes_data_channel_and_node_list() {
 
 #[test]
 fn two_mesh_nodes_data_channels() {
-    let (sshd_addr, _) = spawn_mock_sshd();
+    let (sshd_addr, _, _) = spawn_mock_sshd();
     let mesh = Arc::new(nexus_web_gateway::mesh::InMemoryMeshSignaler::new());
 
     let cfg_a = test_config("node-a", "node-a", "127.0.0.1:0".parse().unwrap(), sshd_addr);
@@ -251,7 +266,7 @@ fn two_mesh_nodes_data_channels() {
 
 #[test]
 fn ssh_terminal_forwarding_with_auth() -> TestResult {
-    let (sshd_addr, auth_count) = spawn_mock_sshd();
+    let (sshd_addr, auth_count, _) = spawn_mock_sshd();
     let cfg = test_config("node-a", "node-a", "127.0.0.1:0".parse().unwrap(), sshd_addr);
     let handle = Gateway::start(cfg).expect("start gateway");
     let addr = handle.local_addr;
@@ -366,7 +381,7 @@ fn ssh_target_unreachable_returns_error() -> TestResult {
 
 #[test]
 fn max_terminals_limit() -> TestResult {
-    let (sshd_addr, _) = spawn_mock_sshd();
+    let (sshd_addr, _, _) = spawn_mock_sshd();
     let cfg = test_config("node-a", "node-a", "127.0.0.1:0".parse().unwrap(), sshd_addr);
     // Override max_terminals to 1.
     let mut cfg = cfg;
@@ -418,7 +433,7 @@ fn max_terminals_limit() -> TestResult {
 
 #[test]
 fn ssh_idle_timeout_closes_terminal() -> TestResult {
-    let (sshd_addr, _) = spawn_mock_sshd();
+    let (sshd_addr, _, _) = spawn_mock_sshd();
     let mut cfg = test_config("node-a", "node-a", "127.0.0.1:0".parse().unwrap(), sshd_addr);
     cfg.ssh.idle_timeout_secs = 1;
     let handle = Gateway::start(cfg).expect("start gateway");
@@ -466,8 +481,60 @@ fn ssh_idle_timeout_closes_terminal() -> TestResult {
 }
 
 #[test]
+fn ssh_reader_thread_exits_on_session_close() -> TestResult {
+    let (sshd_addr, _, active) = spawn_mock_sshd();
+    let cfg = test_config("node-a", "node-a", "127.0.0.1:0".parse().unwrap(), sshd_addr);
+    let handle = Gateway::start(cfg).expect("start gateway");
+
+    let mut browser =
+        Browser::connect_first(&handle.cert_der, handle.local_addr, "node-a", "sess-leak")
+            .expect("connect first");
+    browser.drive_all(Duration::from_secs(5))?;
+
+    browser.peers[0]
+        .send(&BrowserMessage::SshOpen {
+            session_id: "term-1".into(),
+            target: "node-a".into(),
+            auth: None,
+        })
+        .expect("send ssh_open");
+    loop {
+        browser.drive_all(Duration::from_millis(100))?;
+        if let Some(NodeMessage::SshOpenAck { status, .. }) =
+            browser.peers[0].take_message(|m| matches!(m, NodeMessage::SshOpenAck { .. }))
+        {
+            assert_eq!(status, "ok");
+            break;
+        }
+    }
+    assert_eq!(active.load(Ordering::SeqCst), 1, "mock sshd has one active conn");
+
+    // Drop the browser session via the WSS signaling channel. The event loop
+    // removes the Session, which must stop the reader thread and close TCP.
+    browser.ws.send(tungstenite::Message::Text(
+        serde_json::to_string(&serde_json::json!({
+            "type": "close",
+            "session_id": browser.session_id,
+        }))
+        .expect("close json"),
+    ))?;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        browser.drive_all(Duration::from_millis(100))?;
+        if active.load(Ordering::SeqCst) == 0 {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            return Err("timed out waiting for ssh reader thread to exit".into());
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn wss_mesh_relay_between_two_gateways() -> TestResult {
-    let (sshd_addr, _) = spawn_mock_sshd();
+    let (sshd_addr, _, _) = spawn_mock_sshd();
     let port_a = reserve_port();
     let port_b = reserve_port();
     let addr_a: SocketAddr = format!("127.0.0.1:{port_a}").parse().unwrap();
@@ -573,7 +640,7 @@ fn wss_mesh_relay_between_two_gateways() -> TestResult {
 /// WSS handshake probe: connect to `/ws` and read the 101 response status.
 #[test]
 fn wss_endpoint_upgrades() {
-    let (sshd_addr, _) = spawn_mock_sshd();
+    let (sshd_addr, _, _) = spawn_mock_sshd();
     let cfg = test_config("node-a", "node-a", "127.0.0.1:0".parse().unwrap(), sshd_addr);
     let handle = Gateway::start(cfg).expect("start gateway");
 
@@ -656,7 +723,7 @@ fn wss_upgrade_head(
 
 #[test]
 fn mesh_endpoint_rejects_bad_token() {
-    let (sshd_addr, _) = spawn_mock_sshd();
+    let (sshd_addr, _, _) = spawn_mock_sshd();
     let cfg = test_config("node-a", "node-a", "127.0.0.1:0".parse().unwrap(), sshd_addr);
     let mut cfg = cfg;
     cfg.mesh = MeshConfig::Wss {

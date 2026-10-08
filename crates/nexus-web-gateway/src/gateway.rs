@@ -12,6 +12,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 use std::sync::Arc;
 use std::thread;
@@ -116,10 +117,23 @@ impl Session {
     }
 }
 
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Stop every SSH bridge reader thread and close its TCP connection so
+        // no reader thread keeps a cloned fd alive after the session is gone.
+        for (_, bridge) in self.ssh_bridges.drain() {
+            bridge.stop.store(true, Ordering::Relaxed);
+            let _ = bridge.tcp_write.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
 /// An SSH TCP-forward bridge.
 struct SshBridge {
     /// Write end of the TCP connection to the local sshd.
     tcp_write: TcpStream,
+    /// Set when the bridge must close; the reader thread checks it each loop.
+    stop: Arc<AtomicBool>,
     /// Last activity (used for idle timeout).
     last_activity: Instant,
 }
@@ -775,8 +789,10 @@ fn open_ssh_bridge(
         }
     }
 
+    let stop = Arc::new(AtomicBool::new(false));
     let bridge = SshBridge {
         tcp_write: tcp,
+        stop: stop.clone(),
         last_activity: now,
     };
     sess.ssh_bridges.insert(bridge_id.to_string(), bridge);
@@ -793,6 +809,9 @@ fn open_ssh_bridge(
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
             match read_end.read(&mut buf) {
                 Ok(0) => {
                     let _ = event_tx.send(GatewayEvent::SshClosed {
@@ -849,6 +868,7 @@ fn format_auth_prologue(template: &str, auth: &Option<SshAuth>) -> Option<String
 
 fn close_ssh_bridge(sess: &mut Session, bridge_id: &str, reason: &str) {
     if let Some(bridge) = sess.ssh_bridges.remove(bridge_id) {
+        bridge.stop.store(true, Ordering::Relaxed);
         let _ = bridge.tcp_write.shutdown(std::net::Shutdown::Both);
         sess.send(&NodeMessage::SshClose {
             session_id: bridge_id.to_string(),
