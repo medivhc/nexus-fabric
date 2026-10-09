@@ -34,7 +34,7 @@ function b64decode(str) {
 }
 
 const peerId = randomHex(32);
-const sessionId = randomHex(16);
+let sessionId = randomHex(16);
 let config = null;
 let ws = null;
 let firstPc = null;
@@ -56,6 +56,12 @@ const ICE_CONNECT_TIMEOUT_MS = 15000;
 // direct channel to the target node late-connects).
 const sshRoutes = {}; // session_id -> { channel, node }
 
+// True once the first-touch node's hello_ack arrives. After that the mesh runs
+// over WebRTC DataChannels, so a closed signaling WebSocket is no longer an
+// error (the old unconditional "Signaling closed" banner was a false alarm that
+// also covered the first-node ICE guidance).
+let joined = false;
+
 $('peer-id').textContent = `peer: ${peerId}`;
 
 function setStatus(text, cls) {
@@ -73,19 +79,44 @@ function clearTerminalError() {
   setTerminalError('');
 }
 
+function showFirstNodeError(text) {
+  const el = $('first-node-error');
+  if (el) {
+    el.textContent = text;
+    el.hidden = false;
+  }
+}
+
+function hideFirstNodeError() {
+  const el = $('first-node-error');
+  if (el) el.hidden = true;
+}
+
+function showRetry() {
+  const el = $('retry-btn');
+  if (el) el.hidden = false;
+}
+
+function hideRetry() {
+  const el = $('retry-btn');
+  if (el) el.hidden = true;
+}
+
 function createPc() {
   const pc = new RTCPeerConnection({ iceServers });
   pc.oniceconnectionstatechange = () => {
     console.log('ice state', pc.iceConnectionState);
     // First-touch node: if ICE ultimately fails, surface an actionable error
-    // instead of leaving the page stuck on "WebRTC established".
+    // in its own banner (never overwritten by later status changes) instead of
+    // leaving the page stuck on "WebRTC established".
     if (pc === firstPc &&
         (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected')) {
-      setStatus(
+      showFirstNodeError(
         'ICE connection to the first node failed. This node may be behind a strict NAT. ' +
         'Configure a TURN server in the gateway config (ice_servers) or try another ' +
-        'node address from node_list.',
-        'error');
+        'node address from node_list.');
+      setStatus('First node ICE failed', 'error');
+      showRetry();
     }
   };
   return pc;
@@ -113,7 +144,10 @@ async function init() {
   } catch (e) {
     console.warn('failed to fetch /api/config', e);
   }
+  await joinMesh();
+}
 
+function joinMesh() {
   ws = new WebSocket(`wss://${location.host}/ws`);
 
   ws.onmessage = async (ev) => {
@@ -134,46 +168,108 @@ async function init() {
   const wsOpened = new Promise((resolve, reject) => {
     ws.onopen = () => {
       setStatus('Signaling connected, negotiating WebRTC…', 'connecting');
-      ws.onclose = () => setStatus('Signaling closed', 'error');
-      ws.onerror = () => setStatus('Signaling error', 'error');
+      ws.onclose = handleWsClose;
+      ws.onerror = handleWsError;
       resolve();
     };
     ws.onerror = () => reject(new Error('WebSocket error'));
     ws.onclose = () => reject(new Error('WebSocket closed before connecting'));
   });
 
-  try {
-    await wsOpened;
-    firstPc = createPc();
-    controlChannel = openChannel(firstPc, 'control', onControlOpen, onControlMessage);
-    const offer = await firstPc.createOffer();
-    await firstPc.setLocalDescription(offer);
-    ws.send(JSON.stringify({
-      type: 'offer',
-      session_id: sessionId,
-      peer_id: peerId,
-      name: 'browser',
-      sdp: { type: 'offer', sdp: firstPc.localDescription.sdp },
-    }));
+  return (async () => {
+    try {
+      await wsOpened;
+      firstPc = createPc();
+      controlChannel = openChannel(firstPc, 'control', onControlOpen, onControlMessage);
+      const offer = await firstPc.createOffer();
+      await firstPc.setLocalDescription(offer);
+      ws.send(JSON.stringify({
+        type: 'offer',
+        session_id: sessionId,
+        peer_id: peerId,
+        name: 'browser',
+        sdp: { type: 'offer', sdp: firstPc.localDescription.sdp },
+      }));
 
-    // First-touch node ICE timeout: if the control DataChannel never opens, tell
-    // the user what to do instead of hanging forever.
-    setTimeout(() => {
-      if (!controlChannel || controlChannel.readyState !== 'open') {
-        setStatus(
-          'Timed out waiting for the WebRTC connection to the first node. ' +
-          'This node may be behind a strict NAT. Configure a TURN server in the gateway ' +
-          'config (ice_servers) or try another node address from node_list.',
-          'error');
-      }
-    }, 15000);
-  } catch (e) {
-    setStatus(`Failed to join the mesh: ${e.message}`, 'error');
+      // First-touch node ICE timeout: if the control DataChannel never opens,
+      // tell the user what to do instead of hanging forever. Shown in the
+      // dedicated banner so later status changes cannot cover it.
+      clearTimeout(firstIceTimeout);
+      firstIceTimeout = setTimeout(() => {
+        if (!controlChannel || controlChannel.readyState !== 'open') {
+          showFirstNodeError(
+            'Timed out waiting for the WebRTC connection to the first node. ' +
+            'This node may be behind a strict NAT. Configure a TURN server in the gateway ' +
+            'config (ice_servers) or try another node address from node_list.');
+          setStatus('First node ICE timed out', 'error');
+          showRetry();
+        }
+      }, ICE_CONNECT_TIMEOUT_MS);
+    } catch (e) {
+      setStatus(`Failed to join the mesh: ${e.message}`, 'error');
+      showRetry();
+    }
+  })();
+}
+
+function handleWsClose() {
+  if (joined) {
+    // The signaling WebSocket only establishes the first-touch WebRTC session;
+    // after hello_ack the mesh runs over DataChannels. A closed signaling
+    // socket is not an error once we have joined.
+    setStatus('Signaling closed — mesh active over WebRTC', 'connecting');
+  } else {
+    setStatus('Signaling closed', 'error');
+    showRetry();
   }
+}
+
+function handleWsError() {
+  if (!joined) {
+    setStatus('Signaling error', 'error');
+    showRetry();
+  }
+}
+
+async function reconnect() {
+  hideRetry();
+  hideFirstNodeError();
+  clearTimeout(firstIceTimeout);
+
+  // Tear down the old signaling/session objects so joinMesh starts clean.
+  if (ws) {
+    ws.onclose = null;
+    ws.onerror = null;
+    try { ws.close(); } catch (e) { /* already closed */ }
+  }
+  if (firstPc) {
+    try { firstPc.close(); } catch (e) { /* already closed */ }
+  }
+  firstPc = null;
+  controlChannel = null;
+  joined = false;
+  sessionId = randomHex(16);
+
+  for (const k of Object.keys(nodeChannels)) delete nodeChannels[k];
+  for (const k of Object.keys(nodeState)) delete nodeState[k];
+  for (const k of Object.keys(sshRoutes)) delete sshRoutes[k];
+  currentSshSession = null;
+  currentSshChannel = null;
+
+  const nodesCard = $('nodes-card');
+  if (nodesCard) nodesCard.hidden = true;
+  const list = $('node-list');
+  if (list) list.textContent = '';
+
+  setStatus('Reconnecting…', 'connecting');
+  await joinMesh();
 }
 
 function onControlOpen() {
   setStatus('WebRTC established', 'online');
+  // ICE jitter recovered: the first-touch DataChannel is open, so any earlier
+  // first-node ICE banner is stale and must disappear automatically.
+  hideFirstNodeError();
   sendJson(controlChannel, { type: 'hello', peer_id: peerId, name: 'browser' });
 }
 
@@ -190,6 +286,9 @@ function onControlMessage(ev) {
       // trigger connections. Every other node also sends hello_ack; rendering
       // those caused the reconnect storm.
       if (msg.node_id === config.node_id) {
+        joined = true;
+        hideFirstNodeError();
+        hideRetry();
         renderNodes(msg.node_list);
         setStatus(`Joined ${msg.node_name} (${msg.node_list.length} nodes)`, 'online');
       }
@@ -424,5 +523,7 @@ $('ssh-connect').onclick = () => {
     auth,
   });
 };
+
+$('retry-btn').onclick = () => reconnect();
 
 init();

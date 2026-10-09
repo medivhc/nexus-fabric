@@ -11,9 +11,11 @@
 <header>
   <h1>Nexus Web Gateway</h1>
   <p id="status" class="status connecting">Connecting…</p>
+  <button id="retry-btn" type="button" hidden>Retry</button>
 </header>
 
 <main>
+  <section id="first-node-error" class="error-banner" hidden></section>
   <section id="join-card">
     <h2>Join the mesh</h2>
     <p>Your identity is generated in-memory on this page and is lost when the tab closes.</p>
