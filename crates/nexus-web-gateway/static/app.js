@@ -52,8 +52,11 @@ let firstIceTimeout = null;    // first-touch ICE connection timeout handle
 let offerReadTimeout = null;   // waiting for answer read timeout handle
 let wsHeartbeatTimer = null;   // periodic WS ping interval handle
 let lastWsPongTime = 0;        // timestamp of last received WS pong
-let isHeartbeatTimeout = false;// whether current disconnect was caused by heartbeat timeout
+let isHeartbeatTimeout = false;// whether we are currently in a heartbeat-timeout state
 let answerReceived = false;    // whether SDP answer has been received
+let currentErrorKind = null;   // kind of the banner currently shown (if any)
+let joinedName = null;         // node_name from hello_ack, used to restore status
+let joinedCount = 0;           // node_list length from hello_ack, used to restore status
 
 const WS_HEARTBEAT_INTERVAL_MS = 3000;
 const WS_HEARTBEAT_TIMEOUT_MS = 5000;
@@ -98,7 +101,7 @@ function showErrorBanner(text, kind) {
   }
   if (badgeEl) {
     if (kind === 'heartbeat_timeout') {
-      badgeEl.textContent = '心跳超时';
+      badgeEl.textContent = '网络波动';
       badgeEl.className = 'error-banner-badge badge-heartbeat';
     } else if (kind === 'read_timeout') {
       badgeEl.textContent = '读超时';
@@ -112,12 +115,14 @@ function showErrorBanner(text, kind) {
     }
   }
   if (el) el.hidden = false;
+  currentErrorKind = kind || 'error';
   showRetry();
 }
 
 function hideErrorBanner() {
   const el = $('first-node-error');
   if (el) el.hidden = true;
+  currentErrorKind = null;
 }
 
 function showFirstNodeError(text, kind) {
@@ -145,14 +150,18 @@ function startWsHeartbeat() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const now = Date.now();
     if (lastWsPongTime > 0 && (now - lastWsPongTime) > WS_HEARTBEAT_TIMEOUT_MS) {
-      isHeartbeatTimeout = true;
-      showErrorBanner(
-        '心跳超时：未能收到网关的心跳响应（网络可能已断开或丢包严重）。建议检查本地网络、Wi-Fi 或移动数据连接。',
-        'heartbeat_timeout'
-      );
-      setStatus('信令心跳超时 (网络断开)', 'error');
-      try { ws.close(); } catch (e) {}
-      stopWsHeartbeat();
+      if (!isHeartbeatTimeout) {
+        isHeartbeatTimeout = true;
+        showErrorBanner(
+          '信令心跳暂时未收到响应（可能网络波动）。若数据通道仍正常，网络恢复后本提示会自动消失。',
+          'heartbeat_timeout'
+        );
+        setStatus('信令心跳超时 (网络波动)', 'error');
+      }
+      // Do NOT close the WebSocket here: a brief stall (Wi-Fi roam, VPN
+      // jitter, suspend/resume) can exceed the timeout while the underlying
+      // connection is still alive. Closing the socket would make the error
+      // permanent; keeping it open lets the next pong clear the banner.
       return;
     }
     try {
@@ -172,22 +181,59 @@ function stopWsHeartbeat() {
 
 function handleWsPong() {
   lastWsPongTime = Date.now();
+  if (isHeartbeatTimeout) {
+    // The gateway answered again: the stall is over, clear the stale banner
+    // and restore whatever the real connection state is.
+    isHeartbeatTimeout = false;
+    restoreHealthyStatus();
+  }
+}
+
+// Single source of truth for status/banner after a recovery event (pong
+// resumed, ICE reconnected, control channel opened, hello_ack arrived, or the
+// user dismissed the banner). Reflects the real current connection state and
+// clears stale errors instead of leaving a permanent "error" on the page.
+function restoreHealthyStatus() {
+  if (firstPc && (firstPc.iceConnectionState === 'failed' || firstPc.iceConnectionState === 'disconnected')) {
+    setStatus('P2P ICE 失败', 'error');
+    return;
+  }
+  if (isHeartbeatTimeout) {
+    setStatus('信令心跳超时 (网络波动)', 'error');
+    return;
+  }
+  hideErrorBanner();
+  hideRetry();
+  if (joined) {
+    setStatus(`Joined ${joinedName} (${joinedCount} nodes)`, 'online');
+  } else if (controlChannel && controlChannel.readyState === 'open') {
+    setStatus('WebRTC established', 'online');
+  } else if (answerReceived) {
+    setStatus('Signaling connected, establishing ICE…', 'connecting');
+  } else {
+    setStatus('Signaling connected, negotiating WebRTC…', 'connecting');
+  }
 }
 
 function createPc() {
   const pc = new RTCPeerConnection({ iceServers });
   pc.oniceconnectionstatechange = () => {
     console.log('ice state', pc.iceConnectionState);
-    // First-touch node: if ICE ultimately fails, surface an actionable error
-    // in its own banner (never overwritten by later status changes) instead of
-    // leaving the page stuck on "WebRTC established".
-    if (pc === firstPc &&
-        (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected')) {
+    if (pc !== firstPc) return;
+    if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
+      // First-touch node: if ICE ultimately fails, surface an actionable error
+      // in its own banner (never overwritten by later status changes) instead
+      // of leaving the page stuck on "WebRTC established".
       showErrorBanner(
         'WebRTC ICE 握手失败。可能处于严格对称 NAT 环境，建议检查 TURN 服务器配置或尝试其他节点。',
         'ice_failed'
       );
       setStatus('P2P ICE 失败', 'error');
+    } else if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+      // The data plane is back: any heartbeat/ICE error banner is stale and
+      // must disappear automatically.
+      isHeartbeatTimeout = false;
+      restoreHealthyStatus();
     }
   };
   return pc;
@@ -240,7 +286,7 @@ function joinMesh() {
       await firstPc.setRemoteDescription({ type: 'answer', sdp: msg.sdp.sdp });
       // ICE may still be connecting; do NOT claim "WebRTC established" here.
       // The control channel opening is the real signal.
-      setStatus('Signaling connected, establishing ICE…', 'connecting');
+      restoreHealthyStatus();
     } else if (msg.type === 'error') {
       clearTimeout(offerReadTimeout);
       showErrorBanner(`信令错误: ${msg.error}`, 'error');
@@ -363,6 +409,8 @@ async function reconnect() {
   firstPc = null;
   controlChannel = null;
   joined = false;
+  joinedName = null;
+  joinedCount = 0;
   sessionId = randomHex(16);
 
   for (const k of Object.keys(nodeChannels)) delete nodeChannels[k];
@@ -381,10 +429,9 @@ async function reconnect() {
 }
 
 function onControlOpen() {
-  setStatus('WebRTC established', 'online');
-  // ICE jitter recovered: the first-touch DataChannel is open, so any earlier
-  // first-node ICE banner is stale and must disappear automatically.
-  hideErrorBanner();
+  // The first-touch DataChannel is open: any earlier first-node ICE banner is
+  // stale and must disappear automatically.
+  restoreHealthyStatus();
   sendJson(controlChannel, { type: 'hello', peer_id: peerId, name: 'browser' });
 }
 
@@ -402,10 +449,10 @@ function onControlMessage(ev) {
       // those caused the reconnect storm.
       if (msg.node_id === config.node_id) {
         joined = true;
-        hideFirstNodeError();
-        hideRetry();
+        joinedName = msg.node_name;
+        joinedCount = msg.node_list.length;
         renderNodes(msg.node_list);
-        setStatus(`Joined ${msg.node_name} (${msg.node_list.length} nodes)`, 'online');
+        restoreHealthyStatus();
       }
       break;
     case 'relay_answer':
@@ -641,9 +688,16 @@ $('ssh-connect').onclick = () => {
 
 if ($('retry-btn')) $('retry-btn').onclick = () => reconnect();
 if ($('banner-retry-btn')) $('banner-retry-btn').onclick = () => reconnect();
-if ($('error-close-btn')) $('error-close-btn').onclick = () => hideErrorBanner();
+if ($('error-close-btn')) $('error-close-btn').onclick = () => {
+  hideErrorBanner();
+  // Closing the banner must also fix the header status: if the underlying
+  // problem is still real (ICE failed / heartbeat missing) the status stays
+  // red, otherwise it returns to the honest healthy state.
+  restoreHealthyStatus();
+};
 if ($('banner-back-btn')) $('banner-back-btn').onclick = () => {
   hideErrorBanner();
+  restoreHealthyStatus();
   const termCard = $('terminal-card');
   if (termCard) termCard.hidden = true;
   const nodesCard = $('nodes-card');
