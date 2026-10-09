@@ -495,6 +495,11 @@ fn handle_browser_signaling_message(
             .map_err(|e| GatewayError::WebSocket(e.to_string()))?;
             Ok(())
         }
+        "ping" => {
+            ws.send(tungstenite::Message::Text(r#"{"type":"pong"}"#.into()))
+                .map_err(|e| GatewayError::WebSocket(e.to_string()))?;
+            Ok(())
+        }
         "close" => {
             if let Some(sid) = value.get("session_id").and_then(serde_json::Value::as_str) {
                 let _ = shared.event_tx.send(GatewayEvent::CloseSession {
@@ -1019,6 +1024,9 @@ fn handle_channel_data(shared: &Arc<Shared>, sess: &mut Session, data: &ChannelD
         }
         BrowserMessage::SshClose { session_id } => {
             close_ssh_terminal(sess, &session_id, "client closed");
+        }
+        BrowserMessage::Ping => {
+            sess.send(&NodeMessage::Pong);
         }
     }
 }

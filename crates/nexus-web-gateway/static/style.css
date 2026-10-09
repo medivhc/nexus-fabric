@@ -22,6 +22,7 @@ header h1 { font-size: 18px; margin: 0; }
 .status.online { color: var(--ok); }
 .status.error { color: var(--err); }
 #retry-btn { margin-left: auto; background: var(--err); color: #fff; }
+
 .error-banner {
   background: rgba(248, 81, 73, 0.12);
   border: 1px solid var(--err);
@@ -29,7 +30,117 @@ header h1 { font-size: 18px; margin: 0; }
   border-radius: 8px;
   padding: 12px 16px;
   font-size: 13px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.error-banner-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+.error-banner-badge {
+  background: var(--err);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+.error-banner-badge.badge-heartbeat {
+  background: #cf222e;
+}
+.error-banner-badge.badge-read {
+  background: #bf8700;
+}
+.error-banner-badge.badge-ice {
+  background: #8250df;
+}
+.error-message {
+  flex: 1;
+  line-height: 1.4;
+  color: var(--fg);
   white-space: pre-wrap;
+}
+.error-close-btn {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+}
+.error-close-btn:hover {
+  color: var(--fg);
+}
+.error-banner-actions {
+  display: flex;
+  gap: 10px;
+}
+.btn-action {
+  background: var(--card);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.btn-action:hover {
+  background: var(--border);
+}
+#banner-retry-btn {
+  background: rgba(248, 81, 73, 0.25);
+  border-color: var(--err);
+  color: #fff;
+}
+#banner-retry-btn:hover {
+  background: var(--err);
+}
+#banner-back-btn {
+  background: var(--card);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+#banner-back-btn:hover {
+  background: rgba(77, 170, 252, 0.15);
+}
+
+.cert-card {
+  border-left: 3px solid var(--accent);
+  background: var(--card);
+}
+.cert-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.cert-card h2 {
+  margin: 0;
+  font-size: 15px;
+  color: var(--accent);
+}
+.cert-download-link {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 13px;
+  font-weight: 600;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 4px 10px;
+}
+.cert-download-link:hover {
+  background: rgba(77, 170, 252, 0.15);
+}
+.cert-desc {
+  font-size: 13px;
+  color: var(--muted);
+  margin: 0;
+  line-height: 1.5;
 }
 main { padding: 20px; max-width: 1100px; margin: 0 auto; display: grid; gap: 20px; }
 section { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }

@@ -140,6 +140,15 @@ fn https_serves_page_config_and_cert() {
     let page = String::from_utf8_lossy(&body);
     assert!(page.contains("Nexus Web Gateway"));
     assert!(page.contains("xterm.js"));
+    // Error banner elements: layered, dismissible, retry/back actions
+    assert!(page.contains("id=\"first-node-error\""));
+    assert!(page.contains("id=\"error-badge\""));
+    assert!(page.contains("id=\"error-close-btn\""));
+    assert!(page.contains("id=\"banner-retry-btn\""));
+    assert!(page.contains("id=\"banner-back-btn\""));
+    // B4 CA Certificate guidance card: independent section with download link
+    assert!(page.contains("id=\"cert-guidance-card\""));
+    assert!(page.contains("href=\"/cert\""));
 
     let (status, body) = https_get(&handle.cert_der, addr, "/api/config").expect("GET /api/config");
     assert_eq!(status, 200);
@@ -1095,6 +1104,63 @@ fn mesh_endpoint_rejects_bad_token() {
         &[("Authorization", "Bearer token-a")],
     );
     assert!(head.starts_with("HTTP/1.1 101"), "got: {head}");
+}
+
+#[test]
+fn wss_signaling_heartbeat_ping_pong() -> TestResult {
+    let cfg = test_config(
+        "node-a",
+        "node-a",
+        "127.0.0.1:0".parse().unwrap(),
+        dead_ssh_target(),
+    );
+    let handle = Gateway::start(cfg).expect("start gateway");
+
+    let url = format!("wss://127.0.0.1:{}/ws", handle.local_addr.port());
+    let mut ws = common::connect_wss(&handle.cert_der, &url)?;
+
+    // Send heartbeat ping over WSS signaling
+    ws.send(tungstenite::Message::Text(r#"{"type":"ping"}"#.into()))?;
+
+    let pong = common::read_ws_json(&mut ws)?;
+    assert_eq!(
+        pong.get("type").and_then(|v| v.as_str()),
+        Some("pong"),
+        "expected pong response, got {pong:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn control_channel_heartbeat_ping_pong() -> TestResult {
+    let cfg = test_config(
+        "node-a",
+        "node-a",
+        "127.0.0.1:0".parse().unwrap(),
+        dead_ssh_target(),
+    );
+    let handle = Gateway::start(cfg).expect("start gateway");
+
+    let mut browser = Browser::connect_first(
+        &handle.cert_der,
+        handle.local_addr,
+        "node-a",
+        "sess-pingpong",
+    )?;
+    browser.drive_all(Duration::from_secs(5))?;
+    assert!(browser.peers[0].connected, "peer 0 should connect");
+
+    // Send Ping over control DataChannel
+    browser.peers[0].send(&BrowserMessage::Ping)?;
+
+    let pong = loop {
+        browser.drive_all(Duration::from_millis(100))?;
+        if let Some(msg) = browser.peers[0].take_message(|m| matches!(m, NodeMessage::Pong)) {
+            break msg;
+        }
+    };
+    assert_eq!(pong, NodeMessage::Pong);
+    Ok(())
 }
 
 /// Reserve a loopback TCP port by binding then releasing a listener.

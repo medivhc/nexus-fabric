@@ -112,6 +112,8 @@ pub enum BrowserMessage {
     SshData { session_id: String, data: String },
     /// Close the SSH terminal.
     SshClose { session_id: String },
+    /// Heartbeat ping message.
+    Ping,
 }
 
 /// Node → browser messages.
@@ -148,6 +150,8 @@ pub enum NodeMessage {
     SshData { session_id: String, data: String },
     /// SSH bridge closed.
     SshClose { session_id: String, reason: String },
+    /// Heartbeat pong message.
+    Pong,
 }
 
 /// Mesh-internal signaling messages (between gateway nodes).
@@ -219,6 +223,11 @@ mod tests {
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: BrowserMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, msg);
+
+        let ping = BrowserMessage::Ping;
+        let ping_json = serde_json::to_string(&ping).expect("serialize ping");
+        let ping_back: BrowserMessage = serde_json::from_str(&ping_json).expect("deserialize ping");
+        assert_eq!(ping_back, ping);
     }
 
     #[test]
@@ -230,6 +239,11 @@ mod tests {
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: NodeMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, msg);
+
+        let pong = NodeMessage::Pong;
+        let pong_json = serde_json::to_string(&pong).expect("serialize pong");
+        let pong_back: NodeMessage = serde_json::from_str(&pong_json).expect("deserialize pong");
+        assert_eq!(pong_back, pong);
     }
 
     #[test]

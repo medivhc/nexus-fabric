@@ -49,7 +49,15 @@ let termFit = null;
 let currentSshSession = null;
 let currentSshChannel = null;   // channel the open SSH session is bound to
 let firstIceTimeout = null;    // first-touch ICE connection timeout handle
+let offerReadTimeout = null;   // waiting for answer read timeout handle
+let wsHeartbeatTimer = null;   // periodic WS ping interval handle
+let lastWsPongTime = 0;        // timestamp of last received WS pong
+let isHeartbeatTimeout = false;// whether current disconnect was caused by heartbeat timeout
+let answerReceived = false;    // whether SDP answer has been received
 
+const WS_HEARTBEAT_INTERVAL_MS = 3000;
+const WS_HEARTBEAT_TIMEOUT_MS = 5000;
+const OFFER_READ_TIMEOUT_MS = 10000;
 const ICE_CONNECT_TIMEOUT_MS = 15000;
 // Binds an SSH session to the DataChannel route it was opened on, so terminal
 // bytes never switch channels mid-session (which caused silent freezing when a
@@ -79,17 +87,45 @@ function clearTerminalError() {
   setTerminalError('');
 }
 
-function showFirstNodeError(text) {
+function showErrorBanner(text, kind) {
   const el = $('first-node-error');
-  if (el) {
+  const msgEl = $('error-message');
+  const badgeEl = $('error-badge');
+  if (msgEl) {
+    msgEl.textContent = text;
+  } else if (el) {
     el.textContent = text;
-    el.hidden = false;
   }
+  if (badgeEl) {
+    if (kind === 'heartbeat_timeout') {
+      badgeEl.textContent = '心跳超时';
+      badgeEl.className = 'error-banner-badge badge-heartbeat';
+    } else if (kind === 'read_timeout') {
+      badgeEl.textContent = '读超时';
+      badgeEl.className = 'error-banner-badge badge-read';
+    } else if (kind === 'ice_timeout' || kind === 'ice_failed') {
+      badgeEl.textContent = 'P2P 握手';
+      badgeEl.className = 'error-banner-badge badge-ice';
+    } else {
+      badgeEl.textContent = '网络提示';
+      badgeEl.className = 'error-banner-badge';
+    }
+  }
+  if (el) el.hidden = false;
+  showRetry();
+}
+
+function hideErrorBanner() {
+  const el = $('first-node-error');
+  if (el) el.hidden = true;
+}
+
+function showFirstNodeError(text, kind) {
+  showErrorBanner(text, kind);
 }
 
 function hideFirstNodeError() {
-  const el = $('first-node-error');
-  if (el) el.hidden = true;
+  hideErrorBanner();
 }
 
 function showRetry() {
@@ -102,6 +138,42 @@ function hideRetry() {
   if (el) el.hidden = true;
 }
 
+function startWsHeartbeat() {
+  stopWsHeartbeat();
+  lastWsPongTime = Date.now();
+  wsHeartbeatTimer = setInterval(() => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const now = Date.now();
+    if (lastWsPongTime > 0 && (now - lastWsPongTime) > WS_HEARTBEAT_TIMEOUT_MS) {
+      isHeartbeatTimeout = true;
+      showErrorBanner(
+        '心跳超时：未能收到网关的心跳响应（网络可能已断开或丢包严重）。建议检查本地网络、Wi-Fi 或移动数据连接。',
+        'heartbeat_timeout'
+      );
+      setStatus('信令心跳超时 (网络断开)', 'error');
+      try { ws.close(); } catch (e) {}
+      stopWsHeartbeat();
+      return;
+    }
+    try {
+      ws.send(JSON.stringify({ type: 'ping' }));
+    } catch (e) {
+      console.warn('ws ping failed', e);
+    }
+  }, WS_HEARTBEAT_INTERVAL_MS);
+}
+
+function stopWsHeartbeat() {
+  if (wsHeartbeatTimer) {
+    clearInterval(wsHeartbeatTimer);
+    wsHeartbeatTimer = null;
+  }
+}
+
+function handleWsPong() {
+  lastWsPongTime = Date.now();
+}
+
 function createPc() {
   const pc = new RTCPeerConnection({ iceServers });
   pc.oniceconnectionstatechange = () => {
@@ -111,12 +183,11 @@ function createPc() {
     // leaving the page stuck on "WebRTC established".
     if (pc === firstPc &&
         (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected')) {
-      showFirstNodeError(
-        'ICE connection to the first node failed. This node may be behind a strict NAT. ' +
-        'Configure a TURN server in the gateway config (ice_servers) or try another ' +
-        'node address from node_list.');
-      setStatus('First node ICE failed', 'error');
-      showRetry();
+      showErrorBanner(
+        'WebRTC ICE 握手失败。可能处于严格对称 NAT 环境，建议检查 TURN 服务器配置或尝试其他节点。',
+        'ice_failed'
+      );
+      setStatus('P2P ICE 失败', 'error');
     }
   };
   return pc;
@@ -148,16 +219,31 @@ async function init() {
 }
 
 function joinMesh() {
+  isHeartbeatTimeout = false;
+  answerReceived = false;
   ws = new WebSocket(`wss://${location.host}/ws`);
 
   ws.onmessage = async (ev) => {
-    const msg = JSON.parse(ev.data);
+    let msg;
+    try {
+      msg = JSON.parse(ev.data);
+    } catch (e) {
+      return;
+    }
+    if (msg.type === 'pong') {
+      handleWsPong();
+      return;
+    }
     if (msg.type === 'answer' && firstPc) {
+      answerReceived = true;
+      clearTimeout(offerReadTimeout);
       await firstPc.setRemoteDescription({ type: 'answer', sdp: msg.sdp.sdp });
       // ICE may still be connecting; do NOT claim "WebRTC established" here.
       // The control channel opening is the real signal.
       setStatus('Signaling connected, establishing ICE…', 'connecting');
     } else if (msg.type === 'error') {
+      clearTimeout(offerReadTimeout);
+      showErrorBanner(`信令错误: ${msg.error}`, 'error');
       setStatus(`Signaling error: ${msg.error}`, 'error');
     }
   };
@@ -170,6 +256,7 @@ function joinMesh() {
       setStatus('Signaling connected, negotiating WebRTC…', 'connecting');
       ws.onclose = handleWsClose;
       ws.onerror = handleWsError;
+      startWsHeartbeat();
       resolve();
     };
     ws.onerror = () => reject(new Error('WebSocket error'));
@@ -191,50 +278,78 @@ function joinMesh() {
         sdp: { type: 'offer', sdp: firstPc.localDescription.sdp },
       }));
 
+      // Start read timeout: waiting for the gateway to respond with SDP answer
+      clearTimeout(offerReadTimeout);
+      offerReadTimeout = setTimeout(() => {
+        if (!answerReceived && !joined) {
+          showErrorBanner(
+            '读超时：等待网关响应 answer 超时（服务端响应过慢或处理中）。网络已连通，但网关未及时返回信令应答，请稍后重试。',
+            'read_timeout'
+          );
+          setStatus('网关读超时 (Server 响应慢)', 'error');
+        }
+      }, OFFER_READ_TIMEOUT_MS);
+
       // First-touch node ICE timeout: if the control DataChannel never opens,
       // tell the user what to do instead of hanging forever. Shown in the
       // dedicated banner so later status changes cannot cover it.
       clearTimeout(firstIceTimeout);
       firstIceTimeout = setTimeout(() => {
         if (!controlChannel || controlChannel.readyState !== 'open') {
-          showFirstNodeError(
-            'Timed out waiting for the WebRTC connection to the first node. ' +
-            'This node may be behind a strict NAT. Configure a TURN server in the gateway ' +
-            'config (ice_servers) or try another node address from node_list.');
-          setStatus('First node ICE timed out', 'error');
-          showRetry();
+          showErrorBanner(
+            'WebRTC P2P 建连耗时过长（弱网高延迟或丢包）。若网络波动已恢复请点击“重试连接”，如处于对称 NAT 环境可配置 TURN 中继。',
+            'ice_timeout'
+          );
+          setStatus('P2P 握手超时', 'error');
         }
       }, ICE_CONNECT_TIMEOUT_MS);
     } catch (e) {
+      showErrorBanner(`连接网关失败: ${e.message}`, 'error');
       setStatus(`Failed to join the mesh: ${e.message}`, 'error');
-      showRetry();
     }
   })();
 }
 
 function handleWsClose() {
+  stopWsHeartbeat();
+  if (isHeartbeatTimeout) {
+    // Already reported with heartbeat timeout guidance
+    return;
+  }
   if (joined) {
     // The signaling WebSocket only establishes the first-touch WebRTC session;
     // after hello_ack the mesh runs over DataChannels. A closed signaling
     // socket is not an error once we have joined.
     setStatus('Signaling closed — mesh active over WebRTC', 'connecting');
   } else {
-    setStatus('Signaling closed', 'error');
-    showRetry();
+    showErrorBanner(
+      '信令连接已断开，请检查网络或点击“重试连接”。',
+      'ws_close'
+    );
+    setStatus('信令已断开', 'error');
   }
 }
 
 function handleWsError() {
+  stopWsHeartbeat();
+  if (isHeartbeatTimeout) return;
   if (!joined) {
-    setStatus('Signaling error', 'error');
-    showRetry();
+    showErrorBanner(
+      '信令连接发生错误。网络可能中断或不可达。',
+      'ws_error'
+    );
+    setStatus('信令错误', 'error');
   }
 }
 
 async function reconnect() {
   hideRetry();
-  hideFirstNodeError();
+  hideErrorBanner();
   clearTimeout(firstIceTimeout);
+  clearTimeout(offerReadTimeout);
+  stopWsHeartbeat();
+  isHeartbeatTimeout = false;
+  answerReceived = false;
 
   // Tear down the old signaling/session objects so joinMesh starts clean.
   if (ws) {
@@ -269,7 +384,7 @@ function onControlOpen() {
   setStatus('WebRTC established', 'online');
   // ICE jitter recovered: the first-touch DataChannel is open, so any earlier
   // first-node ICE banner is stale and must disappear automatically.
-  hideFirstNodeError();
+  hideErrorBanner();
   sendJson(controlChannel, { type: 'hello', peer_id: peerId, name: 'browser' });
 }
 
@@ -524,6 +639,15 @@ $('ssh-connect').onclick = () => {
   });
 };
 
-$('retry-btn').onclick = () => reconnect();
+if ($('retry-btn')) $('retry-btn').onclick = () => reconnect();
+if ($('banner-retry-btn')) $('banner-retry-btn').onclick = () => reconnect();
+if ($('error-close-btn')) $('error-close-btn').onclick = () => hideErrorBanner();
+if ($('banner-back-btn')) $('banner-back-btn').onclick = () => {
+  hideErrorBanner();
+  const termCard = $('terminal-card');
+  if (termCard) termCard.hidden = true;
+  const nodesCard = $('nodes-card');
+  if (nodesCard) nodesCard.hidden = false;
+};
 
 init();
