@@ -125,7 +125,16 @@ pub fn run(args: &[String]) -> Outcome {
 
     let bindings_before = Bindings::current(&repo);
     let mut envelope = with_budget(base, &request);
-    envelope.snapshot = Some(bindings_before.to_json());
+    // MODULE.md 冻结的 snapshot 含 workspace_root，而 Bindings 不含该字段：
+    // 在此显式补齐，避免"契约声明了、输出里没有"。
+    let mut snapshot = bindings_before.to_json();
+    if let Some(obj) = snapshot.as_object_mut() {
+        obj.insert(
+            "workspace_root".to_string(),
+            json!(request.budget.workspace_scope),
+        );
+    }
+    envelope.snapshot = Some(snapshot);
 
     let started = Instant::now();
     let binary = match provider::resolve_binary(request.provider_override.as_deref()) {
@@ -144,11 +153,15 @@ pub fn run(args: &[String]) -> Outcome {
         Err(e) => {
             envelope.provider = Some(ProviderMeta {
                 kind: "rust-analyzer".to_string(),
+                binary: binary.to_string_lossy().replace('\\', "/"),
                 version,
                 ready: false,
                 restart_count: 0,
+                restart_reason: String::new(),
                 duration_ms: started.elapsed().as_millis(),
                 write_requests_refused: 0,
+                server_requests_unhandled: 0,
+                dropped_notifications: 0,
             });
             return fail(&envelope, &e);
         }
@@ -376,9 +389,32 @@ fn take_option_arg(args: &[String], index: &mut usize, name: &str) -> Result<Str
 }
 
 fn parse_usize(raw: &str, name: &str) -> Result<usize, Failure> {
-    raw.parse::<usize>().map_err(|e| {
-        CodeIntelError::QueryInvalid.with_reason(format!("{name} 需要非负整数，收到 {raw}：{e}"))
-    })
+    let value = raw.parse::<usize>().map_err(|e| {
+        CodeIntelError::QueryInvalid.with_reason(format!("{name} 需要整数，收到 {raw}：{e}"))
+    })?;
+    if value == 0 {
+        // 0 会让每个请求立即超时 / 返回 0 条结果，属退化输入：显式拒绝。
+        return Err(CodeIntelError::QueryInvalid.with_reason(format!("{name} 必须 >= 1，收到 0")));
+    }
+    Ok(value)
+}
+
+/// 查询目标必须落在 `--workspace` 内（提案 §14：语言服务器的工作目录边界）。
+fn validate_target(request: &Request) -> Result<(), Failure> {
+    let target = match &request.target {
+        Target::File(path) => path.clone(),
+        Target::Location(loc) => loc.path.clone(),
+        // 符号名形态由 provider 解析，越界结果以 in_scope 标注而非静默丢弃。
+        Target::Query(_) => return Ok(()),
+    };
+    if !crate::env::path_is_within(&target, &request.workspace) {
+        return Err(CodeIntelError::QueryInvalid.with_reason(format!(
+            "查询目标 {} 不在 --workspace {} 范围内",
+            target.display(),
+            request.workspace.display()
+        )));
+    }
+    Ok(())
 }
 
 /// `--workspace` 必须是仓库内的目录；provider 的 cwd 也限制在其中（提案 §14）。
@@ -389,6 +425,7 @@ fn validate_scope(repo: &Repo, request: &Request) -> Result<(), Failure> {
             request.workspace.display()
         )));
     }
+    validate_target(request)?;
     if !crate::env::path_is_within(&request.workspace, &repo.root) {
         return Err(CodeIntelError::WorkspaceUnresolved.with_reason(format!(
             "workspace 根超出仓库范围：{}",
@@ -499,8 +536,13 @@ fn apply_budget(items: Vec<Value>, budget: &mut Budget) -> (Vec<Value>, usize, O
             break;
         }
         let size = serde_json::to_string(&item).map(|s| s.len()).unwrap_or(0);
-        if !kept.is_empty() && bytes + size > budget.max_result_bytes {
+        if bytes + size > budget.max_result_bytes {
+            // 即使第一条就超字节预算，也要保留它（否则 Agent 拿到空列表却以为
+            // "确实只有这么多"），但必须把 truncated 立起来。
             byte_capped = true;
+            if kept.is_empty() {
+                kept.push(item);
+            }
             break;
         }
         bytes += size;
@@ -613,7 +655,7 @@ mod tests {
             "many".to_string(),
         ]);
         assert_eq!(verdict, "FAIL");
-        assert!(msg.contains("非负整数"), "{msg}");
+        assert!(msg.contains("需要整数"), "{msg}");
     }
 
     #[test]

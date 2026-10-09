@@ -53,11 +53,15 @@ options（全部可选，缺省即预算默认值）：
 扩展字段（`code` 全部命令统一）：
 
 ```text
-results            语言中立结果数组（symbol/kind/kind_id/qualified_name/path/range/snippet）
+results            语言中立结果数组（symbol/kind/kind_id/qualified_name/path/in_scope/range/snippet）
 count              截断前的完整命中数
 budget             {max_results,max_snippet_lines,max_result_bytes,workspace_scope,truncated}
 continuation       截断时 {refinement_hint}（未截断则省略）
-provider           {kind,version,ready,restart_count,duration_ms}
+provider           {kind,binary,version,ready,restart_count,restart_reason,
+                      duration_ms,write_requests_refused,server_requests_unhandled,
+                      dropped_notifications}
+                   kind 是适配器标识，binary 是实际解析到的可执行文件（两者可对照
+                   发现错配）；三类计数彼此分离，"未识别请求"不得污染写拒绝计数
 snapshot           {source_revision,working_tree_digest,target_triple,toolchain_version,workspace_root}
 authority          恒为 "advisory"：Code Intelligence 不拥有最终 PASS
 error              失败时 {code,reason}
@@ -120,7 +124,11 @@ SYMBOL_NOT_FOUND RESULT_TRUNCATED TIMEOUT PROVIDER_CRASHED SNAPSHOT_STALE UNSUPP
 - Code Intelligence 只读不变量：客户端只允许发送白名单内的 LSP 方法（`workspace/symbol`、`textDocument/{documentSymbol,hover,definition,typeDefinition,implementation,references,prepareCallHierarchy,diagnostic}`、`callHierarchy/{incomingCalls,outgoingCalls}`）；`rename`、`workspace/applyEdit`、`codeAction` 自动应用、`workspace/willSaveWaitUntil`、格式化写入、任意 `workspace/executeCommand` 一律拒绝并返回 `UNSUPPORTED`。
 - provider 子进程 command/args 不接受模型或调用方拼接的任意 shell 参数（`--provider-binary` 只接受单个可执行文件名或路径，按 `split_whitespace` 之前的整串传入，不经 shell）。
 - `code` 结果必须绑定 `snapshot`（source_revision + working_tree_digest + target + toolchain + workspace root）；查询完成前后 digest 不一致时返回 `SNAPSHOT_STALE`。
-- 命中超过预算时必须 `budget.truncated = true` 并给出 `continuation.refinement_hint`；禁止静默丢弃结果后宣称完整。
+- 命中超过预算时必须 `budget.truncated = true` 并给出 `continuation.refinement_hint`；禁止静默丢弃结果后宣称完整。字节预算与条数预算同等生效：单条结果自身超过 `max_result_bytes` 时保留它但仍置 `truncated = true`。
+- Code Intelligence 的时间语义属契约面（不是实现细节）：rust-analyzer 的 workspace 加载是多阶段的，就绪只认"`\$/progress` begin/end 收敛且静默 ≥ 1.5s"（`Completed`）。**只有 `Completed` 允许把空结果当作答案**；server 从不上报进度的静默、以及预算耗尽，两者下的空结果一律 `BLOCKED` + `error.code = TIMEOUT`、`provider.ready = false`。把"还没索引完"说成"确实没有引用"即提案 §12 禁止的伪 PASS。didOpen 后另有 15s 空结果重试窗口（文件级分析需要时间）。
+- provider 的构建副作用：rust-analyzer 在 didOpen 后默认跑 flycheck（`cargo check`）；其产物经 `CARGO_TARGET_DIR=<temp>/nexus-code-intel-<workspace 哈希>` 重定向到**仓库外**，被查 workspace 内不留构建产物。不改业务源码，但确有磁盘写入，故在此披露。
+- 数值型选项（`--max-results` / `--max-snippet-lines` / `--max-result-bytes` / `--timeout-secs` / `--ready-timeout-secs`）必须 ≥ 1，0 属退化输入 → `QUERY_INVALID`。
+- `provider.kind` 是适配器标识、`provider.binary` 是实际解析到的可执行文件，两者分开以便发现错配；`write_requests_refused`（applyEdit/executeCommand 拒绝）与 `server_requests_unhandled`（未识别请求）、`dropped_notifications`（缓冲溢出丢弃）三个计数彼此独立，不得合并。
 - `code` 永远不产出最终 PASS：`authority` 恒为 `"advisory"`，correctness 仍由 `cargo check/clippy/test` 与 verify Evidence 决定。
 
 ## Side Effects

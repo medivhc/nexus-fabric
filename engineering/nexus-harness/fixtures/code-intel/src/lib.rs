@@ -8,8 +8,8 @@ mod transport;
 /// re-export：验证 Agent 经公开路径查询时 `definition` 能穿透到真实声明处。
 pub use transport::{Egress, RelayEgress, TcpEgress, UdpEgress};
 
-/// 就绪探针：`nexus-harness code` 的 provider 在响应查询前等待该 symbol 可见，
-/// 以此判定 rust-analyzer 已完成 workspace 加载（不依赖 RA 私有的状态字符串）。
+/// 常量探针：夹具自身的存在性断言用（provider 的就绪判定走 `$/progress`
+/// 收敛，不依赖查这个符号）。
 pub const PROBE_READY: &str = "CodeIntelFixtureProbe";
 
 /// 结构体方法：hover / definition 的单点锚。
@@ -32,7 +32,7 @@ impl Scheduler {
     }
 }
 
-/// 泛型入口：验证 `typeDefinition` / generic 参数的 resolution。
+/// 泛型入口：验证泛型静态分派下的 definition / references。
 pub fn run_static<E: Egress>(egress: &E, payload: &[u8]) -> usize {
     transport::dispatch(egress, payload).unwrap_or(0)
 }

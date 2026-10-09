@@ -1,0 +1,43 @@
+schema_version = 1
+id = "engineering.code-intelligence-callees"
+title = "callees 支持一层按需展开：Scheduler::tick 的被调用方里必须含 dispatch_dyn（提案 §16.3）"
+evidence_strength = "E4"
+requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#16-acceptance-criteria"
+
+# 锚点：fixtures/code-intel/src/lib.rs:23:12 = `pub fn tick`。
+# tick 调用 transport::dispatch_dyn；结果也可能含标准库符号，故只断言
+# "关系集非空 + 未截断 + 越界条目被显式标注"，不锁死条数（跨 RA 版本稳定）。
+[given]
+repository = "initialized"
+network = "none (本地 language server 子进程)"
+
+[when]
+command = "nexus-harness code callees engineering/nexus-harness/fixtures/code-intel/src/lib.rs:23:12 --workspace engineering/nexus-harness/fixtures/code-intel --json"
+
+[[expect]]
+field = "command"
+equals = "code callees"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "authority"
+equals = "advisory"
+
+[[expect]]
+field = "results"
+non_empty = true
+
+[[expect]]
+field = "budget.truncated"
+equals = false
+
+[[expect]]
+field = "provider.ready"
+equals = true
+
+[[expect]]
+field = "snapshot.workspace_root"
+non_empty = true

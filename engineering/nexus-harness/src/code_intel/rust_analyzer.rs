@@ -38,6 +38,8 @@ type LspRange = (usize, usize, usize, usize);
 struct ResolvedSite {
     abs_path: PathBuf,
     range: LspRange,
+    /// 是否落在本次 --workspace 范围内（越界条目保留但标注，不静默丢弃）。
+    in_scope: bool,
 }
 
 pub struct RustAnalyzerProvider {
@@ -54,6 +56,11 @@ pub struct RustAnalyzerProvider {
     tracker: ReadinessTracker,
     /// ready 预算已耗尽仍未收敛（使 Pending 定格为 TimedOut）。
     budget_exhausted: bool,
+    /// language server 的构建副作用（flycheck 产物）落点：**仓库外**的临时目录。
+    /// rust-analyzer 在 didOpen 后默认会跑 `cargo check`，若放任不管会在夹具/被查
+    /// workspace 里生成 target/ 产物 —— 不改业务源码，但确有磁盘副作用，故显式
+    /// 重定向并在 MODULE.md Side Effects 里披露（独立 Review round 1 阻塞项）。
+    scratch_target: PathBuf,
     /// 缓存的 publishDiagnostics（pull 不可用时的兜底）。
     published: Vec<Value>,
 }
@@ -89,24 +96,46 @@ impl RustAnalyzerProvider {
             symbols: HashMap::new(),
             meta: ProviderMeta {
                 kind: "rust-analyzer".to_string(),
+                binary: binary.to_string_lossy().replace('\\', "/"),
                 version: version.to_string(),
                 ready: false,
                 restart_count: 0,
+                restart_reason: String::new(),
                 duration_ms: 0,
                 write_requests_refused: 0,
+                server_requests_unhandled: 0,
+                dropped_notifications: 0,
             },
             timeouts,
             // connect() 前尚未就绪；保守值使空结果被判不可信。
             budget_exhausted: false,
             tracker: ReadinessTracker::new(),
+            scratch_target: scratch_dir_for(workspace_root),
             published: Vec::new(),
         };
         provider.connect()?;
         Ok(provider)
     }
 
+    /// flycheck 产物引导目录：仓库外的稳定临时路径（同一 workspace 复用，
+    /// 不同 workspace 不互相污染）。
+    fn ensure_scratch_target(&self) -> Result<(), Failure> {
+        std::fs::create_dir_all(&self.scratch_target).map_err(|e| {
+            CodeIntelError::WorkspaceUnresolved.with_reason(format!(
+                "无法创建 language server 的构建产物隔离目录 {}：{e}",
+                self.scratch_target.display()
+            ))
+        })
+    }
+
     fn connect(&mut self) -> Result<(), Failure> {
-        let mut session = LspSession::spawn(&self.binary, &self.workspace_root)?;
+        self.ensure_scratch_target()?;
+        let scratch = self.scratch_target.to_string_lossy().replace('\\', "/");
+        let mut session = LspSession::spawn(
+            &self.binary,
+            &self.workspace_root,
+            &[("CARGO_TARGET_DIR", scratch.as_ref())],
+        )?;
         let params = initialize_params(&self.workspace_root);
         // initialize 本身可能触发 cargo metadata / sysroot 探测，给到 ready 预算。
         session
@@ -188,55 +217,81 @@ impl RustAnalyzerProvider {
     }
 
     /// 空结果只有在就绪收敛后才可当作答案；否则显式 BLOCKED（提案 §12：
-    /// 不得把"尚未索引"伪装成"没有命中"）。
+    /// 不得把"尚未索引"伪装成"没有命中"）。用 `TIMEOUT` 而不是
+    /// `INITIALIZATION_FAILED`：前者意味着"加大预算可能出结果"，后者意味着
+    /// "重启也无望"，调用方的 Retry/Abort 决策不同。
     pub fn empty_is_trustworthy(&self, what: &str) -> Result<(), Failure> {
         if self.readiness().trustworthy() {
             return Ok(());
         }
-        Err(CodeIntelError::InitializationFailed.with_reason(format!(
-            "{what} 返回空结果，但 provider 在预算内未收敛（rust-analyzer 可能仍在加载 workspace）；不能据此判定无命中"
+        Err(CodeIntelError::Timeout.with_reason(format!(
+            "{what} 返回空结果，但 provider 在 {}s 就绪预算内未收敛（rust-analyzer 可能仍在加载 workspace）；不能据此判定无命中",
+            self.timeouts.ready.as_secs()
         )))
     }
 
-    /// 只读请求 + 崩溃重启一次（提案 §6/§14：crash 可重启但必须记录）。
-    fn guarded_request(&mut self, method: &str, params: Value) -> Result<Value, Failure> {
-        let first = match self.session.as_mut() {
-            Some(s) => s.request(method, params.clone(), self.timeouts.request),
-            None => {
-                self.connect()?;
-                self.session.as_mut().expect("connect 建立了会话").request(
-                    method,
-                    params.clone(),
-                    self.timeouts.request,
-                )
-            }
-        };
-        match first {
-            Ok(value) => Ok(value),
-            Err(err)
-                if err.code == CodeIntelError::ProviderCrashed && self.meta.restart_count == 0 =>
-            {
-                self.meta.restart_count = 1;
-                if let Some(mut session) = self.session.take() {
-                    session.close_quietly();
-                }
-                self.opened.clear();
-                self.symbols.clear();
-                self.connect()?;
-                let session = self.session.as_mut().expect("重连建立了会话");
-                session
-                    .request(method, params, self.timeouts.request)
-                    .map_err(|retry| {
-                        CodeIntelError::ProviderCrashed.with_reason(format!(
-                            "重启后仍失败（首次原因：{}）：{}",
-                            err.reason, retry.reason
-                        ))
-                    })
-            }
-            Err(err) => Err(err),
+    /// 取会话；没有则建立。会话缺失一律走类型化错误，不用 `expect`：
+    /// `connect()` 成功却没装上会话只可能是内部一致性错误。
+    fn session_mut(&mut self) -> Result<&mut LspSession, Failure> {
+        if self.session.is_none() {
+            self.connect()?;
+        }
+        self.session.as_mut().ok_or_else(|| {
+            CodeIntelError::InitializationFailed
+                .with_reason("connect() 返回 Ok 但未持有会话（内部一致性检查失败）".to_string())
+        })
+    }
+
+    /// request / notify 的统一执行入口（`notify` 走 `Value::Null` 占位返回值）。
+    fn run_on(
+        session: &mut LspSession,
+        method: &str,
+        params: &Value,
+        notify: bool,
+        timeout: std::time::Duration,
+    ) -> Result<Value, Failure> {
+        if notify {
+            session.notify(method, params.clone()).map(|()| Value::Null)
+        } else {
+            session.request(method, params.clone(), timeout)
         }
     }
 
+    /// 只读请求 + 崩溃重启（提案 §6/§14：crash 可重启但必须记录）。
+    /// 重启计数累加、保留**首次**崩溃原因，最多重启 2 次。
+    fn invoke(&mut self, method: &str, params: Value, notify: bool) -> Result<Value, Failure> {
+        let timeout = self.timeouts.request;
+        let first = Self::run_on(self.session_mut()?, method, &params, notify, timeout);
+        let err = match first {
+            Ok(value) => return Ok(value),
+            Err(err) => err,
+        };
+        if err.code != CodeIntelError::ProviderCrashed || self.meta.restart_count >= 2 {
+            return Err(err);
+        }
+        self.meta.restart_count += 1;
+        if self.meta.restart_reason.is_empty() {
+            let kind = if notify { "notify" } else { "request" };
+            self.meta.restart_reason = format!("{kind} {method}: {}", err.reason);
+        }
+        if let Some(mut session) = self.session.take() {
+            session.close_quietly();
+        }
+        self.opened.clear();
+        self.symbols.clear();
+        self.connect()?;
+        let session = self.session_mut()?;
+        Self::run_on(session, method, &params, notify, timeout).map_err(|retry| {
+            CodeIntelError::ProviderCrashed.with_reason(format!(
+                "重启后仍失败（首次原因：{}）：{}",
+                err.reason, retry.reason
+            ))
+        })
+    }
+
+    fn guarded_request(&mut self, method: &str, params: Value) -> Result<Value, Failure> {
+        self.invoke(method, params, false)
+    }
     fn ensure_open(&mut self, path: &Path) -> Result<String, Failure> {
         if let Some(uri) = self.opened.get(path) {
             return Ok(uri.clone());
@@ -261,35 +316,7 @@ impl RustAnalyzerProvider {
     }
 
     fn guarded_request_notify(&mut self, method: &str, params: Value) -> Result<(), Failure> {
-        let first = match self.session.as_mut() {
-            Some(s) => s.notify(method, params.clone()),
-            None => {
-                self.connect()?;
-                self.session
-                    .as_mut()
-                    .expect("connect 建立了会话")
-                    .notify(method, params.clone())
-            }
-        };
-        match first {
-            Ok(()) => Ok(()),
-            Err(err)
-                if err.code == CodeIntelError::ProviderCrashed && self.meta.restart_count == 0 =>
-            {
-                self.meta.restart_count = 1;
-                if let Some(mut session) = self.session.take() {
-                    session.close_quietly();
-                }
-                self.opened.clear();
-                self.symbols.clear();
-                self.connect()?;
-                self.session
-                    .as_mut()
-                    .expect("重连建立了会话")
-                    .notify(method, params)
-            }
-            Err(err) => Err(err),
-        }
+        self.invoke(method, params, true).map(|_| ())
     }
 
     /// 拉取并缓存某文件的 documentSymbol，用于把 LSP `Location` 补成
@@ -379,6 +406,7 @@ impl RustAnalyzerProvider {
             kind_id,
             qualified_name: qualified,
             path: rel,
+            in_scope: site.in_scope,
             range: Some(crate::code_intel::dto::PositionRange {
                 start_line: site.range.0,
                 start_column: site.range.1,
@@ -391,9 +419,17 @@ impl RustAnalyzerProvider {
 
     /// 结束前取元数据，并把会话内累计的写请求拒绝计数并入。
     pub fn finish_meta(&mut self) -> ProviderMeta {
-        let refused = self.session.as_ref().map_or(0, |s| s.refused_writes);
+        let (refused, unhandled) = self
+            .session
+            .as_ref()
+            .map_or((0, 0), |s| (s.refused_writes, s.unhandled_requests));
         let mut meta = self.meta().clone();
         meta.write_requests_refused = refused;
+        meta.server_requests_unhandled = unhandled;
+        meta.dropped_notifications = self
+            .session
+            .as_ref()
+            .map_or(0, LspSession::dropped_notifications);
         meta.ready = self.readiness().trustworthy();
         meta
     }
@@ -428,6 +464,7 @@ impl RustAnalyzerProvider {
             .unwrap_or("")
             .to_string();
         let site = ResolvedSite {
+            in_scope: crate::env::path_is_within(&abs, &self.workspace_root),
             abs_path: abs,
             range,
         };
@@ -539,6 +576,7 @@ impl CodeIntelligenceProvider for RustAnalyzerProvider {
                 kind_id: i64::from(kind),
                 qualified_name: qualified,
                 path: rel,
+                in_scope: crate::env::path_is_within(&abs, &self.workspace_root),
                 range: Some(crate::code_intel::dto::PositionRange {
                     start_line: range.0,
                     start_column: range.1,
@@ -689,6 +727,7 @@ impl CodeIntelligenceProvider for RustAnalyzerProvider {
             kind_id,
             qualified_name: qualified,
             path: relative_path(&self.repo_root, &abs),
+            in_scope: crate::env::path_is_within(&abs, &self.workspace_root),
             range: result
                 .get("range")
                 .and_then(lsp_range_of_ref)
@@ -720,8 +759,9 @@ impl CodeIntelligenceProvider for RustAnalyzerProvider {
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default(),
-            Err(_) => {
-                // 兜底：使用 didOpen 后收到的 publishDiagnostics 通知。
+            // 只有"server 不支持 pull diagnostics"才允许回落到 publishDiagnostics；
+            // TIMEOUT / CRASHED 等必须原样上报，否则就是把失败说成"没有诊断"。
+            Err(err) if err.code == CodeIntelError::Unsupported => {
                 self.pump_published();
                 self.published
                     .iter()
@@ -730,6 +770,7 @@ impl CodeIntelligenceProvider for RustAnalyzerProvider {
                     .flatten()
                     .collect()
             }
+            Err(err) => return Err(err),
         };
         // 诊断条数不在这里裁剪（CLI 层统一按预算裁剪并标记 truncated）。
         Ok(items
@@ -922,23 +963,24 @@ impl ReadinessTracker {
     }
 }
 
-/// 就绪状态：只有"进度全部收敛"或"server 完全不上报进度且静默"时，空结果
-/// 才可相信；否则必须显式 BLOCKED 而不是伪 PASS（提案 §12）。
+/// 就绪状态。**只有 `Completed` 允许把空结果当作答案**：其余状态下"没查到"与
+/// "还没加载完"无法区分，据其产出 PASS 就是提案 §12 禁止的伪 PASS
+/// （独立 Review round 1 用永不上报进度的假 server 复现过 `Quiet` 的问题）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Readiness {
     /// 至少一组 progress 收敛且已静默（workspace 加载/索引完成）。
     Completed,
-    /// server 从不上报 progress，且静默超过阈值。
+    /// server 从不上报 progress 且静默超过阈值：状态未知，**不可信**。
     Quiet,
     /// 还没有结论（继续等或重试查询）。
     Pending,
-    /// 预算耗尽仍未收敛。
+    /// 预算耗尽仍未收敛，**不可信**。
     TimedOut,
 }
 
 impl Readiness {
     const fn trustworthy(self) -> bool {
-        matches!(self, Self::Completed | Self::Quiet)
+        matches!(self, Self::Completed)
     }
 }
 
@@ -1013,11 +1055,12 @@ fn location_pair(value: &Value) -> Option<(String, LspRange)> {
 /// 把 definition/implementation/references 的各种返回形状归一为站点列表。
 ///
 /// 支持：`null`、`Location`、`Location[]`、`LocationLink`、`LocationLink[]`。
-fn sites_from_value(result: &Value, _workspace_root: &Path) -> Vec<ResolvedSite> {
+fn sites_from_value(result: &Value, workspace_root: &Path) -> Vec<ResolvedSite> {
     let mut out: Vec<ResolvedSite> = Vec::new();
     let mut push = |uri: &str, range: LspRange| {
         let abs = PathBuf::from(uri_to_path(uri));
         let site = ResolvedSite {
+            in_scope: crate::env::path_is_within(&abs, workspace_root),
             abs_path: abs,
             range,
         };
@@ -1161,6 +1204,17 @@ fn hover_text(result: &Value) -> String {
     }
 }
 
+/// flycheck 产物隔离目录：temp 下按 workspace 路径哈希分桶，避免不同仓库互污。
+fn scratch_dir_for(workspace: &Path) -> PathBuf {
+    let key = workspace.to_string_lossy().replace(['\\', '/'], "_");
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    std::env::temp_dir().join(format!("nexus-code-intel-{hash:016x}"))
+}
+
 fn absolute(path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
@@ -1281,7 +1335,10 @@ mod tests {
     #[test]
     fn only_converged_readiness_makes_empty_results_trustworthy() {
         assert!(Readiness::Completed.trustworthy());
-        assert!(Readiness::Quiet.trustworthy());
+        assert!(
+            !Readiness::Quiet.trustworthy(),
+            "server 不上报进度时的静默不得被当作可信答案（§12）"
+        );
         assert!(
             !Readiness::Pending.trustworthy(),
             "还没收敛时的空结果必须不可信"

@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -60,6 +60,35 @@ pub fn assert_read_only(method: &str) -> Result<(), Failure> {
         Err(CodeIntelError::Unsupported.with_reason(format!(
             "method {method} 不在 Code Intelligence 只读白名单内（provider 无写能力）"
         )))
+    }
+}
+
+/// server→client 请求的归类（决定计数进哪个信号）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerRequest {
+    /// 写能力请求：拒绝执行。
+    WriteRefused,
+    /// 只读流程需要的良性应答（进度创建、配置读取、能力注册）。
+    Benign,
+    /// 未识别请求：回 `null` 避免 server 阻塞，但**不**计入写拒绝。
+    Unhandled,
+}
+
+/// 对 server→client 请求的纯决策函数（拆出来才能被单元测试覆盖）。
+pub fn server_request_decision(method: &str, configuration_items: usize) -> (Value, ServerRequest) {
+    match method {
+        "workspace/applyEdit" | "workspace/executeCommand" => (
+            json!({"applied": false, "refused": "read-only code intelligence provider"}),
+            ServerRequest::WriteRefused,
+        ),
+        "window/workDoneProgress/create"
+        | "client/registerCapability"
+        | "workspace/codeLens/refresh" => (Value::Null, ServerRequest::Benign),
+        "workspace/configuration" => (
+            Value::Array(vec![Value::Null; configuration_items]),
+            ServerRequest::Benign,
+        ),
+        _ => (Value::Null, ServerRequest::Unhandled),
     }
 }
 
@@ -147,29 +176,54 @@ pub struct LspSession {
     stdin: ChildStdin,
     reader: Option<JoinHandle<()>>,
     responses: Receiver<Value>,
-    notifications: Receiver<Value>,
+    /// 有界 notification 缓冲（读线程只入队，绝不无上限堆积）。
+    notifications: Arc<Mutex<NoteBuffer>>,
     server_requests: Receiver<Value>,
     stderr: Arc<Mutex<StderrRing>>,
     next_id: i64,
-    /// 被拒绝的写请求计数（`workspace/applyEdit` 等）。
+    /// 被拒绝执行的**写能力**请求计数（applyEdit / executeCommand）。
     pub refused_writes: usize,
+    /// 未识别的 server→client 请求计数；与写能力分开，否则正常只读查询
+    /// 也会让 refused 恒为非 0，只读信号失真。
+    pub unhandled_requests: usize,
+}
+
+/// notification 缓冲上限：读线程不能无上限堆积（RA 索引期会刷屏
+/// publishDiagnostics），也不能反过来阻塞读线程（会让 server 卡在写 stdout）。
+const NOTIFICATION_CAP: usize = 256;
+
+/// 一条 notification + 是否因超容被丢弃过。
+#[derive(Default)]
+struct NoteBuffer {
+    queue: std::collections::VecDeque<Value>,
+    dropped: usize,
 }
 
 impl LspSession {
     /// 启动 language server（不经 shell；cwd 限制在 workspace 根内）。
-    pub fn spawn(binary: &Path, cwd: &Path) -> Result<LspSession, Failure> {
-        let mut child = Command::new(binary)
+    ///
+    /// `extra_env` 用于把 server 的构建副作用（flycheck 产物）引导到仓库外，
+    /// 见 `RustAnalyzerProvider::connect`。
+    pub fn spawn(
+        binary: &Path,
+        cwd: &Path,
+        extra_env: &[(&str, &str)],
+    ) -> Result<LspSession, Failure> {
+        let mut command = Command::new(binary);
+        command
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                CodeIntelError::ProviderUnavailable.with_reason(format!(
-                    "cannot spawn language server {}: {e}",
-                    binary.display()
-                ))
-            })?;
+            .stderr(Stdio::piped());
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().map_err(|e| {
+            CodeIntelError::ProviderUnavailable.with_reason(format!(
+                "cannot spawn language server {}: {e}",
+                binary.display()
+            ))
+        })?;
 
         let stdin = child
             .stdin
@@ -185,12 +239,12 @@ impl LspSession {
             .ok_or_else(|| protocol_failure("provider stderr unavailable".to_string()))?;
 
         let (rtx, rrx) = mpsc::channel::<Value>();
-        let (ntx, nrx) = mpsc::channel::<Value>();
+        let notes: Arc<Mutex<NoteBuffer>> = Arc::new(Mutex::new(NoteBuffer::default()));
         let (srx_tx, srx) = mpsc::channel::<Value>();
         let ring = Arc::new(Mutex::new(StderrRing::default()));
 
         let reader = {
-            let ring_err = Arc::clone(&ring);
+            let note_sink = Arc::clone(&notes);
             std::thread::Builder::new()
                 .name("nexus-code-intel-reader".to_string())
                 .spawn(move || {
@@ -199,11 +253,21 @@ impl LspSession {
                     while let Ok(msg) = read_frame(&mut br) {
                         let has_method = msg.get("method").is_some();
                         let has_id = msg.get("id").is_some();
+                        if has_method && !has_id {
+                            // notification：有界入队，溢出丢最旧的并计数（不阻塞读线程）。
+                            if let Ok(mut guard) = note_sink.lock() {
+                                if guard.queue.len() >= NOTIFICATION_CAP {
+                                    guard.queue.pop_front();
+                                    guard.dropped += 1;
+                                }
+                                guard.queue.push_back(msg);
+                            }
+                            continue;
+                        }
                         let target: Option<&Sender<Value>> = match (has_method, has_id) {
                             (true, true) => Some(&srx_tx),
-                            (true, false) => Some(&ntx),
                             (false, true) => Some(&rtx),
-                            (false, false) => None,
+                            _ => None,
                         };
                         if let Some(tx) = target {
                             if tx.send(msg).is_err() {
@@ -211,7 +275,6 @@ impl LspSession {
                             }
                         }
                     }
-                    let _ = ring_err;
                 })
                 .map_err(|e| protocol_failure(format!("reader thread spawn failed: {e}")))?
         };
@@ -247,11 +310,12 @@ impl LspSession {
             stdin,
             reader: Some(reader),
             responses: rrx,
-            notifications: nrx,
+            notifications: Arc::clone(&notes),
             server_requests: srx,
             stderr: ring,
             next_id: 0,
             refused_writes: 0,
+            unhandled_requests: 0,
         })
     }
 
@@ -294,6 +358,13 @@ impl LspSession {
                 Ok(msg) => {
                     if msg.get("id").and_then(Value::as_i64) == Some(id) {
                         if let Some(err) = msg.get("error") {
+                            // -32601 MethodNotFound 是能力缺失，不是进程故障：
+                            // 上层据此决定回退路径，绝不能和 crash 混为一谈。
+                            if err.pointer("/code").and_then(Value::as_i64) == Some(-32601) {
+                                return Err(CodeIntelError::Unsupported.with_reason(format!(
+                                    "{method} 不被该 language server 支持: {err}"
+                                )));
+                            }
                             return Err(protocol_failure(format!(
                                 "{method} returned JSON-RPC error: {err}"
                             )));
@@ -320,41 +391,34 @@ impl LspSession {
 
     /// 非阻塞取一条 notification（供 provider 做就绪判定）。
     pub fn try_notification(&mut self) -> Option<Value> {
-        match self.notifications.try_recv() {
-            Ok(v) => Some(v),
-            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => None,
-        }
+        let mut guard = self.notifications.lock().ok()?;
+        guard.queue.pop_front()
+    }
+
+    /// 因超出 `NOTIFICATION_CAP` 被丢弃的 notification 数（可观测性：
+    /// 丢弃必须可见，不能静默）。
+    pub fn dropped_notifications(&self) -> usize {
+        self.notifications.lock().map_or(0, |g| g.dropped)
     }
 
     /// server→client 请求必须由客户端应答，否则 provider 会阻塞。
-    /// 写能力请求（applyEdit）拒绝执行，只记录。
+    /// 计数分两类：写能力拒绝 vs 未识别请求（见 `server_request_decision`）。
     fn pump_server_requests(&mut self) {
         while let Ok(req) = self.server_requests.try_recv() {
             let Some(id) = req.get("id").cloned() else {
                 continue;
             };
             let method = req.get("method").and_then(Value::as_str).unwrap_or("");
-            let result = match method {
-                "workspace/applyEdit" | "workspace/executeCommand" => {
-                    self.refused_writes += 1;
-                    json!({"applied": false, "refused": "read-only code intelligence provider"})
-                }
-                "window/workDoneProgress/create"
-                | "client/registerCapability"
-                | "workspace/codeLens/refresh" => Value::Null,
-                "workspace/configuration" => {
-                    let items = req
-                        .pointer("/params/items")
-                        .and_then(Value::as_array)
-                        .map(|a| a.len())
-                        .unwrap_or(0);
-                    Value::Array(vec![Value::Null; items])
-                }
-                _ => {
-                    self.refused_writes += 1;
-                    Value::Null
-                }
-            };
+            let items = req
+                .pointer("/params/items")
+                .and_then(Value::as_array)
+                .map_or(0, |a| a.len());
+            let (result, kind) = server_request_decision(method, items);
+            match kind {
+                ServerRequest::WriteRefused => self.refused_writes += 1,
+                ServerRequest::Unhandled => self.unhandled_requests += 1,
+                ServerRequest::Benign => {}
+            }
             let _ = self.write_message(&json!({"jsonrpc":"2.0","id":id,"result":result}));
         }
     }
@@ -509,6 +573,34 @@ mod tests {
         // 非协议 / 自造 method 同样被拒（白名单是穷举允许，不是黑名单排除）。
         assert!(assert_read_only("textDefinition").is_err());
         assert!(assert_read_only("rust-analyzer/reloadWorkspace").is_err());
+    }
+
+    #[test]
+    fn server_requests_that_would_mutate_are_refused_and_counted_separately() {
+        // §16.8 的 server→client 侧防线：applyEdit / executeCommand 必须被拒绝执行。
+        for m in ["workspace/applyEdit", "workspace/executeCommand"] {
+            let (result, kind) = super::server_request_decision(m, 0);
+            assert_eq!(kind, super::ServerRequest::WriteRefused, "{m}");
+            assert_eq!(result["applied"], json!(false), "{m} 必须回 applied:false");
+            assert!(result.get("edit").is_none(), "{m} 的回包不能带任何编辑内容");
+        }
+        // 良性应答不计入写拒绝（否则只读查询的 refused 信号恒非 0）。
+        for m in [
+            "window/workDoneProgress/create",
+            "client/registerCapability",
+            "workspace/codeLens/refresh",
+        ] {
+            let (result, kind) = super::server_request_decision(m, 0);
+            assert_eq!(kind, super::ServerRequest::Benign, "{m}");
+            assert_eq!(result, Value::Null, "{m}");
+        }
+        let (config, kind) = super::server_request_decision("workspace/configuration", 3);
+        assert_eq!(kind, super::ServerRequest::Benign);
+        assert_eq!(config, json!([null, null, null]));
+        // 未识别请求（如 showMessageRequest）走 Unhandled，不污染写拒绝计数。
+        let (result, kind) = super::server_request_decision("window/showMessageRequest", 0);
+        assert_eq!(kind, super::ServerRequest::Unhandled);
+        assert_eq!(result, Value::Null);
     }
 
     #[test]

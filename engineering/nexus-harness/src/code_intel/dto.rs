@@ -111,7 +111,8 @@ pub struct PositionRange {
 }
 
 impl PositionRange {
-    pub fn to_json(&self) -> Value {
+    /// `PositionRange` 是 `Copy`：按 clippy 约定 `to_*` 取值接收者。
+    pub fn to_json(self) -> Value {
         json!({
             "start": {"line": self.start_line, "column": self.start_column},
             "end": {"line": self.end_line, "column": self.end_column},
@@ -130,8 +131,11 @@ pub struct ResultItem {
     /// 数值让调用方能自行判断（不假装我们能纠正 server 的语义）。
     pub kind_id: i64,
     pub qualified_name: String,
-    /// 相对仓库根的路径（`/` 分隔）。
+    /// 相对仓库根的路径（`/` 分隔）；仓库外路径保持原样绝对路径。
     pub path: String,
+    /// 该条目是否落在本次 `--workspace` 范围内。越界条目**不删除**（删掉就是
+    /// 静默丢弃），而是标出来让 Agent 自己判断要不要顺着读到 std 源码。
+    pub in_scope: bool,
     pub range: Option<PositionRange>,
     pub snippet: String,
 }
@@ -144,7 +148,8 @@ impl ResultItem {
             "kind_id": self.kind_id,
             "qualified_name": self.qualified_name,
             "path": self.path,
-            "range": self.range.map(|r| r.to_json()).unwrap_or(Value::Null),
+            "in_scope": self.in_scope,
+            "range": self.range.map(PositionRange::to_json).unwrap_or(Value::Null),
             "snippet": self.snippet,
         })
     }
@@ -187,24 +192,38 @@ impl Budget {
 /// provider 元数据（提案 §9：duration + provider metadata）。
 #[derive(Debug, Clone, Default)]
 pub struct ProviderMeta {
+    /// **适配器**标识（如 `rust-analyzer`），与可执行文件解耦：换 binary 不换适配器。
     pub kind: String,
+    /// 实际解析到的可执行文件（`--provider-binary` / env / PATH），便于发现错配。
+    pub binary: String,
     pub version: String,
     pub ready: bool,
     pub restart_count: usize,
+    /// 触发重启的首个错误原因（不丢弃崩溃细节，供 Retry/Abort 判断）。
+    pub restart_reason: String,
     pub duration_ms: u128,
-    /// 被拒绝的 server→client 写请求数量（`workspace/applyEdit` 等）。
+    /// 被拒绝执行的**写能力** server→client 请求（applyEdit / executeCommand）。
     pub write_requests_refused: usize,
+    /// 因超出 notification 缓冲上限而被丢弃的条数（丢弃必须可见）。
+    pub dropped_notifications: usize,
+    /// 未识别的 server→client 请求数；与写能力分开计数，
+    /// 否则正常只读查询也会让 refused 恒为非 0，信号失真。
+    pub server_requests_unhandled: usize,
 }
 
 impl ProviderMeta {
     pub fn to_json(&self) -> Value {
         json!({
             "kind": self.kind,
+            "binary": self.binary,
             "version": self.version,
             "ready": self.ready,
             "restart_count": self.restart_count,
+            "restart_reason": self.restart_reason,
             "duration_ms": self.duration_ms,
             "write_requests_refused": self.write_requests_refused,
+            "server_requests_unhandled": self.server_requests_unhandled,
+            "dropped_notifications": self.dropped_notifications,
         })
     }
 }
