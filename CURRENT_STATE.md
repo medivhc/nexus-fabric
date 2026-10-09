@@ -708,3 +708,142 @@ This is not inherently invalid, but it means the architectural statement “CLI 
 The most important remaining convergence work is to decide which operations are intentionally local administration and which should migrate behind daemon ownership. In particular, N2 `use/session/resource/grant` semantics need an explicit ownership decision; otherwise daemon state and CLI-local state can continue to represent different operational worlds.
 
 For the current-state baseline, the rule is simple: document the route that actually executes today, not the route implied by the top-level architecture comment.
+
+
+## 40. Control-command routing matrix
+
+The current command surface is broader than the daemon API. The following matrix records the actual execution owner rather than the intended unified architecture.
+
+| Command family | Current execution path | Daemon-owned? | Current-state note |
+|---|---|---:|---|
+| status | LocalAPI `/localapi/v0/status` | Yes | observability snapshot |
+| dns status/cache | LocalAPI | Yes | daemon route exists |
+| dns resolve/providers | synthesized UNSUPPORTED in generic CLI path | No | no daemon route |
+| connectivity status | LocalAPI | Yes | daemon route exists |
+| connectivity candidates/probe/links | synthesized UNSUPPORTED | No | no daemon route |
+| plan explain | LocalAPI dynamic query | Yes | older/frozen observability semantics |
+| plan <resource> | `plan_cli` in process | No | local resolve/filter/score preview |
+| session watch via ControlCommand | LocalAPI dynamic query | Yes | frozen observability route |
+| session list/watch/close command family | `session_cli` in process | No | separate N2 operational path |
+| daemon N2 session list/attach | dedicated LocalAPI routes | Yes | reads global daemon SessionManager |
+| use | `use_cli` in process | No | N2 access path |
+| resource | `resource_cli` in process | No | N2 directory/publish path |
+| grant | `grant_cli` in process | No | N2 authorization administration |
+| provider | `provider_cli` foreground process | No | provider admission root |
+| workspace commit | LocalAPI dynamic path | Yes | Linux daemon WorkspaceManager |
+| workspace heads/conflicts/cache | synthesized UNSUPPORTED | No | generic daemon route absent |
+| task/artifact | `task_cli` → versioned task HTTP service | Yes | separate from generic ControlCommand router |
+| task-provider grant | local operator path | No | explicitly rejects remote target |
+| run <resource> | ControlServiceImpl in process | No | LocalAPI absent |
+| run <resource> -- <cmd> | rejected as N3 semantic mismatch | No execution | honest UNSUPPORTED |
+| network up/status | in-process N1 composition | No | foreground composition |
+| subnet/schedule/proxy/system-proxy/autostart | in-process/local | No | specialized command roots |
+| pair/node/config | local filesystem / foreground operations | No | administrative paths |
+
+This table is evidence that `ControlCommand` is a shared vocabulary, not yet a guarantee of one transport or one runtime owner.
+
+## 41. LocalAPI security and protocol boundary
+
+The general LocalAPI and N3 task HTTP share a local listener but are dispatched in layers. `task_http::dispatch` can consume versioned Task requests first; unconsumed requests fall through to the GET-oriented legacy/general router.
+
+Security properties visible in executable code include:
+
+- bearer token authentication on both TCP and Unix local transports;
+- 64-hex-character token persisted in a shared token file;
+- owner-only token permissions on Unix;
+- constant-time token comparison in the general router;
+- Unix socket hardening to 0600;
+- private runtime directory fallback rather than a predictable world-writable temp socket;
+- bounded five-second client/server I/O timeout;
+- fail-closed behavior when safe socket/token setup cannot be established.
+
+The client does not retry and does not use TLS. Its trust model is local transport + bearer token, not remote-network confidentiality.
+
+Windows named-pipe LocalAPI is not implemented in the inspected server path; the Windows socket branch reports UNSUPPORTED and TCP is the practical fallback.
+
+## 42. Configuration load and hot-reload semantics
+
+The daemon watches a fixed configuration set rather than arbitrary directory contents: `daemon.toml`, `network.toml`, `proxy.yaml`, `dns.toml` and `workspace.toml`.
+
+Startup load validates syntax before assembly. Missing files disable the corresponding subsystem rather than being treated as malformed configuration. Important typed daemon settings include TUN enable/name/MTU and QoS settings; TUN MTU is constrained to 1280–9000 and QoS quantum to 64–65536.
+
+The watcher polls every two seconds and is intentionally a reporter, not a shared-state mutator. It sends `ReloadEvent` to the daemon main thread, preserving a single-writer application model.
+
+Three outcomes are explicit:
+
+- `Applied`: valid hot-applicable change;
+- `NeedsRestart`: valid change that requires process reconstruction;
+- `Rejected`: invalid reload; old configuration remains active and daemon does not crash.
+
+File add/remove and LocalAPI address changes require restart. Invalid content is rejected while retaining the old configuration. The watcher updates metadata after a bad edit to avoid repeatedly flooding the same error.
+
+### 42.1 Important hot-reload caveat
+
+A watcher `Applied` event does not by itself prove that every already-running subsystem object has been rebuilt with the new content. The main loop currently logs the applied event; actual mutable-runtime propagation must be checked subsystem by subsystem. Therefore this baseline distinguishes **configuration accepted as hot** from **runtime object demonstrably reconfigured**.
+
+This distinction is especially important for network/proxy/DNS claims: configuration classification and runtime reassembly are separate facts.
+
+## 43. Repository Evidence at the captured branch
+
+The checked-in `.evidence` tree on `docs/current-state-baseline-20261008` is **not** a comprehensive current-revision certification database.
+
+At the inspected branch, the repository-visible `.evidence` root contains only `red-n2-p0-0/`. That directory contains historical RED/transition artifacts such as `RED-EVIDENCE.md`, RED N2 scenario output, old/new run-honesty JSON and a helper script.
+
+This has an important consequence:
+
+> The repository contains a large scenario catalog and an executable Harness evidence mechanism, but the checked-in branch does not contain a complete bound PASS evidence set for all those scenarios at the current revision.
+
+Accordingly, this document must not assign Verified/E4/E5 status merely from scenario filenames, tests in source, comments saying “green”, or historical evidence files.
+
+The absence of committed current evidence also does not prove tests fail; it means the repository snapshot alone cannot certify their current result. Fresh Harness execution is required for that claim.
+
+## 44. Scenario/Evidence gap classification
+
+For current-state documentation, each capability should be classified along two independent axes:
+
+**Implementation axis**
+- Contract only
+- Implemented
+- Wired
+- Production-reachable
+
+**Verification axis**
+- No scenario
+- Scenario-targeted
+- Historical evidence only
+- Current bound evidence PASS
+- Current bound evidence FAIL/UNKNOWN/BLOCKED/STALE
+
+This two-axis model prevents a common false inference in the repository: “implemented + scenario exists = verified”. It also prevents the inverse mistake: “no committed current evidence = feature absent”.
+
+For the captured branch, many major areas are at least Implemented/Scenario-targeted, but a repository-wide Current-bound-evidence-PASS claim is not supported by the checked-in evidence tree.
+
+## 45. High-confidence current architecture findings after the extended audit
+
+The source audit now supports several repository-wide conclusions with substantially higher confidence:
+
+1. There is one intended system-level Core Planner; proxy rules, DNS, path quality, NAT and estimators are supporting decision inputs/mechanisms, not alternative planners.
+2. Session terminal outcome ownership is deliberately centralized inside SessionOwner semantics, but operational ownership is not yet globally centralized in nexusd because CLI-local N2 paths remain.
+3. Fabric connection identity is independent of network locator; path migration and NAT/TURN operate below application Session identity.
+4. N3 durable execution is much more mature than old “pending” MODULE text suggests, particularly on Linux.
+5. N3 recovery prefers unknown/pending verification over inventing a terminal outcome, preserving exactly-once safety.
+6. Cross-platform repository structure exists, but implementation maturity is asymmetric and durable N3 provider authority is Linux-specific.
+7. The daemon is a real composition root for TUN/dataplane/N1/LocalAPI/Workspace/N2 ownership, contradicting its stale introductory “configuration/status only” boundary.
+8. The CLI is not yet a pure thin client; several operational domains still have independent in-process roots.
+9. Configuration acceptance/hot classification is not equivalent to proof of live subsystem reconfiguration.
+10. Scenario coverage is broad, but checked-in Evidence on the captured branch is sparse/historical and cannot certify the entire current tree.
+
+## 46. Remaining work before calling CURRENT_STATE exhaustive
+
+The remaining work is now narrower and measurable:
+
+- enumerate the few workspace members not yet described at implementation-detail level, especially scheduler/measurement/ingress/proxy-config/proxy-transport and diagnostics;
+- trace N1 bridge and dataplane packet classification end-to-end, including degraded counters and actual send/receive ownership;
+- trace Workspace sync transport, FUSE projection, conflict/recovery and remote authority end-to-end;
+- trace N3 task HTTP verbs/versions through service/provider/executor/artifact paths and record exact unsupported branches;
+- run or inspect fresh Harness verification for this branch if a current Verified matrix is required;
+- map host-dependent platform scenarios to required privileges/devices and SKIP/UNKNOWN behavior;
+- verify whether watcher `Applied` changes are actually propagated into live network/proxy/DNS objects or only accepted/logged;
+- reconcile stale top-of-file/module comments against executable behavior and mark/remove obsolete claims in a later documentation-cleanup pass.
+
+At this point, the document is a detailed source-derived implementation baseline. It is not yet a current-revision test certification report; that distinction is intentional.
