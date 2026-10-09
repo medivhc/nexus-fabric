@@ -6,6 +6,7 @@ mod common;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::{Browser, TestSshd};
@@ -15,15 +16,25 @@ use nexus_web_gateway::config::{
 };
 use nexus_web_gateway::protocol::{BrowserMessage, NodeMessage};
 
+static CERT_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// Unique per-test certificate directory (tests run in parallel in one process).
+fn unique_cert_dir(node_id: &str) -> String {
+    let seq = CERT_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir()
+        .join("nexus-web-gateway-test-certs")
+        .join(format!("{node_id}-{}-{seq}", std::process::id()))
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn test_config(
     node_id: &str,
     node_name: &str,
     listen: SocketAddr,
     ssh_target: SocketAddr,
 ) -> GatewayConfig {
-    let cert_dir = std::env::temp_dir()
-        .join("nexus-web-gateway-test-certs")
-        .join(format!("{node_id}-{}", std::process::id()));
+    let cert_dir = unique_cert_dir(node_id);
     let node_list = vec![
         MeshNodeInfo {
             peer_id: "node-a".into(),
@@ -51,7 +62,7 @@ fn test_config(
         tls: TlsConfig::AutoGenerate {
             names: vec!["localhost".into()],
             ips: vec!["127.0.0.1".parse().unwrap()],
-            cert_dir: Some(cert_dir.to_string_lossy().into_owned()),
+            cert_dir: Some(cert_dir),
         },
         ssh: SshConfig {
             target: ssh_target,
@@ -600,6 +611,72 @@ fn reoffer_to_existing_session_returns_error_not_bogus_answer() -> TestResult {
 }
 
 #[test]
+fn two_nodes_reoffer_storm_returns_error() -> TestResult {
+    let mesh = Arc::new(nexus_web_gateway::mesh::InMemoryMeshSignaler::new());
+    let cfg_a = test_config(
+        "node-a",
+        "node-a",
+        "127.0.0.1:0".parse().unwrap(),
+        dead_ssh_target(),
+    );
+    let handle_a = Gateway::start_with_mesh(cfg_a, mesh.clone()).expect("start node-a");
+    let cfg_b = test_config(
+        "node-b",
+        "node-b",
+        "127.0.0.1:0".parse().unwrap(),
+        dead_ssh_target(),
+    );
+    let _handle_b = Gateway::start_with_mesh(cfg_b, mesh).expect("start node-b");
+
+    let mut browser = Browser::connect_first(
+        &handle_a.cert_der,
+        handle_a.local_addr,
+        "node-a",
+        "sess-storm",
+    )
+    .expect("connect first");
+    browser.drive_all(Duration::from_secs(5))?;
+    browser
+        .connect_node("node-b", "node-b")
+        .expect("connect node-b");
+    browser.drive_all(Duration::from_secs(5))?;
+    assert!(browser.peers[1].connected, "node B should be connected");
+
+    // Simulate the old app.js reconnect storm: after node-b's hello_ack the
+    // browser reconnects to node-b with the same session_id and a fresh offer.
+    // The gateway must reject loudly instead of returning a bogus old-mid
+    // answer, and the existing node-b channel must stay healthy.
+    let (rtc, udp, offer, pending) = common::create_rtc_with_channel()?;
+    let sdp = nexus_web_gateway::protocol::SdpPayload {
+        kind: "offer".into(),
+        sdp: offer.to_sdp_string(),
+    };
+    browser.peers[0].send(&BrowserMessage::RelayOffer {
+        target: "node-b".into(),
+        session_id: browser.session_id.clone(),
+        sdp,
+    })?;
+
+    let err = loop {
+        browser.drive_all(Duration::from_millis(100))?;
+        if let Some(NodeMessage::RelayError { error, .. }) =
+            browser.peers[0].take_message(|m| matches!(m, NodeMessage::RelayError { .. }))
+        {
+            break error;
+        }
+    };
+    assert!(
+        err.contains("already exists"),
+        "expected session-already-exists error, got {err:?}"
+    );
+    assert!(browser.peers[1].connected, "existing peer B should stay connected");
+    let _ = pending;
+    let _ = rtc;
+    let _ = udp;
+    Ok(())
+}
+
+#[test]
 fn wss_mesh_relay_between_two_gateways() -> TestResult {
     let port_a = reserve_port();
     let port_b = reserve_port();
@@ -796,9 +873,7 @@ fn gateway_cfg_wss(
     peer_token: &str,
     ssh_target: SocketAddr,
 ) -> GatewayConfig {
-    let cert_dir = std::env::temp_dir()
-        .join("nexus-web-gateway-test-certs")
-        .join(format!("{node_id}-{}", std::process::id()));
+    let cert_dir = unique_cert_dir(node_id);
     GatewayConfig {
         listen_addr: listen,
         node_id: node_id.into(),
@@ -808,7 +883,7 @@ fn gateway_cfg_wss(
         tls: TlsConfig::AutoGenerate {
             names: vec!["localhost".into()],
             ips: vec!["127.0.0.1".parse().unwrap()],
-            cert_dir: Some(cert_dir.to_string_lossy().into_owned()),
+            cert_dir: Some(cert_dir),
         },
         ssh: SshConfig {
             target: ssh_target,

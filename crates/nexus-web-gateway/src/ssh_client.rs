@@ -99,6 +99,13 @@ pub fn run_ssh_client(
 
     opened(Ok(()));
 
+    // The bridge may have been closed while the channel was being set up (e.g.
+    // the browser session dropped). Exit immediately in that case.
+    if stop.load(Ordering::Relaxed) {
+        closed("client closed");
+        return;
+    }
+
     let mut buf = [0u8; 4096];
     loop {
         if stop.load(Ordering::Relaxed) {

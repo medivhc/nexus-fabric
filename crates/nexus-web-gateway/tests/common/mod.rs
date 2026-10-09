@@ -64,6 +64,9 @@ pub fn read_ws_json(ws: &mut WssClient) -> Result<serde_json::Value, Box<dyn std
 }
 
 static SSHD_COUNTER: AtomicUsize = AtomicUsize::new(0);
+/// Serializes test-sshd spawns so the bind-drop-bind port reservation cannot
+/// collide between concurrently running tests in the same process.
+static SSHD_SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A real OpenSSH server running on a loopback high port with a generated host
 /// key and an `authorized_keys` file for the caller's generated client key.
@@ -80,6 +83,10 @@ pub struct TestSshd {
 impl TestSshd {
     /// Spawn a real `sshd` on a loopback high port.
     pub fn spawn() -> Result<Self, Box<dyn std::error::Error>> {
+        // Hold the lock for the whole spawn: the port is reserved by binding
+        // then releasing a listener, so a concurrent spawner could otherwise
+        // grab the same port before sshd binds it.
+        let _guard = SSHD_SPAWN_LOCK.lock().expect("sshd spawn lock");
         let sshd_bin = which_sshd().ok_or_else(|| {
             "sshd binary not found; install openssh-server to run SSH gateway tests".to_string()
         })?;
