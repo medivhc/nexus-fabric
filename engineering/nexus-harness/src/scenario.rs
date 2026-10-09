@@ -603,10 +603,87 @@ fn run_single_inner(s: &Scenario) -> ScenarioRunReport {
     }
 }
 
+/// 场景并行度：环境变量 NEXUS_HARNESS_JOBS 优先（1 表示强制串行，
+/// 兼容旧行为）；否则按 CPU 数，上限 16。场景主体是等待子进程，
+/// I/O 密集，允许超配；上限防止大机器上进程爆炸。
+fn parallel_jobs() -> usize {
+    parallel_jobs_from_env(std::env::var("NEXUS_HARNESS_JOBS").ok())
+}
+
+fn parallel_jobs_from_env(v: Option<String>) -> usize {
+    if let Some(s) = v {
+        if let Ok(n) = s.trim().parse::<usize>() {
+            return n.max(1);
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 16)
+}
+
+/// 有界并行执行场景：worker 线程从共享队列认领下标，结果经 channel
+/// 按下标回填。`Scenario` 是纯数据（Send+Sync），`run_single` 内只有
+/// 进程隔离的副作用（独立目录/端口），无跨场景共享可变状态。
+/// 任一 worker panic 时 scope 会传播 panic（与串行版行为一致：整轮中止）。
+fn run_parallel(scenarios: &[Scenario], jobs: usize) -> Vec<ScenarioRunReport> {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex, mpsc};
+
+    let n = scenarios.len();
+    let workers = jobs.min(n);
+    let queue: Arc<Mutex<VecDeque<usize>>> = Arc::new(Mutex::new((0..n).collect()));
+    let (tx, rx) = mpsc::channel::<(usize, ScenarioRunReport)>();
+
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            let queue = Arc::clone(&queue);
+            let tx = tx.clone();
+            s.spawn(move || {
+                loop {
+                    // 锁只保护取下标；子进程执行期间不持锁。
+                    let idx = match queue.lock().unwrap().pop_front() {
+                        Some(i) => i,
+                        None => break,
+                    };
+                    let rep = run_single(&scenarios[idx]);
+                    // 主线程一定在收（rx 在 scope 内消费），send 不会阻塞。
+                    let _ = tx.send((idx, rep));
+                }
+            });
+        }
+        drop(tx);
+
+        let mut by_idx: Vec<Option<ScenarioRunReport>> = (0..n).map(|_| None).collect();
+        for (idx, rep) in rx {
+            by_idx[idx] = Some(rep);
+        }
+        by_idx
+            .into_iter()
+            .enumerate()
+            .map(|(i, slot)| {
+                slot.unwrap_or_else(|| ScenarioRunReport {
+                    verdict: "FAIL".to_string(),
+                    failed_step: "harness".to_string(),
+                    assertion: String::new(),
+                    key_log_lines: Vec::new(),
+                    duration_ms: 0,
+                    detail: format!(
+                        "scenario worker produced no report for '{}' (worker panic?)",
+                        scenarios[i].id
+                    ),
+                })
+            })
+            .collect()
+    })
+}
+
 /// Run all command-scenarios in the given subdirs; static ones are recorded
 /// UNKNOWN. Returns (results, gate) — gate is FAIL if any scenario FAIL.
 ///
 /// 逐场景执行委托给 run_single（单一执行路径）；本函数只做聚合与 Gate 判定。
+/// 场景之间并行执行：每个场景是独立子进程（独立 NEXUS_CONFIG_DIR、临时端口），
+/// 无共享可变状态；结果按场景声明顺序收集，保证输出确定性。
 pub fn run_gate(config: &Config, gate_name: &str, subdirs: &[&str]) -> (Vec<ScenarioResult>, Gate) {
     let scenarios = load_all(&config.scenarios_dir, subdirs);
     if scenarios.is_empty() {
@@ -615,10 +692,16 @@ pub fn run_gate(config: &Config, gate_name: &str, subdirs: &[&str]) -> (Vec<Scen
             Gate::ok(gate_name, "no scenario files declared"),
         );
     }
+    let jobs = parallel_jobs();
+    let reports: Vec<ScenarioRunReport> = if jobs <= 1 || scenarios.len() <= 1 {
+        scenarios.iter().map(run_single).collect()
+    } else {
+        run_parallel(&scenarios, jobs)
+    };
     let mut results: Vec<ScenarioResult> = Vec::new();
     let mut failed = false;
-    for s in &scenarios {
-        let rep = run_single(s);
+    // reports 在此之后不再使用，直接 move 字段，省去堆内存复制（review suggestion）。
+    for (s, rep) in scenarios.iter().zip(reports) {
         if rep.verdict == "FAIL" {
             failed = true;
         }
@@ -1103,5 +1186,66 @@ mod tests {
         assert_eq!(rep.failed_step, "command");
         assert_eq!(rep.assertion, "spawn_failed");
         assert!(rep.detail.contains("cannot run scenario command"));
+    }
+
+    /// 并行执行器：多场景并发跑，结果按声明顺序回填、verdict 正确。
+    /// 命令不走 shell（按空白切分直接 exec），用脚本文件实现 sleep 交错；
+    /// sleep 打乱完成顺序：若实现不按序回填，此测试大概率失败。
+    #[test]
+    fn run_parallel_keeps_order_and_verdicts() {
+        let dir =
+            std::env::temp_dir().join(format!("harness-parallel-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        // 偶数 PASS（sleep 交错打乱完成顺序），第 3 个故意 FAIL。
+        for i in 0..6 {
+            let script = dir.join(format!("run{i}.sh"));
+            let body = if i == 2 {
+                "#!/bin/sh\necho not-json\n".to_string()
+            } else {
+                // 脚本直接写文件，不走 TOML：引号用 Rust 转义 \" 即可
+                format!(
+                    "#!/bin/sh\nsleep 0.{}\necho '{{\"verdict\":\"PASS\"}}'\n",
+                    (6 - i) % 5
+                )
+            };
+            std::fs::write(&script, body).expect("write script");
+            let toml_body = format!(
+                "schema_version = 1\nid = \"t.par{i}\"\n[when]\ncommand = \"sh {}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
+                script.display()
+            );
+            std::fs::write(dir.join(format!("s{i}.toml")), toml_body).expect("write toml");
+        }
+        let scenarios = load_all(&dir, &[""]);
+        assert_eq!(scenarios.len(), 6);
+        let reports = run_parallel(&scenarios, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(reports.len(), 6);
+        for (i, rep) in reports.iter().enumerate() {
+            if i == 2 {
+                assert_eq!(rep.verdict, "FAIL", "scenario {i} should fail");
+            } else {
+                assert_eq!(rep.verdict, "PASS", "scenario {i} should pass");
+            }
+        }
+        // verdict 分布（仅下标 2 FAIL）即顺序断言：若按完成顺序而非声明顺序
+        // 回填，FAIL 会落在随机位置；sleep 交错使完成顺序大概率偏离声明顺序。
+    }
+
+    /// 并行度解析：环境变量优先，非法值回退默认；1 表示强制串行。
+    /// 用纯函数版本测试，不碰进程全局环境变量（edition 2024 下 set_var 是 unsafe）。
+    #[test]
+    fn parallel_jobs_env_override() {
+        assert_eq!(parallel_jobs_from_env(Some("1".to_string())), 1);
+        assert_eq!(parallel_jobs_from_env(Some("0".to_string())), 1);
+        assert_eq!(parallel_jobs_from_env(Some("32".to_string())), 32);
+        assert_eq!(parallel_jobs_from_env(Some("  4  ".to_string())), 4);
+        // 非法值回退到默认（CPU 数，clamp 1..=16）
+        let d = parallel_jobs_from_env(Some("not-a-number".to_string()));
+        assert!((1..=16).contains(&d));
+        let d2 = parallel_jobs_from_env(None);
+        assert!((1..=16).contains(&d2));
+        // 真实环境变量路径不断言具体值（机器相关），只断言不 panic
+        let _ = parallel_jobs();
     }
 }
