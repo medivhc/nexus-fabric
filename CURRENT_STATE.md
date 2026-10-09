@@ -417,3 +417,98 @@ These states are intentionally non-monotonic across different slices. For exampl
 The baseline now contains source-level facts for the domain/planner/session core, control/registry/policy/auth/DNS, network/proxy model, daemon N2 ownership, storage/workspace/compute semantics, Fabric/TURN/NAT and platform maturity, plus the scenario surface.
 
 Still not exhaustively enumerated at symbol level are every outbound protocol adapter, every CLI/LocalAPI route, every workspace and N3 persistence file, every path/discovery/routing algorithm, every harness verifier and every scenario's latest evidence artifact. Those are narrower implementation inventories rather than unknown architectural regions; they remain required before calling this document a complete repository certification.
+
+
+## 26. Path, discovery, delivery and flow-session boundaries
+
+### 26.1 Path manager
+
+`nexus-path` answers one question: which currently available path should carry packets to a peer. Candidate kinds are Direct, Mesh, TURN and Proxy. It consumes quality facts and applies scoring/hysteresis; it does not construct sockets, run TURN, perform NAT punching, or make user proxy-rule decisions.
+
+P0 is explicitly single-active-path. “Multipath” scenario names elsewhere must therefore be interpreted carefully: the frozen PathManager contract says concurrent multipath forwarding is not the P0 steady-state model. Connection-establishment racing can select a winner without changing that invariant. Switching preserves the Fabric connection identity and relies on Fabric migration rather than creating a new application session.
+
+The contract also records an important future boundary: predictive trend/history layers and preemptive migration are not current core behavior and ML is explicitly not part of this layer.
+
+### 26.2 Discovery
+
+`nexus-discovery` is distinct from connectivity establishment. It handles bootstrap, peer discovery, endpoint/candidate exchange and presence. Dynamic `PresenceRegistry` entries carry TTL; expired peers are rejected rather than returning stale endpoints. Network discovery is abstracted through an injected request/response `DiscoveryTransport`; the discovery domain itself does not own the connection establishment.
+
+The architectural consequence is important: bootstrap/discovery is not supposed to become a permanent dependency of an already-established data session.
+
+### 26.3 Delivery and transport
+
+`nexus-delivery` is a deliberately domain-neutral shared delivery abstraction and must not depend back on workspace/compute/service.
+
+`nexus-transport` currently has a concrete frozen remote-P0 TCP frame stream: TCP connection plus u32 big-endian length-prefixed frames, with `FrameStream::send_frame`, `recv_frame` and `into_raw`. This is not the same abstraction as Fabric QUIC and should not be collapsed with it in the baseline.
+
+### 26.4 Flow-session mapping
+
+`nexus-flow-session` is the nexusd TUN “flow → resource Session” layer. Its key is the complete five-tuple. A new flow constructs `FlowContext(origin=PacketCapture)`, evaluates Policy, invokes Core Planner and creates a `nexus-session::SessionOwner`. Connectivity establishment runs off the packet-processing path; an allocating entry is later promoted through event/channel feedback. Established-flow fast path reuses the bound session and must not re-run the planner per packet.
+
+The contract explicitly distinguishes local TCP termination state from the higher-level resource Session. One resource Session can own a terminated TCP flow or UDP five-tuple; the transport state is subordinate to the resource Session lifecycle.
+
+## 27. Projection and unified TUN routing
+
+`nexus-projection` is no longer merely a thin TUN-to-Fabric tunnel. The current module contract records a unified routing role: packets can resolve to MeshPeer, Egress or Drop; local UDP egress NAT exists; cross-node egress, hop-loop prevention, domain rules and real UDP egress are marked completed. TCP egress via local termination + Fabric byte stream + remote TcpStream is explicitly marked in progress.
+
+This is another place where coarse labels are dangerous: “projection implemented” is true for L3 tunnel/routing and substantial UDP egress behavior, but does not mean the TCP egress track is complete.
+
+## 28. Outbound protocol reality
+
+The outbound crates share the `nexus-connectivity::OutboundAdapter` seam, but they have materially different completeness levels and protocol goals.
+
+- **Shadowsocks**: AEAD adapter with deterministic offline cipher behavior; its contract additionally defines a real-TCP session track. The original adapter alone must not be described as full Shadowsocks networking.
+- **VMess**: explicitly **not wire-compatible full VMess**; current adapter is an AEAD record-layer implementation and does not initiate real network connections. This is a major scope caveat.
+- **Trojan**: substantially more protocol-realistic: rustls TLS, official-style request header, password validation, certificate pinning and loopback session primitives. It still excludes UDP, WS/gRPC disguise and multiplexing.
+- **AnyTLS**: implements AnyTLS v2 session framing, authentication/settings negotiation, stream commands, UDP-over-TCP framing and TLS loopback primitives. Padding scheme negotiation exists, while padding write-path behavior and session pooling/heartbeat remain outside current responsibility.
+- **VLESS**: implements request/response headers, UUID/addon encoding, TCP/UDP/Mux command framing, lazy response read and XTLS-Vision framing/state machines. Full Mux scheduling, transport chains such as WS/gRPC/REALITY and post-quantum VLESS-Encryption are explicitly not implemented.
+- **Hysteria2**: has its own sans-I/O QUIC driver directly on quinn-proto because Fabric's identity/TLS/config model is incompatible with Hysteria2 requirements. It includes H3-style authentication, TCP/UDP framing, DATAGRAM, Salamander obfuscation and a test server. It should therefore be treated as a separate protocol transport stack, not as “Hysteria2 over Nexus Fabric”.
+
+This diversity is architecturally significant: `OutboundAdapter` is a common handoff seam, not proof that every outbound shares the same transport/runtime or production maturity.
+
+## 29. Explicit protocol limitations that must survive future documentation
+
+The baseline must preserve negative capability facts, because deleting them would recreate the original documentation-drift problem:
+
+- VMess is not a full wire-compatible VMess implementation.
+- VLESS does not implement full Mux.Cool, REALITY/WS/gRPC transport chains or VLESS post-quantum encryption.
+- AnyTLS does not currently own padding write policy, pooling or heartbeat runtime.
+- Trojan does not implement UDP or disguise transports.
+- Hysteria2 deliberately bypasses Fabric's Driver and uses quinn-proto directly.
+- Projection TCP egress is in progress.
+- PathManager steady-state P0 is single-active-path.
+- Discovery is not connectivity establishment.
+- Transport TCP FrameStream and Fabric QUIC are separate delivery mechanisms.
+
+## 30. Architecture map after source audit
+
+A more faithful current execution map is now:
+
+`Ingress/TUN/CLI/LocalAPI`
+→ flow/resource context
+→ `Policy` (intent + hard constraints)
+→ Registry/Discovery/Measurement/Connectivity facts
+→ **single Core Planner**
+→ immutable Plan/DecisionTrace snapshot
+→ SessionOwner
+→ domain runtime (Network/Service/Workspace/Compute)
+→ connectivity/path establishment
+→ one of several delivery mechanisms (Fabric/FrameStream/protocol outbound)
+→ platform/projection/egress.
+
+Supporting planes run alongside rather than inside the planner: DNS contributes resolution/exit-binding facts; Auth gates resource use; Registry carries advertisements; NAT wireup improves connectivity; PathManager chooses among available packet paths; Harness/Scenario/Evidence judges engineering/product behavior.
+
+This map supersedes any interpretation that treats Proxy, NAT, DNS or a domain estimator as a second system-level planner.
+
+## 31. Remaining evidence-focused work
+
+After this pass, the largest unknown is no longer “what are the architectural components”; it is **which exact claims are verified at which evidence level on the captured revision**. A final certification pass should therefore prioritize evidence artifacts and runtime route tracing over adding more conceptual prose.
+
+The still-needed high-value inventories are:
+
+- exact CLI/LocalAPI route → daemon handler → owner/runtime mapping;
+- N2/N3 persistence files, journal/reconcile paths and crash boundaries;
+- current Evidence records for the large scenario catalog;
+- Harness verifier/gate behavior and protected-path enforcement;
+- exact real-vs-loopback-vs-simulation status for outbound/proxy/NAT scenarios;
+- platform scenario PASS/SKIP conditions, especially host-dependent Linux/Windows checks.
