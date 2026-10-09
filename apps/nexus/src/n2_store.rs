@@ -1495,7 +1495,6 @@ impl N2Store {
         self.queue_frame(&ControlFrame::AuthGrant {
             announcement: nexus_registry::GrantAnnouncement {
                 resource: grant.resource.clone(),
-                principal: grant.principal.0.clone(),
                 grant: nexus_registry::UsageGrant {
                     principal: grant.principal.0.clone(),
                     operations: grant.operations.clone(),

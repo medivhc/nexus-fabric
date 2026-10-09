@@ -495,7 +495,7 @@ mod tests {
         assert!(matches!(
             decode_control_frame(&items[0].1),
             Ok(ControlFrame::AuthGrant { ref announcement })
-                if announcement.principal == "ed25519:target"
+                if announcement.grant.principal == "ed25519:target"
         ));
 
         del_grant_from(&dir, "svc-a", "ed25519:target").unwrap();

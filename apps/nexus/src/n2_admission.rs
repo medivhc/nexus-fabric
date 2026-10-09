@@ -283,11 +283,13 @@ fn pending_announcements(store: &N2Store, principal: &str) -> (Vec<u64>, Vec<ser
                 "resource": resource.to_string(),
                 "principal": target,
             })),
-            ControlFrame::AuthGrant { ref announcement } if announcement.principal == principal => {
+            ControlFrame::AuthGrant { ref announcement }
+                if announcement.grant.principal == principal =>
+            {
                 Some(serde_json::json!({
                     "kind": "auth_grant",
                     "resource": announcement.resource.to_string(),
-                    "principal": announcement.principal,
+                    "principal": announcement.grant.principal,
                 }))
             }
             _ => None,
