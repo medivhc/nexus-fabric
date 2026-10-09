@@ -1,1 +1,0 @@
-Promotion candidate blob is `1522640adf2d08af4742cbae1800f5909b0b2672`; promotion review is PASS. This audit marker may be retained with review history after staging cleanup.
