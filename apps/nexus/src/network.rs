@@ -313,7 +313,7 @@ pub fn network_up(config_text: &str, _json_mode: bool) -> i32 {
         eprintln!(
             "error: `nexus network up` is Linux-only in this build (N1 诚实边界：首期 Linux only)"
         );
-        return 2;
+        2
     }
     #[cfg(target_os = "linux")]
     {
