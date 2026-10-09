@@ -303,3 +303,117 @@ This pass materially expands the baseline from architecture skeleton into source
 10. audit shutdown ordering, task/thread ownership, persistence/recovery and crash-consistency boundaries.
 
 The baseline should not be called exhaustive until these ten passes are represented with source-backed tables or traces.
+
+
+## 19. Portable control, registry, policy, authorization and DNS facts
+
+### 19.1 Domain and control API
+
+`nexus-domain` is intentionally dependency-free inside Nexus and is the stable vocabulary layer. Beyond Resource/Provider/Session identifiers, the current contract includes typed Plan extensions for Network, Workspace, Compute and Service, structured `NexusError` and failure disposition, connectivity-evaluation DTOs, N2 resource addressing/authorization vocabulary, decision-trace DTOs, deterministic `PlanId`, and `PlanSnapshot`. N3 Task/Snapshot/Artifact DTOs are separated under the `task` module rather than being folded into the stable Core Plan.
+
+`nexus-control-api` is the front-end contract layer for CLI/GUI/Agent/SDK. Current `ControlCommand` includes status, plan explain, session watch, connectivity status/candidates/probe/links, DNS status/resolve/providers/cache, workspace heads/conflicts/cache/commit, compute jobs, diagnose, platform capabilities and run. The module contract still labels the N3 Application Service operation set as “待实现”; therefore N3 control-plane completeness must be judged from actual LocalAPI/daemon code and scenarios, not inferred from the desired API list in this contract.
+
+### 19.2 Registry and N2 control frames
+
+`nexus-registry` stores facts and advertisements, not scores. `ProviderRecord` keeps identity, resource, placement, locator, capabilities and presence as separate fields. N2 additions include provider advertisements with discoverability/use grants/unavailability/expiry semantics, local human-name mapping, static-provider import, and five explicit control-frame kinds: RESOURCE_ANNOUNCE, RESOURCE_QUERY, AUTH_GRANT, AUTH_REVOKE and LEASE_RENEW.
+
+The N2 control channel requires an already authenticated peer; registry does not invent a second authentication path. Human-readable names are not used as addressing keys on ResourceQuery. Grant announcements have a documented exception because they represent provider-side authorization state rather than requester addressing.
+
+### 19.3 Policy
+
+`nexus-policy` is a deterministic ordered action pipeline. It transforms flow/resource context into Intent + Constraint and explicitly does not choose transport/path/final provider. Rules are evaluated in order; non-terminal actions can add constraints or metadata, while SelectProvider and Reject terminate evaluation. This is a domain policy layer, not a competing planner.
+
+### 19.4 Authorization
+
+`nexus-auth` currently contains two deliberately separated generations/usages. The PSK `verify_token` path remains for frozen N1 remote-host scenarios. N2 authorization explicitly rejects PSK as its identity model: `Principal` is derived from a handshake-verified ed25519 public key; provider-side `GrantTable` authorizes resource operations and emits exactly-once audit records. TOFU for N2 is explicit: unknown identity is surfaced as `UnknownFirstSeen` and must be confirmed before trust is persisted.
+
+### 19.5 DNS
+
+`nexus-dns` is a portable DNS decision/cache layer rather than a real UDP/DoT/DoH transport implementation. The current runtime includes injected Resolver, TTL cache, negative cache, loop guard, IP-family preference, Exit-DNS Binding and multi-server routing. The unified module additionally exposes mesh/fake-IP/classification vocabulary. Real DNS transport remains outside this portable runtime and must be provided by composition.
+
+## 20. Fabric, TURN and NAT traversal implementation
+
+### 20.1 Fabric connection semantics
+
+`nexus-fabric` is a synchronous QUIC-like session layer built around sans-I/O quinn-proto with std threads rather than Tokio. Its product connection identity is `(PeerId, ConnectionId)`, intentionally independent of the UDP 5-tuple. It exposes reliable bidirectional streams, unreliable datagrams, TLS 1.3 end-to-end encryption, connection statistics and roaming/rebind behavior.
+
+Important current invariants include: relay nodes must not decrypt Fabric payloads; datagrams are best effort and initially capped at 1200 bytes; path migration requires challenge/response validation; closed connections are removed from driver connection tables; connect uses one handshake timeout budget across command dispatch and handshake completion; and `FabricConn` must not be confused with `nexus-session::Session`.
+
+Transport is dependency-inverted through `UdpTransport`. Default std UDP remains available, while external transports such as TURN can implement the trait without Fabric depending back on them.
+
+### 20.2 TURN
+
+`nexus-turn` implements the RFC 5766 subset needed for relay fallback: Allocate, Refresh, CreatePermission, ChannelBind, ChannelData and Send indication with long-term authentication. `TurnSocket` implements Fabric's `UdpTransport`, so encrypted Fabric traffic can run over TURN. TURN is a relay mechanism, not the path selector.
+
+Allocation lifetime is explicit; expired allocation produces an error rather than a silent black hole. The client has no hidden refresh thread: callers must explicitly refresh. The included minimal server is primarily an E4/self-test facility, not evidence of a production public TURN deployment.
+
+### 20.3 NAT production wire-up
+
+`nexus-nat-wireup` connects portable punching orchestration to the real Fabric driver. `FabricPunchChannel` carries signaling over an existing relay connection; `DriverPunchSocket` fans out direct QUIC connection attempts from the punch driver; `PunchManager` owns responder, deduplication, tie-break and direct-connection registration.
+
+A `Migrated` result means a direct QUIC handshake actually completed, not merely that punch packets were sent. The relay is deliberately retained as warm backup after migration. Tie-break is deterministic from PeerId. Candidate adoption is nonce-bound to prevent accepting the wrong concurrent connection. The relay stream acceptor is single-owner: once wireup registers a relay, its responder loop owns `accept_bi`; non-punch streams are stashed in an unclaimed queue for the session layer. The contract explicitly notes that nexusd does not yet consume that unclaimed queue, which is a concrete remaining wiring gap.
+
+### 20.4 NAT quality
+
+`nexus-nat-quality` continuously measures candidate Fabric paths. It combines Fabric RTT with an active datagram ping/pong loss probe and feeds `PathStats` into `PathManager`. This exists specifically because direct-path success alone is not sufficient to conclude that direct is the best path.
+
+The quality monitor has bounded thread ownership: one responder per measured connection plus one monitor thread, all stopped and joined by `QualityMonitor::shutdown`. Active and backup probe rates differ, and non-probe datagrams must not be silently consumed.
+
+## 21. Platform implementation matrix
+
+| Platform | Current evidence | Baseline status |
+|---|---|---|
+| Portable platform contract | Capability traits for packet interface, interception, projection, secure store, lifecycle/clock/random/attribution; ProjectedWorkspace; secure-store crypto core | Implemented contract/core |
+| Linux | TUN/host adapter responsibility, transactional OS assembly contract, FUSE ProjectedWorkspace adapter, explicit rollback/dry-run/idempotence/SSH-protection semantics | Concrete implementation exists; individual capabilities still require scenario evidence |
+| Windows | Wintun dynamic adapter, WinINET system proxy, scheduled-task autostart, explicit narrow unsafe FFI boundary and lifecycle order | Concrete implementation exists; capability-by-capability evidence required |
+| macOS | MODULE contract states managed network/filesystem projection responsibility but currently exposes mostly generic skeleton language in the inspected contract | Contract/skeleton; do not claim parity |
+| Android | MODULE contract defines VPN Service, underlay bypass, lifecycle/file bridge and recursion-avoidance invariant, but inspected contract remains skeleton-level | Contract/skeleton; do not claim parity |
+| iOS | MODULE contract defines Packet Tunnel Extension, mobile lifecycle, projection/secure-store bridge and kill-tolerant correctness, but inspected contract remains skeleton-level | Contract/skeleton; do not claim parity |
+
+The important current-state conclusion is asymmetric platform maturity. The repository is cross-platform in structure and contract, but the inspected evidence does not justify saying the five OS adapters are equally implemented.
+
+## 22. Scenario surface and what it proves
+
+The scenario tree is substantial and divided into product, platform, engineering and regression families. Product scenarios cover far more than the original architecture skeleton: N1 connectivity and roaming, Fabric/TURN/NAT, proxy protocols and groups, DNS, routing/failover/multipath, daemon real-host flows, workspace sync/conflict/cache/GC, N2 resource/session operations, N3 durable task behavior, crash recovery, QoS and observability. Platform scenarios cover OS assembly, virtual packet interface, Windows routing/process attribution/system proxy and workspace projection. Regression scenarios explicitly include crash recovery and exactly-once session outcome.
+
+However, **scenario presence is not equivalent to a passing evidence level at this captured revision**. A scenario file proves that a behavior has a machine-readable verification target. Only a recorded run/evidence artifact can prove E-level closure. This baseline therefore records scenario coverage separately from verified status.
+
+Notable scenario families visible in the current tree include:
+
+- N1: `n1_wireup`, `n1_connectivity_roam`, `n1_connectivity_roam_realnet`, daemon real-host/relay/TUN/SOCKS flows;
+- Fabric/NAT: basic/roam/rebind, TURN relay, hole punching, relay fallback, virtual subnet encrypted/holepunch/mesh;
+- N2: grant/deny audit, plan preview, provider offline, resource list/publish/revoke/show, session close/list/watch, use loop;
+- N3: submit, idempotency, authorization, crash reconcile/acceptance crash, cancellation races, client reattach, snapshot/input/artifact integrity, artifact resume/missing, timeout/nonzero exit/environment mismatch, GC roots and LocalAPI boundary;
+- Workspace: authority v2, offline merge, cache eviction, GC, shallow/sparse, sync authorization/basic/conflict convergence/resume/path-race;
+- Proxy: Clash subscription/config/rules, selector/urltest/loadbalance/relay groups, SOCKS/HTTP/TUN ingress, Shadowsocks/Trojan/VMess and real TCP/TLS checks;
+- DNS: exit binding, rule/server selection, IP-CIDR and unified DNS;
+- Recovery/engineering: config hot reload, graceful exit, crash recovery, harness verdict/evidence scenarios.
+
+## 23. Capability status rules for the final baseline
+
+From this point forward the document uses the following strict interpretation:
+
+- **Contract**: a MODULE/schema/policy says the capability should exist.
+- **Implemented**: executable source contains the behavior.
+- **Wired**: a composition root reaches and owns the behavior in a product process.
+- **Scenario-targeted**: a machine-readable scenario exists.
+- **Verified**: evidence from an actual run at the captured revision proves the relevant level.
+- **Production-closed**: implementation, product wiring, failure/recovery semantics and required evidence all agree.
+
+These states are intentionally non-monotonic across different slices. For example, NAT wireup can be implemented while one consumer handoff remains unwired; a platform contract can exist while its adapter remains skeletal; an N3 scenario can exist while a control-api MODULE still marks an API set as pending.
+
+## 24. Newly confirmed drift and incomplete wiring
+
+1. `nexusd` introductory runtime comment is stale relative to executable assembly.
+2. `nexus-nat-wireup` explicitly exposes an unclaimed non-punch stream handoff that nexusd does not yet consume.
+3. N3 control API desired operations are documented in `nexus-control-api/MODULE.md` as pending, while N3 implementation/scenario work exists elsewhere; control-plane completion must be traced through daemon LocalAPI rather than assumed.
+4. Platform maturity is asymmetric: Linux/Windows contracts describe concrete adapters and side effects, whereas inspected macOS/Android/iOS contracts remain largely skeleton-level.
+5. TURN client refresh is caller-owned; existence of TURN support does not imply automatic allocation maintenance in every runtime.
+6. DNS portable runtime does not itself implement real DNS wire transports.
+7. Scenario abundance must not be reported as evidence abundance until current-revision run artifacts are mapped.
+
+## 25. Current audit completeness
+
+The baseline now contains source-level facts for the domain/planner/session core, control/registry/policy/auth/DNS, network/proxy model, daemon N2 ownership, storage/workspace/compute semantics, Fabric/TURN/NAT and platform maturity, plus the scenario surface.
+
+Still not exhaustively enumerated at symbol level are every outbound protocol adapter, every CLI/LocalAPI route, every workspace and N3 persistence file, every path/discovery/routing algorithm, every harness verifier and every scenario's latest evidence artifact. Those are narrower implementation inventories rather than unknown architectural regions; they remain required before calling this document a complete repository certification.
