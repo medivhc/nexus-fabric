@@ -3,6 +3,23 @@
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
+
+/// git 的 `.git/index.lock` 是极短临界区。同一测试二进制并发跑（默认多线程）时，
+/// `write-tree` / `status` 会撞锁失败；调用方把失败降级成哨兵值
+/// （`tree-unknown` / `dirty-unknown` / 空串），于是出现"digest 不确定"的**假失败**
+/// （实测 `env::tests::digests_deterministic_and_sha1_length` 在 Linux 上偶发红）。
+/// 这里只对真正的锁竞争重试，其它错误原样上报，不吞任何失败。
+const GIT_LOCK_RETRIES: u32 = 4;
+const GIT_LOCK_BACKOFF: Duration = Duration::from_millis(25);
+
+/// 判定 stderr 是否为 git 索引/引用锁竞争（大小写不敏感）。
+fn is_lock_contention(stderr: &str) -> bool {
+    let hay = stderr.to_ascii_lowercase();
+    hay.contains("index.lock")
+        || hay.contains("cannot lock ref")
+        || (hay.contains("unable to create") && hay.contains("lock"))
+}
 
 pub struct Repo {
     pub root: PathBuf,
@@ -42,21 +59,29 @@ impl Repo {
     }
 
     /// Run git in the repo root; returns trimmed stdout.
+    ///
+    /// 仅对锁竞争重试（见 `GIT_LOCK_RETRIES`），退避 25/50/75ms；其余失败立即返回 Err。
     pub fn git(&self, args: &[&str]) -> Result<String, String> {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(&self.root)
-            .args(args)
-            .output()
-            .map_err(|e| format!("failed to run git: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "git {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+        let mut attempt = 1u32;
+        loop {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&self.root)
+                .args(args)
+                .output()
+                .map_err(|e| format!("failed to run git: {e}"))?;
+            if out.status.success() {
+                return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
+            }
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let message = format!("git {} failed: {}", args.join(" "), stderr);
+            if attempt < GIT_LOCK_RETRIES && is_lock_contention(&stderr) {
+                std::thread::sleep(GIT_LOCK_BACKOFF * attempt);
+                attempt += 1;
+                continue;
+            }
+            return Err(message);
         }
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
     /// Hash a string through `git hash-object --stdin` (sha1, no crypto dep).
@@ -238,10 +263,44 @@ mod tests {
     #[test]
     fn digests_deterministic_and_sha1_length() {
         let repo = Repo::discover().expect("must run inside the nexus repository");
-        assert_eq!(repo.configuration_digest(), repo.configuration_digest());
-        assert_eq!(repo.contract_hash(), repo.contract_hash());
-        assert_eq!(repo.working_tree_digest(), repo.working_tree_digest());
+        // 降级哨兵值（`*-unknown`）代表"没取到"，不能算成一次确定的取值：
+        // 之前它就是靠 assert_eq!(f(), f()) 两次都拿到同一个哨兵而蒙过去的。
+        for (name, first, second) in [
+            (
+                "configuration_digest",
+                repo.configuration_digest(),
+                repo.configuration_digest(),
+            ),
+            ("contract_hash", repo.contract_hash(), repo.contract_hash()),
+            (
+                "working_tree_digest",
+                repo.working_tree_digest(),
+                repo.working_tree_digest(),
+            ),
+        ] {
+            assert_eq!(first, second, "{name} 两次取值不一致");
+            assert!(
+                !first.ends_with("-unknown"),
+                "{name} 取到降级哨兵值 {first}：git 调用失败，不得当作确定取值"
+            );
+        }
         assert_eq!(repo.hash_stdin("abc").unwrap().len(), 40);
+    }
+
+    /// 锁竞争判定必须只认 git 的锁类错误：把普通失败也拿去重试会掩盖真故障。
+    #[test]
+    fn lock_contention_detection_covers_git_lock_messages_only() {
+        assert!(is_lock_contention(
+            "fatal:Unable to create '/repo/.git/index.lock': File exists."
+        ));
+        assert!(is_lock_contention(
+            "fatal: Unable to create '/repo/.git/index.lock': Permission denied"
+        ));
+        assert!(is_lock_contention("fatal: cannot lock ref 'HEAD'"));
+        assert!(!is_lock_contention("fatal: not a git repository"));
+        assert!(!is_lock_contention(
+            "error: pathspec 'nope' did not match any file(s)"
+        ));
     }
 
     #[test]

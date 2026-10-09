@@ -137,6 +137,7 @@ SYMBOL_NOT_FOUND RESULT_TRUNCATED TIMEOUT PROVIDER_CRASHED SNAPSHOT_STALE UNSUPP
 - Evidence 必须绑定 revision / working-tree / config / feature / target / toolchain / platform，并写入 `.evidence/verify-<id>/`。
 - verdict 语义：`PASS / FAIL / STALE / UNKNOWN / BLOCKED`；STALE 证据必须以 `"verdict":"STALE"` 形式落盘，供 `.githooks/pre-push` 检出。
 - 未实现的 gate（bench/replay/coverage 等）必须显式记录 UNKNOWN，不得以 PASS 掩盖。
+- git 调用失败只在**锁竞争**时重试（`.git/index.lock` 类消息，最多 4 次、25/50/75ms 退避），其它错误原样上报，不得吞掉真故障。digest 的降级哨兵值（`tree-unknown` / `dirty-unknown` / `*-unknown` / 空串）代表"没取到"，**不得**被当成一次确定的取值：`env::tests::digests_deterministic_and_sha1_length` 同时断言"两次相等"与"不是哨兵值"。
 - Code Intelligence 只读不变量：客户端只允许发送白名单内的 LSP 方法（`workspace/symbol`、`textDocument/{documentSymbol,hover,definition,typeDefinition,implementation,references,prepareCallHierarchy,diagnostic}`（`typeDefinition` 为白名单预留，首期无 CLI verb 调用点：提案 §4 的 Agent-facing 列表本身不含 type-definition，故不视为未兑现，但不得假装已经暴露给 Agent）、`callHierarchy/{incomingCalls,outgoingCalls}`）；`rename`、`workspace/applyEdit`、`codeAction` 自动应用、`workspace/willSaveWaitUntil`、格式化写入、任意 `workspace/executeCommand` 一律拒绝并返回 `UNSUPPORTED`。
 - provider 子进程 command/args 不接受模型或调用方拼接的任意 shell 参数（`--provider-binary` 只接受单个可执行文件名或路径，按 `split_whitespace` 之前的整串传入，不经 shell）。
 - `request()` 在返回匹配响应**之前**必须先 `pump_server_requests()` 一次：language server 会阻塞等待其对 server→client 请求的应答，悬置请求既会卡住 provider，也会让 `write_requests_refused` 在观测时刻还没入账（计数失真等于把拒绝能力藏起来）。
@@ -190,7 +191,7 @@ Code Intelligence 场景（E4，冻结于 2026-10-10 契约阶段，夹具为
 
 - 真实执行：workspace-tests / product-scenarios / regression / architecture-policy / dependency-governance（cargo-deny 0.20：`cargo deny --config policies/deny.toml check advisories licenses bans sources`，缺失则 UNKNOWN）/ coverage-summary（cargo-llvm-cov）/ platform-checks（portable-core 平台依赖静态扫描）/ feature-matrix（每成员 `--no-default-features` + `--all-features`）/ portable-core（`cargo check --target wasm32-wasip1`）。
 - 条件执行（无内容/无工具时 UNKNOWN）：integration（成员 tests/*.rs 存在时逐个运行）/ selected-fuzz（cargo-fuzz + fuzz targets）/ selected-concurrency（tests/concurrency 有测试时运行）/ performance-budgets（quality.toml `[performance]` 定义 baseline+blocking 后判定）。
-- 单元测试：`cargo test -p nexus-harness`（101 个 = 既有 56 + Code Intelligence 45；覆盖 scenario 求值、evidence 新鲜度/STALE、digest 确定性、workspace 成员解析、dependency-governance gate 语义，以及 JSON-RPC framing、只读白名单、URI 往返、DTO 形状与预算截断、progress 收敛判定、provider 参数校验、**假 server 主动推 `workspace/applyEdit` 的端到端拒绝**、**工作树指纹哨兵值不得当作新鲜**）。
+- 单元测试：`cargo test -p nexus-harness`（102 个 = 既有 57 + Code Intelligence 45；覆盖 scenario 求值、evidence 新鲜度/STALE、digest 确定性与锁竞争判定、workspace 成员解析、dependency-governance gate 语义，以及 JSON-RPC framing、只读白名单、URI 往返、DTO 形状与预算截断、progress 收敛判定、provider 参数校验、**假 server 主动推 `workspace/applyEdit` 的端到端拒绝**、**工作树指纹哨兵值不得当作新鲜**）。
   - Windows 宿主已知 4 个与本模块能力无关的预存在失败：3 个 scenario 测试把 `sh`/`echo` 当 shell 内建使用（Windows 下按可执行文件解析），1 个 `gates` 的 §12.58 contract-hash 测试受 `text=auto` 的 CRLF 检出影响；两者均非 Code Intelligence 引入。
 
 ## Performance Budget
