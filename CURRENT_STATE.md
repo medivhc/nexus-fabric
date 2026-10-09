@@ -177,3 +177,129 @@ This first committed baseline establishes the semantic frame and high-confidence
 8. explicit drift register linking stale documents/comments to contradictory executable facts.
 
 Until those passes are complete, this file is a reliable baseline skeleton plus verified high-confidence findings, not an exhaustive certification of the repository.
+
+
+## 14. Workspace inventory and implementation map
+
+At the captured revision the root Cargo workspace explicitly contains 49 members: three applications, forty-five product/library crates, and the engineering harness. This list is an executable repository fact, not a design-document inventory.
+
+### 14.1 Applications
+
+- `apps/nexus`: formal user-facing CLI / thin client.
+- `apps/nexusd`: daemon composition root. It owns configuration-root startup, LocalAPI exposure and runtime assembly. Its file-level introductory comment is stale in at least one important respect: later executable code contains concrete N1/N2/runtime wiring that is stronger than the comment's “future work” wording.
+- `apps/nexus-platform-host`: platform-host process boundary.
+
+### 14.2 Core decision and lifecycle layer
+
+- `nexus-domain`: shared domain vocabulary and cross-domain identifiers/contracts.
+- `nexus-registry`: provider records and candidate facts consumed by planning.
+- `nexus-policy`: policy/constraint production; it is not the Core Planner.
+- `nexus-measurement`: measurement facts. Measurements remain facts rather than policy scores.
+- `nexus-planner`: the sole system-level Core Planner. The implementation is portable and I/O-free. Its `PlanningSnapshot` freezes candidates, hard constraints, optional per-provider connectivity evaluation and optional local-provider preference. Filtering happens before scoring. Connectivity evaluation can reject a provider with no feasible path. Scoring is deterministic integer arithmetic; the currently visible components are normalized RTT plus a locality bonus, and the breakdown is recorded in `DecisionTrace`.
+- `nexus-scheduler`: scheduling concern remains distinct from planner by repository invariant.
+- `nexus-session`: portable owner state machine for execution lifecycle. `SessionOwner` is the sole committer of `TerminalOutcome`; workers report `SessionEvent` rather than committing outcomes directly. Cancellation is cooperative through `CancelToken`; `AbortOnDropHandle` converts owner loss into cancellation request. Lifecycle phase and terminal outcome remain separate tracks, so cleanup/disposal can continue after an outcome has been committed.
+
+### 14.3 Connectivity, path and transport layer
+
+The workspace contains `nexus-connectivity`, `nexus-path`, `nexus-transport`, `nexus-fabric`, `nexus-turn`, `nexus-nat-traversal`, `nexus-nat-wireup` and `nexus-nat-quality`. These names do not by themselves prove end-to-end closure; runtime claims must be tied to assembly/scenario evidence.
+
+`nexus-network` exposes N1 assembly through its `n1` module and deliberately consumes injected traits for fabric/path/discovery/platform rather than creating new architecture dependencies. Its simpler `NetworkSession` contract models Connecting → Active → Closed and only becomes Active after a request/response round trip yields a valid three-digit HTTP status.
+
+### 14.4 Proxy and DNS layer
+
+The workspace contains `nexus-ingress`, `nexus-proxy-config`, `nexus-proxy`, `nexus-proxy-transport`, `nexus-dns` and protocol-specific outbound crates for Shadowsocks, VMess, Trojan, AnyTLS, VLESS and Hysteria2.
+
+The `nexus-proxy` implementation describes an explicit local pipeline:
+
+SOCKS5 ingress → `FlowContext` → ordered `RuleEngine` → rule-action chain → `GroupRegistry` → injected `nexus-connectivity::LinkActivator`.
+
+This is intentionally not a second Core Planner. Proxy rule selection is domain-local; urltest consumes injected measurements and does not perform live probing inside the rule engine.
+
+### 14.5 Workspace, compute and storage layer
+
+The workspace contains `nexus-workspace`, `nexus-compute` and `nexus-storage`.
+
+`nexus-storage` implements a portable content-addressed store contract. Equal bytes deterministically map to equal `ObjectId` values. The current portable implementation includes protected roots and reachability-GC semantics; deletion is constrained to the GC path rather than exposed as an unrestricted product operation.
+
+`nexus-workspace` contains immutable commit/DAG semantics and deterministic conflict identity. A `HeadSet` may contain more than one head during offline divergence; conflict identity normalizes local/remote ordering so the two endpoints can derive the same conflict id.
+
+`nexus-compute` now contains both the older request/response job-session surface and newer N3 task-oriented modules: `task`, `task_artifact`, `task_requester`, and `task_runtime`. The task comments explicitly distinguish provider-owned durable acceptance from legacy job sessions. Therefore “compute exists” is too coarse a status: legacy session flow and durable N3 task semantics must be audited separately.
+
+### 14.6 Platform layer
+
+The root workspace explicitly includes the platform abstraction plus Linux, Windows, macOS, Android and iOS crates. Workspace membership proves source/build participation only; it does not prove equivalent runtime capability. Per-platform closure remains a separate evidence matrix.
+
+### 14.7 Engineering layer
+
+`engineering/nexus-harness` is a workspace member; `engineering/evidence-schema`, plugins and verifiers are repository engineering assets around it. This reinforces the earlier conclusion that the repository contains both a product runtime and an agent-native verification/governance runtime.
+
+## 15. Concrete execution semantics verified from source
+
+### 15.1 Planner execution model
+
+The planner is not an abstract future interface. Source defines a concrete two-stage solver. `PlanningSnapshot` is frozen for one planning cycle; hard predicates reject candidates before score; optional connectivity evaluation gates infeasible candidates; scoring uses deterministic integer arithmetic; locality is a preference bonus rather than an absolute override; and `DecisionTrace` captures considered candidates, rejection reasons and score components. The planner performs no network I/O.
+
+This gives a precise current-state boundary:
+
+measurement/discovery/connectivity facts → frozen planning snapshot → Filter → connectivity feasibility gate → Score → Plan + DecisionTrace.
+
+Estimation may feed typed plan-extension facts into planning, but an estimator is not allowed to emit a competing system-level Plan.
+
+### 15.2 Session ownership model
+
+`nexus-session` is also executable semantics rather than merely vocabulary. Workers emit structured events; `SessionOwner` owns phase and terminal outcome; `commit_outcome` is the commit-once authority. Cooperative cancellation and abort-on-owner-loss are explicit primitives. A terminal outcome does not imply immediate disposal, because lifecycle cleanup remains independently representable.
+
+### 15.3 Network session semantics
+
+The simple InternetAccess `NetworkSession::establish` sends a request through an injected `NetworkTransport`, receives one frame, parses the HTTP status from the first line, and only then transitions to Active. Transport failure, closed channel and invalid/unauthorized response are distinct errors. This is a useful narrow executable contract, but must not be mistaken for proof that the complete N1 product path is closed.
+
+### 15.4 Compute session semantics
+
+The legacy `ComputeJobSession::submit` similarly performs an explicit frame round trip. `OK:<result>` activates the session and records the result; `REJECTED` is a provider rejection; other response shapes are protocol errors. The session can then transition Active → Closed while retaining the result. New N3 durable-task modules coexist with this legacy surface and require separate status reporting.
+
+## 16. Daemon ownership and current runtime facts
+
+The daemon source now proves more runtime ownership than its introductory “honest boundary” comment claims.
+
+A particularly concrete N2 example is `N2_SESSION_MANAGER`: it is a process-global `OnceLock` containing the daemon-owned shared session manager and its config root. The source comment records that an earlier implementation assembled and immediately dropped the manager, while the current implementation retains it. LocalAPI N2 session list/attach reads use this manager.
+
+The daemon also owns a periodic N2 detached-session sweeper. It wakes on a fixed interval, exits cooperatively on daemon shutdown, calls `sweep_detached` through the retained manager, and converges sessions outside the attach window to a cancelled outcome rather than silently treating disconnect as failure.
+
+Assembly failure is intentionally degraded rather than fatal: the daemon can continue while N2 integration exposes a structured failure path. The singleton also binds itself to one canonicalized config root; attempts to reuse it for a different root are refused rather than silently cross-wiring state.
+
+These facts mean the file-level comment saying the daemon merely reports configured/unconfigured state must be classified as stale documentary evidence wherever it conflicts with later executable assembly.
+
+## 17. Expanded drift register
+
+### 17.1 nexusd header versus executable body
+
+**Documentary claim:** the file header says mesh/proxy/dns long-lived runtime assembly is future work and status only reports configuration.
+
+**Executable evidence:** the same current source contains retained daemon-owned N2 session state, LocalAPI integration, a background detached-session sweeper, degraded assembly behavior, and additional N1/runtime assembly code beyond that introductory statement.
+
+**Baseline treatment:** executable code wins. The header is retained as evidence of historical intent/drift, not as authoritative current-state truth.
+
+### 17.2 “crate exists” versus “capability closed”
+
+The workspace has broad coverage—NAT traversal, TURN, proxy protocols, five platform crates, workspace, compute and storage—but membership is only evidence that the component participates in the Rust workspace. Every product-level claim still needs wiring and scenario/evidence status.
+
+### 17.3 Compute has two semantic generations
+
+The coexistence of `ComputeJobSession` and provider-owned durable N3 task modules means a single “Compute: implemented” label would erase an important migration boundary. Subsequent capability tables must split legacy remote-job round-trip semantics from N3 durable task acceptance/runtime/artifact/requester semantics.
+
+## 18. Remaining exhaustive audit work
+
+This pass materially expands the baseline from architecture skeleton into source-level implementation facts, but it is not yet the requested exhaustive repository certification. Remaining work is intentionally explicit:
+
+1. enumerate every one of the 49 workspace members with public surface, allowed dependencies, runtime owner and status;
+2. trace N1 end-to-end from CLI/LocalAPI through daemon assembly, planning/connectivity/path/fabric and failure/degraded paths;
+3. trace N2 workspace/session operations including persistence, attach/re-attach, conflict and recovery;
+4. trace N3 durable task acceptance, execution replay, artifacts, cancellation and write-back;
+5. inventory all scenario files and map each capability to E0–E5 evidence at this exact revision;
+6. build the Linux/Windows/macOS/Android/iOS capability matrix from executable platform code;
+7. audit configuration load, validation, hot reload, rollback/rejection and subsystem restart semantics;
+8. audit proxy/DNS/TUN composition and each outbound protocol's real wiring;
+9. audit NAT traversal/TURN/path selection and roaming/rebind ownership;
+10. audit shutdown ordering, task/thread ownership, persistence/recovery and crash-consistency boundaries.
+
+The baseline should not be called exhaustive until these ten passes are represented with source-backed tables or traces.
