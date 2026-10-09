@@ -194,6 +194,61 @@ fn wss_signaling_establishes_data_channel_and_node_list() {
 }
 
 #[test]
+fn wss_signaling_stays_open_after_offer() -> TestResult {
+    let cfg = test_config(
+        "node-a",
+        "node-a",
+        "127.0.0.1:0".parse().unwrap(),
+        dead_ssh_target(),
+    );
+    let handle = Gateway::start(cfg).expect("start gateway");
+
+    let mut browser = Browser::connect_first(
+        &handle.cert_der,
+        handle.local_addr,
+        "node-a",
+        "sess-keepalive",
+    )
+    .expect("connect first");
+    browser.drive_all(Duration::from_secs(2))?;
+
+    // The browser sends exactly one offer and then goes silent over WSS (the
+    // data plane runs on WebRTC DataChannels). The gateway must NOT impose its
+    // HTTP-read timeout on the upgraded WebSocket: a healthy connection has to
+    // stay open well past the old 15s cutoff, otherwise the frontend surfaces
+    // a bogus "Signaling closed" error that also covers the B4 ICE guidance.
+    std::thread::sleep(Duration::from_secs(16));
+
+    // The socket must still be readable (i.e. not closed by the server).
+    browser
+        .ws
+        .get_mut()
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_millis(500)))?;
+    match browser.ws.read() {
+        Err(tungstenite::Error::Io(e))
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut => {}
+        Err(tungstenite::Error::ConnectionClosed) => {
+            return Err("signaling WebSocket was closed after offer".into());
+        }
+        Err(e) => return Err(format!("unexpected read result: {e}").into()),
+        Ok(_) => {}
+    }
+
+    // And it must still accept writes (send a session close).
+    browser.ws.send(tungstenite::Message::Text(
+        serde_json::to_string(&serde_json::json!({
+            "type": "close",
+            "session_id": browser.session_id,
+        }))
+        .expect("close json"),
+    ))?;
+
+    Ok(())
+}
+
+#[test]
 fn two_mesh_nodes_data_channels() {
     let mesh = Arc::new(nexus_web_gateway::mesh::InMemoryMeshSignaler::new());
 

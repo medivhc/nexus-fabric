@@ -412,6 +412,17 @@ fn handle_browser_ws(
     shared: Arc<Shared>,
     mut ws: tungstenite::WebSocket<http::TlsStream>,
 ) -> Result<(), GatewayError> {
+    // The browser signaling WebSocket is a long-lived connection: the browser
+    // sends one offer and then stays silent while the data plane runs over
+    // WebRTC DataChannels. Keep the HTTP-read timeout (used only to bound the
+    // initial request) OFF the upgraded socket; otherwise a healthy page dies
+    // ~15s after joining and the frontend shows a bogus "Signaling closed"
+    // error that also covers the first-node ICE guidance.
+    ws.get_mut()
+        .get_mut()
+        .set_read_timeout(None)
+        .map_err(GatewayError::Io)?;
+
     loop {
         let msg = match ws.read() {
             Ok(m) => m,
