@@ -20,7 +20,7 @@ fn main() {
             let cfg = match GatewayConfig::from_json_file(p) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("config error: {e}");
+                    eprintln!("{e}");
                     std::process::exit(1);
                 }
             };
