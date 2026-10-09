@@ -33,3 +33,6 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 # to the target sshd and authenticates with the browser's form credentials;
 # the browser DataChannel carries only the terminal byte stream (pty layer).
 ssh2 = { version = "0.9", default-features = false }
+# getifaddrs: enumerate local interface addresses so an unspecified listen_addr
+# (0.0.0.0) can derive a routable UDP/ICE host candidate for the browser.
+getifaddrs = "0.6"

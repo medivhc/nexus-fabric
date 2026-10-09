@@ -168,6 +168,25 @@ fn https_serves_page_config_and_cert() {
 }
 
 #[test]
+fn unspecified_listen_addr_derives_concrete_page_addr() {
+    let cfg = test_config(
+        "node-a",
+        "node-a",
+        "0.0.0.0:0".parse().unwrap(),
+        dead_ssh_target(),
+    );
+    let handle = Gateway::start(cfg).expect("start gateway with 0.0.0.0");
+
+    // The HTTPS listener is still on the unspecified address...
+    assert!(handle.local_addr.ip().is_unspecified());
+    // ...but the browser-facing page address must be concrete (never
+    // `https://0.0.0.0:.../`, which real browsers cannot open).
+    assert!(!handle.page_addr.ip().is_unspecified());
+    // The page address must carry the actual bound port (ephemeral here).
+    assert_eq!(handle.page_addr.port(), handle.local_addr.port());
+}
+
+#[test]
 fn wss_signaling_establishes_data_channel_and_node_list() {
     let cfg = test_config(
         "node-a",

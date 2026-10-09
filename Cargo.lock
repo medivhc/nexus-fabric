@@ -1619,6 +1619,7 @@ name = "nexus-web-gateway"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "getifaddrs",
  "rcgen 0.13.2",
  "rustls",
  "serde",

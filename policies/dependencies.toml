@@ -610,3 +610,20 @@ os_transitive_deps = "none"
 approved = true
 approved_date = "2026-10-08"
 review_basis = "复用 nexus-turn 已审的 sha1 依赖，RFC 6455 强制要求"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-web-gateway"
+crate = "getifaddrs"
+version = "0.6"
+default_features = false
+features = []
+architecture_layer = "delivery (web gateway); enumerate local interface addresses when listen_addr is unspecified (0.0.0.0) so the WebRTC UDP/ICE host candidate is routable"
+feature_scope = "no features"
+license = "MIT OR Apache-2.0 (allowlisted)"
+security = "no known advisories; already in Cargo.lock as transitive dep of tun-rs"
+portability = "cross-platform (unix getifaddrs / windows)"
+supply_chain = "0.6.2 pinned by Cargo.lock; already in tree via tun-rs"
+os_transitive_deps = "libc (already in tree), bitflags, windows-sys"
+approved = true
+approved_date = "2026-10-10"
+review_basis = "修复 B-R1：0.0.0.0 时按网卡派生可路由 UDP 地址，避免 SDP 只带 loopback 候选导致真实浏览器零连接"

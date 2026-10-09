@@ -32,6 +32,52 @@ use crate::mesh::{InMemoryMeshSignaler, MeshDataConnection, MeshSignaler, WssMes
 use crate::protocol::{BrowserMessage, MeshMessage, NodeMessage, SdpPayload, SshAuth};
 use crate::ssh_client::{self, SshInput};
 
+/// Pick the IP address the shared WebRTC UDP socket binds to.
+///
+/// A concrete `listen_addr` binds the UDP socket to the same IP so the SDP
+/// host candidate is reachable from browsers. An unspecified address
+/// (`0.0.0.0` / `::`) has no single routable IP, so we derive the first
+/// non-loopback address from the local interfaces; otherwise the socket would
+/// only carry a loopback host candidate that real browsers never collect
+/// (the `0.0.0.0` example-config dead end). When no non-loopback address
+/// exists we fall back to loopback and warn loudly.
+fn udp_bind_ip(listen_ip: std::net::IpAddr) -> std::net::IpAddr {
+    if !listen_ip.is_unspecified() {
+        return listen_ip;
+    }
+    let Ok(interfaces) = getifaddrs::getifaddrs() else {
+        return loopback_for(listen_ip);
+    };
+    for iface in interfaces {
+        if iface.flags.contains(getifaddrs::InterfaceFlags::LOOPBACK) {
+            continue;
+        }
+        if let Some(ip) = iface.address.ip_addr() {
+            if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+                continue;
+            }
+            let same_family = matches!(
+                (listen_ip, ip),
+                (std::net::IpAddr::V4(_), std::net::IpAddr::V4(_))
+                    | (std::net::IpAddr::V6(_), std::net::IpAddr::V6(_))
+            );
+            if same_family {
+                return ip;
+            }
+        }
+    }
+    loopback_for(listen_ip)
+}
+
+/// Loopback fallback for an unspecified `listen_addr` with no usable
+/// non-loopback interface.
+fn loopback_for(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        std::net::IpAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+    }
+}
+
 /// Maximum UDP datagram payload the gateway reads from the shared socket.
 const UDP_BUF_SIZE: usize = 2048;
 
@@ -174,8 +220,13 @@ struct SshRelay {
 
 /// The running gateway handle.
 pub struct GatewayHandle {
-    /// Local address of the HTTPS listener.
+    /// Local address of the HTTPS listener (may be `0.0.0.0` when the config
+    /// used an unspecified `listen_addr`).
     pub local_addr: std::net::SocketAddr,
+    /// Address browsers should open in practice. When `listen_addr` is
+    /// unspecified this is the derived routable IP plus the listener port,
+    /// so the printed page URL is never an unusable `0.0.0.0`.
+    pub page_addr: std::net::SocketAddr,
     /// Self-signed certificate DER presented by the HTTPS server (the local CA).
     pub cert_der: Vec<u8>,
 }
@@ -237,11 +288,21 @@ impl Gateway {
         };
         let tls = Arc::new(cert::server_config(&identity)?);
 
-        let udp_ip = if cfg.listen_addr.ip().is_unspecified() {
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-        } else {
-            cfg.listen_addr.ip()
-        };
+        let udp_ip = udp_bind_ip(cfg.listen_addr.ip());
+        if cfg.listen_addr.ip().is_unspecified() {
+            if udp_ip.is_loopback() {
+                eprintln!(
+                    "warning: no non-loopback network interface found; WebRTC UDP socket bound \
+                     to {udp_ip} only. Browsers cannot reach a loopback ICE candidate — set \
+                     `listen_addr` to a routable IP address."
+                );
+            } else {
+                eprintln!(
+                    "note: `listen_addr` is unspecified; binding the WebRTC UDP socket to \
+                     {udp_ip} so browsers can reach the ICE host candidate."
+                );
+            }
+        }
         let udp = Arc::new(UdpSocket::bind((udp_ip, 0)).map_err(GatewayError::Io)?);
         udp.set_read_timeout(Some(Duration::from_millis(50)))
             .map_err(GatewayError::Io)?;
@@ -250,6 +311,9 @@ impl Gateway {
 
         let listener = TcpListener::bind(cfg.listen_addr).map_err(GatewayError::Io)?;
         let local_addr = listener.local_addr().map_err(GatewayError::Io)?;
+        // The address browsers should actually open (never `0.0.0.0`/`::`).
+        // Use the actually bound port so `listen_addr: "0.0.0.0:0"` works.
+        let page_addr = std::net::SocketAddr::new(udp_ip, local_addr.port());
 
         let shared = Arc::new(Shared {
             cfg: cfg.clone(),
@@ -288,6 +352,7 @@ impl Gateway {
 
         Ok(GatewayHandle {
             local_addr,
+            page_addr,
             cert_der: identity.cert_der,
         })
     }

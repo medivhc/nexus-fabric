@@ -29,12 +29,12 @@ fn main() {
                 Ok(handle) => {
                     println!(
                         "Nexus Web Gateway '{}' listening on https://{}",
-                        cfg.node_name, handle.local_addr
+                        cfg.node_name, handle.page_addr
                     );
                     println!(
                         "Page: https://{}/  (download the local CA at https://{}/cert \
                          and install it once; the certificate persists across restarts)",
-                        handle.local_addr, handle.local_addr
+                        handle.page_addr, handle.page_addr
                     );
                     loop {
                         std::thread::sleep(std::time::Duration::from_secs(3600));
