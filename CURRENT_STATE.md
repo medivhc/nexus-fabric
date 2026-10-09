@@ -611,3 +611,100 @@ For all remaining audits, use these rules:
 7. stale evidence is evidence that a test once ran, not evidence for the current baseline.
 
 This resolves the largest epistemic ambiguity in the repository: the same feature can legitimately be Contract + Implemented + Wired while still not be Verified for the captured revision.
+
+
+## 36. CLI and LocalAPI routing: the control plane is not yet unified
+
+Source tracing of `apps/nexus/src/main.rs` and `apps/nexusd/src/main.rs` shows that the current CLI is only partially a thin client. The top-level CLI comment is accurate only for a subset of commands.
+
+### 36.1 Commands that use daemon LocalAPI
+
+The generic observability path maps supported `ControlCommand` values through `localapi_client::route_for_dynamic` / `route_for` and issues authenticated HTTP GET requests. Daemon-side routes currently include status, dataplane stats, DNS status/cache, frozen session watch, N2 daemon session list/attach, plan explain, connectivity status, platform capabilities and Linux workspace mounts/commit.
+
+N3 `task` and `artifact` command families take a separate thin-client path through `nexus::task_cli` into the authenticated/versioned daemon task HTTP service. `task_http::dispatch` gets first chance to consume the request before the legacy/general GET router.
+
+LocalAPI is bearer-authenticated even on local transports. TCP service is loopback-oriented; Unix socket mode hardens the socket to 0600 and refuses an unsafe predictable temp-socket fallback. Per-connection read/write timeout is bounded at five seconds to prevent a client that never terminates headers from pinning the control plane.
+
+### 36.2 Commands that still execute in the CLI process
+
+The following important command families do **not** uniformly use daemon ownership:
+
+- `plan`: local resolve/filter/score preview;
+- `use`: local N2 resource-access path;
+- `session`: local N2 session store/manager path;
+- `resource`: local N2 resource directory;
+- `grant`: local N2 grant management;
+- `provider`: provider-side admission process;
+- `run <resource>`: in-process SDK;
+- `network up/status`: in-process composition;
+- subnet, schedule, proxy, system-proxy, autostart, pair, node and config families: in-process/local operations.
+
+Unsupported observability commands do not silently fall back to in-process behavior; they synthesize an explicit UNSUPPORTED result. That is good honesty, but it also exposes the incomplete migration surface.
+
+### 36.3 Ownership contradiction that remains
+
+The daemon now owns a global N2 `SessionManager`, and its `/localapi/v0/n2/session/list` and `/attach` routes read that owner. Yet the primary `nexus session ...` CLI family still executes through `nexus::session_cli` using the in-process N2 path. `nexus use` is likewise in-process.
+
+Therefore “daemon is the sole runtime owner of all N2 sessions” is not yet a repository-wide truth. It is true for the daemon-integrated path, but the CLI still exposes parallel local N2 execution paths. This is a concrete control-plane convergence gap, not merely documentation drift.
+
+There are also two session-watch semantics: `session_cli` owns current N2 CLI behavior, while daemon `/localapi/v0/session/watch` is retained as a frozen older observability route. They must not be conflated.
+
+## 37. Daemon boot and shutdown ordering
+
+The executable `run_daemon` path gives a more precise lifecycle than the older header comments.
+
+Boot order is materially:
+
+1. validate config directory and load configuration;
+2. resolve potential orphan workspace mountpoints;
+3. run generic `boot_reconcile` against durable Session/Connectivity state **before accepting new work**;
+4. assemble/replay/reconcile the daemon N2 SessionManager and start the detached-session sweeper;
+5. validate that at least one meaningful subsystem is configured;
+6. build dataplane configuration;
+7. assemble N1, with failure degraded rather than daemon-fatal;
+8. optionally start the single-TUN dataplane thread;
+9. start LocalAPI and wait up to five seconds for READY;
+10. on Linux, start Workspace mounts after LocalAPI ownership is established;
+11. start config watcher and enter the single-writer reload loop.
+
+Shutdown is ordered: LocalAPI → N2 sweeper → Workspace unmount → dataplane → N1 → clear run marker. Individual joins are bounded rather than allowed to hang indefinitely.
+
+This lifecycle is executable composition-root behavior and supersedes the introductory claim that mesh/proxy/DNS long-lived runtime assembly is simply “future work”.
+
+## 38. Generic crash recovery and N3 execution recovery are separate layers
+
+`apps/nexusd/src/recovery.rs` explicitly scopes the generic daemon recovery layer to Session + Connectivity durable markers. It persists `sessions.json`, `links.json` and `run.marker` under `<config>/state`. Writes use same-directory temp + fsync + rename atomic replacement. On restart, stale link markers are not treated as live sockets; unrecoverable/orphan session state is made explicit rather than silently discarded.
+
+The comment saying Workspace/Compute recovery is “Phase 2/3” is only valid for this generic marker module. It must not be generalized to mean that N3 Task crash recovery does not exist.
+
+N3 has a separate and substantially stronger recovery system across acceptance authority, runtime journal, executor proofs, artifact/result state and capacity reconciliation.
+
+### 38.1 N3 executor cold reconciliation
+
+`task_executor_recovery.rs` is conservative by construction:
+
+- it reconciles the original execution identity and never creates/starts a replacement execution;
+- recovery proofs are bound to TaskId and immutable contract digest;
+- Docker container and exec IDs must match the persisted engine identity;
+- command/cwd must match the accepted contract;
+- durable exit/reap/stop-intent proofs are validated before synthesizing corresponding runtime events;
+- missing Docker inspect data or ambiguous ownership is **not** proof of `ExecutionLost`;
+- ambiguous state becomes pending/observation-lost rather than fabricated success/failure;
+- cancellation recovery requires original stop intent plus agreement with the original stopped engine namespace;
+- timeout budget is not reset or extended merely because the daemon restarted.
+
+This is a strong exactly-once-oriented safety property: uncertainty is preserved as uncertainty instead of being converted into a convenient terminal outcome.
+
+## 39. Current control-plane convergence assessment
+
+The product currently has three execution styles coexisting:
+
+1. daemon-owned LocalAPI/runtime paths;
+2. CLI-local/in-process SDK paths;
+3. dedicated long-lived or foreground composition roots such as provider/network/proxy operations.
+
+This is not inherently invalid, but it means the architectural statement “CLI is a thin client and daemon is the sole owner” is aspirational rather than universally true.
+
+The most important remaining convergence work is to decide which operations are intentionally local administration and which should migrate behind daemon ownership. In particular, N2 `use/session/resource/grant` semantics need an explicit ownership decision; otherwise daemon state and CLI-local state can continue to represent different operational worlds.
+
+For the current-state baseline, the rule is simple: document the route that actually executes today, not the route implied by the top-level architecture comment.
