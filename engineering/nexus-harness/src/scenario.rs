@@ -700,14 +700,15 @@ pub fn run_gate(config: &Config, gate_name: &str, subdirs: &[&str]) -> (Vec<Scen
     };
     let mut results: Vec<ScenarioResult> = Vec::new();
     let mut failed = false;
-    for (s, rep) in scenarios.iter().zip(reports.iter()) {
+    // reports 在此之后不再使用，直接 move 字段，省去堆内存复制（review suggestion）。
+    for (s, rep) in scenarios.iter().zip(reports) {
         if rep.verdict == "FAIL" {
             failed = true;
         }
         results.push(ScenarioResult {
             id: s.id.clone(),
-            verdict: rep.verdict.clone(),
-            detail: rep.detail.clone(),
+            verdict: rep.verdict,
+            detail: rep.detail,
         });
     }
     let detail: Vec<String> = results
