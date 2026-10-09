@@ -37,6 +37,7 @@ button:disabled { opacity: 0.5; cursor: default; }
 #auth-form { display: grid; gap: 8px; margin-bottom: 10px; }
 #auth-form label { font-size: 13px; display: grid; gap: 4px; }
 #auth-form input, #auth-form textarea { background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 8px; font-family: inherit; }
+.terminal-error { color: var(--err); font-size: 13px; margin-bottom: 8px; white-space: pre-wrap; }
 #terminal-container { height: 420px; }
 #terminal-container .xterm { height: 100%; }
 [hidden] { display: none !important; }

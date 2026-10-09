@@ -11,38 +11,40 @@
 use nexus_web_gateway::{Gateway, GatewayConfig};
 
 fn main() {
-    let path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| {
-            eprintln!("usage: gateway <config.json>");
-            std::process::exit(2);
-        });
-
-    let cfg = match GatewayConfig::from_json_file(&path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("config error: {e}");
-            std::process::exit(1);
+    let path = std::env::args().nth(1);
+    match path.as_deref() {
+        None | Some("--help" | "-h") => {
+            println!("usage: gateway <config.json>");
         }
-    };
+        Some(p) => {
+            let cfg = match GatewayConfig::from_json_file(p) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("config error: {e}");
+                    std::process::exit(1);
+                }
+            };
 
-    match Gateway::start(cfg.clone()) {
-        Ok(handle) => {
-            println!(
-                "Nexus Web Gateway '{}' listening on https://{}",
-                cfg.node_name, handle.local_addr
-            );
-            println!(
-                "Page: https://{}/  (install the local CA certificate on first visit)",
-                handle.local_addr
-            );
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(3600));
+            match Gateway::start(cfg.clone()) {
+                Ok(handle) => {
+                    println!(
+                        "Nexus Web Gateway '{}' listening on https://{}",
+                        cfg.node_name, handle.local_addr
+                    );
+                    println!(
+                        "Page: https://{}/  (download the local CA at https://{}/cert \
+                         and install it once; the certificate persists across restarts)",
+                        handle.local_addr, handle.local_addr
+                    );
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(3600));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("gateway failed to start: {e}");
+                    std::process::exit(1);
+                }
             }
-        }
-        Err(e) => {
-            eprintln!("gateway failed to start: {e}");
-            std::process::exit(1);
         }
     }
 }

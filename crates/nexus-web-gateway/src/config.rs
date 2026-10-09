@@ -44,34 +44,30 @@ pub struct IceServer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum TlsConfig {
-    /// Generate a self-signed local-CA certificate at startup for the given
-    /// DNS names and IP addresses (recommended for LAN/VPN mesh IPs).
+    /// Generate a self-signed local-CA certificate for the given DNS names and
+    /// IP addresses. When `cert_dir` is set (or on the default path), the
+    /// certificate and key are persisted to disk so the fingerprint is stable
+    /// across restarts and the `/cert` endpoint can serve the CA.
     AutoGenerate {
         #[serde(default)]
         names: Vec<String>,
         #[serde(default)]
         ips: Vec<IpAddr>,
+        /// Optional directory for persisting the generated certificate/key.
+        /// `None` uses the default per-node cache directory.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cert_dir: Option<String>,
     },
     /// Load an existing certificate chain + private key from PEM files.
-    Files {
-        cert_path: String,
-        key_path: String,
-    },
+    Files { cert_path: String, key_path: String },
 }
 
 /// SSH terminal bridge configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshConfig {
-    /// TCP target the DataChannel bytes are forwarded to (the node's local sshd).
+    /// TCP target the node's SSH client connects to (the node's local sshd).
     #[serde(default = "default_ssh_target")]
     pub target: SocketAddr,
-    /// Optional prologue sent as the first bytes on the TCP connection.
-    ///
-    /// `{username}`, `{password}` and `{private_key}` are substituted from the
-    /// browser's `ssh_open` auth payload. This is used by the mock-sshd test
-    /// harness; a real sshd requires `None` (pure byte forwarding).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth_prologue: Option<String>,
     /// Maximum concurrent terminals per browser session.
     #[serde(default = "default_max_terminals")]
     pub max_terminals: usize,
@@ -96,7 +92,6 @@ impl Default for SshConfig {
     fn default() -> Self {
         Self {
             target: default_ssh_target(),
-            auth_prologue: None,
             max_terminals: default_max_terminals(),
             idle_timeout_secs: default_idle_timeout_secs(),
         }
@@ -294,6 +289,7 @@ mod tests {
             tls: TlsConfig::AutoGenerate {
                 names: vec!["localhost".into()],
                 ips: vec!["127.0.0.1".parse().unwrap()],
+                cert_dir: None,
             },
             ssh: SshConfig::default(),
             mesh: MeshConfig::InMemory,
@@ -311,40 +307,28 @@ mod tests {
     fn empty_node_id_rejected() {
         let mut cfg = valid_config();
         cfg.node_id = "".into();
-        assert!(matches!(
-            cfg.validate(),
-            Err(GatewayError::Config(_))
-        ));
+        assert!(matches!(cfg.validate(), Err(GatewayError::Config(_))));
     }
 
     #[test]
     fn empty_node_list_rejected() {
         let mut cfg = valid_config();
         cfg.node_list.clear();
-        assert!(matches!(
-            cfg.validate(),
-            Err(GatewayError::Config(_))
-        ));
+        assert!(matches!(cfg.validate(), Err(GatewayError::Config(_))));
     }
 
     #[test]
     fn node_list_must_contain_self() {
         let mut cfg = valid_config();
         cfg.node_list[0].peer_id = "other".into();
-        assert!(matches!(
-            cfg.validate(),
-            Err(GatewayError::Config(_))
-        ));
+        assert!(matches!(cfg.validate(), Err(GatewayError::Config(_))));
     }
 
     #[test]
     fn zero_max_terminals_rejected() {
         let mut cfg = valid_config();
         cfg.ssh.max_terminals = 0;
-        assert!(matches!(
-            cfg.validate(),
-            Err(GatewayError::Config(_))
-        ));
+        assert!(matches!(cfg.validate(), Err(GatewayError::Config(_))));
     }
 
     #[test]
@@ -368,20 +352,14 @@ mod tests {
     fn node_list_empty_peer_id_rejected() {
         let mut cfg = valid_config();
         cfg.node_list[0].peer_id = "".into();
-        assert!(matches!(
-            cfg.validate(),
-            Err(GatewayError::Config(_))
-        ));
+        assert!(matches!(cfg.validate(), Err(GatewayError::Config(_))));
     }
 
     #[test]
     fn node_list_duplicate_peer_id_rejected() {
         let mut cfg = valid_config();
         cfg.node_list.push(cfg.node_list[0].clone());
-        assert!(matches!(
-            cfg.validate(),
-            Err(GatewayError::Config(_))
-        ));
+        assert!(matches!(cfg.validate(), Err(GatewayError::Config(_))));
     }
 
     #[test]
@@ -392,10 +370,7 @@ mod tests {
             username: None,
             credential: None,
         });
-        assert!(matches!(
-            cfg.validate(),
-            Err(GatewayError::Config(_))
-        ));
+        assert!(matches!(cfg.validate(), Err(GatewayError::Config(_))));
     }
 
     #[test]
@@ -405,10 +380,7 @@ mod tests {
             cert_path: "".into(),
             key_path: "".into(),
         };
-        assert!(matches!(
-            cfg.validate(),
-            Err(GatewayError::Config(_))
-        ));
+        assert!(matches!(cfg.validate(), Err(GatewayError::Config(_))));
     }
 
     #[test]
@@ -418,10 +390,7 @@ mod tests {
             token: "".into(),
             peers: vec![],
         };
-        assert!(matches!(
-            cfg.validate(),
-            Err(GatewayError::Config(_))
-        ));
+        assert!(matches!(cfg.validate(), Err(GatewayError::Config(_))));
     }
 
     #[test]
@@ -435,10 +404,7 @@ mod tests {
                 token: "token-b".into(),
             }],
         };
-        assert!(matches!(
-            cfg.validate(),
-            Err(GatewayError::Config(_))
-        ));
+        assert!(matches!(cfg.validate(), Err(GatewayError::Config(_))));
     }
 
     #[test]

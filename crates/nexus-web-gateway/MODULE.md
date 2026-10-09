@@ -4,21 +4,23 @@
 
 浏览器零安装接入 Nexus 网格的 Web 接入点（每节点内嵌）：
 
-- HTTPS 服务：静态页面（xterm.js 终端）+ `/api/config` + WSS 信令端点 `/ws`。
+- HTTPS 服务：静态页面（xterm.js 终端）+ `/api/config` + `/cert`（本地 CA 下载）+ WSS 信令端点 `/ws`。
 - 节点侧 WebRTC 端点（str0m，sans-IO）：接受浏览器 SDP offer，建立
   RTCPeerConnection + DataChannel（控制通道）。
 - 经控制通道下发 mesh 节点列表（PeerId、候选地址、服务目录）与 ICE 服务器配置。
 - SDP 信令中继：浏览器对其他节点的 offer 经已建连 mesh 转发（`MeshSignaler` trait），
   不依赖外部信令服务。
-- 网页 SSH 终端：浏览器 DataChannel → 目标节点 → 本地 sshd（TCP 转发）。
+- 网页 SSH 终端：浏览器 DataChannel → 目标节点 → **节点侧真实 SSH 客户端（ssh2/libssh2）**
+  → 本地 sshd。浏览器表单里的账号密码/私钥经安全通道传给节点，在节点侧完成 SSH
+  握手与认证，不落盘。浏览器 ↔ 节点之间只传终端字节流（pty 层），SSH 协议只发生在
+  节点 ↔ sshd 之间。
 
 ## Non-Responsibilities
 
-- 不做真实 SSH 客户端/服务器协议（节点只做 TCP 字节转发；SSH 认证由页面侧
-  SSH 客户端或后续阶段的节点侧 SSH 客户端完成）。
+- 不做 SSH 服务器；SSH 协议只发生在节点 ↔ sshd（浏览器不解析 SSH 协议）。
 - 不做浏览器能力暴露（摄像头/传感器）、文件系统浏览、HTTP 服务代理（Phase 2）。
 - 不做持久身份与验证（MVP 用临时身份，节点默认接受）。
-- 不做 TURN 服务器本身（TURN 是标准外部服务器；节点仅把占位符配置下发给浏览器）。
+- 不做 TURN 服务器本身（TURN 是标准外部服务器；节点仅把配置下发给浏览器）。
 - 不实现 Nexus fabric FIB 信令后端（`MeshSignaler` 是接缝；fabric 后端后续接入）。
 
 ## Inputs
@@ -43,6 +45,7 @@
 - `rustls` / `rcgen`（TLS 1.3 + 本地 CA 自签证书）
 - `serde` / `serde_json`（协议与配置）
 - `sha1` / `base64`（RFC 6455 WebSocket 握手）
+- `ssh2` / `libssh2-sys`（节点侧真实 SSH 客户端；仅 `std` 同步线程模型）
 - 仅 `std` 线程模型，零 async runtime（与仓库 std-only 姿态一致）。
 
 ## Forbidden Dependencies
@@ -50,16 +53,18 @@
 - `tokio`、`async-std`、任何 async runtime。
 - Nexus 内部 crate（本 crate 是独立接入模块；fabric FIB 经 `MeshSignaler` trait
   注入，不直接依赖 `nexus-fabric`）。
-- 真实密钥/证书材料硬编码。
+- 真实密钥/证书材料硬编码（证书经 `cert_dir` 落盘，密钥/凭证不写日志）。
 
 ## Invariants
 
 **G1（全程 TLS）**：所有浏览器可见路径均为 HTTPS/WSS，无纯 HTTP。
 **G2（临时身份）**：浏览器身份是内存中的临时 ed25519/随机 ID，节点侧默认接受，
 不持久化、不验证。
-**G3（中继不解密）**：SSH 终端是纯 TCP 字节转发，节点不解析 SSH 应用层内容。
-**G4（凭证不落盘）**：页面提交的密码/私钥只保存在内存 session 中，关闭即丢弃，
-不写盘、不做浏览器端存储。
+**G3（节点侧真实 SSH 客户端）**：节点与目标 sshd 之间运行完整 SSH 协议握手与认证
+（ssh2/libssh2）；浏览器 DataChannel/mesh 只承载终端字节流（pty 层），不解析 SSH
+应用层内容。SSH 协议绝不出现在浏览器 ↔ 节点之间。
+**G4（凭证不落盘）**：页面提交的密码/私钥只保存在内存 session 中，用于节点侧 SSH
+认证，关闭即丢弃，不写盘、不做浏览器端存储。
 **G5（最小 API 面）**：对外只暴露 `Gateway::start` / `GatewayConfig` /
 协议消息类型；内部 `Session`/事件循环为 private。
 **G6（类型化错误）**：业务失败返回 `GatewayError`，不用 panic。
@@ -67,6 +72,10 @@
 本地 token 由 `MeshConfig::Wss.token` 配置；缺失/错误返回 401。
 **G8（空闲终端回收）**：SSH bridge 超过 `SshConfig.idle_timeout_secs` 空闲即断开，
 事件循环周期性扫描并下发 `ssh_close`。
+**G9（不静默丢弃终端数据）**：网关收到未知 session 的 `ssh_data` 时必须回 `ssh_close`
+或明确错误，绝不静默吞掉。
+**G10（证书持久化）**：自签证书按节点落盘（`cert_dir`，默认 `$XDG_CACHE_HOME/nexus-web-gateway/<node_id>`），
+重启指纹不变；`/cert` 提供 PEM 下载。
 
 ## Side Effects
 
@@ -88,16 +97,18 @@
 
 - 单元测试：协议消息 roundtrip、SDP payload 转换、配置校验负路径
   （空 node_id / 空或重复 node_list / 空 ICE urls / TLS 文件空路径 /
-  mesh WSS 空 token 或空 peer 字段）。
+  mesh WSS 空 token 或空 peer 字段）、证书持久化（重启指纹不变）。
 - 集成测试（`tests/gateway_e2e.rs`）：
-  - HTTPS 页面与 `/api/config` 可访问（rustls 客户端 pin 本地 CA）。
+  - HTTPS 页面、`/api/config` 与 `/cert` 可访问（rustls 客户端 pin 本地 CA）。
   - WSS 信令：浏览器-like str0m 客户端经 WSS 交换 SDP，建立 DataChannel。
   - 双节点：经 in-memory mesh 中继，与第二个节点建立 DataChannel。
   - WSS mesh：两个独立 gateway 经 `/mesh` bearer-token 中继 SDP 并建连；
     错误 token 返回 401。
-  - SSH 终端：DataChannel → mock sshd（TCP）→ 回显，认证 prologue 生效；
-    空闲超时后终端被关闭。
-  - 负路径：无节点列表/空 node_id 配置被拒；SSH target 拒绝连接返回错误。
+  - SSH 终端：DataChannel → 节点侧真实 SSH 客户端（ssh2）→ **真实 sshd 子进程**
+    （OpenSSH，loopback 高端口，key 认证）→ 命令回显；空闲超时后终端被关闭。
+  - 中继 SSH：经 WSS mesh 在两个 gateway 间中继终端，目标节点跑真实 SSH 客户端。
+  - 负路径：无节点列表/空 node_id 配置被拒；SSH target 拒绝连接返回错误；
+    未知 session 的 `ssh_data` 返回 `ssh_close`；re-offer 被拒（返回错误而非假 answer）。
 
 ## Performance Budget
 

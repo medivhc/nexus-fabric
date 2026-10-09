@@ -21,8 +21,9 @@ pub mod gateway;
 pub mod http;
 pub mod mesh;
 pub mod protocol;
+pub mod ssh_client;
 
-pub use config::{GatewayConfig, MeshNodeInfo, IceServer, SshConfig, TlsConfig};
+pub use config::{GatewayConfig, IceServer, MeshNodeInfo, SshConfig, TlsConfig};
 pub use error::GatewayError;
 pub use gateway::{Gateway, GatewayHandle};
 pub use protocol::{BrowserMessage, NodeMessage, SdpPayload, SshAuth};

@@ -7,7 +7,9 @@
  * - Receives the mesh node list over the control DataChannel.
  * - Connects to every other node by relaying SDP offers through the
  *   established mesh (no external signaling service).
- * - Opens an SSH terminal: DataChannel -> target node -> local sshd.
+ * - Opens an SSH terminal: DataChannel -> target node -> real SSH client ->
+ *   local sshd. Terminal bytes travel over the DataChannel/mesh (pty layer);
+ *   the SSH protocol only happens node <-> sshd.
  */
 
 const $ = (id) => document.getElementById(id);
@@ -38,13 +40,21 @@ let ws = null;
 let firstPc = null;
 let controlChannel = null; // DataChannel to the first-touch node
 const nodeChannels = {};   // peer_id -> RTCDataChannel
-const nodeState = {};      // peer_id -> { connected, pc }
+const nodeState = {};      // peer_id -> { connected, connecting, pc }
 const iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
 
 let termNode = null;
 let term = null;
 let termFit = null;
 let currentSshSession = null;
+let currentSshChannel = null;   // channel the open SSH session is bound to
+let firstIceTimeout = null;    // first-touch ICE connection timeout handle
+
+const ICE_CONNECT_TIMEOUT_MS = 15000;
+// Binds an SSH session to the DataChannel route it was opened on, so terminal
+// bytes never switch channels mid-session (which caused silent freezing when a
+// direct channel to the target node late-connects).
+const sshRoutes = {}; // session_id -> { channel, node }
 
 $('peer-id').textContent = `peer: ${peerId}`;
 
@@ -54,10 +64,29 @@ function setStatus(text, cls) {
   el.className = `status ${cls || ''}`;
 }
 
+function setTerminalError(text) {
+  const el = $('terminal-error');
+  if (el) el.textContent = text;
+}
+
+function clearTerminalError() {
+  setTerminalError('');
+}
+
 function createPc() {
   const pc = new RTCPeerConnection({ iceServers });
   pc.oniceconnectionstatechange = () => {
     console.log('ice state', pc.iceConnectionState);
+    // First-touch node: if ICE ultimately fails, surface an actionable error
+    // instead of leaving the page stuck on "WebRTC established".
+    if (pc === firstPc &&
+        (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected')) {
+      setStatus(
+        'ICE connection to the first node failed. This node may be behind a strict NAT. ' +
+        'Configure a TURN server in the gateway config (ice_servers) or try another ' +
+        'node address from node_list.',
+        'error');
+    }
   };
   return pc;
 }
@@ -86,35 +115,65 @@ async function init() {
   }
 
   ws = new WebSocket(`wss://${location.host}/ws`);
-  ws.onopen = () => setStatus('Signaling connected, negotiating WebRTC…', 'connecting');
 
   ws.onmessage = async (ev) => {
     const msg = JSON.parse(ev.data);
     if (msg.type === 'answer' && firstPc) {
       await firstPc.setRemoteDescription({ type: 'answer', sdp: msg.sdp.sdp });
-      setStatus('WebRTC established', 'connecting');
+      // ICE may still be connecting; do NOT claim "WebRTC established" here.
+      // The control channel opening is the real signal.
+      setStatus('Signaling connected, establishing ICE…', 'connecting');
     } else if (msg.type === 'error') {
       setStatus(`Signaling error: ${msg.error}`, 'error');
     }
   };
 
-  ws.onclose = () => setStatus('Signaling closed', 'error');
-  ws.onerror = () => setStatus('Signaling error', 'error');
+  // Wait for the WebSocket to be OPEN before sending the offer. Sending while
+  // CONNECTING throws InvalidStateError in the browser and silently kills the
+  // join (no offer -> no answer -> the node list never appears).
+  const wsOpened = new Promise((resolve, reject) => {
+    ws.onopen = () => {
+      setStatus('Signaling connected, negotiating WebRTC…', 'connecting');
+      ws.onclose = () => setStatus('Signaling closed', 'error');
+      ws.onerror = () => setStatus('Signaling error', 'error');
+      resolve();
+    };
+    ws.onerror = () => reject(new Error('WebSocket error'));
+    ws.onclose = () => reject(new Error('WebSocket closed before connecting'));
+  });
 
-  firstPc = createPc();
-  controlChannel = openChannel(firstPc, 'control', onControlOpen, onControlMessage);
-  const offer = await firstPc.createOffer();
-  await firstPc.setLocalDescription(offer);
-  ws.send(JSON.stringify({
-    type: 'offer',
-    session_id: sessionId,
-    peer_id: peerId,
-    name: 'browser',
-    sdp: { type: 'offer', sdp: firstPc.localDescription.sdp },
-  }));
+  try {
+    await wsOpened;
+    firstPc = createPc();
+    controlChannel = openChannel(firstPc, 'control', onControlOpen, onControlMessage);
+    const offer = await firstPc.createOffer();
+    await firstPc.setLocalDescription(offer);
+    ws.send(JSON.stringify({
+      type: 'offer',
+      session_id: sessionId,
+      peer_id: peerId,
+      name: 'browser',
+      sdp: { type: 'offer', sdp: firstPc.localDescription.sdp },
+    }));
+
+    // First-touch node ICE timeout: if the control DataChannel never opens, tell
+    // the user what to do instead of hanging forever.
+    setTimeout(() => {
+      if (!controlChannel || controlChannel.readyState !== 'open') {
+        setStatus(
+          'Timed out waiting for the WebRTC connection to the first node. ' +
+          'This node may be behind a strict NAT. Configure a TURN server in the gateway ' +
+          'config (ice_servers) or try another node address from node_list.',
+          'error');
+      }
+    }, 15000);
+  } catch (e) {
+    setStatus(`Failed to join the mesh: ${e.message}`, 'error');
+  }
 }
 
 function onControlOpen() {
+  setStatus('WebRTC established', 'online');
   sendJson(controlChannel, { type: 'hello', peer_id: peerId, name: 'browser' });
 }
 
@@ -127,14 +186,20 @@ function onControlMessage(ev) {
   }
   switch (msg.type) {
     case 'hello_ack':
-      renderNodes(msg.node_list);
-      setStatus(`Joined ${msg.node_name} (${msg.node_list.length} nodes)`, 'online');
+      // Only the first-touch node's hello_ack should render the node list and
+      // trigger connections. Every other node also sends hello_ack; rendering
+      // those caused the reconnect storm.
+      if (msg.node_id === config.node_id) {
+        renderNodes(msg.node_list);
+        setStatus(`Joined ${msg.node_name} (${msg.node_list.length} nodes)`, 'online');
+      }
       break;
     case 'relay_answer':
       finishRelay(msg.target, msg.session_id, msg.sdp);
       break;
     case 'relay_error':
-      setNodeConn(msg.target, `relay error: ${msg.error}`);
+      setNodeConn(msg.target, `relay error: ${msg.error}`, false);
+      if (nodeState[msg.target]) nodeState[msg.target].connecting = false;
       break;
     case 'ssh_open_ack':
       handleSshOpenAck(msg);
@@ -175,11 +240,19 @@ function renderNodes(nodeList) {
     if (node.peer_id === config.node_id) {
       conn.textContent = 'connected (first node)';
       conn.classList.add('up');
-      nodeState[node.peer_id] = { connected: true };
+      nodeState[node.peer_id] = { connected: true, connecting: false };
     } else {
-      conn.textContent = 'connecting…';
-      nodeState[node.peer_id] = { connected: false };
-      connectToNode(node);
+      const st = nodeState[node.peer_id];
+      if (st && st.connected) {
+        conn.textContent = 'connected';
+        conn.classList.add('up');
+      } else if (st && st.connecting) {
+        conn.textContent = 'connecting…';
+      } else {
+        conn.textContent = 'connecting…';
+        nodeState[node.peer_id] = { connected: false, connecting: false };
+        connectToNode(node);
+      }
     }
 
     const btn = document.createElement('button');
@@ -200,10 +273,17 @@ function setNodeConn(peerId, text, up) {
 }
 
 async function connectToNode(node) {
+  const st = nodeState[node.peer_id];
+  // Deduplicate: never start a second connection while one is in flight, and
+  // never reconnect an already-connected node (reconnect storm fix).
+  if (!st || st.connected || st.connecting) return;
+  st.connecting = true;
+
   const pc = createPc();
-  nodeState[node.peer_id].pc = pc;
+  st.pc = pc;
   const ch = openChannel(pc, 'control', () => {
-    nodeState[node.peer_id].connected = true;
+    st.connected = true;
+    st.connecting = false;
     setNodeConn(node.peer_id, 'connected', true);
   }, (ev) => onControlMessage(ev));
   nodeChannels[node.peer_id] = ch;
@@ -218,8 +298,18 @@ async function connectToNode(node) {
       sdp: { type: 'offer', sdp: pc.localDescription.sdp },
     });
   } catch (e) {
+    st.connecting = false;
     setNodeConn(node.peer_id, `offer failed: ${e.message}`);
   }
+
+  // Direct connection timeout: if the DataChannel to this node does not open,
+  // mark it as relay-only (terminals still work through the first node).
+  setTimeout(() => {
+    if (st.connecting && !st.connected) {
+      st.connecting = false;
+      setNodeConn(node.peer_id, 'direct failed — terminal uses relay', false);
+    }
+  }, 15000);
 }
 
 async function finishRelay(target, sid, sdp) {
@@ -228,6 +318,7 @@ async function finishRelay(target, sid, sdp) {
   try {
     await state.pc.setRemoteDescription({ type: 'answer', sdp: sdp.sdp });
   } catch (e) {
+    state.connecting = false;
     setNodeConn(target, `answer failed: ${e.message}`);
   }
 }
@@ -236,6 +327,7 @@ async function finishRelay(target, sid, sdp) {
 
 function showTerminal(node) {
   termNode = node;
+  clearTerminalError();
   $('terminal-card').hidden = false;
   $('terminal-node').textContent = `${node.name || node.peer_id}`;
   $('auth-form').hidden = false;
@@ -252,13 +344,16 @@ function channelFor(node) {
 }
 
 function handleSshOpenAck(msg) {
+  const route = sshRoutes[msg.session_id];
   if (msg.status !== 'ok') {
-    alert(`SSH open failed: ${msg.error || 'unknown error'}`);
+    setTerminalError(`SSH open failed: ${msg.error || 'unknown error'}`);
+    delete sshRoutes[msg.session_id];
     return;
   }
   currentSshSession = msg.session_id;
   $('auth-form').hidden = true;
   $('terminal-container').hidden = false;
+  clearTerminalError();
   if (!term) {
     term = new Terminal({ cursorBlink: true, fontSize: 13 });
     termFit = new FitAddon.FitAddon();
@@ -266,7 +361,12 @@ function handleSshOpenAck(msg) {
     term.open($('terminal-container'));
     termFit.fit();
     term.onData((data) => {
-      const ch = channelFor(termNode);
+      // Terminal bytes always go over the route the session was opened on.
+      const ch = currentSshChannel || channelFor(termNode);
+      if (!ch || ch.readyState !== 'open') {
+        term.write('\r\n\x1b[31m[connection lost: DataChannel to the node is not open]\x1b[0m\r\n');
+        return;
+      }
       sendJson(ch, {
         type: 'ssh_data',
         session_id: currentSshSession,
@@ -288,14 +388,20 @@ function handleSshClose(msg) {
   if (term) {
     term.write(`\r\n\x1b[31m[connection closed: ${msg.reason}]\x1b[0m\r\n`);
   }
+  delete sshRoutes[msg.session_id];
+  if (msg.session_id === currentSshSession) {
+    currentSshSession = null;
+    currentSshChannel = null;
+  }
 }
 
 $('ssh-connect').onclick = () => {
   const node = termNode;
   if (!node) return;
+  clearTerminalError();
   const ch = channelFor(node);
   if (!ch || ch.readyState !== 'open') {
-    alert('DataChannel to this node is not open yet');
+    setTerminalError('DataChannel to this node is not open yet');
     return;
   }
   const user = $('ssh-user').value.trim();
@@ -306,9 +412,14 @@ $('ssh-connect').onclick = () => {
   } else {
     auth = { type: 'password', username: user, password: authRaw };
   }
+  const sid = randomHex(16);
+  // Bind the session to this channel: all subsequent terminal bytes for this
+  // session go through the same route (direct or relay), never switching.
+  sshRoutes[sid] = { channel: ch, node };
+  currentSshChannel = ch;
   sendJson(ch, {
     type: 'ssh_open',
-    session_id: randomHex(16),
+    session_id: sid,
     target: node.peer_id,
     auth,
   });
