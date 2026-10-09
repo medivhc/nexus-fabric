@@ -207,3 +207,77 @@ The following contradictions or stale statements were added by this pass:
 5. `nexus-diagnostics` and `nexus-delivery` have strong MODULE responsibility text but essentially empty executable `lib.rs` surfaces; diagrams that present them as peers of mature runtime crates overstate current implementation.
 
 These are not cosmetic documentation issues. They are exactly the class of drift that caused the old architecture document to become unreliable: a reader can derive materially wrong implementation conclusions from comments or box names that were once true but no longer track executable reality.
+
+## 64. Platform maturity is more asymmetric than the architecture names suggest
+
+A direct source-level comparison of the five platform crates makes the asymmetry unambiguous.
+
+### 64.1 Linux is a real platform runtime
+
+`nexus-platform-linux` exports concrete modules for address assignment, transactional OS assembly, daemon/PID lifecycle, DNS, file leases, FUSE workspace projection, netlink, operation logging, route snapshot/apply/rollback, secure store, TUN and the VirtualPacketInterface adapter.
+
+The crate therefore owns actual host side effects and recovery/rollback-sensitive behavior. Its maturity is qualitatively different from a contract-only adapter.
+
+### 64.2 Windows also has concrete host integration, but a narrower scope
+
+`nexus-platform-windows` exports scheduled-task autostart, DPAPI, network configuration, secure store, WinINET system proxy, Wintun VPI and the narrow Wintun FFI module. Unsafe code is intentionally concentrated in `wintun.rs`, while the rest of the crate consumes safe wrappers.
+
+The separate `nexus-platform-host` executable is also much narrower than its name may imply: current source primarily exposes a Windows `vpi-capabilities` command for machine-verifiable capability declaration. The default path prints a repository-contract bootstrap string. It is not a general cross-platform host daemon.
+
+### 64.3 macOS, Android and iOS remain source-level skeletons in their root crates
+
+The inspected `src/lib.rs` files for `nexus-platform-macos`, `nexus-platform-android` and `nexus-platform-ios` contain only crate-level responsibility comments and `#![forbid(unsafe_code)]`; they do not expose concrete adapter modules in their root source.
+
+Their MODULE contracts may describe Packet Tunnel/VPN lifecycle, underlay bypass, file projection and secure storage boundaries, but those contracts must not be represented as implemented parity with Linux/Windows.
+
+A stronger platform matrix is therefore:
+
+| Platform | Source maturity | Honest current statement |
+|---|---|---|
+| Linux | broad concrete adapters and host side effects | Runtime implementation |
+| Windows | concrete VPI/proxy/secure-store/autostart/network adapters | Runtime implementation, narrower than Linux |
+| macOS | root compile skeleton | Contract/skeleton |
+| Android | root compile skeleton | Contract/skeleton |
+| iOS | root compile skeleton | Contract/skeleton |
+
+This is a larger difference than “some features missing per platform”; it is a difference in implementation generation.
+
+## 65. `nexus-proto` is not yet the repository's real wire-schema authority
+
+`nexus-proto/src/lib.rs` currently contains only module documentation, the unsafe-code prohibition and a statement that the crate defines a portable wire/control schema boundary and code-generation placeholder.
+
+No executable schema types or generated protocol bindings are exposed in the inspected root source.
+
+Meanwhile, real wire contracts already exist elsewhere: registry control frames, Fabric framing/QUIC semantics, N3 HTTP DTOs, workspace sync frames, proxy protocol implementations and various domain-local encoders/decoders.
+
+Therefore a future architecture diagram must distinguish:
+
+- the **intended centralized protocol-schema boundary** (`nexus-proto` contract);
+- the **actual current wire contracts**, which are distributed across multiple crates.
+
+Calling `nexus-proto` the current wire source of truth would be inaccurate.
+
+## 66. Plugin support is real, but intentionally narrow and compile-time oriented
+
+`nexus-plugin` has a concrete implementation, unlike the diagnostics/proto skeletons. It currently provides a versioned in-process obfuscation transport plugin point:
+
+- hard API version check (`OBFUSCATE_API_VERSION`);
+- static registry with duplicate/version rejection;
+- `ObfuscateTransport` wrapping an already-established `TcpStream`;
+- `ObfuscatedStream` preserving normal Read/Write stream semantics;
+- builtin/dial/registry modules and success/failure counters.
+
+The implementation is explicitly not a general dynamic extension platform. Its first-phase scope is obfuscation transport, synchronous std I/O and compile-time/static registration.
+
+This matters for architecture wording: “Nexus has a plugin system” is true only with a scope qualifier. The current plugin mechanism should not be interpreted as arbitrary runtime-loaded business modules, WASM extensions, or a general MCP-like extension layer.
+
+## 67. Updated architecture drift themes
+
+After the platform/proto/plugin pass, the drift pattern can be grouped into four recurring classes:
+
+1. **historical comments lag executable code** — e.g. discovery, nexusd and proxy-transport;
+2. **contracts run ahead of implementation** — e.g. diagnostics, delivery, proto, macOS/Android/iOS;
+3. **code exists but production ownership is not proven** — e.g. scheduler loop, several discovery sources, flow-session activation, workspace sync binding;
+4. **one architectural box contains multiple maturity generations** — especially `nexus-connectivity` and `nexus-compute`.
+
+This four-class model should be used during the rest of the audit. Every contradiction found should be assigned to one of these classes rather than being recorded as an undifferentiated “documentation mismatch”.
