@@ -339,6 +339,28 @@ pub trait BootstrapFrameCodec {
 - 半开表只在**已分配 VIP 之后**才占资源；速率计数在 `handle_join_init` 入口即执行。
 - 配合 L8（NAT rebinding 换 src 即换会话/窗口）：重连靠 node_id 幂等拿回同 VIP，不依赖半开名额复用。
 
+#### 5.7.1 降级决策：无状态 cookie 本期未实现（2026-10-10）
+
+上表末行的**过载无状态 cookie 本期未实现**，评审 r1 记为 WARNING-1。已实现的替代处置
+是 `BootstrapServer` 触顶时调用 `evict_oldest_pending(now)`：回收最旧半开并把其预分配
+VIP 退回池中，随后放行新的 JoinInit。
+
+**为何本期不做**（而非遗漏）：
+
+1. cookie 是**协议变更**——`JoinReply` 需新增 `cookie` 字段、客户端 `try_join` 需在
+   JoinInit 回显、服务端需引入长期 HMAC 密钥的生成与持久化。三处都要动已冻结的
+   `nexus-discovery` 编解码契约，属于 requirement-change，应单独走契约冻结而非夹在
+   接线修复里。
+2. 已实现的四层限制（每 src 4 条 / 全局 1024 / 每 src 10 次 60s / pending TTL 10s）
+   已经把"单个伪造源能占用的资源"封顶；cookie 额外防的是"大量**不同**伪造源轮换"
+   这一种模式，它提高的是攻击成本而非消除可达的失效模式。
+3. 遗留风险如实记录在此：伪造源持续泛洪时，最旧 pending 会被频密淘汰，**真实节点的
+   半开握手可能被挤掉**，表现为合法节点偶发 join 失败后重试（`join()` 对 `Timeout`
+   会自动切下一个引导节点，故不会硬失败，但会拖慢入网）。
+
+**触发补做的条件**：当引导节点面向不可信网络开放、或实测出现合法节点被泛洪挤出的
+case 时，按 requirement-change 流程补 cookie 字段与服务端密钥持久化。
+
 ---
 
 ## 6. 引导节点服务端设计（功能 A，按评审 §二.2 重写）
