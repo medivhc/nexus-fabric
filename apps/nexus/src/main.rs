@@ -24,8 +24,8 @@ use nexus::schedule_cli::{
     schedule_cancel, schedule_every, schedule_list, schedule_tick, unix_now_secs,
 };
 use nexus::subnet_cli::{
-    assemble_default_tunnel, assemble_real_tunnel_for_daemon, classify_tun_error,
-    default_state_path, subnet_leave, subnet_status, subnet_up, subnet_up_tun,
+    allocate_ephemeral_udp_locator, assemble_default_tunnel, assemble_real_tunnel_for_daemon,
+    classify_tun_error, default_state_path, subnet_leave, subnet_status, subnet_up, subnet_up_tun,
 };
 use nexus_control_api::{ControlCommand, ResourceId, SessionId};
 use serde_json::Value;
@@ -622,13 +622,36 @@ fn subnet_foreground(
 ) -> i32 {
     let result: Result<u8, (String, String)> = if use_tun {
         let name = tun_name.unwrap_or_else(|| "nexus0".to_string());
-        let lsn = listen.unwrap_or_else(|| "udp://0.0.0.0:0".to_string());
+        // WARNING-3：`UdpCarrier::bind` 硬拒 port 0（udp_carrier.rs:56），原先的
+        // `udp://0.0.0.0:0` 默认值必定 TUN_ERROR。缺省时先问 OS 要一个空闲端口，
+        // 再把它作为显式 listen 交给真实装配路径。
+        let lsn = match listen {
+            Some(l) => l,
+            None => match allocate_ephemeral_udp_locator() {
+                Ok(l) => l,
+                Err(e) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "verdict": "TUN_ERROR",
+                            "command": "subnet up",
+                            "error": e,
+                        })
+                    );
+                    return 0;
+                }
+            },
+        };
         subnet_foreground_real(cfg, state_path, encrypt, &name, &lsn)
     } else {
         (|| {
             let tunnel =
                 assemble_default_tunnel(cfg).map_err(|e| ("CONFIG_ERROR".to_string(), e))?;
-            let up = subnet_up(cfg, state_path, encrypt, false)
+            // CRITICAL-3：本函数就是 `subnet up --foreground` 的实现，必须以
+            // foreground=true 调用 subnet_up，否则会被它自己的 S6 门禁判为
+            // "非前台" 并报 BOOTSTRAP_REQUIRES_FOREGROUND（用户加了
+            // --foreground 却被要求加 --foreground）。
+            let up = subnet_up(cfg, state_path, encrypt, true)
                 .map_err(|e| ("CONFIG_ERROR".to_string(), e))?;
             println!("{up}");
             // Auto-Mesh 自动挡：自动打洞 + 断线自动重连。

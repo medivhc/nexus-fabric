@@ -27,6 +27,13 @@ pub const NEXDP1_MAGIC: &[u8; 6] = b"NEXDP1";
 /// TUN 接口名最大字节数（对齐 Linux IFNAMSIZ-1 与 wintun 名称约束）。
 pub const MAX_TUN_NAME_BYTES: usize = 15;
 
+/// 引导入网被装配到 mock carrier 上时的明确错误（v2 §7.2 M12）。
+///
+/// bootstrap 握手需要真实 UDP socket；`subnet up` 的状态写入路径用
+/// `MeshCarrier`（进程内、无连线），在那里发起握手只会白等满 5s 超时。
+pub const BOOTSTRAP_NEEDS_REAL_CARRIER: &str = "BOOTSTRAP_NEEDS_REAL_CARRIER: bootstrap join requires the real UDP data plane \
+     (use `nexus subnet up --config <path> --foreground --tun`)";
+
 /// 子网 TOML 配置（`[subnet]` 表）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct SubnetConfig {
@@ -326,10 +333,23 @@ fn load_network_psk(s: &SubnetSection) -> Result<Option<Vec<u8>>, String> {
     Ok(None)
 }
 
-/// 回读 `node init` 持久化的 x25519 seed（§12.39），重建长期身份（v2 P3：
-/// 替换一次性 generate，使 node_id/VIP 在重启后稳定）。无持久身份时 Err（调用方 fallback）。
+/// 读取本节点长期身份（v2 §7.4 / S7）：`node/identity` 的 `x25519_seed_hex`
+/// → `KeyPair::from_seed`。
+///
+/// 身份文件不存在时**自动 init 并持久化**（复用 `node init` 的写盘路径，0600 权限），
+/// 使 node_id / 派生存根在重启后保持稳定。刻意不提供 `KeyPair::generate()`
+/// 降级：一次性密钥会让每次重启换 static 公钥，服务端按权威 node_id 做的
+/// VIP 租约回收与幂等找回随之失效。
+///
+/// 读失败（目录不可写 / 记录损坏）→ 明确报错，禁止静默生成临时身份。
 fn load_node_identity() -> Result<KeyPair, String> {
-    let path = crate::node_cli::node_dir().join("identity");
+    let dir = crate::node_cli::node_dir();
+    let file = crate::node_cli::identity_file_name();
+    if !dir.join(&file).exists() {
+        crate::node_cli::ensure_node_identity(&dir)
+            .map_err(|e| format!("NODE_IDENTITY_INIT: {e}"))?;
+    }
+    let path = dir.join(&file);
     let text =
         std::fs::read_to_string(&path).map_err(|e| format!("read identity {path:?}: {e}"))?;
     let v: serde_json::Value =
@@ -387,10 +407,9 @@ pub fn subnet_up(
     }
     // §12.43：PSK 文件权限等在装配前校验（fail-closed）。
     let _psk = load_network_psk(&config.subnet)?;
-    // T3：身份全程只获取一次（load_node_identity，缺失才 generate 一次），
-    // VIP 派生、状态写与 join/assemble_with 共用同一把 KeyPair。
-    let identity =
-        load_node_identity().or_else(|_| KeyPair::generate().map_err(|e| e.to_string()))?;
+    // T3：身份全程只获取一次（load_node_identity），VIP 派生、状态写与
+    // join/assemble_with 共用同一把 KeyPair。
+    let identity = load_node_identity()?;
     // §12.43：virtual_ip 缺省 → 由同一身份公钥确定性派生。
     let virtual_ip = match &config.subnet.virtual_ip {
         Some(vip) => vip.clone(),
@@ -399,13 +418,24 @@ pub fn subnet_up(
             .to_string(),
     };
     let mut config = config;
+    let has_bootstrap = !config.subnet.bootstrap.is_empty();
     config.subnet.virtual_ip = Some(virtual_ip.clone());
-    let _tunnel = assemble_with(
-        &config,
-        Box::new(MemoryVpi::new()),
-        Box::new(MeshCarrier::new()),
-        &identity,
-    )?;
+    // CRITICAL-2：本函数只写状态文件，carrier 是进程内 MeshCarrier（无真实连线）。
+    // 这里的装配纯属配置校验，绝不能发起网络握手——否则 join 必然超时并让
+    // `subnet up` 崩溃。真实握手只发生在 assemble_real_tunnel 路径。
+    //
+    // 配了 bootstrap 时连这个"离线装配"也做不了（mock carrier 无法承载握手，
+    // 见 BOOTSTRAP_NEEDS_REAL_CARRIER），而配置面已由上面的 parse_config/PSK
+    // 校验覆盖、握手结果由调用方持有的真实隧道负责，故直接跳过。状态文件里的
+    // virtual_ip 字段是"请求值"；权威租约以隧道内 assigned_vip 为准。
+    if !has_bootstrap {
+        let _tunnel = assemble_with_offline(
+            &config,
+            Box::new(MemoryVpi::new()),
+            Box::new(MeshCarrier::new()),
+            &identity,
+        )?;
+    }
     let s = &config.subnet;
     let state = SubnetState {
         up: true,
@@ -616,33 +646,77 @@ fn bootstrap_join_and_make_hook(
     Ok(Some(Box::new(hook)))
 }
 
-fn assemble_with(
+/// 向 OS 借一个空闲 UDP 端口，返回可直接喂给 `UdpCarrier::bind` 的 locator。
+///
+/// `UdpCarrier::bind` 显式拒绝 port 0（`udp_carrier.rs:56`），所以"让 OS 随机分配"
+/// 只能在这里做一次 bind(0)→读端口→drop 的探测，再把**具体端口**交给真实路径。
+/// 存在 TOCTOU 窗口（探测与正式 bind 之间端口可能被占），故失败时由调用方按
+/// `TUN_ERROR` 结构化上报，不静默换端口重试。
+pub fn allocate_ephemeral_udp_locator() -> Result<String, String> {
+    use std::net::UdpSocket;
+    let sock = UdpSocket::bind(("0.0.0.0", 0))
+        .map_err(|e| format!("TUN_ERROR: udp ephemeral bind: {e}"))?;
+    let port = sock
+        .local_addr()
+        .map_err(|e| format!("TUN_ERROR: udp local_addr: {e}"))?
+        .port();
+    drop(sock);
+    Ok(format!("udp://0.0.0.0:{port}"))
+}
+
+/// `assemble_with` 的入网策略。
+///
+/// 二者必居其一，避免"要不要发起网络握手"这种隐式决定散落在调用点：
+/// - `Join`：carrier 绑定真实 socket，可发起 PSK 握手（`assemble_real_tunnel`）。
+/// - `NoJoin`：carrier 是进程内 mock（`subnet_up` 的 MeshCarrier、纯校验装配），
+///   一律不发起握手，直接用配置/派生的 `virtual_ip`。否则 mock carrier 上
+///   永远等不到回包，join 必然超时并让 `subnet up` 崩溃。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootstrapPolicy {
+    Join,
+    NoJoin,
+}
+
+fn assemble_with_policy(
     config: &SubnetConfig,
     vpi: Box<dyn VirtualPacketInterface>,
     carrier: Box<dyn PacketCarrier>,
     identity: &KeyPair,
+    policy: BootstrapPolicy,
 ) -> Result<VirtualSubnetTunnel, String> {
     let s = &config.subnet;
-    // §12.43：调用方（subnet_up）须先解析 virtual_ip；此处防御性校验。
-    let vip = s
-        .virtual_ip
-        .as_deref()
-        .ok_or("VIRTUAL_IP_UNRESOLVED: virtual_ip must be resolved before assemble")?;
-    // v2 §7.2：bootstrap 非空 → 在 carrier move 进隧道前，借 &mut carrier 完成 PSK 入网，
-    // 得到常驻 hook；建隧道后 set_bootstrap_hook。carrier move 顺序：join(&mut carrier) → tunnel::new。
-    // T3：identity 由调用方全程只获取一次传入（与 VIP 派生同一把 KeyPair）。
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let mut carrier = carrier;
-    let hook = bootstrap_join_and_make_hook(&mut *carrier, identity, s, now)?;
-    // W-VIP：bootstrap 入网成功后，隧道本地 VIP 改用服务端权威租约 assigned_vip，
-    // 保证本端地址与服务端分配一致（而非配置/派生的 static VIP）。
-    let local_vip = hook
-        .as_ref()
-        .and_then(|h| h.assigned_vip().map(str::to_string))
-        .unwrap_or_else(|| vip.to_string());
+    // v2 §7.2 接线点 1：bootstrap 分支先握手，成功后以服务端权威租约
+    // (sess.assigned_vip) 作为隧道本地 VIP；仅在**无** bootstrap 的静态模式才
+    // 要求配置里已解析出 virtual_ip。原实现把该校验放在 join 之前，导致
+    // "virtual_ip 留空由服务端分配" 这条核心流程在装配期就 100% 失败。
+    let (hook, local_vip) = match policy {
+        BootstrapPolicy::Join => {
+            let hook = bootstrap_join_and_make_hook(&mut *carrier, identity, s, now)?;
+            // W-VIP：入网成功后本地 VIP 用服务端权威租约，而非配置/派生的 static VIP。
+            let vip = hook
+                .as_ref()
+                .and_then(|h| h.assigned_vip().map(str::to_string))
+                .ok_or("VIRTUAL_IP_UNRESOLVED: virtual_ip must be resolved before assemble")?;
+            (hook, vip)
+        }
+        BootstrapPolicy::NoJoin => {
+            if !s.bootstrap.is_empty() {
+                // v2 §7.2 M12：mock carrier（MeshCarrier，无真实 UDP）不发起握手，
+                // 也不静默假装入网成功——引导入网只在真实数据面路径受支持。
+                return Err(BOOTSTRAP_NEEDS_REAL_CARRIER.to_string());
+            }
+            let vip = s
+                .virtual_ip
+                .as_deref()
+                .ok_or("VIRTUAL_IP_UNRESOLVED: virtual_ip must be resolved before assemble")?;
+            (None, vip.to_string())
+        }
+    };
     let mut tunnel = VirtualSubnetTunnel::new(
         VirtualSubnetConfig::new(s.cidr.clone(), local_vip),
         vpi,
@@ -682,18 +756,53 @@ fn assemble_with(
     Ok(tunnel)
 }
 
+/// 按已校验配置装配隧道（真实数据面路径会发起 bootstrap 握手）。
+fn assemble_with(
+    config: &SubnetConfig,
+    vpi: Box<dyn VirtualPacketInterface>,
+    carrier: Box<dyn PacketCarrier>,
+    identity: &KeyPair,
+) -> Result<VirtualSubnetTunnel, String> {
+    assemble_with_policy(config, vpi, carrier, identity, BootstrapPolicy::Join)
+}
+
+/// 装配隧道但**不**发起 bootstrap 握手（carrier 为进程内 mock 的校验/状态写入路径）。
+fn assemble_with_offline(
+    config: &SubnetConfig,
+    vpi: Box<dyn VirtualPacketInterface>,
+    carrier: Box<dyn PacketCarrier>,
+    identity: &KeyPair,
+) -> Result<VirtualSubnetTunnel, String> {
+    assemble_with_policy(config, vpi, carrier, identity, BootstrapPolicy::NoJoin)
+}
+
 /// P3.5（§12.32）：daemon 组合根默认装配（MemoryVpi + MeshCarrier），
 /// 返回隧道对象供 nexusd 常驻持有（进程为 Owner，随 drop 清理）。
+///
+/// carrier 是进程内 mock，无真实 UDP 连线，故走 [`BootstrapPolicy::NoJoin`]：
+/// bootstrap 入网只支持真实数据面路径（`assemble_real_tunnel`）。
 pub fn assemble_default_tunnel(config_path: &Path) -> Result<VirtualSubnetTunnel, String> {
-    let config = parse_config(config_path)?;
-    let identity =
-        load_node_identity().or_else(|_| KeyPair::generate().map_err(|e| e.to_string()))?;
-    assemble_with(
+    let mut config = parse_config(config_path)?;
+    let identity = load_node_identity()?;
+    resolve_static_virtual_ip(&mut config, &identity)?;
+    assemble_with_offline(
         &config,
         Box::new(MemoryVpi::new()),
         Box::new(MeshCarrier::new()),
         &identity,
     )
+}
+
+/// 无 bootstrap 时按身份公钥确定性派生 `virtual_ip`（§12.43），使 mock 装配路径
+/// 与 `subnet_up` 行为一致；有 bootstrap 时保持 `None` 交给服务端分配。
+fn resolve_static_virtual_ip(config: &mut SubnetConfig, identity: &KeyPair) -> Result<(), String> {
+    if !config.subnet.bootstrap.is_empty() || config.subnet.virtual_ip.is_some() {
+        return Ok(());
+    }
+    let derived = derive_vip(identity.public_key_bytes(), &config.subnet.cidr, 0)
+        .map_err(|e| format!("DERIVE_VIP: {e:?}"))?;
+    config.subnet.virtual_ip = Some(derived.to_string());
+    Ok(())
 }
 
 /// 按已校验配置装配**真实数据面**隧道（UdpCarrier + 平台 VPI）。
@@ -713,8 +822,7 @@ fn assemble_real_tunnel(
         .map_err(|e| format!("TUN_ERROR: udp bind: {e}"))?;
     let vpi = nexus_platform_windows::WintunVpiAdapter::create(tun_name, "Nexus")
         .map_err(|e| format!("TUN_ERROR: wintun create: {e}"))?;
-    let identity =
-        load_node_identity().or_else(|_| KeyPair::generate().map_err(|e| e.to_string()))?;
+    let identity = load_node_identity()?;
     let tunnel = assemble_with(config, Box::new(vpi), Box::new(carrier), &identity)?;
     Ok((tunnel, bound))
 }
@@ -732,8 +840,7 @@ fn assemble_real_tunnel(
         .map_err(|e| format!("TUN_ERROR: udp bind: {e}"))?;
     let vpi = nexus_platform_linux::TunVpi::create(tun_name)
         .map_err(|e| format!("TUN_ERROR: tun create: {e}"))?;
-    let identity =
-        load_node_identity().or_else(|_| KeyPair::generate().map_err(|e| e.to_string()))?;
+    let identity = load_node_identity()?;
     let tunnel = assemble_with(config, Box::new(vpi), Box::new(carrier), &identity)?;
     Ok((tunnel, bound))
 }
@@ -823,9 +930,12 @@ pub fn subnet_punch(
     let bound = carrier
         .bind(listen)
         .map_err(|e| format!("PUNCH_BIND_FAILED: {e}"))?;
-    let identity =
-        load_node_identity().or_else(|_| KeyPair::generate().map_err(|e| e.to_string()))?;
-    let mut tunnel = assemble_with(
+    let identity = load_node_identity()?;
+    // 打洞目标按静态配置校验（`peer_known` 要求在 [subnet.peers]/egress 中），
+    // 是一次性显式命令：不做 bootstrap 握手，否则会平白等满 5s 超时。
+    let mut config = config;
+    resolve_static_virtual_ip(&mut config, &identity)?;
+    let mut tunnel = assemble_with_offline(
         &config,
         Box::new(MemoryVpi::new()),
         Box::new(carrier),
