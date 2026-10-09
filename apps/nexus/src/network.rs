@@ -21,9 +21,7 @@ use nexus_fabric::{
 };
 use nexus_network::n1::{
     N1Connection, N1Dialer, N1Discovery, N1Error, N1Event, N1EventSink, N1KeepaliveIo,
-    N1KeepaliveStream, N1PeerId,
-    config::N1Config,
-    session::N1SessionManager,
+    N1KeepaliveStream, N1PeerId, config::N1Config, session::N1SessionManager,
 };
 // 包泵与路由类型只被 `network_up_linux`（#[cfg(target_os = "linux")]）消费；
 // 不加 cfg 的话，非 Linux 构建会因 workspace 的 deny(warnings) 直接编译失败。

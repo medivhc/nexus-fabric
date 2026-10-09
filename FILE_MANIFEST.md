@@ -2,10 +2,15 @@
 
 本包实现《Nexus 统一系统设计规范 v9》中的“统一仓库目录契约”。
 
-文件数（不含本清单）：137
+文件数（不含本清单）：167
+
+> 2026-10-10：原声明值 137 与表内实际行数（148）已不一致（既有漂移，含
+> `scenarios/engineering/bench_gate_verdicts.toml` 等未登记项）。本次登记
+> Code Intelligence 的 18 个新文件时一并改为与表内行数一致，并补登该缺口。
 
 | Path | Purpose |
 |---|---|
+| `.agents/red-evidence-code-intelligence.txt` | Red Evidence record（Code Intelligence 契约阶段 9/9 FAIL） |
 | `.agents/skills/README.md` | Project-level agent skill index |
 | `.agents/skills/nexus-contract-first/SKILL.md` | Project-level agent skill |
 | `.agents/skills/nexus-evidence/SKILL.md` | Project-level agent skill |
@@ -124,12 +129,20 @@
 | `engineering/evidence-schema/evidence.schema.json` | Machine-readable schema |
 | `engineering/nexus-harness/Cargo.toml` | Rust package/workspace manifest |
 | `engineering/nexus-harness/MODULE.md` | Module Contract |
+| `engineering/nexus-harness/fixtures/code-intel/Cargo.toml` | Rust package manifest (code-intelligence fixture, standalone workspace) |
+| `engineering/nexus-harness/fixtures/code-intel/src/lib.rs` | Rust source (fixture: re-export/cfg/probe) |
+| `engineering/nexus-harness/fixtures/code-intel/src/transport.rs` | Rust source (fixture: trait + multi-impl + generic dispatch) |
 | `engineering/nexus-harness/src/main.rs` | Minimal compile/bootstrap source |
 | `engineering/nexus-harness/src/env.rs` | Rust source (harness CLI) |
 | `engineering/nexus-harness/src/config.rs` | Rust source (harness CLI) |
 | `engineering/nexus-harness/src/gates.rs` | Rust source (harness CLI) |
 | `engineering/nexus-harness/src/scenario.rs` | Rust source (harness CLI) |
 | `engineering/nexus-harness/src/evidence.rs` | Rust source (harness CLI) |
+| `engineering/nexus-harness/src/code_intel/mod.rs` | Rust source (Code Intelligence CLI 层：参数/预算/snapshot/envelope) |
+| `engineering/nexus-harness/src/code_intel/dto.rs` | Rust source (Code Intelligence 语言中立 DTO 与错误码) |
+| `engineering/nexus-harness/src/code_intel/lsp.rs` | Rust source (JSON-RPC/LSP framing、只读白名单、有界会话) |
+| `engineering/nexus-harness/src/code_intel/provider.rs` | Rust source (CodeIntelligenceProvider 契约与 binary 解析) |
+| `engineering/nexus-harness/src/code_intel/rust_analyzer.rs` | Rust source (rust-analyzer provider：生命周期/就绪收敛/语义映射) |
 | `engineering/nexus-harness/src/commands.rs` | Rust source (harness CLI) |
 | `engineering/plugins/README.md` | Repository contract/documentation |
 | `engineering/plugins/plugin-contract.md` | Repository contract/documentation |
@@ -141,6 +154,16 @@
 | `policies/deny.toml` | Machine-readable contract/policy/scenario (cargo-deny executor config) |
 | `policies/quality.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/README.md` | Repository contract/documentation |
+| `scenarios/engineering/bench_gate_verdicts.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_budget_truncation.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_callers.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_definition.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_diagnostics_advisory.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_hover.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_implementations.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_provider_unavailable.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_symbol.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_write_method_denied.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/harness_status_verdicts.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/harness_verify_fast_evidence.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/platform/virtual_packet_interface.toml` | Machine-readable contract/policy/scenario |

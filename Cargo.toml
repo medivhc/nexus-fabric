@@ -54,6 +54,10 @@ members = [
   "crates/nexus-web-gateway",
   "engineering/nexus-harness",
 ]
+# `exclude` 是防御性声明：Code Intelligence 夹具是**独立 workspace**
+# （自带 [workspace]），绝不进入生产依赖图（提案 §2/§7、MODULE.md
+# Forbidden Dependencies）。列出它可避免未来有人改用 glob 时误纳为成员。
+exclude = ["engineering/nexus-harness/fixtures/code-intel"]
 
 [workspace.package]
 version = "0.1.0"

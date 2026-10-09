@@ -26,6 +26,7 @@ verify_full = "nexus-harness verify --full"
 explain = "nexus-harness explain"
 bench = "nexus-harness bench"
 replay = "nexus-harness replay"
+code = "nexus-harness code"
 
 [output]
 machine_flag = "--json"
