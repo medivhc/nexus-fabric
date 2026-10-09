@@ -39,6 +39,10 @@ pub enum LocalApiTarget {
 }
 
 /// 默认 socket 文件名（daemon 与 CLI 共用；两侧必须一致）。
+///
+/// 仅在 Unix 上被消费（`default_socket_path` 与各 unix 测试都在 `#[cfg(unix)]`
+/// 内）；非 Unix 构建里它是 dead code，故与使用方保持同一 cfg。
+#[cfg(unix)]
 const SOCKET_FILE_NAME: &str = "nexus-localapi.sock";
 
 /// 默认 unix socket 路径（P1-15）。`None` = 无法安全建立本机 socket 目标，
