@@ -88,18 +88,18 @@ fn validate(bytes: &[u8], scope: &Value) -> Result<Option<String>> {
             || record["before_sha256"] == record["after_sha256"]
             || (record["operation"] == "revoke" && record["before_sha256"].is_null())
             || !digest(&record["record_sha256"], false)
-            || !record["at_unix"]
+            || record["at_unix"]
                 .as_u64()
-                .is_some_and(|time| time <= MAX_INTEGER)
+                .is_none_or(|time| time > MAX_INTEGER)
             || !record["principal"].as_str().is_some_and(principal_valid)
             || !record["actor"].as_str().is_some_and(principal_valid)
-            || !record["resource"]
+            || record["resource"]
                 .as_str()
-                .is_some_and(|name| ResourceName::new(name).is_ok())
+                .is_none_or(|name| ResourceName::new(name).is_err())
             || !matches!(record["operation"].as_str(), Some("add" | "revoke"))
-            || !record["mutation_id"]
+            || record["mutation_id"]
                 .as_str()
-                .is_some_and(|id| TaskId::new(id.to_owned()).is_ok())
+                .is_none_or(|id| TaskId::new(id.to_owned()).is_err())
             || record["record_sha256"].as_str() != Some(record_digest(&record)?.as_str())
         {
             return Err(io::corrupt(
