@@ -181,7 +181,7 @@ Until those passes are complete, this file is a reliable baseline skeleton plus 
 
 ## 14. Workspace inventory and implementation map
 
-At the captured revision the root Cargo workspace explicitly contains 49 members: three applications, forty-five product/library crates, and the engineering harness. This list is an executable repository fact, not a design-document inventory.
+At the captured revision the root Cargo workspace explicitly contains 50 members: three applications, forty-five product/library crates, and the engineering harness. This list is an executable repository fact, not a design-document inventory.
 
 ### 14.1 Applications
 
@@ -291,7 +291,7 @@ The coexistence of `ComputeJobSession` and provider-owned durable N3 task module
 
 This pass materially expands the baseline from architecture skeleton into source-level implementation facts, but it is not yet the requested exhaustive repository certification. Remaining work is intentionally explicit:
 
-1. enumerate every one of the 49 workspace members with public surface, allowed dependencies, runtime owner and status;
+1. enumerate every one of the 50 workspace members with public surface, allowed dependencies, runtime owner and status;
 2. trace N1 end-to-end from CLI/LocalAPI through daemon assembly, planning/connectivity/path/fabric and failure/degraded paths;
 3. trace N2 workspace/session operations including persistence, attach/re-attach, conflict and recovery;
 4. trace N3 durable task acceptance, execution replay, artifacts, cancellation and write-back;
@@ -847,3 +847,168 @@ The remaining work is now narrower and measurable:
 - reconcile stale top-of-file/module comments against executable behavior and mark/remove obsolete claims in a later documentation-cleanup pass.
 
 At this point, the document is a detailed source-derived implementation baseline. It is not yet a current-revision test certification report; that distinction is intentional.
+
+
+## 47. Dataplane production wiring: forwarding is real, unified flow sessions are not yet enabled
+
+A second pass over `apps/nexusd/src/dataplane.rs`, `main.rs` and `assembly.rs` resolves an important ambiguity left by the earlier audit.
+
+The stale module header says the MVP dataplane classifies and counts packets while N1/proxy sending is future wiring. That is no longer the executable truth.
+
+The production daemon constructs `Dataplane`, injects the assembled N1 bridge as an `N1Sender`, and constructs/injects `ProxyEngine` when `proxy.yaml` is configured. Therefore Mesh and Proxy forwarding have real production composition paths.
+
+The packet pipeline is materially:
+
+TUN read
+→ DNS interception for UDP/53
+→ PacketClassifier using mesh CIDRs, bypass CIDRs and optional PathManager candidates
+→ TCP Mesh/Proxy traffic enters the user-space TcpTerminator
+→ QoS admission
+→ optional flow-session gate
+→ Mesh via N1Sender / Proxy via ProxyEngine / Direct handling
+→ response packets back to TUN where applicable.
+
+For non-TCP Mesh packets, a configured and injected N1 sender calls `send_to_mesh`; absence/failure increments `mesh_dropped_no_n1`. For Proxy packets, an injected ProxyEngine handles real forwarding and TUN return packets; absence is observable through the no-proxy/degraded counters.
+
+### 47.1 Critical production gap: flow-to-Session is implemented but not enabled
+
+`Dataplane::enable_flow_sessions()` builds the Phase B/C flow lifecycle:
+
+FlowContext
+→ default network PolicyEngine
+→ Registry candidates
+→ PlanningSnapshot
+→ flow SessionManager
+→ ConnectivityEstablisher
+→ Session binding and TCP/UDP gating.
+
+However, the daemon production composition path inspected in `run_dataplane` injects N1 and ProxyEngine but does **not** call `enable_flow_sessions()`.
+
+Therefore the strongest current statement is:
+
+- unified flow→Session machinery: **Implemented**;
+- deterministic tests/E4 hooks for it: **present**;
+- daemon production activation: **not wired in the inspected composition root**.
+
+This is a concrete architecture gap. Production Mesh/Proxy forwarding can occur without every TUN flow being represented by the intended unified resource Session lifecycle.
+
+### 47.2 Dataplane degradation is explicit
+
+N1 assembly failure does not abort daemon startup. The daemon continues with dataplane running and records mesh packets as unsent/degraded. Proxy configuration similarly controls whether a real ProxyEngine is injected. This makes partial availability observable rather than silently pretending forwarding succeeded.
+
+The PathManager is instantiated in the dataplane, but its candidate vector starts empty. `boost_enabled` permits classifier consultation of candidates; configuration alone does not prove a populated live multipath candidate set.
+
+## 48. N1 composition boundary
+
+`assembly::assemble_n1` parses `network.toml`, reuses the N1 SessionManager builder, creates `N1MeshBridge` from configured VPI routes, then asynchronously performs best-effort peer dial.
+
+Peer dial failure is per-peer degradation, not daemon-fatal. The bridge remains the production N1Sender injected into the dataplane.
+
+Mesh CIDRs are derived from `[vpi.routes]`; the old hard-coded `10.0.0.0/8` behavior is explicitly absent. Mesh/bypass overlap is detected and warned, with mesh taking precedence.
+
+This establishes a real production chain:
+
+`network.toml`
+→ N1Config
+→ N1 SessionManager
+→ N1MeshBridge
+→ N1Sender
+→ Dataplane Mesh classification
+→ `send_to_mesh(dst, packet)`.
+
+What remains separate is the newer flow-session ownership chain described above.
+
+## 49. N3 HTTP boundary is deliberately strict
+
+The v1 N3 endpoint is exactly `POST /localapi/v1/task HTTP/1.1`. Query aliases, other v1 routes, Transfer-Encoding and non-JSON bodies are rejected.
+
+Resource bounds are explicit:
+
+- request header: 16 KiB;
+- request body: 1 MiB;
+- response: 2 MiB;
+- total request-read budget: 3 seconds.
+
+Authentication requires all of:
+
+1. authenticated local transport;
+2. exact bearer token match;
+3. a valid token authority bound to the private token file.
+
+On Unix, TokenAuthority pins the original device/inode and verifies regular-file, single-link, non-symlink, 0600 and content identity before N3 execution. A replaced token inode invalidates the authority instead of silently trusting the path again.
+
+Rejected bodies are not drained merely to make TCP shutdown convenient. The server writes the complete bounded response and then shuts down the write side. This prevents an attacker from extending service occupancy with an untrusted rejected body.
+
+The v1 endpoint is one request per connection; pipelining is not a supported semantic.
+
+## 50. N3 service assembly and platform gate
+
+`LocalTaskService` is opened once as part of LocalAPI composition. On Linux, `task-api.toml` is the explicit feature gate. Absence means the local Task provider service is disabled; malformed configuration is an error rather than a silent default.
+
+The config is intentionally narrow: exactly `provider` and `workspace`. Both are validated through the Task identifier vocabulary.
+
+Production construction uses `open_with_sessions`, injecting the daemon's existing shared N2 SessionManager. A trusted Rust-only `prepare_with_existing_session` entry exists, but no LocalAPI request invokes that method directly.
+
+Non-Linux execution returns `UnsupportedCapability`; the N3 provider service is not cross-platform merely because its DTO/domain crates compile elsewhere.
+
+## 51. N3 execution and publication safety
+
+The Linux executor creates a Docker-backed execution identity and records a durable `StartIntent` before process start. Once an execution identity has crossed that boundary, later ambiguity is reconciled against the same identity; a retry cannot silently create a second execution.
+
+The executor persists evidence including engine identity, started proof, stop intent, exit proof, reap proof and a captured unregistered working-tree archive. Output publication is separated from execution.
+
+Publication is allowed only for a confirmed natural exit. `sealed_results` verifies:
+
+- runtime state is Exited + Confirmed;
+- logs are sealed;
+- exit and reap proofs belong to the same Task and contract digest;
+- durable execution handle matches Docker container/exec identity;
+- subtree stop/reap is proven;
+- exit code agrees with durable runtime;
+- output inventory matches the accepted output contract;
+- staged bytes equal the frozen captured work tree;
+- registered stdout/stderr content is bounded and hashed.
+
+This means “process exited” is intentionally weaker than “results are publishable”. Artifact/result publication has its own integrity gate.
+
+Cancellation/timeout similarly records durable stop intent and stops the original execution subtree rather than manufacturing a replacement attempt.
+
+## 52. Workspace production boundary: local projection is wired, distributed sync is a separate claim
+
+Linux daemon startup resolves configured workspace mountpoints before generic boot reconciliation so orphan FUSE mounts can be reported/cleaned consistently. After LocalAPI is READY, `WorkspaceManager::start` performs the production workspace assembly.
+
+This ordering prevents a second daemon using the same configuration from reaching workspace mount takeover before it loses the LocalAPI ownership race.
+
+The production manager owns Linux projection/mount state and exposes daemon LocalAPI status plus explicit commit. Shutdown occurs after LocalAPI stops and before dataplane teardown.
+
+The distributed synchronization code is real but should be described separately from local mount readiness. `sync_transport.rs` adapts Workspace sync over authenticated Fabric streams and authorizes the peer against workspace membership before serving synchronization. Non-members are rejected explicitly.
+
+Therefore:
+
+- immutable workspace/CAS/commit/conflict model: Implemented;
+- Linux FUSE projection and daemon mount lifecycle: Wired;
+- explicit daemon commit endpoint: Wired;
+- Fabric-backed workspace sync transport: Implemented;
+- “every mounted workspace is automatically participating in production cross-node sync”: **not established merely by the mount composition path**.
+
+The final claim requires tracing where the sync server/client is started and bound to the mounted workspace lifecycle.
+
+## 53. Corrected workspace inventory count
+
+The root `Cargo.toml` currently declares **50 workspace members**, not 49. The baseline's earlier count was an audit error and is corrected here.
+
+The 50th member is not a hidden runtime crate; the count includes `engineering/nexus-harness` alongside the apps and product crates. The workspace uses resolver 2, Rust edition 2024, minimum Rust 1.85, workspace-wide `warnings = "deny"`, and the local patched `vendor/quinn-proto`.
+
+## 54. Updated gap ranking after production-wiring trace
+
+The highest-confidence gaps are now more precise:
+
+1. **Flow ownership gap:** production dataplane forwarding is wired, but `enable_flow_sessions()` is not called by the inspected daemon composition root.
+2. **Control ownership gap:** daemon N2 ownership coexists with CLI-local N2 execution paths.
+3. **Verification gap:** broad Scenario catalog lacks a current branch-wide bound Evidence PASS set.
+4. **Workspace integration gap:** local Linux projection is wired, while automatic production binding of Fabric sync to every workspace remains to be proven.
+5. **Runtime reload gap:** watcher acceptance is proven; live subsystem mutation/reassembly is not proven for every hot-classified file.
+6. **Platform parity gap:** Linux carries substantially more daemon/N3/workspace authority than macOS/Android/iOS and some Windows paths.
+7. **Documentation drift:** several source/module headers describe earlier MVP states that executable composition has surpassed.
+
+This ranking supersedes the earlier broader statement that the main issue is simply “wiring”. Some forwarding and persistence wiring is demonstrably real; the remaining gaps are specifically ownership convergence, flow lifecycle activation, distributed-workspace integration and revision-bound verification.
