@@ -579,6 +579,12 @@ impl ClientBootstrapHook {
         Some(&self.session.assigned_vip)
     }
 
+    /// 当前已知 peer 快照（供驱动/测试观测在线目录）。
+    #[must_use]
+    pub fn known_peers_snapshot(&self) -> Vec<BootstrapPeer> {
+        self.known.values().cloned().collect()
+    }
+
     /// 把一条已认证控制帧序列化成 nxb: 线（nonce 前缀 + AEAD）。
     fn build_wire(&mut self, ctrl: &BootstrapCtrl) -> Result<Vec<u8>, BootstrapJoinError> {
         let inner = self.codec.encode(ctrl)?;

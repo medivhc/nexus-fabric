@@ -11843,3 +11843,394 @@ mod hysteria2_dataplane_tests {
         client.close();
     }
 }
+
+/// P4（v2 §11）：真实 UDP loopback 入网驱动。
+///
+/// 1 个引导节点（BootstrapServer，UDP :11010）+ 2 个新节点（零静态 peer，
+/// 仅配 bootstrap 地址 + PSK），全程走真实 `UdpCarrier` socket（127.0.0.1 不同端口），
+/// 验证：JoinInit/JoinReply PSK 认证 + VIP 分配、GetPeers/PeerList 互见、心跳维持租约、
+/// 停节点后 TTL 过期回收。不依赖 TUN/root/跨机。
+/// P4 真实 UDP loopback 驱动使用的三个显式端口（UdpCarrier 拒绝 port 0）。
+#[derive(Debug, Clone, Copy)]
+pub struct LoopbackPorts {
+    pub server: u16,
+    pub a: u16,
+    pub b: u16,
+}
+
+impl Default for LoopbackPorts {
+    fn default() -> Self {
+        Self {
+            server: 11010,
+            a: 11101,
+            b: 11102,
+        }
+    }
+}
+
+pub fn bootstrap_udp_loopback_flow() -> Result<serde_json::Value, NexusError> {
+    bootstrap_udp_loopback_flow_with(LoopbackPorts::default())
+}
+
+pub fn bootstrap_udp_loopback_flow_with(
+    ports: LoopbackPorts,
+) -> Result<serde_json::Value, NexusError> {
+    use nexus_connectivity::bootstrap_joiner::{
+        BootstrapEndpoint, BootstrapJoiner, ClientBootstrapHook,
+    };
+    use nexus_connectivity::bootstrap_server::{BootstrapServer, BootstrapServerConfig};
+    use nexus_connectivity::encryption::KeyPair;
+    use nexus_connectivity::virtual_subnet::BootstrapHook;
+    use nexus_platform::{PacketCarrier, UdpCarrier};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    fn err(m: impl Into<String>) -> NexusError {
+        NexusError::Internal { message: m.into() }
+    }
+
+    let psk = b"p4-loopback-psk".to_vec();
+    let now = Arc::new(AtomicU64::new(1_000u64));
+
+    // ---- 引导服务端：真实 UDP socket ----
+    let server_identity = KeyPair::from_seed(&[7u8; 32]);
+    let srv_locator = format!("udp://127.0.0.1:{}", ports.server);
+    let cfg = BootstrapServerConfig {
+        cidr: "10.144.144.0/24".into(),
+        lease_secs: 100_000,
+        hb_interval_ms: 5_000,
+        refresh_interval_ms: 10_000,
+        server_vip: "10.144.144.1".into(),
+        server_locator: srv_locator.clone(),
+        max_pending_per_src: 4,
+    };
+    let codec = crate::bootstrap_codec::DiscoveryBootstrapCodec::new();
+    let mut server = BootstrapServer::new(server_identity, psk.clone(), cfg, Box::new(codec), None)
+        .map_err(|e| err(format!("server new: {e}")))?;
+    server.upsert_self_entry(now.load(Ordering::SeqCst));
+
+    let mut srv_carrier = UdpCarrier::new();
+    srv_carrier
+        .bind(&srv_locator)
+        .map_err(|e| err(format!("srv bind: {e}")))?;
+
+    let srv = Arc::new(Mutex::new(server));
+    let srv_sock = Arc::new(Mutex::new(srv_carrier));
+    let srv_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let srv_now = now.clone();
+    let srv_handle = std::thread::spawn({
+        let srv = srv.clone();
+        let sock = srv_sock.clone();
+        let stop = srv_stop.clone();
+        move || {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let mut sv = srv.lock().unwrap();
+                let mut sk = sock.lock().unwrap();
+                match sk.receive_into(&mut buf) {
+                    Ok(0) => {
+                        drop(sk);
+                        drop(sv);
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Ok(n) => {
+                        let src = sk.last_peer_locator().unwrap_or_default();
+                        let t = srv_now.load(Ordering::SeqCst);
+                        if let Some((dst, bytes)) = sv.handle_datagram(&src, &buf[..n], t) {
+                            let _ = sk.send_to(&dst, &bytes);
+                        }
+                    }
+                    Err(_) => {
+                        drop(sk);
+                        drop(sv);
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                }
+            }
+        }
+    });
+    let _ = srv_handle;
+
+    // ---- 客户端 helper：发 hook.periodic 出站并泵回收包 ----
+    fn pump_client(
+        carrier: &mut UdpCarrier,
+        hook: &mut ClientBootstrapHook,
+        now: u64,
+    ) -> Vec<String> {
+        let mut all_events = Vec::new();
+        let tick = hook.periodic(now);
+        for (dst, bytes) in &tick.datagrams {
+            let _ = carrier.send_to(dst, bytes);
+        }
+        all_events.extend(tick.events);
+        // 有界等待回收包（PeerList/ack）。
+        let mut buf = vec![0u8; 65535];
+        let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+        while std::time::Instant::now() < deadline {
+            match carrier.receive_into(&mut buf) {
+                Ok(0) => std::thread::sleep(Duration::from_millis(2)),
+                Ok(n) => {
+                    let d = &buf[..n];
+                    if d.strip_prefix(b"nxb:").is_some() {
+                        hook.on_control_datagram(None, &d[4..], now);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        all_events
+    }
+
+    // ---- 客户端 A：零静态 peer，只配 bootstrap + PSK ----
+    let id_a = KeyPair::from_seed(&[11u8; 32]);
+    let a_bind = format!("udp://127.0.0.1:{}", ports.a);
+    let mut ca = UdpCarrier::new();
+    ca.bind(&a_bind).map_err(|e| err(format!("A bind: {e}")))?;
+    let codec_a = crate::bootstrap_codec::DiscoveryBootstrapCodec::new();
+    let eps = [BootstrapEndpoint {
+        server_locator: srv_locator.clone(),
+    }];
+    let (sess_a, peers_a0) = {
+        let mut j = BootstrapJoiner::new(&mut ca, &id_a, &psk, &codec_a);
+        j.join(&eps, None, now.load(Ordering::SeqCst), 3_000)
+            .map_err(|e| err(format!("A join: {e:?}")))?
+    };
+    let vip_a = sess_a.assigned_vip.clone();
+    let mut hook_a = ClientBootstrapHook::new(sess_a, Box::new(codec_a), peers_a0);
+
+    // ---- 客户端 B ----
+    let id_b = KeyPair::from_seed(&[22u8; 32]);
+    let b_bind = format!("udp://127.0.0.1:{}", ports.b);
+    let mut cb = UdpCarrier::new();
+    cb.bind(&b_bind).map_err(|e| err(format!("B bind: {e}")))?;
+    let codec_b = crate::bootstrap_codec::DiscoveryBootstrapCodec::new();
+    let (sess_b, peers_b0) = {
+        let mut j = BootstrapJoiner::new(&mut cb, &id_b, &psk, &codec_b);
+        j.join(&eps, None, now.load(Ordering::SeqCst), 3_000)
+            .map_err(|e| err(format!("B join: {e:?}")))?
+    };
+    let vip_b = sess_b.assigned_vip.clone();
+    let _ = peers_b0;
+
+    // ---- A 刷新 -> 应看到服务端 + B（在线目录互见；refresh_interval=10s）----
+    now.fetch_add(11_000, Ordering::SeqCst);
+    let _ = pump_client(&mut ca, &mut hook_a, now.load(Ordering::SeqCst));
+    let peers_a_now: Vec<String> = hook_a
+        .known_peers_snapshot()
+        .iter()
+        .map(|p| p.virtual_ip.clone())
+        .collect();
+    let a_sees_server = peers_a_now.contains(&"10.144.144.1".to_string());
+    let a_sees_b = peers_a_now.contains(&vip_b);
+
+    // ---- A 心跳维持租约（hb_interval=5s；推进 now 服务端收到 heartbeat 续期）----
+    now.fetch_add(6_000, Ordering::SeqCst);
+    let _ = pump_client(&mut ca, &mut hook_a, now.load(Ordering::SeqCst));
+
+    // ---- P2P：A/B 互见后经真实 UDP 建加密隧道 ----
+    // 从 hook 在线目录取 B 的真实 loopback locator（服务端观测到的源地址）。
+    let b_locator = hook_a
+        .known_peers_snapshot()
+        .into_iter()
+        .find(|p| p.virtual_ip == vip_b)
+        .map(|p| p.locator)
+        .ok_or_else(|| err("P2P: B locator not in PeerList"))?;
+    let a_locator = a_bind.clone();
+
+    use nexus_connectivity::encryption::EncryptionConfig;
+    use nexus_connectivity::virtual_subnet::{
+        TunnelPeer, TunnelState, VirtualSubnetConfig, VirtualSubnetTunnel,
+    };
+    use nexus_platform::VirtualPacketInterface;
+    struct CapVpi {
+        got: Arc<Mutex<Vec<u8>>>,
+    }
+    impl VirtualPacketInterface for CapVpi {
+        fn receive(
+            &mut self,
+            _o: &mut [u8],
+        ) -> std::result::Result<usize, nexus_platform::PlatformError> {
+            Ok(0)
+        }
+        fn send(&mut self, p: &[u8]) -> std::result::Result<(), nexus_platform::PlatformError> {
+            self.got.lock().unwrap().extend_from_slice(p);
+            Ok(())
+        }
+    }
+    let b_got: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![]));
+    let vpi_b = CapVpi { got: b_got.clone() };
+    let vpi_a = CapVpi {
+        got: Arc::new(Mutex::new(vec![])),
+    };
+    let mut tunnel_a = VirtualSubnetTunnel::new(
+        VirtualSubnetConfig::new("10.144.144.0/24", vip_a.clone()),
+        Box::new(vpi_a),
+        Box::new(ca),
+    );
+    let mut tunnel_b = VirtualSubnetTunnel::new(
+        VirtualSubnetConfig::new("10.144.144.0/24", vip_b.clone()),
+        Box::new(vpi_b),
+        Box::new(cb),
+    );
+    tunnel_a.set_bootstrap_hook(Some(Box::new(hook_a)));
+    tunnel_a
+        .add_peer(TunnelPeer::new(vip_b.clone(), b_locator.clone()))
+        .map_err(|e| err(format!("add_peer: {e:?}")))?;
+    tunnel_b
+        .add_peer(TunnelPeer::new(vip_a.clone(), a_locator.clone()))
+        .map_err(|e| err(format!("add_peer: {e:?}")))?;
+    tunnel_a.enable_encryption(EncryptionConfig::default());
+    tunnel_b.enable_encryption(EncryptionConfig::default());
+    tunnel_a
+        .begin_handshake(&vip_b)
+        .map_err(|e| err(format!("handshake: {e:?}")))?;
+
+    // 有界驱动：两端 recv_and_deliver 直至双向 Connected。
+    let mut buf = vec![0u8; 65535];
+    let handshake_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut p2p_connected = false;
+    while std::time::Instant::now() < handshake_deadline {
+        let _ = tunnel_a.recv_and_deliver(&mut buf, now.load(Ordering::SeqCst));
+        let _ = tunnel_b.recv_and_deliver(&mut buf, now.load(Ordering::SeqCst));
+        if tunnel_a.peer_state(&vip_b) == Some(TunnelState::Connected)
+            && tunnel_b.peer_state(&vip_a) == Some(TunnelState::Connected)
+        {
+            p2p_connected = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // 真实 AEAD 数据：A -> B。
+    let payload = b"p4-real-udp-aead-payload";
+    tunnel_a
+        .send_ip_packet(&vip_b, payload)
+        .map_err(|e| err(format!("send: {e:?}")))?;
+    let mut got_len = 0usize;
+    let data_deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < data_deadline {
+        if let Some((_src, n)) = tunnel_b
+            .recv_and_deliver(&mut buf, now.load(Ordering::SeqCst))
+            .map_err(|e| err(format!("recv: {e:?}")))?
+        {
+            got_len = n;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let vpi_bytes = b_got.lock().unwrap().clone();
+    // 隧道交付到 VPI 的是剥净帧头后的原始载荷，须与发送载荷逐字节一致。
+    let p2p_payload_matches = vpi_bytes == payload[..];
+
+    // ---- 停 B 心跳，推进 now 越过 lease(100000s)，服务端 sweep 应回收 B ----
+    now.fetch_add(92_000, Ordering::SeqCst);
+    // A 再 bootstrap_tick 保活自身（经 tunnel send_raw）；服务端自身条目重续。
+    let _ = tunnel_a.bootstrap_tick(now.load(Ordering::SeqCst));
+    {
+        let mut sv = srv.lock().unwrap();
+        sv.upsert_self_entry(now.load(Ordering::SeqCst));
+    }
+    let report = {
+        let mut sv = srv.lock().unwrap();
+        sv.sweep_expired(now.load(Ordering::SeqCst))
+    };
+    let expired_ids = report.expired.clone();
+    let released_ids = report.released_vips.clone();
+    let leases_after: Vec<String> = srv
+        .lock()
+        .unwrap()
+        .leases_snapshot(now.load(Ordering::SeqCst))
+        .iter()
+        .map(|(_, v)| v.clone())
+        .collect();
+    let b_in_directory = leases_after.contains(&vip_b);
+    let a_in_directory = leases_after.contains(&vip_a);
+    let b_evicted_after_lease = !b_in_directory;
+
+    // ---- 硬门：任一关键断言失败即 Err，不产出 PASS ----
+    if !a_sees_server {
+        return Err(err(format!(
+            "gate: A did not see server; peers={peers_a_now:?}"
+        )));
+    }
+    if !a_sees_b {
+        return Err(err(format!("gate: A did not see B; peers={peers_a_now:?}")));
+    }
+    if !p2p_connected {
+        return Err(err("gate: P2P tunnels not Connected between A/B"));
+    }
+    if !p2p_payload_matches {
+        return Err(err(format!(
+            "gate: P2P payload mismatch; got={vpi_bytes:?} expected tail={payload:?}"
+        )));
+    }
+    if !b_evicted_after_lease {
+        return Err(err(format!(
+            "gate: B not evicted after lease; leases={leases_after:?}"
+        )));
+    }
+    if !a_in_directory {
+        return Err(err(format!(
+            "gate: A unexpectedly dropped; leases={leases_after:?}"
+        )));
+    }
+    if !expired_ids
+        .iter()
+        .any(|id| id.ends_with("e82c0d763cb9fdcf"))
+    {
+        return Err(err(format!(
+            "gate: B node_id not in expired; expired={expired_ids:?}"
+        )));
+    }
+
+    // 优雅停机：通知服务端线程退出，释放监听端口。
+    srv_stop.store(true, Ordering::SeqCst);
+    let _ = srv_handle.join();
+
+    Ok(serde_json::json!({
+        "verdict": "PASS",
+        "command": "run",
+        "scenario": "bootstrap-udp-loopback",
+        "server": { "udp": format!("127.0.0.1:{}", ports.server), "vip": "10.144.144.1" },
+        "client_a": { "udp": format!("127.0.0.1:{}", ports.a), "assigned_vip": vip_a, "sees_server": a_sees_server, "sees_peer_b": a_sees_b },
+        "client_b": { "udp": format!("127.0.0.1:{}", ports.b), "assigned_vip": vip_b },
+        "peers_a_after_refresh": peers_a_now,
+        "b_evicted_after_lease": !b_in_directory,
+        "p2p_connected": p2p_connected,
+        "p2p_data_len": got_len,
+        "p2p_payload_matches": p2p_payload_matches,
+        "p2p_a_locator": a_locator,
+        "p2p_b_locator": b_locator,
+        "expired_ids": expired_ids,
+        "released_ids": released_ids,
+        "b_still_in_directory": b_in_directory,
+        "a_still_in_directory": a_in_directory,
+        "leases_after": leases_after,
+    }))
+}
+
+#[cfg(test)]
+mod p4_udp_loopback_tests {
+    use super::*;
+
+    /// P4 自动门：真实 UDP loopback 全链路（控制面 + P2P 加密数据面）。
+    /// 用独特高端口避免与其他并行测试冲突；flow 内部已做硬门 + 优雅停机。
+    #[test]
+    fn bootstrap_udp_loopback_real_socket() {
+        let ports = LoopbackPorts {
+            server: 17011,
+            a: 17111,
+            b: 17112,
+        };
+        let v = bootstrap_udp_loopback_flow_with(ports)
+            .expect("bootstrap udp loopback flow should PASS all hard gates");
+        assert_eq!(v["verdict"], "PASS");
+        assert_eq!(v["p2p_connected"], serde_json::json!(true));
+        assert_eq!(v["p2p_payload_matches"], serde_json::json!(true));
+        assert_eq!(v["b_evicted_after_lease"], serde_json::json!(true));
+    }
+}
