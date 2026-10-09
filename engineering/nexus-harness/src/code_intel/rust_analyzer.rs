@@ -348,7 +348,7 @@ impl RustAnalyzerProvider {
             // 不再展开，kind 记为 "unknown"（不伪造、也不无限拉起 server 工作）。
             None
         };
-        let (name, kind, qualified) = match symbol_name {
+        let (name, kind, kind_id, qualified) = match symbol_name {
             Some(record) => {
                 let qualified = if record.container.is_empty() {
                     record.name.clone()
@@ -358,12 +358,14 @@ impl RustAnalyzerProvider {
                 (
                     record.name.clone(),
                     symbol_kind(i64::from(record.kind)).to_string(),
+                    i64::from(record.kind),
                     qualified,
                 )
             }
             None => (
                 label.to_string(),
                 "unknown".to_string(),
+                0,
                 if label.is_empty() {
                     rel.clone()
                 } else {
@@ -374,6 +376,7 @@ impl RustAnalyzerProvider {
         ResultItem {
             symbol: name,
             kind,
+            kind_id,
             qualified_name: qualified,
             path: rel,
             range: Some(crate::code_intel::dto::PositionRange {
@@ -393,6 +396,48 @@ impl RustAnalyzerProvider {
         meta.write_requests_refused = refused;
         meta.ready = self.readiness().trustworthy();
         meta
+    }
+
+    /// CallHierarchyItem（incoming 的 `from` / outgoing 的 `to`）-> 中立条目。
+    ///
+    /// LSP 的 `detail` 是签名而不是命名空间，不能拼成 `签名::名字`；因此优先用
+    /// documentSymbol 解析真实容器路径，解析不到才退回 item 自带的 name/kind。
+    fn item_from_call(
+        &mut self,
+        call: &Value,
+        key: &str,
+        ranges_key: &str,
+        budget: &Budget,
+    ) -> Option<ResultItem> {
+        let item = call.get(key)?;
+        let uri = item.get("uri").and_then(Value::as_str).unwrap_or("");
+        let abs = PathBuf::from(uri_to_path(uri));
+        let range = item
+            .get("selectionRange")
+            .and_then(lsp_range_of_ref)
+            .or_else(|| item.get("range").and_then(lsp_range_of_ref))
+            .or_else(|| {
+                call.get(ranges_key)
+                    .and_then(Value::as_array)
+                    .and_then(|a| a.first())
+                    .and_then(lsp_range_of_ref)
+            })?;
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let site = ResolvedSite {
+            abs_path: abs,
+            range,
+        };
+        let mut result = self.item_from_site(&site, &name, budget.max_snippet_lines);
+        if result.kind_id == 0 {
+            let raw = item.get("kind").and_then(Value::as_i64).unwrap_or(0);
+            result.kind_id = raw;
+            result.kind = symbol_kind(raw).to_string();
+        }
+        Some(result)
     }
 
     fn locations(
@@ -491,6 +536,7 @@ impl CodeIntelligenceProvider for RustAnalyzerProvider {
             items.push(ResultItem {
                 symbol: name,
                 kind: symbol_kind(i64::from(kind)).to_string(),
+                kind_id: i64::from(kind),
                 qualified_name: qualified,
                 path: rel,
                 range: Some(crate::code_intel::dto::PositionRange {
@@ -578,48 +624,9 @@ impl CodeIntelligenceProvider for RustAnalyzerProvider {
             self.request_until_hits("callHierarchy/incomingCalls", json!({"item": item}))?;
         let mut out = Vec::new();
         for call in result.as_array().into_iter().flatten() {
-            let Some(from) = call.get("from") else {
-                continue;
-            };
-            let uri = from.get("uri").and_then(Value::as_str).unwrap_or("");
-            let abs = PathBuf::from(uri_to_path(uri));
-            let range = from
-                .get("selectionRange")
-                .and_then(lsp_range_of_ref)
-                .or_else(|| from.get("range").and_then(lsp_range_of_ref))
-                .or_else(|| {
-                    call.get("fromRanges")
-                        .and_then(Value::as_array)
-                        .and_then(|a| a.first())
-                        .and_then(lsp_range_of_ref)
-                });
-            let name = from
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let detail = from.get("detail").and_then(Value::as_str).unwrap_or("");
-            let qualified = if detail.is_empty() {
-                name.clone()
-            } else {
-                format!("{detail}::{name}")
-            };
-            let kind = from.get("kind").and_then(Value::as_i64).unwrap_or(0) as u8;
-            out.push(ResultItem {
-                symbol: name,
-                kind: symbol_kind(i64::from(kind)).to_string(),
-                qualified_name: qualified,
-                path: relative_path(&self.repo_root, &abs),
-                range: range.map(|(sl, sc, el, ec)| crate::code_intel::dto::PositionRange {
-                    start_line: sl,
-                    start_column: sc,
-                    end_line: el,
-                    end_column: ec,
-                }),
-                snippet: range.map_or(String::new(), |r| {
-                    snippet_of(&abs, r, budget.max_snippet_lines)
-                }),
-            });
+            if let Some(item) = self.item_from_call(call, "from", "fromRanges", budget) {
+                out.push(item);
+            }
         }
         Ok(out)
     }
@@ -634,40 +641,9 @@ impl CodeIntelligenceProvider for RustAnalyzerProvider {
             self.request_until_hits("callHierarchy/outgoingCalls", json!({"item": item}))?;
         let mut out = Vec::new();
         for call in result.as_array().into_iter().flatten() {
-            let Some(to) = call.get("to") else { continue };
-            let uri = to.get("uri").and_then(Value::as_str).unwrap_or("");
-            let abs = PathBuf::from(uri_to_path(uri));
-            let range = to
-                .get("selectionRange")
-                .and_then(lsp_range_of_ref)
-                .or_else(|| to.get("range").and_then(lsp_range_of_ref));
-            let name = to
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let detail = to.get("detail").and_then(Value::as_str).unwrap_or("");
-            let qualified = if detail.is_empty() {
-                name.clone()
-            } else {
-                format!("{detail}::{name}")
-            };
-            let kind = to.get("kind").and_then(Value::as_i64).unwrap_or(0) as u8;
-            out.push(ResultItem {
-                symbol: name,
-                kind: symbol_kind(i64::from(kind)).to_string(),
-                qualified_name: qualified,
-                path: relative_path(&self.repo_root, &abs),
-                range: range.map(|(sl, sc, el, ec)| crate::code_intel::dto::PositionRange {
-                    start_line: sl,
-                    start_column: sc,
-                    end_line: el,
-                    end_column: ec,
-                }),
-                snippet: range.map_or(String::new(), |r| {
-                    snippet_of(&abs, r, budget.max_snippet_lines)
-                }),
-            });
+            if let Some(item) = self.item_from_call(call, "to", "toRanges", budget) {
+                out.push(item);
+            }
         }
         Ok(out)
     }
@@ -689,9 +665,13 @@ impl CodeIntelligenceProvider for RustAnalyzerProvider {
         let text = cap_lines(&hover_text(&result), budget.max_snippet_lines);
         let abs = absolute(&loc.path);
         let record = self.symbol_at(&abs, loc.line, loc.column);
-        let (name, kind) = match &record {
-            Some(r) => (r.name.clone(), symbol_kind(i64::from(r.kind)).to_string()),
-            None => (String::new(), "unknown".to_string()),
+        let (name, kind, kind_id) = match &record {
+            Some(r) => (
+                r.name.clone(),
+                symbol_kind(i64::from(r.kind)).to_string(),
+                i64::from(r.kind),
+            ),
+            None => (String::new(), "unknown".to_string(), 0),
         };
         let qualified = record.map_or_else(
             || relative_path(&self.repo_root, &abs),
@@ -706,6 +686,7 @@ impl CodeIntelligenceProvider for RustAnalyzerProvider {
         Ok(vec![ResultItem {
             symbol: name,
             kind,
+            kind_id,
             qualified_name: qualified,
             path: relative_path(&self.repo_root, &abs),
             range: result

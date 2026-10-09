@@ -53,7 +53,7 @@ options（全部可选，缺省即预算默认值）：
 扩展字段（`code` 全部命令统一）：
 
 ```text
-results            语言中立结果数组（symbol/kind/qualified_name/path/range/snippet）
+results            语言中立结果数组（symbol/kind/kind_id/qualified_name/path/range/snippet）
 count              截断前的完整命中数
 budget             {max_results,max_snippet_lines,max_result_bytes,workspace_scope,truncated}
 continuation       截断时 {refinement_hint}（未截断则省略）
@@ -62,6 +62,11 @@ snapshot           {source_revision,working_tree_digest,target_triple,toolchain_
 authority          恒为 "advisory"：Code Intelligence 不拥有最终 PASS
 error              失败时 {code,reason}
 ```
+
+`kind` 是 provider 声明的 LSP `SymbolKind` 对应字符串，`kind_id` 是该数值原文
+（0 = provider 未给出）。两者都给是因为 rust-analyzer 对 trait/impl 方法有时
+上报 `property`(6) 或 `variable`(12) 而非 `method`(5)：只给字符串会误导 Agent，
+而 harness 不擅自纠正 language server 的语义声明，交由调用方判断。
 
 错误码（提案 §12 冻结）：
 

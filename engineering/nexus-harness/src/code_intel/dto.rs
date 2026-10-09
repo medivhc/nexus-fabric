@@ -124,6 +124,11 @@ impl PositionRange {
 pub struct ResultItem {
     pub symbol: String,
     pub kind: String,
+    /// provider 声明的原始 LSP `SymbolKind` 数值；0 = provider 未给出。
+    /// 之所以同时保留数值：rust-analyzer 对 trait/impl 方法有时上报
+    /// `property`(6)/`variable`(12) 而非 `method`(5)，字符串会误导 Agent，
+    /// 数值让调用方能自行判断（不假装我们能纠正 server 的语义）。
+    pub kind_id: i64,
     pub qualified_name: String,
     /// 相对仓库根的路径（`/` 分隔）。
     pub path: String,
@@ -136,6 +141,7 @@ impl ResultItem {
         json!({
             "symbol": self.symbol,
             "kind": self.kind,
+            "kind_id": self.kind_id,
             "qualified_name": self.qualified_name,
             "path": self.path,
             "range": self.range.map(|r| r.to_json()).unwrap_or(Value::Null),

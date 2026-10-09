@@ -116,6 +116,8 @@ impl DiagnosticItem {
         json!({
             "symbol": self.code,
             "kind": "diagnostic",
+            // 诊断不是符号：kind_id 固定 0（= provider 未给出符号类别）。
+            "kind_id": 0,
             "qualified_name": self.severity,
             "path": self.path,
             "range": self.range.map(|(sl, sc, el, ec)| {

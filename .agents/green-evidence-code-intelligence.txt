@@ -1,24 +1,25 @@
 # Green Evidence: Code Intelligence 实现阶段（9 个 E4 场景）
-# 日期: 2026-10-09T19:42:21Z  执行者: qoder-desktop (NEXUS_AGENT)
-# 绑定: {"rev":"95e03a88","tree":"44756683f911","cfg":"1a82b0a3bdfa","contract":"096be167075d"}
-# revision: 95e03a8 (branch fix/windows-cfg-portability, 工作树 clean)
+# 生成: 2026-10-09T19:53:03Z  执行者: qoder-desktop (NEXUS_AGENT)
+# 绑定: rev=e9be214a tree=ec9e4744ce6a cfg=1a82b0a3bdfa contract=096be167075d toolchain=1.95.0 target=x86_64-pc-windows-msvc
+# 注意: 运行本记录时工作树含未提交的 kind_id/qualified_name 改进；
+#       提交后需重跑以获得与最终 revision 一致的新鲜证据。
 # 命令: nexus-harness scenario run engineering.code-intelligence-<id> --json
 
-{"command":"scenario run","duration_ms":35781,"evidence_id":"scenario-qoder-desktop-7ff408596272","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-symbol: PASS (command ran, all 9 expectations held)","scenario":"engineering.code-intelligence-symbol","schema_version":1,"verdict":"PASS"}
+{"command":"scenario run","duration_ms":18186,"evidence_id":"scenario-qoder-desktop-d08e84ee5bbc","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-symbol: PASS (command ran, all 9 expectations held)","scenario":"engineering.code-intelligence-symbol","schema_version":1,"verdict":"PASS"}
 
-{"command":"scenario run","duration_ms":18100,"evidence_id":"scenario-qoder-desktop-6fbfa1ff2eda","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-implementations: PASS (command ran, all 7 expectations held)","scenario":"engineering.code-intelligence-implementations","schema_version":1,"verdict":"PASS"}
+{"command":"scenario run","duration_ms":17889,"evidence_id":"scenario-qoder-desktop-765d5b353e07","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-implementations: PASS (command ran, all 7 expectations held)","scenario":"engineering.code-intelligence-implementations","schema_version":1,"verdict":"PASS"}
 
-{"command":"scenario run","duration_ms":17587,"evidence_id":"scenario-qoder-desktop-0affbb009ee3","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-definition: PASS (command ran, all 6 expectations held)","scenario":"engineering.code-intelligence-definition","schema_version":1,"verdict":"PASS"}
+{"command":"scenario run","duration_ms":17778,"evidence_id":"scenario-qoder-desktop-4aa4af8eb126","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-definition: PASS (command ran, all 6 expectations held)","scenario":"engineering.code-intelligence-definition","schema_version":1,"verdict":"PASS"}
 
-{"command":"scenario run","duration_ms":17889,"evidence_id":"scenario-qoder-desktop-37ffbf56e301","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-callers: PASS (command ran, all 6 expectations held)","scenario":"engineering.code-intelligence-callers","schema_version":1,"verdict":"PASS"}
+{"command":"scenario run","duration_ms":18284,"evidence_id":"scenario-qoder-desktop-11fc145649ab","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-callers: PASS (command ran, all 6 expectations held)","scenario":"engineering.code-intelligence-callers","schema_version":1,"verdict":"PASS"}
 
-{"command":"scenario run","duration_ms":17598,"evidence_id":"scenario-qoder-desktop-6c499e406d27","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-hover: PASS (command ran, all 6 expectations held)","scenario":"engineering.code-intelligence-hover","schema_version":1,"verdict":"PASS"}
+{"command":"scenario run","duration_ms":17773,"evidence_id":"scenario-qoder-desktop-4342d37be19b","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-hover: PASS (command ran, all 6 expectations held)","scenario":"engineering.code-intelligence-hover","schema_version":1,"verdict":"PASS"}
 
-{"command":"scenario run","duration_ms":18191,"evidence_id":"scenario-qoder-desktop-0d2a069a6469","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-diagnostics-advisory: PASS (command ran, all 6 expectations held)","scenario":"engineering.code-intelligence-diagnostics-advisory","schema_version":1,"verdict":"PASS"}
+{"command":"scenario run","duration_ms":18501,"evidence_id":"scenario-qoder-desktop-263dc366f858","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-diagnostics-advisory: PASS (command ran, all 6 expectations held)","scenario":"engineering.code-intelligence-diagnostics-advisory","schema_version":1,"verdict":"PASS"}
 
-{"command":"scenario run","duration_ms":18078,"evidence_id":"scenario-qoder-desktop-03800d59477a","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-budget-truncation: PASS (command ran, all 8 expectations held)","scenario":"engineering.code-intelligence-budget-truncation","schema_version":1,"verdict":"PASS"}
+{"command":"scenario run","duration_ms":18500,"evidence_id":"scenario-qoder-desktop-c324ce2363de","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-budget-truncation: PASS (command ran, all 8 expectations held)","scenario":"engineering.code-intelligence-budget-truncation","schema_version":1,"verdict":"PASS"}
 
-{"command":"scenario run","duration_ms":306,"evidence_id":"scenario-qoder-desktop-62103c407028","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-provider-unavailable: PASS (command ran, all 5 expectations held)","scenario":"engineering.code-intelligence-provider-unavailable","schema_version":1,"verdict":"PASS"}
+{"command":"scenario run","duration_ms":206,"evidence_id":"scenario-qoder-desktop-28bf801d4ebd","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-provider-unavailable: PASS (command ran, all 5 expectations held)","scenario":"engineering.code-intelligence-provider-unavailable","schema_version":1,"verdict":"PASS"}
 
-{"command":"scenario run","duration_ms":104,"evidence_id":"scenario-qoder-desktop-ab7239a54ac0","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-write-method-denied: PASS (command ran, all 5 expectations held)","scenario":"engineering.code-intelligence-write-method-denied","schema_version":1,"verdict":"PASS"}
+{"command":"scenario run","duration_ms":105,"evidence_id":"scenario-qoder-desktop-aff64359d380","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-write-method-denied: PASS (command ran, all 5 expectations held)","scenario":"engineering.code-intelligence-write-method-denied","schema_version":1,"verdict":"PASS"}
 
