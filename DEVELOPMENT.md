@@ -252,6 +252,13 @@ MVP 优先 Cargo metadata + 显式 mapping，不构造脆弱的全程序猜测�
   cmd 内建而不是 PE 可执行文件，因此 3 个以 `echo` 为 fixture 的场景单测
   （`run_single_pass_report`、`run_single_expect_failure_signature`、
   `run_parallel_keeps_order_and_verdicts`）在 Windows FAIL、在 Linux/WSL PASS。
+- `env::tests::digests_deterministic_and_sha1_length` 在 Linux 上出现过一次
+  （100 个测试里 99 passed / 1 failed）而在复跑（含 `--test-threads=1`）时全绿。
+  根因是 `Repo::working_tree_digest()` 走 `git write-tree`，与并发跑的其它测试
+  争 `.git/index.lock` 时失败并降级成 `tree-unknown`，于是"两次取值不相等"。
+  这是门禁自身的并发脆弱点，未在本轮修（修法应是重试或让测试串行，属 harness
+  契约变更）。受影响面已由 Code Intelligence 侧兜住：`code` 拿到哨兵值一律
+  `BLOCKED`，不会把"取不到指纹"说成"工作树没变"。
 
 处置：需要作为**结论**的门禁（`cargo test -p nexus-harness`、`verify --fast --json`、
 Contract Hash）在 Linux/WSL 或 `core.autocrlf=false` 的工作树里跑；Windows 侧只用于

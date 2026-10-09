@@ -135,6 +135,18 @@ pub fn run(args: &[String]) -> Outcome {
     }
 
     let bindings_before = Bindings::current(&repo);
+    // `Repo::working_tree_digest()` 在 git 调用失败时会降级成哨兵值（`tree-unknown` /
+    // `dirty-unknown`）。若不加检查，"前后两次都失败"会被当成"工作树没变"，
+    // 于是把"无法证明绑定"说成"绑定成立"——这正是提案 §12 禁止的伪 PASS。
+    // git 侧的失败是可观测的：实测 `cargo test -p nexus-harness` 并发跑时
+    // `git write-tree` 会因 index.lock 竞争失败（见 DEVELOPMENT.md §11.1）。
+    if digest_is_unusable(&bindings_before.working_tree_digest) {
+        let e = CodeIntelError::WorkspaceUnresolved.with_reason(
+            "查询开始前取不到可信的工作树指纹（git status/write-tree 失败或降级），无法把结果绑定到 revision"
+                .to_string(),
+        );
+        return fail(&with_budget(base, &request), &e);
+    }
     let mut envelope = with_budget(base, &request);
     // MODULE.md 冻结的 snapshot 含 workspace_root，而 Bindings 不含该字段：
     // 在此显式补齐，避免"契约声明了、输出里没有"。
@@ -191,6 +203,13 @@ pub fn run(args: &[String]) -> Outcome {
 
     // 提案 §13：查询完成后再算一次 digest，工作树变了就不能当作当前事实。
     let bindings_after = Bindings::current(&repo);
+    if digest_is_unusable(&bindings_after.working_tree_digest) {
+        let e = CodeIntelError::WorkspaceUnresolved.with_reason(
+            "查询结束后取不到可信的工作树指纹（git status/write-tree 失败或降级），无法证明结果仍绑定查询时的 revision"
+                .to_string(),
+        );
+        return fail(&envelope, &e);
+    }
     if bindings_after.working_tree_digest != bindings_before.working_tree_digest {
         let e = CodeIntelError::SnapshotStale
             .with_reason("查询期间工作树发生变化（working_tree_digest 不一致）".to_string());
@@ -223,6 +242,14 @@ fn kept_count(fields: &[(String, Value)]) -> usize {
         .and_then(|(_, v)| v.as_array())
         .map(Vec::len)
         .unwrap_or(0)
+}
+
+/// `Repo::working_tree_digest()` 的降级哨兵值（env.rs 的 `unwrap_or_else` 分支）。
+/// 命中任一哨兵就说明**没取到**指纹，不能参与"前后一致"的判定。
+const DIGEST_SENTINELS: [&str; 2] = ["tree-unknown", "dirty-unknown"];
+
+fn digest_is_unusable(digest: &str) -> bool {
+    digest.is_empty() || DIGEST_SENTINELS.contains(&digest)
 }
 
 fn with_budget(mut envelope: Envelope, request: &Request) -> Envelope {
@@ -574,6 +601,17 @@ fn apply_budget(items: Vec<Value>, budget: &mut Budget) -> (Vec<Value>, usize, O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 取不到工作树指纹时必须拒绝下结论；"前后两次都失败"不等于"工作树没变"。
+    #[test]
+    fn unusable_tree_digest_is_never_treated_as_fresh() {
+        for sentinel in ["tree-unknown", "dirty-unknown", ""] {
+            assert!(digest_is_unusable(sentinel), "{sentinel} 必须判为不可用");
+        }
+        assert!(!digest_is_unusable(
+            "357bb50e37fe1c0f2a5d0b7a4a7e9f0c1b2d3e4f"
+        ));
+    }
 
     fn item(path: &str, line: usize) -> Value {
         json!({"symbol":"s","kind":"method","qualified_name":"C::s","path":path,
