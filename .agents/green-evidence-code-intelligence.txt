@@ -1,24 +1,87 @@
-# Green Evidence: Code Intelligence 实现阶段（9 个 E4 场景）
-# 生成: 2026-10-09T19:58:16Z  执行者: qoder-desktop (NEXUS_AGENT)
-# 绑定: rev=7c5de880 tree=357bb50e37fe cfg=1a82b0a3bdfa contract=096be167075d toolchain=1.95.0 target=x86_64-pc-windows-msvc
-# 说明: 运行于工作树含本文件写入前状态；scenario 只读，不改动被绑定输入之外的文件。
+# Green Evidence: Code Intelligence 的 13 个 E4 场景（第二轮，双宿主复跑）
+# 日期: 2026-10-10
+# 执行者: qoder-desktop（Windows 宿主）+ qoder-wsl（WSL2 Ubuntu 宿主）
+# 绑定 revision: 6aadc4293908317b988aa80145bde5a169a0cbf6（本记录写入前的 HEAD，工作树 clean）
+# 契约代: contract: f13e96c681a6aa3c354896fade811d65d613f96b（= 冻结提交 d4138b7 的 scenarios/** tree 摘要）
+#         本轮提交后的工作树口径值: 9b250ff2927b34af8db94120560b14be7950ac81（Linux 实测与脚本复现一致）
 # 命令: nexus-harness scenario run engineering.code-intelligence-<id> --json
+#
+# 与第一轮（.agents/green-evidence-code-intelligence.txt 的历史内容：9 场景 @34e1aca）的差异：
+#   1) 场景从 9 个增加到 13 个（新增 callees / scope-violation / read-only-counters / budget-count）；
+#   2) 契约哈希改按"已提交 tree 的 LF blob"记录，理由见文末 C 段勘误；
+#   3) 首次在 Linux 宿主拿到 verify --fast 的 overall PASS，提案 §16.11 闭环。
 
-{"command":"scenario run","duration_ms":18286,"evidence_id":"scenario-qoder-desktop-284c67dd5a73","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-symbol: PASS (command ran, all 9 expectations held)","scenario":"engineering.code-intelligence-symbol","schema_version":1,"verdict":"PASS"}
+## A. Windows 宿主（rustc/clippy 1.95.0, x86_64-pc-windows-msvc, rust-analyzer 1.95.0）
+# rev=6aadc42  working_tree_digest=5bad6505b9043352a76d4037085ef7cd7ca2414e  dirty=false  13/13 PASS
 
-{"command":"scenario run","duration_ms":17686,"evidence_id":"scenario-qoder-desktop-e4f5253ea5ff","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-implementations: PASS (command ran, all 7 expectations held)","scenario":"engineering.code-intelligence-implementations","schema_version":1,"verdict":"PASS"}
+{"command":"scenario run","duration_ms":18383,"evidence_id":"scenario-qoder-desktop-79265fcb7f38","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-budget-count: PASS (command ran, all 7 expectations held)","scenario":"engineering.code-intelligence-budget-count","schema_version":1,"verdict":"PASS"}
+{"command":"scenario run","duration_ms":18099,"evidence_id":"scenario-qoder-desktop-d1e4d13a2fe9","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-budget-truncation: PASS (command ran, all 8 expectations held)","scenario":"engineering.code-intelligence-budget-truncation","schema_version":1,"verdict":"PASS"}
+{"command":"scenario run","duration_ms":17982,"evidence_id":"scenario-qoder-desktop-6fe8eb4cf58c","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-callees: PASS (command ran, all 7 expectations held)","scenario":"engineering.code-intelligence-callees","schema_version":1,"verdict":"PASS"}
+{"command":"scenario run","duration_ms":17890,"evidence_id":"scenario-qoder-desktop-0004a4390ccf","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-callers: PASS (command ran, all 6 expectations held)","scenario":"engineering.code-intelligence-callers","schema_version":1,"verdict":"PASS"}
+{"command":"scenario run","duration_ms":18004,"evidence_id":"scenario-qoder-desktop-7f4cb24b27a2","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-definition: PASS (command ran, all 6 expectations held)","scenario":"engineering.code-intelligence-definition","schema_version":1,"verdict":"PASS"}
+{"command":"scenario run","duration_ms":18491,"evidence_id":"scenario-qoder-desktop-0488a9ad7726","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-diagnostics-advisory: PASS (command ran, all 6 expectations held)","scenario":"engineering.code-intelligence-diagnostics-advisory","schema_version":1,"verdict":"PASS"}
+{"command":"scenario run","duration_ms":18183,"evidence_id":"scenario-qoder-desktop-06996a032c5f","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-hover: PASS (command ran, all 6 expectations held)","scenario":"engineering.code-intelligence-hover","schema_version":1,"verdict":"PASS"}
+{"command":"scenario run","duration_ms":17800,"evidence_id":"scenario-qoder-desktop-4f10a604c16b","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-implementations: PASS (command ran, all 7 expectations held)","scenario":"engineering.code-intelligence-implementations","schema_version":1,"verdict":"PASS"}
+{"command":"scenario run","duration_ms":306,"evidence_id":"scenario-qoder-desktop-8a393b4adac1","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-provider-unavailable: PASS (command ran, all 5 expectations held)","scenario":"engineering.code-intelligence-provider-unavailable","schema_version":1,"verdict":"PASS"}
+{"command":"scenario run","duration_ms":18693,"evidence_id":"scenario-qoder-desktop-ec1287e21c81","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-read-only-counters: PASS (command ran, all 8 expectations held)","scenario":"engineering.code-intelligence-read-only-counters","schema_version":1,"verdict":"PASS"}
+{"command":"scenario run","duration_ms":205,"evidence_id":"scenario-qoder-desktop-383b43b52e8c","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-scope-violation: PASS (command ran, all 5 expectations held)","scenario":"engineering.code-intelligence-scope-violation","schema_version":1,"verdict":"PASS"}
+{"command":"scenario run","duration_ms":17888,"evidence_id":"scenario-qoder-desktop-a3ebe706ba2d","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-symbol: PASS (command ran, all 9 expectations held)","scenario":"engineering.code-intelligence-symbol","schema_version":1,"verdict":"PASS"}
+{"command":"scenario run","duration_ms":205,"evidence_id":"scenario-qoder-desktop-814375cf2852","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-write-method-denied: PASS (command ran, all 5 expectations held)","scenario":"engineering.code-intelligence-write-method-denied","schema_version":1,"verdict":"PASS"}
 
-{"command":"scenario run","duration_ms":18296,"evidence_id":"scenario-qoder-desktop-0672c6a6d85a","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-definition: PASS (command ran, all 6 expectations held)","scenario":"engineering.code-intelligence-definition","schema_version":1,"verdict":"PASS"}
+## B. Linux 宿主（WSL2 Ubuntu，rustc/clippy 1.94.1, x86_64-unknown-linux-gnu, rust-analyzer 1.94.1）
+# rev=6aadc4293908  dirty=0  同一份 checkout（脚本先 fetch+reset --hard 到 origin 分支）
+# 完整原始输出保存在仓库外：/d/next/wsl-final3.log（UTF-8）、/d/next/wsl-verify6.log（第一轮，含失败样本）
 
-{"command":"scenario run","duration_ms":17481,"evidence_id":"scenario-qoder-desktop-6880071ab753","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-callers: PASS (command ran, all 6 expectations held)","scenario":"engineering.code-intelligence-callers","schema_version":1,"verdict":"PASS"}
+cargo clippy --workspace --all-targets -- -D warnings      -> exit 0，error 行数 0
+cargo test -p nexus-harness                                 -> 102 passed / 0 failed（连续 3 次，锁竞争 flake 已消失）
+cargo test -p nexus --lib                                   -> 192 passed / 0 failed / 2 ignored
+nexus-harness verify --fast --json                          -> overall PASS（连续 2 次），Evidence dir=verify-qoder-wsl-63fec9d7c073
 
-{"command":"scenario run","duration_ms":17994,"evidence_id":"scenario-qoder-desktop-e87e679d571e","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-hover: PASS (command ran, all 6 expectations held)","scenario":"engineering.code-intelligence-hover","schema_version":1,"verdict":"PASS"}
+gate 逐项（两次一致）：
+    PASS    whitespace              :: no whitespace errors
+    PASS    format                  :: ok
+    PASS    check                   :: ok
+    PASS    clippy                  :: ok
+    PASS    architecture-policy     :: 48 crates declared
+    UNKNOWN dependency-governance   :: static checks passed; cargo-deny not installed
+    PASS    resource-type-neutrality:: 4 crate(s), 6 file(s)
+    PASS    affected-tests          :: no affected crates changed
+    PASS    selected-properties     :: ok
 
-{"command":"scenario run","duration_ms":18186,"evidence_id":"scenario-qoder-desktop-2e910a8f4fb4","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-diagnostics-advisory: PASS (command ran, all 6 expectations held)","scenario":"engineering.code-intelligence-diagnostics-advisory","schema_version":1,"verdict":"PASS"}
+13 个场景（id / verdict / evidence_id）：
+    budget-count             "verdict":"PASS" "evidence_id":"scenario-qoder-wsl-43c1047c23d1"
+    budget-truncation        "verdict":"PASS" "evidence_id":"scenario-qoder-wsl-d4c8f9564782"
+    callees                  "verdict":"PASS" "evidence_id":"scenario-qoder-wsl-e40dce09c0a1"
+    callers                  "verdict":"PASS" "evidence_id":"scenario-qoder-wsl-56cface9b15b"
+    definition               "verdict":"PASS" "evidence_id":"scenario-qoder-wsl-320c54517f5f"
+    diagnostics-advisory     "verdict":"PASS" "evidence_id":"scenario-qoder-wsl-4418fc05aed6"
+    hover                    "verdict":"PASS" "evidence_id":"scenario-qoder-wsl-525366dc8f4e"
+    implementations          "verdict":"PASS" "evidence_id":"scenario-qoder-wsl-f3a4afb66628"
+    provider-unavailable     "verdict":"PASS" "evidence_id":"scenario-qoder-wsl-6f36a05c9b3e"
+    read-only-counters       "verdict":"PASS" "evidence_id":"scenario-qoder-wsl-87d514e096e2"
+    scope-violation          "verdict":"PASS" "evidence_id":"scenario-qoder-wsl-e1a5eea61b30"
+    symbol                   "verdict":"PASS" "evidence_id":"scenario-qoder-wsl-8e91cfa22fcf"
+    write-method-denied      "verdict":"PASS" "evidence_id":"scenario-qoder-wsl-19f2df73ce39"
 
-{"command":"scenario run","duration_ms":18179,"evidence_id":"scenario-qoder-desktop-85f167dbffc0","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-budget-truncation: PASS (command ran, all 8 expectations held)","scenario":"engineering.code-intelligence-budget-truncation","schema_version":1,"verdict":"PASS"}
+副作用核查：`git status --porcelain` 行数 = 0；仓库内 flycheck 残留 = 0 个；
+构建副作用落在 /tmp/nexus-code-intel-479cdfe445e1c6a2（CARGO_TARGET_DIR 重定向，见 MODULE.md Side Effects）。
 
-{"command":"scenario run","duration_ms":207,"evidence_id":"scenario-qoder-desktop-cba7c0cdb425","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-provider-unavailable: PASS (command ran, all 5 expectations held)","scenario":"engineering.code-intelligence-provider-unavailable","schema_version":1,"verdict":"PASS"}
+## C. 契约哈希口径勘误（与 .agents/red-evidence-code-intelligence.txt 文末一致）
 
-{"command":"scenario run","duration_ms":104,"evidence_id":"scenario-qoder-desktop-ff73e7fd467a","failure_signature":{"assertion":"","failed_step":"","key_log_lines":[]},"message":"scenario engineering.code-intelligence-write-method-denied: PASS (command ran, all 5 expectations held)","scenario":"engineering.code-intelligence-write-method-denied","schema_version":1,"verdict":"PASS"}
+第一轮记录里 `contract=096be167075d…` 是 **Windows 工作树字节**值：`.gitattributes` 为
+`* text=auto`，只有 git checkout 的文件转 CRLF、由工具写入的文件保持 LF，所以该值既不可
+在 Linux 复现，也不可在重新 checkout 后复现。已验证的复现口径是对**已提交 tree 的 LF blob**
+按 `Repo::contract_hash()` 的拼接顺序（目录名与文件名排序，段间 `\n===\n`）喂
+`git hash-object --stdin`：
 
+    d4138b7（契约冻结，277+9 个场景）= f13e96c681a6aa3c354896fade811d65d613f96b
+    1f88158/…/6aadc42（+budget_count）= 9b250ff2927b34af8db94120560b14be7950ac81
+
+Linux 上 `nexus-harness status --json` 的 live `contract_hash` 实测等于第二个值，
+证明该口径与实现一致。复现脚本：本仓库外的 /d/next/contract-hash.js。
+
+## D. Windows 宿主的 fast 门禁仍不可通过（与 Code Intelligence 无关）
+
+`verify --fast` 在 Windows 上 check/clippy 两道门必挂：`nexus-platform-linux` 无条件依赖
+fuser(libfuse)，`apps/nexus/examples/discovery_mdns.rs` 用 Unix-only 的 `std::os::fd`，
+另有 4 个单测受本机 echo/CRLF 限制——全部记录在 DEVELOPMENT.md §11.1，未通过放宽门禁绕过。
