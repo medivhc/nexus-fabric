@@ -75,8 +75,14 @@ impl SdpPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SshAuth {
-    Password { username: String, password: String },
-    Key { username: String, private_key: String },
+    Password {
+        username: String,
+        password: String,
+    },
+    Key {
+        username: String,
+        private_key: String,
+    },
 }
 
 /// Browser → node messages (sent over the control DataChannel).
@@ -149,15 +155,9 @@ pub enum NodeMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MeshMessage {
     /// Forward a browser's SDP offer to the target node.
-    RelayOffer {
-        session_id: String,
-        sdp: SdpPayload,
-    },
+    RelayOffer { session_id: String, sdp: SdpPayload },
     /// The target node's SDP answer.
-    RelayAnswer {
-        session_id: String,
-        sdp: SdpPayload,
-    },
+    RelayAnswer { session_id: String, sdp: SdpPayload },
     /// The target node failed to accept the offer.
     RelayError { session_id: String, error: String },
     /// Open an SSH terminal on the target node (data-plane peer-relay).

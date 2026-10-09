@@ -82,7 +82,10 @@ impl InMemoryMeshSignaler {
 
     /// Register the local gateway's offer handler under `peer_id`.
     pub fn register(&self, peer_id: String, handler: MeshOfferHandler) {
-        self.handlers.lock().expect("mesh lock").insert(peer_id, handler);
+        self.handlers
+            .lock()
+            .expect("mesh lock")
+            .insert(peer_id, handler);
     }
 }
 
@@ -99,9 +102,7 @@ impl MeshSignaler for InMemoryMeshSignaler {
             .expect("mesh lock")
             .get(target)
             .cloned()
-            .ok_or_else(|| {
-                GatewayError::Mesh(format!("no in-memory handler for peer {target}"))
-            })?;
+            .ok_or_else(|| GatewayError::Mesh(format!("no in-memory handler for peer {target}")))?;
         handler(session_id, sdp)
     }
 
@@ -141,10 +142,7 @@ impl MeshDataConnection {
     ///
     /// Returns `GatewayError::WebSocket` on write failure.
     pub fn send(&self, msg: &MeshMessage) -> Result<(), GatewayError> {
-        let mut ws = self
-            .ws
-            .lock()
-            .expect("mesh data connection lock");
+        let mut ws = self.ws.lock().expect("mesh data connection lock");
         ws.send(tungstenite::Message::Text(
             serde_json::to_string(msg)
                 .map_err(|e| GatewayError::Protocol(format!("mesh data send: {e}")))?,
@@ -165,9 +163,7 @@ impl MeshDataConnection {
     pub fn read(&self) -> Result<MeshMessage, GatewayError> {
         loop {
             if self.is_stopped() {
-                return Err(GatewayError::Mesh(
-                    "mesh data connection stopped".into(),
-                ));
+                return Err(GatewayError::Mesh("mesh data connection stopped".into()));
             }
             let read_result = {
                 let mut ws = self.ws.lock().expect("mesh data connection lock");
@@ -185,21 +181,16 @@ impl MeshDataConnection {
                     continue;
                 }
                 Err(e) => {
-                    return Err(GatewayError::WebSocket(format!(
-                        "mesh data read: {e}"
-                    )));
+                    return Err(GatewayError::WebSocket(format!("mesh data read: {e}")));
                 }
             };
             match msg {
                 tungstenite::Message::Text(text) => {
-                    return serde_json::from_str(&text).map_err(|e| {
-                        GatewayError::Protocol(format!("mesh data message: {e}"))
-                    });
+                    return serde_json::from_str(&text)
+                        .map_err(|e| GatewayError::Protocol(format!("mesh data message: {e}")));
                 }
                 tungstenite::Message::Close(_) => {
-                    return Err(GatewayError::Mesh(
-                        "mesh data connection closed".into(),
-                    ));
+                    return Err(GatewayError::Mesh("mesh data connection closed".into()));
                 }
                 _ => continue,
             }
@@ -209,10 +200,7 @@ impl MeshDataConnection {
     /// Close the data connection and signal any reader thread to stop.
     pub fn close(&self) {
         self.stop.store(true, Ordering::Relaxed);
-        let mut ws = self
-            .ws
-            .lock()
-            .expect("mesh data connection lock");
+        let mut ws = self.ws.lock().expect("mesh data connection lock");
         let _ = ws.close(None);
     }
 
@@ -334,27 +322,18 @@ fn connect_mesh_ws(
     let socket_addrs = (host.as_str(), port)
         .to_socket_addrs()
         .map_err(GatewayError::Io)?;
-    let tcp = TcpStream::connect_timeout(
-        &socket_addrs.as_slice()[0],
-        Duration::from_secs(5),
-    )
-    .map_err(GatewayError::Io)?;
+    let tcp = TcpStream::connect_timeout(&socket_addrs.as_slice()[0], Duration::from_secs(5))
+        .map_err(GatewayError::Io)?;
     let sni = TlsServerName::try_from(host.clone())
         .map_err(|e| GatewayError::WebSocket(format!("bad server name {host}: {e}")))?;
-    let conn = rustls::ClientConnection::new(
-        Arc::new(permissive_client_config()),
-        sni,
-    )
-    .map_err(|e| GatewayError::WebSocket(e.to_string()))?;
+    let conn = rustls::ClientConnection::new(Arc::new(permissive_client_config()), sni)
+        .map_err(|e| GatewayError::WebSocket(e.to_string()))?;
     let tls = rustls::StreamOwned::new(conn, tcp);
 
-    let mut ws = tungstenite::client::client_with_config(
-        request,
-        tls,
-        Some(WebSocketConfig::default()),
-    )
-    .map_err(|e| GatewayError::WebSocket(format!("mesh ws handshake: {e}")))?
-    .0;
+    let mut ws =
+        tungstenite::client::client_with_config(request, tls, Some(WebSocketConfig::default()))
+            .map_err(|e| GatewayError::WebSocket(format!("mesh ws handshake: {e}")))?
+            .0;
 
     // Short read timeout so a MeshDataConnection can be shared between a
     // reader thread and writers without deadlocking or starving sends. Set
@@ -412,8 +391,7 @@ impl MeshSignaler for WssMeshSignaler {
             sdp: sdp.clone(),
         };
         ws.send(tungstenite::Message::Text(
-            serde_json::to_string(&request)
-                .map_err(|e| GatewayError::Protocol(e.to_string()))?,
+            serde_json::to_string(&request).map_err(|e| GatewayError::Protocol(e.to_string()))?,
         ))
         .map_err(|e| GatewayError::WebSocket(e.to_string()))?;
 

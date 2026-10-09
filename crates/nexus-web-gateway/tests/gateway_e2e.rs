@@ -669,7 +669,10 @@ fn two_nodes_reoffer_storm_returns_error() -> TestResult {
         err.contains("already exists"),
         "expected session-already-exists error, got {err:?}"
     );
-    assert!(browser.peers[1].connected, "existing peer B should stay connected");
+    assert!(
+        browser.peers[1].connected,
+        "existing peer B should stay connected"
+    );
     let _ = pending;
     let _ = rtc;
     let _ = udp;
