@@ -374,7 +374,8 @@ impl BootstrapServer {
         self.established.len()
     }
 
-    /// 处理一帧来自 `src_locator` 的数据报；返回 (回包 dst, 字节)，静默丢弃时 `None`。
+    /// 处理一帧来自 `src_locator` 的完整线帧数据报（含 `nxb:` magic）；
+    /// 返回 (回包 dst, 字节)，静默丢弃时 `None`。
     pub fn handle_datagram(
         &mut self,
         src_locator: &str,
@@ -383,6 +384,19 @@ impl BootstrapServer {
     ) -> Option<(String, Vec<u8>)> {
         // 双保险：nxb: 前缀不符 -> 不是我的帧，交回隧道 fall-through。
         let payload = dgram.strip_prefix(NXB_MAGIC)?;
+        self.handle_payload(src_locator, payload, now)
+    }
+
+    /// 处理一帧**已剥掉 `nxb:` magic** 的 payload。
+    ///
+    /// 隧道 `recv_and_deliver` 在 [`crate::virtual_subnet::BootstrapHook`] 分流前
+    /// 已剥 magic，故服务端常驻钩子走此入口，避免二次 `strip_prefix` 丢帧。
+    fn handle_payload(
+        &mut self,
+        src_locator: &str,
+        payload: &[u8],
+        now: u64,
+    ) -> Option<(String, Vec<u8>)> {
         match self.codec.split_outer(payload) {
             Ok(OuterKind::Secured(blob)) => self.handle_secured(src_locator, blob, now),
             Ok(OuterKind::JoinInit(req)) => match self.handle_join_init(src_locator, req, now) {
@@ -741,6 +755,78 @@ impl BootstrapServer {
             expired,
             released_vips,
         }
+    }
+}
+
+/// 服务端角色的常驻钩子：把隧道收到的 `nxb:` 控制帧转给 [`BootstrapServer`]，
+/// 并在每个 tick 做 TTL 清扫（v2 §6.4 / §7.2 接线点 3）。
+///
+/// 隧道独占 carrier（`virtual_subnet.rs`），服务端不能另持 socket，因此这里
+/// 只做纯逻辑转调：回包交回隧道代发，VIP 租约快照由调用方取走去落盘（§6.6）。
+pub struct ServerBootstrapHook {
+    server: BootstrapServer,
+    /// 上次 `periodic` 的清扫结果（供观测/落盘判定变更）。
+    last_sweep: SweepReport,
+}
+
+impl ServerBootstrapHook {
+    /// 包装服务端状态机为隧道钩子。
+    #[must_use]
+    pub fn new(server: BootstrapServer) -> Self {
+        Self {
+            server,
+            last_sweep: SweepReport {
+                expired: Vec::new(),
+                released_vips: Vec::new(),
+            },
+        }
+    }
+
+    /// 只读访问底层服务端（观测：在线数、租约快照）。
+    #[must_use]
+    pub fn server(&self) -> &BootstrapServer {
+        &self.server
+    }
+
+    /// 当前权威租约快照（§6.6 落盘内容）。
+    #[must_use]
+    pub fn leases_snapshot(&self, now: u64) -> Vec<(String, String)> {
+        self.server.leases_snapshot(now)
+    }
+
+    /// 最近一次清扫释放的 VIP（非空表示租约表发生变化，调用方应触发落盘）。
+    #[must_use]
+    pub fn released_vips(&self) -> &[String] {
+        &self.last_sweep.released_vips
+    }
+}
+
+impl crate::virtual_subnet::BootstrapHook for ServerBootstrapHook {
+    fn on_control_datagram(
+        &mut self,
+        src: Option<&str>,
+        payload: &[u8],
+        now: u64,
+    ) -> Option<(String, Vec<u8>)> {
+        // 隧道已剥掉 `nxb:` magic（virtual_subnet.rs 的 strip_prefix），而
+        // handle_datagram 期望带前缀的完整数据报——这里补回去再转调。
+        let src = src?;
+        let mut wire = Vec::with_capacity(NXB_MAGIC.len() + payload.len());
+        wire.extend_from_slice(NXB_MAGIC);
+        wire.extend_from_slice(payload);
+        self.server.handle_datagram(src, &wire, now)
+    }
+
+    fn periodic(&mut self, now: u64) -> crate::virtual_subnet::BootstrapTick {
+        // 服务端自身续期入册（§6.7）+ TTL 清扫（§6.2）。
+        self.server.upsert_self_entry(now);
+        self.last_sweep = self.server.sweep_expired(now);
+        // 服务端是被动应答方：控制帧只在收到请求时回发，tick 不主动发包。
+        crate::virtual_subnet::BootstrapTick::default()
+    }
+
+    fn lease_snapshot(&self, now: u64) -> Option<Vec<(String, String)>> {
+        Some(self.server.leases_snapshot(now))
     }
 }
 

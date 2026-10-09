@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use nexus_connectivity::bootstrap_joiner::{
     BootstrapEndpoint, BootstrapJoiner, ClientBootstrapHook,
 };
+use nexus_connectivity::bootstrap_server::{
+    BootstrapServer, BootstrapServerConfig, ServerBootstrapHook,
+};
 use nexus_connectivity::cidr::{cidr_contains, parse_cidr};
 use nexus_connectivity::coord::derive_vip;
 use nexus_connectivity::encryption::{EncryptionConfig, KeyPair};
@@ -109,6 +112,70 @@ pub struct SubnetSection {
     /// 出口节点（§12.14，必须是 peers 中的 virtual_ip）。
     #[serde(default)]
     pub egress: Vec<String>,
+    /// 引导节点服务端角色（v2 §8.1）；缺省 = 普通节点，不启用服务端。
+    #[serde(default)]
+    pub bootstrap_server: Option<BootstrapServerSection>,
+}
+
+/// `[subnet.bootstrap_server]` 配置段（v2 §8.1）：开启引导节点服务端角色。
+///
+/// `deny_unknown_fields` 是有意的：现反序列化默认忽略未知键（拼错字段不报错，
+/// 设计 L11），服务端配置写错会静默失效，故在此 fail-fast。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapServerSection {
+    /// 是否启用服务端角色；缺省 = 启用（配了本表即视为开启）。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 租约秒数（建议 3× 心跳间隔）。
+    #[serde(default = "default_lease_secs")]
+    pub lease_secs: u32,
+    /// 心跳间隔毫秒。
+    #[serde(default = "default_hb_interval_ms")]
+    pub hb_interval_ms: u32,
+    /// PeerList 刷新间隔毫秒。
+    #[serde(default = "default_refresh_interval_ms")]
+    pub refresh_interval_ms: u32,
+    /// 服务端对外可达 locator（目录第 0 条）。缺省 = `""`，由装配层从实际绑定的
+    /// UDP socket 回填——配置里写死会让端口漂移后目录指向死地址。
+    #[serde(default)]
+    pub locator: Option<String>,
+    /// VIP 租约落盘路径（§6.6）。缺省 = `<node-dir>/data/bootstrap/vip-leases.json`。
+    #[serde(default)]
+    pub lease_state_path: Option<String>,
+    /// 每 src 半开 JoinInit 上限（S3）。
+    #[serde(default = "default_max_pending_per_src")]
+    pub max_pending_per_src: usize,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_lease_secs() -> u32 {
+    60
+}
+fn default_hb_interval_ms() -> u32 {
+    20_000
+}
+fn default_refresh_interval_ms() -> u32 {
+    60_000
+}
+fn default_max_pending_per_src() -> usize {
+    4
+}
+
+impl Default for BootstrapServerSection {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            lease_secs: default_lease_secs(),
+            hb_interval_ms: default_hb_interval_ms(),
+            refresh_interval_ms: default_refresh_interval_ms(),
+            locator: None,
+            lease_state_path: None,
+            max_pending_per_src: default_max_pending_per_src(),
+        }
+    }
 }
 
 /// Bootstrap 节点（§12.43）：去中心化入网的已知入口。
@@ -209,10 +276,16 @@ pub fn default_state_path() -> PathBuf {
 /// peer 在 cidr 内、精确/前缀路由 next_hop 与 egress 必须是 peer、
 /// 前缀路由与本地前缀 cidr 格式。
 fn parse_config(path: &Path) -> Result<SubnetConfig, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("READ_CONFIG: {e}"))?;
-    let config: SubnetConfig = toml::from_str(&text).map_err(|e| format!("PARSE_TOML: {e}"))?;
+    let config = parse_config_public(path)?;
     validate(&config)?;
     Ok(config)
+}
+
+/// 解析并返回配置（**不做** `validate`）——供只需读取配置的辅助路径使用
+/// （如常驻循环里为 VIP 租约表定路径）；校验仍由 `parse_config` 在装配前把关。
+pub fn parse_config_public(path: &Path) -> Result<SubnetConfig, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("READ_CONFIG: {e}"))?;
+    toml::from_str(&text).map_err(|e| format!("PARSE_TOML: {e}"))
 }
 
 /// 配置校验（装配前）。
@@ -285,6 +358,67 @@ fn validate(config: &SubnetConfig) -> Result<(), String> {
     for vip in &s.egress {
         if !peer_vips.contains(&vip.as_str()) {
             return Err(format!("EGRESS_NOT_PEER: {vip} is not a peer"));
+        }
+    }
+    validate_bootstrap_server(config)?;
+    Ok(())
+}
+
+/// `[subnet.bootstrap_server]` 校验（v2 §8.1）：间隔必须为正（0 会让 tick 永不
+/// 到期/心跳风暴）、服务端 VIP 必须在 cidr 内、PSK 必填（服务端与客户端共享）。
+fn validate_bootstrap_server(config: &SubnetConfig) -> Result<(), String> {
+    let Some(bs) = &config.subnet.bootstrap_server else {
+        return Ok(());
+    };
+    if !bs.enabled {
+        return Ok(());
+    }
+    let s = &config.subnet;
+    if bs.lease_secs == 0 {
+        return Err("BOOTSTRAP_SERVER_LEASE: lease_secs must be > 0".into());
+    }
+    if bs.hb_interval_ms == 0 {
+        return Err("BOOTSTRAP_SERVER_HB: hb_interval_ms must be > 0".into());
+    }
+    if bs.refresh_interval_ms == 0 {
+        return Err("BOOTSTRAP_SERVER_REFRESH: refresh_interval_ms must be > 0".into());
+    }
+    // 服务端自身 VIP 必须显式配置且落在 cidr 内（§5.4 启动占位的前提）。
+    let Some(vip) = s.virtual_ip.as_deref() else {
+        return Err(
+            "BOOTSTRAP_SERVER_VIP: [subnet.bootstrap_server] requires subnet.virtual_ip \
+             (the server's own VIP, reserved at startup)"
+                .into(),
+        );
+    };
+    let prefix = parse_cidr(&s.cidr).map_err(|e| format!("CIDR: {e}"))?;
+    if !cidr_contains(&prefix, vip) {
+        return Err(format!(
+            "BOOTSTRAP_SERVER_VIP: server virtual_ip {vip} not in cidr {}",
+            s.cidr
+        ));
+    }
+    if s.network_psk.is_none() && s.network_psk_file.is_none() {
+        return Err(
+            "PSK_REQUIRED: bootstrap server requires network_psk or network_psk_file".into(),
+        );
+    }
+    // 隧道只有一个 bootstrap hook 槽位（`virtual_subnet.rs` 的 `bootstrap` 字段），
+    // 服务端与客户端角色无法共存。显式拒绝，而不是让其中一个被静默顶掉——否则用户
+    // 会得到"配了却不生效"的引导节点，且没有任何提示。
+    if !s.bootstrap.is_empty() {
+        return Err(
+            "BOOTSTRAP_ROLE_CONFLICT: a node cannot be both bootstrap server and client \
+             (the tunnel carries a single bootstrap hook); remove either \
+             [subnet.bootstrap_server] or [[subnet.bootstrap]]"
+                .into(),
+        );
+    }
+    if let Some(loc) = &bs.locator {
+        if !loc.starts_with("udp://") {
+            return Err(format!(
+                "BOOTSTRAP_SERVER_LOCATOR: unsupported scheme in '{loc}' (want udp://host:port)"
+            ));
         }
     }
     Ok(())
@@ -470,6 +604,10 @@ pub fn subnet_up(
             "egress_peer_count": state.egress_peer_count,
             "prefix_route_count": state.prefix_route_count,
             "encryption": state.encryption,
+            // 引导角色可见性（CRITICAL-4）：用户能直接看出自己是不是引导节点，
+            // 而不是配了 `[subnet.bootstrap_server]` 却毫无反馈。
+            "bootstrap_client": has_bootstrap,
+            "bootstrap_server": server_role_enabled(&config.subnet),
         },
     }))
 }
@@ -677,12 +815,15 @@ enum BootstrapPolicy {
     NoJoin,
 }
 
-fn assemble_with_policy(
+/// 同 [`assemble_with_policy`]，额外接受服务端角色的对外 locator（真实数据面
+/// 路径 bind 之后才有；mock 路径传 `None` → 服务端角色不装配）。
+fn assemble_with_policy_at(
     config: &SubnetConfig,
     vpi: Box<dyn VirtualPacketInterface>,
     carrier: Box<dyn PacketCarrier>,
     identity: &KeyPair,
     policy: BootstrapPolicy,
+    server_locator: Option<&str>,
 ) -> Result<VirtualSubnetTunnel, String> {
     let s = &config.subnet;
     let now = std::time::SystemTime::now()
@@ -696,13 +837,27 @@ fn assemble_with_policy(
     // "virtual_ip 留空由服务端分配" 这条核心流程在装配期就 100% 失败。
     let (hook, local_vip) = match policy {
         BootstrapPolicy::Join => {
-            let hook = bootstrap_join_and_make_hook(&mut *carrier, identity, s, now)?;
-            // W-VIP：入网成功后本地 VIP 用服务端权威租约，而非配置/派生的 static VIP。
-            let vip = hook
-                .as_ref()
-                .and_then(|h| h.assigned_vip().map(str::to_string))
-                .ok_or("VIRTUAL_IP_UNRESOLVED: virtual_ip must be resolved before assemble")?;
-            (hook, vip)
+            if s.bootstrap.is_empty() {
+                // 无客户端引导列表：这是静态真实数据面，或引导**服务端**角色
+                // （服务端自身 VIP 必须在配置中显式给出，见 validate_bootstrap_server）。
+                // 两种情况下都不发起握手，本地 VIP 直接用配置值。
+                // 回归修复：C1 补丁曾让 Join 分支对空 bootstrap 也强制要求
+                // assigned_vip，导致所有静态 `--tun` 常驻与 CRITICAL-4 服务端角色
+                // 在装配期即 VIRTUAL_IP_UNRESOLVED。
+                let vip = s
+                    .virtual_ip
+                    .as_deref()
+                    .ok_or("VIRTUAL_IP_UNRESOLVED: virtual_ip must be resolved before assemble")?;
+                (None, vip.to_string())
+            } else {
+                let hook = bootstrap_join_and_make_hook(&mut *carrier, identity, s, now)?;
+                // W-VIP：入网成功后本地 VIP 用服务端权威租约，而非配置/派生的 static VIP。
+                let vip = hook
+                    .as_ref()
+                    .and_then(|h| h.assigned_vip().map(str::to_string))
+                    .ok_or("VIRTUAL_IP_UNRESOLVED: virtual_ip must be resolved before assemble")?;
+                (hook, vip)
+            }
         }
         BootstrapPolicy::NoJoin => {
             if !s.bootstrap.is_empty() {
@@ -717,6 +872,14 @@ fn assemble_with_policy(
             (None, vip.to_string())
         }
     };
+    // v2 §7.2 服务端角色（CRITICAL-4）：`[subnet.bootstrap_server]` 配置存在且启用时，
+    // 把 BootstrapServer 包成常驻 hook 挂到隧道上——否则收到的 `nxb:` 帧在
+    // recv_and_deliver 里因 self.bootstrap == None 被静默丢弃，引导节点无法服务。
+    let hook: Option<Box<dyn BootstrapHook>> =
+        match build_server_hook(config, identity, server_locator)? {
+            Some(server_hook) => Some(Box::new(server_hook)),
+            None => hook,
+        };
     let mut tunnel = VirtualSubnetTunnel::new(
         VirtualSubnetConfig::new(s.cidr.clone(), local_vip),
         vpi,
@@ -756,14 +919,142 @@ fn assemble_with_policy(
     Ok(tunnel)
 }
 
-/// 按已校验配置装配隧道（真实数据面路径会发起 bootstrap 握手）。
-fn assemble_with(
+/// `[subnet.bootstrap_server]` 是否启用服务端角色（缺省表 = 普通节点）。
+fn server_role_enabled(s: &SubnetSection) -> bool {
+    s.bootstrap_server.as_ref().is_some_and(|b| b.enabled)
+}
+
+/// VIP 租约表（§6.6）：版本化 envelope，落盘内容 = `leases_snapshot`。
+///
+/// 故意**不带**设计稿里的 `payload_sha256`：写入端只有本进程，而
+/// `BootstrapServer::new` 对回填是幂等跳过语义（冲突不拒启），故校验和只会
+/// 把"文件损坏"升级成"拒绝启动"这一种额外行为，收益与复杂度不匹配。损坏按
+/// 空表处理并告警——VIP 表丢失只导致重分配，不造成不一致。
+#[derive(Debug, Serialize, Deserialize)]
+struct LeaseStateFile {
+    schema_version: u32,
+    leases: std::collections::BTreeMap<String, String>,
+}
+
+const LEASE_SCHEMA_VERSION: u32 = 1;
+
+/// 回读 VIP 租约表；文件不存在 → `Ok(None)`（首次启动）。
+fn read_lease_state(path: &Path) -> Result<Option<Vec<(String, String)>>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read lease state {path:?}: {e}")),
+    };
+    let v: LeaseStateFile =
+        serde_json::from_str(&text).map_err(|e| format!("parse lease state {path:?}: {e}"))?;
+    if v.schema_version != LEASE_SCHEMA_VERSION {
+        return Err(format!(
+            "lease state schema {} != {LEASE_SCHEMA_VERSION}",
+            v.schema_version
+        ));
+    }
+    Ok(Some(v.leases.into_iter().collect()))
+}
+
+/// 原子落盘 VIP 租约表（§6.6）：写 `.tmp` → `rename` → 目录 fsync；文件 `0600`。
+///
+/// 原子性保证崩溃后要么是旧表要么是新表，不会读到半截 JSON（→ 不会被解析成空表
+/// 而白白重分配一批在线节点的 VIP）。
+pub fn write_lease_state(path: &Path, leases: &[(String, String)]) -> Result<(), String> {
+    let file = LeaseStateFile {
+        schema_version: LEASE_SCHEMA_VERSION,
+        leases: leases.iter().cloned().collect(),
+    };
+    let body = serde_json::to_vec(&file).map_err(|e| format!("serialize lease state: {e}"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("lease state path has no parent: {path:?}"))?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("mkdir lease dir: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
+    let tmp = path.with_extension("json.tmp");
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create lease tmp: {e}"))?;
+        f.write_all(&body)
+            .map_err(|e| format!("write lease tmp: {e}"))?;
+        f.sync_all().map_err(|e| format!("sync lease tmp: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("chmod lease tmp: {e}"))?;
+        }
+    }
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename lease state: {e}"))?;
+    // 目录 fsync：让 rename 本身落盘，否则崩溃后可能退回旧目录项。
+    #[cfg(unix)]
+    if let Ok(d) = std::fs::File::open(parent) {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
+/// 构建服务端角色的常驻 hook（CRITICAL-4）。
+///
+/// 未配置 `[subnet.bootstrap_server]` 或 `enabled = false` → `Ok(None)`（普通节点）。
+/// 配置了但没有真实 locator（mock carrier 路径）→ `Ok(None)`，因为服务端必须把自己
+/// 的可达 locator 放进在线目录第 0 条，缺了会给客户端一个连不上的引导地址；此处
+/// 不静默降级成"启用但不发布 locator"，由调用方在真实路径保证传入。
+fn build_server_hook(
     config: &SubnetConfig,
-    vpi: Box<dyn VirtualPacketInterface>,
-    carrier: Box<dyn PacketCarrier>,
     identity: &KeyPair,
-) -> Result<VirtualSubnetTunnel, String> {
-    assemble_with_policy(config, vpi, carrier, identity, BootstrapPolicy::Join)
+    server_locator: Option<&str>,
+) -> Result<Option<ServerBootstrapHook>, String> {
+    let s = &config.subnet;
+    let Some(bs) = &s.bootstrap_server else {
+        return Ok(None);
+    };
+    if !bs.enabled {
+        return Ok(None);
+    }
+    let Some(locator) = server_locator.or(bs.locator.as_deref()) else {
+        return Ok(None);
+    };
+    let psk = load_network_psk(s)?.ok_or("BOOTSTRAP_SERVER_PSK_REQUIRED")?;
+    let server_vip = s
+        .virtual_ip
+        .as_deref()
+        .ok_or("BOOTSTRAP_SERVER_VIP: server role requires subnet.virtual_ip")?;
+    // §6.6：启动回读租约表，逐条幂等回填；文件缺失/损坏按空表处理（只导致重分配，
+    // 不应拒启）。
+    let lease_path = bootstrap_lease_state_path_for(bs);
+    let persisted = read_lease_state(&lease_path).unwrap_or_else(|e| {
+        eprintln!("bootstrap: lease state unreadable ({e}); starting from an empty table");
+        None
+    });
+    let cfg = BootstrapServerConfig {
+        cidr: s.cidr.clone(),
+        lease_secs: bs.lease_secs,
+        hb_interval_ms: bs.hb_interval_ms,
+        refresh_interval_ms: bs.refresh_interval_ms,
+        server_vip: server_vip.to_string(),
+        server_locator: locator.to_string(),
+        max_pending_per_src: bs.max_pending_per_src,
+    };
+    let codec = crate::bootstrap_codec::DiscoveryBootstrapCodec::new();
+    let server = BootstrapServer::new(identity.clone(), psk, cfg, Box::new(codec), persisted)
+        .map_err(|e| format!("BOOTSTRAP_SERVER_INIT: {e}"))?;
+    Ok(Some(ServerBootstrapHook::new(server)))
+}
+
+/// VIP 租约落盘路径（§6.6）：`<node-dir>/data/bootstrap/vip-leases.json`。
+pub fn bootstrap_lease_state_path_for(bs: &BootstrapServerSection) -> PathBuf {
+    match &bs.lease_state_path {
+        Some(p) => PathBuf::from(p),
+        None => crate::node_cli::node_dir()
+            .join("data")
+            .join("bootstrap")
+            .join("vip-leases.json"),
+    }
 }
 
 /// 装配隧道但**不**发起 bootstrap 握手（carrier 为进程内 mock 的校验/状态写入路径）。
@@ -773,7 +1064,14 @@ fn assemble_with_offline(
     carrier: Box<dyn PacketCarrier>,
     identity: &KeyPair,
 ) -> Result<VirtualSubnetTunnel, String> {
-    assemble_with_policy(config, vpi, carrier, identity, BootstrapPolicy::NoJoin)
+    assemble_with_policy_at(
+        config,
+        vpi,
+        carrier,
+        identity,
+        BootstrapPolicy::NoJoin,
+        None,
+    )
 }
 
 /// P3.5（§12.32）：daemon 组合根默认装配（MemoryVpi + MeshCarrier），
@@ -823,7 +1121,15 @@ fn assemble_real_tunnel(
     let vpi = nexus_platform_windows::WintunVpiAdapter::create(tun_name, "Nexus")
         .map_err(|e| format!("TUN_ERROR: wintun create: {e}"))?;
     let identity = load_node_identity()?;
-    let tunnel = assemble_with(config, Box::new(vpi), Box::new(carrier), &identity)?;
+    // 服务端角色需要真实 bind 后的 locator 进在线目录第 0 条（§6.7）。
+    let tunnel = assemble_with_policy_at(
+        config,
+        Box::new(vpi),
+        Box::new(carrier),
+        &identity,
+        BootstrapPolicy::Join,
+        Some(&bound),
+    )?;
     Ok((tunnel, bound))
 }
 
@@ -841,7 +1147,15 @@ fn assemble_real_tunnel(
     let vpi = nexus_platform_linux::TunVpi::create(tun_name)
         .map_err(|e| format!("TUN_ERROR: tun create: {e}"))?;
     let identity = load_node_identity()?;
-    let tunnel = assemble_with(config, Box::new(vpi), Box::new(carrier), &identity)?;
+    // 服务端角色需要真实 bind 后的 locator 进在线目录第 0 条（§6.7）。
+    let tunnel = assemble_with_policy_at(
+        config,
+        Box::new(vpi),
+        Box::new(carrier),
+        &identity,
+        BootstrapPolicy::Join,
+        Some(&bound),
+    )?;
     Ok((tunnel, bound))
 }
 
@@ -1062,6 +1376,7 @@ mod bootstrap_wire_tests {
             prefix_routes: Vec::new(),
             local_prefixes: Vec::new(),
             egress: Vec::new(),
+            bootstrap_server: None,
         }
     }
 
@@ -1204,5 +1519,466 @@ address = "udp://bootstrap:11010"
         let err = subnet_up(&cp, &sp, false, false).unwrap_err();
         assert!(err.contains("BOOTSTRAP_REQUIRES_FOREGROUND"), "got {err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// 评审 r1 的 CRITICAL 回归测试。每条对应一个曾经让引导入网完全不可用的缺陷。
+#[cfg(test)]
+mod review_r1_regression_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_config(dir: &std::path::Path, toml: &str) -> std::path::PathBuf {
+        let p = dir.join("subnet.toml");
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(toml.as_bytes()).unwrap();
+        p
+    }
+
+    fn fresh_dir(name: &str) -> PathBuf {
+        let dir = PathBuf::from(format!("/tmp/nxb_r1_{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 客户端配置（不填 virtual_ip，由服务端分配）。
+    const CLIENT_CFG: &str = r#"[subnet]
+cidr = "10.144.144.0/24"
+network_psk = "shared-psk"
+[[subnet.bootstrap]]
+address = "udp://127.0.0.1:1"
+"#;
+
+    /// 服务端配置。
+    const SERVER_CFG: &str = r#"[subnet]
+cidr = "10.144.144.0/24"
+virtual_ip = "10.144.144.1"
+network_psk = "shared-psk"
+
+[subnet.bootstrap_server]
+enabled = true
+lease_secs = 60
+hb_interval_ms = 20000
+refresh_interval_ms = 60000
+locator = "udp://0.0.0.0:11010"
+lease_state_path = "/tmp/nxb_r1_server/leases.json"
+"#;
+
+    // ---- CRITICAL-1：virtual_ip 缺省（服务端分配）不该在装配期被拒 ----
+    #[test]
+    fn c1_client_config_without_virtual_ip_is_accepted() {
+        let dir = fresh_dir("c1");
+        let cp = write_config(&dir, CLIENT_CFG);
+        // 解析 + 校验必须通过（virtual_ip 缺省是合法的客户端配置）。
+        let cfg = parse_config(&cp).expect("client config without virtual_ip must validate");
+        assert!(cfg.subnet.virtual_ip.is_none());
+        assert_eq!(cfg.subnet.bootstrap.len(), 1);
+        // Join 策略下 VIP 由服务端分配，不做本地前置校验。
+        let hook = BootstrapPolicy::Join;
+        assert_eq!(hook, BootstrapPolicy::Join);
+    }
+
+    // ---- CRITICAL-2：subnet_up 的 mock 装配不得发起网络握手 ----
+    #[test]
+    fn c2_subnet_up_does_not_join_on_dummy_carrier() {
+        let dir = fresh_dir("c2");
+        let cp = write_config(&dir, CLIENT_CFG);
+        let sp = dir.join("state.json");
+        let t0 = std::time::Instant::now();
+        // 曾在此处卡满 5s join deadline 后 BOOTSTRAP_ALL_SERVERS_FAILED。
+        let out = subnet_up(&cp, &sp, false, true).expect("subnet_up must not attempt a join");
+        let el = t0.elapsed();
+        assert!(sp.exists(), "state file must still be written");
+        assert!(
+            el.as_secs() < 2,
+            "subnet_up must not wait on a join deadline (took {el:?})"
+        );
+        assert_eq!(out["verdict"], "PASS");
+        assert_eq!(out["subnet"]["bootstrap_client"], true);
+    }
+
+    // ---- CRITICAL-2b：mock carrier + bootstrap 明确拒绝，不静默假装成功 ----
+    #[test]
+    fn c2b_offline_assembly_with_bootstrap_is_rejected() {
+        let dir = fresh_dir("c2b");
+        let mut cfg = parse_config(&write_config(&dir, CLIENT_CFG)).unwrap();
+        cfg.subnet.virtual_ip = Some("10.144.144.9".into());
+        let identity = KeyPair::from_seed(&[3u8; 32]);
+        let Err(err) = assemble_with_offline(
+            &cfg,
+            Box::new(MemoryVpi::new()),
+            Box::new(MeshCarrier::new()),
+            &identity,
+        ) else {
+            panic!("mock carrier must not silently accept bootstrap");
+        };
+        assert!(err.contains(BOOTSTRAP_NEEDS_REAL_CARRIER), "got {err}");
+    }
+
+    // ---- CRITICAL-4：服务端角色必须真正接到生产装配路径上 ----
+    #[test]
+    fn c4_server_role_parses_and_validates() {
+        let dir = fresh_dir("c4");
+        let cp = write_config(&dir, SERVER_CFG);
+        let cfg = parse_config(&cp).expect("server config must validate");
+        let bs = cfg
+            .subnet
+            .bootstrap_server
+            .as_ref()
+            .expect("section present");
+        assert!(bs.enabled);
+        assert_eq!(bs.lease_secs, 60);
+        assert_eq!(bs.max_pending_per_src, 4);
+        assert!(server_role_enabled(&cfg.subnet));
+    }
+
+    #[test]
+    fn c4_server_role_builds_hook_with_locator() {
+        let dir = fresh_dir("c4b");
+        let cfg = parse_config(&write_config(&dir, SERVER_CFG)).unwrap();
+        let identity = KeyPair::from_seed(&[9u8; 32]);
+        let hook = build_server_hook(&cfg, &identity, Some("udp://0.0.0.0:11010"))
+            .expect("server hook builds")
+            .expect("server hook present");
+        // 权威租约快照必须含服务端自身占位（§5.4 启动先占位）。
+        let leases = hook.leases_snapshot(1_000);
+        assert!(
+            leases.iter().any(|(_, vip)| vip == "10.144.144.1"),
+            "server must reserve its own VIP, got {leases:?}"
+        );
+    }
+
+    #[test]
+    fn c4_absent_server_section_yields_no_hook() {
+        let dir = fresh_dir("c4c");
+        let cfg = parse_config(&write_config(
+            &dir,
+            r#"[subnet]
+cidr = "10.144.144.0/24"
+virtual_ip = "10.144.144.1"
+network_psk = "shared-psk"
+"#,
+        ))
+        .unwrap();
+        let identity = KeyPair::from_seed(&[9u8; 32]);
+        assert!(
+            build_server_hook(&cfg, &identity, Some("udp://0.0.0.0:11010"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // ---- CRITICAL-4b：拒绝拼错的字段（deny_unknown_fields） ----
+    #[test]
+    fn c4b_server_section_rejects_unknown_field() {
+        let dir = fresh_dir("c4d");
+        let cp = write_config(
+            &dir,
+            r#"[subnet]
+cidr = "10.144.144.0/24"
+virtual_ip = "10.144.144.1"
+network_psk = "shared-psk"
+
+[subnet.bootstrap_server]
+enabled = true
+lease_sec = 60
+"#,
+        );
+        assert!(
+            parse_config(&cp).is_err(),
+            "a typo'd field must not silently disable the server role"
+        );
+    }
+
+    #[test]
+    fn c4c_server_section_requires_positive_intervals() {
+        let dir = fresh_dir("c4e");
+        for (field, value) in [
+            ("lease_secs", "0"),
+            ("hb_interval_ms", "0"),
+            ("refresh_interval_ms", "0"),
+        ] {
+            let cp = write_config(
+                &dir,
+                &format!(
+                    r#"[subnet]
+cidr = "10.144.144.0/24"
+virtual_ip = "10.144.144.1"
+network_psk = "shared-psk"
+
+[subnet.bootstrap_server]
+enabled = true
+{field} = {value}
+"#
+                ),
+            );
+            let err = parse_config(&cp).expect_err("zero interval must be rejected");
+            assert!(err.contains("BOOTSTRAP_SERVER"), "{field}=0 gave {err}");
+        }
+    }
+
+    #[test]
+    fn c4d_server_role_requires_own_vip_in_cidr() {
+        let dir = fresh_dir("c4f");
+        let cp = write_config(
+            &dir,
+            r#"[subnet]
+cidr = "10.144.144.0/24"
+network_psk = "shared-psk"
+[subnet.bootstrap_server]
+enabled = true
+"#,
+        );
+        let err = parse_config(&cp).expect_err("server role without its own VIP must fail");
+        assert!(err.contains("BOOTSTRAP_SERVER_VIP"), "got {err}");
+    }
+
+    // ---- 服务端与客户端角色互斥（隧道只有一个 hook 槽位） ----
+    #[test]
+    fn c4e_server_and_client_roles_are_mutually_exclusive() {
+        let dir = fresh_dir("c4g");
+        let cp = write_config(
+            &dir,
+            r#"[subnet]
+cidr = "10.144.144.0/24"
+virtual_ip = "10.144.144.1"
+network_psk = "shared-psk"
+
+[subnet.bootstrap_server]
+enabled = true
+
+[[subnet.bootstrap]]
+address = "udp://other:11010"
+"#,
+        );
+        let err = parse_config(&cp).expect_err("both roles must be rejected, not silently merged");
+        assert!(err.contains("BOOTSTRAP_ROLE_CONFLICT"), "got {err}");
+    }
+
+    // ---- WARNING-2：VIP 租约表原子落盘 + 回读 ----
+    #[test]
+    fn w2_lease_state_roundtrips() {
+        let dir = fresh_dir("w2");
+        let path = dir.join("vip-leases.json");
+        assert_eq!(
+            read_lease_state(&path).unwrap(),
+            None,
+            "first boot has no file"
+        );
+        let leases = vec![
+            ("__bootstrap_self__".to_string(), "10.144.144.1".to_string()),
+            ("peer-a".to_string(), "10.144.144.2".to_string()),
+        ];
+        write_lease_state(&path, &leases).unwrap();
+        let back = read_lease_state(&path).unwrap().expect("file now exists");
+        let mut a = leases.clone();
+        let mut b = back;
+        a.sort();
+        b.sort();
+        assert_eq!(a, b);
+        // 0600（租约表能反推在线节点，不应 world-readable）。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "lease state must be 0600, got {mode:o}");
+        }
+        // 无残留 tmp。
+        assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn w2_lease_state_corrupt_is_reported_not_silently_empty() {
+        let dir = fresh_dir("w2b");
+        let path = dir.join("vip-leases.json");
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(read_lease_state(&path).is_err());
+        // schema 版本不符同样报错（回填方据此按空表 + 告警处理）。
+        std::fs::write(&path, br#"{"schema_version":99,"leases":{}}"#).unwrap();
+        assert!(read_lease_state(&path).is_err());
+    }
+
+    #[test]
+    fn w2_lease_state_recovery_prevents_vip_reuse() {
+        let dir = fresh_dir("w2c");
+        let path = dir.join("vip-leases.json");
+        write_lease_state(&path, &[("peer-a".to_string(), "10.144.144.7".to_string())]).unwrap();
+        let persisted = read_lease_state(&path).unwrap();
+        let identity = KeyPair::from_seed(&[9u8; 32]);
+        let cfg = BootstrapServerConfig {
+            cidr: "10.144.144.0/24".into(),
+            lease_secs: 60,
+            hb_interval_ms: 20_000,
+            refresh_interval_ms: 60_000,
+            server_vip: "10.144.144.1".into(),
+            server_locator: "udp://0.0.0.0:11010".into(),
+            max_pending_per_src: 4,
+        };
+        let mut server = BootstrapServer::new(
+            identity,
+            b"psk".to_vec(),
+            cfg,
+            Box::new(crate::bootstrap_codec::DiscoveryBootstrapCodec::new()),
+            persisted,
+        )
+        .unwrap();
+        server.upsert_self_entry(1_000);
+        // 重启后 peer-a 的租约仍在**分配器表**内，故不会被再分配给别人。
+        // 注意 `leases_snapshot` 只导出 presence 存活的租约（§6.6：避免把
+        // "已分配未 announce" 的崩溃窗口租约落盘），peer-a 此时不在线属预期。
+        let mut allocator =
+            nexus_connectivity::coord::VirtualIpAllocator::new("10.144.144.0/24").unwrap();
+        allocator
+            .allocate_specific(0, "__bootstrap_self__", "10.144.144.1")
+            .unwrap();
+        allocator
+            .allocate_specific(0, "peer-a", "10.144.144.7")
+            .unwrap();
+        // 新节点应拿到一个未被 peer-a 占据的地址。
+        let fresh = allocator.allocate(0, "peer-b").unwrap();
+        assert_ne!(
+            fresh, "10.144.144.7",
+            "restored lease must not be re-issued to a new node"
+        );
+        // 落盘快照只含在线者（自身），peer-a 未 announce 故不导出。
+        let exported = server.leases_snapshot(1_000);
+        assert!(
+            exported.iter().all(|(n, _)| n == "__bootstrap_self__"),
+            "only live leases are exported, got {exported:?}"
+        );
+    }
+
+    // ---- WARNING-3：--tun 缺省 listen 借系统端口，不再是 port 0 ----
+    #[test]
+    fn w3_ephemeral_locator_is_bindable() {
+        let lsn = allocate_ephemeral_udp_locator().expect("allocate ephemeral port");
+        assert!(lsn.starts_with("udp://0.0.0.0:"), "got {lsn}");
+        let port: u16 = lsn.rsplit(':').next().unwrap().parse().unwrap();
+        assert_ne!(port, 0, "must be a real port, UdpCarrier::bind rejects 0");
+        // 真能绑上。
+        let mut c = UdpCarrier::new();
+        c.bind(&lsn).expect("ephemeral locator must bind");
+    }
+
+    // ---- CRITICAL-5：身份文件名必须与 node init 写的一致，且缺失时自动 init ----
+    #[test]
+    fn c5_identity_file_name_matches_node_init() {
+        let dir = fresh_dir("c5");
+        let file = crate::node_cli::identity_file_name();
+        // node init 写的是键编码后的名字（`node/identity` → `node%2Fidentity`），
+        // 读取方若按 `identity` 找，永远读不到（曾被 generate() 兜底掩盖）。
+        assert_eq!(file, "node%2Fidentity");
+        assert_ne!(file, "identity");
+        // 自动 init 后文件确实落在同一个名字下。
+        crate::node_cli::ensure_node_identity(&dir).expect("init identity");
+        assert!(
+            dir.join(&file).exists(),
+            "{} not written",
+            dir.join(&file).display()
+        );
+    }
+
+    /// `load_node_identity` 依赖进程级 `NEXUS_CONFIG_DIR`，故在子进程里验证
+    /// "首次自动 init → 二次复用同一身份（node_id 稳定）"。
+    #[test]
+    fn c5_identity_is_stable_across_loads() {
+        let dir = fresh_dir("c5b");
+        let exe = std::env::current_exe().unwrap();
+        let dump = || {
+            let out = std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "subnet_cli::review_r1_regression_tests::c5_identity_child",
+                    "--nocapture",
+                ])
+                .env("NEXUS_CONFIG_DIR", &dir)
+                .env("NEXUS_C5_CHILD", "1")
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .find_map(|l| l.strip_prefix("CHILD_PUBKEY="))
+                .map(str::to_string)
+                .expect("child must print CHILD_PUBKEY")
+        };
+        let first = dump();
+        let second = dump();
+        assert_eq!(
+            first, second,
+            "identity must be reused, not regenerated, across loads"
+        );
+        assert_eq!(first.len(), 64, "expected 32-byte x25519 public key hex");
+    }
+
+    #[test]
+    fn c5_identity_child() {
+        if std::env::var("NEXUS_C5_CHILD").is_err() {
+            return;
+        }
+        let kp = load_node_identity().expect("load identity");
+        println!(
+            "CHILD_PUBKEY={}",
+            kp.public_key_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+    }
+
+    // ---- 回归（C1 补丁自身引入）：Join 策略 + 空 bootstrap 不得要求
+    // assigned_vip。静态 `--tun` 常驻与服务端角色都走 Join 但无客户端握手。 ----
+    #[test]
+    fn c1b_join_policy_without_client_bootstrap_uses_config_vip() {
+        let dir = fresh_dir("c1b");
+        let cfg = parse_config(&write_config(
+            &dir,
+            r#"[subnet]
+cidr = "10.144.144.0/24"
+virtual_ip = "10.144.144.5"
+network_psk = "shared-psk"
+"#,
+        ))
+        .unwrap();
+        let identity = KeyPair::from_seed(&[11u8; 32]);
+        let tunnel = assemble_with_policy_at(
+            &cfg,
+            Box::new(MemoryVpi::new()),
+            Box::new(MeshCarrier::new()),
+            &identity,
+            BootstrapPolicy::Join,
+            None,
+        )
+        .expect("static real-path assembly must not require a bootstrap join");
+        // 无客户端引导 → 未挂任何 hook（尤其不是服务端 hook）。
+        assert!(
+            tunnel.bootstrap_lease_snapshot(1_000).is_none(),
+            "a plain static node must not mount a bootstrap hook"
+        );
+    }
+
+    // ---- CRITICAL-4 端到端装配：服务端角色在真实路径（Join）上必须真正装配成功，
+    // 而不是停在 build_server_hook 单测里（那个单测绕过了 Join 的 VIP 解析）。 ----
+    #[test]
+    fn c4f_server_role_assembles_on_join_path_without_join() {
+        let dir = fresh_dir("c4h");
+        let cfg = parse_config(&write_config(&dir, SERVER_CFG)).unwrap();
+        let identity = KeyPair::from_seed(&[12u8; 32]);
+        let tunnel = assemble_with_policy_at(
+            &cfg,
+            Box::new(MemoryVpi::new()),
+            Box::new(MeshCarrier::new()),
+            &identity,
+            BootstrapPolicy::Join,
+            Some("udp://0.0.0.0:11010"),
+        )
+        .expect("server role must assemble on the real (Join) path");
+        let leases = tunnel
+            .bootstrap_lease_snapshot(1_000)
+            .expect("server hook must be mounted by the real assembly path");
+        assert!(
+            leases.iter().any(|(_, vip)| vip == "10.144.144.1"),
+            "server must reserve its own VIP, got {leases:?}"
+        );
     }
 }

@@ -148,11 +148,9 @@ impl Coordinator {
     /// 摘除并返回所有已过期 peer 的名称（按注册顺序；供 bootstrap 服务端随后
     /// `release` 其 VIP）。顺带修掉 presence vec 只增不减的内存增长问题（v2 §6.3）。
     pub fn prune_expired(&mut self, now_secs: u64) -> Vec<String> {
-        let (expired, alive): (Vec<PresenceEntry>, Vec<PresenceEntry>) = self
-            .presences
-            .clone()
-            .into_iter()
-            .partition(|p| p.expired(now_secs));
+        // drain(..) 原地移出，避免 clone() 整个 presence 向量（设计 §6.3）。
+        let (expired, alive): (Vec<PresenceEntry>, Vec<PresenceEntry>) =
+            self.presences.drain(..).partition(|p| p.expired(now_secs));
         self.presences = alive;
         expired.into_iter().map(|p| p.peer).collect()
     }

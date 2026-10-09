@@ -481,6 +481,13 @@ pub trait BootstrapHook {
     fn assigned_vip(&self) -> Option<&str> {
         None
     }
+
+    /// 服务端角色的权威 VIP 租约快照（§6.6 落盘内容）；客户端角色为 `None`。
+    ///
+    /// crate 层零 I/O，故只吐快照，由组合根（`apps/nexus`）决定何时落盘。
+    fn lease_snapshot(&self, _now: u64) -> Option<Vec<(String, String)>> {
+        None
+    }
 }
 
 /// 一次 tick 产出的 bootstrap 出站数据报与 peer 增删（v2 §6.4）。
@@ -597,6 +604,13 @@ impl VirtualSubnetTunnel {
     /// 挂载/卸载 Bootstrap 钩子（v2 §6.4，S5）。
     pub fn set_bootstrap_hook(&mut self, hook: Option<Box<dyn BootstrapHook>>) {
         self.bootstrap = hook;
+    }
+
+    /// 服务端角色的 VIP 租约快照（§6.6）；客户端角色或未挂载 hook → `None`。
+    ///
+    /// crate 层零 I/O：只吐快照，落盘由组合根（`apps/nexus`）在常驻 tick 里做。
+    pub fn bootstrap_lease_snapshot(&self, now: u64) -> Option<Vec<(String, String)>> {
+        self.bootstrap.as_ref().and_then(|h| h.lease_snapshot(now))
     }
 
     /// Bootstrap 内部发出口（v2 §6.4）：薄封装 carrier.send_to，供常驻 tick 发心跳/刷新/sweep 回执。

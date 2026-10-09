@@ -130,6 +130,10 @@ pub struct AutoMeshController {
     lan_discovery: Option<LanDiscovery>,
     /// WAN Bootstrap 客户端（可选，None = 不走 bootstrap）。
     bootstrap: Option<BootstrapClient>,
+    /// 引导服务端角色的 VIP 租约落盘路径（§6.6）；None = 不落盘。
+    lease_state_path: Option<std::path::PathBuf>,
+    /// 上次落盘的租约快照（只在**变化**时写盘，避免每 tick 刷盘）。
+    last_persisted_leases: Vec<(String, String)>,
     /// 是否已停止。
     stopped: bool,
     /// 已消费事件游标（增量消费）。
@@ -195,9 +199,19 @@ impl AutoMeshController {
             tick_interval: Duration::from_millis(tick_interval_ms),
             lan_discovery,
             bootstrap,
+            lease_state_path: None,
+            last_persisted_leases: Vec::new(),
             stopped: false,
             last_event_index: 0,
         }
+    }
+
+    /// 启用引导服务端角色的 VIP 租约落盘（§6.6）。
+    ///
+    /// 崩溃后重启若不回读租约表，分配池会退回初始状态并把已在线节点的 VIP 再发给
+    /// 新节点，造成 IP 冲突。客户端角色调用本方法无副作用（快照恒为 `None`）。
+    pub fn set_lease_state_path(&mut self, path: std::path::PathBuf) {
+        self.lease_state_path = Some(path);
     }
 
     /// 主运行循环。
@@ -269,6 +283,19 @@ impl AutoMeshController {
             }
             for ev in bt.events {
                 eprintln!("bootstrap: {ev}");
+            }
+
+            // 2d. 服务端角色 VIP 租约落盘（§6.6）：只在租约表变化时写，避免每 tick 刷盘。
+            if let Some(path) = self.lease_state_path.clone() {
+                if let Some(leases) = self.tunnel.bootstrap_lease_snapshot(now_secs) {
+                    if leases != self.last_persisted_leases {
+                        if let Err(e) = crate::subnet_cli::write_lease_state(&path, &leases) {
+                            eprintln!("bootstrap: persist lease state failed: {e}");
+                        } else {
+                            self.last_persisted_leases = leases;
+                        }
+                    }
+                }
             }
 
             // 3. 检查所有 peer，自动打洞

@@ -9514,7 +9514,11 @@ network_psk = "test-psk-001"
 address = "udp://203.0.113.10:11010"
 "#,
     )?;
-    subnet_up(&cfg_psk, &state, false, false).map_err(|e| NexusError::Internal {
+    // 走 foreground=true：S6（设计 §7.3）规定一次性 `subnet up` 配了 bootstrap
+    // 必须报 BOOTSTRAP_REQUIRES_FOREGROUND，故"bootstrap + PSK 可被接受"这一条
+    // 只能在常驻前台语义下成立。PSK 校验本身在 parse_config 内、先于 S6 门禁，
+    // 上一步（无 PSK -> PSK_REQUIRED）因此不受影响。
+    subnet_up(&cfg_psk, &state, false, true).map_err(|e| NexusError::Internal {
         message: format!("decentralized join: bootstrap+psk rejected: {e}"),
     })?;
     events.push("bootstrap_psk_ok");
