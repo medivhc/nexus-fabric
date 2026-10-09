@@ -512,3 +512,102 @@ The still-needed high-value inventories are:
 - Harness verifier/gate behavior and protected-path enforcement;
 - exact real-vs-loopback-vs-simulation status for outbound/proxy/NAT scenarios;
 - platform scenario PASS/SKIP conditions, especially host-dependent Linux/Windows checks.
+
+
+## 32. nexusd composition-root drift and runtime authority
+
+A deeper audit of `apps/nexusd` shows that its own `MODULE.md` is historically layered and cannot be read top-to-bottom as one internally consistent snapshot.
+
+Two concrete examples:
+
+1. the module still contains an “N3 装配契约增补（待实现）” section, while `apps/nexusd/src` now contains a large N3 implementation surface: acceptance store, runtime journal, requester store/outbox, snapshots, artifacts/catalog/download, capacity/recovery, executor/docker/log/result/recovery, task HTTP/service/provider/session and tests;
+2. an earlier TCP-termination section labels Proxy transport wiring as `GAP-1`, while a later P1–P5 section specifies real ProxyEngine TCP/UDP forwarding. The later contract may supersede the earlier statement, but current-state truth must come from executable source + scenario evidence, not section order alone.
+
+Therefore this baseline treats nexusd MODULE text as contract history unless corroborated by current source.
+
+The current `src/` inventory itself is useful evidence of composition ownership. It includes `assembly`, `config`, `dataplane`, `nat_switch`, `proxy_fwd`, `recovery`, `snapshot_store`, `sync_transport`, `workspace` and a dedicated family of N3 task modules. This is materially beyond a thin CLI wrapper.
+
+## 33. N3 provider persistence: executable facts
+
+### 33.1 Acceptance authority
+
+On Linux, `FileTaskAcceptanceStore` is a durable provider-side acceptance authority. It uses a private real directory, rejects symlink/permission violations, serializes access through a stable lock inode, persists a canonical acceptance image and initialization receipt, and synchronizes directories around publication boundaries.
+
+A critical recovery rule is encoded directly in source: an existing directory with signs of prior N3 authority is not silently treated as a new provider if authority files disappear. Missing/corrupt initialized state becomes `StateCorrupt`/`PersistenceFailed`, preventing “recover by resetting history” behavior.
+
+Non-Linux `open` returns `UnsupportedCapability` for durable N3 provider acceptance. This is a concrete platform limitation, not merely a future design note.
+
+### 33.2 Runtime journal
+
+`task_runtime_store.rs` persists `task-runtime-v1.json` plus an initialization receipt. The image contains versioned `RuntimeJournal` entries. Validation enforces:
+
+- supported schema version;
+- unique TaskId journals;
+- every runtime journal must correspond to an accepted task;
+- replay must succeed;
+- execution handles cannot be reused across tasks.
+
+The persisted envelope contains a SHA-256 digest of the canonical runtime payload. Load validates checksum, acceptance linkage and artifact runtime consistency before exposing state.
+
+Acceptance and runtime journal operations deliberately share the acceptance lock. The source comments explicitly state that an invalid runtime authority blocks new work and GC. This is stronger than “write a JSON file”: runtime history is part of the provider authority boundary.
+
+### 33.3 Requester mirror/outbox is separate authority
+
+`FileTaskRequesterStore` is a distinct Linux requester-side cache/outbox. It is explicitly independent of provider acceptance authority. It has its own private root, stable lock, initialization receipt and durable image.
+
+This separation matters semantically: requester state tracks intent/mirror/outbox and must not manufacture provider-authoritative terminal outcomes. Provider acceptance/runtime and requester delivery state are different consistency domains.
+
+### 33.4 N3 persistence conclusion
+
+The previous baseline wording “N3 persistence still needs implementation” is no longer accurate as a blanket statement. There is substantial executable durable-state machinery in nexusd. The remaining question is end-to-end production closure: exact LocalAPI/transport wiring, executor/capacity support, recovery ordering and current scenario evidence must be traced independently.
+
+## 34. Harness implementation, not just methodology
+
+`engineering/nexus-harness` is an executable verifier with no Nexus product-crate dependency. It invokes git/cargo/rustc and reads machine policies; it is forbidden from modifying business code, scenarios, policies, git index or HEAD, and is forbidden from network operations.
+
+Machine JSON has a stable core: `schema_version`, `command`, `verdict`, `message`. Verdict vocabulary includes PASS, FAIL, STALE, UNKNOWN and BLOCKED. An unavailable or unimplemented check is required to surface UNKNOWN rather than silently becoming PASS.
+
+### 34.1 Evidence binding
+
+Current `evidence.rs` binds verification to:
+
+- source revision;
+- working-tree digest;
+- dirty state;
+- configuration digest;
+- feature set;
+- target triple;
+- toolchain version;
+- harness schema version;
+- platform capability digest;
+- contract hash.
+
+A verify id hashes revision + configuration + contract and uses the first 12 hash characters. If `NEXUS_AGENT` is valid, evidence is namespaced per agent so one agent's verification does not stale another agent's evidence.
+
+Each verify writes `summary.json`, `gates.json` and `metadata.json`, then updates `.evidence/latest.json`. Prior evidence in the same agent namespace whose bindings differ is rewritten to verdict STALE. This makes freshness an executable state transition rather than a prose convention.
+
+Single-scenario evidence has a separate `scenario-...` namespace and additionally incorporates the scenario id into its identity seed.
+
+### 34.2 Gate behavior
+
+The harness does not trust arbitrary binaries from PATH for product scenario execution. Its gate code asks Cargo to build current workspace `nexus` and `nexusd` binaries, reads executable paths from Cargo artifact JSON, verifies those paths exist, then injects them into child tests via `NEXUS_N3_TEST_CLI_BIN` and `NEXUS_N3_TEST_DAEMON_BIN`.
+
+The MODULE contract records real full-verification gates for workspace tests, product scenarios, regression, architecture policy, dependency governance, coverage summary, platform checks, feature matrix and portable-core checks; integration/fuzz/concurrency/performance are conditional and become UNKNOWN when prerequisites/content are absent. This is an important distinction from a “green CI = everything passed” model.
+
+### 34.3 Final PASS authority
+
+The engineering contract explicitly states that an Agent claim cannot produce final PASS. Harness/CI gate results and bound Evidence are the certification mechanism. Consequently this CURRENT_STATE document must never use “verified” merely because source, MODULE or a previous agent report says so.
+
+## 35. Evidence interpretation rules tightened
+
+For all remaining audits, use these rules:
+
+1. `MODULE.md` = normative intent/history, not sufficient current-state proof.
+2. source = implementation proof, but not necessarily product wiring proof.
+3. composition-root ownership = wiring proof, but not runtime-success proof.
+4. scenario = verification target, not run result.
+5. `.evidence` bound to the captured revision/config/contract = verification proof.
+6. host-dependent SKIP/UNKNOWN must remain SKIP/UNKNOWN; never normalize them to PASS.
+7. stale evidence is evidence that a test once ran, not evidence for the current baseline.
+
+This resolves the largest epistemic ambiguity in the repository: the same feature can legitimately be Contract + Implemented + Wired while still not be Verified for the captured revision.
