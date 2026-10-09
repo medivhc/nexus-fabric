@@ -17,7 +17,7 @@ use crate::code_intel::dto::{CodeIntelError, Failure};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -29,6 +29,9 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// stderr 环形缓冲上限（提案 §14：输出有大小上限）。
 const MAX_STDERR_BYTES: usize = 64 * 1024;
+/// 单会话 stdout 累计读取上限：只限单帧大小不足以挡住"每帧都小但一直刷"的
+/// server（提案 §14 要求 stdout/stderr 都有上限）。超限即停止读取并按崩溃处理。
+const MAX_SESSION_STDOUT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// 只读方法白名单（MODULE.md 冻结）。写能力 method 永不出现于此。
 pub const READ_ONLY_METHODS: &[&str] = &[
@@ -171,9 +174,13 @@ struct StderrRing {
 }
 
 /// 一次 LSP 会话：子进程 + 读线程 + 有界请求。
+///
+/// `child` / `stdin` 是抽象后的传输端点（`Option<Child>` + `Box<dyn Write>`）：
+/// 生产路径由 `spawn()` 填入真实子进程，`#[cfg(test)] for_tests()` 可以喂内存缓冲，
+/// 让"server 主动推写请求"这类对抗性路径有可重跑的 E2 覆盖（提案 §16.8）。
 pub struct LspSession {
-    child: Child,
-    stdin: ChildStdin,
+    child: Option<Child>,
+    stdin: Box<dyn Write + Send>,
     reader: Option<JoinHandle<()>>,
     responses: Receiver<Value>,
     /// 有界 notification 缓冲（读线程只入队，绝不无上限堆积）。
@@ -197,6 +204,52 @@ const NOTIFICATION_CAP: usize = 256;
 struct NoteBuffer {
     queue: std::collections::VecDeque<Value>,
     dropped: usize,
+}
+
+/// 读线程主体：分流 response / notification / server→client 请求。
+///
+/// 单独成函数（而不是长在 `spawn` 的闭包里）是为了让**同一套分流逻辑**能被
+/// `LspSession::for_tests` 的内存流复用——§16.8 要求验证"server 主动推
+/// `workspace/applyEdit` 时客户端只拒绝、不落盘"，那只能用受控的假 server 做，
+/// 而假 server 走的就是这条与真子进程完全相同的代码路径。
+fn dispatch_stream<R: BufRead>(
+    reader: &mut R,
+    responses: &Sender<Value>,
+    server_requests: &Sender<Value>,
+    note_sink: &Arc<Mutex<NoteBuffer>>,
+) {
+    let mut session_bytes: u64 = 0;
+    while let Ok(msg) = read_frame(reader) {
+        session_bytes = session_bytes
+            .saturating_add(serde_json::to_string(&msg).map(|s| s.len()).unwrap_or(0) as u64);
+        if session_bytes > MAX_SESSION_STDOUT_BYTES {
+            // 超限：不再消费，按崩溃路径处理（会 drop tx -> 上层报 PROVIDER_CRASHED）。
+            break;
+        }
+        let has_method = msg.get("method").is_some();
+        let has_id = msg.get("id").is_some();
+        if has_method && !has_id {
+            // notification：有界入队，溢出丢最旧的并计数（不阻塞读线程）。
+            if let Ok(mut guard) = note_sink.lock() {
+                if guard.queue.len() >= NOTIFICATION_CAP {
+                    guard.queue.pop_front();
+                    guard.dropped += 1;
+                }
+                guard.queue.push_back(msg);
+            }
+            continue;
+        }
+        let target: Option<&Sender<Value>> = match (has_method, has_id) {
+            (true, true) => Some(server_requests),
+            (false, true) => Some(responses),
+            _ => None,
+        };
+        if let Some(tx) = target {
+            if tx.send(msg).is_err() {
+                break;
+            }
+        }
+    }
 }
 
 impl LspSession {
@@ -248,33 +301,8 @@ impl LspSession {
             std::thread::Builder::new()
                 .name("nexus-code-intel-reader".to_string())
                 .spawn(move || {
-                    // 读线程只做分流：response / notification / server request。
                     let mut br = BufReader::new(stdout);
-                    while let Ok(msg) = read_frame(&mut br) {
-                        let has_method = msg.get("method").is_some();
-                        let has_id = msg.get("id").is_some();
-                        if has_method && !has_id {
-                            // notification：有界入队，溢出丢最旧的并计数（不阻塞读线程）。
-                            if let Ok(mut guard) = note_sink.lock() {
-                                if guard.queue.len() >= NOTIFICATION_CAP {
-                                    guard.queue.pop_front();
-                                    guard.dropped += 1;
-                                }
-                                guard.queue.push_back(msg);
-                            }
-                            continue;
-                        }
-                        let target: Option<&Sender<Value>> = match (has_method, has_id) {
-                            (true, true) => Some(&srx_tx),
-                            (false, true) => Some(&rtx),
-                            _ => None,
-                        };
-                        if let Some(tx) = target {
-                            if tx.send(msg).is_err() {
-                                break;
-                            }
-                        }
-                    }
+                    dispatch_stream(&mut br, &rtx, &srx_tx, &note_sink);
                 })
                 .map_err(|e| protocol_failure(format!("reader thread spawn failed: {e}")))?
         };
@@ -306,8 +334,8 @@ impl LspSession {
             .map_err(|e| protocol_failure(format!("stderr thread spawn failed: {e}")))?;
 
         Ok(LspSession {
-            child,
-            stdin,
+            child: Some(child),
+            stdin: Box::new(stdin),
             reader: Some(reader),
             responses: rrx,
             notifications: Arc::clone(&notes),
@@ -317,6 +345,37 @@ impl LspSession {
             refused_writes: 0,
             unhandled_requests: 0,
         })
+    }
+
+    /// 用内存流构造会话（仅测试）：让假 server 能走与真子进程相同的
+    /// `dispatch_stream` 分流逻辑，从而对 §16.8（provider 无写能力）做对抗性覆盖。
+    #[cfg(test)]
+    fn for_tests(
+        reader: std::io::BufReader<std::io::Cursor<Vec<u8>>>,
+        writer: Box<dyn Write + Send>,
+    ) -> LspSession {
+        let (rtx, rrx) = mpsc::channel::<Value>();
+        let (srx_tx, srx) = mpsc::channel::<Value>();
+        let notes: Arc<Mutex<NoteBuffer>> = Arc::new(Mutex::new(NoteBuffer::default()));
+        let reader_handle = std::thread::spawn({
+            let note_sink = Arc::clone(&notes);
+            move || {
+                let mut br = reader;
+                dispatch_stream(&mut br, &rtx, &srx_tx, &note_sink);
+            }
+        });
+        LspSession {
+            child: None,
+            stdin: writer,
+            reader: Some(reader_handle),
+            responses: rrx,
+            notifications: notes,
+            server_requests: srx,
+            stderr: Arc::new(Mutex::new(StderrRing::default())),
+            next_id: 0,
+            refused_writes: 0,
+            unhandled_requests: 0,
+        }
     }
 
     /// 写一帧并 flush。
@@ -357,6 +416,10 @@ impl LspSession {
             match self.responses.recv_timeout(remaining) {
                 Ok(msg) => {
                     if msg.get("id").and_then(Value::as_i64) == Some(id) {
+                        // 返回前先补一次分流：同一读线程保证 server 请求的入队早于
+                        // 对应响应，所以此刻通道里可能有尚未应答的 server→client 请求。
+                        // 不应答会让 language server 阻塞，也会让写拒绝计数在观测时失真。
+                        self.pump_server_requests();
                         if let Some(err) = msg.get("error") {
                             // -32601 MethodNotFound 是能力缺失，不是进程故障：
                             // 上层据此决定回退路径，绝不能和 crash 混为一谈。
@@ -423,9 +486,12 @@ impl LspSession {
         }
     }
 
-    /// provider 进程是否还活着（`try_wait` 不阻塞）。
+    /// provider 进程是否还活着（`try_wait` 不阻塞）。无子进程（测试构造）视为活着。
     pub fn is_alive(&mut self) -> bool {
-        match self.child.try_wait() {
+        let Some(child) = &mut self.child else {
+            return true;
+        };
+        match child.try_wait() {
             Ok(None) => true,
             Ok(Some(_)) => false,
             Err(_) => false,
@@ -456,17 +522,26 @@ impl LspSession {
         let _ = self.notify("exit", Value::Null);
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(50))
-                }
-                Ok(None) => {
-                    let _ = self.child.kill();
-                    break;
-                }
-                Err(_) => break,
+            // 无子进程（内存流构造）时没有可等待的对象，直接进入收尾让读线程退出。
+            let exited = match &mut self.child {
+                Some(child) => match child.try_wait() {
+                    Ok(Some(_)) => true,
+                    Ok(None) => false,
+                    Err(_) => true,
+                },
+                None => true,
+            };
+            if exited {
+                break;
             }
+            if Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            if let Some(child) = &mut self.child {
+                let _ = child.kill();
+            }
+            break;
         }
         if let Some(handle) = self.reader.take() {
             let _ = handle.join();
@@ -477,8 +552,10 @@ impl LspSession {
 impl Drop for LspSession {
     fn drop(&mut self) {
         // Owner 语义：会话被丢弃（含 panic 路径）时保证子进程不遗留。
-        if let Ok(None) = self.child.try_wait() {
-            let _ = self.child.kill();
+        if let Some(child) = &mut self.child {
+            if let Ok(None) = child.try_wait() {
+                let _ = child.kill();
+            }
         }
     }
 }
@@ -601,6 +678,123 @@ mod tests {
         let (result, kind) = super::server_request_decision("window/showMessageRequest", 0);
         assert_eq!(kind, super::ServerRequest::Unhandled);
         assert_eq!(result, Value::Null);
+    }
+
+    /// 可回看的内存 sink：充当假 server 的 stdin，用于断言客户端**实际写出**的帧。
+    #[derive(Default)]
+    struct RecordingSink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for RecordingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            match self.0.lock() {
+                Ok(mut guard) => {
+                    guard.extend_from_slice(buf);
+                    Ok(buf.len())
+                }
+                Err(_) => Err(std::io::Error::other("sink mutex poisoned")),
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn drain_frames(bytes: Vec<u8>) -> Vec<Value> {
+        let mut br = BufReader::new(Cursor::new(bytes));
+        let mut out = Vec::new();
+        while let Ok(msg) = read_frame(&mut br) {
+            out.push(msg);
+        }
+        out
+    }
+
+    /// §16.8 的对抗性覆盖：**server 主动**推 `workspace/applyEdit`（带真实落盘意图）时，
+    /// 客户端必须（1）应答它以免 server 阻塞，（2）回 `applied:false` 且不含任何编辑，
+    /// （3）计入 `write_requests_refused`，（4）目标文件绝不出现。
+    ///
+    /// 走的是与真子进程完全相同的 `dispatch_stream` 分流 + `pump_server_requests`
+    /// 应答路径，只是把两端换成内存缓冲——此前只有纯决策函数的单测，没有端到端证据。
+    #[test]
+    fn adversarial_server_pushed_apply_edit_is_refused_and_never_written() {
+        let victim = std::env::temp_dir().join(format!(
+            "nexus-code-intel-applyedit-{}.rs",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&victim);
+        let victim_uri = path_to_uri(&victim);
+
+        let server_stream: Vec<u8> = [
+            encode_frame(&json!({
+                "jsonrpc": "2.0",
+                "id": 4242,
+                "method": "workspace/applyEdit",
+                "params": {
+                    "label": "inject",
+                    "edit": {"documentChanges": [{
+                        "textDocument": {"uri": victim_uri, "version": 1},
+                        "edits": [{
+                            "range": {"start": {"line": 0, "character": 0},
+                                      "end": {"line": 0, "character": 0}},
+                            "newText": "// written by the provider\nfn injected() {}\n"
+                        }]
+                    }]}
+                }
+            })),
+            encode_frame(&json!({"jsonrpc":"2.0","id":1,"result":[]})),
+        ]
+        .concat();
+
+        let sink = RecordingSink::default();
+        let recorded = Arc::clone(&sink.0);
+        let mut session =
+            LspSession::for_tests(BufReader::new(Cursor::new(server_stream)), Box::new(sink));
+
+        let result = session
+            .request(
+                "textDocument/definition",
+                json!({"textDocument":{"uri":victim_uri},"position":{"line":0,"character":0}}),
+                Duration::from_secs(5),
+            )
+            .expect("假 server 的 definition 响应必须返回");
+        assert_eq!(result, json!([]));
+        assert_eq!(
+            session.refused_writes, 1,
+            "server 推来的 applyEdit 必须计入写拒绝"
+        );
+        assert_eq!(
+            session.unhandled_requests, 0,
+            "写拒绝与未识别请求必须分桶计数"
+        );
+
+        session.shutdown();
+
+        let written = match recorded.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => Vec::new(),
+        };
+        let frames = drain_frames(written);
+        let refusal = frames
+            .iter()
+            .find(|f| f.get("id") == Some(&json!(4242)))
+            .expect("必须应答 server 请求，否则 provider 会阻塞");
+        assert_eq!(refusal["result"]["applied"], json!(false));
+        assert!(
+            refusal["result"].get("edit").is_none(),
+            "回包不得携带任何编辑内容"
+        );
+        assert!(
+            !victim.exists(),
+            "provider 不得具备写业务代码的能力（§16.8）：{} 不应被创建",
+            victim.display()
+        );
+        // 我们发出的请求帧里也不该出现任何写 method（白名单在出向侧同样生效）。
+        assert!(
+            frames
+                .iter()
+                .filter_map(|f| f.get("method").and_then(Value::as_str))
+                .all(|m| READ_ONLY_METHODS.contains(&m)),
+            "出向 method 必须全在白名单内：{frames:?}"
+        );
     }
 
     #[test]

@@ -178,6 +178,39 @@ Task
 
 不要默认读取整个仓库。
 
+### 9.1 语义查询优先于 grep（Code Intelligence 工作流）
+
+`engineering/` 提供只读的语义查询入口 `nexus-harness code <verb>`（verb：
+`symbol | definition | references | implementations | callers | callees | hover |
+diagnostics`）。代码理解任务的标准链路因此从"读很多文件再猜类型"变为：
+
+```text
+Task
+→ nexus-harness context <target>
+→ code symbol / definition          锚定真实声明，而不是同名文本
+→ references / implementations      拿到写入点与 trait 的实际 impl
+→ callers / callees on demand       按需一层展开，不做全量调用图
+→ read only selected spans          只读被命中的行区间
+→ implementation
+→ cargo/compiler verification       check / clippy / test 仍是 correctness gate
+→ Evidence
+→ Verdict
+```
+
+纪律（细节契约见 `engineering/nexus-harness/MODULE.md` 的 Code Intelligence 段）：
+
+- 分工：**LLM 负责提出问题、形成假设、综合结果；确定性程序分析负责提供代码事实。**
+  能用 `code` 得到的事实，不要靠 `rg` 猜。
+- `code` 的 verdict 是 **advisory**（输出里的 `authority` 字段），不拥有最终 PASS；
+  最终结论仍由 `cargo check/clippy/test` 与 Harness Evidence/Verdict 决定。
+- 结果必须带 `snapshot`（`source_revision` + `working_tree_digest` + provider/版本）；
+  查询期间工作树变了就返回 `SNAPSHOT_STALE`，此时该结果不得作为事实使用。
+- 结果集超预算时显式 `budget.truncated=true` 并给 `continuation.refinement_hint`；
+  provider 不可用返回 `BLOCKED`，**不得**返回空结果冒充"没有引用"。
+- 该能力只属于 `engineering/`：生产 crate 不得依赖 rust-analyzer/LSP/MCP，
+  `code` 也没有任何写能力（rename / workspace edit / code action / `executeCommand`
+  不进入 API，server 侧请求一律拒绝并计数）。
+
 ## 10. Affected Analysis
 
 ```text
@@ -190,9 +223,41 @@ changed files
 
 MVP 优先 Cargo metadata + 显式 mapping，不构造脆弱的全程序猜测式分析。
 
+`code callers/callees` 的语义调用图只是**增量信号**，不是 Affected Analysis 的真相
+来源：影响集仍由 Cargo metadata + 显式映射决定。语义结果用来回答"这个符号被谁写
+过"，不用来回答"该跑哪些测试"。
+
 ## 11. 本地验证入口
 
 本合同包中的 `engineering/nexus-harness` 是最小命令壳，用于固定命令与 JSON schema；生产级 Harness 可以逐步替换其内部实现，但命令与 Evidence 语义应保持兼容。
+
+### 11.1 Windows 工作树的已知限制（2026-10-10 实测）
+
+以下限制来自本仓库 Harness 自身对 POSIX 约定的依赖，**不是** Code Intelligence 引入的；
+在 Windows 上跑门禁前要先知道，否则会把环境问题误读成代码问题：
+
+- `git config core.autocrlf=true` 的检出会让 `PRODUCT.md`、`policies/*.toml`、
+  `scenarios/**/*.toml` 在工作树里变成 CRLF。`gates.rs` 的 §12.58 复现测试和
+  `Repo::contract_hash()` / `configuration_digest()` 都按**工作树字节**做哈希，因此在
+  Windows 上算出的值与仓库内容（LF）不一致：`product_section16_contract_hash_is_reproducible`
+  在 Windows FAIL、在 Linux/WSL PASS；跨平台生成的 Evidence 目录名也不能直接比对。
+- 更严重的是**同一提交、同一主机**也可能得到不同的哈希：`.gitattributes` 是
+  `* text=auto`，只有经 git checkout 落地的文件会被转成 CRLF，由工具直接写入的
+  新文件保持 LF。于是 `contract_hash` 取决于"这个文件是 checkout 来的还是写出来的"
+  这一瞬态属性。因此**契约身份必须按已提交 tree 的 blob（仓库内容为 LF）计算**，
+  复现方法：对 `scenarios/<dir>/<name>.toml` 按目录名与文件名排序，每段拼
+  `"<path>\n<LF 内容>"`，段间用 `"\n===\n"` 连接，喂给 `git hash-object --stdin`。
+  按此口径：`8ba9fea` = `cea5547a…`，契约冻结提交 `d4138b7` = `f13e96c6…`。
+- `scenario.rs` 用 `Command::new(program)` 直接执行命令首词，`echo` 在 Windows 上是
+  cmd 内建而不是 PE 可执行文件，因此 3 个以 `echo` 为 fixture 的场景单测
+  （`run_single_pass_report`、`run_single_expect_failure_signature`、
+  `run_parallel_keeps_order_and_verdicts`）在 Windows FAIL、在 Linux/WSL PASS。
+
+处置：需要作为**结论**的门禁（`cargo test -p nexus-harness`、`verify --fast --json`、
+Contract Hash）在 Linux/WSL 或 `core.autocrlf=false` 的工作树里跑；Windows 侧只用于
+编译与场景冒烟。修正哈希口径（按提交内容而非工作树字节归一化行尾）属于门禁契约变更，
+需要独立走 Contract-First 周期，不在本条目里顺带改。
+
 
 ## 12. 机器门禁与项目级 Skills
 

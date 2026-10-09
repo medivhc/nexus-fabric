@@ -50,7 +50,12 @@ options（全部可选，缺省即预算默认值）：
 --provider-binary <name|path> 覆盖 language server 可执行文件（仅用于失败路径验证）
 ```
 
-扩展字段（`code` 全部命令统一）：
+扩展字段（`code` 各命令统一；**字段可得性**按下述规则，不装作永远齐全）：
+
+- `command` / `authority` / `error`（失败时）永远存在。
+- `snapshot` 一旦完成仓库发现就存在（含 verb 不认识、参数非法等 provider 启动前的失败）；不在 git 仓库内时以 `WORKSPACE_UNRESOLVED` 上报。
+- `budget` 在 options 解析成功后存在；`provider` 只在 language server 被解析到之后存在。
+- `results` / `count` 恒存在，失败时为 `[]` / `0`——失败**绝不**表现为"空结果 + PASS"。
 
 ```text
 results            语言中立结果数组（symbol/kind/kind_id/qualified_name/path/in_scope/range/snippet）
@@ -78,6 +83,17 @@ error              失败时 {code,reason}
 PROVIDER_UNAVAILABLE WORKSPACE_UNRESOLVED INITIALIZATION_FAILED QUERY_INVALID
 SYMBOL_NOT_FOUND RESULT_TRUNCATED TIMEOUT PROVIDER_CRASHED SNAPSHOT_STALE UNSUPPORTED
 ```
+
+码表使用现状（如实记录，避免"目录里有、实现里没有"）：
+
+- `RESULT_TRUNCATED` 是**契约预留**：首期截断通过 `budget.truncated = true` +
+  `continuation.refinement_hint` 表达，不作为终态码，因此当前无构造点。
+- 其余九码均有构造点；`TIMEOUT` 同时承载"请求超时"与"就绪预算耗尽导致空结果
+  不可信"两种情形（后者在 `reason` 里写明），以便调用方区分"重启无望"
+  （`INITIALIZATION_FAILED`）与"加大预算可救"（`TIMEOUT`）。
+- 结果条目的 `in_scope` 表达作用域：查询**目标**越出 `--workspace` 直接
+  `QUERY_INVALID`；**结果**越界（例如 callee 落到标准库源码）不删除、只标
+  `in_scope = false`，因为删掉就等于静默丢弃（提案 §5 禁止）。
 
 ## Non-Responsibilities
 
@@ -121,8 +137,10 @@ SYMBOL_NOT_FOUND RESULT_TRUNCATED TIMEOUT PROVIDER_CRASHED SNAPSHOT_STALE UNSUPP
 - Evidence 必须绑定 revision / working-tree / config / feature / target / toolchain / platform，并写入 `.evidence/verify-<id>/`。
 - verdict 语义：`PASS / FAIL / STALE / UNKNOWN / BLOCKED`；STALE 证据必须以 `"verdict":"STALE"` 形式落盘，供 `.githooks/pre-push` 检出。
 - 未实现的 gate（bench/replay/coverage 等）必须显式记录 UNKNOWN，不得以 PASS 掩盖。
-- Code Intelligence 只读不变量：客户端只允许发送白名单内的 LSP 方法（`workspace/symbol`、`textDocument/{documentSymbol,hover,definition,typeDefinition,implementation,references,prepareCallHierarchy,diagnostic}`、`callHierarchy/{incomingCalls,outgoingCalls}`）；`rename`、`workspace/applyEdit`、`codeAction` 自动应用、`workspace/willSaveWaitUntil`、格式化写入、任意 `workspace/executeCommand` 一律拒绝并返回 `UNSUPPORTED`。
+- Code Intelligence 只读不变量：客户端只允许发送白名单内的 LSP 方法（`workspace/symbol`、`textDocument/{documentSymbol,hover,definition,typeDefinition,implementation,references,prepareCallHierarchy,diagnostic}`（`typeDefinition` 为白名单预留，首期无 CLI verb 调用点：提案 §4 的 Agent-facing 列表本身不含 type-definition，故不视为未兑现，但不得假装已经暴露给 Agent）、`callHierarchy/{incomingCalls,outgoingCalls}`）；`rename`、`workspace/applyEdit`、`codeAction` 自动应用、`workspace/willSaveWaitUntil`、格式化写入、任意 `workspace/executeCommand` 一律拒绝并返回 `UNSUPPORTED`。
 - provider 子进程 command/args 不接受模型或调用方拼接的任意 shell 参数（`--provider-binary` 只接受单个可执行文件名或路径，按 `split_whitespace` 之前的整串传入，不经 shell）。
+- `request()` 在返回匹配响应**之前**必须先 `pump_server_requests()` 一次：language server 会阻塞等待其对 server→client 请求的应答，悬置请求既会卡住 provider，也会让 `write_requests_refused` 在观测时刻还没入账（计数失真等于把拒绝能力藏起来）。
+- 只读边界是**可端到端验证的**：`LspSession` 的传输端点被抽象（`child: Option<Child>` + `stdin: Box<dyn Write + Send>`），生产路径只由 `spawn()` 填入真实子进程；`#[cfg(test)] LspSession::for_tests()` 用内存流接一个假 server，走的是与真进程完全相同的 `dispatch_stream` 分流与应答逻辑。修改任何写能力拒绝路径必须让 `code_intel::lsp::tests::adversarial_server_pushed_apply_edit_is_refused_and_never_written` 保持绿色（该测试断言目标文件**不存在**）。
 - `code` 结果必须绑定 `snapshot`（source_revision + working_tree_digest + target + toolchain + workspace root）；查询完成前后 digest 不一致时返回 `SNAPSHOT_STALE`。
 - 命中超过预算时必须 `budget.truncated = true` 并给出 `continuation.refinement_hint`；禁止静默丢弃结果后宣称完整。字节预算与条数预算同等生效：单条结果自身超过 `max_result_bytes` 时保留它但仍置 `truncated = true`。
 - Code Intelligence 的时间语义属契约面（不是实现细节）：rust-analyzer 的 workspace 加载是多阶段的，就绪只认"`\$/progress` begin/end 收敛且静默 ≥ 1.5s"（`Completed`）。**只有 `Completed` 允许把空结果当作答案**；server 从不上报进度的静默、以及预算耗尽，两者下的空结果一律 `BLOCKED` + `error.code = TIMEOUT`、`provider.ready = false`。把"还没索引完"说成"确实没有引用"即提案 §12 禁止的伪 PASS。didOpen 后另有 15s 空结果重试窗口（文件级分析需要时间）。
@@ -133,7 +151,7 @@ SYMBOL_NOT_FOUND RESULT_TRUNCATED TIMEOUT PROVIDER_CRASHED SNAPSHOT_STALE UNSUPP
 
 ## Side Effects
 
-- 允许：写入 `.evidence/verify-<id>/`（Evidence）；运行只读验证命令（cargo/git）；输出状态；为 Code Intelligence 启动长期本地子进程 `rust-analyzer`（工作目录限制在仓库/worktree 内，每请求有 timeout/cancellation，stdout/stderr 有大小上限，crash 最多重启一次且必须记入 `provider.restart_count`，命令结束时发送 `shutdown`/`exit`）。
+- 允许：写入 `.evidence/verify-<id>/`（Evidence）；运行只读验证命令（cargo/git）；输出状态；为 Code Intelligence 启动长期本地子进程 `rust-analyzer`（工作目录限制在仓库/worktree 内，每请求有 timeout/cancellation，stdout 有单帧 64MiB + 单会话累计 256MiB 上限、stderr 有 64KiB 环形上限（超限即按崩溃处理，不静默截断后继续）；crash 最多重启一次且必须记入 `provider.restart_count` 与 `provider.restart_reason`，命令结束时发送 `shutdown`/`exit`）。
 - 禁止：修改业务代码；修改 `scenarios/` 或 `policies/` 内容；执行网络操作；修改 git index/HEAD。
 - 新增副作用前必须更新本契约和 Scenario/Policy（如影响外部行为）。
 
@@ -161,7 +179,9 @@ Code Intelligence 场景（E4，冻结于 2026-10-10 契约阶段，夹具为
 `code_intelligence_definition.toml`、`code_intelligence_callers.toml`、
 `code_intelligence_hover.toml`、`code_intelligence_diagnostics_advisory.toml`、
 `code_intelligence_budget_truncation.toml`、`code_intelligence_provider_unavailable.toml`、
-`code_intelligence_write_method_denied.toml`。
+`code_intelligence_write_method_denied.toml`、`code_intelligence_callees.toml`、
+`code_intelligence_scope_violation.toml`、`code_intelligence_read_only_counters.toml`、
+`code_intelligence_budget_count.toml`。
 
 ### Gate 实现状态（2026-09-15）
 
@@ -169,7 +189,7 @@ Code Intelligence 场景（E4，冻结于 2026-10-10 契约阶段，夹具为
 
 - 真实执行：workspace-tests / product-scenarios / regression / architecture-policy / dependency-governance（cargo-deny 0.20：`cargo deny --config policies/deny.toml check advisories licenses bans sources`，缺失则 UNKNOWN）/ coverage-summary（cargo-llvm-cov）/ platform-checks（portable-core 平台依赖静态扫描）/ feature-matrix（每成员 `--no-default-features` + `--all-features`）/ portable-core（`cargo check --target wasm32-wasip1`）。
 - 条件执行（无内容/无工具时 UNKNOWN）：integration（成员 tests/*.rs 存在时逐个运行）/ selected-fuzz（cargo-fuzz + fuzz targets）/ selected-concurrency（tests/concurrency 有测试时运行）/ performance-budgets（quality.toml `[performance]` 定义 baseline+blocking 后判定）。
-- 单元测试：`cargo test -p nexus-harness`（98 个 = 既有 56 + Code Intelligence 42；覆盖 scenario 求值、evidence 新鲜度/STALE、digest 确定性、workspace 成员解析、dependency-governance gate 语义，以及 JSON-RPC framing、只读白名单、URI 往返、DTO 形状与预算截断、progress 收敛判定、provider 参数校验）。
+- 单元测试：`cargo test -p nexus-harness`（100 个 = 既有 56 + Code Intelligence 44；覆盖 scenario 求值、evidence 新鲜度/STALE、digest 确定性、workspace 成员解析、dependency-governance gate 语义，以及 JSON-RPC framing、只读白名单、URI 往返、DTO 形状与预算截断、progress 收敛判定、provider 参数校验、**假 server 主动推 `workspace/applyEdit` 的端到端拒绝**）。
   - Windows 宿主已知 4 个与本模块能力无关的预存在失败：3 个 scenario 测试把 `sh`/`echo` 当 shell 内建使用（Windows 下按可执行文件解析），1 个 `gates` 的 §12.58 contract-hash 测试受 `text=auto` 的 CRLF 检出影响；两者均非 Code Intelligence 引入。
 
 ## Performance Budget

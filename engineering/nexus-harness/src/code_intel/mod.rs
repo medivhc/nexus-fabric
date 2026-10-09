@@ -87,7 +87,18 @@ impl Envelope {
 pub fn run(args: &[String]) -> Outcome {
     let verb_raw = args.first().map(String::as_str).unwrap_or("");
     let command = format!("code {verb_raw}");
-    let base = Envelope::new(&command);
+    let mut base = Envelope::new(&command);
+
+    // 先做仓库发现：这样即便 verb/参数解析失败，envelope 里仍有 snapshot，
+    // Agent 不必靠"有没有这个字段"去猜失败发生在哪一层。
+    let setup = commands::setup();
+    if let Ok((early_repo, _)) = &setup {
+        let mut snap = Bindings::current(early_repo).to_json();
+        if let Some(obj) = snap.as_object_mut() {
+            obj.insert("workspace_root".to_string(), json!("."));
+        }
+        base.snapshot = Some(snap);
+    }
 
     if verb_raw.is_empty() {
         return fail(
@@ -107,7 +118,7 @@ pub fn run(args: &[String]) -> Outcome {
         );
     };
 
-    let (repo, _config) = match commands::setup() {
+    let (repo, _config) = match setup {
         Ok(pair) => pair,
         Err(outcome) => return enrich(outcome, &base),
     };

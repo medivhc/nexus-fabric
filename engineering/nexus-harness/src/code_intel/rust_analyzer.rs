@@ -7,9 +7,11 @@
 //!   → didOpen 目标文件 → 只读请求（超白名单即拒）→ 崩溃最多重启一次 → shutdown/exit
 //! ```
 //!
-//! 就绪判定不依赖 rust-analyzer 私有状态字符串：优先接受
-//! `rust-analyzer/status`（含 ready/idle）或 `$/progress` 的 `end`；若 server
-//! 完全不上报进度，则在 3s 静默后视为就绪并把 `provider.ready` 记为 true。
+//! 就绪判定（时间语义见 MODULE.md，属契约面）：只认 `$/progress` begin/end
+//! 全部收敛且静默 ≥ 1.5s（`Completed`），或 `rust-analyzer/status` 出现 idle。
+//! server 从不上报进度时的静默（`Quiet`）与预算耗尽（`TimedOut`）都**不算**就绪：
+//! 此时空结果一律 BLOCKED + TIMEOUT，`provider.ready` 记 false，
+//! 因为"还没索引完"与"确实没有引用"无法区分（提案 §12 禁止伪 PASS）。
 
 use crate::code_intel::dto::{
     Budget, CodeIntelError, Failure, ProviderMeta, ResultItem, diagnostic_severity, relative_path,
@@ -266,7 +268,8 @@ impl RustAnalyzerProvider {
             Ok(value) => return Ok(value),
             Err(err) => err,
         };
-        if err.code != CodeIntelError::ProviderCrashed || self.meta.restart_count >= 2 {
+        // 契约（MODULE.md Side Effects）：crash 最多重启一次；第二次崩溃直接上报。
+        if err.code != CodeIntelError::ProviderCrashed || self.meta.restart_count >= 1 {
             return Err(err);
         }
         self.meta.restart_count += 1;
