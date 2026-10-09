@@ -1,0 +1,23 @@
+# Code Intelligence 夹具（deterministic fixture workspace）。
+#
+# 仅供 `nexus-harness code ...` 的语义查询与 E4 Scenario 使用，**不属于**根
+# workspace（见根 Cargo.toml `[workspace] exclude`），也不得被任何生产 crate
+# 依赖：提案 §2/§7 要求 Code Intelligence 只存在于 Engineering Plane。
+#
+# 独立 `[workspace]` 声明使其成为自己的 workspace root，避免被父包目录吞并。
+[workspace]
+
+[package]
+name = "code-intel-fixture"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Deterministic Rust fixture for nexus-harness code-intelligence queries (trait/multi-impl/generic/re-export/cfg)"
+
+[lib]
+name = "code_intel_fixture"
+path = "src/lib.rs"
+
+[dependencies]
+# 故意保持为空：夹具零外部依赖，保证 rust-analyzer 冷启动可重现。

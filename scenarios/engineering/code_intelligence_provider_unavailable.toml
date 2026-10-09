@@ -1,0 +1,34 @@
+schema_version = 1
+id = "engineering.code-intelligence-provider-unavailable"
+title = "language server 不可用时返回 BLOCKED + PROVIDER_UNAVAILABLE，不得伪造空结果（提案 §12/§16.7）"
+evidence_strength = "E4"
+requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#12-failure-semantics"
+
+# --provider-binary 指向必然不存在的可执行文件：验证失败路径是显式 BLOCKED，
+# 而不是 verdict=PASS + results=[]（后者会让 Agent 误以为"该符号无人引用"）。
+[given]
+repository = "initialized"
+network = "none (本地 language server 子进程)"
+
+[when]
+command = "nexus-harness code symbol Egress --workspace engineering/nexus-harness/fixtures/code-intel --provider-binary nexus-code-intel-provider-does-not-exist --json"
+
+[[expect]]
+field = "command"
+equals = "code symbol"
+
+[[expect]]
+field = "verdict"
+equals = "BLOCKED"
+
+[[expect]]
+field = "error.code"
+equals = "PROVIDER_UNAVAILABLE"
+
+[[expect]]
+field = "error.reason"
+non_empty = true
+
+[[expect]]
+field = "authority"
+equals = "advisory"

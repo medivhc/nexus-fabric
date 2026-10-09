@@ -1,0 +1,41 @@
+# Red Evidence: Code Intelligence（契约阶段，旧实现）
+# 日期: 2026-10-09T18:39:42Z
+# 实现基线: 696fb68 (nexus-fabric @ fix/windows-cfg-portability)
+# 执行者: qoder-desktop (NEXUS_AGENT=qoder-desktop)
+# 说明: 以下 9 个 E4 场景在【尚未实现 code 命令】的 nexus-harness 上执行，
+#       必须得到 FAIL（expectation 不满足）——这就是 Red Evidence。
+# Contract Hash: 096be167075d4a4627e746a667a585fb3e015980
+# working_tree_digest: ecf12e37b24d697a293c839050fe9535e5a9bce3
+# 结果: 9/9 verdict=FAIL（failed_step=expect，实际 command="code" / verdict="BLOCKED"）
+# 冻结内容: 9 个 scenarios/engineering/code_intelligence_*.toml 的 expectation +
+#          engineering/nexus-harness/MODULE.md 的 Code Intelligence Contract 章节
+# 进入实现阶段的条件已满足。
+#       按 nexus-contract-first：无 Red Evidence 不得进入实现阶段。
+
+## engineering.code-intelligence-symbol
+{"command":"scenario run","duration_ms":108,"evidence_id":"scenario-733b0499fe5b","failure_signature":{"assertion":"command","failed_step":"expect","key_log_lines":["{\"command\":\"code\",\"message\":\"supported commands: status, context, check, test, verify, explain, bench, replay, scenario\",\"schema_version\":1,\"verdict\":\"BLOCKED\"}"]},"message":"scenario engineering.code-intelligence-symbol: FAIL (expect engineering.code-intelligence-symbol.command failed (actual: \"code\"))","scenario":"engineering.code-intelligence-symbol","schema_version":1,"verdict":"FAIL"}
+
+## engineering.code-intelligence-implementations
+{"command":"scenario run","duration_ms":108,"evidence_id":"scenario-fe7137071417","failure_signature":{"assertion":"command","failed_step":"expect","key_log_lines":["{\"command\":\"code\",\"message\":\"supported commands: status, context, check, test, verify, explain, bench, replay, scenario\",\"schema_version\":1,\"verdict\":\"BLOCKED\"}"]},"message":"scenario engineering.code-intelligence-implementations: FAIL (expect engineering.code-intelligence-implementations.command failed (actual: \"code\"))","scenario":"engineering.code-intelligence-implementations","schema_version":1,"verdict":"FAIL"}
+
+## engineering.code-intelligence-definition
+{"command":"scenario run","duration_ms":104,"evidence_id":"scenario-58daacd3e0cb","failure_signature":{"assertion":"command","failed_step":"expect","key_log_lines":["{\"command\":\"code\",\"message\":\"supported commands: status, context, check, test, verify, explain, bench, replay, scenario\",\"schema_version\":1,\"verdict\":\"BLOCKED\"}"]},"message":"scenario engineering.code-intelligence-definition: FAIL (expect engineering.code-intelligence-definition.command failed (actual: \"code\"))","scenario":"engineering.code-intelligence-definition","schema_version":1,"verdict":"FAIL"}
+
+## engineering.code-intelligence-callers
+{"command":"scenario run","duration_ms":105,"evidence_id":"scenario-018883c9cc40","failure_signature":{"assertion":"command","failed_step":"expect","key_log_lines":["{\"command\":\"code\",\"message\":\"supported commands: status, context, check, test, verify, explain, bench, replay, scenario\",\"schema_version\":1,\"verdict\":\"BLOCKED\"}"]},"message":"scenario engineering.code-intelligence-callers: FAIL (expect engineering.code-intelligence-callers.command failed (actual: \"code\"))","scenario":"engineering.code-intelligence-callers","schema_version":1,"verdict":"FAIL"}
+
+## engineering.code-intelligence-hover
+{"command":"scenario run","duration_ms":106,"evidence_id":"scenario-8068def1b9de","failure_signature":{"assertion":"command","failed_step":"expect","key_log_lines":["{\"command\":\"code\",\"message\":\"supported commands: status, context, check, test, verify, explain, bench, replay, scenario\",\"schema_version\":1,\"verdict\":\"BLOCKED\"}"]},"message":"scenario engineering.code-intelligence-hover: FAIL (expect engineering.code-intelligence-hover.command failed (actual: \"code\"))","scenario":"engineering.code-intelligence-hover","schema_version":1,"verdict":"FAIL"}
+
+## engineering.code-intelligence-diagnostics-advisory
+{"command":"scenario run","duration_ms":109,"evidence_id":"scenario-b560b918d0fc","failure_signature":{"assertion":"command","failed_step":"expect","key_log_lines":["{\"command\":\"code\",\"message\":\"supported commands: status, context, check, test, verify, explain, bench, replay, scenario\",\"schema_version\":1,\"verdict\":\"BLOCKED\"}"]},"message":"scenario engineering.code-intelligence-diagnostics-advisory: FAIL (expect engineering.code-intelligence-diagnostics-advisory.command failed (actual: \"code\"))","scenario":"engineering.code-intelligence-diagnostics-advisory","schema_version":1,"verdict":"FAIL"}
+
+## engineering.code-intelligence-budget-truncation
+{"command":"scenario run","duration_ms":105,"evidence_id":"scenario-c71e24844867","failure_signature":{"assertion":"command","failed_step":"expect","key_log_lines":["{\"command\":\"code\",\"message\":\"supported commands: status, context, check, test, verify, explain, bench, replay, scenario\",\"schema_version\":1,\"verdict\":\"BLOCKED\"}"]},"message":"scenario engineering.code-intelligence-budget-truncation: FAIL (expect engineering.code-intelligence-budget-truncation.command failed (actual: \"code\"))","scenario":"engineering.code-intelligence-budget-truncation","schema_version":1,"verdict":"FAIL"}
+
+## engineering.code-intelligence-provider-unavailable
+{"command":"scenario run","duration_ms":105,"evidence_id":"scenario-c786c0d2d0a0","failure_signature":{"assertion":"command","failed_step":"expect","key_log_lines":["{\"command\":\"code\",\"message\":\"supported commands: status, context, check, test, verify, explain, bench, replay, scenario\",\"schema_version\":1,\"verdict\":\"BLOCKED\"}"]},"message":"scenario engineering.code-intelligence-provider-unavailable: FAIL (expect engineering.code-intelligence-provider-unavailable.command failed (actual: \"code\"))","scenario":"engineering.code-intelligence-provider-unavailable","schema_version":1,"verdict":"FAIL"}
+
+## engineering.code-intelligence-write-method-denied
+{"command":"scenario run","duration_ms":105,"evidence_id":"scenario-e122bae15d87","failure_signature":{"assertion":"command","failed_step":"expect","key_log_lines":["{\"command\":\"code\",\"message\":\"supported commands: status, context, check, test, verify, explain, bench, replay, scenario\",\"schema_version\":1,\"verdict\":\"BLOCKED\"}"]},"message":"scenario engineering.code-intelligence-write-method-denied: FAIL (expect engineering.code-intelligence-write-method-denied.command failed (actual: \"code\"))","scenario":"engineering.code-intelligence-write-method-denied","schema_version":1,"verdict":"FAIL"}
+

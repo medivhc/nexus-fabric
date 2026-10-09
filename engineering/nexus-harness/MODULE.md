@@ -16,6 +16,58 @@ verify --full     全量门禁 + 写入 Evidence
 explain           解释最近一次 gate 失败
 bench             UNKNOWN（MVP 未实现，显式报告）
 replay            UNKNOWN（MVP 未实现，显式报告）
+code <verb>       语义代码查询（只读；见下方 Code Intelligence Contract）
+```
+
+## Code Intelligence Contract
+
+CLI 形态（`--json` 输出沿用核心四字段 + 扩展字段）：
+
+```text
+nexus-harness code symbol <name> [options]
+nexus-harness code definition <location-or-symbol> [options]
+nexus-harness code references <location-or-symbol> [options]
+nexus-harness code implementations <location-or-symbol> [options]
+nexus-harness code callers <location-or-symbol> [options]
+nexus-harness code callees <location-or-symbol> [options]
+nexus-harness code hover <location> [options]
+nexus-harness code diagnostics [target] [options]
+```
+
+`location` 为 `<path>:<line>:<column>`，**行列均为 1-based**（内部按 LSP 0-based
+转换）；`<symbol>` 形态经 `workspace/symbol` 解析，若同名匹配多于一个则
+返回 `FAIL` + `error.code = QUERY_INVALID` 并列出候选，不做静默挑选。
+
+options（全部可选，缺省即预算默认值）：
+
+```text
+--workspace <path>            查询根（相对仓库根解析）；缺省为仓库根
+--max-results <n>             缺省 20
+--max-snippet-lines <n>       缺省 8
+--max-result-bytes <n>        缺省 65536
+--timeout-secs <n>            单请求超时，缺省 20
+--ready-timeout-secs <n>      provider 就绪等待上限，缺省 90
+--provider-binary <name|path> 覆盖 language server 可执行文件（仅用于失败路径验证）
+```
+
+扩展字段（`code` 全部命令统一）：
+
+```text
+results            语言中立结果数组（symbol/kind/qualified_name/path/range/snippet）
+count              截断前的完整命中数
+budget             {max_results,max_snippet_lines,max_result_bytes,workspace_scope,truncated}
+continuation       截断时 {refinement_hint}（未截断则省略）
+provider           {kind,version,ready,restart_count,duration_ms}
+snapshot           {source_revision,working_tree_digest,target_triple,toolchain_version,workspace_root}
+authority          恒为 "advisory"：Code Intelligence 不拥有最终 PASS
+error              失败时 {code,reason}
+```
+
+错误码（提案 §12 冻结）：
+
+```text
+PROVIDER_UNAVAILABLE WORKSPACE_UNRESOLVED INITIALIZATION_FAILED QUERY_INVALID
+SYMBOL_NOT_FOUND RESULT_TRUNCATED TIMEOUT PROVIDER_CRASHED SNAPSHOT_STALE UNSUPPORTED
 ```
 
 ## Non-Responsibilities
@@ -39,8 +91,9 @@ replay            UNKNOWN（MVP 未实现，显式报告）
 - 第三方（均 `default-features = false`，只开所需 feature）：
   - `serde_json`（feature `std`）：结构化 JSON 输出与 Evidence 读写；
   - `toml`（feature `parse`）：解析 `harness.toml` 与 `policies/*.toml`。
-- 外部进程（只读/执行，不解析 ANSI 输出）：`git`（revision、tree digest、hash-object 计算摘要）、`cargo`（fmt/check/clippy/test）、`rustc`（toolchain/target 信息）。
+- 外部进程（只读/执行，不解析 ANSI 输出）：`git`（revision、tree digest、hash-object 计算摘要）、`cargo`（fmt/check/clippy/test）、`rustc`（toolchain/target 信息）、`rust-analyzer`（Code Intelligence 只读语义查询；经手写 JSON-RPC framing 通信，不使用第三方 LSP 库）。
 - 摘要计算复用 `git hash-object`，避免引入密码学依赖（git 是 harness 的硬前置）。
+- `rust-analyzer` 可执行文件解析顺序：`NEXUS_RUST_ANALYZER` → `PATH` → 无；三者皆失败即返回 `BLOCKED` + `PROVIDER_UNAVAILABLE`，不得伪造空结果。
 
 ## Forbidden Dependencies
 
@@ -59,10 +112,15 @@ replay            UNKNOWN（MVP 未实现，显式报告）
 - Evidence 必须绑定 revision / working-tree / config / feature / target / toolchain / platform，并写入 `.evidence/verify-<id>/`。
 - verdict 语义：`PASS / FAIL / STALE / UNKNOWN / BLOCKED`；STALE 证据必须以 `"verdict":"STALE"` 形式落盘，供 `.githooks/pre-push` 检出。
 - 未实现的 gate（bench/replay/coverage 等）必须显式记录 UNKNOWN，不得以 PASS 掩盖。
+- Code Intelligence 只读不变量：客户端只允许发送白名单内的 LSP 方法（`workspace/symbol`、`textDocument/{documentSymbol,hover,definition,typeDefinition,implementation,references,prepareCallHierarchy,diagnostic}`、`callHierarchy/{incomingCalls,outgoingCalls}`）；`rename`、`workspace/applyEdit`、`codeAction` 自动应用、`workspace/willSaveWaitUntil`、格式化写入、任意 `workspace/executeCommand` 一律拒绝并返回 `UNSUPPORTED`。
+- provider 子进程 command/args 不接受模型或调用方拼接的任意 shell 参数（`--provider-binary` 只接受单个可执行文件名或路径，按 `split_whitespace` 之前的整串传入，不经 shell）。
+- `code` 结果必须绑定 `snapshot`（source_revision + working_tree_digest + target + toolchain + workspace root）；查询完成前后 digest 不一致时返回 `SNAPSHOT_STALE`。
+- 命中超过预算时必须 `budget.truncated = true` 并给出 `continuation.refinement_hint`；禁止静默丢弃结果后宣称完整。
+- `code` 永远不产出最终 PASS：`authority` 恒为 `"advisory"`，correctness 仍由 `cargo check/clippy/test` 与 verify Evidence 决定。
 
 ## Side Effects
 
-- 允许：写入 `.evidence/verify-<id>/`（Evidence）；运行只读验证命令（cargo/git）；输出状态。
+- 允许：写入 `.evidence/verify-<id>/`（Evidence）；运行只读验证命令（cargo/git）；输出状态；为 Code Intelligence 启动长期本地子进程 `rust-analyzer`（工作目录限制在仓库/worktree 内，每请求有 timeout/cancellation，stdout/stderr 有大小上限，crash 最多重启一次且必须记入 `provider.restart_count`，命令结束时发送 `shutdown`/`exit`）。
 - 禁止：修改业务代码；修改 `scenarios/` 或 `policies/` 内容；执行网络操作；修改 git index/HEAD。
 - 新增副作用前必须更新本契约和 Scenario/Policy（如影响外部行为）。
 
@@ -83,6 +141,14 @@ nexus-harness verify --fast --json   # 自举验证
 ```
 
 场景（E4，机器可执行）：`scenarios/engineering/harness_verify_fast_evidence.toml`、`scenarios/engineering/harness_status_verdicts.toml`。
+
+Code Intelligence 场景（E4，冻结于 2026-10-10 契约阶段，夹具为
+`engineering/nexus-harness/fixtures/code-intel`）：
+`code_intelligence_symbol.toml`、`code_intelligence_implementations.toml`、
+`code_intelligence_definition.toml`、`code_intelligence_callers.toml`、
+`code_intelligence_hover.toml`、`code_intelligence_diagnostics_advisory.toml`、
+`code_intelligence_budget_truncation.toml`、`code_intelligence_provider_unavailable.toml`、
+`code_intelligence_write_method_denied.toml`。
 
 ### Gate 实现状态（2026-09-15）
 
