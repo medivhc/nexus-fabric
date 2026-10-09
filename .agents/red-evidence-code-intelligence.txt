@@ -1,16 +1,22 @@
 # Red Evidence: Code Intelligence（契约阶段，旧实现）
-# 日期: 2026-10-09T18:39:42Z
-# 实现基线: 696fb68 (nexus-fabric @ fix/windows-cfg-portability)
-# 执行者: qoder-desktop (NEXUS_AGENT=qoder-desktop)
-# 说明: 以下 9 个 E4 场景在【尚未实现 code 命令】的 nexus-harness 上执行，
-#       必须得到 FAIL（expectation 不满足）——这就是 Red Evidence。
+# 日期: 2026-10-10T02:39Z（本地时钟；UTC 见下方 revision）
+# 仓库: nexus-fabric（GitHub medivhc/nexus-fabric 本地克隆）
+# 分支/基线: fix/windows-cfg-portability @ 696fb68（master 8ba9fea + Windows cfg 修复）
+# 执行者: qoder-desktop（NEXUS_AGENT=qoder-desktop）
 # Contract Hash: 096be167075d4a4627e746a667a585fb3e015980
+# source_revision: 696fb68ac9d7c6d676292df4f6876bf8c21b3971
 # working_tree_digest: ecf12e37b24d697a293c839050fe9535e5a9bce3
-# 结果: 9/9 verdict=FAIL（failed_step=expect，实际 command="code" / verdict="BLOCKED"）
-# 冻结内容: 9 个 scenarios/engineering/code_intelligence_*.toml 的 expectation +
-#          engineering/nexus-harness/MODULE.md 的 Code Intelligence Contract 章节
-# 进入实现阶段的条件已满足。
-#       按 nexus-contract-first：无 Red Evidence 不得进入实现阶段。
+#
+# 契约阶段（nexus-contract-first 阶段 A）内容：
+#   1. engineering/nexus-harness/MODULE.md 新增 Code Intelligence Contract 章节
+#      （Agent-facing API、options/预算默认值、扩展字段、10 个错误码、只读白名单）；
+#   2. 新增 deterministic 夹具 engineering/nexus-harness/fixtures/code-intel；
+#   3. 新增 9 个 E4 场景 scenarios/engineering/code_intelligence_*.toml 并冻结 expectation。
+#
+# 结果: 9/9 verdict=FAIL，failed_step=expect，
+#       实际输出 command="code" / verdict="BLOCKED"（"supported commands: …"）。
+#       旧实现不识别 code 子命令 -> 场景不满足，符合 Red Evidence 要求；
+#       按 nexus-contract-first，无 Red Evidence 不得进入实现阶段——条件已满足。
 
 ## engineering.code-intelligence-symbol
 {"command":"scenario run","duration_ms":108,"evidence_id":"scenario-733b0499fe5b","failure_signature":{"assertion":"command","failed_step":"expect","key_log_lines":["{\"command\":\"code\",\"message\":\"supported commands: status, context, check, test, verify, explain, bench, replay, scenario\",\"schema_version\":1,\"verdict\":\"BLOCKED\"}"]},"message":"scenario engineering.code-intelligence-symbol: FAIL (expect engineering.code-intelligence-symbol.command failed (actual: \"code\"))","scenario":"engineering.code-intelligence-symbol","schema_version":1,"verdict":"FAIL"}
