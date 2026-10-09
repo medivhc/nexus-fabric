@@ -18,6 +18,14 @@ use nexus_web_gateway::protocol::{BrowserMessage, NodeMessage};
 
 static CERT_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+/// Serializes WSS gateway port reservation + startup. `reserve_port()`
+/// reserves a loopback port by binding then releasing a listener, so two WSS
+/// mesh tests running in parallel could otherwise grab the same port before
+/// the gateway binds it (observed as intermittent `AddrInUse` in full
+/// workspace runs). Holding this lock across reserve + `Gateway::start` makes
+/// the bind-drop-bind reservation race-free.
+static GATEWAY_START_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Unique per-test certificate directory (tests run in parallel in one process).
 fn unique_cert_dir(node_id: &str) -> String {
     let seq = CERT_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -681,6 +689,7 @@ fn two_nodes_reoffer_storm_returns_error() -> TestResult {
 
 #[test]
 fn wss_mesh_relay_between_two_gateways() -> TestResult {
+    let _gate_lock = GATEWAY_START_LOCK.lock().expect("gateway start lock");
     let port_a = reserve_port();
     let port_b = reserve_port();
     let addr_a: SocketAddr = format!("127.0.0.1:{port_a}").parse().unwrap();
@@ -724,6 +733,7 @@ fn wss_mesh_relay_between_two_gateways() -> TestResult {
 
     let handle_a = Gateway::start(cfg_a)?;
     let _handle_b = Gateway::start(cfg_b)?;
+    drop(_gate_lock);
 
     let mut browser = Browser::connect_first(
         &handle_a.cert_der,
@@ -756,6 +766,7 @@ fn wss_mesh_relay_between_two_gateways() -> TestResult {
 #[test]
 fn wss_mesh_ssh_relay_between_two_gateways() -> TestResult {
     let sshd = TestSshd::spawn()?;
+    let _gate_lock = GATEWAY_START_LOCK.lock().expect("gateway start lock");
     let port_a = reserve_port();
     let port_b = reserve_port();
     let addr_a: SocketAddr = format!("127.0.0.1:{port_a}").parse().unwrap();
@@ -799,6 +810,7 @@ fn wss_mesh_ssh_relay_between_two_gateways() -> TestResult {
 
     let handle_a = Gateway::start(cfg_a)?;
     let _handle_b = Gateway::start(cfg_b)?;
+    drop(_gate_lock);
 
     // Browser joins only node-a (no direct DataChannel to node-b).
     let mut browser = Browser::connect_first(
