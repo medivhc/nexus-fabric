@@ -65,7 +65,9 @@ pub fn run_ssh_client(
         }
     };
     sess.set_tcp_stream(tcp);
-    sess.set_timeout(SSH_IO_TIMEOUT_MS);
+    // Use a generous timeout for handshake/auth/channel setup; the short
+    // poll timeout is only for the bridge loop after the shell is running.
+    sess.set_timeout(10_000);
 
     if let Err(e) = sess.handshake() {
         opened(Err(format!("ssh handshake: {e}")));
@@ -96,6 +98,8 @@ pub fn run_ssh_client(
         opened(Err(format!("start shell: {e}")));
         return;
     }
+    // Channel is up; drop to the short poll timeout for the bridge loop.
+    sess.set_timeout(SSH_IO_TIMEOUT_MS);
 
     // The bridge may have been closed while the channel was being set up (e.g.
     // the browser session dropped). Exit immediately in that case, and do NOT
