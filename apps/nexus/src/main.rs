@@ -24,8 +24,8 @@ use nexus::schedule_cli::{
     schedule_cancel, schedule_every, schedule_list, schedule_tick, unix_now_secs,
 };
 use nexus::subnet_cli::{
-    assemble_default_tunnel, assemble_real_tunnel_for_daemon, classify_tun_error,
-    default_state_path, subnet_leave, subnet_status, subnet_up, subnet_up_tun,
+    allocate_ephemeral_udp_locator, assemble_default_tunnel, assemble_real_tunnel_for_daemon,
+    classify_tun_error, default_state_path, subnet_leave, subnet_status, subnet_up, subnet_up_tun,
 };
 use nexus_control_api::{ControlCommand, ResourceId, SessionId};
 use serde_json::Value;
@@ -552,13 +552,20 @@ fn run_subnet(args: &[String], json_mode: bool) -> i32 {
             }
             if tun {
                 let name = tun_name.unwrap_or_else(|| "nexus0".to_string());
-                let lsn = listen.unwrap_or_else(|| "udp://0.0.0.0:0".to_string());
-                match subnet_up_tun(&cfg, &state_path, &name, &lsn) {
-                    Ok(v) => v,
+                // WARNING-3：`UdpCarrier::bind` 硬拒 port 0，缺省时向 OS 借一个
+                // 空闲端口，而不是给一个注定失败的 `udp://0.0.0.0:0`。
+                match listen
+                    .map(Ok)
+                    .unwrap_or_else(nexus::subnet_cli::allocate_ephemeral_udp_locator)
+                {
+                    Ok(lsn) => match subnet_up_tun(&cfg, &state_path, &name, &lsn) {
+                        Ok(v) => v,
+                        Err(e) => nexus::subnet_cli::classify_tun_error(&e),
+                    },
                     Err(e) => nexus::subnet_cli::classify_tun_error(&e),
                 }
             } else {
-                match subnet_up(&cfg, &state_path, encrypt_state) {
+                match subnet_up(&cfg, &state_path, encrypt_state, false) {
                     Ok(v) => v,
                     Err(e) => serde_json::json!({
                         "verdict": "CONFIG_ERROR",
@@ -622,17 +629,43 @@ fn subnet_foreground(
 ) -> i32 {
     let result: Result<u8, (String, String)> = if use_tun {
         let name = tun_name.unwrap_or_else(|| "nexus0".to_string());
-        let lsn = listen.unwrap_or_else(|| "udp://0.0.0.0:0".to_string());
+        // WARNING-3：`UdpCarrier::bind` 硬拒 port 0（udp_carrier.rs:56），原先的
+        // `udp://0.0.0.0:0` 默认值必定 TUN_ERROR。缺省时先问 OS 要一个空闲端口，
+        // 再把它作为显式 listen 交给真实装配路径。
+        let lsn = match listen {
+            Some(l) => l,
+            None => match allocate_ephemeral_udp_locator() {
+                Ok(l) => l,
+                Err(e) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "verdict": "TUN_ERROR",
+                            "command": "subnet up",
+                            "error": e,
+                        })
+                    );
+                    return 0;
+                }
+            },
+        };
         subnet_foreground_real(cfg, state_path, encrypt, &name, &lsn)
     } else {
         (|| {
             let tunnel =
                 assemble_default_tunnel(cfg).map_err(|e| ("CONFIG_ERROR".to_string(), e))?;
-            let up =
-                subnet_up(cfg, state_path, encrypt).map_err(|e| ("CONFIG_ERROR".to_string(), e))?;
+            // CRITICAL-3：本函数就是 `subnet up --foreground` 的实现，必须以
+            // foreground=true 调用 subnet_up，否则会被它自己的 S6 门禁判为
+            // "非前台" 并报 BOOTSTRAP_REQUIRES_FOREGROUND（用户加了
+            // --foreground 却被要求加 --foreground）。
+            let up = subnet_up(cfg, state_path, encrypt, true)
+                .map_err(|e| ("CONFIG_ERROR".to_string(), e))?;
             println!("{up}");
             // Auto-Mesh 自动挡：自动打洞 + 断线自动重连。
             let mut mesh = AutoMeshController::new(tunnel, 500);
+            if let Some(path) = bootstrap_lease_state_path_for(cfg) {
+                mesh.set_lease_state_path(path);
+            }
 
             // crash 恢复：从磁盘加载已发现的 peer
             let mesh_state = state_path.with_extension("mesh.json");
@@ -688,7 +721,7 @@ fn subnet_foreground_real(
         }
     };
     let mut up =
-        subnet_up(cfg, state_path, encrypt).map_err(|e| ("CONFIG_ERROR".to_string(), e))?;
+        subnet_up(cfg, state_path, encrypt, true).map_err(|e| ("CONFIG_ERROR".to_string(), e))?;
     if let Some(obj) = up.as_object_mut() {
         obj.insert("local_locator".into(), serde_json::json!(local_locator));
     }
@@ -696,6 +729,9 @@ fn subnet_foreground_real(
     // Auto-Mesh 自动挡：自动打洞 + 断线自动重连。
     // 持有真实隧道直到函数返回（drop 清理 wintun/tun 适配器与 UDP socket）。
     let mut mesh = AutoMeshController::new(tunnel, 500);
+    if let Some(path) = bootstrap_lease_state_path_for(cfg) {
+        mesh.set_lease_state_path(path);
+    }
 
     // crash 恢复：从磁盘加载已发现的 peer
     let mesh_state = state_path.with_extension("mesh.json");
@@ -705,6 +741,19 @@ fn subnet_foreground_real(
     let mesh_state_clone = mesh_state.clone();
     mesh.run_with_save(move || !state_path_owned.exists(), Some(mesh_state_clone));
     Ok(0)
+}
+
+/// 引导服务端角色的 VIP 租约落盘路径（§6.6）；配置未启用服务端角色 → `None`。
+///
+/// 配置读取失败返回 `None`（不阻断启动）：本函数只为落盘定路径，真正的配置校验
+/// 由 `assemble_real_tunnel*` / `parse_config` 在装配期 fail-closed 完成。
+fn bootstrap_lease_state_path_for(cfg: &std::path::Path) -> Option<std::path::PathBuf> {
+    let bs = nexus::subnet_cli::parse_config_public(cfg)
+        .ok()?
+        .subnet
+        .bootstrap_server
+        .filter(|b| b.enabled)?;
+    Some(nexus::subnet_cli::bootstrap_lease_state_path_for(&bs))
 }
 
 /// `schedule at|every|list|cancel|tick`：进程内 SDK（LocalAPI 无 schedule 路由，
@@ -1904,5 +1953,56 @@ mod tests {
         let _ = accept_h.join();
         // exit 0 表示诊断完成（verdict 在 JSON 里，loopback 应为 NO_BLOAT_UPSTREAM）。
         assert_eq!(code, 0);
+    }
+}
+
+/// 评审 r1 CRITICAL-3 回归：`subnet_foreground` 必须以 `foreground=true` 调
+/// `subnet_up`，否则被其自身 S6 门禁判为非前台（用户加了 `--foreground`
+/// 却被要求加 `--foreground`）。
+#[cfg(test)]
+mod review_r1_foreground_regression {
+    /// 从 main.rs 源码里取 `subnet_foreground` 传给 `subnet_up` 的第 4 个实参。
+    ///
+    /// 该缺陷是纯调用点传参错误（无法在不改 main 结构的前提下直接单测），
+    /// 故对源码做窄范围断言：只检查 `subnet_foreground` 函数体，不受别处影响。
+    #[test]
+    fn subnet_foreground_passes_foreground_true() {
+        let src = include_str!("main.rs");
+        let start = src
+            .find("fn subnet_foreground(")
+            .expect("subnet_foreground must exist");
+        let body = &src[start..];
+        let end = body
+            .find("\nfn subnet_foreground_real(")
+            .expect("subnet_foreground_real follows subnet_foreground");
+        let body = &body[..end];
+        assert!(
+            !body.contains("subnet_up(cfg, state_path, encrypt, false)"),
+            "subnet_foreground must not pass foreground=false"
+        );
+        assert!(
+            body.contains("subnet_up(cfg, state_path, encrypt, true)"),
+            "subnet_foreground must pass foreground=true"
+        );
+    }
+
+    /// `--tun` 缺省 listen 不得再回落成 `udp://0.0.0.0:0`（WARNING-3：
+    /// `UdpCarrier::bind` 硬拒 port 0，用户不写 --listen 必定 TUN_ERROR）。
+    #[test]
+    fn tun_path_no_longer_defaults_to_port_zero() {
+        // 只看生产代码段（本测试模块自身含该字面量，故先截断）。
+        let src = include_str!("main.rs");
+        let prod = match src.find("#[cfg(test)]\nmod review_r1_foreground_regression") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        assert!(
+            !prod.contains("\"udp://0.0.0.0:0\""),
+            "the port-0 default locator must be gone from production code"
+        );
+        assert!(
+            prod.contains("allocate_ephemeral_udp_locator"),
+            "both --tun paths must borrow an ephemeral port instead"
+        );
     }
 }

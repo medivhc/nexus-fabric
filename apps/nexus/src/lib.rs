@@ -18,6 +18,8 @@ pub mod artifact_download;
 #[cfg(target_os = "linux")]
 mod artifact_download_fs;
 
+/// Bootstrap 帧编解码组合根适配（connectivity 解耦类型 <-> discovery 字节，v2 §5.5）。
+pub mod bootstrap_codec;
 /// CLI 前端 ControlService（17 命令接线 + --json 双输出 + exit 语义）。
 pub mod control_service;
 pub mod geoip_sources;
@@ -6572,12 +6574,12 @@ pub fn identity_auto_exchange_flow() -> Result<Value, NexusError> {
             message: format!("begin_handshake: {e}"),
         })?;
     tunnel_b
-        .recv_and_deliver(&mut buf)
+        .recv_and_deliver(&mut buf, 1000)
         .map_err(|e| NexusError::Internal {
             message: format!("b accept: {e}"),
         })?;
     tunnel_a
-        .recv_and_deliver(&mut buf)
+        .recv_and_deliver(&mut buf, 1000)
         .map_err(|e| NexusError::Internal {
             message: format!("a complete: {e}"),
         })?;
@@ -6618,7 +6620,7 @@ pub fn identity_auto_exchange_flow() -> Result<Value, NexusError> {
             message: format!("send: {e}"),
         })?;
     if tunnel_b
-        .recv_and_deliver(&mut buf)
+        .recv_and_deliver(&mut buf, 1000)
         .map_err(|e| NexusError::Internal {
             message: format!("b recv: {e}"),
         })?
@@ -6637,12 +6639,12 @@ pub fn identity_auto_exchange_flow() -> Result<Value, NexusError> {
             message: format!("re-begin: {e}"),
         })?;
     tunnel_b
-        .recv_and_deliver(&mut buf)
+        .recv_and_deliver(&mut buf, 1000)
         .map_err(|e| NexusError::Internal {
             message: format!("re-b accept: {e}"),
         })?;
     tunnel_a
-        .recv_and_deliver(&mut buf)
+        .recv_and_deliver(&mut buf, 1000)
         .map_err(|e| NexusError::Internal {
             message: format!("re-a complete: {e}"),
         })?;
@@ -6672,7 +6674,7 @@ pub fn identity_auto_exchange_flow() -> Result<Value, NexusError> {
             message: format!("c begin to A: {e}"),
         })?;
     // A 侧 accept 时 TOFU 校验失败 -> IdentityRejected（不发送 RESP）。
-    let mismatch_rejected = match tunnel_a.recv_and_deliver(&mut buf) {
+    let mismatch_rejected = match tunnel_a.recv_and_deliver(&mut buf, 1000) {
         Err(nexus_connectivity::ConnectivityError::IdentityRejected { .. }) => true,
         other => {
             return Err(NexusError::Internal {
@@ -6786,12 +6788,12 @@ pub fn virtual_subnet_encrypted_3node_flow() -> Result<Value, NexusError> {
         })?;
     let mut buf = [0u8; 4096];
     let _ = tunnel_b
-        .recv_and_deliver(&mut buf)
+        .recv_and_deliver(&mut buf, 1000)
         .map_err(|e| NexusError::Internal {
             message: format!("b accept: {e}"),
         })?;
     let _ = tunnel_a
-        .recv_and_deliver(&mut buf)
+        .recv_and_deliver(&mut buf, 1000)
         .map_err(|e| NexusError::Internal {
             message: format!("a complete: {e}"),
         })?;
@@ -6803,12 +6805,12 @@ pub fn virtual_subnet_encrypted_3node_flow() -> Result<Value, NexusError> {
             message: format!("begin_handshake: {e}"),
         })?;
     let _ = tunnel_c
-        .recv_and_deliver(&mut buf)
+        .recv_and_deliver(&mut buf, 1000)
         .map_err(|e| NexusError::Internal {
             message: format!("c accept: {e}"),
         })?;
     let _ = tunnel_b
-        .recv_and_deliver(&mut buf)
+        .recv_and_deliver(&mut buf, 1000)
         .map_err(|e| NexusError::Internal {
             message: format!("b complete: {e}"),
         })?;
@@ -6843,11 +6845,12 @@ pub fn virtual_subnet_encrypted_3node_flow() -> Result<Value, NexusError> {
         || wire_ab.windows(2).any(|w| w == b"->");
 
     // B 收（解密 seq0，转发给 C 时重加密）
-    let b_delivered = tunnel_b
-        .recv_and_deliver(&mut buf)
-        .map_err(|e| NexusError::Internal {
-            message: format!("b recv: {e}"),
-        })?;
+    let b_delivered =
+        tunnel_b
+            .recv_and_deliver(&mut buf, 1000)
+            .map_err(|e| NexusError::Internal {
+                message: format!("b recv: {e}"),
+            })?;
     if b_delivered.is_none() {
         return Err(NexusError::Internal {
             message: "B did not receive A frame".to_string(),
@@ -6859,11 +6862,12 @@ pub fn virtual_subnet_encrypted_3node_flow() -> Result<Value, NexusError> {
         .unwrap_or(0);
 
     // C 收（解密，写 VPI）
-    let c_delivered = tunnel_c
-        .recv_and_deliver(&mut buf)
-        .map_err(|e| NexusError::Internal {
-            message: format!("c recv: {e}"),
-        })?;
+    let c_delivered =
+        tunnel_c
+            .recv_and_deliver(&mut buf, 1000)
+            .map_err(|e| NexusError::Internal {
+                message: format!("c recv: {e}"),
+            })?;
     let c_vpi_len = c_delivered.map(|(_, l)| l).unwrap_or(0);
     let c_vpi_payload = String::from_utf8_lossy(&c_vpi_sent.lock().unwrap()).to_string();
     if c_vpi_payload != "ping-from-a-to-c" {
@@ -6874,7 +6878,7 @@ pub fn virtual_subnet_encrypted_3node_flow() -> Result<Value, NexusError> {
 
     // 防重放：重放 A→B 同一密文帧 → B 拒绝（REPLAY_REJECTED）
     b_recv.lock().unwrap().extend_from_slice(&wire_ab);
-    let replay_err = tunnel_b.recv_and_deliver(&mut buf);
+    let replay_err = tunnel_b.recv_and_deliver(&mut buf, 1000);
     let replay_rejected = matches!(
         replay_err,
         Err(nexus_connectivity::ConnectivityError::Invalid { ref message })
@@ -8241,7 +8245,7 @@ pub fn coord_join_loopback_flow() -> Result<Value, NexusError> {
             message: format!("a send: {e}"),
         })?;
     let mut buf = [0u8; 4096];
-    let a_to_b_delivered = match tunnel_b.recv_and_deliver(&mut buf) {
+    let a_to_b_delivered = match tunnel_b.recv_and_deliver(&mut buf, 1000) {
         Ok(Some((sender, len))) => sender == b_learned_peer_a_vip && len == b"ping-a-to-b".len(),
         other => {
             return Err(NexusError::Internal {
@@ -8256,7 +8260,7 @@ pub fn coord_join_loopback_flow() -> Result<Value, NexusError> {
         .map_err(|e| NexusError::Internal {
             message: format!("b send: {e}"),
         })?;
-    let b_to_a_delivered = match tunnel_a.recv_and_deliver(&mut buf) {
+    let b_to_a_delivered = match tunnel_a.recv_and_deliver(&mut buf, 1000) {
         Ok(Some((sender, len))) => sender == a_learned_peer_b_vip && len == b"ping-b-to-a".len(),
         other => {
             return Err(NexusError::Internal {
@@ -8402,7 +8406,7 @@ pub fn cross_subnet_flow() -> Result<Value, NexusError> {
             message: format!("office send: {e}"),
         })?;
     let mut buf = [0u8; 4096];
-    let office_delivered = match tunnel_b.recv_and_deliver(&mut buf) {
+    let office_delivered = match tunnel_b.recv_and_deliver(&mut buf, 1000) {
         Ok(Some((sender, len))) => sender == "10.99.0.1" && len == b"office-packet".len(),
         other => {
             return Err(NexusError::Internal {
@@ -8421,7 +8425,7 @@ pub fn cross_subnet_flow() -> Result<Value, NexusError> {
         .map_err(|e| NexusError::Internal {
             message: format!("egress send: {e}"),
         })?;
-    let egress_delivered = match tunnel_b.recv_and_deliver(&mut buf) {
+    let egress_delivered = match tunnel_b.recv_and_deliver(&mut buf, 1000) {
         Ok(Some((sender, len))) => sender == "10.99.0.1" && len == b"egress-packet".len(),
         other => {
             return Err(NexusError::Internal {
@@ -8728,10 +8732,10 @@ locator = "udp://127.0.0.1:42001"
     .map_err(|e| NexusError::Internal { message: e })?;
 
     // up（首次）
-    let up_json =
-        subnet_up(&cfg_ok, &state, false).map_err(|e| NexusError::Internal { message: e })?;
+    let up_json = subnet_up(&cfg_ok, &state, false, false)
+        .map_err(|e| NexusError::Internal { message: e })?;
     // up 幂等（同 vip 覆盖，仍成功）
-    subnet_up(&cfg_ok, &state, false).map_err(|e| NexusError::Internal { message: e })?;
+    subnet_up(&cfg_ok, &state, false, false).map_err(|e| NexusError::Internal { message: e })?;
     let up = up_json.get("subnet").cloned().unwrap_or_default();
 
     // status（读回）
@@ -8766,8 +8770,8 @@ locator = "udp://127.0.0.1:42001"
 
     // ---- P3.4 加密状态（§12.31）：--encrypt-state 加密落盘 + status 解密读回 ----
     let state_sec = dir.join("subnet-state-secure.json");
-    let enc_up_json =
-        subnet_up(&cfg_ok, &state_sec, true).map_err(|e| NexusError::Internal { message: e })?;
+    let enc_up_json = subnet_up(&cfg_ok, &state_sec, true, false)
+        .map_err(|e| NexusError::Internal { message: e })?;
     let enc_up_ok = enc_up_json
         .get("subnet")
         .and_then(|s| s.get("up"))
@@ -8826,7 +8830,7 @@ locator = "udp://127.0.0.1:42001"
 
     // 四类非法配置
     let classify = |path: &PathBuf| -> String {
-        match subnet_up(path, &state, false) {
+        match subnet_up(path, &state, false, false) {
             Err(_) => "CONFIG_ERROR".to_string(),
             Ok(_) => "ACCEPTED".to_string(),
         }
@@ -9481,7 +9485,7 @@ encryption = true
 address = "udp://203.0.113.10:11010"
 "#,
     )?;
-    let psk_required_err = match subnet_up(&cfg_no_psk, &state, false) {
+    let psk_required_err = match subnet_up(&cfg_no_psk, &state, false, false) {
         Err(e) if e.contains("PSK_REQUIRED") => "PSK_REQUIRED",
         Err(e) => {
             return Err(NexusError::Internal {
@@ -9510,7 +9514,11 @@ network_psk = "test-psk-001"
 address = "udp://203.0.113.10:11010"
 "#,
     )?;
-    subnet_up(&cfg_psk, &state, false).map_err(|e| NexusError::Internal {
+    // 走 foreground=true：S6（设计 §7.3）规定一次性 `subnet up` 配了 bootstrap
+    // 必须报 BOOTSTRAP_REQUIRES_FOREGROUND，故"bootstrap + PSK 可被接受"这一条
+    // 只能在常驻前台语义下成立。PSK 校验本身在 parse_config 内、先于 S6 门禁，
+    // 上一步（无 PSK -> PSK_REQUIRED）因此不受影响。
+    subnet_up(&cfg_psk, &state, false, true).map_err(|e| NexusError::Internal {
         message: format!("decentralized join: bootstrap+psk rejected: {e}"),
     })?;
     events.push("bootstrap_psk_ok");
@@ -9529,7 +9537,7 @@ virtual_ip = "10.99.0.2"
 locator = "udp://127.0.0.1:42001"
 "#,
     )?;
-    subnet_up(&cfg_legacy, &state, false).map_err(|e| NexusError::Internal {
+    subnet_up(&cfg_legacy, &state, false, false).map_err(|e| NexusError::Internal {
         message: format!("decentralized join: legacy config rejected: {e}"),
     })?;
     events.push("legacy_config_unchanged");
@@ -11837,5 +11845,396 @@ mod hysteria2_dataplane_tests {
         assert_eq!(&buf[..n], b"hello-hy2");
         client.stream_finish(stream);
         client.close();
+    }
+}
+
+/// P4（v2 §11）：真实 UDP loopback 入网驱动。
+///
+/// 1 个引导节点（BootstrapServer，UDP :11010）+ 2 个新节点（零静态 peer，
+/// 仅配 bootstrap 地址 + PSK），全程走真实 `UdpCarrier` socket（127.0.0.1 不同端口），
+/// 验证：JoinInit/JoinReply PSK 认证 + VIP 分配、GetPeers/PeerList 互见、心跳维持租约、
+/// 停节点后 TTL 过期回收。不依赖 TUN/root/跨机。
+/// P4 真实 UDP loopback 驱动使用的三个显式端口（UdpCarrier 拒绝 port 0）。
+#[derive(Debug, Clone, Copy)]
+pub struct LoopbackPorts {
+    pub server: u16,
+    pub a: u16,
+    pub b: u16,
+}
+
+impl Default for LoopbackPorts {
+    fn default() -> Self {
+        Self {
+            server: 11010,
+            a: 11101,
+            b: 11102,
+        }
+    }
+}
+
+pub fn bootstrap_udp_loopback_flow() -> Result<serde_json::Value, NexusError> {
+    bootstrap_udp_loopback_flow_with(LoopbackPorts::default())
+}
+
+pub fn bootstrap_udp_loopback_flow_with(
+    ports: LoopbackPorts,
+) -> Result<serde_json::Value, NexusError> {
+    use nexus_connectivity::bootstrap_joiner::{
+        BootstrapEndpoint, BootstrapJoiner, ClientBootstrapHook,
+    };
+    use nexus_connectivity::bootstrap_server::{BootstrapServer, BootstrapServerConfig};
+    use nexus_connectivity::encryption::KeyPair;
+    use nexus_connectivity::virtual_subnet::BootstrapHook;
+    use nexus_platform::{PacketCarrier, UdpCarrier};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    fn err(m: impl Into<String>) -> NexusError {
+        NexusError::Internal { message: m.into() }
+    }
+
+    let psk = b"p4-loopback-psk".to_vec();
+    let now = Arc::new(AtomicU64::new(1_000u64));
+
+    // ---- 引导服务端：真实 UDP socket ----
+    let server_identity = KeyPair::from_seed(&[7u8; 32]);
+    let srv_locator = format!("udp://127.0.0.1:{}", ports.server);
+    let cfg = BootstrapServerConfig {
+        cidr: "10.144.144.0/24".into(),
+        lease_secs: 100_000,
+        hb_interval_ms: 5_000,
+        refresh_interval_ms: 10_000,
+        server_vip: "10.144.144.1".into(),
+        server_locator: srv_locator.clone(),
+        max_pending_per_src: 4,
+    };
+    let codec = crate::bootstrap_codec::DiscoveryBootstrapCodec::new();
+    let mut server = BootstrapServer::new(server_identity, psk.clone(), cfg, Box::new(codec), None)
+        .map_err(|e| err(format!("server new: {e}")))?;
+    server.upsert_self_entry(now.load(Ordering::SeqCst));
+
+    let mut srv_carrier = UdpCarrier::new();
+    srv_carrier
+        .bind(&srv_locator)
+        .map_err(|e| err(format!("srv bind: {e}")))?;
+
+    let srv = Arc::new(Mutex::new(server));
+    let srv_sock = Arc::new(Mutex::new(srv_carrier));
+    let srv_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let srv_now = now.clone();
+    let srv_handle = std::thread::spawn({
+        let srv = srv.clone();
+        let sock = srv_sock.clone();
+        let stop = srv_stop.clone();
+        move || {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let mut sv = srv.lock().unwrap();
+                let mut sk = sock.lock().unwrap();
+                match sk.receive_into(&mut buf) {
+                    Ok(0) => {
+                        drop(sk);
+                        drop(sv);
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Ok(n) => {
+                        let src = sk.last_peer_locator().unwrap_or_default();
+                        let t = srv_now.load(Ordering::SeqCst);
+                        if let Some((dst, bytes)) = sv.handle_datagram(&src, &buf[..n], t) {
+                            let _ = sk.send_to(&dst, &bytes);
+                        }
+                    }
+                    Err(_) => {
+                        drop(sk);
+                        drop(sv);
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                }
+            }
+        }
+    });
+    let _ = srv_handle;
+
+    // ---- 客户端 helper：发 hook.periodic 出站并泵回收包 ----
+    fn pump_client(
+        carrier: &mut UdpCarrier,
+        hook: &mut ClientBootstrapHook,
+        now: u64,
+    ) -> Vec<String> {
+        let mut all_events = Vec::new();
+        let tick = hook.periodic(now);
+        for (dst, bytes) in &tick.datagrams {
+            let _ = carrier.send_to(dst, bytes);
+        }
+        all_events.extend(tick.events);
+        // 有界等待回收包（PeerList/ack）。
+        let mut buf = vec![0u8; 65535];
+        let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+        while std::time::Instant::now() < deadline {
+            match carrier.receive_into(&mut buf) {
+                Ok(0) => std::thread::sleep(Duration::from_millis(2)),
+                Ok(n) => {
+                    let d = &buf[..n];
+                    if d.strip_prefix(b"nxb:").is_some() {
+                        hook.on_control_datagram(None, &d[4..], now);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        all_events
+    }
+
+    // ---- 客户端 A：零静态 peer，只配 bootstrap + PSK ----
+    let id_a = KeyPair::from_seed(&[11u8; 32]);
+    let a_bind = format!("udp://127.0.0.1:{}", ports.a);
+    let mut ca = UdpCarrier::new();
+    ca.bind(&a_bind).map_err(|e| err(format!("A bind: {e}")))?;
+    let codec_a = crate::bootstrap_codec::DiscoveryBootstrapCodec::new();
+    let eps = [BootstrapEndpoint {
+        server_locator: srv_locator.clone(),
+    }];
+    let (sess_a, peers_a0) = {
+        let mut j = BootstrapJoiner::new(&mut ca, &id_a, &psk, &codec_a);
+        j.join(&eps, None, now.load(Ordering::SeqCst), 3_000)
+            .map_err(|e| err(format!("A join: {e:?}")))?
+    };
+    let vip_a = sess_a.assigned_vip.clone();
+    let mut hook_a = ClientBootstrapHook::new(sess_a, Box::new(codec_a), peers_a0);
+
+    // ---- 客户端 B ----
+    let id_b = KeyPair::from_seed(&[22u8; 32]);
+    let b_bind = format!("udp://127.0.0.1:{}", ports.b);
+    let mut cb = UdpCarrier::new();
+    cb.bind(&b_bind).map_err(|e| err(format!("B bind: {e}")))?;
+    let codec_b = crate::bootstrap_codec::DiscoveryBootstrapCodec::new();
+    let (sess_b, peers_b0) = {
+        let mut j = BootstrapJoiner::new(&mut cb, &id_b, &psk, &codec_b);
+        j.join(&eps, None, now.load(Ordering::SeqCst), 3_000)
+            .map_err(|e| err(format!("B join: {e:?}")))?
+    };
+    let vip_b = sess_b.assigned_vip.clone();
+    let _ = peers_b0;
+
+    // ---- A 刷新 -> 应看到服务端 + B（在线目录互见；refresh_interval=10s）----
+    now.fetch_add(11_000, Ordering::SeqCst);
+    let _ = pump_client(&mut ca, &mut hook_a, now.load(Ordering::SeqCst));
+    let peers_a_now: Vec<String> = hook_a
+        .known_peers_snapshot()
+        .iter()
+        .map(|p| p.virtual_ip.clone())
+        .collect();
+    let a_sees_server = peers_a_now.contains(&"10.144.144.1".to_string());
+    let a_sees_b = peers_a_now.contains(&vip_b);
+
+    // ---- A 心跳维持租约（hb_interval=5s；推进 now 服务端收到 heartbeat 续期）----
+    now.fetch_add(6_000, Ordering::SeqCst);
+    let _ = pump_client(&mut ca, &mut hook_a, now.load(Ordering::SeqCst));
+
+    // ---- P2P：A/B 互见后经真实 UDP 建加密隧道 ----
+    // 从 hook 在线目录取 B 的真实 loopback locator（服务端观测到的源地址）。
+    let b_locator = hook_a
+        .known_peers_snapshot()
+        .into_iter()
+        .find(|p| p.virtual_ip == vip_b)
+        .map(|p| p.locator)
+        .ok_or_else(|| err("P2P: B locator not in PeerList"))?;
+    let a_locator = a_bind.clone();
+
+    use nexus_connectivity::encryption::EncryptionConfig;
+    use nexus_connectivity::virtual_subnet::{
+        TunnelPeer, TunnelState, VirtualSubnetConfig, VirtualSubnetTunnel,
+    };
+    use nexus_platform::VirtualPacketInterface;
+    struct CapVpi {
+        got: Arc<Mutex<Vec<u8>>>,
+    }
+    impl VirtualPacketInterface for CapVpi {
+        fn receive(
+            &mut self,
+            _o: &mut [u8],
+        ) -> std::result::Result<usize, nexus_platform::PlatformError> {
+            Ok(0)
+        }
+        fn send(&mut self, p: &[u8]) -> std::result::Result<(), nexus_platform::PlatformError> {
+            self.got.lock().unwrap().extend_from_slice(p);
+            Ok(())
+        }
+    }
+    let b_got: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![]));
+    let vpi_b = CapVpi { got: b_got.clone() };
+    let vpi_a = CapVpi {
+        got: Arc::new(Mutex::new(vec![])),
+    };
+    let mut tunnel_a = VirtualSubnetTunnel::new(
+        VirtualSubnetConfig::new("10.144.144.0/24", vip_a.clone()),
+        Box::new(vpi_a),
+        Box::new(ca),
+    );
+    let mut tunnel_b = VirtualSubnetTunnel::new(
+        VirtualSubnetConfig::new("10.144.144.0/24", vip_b.clone()),
+        Box::new(vpi_b),
+        Box::new(cb),
+    );
+    tunnel_a.set_bootstrap_hook(Some(Box::new(hook_a)));
+    tunnel_a
+        .add_peer(TunnelPeer::new(vip_b.clone(), b_locator.clone()))
+        .map_err(|e| err(format!("add_peer: {e:?}")))?;
+    tunnel_b
+        .add_peer(TunnelPeer::new(vip_a.clone(), a_locator.clone()))
+        .map_err(|e| err(format!("add_peer: {e:?}")))?;
+    tunnel_a.enable_encryption(EncryptionConfig::default());
+    tunnel_b.enable_encryption(EncryptionConfig::default());
+    tunnel_a
+        .begin_handshake(&vip_b)
+        .map_err(|e| err(format!("handshake: {e:?}")))?;
+
+    // 有界驱动：两端 recv_and_deliver 直至双向 Connected。
+    let mut buf = vec![0u8; 65535];
+    let handshake_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut p2p_connected = false;
+    while std::time::Instant::now() < handshake_deadline {
+        let _ = tunnel_a.recv_and_deliver(&mut buf, now.load(Ordering::SeqCst));
+        let _ = tunnel_b.recv_and_deliver(&mut buf, now.load(Ordering::SeqCst));
+        if tunnel_a.peer_state(&vip_b) == Some(TunnelState::Connected)
+            && tunnel_b.peer_state(&vip_a) == Some(TunnelState::Connected)
+        {
+            p2p_connected = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // 真实 AEAD 数据：A -> B。
+    let payload = b"p4-real-udp-aead-payload";
+    tunnel_a
+        .send_ip_packet(&vip_b, payload)
+        .map_err(|e| err(format!("send: {e:?}")))?;
+    let mut got_len = 0usize;
+    let data_deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < data_deadline {
+        if let Some((_src, n)) = tunnel_b
+            .recv_and_deliver(&mut buf, now.load(Ordering::SeqCst))
+            .map_err(|e| err(format!("recv: {e:?}")))?
+        {
+            got_len = n;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let vpi_bytes = b_got.lock().unwrap().clone();
+    // 隧道交付到 VPI 的是剥净帧头后的原始载荷，须与发送载荷逐字节一致。
+    let p2p_payload_matches = vpi_bytes == payload[..];
+
+    // ---- 停 B 心跳，推进 now 越过 lease(100000s)，服务端 sweep 应回收 B ----
+    now.fetch_add(92_000, Ordering::SeqCst);
+    // A 再 bootstrap_tick 保活自身（经 tunnel send_raw）；服务端自身条目重续。
+    let _ = tunnel_a.bootstrap_tick(now.load(Ordering::SeqCst));
+    {
+        let mut sv = srv.lock().unwrap();
+        sv.upsert_self_entry(now.load(Ordering::SeqCst));
+    }
+    let report = {
+        let mut sv = srv.lock().unwrap();
+        sv.sweep_expired(now.load(Ordering::SeqCst))
+    };
+    let expired_ids = report.expired.clone();
+    let released_ids = report.released_vips.clone();
+    let leases_after: Vec<String> = srv
+        .lock()
+        .unwrap()
+        .leases_snapshot(now.load(Ordering::SeqCst))
+        .iter()
+        .map(|(_, v)| v.clone())
+        .collect();
+    let b_in_directory = leases_after.contains(&vip_b);
+    let a_in_directory = leases_after.contains(&vip_a);
+    let b_evicted_after_lease = !b_in_directory;
+
+    // ---- 硬门：任一关键断言失败即 Err，不产出 PASS ----
+    if !a_sees_server {
+        return Err(err(format!(
+            "gate: A did not see server; peers={peers_a_now:?}"
+        )));
+    }
+    if !a_sees_b {
+        return Err(err(format!("gate: A did not see B; peers={peers_a_now:?}")));
+    }
+    if !p2p_connected {
+        return Err(err("gate: P2P tunnels not Connected between A/B"));
+    }
+    if !p2p_payload_matches {
+        return Err(err(format!(
+            "gate: P2P payload mismatch; got={vpi_bytes:?} expected tail={payload:?}"
+        )));
+    }
+    if !b_evicted_after_lease {
+        return Err(err(format!(
+            "gate: B not evicted after lease; leases={leases_after:?}"
+        )));
+    }
+    if !a_in_directory {
+        return Err(err(format!(
+            "gate: A unexpectedly dropped; leases={leases_after:?}"
+        )));
+    }
+    if !expired_ids
+        .iter()
+        .any(|id| id.ends_with("e82c0d763cb9fdcf"))
+    {
+        return Err(err(format!(
+            "gate: B node_id not in expired; expired={expired_ids:?}"
+        )));
+    }
+
+    // 优雅停机：通知服务端线程退出，释放监听端口。
+    srv_stop.store(true, Ordering::SeqCst);
+    let _ = srv_handle.join();
+
+    Ok(serde_json::json!({
+        "verdict": "PASS",
+        "command": "run",
+        "scenario": "bootstrap-udp-loopback",
+        "server": { "udp": format!("127.0.0.1:{}", ports.server), "vip": "10.144.144.1" },
+        "client_a": { "udp": format!("127.0.0.1:{}", ports.a), "assigned_vip": vip_a, "sees_server": a_sees_server, "sees_peer_b": a_sees_b },
+        "client_b": { "udp": format!("127.0.0.1:{}", ports.b), "assigned_vip": vip_b },
+        "peers_a_after_refresh": peers_a_now,
+        "b_evicted_after_lease": !b_in_directory,
+        "p2p_connected": p2p_connected,
+        "p2p_data_len": got_len,
+        "p2p_payload_matches": p2p_payload_matches,
+        "p2p_a_locator": a_locator,
+        "p2p_b_locator": b_locator,
+        "expired_ids": expired_ids,
+        "released_ids": released_ids,
+        "b_still_in_directory": b_in_directory,
+        "a_still_in_directory": a_in_directory,
+        "leases_after": leases_after,
+    }))
+}
+
+#[cfg(test)]
+mod p4_udp_loopback_tests {
+    use super::*;
+
+    /// P4 自动门：真实 UDP loopback 全链路（控制面 + P2P 加密数据面）。
+    /// 用独特高端口避免与其他并行测试冲突；flow 内部已做硬门 + 优雅停机。
+    #[test]
+    fn bootstrap_udp_loopback_real_socket() {
+        let ports = LoopbackPorts {
+            server: 17011,
+            a: 17111,
+            b: 17112,
+        };
+        let v = bootstrap_udp_loopback_flow_with(ports)
+            .expect("bootstrap udp loopback flow should PASS all hard gates");
+        assert_eq!(v["verdict"], "PASS");
+        assert_eq!(v["p2p_connected"], serde_json::json!(true));
+        assert_eq!(v["p2p_payload_matches"], serde_json::json!(true));
+        assert_eq!(v["b_evicted_after_lease"], serde_json::json!(true));
     }
 }

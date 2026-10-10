@@ -57,7 +57,7 @@ fn pick_port() -> u16 {
 fn punch_empty_targets_errors() {
     let cfg = write_cfg("empty", Some("10.0.0.2"));
     let state = state_path("empty");
-    subnet_up(&cfg, &state, false).unwrap();
+    subnet_up(&cfg, &state, false, false).unwrap();
     let err = subnet_punch(&cfg, &state, "10.0.0.2", &[], "udp://127.0.0.1:0", 10)
         .expect_err("empty targets must fail");
     assert!(
@@ -70,7 +70,7 @@ fn punch_empty_targets_errors() {
 fn punch_zero_attempts_errors() {
     let cfg = write_cfg("zero", Some("10.0.0.2"));
     let state = state_path("zero");
-    subnet_up(&cfg, &state, false).unwrap();
+    subnet_up(&cfg, &state, false, false).unwrap();
     let err = subnet_punch(
         &cfg,
         &state,
@@ -87,7 +87,7 @@ fn punch_zero_attempts_errors() {
 fn punch_unknown_peer_errors() {
     let cfg = write_cfg("unknown", Some("10.0.0.2"));
     let state = state_path("unknown");
-    subnet_up(&cfg, &state, false).unwrap();
+    subnet_up(&cfg, &state, false, false).unwrap();
     let err = subnet_punch(
         &cfg,
         &state,
@@ -104,7 +104,7 @@ fn punch_unknown_peer_errors() {
 fn punch_missing_config_errors() {
     let state = state_path("cfgmiss");
     let cfg = write_cfg("cfgmiss", Some("10.0.0.2"));
-    subnet_up(&cfg, &state, false).unwrap();
+    subnet_up(&cfg, &state, false, false).unwrap();
     let missing = tmp_dir().join("missing.toml");
     let err = subnet_punch(
         &missing,
@@ -122,7 +122,7 @@ fn punch_missing_config_errors() {
 fn subnet_status_after_up_punch_is_null() {
     let cfg = write_cfg("null", Some("10.0.0.2"));
     let state = state_path("null");
-    subnet_up(&cfg, &state, false).unwrap();
+    subnet_up(&cfg, &state, false, false).unwrap();
     let status = subnet_status(&state);
     assert_eq!(status["verdict"], "PASS");
     assert!(
@@ -135,7 +135,7 @@ fn subnet_status_after_up_punch_is_null() {
 fn punch_invalid_listen_errors() {
     let cfg = write_cfg("listen", Some("10.0.0.2"));
     let state = state_path("listen");
-    subnet_up(&cfg, &state, false).unwrap();
+    subnet_up(&cfg, &state, false, false).unwrap();
     let err = subnet_punch(
         &cfg,
         &state,
@@ -152,7 +152,7 @@ fn punch_invalid_listen_errors() {
 fn punch_invalid_config_parse_errors() {
     let state = state_path("cfgparse");
     let cfg = write_cfg("cfgparse", Some("10.0.0.2"));
-    subnet_up(&cfg, &state, false).unwrap();
+    subnet_up(&cfg, &state, false, false).unwrap();
     let bad = tmp_dir().join("bad.toml");
     std::fs::write(&bad, "this is [ not valid toml").unwrap();
     let err = subnet_punch(
@@ -172,7 +172,7 @@ fn punch_encrypted_state_preserved() {
     let _g = port_lock().lock().unwrap();
     let cfg = write_cfg("enc", Some("10.0.0.2"));
     let state = state_path("enc");
-    subnet_up(&cfg, &state, true).unwrap();
+    subnet_up(&cfg, &state, true, false).unwrap();
     let raw_after_up = std::fs::read(&state).unwrap();
     assert!(
         !raw_after_up.starts_with(b"{"),
@@ -206,7 +206,7 @@ fn punch_failure_persists_state_for_status() {
     let _g = port_lock().lock().unwrap();
     let cfg = write_cfg("fail", Some("10.0.0.2"));
     let state = state_path("fail");
-    subnet_up(&cfg, &state, false).unwrap();
+    subnet_up(&cfg, &state, false, false).unwrap();
     // dead 目标（无监听端口）单次尝试 → 失败仍持久化 punch 记录。
     let dead = format!("udp://127.0.0.1:{}", pick_port());
     let lsn = format!("udp://127.0.0.1:{}", pick_port());

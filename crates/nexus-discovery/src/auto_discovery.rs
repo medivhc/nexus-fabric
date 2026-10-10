@@ -195,6 +195,9 @@ const AUTO_FRAME_REGISTER: u8 = 11;
 const AUTO_FRAME_GET_PEERS: u8 = 12;
 const AUTO_FRAME_PEER_LIST: u8 = 13;
 const AUTO_FRAME_HEARTBEAT: u8 = 14;
+/// Bootstrap 服务端 -> 节点：注册结果确认（v2 §5.5 增量 tag；旧节点不参与 bootstrap，
+/// 旧解码器对未知 tag 报 Transport，属预期）。
+const AUTO_FRAME_REGISTER_ACK: u8 = 15;
 
 /// 自动发现协议帧（Register/GetPeers/Heartbeat；独立于既有 `DiscoveryFrame`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +214,8 @@ pub enum AutoDiscoveryFrame {
     PeerList { peers: Vec<DiscoveredNode> },
     /// 节点 -> bootstrap：心跳保活。
     Heartbeat { node_id: String, now: u64 },
+    /// bootstrap -> 节点：注册结果确认（v2 §5.5；bootstrap 专用）。
+    RegisterAck { accepted: bool, ttl_secs: u32 },
 }
 
 /// 写入一个 u64（大端 8 字节）。
@@ -293,6 +298,11 @@ pub fn encode_auto_frame(frame: &AutoDiscoveryFrame) -> Result<Vec<u8>, Discover
             put_str(&mut out, node_id)?;
             put_u64(&mut out, *now);
         }
+        AutoDiscoveryFrame::RegisterAck { accepted, ttl_secs } => {
+            out.push(AUTO_FRAME_REGISTER_ACK);
+            out.push(u8::from(*accepted));
+            out.extend_from_slice(&ttl_secs.to_be_bytes());
+        }
     }
     Ok(out)
 }
@@ -339,6 +349,27 @@ pub fn decode_auto_frame(payload: &[u8]) -> Result<AutoDiscoveryFrame, Discovery
             let now = get_u64(payload, &mut pos)?;
             expect_frame_end(payload, pos)?;
             Ok(AutoDiscoveryFrame::Heartbeat { node_id, now })
+        }
+        AUTO_FRAME_REGISTER_ACK => {
+            if pos + 5 > payload.len() {
+                return Err(DiscoveryError::Transport("frame truncated".into()));
+            }
+            let accepted = match payload[pos] {
+                0 => false,
+                1 => true,
+                other => {
+                    return Err(DiscoveryError::Transport(format!(
+                        "bad RegisterAck accepted byte: {other}"
+                    )));
+                }
+            };
+            pos += 1;
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&payload[pos..pos + 4]);
+            pos += 4;
+            let ttl_secs = u32::from_be_bytes(b);
+            expect_frame_end(payload, pos)?;
+            Ok(AutoDiscoveryFrame::RegisterAck { accepted, ttl_secs })
         }
         other => Err(DiscoveryError::Transport(format!(
             "unknown auto frame type: {other}"
@@ -484,6 +515,10 @@ mod auto_discovery_tests {
             AutoDiscoveryFrame::Heartbeat {
                 node_id: "self".into(),
                 now: 123456789,
+            },
+            AutoDiscoveryFrame::RegisterAck {
+                accepted: true,
+                ttl_secs: 60,
             },
         ];
         for f in &frames {

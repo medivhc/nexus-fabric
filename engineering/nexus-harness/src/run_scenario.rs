@@ -18,6 +18,7 @@ pub fn run_scenario(args: &[String]) -> Outcome {
         "bandwidth-qos" => run_bandwidth_qos(),
         "qos-cake" => run_qos_cake(),
         "auto-reconnect" => run_auto_reconnect(),
+        "bootstrap-join" => run_bootstrap_join(),
         _ => (
             "BLOCKED".to_string(),
             format!("unknown run subcommand: {subcommand}"),
@@ -71,7 +72,7 @@ fn run_virtual_subnet_tunnel() -> Outcome {
     // 2. B 从 carrier 接收并解封装
     let mut recv_buf = [0u8; 2048];
     let recv_result = tunnel_b
-        .recv_and_deliver(&mut recv_buf)
+        .recv_and_deliver(&mut recv_buf, 1000)
         .expect("B receive and deliver");
 
     let b_received = recv_result.is_some();
@@ -90,7 +91,7 @@ fn run_virtual_subnet_tunnel() -> Outcome {
 
     // 4. A 从 carrier 接收回包
     let recv_result = tunnel_a
-        .recv_and_deliver(&mut recv_buf)
+        .recv_and_deliver(&mut recv_buf, 1000)
         .expect("A receive reply");
 
     let a_received_reply = recv_result.is_some();
@@ -217,13 +218,13 @@ fn run_virtual_subnet_mesh() -> Outcome {
     // B receives frame, forwards to C
     let mut buf = [0u8; 2048];
     let b_delivered = tunnel_b
-        .recv_and_deliver(&mut buf)
+        .recv_and_deliver(&mut buf, 1000)
         .expect("B recv and forward")
         .is_some();
 
     // C receives forwarded frame, delivers to VPI
     let c_recv = tunnel_c
-        .recv_and_deliver(&mut buf)
+        .recv_and_deliver(&mut buf, 1000)
         .expect("C recv and deliver");
     let c_delivered = c_recv.is_some();
     let c_payload_len = c_recv.map(|(_, n)| n).unwrap_or(0);
@@ -1764,5 +1765,114 @@ fn run_qos_cake() -> Outcome {
             ),
             extra,
         )
+    }
+}
+
+/// E4/R4：bootstrap join 全握手 happy-path E2E（离线、内存 carrier、 pump 线程）。
+///
+/// 一个引导节点（BootstrapServer，PSK 认证）+ 一个客户端（BootstrapJoiner），
+/// 经 MemoryCarrier 对完成 JoinInit→JoinReply→Register→RegisterAck→GetPeers→PeerList。
+fn run_bootstrap_join() -> Outcome {
+    use nexus_connectivity::bootstrap_joiner::{BootstrapEndpoint, BootstrapJoiner};
+    use nexus_connectivity::bootstrap_server::{BootstrapServer, BootstrapServerConfig, MemCodec};
+    use nexus_connectivity::encryption::KeyPair;
+    use nexus_connectivity::virtual_subnet::MemoryCarrier;
+    use nexus_platform::PacketCarrier;
+
+    let server_identity = KeyPair::from_seed(&[9u8; 32]);
+    let client_identity = KeyPair::from_seed(&[1u8; 32]);
+    let (server_carrier, client_carrier) = MemoryCarrier::connected_pair();
+
+    let cfg = BootstrapServerConfig {
+        cidr: "10.144.144.0/24".into(),
+        lease_secs: 60,
+        hb_interval_ms: 20_000,
+        refresh_interval_ms: 60_000,
+        server_vip: "10.144.144.1".into(),
+        server_locator: "udp://bootstrap:11010".into(),
+        max_pending_per_src: 4,
+    };
+    let mut server = match BootstrapServer::new(
+        server_identity,
+        b"shared-psk".to_vec(),
+        cfg,
+        Box::new(MemCodec),
+        None,
+    ) {
+        Ok(s) => s,
+        Err(e) => return ("FAIL".into(), format!("server new: {e}"), vec![]),
+    };
+    server.upsert_self_entry(1000);
+
+    // pump 线程：从 server carrier 收客户端帧 → handle_datagram → 回包。
+    let mut sc = server_carrier;
+    let pump = std::thread::spawn(move || {
+        let mut buf = vec![0u8; 65535];
+        loop {
+            match sc.receive_into(&mut buf) {
+                Ok(0) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                Ok(n) => {
+                    if let Some((dst, bytes)) =
+                        server.handle_datagram("udp://client:1", &buf[..n], 1000)
+                    {
+                        let _ = sc.send_to(&dst, &bytes);
+                    }
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
+    });
+
+    let mut cc = client_carrier;
+    let codec = MemCodec;
+    let mut joiner = BootstrapJoiner::new(&mut cc, &client_identity, b"shared-psk", &codec);
+    let eps = [BootstrapEndpoint {
+        server_locator: "udp://bootstrap:11010".into(),
+    }];
+    let result = joiner.join(&eps, None, 1000, 5000);
+    let _ = pump; // 后台线程随进程结束；离线场景不优雅停机
+
+    match result {
+        Ok((sess, peers)) => {
+            let vip_ok =
+                sess.assigned_vip.starts_with("10.144.144.") && sess.assigned_vip != "10.144.144.1";
+            let peers_ok = !peers.is_empty();
+            let ok = vip_ok && peers_ok;
+            let extra = vec![
+                ("assigned_vip".to_string(), json!(sess.assigned_vip)),
+                ("peer_count".to_string(), json!(peers.len())),
+                (
+                    "peers".to_string(),
+                    json!(
+                        peers
+                            .iter()
+                            .map(|p| json!({"node_id": p.node_id, "virtual_ip": p.virtual_ip}))
+                            .collect::<Vec<_>>()
+                    ),
+                ),
+            ];
+            if ok {
+                (
+                    "PASS".into(),
+                    format!(
+                        "bootstrap-join: client joined bootstrap, assigned_vip={}, peers={}",
+                        sess.assigned_vip,
+                        peers.len()
+                    ),
+                    extra,
+                )
+            } else {
+                (
+                    "FAIL".into(),
+                    format!("bootstrap-join: vip_ok={vip_ok} peers_ok={peers_ok}"),
+                    extra,
+                )
+            }
+        }
+        Err(e) => (
+            "FAIL".into(),
+            format!("bootstrap-join: join error: {e}"),
+            vec![],
+        ),
     }
 }

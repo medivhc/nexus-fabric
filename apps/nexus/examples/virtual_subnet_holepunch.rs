@@ -70,11 +70,11 @@ fn main() -> ExitCode {
         if ta.peer_state("10.0.0.2") == Some(TunnelState::Probing) {
             success["probe_state_seen"] = serde_json::json!("Probing");
         }
-        if let Err(e) = tb.recv_and_deliver(&mut buf) {
+        if let Err(e) = tb.recv_and_deliver(&mut buf, 1000) {
             eprintln!("tb.recv: {e}");
             return ExitCode::from(1);
         }
-        if let Err(e) = ta.recv_and_deliver(&mut buf) {
+        if let Err(e) = ta.recv_and_deliver(&mut buf, 1000) {
             eprintln!("ta.recv: {e}");
             return ExitCode::from(1);
         }
@@ -96,7 +96,7 @@ fn main() -> ExitCode {
     // 数据帧往返：A → B（写 B 的 VPI）→ B 回帧 → A 收。
     if ta.peer_state("10.0.0.2") == Some(TunnelState::Connected)
         && ta.send_ip_packet("10.0.0.2", b"hole-punch-ok").is_ok()
-        && tb.recv_and_deliver(&mut buf).is_ok()
+        && tb.recv_and_deliver(&mut buf, 1000).is_ok()
     {
         let payload = {
             let mut v = vpi_b_sent.lock().unwrap();
@@ -106,7 +106,7 @@ fn main() -> ExitCode {
         };
         if payload == "hole-punch-ok"
             && tb.send_ip_packet("10.0.0.1", b"ack").is_ok()
-            && ta.recv_and_deliver(&mut buf).is_ok()
+            && ta.recv_and_deliver(&mut buf, 1000).is_ok()
         {
             success["roundtrip"] = serde_json::json!(true);
         }

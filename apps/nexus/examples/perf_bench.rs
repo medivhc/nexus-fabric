@@ -97,8 +97,10 @@ fn main() {
     // 进程内驱动握手：A 发起 → B 自动 accept → A 自动 complete
     tunnel_a.begin_handshake("10.99.0.2").expect("begin hs");
     let mut buf = [0u8; 2048];
-    tunnel_b.recv_and_deliver(&mut buf).expect("b accept");
-    tunnel_a.recv_and_deliver(&mut buf).expect("a complete");
+    tunnel_b.recv_and_deliver(&mut buf, 1000).expect("b accept");
+    tunnel_a
+        .recv_and_deliver(&mut buf, 1000)
+        .expect("a complete");
     let tunnel_ready = tunnel_a.peer_state("10.99.0.2")
         == Some(nexus_connectivity::virtual_subnet::TunnelState::Connected)
         && tunnel_b.peer_state("10.99.0.1")
@@ -111,7 +113,7 @@ fn main() {
         tunnel_a
             .send_ip_packet("10.99.0.2", &payload)
             .expect("send");
-        if let Some((_, n)) = tunnel_b.recv_and_deliver(&mut buf).expect("recv") {
+        if let Some((_, n)) = tunnel_b.recv_and_deliver(&mut buf, 1000).expect("recv") {
             rx_bytes += n;
         }
     }
@@ -122,7 +124,7 @@ fn main() {
     tunnel_a
         .send_ip_packet("10.99.0.2", &payload)
         .expect("send rtt");
-    let _ = tunnel_b.recv_and_deliver(&mut buf).expect("recv rtt");
+    let _ = tunnel_b.recv_and_deliver(&mut buf, 1000).expect("recv rtt");
     let tunnel_roundtrip_us = t0.elapsed().as_secs_f64() * 1e6;
 
     // ---- 3) Performance Budget 判定 ----

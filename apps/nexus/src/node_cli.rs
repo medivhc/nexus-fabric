@@ -23,6 +23,18 @@ use crate::n2_store::N2Store;
 
 /// 节点身份记录键（FileKvStore）。
 const IDENTITY_KEY: &str = "node/identity";
+
+/// 身份记录在 `node_dir()` 下的文件名。
+///
+/// `FileKvStore` 会把键里的 `/` 转义成 `%2F`（`kv.rs::encode_key`），所以落盘名
+/// 是 `node%2Fidentity` 而**不是** `identity`。读取方必须用同一个名字，否则永远
+/// 读不到 `node init` 写的身份（此前的 `load_node_identity` 就踩了这个坑，被
+/// `KeyPair::generate()` 兜底掩盖成"能跑但每次重启换身份"）。
+#[must_use]
+pub fn identity_file_name() -> String {
+    FileKvStore::file_name_for(IDENTITY_KEY).unwrap_or_else(|| "node%2Fidentity".to_string())
+}
+
 /// 身份记录结构版本。
 const IDENTITY_VERSION: u32 = 1;
 
@@ -237,6 +249,17 @@ fn init_node_at(dir: &std::path::Path, force: bool) -> Result<(String, bool), St
         }
     }
     Ok((node_id, true))
+}
+
+/// 供组合根（`subnet_cli`）复用：确保 `node_dir()` 下存在持久身份，存在则原样返回。
+///
+/// v2 §7.4 / S7：`node init` 缺失时**自动 init 并持久化**，而不是在装配路径上
+/// 退化成一次性 `KeyPair::generate()`——后者每次重启都会换 static 公钥，派生出的
+/// 权威 node_id 随之改变，服务端的 VIP 租约回收/幂等找回随之失效。
+///
+/// 失败（目录不可写 / 存储错误）→ 明确报错，禁止静默降级。
+pub fn ensure_node_identity(dir: &std::path::Path) -> Result<(String, bool), String> {
+    init_node_at(dir, false)
 }
 
 /// 从身份记录 JSON 解析 node_id（损坏 → 明确报错，不静默丢弃）。

@@ -70,8 +70,8 @@ fn main() -> ExitCode {
         if ta.begin_hole_punch("10.0.0.2", &target).is_ok() {
             let mut buf = [0u8; 4096];
             for _ in 0..10 {
-                tb.recv_and_deliver(&mut buf).unwrap();
-                ta.recv_and_deliver(&mut buf).unwrap();
+                tb.recv_and_deliver(&mut buf, 1000).unwrap();
+                ta.recv_and_deliver(&mut buf, 1000).unwrap();
                 if ta.peer_state("10.0.0.2").is_some_and(|s| {
                     s == nexus_connectivity::virtual_subnet::TunnelState::Connected
                 }) {

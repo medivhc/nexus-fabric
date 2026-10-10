@@ -741,3 +741,7 @@ mod network_discovery_tests {
 // ---------- 自动节点发现（引导注册 + 对等发现 + 心跳保活；纯内存骨架） ----------
 
 pub mod auto_discovery;
+
+// ---------- Bootstrap 自动入网外层帧（nxb: 前缀分流；v2 §5.2） ----------
+
+pub mod bootstrap_join;

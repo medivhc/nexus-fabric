@@ -137,7 +137,7 @@ fn main() -> ExitCode {
                     return Err("timeout waiting RESP".to_string());
                 }
                 tunnel
-                    .recv_and_deliver(&mut buf)
+                    .recv_and_deliver(&mut buf, 1000)
                     .map_err(|e| format!("recv RESP: {e}"))?;
                 if tunnel
                     .peers()
@@ -156,7 +156,7 @@ fn main() -> ExitCode {
                     return Err("timeout waiting pong".to_string());
                 }
                 if let Some((_, _)) = tunnel
-                    .recv_and_deliver(&mut buf)
+                    .recv_and_deliver(&mut buf, 1000)
                     .map_err(|e| format!("recv pong: {e}"))?
                 {
                     if take_vpi_payload(&vpi_recv).as_deref() == Some("pong") {
@@ -172,7 +172,7 @@ fn main() -> ExitCode {
                     return Err("timeout".to_string());
                 }
                 if let Some((_, _)) = tunnel
-                    .recv_and_deliver(&mut buf)
+                    .recv_and_deliver(&mut buf, 1000)
                     .map_err(|e| format!("recv: {e}"))?
                 {
                     if take_vpi_payload(&vpi_recv).as_deref() == Some("p4.1-real-net-ok") {

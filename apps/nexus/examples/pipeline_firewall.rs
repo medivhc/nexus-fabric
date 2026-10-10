@@ -65,12 +65,12 @@ fn main() -> ExitCode {
     ta.set_dataplane_defaults(Protocol::Udp, 0, 53);
     let _ = ta.send_ip_packet("10.0.0.2", &[0xAA; 100]);
     // B 不应收到任何东西。
-    let denied_flow_dropped = tb.recv_and_deliver(&mut buf).unwrap().is_none();
+    let denied_flow_dropped = tb.recv_and_deliver(&mut buf, 1000).unwrap().is_none();
 
     // 2) tcp/80 流 -> 默认 allow -> 投递到 B 的 VPI（100 字节载荷）。
     ta.set_dataplane_defaults(Protocol::Tcp, 0, 80);
     ta.send_ip_packet("10.0.0.2", &[0xBB; 100]).unwrap();
-    tb.recv_and_deliver(&mut buf).unwrap();
+    tb.recv_and_deliver(&mut buf, 1000).unwrap();
     let delivered: Vec<u8> = {
         let mut v = vpi_b_sent.lock().unwrap();
         let p = v.clone();

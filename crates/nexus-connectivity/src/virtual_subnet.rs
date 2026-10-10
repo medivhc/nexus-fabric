@@ -459,6 +459,48 @@ pub struct VirtualSubnetTunnel {
     pipeline: Option<dataplane_pipeline::DataplanePipeline>,
     /// FIB 解析器（§12.56，可选）：动态选路替代静态 routes。
     fib_resolver: Option<crate::fib_resolver::SharedFibResolver>,
+    /// Bootstrap 钩子（v2 §6.4，S5）：可选；nxb: 控制帧在此分流，回包经 carrier 代发。
+    bootstrap: Option<Box<dyn BootstrapHook>>,
+}
+
+/// Bootstrap 服务端/客户端会话共同实现，挂在隧道上（v2 §6.4）。
+pub trait BootstrapHook {
+    /// 入参为已剥掉 `nxb:` 的 payload + NAT 源 locator + now；
+    /// 返回需经同一 socket 发出的回包 (dst locator, bytes)。
+    fn on_control_datagram(
+        &mut self,
+        src: Option<&str>,
+        payload: &[u8],
+        now: u64,
+    ) -> Option<(String, Vec<u8>)>;
+
+    /// 每 tick 调用：返回待发数据报与 peer 增删（心跳/刷新/服务端 sweep）。
+    fn periodic(&mut self, now: u64) -> BootstrapTick;
+
+    /// 服务端权威分配的本端 VIP（bootstrap 入网后；未入网为 None）。
+    fn assigned_vip(&self) -> Option<&str> {
+        None
+    }
+
+    /// 服务端角色的权威 VIP 租约快照（§6.6 落盘内容）；客户端角色为 `None`。
+    ///
+    /// crate 层零 I/O，故只吐快照，由组合根（`apps/nexus`）决定何时落盘。
+    fn lease_snapshot(&self, _now: u64) -> Option<Vec<(String, String)>> {
+        None
+    }
+}
+
+/// 一次 tick 产出的 bootstrap 出站数据报与 peer 增删（v2 §6.4）。
+#[derive(Debug, Default)]
+pub struct BootstrapTick {
+    /// 待发数据报 (dst locator, bytes)。
+    pub datagrams: Vec<(String, Vec<u8>)>,
+    /// 新发现应打洞的 peer。
+    pub peers_added: Vec<crate::bootstrap_server::BootstrapPeer>,
+    /// 降级 peer（不删，仅标记）。
+    pub peers_gone: Vec<String>,
+    /// 结构化可观测事件（本 tick 取出，避免无界增长）。
+    pub events: Vec<String>,
 }
 
 impl VirtualSubnetTunnel {
@@ -493,6 +535,7 @@ impl VirtualSubnetTunnel {
             relay_locators: HashMap::new(),
             pipeline: None,
             fib_resolver: None,
+            bootstrap: None,
         }
     }
 
@@ -556,6 +599,49 @@ impl VirtualSubnetTunnel {
     /// 设置 FIB 解析器（§12.56）：动态选路。设为 None 则禁用，回退静态路由。
     pub fn set_fib_resolver(&mut self, resolver: Option<crate::fib_resolver::SharedFibResolver>) {
         self.fib_resolver = resolver;
+    }
+
+    /// 挂载/卸载 Bootstrap 钩子（v2 §6.4，S5）。
+    pub fn set_bootstrap_hook(&mut self, hook: Option<Box<dyn BootstrapHook>>) {
+        self.bootstrap = hook;
+    }
+
+    /// 服务端角色的 VIP 租约快照（§6.6）；客户端角色或未挂载 hook → `None`。
+    ///
+    /// crate 层零 I/O：只吐快照，落盘由组合根（`apps/nexus`）在常驻 tick 里做。
+    pub fn bootstrap_lease_snapshot(&self, now: u64) -> Option<Vec<(String, String)>> {
+        self.bootstrap.as_ref().and_then(|h| h.lease_snapshot(now))
+    }
+
+    /// Bootstrap 内部发出口（v2 §6.4）：薄封装 carrier.send_to，供常驻 tick 发心跳/刷新/sweep 回执。
+    pub(crate) fn send_raw(
+        &mut self,
+        locator: &str,
+        bytes: &[u8],
+    ) -> Result<(), ConnectivityError> {
+        self.carrier
+            .send_to(locator, bytes)
+            .map_err(|e| ConnectivityError::Io {
+                operation: "bootstrap send_raw".to_string(),
+                message: e.to_string(),
+            })
+    }
+
+    /// 驱动挂载的 Bootstrap 钩子周期性 tick（v2 §6.4）：心跳/刷新/sweep 出站数据报
+    /// 统一经 [`Self::send_raw`] 发出；返回 peer 增删供 mesh 层接管打洞。
+    pub fn bootstrap_tick(&mut self, now: u64) -> BootstrapTick {
+        match self.bootstrap.as_mut() {
+            Some(hook) => {
+                let tick = hook.periodic(now);
+                for (dst, bytes) in &tick.datagrams {
+                    if self.send_raw(dst, bytes).is_err() {
+                        break;
+                    }
+                }
+                tick
+            }
+            None => BootstrapTick::default(),
+        }
     }
 
     pub fn add_route(
@@ -1411,6 +1497,7 @@ impl VirtualSubnetTunnel {
     pub fn recv_and_deliver(
         &mut self,
         buffer: &mut [u8],
+        now_secs: u64,
     ) -> Result<Option<(String, usize)>, ConnectivityError> {
         let n = self
             .carrier
@@ -1425,6 +1512,23 @@ impl VirtualSubnetTunnel {
         }
 
         let data = buffer[..n].to_vec();
+
+        // nxb: bootstrap 控制帧分流（v2 §6.4，S5）：命中即交 hook，不进数据管线/试解密。
+        if let Some(rest) = data.strip_prefix(b"nxb:") {
+            if let Some(hook) = self.bootstrap.as_mut() {
+                let src = self.carrier.last_peer_locator();
+                if let Some((dst, bytes)) = hook.on_control_datagram(src.as_deref(), rest, now_secs)
+                {
+                    self.carrier
+                        .send_to(&dst, &bytes)
+                        .map_err(|e| ConnectivityError::Io {
+                            operation: "bootstrap reply".to_string(),
+                            message: e.to_string(),
+                        })?;
+                }
+            }
+            return Ok(None);
+        }
 
         // 数据面管线（§12.41）：识别 NXP1 管线单元，逆序重组/解压/门控后还原 legacy inner。
         let data = if dataplane_pipeline::is_pipeline_unit(&data) {
@@ -2166,13 +2270,13 @@ mod tests {
 
         // B 鏀跺埌甯?鈫?dst 涓嶆槸 B 鈫?杞彂缁?C
         let mut buf = [0u8; 1024];
-        let delivered = tunnel_b.recv_and_deliver(&mut buf).unwrap();
+        let delivered = tunnel_b.recv_and_deliver(&mut buf, 1000).unwrap();
         assert!(delivered.is_some());
         // B 鐨?bytes_forwarded > 0
         assert!(tunnel_b.peer_stats("10.0.0.3").unwrap().bytes_forwarded > 0);
 
         // C 鏀跺埌杞彂鍚庣殑甯?鈫?dst == C 鈫?鍐?VPI
-        let delivered_c = tunnel_c.recv_and_deliver(&mut buf).unwrap();
+        let delivered_c = tunnel_c.recv_and_deliver(&mut buf, 1000).unwrap();
         assert!(delivered_c.is_some());
         // C 瑙ｅ皝瑁呭悗鎷垮埌 payload锛岄暱搴﹀簲绛変簬鍘熷 packet
         assert_eq!(delivered_c.unwrap().1, packet.len());
@@ -2200,7 +2304,7 @@ mod tests {
         b_recv.lock().unwrap().extend_from_slice(fake_frame);
 
         let mut buf = [0u8; 1024];
-        let err = tunnel_b.recv_and_deliver(&mut buf).unwrap_err();
+        let err = tunnel_b.recv_and_deliver(&mut buf, 1000).unwrap_err();
         assert!(matches!(err, ConnectivityError::Invalid { .. }));
     }
 
@@ -2223,7 +2327,7 @@ mod tests {
         b_recv.lock().unwrap().extend_from_slice(fake_frame);
 
         let mut buf = [0u8; 1024];
-        let err = tunnel_b.recv_and_deliver(&mut buf).unwrap_err();
+        let err = tunnel_b.recv_and_deliver(&mut buf, 1000).unwrap_err();
         assert!(matches!(err, ConnectivityError::Invalid { .. }));
     }
     #[test]
@@ -2244,14 +2348,14 @@ mod tests {
         ta.begin_handshake("10.0.0.2")?;
         assert_eq!(ta.peer_state("10.0.0.2"), Some(TunnelState::Handshaking));
         let mut buf = [0u8; 4096];
-        assert!(tb.recv_and_deliver(&mut buf)?.is_none()); // 握手帧不写 VPI
+        assert!(tb.recv_and_deliver(&mut buf, 1000)?.is_none()); // 握手帧不写 VPI
         assert_eq!(tb.peer_state("10.0.0.1"), Some(TunnelState::Connected));
-        assert!(ta.recv_and_deliver(&mut buf)?.is_none());
+        assert!(ta.recv_and_deliver(&mut buf, 1000)?.is_none());
         assert_eq!(ta.peer_state("10.0.0.2"), Some(TunnelState::Connected));
 
         // 数据：A → B
         ta.send_ip_packet("10.0.0.2", b"secret-a-to-b")?;
-        let got = tb.recv_and_deliver(&mut buf)?;
+        let got = tb.recv_and_deliver(&mut buf, 1000)?;
         let (sender, len) = got.expect("data frame delivered");
         assert_eq!(sender, "10.0.0.1");
         assert_eq!(len, b"secret-a-to-b".len());
@@ -2286,7 +2390,7 @@ mod tests {
 
         ta.begin_handshake("10.0.0.2")?;
         let mut buf = [0u8; 4096];
-        assert!(tb.recv_and_deliver(&mut buf)?.is_none()); // 握手帧不写 VPI
+        assert!(tb.recv_and_deliver(&mut buf, 1000)?.is_none()); // 握手帧不写 VPI
         // 来源学习：locator 从占位刷新为 NAT 映射地址，事件可观测。
         assert_eq!(
             tb.peer_locator("10.0.0.1").as_deref(),
@@ -2315,7 +2419,7 @@ mod tests {
         tb.enable_encryption(EncryptionConfig::default());
 
         let mut buf = [0u8; 4096];
-        let err = tb.recv_and_deliver(&mut buf).unwrap_err();
+        let err = tb.recv_and_deliver(&mut buf, 1000).unwrap_err();
         assert!(matches!(err, ConnectivityError::Invalid { .. }));
         assert_eq!(tb.peer_locator("10.0.0.1").as_deref(), Some("mem-a"));
         assert!(
@@ -2346,15 +2450,17 @@ mod tests {
         tb.enable_encryption(EncryptionConfig::default());
         ta.begin_handshake("10.0.0.2")?;
         let mut buf = [0u8; 4096];
-        let _ = tb.recv_and_deliver(&mut buf)?;
-        let _ = ta.recv_and_deliver(&mut buf)?;
+        let _ = tb.recv_and_deliver(&mut buf, 1000)?;
+        let _ = ta.recv_and_deliver(&mut buf, 1000)?;
 
         ta.send_ip_packet("10.0.0.2", b"frame-1")?;
         let wire = b_recv.lock().unwrap().clone(); // 密文帧
-        assert!(tb.recv_and_deliver(&mut buf)?.is_some());
+        assert!(tb.recv_and_deliver(&mut buf, 1000)?.is_some());
         // 重放：注入同一密文
         b_recv.lock().unwrap().extend_from_slice(&wire);
-        let err = tb.recv_and_deliver(&mut buf).expect_err("replay must fail");
+        let err = tb
+            .recv_and_deliver(&mut buf, 1000)
+            .expect_err("replay must fail");
         assert!(err.to_string().contains("REPLAY_REJECTED"), "got: {err}");
         Ok(())
     }
@@ -2374,7 +2480,7 @@ mod tests {
 
         ta.send_ip_packet("10.0.0.2", b"plaintext-ok")?;
         let mut buf = [0u8; 4096];
-        let (sender, len) = tb.recv_and_deliver(&mut buf)?.expect("delivered");
+        let (sender, len) = tb.recv_and_deliver(&mut buf, 1000)?.expect("delivered");
         assert_eq!(sender, "10.0.0.1");
         assert_eq!(len, b"plaintext-ok".len());
         assert!(!ta.is_encryption_enabled());
@@ -2510,8 +2616,8 @@ mod tests {
 
         let mut buf = [0u8; 4096];
         for _ in 0..10 {
-            tb.recv_and_deliver(&mut buf).unwrap();
-            ta.recv_and_deliver(&mut buf).unwrap();
+            tb.recv_and_deliver(&mut buf, 1000).unwrap();
+            ta.recv_and_deliver(&mut buf, 1000).unwrap();
             if ta.peer_state("10.0.0.2") == Some(TunnelState::Connected) {
                 break;
             }
@@ -2525,7 +2631,7 @@ mod tests {
 
         // 数据帧 A→B 走打洞后 locator 送达（写 B 的 VPI）
         ta.send_ip_packet("10.0.0.2", b"ping").unwrap();
-        tb.recv_and_deliver(&mut buf).unwrap();
+        tb.recv_and_deliver(&mut buf, 1000).unwrap();
         let payload = {
             let mut v = vpi_b_sent.lock().unwrap();
             let p = v.clone();
@@ -2641,7 +2747,7 @@ mod tests {
 
         ta.begin_hole_punch("10.0.0.2", "mem-b").unwrap();
         let mut buf = [0u8; 4096];
-        tb.recv_and_deliver(&mut buf).unwrap(); // B 收 ph → 回 pa（控制面）
+        tb.recv_and_deliver(&mut buf, 1000).unwrap(); // B 收 ph → 回 pa（控制面）
         let payload = {
             let mut v = vpi_b_sent.lock().unwrap();
             let p = v.clone();
@@ -2650,7 +2756,7 @@ mod tests {
         };
         assert!(payload.is_empty(), "punch frames must not reach VPI");
 
-        ta.recv_and_deliver(&mut buf).unwrap(); // A 收 pa → 落账
+        ta.recv_and_deliver(&mut buf, 1000).unwrap(); // A 收 pa → 落账
         assert_eq!(ta.peer_state("10.0.0.2"), Some(TunnelState::Connected));
     }
 
@@ -2673,8 +2779,8 @@ mod tests {
         ta.begin_hole_punch("10.0.0.2", "mem-b").unwrap();
         let mut buf = [0u8; 4096];
         for _ in 0..10 {
-            tb.recv_and_deliver(&mut buf).unwrap();
-            ta.recv_and_deliver(&mut buf).unwrap();
+            tb.recv_and_deliver(&mut buf, 1000).unwrap();
+            ta.recv_and_deliver(&mut buf, 1000).unwrap();
             if ta.peer_state("10.0.0.2") == Some(TunnelState::Connected) {
                 break;
             }
@@ -2706,7 +2812,7 @@ mod tests {
         ta.add_peer(TunnelPeer::new("10.0.0.2", "mem-b")).unwrap();
 
         let mut buf = [0u8; 4096];
-        let r = ta.recv_and_deliver(&mut buf).unwrap();
+        let r = ta.recv_and_deliver(&mut buf, 1000).unwrap();
         assert!(r.is_none(), "unexpected pa must be swallowed");
         assert_ne!(ta.peer_state("10.0.0.2"), Some(TunnelState::Connected));
         assert!(
@@ -2734,7 +2840,7 @@ mod tests {
         tb.add_peer(TunnelPeer::new("10.0.0.1", "mem-a")).unwrap();
 
         let mut buf = [0u8; 4096];
-        let r = tb.recv_and_deliver(&mut buf).unwrap();
+        let r = tb.recv_and_deliver(&mut buf, 1000).unwrap();
         assert!(r.is_none(), "bad-magic frame must be dropped");
         assert_eq!(tb.peer_state("10.0.0.1"), Some(TunnelState::Disconnected));
         let payload = {
@@ -2745,7 +2851,7 @@ mod tests {
         };
         assert!(payload.is_empty());
         // A 无回包（B 未回 pa）
-        let r2 = ta.recv_and_deliver(&mut buf).unwrap();
+        let r2 = ta.recv_and_deliver(&mut buf, 1000).unwrap();
         assert!(r2.is_none());
     }
 
@@ -2790,8 +2896,8 @@ mod tests {
         ta.begin_hole_punch("10.0.0.2", "mem-b").unwrap();
         let mut buf = [0u8; 4096];
         for _ in 0..10 {
-            tb.recv_and_deliver(&mut buf).unwrap();
-            ta.recv_and_deliver(&mut buf).unwrap();
+            tb.recv_and_deliver(&mut buf, 1000).unwrap();
+            ta.recv_and_deliver(&mut buf, 1000).unwrap();
             if ta.peer_state("10.0.0.2") == Some(TunnelState::Connected) {
                 break;
             }
@@ -2920,8 +3026,8 @@ mod tests {
         .unwrap();
         let mut buf = [0u8; 4096];
         for _ in 0..10 {
-            tb.recv_and_deliver(&mut buf).unwrap();
-            ta.recv_and_deliver(&mut buf).unwrap();
+            tb.recv_and_deliver(&mut buf, 1000).unwrap();
+            ta.recv_and_deliver(&mut buf, 1000).unwrap();
             if ta.peer_state("10.0.0.2") == Some(TunnelState::Connected) {
                 break;
             }
@@ -3008,8 +3114,8 @@ mod tests {
             .unwrap();
         let mut buf = [0u8; 4096];
         for _ in 0..10 {
-            tb.recv_and_deliver(&mut buf).unwrap();
-            ta.recv_and_deliver(&mut buf).unwrap();
+            tb.recv_and_deliver(&mut buf, 1000).unwrap();
+            ta.recv_and_deliver(&mut buf, 1000).unwrap();
             if ta.peer_state("10.0.0.2") == Some(TunnelState::Connected) {
                 break;
             }
@@ -3070,8 +3176,8 @@ mod tests {
         .unwrap();
         let mut buf = [0u8; 4096];
         for _ in 0..10 {
-            tb.recv_and_deliver(&mut buf).unwrap();
-            ta.recv_and_deliver(&mut buf).unwrap();
+            tb.recv_and_deliver(&mut buf, 1000).unwrap();
+            ta.recv_and_deliver(&mut buf, 1000).unwrap();
             if ta.peer_state("10.0.0.2") == Some(TunnelState::Connected) {
                 break;
             }
@@ -3087,7 +3193,7 @@ mod tests {
         // B 侧 carrier 直发（B.send_buf 与 A.recv_buf 共享）。
         let late_pa = hole_punch_frame(b'a', "10.0.0.2", &ta.hole_punch_config.magic);
         tb.carrier.send_to("mem-a", &late_pa).unwrap();
-        ta.recv_and_deliver(&mut buf).unwrap();
+        ta.recv_and_deliver(&mut buf, 1000).unwrap();
         assert_eq!(ta.peer_state("10.0.0.2"), Some(TunnelState::Connected));
         let succeeded_after = ta
             .events()
@@ -3120,8 +3226,8 @@ mod tests {
             .unwrap();
         let mut buf = [0u8; 4096];
         for _ in 0..10 {
-            tb.recv_and_deliver(&mut buf).unwrap();
-            ta.recv_and_deliver(&mut buf).unwrap();
+            tb.recv_and_deliver(&mut buf, 1000).unwrap();
+            ta.recv_and_deliver(&mut buf, 1000).unwrap();
             if ta.peer_state("10.0.0.2") == Some(TunnelState::Connected) {
                 break;
             }
@@ -3132,5 +3238,71 @@ mod tests {
             e,
             VirtualSubnetEvent::HolePunchSucceeded { target, .. } if target == "dead-first"
         )));
+    }
+
+    /// 记录入站、可回包的最小 BootstrapHook 测试桩（经 shared 句柄回读）。
+    #[derive(Default)]
+    struct RecHook {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        reply: Option<(String, Vec<u8>)>,
+    }
+    impl BootstrapHook for RecHook {
+        fn on_control_datagram(
+            &mut self,
+            _src: Option<&str>,
+            payload: &[u8],
+            _now: u64,
+        ) -> Option<(String, Vec<u8>)> {
+            self.seen.lock().unwrap().push(payload.to_vec());
+            self.reply.take()
+        }
+        fn periodic(&mut self, _now: u64) -> BootstrapTick {
+            BootstrapTick::default()
+        }
+    }
+
+    #[test]
+    fn nxb_magic_vs_data_frame_demux() -> Result<(), ConnectivityError> {
+        // nxb: 前缀帧在隧道入口即被 bootstrap hook 截获：剥 magic、不写 VPI、不进数据管线；
+        // 无 nxb 前缀的数据帧不路由到 hook。
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut buf = [0u8; 4096];
+
+        // 隧道1：注入 nxb: + 内层 body（在构造前入队）。
+        let (_, cb) = MemoryCarrier::connected_pair();
+        let mut wire = b"nxb:".to_vec();
+        wire.extend_from_slice(b"\x10hello-body");
+        cb.inject(&wire);
+        let mut tb = VirtualSubnetTunnel::new(
+            VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.2"),
+            Box::new(MemoryVpi::new()),
+            Box::new(cb),
+        );
+        tb.set_bootstrap_hook(Some(Box::new(RecHook {
+            seen: seen.clone(),
+            reply: None,
+        })));
+        let delivered = tb.recv_and_deliver(&mut buf, 1000)?;
+        assert!(delivered.is_none()); // 控制帧不交付数据面
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(&seen.lock().unwrap()[0][..], b"\x10hello-body");
+
+        // 隧道2：注入普通数据帧（无 nxb 前缀）→ hook 不应被调用。
+        seen.lock().unwrap().clear();
+        let (_, cb2) = MemoryCarrier::connected_pair();
+        cb2.inject(b"plain-data-frame");
+        let mut tb2 = VirtualSubnetTunnel::new(
+            VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.2"),
+            Box::new(MemoryVpi::new()),
+            Box::new(cb2),
+        );
+        tb2.set_bootstrap_hook(Some(Box::new(RecHook {
+            seen: seen.clone(),
+            reply: None,
+        })));
+        // 普通数据帧走原数据路径（可能因非法头返回 Err），但绝不应路由到 bootstrap hook。
+        let _ = tb2.recv_and_deliver(&mut buf, 1000);
+        assert!(seen.lock().unwrap().is_empty());
+        Ok(())
     }
 }

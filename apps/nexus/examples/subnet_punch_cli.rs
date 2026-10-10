@@ -40,7 +40,7 @@ fn main() -> ExitCode {
             .expect("resp add_peer");
         let mut buf = [0u8; 4096];
         for _ in 0..400 {
-            match tunnel.recv_and_deliver(&mut buf) {
+            match tunnel.recv_and_deliver(&mut buf, 1000) {
                 Ok(Some(_)) => {}
                 Ok(None) => {}
                 Err(_) => break,

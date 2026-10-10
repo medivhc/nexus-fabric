@@ -130,6 +130,10 @@ pub struct AutoMeshController {
     lan_discovery: Option<LanDiscovery>,
     /// WAN Bootstrap 客户端（可选，None = 不走 bootstrap）。
     bootstrap: Option<BootstrapClient>,
+    /// 引导服务端角色的 VIP 租约落盘路径（§6.6）；None = 不落盘。
+    lease_state_path: Option<std::path::PathBuf>,
+    /// 上次落盘的租约快照（只在**变化**时写盘，避免每 tick 刷盘）。
+    last_persisted_leases: Vec<(String, String)>,
     /// 是否已停止。
     stopped: bool,
     /// 已消费事件游标（增量消费）。
@@ -195,9 +199,19 @@ impl AutoMeshController {
             tick_interval: Duration::from_millis(tick_interval_ms),
             lan_discovery,
             bootstrap,
+            lease_state_path: None,
+            last_persisted_leases: Vec::new(),
             stopped: false,
             last_event_index: 0,
         }
+    }
+
+    /// 启用引导服务端角色的 VIP 租约落盘（§6.6）。
+    ///
+    /// 崩溃后重启若不回读租约表，分配池会退回初始状态并把已在线节点的 VIP 再发给
+    /// 新节点，造成 IP 冲突。客户端角色调用本方法无副作用（快照恒为 `None`）。
+    pub fn set_lease_state_path(&mut self, path: std::path::PathBuf) {
+        self.lease_state_path = Some(path);
     }
 
     /// 主运行循环。
@@ -219,8 +233,12 @@ impl AutoMeshController {
         let save_interval_ticks = (10_000 / self.tick_interval.as_millis() as u64).max(1); // 每 10 秒保存一次
 
         while !self.stopped && !should_stop() {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
             // 1. 轮询收包（非阻塞）
-            match self.tunnel.recv_and_deliver(&mut buf) {
+            match self.tunnel.recv_and_deliver(&mut buf, now_secs) {
                 Ok(Some((src, n))) => {
                     // 收到数据，对应 peer 是活跃的
                     if let Some(peer) = self.peers.get_mut(&src) {
@@ -250,6 +268,33 @@ impl AutoMeshController {
                 let new_peers = bootstrap.tick();
                 for (vip, locator) in new_peers {
                     self.add_discovered_peer(&vip, &locator);
+                }
+            }
+
+            // 2c. Bootstrap 常驻会话 tick（v2 §6.4）：心跳/刷新/sweep 出站经隧道 send_raw，
+            //     新发现 peer 交回打洞。未挂载 hook 时为 no-op。
+            let bt = self.tunnel.bootstrap_tick(now_secs);
+            for p in bt.peers_added {
+                self.add_discovered_peer(&p.virtual_ip, &p.locator);
+            }
+            // W-GONE：peer 从最新 PeerList 消失 → 降级（不删除隧道 peer）。
+            for gone in bt.peers_gone {
+                eprintln!("bootstrap: peer {gone} degraded (absent from PeerList)");
+            }
+            for ev in bt.events {
+                eprintln!("bootstrap: {ev}");
+            }
+
+            // 2d. 服务端角色 VIP 租约落盘（§6.6）：只在租约表变化时写，避免每 tick 刷盘。
+            if let Some(path) = self.lease_state_path.clone() {
+                if let Some(leases) = self.tunnel.bootstrap_lease_snapshot(now_secs) {
+                    if leases != self.last_persisted_leases {
+                        if let Err(e) = crate::subnet_cli::write_lease_state(&path, &leases) {
+                            eprintln!("bootstrap: persist lease state failed: {e}");
+                        } else {
+                            self.last_persisted_leases = leases;
+                        }
+                    }
                 }
             }
 

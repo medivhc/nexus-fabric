@@ -45,8 +45,8 @@ fn main() -> ExitCode {
     .unwrap();
     let mut buf = [0u8; 4096];
     for _ in 0..10 {
-        tb.recv_and_deliver(&mut buf).unwrap();
-        ta.recv_and_deliver(&mut buf).unwrap();
+        tb.recv_and_deliver(&mut buf, 1000).unwrap();
+        ta.recv_and_deliver(&mut buf, 1000).unwrap();
         if ta.peer_state("10.0.0.2") == Some(TunnelState::Connected) {
             break;
         }
