@@ -30,7 +30,7 @@
 |---|---|---|
 | 沙盒 | `verify --fast` | 沙盒 UDP 被禁，`verify --full` 永无绿基线，**不跑** |
 | xc-pc-linux 真机 | `verify --full`、E4 场景 | 经 SSH（mesh），`CARGO_TARGET_DIR=<worktree>/target` 隔离 |
-| NU-SH-1217 | N2 跨机 E4 | 10.144.144.66，需 sudo 密码的操作提前列出 |
+| NU-SH-1217 | N2 跨机 E4 | 10.x.x.x，需 sudo 密码的操作提前列出 |
 
 - `cargo check` 必须 `--workspace --all-targets`（examples 里的旧签名会漏网）。
 - 时序 flake 判读：用干净基线 worktree（同 commit、未改代码）对照跑，
@@ -70,8 +70,8 @@
 
 ## 7. 网络生命线
 
-- `tun0` / `10.144.144.0/24` 是 SSH 生命线，**不得修改**。
-- `ssh xc-pc-linux` 经 EasyTier 端口转发（127.0.0.1:12222 → 10.144.144.6:22）；
+- `tun0` / `10.x.x.x/24` 是 SSH 生命线，**不得修改**。
+- `ssh xc-pc-linux` 经 EasyTier 端口转发（127.0.0.1:12222 → 10.x.x.x:22）；
   `/root/.ssh/config` 的别名在 VM 更换后可能丢失，
   若出现 "Connection reset by 198.19.0.1:3128" 先重建别名再排查 mesh。
 - `easytier-watchdog` 是 runtime cron（每 10 分钟），不是系统 crontab ——
