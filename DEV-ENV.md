@@ -15,7 +15,7 @@
 
 
 ```
-ssh appen@xc-pc-linux.local
+ssh <user>@<host>.local
 ```
 
 
@@ -121,7 +121,7 @@ export PATH=\$CARGO\_HOME/bin:\$PATH
 
 git bundle create D:\nexus-master.bundle master
 
-scp D:\nexus-master.bundle appen@xc-pc-linux.local:/work/nexus-dev/
+scp D:\nexus-master.bundle <user>@<host>.local:/work/nexus-dev/
 
 \# Linux：
 
