@@ -73,3 +73,7 @@ mod tests {
         assert_eq!(sched.tick(&egress, b"x").unwrap_or(0), 1);
     }
 }
+
+/// 诊断形状夹具（round 3 待办 3）。**必须挂在文件末尾**：`lib.rs:9:21` 与
+/// `lib.rs:23:12` 是 E4 场景冻结的行列锚点，往中间插 `mod` 会把它们整体下移。
+mod diagnostic_probe;

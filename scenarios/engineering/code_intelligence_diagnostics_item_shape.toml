@@ -1,0 +1,61 @@
+schema_version = 1
+id = "engineering.code-intelligence-diagnostics-item-shape"
+title = "diagnostics 条目形状有 E4 覆盖：诊断映射到通用条目字段，in_scope 走与符号条目同一判定（提案 §16.4）"
+evidence_strength = "E4"
+requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#16-acceptance-criteria"
+
+# 夹具：fixtures/code-intel/src/diagnostic_probe.rs 里刻意留一处类型错误。
+# 本场景只断言**契约保证的结构**（字段映射 + severity 归类 + 归一化 in_scope），
+# 不钉 provider 的自由文本，也不钉诊断条数——两者都随 rust-analyzer 版本的分析面
+# 变化，钉它们会得到与语义无关的脆弱红（MODULE.md「诊断条目字段映射」）。
+
+[given]
+repository = "initialized"
+network = "none (本地 language server 子进程)"
+
+[when]
+command = "nexus-harness code diagnostics engineering/nexus-harness/fixtures/code-intel/src/diagnostic_probe.rs --workspace engineering/nexus-harness/fixtures/code-intel --json"
+
+[[expect]]
+field = "command"
+equals = "code diagnostics"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "authority"
+equals = "advisory"
+
+[[expect]]
+field = "provider.kind"
+equals = "rust-analyzer"
+
+[[expect]]
+field = "results.0.kind"
+equals = "diagnostic"
+
+[[expect]]
+field = "results.0.kind_id"
+equals = 0
+
+[[expect]]
+field = "results.0.qualified_name"
+equals = "error"
+
+[[expect]]
+field = "results.0.in_scope"
+equals = true
+
+[[expect]]
+field = "results.0.path"
+equals = "engineering/nexus-harness/fixtures/code-intel/src/diagnostic_probe.rs"
+
+[[expect]]
+field = "results.0.snippet"
+non_empty = true
+
+[[expect]]
+field = "results.0.range.start.line"
+non_empty = true
