@@ -119,12 +119,13 @@ impl Repo {
     }
 
     /// `git status --porcelain` 原始输出，**保留失败**：调用方不得把"问不到"当成"干净"。
+    ///
+    /// 这里刻意**没有** `porcelain() -> String` 这种吞掉 `Err` 的便捷包装：round 2/3
+    /// 两次独立 Review 都在同一个地方踩到 fail-open（Evidence 的 `dirty_state`、
+    /// affected 分析的变更集），根因就是有一个把失败读成"空输出 = 干净/无变更"的
+    /// 默认值可用。失败必须由调用方显式决定记 UNKNOWN 还是 FAIL。
     pub fn porcelain_result(&self) -> Result<String, String> {
         self.git(&["status", "--porcelain"])
-    }
-
-    pub fn porcelain(&self) -> String {
-        self.porcelain_result().unwrap_or_default()
     }
 
     /// `None` = git 查询失败。独立 Review round 2 记的 fail-open 缺口就在这里：
@@ -364,6 +365,42 @@ mod tests {
         // 归一化失败（不存在）必须是"无法证明"，不是"通过"。
         let ghost = ws.join("nope-does-not-exist");
         assert!(!path_is_within_resolved(&ghost, &ws));
+    }
+
+    /// 符号链接越界形态的**跨宿主固化**（round 3 待办 5）。
+    ///
+    /// 这一形态此前只有 xc-pc-linux 上的一次手工实测（`.agents/green-evidence-…txt` §G），
+    /// Windows 侧因无特权建链接而无人复现。这里用 `#[cfg(unix)]` 把它变成回归测试：
+    /// workspace 内放一个指向 workspace 外的链接文件，归一化判定必须拒绝，而词法判定
+    /// 必须仍然"放过"——否则测试没有覆盖到缺陷本身。
+    #[cfg(unix)]
+    #[test]
+    fn resolved_containment_blocks_symlink_escape_that_lexical_allows() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("nexus-symescape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("ws")).expect("temp ws");
+        // 真实文件在 workspace 之外。
+        std::fs::create_dir_all(&base).expect("temp base");
+        let outside = base.join("outside.rs");
+        std::fs::write(&outside, "pub fn outside() {}\n").expect("write outside");
+        // workspace 内的链接指向它。
+        let link = base.join("ws").join("link.rs");
+        symlink(&outside, &link).expect("symlink");
+        let ws = base.join("ws");
+        assert!(
+            path_is_within(&link, &ws),
+            "词法判定放过链接——这正是必须被归一化堵住的形态"
+        );
+        assert!(
+            !path_is_within_resolved(&link, &ws),
+            "canonical 后链接目标是 workspace 外的真实文件，必须判为越界"
+        );
+        // 同目录内的普通文件仍须放行（避免修复过头）。
+        let inside = ws.join("real.rs");
+        std::fs::write(&inside, "pub fn inside() {}\n").expect("write inside");
+        assert!(path_is_within_resolved(&inside, &ws));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// 锁竞争判定必须只认 git 的锁类错误：把普通失败也拿去重试会掩盖真故障。

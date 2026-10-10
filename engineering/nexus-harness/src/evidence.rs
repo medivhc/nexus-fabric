@@ -328,6 +328,47 @@ mod tests {
     }
 
     #[test]
+    fn dirty_state_none_serializes_as_null_not_false() {
+        // 独立 Review round 3 待办 2：`dirty_state` 的 `None` 分支此前零测试。
+        // "git 问不出干净与否"绝不能被写成"干净"——那是往 Evidence 里伪造事实。
+        let mut b = bindings("r1");
+        b.dirty_state = None;
+        let json = b.to_json();
+        assert!(
+            json["dirty_state"].is_null(),
+            "None 必须是 null，实际：{}",
+            json["dirty_state"]
+        );
+        assert_ne!(
+            json,
+            bindings("r1").to_json(),
+            "null 与 false 不得是同一个绑定"
+        );
+    }
+
+    #[test]
+    fn bindings_from_non_repo_root_keep_dirty_state_unknown() {
+        // 结构性覆盖：真正的 git 失败路径（root 不是仓库）下 `Bindings::current`
+        // 产出 `None`，而不是 `Some(false)`。
+        let root = std::env::temp_dir().join(format!("nexus-ev-not-a-repo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp dir");
+        let repo = Repo { root: root.clone() };
+        assert!(
+            repo.git(&["rev-parse", "--show-toplevel"]).is_err(),
+            "本测试需要一个不在任何 git 仓库内的临时目录"
+        );
+        let b = Bindings::current(&repo);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(b.dirty_state, None, "git 失败时不得产出脏/净判断");
+        assert!(
+            b.working_tree_digest.contains("unknown"),
+            "同一失败下工作树指纹也必须带哨兵值：{}",
+            b.working_tree_digest
+        );
+    }
+
+    #[test]
     fn verify_id_deterministic() {
         let repo = Repo::discover().expect("must run inside the nexus repository");
         let a = bindings("r1");

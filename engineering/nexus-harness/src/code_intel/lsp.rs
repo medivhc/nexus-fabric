@@ -655,6 +655,7 @@ fn percent_decode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::code_intel::dto::ProviderMeta;
     use std::io::Cursor;
 
     #[test]
@@ -856,6 +857,67 @@ mod tests {
             Some(3),
             "溢出丢最旧的，队首应是被挤掉 3 条之后的那一条"
         );
+    }
+
+    /// round 3 待办 6：溢出计数不能只在缓冲区单元测试里成立。这里灌一条**真实的**
+    /// server 输出流（`NOTIFICATION_CAP + 5` 条 publishDiagnostics 后跟一个响应），
+    /// 走 `dispatch_stream` 的分流路径，确认丢弃数被记进会话，并且能被
+    /// `ProviderMeta::absorb` 带到 envelope 的 `provider.dropped_notifications` 上
+    /// ——那才是 Agent 看得见的地方。
+    #[test]
+    fn overflowing_server_notifications_are_counted_through_the_read_path() {
+        let overflow = 5usize;
+        let mut server_stream = Vec::new();
+        for i in 0..(NOTIFICATION_CAP + overflow) {
+            server_stream.extend(encode_frame(&json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/publishDiagnostics",
+                "params": {"uri": "file:///x.rs", "diagnostics": []},
+                "seq": i
+            })));
+        }
+        server_stream.extend(encode_frame(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": []
+        })));
+
+        let mut session = LspSession::for_tests(
+            BufReader::new(Cursor::new(server_stream)),
+            Box::new(RecordingSink::default()),
+        );
+        let result = session
+            .request(
+                "textDocument/definition",
+                json!({"textDocument":{"uri":"file:///x.rs"},"position":{"line":0,"character":0}}),
+                Duration::from_secs(5),
+            )
+            .expect("响应必须在溢出之后仍然返回");
+        assert_eq!(result, json!([]), "溢出不得影响响应本身");
+        assert_eq!(
+            session.dropped_notifications(),
+            overflow,
+            "读线程分流出来的丢弃数必须入账"
+        );
+
+        // 入账之后还要"看得见"：absorb 进 provider 元数据并出现在序列化字段里。
+        let mut meta = ProviderMeta::default();
+        meta.absorb(
+            session.refused_writes,
+            session.unhandled_requests,
+            session.dropped_notifications(),
+        );
+        assert_eq!(
+            meta.to_json()["dropped_notifications"],
+            json!(overflow),
+            "丢弃必须出现在 envelope 的 provider 字段里，不能只活在内存中"
+        );
+        assert_eq!(
+            meta.to_json()["write_requests_refused"],
+            json!(0),
+            "三条计数不得互相污染：{meta:?}"
+        );
+        session.shutdown();
     }
 
     #[test]
