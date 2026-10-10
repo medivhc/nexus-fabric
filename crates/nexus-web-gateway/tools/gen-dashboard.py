@@ -24,7 +24,7 @@ from pathlib import Path
 
 STATUSES = ["todo", "doing", "done"]
 STATUS_LABEL = {"todo": "待做", "doing": "进行中", "done": "已完成"}
-PRIORITY_COLOR = {"P0": "#e74c3c", "P1": "#f39c12", "P2": "#27ae60"}
+PRIORITY_COLOR = {"P0": "#fa5252", "P1": "#f59f00", "P2": "#0ca678"}
 
 
 def sh(cmd: list[str], cwd: Path) -> str:
@@ -116,25 +116,86 @@ def load_json_file(p: Path | None) -> tuple[dict | None, str | None]:
         return None, "bad"
 
 
+# Linear/Vercel clean white style
 CSS = """
-*{box-sizing:border-box}body{font-family:system-ui,-apple-system,sans-serif;margin:0;padding:16px;background:#f5f7fa;color:#222}
-h1{font-size:1.4em}h2{font-size:1.1em;border-bottom:2px solid #ddd;padding-bottom:4px}
-.kanban{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
-.col{background:#fff;border-radius:8px;padding:10px;min-height:80px}
-.card{background:#fafafa;border-left:4px solid #999;border-radius:4px;padding:8px;margin:6px 0;font-size:.9em}
-.card .pri{font-weight:bold}.card .acc{color:#555;font-size:.85em;margin-top:4px}
-.empty{color:#999;text-align:center;padding:20px}
-table{width:100%;border-collapse:collapse;font-size:.9em;background:#fff}
-th,td{padding:6px 8px;border-bottom:1px solid #eee;text-align:left}
-tr.stale30{background:#fef9e7}tr.stale90{background:#fdedec}
-.timeline{border-left:3px solid #3498db;margin-left:8px;padding-left:16px}
-.tl-item{margin:10px 0;font-size:.9em}.tl-item .hash{font-family:monospace;color:#666}
-.badge{display:inline-block;padding:6px 14px;border-radius:20px;color:#fff;font-weight:bold}
-.badge.green{background:#27ae60}.badge.red{background:#e74c3c}.badge.gray{background:#95a5a6}
-.charts{display:flex;gap:24px;flex-wrap:wrap;align-items:center}
-canvas{background:#fff;border-radius:8px}
-.meta{color:#888;font-size:.8em}
-@media(max-width:600px){.kanban{grid-template-columns:1fr}table{font-size:.8em}}
+:root{
+  --bg:#ffffff;--bg-subtle:#fafafa;--border:#eaeaea;
+  --text:#000000;--text-2:#666666;--text-3:#999999;
+  --accent:#5e6ad2;--accent-soft:#eef0fd;
+  --green:#0ca678;--green-bg:#e6fcf5;
+  --yellow:#e8890c;--yellow-bg:#fff9db;
+  --red:#fa5252;--red-bg:#ffe3e3;
+  --gray:#868e96;--gray-bg:#f1f3f5;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+  background:var(--bg);color:var(--text);line-height:1.6;
+  -webkit-font-smoothing:antialiased}
+.page{max-width:1200px;margin:0 auto;padding:48px 24px 80px}
+header.top{margin-bottom:40px}
+header.top h1{font-size:28px;font-weight:700;letter-spacing:-0.02em;margin-bottom:8px}
+header.top .meta{color:var(--text-3);font-size:13px}
+section{margin-bottom:48px}
+section>h2{font-size:15px;font-weight:600;color:var(--text-2);
+  text-transform:uppercase;letter-spacing:0.08em;margin-bottom:16px;
+  padding-bottom:12px;border-bottom:1px solid var(--border)}
+.kanban{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+.col{background:var(--bg-subtle);border:1px solid var(--border);border-radius:12px;padding:16px;min-height:120px}
+.col h3{font-size:13px;font-weight:600;color:var(--text-2);margin-bottom:12px;
+  display:flex;align-items:center;gap:8px}
+.col h3 .count{display:inline-flex;align-items:center;justify-content:center;
+  min-width:22px;height:22px;padding:0 6px;border-radius:11px;
+  background:#fff;border:1px solid var(--border);font-size:12px;color:var(--text-2)}
+.card{background:#fff;border:1px solid var(--border);border-radius:8px;
+  padding:14px;margin-bottom:10px;transition:box-shadow .15s ease,border-color .15s ease}
+.card:hover{box-shadow:0 4px 12px rgba(0,0,0,.06);border-color:#d4d4d4}
+.card:last-child{margin-bottom:0}
+.card .row1{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.card .rid{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;
+  color:var(--text-2);background:var(--gray-bg);padding:2px 8px;border-radius:4px}
+.card .pri{font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px}
+.card .pri.P0{background:var(--red-bg);color:var(--red)}
+.card .pri.P1{background:var(--yellow-bg);color:var(--yellow)}
+.card .pri.P2{background:var(--green-bg);color:var(--green)}
+.card .title{font-size:14px;font-weight:500;margin-bottom:6px}
+.card .acc{font-size:12px;color:var(--text-3);line-height:1.5}
+.empty{color:var(--text-3);text-align:center;padding:32px 16px;font-size:13px;
+  border:1px dashed var(--border);border-radius:8px;background:#fff}
+table{width:100%;border-collapse:collapse;font-size:13px;background:#fff;
+  border:1px solid var(--border);border-radius:8px;overflow:hidden}
+thead th{background:var(--bg-subtle);font-weight:600;color:var(--text-2);
+  text-align:left;padding:10px 14px;border-bottom:1px solid var(--border);font-size:12px;
+  text-transform:uppercase;letter-spacing:0.04em}
+tbody td{padding:10px 14px;border-bottom:1px solid var(--border)}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover{background:var(--bg-subtle)}
+tbody tr.stale30{background:#fffdf5}
+tbody tr.stale90{background:#fff8f8}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;
+  background:var(--gray-bg);padding:2px 6px;border-radius:4px;color:var(--text-2)}
+.timeline{position:relative;margin-left:6px;padding-left:24px}
+.timeline::before{content:"";position:absolute;left:0;top:8px;bottom:8px;width:2px;background:var(--border)}
+.tl-item{position:relative;margin-bottom:18px;font-size:13px}
+.tl-item::before{content:"";position:absolute;left:-29px;top:6px;width:8px;height:8px;
+  border-radius:50%;background:#fff;border:2px solid var(--accent)}
+.tl-item .hash{font-family:ui-monospace,Menlo,monospace;color:var(--accent);font-size:12px;margin-right:8px}
+.tl-item .meta{color:var(--text-3);font-size:12px;margin-left:8px}
+.badge{display:inline-flex;align-items:center;gap:6px;padding:6px 14px;border-radius:999px;
+  font-size:13px;font-weight:600}
+.badge::before{content:"";width:8px;height:8px;border-radius:50%;background:currentColor}
+.badge.green{background:var(--green-bg);color:var(--green)}
+.badge.red{background:var(--red-bg);color:var(--red)}
+.badge.gray{background:var(--gray-bg);color:var(--gray)}
+.badge.yellow{background:var(--yellow-bg);color:var(--yellow)}
+.charts{display:flex;gap:32px;flex-wrap:wrap;align-items:center;margin-bottom:20px}
+.chart-card{background:#fff;border:1px solid var(--border);border-radius:12px;padding:20px}
+.stat{font-size:14px;color:var(--text-2)}
+.stat b{font-size:20px;color:var(--text);font-weight:700}
+.stat .ok{color:var(--green)}.stat .fail{color:var(--red)}
+.note{font-size:13px;color:var(--text-2);background:var(--accent-soft);
+  border:1px solid #dfe3fa;border-radius:8px;padding:12px 16px;margin-top:12px}
+.note.err{background:var(--red-bg);border-color:#ffc9c9;color:#c92a2a}
+@media(max-width:720px){.kanban{grid-template-columns:1fr}.page{padding:32px 16px 64px}header.top h1{font-size:22px}}
 """
 
 
@@ -146,13 +207,14 @@ def pie_chart_js(canvas_id: str, counts: dict, colors: list[str]) -> str:
 var c=document.getElementById('{canvas_id}');if(!c)return;var x=c.getContext('2d');
 var vals={json.dumps(values)},labs={json.dumps(labels)},cols={json.dumps(colors)};
 var tot=vals.reduce((a,b)=>a+b,0);var cx=90,cy=90,r=70,a0=-Math.PI/2;
-if(tot===0){{x.fillStyle='#95a5a6';x.beginPath();x.arc(cx,cy,r,0,7);x.fill();
-x.fillStyle='#fff';x.font='12px sans-serif';x.textAlign='center';x.fillText('暂无数据',cx,cy);return;}}
+if(tot===0){{x.strokeStyle='#eaeaea';x.lineWidth=14;x.beginPath();x.arc(cx,cy,r-7,0,7);x.stroke();
+x.fillStyle='#999';x.font='12px Inter,sans-serif';x.textAlign='center';x.fillText('暂无数据',cx,cy+4);return;}}
 vals.forEach(function(v,i){{var a1=a0+v/tot*2*Math.PI;
-x.fillStyle=cols[i%cols.length];x.beginPath();x.moveTo(cx,cy);x.arc(cx,cy,r,a0,a1);x.closePath();x.fill();a0=a1;}});
-var lx=180;x.font='12px sans-serif';
-labs.forEach(function(l,i){{x.fillStyle=cols[i%cols.length];x.fillRect(lx,20+i*22,12,12);
-x.fillStyle='#222';x.fillText(l+': '+vals[i],lx+18,30+i*22);}});
+x.strokeStyle=cols[i%cols.length];x.lineWidth=22;x.beginPath();x.arc(cx,cy,r-11,a0,a1);x.stroke();a0=a1;}});
+var lx=190;x.font='13px Inter,sans-serif';
+labs.forEach(function(l,i){{x.fillStyle=cols[i%cols.length];
+x.beginPath();x.arc(lx+6,26+i*26,6,0,7);x.fill();
+x.fillStyle='#666';x.textAlign='left';x.fillText(l+': '+vals[i],lx+20,30+i*26);}});
 }})();"""
 
 
@@ -161,14 +223,15 @@ def donut_js(canvas_id: str, passed: int, failed: int) -> str:
     return f"""
 (function(){{
 var c=document.getElementById('{canvas_id}');if(!c)return;var x=c.getContext('2d');
-var p={passed},f={failed},tot=p+f,cx=90,cy=90,r=70,ir=40;
-if(tot===0){{x.strokeStyle='#95a5a6';x.lineWidth=r-ir;x.beginPath();x.arc(cx,cy,(r+ir)/2,0,7);x.stroke();
-x.fillStyle='#888';x.font='12px sans-serif';x.textAlign='center';x.fillText('暂无数据',cx,cy+4);return;}}
+var p={passed},f={failed},tot=p+f,cx=90,cy=90,r=70,ir=44;
+if(tot===0){{x.strokeStyle='#eaeaea';x.lineWidth=r-ir;x.beginPath();x.arc(cx,cy,(r+ir)/2,0,7);x.stroke();
+x.fillStyle='#999';x.font='12px Inter,sans-serif';x.textAlign='center';x.fillText('暂无数据',cx,cy+4);return;}}
 var a0=-Math.PI/2,a1=a0+p/tot*2*Math.PI;
-x.strokeStyle='#27ae60';x.lineWidth=r-ir;x.beginPath();x.arc(cx,cy,(r+ir)/2,a0,a1);x.stroke();
-x.strokeStyle='#e74c3c';x.beginPath();x.arc(cx,cy,(r+ir)/2,a1,a0+2*Math.PI);x.stroke();
-x.fillStyle='#222';x.font='bold 16px sans-serif';x.textAlign='center';
-x.fillText(Math.round(p/tot*100)+'%',cx,cy+6);
+x.strokeStyle='#0ca678';x.lineWidth=r-ir;x.lineCap='round';
+x.beginPath();x.arc(cx,cy,(r+ir)/2,a0,a1);x.stroke();
+if(f>0){{x.strokeStyle='#fa5252';x.beginPath();x.arc(cx,cy,(r+ir)/2,a1,a0+2*Math.PI);x.stroke();}}
+x.fillStyle='#000';x.font='700 18px Inter,sans-serif';x.textAlign='center';
+x.fillText(Math.round(p/tot*100)+'%',cx,cy+7);
 }})();"""
 
 
@@ -180,84 +243,99 @@ def render(reqs, docs, commits, test_data, test_err, build_data, build_err,
            gen_time: str, degraded_msg: str | None = None) -> str:
     scripts: list[str] = []
     body: list[str] = []
-    body.append(f"<h1>nexus-web-gateway 开发状态看板</h1><p class='meta'>生成时间：{esc(gen_time)}（UTC）</p>")
+    body.append("<header class='top'><h1>nexus-web-gateway</h1>"
+                f"<div class='meta'>开发状态看板 · 更新于 {esc(gen_time)} UTC</div></header>")
 
     if degraded_msg is not None:
         # Degraded mode: F5 red + error explanation only (SPEC §2 F5)
-        body.append("<h2>构建状态</h2>")
-        body.append("<span class='badge red'>构建失败</span> <span style='color:#e74c3c'>前置校验失败</span>")
-        body.append(f"<p>{esc(degraded_msg)}</p>")
-        body.append("<p class='meta'>降级页面：仅显示构建状态，其余功能因 requirements.toml 校验失败暂不可用。</p>")
+        body.append("<section><h2>构建状态</h2>")
+        body.append("<span class='badge red'>构建失败</span>")
+        body.append(f"<div class='note err'>{esc(degraded_msg)}</div>")
+        body.append("<p class='meta' style='margin-top:12px;font-size:12px;color:#999'>"
+                    "降级页面：仅显示构建状态，其余功能因 requirements.toml 校验失败暂不可用。</p></section>")
     else:
         # F1: requirements kanban
-        body.append("<h2>需求看板</h2>")
+        body.append("<section><h2>需求看板</h2>")
         if reqs is None:
             body.append("<p class='empty'>暂无数据（requirements.toml 不存在）</p>")
         else:
             counts = {s: 0 for s in STATUSES}
             for r in reqs:
                 counts[r["status"]] = counts.get(r["status"], 0) + 1
-            body.append("<div class='charts'><canvas id='pie1' width='320' height='180'></canvas></div>")
+            body.append("<div class='charts'><div class='chart-card'>"
+                        "<canvas id='pie1' width='340' height='180'></canvas></div></div>")
             scripts.append(pie_chart_js("pie1", {STATUS_LABEL[k]: counts[k] for k in STATUSES},
-                                        ["#95a5a6", "#f39c12", "#27ae60"]))
+                                        ["#dee2e6", "#ffd43b", "#0ca678"]))
             body.append("<div class='kanban'>")
             for s in STATUSES:
-                body.append(f"<div class='col'><h3>{STATUS_LABEL[s]}</h3>")
                 items = [r for r in reqs if r["status"] == s]
+                body.append(f"<div class='col'><h3>{STATUS_LABEL[s]}"
+                            f"<span class='count'>{len(items)}</span></h3>")
                 if not items:
                     body.append("<p class='empty'>暂无</p>")
                 for r in items:
-                    pc = PRIORITY_COLOR.get(r["priority"], "#999")
                     body.append(
-                        f"<div class='card' style='border-left-color:{pc}'>"
-                        f"<div><b>{esc(r['id'])}</b> <span class='pri' style='color:{pc}'>{esc(r['priority'])}</span></div>"
-                        f"<div>{esc(r['title'])}</div>"
-                        f"<div class='acc'>验收：{esc(r['acceptance'])}</div></div>"
+                        f"<div class='card'>"
+                        f"<div class='row1'><span class='rid'>{esc(r['id'])}</span>"
+                        f"<span class='pri {esc(r['priority'])}'>{esc(r['priority'])}</span></div>"
+                        f"<div class='title'>{esc(r['title'])}</div>"
+                        f"<div class='acc'>{esc(r['acceptance'])}</div></div>"
                     )
                 body.append("</div>")
             body.append("</div>")
+        body.append("</section>")
 
         # F2: docs
-        body.append("<h2>文档状态</h2>")
+        body.append("<section><h2>文档状态</h2>")
         if not docs:
             body.append("<p class='empty'>暂无文档（docs/ 为空）</p>")
         else:
-            body.append("<table><tr><th>文件</th><th>最后修改</th><th>Commit</th><th>天数</th></tr>")
+            body.append("<table><thead><tr><th>文件</th><th>最后修改</th><th>Commit</th><th>天数</th></tr></thead><tbody>")
             for d in docs:
+                stale_tag = ""
+                if d['stale'] == 'stale90':
+                    stale_tag = " <span class='badge red' style='font-size:11px;padding:2px 8px'>90天+</span>"
+                elif d['stale'] == 'stale30':
+                    stale_tag = " <span class='badge yellow' style='font-size:11px;padding:2px 8px'>30天+</span>"
                 body.append(
-                    f"<tr class='{d['stale']}'><td>{esc(d['name'])}</td>"
+                    f"<tr class='{d['stale']}'><td>{esc(d['name'])}{stale_tag}</td>"
                     f"<td>{esc(d['date'])}</td><td><code>{esc(d['commit'])}</code></td>"
                     f"<td>{d['age_days']}</td></tr>"
                 )
-            body.append("</table>")
+            body.append("</tbody></table>")
+        body.append("</section>")
 
         # F3: commits
-        body.append("<h2>最近变更</h2>")
+        body.append("<section><h2>最近变更</h2>")
         if not commits:
             body.append("<p class='empty'>暂无 commit 记录</p>")
         else:
             body.append("<div class='timeline'>")
             for c in commits:
                 body.append(
-                    f"<div class='tl-item'><span class='hash'>{esc(c['hash'])}</span> "
-                    f"{esc(c['subject'])} <span class='meta'>{esc(c['date'])} · {esc(c['author'])}</span></div>"
+                    f"<div class='tl-item'><span class='hash'>{esc(c['hash'])}</span>"
+                    f"{esc(c['subject'])}<span class='meta'>{esc(c['date'])} · {esc(c['author'])}</span></div>"
                 )
             body.append("</div>")
+        body.append("</section>")
 
         # F4: tests
-        body.append("<h2>测试状态</h2>")
+        body.append("<section><h2>测试状态</h2>")
         if test_err == "missing":
             body.append("<p class='empty'>暂无数据</p>")
         elif test_err == "bad":
-            body.append("<p style='color:#e74c3c'>数据错误（test-results.json 格式非法）</p>")
+            body.append("<div class='note err'>数据错误（test-results.json 格式非法）</div>")
         else:
             p, f = int(test_data.get("passed", 0)), int(test_data.get("failed", 0))
-            body.append(f"<div class='charts'><canvas id='donut1' width='200' height='180'></canvas>"
-                        f"<div>通过 <b>{p}</b> · 失败 <b>{f}</b></div></div>")
+            body.append("<div class='charts'><div class='chart-card'>"
+                        f"<canvas id='donut1' width='200' height='180'></canvas></div>"
+                        f"<div class='stat'>通过 <b class='ok'>{p}</b> &nbsp;·&nbsp; "
+                        f"失败 <b class='fail'>{f}</b></div></div>")
             scripts.append(donut_js("donut1", p, f))
+        body.append("</section>")
 
         # F5: build
-        body.append("<h2>构建状态</h2>")
+        body.append("<section><h2>构建状态</h2>")
         if build_err == "missing":
             body.append("<span class='badge gray'>暂无数据</span>")
         elif build_err == "bad":
@@ -268,12 +346,14 @@ def render(reqs, docs, commits, test_data, test_err, build_data, build_err,
                 body.append("<span class='badge green'>构建成功</span>")
             else:
                 body.append("<span class='badge red'>构建失败</span>")
+        body.append("</section>")
 
     return ("<!DOCTYPE html><html lang='zh-CN'><head><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-            f"<title>gateway-dashboard</title><style>{CSS}</style></head><body>"
+            "<title>nexus-web-gateway · 开发状态看板</title>"
+            f"<style>{CSS}</style></head><body><div class='page'>"
             + "".join(body)
-            + "<script>" + "".join(scripts) + "</script></body></html>")
+            + "</div><script>" + "".join(scripts) + "</script></body></html>")
 
 
 def main() -> int:
