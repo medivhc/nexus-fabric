@@ -36,6 +36,14 @@ impl LocalIdentity {
     pub fn key_pem(&self) -> Result<String, GatewayError> {
         Ok(encode_pem_block(&self.key_der, "PRIVATE KEY"))
     }
+
+    /// SHA256 fingerprint of the certificate DER, as colon-separated hex (REQ-001).
+    /// Use this to verify the CA out-of-band before installing.
+    pub fn fingerprint_sha256(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest(&self.cert_der);
+        hash.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(":")
+    }
 }
 
 /// Default directory for persisted certificates, derived from the node id.

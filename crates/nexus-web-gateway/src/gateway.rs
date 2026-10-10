@@ -143,6 +143,8 @@ struct Shared {
     udp: Arc<UdpSocket>,
     /// PEM-encoded self-signed certificate, served at `/cert`.
     cert_pem: String,
+    /// SHA256 fingerprint of the certificate, for /cert HTML page (REQ-001).
+    cert_fingerprint: String,
 }
 
 /// One browser session: the node-side WebRTC peer plus protocol state.
@@ -322,6 +324,7 @@ impl Gateway {
             event_tx: event_tx.clone(),
             udp: udp.clone(),
             cert_pem: identity.cert_pem()?,
+            cert_fingerprint: identity.fingerprint_sha256(),
         });
 
         // Register the local mesh offer handler (in-memory backend).
@@ -532,16 +535,29 @@ fn serve_http(
         return Ok(());
     }
     if request.path.starts_with("/cert") {
-        http::write_http_response(
-            tls,
-            "application/x-pem-file",
-            shared.cert_pem.as_bytes(),
-            &[(
-                "Content-Disposition",
-                "attachment; filename=\"nexus-ca.pem\"",
-            )],
-        )
-        .map_err(GatewayError::Io)?;
+        // REQ-001: Browser gets HTML guidance page (A), direct download gets PEM (B).
+        let accepts_html = request
+            .header("accept")
+            .map(|v| v.contains("text/html"))
+            .unwrap_or(false);
+        let force_pem = request.path.contains("format=pem");
+        if accepts_html && !force_pem {
+            let html = format!(
+                "<!DOCTYPE html><html><head><meta charset=\"utf-8\">                <title>Install Nexus CA</title>                <style>body{{font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 16px;}}                code{{background:#f0f0f0;padding:2px 6px;border-radius:4px;word-break:break-all;}}                pre{{background:#f0f0f0;padding:12px;border-radius:8px;overflow-x:auto;}}                .btn{{display:inline-block;background:#0066cc;color:#fff;padding:10px 20px;                text-decoration:none;border-radius:6px;margin:10px 0;}}</style></head>                <body><h1>Install Nexus Local CA</h1>                <p>This gateway uses a self-signed certificate. Install the CA below.</p>                <h2>SHA256 Fingerprint</h2><p><code>{fp}</code></p>                <h2>Option A: Browser Download</h2>                <a class=\"btn\" href=\"/cert?format=pem\" download=\"nexus-ca.crt\">Download nexus-ca.crt</a>                <h2>Option B: Command Line</h2>                <pre>curl -k https://{host}/cert?format=pem -o nexus-ca.crt</pre>                </body></html>",
+                fp = shared.cert_fingerprint,
+                host = request.header("host").unwrap_or("this-gateway"),
+            );
+            http::write_http_response(tls, "text/html; charset=utf-8", html.as_bytes(), &[])
+                .map_err(GatewayError::Io)?;
+        } else {
+            http::write_http_response(
+                tls,
+                "application/x-pem-file",
+                shared.cert_pem.as_bytes(),
+                &[("Content-Disposition", "attachment; filename=\"nexus-ca.crt\"")],
+            )
+            .map_err(GatewayError::Io)?;
+        }
         return Ok(());
     }
     if let Some(asset) = http::lookup_asset(&request.path) {
