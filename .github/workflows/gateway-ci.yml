@@ -51,8 +51,8 @@ jobs:
         run: |
           # 只测网关 crate，避免全 workspace 的无关 flaky
           cargo test -p nexus-web-gateway -- --format json > /tmp/test-out.json 2>&1 || true
-          PASSED=$(grep -c '"type":"test","event":"ok"' /tmp/test-out.json 2>/dev/null || echo 0)
-          FAILED=$(grep -c '"type":"test","event":"failed"' /tmp/test-out.json 2>/dev/null || echo 0)
+          PASSED=$(grep -c '"type":"test","event":"ok"' /tmp/test-out.json 2>/dev/null); PASSED=${PASSED:-0}
+          FAILED=$(grep -c '"type":"test","event":"failed"' /tmp/test-out.json 2>/dev/null); FAILED=${FAILED:-0}
           # cargo test 退出码决定 build status
           cargo test -p nexus-web-gateway > /dev/null 2>&1 && STATUS=success || STATUS=failure
           TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
