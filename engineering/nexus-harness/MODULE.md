@@ -214,6 +214,15 @@ Code Intelligence 场景（E4，冻结于 2026-10-10 契约阶段，夹具为
 `code_intelligence_budget_count.toml`、`code_intelligence_scope_escape.toml`（目标用 `..` 逃出
 `--workspace`）、`code_intelligence_workspace_escape.toml`（`--workspace` 根逃出仓库，必须在 spawn 之前被拒）。
 
+### Review 结论与待办承载体（2026-10-10）
+
+独立 Review 三轮走完（AGENTS.md §19.1 上限）：round 1/2 = `CHANGES_REQUESTED`（阻塞项已逐条修复），
+round 3 对被验 rev `3088dfe` 判 **`COMMENTED`（0 FAIL、0 阻塞、12 条非阻塞待办）**，案卷
+`.evidence/review-qoder-independent-3088dfe/`。12 条待办的承载体是
+`.agents/code-intelligence-followups.md`（逐条带 `文件:行` 与验收动作），本模块不另开散文清单 ——
+round 2 的教训就是"待办只写在提交说明里，下一轮没有承载体"。其中第 3、4、7、9、10 条属契约面变更，
+必须各自走独立 Contract-First 周期（新的 Red Evidence → 冻结 → 实现），不得与本模块的既有契约混改。
+
 ### Gate 实现状态（2026-09-15）
 
 `verify --full` 按 `policies/quality.toml [verification.full]` 声明执行；gate 语义统一为：**有可验证内容则真实执行，工具缺失或无可验证内容则显式 UNKNOWN 并给出原因，不静默 PASS**。

@@ -2,7 +2,7 @@
 
 本包实现《Nexus 统一系统设计规范 v9》中的“统一仓库目录契约”。
 
-文件数（不含本清单）：174
+文件数（不含本清单）：175
 
 > 2026-10-10：原声明值 137 与表内实际行数（148）已不一致（既有漂移，含
 > `scenarios/engineering/bench_gate_verdicts.toml` 等未登记项）。本次登记
@@ -19,6 +19,10 @@
 > 声明值 172 -> 174。注意 `.evidence/review-*` 与 `verify-*` 目录由 `.gitignore` 排除，
 > 不进本清单；Review 案卷因此只在本机可见，需要分享时得显式 `git add -f`。
 >
+> 2026-10-10（第四轮，独立 Review round 3 判 `COMMENTED`）：补登
+> `.agents/code-intelligence-followups.md`（12 条后续待办的承载体，避免"待办只写在提交说明里"），
+> 声明值 174 -> 175。
+>
 > 既有缺口（非本次引入，保留待仓库所有者裁决）：`.evidence/.gitignore`、
 > `.evidence/README.md` 两行来自基线（`7d2e643`），但这两个文件已在
 > `5694faa`（"untrack generated .evidence artifacts"）中被取消跟踪，磁盘上也不
@@ -27,6 +31,7 @@
 
 | Path | Purpose |
 |---|---|
+| `.agents/code-intelligence-followups.md` | 独立 Review round 3（`COMMENTED`）的 12 条后续待办，逐条带 `文件:行` 与验收动作；作为"机器可见的待办承载体" |
 | `.agents/green-evidence-code-intelligence.txt` | Green Evidence record（Code Intelligence E4 场景全 PASS，正文记录其绑定的 source_revision） |
 | `.agents/red-evidence-code-intelligence.txt` | Red Evidence record（Code Intelligence 契约阶段 9/9 FAIL） |
 | `.agents/skills/README.md` | Project-level agent skill index |
