@@ -220,7 +220,10 @@ Code Intelligence 场景（E4，冻结于 2026-10-10 契约阶段，夹具为
 `code_intelligence_write_method_denied.toml`、`code_intelligence_callees.toml`、
 `code_intelligence_scope_violation.toml`、`code_intelligence_read_only_counters.toml`、
 `code_intelligence_budget_count.toml`、`code_intelligence_scope_escape.toml`（目标用 `..` 逃出
-`--workspace`）、`code_intelligence_workspace_escape.toml`（`--workspace` 根逃出仓库，必须在 spawn 之前被拒）。
+`--workspace`）、`code_intelligence_workspace_escape.toml`（`--workspace` 根逃出仓库，必须在 spawn 之前被拒）、
+`code_intelligence_diagnostics_item_shape.toml`（诊断条目映射后的形状，round 3 待办 3；夹具
+`fixtures/code-intel/src/diagnostic_probe.rs` 刻意留一处类型错误，只钉结构不钉文案与条数）。
+共 **16** 个，全部在 xc-pc-linux（rust-analyzer 1.98.1）上 PASS。
 
 ### Review 结论与待办承载体（2026-10-10）
 
@@ -237,7 +240,7 @@ round 2 的教训就是"待办只写在提交说明里，下一轮没有承载�
 
 - 真实执行：workspace-tests / product-scenarios / regression / architecture-policy / dependency-governance（cargo-deny 0.20：`cargo deny --config policies/deny.toml check advisories licenses bans sources`，缺失则 UNKNOWN）/ coverage-summary（cargo-llvm-cov）/ platform-checks（portable-core 平台依赖静态扫描）/ feature-matrix（每成员 `--no-default-features` + `--all-features`）/ portable-core（`cargo check --target wasm32-wasip1`）。
 - 条件执行（无内容/无工具时 UNKNOWN）：integration（成员 tests/*.rs 存在时逐个运行）/ selected-fuzz（cargo-fuzz + fuzz targets）/ selected-concurrency（tests/concurrency 有测试时运行）/ performance-budgets（quality.toml `[performance]` 定义 baseline+blocking 后判定）。
-- 单元测试：`cargo test -p nexus-harness`（109 个 = 既有 58 + Code Intelligence 51；覆盖 scenario 求值、evidence 新鲜度/STALE、digest 确定性与锁竞争判定、containment 的归一化比较、workspace 成员解析、dependency-governance gate 语义，以及 JSON-RPC framing、只读白名单、URI 往返、DTO 形状与预算截断、progress 收敛判定、provider 参数校验、**假 server 主动推 `workspace/applyEdit` 的端到端拒绝**、**工作树指纹哨兵值不得当作新鲜**、**`..` 不能逃出 `--workspace` 或仓库**、notification 有界缓冲溢出、会话体积上限边界、跨重启计数合并）。
+- 单元测试：`cargo test -p nexus-harness`（xc-pc-linux/1.98.1 上 **117 个 = 既有 58 + Code Intelligence 51 + round 3 待办整改新增 8**；Windows/1.95.0 上是 116 个，差的那一条是 `cfg(unix)` 的 symlink 越界回归，另有 master 自带、依赖 POSIX `echo` 的 3 条 `scenario::tests::run_single_*`/`run_parallel_*` 在本宿主假红，见 DEVELOPMENT.md §11.1；覆盖 scenario 求值、evidence 新鲜度/STALE、digest 确定性与锁竞争判定、containment 的归一化比较（含 `#[cfg(unix)]` 真实符号链接形态）、workspace 成员解析、dependency-governance gate 语义、affected 分析在 git 失败时上抛而非交空集，以及 JSON-RPC framing、只读白名单、URI 往返、DTO 形状与预算截断、progress 收敛判定、provider 参数校验、**假 server 主动推 `workspace/applyEdit` 的端到端拒绝**、**notification 溢出经读线程入账并出现在 `provider.dropped_notifications`**、**工作树指纹哨兵值不得当作新鲜**、**`..` 不能逃出 `--workspace` 或仓库**、**早期失败不得用 `"."` 冒充 `workspace_root`**、会话体积上限边界、跨重启计数合并）。
   - Windows 宿主已知 4 个与本模块能力无关的预存在失败：3 个 scenario 测试把 `sh`/`echo` 当 shell 内建使用（Windows 下按可执行文件解析），1 个 `gates` 的 §12.58 contract-hash 测试受 `text=auto` 的 CRLF 检出影响；两者均非 Code Intelligence 引入。
 
 ## Performance Budget

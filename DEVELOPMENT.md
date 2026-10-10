@@ -252,6 +252,22 @@ MVP 优先 Cargo metadata + 显式 mapping，不构造脆弱的全程序猜测�
   cmd 内建而不是 PE 可执行文件，因此 3 个以 `echo` 为 fixture 的场景单测
   （`run_single_pass_report`、`run_single_expect_failure_signature`、
   `run_parallel_keeps_order_and_verdicts`）在 Windows FAIL、在 Linux/WSL PASS。
+  2026-10-10 复测补正机制描述：本机装了 Git for Windows，`D:\Program Files\Git\usr\bin\echo.exe`
+  确实存在，`node child_process.spawnSync("echo", ['{"verdict":"PASS"}'])` 能拿到正确输出；
+  但 harness 的管道形态（`Stdio::piped()` + 读线程）下 stdout 读回来是空的，报告落在
+  `failed_step=parse`、`detail=output not JSON (EOF while parsing a value at line 2 column 0)`。
+  结论不变（Windows 假红、Linux 绿、与本模块无关），但根因是"MSYS echo 在重定向管道下的
+  输出没有按预期到达"，不是"命令解析不到可执行文件"。
+- `gates::tests::product_section16_contract_hash_is_reproducible`（PRODUCT.md 冻结边界防篡改）
+  在 Windows 工作树里必然假红：`.gitattributes` 的 `* text=auto` 把 checkout 变成 CRLF，
+  而文档里存的 sha256 是按 LF blob 算的，同一 commit 在 Linux 上绿、在 Windows 上红
+  （实测 rev `54010f8`：Windows FAIL，xc-pc-linux PASS）。已修：该测试读入后先
+  `replace("\r\n", "\n")` 再算，并新增 `product_freeze_hash_is_line_ending_independent`
+  锁定"同一内容两种行尾 → 同一个 hash"，同时断言不归一化时二者确实不同（否则测试没意义）。
+  **口径边界要说清**：这条修改只作用于该防篡改测试，`Repo::contract_hash()`、
+  `configuration_digest()`、`working_tree_digest()` 仍然按工作树字节计算，也就是说上面
+  那条"契约身份必须按已提交 blob 计算"的待办**没有被关闭**，它仍属门禁契约变更，
+  需要独立走 Contract-First 周期。
 - `env::tests::digests_deterministic_and_sha1_length` 曾在 Linux 上偶发红（100 个里
   1 个失败，复跑与 `--test-threads=1` 全绿）。根因：`Repo::working_tree_digest()` 走
   `git write-tree`，与并发跑的其它测试争 `.git/index.lock` 时失败并**静默降级**成

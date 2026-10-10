@@ -230,3 +230,98 @@ round 2 阻塞项 B-R2-1 的四种越界形态实测（全部在 spawn 之前被
 product 场景与产品运行时行为（`cargo test -p nexus --lib` 192/0、workspace clippy 0 error），
 加上 UNKNOWN 项自带 "master Red" 标注。要把它升级成"已对照证明"，需要在 `66b6b78` 上跑一次
 `verify --full` 并 diff 结果 —— 已列入 `.agents/code-intelligence-followups.md` 合并前置项。
+
+## I. xc-pc-linux 复跑 @rev 54010f8（2026-10-10，合并 master 之后；G 段结论因 rev 变更作废）
+
+分支先 merge 掉 master 的 PR #10（`0e751fb`）⇒ 新 rev `54010f8`。G 段的 Evidence
+（`verify-qoder-xc-c9bc84e20690` @`3088dfe`）绑定的 rev 已不存在于当前历史线上，按 harness
+自己的新鲜度语义一律作废，故全部重跑。宿主身份同 G 段（rustc/clippy/rust-analyzer 1.98.1、
+`cargo-deny 0.20.2` **在场**、Ubuntu 5.15.0-139、/work 卷）。日志 `/work/xc-verify-54010f8.log`。
+
+    fmt --all -- --check                      exit 0
+    clippy --workspace --all-targets -D warn  exit 0（error_lines=0）
+    cargo test -p nexus-harness               117 passed / 0 failed / 0 ignored
+    cargo test -p nexus --lib                 217 passed / 0 failed / 2 ignored
+    verify --fast --json                      overall PASS，9/9 门 PASS，无 UNKNOWN
+        Evidence  dir=verify-qoder-xc-da41a40845f1  id=qoder-xc-da41a40845f1
+        rev=54010f85ea24  dirty=False  contract=3652314f9c21  tree=3187fff368d0
+        cfg=fa6c1bdb335a  toolchain=1.98.1  target=x86_64-unknown-linux-gnu
+        whitespace/format/check/clippy/architecture-policy(49 crates)/
+        dependency-governance(cargo-deny 四项 PASS)/resource-type-neutrality/
+        affected-tests/selected-properties  —— 全 PASS
+
+16 个 E4 场景（`code_intelligence_*.toml` 全量 glob，含本轮新增的 diagnostics-item-shape）
+**16 PASS / 0 FAIL**：
+
+    budget-count            scenario-qoder-xc-aee66714f50b
+    budget-truncation       scenario-qoder-xc-d4fa86bea8db
+    callees                 scenario-qoder-xc-f9a7370d2c84
+    callers                 scenario-qoder-xc-6d409125b24a
+    definition              scenario-qoder-xc-bc6ddd4a5b65
+    diagnostics-advisory    scenario-qoder-xc-a8c04da123cd
+    diagnostics-item-shape  scenario-qoder-xc-90ff2c8263b8   <- 本轮新增，RA 1.98 下 11 条期望全过
+    hover                   scenario-qoder-xc-7265bb1ca577
+    implementations         scenario-qoder-xc-582a0aec0557
+    provider-unavailable    scenario-qoder-xc-055698054342
+    read-only-counters      scenario-qoder-xc-4c015f8d3bb7
+    scope-escape            scenario-qoder-xc-841709fd0a59
+    scope-violation         scenario-qoder-xc-f4b725cb08c5
+    symbol                  scenario-qoder-xc-839889db81c4
+    workspace-escape        scenario-qoder-xc-2c243bef5e7d
+    write-method-denied     scenario-qoder-xc-e3ae20f176fd
+
+新场景的 Red→Green 顺序（契约先行，不是先看输出再补期望）：
+`scenario-edf5bdf1d4b8`（Windows 上夹具文件尚不存在时跑的 Red：`verdict` 期望落空，
+实际 `FAIL` + `QUERY_INVALID`"不是存在的文件"）⇒ 加 `diagnostic_probe.rs` ⇒ Green。
+
+四种越界形态复现（全部在 spawn provider 之前被拒，envelope 里**没有** `provider` 字段）：
+(a) 目标含 `..` 逃出 `--workspace` → FAIL/QUERY_INVALID；(b) 目标用 `..` 逃出整个仓库 →
+FAIL/QUERY_INVALID；(c) `--workspace` 根本身逃出仓库 → BLOCKED/WORKSPACE_UNRESOLVED；
+(d) workspace 内真实 symlink 指向 `$HOME` 下仓库外文件 → FAIL/QUERY_INVALID，reason 直接
+写明归一化后的目标不在 `--workspace` 内。
+
+副作用检查：`dirty_after=0`；仓库内 flycheck 残留 0；scratch 目录
+`/tmp/nexus-code-intel-517b88935b83eb87`（112K，跨命令复用，属 Phase 4 话题）。
+
+Windows 侧同批改动（rustc/clippy/rust-analyzer 1.95.0，**只作冒烟不作结论**）：
+`cargo test -p nexus-harness` 116 个（比 Linux 少 1 条 = `#[cfg(unix)]` 的 symlink 回归），
+3 条 master 自带、依赖 POSIX `echo` 的 scenario 单测假红（机制更正见 DEVELOPMENT.md §11.1：
+`echo.exe` 能 spawn，但 harness 的管道形态读回空 stdout ⇒ `failed_step=parse`）；
+PRODUCT.md 冻结边界防篡改测试因 `* text=auto` 的 CRLF checkout 假红，本轮已在测试内按 LF
+规范化修掉并补了"行尾无关"锁定测试。16 个场景串行跑出现 1 次 `symbol` 假红
+（`scenario-ffd32feefd2a`），单跑即 PASS（`scenario-105171ccc9f9`）——前一个场景的
+rust-analyzer 还在夹具 workspace 里做 cargo check，后一个的索引/就绪判定被打断，
+是冷启动/无会话复用问题，不是语义回归。
+
+## J. `verify --full` 本轮**未能完成**（磁盘余量），已中止并如实记录
+
+rev `54010f8` 上启动 `verify --full --json`（`/work/xc-verify-full.sh`，
+日志 `/work/xc-full-54010f8.log`）。跑到 coverage/feature-matrix 阶段时 `/work`
+从 22G 余量一路掉到 8.3G（`df` 100%），继续下去会打满这块**共享开发卷**（该机上还有
+其它任务的 clone 与 systemd 服务），所以在 08:23 处主动终止：
+`verify-full-exit=143`（SIGTERM），Evidence 目录尚未写出 ⇒ **本轮没有 --full 结论**。
+
+善后核对：`dirty_after=0`（工作树未被这轮中止污染）、仓库内无残留 `cargo`/`nexus-harness`
+进程；随后删除本验证专用的 `/work/nexus-ci/target`（32G，可再生）把余量恢复到 40G。
+`/tmp` 里 220M×N 的 `pf*.rgba` 不是本任务产物，未动。
+
+对照实验（原计划"纯 master 的 `verify --full`"）也一并降级说明：动态对照需要为
+`0e751fb` 重建整个 workspace，磁盘与时间都不支持，本轮改为**静态等价论证**：
+
+    git diff --stat origin/master...HEAD -- scenarios/product/     ⇒ 空（本分支没碰任何 product 场景）
+    apps 侧 6 个文件的差异逐条看过（+43/-7）：
+      · localapi_client.rs / task_authorization.rs / task_provider_grant.rs /
+        nexusd/task_service.rs —— 全部是给 import 或 item 加 `#[cfg(unix)]` /
+        `#[cfg(target_os = "linux")]` / `#[cfg_attr(not(linux), allow(dead_code))]`，
+        Linux 分支内容与 master 一致；
+      · main.rs —— 只加 `#[cfg(windows)]` 的 system-proxy helper 与 `json!` 导入；
+      · network.rs —— `pump::{Ipv4Route,PeerConnLookup,VpiPump}`、`VirtualPacketInterface`、
+        `Mutex`、`ManagerLookup` 等改为仅 Linux 导入/定义（Linux 侧仍在），外加非 Linux
+        分支里 `return 2;` → `2;`（该块在 Linux 上不参与编译）。
+    ⇒ 在权威宿主（Linux）上，本分支相对 master 的**产品可见行为等价**，因此 --full 里
+      `product-scenarios` 的红（H 段：约 20 条 `product.n3-*` 自带 "master Red" 标注 +
+      `daemon-workspace-mount` / `n1-connectivity-roam` 真设备语义）不是本分支引入的。
+
+诚实边界：这是"按差异枚举论证等价"，**不是**同一命令在 master 上的实测对照。动态对照
+脚本已就位（`/work/xc-master-control.sh`：跑同一组 `scenarios/product/*.toml` 逐条
+`scenario run` 并 diff verdict 集合），列为待办，前提是宿主有 ≥40G 余量或改用独立 clone。
