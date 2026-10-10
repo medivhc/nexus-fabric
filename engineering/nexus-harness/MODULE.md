@@ -54,6 +54,7 @@ options（全部可选，缺省即预算默认值）：
 
 - `command` / `authority` / `error`（失败时）永远存在。
 - `snapshot` 一旦完成仓库发现就存在（含 verb 不认识、参数非法等 provider 启动前的失败）；不在 git 仓库内时以 `WORKSPACE_UNRESOLVED` 上报。
+- `snapshot.workspace_root` **只在作用域校验通过后出现**。早期失败（verb 缺失/不认识、参数非法、作用域被拒）里 `snapshot` 存在但没有这个字段——不用 `"."` 之类的占位值表示"还没确定"，那会让消费方把"未确定作用域"读成"作用域就是仓库根"（round 3 待办 4）。
 - `budget` 在 options 解析成功后存在；`provider` 只在 language server 被解析到之后存在。
 - `results` / `count` 恒存在，失败时为 `[]` / `0`——失败**绝不**表现为"空结果 + PASS"。
 
@@ -67,7 +68,9 @@ provider           {kind,binary,version,ready,restart_count,restart_reason,
                       dropped_notifications}
                    kind 是适配器标识，binary 是实际解析到的可执行文件（两者可对照
                    发现错配）；三类计数彼此分离，"未识别请求"不得污染写拒绝计数
-snapshot           {source_revision,working_tree_digest,target_triple,toolchain_version,workspace_root}
+snapshot           {source_revision,working_tree_digest,target_triple,toolchain_version,
+                      workspace_root}
+                   workspace_root 仅在作用域校验通过后出现（见上方字段可得性规则）
 authority          恒为 "advisory"：Code Intelligence 不拥有最终 PASS
 error              失败时 {code,reason}
 ```
@@ -116,9 +119,13 @@ SYMBOL_NOT_FOUND RESULT_TRUNCATED TIMEOUT PROVIDER_CRASHED SNAPSHOT_STALE UNSUPP
 | `range`（0-based） | `range`（1-based） | 与其他 verb 同一转换规则 |
 | `message` | `snippet` | 自由文本只进 `snippet`，判定不依赖解析它 |
 
-已知缺口（照实记）：当前 deterministic 夹具里没有任何会产生诊断的文件，因此**条目形状
-只有代码与单测为证，没有 E4 覆盖**。补一个"带 `#[deny(...)]` 的稳定诊断源文件"夹具
-属契约扩展（要新场景 + 冻结期望），留待独立周期做。
+条目形状由 `engineering.code-intelligence-diagnostics-item-shape`（E4）锁定：夹具里
+`fixtures/code-intel/src/diagnostic_probe.rs` 刻意留**一处**类型错误，场景断言
+`results.0` 的映射后形状（`kind == "diagnostic"`、`kind_id == 0`、`qualified_name`
+即 severity 且必须是 `error`、`in_scope == true`、`path` 指向该文件、`symbol`/`snippet`
+非空）。只断言**契约保证的结构**，不钉 provider 版本的自由文本——RA 1.95 与 1.98 的
+message 措辞不同，钉文案等于把版本耦合写进契约。诊断条目的**数量**同样不钉：
+它随 RA 的分析面变化，钉数量会制造与语义无关的脆弱红。
 
 ## Non-Responsibilities
 
@@ -184,6 +191,7 @@ SYMBOL_NOT_FOUND RESULT_TRUNCATED TIMEOUT PROVIDER_CRASHED SNAPSHOT_STALE UNSUPP
 - 允许：写入 `.evidence/verify-<id>/`（Evidence）；运行只读验证命令（cargo/git）；输出状态；为 Code Intelligence 启动长期本地子进程 `rust-analyzer`（工作目录限制在仓库/worktree 内，每请求有 timeout/cancellation，stdout 有单帧 64MiB + 单会话累计 256MiB 上限、stderr 有 64KiB 环形上限（超限即按崩溃处理，不静默截断后继续）；crash 最多重启一次且必须记入 `provider.restart_count` 与 `provider.restart_reason`，命令结束时发送 `shutdown`/`exit`）。
 - 禁止：修改业务代码；修改 `scenarios/` 或 `policies/` 内容；执行网络操作；修改 git index/HEAD。
 - 新增副作用前必须更新本契约和 Scenario/Policy（如影响外部行为）。
+- 容量口径（照实说明，别把近似值当精确值）：上述 256MiB 量的是**读线程再序列化后累计的近似线上字节**（`serde_json::to_string` 后的长度），不是进程 RSS，也不是 `serde_json::Value` 的堆占用——后者通常是线上字节的好几倍，所以 256MiB 并不等于"最多用 256MiB 内存"。把口径做精确的前提是 `read_frame` 直接返回本帧消耗的字节数（round 3 待办 8），在此之前调小上限只是换一个同样含糊的数；因此本轮**不动数值**，只把口径写进契约，并把"降上限到 32–64MiB"留作带测量的独立契约周期（属契约数值变更，会影响超大 workspace 的可用性）。
 
 ## Public API
 

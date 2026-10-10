@@ -91,13 +91,14 @@ pub fn run(args: &[String]) -> Outcome {
 
     // 先做仓库发现：这样即便 verb/参数解析失败，envelope 里仍有 snapshot，
     // Agent 不必靠"有没有这个字段"去猜失败发生在哪一层。
+    //
+    // 这里**不写** `workspace_root`（旧实现写 `"."`）。`"."` 与成功路径上的真实作用域
+    // 共用同一个字段名却语义相反（一个是"还没确定"、一个是"已确定为 X"），消费方按
+    // 字段存在与否判断就会把"未确定"读成"就是仓库根"。独立 Review round 3 待办 4
+    // 要求取消这一双含义：未确定作用域时该字段不出现（见 MODULE.md 字段可得性规则）。
     let setup = commands::setup();
     if let Ok((early_repo, _)) = &setup {
-        let mut snap = Bindings::current(early_repo).to_json();
-        if let Some(obj) = snap.as_object_mut() {
-            obj.insert("workspace_root".to_string(), json!("."));
-        }
-        base.snapshot = Some(snap);
+        base.snapshot = Some(Bindings::current(early_repo).to_json());
     }
 
     if verb_raw.is_empty() {
@@ -818,5 +819,40 @@ mod tests {
             obj.get("provider").is_none(),
             "越界的 --workspace 不得启动 language server：{obj:?}"
         );
+        // round 3 待办 4：作用域被拒时 snapshot 仍在（仓库发现已完成），但
+        // `workspace_root` 不得出现——它只有"已确定为 X"这一种含义。
+        let snap = &obj["snapshot"];
+        assert!(snap.is_object(), "仓库发现成功就必须带 snapshot：{obj:?}");
+        assert!(
+            snap.get("workspace_root").is_none(),
+            "未确定作用域时不得出现 workspace_root（旧实现写 `\".\"` 冒充仓库根）：{snap}"
+        );
+    }
+
+    #[test]
+    fn early_failures_never_claim_a_workspace_root() {
+        // 同一不变量的另一条路径：verb 缺失（QUERY_INVALID → FAIL）与 verb 不认识
+        // （UNSUPPORTED → BLOCKED）都发生在 options 解析之前，作用域从未被确定过，
+        // 因此 `workspace_root` 不该出现。verdict 按 MODULE.md 冻结的错误码表逐个钉死。
+        for (args, want_verdict, want_code) in [
+            (Vec::<String>::new(), "FAIL", json!("QUERY_INVALID")),
+            (
+                vec!["rename".to_string(), "x".to_string()],
+                "BLOCKED",
+                json!("UNSUPPORTED"),
+            ),
+        ] {
+            let (verdict, msg, extras) = run(&args);
+            assert_eq!(verdict, want_verdict, "{msg}");
+            let obj: serde_json::Map<String, Value> = extras.into_iter().collect();
+            assert_eq!(obj["error"]["code"], want_code, "{msg}");
+            if let Some(snap) = obj.get("snapshot") {
+                assert!(
+                    snap.get("workspace_root").is_none(),
+                    "verb={} 的早期失败里 snapshot 冒充了作用域：{snap}",
+                    args.first().map(String::as_str).unwrap_or("<none>")
+                );
+            }
+        }
     }
 }
