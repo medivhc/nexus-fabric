@@ -1,6 +1,0 @@
-# Normalize line endings for text files; git stores LF in the object database.
-* text=auto
-
-# POSIX shell hooks must stay LF so git can execute them (shebang).
-.githooks/* text eol=lf
-*.sh text eol=lf
