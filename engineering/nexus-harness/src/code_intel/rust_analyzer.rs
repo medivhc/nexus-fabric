@@ -260,7 +260,7 @@ impl RustAnalyzerProvider {
     }
 
     /// 只读请求 + 崩溃重启（提案 §6/§14：crash 可重启但必须记录）。
-    /// 重启计数累加、保留**首次**崩溃原因，最多重启 2 次。
+    /// 重启计数累加、保留**首次**崩溃原因，**最多重启一次**（与 MODULE.md 一致）。
     fn invoke(&mut self, method: &str, params: Value, notify: bool) -> Result<Value, Failure> {
         let timeout = self.timeouts.request;
         let first = Self::run_on(self.session_mut()?, method, &params, notify, timeout);
@@ -278,6 +278,13 @@ impl RustAnalyzerProvider {
             self.meta.restart_reason = format!("{kind} {method}: {}", err.reason);
         }
         if let Some(mut session) = self.session.take() {
+            // 计数**跨重启累计**：旧会话拒绝过的写请求、丢弃过的 notification 若随
+            // session 一起丢掉，就等于把"拒绝能力发生过"这件事抹掉（MODULE.md）。
+            self.meta.absorb(
+                session.refused_writes,
+                session.unhandled_requests,
+                session.dropped_notifications(),
+            );
             session.close_quietly();
         }
         self.opened.clear();
@@ -422,17 +429,16 @@ impl RustAnalyzerProvider {
 
     /// 结束前取元数据，并把会话内累计的写请求拒绝计数并入。
     pub fn finish_meta(&mut self) -> ProviderMeta {
-        let (refused, unhandled) = self
-            .session
-            .as_ref()
-            .map_or((0, 0), |s| (s.refused_writes, s.unhandled_requests));
+        // `self.meta` 里已带重启前累计的计数；这里把**最后一个仍活着的**会话累加进来
+        // （它还没被 invoke 的替换路径 absorb 过，所以不会重复计）。
         let mut meta = self.meta().clone();
-        meta.write_requests_refused = refused;
-        meta.server_requests_unhandled = unhandled;
-        meta.dropped_notifications = self
-            .session
-            .as_ref()
-            .map_or(0, LspSession::dropped_notifications);
+        if let Some(session) = self.session.as_ref() {
+            meta.absorb(
+                session.refused_writes,
+                session.unhandled_requests,
+                session.dropped_notifications(),
+            );
+        }
         meta.ready = self.readiness().trustworthy();
         meta
     }
@@ -467,7 +473,7 @@ impl RustAnalyzerProvider {
             .unwrap_or("")
             .to_string();
         let site = ResolvedSite {
-            in_scope: crate::env::path_is_within(&abs, &self.workspace_root),
+            in_scope: site_in_scope(&abs, &self.workspace_root),
             abs_path: abs,
             range,
         };
@@ -579,7 +585,7 @@ impl CodeIntelligenceProvider for RustAnalyzerProvider {
                 kind_id: i64::from(kind),
                 qualified_name: qualified,
                 path: rel,
-                in_scope: crate::env::path_is_within(&abs, &self.workspace_root),
+                in_scope: site_in_scope(&abs, &self.workspace_root),
                 range: Some(crate::code_intel::dto::PositionRange {
                     start_line: range.0,
                     start_column: range.1,
@@ -730,7 +736,7 @@ impl CodeIntelligenceProvider for RustAnalyzerProvider {
             kind_id,
             qualified_name: qualified,
             path: relative_path(&self.repo_root, &abs),
-            in_scope: crate::env::path_is_within(&abs, &self.workspace_root),
+            in_scope: site_in_scope(&abs, &self.workspace_root),
             range: result
                 .get("range")
                 .and_then(lsp_range_of_ref)
@@ -780,6 +786,9 @@ impl CodeIntelligenceProvider for RustAnalyzerProvider {
             .into_iter()
             .map(|d| DiagnosticItem {
                 path: rel.clone(),
+                // 诊断条目也用同一套归一化判定，不再硬编码 true：
+                // server 完全可能把别处（sysroot、依赖 crate）的诊断报进同一份 pull 结果。
+                in_scope: site_in_scope(&abs, &self.workspace_root),
                 severity: diagnostic_severity(
                     d.get("severity").and_then(Value::as_i64).unwrap_or(0),
                 )
@@ -1063,7 +1072,7 @@ fn sites_from_value(result: &Value, workspace_root: &Path) -> Vec<ResolvedSite> 
     let mut push = |uri: &str, range: LspRange| {
         let abs = PathBuf::from(uri_to_path(uri));
         let site = ResolvedSite {
-            in_scope: crate::env::path_is_within(&abs, workspace_root),
+            in_scope: site_in_scope(&abs, workspace_root),
             abs_path: abs,
             range,
         };
@@ -1225,6 +1234,20 @@ fn absolute(path: &Path) -> PathBuf {
         std::env::current_dir()
             .map(|cwd| cwd.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+/// 条目是否落在 workspace 内。**先按 canonical 比较**，这样 `..` 组件、符号链接/
+/// junction、盘符大小写都不会造成假阳或假阴；只有当归一化失败（server 报出的路径
+/// 尚未落盘，例如虚拟文档或生成代码）才退回词法前缀比较——那种情况下无法证明文件
+/// 在界内，但也不该把确定在界内的条目标成越界；`in_scope` 只标注、不删除条目。
+fn site_in_scope(candidate: &Path, workspace_root: &Path) -> bool {
+    match (
+        crate::env::canonicalized(candidate),
+        crate::env::canonicalized(workspace_root),
+    ) {
+        (Some(c), Some(w)) => c.starts_with(&w),
+        _ => crate::env::path_is_within(candidate, workspace_root),
     }
 }
 

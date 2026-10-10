@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -193,6 +194,10 @@ pub struct LspSession {
     /// 未识别的 server→client 请求计数；与写能力分开，否则正常只读查询
     /// 也会让 refused 恒为非 0，只读信号失真。
     pub unhandled_requests: usize,
+    /// 读线程是否因单会话 stdout 上限掐断：把"资源边界违规"与"进程普通退出"分开报。
+    stdout_capped: Arc<AtomicBool>,
+    /// 仅内存流测试会话为 true（此时 `child` 允许为 None）；生产会话恒 false。
+    test_transport: bool,
 }
 
 /// notification 缓冲上限：读线程不能无上限堆积（RA 索引期会刷屏
@@ -206,6 +211,22 @@ struct NoteBuffer {
     dropped: usize,
 }
 
+/// 有界入队：满了就丢最旧的一条并计数（丢弃必须可见，不能静默）。
+/// 单独成函数是为了能被单元测试直接打到上限 —— 生产路径要灌 257 条
+/// `publishDiagnostics` 才能触发一次，测试里直接构造缓冲区更便宜也更确定。
+fn push_notification(buffer: &mut NoteBuffer, message: Value) {
+    if buffer.queue.len() >= NOTIFICATION_CAP {
+        buffer.queue.pop_front();
+        buffer.dropped += 1;
+    }
+    buffer.queue.push_back(message);
+}
+
+/// 单会话累计体积是否已越限。
+fn session_over_limit(accumulated: u64, added: u64, cap: u64) -> bool {
+    accumulated.saturating_add(added) > cap
+}
+
 /// 读线程主体：分流 response / notification / server→client 请求。
 ///
 /// 单独成函数（而不是长在 `spawn` 的闭包里）是为了让**同一套分流逻辑**能被
@@ -217,25 +238,24 @@ fn dispatch_stream<R: BufRead>(
     responses: &Sender<Value>,
     server_requests: &Sender<Value>,
     note_sink: &Arc<Mutex<NoteBuffer>>,
+    stdout_capped: &Arc<AtomicBool>,
 ) {
     let mut session_bytes: u64 = 0;
     while let Ok(msg) = read_frame(reader) {
-        session_bytes = session_bytes
-            .saturating_add(serde_json::to_string(&msg).map(|s| s.len()).unwrap_or(0) as u64);
-        if session_bytes > MAX_SESSION_STDOUT_BYTES {
-            // 超限：不再消费，按崩溃路径处理（会 drop tx -> 上层报 PROVIDER_CRASHED）。
+        let added = serde_json::to_string(&msg).map(|s| s.len()).unwrap_or(0) as u64;
+        if session_over_limit(session_bytes, added, MAX_SESSION_STDOUT_BYTES) {
+            // 超限：不再消费，并把"是上限掐断的"这件事记下来 —— 否则上层只能报
+            // 泛化的"进程已退出"，把一个资源边界违规伪装成一次普通崩溃。
+            stdout_capped.store(true, Ordering::Relaxed);
             break;
         }
+        session_bytes = session_bytes.saturating_add(added);
         let has_method = msg.get("method").is_some();
         let has_id = msg.get("id").is_some();
         if has_method && !has_id {
             // notification：有界入队，溢出丢最旧的并计数（不阻塞读线程）。
             if let Ok(mut guard) = note_sink.lock() {
-                if guard.queue.len() >= NOTIFICATION_CAP {
-                    guard.queue.pop_front();
-                    guard.dropped += 1;
-                }
-                guard.queue.push_back(msg);
+                push_notification(&mut guard, msg);
             }
             continue;
         }
@@ -295,14 +315,16 @@ impl LspSession {
         let notes: Arc<Mutex<NoteBuffer>> = Arc::new(Mutex::new(NoteBuffer::default()));
         let (srx_tx, srx) = mpsc::channel::<Value>();
         let ring = Arc::new(Mutex::new(StderrRing::default()));
+        let stdout_capped = Arc::new(AtomicBool::new(false));
 
         let reader = {
             let note_sink = Arc::clone(&notes);
+            let capped = Arc::clone(&stdout_capped);
             std::thread::Builder::new()
                 .name("nexus-code-intel-reader".to_string())
                 .spawn(move || {
                     let mut br = BufReader::new(stdout);
-                    dispatch_stream(&mut br, &rtx, &srx_tx, &note_sink);
+                    dispatch_stream(&mut br, &rtx, &srx_tx, &note_sink, &capped);
                 })
                 .map_err(|e| protocol_failure(format!("reader thread spawn failed: {e}")))?
         };
@@ -344,6 +366,8 @@ impl LspSession {
             next_id: 0,
             refused_writes: 0,
             unhandled_requests: 0,
+            stdout_capped,
+            test_transport: false,
         })
     }
 
@@ -357,11 +381,13 @@ impl LspSession {
         let (rtx, rrx) = mpsc::channel::<Value>();
         let (srx_tx, srx) = mpsc::channel::<Value>();
         let notes: Arc<Mutex<NoteBuffer>> = Arc::new(Mutex::new(NoteBuffer::default()));
+        let stdout_capped = Arc::new(AtomicBool::new(false));
         let reader_handle = std::thread::spawn({
             let note_sink = Arc::clone(&notes);
+            let capped = Arc::clone(&stdout_capped);
             move || {
                 let mut br = reader;
-                dispatch_stream(&mut br, &rtx, &srx_tx, &note_sink);
+                dispatch_stream(&mut br, &rtx, &srx_tx, &note_sink, &capped);
             }
         });
         LspSession {
@@ -375,6 +401,8 @@ impl LspSession {
             next_id: 0,
             refused_writes: 0,
             unhandled_requests: 0,
+            stdout_capped,
+            test_transport: true,
         }
     }
 
@@ -438,9 +466,17 @@ impl LspSession {
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(protocol_failure(
-                        "provider 进程已退出（读通道关闭）".to_string(),
-                    ));
+                    // 区分两种断开：被资源上限掐断 vs 进程自己退出。前者调大预算也没用，
+                    // 后者才该走重启路径，混在一起会让 Retry/Abort 判断读到假原因。
+                    let capped = self.stdout_capped.load(Ordering::Relaxed);
+                    return Err(protocol_failure(if capped {
+                        format!(
+                            "provider stdout 累计超过 {}MiB 会话上限，读线程已停止（不是进程崩溃）",
+                            MAX_SESSION_STDOUT_BYTES / (1024 * 1024)
+                        )
+                    } else {
+                        "provider 进程已退出（读通道关闭）".to_string()
+                    }));
                 }
             }
         }
@@ -486,10 +522,14 @@ impl LspSession {
         }
     }
 
-    /// provider 进程是否还活着（`try_wait` 不阻塞）。无子进程（测试构造）视为活着。
+    /// provider 进程是否还活着（`try_wait` 不阻塞）。
+    ///
+    /// `child == None` 只可能来自内存流构造的测试会话（`test_transport = true`）。
+    /// 生产会话若走到这条分支，按"已死"处理而**不是**返回保守 true：把"根本没有
+    /// 子进程"说成"还活着"会让上层把就绪预算空转到超时（round 2 评审的 fail-slow 项）。
     pub fn is_alive(&mut self) -> bool {
         let Some(child) = &mut self.child else {
-            return true;
+            return self.test_transport;
         };
         match child.try_wait() {
             Ok(None) => true,
@@ -795,6 +835,49 @@ mod tests {
                 .all(|m| READ_ONLY_METHODS.contains(&m)),
             "出向 method 必须全在白名单内：{frames:?}"
         );
+    }
+
+    /// notification 上限必须能在测试里被打到：生产路径要灌 257 条 publishDiagnostics
+    /// 才会触发一次，直接构造缓冲区既便宜又确定。
+    #[test]
+    fn notification_buffer_overflow_is_bounded_and_counted() {
+        let mut buffer = NoteBuffer::default();
+        for i in 0..(NOTIFICATION_CAP + 3) {
+            push_notification(&mut buffer, json!({"i": i}));
+        }
+        assert_eq!(buffer.queue.len(), NOTIFICATION_CAP, "队列不得越过上限");
+        assert_eq!(buffer.dropped, 3, "丢弃必须计数，不能静默");
+        assert_eq!(
+            buffer
+                .queue
+                .front()
+                .and_then(|v| v.get("i"))
+                .and_then(Value::as_i64),
+            Some(3),
+            "溢出丢最旧的，队首应是被挤掉 3 条之后的那一条"
+        );
+    }
+
+    #[test]
+    fn session_byte_cap_boundaries() {
+        assert!(!session_over_limit(0, 1, 10));
+        assert!(!session_over_limit(10, 0, 10));
+        assert!(!session_over_limit(6, 4, 10), "正好等于上限不算越限");
+        assert!(session_over_limit(6, 5, 10));
+        // saturating 累加：反复相加不会绕回小数从而放过恶意流量。
+        assert!(session_over_limit(u64::MAX, 5, 10));
+    }
+
+    /// 内存流会话（`test_transport = true`）没有子进程，`is_alive` 才允许报存活；
+    /// 生产会话的 `child` 恒为 `Some`，因此"没有进程"不会被说成"还活着"。
+    #[test]
+    fn test_transport_session_reports_alive_by_definition() {
+        let mut session = LspSession::for_tests(
+            BufReader::new(Cursor::new(Vec::new())),
+            Box::new(RecordingSink::default()),
+        );
+        assert!(session.is_alive());
+        assert!(session.test_transport);
     }
 
     #[test]

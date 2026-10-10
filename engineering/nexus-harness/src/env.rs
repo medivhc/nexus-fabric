@@ -118,23 +118,37 @@ impl Repo {
             .unwrap_or_else(|_| "no-commit".to_string())
     }
 
-    pub fn porcelain(&self) -> String {
-        self.git(&["status", "--porcelain"]).unwrap_or_default()
+    /// `git status --porcelain` 原始输出，**保留失败**：调用方不得把"问不到"当成"干净"。
+    pub fn porcelain_result(&self) -> Result<String, String> {
+        self.git(&["status", "--porcelain"])
     }
 
-    pub fn is_dirty(&self) -> bool {
-        !self.porcelain().is_empty()
+    pub fn porcelain(&self) -> String {
+        self.porcelain_result().unwrap_or_default()
+    }
+
+    /// `None` = git 查询失败。独立 Review round 2 记的 fail-open 缺口就在这里：
+    /// 旧实现 `unwrap_or_default()` 会把"问不到"写成 `dirty_state: false`，
+    /// 于是 Evidence 里出现一条正面事实"工作树干净"。
+    pub fn dirty_state(&self) -> Option<bool> {
+        self.porcelain_result().map(|p| !p.is_empty()).ok()
     }
 
     /// Digest of the working tree: index tree when clean, otherwise a hash of
     /// the porcelain output (stable for a given dirty state).
+    ///
+    /// 只问一次 `git status`（旧实现问两次，既多一倍开销又多一倍 index.lock 竞争面）。
+    /// 问不到状态时返回哨兵值 `dirty-unknown`，由调用方显式处理
+    /// （`code_intel::digest_is_unusable` 就是那个"显式处理"）。
     pub fn working_tree_digest(&self) -> String {
-        if self.is_dirty() {
-            self.hash_stdin(&self.porcelain())
-                .unwrap_or_else(|_| "dirty-unknown".to_string())
-        } else {
-            self.git(&["write-tree"])
-                .unwrap_or_else(|_| "tree-unknown".to_string())
+        match self.porcelain_result() {
+            Ok(porcelain) if porcelain.is_empty() => self
+                .git(&["write-tree"])
+                .unwrap_or_else(|_| "tree-unknown".to_string()),
+            Ok(porcelain) => self
+                .hash_stdin(&porcelain)
+                .unwrap_or_else(|_| "dirty-unknown".to_string()),
+            Err(_) => "dirty-unknown".to_string(),
         }
     }
 
@@ -256,6 +270,27 @@ pub fn path_is_within(path: &Path, dir: &Path) -> bool {
     path.starts_with(dir)
 }
 
+/// `std::fs::canonicalize` 的 Option 形态：失败（不存在、无权限、跨卷…）返回 None。
+pub fn canonicalized(path: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(path).ok()
+}
+
+/// **文件系统视角**的包含关系：两侧都先 canonicalize，再按路径组件比较。
+///
+/// 为什么不能用 `path_is_within`：`fixtures/../../../../run-scenarios.sh` 在词法上
+/// 以仓库根为前缀，实际指向仓库之外（独立 Review round 2 的 B-R2-1 就是这条通路把查询
+/// 目标送出仓库、并让子进程 cwd 落在仓库外的）。canonicalize 同时解决三类假阳/假阴：
+/// `.`/`..` 组件、符号链接与 Windows junction、盘符大小写。
+///
+/// fail-closed 语义：任一侧归一化失败即返回 false —— 调用方必须把 false 当作
+/// "无法证明在范围内"并显式报错，不得当成通过。
+pub fn path_is_within_resolved(path: &Path, dir: &Path) -> bool {
+    match (canonicalized(path), canonicalized(dir)) {
+        (Some(p), Some(d)) => p.starts_with(&d),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +320,50 @@ mod tests {
             );
         }
         assert_eq!(repo.hash_stdin("abc").unwrap().len(), 40);
+    }
+
+    /// B-R2-1 的根因测试：词法前缀判定会被 `..` 骗过，归一化判定不会。
+    /// 两条断言合起来才说明问题——先证明缺陷形状仍然存在（词法判"在内"），
+    /// 再证明修复后的判定把它挡下（canonical 判"越界"）。
+    #[test]
+    fn resolved_containment_blocks_dotdot_that_lexical_allows() {
+        let repo = Repo::discover().expect("must run inside the nexus repository");
+        let root = repo.root.clone();
+        let ws = root.join("engineering").join("nexus-harness");
+        // engineering/nexus-harness/src/../../../crates/nexus-domain/Cargo.toml
+        //   == <repo>/crates/nexus-domain/Cargo.toml —— 在仓库内、在 workspace 外。
+        let escapee = ws
+            .join("src")
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("crates")
+            .join("nexus-domain")
+            .join("Cargo.toml");
+        assert!(escapee.is_file(), "夹具路径失效：{}", escapee.display());
+        assert!(
+            path_is_within(&escapee, &ws),
+            "词法判定仍命中前缀——这正是 round 2 缺陷的来源"
+        );
+        assert!(
+            !path_is_within_resolved(&escapee, &ws),
+            "归一化后必须判为越界"
+        );
+        // 同一棵树里的冗余 `.`/`..` 组合不该被误判为越界（避免修复过头）。
+        let legit = ws
+            .join("src")
+            .join(".")
+            .join("..")
+            .join("src")
+            .join("main.rs");
+        assert!(legit.is_file(), "夹具路径失效：{}", legit.display());
+        assert!(
+            path_is_within_resolved(&legit, &ws),
+            "canonical 后仍在 workspace 内"
+        );
+        // 归一化失败（不存在）必须是"无法证明"，不是"通过"。
+        let ghost = ws.join("nope-does-not-exist");
+        assert!(!path_is_within_resolved(&ghost, &ws));
     }
 
     /// 锁竞争判定必须只认 git 的锁类错误：把普通失败也拿去重试会掩盖真故障。

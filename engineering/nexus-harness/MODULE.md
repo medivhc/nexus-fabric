@@ -94,6 +94,31 @@ SYMBOL_NOT_FOUND RESULT_TRUNCATED TIMEOUT PROVIDER_CRASHED SNAPSHOT_STALE UNSUPP
 - 结果条目的 `in_scope` 表达作用域：查询**目标**越出 `--workspace` 直接
   `QUERY_INVALID`；**结果**越界（例如 callee 落到标准库源码）不删除、只标
   `in_scope = false`，因为删掉就等于静默丢弃（提案 §5 禁止）。
+- 作用域判定是**归一化后**的（`env::path_is_within_resolved`：两侧先 `canonicalize`
+  再按组件比较），不是字符串前缀。理由：`fixtures/../../../../x` 这类路径词法上仍以
+  声明的作用域为前缀，实际却指向作用域之外甚至仓库之外（独立 Review round 2 的
+  B-R2-1）。归一化同时覆盖 `.`/`..` 组件、符号链接与 Windows junction、盘符大小写；
+  任一侧 canonicalize 失败一律判"不在范围内"（fail-closed），绝不当作通过。
+  `in_scope` 用同一判定，仅当 server 报出的路径尚未落盘（虚拟文档/生成代码）才退回词法比较。
+
+### 诊断条目字段映射（`code diagnostics`，提案 §16.4）
+
+诊断不是符号，但必须复用同一套条目形状，所以字段是**映射**而不是同名：
+
+| LSP Diagnostic | 输出字段 | 语义 |
+|---|---|---|
+| `code` | `symbol` | 诊断码（数字按字符串输出）；没有 code 时为空串 |
+| 固定 `"diagnostic"` | `kind` | 条目类型 |
+| 固定 `0` | `kind_id` | 诊断没有符号类别（0 = provider 未给出） |
+| `severity` | `qualified_name` | 经 `diagnostic_severity` 映射为 `error/warning/info/hint` |
+| 诊断所属文件 | `path` | 相对仓库根；与 `code` 请求的目标文件一致 |
+| 同一目标文件 | `in_scope` | 用与符号条目相同的归一化判定（不再硬编码 true：pull 结果里可能带 sysroot/依赖 crate 的诊断） |
+| `range`（0-based） | `range`（1-based） | 与其他 verb 同一转换规则 |
+| `message` | `snippet` | 自由文本只进 `snippet`，判定不依赖解析它 |
+
+已知缺口（照实记）：当前 deterministic 夹具里没有任何会产生诊断的文件，因此**条目形状
+只有代码与单测为证，没有 E4 覆盖**。补一个"带 `#[deny(...)]` 的稳定诊断源文件"夹具
+属契约扩展（要新场景 + 冻结期望），留待独立周期做。
 
 ## Non-Responsibilities
 
@@ -135,11 +160,14 @@ SYMBOL_NOT_FOUND RESULT_TRUNCATED TIMEOUT PROVIDER_CRASHED SNAPSHOT_STALE UNSUPP
 - Gate 失败必须显式 FAIL/BLOCKED/UNKNOWN，不能静默降级。
 - Local Harness 与 CI 使用同一 Gate 定义（`policies/quality.toml`）。
 - Evidence 必须绑定 revision / working-tree / config / feature / target / toolchain / platform，并写入 `.evidence/verify-<id>/`。
+- `dirty_state` 是**三态**：`true`/`false` 是 git 给出的事实，`null` 表示"问不到 git"（`Repo::dirty_state() -> Option<bool>`）。git 查询失败时绝不写 `false`——那会把"无法证明"变成一条正面事实，而 verify 的 freshness 判定正好消费这个字段（独立 Review round 2 记的 fail-open 缺口）。同一失败路径下 `working_tree_digest` 取哨兵值（`tree-unknown`/`dirty-unknown`），按上一条规则不得当作确定取值。
 - verdict 语义：`PASS / FAIL / STALE / UNKNOWN / BLOCKED`；STALE 证据必须以 `"verdict":"STALE"` 形式落盘，供 `.githooks/pre-push` 检出。
 - 未实现的 gate（bench/replay/coverage 等）必须显式记录 UNKNOWN，不得以 PASS 掩盖。
 - git 调用失败只在**锁竞争**时重试（`.git/index.lock` 类消息，最多 4 次、25/50/75ms 退避），其它错误原样上报，不得吞掉真故障。digest 的降级哨兵值（`tree-unknown` / `dirty-unknown` / `*-unknown` / 空串）代表"没取到"，**不得**被当成一次确定的取值：`env::tests::digests_deterministic_and_sha1_length` 同时断言"两次相等"与"不是哨兵值"。
 - Code Intelligence 只读不变量：客户端只允许发送白名单内的 LSP 方法（`workspace/symbol`、`textDocument/{documentSymbol,hover,definition,typeDefinition,implementation,references,prepareCallHierarchy,diagnostic}`（`typeDefinition` 为白名单预留，首期无 CLI verb 调用点：提案 §4 的 Agent-facing 列表本身不含 type-definition，故不视为未兑现，但不得假装已经暴露给 Agent）、`callHierarchy/{incomingCalls,outgoingCalls}`）；`rename`、`workspace/applyEdit`、`codeAction` 自动应用、`workspace/willSaveWaitUntil`、格式化写入、任意 `workspace/executeCommand` 一律拒绝并返回 `UNSUPPORTED`。
 - provider 子进程 command/args 不接受模型或调用方拼接的任意 shell 参数（`--provider-binary` 只接受单个可执行文件名或路径，按 `split_whitespace` 之前的整串传入，不经 shell）。
+- **边界校验必须发生在 spawn 之前**，且顺序是：workspace 根存在 → workspace 根归一化后仍在仓库内 → 查询目标归一化后仍在 workspace 内。三者任一失败都不得起 language server（envelope 里不出现 `provider` 字段）。round 2 的实测反例是越界的 `--workspace` 被词法判定放行、子进程真的带着仓库外的 cwd 起来了。
+- `code` 永远不产出最终 PASS：`authority` 恒为 `"advisory"`，correctness 仍由 `cargo check/clippy/test` 与 verify Evidence 决定。
 - `request()` 在返回匹配响应**之前**必须先 `pump_server_requests()` 一次：language server 会阻塞等待其对 server→client 请求的应答，悬置请求既会卡住 provider，也会让 `write_requests_refused` 在观测时刻还没入账（计数失真等于把拒绝能力藏起来）。
 - 只读边界是**可端到端验证的**：`LspSession` 的传输端点被抽象（`child: Option<Child>` + `stdin: Box<dyn Write + Send>`），生产路径只由 `spawn()` 填入真实子进程；`#[cfg(test)] LspSession::for_tests()` 用内存流接一个假 server，走的是与真进程完全相同的 `dispatch_stream` 分流与应答逻辑。修改任何写能力拒绝路径必须让 `code_intel::lsp::tests::adversarial_server_pushed_apply_edit_is_refused_and_never_written` 保持绿色（该测试断言目标文件**不存在**）。
 - `code` 结果必须绑定 `snapshot`（source_revision + working_tree_digest + target + toolchain + workspace root）；查询完成前后 digest 不一致时返回 `SNAPSHOT_STALE`。
@@ -148,7 +176,7 @@ SYMBOL_NOT_FOUND RESULT_TRUNCATED TIMEOUT PROVIDER_CRASHED SNAPSHOT_STALE UNSUPP
 - Code Intelligence 的时间语义属契约面（不是实现细节）：rust-analyzer 的 workspace 加载是多阶段的，就绪只认"`\$/progress` begin/end 收敛且静默 ≥ 1.5s"（`Completed`）。**只有 `Completed` 允许把空结果当作答案**；server 从不上报进度的静默、以及预算耗尽，两者下的空结果一律 `BLOCKED` + `error.code = TIMEOUT`、`provider.ready = false`。把"还没索引完"说成"确实没有引用"即提案 §12 禁止的伪 PASS。didOpen 后另有 15s 空结果重试窗口（文件级分析需要时间）。
 - provider 的构建副作用：rust-analyzer 在 didOpen 后默认跑 flycheck（`cargo check`）；其产物经 `CARGO_TARGET_DIR=<temp>/nexus-code-intel-<workspace 哈希>` 重定向到**仓库外**，被查 workspace 内不留构建产物。不改业务源码，但确有磁盘写入，故在此披露。
 - 数值型选项（`--max-results` / `--max-snippet-lines` / `--max-result-bytes` / `--timeout-secs` / `--ready-timeout-secs`）必须 ≥ 1，0 属退化输入 → `QUERY_INVALID`。
-- `provider.kind` 是适配器标识、`provider.binary` 是实际解析到的可执行文件，两者分开以便发现错配；`write_requests_refused`（applyEdit/executeCommand 拒绝）与 `server_requests_unhandled`（未识别请求）、`dropped_notifications`（缓冲溢出丢弃）三个计数彼此独立，不得合并。
+- `provider.kind` 是适配器标识、`provider.binary` 是实际解析到的可执行文件，两者分开以便发现错配；`write_requests_refused`（applyEdit/executeCommand 拒绝）与 `server_requests_unhandled`（未识别请求）、`dropped_notifications`（缓冲溢出丢弃）三个计数彼此独立，不得合并。三者都按**整个 `code` 调用的累计值**上报：崩溃重启会换新会话，旧会话的计数在替换前先累加进 `provider`，否则"重启前拒绝过 N 次写请求"会随进程一起消失——计数失真等于把拒绝能力藏起来。
 - `code` 永远不产出最终 PASS：`authority` 恒为 `"advisory"`，correctness 仍由 `cargo check/clippy/test` 与 verify Evidence 决定。
 
 ## Side Effects
@@ -183,7 +211,8 @@ Code Intelligence 场景（E4，冻结于 2026-10-10 契约阶段，夹具为
 `code_intelligence_budget_truncation.toml`、`code_intelligence_provider_unavailable.toml`、
 `code_intelligence_write_method_denied.toml`、`code_intelligence_callees.toml`、
 `code_intelligence_scope_violation.toml`、`code_intelligence_read_only_counters.toml`、
-`code_intelligence_budget_count.toml`。
+`code_intelligence_budget_count.toml`、`code_intelligence_scope_escape.toml`（目标用 `..` 逃出
+`--workspace`）、`code_intelligence_workspace_escape.toml`（`--workspace` 根逃出仓库，必须在 spawn 之前被拒）。
 
 ### Gate 实现状态（2026-09-15）
 
@@ -191,7 +220,7 @@ Code Intelligence 场景（E4，冻结于 2026-10-10 契约阶段，夹具为
 
 - 真实执行：workspace-tests / product-scenarios / regression / architecture-policy / dependency-governance（cargo-deny 0.20：`cargo deny --config policies/deny.toml check advisories licenses bans sources`，缺失则 UNKNOWN）/ coverage-summary（cargo-llvm-cov）/ platform-checks（portable-core 平台依赖静态扫描）/ feature-matrix（每成员 `--no-default-features` + `--all-features`）/ portable-core（`cargo check --target wasm32-wasip1`）。
 - 条件执行（无内容/无工具时 UNKNOWN）：integration（成员 tests/*.rs 存在时逐个运行）/ selected-fuzz（cargo-fuzz + fuzz targets）/ selected-concurrency（tests/concurrency 有测试时运行）/ performance-budgets（quality.toml `[performance]` 定义 baseline+blocking 后判定）。
-- 单元测试：`cargo test -p nexus-harness`（102 个 = 既有 57 + Code Intelligence 45；覆盖 scenario 求值、evidence 新鲜度/STALE、digest 确定性与锁竞争判定、workspace 成员解析、dependency-governance gate 语义，以及 JSON-RPC framing、只读白名单、URI 往返、DTO 形状与预算截断、progress 收敛判定、provider 参数校验、**假 server 主动推 `workspace/applyEdit` 的端到端拒绝**、**工作树指纹哨兵值不得当作新鲜**）。
+- 单元测试：`cargo test -p nexus-harness`（109 个 = 既有 58 + Code Intelligence 51；覆盖 scenario 求值、evidence 新鲜度/STALE、digest 确定性与锁竞争判定、containment 的归一化比较、workspace 成员解析、dependency-governance gate 语义，以及 JSON-RPC framing、只读白名单、URI 往返、DTO 形状与预算截断、progress 收敛判定、provider 参数校验、**假 server 主动推 `workspace/applyEdit` 的端到端拒绝**、**工作树指纹哨兵值不得当作新鲜**、**`..` 不能逃出 `--workspace` 或仓库**、notification 有界缓冲溢出、会话体积上限边界、跨重启计数合并）。
   - Windows 宿主已知 4 个与本模块能力无关的预存在失败：3 个 scenario 测试把 `sh`/`echo` 当 shell 内建使用（Windows 下按可执行文件解析），1 个 `gates` 的 §12.58 contract-hash 测试受 `text=auto` 的 CRLF 检出影响；两者均非 Code Intelligence 引入。
 
 ## Performance Budget

@@ -212,6 +212,14 @@ pub struct ProviderMeta {
 }
 
 impl ProviderMeta {
+    /// 累加一次会话的三个计数。重启会换新会话，替换旧会话前必须先把它 absorb 进来，
+    /// 否则"重启前拒绝过 N 次写请求"随进程消失（MODULE.md：计数失真等于把拒绝能力藏起来）。
+    pub fn absorb(&mut self, refused: usize, unhandled: usize, dropped: usize) {
+        self.write_requests_refused += refused;
+        self.server_requests_unhandled += unhandled;
+        self.dropped_notifications += dropped;
+    }
+
     pub fn to_json(&self) -> Value {
         json!({
             "kind": self.kind,
@@ -291,6 +299,19 @@ pub fn relative_path(repo_root: &Path, abs: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 跨重启计数合并规则：每次会话的计数累加而不是覆盖（observability 不变量）。
+    #[test]
+    fn provider_meta_absorbs_counts_instead_of_replacing_them() {
+        let mut meta = ProviderMeta::default();
+        meta.absorb(1, 2, 3);
+        meta.absorb(4, 5, 6);
+        assert_eq!(meta.write_requests_refused, 5);
+        assert_eq!(meta.server_requests_unhandled, 7);
+        assert_eq!(meta.dropped_notifications, 9);
+        // 三桶独立：合并后仍不得互相污染。
+        assert_ne!(meta.write_requests_refused, meta.server_requests_unhandled);
+    }
 
     #[test]
     fn error_verdicts_never_yield_pass() {

@@ -12,7 +12,8 @@ use std::path::PathBuf;
 pub struct Bindings {
     pub source_revision: String,
     pub working_tree_digest: String,
-    pub dirty_state: bool,
+    /// `None` = git 状态查询失败，此时**不产出**"干净/不干净"这一事实（序列化为 null）。
+    pub dirty_state: Option<bool>,
     pub configuration_digest: String,
     pub feature_set: Vec<String>,
     pub target_triple: String,
@@ -28,7 +29,7 @@ impl Bindings {
         Bindings {
             source_revision: repo.revision(),
             working_tree_digest: repo.working_tree_digest(),
-            dirty_state: repo.is_dirty(),
+            dirty_state: repo.dirty_state(),
             configuration_digest: repo.configuration_digest(),
             feature_set: vec!["workspace:default".to_string()],
             target_triple: target,
@@ -304,7 +305,7 @@ mod tests {
         Bindings {
             source_revision: rev.to_string(),
             working_tree_digest: "wt".to_string(),
-            dirty_state: false,
+            dirty_state: Some(false),
             configuration_digest: "cfg".to_string(),
             feature_set: vec!["f".to_string()],
             target_triple: "t".to_string(),

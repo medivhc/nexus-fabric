@@ -1,0 +1,42 @@
+schema_version = 1
+id = "engineering.code-intelligence-scope-escape"
+title = "用 `..` 逃出 --workspace 的目标必须被拒（独立 Review round 2 的 B-R2-1）"
+evidence_strength = "E4"
+requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#14-security-and-resource-control"
+
+# 这条与 scope-violation 的区别是输入形状：路径里带 `..`，词法上仍以 `--workspace`
+# 为前缀，但 canonical 之后落在 engineering/nexus-harness/src（仓库内、workspace 外）。
+# 旧实现用字符串前缀判定 ⇒ verdict=PASS 并真的起了 language server；本轮改成
+# 归一化后按组件比较，所以必须 QUERY_INVALID，且发生在 spawn 之前。
+# 解析后的真实目标：engineering/nexus-harness/fixtures/code-intel/src/../../../src/main.rs
+#   = engineering/nexus-harness/src/main.rs（存在，因此不是"文件不存在"这类失败）
+[given]
+repository = "initialized"
+network = "none (不启动 language server)"
+
+[when]
+command = "nexus-harness code definition engineering/nexus-harness/fixtures/code-intel/src/../../../src/main.rs:1:1 --workspace engineering/nexus-harness/fixtures/code-intel --json"
+
+[[expect]]
+field = "command"
+equals = "code definition"
+
+[[expect]]
+field = "verdict"
+equals = "FAIL"
+
+[[expect]]
+field = "error.code"
+equals = "QUERY_INVALID"
+
+[[expect]]
+field = "error.reason"
+non_empty = true
+
+[[expect]]
+field = "count"
+equals = 0
+
+[[expect]]
+field = "authority"
+equals = "advisory"

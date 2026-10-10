@@ -105,6 +105,8 @@ impl SourceLocation {
 #[derive(Debug, Clone)]
 pub struct DiagnosticItem {
     pub path: String,
+    /// 该条目是否落在本次 `--workspace` 范围内（归一化后比较；诊断也走同一判定）。
+    pub in_scope: bool,
     pub severity: String,
     pub code: String,
     pub message: String,
@@ -119,7 +121,7 @@ impl DiagnosticItem {
             // 诊断不是符号：kind_id 固定 0（= provider 未给出符号类别）。
             "kind_id": 0,
             "qualified_name": self.severity,
-            "in_scope": true,
+            "in_scope": self.in_scope,
             "path": self.path,
             "range": self.range.map(|(sl, sc, el, ec)| {
                 json!({"start": {"line": sl, "column": sc}, "end": {"line": el, "column": ec}})

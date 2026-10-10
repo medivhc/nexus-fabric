@@ -2,16 +2,22 @@
 
 本包实现《Nexus 统一系统设计规范 v9》中的“统一仓库目录契约”。
 
-文件数（不含本清单）：172
+文件数（不含本清单）：174
 
 > 2026-10-10：原声明值 137 与表内实际行数（148）已不一致（既有漂移，含
 > `scenarios/engineering/bench_gate_verdicts.toml` 等未登记项）。本次登记
 > Code Intelligence 的 18 个新文件时一并改为与表内行数一致，并补登该缺口。
 >
-> 2026-10-10（第二轮，独立 Review 整改）：补登 `code_intelligence_callees`、
+> 2026-10-10（第二轮，独立 Review round 1 整改）：补登 `code_intelligence_callees`、
 > `code_intelligence_read_only_counters`、`code_intelligence_scope_violation`、
 > `code_intelligence_budget_count` 四个场景与 `.agents/green-evidence-code-intelligence.txt`，
-> 声明值同步为表内行数 172。
+> 声明值同步为表内行数。
+>
+> 2026-10-10（第三轮，独立 Review round 2 整改）：补登
+> `code_intelligence_scope_escape.toml`（目标用 `..` 逃出 `--workspace`）与
+> `code_intelligence_workspace_escape.toml`（`--workspace` 根逃出仓库，须在 spawn 前被拒），
+> 声明值 172 -> 174。注意 `.evidence/review-*` 与 `verify-*` 目录由 `.gitignore` 排除，
+> 不进本清单；Review 案卷因此只在本机可见，需要分享时得显式 `git add -f`。
 >
 > 既有缺口（非本次引入，保留待仓库所有者裁决）：`.evidence/.gitignore`、
 > `.evidence/README.md` 两行来自基线（`7d2e643`），但这两个文件已在
@@ -177,8 +183,10 @@
 | `scenarios/engineering/code_intelligence_implementations.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/code_intelligence_provider_unavailable.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/code_intelligence_read_only_counters.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_scope_escape.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/code_intelligence_scope_violation.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/code_intelligence_symbol.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_workspace_escape.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/code_intelligence_write_method_denied.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/harness_status_verdicts.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/harness_verify_fast_evidence.toml` | Machine-readable contract/policy/scenario |

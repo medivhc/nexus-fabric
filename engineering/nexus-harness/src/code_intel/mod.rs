@@ -438,6 +438,7 @@ fn parse_usize(raw: &str, name: &str) -> Result<usize, Failure> {
 }
 
 /// 查询目标必须落在 `--workspace` 内（提案 §14：语言服务器的工作目录边界）。
+/// **归一化后**比较：词法前缀判定会被 `fixtures/../../../../x` 这类 `..` 路径骗过。
 fn validate_target(request: &Request) -> Result<(), Failure> {
     let target = match &request.target {
         Target::File(path) => path.clone(),
@@ -445,9 +446,9 @@ fn validate_target(request: &Request) -> Result<(), Failure> {
         // 符号名形态由 provider 解析，越界结果以 in_scope 标注而非静默丢弃。
         Target::Query(_) => return Ok(()),
     };
-    if !crate::env::path_is_within(&target, &request.workspace) {
+    if !crate::env::path_is_within_resolved(&target, &request.workspace) {
         return Err(CodeIntelError::QueryInvalid.with_reason(format!(
-            "查询目标 {} 不在 --workspace {} 范围内",
+            "查询目标 {} 不在 --workspace {} 范围内（按 canonical 后的组件比较；`..` 不能用来逃出作用域）",
             target.display(),
             request.workspace.display()
         )));
@@ -456,6 +457,10 @@ fn validate_target(request: &Request) -> Result<(), Failure> {
 }
 
 /// `--workspace` 必须是仓库内的目录；provider 的 cwd 也限制在其中（提案 §14）。
+///
+/// 顺序是契约的一部分：先验根、再验目标。round 2 的 B-R2-1 里越界的 `--workspace`
+/// 因为只做了词法判定而被放行，结果**真的 spawn 了子进程**（错误发生在 initialize 之后），
+/// 等于"仓库边界"只在看起来像失败时才失败。
 fn validate_scope(repo: &Repo, request: &Request) -> Result<(), Failure> {
     if !request.workspace.is_dir() {
         return Err(CodeIntelError::WorkspaceUnresolved.with_reason(format!(
@@ -463,14 +468,14 @@ fn validate_scope(repo: &Repo, request: &Request) -> Result<(), Failure> {
             request.workspace.display()
         )));
     }
-    validate_target(request)?;
-    if !crate::env::path_is_within(&request.workspace, &repo.root) {
+    if !crate::env::path_is_within_resolved(&request.workspace, &repo.root) {
         return Err(CodeIntelError::WorkspaceUnresolved.with_reason(format!(
-            "workspace 根超出仓库范围：{}",
-            request.workspace.display()
+            "workspace 根超出仓库范围：{}（仓库根 {}）",
+            request.workspace.display(),
+            repo.root.display()
         )));
     }
-    Ok(())
+    validate_target(request)
 }
 
 /// 执行 verb，返回语言中立的 JSON 条目。
@@ -774,6 +779,44 @@ mod tests {
         assert!(
             msg.contains("超出仓库范围") || msg.contains("不是目录"),
             "{msg}"
+        );
+    }
+
+    /// B-R2-1 表现一：带 `..` 的目标在词法上仍以 `--workspace` 为前缀，实际落在其外。
+    /// canonical 之后它是 `engineering/nexus-harness/src/main.rs`（存在，故不是"文件不存在"）。
+    #[test]
+    fn dotdot_target_cannot_escape_workspace() {
+        let (verdict, msg, extras) = run(&[
+            "definition".to_string(),
+            "engineering/nexus-harness/fixtures/code-intel/src/../../../src/main.rs:1:1"
+                .to_string(),
+            "--workspace".to_string(),
+            "engineering/nexus-harness/fixtures/code-intel".to_string(),
+        ]);
+        assert_eq!(verdict, "FAIL", "{msg}");
+        let obj: serde_json::Map<String, Value> = extras.into_iter().collect();
+        assert_eq!(obj["error"]["code"], json!("QUERY_INVALID"), "{msg}");
+        assert!(
+            obj.get("provider").is_none(),
+            "越界目标必须在 spawn 之前被拒：{obj:?}"
+        );
+    }
+
+    /// B-R2-1 表现二：`--workspace` 根自身逃出仓库时，不得起子进程（round 2 实测曾 spawn）。
+    #[test]
+    fn workspace_escape_is_rejected_before_provider_spawn() {
+        let (verdict, msg, extras) = run(&[
+            "symbol".to_string(),
+            "Egress".to_string(),
+            "--workspace".to_string(),
+            "engineering/nexus-harness/../../../".to_string(),
+        ]);
+        assert_eq!(verdict, "BLOCKED", "{msg}");
+        let obj: serde_json::Map<String, Value> = extras.into_iter().collect();
+        assert_eq!(obj["error"]["code"], json!("WORKSPACE_UNRESOLVED"), "{msg}");
+        assert!(
+            obj.get("provider").is_none(),
+            "越界的 --workspace 不得启动 language server：{obj:?}"
         );
     }
 }
