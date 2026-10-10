@@ -2156,13 +2156,14 @@ owner 列给出推荐的身份值（见 29.2），未分配 Agent 的 crate 先�
 git fetch origin
 git rebase origin/master      # 线性历史；冲突在此显式解决（§17：FF/3-way/显式冲突，已提交数据不静默丢弃）
 nexus-harness verify --fast   # 在最新 base 上生成绑定当前 revision 的证据
-git push origin master        # pre-push 门禁（verify PASS / 无 STALE / Review Evidence）
+git push origin $(git branch --show-current)   # 只推自己的任务分支，禁止直推 master（§30）
 ```
 
 规则：
 - 统一用 rebase 而非 merge（线性历史，冲突一次解决）。
 - 冲突解决是显式协议，不是自动丢弃；rebase 中断时禁止 `--abort` 以外的破坏性操作。
 - 小步单主题提交；一个逻辑变更一个 commit，避免长分支。
+- master 只经 Pull Request 由 coordinator 合并（§30）；任何 Agent 不得 `git push origin master`，分支保护会在机械层面拒绝。
 - 契约文件（29.1 共享列）改动必须携带 contract marker 并由 owner 评审后合入。
 
 ### 29.4 CI 建议
@@ -2201,4 +2202,60 @@ git worktree add -b feat/c-proxy    ../ws-c     # Agent C
 - 跨沙箱 Review 证据不互通：`.evidence/` 为 gitignore 的本地目录，独立 Review
   （§19.1）的产物只存在于评审方沙箱，提交方 push 时看不到。建议约定评审结论以
   marker 形式进 commit 正文（如 `review: <id>`）并由 hook 校验，或由 CI 存档评审产物。
-- branch protection（29.4）需在 GitHub 仓库设置页开启，沙箱 CLI 无权代开。
+- branch protection 因私有库 + 非 Pro 账号暂无法开启，见 §30.3 现状说明。
+***
+
+## 30. 分支与合并工作流（Trunk-Based，GitHub）
+
+`master` 是唯一长期分支，必须始终保持可构建、可验证。所有变更走短命任务分支 +
+Pull Request 合并；直推 `master` 是违规行为（目标：GitHub 分支保护，见 §30.3）。
+
+### 30.1 分支
+
+- `master`：唯一长期分支，受分支保护（§30.3）。
+- 任务分支：`task/<run-id>-<slug>`（沿用 `feature/`、`bugfix/`、`docs/` 前缀亦可），
+  一个 pipeline run 对应一个分支，生命周期 = 任务周期，合并后删除。
+- 禁止长期并存的 `develop` / `release` 分支；发版用 tag 打在 `master` 上。
+
+### 30.2 合并流程（coordinator 专属）
+
+```
+Agent：任务分支上完成实现 → 独立评审 → 修复 → 复验（§19 / §19.1）
+  → push 任务分支（§29.3）
+  ↓
+Coordinator：开 PR（描述自动填：任务原文、spec/contract hash、评审 verdict、evidence 链接）
+  ↓
+门禁：PR 已 rebase 到最新 master；verify --fast 在最新 base 上为 PASS（pre-push 门禁同样适用）
+  ↓
+Coordinator：squash merge → 删除任务分支（仓库已开 delete_branch_on_merge）
+```
+
+- 一次只合并一个 PR，串行化；冲突在合并时刻显式解决（§17 / §29.3）。
+- squash merge：一个任务在 `master` 上为一个 commit，回滚是一条 `git revert`。
+- PR **不需要人工评审**：pipeline 内的独立评审（不同模型/会话，§19.1）即评审，
+  PR 是机械门禁与审计容器。用户日常不看 PR，看 coordinator 报告与 evidence。
+
+### 30.3 分支保护（`master`）
+
+目标态（GitHub 分支保护）：
+- Require a pull request before merging：禁止一切直推（含 admin）。
+- Require linear history：rebase / squash 合并，禁 merge commit。
+- 暂不开 required status checks：`verify --fast` 跑在真机（xc-pc-linux /
+  NU-SH-1217），不在 GitHub Actions；远期 coordinator 可在真机验证通过后经 API
+  回写 check-run，届时再开。
+- 禁止 force push 与分支删除。
+
+现状（2026-10-08）：仓库为私有库、账号未绑支付（非 Pro），GitHub 拒绝为私有库
+开启分支保护（"Upgrade to GitHub Pro or make this repository public"）。在升级或
+公开之前，以下机制代替执行：
+- pre-push 门禁（§28）：verify --fast、STALE 扫描、contract marker、Review Evidence，
+  任何一项不过都推不出去；
+- mirror 侧 pre-receive 钩子：拒绝一切对 `refs/heads/master` 的直接推送；
+- coordinator 经 GitHub API 串行 squash-merge PR，一次一个；
+- 仓库已开 `delete_branch_on_merge`，合并后任务分支自动删除。
+直推 `master` 无论是否成功都是违规。
+
+### 30.4 例外
+
+生产事故等必须绕行时：仍走 PR 流程，标题加 `emergency:` 前缀，事后 24h 内补齐
+evidence；"禁止 `--no-verify`、禁止削弱门禁"的铁律不变——门禁失败就修，不绕行。
