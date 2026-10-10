@@ -1,0 +1,119 @@
+# gateway-ci.yml — nexus-web-gateway 单流水线
+# SPEC: ~/workspace/pipeline/runs/gateway-dashboard/SPEC.md §9
+#
+# 单流水线原因（SPEC §4）：双 workflow 方案中，用默认 GITHUB_TOKEN
+# push 的 commit 不会触发新的 workflow run，导致 dashboard 永远落后一版。
+# 单流水线内用 needs + artifacts 传递数据，无此问题。
+
+name: gateway-ci
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'crates/nexus-web-gateway/**'
+      - '.github/workflows/gateway-ci.yml'
+
+permissions:
+  contents: write  # 用于推到 gh-pages 分支
+
+concurrency:
+  group: gateway-dashboard
+  cancel-in-progress: false  # 排队，非取消；看板场景排队是安全的
+
+jobs:
+  validate-requirements:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # F2/F3 需要完整 git 历史
+      - name: Validate requirements.toml
+        run: |
+          REQ=crates/nexus-web-gateway/requirements.toml
+          if [ ! -f "$REQ" ]; then
+            echo "::warning::requirements.toml not found (bootstrap mode)"
+            exit 0
+          fi
+          python3 crates/nexus-web-gateway/tools/validate-requirements.py "$REQ"
+
+  test:
+    needs: [validate-requirements]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run gateway tests
+        id: runtests
+        run: |
+          # 只测网关 crate，避免全 workspace 的无关 flaky
+          cargo test -p nexus-web-gateway -- --format json > /tmp/test-out.json 2>&1 || true
+          PASSED=$(grep -c '"type":"test","event":"ok"' /tmp/test-out.json 2>/dev/null || echo 0)
+          FAILED=$(grep -c '"type":"test","event":"failed"' /tmp/test-out.json 2>/dev/null || echo 0)
+          # cargo test 退出码决定 build status
+          cargo test -p nexus-web-gateway > /dev/null 2>&1 && STATUS=success || STATUS=failure
+          TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          printf '{"passed": %d, "failed": %d, "timestamp": "%s"}' "$PASSED" "$FAILED" "$TS" > test-results.json
+          printf '{"status": "%s", "timestamp": "%s"}' "$STATUS" "$TS" > build-status.json
+          echo "passed=$PASSED failed=$FAILED status=$STATUS"
+      - name: Upload test results artifact
+        if: always()  # SPEC §2 F4: 失败时也上传，确保 F5 能显示红色
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            test-results.json
+            build-status.json
+
+  dashboard:
+    needs: [validate-requirements, test]
+    if: always()  # SPEC §9: test 失败时也生成页面
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Download test results
+        if: needs.test.result != 'skipped'
+        uses: actions/download-artifact@v4
+        with:
+          name: test-results
+          path: ./artifacts
+      - name: Generate dashboard
+        run: |
+          ARGS="--repo-root . --crate-dir crates/nexus-web-gateway --out dist/index.html"
+          mkdir -p dist
+          if [ "${{ needs.test.result }}" = "skipped" ]; then
+            # validate 失败：降级页面（SPEC §2 F5）
+            python3 crates/nexus-web-gateway/tools/gen-dashboard.py $ARGS \
+              --degraded "requirements.toml 校验失败，详见 validate-requirements job 日志"
+          else
+            [ -f artifacts/test-results.json ] && ARGS="$ARGS --test-results artifacts/test-results.json"
+            [ -f artifacts/build-status.json ] && ARGS="$ARGS --build-status artifacts/build-status.json"
+            python3 crates/nexus-web-gateway/tools/gen-dashboard.py $ARGS
+          fi
+          ls -lh dist/index.html
+      - name: Validate publish directory
+        # E2E 防护：确保只发布 index.html，不会把整个 repo 推上去
+        run: |
+          COUNT=$(find dist -type f | wc -l)
+          if [ "$COUNT" -ne 1 ]; then
+            echo "::error::dist/ should contain exactly 1 file (index.html), found $COUNT"
+            find dist -type f
+            exit 1
+          fi
+          [ -f dist/index.html ] || { echo "::error::dist/index.html missing"; exit 1; }
+          echo "Publish directory OK: $(du -h dist/index.html | cut -f1)"
+      - name: Deploy to gh-pages
+        # 用 peaceiris/actions-gh-pages 或 git push，SPEC §9 注明 develop 阶段定；
+        # 此处用 peaceiris（最常用，零配置）
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./dist
+          publish_branch: gh-pages
+          destination_dir: gateway-dashboard
+          keep_files: false
