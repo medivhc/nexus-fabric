@@ -1,0 +1,38 @@
+schema_version = 1
+id = "product.n3-10-operator-grant"
+title = "真实产物通过本地scoped Use运维撤权、恢复和过期拒绝"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#177-n3-10"
+[given]
+[when]
+command = "python3 engineering/verifiers/n3_operator_grant.py"
+[[expect]]
+field = "verdict"
+equals = "PASS"
+[[expect]]
+field = "real_execution"
+equals = true
+[[expect]]
+field = "scoped_list"
+equals = true
+[[expect]]
+field = "revoked_download_denied"
+equals = true
+[[expect]]
+field = "restored_download"
+equals = true
+[[expect]]
+field = "expired_download_denied"
+equals = true
+[[expect]]
+field = "published_inode_preserved"
+equals = true
+[[expect]]
+field = "operator_audit"
+equals = true
+[[expect]]
+field = "shutdown_reaped"
+equals = true
+[[expect]]
+field = "owned_container_cleanup"
+equals = true

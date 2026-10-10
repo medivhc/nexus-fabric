@@ -1,0 +1,629 @@
+schema_version = 1
+
+[third_party]
+default_features_policy = "prefer-disabled"
+allow_unpinned_git = false
+allow_path_outside_workspace = false
+require_declared_reason_for_default_features = true
+require_architecture_layer_review = true
+require_os_transitive_dependency_review = true
+require_portability_review_for_portable_crates = true
+
+[licenses]
+policy = "allowlist"
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "0BSD",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib"
+]
+
+[security]
+advisory_gate = "deny-known-vulnerabilities"
+recommended_tool = "cargo-deny"
+# Machine enforcement: policies/deny.toml is the cargo-deny executor config
+# (same license allowlist, advisories always fail, yanked denied, sources
+# restricted to crates.io). Executed by the harness `dependency-governance`
+# gate via `cargo deny --config policies/deny.toml check advisories licenses
+# bans sources`; cargo-deny missing makes the gate UNKNOWN, never silent PASS.
+
+[supply_chain]
+lockfile_required = true
+review_new_direct_dependencies = true
+review_feature_expansion = true
+
+[dependency_reviews]
+note = "Six-aspect review required by [supply_chain].review_new_direct_dependencies = true. Recorded here so the review is machine-visible."
+
+[[dependency_reviews.direct]]
+consumer = "engineering/nexus-harness"
+crate = "serde_json"
+version = "1"
+default_features = false
+features = ["std"]
+architecture_layer = "engineering tooling (outside crates/ portable core; no new architecture edge)"
+feature_scope = "std feature only; no alloc/raw parsing features enabled"
+license = "MIT OR Apache-2.0 (allowlisted)"
+security = "no known advisories in allowlist; cargo-deny recommended for CI"
+portability = "pure Rust, no OS-specific API"
+supply_chain = "version pinned by Cargo.lock (lockfile_required)"
+approved = true
+approved_date = "2026-09-15"
+
+[[dependency_reviews.direct]]
+consumer = "engineering/nexus-harness"
+crate = "toml"
+version = "0.8"
+default_features = false
+features = ["parse"]
+architecture_layer = "engineering tooling (outside crates/ portable core; no new architecture edge)"
+feature_scope = "parse feature only; serde/display features not enabled"
+license = "MIT OR Apache-2.0 (allowlisted)"
+security = "no known advisories in allowlist; cargo-deny recommended for CI"
+portability = "pure Rust, no OS-specific API"
+supply_chain = "version pinned by Cargo.lock (lockfile_required)"
+approved = true
+approved_date = "2026-09-15"
+
+[[dependency_reviews.direct]]
+consumer = "apps/nexus"
+crate = "serde_json"
+version = "1"
+default_features = false
+features = ["std"]
+architecture_layer = "composition-root app host (not a crates/ member; portable-core crates stay dependency-free)"
+feature_scope = "std feature only; used to render the E4 flow report JSON at the app boundary"
+license = "MIT OR Apache-2.0 (allowlisted); already used and reviewed for engineering/nexus-harness"
+security = "no known advisories in allowlist; cargo-deny recommended for CI"
+portability = "pure Rust, no OS-specific API; app is not on the portable-core WASI list"
+supply_chain = "already present in Cargo.lock, no lockfile change required"
+approved = true
+approved_date = "2026-09-15"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-connectivity"
+crate = "ring"
+version = "0.17"
+default_features = false
+features = ["std"]
+architecture_layer = "delivery layer; only used by new `encryption` module (X25519/HKDF/AEAD), no new internal edge"
+feature_scope = "std feature only (alloc implied); no pem/test/dev features enabled"
+license = "Apache-2.0 AND ISC (allowlisted)"
+security = "no known advisories; already compiled in workspace via rustls 0.23"
+portability = "crate portable=false; BoringSSL C code already built on all supported host targets"
+supply_chain = "0.17.14 already pinned in Cargo.lock; no lockfile churn expected"
+approved = true
+approved_date = "2026-09-20"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-platform"
+crate = "ring"
+version = "0.17"
+default_features = false
+features = ["std"]
+architecture_layer = "platform-abstraction layer; SecureStore 平台无关核心 (PRODUCT §12.30) 使用 HKDF-SHA256 + ChaCha20-Poly1305 AEAD, 与 nexus-connectivity 共享同一锁版本"
+feature_scope = "std feature only; no pem/test/dev features enabled"
+license = "Apache-2.0 AND ISC (allowlisted; 同 nexus-connectivity 已审条目)"
+security = "no known advisories; workspace 已编译验证"
+portability = "nexus-platform 不在 harness.toml [portable_core] WASI 清单 (portable=false); ring 的 BoringSSL C 代码在 host 目标已构建"
+supply_chain = "0.17.14 已在 Cargo.lock, 无锁文件膨胀"
+approved = true
+approved_date = "2026-09-21"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-connectivity"
+crate = "x25519-dalek"
+version = "2"
+default_features = false
+features = ["static_secrets", "zeroize"]
+architecture_layer = "delivery layer; P4.1 §12.39 身份密钥 (IdentityKeyPair) 需私钥可序列化 (ring EphemeralPrivateKey 不暴露私钥导出)，仅用于 encryption 模块长期身份，无新内部架构边"
+feature_scope = "static_secrets (StaticSecret to/from seed 支持身份持久化) + zeroize (私钥落零) 两个 feature；default-features=false 排除 alloc/std 不需要路径"
+license = "BSD-3-Clause (allowlisted)"
+security = "X25519 公钥密码学标准实现 (curve25519-dalek 2 系)，无已知 advisories; 混合 DH 仅作 KDF 输入，不直接输出"
+portability = "纯 Rust (curve25519-dalek/fiat-crypto/subtle)，无 C 代码、无 OS-specific API；nexus-connectivity 不在 portable_core WASI 清单 (portable=false)"
+supply_chain = "2.0.1 已由 Cargo.lock 锁定；传递依赖全为纯 Rust (curve25519-dalek/fiat-crypto/subtle/rand_chacha/ppv-lite86)"
+approved = true
+approved_date = "2026-09-25"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-connectivity"
+crate = "rand"
+version = "0.8"
+default_features = false
+features = ["std", "getrandom"]
+architecture_layer = "delivery layer; x25519-dalek StaticSecret::random_from_rng 的 CSPRNG 来源 (OsRng)，仅 encryption 模块使用，无新架构边"
+feature_scope = "std + getrandom (OsRng 系统熵)；不启用 small_rng/thread_rng 等非安全生成器"
+license = "MIT OR Apache-2.0 (allowlisted)"
+security = "rand_core 0.6 系成熟 CSPRNG 生态；OsRng 走 getrandom 系统熵源"
+portability = "纯 Rust；getrandom 在 Windows 走 RtlGenRandom，无需额外依赖"
+supply_chain = "0.8.5 已由 Cargo.lock 锁定；传递依赖 rand_core/rand_chacha/ppv-lite86 纯 Rust"
+approved = true
+approved_date = "2026-09-25"
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-projection"
+crate = "smoltcp"
+version = "0.12"
+default_features = false
+features = ["std", "proto-ipv4", "socket-tcp", "medium-ip"]
+architecture_layer = "projection (TCP egress terminator); userspace TCP state machine, no async runtime, no tokio (repo is std-only)"
+feature_scope = "std+proto-ipv4+socket-tcp+medium-ip only; ipv6/udp/icmp/dns/mqtt/ethernet explicitly disabled for P0"
+license = "0BSD (allowlisted 2026-09-30; OSI-approved, more permissive than MIT; cargo-deny PASS)"
+security = "RustSec DB to be checked at implementation time via harness gate"
+portability = "pure Rust, no_std capable; not in portable_core (projection is platform-side)"
+supply_chain = "version pinned by Cargo.lock (lockfile_required); zero transitive deps with this feature set"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-09-30"
+review_basis = "2026-09-30 foundation decision: userspace TCP stack = smoltcp (MEMORY.md); live build eval on 2026-09-30 (no-default-features set compiles)"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-projection"
+crate = "tun-rs"
+version = "2.8"
+default_features = false
+features = []
+architecture_layer = "projection (real TUN device, sync API)"
+feature_scope = "sync only; no async/async_io/async_std/async_framed features (repo is std-only, no tokio)"
+license = "Apache-2.0 (allowlisted; to be confirmed by cargo-deny at implementation time)"
+security = "RustSec DB to be checked at implementation time via harness gate"
+portability = "Windows/Linux/macOS/BSD/Android/OpenHarmony/iOS/tvOS; Windows needs wintun.dll shipped with binary (later packaging task); iOS/Android use SyncDevice::from_fd (later task)"
+supply_chain = "version pinned by Cargo.lock (lockfile_required); default deps: byteorder/bytes/getifaddrs/ipnet/libc/log (all MIT/Apache-2.0, no async)"
+os_transitive_deps = "libc (accepted)"
+approved = true
+approved_date = "2026-09-30"
+review_basis = "2026-09-30 dep review: tun2 rejected (WTFPL); tun-rs 2.8.11 Apache-2.0, 551k+ downloads, sync API"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-fabric"
+crate = "quinn-proto"
+version = "0.11"
+default_features = false
+features = ["rustls", "ring"]
+architecture_layer = "delivery (session layer); sans-IO, no async runtime, no tokio (repo is std-only)"
+feature_scope = "rustls+ring only; platform-verifier and runtime-tokio explicitly disabled"
+license = "MIT OR Apache-2.0 (allowlisted; cargo-deny PASS on 2026-09-30, 57 third-party pkgs)"
+security = "RustSec DB fetch failed on 2026-09-30 (network); re-check at implementation time via harness gate"
+portability = "sans-IO, no socket code; not in portable_core; old wasm32-wasip1 FAIL was quinn-udp/socket2 (not pulled)"
+supply_chain = "58 pkgs total; no C deps except ring's cc build (already in tree); rustls 0.23.45 matches existing tree version"
+os_transitive_deps = "none beyond ring's cc (already accepted)"
+patch = "vendor/quinn-proto ([patch.crates-io]): quinn-proto 0.11.18 + Nexus patch for quinn-rs/quinn#2658 (adds missing guard in on_loss_detection_timeout mirroring set_loss_detection_timer; required for connection migration without debug_assert panic). Upstream issue open, no fixed release. Patch is minimal and documented in vendor/quinn-proto/src/connection/mod.rs."
+approved = true
+approved_date = "2026-09-30"
+review_basis = "docs/foundation/PHASE0-INVENTORY.md#6 (live eval on xc-pc-linux)"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-fabric"
+crate = "bytes"
+version = "1"
+default_features = false
+features = []
+architecture_layer = "delivery (session layer); buffer types for the quinn-proto sans-IO API"
+feature_scope = "no features enabled; Bytes/BytesMut only"
+license = "MIT (allowlisted)"
+security = "no known advisories in allowlist; cargo-deny recommended for CI"
+portability = "pure Rust, no OS-specific API"
+supply_chain = "version pinned by Cargo.lock (lockfile_required); already in tree via quinn-proto"
+approved = true
+approved_date = "2026-09-30"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-fabric"
+crate = "rcgen"
+version = "0.13"
+default_features = false
+features = []
+architecture_layer = "delivery (session layer); self-signed ed25519 certs binding PeerId"
+feature_scope = "no features enabled; KeyPair/CertificateParams only"
+license = "MIT OR Apache-2.0 (allowlisted)"
+security = "no known advisories in allowlist; cargo-deny recommended for CI"
+portability = "pure Rust; ring backend already in tree"
+supply_chain = "version pinned by Cargo.lock (lockfile_required); already in tree via nexus-outbound-trojan (0.13.2)"
+approved = true
+approved_date = "2026-09-30"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-fabric"
+crate = "ring"
+version = "0.17"
+default_features = false
+features = []
+architecture_layer = "delivery (session layer); ed25519 signature verification in the PeerId-pinning TLS verifier"
+feature_scope = "no features enabled; signature::UnparsedPublicKey only"
+license = "MIT OR Apache-2.0 (allowlisted; ISC also granted upstream)"
+security = "no known advisories in allowlist; cargo-deny recommended for CI"
+portability = "has C/asm build via cc (already accepted in tree via quinn-proto/rustls)"
+supply_chain = "version pinned by Cargo.lock (lockfile_required); already in tree via quinn-proto (0.17.14)"
+os_transitive_deps = "cc build only (already accepted)"
+approved = true
+approved_date = "2026-09-30"
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-turn"
+crate = "hmac"
+version = "0.12"
+default_features = false
+features = []
+architecture_layer = "turn (RFC 5766 MESSAGE-INTEGRITY HMAC-SHA1); no async runtime, repo is std-only"
+feature_scope = "default features only (no std-dependent extras needed; alloc not required)"
+license = "MIT OR Apache-2.0 (allowlisted; crates.io 2026-09-30)"
+security = "RustCrypto maintained; HMAC-SHA1 for STUN integrity is the RFC-mandated primitive (not password hashing); RustSec DB checked via harness gate"
+portability = "pure Rust; already in tree"
+supply_chain = "0.12.1 already pinned by Cargo.lock via hkdf 0.12.4; reuses existing pin, no new transitive deps"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-09-30"
+review_basis = "2026-09-30 4b TURN contract T1: RFC 5766 long-term auth needs SHA-1; 0.10.6 deps cfg-if + digest 0.10 (both already in tree)"
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-turn"
+crate = "sha1"
+version = "0.10"
+default_features = false
+features = []
+architecture_layer = "turn (RFC 5766 MESSAGE-INTEGRITY + nonce/realm handling); no async runtime"
+feature_scope = "default features only; asm feature explicitly off (pure Rust)"
+license = "MIT OR Apache-2.0 (allowlisted; crates.io 2026-09-30)"
+security = "RustCrypto maintained; SHA-1 used only as HMAC inner primitive per RFC 5766 (not for collision-sensitive hashing); RustSec DB checked via harness gate"
+portability = "pure Rust (asm off); already in tree via digest 0.10 ecosystem"
+supply_chain = "version pinned by Cargo.lock (lockfile_required); transitive deps cfg-if + digest 0.10 already in tree"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-09-30"
+review_basis = "2026-09-30 4b TURN contract T1: RFC 5766 key = MD5(username:realm:password); zero-dependency crate"
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-turn"
+crate = "md5"
+version = "0.7"
+default_features = false
+features = []
+architecture_layer = "turn (RFC 5766 long-term credential key derivation); no async runtime"
+feature_scope = "no features exist; zero transitive deps"
+license = "Apache-2.0 OR MIT (allowlisted; crates.io 2026-09-30)"
+security = "MD5 used only for the RFC 5766 key derivation formula (not security-critical hashing); RustSec DB checked via harness gate"
+portability = "pure Rust, zero deps"
+supply_chain = "version pinned by Cargo.lock (lockfile_required); zero transitive deps"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-09-30"
+review_basis = "2026-09-30 4b TURN contract T1: RFC 5766 key = MD5(username:realm:password); zero-dependency crate"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-platform-linux"
+crate = "fuser"
+version = "0.18"
+default_features = false
+features = []
+architecture_layer = "platform-adapter (Linux FUSE filesystem projection, v9 §22); pure-Rust FUSE protocol, no libfuse link"
+feature_scope = "default features; mount via fusermount(1) or /dev/fuse"
+license = "MIT (allowlisted; check via cargo-deny gate)"
+security = "no known advisories; re-check at implementation time via harness gate"
+portability = "Linux-only by design (this crate is nexus-platform-linux); not in portable_core"
+supply_chain = "version pinned by Cargo.lock (lockfile_required); transitive: libc, log, memchr, etc. (standard)"
+os_transitive_deps = "libc (accepted); no C build (pure Rust, no cc)"
+approved = true
+approved_date = "2026-10-02"
+review_basis = "2026-10-02 W4: v9 §22 D4=A (portable trait + Linux FUSE first); tun-rs precedent for platform crates"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-auth"
+crate = "sha2"
+version = "0.10"
+default_features = false
+features = []
+architecture_layer = "portable-core crypto primitive (D6: Principal content-derivation from ed25519 pubkey); no new architecture edge (nexus-auth keeps allowed_internal_dependencies=[nexus-domain])"
+feature_scope = "no default features; only sha2::Sha256 digest interface (no oid/std extras)"
+license = "MIT OR Apache-2.0 (allowlisted; check via cargo-deny gate)"
+security = "no known advisories; re-check at push time via harness dependency-governance gate"
+portability = "pure Rust, no_std-compatible; portable_core WASI check unaffected"
+supply_chain = "version pinned by Cargo.lock (lockfile_required); already present as transitive dep (0.10.9); transitive: digest, cpufeatures, cfg-if (standard RustCrypto)"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-03"
+review_basis = "N2 P0-1 D6: Principal::from_ed25519_public_key needs SHA-256; alternatives considered: ring (heavier, AEAD/HKDF unneeded) rejected, hand-rolled SHA-256 rejected (never hand-roll crypto)"
+
+[[dependency_reviews.direct]]
+consumer = "apps/nexus"
+crate = "getrandom"
+version = "0.2"
+default_features = false
+features = []
+architecture_layer = "composition-root app host (D8: LocalAPI bearer token generation only); not a crates/ member, portable-core untouched"
+feature_scope = "no default features; only getrandom::getrandom(&mut [u8]) for 32-byte token"
+license = "MIT OR Apache-2.0 (allowlisted; check via cargo-deny gate)"
+security = "no known advisories; re-check at push time via harness dependency-governance gate"
+portability = "OS-backed entropy; Linux/Windows/macOS supported (getrandom 0.2 platform matrix)"
+supply_chain = "version pinned by Cargo.lock (lockfile_required); already present as transitive dep (0.2.17); transitive: cfg-if, libc/wasi (platform)"
+os_transitive_deps = "libc (accepted, standard)"
+approved = true
+approved_date = "2026-10-03"
+review_basis = "N2 P0-1 D8: bearer token for LocalAPI auth needs OS CSPRNG; alternatives: /dev/urandom read (unix-only, rejected), ring::rand (heavier dep, rejected)"
+
+[[dependency_reviews.direct]]
+consumer = "apps/nexus"
+crate = "ring"
+version = "0.17"
+default_features = false
+features = []
+architecture_layer = "composition-root app host (N2 P0-4 D6: ed25519 auth identity keypair); not a crates/ member, portable-core untouched"
+feature_scope = "no default features, no extra features; only ring::signature::{Ed25519KeyPair, KeyPair} (from_seed_unchecked/public_key)"
+license = "Apache-2.0 AND ISC (allowlisted; same crate/version already reviewed for crates/nexus-connectivity and crates/nexus-platform)"
+security = "no known advisories; re-check at push time via harness dependency-governance gate"
+portability = "crate portable=false; BoringSSL C code already built on all supported host targets (same as nexus-connectivity/nexus-platform entries)"
+supply_chain = "0.17.14 already pinned by Cargo.lock (lockfile_required); already present in tree via nexus-discovery/nexus-connectivity"
+os_transitive_deps = "none (pure compile-time crypto; RNG comes from getrandom crate, separately reviewed)"
+approved = true
+approved_date = "2026-10-03"
+review_basis = "N2 P0-4 D6: ed25519 授权身份密钥对（apps/nexus/src/n2_identity.rs）; alternatives: ed25519-dalek (new dep, rejected), ring already in tree"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-outbound-anytls"
+crate = "sha2"
+version = "0.10"
+default_features = false
+features = []
+architecture_layer = "outbound (AnyTLS): SHA-256(password) 认证帧构造; no async runtime"
+feature_scope = "no default features; only sha2::Sha256 digest interface"
+license = "MIT OR Apache-2.0 (allowlisted; check via cargo-deny gate)"
+security = "no known advisories; re-check at push time via harness dependency-governance gate"
+portability = "pure Rust; crate marked portable = false due to rustls/ring (same as nexus-outbound-trojan)"
+supply_chain = "version pinned by Cargo.lock (lockfile_required); already present in tree as nexus-outbound-trojan dep (0.10.9)"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-04"
+review_basis = "AnyTLS 协议语义 §3.1: 认证帧首 32 字节为 SHA-256(password); alternatives considered: hand-rolled SHA-256 rejected (never hand-roll crypto)"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-outbound-anytls"
+crate = "md5"
+version = "0.7"
+default_features = false
+features = []
+architecture_layer = "outbound (AnyTLS): Settings padding-md5 指纹计算; no async runtime"
+feature_scope = "no features exist; zero transitive deps"
+license = "Apache-2.0 OR MIT (allowlisted; crates.io 2026-09-30)"
+security = "MD5 used only for the padding-scheme consistency fingerprint (not security-critical hashing); RustSec DB checked via harness gate"
+portability = "pure Rust, zero deps"
+supply_chain = "version pinned by Cargo.lock (lockfile_required); already present in tree as nexus-turn dep (0.7.0)"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-04"
+review_basis = "AnyTLS 协议语义 §3.4/§4.1: padding-md5 = MD5(小写 hex) of padding scheme 原始字节; same crate+version already allowlisted 2026-09-30 for crates/nexus-turn"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-outbound-hysteria2"
+crate = "quinn-proto"
+version = "0.11"
+default_features = false
+features = ["rustls", "ring"]
+architecture_layer = "outbound (Hysteria2): QUIC sans-IO 建连/握手/stream/datagram (RFC 9000 + RFC 9221); no async runtime, no tokio (repo is std-only)"
+feature_scope = "rustls+ring only; platform-verifier and runtime-tokio explicitly disabled"
+license = "MIT OR Apache-2.0 (allowlisted; cargo-deny PASS on 2026-09-30 for nexus-fabric entry, 57 third-party pkgs)"
+security = "RustSec DB fetch failed on 2026-09-30 (network); re-check at push time via harness gate"
+portability = "sans-IO, no socket code; crate marked portable = false (QUIC/rustls)"
+supply_chain = "0.11.18 pinned by Cargo.lock (lockfile_required); same vendored source as nexus-fabric ([patch.crates-io] vendor/quinn-proto + Nexus patch for quinn-rs/quinn#2658)"
+os_transitive_deps = "none beyond ring's cc (already accepted)"
+approved = true
+approved_date = "2026-10-04"
+review_basis = "Hysteria2 协议语义 §1/§2.1: QUIC + DATAGRAM 传输; nexus-fabric Driver 旋钮不足（SNI/ALPN/证书三选一/传输参数均不可配），故直接用 quinn-proto 手写最小 client handshake; quiche 明确不引入（见 crate MODULE.md QUIC 选型结论）"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-outbound-hysteria2"
+crate = "rustls"
+version = "0.23"
+default_features = false
+features = ["ring", "std"]
+architecture_layer = "outbound (Hysteria2): QUIC TLS 1.3 握手 (ALPN h3, pin-sha256/insecure/系统根三选一 verifier)"
+feature_scope = "ring+std only; aws-lc-rs/tls12 explicitly off (QUIC requires TLS 1.3)"
+license = "Apache-2.0 OR ISC OR MIT (allowlisted; same version already in tree via quinn-proto/nexus-fabric)"
+security = "no known advisories; re-check at push time via harness dependency-governance gate"
+portability = "pure Rust + ring cc build (already accepted in tree); crate marked portable = false"
+supply_chain = "0.23.45 pinned by Cargo.lock (lockfile_required); already in tree via quinn-proto"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-04"
+review_basis = "Hysteria2 协议语义 §2.1(2)(3): QUIC 握手需要 TLS 1.3 + ALPN h3 + 证书校验三选一；与 nexus-outbound-trojan/anytls 同版本同 feature 集"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-outbound-hysteria2"
+crate = "rustls-native-certs"
+version = "0.8"
+default_features = false
+features = []
+architecture_layer = "outbound (Hysteria2): 证书校验三选一之系统根证书加载"
+feature_scope = "no features; only load_native_certs()"
+license = "Apache-2.0 OR ISC OR MIT (allowlisted; check via cargo-deny gate)"
+security = "loads platform trust store only; no network; no known advisories; re-check at push time via harness gate"
+portability = "platform trust store (Linux: /etc/ssl/certs or SSL_CERT_* env); crate marked portable = false"
+supply_chain = "0.8.4 pinned by Cargo.lock (lockfile_required); transitive: openssl-probe, rustls-pki-types, schannel/security-framework (platform-gated)"
+os_transitive_deps = "none on Linux (openssl-probe reads /etc/ssl, no link)"
+approved = true
+approved_date = "2026-10-04"
+review_basis = "Hysteria2 协议语义 §2.1(3): 证书校验三选一含系统根证书链校验；alternatives: webpki-roots (static Mozilla bundle, new dep, rejected)"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-outbound-hysteria2"
+crate = "ring"
+version = "0.17"
+default_features = false
+features = []
+architecture_layer = "outbound (Hysteria2): rustls crypto provider (ring) + 系统 RNG (Salamander salt / padding) + TLS 握手签名校验"
+feature_scope = "no default features, no extra features; only crypto provider + rand::SystemRandom + signature verification"
+license = "Apache-2.0 AND ISC (allowlisted; same crate/version already reviewed for crates/nexus-connectivity and apps/nexus)"
+security = "no known advisories; re-check at push time via harness dependency-governance gate"
+portability = "BoringSSL C code already built on all supported host targets; crate marked portable = false"
+supply_chain = "0.17.14 pinned by Cargo.lock (lockfile_required); already in tree via quinn-proto/rustls"
+os_transitive_deps = "none (pure compile-time crypto)"
+approved = true
+approved_date = "2026-10-04"
+review_basis = "Hysteria2 需要 CSPRNG (salt/padding) 与 rustls crypto provider；ring 已在树内（quinn-proto/rustls 的 provider），不新增编译负担"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-outbound-hysteria2"
+crate = "rcgen"
+version = "0.13"
+default_features = false
+features = []
+architecture_layer = "outbound (Hysteria2): 仅测试用最小 server 的自签证书生成 (CN/SAN=localhost)"
+feature_scope = "no default features; only generate_simple_self_signed"
+license = "MIT OR Apache-2.0 (allowlisted; same crate/version already reviewed for crates/nexus-fabric)"
+security = "test-only usage; no known advisories; re-check at push time via harness gate"
+portability = "pure Rust; test-only"
+supply_chain = "0.13.2 pinned by Cargo.lock (lockfile_required); already in tree via nexus-fabric/nexus-outbound-trojan"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-04"
+review_basis = "Hysteria2 loopback E4 需要 server 证书；沿用 nexus-outbound-trojan 的 rcgen 自签做法（离线、确定性）"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-outbound-hysteria2"
+crate = "sha2"
+version = "0.10"
+default_features = false
+features = []
+architecture_layer = "outbound (Hysteria2): pin-sha256 证书校验（叶子 DER 的 SHA-256）"
+feature_scope = "no default features; only sha2::Sha256 digest interface"
+license = "MIT OR Apache-2.0 (allowlisted; check via cargo-deny gate)"
+security = "no known advisories; re-check at push time via harness dependency-governance gate"
+portability = "pure Rust; crate marked portable = false (QUIC/rustls)"
+supply_chain = "0.10.9 pinned by Cargo.lock (lockfile_required); already in tree via nexus-outbound-anytls"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-04"
+review_basis = "Hysteria2 协议语义 §2.1(3)/§4: pin-sha256 = 叶子证书 DER 的 SHA-256；alternatives: hand-rolled SHA-256 rejected (never hand-roll crypto)"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-outbound-hysteria2"
+crate = "blake2"
+version = "0.10"
+default_features = false
+features = []
+architecture_layer = "outbound (Hysteria2): Salamander 混淆的 BLAKE2b-256(key||salt) 密钥流; no async runtime"
+feature_scope = "no default features; only Blake2b<U32> digest interface (new/update/finalize)"
+license = "MIT OR Apache-2.0 (allowlisted; check via cargo-deny gate)"
+security = "RustCrypto maintained; used as obfuscation keystream PRF (not password hashing, not collision-sensitive); no known advisories; re-check at push time via harness gate"
+portability = "pure Rust; crate marked portable = false (QUIC/rustls)"
+supply_chain = "0.10.6 pinned by Cargo.lock (lockfile_required); transitive: digest 0.10 (already in tree)"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-04"
+review_basis = "Hysteria2 协议语义 §2.4: Salamander = payload XOR BLAKE2b-256(key||salt) 循环密钥流；alternatives considered: hand-rolled BLAKE2b rejected (never hand-roll crypto), blake3 (wrong algorithm — Salamander 指定 BLAKE2b, rejected)"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-outbound-hysteria2"
+crate = "bytes"
+version = "1"
+default_features = false
+features = []
+architecture_layer = "outbound (Hysteria2): quinn-proto sans-IO API 的 buffer 类型 (Bytes/BytesMut)"
+feature_scope = "no features enabled; Bytes/BytesMut only"
+license = "MIT (allowlisted)"
+security = "no known advisories in allowlist; cargo-deny recommended for CI"
+portability = "pure Rust, no OS-specific API"
+supply_chain = "pinned by Cargo.lock (lockfile_required); already in tree via quinn-proto"
+approved = true
+approved_date = "2026-10-04"
+review_basis = "quinn-proto sans-IO API (Endpoint::handle / poll_transmit / datagrams) 需要 bytes 类型；与 nexus-fabric 同"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-web-gateway"
+crate = "str0m"
+version = "0.24"
+default_features = false
+features = ["rust-crypto"]
+architecture_layer = "delivery (web gateway); node-side WebRTC endpoint (SDP/ICE/DTLS/SCTP DataChannel); sans-IO, no async runtime, repo stays std-only"
+feature_scope = "rust-crypto feature only; default aws-lc-rs/examples features disabled"
+license = "MIT OR Apache-2.0 (allowlisted)"
+security = "no known advisories; str0m is the WebRTC stack used by LiveKit; RustSec checked via harness gate"
+portability = "pure Rust with rust-crypto backend (RustCrypto, no C build); crate marked portable = false (DTLS crypto)"
+supply_chain = "0.24.1 pinned by Cargo.lock; deps are str0m-proto/is/dimpl/RustCrypto crates (all MIT/Apache-2.0)"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-08"
+review_basis = "repo std-only 姿态下唯一可行的成熟 WebRTC 栈（webrtc-rs 需 tokio，架构级倒退）；sans-IO 由调用方线程驱动，与 nexus-fabric/quinn-proto 模式一致"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-web-gateway"
+crate = "str0m-rust-crypto"
+version = "0.6"
+default_features = false
+features = []
+architecture_layer = "delivery (web gateway); str0m 的纯 Rust DTLS/SRTP crypto 后端"
+feature_scope = "no default features; RustCrypto backend (aes-gcm/hmac/p256/sha1/sha2)"
+license = "MIT OR Apache-2.0 (allowlisted)"
+security = "RustCrypto maintained; no known advisories; harness dependency-governance gate"
+portability = "pure Rust, no C"
+supply_chain = "0.6.0 pinned by Cargo.lock via str0m feature"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-08"
+review_basis = "str0m 的 rust-crypto feature 依赖；避免 aws-lc-rs C 构建"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-web-gateway"
+crate = "tungstenite"
+version = "0.24"
+default_features = false
+features = ["handshake"]
+architecture_layer = "delivery (web gateway); sync WebSocket server/client over rustls streams (WSS signaling + mesh relay)"
+feature_scope = "handshake feature only; no tokio/async features (repo std-only)"
+license = "MIT OR Apache-2.0 (allowlisted)"
+security = "mature WebSocket library (used by many Rust projects); no known advisories"
+portability = "pure Rust, sync Read+Write abstraction"
+supply_chain = "0.24.0 pinned by Cargo.lock; transitive deps http/httparse/byteorder/rand/thiserror/utf-8 (all allowlisted)"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-08"
+review_basis = "手写 RFC 6455 风险高；tungstenite 与仓库 std-only 同步架构契合（无 tokio），经 rustls StreamOwned 直接驱动"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-web-gateway"
+crate = "base64"
+version = "0.22"
+default_features = false
+features = ["std"]
+architecture_layer = "delivery (web gateway); RFC 6455 Sec-WebSocket-Accept + SSH data base64 in JSON protocol"
+feature_scope = "std feature only"
+license = "MIT OR Apache-2.0 (allowlisted)"
+security = "no known advisories"
+portability = "pure Rust"
+supply_chain = "0.22.1 pinned by Cargo.lock; already in tree via other crates"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-08"
+review_basis = "已在树内的标准编码库，避免手写 base64"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-web-gateway"
+crate = "sha1"
+version = "0.10"
+default_features = false
+features = []
+architecture_layer = "delivery (web gateway); RFC 6455 Sec-WebSocket-Accept = base64(SHA1(key+GUID))"
+feature_scope = "no default features"
+license = "MIT OR Apache-2.0 (allowlisted; 同 nexus-turn 已审条目)"
+security = "RustCrypto maintained; used for WS handshake only (not collision-sensitive)"
+portability = "pure Rust"
+supply_chain = "0.10.7 pinned by Cargo.lock; already in tree via nexus-turn"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-08"
+review_basis = "复用 nexus-turn 已审的 sha1 依赖，RFC 6455 强制要求"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-web-gateway"
+crate = "getifaddrs"
+version = "0.6"
+default_features = false
+features = []
+architecture_layer = "delivery (web gateway); enumerate local interface addresses when listen_addr is unspecified (0.0.0.0) so the WebRTC UDP/ICE host candidate is routable"
+feature_scope = "no features"
+license = "MIT OR Apache-2.0 (allowlisted)"
+security = "no known advisories; already in Cargo.lock as transitive dep of tun-rs"
+portability = "cross-platform (unix getifaddrs / windows)"
+supply_chain = "0.6.2 pinned by Cargo.lock; already in tree via tun-rs"
+os_transitive_deps = "libc (already in tree), bitflags, windows-sys"
+approved = true
+approved_date = "2026-10-10"
+review_basis = "修复 B-R1：0.0.0.0 时按网卡派生可路由 UDP 地址，避免 SDP 只带 loopback 候选导致真实浏览器零连接"

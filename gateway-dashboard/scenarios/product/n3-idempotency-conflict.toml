@@ -1,0 +1,32 @@
+schema_version = 1
+id = "product.n3-idempotency-conflict"
+title = "同键不同执行契约明确冲突"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#17-n3-task"
+
+# N3 contract-first: future verifier, not a delivered runtime.
+# Modules: nexus-domain nexus-compute nexus-workspace nexus-storage
+# nexus-session nexus-control-api apps/nexus apps/nexusd
+
+[given]
+topology = "separate requester/provider processes; local E4, not Windows/Linux E5"
+steps = "已接受请求后在 TTL 内改变 command 用同键提交，读取独立冲突响应。"
+
+[when]
+command = "cargo run --locked --quiet -p nexusd --example n3_task_e4 -- idempotency-conflict"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "error.code"
+equals = "IDEMPOTENCY_CONFLICT"
+
+[[expect]]
+field = "observed.accepted_task_count"
+equals = 1
+
+[[expect]]
+field = "observed.command_start_count"
+equals = 1

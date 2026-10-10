@@ -1,0 +1,39 @@
+schema_version = 1
+id = "product.proxy-vmess-adapter"
+title = "OutboundAdapter 接缝：VMess AEAD 出站被规则选中并自洽加解密（离线）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-proxy-kernel"
+
+[given]
+outbound = "tag=vm-out, kind=vmess, method=chacha20-poly1305, uuid"
+rule = "rule-vm -> select_outbound vm-out"
+offline = "Composition Root 构造 VmessAdapter，不连真实 vmess server"
+
+# 可执行 E4：组合根 example 解析 vmess 出站配置、构造 VmessAdapter 并按 tag 注册；
+# 规则把流量导向 vm-out -> handoff kind=vmess；AEAD encrypt->decrypt 自洽往返。
+[when]
+command = "cargo run --quiet -p nexus --example proxy_vmess_adapter -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "selected_outbound_kind"
+equals = "vmess"
+
+[[expect]]
+field = "selected_outbound_tag"
+equals = "vm-out"
+
+[[expect]]
+field = "method"
+equals = "chacha20-poly1305"
+
+[[expect]]
+field = "roundtrip_ok"
+equals = true
+
+[[expect]]
+field = "ciphertext_nonempty"
+equals = true

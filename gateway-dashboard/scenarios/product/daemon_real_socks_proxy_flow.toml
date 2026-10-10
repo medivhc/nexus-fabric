@@ -1,0 +1,62 @@
+schema_version = 1
+id = "product.daemon-real-socks-proxy-flow"
+title = "真实 SOCKS5 代理上网全链路：握手 → 规则路由 → Session → 真实出站 → 字节中继"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-proxy-kernel"
+
+[given]
+delivery = "real-proxy"
+egress = "real-outbound-connect"
+ingress = "socks5-handshake-state-machine"
+
+# 可执行 E4：本地 HTTP 目标 + nexus 代理单会话闭环 + 原始 SOCKS5 客户端，
+# 客户端经代理真实访问目标并获得 HTTP 200。
+[when]
+command = "cargo run --quiet -p nexus --example real_socks_proxy_flow"
+
+# 冻结期望：SOCKS5 握手成功（NO-AUTH）；CONNECT 回复 0x00；
+# 规则路由命中 MATCH 并选定 direct 出站；HTTP 200 往返；Session 双轨
+# Disposed/Completed；TerminalOutcome 恰好一次；字节中继双向非零。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "socks.auth_method_reply"
+equals = "0x05,0x00"
+
+[[expect]]
+field = "socks.reply_code"
+equals = 0
+
+[[expect]]
+field = "routing.matched_rule"
+equals = "rule-match"
+
+[[expect]]
+field = "routing.selected_outbound_tag"
+equals = "direct"
+
+[[expect]]
+field = "client.http_ok"
+equals = true
+
+[[expect]]
+field = "session.phase"
+equals = "Disposed"
+
+[[expect]]
+field = "session.outcome"
+equals = "Completed"
+
+[[expect]]
+field = "terminal_outcome_commit_count"
+equals = 1
+
+[[expect]]
+field = "bytes.to_upstream"
+non_empty = true
+
+[[expect]]
+field = "bytes.to_client"
+non_empty = true

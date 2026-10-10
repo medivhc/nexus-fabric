@@ -1,0 +1,53 @@
+schema_version = 1
+id = "product.workspace-sync-basic"
+title = "Workspace sync 经 fabric QUIC bi-stream：双端 heads 收敛"
+evidence_strength = "E4"
+requirement = "v9 §17/§18 + C2-D1/D2/D3（fabric QUIC bi-stream 承载，复用 active_conn，STREAM_TYPE_WORKSPACE_SYNC=0x03）"
+
+[given]
+description = "双端独立建仓（A/B 各自 commit）；fabric loopback 建连；A 经 FabricSyncTransport 主动 sync_with_remote，B 端 accept_bi 按 type 0x03 路由到 serve_sync"
+
+[when]
+command = "cargo run --quiet -p nexusd --example workspace_sync_e4 -- --scenario basic --json"
+
+# 冻结期望：
+# - fabric 建连成功（QUIC 握手完成，PeerId 绑定）；
+# - sync 走 bi-stream，不另建连接；
+# - 被动端按 stream type 0x03 正确路由到 serve_sync；
+# - 双端 heads 收敛一致；
+# - 拉取的提交 id == hash(content) 校验通过；
+# - SyncReport 计数正确（fetched_commits / fetched_objects）。
+# requirement-change 2026-10-02（Review F2）：fetched_commits 1→2。
+# genesis 按 author 区分内容哈希（Workspace::init），双端独立建仓时 genesis
+# 必然不同；B 从 A 拉取时需同时拉取 hello commit 与对端 genesis，故为 2。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "fabric.handshake_ok"
+equals = true
+
+[[expect]]
+field = "fabric.reused_conn"
+equals = true
+
+[[expect]]
+field = "routing.stream_type"
+equals = 3
+
+[[expect]]
+field = "sync.heads_converged"
+equals = true
+
+[[expect]]
+field = "sync.id_hash_verified"
+equals = true
+
+[[expect]]
+field = "sync.fetched_commits"
+equals = 2
+
+[[expect]]
+field = "sync.disposition"
+equals = "fast_forward"

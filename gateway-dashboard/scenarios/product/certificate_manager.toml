@@ -1,0 +1,60 @@
+schema_version = 1
+id = "product.certificate-manager"
+title = "证书管理：过期三态分类与原子轮换"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-certificate-manager"
+
+[given]
+cert_path = "/etc/nexus/cert.pem"
+key_path = "/etc/nexus/key.pem"
+warn_before_secs = 300
+
+[when]
+command = "cargo run --quiet -p nexus --example certificate_manager -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "certificate-manager"
+
+# now=100 < not_before=200 -> 未生效，拒绝构造
+[[expect]]
+field = "not_yet_valid_rejected"
+equals = true
+
+# now=2000 > not_after=1000 -> 已过期，拒绝构造
+[[expect]]
+field = "expired_rejected"
+equals = true
+
+# now=100，剩余 900 > 300 -> valid
+[[expect]]
+field = "status_valid"
+equals = "valid"
+
+# now=800，剩余 200 <= 300 -> expiring-soon 剩余 200 秒
+[[expect]]
+field = "status_expiring_soon_remaining"
+equals = 200
+
+# now=1001 -> 过期错误
+[[expect]]
+field = "status_expired_rejected"
+equals = true
+
+# 轮换到新证书成功，旧证书 not_after=1000，新证书非自签名
+[[expect]]
+field = "rotate_ok"
+equals = true
+
+[[expect]]
+field = "rotations_after"
+equals = 1
+
+# 已过期的新证书拒绝轮换，rotations 保持 1
+[[expect]]
+field = "rotate_bad_rejected"
+equals = true

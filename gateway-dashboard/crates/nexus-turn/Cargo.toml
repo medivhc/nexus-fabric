@@ -1,0 +1,16 @@
+[package]
+name = "nexus-turn"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+nexus-fabric = { path = "../nexus-fabric" }
+hmac = { version = "0.12", default-features = false }
+sha1 = { version = "0.10", default-features = false }
+md5 = { version = "0.7", default-features = false }
+
+[dev-dependencies]
+
+[features]
+default = []

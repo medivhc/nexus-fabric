@@ -1,0 +1,35 @@
+[package]
+name = "nexus-proxy-transport"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "QUIC over SOCKS5 CONNECT: length-prefixed framing over TCP, implements nexus-fabric UdpTransport (DESIGN §3.5)"
+
+[dependencies]
+nexus-fabric = { path = "../nexus-fabric" }
+# T 期：仅复用密码学/握手原语与配置结构（T3/T4）；零新增第三方依赖。
+nexus-outbound-shadowsocks = { path = "../nexus-outbound-shadowsocks" }
+nexus-outbound-trojan = { path = "../nexus-outbound-trojan" }
+nexus-proxy-config = { path = "../nexus-proxy-config" }
+# T7: rustls for trojan-over-TLS (same version as nexus-outbound-trojan, already in Cargo.lock).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# T7: native root certificates for strict TLS verification (already in Cargo.lock).
+rustls-native-certs = { version = "0.8", default-features = false }
+
+[dev-dependencies]
+
+[[example]]
+name = "proxy_quic"
+path = "examples/proxy_quic.rs"
+
+[[example]]
+name = "proxy_ss_quic"
+path = "examples/proxy_ss_quic.rs"
+
+[[example]]
+name = "proxy_trojan_quic"
+path = "examples/proxy_trojan_quic.rs"
+
+[[example]]
+name = "proxy_trojan_tls_quic"
+path = "examples/proxy_trojan_tls_quic.rs"

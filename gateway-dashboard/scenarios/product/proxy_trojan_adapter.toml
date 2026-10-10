@@ -1,0 +1,38 @@
+schema_version = 1
+id = "product.proxy-trojan-adapter"
+title = "Trojan TLS loopback 出站闭环（rcgen 自签 + 公钥 pin + 正确密码 + payload 往返）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-trojan"
+
+[given]
+topology = "same-process loopback 127.0.0.1: trojan server + trojan client"
+tls = "rustls 0.23(ring) over std::net::TcpStream; rcgen self-signed; client pins server SPKI"
+header = "hex(SHA-224(password)) + CRLF + ATYP+ADDR+PORT + CRLF"
+offline = "no public network; threads joined"
+
+[when]
+command = "cargo run --quiet -p nexus --example proxy_trojan_adapter -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "kind"
+equals = "trojan"
+
+[[expect]]
+field = "handshake_ok"
+equals = true
+
+[[expect]]
+field = "auth_accepted"
+equals = true
+
+[[expect]]
+field = "target_delivered_ok"
+equals = true
+
+[[expect]]
+field = "payload_roundtrip_ok"
+equals = true

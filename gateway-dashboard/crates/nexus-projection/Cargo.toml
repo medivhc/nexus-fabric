@@ -1,0 +1,19 @@
+[package]
+name = "nexus-projection"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Projection layer for the Nexus foundation: L3 tunnel (TUN IP packets <-> fabric datagrams)"
+
+[dependencies]
+nexus-domain = { path = "../nexus-domain" }
+nexus-fabric = { path = "../nexus-fabric" }
+nexus-ingress = { path = "../nexus-ingress" }
+nexus-path = { path = "../nexus-path" }
+smoltcp = { version = "0.12", default-features = false, features = ["std", "proto-ipv4", "socket-tcp", "medium-ip"] }
+tun-rs = { version = "2.8", default-features = false }
+
+[dev-dependencies]
+# E4 boost_v1 的组合根：network.toml 解析（nexus-network）+ boost 胶水（本 crate）。
+nexus-network = { path = "../nexus-network" }

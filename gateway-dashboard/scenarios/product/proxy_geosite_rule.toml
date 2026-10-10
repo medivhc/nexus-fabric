@@ -1,0 +1,38 @@
+schema_version = 1
+id = "product.proxy-geosite-rule"
+title = "GEOSITE 规则：按分类集合匹配目标域名后缀"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-proxy-kernel"
+
+[given]
+command = "proxy route"
+rule_kind = "geosite"
+data = "injected geosite db (cn->[example.cn, foo.cn])"
+network = "none (offline data injection)"
+
+# 可执行 E4：组合根注入 geosite 分类清单，SOCKS5 CONNECT 三个目标：
+# 1) www.example.cn（子域）→ 命中 geosite 规则（后缀匹配）；
+# 2) foo.cn（精确）→ 命中 geosite 规则；
+# 3) other.com（不在分类）→ 走 MATCH。
+[when]
+command = "cargo run --quiet -p nexus --example proxy_geosite_rule -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "case_sub.rule_kind"
+equals = "geosite"
+
+[[expect]]
+field = "case_exact.rule_kind"
+equals = "geosite"
+
+[[expect]]
+field = "case_other.rule_kind"
+equals = "match"
+
+[[expect]]
+field = "case_sub.matched_rule"
+equals = "rule-geosite-cn"

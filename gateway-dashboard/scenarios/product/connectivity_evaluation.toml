@@ -1,0 +1,65 @@
+schema_version = 1
+id = "product.connectivity-evaluation"
+title = "Connectivity Evaluation（v9 §8.1）：规划期低成本连通性评估接入 Planner"
+evidence_strength = "E4"
+requirement = "v9 §8.1 Connectivity Evaluation"
+
+[given]
+description = "纯函数评估（零 I/O、不建立业务 Link、确定性）；输出作为 Core Planner 的 Connectivity Feasibility 输入：无可行路径的候选被 Filter 门控拒绝，DecisionTrace 记录评估贡献"
+
+[when]
+command = "cargo run --quiet -p nexus --example connectivity_evaluation -- --json"
+
+# 冻结期望（语义来源：v9 §8.1 + 冻结 NAT 合同的可达性语义）：
+# - cone–cone：打洞可能（冻结合同：cone-cone 可达），Planner 保留候选
+# - symmetric–symmetric 且无中继：无可行路径，Planner 以 no_feasible_connectivity_path 拒绝
+# - symmetric–symmetric 但有中继：relay 可用，Planner 保留候选
+# - 双端 NAT 未知：保守不判打洞可能，置信度 30（100-25-25-10-10）
+# - 本端 FullCone：直连可能；有 recent RTT 时建连成本取实测 RTT
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "cases.cone_cone.punching_likely"
+equals = true
+
+[[expect]]
+field = "cases.cone_cone.planner_rejected"
+equals = "none"
+
+[[expect]]
+field = "cases.symmetric_symmetric_no_relay.has_feasible_path"
+equals = false
+
+[[expect]]
+field = "cases.symmetric_symmetric_no_relay.planner_rejected"
+equals = "no_feasible_connectivity_path"
+
+[[expect]]
+field = "cases.symmetric_symmetric_with_relay.relay_available"
+equals = true
+
+[[expect]]
+field = "cases.symmetric_symmetric_with_relay.planner_rejected"
+equals = "none"
+
+[[expect]]
+field = "cases.unknown_nat.punching_likely"
+equals = false
+
+[[expect]]
+field = "cases.unknown_nat.confidence_percent"
+equals = 30
+
+[[expect]]
+field = "cases.fullcone_direct.direct_likely"
+equals = true
+
+[[expect]]
+field = "cases.fullcone_direct.estimated_setup_cost_ms"
+equals = 42
+
+[[expect]]
+field = "cases.fullcone_direct.planner_rejected"
+equals = "none"

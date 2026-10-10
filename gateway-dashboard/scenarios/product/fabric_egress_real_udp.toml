@@ -1,0 +1,58 @@
+schema_version = 1
+id = "product.fabric-egress-real-udp"
+title = "真实 UDP 出口：egress 节点经真实 socket 转发，回包反向 NAT 返回"
+evidence_strength = "E4"
+requirement = "docs/foundation/DESIGN.md#6.4"
+
+[given]
+topology = "two Projections (A + B) with MockTun, mock peer link; B has RealUdpEgress with real OS socket; local UDP echo server on 127.0.0.1"
+rules = "A: 1.2.3.0/24 -> Egress{peer=B}; B: 0.0.0.0/0 -> Egress{self} + real socket egress enabled"
+packets = "deterministic: 10 x UDP packets from A to 127.0.0.1:<echo_port> via Egress{B}"
+
+# 可执行 E4：A 的包路由到 Egress{B} -> B 的 downlink 收到 egress 意图 ->
+# B 经真实 UdpSocket 发往 127.0.0.1 echo 服务器（S18） ->
+# echo 回包 -> B 的 socket 收到 -> NAT 反查到源 peer=A（S19） ->
+# B 经 transport 发回 A（mesh 意图） -> A 的 TUN 收到回包 ->
+# 验证回包内容一致 -> 输出 JSON。
+# 全程无 mock 回包（handle_egress_reply 不再使用）。
+[when]
+command = "cargo run --quiet -p nexus-projection --example egress_real_udp -- --json"
+
+# 冻结期望。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+# A 侧 10 个包全部路由到 Egress{B}。
+[[expect]]
+field = "a.route.egress_remote"
+equals = 10
+
+# B 侧真实 socket 发出 10 个包（S18）。
+[[expect]]
+field = "b.egress.real_sent"
+equals = 10
+
+# B 侧 socket 收到 10 个回包并 NAT 反查成功（S19）。
+[[expect]]
+field = "b.egress.reply_routed"
+equals = 10
+
+# A 侧收到 10 个正确回包（内容与发出一致）。
+[[expect]]
+field = "a.nat.reply_received"
+equals = 10
+
+[[expect]]
+field = "a.nat.reply_bytes_match"
+equals = true
+
+# 无映射回包被丢弃（S19）：向 B 的 socket 直接发一个无 NAT 记录的包。
+[[expect]]
+field = "b.egress.unmapped_dropped"
+equals = 1
+
+# 意图位正确。
+[[expect]]
+field = "intent.egress_bit_set"
+equals = true

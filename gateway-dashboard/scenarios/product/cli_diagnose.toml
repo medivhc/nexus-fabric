@@ -1,0 +1,27 @@
+schema_version = 1
+id = "product.cli-diagnose"
+title = "nexus CLI thin-client：diagnose 无 daemon 路由 → 显式 UNSUPPORTED（--json）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#9-observability"
+
+[given]
+domain_state = "subsystem snapshots ready (status/connectivity/dns/workspace/plan/session/platform)"
+cli_frontend = "nexus CLI 为 thin-client：diagnose 暂无 LocalAPI 路由，CLI 本地合成显式 UNSUPPORTED（不回退进程内 observability，PRODUCT §9 禁止静默降级）"
+
+[when]
+command = "cargo run --quiet -p nexus -- diagnose --json"
+
+# 冻结期望（requirement-change 2026-09-20）：thin-client 化后 CLI 不再在进程内执行观察命令；
+# 无 daemon 路由的命令输出结构化 UNSUPPORTED FAIL JSON（与 nexusd 兜底同形）。
+# Red Evidence：verify-e003ba88e02b（旧期望 PASS 数据在 thin-client 实现上 9/9 FAIL）。
+[[expect]]
+field = "verdict"
+equals = "FAIL"
+
+[[expect]]
+field = "error.code"
+equals = "UNSUPPORTED"
+
+[[expect]]
+field = "error.command"
+equals = "diagnose"

@@ -1,0 +1,44 @@
+schema_version = 1
+id = "product.n3-snapshot-immutable"
+title = "提交后本地改动不改变任务输入"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#17-n3-task"
+
+# N3 contract-first: future verifier, not a delivered runtime.
+# Modules: nexus-domain nexus-compute nexus-workspace nexus-storage
+# nexus-session nexus-control-api apps/nexus apps/nexusd
+
+[given]
+topology = "separate requester/provider processes; local E4, not Windows/Linux E5"
+steps = "固定内容 original 并提交；运行前把本地文件改成 changed；远端真实读取仍须是 original。"
+
+[when]
+command = "cargo run --locked --quiet -p nexusd --example n3_task_e4 -- snapshot-immutable"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "observed.local_content_after"
+equals = "changed"
+
+[[expect]]
+field = "observed.executed_content"
+equals = "original"
+
+[[expect]]
+field = "observed.submitted_snapshot_id"
+non_empty = true
+
+[[expect]]
+field = "observed.executed_snapshot_id"
+non_empty = true
+
+[[expect]]
+field = "observed.snapshot_ids_equal"
+equals = true
+
+[[expect]]
+field = "observed.command_start_count"
+equals = 1

@@ -1,0 +1,68 @@
+schema_version = 1
+id = "product.remote-compute-rejected-rollback"
+title = "远程计算作业被提供方拒绝时按逆序幂等回滚"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#remote"
+
+[given]
+node_a = "requester"
+node_b = "provider"
+resource = "compute"
+auth = "pre-shared-token-valid"
+transport = "tcp-length-prefix-frame"
+
+# 可执行 E4：组合根驱动远程计算拒绝路径并输出 JSON。
+# 认证已通过（token 正确），失败发生在提供方对作业内容的拒绝（REJECTED 帧）。
+[when]
+command = "cargo run --quiet -p nexus --example remote_compute_rejected_rollback -- --json"
+
+# 冻结期望：认证门控通过、提供方拒绝作业、Owner 唯一提交 Failed(COMPUTE_JOB_REJECTED)、
+# 逆序幂等回滚到 Disposed。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "auth.gate"
+equals = "token_verified"
+
+[[expect]]
+field = "error.code"
+equals = "COMPUTE_JOB_REJECTED"
+
+[[expect]]
+field = "rollback.idempotent"
+equals = true
+
+[[expect]]
+field = "rollback.drained_to_disposed"
+equals = true
+
+[[expect]]
+field = "session.phase"
+equals = "Disposed"
+
+[[expect]]
+field = "session.outcome"
+equals = "Failed"
+
+[[expect]]
+field = "terminal_outcome_commit_count"
+equals = 1
+
+[[expect]]
+field = "redundant_commit_rejected"
+equals = true
+
+# 失败发生在提交阶段而非解析/规划/认证阶段：Discovery 已解析 Node B 并完成规划。
+[[expect]]
+field = "plan.provider_id"
+equals = "node-b"
+
+[[expect]]
+field = "discovery.peer_id"
+equals = "node-b"
+
+[[expect]]
+field = "discovery.endpoint"
+non_empty = true

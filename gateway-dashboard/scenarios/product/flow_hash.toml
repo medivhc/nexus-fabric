@@ -1,0 +1,46 @@
+schema_version = 1
+id = "product.flow-hash"
+title = "按流哈希选择 FIB 下一跳：同流恒定、异流分散"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-flow-hash"
+
+[given]
+topology = "diamond: A-B(10ms), B-D(10ms), A-C(10ms), C-D(10ms); A->D has two 20ms equal-cost paths, FIB holds 2 NextHops"
+fib_shape = "dst vip -> Vec<NextHop> (sorted by peer); select_next_hop(vip, FlowKey) -> Option<&NextHop>"
+api = "FlowKey 5-tuple; FNV-1a 64 flow hash; hash % n index"
+
+# 可执行 E4：进程内菱形拓扑（A 视角）+ 流哈希选择
+#   flow_stable          同一 FlowKey 连续选择 100 次结果恒定（同一下一跳）
+#   flows_spread         1000 个不同流分散到 2 条下一跳（每条 >= 30%）
+#   single_path_stable   单下一跳 dst（A->B）选择恒为该条
+#   unknown_vip_none     未知 VIP 返回 None
+[when]
+command = "cargo run --quiet -p nexus --example flow_hash -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "events.0"
+equals = "flow_stable"
+
+[[expect]]
+field = "events.1"
+equals = "flows_spread"
+
+[[expect]]
+field = "events.2"
+equals = "single_path_stable"
+
+[[expect]]
+field = "events.3"
+equals = "unknown_vip_none"
+
+[[expect]]
+field = "selection.a_to_d_next_hops"
+equals = 2
+
+[[expect]]
+field = "selection.flow_stable_rounds"
+equals = 100

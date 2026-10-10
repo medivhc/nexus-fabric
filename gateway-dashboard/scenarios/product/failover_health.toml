@@ -1,0 +1,41 @@
+schema_version = 1
+id = "product.failover-health"
+title = "故障转移：消费健康事件流驱动主备切换与自动回切"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-failover-health"
+
+[given]
+primary = "primary"
+standbys = ["s1", "s2"]
+auto_failback = true
+
+[when]
+command = "cargo run --quiet -p nexus --example failover_health -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "failover-health"
+
+# primary 变 Unhealthy → 切到 s1
+[[expect]]
+field = "after_primary_unhealthy_active"
+equals = "s1"
+
+# s1 变 Unhealthy → 退到 s2
+[[expect]]
+field = "after_s1_unhealthy_active"
+equals = "s2"
+
+# primary 恢复 Healthy 且 auto_failback → 切回 Primary
+[[expect]]
+field = "after_primary_healthy_active"
+equals = "primary"
+
+# Degraded 事件不触发切换（仍在 s2 时注入 Degraded，active 不变）
+[[expect]]
+field = "degraded_event_did_not_switch"
+equals = true

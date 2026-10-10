@@ -1,0 +1,85 @@
+[workspace]
+resolver = "2"
+members = [
+  "apps/nexus",
+  "apps/nexusd",
+  "apps/nexus-platform-host",
+  "crates/nexus-domain",
+  "crates/nexus-control-api",
+  "crates/nexus-registry",
+  "crates/nexus-discovery",
+  "crates/nexus-connectivity",
+  "crates/nexus-ingress",
+  "crates/nexus-proxy-config",
+  "crates/nexus-proxy",
+  "crates/nexus-dns",
+  "crates/nexus-policy",
+  "crates/nexus-auth",
+  "crates/nexus-scheduler",
+  "crates/nexus-planner",
+  "crates/nexus-session",
+  "crates/nexus-measurement",
+  "crates/nexus-delivery",
+  "crates/nexus-transport",
+  "crates/nexus-network",
+  "crates/nexus-service",
+  "crates/nexus-flow-session",
+  "crates/nexus-workspace",
+  "crates/nexus-workspace-intel",
+  "crates/nexus-compute",
+  "crates/nexus-storage",
+  "crates/nexus-platform",
+  "crates/nexus-platform-linux",
+  "crates/nexus-platform-windows",
+  "crates/nexus-platform-macos",
+  "crates/nexus-platform-android",
+  "crates/nexus-platform-ios",
+  "crates/nexus-diagnostics",
+  "crates/nexus-proto",
+  "crates/nexus-outbound-shadowsocks",
+  "crates/nexus-outbound-vmess",
+  "crates/nexus-outbound-trojan",
+  "crates/nexus-outbound-anytls",
+  "crates/nexus-outbound-vless",
+  "crates/nexus-outbound-hysteria2",
+  "crates/nexus-fabric",
+  "crates/nexus-proxy-transport",
+  "crates/nexus-path",
+  "crates/nexus-projection",
+  "crates/nexus-plugin",
+  "crates/nexus-turn",
+  "crates/nexus-nat-traversal",
+  "crates/nexus-nat-wireup",
+  "crates/nexus-nat-quality",
+  "crates/nexus-web-gateway",
+  "engineering/nexus-harness",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+codegen-units = 1
+panic = "abort"
+
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.metadata.nexus]
+architecture_policy = "policies/architecture.toml"
+dependency_policy = "policies/dependencies.toml"
+quality_policy = "policies/quality.toml"
+harness = "harness.toml"
+
+[patch.crates-io]
+# Nexus patch: quinn-proto 0.11.18 + fix for quinn-rs/quinn#2658
+# (loss-detection timer firing post-migration with no ack-eliciting packets
+# in flight trips a debug_assert in pto_time_and_space). The patch adds the
+# same guard that already exists in set_loss_detection_timer to
+# on_loss_detection_timeout. Upstream issue is open with no fix released.
+quinn-proto = { path = "vendor/quinn-proto" }

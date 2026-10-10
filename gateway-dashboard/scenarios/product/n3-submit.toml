@@ -1,0 +1,56 @@
+schema_version = 1
+id = "product.n3-submit"
+title = "持久接受指定 Provider 的任务"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#17-n3-task"
+
+# N3 contract-first: future verifier, not a delivered runtime.
+# Modules: nexus-domain nexus-compute nexus-workspace nexus-storage
+# nexus-session nexus-control-api apps/nexus apps/nexusd
+
+[given]
+topology = "separate requester/provider processes; local E4, not Windows/Linux E5"
+steps = "编排真实请求方/提供方进程，生成完整 Snapshot 与固定环境后，经 nexus task submit 提交并查询。"
+
+[when]
+command = "cargo run --locked --quiet -p nexusd --example n3_task_e4 -- submit"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "task.task_id"
+non_empty = true
+
+[[expect]]
+field = "task.contract_digest"
+non_empty = true
+
+[[expect]]
+field = "task.accepted_contract.request.provider"
+equals = "prov-linux-build"
+
+[[expect]]
+field = "observed.accepted_record_reloaded"
+equals = true
+
+[[expect]]
+field = "observed.command_start_count"
+equals = 1
+
+[[expect]]
+field = "task.outcome"
+equals = "Completed"
+
+[[expect]]
+field = "task.execution.exit_code"
+equals = 0
+
+[[expect]]
+field = "task.delivery.state"
+equals = "Complete"
+
+[[expect]]
+field = "observed.artifact_digest_matches"
+equals = true

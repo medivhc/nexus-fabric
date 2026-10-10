@@ -1,0 +1,29 @@
+schema_version = 1
+id = "product.observability-diagnose"
+title = "§9 可观察性：nexus CLI thin-client 下 diagnose 无路由 → 显式 UNSUPPORTED"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#9-observability"
+
+[given]
+domain_state = "subsystem snapshots ready (status/connectivity/dns/workspace/plan/session/platform)"
+observability = "aggregated health report"
+
+# requirement-change 2026-10-02（用户已批准）：2026-10-01 CLI 统一（01e5114）后 nexus
+# 是 thin-client，不再在进程内执行观察命令；diagnose 暂无 LocalAPI 路由，CLI 本地
+# 合成显式 UNSUPPORTED（PRODUCT §9 禁止静默降级）。
+# 与 2026-09-20 冻结的 cli_diagnose.toml 合同一致。
+[when]
+command = "cargo run --quiet -p nexus -- diagnose --json"
+
+# 冻结期望（2026-10-02）：无路由命令输出结构化 UNSUPPORTED FAIL JSON。
+[[expect]]
+field = "verdict"
+equals = "FAIL"
+
+[[expect]]
+field = "error.code"
+equals = "UNSUPPORTED"
+
+[[expect]]
+field = "error.command"
+equals = "diagnose"

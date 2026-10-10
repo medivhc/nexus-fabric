@@ -1,0 +1,37 @@
+schema_version = 1
+id = "product.proxy-trojan-auth-rejected"
+title = "Trojan 错密码结构化拒绝（AUTH_DENIED，TLS 通过但不中继）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-trojan"
+
+[given]
+topology = "same-process loopback 127.0.0.1: trojan server + trojan client (wrong password)"
+tls = "rustls handshake succeeds; only header password hash mismatches"
+offline = "no public network; threads joined"
+
+[when]
+command = "cargo run --quiet -p nexus --example proxy_trojan_adapter -- --json --scenario rejected"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "kind"
+equals = "trojan"
+
+[[expect]]
+field = "handshake_ok"
+equals = true
+
+[[expect]]
+field = "auth_accepted"
+equals = false
+
+[[expect]]
+field = "reject_reason"
+equals = "AUTH_DENIED"
+
+[[expect]]
+field = "payload_relayed"
+equals = false

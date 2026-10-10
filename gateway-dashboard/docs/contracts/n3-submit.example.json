@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "workspace": "ws-n3-example",
+  "resource": "res-rust-build",
+  "provider": "prov-linux-build",
+  "input_snapshot": {
+    "schema_version": 1,
+    "workspace": "ws-n3-example",
+    "commit_id": "example-commit-ref",
+    "root_manifest_id": "example-manifest-ref",
+    "manifest_sha256": "sha256:42dd3018a1ca1afdd3268e71557a03efca64ffcdbb35e91cdd000fe6ca0024c3",
+    "selection_digest": "sha256:387a73c8e394d1c2b22210392d57e6d2248f9145d0646c01064b299556be24f8",
+    "file_count": 1,
+    "total_bytes": 38,
+    "snapshot_id": "sha256:0bedd81acbeffde4ee9142e16de72590714ec001a1b468a1122c931acac67644"
+  },
+  "command": [
+    "cargo",
+    "test",
+    "--offline",
+    "--locked"
+  ],
+  "cwd": ".",
+  "environment": {
+    "os": "linux",
+    "architecture": "x86_64",
+    "image_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "isolation": "container",
+    "network": "none"
+  },
+  "limits": {
+    "timeout_seconds": 1200,
+    "cpu_millis": 2000,
+    "memory_bytes": 2147483648,
+    "storage_bytes": 4294967296,
+    "log_bytes": 16777216
+  },
+  "outputs": [],
+  "success_exit_codes": [
+    0
+  ],
+  "idempotency_key": "n3-example-request-1",
+  "idempotency_ttl_seconds": 3600
+}

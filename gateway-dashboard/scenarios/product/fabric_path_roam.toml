@@ -1,0 +1,44 @@
+schema_version = 1
+id = "product.fabric-path-roam"
+title = "路径层漫游：路径失效时自动切换，流不中断"
+evidence_strength = "E4"
+requirement = "docs/foundation/DESIGN.md#4"
+
+[given]
+topology = "loopback UDP, PathManager + FabricConn (example binary)"
+flow = "4 MiB reliable stream via FabricConn over active path"
+
+# 可执行 E4：example 建连（FabricConn）-> PathManager 选直连 ->
+# 传输中模拟直连失效（丢包 100%）-> PathManager 检测到失败 ->
+# 切换到备用路径（mock TURN） -> FabricConn 被动迁移 ->
+# 验证流完整（hash）、CID 不变、切换发生 -> 输出 JSON。
+[when]
+command = "cargo run --quiet -p nexus-path --example roam -- --json"
+
+# 冻结期望（S2/S5/S6）。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+# 流完整（S2：切换不丢连接，数据完整）。
+[[expect]]
+field = "stream.hash_match"
+equals = true
+
+# 连接 ID 不变（S2）。
+[[expect]]
+field = "connection.id_unchanged"
+equals = true
+
+# 确实发生了切换（S6：失效切换）。
+[[expect]]
+field = "path.switched"
+equals = true
+
+[[expect]]
+field = "path.failed_kind"
+equals = "direct"
+
+[[expect]]
+field = "path.new_kind"
+equals = "turn"

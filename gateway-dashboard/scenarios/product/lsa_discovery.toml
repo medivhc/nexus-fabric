@@ -1,0 +1,43 @@
+schema_version = 1
+id = "product.lsa-discovery"
+title = "去中心化发现：Hello/Welcome 入网 + LSA 泛洪收敛 + LSDB 一致"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-lsa-discovery"
+
+[given]
+lsa_frame = "version(u8=1) + tag(u8) + fields; strings = u16 BE len + UTF-8; ints = BE"
+lsdb = "update by (incarnation, seq); self never overwritten"
+flood = "forward to all neighbors except source; dedup by (node_id, incarnation, seq)"
+
+# 可执行 E4：三节点进程内（A 经 B 入网，C 经 B 入网，A 经泛洪学到 C）
+# 事件序列（冻结）：
+#   hello_welcome_completed  A -> B Hello，B -> A Welcome（含 B 的 LSA），A 的 LSDB 有 A+B
+#   lsa_flood_converged      C 入网后泛洪 LSA，A 学到 C，三节点 LSDB 节点集合一致
+#   lsa_stale_rejected       旧 seq 的 LSA 被 LSDB 拒绝（Stale）
+#   lsa_self_ignored         本端 LSA 不被远端同名 LSA 覆盖（SelfIgnored）
+[when]
+command = "cargo run --quiet -p nexus --example lsa_discovery -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "events.0"
+equals = "hello_welcome_completed"
+
+[[expect]]
+field = "events.1"
+equals = "lsa_flood_converged"
+
+[[expect]]
+field = "events.2"
+equals = "lsa_stale_rejected"
+
+[[expect]]
+field = "events.3"
+equals = "lsa_self_ignored"
+
+[[expect]]
+field = "converged.node_count"
+equals = 3

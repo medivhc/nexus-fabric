@@ -1,0 +1,14 @@
+[package]
+name = "nexus-nat-quality"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Active quality measurement for NAT paths: datagram loss probes + RTT supply to PathManager"
+
+[dependencies]
+nexus-fabric = { path = "../nexus-fabric" }
+nexus-path = { path = "../nexus-path" }
+
+[lints]
+workspace = true

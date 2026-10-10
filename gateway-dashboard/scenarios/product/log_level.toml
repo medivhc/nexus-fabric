@@ -1,0 +1,43 @@
+schema_version = 1
+id = "product.log-level"
+title = "日志级别控制：全局/模块级级别、动态调整与覆盖"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-log-level"
+
+[when]
+command = "cargo run --quiet -p nexus --example log_level -- --json"
+
+# 模块覆盖生效：connectivity=Debug
+[[expect]]
+field = "eff_connectivity"
+equals = "debug"
+
+# 未覆盖模块回退全局：routing=Info
+[[expect]]
+field = "eff_routing"
+equals = "info"
+
+# connectivity 覆盖为 Debug，Debug 应输出
+[[expect]]
+field = "debug_conn_enabled"
+equals = true
+
+# routing 回退全局 Info，Debug 不输出
+[[expect]]
+field = "debug_routing_enabled"
+equals = false
+
+# set_global(Warn) 后 routing 全局变为 Warn
+[[expect]]
+field = "after_global_warn"
+equals = "warn"
+
+# set_module_level(routing, Trace) 后 routing 覆盖为 Trace
+[[expect]]
+field = "after_module_trace"
+equals = "trace"
+
+# from_str("ERROR") 大小写不敏感解析为 error
+[[expect]]
+field = "parsed_level"
+equals = "error"

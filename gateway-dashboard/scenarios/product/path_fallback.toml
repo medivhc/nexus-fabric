@@ -1,0 +1,47 @@
+schema_version = 1
+id = "product.path-fallback"
+title = "路径自动 fallback：直连被阻断时 staggered 建连自动经 SOCKS5 代理，数据真实走通"
+evidence_strength = "E4"
+requirement = "docs/foundation/DESIGN.md#3.5"
+
+[given]
+topology = "xc-pc-linux 真机；直连候选指向不可路由地址 192.0.2.1（TEST-NET-1，模拟防火墙 DROP：发出去的包有去无回、无 RST，connect 超时；不是真实 GFW）；SOCKS5 代理与 TCP echo 服务均在 127.0.0.1（example 内建）"
+chain = "FallbackConfig { proxy: Some(..), turn: None } → 展开为 [Direct, Proxy]；Turn 无配置诚实跳过并计数"
+connector = "example 内建（组合根模式）：Direct 用带 cancel 协作的 connect_timeout 循环（必失败）；Proxy 做真实 SOCKS5 CONNECT 握手，建连成功后跑 N 字节 echo roundtrip"
+budget = "stagger_delay 200ms, max_parallel 2, total_timeout 5s"
+
+# 可执行 E4：直连先发（stagger 排序）但永远连不上；200ms 后 proxy 并行启动，
+# 真实 SOCKS5 握手 + echo roundtrip 成功 → proxy 胜出。
+# 断言：胜出者是 proxy；roundtrip 真实走通；代理实际中继字节数 > 0（数据真经代理）；
+# direct 确实被尝试过（stagger 顺序）；turn 被诚实跳过。
+[when]
+command = "cargo run --quiet -p nexus-path --example path_fallback -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+# fallback 链生效：被阻断的直连之后，代理级别胜出。
+[[expect]]
+field = "fallback.winner_kind"
+equals = "proxy"
+
+# 数据面：N 字节经代理完成 echo roundtrip。
+[[expect]]
+field = "fallback.roundtrip_ok"
+equals = true
+
+# 代理真的中继了字节（>0 由 example 计入 verdict；此处断言字段存在）。
+[[expect]]
+field = "fallback.proxy_relayed_bytes"
+non_empty = true
+
+# stagger 顺序：direct 先被尝试（失败），不是被跳过。
+[[expect]]
+field = "fallback.direct_attempted"
+equals = true
+
+# F4：无配置的 Turn 级被跳过并计数，不报错。
+[[expect]]
+field = "fallback.turn_skipped"
+equals = true

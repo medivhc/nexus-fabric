@@ -1,0 +1,45 @@
+RED EVIDENCE — 插件机制（混淆传输点）(feature/plugin-obfs)
+==============================================================
+Date: 2026-09-30
+Contract: nexus-plugin S1–S6（用户批准：只做混淆传输点 / 版本硬校验 / 静态注册）
+
+## Scenario: product.plugin-obfs-echo → BLOCKED
+
+$ cargo run -p nexus-plugin --example obfs_echo
+Result: BLOCKED — crate `nexus-plugin` 只有 Cargo.toml 空壳：
+
+error: no example target named `obfs_echo` in `nexus-plugin`
+
+## Unit tests (TDD Red): 以下测试在实现前全部 FAIL（编译失败/缺失）
+
+1. `registry::tests::rejects_incompatible_api_version` (S2)
+   → FAIL: `nexus_plugin::PluginRegistry` 不存在
+
+2. `registry::tests::rejects_duplicate_name` (S2)
+   → FAIL: 同上
+
+3. `obfs::tests::xor_roundtrip` (S4)
+   → FAIL: `builtin::xor` 插件不存在
+
+4. `registry::tests::wrap_plain_passthrough` (S4)
+   → FAIL: `builtin::plain` 插件不存在
+
+5. `registry::tests::names_lists_registered` (S6)
+   → FAIL: `names()` 不存在
+
+## 契约要点（已冻结）
+
+- 新 crate `nexus-plugin`：S1 插件点唯一（只混淆传输）；S2 版本硬校验
+  （OBFUSCATE_API_VERSION=1，注册时检查，不兼容/重名拒绝）；S3 静态注册
+  （`builtin::register_all`，二进制启动时显式调用）；S4 流语义
+  （wrap 失败不自动回退）；S5 sync 零 tokio；S6 可观测。
+- 零第三方依赖（首期）。
+- 不做：路径提供方/选路策略插件点、出站拨号路径改造、dlopen 动态加载。
+- 基座：`4c1b86f`（watcher 修复分支；与 feature/turn-relay 的 4b 实现零交叉，
+  并行无冲突）。
+
+## Contract Hash (frozen, 2026-09-30)
+
+新文件: crates/nexus-plugin/{Cargo.toml,MODULE.md}
+修改: Cargo.toml (workspace members)
+场景文件: scenarios/product/plugin_obfs_echo.toml (新建)

@@ -1,0 +1,45 @@
+# Nexus 虚拟子网配置 —— 替代 EasyTier 组网
+#
+# 对应 EasyTier 现网拓扑（本机 easytier-gui 实测）：
+#   - 虚拟网段 10.144.144.0/24，本机虚拟 IP 10.144.144.3
+#   - 现存 peer：192.3.53.155:11010（VPS 中转）、172.168.9.202:11010、
+#     172.168.12.107:11010（内网 Linux 节点）
+#
+# 注意：
+#   1. Nexus 承载为 UDP（locator 前缀必须为 udp://），对端也必须运行
+#      Nexus（或等价 UDP 承载实现）才能互通；EasyTier 的 tcp:// 不能直连。
+#   2. 对端虚拟 IP（10.144.144.1/.2/.4）为示例占位，请按实际网络拓扑核对修改。
+#   3. 本文件仅为 Nexus 侧配置；对端节点的虚拟 IP 分配需全网一致（子网协调）。
+
+[subnet]
+cidr = "10.144.144.0/24"      # 虚拟子网网段（与 easytier 现网一致）
+virtual_ip = "10.144.144.3"   # 本机虚拟 IP（与 easytier 现网一致）
+encryption = true             # 开启 X25519 + ChaCha20Poly1305 AEAD 加密数据面
+
+# --- 对端节点（按本机 easytier 已连接对象整理） ---
+[[subnet.peers]]
+virtual_ip = "10.144.144.1"   # VPS 中转节点（占位，需核对）
+locator = "udp://192.3.53.155:11010"
+
+[[subnet.peers]]
+virtual_ip = "10.144.144.2"   # 内网 Linux（mylinux，占位，需核对）
+locator = "udp://172.168.9.202:11010"
+
+[[subnet.peers]]
+virtual_ip = "10.144.144.4"   # 内网 Linux（j6m，占位，需核对）
+locator = "udp://172.168.12.107:11010"
+
+# --- 可选：静态路由 / 前缀路由 / 出口节点（按需启用） ---
+# [[subnet.routes]]
+# dst = "10.144.144.100"
+# next_hop = "10.144.144.1"
+
+# [[subnet.prefix_routes]]
+# cidr = "192.168.5.0/24"
+# next_hop = "10.144.144.2"
+
+# [[subnet.local_prefixes]]
+# cidr = "172.168.12.0/24"
+
+# [subnet.egress]
+# 出口节点（须是 peers 中的 virtual_ip）

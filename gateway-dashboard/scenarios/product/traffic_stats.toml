@@ -1,0 +1,48 @@
+schema_version = 1
+id = "product.traffic-stats"
+title = "流量统计汇总：按节点记账与全量快照导出"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-traffic-stats"
+
+[given]
+node_a_rx_records = [[100, 200], [50, 50]]
+node_b_rx_record = [10, 20]
+
+[when]
+command = "cargo run --quiet -p nexus --example traffic_stats -- --json"
+
+# node-a 字节累加：rx=150, tx=250
+[[expect]]
+field = "node_a_summary.rx_bytes"
+equals = 150
+
+[[expect]]
+field = "node_a_summary.tx_bytes"
+equals = 250
+
+# node-a 连接数：+1+1-1 = 1
+[[expect]]
+field = "node_a_summary.active_connections"
+equals = 1
+
+# 从未记录的节点 → null
+[[expect]]
+field = "unknown_node_summary"
+equals = null
+
+# 快照汇总：node-a + node-b
+[[expect]]
+field = "snapshot.total_rx_bytes"
+equals = 160
+
+[[expect]]
+field = "snapshot.total_tx_bytes"
+equals = 270
+
+[[expect]]
+field = "snapshot.active_connections"
+equals = 2
+
+[[expect]]
+field = "snapshot.active_nodes"
+equals = 2

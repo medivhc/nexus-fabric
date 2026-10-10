@@ -1,0 +1,39 @@
+schema_version = 1
+id = "product.socks5-handshake"
+title = "SOCKS5 有状态握手状态机：分步喂字节推进 Greeting→Method→Request→Established，失败路径结构化"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#network"
+
+[given]
+protocol = "socks5-rfc1928-rfc1929"
+state_machine = "sing-box-inspired-enum-state-machine"
+handshake = "no-auth then CONNECT to example.com:443"
+
+# 可执行 E4：组合根 example 分步喂入握手字节，断言状态转移、响应字节、
+# FlowContext 产出与错误路径（坏版本 → Failed）。
+[when]
+command = "cargo run --quiet -p nexus --example socks5_handshake -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "final_state"
+equals = "established"
+
+[[expect]]
+field = "auth_reply"
+equals = "0x05,0x00"
+
+[[expect]]
+field = "flow_origin"
+equals = "socks5"
+
+[[expect]]
+field = "flow_destination"
+equals = "example.com:443"
+
+[[expect]]
+field = "bad_version_fails"
+equals = true

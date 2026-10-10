@@ -1,0 +1,50 @@
+schema_version = 1
+id = "product.dns-exit-binding"
+title = "DNS 子系统：解析→缓存→环路守卫→RDRC 负缓存→Exit-DNS Binding 进入 NetworkPlanExtension"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#network"
+
+[given]
+resolver = "memory-mock (example.com -> 93.184.216.34 / 2606:2800:220:1:248:1893:25c8:1946; blacklisted.internal -> REFUSED)"
+preference = "prefer_v4"
+exit_rule = "example.com -> exit-a"
+loop_guard = "upstream address dns.example.internal queried directly"
+negative_cache = "refused query cached, no retry within TTL"
+
+# 可执行 E4：组合根 example 驱动 DnsRuntime（注入内存 mock Resolver），断言：
+# 缓存命中、singleflight 去重（底层 resolver 仅调一次）、PreferV4 排序、
+# 环路守卫 LoopDetected、RDRC 负缓存不重试、Exit-DNS Binding 进入 NetworkPlanExtension v1。
+[when]
+command = "cargo run --quiet -p nexus --example dns_exit_binding -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "resolved_ip"
+equals = "93.184.216.34"
+
+[[expect]]
+field = "from_cache_second"
+equals = true
+
+[[expect]]
+field = "exit_dns_binding"
+equals = "exit-a"
+
+[[expect]]
+field = "loop_detected"
+equals = true
+
+[[expect]]
+field = "negative_cached"
+equals = true
+
+[[expect]]
+field = "preference"
+equals = "prefer_v4"
+
+[[expect]]
+field = "plan_extension_version"
+equals = 1

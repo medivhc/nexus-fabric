@@ -1,0 +1,45 @@
+schema_version = 1
+id = "product.n2-plan-preview"
+title = "nexus plan <resource>：只读规划预览（resolve＋filter＋score，不建连）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#16-n2-resource-access"
+
+[given]
+# P0-0 契约冻结（2026-10-03）：`nexus plan <resource>` 在 P0-3 实现，此处先冻结期望。
+# requirement-change 注释：本场景为新契约（contract-first）；当前实现只有
+# `plan explain <resource>`，`plan <resource>` 为 unknown command，预期 Red（FAIL）。
+# D3：Plan 可重算、不独立持久化；`nexus plan <resource>` 为纯只读预览
+# （resolve＋filter＋score，不建连；场景断言 Provider 侧连接计数不变）；
+# PlanId 用确定性非密码学摘要作标识符，不做安全边界；
+# DecisionTrace 加厚：score breakdown、Measurement 快照、Connectivity
+# Feasibility、结构化拒绝原因。
+resource_name = "dev-svc"
+
+[when]
+command = "cargo run --quiet -p nexus -- plan dev-svc --json"
+
+# 冻结期望（P0-3 实现后必须满足）：
+# - verdict=PASS；plan.resource=dev-svc
+# - plan.plan_id 非空（确定性摘要；同一输入多次调用结果一致）
+# - plan.provider 非空（选中的 Provider）
+# - plan.read_only=true（只读预览的显式标记；Provider 侧不得因此产生连接，
+#   实现侧 E4 需另行断言连接计数不变）
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "plan.resource"
+equals = "dev-svc"
+
+[[expect]]
+field = "plan.plan_id"
+non_empty = true
+
+[[expect]]
+field = "plan.provider"
+non_empty = true
+
+[[expect]]
+field = "plan.read_only"
+equals = true

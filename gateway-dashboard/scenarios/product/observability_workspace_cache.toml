@@ -1,0 +1,29 @@
+schema_version = 1
+id = "product.observability-workspace-cache"
+title = "§9 可观察性：nexus CLI thin-client 下 workspace cache 无路由 → 显式 UNSUPPORTED"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#9-observability"
+
+[given]
+domain_state = "content store ready (objects + protected roots + ReachabilityGc)"
+observability = "cache snapshot with GC retention semantics"
+
+# requirement-change 2026-10-02（用户已批准）：2026-10-01 CLI 统一（01e5114）后 nexus
+# 是 thin-client，不再在进程内执行观察命令；workspace cache 暂无 LocalAPI 路由，
+# CLI 本地合成显式 UNSUPPORTED（PRODUCT §9 禁止静默降级）。
+# 与 2026-09-20 冻结的 cli_workspace_cache.toml 合同一致（cache 需 <workspace> 参数）。
+[when]
+command = "cargo run --quiet -p nexus -- workspace cache ws1 --json"
+
+# 冻结期望（2026-10-02）：无路由命令输出结构化 UNSUPPORTED FAIL JSON。
+[[expect]]
+field = "verdict"
+equals = "FAIL"
+
+[[expect]]
+field = "error.code"
+equals = "UNSUPPORTED"
+
+[[expect]]
+field = "error.command"
+equals = "workspace cache"

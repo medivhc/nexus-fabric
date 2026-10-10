@@ -1,0 +1,36 @@
+schema_version = 1
+id = "product.fabric-mutual-auth"
+title = "独立进程 Fabric 双向 TLS 身份门禁与真实加密流"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#17-n3-task"
+[given]
+# 本机独立 requester/provider 进程，不称跨平台两真机 E5。
+[when]
+command = "cargo run --quiet -p nexus-fabric --example mutual_auth_e4 -- --json"
+[[expect]]
+field = "verdict"
+equals = "PASS"
+[[expect]]
+field = "two_processes"
+equals = true
+[[expect]]
+field = "peer_keys_verified"
+equals = true
+[[expect]]
+field = "tls13"
+equals = true
+[[expect]]
+field = "payload_integrity"
+equals = true
+[[expect]]
+field = "wrong_server_pin_denied"
+equals = true
+[[expect]]
+field = "anonymous_client_denied"
+equals = true
+[[expect]]
+field = "unknown_client_denied"
+equals = true
+[[expect]]
+field = "unauthenticated_payload_deliveries"
+equals = 0

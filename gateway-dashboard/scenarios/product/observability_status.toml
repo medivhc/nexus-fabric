@@ -1,0 +1,30 @@
+schema_version = 1
+id = "product.observability-status"
+title = "§9 可观察性：nexusd status 总览（DNS 快照 + 建连链路 + 规划决策 + 平台能力）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#9-observability"
+
+[given]
+command = "status"
+backed_by = "dns_status/connectivity_status/plan_explain/platform_capabilities snapshots"
+
+[when]
+# CLI 统一重构（01e5114）后观察命令走 daemon LocalAPI；harness 不负责起 daemon，
+# 故用 localapi_probe 自包含起临时 daemon 查一次（等价于旧 `nexusd <cmd> --json` 进程内快照）。
+command = "cargo run --quiet -p nexusd --example localapi_probe -- --path /localapi/v0/status"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "summary.plan_selected_provider"
+equals = "p1"
+
+[[expect]]
+field = "summary.typed_plan_extension"
+equals = true
+
+[[expect]]
+field = "summary.capabilities"
+non_empty = true

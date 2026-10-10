@@ -1,0 +1,16 @@
+[package]
+name = "nexus-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nexus-domain = { path = "../nexus-domain" }
+# D6：Principal 由 ed25519 公钥内容派生（SHA-256 截断 hex，与
+# `IdentityManager::peer_id_of` 同构）；sha2 为纯 Rust、无平台依赖，
+# portable-core（WASI）可用。default-features=false（仅需 digest 接口）。
+sha2 = { version = "0.10", default-features = false }

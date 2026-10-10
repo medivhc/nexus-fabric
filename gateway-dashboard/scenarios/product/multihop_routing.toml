@@ -1,0 +1,92 @@
+schema_version = 1
+id = "product.multihop-routing"
+title = "四节点线性拓扑距离矢量多跳路由闭环（A-B-C-D，3 跳可达）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-multihop-routing"
+
+[given]
+topology = "linear"
+node_a_virtual_ip = "10.0.0.1"
+node_b_virtual_ip = "10.0.0.2"
+node_c_virtual_ip = "10.0.0.3"
+node_d_virtual_ip = "10.0.0.4"
+# A 与 D 无直连；初始仅直连邻居注册
+initial_direct_peers_only = true
+# 2~3 轮邻居通告后收敛
+advertisement_rounds = 3
+# 逻辑时钟 TTL（tick 数），超时后非直连路由被删除
+route_ticks_to_live = 5
+# 初始 TTL（每跳 -1）
+initial_ttl = 64
+
+[when]
+command = "nexus-harness run multihop-routing --json"
+
+[[expect]]
+field = "topology"
+equals = "linear"
+
+[[expect]]
+field = "node_a.virtual_ip"
+equals = "10.0.0.1"
+
+[[expect]]
+field = "node_d.virtual_ip"
+equals = "10.0.0.4"
+
+# 收敛后 A 到 D 经 B，cost=3
+[[expect]]
+field = "node_a.route_to_d.next_hop"
+equals = "10.0.0.2"
+
+[[expect]]
+field = "node_a.route_to_d.cost"
+equals = 3
+
+# 收敛后 D 到 A 经 C，对称
+[[expect]]
+field = "node_d.route_to_a.next_hop"
+equals = "10.0.0.3"
+
+[[expect]]
+field = "node_d.route_to_a.cost"
+equals = 3
+
+# A 只直连 B，不知道 D 的 locator
+[[expect]]
+field = "node_a.direct_peer_count"
+equals = 1
+
+[[expect]]
+field = "node_d.direct_peer_count"
+equals = 1
+
+# A->D 包逐跳转发，最终 D 本地交付
+[[expect]]
+field = "packet_delivered_to_d.ok"
+equals = true
+
+# 经过 3 跳后 TTL 从 64 减到 61
+[[expect]]
+field = "packet_delivered_to_d.ttl_at_delivery"
+equals = 61
+
+# 中间节点事件序列非空（3 次 PacketForwarded：A->B, B->C, C->D）
+[[expect]]
+field = "forward_events.count"
+equals = 3
+
+# 推进逻辑时钟超过 TTL 后，非直连路由被超时删除
+[[expect]]
+field = "expiration.route_expired"
+equals = true
+
+# 超时后被删的必须包含远端路由 D(10.0.0.4)（C 也会一起过期）
+[[expect]]
+field = "expiration.expired_contains_d"
+equals = true
+
+# 直连邻居 B(10.0.0.2) 不应被超时删除
+[[expect]]
+field = "expiration.direct_b_still_present"
+equals = true

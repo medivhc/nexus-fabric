@@ -1,0 +1,98 @@
+schema_version = 1
+
+[compiler]
+deny_warnings = true
+fmt_check = true
+clippy_all_targets = true
+
+[features]
+check_default = true
+check_no_default_features = true
+check_each_feature = true
+check_supported_combinations = true
+check_all_features_when_valid = true
+
+[portability]
+wasi_or_equivalent_check = true
+
+[verification.fast]
+gates = [
+  "format",
+  "check",
+  "clippy",
+  "architecture-delta",
+  "dependency-delta",
+  "resource-type-neutrality",
+  "affected-tests",
+  "selected-properties"
+]
+
+[verification.full]
+gates = [
+  "workspace-tests",
+  "integration",
+  "product-scenarios",
+  "regression",
+  "architecture-policy",
+  "dependency-governance",
+  "coverage-summary",
+  "selected-fuzz",
+  "selected-concurrency",
+  "performance-budgets",
+  "bench",
+  "platform-checks",
+  "feature-matrix",
+  "portable-core"
+]
+
+[evidence]
+verdicts = ["PASS", "FAIL", "STALE", "UNKNOWN", "BLOCKED"]
+candidate_completion_is_pass = false
+minimum_user_visible_strength = "E4"
+stale_on_revision_change = true
+stale_on_config_change = true
+stale_on_feature_change = true
+stale_on_target_change = true
+stale_on_toolchain_change = true
+
+[concurrency]
+fire_and_forget_tasks = "deny"
+dropped_join_handle = "deny"
+worker_writes_terminal_outcome = "deny"
+exactly_one_terminal_outcome = true
+
+[rust]
+normal_business_failure_via_panic = "deny"
+unsafe_requires_safety_invariant = true
+public_api_minimization = true
+
+# 关键路径性能预算（AGENTS.md §21：baseline / noise tolerance / warning / blocking）。
+# 当前全部关键路径为纯内存、确定性函数（零 I/O）：Policy 求值、Planner 规划、
+# Connectivity 建连评估、Session 状态迁移。数值为单次调用纳秒估算基线，
+# 待 benchmark（cargo bench / nexus-harness bench）落地后以实测校准并绑定 Evidence。
+# 真实 I/O 热路径（平台 VPI、传输、存储）引入后按模块追加明细。
+[performance]
+
+[performance.baseline]
+policy_evaluate_ns = 1000
+planner_plan_ns = 2000
+connectivity_establish_ns = 1000
+session_transition_ns = 500
+
+[performance.noise_tolerance]
+policy_evaluate_ns = 200
+planner_plan_ns = 400
+connectivity_establish_ns = 200
+session_transition_ns = 100
+
+[performance.warning_threshold]
+policy_evaluate_ns = 5000
+planner_plan_ns = 10000
+connectivity_establish_ns = 5000
+session_transition_ns = 2500
+
+[performance.blocking]
+policy_evaluate_ns = 50000
+planner_plan_ns = 100000
+connectivity_establish_ns = 50000
+session_transition_ns = 25000

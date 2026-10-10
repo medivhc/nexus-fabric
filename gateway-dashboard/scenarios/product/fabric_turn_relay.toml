@@ -1,0 +1,31 @@
+schema_version = 1
+id = "product.fabric-turn-relay"
+title = "TURN 真实中继：双 client 经自研 TURN server 建 QUIC 并传数据"
+evidence_strength = "E4"
+requirement = "docs/foundation/DESIGN.md#4"
+
+[given]
+topology = "TURN server S on 127.0.0.1:0; clients A and B allocate relay addresses on S (xc-pc-linux, real UDP)"
+packets = "deterministic: A opens a QUIC bi stream to B's relayed address, sends N bytes, B echoes"
+
+# 可执行 E4：example 在真机跑：
+# - S = TurnServer::bind(127.0.0.1:0, creds{user,pass})（最小实现，RFC 5766
+#   子集：Allocate/Refresh/CreatePermission/ChannelBind/ChannelData/Send）
+# - A = TurnClient::allocate(S, creds) → relay_a；B 同理 → relay_b
+# - A.create_permission(relay_b)；B.create_permission(relay_a)
+# - A: FabricConn::connect_with_transport(peer_b, config, TurnSocket(A))，
+#   目标地址 = relay_b（QUIC Initial 经 A 的分配中继到 S，S 转给 B）
+# - B: FabricListener::bind_with_transport(relay_b, TurnSocket(B))，accept 回显
+# - A 发 N=65536 字节，B 回显；断言往返完整
+# - 断言 S 的 turn_relayed_bytes > 0（流量真实经过 TURN 中继，非直连）
+# - 沙箱 UDP EPERM 时输出 {"verdict":"SKIP","reason":"..."} 而非 FAIL
+# - 只用公开 API + 可观测输出，无"上帝之手"。
+# PASS 路径的字段由实现者在真机上验证；本 scenario 只门禁"不 FAIL"
+# （沙箱无 UDP 时允许 SKIP）。
+[when]
+command = "cargo run --quiet -p nexus-turn --example turn_relay -- --json"
+
+# 冻结期望。
+[[expect]]
+field = "verdict"
+one_of = ["PASS", "SKIP"]

@@ -1,0 +1,30 @@
+schema_version = 1
+id = "product.observability-compute-jobs"
+title = "§9 可观察性：nexus CLI thin-client 下 compute jobs 无路由 → 显式 UNSUPPORTED"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#9-observability"
+
+[given]
+domain_state = "compute sessions ready (submitted via in-memory transport)"
+observability = "job phase/result snapshot via nexus-compute"
+
+# requirement-change 2026-10-02（用户已批准）：2026-10-01 CLI 统一（01e5114）后 nexus
+# 是 thin-client，不再在进程内执行观察命令；compute jobs 暂无 LocalAPI 路由，CLI 本地
+# 合成显式 UNSUPPORTED（不回退进程内 observability，PRODUCT §9 禁止静默降级）。
+# 与 2026-09-20 冻结的 cli_compute_jobs.toml 合同一致。
+[when]
+command = "cargo run --quiet -p nexus -- compute jobs --json"
+
+# 冻结期望（2026-10-02）：无路由命令输出结构化 UNSUPPORTED FAIL JSON
+#（与 nexusd 兜底同形；verdict=FAIL + error.code=UNSUPPORTED + error.command）。
+[[expect]]
+field = "verdict"
+equals = "FAIL"
+
+[[expect]]
+field = "error.code"
+equals = "UNSUPPORTED"
+
+[[expect]]
+field = "error.command"
+equals = "compute jobs"

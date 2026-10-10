@@ -1,0 +1,132 @@
+schema_version = 1
+project = "Nexus"
+
+[paths]
+product = "PRODUCT.md"
+architecture = "ARCHITECTURE.md"
+development = "DEVELOPMENT.md"
+policies = "policies"
+scenarios = "scenarios"
+evidence = ".evidence"
+crates = "crates"
+engineering = "engineering"
+
+[discovery]
+module_contract = "MODULE.md"
+cargo_workspace = "Cargo.toml"
+context_order = ["product", "module", "public_api", "tests", "implementation"]
+
+[commands]
+status = "nexus-harness status"
+context = "nexus-harness context"
+check = "nexus-harness check"
+test_affected = "nexus-harness test affected"
+verify_fast = "nexus-harness verify --fast"
+verify_full = "nexus-harness verify --full"
+explain = "nexus-harness explain"
+bench = "nexus-harness bench"
+replay = "nexus-harness replay"
+
+[output]
+machine_flag = "--json"
+schema = "engineering/evidence-schema/evidence.schema.json"
+ansi_in_machine_mode = false
+
+[evidence]
+verdicts = ["PASS", "FAIL", "STALE", "UNKNOWN", "BLOCKED"]
+minimum_user_visible_strength = "E4"
+bind_revision = true
+bind_working_tree_digest = true
+bind_configuration_digest = true
+bind_feature_set = true
+bind_target_triple = true
+bind_toolchain = true
+bind_platform_capabilities = true
+
+[contract_first]
+enabled = true
+red_evidence_required = true
+freeze_scenario_expectations = true
+freeze_module_invariants = true
+requirement_change_invalidates_evidence = true
+
+[protection]
+root_contract_paths = [
+  "PRODUCT.md",
+  "ARCHITECTURE.md",
+  "policies/",
+  "scenarios/"
+]
+implementation_phase_protected = [
+  "scenarios/**/expectations",
+  "PRODUCT.md#frozen",
+  "crates/**/MODULE.md#frozen-invariants"
+]
+
+[affected_analysis]
+cargo_metadata = true
+reverse_dependencies = true
+scenario_mapping = true
+whole_program_guessing = false
+
+[portable_core]
+wasi_check = true
+crates = [
+  "nexus-domain",
+  "nexus-registry",
+  "nexus-policy",
+  "nexus-auth",
+  "nexus-scheduler",
+  "nexus-planner",
+  "nexus-session",
+  "nexus-measurement",
+  "nexus-delivery",
+  "nexus-ingress",
+  "nexus-proxy-config",
+  "nexus-proxy"
+]
+
+[hooks]
+# Machine-enforced gates declared by AGENTS.md; Local Harness and CI share the same definition.
+hooks_path = ".githooks"
+install = ".githooks/install.ps1"
+install_posix = ".githooks/install.sh"
+gates = ["pre-commit", "commit-msg", "pre-push"]
+allow_override = "--no-verify"
+override_does_not_produce_evidence = true
+
+[hooks.task_types]
+allowed = [
+  "feature",
+  "bugfix",
+  "refactor",
+  "test",
+  "docs",
+  "performance",
+  "dependency",
+  "requirement-change"
+]
+
+[hooks.protected]
+paths = [
+  "PRODUCT.md",
+  "ARCHITECTURE.md",
+  "policies/",
+  "scenarios/",
+  "harness.toml",
+  "**/MODULE.md"
+]
+# Contract Hash marker required in commit body / pushed range when protected paths change.
+marker = "^(contract|requirement-change):\\s*[A-Za-z0-9]{8,64}"
+
+[hooks.verify]
+mode = "fast"
+minimum_verdict = "PASS"
+stale_evidence_blocks_push = true
+block_on = ["FAIL", "BLOCKED"]
+
+[skills]
+# Project-level agent skills consumed by agents working in this repository.
+root = ".agents/skills"
+index = ".agents/skills/README.md"
+entries = ["nexus-task", "nexus-contract-first", "nexus-review", "nexus-knowledge", "nexus-evidence", "nexus-multiagent", "nexus-selfrepair"]

@@ -1,0 +1,43 @@
+schema_version = 1
+id = "product.fabric-conn-basic"
+title = "FabricConn 基本建连：可靠流回显 + 不可靠数据报 + E2E 加密"
+evidence_strength = "E4"
+requirement = "docs/foundation/DESIGN.md#3"
+
+[given]
+topology = "loopback UDP, two endpoints in one process (example binary)"
+payload_stream = "1 MiB deterministic bytes"
+payload_datagram = "100 x 200B datagrams"
+
+# 可执行 E4：example 启动双端点 -> 建连（对端 PeerId 认证） ->
+# 可靠流回显 1 MiB 并校验有序完整 -> 收发数据报 -> 输出 stats JSON。
+[when]
+command = "cargo run --quiet -p nexus-fabric --example basic -- --json"
+
+# 冻结期望（S1/S2/S4/S5/S8）。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "stream.echo_bytes_match"
+equals = true
+
+[[expect]]
+field = "stream.in_order"
+equals = true
+
+# 不可靠语义：只要求尽力（loopback 应全收，但契约不承诺）。
+# harness 只支持 equals/one_of/non_empty，故 example 输出布尔值。
+[[expect]]
+field = "datagrams.received_at_least_one"
+equals = true
+
+# rtt 被实测到（null -> NonEmpty 失败；数字 -> 通过）。
+[[expect]]
+field = "stats.rtt_ms"
+non_empty = true
+
+[[expect]]
+field = "peer.authenticated"
+equals = true

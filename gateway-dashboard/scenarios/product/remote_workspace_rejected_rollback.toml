@@ -1,0 +1,86 @@
+schema_version = 1
+id = "product.remote-workspace-rejected-rollback"
+title = "Node A 远程提交被 Node B 拒绝后按逆序幂等回滚"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#remote"
+
+[given]
+requester = "node-a"
+provider = "node-b"
+resource = "workspace"
+auth = "pre-shared-token"
+transport = "tcp-length-prefix-frame"
+change_set = "UNKNOWN\nremote.txt\nremote-content"
+
+# 可执行 E4：认证与建连真实完成（gate 在业务帧前通过），但 ChangeSet 携带未知 parent
+# （UNKNOWN），Node B 侧真实 Workspace 按 `UnknownCommit` 语义拒绝（REJECTED 帧）；
+# Node A 在会话建立后收到提供方拒绝，逆序幂等回滚到 Disposed 并提交 Failed。
+[when]
+command = "cargo run --quiet -p nexus --example remote_workspace_rejected_rollback -- --json"
+
+# 冻结期望：认证通过（失败发生在提供方业务拒绝，而非认证）；错误码 WORKSPACE_COMMIT_REJECTED；
+# 回滚幂等、Session 排空到 Disposed、TerminalOutcome 唯一提交 Failed、冗余提交被拒绝。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "events.0"
+equals = "remote_provider_resolved"
+
+[[expect]]
+field = "events.1"
+equals = "plan_selected"
+
+[[expect]]
+field = "events.2"
+equals = "session_created"
+
+[[expect]]
+field = "events.3"
+equals = "connectivity_established"
+
+# 认证门控在业务帧前通过（预共享 Token 校验成功）。
+[[expect]]
+field = "auth.gate"
+equals = "token_verified"
+
+[[expect]]
+field = "auth.principal"
+non_empty = true
+
+# 失败发生在提供方业务拒绝（会话已建立、帧已往返）。
+[[expect]]
+field = "error.code"
+equals = "WORKSPACE_COMMIT_REJECTED"
+
+# Planner 真实决策：Provider = Node B。
+[[expect]]
+field = "plan.provider_id"
+equals = "node-b"
+
+# 逆序幂等回滚：Session 排空到 Disposed，TerminalOutcome 由 Owner 唯一提交 Failed。
+[[expect]]
+field = "session.phase"
+equals = "Disposed"
+
+[[expect]]
+field = "session.outcome"
+equals = "Failed"
+
+[[expect]]
+field = "terminal_outcome_commit_count"
+equals = 1
+
+[[expect]]
+field = "rollback.idempotent"
+equals = true
+
+[[expect]]
+field = "rollback.drained_to_disposed"
+equals = true
+
+# 架构不变量：nexus-network 不依赖 nexus-ingress（ARCHITECTURE §3 禁止边）。
+[[expect]]
+field = "architecture.network_depends_on_ingress"
+equals = false

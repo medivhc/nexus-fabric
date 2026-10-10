@@ -1,0 +1,152 @@
+#!/bin/sh
+# Nexus pre-push gate (AGENTS.md §19/§19.1/§20 Evidence & Verdict / §7 Protected Paths).
+#   1. nexus-harness verify --fast must not be FAIL/BLOCKED
+#   2. STALE evidence blocks push (fresh evidence is a precondition for completion)
+#   3. pushed range modifying protected contract paths must carry a contract marker
+#   4. code changes require Review Evidence with APPROVED/COMMENTED verdict
+# stdin (git): <local ref> <local sha> <remote ref> <remote sha>
+set -u
+
+ROOT="$(git rev-parse --show-toplevel)" || { echo "[nexus-hook] not a git repository" >&2; exit 1; }
+. "$ROOT/.githooks/hook-common.sh"
+
+fail=0
+remote_sha=""
+while read -r _lref lsha _rref rsha; do
+  [ "$lsha" = "0000000000000000000000000000000000000000" ] && continue
+  remote_sha="$rsha"
+done
+
+# --- 1. harness verify gate ------------------------------------------------------
+# Skip harness verify if no Rust code changed (e.g. docs, Python scripts, CI configs)
+# The harness only validates Rust code; non-Rust changes don't need it.
+# Check files changed in HEAD commit (simpler and more robust than push range parsing)
+rust_changed=0
+if git show --name-only --format="" HEAD 2>/dev/null | grep -qE '\.(rs)$'; then
+  rust_changed=1
+fi
+
+if [ "$rust_changed" -eq 0 ]; then
+  log_info "no Rust code changed in HEAD, skipping harness verify gate"
+else
+if command -v cargo >/dev/null 2>&1; then
+  task_exit=0
+  out="$(worktree_cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -p nexus-harness -- verify --fast --json 2>&1)" || task_exit=$?
+  verdict="$(printf '%s' "$out" | sed -n 's/.*"verdict"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  if [ "$task_exit" -ne 0 ]; then
+    log_error "current worktree Harness failed (exit $task_exit):"
+    printf '%s\n' "$out" >&2
+    fail=1
+  fi
+  case "$verdict" in
+    FAIL|BLOCKED)
+      log_error "nexus-harness verify --fast = $verdict; fix before pushing"
+      fail=1
+      ;;
+    PASS)
+      log_info "nexus-harness verify --fast = PASS"
+      ;;
+    *)
+      log_error "nexus-harness verify --fast = ${verdict:-unavailable}; current Fast PASS required"
+      fail=1
+      ;;
+  esac
+else
+  log_error "cargo not on PATH; cannot run current worktree Harness"
+  fail=1
+fi
+fi
+
+# --- 2. stale evidence scan ------------------------------------------------------
+# Skip for non-Rust changes (same rationale as §1)
+if [ "$rust_changed" -eq 0 ]; then
+  log_info "no Rust code changed, skipping STALE evidence check"
+else
+# Multi-agent: only the current agent's STALE tombstones block; other agents'
+# evidence is out of scope (harness marks STALE within an agent scope only).
+AGENT="${NEXUS_AGENT:-}"
+if [ -d "$ROOT/.evidence" ]; then
+  if [ -n "$AGENT" ]; then
+    stale=""
+    for f in "$ROOT/.evidence"/verify-${AGENT}-*/summary.json; do
+      [ -f "$f" ] || continue
+      if grep -q '"verdict"[[:space:]]*:[[:space:]]*"STALE"' "$f"; then
+        stale="$stale
+$f"
+      fi
+    done
+  else
+    stale="$(grep -rl '"verdict"[[:space:]]*:[[:space:]]*"STALE"' "$ROOT/.evidence" 2>/dev/null || true)"
+  fi
+  if [ -n "$stale" ]; then
+    log_error "STALE evidence found; refresh with 'nexus-harness verify --full' before pushing:"
+    printf '%s\n' "$stale" | sed 's/^/    /'
+    fail=1
+  fi
+fi
+fi
+
+# --- 3. protected changes in pushed range without contract marker -----------------
+if [ -n "$remote_sha" ] && [ "$remote_sha" != "0000000000000000000000000000000000000000" ]; then
+  range="${remote_sha}..HEAD"
+  protected="$(protected_paths_in_range "$range")"
+  if [ -n "$protected" ]; then
+    if ! git log --format=%B "$range" 2>/dev/null | grep -qE "$CONTRACT_MARKER_PATTERN"; then
+      log_error "pushed range modifies protected contract paths without 'contract:'/'requirement-change:' marker:"
+      printf '%s\n' "$protected" | sed 's/^/    /'
+      fail=1
+    fi
+  fi
+fi
+
+# --- 4. code changes require Review Evidence ------------------------------------
+# Check if pushed range modifies any Rust code in crates/
+if [ -n "$remote_sha" ] && [ "$remote_sha" != "0000000000000000000000000000000000000000" ]; then
+  range="${remote_sha}..HEAD"
+  code_changed="$(git diff --name-only "$range" -- 'crates/*.rs' 2>/dev/null | head -1 || true)"
+
+  if [ -n "$code_changed" ]; then
+    # Find latest Review Evidence for this agent (fall back to any review for
+    # legacy pre-namespaced evidence; multi-agent repos MUST name reviews
+    # `review-<scope>-<agent>-r<n>` so one agent's review never satisfies
+    # another agent's push).
+    if [ -n "$AGENT" ]; then
+      review_dir="$(ls -1d "$ROOT/.evidence"/review-*-${AGENT}-* 2>/dev/null | sort | tail -1 || true)"
+      [ -z "$review_dir" ] && review_dir="$(ls -1d "$ROOT/.evidence"/review-* 2>/dev/null | sort | tail -1 || true)"
+    else
+      review_dir="$(ls -1d "$ROOT/.evidence"/review-* 2>/dev/null | sort | tail -1 || true)"
+    fi
+
+    if [ -z "$review_dir" ]; then
+      log_error "pushed range modifies Rust code but no Review Evidence found in .evidence/"
+      log_error "  Run independent Review first (see nexus-review skill)"
+      fail=1
+    else
+      summary_json="$review_dir/summary.json"
+      if [ ! -f "$summary_json" ]; then
+        log_error "Review Evidence found at $review_dir but missing summary.json"
+        fail=1
+      else
+        review_verdict="$(sed -n 's/.*"verdict"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$summary_json" | head -1)"
+        case "$review_verdict" in
+          APPROVED|COMMENTED)
+            log_info "Review Evidence = $review_verdict ($(basename "$review_dir"))"
+            ;;
+          CHANGES_REQUESTED|BLOCKED|*)
+            log_error "Latest Review Evidence verdict = ${review_verdict:-unknown}"
+            log_error "  Review must be APPROVED or COMMENTED before pushing code changes"
+            log_error "  Review dir: $review_dir"
+            fail=1
+            ;;
+        esac
+      fi
+    fi
+  fi
+fi
+
+if [ "$fail" -ne 0 ]; then
+  log_error "pre-push gate failed"
+  exit 1
+fi
+log_info "pre-push gate passed"
+exit 0

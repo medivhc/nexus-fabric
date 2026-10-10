@@ -1,0 +1,16 @@
+[package]
+name = "nexus-discovery"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nexus-domain = { path = "../nexus-domain" }
+nexus-registry = { path = "../nexus-registry" }
+nexus-platform = { path = "../nexus-platform" }
+# ring: ed25519 签名/验证（配对协议 D7；workspace 已用，nexus-fabric 在用）
+ring = { version = "0.17", default-features = false }

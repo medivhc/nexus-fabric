@@ -1,0 +1,64 @@
+schema_version = 1
+id = "product.n3-cancel-pending"
+title = "不可达时取消待确认且不提前提交终态"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#17-n3-task"
+
+# N3 contract-first: future verifier, not a delivered runtime.
+# Modules: nexus-domain nexus-compute nexus-workspace nexus-storage
+# nexus-session nexus-control-api apps/nexus apps/nexusd
+
+[given]
+topology = "separate requester/provider processes; local E4, not Windows/Linux E5"
+steps = "任务运行时隔离控制通道，请求取消，重启请求方 daemon 核实 outbox 恢复，再恢复通道并核实子树停止/reap。"
+
+[when]
+command = "cargo run --locked --quiet -p nexusd --example n3_task_e4 -- cancel-pending"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "before.cancel_request.origin"
+equals = "RequesterIntent"
+
+[[expect]]
+field = "before.cancel_request.state"
+equals = "Queued"
+
+[[expect]]
+field = "before.cancellation.state"
+equals = "None"
+
+[[expect]]
+field = "before.execution.state"
+equals = "Running"
+
+[[expect]]
+field = "before.observation"
+equals = "PendingVerification"
+
+[[expect]]
+field = "observed.cancel_intent_reloaded"
+equals = true
+
+[[expect]]
+field = "before.outcome"
+equals = "Unfinished"
+
+[[expect]]
+field = "after.cancellation.state"
+equals = "Confirmed"
+
+[[expect]]
+field = "after.outcome"
+equals = "Cancelled"
+
+[[expect]]
+field = "observed.live_child_processes"
+equals = 0
+
+[[expect]]
+field = "observed.terminal_commit_count"
+equals = 1

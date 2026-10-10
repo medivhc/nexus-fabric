@@ -1,0 +1,43 @@
+schema_version = 1
+id = "product.proxy-speedtest-http204-loopback"
+title = "proxy speedtest http204 真实探测 loopback HTTP/204 服务"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-proxy-kernel"
+
+[given]
+command = "proxy speedtest"
+probe_kind = "http204"
+target = "loopback 127.0.0.1 (local HTTP/1.1 server replying 204)"
+probe = "real Http204LatencyProbe (TCP connect + GET + read status line)"
+network = "loopback only (deterministic, offline)"
+
+# 可执行 E4：同一进程内起 loopback HTTP 服务（accept → 读请求行 → 回
+# HTTP/1.1 204 No Content），组合根真实 Http204LatencyProbe 对 127.0.0.1
+# 发 GET / 并读响应首行；断言 probe_kind=http204、status=ok、latency_ms 有值
+# 且低于宽松阈值（本地回环）。进程内 join 回收服务线程，不遗留监听。
+[when]
+command = "cargo run --quiet -p nexus --example proxy_speedtest_http204_loopback -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "proxy speedtest"
+
+[[expect]]
+field = "probe_kind"
+equals = "http204"
+
+[[expect]]
+field = "results.0.tag"
+equals = "loopback"
+
+[[expect]]
+field = "results.0.status"
+equals = "ok"
+
+[[expect]]
+field = "results.0.latency_ms"
+one_of = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]

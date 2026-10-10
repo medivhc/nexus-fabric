@@ -1,0 +1,28 @@
+schema_version = 1
+id = "engineering.harness-status-verdicts"
+title = "nexus-harness status 报告仓库状态与 Evidence 新鲜度（含 STALE 语义）"
+evidence_strength = "E4"
+requirement = "harness.toml#evidence"
+
+[given]
+repository = "initialized"
+evidence_present = "optional"
+
+[when]
+command = "nexus-harness status --json"
+
+[[expect]]
+field = "schema_version"
+equals = 1
+
+[[expect]]
+field = "command"
+equals = "status"
+
+[[expect]]
+field = "verdict"
+one_of = ["PASS", "STALE", "UNKNOWN", "BLOCKED"]
+
+[[expect]]
+field = "evidence.available"
+one_of = [true, false]

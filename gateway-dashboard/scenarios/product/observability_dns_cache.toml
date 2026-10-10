@@ -1,0 +1,26 @@
+schema_version = 1
+id = "product.observability-dns-cache"
+title = "§9 可观察性：dns cache 输出正/负缓存快照（挂 DnsRuntime snapshot API）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#9-observability"
+
+[given]
+resolver = "memory-mock"
+snapshot_api = "DnsRuntime::cache_snapshot / negative_cache_snapshot"
+
+[when]
+# CLI 统一重构（01e5114）后观察命令走 daemon LocalAPI；harness 不负责起 daemon，
+# 故用 localapi_probe 自包含起临时 daemon 查一次（等价于旧 `nexusd <cmd> --json` 进程内快照）。
+command = "cargo run --quiet -p nexusd --example localapi_probe -- --path /localapi/v0/dns/cache"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "cache"
+non_empty = true
+
+[[expect]]
+field = "negative_cache"
+non_empty = true

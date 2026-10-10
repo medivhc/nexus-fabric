@@ -1,0 +1,45 @@
+schema_version = 1
+id = "product.pipeline-firewall"
+title = "数据面管线：firewall 在隧道收发路径上真实拦截，traffic_stats 只计放行字节"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-dataplane-pipeline"
+
+[given]
+subnet_cidr = "10.0.0.0/24"
+a_virtual_ip = "10.0.0.1"
+b_virtual_ip = "10.0.0.2"
+default_policy = "allow"
+rules = [
+  "deny udp/53",
+]
+
+[when]
+command = "cargo run --quiet -p nexus --example pipeline_firewall -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "pipeline-firewall"
+
+# 命中 deny udp/53 的出向包被丢弃，不触碰 carrier
+[[expect]]
+field = "denied_flow_dropped"
+equals = true
+
+# 未命中规则的出向包放行并投递到对端 VPI
+[[expect]]
+field = "allowed_flow_delivered"
+equals = true
+
+# 被防火墙丢弃的包不计入对端收到字节
+[[expect]]
+field = "b_received_bytes"
+equals = 100
+
+# 管线侧记录丢弃计数
+[[expect]]
+field = "firewall_dropped"
+equals = 1

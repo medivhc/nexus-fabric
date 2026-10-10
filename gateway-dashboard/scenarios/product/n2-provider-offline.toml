@@ -1,0 +1,56 @@
+schema_version = 1
+id = "product.n2-provider-offline"
+title = "Provider 下线后请求方看到结构化不可达（非静默失败）"
+evidence_strength = "E5"
+requirement = "PRODUCT.md#16-n2-resource-access"
+
+[given]
+# P0-0 契约冻结（2026-10-03）：Provider 下线检测与结构化不可达在 P0-2/P0-5
+# 实现，此处先冻结期望。
+# requirement-change 注释：本场景为新契约（contract-first）；当前实现无
+# `use` 入口，预期 Red（FAIL：unknown command）。
+# D2：三种不可用原因的结构化区分——
+# ProviderOffline / HealthDegraded / NotAcceptingWork；过期广告拒绝。
+# P0 完成标志 2 的直接覆盖：B 机下线后 A 机看到结构化不可达，非静默失败。
+# E5 说明：本场景需双真机（xc-pc-linux → NU-SH-1217）；B 机下线为独立外部
+# 动作，A 机侧的观察即为外部观察。E4 前置可在 P0-5 用本机 fake-provider
+# 先行验证形状，本文件冻结的是真机语义。
+# E4 夹具（P0-6 / P1-8）：harness 在执行 [when].command 前按序跑 fixture（幂等，
+# 全部 exit 0 才跑场景命令）。`svc-on-b` 不在 SEED 中，干净目录下 resolve 阶段
+# 即 NOT_FOUND，到不了 PROVIDER_UNREACHABLE。此处发布该资源并把准入端点
+# 指向一个必然拨号不通的地址（127.0.0.1:1），在本机复现"B 机下线"这一事实；
+# `error.reason=ProviderOffline` 的语义与真机一致。E5 真跨机路径仍以下方
+# topology 描述为准（B 机下线为独立外部动作）。
+# 冻结期望未动——夹具只准备 E4 环境。
+fixture = [
+  "cargo run --quiet -p nexus -- node init --json",
+  "cargo run --quiet -p nexus -- resource publish --name svc-on-b --kind service --locator 127.0.0.1:8080 --locator n2adm://127.0.0.1:1 --json",
+]
+topology = "xc-pc-linux（请求方 A）→ NU-SH-1217（提供方 B，真跨机，非 loopback）"
+provider = "node-b"
+provider_state = "offline（B 机 nexusd 已停 / 网络不可达）"
+resource_name = "svc-on-b"
+
+[when]
+command = "cargo run --quiet -p nexus -- use svc-on-b --json"
+
+# 冻结期望（实现后必须满足）：
+# - verdict=FAIL（显式失败，非静默挂起/超时无声）
+# - error.code=PROVIDER_UNREACHABLE（结构化不可达码）
+# - error.reason=ProviderOffline（D2 三种不可用原因之一，精确值）
+# - error.provider=svc-on-b 的提供方标识（可观测：到底是谁不可达）
+[[expect]]
+field = "verdict"
+equals = "FAIL"
+
+[[expect]]
+field = "error.code"
+equals = "PROVIDER_UNREACHABLE"
+
+[[expect]]
+field = "error.reason"
+equals = "ProviderOffline"
+
+[[expect]]
+field = "error.provider"
+non_empty = true

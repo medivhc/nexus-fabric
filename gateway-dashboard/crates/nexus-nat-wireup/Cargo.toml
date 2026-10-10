@@ -1,0 +1,20 @@
+[package]
+name = "nexus-nat-wireup"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Production wiring for NAT punch-through: PunchChannel/PunchSocket over nexus-fabric driver, PunchManager orchestration, tie-break"
+
+[dependencies]
+nexus-fabric = { path = "../nexus-fabric" }
+nexus-nat-traversal = { path = "../nexus-nat-traversal" }
+nexus-connectivity = { path = "../nexus-connectivity" }
+
+[dev-dependencies]
+nexus-turn = { path = "../nexus-turn" }
+# E4-only: e4_prod_switch wires the full switching stack (PathLink +
+# QualityMonitor) for verification. src/ implementation never touches these.
+nexus-nat-quality = { path = "../nexus-nat-quality" }
+nexus-path = { path = "../nexus-path" }
+nexus-projection = { path = "../nexus-projection" }

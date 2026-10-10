@@ -1,0 +1,63 @@
+schema_version = 1
+id = "product.virtual-subnet-nat-probe"
+title = "NAT 打洞集成：成功直连 / 失败 Relay 回退（数据面闭环双路径）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#12-nat-probe"
+
+[given]
+subnet_cidr = "10.0.0.0/24"
+node_a_virtual_ip = "10.0.0.1"
+node_b_virtual_ip = "10.0.0.2"
+direct_locator = "udp://203.0.113.1:5000"
+relay_locator = "relay://relay.example.org:443"
+
+# 可执行 E4：组合根驱动打洞集成（成功/失败双路径）并输出 JSON。
+# 成功路径：A probe B → apply_hole_punch(直连 locator) → locator 动态更新、
+# state=Connected、帧经直连 locator 送达。
+# 失败路径：A 再次 probe → fallback_to_relay(relay locator) → locator=relay、
+# state=Connected、帧经 relay 送达（保底）。
+# 中间态断言：probe 后 peer_state == Probing（在 apply/fallback 前可见）。
+[when]
+command = "cargo run --quiet -p nexus --example virtual_subnet_nat_probe -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "command"
+equals = "virtual subnet nat probe"
+
+# --- 成功路径 ---
+[[expect]]
+field = "success.probe_state_seen"
+equals = "Probing"
+
+[[expect]]
+field = "success.state"
+equals = "Connected"
+
+[[expect]]
+field = "success.locator"
+equals = "udp://203.0.113.1:5000"
+
+[[expect]]
+field = "success.sent_via_direct"
+equals = true
+
+# --- 失败路径（Relay 回退）---
+[[expect]]
+field = "fallback.state"
+equals = "Connected"
+
+[[expect]]
+field = "fallback.locator"
+equals = "relay://relay.example.org:443"
+
+[[expect]]
+field = "fallback.sent_via_relay"
+equals = true
+
+[[expect]]
+field = "fallback.probe_state_seen"
+equals = "Probing"

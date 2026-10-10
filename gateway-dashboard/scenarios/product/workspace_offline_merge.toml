@@ -1,0 +1,32 @@
+schema_version = 1
+id = "product.workspace-offline-merge"
+title = "Workspace 多端离线提交不丢失并三方合并"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#workspace"
+
+[given]
+description = "双端离线分叉后 HeadSet 为 2；重连三方合并事件有序出现；合并后本地提交零丢失（v2：CommitId 为内容哈希，不再使用 C{seq} 序列号）"
+network = "offline-then-online"
+
+# 可执行 E4：nexus-workspace 的 example 按 Base + Local + Remote -> 分叉 -> 重连合并
+# 驱动 portable-core（nexus-workspace + nexus-storage），输出单个 JSON 对象供 harness 按路径求值。
+[when]
+command = "cargo run --quiet -p nexus-workspace --example workspace_offline_merge -- --json"
+
+# 冻结期望（与初版静态契约同语义，转为可机检路径）：
+# 多端离线提交后 HeadSet 必须为 2；重连合并事件按序出现；三方合并后本地提交零丢失。
+[[expect]]
+field = "head_count_before_merge"
+equals = 2
+
+[[expect]]
+field = "events.0"
+equals = "common_ancestor_found"
+
+[[expect]]
+field = "events.1"
+equals = "merge_commit_created"
+
+[[expect]]
+field = "lost_successful_local_commits"
+equals = 0

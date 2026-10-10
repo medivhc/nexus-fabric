@@ -1,0 +1,88 @@
+# nexus-transport Module Contract
+
+## Responsibility
+
+提供 Stream、Datagram、Multiplexing、Connection Reuse、Backpressure 与 Flow Control 的可移植传输抽象。
+
+## Non-Responsibilities
+
+不决定目标 Provider，不执行 Planner 逻辑。
+
+## Inputs
+
+- 仅接受公开类型、DTO、trait、事件或稳定协议对象。
+- 输入必须可被结构化验证；不得依赖未声明的全局隐式状态。
+
+## Outputs
+
+- 结构化 Result / Event / DTO。
+- 失败必须保留可诊断原因，不以日志文本代替错误类型。
+
+## Allowed Dependencies
+
+- `nexus-delivery`
+- `nexus-platform`
+
+## Forbidden Dependencies
+
+- `engineering/` 下的 Harness/Plugin。
+- 未在 `policies/architecture.toml` 声明的 Nexus 内部 crate。
+- Portable 模块中的平台专有 Framework/API。
+- 通过“便利”依赖绕过公开领域边界。
+
+## Invariants
+
+- Transport != Connectivity。
+- 具体平台/协议能力通过 Adapter/Provider 注入。
+
+## Side Effects
+
+- 仅允许 Responsibility 所需且在架构层中明确归属的副作用。
+- 新增副作用前必须更新本契约和 Scenario/Policy（如影响外部行为）。
+
+## Public API
+
+### 冻结契约（remote P0，scenarios/product/remote_service_access_flow.toml）
+
+- `pub fn connect(endpoint: &SocketAddr) -> Result<FrameStream, TransportError>`
+  建立到远端 Endpoint 的 TCP 连接，封装为长度前缀帧流。transport 不在 harness.toml `[portable_core]` 清单，允许使用 `std::net`。
+- `pub struct FrameStream`：帧流。
+  - `pub fn send_frame(&mut self, payload: &[u8]) -> Result<(), TransportError>`
+  - `pub fn recv_frame(&mut self) -> Result<Vec<u8>, TransportError>`
+  - `pub fn into_raw(self) -> std::net::TcpStream`：取回底层 TCP 流，供真实 relay 双向字节中继使用（新增 API，不改动任何冻结签名与帧协议）。
+- 帧协议冻结：`u32` 大端长度前缀 + payload（空 payload 合法）。
+- `pub enum TransportError { ConnectFailed, Closed, Protocol }`
+
+冻结语义：帧协议与错误变体在 remote P0 内为 Protected；实现阶段只允许补全行为与诊断信息，不得改变帧格式或签名。
+
+### 常规要求
+
+- 默认最小 surface：`private -> pub(crate) -> pub`。
+- Public API 变更必须保持结构化、可版本化并有调用方验证。
+
+## Verification
+
+最低：
+
+```text
+cargo check -p nexus-transport
+cargo clippy -p nexus-transport --all-targets -- -D warnings
+```
+
+如果该模块影响产品行为，还必须映射 Integration/Scenario Evidence。
+
+## Performance Budget
+
+未定义性能预算的路径不得宣称“性能完成”。进入 hot path 后必须在 Contract 中增加 baseline、noise tolerance、warning threshold 与 blocking threshold。
+
+## Observability
+
+稳定结构化字段优先于自由文本；如涉及 Session/Provider/Path/Workspace，应携带对应 correlation id。
+
+## Recovery Semantics
+
+任何持久状态或长期任务都必须定义 crash 后的 reconcile 行为。无持久状态的纯模块应保持可重建。
+
+## Platform Constraints
+
+平台专有代码只允许存在于 `nexus-platform-*` 或 Composition Root。Portable crate 必须通过相应 portability gate。

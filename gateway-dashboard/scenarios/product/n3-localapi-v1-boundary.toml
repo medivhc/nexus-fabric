@@ -1,0 +1,30 @@
+schema_version = 1
+id = "product.n3-localapi-v1-boundary"
+title = "真实 daemon 的版本化 Task LocalAPI 认证与能力边界"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#17-n3-task"
+[given]
+# 只验协议、拒绝与能力门禁，不代替完整 Submit/执行 E4。
+[when]
+command = "cargo run --quiet -p nexusd --example n3_localapi_v1_e4 -- --json"
+[[expect]]
+field = "verdict"
+equals = "PASS"
+[[expect]]
+field = "unauthorized_denied"
+equals = true
+[[expect]]
+field = "unknown_version_rejected"
+equals = true
+[[expect]]
+field = "oversize_rejected"
+equals = true
+[[expect]]
+field = "ambiguous_framing_rejected"
+equals = true
+[[expect]]
+field = "disabled_service_explicit"
+equals = true
+[[expect]]
+field = "acceptance_unchanged"
+equals = true

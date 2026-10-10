@@ -1,0 +1,12 @@
+schema_version = 1
+id = "product.schedule-cli-reachable"
+title = "计划任务 CLI 用户入口可达：`nexus schedule list --json` 返回结构化结果"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#14-schedule"
+
+[when]
+command = "cargo run --quiet -p nexus -- schedule list --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"

@@ -1,0 +1,36 @@
+schema_version = 1
+id = "product.dns-rule-server-selection"
+title = "DNS 多 server 规则路由：按域名规则选择本次解析走哪个 server（A/B + MATCH 兜底）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-dns"
+
+[given]
+servers = "server-a (192.0.2.10) / server-b (198.51.100.20)，离线内存 mock Resolver"
+rule = "example.internal -> server-a"
+match_fallback = "其余 MATCH -> server-b"
+
+# 可执行 E4：组合根 example 解析带 dns 段的配置并驱动 MultiServerDns（离线注入 mock），
+# 断言 example.internal 经规则命中走 server-a、other.example 经 MATCH 兜底走 server-b，
+# 且解析结果确为被选中 server 的应答。
+[when]
+command = "cargo run --quiet -p nexus --example dns_rule_server_selection -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "selected_server_internal"
+equals = "server-a"
+
+[[expect]]
+field = "selected_server_other"
+equals = "server-b"
+
+[[expect]]
+field = "internal_resolved_ip"
+equals = "192.0.2.10"
+
+[[expect]]
+field = "other_resolved_ip"
+equals = "198.51.100.20"

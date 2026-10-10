@@ -1,0 +1,33 @@
+schema_version = 1
+id = "product.proxy-rule-invalid"
+title = "GEOIP/rule-providers 严格校验：未知国家码与缺失 provider 拒绝编译"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-proxy-kernel"
+
+[given]
+command = "proxy route"
+data = "injected geoip (CN) / providers (cn-domains) — 规则引用不存在实体"
+network = "none (offline data injection)"
+
+# 可执行 E4：编译期严格校验，不静默降级为不匹配：
+# 1) 规则引用未注入的国家码（GEOIP,XX）→ CONFIG_INVALID；
+# 2) 规则引用未定义的 provider（rule_set,missing）→ CONFIG_INVALID；
+# 3) rule-providers 配置 behavior 非法 / path 缺失 → CONFIG_INVALID。
+[when]
+command = "cargo run --quiet -p nexus --example proxy_rule_invalid -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "unknown_country.rejected"
+equals = true
+
+[[expect]]
+field = "missing_provider.rejected"
+equals = true
+
+[[expect]]
+field = "bad_provider_cfg.rejected"
+equals = true

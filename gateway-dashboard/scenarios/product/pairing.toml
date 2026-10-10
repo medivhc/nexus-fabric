@@ -1,0 +1,44 @@
+schema_version = 1
+id = "product.pairing"
+title = "设备配对：配对码生成、双节点配对流程、信任建立"
+evidence_strength = "E4"
+requirement = ".agents/plans/pairing-plan.md"
+
+[given]
+setup = "两个独立配置目录 <a-dir> 和 <b-dir>；A 为邀请方，B 为加入方"
+transport = "TCP loopback（配对协议）；配对码经变量传递（模拟带外通道）"
+
+[when]
+# Red Evidence：在未实现时运行，期望 FAIL（nexus pair 命令不存在）
+# 实现后：example 内部执行完整双节点配对流程，断言全部行为后输出 PASS
+command = "cargo run --quiet -p nexus --example pairing_flow -- --json"
+
+# 冻结期望（D7）：example 内部断言全部行为后才输出 PASS；
+# toml 钉住关键可观察字段（verdict=PASS 蕴含其余行为正确）。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "code_format_valid"
+equals = true
+
+[[expect]]
+field = "pairing_completed"
+equals = true
+
+[[expect]]
+field = "a_has_b_peer_file"
+equals = true
+
+[[expect]]
+field = "b_has_a_peer_file"
+equals = true
+
+[[expect]]
+field = "signature_verified"
+equals = true
+
+[[expect]]
+field = "wrong_token_rejected"
+equals = true

@@ -1,0 +1,33 @@
+schema_version = 1
+id = "regression.crash-recovery"
+title = "强杀后冷启动先 Reconciliation 再接受新工作"
+evidence_strength = "E4"
+
+[given]
+persisted_session = "Active+Unfinished"
+process_alive = false
+dirty_workspace_journal = true
+
+# 可执行 E4：nexus-workspace 的 example 按 持久会话记录 + 写前日志 -> 崩溃 -> 冷启动
+# 驱动 portable-core（nexus-workspace + nexus-session + nexus-storage），输出单个 JSON
+# 对象供 harness 按路径求值。
+[when]
+command = "cargo run --quiet -p nexus-workspace --example crash_recovery -- --json"
+
+# 冻结期望（与初版静态契约同语义，转为可机检路径）：
+# Reconciliation 必须先于接受新工作；workspace 日志与孤儿会话均被处理。
+[[expect]]
+field = "events.0"
+equals = "reconciliation_started"
+
+[[expect]]
+field = "events.1"
+equals = "workspace_journal_reconciled"
+
+[[expect]]
+field = "events.2"
+equals = "orphan_session_classified"
+
+[[expect]]
+field = "events.3"
+equals = "accept_new_work"

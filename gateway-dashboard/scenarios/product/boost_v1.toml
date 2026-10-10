@@ -1,0 +1,70 @@
+schema_version = 1
+id = "product.boost-v1"
+title = "Network Boost v1：[boost] 配置驱动激进切路参数 + EWMA 选路 + 建连竞速"
+evidence_strength = "E4"
+requirement = "docs/DAEMON_ARCHITECTURE.md#12"
+
+[given]
+topology = "loopback; network.toml 含 [boost] enabled=true (hysteresis 10%, hold 1s, race_on_connect=true)"
+config = "[boost] enabled=true, hysteresis_pct=0.10, switch_hold_ms=1000, race_on_connect=true"
+candidates = "direct (rtt 20ms, 好) + proxy (rtt 200ms, 差); fake PathConnector 延迟注入"
+
+# 可执行 E4：example 走生产路径。
+# 1. N1Config::parse_toml 解析含 [boost] 的 network.toml → BoostConfig。
+# 2. path_params() → nexus-projection::boost::path_config_for_boost → PathConfig。
+#    断言：hysteresis_pct == 0.10，switch_hold_ms == 1000（激进参数生效）。
+# 3. PathManager 加 2 候选，喂 stats（direct 好 / proxy 差），select_best 只读选路。
+#    断言：选中 direct（EWMA 高分者），degraded == false。
+# 4. boost_connect(race_on_connect=true) → connect_with_fallback → race_connect。
+#    断言：race.used == true，winner 为快路径，attempts 在预算内。
+# 5. 对照：无 [boost] 的 network.toml → 参数回落 0.20 / 3000（零回归）。
+[when]
+command = "cargo run --quiet -p nexus-projection --example boost_v1 -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+# B1/B2：boost 配置解析与参数映射。
+[[expect]]
+field = "boost.enabled"
+equals = true
+
+[[expect]]
+field = "boost.hysteresis_pct"
+equals = 0.1
+
+[[expect]]
+field = "boost.switch_hold_ms"
+equals = 1000
+
+[[expect]]
+field = "boost.race_on_connect"
+equals = true
+
+# B3：EWMA 驱动选路（只读）。
+[[expect]]
+field = "selection.best_kind"
+equals = "direct"
+
+[[expect]]
+field = "selection.degraded"
+equals = false
+
+# B4：建连竞速。
+[[expect]]
+field = "race.used"
+equals = true
+
+[[expect]]
+field = "race.attempts_within_budget"
+equals = true
+
+# B4 不变量：无 [boost] 时回落默认（零回归）。
+[[expect]]
+field = "noboost.hysteresis_pct"
+equals = 0.2
+
+[[expect]]
+field = "noboost.switch_hold_ms"
+equals = 3000

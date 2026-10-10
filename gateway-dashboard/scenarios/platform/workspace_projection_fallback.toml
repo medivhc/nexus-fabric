@@ -1,0 +1,32 @@
+schema_version = 1
+id = "platform.workspace-projection-fallback"
+title = "无 Mount 平台仍可通过 Materialization/Native API 使用 Workspace"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#workspace"
+
+[given]
+native_mount = false
+materialization = true
+
+# 可执行 E4：nexus-workspace 组合根示例按 [given] 选择访问提供者并输出 JSON。
+[when]
+command = "cargo run --quiet -p nexus-workspace --example workspace_projection_fallback -- --json"
+
+# 冻结期望（与初版静态契约同语义）：
+# 1) 无 Mount 平台必须选中 MaterializedDirectory 访问提供者；
+# 2) 投影访问必须保持产品语义（Commit DAG / Head Set / Manifest 仍可用）。
+[[expect]]
+field = "given.native_mount"
+equals = false
+
+[[expect]]
+field = "given.materialization"
+equals = true
+
+[[expect]]
+field = "selected_access_provider"
+equals = "MaterializedDirectory"
+
+[[expect]]
+field = "product_semantics_preserved"
+equals = true
