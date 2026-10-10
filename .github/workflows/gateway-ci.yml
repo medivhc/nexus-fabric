@@ -84,7 +84,8 @@ jobs:
           path: ./artifacts
       - name: Generate dashboard
         run: |
-          ARGS="--repo-root . --crate-dir crates/nexus-web-gateway --out index.html"
+          ARGS="--repo-root . --crate-dir crates/nexus-web-gateway --out dist/index.html"
+          mkdir -p dist
           if [ "${{ needs.test.result }}" = "skipped" ]; then
             # validate 失败：降级页面（SPEC §2 F5）
             python3 crates/nexus-web-gateway/tools/gen-dashboard.py $ARGS \
@@ -95,13 +96,20 @@ jobs:
             python3 crates/nexus-web-gateway/tools/gen-dashboard.py $ARGS
           fi
           ls -lh index.html
+      - name: Validate publish directory
+        run: |
+          COUNT=$(find dist -type f | wc -l)
+          if [ "$COUNT" -ne 1 ]; then
+            echo "::error::dist/ should contain exactly 1 file, found $COUNT"
+            exit 1
+          fi
       - name: Deploy to gh-pages
         # 用 peaceiris/actions-gh-pages 或 git push，SPEC §9 注明 develop 阶段定；
         # 此处用 peaceiris（最常用，零配置）
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: .
+          publish_dir: ./dist
           publish_branch: gh-pages
           destination_dir: gateway-dashboard
-          keep_files: true
+          keep_files: false
