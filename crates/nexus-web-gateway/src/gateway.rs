@@ -1531,9 +1531,43 @@ fn create_session(
     let now = Instant::now();
     let mut rtc = Rtc::builder().build(now);
     let udp_addr = shared.udp.local_addr().map_err(GatewayError::Io)?;
-    let candidate = Candidate::host(udp_addr, "udp")
-        .map_err(|e| GatewayError::Rtc(format!("host candidate: {e}")))?;
-    rtc.add_local_candidate(candidate);
+    let udp_port = udp_addr.port();
+    // Advertise all non-loopback interface addresses as host candidates so
+    // ICE can try each path (multi-homed hosts, mesh + LAN, etc.). The UDP
+    // socket is bound to the selected IP, but candidates cover all interfaces.
+    let mut added = 0;
+    if let Ok(interfaces) = getifaddrs::getifaddrs() {
+        for iface in interfaces {
+            if iface.flags.contains(getifaddrs::InterfaceFlags::LOOPBACK) {
+                continue;
+            }
+            if let Some(ip) = iface.address.ip_addr() {
+                if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+                    continue;
+                }
+                // Match address family with the bound socket
+                let same_family = matches!(
+                    (udp_addr.ip(), ip),
+                    (std::net::IpAddr::V4(_), std::net::IpAddr::V4(_))
+                        | (std::net::IpAddr::V6(_), std::net::IpAddr::V6(_))
+                );
+                if !same_family {
+                    continue;
+                }
+                let cand_addr = std::net::SocketAddr::new(ip, udp_port);
+                if let Ok(candidate) = Candidate::host(cand_addr, "udp") {
+                    rtc.add_local_candidate(candidate);
+                    added += 1;
+                }
+            }
+        }
+    }
+    // Fallback: if no interface candidates were added, use the bound address
+    if added == 0 {
+        let candidate = Candidate::host(udp_addr, "udp")
+            .map_err(|e| GatewayError::Rtc(format!("host candidate: {e}")))?;
+        rtc.add_local_candidate(candidate);
+    }
 
     let offer = sdp.to_offer()?;
     let answer = rtc.sdp_api().accept_offer(offer)?;
