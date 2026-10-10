@@ -12,6 +12,7 @@
   <h1>Nexus Web Gateway</h1>
   <p id="status" class="status connecting">Connecting…</p>
   <button id="retry-btn" type="button" hidden>Retry</button>
+  <button id="theme-toggle-btn" type="button" class="theme-toggle" title="Toggle theme" aria-label="Switch to light theme">&#x2600;</button>
 </header>
 
 <main>
@@ -43,6 +44,11 @@
     <h2>Join the mesh</h2>
     <p>Your identity is generated in-memory on this page and is lost when the tab closes.</p>
     <p class="mono" id="peer-id">peer: (not generated yet)</p>
+    <p class="reconnect-notice" id="reconnect-notice">
+      <strong>Note:</strong> refreshing this page clears the in-memory identity.
+      WebRTC and SSH connections must be re-established after a refresh.
+      Only your display preferences (theme, SSH username) are remembered.
+    </p>
   </section>
 
   <section id="nodes-card" hidden>

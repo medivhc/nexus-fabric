@@ -26,6 +26,8 @@ serde = { version = "1", default-features = false, features = ["derive", "std"] 
 serde_json = { version = "1", default-features = false, features = ["std"] }
 # sha1 + base64: RFC 6455 Sec-WebSocket-Accept computation.
 sha1 = { version = "0.10", default-features = false }
+# sha2: SHA256 fingerprint for /cert endpoint (REQ-001).
+sha2 = { version = "0.10", default-features = false, features = ["std"] }
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 # tracing: structured logs (already in the workspace tree via str0m/nexus crates).
 tracing = { version = "0.1", default-features = false, features = ["std"] }
