@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nexus Web Gateway</title>
+<link rel="stylesheet" href="/xterm.css">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>Nexus Web Gateway</h1>
+  <p id="status" class="status connecting">Connecting…</p>
+  <button id="retry-btn" type="button" hidden>Retry</button>
+</header>
+
+<main>
+  <!-- 错误横幅：分层显示、文案区分心跳/读超时、可关闭、提供重试和返回逃生口 -->
+  <section id="first-node-error" class="error-banner" hidden>
+    <div class="error-banner-header">
+      <span id="error-badge" class="error-banner-badge">网络提示</span>
+      <span id="error-message" class="error-message"></span>
+      <button id="error-close-btn" class="error-close-btn" type="button" title="关闭横幅">&times;</button>
+    </div>
+    <div class="error-banner-actions">
+      <button id="banner-retry-btn" type="button" class="btn-action">重试连接</button>
+      <button id="banner-back-btn" type="button" class="btn-action">返回节点列表</button>
+    </div>
+  </section>
+
+  <!-- B4 证书指引卡片：独立分层显示，不被错误横幅遮挡或覆盖 -->
+  <section id="cert-guidance-card" class="cert-card">
+    <div class="cert-card-header">
+      <h2>证书指引 (B4 CA 证书)</h2>
+      <a href="/cert" download="nexus-ca.pem" class="cert-download-link">下载本地 CA 根证书 (/cert)</a>
+    </div>
+    <p class="cert-desc">
+      网关使用持久自签根证书（重启后指纹保持一致）。弱网重连或首次使用时若出现安全警告或连接异常，请下载并安装本地 CA 证书到系统/浏览器信任库。
+    </p>
+  </section>
+
+  <section id="join-card">
+    <h2>Join the mesh</h2>
+    <p>Your identity is generated in-memory on this page and is lost when the tab closes.</p>
+    <p class="mono" id="peer-id">peer: (not generated yet)</p>
+  </section>
+
+  <section id="nodes-card" hidden>
+    <h2>Mesh nodes</h2>
+    <ul id="node-list" class="node-list"></ul>
+  </section>
+
+  <section id="terminal-card" hidden>
+    <h2>Terminal <span id="terminal-node" class="mono"></span></h2>
+    <div id="terminal-error" class="terminal-error"></div>
+    <div id="auth-form">
+      <label>Username <input id="ssh-user" type="text" value="root" autocomplete="off"></label>
+      <label>Password or private key
+        <textarea id="ssh-auth" rows="3" placeholder="password or paste an OpenSSH private key"></textarea>
+      </label>
+      <button id="ssh-connect" type="button">Connect SSH</button>
+    </div>
+    <div id="terminal-container"></div>
+  </section>
+</main>
+
+<script src="/xterm.js"></script>
+<script src="/xterm-addon-fit.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

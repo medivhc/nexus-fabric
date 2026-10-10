@@ -37,6 +37,7 @@ Persist / Recover
 - [policies/](policies/)：架构、依赖与质量门禁。
 - [scenarios/](scenarios/)：产品级 E4 场景契约。
 - `crates/<crate>/MODULE.md`：局部模块契约。
+- `crates/nexus-web-gateway/USER_MANUAL.md`：Nexus Web Gateway（零安装浏览器网页 SSH 终端）用户手册。
 - `.evidence/`：与 revision/config/feature/target 绑定的验证证据。
 - [.githooks/](.githooks/README.md)：提交/推送前的机器门禁（pre-commit / commit-msg / pre-push）。
 - [.agents/skills/](.agents/skills/README.md)：项目级 Agent Skills（nexus-task / nexus-contract-first / nexus-evidence）。

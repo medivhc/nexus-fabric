@@ -525,3 +525,105 @@ supply_chain = "pinned by Cargo.lock (lockfile_required); already in tree via qu
 approved = true
 approved_date = "2026-10-04"
 review_basis = "quinn-proto sans-IO API (Endpoint::handle / poll_transmit / datagrams) 需要 bytes 类型；与 nexus-fabric 同"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-web-gateway"
+crate = "str0m"
+version = "0.24"
+default_features = false
+features = ["rust-crypto"]
+architecture_layer = "delivery (web gateway); node-side WebRTC endpoint (SDP/ICE/DTLS/SCTP DataChannel); sans-IO, no async runtime, repo stays std-only"
+feature_scope = "rust-crypto feature only; default aws-lc-rs/examples features disabled"
+license = "MIT OR Apache-2.0 (allowlisted)"
+security = "no known advisories; str0m is the WebRTC stack used by LiveKit; RustSec checked via harness gate"
+portability = "pure Rust with rust-crypto backend (RustCrypto, no C build); crate marked portable = false (DTLS crypto)"
+supply_chain = "0.24.1 pinned by Cargo.lock; deps are str0m-proto/is/dimpl/RustCrypto crates (all MIT/Apache-2.0)"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-08"
+review_basis = "repo std-only 姿态下唯一可行的成熟 WebRTC 栈（webrtc-rs 需 tokio，架构级倒退）；sans-IO 由调用方线程驱动，与 nexus-fabric/quinn-proto 模式一致"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-web-gateway"
+crate = "str0m-rust-crypto"
+version = "0.6"
+default_features = false
+features = []
+architecture_layer = "delivery (web gateway); str0m 的纯 Rust DTLS/SRTP crypto 后端"
+feature_scope = "no default features; RustCrypto backend (aes-gcm/hmac/p256/sha1/sha2)"
+license = "MIT OR Apache-2.0 (allowlisted)"
+security = "RustCrypto maintained; no known advisories; harness dependency-governance gate"
+portability = "pure Rust, no C"
+supply_chain = "0.6.0 pinned by Cargo.lock via str0m feature"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-08"
+review_basis = "str0m 的 rust-crypto feature 依赖；避免 aws-lc-rs C 构建"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-web-gateway"
+crate = "tungstenite"
+version = "0.24"
+default_features = false
+features = ["handshake"]
+architecture_layer = "delivery (web gateway); sync WebSocket server/client over rustls streams (WSS signaling + mesh relay)"
+feature_scope = "handshake feature only; no tokio/async features (repo std-only)"
+license = "MIT OR Apache-2.0 (allowlisted)"
+security = "mature WebSocket library (used by many Rust projects); no known advisories"
+portability = "pure Rust, sync Read+Write abstraction"
+supply_chain = "0.24.0 pinned by Cargo.lock; transitive deps http/httparse/byteorder/rand/thiserror/utf-8 (all allowlisted)"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-08"
+review_basis = "手写 RFC 6455 风险高；tungstenite 与仓库 std-only 同步架构契合（无 tokio），经 rustls StreamOwned 直接驱动"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-web-gateway"
+crate = "base64"
+version = "0.22"
+default_features = false
+features = ["std"]
+architecture_layer = "delivery (web gateway); RFC 6455 Sec-WebSocket-Accept + SSH data base64 in JSON protocol"
+feature_scope = "std feature only"
+license = "MIT OR Apache-2.0 (allowlisted)"
+security = "no known advisories"
+portability = "pure Rust"
+supply_chain = "0.22.1 pinned by Cargo.lock; already in tree via other crates"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-08"
+review_basis = "已在树内的标准编码库，避免手写 base64"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-web-gateway"
+crate = "sha1"
+version = "0.10"
+default_features = false
+features = []
+architecture_layer = "delivery (web gateway); RFC 6455 Sec-WebSocket-Accept = base64(SHA1(key+GUID))"
+feature_scope = "no default features"
+license = "MIT OR Apache-2.0 (allowlisted; 同 nexus-turn 已审条目)"
+security = "RustCrypto maintained; used for WS handshake only (not collision-sensitive)"
+portability = "pure Rust"
+supply_chain = "0.10.7 pinned by Cargo.lock; already in tree via nexus-turn"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-08"
+review_basis = "复用 nexus-turn 已审的 sha1 依赖，RFC 6455 强制要求"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-web-gateway"
+crate = "getifaddrs"
+version = "0.6"
+default_features = false
+features = []
+architecture_layer = "delivery (web gateway); enumerate local interface addresses when listen_addr is unspecified (0.0.0.0) so the WebRTC UDP/ICE host candidate is routable"
+feature_scope = "no features"
+license = "MIT OR Apache-2.0 (allowlisted)"
+security = "no known advisories; already in Cargo.lock as transitive dep of tun-rs"
+portability = "cross-platform (unix getifaddrs / windows)"
+supply_chain = "0.6.2 pinned by Cargo.lock; already in tree via tun-rs"
+os_transitive_deps = "libc (already in tree), bitflags, windows-sys"
+approved = true
+approved_date = "2026-10-10"
+review_basis = "修复 B-R1：0.0.0.0 时按网卡派生可路由 UDP 地址，避免 SDP 只带 loopback 候选导致真实浏览器零连接"
