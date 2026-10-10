@@ -325,3 +325,25 @@ rev `54010f8` 上启动 `verify --full --json`（`/work/xc-verify-full.sh`，
 诚实边界：这是"按差异枚举论证等价"，**不是**同一命令在 master 上的实测对照。动态对照
 脚本已就位（`/work/xc-master-control.sh`：跑同一组 `scenarios/product/*.toml` 逐条
 `scenario run` 并 diff verdict 集合），列为待办，前提是宿主有 ≥40G 余量或改用独立 clone。
+
+### I.1 收尾复跑 @rev 1e6b2b35（docs-only 之后，Evidence 绑当前 HEAD）
+
+§I 的数字绑 `54010f8`，其后只有一个 docs 提交 ⇒ 再跑一次让结论绑当前 HEAD（同一主机、同一
+脚本 `/work/xc-verify.sh`，日志 `/work/xc-verify-1e6b2b3.log`，本机存档
+`D:\next\xc-evidence\xc-verify-1e6b2b3.log`）：
+
+    rev=1e6b2b35a759  dirty=0  rustc/clippy/rust-analyzer=1.98.1  cargo-deny 0.20.2 在场
+    fmt --all -- --check                      exit 0
+    clippy --workspace --all-targets -D warn  exit 0（error_lines=0）
+    cargo test -p nexus-harness               117 / 0 / 0 ignored
+    cargo test -p nexus --lib                 217 / 0 / 2 ignored
+    verify --fast --json                      overall PASS，9/9 门 PASS，无 UNKNOWN
+        Evidence dir=verify-qoder-xc-2432533a7ccc  contract=3652314f9c21  tree=faef6bac15e1
+        cfg=fa6c1bdb335a
+    16 个 E4 场景                             PASS=16 FAIL=0（含 diagnostics-item-shape）
+    四种越界形态                              仍在 spawn 前被拒，envelope 无 provider 字段
+    dirty_after=0  flycheck 残留=0  disk 39G 余量
+
+`contract=3652314f9c21` 与 §I（`54010f8`）**相同**、`cfg=fa6c1bdb335a` 亦相同 —— 这正好是
+"docs-only 提交不改变契约输入面"的实测旁证；变化的只有 `tree`（工作树指纹），因为它按字节算，
+任何文件改动都会动它。要记住 §J 那条：本轮**没有** `verify --full` 结论。
