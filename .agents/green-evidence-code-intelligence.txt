@@ -1,6 +1,18 @@
 # Green Evidence: Code Intelligence 的 13 个 E4 场景（第二轮，双宿主复跑）
 # 日期: 2026-10-10
 # 执行者: qoder-desktop（Windows 宿主）+ qoder-wsl（WSL2 Ubuntu 宿主）
+#
+# ⚠ 证据来源与适用条件（2026-10-10 用户指示"不要用 WSL"后就地重新标注，数据不删）：
+#   - "Linux 宿主"一节里的环境是**本机 WSL2 Ubuntu**，与 Windows 侧同一物理机、同一份
+#     代码（其 origin 指向 /mnt/d/next/nexus-fabric，即从 Windows 工作副本 fetch，不是 GitHub）。
+#     它是"一个 Linux 用户态"，**不是**项目的 Linux 主机 xc-pc-linux。
+#   - 该次 `verify --fast` overall PASS 是在 **cargo-deny 未安装** 的条件下取得的
+#     （`dependency-governance` 记 UNKNOWN，按契约不算失败）。装上 cargo-deny 0.20.2 复跑后，
+#     同一分支的门禁变成 **FAIL**（`failed to get 'FETCH_HEAD' metadata`：我给那台 WSL 换
+#     sparse 索引的后遗症），并且既有单测 `dependency_gate_runs_cargo_deny_when_available`
+#     随之变红 —— 即门禁正确地拒绝了"工具可用却没真跑"的结论。
+#   - 结论：下面 B 段只证明"在受限 Linux 用户态 + 无 cargo-deny 时这些门能通过"，
+#     **不构成 §16.11 的达成证据**；§16.11 状态回退为"未在可信 Linux 宿主验证"（见 F 段）。
 # 绑定 revision: 6aadc4293908317b988aa80145bde5a169a0cbf6（本记录写入前的 HEAD，工作树 clean）
 # 契约代: contract: f13e96c681a6aa3c354896fade811d65d613f96b（= 冻结提交 d4138b7 的 scenarios/** tree 摘要）
 #         本轮提交后的工作树口径值: 9b250ff2927b34af8db94120560b14be7950ac81（Linux 实测与脚本复现一致）
@@ -9,7 +21,8 @@
 # 与第一轮（.agents/green-evidence-code-intelligence.txt 的历史内容：9 场景 @34e1aca）的差异：
 #   1) 场景从 9 个增加到 13 个（新增 callees / scope-violation / read-only-counters / budget-count）；
 #   2) 契约哈希改按"已提交 tree 的 LF blob"记录，理由见文末 C 段勘误；
-#   3) 首次在 Linux 宿主拿到 verify --fast 的 overall PASS，提案 §16.11 闭环。
+#   3) 在同机 WSL2 Ubuntu 用户态拿到过 verify --fast 的 overall PASS —— 但见上方标注：
+#      该 PASS 依赖 cargo-deny 缺失，且环境不是项目 Linux 主机，故**不**作为 §16.11 达成证据。
 
 ## A. Windows 宿主（rustc/clippy 1.95.0, x86_64-pc-windows-msvc, rust-analyzer 1.95.0）
 # rev=6aadc42  working_tree_digest=5bad6505b9043352a76d4037085ef7cd7ca2414e  dirty=false  13/13 PASS
@@ -85,3 +98,29 @@ Linux 上 `nexus-harness status --json` 的 live `contract_hash` 实测等于第
 `verify --fast` 在 Windows 上 check/clippy 两道门必挂：`nexus-platform-linux` 无条件依赖
 fuser(libfuse)，`apps/nexus/examples/discovery_mdns.rs` 用 Unix-only 的 `std::os::fd`，
 另有 4 个单测受本机 echo/CRLF 限制——全部记录在 DEVELOPMENT.md §11.1，未通过放宽门禁绕过。
+
+## F. 待复核清单（用户指示"不要用 WSL"之后的诚实口径）
+
+本文件上方 A 段（Windows, rev `6aadc42`）仍是有效证据：13/13 E4 PASS，工作树 clean。
+B 段的 Linux 结论按上方标注降级。当前 HEAD 是 `95dc9ca`（round 2 整改：作用域判定改为
+归一化比较、诊断 in_scope 真判定、dirty_state 三态、stdout 越限专属原因、跨重启计数合并、
+新增 2 个越界 E4 场景 + callees 兑现标题，共 15 个场景 / 109 个单测）。它的验证状态：
+
+- 已在 Windows 验证（rev `95dc9ca`，工作树即本提交内容）：`cargo fmt --check` 通过；
+  `cargo clippy -p nexus-harness --all-targets -- -D warnings` 通过；
+  `cargo test -p nexus-harness` = 105 passed / 4 failed（§11.1 记录的本机预存在 4 个）；
+  15 个 E4 场景 15/15 PASS；两条越界探针实测被拒（`QUERY_INVALID` / `WORKSPACE_UNRESOLVED`
+  且 envelope 无 `provider` 字段）。
+- **未在任何可信 Linux 宿主验证**（全部待补）：`cargo clippy --workspace --all-targets`、
+  `cargo test -p nexus-harness`（109 个）、`cargo test -p nexus`（含 hysteria2 loopback，
+  Windows 上必挂）、`nexus-harness verify --fast --json` 的 overall 结论、15 个 E4 场景、
+  符号链接形态的越界探针、装上 cargo-deny 后 `dependency-governance` 能否真跑通过。
+- 曾在本机 WSL 用户态观测到、但按指示不再采信的中间数据（留在 `D:\next\wsl-final4.log`，
+  不进结论）：workspace clippy exit 0；symlink 探针得 `QUERY_INVALID` 且无 `provider`；
+  split 分支 `fix/apps-nexus-clippy-gates` 的 `clippy -p nexus --lib` exit 0、
+  `cargo test -p nexus --lib` 192/0/2；装 cargo-deny 后 `dependency-governance` FAIL。
+- `xc-pc-linux` 可达性实测（2026-10-10，只读探测）：`xc-pc-linux.local` / `172.168.8.234` /
+  `172.168.11.23` / `192.168.55.2` 的 22 端口全部超时或被立即关闭；easytier 网段
+  `10.144.144.1:22` 开着且 banner 是 `OpenSSH_9.6p1 Ubuntu-3ubuntu13.19`，但该主机名是
+  `racknerd-1e8245e`（VPS，无 rustc/cargo/rustup，磁盘 19G/24G 已用），**不是 xc-pc-linux**。
+  因此项目 Linux 宿主目前仍不可达，等所有者给可达路径与凭据渠道。

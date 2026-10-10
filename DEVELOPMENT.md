@@ -260,9 +260,13 @@ MVP 优先 Cargo metadata + 显式 mapping，不构造脆弱的全程序猜测�
   `*-unknown` 哨兵值"，避免"都没取到"被当成"取到了同一个值"。
 
 处置：需要作为**结论**的门禁（`cargo test -p nexus-harness`、`verify --fast --json`、
-Contract Hash）在 Linux/WSL 或 `core.autocrlf=false` 的工作树里跑；Windows 侧只用于
-编译与场景冒烟。修正哈希口径（按提交内容而非工作树字节归一化行尾）属于门禁契约变更，
-需要独立走 Contract-First 周期，不在本条目里顺带改。
+Contract Hash）在**项目的 Linux 主机（`xc-pc-linux`）**或 `core.autocrlf=false` 的工作树里跑。
+本机 WSL2 Ubuntu 用户态（同物理机、从 Windows 工作副本 fetch、由工具改过 resolv.conf 与
+`~/.cargo/config.toml`）**只可用于开发试跑，不作为结论来源**（2026-10-10 所有者指示）。
+另外一条同样重要的口径：`verify --fast` 在 `cargo-deny` 缺失时把 `dependency-governance`
+记成 UNKNOWN 因而可能"overall PASS"，这种 PASS 不代表依赖治理真跑过 —— 装上工具后同一
+分支会 FAIL。引用 PASS 时必须同时写明工具在场与否。修正哈希口径（按提交内容而非工作树字节
+归一化行尾）属于门禁契约变更，需要独立走 Contract-First 周期，不在本条目里顺带改。
 
 
 ## 12. 机器门禁与项目级 Skills
