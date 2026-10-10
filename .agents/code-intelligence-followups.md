@@ -53,6 +53,13 @@
     特性分支再 rebase 掉那两笔；否则 §16.11 的 Linux 绿实际上依赖特性分支自带产品域改动，
     而产品认证代码的评审结论会被特性评审覆盖。审查者指出：现在的拆分只是"另开分支复制"，
     特性分支历史里仍在。
+    该分支已在 xc-pc-linux 上**独立自证**（与特性分支无关，可在合入前单独评审）：
+    分支内 `engineering/nexus-harness/src/code_intel` 文件数 = 0；diff 只有
+    `apps/nexus/src/{n2_identity.rs,task_localapi.rs,task_provider_grant/audit.rs}` 共 10+/9−；
+    `cargo clippy --workspace --all-targets -- -D warnings` exit 0；
+    `cargo test -p nexus --lib` 192/0/2；`cargo test -p nexus-harness` **56/0**（master 基线，
+    证明不依赖 Code Intelligence 也全绿）；`verify --fast --json` **overall PASS，9/9 门 PASS**，
+    Evidence `verify-qoder-xc-7c926d27ccaa` @`179a435`，跑完工作树 0 行改动。
 12. **Windows 侧两项结构性障碍**（产品域/平台待办，不属本模块契约）：`nexus-platform-linux` 无条件依赖
     `fuser`(libfuse)，`apps/nexus/examples/discovery_mdns.rs` 使用 Unix-only `std::os::fd`。
     后果：`verify --fast` 在 Windows 上结构性不可能通过，Windows 只能作冒烟宿主。
@@ -65,3 +72,45 @@
 - `verify --full`：round 3 判 `COMMENTED` 后按 `nexus-review` 语义可进入，正在 xc-pc-linux 上执行；
   结果追加到 `.agents/green-evidence-code-intelligence.txt`。
 - 推送与 PR：用户至今未授权，`fix/windows-cfg-portability` 与 `fix/apps-nexus-clippy-gates` 都只在本地。
+
+## 合并前置（推送时新发现，2026-10-10）
+
+推送 PR #10 时发现 **`origin/master` 已从本分支基点 `8ba9fea` 前进 45 个提交到 `66b6b78`**，
+其中与本工作重叠的部分：`apps/nexus/src/{lib.rs +467, main.rs +120, subnet_cli.rs +1241, mesh.rs, node_cli.rs}`、
+`engineering/nexus-harness/{Cargo.toml +1, src/run_scenario.rs +118}`、`policies/{architecture.toml +6, dependencies.toml +102}`、
+新增 `scenarios/product/bootstrap_join.toml`。因此：
+
+- 产品域 PR #10 需要 rebase 到当前 master 后**重跑** `cargo clippy --workspace --all-targets -- -D warnings`
+  与 `cargo test -p nexus --lib`（已在本 PR 里以评论承诺）。它改的三个文件不在 master 变更清单里，
+  预计不冲突。
+- 特性分支 `fix/windows-cfg-portability` 推之前**必须** rebase 到 `66b6b78`，重点处理
+  `engineering/nexus-harness/Cargo.toml`（双方都改）与 `policies/*`（Protected 路径已变），
+  rebase 后现有 Evidence（绑定 `3088dfe`）一律作废，需在 `66b6b78` 基线上重新产出 fast/full 与 15 场景。
+- 另需补一次**纯 master 的 `verify --full` 对照**：本分支上 `verify --full` 唯一 FAIL 是
+  `product-scenarios`（约 20 条 `product.n3-*` 自带 "master Red" 标注 + `daemon-workspace-mount`/
+  `n1-connectivity-roam` 真设备语义）。目前的"与本模块无关"依据是文件归属与仓库自述，
+  不是对照实验；补上对照才能把它从"判断"升级成"证明"。
+- harness 可观测性缺陷（顺带发现，属本模块邻近范围）：`verify_id = hash(rev|configuration_digest|contract_hash)`
+  不含 verification level，所以 `--fast` 与 `--full` 写进**同一个** `.evidence/verify-<id>/` 目录并互相覆盖，
+  `--full` 的结果把 `--fast` 那份 gates 快照冲掉了。修法要么把 level 进 id，要么目录分层；属 Evidence 契约变更，
+  走独立 Contract-First 周期。
+
+## 合并前置（推送时新发现，2026-10-10）
+
+推送 PR #10 时发现 **`origin/master` 已从本分支基点 `8ba9fea` 前进 45 个提交到 `66b6b78`**，
+与本工作重叠的部分：`apps/nexus/src/{lib.rs +467, main.rs +120, subnet_cli.rs +1241, mesh.rs, node_cli.rs}`、
+`engineering/nexus-harness/{Cargo.toml +1, src/run_scenario.rs +118}`、`policies/{architecture.toml +6, dependencies.toml +102}`、
+新增 `scenarios/product/bootstrap_join.toml`。因此：
+
+- 产品域 PR #10 需要 rebase 到当前 master 后**重跑** `cargo clippy --workspace --all-targets -- -D warnings`
+  与 `cargo test -p nexus --lib`（已在本 PR 评论里承诺）。它改的三个文件不在 master 变更清单里，预计不冲突。
+- 特性分支 `fix/windows-cfg-portability` 推之前**必须** rebase 到 `66b6b78`，重点处理
+  `engineering/nexus-harness/Cargo.toml`（双方都改）与 `policies/*`（Protected 路径已变）；
+  rebase 后现有 Evidence（绑定 `3088dfe`）一律作废，需在 `66b6b78` 基线上重新产出 fast/full 与 15 个场景。
+- 需补一次**纯 master 的 `verify --full` 对照**：本分支上唯一 FAIL 是 `product-scenarios`
+  （约 20 条 `product.n3-*` 自带 "master Red" 标注 + `daemon-workspace-mount` / `n1-connectivity-roam`
+  真设备语义）。目前"与本模块无关"的依据是文件归属与仓库自述，不是对照实验。
+- 顺带发现的 harness 缺陷：`verify_id = hash(rev|configuration_digest|contract_hash)` **不含 verification
+  level** ⇒ `--fast` 与 `--full` 写进同一个 `.evidence/verify-<id>/` 并互相覆盖（本次 full 把 fast 的
+  gates 快照冲掉了，目录名仍是 `verify-qoder-xc-c9bc84e20690`）。修法要么把 level 进 id，要么目录分层；
+  属 Evidence 契约变更，走独立 Contract-First 周期。

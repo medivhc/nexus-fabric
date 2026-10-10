@@ -200,3 +200,33 @@ round 2 阻塞项 B-R2-1 的四种越界形态实测（全部在 spawn 之前被
 - (iii) 仍未做：**"哪个宿主是权威"目前只在 DEVELOPMENT.md 散文里**，`policies/quality.toml`
   没有对应声明。按本仓库"门禁定义必须机器可见"的自述，这属于 Protected 契约变更，
   需要独立的 Contract-First 周期与新的 Red Evidence，本轮不顺手改，已登记为下一轮待办。
+
+## H. `verify --full` @xc-pc-linux（rev `3088dfe`，round 3 `COMMENTED` 之后按 nexus-review 语义进入）
+
+日志 `D:\next\xc-full.log`（远端 `/work/xc-full.log`），Evidence `verify-qoder-xc-c9bc84e20690`
+（注意：`verify_id` 由 `rev|configuration_digest|contract_hash` 决定，所以 `--full` 复用了 `--fast`
+同一目录名并把内容覆盖成 full 的 gates —— 这本身是 harness 的一个可观测性缺陷，已登记）。
+
+    gate 统计：22 PASS / 1 FAIL，其余无 UNKNOWN —— cargo-deny、cargo-llvm-cov、
+    wasm32-wasip1、fuzz、concurrency、performance/bench 全部真跑：
+      coverage-summary      TOTAL 169869 区域 69.77% / 函数 65.98% / 行 68.47%
+      feature-matrix        102 member×feature 检查通过（51 成员）
+      portable-core         12 个 portable crate 编译到 wasm32-wasip1
+      platform-checks       12 portable-core crate 无平台专有依赖
+      bench                 aead 1389.3 MB/s (1.57us/frame) / tunnel 172.0 MB/s (5.77us rtt) → PASS
+      integration           20 个集成测试目标通过
+      performance-budgets   baseline/blocking/noise_tolerance/warning_threshold 均已定义
+    唯一 FAIL：product-scenarios —— 全部落在**产品域自有场景包**，与本模块无关：
+      · product.n3-*（约 20 条）= UNKNOWN，原因串里仓库自己写着
+        "contract-first: n3_task_e4 not implemented (master Red)"，即基线上就是欠实现的红；
+      · product.n3-9-artifact-cli = FAIL（期望 PASS，实得 UNKNOWN）；
+      · product.daemon-workspace-mount = FAIL、product.n1-connectivity-roam = FAIL
+        （真设备/网络语义，该宿主上不具备条件）。
+    Code Intelligence 自己的 15 个 E4 场景由 `selected-properties`/场景门之外的独立复跑覆盖
+    （G 段 15/15 PASS），不依赖这一门。
+
+诚实边界：我没有在**纯 master** 上跑同一 `verify --full` 做对照，所以"这 1 个 FAIL 与
+`95dc9ca`/`3088dfe` 无关"目前的依据是：失败项全在 `scenarios/product/**`，本分支未改任何
+product 场景与产品运行时行为（`cargo test -p nexus --lib` 192/0、workspace clippy 0 error），
+加上 UNKNOWN 项自带 "master Red" 标注。要把它升级成"已对照证明"，需要在 `66b6b78` 上跑一次
+`verify --full` 并 diff 结果 —— 已列入 `.agents/code-intelligence-followups.md` 合并前置项。
