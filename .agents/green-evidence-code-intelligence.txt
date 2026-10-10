@@ -111,7 +111,8 @@ B 段的 Linux 结论按上方标注降级。当前 HEAD 是 `95dc9ca`（round 2
   `cargo test -p nexus-harness` = 105 passed / 4 failed（§11.1 记录的本机预存在 4 个）；
   15 个 E4 场景 15/15 PASS；两条越界探针实测被拒（`QUERY_INVALID` / `WORKSPACE_UNRESOLVED`
   且 envelope 无 `provider` 字段）。
-- **未在任何可信 Linux 宿主验证**（全部待补）：`cargo clippy --workspace --all-targets`、
+- **已补齐**（原本"未在任何可信 Linux 宿主验证"）：见下方 G 段 —— 现在跑在真正的
+  `xc-pc-linux` 上，`cargo clippy --workspace --all-targets`、
   `cargo test -p nexus-harness`（109 个）、`cargo test -p nexus`（含 hysteria2 loopback，
   Windows 上必挂）、`nexus-harness verify --fast --json` 的 overall 结论、15 个 E4 场景、
   符号链接形态的越界探针、装上 cargo-deny 后 `dependency-governance` 能否真跑通过。
@@ -124,3 +125,78 @@ B 段的 Linux 结论按上方标注降级。当前 HEAD 是 `95dc9ca`（round 2
   `10.144.144.1:22` 开着且 banner 是 `OpenSSH_9.6p1 Ubuntu-3ubuntu13.19`，但该主机名是
   `racknerd-1e8245e`（VPS，无 rustc/cargo/rustup，磁盘 19G/24G 已用），**不是 xc-pc-linux**。
   因此项目 Linux 宿主目前仍不可达，等所有者给可达路径与凭据渠道。
+
+## G. xc-pc-linux 结论级复跑（2026-10-10，round 2 整改后；F 段待补项在此关闭）
+
+# 主机身份：hostname=xc-pc-linux，Ubuntu（Linux 5.15.0-139-generic），user=appen
+# 传输方式：Windows 侧 `git bundle`（refs: fix/windows-cfg-portability, fix/apps-nexus-clippy-gates,
+#   master）-> /tmp/nexus-ci.bundle -> 克隆到 /work/nexus-ci，工作树 dirty=0
+# 工具链：rustc 1.98.1 / cargo 1.98.1 / clippy 0.1.98 / rust-analyzer 1.98.1（rustup component add 现装）
+#         cargo-deny 0.20.2 **在场**（所以 dependency-governance 是真跑，不是 UNKNOWN）
+#         git 2.25.1 / cmake 3.31.2 / protoc 3.6.1 / pkg-config 0.29.1 / sccache 生效
+#         CARGO_HOME=/work/nexus-dev/.cargo（rsproxy.cn sparse 镜像，registry 缓存 1.2G 已热）
+#         磁盘 /work 剩余 42G（跑前 43G，跑后 42G）
+# 被验 revision = 3088dfeeec14684b35ee5215011f9592a912a12a（分支 tip；95dc9ca 之后的 docs-only 提交）
+# 原始日志：D:\next\xc-verify.log（远端 /work/xc-verify.log），脚本 D:\next\xc-verify.sh
+
+cargo fmt --all -- --check                              -> exit 0，0 行差异
+cargo clippy --workspace --all-targets -- -D warnings   -> **exit 0，error 行数 0**（clippy 0.1.98）
+cargo test -p nexus-harness                             -> **109 passed / 0 failed**
+cargo test -p nexus --lib                               -> **192 passed / 0 failed / 2 ignored**
+nexus-harness verify --fast --json                      -> exit 0，**overall PASS**
+   Evidence dir=verify-qoder-xc-c9bc84e20690  id=qoder-xc-c9bc84e20690
+   rev=3088dfeeec14  dirty=false  contract=62a0364b26c9  toolchain=1.98.1
+   target=x86_64-unknown-linux-gnu  tree=f2575d7fc679  cfg=9adbf3d08012
+   九门逐项（**无 UNKNOWN，全部真跑**）：
+     PASS whitespace               :: no whitespace errors
+     PASS format                   :: ok
+     PASS check                    :: ok
+     PASS clippy                   :: ok
+     PASS architecture-policy      :: 48 crates declared
+     PASS dependency-governance    :: cargo-deny: advisories/licenses/bans/sources PASS
+     PASS resource-type-neutrality :: 4 crate(s), 6 file(s)
+     PASS affected-tests           :: no affected crates changed
+     PASS selected-properties      :: ok
+
+15 个 E4 场景（id / verdict / evidence_id）：
+    budget-count             "verdict":"PASS" "evidence_id":"scenario-qoder-xc-f2516aedf1e5"
+    budget-truncation        "verdict":"PASS" "evidence_id":"scenario-qoder-xc-2fc67eb6e0b9"
+    callees                  "verdict":"PASS" "evidence_id":"scenario-qoder-xc-8850d9c0260e"
+    callers                  "verdict":"PASS" "evidence_id":"scenario-qoder-xc-7ea504ff4caa"
+    definition               "verdict":"PASS" "evidence_id":"scenario-qoder-xc-8f27ddb30717"
+    diagnostics-advisory     "verdict":"PASS" "evidence_id":"scenario-qoder-xc-48cf8cdb51fb"
+    hover                    "verdict":"PASS" "evidence_id":"scenario-qoder-xc-c3ce188a04ee"
+    implementations          "verdict":"PASS" "evidence_id":"scenario-qoder-xc-df458c964437"
+    provider-unavailable     "verdict":"PASS" "evidence_id":"scenario-qoder-xc-b5a9c342bb98"
+    read-only-counters       "verdict":"PASS" "evidence_id":"scenario-qoder-xc-bfec57363eff"
+    scope-escape             "verdict":"PASS" "evidence_id":"scenario-qoder-xc-9b3bb8158dc8"
+    scope-violation          "verdict":"PASS" "evidence_id":"scenario-qoder-xc-591ab2057778"
+    symbol                   "verdict":"PASS" "evidence_id":"scenario-qoder-xc-d20b5e28f5a3"
+    workspace-escape         "verdict":"PASS" "evidence_id":"scenario-qoder-xc-255e8b518cfa"
+    write-method-denied      "verdict":"PASS" "evidence_id":"scenario-qoder-xc-d1db008d3761"
+（`xc-scenarios: PASS=15 FAIL=0`）
+
+round 2 阻塞项 B-R2-1 的四种越界形态实测（全部在 spawn 之前被拒，`provider_present=False`）：
+
+    (a) 目标用 .. 逃出 --workspace        -> verdict=FAIL    error=QUERY_INVALID
+    (b) 目标用 .. 逃出整个仓库            -> verdict=FAIL    error=QUERY_INVALID
+        （reviewer probe-P5 的形状；把仓库外文件换成 /work 下真实存在的文件，
+          这样失败原因只能是作用域判定，而不是"文件不存在"）
+    (c) --workspace 根用 .. 逃出仓库      -> verdict=BLOCKED error=WORKSPACE_UNRESOLVED
+    (d) 夹具内真实 symlink 指向仓库外文件  -> verdict=FAIL    error=QUERY_INVALID
+        （ln -s /home/appen/xc-escape-target.rs <夹具>/src/escape_link.rs；canonicalize 把它还原成仓库外路径后拒绝）
+
+副作用核查：跑完 `git status --porcelain` = 0 行；仓库内 flycheck 残留 0 个；
+构建副作用落在 /tmp/nexus-code-intel-517b88935b83eb87。探针用的临时文件与符号链接均已删除。
+
+结论口径更新：
+
+- 提案 §16.11（`cargo test -p nexus-harness` + `verify --fast --json` 通过并产符合规则的
+  Evidence）**在 xc-pc-linux 上达成**，且这次 `dependency-governance` 是真跑 PASS，
+  不再依赖"工具缺失记 UNKNOWN"的口径 —— B 段那条限制只适用于旧的 WSL 记录。
+- round 2 reviewer 的第 6 问里 (i)（装 cargo-deny 再跑）与 (ii)（没有单一宿主能全绿）
+  现已解决：xc-pc-linux 上 9/9 门 PASS，Windows 侧的结构性障碍（fuser/libfuse 与
+  Unix-only example）仍在，属已披露的本机限制。
+- (iii) 仍未做：**"哪个宿主是权威"目前只在 DEVELOPMENT.md 散文里**，`policies/quality.toml`
+  没有对应声明。按本仓库"门禁定义必须机器可见"的自述，这属于 Protected 契约变更，
+  需要独立的 Contract-First 周期与新的 Red Evidence，本轮不顺手改，已登记为下一轮待办。
