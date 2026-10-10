@@ -256,7 +256,7 @@ nexusd DNS (0.0.0.0:53)
 | 项目 | 设计 |
 |------|------|
 | Fake-IP 池 | `198.18.0.0/15`（RFC 2544 benchmarking，与 Clash 兼容） |
-| Mesh 域名后缀 | `.mesh`（如 `xc-pc-linux.mesh` → `10.144.144.6`）；可配置 |
+| Mesh 域名后缀 | `.mesh`（如 `xc-pc-linux.mesh` → `10.x.x.x`）；可配置 |
 | 查询分类顺序 | mesh 域名 > 代理规则（fake-ip）> 直连上游 |
 | 缓存 | 按查询类型分别缓存；fake-ip 映射表常驻内存（随 daemon 生命周期） |
 | `dns.toml` | 上游 DNS、fake-ip 开关、mesh 后缀、自定义 hosts |
