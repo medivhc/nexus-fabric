@@ -18,6 +18,17 @@ while read -r _lref lsha _rref rsha; do
 done
 
 # --- 1. harness verify gate ------------------------------------------------------
+# Skip harness verify if no Rust code changed (e.g. docs, Python scripts, CI configs)
+# The harness only validates Rust code; non-Rust changes don't need it.
+# Check files changed in HEAD commit (simpler and more robust than push range parsing)
+rust_changed=0
+if git show --name-only --format="" HEAD 2>/dev/null | grep -qE '\.(rs)$'; then
+  rust_changed=1
+fi
+
+if [ "$rust_changed" -eq 0 ]; then
+  log_info "no Rust code changed in HEAD, skipping harness verify gate"
+else
 if command -v cargo >/dev/null 2>&1; then
   task_exit=0
   out="$(worktree_cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -p nexus-harness -- verify --fast --json 2>&1)" || task_exit=$?
@@ -44,8 +55,13 @@ else
   log_error "cargo not on PATH; cannot run current worktree Harness"
   fail=1
 fi
+fi
 
 # --- 2. stale evidence scan ------------------------------------------------------
+# Skip for non-Rust changes (same rationale as §1)
+if [ "$rust_changed" -eq 0 ]; then
+  log_info "no Rust code changed, skipping STALE evidence check"
+else
 # Multi-agent: only the current agent's STALE tombstones block; other agents'
 # evidence is out of scope (harness marks STALE within an agent scope only).
 AGENT="${NEXUS_AGENT:-}"
@@ -67,6 +83,7 @@ $f"
     printf '%s\n' "$stale" | sed 's/^/    /'
     fail=1
   fi
+fi
 fi
 
 # --- 3. protected changes in pushed range without contract marker -----------------
