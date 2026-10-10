@@ -46,19 +46,27 @@ jobs:
           fetch-depth: 0
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+      - name: Install openssh-server
+        # 5 个 SSH e2e 测试需要起真实 sshd；ubuntu-latest 默认只有 openssh-client
+        run: sudo apt-get update && sudo apt-get install -y openssh-server
       - name: Run gateway tests
         id: runtests
         run: |
           # 只测网关 crate，避免全 workspace 的无关 flaky
-          cargo test -p nexus-web-gateway -- --format json > /tmp/test-out.json 2>&1 || true
-          PASSED=$(grep -c '"type":"test","event":"ok"' /tmp/test-out.json 2>/dev/null || true); PASSED=${PASSED:-0}
-          FAILED=$(grep -c '"type":"test","event":"failed"' /tmp/test-out.json 2>/dev/null || true); FAILED=${FAILED:-0}
-          # cargo test 退出码决定 build status
-          cargo test -p nexus-web-gateway > /dev/null 2>&1 && STATUS=success || STATUS=failure
+          # 注意：--format json 是 nightly-only，stable 下测试二进制启动即报错、零测试执行；
+          # 改用人类可读输出计数，cargo 只跑一遍，tee 保留可见日志
+          set +e
+          cargo test -p nexus-web-gateway 2>&1 | tee /tmp/test-out.txt
+          STATUS=${PIPESTATUS[0]}
+          set -e
+          PASSED=$(grep -c '^test .* ok$' /tmp/test-out.txt || true)
+          FAILED=$(grep -c '^test .* FAILED$' /tmp/test-out.txt || true)
           TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           printf '{"passed": %d, "failed": %d, "timestamp": "%s"}' "$PASSED" "$FAILED" "$TS" > test-results.json
-          printf '{"status": "%s", "timestamp": "%s"}' "$STATUS" "$TS" > build-status.json
-          echo "passed=$PASSED failed=$FAILED status=$STATUS"
+          [ "$STATUS" -eq 0 ] && S=success || S=failure
+          printf '{"status": "%s", "timestamp": "%s"}' "$S" "$TS" > build-status.json
+          echo "passed=$PASSED failed=$FAILED status=$S"
+          exit $STATUS
       - name: Upload test results artifact
         if: always()  # SPEC §2 F4: 失败时也上传，确保 F5 能显示红色
         uses: actions/upload-artifact@v4
@@ -67,6 +75,7 @@ jobs:
           path: |
             test-results.json
             build-status.json
+            /tmp/test-out.txt
 
   dashboard:
     needs: [validate-requirements, test]
