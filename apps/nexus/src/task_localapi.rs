@@ -279,9 +279,10 @@ fn parse_header(bytes: &[u8]) -> Result<(u16, usize), TaskError> {
                 length = Some(count);
             }
             "content-type" => {
-                if content_type.replace(value).is_some() {
+                if content_type.is_some() {
                     return Err(bad("duplicate Content-Type"));
                 }
+                content_type = Some(value);
             }
             "authorization" => {
                 if authorization {

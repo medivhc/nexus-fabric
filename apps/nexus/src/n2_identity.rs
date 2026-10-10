@@ -32,9 +32,9 @@ pub(crate) fn principal_from_existing_bytes(bytes: &[u8]) -> Result<Principal, S
     let fields = value.as_object().ok_or("identity must be an object")?;
     if fields.len() != 4
         || value["version"].as_u64() != Some(u64::from(AUTH_IDENTITY_VERSION))
-        || !value["created_at_unix"]
+        || value["created_at_unix"]
             .as_u64()
-            .is_some_and(|v| v <= nexus_domain::task::MAX_INTEGER)
+            .is_none_or(|v| v > nexus_domain::task::MAX_INTEGER)
     {
         return Err("invalid existing identity shape or version".into());
     }
