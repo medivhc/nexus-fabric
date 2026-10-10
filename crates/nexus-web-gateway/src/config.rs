@@ -157,12 +157,6 @@ pub struct GatewayConfig {
     /// Mesh signaling backend.
     #[serde(default)]
     pub mesh: MeshConfig,
-    /// Bearer <redacted> browsers for HTTP access, if any.
-    /// When set, browsers must present it via `Authorization: Bearer <redacted>
-    /// or the `nexus_auth` HttpOnly cookie (set by POST /login).
-    /// Stored as plaintext; protect the config file (600 permissions).
-    #[serde(default)]
-    pub auth_token: Option<String>,
 }
 
 impl GatewayConfig {
@@ -299,7 +293,6 @@ mod tests {
             },
             ssh: SshConfig::default(),
             mesh: MeshConfig::InMemory,
-            auth_token: None,
         }
     }
 

@@ -431,91 +431,11 @@ fn handle_connection(shared: Arc<Shared>, tcp: TcpStream) -> Result<(), GatewayE
     }
 }
 
-fn is_authenticated(shared: &Shared, request: &http::HttpRequest) -> bool {
-    let Some(expected) = shared.cfg.auth_token.as_deref() else {
-        return true;
-    };
-    if let Some(provided) = request
-        .header("authorization")
-        .and_then(|v| v.strip_prefix("Bearer "))
-    {
-        if constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
-            return true;
-        }
-    }
-    if let Some(cookie_header) = request.header("cookie") {
-        for part in cookie_header.split(';') {
-            let part = part.trim();
-            if let Some(value) = part.strip_prefix("nexus_auth=") {
-                if constant_time_eq(value.as_bytes(), expected.as_bytes()) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-fn serve_login_post(
-    shared: Arc<Shared>,
-    tls: &mut http::TlsStream,
-    request: &http::HttpRequest,
-) -> Result<(), GatewayError> {
-    let Some(expected) = shared.cfg.auth_token.as_deref() else {
-        http::write_http_response(tls, "text/plain", b"auth disabled", &[])
-            .map_err(GatewayError::Io)?;
-        return Ok(());
-    };
-    let provided = request
-        .header("authorization")
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("");
-    if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
-        http::write_http_401(tls).map_err(GatewayError::Io)?;
-        return Ok(());
-    }
-    // Token valid: set HttpOnly cookie
-    let cookie = format!(
-        "nexus_auth={}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=31536000",
-        expected
-    );
-    http::write_http_response(
-        tls,
-        "text/plain",
-        b"ok",
-        &[("Set-Cookie", cookie.as_str())],
-    )
-    .map_err(GatewayError::Io)?;
-    Ok(())
-}
-
 fn serve_http(
     shared: Arc<Shared>,
     tls: &mut http::TlsStream,
     request: &http::HttpRequest,
 ) -> Result<(), GatewayError> {
-    // POST /login: verify Bearer token, set HttpOnly cookie
-    if request.path == "/login" && request.method == "POST" {
-        return serve_login_post(shared, tls, request);
-    }
-    if !is_authenticated(&shared, request) {
-        let accepts_html = request
-            .header("accept")
-            .map(|v| v.contains("text/html"))
-            .unwrap_or(false);
-        if accepts_html || request.path == "/" {
-            http::write_http_response(
-                tls,
-                "text/html",
-                b"<html><body><h2>Login Required</h2><p>Use POST /login with token</p></body></html>",
-                &[],
-            )
-            .map_err(GatewayError::Io)?;
-            return Ok(());
-        }
-        http::write_http_401(tls).map_err(GatewayError::Io)?;
-        return Ok(());
-    }
     if request.method != "GET" {
         http::write_http_405(tls).map_err(GatewayError::Io)?;
         return Ok(());

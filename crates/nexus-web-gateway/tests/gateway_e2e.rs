@@ -78,7 +78,6 @@ fn test_config(
             idle_timeout_secs: 600,
         },
         mesh: MeshConfig::InMemory,
-        auth_token: None,
     }
 }
 
@@ -997,7 +996,6 @@ fn gateway_cfg_wss(
                 token: peer_token.into(),
             }],
         },
-        auth_token: None,
     }
 }
 
