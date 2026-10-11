@@ -33,6 +33,20 @@ equals = "QUEUE_FULL"
 field = "file_drops_reported"
 equals = true
 
+# M1 评审 r1 F1/F2 的机器化：预算长在引擎上、账按消息条数记
+# （加严期望，不放宽任何已冻结字段）
+[[expect]]
+field = "read_page_charged_to_shared_budget"
+equals = true
+
+[[expect]]
+field = "squeeze_accounting_is_per_message"
+equals = true
+
+[[expect]]
+field = "per_session_inflight_ceiling_enforced"
+equals = true
+
 # 终端面零丢失
 [[expect]]
 field = "ssh_messages_delivered"
@@ -45,4 +59,25 @@ equals = 0
 # 单会话峰值句柄不随分片数增长（V1 每片一个新 stream_id ⇒ ~1022 片后全节点挂死）
 [[expect]]
 field = "peak_read_handles_within_budget"
+equals = true
+
+# 评审 r2 NEW-2 / NEW-4 / W-4：预算的三条释放路径与会话准入
+[[expect]]
+field = "messages_queued_before_final_send"
+equals = 16
+
+[[expect]]
+field = "inflight_released_on_squeeze"
+equals = true
+
+[[expect]]
+field = "teardown_releases_budget"
+equals = true
+
+[[expect]]
+field = "session_admission_capped"
+equals = true
+
+[[expect]]
+field = "zero_byte_page_refused"
 equals = true

@@ -1,11 +1,17 @@
 //! E4 contract probe for the gateway file service.
 //!
-//! One binary, eight cases, flat JSON on stdout — the shape the repository uses
+//! One binary, nine cases, flat JSON on stdout — the shape the repository uses
 //! for product scenarios (see `apps/nexus/examples/certificate_manager.rs` and
 //! `scenarios/product/gateway_file_*.toml`). Every field the scenarios assert is
 //! derived from observable engine behaviour: a counter, a refusal code, a byte
 //! comparison, or a *differential* run of the naive implementation the contract
 //! forbids. Nothing here asserts "the code says it did the right thing".
+//!
+//! 一处**已登记的例外**（评审 r2 W-7 / r3 W-6）：`capability-negotiation` 一案判定的是
+//! 探针里自己实现的 `decide_channel`（版本/能力门控的规则模型），产品侧还没有这段代码
+//! ——`GatewayConfig` 尚无 `files` 字段，配置接线属 M1 剩余项。所以那 7 条期望与
+//! 引擎代码零耦合，跑绿不等于网关已经会做能力协商；该场景与上面那句话不符，直到
+//! M2 把 `/api/config.files` 真接出来为止。
 //!
 //! Run: `cargo run -p nexus-web-gateway --example gateway_file_contract -- --case <slug> --json`
 
@@ -13,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use nexus_web_gateway::file_service::{
-    BackendKind, FileEngine, FileLimits, SandboxRoot, SendBudget, code,
+    BackendKind, FileEngine, FileLimits, FileResult, SandboxRoot, code,
 };
 use serde_json::{Map, Value, json};
 
@@ -257,8 +263,6 @@ fn sandbox_symlink(f: &mut Map<String, Value>) -> Result<(), String> {
     let mut e = engine_at(&dir, FileLimits::default())?;
     let s = auth(&mut e)?;
 
-    let code_of = |r: Result<(), String>| json!(r);
-    let _ = code_of;
     f.insert(
         "list_rejects_escaping_symlink".into(),
         json!(refuses_link(
@@ -407,6 +411,38 @@ fn sftp_backend_boundary(f: &mut Map<String, Value>) -> Result<(), String> {
         "mutation_capability_of_sftp_backend".into(),
         json!(BackendKind::Sftp.allows_mutation()),
     );
+    // 评审 F3：上面那一条是常量回读——把 `allows_mutation()` 翻成 true，
+    // 下一道 `require_local_io` 仍然回 UNSUPPORTED，场景照样绿。所以再报
+    // **是哪一道门拒的**：G14"没有无覆盖发布原语"必须与"传输未实现"可区分，
+    // 翻转能力位就会把这个字段从 G14_* 变成 TRANSPORT_*，场景因此变红。
+    let gate = match e.open_upload(s, "remotedir", "gate.bin", Some(1)) {
+        Ok(_) => "ACCEPTED",
+        Err(err) if err.message.contains("non-overwriting") => "G14_NO_NON_OVERWRITING_PUBLISH",
+        Err(err) if err.message.contains("no implemented transport") => "TRANSPORT_NOT_IMPLEMENTED",
+        Err(_) => "OTHER",
+    };
+    f.insert("sftp_refusal_gate".into(), json!(gate));
+    // 评审 r2 NEW-1：提交动词曾绕过权限门，而且流不记它开在哪个 root 上，
+    // 所以"在可写根上传、换个 root 参数提交"能落进只读根或把远端路径丢给本地解析器。
+    let sid = e
+        .open_upload(s, "downloads", "bound.bin", Some(4))
+        .map_err(|x| x.to_string())?;
+    e.stage_chunk(s, sid, 0, b"abcd")
+        .map_err(|x| x.to_string())?;
+    let redirect = e
+        .commit_upload(s, "remotedir", sid, None)
+        .map(|_| "NONE")
+        .unwrap_or_else(|err| err.code);
+    f.insert("commit_root_redirect_code".into(), json!(redirect));
+    // 拒绝不得吃掉流：回到真正的 root 必须仍能发布。
+    let recovered = match e.commit_upload(s, "downloads", sid, None) {
+        Ok(p) => p,
+        Err(err) => format!("ERR:{}", err.code),
+    };
+    f.insert(
+        "commit_after_refusal_recovers".into(),
+        json!(recovered == "bound.bin"),
+    );
     // A remote root must not be silently accepted in a non-absolute or dotted form.
     f.insert(
         "relative_remote_root_rejected".into(),
@@ -442,9 +478,77 @@ fn auth_throttle(f: &mut Map<String, Value>) -> Result<(), String> {
         json!(sixth.map(|_| "NONE").unwrap_or_else(|err| err.code)),
     );
     f.insert("interim_codes".into(), json!(codes));
+    // 评审 r2 W-6：过去这里把 `lockout_after + 1` 当测量值回读。改成观测：
+    // 一直喂错令牌直到第一次出现 THROTTLED，再看紧接着一次**正确令牌**是否仍被拒，
+    // 那个尝试序号才是"锁定生效于第几次"。
+    let mut e3 = engine_at(&dir, FileLimits::default())?;
+    let mut attempt_of_throttle = 0usize;
+    for n in 1..=64usize {
+        let denial = e3
+            .authenticate("observer", "10.0.0.5", "nope")
+            .map(|_| "NONE")
+            .unwrap_or_else(|err| err.code);
+        if denial == code::THROTTLED {
+            attempt_of_throttle = n;
+            break;
+        }
+    }
+    let locked_attempt =
+        if attempt_of_throttle > 0 && e3.authenticate("observer", "10.0.0.5", TOKEN).is_err() {
+            attempt_of_throttle + 1
+        } else {
+            0
+        };
+    f.insert("locked_after_attempts".into(), json!(locked_attempt));
+    // 评审 r2 NEW-3：节流表被伪造量填满时旧实现是 fail-**open**（只累加私有计数，
+    // 从不写 `locked`，令牌比对继续做）⇒ 轮换 principal 就能买无限次猜测。
+    let mut e4 = engine_at(
+        &dir,
+        FileLimits {
+            max_throttle_buckets: 8,
+            lockout_after: 3,
+            ..Default::default()
+        },
+    )?;
+    for i in 0..8 {
+        let _ = e4.authenticate(&format!("p{i}"), "10.0.0.6", "nope");
+    }
+    let overflow_codes: Vec<&str> = (0..3)
+        .map(|_| {
+            e4.authenticate("rot", "10.0.0.6", "nope")
+                .map(|_| "NONE")
+                .unwrap_or_else(|err| err.code)
+        })
+        .collect();
+    // 两个群体都要断言。评审 r5 N-7：只断言"不在册"的主体对旧豁免逻辑零杀伤力
+    // （旧写法恰恰只作用于不在册人群），所以必须 additionally 拿一个**已在册**的
+    // p0 去试正确令牌——旧实现这里是 ACCEPTED。
+    let in_table_correct = e4
+        .authenticate("p0", "10.0.0.6", TOKEN)
+        .map(|_| "ACCEPTED")
+        .unwrap_or_else(|err| err.code);
+    let fresh_correct = e4
+        .authenticate("brand-new", "10.0.0.6", TOKEN)
+        .map(|_| "ACCEPTED")
+        .unwrap_or_else(|err| err.code);
     f.insert(
-        "locked_after_attempts".into(),
-        json!(e.limits().lockout_after + 1),
+        "throttle_buckets_at_cap".into(),
+        json!(e4.throttle_buckets()),
+    );
+    f.insert("throttle_overflow_codes".into(), json!(overflow_codes));
+    f.insert(
+        "throttle_overflow_count".into(),
+        json!(e4.throttle_overflow()),
+    );
+    f.insert(
+        "throttle_full_fail_closed".into(),
+        json!(
+            e4.throttle_buckets() == 8
+                && e4.throttle_overflow() >= 3
+                && e4.throttle_globally_locked()
+                && in_table_correct == code::THROTTLED
+                && fresh_correct == code::THROTTLED
+        ),
     );
     // The correct token during the lockout window is still refused.
     let correct = e.authenticate("attacker", "10.0.0.1", TOKEN);
@@ -456,7 +560,21 @@ fn auth_throttle(f: &mut Map<String, Value>) -> Result<(), String> {
     let other = e.authenticate("attacker", "10.0.0.2", TOKEN);
     f.insert("other_source_still_admitted".into(), json!(other.is_ok()));
     if let Ok(sid) = other {
-        e.close_session(sid, "10.0.0.2");
+        e.close_session(sid);
+    }
+    // Session teardown clears the bucket for that principal+source pair.
+    // 顺序是**有意的**：它必须跑在下面的伪造量淹没之前——NEW-3 把表满改成
+    // fail-closed 之后，淹没过的引擎会对任何未在册主体拒认证，这段就会假红
+    // （第一次 Linux 跑正是这样红的）。
+    let sid = auth(&mut e)?;
+    e.close_session(sid);
+    let after_forget = e.authenticate("probe", "127.0.0.1", TOKEN);
+    f.insert(
+        "state_cleared_after_close".into(),
+        json!(after_forget.is_ok()),
+    );
+    if let Ok(x) = after_forget {
+        e.close_session(x);
     }
     // Forged volume must not grow the table with the volume.
     let buckets_before = e.throttle_buckets();
@@ -471,17 +589,25 @@ fn auth_throttle(f: &mut Map<String, Value>) -> Result<(), String> {
     f.insert("buckets_before".into(), json!(buckets_before));
     f.insert("buckets_after".into(), json!(e.throttle_buckets()));
     f.insert("max_buckets".into(), json!(e.limits().max_throttle_buckets));
-    // Session teardown clears the bucket for that principal+source pair.
-    let sid = auth(&mut e)?;
-    e.close_session(sid, "127.0.0.1");
-    let after_forget = e.authenticate("probe", "127.0.0.1", TOKEN);
+    // 同一台引擎在淹没之后必须 fail-closed（r2 NEW-3 在产品引擎上的直接观测，
+    // 不只是 e4 那台小表引擎）。两个群体都断言：`p0` 已在册（旧豁免逻辑下这里
+    // 是 ACCEPTED，评审 r5 N-7），`fresh-after-flood` 不在册。
+    let in_table_post_flood = e
+        .authenticate("p0", "10.0.0.9", TOKEN)
+        .map(|_| "ACCEPTED")
+        .unwrap_or_else(|err| err.code);
+    let post_flood = e
+        .authenticate("fresh-after-flood", "10.0.0.9", TOKEN)
+        .map(|_| "ACCEPTED")
+        .unwrap_or_else(|err| err.code);
     f.insert(
-        "state_cleared_after_close".into(),
-        json!(after_forget.is_ok()),
+        "product_engine_fails_closed_when_flooded".into(),
+        json!(
+            e.throttle_globally_locked()
+                && in_table_post_flood == code::THROTTLED
+                && post_flood == code::THROTTLED
+        ),
     );
-    if let Ok(x) = after_forget {
-        e.close_session(x, "127.0.0.1");
-    }
     cleanup(&dir);
     Ok(())
 }
@@ -492,17 +618,21 @@ fn quota_backpressure(f: &mut Map<String, Value>) -> Result<(), String> {
     std::fs::write(dir.join("big.bin"), &source).map_err(|e| e.to_string())?;
     let limits = FileLimits {
         chunk_bytes: 8,
-        max_inflight_bytes_per_session: 16,
+        // G12 要求 per-session in-flight <= 共享预算，这里取等号：让**共享发送
+        // 预算**成为本案的约束（per-session 上限单独用第三个引擎验，避免两个
+        // 约束互相掩盖）。评审 F1：预算必须真的接在引擎上，不是探针手搓一份。
+        max_inflight_bytes_per_session: 128,
         // 这条 fixture 必须同时把 ack 上限压到预算之内，否则被 G12 的交叉约束
-        // 直接拒启动（第一版探针就是这样失败的——那个拒绝本身是契约想要的答案）。
-        max_ack_bytes: 64,
+        // 直接拒启动（第一版探针就是这样失败的——那个拒绝本身是契约想要的答案）；
+        // 它同时不能低于"信封 + 一个条目"的下限，否则 list 页永远截断成 0 条。
+        max_ack_bytes: 128,
         max_read_handles: 4,
         max_sessions: 2,
         max_browser_sessions: 1,
         max_buffered_amount: 128,
         ..Default::default()
     };
-    let mut e = engine_at(&dir, limits)?;
+    let mut e = engine_at(&dir, limits.clone())?;
     let s = auth(&mut e)?;
     // A budget that cannot express one page must be rejected at construction;
     // prove it separately so this case does not depend on an invalid table.
@@ -516,12 +646,12 @@ fn quota_backpressure(f: &mut Map<String, Value>) -> Result<(), String> {
         json!(impossible.validate().is_err()),
     );
 
-    let mut budget = SendBudget::new(e.limits().max_buffered_amount);
-    // Fill the shared budget with file-class messages, then force one overflow.
+    // 灌满共享预算走的是引擎的过账入口（wire 层报真实序列化长度），
+    // 不是探针自己 new 一个 SendBudget。
     let mut file_accepted = 0usize;
     let mut overflow_code = "NONE";
     for _ in 0..64 {
-        match budget.push_file(8) {
+        match e.send_file_message(s, 8) {
             Ok(()) => file_accepted += 1,
             Err(err) => {
                 // 报告实际拿到的码，而不是把常量抄回来。
@@ -535,31 +665,186 @@ fn quota_backpressure(f: &mut Map<String, Value>) -> Result<(), String> {
         json!(overflow_code == code::QUEUE_FULL),
     );
     f.insert("overflow_code".into(), json!(overflow_code));
-    f.insert("file_drops_reported".into(), json!(budget.file_drops > 0));
+    f.insert(
+        "file_drops_reported".into(),
+        json!(e.budget().file_drops > 0),
+    );
     f.insert("file_accepted_before_overflow".into(), json!(file_accepted));
+    f.insert("budget_limit".into(), json!(e.budget().limit));
+    f.insert("budget_buffered".into(), json!(e.budget().buffered()));
 
     // Terminal class: 100 messages must all be delivered with zero drops.
     let mut delivered = 0usize;
     let mut failed = 0usize;
     for _ in 0..100 {
-        if budget.push_terminal(4).is_ok() {
+        if e.send_terminal(4).is_ok() {
             delivered += 1;
-            budget.settle(4);
+            e.settle_terminal(4);
         } else {
             failed += 1;
         }
     }
     f.insert("ssh_messages_delivered".into(), json!(delivered));
     f.insert("ssh_messages_dropped".into(), json!(failed));
+    // 评审 r1 F2 的机器化，并按 r2 NEW-5 的意见改成**独立一段**：上一版把断言挂在
+    // "100 条 4 字节终端消息之后"，队列深度就取决于挤占次序，静态读法能算出 0
+    // 而主机实测是 15 —— 同一个字段两种读法，这种证据不合格。现在用一台全新引擎：
+    // 灌满 → 一次整预算的终端发送 → 被挤掉的条数必须**恰好等于**灌进去的条数。
+    let mut eb = engine_at(&dir, limits.clone())?;
+    let sb = auth(&mut eb)?;
+    let mut queued = 0usize;
+    while eb.send_file_message(sb, 8).is_ok() {
+        queued += 1;
+        if queued > 64 {
+            return Err("file queue did not bound".to_string());
+        }
+    }
+    let drops_before = eb.budget().file_drops;
+    let final_limit = eb.budget().limit;
+    let terminal_ok = eb.send_terminal(final_limit).is_ok();
+    let squeezed = eb.budget().file_drops - drops_before;
+    f.insert("messages_queued_before_final_send".into(), json!(queued));
+    f.insert("file_messages_squeezed_out".into(), json!(squeezed));
+    f.insert("final_terminal_send_ok".into(), json!(terminal_ok));
+    f.insert(
+        "pending_messages_after_final_send".into(),
+        json!(eb.budget().pending_file_messages()),
+    );
+    f.insert(
+        "squeeze_accounting_is_per_message".into(),
+        json!(
+            queued > 1
+                && terminal_ok
+                && squeezed == queued
+                && eb.budget().pending_file_messages() == 0
+        ),
+    );
+    // r2 NEW-2 第 1 点：被挤掉的消息必须同时回冲它自己会话的 in-flight 额度，
+    // 否则客户端只能去 ack 一份它从未收到的页。
+    f.insert(
+        "inflight_released_on_squeeze".into(),
+        json!(eb.inflight_bytes(sb) == 0 && eb.inflight_matches_budget(sb)),
+    );
+    // r2 NEW-2 第 2 点：会话拆除（断线/闲置）必须归还共享预算。
+    let mut et = engine_at(&dir, limits.clone())?;
+    let st_ = auth(&mut et)?;
+    et.send_file_message(st_, 8).map_err(|x| x.to_string())?;
+    let held = et.budget().buffered();
+    et.close_session(st_);
+    f.insert("teardown_held_bytes".into(), json!(held));
+    f.insert(
+        "teardown_releases_budget".into(),
+        json!(held == 8 && et.budget().buffered() == 0 && et.budget().pending_file_messages() == 0),
+    );
+    // r2 NEW-4：会话配额是**准入**检查，不是只在 validate 里比一下。
+    let mut ea = engine_at(&dir, limits.clone())?;
+    let admission: Vec<FileResult<u64>> = (0..8)
+        .map(|_| ea.authenticate("quota-probe", "10.0.0.7", TOKEN))
+        .collect();
+    let accepted = admission.iter().filter(|r| r.is_ok()).count();
+    let admission_code = admission
+        .iter()
+        .find_map(|r| r.as_ref().err().map(|e| e.code))
+        .unwrap_or("NONE");
+    let first_session = admission.iter().find_map(|r| r.as_ref().ok()).copied();
+    f.insert("sessions_accepted".into(), json!(accepted));
+    f.insert("max_sessions".into(), json!(ea.limits().max_sessions));
+    f.insert(
+        "max_browser_sessions".into(),
+        json!(ea.limits().max_browser_sessions),
+    );
+    f.insert(
+        "session_admission_capped".into(),
+        json!(accepted == ea.limits().max_browser_sessions && admission_code == code::CAPACITY),
+    );
+    // r2 W-4：0 字节页请求必须显式拒，否则 next_offset 原地踏步。
+    let zero_err = first_session
+        .map(|sid| {
+            ea.read_page(sid, "downloads", "big.bin", 0, 0)
+                .map(|_| "NONE")
+                .unwrap_or_else(|err| err.code)
+        })
+        .unwrap_or("NO_SESSION");
+    f.insert(
+        "zero_byte_page_refused".into(),
+        json!(zero_err == code::PAGE_TOO_LARGE),
+    );
+
+    // 真实下载路径同样过账：read_page 不 settle 就会在预算耗尽时显式 QUEUE_FULL，
+    // ack 之后才能继续（G18 拉式）。这一段证明预算长在引擎上，不是模型。
+    let mut e2 = engine_at(&dir, limits.clone())?;
+    let s2 = auth(&mut e2)?;
+    let first = e2
+        .read_page(s2, "downloads", "big.bin", 0, 8)
+        .map_err(|x| x.to_string())?;
+    f.insert(
+        "read_page_charged_to_shared_budget".into(),
+        json!(e2.budget().file_buffered() == first.bytes.len() && e2.inflight_bytes(s2) == 8),
+    );
+    let mut page_overflow_code = "NONE";
+    for _ in 0..64 {
+        match e2.read_page(s2, "downloads", "big.bin", 0, 8) {
+            Ok(_) => {}
+            Err(err) => {
+                page_overflow_code = err.code;
+                break;
+            }
+        }
+    }
+    f.insert("read_page_overflow_code".into(), json!(page_overflow_code));
+    // 对端 ack 一页 ⇒ 预算与 per-session in-flight 同时释放，下载可以继续。
+    e2.settle_file(s2, 8);
+    f.insert(
+        "settle_releases_budget_and_inflight".into(),
+        json!(
+            e2.inflight_bytes(s2) == e2.budget().file_buffered()
+                && e2.read_page(s2, "downloads", "big.bin", 0, 8).is_ok()
+        ),
+    );
+
+    // per-session in-flight 上限是独立约束：共享预算宽裕时它也必须生效。
+    // 走 `send_file_message` 而不是 `read_page`：夹具里 big.bin 只有 40 字节，
+    // 读不出 128 字节的在途量，而这条要验的是额度记账不是文件内容。
+    let mut e3 = engine_at(
+        &dir,
+        FileLimits {
+            max_inflight_bytes_per_session: 128,
+            max_ack_bytes: 128,
+            max_buffered_amount: 4096,
+            ..limits.clone()
+        },
+    )?;
+    let s3 = auth(&mut e3)?;
+    let mut charged = 0usize;
+    while e3.send_file_message(s3, 8).is_ok() {
+        charged += 1;
+        if charged > 64 {
+            return Err("per-session ceiling never bound".to_string());
+        }
+    }
+    f.insert("inflight_bytes_before_ceiling".into(), json!(charged * 8));
+    f.insert(
+        "per_session_inflight_ceiling_enforced".into(),
+        json!(
+            charged * 8 == 128
+                && e3.budget().file_buffered() == 128
+                && e3.budget().limit == 4096
+                && e3.inflight_matches_budget(s3)
+        ),
+    );
 
     // Read handles stay inside the budget across many pages of one download.
+    let mut e4 = engine_at(&dir, limits)?;
+    let s4 = auth(&mut e4)?;
     let mut pages = 0usize;
     let mut offset = 0u64;
     loop {
-        let p = e
-            .read_page(s, "downloads", "big.bin", offset, 8)
+        let p = e4
+            .read_page(s4, "downloads", "big.bin", offset, 8)
             .map_err(|x| x.to_string())?;
         pages += 1;
+        // 拉式协议：每页落地后才取下一页（同时释放预算与 in-flight）。
+        e4.settle_file(s4, p.bytes.len());
         if p.eof {
             break;
         }
@@ -568,22 +853,22 @@ fn quota_backpressure(f: &mut Map<String, Value>) -> Result<(), String> {
             return Err("download did not terminate".to_string());
         }
     }
-    let (live, peak) = e.handle_stats();
+    let (live, peak) = e4.handle_stats();
     f.insert("pages_read".into(), json!(pages));
     f.insert(
         "peak_read_handles_within_budget".into(),
-        json!(peak <= e.limits().max_read_handles && live == 0),
+        json!(peak <= e4.limits().max_read_handles && live == 0),
     );
     f.insert("peak_read_handles".into(), json!(peak));
     f.insert("live_read_handles".into(), json!(live));
-    f.insert("handle_budget".into(), json!(e.limits().max_read_handles));
+    f.insert("handle_budget".into(), json!(e4.limits().max_read_handles));
 
     // Oversized declared upload is refused before any bytes are staged.
-    let big = e.open_upload(
-        s,
+    let big = e4.open_upload(
+        s4,
         "downloads",
         "huge.bin",
-        Some(e.limits().max_upload_bytes + 1),
+        Some(e4.limits().max_upload_bytes + 1),
     );
     f.insert(
         "declared_size_code".into(),
@@ -658,8 +943,14 @@ fn decide_channel(config: &Value) -> Decision {
     }
 }
 
-fn refuses_link<T, E: std::fmt::Debug>(r: Result<T, E>) -> Value {
-    json!(r.is_err())
+/// 拒绝**且理由是符号链接**才算数。旧写法只看 `is_err()`，于是把 `resolve` 的
+/// 符号链接检查整段删掉，这两个字段仍然 true（`list` 会因 read_dir 失败、
+/// `mkdir` 会因 create_dir_all 失败而"看起来拒了"）——评审 r2 W-6。
+fn refuses_link<T>(r: FileResult<T>) -> Value {
+    json!(match r {
+        Err(err) => err.code == code::SYMLINK_ESCAPE,
+        Ok(_) => false,
+    })
 }
 
 fn sha256_of(bytes: &[u8]) -> [u8; 32] {

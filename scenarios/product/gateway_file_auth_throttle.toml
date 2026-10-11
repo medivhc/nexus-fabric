@@ -41,3 +41,14 @@ equals = true
 [[expect]]
 field = "correct_token_bypasses_lockout"
 equals = false
+
+# 评审 r2 NEW-3：节流表被伪造量填满时必须 fail-closed（旧实现只累加私有计数、
+# 从不写 locked，令牌比对继续做 ⇒ 轮换 principal 就能买无限次猜测）。
+[[expect]]
+field = "throttle_full_fail_closed"
+equals = true
+
+# 同一判据在产品尺寸的引擎（max_throttle_buckets=1024）上也成立，不只是小表夹具
+[[expect]]
+field = "product_engine_fails_closed_when_flooded"
+equals = true

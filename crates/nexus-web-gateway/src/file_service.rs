@@ -24,7 +24,7 @@
 //!   *differential* naive path where a "resolve once / ack per chunk / no
 //!   throttle" implementation would pass for the wrong reason.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -104,12 +104,20 @@ pub struct FileLimits {
     pub max_inflight_bytes_per_session: usize,
     /// Declared size ceiling for one upload.
     pub max_upload_bytes: u64,
-    /// Bytes the server will re-hash per stream while verifying a resume.
+    /// Bytes the server will **re-read from disk** per stream while verifying a
+    /// duplicate/replayed page. Sequential new bytes are hashed as they arrive,
+    /// whose cost is already bounded by `max_upload_bytes` — so this budget must
+    /// not gate the digest itself, or an artifact larger than the budget could
+    /// never be digest-published（评审 WARN：旧实现把它当验证门用）.
     pub max_rehash_bytes_per_stream: u64,
     /// Idle window after which a file session is recycled (G21).
     pub idle_timeout: Duration,
     /// Failed authentications before the principal/source bucket is locked out.
     pub lockout_after: usize,
+    /// How long a lockout lasts. A field rather than a hardcoded 60 s so the
+    /// expiry path (re-lock after lapse, overflow counter decay) is testable
+    /// without sleeping for a minute（评审 r3 R3-NEW-2 要求可验证）.
+    pub lockout_window: Duration,
     /// Entries kept in the throttle table; beyond that, oldest buckets are
     /// merged into the global bucket so memory cannot grow with forged volume.
     pub max_throttle_buckets: usize,
@@ -126,11 +134,15 @@ impl Default for FileLimits {
             max_sessions: 4,
             max_browser_sessions: 2,
             max_read_handles: 32,
-            max_inflight_bytes_per_session: 1024 * 1024,
+            // 与 max_buffered_amount 同量级：in-flight 与共享发送预算由**同一个
+            // 事件**（对端 ack / 传输冲刷）释放，所以高于预算的 per-session 上限
+            // 是永远够不到的死配置（评审 WARN：旧默认 1 MiB 配 128 KiB 预算）。
+            max_inflight_bytes_per_session: 128 * 1024,
             max_upload_bytes: 2 * 1024 * 1024 * 1024,
             max_rehash_bytes_per_stream: 64 * 1024 * 1024,
             idle_timeout: Duration::from_secs(300),
             lockout_after: 5,
+            lockout_window: Duration::from_secs(60),
             max_throttle_buckets: 1024,
             max_buffered_amount: 128 * 1024,
         }
@@ -153,6 +165,56 @@ impl FileLimits {
             return Err(FileError::new(
                 code::CONFIG,
                 "no limit may be zero: a zero ceiling silently disables its gate",
+            ));
+        }
+        // 时长与 u64 上限同样受这条规则约束（评审 r4 R4-NEW-1）：
+        // `lockout_window = 0` 时每次锁定在写入的那一刻就已过期，全局窗口又只在
+        // 锁表满时才升级，于是**每个错令牌都能走到常数时间比较**——实测比较次数
+        // 从 5/200 变成 200/200，G15 的"有界尝试"变成纸面话。
+        // `idle_timeout = 0` 会让会话刚建立就被回收；`max_upload_bytes = 0` 与
+        // `max_rehash_bytes_per_stream = 0` 则是"声明了上限但任何操作都超"的死配置。
+        if self.lockout_window.is_zero() {
+            return Err(FileError::new(
+                code::CONFIG,
+                "lockout_window must not be zero: a zero lockout expires on insert and disables throttling",
+            ));
+        }
+        if self.idle_timeout.is_zero() {
+            return Err(FileError::new(
+                code::CONFIG,
+                "idle_timeout must not be zero: every session would be recycled the moment it is created",
+            ));
+        }
+        if self.max_upload_bytes == 0 || self.max_rehash_bytes_per_stream == 0 {
+            return Err(FileError::new(
+                code::CONFIG,
+                "no limit may be zero: a zero ceiling silently disables its gate",
+            ));
+        }
+        // 高边同样要封（评审 r5 R5-W-2：同一片刚在 config.rs 里给 max_terminals
+        // 补了上界，却没封自己新加的两个时长）。时长参与 `Instant + Duration`，
+        // 一个病态大值不是"更宽松"，而是把锁死/回收推到时钟边界之外；
+        // 数值型上限（上传大小、回读预算）本身没有这种后果，仍只封低边。
+        const MAX_WINDOW_SECS: u64 = 24 * 3600;
+        if self.lockout_window > Duration::from_secs(MAX_WINDOW_SECS) {
+            return Err(FileError::new(
+                code::CONFIG,
+                "lockout_window must be <= 24h: an unbounded window cannot be represented in clock arithmetic",
+            ));
+        }
+        if self.idle_timeout > Duration::from_secs(MAX_WINDOW_SECS) {
+            return Err(FileError::new(
+                code::CONFIG,
+                "idle_timeout must be <= 24h: an unbounded window cannot be represented in clock arithmetic",
+            ));
+        }
+        // 计费配额要配对：`list` 现在按 `ack_bytes` 过账，所以一条完整 ack 必须
+        // 放得进单会话在途上限，否则每个 list 页都会当场 CAPACITY——配置"自洽"
+        // 却永远不可用（评审 r5 R5-W-3）。
+        if self.max_ack_bytes > self.max_inflight_bytes_per_session {
+            return Err(FileError::new(
+                code::CONFIG,
+                "max_ack_bytes must be <= max_inflight_bytes_per_session, else a full-size ack can never be charged",
             ));
         }
         if self.max_browser_sessions > self.max_sessions {
@@ -183,17 +245,31 @@ impl FileLimits {
                 "max_ack_bytes must be <= max_buffered_amount",
             ));
         }
-        // Cross constraint that V1 never checked: the worst-case in-flight file
-        // bytes across all sessions must stay below what the SCTP budget can
-        // absorb, otherwise the queue grows without bound (measured: +1 GiB RSS).
-        let worst_case = self
-            .max_sessions
-            .checked_mul(self.max_inflight_bytes_per_session)
-            .ok_or_else(|| FileError::new(code::OVERFLOW, "limits multiplication overflow"))?;
-        if worst_case > self.max_buffered_amount.saturating_mul(64) {
+        // 下限同样要交叉校验：ack 预算装不下"信封 + 一个条目"时，每个 list 页
+        // 都会截断成 0 条目——客户端永远翻不完目录，而且看起来"没报错"。
+        // （评审 WARN：旧 validate 只管上限，不管 entries × name 的字节数。）
+        let min_ack = LIST_ACK_ENVELOPE_BYTES
+            .checked_add(ENTRY_ACK_OVERHEAD_BYTES)
+            .ok_or_else(|| FileError::new(code::OVERFLOW, "ack floor overflow"))?;
+        if self.max_ack_bytes < min_ack {
             return Err(FileError::new(
                 code::CONFIG,
-                "max_sessions * max_inflight_bytes_per_session exceeds the buffered-amount budget (x64)",
+                format!(
+                    "max_ack_bytes must be >= {min_ack} (list envelope + one entry), \
+                     else every list page truncates to zero entries"
+                ),
+            ));
+        }
+        // per-session in-flight 与共享发送预算由同一事件释放（`settle_file`），
+        // 所以 in-flight 永远不可能超过预算：高于预算的上限是够不到的死配置。
+        // 这条替代了旧的 `max_sessions * inflight <= buffered * 64`——那个 64
+        // 是没有推导的魔数，实际允许 32-64 倍超配（评审 WARN）。总量本来就由
+        // 共享预算封顶，不需要再乘一个会话数。
+        if self.max_inflight_bytes_per_session > self.max_buffered_amount {
+            return Err(FileError::new(
+                code::CONFIG,
+                "max_inflight_bytes_per_session must be <= max_buffered_amount, \
+                 else the per-session ceiling can never be reached",
             ));
         }
         // Read handles must cover at least one handle per session, otherwise the
@@ -369,7 +445,10 @@ impl SandboxRoot {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     // Missing is fine for write/mkdir targets (they create it) and
                     // becomes NOT_FOUND for read/stat/remove, decided by the caller.
-                    break;
+                    // Resolution MUST continue over the remaining components: stopping
+                    // here would silently truncate `a/b/c` to `a` and publish bytes
+                    // under the wrong prefix (N3-4/N3-9 fix the output path).
+                    continue;
                 }
                 Err(e) => return Err(FileError::new(code::NOT_FOUND, format!("{rel:?}: {e}"))),
             };
@@ -489,9 +568,13 @@ pub struct DataPage {
 /// Accounting for open read handles (G16). One entry per (session, path), so N
 /// chunks of one download cost **one** handle; V1 allocated one per chunk and
 /// died around handle ~1022.
+///
+/// 计数单位是"不同的 (会话, 路径)"，不是引用计数：旧实现 `live() = values().sum()`
+/// 与自己的文档矛盾（第二次 acquire 同一路径就报 2 个活句柄），预算因此比声明的
+/// 更紧、且 `peak` 记的是分片数而不是并发文件数（评审 r2 W-9 顺带查出）。
 #[derive(Debug)]
 pub struct HandleRegistry {
-    open: HashMap<(u64, String), usize>,
+    open: HashSet<(u64, String)>,
     budget: usize,
     pub peak: usize,
 }
@@ -499,7 +582,7 @@ pub struct HandleRegistry {
 impl HandleRegistry {
     pub fn new(budget: usize) -> Self {
         Self {
-            open: HashMap::new(),
+            open: HashSet::new(),
             budget,
             peak: 0,
         }
@@ -510,8 +593,10 @@ impl HandleRegistry {
     /// server-issued stream identity (G16).
     pub fn acquire(&mut self, session: u64, path: &str) -> FileResult<usize> {
         let key = (session, path.to_string());
-        let already_open = self.open.contains_key(&key);
-        if !already_open && self.live() >= self.budget {
+        if self.open.contains(&key) {
+            return Ok(self.live());
+        }
+        if self.live() >= self.budget {
             return Err(FileError::new(
                 code::CAPACITY,
                 format!(
@@ -521,23 +606,17 @@ impl HandleRegistry {
                 ),
             ));
         }
-        *self.open.entry(key).or_insert(0) += 1;
+        self.open.insert(key);
         self.peak = self.peak.max(self.live());
         Ok(self.live())
     }
 
     pub fn release(&mut self, session: u64, path: &str) {
-        let key = (session, path.to_string());
-        if let Some(e) = self.open.get_mut(&key) {
-            *e = e.saturating_sub(1);
-            if *e == 0 {
-                self.open.remove(&key);
-            }
-        }
+        self.open.remove(&(session, path.to_string()));
     }
 
     pub fn live(&self) -> usize {
-        self.open.values().sum()
+        self.open.len()
     }
 }
 
@@ -546,12 +625,24 @@ impl HandleRegistry {
 pub struct UploadStream {
     pub id: u64,
     pub session: u64,
+    /// The root the stream was opened on. Commit must publish through *this*
+    /// root: taking the caller's `root` argument at commit time would let a
+    /// stream opened on a writable root land in a `read_only` one, or hand an
+    /// SFTP root's remote path to the local resolver (评审 r2 NEW-1).
+    pub root: String,
     pub rel: String,
-    /// Contiguous bytes already durably staged; the only number ever acked.
+    /// Contiguous bytes staged in the `.part` file; the only number ever acked.
+    /// "Staged" is **not** a durability claim: `flush()` on `std::fs::File` is a
+    /// no-op, so the bytes are only guaranteed on stable storage after
+    /// `commit_upload` calls `sync_all()` before publishing (评审 WARN：
+    /// 逐片 fsync 会把上传吞吐打到不可用， durability 声明因此后移到 commit)。
     pub staged: u64,
     pub declared_len: Option<u64>,
     pub hasher: Sha256,
     pub hashed_bytes: u64,
+    /// Bytes re-read from disk for duplicate-page verification, charged against
+    /// `max_rehash_bytes_per_stream` (the DoS that budget actually covers).
+    pub rehash_bytes: u64,
     pub part_path: PathBuf,
     pub file: std::fs::File,
     pub last_activity: Instant,
@@ -562,6 +653,11 @@ pub struct UploadStream {
 pub struct FileSession {
     pub id: u64,
     pub principal: String,
+    /// Where the peer came from, recorded at authentication. Used for the
+    /// per-peer session quota (G16) and for clearing the right throttle bucket
+    /// on teardown (评审 r2 N-8: a caller-supplied source could wipe someone
+    /// else's lockout).
+    pub source: String,
     pub inflight_bytes: usize,
     pub streams: BTreeMap<u64, UploadStream>,
     /// The field the idle sweeper reads. Every activity updates *this* field —
@@ -577,6 +673,11 @@ pub struct Throttle {
     /// Overflow sink: when the table is full, new failures land here instead of
     /// growing memory with forged volume (so `throttle_entries_bounded` is real).
     global: usize,
+    /// Fail-closed window for the overflowing population. The旧行为 was
+    /// fail-**open**: overflow failures only moved a private counter, `locked`
+    /// was never written, and `authenticate` still compared the token, so
+    /// rotating principals bought an unlimited number of guesses (评审 r2 NEW-3).
+    global_locked_until: Option<Instant>,
     locked: HashMap<(String, String), Instant>,
     max_buckets: usize,
     lockout: Duration,
@@ -588,6 +689,7 @@ impl Throttle {
         Self {
             buckets: HashMap::new(),
             global: 0,
+            global_locked_until: None,
             locked: HashMap::new(),
             max_buckets,
             lockout,
@@ -595,43 +697,117 @@ impl Throttle {
         }
     }
 
-    pub fn is_locked(&self, principal: &str, source: &str) -> bool {
-        let key = (principal.to_string(), source.to_string());
-        match self.locked.get(&key) {
-            Some(until) => *until > Instant::now(),
-            None => false,
+    /// 时钟加法必须 `checked_add`（评审 r5 R5-W-2：G20 要求 panic-free-by-construction，
+    /// 而 `Instant + Duration` 在 std 语义下会 panic）。`validate()` 已把窗口封在 24h
+    /// 内，所以正常路径不会溢出；万一溢出（时钟已到平台边界），返回 `None` 表示
+    /// "这次不写入持久锁，但本次仍按锁定处理"——绝不退成"立即过期后照常比令牌"，
+    /// 那等于把 fail-closed 换成 fail-open（评审 r6 NOTE-2）。
+    fn lock_until(&self, now: Instant) -> Option<Instant> {
+        now.checked_add(self.lockout)
+            .or_else(|| now.checked_add(Duration::from_secs(3600)))
+    }
+
+    fn bounded_key(&self, principal: &str, source: &str) -> (String, String) {
+        // "表项有界"只有在键也有界时才成立：键由未认证调用方给出，不裁长度就是
+        // 1024 项 × 任意长字符串（评审 r5 R5-W-4）。裁剪只影响归因精度，
+        // 不影响判定方向，且截断标记可见。
+        (
+            bounded_label(principal, IDENTITY_LABEL_MAX_BYTES),
+            bounded_label(source, IDENTITY_LABEL_MAX_BYTES),
+        )
+    }
+
+    /// Expire locks and the global window. Both are time-bounded: expired
+    /// `locked` entries are dropped so the table cannot fill up with dead locks,
+    /// and when the global window lapses the overflow counter resets too —
+    /// otherwise one flood would stay "armed" forever and a single extra
+    /// overflow failure per window would renew it indefinitely（评审 r3 R3-W-2）.
+    fn decay(&mut self, now: Instant) {
+        self.locked.retain(|_, until| *until > now);
+        if let Some(until) = self.global_locked_until {
+            if until <= now {
+                self.global_locked_until = None;
+                self.global = 0;
+            }
         }
+    }
+
+    pub fn is_locked(&self, principal: &str, source: &str) -> bool {
+        let now = Instant::now();
+        let key = self.bounded_key(principal, source);
+        if let Some(until) = self.locked.get(&key) {
+            if *until > now {
+                return true;
+            }
+        }
+        // 全局窗口对**所有**主体生效。旧写法额外要求"该主体不在 buckets 里"，
+        // 于是把表填满的那批 principal 恰好被豁免，成为永久绕开锁定点
+        // （评审 r3 R3-NEW-2：换了人群的同一条 NEW-3）。
+        matches!(self.global_locked_until, Some(until) if until > now)
     }
 
     /// Record a failure; returns true if this pushed the bucket into lockout.
     pub fn record_failure(&mut self, principal: &str, source: &str) -> bool {
-        let key = (principal.to_string(), source.to_string());
+        let now = Instant::now();
+        self.decay(now);
+        let key = self.bounded_key(principal, source);
         if self.buckets.len() >= self.max_buckets && !self.buckets.contains_key(&key) {
             self.global += 1;
-            return self.global >= self.lockout_after;
+            if self.global >= self.lockout_after {
+                if let Some(until) = self.lock_until(now) {
+                    self.global_locked_until = Some(until);
+                }
+                return true;
+            }
+            return false;
         }
         let n = self.buckets.entry(key.clone()).or_insert(0);
         *n += 1;
         if *n >= self.lockout_after {
-            self.locked.insert(key, Instant::now() + self.lockout);
+            // 每次达到阈值都重新上锁（锁可续期）；锁表满了才升级为全局窗口。
+            // 时钟边界（`None`）时不写持久锁，但这次调用仍按"已锁定"回给 authenticate。
+            if let Some(until) = self.lock_until(now) {
+                if self.locked.len() >= self.max_buckets {
+                    self.global_locked_until = Some(until);
+                } else {
+                    self.locked.insert(key, until);
+                }
+            }
             return true;
         }
         false
     }
 
     pub fn succeed(&mut self, principal: &str, source: &str) {
-        self.buckets
-            .remove(&(principal.to_string(), source.to_string()));
+        let key = self.bounded_key(principal, source);
+        self.buckets.remove(&key);
     }
 
     pub fn buckets(&self) -> usize {
         self.buckets.len()
     }
 
+    /// Overflow failures counted outside the bounded table (observability:
+    /// without this the fail-open path was invisible to the probe, r2 NEW-3).
+    pub fn global(&self) -> usize {
+        self.global
+    }
+
+    pub fn globally_locked(&self) -> bool {
+        self.global_locked_until
+            .is_some_and(|until| until > Instant::now())
+    }
+
     /// Called on session teardown: a recycled session must not leave state
     /// behind, or the table grows with connection churn (asserted by the probe).
+    ///
+    /// 注意与 `sweep_idle` 的**不对称是有意的**（评审 r5 说我上一片的注释说反了，
+    /// 这里按代码实际语义重写）：只有显式 `close_session` 才清掉该 (主体,源) 的
+    /// 在途锁定与计数；闲置回收**不**清，否则"把会话挂到超时"就成了免费的
+    /// 解锁路径。今天两条都不可被无令牌者利用（开 session 必须先过一次成功认证，
+    /// 而那次成功已经清过桶），但语义差异必须写下来，不能靠读者猜。
     pub fn forget(&mut self, principal: &str, source: &str) {
-        let key = (principal.to_string(), source.to_string());
+        let key = self.bounded_key(principal, source);
         self.buckets.remove(&key);
         self.locked.remove(&key);
     }
@@ -639,12 +815,27 @@ impl Throttle {
 
 /// Shared SCTP send budget with class priority (G16). Terminal bytes are never
 /// dropped; file-class messages are refused explicitly and counted.
+///
+/// 队列里存的是 **(会话号, 每条消息字节数)**，不是"一次事件"，也不是无归属的字节数：
+/// - 按条计数（评审 r1 F2）：`usize::from(freed > 0)` 把挤掉 4 条记成 1 条；
+/// - 按会话归属释放（评审 r2 NEW-2）：被挤掉的消息必须回冲**它自己会话**的 in-flight
+///   额度，否则那个会话只能去 ack 一份它从未收到的页，此后永久 `CAPACITY`。
+///
+/// 消息按 FIFO 整条出队：SCTP 消息不可部分发送，所以 settle/drain 都只处理
+/// 完整消息，宁可少释放也不虚报已发送。
 #[derive(Debug)]
 pub struct SendBudget {
     pub limit: usize,
-    pub buffered: usize,
+    /// Terminal-class bytes currently waiting in the transport buffer.
+    pub terminal_buffered: usize,
+    /// File-class messages waiting to be flushed, oldest first: `(session, bytes)`.
+    pub file_queue: VecDeque<(u64, usize)>,
+    /// File-class messages squeezed out or refused, counted per message.
     pub file_drops: usize,
-    pub terminal_delivered: usize,
+    /// Terminal-class sends the budget **accepted**. Naming matters: this is not
+    /// a delivery confirmation (the transport hasn't been involved yet), so the
+    /// old name `terminal_delivered` overstated it（评审 r3 N-8）.
+    pub terminal_accepted: usize,
     pub terminal_drops: usize,
 }
 
@@ -652,54 +843,195 @@ impl SendBudget {
     pub fn new(limit: usize) -> Self {
         Self {
             limit,
-            buffered: 0,
+            terminal_buffered: 0,
+            file_queue: VecDeque::new(),
             file_drops: 0,
-            terminal_delivered: 0,
+            terminal_accepted: 0,
             terminal_drops: 0,
         }
     }
 
-    pub fn push_terminal(&mut self, bytes: usize) -> FileResult<()> {
-        // Terminal has priority: if the budget is full, file-class drops first.
-        if self.buffered + bytes > self.limit {
-            self.file_drops += self.drain_file_reserve(bytes);
-        }
-        if self.buffered + bytes > self.limit {
-            // Still no room: this is a hard capacity failure, never a silent drop.
-            self.terminal_drops += 1;
-            return Err(FileError::new(code::CAPACITY, "terminal budget exhausted"));
-        }
-        self.buffered += bytes;
-        self.terminal_delivered += 1;
-        Ok(())
+    pub fn file_buffered(&self) -> usize {
+        self.file_queue.iter().map(|(_, b)| b).sum()
     }
 
-    pub fn push_file(&mut self, bytes: usize) -> FileResult<()> {
-        if self.buffered + bytes > self.limit {
+    /// Bytes still holding budget on behalf of one session.
+    pub fn file_buffered_for(&self, session: u64) -> usize {
+        self.file_queue
+            .iter()
+            .filter(|(s, _)| *s == session)
+            .map(|(_, b)| b)
+            .sum()
+    }
+
+    pub fn buffered(&self) -> usize {
+        self.terminal_buffered + self.file_buffered()
+    }
+
+    pub fn pending_file_messages(&self) -> usize {
+        self.file_queue.len()
+    }
+
+    /// `buffered + bytes > limit`，但**不允许溢出**（评审 r5 R5-W-5：G20 要求
+    /// panic-free-by-construction，而 `send_file_message` 的 `bytes` 是调用方给的）。
+    /// 溢出按"放不下"处理，即 fail-closed。
+    fn exceeds_limit(&self, bytes: usize) -> bool {
+        match self.buffered().checked_add(bytes) {
+            Some(total) => total > self.limit,
+            None => true,
+        }
+    }
+
+    /// Terminal has priority. **Always** hands back the file-class messages it
+    /// evicted, including on the failure path — an eviction that is not returned
+    /// is a session that keeps charging in-flight bytes for pages that are gone
+    /// (评审 r3 R3-NEW-1：`Ok/Err` 二选一携带清单会把清单丢掉）。
+    /// 返回 `(evicted, result)`，调用方必须先按清单回冲额度，再看 result。
+    pub fn push_terminal(&mut self, bytes: usize) -> (Vec<(u64, usize)>, FileResult<()>) {
+        let mut evicted: Vec<(u64, usize)> = Vec::new();
+        if bytes > self.limit {
+            // 一条比整个预算还大的终端消息永远发不出去；这种情况**一条文件消息都不该挤**，
+            // 否则挤掉的字节白赔进去。
+            self.terminal_drops += 1;
+            return (
+                evicted,
+                Err(FileError::new(
+                    code::CAPACITY,
+                    format!(
+                        "terminal message of {bytes} bytes exceeds the whole send budget {}",
+                        self.limit
+                    ),
+                )),
+            );
+        }
+        if self.exceeds_limit(bytes) {
+            self.drain_file_reserve(bytes, &mut evicted);
+            self.file_drops += evicted.len();
+        }
+        if self.exceeds_limit(bytes) {
+            // Still no room (terminal-class bytes already occupy the buffer and
+            // by definition those are never evicted): a hard capacity failure,
+            // never a silent drop. The eviction above really happened, so the
+            // list goes back to the caller even though this send failed.
+            self.terminal_drops += 1;
+            return (
+                evicted,
+                Err(FileError::new(code::CAPACITY, "terminal budget exhausted")),
+            );
+        }
+        self.terminal_buffered += bytes;
+        self.terminal_accepted += 1;
+        (evicted, Ok(()))
+    }
+
+    pub fn push_file(&mut self, session: u64, bytes: usize) -> FileResult<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        if self.exceeds_limit(bytes) {
             self.file_drops += 1;
             return Err(FileError::new(
                 code::QUEUE_FULL,
                 "shared send budget full; file class refused",
             ));
         }
-        self.buffered += bytes;
+        self.file_queue.push_back((session, bytes));
         Ok(())
     }
 
-    /// Simulate the event loop flushing `bytes` worth of pending file messages.
-    fn drain_file_reserve(&mut self, bytes: usize) -> usize {
-        let need = bytes.saturating_sub(self.limit - self.buffered);
-        // File-class traffic is what gets squeezed; we model the freed space as
-        // the whole file reservation, and every squeezed message is counted.
-        let freed = self.buffered.min(need);
-        self.buffered -= freed;
-        usize::from(freed > 0)
+    /// Undo a `push_file` that a later gate rejected: the message never went out,
+    /// so it must not hold budget. Only the just-pushed message is removed.
+    pub fn unpush_file(&mut self, session: u64, bytes: usize) {
+        if self.file_queue.back() == Some(&(session, bytes)) {
+            self.file_queue.pop_back();
+        }
     }
 
-    pub fn settle(&mut self, bytes: usize) {
-        self.buffered = self.buffered.saturating_sub(bytes);
+    /// Squeeze out the oldest file-class messages until `bytes` of terminal
+    /// traffic fits, collecting every message actually evicted (counted per
+    /// message by the caller, never as a single "eviction happened" event).
+    fn drain_file_reserve(&mut self, bytes: usize, out: &mut Vec<(u64, usize)>) {
+        // `buffered() <= limit` 是结构不变量，但按 G20 不靠注释保证：减法也走
+        // saturating（评审 r6 NOTE-5）。
+        let mut need = bytes.saturating_sub(self.limit.saturating_sub(self.buffered()));
+        while need > 0 {
+            match self.file_queue.pop_front() {
+                Some(msg) => {
+                    need = need.saturating_sub(msg.1);
+                    out.push(msg);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// The transport flushed whole file-class messages of `session` totalling up
+    /// to `bytes`. Returns the bytes actually freed — never a partial message.
+    pub fn settle_file(&mut self, session: u64, bytes: usize) -> usize {
+        // 严格只看队头：越过队头去释放后面的消息，等于给**还在传输缓冲里**的字节
+        // 提前退额度（评审 r3 R3-W-4，复算件 [(s,12),(s,10)] 上 settle(s,10)
+        // 旧实现会退 10）。跨会话的消息同样只能等它前面的先落地。
+        let mut remaining = bytes;
+        let mut freed = 0usize;
+        while let Some(&(s, b)) = self.file_queue.front() {
+            if s != session || b > remaining {
+                break;
+            }
+            self.file_queue.pop_front();
+            remaining -= b;
+            freed += b;
+        }
+        freed
+    }
+
+    /// A session went away (closed or idle-recycled): every message still holding
+    /// budget for it is released. Without this one churned peer pins the node-wide
+    /// budget permanently (评审 r2 NEW-2 第 2 点).
+    pub fn release_session(&mut self, session: u64) -> usize {
+        let before = self.file_buffered();
+        self.file_queue.retain(|(s, _)| *s != session);
+        before - self.file_buffered()
+    }
+
+    /// The transport flushed `bytes` of terminal-class traffic.
+    pub fn settle_terminal(&mut self, bytes: usize) {
+        self.terminal_buffered = self.terminal_buffered.saturating_sub(bytes);
     }
 }
+
+/// 调用方可控字符串的记账长度上限（评审 r5 R5-W-4）。"表项有界/审计环有界"只有在
+/// 值也有界时才是事实：认证主体名、源地址、审计里的 principal/root/rel 都来自
+/// 外部输入（其中 principal 在令牌校验**之前**就被写下），不裁长度就是
+/// "行数 × 任意长字符串"。裁剪只损失归因精度，不改变任何判定方向，且带可见标记。
+const IDENTITY_LABEL_MAX_BYTES: usize = 128;
+const AUDIT_FIELD_MAX_BYTES: usize = 256;
+
+/// Byte-bounded copy of a caller-supplied label, cutting on a char boundary and
+/// appending how much was dropped (so the truncation is visible in the record).
+fn bounded_label(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[+{}B]", &s[..end], s.len() - end)
+}
+
+/// Audit ring capacity. Bounded on purpose: an unbounded log is a memory-exhaustion
+/// path driven by the very refusals it records. Overflow drops the oldest line and
+/// bumps `FileEngine::audit_dropped`, so the rotation is observable.
+const AUDIT_CAPACITY: usize = 8192;
+
+/// Serialized-cost model for one list ack, measured from the JSON shape the probe
+/// emits (`{"next_offset":0,"entries":[...],"truncated":false,"is_complete_list":true}`
+/// = 72 bytes empty; one entry `{"name":"x","is_dir":false,"is_symlink":false,"size":1}`
+/// = 52 bytes plus the name). M2 owns the real wire encoding and must re-measure
+/// these two numbers there; until then they are the ceiling `list` enforces, and
+/// `validate()` refuses an ack budget that could not carry even one entry.
+const LIST_ACK_ENVELOPE_BYTES: usize = 72;
+const ENTRY_ACK_OVERHEAD_BYTES: usize = 52;
 
 /// One audit line (G21): refusals are recorded too.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -721,8 +1053,13 @@ pub struct FileEngine {
     next_stream: u64,
     handles: HandleRegistry,
     throttle: Throttle,
-    audit: Vec<AuditRecord>,
+    audit: VecDeque<AuditRecord>,
+    audit_dropped: usize,
     token: String,
+    /// G16 共享发送预算。引擎**自己持有**它，页/ack 出门前必须先过账；
+    /// 之前预算只在探针里手搓一份，`quota-backpressure` 案证明的是模型
+    /// 而不是产品路径（评审 F1）。
+    budget: SendBudget,
 }
 
 impl FileEngine {
@@ -734,6 +1071,7 @@ impl FileEngine {
         limits.validate()?;
         // Capture before `limits` moves into the engine below.
         let read_handles = limits.max_read_handles;
+        let buffered = limits.max_buffered_amount;
         let mut map = HashMap::new();
         for r in roots {
             if map.contains_key(r.name()) {
@@ -757,7 +1095,7 @@ impl FileEngine {
         let throttle = Throttle::new(
             limits.max_throttle_buckets,
             limits.lockout_after,
-            Duration::from_secs(60),
+            limits.lockout_window,
         );
         Ok(Self {
             limits,
@@ -767,8 +1105,10 @@ impl FileEngine {
             next_stream: 1,
             handles: HandleRegistry::new(read_handles),
             throttle,
-            audit: Vec::new(),
+            audit: VecDeque::new(),
+            audit_dropped: 0,
             token,
+            budget: SendBudget::new(buffered),
         })
     }
 
@@ -776,8 +1116,14 @@ impl FileEngine {
         &self.limits
     }
 
-    pub fn audit(&self) -> &[AuditRecord] {
+    pub fn audit(&self) -> &VecDeque<AuditRecord> {
         &self.audit
+    }
+
+    /// Audit lines dropped because the bounded buffer was full. Non-zero means
+    /// the log rotated, not that nothing happened.
+    pub fn audit_dropped(&self) -> usize {
+        self.audit_dropped
     }
 
     pub fn handle_stats(&self) -> (usize, usize) {
@@ -786,6 +1132,125 @@ impl FileEngine {
 
     pub fn throttle_buckets(&self) -> usize {
         self.throttle.buckets()
+    }
+
+    /// Overflow failures the bounded table could not hold (G15 observability).
+    pub fn throttle_overflow(&self) -> usize {
+        self.throttle.global()
+    }
+
+    /// True while the fail-closed global lockout window is active.
+    pub fn throttle_globally_locked(&self) -> bool {
+        self.throttle.globally_locked()
+    }
+
+    /// Read-only view of the shared send budget (probe/diagnostics).
+    pub fn budget(&self) -> &SendBudget {
+        &self.budget
+    }
+
+    /// Terminal-class (ssh/control) send. Never squeezed out by file traffic.
+    /// 被挤掉的每一条文件类消息都会回冲它自己会话的在途额度（r2 NEW-2 第 1 点），
+    /// 否则那个会话只能去 ack 一份它从未收到的页。
+    pub fn send_terminal(&mut self, bytes: usize) -> FileResult<()> {
+        // 清单必须**先回冲再看结果**：用 `?` 提前返回会把挤掉的消息连同清单一起
+        // 丢掉，那些会话的额度就永久悬空（评审 r3 R3-NEW-1，本机无编译能力，
+        // 由评审方的 std-only 复算件证实：弹 8 条后 inflight 64 而 budget 0）。
+        let (evicted, outcome) = self.budget.push_terminal(bytes);
+        for (sid, n) in evicted {
+            if let Some(s) = self.sessions.get_mut(&sid) {
+                s.inflight_bytes = s.inflight_bytes.saturating_sub(n);
+            }
+        }
+        outcome
+    }
+
+    /// The transport flushed terminal-class bytes.
+    pub fn settle_terminal(&mut self, bytes: usize) {
+        self.budget.settle_terminal(bytes);
+    }
+
+    /// The peer acked `bytes` of file-class traffic from `session`: both the
+    /// per-session in-flight ceiling and the shared budget are released here,
+    /// and nowhere else (G18 pull-based download). 会话额度按**实际释放的字节**
+    /// 回冲，不按请求量——整条消息才可能出队，部分 ack 不虚报。
+    pub fn settle_file(&mut self, session: u64, bytes: usize) {
+        let freed = self.budget.settle_file(session, bytes);
+        if let Some(s) = self.sessions.get_mut(&session) {
+            s.inflight_bytes = s.inflight_bytes.saturating_sub(freed);
+        }
+    }
+
+    /// Un-acked file-class bytes for one session.
+    pub fn inflight_bytes(&self, session: u64) -> usize {
+        self.sessions
+            .get(&session)
+            .map(|s| s.inflight_bytes)
+            .unwrap_or(0)
+    }
+
+    /// 不变量：会话的在途额度必须等于预算里替它占着的字节。挤占、ack、会话拆除
+    /// 任一处漏了释放，这里就会背离（r2 NEW-2 的机器化判据）。
+    pub fn inflight_matches_budget(&self, session: u64) -> bool {
+        self.inflight_bytes(session) == self.budget.file_buffered_for(session)
+    }
+
+    /// Wire layer: charge one outbound file-class message whose serialized size
+    /// only the caller knows (acks, list pages). 引擎不替它编数字——宁可要求
+    /// 调用方显式过账，也不让预算在看不见的地方漏计（评审 F1）。
+    pub fn send_file_message(&mut self, session: u64, bytes: usize) -> FileResult<()> {
+        self.charge_file(session, bytes)
+    }
+
+    /// 流属于哪个 root（审计归因用；r6 WARN-1：`stage_chunk`/`ack_staged` 的
+    /// 拒绝行过去写死 `root=""`，G21 要求的五字段就缺了一格）。
+    fn stream_root(&self, session: u64, stream: u64) -> Option<String> {
+        self.sessions
+            .get(&session)
+            .and_then(|s| s.streams.get(&stream))
+            .map(|st| st.root.clone())
+    }
+
+    /// Charge one outbound file-class message: first against the shared SCTP
+    /// budget (the transport-level truth), then against the per-session
+    /// in-flight ceiling. A refusal is explicit (`QUEUE_FULL` / `CAPACITY`) and
+    /// leaves no state behind, so the caller can retry after the peer acks.
+    fn charge_file(&mut self, session: u64, bytes: usize) -> FileResult<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        // 会话必须已存在：对未知会话过账会造出一条无归属、永不释放的预算条目
+        // （r2 NEW-2 第 3 点）。
+        let current = self.session(session)?.inflight_bytes;
+        let ceiling = self.limits.max_inflight_bytes_per_session;
+        // 共享预算先扣：两条上限同时满时，对外报的是"传输发不出去"（QUEUE_FULL），
+        // 这才是调用方需要的信号；per-session 额度是第二道闸，报 CAPACITY。
+        self.budget.push_file(session, bytes)?;
+        // 过账之后的**每一条**早退都必须回滚预算（评审 r3 R3-W-1：旧写法只回滚
+        // CAPACITY 那条，`?` 走掉的 OVERFLOW 会留下"占共享预算、不占会话额度"
+        // 的条目，inflight_matches_budget 反向背离且没有释放路径）。
+        let next = match current.checked_add(bytes) {
+            Some(n) => n,
+            None => {
+                self.budget.unpush_file(session, bytes);
+                return Err(FileError::new(code::OVERFLOW, "in-flight bytes overflow"));
+            }
+        };
+        if next > ceiling {
+            // 回滚刚刚记入预算的这一条：它没有出门，不能占额度。
+            self.budget.unpush_file(session, bytes);
+            return Err(FileError::new(
+                code::CAPACITY,
+                format!(
+                    "per-session in-flight budget {ceiling} exhausted; \
+                     ack outstanding pages before requesting more"
+                ),
+            ));
+        }
+        if let Some(s) = self.sessions.get_mut(&session) {
+            s.inflight_bytes = next;
+        }
+        Ok(())
     }
 
     fn root(&self, name: &str) -> FileResult<&SandboxRoot> {
@@ -831,6 +1296,34 @@ impl FileEngine {
             ));
         }
         self.throttle.succeed(principal, source);
+        // 会话数必须是**准入**检查，不是只在 `validate()` 里比一下（评审 r2 NEW-4）：
+        // 否则一个持有合法令牌的浏览器可以无限量开会话，每会话再开无限条流、
+        // 每流一个 `.part`。G16/PRODUCT §18.2 把"并发会话数"列为有配额表的上界。
+        if self.sessions.len() >= self.limits.max_sessions {
+            self.record(0, principal, "", "authenticate", "", code::CAPACITY);
+            return Err(FileError::new(
+                code::CAPACITY,
+                format!(
+                    "max_sessions {} reached; close an idle file session first",
+                    self.limits.max_sessions
+                ),
+            ));
+        }
+        let held_by_peer = self
+            .sessions
+            .values()
+            .filter(|s| s.source == source)
+            .count();
+        if held_by_peer >= self.limits.max_browser_sessions {
+            self.record(0, principal, "", "authenticate", "", code::CAPACITY);
+            return Err(FileError::new(
+                code::CAPACITY,
+                format!(
+                    "peer {source:?} already holds {held_by_peer} of {} browser file sessions",
+                    self.limits.max_browser_sessions
+                ),
+            ));
+        }
         let id = self.next_session;
         self.next_session += 1;
         self.sessions.insert(
@@ -838,6 +1331,7 @@ impl FileEngine {
             FileSession {
                 id,
                 principal: principal.to_string(),
+                source: source.to_string(),
                 inflight_bytes: 0,
                 streams: BTreeMap::new(),
                 last_activity: Instant::now(),
@@ -848,12 +1342,28 @@ impl FileEngine {
         Ok(id)
     }
 
-    pub fn close_session(&mut self, session: u64, source: &str) {
-        if let Some(s) = self.sessions.remove(&session) {
-            for st in s.streams.into_values() {
-                let _ = std::fs::remove_file(&st.part_path);
+    /// Tear a session down. `source` is **not** a parameter on purpose
+    /// (评审 r2 N-8): clearing a throttle bucket by a caller-supplied source only
+    /// works if the caller happens to pass the right one, so the session's own
+    /// recorded source is used and a peer cannot wipe somebody else's lockout.
+    pub fn close_session(&mut self, session: u64) {
+        match self.sessions.remove(&session) {
+            Some(s) => {
+                for st in s.streams.into_values() {
+                    let _ = std::fs::remove_file(&st.part_path);
+                }
+                // 会话没了，它占着的预算条目必须一起释放，否则一次断线就把全节点
+                // 文件类发送预算永久钉死（r2 NEW-2 第 2 点）。
+                self.budget.release_session(session);
+                self.throttle.forget(&s.principal, &s.source);
+                self.record(session, &s.principal, "", "close_session", "", "OK");
             }
-            self.throttle.forget(&s.principal, source);
+            // 未知会话号也要留一行：否则"关不掉"在审计里是隐形的，G21 说的
+            // "漏记在结构上不可发生"就只对已知会话成立（评审 r5 N-8）。
+            None => {
+                let label = session.to_string();
+                self.record(session, "", "", "close_session", &label, code::NOT_FOUND);
+            }
         }
     }
 
@@ -873,6 +1383,7 @@ impl FileEngine {
         }
         for id in &out {
             if let Some(s) = self.sessions.remove(id) {
+                self.budget.release_session(s.id);
                 self.record(s.id, &s.principal, "", "idle_recycle", "", code::IDLE);
             }
         }
@@ -897,9 +1408,26 @@ impl FileEngine {
             .ok_or_else(|| FileError::new(code::NOT_FOUND, format!("no such session {session}")))
     }
 
-    /// Paged listing (G17). Entries are read lazily up to the page cap so a
-    /// 100k-entry directory cannot be materialized as one ack.
+    /// Paged listing (G17). Entries are read lazily up to the page cap **and**
+    /// up to the serialized-ack ceiling, so a 100k-entry directory cannot be
+    /// materialized as one ack and a directory of long names cannot produce an
+    /// oversized ack either (评审 WARN：旧实现只数条目，不看字节).
     pub fn list(
+        &mut self,
+        session: u64,
+        root: &str,
+        rel: &str,
+        offset: usize,
+    ) -> FileResult<ListPage> {
+        let outcome = self.list_inner(session, root, rel, offset);
+        match &outcome {
+            Ok(_) => self.record(session, "", root, "list", rel, "OK"),
+            Err(e) => self.record(session, "", root, "list", rel, e.code),
+        }
+        outcome
+    }
+
+    fn list_inner(
         &mut self,
         session: u64,
         root: &str,
@@ -913,8 +1441,11 @@ impl FileEngine {
         let mut rd = std::fs::read_dir(&abs)
             .map_err(|e| FileError::new(code::NOT_FOUND, format!("{rel:?}: {e}")))?;
         let cap = self.limits.max_entries_per_page;
+        let ack_budget = self.limits.max_ack_bytes;
+        let mut ack_bytes = LIST_ACK_ENVELOPE_BYTES;
         let mut entries = Vec::with_capacity(cap.min(64));
         let mut idx = 0usize;
+        let mut truncated = false;
         loop {
             let next = match rd.next() {
                 Some(Ok(e)) => e,
@@ -925,33 +1456,50 @@ impl FileEngine {
                 idx += 1;
                 continue;
             }
-            if entries.len() == cap {
+            let raw_name = next.file_name().to_string_lossy().replace('\\', "/");
+            // 条目数上限与 ack 字节上限，谁先到谁截断；两者都必须显式报 truncated。
+            if entries.len() >= cap
+                || ack_bytes + ENTRY_ACK_OVERHEAD_BYTES + raw_name.len() > ack_budget
+            {
+                truncated = true;
                 break;
             }
-            let meta = next
-                .metadata()
-                .map_err(|e| FileError::new(code::NOT_FOUND, e.to_string()))?;
+            // 只用 symlink_metadata 的结果：`next.metadata()` 会**跟随**链接，
+            // 于是一个悬空链接就能让整页以 NOT_FOUND 失败（本地用户放一个坏链接
+            // 即可让该目录不可浏览），而且 `is_dir` 会取自 root 外的目标，
+            // 把一个 root 外目录的存在性当 oracle 回给客户端（评审 r2 W-2）。
             let link = next
                 .path()
                 .symlink_metadata()
                 .map_err(|e| FileError::new(code::NOT_FOUND, e.to_string()))?;
-            let name = next.file_name().to_string_lossy().replace('\\', "/");
-            // A symlink inside the directory is *reported* as a symlink and never
-            // traversed by the entry's size read (the escaping case is refused
-            // again in read/stat/write/remove).
+            let is_link = link.file_type().is_symlink();
+            ack_bytes += ENTRY_ACK_OVERHEAD_BYTES + raw_name.len();
             entries.push(Entry {
-                name,
-                is_dir: meta.is_dir(),
-                is_symlink: link.file_type().is_symlink(),
-                size: if link.file_type().is_symlink() {
-                    0
-                } else {
-                    meta.len()
-                },
+                name: raw_name,
+                is_dir: link.is_dir(),
+                is_symlink: is_link,
+                size: if is_link { 0 } else { link.len() },
             });
             idx += 1;
         }
-        let truncated = entries.len() == cap;
+        // 字节上限把一个"应该有进展"的页压成 0 条目时，返回空页等于让客户端
+        // 永远停在同一个 `next_offset == offset`（G17 的单调性被静默破坏，评审 r5
+        // R5-W-3）。这种情况必须显式拒，而不是假装"这一页是空的但没读完"。
+        if truncated && entries.is_empty() {
+            return Err(FileError::new(
+                code::PAGE_TOO_LARGE,
+                format!(
+                    "the next entry of {rel:?} does not fit max_ack_bytes {ack_budget} \
+                     (envelope {ack_bytes} + entry cost); raise max_ack_bytes or list a \
+                     directory with shorter names — returning an empty page would stall \
+                     next_offset at {offset}"
+                ),
+            ));
+        }
+        // G16/W-11：`list` 是引擎能自己算出序列化成本的动词——上面的截断逻辑已经
+        // 累计了 `ack_bytes`，这里就按它过账。预算满时报 `QUEUE_FULL` 且**不回滚**
+        // 目录扫描：目录读成功是事实，只是这一页发不出去，调用方排空后重试即可。
+        self.charge_file(session, ack_bytes)?;
         Ok(ListPage {
             next_offset: offset + entries.len(),
             entries,
@@ -962,6 +1510,10 @@ impl FileEngine {
 
     /// Read one page (G18/G20). `offset + max_bytes` uses checked arithmetic;
     /// `max_bytes` above the configured page ceiling is refused, not clamped.
+    ///
+    /// 审计在这一层统一落账：无论成功还是任何一条拒绝路径，都恰好一行
+    /// （G21）。放在包装层而不是散在各 return 前，是为了让"漏记"在结构上
+    /// 不可能——评审指出旧写法删掉任意一处 `record` 测试都不会红。
     pub fn read_page(
         &mut self,
         session: u64,
@@ -970,12 +1522,30 @@ impl FileEngine {
         offset: u64,
         max_bytes: usize,
     ) -> FileResult<DataPage> {
+        let outcome = self.read_page_inner(session, root, rel, offset, max_bytes);
+        match &outcome {
+            Ok(_) => self.record(session, "", root, "read", rel, "OK"),
+            Err(e) => self.record(session, "", root, "read", rel, e.code),
+        }
+        outcome
+    }
+
+    fn read_page_inner(
+        &mut self,
+        session: u64,
+        root: &str,
+        rel: &str,
+        offset: u64,
+        max_bytes: usize,
+    ) -> FileResult<DataPage> {
         self.touch(session)?;
-        if max_bytes > self.limits.chunk_bytes {
+        if max_bytes == 0 || max_bytes > self.limits.chunk_bytes {
+            // 0 字节请求会让 `next_offset == offset`，破坏 G17 的"next_offset 单调"
+            // （客户端会永远停在同一页），所以显式拒而不是返回空页（评审 r2 W-4）。
             return Err(FileError::new(
                 code::PAGE_TOO_LARGE,
                 format!(
-                    "requested {max_bytes} > chunk_bytes {}",
+                    "requested {max_bytes} must be in 1..=chunk_bytes {}",
                     self.limits.chunk_bytes
                 ),
             ));
@@ -1001,7 +1571,6 @@ impl FileEngine {
         // inside the root and still not a symlink.
         if let Err(e) = r.reverify(&abs, rel) {
             self.handles.release(session, &key);
-            self.record(session, "", root, "read", rel, e.code);
             return Err(e);
         }
         let len = match f.metadata() {
@@ -1039,7 +1608,8 @@ impl FileEngine {
         // 同步读完即释放：`File` 在这里离开作用域，注册表也必须在这里一起结束。
         // 只在 eof 时释放会让每个非末页驻留一个"活句柄"，正是 V1 每片一条流的翻版。
         self.handles.release(session, &key);
-        self.record(session, "", root, "read", rel, "OK");
+        // 页字节走共享预算：满则显式拒绝（拉式协议下客户端必须先 ack 上一页）。
+        self.charge_file(session, buf.len())?;
         Ok(DataPage {
             bytes: buf,
             offset,
@@ -1057,13 +1627,26 @@ impl FileEngine {
         rel: &str,
         declared_len: Option<u64>,
     ) -> FileResult<u64> {
+        let outcome = self.open_upload_inner(session, root, rel, declared_len);
+        match &outcome {
+            Ok(_) => self.record(session, "", root, "open_upload", rel, "OK"),
+            Err(e) => self.record(session, "", root, "open_upload", rel, e.code),
+        }
+        outcome
+    }
+
+    fn open_upload_inner(
+        &mut self,
+        session: u64,
+        root: &str,
+        rel: &str,
+        declared_len: Option<u64>,
+    ) -> FileResult<u64> {
         self.touch(session)?;
-        let r = self.root(root)?;
+        let r = self.root(root)?.clone();
         r.require_writable()?;
-        let name = r.name().to_string();
         if let Some(n) = declared_len {
             if n > self.limits.max_upload_bytes {
-                self.record(session, "", &name, "open_upload", rel, code::CAPACITY);
                 return Err(FileError::new(
                     code::CAPACITY,
                     format!(
@@ -1073,25 +1656,13 @@ impl FileEngine {
                 ));
             }
         }
-        let abs = match r.resolve(rel) {
-            Ok(p) => p,
-            Err(e) if e.code == code::NOT_FOUND => {
-                // Not existing yet is the normal case for an upload target.
-                r.canonical.join(rel)
-            }
-            Err(e) => {
-                self.record(session, "", &name, "open_upload", rel, e.code);
-                return Err(e);
-            }
-        };
-        if let Err(e) = r.reverify_parent(&abs, rel) {
-            self.record(session, "", &name, "open_upload", rel, e.code);
-            return Err(e);
-        }
+        // resolve() 不再对缺失路径提前返回：目标不存在是上传的正常情况，
+        // 而 `..`/符号链接/越界必须在这里就拒，绝不退化到未校验的 join。
+        let abs = r.resolve(rel)?;
+        r.reverify_parent(&abs, rel)?;
         // Refuse when the final target already exists: publishing must not
         // replace it (G14), so we also refuse to start a stream that cannot land.
         if abs.exists() {
-            self.record(session, "", &name, "open_upload", rel, code::EXISTS);
             return Err(FileError::new(
                 code::EXISTS,
                 format!("{rel:?} already exists"),
@@ -1105,25 +1676,37 @@ impl FileEngine {
             .write(true)
             .create_new(true)
             .open(&part)
-            .map_err(|e| FileError::new(code::CAPACITY, format!("cannot create part file: {e}")))?;
+            .map_err(|e| {
+                // 评审 r3 N-3（原 r2 N-3）：预置同名/链接的 `.part` 被拒是**授权面**
+                // 问题，过去一律记成 CAPACITY_UNAVAILABLE，审计行跟着归因错。
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    FileError::new(
+                        code::EXISTS,
+                        format!("part file name was already taken: {e}"),
+                    )
+                } else {
+                    FileError::new(code::CAPACITY, format!("cannot create part file: {e}"))
+                }
+            })?;
         let s = self.session_mut(session)?;
         s.streams.insert(
             id,
             UploadStream {
                 id,
                 session,
+                root: root.to_string(),
                 rel: rel.to_string(),
                 staged: 0,
                 declared_len,
                 hasher: Sha256::new(),
                 hashed_bytes: 0,
+                rehash_bytes: 0,
                 part_path: part.clone(),
                 file,
                 last_activity: Instant::now(),
             },
         );
         s.last_activity = Instant::now();
-        self.record(session, "", &name, "open_upload", rel, "OK");
         Ok(id)
     }
 
@@ -1131,7 +1714,26 @@ impl FileEngine {
     /// a chunk at the current prefix appends and advances; a fully duplicate page
     /// must match byte-for-byte and advances nothing; a jump or an overlapping
     /// mismatch is refused and the prefix is never rewritten.
+    ///
+    /// 只记**拒绝**：逐片成功行会把有界审计环冲满（一个 2 GiB 上传就是 32768 行），
+    /// 而成功路径由"连续前缀 ack + commit 行"完整覆盖（G21 要的是可归因，不是刷屏）。
     pub fn stage_chunk(
+        &mut self,
+        session: u64,
+        stream: u64,
+        offset: u64,
+        bytes: &[u8],
+    ) -> FileResult<u64> {
+        let outcome = self.stage_chunk_inner(session, stream, offset, bytes);
+        if let Err(e) = &outcome {
+            let label = stream.to_string();
+            let root = self.stream_root(session, stream).unwrap_or_default();
+            self.record(session, "", &root, "stage_chunk", &label, e.code);
+        }
+        outcome
+    }
+
+    fn stage_chunk_inner(
         &mut self,
         session: u64,
         stream: u64,
@@ -1182,12 +1784,11 @@ impl FileEngine {
             st.file
                 .flush()
                 .map_err(|e| FileError::new(code::CAPACITY, e.to_string()))?;
-            // Bounded re-hash budget: hashing an unbounded declared size is itself DoS.
-            if st.hashed_bytes < rehash_budget {
-                let take = (rehash_budget - st.hashed_bytes).min(bytes.len() as u64) as usize;
-                st.hasher.update(&bytes[..take]);
-                st.hashed_bytes += take as u64;
-            }
+            // 顺序到达的字节直接进摘要：这部分成本已经由 `max_upload_bytes` 封顶，
+            // 再用 rehash 预算去截断它，等于让"大于预算的工件永远无法带摘要发布"
+            // （评审 WARN：把回读预算误用成验证门）。
+            st.hasher.update(bytes);
+            st.hashed_bytes += bytes.len() as u64;
             st.staged = end;
             s.last_activity = Instant::now();
             return Ok(st.staged);
@@ -1203,6 +1804,22 @@ impl FileEngine {
                     ),
                 ));
             }
+            // 这才是 rehash 预算真正覆盖的成本：恶意客户端反复重放已暂存的页，
+            // 服务端每次都从磁盘回读。超过预算就显式拒绝，不是静默少算。
+            let reread = st
+                .rehash_bytes
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| FileError::new(code::OVERFLOW, "rehash accounting overflow"))?;
+            if reread > rehash_budget {
+                return Err(FileError::new(
+                    code::CAPACITY,
+                    format!(
+                        "duplicate-page re-read budget {rehash_budget} exceeded \
+                         (replayed {reread} bytes)"
+                    ),
+                ));
+            }
+            st.rehash_bytes = reread;
             let mut buf = vec![0u8; bytes.len()];
             st.file
                 .seek(SeekFrom::Start(offset))
@@ -1227,18 +1844,29 @@ impl FileEngine {
     }
 
     /// Ack after staging: contiguous bytes, capped so the ack itself can never
-    /// exceed the send budget (G17).
-    pub fn ack_staged(&self, session: u64, stream: u64) -> FileResult<u64> {
-        let s = self.session(session)?;
-        let st = s
-            .streams
-            .get(&stream)
-            .ok_or_else(|| FileError::new(code::NOT_FOUND, format!("no such stream {stream}")))?;
-        Ok(st.staged)
+    /// exceed the send budget (G17). 成功不写审计行（逐片 ack 会灌满环，与
+    /// `stage_chunk` 同一口径），拒绝必须写。
+    pub fn ack_staged(&mut self, session: u64, stream: u64) -> FileResult<u64> {
+        let outcome = (|| -> FileResult<u64> {
+            let s = self.session(session)?;
+            let st = s.streams.get(&stream).ok_or_else(|| {
+                FileError::new(code::NOT_FOUND, format!("no such stream {stream}"))
+            })?;
+            Ok(st.staged)
+        })();
+        if let Err(e) = &outcome {
+            let label = stream.to_string();
+            let root = self.stream_root(session, stream).unwrap_or_default();
+            self.record(session, "", &root, "ack_staged", &label, e.code);
+        }
+        outcome
     }
 
     /// Commit: verify length and (when within the rehash budget) the digest, then
     /// publish with a **non-overwriting** hard link (G14/G18).
+    ///
+    /// 审计在包装层统一落一行（成功用发布后的路径，拒绝用流里记录的 rel），
+    /// 这样任何一条提前 return 的拒绝路径都不可能漏记。
     pub fn commit_upload(
         &mut self,
         session: u64,
@@ -1246,9 +1874,51 @@ impl FileEngine {
         stream: u64,
         expected_sha256: Option<[u8; 32]>,
     ) -> FileResult<String> {
+        let audit_rel = self
+            .sessions
+            .get(&session)
+            .and_then(|s| s.streams.get(&stream))
+            .map(|st| st.rel.clone())
+            .unwrap_or_else(|| format!("stream {stream}"));
+        let outcome = self.commit_upload_inner(session, root, stream, expected_sha256);
+        match &outcome {
+            Ok(published) => self.record(session, "", root, "commit", published, "OK"),
+            Err(e) => self.record(session, "", root, "commit", &audit_rel, e.code),
+        }
+        outcome
+    }
+
+    fn commit_upload_inner(
+        &mut self,
+        session: u64,
+        root: &str,
+        stream: u64,
+        expected_sha256: Option<[u8; 32]>,
+    ) -> FileResult<String> {
         self.touch(session)?;
+        // 流绑死在打开它的那个 root 上（评审 r2 NEW-1）：提交时换一个 root 参数
+        // 曾可以把可写根上开的流发布进 `read_only` 根，或把 SFTP 根的远端路径
+        // 丢给本地解析器 `hard_link`。授权面只有 G13 的 root 一个。
+        let opened_on = {
+            let s = self.session(session)?;
+            let st = s.streams.get(&stream).ok_or_else(|| {
+                FileError::new(code::NOT_FOUND, format!("no such stream {stream}"))
+            })?;
+            st.root.clone()
+        };
+        if opened_on != root {
+            return Err(FileError::new(
+                code::OUTSIDE_ROOT,
+                format!(
+                    "stream {stream} was opened on root {opened_on:?}; \
+                     refusing to publish through {root:?}"
+                ),
+            ));
+        }
         let r = self.root(root)?.clone();
-        let (rel, staged, part, file, digest_complete, digest) = {
+        r.require_writable()?;
+        r.require_local_io()?;
+        let (rel, part, file, digest_complete, digest) = {
             let s = self.session_mut(session)?;
             let st = s.streams.get_mut(&stream).ok_or_else(|| {
                 FileError::new(code::NOT_FOUND, format!("no such stream {stream}"))
@@ -1261,8 +1931,10 @@ impl FileEngine {
                     ));
                 }
             }
+            // 发布前唯一一次 fsync：`.part` 落盘后才允许 hard_link 曝光，
+            // 否则"已提交"的文件可能是零长度（评审 WARN：ack 不得自称 durable）。
             st.file
-                .flush()
+                .sync_all()
                 .map_err(|e| FileError::new(code::CAPACITY, e.to_string()))?;
             let digest_complete = st.hashed_bytes >= st.staged;
             let digest = st.hasher.clone().finalize();
@@ -1272,7 +1944,6 @@ impl FileEngine {
             }
             (
                 st.rel.clone(),
-                st.staged,
                 st.part_path.clone(),
                 st.file
                     .try_clone()
@@ -1289,16 +1960,20 @@ impl FileEngine {
                 ));
             }
             if digest != exp {
-                self.abort_upload(session, stream);
-                self.record(session, "", root, "commit", &rel, code::INTEGRITY);
+                self.discard_stream(session, stream);
                 return Err(FileError::new(code::INTEGRITY, "sha256 mismatch"));
             }
         }
-        let target = r.resolve(&rel).unwrap_or_else(|_| r.canonical.join(&rel));
+        let target = match r.resolve(&rel) {
+            Ok(p) => p,
+            Err(e) => {
+                self.discard_stream(session, stream);
+                return Err(e);
+            }
+        };
         if let Err(e) = r.reverify_parent(&target, &rel) {
             // 发布前的目录级复核失败：这条流不可能落地，清掉暂存物再返回。
-            self.abort_upload(session, stream);
-            self.record(session, "", root, "commit", &rel, e.code);
+            self.discard_stream(session, stream);
             return Err(e);
         }
         // Non-overwriting publish. `hard_link` fails if the destination exists,
@@ -1316,19 +1991,18 @@ impl FileEngine {
             // 已承认前缀供续传（G18），而"目标已存在"这条流永远不可能成功，
             // 留着只会变成无人负责的中转字节（E4 场景实测抓到的正是这个残留）。
             drop(file);
-            self.abort_upload(session, stream);
-            self.record(session, "", root, "commit", &rel, err.code);
+            self.discard_stream(session, stream);
             return Err(err);
         }
         drop(file);
         let _ = std::fs::remove_file(&part);
         self.session_mut(session)?.streams.remove(&stream);
-        self.record(session, "", root, "commit", &rel, "OK");
-        let _ = staged;
         Ok(r.display_rel(&target))
     }
 
-    pub fn abort_upload(&mut self, session: u64, stream: u64) {
+    /// Discard a stream and its staged bytes. Used internally by refusals that
+    /// already write their own audit line (commit), so it does not record here.
+    fn discard_stream(&mut self, session: u64, stream: u64) {
         if let Some(s) = self.sessions.get_mut(&session) {
             if let Some(st) = s.streams.remove(&stream) {
                 let _ = std::fs::remove_file(&st.part_path);
@@ -1336,19 +2010,44 @@ impl FileEngine {
         }
     }
 
+    /// Client-initiated abort: destructive (it deletes already-staged bytes), so
+    /// it must leave an audit line like every other client verb (评审 r2 W-5).
+    pub fn abort_upload(&mut self, session: u64, stream: u64) {
+        let located = self
+            .sessions
+            .get(&session)
+            .and_then(|s| s.streams.get(&stream))
+            .map(|st| (st.root.clone(), st.rel.clone()));
+        self.discard_stream(session, stream);
+        match located {
+            Some((root, rel)) => self.record(session, "", &root, "abort_upload", &rel, "OK"),
+            None => {
+                let label = stream.to_string();
+                self.record(session, "", "", "abort_upload", &label, code::NOT_FOUND);
+            }
+        }
+    }
+
     pub fn mkdir(&mut self, session: u64, root: &str, rel: &str) -> FileResult<()> {
+        let outcome = self.mkdir_inner(session, root, rel);
+        match &outcome {
+            Ok(_) => self.record(session, "", root, "mkdir", rel, "OK"),
+            Err(e) => self.record(session, "", root, "mkdir", rel, e.code),
+        }
+        outcome
+    }
+
+    fn mkdir_inner(&mut self, session: u64, root: &str, rel: &str) -> FileResult<()> {
         self.touch(session)?;
         let r = self.root(root)?.clone();
         r.require_writable()?;
-        let name = r.name().to_string();
-        // The target may not exist yet; its parent must resolve inside the root
-        // without traversing any symlink, and the target itself must not already
-        // be a symlink.
-        let abs = r.canonical.join(rel);
-        r.reverify_parent(&abs, rel)?;
+        // The target may not exist yet; every existing component (including the
+        // parent) must resolve inside the root without traversing any symlink,
+        // and the target itself must not already be a symlink.
+        let abs = r.resolve(rel)?;
+        r.reverify_ancestor(&abs, rel)?;
         if let Ok(meta) = std::fs::symlink_metadata(&abs) {
             if meta.file_type().is_symlink() {
-                self.record(session, "", &name, "mkdir", rel, code::SYMLINK_ESCAPE);
                 return Err(FileError::new(
                     code::SYMLINK_ESCAPE,
                     format!("{rel:?} is already a symlink"),
@@ -1357,14 +2056,28 @@ impl FileEngine {
         }
         std::fs::create_dir_all(&abs)
             .map_err(|e| FileError::new(code::CAPACITY, format!("mkdir {rel:?}: {e}")))?;
-        self.record(session, "", &name, "mkdir", rel, "OK");
         Ok(())
     }
 
     /// Remove one entry; recursion is bounded to the root and refuses to follow
-    /// any symlink (G13). `remove_all_in_root` is only ever called with paths
+    /// any symlink (G13). `remove_tree` is only ever called with paths
     /// that resolved inside the root component-by-component.
     pub fn remove(
+        &mut self,
+        session: u64,
+        root: &str,
+        rel: &str,
+        recursive: bool,
+    ) -> FileResult<usize> {
+        let outcome = self.remove_inner(session, root, rel, recursive);
+        match &outcome {
+            Ok(_) => self.record(session, "", root, "remove", rel, "OK"),
+            Err(e) => self.record(session, "", root, "remove", rel, e.code),
+        }
+        outcome
+    }
+
+    fn remove_inner(
         &mut self,
         session: u64,
         root: &str,
@@ -1374,12 +2087,10 @@ impl FileEngine {
         self.touch(session)?;
         let r = self.root(root)?.clone();
         r.require_writable()?;
-        let name = r.name().to_string();
         let abs = r.resolve(rel)?;
         let meta = std::fs::symlink_metadata(&abs)
             .map_err(|e| FileError::new(code::NOT_FOUND, format!("{rel:?}: {e}")))?;
         if meta.file_type().is_symlink() {
-            self.record(session, "", &name, "remove", rel, code::SYMLINK_ESCAPE);
             return Err(FileError::new(
                 code::SYMLINK_ESCAPE,
                 format!("{rel:?} is a symlink"),
@@ -1400,7 +2111,6 @@ impl FileEngine {
         } else {
             removed += 1;
         }
-        self.record(session, "", &name, "remove", rel, "OK");
         Ok(removed)
     }
 
@@ -1435,45 +2145,79 @@ impl FileEngine {
     }
 
     pub fn rename(&mut self, session: u64, root: &str, from: &str, to: &str) -> FileResult<()> {
+        let outcome = self.rename_inner(session, root, from, to);
+        match &outcome {
+            // 审计行的 rel 记源路径；目标在错误消息里（一条操作只留一行）。
+            Ok(_) => self.record(session, "", root, "rename", from, "OK"),
+            Err(e) => self.record(session, "", root, "rename", from, e.code),
+        }
+        outcome
+    }
+
+    fn rename_inner(&mut self, session: u64, root: &str, from: &str, to: &str) -> FileResult<()> {
         self.touch(session)?;
         let r = self.root(root)?.clone();
         r.require_writable()?;
-        let name = r.name().to_string();
         let src = r.resolve(from)?;
-        let dst = r.resolve(to).unwrap_or_else(|_| r.canonical.join(to));
+        let dst = r.resolve(to)?;
         r.reverify(&src, from)?;
         r.reverify_parent(&dst, to)?;
         if dst.exists() {
-            self.record(session, "", &name, "rename", from, code::EXISTS);
             return Err(FileError::new(code::EXISTS, format!("{to:?} exists")));
         }
+        // `rename(2)` 的语义是**静默替换**，所以"先 exists 再 rename"在两个会话之间
+        // （或会话与本地写者之间）存在窗口，目标一出现就覆盖原字节（评审 r2 W-3）。
+        // 文件走原子路径：`hard_link` 对已存在目标必失败，成功再删源名；
+        // 删源失败就回滚新名，绝不留下两个指向同一数据的名字。
+        let src_is_dir = std::fs::metadata(&src)
+            .map_err(|e| FileError::new(code::NOT_FOUND, format!("{from:?}: {e}")))?
+            .is_dir();
+        if !src_is_dir {
+            if let Err(e) = std::fs::hard_link(&src, &dst) {
+                return Err(if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    FileError::new(
+                        code::EXISTS,
+                        format!("{to:?} exists; refusing to overwrite"),
+                    )
+                } else {
+                    FileError::new(code::CAPACITY, format!("rename link failed: {e}"))
+                });
+            }
+            if let Err(e) = std::fs::remove_file(&src) {
+                let _ = std::fs::remove_file(&dst);
+                return Err(FileError::new(
+                    code::CAPACITY,
+                    format!("rename unlink failed, rolled back: {e}"),
+                ));
+            }
+            return Ok(());
+        }
+        // 目录：std 下拿不到"目标存在即失败"的原子改名（`hard_link` 对目录失败），
+        // 这个窗口是**声明过的残余**，见 MODULE.md G13/PRODUCT §18.4——目录改名可能
+        // 覆盖并发创建的同名目标，不提供无覆盖保证。
         std::fs::rename(&src, &dst)
             .map_err(|e| FileError::new(code::CAPACITY, format!("rename failed: {e}")))?;
-        self.record(session, "", &name, "rename", from, "OK");
         Ok(())
     }
 
     pub fn stat(&mut self, session: u64, root: &str, rel: &str) -> FileResult<Entry> {
+        let outcome = self.stat_inner(session, root, rel);
+        match &outcome {
+            // 成功同样留一行：旧实现只记拒绝，"谁看了哪个文件"查不出来。
+            Ok(_) => self.record(session, "", root, "stat", rel, "OK"),
+            Err(e) => self.record(session, "", root, "stat", rel, e.code),
+        }
+        outcome
+    }
+
+    fn stat_inner(&mut self, session: u64, root: &str, rel: &str) -> FileResult<Entry> {
         self.touch(session)?;
         let r = self.root(root)?.clone();
         r.require_local_io()?;
-        let abs = match r.resolve(rel) {
-            Ok(p) => p,
-            Err(err) => {
-                // G21: 拒绝也要留痕。
-                self.record(session, "", root, "stat", rel, err.code);
-                return Err(err);
-            }
-        };
-        let meta = match std::fs::symlink_metadata(&abs) {
-            Ok(m) => m,
-            Err(e) => {
-                self.record(session, "", root, "stat", rel, code::NOT_FOUND);
-                return Err(FileError::new(code::NOT_FOUND, format!("{rel:?}: {e}")));
-            }
-        };
+        let abs = r.resolve(rel)?;
+        let meta = std::fs::symlink_metadata(&abs)
+            .map_err(|e| FileError::new(code::NOT_FOUND, format!("{rel:?}: {e}")))?;
         if meta.file_type().is_symlink() {
-            self.record(session, "", root, "stat", rel, code::SYMLINK_ESCAPE);
             return Err(FileError::new(
                 code::SYMLINK_ESCAPE,
                 format!("{rel:?} is a symlink"),
@@ -1488,6 +2232,12 @@ impl FileEngine {
     }
 
     /// Every operation, including refusals, leaves one audit line (G21).
+    ///
+    /// 日志本身是**有界**的，而且是**字节**有界（评审 r5 R5-W-4）：行数封顶
+    /// `AUDIT_CAPACITY`，每个调用方可控字段裁到 `AUDIT_FIELD_MAX_BYTES` 并带
+    /// `[+NB]` 截断标记——只写"行数有界"是不成立的，因为 `principal` 在令牌
+    /// 校验之前就被写下、`rel` 由调用方给，未认证者本可以把每行写成任意大。
+    /// 超出容量时丢最旧的一条并累加 `audit_dropped`，丢弃本身可观测，不是静默的。
     fn record(
         &mut self,
         session: u64,
@@ -1497,18 +2247,69 @@ impl FileEngine {
         rel: &str,
         result_code: &str,
     ) {
-        self.audit.push(AuditRecord {
+        // 审计行必须带真实 principal：调用点传空串时从会话解析，
+        // 否则拒绝记录只有会话号，事后无法归因（G21"可审计的拒绝"）。
+        let principal = if principal.is_empty() {
+            self.sessions
+                .get(&session)
+                .map(|s| s.principal.clone())
+                .unwrap_or_default()
+        } else {
+            principal.to_string()
+        };
+        if self.audit.len() >= AUDIT_CAPACITY {
+            self.audit.pop_front();
+            self.audit_dropped += 1;
+        }
+        self.audit.push_back(AuditRecord {
             session,
-            principal: principal.to_string(),
-            root: root.to_string(),
+            principal: bounded_label(&principal, AUDIT_FIELD_MAX_BYTES),
+            root: bounded_label(root, AUDIT_FIELD_MAX_BYTES),
             action,
-            rel: rel.to_string(),
+            rel: bounded_label(rel, AUDIT_FIELD_MAX_BYTES),
             result_code: result_code.to_string(),
         });
     }
 }
 
 impl SandboxRoot {
+    /// Verify the *deepest existing ancestor* of a create target resolves inside
+    /// the root and is not a symlink. `mkdir` needs this rather than
+    /// [`reverify_parent`]: it creates a whole chain (`a/b/c`), so the immediate
+    /// parent legitimately does not exist yet.
+    ///
+    /// 这是 F4 修复的配套一件：`resolve` 不再截断缺失路径之后，"父目录必须已存在"
+    /// 的复核会把 `mkdir a/b` 一起拒掉（Linux 实测红过一条，见 green evidence）。
+    /// 组件级检查仍然成立——`resolve` 已经逐段拒过符号链接。
+    pub fn reverify_ancestor(&self, abs: &Path, rel: &str) -> FileResult<()> {
+        let mut cur = abs.to_path_buf();
+        loop {
+            match std::fs::symlink_metadata(&cur) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        return Err(FileError::new(
+                            code::SYMLINK_ESCAPE,
+                            format!("ancestor of {rel:?} is a symlink: {cur:?}"),
+                        ));
+                    }
+                    let canon = cur
+                        .canonicalize()
+                        .map_err(|e| FileError::new(code::NOT_FOUND, format!("{rel:?}: {e}")))?;
+                    return Self::ensure_within(&self.canonical, &canon, rel);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if !cur.pop() {
+                        return Err(FileError::new(
+                            code::OUTSIDE_ROOT,
+                            format!("{rel:?} has no ancestor inside the root"),
+                        ));
+                    }
+                }
+                Err(e) => return Err(FileError::new(code::NOT_FOUND, format!("{rel:?}: {e}"))),
+            }
+        }
+    }
+
     /// Verify the *parent* directory of a create/publish target resolves inside
     /// the root and is not reached through a symlink. The final component may
     /// not exist yet, which is why this is separate from `reverify`.
@@ -1527,6 +2328,13 @@ impl SandboxRoot {
 /// pre-planted (G14/G21). Entropy note: this uses process id + wall clock +
 /// stream id, not a stack address (V2 §13 flagged the stack-address seed as an
 /// unjustified entropy claim).
+///
+/// 竞争窗口是**声明过的**（评审 F5）：`create_new(true)` = `O_CREAT|O_EXCL`，
+/// 在 Linux/POSIX 上对已存在的符号链接同样返回 `EEXIST` 而不跟随它，所以
+/// "预置一个 `.part` 符号链接"这条攻击面是被拒的，不是靠 `O_NOFOLLOW`；
+/// 但"父目录被换成链接"这一类 TOCTOU 仍然只能靠 `reverify_parent` 的事前/事后
+/// 两次检查夹住，std 下没有第三道闸。这条残余风险写在 G13 与 `PRODUCT.md` §18.3
+/// 的平台矩阵里，不假装它不存在。
 fn part_path(target: &Path, stream: u64) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1599,6 +2407,24 @@ mod tests {
     fn engine(dir: &Path) -> FileEngine {
         let root = SandboxRoot::open("downloads", dir, false).unwrap();
         FileEngine::new(FileLimits::default(), vec![root], "s3cret").unwrap()
+    }
+
+    /// Recursive listing (no `walkdir` dependency: the crate is std-only).
+    fn walkdir(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(p) = stack.pop() {
+            if let Ok(rd) = std::fs::read_dir(&p) {
+                for e in rd.flatten() {
+                    let path = e.path();
+                    if path.is_dir() {
+                        stack.push(path.clone());
+                    }
+                    out.push(path);
+                }
+            }
+        }
+        out
     }
 
     #[test]
@@ -1732,7 +2558,7 @@ mod tests {
             "naive single-canonicalize resolver was supposed to escape: {naive:?}"
         );
         assert!(std::fs::read(outside.join("secret.txt")).is_ok());
-        e.close_session(s, "loopback");
+        e.close_session(s);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&outside);
     }
@@ -1771,7 +2597,45 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains("nexus-part"))
             .collect();
         assert_eq!(leftovers.len(), 0);
-        e.close_session(s, "loopback");
+        e.close_session(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rehash_budget_covers_replay_not_digest_publishing() {
+        // 评审 WARN：旧实现把 `max_rehash_bytes_per_stream` 当**验证门**用，
+        // 于是大于该预算的工件永远拿不到摘要，无法带 `expected_sha256` 发布。
+        // 现在预算只覆盖"重放页的磁盘回读"，顺序字节一直进摘要。
+        let dir = tmp("rehash");
+        let l = FileLimits {
+            chunk_bytes: 8,
+            max_rehash_bytes_per_stream: 16,
+            ..Default::default()
+        };
+        let root = SandboxRoot::open("downloads", &dir, false).unwrap();
+        let mut e = FileEngine::new(l, vec![root], "s3cret").unwrap();
+        let s = e.authenticate("u", "loopback", "s3cret").unwrap();
+        let payload: Vec<u8> = (0..48u8).collect(); // 48 > 16 的 rehash 预算
+        let want: [u8; 32] = Sha256::digest(&payload).into();
+        let id = e.open_upload(s, "downloads", "big.bin", Some(48)).unwrap();
+        for (i, chunk) in payload.chunks(8).enumerate() {
+            e.stage_chunk(s, id, (i * 8) as u64, chunk).unwrap();
+        }
+        assert_eq!(e.ack_staged(s, id).unwrap(), 48);
+        // 顺序上传全程在预算之外，摘要仍然完整可用：发布必须成功。
+        let name = e.commit_upload(s, "downloads", id, Some(want)).unwrap();
+        assert_eq!(name, "big.bin");
+        assert_eq!(std::fs::read(dir.join("big.bin")).unwrap(), payload);
+
+        // 重放侧：同一页反复回读，超过预算就显式拒绝，不是静默少算。
+        let id2 = e.open_upload(s, "downloads", "b2.bin", Some(8)).unwrap();
+        e.stage_chunk(s, id2, 0, &payload[..8]).unwrap();
+        for _ in 0..2 {
+            e.stage_chunk(s, id2, 0, &payload[..8]).unwrap(); // 8 + 8 = 16 == 预算
+        }
+        let err = e.stage_chunk(s, id2, 0, &payload[..8]).unwrap_err();
+        assert_eq!(err.code, code::CAPACITY, "回读预算必须封顶重放成本: {err}");
+        e.abort_upload(s, id2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1818,7 +2682,7 @@ mod tests {
             0,
             "refused publish must not leave .part behind"
         );
-        e.close_session(s, "loopback");
+        e.close_session(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1859,13 +2723,487 @@ mod tests {
     fn terminal_class_has_priority_over_file_class() {
         let mut b = SendBudget::new(100);
         for _ in 0..10 {
-            b.push_file(10).unwrap();
+            b.push_file(1, 10).unwrap();
         }
-        assert_eq!(b.push_file(10).unwrap_err().code, code::QUEUE_FULL);
+        assert_eq!(b.push_file(1, 10).unwrap_err().code, code::QUEUE_FULL);
         assert_eq!(b.file_drops, 1);
-        assert!(b.push_terminal(50).is_ok());
-        assert_eq!(b.terminal_delivered, 1);
+        assert_eq!(b.pending_file_messages(), 10);
+        assert_eq!(b.file_buffered_for(1), 100);
+        // 一条 50 字节的 terminal 消息要挤掉 **5 条** file 消息，账上必须记 5，
+        // 不是"发生过一次挤占"（评审 r1 F2：旧实现 `usize::from(freed > 0)` 恒为 1）。
+        // 挤掉的**是谁的消息**也必须报出来，否则会话侧的 in-flight 永远冲不回去
+        // （评审 r2 NEW-2 第 1 点）。
+        let (evicted, ok) = b.push_terminal(50);
+        assert!(ok.is_ok());
+        assert_eq!(evicted.len(), 5, "返回值就是被挤掉的消息清单");
+        assert!(evicted.iter().all(|(s, n)| *s == 1 && *n == 10));
+        assert_eq!(b.terminal_accepted, 1);
         assert_eq!(b.terminal_drops, 0);
+        assert_eq!(b.file_drops, 6, "1 条被拒 + 5 条被挤掉");
+        assert_eq!(b.pending_file_messages(), 5);
+        assert_eq!(b.file_buffered_for(1), 50);
+        assert_eq!(b.buffered(), 100);
+        b.settle_terminal(50);
+        // 严格 FIFO：队头不是这个会话的，就不许越过它去释放后面的
+        // （评审 r3 R3-W-4：旧实现扫全队列，等于给还在缓冲里的字节提前退额度）。
+        assert_eq!(b.settle_file(2, 50), 0);
+        b.push_file(2, 20).unwrap();
+        assert_eq!(
+            b.settle_file(2, 20),
+            0,
+            "队头是会话 1 的消息，会话 2 不得插队释放"
+        );
+        assert_eq!(b.file_buffered_for(2), 20);
+        assert_eq!(b.settle_file(1, 10), 10);
+        assert_eq!(b.settle_file(1, 4), 0, "部分 settle 不得虚报：整条才能出队");
+        // 会话 2 的消息排在会话 1 的**四条**之后，只能等它们全部落地。
+        assert_eq!(b.settle_file(2, 20), 0, "队头仍是会话 1，会话 2 不得插队");
+        assert_eq!(
+            b.settle_file(1, 40),
+            40,
+            "一次 settle 可以连续冲多条本会话消息"
+        );
+        assert_eq!(b.settle_file(2, 20), 20, "队头轮到会话 2 后才释放");
+        assert_eq!(b.file_buffered_for(1), 0);
+        assert_eq!(b.pending_file_messages(), 0);
+        // 会话消失：它占着的全部条目一次释放（close/sweep 走的就是这条）。
+        b.push_file(9, 12).unwrap();
+        b.push_file(9, 8).unwrap();
+        b.push_file(7, 5).unwrap();
+        assert_eq!(b.release_session(9), 20);
+        assert_eq!(b.file_buffered_for(7), 5, "别的会话不得被连带释放");
+        b.settle_terminal(50);
+        assert_eq!(b.terminal_buffered, 0);
+    }
+
+    #[test]
+    fn failed_terminal_send_still_hands_back_the_evicted_list() {
+        // 评审 r3 R3-NEW-1：旧签名 `FileResult<Vec<..>>` 在失败分支把清单随 Err
+        // 一起丢掉，而挤占**已经发生**并计入 file_drops ⇒ 那些会话的 in-flight
+        // 额度永久悬空，G16 自己的不变量 `inflight == budget.file_buffered_for`
+        // 反向背离且没有释放 API。
+        let mut d = SendBudget::new(100);
+        let (ev0, ok0) = d.push_terminal(80);
+        assert!(ok0.is_ok() && ev0.is_empty());
+        d.push_file(1, 15).unwrap();
+        let (ev1, res1) = d.push_terminal(30);
+        assert!(
+            res1.is_err(),
+            "终端字节占位时腾不出空间必须硬失败，不得静默挤"
+        );
+        assert_eq!(ev1, vec![(1, 15)], "失败路径也必须交回被挤掉的消息");
+        assert_eq!(d.file_drops, 1);
+        assert_eq!(d.file_buffered_for(1), 0);
+
+        // 一条比整个预算还大的消息：一条文件消息都不该挤。
+        let mut e = SendBudget::new(100);
+        e.push_file(1, 10).unwrap();
+        let (ev, res) = e.push_terminal(200);
+        assert!(res.is_err());
+        assert!(ev.is_empty(), "不可能发出去的终端消息不得白赔文件字节");
+        assert_eq!(e.file_drops, 0);
+        assert_eq!(e.pending_file_messages(), 1);
+
+        // 引擎侧：失败发送之后额度必须已回冲（inflight_matches_budget 是引擎自证）。
+        // 夹具要满足 G12：ack 下限 124 ≤ 预算，所以预算取 128。
+        let dir = tmp("terminal-fail");
+        let l = FileLimits {
+            chunk_bytes: 32,
+            max_inflight_bytes_per_session: 128,
+            max_ack_bytes: 128,
+            max_buffered_amount: 128,
+            ..Default::default()
+        };
+        let root = SandboxRoot::open("downloads", &dir, false).unwrap();
+        let mut eng = FileEngine::new(l, vec![root], "s3cret").unwrap();
+        let s = eng.authenticate("u", "loopback", "s3cret").unwrap();
+        eng.send_terminal(96).unwrap();
+        eng.send_file_message(s, 16).unwrap();
+        assert_eq!(eng.inflight_bytes(s), 16);
+        assert!(
+            eng.send_terminal(96).is_err(),
+            "终端字节占位 + 已无文件消息可挤 ⇒ 必须硬失败，不得静默挤"
+        );
+        assert_eq!(eng.budget().file_drops, 1, "被挤掉的那条要计入");
+        assert_eq!(
+            eng.inflight_bytes(s),
+            0,
+            "被挤掉的 16 字节必须已回冲会话额度"
+        );
+        assert!(eng.inflight_matches_budget(s));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lockout_rearms_after_expiry_and_flood_arms_are_not_exempt() {
+        // 评审 r3 R3-NEW-2 / R3-W-2：
+        //  (a) 全局窗口旧写法只作用于"不在 buckets 里"的主体 ⇒ 把表填满的那批
+        //      principal 恰好被豁免，反而永久绕开锁定点；
+        //  (b) `locked` 的到期项从不回收 ⇒ 灌满之后 record_failure 只能设全局窗口，
+        //      叠加 (a) 就是"已在册主体永远锁不住"；
+        //  (c) 溢出计数只增不减 ⇒ 一次洪水之后每窗口一条伪造失败就能无限续期。
+        let dir = tmp("throttle-rearm");
+        let l = FileLimits {
+            max_throttle_buckets: 8,
+            lockout_after: 2,
+            lockout_window: Duration::from_millis(40),
+            max_sessions: 8,
+            max_browser_sessions: 8,
+            ..Default::default()
+        };
+        let root = SandboxRoot::open("downloads", &dir, false).unwrap();
+        let mut e = FileEngine::new(l, vec![root], "s3cret").unwrap();
+
+        // 同一 principal：锁定 → 正确口令被拒 → 窗口过期 → 再失败 → **必须重新锁上**
+        for _ in 0..e.limits().lockout_after {
+            let _ = e.authenticate("repeat", "10.0.0.1", "wrong");
+        }
+        assert_eq!(
+            e.authenticate("repeat", "10.0.0.1", "s3cret")
+                .unwrap_err()
+                .code,
+            code::THROTTLED
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        for _ in 0..e.limits().lockout_after {
+            let _ = e.authenticate("repeat", "10.0.0.1", "wrong");
+        }
+        assert_eq!(
+            e.authenticate("repeat", "10.0.0.1", "s3cret")
+                .unwrap_err()
+                .code,
+            code::THROTTLED,
+            "锁到期后再次失败必须能重新上锁，而不是永久放行"
+        );
+
+        // 填满表并让全局窗口生效，然后等它过期：溢出计数必须归零，
+        // 不能靠"每窗口一条失败"无限续期。
+        for i in 0..(e.limits().max_throttle_buckets + 4) {
+            let _ = e.authenticate(&format!("flood{i}"), "10.0.0.2", "wrong");
+        }
+        assert!(e.throttle_globally_locked(), "溢出必须升级为全局窗口");
+        // 评审 r4 R4-W-1：**必须断言一个已在册的主体**。上一版这里断言的是
+        // `in-table-but-not-locked`（其实根本不在 buckets 里），于是把豁免逻辑
+        // 换回去也照样绿——这条才是真正的杀伤性判据：旧写法额外要求"不在 buckets
+        // 里"才受全局窗口约束，所以把表填满的那批 principal 恰好被豁免，永久锁不住。
+        assert_eq!(
+            e.throttle_buckets(),
+            e.limits().max_throttle_buckets,
+            "夹具前提：表已满，flood0..flood7 都在册且自身没有被锁"
+        );
+        assert_eq!(
+            e.authenticate("flood0", "10.0.0.2", "s3cret")
+                .map(|_| "ACCEPTED")
+                .unwrap_or_else(|err| err.code),
+            code::THROTTLED,
+            "已在册主体在全局窗口内同样必须被拒（旧豁免逻辑下这里是 ACCEPTED）"
+        );
+        // 同一窗口内不在册的主体也必须被拒（fail-closed 覆盖面完整）。
+        assert_eq!(
+            e.authenticate("not-in-table", "10.0.0.2", "s3cret")
+                .unwrap_err()
+                .code,
+            code::THROTTLED
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            !e.throttle_globally_locked(),
+            "窗口必须自行过期，不靠持续注入伪造失败"
+        );
+        assert!(
+            e.authenticate("late-comer", "10.0.0.3", "s3cret").is_ok(),
+            "窗口过期后合法用户必须能进来（fail-closed 不等于永久拒绝服务）"
+        );
+        // 窗口过期后**一条**溢出失败不得立刻重新武装；要重新武装必须再攒满
+        // `lockout_after` 条。评审 r5 R5-NEW-1：上一版这里喂的是 flood0，而它在
+        // buckets 里、走的是单桶分支，`global` 根本不参与判定 ⇒ 把 `decay` 的归零
+        // 整段删掉本测试照样绿，"溢出计数会衰减"这句话实际零覆盖。必须用**不在册**
+        // 的主体走溢出分支（表已满，off-a/off-b 进不去）。
+        let _ = e.authenticate("off-a", "10.0.0.2", "wrong");
+        assert!(
+            !e.throttle_globally_locked(),
+            "窗口刚过期就被 1 条失败重新武装 ⇒ decay 的 global 归零没生效（删掉它就红这里）"
+        );
+        assert_eq!(e.throttle_overflow(), 1, "溢出计数必须从 0 重新攒起");
+        let _ = e.authenticate("off-b", "10.0.0.2", "wrong");
+        assert!(
+            e.throttle_globally_locked(),
+            "攒满 lockout_after 条溢出失败后必须重新武装全局窗口"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn root_table_is_validated_at_construction() {
+        // 评审 r6 NOTE-3：G12 写着"root 非空且不重复、read_only 组合同样校验"，
+        // 但构造期这三条（重名 root、零 root、空令牌）都没有测试。
+        let dir = tmp("roots");
+        let a = SandboxRoot::open("dup", &dir, false).unwrap();
+        let b = SandboxRoot::open("dup", &dir, true).unwrap();
+        assert_eq!(
+            FileEngine::new(FileLimits::default(), vec![a, b], "t")
+                .map(|_| ())
+                .unwrap_err()
+                .code,
+            code::CONFIG,
+            "重名 root 必须拒启动"
+        );
+        assert_eq!(
+            FileEngine::new(FileLimits::default(), vec![], "t")
+                .map(|_| ())
+                .unwrap_err()
+                .code,
+            code::CONFIG,
+            "一个 root 都没有等于开了个没有授权面的文件面"
+        );
+        let solo = SandboxRoot::open("solo", &dir, false).unwrap();
+        assert_eq!(
+            FileEngine::new(FileLimits::default(), vec![solo], "")
+                .map(|_| ())
+                .unwrap_err()
+                .code,
+            code::CONFIG,
+            "空令牌必须拒启动，而不是谁都能进"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_pages_are_charged_to_the_shared_budget() {
+        // 评审 r4 R4-W-3：本片把 `list` 也接上了过账（引擎自己算得出 ack 长度），
+        // 但当时没有任何测试覆盖——删掉那行 `charge_file` 不会让任何东西变红。
+        // 这条测试的作用就是让那一行有杀伤力。
+        let dir = tmp("list-budget");
+        for i in 0..5 {
+            std::fs::write(dir.join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let l = FileLimits {
+            chunk_bytes: 8,
+            max_entries_per_page: 2,
+            max_ack_bytes: 256,
+            max_inflight_bytes_per_session: 512,
+            max_buffered_amount: 512,
+            ..Default::default()
+        };
+        let root = SandboxRoot::open("downloads", &dir, false).unwrap();
+        let mut e = FileEngine::new(l, vec![root], "s3cret").unwrap();
+        let s = e.authenticate("u", "loopback", "s3cret").unwrap();
+        let p1 = e.list(s, "downloads", ".", 0).unwrap();
+        assert_eq!(p1.entries.len(), 2);
+        assert!(
+            e.budget().file_buffered() > 0,
+            "list 页必须过账——删掉 charge_file 这一行就红"
+        );
+        assert_eq!(e.inflight_bytes(s), e.budget().file_buffered());
+        assert!(e.inflight_matches_budget(s));
+        let p2 = e.list(s, "downloads", ".", p1.next_offset).unwrap();
+        assert_eq!(p2.entries.len(), 2);
+        let p3 = e.list(s, "downloads", ".", p2.next_offset).unwrap();
+        assert_eq!(p3.entries.len(), 1);
+        assert!(
+            !p3.truncated && p3.is_complete_list,
+            "1 条 < cap 不得谎报截断"
+        );
+        let err = e.list(s, "downloads", ".", 0).unwrap_err();
+        assert_eq!(
+            err.code,
+            code::QUEUE_FULL,
+            "共享预算满时 list 必须显式拒: {err}"
+        );
+        // 被拒的那页不能在任何地方返回出去，也不能留下占位条目。
+        assert!(e.inflight_matches_budget(s));
+        e.settle_file(s, e.budget().file_buffered());
+        assert_eq!(e.inflight_bytes(s), 0);
+        let again = e.list(s, "downloads", ".", 0).unwrap();
+        assert_eq!(again.entries.len(), 2, "腾出预算后必须能重新读");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_refuses_to_stall_on_an_unrenderable_entry() {
+        // 评审 r5 R5-W-3：ack 下限只保证"信封 + 一条空名条目"放得下，长文件名
+        // 仍可能一条都塞不进。返回"0 条目但 truncated=true"等于让 `next_offset`
+        // 停在原地——客户端永远翻不过这一页，而看起来什么都没失败。必须显式拒。
+        let dir = tmp("list-stall");
+        // 200 字节：在 Linux 的 255 字节 NAME_MAX 之内，又足以塞不进这条 ack 预算。
+        let long_name = "n".repeat(200);
+        std::fs::write(dir.join(&long_name), "x").unwrap();
+        let l = FileLimits {
+            max_entries_per_page: 8,
+            max_ack_bytes: LIST_ACK_ENVELOPE_BYTES + ENTRY_ACK_OVERHEAD_BYTES + 64,
+            max_buffered_amount: 128 * 1024,
+            max_inflight_bytes_per_session: 128 * 1024,
+            chunk_bytes: 8,
+            ..Default::default()
+        };
+        let root = SandboxRoot::open("downloads", &dir, false).unwrap();
+        let mut e = FileEngine::new(l, vec![root], "s3cret").unwrap();
+        let s = e.authenticate("u", "loopback", "s3cret").unwrap();
+        let err = e.list(s, "downloads", ".", 0).unwrap_err();
+        assert_eq!(
+            err.code,
+            code::PAGE_TOO_LARGE,
+            "0 条目页必须显式拒而不是谎报进展: {err}"
+        );
+        // "读完了"与"塞不进任何条目"必须是两回事：越过末尾是 Ok + complete
+        // （客户端据此前进），而 0 条目且仍有剩余必须是显式错误。
+        let past_end = e.list(s, "downloads", ".", 1).unwrap();
+        assert!(
+            past_end.entries.is_empty() && !past_end.truncated && past_end.is_complete_list,
+            "越过末尾应报完整，而不是假装截断"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn engine_read_page_is_charged_to_the_shared_budget() {
+        let dir = tmp("budget");
+        std::fs::write(dir.join("f.bin"), vec![3u8; 256]).unwrap();
+        // 预算只够两页：第三页必须显式 QUEUE_FULL，而不是静默排队。
+        // per-session 上限与预算相等（G12 要求 inflight <= buffered），
+        // 所以先扣的共享预算就是这里的约束。ack 下限由 G12 另管（>= 信封+一条目）。
+        let l = FileLimits {
+            chunk_bytes: 64,
+            max_inflight_bytes_per_session: 128,
+            max_ack_bytes: 128,
+            max_buffered_amount: 128,
+            ..Default::default()
+        };
+        let root = SandboxRoot::open("downloads", &dir, false).unwrap();
+        let mut e = FileEngine::new(l, vec![root], "s3cret").unwrap();
+        let s = e.authenticate("u", "loopback", "s3cret").unwrap();
+        assert!(e.read_page(s, "downloads", "f.bin", 0, 64).is_ok());
+        assert!(e.read_page(s, "downloads", "f.bin", 64, 64).is_ok());
+        assert_eq!(e.budget().buffered(), 128);
+        let err = e.read_page(s, "downloads", "f.bin", 128, 64).unwrap_err();
+        assert_eq!(err.code, code::QUEUE_FULL, "预算满必须显式拒绝，实际 {err}");
+        assert_eq!(e.budget().file_drops, 1);
+        // terminal 类优先：挤掉 file 消息也要成功送达。
+        assert!(e.send_terminal(128).is_ok());
+        assert_eq!(e.budget().terminal_drops, 0);
+        assert_eq!(e.budget().file_drops, 3, "两条 64 字节页被挤掉");
+        // 被挤掉的消息必须回冲它**自己会话**的额度（评审 r2 NEW-2 第 1 点）：
+        // 上一版这里冻的是"inflight 仍是 64"，那锁住的是缺陷——客户端只能去 ack
+        // 一份它从未收到的页才能恢复。
+        assert_eq!(e.inflight_bytes(s), 0, "挤掉的消息不得继续占会话额度");
+        assert!(e.inflight_matches_budget(s), "过账与额度必须同步");
+        // 冲刷终端字节后，拉式下载才能继续取下一页。
+        e.settle_terminal(128);
+        assert!(e.read_page(s, "downloads", "f.bin", 128, 64).is_ok());
+        assert!(e.inflight_matches_budget(s));
+        e.settle_file(s, 64);
+        assert_eq!(e.inflight_bytes(s), 0, "对端 ack 才释放额度");
+        assert!(e.inflight_matches_budget(s));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn per_session_inflight_ceiling_is_enforced_by_the_engine() {
+        let dir = tmp("inflight");
+        std::fs::write(dir.join("f.bin"), vec![9u8; 256]).unwrap();
+        // G12 新增的配对约束（评审 r5 R5-W-3）：`max_ack_bytes ≤ inflight`，所以
+        // 会话上限不可能低于一条 ack 的下限 124——用 128，共享预算给到 4096，
+        // 让 per-session 上限成为**唯一**生效的约束。
+        let l = FileLimits {
+            chunk_bytes: 8,
+            max_inflight_bytes_per_session: 128,
+            max_ack_bytes: 128,
+            max_buffered_amount: 4096,
+            ..Default::default()
+        };
+        let root = SandboxRoot::open("downloads", &dir, false).unwrap();
+        let mut e = FileEngine::new(l, vec![root], "s3cret").unwrap();
+        let s = e.authenticate("u", "loopback", "s3cret").unwrap();
+        for page in 0..16 {
+            e.read_page(s, "downloads", "f.bin", page * 8, 8).unwrap();
+        }
+        assert_eq!(e.inflight_bytes(s), 128);
+        assert!(
+            e.budget().buffered() < e.limits().max_buffered_amount,
+            "夹具前提：共享预算还宽裕，绑住它的只能是要断言的那条上限"
+        );
+        let err = e.read_page(s, "downloads", "f.bin", 128, 8).unwrap_err();
+        assert_eq!(
+            err.code,
+            code::CAPACITY,
+            "共享预算还空着，per-session 上限必须独立生效"
+        );
+        // 评审 r4 R4-W-2：上一版处置清单声称"每次拒绝之后不变量仍成立"，但仓里
+        // 并没有这条断言——删掉 charge_file 的 unpush_file 回滚，本测试照样绿
+        // （残留条目会被后面的 settle_file 一并冲掉）。所以这里必须在**拒绝之后、
+        // 任何 settle 之前**断言不变量：回滚丢了就是 136/128 背离。
+        assert_eq!(e.budget().buffered(), 128, "被拒的 8 字节不得占预算");
+        assert!(
+            e.inflight_matches_budget(s),
+            "CAPACITY 拒绝之后共享预算与会话额度必须仍一致（回滚有效性）"
+        );
+        // 释放后同一条流可以继续，说明上限不是"一次性配额"。
+        e.settle_file(s, 128);
+        assert_eq!(e.inflight_bytes(s), 0);
+        assert!(e.read_page(s, "downloads", "f.bin", 128, 8).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_does_not_truncate_missing_multi_segment_paths() {
+        let dir = tmp("resolve");
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        let root = SandboxRoot::open("downloads", &dir, false).unwrap();
+        // 旧实现遇到第一个缺失分量就 break，`a/b/c` 被截断成 `a`：
+        // 上传因此能"成功"发布到错误前缀且不报错（评审 F4）。
+        assert_eq!(
+            root.resolve("a/b/c").unwrap(),
+            dir.join("a").join("b").join("c"),
+            "缺失分量必须继续按字面解析，而不是截断"
+        );
+        assert_eq!(root.resolve("x/y/z").unwrap(), dir.join("x/y/z"));
+        assert_eq!(root.resolve("./a/./b").unwrap(), dir.join("a/b"));
+        // 已存在的分量仍然逐个查符号链接：缺失不能变成检查的豁免。
+        // （Windows 上建目录符号链接需要特权，与既有的
+        // `symlink_component_is_refused_on_every_verb` 同一限制。）
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(dir.join("link-target")).unwrap();
+            std::os::unix::fs::symlink(dir.join("link-target"), dir.join("a/escape")).unwrap();
+            assert_eq!(
+                root.resolve("a/escape/deep").unwrap_err().code,
+                code::SYMLINK_ESCAPE
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upload_into_a_missing_intermediate_directory_fails_loudly() {
+        let dir = tmp("upload-missing");
+        std::fs::create_dir_all(dir.join("up")).unwrap();
+        let root = SandboxRoot::open("uploads", &dir, false).unwrap();
+        let mut e = FileEngine::new(FileLimits::default(), vec![root], "s3cret").unwrap();
+        let s = e.authenticate("u", "loopback", "s3cret").unwrap();
+        let err = e.open_upload(s, "uploads", "a/b/c.bin", None).unwrap_err();
+        assert_eq!(
+            err.code,
+            code::NOT_FOUND,
+            "中间目录不存在必须显式拒绝，实际 {err}"
+        );
+        // 拒绝后不得留下任何字节：既没有错误前缀下的文件，也没有 `.part`。
+        assert!(!dir.join("a").exists(), "绝不能只在 `a` 下创建东西");
+        let leftovers: Vec<_> = walkdir(&dir)
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "残留中转物: {leftovers:?}");
+        // mkdir 建出前缀之后，同一条路径必须能正常上传并发布到 `a/b/c.bin`。
+        e.mkdir(s, "uploads", "a/b").unwrap();
+        let id = e.open_upload(s, "uploads", "a/b/c.bin", Some(4)).unwrap();
+        e.stage_chunk(s, id, 0, b"abcd").unwrap();
+        let published = e.commit_upload(s, "uploads", id, None).unwrap();
+        assert_eq!(published, "a/b/c.bin");
+        assert_eq!(std::fs::read(dir.join("a/b/c.bin")).unwrap(), b"abcd");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1940,7 +3278,14 @@ mod tests {
         let _ = e.stat(s, "downloads", "x.bin");
         assert!(e.sweep_idle(Instant::now()).is_empty());
         std::thread::sleep(Duration::from_millis(40));
+        // 评审 r5 N-8：这里也要断言"恰好一行"，不只是"这一行存在"。
+        let before_sweep = e.audit().len();
         assert_eq!(e.sweep_idle(Instant::now()), vec![s]);
+        assert_eq!(
+            e.audit().len(),
+            before_sweep + 1,
+            "动作 idle_recycle 必须恰好留一行审计"
+        );
         assert_eq!(
             std::fs::read_dir(&dir)
                 .unwrap()
@@ -1950,21 +3295,705 @@ mod tests {
             0,
             "recycling must not leave .part behind"
         );
+        // 回收同样要留一行审计（评审 r3 R3-NEW-3：G21 说"逐个动词断言"，
+        // 而 idle_recycle 这行过去没有任何断言覆盖）。
+        let rec = e.audit().back().unwrap();
+        assert_eq!(rec.action, "idle_recycle");
+        assert_eq!(rec.result_code, code::IDLE);
+        assert_eq!(rec.principal, "u", "回收行必须能归因到主体");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn every_verb_is_audited_including_refusals() {
         let dir = tmp("audit");
+        std::fs::write(dir.join("f.txt"), "hello").unwrap();
+        std::fs::write(dir.join("taken.txt"), "x").unwrap();
         let mut e = engine(&dir);
-        let _ = e.authenticate("u", "loopback", "bad").unwrap_err();
-        let s = e.authenticate("u", "loopback", "s3cret").unwrap();
-        let _ = e.stat(s, "downloads", "missing.bin").unwrap_err();
-        let codes: Vec<&str> = e.audit().iter().map(|r| r.result_code.as_str()).collect();
-        assert!(codes.contains(&code::AUTH_DENIED));
-        assert!(codes.contains(&code::NOT_FOUND));
-        assert!(codes.contains(&"OK"));
+
+        // 旧断言只看"某个码出现过"，删掉任意一处 `record` 都不会红（评审：装饰测试）。
+        // 这里逐个动作断言"恰好一行、action 对、码对、principal 非空"。
+        macro_rules! audited {
+            ($label:expr, $want:expr, $call:expr) => {{
+                let before = e.audit().len();
+                let outcome = $call;
+                assert_eq!(
+                    e.audit().len(),
+                    before + 1,
+                    "动作 {} 必须恰好留一行审计",
+                    $label
+                );
+                let rec = e.audit().back().unwrap();
+                assert_eq!(rec.action, $label, "审计行的 action");
+                assert_eq!(rec.result_code, $want, "{} 的结果码", $label);
+                assert!(!rec.principal.is_empty(), "{} 的审计行必须能归因", $label);
+                outcome
+            }};
+        }
+
+        let _ = audited!(
+            "authenticate",
+            code::AUTH_DENIED,
+            e.authenticate("u", "loopback", "bad")
+                .map(|_| ())
+                .unwrap_err()
+        );
+        let s = audited!(
+            "authenticate",
+            "OK",
+            e.authenticate("u", "loopback", "s3cret")
+        )
+        .unwrap();
+
+        let _ = audited!(
+            "stat",
+            code::NOT_FOUND,
+            e.stat(s, "downloads", "missing.bin").map(|_| ())
+        );
+        let _ = audited!(
+            "list",
+            code::NOT_FOUND,
+            e.list(s, "downloads", "missing-dir", 0).map(|_| ())
+        );
+        let _ = audited!("list", "OK", e.list(s, "downloads", ".", 0).map(|_| ()));
+        let _ = audited!(
+            "read",
+            code::PAGE_TOO_LARGE,
+            e.read_page(s, "downloads", "f.txt", 0, e.limits().chunk_bytes + 1)
+                .map(|_| ())
+        );
+        let _ = audited!(
+            "read",
+            code::NOT_FOUND,
+            e.read_page(s, "downloads", "missing.bin", 0, 4).map(|_| ())
+        );
+        let _ = audited!(
+            "read",
+            "OK",
+            e.read_page(s, "downloads", "f.txt", 0, 4).map(|_| ())
+        );
+        let _ = audited!(
+            "open_upload",
+            code::EXISTS,
+            e.open_upload(s, "downloads", "taken.txt", Some(1))
+                .map(|_| ())
+        );
+        let _ = audited!(
+            "open_upload",
+            code::CAPACITY,
+            e.open_upload(
+                s,
+                "downloads",
+                "big.bin",
+                Some(e.limits().max_upload_bytes + 1)
+            )
+            .map(|_| ())
+        );
+        let _ = audited!(
+            "open_upload",
+            code::NOT_FOUND,
+            e.open_upload(s, "downloads", "no/such/dir/x.bin", None)
+                .map(|_| ())
+        );
+        let id = audited!(
+            "open_upload",
+            "OK",
+            e.open_upload(s, "downloads", "ok.bin", Some(4))
+        )
+        .unwrap();
+        let _ = audited!(
+            "stage_chunk",
+            code::INTEGRITY,
+            e.stage_chunk(s, id, 9, b"abcd").map(|_| ())
+        );
+        assert_eq!(
+            e.audit().back().unwrap().root,
+            "downloads",
+            "stage_chunk 的拒绝行必须带 root（评审 r6 WARN-1：过去写死空串）"
+        );
+        let before = e.audit().len();
+        e.stage_chunk(s, id, 0, b"ab").unwrap();
+        assert_eq!(
+            e.audit().len(),
+            before,
+            "逐片成功不得灌满审计环（设计取舍见 stage_chunk 文档）"
+        );
+        let _ = audited!(
+            "commit",
+            code::INTEGRITY,
+            e.commit_upload(s, "downloads", id, None).map(|_| ())
+        );
+        // `abort_upload` 返回单元值，走不了上面的宏（`let outcome = …` 会被
+        // clippy 的 let_unit_value 拒），所以这里手写下同样的"恰好一行"断言。
+        let before_abort = e.audit().len();
+        e.abort_upload(s, id);
+        assert_eq!(
+            e.audit().len(),
+            before_abort + 1,
+            "动作 abort_upload 必须恰好留一行审计"
+        );
+        let rec = e.audit().back().unwrap();
+        assert_eq!(rec.action, "abort_upload");
+        assert_eq!(rec.result_code, "OK");
+        assert!(!rec.principal.is_empty(), "abort_upload 的审计行必须能归因");
+        let _ = audited!(
+            "ack_staged",
+            code::NOT_FOUND,
+            e.ack_staged(s, 999_999).map(|_| ())
+        );
+        let _ = audited!(
+            "mkdir",
+            code::OUTSIDE_ROOT,
+            e.mkdir(s, "downloads", "../escape").map(|_| ())
+        );
+        // mkdir 允许一次建出整条链（`a/b`），所以它的拒绝来自越界而不是"父目录不存在"。
+        let _ = audited!("mkdir", "OK", e.mkdir(s, "downloads", "a/b").map(|_| ()));
+        assert!(dir.join("a/b").is_dir(), "mkdir 必须建出整条缺失链");
+        // 评审 r4 R4-W-4：G21 列出 12 个动词，而上一版只有拒绝侧被断言，
+        // 成功侧的 `stat`/`remove`/`commit`/`close_session` 一行都没验过——
+        // 删掉包装层的 `Ok` 分支只有 `list` 会红。这里把成功侧逐个钉上。
+        let _ = audited!("stat", "OK", e.stat(s, "downloads", "f.txt").map(|_| ()));
+        std::fs::write(dir.join("gone.txt"), "bye").unwrap();
+        let _ = audited!(
+            "remove",
+            "OK",
+            e.remove(s, "downloads", "gone.txt", false).map(|_| ())
+        );
+        let cid = e.open_upload(s, "downloads", "c1.bin", Some(2)).unwrap();
+        e.stage_chunk(s, cid, 0, b"hi").unwrap();
+        let _ = audited!("commit", "OK", e.commit_upload(s, "downloads", cid, None));
+        assert_eq!(std::fs::read(dir.join("c1.bin")).unwrap(), b"hi");
+        let _ = audited!(
+            "remove",
+            code::NOT_FOUND,
+            e.remove(s, "downloads", "missing.bin", false).map(|_| ())
+        );
+        let _ = audited!(
+            "rename",
+            code::NOT_FOUND,
+            e.rename(s, "downloads", "missing.bin", "x.bin").map(|_| ())
+        );
+        let _ = audited!(
+            "rename",
+            code::EXISTS,
+            e.rename(s, "downloads", "f.txt", "taken.txt").map(|_| ())
+        );
+        let _ = audited!(
+            "rename",
+            "OK",
+            e.rename(s, "downloads", "f.txt", "r.txt").map(|_| ())
+        );
+
+        // `close_session` 同样返回单元值，手写"恰好一行"的断言（同上）。
+        let before_close = e.audit().len();
+        e.close_session(s);
+        assert_eq!(
+            e.audit().len(),
+            before_close + 1,
+            "动作 close_session 必须恰好留一行审计"
+        );
+        let rec = e.audit().back().unwrap();
+        assert_eq!(rec.action, "close_session");
+        assert_eq!(rec.result_code, "OK");
+        assert_eq!(rec.principal, "u");
+
+        // 审计环有界：灌满之后丢最旧并计数，不是无限增长。
+        let s2 = e.authenticate("u", "loopback", "s3cret").unwrap();
+        let cap = AUDIT_CAPACITY;
+        for _ in 0..(cap + 50) {
+            let _ = e.stat(s2, "downloads", "missing.bin");
+        }
+        assert!(e.audit().len() <= cap, "审计日志必须有界");
+        assert!(e.audit_dropped() >= 50, "溢出必须可观测");
+        assert_eq!(e.audit().back().unwrap().result_code, code::NOT_FOUND);
+
+        // 评审 r5 R5-W-4：光有"行数有界"不算数。`principal` 在令牌校验**之前**
+        // 就被写下，`rel` 也来自调用方——不裁长度的话未认证者可以把每一行撑到
+        // 任意大，"用审计把内存打满"那条路径只是换了形状。这里断言按**字节**封顶，
+        // 且截断是可见的（不是悄悄改写内容）。
+        let long = "x".repeat(4000);
+        for i in 0..20 {
+            let _ = e.authenticate(&format!("{long}{i}"), &long, "wrong");
+        }
+        let _ = e.stat(s2, "downloads", &long);
+        // 环已经饱和（前面灌了 8242 次），所以这里不能断言"长度又涨了 21"——
+        // 饱和环的行长恒等于容量，能断言的是**最后 21 行**的字节上界与内容。
+        assert_eq!(e.audit().len(), AUDIT_CAPACITY, "饱和后行数就停在容量");
+        for rec in e.audit().iter().rev().take(21) {
+            assert!(
+                rec.principal.len() <= AUDIT_FIELD_MAX_BYTES + 16,
+                "principal 必须按字节封顶，实际 {}",
+                rec.principal.len()
+            );
+            assert!(
+                rec.rel.len() <= AUDIT_FIELD_MAX_BYTES + 16,
+                "rel 必须按字节封顶，实际 {}",
+                rec.rel.len()
+            );
+        }
+        assert!(
+            e.audit()
+                .iter()
+                .rev()
+                .take(20)
+                .any(|r| r.principal.contains("[+")),
+            "截断必须留下可见标记，不能静默改写"
+        );
+
+        // 未知会话号的 close 也要留一行（评审 r5 N-8：否则"漏记结构性不可发生"
+        // 只对已知会话成立）。环此时已饱和 ⇒ 按**尾部内容**断言，不断言行数增长。
+        e.close_session(999_999);
+        let rec = e.audit().back().unwrap();
+        assert_eq!(rec.action, "close_session");
+        assert_eq!(
+            rec.result_code,
+            code::NOT_FOUND,
+            "未知会话的 close 记 NOT_FOUND"
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commit_cannot_be_redirected_to_another_root() {
+        // 评审 r2 NEW-1：commit 曾经只看调用方当场给的 root 参数，既不查可写、
+        // 也不查后端，而流本身不记它开在哪个 root 上。
+        let dir = tmp("commit-root");
+        let ro = tmp("commit-ro");
+        let writable = SandboxRoot::open("w", &dir, false).unwrap();
+        let readonly = SandboxRoot::open("ro", &ro, true).unwrap();
+        let remote = SandboxRoot::open_sftp("remote", "/home/user/files", false).unwrap();
+        let mut e = FileEngine::new(
+            FileLimits::default(),
+            vec![writable, readonly, remote],
+            "s3cret",
+        )
+        .unwrap();
+        let s = e.authenticate("u", "loopback", "s3cret").unwrap();
+        let id = e.open_upload(s, "w", "new.bin", Some(4)).unwrap();
+        e.stage_chunk(s, id, 0, b"abcd").unwrap();
+
+        assert_eq!(
+            e.commit_upload(s, "ro", id, None).unwrap_err().code,
+            code::OUTSIDE_ROOT,
+            "把可写根上开的流提交进只读根必须被拒"
+        );
+        assert_eq!(
+            std::fs::read_dir(&ro).unwrap().flatten().count(),
+            0,
+            "只读根里不得出现任何字节"
+        );
+        assert_eq!(
+            e.commit_upload(s, "remote", id, None).unwrap_err().code,
+            code::OUTSIDE_ROOT,
+            "SFTP 根的远端路径绝不能进本地解析器"
+        );
+        // 拒绝不能吃掉流：回到真正的 root 仍要能发布。
+        assert_eq!(
+            e.commit_upload(s, "w", id, None).unwrap(),
+            "new.bin",
+            "提交必须落在打开它的那个 root"
+        );
+        assert_eq!(std::fs::read(dir.join("new.bin")).unwrap(), b"abcd");
+        assert_eq!(
+            e.open_upload(s, "ro", "x.bin", None).unwrap_err().code,
+            code::READ_ONLY
+        );
+        e.close_session(s);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ro);
+    }
+
+    #[test]
+    fn session_teardown_releases_the_shared_budget() {
+        // 评审 r2 NEW-2 第 2 点：close/sweep 曾经只丢 FileSession，从不冲共享预算，
+        // 于是"认证→读两页→断线"两轮就把**全节点**的文件类发送预算永久钉死。
+        let dir = tmp("teardown");
+        std::fs::write(dir.join("f.bin"), vec![1u8; 256]).unwrap();
+        let l = FileLimits {
+            chunk_bytes: 64,
+            max_inflight_bytes_per_session: 128,
+            max_ack_bytes: 128,
+            max_buffered_amount: 128,
+            idle_timeout: Duration::from_millis(20),
+            ..Default::default()
+        };
+        let root = SandboxRoot::open("downloads", &dir, false).unwrap();
+        let mut e = FileEngine::new(l, vec![root], "s3cret").unwrap();
+        let s1 = e.authenticate("u", "10.0.0.1", "s3cret").unwrap();
+        e.read_page(s1, "downloads", "f.bin", 0, 64).unwrap();
+        e.read_page(s1, "downloads", "f.bin", 64, 64).unwrap();
+        assert_eq!(e.budget().buffered(), 128);
+
+        let s2 = e.authenticate("u", "10.0.0.2", "s3cret").unwrap();
+        assert_eq!(
+            e.read_page(s2, "downloads", "f.bin", 0, 64)
+                .unwrap_err()
+                .code,
+            code::QUEUE_FULL,
+            "预算被 s1 占满时第二个会话必须显式排队失败"
+        );
+        e.close_session(s1);
+        assert_eq!(e.budget().buffered(), 0, "会话拆除必须归还共享预算");
+        assert!(e.read_page(s2, "downloads", "f.bin", 0, 64).is_ok());
+
+        // 闲置回收走同一条释放路径。
+        e.settle_file(s2, 64);
+        e.read_page(s2, "downloads", "f.bin", 64, 64).unwrap();
+        assert_eq!(e.budget().buffered(), 64);
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(e.sweep_idle(Instant::now()), vec![s2]);
+        assert_eq!(e.budget().buffered(), 0, "闲置回收同样必须归还共享预算");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn throttle_fails_closed_when_the_table_is_full() {
+        // 评审 r2 NEW-3：表满后旧实现只累加私有计数、从不写 `locked`，
+        // `authenticate` 却继续比令牌 ⇒ 轮换 principal 就买到无限次猜测。
+        let dir = tmp("throttle-full");
+        let l = FileLimits {
+            max_throttle_buckets: 8,
+            lockout_after: 3,
+            ..Default::default()
+        };
+        let root = SandboxRoot::open("downloads", &dir, false).unwrap();
+        let mut e = FileEngine::new(l, vec![root], "s3cret").unwrap();
+        for i in 0..e.limits().max_throttle_buckets {
+            let _ = e.authenticate(&format!("p{i}"), "10.0.0.9", "wrong");
+        }
+        assert_eq!(e.throttle_buckets(), e.limits().max_throttle_buckets);
+        assert_eq!(e.throttle_overflow(), 0);
+        assert!(
+            !e.throttle_globally_locked(),
+            "填满但未超阈值时不应全局锁定"
+        );
+        for _ in 0..e.limits().lockout_after {
+            let _ = e.authenticate("rotating", "10.0.0.9", "wrong");
+        }
+        assert!(e.throttle_overflow() >= e.limits().lockout_after);
+        assert!(
+            e.throttle_globally_locked(),
+            "溢出必须升级为可观测的全局锁定窗口"
+        );
+        // 关键：全新 principal + **正确令牌**也必须被拒（旧实现这里返回 Ok）。
+        assert_eq!(
+            e.authenticate("brand-new", "10.0.0.9", "s3cret")
+                .unwrap_err()
+                .code,
+            code::THROTTLED
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_quotas_are_admission_checks() {
+        // 评审 r2 NEW-4：max_sessions / max_browser_sessions 过去只出现在
+        // `validate()` 的两两比较里，从不参与准入 ⇒ 一个合法令牌能开无限会话。
+        let dir = tmp("admission");
+        let l = FileLimits {
+            max_sessions: 3,
+            max_browser_sessions: 2,
+            ..Default::default()
+        };
+        let root = SandboxRoot::open("downloads", &dir, false).unwrap();
+        let mut e = FileEngine::new(l, vec![root], "s3cret").unwrap();
+        let a = e.authenticate("u", "10.0.0.1", "s3cret").unwrap();
+        let b = e.authenticate("u", "10.0.0.1", "s3cret").unwrap();
+        assert_eq!(
+            e.authenticate("u", "10.0.0.1", "s3cret").unwrap_err().code,
+            code::CAPACITY,
+            "同一 peer 超过 max_browser_sessions 必须拒"
+        );
+        let c = e.authenticate("u", "10.0.0.2", "s3cret").unwrap();
+        assert_eq!(
+            e.authenticate("u", "10.0.0.3", "s3cret").unwrap_err().code,
+            code::CAPACITY,
+            "全局 max_sessions 同样必须拒"
+        );
+        // 释放的额度必须可复用，不是"一次性配额"。
+        e.close_session(a);
+        e.close_session(b);
+        e.close_session(c);
+        assert!(e.authenticate("u", "10.0.0.3", "s3cret").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audit_records_are_snapshottable() {
+        // 评审 r2 W-1：`#[derive(Debug, Clone, PartialEq, Eq)]` 曾被误写进 `///`
+        // 注释里，四个 derive 全部静默消失（照样能编译，因为没人 clone）。
+        let dir = tmp("audit-derive");
+        let mut e = engine(&dir);
+        let s = e.authenticate("u", "loopback", "s3cret").unwrap();
+        let rec = e.audit().back().unwrap().clone();
+        assert_eq!(&rec, e.audit().back().unwrap());
+        assert!(format!("{rec:?}").contains("authenticate"));
+        assert_eq!(rec.principal, "u", "principal 必须是真实主体");
+        e.close_session(s);
+        assert_eq!(
+            e.audit().back().unwrap().action,
+            "close_session",
+            "拆除会话也要留痕（r2 W-5）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_a_file_is_non_overwriting_and_leaves_one_name() {
+        // 评审 r2 W-3：`dst.exists()` 之后 `rename(2)` 是**静默替换**，
+        // 窗口里目标出现就覆盖原字节。文件因此改走 hard_link + unlink。
+        let dir = tmp("rename-atomic");
+        std::fs::write(dir.join("a.txt"), "AAA").unwrap();
+        let mut e = engine(&dir);
+        let s = e.authenticate("u", "loopback", "s3cret").unwrap();
+        assert!(e.rename(s, "downloads", "a.txt", "b.txt").is_ok());
+        assert!(!dir.join("a.txt").exists(), "改名后只能剩一个名字");
+        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "AAA");
+        // 目标在检查之后、发布之前出现：必须 EXISTS 且原字节一字未动。
+        std::fs::write(dir.join("c.txt"), "CCC").unwrap();
+        std::fs::write(dir.join("d.txt"), "SRC").unwrap();
+        assert!(e.rename(s, "downloads", "d.txt", "e.txt").is_ok());
+        assert_eq!(
+            e.rename(s, "downloads", "e.txt", "c.txt").unwrap_err().code,
+            code::EXISTS
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("c.txt")).unwrap(), "CCC");
+        assert_eq!(std::fs::read_to_string(dir.join("e.txt")).unwrap(), "SRC");
+        // 目录改名仍走 rename(2)：目标存在时靠前置检查拒，但窗口是**声明过的**
+        // （std 下 `hard_link` 对目录失败，拿不到原子无覆盖），见 G13/§18.4。
+        e.mkdir(s, "downloads", "d1").unwrap();
+        e.mkdir(s, "downloads", "d2").unwrap();
+        assert_eq!(
+            e.rename(s, "downloads", "d1", "d2").unwrap_err().code,
+            code::EXISTS,
+            "目录改名撞上已存在目标也必须拒（前置检查这一半）"
+        );
+        assert!(dir.join("d1").is_dir() && dir.join("d2").is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_registry_ceiling_is_reachable() {
+        // 评审 r2 W-9：`read_page` 在同一次调用里 acquire+release，`live()` 恒 0，
+        // 所以配额分支在产品路径上**结构不可达**——G16 的句柄防线是意外成立的。
+        // 这里直接测注册表本身，让 `max_read_handles` 至少有一条真会红的断言；
+        // OS 句柄层面（/proc/self/fd）仍未验，记在 M1 剩余项。
+        let mut reg = HandleRegistry::new(2);
+        assert_eq!(reg.acquire(1, "/a").unwrap(), 1);
+        assert_eq!(reg.acquire(1, "/a").unwrap(), 1, "同会话同路径不得重复计数");
+        assert_eq!(reg.acquire(1, "/b").unwrap(), 2);
+        assert_eq!(reg.acquire(1, "/c").unwrap_err().code, code::CAPACITY);
+        reg.release(1, "/a");
+        assert_eq!(reg.live(), 1);
+        assert_eq!(reg.acquire(1, "/c").unwrap(), 2);
+        assert!(reg.peak >= 2, "峰值必须记录实际并发，而不是恒 1");
+    }
+
+    #[test]
+    fn every_validate_rule_has_a_red_test() {
+        // 评审 r2 W-8 补了测试，评审 r3 R3-NEW-3 又指出这些红**不代表各自那条规则**：
+        // 例如 `handles < sessions` 的夹具会先在 `chunk > inflight` 上短路，删掉
+        // 句柄那条规则它照样红。所以这里每条都断言错误消息里的规则名，且夹具必须
+        // 只违反自己那一条。
+        let cases = [
+            (
+                "no limit may be zero",
+                FileLimits {
+                    max_entries_per_page: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                // 评审 r4 R4-NEW-1：本批新加的时长字段漏在零值检查之外，
+                // `lockout_window = 0` 会让每次锁定刚写下就过期，节流形同不存在。
+                "lockout_window must not be zero",
+                FileLimits {
+                    lockout_window: Duration::ZERO,
+                    ..Default::default()
+                },
+            ),
+            (
+                "idle_timeout must not be zero",
+                FileLimits {
+                    idle_timeout: Duration::ZERO,
+                    ..Default::default()
+                },
+            ),
+            (
+                "no limit may be zero: a zero ceiling silently disables its gate",
+                FileLimits {
+                    max_upload_bytes: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "no limit may be zero: a zero ceiling silently disables its gate",
+                FileLimits {
+                    max_rehash_bytes_per_stream: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "max_browser_sessions must not exceed",
+                FileLimits {
+                    max_browser_sessions: 8,
+                    ..Default::default()
+                },
+            ),
+            (
+                "chunk_bytes must be <= max_buffered_amount",
+                FileLimits {
+                    chunk_bytes: 256 * 1024,
+                    max_ack_bytes: 32 * 1024,
+                    max_inflight_bytes_per_session: 256 * 1024,
+                    max_buffered_amount: 128 * 1024,
+                    ..Default::default()
+                },
+            ),
+            (
+                "chunk_bytes must be <= max_inflight_bytes_per_session",
+                FileLimits {
+                    chunk_bytes: 64 * 1024,
+                    max_inflight_bytes_per_session: 32 * 1024,
+                    ..Default::default()
+                },
+            ),
+            (
+                // 注：加了 `max_ack_bytes ≤ max_inflight_bytes_per_session` 之后，
+                // `max_ack_bytes ≤ max_buffered_amount` 已成为**被蕴含**的约束
+                // （ack ≤ inflight ≤ buffered 两段链），它作为先写下的检查保留是
+                // 纵深防御，但无法再构造"只违反它"的夹具——强行构造会同时违反
+                // inflight ≤ buffered。这里验链条的后半段。
+                "max_inflight_bytes_per_session must be <= max_buffered_amount",
+                FileLimits {
+                    max_ack_bytes: 32 * 1024,
+                    max_inflight_bytes_per_session: 256 * 1024,
+                    max_buffered_amount: 128 * 1024,
+                    ..Default::default()
+                },
+            ),
+            (
+                // 评审 r5 R5-W-3：新加的计费量必须有配对约束，否则"配置自洽却
+                // 永远无法完成一次 list"。
+                "max_ack_bytes must be <= max_inflight_bytes_per_session",
+                FileLimits {
+                    max_ack_bytes: 128 * 1024,
+                    max_inflight_bytes_per_session: 64 * 1024,
+                    ..Default::default()
+                },
+            ),
+            (
+                // 评审 r5 R5-W-2：只封低边等于没封——同一片刚在 config.rs 里给
+                // max_terminals 补了上界。时长参与 `Instant + Duration`。
+                "lockout_window must be <= 24h",
+                FileLimits {
+                    lockout_window: Duration::from_secs(24 * 3600 + 1),
+                    ..Default::default()
+                },
+            ),
+            (
+                "idle_timeout must be <= 24h",
+                FileLimits {
+                    idle_timeout: Duration::from_secs(24 * 3600 + 1),
+                    ..Default::default()
+                },
+            ),
+            (
+                "max_ack_bytes must be >=",
+                FileLimits {
+                    max_ack_bytes: 100,
+                    ..Default::default()
+                },
+            ),
+            (
+                "max_inflight_bytes_per_session must be <= max_buffered_amount",
+                FileLimits {
+                    max_inflight_bytes_per_session: 256 * 1024,
+                    ..Default::default()
+                },
+            ),
+            (
+                "max_read_handles must be >=",
+                FileLimits {
+                    max_sessions: 8,
+                    max_read_handles: 2,
+                    max_browser_sessions: 2,
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (keyword, l) in cases {
+            let err = l
+                .validate()
+                .expect_err(&format!("规则 {keyword:?} 必须拒启动"));
+            assert_eq!(err.code, code::CONFIG, "{keyword} 的码");
+            assert!(
+                err.message.contains(keyword),
+                "夹具本该触发 {keyword:?}，实际触发的是：{}",
+                err.message
+            );
+        }
+        // 反向：合法边界必须放行，否则上界就成了不可用的死配置。
+        assert!(
+            FileLimits {
+                max_ack_bytes: LIST_ACK_ENVELOPE_BYTES + ENTRY_ACK_OVERHEAD_BYTES,
+                max_buffered_amount: LIST_ACK_ENVELOPE_BYTES + ENTRY_ACK_OVERHEAD_BYTES,
+                chunk_bytes: 8,
+                max_inflight_bytes_per_session: LIST_ACK_ENVELOPE_BYTES + ENTRY_ACK_OVERHEAD_BYTES,
+                max_read_handles: 4,
+                max_sessions: 4,
+                max_browser_sessions: 1,
+                ..Default::default()
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn zero_byte_page_request_is_refused_not_stalling() {
+        // 评审 r2 W-4：`max_bytes = 0` 会返回 `next_offset == offset` 的空页，
+        // 客户端因此永远停在同一页 —— G17 的"next_offset 单调"被破坏。
+        let dir = tmp("zero-page");
+        std::fs::write(dir.join("f.bin"), vec![7u8; 10]).unwrap();
+        let mut e = engine(&dir);
+        let s = e.authenticate("u", "loopback", "s3cret").unwrap();
+        let err = e.read_page(s, "downloads", "f.bin", 0, 0).unwrap_err();
+        assert_eq!(
+            err.code,
+            code::PAGE_TOO_LARGE,
+            "0 字节请求必须显式拒: {err}"
+        );
+        let p = e.read_page(s, "downloads", "f.bin", 0, 4).unwrap();
+        assert!(p.next_offset > 0, "正常页的 next_offset 必须前进");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn part_creation_refuses_a_preplanted_symlink() {
+        // `part_path` 的"不可预置"依赖一条 std 语义：O_CREAT|O_EXCL 遇到已存在的
+        // 符号链接必须失败，而不是跟随它把字节写穿到链接目标（评审 F5）。
+        // 这条测试锁住前提本身；父目录被换链接那一类 TOCTOU 由 reverify_parent
+        // 事前/事后两次检查夹住，残余窗口写在 G13 与 PRODUCT §18.3。
+        if !cfg!(unix) {
+            eprintln!(
+                "skip: Windows 建符号链接需要特权（见 symlink_component_is_refused_on_every_verb）"
+            );
+            return;
+        }
+        let dir = tmp("part-oexcl");
+        let outside = tmp("part-outside");
+        std::fs::write(outside.join("victim"), b"ORIGINAL").unwrap();
+        let link = dir.join(".f.bin.nexus-part-deadbeef");
+        std::os::unix::fs::symlink(outside.join("victim"), &link).unwrap();
+        let opened = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&link);
+        assert!(opened.is_err(), "O_EXCL 必须拒绝已存在的符号链接");
+        assert_eq!(std::fs::read(outside.join("victim")).unwrap(), b"ORIGINAL");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]
@@ -1973,5 +4002,9 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
         assert!(!constant_time_eq(b"", b"a"));
+        // 诚实边界（评审：这是第二条装饰测试）：本测试能杀"长度不等提前返回 false"
+        // 和"只比前缀"两种变异，但**杀不掉**"逐字节比较时提前 return"——那是
+        // 时序侧信道，进程内无法可靠观测。该变异因此登记在 V2 §10 的
+        // 变异可杀性清单里，按"评审目视 + 人工检查"处理，不谎称机器可验。
     }
 }

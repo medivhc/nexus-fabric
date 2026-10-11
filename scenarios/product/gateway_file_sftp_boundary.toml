@@ -64,10 +64,26 @@ equals = false
 field = "mutation_capability_of_sftp_backend"
 equals = false
 
+# 评审 r1 F3：常量回读杀不掉变异（把 allows_mutation() 翻成 true 时下一道
+# require_local_io 同样回 UNSUPPORTED，场景照样绿）。这里加严成"哪一道门拒的"，
+# 翻转能力位会把它变成 TRANSPORT_NOT_IMPLEMENTED ⇒ 场景变红。
+[[expect]]
+field = "sftp_refusal_gate"
+equals = "G14_NO_NON_OVERWRITING_PUBLISH"
+
 [[expect]]
 field = "relative_remote_root_rejected"
 equals = true
 
 [[expect]]
 field = "dotdot_remote_root_rejected"
+equals = true
+
+# 评审 r2 NEW-1：提交必须落在打开它的那个 root，且提交路径同过权限门
+[[expect]]
+field = "commit_root_redirect_code"
+equals = "OUTSIDE_ROOT"
+
+[[expect]]
+field = "commit_after_refusal_recovers"
 equals = true

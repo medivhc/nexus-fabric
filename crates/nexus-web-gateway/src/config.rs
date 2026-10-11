@@ -12,6 +12,11 @@ use crate::error::GatewayError;
 pub const DEFAULT_SSH_TARGET: &str = "127.0.0.1:22";
 /// Default per-session concurrent terminal limit.
 pub const DEFAULT_MAX_TERMINALS: usize = 5;
+
+/// Upper bound accepted by `validate()`. Deliberately far above the default:
+/// it exists to reject a config that would open unbounded channels/threads,
+/// not to tune capacity.
+pub const MAX_TERMINALS_CEILING: usize = 64;
 /// Default idle timeout for an SSH terminal.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 600;
 
@@ -257,6 +262,15 @@ impl GatewayConfig {
                 "ssh.max_terminals must be >= 1".into(),
             ));
         }
+        // 上界同样要检查：每条 terminal 是一个 ssh channel + 一个 worker +
+        // 一段发送缓冲。只检查 `== 0` 时，一个浏览器会话把这项配成 10 万也能
+        // 起进程——这和文件类预算未接线是同一类资源缺陷（评审 WARN），
+        // 所以两个方向都在 `validate()` 里封住。
+        if self.ssh.max_terminals > MAX_TERMINALS_CEILING {
+            return Err(GatewayError::Config(format!(
+                "ssh.max_terminals must be <= {MAX_TERMINALS_CEILING}"
+            )));
+        }
         if self.ssh.idle_timeout_secs == 0 {
             return Err(GatewayError::Config(
                 "ssh.idle_timeout_secs must be >= 1".into(),
@@ -329,6 +343,17 @@ mod tests {
         let mut cfg = valid_config();
         cfg.ssh.max_terminals = 0;
         assert!(matches!(cfg.validate(), Err(GatewayError::Config(_))));
+    }
+
+    #[test]
+    fn oversized_max_terminals_rejected() {
+        // 只有下界的检查等于没有检查：把上界配成 10 万照样通过。
+        let mut cfg = valid_config();
+        cfg.ssh.max_terminals = MAX_TERMINALS_CEILING + 1;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("max_terminals"), "错误信息要可执行: {err}");
+        cfg.ssh.max_terminals = MAX_TERMINALS_CEILING;
+        assert!(cfg.validate().is_ok(), "上界本身必须可用");
     }
 
     #[test]
