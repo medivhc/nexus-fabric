@@ -1,0 +1,63 @@
+schema_version = 1
+id = "engineering.code-intelligence-callees"
+title = "callees 支持一层按需展开：Scheduler::tick 的被调用方里必须含 dispatch_dyn（提案 §16.3）"
+evidence_strength = "E4"
+requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#16-acceptance-criteria"
+
+# 锚点：fixtures/code-intel/src/lib.rs:23:12 = `pub fn tick`。
+# tick 调用 transport::dispatch_dyn，同时 RA 会把 `Result::Ok` 这类标准库构造算作被调方。
+# 这里兑现标题：断言第 0 条就是 dispatch_dyn 且 in_scope=true，第 1 条是仓库外标准库符号且
+# in_scope=false（"越界不删除、只标注"这条不变量首次有 E4 覆盖）。
+# 依据：outgoingCalls 按源码出现顺序返回，两宿主实测一致（Windows RA 1.95.0 / Linux RA 1.94.1，
+# results[0]=dispatch_dyn、results[1]=Result::Ok）。若某次 RA 改了顺序，本场景会变红——
+# 那是真回归信号，不是脆弱性；届时应按 requirement-change 流程重冻结，而不是删断言。
+[given]
+repository = "initialized"
+network = "none (本地 language server 子进程)"
+
+[when]
+command = "nexus-harness code callees engineering/nexus-harness/fixtures/code-intel/src/lib.rs:23:12 --workspace engineering/nexus-harness/fixtures/code-intel --json"
+
+[[expect]]
+field = "command"
+equals = "code callees"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "authority"
+equals = "advisory"
+
+[[expect]]
+field = "results"
+non_empty = true
+
+[[expect]]
+field = "budget.truncated"
+equals = false
+
+[[expect]]
+field = "provider.ready"
+equals = true
+
+[[expect]]
+field = "snapshot.workspace_root"
+non_empty = true
+
+[[expect]]
+field = "results.0.symbol"
+equals = "dispatch_dyn"
+
+[[expect]]
+field = "results.0.in_scope"
+equals = true
+
+[[expect]]
+field = "results.1.in_scope"
+equals = false
+
+[[expect]]
+field = "results.1.qualified_name"
+equals = "Result::Ok"

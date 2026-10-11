@@ -2,10 +2,46 @@
 
 本包实现《Nexus 统一系统设计规范 v9》中的“统一仓库目录契约”。
 
-文件数（不含本清单）：137
+文件数（不含本清单）：177
+
+> 2026-10-10：原声明值 137 与表内实际行数（148）已不一致（既有漂移，含
+> `scenarios/engineering/bench_gate_verdicts.toml` 等未登记项）。本次登记
+> Code Intelligence 的 18 个新文件时一并改为与表内行数一致，并补登该缺口。
+>
+> 2026-10-10（第二轮，独立 Review round 1 整改）：补登 `code_intelligence_callees`、
+> `code_intelligence_read_only_counters`、`code_intelligence_scope_violation`、
+> `code_intelligence_budget_count` 四个场景与 `.agents/green-evidence-code-intelligence.txt`，
+> 声明值同步为表内行数。
+>
+> 2026-10-10（第三轮，独立 Review round 2 整改）：补登
+> `code_intelligence_scope_escape.toml`（目标用 `..` 逃出 `--workspace`）与
+> `code_intelligence_workspace_escape.toml`（`--workspace` 根逃出仓库，须在 spawn 前被拒），
+> 声明值 172 -> 174。注意 `.evidence/review-*` 与 `verify-*` 目录由 `.gitignore` 排除，
+> 不进本清单；Review 案卷因此只在本机可见，需要分享时得显式 `git add -f`。
+>
+> 2026-10-10（第四轮，独立 Review round 3 判 `COMMENTED`）：补登
+> `.agents/code-intelligence-followups.md`（12 条后续待办的承载体，避免"待办只写在提交说明里"），
+> 声明值 174 -> 175。
+>
+> 2026-10-10（第五轮，round 3 待办 3 落地）：补登
+> `scenarios/engineering/code_intelligence_diagnostics_item_shape.toml`（诊断条目形状的 E4）
+> 与其夹具 `engineering/nexus-harness/fixtures/code-intel/src/diagnostic_probe.rs`
+> （刻意留一处类型错误；`lib.rs` 只在**末尾**挂 `mod diagnostic_probe;`，否则会挪动
+> `lib.rs:9:21` / `lib.rs:23:12` 两个冻结锚点），声明值 175 -> 177。
+> 本轮先跑出新场景的 Red（`scenario-edf5bdf1d4b8`，夹具文件尚不存在 ⇒ `verdict` 期望落空），
+> 再加夹具转 Green——契约先行，不是先看输出再补期望。
+>
+> 既有缺口（非本次引入，保留待仓库所有者裁决）：`.evidence/.gitignore`、
+> `.evidence/README.md` 两行来自基线（`7d2e643`），但这两个文件已在
+> `5694faa`（"untrack generated .evidence artifacts"）中被取消跟踪，磁盘上也不
+> 存在，因此按"表内行数"统计的值比按 `git ls-files` 口径多 2。本清单未按
+> `git ls-files` 口径校准，此处如实标注差异而不是静默改数。
 
 | Path | Purpose |
 |---|---|
+| `.agents/code-intelligence-followups.md` | 独立 Review round 3（`COMMENTED`）的 12 条后续待办，逐条带 `文件:行` 与验收动作；作为"机器可见的待办承载体" |
+| `.agents/green-evidence-code-intelligence.txt` | Green Evidence record（Code Intelligence E4 场景全 PASS，正文记录其绑定的 source_revision） |
+| `.agents/red-evidence-code-intelligence.txt` | Red Evidence record（Code Intelligence 契约阶段 9/9 FAIL） |
 | `.agents/skills/README.md` | Project-level agent skill index |
 | `.agents/skills/nexus-contract-first/SKILL.md` | Project-level agent skill |
 | `.agents/skills/nexus-evidence/SKILL.md` | Project-level agent skill |
@@ -124,12 +160,21 @@
 | `engineering/evidence-schema/evidence.schema.json` | Machine-readable schema |
 | `engineering/nexus-harness/Cargo.toml` | Rust package/workspace manifest |
 | `engineering/nexus-harness/MODULE.md` | Module Contract |
+| `engineering/nexus-harness/fixtures/code-intel/Cargo.toml` | Rust package manifest (code-intelligence fixture, standalone workspace) |
+| `engineering/nexus-harness/fixtures/code-intel/src/lib.rs` | Rust source (fixture: re-export/cfg/probe) |
+| `engineering/nexus-harness/fixtures/code-intel/src/transport.rs` | Rust source (fixture: trait + multi-impl + generic dispatch) |
+| `engineering/nexus-harness/fixtures/code-intel/src/diagnostic_probe.rs` | Rust source (fixture: 刻意一处类型错误，供诊断条目形状 E4 断言) |
 | `engineering/nexus-harness/src/main.rs` | Minimal compile/bootstrap source |
 | `engineering/nexus-harness/src/env.rs` | Rust source (harness CLI) |
 | `engineering/nexus-harness/src/config.rs` | Rust source (harness CLI) |
 | `engineering/nexus-harness/src/gates.rs` | Rust source (harness CLI) |
 | `engineering/nexus-harness/src/scenario.rs` | Rust source (harness CLI) |
 | `engineering/nexus-harness/src/evidence.rs` | Rust source (harness CLI) |
+| `engineering/nexus-harness/src/code_intel/mod.rs` | Rust source (Code Intelligence CLI 层：参数/预算/snapshot/envelope) |
+| `engineering/nexus-harness/src/code_intel/dto.rs` | Rust source (Code Intelligence 语言中立 DTO 与错误码) |
+| `engineering/nexus-harness/src/code_intel/lsp.rs` | Rust source (JSON-RPC/LSP framing、只读白名单、有界会话) |
+| `engineering/nexus-harness/src/code_intel/provider.rs` | Rust source (CodeIntelligenceProvider 契约与 binary 解析) |
+| `engineering/nexus-harness/src/code_intel/rust_analyzer.rs` | Rust source (rust-analyzer provider：生命周期/就绪收敛/语义映射) |
 | `engineering/nexus-harness/src/commands.rs` | Rust source (harness CLI) |
 | `engineering/plugins/README.md` | Repository contract/documentation |
 | `engineering/plugins/plugin-contract.md` | Repository contract/documentation |
@@ -141,6 +186,23 @@
 | `policies/deny.toml` | Machine-readable contract/policy/scenario (cargo-deny executor config) |
 | `policies/quality.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/README.md` | Repository contract/documentation |
+| `scenarios/engineering/bench_gate_verdicts.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_budget_count.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_budget_truncation.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_callees.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_callers.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_definition.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_diagnostics_advisory.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_diagnostics_item_shape.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_hover.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_implementations.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_provider_unavailable.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_read_only_counters.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_scope_escape.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_scope_violation.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_symbol.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_workspace_escape.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_write_method_denied.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/harness_status_verdicts.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/harness_verify_fast_evidence.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/platform/virtual_packet_interface.toml` | Machine-readable contract/policy/scenario |

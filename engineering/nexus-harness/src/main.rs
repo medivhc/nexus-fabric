@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod code_intel;
 mod commands;
 mod config;
 mod env;
@@ -67,6 +68,7 @@ fn dispatch(command: &str, rest: &[String]) -> Outcome {
         "explain" => commands::explain(),
         "run" => run_scenario::run_scenario(rest),
         "scenario" => scenario_cmd::dispatch(rest),
+        "code" => code_intel::run(rest),
         "bench" => commands::bench(),
         "replay" => (
             "UNKNOWN".to_string(),
@@ -76,7 +78,7 @@ fn dispatch(command: &str, rest: &[String]) -> Outcome {
         ),
         _ => (
             "BLOCKED".to_string(),
-            "supported commands: status, context, check, test, verify, explain, bench, replay, scenario"
+            "supported commands: status, context, check, test, verify, explain, bench, replay, scenario, code"
                 .to_string(),
             Vec::new(),
         ),

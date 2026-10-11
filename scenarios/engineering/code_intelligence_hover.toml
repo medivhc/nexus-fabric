@@ -1,0 +1,37 @@
+schema_version = 1
+id = "engineering.code-intelligence-hover"
+title = "hover 返回结构化标记文本而非 ANSI 终端文本（提案 §4/§16.4）"
+evidence_strength = "E4"
+requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#16-acceptance-criteria"
+
+# 锚点：fixtures/code-intel/src/lib.rs:23:12 = `pub fn tick`。
+[given]
+repository = "initialized"
+network = "none (本地 language server 子进程)"
+
+[when]
+command = "nexus-harness code hover engineering/nexus-harness/fixtures/code-intel/src/lib.rs:23:12 --workspace engineering/nexus-harness/fixtures/code-intel --json"
+
+[[expect]]
+field = "command"
+equals = "code hover"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "count"
+equals = 1
+
+[[expect]]
+field = "results.0.snippet"
+non_empty = true
+
+[[expect]]
+field = "results.0.qualified_name"
+non_empty = true
+
+[[expect]]
+field = "authority"
+equals = "advisory"

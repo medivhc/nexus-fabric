@@ -309,7 +309,10 @@ pub fn affected_tests_gate(repo: &Repo, _config: &Config) -> Gate {
         Err(e) => return Gate::unknown("affected-tests", &format!("cargo metadata failed: {e}")),
     };
     let members = member_names(&meta);
-    let affected = changed_member_names(repo, &meta, &members);
+    let affected = match changed_member_names(repo, &meta, &members) {
+        Ok(affected) => affected,
+        Err(e) => return Gate::unknown("affected-tests", &e),
+    };
     if affected.is_empty() {
         return Gate::ok("affected-tests", "no affected crates changed");
     }
@@ -396,17 +399,30 @@ fn reverse_deps(meta: &Value, name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn changed_member_names(repo: &Repo, meta: &Value, members: &[String]) -> Vec<String> {
+/// Changed files -> owning crates (+ direct reverse deps).
+///
+/// git 失败一律上抛而不是 `unwrap_or_default()`：变更集为空会被调用方读成
+/// "no affected crates changed" 并 **PASS**，那是 fail-open —— 同一缺陷类刚在
+/// `code_intel` 侧被独立 Review round 2 堵住（`Repo::porcelain_result()`）。
+/// 现在 git 取不到变更集时门记 UNKNOWN 并写明原因。
+fn changed_member_names(
+    repo: &Repo,
+    meta: &Value,
+    members: &[String],
+) -> Result<Vec<String>, String> {
     let manifests = member_manifests(meta);
     let mut changed: Vec<String> = Vec::new();
 
     // committed changes vs HEAD
     let tracked = repo
         .git(&["diff", "--name-only", "HEAD"])
-        .unwrap_or_default();
+        .map_err(|e| format!("git diff HEAD failed, cannot tell what changed: {e}"))?;
     let mut files: Vec<String> = tracked.lines().map(str::to_string).collect();
     // untracked additions
-    for line in repo.porcelain().lines() {
+    let status = repo
+        .porcelain_result()
+        .map_err(|e| format!("git status --porcelain failed, cannot tell what changed: {e}"))?;
+    for line in status.lines() {
         if let Some(rest) = line.strip_prefix("?? ") {
             files.push(rest.to_string());
         }
@@ -415,6 +431,10 @@ fn changed_member_names(repo: &Repo, meta: &Value, members: &[String]) -> Vec<St
     for f in &files {
         let abs = repo.root.join(f);
         for (name, dir) in &manifests {
+            // 词法比较而非归一化比较：`git diff HEAD` 会列出**已删除**的路径，
+            // 那些路径归一化必然失败，用 `path_is_within_resolved` 反而会把删除的
+            // crate 从 affected 集合里漏掉（fail-open）。这里不涉及 spawn，安全边界
+            // 不在这一层，保留词法判定。
             if path_is_within(&abs, dir) && !changed.iter().any(|c| c == name) {
                 changed.push(name.clone());
             }
@@ -432,7 +452,7 @@ fn changed_member_names(repo: &Repo, meta: &Value, members: &[String]) -> Vec<St
     }
     with_rev.sort();
     with_rev.dedup();
-    with_rev
+    Ok(with_rev)
 }
 
 /// Light architecture gate: every `crates/*` workspace member must be declared
@@ -1798,6 +1818,12 @@ mod tests {
         // §12.58 声明了同一算法且可复现，用它做算法基准。
         let repo = crate::env::Repo::discover().expect("repo must be discoverable");
         let text = std::fs::read_to_string(repo.root.join("PRODUCT.md")).expect("PRODUCT.md");
+        // 冻结边界的 hash 必须与"git 里那份 blob"对齐，而不是与某个宿主的 checkout
+        // 字节对齐：`.gitattributes` 的 `* text=auto` 会在 Windows 工作树里把 LF 换成
+        // CRLF，于是同一 commit 在 Windows 上算出的 hash 与文档里存的值不同——这个
+        // 防篡改检查在本就无可篡改的宿主上假红（实测：Windows 109 项里此测试 FAIL，
+        // xc-pc-linux 上 PASS，差别只在行尾）。按 LF 规范化后再算，与 git blob 一致。
+        let text = text.replace("\r\n", "\n");
         let lines: Vec<&str> = text.split('\n').collect();
 
         let hash_of =
@@ -1838,6 +1864,82 @@ mod tests {
             lines[idx16].contains(&h16),
             "PRODUCT §16 contract hash is not reproducible: documented {} but computed {h16}",
             lines[idx16]
+        );
+    }
+
+    #[test]
+    fn product_freeze_hash_is_line_ending_independent() {
+        // 冻结边界防篡改检查必须与 git blob（LF）对齐，而不是与某个宿主的 checkout
+        // 字节（Windows 上 `* text=auto` 会给出 CRLF）对齐。这里锁定"同一内容、
+        // 两种行尾 → 同一个 hash"，防止有人把规范化改回去而本宿主仍绿。
+        fn sha256_hex(data: &[u8]) -> String {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(data);
+            hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        }
+        let body = "### §12.58 标题\n\n正文一行。\n\n契约 hash: `x`\n";
+        let crlf = body.replace('\n', "\r\n");
+        assert_ne!(body, crlf, "fixture must actually differ in line endings");
+        // 与实现里的做法一致：先规范化行尾再算。
+        assert_eq!(
+            sha256_hex(crlf.replace("\r\n", "\n").as_bytes()),
+            sha256_hex(body.as_bytes()),
+            "CRLF checkout must hash to the same value as the LF blob"
+        );
+        // 反面：不规范化就一定不一致（说明这条测试有意义）。
+        assert_ne!(sha256_hex(crlf.as_bytes()), sha256_hex(body.as_bytes()));
+    }
+
+    #[test]
+    fn affected_analysis_surfaces_git_failure_instead_of_empty_change_set() {
+        // 独立 Review round 3 待办 1：`git diff --name-only HEAD` 与 porcelain 双双
+        // `unwrap_or_default()` ⇒ git 失败时变更集为空 ⇒ affected-tests 门输出
+        // "no affected crates changed" 并 **PASS**（fail-open）。现在必须上抛。
+        let root = std::env::temp_dir().join(format!("harness-not-a-repo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp dir");
+        let repo = crate::env::Repo { root: root.clone() };
+        assert!(
+            repo.git(&["rev-parse", "--show-toplevel"]).is_err(),
+            "本测试需要一个不在任何 git 仓库内的临时目录，否则失败注入不成立"
+        );
+        let meta = serde_json::json!({ "packages": [] });
+        let err = changed_member_names(&repo, &meta, &[])
+            .expect_err("git 失败必须上抛，不能伪装成『没有变更』");
+        assert!(
+            err.contains("git diff"),
+            "错误里要写明是哪一步取不到：{err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn affected_gate_is_unknown_when_git_fails() {
+        // 门侧收口：git 取不到变更集时门记 UNKNOWN 并给出原因，而不是 PASS。
+        let root =
+            std::env::temp_dir().join(format!("harness-affected-unknown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp dir");
+        let repo = crate::env::Repo { root: root.clone() };
+        let config = crate::config::Config::load(&crate::env::Repo::discover().expect("repo"))
+            .expect("config");
+        let gate = affected_tests_gate(&repo, &config);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(gate.name, "affected-tests");
+        assert_eq!(
+            gate.verdict, "UNKNOWN",
+            "git 失败绝不能是 PASS：detail={}",
+            gate.detail
+        );
+        assert!(
+            gate.detail.contains("git"),
+            "UNKNOWN 必须写明原因：{}",
+            gate.detail
         );
     }
 }

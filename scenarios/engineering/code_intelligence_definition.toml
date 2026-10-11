@@ -1,0 +1,38 @@
+schema_version = 1
+id = "engineering.code-intelligence-definition"
+title = "从 re-export 位置解析 definition 必须穿透到真实声明处（提案 §16.1）"
+evidence_strength = "E4"
+requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#16-acceptance-criteria"
+
+# 锚点：fixtures/code-intel/src/lib.rs:9:21 = `pub use transport::{Egress, ...}`
+# 中的 `Egress`。definition 应落到 transport.rs 的 trait 声明（7:11），唯一命中。
+[given]
+repository = "initialized"
+network = "none (本地 language server 子进程)"
+
+[when]
+command = "nexus-harness code definition engineering/nexus-harness/fixtures/code-intel/src/lib.rs:9:21 --workspace engineering/nexus-harness/fixtures/code-intel --json"
+
+[[expect]]
+field = "command"
+equals = "code definition"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "count"
+equals = 1
+
+[[expect]]
+field = "results.0.path"
+equals = "engineering/nexus-harness/fixtures/code-intel/src/transport.rs"
+
+[[expect]]
+field = "results.0.range.start.line"
+equals = 7
+
+[[expect]]
+field = "authority"
+equals = "advisory"

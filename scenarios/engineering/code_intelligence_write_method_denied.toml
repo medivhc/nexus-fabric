@@ -1,0 +1,34 @@
+schema_version = 1
+id = "engineering.code-intelligence-write-method-denied"
+title = "Code Intelligence 只读：rename / applyEdit / executeCommand 类动词一律 UNSUPPORTED（提案 §3/§14/§16.8）"
+evidence_strength = "E4"
+requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#14-security-and-resource-control"
+
+# 写能力不进入 Agent-facing API：CLI 层即拒绝，不依赖 provider 侧自觉。
+# 与单元测试（LSP 方法白名单）互为冗余防线。
+[given]
+repository = "initialized"
+network = "none (本地 language server 子进程)"
+
+[when]
+command = "nexus-harness code rename engineering/nexus-harness/fixtures/code-intel/src/transport.rs:9:8 --workspace engineering/nexus-harness/fixtures/code-intel --json"
+
+[[expect]]
+field = "command"
+equals = "code rename"
+
+[[expect]]
+field = "verdict"
+equals = "BLOCKED"
+
+[[expect]]
+field = "error.code"
+equals = "UNSUPPORTED"
+
+[[expect]]
+field = "error.reason"
+non_empty = true
+
+[[expect]]
+field = "authority"
+equals = "advisory"

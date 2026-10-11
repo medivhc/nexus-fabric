@@ -1,0 +1,36 @@
+schema_version = 1
+id = "engineering.code-intelligence-diagnostics-advisory"
+title = "diagnostics 输出结构化 DTO 且 authority 恒为 advisory，不产出 correctness PASS（提案 §7/§16.10）"
+evidence_strength = "E4"
+requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#7-compiler-truth-remains-separate"
+
+[given]
+repository = "initialized"
+network = "none (本地 language server 子进程)"
+
+[when]
+command = "nexus-harness code diagnostics engineering/nexus-harness/fixtures/code-intel/src/lib.rs --workspace engineering/nexus-harness/fixtures/code-intel --json"
+
+[[expect]]
+field = "command"
+equals = "code diagnostics"
+
+[[expect]]
+field = "verdict"
+one_of = ["PASS", "FAIL"]
+
+[[expect]]
+field = "authority"
+equals = "advisory"
+
+[[expect]]
+field = "provider.kind"
+equals = "rust-analyzer"
+
+[[expect]]
+field = "snapshot.source_revision"
+non_empty = true
+
+[[expect]]
+field = "message"
+non_empty = true

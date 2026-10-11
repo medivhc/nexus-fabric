@@ -3,6 +3,23 @@
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
+
+/// git 的 `.git/index.lock` 是极短临界区。同一测试二进制并发跑（默认多线程）时，
+/// `write-tree` / `status` 会撞锁失败；调用方把失败降级成哨兵值
+/// （`tree-unknown` / `dirty-unknown` / 空串），于是出现"digest 不确定"的**假失败**
+/// （实测 `env::tests::digests_deterministic_and_sha1_length` 在 Linux 上偶发红）。
+/// 这里只对真正的锁竞争重试，其它错误原样上报，不吞任何失败。
+const GIT_LOCK_RETRIES: u32 = 4;
+const GIT_LOCK_BACKOFF: Duration = Duration::from_millis(25);
+
+/// 判定 stderr 是否为 git 索引/引用锁竞争（大小写不敏感）。
+fn is_lock_contention(stderr: &str) -> bool {
+    let hay = stderr.to_ascii_lowercase();
+    hay.contains("index.lock")
+        || hay.contains("cannot lock ref")
+        || (hay.contains("unable to create") && hay.contains("lock"))
+}
 
 pub struct Repo {
     pub root: PathBuf,
@@ -42,21 +59,29 @@ impl Repo {
     }
 
     /// Run git in the repo root; returns trimmed stdout.
+    ///
+    /// 仅对锁竞争重试（见 `GIT_LOCK_RETRIES`），退避 25/50/75ms；其余失败立即返回 Err。
     pub fn git(&self, args: &[&str]) -> Result<String, String> {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(&self.root)
-            .args(args)
-            .output()
-            .map_err(|e| format!("failed to run git: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "git {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+        let mut attempt = 1u32;
+        loop {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&self.root)
+                .args(args)
+                .output()
+                .map_err(|e| format!("failed to run git: {e}"))?;
+            if out.status.success() {
+                return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
+            }
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let message = format!("git {} failed: {}", args.join(" "), stderr);
+            if attempt < GIT_LOCK_RETRIES && is_lock_contention(&stderr) {
+                std::thread::sleep(GIT_LOCK_BACKOFF * attempt);
+                attempt += 1;
+                continue;
+            }
+            return Err(message);
         }
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
     /// Hash a string through `git hash-object --stdin` (sha1, no crypto dep).
@@ -93,23 +118,38 @@ impl Repo {
             .unwrap_or_else(|_| "no-commit".to_string())
     }
 
-    pub fn porcelain(&self) -> String {
-        self.git(&["status", "--porcelain"]).unwrap_or_default()
+    /// `git status --porcelain` 原始输出，**保留失败**：调用方不得把"问不到"当成"干净"。
+    ///
+    /// 这里刻意**没有** `porcelain() -> String` 这种吞掉 `Err` 的便捷包装：round 2/3
+    /// 两次独立 Review 都在同一个地方踩到 fail-open（Evidence 的 `dirty_state`、
+    /// affected 分析的变更集），根因就是有一个把失败读成"空输出 = 干净/无变更"的
+    /// 默认值可用。失败必须由调用方显式决定记 UNKNOWN 还是 FAIL。
+    pub fn porcelain_result(&self) -> Result<String, String> {
+        self.git(&["status", "--porcelain"])
     }
 
-    pub fn is_dirty(&self) -> bool {
-        !self.porcelain().is_empty()
+    /// `None` = git 查询失败。独立 Review round 2 记的 fail-open 缺口就在这里：
+    /// 旧实现 `unwrap_or_default()` 会把"问不到"写成 `dirty_state: false`，
+    /// 于是 Evidence 里出现一条正面事实"工作树干净"。
+    pub fn dirty_state(&self) -> Option<bool> {
+        self.porcelain_result().map(|p| !p.is_empty()).ok()
     }
 
     /// Digest of the working tree: index tree when clean, otherwise a hash of
     /// the porcelain output (stable for a given dirty state).
+    ///
+    /// 只问一次 `git status`（旧实现问两次，既多一倍开销又多一倍 index.lock 竞争面）。
+    /// 问不到状态时返回哨兵值 `dirty-unknown`，由调用方显式处理
+    /// （`code_intel::digest_is_unusable` 就是那个"显式处理"）。
     pub fn working_tree_digest(&self) -> String {
-        if self.is_dirty() {
-            self.hash_stdin(&self.porcelain())
-                .unwrap_or_else(|_| "dirty-unknown".to_string())
-        } else {
-            self.git(&["write-tree"])
-                .unwrap_or_else(|_| "tree-unknown".to_string())
+        match self.porcelain_result() {
+            Ok(porcelain) if porcelain.is_empty() => self
+                .git(&["write-tree"])
+                .unwrap_or_else(|_| "tree-unknown".to_string()),
+            Ok(porcelain) => self
+                .hash_stdin(&porcelain)
+                .unwrap_or_else(|_| "dirty-unknown".to_string()),
+            Err(_) => "dirty-unknown".to_string(),
         }
     }
 
@@ -231,6 +271,27 @@ pub fn path_is_within(path: &Path, dir: &Path) -> bool {
     path.starts_with(dir)
 }
 
+/// `std::fs::canonicalize` 的 Option 形态：失败（不存在、无权限、跨卷…）返回 None。
+pub fn canonicalized(path: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(path).ok()
+}
+
+/// **文件系统视角**的包含关系：两侧都先 canonicalize，再按路径组件比较。
+///
+/// 为什么不能用 `path_is_within`：`fixtures/../../../../run-scenarios.sh` 在词法上
+/// 以仓库根为前缀，实际指向仓库之外（独立 Review round 2 的 B-R2-1 就是这条通路把查询
+/// 目标送出仓库、并让子进程 cwd 落在仓库外的）。canonicalize 同时解决三类假阳/假阴：
+/// `.`/`..` 组件、符号链接与 Windows junction、盘符大小写。
+///
+/// fail-closed 语义：任一侧归一化失败即返回 false —— 调用方必须把 false 当作
+/// "无法证明在范围内"并显式报错，不得当成通过。
+pub fn path_is_within_resolved(path: &Path, dir: &Path) -> bool {
+    match (canonicalized(path), canonicalized(dir)) {
+        (Some(p), Some(d)) => p.starts_with(&d),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,10 +299,124 @@ mod tests {
     #[test]
     fn digests_deterministic_and_sha1_length() {
         let repo = Repo::discover().expect("must run inside the nexus repository");
-        assert_eq!(repo.configuration_digest(), repo.configuration_digest());
-        assert_eq!(repo.contract_hash(), repo.contract_hash());
-        assert_eq!(repo.working_tree_digest(), repo.working_tree_digest());
+        // 降级哨兵值（`*-unknown`）代表"没取到"，不能算成一次确定的取值：
+        // 之前它就是靠 assert_eq!(f(), f()) 两次都拿到同一个哨兵而蒙过去的。
+        for (name, first, second) in [
+            (
+                "configuration_digest",
+                repo.configuration_digest(),
+                repo.configuration_digest(),
+            ),
+            ("contract_hash", repo.contract_hash(), repo.contract_hash()),
+            (
+                "working_tree_digest",
+                repo.working_tree_digest(),
+                repo.working_tree_digest(),
+            ),
+        ] {
+            assert_eq!(first, second, "{name} 两次取值不一致");
+            assert!(
+                !first.ends_with("-unknown"),
+                "{name} 取到降级哨兵值 {first}：git 调用失败，不得当作确定取值"
+            );
+        }
         assert_eq!(repo.hash_stdin("abc").unwrap().len(), 40);
+    }
+
+    /// B-R2-1 的根因测试：词法前缀判定会被 `..` 骗过，归一化判定不会。
+    /// 两条断言合起来才说明问题——先证明缺陷形状仍然存在（词法判"在内"），
+    /// 再证明修复后的判定把它挡下（canonical 判"越界"）。
+    #[test]
+    fn resolved_containment_blocks_dotdot_that_lexical_allows() {
+        let repo = Repo::discover().expect("must run inside the nexus repository");
+        let root = repo.root.clone();
+        let ws = root.join("engineering").join("nexus-harness");
+        // engineering/nexus-harness/src/../../../crates/nexus-domain/Cargo.toml
+        //   == <repo>/crates/nexus-domain/Cargo.toml —— 在仓库内、在 workspace 外。
+        let escapee = ws
+            .join("src")
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("crates")
+            .join("nexus-domain")
+            .join("Cargo.toml");
+        assert!(escapee.is_file(), "夹具路径失效：{}", escapee.display());
+        assert!(
+            path_is_within(&escapee, &ws),
+            "词法判定仍命中前缀——这正是 round 2 缺陷的来源"
+        );
+        assert!(
+            !path_is_within_resolved(&escapee, &ws),
+            "归一化后必须判为越界"
+        );
+        // 同一棵树里的冗余 `.`/`..` 组合不该被误判为越界（避免修复过头）。
+        let legit = ws
+            .join("src")
+            .join(".")
+            .join("..")
+            .join("src")
+            .join("main.rs");
+        assert!(legit.is_file(), "夹具路径失效：{}", legit.display());
+        assert!(
+            path_is_within_resolved(&legit, &ws),
+            "canonical 后仍在 workspace 内"
+        );
+        // 归一化失败（不存在）必须是"无法证明"，不是"通过"。
+        let ghost = ws.join("nope-does-not-exist");
+        assert!(!path_is_within_resolved(&ghost, &ws));
+    }
+
+    /// 符号链接越界形态的**跨宿主固化**（round 3 待办 5）。
+    ///
+    /// 这一形态此前只有 xc-pc-linux 上的一次手工实测（`.agents/green-evidence-…txt` §G），
+    /// Windows 侧因无特权建链接而无人复现。这里用 `#[cfg(unix)]` 把它变成回归测试：
+    /// workspace 内放一个指向 workspace 外的链接文件，归一化判定必须拒绝，而词法判定
+    /// 必须仍然"放过"——否则测试没有覆盖到缺陷本身。
+    #[cfg(unix)]
+    #[test]
+    fn resolved_containment_blocks_symlink_escape_that_lexical_allows() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("nexus-symescape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("ws")).expect("temp ws");
+        // 真实文件在 workspace 之外。
+        std::fs::create_dir_all(&base).expect("temp base");
+        let outside = base.join("outside.rs");
+        std::fs::write(&outside, "pub fn outside() {}\n").expect("write outside");
+        // workspace 内的链接指向它。
+        let link = base.join("ws").join("link.rs");
+        symlink(&outside, &link).expect("symlink");
+        let ws = base.join("ws");
+        assert!(
+            path_is_within(&link, &ws),
+            "词法判定放过链接——这正是必须被归一化堵住的形态"
+        );
+        assert!(
+            !path_is_within_resolved(&link, &ws),
+            "canonical 后链接目标是 workspace 外的真实文件，必须判为越界"
+        );
+        // 同目录内的普通文件仍须放行（避免修复过头）。
+        let inside = ws.join("real.rs");
+        std::fs::write(&inside, "pub fn inside() {}\n").expect("write inside");
+        assert!(path_is_within_resolved(&inside, &ws));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 锁竞争判定必须只认 git 的锁类错误：把普通失败也拿去重试会掩盖真故障。
+    #[test]
+    fn lock_contention_detection_covers_git_lock_messages_only() {
+        assert!(is_lock_contention(
+            "fatal:Unable to create '/repo/.git/index.lock': File exists."
+        ));
+        assert!(is_lock_contention(
+            "fatal: Unable to create '/repo/.git/index.lock': Permission denied"
+        ));
+        assert!(is_lock_contention("fatal: cannot lock ref 'HEAD'"));
+        assert!(!is_lock_contention("fatal: not a git repository"));
+        assert!(!is_lock_contention(
+            "error: pathspec 'nope' did not match any file(s)"
+        ));
     }
 
     #[test]

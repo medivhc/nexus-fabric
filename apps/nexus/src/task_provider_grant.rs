@@ -16,6 +16,8 @@ enum Operation {
     List,
 }
 impl Operation {
+    /// 仅 Linux 执行路径消费（审计 intent 渲染）；非 Linux 构建不编译。
+    #[cfg(target_os = "linux")]
     fn name(&self) -> &'static str {
         match self {
             Self::Add => "add",
@@ -24,6 +26,9 @@ impl Operation {
         }
     }
 }
+/// 解析结果在两侧都要构造（非 Linux 也要先做参数校验再报 Unsupported），
+/// 但字段只有 Linux 执行路径会读取，故仅对非 Linux 关闭 dead_code 告警。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone)]
 struct Command {
     operation: Operation,
@@ -139,6 +144,8 @@ impl Failure {
             may_have_applied: false,
         }
     }
+    /// 阶段标注仅 Linux 执行路径使用；非 Linux 直接以 `new()` 报 Unsupported。
+    #[cfg(target_os = "linux")]
     fn at(mut self, phase: &'static str, may_have_applied: bool) -> Self {
         self.phase = phase;
         self.may_have_applied = may_have_applied;

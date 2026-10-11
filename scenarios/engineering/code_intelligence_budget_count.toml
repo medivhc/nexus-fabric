@@ -1,0 +1,46 @@
+schema_version = 1
+id = "engineering.code-intelligence-budget-count"
+title = "截断时 count 必须是**截断前**的完整命中数（提案 §5 反静默丢弃的可量化形式）"
+evidence_strength = "E4"
+requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#5-context-budget"
+
+# 锚点：fixtures/code-intel/src/transport.rs:9:8 = trait 方法 `Egress::send` 声明。
+# includeDeclaration 下的完整命中集由夹具自身结构决定，共 7 处：
+# 声明 1 + 三个 impl（TcpEgress/UdpEgress/RelayEgress）3 + 调用点 3
+# （dispatch、dispatch_dyn、Scheduler::tick）= 7。
+# 因此 --max-results 2 时 count 必须仍是 7；若未来命中数变化，说明夹具结构或
+# provider 语义变了，必须重走契约阶段而不是改这里的数字。
+[given]
+repository = "initialized"
+network = "none (本地 language server 子进程)"
+
+[when]
+command = "nexus-harness code references engineering/nexus-harness/fixtures/code-intel/src/transport.rs:9:8 --workspace engineering/nexus-harness/fixtures/code-intel --max-results 2 --json"
+
+[[expect]]
+field = "command"
+equals = "code references"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "count"
+equals = 7
+
+[[expect]]
+field = "budget.max_results"
+equals = 2
+
+[[expect]]
+field = "budget.truncated"
+equals = true
+
+[[expect]]
+field = "continuation.refinement_hint"
+non_empty = true
+
+[[expect]]
+field = "authority"
+equals = "advisory"

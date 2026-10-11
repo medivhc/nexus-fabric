@@ -1,5 +1,9 @@
 //! Optional local provider service. Submit remains gated on real remote prerequisites.
-use nexus_control_api::task::{TaskCallContext, TaskEnvelope, TaskRequest, TaskResponse};
+use nexus_control_api::task::{TaskEnvelope, TaskRequest};
+// `TaskCallContext` / `TaskResponse` 由 Linux-only 的 `task_service_provider`
+// （经 `use super::*` 继承本模块导入）与各 `#[cfg(target_os = "linux")]` 分支消费。
+#[cfg(target_os = "linux")]
+use nexus_control_api::task::{TaskCallContext, TaskResponse};
 use nexus_domain::task::{TaskError, TaskErrorCode, TaskId};
 use std::path::{Path, PathBuf};
 /// Borrowed by every daemon consumer; only the composition root constructs it.

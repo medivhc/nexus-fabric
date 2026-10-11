@@ -1,0 +1,47 @@
+schema_version = 1
+id = "engineering.code-intelligence-workspace-escape"
+title = "--workspace 根用 `..` 逃出仓库必须在 spawn 之前被拒（B-R2-1 第二表现）"
+evidence_strength = "E4"
+requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#14-security-and-resource-control"
+
+# round 2 实测到的缺陷形状：`--workspace engineering/nexus-harness/../../../` 的
+# is_dir() 为真、词法前缀也命中仓库根，于是校验放行，**子进程真的被 spawn**，
+# 错误要到 initialize 之后才以 TIMEOUT 形式冒出来（cwd 已落到仓库之外）。
+# 现在 validate_scope 先做归一化的仓库归属判定，因此必须是 WORKSPACE_UNRESOLVED，
+# 且 provider 字段根本不出现（没起进程）。
+# 解析后的 workspace 根 = 仓库根的父目录（Windows: D:/next；Linux: $HOME），确在仓库外。
+[given]
+repository = "initialized"
+network = "none (不启动 language server)"
+
+[when]
+command = "nexus-harness code symbol Egress --workspace engineering/nexus-harness/../../../ --json"
+
+[[expect]]
+field = "command"
+equals = "code symbol"
+
+[[expect]]
+field = "verdict"
+equals = "BLOCKED"
+
+[[expect]]
+field = "error.code"
+equals = "WORKSPACE_UNRESOLVED"
+
+[[expect]]
+field = "error.reason"
+non_empty = true
+
+[[expect]]
+field = "count"
+equals = 0
+
+[[expect]]
+field = "authority"
+equals = "advisory"
+
+# 说明：场景求值器没有"字段必须不存在"的操作符（Equals 按 actual==Some(expected) 比较，
+# 缺字段即判 FAIL），因此"没有 spawn 子进程"这条由 E2 单测
+# code_intel::tests::workspace_escape_is_rejected_before_provider_spawn 精确断言
+# envelope 里不出现 provider 字段。

@@ -1,0 +1,34 @@
+schema_version = 1
+id = "engineering.code-intelligence-scope-violation"
+title = "查询目标越出 --workspace 范围必须被拒（提案 §14 资源与安全边界）"
+evidence_strength = "E4"
+requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#14-security-and-resource-control"
+
+# 目标文件真实存在，但不在声明的 --workspace 内：必须 QUERY_INVALID，
+# 而不是悄悄按仓库根去查（那会让 --workspace 变成装饰性参数）。
+[given]
+repository = "initialized"
+network = "none (不启动 language server)"
+
+[when]
+command = "nexus-harness code definition engineering/nexus-harness/fixtures/code-intel/src/transport.rs:9:8 --workspace engineering/nexus-harness/src --json"
+
+[[expect]]
+field = "command"
+equals = "code definition"
+
+[[expect]]
+field = "verdict"
+equals = "FAIL"
+
+[[expect]]
+field = "error.code"
+equals = "QUERY_INVALID"
+
+[[expect]]
+field = "error.reason"
+non_empty = true
+
+[[expect]]
+field = "authority"
+equals = "advisory"

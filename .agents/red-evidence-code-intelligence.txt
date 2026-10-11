@@ -1,0 +1,72 @@
+# Red Evidence: Code Intelligence（契约阶段，旧实现）
+# 日期: 2026-10-10T02:39Z（本地时钟；UTC 见下方 revision）
+# 仓库: nexus-fabric（GitHub medivhc/nexus-fabric 本地克隆）
+# 分支/基线: fix/windows-cfg-portability @ 696fb68（master 8ba9fea + Windows cfg 修复）
+# 执行者: qoder-desktop（NEXUS_AGENT=qoder-desktop）
+# Contract Hash: 096be167075d4a4627e746a667a585fb3e015980   ← 事后证明不可复现，见文末勘误
+# source_revision: 696fb68ac9d7c6d676292df4f6876bf8c21b3971
+# working_tree_digest: ecf12e37b24d697a293c839050fe9535e5a9bce3
+#
+# 契约阶段（nexus-contract-first 阶段 A）内容：
+#   1. engineering/nexus-harness/MODULE.md 新增 Code Intelligence Contract 章节
+#      （Agent-facing API、options/预算默认值、扩展字段、10 个错误码、只读白名单）；
+#   2. 新增 deterministic 夹具 engineering/nexus-harness/fixtures/code-intel；
+#   3. 新增 9 个 E4 场景 scenarios/engineering/code_intelligence_*.toml 并冻结 expectation。
+#
+# 结果: 9/9 verdict=FAIL，failed_step=expect，
+#       实际输出 command="code" / verdict="BLOCKED"（"supported commands: …"）。
+#       旧实现不识别 code 子命令 -> 场景不满足，符合 Red Evidence 要求；
+#       按 nexus-contract-first，无 Red Evidence 不得进入实现阶段——条件已满足。
+
+## engineering.code-intelligence-symbol
+{"command":"scenario run","duration_ms":108,"evidence_id":"scenario-733b0499fe5b","failure_signature":{"assertion":"command","failed_step":"expect","key_log_lines":["{\"command\":\"code\",\"message\":\"supported commands: status, context, check, test, verify, explain, bench, replay, scenario\",\"schema_version\":1,\"verdict\":\"BLOCKED\"}"]},"message":"scenario engineering.code-intelligence-symbol: FAIL (expect engineering.code-intelligence-symbol.command failed (actual: \"code\"))","scenario":"engineering.code-intelligence-symbol","schema_version":1,"verdict":"FAIL"}
+
+## engineering.code-intelligence-implementations
+{"command":"scenario run","duration_ms":108,"evidence_id":"scenario-fe7137071417","failure_signature":{"assertion":"command","failed_step":"expect","key_log_lines":["{\"command\":\"code\",\"message\":\"supported commands: status, context, check, test, verify, explain, bench, replay, scenario\",\"schema_version\":1,\"verdict\":\"BLOCKED\"}"]},"message":"scenario engineering.code-intelligence-implementations: FAIL (expect engineering.code-intelligence-implementations.command failed (actual: \"code\"))","scenario":"engineering.code-intelligence-implementations","schema_version":1,"verdict":"FAIL"}
+
+## engineering.code-intelligence-definition
+{"command":"scenario run","duration_ms":104,"evidence_id":"scenario-58daacd3e0cb","failure_signature":{"assertion":"command","failed_step":"expect","key_log_lines":["{\"command\":\"code\",\"message\":\"supported commands: status, context, check, test, verify, explain, bench, replay, scenario\",\"schema_version\":1,\"verdict\":\"BLOCKED\"}"]},"message":"scenario engineering.code-intelligence-definition: FAIL (expect engineering.code-intelligence-definition.command failed (actual: \"code\"))","scenario":"engineering.code-intelligence-definition","schema_version":1,"verdict":"FAIL"}
+
+## engineering.code-intelligence-callers
+{"command":"scenario run","duration_ms":105,"evidence_id":"scenario-018883c9cc40","failure_signature":{"assertion":"command","failed_step":"expect","key_log_lines":["{\"command\":\"code\",\"message\":\"supported commands: status, context, check, test, verify, explain, bench, replay, scenario\",\"schema_version\":1,\"verdict\":\"BLOCKED\"}"]},"message":"scenario engineering.code-intelligence-callers: FAIL (expect engineering.code-intelligence-callers.command failed (actual: \"code\"))","scenario":"engineering.code-intelligence-callers","schema_version":1,"verdict":"FAIL"}
+
+## engineering.code-intelligence-hover
+{"command":"scenario run","duration_ms":106,"evidence_id":"scenario-8068def1b9de","failure_signature":{"assertion":"command","failed_step":"expect","key_log_lines":["{\"command\":\"code\",\"message\":\"supported commands: status, context, check, test, verify, explain, bench, replay, scenario\",\"schema_version\":1,\"verdict\":\"BLOCKED\"}"]},"message":"scenario engineering.code-intelligence-hover: FAIL (expect engineering.code-intelligence-hover.command failed (actual: \"code\"))","scenario":"engineering.code-intelligence-hover","schema_version":1,"verdict":"FAIL"}
+
+## engineering.code-intelligence-diagnostics-advisory
+{"command":"scenario run","duration_ms":109,"evidence_id":"scenario-b560b918d0fc","failure_signature":{"assertion":"command","failed_step":"expect","key_log_lines":["{\"command\":\"code\",\"message\":\"supported commands: status, context, check, test, verify, explain, bench, replay, scenario\",\"schema_version\":1,\"verdict\":\"BLOCKED\"}"]},"message":"scenario engineering.code-intelligence-diagnostics-advisory: FAIL (expect engineering.code-intelligence-diagnostics-advisory.command failed (actual: \"code\"))","scenario":"engineering.code-intelligence-diagnostics-advisory","schema_version":1,"verdict":"FAIL"}
+
+## engineering.code-intelligence-budget-truncation
+{"command":"scenario run","duration_ms":105,"evidence_id":"scenario-c71e24844867","failure_signature":{"assertion":"command","failed_step":"expect","key_log_lines":["{\"command\":\"code\",\"message\":\"supported commands: status, context, check, test, verify, explain, bench, replay, scenario\",\"schema_version\":1,\"verdict\":\"BLOCKED\"}"]},"message":"scenario engineering.code-intelligence-budget-truncation: FAIL (expect engineering.code-intelligence-budget-truncation.command failed (actual: \"code\"))","scenario":"engineering.code-intelligence-budget-truncation","schema_version":1,"verdict":"FAIL"}
+
+## engineering.code-intelligence-provider-unavailable
+{"command":"scenario run","duration_ms":105,"evidence_id":"scenario-c786c0d2d0a0","failure_signature":{"assertion":"command","failed_step":"expect","key_log_lines":["{\"command\":\"code\",\"message\":\"supported commands: status, context, check, test, verify, explain, bench, replay, scenario\",\"schema_version\":1,\"verdict\":\"BLOCKED\"}"]},"message":"scenario engineering.code-intelligence-provider-unavailable: FAIL (expect engineering.code-intelligence-provider-unavailable.command failed (actual: \"code\"))","scenario":"engineering.code-intelligence-provider-unavailable","schema_version":1,"verdict":"FAIL"}
+
+## engineering.code-intelligence-write-method-denied
+{"command":"scenario run","duration_ms":105,"evidence_id":"scenario-e122bae15d87","failure_signature":{"assertion":"command","failed_step":"expect","key_log_lines":["{\"command\":\"code\",\"message\":\"supported commands: status, context, check, test, verify, explain, bench, replay, scenario\",\"schema_version\":1,\"verdict\":\"BLOCKED\"}"]},"message":"scenario engineering.code-intelligence-write-method-denied: FAIL (expect engineering.code-intelligence-write-method-denied.command failed (actual: \"code\"))","scenario":"engineering.code-intelligence-write-method-denied","schema_version":1,"verdict":"FAIL"}
+
+
+## 勘误（2026-10-10 第二轮，独立 Review 整改）
+
+上方 `# Contract Hash: 096be167…` 这一绑定值**不可复现**，原因是记录口径本身有缺陷：
+
+- `Repo::contract_hash()`（`engineering/nexus-harness/src/env.rs`）对
+  `scenarios/**` 的**工作树字节**做 `git hash-object --stdin`。
+- 本仓库 `.gitattributes` 是 `* text=auto`：git 检出的文件在 Windows 工作树里是 CRLF，
+  而本次由工具直接写入的 scenario 文件是 LF。于是同一提交状态下，哈希取决于
+  "哪些文件是 checkout 来的、哪些是工具写的"——这是瞬态属性，不属仓库内容。
+- 复现验证（对同一 commit tree 的 LF blob 计算）：
+  - `8ba9fea`（无 Code Intelligence 场景）= `cea5547abcfd2cb2e975a72f183b0b98a6237e74`
+  - `d4138b7`（契约冻结，+9 场景）      = `f13e96c681a6aa3c354896fade811d65d613f96b`
+  - `ca9709a`（+3 场景）                = `11626ed60e0c23ff176b484e0e8d8326750cee7a`
+  - 全 CRLF 变体分别为 `8607c8cf…` / `e71ac957…` / `b003898d…`；两者都不等于 `096be167…`。
+
+修正后的记录口径：**契约身份按已提交 tree 的 blob（仓库内容为 LF）计算**，
+即本阶段冻结的契约代 = `f13e96c681a6aa3c354896fade811d65d613f96b`（`d4138b7` 的
+277+9 个场景）。Red Evidence 是在该 tree 成形之前的瞬态工作树上跑出来的，
+因此它证明的是"旧实现不认 `code` 子命令 -> 9/9 FAIL"这一事实本身，
+而**不是**绑定到某个可复现的契约哈希；此后所有绿证据一律使用上述可复现口径。
+
+副作用披露修正的连带说明：`working_tree_digest` / `configuration_digest` 同样
+工作树字节敏感，跨 Windows/Linux 的 Evidence 目录名不可直接比对（已写入
+`DEVELOPMENT.md` §11.1）。
