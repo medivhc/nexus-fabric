@@ -1,0 +1,103 @@
+# Green Evidence: 网关文件服务 M1 第一片（引擎 + E4 探针）
+# 日期: 2026-10-11（UTC 见 bindings.created_at）
+# 分支: feature/gateway-file-service-contracts（**本地分支，owner 决定未推公开仓库**）
+# 代码提交: 93d1dd7 "feature(nexus-web-gateway): 文件服务引擎 M1 第一片（G12-G21 的可执行面 + 单测）"
+#   基线 e1ef70c = fix/gateway-ice-candidate-bind（master 176c5a5 + G11）
+# 宿主: xc-pc-linux（hostname xc-pc-linux），rustc/cargo 1.98.1，git 2.25.1，
+#   target_triple=x86_64-unknown-linux-gnu，CARGO_TARGET_DIR=/work/nexus-dev/target（sccache + CARGO_INCREMENTAL=0）
+#   工作树 /work/m0-verify（从 Windows 侧 git push 到该机 bare repo /work/m0-origin.git 后 clone）
+# bindings: contract_hash=63eff98eb965bf3382895eb95c59a75c255e194c（与 M0 场景集一致，
+#   本片未改 scenarios/**，故 marker 对本提交同样成立）
+#           dirty_state=false，verify --fast evidence dir = verify-0b58c8a75ca1（verdict PASS）
+#
+# 与 M0 的关系：M0 的 8 条 E4 场景在本片之前是 RED（8/8 FAIL，failed_step=parse，
+# 见 .agents/red-evidence-gateway-file-service.txt）。本片落地探针后它们全部第一次被
+# 逐项判定。expectation 一字未改（AGENTS.md §5 阶段 B：实现方只改业务代码）。
+
+## 实测结果（同一条命令、同一棵树）
+
+```
+cargo test -p nexus-web-gateway --lib          → 36 passed; 0 failed
+cargo clippy -p nexus-web-gateway --all-targets → 无输出（workspace lints 下 -D warnings 干净）
+cargo fmt --check --all                          → 退出 0
+nexus-harness verify --fast                      → 9 门全 PASS
+  whitespace format check clippy architecture-policy dependency-governance
+  resource-type-neutrality affected-tests selected-properties
+nexus-harness scenario run product.gateway-file-* --json → 8/8 PASS
+  list-pagination              PASS  6 expectations   (scenario-4e8026adfcc5)
+  download-page                PASS  10 expectations  (scenario-c967e2ef29c9)
+  upload-resume                PASS   9 expectations  (scenario-5d06b9972f36)
+  upload-no-replace            PASS   6 expectations  (scenario-18452091981b)
+  sandbox-symlink              PASS   9 expectations  (scenario-8ace4250d6c6)
+  auth-throttle                PASS   7 expectations  (scenario-1bb1063dcc20)
+  quota-backpressure           PASS   8 expectations  (scenario-6c99981c5631)
+  capability-negotiation       PASS   7 expectations  (scenario-a86885777add)
+  合计 62 条 expectation 全部成立
+```
+
+Windows 侧诚实说明：`nexus-web-gateway` 在本机**无法编译**（ssh2 0.9.6 的
+`userauth_pubkey_memory` 被 `any(unix, vendored-openssl, openssl-on-win32)` 门控，
+本机无 cl.exe/nasm 启不了 vendored-openssl），上面的每一条都来自 Linux；Windows 只跑了
+`cargo fmt`。没有任何一条数字来自同机 WSL。
+
+## E4 场景抓到、单测漏掉的两个真问题（这轮 E4 的价值所在）
+
+1. **被拒绝的发布会留 `.part` 残留**。首轮 `upload-no-replace` FAIL 在
+   `part_artifacts_remaining`（期望 0，实际 1）：`commit_upload` 在 `hard_link` 因目标
+   已存在而失败时直接返回错误，把暂存文件留在磁盘上。12 条单测当时全绿——因为
+   `publish_never_overwrites_an_existing_target` 只检查了"原字节没被动过"，没检查残留。
+   修法是发布被拒即 `abort_upload`（删 `.part`、撤流），并补了一条单测锚住。
+   刻意与"页级拒绝"区分：后者要保留已承认前缀供续传（G18），而"目标已存在"这条流
+   永远不可能成功，留着只会变成无人负责的中转字节。
+2. **探针自己的 fixture 不自洽，被 G12 交叉约束拒启动**。`quota-backpressure` 首轮 FAIL
+   在 `verdict`，实际错误是 `CONFIG_INVALID: max_ack_bytes must be <= max_buffered_amount`
+   （我把 `max_buffered_amount` 压到 128 却没同步压 ack 上限）。这不是引擎缺陷，而是
+   配置门确实在拒——契约要的就是这个行为，探针之前没走到。修法是把 fixture 写全。
+
+另外一条流程事实：`overflow_code` 原本在探针里是把常量抄回 JSON（`json!(code::QUEUE_FULL)`），
+那样 `queue_full_reported` 就成了自证。已改成报告实际拿到的错误码。
+
+## 尚未清偿的部分（两份独立评审都是 CHANGES_REQUESTED，不在本文件里假装过了）
+
+两份案卷（评审者均为 general-purpose 子代理，**不是** owner 点名的 qwen3.8-flash；
+owner 2026-10-11 指示"子代理独立评审即可 不要等我操作"，故按此执行并如实标注实际执行者）：
+
+- `plan-artifacts/review-m0-contract-r1.md` — M0 契约，verdict **CHANGES_REQUESTED**
+- `plan-artifacts/review-v2-design-r2.md` — V2 rev2.1 复评，verdict **CHANGES_REQUESTED**
+
+其中一条我已**独立取证确认**（不是采信评审者）：V2 §1④b 的"SFTP 提交显式携带
+no-replace 标志"在 ssh2 0.9.6 上是**空操作**。取证命令与输出（Linux，libssh2 1.0.0）：
+
+```
+include/libssh2_sftp.h:51: #define LIBSSH2_SFTP_VERSION 3
+src/sftp.c:2800:  _libssh2_sftp_rename_ex(..., unsigned int flags, ...)
+src/sftp.c:2833:  if (flags && sftp->version >= 5) {
+src/sftp.c:2834:      /* version 5 of the SFTP protocol adds a few interesting flags */
+grep -n "sftp->version *=" src/*.c   → 无任何赋值（通告即 LIBSSH2_SFTP_VERSION=3）
+src/sftp.c:2827:  if (libssh2_sftp_handle... SSH_FXP_RENAME ... use it.
+```
+
+⇒ `Some(ATOMIC|NATIVE)` 与 `None` 的包体逐字节相同；真正的无覆盖改名原语是
+`SSH_FXP_POSIX_RENAME`（`libssh2_sftp_posix_rename_ex`，sftp.c:3033），ssh2 0.9.6 未包装。
+因此 **G14/REQ-008 里"SFTP 显式 no-replace"这一句必须重写**：要么 (a) SFTP 面只提供
+"发布到一个不存在的路径"且用唯一名 + 事前 stat 检查（仍有竞态，须写明），
+要么 (b) 在拿到可用的 no-replace 原语之前**根本不支持 SFTP 上传**（fail-closed，推荐），
+要么 (c) 走依赖治理给 ssh2 加 `posix_rename` 绑定。这条属于契约文本纠正，
+需要 requirement-change 口径，不能靠实现细节回避——owner 拍板后改。
+
+其余待办（按评审给的阻塞序）：错误码词表在 V2 设计与冻结契约之间分叉
+（V2 自造 `BUFFERED_LIMIT/QUOTA_*`，契约与代码用 `PAGE_TOO_LARGE/THROTTLED/AUTH_DENIED/...`）；
+V2 对 `config.rs/protocol.rs/gateway.rs/file.rs` 的约 40 处行号引用全部指向
+**未合入的 V1 工作树**；fd/RSS 两条预算不等式只算文件面（`max_terminals` 无上界）；
+`MODULE.md:188-189` 的"不依赖平台专用 API"与 §18.3 平台分级互斥；
+`remote_flag_honored_claimed=false` 是反向冻结（证明成功反而让场景红）；
+8 个场景文件未登记进 `FILE_MANIFEST.md`；G20/G21、mkdir/rename、RSS/重哈希、
+空闲回收、审计、平台等级无 REQ 无场景；Windows 侧 `MetadataExt::file_attributes()`
+其实稳定可用（评审探针证明，我未复现，标为**待核**）。
+
+## 关于 `verify --full` 的 `product-scenarios` 门（一处更正）
+
+M0 阶段我按评审提示担心"8 条 RED 场景会把 full 门禁变红"。核对 `gates.rs:766` 的语义是
+"FAIL ⇒ 门 FAIL；run/parse 失败 ⇒ UNKNOWN（绝不静默 PASS）"，而 M0 的失败形态是
+`failed_step=parse`（探针不存在，stdout 为空）⇒ 记 UNKNOWN，不阻塞。
+本片之后 8 条为 PASS，该门更不涉及。评审案卷里"恒红"那句据此更正为"恒 UNKNOWN"。
