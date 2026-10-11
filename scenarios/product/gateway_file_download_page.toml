@@ -1,0 +1,57 @@
+schema_version = 1
+id = "product.gateway-file-download-page"
+title = "网关文件下载：offset/max_bytes/next_offset/eof 与页上限（对齐 N3-9）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#18-gateway-file-service"
+
+[given]
+source_bytes = 24
+requested_max_bytes = 16
+page_hard_limit_bytes = 65536
+
+[when]
+command = "cargo run --quiet -p nexus-web-gateway --example gateway_file_contract -- --case download-page --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "case"
+equals = "download-page"
+
+# 第一页：16 字节、未到 EOF、next_offset=16
+[[expect]]
+field = "first_page_bytes_len"
+equals = 16
+
+[[expect]]
+field = "first_page_eof"
+equals = false
+
+[[expect]]
+field = "first_page_next_offset"
+equals = 16
+
+# 第二页：剩余 8 字节、eof=true、next_offset=size
+[[expect]]
+field = "last_page_bytes_len"
+equals = 8
+
+[[expect]]
+field = "last_page_eof"
+equals = true
+
+[[expect]]
+field = "last_page_next_offset"
+equals = 24
+
+# 逐页拼接与源文件逐字节一致
+[[expect]]
+field = "reassembled_matches_source"
+equals = true
+
+# 超过服务端硬上限的请求必须被拒，而不是被静默夹取
+[[expect]]
+field = "oversized_request_code"
+equals = "PAGE_TOO_LARGE"

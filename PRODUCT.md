@@ -3248,3 +3248,94 @@ Linux artifact get 接通真实分页服务与已有持久断点接收器：先�
 ### 17.7 N3-10 本地提供方 Use 授权运维
 
 新增 `nexus task-provider grant add|revoke|list --config <absolute-private-config>`，从既存 `task-api.toml` 的 provider/workspace 固定本机授权范围，直接管理该 Workspace 中显式 resource/主体的真实 N2 Use grant。命令不依赖 default Workspace 目录解析，不创建身份、Task、Session 或提供方容量，不改变既有 generic grant CLI 和 Task schema1。list 只读；mutation 保留非 Use 权限与其他 Workspace，先持久审计 intent，再原子更新 grant 并持久 applied。普通 daemon 下一次请求按当前 grant 决定授权；本批不通知远端，不接通 Submit/输入上传。冻结细节、真实 CLI/daemon/Engine E4 与失败语义见 docs/N3-10-OPERATOR-GRANT-CONTRACT.md。
+
+***
+
+## 18. 网关文件服务（Gateway File Service，2026-10-11）{#18-gateway-file-service}
+
+本节回答一个此前明确列为"非职责"的用户问题：**浏览器接入节点之后，能不能按目录浏览、
+下载、上传该节点（或它经网格可达的另一个节点）上的文件？** 在这一节写下承诺之前，
+`crates/nexus-web-gateway/MODULE.md` 的 Non-Responsibilities 里写着"不做……文件系统浏览
+……（Phase 2）"，且 `PRODUCT.md`/`scenarios/` 对网关文件能力的命中数为 **0**（实测：
+`grep -rln "gateway" scenarios/` 无结果）。也就是说本节不是给已有实现补文档，而是先把
+用户可见语义钉住，再据此分期实现。
+
+权威关系（避免"两套下载契约"）：网关文件服务是 **N3-4/N3-9 分页与接收器语义的一个消费方**，
+不是新契约的源头。字段与失败含义必须逐字对齐
+`docs/N3-4-ARTIFACT-DELIVERY.md`（私有目录、跨进程 receiver lease、`offset`/`prefix_sha256`
+续传、完整 SHA-256 + 长度的 Publishing intent、同文件系统 `hard_link` 原子**不覆盖**发布、
+`OUTPUT_EXISTS`/`ARTIFACT_INTEGRITY_FAILED`）与 `docs/N3-9-ARTIFACT-CLI-CONTRACT.md`
+（`offset`/`max_bytes`/`next_offset`/`eof`、每页上限 64 KiB、整体上限 80 MiB、分页不得替换
+固定 record 的任意字段）。**下沉为共享 crate 已被否决**（D1：`MODULE.md` 禁内部依赖 +
+portable-core/WASI 门），代之以双向一致性测试保证不漂移。
+
+### 18.1 用户可见承诺
+
+- **浏览**：用户在一个"根（root）"清单里选择被暴露的目录，可列目录、看条目类型与字节数。
+  列表**分页**，单页条目与单条 ack 的字节数都有服务端硬上限；超限返回明确的
+  `TRUNCATED`+`next_offset`，绝不把截断结果当完整结果呈现（一个 10 万条目的目录不能
+  撑爆控制通道，也不能让页面假装它已看全）。
+- **下载**：按 `offset`/`max_bytes` 拉字节页，回 `next_offset`/`eof`。读取是**拉式**的：
+  浏览器不催，节点不动。
+- **上传**：分片写入，服务端对**已连续落盘的字节数**回 ack（不是"收到了某个分片"），
+  因此浏览器重连后能从不一致处重发而不重写前缀。写入落在 `.nexus-part.*` 临时物，
+  完成后原子改名/链接发布。
+- **不覆盖已存在目标**（D5，属用户可见语义变更，故走 requirement-change）：上传**不得**
+  覆盖已存在的目标文件，目标已存在返回 `OUTPUT_EXISTS`；本地引擎用同文件系统
+  `hard_link` 实现，SFTP 引擎显式携带 no-replace 语义。**"远端 sftp-server 是否真的
+  honor 该 flag"在 OpenSSH 各版本上是未证的**（V2 §1④b 列为需实测），探针结论达标之前，
+  产品口径只声称"网关不会覆盖"，不声称"跨进程并发对手也不会覆盖"。
+- **建目录 / 改名 / 删除**：仅在 root 可写时提供；改名与删除的目标必须是解析后仍在该
+  root 内的路径，删除**不递归**出 root（V1 的反面教训：SFTP 引擎把 `stat` 当 `lstat` 用，
+  一个指向 home 外的符号链接就让"递归删除"打到了 home 外）。
+- **能力协商**：页面在建通道前先读 `/api/config.files`；字段缺失＝旧版网关，自动退化为
+  "无文件模式"，不报错、不半可用。版本不匹配是显式状态，不是静默失败。
+
+### 18.2 边界（承诺的另一半是它拒什么）
+
+- **root 是唯一授权面**：所有路径以配置里的 root 为界；root 必须是 `canonicalize` 后的
+  真实路径（非规范 root 会在 Windows/macOS 上回显错误路径并让越界检查失效）。
+- **逐分量解析**：自 root 起对每一段做 `lstat`/`readlink`，任何一段是符号链接即拒绝，
+  且在**打开之后**重新解析核实最终路径仍在 root 内（TOCTOU 快照类型化，不是"相信一次
+  解析结果"）。
+- **鉴权与节流**：文件通道需要一个独立于页面登录的配置令牌，常数时间比较；失败按
+  （会话 + 源）两层键节流并锁定，**有界**计数（V1 是零节流：实测 84.4 次认证/秒可放大成
+  `faillock` 拒绝服务）。
+- **资源上界**：读句柄数、并发会话数、单会话在途字节、全局 RSS、`.part` 声明大小、
+  重哈希预算都有配额表；超预算回 `QUEUE_FULL`/`CAPACITY_UNAVAILABLE` 并**显式**丢弃
+  文件类消息，不挤占终端字节流（终端通道优先）。SCTP 的 `bufferedAmount` 预算在两条
+  通道间共享，公式与 `FileLimits` 交叉校验，配置不自洽即拒启动（fail-closed）。
+- **算术与崩溃安全**：`offset + len` 一律 `checked_*`；本 crate 在 release 下
+  `panic = "abort"`，故**不靠 `catch_unwind` 假装隔离**（D7），要求 panic-free-by-construction
+  加对 str0m 输入面的 fuzz。
+- **空闲回收**：文件会话空闲按配置的 `idle_timeout_secs` 回收；任何"活动刷新"都必须
+  更新被检查的那个时间戳，否则刷新等于免死（V1 的空闲刷新打在错的字段上，超时形同不存在）。
+
+### 18.3 平台支持口径（支持等级是契约，不是注释）
+
+| 等级 | 平台 | 口径 |
+|---|---|---|
+| A | Linux | 全量：浏览/下载/上传/改名/删除 + SFTP 引擎 + 真实 sshd e2e 证据 |
+| B | Windows | 本地沙箱引擎 + 密码认证；`(dev,ino)` 在 stable std 不可得（实测 E0658 `windows_by_handle`），身份判定改为"打开后重解析路径 + `create_new` 等价物"，残余竞态风险写进文档而非隐藏；升 A 需 `windows-sys` 依赖评审（D3） |
+| C | macOS | 未列承诺，只保证 fail-closed：配置校验不通过即拒启动，不出现"半启用" |
+
+### 18.4 非目标与未证事项
+
+- 不做跨节点的 Artifact 分发、不引入 `storage_ref` 作为凭证、不做浏览器端文件系统访问。
+- 不在本节宣称 E4/E5：本节的场景当前状态是 **Red Evidence（契约先于实现）**，
+  见 `.agents/red-evidence-gateway-file-service.txt`；实现落地并跑绿之前，
+  网关文件能力在 `requirements.toml` 里保持 `doing`。
+- **未证且不得当作已证的三点**：① OpenSSH 各版本 sftp-server 是否 honor no-replace 标志
+  （探针达标前不声称）；② 浏览器侧 SCTP 发送缓冲上限与 `set_sctp_max_buffered_amount`
+  的对称性；③ TURN 凭据下发面的收缩（M2，见 `REQ-011`：`/api/config` 只回 `urls`，
+  凭据走建立连接前的一次性短时效通道）。
+  在 ①②③ 各自拿到证据之前，本节不构成"跨进程无覆盖已证"、"浏览器预算已对齐"或
+  "凭据下发面已收敛"的声明。
+
+### 18.5 退出准则（分期）
+
+M0 契约（本节 + `MODULE.md` G13/G17-G21 + `scenarios/product/gateway_file_*.toml` +
+RED 证据）→ M1 安全/可用性收口（零新 wire 语义）→ M2 协议演进（分页、服务端签发
+`stream_id`、capability 门控、`/api/config` 收缩）→ M3 完整性与续传（流式摘要、prefix
+区间哈希、不覆盖发布达标）→ M4 结构收敛。**无 RED 不进 M1**；每期的完成判据含一次
+真实 push 触发的 CI 绿，不接受本地复述（V2 §10 的教训登记）。

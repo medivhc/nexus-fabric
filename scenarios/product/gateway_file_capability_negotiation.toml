@@ -1,0 +1,42 @@
+schema_version = 1
+id = "product.gateway-file-capability-negotiation"
+title = "网关文件能力协商：旧版网关缺 files 字段时页面退化为无文件模式，不半可用"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#18-gateway-file-service"
+
+[given]
+gateway_version = "pre-file-service"
+config_endpoint = "/api/config"
+
+[when]
+command = "cargo run --quiet -p nexus-web-gateway --example gateway_file_contract -- --case capability-negotiation --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "case"
+equals = "capability-negotiation"
+
+[[expect]]
+field = "config_has_files_field"
+equals = false
+
+[[expect]]
+field = "file_channel_opened"
+equals = false
+
+[[expect]]
+field = "page_mode"
+equals = "no-file"
+
+# 退化不是错误：页面不得因缺字段而报错或卡在连接中
+[[expect]]
+field = "reported_error"
+equals = false
+
+# 反过来：字段存在但版本不认识时也不能静默建通道
+[[expect]]
+field = "unknown_version_channel_opened"
+equals = false

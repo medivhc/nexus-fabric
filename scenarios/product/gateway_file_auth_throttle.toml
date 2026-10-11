@@ -1,0 +1,43 @@
+schema_version = 1
+id = "product.gateway-file-auth-throttle"
+title = "网关文件令牌：错误口令拒绝且失败计数有界、达阈值锁定（V1 零节流的反面）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#18-gateway-file-service"
+
+[given]
+wrong_token_attempts = 6
+lockout_after = 5
+
+[when]
+command = "cargo run --quiet -p nexus-web-gateway --example gateway_file_contract -- --case auth-throttle --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "case"
+equals = "auth-throttle"
+
+[[expect]]
+field = "first_denial_code"
+equals = "AUTH_DENIED"
+
+# 第 6 次已进锁定态，不再是普通拒绝
+[[expect]]
+field = "sixth_attempt_code"
+equals = "THROTTLED"
+
+[[expect]]
+field = "locked_after_attempts"
+equals = 6
+
+# 节流状态有界：不随伪造会话数线性增长
+[[expect]]
+field = "throttle_entries_bounded"
+equals = true
+
+# 正确口令在锁定窗口内也不能绕过
+[[expect]]
+field = "correct_token_bypasses_lockout"
+equals = false

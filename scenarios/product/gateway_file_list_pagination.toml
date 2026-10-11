@@ -1,0 +1,38 @@
+schema_version = 1
+id = "product.gateway-file-list-pagination"
+title = "网关文件列表：单页条目上限与截断必须显式（不得把截断当完整）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#18-gateway-file-service"
+
+[given]
+root = "sandbox://downloads"
+page_max_entries = 2
+directory_entry_count = 5
+
+[when]
+command = "cargo run --quiet -p nexus-web-gateway --example gateway_file_contract -- --case list-pagination --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "case"
+equals = "list-pagination"
+
+[[expect]]
+field = "entries_returned"
+equals = 2
+
+[[expect]]
+field = "truncated"
+equals = true
+
+[[expect]]
+field = "next_offset"
+non_empty = true
+
+# 截断的一页绝不能被标记为"完整列表"
+[[expect]]
+field = "is_complete_list"
+equals = false

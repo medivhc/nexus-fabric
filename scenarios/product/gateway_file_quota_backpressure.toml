@@ -1,0 +1,48 @@
+schema_version = 1
+id = "product.gateway-file-quota-backpressure"
+title = "网关文件配额：超预算显式 QUEUE_FULL 且不挤占终端字节流（终端优先）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#18-gateway-file-service"
+
+[given]
+max_inflight_bytes_per_session = 1048576
+concurrent_file_streams = 32
+ssh_messages_sent = 100
+
+[when]
+command = "cargo run --quiet -p nexus-web-gateway --example gateway_file_contract -- --case quota-backpressure --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "case"
+equals = "quota-backpressure"
+
+[[expect]]
+field = "queue_full_reported"
+equals = true
+
+[[expect]]
+field = "overflow_code"
+equals = "QUEUE_FULL"
+
+# 丢弃是显式的：被丢的文件类消息有计数，不是静默吞掉
+[[expect]]
+field = "file_drops_reported"
+equals = true
+
+# 终端面零丢失
+[[expect]]
+field = "ssh_messages_delivered"
+equals = 100
+
+[[expect]]
+field = "ssh_messages_dropped"
+equals = 0
+
+# 单会话峰值句柄不随分片数增长（V1 每片一个新 stream_id ⇒ ~1022 片后全节点挂死）
+[[expect]]
+field = "peak_read_handles_within_budget"
+equals = true

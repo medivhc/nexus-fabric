@@ -1,0 +1,40 @@
+schema_version = 1
+id = "product.gateway-file-upload-no-replace"
+title = "网关上传不覆盖已存在目标（D5 requirement-change 语义；远端 flag honor 与否不在本场景声称）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#18-gateway-file-service"
+
+[given]
+preexisting_target_content = "ORIGINAL"
+uploaded_content = "REPLACEMENT"
+
+[when]
+command = "cargo run --quiet -p nexus-web-gateway --example gateway_file_contract -- --case upload-no-replace --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "case"
+equals = "upload-no-replace"
+
+[[expect]]
+field = "target_exists_code"
+equals = "OUTPUT_EXISTS"
+
+# 原目标字节必须一字未动
+[[expect]]
+field = "original_bytes_unchanged"
+equals = true
+
+# 拒绝覆盖后不留半成品
+[[expect]]
+field = "part_artifacts_remaining"
+equals = 0
+
+# 本场景只钉"网关自己不会覆盖"；远端 sftp-server 是否 honor no-replace 标志
+# 属未实测项（V2 §1④b），实现方不得借本字段宣称已证
+[[expect]]
+field = "remote_flag_honored_claimed"
+equals = false

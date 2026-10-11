@@ -1,0 +1,51 @@
+schema_version = 1
+id = "product.gateway-file-sandbox-symlink"
+title = "网关文件沙箱：逐分量拒绝逃逸符号链接、递归删除不出 root、非规范 root 拒启动"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#18-gateway-file-service"
+
+[given]
+root = "sandbox://home"
+escaping_symlink_target = "outside-root-secret.txt"
+
+[when]
+command = "cargo run --quiet -p nexus-web-gateway --example gateway_file_contract -- --case sandbox-symlink --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "case"
+equals = "sandbox-symlink"
+
+[[expect]]
+field = "list_rejects_escaping_symlink"
+equals = true
+
+[[expect]]
+field = "read_rejects_escaping_symlink"
+equals = true
+
+[[expect]]
+field = "write_rejects_escaping_symlink"
+equals = true
+
+# 删除不递归出 root：root 外文件必须仍在场
+[[expect]]
+field = "remove_recursive_stays_in_root"
+equals = true
+
+[[expect]]
+field = "outside_file_still_exists"
+equals = true
+
+# 打开后重解析核实（TOCTOU）：解析一次即相信的写法不成立
+[[expect]]
+field = "post_open_reverify_used"
+equals = true
+
+# 非 canonical root（含 .. / 符号链接 / 未解析前缀）直接拒启动
+[[expect]]
+field = "non_canonical_root_rejected"
+equals = true

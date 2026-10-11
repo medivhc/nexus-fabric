@@ -33,3 +33,74 @@ status = "todo"
 priority = "P0"
 acceptance = "重启后 node_id 不变，无需重新配置"
 created = "2026-10-10"
+
+# ---- 网关文件服务（PRODUCT.md#18-gateway-file-service，契约先行，2026-10-11 M0）----
+# 全部条目 status = "doing"：PRODUCT.md §18 与 MODULE.md G12-G21 已冻结语义，
+# 实现按 V2 §11 分期（M1 安全收口 → M2 协议演进 → M3 完整性/续传 → M4 结构收敛）。
+# 每条都有一条 E4 场景在 scenarios/product/gateway_file_*.toml 先行落 RED 证据
+# （见 .agents/red-evidence-gateway-file-service.txt）；实现方只能改业务代码使其变绿，
+# 不得修改已冻结的 expectation（AGENTS.md §5 阶段 B / harness.toml [contract_first]）。
+
+[[req]]
+id = "REQ-005"
+title = "文件浏览：root 清单与分页列表"
+status = "doing"
+priority = "P0"
+acceptance = "列表按服务端硬上限分页；超限回 TRUNCATED+next_offset 且 next_offset 单调；截断结果不得被标记为完整列表（G12/G17；product.gateway-file-list-pagination）"
+created = "2026-10-11"
+
+[[req]]
+id = "REQ-006"
+title = "文件下载：按 offset/max_bytes 拉字节页"
+status = "doing"
+priority = "P0"
+acceptance = "回 next_offset/eof；逐页拼接与源逐字节一致；超过页硬上限的请求显式拒绝（PAGE_TOO_LARGE）而不是静默夹取；字段语义对齐 N3-9（G17/G18；product.gateway-file-download-page）"
+created = "2026-10-11"
+
+[[req]]
+id = "REQ-007"
+title = "文件上传与续传：ack 只承认已连续落盘字节"
+status = "doing"
+priority = "P0"
+acceptance = "重复旧页必须逐字节匹配才接受；跳跃/重叠页拒绝且不重写已承认前缀；完整 SHA-256+长度校验通过后才提交；提交后不残留 .nexus-part.*（G18；product.gateway-file-upload-resume）"
+created = "2026-10-11"
+
+[[req]]
+id = "REQ-008"
+title = "上传不覆盖已存在目标（requirement-change）"
+status = "doing"
+priority = "P0"
+acceptance = "目标已存在回 OUTPUT_EXISTS 且原字节一字未动；本地同文件系统 hard_link 原子发布；SFTP 显式 no-replace，但在 OpenSSH 各版本 honor 该标志的探针达标前不得声称跨进程对手也不会覆盖（G14；product.gateway-file-upload-no-replace）。本条是用户可见语义变更，走 AGENTS.md §5 requirement-change，不用实现细节回避"
+created = "2026-10-11"
+
+[[req]]
+id = "REQ-009"
+title = "root 沙箱：逐分量拒绝符号链接，删除不递归出界"
+status = "doing"
+priority = "P0"
+acceptance = "root 必须 canonicalize；逐段 lstat/readlink 拒绝逃逸；打开后重解析核实；list/read/write/remove 四条路径各自拒绝且 root 外文件仍在场；非规范 root 拒启动（G13；product.gateway-file-sandbox-symlink）"
+created = "2026-10-11"
+
+[[req]]
+id = "REQ-010"
+title = "文件令牌鉴权与失败节流锁定"
+status = "doing"
+priority = "P0"
+acceptance = "独立于页面登录的配置令牌 + 常数时间比较；失败按（会话+源）两层键节流，达阈值锁定，锁定窗口内正确口令也不绕过；计数与表项有界，随会话回收清零（G15；product.gateway-file-auth-throttle）"
+created = "2026-10-11"
+
+[[req]]
+id = "REQ-011"
+title = "配额、背压与终端优先"
+status = "doing"
+priority = "P0"
+acceptance = "stream_id 由服务端签发，分片不新开读句柄；读句柄/会话/在途字节/RSS/重哈希字节有上界；超预算显式 QUEUE_FULL 且文件类丢弃有计数；终端字节流零丢失；配置交叉约束不自洽拒启动（G12/G16；product.gateway-file-quota-backpressure）"
+created = "2026-10-11"
+
+[[req]]
+id = "REQ-012"
+title = "能力协商、混版本退化与 /api/config 返回面收缩"
+status = "doing"
+priority = "P0"
+acceptance = "files 字段缺失＝旧版 ⇒ 无文件模式（不报错不卡连接）；版本不认识不静默建通道；/api/config 的文件面只声明能力与限制，TURN 段只回 urls，凭据经建立连接前的一次性短时效通道下发（G19；product.gateway-file-capability-negotiation）"
+created = "2026-10-11"

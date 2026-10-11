@@ -1,0 +1,107 @@
+# Red Evidence: 网关文件服务（Gateway File Service，契约阶段 M0）
+# 日期: 2026-10-11（本地时钟；UTC 见 bindings）
+# 仓库: nexus-fabric（GitHub medivhc/nexus-fabric 本地克隆）
+# 分支/基线: feature/gateway-file-service-contracts @ e36b598
+#            （基线 = fix/gateway-ice-candidate-bind e1ef70c = master 176c5a5 + G11）
+# 执行者: qoder-desktop（未设 NEXUS_AGENT，证据名不带 agent 前缀）
+# Contract Hash: 63eff98eb965bf3382895eb95c59a75c255e194c   ← 含本批 8 个新场景的场景集指纹
+# source_revision: e36b598d9b02be159c24583a782b1d3e13acc270
+# working_tree_digest: 08ccbb125f361affe9078ff82d7098aa46e9b08b（dirty_state=false）
+# 宿主: xc-pc-linux，rustc/cargo 1.98.1，git 2.25.1，target_triple=x86_64-unknown-linux-gnu
+#        CARGO_TARGET_DIR=/work/nexus-dev/target（共享）
+#
+# 契约阶段（AGENTS.md §5 阶段 A）内容：
+#   1. PRODUCT.md 新增 §18「网关文件服务」（{#18-gateway-file-service}）：
+#      用户可见承诺、边界、平台支持矩阵（Linux=A / Windows=B / macOS=C 未承诺）、
+#      非目标与三条"未证不得当已证"、分期退出准则；
+#   2. crates/nexus-web-gateway/MODULE.md：把"文件系统浏览"从 Non-Responsibilities 移出，
+#      Responsibility 增加"契约先行、非已交付 API"的文件服务条目，
+#      新增不变量 **G12-G21**（默认关闭/沙箱逐分量/不覆盖/鉴权节流/句柄与背压/分页显式/
+#      拉式续传/能力协商/算术与 panic 面/空闲回收与审计）；
+#   3. crates/nexus-web-gateway/requirements.toml：新增 **REQ-005..REQ-012**，
+#      全部 status="doing"，每条 acceptance 反向点名其 E4 场景 id；
+#   4. 新增 8 个 E4 场景 scenarios/product/gateway_file_*.toml 并冻结 expectation
+#      （只用解析器真实支持的 equals / one_of / non_empty，见 scenario.rs:98-102；
+#       不使用会被静默丢弃的 non_zero）。
+#
+# 结果: **8/8 verdict=FAIL，failed_step="parse"**（旧实现上命令无 stdout 可解析）。
+#       按 nexus-contract-first，无 Red Evidence 不得进入实现阶段——条件已满足。
+#
+# 失败的真实原因（harness 只解析 stdout，故 key_log_lines 为空，这里单独取证）：
+#   $ cargo run --quiet -p nexus-web-gateway --example gateway_file_contract -- --case list-pagination --json
+#   error: no example target named `gateway_file_contract` in `nexus-web-gateway` package
+#   help: available example targets:
+#       gateway
+#   ⇒ 契约要求的探针面在当前实现上根本不存在，8 条场景全部无法执行到 expectation 判定。
+#
+# 本批 RED 的证据强度（诚实标注，勿过度解读）：
+#   - 它证明的是"接口缺失"，**不是**"哪一条 expectation 未满足"。与 #12 的
+#     code-intelligence RED（旧实现能跑、返回 BLOCKED JSON、失败落在 expect 步并点名
+#     `command` 字段）相比，本批落在 parse 步，信息量更低；
+#   - 因此 M1/M2 实现 `gateway_file_contract` 探针后，每条 expectation 才第一次被逐项判定；
+#     届时若某条因契约本身写错而不可能满足，必须按 AGENTS.md §5 停止实现并走
+#     requirement-change，而不是改 expectation（harness.toml [contract_first]
+#     freeze_scenario_expectations = true）。
+#
+# 门禁未被本批 RED 破坏（实测）：加入 8 条 FAIL 场景后
+#   $ nexus-harness verify --fast --json
+#   verdict=PASS，9 门全 PASS（whitespace/format/check/clippy/architecture-policy/
+#   dependency-governance/resource-type-neutrality/affected-tests/selected-properties），
+#   evidence dir = verify-60aa19e1361e。contract_hash 由 3652314f9c213a60fb21c23fc9a296359b63c0b5
+#   （master 176c5a5 的场景集）变为本文件头的 63eff98eb965bf3382895eb95c59a75c255e194c，
+#   即新场景已进入契约集并被冻结。
+
+## scenario list 命中（8/8 可发现）
+product.gateway-file-auth-throttle
+product.gateway-file-capability-negotiation
+product.gateway-file-download-page
+product.gateway-file-list-pagination
+product.gateway-file-quota-backpressure
+product.gateway-file-sandbox-symlink
+product.gateway-file-upload-no-replace
+product.gateway-file-upload-resume
+
+## product.gateway-file-list-pagination
+{"command":"scenario run","duration_ms":11908,"evidence_id":"scenario-792e6edda74e","failure_signature":{"assertion":"","failed_step":"parse","key_log_lines":[]},"message":"scenario product.gateway-file-list-pagination: FAIL (output not JSON (EOF while parsing a value at line 1 column 0): )","scenario":"product.gateway-file-list-pagination","schema_version":1,"verdict":"FAIL"}
+
+## product.gateway-file-download-page
+{"command":"scenario run","duration_ms":4303,"evidence_id":"scenario-795ada3fb3f1","failure_signature":{"assertion":"","failed_step":"parse","key_log_lines":[]},"message":"scenario product.gateway-file-download-page: FAIL (output not JSON (EOF while parsing a value at line 1 column 0): )","scenario":"product.gateway-file-download-page","schema_version":1,"verdict":"FAIL"}
+
+## product.gateway-file-upload-resume
+{"command":"scenario run","duration_ms":101,"evidence_id":"scenario-807528266892","failure_signature":{"assertion":"","failed_step":"parse","key_log_lines":[]},"message":"scenario product.gateway-file-upload-resume: FAIL (output not JSON (EOF while parsing a value at line 1 column 0): )","scenario":"product.gateway-file-upload-resume","schema_version":1,"verdict":"FAIL"}
+
+## product.gateway-file-upload-no-replace
+{"command":"scenario run","duration_ms":101,"evidence_id":"scenario-67c799630ea6","failure_signature":{"assertion":"","failed_step":"parse","key_log_lines":[]},"message":"scenario product.gateway-file-upload-no-replace: FAIL (output not JSON (EOF while parsing a value at line 1 column 0): )","scenario":"product.gateway-file-upload-no-replace","schema_version":1,"verdict":"FAIL"}
+
+## product.gateway-file-sandbox-symlink
+{"command":"scenario run","duration_ms":101,"evidence_id":"scenario-c06fa67796c8","failure_signature":{"assertion":"","failed_step":"parse","key_log_lines":[]},"message":"scenario product.gateway-file-sandbox-symlink: FAIL (output not JSON (EOF while parsing a value at line 1 column 0): )","scenario":"product.gateway-file-sandbox-symlink","schema_version":1,"verdict":"FAIL"}
+
+## product.gateway-file-auth-throttle
+{"command":"scenario run","duration_ms":101,"evidence_id":"scenario-dd5c5cc06231","failure_signature":{"assertion":"","failed_step":"parse","key_log_lines":[]},"message":"scenario product.gateway-file-auth-throttle: FAIL (output not JSON (EOF while parsing a value at line 1 column 0): )","scenario":"product.gateway-file-auth-throttle","schema_version":1,"verdict":"FAIL"}
+
+## product.gateway-file-quota-backpressure
+{"command":"scenario run","duration_ms":100,"evidence_id":"scenario-394bf77869df","failure_signature":{"assertion":"","failed_step":"parse","key_log_lines":[]},"message":"scenario product.gateway-file-quota-backpressure: FAIL (output not JSON (EOF while parsing a value at line 1 column 0): )","scenario":"product.gateway-file-quota-backpressure","schema_version":1,"verdict":"FAIL"}
+
+## product.gateway-file-capability-negotiation
+{"command":"scenario run","duration_ms":100,"evidence_id":"scenario-41dee08b330d","failure_signature":{"assertion":"","failed_step":"parse","key_log_lines":[]},"message":"scenario product.gateway-file-capability-negotiation: FAIL (output not JSON (EOF while parsing a value at line 1 column 0): )","scenario":"product.gateway-file-capability-negotiation","schema_version":1,"verdict":"FAIL"}
+
+## 编号偏离登记（对照 V2 §11 的 M0 交付物）
+V2 设计写的是"G13 重写、新增 G17-G21"，那是按 V1 工作树里 G11..G16 已存在排的号。
+V1 从未合入 master，本分支上 G12..G16 为空，故一次性落成 **G12-G21**，语义与 V2 §2-§9
+一一对应；后续期次不再重排号（已在 MODULE.md 里写明，避免后人对不上 V2 的文字）。
+
+## M0 未完成项（诚实列出，不假装退出准则已达成）
+1. **docs 独立评审**（V2 §11 M0 退出准则的一半）：需要非实现者的独立评审者。
+   本机子智能体模型不由我绑定（用户要求 qwen3.8-flash，Agent 工具无 model 入参），
+   未拿到该模型时**不自签、不伪造**，此项留空。
+2. **ADR 目录与编号登记（D0）**：`docs/` 下未发现既有 ADR 惯例（实测
+   `ls docs | grep -iE "adr|decision"` 与 `grep -rl "^ADR-" docs/*.md` 均无结果）。
+   现在决策分散在 V2 设计 §0/§13 与 MODULE.md 不变量里；是否新建 `docs/adr/` 属
+   文档结构决策，未擅自新建。
+3. **V2 设计文档本身尚未入库**：`docs/GATEWAY-FILE-SERVICE-DESIGN-V2.md`、
+   `FILE-MODULE-REVIEW-2026-10-11.md`、`GATEWAY-FILE-SERVICE-RETROSPECTIVE-2026-10-11.md`
+   目前只在主工作树未提交（它们公开点名未修补项与逃逸配方，是否入库待 owner 决定）。
+   PRODUCT.md §18 因此写成**自包含**：不引用未入库文档也能读懂边界。
+4. `harness.toml` 的 `[contract_first]` 只要求 RED 证据存在，未规定存放路径；
+   本文件按仓库现存惯例落在 `.agents/red-evidence-<feature>.txt`（对照
+   `red-evidence-code-intelligence.txt` 等 20+ 个同类文件）。

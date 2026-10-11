@@ -1,0 +1,52 @@
+schema_version = 1
+id = "product.gateway-file-upload-resume"
+title = "网关上传：ack 只承认已连续落盘字节，重复页逐字节匹配、乱序重叠页拒绝"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#18-gateway-file-service"
+
+[given]
+target_bytes = 24
+chunk_bytes = 8
+
+[when]
+command = "cargo run --quiet -p nexus-web-gateway --example gateway_file_contract -- --case upload-resume --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "case"
+equals = "upload-resume"
+
+# 收到前 8 字节后，ack 必须是"连续已落盘 8"，不是"收到某片"
+[[expect]]
+field = "ack_contiguous_bytes"
+equals = 8
+
+# 完全重复的旧页：接受但必须逐字节一致
+[[expect]]
+field = "duplicate_page_accepted"
+equals = true
+
+[[expect]]
+field = "duplicate_mismatch_rejected"
+equals = true
+
+# 跳跃/部分重叠的一页（offset 与已承认前缀不衔接）必须拒绝而非重写前缀
+[[expect]]
+field = "overlapping_page_rejected"
+equals = true
+
+[[expect]]
+field = "prefix_rewritten"
+equals = false
+
+# 提交后目标字节正确，且不遗留 .nexus-part.* 临时物
+[[expect]]
+field = "final_sha256_matches"
+equals = true
+
+[[expect]]
+field = "part_artifacts_remaining"
+equals = 0
