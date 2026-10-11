@@ -474,7 +474,10 @@ fn serve_http(
                 tls,
                 "application/x-pem-file",
                 shared.cert_pem.as_bytes(),
-                &[("Content-Disposition", "attachment; filename=\"nexus-ca.crt\"")],
+                &[(
+                    "Content-Disposition",
+                    "attachment; filename=\"nexus-ca.crt\"",
+                )],
             )
             .map_err(GatewayError::Io)?;
         }
