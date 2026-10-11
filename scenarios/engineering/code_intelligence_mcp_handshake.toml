@@ -56,6 +56,23 @@ equals = true
 field = "bad_arguments_rejected"
 equals = true
 
+# 负向清单的真正落点：按名请求写能力工具必须被**结构化**拒绝。
+# selftest 侧的判据不止"回了个 error"，而是 code == -32602 且 message 以 UNSUPPORTED 开头，
+# 这里再钉一次，防止将来拒绝文案漂成自然语言而探测仍然绿。
+[[expect]]
+field = "write_call_rejected"
+equals = true
+
+# serve 的退出形状（不需要 language server，默认路径即跑）：
+# 零请求就挂断 ⇒ UNKNOWN（不伪装成 PASS，也不谎报崩溃）；畸形帧 ⇒ FAIL。
+[[expect]]
+field = "eof_verdict"
+equals = "UNKNOWN"
+
+[[expect]]
+field = "malformed_frame_verdict"
+equals = "FAIL"
+
 # 不触发 provider：这条把"selftest 默认是便宜的"钉成契约，
 # 否则将来有人给 selftest 加了全仓查询，场景会悄悄变慢而不被察觉。
 [[expect]]

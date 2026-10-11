@@ -462,6 +462,12 @@ fn status_for_error(code: &str) -> &'static str {
 /// 代价是要合成一次 argv，比暴露一个 typed 入口丑，但它换来的是"只有一套真相"。
 pub fn anchors(repo: &Repo, module_dir: &Path, provider_override: Option<&str>) -> SemanticReport {
     let scope_rel = dto::relative_path(&repo.root, module_dir);
+    // 顺序是契约要求的，不是可以"优化"掉的：`context <成员目录>` 即使 declined（门 1
+    // `unsupported_scope`）也必须带出 `snapshot`，Agent 才能判断这份 declination 绑在哪棵树上
+    // （见 `scenarios/engineering/code_intelligence_context_scope_guard.toml` 对
+    // `snapshot.source_revision` 的 non_empty 期望）。把 `Bindings::current` 挪到门 1 之后
+    // 看着省一次 git 调用，实际会让 declined 结果失去绑定 —— 而"没有绑定的事实"正是本模块
+    // 最不允许的输出形态。
     let bindings = Bindings::current(repo);
     let digest = bindings.working_tree_digest.clone();
     let mut rep = SemanticReport {

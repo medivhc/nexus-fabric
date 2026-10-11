@@ -136,10 +136,11 @@ message 措辞不同，钉文案等于把版本耦合写进契约。诊断条目
 
 ```text
 semantic_status   ok | no_candidates | not_found | unavailable | timeout | stale
-                    | unsupported_scope
+                    | unsupported_scope | invalid_query
 semantic_anchors  复用 code 的 ResultItem 形状（symbol/kind/kind_id/qualified_name/
                     path/in_scope/range/snippet），不另造 DTO
-semantic_budget   {max_results, truncated, candidate_queries, workspace_scope}
+semantic_budget   {max_results, truncated, candidate_queries, candidate_spans,
+                    workspace_scope}
 semantic_reason   非 ok 时 {code, reason}，code 取自下方错误码
 snapshot          与 code 同一套 Bindings（source_revision/working_tree_digest/…）
 authority         恒为 "advisory"
@@ -198,7 +199,13 @@ Agent ──MCP(stdio JSON-RPC)──▶ nexus-harness mcp serve ──▶ code_
 - 暴露 8 个工具，名字与 CLI 一一对应：`code.symbol` / `code.definition` / `code.references` /
   `code.implementations` / `code.callers` / `code.callees` / `code.hover` / `code.diagnostics`。
   **不暴露任何写能力工具**（rename / format / applyEdit / executeCommand 一律不在
-  `tools/list` 里；被按名请求时返回结构化 `UNSUPPORTED`，不是空结果）。
+  `tools/list` 里）。被按名请求时分两层拒绝，两层各说各的话：协议层回 JSON-RPC
+  `-32602`，其 `message` **以 `UNSUPPORTED: ` 开头**（即 Nexus 冻结错误码字面量），
+  让客户端能按前缀断言"撞了白名单"而不必匹配自然语言全文；两层不混用，
+  也绝不返回空结果或把写请求降级成一次无意义查询。白名单判定发生在命名约定判定
+  **之前**——`workspace/applyEdit` 这类不带 `code.` 前缀的名字也必须走同一条
+  `UNSUPPORTED` 拒绝，不能落进"未知工具"文案（那等于把越权说成拼写问题，客户端可以换个
+  拼法重试）。selftest 逐个试完负向清单上的**全部** 6 个名字，不抽查一个。
 - 工具入参只接受 `target` / `workspace` / `max_results` / `max_snippet_lines` /
   `max_result_bytes` / `timeout_secs` / `ready_timeout_secs`。**不接受** `provider_binary`
   之类的启动期参数：把可执行路径放进 tool 参数就等于让模型给 language server launcher
@@ -209,6 +216,10 @@ Agent ──MCP(stdio JSON-RPC)──▶ nexus-harness mcp serve ──▶ code_
   默认不触发 provider 冷启动（第三条 `tools/call` 用**故意非法**的参数，验证协议层与
   参数校验的失败形状）；`--with-query` 时额外跑**两次**夹具 workspace 上的真实查询
   （作用域限定在 3 个源文件内，冷启动面确定）。
+- `selftest` 还单独探测 `serve` 的**退出形状**（不依赖 language server，默认路径即跑）：
+  客户端一条请求都没发就挂断 ⇒ `eof_verdict = "UNKNOWN"`（既不是崩溃也不是 PASS，
+  零请求不能伪装成"处理过了"）；发来畸形帧 ⇒ `malformed_frame_verdict = "FAIL"`。
+  这两个值是 serve 的对外契约的一部分，由握手场景直接断言。
 - `--with-query` 顺带产出 Phase 4 的判定数据：`query_first_ms` / `query_second_ms` 与
   `query_warm_reused`（判据是**相对**的 `second × 4 < first`，同一个 serve 进程里第二次查询
   不该再付一次 initialize+索引的钱）。**不钉绝对毫秒数**——绝对值随宿主负载漂移，
@@ -356,9 +367,12 @@ Code Intelligence 场景（E4，冻结于 2026-10-10 契约阶段，夹具为
 `code_intelligence_context_anchors.toml`（Phase 2：`context` 的语义锚点有界、绑定 snapshot、
 候选来自模块契约）、`code_intelligence_context_no_fake_semantics.toml`（Phase 2：provider
 不可用时 `context` 的 verdict 不变且**不伪造锚点**）、
-`code_intelligence_mcp_handshake.toml`（Phase 3：MCP 只暴露 8 个只读工具，未知方法/非法参数/
-写能力调用都被拒）、`code_intelligence_mcp_real_query.toml`（Phase 3：`tools/call` 走真实查询并
-返回 CLI 那套中立 DTO）。共 **20** 个。
+`code_intelligence_context_scope_guard.toml`（Phase 2：成员目录上报 `unsupported_scope`
+且一次 provider 都不起）、`code_intelligence_mcp_handshake.toml`（Phase 3：MCP 只暴露 8 个
+只读工具，未知方法/非法参数/写能力调用都被拒，并覆盖 **EOF 的两种形状** —— 客户端一条请求
+都没发就挂断 ⇒ `UNKNOWN`，畸形/半帧 ⇒ `FAIL`）、
+`code_intelligence_mcp_real_query.toml`（Phase 3/4：`tools/call` 走真实查询并返回 CLI 那套
+中立 DTO，且第二次查询必须复用同一 provider 会话）。共 **21** 个。
 
 ### Review 结论与待办承载体（2026-10-10）
 

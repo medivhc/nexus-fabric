@@ -180,3 +180,25 @@ spike 与实现结论（2026-10-11 回填）：
   `session_invalidated_reason`）判定，时延只作旁证。原因是我第一版把
   `second*4 < first` 写成了判据 —— 那是把宿主负载写进契约，属于会造成脆弱红的做法，
   已在 MODULE.md 与本文件里改成结构判据。
+
+## 阶段 4 收尾状态（2026-10-11）
+
+提案 §15 Phase 4 的目标在本区间按**已授权的口径**走完：多语言 provider 与跨进程缓存
+不在范围内（前者：仓库内 0 个 C/C++/Go/TS 源文件、两个宿主都没有对应 language server，
+且所有者明确"都不装，按现状交付"；后者：§11 只在出现证据时再加，而当前证据只支撑到
+进程内复用）。剩下有证据的一件事 —— 同一进程内重复查询重复付冷启动 —— 已消掉并有
+结构判据。
+
+独立 Review（round 1，对象 `df2049c..aba6de2`）判 `CHANGES_REQUESTED`，2 阻塞 /
+5 非阻塞 + 4 条 minor，已全部处置（B1/G1/A1/A2/A3/G2 修，H1 与 4 条 minor 逐条表态、
+其中 1 条**不能改**因为会破坏既有契约的字段可得性），修复复跑记在
+`.agents/green-evidence-code-intelligence.txt` §M。
+审查者是独立执行者但 `model=unbound`，且在 Windows 只做静态阅读没跑 cargo —— 它的
+verdict 不能当门禁结论，本轮修复后的数字全部由实现侧复跑补齐（fmt/clippy/test/selftest/21 场景）。
+
+仍未验证（诚实边界，别在被问到时说成已完成）：
+- 第三方 MCP 客户端互操作（两个宿主都没有真实客户端）；
+- `verify --full` 对本区间无结论（宿主余量 27G < 实测需要的 30G+）；
+- 跨进程/跨命令的会话成本（判据 `provider.session_reused` 已可见，数据未取）；
+- 多语言 provider 的真实表现（未装，未测，不做任何声称）。
+

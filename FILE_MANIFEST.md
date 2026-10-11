@@ -33,9 +33,9 @@
 >
 > 2026-10-11（Phase 2-4 开工）：登记 `.agents/code-intelligence-phase-2-4-plan.md`，声明值 177 -> 178。
 >
-> 2026-10-11（Phase 2/3 契约与实现）：新增夹具 `MODULE.md`、`code_intel/mcp.rs` 与
-> 4 个场景（context 语义锚点 2 条、MCP 2 条），声明值 178 -> 184；
-> Code Intelligence 场景总数由 16 增至 20。
+> 2026-10-11（Phase 2/3/4 契约与实现）：新增夹具 `MODULE.md`、`code_intel/mcp.rs` 与
+> 5 个场景（context 语义锚点 3 条、MCP 2 条），声明值 178 -> 185；
+> Code Intelligence 场景总数由 16 增至 21（Phase 2 三条、Phase 3 两条）。
 >
 > 既有缺口（非本次引入，保留待仓库所有者裁决）：`.evidence/.gitignore`、
 > `.evidence/README.md` 两行来自基线（`7d2e643`），但这两个文件已在

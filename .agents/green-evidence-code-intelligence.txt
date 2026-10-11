@@ -433,3 +433,39 @@ CLI 一次性路径的会话卫生实测：跑 `code symbol Egress ...` 前后 `
 
 同一 rev 上 `verify --full` 仍**没有结论**：`/work` 只有 27G 余量，而上一轮实测
 `--full` 需要 30G+ 才打得满得安全（见 §J）。不重复冒险。
+
+## M. 独立 Review round 1 的修复复跑（Windows 冒烟宿主，对象 `aba6de2` 之上的修复）
+
+案卷 `.evidence/review-qoder-independent-p234-r1/`（verdict `CHANGES_REQUESTED`；
+审查者只静态阅读、未跑 cargo、`model=unbound`）。修复 2 条阻塞（B1、G1）+
+4 条非阻塞（A1/A2/A3/G2），minor 4 条逐条表态（1 条**不能改**，理由见
+`.agents/code-intelligence-followups.md` 第 8 条）。
+
+改动面：`code_intel/lsp.rs`（`FrameIn` / `read_frame_result`，`read_frame` 原语义保留给
+LSP 客户端）、`code_intel/mcp.rs`（serve 退出形状、serve_exit_shape 探测、负向清单逐个试、
+`build_argv` 白名单门前移 + `UNSUPPORTED: ` 前缀）、`code_intel/mod.rs`（anchors 顺序理由注释）、
+`MODULE.md`（21 场景、`invalid_query`、`candidate_spans`、EOF 形状、拒绝形态）、
+`FILE_MANIFEST.md`（changelog 叙述）、`code_intelligence_mcp_handshake.toml`（+3 期望 = 14）。
+
+Windows 复跑（同一 worktree，串行）：
+
+    cargo fmt --all                          exit 0
+    cargo clippy -p nexus-harness --all-targets -D warnings   exit 0
+    nexus-harness mcp selftest --json        PASS，8/8 probes，duration_ms=75
+        eof_verdict=UNKNOWN  malformed_frame_verdict=FAIL
+        write_call_rejected=true（6 个越权名全部按 -32602 + UNSUPPORTED 拒绝）
+    cargo test -p nexus-harness              129 passed / 3 failed
+        3 条失败 = master 自带依赖 POSIX `echo` 的 scenario 单测（DEVELOPMENT.md §11.1），
+        与本模块无关，Windows 结构性假红，未削弱
+    21 个 E4 场景                             PASS=21 FAIL=0
+        关键 evidence_id：
+          mcp-handshake           scenario-105d6362e944（14 期望全过，含新增 3 条）
+          context-anchors         scenario-30e3e615b40a（15 期望）
+          mcp-real-query          scenario-8c78f08d4ea7
+        日志 /d/next/win-scenarios-p4b.log（工作树外，不入库）
+
+B1 的修复不是"读一遍代码确认改了"：`serve_exit_shape` 会把**自己**作为子进程拉起
+`mcp serve`，喂真实字节流（空输入 = 干净 EOF；`Content-Length: 9\r\n\r\n{}` = 畸形帧），
+再看它返回的 verdict。修复前这条探测把 clean EOF 报成 FAIL 且 PASS 分支不可达，
+修复后 `UNKNOWN` / `FAIL` 分别为真。
+

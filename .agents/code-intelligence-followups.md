@@ -148,3 +148,77 @@
    `cfg(target_os = "linux")` / `cfg_attr(not(linux), allow(dead_code))`，Linux 分支内容与
    master 一致 ⇒ 权威宿主上产品可见行为等价。口径限制也要记着：这不是同一命令在 master 上
    的实测对照，也不是 product-scenarios 的门包装（门包装还做 pack 归属与 UNKNOWN 映射）。
+
+## Phase 2/3/4 独立 Review round 1（对象 `df2049c..aba6de2`）修复台账
+
+案卷：`.evidence/review-qoder-independent-p234-r1/`（`review.md` 是审查者原文，`summary.json` 带
+逐维度 verdict）。审查者是**独立于实现会话**的执行者，但两点必须记着：
+①模型没能绑定（Agent 工具无 `model` 参数），口径记 `model=unbound`；
+②它在 Windows 上**只做静态阅读**，没跑 cargo —— 所以它的 verdict 不能当门禁结论，
+它自己也把"所有门禁结果 / E4 运行时 PASS / 第三方 MCP 客户端互操作"列进了 could-NOT-verify。
+本轮修复后的复跑数字见 `.agents/green-evidence-code-intelligence.txt` §M。
+
+verdict `CHANGES_REQUESTED`：4 个 CHANGES_REQUESTED 维度（A/B/G/H）、4 个 PASS（C/D/E/F）、
+2 条阻塞（B1、G1）、4 条非阻塞（A1/A2/A3/G2）+ 1 组 minor（H1 与 E1/F/G 四条）。
+
+1. **B1（阻塞，已修）** —— `lsp::read_frame` 把**所有**协议失败（含正常 EOF）都映射成
+   `PROVIDER_CRASHED`，`serve` 的 FAIL 分支因此吃掉一切，PASS 分支变成**不可达死代码**，
+   而注释"客户端关管道 = 正常退出"是假的：干净挂断与崩溃/畸形帧同形。
+   【处置】`lsp.rs` 拆出 `FrameIn::{Message, CleanEof, Failed}` 与 `read_frame_result`
+   （`read_frame` 原语义保留给 LSP 客户端侧，不改变 provider 失败的判法）；
+   `serve` 与 `spawn_reader` 改用新入口。**偏离审查者的修法**：它建议 EOF 一律路由到 PASS，
+   我改成 `handled > 0 ? PASS : UNKNOWN` —— 一条请求都没处理就报 PASS，等于把
+   "什么都没验证"说成"验证过了"，与 §12 的 verdict 语义冲突。
+   新增 `serve_exit_shape` 一次性子进程探测并挂进 selftest 第 8 步（默认路径即跑，不需要
+   language server），因为**此前没有任何测试直接跑过 `serve`**，这正是 B1 能藏住的原因。
+   实测：`verdict=PASS | eof_verdict=UNKNOWN | malformed_frame_verdict=FAIL`，
+   probes `clean_eof_is_not_reported_as_crash=true`、`malformed_frame_is_failure=true`。
+
+2. **G1（阻塞，已修）** —— 已冻结的 `MODULE.md` 场景清单只列了 4 条新场景并写"共 **20** 个"，
+   而 `code_intelligence_context_scope_guard.toml` 就在同一区间落地 ⇒ 真实是 **21**。
+   契约文件少报了自己的验证集。【处置】补 scope_guard 行、计数改 21。
+
+3. **A1（非阻塞，已修）** —— `status_for_error` 会产出 `semantic_status = "invalid_query"`
+   （候选符号歧义 ⇒ `code` 回 `QUERY_INVALID`），而契约枚举里没有这个值。
+   【处置】`MODULE.md` 枚举补 `invalid_query`。
+
+4. **A2（非阻塞 → 修出真缺陷）** —— 审查者指出 `MODULE.md` 写"按名请求写能力返回结构化
+   `UNSUPPORTED`"，实现只回 JSON-RPC `-32602`，且 selftest 只断言 `error.is_some()`。
+   把文案断言加严（要求 `-32602` **且** message 以 `UNSUPPORTED` 开头）之后 selftest 立刻变红：
+   `build_argv` 把 `strip_prefix("code.")` 放在白名单判定**之前**，于是
+   `workspace/applyEdit` / `workspace/executeCommand` / `textDocument/rename` 这 3 个不带
+   `code.` 前缀的负向名落进"未知工具"文案 —— 把**越权**说成了"你没这个名字"，
+   客户端可以换个拼法继续试。
+   【处置】白名单门前移（命名约定判定留在其后，作为"白名单被改坏"的兜底），
+   所有拒绝统一 `UNSUPPORTED: ` 前缀并区分"写能力工具"与"不在只读白名单"；
+   selftest 第 6 步改为**逐个试完负向清单上的全部 6 个名字**（只抽一个，其余 5 个是 free-ride）；
+   单测 `forbidden_tool_names_are_refused_not_executed` 从"只断言有 error"升级为断言
+   `code` + 前缀，并补了带/不带 `code.` 前缀两类陌生名。
+   值得留一句教训：**"断言只做到 error 存在"等于没断言 message** —— 契约写的是形状，
+   测试就要钉形状。
+
+5. **A3（非阻塞，已修）** —— `semantic_budget` 的字段形状块漏了 `candidate_spans`
+   （`commands.rs` 在发、同文件的不变量文字在要求）。【处置】字段表补上。
+
+6. **G2（非阻塞，已修）** —— `FILE_MANIFEST.md` 的 changelog 写"新增 4 个场景 / 16 增至 20 /
+   178→184"，而表内实为 5 行、头部是 185（声明总数与行数本身是一致的，只有叙述陈旧）。
+   【处置】改为 5 场景 / 16→21 / 178→185。
+
+7. **H1（非阻塞，不改，记理由）** —— `status_for_error` 为 context 路径重复编码了一遍
+   `code` 的错误→结论映射。这是契约里明写的口径（context 的 `semantic_status` 词表与
+   CLI verdict 不同源），消重复就得动 `code` 的冻结错误映射表 —— 收益是 DRY，代价是
+   动已冻结语义，本轮不做。漂移风险由 `mod.rs` 的显式 match 分支 + `invalid_query`
+   单测（A1 补齐后枚举与实现同形）压住。
+
+8. **E1/F/G minor 四条（不改，逐条记理由）**
+   - `anchors` 在作用域门**之前**调 `Bindings::current`（git），`context <成员目录>` 即使
+     declined 也付一次 git 调用。**不改，而且不能改**：`context_scope_guard` 场景要求
+     declined 结果仍带 `snapshot.source_revision`（非空），把 git 调用挪到门后就丢绑定。
+     已在 `anchors()` 里把这段顺序理由写成注释，防止下一轮把它当"优化点"删掉。
+   - anchors 的 happy-path / 复用循环 / "首个命中即停"没有单测，只有 E4（依赖真 RA）。
+     本轮不加：需要造假 provider 才能测，属独立一小块工作。
+   - 会话重建失败时旧 provider 活到 `serve` 退出。可接受：作用域只在同一进程内，
+     `ProviderSession` 的 `Drop` 保证退出即回收，不留孤儿。
+   - MCP 的预算参数没有上限校验 —— 与 CLI `code` 同口径（上限由上下文预算与截断可见性兜），
+     不是本区间新引入的差别。
+

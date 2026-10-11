@@ -14,7 +14,7 @@
 //! 复制一份编解码器等于复制一份安全边界，这类东西迟早漂移（round 2 的 `..` 绕过就是教训）。
 
 use super::ProviderSession;
-use super::lsp::{encode_frame, read_frame};
+use super::lsp::{FrameIn, encode_frame, read_frame_result};
 use serde_json::{Value, json};
 use std::io::{BufReader, Write};
 use std::path::Path;
@@ -134,19 +134,36 @@ fn envelope_object(command: &str, outcome: &Outcome) -> Value {
 
 /// `tools/call` 的参数校验 + argv 合成。返回 `Err((code, message))` 时调用方回 JSON-RPC error。
 fn build_argv(name: &str, arguments: Option<&Value>) -> Result<Vec<String>, (i64, String)> {
-    let verb = name
-        .strip_prefix("code.")
-        .ok_or((ERR_INVALID_PARAMS, format!("未知工具：{name}")))?;
     if !TOOLS.contains(&name) {
-        // 明确拒绝，而不是"当作未知符号查一次"。
+        // 明确拒绝，而不是"当作未知符号查一次"。白名单判定必须在 `strip_prefix` 之前：
+        // `workspace/applyEdit` 这类名字压根不带 `code.` 前缀，先 strip 会让它落进
+        // "未知工具"分支，把一个**越权**请求说成"你没这个名字"——客户端于是可以
+        // 换个拼法重试，而契约要的是"这类能力本适配器永久不提供"。
+        let hint = if FORBIDDEN_TOOLS.contains(&name) {
+            "是写能力工具，本适配器永久不暴露"
+        } else {
+            "不是只读查询工具"
+        };
+        // 消息首词固定为 `UNSUPPORTED`（Nexus 冻结错误码字面量）+ `-32602`：
+        // 两者一起构成"撞了白名单"的可断言形态，客户端不必匹配自然语言全文。
         return Err((
             ERR_INVALID_PARAMS,
             format!(
-                "{name} 不是只读查询工具；本适配器只暴露 {} 个只读 verb",
+                "UNSUPPORTED: {name} {hint}；本适配器只暴露 {} 个只读 verb",
                 TOOLS.len()
             ),
         ));
     }
+    // TOOLS 里的名字必然带 `code.` 前缀；到不了这条分支说明白名单被改坏了，仍然显式拒。
+    let verb = match name.strip_prefix("code.") {
+        Some(verb) => verb,
+        None => {
+            return Err((
+                ERR_INVALID_PARAMS,
+                format!("UNSUPPORTED: {name} 不符合 code.* 命名约定"),
+            ));
+        }
+    };
     let Some(args) = arguments else {
         return Err((ERR_INVALID_PARAMS, "tools/call 缺少 arguments".to_string()));
     };
@@ -285,16 +302,19 @@ where
 {
     std::thread::spawn(move || {
         loop {
-            match read_frame(&mut reader) {
-                Ok(value) => {
+            match read_frame_result(&mut reader) {
+                FrameIn::Message(value) => {
                     if tx.send(Ok(value)).is_err() {
                         return;
                     }
                 }
-                Err(failure) => {
+                FrameIn::Failed(failure) => {
                     let _ = tx.send(Err(format!("{}: {}", failure.code.code(), failure.reason)));
                     return;
                 }
+                // 子进程在帧边界上退出：不当成"崩溃"上报，直接让 channel 结束，
+                // 等待方会收到"管道已关闭"——那是事实，比编一个错误码诚实。
+                FrameIn::CleanEof => return,
             }
         }
     })
@@ -320,8 +340,38 @@ pub fn serve() -> Outcome {
     let mut session: Option<ProviderSession> = None;
     let mut handled = 0usize;
     loop {
-        match read_frame(&mut reader) {
-            Ok(message) => {
+        // 用 read_frame_result 而不是 read_frame：客户端在帧边界上正常挂断**不是失败**，
+        // 独立 Review 的 B1 就是把它混成了 PROVIDER_CRASHED（PASS 分支因此不可达）。
+        match read_frame_result(&mut reader) {
+            FrameIn::CleanEof => {
+                // 处理过请求才谈得上 PASS；一条都没收到就 EOF ⇒ UNKNOWN。
+                let verdict = if handled > 0 { "PASS" } else { "UNKNOWN" };
+                let message = if handled > 0 {
+                    format!("MCP stdin 已关闭，处理 {handled} 条请求后退出")
+                } else {
+                    "MCP stdin 立即 EOF：未收到任何请求，本结果不代表适配层可用".to_string()
+                };
+                return (
+                    verdict.to_string(),
+                    message,
+                    vec![
+                        ("authority".to_string(), json!("advisory")),
+                        ("handled_requests".to_string(), json!(handled)),
+                    ],
+                );
+            }
+            FrameIn::Failed(failure) => {
+                let code = failure.code.code();
+                return (
+                    "FAIL".to_string(),
+                    format!("MCP 入站帧不合规：{code} - {}", failure.reason),
+                    vec![
+                        ("authority".to_string(), json!("advisory")),
+                        ("handled_requests".to_string(), json!(handled)),
+                    ],
+                );
+            }
+            FrameIn::Message(message) => {
                 if let Some(response) = handle_request(&message, &mut session) {
                     if let Err(e) = write_frame(&mut writer, &response) {
                         return (
@@ -335,28 +385,6 @@ pub fn serve() -> Outcome {
                     }
                     handled += 1;
                 }
-            }
-            // 客户端关管道 = 正常退出；畸形帧 = PROVIDER/协议层失败，不伪装成 PASS。
-            Err(failure) => {
-                let code = failure.code.code();
-                if code == "PROVIDER_CRASHED" || code == "UNSUPPORTED" {
-                    return (
-                        "FAIL".to_string(),
-                        format!("MCP 入站帧不合规：{code} - {}", failure.reason),
-                        vec![
-                            ("authority".to_string(), json!("advisory")),
-                            ("handled_requests".to_string(), json!(handled)),
-                        ],
-                    );
-                }
-                return (
-                    "PASS".to_string(),
-                    format!("MCP stdin 已关闭，处理 {handled} 条请求后退出"),
-                    vec![
-                        ("authority".to_string(), json!("advisory")),
-                        ("handled_requests".to_string(), json!(handled)),
-                    ],
-                );
             }
         }
     }
@@ -581,32 +609,60 @@ pub fn selftest(args: &[String]) -> Outcome {
         }
     }
 
-    // 6) 按名请求写能力工具必须被拒（负向清单的真正落点）
+    // 6) 按名请求**每一个**写能力工具都必须被结构化拒绝（负向清单的真正落点）。
+    //    逐个试而不是只试一个：白名单门外有 6 个名字，它们的拒绝路径并不天然相同
+    //    （带不带 `code.` 前缀就曾分流出两种文案），只抽一个会让其余 5 个free-ride。
     if failure.is_none() {
-        let bad = json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{
-            "name":"workspace/applyEdit","arguments":{"target":"x","workspace":"."}
-        }});
-        match drive(&mut writer, &rx, &bad, Duration::from_secs(10)) {
-            Ok(response) => {
-                let rejected = response.get("error").is_some();
-                probes.push(Probe {
-                    name: "write_call_rejected",
-                    ok: rejected,
-                    detail: format!("实得 {}", response["error"]["code"]),
-                });
-                if !rejected {
-                    failure = Some("写能力工具调用未被拒绝".to_string());
+        let mut rejected_all = true;
+        let mut detail = String::new();
+        let mut drive_err: Option<String> = None;
+        for (i, forbidden) in FORBIDDEN_TOOLS.iter().enumerate() {
+            let bad = json!({"jsonrpc":"2.0","id":50+i,"method":"tools/call","params":{
+                "name":forbidden,"arguments":{"target":"x","workspace":"."}
+            }});
+            match drive(&mut writer, &rx, &bad, Duration::from_secs(10)) {
+                Ok(response) => {
+                    let code = response["error"]["code"].as_i64();
+                    let message = response["error"]["message"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    // 光"回了个 error"不够：必须断言拒绝的**形态**（`-32602` + `UNSUPPORTED` 前缀）。
+                    // 否则将来有人把拒绝文案改成"未知工具"这类模糊说法，探测仍然绿而契约已漂。
+                    let ok = code == Some(ERR_INVALID_PARAMS) && message.starts_with("UNSUPPORTED");
+                    rejected_all &= ok;
+                    if !detail.is_empty() {
+                        detail.push('|');
+                    }
+                    detail.push_str(&format!(
+                        "{forbidden}=>{}:{message}",
+                        code.unwrap_or_default()
+                    ));
+                }
+                Err(e) => {
+                    rejected_all = false;
+                    drive_err = Some(format!("{forbidden}: {e}"));
+                    break;
                 }
             }
-            Err(e) => {
-                failure = Some(format!("写能力拒绝探测失败：{e}"));
-                probes.push(Probe {
-                    name: "write_call_rejected",
-                    ok: false,
-                    detail: e,
-                });
-            }
         }
+        if let Some(e) = drive_err {
+            failure = Some(format!("写能力拒绝探测失败：{e}"));
+        } else if !rejected_all {
+            failure = Some("写能力工具调用未被结构化拒绝（-32602 + UNSUPPORTED）".to_string());
+        }
+        probes.push(Probe {
+            name: "write_call_rejected",
+            ok: rejected_all,
+            detail: if rejected_all {
+                format!(
+                    "{} 个越权名全部按 -32602 + UNSUPPORTED 拒绝",
+                    FORBIDDEN_TOOLS.len()
+                )
+            } else {
+                detail
+            },
+        });
     }
 
     // 7) 可选：**两次**真实查询（作用域限定在夹具 workspace）。
@@ -757,6 +813,38 @@ pub fn selftest(args: &[String]) -> Outcome {
         query.push(("query_skipped".to_string(), json!(!with_query)));
     }
 
+    // 8) serve 的退出形状：干净挂断 != 崩溃；畸形帧必须 FAIL。
+    //    不需要 language server，因此走 selftest 的默认路径（不加 --with-query 也跑）。
+    let (eof_verdict, eof_message) = serve_exit_shape("");
+    let (malformed_verdict, malformed_message) = serve_exit_shape("Content-Length: 9\r\n\r\n{}");
+    query.push(("eof_verdict".to_string(), json!(eof_verdict)));
+    query.push((
+        "malformed_frame_verdict".to_string(),
+        json!(malformed_verdict),
+    ));
+    let eof_ok = eof_verdict == "UNKNOWN";
+    probes_ok(
+        "clean_eof_is_not_reported_as_crash",
+        eof_ok,
+        format!("verdict={eof_verdict} message={eof_message}"),
+        &mut probes,
+    );
+    if !eof_ok {
+        failure = Some(format!(
+            "客户端一条请求都没发就挂断，serve 报成 {eof_verdict}；应是 UNKNOWN（既非崩溃也非 PASS）"
+        ));
+    }
+    let malformed_ok = malformed_verdict == "FAIL";
+    probes_ok(
+        "malformed_frame_is_failure",
+        malformed_ok,
+        format!("verdict={malformed_verdict} message={malformed_message}"),
+        &mut probes,
+    );
+    if !malformed_ok {
+        failure = Some(format!("畸形帧应报 FAIL，实得 {malformed_verdict}"));
+    }
+
     // 收尾：优雅 shutdown；无论如何都要回收子进程（不留孤儿 language server 进程）。
     let shutdown = json!({"jsonrpc":"2.0","id":99,"method":"shutdown","params":{}});
     let _ = drive(&mut writer, &rx, &shutdown, Duration::from_secs(10));
@@ -875,6 +963,53 @@ fn cli_snapshot() -> Value {
     match crate::env::Repo::discover() {
         Ok(repo) => crate::evidence::Bindings::current(&repo).to_json(),
         Err(e) => json!({"source_revision": "", "working_tree_digest": "", "error": e}),
+    }
+}
+
+/// 用一次性子进程演练 `mcp serve` 的**退出形状**。
+///
+/// 为什么要专门探：帧边界上的 EOF（客户端正常挂断）与畸形/半帧必须给出**不同** verdict。
+/// 独立 Review 抓到我把两者都判成 FAIL —— `read_frame` 把干净 EOF 也报成
+/// `PROVIDER_CRASHED`，于是 PASS 分支不可达；而 `selftest` 之前不看子进程退出码，
+/// 这条路径谁也走不到。这个探针把"serve 怎么结束"变成可断言的事实，而不是注释里的承诺。
+fn serve_exit_shape(input: &str) -> (String, String) {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return (String::new(), format!("定位自身可执行文件失败：{e}")),
+    };
+    let mut child = match Command::new(&exe)
+        .args(["mcp", "serve", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return (String::new(), format!("spawn mcp serve 失败：{e}")),
+    };
+    {
+        let mut si = match child.stdin.take() {
+            Some(s) => s,
+            None => return (String::new(), "子进程没有 stdin 管道".to_string()),
+        };
+        let _ = si.write_all(input.as_bytes());
+        // 离开作用域即关闭写端 ⇒ 子进程读到 EOF
+    }
+    let output = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => return (String::new(), format!("等待子进程失败：{e}")),
+    };
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    let line = match text.lines().rev().find(|l| l.trim_start().starts_with('{')) {
+        Some(l) => l,
+        None => return (String::new(), "子进程没有输出 JSON".to_string()),
+    };
+    match serde_json::from_str::<Value>(line) {
+        Ok(v) => (
+            v["verdict"].as_str().unwrap_or("").to_string(),
+            v["message"].as_str().unwrap_or("").to_string(),
+        ),
+        Err(e) => (String::new(), format!("解析子进程输出失败：{e}")),
     }
 }
 
@@ -1010,21 +1145,42 @@ mod tests {
 
     /// 按名请求写能力工具时必须被拒 —— 而且拒绝发生在**任何** provider 启动之前。
     /// 这条是 §16.8（provider 无写业务代码能力）在 MCP 面上的等价物。
+    ///
+    /// 断言的是**拒绝形态**（`-32602` + `UNSUPPORTED` 前缀），不只是"回了个 error"：
+    /// `workspace/applyEdit` 曾经因为不带 `code.` 前缀而落进"未知工具"文案，
+    /// 只断言"有错误"时探测是绿的，而对外契约已经把越权说成了拼写问题。
     #[test]
     fn forbidden_tool_names_are_refused_not_executed() {
         for name in FORBIDDEN_TOOLS {
             let err = build_argv(name, Some(&json!({"target": "Egress", "workspace": "."})))
                 .expect_err("{name} 不是只读工具，必须被拒");
             assert_eq!(err.0, ERR_INVALID_PARAMS, "{name} → {err:?}");
+            assert!(
+                err.1.starts_with("UNSUPPORTED"),
+                "{name} 的拒绝必须以 Nexus 错误码 UNSUPPORTED 开头，实得 {:?}",
+                err.1
+            );
         }
-        // 未知工具名同样拒，不"当作符号查一次"。
+        // 未知工具名同样拒，不"当作符号查一次"；形状与越权名一致。
+        let unknown = build_argv(
+            "code.teleport",
+            Some(&json!({"target": "x", "workspace": "."})),
+        )
+        .expect_err("白名单外的名字必须被拒");
+        assert_eq!(unknown.0, ERR_INVALID_PARAMS);
         assert!(
-            build_argv(
-                "code.teleport",
-                Some(&json!({"target": "x", "workspace": "."}))
-            )
-            .is_err()
+            unknown.1.starts_with("UNSUPPORTED"),
+            "未知 verb 也必须走同一条结构化拒绝，实得 {:?}",
+            unknown.1
         );
+        // 不带 `code.` 前缀的陌生名同样落进白名单门，而不是命名约定门。
+        let odd = build_argv(
+            "workspace/whatever",
+            Some(&json!({"target": "x", "workspace": "."})),
+        )
+        .expect_err("前缀外的名字必须被拒");
+        assert_eq!(odd.0, ERR_INVALID_PARAMS);
+        assert!(odd.1.starts_with("UNSUPPORTED"), "实得 {:?}", odd.1);
     }
 
     /// `initialize` 只声明 tools 能力。声明 workspace/completion/logging 之类
