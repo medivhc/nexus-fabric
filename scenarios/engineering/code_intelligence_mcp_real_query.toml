@@ -47,9 +47,30 @@ equals = "PASS"
 field = "query_second_results"
 non_empty = true
 
-# Phase 4 的判定数据：第二次查询落在同一个 provider 会话里（没有重新 initialize/索引），
-# 判据用**相对比值**（selftest 里算 `second*4 < first`）而不是绝对毫秒数 —— 绝对值随宿主
-# 负载漂移，钉死它只会造出与语义无关的脆弱红。
+# Phase 4 的判定数据：第二次查询必须落在**同一个 provider 会话**里（不重新 initialize/索引）。
+# 判据用结构事实（`provider.session_reused` / `session_queries`），不用时延比值——
+# 绝对毫秒随宿主负载漂移，钉时延只会造出与语义无关的脆弱红。时延仍由 selftest 输出当旁证。
+[[expect]]
+field = "query_first_session_reused"
+equals = false
+
+[[expect]]
+field = "query_first_session_queries"
+equals = 1
+
+[[expect]]
+field = "query_second_session_reused"
+equals = true
+
+[[expect]]
+field = "query_second_session_queries"
+equals = 2
+
+# 复用生效时会话没有被判失效：失效原因必须是空串，否则"复用了"与"重建了"分不开。
+[[expect]]
+field = "query_second_invalidated"
+equals = ""
+
 [[expect]]
 field = "query_warm_reused"
 equals = true

@@ -160,9 +160,23 @@ Phase 0/1 与提案 §16 十一条已交付：16 个 E4 场景在 xc-pc-linux �
 | 多语言 provider seam（代码层抽象） | **不做实现，只做清单** | 上面四项都不做 ⇒ seam 没有第二个使用者，写了就是 §15 禁止的"空泛框架"。改为在 MODULE.md 写"接下一个语言 provider 需要动哪几处"的清单，成本是文档、收益是将来不重构 |
 | 跨命令会话复用缓存 | **先 spike，由数字决定** | 触发条件（§11 第一条）已由实测满足：真实 47-crate workspace 上 `symbol Task` `duration_ms=90535` 且 `ready=false`；`references` 给 `--ready-timeout-secs 300` 仍不收敛；`symbol` 类在缓存热的情况下 31s 收敛。spike 载体是 `mcp selftest --with-query` 的两次查询（`query_first_ms` / `query_second_ms` / 相对判据 `second×4 < first`），数字必须来自 xc-pc-linux |
 
-spike 结论（回填于 M3 提交）：
+spike 与实现结论（2026-10-11 回填）：
 
-- 同一 `mcp serve` 进程内第二次查询：`query_first_ms = <待填>`、`query_second_ms = <待填>`，
-  `query_warm_reused = <待填>`（Evidence：`<待填>`，宿主 `xc-pc-linux`）。
-- 由这组数字决定的落法：`<待填>`（三选一：做跨命令缓存 / 只做 serve 进程内复用并把跨命令记为暂缓 /
-  完全不做并记录理由）。
+- **复用发生前**（Red）：`mcp selftest --with-query` 两次查询 first=18352ms / second=17817ms，
+  比值判据 `second*4 < first` 不成立 ⇒ 同一个 serve 进程内也没有复用，根因是 `run()`
+  每次调用都新建 provider。Red Evidence：`scenario-9e6b63057174`（宿主 Windows/RA 1.95.0）。
+- **实现进程内复用之后**（Green）：first=18029ms / second=486ms（**37 倍**），
+  结构层 `query_first_session_reused=false / session_queries=1`、
+  `query_second_session_reused=true / session_queries=2`、`session_invalidated_reason=""`。
+  Green Evidence：`scenario-61696a369a4c`（19 条期望全过，宿主 Windows/RA 1.95.0；
+  结论级复跑待 xc-pc-linux）。
+- **落法决定**：只做**同一进程内**的 provider 会话复用（`mcp serve` 持有），
+  **不做**跨进程缓存/后台 daemon/socket/索引落盘。理由：后者要新增一套隐藏的服务生命周期
+  与写副作用（谁启动、谁回收、崩溃后谁清），而当前唯一有证据的成本是
+  "一个长驻适配器里每次查询重新索引一遍"，进程内复用已经把它消掉；跨命令缓存的判据
+  （`provider.session_reused`）留在输出里，将来若真出现"Agent 每条命令都要冷启动"的
+  实测证据，再按 §11 单独立项。**这一条不是"没时间做"，是证据只支撑到这一步。**
+- 判据口径：复用与否用**结构事实**（`session_reused` / `session_queries` /
+  `session_invalidated_reason`）判定，时延只作旁证。原因是我第一版把
+  `second*4 < first` 写成了判据 —— 那是把宿主负载写进契约，属于会造成脆弱红的做法，
+  已在 MODULE.md 与本文件里改成结构判据。

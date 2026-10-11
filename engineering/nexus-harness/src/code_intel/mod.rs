@@ -85,7 +85,18 @@ impl Envelope {
     }
 }
 
+/// CLI 一次性入口：不持有任何跨调用状态，provider 在本次调用内建立并关闭。
 pub fn run(args: &[String]) -> Outcome {
+    let mut session: Option<ProviderSession> = None;
+    run_with_session(args, &mut session)
+}
+
+/// 带可复用会话的入口（`mcp serve` 用；契约见 MODULE.md「Provider Session Reuse」）。
+///
+/// `session` 由**调用方**持有：命中复用键就复用，否则重建（旧会话在替换时被 Drop 关掉）。
+/// CLI 传一个用完即丢的局部 `None`，行为与从前完全一致 —— 复用绝不能变成
+/// "默认悄悄留一个活进程"。
+pub fn run_with_session(args: &[String], session: &mut Option<ProviderSession>) -> Outcome {
     let verb_raw = args.first().map(String::as_str).unwrap_or("");
     let command = format!("code {verb_raw}");
     let mut base = Envelope::new(&command);
@@ -167,35 +178,80 @@ pub fn run(args: &[String]) -> Outcome {
         Err(e) => return fail(&envelope, &e),
     };
     let version = provider::probe_version(&binary);
-    let mut session = match RustAnalyzerProvider::start(
-        &binary,
-        &request.workspace,
-        &repo.root,
-        &version,
-        request.timeouts,
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            envelope.provider = Some(ProviderMeta {
-                kind: "rust-analyzer".to_string(),
-                binary: binary.to_string_lossy().replace('\\', "/"),
-                version,
-                ready: false,
-                restart_count: 0,
-                restart_reason: String::new(),
-                duration_ms: started.elapsed().as_millis(),
-                write_requests_refused: 0,
-                server_requests_unhandled: 0,
-                dropped_notifications: 0,
-            });
-            return fail(&envelope, &e);
-        }
+    // 复用键。四项全等才复用；**指纹一致**是"索引还描述当前工作树"的前提，
+    // 不一致就重建 —— 宁可付一次冷启动，也不拿旧树的结果冒充新鲜（MODULE.md 该节第 2 条）。
+    let want_key = SessionKey {
+        binary: binary.to_string_lossy().replace('\\', "/"),
+        workspace: request.budget.workspace_scope.clone(),
+        version: version.clone(),
+        digest: bindings_before.working_tree_digest.clone(),
     };
+    let mut reused = false;
+    let mut session_queries = 1usize;
+    let mut invalidated: &'static str = "";
+    match session.as_mut() {
+        // 命中复用键：本次不新建 provider，计数累加到整个会话。
+        Some(state) if state.key == want_key => {
+            state.queries += 1;
+            session_queries = state.queries;
+            reused = true;
+        }
+        // 键不同 ⇒ 重建。旧会话在赋值时被 Drop 关闭（不手动 close，避免双重回收）。
+        Some(state) => {
+            invalidated = session_invalidated_reason(&state.key, &want_key);
+            match RustAnalyzerProvider::start(
+                &binary,
+                &request.workspace,
+                &repo.root,
+                &version,
+                request.timeouts,
+            ) {
+                Ok(provider) => {
+                    *state = ProviderSession {
+                        provider,
+                        key: want_key.clone(),
+                        queries: 1,
+                    };
+                }
+                Err(e) => {
+                    envelope.provider = Some(startup_failure_meta(&want_key, &version, &started));
+                    return fail(&envelope, &e);
+                }
+            }
+        }
+        // 调用方没给会话槽（CLI 一次性路径）：新建一个用完即丢的，Drop 负责收尾。
+        None => {
+            match RustAnalyzerProvider::start(
+                &binary,
+                &request.workspace,
+                &repo.root,
+                &version,
+                request.timeouts,
+            ) {
+                Ok(provider) => {
+                    *session = Some(ProviderSession {
+                        provider,
+                        key: want_key.clone(),
+                        queries: 1,
+                    });
+                }
+                Err(e) => {
+                    envelope.provider = Some(startup_failure_meta(&want_key, &version, &started));
+                    return fail(&envelope, &e);
+                }
+            }
+        }
+    }
 
-    let execution = execute(&request, &mut session, &repo.root);
-    let mut meta = session.finish_meta();
+    let state = session.as_mut().expect("上面每个分支都建立了会话");
+    let execution = execute(&request, &mut state.provider, &repo.root);
+    let mut meta = state.provider.finish_meta();
+    // duration_ms 是**本次查询**的耗时，不是会话累计：混进来会让 Agent 把"复用了"
+    // 读成"这次很快"，或把"会话很久"读成"单次查询很慢"。
     meta.duration_ms = started.elapsed().as_millis();
-    session.close();
+    meta.session_reused = reused;
+    meta.session_queries = session_queries;
+    meta.session_invalidated_reason = invalidated.to_string();
     envelope.provider = Some(meta);
 
     let items = match execution {
@@ -235,6 +291,69 @@ pub fn run(args: &[String]) -> Outcome {
         kept_count(&fields)
     );
     ("PASS".to_string(), message, fields)
+}
+
+/// provider 的复用键（MODULE.md「Provider Session Reuse」）。四项全等才算同一个会话。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionKey {
+    /// 解析后的可执行文件路径（`\\` 归一化成 `/`）。
+    binary: String,
+    /// 相对仓库根的 workspace 作用域。
+    workspace: String,
+    /// provider 版本：换了 server 不能拿旧索引冒充新 server 的结论。
+    version: String,
+    /// **会话建立时**的工作树指纹。
+    digest: String,
+}
+
+/// 可跨查询持有的 provider 会话。目前唯一的持有者是 `mcp serve`。
+///
+/// `Drop` 里关闭 provider：这样"忘了关"不会留下孤儿 language server 进程，
+/// 而重建路径（`*state = ProviderSession { .. }`）也自动回收旧进程。
+pub struct ProviderSession {
+    provider: RustAnalyzerProvider,
+    key: SessionKey,
+    queries: usize,
+}
+
+impl Drop for ProviderSession {
+    fn drop(&mut self) {
+        self.provider.close();
+    }
+}
+
+/// 会话为什么被重建。顺序有意：指纹变化最危险，先报它。
+fn session_invalidated_reason(saved: &SessionKey, want: &SessionKey) -> &'static str {
+    if saved.digest != want.digest {
+        "digest_changed"
+    } else if saved.workspace != want.workspace {
+        "workspace_changed"
+    } else if saved.binary != want.binary {
+        "binary_changed"
+    } else {
+        // 只剩版本（或内部状态）不同：一律算"换了 provider 进程"。
+        "provider_restarted"
+    }
+}
+
+/// provider 起不来时的元数据。`session_queries = 0` 是刻意的：
+/// 一次都没服务成功，报 1 就是把失败说成发生过查询。
+fn startup_failure_meta(key: &SessionKey, version: &str, started: &Instant) -> ProviderMeta {
+    ProviderMeta {
+        kind: "rust-analyzer".to_string(),
+        binary: key.binary.clone(),
+        version: version.to_string(),
+        ready: false,
+        restart_count: 0,
+        restart_reason: String::new(),
+        duration_ms: started.elapsed().as_millis(),
+        write_requests_refused: 0,
+        server_requests_unhandled: 0,
+        dropped_notifications: 0,
+        session_reused: false,
+        session_queries: 0,
+        session_invalidated_reason: String::new(),
+    }
 }
 
 /// `context` 语义层的产物（提案 §15 Phase 2，契约见 MODULE.md「Context Semantic Anchoring」）。
@@ -1100,6 +1219,90 @@ mod tests {
     /// 所以同一个反引号对里的列表**整体被丢弃**——既不产 `Foo` 也不产 `Bar`。
     /// 这与"取词首"的意图不符（也正因此那段 take_while 实际不可达）。这里按现状
     /// 钉死形状：生产侧改成先取词首时，本断言会立刻红，不会被静默放过。
+    /// 复用键的四个维度必须**逐个**能单独触发重建，且原因串分辨得出是哪一维变了。
+    /// 顺序也有意义：指纹变化最危险，所以它优先于 workspace/binary/version 被报出来。
+    #[test]
+    fn session_key_invalidation_reports_the_first_changed_dimension() {
+        let base = SessionKey {
+            binary: "rust-analyzer".to_string(),
+            workspace: "crates/nexus-domain".to_string(),
+            version: "1.98.1".to_string(),
+            digest: "aaaa".to_string(),
+        };
+        assert_eq!(
+            session_invalidated_reason(&base, &base.clone()),
+            "provider_restarted"
+        );
+
+        let mut digest_changed = base.clone();
+        digest_changed.digest = "bbbb".to_string();
+        assert_eq!(
+            session_invalidated_reason(&base, &digest_changed),
+            "digest_changed",
+            "工作树指纹变化必须最先报，它决定索引是否还描述当前代码"
+        );
+
+        // 指纹与 workspace 同时变时，仍先报 digest_changed（更危险的那一个优先）。
+        let mut both = digest_changed.clone();
+        both.workspace = "crates/nexus-network".to_string();
+        assert_eq!(session_invalidated_reason(&base, &both), "digest_changed");
+
+        let mut ws_only = base.clone();
+        ws_only.workspace = "apps/nexus".to_string();
+        assert_eq!(
+            session_invalidated_reason(&base, &ws_only),
+            "workspace_changed"
+        );
+
+        let mut bin_only = base.clone();
+        bin_only.binary = "D:/other/rust-analyzer".to_string();
+        assert_eq!(
+            session_invalidated_reason(&base, &bin_only),
+            "binary_changed"
+        );
+
+        // 版本不同没有独立标签（同一 binary/workspace 换 server 版本 = 进程换了），
+        // 但绝不能被判成"可以复用"——键本身不相等。
+        let mut ver_only = base.clone();
+        ver_only.version = "1.95.0".to_string();
+        assert_ne!(
+            base, ver_only,
+            "版本不同必须使键不等，否则旧索引冒充新 server 的结论"
+        );
+        assert_eq!(
+            session_invalidated_reason(&base, &ver_only),
+            "provider_restarted"
+        );
+    }
+
+    /// provider 没起来时的元数据不许谎报会话状态：复用 false、查询次数 **0**、无失效原因。
+    /// （0 而不是 1：一次都没成功服务过查询。）
+    #[test]
+    fn startup_failure_meta_claims_no_session_activity() {
+        let key = SessionKey {
+            binary: "rust-analyzer".to_string(),
+            workspace: "crates/nexus-domain".to_string(),
+            version: "1.98.1".to_string(),
+            digest: "aaaa".to_string(),
+        };
+        let meta = startup_failure_meta(&key, "1.98.1", &Instant::now());
+        assert!(!meta.ready, "起不来不得自称就绪");
+        assert!(!meta.session_reused);
+        assert_eq!(meta.session_queries, 0, "没起来就是零次查询");
+        assert!(meta.session_invalidated_reason.is_empty());
+        let json = meta.to_json();
+        for field in [
+            "session_reused",
+            "session_queries",
+            "session_invalidated_reason",
+        ] {
+            assert!(
+                json.get(field).is_some(),
+                "{field} 必须出现在 provider 输出里，否则消费方看不见复用状态"
+            );
+        }
+    }
+
     #[test]
     fn contract_candidates_keeps_only_deduped_uppercase_identifiers() {
         let dir = scratch_dir("candidates");

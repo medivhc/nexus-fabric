@@ -347,3 +347,53 @@ rev `54010f8` 上启动 `verify --full --json`（`/work/xc-verify-full.sh`，
 `contract=3652314f9c21` 与 §I（`54010f8`）**相同**、`cfg=fa6c1bdb335a` 亦相同 —— 这正好是
 "docs-only 提交不改变契约输入面"的实测旁证；变化的只有 `tree`（工作树指纹），因为它按字节算，
 任何文件改动都会动它。要记住 §J 那条：本轮**没有** `verify --full` 结论。
+
+## K. Phase 2/3/4（context 语义锚点 + MCP 适配 + 同进程会话复用）
+
+执行宿主：Windows（rustc/clippy 1.95.0、rust-analyzer 1.95.0、`D:
+extci-p24` worktree，
+分支 `feature/code-intel-phase-234`）。**这是冒烟宿主，不是结论宿主**；同一批在
+xc-pc-linux 的复跑见 §L。工作树起点 `df2049c`（PR #12 head）。
+
+21 个 E4 场景逐个 verdict 与 evidence_id（串行，每场景一个全新 provider 进程）：
+
+    budget-count                 PASS
+    budget-truncation            PASS
+    callees                      PASS
+    callers                      PASS
+    context-anchors              PASS
+    context-no-fake-semantics    PASS
+    context-scope-guard          PASS
+    definition                   PASS
+    diagnostics-advisory         PASS
+    diagnostics-item-shape       PASS
+    hover                        PASS
+    implementations              PASS
+    mcp-handshake                PASS
+    mcp-real-query               PASS
+    provider-unavailable         PASS
+    read-only-counters           PASS
+    scope-escape                 PASS
+    scope-violation              PASS
+    symbol                       PASS
+    workspace-escape             PASS
+    write-method-denied          PASS
+
+合计 PASS=21 FAIL=0。Phase 4 的 Red→Green 链：
+  Red   scenario-9e6b63057174  first=18352ms second=17817ms，`provider.session_reused` 读为 null
+        ⇒ 同一个 `mcp serve` 进程内也没复用（`run()` 每次新建 provider）
+  Green scenario-61696a369a4c  first=18029ms second=486ms（37x），`session_reused=true`、
+        `session_queries=2`、`session_invalidated_reason=""`，19 条期望全过
+判据从时延比值改成**结构事实**的理由写在 MODULE.md「Provider Session Reuse」与
+.agents/code-intelligence-phase-2-4-plan.md 附录 A：时延绝对值随宿主负载漂移，
+把它写进契约就是造脆弱红（round 2/3 同类教训）。
+
+Phase 2 三条场景的 Red→Green：
+  context-anchors            Red scenario-d0ed41450b95（`authority` 字段 <missing>）
+                             → Green scenario-d0a714197aeb
+  context-no-fake-semantics  Red scenario-6ba4e0adc515 → Green scenario-d12053b9f176
+  context-scope-guard        （契约先行新增，无 Red：实现即 Green）scenario-89ac9a572677
+Phase 3：mcp-handshake Red scenario-922202299c25（verdict 实得 BLOCKED）→ Green scenario-fe203f567c59
+
+CLI 一次性路径的会话卫生实测：跑 `code symbol Egress ...` 前后 `rust-analyzer` 进程数都是 0，
+输出 `session_reused=false / session_queries=1` ⇒ 复用只在调用方显式持有会话时发生。

@@ -13,6 +13,7 @@
 //! `Content-Length` 帧格式，而那两个函数已经带着 header/body 上限与结构化失败原因。
 //! 复制一份编解码器等于复制一份安全边界，这类东西迟早漂移（round 2 的 `..` 绕过就是教训）。
 
+use super::ProviderSession;
 use super::lsp::{encode_frame, read_frame};
 use serde_json::{Value, json};
 use std::io::{BufReader, Write};
@@ -203,7 +204,7 @@ fn build_argv(name: &str, arguments: Option<&Value>) -> Result<Vec<String>, (i64
 }
 
 /// 单条请求 → 响应。`None` 表示这是 notification（不回复）。
-fn handle_request(message: &Value) -> Option<Value> {
+fn handle_request(message: &Value, session: &mut Option<ProviderSession>) -> Option<Value> {
     let method = message.get("method").and_then(Value::as_str)?;
     // notification（无 id）只接受并忽略；带 id 的才需要回复。
     let id = message.get("id").cloned()?;
@@ -236,7 +237,7 @@ fn handle_request(message: &Value) -> Option<Value> {
                 Ok(argv) => {
                     let command =
                         format!("code {}", argv.first().map(String::as_str).unwrap_or(""));
-                    let outcome = super::run(&argv);
+                    let outcome = super::run_with_session(&argv, session);
                     let envelope = envelope_object(&command, &outcome);
                     let text =
                         serde_json::to_string(&envelope).unwrap_or_else(|_| "{}".to_string());
@@ -315,11 +316,13 @@ pub fn serve() -> Outcome {
     let stdout = std::io::stdout();
     let mut reader = BufReader::new(stdin.lock());
     let mut writer = stdout.lock();
+    // 会话只活在这个进程里：serve 返回即 Drop，不留孤儿 provider。
+    let mut session: Option<ProviderSession> = None;
     let mut handled = 0usize;
     loop {
         match read_frame(&mut reader) {
             Ok(message) => {
-                if let Some(response) = handle_request(&message) {
+                if let Some(response) = handle_request(&message, &mut session) {
                     if let Err(e) = write_frame(&mut writer, &response) {
                         return (
                             "BLOCKED".to_string(),
@@ -646,6 +649,24 @@ pub fn selftest(args: &[String]) -> Outcome {
                     query.push((verdict_key.to_string(), json!(verdict)));
                     query.push((results_key.to_string(), json!(results)));
                     query.push((ms_key.to_string(), json!(elapsed_ms)));
+                    // 结构层判据：provider 自己报有没有复用、这是会话的第几次查询。
+                    let prefix = if tool == "code.symbol" {
+                        "query_first"
+                    } else {
+                        "query_second"
+                    };
+                    query.push((
+                        format!("{prefix}_session_reused"),
+                        json!(envelope["provider"]["session_reused"]),
+                    ));
+                    query.push((
+                        format!("{prefix}_session_queries"),
+                        json!(envelope["provider"]["session_queries"]),
+                    ));
+                    query.push((
+                        format!("{prefix}_invalidated"),
+                        json!(envelope["provider"]["session_invalidated_reason"]),
+                    ));
                     if tool == "code.symbol" {
                         query.push((
                             "query_provider_kind".to_string(),
@@ -703,17 +724,24 @@ pub fn selftest(args: &[String]) -> Outcome {
             .find(|(k, _)| k == "query_second_ms")
             .and_then(|(_, v)| v.as_u64())
             .unwrap_or(u64::MAX);
-        let warm = second_ms.saturating_mul(4) < first_ms;
-        query.push(("query_warm_reused".to_string(), json!(warm)));
+        // 判据分两层：**结构层**（provider 自报 session_reused / session_queries）是结论；
+        // 时延只是旁证，不拿来当判据 —— 绝对毫秒数随宿主负载漂移，钉死它会造出与语义
+        // 无关的脆弱红（round 3 同类教训）。
+        let reused = bool_of(&query, "query_second_session_reused");
+        let queries = usize_of(&query, "query_second_session_queries");
+        let structural = reused && queries >= 2;
+        query.push(("query_warm_reused".to_string(), json!(structural)));
         probes_ok(
-            "warm_session_reused",
-            warm,
-            format!("first_ms={first_ms} second_ms={second_ms}"),
+            "provider_session_reused",
+            structural,
+            format!(
+                "second.session_reused={reused} queries={queries} first_ms={first_ms} second_ms={second_ms}"
+            ),
             &mut probes,
         );
-        if !warm {
+        if !structural {
             failure = Some(format!(
-                "第二次查询未体现会话复用（first={first_ms}ms second={second_ms}ms，期望 second*4 < first）"
+                "第二次查询未复用 provider 会话（session_reused={reused} queries={queries}）；两者都在冷启动量级就说明复用键或会话持有有问题"
             ));
         }
     } else {
@@ -839,6 +867,23 @@ fn cli_snapshot() -> Value {
         Ok(repo) => crate::evidence::Bindings::current(&repo).to_json(),
         Err(e) => json!({"source_revision": "", "working_tree_digest": "", "error": e}),
     }
+}
+
+/// 从已收集的字段里读布尔/整数；读不到算"没发生"，不默认成 true/1。
+fn bool_of(fields: &[(String, Value)], key: &str) -> bool {
+    fields
+        .iter()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, v)| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn usize_of(fields: &[(String, Value)], key: &str) -> usize {
+    fields
+        .iter()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, v)| v.as_u64())
+        .unwrap_or(0) as usize
 }
 
 /// 一次探测的记账。独立成函数只为了循环里少写八行样板。
@@ -977,9 +1022,10 @@ mod tests {
     /// 就等于对外承诺本适配器有那些面 —— 契约不能靠"反正客户端不用"糊过去。
     #[test]
     fn initialize_declares_only_tools_capability() {
-        let response = handle_request(&json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}
-        }))
+        let response = handle_request(
+            &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+            &mut None,
+        )
         .expect("initialize 必须有回复");
         assert_eq!(
             response["result"]["protocolVersion"],
@@ -998,15 +1044,17 @@ mod tests {
     #[test]
     fn notifications_are_silent_while_errors_are_structured() {
         assert!(
-            handle_request(&json!({
-                "jsonrpc": "2.0", "method": "notifications/initialized", "params": {}
-            }))
+            handle_request(
+                &json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+                &mut None,
+            )
             .is_none(),
             "notification 不该产生回复"
         );
-        let unknown = handle_request(&json!({
-            "jsonrpc": "2.0", "id": 7, "method": "nexus/not-a-method", "params": {}
-        }))
+        let unknown = handle_request(
+            &json!({"jsonrpc":"2.0","id":7,"method":"nexus/not-a-method","params":{}}),
+            &mut None,
+        )
         .expect("带 id 的请求必须有回复");
         assert_eq!(unknown["error"]["code"], json!(ERR_METHOD_NOT_FOUND));
         // 缺 jsonrpc 版本 = 无效请求，不能当合法请求处理。
@@ -1014,7 +1062,7 @@ mod tests {
             json!({"id": 8, "method": "tools/list"}),
             json!({"jsonrpc": "1.0", "id": 9, "method": "tools/list"}),
         ] {
-            let response = handle_request(&bad).expect("必须有回复");
+            let response = handle_request(&bad, &mut None).expect("必须有回复");
             assert_eq!(
                 response["error"]["code"],
                 json!(ERR_INVALID_REQUEST),

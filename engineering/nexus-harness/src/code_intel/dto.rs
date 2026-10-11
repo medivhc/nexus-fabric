@@ -209,6 +209,15 @@ pub struct ProviderMeta {
     /// 未识别的 server→client 请求数；与写能力分开计数，
     /// 否则正常只读查询也会让 refused 恒为非 0，信号失真。
     pub server_requests_unhandled: usize,
+    /// 本次查询是否**复用**了已有 provider 会话（MODULE.md「Provider Session Reuse」）。
+    /// CLI 一次性路径恒为 false —— 那里没有可复用的对象，写 true 就是撒谎。
+    pub session_reused: bool,
+    /// 该会话到本次为止服务过几次查询（1 = 本次即首次）。
+    pub session_queries: usize,
+    /// 为什么会重建会话：`digest_changed` / `workspace_changed` / `binary_changed` /
+    /// `provider_restarted`，空串表示未重建。复用失效必须是**可见事件**，
+    /// 否则"每次都很慢"会被读成"复用没生效"，而真相可能是"每次都被判失效"。
+    pub session_invalidated_reason: String,
 }
 
 impl ProviderMeta {
@@ -232,6 +241,9 @@ impl ProviderMeta {
             "write_requests_refused": self.write_requests_refused,
             "server_requests_unhandled": self.server_requests_unhandled,
             "dropped_notifications": self.dropped_notifications,
+            "session_reused": self.session_reused,
+            "session_queries": self.session_queries,
+            "session_invalidated_reason": self.session_invalidated_reason,
         })
     }
 }
