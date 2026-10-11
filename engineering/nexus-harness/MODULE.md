@@ -441,9 +441,9 @@ round 2 的教训就是"待办只写在提交说明里，下一轮没有承载�
 
 - 真实执行：workspace-tests / product-scenarios / regression / architecture-policy / dependency-governance（cargo-deny 0.20：`cargo deny --config policies/deny.toml check advisories licenses bans sources`，缺失则 UNKNOWN）/ coverage-summary（cargo-llvm-cov）/ platform-checks（portable-core 平台依赖静态扫描）/ feature-matrix（每成员 `--no-default-features` + `--all-features`）/ portable-core（`cargo check --target wasm32-wasip1`）。
 - 条件执行（无内容/无工具时 UNKNOWN）：integration（成员 tests/*.rs 存在时逐个运行）/ selected-fuzz（cargo-fuzz + fuzz targets）/ selected-concurrency（tests/concurrency 有测试时运行）/ performance-budgets（quality.toml `[performance]` 定义 baseline+blocking 后判定）。
-- 单元测试：`cargo test -p nexus-harness`（Windows/1.95.0 上**本轮实测 134 个 = 131 passed + 3 failed**，
+- 单元测试：`cargo test -p nexus-harness`（Windows/1.95.0 上**本轮实测 135 个 = 132 passed + 3 failed**，
   xc-pc-linux/1.98.1 上再多 1 条 —— 差的那条是 `#[cfg(unix)]` 的真实符号链接越界回归，
-  所以 Linux 是 135；**117/116 是 round 2 之前的陈旧声明，本区间把测试数从 117 推到了 134 却没同步这行，
+  所以 Linux 是 **136**；**117/116 是 round 2 之前的陈旧声明，本区间把测试数从 117 推到了 135 却没同步这行，
   已由独立 Review 的 N2 抓出并在此更正**。那 3 条失败是 master 自带、依赖 POSIX `echo` 的
   `scenario::tests::run_single_*`/`run_parallel_*` 在本宿主假红，见 DEVELOPMENT.md §11.1；
   覆盖 scenario 求值、evidence 新鲜度/STALE、digest 确定性与锁竞争判定、containment 的归一化比较

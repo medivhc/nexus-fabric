@@ -535,7 +535,7 @@ Windows 复跑（最终二进制，串行；`dirty=0` 之前取）：
 
     cargo fmt --all -- --check                             exit 0
     cargo clippy -p nexus-harness --all-targets -D warn    exit 0
-    cargo test -p nexus-harness                            131 passed / 3 failed（共 134）
+    cargo test -p nexus-harness                            132 passed / 3 failed（共 135）
         3 条 = master 自带依赖 POSIX `echo` 的 scenario 单测（DEVELOPMENT.md §11.1）
         注：`cargo clippy --workspace` 在本宿主 exit 101，原因是 `nexus-platform-linux`
         要 `fuser`（PR #12 记录的结构性限制），不是本模块引入
@@ -578,6 +578,11 @@ Windows 复跑（最终二进制，串行；`dirty=0` 之前取）：
    后果很实际：Red→Green 若在同一 rev 上完成，`.evidence/` 里**留不下 Red** ——
    本模块之所以每次把 verdict/输出逐条抄进 `.agents/*evidence*.txt`，正是因为这个覆盖行为，
    而不是巧合。已登记为后续项（见 `.agents/code-intelligence-followups.md`）。
+3. **本节第一次记的单测总数是少的（写成 134），已更正为 135**：那次 `cargo test -p nexus-harness`
+   跑在第 3 条新测试（`selftest_rejects_unknown_arguments_before_spawning_anything`）落地之前。
+   发现方式是**跨宿主对账**：Linux 实测 136，Windows 若是 134 就差 2 条，而两宿主之间唯一的
+   已知差异是 1 条 `#[cfg(unix)]` 测试 ⇒ 算术不成立；回 Windows 重跑得 132 passed + 3 failed = 135。
+   这正是 N2/N3 那类错误的成因，也是为什么记下来的数字必须带宿主和测量时点。
 
 ### N7 与 S1 的实测依据
 
@@ -587,6 +592,56 @@ Windows 复跑（最终二进制，串行；`dirty=0` 之前取）：
 - S1：`handled_requests` 此前只在输出里、契约从没定义它，而它正是 `PASS`/`UNKNOWN` 的判据本身
   （`mcp.rs` serve 的 `handled > 0`）。现在 MODULE.md 定义了它（含"notification 不计"），
   且探针断言 `pass_handled_requests=1` 与"stdout 帧数=1"必须同时成立。
+
+## P. round 2 整改后的结论级复跑（xc-pc-linux，rev `52184e96`）
+
+宿主 `xc-pc-linux`（rustc/clippy/rust-analyzer **1.98.1**，`cargo-deny 0.20.2` 在场）；
+`dirty=0`；起点由 thin bundle（`a3af128..52184e96`，28KB）传入后 `checkout -f FETCH_HEAD`。
+日志 `/work/xc-verify-p234d.log`。**批次期间没有任何并发构建**（§O 过程事实 1 的教训已执行）。
+
+    cargo fmt --all -- --check                       exit 0
+    cargo clippy --workspace --all-targets -D warn   exit 0，error 行数 0
+    cargo test -p nexus-harness                      136 passed / 0 failed
+        与 Windows 135 的差 1 条 = `#[cfg(unix)]` 的真实符号链接越界回归（跨宿主对账见 §O 第 3 条）
+    cargo test -p nexus --lib                        217 passed / 0 failed / 2 ignored
+    verify --fast --json                             overall PASS，9/9 门 PASS、无 UNKNOWN
+        Evidence dir=verify-qoder-xc-488a84ca265c  contract=78981c3f32f0
+        rev=52184e96c682  dirty=False  tree=ae674a94a16e  cfg=fa6c1bdb335a
+        toolchain=1.98.1  target=x8_64-unknown-linux-gnu
+        dependency-governance 真跑过（cargo-deny 在场）：advisories/licenses/bans/sources PASS
+    21 个 E4 场景                                     PASS=21 FAIL=0
+    四种越界形态                                       仍在 spawn provider 之前被拒
+    dirty_after=0   flycheck 残留(仓库内)=0   disk_after=27G 可用
+
+第 6b 步（默认 `mcp selftest`，权威宿主）—— round 2 整改点的直接复证：
+
+    verdict=PASS  authority=advisory  tools=8  probes_ok=11/11  duration_ms=172
+      eof_verdict=UNKNOWN      malformed_frame_verdict=FAIL
+      pass_verdict=PASS        pass_handled_requests=1     stdout_frames_ok=True
+      notification_no_reply=True（期望下一条响应 id=2，实得 2）
+      provider_override_honored=True（BLOCKED / PROVIDER_UNAVAILABLE / 原因点名 --provider-binary）
+      write_call_rejected=True（6 个越权名全部按 -32602 + UNSUPPORTED 拒绝）
+
+第 6c 步（N5 通道纯度的直接复证，手工喂字节流）：
+
+    printf '' | mcp serve --json                 exit=0  stdout_bytes=**0**  stderr_bytes=685
+    一帧 initialize + 关管道                       exit=0  stdout_bytes=230
+                                                 Content-Length 出现次数=**1**（恰好一帧、无尾字节）
+                                                 stderr: verdict=PASS handled_requests=1
+    mcp serve --totally-made-up --json           exit=**2**  stdout_bytes=0（不再静默丢弃）
+
+本轮 5 条相关场景在 Linux 的 evidence_id：
+
+    context-anchors            scenario-qoder-xc-def0690d3cf5
+    context-no-fake-semantics  scenario-qoder-xc-51cc6326fd94
+    context-scope-guard        scenario-qoder-xc-885fac35b175
+    mcp-handshake              scenario-qoder-xc-f512d7d0079e（19 期望全过）
+    mcp-real-query             scenario-qoder-xc-723a9049cd7d（19 期望全过）
+
+口径重申（别把两宿主的数当一个量）：contract hash 随宿主不同 —— 同一内容 Windows 工作树
+算出 `b9242a09eefd…`（本轮提交 marker 记的就是它），Linux 算出 `78981c3f32f0`，
+根因是 `* text=auto` 的 CRLF 检出（DEVELOPMENT.md §11.1）。
+`verify --full` 仍**无结论**：`/work` 只有 27G 余量，实测需要 30G+（§J 同一口径），不重复冒险。
 
 
 

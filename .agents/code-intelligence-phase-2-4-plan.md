@@ -195,6 +195,15 @@ spike 与实现结论（2026-10-11 回填）：
 5 非阻塞 + 4 条 minor，已全部处置（B1/G1/A1/A2/A3/G2 修，H1 与 4 条 minor 逐条表态、
 其中 1 条**不能改**因为会破坏既有契约的字段可得性），修复复跑记在
 `.agents/green-evidence-code-intelligence.txt` §M。
+**round 2（对象 `aba6de2..a3af128`）判 `COMMENTED`、0 阻塞**：round 1 六条由独立执行者以
+实跑命令确认 CLOSED，新提 7 条非阻塞（N1-N7）加我自查的 S1（`handled_requests` 从未进契约）
+也已全部处置 —— 修前 Red `.agents/red-evidence-mcp-round2.txt`，修后 Windows §O、
+Linux 结论级 §P。三条值得留下的口径：① **契约承诺的开关要端到端证明**（"参数被接受"不等于
+"参数生效"，而 exit 0 + 输出不变是最坏失效形状）；② **stdout 属于协议通道**，
+CLI 顺手 `println!` 就能让服务端在会话结尾发出客户端读不进去的字节；
+③ **决定 verdict 的量必须出现在输出里并被契约定义**。
+另记一条我自己的错：**N3 是把默认路径的 8 条探针记成 11 条** —— 把没跑过的东西写进
+"结论级证据"正是提案禁止的形状，勘误见 §N 末。
 审查者是独立执行者但 `model=unbound`，且在 Windows 只做静态阅读没跑 cargo —— 它的
 verdict 不能当门禁结论，本轮修复后的数字全部由实现侧复跑补齐（fmt/clippy/test/selftest/21 场景）。
 
@@ -202,5 +211,7 @@ verdict 不能当门禁结论，本轮修复后的数字全部由实现侧复跑
 - 第三方 MCP 客户端互操作（两个宿主都没有真实客户端）；
 - `verify --full` 对本区间无结论（宿主余量 27G < 实测需要的 30G+）；
 - 跨进程/跨命令的会话成本（判据 `provider.session_reused` 已可见，数据未取）；
-- 多语言 provider 的真实表现（未装，未测，不做任何声称）。
+- 多语言 provider 的真实表现（未装，未测，不做任何声称）；
+- **round 2 整改本身的独立复核**：`3c3bb97`/`52184e9` 动了传输通道与启动参数面，
+  属审查者已验过的面；AGENTS.md §19.1 上限 3 轮，第 3 轮（末轮）只用于核这一 delta。
 
