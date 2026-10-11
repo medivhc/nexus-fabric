@@ -12,7 +12,9 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use nexus_web_gateway::file_service::{FileEngine, FileLimits, SandboxRoot, SendBudget, code};
+use nexus_web_gateway::file_service::{
+    BackendKind, FileEngine, FileLimits, SandboxRoot, SendBudget, code,
+};
 use serde_json::{Map, Value, json};
 
 const TOKEN: &str = "probe-token";
@@ -54,6 +56,7 @@ fn dispatch(case: &str) -> Result<Value, String> {
         "auth-throttle" => auth_throttle(&mut fields)?,
         "quota-backpressure" => quota_backpressure(&mut fields)?,
         "capability-negotiation" => capability_negotiation(&mut fields)?,
+        "sftp-backend-boundary" => sftp_backend_boundary(&mut fields)?,
         other => return Err(format!("unknown case {other:?}")),
     }
     fields.insert("verdict".into(), json!("PASS"));
@@ -340,6 +343,80 @@ fn sandbox_symlink(f: &mut Map<String, Value>) -> Result<(), String> {
     cleanup(&dir);
     cleanup(&outside);
     cleanup(&elsewhere);
+    Ok(())
+}
+
+/// G14 fail-closed boundary (owner decision 2026-10-11, option (b)).
+///
+/// The non-overwriting publish promised for uploads cannot be expressed over SFTP
+/// with ssh2 0.9.6: libssh2 advertises and pins SFTP v3
+/// (`include/libssh2_sftp.h:51  #define LIBSSH2_SFTP_VERSION 3`) and the rename
+/// flags are only serialized when `sftp->version >= 5` (`src/sftp.c:2833-2834`),
+/// with no assignment to that field anywhere in the tree - so
+/// `Some(ATOMIC|NATIVE)` and `None` produce byte-identical packets.
+/// The primitive that would work (`SSH_FXP_POSIX_RENAME` /
+/// `libssh2_sftp_posix_rename_ex`) is not wrapped by the crate.
+///
+/// Rather than ship an upload path that silently overwrites a remote file, the
+/// engine refuses every mutation on an SFTP-backed root. M1 implements only the
+/// local transport, so reads on an SFTP root are refused too - a remote path
+/// handed to the local resolver would otherwise produce a misleading NOT_FOUND.
+fn sftp_backend_boundary(f: &mut Map<String, Value>) -> Result<(), String> {
+    let dir = fixture("sftp-boundary")?;
+    let local = SandboxRoot::open("downloads", &dir, false).map_err(|e| e.to_string())?;
+    let remote = SandboxRoot::open_sftp("remotedir", "/home/user/files", false)
+        .map_err(|e| e.to_string())?;
+    assert_eq!(local.backend(), BackendKind::Local);
+    assert_eq!(remote.backend(), BackendKind::Sftp);
+    let mut e = FileEngine::new(FileLimits::default(), vec![local, remote], TOKEN)
+        .map_err(|x| x.to_string())?;
+    let s = auth(&mut e)?;
+
+    f.insert(
+        "local_upload_supported".into(),
+        json!(e.open_upload(s, "downloads", "a.bin", Some(1)).is_ok()),
+    );
+    f.insert(
+        "sftp_upload_supported".into(),
+        json!(e.open_upload(s, "remotedir", "a.bin", Some(1)).is_ok()),
+    );
+    let refusal = e.open_upload(s, "remotedir", "b.bin", Some(1));
+    f.insert(
+        "refusal_code".into(),
+        json!(refusal.map(|_| "NONE").unwrap_or_else(|err| err.code)),
+    );
+    f.insert(
+        "sftp_mkdir_supported".into(),
+        json!(e.mkdir(s, "remotedir", "sub").is_ok()),
+    );
+    f.insert(
+        "sftp_remove_supported".into(),
+        json!(e.remove(s, "remotedir", "a.bin", false).is_ok()),
+    );
+    f.insert(
+        "sftp_rename_supported".into(),
+        json!(e.rename(s, "remotedir", "a.bin", "c.bin").is_ok()),
+    );
+    f.insert(
+        "sftp_list_supported".into(),
+        json!(e.list(s, "remotedir", ".", 0).is_ok()),
+    );
+    // Static half of the promise: mutation capability is a property of the
+    // backend kind, not a runtime negotiation that could be misconfigured.
+    f.insert(
+        "mutation_capability_of_sftp_backend".into(),
+        json!(BackendKind::Sftp.allows_mutation()),
+    );
+    // A remote root must not be silently accepted in a non-absolute or dotted form.
+    f.insert(
+        "relative_remote_root_rejected".into(),
+        json!(SandboxRoot::open_sftp("r", "home/user", false).is_err()),
+    );
+    f.insert(
+        "dotdot_remote_root_rejected".into(),
+        json!(SandboxRoot::open_sftp("r", "/home/../etc", false).is_err()),
+    );
+    cleanup(&dir);
     Ok(())
 }
 

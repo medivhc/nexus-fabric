@@ -212,6 +212,20 @@
 | `scenarios/product/workspace_offline_merge.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/regression/crash_recovery.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/regression/session_outcome_exactly_once.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/product/gateway_file_auth_throttle.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/product/gateway_file_capability_negotiation.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/product/gateway_file_download_page.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/product/gateway_file_list_pagination.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/product/gateway_file_quota_backpressure.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/product/gateway_file_sandbox_symlink.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/product/gateway_file_sftp_boundary.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/product/gateway_file_upload_no_replace.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/product/gateway_file_upload_resume.toml` | Machine-readable contract/policy/scenario |
+| `crates/nexus-web-gateway/src/file_service.rs` | Implementation under the gateway file contract (G12-G21) |
+| `crates/nexus-web-gateway/examples/gateway_file_contract.rs` | E4 probe for the 9 gateway_file_* scenarios |
+| `.agents/red-evidence-gateway-file-service.txt` | Contract-first Red Evidence (M0) |
+| `.agents/green-evidence-gateway-file-service-m1.txt` | Green Evidence for M1 slice 1 |
+
 | `tests/README.md` | Repository contract/documentation |
 | `tests/concurrency/README.md` | Repository contract/documentation |
 | `tests/integration/README.md` | Repository contract/documentation |

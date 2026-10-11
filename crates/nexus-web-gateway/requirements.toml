@@ -70,7 +70,7 @@ id = "REQ-008"
 title = "上传不覆盖已存在目标（requirement-change）"
 status = "doing"
 priority = "P0"
-acceptance = "目标已存在回 OUTPUT_EXISTS 且原字节一字未动；本地同文件系统 hard_link 原子发布；SFTP 显式 no-replace，但在 OpenSSH 各版本 honor 该标志的探针达标前不得声称跨进程对手也不会覆盖（G14；product.gateway-file-upload-no-replace）。本条是用户可见语义变更，走 AGENTS.md §5 requirement-change，不用实现细节回避"
+acceptance = "目标已存在回 OUTPUT_EXISTS 且原字节一字未动；本地同文件系统 hard_link 原子发布；发布被拒时不留 .part 残留（G14；product.gateway-file-upload-no-replace + gateway_file_sftp_boundary 的 local_upload_supported=true）。写路径不适用于 SFTP 后端（见 REQ-013）。本条是用户可见语义变更，走 AGENTS.md §5 requirement-change，不用实现细节回避"
 created = "2026-10-11"
 
 [[req]]
@@ -95,6 +95,14 @@ title = "配额、背压与终端优先"
 status = "doing"
 priority = "P0"
 acceptance = "stream_id 由服务端签发，分片不新开读句柄；读句柄/会话/在途字节/RSS/重哈希字节有上界；超预算显式 QUEUE_FULL 且文件类丢弃有计数；终端字节流零丢失；配置交叉约束不自洽拒启动（G12/G16；product.gateway-file-quota-backpressure）"
+created = "2026-10-11"
+
+[[req]]
+id = "REQ-013"
+title = "SFTP 后端不提供写操作（无覆盖原语不可得，fail-closed）"
+status = "doing"
+priority = "P0"
+acceptance = "SFTP 根的 open_upload/mkdir/rename/remove 一律 UNSUPPORTED_CAPABILITY；在该传输真正实现前，其 list/read/stat 同样拒绝而不是返回误导性 NOT_FOUND；后端能力是 BackendKind 的静态属性（BackendKind::Sftp.allows_mutation()==false）；相对或含 .. 的远端根配置拒启动（G14/G13；product.gateway-file-sftp-boundary）。依据：libssh2 钳在 SFTP v3、rename flags 仅在 version>=5 入包，ssh2 0.9.6 未绑定 posix_rename；owner 2026-10-11 选定 fail-closed 选项"
 created = "2026-10-11"
 
 [[req]]

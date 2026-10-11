@@ -16,7 +16,7 @@
   节点 ↔ sshd 之间。
 - 网关文件服务（契约先行，`PRODUCT.md#18-gateway-file-service`）：在显式配置的 root 沙箱内
   提供浏览/下载/上传/建目录/改名/删除，经独立二进制 DataChannel 承载。**本节是契约声明，
-  不是已交付 API**：实现按 M1-M4 分期落地，`requirements.toml` 的 REQ-005..REQ-011 保持
+  不是已交付 API**：实现按 M1-M4 分期落地，`requirements.toml` 的 REQ-005..REQ-013 保持
   `doing`，在此之前不存在对外可调用面。
 
 ## Non-Responsibilities
@@ -105,10 +105,16 @@
 自 root 起对每一段做 `lstat`/`readlink`，任一段是符号链接即拒绝；**打开之后**重新解析
 核实最终路径仍在 root 内（TOCTOU 快照类型化，不允许"解析一次即相信"）；改名/删除的
 目标同样受此约束，删除**不递归**出 root。
-**G14（上传不覆盖已存在目标）**：目标已存在 ⇒ `OUTPUT_EXISTS` 且原字节一字未动；
-本地引擎用同文件系统 `hard_link` 原子发布；SFTP 引擎显式携带 no-replace 语义，
-但**"远端 sftp-server 是否 honor 该标志"在 OpenSSH 各版本上属未实测项**，
-探针结论达标之前不得声称跨进程对手也不会覆盖；拒绝路径不留 `.nexus-part.*` 残留。
+**G14（不覆盖；SFTP 后端结构性不支持写）**：目标已存在 ⇒ `OUTPUT_EXISTS` 且原字节一字未动；
+**发布被拒时不得留 `.part` 残留**（实测：E4 场景抓到过一处残留，而当时 12 条单测全绿）。
+本地引擎用同文件系统 `hard_link`（目标存在即失败）原子发布。SFTP 根**不提供
+上传/改名/删除**：`ssh2 0.9.6` 依赖的 libssh2 通告并把 SFTP 钳在 v3
+（`include/libssh2_sftp.h:51`），rename 的 flags 仅在 `sftp->version >= 5` 入包
+（`src/sftp.c:2833-2834`，全树无赋值）⇒ `Some(ATOMIC|NATIVE)` 与 `None` 包体逐字节相同；
+可用原语是 `SSH_FXP_POSIX_RENAME`（`libssh2_sftp_posix_rename_ex`），该 crate 未绑定。
+所以这里的口径是"拒绝写"，不是"携带标志"，也不是"等服务端实测"（owner 2026-10-11 选定）。
+在 SFTP 传输真正实现之前，其读面同样返回 `UNSUPPORTED_CAPABILITY`——把远端路径交给本地
+解析器只会得到误导性的 `NOT_FOUND`。
 **G15（文件凭证不落盘，失败计数有界）**：文件通道使用独立于页面登录的配置令牌，
 比较必须常数时间；认证失败按（会话 + 源）**两层键**节流并锁定，计数与表项**有界**
 （不得随伪造会话线性增长）；锁定窗口内正确口令也不得绕过；沿用 G4 的"凭证不落盘"。
@@ -185,5 +191,10 @@
 
 ## Platform Constraints
 
-- Linux/macOS/Windows 均可（纯 Rust + std）。
-- 不依赖平台专用 API。
+- 本地引擎纯 Rust + std，**不使用 libc/`unsafe`**（crate 级 `forbid(unsafe_code)`）。代价是
+  拿不到 `O_NOFOLLOW` 和跨平台稳定的句柄身份键，因此 G13 以"逐分量 `symlink_metadata` +
+  打开后重解析"实现，其残余竞态窗口是**已知限制**，不是没列出来的依赖。
+- 支持等级按平台分述（`PRODUCT.md` §18.3）：Linux = A（全量 + 真 sshd e2e 证据）、
+  Windows = B（本地沙箱 + 密码认证）、macOS = C（不承诺，只保证 fail-closed 拒启动）。
+  此处原有"不依赖平台专用 API"一句与上面的分级互斥，已删；若为提升 Windows 等级引入
+  `windows-sys`/`libc`，属依赖治理评审项（D3）。

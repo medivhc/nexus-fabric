@@ -1,0 +1,73 @@
+schema_version = 1
+id = "product.gateway-file-sftp-boundary"
+title = "网关文件服务后端边界：SFTP 根拒绝一切变更（无覆盖原语不可得，fail-closed）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#18-gateway-file-service"
+
+# 依据（owner 2026-10-11 选定选项 b）：ssh2 0.9.6 表达不出"不覆盖的改名"——
+# libssh2 通告并钳在 SFTP v3（include/libssh2_sftp.h:51），rename 的 flags 只在
+# sftp->version >= 5 才入包（src/sftp.c:2833-2834，全树无赋值），
+# 因此 Some(ATOMIC|NATIVE) 与 None 的包体逐字节相同；可用原语是
+# SSH_FXP_POSIX_RENAME（libssh2_sftp_posix_rename_ex），该 crate 未绑定。
+# 结论写进 G14/REQ-008：SFTP 后端结构性不支持上传/改名/删除，而不是"实现时小心"。
+
+[given]
+local_root = "downloads"
+remote_root = "/home/user/files"
+backend = "sftp"
+
+[when]
+command = "cargo run --quiet -p nexus-web-gateway --example gateway_file_contract -- --case sftp-backend-boundary --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "case"
+equals = "sftp-backend-boundary"
+
+# 本地后端不受影响
+[[expect]]
+field = "local_upload_supported"
+equals = true
+
+# SFTP 后端的四类变更全部结构性拒绝
+[[expect]]
+field = "sftp_upload_supported"
+equals = false
+
+[[expect]]
+field = "refusal_code"
+equals = "UNSUPPORTED_CAPABILITY"
+
+[[expect]]
+field = "sftp_mkdir_supported"
+equals = false
+
+[[expect]]
+field = "sftp_remove_supported"
+equals = false
+
+[[expect]]
+field = "sftp_rename_supported"
+equals = false
+
+# M1 未接 SFTP 传输 ⇒ 读面也必须显式拒绝，不能把远端路径丢给本地解析器
+# 换来一个误导性的 NOT_FOUND
+[[expect]]
+field = "sftp_list_supported"
+equals = false
+
+# 能力是后端的静态属性，不是可以在运行时配歪的东西
+[[expect]]
+field = "mutation_capability_of_sftp_backend"
+equals = false
+
+[[expect]]
+field = "relative_remote_root_rejected"
+equals = true
+
+[[expect]]
+field = "dotdot_remote_root_rejected"
+equals = true

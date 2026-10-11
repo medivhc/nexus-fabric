@@ -3262,8 +3262,8 @@ Linux artifact get 接通真实分页服务与已有持久断点接收器：先�
 
 权威关系（避免"两套下载契约"）：网关文件服务是 **N3-4/N3-9 分页与接收器语义的一个消费方**，
 不是新契约的源头。字段与失败含义必须逐字对齐
-`docs/N3-4-ARTIFACT-DELIVERY.md`（私有目录、跨进程 receiver lease、`offset`/`prefix_sha256`
-续传、完整 SHA-256 + 长度的 Publishing intent、同文件系统 `hard_link` 原子**不覆盖**发布、
+`docs/N3-4-ARTIFACT-DELIVERY.md`（私有目录、跨进程 receiver lease、`offset` 续传与
+"部分字节摘要/前缀摘要"——字段名 `prefix_sha256` 是 N3-9 的收口命名，引用时以此为准）、
 `OUTPUT_EXISTS`/`ARTIFACT_INTEGRITY_FAILED`）与 `docs/N3-9-ARTIFACT-CLI-CONTRACT.md`
 （`offset`/`max_bytes`/`next_offset`/`eof`、每页上限 64 KiB、整体上限 80 MiB、分页不得替换
 固定 record 的任意字段）。**下沉为共享 crate 已被否决**（D1：`MODULE.md` 禁内部依赖 +
@@ -3277,14 +3277,18 @@ portable-core/WASI 门），代之以双向一致性测试保证不漂移。
   撑爆控制通道，也不能让页面假装它已看全）。
 - **下载**：按 `offset`/`max_bytes` 拉字节页，回 `next_offset`/`eof`。读取是**拉式**的：
   浏览器不催，节点不动。
-- **上传**：分片写入，服务端对**已连续落盘的字节数**回 ack（不是"收到了某个分片"），
-  因此浏览器重连后能从不一致处重发而不重写前缀。写入落在 `.nexus-part.*` 临时物，
-  完成后原子改名/链接发布。
+- **上传**（仅本地后端，见 §18.2"后端边界"）：分片写入，服务端对**已连续落盘的字节数**回 ack
+  （不是"收到了某个分片"），因此浏览器重连后能从不一致处重发而不重写前缀。写入落在
+  `.nexus-part.*` 临时物，完成后以同文件系统 `hard_link` 原子、不覆盖地发布；
+  经 SFTP 可达的远端根不给上传，理由见下一条。
 - **不覆盖已存在目标**（D5，属用户可见语义变更，故走 requirement-change）：上传**不得**
-  覆盖已存在的目标文件，目标已存在返回 `OUTPUT_EXISTS`；本地引擎用同文件系统
-  `hard_link` 实现，SFTP 引擎显式携带 no-replace 语义。**"远端 sftp-server 是否真的
-  honor 该 flag"在 OpenSSH 各版本上是未证的**（V2 §1④b 列为需实测），探针结论达标之前，
-  产品口径只声称"网关不会覆盖"，不声称"跨进程并发对手也不会覆盖"。
+  覆盖已存在的目标文件，目标已存在返回 `OUTPUT_EXISTS`，且**被拒绝的发布不得留 `.part`
+  残留**（这条是 E4 实测抓到的：当时 12 条单测全绿，漏的正是它）。本地引擎用同文件系统
+  `hard_link`（目标存在即失败）实现。**经 SFTP 可达的远端根不提供上传**——这不是保守措辞，
+  而是已证否的能力：`ssh2 0.9.6` 依赖的 libssh2 通告并把 SFTP 钳在 v3
+  （`include/libssh2_sftp.h:51`），rename 的 flags 只在 `sftp->version >= 5` 才写进包体
+  （`src/sftp.c:2833-2834`，全树无赋值），所以 `Some(ATOMIC|NATIVE)` 与 `None` 的字节完全相同；
+  真正的无覆盖改名是 `SSH_FXP_POSIX_RENAME`（`libssh2_sftp_posix_rename_ex`），该 crate 未绑定。
 - **建目录 / 改名 / 删除**：仅在 root 可写时提供；改名与删除的目标必须是解析后仍在该
   root 内的路径，删除**不递归**出 root（V1 的反面教训：SFTP 引擎把 `stat` 当 `lstat` 用，
   一个指向 home 外的符号链接就让"递归删除"打到了 home 外）。
@@ -3298,6 +3302,10 @@ portable-core/WASI 门），代之以双向一致性测试保证不漂移。
 - **逐分量解析**：自 root 起对每一段做 `lstat`/`readlink`，任何一段是符号链接即拒绝，
   且在**打开之后**重新解析核实最终路径仍在 root 内（TOCTOU 快照类型化，不是"相信一次
   解析结果"）。
+- **后端边界**（G14 的可执行口径）：根（root）分为本地根与 SFTP 根。SFTP 根的
+  `mkdir`/`rename`/`remove`/上传一律返回 `UNSUPPORTED_CAPABILITY`；在 SFTP 传输真正实现之前，
+  其浏览与下载同样拒绝（把远端路径丢给本地解析器只会得到误导性的 `NOT_FOUND`）。
+  能力是**后端的静态属性**，不是运行时可以配歪的东西。
 - **鉴权与节流**：文件通道需要一个独立于页面登录的配置令牌，常数时间比较；失败按
   （会话 + 源）两层键节流并锁定，**有界**计数（V1 是零节流：实测 84.4 次认证/秒可放大成
   `faillock` 拒绝服务）。
@@ -3325,17 +3333,22 @@ portable-core/WASI 门），代之以双向一致性测试保证不漂移。
 - 不在本节宣称 E4/E5：本节的场景当前状态是 **Red Evidence（契约先于实现）**，
   见 `.agents/red-evidence-gateway-file-service.txt`；实现落地并跑绿之前，
   网关文件能力在 `requirements.toml` 里保持 `doing`。
-- **未证且不得当作已证的三点**：① OpenSSH 各版本 sftp-server 是否 honor no-replace 标志
-  （探针达标前不声称）；② 浏览器侧 SCTP 发送缓冲上限与 `set_sctp_max_buffered_amount`
-  的对称性；③ TURN 凭据下发面的收缩（M2，见 `REQ-011`：`/api/config` 只回 `urls`，
-  凭据走建立连接前的一次性短时效通道）。
-  在 ①②③ 各自拿到证据之前，本节不构成"跨进程无覆盖已证"、"浏览器预算已对齐"或
-  "凭据下发面已收敛"的声明。
+- **未证且不得当作已证的三点**：① 浏览器侧 SCTP 发送缓冲上限与
+  `set_sctp_max_buffered_amount` 的对称性（`REQ-011`）；② TURN 凭据下发面的收缩（M2，
+  `REQ-012`：`/api/config` 只回 `urls`，凭据经建立连接前的一次性短时效通道）；
+  ③ Windows 上"打开后重解析"作为身份键的残余竞态窗口究竟多小（§18.3 的 B 级口径）。
+  原先列为未证的"远端 sftp-server 是否 honor no-replace"已**改为证否**：卡点不在服务端
+  honor 与否，而在客户端根本没把 flags 发到线上（§18.2 后端边界），因此它不再是待证事项，
+  而是"SFTP 不提供写"的既定口径。在 ①②③ 拿到证据之前，本节不构成"浏览器预算已对齐"、
+  "凭据下发面已收敛"或"Windows 身份键无残余风险"的声明。
 
 ### 18.5 退出准则（分期）
 
-M0 契约（本节 + `MODULE.md` G13/G17-G21 + `scenarios/product/gateway_file_*.toml` +
-RED 证据）→ M1 安全/可用性收口（零新 wire 语义）→ M2 协议演进（分页、服务端签发
+M0 契约（本节 + `MODULE.md` G12-G21 + `scenarios/product/gateway_file_*.toml` 共 9 条
+E4 场景 + RED 证据）→ M1 安全/可用性收口（零新 wire 语义）→ M2 协议演进（分页、服务端签发
 `stream_id`、capability 门控、`/api/config` 收缩）→ M3 完整性与续传（流式摘要、prefix
-区间哈希、不覆盖发布达标）→ M4 结构收敛。**无 RED 不进 M1**；每期的完成判据含一次
-真实 push 触发的 CI 绿，不接受本地复述（V2 §10 的教训登记）。
+**无 RED 不进 M1**；每期的完成判据含一次
+真实 push 触发的 CI 绿，不接受本地复述（V2 §10 的教训登记）。**口径限定**：本仓库当前没有
+执行 Rust 门禁的 workflow（`.github/workflows/` 内唯一在跑的产物是看板生成），所以这条判据
+在网关侧的可执行形式是"在 xc-pc-linux 上跑 `verify --fast` + 场景实跑，结果记进
+`.agents/*-evidence-gateway-file-service*.txt"；若接入 Rust CI，本条改为引用 CI 运行号。

@@ -33,8 +33,6 @@ equals = true
 field = "part_artifacts_remaining"
 equals = 0
 
-# 本场景只钉"网关自己不会覆盖"；远端 sftp-server 是否 honor no-replace 标志
-# 属未实测项（V2 §1④b），实现方不得借本字段宣称已证
-[[expect]]
-field = "remote_flag_honored_claimed"
-equals = false
+# 范围更正（M0 评审 E 项）：原先这里断言 remote_flag_honored_claimed=false，
+# 那是反向冻结——真要证明成功反而让场景变红。SFTP 侧的诚实口径改由
+# product.gateway-file-sftp-boundary 钉（变更操作结构性不可用），本场景只钉本地发布路径。

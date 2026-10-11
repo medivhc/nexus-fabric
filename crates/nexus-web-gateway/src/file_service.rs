@@ -49,6 +49,7 @@ pub mod code {
     pub const INTEGRITY: &str = "ARTIFACT_INTEGRITY_FAILED";
     pub const QUEUE_FULL: &str = "QUEUE_FULL";
     pub const CAPACITY: &str = "CAPACITY_UNAVAILABLE";
+    pub const UNSUPPORTED: &str = "UNSUPPORTED_CAPABILITY";
     pub const OVERFLOW: &str = "OFFSET_OVERFLOW";
     pub const IS_DIR: &str = "IS_DIR";
     pub const IDLE: &str = "IDLE_RECYCLED";
@@ -207,6 +208,28 @@ impl FileLimits {
     }
 }
 
+/// Which transport backs a root. This is not cosmetic: the non-overwriting
+/// publish promised by G14 is implementable on the local engine (`hard_link`
+/// fails on an existing destination) but **not** over SFTP with `ssh2` 0.9.6 —
+/// libssh2 advertises and pins SFTP v3 (`include/libssh2_sftp.h:51`), and the
+/// rename flags are only put on the wire when `sftp->version >= 5`
+/// (`src/sftp.c:2833-2834`), so `Some(ATOMIC|NATIVE)` and `None` produce
+/// byte-identical packets. The real primitive (`SSH_FXP_POSIX_RENAME`,
+/// `libssh2_sftp_posix_rename_ex`) is not wrapped by the crate. Rather than ship
+/// an upload path that silently overwrites, an SFTP-backed root refuses every
+/// mutation (fail-closed, owner decision 2026-10-11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKind {
+    Local,
+    Sftp,
+}
+
+impl BackendKind {
+    pub fn allows_mutation(self) -> bool {
+        matches!(self, Self::Local)
+    }
+}
+
 /// A configured export directory. Construction is the only place where a root
 /// becomes canonical, and a non-canonical configured root is rejected (G13).
 #[derive(Debug, Clone)]
@@ -214,6 +237,7 @@ pub struct SandboxRoot {
     name: String,
     canonical: PathBuf,
     read_only: bool,
+    backend: BackendKind,
 }
 
 impl SandboxRoot {
@@ -266,6 +290,41 @@ impl SandboxRoot {
             name,
             canonical,
             read_only,
+            backend: BackendKind::Local,
+        })
+    }
+
+    /// SFTP 根：路径是**远端** POSIX 路径，不能拿本地 `canonicalize` 去规范化它
+    /// （那会把它当本地路径解析）。这里只检查形状（绝对、无 `..`、非空），
+    /// 并把后端标记成 `Sftp`：M1 没有实现 SFTP 传输，所以任何 IO 都会被
+    /// `require_local_io` 拒；变更类操作则被 `require_writable` 永久拒（G14）。
+    pub fn open_sftp(
+        name: impl Into<String>,
+        remote_path: &str,
+        read_only: bool,
+    ) -> FileResult<Self> {
+        let name = name.into();
+        let path = Path::new(remote_path);
+        if !path.is_absolute() {
+            return Err(FileError::new(
+                code::CONFIG,
+                format!("sftp root {name} must be an absolute remote path: {remote_path:?}"),
+            ));
+        }
+        if path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+        {
+            return Err(FileError::new(
+                code::NON_CANONICAL_ROOT,
+                format!("sftp root {name} must not contain . or ..: {remote_path:?}"),
+            ));
+        }
+        Ok(Self {
+            name,
+            canonical: path.to_path_buf(),
+            read_only,
+            backend: BackendKind::Sftp,
         })
     }
 
@@ -357,10 +416,38 @@ impl SandboxRoot {
     }
 
     fn require_writable(&self) -> FileResult<()> {
+        if !self.backend.allows_mutation() {
+            // G14 fail-closed：没有可用的无覆盖改名原语，就不提供会造成静默覆盖的
+            // 写路径。这不是"待办"，而是契约的一部分（owner 2026-10-11 选定）。
+            return Err(FileError::new(
+                code::UNSUPPORTED,
+                format!(
+                    "root {:?} is an {:?} backend: mutation requires a non-overwriting \
+                     publish primitive that the current dependency cannot express",
+                    self.name, self.backend
+                ),
+            ));
+        }
         if self.read_only {
             return Err(FileError::new(code::READ_ONLY, self.name.clone()));
         }
         Ok(())
+    }
+
+    /// M1 只实现本地后端。任何落在本地文件系统上的动作，对 SFTP 根都必须显式拒绝，
+    /// 而不是"看起来能跑"（远端路径在本地不存在时会得到误导性的 NOT_FOUND）。
+    fn require_local_io(&self) -> FileResult<()> {
+        if self.backend != BackendKind::Local {
+            return Err(FileError::new(
+                code::UNSUPPORTED,
+                format!("root {:?} has no implemented transport yet", self.name),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn backend(&self) -> BackendKind {
+        self.backend
     }
 
     /// Relative display path, computed from the canonical root.
@@ -821,6 +908,7 @@ impl FileEngine {
     ) -> FileResult<ListPage> {
         self.touch(session)?;
         let r = self.root(root)?.clone();
+        r.require_local_io()?;
         let abs = r.resolve(rel)?;
         let mut rd = std::fs::read_dir(&abs)
             .map_err(|e| FileError::new(code::NOT_FOUND, format!("{rel:?}: {e}")))?;
@@ -893,6 +981,7 @@ impl FileEngine {
             ));
         }
         let r = self.root(root)?.clone();
+        r.require_local_io()?;
         let abs = r.resolve(rel)?;
         let end = offset
             .checked_add(max_bytes as u64)
@@ -1367,6 +1456,7 @@ impl FileEngine {
     pub fn stat(&mut self, session: u64, root: &str, rel: &str) -> FileResult<Entry> {
         self.touch(session)?;
         let r = self.root(root)?.clone();
+        r.require_local_io()?;
         let abs = match r.resolve(rel) {
             Ok(p) => p,
             Err(err) => {
@@ -1531,6 +1621,59 @@ mod tests {
         };
         assert_eq!(z.validate().unwrap_err().code, code::CONFIG);
         assert!(FileLimits::default().validate().is_ok());
+    }
+
+    #[test]
+    fn sftp_backend_refuses_mutation_and_unwired_io() {
+        // G14 fail-closed（owner 2026-10-11 选定 (b)）：ssh2 0.9.6 表达不出
+        // "不覆盖的改名"（libssh2 通告并钳在 SFTP v3，rename 的 flags 只在
+        // version>=5 入包），所以 SFTP 根上的变更操作结构性不可用，而不是
+        // "实现时要小心"。
+        assert!(BackendKind::Local.allows_mutation());
+        assert!(!BackendKind::Sftp.allows_mutation());
+
+        let dir = tmp("sftp-refuse");
+        let remote = SandboxRoot::open_sftp("remotedir", "/home/user/files", false).unwrap();
+        let local = SandboxRoot::open("downloads", &dir, false).unwrap();
+        let mut e = FileEngine::new(FileLimits::default(), vec![local, remote], "s3cret").unwrap();
+        let s = e.authenticate("u", "loopback", "s3cret").unwrap();
+
+        for err in [
+            e.open_upload(s, "remotedir", "a.bin", Some(1))
+                .map(|_| ())
+                .unwrap_err(),
+            e.mkdir(s, "remotedir", "sub").unwrap_err(),
+            e.remove(s, "remotedir", "a.bin", false).unwrap_err(),
+            e.rename(s, "remotedir", "a.bin", "b.bin").unwrap_err(),
+        ] {
+            assert_eq!(err.code, code::UNSUPPORTED, "mutation on an SFTP root");
+        }
+        // M1 还没接 SFTP 传输：读面也必须显式拒绝，不能把远端路径当本地路径
+        // 去 stat（那会给出误导性的 NOT_FOUND）。
+        assert_eq!(
+            e.list(s, "remotedir", ".", 0).unwrap_err().code,
+            code::UNSUPPORTED
+        );
+        assert_eq!(
+            e.read_page(s, "remotedir", "a.bin", 0, 8).unwrap_err().code,
+            code::UNSUPPORTED
+        );
+        // 远端根的形状检查：相对路径与含 .. 的路径都拒。
+        assert_eq!(
+            SandboxRoot::open_sftp("r", "home/user", false)
+                .unwrap_err()
+                .code,
+            code::CONFIG
+        );
+        assert_eq!(
+            SandboxRoot::open_sftp("r", "/home/../etc", false)
+                .unwrap_err()
+                .code,
+            code::NON_CANONICAL_ROOT
+        );
+        // 本地根不受影响。
+        assert!(e.open_upload(s, "downloads", "ok.bin", Some(1)).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
