@@ -127,7 +127,7 @@ pub struct ResultItem {
     pub kind: String,
     /// provider 声明的原始 LSP `SymbolKind` 数值；0 = provider 未给出。
     /// 之所以同时保留数值：rust-analyzer 对 trait/impl 方法有时上报
-    /// `property`(6)/`variable`(12) 而非 `method`(5)，字符串会误导 Agent，
+    /// `property`(7)/`variable`(13) 而非 `method`(6)，字符串会误导 Agent，
     /// 数值让调用方能自行判断（不假装我们能纠正 server 的语义）。
     pub kind_id: i64,
     pub qualified_name: String,
@@ -243,29 +243,29 @@ pub fn symbol_kind(lsp_kind: i64) -> &'static str {
         1 => "file",
         2 => "module",
         3 => "namespace",
-        4 => "class",
-        5 => "method",
-        6 => "property",
-        7 => "field",
-        8 => "constructor",
-        9 => "enum",
-        10 => "interface",
-        11 => "function",
-        12 => "variable",
-        13 => "constant",
-        14 => "string",
-        15 => "number",
-        16 => "boolean",
-        17 => "array",
-        18 => "object",
-        19 => "key",
-        20 => "null",
-        21 => "enum-member",
-        22 => "struct",
-        23 => "event",
-        24 => "operator",
-        25 => "type-parameter",
-        26 => "default",
+        4 => "package",
+        5 => "class",
+        6 => "method",
+        7 => "property",
+        8 => "field",
+        9 => "constructor",
+        10 => "enum",
+        11 => "interface",
+        12 => "function",
+        13 => "variable",
+        14 => "constant",
+        15 => "string",
+        16 => "number",
+        17 => "boolean",
+        18 => "array",
+        19 => "object",
+        20 => "key",
+        21 => "null",
+        22 => "enum-member",
+        23 => "struct",
+        24 => "event",
+        25 => "operator",
+        26 => "type-parameter",
         _ => "default",
     }
 }
@@ -336,12 +336,46 @@ mod tests {
 
     #[test]
     fn symbol_kind_mapping_matches_lsp_spec_numbers() {
-        assert_eq!(symbol_kind(5), "method");
-        assert_eq!(symbol_kind(10), "interface");
-        assert_eq!(symbol_kind(11), "function");
-        assert_eq!(symbol_kind(13), "constant");
-        assert_eq!(symbol_kind(22), "struct");
-        assert_eq!(symbol_kind(0), "default");
+        // Independent oracle: LSP 3.17 SymbolKind, not the adapter's table.
+        // https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#symbolKind
+        let standard_kinds = [
+            (1, "file"),
+            (2, "module"),
+            (3, "namespace"),
+            (4, "package"),
+            (5, "class"),
+            (6, "method"),
+            (7, "property"),
+            (8, "field"),
+            (9, "constructor"),
+            (10, "enum"),
+            (11, "interface"),
+            (12, "function"),
+            (13, "variable"),
+            (14, "constant"),
+            (15, "string"),
+            (16, "number"),
+            (17, "boolean"),
+            (18, "array"),
+            (19, "object"),
+            (20, "key"),
+            (21, "null"),
+            (22, "enum-member"),
+            (23, "struct"),
+            (24, "event"),
+            (25, "operator"),
+            (26, "type-parameter"),
+        ];
+        for (kind_id, label) in standard_kinds {
+            assert_eq!(symbol_kind(kind_id), label, "LSP SymbolKind {kind_id}");
+        }
+    }
+
+    #[test]
+    fn symbol_kind_unknown_values_keep_the_existing_fallback() {
+        for kind_id in [i64::MIN, -1, 0, 27, i64::MAX] {
+            assert_eq!(symbol_kind(kind_id), "default", "LSP SymbolKind {kind_id}");
+        }
     }
 
     #[test]
