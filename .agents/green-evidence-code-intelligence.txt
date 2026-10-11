@@ -397,3 +397,39 @@ Phase 3：mcp-handshake Red scenario-922202299c25（verdict 实得 BLOCKED）→
 
 CLI 一次性路径的会话卫生实测：跑 `code symbol Egress ...` 前后 `rust-analyzer` 进程数都是 0，
 输出 `session_reused=false / session_queries=1` ⇒ 复用只在调用方显式持有会话时发生。
+
+## L. Phase 2/3/4 的结论级复跑（xc-pc-linux，rev `f3cc6234`）
+
+宿主：`xc-pc-linux`（Ubuntu 5.15.0-139，rustc/clippy/rust-analyzer **1.98.1**，
+`cargo-deny 0.20.2` **在场** ⇒ dependency-governance 是真跑过的 PASS）。
+工作树起点 `f3cc6234`（= PR #12 head `df2049c` + Phase 2/3/4 五个提交），
+`dirty=0`。日志 `/work/xc-verify-p234b.log`。
+
+    fmt --all -- --check                       exit 0
+    clippy --workspace --all-targets -D warn   exit 0
+    cargo test -p nexus-harness                133 passed / 0 failed
+    cargo test -p nexus --lib                  217 / 0 / 2 ignored
+    verify --fast --json                       overall PASS，9/9 门 PASS、无 UNKNOWN
+        Evidence dir=verify-qoder-xc-0ef59d73c701  contract=4682a05f32c2
+        rev=f3cc62344cad  dirty=False  tree=e8966722c743  cfg=fa6c1bdb335a
+        toolchain=1.98.1  target=x86_64-unknown-linux-gnu
+    21 个 E4 场景                               PASS=21 FAIL=0
+    四种越界形态                                 仍在 spawn provider 之前被拒（envelope 无 provider 字段）
+    dirty_after=0   flycheck 残留(仓库内)=0
+
+本轮新增 5 条场景在 Linux 的 evidence_id：
+
+    context-anchors            scenario-qoder-xc-3b3029e45de0
+    context-no-fake-semantics  scenario-qoder-xc-30e1a342e353
+    context-scope-guard        scenario-qoder-xc-169dbf244780
+    mcp-handshake              scenario-qoder-xc-fca56a2877bc
+    mcp-real-query             scenario-qoder-xc-b2e96e267fac   <- Phase 4 复用判据（结构层）
+
+一条必须由 Linux 才抓得到的事：`f8f41d9c` 那一版 `anchors_without_contract_candidates…`
+在并发下 FAILED（单独跑必过、Windows 上从未复现）。根因是**测试自己**二次取 git 判分支，
+与 `git write-tree` 的 `index.lock` 降级形成竞态。修复见提交 `f3cc6234`
+（判据只用这次调用产出的 snapshot digest）。教训留档：
+"再测一次来选断言分支"在并发下等于没测。
+
+同一 rev 上 `verify --full` 仍**没有结论**：`/work` 只有 27G 余量，而上一轮实测
+`--full` 需要 30G+ 才打得满得安全（见 §J）。不重复冒险。
