@@ -17,6 +17,7 @@
 pub mod cert;
 pub mod config;
 pub mod error;
+pub mod file_service;
 pub mod gateway;
 pub mod http;
 pub mod mesh;
