@@ -228,3 +228,82 @@ verdict `CHANGES_REQUESTED`：4 个 CHANGES_REQUESTED 维度（A/B/G/H）、4 �
    - MCP 的预算参数没有上限校验 —— 与 CLI `code` 同口径（上限由上下文预算与截断可见性兜），
      不是本区间新引入的差别。
 
+## Phase 2/3/4 独立 Review round 2（对象 `aba6de2..a3af128`）发现与处置
+
+案卷 `.evidence/review-qoder-independent-p234-r2/`。verdict **`COMMENTED`，0 阻塞**：
+round 1 的 B1/G1/A1/A2/A3/G2 全部 **CLOSED**，H1 与 4 条 minor 的"不改"处置被接受
+（E1 那条审查者还去 `scope_guard.toml:58-60` 与 `commands.rs:189` 核了一遍，确认"declined 也必须
+带非空 `snapshot.source_revision`"是真的，所以顺序不能挪）。与 round 1 不同的是这次它**跑了命令**
+（fmt/clippy/test/selftest + 十条直接喂字节流的 `mcp serve` 探测），所以结论有载体。
+模型口径仍旧：**`model=unbound`**。
+
+新增 7 条非阻塞，处置如下（修前实测在 `.agents/red-evidence-mcp-round2.txt`）：
+
+- **N5（已修）stdout 被裸 JSON 污染** —— `main.rs` 对所有命令一律 `println!`，而 `mcp serve` 的
+  stdout **就是协议通道**：干净 EOF 时 stdout 是 194 字节裸 JSON；处理过请求后裸 envelope 直接
+  粘在最后一帧尾部、中间没有分隔。修：只有 `mcp serve` 的退出 envelope 改打 stderr
+  （human 与 `--json` 两种形态都改，退出码仍由 verdict 决定），stdout 恢复为纯帧通道，
+  并在 selftest 里断言"stdout 可按帧完整消费且无多余字节"。
+- **N4b（已修）PASS 分支此前不可探针** —— round 1 修好的 `handled > 0 ⇒ PASS` 只能靠人工
+  `printf` 观察，因为旧探针"取最后一行 JSON"在 N5 那种粘连下解析不出来。修后新增
+  `handled_request_exit_is_pass_and_stdout_is_pure` 探针（喂一帧 `initialize` 再关管道 ⇒
+  `PASS` + `handled_requests=1` + 恰好 1 帧纯净 stdout）。
+- **N4a（已修）notification 探针自我实现** —— 原来 `ok = write_frame(..).is_ok()` 测的是管道写通，
+  与被声称的"不产生回复"无关。改成**序列证明**：notification 之后紧发的 `id=2` 请求，
+  其响应必须是管道里的下一条帧（`response.id == 2`），不吃超时也不靠"没读到东西"。
+- **N6（已修）`serve` 的退出 envelope 没有 `snapshot`** —— 新增的 `UNKNOWN` 恰好就是 declined 形态，
+  按 doctrine declined 要说自己绑在哪棵树上。四条退出路径统一带
+  `authority + handled_requests + snapshot`（`serve_exit_fields`），并加单测钉住字段存在性。
+- **S1（自查发现，已修）`handled_requests` 从没写进契约** —— 它偏偏就是 PASS/UNKNOWN 的判据本身。
+  "一个决定 verdict 的量只活在代码里"属于本模块最不该有的形态，已在 MODULE.md 定义
+  （已回复请求数；notification 不计）。
+- **N1（已修）`--provider-binary` 在 `mcp serve` 上静默失效** —— 契约承诺了它，`dispatch` 却把
+  `args` 整个丢掉，实测给 `/definitely/not/ra` 与不给了完全同形、exit 0。修：`serve(args)` 解析
+  `--provider-binary`（空格与 `=` 两种形式，空值拒绝），线程化进 `run_with_session` 的同一 argv 通道
+  （于是解析顺序与"指定了但不存在 ⇒ `PROVIDER_UNAVAILABLE`、不回退 PATH"一并生效）；
+  **未知启动参数一律 BLOCKED**，不再静默。新增端到端探针 `provider_override_honored`：
+  另起一个带不存在路径的 serve，跑真实 `tools/call`，断言错误码是 `PROVIDER_UNAVAILABLE`
+  **且**原因文字点名 `--provider-binary`（两件事同时成立才算过 —— 单看错误码无法排除
+  "悄悄用了 PATH 上的 server 之后又失败"）。
+- **N2（已修）MODULE.md 的单测数陈旧** —— 还写着 Linux 117 / Windows 116，而本区间自己把测试数
+  从 117 推到了 134（Windows 实测 131 passed + 3 failed；Linux 多 1 条 `cfg(unix)` ⇒ 135）。
+  同一段还漏了 serve 退出形状、6 名越权拒绝、启动参数面三类新覆盖。
+  顺带更正另一处虚报：原文说 Windows 有 **4** 个预存在失败，第 4 条（§12.58 contract-hash 测试）
+  在本 worktree 实测**是过的** —— 它只在完成 CRLF 检出的宿主上红，条件由 §11.1 自己解释。
+  按实测改成 3 并写明条件。
+- **N3（已修，我自己写错的台账）** —— `.agents/green-evidence-code-intelligence.txt` §N 把 Linux
+  第 6b 步的默认 `mcp selftest` 记成 "11/11 probes"，实测输出是 **8/8**；11/11 是另一次
+  `--with-query` 的数。把没跑过的探针算进结论正是提案禁止的那类错误。勘误见 §N 末尾与 §O。
+- **N7（已修）** —— `mcp.rs` 模块文档还说分帧复用 `read_frame`（实际入站读用
+  `read_frame_result`，provider 侧才用 `read_frame`）；`mapped_scenarios` 是子串启发式，
+  它的条数不是场景总数（`context engineering/nexus-harness` 报 20 而清单 21，因为握手场景
+  正文不含目标路径串）—— 已在 MODULE.md 写清口径，防止被当成"有场景漏登记"的假结论。
+
+本轮学到、值得留着继续生效的三条口径：
+① **契约承诺的开关必须端到端证明**，"参数被接受"不等于"参数生效"，而"exit 0 且输出没变"
+   是最坏失效形状（看起来成功）；
+② **传输通道的纯度属于正确性**：一个 CLI 顺手 `println!` 到 stdout，就能让协议服务端
+   在会话结尾发出客户端读不进去的字节；
+③ **决定 verdict 的量必须出现在输出里并被契约定义**（`handled_requests` 就是这一轮的例子）。
+
+### 本轮新登记的两条后续项（有承载体，不靠记忆）
+
+- **场景证据 id 的覆盖行为**：`evidence.rs:218-231` 的 `scenario_run_id` 种子是
+  `source_revision + scenario_id + configuration_digest + contract_hash`，**不含工作树指纹**。
+  于是同一 rev 上脏树的两次运行算出同一个 id，后一次直接覆盖前一次的
+  `.evidence/scenario-*/summary.json`（本轮实测：`callees` 的 FAIL 与 PASS 都是
+  `scenario-8eed2a7b113c`，磁盘上只剩 PASS）。
+  影响面：**在同一 rev 上做 Red→Green 时，`.evidence/` 留不下 Red** ——
+  本模块一直把 verdict/输出逐条抄进 `.agents/*evidence*.txt`，正是因为这个覆盖，不是巧合。
+  修法二选一，都要另走契约周期（它改的是 Evidence 语义，属 harness 的对外承诺）：
+  ① 把 `working_tree_digest` 加进种子（Red/Green 自然分家，代价是同一棵脏树上的重复运行
+  不再复用同一条记录）；② 保持 id 稳定但**追加** `runs[]` 历史而不是覆盖 summary
+  （可读性更好，代价是记录格式变更）。本轮不动，理由：不属于 Phase 4 目标，且需要
+  先定义"同一条场景记录"到底代表一次运行还是一个 revision 的结论 —— 那是另一个契约问题。
+- **E4 批次期间不得并发构建**：批量场景跑的是真实 rust-analyzer，flycheck 走
+  `CARGO_TARGET_DIR` 指定的 scratch；此时执行 `cargo build` 会争 target 目录锁，
+  让某条场景拿到 `BLOCKED`（本轮 `callees` 就这样假红过一次，单跑即 PASS）。
+  已写进 §O 的过程事实；下次接手先确认没有构建在跑再开批次。
+
+
+

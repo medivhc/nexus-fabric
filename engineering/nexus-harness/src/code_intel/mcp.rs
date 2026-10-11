@@ -9,9 +9,15 @@
 //! 不在 MCP 侧新造 schema、不新造错误码、也不给任何写能力开门（提案 §3 的
 //! `Agent Contract != LSP Contract`、§6 的"不得把任意 shell 参数透传给 launcher"）。
 //!
-//! 分帧复用 `super::lsp::{encode_frame, read_frame}` —— MCP stdio 与 LSP 用的是同一套
+//! 分帧复用 `super::lsp::{encode_frame, read_frame_result}` —— MCP stdio 与 LSP 用的是同一套
 //! `Content-Length` 帧格式，而那两个函数已经带着 header/body 上限与结构化失败原因。
 //! 复制一份编解码器等于复制一份安全边界，这类东西迟早漂移（round 2 的 `..` 绕过就是教训）。
+//!
+//! 入站读用 `read_frame_result`（区分"客户端在帧边界正常挂断"与"畸形/超限帧"），
+//! provider 侧仍用 `read_frame`：那边的 EOF 真的是崩溃，两种语义不能混（round 1 的 B1）。
+//!
+//! **stdout 只承载 MCP 帧**：进程退出时的 CLI envelope 由 `main` 打到 stderr，
+//! 否则裸 JSON 混进协议通道，严格客户端会把会话结尾读成畸形帧（round 2 的 N5）。
 
 use super::ProviderSession;
 use super::lsp::{FrameIn, encode_frame, read_frame_result};
@@ -221,7 +227,11 @@ fn build_argv(name: &str, arguments: Option<&Value>) -> Result<Vec<String>, (i64
 }
 
 /// 单条请求 → 响应。`None` 表示这是 notification（不回复）。
-fn handle_request(message: &Value, session: &mut Option<ProviderSession>) -> Option<Value> {
+fn handle_request(
+    message: &Value,
+    session: &mut Option<ProviderSession>,
+    provider_override: &Option<String>,
+) -> Option<Value> {
     let method = message.get("method").and_then(Value::as_str)?;
     // notification（无 id）只接受并忽略；带 id 的才需要回复。
     let id = message.get("id").cloned()?;
@@ -251,7 +261,15 @@ fn handle_request(message: &Value, session: &mut Option<ProviderSession>) -> Opt
                 .and_then(Value::as_str)
                 .unwrap_or("");
             match build_argv(name, params.and_then(|p| p.get("arguments"))) {
-                Ok(argv) => {
+                Ok(mut argv) => {
+                    // 启动期的 provider 覆盖由 `serve` 的参数带来，**不经过** tool 参数
+                    // （`build_argv` 的白名单里没有 provider_binary，模型给不进来）。
+                    // 走的是与 `code --provider-binary` 完全相同的 argv 通道，
+                    // 所以解析顺序与"指定了但不存在 ⇒ PROVIDER_UNAVAILABLE"的回退禁令一并生效。
+                    if let Some(binary) = provider_override {
+                        argv.push("--provider-binary".to_string());
+                        argv.push(binary.clone());
+                    }
                     let command =
                         format!("code {}", argv.first().map(String::as_str).unwrap_or(""));
                     let outcome = super::run_with_session(&argv, session);
@@ -329,9 +347,75 @@ fn recv_frame(rx: &Receiver<Result<Value, String>>, budget: Duration) -> Result<
     }
 }
 
+/// `mcp serve` 的**启动**参数解析：只认 `--provider-binary <path>`（也接 `=` 形式），
+/// 其余一律 `Err` ⇒ 调用方回 BLOCKED。
+///
+/// 为什么单独成一个纯谓词：`mcp serve --provider-binary /不存在/的路径` 以前被 `dispatch`
+/// 整个丢掉（实测与不给了完全相同的输出、exit 0）。被契约承诺的开关静默失效，比报错危险得多
+/// —— 用户以为自己换了 language server。独立 Review round 2 的 N1。
+fn parse_serve_args(args: &[String]) -> Result<Option<String>, String> {
+    // args[0] 是子命令名 `serve`，从它之后开始看。
+    let mut i = 1;
+    let mut override_value: Option<String> = None;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        if let Some((name, inline)) = flag.split_once('=') {
+            if name == "--provider-binary" {
+                // `=` 形式同样不接受空值：空字符串会让 `resolve_binary` 拿到一个
+                // 看似"给了覆盖"的路径，而调用方本意通常是"这次不给"。
+                if inline.is_empty() {
+                    return Err("--provider-binary 不接受空路径".to_string());
+                }
+                override_value = Some(inline.to_string());
+                i += 1;
+                continue;
+            }
+            return Err(format!(
+                "mcp serve 不支持的参数：{flag}（唯一可用的启动参数是 --provider-binary <path>）"
+            ));
+        }
+        if flag == "--provider-binary" {
+            let Some(value) = args.get(i + 1) else {
+                return Err("--provider-binary 后面要跟一个可执行文件路径".to_string());
+            };
+            if value.is_empty() {
+                return Err("--provider-binary 不接受空路径".to_string());
+            }
+            override_value = Some(value.clone());
+            i += 2;
+            continue;
+        }
+        return Err(format!(
+            "mcp serve 不支持的参数：{flag}（唯一可用的启动参数是 --provider-binary <path>）"
+        ));
+    }
+    Ok(override_value)
+}
+
+/// `serve` 每条退出路径的共同字段。`authority` 恒 advisory；`handled_requests` 是
+/// PASS/UNKNOWN 的判据本身；`snapshot` 让"退出/declined"也说自己绑在哪棵树上
+/// （与 `code`/`context` 同一规则，round 2 的 N6：新增的 UNKNOWN 恰好就是 declined 形态）。
+fn serve_exit_fields(handled: usize) -> Vec<(String, Value)> {
+    vec![
+        ("authority".to_string(), json!("advisory")),
+        ("handled_requests".to_string(), json!(handled)),
+        ("snapshot".to_string(), cli_snapshot()),
+    ]
+}
+
 /// `mcp serve`：从 stdin 逐帧读到 EOF。任何超限/畸形帧都按结构化原因退出，
 /// 不做"截断后继续"（提案 §14）。
-pub fn serve() -> Outcome {
+///
+/// **stdout 只承载 MCP 帧**：进程退出时的 CLI envelope 由 `main` 打到 stderr，
+/// 否则裸 JSON 会混进协议通道（见 `MODULE.md` 的通道划分条目）。
+pub fn serve(args: &[String]) -> Outcome {
+    // 参数错误先于子进程与协议通道 —— 与 `code` 同一规则。
+    let provider_override = match parse_serve_args(args) {
+        Ok(value) => value,
+        Err(reason) => {
+            return ("BLOCKED".to_string(), reason, serve_exit_fields(0));
+        }
+    };
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut reader = BufReader::new(stdin.lock());
@@ -351,37 +435,20 @@ pub fn serve() -> Outcome {
                 } else {
                     "MCP stdin 立即 EOF：未收到任何请求，本结果不代表适配层可用".to_string()
                 };
-                return (
-                    verdict.to_string(),
-                    message,
-                    vec![
-                        ("authority".to_string(), json!("advisory")),
-                        ("handled_requests".to_string(), json!(handled)),
-                    ],
-                );
+                return (verdict.to_string(), message, serve_exit_fields(handled));
             }
             FrameIn::Failed(failure) => {
                 let code = failure.code.code();
                 return (
                     "FAIL".to_string(),
                     format!("MCP 入站帧不合规：{code} - {}", failure.reason),
-                    vec![
-                        ("authority".to_string(), json!("advisory")),
-                        ("handled_requests".to_string(), json!(handled)),
-                    ],
+                    serve_exit_fields(handled),
                 );
             }
             FrameIn::Message(message) => {
-                if let Some(response) = handle_request(&message, &mut session) {
+                if let Some(response) = handle_request(&message, &mut session, &provider_override) {
                     if let Err(e) = write_frame(&mut writer, &response) {
-                        return (
-                            "BLOCKED".to_string(),
-                            e,
-                            vec![
-                                ("authority".to_string(), json!("advisory")),
-                                ("handled_requests".to_string(), json!(handled)),
-                            ],
-                        );
+                        return ("BLOCKED".to_string(), e, serve_exit_fields(handled));
                     }
                     handled += 1;
                 }
@@ -399,6 +466,19 @@ struct Probe {
 
 /// `mcp selftest`：把**自己**作为 `mcp serve` 子进程拉起来，经真实 stdio 管道跑协议。
 pub fn selftest(args: &[String]) -> Outcome {
+    // `selftest` 的参数面同样**不接受静默忽略**（与 N1 同一类）：只认 `--with-query`。
+    // provider 覆盖不在这里给 —— 子进程会继承 `NEXUS_RUST_ANALYZER`，那已经是文档化的入口，
+    // 再造一个只有 selftest 认的 flag 只会多出一条没人验证的旁路。
+    if let Some(unknown) = args.iter().find(|a| a.as_str() != "--with-query") {
+        return (
+            "BLOCKED".to_string(),
+            format!(
+                "mcp selftest 不支持的参数：{unknown}（唯一可用的参数是 --with-query；\
+                 要换 provider 请设 NEXUS_RUST_ANALYZER 或用 mcp serve --provider-binary）"
+            ),
+            Vec::new(),
+        );
+    }
     let with_query = args.iter().any(|a| a == "--with-query");
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -495,14 +575,21 @@ pub fn selftest(args: &[String]) -> Outcome {
         }
     }
 
-    // 2) notifications/initialized（无 id，不该有回复）
+    // 2) notifications/initialized（无 id，不该有回复）。这里只负责把 notification 写进管道，
+    //    "没产生回复"这件事**不能**用"写成功了"来证明（round 2 的 N4a：那测的是管道通不通）。
+    //    证明放在第 3 步：紧接着发的 `id=2` 请求，其响应必须是管道里的**下一条**帧。
+    let mut note_written = false;
+    let mut notification_no_reply = false;
     if failure.is_none() {
         let note = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
-        let ok = write_frame(&mut writer, &note).is_ok();
+        note_written = write_frame(&mut writer, &note).is_ok();
+        if !note_written {
+            failure = Some("notification 写不进管道，后续序列证明无法成立".to_string());
+        }
         probes.push(Probe {
-            name: "notification_accepted_silently",
-            ok,
-            detail: "notification 不应产生回复".to_string(),
+            name: "notification_written",
+            ok: note_written,
+            detail: "notification 已写入管道（回复性由下一条响应的 id 序列证明）".to_string(),
         });
     }
 
@@ -511,6 +598,22 @@ pub fn selftest(args: &[String]) -> Outcome {
         let list = json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}});
         match drive(&mut writer, &rx, &list, Duration::from_secs(10)) {
             Ok(response) => {
+                // 序列证明成立 ⇔ 这条响应就是 id=2，说明 notification 没有换来一条回复、
+                // 也没有多消耗一条响应帧（多消耗会让这里的 recv 拿到上一请求的回包）。
+                notification_no_reply = note_written && response["id"] == json!(2);
+                probes_ok(
+                    "notification_no_reply",
+                    notification_no_reply,
+                    format!("期望下一条响应 id=2，实得 {}", response["id"]),
+                    &mut probes,
+                );
+                if !notification_no_reply {
+                    failure = Some(format!(
+                        "notification 之后第一条响应应是 id=2 的 tools/list 回复，实得 id={} \
+                         —— 说明 notification 产生了回复或响应被错配",
+                        response["id"]
+                    ));
+                }
                 let tools = response
                     .get("result")
                     .and_then(|r| r.get("tools"))
@@ -815,34 +918,81 @@ pub fn selftest(args: &[String]) -> Outcome {
 
     // 8) serve 的退出形状：干净挂断 != 崩溃；畸形帧必须 FAIL。
     //    不需要 language server，因此走 selftest 的默认路径（不加 --with-query 也跑）。
-    let (eof_verdict, eof_message) = serve_exit_shape("");
-    let (malformed_verdict, malformed_message) = serve_exit_shape("Content-Length: 9\r\n\r\n{}");
-    query.push(("eof_verdict".to_string(), json!(eof_verdict)));
+    let eof = serve_exit_shape(b"", &[]);
+    let malformed = serve_exit_shape(b"Content-Length: 9\r\n\r\n{}", &[]);
+    // 处理过一条请求再正常挂断：round 1 修好的那条 PASS 分支此前探针覆盖不到
+    // （裸 envelope 与最后一帧粘在同一行），现在必须能自动证。
+    let pass_input = initialize_frame_bytes();
+    let passed = serve_exit_shape(&pass_input, &[]);
+    query.push(("eof_verdict".to_string(), json!(eof.verdict)));
     query.push((
         "malformed_frame_verdict".to_string(),
-        json!(malformed_verdict),
+        json!(malformed.verdict),
     ));
-    let eof_ok = eof_verdict == "UNKNOWN";
+    query.push(("pass_verdict".to_string(), json!(passed.verdict)));
+    query.push(("pass_handled_requests".to_string(), json!(passed.handled)));
+    query.push((
+        "stdout_frames_ok".to_string(),
+        json!(eof.stdout_pure && malformed.stdout_pure && passed.stdout_pure),
+    ));
+    let eof_ok = eof.verdict == "UNKNOWN" && eof.handled == 0 && eof.stdout_pure;
     probes_ok(
         "clean_eof_is_not_reported_as_crash",
         eof_ok,
-        format!("verdict={eof_verdict} message={eof_message}"),
+        eof.detail.clone(),
         &mut probes,
     );
     if !eof_ok {
         failure = Some(format!(
-            "客户端一条请求都没发就挂断，serve 报成 {eof_verdict}；应是 UNKNOWN（既非崩溃也非 PASS）"
+            "客户端一条请求都没发就挂断，serve 报成 {}；应是 UNKNOWN（既非崩溃也非 PASS），\
+             且 stdout 不该有任何非帧字节。{}",
+            eof.verdict, eof.message
         ));
     }
-    let malformed_ok = malformed_verdict == "FAIL";
+    let malformed_ok = malformed.verdict == "FAIL";
     probes_ok(
         "malformed_frame_is_failure",
         malformed_ok,
-        format!("verdict={malformed_verdict} message={malformed_message}"),
+        malformed.detail.clone(),
         &mut probes,
     );
     if !malformed_ok {
-        failure = Some(format!("畸形帧应报 FAIL，实得 {malformed_verdict}"));
+        failure = Some(format!("畸形帧应报 FAIL，实得 {}", malformed.verdict));
+    }
+    // PASS + 已回复计数 + stdout 恰好一帧且无多余字节。帧数与 handled_requests 必须相等：
+    // 不相等就说明要么有回复没写出去，要么有裸 JSON 混进了协议通道。
+    let pass_ok =
+        passed.verdict == "PASS" && passed.handled == 1 && passed.frames == 1 && passed.stdout_pure;
+    probes_ok(
+        "handled_request_exit_is_pass_and_stdout_is_pure",
+        pass_ok,
+        passed.detail.clone(),
+        &mut probes,
+    );
+    if !pass_ok {
+        failure = Some(format!(
+            "处理 1 条请求后正常挂断应是 PASS/handled_requests=1/1 帧纯净 stdout，实得 {}",
+            passed.detail
+        ));
+    }
+
+    // 9) `--provider-binary` 必须真的生效（契约承诺过它，而 round 2 实测它被静默丢弃）。
+    if failure.is_none() {
+        let (honored, detail) = provider_override_probe();
+        query.push(("provider_override_honored".to_string(), json!(honored)));
+        probes_ok(
+            "provider_override_honored",
+            honored,
+            detail.clone(),
+            &mut probes,
+        );
+        if !honored {
+            failure = Some(format!(
+                "`mcp serve --provider-binary` 未被端到端兑现（应因该 flag 报 PROVIDER_UNAVAILABLE）：{detail}"
+            ));
+        }
+    } else {
+        query.push(("provider_override_honored".to_string(), json!(false)));
     }
 
     // 收尾：优雅 shutdown；无论如何都要回收子进程（不留孤儿 language server 进程）。
@@ -874,6 +1024,10 @@ pub fn selftest(args: &[String]) -> Outcome {
                 json!(probes.first().map(|p| p.ok).unwrap_or(false)),
             ),
             ("tools_count".to_string(), json!(tools_count)),
+            (
+                "notification_no_reply".to_string(),
+                json!(notification_no_reply),
+            ),
             (
                 "write_tools_exposed".to_string(),
                 json!(write_tools_exposed),
@@ -942,15 +1096,20 @@ pub fn selftest(args: &[String]) -> Outcome {
     )
 }
 
-/// CLI 派发：`mcp serve` / `mcp selftest [--with-query]`。
+/// CLI 派发：`mcp serve [--provider-binary <path>]` / `mcp selftest [--with-query]`。
 /// 未知子命令**不启动任何东西**直接 BLOCKED —— 与 `code` 的"参数错误先于子进程"同一规则。
+/// `serve` 的未知**启动参数**同样 BLOCKED（`parse_serve_args`）：以前 `args` 被整个丢掉，
+/// 于是契约里承诺的 `--provider-binary` 静默失效，这一半此前没人堵。
 pub fn dispatch(args: &[String]) -> Outcome {
     match args.first().map(String::as_str).unwrap_or("") {
-        "serve" => serve(),
+        "serve" => serve(args),
         "selftest" => selftest(&args[1..]),
         other => (
             "BLOCKED".to_string(),
-            format!("supported mcp subcommands: serve, selftest [--with-query]（收到：{other}）"),
+            format!(
+                "supported mcp subcommands: serve [--provider-binary <path>], \
+                 selftest [--with-query]（收到：{other}）"
+            ),
             Vec::new(),
         ),
     }
@@ -966,51 +1125,211 @@ fn cli_snapshot() -> Value {
     }
 }
 
-/// 用一次性子进程演练 `mcp serve` 的**退出形状**。
+/// 一次性演练 `mcp serve` 的结果。每个量都是对外契约的一部分：
+/// `verdict`/`message` 说"serve 是怎么结束的"，`handled` 就是 PASS/UNKNOWN 的判据本身，
+/// `frames` + `stdout_pure` 说"stdout 上是不是只有帧、有没有多余字节"。
+struct ExitShape {
+    verdict: String,
+    message: String,
+    handled: usize,
+    frames: usize,
+    stdout_pure: bool,
+    detail: String,
+}
+
+/// 用一次性子进程演练 `mcp serve` 的**退出形状**（`extra_args` 用来试启动参数）。
 ///
 /// 为什么要专门探：帧边界上的 EOF（客户端正常挂断）与畸形/半帧必须给出**不同** verdict。
-/// 独立 Review 抓到我把两者都判成 FAIL —— `read_frame` 把干净 EOF 也报成
-/// `PROVIDER_CRASHED`，于是 PASS 分支不可达；而 `selftest` 之前不看子进程退出码，
-/// 这条路径谁也走不到。这个探针把"serve 怎么结束"变成可断言的事实，而不是注释里的承诺。
-fn serve_exit_shape(input: &str) -> (String, String) {
+/// 独立 Review round 1 抓到我把两者都判成 FAIL —— `read_frame` 把干净 EOF 也报成
+/// `PROVIDER_CRASHED`，于是 PASS 分支不可达。
+///
+/// 为什么这里读 **stderr** 而不是 stdout：round 2 之前退出 envelope 是被 `main` 打到 stdout 的，
+/// 于是它和最后一帧粘在同一行（实测 `…"}}}{"authority":…`），"取最后一行 JSON"的探针
+/// 解析不出来 ⇒ `handled > 0 ⇒ PASS` 这条分支**探针覆盖不到**，只能靠人工 `printf` 看见。
+/// 现在 stdout 只承载协议帧，envelope 走 stderr，本函数顺带把"stdout 可否按帧完整消费"
+/// 变成断言对象（同一处改动同时解掉 N4b 与 N5）。
+fn serve_exit_shape(input: &[u8], extra_args: &[String]) -> ExitShape {
+    let failed = |detail: String| ExitShape {
+        verdict: String::new(),
+        message: String::new(),
+        handled: 0,
+        frames: 0,
+        stdout_pure: false,
+        detail,
+    };
     let exe = match std::env::current_exe() {
         Ok(p) => p,
-        Err(e) => return (String::new(), format!("定位自身可执行文件失败：{e}")),
+        Err(e) => return failed(format!("定位自身可执行文件失败：{e}")),
     };
+    let mut cmd = Command::new(&exe);
+    let mut argv: Vec<String> = vec!["mcp".to_string(), "serve".to_string(), "--json".to_string()];
+    argv.extend(extra_args.iter().cloned());
+    let mut child = match cmd
+        .args(&argv)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return failed(format!("spawn mcp serve 失败：{e}")),
+    };
+    {
+        let mut si = match child.stdin.take() {
+            Some(s) => s,
+            None => return failed("子进程没有 stdin 管道".to_string()),
+        };
+        let _ = si.write_all(input);
+        // 离开作用域即关闭写端 ⇒ 子进程读到 EOF
+    }
+    let output = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => return failed(format!("等待子进程失败：{e}")),
+    };
+
+    // stdout 必须能被**完整**消费成帧：每条都是 Message，最后恰好一次 CleanEof；
+    // 出现 Failed（裸 JSON、半帧、超限）就说明协议通道被污染。
+    let mut cursor = std::io::Cursor::new(output.stdout.as_slice());
+    let mut reader = BufReader::new(&mut cursor);
+    let mut frames = 0usize;
+    let mut stdout_pure = true;
+    let mut frame_detail = String::new();
+    loop {
+        match read_frame_result(&mut reader) {
+            FrameIn::CleanEof => break,
+            FrameIn::Message(_) => frames += 1,
+            FrameIn::Failed(failure) => {
+                stdout_pure = false;
+                frame_detail = format!("{} - {}", failure.code.code(), failure.reason);
+                break;
+            }
+        }
+    }
+
+    // 退出 envelope 在 stderr 上（stdout 是协议通道，不放裸 JSON）。
+    let text = String::from_utf8_lossy(&output.stderr).to_string();
+    let line = match text.lines().rev().find(|l| l.trim_start().starts_with('{')) {
+        Some(l) => l,
+        None => {
+            return failed(format!(
+                "stderr 没有退出 envelope（stdout 帧数={frames} pure={stdout_pure} {frame_detail}）"
+            ));
+        }
+    };
+    match serde_json::from_str::<Value>(line) {
+        Ok(v) => {
+            let mut detail = format!(
+                "verdict={} handled_requests={} 帧数={} stdout_pure={stdout_pure}",
+                v["verdict"].as_str().unwrap_or(""),
+                v["handled_requests"].as_u64().unwrap_or(0),
+                frames
+            );
+            if !stdout_pure {
+                detail.push_str(&format!("（多余字节：{frame_detail}）"));
+            }
+            ExitShape {
+                verdict: v["verdict"].as_str().unwrap_or("").to_string(),
+                message: v["message"].as_str().unwrap_or("").to_string(),
+                handled: v["handled_requests"].as_u64().unwrap_or(0) as usize,
+                frames,
+                stdout_pure,
+                detail,
+            }
+        }
+        Err(e) => failed(format!("解析 stderr envelope 失败：{e}")),
+    }
+}
+
+/// `mcp serve --provider-binary` 的端到端探针：证明这个启动参数**真的生效**。
+///
+/// 为什么用不存在的路径而不是真 server：要断言的是"失败原因点名这个 flag"，
+/// 而不是"换了一个能用的 server"。这样既不需要 language server 可用，也不受宿主负载影响
+/// （`resolve_binary` 在 spawn 之前就失败，毫秒级返回），同时把最危险的那种回归钉死 ——
+/// 静默回退到 PATH 上的 server 会让"我以为换了 provider"变成"其实没换"。
+/// round 2 的 N1 就是这个 flag 被 `dispatch` 整个丢掉、给了不存在的路径与不给了完全同形。
+fn provider_override_probe() -> (bool, String) {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return (false, format!("定位自身可执行文件失败：{e}")),
+    };
+    // 与自身同目录、但任何宿主都不该存在的文件名：路径合法、文件不存在。
+    let bogus = exe.with_file_name("nexus-harness-not-a-language-server");
+    let bogus_text = bogus.to_string_lossy().to_string();
     let mut child = match Command::new(&exe)
-        .args(["mcp", "serve", "--json"])
+        .args(["mcp", "serve", "--json", "--provider-binary", &bogus_text])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
     {
         Ok(c) => c,
-        Err(e) => return (String::new(), format!("spawn mcp serve 失败：{e}")),
+        Err(e) => return (false, format!("spawn mcp serve 失败：{e}")),
     };
+    let Some(stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        return (false, "子进程没有 stdin 管道".to_string());
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        return (false, "子进程没有 stdout 管道".to_string());
+    };
+    let (tx, rx) = channel::<Result<Value, String>>();
+    let reader = spawn_reader(BufReader::new(stdout), tx);
+    let mut writer = stdin;
+    let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "protocolVersion": PROTOCOL_VERSION, "capabilities": {},
+        "clientInfo": {"name": "nexus-harness-provider-probe", "version": env!("CARGO_PKG_VERSION")}
+    }});
+    let call = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+        "name": "code.symbol",
+        "arguments": {"target": "Egress", "workspace": SELFTEST_WORKSPACE,
+                      "max_results": 2, "max_snippet_lines": 1,
+                      "ready_timeout_secs": 20, "timeout_secs": 20}
+    }});
+    let (ok, detail) = match drive(&mut writer, &rx, &init, Duration::from_secs(20))
+        .and_then(|_| drive(&mut writer, &rx, &call, Duration::from_secs(60)))
     {
-        let mut si = match child.stdin.take() {
-            Some(s) => s,
-            None => return (String::new(), "子进程没有 stdin 管道".to_string()),
-        };
-        let _ = si.write_all(input.as_bytes());
-        // 离开作用域即关闭写端 ⇒ 子进程读到 EOF
-    }
-    let output = match child.wait_with_output() {
-        Ok(o) => o,
-        Err(e) => return (String::new(), format!("等待子进程失败：{e}")),
+        Ok(response) => {
+            let envelope = response
+                .get("result")
+                .and_then(|r| r.get("structuredContent"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let code = envelope["error"]["code"].as_str().unwrap_or("").to_string();
+            let reason = envelope["error"]["reason"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            // 两条同时成立才算过：错误码是 PROVIDER_UNAVAILABLE（不是"悄悄用别的 server 成功了"），
+            // 且原因文字点名 `--provider-binary`（证明失败来自这个 flag 而不是 PATH 里缺 rust-analyzer）。
+            let honored = code == "PROVIDER_UNAVAILABLE" && reason.contains("--provider-binary");
+            let detail = format!(
+                "verdict={} code={code} reason={}",
+                envelope["verdict"].as_str().unwrap_or(""),
+                reason.chars().take(90).collect::<String>()
+            );
+            (honored, detail)
+        }
+        Err(e) => (false, format!("探针没拿到 tools/call 响应：{e}")),
     };
-    let text = String::from_utf8_lossy(&output.stdout).to_string();
-    let line = match text.lines().rev().find(|l| l.trim_start().starts_with('{')) {
-        Some(l) => l,
-        None => return (String::new(), "子进程没有输出 JSON".to_string()),
-    };
-    match serde_json::from_str::<Value>(line) {
-        Ok(v) => (
-            v["verdict"].as_str().unwrap_or("").to_string(),
-            v["message"].as_str().unwrap_or("").to_string(),
-        ),
-        Err(e) => (String::new(), format!("解析子进程输出失败：{e}")),
-    }
+    // 关写端 ⇒ 子进程读到 EOF 自己退出；不靠 kill，也不留孤儿 provider。
+    drop(writer);
+    let _ = child.wait();
+    let _ = reader.join();
+    (ok, detail)
+}
+/// 构造一帧 `initialize` 请求，供退出形状探针喂给子进程。
+fn initialize_frame_bytes() -> Vec<u8> {
+    encode_frame(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "nexus-harness-serve-probe", "version": env!("CARGO_PKG_VERSION")}
+        }
+    }))
 }
 
 /// 从已收集的字段里读布尔/整数；读不到算"没发生"，不默认成 true/1。
@@ -1190,6 +1509,7 @@ mod tests {
         let response = handle_request(
             &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
             &mut None,
+            &None,
         )
         .expect("initialize 必须有回复");
         assert_eq!(
@@ -1212,6 +1532,7 @@ mod tests {
             handle_request(
                 &json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
                 &mut None,
+                &None,
             )
             .is_none(),
             "notification 不该产生回复"
@@ -1219,6 +1540,7 @@ mod tests {
         let unknown = handle_request(
             &json!({"jsonrpc":"2.0","id":7,"method":"nexus/not-a-method","params":{}}),
             &mut None,
+            &None,
         )
         .expect("带 id 的请求必须有回复");
         assert_eq!(unknown["error"]["code"], json!(ERR_METHOD_NOT_FOUND));
@@ -1227,7 +1549,7 @@ mod tests {
             json!({"id": 8, "method": "tools/list"}),
             json!({"jsonrpc": "1.0", "id": 9, "method": "tools/list"}),
         ] {
-            let response = handle_request(&bad, &mut None).expect("必须有回复");
+            let response = handle_request(&bad, &mut None, &None).expect("必须有回复");
             assert_eq!(
                 response["error"]["code"],
                 json!(ERR_INVALID_REQUEST),
@@ -1273,5 +1595,89 @@ mod tests {
             "分帧头必须一致：{text}"
         );
         assert!(text.contains("\r\n\r\n"), "头与体之间必须是空行");
+    }
+
+    /// `serve` 的启动参数面：`--provider-binary` 是唯一入口，且**不接受**的必须报错。
+    /// 这条测试是 N1 的回归护栏 —— 原来的 `dispatch` 把 `args` 整个丢掉，
+    /// 于是"文档承诺了但实现不认"这种形状可以长期存在而没有任何信号。
+    #[test]
+    fn serve_args_accept_only_provider_binary_and_reject_everything_else() {
+        let argv =
+            |items: &[&str]| -> Vec<String> { items.iter().map(|s| s.to_string()).collect() };
+        // 只给子命令 ⇒ 没有覆盖，走 NEXUS_RUST_ANALYZER/PATH 的解析顺序。
+        assert_eq!(parse_serve_args(&argv(&["serve"])).unwrap(), None);
+        // 空格形式与 `=` 形式都认。
+        assert_eq!(
+            parse_serve_args(&argv(&["serve", "--provider-binary", "/x/ra"])).unwrap(),
+            Some("/x/ra".to_string())
+        );
+        assert_eq!(
+            parse_serve_args(&argv(&["serve", "--provider-binary=/x/ra"])).unwrap(),
+            Some("/x/ra".to_string())
+        );
+        // 未知参数、缺值、空值 ⇒ 报错（错误里要说清可用参数，不然调用方只能猜）。
+        for bad in [
+            argv(&["serve", "--totally-made-up"]),
+            argv(&["serve", "--provider-binary"]),
+            argv(&["serve", "--provider-binary="]),
+            argv(&["serve", "--provider-binary", ""]),
+            argv(&["serve", "--max-results", "8"]),
+            argv(&["serve", "--provider-binary=/x", "--bogus"]),
+        ] {
+            let err = parse_serve_args(&bad).expect_err("不该被静默接受");
+            assert!(
+                err.contains("--provider-binary"),
+                "拒绝原因必须指出唯一可用参数：{err}"
+            );
+        }
+    }
+
+    /// `selftest` 也只认自己那一个参数：静默忽略未知 flag 属于 N1 的同一类失效形状。
+    /// 这里断言 BLOCKED 而**不启动子进程** —— 参数错误先于任何 provider/管道动作。
+    #[test]
+    fn selftest_rejects_unknown_arguments_before_spawning_anything() {
+        let args: Vec<String> = ["--max-results", "8"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (verdict, message, _) = selftest(&args);
+        assert_eq!(verdict, "BLOCKED", "未知参数必须被拒，实得 {verdict}");
+        assert!(
+            message.contains("--with-query"),
+            "拒绝原因要指出唯一可用参数：{message}"
+        );
+        assert!(
+            message.contains("NEXUS_RUST_ANALYZER"),
+            "还要把换 provider 的正确入口说出来：{message}"
+        );
+    }
+
+    /// 每条 `serve` 退出路径的共同字段：advisory + 判据本身（handled_requests）+ 绑定。
+    /// 少一个字段就等于对外少承诺一件事（round 2 的 N6：新增的 UNKNOWN 正是 declined 形态，
+    /// declined 也要说清绑在哪棵树上）。
+    #[test]
+    fn serve_exit_fields_carry_authority_counter_and_snapshot() {
+        let fields = serve_exit_fields(3);
+        let get = |key: &str| {
+            fields
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or(Value::Null)
+        };
+        assert_eq!(get("authority"), json!("advisory"));
+        assert_eq!(get("handled_requests"), json!(3));
+        let snapshot = get("snapshot");
+        assert!(
+            snapshot.is_object(),
+            "snapshot 必须是对象（取不到仓库时也是带 error 的对象，不是缺字段）：{snapshot}"
+        );
+        // 只钉"字段在不在"，不钉"取没取到"：单测的 cwd 可能是仓库也可能不是，
+        // 取不到时 `cli_snapshot()` 会给出 `source_revision: ""` + `error`，
+        // 两种形态都必须让消费方看得见（后者正是它不假装绑定的方式）。
+        assert!(
+            snapshot.get("source_revision").is_some(),
+            "snapshot 必须自述有没有绑定上：{snapshot}"
+        );
     }
 }

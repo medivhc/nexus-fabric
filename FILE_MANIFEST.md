@@ -2,7 +2,7 @@
 
 本包实现《Nexus 统一系统设计规范 v9》中的“统一仓库目录契约”。
 
-文件数（不含本清单）：185
+文件数（不含本清单）：186
 
 > 2026-10-10：原声明值 137 与表内实际行数（148）已不一致（既有漂移，含
 > `scenarios/engineering/bench_gate_verdicts.toml` 等未登记项）。本次登记
@@ -33,6 +33,7 @@
 >
 > 2026-10-11（Phase 2-4 开工）：登记 `.agents/code-intelligence-phase-2-4-plan.md`，声明值 177 -> 178。
 >
+> 2026-10-11（独立 Review round 2 整改）：登记 `.agents/red-evidence-mcp-round2.txt`，声明值 185 -> 186。
 > 2026-10-11（Phase 2/3/4 契约与实现）：新增夹具 `MODULE.md`、`code_intel/mcp.rs` 与
 > 5 个场景（context 语义锚点 3 条、MCP 2 条），声明值 178 -> 185；
 > Code Intelligence 场景总数由 16 增至 21（Phase 2 三条、Phase 3 两条）。
@@ -49,6 +50,7 @@
 | `.agents/code-intelligence-followups.md` | 独立 Review round 3（`COMMENTED`）的 12 条后续待办，逐条带 `文件:行` 与验收动作；作为"机器可见的待办承载体" |
 | `.agents/green-evidence-code-intelligence.txt` | Green Evidence record（Code Intelligence E4 场景全 PASS，正文记录其绑定的 source_revision） |
 | `.agents/red-evidence-code-intelligence.txt` | Red Evidence record（Code Intelligence 契约阶段 9/9 FAIL） |
+| `.agents/red-evidence-mcp-round2.txt` | Red Evidence record（MCP stdout 通道泄漏、PASS 分支不可探针、`--provider-binary` 静默丢弃的修前实测） |
 | `.agents/skills/README.md` | Project-level agent skill index |
 | `.agents/skills/nexus-contract-first/SKILL.md` | Project-level agent skill |
 | `.agents/skills/nexus-evidence/SKILL.md` | Project-level agent skill |

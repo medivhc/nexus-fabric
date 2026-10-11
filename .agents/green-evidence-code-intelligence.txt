@@ -514,4 +514,79 @@ Phase 4 的复用判据在权威宿主上单独量了一次（`mcp selftest --wi
   根本不启动 provider，只跑 stdio 协议与参数校验，因此不影响 `dirty_after=0` 的读数；
   单独那次 `--with-query` 是在复跑结束之后跑的，也不写仓库（flycheck 走 `/tmp/nexus-code-intel-*`）。
 
+### N3 勘误（round 2 由独立审查抓出，2026-10-11）
+
+上面 §N 第 6b 步那行写的 **`11/11 probes` 是错的**：默认路径（不带 `--with-query`）的
+`mcp selftest` 当时只发 **8** 条探针，11/11 属于**另一次** `--with-query` 的运行，我把两次的数
+混记成了一条。正确记录以本文件 §O 为准（整改后默认路径发 11 条、`--with-query` 发 14 条 ——
+新增探针使然，两个数各归各的口径）。§M:454 的 `8/8` 是对的，不动。
+这条错误的性质值得留着：**把没跑过的探针算进结论**正是提案 §12 禁止的形状，而它出现在
+"结论级证据"段落里，比出现在代码注释里危险得多。
+
+## O. 独立 Review round 2 的整改复跑（Windows 冒烟宿主，rev `a3af128` 之上的整改）
+
+案卷 `.evidence/review-qoder-independent-p234-r2/`（verdict `COMMENTED`，0 阻塞；
+round 1 的 B1/G1/A1/A2/A3/G2 全部 CLOSED，H1 与 4 条 minor 处置被接受；`model=unbound`）。
+整改对象是 round 2 新提的 N1/N2/N3/N4/N5/N6/N7 + 自查项 S1（`handled_requests` 从未写进契约）。
+修前实测：`.agents/red-evidence-mcp-round2.txt`（stdout 裸 JSON 194 字节、PASS 分支不可探针、
+`--provider-binary` 与未知参数双双静默丢弃）。
+
+Windows 复跑（最终二进制，串行；`dirty=0` 之前取）：
+
+    cargo fmt --all -- --check                             exit 0
+    cargo clippy -p nexus-harness --all-targets -D warn    exit 0
+    cargo test -p nexus-harness                            131 passed / 3 failed（共 134）
+        3 条 = master 自带依赖 POSIX `echo` 的 scenario 单测（DEVELOPMENT.md §11.1）
+        注：`cargo clippy --workspace` 在本宿主 exit 101，原因是 `nexus-platform-linux`
+        要 `fuser`（PR #12 记录的结构性限制），不是本模块引入
+    cargo test -p nexus-harness -- code_intel              72 passed / 0 failed
+    nexus-harness mcp selftest --json                      PASS，11/11 probes，dur≈1.0s
+        eof_verdict=UNKNOWN  malformed_frame_verdict=FAIL
+        pass_verdict=PASS  pass_handled_requests=1  stdout_frames_ok=true
+        notification_no_reply=true  provider_override_honored=true
+        write_call_rejected=true（6/6 越权名 -32602 + UNSUPPORTED）
+    nexus-harness mcp selftest --with-query --json          PASS，14/14 probes，dur 19221ms
+        first=17590ms（session_reused=false, queries=1）
+        second=444ms（session_reused=true, queries=2）⇒ 40x，query_warm_reused=true
+    手工通道核对（这些正是 N5/N1 的直接复证）：
+        printf '' | mcp serve --json            ⇒ stdout **0 字节**，stderr 682 字节 envelope
+                                                  （verdict=UNKNOWN handled_requests=0 带 snapshot）
+        一帧 initialize + 关管道                 ⇒ stdout 230 字节 = **恰好 1 帧**，
+                                                  stderr verdict=PASS handled_requests=1
+        mcp serve --totally-made-up             ⇒ BLOCKED，exit 2（不再静默丢弃）
+        mcp selftest --bogus-flag               ⇒ BLOCKED，exit 2
+        mcp serve --provider-binary <不存在路径> ⇒ 真实 tools/call 回
+                                                  PROVIDER_UNAVAILABLE 且原因点名 --provider-binary
+    21 个 E4 场景                                PASS=21 FAIL=0
+
+本轮三个新事实的实测载体：
+
+    mcp-handshake（现 19 条期望）        scenario-23a2a68499f0
+    mcp-real-query（现 19 条期望）        scenario-5f802a9bb856
+    callees（11 条期望）                  scenario-8eed2a7b113c
+
+### 两条必须一起记下的过程事实
+
+1. **`callees` 第一次是 FAIL（verdict 实得 BLOCKED），是我的操作造成的，不是代码回归**：
+   批量场景还在跑的时候我并发执行了 `cargo build -q -p nexus-harness`，两者争同一个
+   `target/` 目录（cargo 的 build directory lock），使那一次 provider 侧未能起来 ⇒ BLOCKED。
+   单独复跑即 PASS（`scenario-8eed2a7b113c`，11 条期望全过）。教训：**跑 E4 批次期间不许并发构建**。
+2. **场景证据 id 是确定性的，复跑会覆盖前一条记录**：`scenario_run_id`
+   （`evidence.rs:218-231`）的种子只有 `source_revision + scenario_id + configuration_digest +
+   contract_hash`，**不含工作树指纹**，所以同一 rev 上脏树的两次运行会算出同一个 id
+   （上面那次 FAIL 与 PASS 都是 `scenario-8eed2a7b113c`，磁盘上只剩 PASS）。
+   后果很实际：Red→Green 若在同一 rev 上完成，`.evidence/` 里**留不下 Red** ——
+   本模块之所以每次把 verdict/输出逐条抄进 `.agents/*evidence*.txt`，正是因为这个覆盖行为，
+   而不是巧合。已登记为后续项（见 `.agents/code-intelligence-followups.md`）。
+
+### N7 与 S1 的实测依据
+
+- `context engineering/nexus-harness --json` ⇒ `verdict=PASS`、`semantic_status=unsupported_scope`、
+  `mapped_scenarios=20`（而 `MODULE.md` 场景清单是 21）。这坐实了 N7：`mapped_scenarios`
+  是子串启发式，不能当"场景总数"用，也不能与清单数互相验证；口径已写进 MODULE.md。
+- S1：`handled_requests` 此前只在输出里、契约从没定义它，而它正是 `PASS`/`UNKNOWN` 的判据本身
+  （`mcp.rs` serve 的 `handled > 0`）。现在 MODULE.md 定义了它（含"notification 不计"），
+  且探针断言 `pass_handled_requests=1` 与"stdout 帧数=1"必须同时成立。
+
+
 

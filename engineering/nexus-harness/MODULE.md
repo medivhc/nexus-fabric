@@ -132,6 +132,11 @@ message 措辞不同，钉文案等于把版本耦合写进契约。诊断条目
 只增不改**）之外，附加一组**有界**语义锚点，让 Agent 从模块契约直接落到"实现在哪"，
 不必退回 `rg` + 猜类型（提案 §1）。
 
+`mapped_scenarios` 的口径必须说准：它是**子串启发式**（场景正文里出现 target 名就算命中），
+所以它的条数**不是**"该模块的场景总数"，也不能与 `MODULE.md` 里声明的场景清单数互相验证
+（例：`context engineering/nexus-harness` 报 20 而清单是 21，因为握手场景正文不含目标路径串）。
+把它当总数用会得出"有一个场景漏登记"的假结论（独立 Review round 2 的 N7）。
+
 新增字段（`context` 的 `--json` 输出）：
 
 ```text
@@ -179,7 +184,8 @@ authority         恒为 "advisory"
 
 ## MCP Adapter（提案 §15 Phase 3、§10）
 
-`nexus-harness mcp <serve|selftest> [--with-query]` 是一个**薄 transport 适配层**：把 MCP 的
+`nexus-harness mcp serve [--provider-binary <path>]` /
+`nexus-harness mcp selftest [--with-query]` 是一个**薄 transport 适配层**：把 MCP 的
 `tools/list` / `tools/call` 映射到同一套 `code <verb>` 能力，让外部 Agent runtime 用的仍然是
 Nexus 的中立 schema，而不是 LSP 原文（提案 §3 的 `Agent Contract != LSP Contract`）。
 
@@ -209,27 +215,73 @@ Agent ──MCP(stdio JSON-RPC)──▶ nexus-harness mcp serve ──▶ code_
 - 工具入参只接受 `target` / `workspace` / `max_results` / `max_snippet_lines` /
   `max_result_bytes` / `timeout_secs` / `ready_timeout_secs`。**不接受** `provider_binary`
   之类的启动期参数：把可执行路径放进 tool 参数就等于让模型给 language server launcher
-  注入 argv，提案 §6 明令禁止。provider 二进制只能在 `mcp serve` 启动时由 `--provider-binary`
-  指定（与 `code` 同一入口，作用域校验同一套归一化判定）。
+  注入 argv，提案 §6 明令禁止。provider 二进制的**唯一**入口是启动期：
+  `mcp serve --provider-binary <path>`，解析顺序与 `code` 完全同一函数
+  （`--provider-binary` 覆盖 → `NEXUS_RUST_ANALYZER` → `PATH`；
+  指定了但不存在 ⇒ `PROVIDER_UNAVAILABLE`，不回退到 PATH —— 静默回退会把"我以为换了
+  server"变成"其实没换"）。`serve` 的**未知启动参数一律 `BLOCKED`**，不静默丢弃：
+  被文档承诺过的开关失效必须看得见（独立 Review round 2 的 N1 就是文档承诺了这个 flag
+  而 `dispatch` 把 `args` 整个丢掉，实测给不存在的路径与不给完全同形、exit 0）。
+- **通道划分（传输层正确性，不是风格问题）**：`mcp serve` 的 **stdout 只承载 MCP 帧**
+  （`Content-Length` 分帧的 JSON-RPC），进程退出时的 CLI envelope（`verdict` / `message` /
+  `command` / `schema_version` / `authority` / `handled_requests` / `snapshot`）走 **stderr**；
+  退出码仍由 verdict 决定（`PASS`/`UNKNOWN` ⇒ 0，`FAIL` ⇒ 1，`BLOCKED` ⇒ 2）。
+  理由：stdout 对 MCP 而言**就是协议通道**，往它上面追加一段裸 JSON，严格客户端会把会话结尾
+  读成畸形帧。这条在 round 2 之前是破的（实测 `printf '' | mcp serve --json` 的 stdout 是
+  194 字节裸 JSON），修前 Red 见 `.agents/red-evidence-mcp-round2.txt`。
+- `serve` 的**每条**退出路径都带 `authority = "advisory"`、`handled_requests` 与 `snapshot`。
+  `handled_requests` = 本会话已回复的请求条数；notification 按定义不产生回复，**不计入**。
+  它是 PASS/UNKNOWN 的**判据本身**（`> 0` ⇒ PASS，`= 0` ⇒ UNKNOWN），所以必须出现在输出里、
+  也必须被契约定义 —— 一个决定 verdict 的量只活在代码里，等于把判定藏起来。
+  `snapshot` 的存在理由与 `context` 相同：declined/退出的结果也要说清绑在哪棵树上。
 - `selftest` 用 `current_exe()` 把**自己**作为子进程拉起 `mcp serve`，通过真实管道跑
   `initialize → notifications/initialized → tools/list → tools/call`，
   默认不触发 provider 冷启动（第三条 `tools/call` 用**故意非法**的参数，验证协议层与
   参数校验的失败形状）；`--with-query` 时额外跑**两次**夹具 workspace 上的真实查询
-  （作用域限定在 3 个源文件内，冷启动面确定）。
+  （作用域限定在 3 个源文件内，冷启动面确定）。`selftest` **只认 `--with-query`**，
+  未知参数在启动任何子进程之前就 `BLOCKED`（与 `serve` 同一规则；要换 provider 用
+  `NEXUS_RUST_ANALYZER` 或 `mcp serve --provider-binary`，selftest 不自造旁路入口）。
+- `selftest` 里"notification 不产生回复"必须是**序列证明**而不是"写成功了就算过"：
+  发完 notification 紧接着发一条带 id 的请求，断言下一条响应就是那个 id ——
+  证明中间没有多出帧。只断言 `write_frame(..).is_ok()` 是在测管道写通不写通，
+  与被声称的性质无关（round 2 的 N4a）。
 - `selftest` 还单独探测 `serve` 的**退出形状**（不依赖 language server，默认路径即跑）：
   客户端一条请求都没发就挂断 ⇒ `eof_verdict = "UNKNOWN"`（既不是崩溃也不是 PASS，
-  零请求不能伪装成"处理过了"）；发来畸形帧 ⇒ `malformed_frame_verdict = "FAIL"`。
-  这两个值是 serve 的对外契约的一部分，由握手场景直接断言。
-- `--with-query` 顺带产出 Phase 4 的判定数据：`query_first_ms` / `query_second_ms` 与
-  `query_warm_reused`（判据是**相对**的 `second × 4 < first`，同一个 serve 进程里第二次查询
-  不该再付一次 initialize+索引的钱）。**不钉绝对毫秒数**——绝对值随宿主负载漂移，
-  钉死它只会造出与语义无关的脆弱红。跨命令（进程之间）的会话复用是否要做，由这组数字决定。
+  零请求不能伪装成"处理过了"）；发来畸形帧 ⇒ `malformed_frame_verdict = "FAIL"`；
+  处理过至少一条请求后正常挂断 ⇒ `pass_verdict = "PASS"` 且 `handled_requests = 1`。
+  第三条探针同时断言 **stdout 可按帧完整消费且没有多余字节**（帧数与已回复请求数一致）——
+  这是通道划分的回归保护：round 1 修好的那条 PASS 分支此前只能靠人工 `printf` 看见，
+  因为退出 envelope 混在同一个 stdout 里让"取最后一行 JSON"的探针解析不出来。
+  这些值是 serve 的对外契约的一部分，由握手场景直接断言。
+- `selftest` 还端到端证明 **`--provider-binary` 真的生效**（`provider_override_honored`）：
+  它另起一个 `mcp serve --provider-binary <与自身同目录的不存在路径>`，跑一次真实
+  `tools/call`，断言结果同时满足两件事 —— 错误码是 `PROVIDER_UNAVAILABLE`（不是"悄悄用了
+  PATH 上的 server 然后成功"），且失败原因点名 `--provider-binary`。选不存在的路径而不是
+  真 server，是为了让这条探针在任何宿主都 fail fast 且不受负载影响。
+- `selftest` 的 `--json` 输出字段（缺任何一个都算契约破坏，字段名即对外承诺）：
+  `verdict` / `message` / `authority` / `protocol_version` / `initialized_ok` / `tools_count` /
+  `notification_no_reply` / `write_tools_exposed` / `unknown_method_rejected` /
+  `bad_arguments_rejected` / `write_call_rejected` / `eof_verdict` /
+  `malformed_frame_verdict` / `pass_verdict` / `pass_handled_requests` / `stdout_frames_ok` /
+  `provider_override_honored` / `query_skipped` / `probes[]` / `duration_ms` / `snapshot`，
+  加了 `--with-query` 才有 `query_*` 一族。默认路径 11 条 probes，`--with-query` 再多 3 条 ——
+  计数写在这里是为了"声称跑过多少条"必须对得上（round 2 的 N3 就是把 8 记成了 11）。
+- `--with-query` 顺带产出 Phase 4 的判定数据：`query_first_ms` / `query_second_ms` 是**旁证**，
+  判据本身是结构事实 —— `query_warm_reused = provider.session_reused && session_queries >= 2`
+  （场景 `mcp_real_query` 直接钉 `query_first_session_reused=false`/`queries=1` 与
+  `query_second_session_reused=true`/`queries=2`）。**为什么不用时延比值**：我第一版写的判据是
+  `second × 4 < first`，那是把宿主负载写进契约，只会造出与语义无关的脆弱红；
+  绝对毫秒数同样不钉。跨命令（进程之间）的会话复用是否要做，由 `provider.session_reused`
+  这个可见判据将来是否出现新的实测证据来决定（见「Provider Session Reuse」）。
 
 诚实边界（必须照此声明，不许含糊）：
 
 - 本适配器的**协议合规性只由 selftest + E4 场景证明**，即"我们的 server 与我们的 client
   在真实 stdio 管道上互操作正确"。**第三方 MCP 客户端**（OpenCode / Claude Code 等）
   在本仓库两个宿主上都不存在，因此与真实客户端的互操作**未经验证**，不得声称已通过。
+  口径要说准：未验证的是"真实客户端的行为"，**不是**"我们自己知道的正确性"——
+  退出 envelope 混进 stdout 这类**已知**偏差在 round 2 被抓出并已修（见上方通道划分 +
+  `pass_verdict`/stdout 纯净探针），不能再把它说成"未知风险"。
 - `mcp serve` 不写 Evidence、不拥有最终 PASS：每条工具结果的 `authority` 恒 `advisory`；
   correctness 仍归 `cargo check/clippy/test`（提案 §7）。
 - 零新依赖：JSON-RPC 帧沿用 `code_intel/lsp.rs` 的 `Content-Length` 分帧实现
@@ -389,8 +441,27 @@ round 2 的教训就是"待办只写在提交说明里，下一轮没有承载�
 
 - 真实执行：workspace-tests / product-scenarios / regression / architecture-policy / dependency-governance（cargo-deny 0.20：`cargo deny --config policies/deny.toml check advisories licenses bans sources`，缺失则 UNKNOWN）/ coverage-summary（cargo-llvm-cov）/ platform-checks（portable-core 平台依赖静态扫描）/ feature-matrix（每成员 `--no-default-features` + `--all-features`）/ portable-core（`cargo check --target wasm32-wasip1`）。
 - 条件执行（无内容/无工具时 UNKNOWN）：integration（成员 tests/*.rs 存在时逐个运行）/ selected-fuzz（cargo-fuzz + fuzz targets）/ selected-concurrency（tests/concurrency 有测试时运行）/ performance-budgets（quality.toml `[performance]` 定义 baseline+blocking 后判定）。
-- 单元测试：`cargo test -p nexus-harness`（xc-pc-linux/1.98.1 上 **117 个 = 既有 58 + Code Intelligence 51 + round 3 待办整改新增 8**；Windows/1.95.0 上是 116 个，差的那一条是 `cfg(unix)` 的 symlink 越界回归，另有 master 自带、依赖 POSIX `echo` 的 3 条 `scenario::tests::run_single_*`/`run_parallel_*` 在本宿主假红，见 DEVELOPMENT.md §11.1；覆盖 scenario 求值、evidence 新鲜度/STALE、digest 确定性与锁竞争判定、containment 的归一化比较（含 `#[cfg(unix)]` 真实符号链接形态）、workspace 成员解析、dependency-governance gate 语义、affected 分析在 git 失败时上抛而非交空集，以及 JSON-RPC framing、只读白名单、URI 往返、DTO 形状与预算截断、progress 收敛判定、provider 参数校验、**假 server 主动推 `workspace/applyEdit` 的端到端拒绝**、**notification 溢出经读线程入账并出现在 `provider.dropped_notifications`**、**工作树指纹哨兵值不得当作新鲜**、**`..` 不能逃出 `--workspace` 或仓库**、**早期失败不得用 `"."` 冒充 `workspace_root`**、会话体积上限边界、跨重启计数合并）。
-  - Windows 宿主已知 4 个与本模块能力无关的预存在失败：3 个 scenario 测试把 `sh`/`echo` 当 shell 内建使用（Windows 下按可执行文件解析），1 个 `gates` 的 §12.58 contract-hash 测试受 `text=auto` 的 CRLF 检出影响；两者均非 Code Intelligence 引入。
+- 单元测试：`cargo test -p nexus-harness`（Windows/1.95.0 上**本轮实测 134 个 = 131 passed + 3 failed**，
+  xc-pc-linux/1.98.1 上再多 1 条 —— 差的那条是 `#[cfg(unix)]` 的真实符号链接越界回归，
+  所以 Linux 是 135；**117/116 是 round 2 之前的陈旧声明，本区间把测试数从 117 推到了 134 却没同步这行，
+  已由独立 Review 的 N2 抓出并在此更正**。那 3 条失败是 master 自带、依赖 POSIX `echo` 的
+  `scenario::tests::run_single_*`/`run_parallel_*` 在本宿主假红，见 DEVELOPMENT.md §11.1；
+  覆盖 scenario 求值、evidence 新鲜度/STALE、digest 确定性与锁竞争判定、containment 的归一化比较
+  （含 `#[cfg(unix)]` 真实符号链接形态）、workspace 成员解析、dependency-governance gate 语义、
+  affected 分析在 git 失败时上抛而非交空集，以及 JSON-RPC framing、只读白名单、URI 往返、
+  DTO 形状与预算截断、progress 收敛判定、provider 参数校验、
+  **假 server 主动推 `workspace/applyEdit` 的端到端拒绝**、
+  **notification 溢出经读线程入账并出现在 `provider.dropped_notifications`**、
+  **工作树指纹哨兵值不得当作新鲜**、**`..` 不能逃出 `--workspace` 或仓库**、
+  **早期失败不得用 `"."` 冒充 `workspace_root`**、会话体积上限边界、跨重启计数合并、
+  **serve 的三条退出形状（零请求 EOF ⇒ UNKNOWN / 畸形 ⇒ FAIL / 处理过 ⇒ PASS 且 stdout 只有帧）**、
+  **负向清单上 6 个越权名逐个被结构化拒绝**、`serve` **启动参数面（只认 `--provider-binary`，
+  未知参数报错而非静默丢弃）**）。
+  - Windows 宿主已知 **3** 个与本模块能力无关的预存在失败：3 个 scenario 测试把 `sh`/`echo`
+    当 shell 内建使用（Windows 下按可执行文件解析，管道形态读回空 stdout ⇒ `failed_step=parse`）。
+    此前这里写"4 个"，第 4 条是 `gates` 的 §12.58 contract-hash 测试受 `* text=auto` 的 CRLF 检出影响 ——
+    **独立 Review round 2 在本 worktree 实测它是过的**，因为该失败只在完成 CRLF 检出的宿主上出现
+    （条件性由 §11.1 自己解释）。按实测改成 3，并把条件写清，不再虚报一个不存在的红。
 
 ## Performance Budget
 
