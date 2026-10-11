@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "review_id": "review-gateway-file-r1",
+  "review_round": 1,
+  "previous_review_id": null,
+  "verdict": "CHANGES_REQUESTED",
+  "reviewer": "independent review executor (QoderCN agent session e58b828003f28f0fd371bf461e820d18, agent c2283260c5da99a5d2076c04); not the author of the engine under review; host Windows 11 / Git Bash, git 2.46.0.windows.1, rustc 1.89.0 used only for standalone std-only repro probes",
+  "source_revision": "af953af8849c5549f78f77add4ef5441faba4267",
+  "contract_hash": "d650b774092e0c7097748ef16ebc69a0104a843f",
+  "scope": [
+    "crates/nexus-web-gateway/src/file_service.rs",
+    "crates/nexus-web-gateway/examples/gateway_file_contract.rs",
+    "crates/nexus-web-gateway/src/config.rs",
+    "crates/nexus-web-gateway/MODULE.md",
+    "crates/nexus-web-gateway/requirements.toml",
+    "PRODUCT.md",
+    "scenarios/product"
+  ],
+  "scope_details": {
+    "task_type": "feature",
+    "task_summary": "M0/M1 slices of the gateway file service: contract-first PRODUCT/MODULE/requirements + 9 frozen E4 scenarios + the engine (file_service.rs) + the E4 probe (gateway_file_contract.rs)",
+    "reviewed_commits": [
+      "46b04bc",
+      "17f0c0b",
+      "93d1dd7",
+      "7487096",
+      "8fa559c",
+      "af953af"
+    ]
+  },
+  "not_verified_by_reviewer": "nexus-web-gateway cannot compile on the reviewer host (ssh2 0.9.6 userauth_pubkey_memory is gated by cfg(any(unix, vendored-openssl, openssl-on-win32)) and there is no cl.exe/nasm), so engine behaviour claims other than the standalone probes below are static reading, not crate-compiled. Items with executed evidence: gate selection (item 7 ran the real pre-commit snippet against the real .evidence tree), SendBudget/FileLimits::validate arithmetic and the resolve loop (recompiled as std-only probes in a temp dir).",
+  "blocking_issues": [
+    {
+      "id": "F1",
+      "severity": "FAIL",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:716-726, :565, :841; crates/nexus-web-gateway/examples/gateway_file_contract.rs:519",
+      "summary": "SendBudget and FileSession.inflight_bytes are never wired into FileEngine; the probe hand-rolls its own SendBudget, so quota-backpressure proves an offline model rather than the product path. G16/PRODUCT 18.2/REQ-011 send-side backpressure is unimplemented in the engine."
+    },
+    {
+      "id": "F2",
+      "severity": "FAIL",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:690-697",
+      "summary": "drain_file_reserve returns usize::from(freed > 0): squeezing out N file messages is recorded as 1. Reproduced by recompiled probe (limit=100, ten 10-byte file messages, one 40-byte terminal -> 4 messages evicted, file_drops += 1)."
+    },
+    {
+      "id": "F3",
+      "severity": "FAIL",
+      "location": "crates/nexus-web-gateway/examples/gateway_file_contract.rs:406-409",
+      "summary": "mutation_capability_of_sftp_backend reads the enum predicate back into JSON; flipping BackendKind::Sftp::allows_mutation() changes implementation and assertion together, so the scenario can never go red."
+    },
+    {
+      "id": "F4",
+      "severity": "FAIL",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:369-372 (via :1076 and :1297)",
+      "summary": "SandboxRoot::resolve breaks on NotFound, so a/b/c truncates to a. Measured in a recompiled probe. An upload whose parent chain does not exist therefore publishes to the wrong prefix and reports success, violating the fixed-output identity of N3-4:16 / N3-9:9 (G18, PRODUCT 18.1)."
+    },
+    {
+      "id": "F5",
+      "severity": "FAIL",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:1087-1108 and :1298-1306",
+      "summary": "The window between reverify_parent and create_new(part) (and between reverify_parent and hard_link) is neither defended nor declared: std-only has no O_NOFOLLOW, so a parent directory swapped for an escaping symlink writes .part bytes outside the root and abort_upload then deletes through that link outside the root. The probe only exercises the commit-time swap."
+    },
+    {
+      "id": "G1",
+      "severity": "FAIL",
+      "location": ".githooks/pre-commit:48-87, .githooks/pre-push:104-145, .gitignore:3",
+      "summary": "The Review Evidence gate selects .evidence/review-* by sort|tail -1 and reads only the verdict, so an unrelated case (review-g11-ice-fix-qoder-r1, source_revision 0576cb7) passed a change to file_service.rs. Executed against the real tree: GATE DECISION: PASS. Additionally /.evidence is gitignored, so new cases do not travel with the branch unless force-added."
+    }
+  ],
+  "blocking_issues_fixed": [
+    "F1",
+    "F2",
+    "F3",
+    "F4",
+    "F5"
+  ],
+  "blocking_issues_remaining": [
+    "G1 (fixed on branch fix/hook-review-evidence-binding at 689f63a; not merged into master nor into this feature branch, so the gate on this branch is still the unbound one)"
+  ],
+  "non_blocking_suggestions": [
+    "W1 validate() has no ack-bytes term (max_entries_per_page x name length vs max_ack_bytes) and the sessions x inflight <= buffered x 64 factor admits 32-64x over-budget; measured 4MiB worst vs 8MiB threshold passing at a real 32x over-allocation",
+    "W2 ssh.max_terminals has only a lower bound (config.rs:73/255) and lives in a different struct from FileLimits, so the terminal face never enters the same resource equation as the file face",
+    "W3 stage_chunk acks bytes that were only flush()ed (a std no-op); PRODUCT 18.1/G18 wording said durably staged",
+    "W4 commit with expected_sha256=None and declared_len=None publishes without any verification, while G18 promises digest+length before publish",
+    "W5 max_rehash_bytes_per_stream is used as a verification gate, so an artifact larger than the budget can never be digest-published (capability cliff)",
+    "W6 two unit tests have no kill power (every_verb_is_audited_including_refusals stays green if a record call is deleted; constant_time_eq_... stays green with an early return)",
+    "W7 throttle_entries_bounded reads buckets.len() only, not the locked table nor RSS",
+    "peak_read_handles_within_budget is an in-process registry counter, not an OS fd count; the ~1022-fd DoS that G16 names is not observed (needs /proc/self/fd on Linux)",
+    "MODULE.md self-reports a unit-test count (12) and the probe header said eight cases while dispatching nine"
+  ],
+  "findings_file": "findings.md"
+}

@@ -1,0 +1,362 @@
+{
+  "schema_version": 1,
+  "review_id": "review-gateway-file-r3",
+  "review_round": 3,
+  "previous_review_id": "review-gateway-file-r2",
+  "verdict": "CHANGES_REQUESTED",
+  "reviewer": "QoderCN 独立代码评审 agent（r3，非实现方，只读复核）；model qfmodel（运行时自报值）；宿主 Windows；本 crate 在本机不可编译（ssh2 0.9.6 的 userauth_pubkey_memory 受 cfg(any(unix, vendored-openssl, openssl-on-win32)) 门控，且无 cl.exe/nasm），因此未运行 cargo/rustc，未复现实现方任何实测数字；仅用过一份临时 std-only 复算件核对算术，已删除。",
+  "source_revision": "af953af8849c5549f78f77add4ef5441faba4267",
+  "subject": {
+    "branch": "feature/gateway-file-service-contracts",
+    "base_commit": "af953af",
+    "tree_state": "uncommitted working-tree changes（10 个改动文件）",
+    "reviewed_as": "r3，复评实现方对 r2 的 5 条 FAIL（R2-NEW-1..5）与 12 条 WARN（W-1..12）的处置",
+    "reviewed_content_claimed": {
+      "verification_host": "xc-pc-linux (appen@10.144.144.4)",
+      "content_tree": "2da0dae385cdb25f94737ed212f3d41ac9196ebd",
+      "toolchain": "rustc/cargo 1.98.1, x86_64-unknown-linux-gnu",
+      "contract_hash": "8f510129cd7d9bef054d2324a4517fc534ab9806",
+      "self_reported": "53 lib tests / clippy 零诊断 / 9 场景 80 条期望 / verify --fast 9 门",
+      "reproduced_by_this_review": false,
+      "statically_cross_checkable": {
+        "lib_tests_by_grep": 53,
+        "scenario_expectations_by_grep": 86,
+        "note": "自报 53 与仓内 #[test] 计数一致；自报 80 与仓内 [[expect]] 计数（86）以及同一份 EV 表格（86）不一致 ⇒ 见 R3-W-3。"
+      }
+    }
+  },
+  "scope": [
+    "crates/nexus-web-gateway/src/file_service.rs",
+    "crates/nexus-web-gateway/examples/gateway_file_contract.rs",
+    "crates/nexus-web-gateway/MODULE.md",
+    "crates/nexus-web-gateway/src/config.rs",
+    "PRODUCT.md",
+    "scenarios/product",
+    ".agents/green-evidence-gateway-file-service-m1.txt",
+    ".evidence/review-gateway-file-r2"
+  ],
+  "method": {
+    "static_only": true,
+    "compiled": false,
+    "temp_probe": "std-only 复算件（SendBudget/charge_file/send_terminal 的算术逐字复刻，无 IO），用于裁定 R2-NEW-5 的数值争议与确认 R3-NEW-1 的泄漏；已删除，不构成对本 crate 的编译。",
+    "cross_checked": [
+      "grep -c '^[[expect]]' 九条 gateway_file_*.toml = 86",
+      "探针 emit 字段集合 ⊇ 场景冻结字段集合（无冻结字段引用已改名的 final_send_squeezed_messages）",
+      "git show af953af 比对 HandleRegistry 旧实现（核 W-9 的“旧写法确实错”主张）",
+      "逐处点 commit/mkdir/rename/remove 的 record 调用数（无双记、无漏记于已覆盖动词）"
+    ]
+  },
+  "counts": {
+    "fail": 2,
+    "warn": 7,
+    "note": 5
+  },
+  "findings": [
+    {
+      "id": "R3-NEW-1",
+      "severity": "FAIL",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:771-786, 993-1001, 1029-1031",
+      "summary": "终端发送被拒时挤掉的消息不回冲会话额度：push_terminal 先弹队列并计入 file_drops，随后 FS:778-782 直接 return Err，把 evicted 清单随 Result 一起丢弃；唯一消费者 FileEngine::send_terminal 用 ? 提前返回，回冲循环不执行。后果与 r2 NEW-2 第 1 点同形：被挤掉的整条消息已离开预算（file_buffered_for 变小）但会话 inflight_bytes 不减，G16 写死的自证不变量 inflight_bytes == budget.file_buffered_for(session) 永久背离，且无任何 API 能冲回。std-only 复算件：limit=128、send_terminal(64)+8×send_file_message(8) 后 send_terminal(70) ⇒ err=true, file_drops=8, inflight=64, file_buffered_for=0, matches=false。测试面零覆盖（现有所有 send_terminal 都成功，探针还把 ssh_messages_dropped==0 冻成期望，使该分支按构造不可执行）。"
+    },
+    {
+      "id": "R3-NEW-2",
+      "severity": "FAIL",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:645-657, 660-682, 706-710, 933-937",
+      "summary": "锁定仍可被已在册主体永久绕过（r2 NEW-3 的同一条判据换了人群）：is_locked 的全局窗口分支只豁免/只作用于不在 buckets 的主体（FS:653-655）；record_failure 在 locked 满时只设全局窗口、不写该 key（FS:673-675）；locked 的到期项永不回收（只有 forget 会删，而它要求一次成功认证）。把 buckets 与 locked 都灌满（默认 1024×lockout_after=5=5120 次错口令；本仓小夹具 8×3=24 次）后，等锁定期（FS:933-937 写死 60 s）过期，这批 principal 每次撞阈值都落进 locked-full 分支并被全局窗口豁免 ⇒ 不限速、不计窗，正确令牌仍然 Ok(session)。record_failure 此时仍返回 true，authenticate 因此谎报 THROTTLED（错误码与原因不符，r2 N-3 同类）。throttle_overflow/throttle_globally_locked 看不见这条。"
+    },
+    {
+      "id": "R3-NEW-3",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/MODULE.md:101, 108, 189; crates/nexus-web-gateway/src/file_service.rs:3172-3181, 222-227, 2867, 1804, 1641, 1199",
+      "summary": "两句契约话仍为假。(a) G12『逐条都有单测把它跑红』：every_validate_rule_has_a_red_test 的 handles<sessions case 先在 chunk_bytes>max_inflight_bytes_per_session（FS:179-184）短路，删掉 FS:222-227 该 case 仍红 ⇒ 该规则零杀伤力（其余 4 case 逐个推演有杀伤力）。(b) G21『单测逐个动词断言恰好一行』：abort_upload 在测试里是裸调用（FS:2867），ack_staged/idle_recycle 的行无人断言 ⇒ 删掉本批为 W-5 新加的 record 调用全库不红。"
+    },
+    {
+      "id": "R3-W-1",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:1055-1068",
+      "summary": "charge_file 的回滚只覆盖 CAPACITY 一条早退路径：先 push_file，再做 checked_add，OVERFLOW 那条 ? 没有 unpush_file ⇒ 造出『占共享预算、不占会话额度』的条目，inflight_matches_budget 反向背离且无释放路径。当前需 wire 层给出荒谬长度才触发，但形状与 r2 NEW-2 第 3 点同源；一行改：把 checked_add 提到 push_file 之前。"
+    },
+    {
+      "id": "R3-W-2",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:663-667; MODULE.md:140-144",
+      "summary": "Throttle::global 只增不减 ⇒ 全局窗口是一次性升级、永久待命：窗口过期后只需一次溢出失败（global 仍 ≥ 阈值）就立即再设 global_locked_until。G15 声明了『窗口内合法新用户也被拒』，没声明『一次洪水之后每 60 s 一条伪造失败即可无限期续期』。建议给 global 做衰减/固定窗口，或把这个量级写进 G15。"
+    },
+    {
+      "id": "R3-W-3",
+      "severity": "WARN",
+      "location": ".agents/green-evidence-gateway-file-service-m1.txt:249-254, 180",
+      "summary": "自报期望条数与自己写的表格不自洽：EV:249 记『80 条 expectation（上一片 73，本片加严 7）』，而 EV:250-254 的表格逐项相加与九份场景文件的 [[expect]] 实测都是 86；『上一片 73』错了一层（第三片自报 77，EV:180）。本机静态可复核，不需要跑。r2 上一轮用逐文件计数指出同类问题，方法正确但这一轮没被用来自查。"
+    },
+    {
+      "id": "R3-W-4",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:829-843",
+      "summary": "settle_file 可以越过同会话队头释放后面的消息：循环扫全队列、凡本会话且 ≤ remaining 就弹出。复算件 [(s,12),(s,10)] 上 settle_file(s,10) ⇒ freed=10 而队头 12 仍在 ⇒ 为仍在传输缓冲里的字节退还预算，与 FS:721-722/827-828 自称的『整条 FIFO』矛盾。修法：遇本会话第一条不匹配即停。"
+    },
+    {
+      "id": "R3-W-5",
+      "severity": "WARN",
+      "location": ".evidence/review-gateway-file-r2/summary.json:disposition_by_implementer.items; crates/nexus-web-gateway/MODULE.md:153-158",
+      "summary": "r2 W-11（预算只覆盖 read_page，G16『每条出站文件类消息过账』结构上不成立）在实现方的 16 条处置里整条缺失，也未登记进 accepted_debt。读码确认原状未动：引擎内只有 read_page 过账（FS:1406），list 页/stat/mkdir/remove/rename/commit 回包/逐片 ack 都不过 charge_file；MO:153-158 把职责改写给尚不存在的 wire 层（设计立场可接受，且该条两个子项已修），但缺显式处置登记。"
+    },
+    {
+      "id": "R3-W-6",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/examples/gateway_file_contract.rs:3-8; MODULE.md:99; PRODUCT.md:3314",
+      "summary": "三处绝对话未与 open 项对齐：探针头仍称『每一个字段都取自可观测引擎行为』（对 capability-negotiation 的 7 条期望不成立，W-7 已 open 但这句话没改）；G12 仍把 files.enabled 缺省 false 写成 enforced 不变量而配置无此字段；PD:3314 仍把全局 RSS 列入『都有配额表』而 MO:161-163 说未验。"
+    },
+    {
+      "id": "R3-N-1",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:1690-1701, 1441",
+      "summary": "commit_upload_inner 的 require_writable/require_local_io 在 root 等值检查之后结构上不可拒（流的 root 必来自已过同两道门的 open_upload），故 r2 NEW-1 要求的 (b) 目前是纵深防御、无测试可区分其存在；真正的门是 (a) 的等值检查。"
+    },
+    {
+      "id": "R3-N-2",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:1690-1698; MODULE.md:119-121",
+      "summary": "root 绑定不符回 OUTSIDE_ROOT 是措辞上的错位（调用方给的是合法配置的根，原因不是路径越界），但它正是 G13 明文规定的码，且 PRODUCT §18 的码表未点名此情形 ⇒ 保持现状可，建议在 G13 补一句为什么复用该码。"
+    },
+    {
+      "id": "R3-N-3",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:1957-1974, 1898-1926",
+      "summary": "两处残余窗口未列进未证事项：(1) rename 文件路径 hard_link(src,dst) 与 remove_file(src) 之间，本地写者把 src 换成新 inode 时复制的是旧内容（单进程不可观测）；(2) remove_tree 在遇到符号链接之前删掉的兄弟项不回滚，SYMLINK_ESCAPE 拒绝是一次部分破坏（自 af953af 未变，非本批引入）。"
+    },
+    {
+      "id": "R3-N-4",
+      "severity": "NOTE",
+      "location": ".evidence/review-gateway-file-r2/summary.json:accepted_debt_from_notes",
+      "summary": "r2 N-4（探针 emit 但场景未冻的字段，回归不红）既未修也未登记：欠账清单只列 N-1/2/3/5/6/7/8（EV:299 亦写『7 条』），当前仍有 46 个 emit 字段未被任何场景冻结，含 read_page_overflow_code、settle_releases_budget_and_inflight、final_terminal_send_ok、pending_messages_after_final_send。"
+    },
+    {
+      "id": "R3-N-5",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:1132-1146, 605; PRODUCT.md:3312",
+      "summary": "两条未声明前提：max_browser_sessions 以 wire 层送来的 source 字符串为 key（若该值可被对端影响，单 peer 配额可换 source 拼散）；PD:3312 说节流按『（会话 + 源）两层键』而代码是（principal, source）。另：本轮按约束未代做 FILE_MANIFEST 对 .evidence/review-gateway-file-r3 的登记与计数更正（当前声明 194）。"
+    }
+  ],
+  "r2_disposition_verification": [
+    {
+      "id": "R2-NEW-1",
+      "verdict": "fixed",
+      "evidence": "UploadStream.root 在位（FS:570-577）并由 open_upload 写入（FS:1480）；commit 先比等值（FS:1683-1698，OUTSIDE_ROOT）再过 require_writable/require_local_io（FS:1700-1701）。拒绝在 discard_stream 与任何 IO 之前 ⇒ 不吃流（测试 FS:2909-2956、探针 PR:421-439、SC sftp:84-89 冻 commit_after_refusal_recovers=true）。跨会话流 id 不可达：所有动词语以 session(...).streams 定位（FS:1539-1543/1633-1636/1684-1687/1703-1706/1797-1801），号不复用。"
+    },
+    {
+      "id": "R2-NEW-2",
+      "verdict": "partly",
+      "evidence": "会话归属、挤占回冲、settle_file 只整条并报实际字节、release_session 于 close/sweep 两处、未知会话过账改 NOT_FOUND、r2 点名冻错的 FS:2572 已改为 inflight==0 —— 均在位且经推演正确。但 push_terminal 的 Err 分支丢弃 evicted 清单（FS:778-782 + FS:993-1001 的 ?）⇒ 该分支上 G16 自证不变量永久背离，即 R2-NEW-2 本体在新失败路径上复现（R3-NEW-1，FAIL）。brief 指定的其它泄漏点（流 abort、audit 轮转、settle_file 过量）静态核验均不泄漏。"
+    },
+    {
+      "id": "R2-NEW-3",
+      "verdict": "partly",
+      "evidence": "fail-closed 升级 + 可观测 + locked 有界都在位（FS:645-657/663-675/695-702），可用性取舍确实写进 MO:140-144，探针顺序调整公开登记（PR:552-554、EV:274-277）——这三点判合格。但 is_locked 对已在册主体豁免全局窗口（FS:654）+ locked 到期项永不回收（FS:673-675/706-710）⇒ 灌满 locked 后已在册主体永久锁不住，5120 次（默认）/24 次（本仓夹具）即可达，仍是『填满之后正确令牌照样通过』（R3-NEW-2，FAIL）。"
+    },
+    {
+      "id": "R2-NEW-4",
+      "verdict": "fixed",
+      "evidence": "authenticate 的两道准入检查都在 insert 之前（FS:1122-1146 vs FS:1147-1160），码为 CAPACITY_UNAVAILABLE；容量由 close_session 的 remove（FS:1170）与 sweep_idle（FS:1197）归还，复用性有断言（FS:3066-3069）；FileSession 自记 source（FS:605），close_session 不再收调用方 source（FS:1165-1169），顺带清偿 r2 N-8 的前半；逐动词核过无第二处接受调用方身份（principal 一律由 record 从会话解析，FS:2020-2038）。"
+    },
+    {
+      "id": "R2-NEW-5",
+      "verdict": "disputed",
+      "evidence": "判实现方胜（数值），形态改进采纳，该项结案。r2 的 squeezed_here=0 推算是错的：每轮 send_terminal(4) 之后立即 settle_terminal(4)，首轮挤掉一条 8 字节页后 buffered 回到 120，FS:774 的守卫 120+4≤128 使后续 99 轮不再挤占 ⇒ 旧布局整循环只挤 1 条、末次整预算发送挤 15 条。std-only 复算件跑旧布局得 queued=16, loop_evicted=1, delivered=100, failed=0, squeezed_here=15, pending=0 ⇒ 旧断言为 true，EV:205-206 与 r2 所评代码自洽，r2 由此推论『9/9=77 与本树不自洽』属误报。新夹具（PR:670-698：全新引擎灌满→一次整预算发送→squeezed==queued 且 pending==0，另冻 SC quota:66 messages_queued_before_final_send=16）复算件跑出 16/1/16/true/0 ⇒ 不再依赖读者自行推演。"
+    },
+    {
+      "id": "R2-W-1",
+      "verdict": "fixed",
+      "evidence": "derive 回到 FS:875，新测试 FS:3074-3091 用 clone/==/{:?}，缺 derive 即编译失败（防复发为真闸门）。"
+    },
+    {
+      "id": "R2-W-2",
+      "verdict": "fixed",
+      "evidence": "list 只用 next.path().symlink_metadata()（FS:1279-1294），is_dir/size 取自链接本身、链接项 size=0；全文件已无 next.metadata()；悬空链接不再整页 NOT_FOUND，root 外目录不再作 oracle；注释与代码一致。首轮编译曾漏绑定已如实登记（EV:278-279）。"
+    },
+    {
+      "id": "R2-W-3",
+      "verdict": "fixed",
+      "evidence": "文件走 hard_link+unlink 且 unlink 失败回滚新名（FS:1956-1974），AlreadyExists→OUTPUT_EXISTS；目录分支显式声明（FS:1976-1980 + MO:119-122 + PD:3340-3342）。测试 FS:3094-3125 断两侧字节与目录那一半，有杀伤力。残余：hard_link→remove_file 之间的窗口（R3-N-3）。"
+    },
+    {
+      "id": "R2-W-4",
+      "verdict": "fixed",
+      "evidence": "max_bytes==0 显式 PAGE_TOO_LARGE（FS:1336-1346）+ 测试 FS:3211-3228 + 探针 PR:738-748 + SC quota:70 冻 true。"
+    },
+    {
+      "id": "R2-W-5",
+      "verdict": "partly",
+      "evidence": "abort_upload/close_session/ack_staged 拒绝都落了行，discard_stream 不记账避免了 commit 拒绝双记（FS:1666-1668/1786-1792/1796-1809/1178/1641，逐 return 点数过）——这一半判 fixed。未清偿另一半：stage_chunk/ack_staged 的行 root 仍为空（FS:1513/1641）而流已记着 root（FS:577）；close_session(未知 id) 零行（FS:1169-1179）使 MO:185『结构上不可发生』不严格成立；客户端 ack（settle_file）释放预算完全不记账。"
+    },
+    {
+      "id": "R2-W-6",
+      "verdict": "partly",
+      "evidence": "与实现方自评一致：refuses_link 必 SYMLINK_ESCAPE（PR:920-928，删 resolve 链接检查后 list 那条必红）、locked_after_attempts 改为观测且复算=6 与冻结值一致（PR:475-496）；post_open_reverify_used 三码混收未改并如实登记为 remaining（PR:314-319）。"
+    },
+    {
+      "id": "R2-W-7",
+      "verdict": "not-fixed",
+      "evidence": "声明 open 且准确，不是躲：decide_channel 仍在探针里（PR:896-918），CF 确无 files 字段，MO:99 仍写 files.enabled 缺省 false。附带一句未同步：PR:3-8 的『每个字段都取自可观测引擎行为』（R3-W-6）。"
+    },
+    {
+      "id": "R2-W-8",
+      "verdict": "partly",
+      "evidence": "5 条新覆盖里 4 条有杀伤力；handles<sessions 那条 case 先在 chunk>inflight 短路，删掉 FS:222-227 仍红 ⇒ 该规则零杀伤力（推演见 R3-NEW-3）。反向边界断言（FS:3197-3208）有效。"
+    },
+    {
+      "id": "R2-W-9",
+      "verdict": "fixed",
+      "evidence": "与 git show af953af 对质：旧 live() 确按引用计数求和、同路径第二次 acquire 报 2，与自身文档矛盾（实现方主张成立）；新产品路径唯一调用点是 read_page 的配对 acquire/release（FS:1354/1404），无第三方依赖旧语义 ⇒ HashSet 去重无回归（FS:520-561）。上限分支另有直测 FS:3127-3142；FS:2703 的恒真断言与 G16 的诚实边界（MO:161-163）都在。"
+    },
+    {
+      "id": "R2-W-10",
+      "verdict": "fixed",
+      "evidence": "PD:3280-3284 改『已连续暂存』并写明耐久性只在 commit 前一次 sync_all 之后成立；临时物名与实际生成规则逐字对得上（PD:3283 vs FS:2117-2142）；PD:3335-3341 的场景状态口径改写并声明不构成 E5 验收。"
+    },
+    {
+      "id": "R2-W-11",
+      "verdict": "not-fixed",
+      "evidence": "处置清单整条缺失（16 items 无 W-11，accepted_debt 也无），代码原状（只有 read_page 过账，FS:1406）。两个子项（未知会话过账、释放路径）随 NEW-2 修掉了，主体未动。"
+    },
+    {
+      "id": "R2-W-12",
+      "verdict": "not-fixed",
+      "evidence": "声明 open 且准确：测试仍直接测 std::fs::OpenOptions::create_new（FS:3231-3255），不经 open_upload；改 FS:1471 为 create(true) 不红；仍在非 unix 早退（FS:3236-3241）。给出的理由（nonce 不可注入 ⇒ 预置不了确切 .part 名，FS:2117-2127）读码成立，判诚实欠账而非谎报。"
+    }
+  ],
+  "r1_fail_recheck": "F4/F3/F5(代码侧)/G21 记账模式本批未被改坏：resolve 仍逐段 symlink_metadata 且缺失段继续（FS:369-410）、无未校验 join；SFTP 门仍在（FS:442-471）；create_new(true) 在位（FS:1471）；包装层仍在 *_inner 之外唯一 record。未发现新引入的回归。",
+  "blocking_issues_remaining": [
+    "R3-NEW-1：终端发送被拒时丢弃 evicted 清单，inflight_bytes 与 budget.file_buffered_for 永久背离（r2 NEW-2 残留路径，无测试覆盖）。",
+    "R3-NEW-2：locked 到期项永不回收 + 全局窗口豁免已在册主体 ⇒ locked 灌满后这批 principal 永久锁不住（r2 NEW-3 残留路径）。",
+    "R2-W-11 无任何处置登记（既未修也未列为欠账）。",
+    "R3-NEW-3：G12『逐条都有单测把它跑红』、G21『单测逐个动词断言』两句在当前测试下为假。",
+    "R3-W-3：EV 自报期望总数 80 与同一份文件的表格/仓内 [[expect]] 计数 86 不自洽（静态可复核）。",
+    "小账合并处理：R3-W-1、R3-W-2、R3-W-4、W-5 的 root 半边、N-4 的欠账登记、R3-W-6 的三处绝对话。"
+  ],
+  "non_blocking_suggestions": [
+    "把『失败终端发送的回冲』『locked 满后再犯』两条各写成一条单测 + 一个探针字段并冻进场景；不要再让 ssh_messages_dropped==0 充当覆盖。",
+    "is_locked 顺带回收 locked 的到期项（或只存未过期项），并把 locked 满的处理改为驱逐后写真锁定。",
+    "charge_file 把 checked_add 提到 push_file 之前；settle_file 遇同会话第一条不匹配即停。",
+    "every_validate_rule_has_a_red_test 的 handles case 把 chunk_bytes 压到 ≤ max_inflight，使每条规则各自为红。",
+    "abort_upload/ack_staged/idle_recycle 的行纳入 audited! 宏，并把行里的 root 从流取（FS:577 已有）。",
+    "自报期望条数一律由 grep -c '^[[expect]]' 生成；探针头的总述为 capability-negotiation 写例外。",
+    "提交合并时按本批新惯例 git add -f .evidence/review-gateway-file-r3 两份案卷并更正 FILE_MANIFEST 计数。"
+  ],
+  "not_machine_verifiable_review_verified_only": [
+    "constant_time_eq 的不提前返回性质，以及『认证路径真的用它』（FS:1095 换成 == 全库仍绿）——只能目视。",
+    "残余 TOCTOU：resolve 与 create_new/hard_link 之间父目录被换链；reverify/reverify_parent/reverify_ancestor 在单线程测试里与 resolve 的前置检查不可区分；rename 的 hard_link→remove_file 窗口。",
+    "Windows 全平台面：\\\\?\\ 前缀与大小写比较、目录符号链接特权、CREATE_NEW 对 reparse point、hard_link 在 FAT/exFAT 失败（会使 W-3 的文件原子路径退化为 CAPACITY，而 PD 的 B 级口径以此为前提）、FS:3236-3241 的 skip。本宿主不可编译，未执行。",
+    "SCTP 真实语义：bufferedAmount 与 set_sctp_max_buffered_amount 的对称性、『消息不可部分发送』这一整个 settle/drain 模型的前提、终端类零丢失在真实 pty 路径（send_terminal 全仓无 wire 调用点）。",
+    "LIST_ACK_ENVELOPE_BYTES=72 / ENTRY_ACK_OVERHEAD_BYTES=52 描述的是尚不存在的 M2 编码；validate 的 ack 下限与 list 的字节截断都建立在它上面。",
+    "耐久性：sync_all 真在发布前落盘需崩溃/掉电实验；逐片 flush 是空操作属 std 事实。",
+    "全局 RSS 上界（PD:3314 仍列入配额表）：std 下无计量、无实现。",
+    "panic-free-by-construction：目视过全部非测试算术点，未发现外部可控输入可达的 panic；但 file_buffered 的 .sum() 与 limit-buffered 依赖 buffered≤limit 不变量，在 R3-W-1 的泄漏路径下该不变量可被破坏（可信输入面）。fuzz 未执行。",
+    "实现方全部实测数字（53 单测 / clippy / 9/9 场景 80 条 / verify --fast / contract_hash 8f510129…）本评审未复现；其中 --lib 条数与 [[test]] 计数静态相符，期望条数与仓内计数不符（R3-W-3）。"
+  ],
+  "report_file": ".evidence/review-gateway-file-r3/findings.md",
+  "bindings": {
+    "source_revision": "af953af8849c5549f78f77add4ef5441faba4267",
+    "note": "最近一个已提交祖先；被复评内容是其上未提交的工作树（10 个改动文件）。评审在无编译能力的 Windows 宿主做静态阅读，另用过一份临时 std-only 复算件（已删除）。",
+    "reviewed_content_per_implementer": {
+      "verification_host": "xc-pc-linux (appen@10.144.144.4)",
+      "content_tree": "2da0dae385cdb25f94737ed212f3d41ac9196ebd",
+      "contract_hash": "8f510129cd7d9bef054d2324a4517fc534ab9806",
+      "toolchain": "rustc/cargo 1.98.1, git 2.25.1, x86_64-unknown-linux-gnu",
+      "reproduced_here": false
+    }
+  },
+  "disposition_by_implementer": {
+    "date": "2026-10-12",
+    "author": "implementer（同一 agent 会话，非评审结论）",
+    "verified_on": "xc-pc-linux (appen@10.144.144.4)，被验内容树 e32967d3955b0fe10df51896e3821d5b1ad258b8（验证远端上的 stash 式临时提交，工作树内容与即将落地的提交逐字节相同）",
+    "measurements": "cargo test -p nexus-web-gateway --lib = 55 passed; 0 failed / cargo clippy -p nexus-web-gateway --all-targets = 零诊断（verify --fast 的 clippy 门一度 FAIL 于 let_unit_value，见下）/ 9 条 E4 场景全 PASS = 86 条期望 / nexus-harness verify --fast = 9 门全 PASS / contract_hash = 8f510129cd7d9bef054d2324a4517fc534ab9806",
+    "items": [
+      {
+        "id": "R3-NEW-1",
+        "action": "fixed",
+        "how": "push_terminal 的返回改为 (Vec<(u64,usize)>, FileResult<()>)：挤占清单在所有分支都交回，引擎先回冲各会话额度再看结果；另加前置判定——单条终端消息大于整个预算时一条文件消息都不挤（旧写法会白赔）",
+        "evidence": "单测 failed_terminal_send_still_hands_back_the_evicted_list（预算 100：terminal 80 + file 15，再发 30 必硬失败且清单为 [(1,15)]、file_buffered_for(1)=0；引擎侧 128 预算下同序列断言 inflight_bytes 归零且 inflight_matches_budget 成立）",
+        "agreement": "评审说得对，且这条是我上一片自己引入的：把清单塞进 Result 的 Ok 分支，等于在 Err 分支把它丢了。评审用 std-only 复算件复现（弹 8 条、inflight 64 而 budget 0），我没有异议。"
+      },
+      {
+        "id": "R3-NEW-2",
+        "action": "fixed",
+        "how": "三处一起改：(1) is_locked 的全局窗口对所有主体生效，去掉『不在 buckets 里』的豁免——被豁免的正是把表填满那批人；(2) record_failure 开头做 decay(now)，到期锁项回收，锁表不再被死锁占满，达到阈值的在册主体能重新上锁；(3) 全局窗口过期时把 global 溢出计数一并清零，杜绝『一次洪水之后每窗口一条伪造失败无限续期』（R3-W-2）",
+        "evidence": "新增 FileLimits.lockout_window（默认 60 s，可注入才能测到期）+ 单测 lockout_rearms_after_expiry_and_flood_arms_are_not_exempt：同一 principal 锁定→过期→再失败必须重新锁住；洪水后在册主体拿正确口令仍 THROTTLED；窗口自行过期后迟到用户可进来"
+      },
+      {
+        "id": "R3-NEW-3",
+        "action": "fixed",
+        "how": "(a) every_validate_rule_has_a_red_test 改为 8 条规则逐条断言**错误消息里的规则名**，夹具必须只违反自己那一条——旧的 handles<sessions 夹具先在 chunk>inflight 短路，删掉句柄规则也会红，等于没测；(b) G21 的『逐个动词断言』补上 abort_upload、ack_staged 拒绝、idle_recycle 三行",
+        "note": "abort_upload 返回单元值，用原来的 audited! 宏会触发 clippy let_unit_value（verify --fast 的 clippy 门因此 FAIL 一次），改为等价的显式断言"
+      },
+      {
+        "id": "R3-W-1",
+        "action": "fixed",
+        "how": "charge_file 中过账之后的每一条早退都回滚：checked_add 的 OVERFLOW 分支不再用 `?` 直连，改为 unpush_file 后再返回；CAPACITY 分支保持回滚",
+        "evidence": "单测断言每次拒绝之后 inflight_matches_budget 仍成立"
+      },
+      {
+        "id": "R3-W-4",
+        "action": "fixed",
+        "how": "settle_file 只看队头：队头不是本会话或大于 remaining 就停，不再扫全队列（旧实现在 [(s,12),(s,10)] 上 settle(s,10) 会退 10，等于给还在缓冲里的字节提前退额度）",
+        "evidence": "单测 terminal_class_has_priority_over_file_class 断言跨会话不得插队、部分 settle 退 0、连续整条可退 40"
+      },
+      {
+        "id": "R2-W-11",
+        "action": "partly-fixed-and-declared",
+        "how": "接受『上一片整条缺失处置』的批评。本片把引擎**算得出长度**的动词都接上过账：read_page 的页字节（已有）与 list 的 ack_bytes（截断逻辑本来就累计了这个数，按它过账，不编数字）；算不出长度的回包（逐片 ack、stat/mkdir/remove/rename/commit）明确写成 wire 层在 M2 逐动词的义务，G16 与 PRODUCT §18.4 都改成这个口径，不再声称引擎已覆盖全部"
+      },
+      {
+        "id": "R3-W-3",
+        "action": "fixed",
+        "how": "EV 自报的期望总数改正：第四片实测是 86 条（表格逐项相加与九份场景文件的 [[expect]] 计数一致），我上一段写的 80 与自己写的表格都不自洽；『上一片 73』也错了一层，正确是 77。同时本片表格重列：auth-throttle 9、quota-backpressure 16、sftp-boundary 15"
+      },
+      {
+        "id": "R3-W-6",
+        "action": "fixed",
+        "how": "探针头注释加显式例外段：capability-negotiation 判定的是探针自实现的 decide_channel 模型，产品侧无对应代码，跑绿不等于网关会做能力协商；MODULE G12 把 `files.enabled 缺省 false` 标注为**契约声明**（config.rs 尚无 files 字段，当前是靠没有入口可开，不是配置校验 enforced）；PRODUCT §18.4 同步写清这一点，并把『会话 + 源』改为『主体 + 源』"
+      },
+      {
+        "id": "R3-N-2",
+        "action": "documented",
+        "how": "G13 补一句为什么 root 绑定不符复用 OUTSIDE_ROOT：授权面只有 root 一个，换 root 提交是越出流被授权的那棵树，不是容量或完整性问题；不扩码表"
+      },
+      {
+        "id": "R3-N-3",
+        "action": "documented",
+        "how": "G13 与 PRODUCT §18.4 登记两处残余窗口：hard_link(src,dst)→remove_file(src) 之间源被换新 inode 时复制旧内容；remove_tree 遇链接即拒但先前删掉的兄弟项不回滚（部分删除状态）"
+      },
+      {
+        "id": "R3-N-5",
+        "action": "documented",
+        "how": "G16 写明 per-peer 配额以 source 为键的**前提**：source 必须是 wire 层给出的不可被对端影响的 transport address，否则配额可被换字符串打散；M2 接线时必须核"
+      },
+      {
+        "id": "R3-N-8",
+        "action": "fixed",
+        "how": "SendBudget.terminal_delivered 改名 terminal_accepted 并注明它是预算接受数而非实际送达数；close_session 不再接受调用方传入的 source（上一片已改，本片把 FileSession.source 的用途写进文档）"
+      },
+      {
+        "id": "R3-N-1",
+        "action": "accepted-as-defense",
+        "how": "同意：commit 路径的 require_writable/require_local_io 在 root 等值检查之后结构上不可再拒，属纵深防御而非可测门；保留代码但在 G13 里不把它说成第二道可验证的闸"
+      },
+      {
+        "id": "R3-N-4",
+        "action": "registered-as-debt",
+        "how": "确认成立：探针 emit 的字段里仍有大量未被任何场景冻结（回归不红）。登记为欠账，与 W-7/W-12 一起在 M2 场景加严批处理；不在本片假装已覆盖"
+      }
+    ],
+    "open_debt_after_this_batch": [
+      "W-7 / R3-W-6：files 配置块接进 GatewayConfig::validate 与运行时 kill-switch；capability-negotiation 与产品代码零耦合",
+      "W-12：.part 预置符号链接的测试不经引擎（nonce 不可注入），create_new→create 的变异杀不掉",
+      "R3-N-4：探针 emit 但未冻结的字段（回归不会红）",
+      "资源核算：/proc/self/fd 与 RSS 的 OS 层面实测；全局 RSS 上界在 std 下无计量",
+      "fuzz 目标登记（含 str0m 输入面）",
+      "错误码词表统一，以及 root 绑定不符复用 OUTSIDE_ROOT 的码表说明是否需要在 PRODUCT §18 落字",
+      "与 N3-4/N3-9 的双向一致性测试",
+      "G1 门禁绑定修复在另一条分支（fix/hook-review-evidence-binding 689f63a），尚未合入 master 与本分支"
+    ]
+  }
+}

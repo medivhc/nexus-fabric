@@ -159,3 +159,289 @@ F4 Windows `MetadataExt::file_attributes()` 其实稳定可用（评审方探针
 §18.3 的 B 级理由目前只站在 `(dev,ino)` 不可得这一层）、F5/F6 预算不等式只算文件面
 （`max_terminals` 无上界、`sctp_send_budget_bytes` 属 per-association）、
 以及 V2 里约 40 处指向未合入 V1 工作树的行号引用。这些属设计文档，另批处理。
+
+================================================================================
+追加：M1 第三片（评审 r1 的六条 FAIL 修复），宿主 xc-pc-linux（appen@10.144.144.4）
+================================================================================
+# 被审/被验内容树：stash 式临时提交 84dafb52555160c9641b62034149c5266d196384
+#   （`git stash create` 造树后 `git push -f ssh://…/m0-origin.git $sha:refs/heads/m0-verify`，
+#    Linux 侧 `git fetch && git reset --hard FETCH_HEAD`；工作区保持未提交，
+#    先跑红/跑绿再提交——这条通道已写进用户记忆）
+# bindings（Linux `nexus-harness status --json` 实测，非本地复算）:
+#   contract_hash = c53412186e7306333563b60a5262b5a73697e94c
+#   working_tree_digest = 93c75c85191736a72b4a3442f12914f71d283564, dirty_state=false
+# 工具链：rustc/cargo 1.98.1，git 2.25.1，target x86_64-unknown-linux-gnu
+
+实测结果：
+```
+cargo test -p nexus-web-gateway --lib            -> 44 passed; 0 failed（本片新增 7 条）
+cargo clippy -p nexus-web-gateway --all-targets  -> 无输出
+nexus-harness verify --fast                      -> 9 门全 PASS，evidence dir verify-c6fbaeac54b0
+E4 场景 9/9 PASS = 77 条 expectation 成立（上一片是 73 条，本片加严 4 条）
+  list-pagination              6   download-page           10
+  upload-resume                9   upload-no-replace        5
+  sandbox-symlink              9   auth-throttle            7
+  quota-backpressure          11←8 sftp-boundary           13←12
+  capability-negotiation       7
+```
+
+逐条修复的可证伪证据（不是"我改了"，而是"改坏必红"）：
+- F4 截断：`resolve_does_not_truncate_missing_multi_segment_paths` 断言
+  `resolve("a/b/c") == root/a/b/c`（旧实现返回 `root/a` ⇒ 红）；
+  `upload_into_a_missing_intermediate_directory_fails_loudly` 断言
+  `open_upload("a/b/c.bin")` 在 `a` 缺失时 `NOT_FOUND`、`a/` 目录根本没被创建、
+  且无任何 `.` 开头残留，随后 `mkdir a/b` 成功 + 同路径上传发布到 `a/b/c.bin`。
+  **这条修复自己也曾把 `mkdir` 弄红**（`reverify_parent` 要求父目录已存在），
+  第一次 Linux 跑就红在该处 ⇒ 新增 `reverify_ancestor`，mkdir 建整条链、
+  上传仍要求父存在。这条不对称写进了 G13。
+- F1 预算接线：`engine_read_page_is_charged_to_the_shared_budget` 用真实 `read_page`
+  灌满预算 ⇒ 第三页 `QUEUE_FULL`；`per_session_inflight_ceiling_is_enforced_by_the_engine`
+  在宽裕预算下单独把 per-session 上限跑红（`CAPACITY`）；`unpush_file` 回滚由
+  "拒后不得占额"断言覆盖。探针里 quota 案改为驱动引擎，实测
+  `read_page_charged_to_shared_budget=true`、`read_page_overflow_code=QUEUE_FULL`、
+  `settle_releases_budget_and_inflight=true`。
+- F2 按条记账：`terminal_class_has_priority_over_file_class` 断言 5 条被挤掉 ⇒
+  `file_drops == 6`（旧实现恒为 2），并断言 `settle_file(4)` 对一条 10 字节消息
+  不产生"部分冲刷"。探针实测 `file_messages_squeezed_out=16`、
+  `final_send_squeezed_messages=15`、`squeeze_accounting_is_per_message=true`
+  （4 字节×100 的终端循环一次只挤 1 条，所以另加一次整预算终端发送才把队列清空——
+  第一次跑这里给的 2 就是"没挤干净"，已按实测改正而不是改期望）。
+- F3 常量回读：新增 `sftp_refusal_gate` 从**实际错误消息**判定是哪道门拒的，
+  实测 `G14_NO_NON_OVERWRITING_PUBLISH`，并冻进 `sftp-boundary` 期望。
+  翻转 `allows_mutation()` 会让它变成 `TRANSPORT_NOT_IMPLEMENTED` ⇒ 场景红。
+- F5 声明：`part_creation_refuses_a_preplanted_symlink` 锁住
+  `O_CREAT|O_EXCL` 遇已存在符号链接必失败这条 std 前提（父目录换链那一类
+  残余窗口在 `part_path` 文档、G13、PRODUCT §18.3 明示）。
+- G21 审计：七个动词拆成 `*_inner` + 记录包装层，
+  `every_verb_is_audited_including_refusals` 逐动作断言"恰好一行 + action 对 +
+  码对 + principal 非空"，并灌 8242 次拒绝验证环有界且 `audit_dropped>=50`。
+  逐片上传成功刻意不记（同测试断言"不增长"）。
+- validate：`×64` 魔数换成 `inflight <= buffered`（默认 1 MiB→128 KiB）；
+  新增 `max_ack_bytes >= 信封+一个条目` 下限（72+52，取自探针实际 JSON 形状，
+  M2 换真编码后必须重测）；`list` 的截断同时受序列化字节约束，并修掉
+  "目录恰好等于 cap 条时谎报 truncated"。
+- rehash 预算：`rehash_budget_covers_replay_not_digest_publishing` 断言
+  48 字节（>16 预算）顺序上传仍能带 `expected_sha256` 发布，而重放第 3 次回读
+  被 `CAPACITY` 拒。旧行为下第一件事会返回 `CAPACITY_UNAVAILABLE`（能力悬崖）。
+- config：`oversized_max_terminals_rejected` 断言上界 64 与"上界本身可用"。
+
+一处自我描述纠正（公开，不静默改）：探针头注释写 "eight cases"，dispatch 表实际
+9 条；MODULE.md G14 里"当时 12 条单测全绿"是历史事实但读起来像当前值，已改成
+"计数以本文件为准，本文不再自我报告数量"。FILE_MANIFEST.md 的声明数在上一片
+就漂了 13 行（加了 13 行表格没改头部的 177），本片按 `awk` 实测校准。
+
+仍未清偿（下一批）：见本片评审 r2 案卷与文末清单。
+
+================================================================================
+追加：M1 第四片（评审 r2 的 5 条 FAIL 处置），宿主 xc-pc-linux
+================================================================================
+# 被验内容树：验证机上的 stash 提交序列 98cdd48 → 80c3329 → 40a1adf → b02a83d →
+#   1456c68 → acc1050 → 2da0dae（每轮修复都重新 push -f 再跑，全程工作树未提交）
+# bindings（Linux `nexus-harness status` 实测）:
+#   contract_hash = 8f510129cd7d9bef054d2324a4517fc534ab9806
+# 工具链：rustc/cargo 1.98.1，git 2.25.1，x86_64-unknown-linux-gnu
+
+实测结果：
+```
+cargo test -p nexus-web-gateway --lib            -> 53 passed; 0 failed（本片新增 9 条）
+cargo clippy -p nexus-web-gateway --all-targets  -> 零诊断
+nexus-harness verify --fast                      -> 9 门全 PASS
+E4 场景 9/9 PASS = 86 条 expectation（上一片 77，本片加严 9）
+  list-pagination              6   download-page           10
+  upload-resume                9   upload-no-replace        5
+  sandbox-symlink              9   auth-throttle            9←7
+  quota-backpressure          16←11 capability-negotiation  7
+  sftp-boundary               15←13
+关键实测值（不是推算）：
+  messages_queued_before_final_send = 16
+  file_messages_squeezed_out        = 16
+  inflight_released_on_squeeze      = true
+  teardown_releases_budget          = true
+  session_admission_capped          = true
+  zero_byte_page_refused            = true
+  throttle_full_fail_closed         = true
+  product_engine_fails_closed_when_flooded = true
+  commit_root_redirect_code         = OUTSIDE_ROOT
+  commit_after_refusal_recovers     = true
+```
+
+红过之后再改对的四条（如实登记，不写成一次通过）：
+1) `cargo test` 首轮红 2 条：`HandleRegistry::live()` 按引用计数求和，与自身文档
+   "N 个分片只占一个句柄"矛盾 ⇒ 改为按 (会话, 路径) 去重；`SendBudget` 单测里
+   先 push_file(2,20) 再断言，被预算满拒 ⇒ 顺序改为先 settle_terminal。
+2) clippy 首轮红 2 类：列表项续行缺缩进（doc_lazy_continuation，`- ` 之后的段落
+   要空行）；探针里 `.map(|p| p)` 是 identity map。
+3) 场景 auth-throttle 首轮 FAIL("THROTTLED: locked out")：这是 **NEW-3 的修复
+   自己造成的合法红**——表满改 fail-closed 后，探针在"淹没 2048 个 principal"之后
+   再开新会话的那一步必然被拒。改法是调整探针顺序并注释写明顺序有意，而不是把
+   fail-closed 改回 fail-open。
+4) 首轮编译红 3 处：W-2 改动漏了 `let link = next.path().symlink_metadata()` 绑定
+   （`link` 撞到内置属性名）；`HashSet` 未导入。
+
+与评审的一处不同意见（保留双方，不做静默取舍）：
+r2 的 NEW-5 静态推算 `squeezed_here = 0`，据此判"场景应为红、自报数字不自洽"。
+主机实跑该表达式为 15 且 11 条期望 PASS。分歧点在 100 条 4 字节终端消息的循环里
+到底挤掉几条：每条 `send_terminal(4)` 之后立刻 `settle_terminal(4)`，第一次挤掉
+一条 8 字节页后 `buffered = 120`，`120 + 4 = 124 <= 128` 便不再挤，所以整个循环
+只挤 1 条。数值上不接受评审结论，但**接受其对证据形态的批评**：把 F2 的判据挂在
+一段与挤占次序耦合的循环之后，静态读法能得出两种值，这种证据本身不合格。已改为
+独立夹具（全新引擎灌满 16 条 → 一次整预算终端发送 → 被挤条数必须恰好等于灌入
+条数），并把 `messages_queued_before_final_send = 16` 冻进场景，让这条不再依赖
+读者自行推演。
+
+本批自己造成并已被评审查出的缺陷（公开登记）：`#[derive(Debug, Clone, PartialEq,
+Eq)]` 被一次误删换行并进 `///` 注释，四个 derive 静默消失且照样编译——这是"改完
+没有通读"的后果，新增 `audit_records_are_snapshottable` 断言 clone/==/{:?} 防复发。
+
+仍未清偿（登记进 r2 案卷 disposition 的 open 项）：W-7 capability-negotiation 仍是
+探针自证（GatewayConfig 尚无 files 字段，属"配置接线"欠账）、W-12 .part 符号链接
+测试不经引擎（nonce 不可注入）、OS 句柄与 RSS 的资源核算测试、fuzz 目标登记、
+错误码词表统一、与 N3-4/N3-9 的双向一致性测试、NOTE 清单 N-1..N-8 中的 7 条。
+合入门禁：本分支的 pre-commit 第 4 关只认最新 review 目录的 verdict，所以第四片
+必须等 r3 给出 APPROVED/COMMENTED 才能提交；不用 --no-verify 绕过。
+
+================================================================================
+追加：M1 第五片（评审 r3 的 2 条 FAIL 与 7 条 WARN 处置），宿主 xc-pc-linux
+================================================================================
+# 被验内容树：98cdd48 系列之后 → 65221de → 1440554 → e32967d3955b0fe10df51896e3821d5b1ad258b8
+# bindings：contract_hash = 8f510129cd7d9bef054d2324a4517fc534ab9806
+#   一个待核事实：c5341218→8f510129 与 scenarios/ 三处期望加严同步；此后我对
+#   PRODUCT.md/MODULE.md 的多处编辑**没有**改变该数值，两次 status 同为 8f510129
+#   ⇒ 契约哈希覆盖的文件集实际不含这两份文档（与 harness.toml 的 contract_first
+#   口径是否一致待核）。登记观察，不据此改任何契约声明。
+
+实测结果（e32967d 树）：
+```
+cargo test -p nexus-web-gateway --lib            -> 55 passed; 0 failed（本片新增 2 条）
+cargo clippy -p nexus-web-gateway --all-targets  -> 零诊断
+nexus-harness verify --fast                      -> 9 门全 PASS
+E4 场景 9/9 PASS = 86 条 expectation（本批未再加严期望）
+```
+
+一处必须登记的**期望总数自述错误**（评审 r3 W-3 抓出）：我在第四片把总数写成
+"80 条（上一片 73，本片加严 7）"，而同一份文件里我自己列的表格逐项相加是 86，
+"上一片 73"也错了一层（上一片自报 77）。正确：本批 86 = 6+10+9+5+9+9+16+7+15，
+相对 77 加严 9（auth-throttle 7→9、quota-backpressure 11→16、sftp-boundary 13→15）。
+这条是静态可复核的算术错误，与宿主无关，已就地改正而不是覆盖历史。
+
+r3 两条 FAIL 都是**我上一片自己引入**的，评审说得对：
+1) `push_terminal` 把挤占清单塞进 `Ok(Vec)`，于是 `Err` 分支把清单丢了——而挤占
+   已经发生并计入 `file_drops` ⇒ 那些会话的 `inflight_bytes` 永久悬空，G16 我自己
+   写的不变量反向背离且没有释放 API。改为返回 `(evicted, result)` 二元组，引擎先
+   回冲再看结果；并加前置判定：单条终端消息大于整个预算时一条文件消息都不该挤。
+   评审用 std-only 复算件复现（弹 8 条、inflight 64 而 budget 0）。
+2) 节流仍有永久绕开锁定点：全局窗口额外要求"该主体不在 buckets 里"，于是**把表
+   填满的那批 principal 恰好被豁免**；`locked` 到期项从不回收 ⇒ 灌满后
+   `record_failure` 只能设全局窗口，叠加上面的豁免就是这批 principal 永久锁不住，
+   而 `authenticate` 会一边返回 THROTTLED 一边让正确口令成功。修复是三件事：
+   窗口对所有主体生效、`record_failure` 开头 `decay(now)` 回收到期锁、窗口过期时
+   溢出计数一并清零（否则一次洪水之后每窗口一条伪造失败就无限续期，r3 W-2）。
+   为此把 `lockout_window` 做成 `FileLimits` 字段（默认 60 s），到期路径才可测。
+
+其余处置：charge_file 的 OVERFLOW 早退未回滚预算（W-1）、settle_file 扫全队列可
+越过队头退额度（W-4）都已修；W-11 的处置**上一片整条缺失**这件事本身是流程缺陷，
+本片把引擎算得出长度的 `list` 也接上过账，并把算不出长度的回包明确写成 M2 的
+wire 层义务（不再声称引擎覆盖全部）；探针头的"每个字段都取自引擎可观测行为"为
+`capability-negotiation` 写了显式例外，G12 的 `files.enabled` 标注为契约声明而非
+已 enforced。
+
+新引入又当场改掉的一处：`audited!` 宏用在返回单元值的 `abort_upload` 上触发
+clippy `let_unit_value`，`verify --fast` 的 clippy 门 FAIL 一次；改为等价的显式断言。
+
+仍未清偿见 `.agents/green-evidence` 文末与 r3 案卷的 open_debt_after_this_batch。
+合入门禁：本分支第 4 关只认最新 review 目录的 verdict，r3 是 CHANGES_REQUESTED，
+所以第五片必须等 r4 给出 APPROVED/COMMENTED 才能提交。
+
+================================================================================
+追加：M1 第六片（评审 r4 的 1 条 FAIL 与 3 条「证据不实」处置），宿主 xc-pc-linux
+================================================================================
+# 被验内容树 20362c2459760ca58fee481f2ca72b73cd0117c1
+# contract_hash = 8f510129cd7d9bef054d2324a4517fc534ab9806（未变：本批未动 scenarios/）
+实测：cargo test --lib = 56 passed; 0 failed / clippy --all-targets = 零诊断 /
+     9 条 E4 场景全 PASS = 86 条期望 / verify --fast = 9 门全 PASS
+
+r4 只有 1 条 FAIL，但另外三条是**我的处置清单在说谎**，性质比代码缺陷更严重：
+1) R4-NEW-1：上一片加 `lockout_window` 时只改了构造路径、没改 `validate()` 的零值
+   检查。`Duration::ZERO` 会让每次锁定写入即过期，全局窗口又只在锁表满时升级 ⇒
+   每个错令牌都能走到常数时间比较（评审复算：比较次数 5/200 → 200/200）。
+   现在时长与两个 u64 上限一起进零值检查，4 个新夹具按错误消息关键词断言。
+2) R4-W-2：我在 r3 处置里写「单测断言每次拒绝之后 inflight_matches_budget 仍成立」，
+   而仓里根本没有这条断言——r4 复算证明删掉 `charge_file` 的 `unpush_file` 回滚，
+   原测试照样绿。现在在「拒绝之后、任何 settle 之前」断言 buffered==16 且不变量成立。
+3) R4-W-1：r3 那条 FAIL 的测试断言的主体（in-table-but-not-locked）**其实不在 buckets
+   里**，所以把旧豁免逻辑换回去也照样绿。改为断言已在册的 flood0（旧写法这里是
+   ACCEPTED），另补「窗口过期后一条伪造失败不得立刻重新武装」。
+4) R4-W-3：`list` 接上过账这件事当时零覆盖，删掉那行没人红 ⇒ 新增
+   list_pages_are_charged_to_the_shared_budget（第四页必须 QUEUE_FULL、被拒不返回、
+   settle 后可重读）。
+5) R4-W-4：G21 说「逐个动词断言恰好一行」，实测 12 个动词里 6 个的成功侧没人断言 ⇒
+   补 authenticate/open_upload/stat/remove/commit/close_session 六条 OK 侧断言。
+6) R4-W-7：PRODUCT §18.2 的「全局 RSS 有配额表」与 MODULE G16 的「RSS 未验」互相矛盾 ⇒
+   删掉前者，明说 RSS 既无配额也无计量。
+
+R4-W-6（`buckets` 不随时间衰减 ⇒ 占满表之后每窗口 5 条伪造失败即可无限续期全局窗口，
+合法主体约 94% 时间被拒）**没有顺手改**：加桶衰减等于放宽 fail-closed 的时长口径，
+是产品可用性决策。已按 AGENTS.md 的迭代上限升级给仓库所有者裁决，同时在 G15 与
+PRODUCT 里把这个口径写明白，不静默改变语义。
+
+写这批测试时我自己又犯过一次并当场改掉：误删相邻测试的 `#[test]` 头，以及写了一条
+自证算式断言（512-130+130-…）——那属于装饰断言，删掉。流程教训记进案卷：
+处置清单里每句「已被测试覆盖」都必须能指到具体断言行，否则不许写。
+
+评审迭代轮次：r1→r2→r3→r4→r5。AGENTS.md:1585 的上限是默认 3 轮、超过升级人工，
+所以第四片之后的每一轮都已向 owner 报备；r5 的任务是复核本批 6 条处置是否名副其实。
+
+================================================================================
+追加：M1 第六片（评审 r5 的 1 条 FAIL 与 5 条 WARN 处置），宿主 xc-pc-linux
+================================================================================
+# 被验内容树：98cdd48…→20362c2→f80591f→6cd71de→5dd8c66（每轮改完重推重跑）
+# contract_hash = 8f510129cd7d9bef054d2324a4517fc534ab9806（本批未动 scenarios/）
+实测（5dd8c66）：cargo test --lib = 57 passed; 0 failed / clippy --all-targets = 零诊断 /
+     9 条 E4 场景全 PASS = 86 条期望 / verify --fast = 9 门全 PASS
+
+r5 唯一那条 FAIL 是**我又一次写了没有杀伤力的判据**：过期后我喂的是 flood0，而它在
+buckets 里、走单桶分支，`global` 根本不参与判定 ⇒ 把 `Throttle::decay` 的归零整段删掉，
+57 条测试全绿。改成走溢出分支的 off-table 主体并断言 `throttle_overflow() == 1`
+（即确实从 0 重新攒起）之后，删掉 decay 立刻红。
+
+其余处置：时长加 24h 上界 + `Instant` 加法改 `checked_add`（溢出回退成 1 小时而非
+"立即过期"）；补 `max_ack_bytes ≤ max_inflight`（这条一加就暴露出
+`max_ack_bytes ≤ max_buffered` 已被蕴含 ⇒ 我把它从"独立可红"改成"被蕴含的纵深防御"
+并换掉夹具，不再假装它有独立覆盖）；长文件名塞不进 ack 预算时改为显式
+`PAGE_TOO_LARGE`，绝不再返回 `next_offset == offset` 的空页；"有界"改成**字节**有界
+（审计字段与节流键都裁长度并留 `[+NB]` 可见标记）；探针两个冻结字段补上"已在册主体"
+断言，杀伤力不再只由单测承担；`close_session` 关未知会话号补一行 NOT_FOUND。
+
+本批我自己写错并被当场抓出的三处（如实登记）：
+1) 400 字节的文件名在 Linux 上直接 ENAMETOOLONG（NAME_MAX=255），夹具改为 200 字节；
+2) 在**已饱和**的审计环上断言"行数 +21" / "行数 +1" 连红两次（8192 vs 8213、8192 vs
+   8193），因为环到容量就停——判据改成按尾部内容与截断标记断言，并在注释里写明
+   "饱和环不能断言行数增长"；
+3) `max_inflight_bytes_per_session: 16` 与新的 ack 下限冲突，探针 e3 夹具改为
+   `send_file_message` 累计到 128 再验 CAPACITY（原来靠 read_page 读不出那么多在途量）。
+
+第 3 条同时说明：这条新约束确实抓到了"配置能过校验但运行时无效"的真实形状。
+
+================================================================================
+追加：M1 第七片（评审 r6 = COMMENTED 的 1 WARN + 4 NOTE 处置），宿主 xc-pc-linux
+================================================================================
+# 被验内容树 e70233f9a8b670903033439c3457673f82bf1cd4
+实测：cargo test --lib = 58 passed; 0 failed / clippy --all-targets = 零诊断 /
+     9 条 E4 场景 = 86 条期望全 PASS / verify --fast = 9 门全 PASS /
+     contract_hash = 8f510129cd7d9bef054d2324a4517fc534ab9806（未动 scenarios/）
+
+r6 判 0 FAIL、可合入，并把 r5 的处置逐条按变异推演复核为"verified"（含 R5-NEW-1
+现在真的会红：删掉 decay 的 global 归零 ⇒ 两条断言同时红）。它的 1 WARN + 4 NOTE
+本批全部处置：stage_chunk/ack_staged 拒绝行补上真实 root；`lock_until` 全程
+checked_add 并返回 Option（时钟边界时不写持久锁但仍按锁定回话）；G12 那句
+"逐条都有单测"改成"除注明外逐条"并补构造期三条的测试；身份键碰撞写进 G15 并
+与 R4-W-6 一起升级 owner；`limit - buffered()` 改 saturating。
+
+两处自己的红：新测试因为 `FileEngine` 刻意不派生 Debug（挂着打开的 File 与令牌）
+而 `.unwrap_err()` 编不过 ⇒ 改 `.map(|_| ()).unwrap_err()`；`lock_until` 兜底那步
+本身是裸加法（r6 NOTE-2）且第一次写成 `match` 单模式被 clippy 判 `single_match`。
+
+评审链：r1(6F) → r2(5F) → r3(2F) → r4(1F) → r5(1F) → r6(0F, COMMENTED)。
+提交顺序按"先代码+契约、后案卷"走，pre-commit/commit-msg 手工跑、不用 --no-verify；
+本分支第 4 关仍是旧逻辑（只看最新 review 目录的 verdict），r6 的 COMMENTED 就是
+它认的那个证；provenance/scope 绑定的修复在 fix/hook-review-evidence-binding（689f63a）。

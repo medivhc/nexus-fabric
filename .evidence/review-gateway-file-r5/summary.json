@@ -1,0 +1,223 @@
+{
+  "schema_version": 1,
+  "review_id": "review-gateway-file-r5",
+  "review_round": 5,
+  "previous_review_id": "review-gateway-file-r4",
+  "verdict": "CHANGES_REQUESTED",
+  "reviewer": {
+    "agent": "independent code reviewer (not the implementer)",
+    "model": "Qoder 主模型（底层模型标识未对外披露，故此处按用户要求如实说明：无法在本环境确认具体模型名称）",
+    "host": "Windows x64 (win32) + Git Bash",
+    "could_not_compile": "本评审未编译该 crate：ssh2 0.9.6 的 userauth_pubkey_memory 受 cfg(any(unix, vendored-openssl, openssl-on-win32)) 门控，本机无 cl.exe/nasm；结论全部来自静态阅读与整数推算，未运行 std-only 探针",
+    "static_only": true
+  },
+  "source_revision": "af953af8849c5549f78f77add4ef5441faba4267",
+  "scope": [
+    "crates/nexus-web-gateway/src/file_service.rs",
+    "crates/nexus-web-gateway/examples/gateway_file_contract.rs",
+    "crates/nexus-web-gateway/MODULE.md (G12-G21)",
+    "crates/nexus-web-gateway/src/config.rs",
+    "PRODUCT.md §18.2/§18.4",
+    "scenarios/product/gateway_file_auth_throttle.toml",
+    "scenarios/product/gateway_file_quota_backpressure.toml",
+    "scenarios/product/gateway_file_sftp_boundary.toml",
+    "FILE_MANIFEST.md",
+    ".agents/green-evidence-gateway-file-service-m1.txt (last two sections)",
+    ".evidence/review-gateway-file-r4/summary.json:disposition_by_implementer"
+  ],
+  "bindings": {
+    "reviewed_content": {
+      "content_tree": "20362c2459760ca58fee481f2ca72b73cd0117c1",
+      "verification_host": "xc-pc-linux",
+      "toolchain": "rustc/cargo 1.98.1",
+      "contract_hash": "8f510129cd7d9bef054d2324a4517fc534ab9806",
+      "note": "被复评内容是其上未提交的工作树"
+    }
+  },
+  "counts": {
+    "fail": 1,
+    "warn": 4,
+    "note": 3,
+    "r4_items_audited": 9
+  },
+  "findings": [
+    {
+      "id": "R5-NEW-1",
+      "severity": "FAIL",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:679-688 (decay 的 global 归零在 681-685), 745-748, 704-715, 2786-2799; .agents/green-evidence-gateway-file-service-m1.txt 末节第 3 条; .evidence/review-gateway-file-r4/summary.json:disposition_by_implementer(R4-W-1)",
+      "summary": "处置声称的第二条判据没有杀伤力，且 decay 整体零覆盖。`Throttle::decay` 的『窗口到期时溢出计数归零』（FS:681-685）正是 r3 R3-W-2/r3 FAIL 的唯一缓解，而把它换成空函数后 56 条单测全绿：测试 `lockout_rearms_after_expiry_and_flood_arms_are_not_exempt` 在过期后喂的是 **flood0**，它已在 buckets 里（表内容 = {repeat, flood0..flood6} = 8），于是 record_failure 走 FS:712-715 的桶分支，`global += 1`（FS:708-711）在两个实现下都不执行 ⇒ FS:2796-2799 的 `!throttle_globally_locked()` 恒真；FS:2787 那条同样由 globally_locked 自己的 `until > now`（FS:745-748）满足，与 decay 无关。`locked.retain` 也无杀伤力（锁表最多 1 项，远未到 max_buckets=8，重新上锁走 FS:722-723）。要杀它必须用**不在册**主体：过期后连喂 lockout_after-1 条新 principal 的失败并断言未锁定（归零正确实现=1<2 未武装；缺陷实现=6>=2 立刻武装），再补一条断言其反向。这是 r4 W-1/W-2 同族『声称有覆盖而实际没覆盖』的第三次，且案卷（green-evidence 末节）逐字写着『另补「窗口过期后一条伪造失败不得立刻重新武装』』。修复 ≤3 行。"
+    },
+    {
+      "id": "R5-W-2",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:711, 721, 723, 1270, 153-185; crates/nexus-web-gateway/src/config.rs:15-19, 266-272; crates/nexus-web-gateway/MODULE.md:206-208, 209-210",
+      "summary": "本批只封了低边，没封高边，而同一片在 ssh 侧刚刚证明作者知道『只检查 == 0 等于没有检查』（config.rs 新增 MAX_TERMINALS_CEILING 及其注释）。`lockout_window` 被用在三处**未检查的** `Instant + Duration`（FS:711/721/723），大值按 std 语义 panic，而 MODULE G20 明写本 crate release 为 panic=abort、要求 panic-free-by-construction ⇒ 一个 `lockout_window = Duration::MAX` 的配置在**第一次错令牌**时就能崩掉网关。`idle_timeout` 大值同样通过 validate()，而 sweep_idle 用 `now.saturating_duration_since(last_activity) > timeout`（FS:1270），于是会话永不回收，与 G21『按配置空闲回收』相反（saturating 只防减法，不防这个反向语义）。修法：给两个时长加上界（如 ≤1 h）+ 夹具，或改用 checked_add 并把溢出报成 CONFIG。"
+    },
+    {
+      "id": "R5-W-3",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:1383 (list 过账), 225-236 (ack 下限), 198 (chunk≤inflight), 1142-1148 (CAPACITY 分支), 1356-1360 与 1385 (0 条目页/next_offset), 3636-3649 (反向边界夹具); examples/gateway_file_contract.rs:608-611, 97-124; crates/nexus-web-gateway/MODULE.md:111, G17 (:198-204)",
+      "summary": "新计费量没有配对校验，正是 R4-NEW-1 的形状。`list` 现在按 `ack_bytes`（上限 `max_ack_bytes`）过账，而 validate() 只对 `chunk_bytes` 做了 ≤ max_inflight_bytes_per_session（FS:198），**没有** `max_ack_bytes ≤ max_inflight_bytes_per_session`：`buffered=4096/inflight=128/ack=4096/chunk=8` 能通过校验，但每个 ack_bytes>128 的页必然走 FS:1142-1148 的 CAPACITY 早退、回滚、再试仍 >128 ⇒ **通过校验的配置可以让每一次 list 永久被拒**（brief 点名的这一类，实到）。相关另一半：ack 下限是 `72+52=124`（FS:225-236）而不含名字长度，截断判据却是 `72+52+name.len() > budget`（FS:1357），于是 budget 落在 [124,124+len) 时页返回 **0 条目**且 `next_offset = offset + 0 = offset`（FS:1385）——客户端永远翻不完目录且『没报错』，正是 r2 W-4 在 read 上修掉的缺陷，也破坏 G17『next_offset 必须单调』。两处旁证：探针自己的夹具（examples:608-611 注释说不许低于下限否则 list 页永远 0 条目，可它自己 max_ack_bytes=128 配 6 字节名 ⇒ 130>128 就是 0 条目），以及反向边界夹具 FS:3636-3649 **断言 max_ack_bytes=124 合法**，即测试替不可用配置背书。修法：加一条交叉规则 + 对装不下的条目显式拒绝或前进一格。"
+    },
+    {
+      "id": "R5-W-4",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:2118-2147 (record), 936 (AUDIT_CAPACITY=8192), 1168-1176 (认证前落账), 707/753-755 (节流键), 3278-3283 (只数行数的测试); crates/nexus-web-gateway/MODULE.md:218-220 (G21 有界句), :145-148 (G15 表项有界)",
+      "summary": "『有界』是**行数**有界，不是**字节**有界，契约句据此 overstated。record 对每行的 principal/root/rel 无任何长度上限（FS:2141-2146），而 authenticate 在令牌校验**之前**就用调用方给的 principal 落账且 session 记 0（FS:1174-1176）⇒ 未认证者可把 8192 行的审计环填成每行任意大；节流键同理（1024 项 × 任意长度字符串）。G21『审计环本身有界…无上限的审计日志就是…把节点内存打满的路径』与 G15『表项有界』只在计数意义下成立；现有测试只断言 `audit().len() <= cap`。修法：记录时截断（带标记）或按字节预算封住，并在场景里冻一个字段。这条与已登记的 RSS 欠账（PRODUCT:3320-3322）同源。"
+    },
+    {
+      "id": "R5-W-5",
+      "severity": "WARN",
+      "location": ".evidence/review-gateway-file-r4/summary.json:disposition_by_implementer(items R4-N-4, 缺失 R4-W-5/R4-W-8; still_open_after_this_batch), crates/nexus-web-gateway/src/file_service.rs:840/844/864, 887, 1739, 750-751, 1266-1285",
+      "summary": "欠账清单不完整，且有一条『已记录』不存在。r4 的 8 条 WARN 里 W-5 与 W-8 既没修也没进 still_open_after_this_batch（7 条里没有它们），我在代码里复核：W-8 的裸加 `self.buffered() + bytes` 仍在 FS:840/844/864（`send_file_message` FS:1112 公开可达），只有减法那半改成了 FS:887 的 saturating_sub；W-5 的拒绝行 root 仍为空串（ack_staged FS:1739、stage_chunk 同族）。R4-N-4 声称『documented：G21 侧记 close_session 会 forget 而 sweep_idle 不会』——MODULE.md/PRODUCT.md 全文 grep 无 forget/该句，代码里也没有注释，反而 FS:750-751 的 forget 文档注释写着『Called on session teardown: a recycled session must not leave state behind』，与 FS:1266-1285 的 sweep_idle 不调 forget 的事实**相反**。要么把两条放回欠账清单，要么改掉注释与文档口径。"
+    },
+    {
+      "id": "R5-N-6",
+      "severity": "NOTE",
+      "location": "FILE_MANIFEST.md:5, 239-242; .gitignore:3",
+      "summary": "声明自洽：`awk '/^\\| /{n++}'` = 195，减表头 = 194 = 声明值 ✓。但已登记的 4 行指向 `.evidence/review-gateway-file-r1|r2/*`，而 `git ls-files .evidence` 只返回 red-n2-p0-0 与 review-g11-ice-fix-qoder-r1 ⇒ 这些文件仍未 `git add -f`；r3/r4（以及本轮 r5）目录未登记。落地提交时计数必然再次漂移。这是 R4-N-9 的同一项、第二轮，处置清单里没有对应条目。"
+    },
+    {
+      "id": "R5-N-7",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/examples/gateway_file_contract.rs:537-543, 591-592; scenarios/product/gateway_file_auth_throttle.toml:45-54",
+      "summary": "探针侧的 `throttle_full_fail_closed` 与 `product_engine_fails_closed_when_flooded` 仍用**不在册**主体（r4 W-1 的第②点未动），因此场景冻的这两个字段对旧豁免逻辑零杀伤力；杀伤力现在完全由单测 FS:2772 承担（那一条我验证有效）。处置没有声称探针已加强，故降为 NOTE，但欠账清单里也没有它。"
+    },
+    {
+      "id": "R5-N-8",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/MODULE.md:213, 214-217; crates/nexus-web-gateway/src/file_service.rs:1252-1262, 3080-3083",
+      "summary": "G21 两句仍有余味：『『漏记』在结构上不可发生』（:213）对 close_session 不严格成立——record 在 `if let Some` 里，关未知 id 零行（r4 原话，未改）；『单测逐个动词断言恰好一行 + action + 码 + principal』（:217）对 12 个出口里的 11 个成立，`idle_recycle` 只断 action/码/principal（FS:3080-3083），没断行数。存在性与四件套其余部分本轮都已钉住。"
+    }
+  ],
+  "r4_disposition_verification": [
+    {
+      "id": "R4-NEW-1",
+      "verdict": "verified",
+      "mutation_evidence": "validate() 现拒 lockout_window=0（FS:167-173）、idle_timeout=0（FS:174-178）、max_upload_bytes/max_rehash_bytes_per_stream=0（FS:179-185）。逐条按规则顺序手推 12 个夹具：4 个新夹具各自只违反自己那条（规则 1 的零值清单不含这四个字段，规则 5-11 比较的是别量），删掉对应 if 之后 validate() 返回 Ok ⇒ expect_err 变红。max_upload/max_rehash 两个夹具的关键词与规则 1 的整句相同，归属弱一点但杀伤力真实。14 个数值字段现全覆盖（inflight=0 被 FS:198 拦住）。接线复核：FS:1006-1010 传参顺序与 FS:662 签名一致，无硬编码 60 s；record_failure 首行 decay（FS:706）。"
+    },
+    {
+      "id": "R4-W-1",
+      "verdict": "partly",
+      "mutation_evidence": "真实的一半：洪水循环 0..12 使表最终为 {repeat, flood0..flood6}=8，flood0 确实在册且计数 1 未上锁，FS:2766 断言 buckets==8 成立；把 is_locked 的全局窗口恢复成额外要求『不在 buckets』⇒ flood0 被豁免、令牌正确返回 Ok ⇒ FS:2772 的 .map(|_| \"ACCEPTED\") 变红。这是 r4 点名的主语错误，现已名副其实。不实的一半：FS:2795-2799『过期后一条伪造失败不得立刻重新武装』用 flood0（在册）走桶分支，global 永不自增，把 decay 的全局归零（FS:681-685）删掉也照样绿 ⇒ 见 R5-NEW-1。"
+    },
+    {
+      "id": "R4-W-2",
+      "verdict": "verified",
+      "mutation_evidence": "FS:2918 断 `budget().buffered() == 16`、FS:2919-2922 断 inflight_matches_budget，位置在 CAPACITY 拒绝之后、settle_file(FS:2927) 之前。两个数：现状 16（两页各 8 被接受）；删掉 FS:1144 的 unpush_file ⇒ 被拒的 8 字节仍占预算，buffered=24（≠16）且 inflight 16 vs file_buffered_for 24 ⇒ 两条同时红。处置描述与仓内一致。"
+    },
+    {
+      "id": "R4-W-3",
+      "verdict": "verified",
+      "mutation_evidence": "删掉 FS:1383 的 charge_file：FS:2824 的 file_buffered()>0 变 0 而红；且第四页不再 QUEUE_FULL，FS:2838 的 unwrap_err 红（两处独立杀伤）。无自证算式残留：断言只比较两套独立存储（inflight vs file_buffered、inflight_matches_budget）或引擎输出（entries.len/truncated），settle_file(s, e.budget().file_buffered()) 是排空而非断言。数字复核：envelope 72 + 每条 52+6=58 ⇒ 页1=188、页2=188、页3=130，合计 506 ≤ 512；页4=188 ⇒ 694 > 512 ⇒ FS:864-870 QUEUE_FULL。探针/场景侧仍无 list 计费观测，但处置未声称有。"
+    },
+    {
+      "id": "R4-W-4",
+      "verdict": "verified",
+      "mutation_evidence": "成功侧六条都在：authenticate/OK(FS:3121)、open_upload/OK(3167)、stat/OK(3222)、remove/OK(3224)、commit/OK(3230) 走 audited! 宏（行数+1/action/码/principal 非空，FS:3097-3112）；abort_upload(FS:3205-3214) 与 close_session(FS:3263-3274) 的手写块逐要素等价（后者还把 principal 钉成 \"u\"），删任一处 record 即红。G21 的 12 个落账出口存在性全部有测试。审计环灌满改用新会话 s2（FS:3277）走真实 NOT_FOUND 而非『无此会话』。残留仅措辞（R5-N-8）。"
+    },
+    {
+      "id": "R4-W-6",
+      "verdict": "verified",
+      "mutation_evidence": "MODULE.md:157-163 以『仍未闭环的可用性口径（评审 r4 R4-W-6，待 owner 裁决）』为题登记：桶不衰减、每窗口 lockout_after 条即可无限续期、94% 时间为拒、两条出路、本批不静默改语义；PRODUCT.md:3315-3318 同步并写明留给所有者裁决。是 open 决策而非已解决性质，符合『登记为欠账』的要求。"
+    },
+    {
+      "id": "R4-W-7",
+      "verdict": "verified",
+      "mutation_evidence": "PRODUCT.md:3320-3322 已删去『全局 RSS 有配额表』，改为『全局 RSS 没有配额也没有计量…本条不得再被读成内存有上界』，与 MODULE.md:189（/proc/self/fd 与 RSS 上界未验）同向；全仓 grep 仍无任何 RSS 计量实现，故该句是诚实的负向声明。"
+    },
+    {
+      "id": "R4-N-4",
+      "verdict": "not-verified",
+      "mutation_evidence": "声称『documented（G21 侧记 close_session forget 而 sweep_idle 不 forget）』：MODULE.md 与 PRODUCT.md 中无 forget、无该句，sweep_idle（FS:1266-1285）也没有相应注释；反而 FS:750-751 的 forget 文档注释声称『recycled session must not leave state behind』，与代码相反。属案卷陈述在仓内找不到（详见 R5-W-5）。"
+    },
+    {
+      "id": "R4-N-2",
+      "verdict": "verified",
+      "mutation_evidence": "声称留作 M2 观测面（release_session 返回值在 FS:1259 与 1281 两处仍被丢弃）——代码事实与声明一致，未假称已修。"
+    }
+  ],
+  "merge_decision": "不合并（CHANGES_REQUESTED）。R4 那一条 FAIL 与 R4-W-1/2/3/4 的『证据不实』指控本轮基本兑现：R4-NEW-1、W-2、W-3、W-4 经我逐条变异推演确有杀伤力，W-6/W-7 的声明文字逐字核对为真，8 项『已修/已登记』里 7 项名副其实。但仍有 1 条 FAIL 与 4 条 WARN 阻塞：(1) R5-NEW-1——处置声称的第二条判据在 decay 被删空的情况下照样绿，唯一防『一次洪水永久待命』的 FS:681-685 无任何回归保护，这是同族缺陷第三次；(2) R5-W-3——新计费量缺配对校验，存在『通过 validate() 却使每次 list 永久被拒』的配置，且 0 条目页破坏 G17 的 next_offset 单调、反向夹具替坏配置背书；(3) R5-W-2——高边未封而 lockout 用未检查的 Instant+Duration（release=panic=abort），同批 ssh 侧刚加了上界，口径不一致；(4) R5-W-4——审计/节流『有界』是行数意义，未认证者可撑大字节；(5) R5-W-5——W-5/W-8 从欠账清单消失，N-4 声称的记录不存在且代码注释与实现相反。R4-W-6（桶衰减 vs 长期拒服务）按已声明的 open 决策不再单独阻塞本增量；它仍等 owner 裁决。上述五处落地并带来其声称的变异杀掉后，本增量在 W-6 声明为 open 的前提下可合并。评审已第 5 轮，超过 AGENTS.md:1585 默认 3 轮上限，人工升级状态延续（r4 已向 owner 报备，本轮无新增升级事项）。",
+  "blocking_issues_remaining": [
+    "R5-NEW-1: 用不在册主体重写『过期后不得立刻重新武装』判据并覆盖 FS:681-685（decay 全局归零），否则 r3 R3-W-2 的修复仍无回归保护",
+    "R5-W-3: validate() 增 `max_ack_bytes <= max_inflight_bytes_per_session` 与含名字长度的 ack 下限；list 遇到装不下的条目须显式拒绝或让 next_offset 前进（现在返回 0 条目 + 同一 offset，客户端死循环）",
+    "R5-W-2: lockout_window/idle_timeout 的上界 + 用 checked_add 取代 FS:711/721/723 的裸加法",
+    "R5-W-4: 审计行与节流键的字节上界（或截断），并让 G15/G21 的『有界』措辞与实现对齐",
+    "R5-W-5: 把 R4-W-5/R4-W-8 放回欠账清单或修掉；删除/更正 FS:750-751 的 forget 注释与处置里不存在的 R4-N-4『已记录』说法",
+    "R4-W-6（owner 决策，非本增量阻塞项）: 桶衰减 vs 明示可接受的长期拒服务"
+  ],
+  "non_blocking_suggestions": [
+    "R5-N-6: 落地提交前 `git add -f .evidence/review-gateway-file-r{3,4,5}` 并把 FILE_MANIFEST 计数与表内行数一起校准（已连续两轮漂移）",
+    "R5-N-7: 探针的两个 fail-closed 字段改用与单测同款的在册主体，使场景层也带杀伤力",
+    "R5-N-8: G21 的『逐个动词恰好一行』补 idle_recycle 的行数断言，并把 close_session 的 record 移出 `if let Some`"
+  ],
+  "not_machine_verifiable_this_round": [
+    "本轮未编译、未运行任何测试或场景（宿主不具备条件，见 reviewer.could_not_compile）；所有判定来自静态阅读 + 整数推算，未复算实现方的 56/9/86/contract_hash 数字，也不以其作为我可读证据的替代",
+    "decay/global 归零、0 条目页、QUEUE_FULL 永久拒绝、Instant+Duration 溢出这几处变异结论我只用代码算术推得，落地前请在 xc-pc-linux 上实跑一次变异确认"
+  ],
+  "report_file": ".evidence/review-gateway-file-r5/findings.md",
+  "escalation_note": "第 5 轮 > AGENTS.md:1585 的默认 3 轮上限，owner 已在 r4 被告知；唯一待裁决项仍是 R4-W-6。",
+  "disposition_by_implementer": {
+    "date": "2026-10-12",
+    "author": "implementer（同一 agent 会话，非评审结论）",
+    "verified_on": "xc-pc-linux，被验内容树 5dd8c66b1f5385a22562ba295964373363d0cb37（验证远端上的 stash 式临时提交；工作树内容与即将落地的提交逐字节相同）",
+    "measurements": "cargo test -p nexus-web-gateway --lib = 57 passed; 0 failed / cargo clippy -p nexus-web-gateway --all-targets = 零诊断 / 9 条 E4 场景全 PASS = 86 条期望 / nexus-harness verify --fast = 9 门全 PASS / contract_hash = 8f510129cd7d9bef054d2324a4517fc534ab9806",
+    "items": [
+      {
+        "id": "R5-NEW-1",
+        "action": "fixed",
+        "how": "判据改为走溢出分支的**不在册**主体：窗口过期后第一条 off-table 失败必须【不】重新武装（并断言 throttle_overflow() == 1，即计数确实从 0 重新攒起），第二条才重新武装。旧写法的 flood0 在 buckets 里、走单桶分支，global 根本不参与判定，所以 decay 整段删掉也照样绿——评审这条批评成立",
+        "evidence": "单测 lockout_rearms_after_expiry_and_flood_arms_are_not_exempt 末段；把 Throttle::decay 的 global 归零删掉，第一条断言必红"
+      },
+      {
+        "id": "R5-W-2",
+        "action": "fixed",
+        "how": "两处一起补：(1) validate 给 lockout_window 与 idle_timeout 加上界 24h，并把理由写成『时长参与 Instant 加法，病态大值不是更宽松而是把锁死推到时钟边界之外』；数值型上限没有这种后果，仍只封低边（G12 已写）。(2) 三处 `now + lockout` 改 `checked_add`，溢出回退到一个有限的 1 小时窗口——绝不回退成『立即过期』，那是把 fail-closed 换成 fail-open",
+        "evidence": "every_validate_rule_has_a_red_test 的 2 个高边夹具 + G12 文本"
+      },
+      {
+        "id": "R5-W-3",
+        "action": "fixed",
+        "how": "加配对约束 max_ack_bytes ≤ max_inflight_bytes_per_session（否则每次 list 都当场 CAPACITY：配置自洽却永远不可用）。这条同时暴露出 max_ack_bytes ≤ max_buffered_amount 已被蕴含——作为先写的检查保留是纵深防御，但我把它从『独立可红』改成『被蕴含』并改了夹具，不再假装它有独立覆盖。另一半（长文件名塞不进 ack 预算 → 0 条目页 next_offset 原地不动）改为运行期显式 PAGE_TOO_LARGE，并新增单测 list_refuses_to_stall_on_an_unrenderable_entry：夹具先用 400 字节名跑红在 Linux 的 NAME_MAX(255) 上，已改 200 字节",
+        "evidence": "2 个新夹具 + list 的 0 条目 refusal 单测；G12/G17 文本写明 ack 下限『必要不充分』"
+      },
+      {
+        "id": "R5-W-4",
+        "action": "fixed",
+        "how": "把『有界』做成真话：审计每个由调用方控制的字段（principal/root/rel）裁到 AUDIT_FIELD_MAX_BYTES 并留 [+NB] 截断标记；节流键两半裁到 IDENTITY_LABEL_MAX_BYTES（principal 在令牌校验之前就被写下，不裁长度就是行数 × 任意字符串）",
+        "evidence": "every_verb 测试末段用 4000 字节主体与 rel 灌 21 次，断言尾部记录按字节封顶且截断可见。注意：这段一开始断言『行数 +21』，在饱和环上必然假（Linux 实测 8192 vs 8213、8192 vs 8193 两次红）——已改成按尾部内容断言并写明原因，这是我自己的测试设计错，不掩盖"
+      },
+      {
+        "id": "R5-W-5",
+        "action": "fixed",
+        "how": "欠账清单补回漏掉的 R4-W-5 / R4-W-8；R4-N-4 那条『已记录』当时并不存在（forget 的注释写的正是相反语义），已按代码实际语义重写注释：显式 close 才清在途锁定，闲置回收**不**清（否则把会话挂到超时就是免费解锁路径）；R5-W-5 点出的裸加 self.buffered() + bytes 全部改走 exceeds_limit 的 checked_add，溢出按放不下处理（fail-closed）"
+      },
+      {
+        "id": "R5-N-7",
+        "action": "fixed",
+        "how": "探针的两个冻结字段改为同时断言**已在册**与不在册主体：throttle_full_fail_closed 加 p0 + 正确令牌（旧豁免逻辑下是 ACCEPTED），product_engine_fails_closed_when_flooded 同理。杀伤力不再只由单测承担"
+      },
+      {
+        "id": "R5-N-6",
+        "action": "fixed",
+        "how": "FILE_MANIFEST 登记 r3/r4/r5 三份案卷（6 行），声明值 194 → 200，并注明本批案卷全部走 git add -f 携带；r1/r2 的行此前已登记但仍未跟踪，落地提交时一并 add -f"
+      },
+      {
+        "id": "R5-N-8",
+        "action": "fixed",
+        "how": "close_session 走未知会话号时补一行 NOT_FOUND 审计（此前 record 在 if let Some 里 ⇒ 关不掉的会话零行，G21 那句『漏记结构性不可发生』只对已知会话成立）；idle_recycle 的断言从『这一行存在』升级为『恰好一行』"
+      }
+    ],
+    "still_open_after_this_batch": [
+      "R4-W-6：buckets 不随时间衰减 ⇒ 占满表后每窗口 lockout_after 条失败即可无限续期全局锁定（合法主体约 94% 时间被拒）。已写进 G15/PRODUCT 并升级给 owner 裁决，不顺手改语义",
+      "W-7 / R3-W-6：files 配置块接进 GatewayConfig::validate 与 kill-switch；capability-negotiation 仍与产品代码零耦合",
+      "W-12：.part 预置符号链接测试不经引擎（nonce 不可注入）",
+      "R3-N-4：探针 emit 但未被场景冻结的字段（回归不红）",
+      "资源核算：/proc/self/fd 与 RSS 的 OS 层面实测；全局 RSS 无计量（本轮已在 PRODUCT 明说）",
+      "fuzz 目标登记（含 str0m 输入面）",
+      "错误码词表统一；与 N3-4/N3-9 的双向一致性测试",
+      "G1 门禁绑定修复在 fix/hook-review-evidence-binding（689f63a），未合入 master 与本分支",
+      "release_session 的释放字节数被丢弃（会话拆除归还了多少不可观测，r4 N-2）"
+    ]
+  }
+}

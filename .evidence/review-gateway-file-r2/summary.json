@@ -1,0 +1,352 @@
+{
+  "verdict": "CHANGES_REQUESTED",
+  "reviewer": {
+    "agent": "independent-code-reviewer (r2, not the implementer; static read only, no file edits outside plan-artifacts)",
+    "model": "qfmodel",
+    "host": "Windows (no compile possible: ssh2 cfg gate)",
+    "toolchain": "static read only",
+    "date": "2026-10-12"
+  },
+  "subject": {
+    "branch": "feature/gateway-file-service-contracts",
+    "base_commit": "af953af",
+    "tree_state": "uncommitted working-tree changes",
+    "reviewed_as": "r2 (follow-up to r1 CHANGES_REQUESTED with 6 FAILs)"
+  },
+  "scope": [
+    "crates/nexus-web-gateway/src/file_service.rs",
+    "crates/nexus-web-gateway/examples/gateway_file_contract.rs",
+    "crates/nexus-web-gateway/MODULE.md",
+    "scenarios/product",
+    "crates/nexus-web-gateway/src/config.rs",
+    "PRODUCT.md"
+  ],
+  "also_read": [
+    "PRODUCT.md#18-gateway-file-service (lines 3254-3355)",
+    ".agents/green-evidence-gateway-file-service-m1.txt"
+  ],
+  "r1_fail_verification": {
+    "F4_path_truncation": "FIXED (resolve continues over missing components, no unvalidated join() left, reverify_ancestor does not weaken the symlink guarantee)",
+    "F1_send_budget_wiring": "PARTIALLY FIXED (budget is engine-owned and read_page charges it, but there is no release path -> FAIL R2-NEW-2; only read_page is charged -> W-11)",
+    "F2_drop_counting": "MODEL FIXED, ITS MACHINE CHECK DOES NOT EVALUATE TRUE -> FAIL R2-NEW-5",
+    "F3_sftp_constant_readback": "FIXED (three independent fields go red when allows_mutation() is flipped; the implementer's stated mechanism is wrong but the outcome holds)",
+    "F5_part_toctou": "FIXED IN CODE AND DOC, TEST DOES NOT EXERCISE THE ENGINE -> W-12",
+    "G21_audit_record": "PARTIALLY FIXED (wrapper pattern real and its test has kill power, but AuditRecord lost all derives, and abort_upload/ack_staged/close_session still record nothing) -> W-1 + W-5"
+  },
+  "counts": {
+    "fail": 5,
+    "warn": 12,
+    "note": 8
+  },
+  "findings": [
+    {
+      "id": "R2-NEW-1",
+      "severity": "FAIL",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:1527-1536,1596 (also 570-589, 1304)",
+      "summary": "commit_upload_inner calls neither require_writable() nor require_local_io(), and UploadStream records no root, so the commit-time root is caller-chosen: an upload opened on a writable root can be published into a read_only root, and commit with an SFTP root hands the remote POSIX path to the local resolver and hard_link()s into it if that path exists locally. Violates G13/G14 and PRODUCT 18.1/18.2; no unit test and no E4 field covers it."
+    },
+    {
+      "id": "R2-NEW-2",
+      "severity": "FAIL",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:719,756-769,922-927,1037-1044,1047-1066",
+      "summary": "Budget accounting leaks with no settle path: SendBudget has no session attribution, so messages squeezed out by push_terminal never release the owning session's inflight_bytes (that session is permanently capped), and close_session/sweep_idle drop the session without ever calling budget.settle_file, so the shared 128 KiB budget stays permanently pinned -> node-wide permanent QUEUE_FULL reachable by any token holder (authenticate, read 2 pages, disconnect, repeat). Unit test file_service.rs:2335-2341 freezes the wrong equality as an expectation."
+    },
+    {
+      "id": "R2-NEW-3",
+      "severity": "FAIL",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:638-651,629-635,992-996",
+      "summary": "Throttle is fail-open once the bucket table is full: the overflow branch only increments a private global counter and never inserts into `locked`, while authenticate consults is_locked() (which reads only `locked`) and then compares the token anyway. Filling the 1024 buckets is cheap, after which any new principal/source gets unlimited guesses and a correct token still succeeds; THROTTLED is only an error-code label. `global` has no accessor, so probe field throttle_entries_bounded proves memory bounds but cannot see the lost lockout. Contradicts G15/PRODUCT 18.2."
+    },
+    {
+      "id": "R2-NEW-4",
+      "severity": "FAIL",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:1020-1032 (config fields 98,100,130,131,153,154,165,222)",
+      "summary": "Concurrent session count has no ceiling: authenticate inserts unconditionally; max_sessions and max_browser_sessions appear only inside FileLimits::validate cross-checks and are never used for admission. MODULE.md G16 and PRODUCT 18.2 list 'concurrent sessions' as bounded; idle sweeping bounds lifetime, not count. Each session may open unbounded streams, each with a .part file."
+    },
+    {
+      "id": "R2-NEW-5",
+      "severity": "FAIL",
+      "location": "crates/nexus-web-gateway/examples/gateway_file_contract.rs:536-591 vs scenarios/product/gateway_file_quota_backpressure.toml:42-44",
+      "summary": "The F2 machine check cannot evaluate true on this tree: send_file_message(s,8) accepts 16 messages (file_drops=1), each 4-byte send_terminal in the 100-loop evicts exactly one whole file message (drain_file_reserve need=4), so the queue is empty after 16 iterations and the later send_terminal(limit) evicts nothing -> squeezed_here=0, so `squeeze_accounting_is_per_message` = (16==16) && (0>1) && (pending==0) = false while the frozen expectation is true. The recorded evidence value final_send_squeezed_messages=15 (.agents/green-evidence...m1.txt:205-206) is unreachable for this code (file_messages_squeezed_out=16 does match). Either the scenario is red or the claimed 9/9 = 77 expectations came from a different tree; must be re-run and corrected honestly."
+    },
+    {
+      "id": "R2-W-1",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:804-812",
+      "summary": "AuditRecord's #[derive(Debug, Clone, PartialEq, Eq)] is inside the preceding /// doc comment, so the public audit record type silently has no derives; it compiles only because current tests read fields instead of using {:?}/==/clone(). Regression introduced by this batch's G21 refactor; blocks the M2 wire layer from snapshotting audit lines."
+    },
+    {
+      "id": "R2-W-2",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:1142-1158",
+      "summary": "list traverses symlinks: is_dir comes from next.metadata() (follows the link, possibly to outside the root) and a single dangling symlink aborts the whole directory page with NOT_FOUND. The adjacent comment claims symlinks are 'never traversed', which is false."
+    },
+    {
+      "id": "R2-W-3",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:1758-1764",
+      "summary": "rename's no-overwrite guarantee is check-then-act (dst.exists() then std::fs::rename, which silently replaces on POSIX); unlike commit_upload's atomic hard_link, the race window is neither closed nor declared. G14's 'original bytes untouched' is therefore timing-dependent for another session or local writer."
+    },
+    {
+      "id": "R2-W-4",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:1240-1248,1263-1275",
+      "summary": "max_bytes = 0 is accepted and returns an empty page with next_offset == offset and eof = false, breaking G17's monotonic next_offset requirement; validate() only forbids chunk_bytes == 0, not a zero request."
+    },
+    {
+      "id": "R2-W-5",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:1618-1624,1492-1499,1037-1044,1375",
+      "summary": "G21 gaps remain: abort_upload (client-reachable, deletes staged bytes), ack_staged and close_session have no recording wrapper, so MODULE.md's 'missing a record is structurally impossible' is false; stage_chunk/authenticate/idle_recycle lines carry root = \"\", so the five fields G21 promises are not complete for those actions."
+    },
+    {
+      "id": "R2-W-6",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/examples/gateway_file_contract.rs:763-765,260-275,313-319,455-457",
+      "summary": "Decorative E4 fields: refuses_link only asserts is_err(), so list_rejects_escaping_symlink and write_rejects_escaping_symlink stay true even if resolve's symlink guard is deleted (both then fail for the wrong reason); post_open_reverify_used accepts three codes and is satisfied by resolve alone, so deleting reverify_parent at file_service.rs:1589 keeps it green; locked_after_attempts is a lockout_after+1 constant readback."
+    },
+    {
+      "id": "R2-W-7",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/examples/gateway_file_contract.rs:739-761, crates/nexus-web-gateway/src/config.rs:144-165",
+      "summary": "capability-negotiation asserts a probe-local decide_channel with no product counterpart (GatewayConfig has no files field; unknown JSON keys are silently dropped), so the scenario's 8 expectations are decoupled from product code - the same 'proves the model, not the product path' defect as r1 F1. The probe header's claim that every field derives from observable engine behaviour is false for this case."
+    },
+    {
+      "id": "R2-W-8",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:150-227, crates/nexus-web-gateway/MODULE.md:101",
+      "summary": "Five of the eight cross-checks MODULE.md claims are individually test-red have no test: chunk_bytes<=max_inflight (179-184), max_ack_bytes<=max_buffered (187-192), the newly added max_ack_bytes>=envelope+entry floor (196-207), max_read_handles>=max_sessions (222-227), and the no-zero rule (150-164). Deleting any of them keeps all tests and scenarios green."
+    },
+    {
+      "id": "R2-W-9",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:1217,1267,538-547,2463-2465, examples/gateway_file_contract.rs:673-681",
+      "summary": "Read-handle quota can never bind: acquire/release are paired inside one synchronous call, so live() is always 0 and peak() always 1; the CAPACITY branch, max_read_handles, the unit assertion peak<=1 and the E4 field peak_read_handles_within_budget are tautologies. G16's 'N chunks of one download cost one handle' currently holds only because reads are synchronous and will need re-wiring in M2."
+    },
+    {
+      "id": "R2-W-10",
+      "severity": "WARN",
+      "location": "PRODUCT.md:3280,3282,3333",
+      "summary": "PRODUCT.md was not updated with this batch: 18.1 still promises the upload ack is 'already persisted bytes' while G18 was corrected to 'staged', still names .nexus-part.* (real name is .<name>.nexus-part-<hex>), and 18.4 still declares the scenarios Red Evidence though they are claimed green."
+    },
+    {
+      "id": "R2-W-11",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:940-975,1105-1168",
+      "summary": "Only read_page is charged; list pages, stat/mkdir/remove/rename/commit replies and per-chunk acks never touch charge_file, so G16's 'engine charges every outbound file-class message' holds only if a not-yet-existing wire layer volunteers to call send_file_message. send_file_message with an unknown session id also charges the shared budget with no per-session attribution and no release path."
+    },
+    {
+      "id": "R2-W-12",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:2671-2695,1331-1336",
+      "summary": "part_creation_refuses_a_preplanted_symlink tests std::fs::OpenOptions directly and never drives open_upload, so changing create_new(true) to create(true) leaves it green; it also early-returns on Windows, the very platform whose PRODUCT 18.3 level-B claim rests on the 'create_new equivalent' premise."
+    },
+    {
+      "id": "R2-N-1",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:426-440,1229; MODULE.md:116",
+      "summary": "reverify returns FileResult<bool> whose Ok value is always true and never consumed; MODULE.md/PRODUCT.md's 'typed TOCTOU snapshot' has no corresponding type (only a post-operation re-resolve, no pre-op snapshot)."
+    },
+    {
+      "id": "R2-N-2",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:1657-1659",
+      "summary": "Doc comment references remove_all_in_root, which does not exist (the function is remove_tree at 1712)."
+    },
+    {
+      "id": "R2-N-3",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:1331-1336",
+      "summary": "A pre-planted symlink/name at the .part path is refused but reported (and audited) as CAPACITY_UNAVAILABLE rather than SYMLINK_ESCAPE/EXISTS, so an attack attempt is recorded as a capacity problem."
+    },
+    {
+      "id": "R2-N-4",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/examples/gateway_file_contract.rs:614,617-623,527-530,453,487-490,581,583",
+      "summary": "Two of the three fields cited as F1/F2 evidence (read_page_overflow_code, settle_releases_budget_and_inflight) and several others are emitted but not frozen by any scenario, so regressions there stay invisible; interim_codes is emitted while the 5th-attempt-throttles behaviour it documents is unasserted."
+    },
+    {
+      "id": "R2-N-5",
+      "severity": "NOTE",
+      "location": "scenarios/product/gateway_file_quota_backpressure.toml:8",
+      "summary": "[given] max_inflight_bytes_per_session = 1048576 still describes the pre-r2 default (now 128 KiB); prose-side drift only, no expectation depends on it."
+    },
+    {
+      "id": "R2-N-6",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/examples/gateway_file_contract.rs:412-418",
+      "summary": "sftp_refusal_gate classifies the refusal by substring-matching the error message; rewording file_service.rs:449-452 flips it to OTHER (fails red, so the direction is safe) - an error-code-level discriminator would be sturdier."
+    },
+    {
+      "id": "R2-N-7",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:292-302,2384-2389",
+      "summary": "Windows path shape: open accepts an un-prefixed spelling but stores the \\?\\-prefixed canonical form, so resolve()'s output cannot equal a plain dir.join() - unit test resolve_does_not_truncate_missing_multi_segment_paths would fail on Windows; byte-exact root comparison also rejects case-varied (still canonical) Windows paths, and UNC roots are refused."
+    },
+    {
+      "id": "R2-N-8",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:1042,727",
+      "summary": "close_session takes the source from its caller (sessions never store it), so throttle cleanup only hits if the wire layer passes the right value; SendBudget.terminal_delivered is incremented on acceptance, not actual delivery."
+    }
+  ],
+  "test_quality": {
+    "rewritten_tests_with_real_kill_power": [
+      "file_service.rs:2523-2668 every_verb_is_audited_including_refusals - the audited! macro asserts exactly-one-line + action + code + non-empty principal, so deleting any wrapper's record (or adding a second) goes red; r1's decorative-ness is cleared",
+      "file_service.rs:2376-2403 and 2405-2436 - both fail on the old break-on-NotFound behaviour and on any reintroduced wrong-prefix publish",
+      "file_service.rs:2285-2309 terminal_class_has_priority_over_file_class - requires file_drops==6 for a 5-message squeeze (old code gave 2)",
+      "file_service.rs:2311-2374, 2167-2203, 2016-2065, config.rs:348-357"
+    ],
+    "assertions_still_green_under_obvious_mutation": [
+      "file_service.rs:2341 - asserts the post-squeeze inflight value that R2-NEW-2 shows is wrong (the test now protects the defect)",
+      "file_service.rs:2465 / gateway_file_contract.rs:673-681 - handle peak<=1 and peak<=max_read_handles are tautologies",
+      "nothing pins constant-time comparison being used: replacing constant_time_eq at file_service.rs:996 with == keeps the whole suite green",
+      "no coverage for create_new(true) in the engine path (W-12), for list's byte-based truncation, for the exactly-cap-not-truncated fix, or for five validate() rules (W-8)",
+      "probe fields list_rejects_escaping_symlink / write_rejects_escaping_symlink / post_open_reverify_used / locked_after_attempts (W-6)"
+    ],
+    "honest_declared_limits": "constant_time_eq test states plainly that it cannot kill an early-return mutation and defers that to review (file_service.rs:2703-2706) - accepted as the correct treatment"
+  },
+  "not_machine_verifiable_review_verified_only": [
+    "Timing side channels: constant_time_eq's no-early-exit property (implementation read at 1929-1938 is correct; loop length leaks max(len), acceptable for a fixed configured token)",
+    "The residual TOCTOU window (parent swapped between resolve and create/hard_link); no in-process test can distinguish reverify/reverify_parent from resolve's pre-check, and SandboxRoot::reverify has no test at all that is not also satisfied by resolve",
+    "Windows semantics: \\\\?\\ prefix, case-insensitive canonical-path comparison, symlink privilege limits, CREATE_NEW on reparse points - never executed here (crate cannot compile on this host)",
+    "Real SCTP behaviour: bufferedAmount symmetry and set_sctp_max_buffered_amount (PRODUCT 18.4 item 1), and the message-atomicity premise behind F2's whole-message settle/drain model",
+    "The list ack cost model constants LIST_ACK_ENVELOPE_BYTES=72 / ENTRY_ACK_OVERHEAD_BYTES=52 (file_service.rs:795-802) - they describe an M2 wire encoding that does not exist yet and are asserted by nothing",
+    "Durability: sync_all() before publish cannot be observed without a crash/power-loss harness; per-chunk flush() being a no-op is a std fact, not a test fact",
+    "Terminal-class priority and zero loss in the real pty path: send_terminal has no caller outside tests/the probe",
+    "Global RSS ceiling named in G16 - no accounting exists and none is possible in std-only code",
+    "Panic-free-by-construction (G20): verified by reading every fallible construct in non-test code (no unwrap/expect/index-slice beyond the fixed sha256 digest slice at 1913; limit - buffered is protected by the buffered<=limit invariant) - but the CAPACITY handle branch is structurally unreachable and no fuzzing was run"
+  ],
+  "unverified_claims_by_implementer": {
+    "numbers": "44 lib tests, clippy clean, verify --fast 9/9, 9 scenarios = 77 expectations, contract_hash c53412186e7306333563b60a5262b5a73697e9c4",
+    "status": "not reproduced by this review (Windows host, ssh2 cfg gate, static read only); finding R2-NEW-5 shows at least the quota-backpressure number set is inconsistent with the source under review"
+  },
+  "report_file": "plan-artifacts/review-gateway-file-r2.md",
+  "schema_version": 1,
+  "review_id": "review-gateway-file-r2",
+  "review_round": 2,
+  "previous_review_id": "review-gateway-file-r1",
+  "bindings": {
+    "source_revision": "af953af8849c5549f78f77add4ef5441faba4267",
+    "note": "最近一个已提交祖先；被复评内容是其上未提交的工作树。评审在无编译能力的 Windows 宿主做静态阅读，未复现实现方的任何实测数字。",
+    "reviewed_content": {
+      "verification_host": "xc-pc-linux (appen@10.144.144.4), clone /work/m0-verify",
+      "stash_commit_on_verification_host": "84dafb52555160c9641b62034149c5266d196384",
+      "contract_hash": "c53412186e7306333563b60a5262b5a73697e9c4",
+      "working_tree_digest": "93c75c85191736a72b4a3442f12914f71d283564",
+      "dirty_state": false,
+      "toolchain": "rustc/cargo 1.98.1, git 2.25.1, x86_64-unknown-linux-gnu"
+    }
+  },
+  "disposition_by_implementer": {
+    "date": "2026-10-12",
+    "author": "implementer (the agent session that authored the code; NOT a review verdict)",
+    "verified_on": "xc-pc-linux (appen@10.144.144.4)，被验内容树 2da0dae385cdb25f94737ed212f3d41ac9196ebd（同为 stash 式临时提交；其工作树内容与即将落地的提交逐字节相同）",
+    "measurements": "cargo test -p nexus-web-gateway --lib = 53 passed; 0 failed / cargo clippy -p nexus-web-gateway --all-targets = 0 条诊断 / 9 条 E4 场景全 PASS 合计 80 条 expectation / nexus-harness verify --fast = 9 门全 PASS / contract_hash = 8f510129cd7d9bef054d2324a4517fc534ab9806",
+    "items": [
+      {
+        "id": "R2-NEW-1",
+        "action": "fixed",
+        "how": "UploadStream 记录打开时的 root；commit_upload_inner 先校验提交 root 与之一致（否则 OUTSIDE_ROOT），再过 require_writable + require_local_io",
+        "evidence": "单测 commit_cannot_be_redirected_to_another_root；探针字段 commit_root_redirect_code=OUTSIDE_ROOT、commit_after_refusal_recovers=true，已冻进 sftp-boundary 场景"
+      },
+      {
+        "id": "R2-NEW-2",
+        "action": "fixed",
+        "how": "SendBudget 队列改为 (session, bytes)；push_terminal 返回被挤掉的消息清单并由引擎逐条回冲各会话额度；settle_file 按会话且只冲完整消息并返回实际释放字节；release_session 在 close_session 与 sweep_idle 两处归还共享预算；对未知会话过账直接 NOT_FOUND（无归属条目没有释放路径）",
+        "evidence": "单测 session_teardown_releases_the_shared_budget、改写后的 terminal_class_has_priority_over_file_class（断言挤掉清单的归属）；探针字段 inflight_released_on_squeeze=true、teardown_releases_budget=true。上一版被冻成期望的错误等式（挤掉后 inflight 仍为 64）已按评审意见改正——评审指的对，那条断言锁住的是缺陷"
+      },
+      {
+        "id": "R2-NEW-3",
+        "action": "fixed",
+        "how": "溢出计数达到阈值时升级为全局锁定窗口；locked 表自身到容量时同样升级为全局窗口而非无界增长；新增 throttle_overflow / throttle_globally_locked 两个观测",
+        "evidence": "单测 throttle_fails_closed_when_the_table_is_full；探针字段 throttle_full_fail_closed=true、product_engine_fails_closed_when_flooded=true，已冻进 auth-throttle 场景",
+        "side_effect_recorded": "这条修复让探针原有的『淹没之后再开一个新会话』步骤合法地变红（第一次 Linux 跑就红在那里）。已把该步骤移到淹没之前并在代码里写明顺序是有意的；可用性代价（窗口内合法新用户也被拒）写进 G15，不偷偷换语义"
+      },
+      {
+        "id": "R2-NEW-4",
+        "action": "fixed",
+        "how": "authenticate 增加准入检查：全局 max_sessions 与单 peer（按会话记录的 source）max_browser_sessions 达上限即 CAPACITY_UNAVAILABLE；FileSession 记住自己的 source，close 时用它清桶，不再接受调用方传入的 source（评审 N-8 同批处理）",
+        "evidence": "单测 session_quotas_are_admission_checks（含释放后可复用）；探针字段 session_admission_capped=true；G16 文本改为『会话配额是准入检查』"
+      },
+      {
+        "id": "R2-NEW-5",
+        "action": "disputed-on-value-accepted-on-form",
+        "reviewer_claim": "静态求值得 squeezed_here=0，因此 squeeze_accounting_is_per_message=false 而场景冻 true；据此推论『9/9=77 PASS』与本树不自洽",
+        "measured": "同一棵树在 xc-pc-linux 上实跑得 file_messages_squeezed_out=16、final_send_squeezed_messages=15、squeeze_accounting_is_per_message=true，quota-backpressure 11 条期望 PASS。评审推算的前提是『100 条 4 字节终端消息会把队列挤空』；实际每条终端消息发出后立即 settle_terminal(4)，第一次挤掉一条 8 字节页后 buffered=120，120+4=124<=128 便不再挤，整个循环只挤掉 1 条",
+        "action_taken": "结论不同，但评审对证据形态的批评成立：把 F2 的判据挂在一段与挤占次序耦合的循环之后，静态读法能得出两种值，这种证据不合格。已改成独立夹具（全新引擎灌满 → 一次整预算的终端发送 → 被挤条数必须恰好等于灌入条数），并把 messages_queued_before_final_send=16 一起冻进场景，使这条不再依赖读者自行推演"
+      },
+      {
+        "id": "R2-W-1",
+        "action": "fixed",
+        "how": "#[derive(Debug, Clone, PartialEq, Eq)] 从 /// 注释里救回；新增单测断言 clone / == / {:?} 可用，防止再次静默丢失",
+        "note": "该缺陷由我自己的编辑造成（一次误删换行把 derive 并进注释），评审发现得对；也侧面证明这批改完没有被通读——已在欠账清单登记『改完未通读』为流程问题"
+      },
+      {
+        "id": "R2-W-2",
+        "action": "fixed",
+        "how": "list 的 is_dir/size 一律取自 symlink_metadata，不再调用会跟随链接的 next.metadata()（悬空链接不再让整页 NOT_FOUND，root 外目录的存在性也不再当 oracle 回传）"
+      },
+      {
+        "id": "R2-W-3",
+        "action": "fixed-for-files-declared-for-dirs",
+        "how": "文件改名走 hard_link + unlink（unlink 失败则回滚新名，绝不留两个名字）；目录在 std 下拿不到原子无覆盖原语（hard_link 对目录失败），该窗口写进 G13 与 PRODUCT §18.4 的未证事项",
+        "evidence": "单测 rename_a_file_is_non_overwriting_and_leaves_one_name"
+      },
+      {
+        "id": "R2-W-4",
+        "action": "fixed",
+        "how": "read_page 对 max_bytes=0 显式 PAGE_TOO_LARGE，不再返回 next_offset 原地踏步的空页",
+        "evidence": "单测 zero_byte_page_request_is_refused_not_stalling + 探针字段 zero_byte_page_refused=true（已冻）"
+      },
+      {
+        "id": "R2-W-5",
+        "action": "fixed",
+        "how": "abort_upload（客户端可发起、删已暂存字节）与 close_session 落审计行；ack_staged 的拒绝落行；内部清理改走 discard_stream，避免一次 commit 拒绝记两行",
+        "evidence": "单测 audit_records_are_snapshottable 断言 close_session 留行；G21 文本列出出口覆盖的动词清单"
+      },
+      {
+        "id": "R2-W-6",
+        "action": "partly-fixed",
+        "how": "refuses_link 改为必须 SYMLINK_ESCAPE（旧写法只看 is_err，删掉 resolve 的符号链接检查仍然绿）；locked_after_attempts 改为观测『第几次尝试才由锁定预检查拒』，不再是 lockout_after+1 的常量回读（实测仍为 6，与冻结期望一致）",
+        "remaining": "post_open_reverify_used 仍无法与 resolve 的前置检查区分：单线程测试造不出『resolve 之后、open 之前换链』。这条属评审自己列的『非机器可验』第 2 项，登记为欠账，不假装已解决"
+      },
+      {
+        "id": "R2-W-8",
+        "action": "fixed",
+        "how": "新增 every_validate_rule_has_a_red_test 补齐 5 条无覆盖的交叉约束（chunk≤inflight、ack≤buffered、ack≥信封+条目、handles≥sessions、任一上限不得为 0），并加一条『合法边界必须放行』的反向断言；MODULE.md 那句『逐条都有单测把它跑红』现在是事实"
+      },
+      {
+        "id": "R2-W-9",
+        "action": "declared-plus-direct-test",
+        "how": "读句柄在产品路径确实打不满（同步读在同一次调用内 acquire+release 配对）——G16 里如实写明；同时新增 HandleRegistry 直接单测，让 max_read_handles 分支至少有一条会红的断言。顺带修出真缺陷：live() 过去按引用计数求和，同一路径重复 acquire 会报 2 个活句柄，与自身文档矛盾，现改为按 (会话, 路径) 去重计数",
+        "remaining": "OS 句柄层面（/proc/self/fd 交叉验证）与全局 RSS 上界仍未验，属 M1 剩余项"
+      },
+      {
+        "id": "R2-W-10",
+        "action": "fixed",
+        "how": "PRODUCT §18.1 的『已连续落盘』改为『已连续暂存』并写明耐久性只在提交前一次 sync_all 之后成立；临时物名改为实际的 .<目标名>.nexus-part-<16hex>；§18.4 的『本节的场景当前状态是 Red Evidence』改为『M1 起 9 条跑绿但不构成 E5 验收，files.enabled 仍缺省关闭』"
+      },
+      {
+        "id": "R2-W-7",
+        "action": "open",
+        "how": "capability-negotiation 整案仍是探针自证（decide_channel 写在探针里，GatewayConfig 没有 files 字段）。这条属 M1 剩余项『files 配置块接进 GatewayConfig::validate 与 kill-switch』，本批未做；不把场景判绿当作产品已接线"
+      },
+      {
+        "id": "R2-W-12",
+        "action": "open",
+        "how": "part_creation_refuses_a_preplanted_symlink 仍只锁 std 前提（O_CREAT|O_EXCL 不跟随已存在符号链接），不经引擎：nonce 不可注入所以预置不了确切的 .part 名，把 create_new(true) 改成 create(true) 该测试不会红。如实登记为欠账，不声称闭环"
+      }
+    ],
+    "accepted_debt_from_notes": [
+      "N-1 SandboxRoot::reverify 返回恒 true 的 bool，与 TOCTOU『快照类型化』的措辞仍不匹配",
+      "N-2 注释引用了不存在的 remove_all_in_root（实际是 remove_tree）",
+      "N-3 预置 .part 被拒时报 CAPACITY_UNAVAILABLE 而非 SYMLINK_ESCAPE/EXISTS，审计行跟着记成容量问题",
+      "N-5 场景 [given] 的 max_inflight_bytes_per_session=1048576 与新默认 128 KiB 脱节（散文侧，不参与判定）",
+      "N-6 sftp_refusal_gate 靠错误消息子串判定，脆但失败方向安全",
+      "N-7 Windows 路径形状（extended-length 前缀、大小写不敏感使逐字节比较误判非规范）两条测试问题：本宿主不可编译，未验",
+      "N-8 terminal_delivered 在『接受』时自增而非实际送达，字段名与语义不符",
+      "流程性欠账：本批改动量大，改完没有被完整通读（W-1 的 derive 丢失即其后果）"
+    ]
+  }
+}

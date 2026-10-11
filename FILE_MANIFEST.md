@@ -2,7 +2,7 @@
 
 本包实现《Nexus 统一系统设计规范 v9》中的“统一仓库目录契约”。
 
-文件数（不含本清单）：177
+文件数（不含本清单）：202
 
 > 2026-10-10：原声明值 137 与表内实际行数（148）已不一致（既有漂移，含
 > `scenarios/engineering/bench_gate_verdicts.toml` 等未登记项）。本次登记
@@ -30,6 +30,19 @@
 > `lib.rs:9:21` / `lib.rs:23:12` 两个冻结锚点），声明值 175 -> 177。
 > 本轮先跑出新场景的 Red（`scenario-edf5bdf1d4b8`，夹具文件尚不存在 ⇒ `verdict` 期望落空），
 > 再加夹具转 Green——契约先行，不是先看输出再补期望。
+>
+> 2026-10-12（网关文件服务 M1 第三片）：**修一处我自己造成的声明漂移**。上一片登记
+> 9 个 `gateway_file_*` 场景 + 引擎 + 探针 + 两份 evidence 时新增了 13 行表格，
+> 但头部声明值仍停在 177（表内实际 190 行）。这条漂移是那片引入的，不是既有历史，
+> 已在 `plan-artifacts/review-gateway-file-r1.md` 的整改中被点名"自述数字不可信"，
+> 现按 `awk '/^\| /{n++}'` 减表头一行实测校准为 190，加上本片新落入的两份
+> Review 案卷（r1/r2 各 2 行）⇒ 194；第五片又落入 r3/r4/r5 三份案卷（各 2 行）⇒ 200。
+>
+> 同时改变一条惯例：`.evidence/review-gateway-file-r1/` 与 `-r2/`（`summary.json` +
+> `findings.md`）按 `git add -f` **随分支携带**。理由是评审 r1 的 G1 项实测证明
+> "案卷只在评审机本地存在"使门禁不可跨宿主核验；`.gitignore:3` 的 `/.evidence`
+> 仍是默认排除，携带者必须显式放行（先例：`red-n2-p0-0`、`review-g11-ice-fix-qoder-r1`，
+> 见 commit `6757ffa`）。
 >
 > 既有缺口（非本次引入，保留待仓库所有者裁决）：`.evidence/.gitignore`、
 > `.evidence/README.md` 两行来自基线（`7d2e643`），但这两个文件已在
@@ -223,6 +236,18 @@
 | `scenarios/product/gateway_file_upload_resume.toml` | Machine-readable contract/policy/scenario |
 | `crates/nexus-web-gateway/src/file_service.rs` | Implementation under the gateway file contract (G12-G21) |
 | `crates/nexus-web-gateway/examples/gateway_file_contract.rs` | E4 probe for the 9 gateway_file_* scenarios |
+| `.evidence/review-gateway-file-r1/summary.json` | 引擎+探针独立评审第 1 轮（`CHANGES_REQUESTED`，6 条 FAIL）的机器可读案卷，`git add -f` 携带 |
+| `.evidence/review-gateway-file-r1/findings.md` | 上述评审的逐项取证（含本机复算探针与门禁复现） |
+| `.evidence/review-gateway-file-r2/summary.json` | 第 2 轮复评（针对 F1/F2/F3/F4/F5 修复）的机器可读案卷，`git add -f` 携带 |
+| `.evidence/review-gateway-file-r2/findings.md` | 第 2 轮复评的逐项判定与新发现 |
+| `.evidence/review-gateway-file-r3/summary.json` | 第 3 轮复评（针对 r2 的 5 条 FAIL）机器可读案卷，`git add -f` 携带 |
+| `.evidence/review-gateway-file-r3/findings.md` | 第 3 轮逐项判定：NEW-1..NEW-5 处置复核 + 2 条新 FAIL |
+| `.evidence/review-gateway-file-r4/summary.json` | 第 4 轮复评（针对 r3 修复）机器可读案卷，`git add -f` 携带 |
+| `.evidence/review-gateway-file-r4/findings.md` | 第 4 轮逐项判定：1 条 FAIL + 8 条 WARN，含"证据不实"三条 |
+| `.evidence/review-gateway-file-r5/summary.json` | 第 5 轮处置审计（评审方按变异核验），`git add -f` 携带 |
+| `.evidence/review-gateway-file-r5/findings.md` | 第 5 轮：1 条 FAIL（衰减判据无杀伤力）+ 4 条 WARN |
+| `.evidence/review-gateway-file-r6/summary.json` | 第 6 轮处置审计，verdict `COMMENTED`（0 FAIL），`git add -f` 携带 |
+| `.evidence/review-gateway-file-r6/findings.md` | 第 6 轮：1 WARN + 4 NOTE，并判定本增量可合入 |
 | `.agents/red-evidence-gateway-file-service.txt` | Contract-first Red Evidence (M0) |
 | `.agents/green-evidence-gateway-file-service-m1.txt` | Green Evidence for M1 slice 1 |
 
