@@ -61,7 +61,7 @@ fn main() -> ExitCode {
 fn dispatch(command: &str, rest: &[String]) -> Outcome {
     match command {
         "status" => commands::status(),
-        "context" => commands::context(rest.first().map(String::as_str).unwrap_or("")),
+        "context" => commands::context(rest),
         "check" => commands::check(),
         "test" => commands::test_affected(),
         "verify" => commands::verify(rest.first().map(String::as_str).unwrap_or("")),
@@ -69,6 +69,7 @@ fn dispatch(command: &str, rest: &[String]) -> Outcome {
         "run" => run_scenario::run_scenario(rest),
         "scenario" => scenario_cmd::dispatch(rest),
         "code" => code_intel::run(rest),
+        "mcp" => code_intel::mcp::dispatch(rest),
         "bench" => commands::bench(),
         "replay" => (
             "UNKNOWN".to_string(),

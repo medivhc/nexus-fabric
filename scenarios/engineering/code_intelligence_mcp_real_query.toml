@@ -1,0 +1,76 @@
+schema_version = 1
+id = "engineering.code-intelligence-mcp-real-query"
+title = "经 MCP tools/call 走一次真实语义查询，返回的就是 CLI 那套中立 DTO（不另造 schema，也不泄露 LSP 原文）"
+evidence_strength = "E4"
+requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#4-agent-facing-api"
+
+# 作用域限定在夹具 workspace（3 个源文件、独立 cargo workspace root），
+# 因此冷启动面与命中集合都是确定的；换成仓库根 workspace 会让这条场景变成网速竞赛。
+
+[given]
+repository = "initialized"
+network = "none (本地 language server 子进程)"
+
+[when]
+command = "nexus-harness mcp selftest --with-query --json"
+
+[[expect]]
+field = "command"
+equals = "mcp"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "authority"
+equals = "advisory"
+
+[[expect]]
+field = "query_skipped"
+equals = false
+
+# 真实两次 tools/call → code_intel::run → **同一个** rust-analyzer 进程。
+[[expect]]
+field = "query_first_verdict"
+equals = "PASS"
+
+[[expect]]
+field = "query_first_results"
+non_empty = true
+
+[[expect]]
+field = "query_second_verdict"
+equals = "PASS"
+
+[[expect]]
+field = "query_second_results"
+non_empty = true
+
+# Phase 4 的判定数据：第二次查询落在同一个 provider 会话里（没有重新 initialize/索引），
+# 判据用**相对比值**（selftest 里算 `second*4 < first`）而不是绝对毫秒数 —— 绝对值随宿主
+# 负载漂移，钉死它只会造出与语义无关的脆弱红。
+[[expect]]
+field = "query_warm_reused"
+equals = true
+
+[[expect]]
+field = "query_provider_kind"
+equals = "rust-analyzer"
+
+# MCP 侧不得把 authority 洗掉：工具结果里仍然是 advisory，而不是"PASS 权"。
+[[expect]]
+field = "query_authority"
+equals = "advisory"
+
+[[expect]]
+field = "query_workspace_scope"
+equals = "engineering/nexus-harness/fixtures/code-intel"
+
+[[expect]]
+field = "query_snapshot_bound"
+equals = true
+
+[[expect]]
+field = "snapshot.source_revision"
+non_empty = true

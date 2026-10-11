@@ -144,3 +144,25 @@ Phase 0/1 与提案 §16 十一条已交付：16 个 E4 场景在 xc-pc-linux �
 | M2 Phase 3 | `mcp serve` 握手 + `tools/list` + `tools/call` 通过 E2；`mcp selftest` E4 在 Linux PASS；写请求拒绝计数可见；文档写明"第三方客户端未验证" |
 | M3 Phase 4 | 会话复用 spike 有结论；若做 ⇒ E4 证明复用生效 + 失效正确 + `--no-session` 可退；若不做 ⇒ 记录降级理由；判断台账落地；MODULE.md 增补 provider 清单 |
 | M4 收尾 | Linux 上 `verify --fast` overall PASS、全部 E4（含新增）PASS、`cargo test -p nexus-harness` 全绿；FILE_MANIFEST/MODULE/证据同步；推送 stacked 分支并开 PR |
+
+## 附录 A：Phase 4 判断台账（逐项做/不做 + 实测依据）
+
+测量时间 2026-10-11，宿主 Windows（rust-analyzer 1.95.0 / node v24.14.1 / 无 python）与
+`xc-pc-linux`（rust-analyzer 1.98.1 / Python 3.8.10 / clangd 10.0.0 / node v10.19.0）。
+仓库面积统计排除 `.git`、`target/`、`node_modules`、`.evidence/`。
+
+| 候选（提案 §15 Phase 4 列表） | 决定 | 依据 |
+| --- | --- | --- |
+| `clangd` | **不做** | 仓库内 `.c/.h/.cpp` = **0 文件**，无 `build.rs`、无 `bindgen`/`cc` 依赖。Linux 上 clangd 10 在场也无物可查。接它只会得到一个没有使用者的 provider |
+| `gopls` | **不做** | `.go` = **0 文件**。 |
+| `pyright` / `pylsp` | **不做** | 提供方缺席：两宿主都没有 pyright/pylsp；装上需要网络安装（npm/pip），所有者已明确"都不装，按现状交付"。且 Python 侧只有 1456 行 stdlib 脚本、无类型工具配置，语义查询的收益面很小 |
+| `typescript-language-server` | **不做** | `.ts/.tsx` = **0 文件**；手写 JS 只有 `crates/nexus-web-gateway/static/app.js` 一个 767 行文件，无 `package.json`/`tsconfig.json`/构建器 |
+| 多语言 provider seam（代码层抽象） | **不做实现，只做清单** | 上面四项都不做 ⇒ seam 没有第二个使用者，写了就是 §15 禁止的"空泛框架"。改为在 MODULE.md 写"接下一个语言 provider 需要动哪几处"的清单，成本是文档、收益是将来不重构 |
+| 跨命令会话复用缓存 | **先 spike，由数字决定** | 触发条件（§11 第一条）已由实测满足：真实 47-crate workspace 上 `symbol Task` `duration_ms=90535` 且 `ready=false`；`references` 给 `--ready-timeout-secs 300` 仍不收敛；`symbol` 类在缓存热的情况下 31s 收敛。spike 载体是 `mcp selftest --with-query` 的两次查询（`query_first_ms` / `query_second_ms` / 相对判据 `second×4 < first`），数字必须来自 xc-pc-linux |
+
+spike 结论（回填于 M3 提交）：
+
+- 同一 `mcp serve` 进程内第二次查询：`query_first_ms = <待填>`、`query_second_ms = <待填>`，
+  `query_warm_reused = <待填>`（Evidence：`<待填>`，宿主 `xc-pc-linux`）。
+- 由这组数字决定的落法：`<待填>`（三选一：做跨命令缓存 / 只做 serve 进程内复用并把跨命令记为暂缓 /
+  完全不做并记录理由）。

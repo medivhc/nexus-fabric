@@ -11,6 +11,7 @@
 
 mod dto;
 mod lsp;
+pub(crate) mod mcp;
 mod provider;
 mod rust_analyzer;
 
@@ -234,6 +235,225 @@ pub fn run(args: &[String]) -> Outcome {
         kept_count(&fields)
     );
     ("PASS".to_string(), message, fields)
+}
+
+/// `context` 语义层的产物（提案 §15 Phase 2，契约见 MODULE.md「Context Semantic Anchoring」）。
+pub struct SemanticReport {
+    /// `ok` | `no_candidates` | `not_found` | `unavailable` | `timeout` | `stale`
+    /// | `unsupported_scope`
+    pub status: &'static str,
+    /// 非 `ok` 时的结构化原因（`code` 沿用 `code` 命令的 10 个冻结错误码，不新造）。
+    pub reason: Option<(String, String)>,
+    /// 复用 `ResultItem` 的语言中立形状，不另造 DTO。
+    pub anchors: Vec<Value>,
+    pub candidate_queries: usize,
+    /// 模块契约里看到的 code span 总数（>= candidate_queries 的取材上限），
+    /// 用于让"写法不合规则被跳过"成为可见数字。
+    pub candidate_spans: usize,
+    pub max_results: usize,
+    pub truncated: bool,
+    pub workspace_scope: String,
+    pub snapshot: Value,
+}
+
+/// `context` 的语义预算：比 `code` 小得多，因为它默认会被 Agent 当作"入口"反复调用。
+pub const CONTEXT_MAX_RESULTS: usize = 8;
+/// 最多尝试几个候选符号；**首个产出锚点的候选即停**（每次尝试都是一次冷启动，实测 30–90s）。
+const CONTEXT_MAX_CANDIDATES: usize = 3;
+
+/// 从模块契约里取候选符号名：只认反引号**成对包裹**的、首字母大写的 Rust 风格标识符。
+/// 刻意不猜、不扫源码 —— 扫源码就把"语义层"退化成又一次文本匹配（提案 §1 要避免的东西）。
+///
+/// 返回 `(候选, 看到的 span 数)`：后者让"没被采用的格子"成为可见数字，
+/// 否则 MODULE.md 写法不合规则漏收时，消费方只看到"锚点少"而分不清是没写还是没查到。
+fn contract_candidates(module_md: &Path) -> (Vec<String>, usize) {
+    let Ok(text) = std::fs::read_to_string(module_md) else {
+        return (Vec::new(), 0);
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut spans = 0usize;
+    // 用状态机取"成对反引号之间"的内容。早先用 `split('`').skip(1)` 是把首个反引号之后的
+    // 每一段都当作 code span，于是两个 span 之间的普通散文里一个首字母大写的单词也会漏进来
+    // ——那不是候选符号，是散文（独立子代理实测指出）。
+    let mut in_code = false;
+    let mut span = String::new();
+    for ch in text.chars() {
+        if ch == '`' {
+            if in_code {
+                spans += 1;
+                push_candidate(&mut out, &span);
+                span.clear();
+            }
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            span.push(ch);
+        }
+    }
+    (out, spans)
+}
+
+/// 只收**整段就是一个标识符**的 code span。
+///
+/// 刻意不做"取词首"那种截断：`Cargo.toml` 会变成 `Cargo`、`Context-Builder` 会变成 `Context`，
+/// 而这些截断片段完全可能命中**另一个**符号，把 Agent 领到错地方 —— 比漏收更糟。
+/// 代价是一格子里写多个名字（`Foo, Bar`）不会被采用，这必须写进 MODULE.md 的契约里，
+/// 而不是让作者去猜；同时把"看到几个 span、采用几个"通过 `semantic_budget` 暴露出来，
+/// 让漏收是可观测的（提案 §5：禁止静默丢弃）。
+fn push_candidate(out: &mut Vec<String>, span: &str) {
+    let word = span.trim();
+    if word.len() < 3 || !word.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return;
+    }
+    if !word.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return;
+    }
+    if !out.iter().any(|s| *s == word) {
+        out.push(word.to_string());
+    }
+}
+
+/// 错误码 → `semantic_status`。保持与 `code` 一致的可观测语义：
+/// "工具不在场"是 `unavailable`，"索引没收敛完"是 `timeout`，"确实没有这个符号"才是 `not_found`。
+/// 10 个冻结错误码逐个表态，不留 catch-all 把"我们自己的用法错了"糊成"工具不可用"。
+fn status_for_error(code: &str) -> &'static str {
+    match code {
+        "PROVIDER_UNAVAILABLE" | "INITIALIZATION_FAILED" | "PROVIDER_CRASHED" => "unavailable",
+        "TIMEOUT" => "timeout",
+        "SYMBOL_NOT_FOUND" => "not_found",
+        "SNAPSHOT_STALE" => "stale",
+        "WORKSPACE_UNRESOLVED" => "unsupported_scope",
+        // 参数不合法是我们的用法问题，不是工具不在场：单独一个状态，便于场景与排查分辨。
+        "QUERY_INVALID" => "invalid_query",
+        // 截断本身由 `semantic_budget.truncated` 表达，不该作为失败码出现。
+        // 真出现在失败路径上就说明实现有问题 —— 宁可"什么都不宣称"(unavailable)，
+        // 也不把它翻译成 ok/not_found 这类看起来像结论的状态。
+        "RESULT_TRUNCATED" => "unavailable",
+        _ => "unavailable",
+    }
+}
+
+/// 供 `context` 复用的入口（Phase 2）。
+///
+/// 这里刻意**复用 `run()`** 而不是另写一条语义查询路径：`run()` 里已经钉住了
+/// 作用域归一化判定、"参数错误不得先起子进程"、指纹哨兵值拒用、预算截断可见、
+/// `authority = advisory` 与全部错误码映射。另起一条路径就等于把这些不变量复制一份
+/// ——而复制出去的不变量迟早漂移（round 2 的 `..` 绕过就是这么来的）。
+/// 代价是要合成一次 argv，比暴露一个 typed 入口丑，但它换来的是"只有一套真相"。
+pub fn anchors(repo: &Repo, module_dir: &Path, provider_override: Option<&str>) -> SemanticReport {
+    let scope_rel = dto::relative_path(&repo.root, module_dir);
+    let bindings = Bindings::current(repo);
+    let digest = bindings.working_tree_digest.clone();
+    let mut rep = SemanticReport {
+        status: "ok",
+        reason: None,
+        anchors: Vec::new(),
+        candidate_queries: 0,
+        candidate_spans: 0,
+        max_results: CONTEXT_MAX_RESULTS,
+        truncated: false,
+        workspace_scope: scope_rel.clone(),
+        snapshot: bindings.to_json(),
+    };
+
+    // 1) 语义作用域必须是 cargo workspace root。理由写在契约里，不是实现细节：
+    //    从成员目录启动 rust-analyzer 会把整个仓库 workspace 灌进索引（实测 30–90s 且
+    //    `ready` 常常不收敛），有界预算兜不住，与其静默给一份偏低的锚点集合，
+    //    不如明确说"这次不跑语义层"。
+    let is_workspace_root = std::fs::read_to_string(module_dir.join("Cargo.toml"))
+        .map(|text| text.lines().any(|l| l.trim().starts_with("[workspace]")))
+        .unwrap_or(false);
+    if !is_workspace_root {
+        rep.status = "unsupported_scope";
+        rep.reason = Some((
+            "UNSUPPORTED".to_string(),
+            format!(
+                "{scope_rel} 不是 cargo workspace root（其 Cargo.toml 没有 [workspace] 声明），\
+                 在此启动 rust-analyzer 会加载整个仓库 workspace；要语义锚点请对小作用域直接跑 \
+                 `nexus-harness code symbol <Name> --workspace <workspace-root> --json`"
+            ),
+        ));
+        return rep;
+    }
+
+    // 2) 指纹不可用 ⇒ 不起 provider（与 `code` 同一规则：不把"无法证明绑定"说成"绑定成立"）。
+    if digest_is_unusable(&digest) {
+        rep.status = "stale";
+        rep.reason = Some((
+            "SNAPSHOT_STALE".to_string(),
+            "查询开始前取不到可信的工作树指纹（git status/write-tree 失败或降级）".to_string(),
+        ));
+        return rep;
+    }
+
+    // 3) 候选只来自模块契约。
+    let (candidates, spans) = contract_candidates(&module_dir.join("MODULE.md"));
+    rep.candidate_spans = spans;
+    if candidates.is_empty() {
+        rep.status = "no_candidates";
+        rep.reason = Some((
+            "SYMBOL_NOT_FOUND".to_string(),
+            "模块契约 MODULE.md 里没有可解析的反引号标识符；语义层不猜名字也不扫源码".to_string(),
+        ));
+        return rep;
+    }
+
+    // 4) 逐个尝试，首个产出的即停；全部空手时保留**最后一条**失败原因（不编造）。
+    let mut last_reason: Option<(String, String)> = None;
+    for name in candidates.iter().take(CONTEXT_MAX_CANDIDATES) {
+        rep.candidate_queries += 1;
+        let mut args: Vec<String> = vec![
+            "symbol".to_string(),
+            name.clone(),
+            "--workspace".to_string(),
+            scope_rel.clone(),
+            "--max-results".to_string(),
+            CONTEXT_MAX_RESULTS.to_string(),
+            // context 是入口，不是下钻工具：片段压到 1 行，要看细节再用 `code hover`。
+            "--max-snippet-lines".to_string(),
+            "1".to_string(),
+        ];
+        if let Some(binary) = provider_override {
+            args.push("--provider-binary".to_string());
+            args.push(binary.to_string());
+        }
+
+        let (verdict, _message, fields) = run(&args);
+        let map: serde_json::Map<String, Value> = fields.into_iter().collect();
+        let results = map
+            .get("results")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if verdict == "PASS" && !results.is_empty() {
+            rep.anchors = results.into_iter().take(CONTEXT_MAX_RESULTS).collect();
+            rep.truncated = map
+                .get("budget")
+                .and_then(|b| b.get("truncated"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            rep.status = "ok";
+            rep.reason = None;
+            return rep;
+        }
+        let code = map
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(Value::as_str)
+            .unwrap_or("SYMBOL_NOT_FOUND")
+            .to_string();
+        let reason_text = map
+            .get("error")
+            .and_then(|e| e.get("reason"))
+            .and_then(Value::as_str)
+            .unwrap_or("语义查询未产出锚点")
+            .to_string();
+        rep.status = status_for_error(&code);
+        last_reason = Some((code, reason_text));
+    }
+    rep.reason = last_reason;
+    rep
 }
 
 fn kept_count(fields: &[(String, Value)]) -> usize {
@@ -854,5 +1074,259 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 每个用例独占的临时目录：测试在同一进程里并发跑，名字必须带用例标签与 pid；
+    /// 一律落在 `std::env::temp_dir()` 下，绝不在仓库工作树里造文件。
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("nexus-context-{tag}-{pid}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)
+            .unwrap_or_else(|e| panic!("建临时目录 {} 失败：{e}", dir.display()));
+        dir
+    }
+
+    /// `anchors` 的候选门之后就是 `run()`，一旦门次出错就会去找 language server。
+    /// 传一个必然不存在的 binary 名，把"不该发生 provider 调用"变成可观测的断言：
+    /// 真走到那一步的话 `resolve_binary` 报 `PROVIDER_UNAVAILABLE`，status 变成
+    /// `unavailable` 且 `candidate_queries >= 1`，绝不再是预期的那个门状态。
+    const BOGUS_PROVIDER: &str = "definitely-not-a-real-language-server";
+
+    /// 候选只认反引号里的 Rust 风格标识符：首字母大写、长度 >= 3、逐字符是 ASCII
+    /// 字母数字或下划线；重复项去重并保留首次出现顺序。
+    ///
+    /// `Foo, Bar` 的形状要说清：实现先做"整段逐字符合法"过滤，再取词首连续 run，
+    /// 所以同一个反引号对里的列表**整体被丢弃**——既不产 `Foo` 也不产 `Bar`。
+    /// 这与"取词首"的意图不符（也正因此那段 take_while 实际不可达）。这里按现状
+    /// 钉死形状：生产侧改成先取词首时，本断言会立刻红，不会被静默放过。
+    #[test]
+    fn contract_candidates_keeps_only_deduped_uppercase_identifiers() {
+        let dir = scratch_dir("candidates");
+        let md = dir.join("MODULE.md");
+        std::fs::write(
+            &md,
+            "- `Egress` 出向网关\n\
+             - `Scheduler` 调度\n\
+             - `Foo, Bar` 一个反引号里的列表\n\
+             - `run_static` 小写开头\n\
+             - `AB` 长度不足 3\n\
+             - `not a symbol` 含空格\n\
+             - `Egress` 重复出现\n\
+             - `Snapshot_1` 下划线与数字合法\n\
+             - `Context-Builder` 含连字符\n",
+        )
+        .expect("写 MODULE.md");
+        let (raw, spans) = contract_candidates(&md);
+        let got: Vec<&str> = raw.iter().map(String::as_str).collect();
+        assert_eq!(
+            got,
+            ["Egress", "Scheduler", "Snapshot_1"],
+            "只留合法标识符并按首次顺序去重"
+        );
+        // 看到的 code span 总数必须如实上报：漏收要能被看见，而不是悄悄少几个锚点。
+        assert_eq!(spans, 9, "成对反引号的格子总数");
+        assert_eq!(
+            got.iter().filter(|s| **s == "Egress").count(),
+            1,
+            "重复项必须去重"
+        );
+        // 一格里写多个名字（Foo, Bar）整格作废：刻意不做「取词首」，因为那会把
+        // Cargo.toml 变成 Cargo、把 Context-Builder 变成 Context，而截断片段可能命中
+        // 另一个符号、把 Agent 领到错的地方。取舍与代价都写在 MODULE.md 的契约里。
+        for leak in [
+            "Foo",
+            "Bar",
+            "run_static",
+            "AB",
+            "not a symbol",
+            "Context-Builder",
+        ] {
+            assert!(!got.contains(&leak), "{leak:?} 不该成为候选");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 读不到 MODULE.md（文件不存在 / 该路径是目录 / 父目录都不在）一律返回空 Vec：
+    /// 候选集不许靠猜，IO 失败也不许 panic——上层据此报 `no_candidates`。
+    #[test]
+    fn contract_candidates_without_readable_module_md_is_empty() {
+        let dir = scratch_dir("missing-md");
+        let absent = dir.join("MODULE.md");
+        assert!(
+            contract_candidates(&absent).0.is_empty(),
+            "文件不存在时必须为空"
+        );
+        std::fs::create_dir_all(&absent).expect("把 MODULE.md 的位置做成目录");
+        assert!(
+            contract_candidates(&absent).0.is_empty(),
+            "路径是目录时必须为空"
+        );
+        let deep = dir.join("no-such-dir").join("MODULE.md");
+        assert!(
+            contract_candidates(&deep).0.is_empty(),
+            "父目录不存在时同样为空"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 映射表逐臂钉死，兜底必须是悲观值 `unavailable`：空串、拼错的码、大小写不符
+    /// 都不许落到 `ok` / `no_candidates` / `not_found` 这类看起来像结论的状态——
+    /// "我们没映射上这个码"不等于"查过了确实没有"。
+    #[test]
+    fn status_for_error_maps_every_arm_and_fails_closed() {
+        for code in [
+            "PROVIDER_UNAVAILABLE",
+            "INITIALIZATION_FAILED",
+            "PROVIDER_CRASHED",
+        ] {
+            assert_eq!(status_for_error(code), "unavailable", "{code} 是工具不在场");
+        }
+        assert_eq!(
+            status_for_error("TIMEOUT"),
+            "timeout",
+            "索引未收敛不等于没有符号"
+        );
+        assert_eq!(status_for_error("SYMBOL_NOT_FOUND"), "not_found");
+        assert_eq!(status_for_error("SNAPSHOT_STALE"), "stale");
+        assert_eq!(
+            status_for_error("WORKSPACE_UNRESOLVED"),
+            "unsupported_scope"
+        );
+        // QUERY_INVALID 有独立状态：那是"我们自己的用法错了"，不能被糊成"工具不可用"。
+        assert_eq!(status_for_error("QUERY_INVALID"), "invalid_query");
+        // 剩下的冻结码（RESULT_TRUNCATED）与一切未知码都走悲观兜底。
+        for code in [
+            "",
+            " ",
+            "ok",
+            "OK",
+            "snapshot_stale",
+            "RESULT_TRUNCATED",
+            "BOGUS_CODE",
+        ] {
+            let got = status_for_error(code);
+            assert_eq!(got, "unavailable", "未知码 {code:?} 必须落到悲观值");
+            assert_ne!(got, "ok", "未知码 {code:?} 不得伪造成成功");
+            assert_ne!(got, "no_candidates", "未知码 {code:?} 不得伪装成契约缺候选");
+            assert_ne!(got, "not_found", "未知码 {code:?} 不得伪装成查过没有");
+        }
+    }
+
+    /// 语义作用域门（gate 1）必须先于候选门与 provider：非 workspace root 只回
+    /// `unsupported_scope` + `UNSUPPORTED`，且一次 `run()` 都不发起。
+    /// MODULE.md 里刻意放一个合法候选——万一作用域门被挪到候选之后，代码就会走到
+    /// `run()`，届时 status 变成 `unavailable`（假 binary 名）、`candidate_queries`
+    /// 变成 1，下面关于这两项的断言会同时抓住它，不会静默起真的 rust-analyzer。
+    #[test]
+    fn anchors_refuses_non_workspace_scope_without_spawning_provider() {
+        let repo = Repo::discover().expect("must run inside the nexus repository");
+        for (tag, manifest) in [
+            ("package-only", Some("[package]\nname = \"scratch\"\n")),
+            ("no-manifest", None),
+        ] {
+            let dir = scratch_dir(&format!("scope-{tag}"));
+            if let Some(text) = manifest {
+                std::fs::write(dir.join("Cargo.toml"), text).expect("写 Cargo.toml");
+            }
+            std::fs::write(dir.join("MODULE.md"), "- `Egress` 出向网关\n").expect("写 MODULE.md");
+
+            let rep = anchors(&repo, &dir, Some(BOGUS_PROVIDER));
+            assert_eq!(
+                rep.status, "unsupported_scope",
+                "{tag}：status 实际为 {}",
+                rep.status
+            );
+            let reason = rep.reason.as_ref().expect("非 ok 状态必须带结构化原因");
+            assert_eq!(reason.0, "UNSUPPORTED", "{tag}：原因码沿用 code 的冻结表");
+            assert!(
+                reason.1.contains("cargo workspace root"),
+                "{tag}：{}",
+                reason.1
+            );
+            assert!(rep.anchors.is_empty(), "{tag}：作用域被拒时不得有锚点");
+            assert_eq!(
+                rep.candidate_queries, 0,
+                "{tag}：0 次尝试才等于没起 language server"
+            );
+            assert!(!rep.truncated, "{tag}：没有查询就没有截断可报");
+            assert_eq!(rep.max_results, CONTEXT_MAX_RESULTS, "{tag}");
+            assert!(
+                rep.snapshot.is_object(),
+                "{tag}：仓库发现已完成，snapshot 必须在场"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// 候选集为空 ⇒ `no_candidates` + `SYMBOL_NOT_FOUND`，同样一次查询都不发起。
+    /// 门次提醒：作用域门之后、候选门之前还有一道指纹门（gate 2），git 调用降级成
+    /// 哨兵值时本用例只能观测到 `stale`（并发跑测试时的真实形态，见 env.rs 的
+    /// index.lock 说明）。两个分支都写断言，不用 early return 跳过——"没测到"
+    /// 不能伪装成"测过了"。
+    #[test]
+    fn anchors_without_contract_candidates_reports_no_candidates() {
+        let repo = Repo::discover().expect("must run inside the nexus repository");
+        let dir = scratch_dir("no-candidates");
+        std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = []\n")
+            .expect("写 Cargo.toml");
+        std::fs::write(
+            dir.join("MODULE.md"),
+            "- 只有小写 `run_static` 与短名 `AB`，无合法候选\n",
+        )
+        .expect("写 MODULE.md");
+
+        let rep = anchors(&repo, &dir, Some(BOGUS_PROVIDER));
+        assert!(rep.anchors.is_empty(), "候选缺失时不得有锚点");
+        assert_eq!(rep.candidate_queries, 0, "候选为空即返回，不得尝试任何查询");
+        assert!(!rep.truncated);
+        let reason = rep.reason.as_ref().expect("非 ok 状态必须带结构化原因");
+        if digest_is_unusable(&repo.working_tree_digest()) {
+            assert_eq!(rep.status, "stale", "指纹降级时门 2 先命中");
+            assert_eq!(reason.0, "SNAPSHOT_STALE");
+        } else {
+            assert_eq!(rep.status, "no_candidates", "status 实际为 {}", rep.status);
+            assert_eq!(
+                reason.0, "SYMBOL_NOT_FOUND",
+                "不猜名字不等于'库里没有这个符号'"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 门次回归护栏：既没有 Cargo.toml 也没有 MODULE.md 时必须报 `unsupported_scope`，
+    /// 而不是看似无害的 `no_candidates`——后者会被 Agent 读成"契约里没符号"而跑去改
+    /// MODULE.md，真正该说的是"这个作用域压根不该跑语义层"。反向对照（补上 `[workspace]`
+    /// 声明后落回后续门）证明 unsupported_scope 来自 Cargo.toml 判定，
+    /// 不是"目录空无一物"的巧合。
+    #[test]
+    fn anchors_checks_workspace_scope_before_candidate_extraction() {
+        let repo = Repo::discover().expect("must run inside the nexus repository");
+        let dir = scratch_dir("scope-before-candidates");
+
+        let bare = anchors(&repo, &dir, Some(BOGUS_PROVIDER));
+        assert_eq!(
+            bare.status, "unsupported_scope",
+            "作用域门必须先于候选门命中"
+        );
+        let reason = bare.reason.as_ref().expect("非 ok 状态必须带结构化原因");
+        assert_eq!(reason.0, "UNSUPPORTED", "空目录不得被说成契约缺候选");
+        assert_eq!(bare.candidate_queries, 0, "门 1 命中时不该有任何语义尝试");
+        assert!(bare.anchors.is_empty());
+
+        std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = []\n")
+            .expect("写 Cargo.toml");
+        let after = anchors(&repo, &dir, Some(BOGUS_PROVIDER));
+        assert_ne!(
+            after.status, "unsupported_scope",
+            "补上 [workspace] 后必须穿过作用域门"
+        );
+        assert!(
+            matches!(after.status, "no_candidates" | "stale"),
+            "只允许落到候选门或指纹门，实际 {}",
+            after.status
+        );
+        assert_eq!(after.candidate_queries, 0, "两道门都在 run() 之前返回");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

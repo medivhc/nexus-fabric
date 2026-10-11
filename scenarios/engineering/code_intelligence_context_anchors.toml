@@ -1,0 +1,80 @@
+schema_version = 1
+id = "engineering.code-intelligence-context-anchors"
+title = "context 从模块契约取候选符号并有界返回语义锚点，绑定 snapshot（提案 §15 Phase 2 / §13）"
+evidence_strength = "E4"
+requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#15-suggested-implementation-phases"
+
+# 语义作用域取夹具目录：它是 cargo workspace root（自带 [workspace]），rust-analyzer 从那里
+# 启动只加载 3 个源文件 ⇒ 本场景的命中集合与耗时都是确定的。成员目录（如
+# engineering/nexus-harness）走的是另一条承诺：unsupported_scope，见
+# code_intelligence_context_scope_guard.toml。
+
+[given]
+repository = "initialized"
+network = "none (本地 language server 子进程)"
+
+[when]
+command = "nexus-harness context engineering/nexus-harness/fixtures/code-intel --json"
+
+[[expect]]
+field = "command"
+equals = "context"
+
+# 原有三项输出不得被 Phase 2 改变语义（只增不改）。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "module_contract"
+non_empty = true
+
+[[expect]]
+field = "headings"
+non_empty = true
+
+[[expect]]
+field = "mapped_scenarios"
+non_empty = true
+
+# 新增的语义面。
+[[expect]]
+field = "authority"
+equals = "advisory"
+
+[[expect]]
+field = "semantic_status"
+equals = "ok"
+
+[[expect]]
+field = "semantic_anchors"
+non_empty = true
+
+[[expect]]
+field = "semantic_anchors.0.path"
+non_empty = true
+
+[[expect]]
+field = "semantic_anchors.0.in_scope"
+equals = true
+
+[[expect]]
+field = "semantic_budget.max_results"
+equals = 8
+
+[[expect]]
+field = "semantic_budget.truncated"
+one_of = [true, false]
+
+[[expect]]
+field = "semantic_budget.candidate_queries"
+one_of = [1, 2, 3]
+
+# 语义事实必须知道自己描述的是哪个工作树（提案 §13）。
+[[expect]]
+field = "snapshot.source_revision"
+non_empty = true
+
+[[expect]]
+field = "snapshot.working_tree_digest"
+non_empty = true

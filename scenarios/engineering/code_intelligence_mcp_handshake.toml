@@ -1,0 +1,67 @@
+schema_version = 1
+id = "engineering.code-intelligence-mcp-handshake"
+title = "MCP 薄适配只暴露 8 个只读工具，握手/未知方法/非法参数的失败形状正确，且不声明任何写能力（提案 §10/§6/§12/§16.8）"
+evidence_strength = "E4"
+requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#10-mcp-integration"
+
+# selftest 用 current_exe() 把自身作为子进程拉起 `mcp serve`，经**真实 stdio 管道**跑协议。
+# 默认不触发 language server 冷启动：第三条 tools/call 故意用非法参数，验证的是
+# "协议层错误走 JSON-RPC error，而不是伪装成 Nexus verdict"。
+# 诚实边界：这条场景证明的是"我们的 server 与我们的 client 互操作正确"；第三方 MCP 客户端
+# 在本仓库两个宿主上都不存在，与真实客户端的互操作**未经验证**（MODULE.md 已照此声明）。
+
+[given]
+repository = "initialized"
+network = "none (本地 stdio 子进程)"
+
+[when]
+command = "nexus-harness mcp selftest --json"
+
+[[expect]]
+field = "command"
+equals = "mcp"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+# 适配器本身不拥有最终 PASS 权。
+[[expect]]
+field = "authority"
+equals = "advisory"
+
+[[expect]]
+field = "protocol_version"
+non_empty = true
+
+[[expect]]
+field = "initialized_ok"
+equals = true
+
+# 8 个只读 verb 一一对应，且**没有任何写能力工具**。
+[[expect]]
+field = "tools_count"
+equals = 8
+
+[[expect]]
+field = "write_tools_exposed"
+equals = 0
+
+# 未知方法与非法参数都必须被拒绝（不是静默返回空结果）。
+[[expect]]
+field = "unknown_method_rejected"
+equals = true
+
+[[expect]]
+field = "bad_arguments_rejected"
+equals = true
+
+# 不触发 provider：这条把"selftest 默认是便宜的"钉成契约，
+# 否则将来有人给 selftest 加了全仓查询，场景会悄悄变慢而不被察觉。
+[[expect]]
+field = "query_skipped"
+equals = true
+
+[[expect]]
+field = "snapshot.source_revision"
+non_empty = true

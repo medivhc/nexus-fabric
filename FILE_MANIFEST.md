@@ -2,7 +2,7 @@
 
 本包实现《Nexus 统一系统设计规范 v9》中的“统一仓库目录契约”。
 
-文件数（不含本清单）：178
+文件数（不含本清单）：184
 
 > 2026-10-10：原声明值 137 与表内实际行数（148）已不一致（既有漂移，含
 > `scenarios/engineering/bench_gate_verdicts.toml` 等未登记项）。本次登记
@@ -32,6 +32,10 @@
 > 再加夹具转 Green——契约先行，不是先看输出再补期望。
 >
 > 2026-10-11（Phase 2-4 开工）：登记 `.agents/code-intelligence-phase-2-4-plan.md`，声明值 177 -> 178。
+>
+> 2026-10-11（Phase 2/3 契约与实现）：新增夹具 `MODULE.md`、`code_intel/mcp.rs` 与
+> 4 个场景（context 语义锚点 2 条、MCP 2 条），声明值 178 -> 184；
+> Code Intelligence 场景总数由 16 增至 20。
 >
 > 既有缺口（非本次引入，保留待仓库所有者裁决）：`.evidence/.gitignore`、
 > `.evidence/README.md` 两行来自基线（`7d2e643`），但这两个文件已在
@@ -167,12 +171,14 @@
 | `engineering/nexus-harness/fixtures/code-intel/src/lib.rs` | Rust source (fixture: re-export/cfg/probe) |
 | `engineering/nexus-harness/fixtures/code-intel/src/transport.rs` | Rust source (fixture: trait + multi-impl + generic dispatch) |
 | `engineering/nexus-harness/fixtures/code-intel/src/diagnostic_probe.rs` | Rust source (fixture: 刻意一处类型错误，供诊断条目形状 E4 断言) |
+| `engineering/nexus-harness/fixtures/code-intel/MODULE.md` | 夹具自身的模块契约（context 的语义候选只从这里取，反引号标识符即候选） |
 | `engineering/nexus-harness/src/main.rs` | Minimal compile/bootstrap source |
 | `engineering/nexus-harness/src/env.rs` | Rust source (harness CLI) |
 | `engineering/nexus-harness/src/config.rs` | Rust source (harness CLI) |
 | `engineering/nexus-harness/src/gates.rs` | Rust source (harness CLI) |
 | `engineering/nexus-harness/src/scenario.rs` | Rust source (harness CLI) |
 | `engineering/nexus-harness/src/evidence.rs` | Rust source (harness CLI) |
+| `engineering/nexus-harness/src/code_intel/mcp.rs` | Rust source (MCP stdio 薄适配：tools/list + tools/call 映射到 8 个只读 verb，含 selftest) |
 | `engineering/nexus-harness/src/code_intel/mod.rs` | Rust source (Code Intelligence CLI 层：参数/预算/snapshot/envelope) |
 | `engineering/nexus-harness/src/code_intel/dto.rs` | Rust source (Code Intelligence 语言中立 DTO 与错误码) |
 | `engineering/nexus-harness/src/code_intel/lsp.rs` | Rust source (JSON-RPC/LSP framing、只读白名单、有界会话) |
@@ -196,7 +202,11 @@
 | `scenarios/engineering/code_intelligence_callers.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/code_intelligence_definition.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/code_intelligence_diagnostics_advisory.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_context_anchors.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_context_no_fake_semantics.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/code_intelligence_diagnostics_item_shape.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_mcp_handshake.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_mcp_real_query.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/code_intelligence_hover.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/code_intelligence_implementations.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/code_intelligence_provider_unavailable.toml` | Machine-readable contract/policy/scenario |

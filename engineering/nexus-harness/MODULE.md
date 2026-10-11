@@ -127,6 +127,101 @@ SYMBOL_NOT_FOUND RESULT_TRUNCATED TIMEOUT PROVIDER_CRASHED SNAPSHOT_STALE UNSUPP
 message 措辞不同，钉文案等于把版本耦合写进契约。诊断条目的**数量**同样不钉：
 它随 RA 的分析面变化，钉数量会制造与语义无关的脆弱红。
 
+## Context Semantic Anchoring（提案 §15 Phase 2）
+
+`context <target>` 在原有三项输出（`module_contract` / `headings` / `mapped_scenarios`，**语义不变、
+只增不改**）之外，附加一组**有界**语义锚点，让 Agent 从模块契约直接落到"实现在哪"，
+不必退回 `rg` + 猜类型（提案 §1）。
+
+新增字段（`context` 的 `--json` 输出）：
+
+```text
+semantic_status   ok | no_candidates | not_found | unavailable | timeout | stale
+                    | unsupported_scope
+semantic_anchors  复用 code 的 ResultItem 形状（symbol/kind/kind_id/qualified_name/
+                    path/in_scope/range/snippet），不另造 DTO
+semantic_budget   {max_results, truncated, candidate_queries, workspace_scope}
+semantic_reason   非 ok 时 {code, reason}，code 取自下方错误码
+snapshot          与 code 同一套 Bindings（source_revision/working_tree_digest/…）
+authority         恒为 "advisory"
+```
+
+不变量（这些是本节的承诺，不是实现细节）：
+
+1. **语义层永远不改变 `context` 自己的 verdict。** 目标目录存在 ⇒ PASS；不存在 ⇒ BLOCKED。
+   语义查不到就写 `semantic_status`，绝不把"没查到"升级成"没有实现"，也不把"查到了"
+   当成 correctness（提案 §7/§12）。
+2. **候选符号只从模块契约里取**：解析 `<target>/MODULE.md` 中反引号包裹的 Rust 风格标识符
+   （首字母大写、长度 ≥3），按出现顺序去重，**最多 3 个候选**；按顺序尝试，
+   **首个产出锚点的候选即停止**（每次尝试都要一次 language server 冷启动，实测 30–90s，
+   三次串行会把 `context` 拖成分钟级），`semantic_budget.candidate_queries` 记实际尝试数（1–3）。
+   聚合上限 `max_results = 8`；不猜名字、不扫源码找符号、不做全仓索引。
+3. **只在 cargo workspace root 上跑语义层**（目标目录里存在带 `[workspace]` 的 `Cargo.toml`）。
+   原因必须写清：rust-analyzer 从 workspace root 启动才能限定加载面；从根 workspace 的成员
+   目录启动会把 47 个 crate 全灌进索引，实测冷启动 30–90s 且 `ready` 常常不收敛，
+   有界预算兜不住。此时 `semantic_status = "unsupported_scope"`，`semantic_reason` 里指向
+   `code symbol`（一次性小查询）与 Phase 4 的会话复用缓存。
+4. **未收敛即降级，不冒充结论**：provider 侧判定"索引未收敛 ⇒ 空结果不可信"的既有规则
+   （`PROVIDER_UNAVAILABLE` / `TIMEOUT` / `SYMBOL_NOT_FOUND`）原样映射到 `semantic_status`，
+   错误码不新造。
+5. 作用域与 containment 判定与 `code` 共用同一套归一化实现（`path_is_within_resolved`，
+   fail-closed）；工作树指纹取不到（`tree-unknown`/`dirty-unknown`）时
+   `semantic_status = "stale"` 且**不发起** provider 调用。
+6. `context` 接受 `--provider-binary <path>`，仅用于让"provider 不可用"这条路径可被 E4 确定性地
+   演练；它不改变其它字段语义，也不接受任何写能力参数（提案 §6：不得把任意 shell 参数
+   透传给 language server launcher）。
+
+## MCP Adapter（提案 §15 Phase 3、§10）
+
+`nexus-harness mcp <serve|selftest> [--with-query]` 是一个**薄 transport 适配层**：把 MCP 的
+`tools/list` / `tools/call` 映射到同一套 `code <verb>` 能力，让外部 Agent runtime 用的仍然是
+Nexus 的中立 schema，而不是 LSP 原文（提案 §3 的 `Agent Contract != LSP Contract`）。
+
+```text
+Agent ──MCP(stdio JSON-RPC)──▶ nexus-harness mcp serve ──▶ code_intel::run ──▶ rust-analyzer
+```
+
+握手与方法：
+
+- 实现 `initialize`（回 `protocolVersion` / `serverInfo` / `capabilities = { tools: {} }`，
+  **不声明** `workspace`、`completion`、`logging` 等能力）、`notifications/initialized`
+  （以及任何 `notifications/*`：接收、不响应、不影响状态）、`tools/list`、`tools/call`、
+  `shutdown`。未实现的合法方法返回 JSON-RPC `-32601`，参数不合形态返回 `-32602`，
+  未知 method 返回 `-32601` —— 协议层错误用 JSON-RPC error object 表达，
+  **不**伪装成 Nexus 的 `verdict`；而语义层失败仍以 `content[0].text` 里的 Nexus envelope
+  原样返回（保持 §12 的错误码与 `authority = "advisory"`）。
+- 暴露 8 个工具，名字与 CLI 一一对应：`code.symbol` / `code.definition` / `code.references` /
+  `code.implementations` / `code.callers` / `code.callees` / `code.hover` / `code.diagnostics`。
+  **不暴露任何写能力工具**（rename / format / applyEdit / executeCommand 一律不在
+  `tools/list` 里；被按名请求时返回结构化 `UNSUPPORTED`，不是空结果）。
+- 工具入参只接受 `target` / `workspace` / `max_results` / `max_snippet_lines` /
+  `max_result_bytes` / `timeout_secs` / `ready_timeout_secs`。**不接受** `provider_binary`
+  之类的启动期参数：把可执行路径放进 tool 参数就等于让模型给 language server launcher
+  注入 argv，提案 §6 明令禁止。provider 二进制只能在 `mcp serve` 启动时由 `--provider-binary`
+  指定（与 `code` 同一入口，作用域校验同一套归一化判定）。
+- `selftest` 用 `current_exe()` 把**自己**作为子进程拉起 `mcp serve`，通过真实管道跑
+  `initialize → notifications/initialized → tools/list → tools/call`，
+  默认不触发 provider 冷启动（第三条 `tools/call` 用**故意非法**的参数，验证协议层与
+  参数校验的失败形状）；`--with-query` 时额外跑**两次**夹具 workspace 上的真实查询
+  （作用域限定在 3 个源文件内，冷启动面确定）。
+- `--with-query` 顺带产出 Phase 4 的判定数据：`query_first_ms` / `query_second_ms` 与
+  `query_warm_reused`（判据是**相对**的 `second × 4 < first`，同一个 serve 进程里第二次查询
+  不该再付一次 initialize+索引的钱）。**不钉绝对毫秒数**——绝对值随宿主负载漂移，
+  钉死它只会造出与语义无关的脆弱红。跨命令（进程之间）的会话复用是否要做，由这组数字决定。
+
+诚实边界（必须照此声明，不许含糊）：
+
+- 本适配器的**协议合规性只由 selftest + E4 场景证明**，即"我们的 server 与我们的 client
+  在真实 stdio 管道上互操作正确"。**第三方 MCP 客户端**（OpenCode / Claude Code 等）
+  在本仓库两个宿主上都不存在，因此与真实客户端的互操作**未经验证**，不得声称已通过。
+- `mcp serve` 不写 Evidence、不拥有最终 PASS：每条工具结果的 `authority` 恒 `advisory`；
+  correctness 仍归 `cargo check/clippy/test`（提案 §7）。
+- 零新依赖：JSON-RPC 帧沿用 `code_intel/lsp.rs` 的 `Content-Length` 分帧实现
+  （MCP stdio 与 LSP 同帧格式），不引入 `rmcp` 等第三方 crate
+  ——Allowed Dependencies 是闭集，加依赖要走独立的 requirement-change 周期。
+- 资源边界沿用 `code`：单帧与会话字节上限、stderr 环形上限、每请求 timeout、
+  notification 有界缓冲与丢弃计数；超限即断会话并给结构化原因，不静默截断后继续。
+
 ## Non-Responsibilities
 
 不拥有产品真相；不重写 Cargo/Git/Test/Tracing/Benchmark；不被 production crate 依赖；不直接修改业务代码；不生成或修改 `scenarios/`、`policies/` 契约内容（只执行与验证）。
@@ -223,7 +318,12 @@ Code Intelligence 场景（E4，冻结于 2026-10-10 契约阶段，夹具为
 `--workspace`）、`code_intelligence_workspace_escape.toml`（`--workspace` 根逃出仓库，必须在 spawn 之前被拒）、
 `code_intelligence_diagnostics_item_shape.toml`（诊断条目映射后的形状，round 3 待办 3；夹具
 `fixtures/code-intel/src/diagnostic_probe.rs` 刻意留一处类型错误，只钉结构不钉文案与条数）。
-共 **16** 个，全部在 xc-pc-linux（rust-analyzer 1.98.1）上 PASS。
+`code_intelligence_context_anchors.toml`（Phase 2：`context` 的语义锚点有界、绑定 snapshot、
+候选来自模块契约）、`code_intelligence_context_no_fake_semantics.toml`（Phase 2：provider
+不可用时 `context` 的 verdict 不变且**不伪造锚点**）、
+`code_intelligence_mcp_handshake.toml`（Phase 3：MCP 只暴露 8 个只读工具，未知方法/非法参数/
+写能力调用都被拒）、`code_intelligence_mcp_real_query.toml`（Phase 3：`tools/call` 走真实查询并
+返回 CLI 那套中立 DTO）。共 **20** 个。
 
 ### Review 结论与待办承载体（2026-10-10）
 
