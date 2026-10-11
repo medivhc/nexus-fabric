@@ -168,8 +168,10 @@ spike 与实现结论（2026-10-11 回填）：
 - **实现进程内复用之后**（Green）：first=18029ms / second=486ms（**37 倍**），
   结构层 `query_first_session_reused=false / session_queries=1`、
   `query_second_session_reused=true / session_queries=2`、`session_invalidated_reason=""`。
-  Green Evidence：`scenario-61696a369a4c`（19 条期望全过，宿主 Windows/RA 1.95.0；
-  结论级复跑待 xc-pc-linux）。
+  Green Evidence：`scenario-61696a369a4c`（19 条期望全过，宿主 Windows/RA 1.95.0）。
+  **结论级复跑已在 xc-pc-linux 拿到**（rev `3c3bb97e`，RA 1.98.1）：`query_first_ms=16128` →
+  `query_second_ms=69`（233 倍），`session_reused=true / session_queries=2`，11/11 probes，
+  场景 `scenario-qoder-xc-be7c21cccdac` PASS —— 见 `.agents/green-evidence-code-intelligence.txt` §N。
 - **落法决定**：只做**同一进程内**的 provider 会话复用（`mcp serve` 持有），
   **不做**跨进程缓存/后台 daemon/socket/索引落盘。理由：后者要新增一套隐藏的服务生命周期
   与写副作用（谁启动、谁回收、崩溃后谁清），而当前唯一有证据的成本是

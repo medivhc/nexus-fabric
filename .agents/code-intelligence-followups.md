@@ -110,7 +110,11 @@
 ## 仍未满足的流程项
 
 - **模型绑定**：用户要求独立 Review 用 `qwen3.8-flash`，可用的独立执行者不接受 `model` 参数，
-  故三轮案卷均记 `model=unknown`；会话独立性成立（非实现会话）。
+  故 round 1–3 与 Phase 2/3/4 的 round 1 案卷一律记 `model=unbound`；会话独立性成立（非实现会话），
+  模型口径不成立 —— 这一点在被问到时不能说成"已按 qwen3.8-flash 审过"。
+- **Phase 2/3/4 的 round 1 已修完并双宿主复跑，round 2 待审**（AGENTS.md §19.1 上限 3 轮）：
+  审查对象从 `aba6de2` 变成 `3c3bb97e`，2 条阻塞与 6 条非阻塞的处置需要另一个独立执行者
+  复核，不能由实现侧自证为"已关闭"。
 - `verify --full`：round 3 判 `COMMENTED` 后按 `nexus-review` 语义可进入。本轮在 rev `54010f8`
   上启动后**因磁盘余量不足主动中止**（`/work` 8.3G ⇒ SIGTERM，`verify-full-exit=143`，
   没有写出 Evidence），细节与善后见 `.agents/green-evidence-code-intelligence.txt` §J。
@@ -156,7 +160,9 @@
 ①模型没能绑定（Agent 工具无 `model` 参数），口径记 `model=unbound`；
 ②它在 Windows 上**只做静态阅读**，没跑 cargo —— 所以它的 verdict 不能当门禁结论，
 它自己也把"所有门禁结果 / E4 运行时 PASS / 第三方 MCP 客户端互操作"列进了 could-NOT-verify。
-本轮修复后的复跑数字见 `.agents/green-evidence-code-intelligence.txt` §M。
+本轮修复后的复跑数字见 `.agents/green-evidence-code-intelligence.txt` §M（Windows 冒烟宿主）
+与 §N（xc-pc-linux 结论级：`verify --fast` 9/9 门 PASS、`nexus-harness` 单测 133/0、
+21/21 场景 PASS、`mcp selftest` 11/11 probes、Phase 4 复用 16128ms→69ms）。
 
 verdict `CHANGES_REQUESTED`：4 个 CHANGES_REQUESTED 维度（A/B/G/H）、4 个 PASS（C/D/E/F）、
 2 条阻塞（B1、G1）、4 条非阻塞（A1/A2/A3/G2）+ 1 组 minor（H1 与 E1/F/G 四条）。
