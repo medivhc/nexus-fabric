@@ -97,8 +97,8 @@ pub fn run(args: &[String]) -> Outcome {
     // 字段存在与否判断就会把"未确定"读成"就是仓库根"。独立 Review round 3 待办 4
     // 要求取消这一双含义：未确定作用域时该字段不出现（见 MODULE.md 字段可得性规则）。
     let setup = commands::setup();
-    if let Ok((early_repo, _)) = &setup {
-        base.snapshot = Some(Bindings::current(early_repo).to_json());
+    if let Ok((early_repo, early_config)) = &setup {
+        base.snapshot = Some(Bindings::current(early_repo, early_config).to_json());
     }
 
     if verb_raw.is_empty() {
@@ -119,7 +119,7 @@ pub fn run(args: &[String]) -> Outcome {
         );
     };
 
-    let (repo, _config) = match setup {
+    let (repo, config) = match setup {
         Ok(pair) => pair,
         Err(outcome) => return enrich(outcome, &base),
     };
@@ -135,7 +135,7 @@ pub fn run(args: &[String]) -> Outcome {
         return fail(&envelope, &e);
     }
 
-    let bindings_before = Bindings::current(&repo);
+    let bindings_before = Bindings::current(&repo, &config);
     // `Repo::working_tree_digest()` 在 git 调用失败时会降级成哨兵值（`tree-unknown` /
     // `dirty-unknown`）。若不加检查，"前后两次都失败"会被当成"工作树没变"，
     // 于是把"无法证明绑定"说成"绑定成立"——这正是提案 §12 禁止的伪 PASS。
@@ -203,7 +203,7 @@ pub fn run(args: &[String]) -> Outcome {
     };
 
     // 提案 §13：查询完成后再算一次 digest，工作树变了就不能当作当前事实。
-    let bindings_after = Bindings::current(&repo);
+    let bindings_after = Bindings::current(&repo, &config);
     if digest_is_unusable(&bindings_after.working_tree_digest) {
         let e = CodeIntelError::WorkspaceUnresolved.with_reason(
             "查询结束后取不到可信的工作树指纹（git status/write-tree 失败或降级），无法证明结果仍绑定查询时的 revision"

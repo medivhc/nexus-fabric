@@ -62,6 +62,20 @@ impl Repo {
     ///
     /// 仅对锁竞争重试（见 `GIT_LOCK_RETRIES`），退避 25/50/75ms；其余失败立即返回 Err。
     pub fn git(&self, args: &[&str]) -> Result<String, String> {
+        self.git_bytes(args)
+            .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+    }
+
+    /// Run git in the repo root; returns **raw** stdout bytes (no trim, no
+    /// lossy UTF-8). Required by binary-safe consumers (`git diff --binary`,
+    /// `-z` path lists): trimming would strip the leading ` ` of porcelain
+    /// ` M path` lines and destroy binary hunk payloads, both of which carry
+    /// meaning for content digests.
+    ///
+    /// 仅对锁竞争重试（见 `GIT_LOCK_RETRIES`），退避 25/50/75ms；其余失败立即返回 Err。
+    /// 重试住在字节版里，`git()` 只是它的 trim 包装：两条调用路径共享同一
+    /// 锁竞争语义，不会出现"`git()` 重试而 `diff --binary` 不重试"的分裂。
+    pub fn git_bytes(&self, args: &[&str]) -> Result<Vec<u8>, String> {
         let mut attempt = 1u32;
         loop {
             let out = Command::new("git")
@@ -71,7 +85,7 @@ impl Repo {
                 .output()
                 .map_err(|e| format!("failed to run git: {e}"))?;
             if out.status.success() {
-                return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
+                return Ok(out.stdout);
             }
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
             let message = format!("git {} failed: {}", args.join(" "), stderr);
@@ -86,6 +100,12 @@ impl Repo {
 
     /// Hash a string through `git hash-object --stdin` (sha1, no crypto dep).
     pub fn hash_stdin(&self, data: &str) -> Result<String, String> {
+        self.hash_stdin_bytes(data.as_bytes())
+    }
+
+    /// Byte-exact variant of [`hash_stdin`](Repo::hash_stdin) for inputs that
+    /// are not valid UTF-8 (binary diffs).
+    pub fn hash_stdin_bytes(&self, data: &[u8]) -> Result<String, String> {
         let mut child = Command::new("git")
             .arg("-C")
             .arg(&self.root)
@@ -99,7 +119,7 @@ impl Repo {
             .stdin
             .as_mut()
             .ok_or("no stdin")?
-            .write_all(data.as_bytes())
+            .write_all(data)
             .map_err(|e| format!("failed to write stdin: {e}"))?;
         let out = child
             .wait_with_output()
@@ -135,22 +155,83 @@ impl Repo {
         self.porcelain_result().map(|p| !p.is_empty()).ok()
     }
 
-    /// Digest of the working tree: index tree when clean, otherwise a hash of
-    /// the porcelain output (stable for a given dirty state).
+    /// Digest of the working tree: index tree (`git write-tree`) when clean;
+    /// when dirty, a **content-bound** hash — see
+    /// [`dirty_content_digest`](Repo::dirty_content_digest).
     ///
-    /// 只问一次 `git status`（旧实现问两次，既多一倍开销又多一倍 index.lock 竞争面）。
-    /// 问不到状态时返回哨兵值 `dirty-unknown`，由调用方显式处理
-    /// （`code_intel::digest_is_unusable` 就是那个"显式处理"）。
+    /// 历史缺陷（2026-10-11 立案，EXP4/EXP5）：dirty 分支曾对
+    /// `git status --porcelain` 文本做哈希。porcelain 只含状态码+路径，不含
+    /// 字节：同路径下改内容 digest 不变，未跟踪目录整体换内容 digest 恒不变；
+    /// 且 `git()` 的 `trim()` 还会剥掉首行行首空格，破坏 ` M path` 的 X 列语义。
+    /// 现 dirty 分支不再依赖 porcelain 文本。
+    ///
+    /// 只问一次 `git status`（旧实现问两次，既多一倍开销又多一倍 index.lock
+    /// 竞争面）。三种失败各自返回**不同**哨兵值，绝不折叠成正面结论：
+    ///
+    /// - porcelain 查询失败 → `dirty-unknown`（不知道脏净，不假装干净）
+    /// - 脏但内容取不到 → `dirty-unknown`
+    /// - 干净但 `write-tree` 失败 → `tree-unknown`
+    ///
+    /// `code_intel::digest_is_unusable` 就是那个"调用方显式处理"。
     pub fn working_tree_digest(&self) -> String {
         match self.porcelain_result() {
             Ok(porcelain) if porcelain.is_empty() => self
                 .git(&["write-tree"])
                 .unwrap_or_else(|_| "tree-unknown".to_string()),
-            Ok(porcelain) => self
-                .hash_stdin(&porcelain)
+            Ok(_) => self
+                .dirty_content_digest()
                 .unwrap_or_else(|_| "dirty-unknown".to_string()),
             Err(_) => "dirty-unknown".to_string(),
         }
+    }
+
+    /// Content-bound digest of a dirty working tree, built from two
+    /// deterministic byte streams and hashed once through
+    /// `git hash-object --stdin`:
+    ///
+    /// 1. **tracked 改动**：`git diff HEAD --binary` 的原始输出。`diff HEAD`
+    ///    同时覆盖 staged 与 unstaged（相对 HEAD 的工作树最终态），并含
+    ///    模式变更与删除，故不再单独哈希 index（避免重复计数）。
+    ///    无 HEAD（空仓库/unborn branch）时退为 `git ls-files -s`（绑定
+    ///    staged blob oid）叠加 `git diff --binary`（index→工作树的未暂存
+    ///    改动），两者都以 0x00 分隔拼接。
+    /// 2. **未跟踪文件**：`git ls-files --others --exclude-standard -z`
+    ///    逐文件枚举（不折叠目录），每个路径用 `git hash-object -- <path>`
+    ///    绑定工作树字节，产出 `path oid` 行并排序保证确定性。读被
+    ///    .gitignore 尊重：忽略物按契约不属于工程状态。
+    ///
+    /// 两个分量各自 `?` 上抛：任何一侧查不到就整体失败，由
+    /// [`working_tree_digest`](Repo::working_tree_digest) 落成 `dirty-unknown`
+    /// 哨兵。不得用空字节凑出一个"看似正常"的 digest——那正是 #12 独立 Review
+    /// 在别处收口的 fail-open 形态。单文件 `hash-object` 失败是例外（下述）。
+    fn dirty_content_digest(&self) -> Result<String, String> {
+        let tracked = match self.git_bytes(&["diff", "HEAD", "--binary"]) {
+            Ok(b) => b,
+            Err(_) => {
+                // unborn branch（无 HEAD）：绑定 index 条目 + 未暂存 diff。
+                // 备用查询任一失败同样上抛，不静默降级。
+                let mut v = self.git_bytes(&["ls-files", "-s"])?;
+                v.push(0u8);
+                v.extend(self.git_bytes(&["diff", "--binary"])?);
+                v
+            }
+        };
+        let others = self.git_bytes(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+        let mut lines: Vec<String> = Vec::new();
+        for path in others.split(|b| *b == 0u8).filter(|p| !p.is_empty()) {
+            let rel = String::from_utf8_lossy(path).to_string();
+            // 单文件哈希失败（竞态删除、权限）→ 记录稳定标记而非 panic；
+            // 路径本身仍在 digest 里，不丢"存在性"绑定。
+            let oid = self
+                .git(&["hash-object", "--", &rel])
+                .unwrap_or_else(|_| "unreadable".to_string());
+            lines.push(format!("{rel} {oid}"));
+        }
+        lines.sort();
+        let mut combined = tracked;
+        combined.push(0u8);
+        combined.extend_from_slice(lines.join("\n").as_bytes());
+        self.hash_stdin_bytes(&combined)
     }
 
     /// Digest over configuration inputs that affect verification conclusions
@@ -293,8 +374,157 @@ pub fn path_is_within_resolved(path: &Path, dir: &Path) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// 临时 git 仓库沙盒：`git init` + 仓库本地身份/行尾配置，
+    /// 不依赖网络、不依赖宿主机的 global git config（user.email 等）。
+    /// evidence.rs 的同 id 覆写保护测试也复用此构造器。
+    pub(crate) fn init_temp_repo(tag: &str) -> Repo {
+        let dir = std::env::temp_dir().join(format!(
+            "nexus-harness-{}-{}-{tag}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir must be creatable");
+        let repo = Repo { root: dir };
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "harness-test@example.invalid"],
+            vec!["config", "user.name", "harness-test"],
+            vec!["config", "core.autocrlf", "false"],
+            // 宿主 global config 不得渗入沙盒：commit.gpgsign=true 会让测试
+            // commit 失败，core.hooksPath 会把外部钩子挂进来。
+            vec!["config", "commit.gpgsign", "false"],
+            vec!["config", "core.hooksPath", ".git/hooks"],
+        ] {
+            repo.git(&args)
+                .unwrap_or_else(|e| panic!("sandbox setup `git {args:?}` failed: {e}"));
+        }
+        repo
+    }
+
+    /// 在沙盒里写文件并提交一次，制造 clean 基线。
+    pub(crate) fn commit_baseline(repo: &Repo, name: &str, content: &str) {
+        std::fs::write(repo.resolve(name), content).expect("write baseline");
+        repo.git(&["add", "-A"]).unwrap();
+        repo.git(&["commit", "--no-verify", "-m", "baseline"])
+            .unwrap();
+    }
+
+    #[test]
+    fn dirty_digest_binds_file_content() {
+        // 守住缺陷本体：porcelain 文本完全相同、仅字节不同 → digest 必须变。
+        // 旧实现（hash porcelain）在此断言必红。
+        let repo = init_temp_repo("content");
+        commit_baseline(&repo, "lib.rs", "fn main() {}\n");
+        std::fs::write(repo.resolve("lib.rs"), "fn main() {}\n// marker A\n").unwrap();
+        let d1 = repo.working_tree_digest();
+        let p1 = repo.porcelain_result().unwrap();
+        assert!(!p1.is_empty(), "tree must be dirty here");
+        std::fs::write(
+            repo.resolve("lib.rs"),
+            "fn main() {}\n// marker A plus a substantially longer second line\n",
+        )
+        .unwrap();
+        let p2 = repo.porcelain_result().unwrap();
+        assert_eq!(
+            p1, p2,
+            "porcelain identical by construction (same path, same XY)"
+        );
+        let d2 = repo.working_tree_digest();
+        assert_ne!(
+            d1, d2,
+            "content drift under unchanged porcelain must change digest"
+        );
+        assert_ne!(d2, "dirty-unknown");
+        // 确定性：恢复原字节 → digest 回到 d1（不掺 mtime 之类不稳定输入）。
+        std::fs::write(repo.resolve("lib.rs"), "fn main() {}\n// marker A\n").unwrap();
+        assert_eq!(repo.working_tree_digest(), d1);
+    }
+
+    #[test]
+    fn clean_digest_equals_write_tree() {
+        let repo = init_temp_repo("clean");
+        commit_baseline(&repo, "lib.rs", "fn main() {}\n");
+        assert_eq!(repo.dirty_state(), Some(false));
+        assert_eq!(
+            repo.working_tree_digest(),
+            repo.git(&["write-tree"]).unwrap()
+        );
+    }
+
+    #[test]
+    fn digest_binds_untracked_content() {
+        // EXP5 场景：未跟踪目录整体换内容/换文件名，porcelain 折叠为同一行
+        // `?? untracked-exp/`，旧实现 digest 恒不变；新实现必须变。
+        let repo = init_temp_repo("untracked");
+        commit_baseline(&repo, "lib.rs", "fn main() {}\n");
+        let clean = repo.working_tree_digest();
+        std::fs::create_dir_all(repo.resolve("untracked-exp")).unwrap();
+        std::fs::write(repo.resolve("untracked-exp/a.txt"), "AAAA\n").unwrap();
+        let d1 = repo.working_tree_digest();
+        assert_ne!(d1, clean);
+        std::fs::remove_dir_all(repo.resolve("untracked-exp")).unwrap();
+        std::fs::create_dir_all(repo.resolve("untracked-exp")).unwrap();
+        std::fs::write(
+            repo.resolve("untracked-exp/b.txt"),
+            "BBBB different bytes\n",
+        )
+        .unwrap();
+        let d2 = repo.working_tree_digest();
+        assert_ne!(d2, d1, "replaced untracked dir must change digest");
+        assert_ne!(repo.porcelain_result().unwrap(), String::new());
+        // 未跟踪文件消失 → 回到 clean 分支语义。
+        std::fs::remove_dir_all(repo.resolve("untracked-exp")).unwrap();
+        assert_eq!(repo.working_tree_digest(), clean);
+    }
+
+    #[test]
+    fn digest_handles_unborn_branch_without_panic() {
+        // 边界：无 HEAD（空仓库）。staged + unstaged + untracked 全部存在时
+        // 不 panic、digest 为 40 hex、且随各自内容漂移而变。
+        let repo = init_temp_repo("unborn");
+        std::fs::write(repo.resolve("staged.txt"), "v1\n").unwrap();
+        repo.git(&["add", "staged.txt"]).unwrap();
+        let d_stage = repo.working_tree_digest();
+        assert_eq!(d_stage.len(), 40);
+        assert_ne!(d_stage, "dirty-unknown");
+        // 改未跟踪文件 → 变
+        std::fs::write(repo.resolve("other.txt"), "x\n").unwrap();
+        let d_untracked = repo.working_tree_digest();
+        assert_ne!(d_untracked, d_stage);
+        // 已 staged 文件的工作树再改动（未再 add）→ 也要变（index+diff 叠加兜底）
+        std::fs::write(repo.resolve("staged.txt"), "v2\n").unwrap();
+        let d_worktree = repo.working_tree_digest();
+        assert_ne!(d_worktree, d_untracked);
+        // 提交后 HEAD 出现 → clean 分支
+        repo.git(&["add", "-A"]).unwrap();
+        repo.git(&["commit", "-m", "first"]).unwrap();
+        assert_eq!(
+            repo.working_tree_digest(),
+            repo.git(&["write-tree"]).unwrap()
+        );
+    }
+
+    #[test]
+    fn digest_survives_deleted_and_mode_changed_tracked_files() {
+        // 边界：tracked 删除（diff 里是 - 行）与模式变更都不 panic 且可区分。
+        let repo = init_temp_repo("delete");
+        commit_baseline(&repo, "a.txt", "aaa\n");
+        std::fs::write(repo.resolve("b.txt"), "bbb\n").unwrap();
+        repo.git(&["add", "b.txt"]).unwrap();
+        repo.git(&["commit", "-m", "second"]).unwrap();
+        std::fs::remove_file(repo.resolve("a.txt")).unwrap();
+        let d_del = repo.working_tree_digest();
+        assert_ne!(d_del, repo.git(&["write-tree"]).unwrap_or_default());
+        std::fs::write(repo.resolve("a.txt"), "aaa\n").unwrap();
+        assert_ne!(repo.working_tree_digest(), d_del);
+    }
 
     #[test]
     fn digests_deterministic_and_sha1_length() {

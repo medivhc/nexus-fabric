@@ -41,7 +41,7 @@ pub fn status() -> Outcome {
         Ok(x) => x,
         Err(o) => return o,
     };
-    let bindings = Bindings::current(&repo);
+    let bindings = Bindings::current(&repo, &config);
     let latest = evidence::read_latest_summary(&config);
 
     let (verdict, message, extra) = match &latest {
@@ -263,7 +263,7 @@ pub fn verify(sub: &str) -> Outcome {
         Ok(x) => x,
         Err(o) => return o,
     };
-    let bindings = Bindings::current(&repo);
+    let bindings = Bindings::current(&repo, &config);
 
     // Gates are driven by policies/quality.toml declarations (single source of
     // truth); declared-but-unimplemented gates surface as UNKNOWN, never skipped.

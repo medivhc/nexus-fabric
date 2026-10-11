@@ -109,7 +109,7 @@ fn run_one(name: &str) -> Outcome {
         "assertion": rep.assertion,
         "key_log_lines": rep.key_log_lines,
     });
-    let bindings = Bindings::current(&repo);
+    let bindings = Bindings::current(&repo, &config);
     let message = format!("scenario {name}: {} ({})", verdict, rep.detail);
     let ev = evidence::ScenarioEvidence {
         scenario_id: name,
@@ -158,7 +158,7 @@ fn blocked_unknown(
         "assertion": assertion,
         "key_log_lines": [],
     });
-    let bindings = Bindings::current(repo);
+    let bindings = Bindings::current(repo, config);
     let ev = evidence::ScenarioEvidence {
         scenario_id: name,
         verdict: "BLOCKED",
