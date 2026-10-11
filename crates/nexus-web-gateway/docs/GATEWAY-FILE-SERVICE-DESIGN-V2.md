@@ -654,3 +654,24 @@ IPv6 候选→§10（bind plan 纯函数化，G11 契约不变）；产品锚点
 rev2.1 必改①→§1-④b/§10；②→§5 逐分量算法；③→§5 快照类型/§2；④→§9/§2/§1 代价段；
 ⑤→§3 预算段/§6；⑥→§5 config 段/§13-D4；⑦→§5 节流段/§8；⑧→§2/§6/§11-M0/§13；
 顺①→§6 矛盾闭合；顺②→§7 FileTarget 段。
+
+---
+
+## 15. 复评 r2 的处置（2026-10-11 追加，rev2.2 更正块）
+
+追加依据：第二轮独立评审（`plan-artifacts/review-v2-design-r2.md`，verdict
+**CHANGES_REQUESTED**；8 条旧意见判定 RESOLVED 1 / PARTIAL 5 / NOT_RESOLVED 2，新发现
+6 FAIL）。本节按 L3 的 append-only 纪律**只追加不重写**——上文各处一旦被本节推翻，
+以本节为准；§1④(b) 已就地插入勘误块并保留原文作决策痕迹，那是本节 F1 的落地形式。
+
+| 评审项 | 结论 | 处置 |
+|---|---|---|
+| **F1** SFTP no-replace 是空操作 | **接受，且我独立复现** | libssh2 通告并钳在 SFTP v3（`include/libssh2_sftp.h:51`），flags 仅当 `sftp->version >= 5` 入包（`src/sftp.c:2833-2834`），发出的是 `SSH_FXP_RENAME`（`:2827`）⇒ `Some(ATOMIC\|NATIVE)` 与 `None` 字节相同；可用原语 `posix_rename_ex`（`:3033`）未被 ssh2 0.9.6 绑定。现行口径改为 **SFTP 根不提供写**（owner 选 fail-closed 选项 b），已落 `PRODUCT.md` §18.2/§18.4、`MODULE.md` G14、`REQ-008`/`REQ-013`、场景 `gateway_file_sftp_boundary.toml`。§10 那条"SFTP no-replace 一致性探针 + 变异判据"**作废** |
+| **F2** 节流两层键与"IP 维度不做"互斥 | **接受** | 契约三处（`PRODUCT.md` §18.2、`MODULE.md` G15、`REQ-010`）都已写明（会话+源）两层键，实现按此落地：`Throttle` 以 `(principal, source)` 为键、`max_throttle_buckets` 有界、溢出并入全局桶、`close_session` 清桶。本稿的"IP 维度不做"表述作废——源维度是键的一部分，只是不做 CIDR 归并 |
+| **F3** 本稿自造错误码与冻结契约分叉 | **接受，以契约为准** | 权威词表是实现与场景共同使用的：`PAGE_TOO_LARGE`、`TRUNCATED`、`OUTPUT_EXISTS`、`ARTIFACT_INTEGRITY_FAILED`、`QUEUE_FULL`、`CAPACITY_UNAVAILABLE`、`UNSUPPORTED_CAPABILITY`、`AUTH_DENIED`、`THROTTLED`、`SYMLINK_ESCAPE`、`OUTSIDE_ROOT`、`NON_CANONICAL_ROOT`、`READ_ONLY`、`OFFSET_OVERFLOW`、`IS_DIR`、`IDLE_RECYCLED`、`CONFIG_INVALID`。本稿的 `BUFFERED_LIMIT`、`QUOTA_HANDLES`、`QUOTA_STREAMS`、`QUOTA_SESSIONS`、`SYMLINK_DENIED`、`TARGET_LOCKED` 一律视为**旧命名**，按上表映射理解；引用本稿实现代码时以词表为准 |
+| **F4** "Windows 拿不到任何文件级身份键"说得太宽 | **接受一半，并给出我自己的探针数据** | 我在本机（Windows，rustc 1.95.0）编了一个 std-only 探针：`MetadataExt::file_attributes()` **稳定可用**，实测 `file=0x820`（ARCHIVE\|NORMAL）、`dir=0x810`（ARCHIVE\|DIRECTORY），二者可判别；`creation_time()`/`last_write_time()` 同样稳定返回真实值。而 `number_of_links()` 才是 `E0658: use of unstable library feature windows_by_handle` 的那一个。所以 §1②/§9 的正确表述是：**卷号+文件索引与 by-handle 身份、硬链接计数不可得**（故无法把"同路径的新文件"与"同一文件对象"严格区分），但"文件 vs 目录"与时间戳元数据**可得**，可用于快照比对。§13-D3 的 B 级结论不变（残余风险仍在），但**理由要按这一行重写**，不能写成"拿不到任何身份键"。附注：本机 `symlink_file()` 因特权不足失败（os error 1314），所以 Windows 上的符号链接逃逸路径**无法在本机 e2e 复现**，符号链接相关证据一律来自 Linux |
+| **F5/F6** 预算不等式只算文件面、SCTP 算例与公式不符 | **接受，作为 M1 未完项** | `max_terminals` 在 `config.rs` 无上限、`sctp_send_budget_bytes` 属 per-association 却按会话乘——这两条要在配置校验里补成显式不等式（`FILE_MANIFEST` 之外的 `REQ-011` 承接）。本稿 §6 的算例数字（2.75/8.5 MiB）与其自身公式不符，正确值按公式应为 **2.25 / 8.25 MiB**；以公式为准，算例作废 |
+| **引用面系统性偏移**（约 40 处 `src/*.rs:NN`） | **接受，改引用基准声明** | 本稿所有 `src/file.rs`、`src/config.rs:105`、`src/protocol.rs`、`gateway.rs` 的行号指向的是**从未合入的 V1 工作树**（仅存于会话产物 patch），不是 master，也不是承载冻结契约的分支。读法约定：这些行号是"V1 反例定位"，不能当现行代码看；需要现行行号时改读 `MODULE.md` 的 G12-G21 与 `feature/gateway-file-service-contracts` 分支 |
+| **§12/§13 之外的开放项**（`grant-nonce` 有更简单替代） | **接受并采纳** | 评审指出 `app.js` 里 WSS 信令 socket 早于 `createPc()` 就绪，短时效凭据可以直接经**已开的信令通道**前置下发，省掉新端点、nonce 概念与 `hmac` 依赖。本稿当年否掉的是 `hello_ack`（DataChannel 之后），确实把"信令 socket"与"数据通道"混为一谈。M2 实现 `/api/config` 收缩时按这条走 |
+
+一句总结：本稿作为设计案卷的问题不在方向，而在**把未经取证的猜测写成了规定**（F1 的 flags、F4 的身份键、F5/F6 的算例），以及**自造词表与冻结契约并行**（F3）。这两类都由本轮的"先取证、再落契约、后写代码"流程纠正；后续期次继续按这个次序，不允许倒过来。
