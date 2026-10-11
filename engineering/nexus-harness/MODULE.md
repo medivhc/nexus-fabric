@@ -65,9 +65,8 @@ budget             {max_results,max_snippet_lines,max_result_bytes,workspace_sco
 continuation       截断时 {refinement_hint}（未截断则省略）
 provider           {kind,binary,version,ready,restart_count,restart_reason,
                       duration_ms,write_requests_refused,server_requests_unhandled,
-                      dropped_notifications}
-                   kind 是适配器标识，binary 是实际解析到的可执行文件（两者可对照
-                   发现错配）；三类计数彼此分离，"未识别请求"不得污染写拒绝计数
+                      dropped_notifications,session_reused,session_queries,
+                      session_invalidated_reason}
 snapshot           {source_revision,working_tree_digest,target_triple,toolchain_version,
                       workspace_root}
                    workspace_root 仅在作用域校验通过后出现（见上方字段可得性规则）
@@ -151,11 +150,17 @@ authority         恒为 "advisory"
 1. **语义层永远不改变 `context` 自己的 verdict。** 目标目录存在 ⇒ PASS；不存在 ⇒ BLOCKED。
    语义查不到就写 `semantic_status`，绝不把"没查到"升级成"没有实现"，也不把"查到了"
    当成 correctness（提案 §7/§12）。
-2. **候选符号只从模块契约里取**：解析 `<target>/MODULE.md` 中反引号包裹的 Rust 风格标识符
-   （首字母大写、长度 ≥3），按出现顺序去重，**最多 3 个候选**；按顺序尝试，
-   **首个产出锚点的候选即停止**（每次尝试都要一次 language server 冷启动，实测 30–90s，
-   三次串行会把 `context` 拖成分钟级），`semantic_budget.candidate_queries` 记实际尝试数（1–3）。
+2. **候选符号只从模块契约里取**：解析 `<target>/MODULE.md` 中**成对反引号包裹**的整段
+   标识符（首字母大写、长度 ≥3、只含 ASCII 字母数字与 `_`），按出现顺序去重，
+   **最多 3 个候选**；按顺序尝试，**首个产出锚点的候选即停止**（每次尝试都要一次 language
+   server 冷启动，实测 18–30s，三次串行会把 `context` 拖成分钟级），
+   `semantic_budget.candidate_queries` 记实际尝试数（1–3）。
    聚合上限 `max_results = 8`；不猜名字、不扫源码找符号、不做全仓索引。
+   - **整段必须是标识符**：一格里写多个名字（`Foo, Bar`）整格作废，刻意不做"取词首"——
+     词首截断会把 `Cargo.toml` 变成 `Cargo`、把 `Context-Builder` 变成 `Context`，而截断片段
+     完全可能命中**另一个**符号、把 Agent 领到错的地方，那比漏收更糟。
+   - 漏收必须可见：`semantic_budget.candidate_spans` 报"契约里一共看到几个 code span"，
+     与 `candidate_queries` 对照就能分辨"契约没写"与"写了但不合命名规则"（提案 §5 禁止静默丢弃）。
 3. **只在 cargo workspace root 上跑语义层**（目标目录里存在带 `[workspace]` 的 `Cargo.toml`）。
    原因必须写清：rust-analyzer 从 workspace root 启动才能限定加载面；从根 workspace 的成员
    目录启动会把 47 个 crate 全灌进索引，实测冷启动 30–90s 且 `ready` 常常不收敛，
@@ -221,6 +226,36 @@ Agent ──MCP(stdio JSON-RPC)──▶ nexus-harness mcp serve ──▶ code_
   ——Allowed Dependencies 是闭集，加依赖要走独立的 requirement-change 周期。
 - 资源边界沿用 `code`：单帧与会话字节上限、stderr 环形上限、每请求 timeout、
   notification 有界缓冲与丢弃计数；超限即断会话并给结构化原因，不静默截断后继续。
+
+## Provider Session Reuse（提案 §15 Phase 4、§11）
+
+证据先行：§11 把持久索引/缓存列为"出现证据才做"。证据已实测拿到——在 47-crate 的真实
+workspace 上 `symbol Task` 冷启动 `duration_ms=90535` 且 `provider.ready=false`；
+`mcp selftest --with-query` 的两次查询是 18352ms / 17817ms，**同一个 serve 进程内也没有复用**
+（`run()` 每次都新建一个 provider）。因此本模块只做一件有证据支撑的泛化：
+**同一进程内**复用 provider 会话。
+
+契约：
+
+- **复用键** = 解析后的 provider 二进制 + `--workspace` 根 + provider 版本 +
+  **会话建立时的 `working_tree_digest`**。四项任一不同 ⇒ 不复用。
+- **指纹不一致就重建，不冒充新鲜。** 工作树在会话建立之后变过，索引描述的已经不是当前树；
+  此时宁可付一次冷启动，也不给一份"看起来新鲜"的结果。重建原因写进
+  `provider.session_invalidated_reason`（`digest_changed` / `workspace_changed` /
+  `provider_restarted` / `binary_changed`），`session_reused` 记 `false`。
+  这条优先于"要快"。
+- 复用生效时 `provider.session_reused = true`、`provider.session_queries >= 2`；
+  `ready`、`dropped_notifications`、`write_requests_refused` 等计数继续按**整个会话**累计
+  （与既有"跨重启计数合并"规则同源，不因复用而重置）。
+- **每条结果仍做查询前后 digest 对比**，`SNAPSHOT_STALE` 的判定不因复用放宽；
+  `duration_ms` 仍然是**本次查询**的耗时（不是会话累计），否则 Agent 会把会话成本误读成查询成本。
+- CLI 路径（`nexus-harness code ...`）**不启用**跨命令复用：一次性进程里的会话复用没有意义，
+  而且引入后台/落盘状态会把隐藏生命周期带进 Engineering Plane。
+  `mcp serve` 是唯一持有会话的调用方，退出时必须关闭 provider，不留孤儿进程。
+- **明确不做**（本轮决定，理由写在这而不是藏在代码里）：跨进程缓存、后台 daemon、
+  socket/端口、把索引落盘或写进仓库。这些需要新的生命周期与副作用面，属提案 §11
+  "只在出现证据时再加"的另一半；`provider.session_reused` 就是判断要不要再加的可见判据。
+  相应地 `FILE_MANIFEST`/Side Effects 不新增写副作用。
 
 ## Non-Responsibilities
 

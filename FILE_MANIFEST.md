@@ -2,7 +2,7 @@
 
 本包实现《Nexus 统一系统设计规范 v9》中的“统一仓库目录契约”。
 
-文件数（不含本清单）：184
+文件数（不含本清单）：185
 
 > 2026-10-10：原声明值 137 与表内实际行数（148）已不一致（既有漂移，含
 > `scenarios/engineering/bench_gate_verdicts.toml` 等未登记项）。本次登记
@@ -204,6 +204,7 @@
 | `scenarios/engineering/code_intelligence_diagnostics_advisory.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/code_intelligence_context_anchors.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/code_intelligence_context_no_fake_semantics.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_context_scope_guard.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/code_intelligence_diagnostics_item_shape.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/code_intelligence_mcp_handshake.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/code_intelligence_mcp_real_query.toml` | Machine-readable contract/policy/scenario |
