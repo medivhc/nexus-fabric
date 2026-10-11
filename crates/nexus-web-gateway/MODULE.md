@@ -78,6 +78,11 @@
 或明确错误，绝不静默吞掉。
 **G10（证书持久化）**：自签证书按节点落盘（`cert_dir`，默认 `$XDG_CACHE_HOME/nexus-web-gateway/<node_id>`），
 重启指纹不变；`/cert` 提供 PEM 下载。
+**G11（候选/收包一致）**：SDP 通告的 ICE host candidate 必须是共享 UDP socket
+**实际能收到包**的地址。绑定具体 IP 的 socket 只收该目的地址的包，因此
+`listen_addr` 为具体 IP（含 `127.0.0.1`）时只能通告该 IP；`listen_addr` 为未指定地址时
+绑定族内通配地址，此时才可通告全部可路由网卡 IP（多网卡：LAN + mesh）。
+通告 socket 收不到的候选会让 ICE 静默超时（曾导致网关所有 DataChannel 测试与 CI 红）。
 
 ## Side Effects
 
@@ -100,10 +105,13 @@
 
 - 单元测试：协议消息 roundtrip、SDP payload 转换、配置校验负路径
   （空 node_id / 空或重复 node_list / 空 ICE urls / TLS 文件空路径 /
-  mesh WSS 空 token 或空 peer 字段）、证书持久化（重启指纹不变）。
+  mesh WSS 空 token 或空 peer 字段）、证书持久化（重启指纹不变）、
+  **G11 绑定与候选集合关系（具体 IP 只通告自己、未指定地址绑通配且不通告 0.0.0.0）**。
 - 集成测试（`tests/gateway_e2e.rs`）：
   - HTTPS 页面、`/api/config` 与 `/cert` 可访问（rustls 客户端 pin 本地 CA）。
   - WSS 信令：浏览器-like str0m 客户端经 WSS 交换 SDP，建立 DataChannel。
+  - **ICE 候选真连通**：`127.0.0.1` 绑定的网关必须通告且仅通告 loopback 候选，
+    并真的连上（G11 回归）；未指定地址绑定时候选等于可路由网卡集合。
   - 双节点：经 in-memory mesh 中继，与第二个节点建立 DataChannel。
   - WSS mesh：两个独立 gateway 经 `/mesh` bearer-token 中继 SDP 并建连；
     错误 token 返回 401。

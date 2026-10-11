@@ -32,41 +32,86 @@ use crate::mesh::{InMemoryMeshSignaler, MeshDataConnection, MeshSignaler, WssMes
 use crate::protocol::{BrowserMessage, MeshMessage, NodeMessage, SdpPayload, SshAuth};
 use crate::ssh_client::{self, SshInput};
 
-/// Pick the IP address the shared WebRTC UDP socket binds to.
-///
-/// A concrete `listen_addr` binds the UDP socket to the same IP so the SDP
-/// host candidate is reachable from browsers. An unspecified address
-/// (`0.0.0.0` / `::`) has no single routable IP, so we derive the first
-/// non-loopback address from the local interfaces; otherwise the socket would
-/// only carry a loopback host candidate that real browsers never collect
-/// (the `0.0.0.0` example-config dead end). When no non-loopback address
-/// exists we fall back to loopback and warn loudly.
-fn udp_bind_ip(listen_ip: std::net::IpAddr) -> std::net::IpAddr {
-    if !listen_ip.is_unspecified() {
-        return listen_ip;
-    }
+/// Enumerate routable interface addresses of the same family as `for_ip`
+/// (skipping loopback, unspecified and multicast), deduplicated.
+fn routable_iface_ips(for_ip: std::net::IpAddr) -> Vec<std::net::IpAddr> {
     let Ok(interfaces) = getifaddrs::getifaddrs() else {
-        return loopback_for(listen_ip);
+        return Vec::new();
     };
+    let mut ips: Vec<std::net::IpAddr> = Vec::new();
     for iface in interfaces {
         if iface.flags.contains(getifaddrs::InterfaceFlags::LOOPBACK) {
             continue;
         }
-        if let Some(ip) = iface.address.ip_addr() {
-            if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
-                continue;
-            }
-            let same_family = matches!(
-                (listen_ip, ip),
-                (std::net::IpAddr::V4(_), std::net::IpAddr::V4(_))
-                    | (std::net::IpAddr::V6(_), std::net::IpAddr::V6(_))
-            );
-            if same_family {
-                return ip;
-            }
+        let Some(ip) = iface.address.ip_addr() else {
+            continue;
+        };
+        if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+            continue;
+        }
+        let same_family = matches!(
+            (for_ip, ip),
+            (std::net::IpAddr::V4(_), std::net::IpAddr::V4(_))
+                | (std::net::IpAddr::V6(_), std::net::IpAddr::V6(_))
+        );
+        if same_family && !ips.contains(&ip) {
+            ips.push(ip);
         }
     }
-    loopback_for(listen_ip)
+    ips
+}
+
+/// How the shared WebRTC UDP socket is bound, and which addresses the SDP may
+/// advertise as ICE host candidates.
+///
+/// **G11 (candidate/receive coherence)**: every advertised host candidate must
+/// be an address the bound socket can actually receive on. A UDP socket bound to
+/// a concrete IP only receives datagrams whose destination is that IP, so a
+/// gateway listening on `127.0.0.1` must advertise the loopback address and
+/// nothing else. Advertising the host's LAN/mesh IPs instead — which is what the
+/// multi-homed fix used to do unconditionally — yields candidates that always
+/// time out: ICE never connected, and every DataChannel test failed with
+/// "no control channel open".
+///
+/// An unspecified `listen_addr` is therefore bound to the family's wildcard
+/// address, which *does* receive on every interface. That is exactly the
+/// configuration where advertising all non-loopback interface IPs (multi-homed
+/// hosts: LAN + mesh) is both valid and necessary.
+struct IceBindPlan {
+    /// Address to bind the shared UDP socket to.
+    bind_ip: std::net::IpAddr,
+    /// Addresses the bound socket can receive on, in advertisement order.
+    candidate_ips: Vec<std::net::IpAddr>,
+    /// Browser-facing address for the page URL (never unspecified).
+    page_ip: std::net::IpAddr,
+    /// An unspecified `listen_addr` with no routable interface at all: ICE can
+    /// only offer a loopback candidate, which no remote browser can reach.
+    no_routable_interface: bool,
+}
+
+/// Derive the UDP bind address and the host-candidate set for a `listen_addr`.
+fn ice_bind_plan(listen_ip: std::net::IpAddr) -> IceBindPlan {
+    if !listen_ip.is_unspecified() {
+        // Concrete bind: the socket receives on this address only, so this is
+        // also the only candidate we may advertise.
+        return IceBindPlan {
+            bind_ip: listen_ip,
+            candidate_ips: vec![listen_ip],
+            page_ip: listen_ip,
+            no_routable_interface: false,
+        };
+    }
+    let ifaces = routable_iface_ips(listen_ip);
+    let no_routable_interface = ifaces.is_empty();
+    IceBindPlan {
+        bind_ip: listen_ip,
+        candidate_ips: ifaces.clone(),
+        page_ip: ifaces
+            .first()
+            .copied()
+            .unwrap_or_else(|| loopback_for(listen_ip)),
+        no_routable_interface,
+    }
 }
 
 /// Loopback fallback for an unspecified `listen_addr` with no usable
@@ -141,6 +186,9 @@ struct Shared {
     mesh: Arc<dyn MeshSignaler>,
     event_tx: Sender<GatewayEvent>,
     udp: Arc<UdpSocket>,
+    /// ICE host candidates to advertise: exactly the addresses the shared UDP
+    /// socket can receive on (G11). Computed once at startup.
+    host_candidate_ips: Vec<std::net::IpAddr>,
     /// PEM-encoded self-signed certificate, served at `/cert`.
     cert_pem: String,
     /// SHA256 fingerprint of the certificate, for /cert HTML page (REQ-001).
@@ -290,22 +338,18 @@ impl Gateway {
         };
         let tls = Arc::new(cert::server_config(&identity)?);
 
-        let udp_ip = udp_bind_ip(cfg.listen_addr.ip());
-        if cfg.listen_addr.ip().is_unspecified() {
-            if udp_ip.is_loopback() {
-                eprintln!(
-                    "warning: no non-loopback network interface found; WebRTC UDP socket bound \
-                     to {udp_ip} only. Browsers cannot reach a loopback ICE candidate — set \
-                     `listen_addr` to a routable IP address."
-                );
-            } else {
-                eprintln!(
-                    "note: `listen_addr` is unspecified; binding the WebRTC UDP socket to \
-                     {udp_ip} so browsers can reach the ICE host candidate."
-                );
-            }
+        let plan = ice_bind_plan(cfg.listen_addr.ip());
+        if plan.no_routable_interface {
+            eprintln!(
+                "warning: `listen_addr` is unspecified and no non-loopback network interface was \
+                 found; ICE can only offer the loopback candidate {ip}, which remote browsers \
+                 cannot reach — set `listen_addr` to a routable IP address.",
+                ip = plan.page_ip
+            );
         }
-        let udp = Arc::new(UdpSocket::bind((udp_ip, 0)).map_err(GatewayError::Io)?);
+        // Wildcard bind (unspecified listen_addr) receives on every interface,
+        // which is what makes the multi-candidate advertisement below valid.
+        let udp = Arc::new(UdpSocket::bind((plan.bind_ip, 0)).map_err(GatewayError::Io)?);
         udp.set_read_timeout(Some(Duration::from_millis(50)))
             .map_err(GatewayError::Io)?;
 
@@ -315,7 +359,7 @@ impl Gateway {
         let local_addr = listener.local_addr().map_err(GatewayError::Io)?;
         // The address browsers should actually open (never `0.0.0.0`/`::`).
         // Use the actually bound port so `listen_addr: "0.0.0.0:0"` works.
-        let page_addr = std::net::SocketAddr::new(udp_ip, local_addr.port());
+        let page_addr = std::net::SocketAddr::new(plan.page_ip, local_addr.port());
 
         let shared = Arc::new(Shared {
             cfg: cfg.clone(),
@@ -323,6 +367,7 @@ impl Gateway {
             mesh: mesh.clone(),
             event_tx: event_tx.clone(),
             udp: udp.clone(),
+            host_candidate_ips: plan.candidate_ips,
             cert_pem: identity.cert_pem()?,
             cert_fingerprint: identity.fingerprint_sha256(),
         });
@@ -474,7 +519,10 @@ fn serve_http(
                 tls,
                 "application/x-pem-file",
                 shared.cert_pem.as_bytes(),
-                &[("Content-Disposition", "attachment; filename=\"nexus-ca.crt\"")],
+                &[(
+                    "Content-Disposition",
+                    "attachment; filename=\"nexus-ca.crt\"",
+                )],
             )
             .map_err(GatewayError::Io)?;
         }
@@ -1548,39 +1596,25 @@ fn create_session(
     let mut rtc = Rtc::builder().build(now);
     let udp_addr = shared.udp.local_addr().map_err(GatewayError::Io)?;
     let udp_port = udp_addr.port();
-    // Advertise all non-loopback interface addresses as host candidates so
-    // ICE can try each path (multi-homed hosts, mesh + LAN, etc.). The UDP
-    // socket is bound to the selected IP, but candidates cover all interfaces.
+    // G11: advertise exactly the addresses the shared socket can receive on —
+    // the single bound address for a concrete `listen_addr`, or every routable
+    // interface address when it is unspecified (multi-homed hosts: LAN + mesh,
+    // so ICE can try each path).
     let mut added = 0;
-    if let Ok(interfaces) = getifaddrs::getifaddrs() {
-        for iface in interfaces {
-            if iface.flags.contains(getifaddrs::InterfaceFlags::LOOPBACK) {
-                continue;
-            }
-            if let Some(ip) = iface.address.ip_addr() {
-                if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
-                    continue;
-                }
-                // Match address family with the bound socket
-                let same_family = matches!(
-                    (udp_addr.ip(), ip),
-                    (std::net::IpAddr::V4(_), std::net::IpAddr::V4(_))
-                        | (std::net::IpAddr::V6(_), std::net::IpAddr::V6(_))
-                );
-                if !same_family {
-                    continue;
-                }
-                let cand_addr = std::net::SocketAddr::new(ip, udp_port);
-                if let Ok(candidate) = Candidate::host(cand_addr, "udp") {
-                    rtc.add_local_candidate(candidate);
-                    added += 1;
-                }
-            }
+    for ip in &shared.host_candidate_ips {
+        if let Ok(candidate) = Candidate::host(std::net::SocketAddr::new(*ip, udp_port), "udp") {
+            rtc.add_local_candidate(candidate);
+            added += 1;
         }
     }
-    // Fallback: if no interface candidates were added, use the bound address
+    // Defensive fallback: never answer an offer with no host candidate at all.
     if added == 0 {
-        let candidate = Candidate::host(udp_addr, "udp")
+        let fallback = if udp_addr.ip().is_unspecified() {
+            std::net::SocketAddr::new(loopback_for(udp_addr.ip()), udp_port)
+        } else {
+            udp_addr
+        };
+        let candidate = Candidate::host(fallback, "udp")
             .map_err(|e| GatewayError::Rtc(format!("host candidate: {e}")))?;
         rtc.add_local_candidate(candidate);
     }
@@ -1603,4 +1637,61 @@ fn create_session(
     });
     sessions.insert(session_id.to_string(), session);
     Ok(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// G11: a concrete `listen_addr` binds that address, so the socket can only
+    /// receive datagrams addressed to it — it must be the only host candidate.
+    /// Advertising this host's other interface IPs here is precisely the bug
+    /// that made every ICE connection time out on loopback-bound gateways.
+    #[test]
+    fn concrete_listen_addr_advertises_only_the_bound_address() {
+        for listen in ["127.0.0.1", "192.168.7.13", "10.144.144.4"] {
+            let ip: std::net::IpAddr = listen.parse().expect("parse listen ip");
+            let plan = ice_bind_plan(ip);
+            assert_eq!(plan.bind_ip, ip, "{listen} must bind itself");
+            assert_eq!(plan.candidate_ips, vec![ip], "{listen} candidate set");
+            assert_eq!(plan.page_ip, ip, "{listen} page ip");
+            assert!(!plan.no_routable_interface, "{listen} needs no warning");
+        }
+    }
+
+    /// G11: an unspecified `listen_addr` is the one configuration where a socket
+    /// receives on every interface, so it must bind the wildcard (not one derived
+    /// interface IP) and advertise the routable interfaces rather than `0.0.0.0`
+    /// itself. The page address stays concrete so browsers get a usable URL.
+    #[test]
+    fn unspecified_listen_addr_widens_bind_and_candidates() {
+        let ip: std::net::IpAddr = "0.0.0.0".parse().expect("parse wildcard ip");
+        let plan = ice_bind_plan(ip);
+
+        assert!(
+            plan.bind_ip.is_unspecified(),
+            "wildcard bind is what makes multi-interface candidates reachable"
+        );
+        assert!(
+            !plan.candidate_ips.is_empty(),
+            "an offer must never be candidate-less"
+        );
+        assert!(
+            !plan.candidate_ips.iter().any(|c| c.is_unspecified()),
+            "0.0.0.0 leaked into candidates: {:?}",
+            plan.candidate_ips
+        );
+        assert!(
+            !plan.page_ip.is_unspecified(),
+            "page_addr must be browser-openable, got {}",
+            plan.page_ip
+        );
+        if !plan.no_routable_interface {
+            assert!(
+                plan.candidate_ips.iter().all(|c| !c.is_loopback()),
+                "loopback candidate offered on a routable host: {:?}",
+                plan.candidate_ips
+            );
+        }
+    }
 }

@@ -42,7 +42,10 @@ impl LocalIdentity {
     pub fn fingerprint_sha256(&self) -> String {
         use sha2::{Digest, Sha256};
         let hash = Sha256::digest(&self.cert_der);
-        hash.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(":")
+        hash.iter()
+            .map(|b| format!("{:02X}", b))
+            .collect::<Vec<_>>()
+            .join(":")
     }
 }
 

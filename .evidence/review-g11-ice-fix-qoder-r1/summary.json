@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "review_id": "review-g11-ice-fix-qoder-r1",
+  "review_round": 1,
+  "previous_review_id": null,
+  "verdict": "COMMENTED",
+  "reviewer": "independent review executor (QoderCN agent session e58b828003f28f0fd371bf461e820d18, agent c2283260c5da99a5d2076c04); model: unknown-bound-by-app; not the author of the G11 patch; all falsifying experiments run on a separate Linux host (appen@10.144.144.4)",
+  "source_revision": "0576cb73a802256604088f6accd4917b245c3945",
+  "working_tree_digest": "2f1d4c3e66b6978a06642328acedc769078c30a8",
+  "contract_hash": "9c44e9351f04ba1d2afc3a924954d4ad7710c97e",
+  "scope": {
+    "task_type": "bugfix",
+    "task_summary": "G11: ICE host candidates must be a subset of the addresses the shared UDP socket can actually receive on; bind the family wildcard for an unspecified listen_addr, advertise only the bound address for a concrete one, and replace the zero-assertion ICE regression test with real assertions",
+    "changed_crates": [
+      "nexus-web-gateway"
+    ],
+    "changed_files": 6
+  },
+  "dimensions": [
+    {
+      "name": "contract-consistency",
+      "status": "WARN",
+      "findings": [
+        "MODULE.md:79-84 (G11) is verbatim consistent with gateway.rs:93-116: concrete listen_addr advertises exactly the bound IP, unspecified binds the family wildcard and only then advertises all routable NIC IPs; the loopback/unspecified/multicast filters and the family match are present at gateway.rs:37-61",
+        "GatewayHandle contract intact: page_ip stays concrete for an unspecified listen_addr (gateway.rs:362) and the pre-existing contract test gateway_e2e.rs:171 unspecified_listen_addr_derives_concrete_page_addr passes; USER_MANUAL.md:131 quotes the new warning text (gateway.rs:343-348) character for character",
+        "USER_MANUAL.md:39-42 still tells the operator to look for 'note: listen_addr is unspecified; binding the WebRTC UDP socket to <IP> ...' and for the old 'warning: no non-loopback network interface found ...' - the patch deletes both strings (no 'note:' remains anywhere in src/), so the startup-log section now documents log lines that cannot occur",
+        "MODULE.md:49-50 Allowed Dependencies still justifies getifaddrs as deriving a routable 'WebRTC UDP 地址'; post-patch the UDP bind address is the wildcard and getifaddrs only derives the candidate set plus page_ip",
+        "requirements.toml:18 REQ-002 acceptance '多网卡机器上所有非 loopback IP 都成为 ICE host candidate' is unconditional and is now only true when listen_addr is unspecified; gateway_e2e.rs:1291-1292 cites 'REQ-002 intent' without amending the requirement text",
+        "G11 is honoured for the interface state observed at startup only: the candidate set is frozen in Shared.host_candidate_ips (gateway.rs:191, computed at 341), so an interface/tun address that appears, disappears or is renumbered later is never reflected, and an advertised IP the host no longer owns is once again a candidate the socket cannot receive on - the invariant degrades to 'receivable at bind time'"
+      ],
+      "recommendation": "Re-sync USER_MANUAL.md:39-43 with the single surviving warning string, reword MODULE.md:49-50 to 'derive the host-candidate set and page address', and scope REQ-002's acceptance to the unspecified-listen_addr case (or record the narrowing explicitly); state the startup-freeze assumption in MODULE.md G11 / USER_MANUAL so operators know a NIC change requires a gateway restart"
+    },
+    {
+      "name": "edge-coverage",
+      "status": "WARN",
+      "findings": [
+        "ice_bind_plan branches verified by direct probing on a 9-routable-IPv4 / 23-routable-IPv6 host: 127.0.0.1, 192.168.7.13, 10.144.144.4 -> bind=candidate=page=that IP, no_routable_interface=false; 0.0.0.0 -> bind=0.0.0.0, 9 IPv4 candidates, 0 loopback, 0 link-local, page=172.168.12.97; :: -> bind=::, 23 IPv6 candidates, page=global IPv6; dedup, is_unspecified/is_multicast/is_loopback and family match all behave as documented (gateway.rs:37-61)",
+        "No path produces a candidate-less offer: concrete listen_addr always yields exactly one candidate; unspecified with no routable interface yields an empty set that reaches the defensive fallback (gateway.rs:1611-1620), which advertises loopback for a wildcard-bound socket - that fallback is genuinely reachable and genuinely necessary, and a loopback candidate is receivable on a 0.0.0.0 bind, so it does not violate G11",
+        "Surviving mutant: disabling the fallback (gateway.rs:1611 condition never true) leaves all 24 unit tests and all 21 e2e tests GREEN - the branch has no coverage of its own; only the combination 'empty candidate set AND no fallback' is caught, by the !addrs.is_empty() assertion at gateway_e2e.rs:1308",
+        "getifaddrs failure is silently folded into 'no routable interface': gateway.rs:38-40 turns the OS error into Vec::new(), so an enumeration error prints the same operator message as a genuinely NIC-less host (gateway.rs:343-348) and, because the set is computed once at startup, one transient failure permanently degrades every later session to loopback-only",
+        "IPv6 path advertises link-local addresses with no scope-id: probed :: -> 14 of 23 candidates are fe80::/64, unreachable for any peer without a zone; inherited from the deleted code's filter set, but undocumented in MODULE.md G11 and in USER_MANUAL.md:126-133, which never mention IPv6 or dual-stack receive semantics for a :: bind"
+      ],
+      "recommendation": "Make the fallback branch testable (extract fallback_candidate_addr(bind: SocketAddr) -> SocketAddr and unit-test the unspecified/concrete split, or inject the interface list into ice_bind_plan so a test can pass an empty one); distinguish getifaddrs Err from an empty interface list in both the warning text and the log; keep G11's IPv6 caveats (link-local without scope-id, :: bind still receiving IPv4) explicit in MODULE.md or filter is_unicast_link_local out of the candidate set"
+    },
+    {
+      "name": "api-surface-minimization",
+      "status": "PASS",
+      "findings": [
+        "No new pub item in src/: IceBindPlan (gateway.rs:80), routable_iface_ips (37), ice_bind_plan (93) and Shared.host_candidate_ips (191) are all private/pub(crate)-internal; the only pub addition in the whole diff is the test-harness field tests/common/mod.rs:393 'pub answer_sdp', which lives in the integration-test module",
+        "G5 (最小 API 面) intact: exports remain Gateway::start / GatewayConfig / GatewayHandle / protocol types (MODULE.md:93-104); nothing was promoted from pub(crate) to pub",
+        "Public doc comments on the new struct fields are complete (bind_ip / candidate_ips / page_ip / no_routable_interface)"
+      ],
+      "recommendation": "None. Keep ice_bind_plan private; if a future session-level refresh is added, expose it as an internal helper rather than public API"
+    },
+    {
+      "name": "dependency-boundary",
+      "status": "PASS",
+      "findings": [
+        "git diff --stat over Cargo.toml and Cargo.lock is empty: no new third-party dependency, no version bump, no six-review trigger",
+        "getifaddrs use stays inside MODULE.md:41-53 Allowed Dependencies; no new call site was added outside gateway.rs (grep shows the only two users are routable_iface_ips and the test helper)",
+        "policies/architecture.toml:306-309 for nexus-web-gateway (allowed_internal_dependencies = [], layer = delivery, portable = false) is untouched and no internal crate import was added",
+        "src/cert.rs diff is formatting only: one expression split over four lines inside fingerprint_sha256 (cert.rs:42-48); cargo fmt --check on the patched tree is clean, confirming the change is what rustfmt produces, and no behaviour, signature or dependency is altered"
+      ],
+      "recommendation": "None"
+    },
+    {
+      "name": "error-handling-quality",
+      "status": "WARN",
+      "findings": [
+        "gateway.rs:1605 'if let Ok(candidate) = Candidate::host(...)' discards the conversion error per candidate; the loop is now the only guard between the startup plan and the SDP, so a rejected candidate shrinks the advertised set with no trace and only trips the fallback if the count reaches zero",
+        "gateway.rs:38-40 'let Ok(interfaces) = getifaddrs() else { Vec::new() }' swallows the OS error and mislabels it as 'no non-loopback network interface was found' (gateway.rs:343-348); the error string, which would distinguish a driver/netlink failure from a truly NIC-less host, is dropped",
+        "Positive: no unwrap/expect/panic! was introduced in non-test code (the two .expect calls sit in the new #[cfg(test)] module that starts at gateway.rs:1642, namely gateway.rs:1653 and gateway.rs:1668); the fallback keeps a typed GatewayError::Rtc with the candidate text as context (gateway.rs:1617-1618), so an unparseable fallback still fails the session loudly instead of silently"
+      ],
+      "recommendation": "Log (tracing::warn) each rejected candidate with session_id and the offending address, and propagate or at least print the getifaddrs error so the two 'no candidates' causes are distinguishable in the field"
+    },
+    {
+      "name": "test-quality",
+      "status": "WARN",
+      "findings": [
+        "The tests do falsify the fix, measured by mutation: reverting the invariant in place (concrete bind advertising every NIC, gateway.rs:99) turns 14 of 21 e2e tests RED including the new loopback_bound_gateway_advertises_only_loopback_candidates (gateway_e2e.rs:1278) and reproduces the historical 'peer 0 should connect' / 'no control channel open' signature; the unit test gateway.rs:1656 goes RED on the same mutant",
+        "The deleted test was provably vacuous: on the pre-patch tree (all six files reverted to 0576cb73) ice_advertises_multiple_host_candidates reported ok while 13 e2e tests failed - a green test on a broken feature",
+        "Fragile assertion: gateway.rs:1675-1677 asserts !plan.candidate_ips.is_empty() for 0.0.0.0, which is a property of the host, not of the code; simulating a loopback-only host (routable_iface_ips always empty) makes this unit test RED even though the documented design for exactly that state is 'empty set + fallback + operator warning', and the same test reads no_routable_interface two lines later - it contradicts the branch it is testing",
+        "Host-state coupling in the e2e pair: gateway_e2e.rs:1337-1341 compares the candidate set computed at Gateway::start against a second getifaddrs snapshot taken in the test body; on a box with churning container/veth interfaces the two snapshots can legitimately differ, so the test can fail without any product defect",
+        "Coverage gap for the new branch: gateway.rs:1611-1620 survives mutation (all tests green with the fallback disabled), and no test at all exercises the IPv6 / :: path, which is where the link-local and dual-stack surprises live"
+      ],
+      "recommendation": "Replace the is_empty assertion at gateway.rs:1675-1677 with the property that actually holds in both worlds (candidate_ips.is_empty() == plan.no_routable_interface, plus page_ip concreteness), inject the interface list to make the lo-only case testable, and add a small unit test for the :: plan asserting that every advertised candidate is same-family and non-unspecified"
+    },
+    {
+      "name": "complexity-control",
+      "status": "PASS",
+      "findings": [
+        "IceBindPlan passes the deletion test: removing it would re-scatter the bind/candidate/page/warning decision across Gateway::start and create_session, which is precisely how the original defect was introduced; the patch deletes about 25 duplicated enumeration lines from create_session (gateway.rs:1596-1609) and leaves one pure function as the single source of truth",
+        "No new trait, abstraction or async runtime; the crate stays std-thread-only as MODULE.md:52-53 requires",
+        "Minor redundancy, not worth churn: no_routable_interface is exactly ifaces.is_empty() (gateway.rs:105) and ifaces.clone() at 108 exists only to keep page_ip derivation after the move",
+        "The per-session NIC enumeration removal is a negligible win in exchange for the staleness it introduces: create_session runs once per browser session, not per packet, so the eliminated getifaddrs call is not a hot path"
+      ],
+      "recommendation": "Keep the plan struct; if the staleness finding is addressed, recompute the plan per session (or on a coarse timer) rather than adding a cache-invalidation layer"
+    },
+    {
+      "name": "observability",
+      "status": "WARN",
+      "findings": [
+        "Net loss of startup signal: the patch deletes the 'note: listen_addr is unspecified; binding the WebRTC UDP socket to {udp_ip}' line (old gateway.rs:341-353) and prints nothing at startup about which addresses will be advertised as ICE host candidates - the one fact an operator needs when a browser later cannot connect, and now a fact fixed for the process lifetime",
+        "Only the degraded case is logged (gateway.rs:343-348); the healthy multi-homed case is silent, while the deleted note used to name the chosen address",
+        "The surviving warning still uses eprintln! rather than tracing, contradicting MODULE.md:120-122 Observability which promises tracing-based structured events (pre-existing pattern, carried forward by this patch)",
+        "No session_id / node_id correlation on candidate rejection (gateway.rs:1605), so a per-session shrink of the advertised set is invisible"
+      ],
+      "recommendation": "Emit one tracing::info at startup summarising bind_ip, the candidate set and page_ip (with node_id), and a tracing::warn per rejected candidate; that also repairs the operator guidance in USER_MANUAL.md:39-43 with a real line to grep for"
+    }
+  ],
+  "dimension_changes": {},
+  "blocking_issues": [],
+  "blocking_issues_fixed": [],
+  "blocking_issues_remaining": [],
+  "non_blocking_suggestions": [
+    "USER_MANUAL.md:39-43: delete the references to the removed 'note:' line and to the old 'no non-loopback network interface found' wording, and quote the single warning string the code actually prints (gateway.rs:343-348); also drop '网关自动挑选一个可路由的网卡 IP 用于 WebRTC' at USER_MANUAL.md:21, which no longer describes the wildcard bind",
+    "gateway.rs:1675-1677: the 'an offer must never be candidate-less' unit assertion encodes host state and contradicts the no_routable_interface branch the same test reads; assert candidate_ips.is_empty() == plan.no_routable_interface instead so the test passes on a loopback-only CI box",
+    "gateway.rs:1611-1620: the defensive fallback is a surviving mutant - extract its address choice into a testable helper and cover the unspecified vs concrete split",
+    "gateway.rs:38-40 and 343-348: separate 'getifaddrs failed' from 'no routable interface' in both the log and the message, and do not let a one-time enumeration error permanently pin the gateway to loopback candidates",
+    "gateway.rs:191/341: document or remove the startup-time freeze of the candidate set; on a gateway that must survive EasyTier/tun re-dialling, recomputing the plan per create_session call (or on a timer) restores the pre-patch recovery behaviour while keeping the G11 invariant",
+    "MODULE.md:79-84 (G11): add the IPv6 clause - a :: bind advertises fe80:: candidates with no scope-id (14 of 23 measured) and receives IPv4 as well, so dual-stack deployments need explicit guidance",
+    "MODULE.md:49-50: reword the getifaddrs Allowed-Dependencies rationale to match its new role (candidate set + page_ip, not the UDP bind address)",
+    "requirements.toml:18: scope REQ-002's acceptance to the unspecified listen_addr, or raise a requirement-change note recording that concrete binds intentionally advertise a single candidate"
+  ]
+}

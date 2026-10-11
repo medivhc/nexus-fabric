@@ -123,9 +123,13 @@ HTTPS/WSS 监听地址，同时决定 WebRTC UDP socket 绑定的 IP。
 
 ## 常见问题
 
-- **页面一直停在 “P2P ICE 失败”**：检查 `listen_addr` 是否填了 `127.0.0.1`；
-  确认启动日志没有 “no non-loopback network interface found” 告警；确认访问的是
-  `https://<可路由IP>:<端口>/` 而不是 `https://0.0.0.0:.../`。
+- **页面一直停在 “P2P ICE 失败”**：先看 `listen_addr`。网关只通告**自己的 UDP socket
+  真能收包**的地址（G11）：`listen_addr=127.0.0.1` 时只通告 loopback（本机测试可用，
+  远程浏览器连不上）；`listen_addr=<某网卡IP>` 时只通告那个 IP；要让局域网/网格都能连，
+  填 `0.0.0.0`（绑通配地址并通告全部可路由网卡）或直接填那块网卡的 IP。
+  确认访问的是 `https://<可路由IP>:<端口>/` 而不是 `https://0.0.0.0:.../`；
+  启动日志出现 “`listen_addr` is unspecified and no non-loopback network interface was found”
+  说明这台机器根本没有可路由网卡，必须改网络或换节点。
 - **浏览器证书警告**：下载 `/cert` 安装本地 CA，并把机器 IP 加入 `tls.ips`
   后重新启动网关（证书会重新生成并持久化）。
 - **节点列表为空**：访问地址的 host 必须是网关所在机器的可路由 IP；`0.0.0.0`

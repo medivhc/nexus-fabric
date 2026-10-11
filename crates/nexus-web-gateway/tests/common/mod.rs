@@ -390,6 +390,9 @@ pub struct Browser {
     pub peer_id: String,
     pub ws: WssClient,
     pub peers: Vec<BrowserPeer>,
+    /// Raw SDP of the answer to the first offer, so tests can assert on the
+    /// advertised ICE candidates.
+    pub answer_sdp: String,
 }
 
 impl Browser {
@@ -420,9 +423,10 @@ impl Browser {
         )?))?;
 
         let answer_msg = read_ws_json(&mut ws)?;
-        let answer_sdp: SdpPayload =
+        let answer_payload: SdpPayload =
             serde_json::from_value(answer_msg.get("sdp").ok_or("answer missing sdp")?.clone())?;
-        let answer = answer_sdp.to_answer().map_err(|e| e.to_string())?;
+        let answer_sdp = answer_payload.sdp.clone();
+        let answer = answer_payload.to_answer().map_err(|e| e.to_string())?;
         rtc.sdp_api().accept_answer(pending, answer)?;
 
         let peer = BrowserPeer::new(node_id.to_string(), peer_id.to_string(), rtc, udp);
@@ -432,6 +436,7 @@ impl Browser {
             peer_id: peer_id.to_string(),
             ws,
             peers: vec![peer],
+            answer_sdp,
         })
     }
 
