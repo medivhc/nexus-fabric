@@ -46,8 +46,8 @@
 - `serde` / `serde_json`（协议与配置）
 - `sha1` / `base64`（RFC 6455 WebSocket 握手）
 - `ssh2` / `libssh2-sys`（节点侧真实 SSH 客户端；仅 `std` 同步线程模型）
-- `getifaddrs`（枚举本机网卡地址；`listen_addr` 为 `0.0.0.0` 时派生可路由的
-  WebRTC UDP 地址，避免 SDP 只带 loopback 候选导致真实浏览器连不上）
+- `getifaddrs`（枚举本机网卡地址：`listen_addr` 未指定时导出可通告的 host candidate
+  集合与 `page_addr`；UDP socket 绑族内通配地址而非某个网卡 IP，见 G11）
 - 仅 `std` 线程模型，零 async runtime（与仓库 std-only 姿态一致）。
 
 ## Forbidden Dependencies

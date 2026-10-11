@@ -36,11 +36,13 @@ cargo run -p nexus-web-gateway --example gateway -- ./gateway.json
 Page: https://192.168.1.10:8443/  (download the local CA at https://192.168.1.10:8443/cert ...)
 ```
 
-如果 `listen_addr` 填了 `0.0.0.0`，启动日志会额外打印一行
-`note: listen_addr is unspecified; binding the WebRTC UDP socket to <IP> ...`，
-告诉浏览器实际使用的 ICE 地址。若打印的是
-`warning: no non-loopback network interface found ...`，说明机器没有可路由网卡，
-浏览器将无法连接，必须把 `listen_addr` 改成具体 IP。
+`listen_addr` 为 `0.0.0.0` 时不会再打印额外提示：UDP socket 绑该族的通配地址
+（因此能收到发往任意网卡的包），SDP 里通告的是本机全部可路由网卡地址（G11）。
+只有当这台机器**根本没有**可路由网卡时，启动才会打
+`warning: 'listen_addr' is unspecified and no non-loopback network interface was found ...`，
+此时 ICE 只能给出 loopback 候选、远端浏览器必然连不上，必须把 `listen_addr`
+改成具体网卡 IP 或换机器。`page_addr`（页面提示的那个地址）永远是可路由的具体 IP，
+不会是 `0.0.0.0`。
 
 ### 3. 安装本地 CA 证书
 
