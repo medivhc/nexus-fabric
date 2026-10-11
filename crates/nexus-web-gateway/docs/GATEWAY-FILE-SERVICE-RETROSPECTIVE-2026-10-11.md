@@ -222,3 +222,16 @@ master 手工跑该钩子：留墓碑 ⇒ `ERROR STALE evidence found → pre-pu
 
 1. 归档 agent 报告"评审 §4 写 `FRAME_HEADER_LEN=15` 与实际 14 不一致"——**这条不成立**：评审原文是"把 `FRAME_HEADER_LEN` 从 14 改成 15"这一**变异动作**，不是声称现值为 15；帧头确为 14 字节（`src/file.rs:50`，且 `FRAME_HEADER_LEN=15` 的变异导致编译期类型锁死而红）。特此更正，避免误改。
 2. 我上一轮对 harness 的判断（"疑似只看 git index"）已在 V1 案卷里更正为准确版本；本轮实验进一步确认它**在 dirty 态对内容完全盲**，并追加三处加重：`porcelain` 被 `.trim()` 破坏状态列语义、未跟踪目录折叠成单行、同 id 覆写使旧证据消失而非 STALE。
+
+## 7. 2026-10-11 当日追加：§18/M1 落地后的两处口径变化（以最新文本为准）
+
+1. **SFTP 的"显式 no-replace flags"方案已被证否并作废**。独立复评指出、我在 libssh2 源码侧
+   复核确认：libssh2 通告并把 SFTP 钳在 v3（`include/libssh2_sftp.h:51`），rename 的 flags
+   只在 `sftp->version >= 5` 入包（`src/sftp.c:2833-2834`，全树无赋值）⇒ `Some(ATOMIC|NATIVE)`
+   与 `None` 字节相同，V2 §1④(b) 是空操作。现行口径改为 **SFTP 根不提供写操作**
+   （fail-closed，owner 选定选项 b），详见 V2 §1④ 的勘误块。本文 §5 决策表 D5 与
+   §5b/§5c 里"SFTP 显式 flags + 服务端 honor 待实测"的表述据此作废。
+2. **契约号一律取主机 `nexus-harness status` 输出，不取本地复算**。我在 M1 第二片提交时用
+   Windows 侧脚本复算 `contract_hash`，对 HEAD 复现出既有值就以为方法可信，对新树算出的数
+   是错的（脚本的"读 index"分支里文件清单仍取自 `git ls-tree HEAD`，新增的第 9 个场景没进清单）。
+   教训：**能复现旧值不等于方法正确**，改动集合后必须换独立来源交叉验证。

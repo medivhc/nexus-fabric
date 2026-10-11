@@ -29,12 +29,12 @@
 | A2 | 句柄/流模型：**服务端签发 stream_id**、按已解析目标缓存句柄、显式 close_stream、字节+数量双上限 | §2 |
 | A3 | ack/背压：列表分页 `entry_offset/next_offset/eof`、单消息 64 KiB 硬上限、分优先级有界队列 | §3 |
 | A4 | 健壮性：`checked_*` 全域 + panic-free-by-construction（release `panic=abort` 下 unwind 防线**不存在**，改 profile 与否属 owner 待批，见 §13-D7） | §4 |
-| A5 | 安全：SFTP 逐分量 lstat/readlink deny-by-default、`.part` 服务端命名 + EXCL、TOCTOU 快照类型化（本地 (dev,ino)/Windows 降级/SFTP 元数据）、会话级+全局令牌节流、`/api/config` 去凭据 + 建 PC 前短时效凭据端点、SFTP 复用+熔断、SFTP 提交显式 no-replace flags | §5 |
+| A5 | 安全：SFTP 逐分量 lstat/readlink deny-by-default、`.part` 服务端命名 + EXCL、TOCTOU 快照类型化（本地 (dev,ino)/Windows 降级/SFTP 元数据）、会话级+全局令牌节流、`/api/config` 去凭据 + 建 PC 前短时效凭据端点、SFTP 复用+熔断、**SFTP 根不提供写操作（fail-closed，见 §1④(b) 的勘误）** | §5 |
 | A6 | 配额：全局浏览器会话/fd/RSS/磁盘/摘要重算预算全清单 + `validate()` 交叉闭合公式 | §6 |
 | A7 | 兼容：`version` 协商 + capability 门控建通道 + 帧头保留位 + FileTarget **显式 kind 校验**（非反序列化失败） | §7 |
 | A8 | 可观测：composition root 装 subscriber；生命周期/拒绝 INFO；每帧 0 日志、5 s 汇总 | §8 |
 | A9 | 平台矩阵：Windows=密码认证+本地沙箱（**B 级**，§13-D3），macOS=全量，`\\?\`/mode=0 写进契约 | §9 |
-| A10 | 测试：资源核算测试 + 变异必红清单 + CI 真跑的 JS↔Rust golden fixture + hermetic 化 + SFTP no-replace 一致性探针 | §10 |
+| A10 | 测试：资源核算测试 + 变异必红清单 + CI 真跑的 JS↔Rust golden fixture + hermetic 化 + ~~SFTP no-replace 一致性探针~~（作废：客户端发不出该字段，见 §1④ 勘误） | §10 |
 | A11 | 分期 M0–M4 与回滚：wire 只加不改、无超前 stub、每期独立可 revert；M0 补 scenario+RED 前置 | §11 |
 | A12 | 待决策仅剩 D6；D0-D5/D7/D8 已固化 | §12/§13 |
 
@@ -74,7 +74,25 @@ V1 网关文件面字段名同构而保证更弱、零内容校验、互不引�
 （N3-4:63-64、`PRODUCT.md:3220`"默认拒绝覆盖文件，SHA-256 校验后原子发布"、
 artifact_download.rs:190-192）。V1 的 `fs::rename`（`src/file.rs:602`）**会静默覆盖**既有目标，
 与自身 `rename` 操作的拒覆盖语义（file.rs:650-651）分叉——废除。
-(b) **SFTP（rev2.1 补，评审必改①）**：V1 提交走 `sftp.rename(part, final, None)`
+> **勘误（2026-10-11，来自独立复评 r2 的 F1；我已在 libssh2 源码侧独立取证确认，不是转述）**
+> 下面这条 (b) 的方案是**空操作**，已被推翻。`ssh2 0.9.6` 依赖的 libssh2 通告并把 SFTP 版本
+> 钳在 v3（`include/libssh2_sftp.h:51  #define LIBSSH2_SFTP_VERSION 3`，全树没有任何
+> `sftp->version =` 赋值），而 `_libssh2_sftp_rename_ex` 只在 `sftp->version >= 5` 时才把 flags
+> 写进包体（`src/sftp.c:2833-2834`），发出的是 `SSH_FXP_RENAME`（`src/sftp.c:2827`）。
+> 所以 `Some(RenameFlags::ATOMIC | NATIVE)` 与 `None` 的字节**完全相同**，
+> 不存在「显式携带 no-replace flags」这条路；而「服务端是否 honor」这个提法本身也问错了对象
+> ——卡点在客户端。真正的无覆盖改名是 `SSH_FXP_POSIX_RENAME`
+> （`libssh2_sftp_posix_rename_ex`，`src/sftp.c:3033`），ssh2 0.9.6 **未绑定**它。
+>
+> **现行口径（owner 2026-10-11 选定 fail-closed 选项 b）**：经 SFTP 可达的根**不提供
+> 上传/改名/删除**，一律 `UNSUPPORTED_CAPABILITY`；在 SFTP 传输真正实现之前其读面同样拒绝
+> （把远端路径丢给本地解析器只会得到误导性的 `NOT_FOUND`）。已写进未推送分支
+> `feature/gateway-file-service-contracts` 的 `PRODUCT.md` §18.2/§18.4、`MODULE.md` G14 与
+> `REQ-008`/`REQ-013`（该分支按 owner 决定暂不入库，所以本仓库现在还看不到 §18 与那条场景文件）。
+> 本节 (b) 与 §10 的「SFTP no-replace 一致性探针（含变异判据）」随之作废：要测的东西已经
+> 不需要测了，因为客户端压根发不出那个字段。下面原文保留，仅作决策痕迹。
+
+(b) **SFTP（rev2.1 补，评审必改①；已被上方勘误推翻，保留作历史）**：V1 提交走 `sftp.rename(part, final, None)`
 （`src/file.rs:906-911`），ssh2 0.9.6 的 `rename` 在 `flags=None` 时**默认取全部
 RenameFlags**，其中含 `OVERWRITE`（`ssh2-0.9.6/src/sftp.rs:407-409`；位定义 :135-146：
 `OVERWRITE=:139 / ATOMIC=:142 / NATIVE=:145`；其 doc :405 明言 "If no flags are specified
