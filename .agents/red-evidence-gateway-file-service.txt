@@ -50,6 +50,20 @@
 #   evidence dir = verify-60aa19e1361e。contract_hash 由 3652314f9c213a60fb21c23fc9a296359b63c0b5
 #   （master 176c5a5 的场景集）变为本文件头的 63eff98eb965bf3382895eb95c59a75c255e194c，
 #   即新场景已进入契约集并被冻结。
+#
+# 提交号与复跑对应关系（避免把旧 sha 的数当作新提交的数）：
+#   - 上面的 8 条 scenario run 与首轮 verify --fast 取证于 **e36b598**（首个契约提交，
+#     amend 前的临时对象，只在作者本地 reflog 可达、不在任何分支上）；
+#   - 该提交被 amend 为 **46b04bc**（补 PRODUCT.md 措辞、MODULE.md G12-G21、
+#     requirements.toml REQ-005..012、本证据文件），**scenarios/ 逐字节未变**
+#     （`git diff e36b598 46b04bc -- scenarios/` 为空）⇒ 8/8 FAIL 的结论直接迁移，无需重跑；
+#   - 在 46b04bc 上重跑门禁：contract_hash 仍为 63eff98eb965bf3382895eb95c59a75c255e194c
+#     （即 commit marker 对最终提交成立），dirty_state=false，
+#     verify --fast = 9 门全 PASS，evidence dir = verify-ec5649ae8d49；
+#   - 顺带记一条宿主事实：取证期间该机 sshd 报
+#     `kex_exchange_identification: banner line 0: Exceeded MaxStartups`，
+#     连续快速新建连接会被拒——与本模块 V1 评审的 P0-12（认证风暴放大成拒绝服务）同一类机制，
+#     只是这次发生在我的验证通道上而不是被测代码里。
 
 ## scenario list 命中（8/8 可发现）
 product.gateway-file-auth-throttle
