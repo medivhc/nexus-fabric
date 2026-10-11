@@ -327,7 +327,10 @@ pub fn serve() -> Outcome {
                         return (
                             "BLOCKED".to_string(),
                             e,
-                            vec![("handled_requests".to_string(), json!(handled))],
+                            vec![
+                                ("authority".to_string(), json!("advisory")),
+                                ("handled_requests".to_string(), json!(handled)),
+                            ],
                         );
                     }
                     handled += 1;
@@ -340,13 +343,19 @@ pub fn serve() -> Outcome {
                     return (
                         "FAIL".to_string(),
                         format!("MCP 入站帧不合规：{code} - {}", failure.reason),
-                        vec![("handled_requests".to_string(), json!(handled))],
+                        vec![
+                            ("authority".to_string(), json!("advisory")),
+                            ("handled_requests".to_string(), json!(handled)),
+                        ],
                     );
                 }
                 return (
                     "PASS".to_string(),
                     format!("MCP stdin 已关闭，处理 {handled} 条请求后退出"),
-                    vec![("handled_requests".to_string(), json!(handled))],
+                    vec![
+                        ("authority".to_string(), json!("advisory")),
+                        ("handled_requests".to_string(), json!(handled)),
+                    ],
                 );
             }
         }
@@ -751,8 +760,8 @@ pub fn selftest(args: &[String]) -> Outcome {
     // 收尾：优雅 shutdown；无论如何都要回收子进程（不留孤儿 language server 进程）。
     let shutdown = json!({"jsonrpc":"2.0","id":99,"method":"shutdown","params":{}});
     let _ = drive(&mut writer, &rx, &shutdown, Duration::from_secs(10));
+    // 关掉写端：server 侧读到 EOF 才会自己退出，不靠 kill 兜底。
     drop(writer);
-    let _ = child.stdin.take();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match child.try_wait() {

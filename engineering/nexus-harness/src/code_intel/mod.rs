@@ -1465,8 +1465,9 @@ mod tests {
     /// 候选集为空 ⇒ `no_candidates` + `SYMBOL_NOT_FOUND`，同样一次查询都不发起。
     /// 门次提醒：作用域门之后、候选门之前还有一道指纹门（gate 2），git 调用降级成
     /// 哨兵值时本用例只能观测到 `stale`（并发跑测试时的真实形态，见 env.rs 的
-    /// index.lock 说明）。两个分支都写断言，不用 early return 跳过——"没测到"
-    /// 不能伪装成"测过了"。
+    /// index.lock 说明）。分支判定只允许用**这次调用产出的 snapshot**，不许再问一次
+    /// git —— 二次取值会带来"实现降级了但测试没看出来"的假红。两个分支都写断言，
+    /// 不用 early return 跳过——"没测到"不能伪装成"测过了"。
     #[test]
     fn anchors_without_contract_candidates_reports_no_candidates() {
         let repo = Repo::discover().expect("must run inside the nexus repository");
@@ -1484,8 +1485,19 @@ mod tests {
         assert_eq!(rep.candidate_queries, 0, "候选为空即返回，不得尝试任何查询");
         assert!(!rep.truncated);
         let reason = rep.reason.as_ref().expect("非 ok 状态必须带结构化原因");
-        if digest_is_unusable(&repo.working_tree_digest()) {
-            assert_eq!(rep.status, "stale", "指纹降级时门 2 先命中");
+        // 判据只能来自**这次调用自己的产物**：再问一次 git 会引入二次竞态
+        // ——并发跑时 `anchors()` 里那次 `git write-tree` 可能因 index.lock 降级成哨兵值，
+        // 而测试随后再问一次却拿到了正常指纹，于是走进 else 分支断言 `no_candidates`
+        // 并假红（Linux 上实测过；Windows 单跑永远复现不出来）。
+        let digest = rep.snapshot["working_tree_digest"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if digest_is_unusable(&digest) {
+            assert_eq!(
+                rep.status, "stale",
+                "这次调用的指纹是哨兵值时，门 2 必须先命中（digest={digest}）"
+            );
             assert_eq!(reason.0, "SNAPSHOT_STALE");
         } else {
             assert_eq!(rep.status, "no_candidates", "status 实际为 {}", rep.status);
