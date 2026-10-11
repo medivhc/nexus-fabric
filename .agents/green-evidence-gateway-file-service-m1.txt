@@ -101,3 +101,61 @@ M0 阶段我按评审提示担心"8 条 RED 场景会把 full 门禁变红"。�
 "FAIL ⇒ 门 FAIL；run/parse 失败 ⇒ UNKNOWN（绝不静默 PASS）"，而 M0 的失败形态是
 `failed_step=parse`（探针不存在，stdout 为空）⇒ 记 UNKNOWN，不阻塞。
 本片之后 8 条为 PASS，该门更不涉及。评审案卷里"恒红"那句据此更正为"恒 UNKNOWN"。
+
+================================================================================
+追加：M1 第二片（后端边界 fail-closed + M0 评审 r1 的契约纠正），同一宿主同一工具链
+================================================================================
+# 代码提交: 8fa559c "requirement-change(gateway): 后端边界改为 fail-closed..."
+#   （其 amend 前的临时提交是 5b9ce4c；两者的 scenarios/** 逐字节相同，
+#    所以 contract_hash 一致，但 5b9ce4c 不含探针的 import 修正，不作为引用基准）
+# bindings（Linux 侧 status 实测，非本地复算）:
+#   source_revision=8fa559c733f5247c0156363aa96e5981c2c4802d
+#   contract_hash  =d650b774092e0c7097748ef16ebc69a0104a843f
+#   working_tree_digest=30173c3625e524f8e0724cfcd1b5523f6734c7e4, dirty_state=false
+#   ⇒ commit message 里的 `requirement-change:` marker 对该提交成立
+# verify --fast: verdict PASS，9 门全 PASS，evidence dir = verify-1d52b78ae5e0
+
+实测结果：
+```
+cargo test -p nexus-web-gateway --lib           → 37 passed; 0 failed（新增 1 条后端边界单测）
+cargo clippy -p nexus-web-gateway --all-targets → 无输出
+E4 场景 9/9 PASS：
+  list-pagination              6 expectations
+  download-page               10 expectations
+  upload-resume                9 expectations
+  upload-no-replace            5 expectations   ← 已从 6 条收窄（见下）
+  sandbox-symlink              9 expectations
+  auth-throttle                7 expectations
+  quota-backpressure           8 expectations
+  capability-negotiation       7 expectations
+  sftp-boundary               12 expectations   ← 本片新增
+  合计 73 条 expectation 成立
+```
+
+一处必须登记的自身错误（不做静默修正）：我在提交过程中先用 Windows 侧脚本按
+`env.rs:contract_hash` 的算法复算契约号。对 HEAD 复现出 63eff98eb965bf3382895eb95c59a75c255e194c
+（与既有案卷逐字节相同），我便据此对新树算得 242b3d17f83260f76eb677523c12afb374c210ac。
+**那个数是错的**：脚本的"读 index"分支里文件清单仍来自 `git ls-tree HEAD`，
+于是第 9 个新增场景根本没进清单——内容取 index、清单取 HEAD。Linux 实测值
+d650b774092e0c7097748ef16ebc69a0104a843f 才是对的，marker 已在 amend 前改成它。
+教训：**能复现旧值不等于方法正确**，只说明那次的集合恰好没变；一旦改动集合，
+必须换独立来源交叉验证，而不是沿用同一个可能被写歪的复算器。契约号一律以主机
+`nexus-harness status` 的输出为准。
+
+契约侧的实质变化（owner 选定 (b) 之后）：
+- SFTP 根上 `open_upload`/`mkdir`/`rename`/`remove` 一律 `UNSUPPORTED_CAPABILITY`，
+  且在 SFTP 传输实现之前 `list`/`read_page`/`stat` 同样拒绝。依据不是"保守"，而是
+  客户端根本发不出 no-replace 标志（libssh2 钳在 SFTP v3）。
+- `upload-no-replace` 场景去掉 `remote_flag_honored_claimed = false` 这条**反向冻结**
+  （评审 r1 的 E 项：真要证明远端 honor 反而让场景变红）。这批场景从未合入 master，
+  所以这是 M0→M1 之间的契约收紧，不是修改已冻结的 expectation。
+- 新增 `product.gateway-file-sftp-boundary`（13 条断言，实测 12 条 expectation 被解析判定）：
+  钉住"sftp 根四类变更均不可用 + 读面不可用 + 后端能力是静态属性 + 远端根形状检查"。
+- FILE_MANIFEST.md 补登 9 个场景 + 引擎 + 探针 + 两份 evidence（此前一条都没有）。
+
+仍未清偿（评审 r2 给的，按阻塞序）：F2 两层键（已实现，需回头核对文档口径）、
+F3 错误码词表（契约/代码统一，V2 设计的 `BUFFERED_LIMIT/QUOTA_*` 待改）、
+F4 Windows `MetadataExt::file_attributes()` 其实稳定可用（评审方探针结论，**我未复现**，
+§18.3 的 B 级理由目前只站在 `(dev,ino)` 不可得这一层）、F5/F6 预算不等式只算文件面
+（`max_terminals` 无上界、`sctp_send_budget_bytes` 属 per-association）、
+以及 V2 里约 40 处指向未合入 V1 工作树的行号引用。这些属设计文档，另批处理。
