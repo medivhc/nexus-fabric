@@ -2,7 +2,7 @@
 
 本包实现《Nexus 统一系统设计规范 v9》中的“统一仓库目录契约”。
 
-文件数（不含本清单）：177
+文件数（不含本清单）：178
 
 > 2026-10-10：原声明值 137 与表内实际行数（148）已不一致（既有漂移，含
 > `scenarios/engineering/bench_gate_verdicts.toml` 等未登记项）。本次登记
@@ -31,6 +31,8 @@
 > 本轮先跑出新场景的 Red（`scenario-edf5bdf1d4b8`，夹具文件尚不存在 ⇒ `verdict` 期望落空），
 > 再加夹具转 Green——契约先行，不是先看输出再补期望。
 >
+> 2026-10-11（Phase 2-4 开工）：登记 `.agents/code-intelligence-phase-2-4-plan.md`，声明值 177 -> 178。
+>
 > 既有缺口（非本次引入，保留待仓库所有者裁决）：`.evidence/.gitignore`、
 > `.evidence/README.md` 两行来自基线（`7d2e643`），但这两个文件已在
 > `5694faa`（"untrack generated .evidence artifacts"）中被取消跟踪，磁盘上也不
@@ -39,6 +41,7 @@
 
 | Path | Purpose |
 |---|---|
+| `.agents/code-intelligence-phase-2-4-plan.md` | 提案 §15 Phase 2/3/4 的工作计划与判据（含多语言/冷启动的实测证据与逐项做/不做的判断台账） |
 | `.agents/code-intelligence-followups.md` | 独立 Review round 3（`COMMENTED`）的 12 条后续待办，逐条带 `文件:行` 与验收动作；作为"机器可见的待办承载体" |
 | `.agents/green-evidence-code-intelligence.txt` | Green Evidence record（Code Intelligence E4 场景全 PASS，正文记录其绑定的 source_revision） |
 | `.agents/red-evidence-code-intelligence.txt` | Red Evidence record（Code Intelligence 契约阶段 9/9 FAIL） |
