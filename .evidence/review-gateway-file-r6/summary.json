@@ -181,6 +181,16 @@
       "G1 门禁绑定修复在 fix/hook-review-evidence-binding（689f63a），未合入 master 与本分支：本分支提交通过的是旧门（只看最新 review 目录的 verdict），provenance/scope 绑定要等那条分支合入才生效",
       "release_session 的释放字节数被丢弃，会话拆除归还了多少不可观测"
     ],
-    "review_chain": "r1 CHANGES_REQUESTED(6 FAIL) → r2 CHANGES_REQUESTED(5 FAIL) → r3 CHANGES_REQUESTED(2 FAIL) → r4 CHANGES_REQUESTED(1 FAIL) → r5 CHANGES_REQUESTED(1 FAIL) → r6 COMMENTED(0 FAIL，1 WARN + 4 NOTE，本批已全部处置)。AGENTS.md:1585 的 3 轮上限早已超出并向 owner 报备过三次；r6 明确判定可合入（在声明为 open 的 owner 项之前提下）。"
+    "review_chain": "r1 CHANGES_REQUESTED(6 FAIL) → r2 CHANGES_REQUESTED(5 FAIL) → r3 CHANGES_REQUESTED(2 FAIL) → r4 CHANGES_REQUESTED(1 FAIL) → r5 CHANGES_REQUESTED(1 FAIL) → r6 COMMENTED(0 FAIL，1 WARN + 4 NOTE，本批已全部处置)。AGENTS.md:1585 的 3 轮上限早已超出并向 owner 报备过三次；r6 明确判定可合入（在声明为 open 的 owner 项之前提下）。",
+    "landed_in_commits": {
+      "code_and_contract_commit": "bd2845c",
+      "evidence_commit": "7fe1813",
+      "verified_committed_state_on": "xc-pc-linux, git status --porcelain 为空（dirty_state=false）",
+      "source_revision": "7fe18131f",
+      "working_tree_digest": "b65d6b0b5",
+      "contract_hash": "8f510129cd7d9bef054d2324a4517fc534ab9806",
+      "measurements_at_committed_state": "cargo test -p nexus-web-gateway --lib = 58 passed; 0 failed；verify --fast = 9 门全 PASS",
+      "note": "先前各轮的实测数取自验证远端上的 stash 式内容树；此条把同一组数字锚回真正落地的提交，后续门禁可核。"
+    }
   }
 }
