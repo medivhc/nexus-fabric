@@ -914,3 +914,99 @@ xc-pc-linux 结论级（rustc/clippy/rust-analyzer 1.98.1，rev f1575b5d，dirty
 未验证边界不变（第三方 MCP 客户端互操作、本 rev 的 verify --full、多语言 provider）；
 新增一条：daemon 在负载宿主上的"connect 超时 vs 被拒"分类虽已按 ConnectionRefused 收紧，
 但 OPEN-1 的完整复现（活 daemon 被误判为残留）我**没有**再造出来一次，只做了机理修正。
+
+================================================================================
+§V round 2 整改后的 Windows 冒烟复跑（2026-10-13，宿主 SH-YF-CX-PC，
+   rustc/cargo 1.95.0，host triple x86_64-pc-windows-msvc，rust-analyzer 1.95.0 在场）
+   运行基线：rev `4b61987`（round 2 整改提交），工作树 **clean**
+   被测二进制（N-r2-5 起的新记法：每条运行结论都必须带同一次跑的路径+md5+mtime）：
+     path  = D:/next/ci-p24/target/debug/nexus-harness.exe
+     md5   = 0f610087190b40fdc733a754478035e7
+     mtime = 2026-10-13 06:43（还原 61s 反证补丁之后重新 build 的那一份）
+     size  = 6569984 bytes
+   本机 contract_hash = ef1a950bca55d2ffb7729ac700c051be684f65c3
+   本机 working_tree_digest（clean @ 4b61987）= c1189dd845c35205eabce77c1ec65ad4b7914dc0
+   ⇒ 与 Linux 侧 §U 的 f8c85522… / §R 的 78981c3f… **不是同一量的两次测量**（工作树字节 + 行尾差异），
+     不要互相对账；口径见 DEVELOPMENT.md §11.1。
+================================================================================
+
+门禁（本轮实跑，逐条取退出码而不是看尾巴输出）：
+
+    cargo fmt --all -- --check                0 字节（干净）
+    cargo build -q -p nexus-harness           exit 0
+    cargo clippy -q -p nexus-harness --all-targets -- -D warnings
+                                              exit 0，输出 0 字节
+    cargo test -q -p nexus-harness -- --test-threads=1
+                                              **152 个 = 149 passed + 3 failed**，46.89s
+                                              3 条固定失败 = master 自带、依赖 POSIX echo 的
+                                              `scenario::tests::run_single_*`/`run_parallel_*`
+                                              （DEVELOPMENT.md §11.1 已披露，未削弱）
+                                              较上一档 150 的增量 = 本轮新增的 2 条单测
+
+两枚新单测**逐名实跑**（不是只在源码里存在）：
+
+    code_intel::daemon::tests::silent_daemon_probe_returns_within_the_probe_budget  ok  10.00s
+    code_intel::daemon::tests::takeover_flag_is_valueless_and_refused_on_serve_entry  ok  0.00s
+
+    反证（这条测试能不能变红）：把 `PROBE_READ_TIMEOUT` 从 10s 临时改成 **61s**
+    ——"两档预算并回一档"的等价代理，真用 900s 跑一次太贵——该测试
+    FAILED：`探活等了 61.0098391s：握手档被换回查询预算（900s）了`，随后从
+    /tmp/daemon.rs.bak-v 还原并重新 build（还原后 md5 见上）。它不是一条只会绿的断言。
+
+N-r2-2 的真实 CLI 三档观测（**stdout 走文件而不是管道**，见下方 F-新2 那条计时警告）：
+夹具 = 一个 accept 之后永不回帧的监听者，租约手工写进私有命名空间指向它。
+
+    status                     10.2s   UNKNOWN，daemon.running=false，
+                                       daemon_unavailable 带"握手失败…header read failed"
+    start（无 flag）           10.2s   UNKNOWN，**租约仍是那份假的**（不起第二个监听者）
+    start --takeover           20.3s   PASS，租约换代 61735 ⇒ 61900，daemon.running=true
+    code symbol Egress         18.1s   PASS，daemon.session_source="daemon"，
+                                       provider.session_reused=false，session_queries=1
+    code symbol Ingress（同池）15.6s   PASS，session_reused=true，session_queries=2
+    daemon stop                 0.42s  PASS，sessions_after_stop=0，
+                                       stop_reply={sessions_before_stop:1, sessions_after_stop:0}
+                                       （回收观测仍是**唯一出处** stopped 帧 ⇒ N-r2-1 生效），租约已删
+
+    同一步骤在**管道 stdio** 下测到 240s（那是脚本自己的 timeout 到点，不是命令耗时）⇒ 这就是
+    F-新2 记的"daemon 继承调用方可继承的 stdout 管道句柄"的效应。以后凡是给 daemon 相关命令计时，
+    **必须以文件 stdio 为准**，管道里的数字是句柄生命周期，不是延迟。
+
+`daemon selftest --workspace engineering/nexus-harness/fixtures/code-intel --json`（干净树）：
+
+    verdict=PASS  probe_count=23  红 0 枚  duration_ms=126721（2m10s）
+    sessions_after_stop=0  dirty_after_lifecycle=0  cache_second_run_tier=disk
+    snapshot.source_revision=4b61987292e4d1ac9aa109946b629e319a159d50  dirty_state=false
+
+26 条 code_intelligence_* 场景（串行批次，Windows 冒烟口径，非结论级）：
+
+    **25 PASS + 1 FAIL**
+    FAIL = engineering.code-intelligence-diagnostics-advisory @ failed_step=expect /
+           assertion=verdict，41308ms，evidence_id=scenario-913ca46600cd
+      载荷实况：`error.code=TIMEOUT`，reason="textDocument/diagnostic 在 20s 内未响应，
+      已发送 $/cancelRequest"；`provider.ready=true`、`duration_ms=37585`、
+      `server_requests_unhandled=2`、`count=0` ⇒ 不是"没就绪就采信空结果"，是**取诊断这一步超时**。
+      期望是 `verdict one_of ["PASS","FAIL"]`，实际得 UNKNOWN ⇒ 断言失败（方向安全：它红了）。
+    复跑与判因（三步，别把第一步当独立重复）：
+      ① 单条 `scenario run` ⇒ PASS 1007ms —— **这条是缓存回放**（同参数手工 `code diagnostics`
+         实测 `cache.tier=disk`、`provider.duration_ms=364`），回放不能算一次独立重复。
+      ② 独立重复 = `code diagnostics … --no-cache` ⇒ **PASS**，tier=miss + disabled=true，
+         22.0s，count=1，ready=true ⇒ 新鲜路径本身是通的。
+      ③ 负载来源：本机同时有**另一个会话**的 `nexus-harness.exe verify --fast`（PID 40100，
+         跑在 D:\next\nexus，不是本任务的进程，我没有动它）在跑，rust-analyzer flycheck 与它
+         争 CPU/target 锁。与 §T 的 N-1（"冷启动/负载前置条件未登记"）同域。
+    处置：**不改判据、不降超时、不削断言**，只如实登记为"负载宿主上这条可假红"。
+    记录警告：FAIL 与复跑 PASS 的 evidence_id **同为** scenario-913ca46600cd（确定性 id，
+    种子不含工作树指纹）⇒ PASS 已原地覆盖 FAIL 的落盘记录，FAIL 的数值只存在于本段。
+
+Windows 结构性限制不变：`verify --fast` 在本宿主不可跑（nexus-platform-linux 的 fuser 依赖 +
+apps/nexus/examples/discovery_mdns.rs 的 Unix-only std::os::fd），Linux 结论级复跑另见 §W。
+
+公开更正（对**我自己的历史记录**，不是对测量值）：`.githooks/commit-msg` 的 type 分类法是
+`feature|bug|refactor|test|docs|performance|dependency|requirement-change`，而这三笔不合：
+    0a42240 `feat(...)`   应为 `feature(...)`
+    f1575b5 `fix(...)`    应为 `bug(...)`
+    4b61987 `fix(...)`    应为 `bug(...)`
+`fix` 还正好落在它的模糊主题黑名单里。根因是仓库没装 hooks（`core.hooksPath` 未设），而我
+手工调 `pre-commit` 却在**提交之后**才调 `commit-msg`（4b61987 就是这样才发现的）。
+三笔都未推送，但按"不重写历史、破坏性动作先问"的规矩我没有原地改；要不要本地 rebase 改 subject
+归所有者定。往后我自己的口径：**commit-msg 必须在提交前用同一份消息文本跑通**。
