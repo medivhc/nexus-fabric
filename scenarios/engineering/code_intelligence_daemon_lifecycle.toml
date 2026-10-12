@@ -12,6 +12,8 @@ requirement = "engineering/nexus-harness/MODULE.md#provider-daemon--result-cache
 # 必须显式 --workspace：契约规定 selftest 没有缺省作用域，缺省即环境依赖。
 # 独立性与隔离：selftest 用自己的租约/缓存命名空间与 temp scratch workspace，
 # 因此既不碰开发者真实在跑的 daemon，也不在仓库工作树里造文件（dirty_after_lifecycle=0 钉这条）。
+# 命名空间**每次运行唯一**：否则第二次跑会读到上一次的缓存条目，default_path_* 与
+# cache_second_run_tier 的含义就随运行次数漂移（契约「作用域与隔离」②）。
 # 诚实边界：second_process_* / cache_second_run_tier / stale_fallback_verdict 要求宿主有可解析的
 # rust-analyzer；没有 RA 的宿主上本场景如实变红（与 provider_override_honored 同一口径）。
 
@@ -42,7 +44,7 @@ equals = "advisory"
 # 探针条数 = 契约清单条数；实现少跑一条就红（§N 那类"记错条数"不能靠人复查）。
 [[expect]]
 field = "probe_count"
-equals = 30
+equals = 32
 
 [[expect]]
 field = "start_verdict"
@@ -150,6 +152,16 @@ equals = true
 
 [[expect]]
 field = "unknown_flag_blocked"
+equals = true
+
+# 未运行时的字段可得性必须是"不出现"，不是 null/0 占位（只在散文里规定等于没规定）。
+[[expect]]
+field = "absent_fields_when_not_running"
+equals = true
+
+# daemon_unavailable 出现时原因必非空且结构化（回落可见，不是静默降级）。
+[[expect]]
+field = "unavailable_reason_present"
 equals = true
 
 [[expect]]

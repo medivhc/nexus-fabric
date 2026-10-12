@@ -7,6 +7,8 @@ requirement = "engineering/nexus-harness/MODULE.md#provider-daemon--result-cache
 # --no-daemon 是"契约授权的确定化口径"：环境里有没有人手工起过 daemon 都不影响本场景。
 # 它**不**用来证明"默认路径不自动 spawn" —— 那是同义反复；那条性质由 daemon selftest 的
 # default_path_session_source / default_path_lease_absent 两枚值断言钉（selftest 控制起始状态）。
+# 契约把 daemon.running 定义为"本次查询经由 daemon"（不是"机器上有没有 daemon"），
+# 所以 running=false 在本场景里与环境里是否有别人的 daemon 无关；"有没有"另由 daemon.detected 暴露。
 # 本场景不钉 cache.tier：默认允许缓存时 tier 取决于是否已有同指纹条目，属环境既有状态，
 # 拿 one_of 容忍它不是断言。命中条件与真实命中由 selftest 的 cache_second_run_tier="disk" 负责。
 

@@ -381,22 +381,47 @@ nexus-harness code <verb> ──(daemon 在跑且握手成功)──▶ daemon(1
 - **字段与可得性**（缺字段即契约破坏，`null`/`0` 不得冒充"有但不知道"）：
 
   ```text
-  daemon   {running, session_source: "daemon"|"in-process", lease_path, port, pid,
+  daemon   {running, detected, session_source: "daemon"|"in-process", lease_path, port, pid,
             idle_secs, already_running, stale_lease, daemon_unavailable,
             provider_sessions, provider_session_capacity}
   cache    {tier: "miss"|"memory"|"disk", key_digest, entries, bytes, disabled}
   ```
-  `running=false` 时 `port`/`pid`/`lease_path` **不出现**；`daemon_unavailable` 只在
-  本想用 daemon 却失败时出现，并带结构化原因（此时查询照常完成，不得 hang 在超时上，
-  也不得把回落说成 PASS 之外的任何结论）。默认值也是契约：`idle_secs=900`、
-  `max_workspaces=2`，即使没有 daemon，`daemon status` 也要把这两个默认值报出来
-  （否则"默认值都是允许"这句话没有任何机器对应物）。
+  - **`running` 的语义必须是"本次查询经由 daemon"，不是"机器上有没有 daemon"**
+    （独立盲评 round 2 抓的歧义：`--no-daemon` 时环境里可能真有一个别人的 daemon，
+    此时 `running` 两种读法都自洽 ⇒ 场景变成碰运气）。"有没有可用 daemon"是另一个字段
+    **`detected`**，`--no-daemon` 下它可以是 `true` 而 `running` 仍为 `false`，两问不互相覆盖。
+  - `running=false` 时 `port`/`pid`/`lease_path` **不出现**（这条由 `mcp selftest` 的同类断言
+    升级而来，并由 selftest 探针 `absent_fields_when_not_running` 机器钉住 —— 只在散文里说
+    "不出现"等于没规定）。
+  - **所有 `daemon *` 输出**（含 `BLOCKED` 与 `selftest`）都带 `command="daemon"`、`authority`
+    与 `snapshot`：declined 也要说清绑在哪棵树上，与 `code`/`context`/`serve` 同一规矩。
+  - `daemon_unavailable` 只在本想用 daemon 却失败时出现，并带结构化原因（此时查询照常完成，
+    不得 hang 在超时上，也不得把回落说成 PASS 之外的任何结论；由探针
+    `unavailable_reason_present` 钉住"原因必非空"）。
+  - 默认值也是契约：`idle_secs=900`、`max_workspaces=2`，即使没有 daemon，`daemon status`
+    也要把这两个默认值以 `daemon.idle_secs` / `daemon.provider_session_capacity` 报出来
+    （否则"默认值都是允许"没有任何机器对应物；`code_intelligence_daemon_status_defaults.toml`
+    就是钉这两个值，且**故意不钉 verdict** —— verdict 取决于环境里有没有 daemon）。
+- **缓存命中时返回什么**（这条不写清，实现就会被已冻结的场景绑架 —— 独立盲评 round 2 的头号问题）：
+  ① 命中即**逐字回放**当初产出的 envelope，**包含 `provider` / `snapshot` / `budget` 整块**，
+  所以 16 条已冻结的 `code_*` 场景（例如 `code_intelligence_symbol.toml:31` 钉 `provider.kind`）
+  在命中路径上拿到的字段面与未命中时**完全一致**，不会因"跳过了 provider"而消失；
+  ② 命中不重新推导、不"顺手刷新"任何字段；新加的可见字段只有 `cache.tier="disk"` 与
+  `cache.key_digest`，属**追加**而非替换；
+  ③ 命中前仍要取**当前**工作树指纹与键比对，且查询前后各一次 digest 检查照旧执行 ——
+  即"旧指纹的结果在新树上被当成新结果"在结构上不可能发生，而不是靠实现自觉；
+  ④ 数值上限进契约（否则"有界"不可证伪）：结果缓存**每个 workspace 最多 512 条、
+  累计最多 8 MiB**，超限即不写入并把 `cache.entries` / `cache.bytes` 报出来；
+  ⑤ 缓存内容**不得包含源码原文**（只存符号名、URI、行列与 kind 等中立字段）。
 - **`daemon selftest` 的作用域与隔离**（缺了就不可复现，故属契约）：
-  ① 必须显式给 `--workspace`，**没有缺省作用域**（不写就是环境依赖）；
-  ② 必须在**私有租约/缓存命名空间**里跑 —— 不得读写开发者真实在跑的 daemon 的
-     `lease.json`/cache 目录，也不得让环境里的 daemon 改变探针结果；
+  ① 必须显式给 `--workspace`，**没有缺省作用域**（不写就是环境依赖）；该参数的语义是
+  "**来源**"：selftest 必须先把它复制成自己的一份 scratch，之后任何写操作只允许落在那份副本上
+  —— 直接在仓库内夹具上写，会同时打脸 `dirty_after_lifecycle=0` 与 Side Effects 禁令；
+  ② 命名空间必须**每次运行唯一**（新建的私有租约/缓存目录，带 run 唯一后缀），不只是"私有"：
+  否则重复运行会读到上一次的缓存条目，`default_path_*` 与 `cache_second_run_tier` 在第二次
+  跑的时候含义就变了；也不得读写开发者真实在跑的 daemon 的 `lease.json`/cache 目录；
   ③ 需要"无 daemon"前提的探针（`default_path_*`、`stop_absent_*`）必须自己确认起始状态，
-     不靠执行顺序碰运气；
+  不靠执行顺序碰运气；
   ④ 空闲自退出用**注入的小 `--idle-secs`** 观测，默认 900s 大于场景 600s 超时，天然不可测；
   ⑤ 全程只在自己的 temp scratch workspace 里跑，结束时 `git status --porcelain` 仍为 0 行。
 - **`daemon selftest --json` 的字段清单**（`probe_count` 必须等于本清单条数；场景侧对每条钉**值**
@@ -431,12 +456,16 @@ nexus-harness code <verb> ──(daemon 在跑且握手成功)──▶ daemon(1
   wire_refuses_non_whitelist           true          内部协议收到白名单外 verb ⇒ 拒绝且不改状态
   commands_surface_lists_daemon        true          兜底 BLOCKED 消息里的命令清单必须含 daemon
   unknown_flag_blocked                 true          未知启动参数 BLOCKED（不接受"参数被忽略"）
+  absent_fields_when_not_running       true          未运行时 port/pid/lease_path 确实不出现（不是 null 占位）
+  unavailable_reason_present           true          daemon_unavailable 出现时原因必非空且结构化
   defaults_idle_secs                   900           契约默认值
   defaults_max_workspaces              2             契约默认值
   dirty_after_lifecycle                0             整个生命周期结束后工作树未被写入
   ```
-  `probe_count = 30`。"不得 hang" 不用时间上界钉死（那是把宿主负载写进契约）：真卡住时
-  场景会以 `failed_step="run"`（超时）暴露，而不是被某条脆弱的毫秒断言误判。
+  `probe_count = 32`。"不得 hang" 不用时间上界钉死（那是把宿主负载写进契约）：真卡住时
+  场景会以 `failed_step="command"`（命令步超时；求值器的词表是
+  `lookup`/`fixture`/`command`/`parse`/`expect`，**没有** `"run"`）暴露，
+  而不是被某条脆弱的毫秒断言误判。
   部分探针（`second_process_*`、`cache_second_run_tier`、`stale_fallback_verdict`）要求宿主
   有可解析的 rust-analyzer；在没有 RA 的宿主上它们**如实变红**，这是性质而非环境噪声
   —— 与 `provider_override_honored` 同一口径。
@@ -558,7 +587,7 @@ Code Intelligence 场景（E4，冻结于 2026-10-10 契约阶段，夹具为
 `code_intelligence_mcp_real_query.toml`（Phase 3/4：`tools/call` 走真实查询并返回 CLI 那套
 中立 DTO，且第二次查询必须复用同一 provider 会话）。
 `code_intelligence_daemon_lifecycle.toml`（daemon 的显式生命周期、跨命令复用与两层缓存：
-**逐条钉本文件 selftest 字段清单的值**（36 条期望，`probe_count = 30`），并显式传 `--workspace`
+**逐条钉本文件 selftest 字段清单的值**（38 条期望，`probe_count = 32`），并显式传 `--workspace`
 —— 契约规定 selftest 没有缺省作用域，缺省即环境依赖。覆盖 start 幂等、默认路径不自动 spawn
 （`default_path_session_source` + `default_path_lease_absent` 两枚值断言，而非用 `--no-daemon`
 同义反复）、残留租约回落不谎报、错误 token 被拒、注入小 idle 后自退出并删租约、
@@ -570,7 +599,7 @@ digest 变更 ⇒ `digest_invalidation_reason="digest_changed"`、结果层**真
 证明 CLI 不自动 spawn，且该口径不受环境里是否有人手起过 daemon 影响）、
 `code_intelligence_cache_disabled.toml`（`--no-cache` ⇒ `cache.disabled=true` 且 `tier="miss"`，
 键绑定字段仍可见）、`code_intelligence_daemon_command_surface.toml`（未知 daemon 子命令 `BLOCKED`
-且 declined 输出照样带 `authority`/`daemon.running`）、`code_intelligence_daemon_unknown_flag.toml`（daemon 的未知启动参数 `BLOCKED` —— 本模块两次栽在"参数被接受但不生效"上，daemon 一次新增三个参数，同一漂移最可能复发的地方就是它；参数被真实兑现由 selftest 的 `defaults_*`/`idle_self_exit_observed` 值探针钉）。共 **26** 个。
+且 declined 输出照样带 `authority`/`daemon.running`）、`code_intelligence_daemon_unknown_flag.toml`（daemon 的未知启动参数 `BLOCKED` —— 本模块两次栽在"参数被接受但不生效"上，daemon 一次新增三个参数，同一漂移最可能复发的地方就是它；参数被真实兑现由 selftest 的 `defaults_*`/`idle_self_exit_observed` 值探针钉）、`code_intelligence_daemon_status_defaults.toml`（无 daemon 时 `daemon status` 仍报契约默认值 `provider_session_capacity=2`/`idle_secs=900`，并**故意不钉 verdict** —— verdict 随环境变化，不是被测性质；`daemon.detected` 用 one_of 只钉"这个字段必须在"）。共 **27** 个。
 
 ### Review 结论与待办承载体（2026-10-10）
 

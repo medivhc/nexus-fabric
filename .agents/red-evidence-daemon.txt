@@ -114,3 +114,48 @@ cache-disabled 4/7、explicit-only 3/8、lifecycle 1/20 —— 那说明红灯�
 2. 对门禁：实测无任何"声明条数 == 加载条数"的校验（`grep scenario_count gates.rs` 为空），
    所以**一条语法错误的场景文件会从 pack 里无声消失**，场景数少 1 而全绿。
    这属 harness 自己的 fail-open 形态，与本特性无关，已另登记为后续项。
+---
+
+## 第三轮红灯（盲评 round 2 打回后的第二次修订；4 条阻塞 + 若干 nit）
+
+round-2 案卷 `.evidence/test-review-branch-feature-code-intel-phase-234-2026-10-12-r2/`：
+verdict 仍 `CHANGES_REQUESTED`，但**收窄到 4 条**，并确认 r1 的 16 条里 11 CLOSED / 5 PARTIAL、
+根因（契约没枚举 selftest 字段）已修、两个假绿现在都能被抓。仍然只改测试与契约。
+
+四条阻塞与处置
+1. **命名空间必须每次运行唯一**（不只是"私有"）：否则第二次跑会命中上一次的缓存条目，
+   `default_path_*` 与 `cache_second_run_tier` 的含义随运行次数漂移。契约「作用域与隔离」②已改写。
+2. **缓存命中时返回什么，契约一字未写** —— 这条最狠：命中若跳过 provider，已冻结的 16 条
+   `code_*` 场景（如 `code_intelligence_symbol.toml:31` 钉 `provider.kind`）就会变红，
+   实现方会被冻结测试绑架 —— 正是技能禁止的双向调和。已规定：命中 = **逐字回放**录得的
+   envelope（含 `provider`/`snapshot`/`budget`），`cache.tier` 属**追加**字段而非替换，
+   命中前仍与当前工作树指纹比对、前后 digest 检查不放宽。
+3. **`daemon.running` 在 `--no-daemon` 下两义合法**（"本次经由 daemon" vs "机器上有 daemon"），
+   而 explicit-only 钉 `false` 就成了碰运气。已把语义钉死为前者，另设 `daemon.detected`
+   暴露"有没有可用 daemon"，两问分离。
+4. **`daemon *` 输出的可得性锚点缺失**（`command="daemon"`、`authority`、`snapshot` 在
+   BLOCKED/selftest 路径上没有条款要求）。已补"所有 daemon 输出都带这三项"。
+
+一并收掉的 nit：契约里"真卡住以 `failed_step="run"` 暴露"是**错的**（求值器词表是
+`lookup`/`fixture`/`command`/`parse`/`expect`，没有 `run`）⇒ 改成 `command`；
+提交说明声称已补"未运行时 port/pid/lease_path 不出现"但清单里根本没有对应探针 ⇒
+现在真有 `absent_fields_when_not_running`；`cache_bounded_and_source_free` 的"有界"没有数 ⇒
+契约写死每 workspace 512 条 / 8 MiB；plan 文档残留第三处漂移名 `reuse_probe` 已改。
+字段清单 30 → **32**，`probe_count = 32`，lifecycle 期望 36 → 38。
+新增第 7 条场景 `daemon-status-defaults`：钉 `provider_session_capacity=2` 与 `idle_secs=900`，
+**故意不钉 verdict**（verdict 随环境有没有 daemon 变，那不是被测性质）—— 这是盲评指出
+"契约说了 status 要报默认值，但场景层零触达"的补丁。
+
+自证一致性检查（不靠人读）：契约清单条数、场景钉的探针数、`probe_count` 三者必须相等；
+所有场景里 `daemon.x` / `cache.x` 的名字必须在契约命名空间里声明。实测：
+contract list=32，lifecycle pinned=32，probe_count=32，双向差集为空；
+6 条场景的 ns 引用 12 处全部已声明。
+
+第三轮红灯（6 条，全在 `failed_step="expect"`；新文件也能被加载 ⇒ 上一轮的静默跳过陷阱已避开）：
+
+    daemon-lifecycle       FAIL  expect  verdict            scenario-f50c7a7bde0c
+    daemon-explicit-only   FAIL  expect  verdict            scenario-aabea75ead19
+    cache-disabled         FAIL  expect  verdict            scenario-d94b446a983a
+    daemon-command-surface FAIL  expect  daemon.running     scenario-a3d12d2f8bd0
+    daemon-unknown-flag    FAIL  expect  daemon.running     scenario-a561b7c07a73
+    daemon-status-defaults FAIL  expect  authority          scenario-2e368d679f32

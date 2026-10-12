@@ -1,0 +1,51 @@
+schema_version = 1
+id = "engineering.code-intelligence-daemon-status-defaults"
+title = "没有 daemon 时 daemon status 仍报出契约默认容量与 idle 上限：provider_session_capacity=2、idle_secs=900（MODULE.md 默认值也是契约）"
+evidence_strength = "E4"
+requirement = "engineering/nexus-harness/MODULE.md#provider-daemon--result-cache"
+
+# 这条场景的存在理由（独立盲评 round 2 指出）：契约写了"即使没有 daemon，daemon status 也要把
+# 默认值报出来"，但场景层零触达 ⇒ "默认值都是允许"没有机器对应物。
+# 关键取舍：**故意不钉 verdict**。环境里有没有别人起过的 daemon 会改变 verdict
+# （无 ⇒ UNKNOWN，有 ⇒ PASS），那是环境事实而不是本性质；而两个默认值在两种情况下都必须成立。
+# 同理不钉 daemon.running —— 它的语义是"本次查询经由 daemon"（契约定义），
+# 而 status 本身不发起查询，取值随环境。这里只钉与 ambient 状态无关的两个常量。
+
+[given]
+repository = "initialized"
+network = "none (不启动 daemon，只做本地探测与默认值上报)"
+
+[when]
+command = "nexus-harness daemon status --json"
+
+[[expect]]
+field = "command"
+equals = "daemon"
+
+[[expect]]
+field = "schema_version"
+equals = 1
+
+# declined/无 daemon 的输出也要自述权威与绑定。
+[[expect]]
+field = "authority"
+equals = "advisory"
+
+[[expect]]
+field = "snapshot.source_revision"
+non_empty = true
+
+# 两个契约默认值。
+[[expect]]
+field = "daemon.provider_session_capacity"
+equals = 2
+
+[[expect]]
+field = "daemon.idle_secs"
+equals = 900
+
+# detected 无论环境如何都必须存在（它是"有没有可用 daemon"的唯一可见出口，
+# 与 running 的"本次是否经由 daemon"分开定义，避免两义合法）。
+[[expect]]
+field = "daemon.detected"
+one_of = [true, false]
