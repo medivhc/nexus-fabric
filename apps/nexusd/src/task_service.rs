@@ -99,6 +99,9 @@ fn load(
     sessions: Option<SharedSessionManager>,
 ) -> Result<Option<provider::ProviderService>, TaskError> {
     use std::{fs, io::Read, os::unix::fs::OpenOptionsExt};
+    // A remaining managed anchor must never fall back to disabled/legacy mode,
+    // or open a store that can create a replacement identity or authority.
+    crate::task_provider_init::validate_managed_root(config_root)?;
     let path = config_root.join("task-api.toml");
     let mut file = match fs::OpenOptions::new()
         .read(true)

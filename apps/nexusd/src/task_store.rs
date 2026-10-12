@@ -378,59 +378,11 @@ impl FileTaskAcceptanceStore {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
             .map_err(|e| io_error(&path, e))?;
-        let decode = || {
-            let Value::Object(mut envelope) = parse_canonical_json(&bytes)? else {
-                return Err(TaskError::invalid("invalid acceptance envelope"));
-            };
-            let version = u64::from_value(
-                envelope
-                    .remove("schema_version")
-                    .ok_or_else(|| TaskError::invalid("missing envelope version"))?,
-            )?;
-            if version != 1 && version != 2 {
-                return Err(TaskError::invalid(
-                    "unsupported acceptance envelope version",
-                ));
-            }
-            let checksum = Sha256Digest::from_value(
-                envelope
-                    .remove("payload_sha256")
-                    .ok_or_else(|| TaskError::invalid("missing acceptance checksum"))?,
-            )?;
-            let value = envelope
-                .remove("ledger")
-                .ok_or_else(|| TaskError::invalid("missing acceptance ledger"))?;
-            let capacity = if version == 2 {
-                Some(
-                    envelope
-                        .remove("capacity")
-                        .ok_or_else(|| TaskError::invalid("missing coupled capacity image"))?,
-                )
-            } else {
-                None
-            };
-            let payload = match &capacity {
-                Some(capacity) => Value::Object(BTreeMap::from([
-                    ("ledger".into(), value.clone()),
-                    ("capacity".into(), capacity.clone()),
-                ])),
-                None => value.clone(),
-            };
-            if !envelope.is_empty() || sha256(&payload.canonical_bytes()) != checksum {
-                return Err(TaskError::invalid("corrupt acceptance image/checksum"));
-            }
-            let ledger = AcceptanceLedger::from_value(value)?;
-            ledger.validate(sha256)?;
-            let capacity = capacity
-                .map(crate::task_capacity::CapacityImage::from_value)
-                .transpose()?;
-            if let Some(image) = &capacity {
-                image.validate(&ledger)?;
-            }
+        let result = decode_authority_bytes(&bytes).and_then(|(ledger, capacity)| {
             crate::task_capacity::check_receipt(&self.root, capacity.is_some(), allow_incomplete)?;
             Ok((ledger, capacity))
-        };
-        decode().map_err(|e: TaskError| {
+        });
+        result.map_err(|e: TaskError| {
             TaskError::new(
                 TaskErrorCode::StateCorrupt,
                 format!("{}: {e}", path.display()),
@@ -674,3 +626,75 @@ impl FileTaskAcceptanceStore {
 #[cfg(all(test, target_os = "linux"))]
 #[path = "task_store_tests.rs"]
 mod tests;
+
+/// Decode coupled acceptance authority with no filesystem side effects. The
+/// caller verifies required receipts, fixed owner binding and a consistent lock.
+#[cfg(target_os = "linux")]
+pub(crate) fn decode_authority_bytes(
+    bytes: &[u8],
+) -> Result<
+    (
+        AcceptanceLedger,
+        Option<crate::task_capacity::CapacityImage>,
+    ),
+    TaskError,
+> {
+    let decode = || {
+        let Value::Object(mut envelope) = parse_canonical_json(bytes)? else {
+            return Err(TaskError::invalid("invalid acceptance envelope"));
+        };
+        let version = u64::from_value(
+            envelope
+                .remove("schema_version")
+                .ok_or_else(|| TaskError::invalid("missing envelope version"))?,
+        )?;
+        if version != 1 && version != 2 {
+            return Err(TaskError::invalid(
+                "unsupported acceptance envelope version",
+            ));
+        }
+        let checksum = Sha256Digest::from_value(
+            envelope
+                .remove("payload_sha256")
+                .ok_or_else(|| TaskError::invalid("missing acceptance checksum"))?,
+        )?;
+        let value = envelope
+            .remove("ledger")
+            .ok_or_else(|| TaskError::invalid("missing acceptance ledger"))?;
+        let capacity = if version == 2 {
+            Some(
+                envelope
+                    .remove("capacity")
+                    .ok_or_else(|| TaskError::invalid("missing coupled capacity image"))?,
+            )
+        } else {
+            None
+        };
+        let payload = match &capacity {
+            Some(capacity) => Value::Object(BTreeMap::from([
+                ("ledger".into(), value.clone()),
+                ("capacity".into(), capacity.clone()),
+            ])),
+            None => value.clone(),
+        };
+        if !envelope.is_empty() || sha256(&payload.canonical_bytes()) != checksum {
+            return Err(TaskError::invalid("corrupt acceptance image/checksum"));
+        }
+        let ledger = AcceptanceLedger::from_value(value)?;
+        ledger.validate(sha256)?;
+        let capacity = capacity
+            .map(crate::task_capacity::CapacityImage::from_value)
+            .transpose()?;
+        if let Some(image) = &capacity {
+            image.validate(&ledger)?;
+        }
+        Ok((ledger, capacity))
+    };
+    decode().map_err(|e: TaskError| {
+        TaskError::new(
+            TaskErrorCode::StateCorrupt,
+            format!("acceptance authority: {e}"),
+            false,
+        )
+    })
+}

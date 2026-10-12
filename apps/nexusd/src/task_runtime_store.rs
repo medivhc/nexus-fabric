@@ -153,7 +153,7 @@ pub(crate) fn load_and_validate(
     crate::task_artifacts::validate_runtime(root, accepted, &image)?;
     Ok(image)
 }
-fn decode(bytes: &[u8], accepted: &AcceptanceLedger) -> Result<RuntimeImage, TaskError> {
+pub(crate) fn decode(bytes: &[u8], accepted: &AcceptanceLedger) -> Result<RuntimeImage, TaskError> {
     let decode = || {
         let Value::Object(mut f) = parse_canonical_json(bytes)? else {
             return Err(corrupt("invalid runtime envelope"));

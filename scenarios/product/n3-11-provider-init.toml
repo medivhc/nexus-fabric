@@ -1,0 +1,45 @@
+schema_version = 1
+id = "product.n3-11-provider-init"
+title = "正式提供方初始化、只读检查及真实daemon恢复"
+evidence_strength = "E4"
+platform = "linux"
+requirement = "PRODUCT.md#178-n3-11"
+[given]
+[when]
+command = "python3 engineering/verifiers/n3_provider_init.py"
+[[expect]]
+field = "verdict"
+equals = "PASS"
+[[expect]]
+field = "formal_init"
+equals = true
+[[expect]]
+field = "check_readonly"
+equals = true
+[[expect]]
+field = "duplicate_init_preserved"
+equals = true
+[[expect]]
+field = "daemon_task_service_available"
+equals = true
+[[expect]]
+field = "postboot_init_preserved"
+equals = true
+[[expect]]
+field = "scope_policy_change_denied"
+equals = true
+[[expect]]
+field = "authority_loss_denied"
+equals = true
+[[expect]]
+field = "damaged_boot_denied"
+equals = true
+[[expect]]
+field = "decoy_untouched"
+equals = true
+[[expect]]
+field = "one_manager"
+equals = true
+[[expect]]
+field = "shutdown_reaped"
+equals = true

@@ -241,6 +241,7 @@ fn tun_enabled() -> bool {
     *TUN_ENABLED.get().unwrap_or(&true)
 }
 
+mod task_provider_command;
 mod watcher;
 
 use std::process::ExitCode;
@@ -254,9 +255,31 @@ use serde_json::{Value, json};
 use nexusd::assembly;
 use nexusd::config::{self, ConfigDir, LoadedConfig};
 
+/// Verify managed bindings before any startup operation can create durable state.
+fn validate_task_provider_startup(config_root: &std::path::Path) -> Result<bool, ExitCode> {
+    #[cfg(target_os = "linux")]
+    {
+        nexusd::task_provider_init::validate_managed_root(config_root).map_err(|error| {
+            eprintln!(
+                "{}",
+                json!({"schema_version":1, "verdict":"FAIL", "error":{
+                    "code":error.code.as_str(), "reason":error.reason, "retryable":error.retryable
+                }, "phase":"managed-provider-preflight", "mutation_may_have_applied":false})
+            );
+            ExitCode::from(1)
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = config_root;
+        Ok(false)
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("task-provider") => task_provider_command::run(&args[1..]),
         // 新入口：nexusd <config-folder>
         Some(path) if !path.starts_with('-') && path != "serve" => {
             if args.len() != 1 {
@@ -384,7 +407,23 @@ fn run_dataplane(
 /// 关闭顺序（§13.4/R4/D7）：SIGTERM/SIGINT → LocalAPI → Workspace unmount → Dataplane（1s 超时）
 /// → N1（5s 超时）→ TUN（随线程退出）→ exit 0。
 fn run_daemon(config_dir: &str) -> ExitCode {
-    let dir = match ConfigDir::new(std::path::Path::new(config_dir)) {
+    // Anchor relative daemon input once without resolving symlinks or removing
+    // parent components: managed preflight must retain its path safety checks.
+    let config_root = match std::path::absolute(config_dir) {
+        Ok(root) => root,
+        Err(error) => {
+            eprintln!(
+                "{}",
+                json!({"verdict":"FAIL", "error":{"code":"CONFIG", "message":error.to_string()}})
+            );
+            return ExitCode::from(1);
+        }
+    };
+    let managed_provider = match validate_task_provider_startup(&config_root) {
+        Ok(managed) => managed,
+        Err(exit) => return exit,
+    };
+    let dir = match ConfigDir::new(&config_root) {
         Ok(d) => d,
         Err(e) => {
             eprintln!(
@@ -408,6 +447,19 @@ fn run_daemon(config_dir: &str) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let no_other_subsystem = loaded.proxy_yaml.is_none()
+        && loaded.network_toml.is_none()
+        && loaded.workspace_toml.is_none();
+    if managed_provider
+        && no_other_subsystem
+        && (!loaded.meta.contains_key(config::DAEMON_TOML) || loaded.daemon.tun.enabled)
+    {
+        eprintln!(
+            "{}",
+            json!({"verdict":"FAIL", "error":{"code":"CONFIG", "message":"N3-only startup requires explicit daemon.toml [tun] enabled=false"}})
+        );
+        return ExitCode::from(1);
+    }
     log_enabled_subsystems(&loaded);
 
     // F1：orphan FUSE 挂载收敛进 boot_reconcile 统一报告。挂载点在 reconcile
@@ -417,10 +469,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     #[cfg(target_os = "linux")]
     let orphan_mountpoints: Vec<std::path::PathBuf> = match loaded.workspace_toml.as_deref() {
         Some(text) => {
-            match nexusd::workspace::WorkspaceManager::resolve_mountpoints(
-                std::path::Path::new(config_dir),
-                text,
-            ) {
+            match nexusd::workspace::WorkspaceManager::resolve_mountpoints(&config_root, text) {
                 Ok(mps) => mps,
                 Err(e) => {
                     eprintln!(
@@ -461,11 +510,8 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     ensure_n2_session_manager(&dir.root);
     let n2_sweeper_handle = spawn_n2_session_sweeper(&shutdown);
 
-    // T3：缺 proxy.yaml 且缺 network.toml 且缺 workspace.toml → 拒绝启动（无意义）。
-    if loaded.proxy_yaml.is_none()
-        && loaded.network_toml.is_none()
-        && loaded.workspace_toml.is_none()
-    {
+    // T3: a validated managed provider is also an effective subsystem.
+    if no_other_subsystem && !managed_provider {
         eprintln!(
             "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"CONFIG\",\"message\":\"no subsystem configured: need proxy.yaml and/or network.toml and/or workspace.toml\"}}}}"
         );
@@ -570,7 +616,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     // 挂载失败 → 拒绝启动（fail-fast，诚实）。
     #[cfg(target_os = "linux")]
     if let Some(text) = loaded.workspace_toml.as_deref() {
-        match nexusd::workspace::WorkspaceManager::start(std::path::Path::new(config_dir), text) {
+        match nexusd::workspace::WorkspaceManager::start(&config_root, text) {
             Ok(mgr) => {
                 if !mgr.fuse_available {
                     eprintln!("[nexusd] workspace subsystem disabled (no /dev/fuse)");
@@ -752,6 +798,9 @@ fn serve_localapi(
     shutdown: Arc<AtomicBool>,
     config_root: &std::path::Path,
 ) {
+    if validate_task_provider_startup(config_root).is_err() {
+        return;
+    }
     let sessions = ensure_n2_session_manager(config_root);
     let tasks = nexusd::task_service::LocalTaskService::open_with_sessions(config_root, sessions);
     let addr: std::net::SocketAddr = match addr_raw.parse() {
@@ -850,7 +899,28 @@ fn serve_resource(args: &[String]) -> ExitCode {
     // P1-1：`serve` 形态也必须持有 daemon 内唯一的 N2 SessionManager，否则
     // `/localapi/v0/n2/session/*` 会报 N2_UNAVAILABLE（D1 只在 `run_daemon`
     // 路径装配）。token 与 N2 存储同源于 node_dir，这里沿用同一口径。
-    let config_root = task_config_root();
+    let config_root = match task_config_root() {
+        Ok(root) => root,
+        Err(exit) => return exit,
+    };
+    let managed = match validate_task_provider_startup(&config_root) {
+        Ok(managed) => managed,
+        Err(exit) => return exit,
+    };
+    if managed {
+        let loaded = ConfigDir::new(&config_root).and_then(|dir| config::load(&dir));
+        match loaded {
+            Ok(loaded)
+                if loaded.meta.contains_key(config::DAEMON_TOML) && !loaded.daemon.tun.enabled => {}
+            _ => {
+                eprintln!(
+                    "{}",
+                    json!({"verdict":"FAIL", "error":{"code":"CONFIG", "message":"managed provider serve requires explicit daemon.toml [tun] enabled=false"}})
+                );
+                return ExitCode::from(1);
+            }
+        }
+    }
     ensure_n2_session_manager(&config_root);
     match flags.get("--addr").and_then(|v| v.as_deref()) {
         Some(raw) => serve_over_tcp(raw),
@@ -891,7 +961,13 @@ fn localapi_bearer_token(config_root: &std::path::Path) -> Result<String, ExitCo
 
 /// TCP loopback 监听 + 服务循环（既有行为）。
 fn serve_over_tcp(addr_raw: &str) -> ExitCode {
-    let config_root = task_config_root();
+    let config_root = match task_config_root() {
+        Ok(root) => root,
+        Err(exit) => return exit,
+    };
+    if let Err(exit) = validate_task_provider_startup(&config_root) {
+        return exit;
+    }
     let sessions = ensure_n2_session_manager(&config_root);
     let tasks = nexusd::task_service::LocalTaskService::open_with_sessions(&config_root, sessions);
     let token = match localapi_bearer_token(&config_root) {
@@ -950,7 +1026,13 @@ fn serve_over_tcp(addr_raw: &str) -> ExitCode {
 #[cfg(unix)]
 fn serve_over_socket(path: &str) -> ExitCode {
     use std::os::unix::{fs::PermissionsExt, net::UnixListener};
-    let config_root = task_config_root();
+    let config_root = match task_config_root() {
+        Ok(root) => root,
+        Err(exit) => return exit,
+    };
+    if let Err(exit) = validate_task_provider_startup(&config_root) {
+        return exit;
+    }
     let sessions = ensure_n2_session_manager(&config_root);
     let tasks = nexusd::task_service::LocalTaskService::open_with_sessions(&config_root, sessions);
     let private_parent = std::path::Path::new(path)
@@ -1033,8 +1115,16 @@ fn serve_over_socket(path: &str) -> ExitCode {
 
 use nexusd::task_http::HttpIo as LocalIo;
 
-fn task_config_root() -> std::path::PathBuf {
-    nexus::node_cli::node_dir()
+fn task_config_root() -> Result<std::path::PathBuf, ExitCode> {
+    // Give N2, token setup and Task adapters one lexical startup root.
+    // Preflight still rejects managed symlinks and parent components.
+    std::path::absolute(nexus::node_cli::node_dir()).map_err(|error| {
+        eprintln!(
+            "{}",
+            json!({"verdict":"FAIL", "error":{"code":"CONFIG", "message":error.to_string()}})
+        );
+        ExitCode::from(1)
+    })
 }
 
 /// C1：`GET /localapi/v0/workspace/mounts` — 已挂载 workspace 状态快照。
