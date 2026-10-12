@@ -779,3 +779,25 @@ lockout_after-1 条失败），风险全在"变异逃逸"侧 ⇒ 我写进知识
 评审链：r1(6F) → r2(5F) → r3(2F) → r4(1F) → r5(1F) → r6(0F, COMMENTED) →
 r7(0F；撰写者 6W/12N，签发者改判 3W/16N 并否决 1 条) → r8(0F, COMMENTED；3W 全部是
 第九片自己写进去的错误，已在同一提交内改正，7N 见 summary.json)。
+
+================================================================================
+追加：第九/十片落地提交后的锚回（把门禁数字钉在真实提交上），宿主 xc-pc-linux
+================================================================================
+落地提交：
+  e9396ec  bugfix(gateway): 节流按窗口衰减并改身份摘要键，会话拆除不再清鉴权状态
+  046dd0b  docs(gateway): 把 r7/r8 两轮独立评审案卷落进 .evidence 并随分支携带
+在**已提交的分支尖**（046dd0b4e0a31a530ee69a83710264cb1a8cbc92，不是 stash 式临时提交）
+上重跑，`git status --porcelain` 为空 ⇒ dirty_state=false，bindings 直接绑这棵树的字节：
+  working_tree_digest  60eab70cb216094ffc89fd3f77fda6665a50238a
+  contract_hash        8069ca7ed83cb5bfe7ef2c542e2fd5e86749a170
+  toolchain            1.98.1 / x86_64-unknown-linux-gnu
+  cargo test -p nexus-web-gateway --lib   = 63 passed; 0 failed
+  cargo clippy -p nexus-web-gateway --all-targets = 零诊断
+  9 条 E4 场景 = 95 条期望全 PASS（6/10/9/5/9/18/16/7/15，逐条 "all N expectations held"）
+  nexus-harness verify --fast = 9 门全 PASS，evidence dir = verify-14471c3356a6
+两扇门禁手工跑（不用 --no-verify）：`.githooks/pre-commit` 报
+"Review Evidence = COMMENTED (review-gateway-file-r8)" 并通过；`.githooks/commit-msg`
+对 e9396ec 的 `contract: 8069ca7e…` 标记通过。本分支第 4 关仍是旧逻辑（只看最新
+review 目录的 verdict），provenance/scope 绑定的修复在 fix/hook-review-evidence-binding
+（689f63a）未合入，所以 r8 案卷里 `scope` 写成数组、`source_revision` 用真实基线 175e115，
+是为那条分支合入后准备的，不是当前门禁的要求。

@@ -230,5 +230,62 @@
   ],
   "rejected_items": [],
   "report_file": ".evidence/review-gateway-file-r8/findings.md",
-  "escalation_note": "第 8 轮 > AGENTS.md:1585 的默认 3 轮上限（超过则升级为 BLOCKED，需要人工介入），r4/r5/r6 已三次向 owner 报备，r7/r8 延续该报备状态，本轮不新报。r7 遗留的两条待裁决项 owner 已裁决并落地（R4-W-6 → 实现桶与溢出计数按 lockout_window 衰减；r6 NOTE-4 → 身份键改 SHA-256 定长摘要），本轮不再作为待裁决项携带。本轮新增的升级事项一条：R8-W-2 —— 语义翻转只关掉了一半，另一半（清计数可阻止武装）要么在 G15 代价里登记残余 + 它依赖的 source 前提，要么把 forget_failures 一起推迟到 M2 的归属检查之后；这是产品取舍（拆会话后重登是否该背旧账），建议 owner 定方向。评审链：r1(6F) → r2(5F) → r3(2F) → r4(1F) → r5(1F) → r6(0F, COMMENTED) → r7(0F, COMMENTED；撰写者 6W/12N，签发者改判 3W/16N 并否决 1 条 NOTE) → r8(0F, COMMENTED, 3W/7N；r7 三条 WARN 判 verified / verified / verified_with_new_defect，三条降级 NOTE 判 verified / verified / partly，实现方对 R7-N-10 的否决维持)。"
+  "escalation_note": "第 8 轮 > AGENTS.md:1585 的默认 3 轮上限（超过则升级为 BLOCKED，需要人工介入），r4/r5/r6 已三次向 owner 报备，r7/r8 延续该报备状态，本轮不新报。r7 遗留的两条待裁决项 owner 已裁决并落地（R4-W-6 → 实现桶与溢出计数按 lockout_window 衰减；r6 NOTE-4 → 身份键改 SHA-256 定长摘要），本轮不再作为待裁决项携带。本轮新增的升级事项一条：R8-W-2 —— 语义翻转只关掉了一半，另一半（清计数可阻止武装）要么在 G15 代价里登记残余 + 它依赖的 source 前提，要么把 forget_failures 一起推迟到 M2 的归属检查之后；这是产品取舍（拆会话后重登是否该背旧账），建议 owner 定方向。评审链：r1(6F) → r2(5F) → r3(2F) → r4(1F) → r5(1F) → r6(0F, COMMENTED) → r7(0F, COMMENTED；撰写者 6W/12N，签发者改判 3W/16N 并否决 1 条 NOTE) → r8(0F, COMMENTED, 3W/7N；r7 三条 WARN 判 verified / verified / verified_with_new_defect，三条降级 NOTE 判 verified / verified / partly，实现方对 R7-N-10 的否决维持)。",
+  "disposition_by_implementer": {
+    "date": "2026-10-13",
+    "author": "implementer（同一 agent 会话，非评审结论）",
+    "items": [
+      {
+        "id": "R8-W-1",
+        "action": "fixed",
+        "how": "占空比分子改成武装成本 (max_throttle_buckets + lockout_after)/注入率，避开锁定策略写成 (max_buckets + 1) x (lockout_after - 1)/window = 1025x4/60 = 68.33；85.33 与 17.07 保留"
+      },
+      {
+        "id": "R8-W-2",
+        "action": "fixed",
+        "how": "不登记残余，而是删掉整条拆除清状态路径：Throttle::forget_failures 不存在，close_session 与 sweep_idle 都不碰节流状态；计数只由 succeed 与 decay 清理"
+      },
+      {
+        "id": "R8-W-3",
+        "action": "fixed",
+        "how": "补三句前提（行与锁死亡条件逐字等价 / 行只由 decay 与 succeed 消失 / 新行受准入行门禁），并新增 Throttle::locks() 与 FileEngine::throttle_locks() 给锁表观测面；单测断言 throttle_locks()==throttle_buckets() 与 <=max；探针 e6 自愈合成式加锁表清空"
+      },
+      {
+        "id": "R8-N-e8-flaky-direction",
+        "action": "fixed",
+        "how": "知识条目里那句最可能先假红方向说反，按 r8 复核改写：sleep 只有下界语义，插桩放大是假红风险；e8 的真实风险在变异逃逸侧，效力只由变异实测证明"
+      },
+      {
+        "id": "R8-N-reviewrun-wording",
+        "action": "fixed",
+        "how": "全仓零命中的措辞改成除本案卷自身引用文本外零命中"
+      },
+      {
+        "id": "R7-AUDIT-1",
+        "action": "fixed",
+        "how": "r8 判 partly 的后半（锁表上界无观测面）已补 throttle_locks()"
+      }
+    ],
+    "mutation_recheck_on_landed_tree": {
+      "N7_close_clears_counts": "RED session_teardown_touches_no_throttle_state；探针 lock_survives_session_teardown 仍 true（射程边界已写进注释与场景说明）",
+      "N8_close_unlocks": "RED 同条单测 + lock_survives=false + code_after_teardown=ACCEPTED",
+      "N9_sweep_clears": "RED idle_recycle_clears_no_throttle_state",
+      "N4_no_length_prefix": "RED 摘要键单测 + throttle_pair_concatenation_is_separate=false",
+      "N5_no_source": "RED lockout_refuses_even_the_correct_token... + other_source_still_admitted=false",
+      "N6_no_bucket_decay": "RED 3 条单测 + throttle_sustainable_failure_budget=false（pool_denials 48->20, pool_lockouts 0->28）+ self_heals=false",
+      "M9_locks_never_reclaimed": "RED expired_locks_are_reclaimed_...（唯一柱子）",
+      "E_escalation_off": "63 全绿、18 条期望字段无一翻转（与不可达性一致，零红有解释）",
+      "F_constant_time_bypassed": "63 全绿（残余，继续挂未清偿）",
+      "M10b_no_lock_precheck": "RED 6 条单测 + correct_token_bypasses_lockout=true + locked_after_attempts=0"
+    },
+    "landed_in_commits": {
+      "code_and_contract_commit": "e9396ec",
+      "evidence_commit": "046dd0b",
+      "verified_committed_state_on": "xc-pc-linux, git status --porcelain 为空（dirty_state=false）",
+      "source_revision": "046dd0b4e0a31a530ee69a83710264cb1a8cbc92",
+      "working_tree_digest": "60eab70cb216094ffc89fd3f77fda6665a50238a",
+      "contract_hash": "8069ca7ed83cb5bfe7ef2c542e2fd5e86749a170",
+      "measurements_at_committed_state": "cargo test --lib = 63 passed; 0 failed；clippy --all-targets 零诊断；9 条 E4 场景 = 95 条期望全 PASS；verify --fast = 9 门全 PASS（verify-14471c3356a6）"
+    }
+  }
 }
