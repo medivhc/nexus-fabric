@@ -95,3 +95,9 @@ equals = true
 [[expect]]
 field = "snapshot.source_revision"
 non_empty = true
+
+# `--with-query` 的探针条数同样是机器可核的：11 条默认 + 3 条查询相关 = 14。
+# 与握手场景的 11 一起，把"声称跑过多少条探针"从散文变成断言（round 3 的 N-A6）。
+[[expect]]
+field = "probe_count"
+equals = 14

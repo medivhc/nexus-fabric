@@ -550,6 +550,10 @@ Windows 复跑（最终二进制，串行；`dirty=0` 之前取）：
         second=444ms（session_reused=true, queries=2）⇒ 40x，query_warm_reused=true
     手工通道核对（这些正是 N5/N1 的直接复证）：
         printf '' | mcp serve --json            ⇒ stdout **0 字节**，stderr 682 字节 envelope
+              （该字节数取自 rev `a3af128` 之上、**dirty_state=true** 的工作树；
+               同一 envelope 在 clean 树上是 683 字节，round 3 的 N-A5 实测换算过。
+               字节数不是契约量，但它会随 dirty/宿主三元组变化 —— 所以这里把条件写全，
+               别让两个宿主的 682 vs 685 看起来像行为差异）
                                                   （verdict=UNKNOWN handled_requests=0 带 snapshot）
         一帧 initialize + 关管道                 ⇒ stdout 230 字节 = **恰好 1 帧**，
                                                   stderr verdict=PASS handled_requests=1

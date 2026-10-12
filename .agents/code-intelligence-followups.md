@@ -265,8 +265,19 @@ round 1 的 B1/G1/A1/A2/A3/G2 全部 **CLOSED**，H1 与 4 条 minor 的"不改"
   另起一个带不存在路径的 serve，跑真实 `tools/call`，断言错误码是 `PROVIDER_UNAVAILABLE`
   **且**原因文字点名 `--provider-binary`（两件事同时成立才算过 —— 单看错误码无法排除
   "悄悄用了 PATH 上的 server 之后又失败"）。
+  **round 3 把这条判据说重了**：RA 缺失时的兜底文案里本身就含 `--provider-binary` 字样
+  （`provider.rs` 的"找不到 rust-analyzer：…或设置 NEXUS_RUST_ANALYZER / --provider-binary"），
+  所以只断言那两条，在**没有可解析 RA 的宿主**上把 threading 整段删掉也照样绿 ——
+  审查者用受控 PATH 复现了这个假绿。现改为三条：码 + flag 名 + **原因里带上我传进去的那条路径**，
+  并补一条不依赖子进程的直接单测 `tools_call_threads_startup_provider_override`。
+  副作用要说清：这条探针在没有 RA 的宿主上会**如实变红**，那是它该测的东西。
 - **N2（已修）MODULE.md 的单测数陈旧** —— 还写着 Linux 117 / Windows 116，而本区间自己把测试数
-  从 117 推到了 134（Windows 实测 131 passed + 3 failed；Linux 多 1 条 `cfg(unix)` ⇒ 135）。
+  从 117 推到了 **135**（rev `52184e9`/`c453a0b` 时点 Windows 实测 132 passed + 3 failed；
+  Linux 多 1 条 `cfg(unix)` ⇒ 136）。round 3 整改又加了 2 条测试，`c453a0b` 之后是 **137**
+  （134 passed + 3 failed，Windows；Linux 待 §Q 实测），所以这里的原则改为：
+  **凡引用条数就带 rev**，不写"现在的总数"。
+  本文件此前把它记成 134/131/135，是 round 3 的 N-A4 抓出来的第三次同类漂移 ——
+  同一 commit 修了 `MODULE.md` 与 §O 却没扫到这里。正确值以 `MODULE.md` 与 §O/§P 实测为准。
   同一段还漏了 serve 退出形状、6 名越权拒绝、启动参数面三类新覆盖。
   顺带更正另一处虚报：原文说 Windows 有 **4** 个预存在失败，第 4 条（§12.58 contract-hash 测试）
   在本 worktree 实测**是过的** —— 它只在完成 CRLF 检出的宿主上红，条件由 §11.1 自己解释。
@@ -285,6 +296,56 @@ round 1 的 B1/G1/A1/A2/A3/G2 全部 **CLOSED**，H1 与 4 条 minor 的"不改"
 ② **传输通道的纯度属于正确性**：一个 CLI 顺手 `println!` 到 stdout，就能让协议服务端
    在会话结尾发出客户端读不进去的字节；
 ③ **决定 verdict 的量必须出现在输出里并被契约定义**（`handled_requests` 就是这一轮的例子）。
+
+## 独立 Review round 3（末轮，对象 `a3af128..c453a0b`）发现与处置
+
+案卷 `.evidence/review-qoder-independent-p234-r3/`。verdict **`COMMENTED`、0 阻塞、无新回归**，
+round 2 的 N1-N7 + S1 **全部 CLOSED**（这次审查者跑了 29 条命令并先重建了二进制）。
+它同时给出一个我必须接住的判断：**我自己那两次自我更正（§N 11/11→8/8、§O 134→135）
+不是偶然，是系统性弱点** —— 数字是从一次终端输出抄下来的、没有随存工件，
+更正靠记忆传播而不是靠检索（135 那次修了两个文件、漏了两个）。
+这是 §19.1 的第 3 轮 = **上限轮**，所以以下 N-A1..N-A6 属整改项，**不再有第 4 轮复核**，
+完成与否由所有者判定。
+
+- **N-A2（已修，且是本轮最有价值的一条）** —— 我上一轮写的 `provider_override_honored`
+  判据可以假绿：它要求 `PROVIDER_UNAVAILABLE` + 原因含 `--provider-binary`，
+  而 rust-analyzer 缺失时 `provider.rs:209` 的**兜底文案本身就写着这个 flag 名**
+  （"…或设置 NEXUS_RUST_ANALYZER / --provider-binary"）。审查者在 RA 不可解析的受控 PATH 下
+  复现了等价状态：把 threading 整段删掉，谓词照样为真。
+  我先前写在代码注释与待办里的"两条同时成立就排除了悄悄用 PATH 上的 server"是**过度声称**。
+  修法：判据抽成纯函数 `override_proof_honored(code, reason, bogus_path)`，第三条要求
+  **原因里带上调用方实际传入的那条路径**；另加单测
+  `override_predicate_rejects_the_rust_analyzer_missing_fallback`，直接拿兜底文案真身当输入，
+  在**没有 RA、没有子进程**的环境下把这条假绿证伪（我用受控 PATH 试过端到端复现，
+  但那种环境同时切掉了 git，导致失败发生在 `WORKSPACE_UNRESOLVED` 而非 provider 解析，
+  所以最终采用可确定性复现的纯函数单测，而不是一个"大概能复现"的环境实验）。
+  再加 `tools_call_threads_startup_provider_override`：以前所有 `handle_request` 单测都传 `&None`，
+  threading 本身没有任何直接覆盖。
+  代价说清：这条探针在**没有 RA 的宿主上会如实变红** —— 它测的是 flag 有没有兑现，不是环境好不好。
+- **N-A1（已修）** —— `selftest` 的 BLOCKED 路径只回 4 个核心键，而同一轮我在 MODULE.md
+  新写了"字段缺任何一个都算契约破坏"。`code`/`serve` 的 declined 都带 `authority`+`snapshot`，
+  规矩不能只对它们生效 ⇒ 三条 declined 路径改用 `decline_fields()`。
+  顺带修一处潜在阻塞：selftest 的子进程 stderr 是 piped 却从不排空，而 N5 之后 envelope
+  正好写在 stderr 上 ⇒ 改 `Stdio::null()`（要看 envelope 的是 `serve_exit_shape`，它自己收全）。
+- **N-A3（已修）** —— `frames == handled` 只在 PASS 分支比对；零请求与畸形分支上冒出一条
+  **格式合法**的幽灵帧仍然会绿，而幽灵帧正是"把 envelope 当帧发出去"的形态 ⇒ 三条分支全比。
+- **N-A4（已修）** —— 135/136 的更正没扫到本文件（`52184e9` 加的段落仍写 134/131/135），
+  于是两个文件对同一个数各执一词。已按审查者要求的勘误协议 `git grep` 一遍旧值并逐处表态，
+  同时把口径改成"**引用条数必须带 rev**"（round 3 整改又加 2 条测试 ⇒ Windows 现在是 137，
+  Linux 待 §Q 实测，不在契约里预填）。
+- **N-A5（已修）** —— §O 记的 stderr `682 字节` 其实是在**脏树**上取的（clean 是 683，
+  Linux 三元组换算是 685 = §P 的数），而那一行没带任何条件限定 —— 恰好是它上面一条
+  刚立下的"数字必须带宿主与测量时点"规则的违反者。已就地补全条件。
+- **N-A6（已修）** —— 第 9 步 gate 在 `failure.is_none()` 上，前面一失败它就"没跑"，
+  但输出里记的是 `false` ⇒ "没跑"与"跑了没过"在消费方看来同形。改成不 gate（它不需要 RA、
+  几十毫秒），并把探针条数变成机器可核字段 `probe_count`（握手场景钉 11、real-query 钉 14）——
+  §N 那次记错条数正是因为这个数只活在散文里。
+
+审查者提的"下一轮该怎么记数"我按可行性接了这些：判据尽量做成**纯函数 + 单测**（能在无 RA、
+无子进程、无网络的环境下证伪），条数变成**输出字段**由场景钉住，引用数字必须带 rev，
+勘误时 `git grep` 旧值并列出故意保留的历史值。没接的一条：**每个结论数字都要有随存工件**
+——场景证据的确定性 id 会覆盖前一次记录（本文件上面登记的那条后续项），所以工件化要等
+那个 id 语义先定清楚，否则会写出"看起来有工件、其实每次都被覆盖"的假安全感。
 
 ### 本轮新登记的两条后续项（有承载体，不靠记忆）
 

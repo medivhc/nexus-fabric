@@ -464,6 +464,16 @@ struct Probe {
     detail: String,
 }
 
+/// `selftest` 未跑成就退出时的公共字段（与 `code`/`serve` 的 declined 约定同形）。
+/// round 3 的 N-A1：MODULE.md 声明了 selftest 的字段清单，而这几条 BLOCKED 路径原来只回
+/// `Vec::new()` —— "declined 也要带 authority/snapshot"这条规矩不能只对 `code` 和 `serve` 生效。
+fn decline_fields() -> Vec<(String, Value)> {
+    vec![
+        ("authority".to_string(), json!("advisory")),
+        ("snapshot".to_string(), cli_snapshot()),
+    ]
+}
+
 /// `mcp selftest`：把**自己**作为 `mcp serve` 子进程拉起来，经真实 stdio 管道跑协议。
 pub fn selftest(args: &[String]) -> Outcome {
     // `selftest` 的参数面同样**不接受静默忽略**（与 N1 同一类）：只认 `--with-query`。
@@ -476,7 +486,7 @@ pub fn selftest(args: &[String]) -> Outcome {
                 "mcp selftest 不支持的参数：{unknown}（唯一可用的参数是 --with-query；\
                  要换 provider 请设 NEXUS_RUST_ANALYZER 或用 mcp serve --provider-binary）"
             ),
-            Vec::new(),
+            decline_fields(),
         );
     }
     let with_query = args.iter().any(|a| a == "--with-query");
@@ -486,7 +496,7 @@ pub fn selftest(args: &[String]) -> Outcome {
             return (
                 "BLOCKED".to_string(),
                 format!("无法定位自身可执行文件，selftest 不能启动子进程: {e}"),
-                Vec::new(),
+                decline_fields(),
             );
         }
     };
@@ -496,7 +506,10 @@ pub fn selftest(args: &[String]) -> Outcome {
         .args(["mcp", "serve"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        // 子进程的 stdout 是协议通道（读线程逐帧消费）。它的**退出 envelope 从 N5 起走 stderr**，
+        // 而这里从不排空 stderr —— 一条不被读取的管道迟早把写端阻塞住，所以直接丢弃。
+        // 需要看 envelope 的是 `serve_exit_shape`，它自己 `wait_with_output()` 收全。
+        .stderr(Stdio::null())
         .spawn()
     {
         Ok(c) => c,
@@ -504,22 +517,24 @@ pub fn selftest(args: &[String]) -> Outcome {
             return (
                 "BLOCKED".to_string(),
                 format!("cannot spawn mcp serve: {e}"),
-                Vec::new(),
+                decline_fields(),
             );
         }
     };
     let Some(stdin) = child.stdin.take() else {
+        let _ = child.kill();
         return (
             "BLOCKED".to_string(),
             "子进程没有 stdin 管道".to_string(),
-            Vec::new(),
+            decline_fields(),
         );
     };
     let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
         return (
             "BLOCKED".to_string(),
             "子进程没有 stdout 管道".to_string(),
-            Vec::new(),
+            decline_fields(),
         );
     };
     let mut writer = stdin;
@@ -935,7 +950,10 @@ pub fn selftest(args: &[String]) -> Outcome {
         "stdout_frames_ok".to_string(),
         json!(eof.stdout_pure && malformed.stdout_pure && passed.stdout_pure),
     ));
-    let eof_ok = eof.verdict == "UNKNOWN" && eof.handled == 0 && eof.stdout_pure;
+    // 三条退出形状都要同时钉住 verdict、`handled` 与"帧数 == 已回复请求数"
+    // （round 3 的 N-A3：只在 PASS 分支比帧数，零请求分支上多冒一条**格式合法**的幽灵帧
+    // 仍然会绿 —— 而幽灵帧正是"把 CLI envelope 当帧发出去"这类改动的形态）。
+    let eof_ok = eof.verdict == "UNKNOWN" && eof.handled == 0 && eof.frames == 0 && eof.stdout_pure;
     probes_ok(
         "clean_eof_is_not_reported_as_crash",
         eof_ok,
@@ -944,12 +962,15 @@ pub fn selftest(args: &[String]) -> Outcome {
     );
     if !eof_ok {
         failure = Some(format!(
-            "客户端一条请求都没发就挂断，serve 报成 {}；应是 UNKNOWN（既非崩溃也非 PASS），\
-             且 stdout 不该有任何非帧字节。{}",
-            eof.verdict, eof.message
+            "客户端一条请求都没发就挂断，serve 报成 {}；应是 UNKNOWN（既非崩溃也非 PASS）、\
+             handled_requests=0 且 stdout 不得有任何帧或非帧字节。{}",
+            eof.verdict, eof.detail
         ));
     }
-    let malformed_ok = malformed.verdict == "FAIL";
+    let malformed_ok = malformed.verdict == "FAIL"
+        && malformed.handled == 0
+        && malformed.frames == 0
+        && malformed.stdout_pure;
     probes_ok(
         "malformed_frame_is_failure",
         malformed_ok,
@@ -957,7 +978,10 @@ pub fn selftest(args: &[String]) -> Outcome {
         &mut probes,
     );
     if !malformed_ok {
-        failure = Some(format!("畸形帧应报 FAIL，实得 {}", malformed.verdict));
+        failure = Some(format!(
+            "畸形帧应报 FAIL、0 回复 0 帧且 stdout 纯净，实得 {}",
+            malformed.detail
+        ));
     }
     // PASS + 已回复计数 + stdout 恰好一帧且无多余字节。帧数与 handled_requests 必须相等：
     // 不相等就说明要么有回复没写出去，要么有裸 JSON 混进了协议通道。
@@ -977,22 +1001,21 @@ pub fn selftest(args: &[String]) -> Outcome {
     }
 
     // 9) `--provider-binary` 必须真的生效（契约承诺过它，而 round 2 实测它被静默丢弃）。
-    if failure.is_none() {
-        let (honored, detail) = provider_override_probe();
-        query.push(("provider_override_honored".to_string(), json!(honored)));
-        probes_ok(
-            "provider_override_honored",
-            honored,
-            detail.clone(),
-            &mut probes,
-        );
-        if !honored {
-            failure = Some(format!(
-                "`mcp serve --provider-binary` 未被端到端兑现（应因该 flag 报 PROVIDER_UNAVAILABLE）：{detail}"
-            ));
-        }
-    } else {
-        query.push(("provider_override_honored".to_string(), json!(false)));
+    //    **不 gate 在 failure.is_none() 上**（round 3 的 N-A6）：gate 了的话，前面一失败
+    //    这里就"没跑"，而输出里记的是 `false` —— "没跑"和"跑了但没过"在消费方看来一模一样。
+    //    本探针不需要 language server（RA 在 spawn 之前就被路径检查挡下），成本恒定几十毫秒。
+    let (honored, detail) = provider_override_probe();
+    query.push(("provider_override_honored".to_string(), json!(honored)));
+    probes_ok(
+        "provider_override_honored",
+        honored,
+        detail.clone(),
+        &mut probes,
+    );
+    if !honored {
+        failure = Some(format!(
+            "`mcp serve --provider-binary` 未被端到端兑现（失败原因必须带上我传进去的那条路径）：{detail}"
+        ));
     }
 
     // 收尾：优雅 shutdown；无论如何都要回收子进程（不留孤儿 language server 进程）。
@@ -1015,6 +1038,9 @@ pub fn selftest(args: &[String]) -> Outcome {
     let _ = reader.join();
 
     let all_ok = probes.iter().all(|p| p.ok) && failure.is_none();
+    // 探针条数是契约里的声明（默认 11 条、`--with-query` 14 条），必须**机器可核**：
+    // §N 那次把 8 记成 11 正是因为这个数只活在散文里（round 3 的 N-A6/R1）。
+    let probes_before_move = probes.len();
     let extras: Vec<(String, Value)> = {
         let mut e = vec![
             ("authority".to_string(), json!("advisory")),
@@ -1068,6 +1094,7 @@ pub fn selftest(args: &[String]) -> Outcome {
                         .collect::<Vec<Value>>()
                 ),
             ),
+            ("probe_count".to_string(), json!(probes_before_move)),
             (
                 "duration_ms".to_string(),
                 json!(started.elapsed().as_millis() as u64),
@@ -1126,11 +1153,12 @@ fn cli_snapshot() -> Value {
 }
 
 /// 一次性演练 `mcp serve` 的结果。每个量都是对外契约的一部分：
-/// `verdict`/`message` 说"serve 是怎么结束的"，`handled` 就是 PASS/UNKNOWN 的判据本身，
+/// `verdict` 说"serve 是怎么结束的"，`handled` 就是 PASS/UNKNOWN 的判据本身，
 /// `frames` + `stdout_pure` 说"stdout 上是不是只有帧、有没有多余字节"。
+/// 不存 `message`：三条断言现在全部由 `detail` 承载（含 verdict/handled/帧数/纯净度），
+/// 留一个没人读的字段的下场就是它和实际断言漂移而无人知。
 struct ExitShape {
     verdict: String,
-    message: String,
     handled: usize,
     frames: usize,
     stdout_pure: bool,
@@ -1151,7 +1179,6 @@ struct ExitShape {
 fn serve_exit_shape(input: &[u8], extra_args: &[String]) -> ExitShape {
     let failed = |detail: String| ExitShape {
         verdict: String::new(),
-        message: String::new(),
         handled: 0,
         frames: 0,
         stdout_pure: false,
@@ -1229,7 +1256,6 @@ fn serve_exit_shape(input: &[u8], extra_args: &[String]) -> ExitShape {
             }
             ExitShape {
                 verdict: v["verdict"].as_str().unwrap_or("").to_string(),
-                message: v["message"].as_str().unwrap_or("").to_string(),
                 handled: v["handled_requests"].as_u64().unwrap_or(0) as usize,
                 frames,
                 stdout_pure,
@@ -1240,13 +1266,30 @@ fn serve_exit_shape(input: &[u8], extra_args: &[String]) -> ExitShape {
     }
 }
 
+/// `provider_override_honored` 的判据本身。抽成纯函数的原因很实际：
+/// 它要能在**没有 RA、也没有子进程**的情况下被证伪（round 3 的 N-A2）。
+/// RA 缺失时 `provider.rs` 的兜底文案里本来就写着 `--provider-binary`，
+/// 所以"码 + flag 名"两条在 flag 根本没兑现的宿主上同样为真 —— 必须再要求
+/// 原因里带上**调用方实际传入的那条路径**，兜底文案没有它。
+fn override_proof_honored(code: &str, reason: &str, bogus_path: &str) -> bool {
+    code == "PROVIDER_UNAVAILABLE"
+        && reason.contains("--provider-binary")
+        && reason.contains(bogus_path)
+}
+
 /// `mcp serve --provider-binary` 的端到端探针：证明这个启动参数**真的生效**。
 ///
-/// 为什么用不存在的路径而不是真 server：要断言的是"失败原因点名这个 flag"，
-/// 而不是"换了一个能用的 server"。这样既不需要 language server 可用，也不受宿主负载影响
-/// （`resolve_binary` 在 spawn 之前就失败，毫秒级返回），同时把最危险的那种回归钉死 ——
-/// 静默回退到 PATH 上的 server 会让"我以为换了 provider"变成"其实没换"。
+/// 为什么用不存在的路径而不是真 server：要断言的是"失败原因点名**我传进去的那条路径**"，
+/// 而不是"换了一个能用的 server"。`resolve_binary` 在 spawn 之前就失败，毫秒级返回。
 /// round 2 的 N1 就是这个 flag 被 `dispatch` 整个丢掉、给了不存在的路径与不给了完全同形。
+///
+/// 为什么必须断言路径本身（round 3 的 N-A2，实测复现过的假绿）：只断言
+/// `PROVIDER_UNAVAILABLE` + 原因含 `--provider-binary` 是**不够的** —— rust-analyzer
+/// 找不到时的提示文案里也写着 `…或设置 NEXUS_RUST_ANALYZER / --provider-binary`
+/// （`provider.rs` 的兜底原因），所以在**没有可解析 RA 的宿主**上，即使把
+/// threading 整段删掉，这个谓词仍然为真。加上"含 bogus_text"之后，
+/// 兜底文案（不含具体路径）无法满足断言，假绿被排除；代价是没有 RA 的宿主上本探针会
+/// 如实变红，这是正确行为而不是缺陷 —— 它测的就是 flag 有没有被兑现。
 fn provider_override_probe() -> (bool, String) {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -1300,12 +1343,16 @@ fn provider_override_probe() -> (bool, String) {
                 .as_str()
                 .unwrap_or("")
                 .to_string();
-            // 两条同时成立才算过：错误码是 PROVIDER_UNAVAILABLE（不是"悄悄用别的 server 成功了"），
-            // 且原因文字点名 `--provider-binary`（证明失败来自这个 flag 而不是 PATH 里缺 rust-analyzer）。
-            let honored = code == "PROVIDER_UNAVAILABLE" && reason.contains("--provider-binary");
+            // 三条同时成立才算过：
+            // ① 错误码是 PROVIDER_UNAVAILABLE（不是"悄悄用别的 server 又成功了"）；
+            // ② 原因点名 `--provider-binary`；③ 原因**带上我传进去的那条路径**。
+            // ③ 是 round 3 的 N-A2：RA 缺失时的兜底文案也含 `--provider-binary` 字样，
+            // 只断言 ①+② 在没有 RA 的宿主上会假绿（谓词为真而 flag 根本没被兑现）。
+            let honored = override_proof_honored(&code, &reason, &bogus_text);
             let detail = format!(
-                "verdict={} code={code} reason={}",
+                "verdict={} code={code} 含指定路径={} reason={}",
                 envelope["verdict"].as_str().unwrap_or(""),
+                reason.contains(&bogus_text),
                 reason.chars().take(90).collect::<String>()
             );
             (honored, detail)
@@ -1582,6 +1629,68 @@ mod tests {
         assert_eq!(envelope["command"], json!("code symbol"));
         assert_eq!(envelope["count"], json!(2));
         assert_eq!(envelope["results"][0]["symbol"], json!("Egress"));
+    }
+
+    /// 启动期的 provider 覆盖必须**被线程化到查询里**（round 3 的 N-A2）。
+    /// 其余 `handle_request` 测试一律传 `&None`，所以这条是唯一直接盯 threading 的单测：
+    /// 断言的是"失败原因带上我传进去的那条路径"，而不是只看错误码 ——
+    /// `PROVIDER_UNAVAILABLE` 在 rust-analyzer 缺失的宿主上本来就会出现，
+    /// 连兜底文案里都写着 `--provider-binary` 字样，只看码或只看 flag 名都会假绿。
+    #[test]
+    fn tools_call_threads_startup_provider_override() {
+        let bogus = std::env::current_exe()
+            .expect("定位自身")
+            .with_file_name("nexus-harness-not-a-language-server")
+            .to_string_lossy()
+            .to_string();
+        let response = handle_request(
+            &json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+                "name":"code.symbol",
+                "arguments":{"target":"Egress","workspace":".","max_results":1}
+            }}),
+            &mut None,
+            &Some(bogus.clone()),
+        )
+        .expect("带 id 的 tools/call 必须有回复");
+        let envelope = &response["result"]["structuredContent"];
+        assert_eq!(
+            envelope["error"]["code"],
+            json!("PROVIDER_UNAVAILABLE"),
+            "指定了不存在的 provider 必须显式失败，实得 {envelope}"
+        );
+        let reason = envelope["error"]["reason"].as_str().unwrap_or("");
+        assert!(
+            reason.contains(&bogus),
+            "原因必须点名**传进去的那条路径**，否则无法区分'flag 生效了'与'宿主本来就缺 RA'：{reason}"
+        );
+        assert!(reason.contains("--provider-binary"), "{reason}");
+    }
+
+    /// 判据必须能被**没有 RA 的宿主**证伪（round 3 的 N-A2 的实质）。
+    /// 这里不启动任何子进程：直接拿 `provider.rs` 兜底文案的真身当输入，
+    /// 展示"码 + flag 名"两条会为真、加上"含实际路径"第三条才把它否掉。
+    #[test]
+    fn override_predicate_rejects_the_rust_analyzer_missing_fallback() {
+        let bogus = "D:\\anywhere\\nexus-harness-not-a-language-server";
+        // provider.rs 找不到 rust-analyzer 时的兜底原因（含 "--provider-binary" 字样）。
+        let fallback = "找不到 rust-analyzer：请安装 `rustup component add rust-analyzer`，\
+                        或设置 NEXUS_RUST_ANALYZER / --provider-binary";
+        assert!(
+            fallback.contains("--provider-binary"),
+            "前提：兜底文案确实含 flag 名 —— 这正是旧判据假绿的来源"
+        );
+        assert!(
+            !override_proof_honored("PROVIDER_UNAVAILABLE", fallback, bogus),
+            "RA 缺失的兜底原因不得被当成 flag 兑现的证据"
+        );
+        // flag 真正生效时，原因里带的是调用方传入的那条路径。
+        let honored = "--provider-binary 指定的可执行文件不存在：D:\\anywhere\\nexus-harness-not-a-language-server";
+        assert!(
+            override_proof_honored("PROVIDER_UNAVAILABLE", honored, bogus),
+            "真兑现的形态必须为真：{honored}"
+        );
+        // 错误码不对时，即便文案含路径也不算过。
+        assert!(!override_proof_honored("QUERY_INVALID", honored, bogus));
     }
 
     /// 帧编码必须与 `code_intel/lsp.rs` 的实现同源：MCP stdio 与 LSP 共用一套

@@ -102,6 +102,12 @@ equals = true
 field = "provider_override_honored"
 equals = true
 
+# 探针条数是机器可核的量，不是散文（round 2 的 N3 把默认路径的 8 记成了 11；
+# round 3 的 N-A6 要求把它钉住）。默认路径 = 11 条。
+[[expect]]
+field = "probe_count"
+equals = 11
+
 # 不触发 provider：这条把"selftest 默认是便宜的"钉成契约，
 # 否则将来有人给 selftest 加了全仓查询，场景会悄悄变慢而不被察觉。
 [[expect]]

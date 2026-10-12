@@ -255,17 +255,26 @@ Agent ──MCP(stdio JSON-RPC)──▶ nexus-harness mcp serve ──▶ code_
   这些值是 serve 的对外契约的一部分，由握手场景直接断言。
 - `selftest` 还端到端证明 **`--provider-binary` 真的生效**（`provider_override_honored`）：
   它另起一个 `mcp serve --provider-binary <与自身同目录的不存在路径>`，跑一次真实
-  `tools/call`，断言结果同时满足两件事 —— 错误码是 `PROVIDER_UNAVAILABLE`（不是"悄悄用了
-  PATH 上的 server 然后成功"），且失败原因点名 `--provider-binary`。选不存在的路径而不是
-  真 server，是为了让这条探针在任何宿主都 fail fast 且不受负载影响。
-- `selftest` 的 `--json` 输出字段（缺任何一个都算契约破坏，字段名即对外承诺）：
+  `tools/call`，断言**三件事**同时成立 —— 错误码是 `PROVIDER_UNAVAILABLE`（不是"悄悄用了
+  PATH 上的 server 然后成功"）、失败原因点名 `--provider-binary`、**且原因里带上我传进去的
+  那条路径**。第三条是 round 3 的 N-A2 补的：rust-analyzer 缺失时的兜底文案本身就写着
+  `--provider-binary` 字样，只断言前两条在**没有可解析 RA 的宿主**上会"flag 根本没兑现也报绿"。
+  所以这条探针在没有 RA 的宿主上会如实变红 —— 它测的是 flag 有没有被兑现，不是环境好不好。
+  选不存在的路径而不是真 server，是为了在任何宿主都 fail fast 且不受负载影响
+  （`resolve_binary` 在 spawn 之前就失败）。threading 另有一条直接单测
+  （`tools_call_threads_startup_provider_override`），不依赖任何子进程。
+- `selftest` 的 `--json` 输出字段（缺任何一个都算契约破坏，字段名即对外承诺；
+  BLOCKED/declined 路径同样带 `authority` + `snapshot`，与 `code`/`serve` 同形 ——
+  round 3 的 N-A1 补的不一致）：
   `verdict` / `message` / `authority` / `protocol_version` / `initialized_ok` / `tools_count` /
   `notification_no_reply` / `write_tools_exposed` / `unknown_method_rejected` /
   `bad_arguments_rejected` / `write_call_rejected` / `eof_verdict` /
   `malformed_frame_verdict` / `pass_verdict` / `pass_handled_requests` / `stdout_frames_ok` /
-  `provider_override_honored` / `query_skipped` / `probes[]` / `duration_ms` / `snapshot`，
-  加了 `--with-query` 才有 `query_*` 一族。默认路径 11 条 probes，`--with-query` 再多 3 条 ——
-  计数写在这里是为了"声称跑过多少条"必须对得上（round 2 的 N3 就是把 8 记成了 11）。
+  `provider_override_honored` / `probe_count` / `query_skipped` / `probes[]` / `duration_ms` /
+  `snapshot`，加了 `--with-query` 才有 `query_*` 一族。
+  `probe_count` 把探针条数变成**机器可核**的量（默认路径 11、`--with-query` 14，
+  由握手与 real-query 两条场景分别钉住）—— 以前这个数只活在散文里，§N 把 8 记成 11
+  正是这么发生的（round 2 的 N3）。
 - `--with-query` 顺带产出 Phase 4 的判定数据：`query_first_ms` / `query_second_ms` 是**旁证**，
   判据本身是结构事实 —— `query_warm_reused = provider.session_reused && session_queries >= 2`
   （场景 `mcp_real_query` 直接钉 `query_first_session_reused=false`/`queries=1` 与
@@ -441,10 +450,11 @@ round 2 的教训就是"待办只写在提交说明里，下一轮没有承载�
 
 - 真实执行：workspace-tests / product-scenarios / regression / architecture-policy / dependency-governance（cargo-deny 0.20：`cargo deny --config policies/deny.toml check advisories licenses bans sources`，缺失则 UNKNOWN）/ coverage-summary（cargo-llvm-cov）/ platform-checks（portable-core 平台依赖静态扫描）/ feature-matrix（每成员 `--no-default-features` + `--all-features`）/ portable-core（`cargo check --target wasm32-wasip1`）。
 - 条件执行（无内容/无工具时 UNKNOWN）：integration（成员 tests/*.rs 存在时逐个运行）/ selected-fuzz（cargo-fuzz + fuzz targets）/ selected-concurrency（tests/concurrency 有测试时运行）/ performance-budgets（quality.toml `[performance]` 定义 baseline+blocking 后判定）。
-- 单元测试：`cargo test -p nexus-harness`（Windows/1.95.0 上**本轮实测 135 个 = 132 passed + 3 failed**，
-  xc-pc-linux/1.98.1 上再多 1 条 —— 差的那条是 `#[cfg(unix)]` 的真实符号链接越界回归，
-  所以 Linux 是 **136**；**117/116 是 round 2 之前的陈旧声明，本区间把测试数从 117 推到了 135 却没同步这行，
-  已由独立 Review 的 N2 抓出并在此更正**。那 3 条失败是 master 自带、依赖 POSIX `echo` 的
+- 单元测试：`cargo test -p nexus-harness`（Windows/1.95.0 上**本轮实测 137 个 = 134 passed + 3 failed**；
+  Linux 只多 1 条 —— 差额是 `#[cfg(unix)]` 的真实符号链接越界回归在该宿主才编译，
+  所以 xc-pc-linux 应为 138，**该值以 §Q 的实测为准，不在这里预填**；
+  **117/116 是 round 2 之前的陈旧声明，本区间把测试数从 117 一路推到 137 却没同步这行，
+  已由独立 Review 的 N2/N-A4 抓出并在此更正**。那 3 条失败是 master 自带、依赖 POSIX `echo` 的
   `scenario::tests::run_single_*`/`run_parallel_*` 在本宿主假红，见 DEVELOPMENT.md §11.1；
   覆盖 scenario 求值、evidence 新鲜度/STALE、digest 确定性与锁竞争判定、containment 的归一化比较
   （含 `#[cfg(unix)]` 真实符号链接形态）、workspace 成员解析、dependency-governance gate 语义、
