@@ -1,0 +1,41 @@
+schema_version = 1
+id = "product.n2-plan-explain-history"
+title = "plan explain <session-id>：读 Session 内嵌历史记录（mode=history，不重算、不伪造）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#16-n2-resource-access"
+
+[given]
+# N2 收尾补场景（2026-10-12，post-freeze coverage addition；不属于 P0-0 冻结集）。
+# 契约依据：D3"Session 内嵌 `PlanSnapshot{plan, decision_trace}`；`plan explain`
+# 双模式（`<session-id>` 读历史真实记录 vs `<resource>` 显式标注估算非承诺）"+
+# P0 完成标志 3（"CLI 退出重进，可按 SessionId 查到状态＋历史 DecisionTrace"）。
+# 既有 n2-session-watch 覆盖状态查询（watch）；本场景覆盖历史 DecisionTrace
+# 面（explain 的 history 模式）：种子会话内嵌最小 PlanSnapshot，explain 必须
+# 读出它并显式标注 mode=history，而不是事后重算或伪造。
+fixture = [
+  "cargo run --quiet -p nexus -- node init --json",
+  "cargo run --quiet -p nexus -- session seed sess-n2-hist-1 --json",
+]
+
+[when]
+command = "cargo run --quiet -p nexus -- plan explain sess-n2-hist-1 --json"
+
+# 冻结期望：
+# - verdict=PASS；mode=history（显式标注"历史真实记录，非事后重算"）
+# - plan_id 非空（Session 内嵌快照的确定性摘要）
+# - trace.selected 非空（历史 DecisionTrace 存在且可读）
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "mode"
+equals = "history"
+
+[[expect]]
+field = "plan_id"
+non_empty = true
+
+[[expect]]
+field = "trace.selected"
+non_empty = true

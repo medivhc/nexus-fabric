@@ -14,6 +14,45 @@
 
 const $ = (id) => document.getElementById(id);
 
+/* REQ-002: Identity preference persistence (localStorage).
+ * Only UI preferences are persisted (theme, SSH username).
+ * Connection state (peerId, sessionId, WebRTC/SSH sessions) is intentionally
+ * NOT persisted: after a page refresh the user must re-establish connections.
+ */
+const PREFS_KEY = 'nexus-web-gateway-prefs';
+const DEFAULT_PREFS = { theme: 'dark', sshUser: 'root' };
+
+function loadPrefs() {
+  try {
+    const raw = localStorage.getItem(PREFS_KEY);
+    if (!raw) return { ...DEFAULT_PREFS };
+    const parsed = JSON.parse(raw);
+    return {
+      theme: parsed.theme === 'light' ? 'light' : 'dark',
+      sshUser: typeof parsed.sshUser === 'string' && parsed.sshUser ? parsed.sshUser : DEFAULT_PREFS.sshUser,
+    };
+  } catch (e) {
+    return { ...DEFAULT_PREFS };
+  }
+}
+
+function savePrefs(prefs) {
+  try {
+    localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
+  } catch (e) {
+    /* storage unavailable: preferences just will not persist */
+  }
+}
+
+const prefs = loadPrefs();
+
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  const btn = $('theme-toggle-btn');
+  if (btn) btn.textContent = theme === 'dark' ? '\u2600' : '\u263E';
+  if (btn) btn.setAttribute('aria-label', theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme');
+}
+
 function randomHex(bytes) {
   const arr = new Uint8Array(bytes);
   crypto.getRandomValues(arr);
@@ -74,6 +113,13 @@ const sshRoutes = {}; // session_id -> { channel, node }
 let joined = false;
 
 $('peer-id').textContent = `peer: ${peerId}`;
+
+// REQ-002: restore persisted preferences (theme + SSH username)
+applyTheme(prefs.theme);
+(function restoreSshUser() {
+  const el = $('ssh-user');
+  if (el && prefs.sshUser) el.value = prefs.sshUser;
+})();
 
 function setStatus(text, cls) {
   const el = $('status');
@@ -703,5 +749,19 @@ if ($('banner-back-btn')) $('banner-back-btn').onclick = () => {
   const nodesCard = $('nodes-card');
   if (nodesCard) nodesCard.hidden = false;
 };
+
+// REQ-002: theme toggle + persist SSH username on change
+if ($('theme-toggle-btn')) $('theme-toggle-btn').onclick = () => {
+  prefs.theme = prefs.theme === 'dark' ? 'light' : 'dark';
+  savePrefs(prefs);
+  applyTheme(prefs.theme);
+};
+if ($('ssh-user')) $('ssh-user').addEventListener('change', () => {
+  const v = $('ssh-user').value.trim();
+  if (v) {
+    prefs.sshUser = v;
+    savePrefs(prefs);
+  }
+});
 
 init();

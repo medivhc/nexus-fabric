@@ -1,0 +1,37 @@
+schema_version = 1
+id = "product.n2-plan-explain-estimate"
+title = "plan explain <resource>：估算预览显式标注（mode=estimate，只读）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#16-n2-resource-access"
+
+[given]
+# N2 收尾补场景（2026-10-12，post-freeze coverage addition；不属于 P0-0 冻结集）。
+# 契约依据：D3 双模式之 estimate 面（"`<resource>` 显式标注'估算非承诺'"）+
+# "Plan 可重算、不独立持久化"；`plan explain <resource>` 是纯只读预览，
+# 不得让用户把估算误读为承诺。
+# 既有 n2-plan-preview 覆盖 `plan <resource>` 的只读标记；本场景覆盖
+# `plan explain <resource>` 的显式模式标注（mode=estimate + read_only）。
+resource_name = "dev-svc"
+
+[when]
+command = "cargo run --quiet -p nexus -- plan explain dev-svc --json"
+
+# 冻结期望：
+# - verdict=PASS；mode=estimate（显式标注估算而非历史）
+# - plan.read_only=true（只读预览，不建连）
+# - plan_id 非空（确定性摘要）
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "mode"
+equals = "estimate"
+
+[[expect]]
+field = "plan.read_only"
+equals = true
+
+[[expect]]
+field = "plan_id"
+non_empty = true

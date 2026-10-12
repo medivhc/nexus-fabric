@@ -77,7 +77,10 @@
 **G9（不静默丢弃终端数据）**：网关收到未知 session 的 `ssh_data` 时必须回 `ssh_close`
 或明确错误，绝不静默吞掉。
 **G10（证书持久化）**：自签证书按节点落盘（`cert_dir`，默认 `$XDG_CACHE_HOME/nexus-web-gateway/<node_id>`），
-重启指纹不变；`/cert` 提供 PEM 下载。
+重启指纹不变；`/cert` 提供 PEM 下载。证书目录权限 `0700`、私钥 `key.pem` 权限 `0600`（Unix），
+写盘为临时文件 + 原子 rename；加载旧版本落盘的身份时收紧过宽权限；损坏身份重生成必须有 warn 日志。
+ICE host candidate 必须始终包含 UDP 套接字的**实际绑定地址**（接口枚举候选之外的强制项，
+去重）：绑在具体 IP（含 loopback）上的套接字不会收到发往其他网卡 IP 的数据报。
 
 ## Side Effects
 
@@ -103,15 +106,20 @@
   mesh WSS 空 token 或空 peer 字段）、证书持久化（重启指纹不变）。
 - 集成测试（`tests/gateway_e2e.rs`）：
   - HTTPS 页面、`/api/config` 与 `/cert` 可访问（rustls 客户端 pin 本地 CA）。
-  - WSS 信令：浏览器-like str0m 客户端经 WSS 交换 SDP，建立 DataChannel。
+  - WSS 信令：浏览器-like str0m 客户端经 WSS 交换 SDP，建立 DataChannel；
+    answer SDP 断言包含 UDP 套接字实际绑定地址的 host candidate（H1 回归）。
   - 双节点：经 in-memory mesh 中继，与第二个节点建立 DataChannel。
   - WSS mesh：两个独立 gateway 经 `/mesh` bearer-token 中继 SDP 并建连；
     错误 token 返回 401。
   - SSH 终端：DataChannel → 节点侧真实 SSH 客户端（ssh2）→ **真实 sshd 子进程**
     （OpenSSH，loopback 高端口，key 认证）→ 命令回显；空闲超时后终端被关闭。
+    环境门禁：宿主缺少 `sshd`/`ssh-keygen` 时这些用例显式 skip（打印原因），
+    不计为产品失败；fixture 在 root（容器）下自适应 `PermitRootLogin yes`。
   - 中继 SSH：经 WSS mesh 在两个 gateway 间中继终端，目标节点跑真实 SSH 客户端。
+  - worker 连接回收用例依赖 `ss`；宿主缺 `ss` 时显式 skip（不得假通过）。
   - 负路径：无节点列表/空 node_id 配置被拒；SSH target 拒绝连接返回错误；
     未知 session 的 `ssh_data` 返回 `ssh_close`；re-offer 被拒（返回错误而非假 answer）。
+  - 所有消息等待必须有 deadline（缺消息 = 带超时报错的失败，不得无限挂起）。
 
 ## Performance Budget
 

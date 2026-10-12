@@ -8,6 +8,18 @@
   --err: #f85149;
   --ok: #3fb950;
 }
+
+/* REQ-002: light theme overrides */
+:root[data-theme="light"] {
+  --bg: #ffffff;
+  --fg: #1f2328;
+  --accent: #0969da;
+  --muted: #59636e;
+  --card: #f6f8fa;
+  --border: #d1d9e0;
+  --err: #cf222e;
+  --ok: #1a7f37;
+}
 * { box-sizing: border-box; }
 body {
   margin: 0;
@@ -162,3 +174,43 @@ button:disabled { opacity: 0.5; cursor: default; }
 #terminal-container { height: 420px; }
 #terminal-container .xterm { height: 100%; }
 [hidden] { display: none !important; }
+
+/* REQ-002: theme toggle button */
+.theme-toggle {
+  margin-left: auto;
+  background: var(--card);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  width: 32px;
+  height: 32px;
+  font-size: 16px;
+  cursor: pointer;
+  line-height: 1;
+}
+.theme-toggle:hover {
+  border-color: var(--accent);
+}
+#retry-btn {
+  margin-left: 0;
+}
+header .theme-toggle {
+  margin-left: auto;
+}
+header #retry-btn:not([hidden]) ~ .theme-toggle {
+  margin-left: 8px;
+}
+
+/* REQ-002: reconnection notice */
+.reconnect-notice {
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin-top: 12px;
+}
+.reconnect-notice strong {
+  color: var(--fg);
+}

@@ -1,0 +1,44 @@
+schema_version = 1
+id = "product.n2-grant-expired-deny"
+title = "过期 grant：use 判定 Deny{Expired} 并写审计（D6 五拒绝之一）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#16-n2-resource-access"
+
+[given]
+# N2 收尾补场景（2026-10-12，post-freeze coverage addition；不属于 P0-0 冻结集）。
+# 契约依据：D6 结构化 Deny{NoSuchGrant/WrongWorkspace/OperationNotGranted/
+# Expired/Revoked}；grant 表条目 {resource, principal, operations, not_after}
+# 的 not_after 到期后必须在"每次建 Session 的判定点"拒绝（目录可见≠有权限），
+# 且判定必须写审计（P0 完成标志 5 的判定面扩展）。
+# 既有 n2-grant-deny-audit 覆盖 NoSuchGrant；本场景覆盖 Expired 变体：
+# restricted-svc（静态种子、无任何既有 grant）上写入一条**已过期**的自授权，
+# use 必须落到 Deny{Expired}（而非 Allow 或 NoSuchGrant）。
+# `--not-after 1000`（1970 年固定时刻）判定时必然过期；grant add 允许过去
+# 时间，拒绝由当前 Use 判定执行（禁静默降级为永久授权）。
+fixture = [
+  "cargo run --quiet -p nexus -- node init --json",
+  "cargo run --quiet -p nexus -- grant add --resource restricted-svc --self --op Use --not-after 1000 --json",
+]
+
+[when]
+command = "cargo run --quiet -p nexus -- use restricted-svc --json"
+
+# 冻结期望：
+# - verdict=FAIL；error.code=AUTH_DENIED（结构化拒绝码）
+# - error.deny=Expired（D6 五拒绝原因之一，精确值）
+# - error.audit_written=true（判定写审计的真实落盘证据，P0-5 语义）
+[[expect]]
+field = "verdict"
+equals = "FAIL"
+
+[[expect]]
+field = "error.code"
+equals = "AUTH_DENIED"
+
+[[expect]]
+field = "error.deny"
+equals = "Expired"
+
+[[expect]]
+field = "error.audit_written"
+equals = true

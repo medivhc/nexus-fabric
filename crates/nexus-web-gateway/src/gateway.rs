@@ -143,6 +143,8 @@ struct Shared {
     udp: Arc<UdpSocket>,
     /// PEM-encoded self-signed certificate, served at `/cert`.
     cert_pem: String,
+    /// SHA256 fingerprint of the certificate, for /cert HTML page (REQ-001).
+    cert_fingerprint: String,
 }
 
 /// One browser session: the node-side WebRTC peer plus protocol state.
@@ -322,6 +324,7 @@ impl Gateway {
             event_tx: event_tx.clone(),
             udp: udp.clone(),
             cert_pem: identity.cert_pem()?,
+            cert_fingerprint: identity.fingerprint_sha256(),
         });
 
         // Register the local mesh offer handler (in-memory backend).
@@ -452,16 +455,32 @@ fn serve_http(
         return Ok(());
     }
     if request.path.starts_with("/cert") {
-        http::write_http_response(
-            tls,
-            "application/x-pem-file",
-            shared.cert_pem.as_bytes(),
-            &[(
-                "Content-Disposition",
-                "attachment; filename=\"nexus-ca.pem\"",
-            )],
-        )
-        .map_err(GatewayError::Io)?;
+        // REQ-001: Browser gets HTML guidance page (A), direct download gets PEM (B).
+        let accepts_html = request
+            .header("accept")
+            .map(|v| v.contains("text/html"))
+            .unwrap_or(false);
+        let force_pem = request.path.contains("format=pem");
+        if accepts_html && !force_pem {
+            let html = format!(
+                "<!DOCTYPE html><html><head><meta charset=\"utf-8\">                <title>Install Nexus CA</title>                <style>body{{font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 16px;}}                code{{background:#f0f0f0;padding:2px 6px;border-radius:4px;word-break:break-all;}}                pre{{background:#f0f0f0;padding:12px;border-radius:8px;overflow-x:auto;}}                .btn{{display:inline-block;background:#0066cc;color:#fff;padding:10px 20px;                text-decoration:none;border-radius:6px;margin:10px 0;}}</style></head>                <body><h1>Install Nexus Local CA</h1>                <p>This gateway uses a self-signed certificate. Install the CA below.</p>                <h2>SHA256 Fingerprint</h2><p><code>{fp}</code></p>                <h2>Option A: Browser Download</h2>                <a class=\"btn\" href=\"/cert?format=pem\" download=\"nexus-ca.crt\">Download nexus-ca.crt</a>                <h2>Option B: Command Line</h2>                <pre>curl -k https://{host}/cert?format=pem -o nexus-ca.crt</pre>                </body></html>",
+                fp = shared.cert_fingerprint,
+                host = request.header("host").unwrap_or("this-gateway"),
+            );
+            http::write_http_response(tls, "text/html; charset=utf-8", html.as_bytes(), &[])
+                .map_err(GatewayError::Io)?;
+        } else {
+            http::write_http_response(
+                tls,
+                "application/x-pem-file",
+                shared.cert_pem.as_bytes(),
+                &[(
+                    "Content-Disposition",
+                    "attachment; filename=\"nexus-ca.crt\"",
+                )],
+            )
+            .map_err(GatewayError::Io)?;
+        }
         return Ok(());
     }
     if let Some(asset) = http::lookup_asset(&request.path) {
@@ -1533,9 +1552,18 @@ fn create_session(
     let udp_addr = shared.udp.local_addr().map_err(GatewayError::Io)?;
     let udp_port = udp_addr.port();
     // Advertise all non-loopback interface addresses as host candidates so
-    // ICE can try each path (multi-homed hosts, mesh + LAN, etc.). The UDP
-    // socket is bound to the selected IP, but candidates cover all interfaces.
-    let mut added = 0;
+    // ICE can try each path (multi-homed hosts, mesh + LAN, etc.), then
+    // ALWAYS add the address the shared UDP socket is actually bound to.
+    //
+    // On Linux a socket bound to a concrete IP only receives datagrams sent
+    // to that IP: advertising other interfaces' addresses without the bound
+    // one produced unreachable candidates (observed with a loopback-bound
+    // gateway on a host that also has eth0: the answer listed only the eth0
+    // candidate and ICE never connected). The bound address is therefore
+    // mandatory, not a fallback used only when enumeration found nothing
+    // (review H1). `advertised` dedupes it against the enumerated set.
+    let mut advertised: std::collections::HashSet<std::net::SocketAddr> =
+        std::collections::HashSet::new();
     if let Ok(interfaces) = getifaddrs::getifaddrs() {
         for iface in interfaces {
             if iface.flags.contains(getifaddrs::InterfaceFlags::LOOPBACK) {
@@ -1555,15 +1583,16 @@ fn create_session(
                     continue;
                 }
                 let cand_addr = std::net::SocketAddr::new(ip, udp_port);
-                if let Ok(candidate) = Candidate::host(cand_addr, "udp") {
-                    rtc.add_local_candidate(candidate);
-                    added += 1;
+                if advertised.insert(cand_addr) {
+                    if let Ok(candidate) = Candidate::host(cand_addr, "udp") {
+                        rtc.add_local_candidate(candidate);
+                    }
                 }
             }
         }
     }
-    // Fallback: if no interface candidates were added, use the bound address
-    if added == 0 {
+    // Mandatory reachable candidate: the socket's own bound address.
+    if advertised.insert(udp_addr) {
         let candidate = Candidate::host(udp_addr, "udp")
             .map_err(|e| GatewayError::Rtc(format!("host candidate: {e}")))?;
         rtc.add_local_candidate(candidate);

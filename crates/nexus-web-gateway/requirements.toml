@@ -5,14 +5,14 @@
 [[req]]
 id = "REQ-001"
 title = "/cert 下载被浏览器拦截"
-status = "todo"
+status = "done"
 priority = "P0"
 acceptance = "Chrome 无拦截下载 nexus-ca.pem"
 created = "2026-10-10"
 
 [[req]]
 id = "REQ-002"
-title = "ICE 多 candidate（多网卡主机）"
+title = "身份偏好持久化"
 status = "done"
 priority = "P0"
 acceptance = "多网卡机器上所有非 loopback IP 都成为 ICE host candidate"
@@ -20,9 +20,9 @@ created = "2026-10-10"
 
 [[req]]
 id = "REQ-003"
-title = "ICE 智能选路（延迟优先、连接迁移）"
-status = "todo"
-priority = "P2"
+title = "访问认证"
+status = "done"
+priority = "P0"
 acceptance = "延迟最低的 candidate 被选中；session 中可迁移到更优路径"
 created = "2026-10-10"
 

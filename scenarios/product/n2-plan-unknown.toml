@@ -1,0 +1,27 @@
+schema_version = 1
+id = "product.n2-plan-unknown-not-found"
+title = "nexus plan 未知资源：结构化 NOT_FOUND（只读预览不伪造）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#16-n2-resource-access"
+
+[given]
+# N2 收尾补场景（2026-10-12，post-freeze coverage addition；不属于 P0-0 冻结集）。
+# 契约依据：D3"Plan 可重算、不独立持久化；`nexus plan <resource>` 纯只读预览"；
+# P0-3 语义落地"未知资源名返回结构化 NotFound，不伪造"。
+# 既有 n2-plan-preview 覆盖已知资源的只读预览；本场景覆盖未知资源面：
+# 预览必须显式 NOT_FOUND，而不是编造 plan/provider。期望对当前实现冻结。
+resource_name = "no-such-svc"
+
+[when]
+command = "cargo run --quiet -p nexus -- plan no-such-svc --json"
+
+# 冻结期望：
+# - verdict=FAIL（显式失败，非静默）
+# - error.code=NOT_FOUND（结构化解析失败码）
+[[expect]]
+field = "verdict"
+equals = "FAIL"
+
+[[expect]]
+field = "error.code"
+equals = "NOT_FOUND"
