@@ -334,5 +334,13 @@
     "module": "engineering",
     "category": "implementation-pattern",
     "summary": "Skill 挖掘五步法（Lauren Tan/pstack 播客提炼）：记痛点→翻记录找重复→分类（传话筒/反复纠正/重讲背景）→拆分确定性→buffer 再固化；自下而上、自己的刀"
+  },
+  {
+    "id": "hsh-contract-hash-crlf-001",
+    "file": "entries/2026-10-13-contract-hash-crlf-sensitivity.md",
+    "date": "2026-10-13",
+    "module": "engineering/nexus-harness",
+    "category": "implementation-pitfall",
+    "summary": "contract_hash 把 scenarios/*.toml 的字节（含行尾）喂进哈希：LF 归一 e166ea79… vs 裸 CRLF c3e352b7…，Windows 侧复算必须先归一并声明归一方式；取号一律用验证宿主的 status 输出"
   }
 ]

@@ -445,3 +445,337 @@ checked_add 并返回 Option（时钟边界时不写持久锁但仍按锁定回�
 提交顺序按"先代码+契约、后案卷"走，pre-commit/commit-msg 手工跑、不用 --no-verify；
 本分支第 4 关仍是旧逻辑（只看最新 review 目录的 verdict），r6 的 COMMENTED 就是
 它认的那个证；provenance/scope 绑定的修复在 fix/hook-review-evidence-binding（689f63a）。
+
+================================================================================
+追加：M1 第八片（两条 owner 裁决落地：节流桶衰减 + 身份摘要键），宿主 xc-pc-linux
+================================================================================
+# bindings（Linux `nexus-harness status --json` 实测，非本地复算）:
+#   source_revision       1ab58b1ff11d135fd43deb9d726c66b4a96d235c（dirty_state=false；
+#                         验证走 `git stash create` → m0-verify → reset --hard 的通道，
+#                         所以绑的是真实提交而不是脏树摘要）
+#   working_tree_digest   a8d2cda1ca9fd1a67df1ca8bbf76cbbdfe4947e0
+#   contract_hash         e166ea79359b6559165e6b6af263fc3b74c5ee79（**变了**：本批动了
+#                         scenarios/product/gateway_file_auth_throttle.toml）
+#   toolchain             1.98.1 / x86_64-unknown-linux-gnu
+#   verify --fast         9 门全 PASS，evidence dir = verify-5f2f68a4d63f
+# 同一批代码/契约还在这两棵树上跑过同样的门禁，数字一致：
+#   b968081bc20247a44236b8e34355a435ffd7bba8（纯代码+契约树，61 单测 / clippy 零诊断 /
+#     9 场景 90 期望 / verify --fast 9 门 = evidence dir verify-046ce58629e2）
+#   a9fad4d5616e2c95bee601919b4fd545d1770a8b（同一棵树 + 本文件第八片正文）
+# 三棵树的 src/、examples/、scenarios/、MODULE.md、PRODUCT.md 字节完全相同，差异只在
+# 本文字；上面的 bindings 取最终树，因为它已经含有本文件里这些自述数字。
+实测：cargo test --lib = 61 passed; 0 failed / clippy --all-targets = 零诊断 /
+     9 条 E4 场景 = 90 条期望全 PASS（auth-throttle 13 条：scenario-54a3da9c0936；
+     sftp-boundary 15 条：scenario-af9e5b6f765b）
+
+公开更正本仓自报数字：E4 期望 86 → **90**（auth-throttle 9 → 13），
+单测 58 → **61**。上一片写的是"86 条期望 / 58 条单测"，那是第七片的事实；本批
+新增 4 条期望与 3 条单测，数字必须随树更新，不能沿用旧片。
+
+两条裁决的落地理由与代价（登记为 owner 决定，不再是"待裁决"）：
+1) R4-W-6 → **实现桶衰减**。`BucketState { count, last }`，`decay` 在每次写入前
+   同时回收：过期的锁、窗口内无失败的桶、过期的溢出计数。于是（a）洪水占住的桶位
+   自己腾出来，迟到的合法身份重新拿到**自己的**桶而不是被扫进 fail-closed 人群；
+   （b）维持全局窗口需要**持续**注入，停止注入一个窗口内自愈。代价写进 G15：锁定
+   门槛从"累计 lockout_after 条"变成"**同一窗口内** lockout_after 条"，按窗口慢滴
+   者不再被锁死。同一个 `lockout_window` 既是锁定时长也是遗忘周期（有意一物两用）。
+   `lockout_window` **没有下界**（只校验非 0 与 ≤24h）：把它配成毫秒级会同时缩短
+   锁定与放宽慢滴门槛——本批不新增下界规则，也不谎称这条有测，登记为未证事项。
+2) R6-NOTE-4 → **身份键改为 SHA-256 摘要**（定长 32 B，两半各自先写 u64 长度前缀
+   再哈希）。裁剪标签的键只让项数有界、标签仍按调用方长度分配，更给出"前 128 字节
+   相同且总长相同 ⇒ 共用一个桶"的定向锁定面。
+   ——本段前两句里"只让项数有界、标签仍按调用方长度分配"**不实**（评审 r7 R7-W-4：
+   `bounded_label` 恰恰把标签封在裁剪点 + `…[+NB]` 标记之内），第九片更正为：摘要键的
+   收益是每行从"两个定长 String"变成 32 字节数组（常数内存）+ 消除定向锁定面；
+   裁决本身不变。
+   相同且总长相同"的**定向锁定**面：伪造者用自己的几条失败替一个从未出错的合法
+   主体招来锁定，不需要淹没任何东西。摘要键之后共用一个桶需要 SHA-256 碰撞。
+   残余：`Throttle` 不再保存可读身份，"谁被锁了"只能靠审计环（principal 记在审计里，
+   裁到 256 B 带截断标记）——这是把归因从节流表移到审计面的显式取舍。
+
+自己的缺陷，由**变异实测**抓到而不是由评审抓到（按 AGENTS.md 口径如实登记）：
+`record_failure` 里我原本还写了一道 `Some(previous) if !stale(...)` 的窗口守卫。
+把这条守卫改成恒真，61 条单测**全绿**——`decay` 已用同一个 `now`、同一个谓词丢掉过期
+行，所以活到计数那一步的行按定义在窗口内，那个分支结构上不可达。已删除，并把"衰减
+只有 decay 一个机制"写进注释与 G15（单点可杀）。
+
+第二条同样是先红给自己看：把 `locked.retain` 改成恒真（过期锁不回收）时，全部单测
+**全绿**——因为过期锁在 `is_locked` 里本来就判 false。但它的危害不在判定而在**升级
+路径**：`record_failure` 只在 `locked.len() >= max_buckets` 时升级为全局窗口，死锁项
+占位会把后来者的**个体锁定**偷偷换成**全体 fail-closed**。补了
+`expired_locks_are_reclaimed_instead_of_escalating_to_the_global_window`（小锁表夹具
+max_throttle_buckets=2，两条身份各自锁满 → 静置一个窗口 → 第三条身份到阈值时必须
+仍走个体锁、且已过期身份的正确令牌必须重新进得来）。补完之后该变异实测为红。
+
+变异表（全部在 xc-pc-linux 上跑 `cargo test -p nexus-web-gateway --lib` 实测，
+GREEN 表示该断言没有杀伤力，如实记录）：
+  M1 decay 不回收桶            → RED lockout_requires_failures_inside_one_window,
+                                  RED lockout_rearms_after_expiry_and_flood_arms_are_not_exempt
+  M2 溢出计数时钟不推进        → RED lockout_rearms_...；
+                                  GREEN throttle_fails_closed_when_the_table_is_full
+                                  （该测试无静置，本就不该由它杀，如实记）
+  M3 身份键丢掉两段长度前缀    → RED throttle_identity_keys_do_not_collide_...
+  M4 读侧访问器不按窗口过滤    → RED lockout_rearms_...（"读侧报存活值"这句话确实有测）
+  M5 全局窗口从不武装          → RED throttle_fails_closed_when_the_table_is_full,
+                                  RED lockout_rearms_...
+  M6 摘要忽略源半              → RED lockout_refuses_even_the_correct_token_and_stays_bounded
+                                  （"不同源不受牵连"那条断言确有杀伤力）
+  M7 摘要忽略主体半            → RED throttle_identity_keys_do_not_collide_...
+  M8 计数永不触达阈值          → RED 3 条
+  M9 过期锁不回收              → 第一版全绿 ⇒ 补测试后 RED
+  M0（旧代码遗留）record_failure 内的冗余窗口守卫 → 全绿 ⇒ 已删除该冗余
+
+契约与场景侧：G15 重写为"摘要键 + 双层衰减"，并把读侧存活值与写侧内存上界明确分开
+（`throttle_buckets`/`throttle_overflow`/`throttle_failures` 报的是按窗口过滤后的值，
+不背书内存）；PRODUCT §18.2 的"留给仓库所有者裁决"两句改为已落地的产品行为，并写明
+慢滴代价。auth-throttle 场景新增 4 条期望：
+throttle_identity_prefixes_are_separate_buckets=true、
+victim_code_after_forged_prefix="ACCEPTED"、
+flood_armed_before_quiet_window=true、
+throttle_flood_self_heals_after_quiet_window=true。
+探针里两条时间夹具（100 ms 窗口静置 400 ms；小表 2 锁位）是**有意的时间依赖**，
+余量分别 4×、2×；夹具若在慢 CI 上抖动，红的是这条自证而不是静默空转——
+`flood_armed_before_quiet_window` 就是为此单独 emit 并冻结的（没有它，"自愈"会因为
+"从未武装"而空转成立）。
+
+评审链：r1(6F) → r2(5F) → r3(2F) → r4(1F) → r5(1F) → r6(0F, COMMENTED) → r7（本批
+针对这两条语义变更的独立评审）。
+
+================================================================================
+追加：M1 第九片（r7 的 3 WARN + 若干 NOTE 处置，含一次语义翻转），宿主 xc-pc-linux
+================================================================================
+# bindings（Linux `nexus-harness status --json` 实测，clean 树，dirty_state=false）:
+#   source_revision       69925963417c20b0862791453de05e5182b8f97e
+#   working_tree_digest   e1ec4aa2a523eb61fa01bda22e2fd41ba84d6a46
+#   contract_hash         8069ca7ed83cb5bfe7ef2c542e2fd5e86749a170（**变了两次**：
+#                         先 13→18 条期望，后 r8 之后改了三条期望的注释文字——
+#                         注释也在哈希覆盖集内）
+#   toolchain             1.98.1 / x86_64-unknown-linux-gnu
+#   verify --fast         9 门全 PASS，evidence dir = verify-8232947d65e2
+#   代码/契约那一半的验证树是 e5a0780（verify-0e5578700ac3，同一 contract_hash
+#   8069ca7e…，63 单测 + 95 期望 + 9 门全绿）；6992596 与它的差异经 `git diff` 逐文件
+#   核过，只有本案卷、一条知识条目与 FILE_MANIFEST 三个文档文件。
+#   再往前的 4d6223a / 6bf7691 / 3e8600b 也各自跑过全套门禁（verify-7716a60e1951 /
+#   verify-1efb49b6c77f / verify-0ffee5f17190），差异只在注释与被 r8 否证的那两版语义写法。
+#   9 条 E4 场景 = **95** 条期望全 PASS（6+10+9+5+9+18+16+7+15，逐条由
+#                         `scenario run` 的 "all N expectations held" 报出）
+实测：cargo test --lib = 63 passed; 0 failed / clippy --all-targets = 零诊断
+
+公开更正本仓自报数字：E4 期望 90 → **95**，单测 61 → **63**。第八片的"90/61"在它
+那棵树上是真的，本批新增 5 条期望与 2 条单测，数字随树更新。
+
+r7 案卷的 verdict 有两个来源，如实写下来而不是挑好听的那个：写 findings.md 的评审者
+给 **COMMENTED / 0 FAIL / 6 WARN / 12 NOTE**；随后另一名独立 agent（签发者）逐条复核
+后改判为 **COMMENTED / 0 FAIL / 3 WARN / 16 NOTE**（W-3/W-5/W-7 降为 NOTE，另否决
+R7-N-10，并自加 2 条）。两份都在 `.evidence/review-gateway-file-r7/`。
+
+实现方按签发者要求补跑的两条变异（r7 复算台是仓外 std-only 转录，它自己声明"要升格
+为对全仓的陈述还差 55 条"）——在 Linux 的**真树**上跑 `cargo test -p nexus-web-gateway
+--lib`：
+  删空 `Throttle::forget` 两行           → 61 passed; 0 failed（**零红**，R7-W-2 成立）
+  关掉 `locked` 满 ⇒ 全局升级那一支      → 61 passed; 0 failed（**零红**，R7-W-3 成立）
+  顺带：`authenticate` 里把 `constant_time_eq` 换成 `!=` → 61 passed; 0 failed
+  ⇒ r1 起就一直声明的"没有任何断言约束 authenticate 真的用常数时间比较"这条残余，
+  本批再次实测确认，仍列在未清偿清单里。
+
+本批的处置（一条是**语义翻转**，与评审者的建议不同，分歧写在案卷里）：
+
+1) R7-W-2 → 不是补测试，而是把行为改掉：`Throttle::forget` 改名
+   `forget_failures`，只清失败**计数**，**不再**清已武装的 `locked`。
+   评审者建议"补两条无时间依赖的单测钉住现状"，我判断现状本身是扇门：会话号由
+   `next_session` 顺序自增，而 `close_session(session)` 在 M2 接线前没有归属检查
+   （r2 N-8 那条面），所以"拆会话即解锁"给能猜整数的人一条无限猜测预算——它不需要
+   别人的令牌，但也正因如此不需要停止猜测。改完之后两侧都有柱子且都实测红：
+     N1 恢复旧语义（close 也删锁）→ RED `session_teardown_clears_the_count_but_serves_the_lockout`
+        + 探针 `lock_survives_session_teardown` = false、`code_after_teardown` = ACCEPTED
+        （连带 `throttle_pair_concatenation_is_separate` 也 false，因为那条合成式里
+         有"确实锁过"这一项）
+     N2 把 `forget_failures` 掏空 → RED 同一条单测（计数半）
+     N3 让 `sweep_idle` 也去清 → RED `idle_recycle_clears_no_throttle_state`
+   G15、PRODUCT §18.2、requirements.toml REQ-010 三处散文同步（后者不在 contract_hash
+   覆盖集内，这条同步只能靠人核——正是 r7 R7-W-5 说的那个盲区）。
+
+2) R7-W-1 → 聚合侧代价登记 + 产品路径上的可红对象。G15 与 PRODUCT 现在写明：整台
+   引擎每窗口可记录失败的上界 = `max_throttle_buckets × lockout_after`，默认参数约
+   **85.33 次/秒**（避开锁定策略约 68.33；衰减之前的旧语义同口径约 17.07），并明说
+   节流器**没有**把 PRODUCT 自己引用的 84.4 次/秒压下去——它管的是单身份被猜速率与
+   内存，整节点认证成本属于连接层限流与 RSS 计量（未闭环）。
+   新增探针字段 `throttle_sustainable_failure_budget`（8 行 × 每行 lockout_after-1 条
+   × 3 轮、轮间静置 1.5 个窗口、全程新身份）并冻结为 true。实测杀伤力：
+     现状        → pool_denials_observed = 48，pool_lockouts_observed = 0
+     N6 桶不衰减 → pool_denials_observed = **20**，pool_lockouts_observed = **28** ⇒ 期望红
+   （r7 的算术是 8×2×3=48 对上界；N6 实测 20 而不是它推演的"约 16"，方向一致，
+    数字以实现为准，r7 §2.1 的"约 16"作为推算保留在原案卷里。）
+
+3) R7-W-4 → 公开更正：我第八片在 MODULE G15 与本案卷里都写了"裁剪只让项数有界、
+   标签仍按调用方长度分配"，这句**为假**（`bounded_label` 恰恰把标签封在裁剪点 +
+   `…[+NB]` 之内）。摘要键裁决的理由改为：每行从"两个定长 String"变成 32 字节数组
+   （常数内存收益）+ 消除定向锁定面（这才是收益）。本案卷原句旁已就地标注更正，
+   不抹历史。
+
+4) R7-W-3（签发者降为 NOTE）→ 注释与 G15 改口径：fail-closed 实际只有溢出计数这一条
+   路径；`locked` 满那一支是纵深防御，经 `authenticate` 不可达（不变式
+   `locked.len() ≤ buckets.len() ≤ max_buckets`，证明写进 `record_failure` 注释），
+   且它唯一能被触及的方式就是"过期锁回收坏了"——那正是
+   `expired_locks_are_reclaimed_instead_of_escalating_to_the_global_window` 钉的东西。
+   读侧访问器 doc 同步改为"物理行有界来自准入行门禁，回收决定的是行会不会死"。
+
+5) R7-W-7（降 NOTE）→ 归因残余进契约：G15 代价 (4) 明写"节流表只剩摘要，谁被锁了
+   只能靠审计环，而审计把 principal 裁到 256 B ⇒ 长身份归因精度只剩前 256 字节 +
+   长度这一近似类"。
+
+6) NOTE 一批：`max_throttle_buckets` 字段文档改掉从未存在过的"oldest buckets are
+   merged into the global bucket"（N-7）；G15 病句"既是对话被锁的时长"改"锁定持续的
+   时间"（N-3）；场景注释里"`flood_armed_before_quiet_window` 用于防空转"这句**不实**
+   （合成式第一项就是它），改成"用于区分从未武装 / 武装后自愈"（N-4）；新冻结
+   `throttle_pair_concatenation_is_separate`（N4 实测红）与 `other_source_still_admitted`
+   （N5 实测红），把长度前缀与"源"这两条性质的契约面柱子补上（N-5/N-6）；涓流口径
+   按 R7-AUDIT-4 改成"每满一个窗口只滴一条者不被锁死，严格小于一个窗口的涓流仍会
+   累积到阈值"；N-8/N-9/N-11（principal 长度无上界、身份不做 NFC/大小写归一、
+   `Throttle` 时钟不可注入 ⇒ 三条时间夹具依赖墙钟）全部登记进 G15 的未证事项。
+
+7) R7-N-10 **不予处置并公开否决**：它声称"harness.toml 给 9 条 gateway_file_* 场景要求
+   的 artifact 种类是 ReviewRun，而 gates.rs:675-683 对 ReviewRun 直接返回 BLOCKED，
+   所以 §18 产品面没被任何门禁跑过"。签发者复核与本案卷实跑都否定它：除本案卷自己
+   引用/否决这段的文字之外，`ReviewRun` 在代码与配置里零命中；它列的三处行号对不上号
+   （harness.toml:65-67 是 `[protection]` 段、仓内没有它说的那个 requirements.rs 解析器、
+   gates.rs:675 是 coverage_gate），而真实的 product-scenarios 门确实逐条求值
+   `[[expect]]`——本批 9 条场景就是 `scenario run` 跑出 "all N expectations held" 的。
+   本文件保留这条否决，避免下一个读者把"§18 是门禁盲区"当既成事实。
+   （r8 补正措辞：写"全仓零命中"时要把本案卷自己的引用文本排除，否则这句话会被
+   它自己的文本否证。）
+
+8) **本批自己抓到并公开的一条：我为自己造的例外改了不变式。**
+   r7 §3.2 的证明依赖 `locked.len() ≤ buckets.len()`（"锁不会比行多"），其支点是旧
+   `forget` 行锁一起删。第 1 条把 `forget` 翻成"只删行不删锁"之后，这条不等式**当场失效**：
+   "带活锁但没有行"变成被有意制造出来的状态。我在把案卷发给 r8 之前自查 A 项时发现
+   自己在 `record_failure` 注释与 G15 里都还写着"结构不可达 / L ≤ B ≤ max"，于是：
+   - 注释与 G15 改为"两个上界各自独立成立（`buckets.len() ≤ max` 由准入行门禁，
+     `locked.len() ≤ max` 由那支自己的判断），但 L ≤ B 本批之后不再成立"；
+   - 那支的可达性从"结构不可达"降级为"**只在一条窄路径上可达**"：无令牌者到不了
+     （行满 ⇒ 后来者一律走溢出分支；要让行消失得先 `close_session`，而那要求先有一次
+     成功认证），有令牌者的腾位上界是 `max_sessions`，且代价是自己的锁定；
+   - 单测 `session_teardown_clears_the_count_but_serves_the_lockout` 里加了两条断言，
+     把这个状态**正面钉住**：拆会话之后 `throttle_failures() == 0` 且
+     `throttle_locked("td-lock", …) == true` 同时成立。少删一行（N2）红前者，多删一行
+     （N1，旧语义）红后者。N1/N2/N3 在新树上重跑，均实测 RED 指定单测
+     （62 passed; 1 failed），N5/N6 亦在新树上复现同样结论。
+   这件事的性质比"评审又抓到我一条"重：**是我这批改动把一条已被上一轮当作证明前提的
+   不变式改假的**，如果只改行为不回去核引用它的注释与契约，就会留下两处现在为假的"证明"。
+   最终树 6bf7691 上重跑的两条"零红"判据（把上面第 3 条的旧树数字升到当前树）：
+     E 关掉"锁表满 ⇒ 升级全局窗口"那支 ⇒ 63 passed; 0 failed，且 auth-throttle 探针
+       18 条冻结期望的字段无一翻转（`lock_survives`/`entries_bounded`/`self_heals`/
+       `full_fail_closed`/`prefixes_are_separate`/`sustainable_budget` 全部仍 true）
+     F `authenticate` 里把 `constant_time_eq` 换成 `!=` ⇒ 63 passed; 0 failed
+       ⇒ "没有任何断言约束 authenticate 真的用常数时间比较"这条残余在当前树仍然成立，
+       继续列在未清偿清单里。
+   ——本条的**结论已被下面"第九片续"一节取代**：r8 证明"清计数"这一半同样是洞，于是
+   会话拆除不再清任何东西，`locked.len() ≤ buckets.len()` 随之重新成立，并新增
+   `throttle_locks()` 给锁表观测面。原文保留不删，因为它记录了当时的真实状态与一段
+   真实的错误推理（"有令牌者腾位上界是 `max_sessions`"就是在这一条里写错的，r8 否证：
+   `close_session` 会释放会话槽，额度可顺序复用）。
+
+未随本批处理、明确结转的：
+  - 给 `source` 单独设一道限额（r7 整改清单第 3 条：现在整张表按"对"分桶，一个源就能
+    占满 1024 行 ⇒ 池子归一个 IP）。这是一件新机制 + 新配置项 + 新契约面，随 `files`
+    配置接线那一片做，本批不用"顺手改"糊过去。
+  - `Throttle` 的时钟注入（`sweep_idle(now)` 已有形态），以及把两条时间夹具从墙钟依赖
+    里解放出来。
+  - `authenticate` 用没用 `constant_time_eq` 仍无断言约束（本批实测再次确认零红）。
+  - `close_session` 的**归属检查**（M2）：本批把"拆除能清节流状态"这条路径删掉之后，
+    它仍然能终止别人的会话，而会话号顺序自增 ⇒ 这一半没关，只是不再连带影响鉴权面。
+    登记在 G15"会话拆除"那段的残余里。
+  - r7 R7-AUDIT-5：**本批已满足**——r8 案卷的 `source_revision` 写的是真实基线 175e115
+    （r7 那份写的 af953af 落后两个提交）。
+
+评审链：r1(6F) → r2(5F) → r3(2F) → r4(1F) → r5(1F) → r6(0F, COMMENTED) →
+r7(0F；撰写者 6W/12N，签发者改判 3W/16N 并否决 1 条) → r8（针对本批的语义翻转与
+聚合率登记）。
+
+================================================================================
+追加：第九片续（r8 独立评审回来后，同一批内的三处自我更正），宿主 xc-pc-linux
+================================================================================
+r8 的签发结论：**COMMENTED / 0 FAIL / 3 WARN / 7 NOTE**，判定可合入。案卷在
+`.evidence/review-gateway-file-r8/`（撰写与签发是同一个独立 agent，它先写 summary.json
+再写 findings.md，就是为了不再重演 r7 那种"findings 写完没预算写 verdict"）。
+它自己复算了 `contract_hash`（LF 归一后 = 我当时那棵树的 750cbe0b…，CRLF 下给 ad717763…），
+并 `git diff` 核过"自报数字所在树与我的工作树在 src/examples/scenarios/MODULE/PRODUCT/
+requirements 上字节相同"这句话为真。
+
+三条 WARN 全部是**我这一批自己写进去的错误**，都在同一提交里改掉：
+
+R8-W-1（契约里的算式算不出它旁边的数）：
+  - 拒止占空比我写成 `w / (w + max_buckets·lockout_after / 注入率)`，按这个式子是
+    49.7%，而旁边写着 ≈83%。83% 来自 r7 §2.3 的 `w / (w + (max_buckets + lockout_after)/注入率)`
+    （分子是**武装一次的成本** = 灌满表的条数 + 触发溢出的条数，不是两者的积）。已改，
+    并把"上一版写成积、得 49.7%"这句留在原地当痕。
+  - 避开锁定策略我写 `max_buckets × (lockout_after-1)` 却报 68.33：那个式子是 68.27。
+    改成 `(max_buckets + 1) × (lockout_after-1) / window` = 1025×4/60 = 68.33。
+  - 85.33 与 17.07 两条 r8 复算为真。PRODUCT 那句"表达式见 MODULE G15"被一个错式子
+    毒化了两个文件，这条是根因侧的修法。
+
+R8-W-2（语义翻转只关了一半，而且关错了那一半）：
+  r8 逐帧重走后指出：锁是由**计数**达到阈值才武装的，而"清计数"走的还是同一扇没有
+  归属检查的门 ⇒ 一个能猜会话号的第三方每 `lockout_after - 1` 次替被冒用身份关一次
+  会话，就把计数按定义钉在阈值之下，**锁永远武装不了**——比解锁更省事。
+  我没有"登记残余"了事，而是把这条路径整个删掉：`Throttle::forget_failures` 不存在了，
+  `close_session` 与 `sweep_idle` 都不碰节流状态，计数只由成功认证（`succeed`）与窗口
+  衰减（`decay`）清理。这样删不损失任何正当收益（回来的合法主体本来就会被 `succeed`
+  清账），还把 r7 §3.2 那条 `locked.len() ≤ buckets.len()` 的前提补回来了。
+  测试改名 `session_teardown_touches_no_throttle_state`，(a) 半断言"拆会话之后第二条
+  失败必须直接 THROTTLED"（清了计数就变 AUTH_DENIED ⇒ 红）。
+  分歧如实登记：r7 撰写者建议"补测试钉住现状"，r8 建议"三选一"，我选的是第四个方案
+  （删掉整条路径），理由是前两个方案都把安全性挂在一个 M2 才补得上的归属检查上。
+
+R8-W-3（不变式与观测面）：
+  - "不可达"的证明我漏写了第一句前提（行与锁的死亡条件逐字等价 ⇒ 拆除不再清行之后，
+    孤锁没有来源），r8 说那一版"不可达"从证明退化成断言，是对的。
+  - 我在第八片写的"有令牌者的腾位上界是 max_sessions"**不成立**：`close_session` 会释放
+    会话槽（`sessions.remove`），`next_session` 单调自增 ⇒ 同一份额度可以顺序复用去拆
+    N 个不同身份。真正的界是"一个窗口内能造出多少条活锁" = `max_buckets × (1 + lockout_after)`
+    次认证落在窗口内，默认参数下需要 102.4 次/秒，**高于**同一份 G15 自己算的 85.33 次/秒
+    ⇒ 默认参数下那支确实到不了，但我给的理由一直是错的。
+  - 更要紧的一条：`locked` 表大小此前**全仓不可读**，所以 G15 标题那句"计数与表项有界"
+    对锁表那一半是零可红对象。新增 `Throttle::locks()` + `FileEngine::throttle_locks()`，
+    单测里断言 `throttle_locks() == throttle_buckets()`（孤锁检测）与
+    `throttle_locks() ≤ max_throttle_buckets`，探针 e6 的自愈合成式里也加了"锁表清空"。
+
+最终树 e5a0780 上的变异实测（`cargo test -p nexus-web-gateway --lib` + auth-throttle 探针）：
+  N7 拆会话又清计数（r8 指的那个洞）  → RED session_teardown_touches_no_throttle_state；
+     探针 lock_survives_session_teardown 仍 true ⇒ **射程边界写进注释与场景说明**：
+     那条冻结期望只观测锁定，打不住"只清计数"这一版
+  N8 拆会话连锁一起删（最早那版）      → RED 同一条单测 + lock_survives=false、
+     code_after_teardown=ACCEPTED、throttle_pair_concatenation_is_separate=false
+  N9 闲置回收也去清                    → RED idle_recycle_clears_no_throttle_state
+  N4 摘要丢两段长度前缀                → RED throttle_identity_keys_..._concatenation
+     + 冻结期望 throttle_pair_concatenation_is_separate=false
+  N5 摘要忽略 source 半                → RED lockout_refuses_even_the_correct_token...
+     + 冻结期望 other_source_still_admitted=false
+  N6 桶不回收                          → RED 3 条单测 + throttle_sustainable_failure_budget
+     =false（pool_denials 48→**20**、pool_lockouts 0→**28**）+ self_heals=false
+     机制按 r8 订正：不是"计数粘住每行第一条推到阈值"，而是新身份拿不到行 ⇒ 走溢出计数，
+     每轮白送 lockout_after-1=2 条拒绝，第三条武装全局窗口 ⇒ 其余短路。r7 §2.1 推的
+     "约 16"连机制带数字都不对，两处注释与场景说明都已改。
+  M9 过期锁不回收                      → RED expired_locks_are_reclaimed_...（唯一柱子）
+  E  关掉纵深防御那支                  → 63 单测全绿、18 条期望字段无一翻转
+     （与"经 authenticate 不可达"一致；这条零红现在是**有解释的**而不是悬空的）
+  F  authenticate 里把 constant_time_eq 换成 != → 63 单测全绿（残余，继续挂未清偿）
+  M10b 去掉 authenticate 的锁定预检    → RED 6 条单测 + correct_token_bypasses_lockout=true、
+     locked_after_attempts=0、full_fail_closed=false ⇒ "锁内正确口令不得绕过"有多根柱子
+
+数字（最终树 e5a0780，实测）：63 单测全绿 / clippy --all-targets 零诊断 /
+9 条 E4 场景 = 95 条期望全 PASS（6+10+9+5+9+18+16+7+15）/ verify --fast 9 门全 PASS /
+contract_hash 8069ca7ed83cb5bfe7ef2c542e2fd5e86749a170。
+公开更正：本节开头 bindings 里的 contract_hash 从 750cbe0b… 变成 8069ca7e…，是 r8 之后
+改期望注释造成的；期望**条数**没变（仍 18/95），这点容易被读成"又加了期望"，所以写明白。
+
+r8 的 NOTE 一批：它判 e8 夹具**不可能假红**（sleep 只有下界语义、每身份恰好
+lockout_after-1 条失败），风险全在"变异逃逸"侧 ⇒ 我写进知识条目那句"最可能先假红"
+方向反了，已改；它另判 R7-AUDIT-1 为 partly（口径改了但锁表上界当时仍无观测面 ⇒ 本续
+已补 `throttle_locks()`）。它对 R7-N-10 的否决做了独立复核并**维持**，但指出我那句
+"`git grep ReviewRun` 全仓零命中"现在被我自己写下的否决文本命中 2 处 ⇒ 措辞改成
+"除本案卷的否决文本外零命中"。
+
+评审链：r1(6F) → r2(5F) → r3(2F) → r4(1F) → r5(1F) → r6(0F, COMMENTED) →
+r7(0F；撰写者 6W/12N，签发者改判 3W/16N 并否决 1 条) → r8(0F, COMMENTED；3W 全部是
+第九片自己写进去的错误，已在同一提交内改正，7N 见 summary.json)。

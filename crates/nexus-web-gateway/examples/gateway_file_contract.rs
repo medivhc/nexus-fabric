@@ -608,6 +608,183 @@ fn auth_throttle(f: &mut Map<String, Value>) -> Result<(), String> {
                 && post_flood == code::THROTTLED
         ),
     );
+    // 评审 r6 NOTE-4（owner 裁决：节流键改为身份摘要）。旧写法把两半裁到 128 字节，
+    // 于是"同一前缀 + 同一总长"的两个身份共用一个桶：伪造者只要用
+    // `base+"bbbb"` 喂满 `lockout_after` 条失败，就把 `base+"aaaa"` 那个合法主体
+    // 锁在门外——一个**不淹没任何东西**的定向锁定。摘要键之后这需要 SHA-256 碰撞。
+    let mut e5 = engine_at(&dir, FileLimits::default())?;
+    let base = "b".repeat(128);
+    let victim = format!("{base}aaaa");
+    let forged = format!("{base}bbbb");
+    for _ in 0..e5.limits().lockout_after {
+        let _ = e5.authenticate(&forged, "10.0.0.10", "nope");
+    }
+    // 受害者自己也错一次：旧写法下这条会把共用桶推到 `lockout_after + 1` 并再次
+    // 武装，正确令牌必被拒；摘要键下它只是自己桶里的 1 条失败。
+    let _ = e5.authenticate(&victim, "10.0.0.10", "nope");
+    // 观测值必须在"受害者认证成功"**之前**取：`succeed` 会清掉它自己的桶，
+    // 之后再读就只剩伪造者那一行，判据就空转了。
+    let rows_before_success = e5.throttle_buckets();
+    let failures_before_success = e5.throttle_failures();
+    let victim_after_forged = e5
+        .authenticate(&victim, "10.0.0.10", TOKEN)
+        .map(|_| "ACCEPTED")
+        .unwrap_or_else(|err| err.code);
+    f.insert(
+        "throttle_rows_before_victim_success".into(),
+        json!([rows_before_success, failures_before_success]),
+    );
+    f.insert(
+        "throttle_identity_prefixes_are_separate_buckets".into(),
+        json!(
+            rows_before_success == 2
+                && failures_before_success == e5.limits().lockout_after + 1
+                && victim_after_forged == "ACCEPTED"
+        ),
+    );
+    f.insert(
+        "victim_code_after_forged_prefix".into(),
+        json!(victim_after_forged),
+    );
+    // R4-W-6（owner 裁决：实现桶衰减）。停止注入满一个窗口之后，伪造量占住的桶位
+    // 必须自己腾出来：全局窗口解除、表清空、新来的合法主体重新拿到**自己的桶**
+    // 而不是被扫进 fail-closed 的溢出人群。窗口取 100 ms、静置 400 ms（4 倍余量），
+    // 让"是否真的按窗口回收"由时间决定而不是由巧合决定。
+    let mut e6 = engine_at(
+        &dir,
+        FileLimits {
+            max_throttle_buckets: 4,
+            lockout_after: 2,
+            lockout_window: std::time::Duration::from_millis(100),
+            ..Default::default()
+        },
+    )?;
+    for i in 0..6 {
+        let _ = e6.authenticate(&format!("flood{i}"), "10.0.0.11", "nope");
+    }
+    let armed_before = e6.throttle_globally_locked();
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let lapsed = !e6.throttle_globally_locked();
+    // 表清空**且锁表也清空**才算自愈：锁表大小此前在契约面上不可读（r8 R8-W-3）。
+    let table_empty = e6.throttle_buckets() == 0 && e6.throttle_locks() == 0;
+    let overflow_zero = e6.throttle_overflow() == 0;
+    let late = e6.authenticate("late-comer", "10.0.0.12", TOKEN);
+    let admitted = late.is_ok();
+    if let Ok(sid) = late {
+        e6.close_session(sid);
+    }
+    let _ = e6.authenticate("fresh-failure", "10.0.0.12", "nope");
+    let healed = e6.throttle_buckets() == 1 && e6.throttle_overflow() == 0;
+    f.insert(
+        "flood_armed_before_quiet_window".into(),
+        json!(armed_before),
+    );
+    f.insert(
+        "throttle_flood_self_heals_after_quiet_window".into(),
+        json!(armed_before && lapsed && table_empty && overflow_zero && admitted && healed),
+    );
+    // 评审 r7 R7-W-2 → r8 R8-W-2 的落点：拆会话**什么节流状态都不清**（既不删锁，
+    // 也不删计数），计数只由成功认证与窗口衰减两途清。
+    // 整条序列不靠时钟：会话号顺序自增、而 `close_session` 在 M2 接线前没有归属检查，
+    // 所以"拆会话即解锁"等于给一个能猜整数的人无限猜测预算（完整三段历史因果写在
+    // `Throttle::succeed` 上）。射程要看准：本字段只观测**锁定**是否被拆除抹掉，
+    // 所以它打得住最早的 `forget`（连带删 `locked` ⇒ 这里回 ACCEPTED ⇒ 红），
+    // 打不住第八片那版"清计数不删锁"（锁还在 ⇒ 本字段仍 true）——后者由单测
+    // `session_teardown_touches_no_throttle_state` 的 (a) 半打（拆会话后第二条失败
+    // 必须是 THROTTLED，清了计数就变 AUTH_DENIED ⇒ 红）。
+    let mut e7 = engine_at(&dir, FileLimits::default())?;
+    let td = e7
+        .authenticate("teardown", "10.0.0.13", TOKEN)
+        .map_err(|x| x.to_string())?;
+    for _ in 0..e7.limits().lockout_after {
+        let _ = e7.authenticate("teardown", "10.0.0.13", "nope");
+    }
+    let locked_before_teardown = e7
+        .authenticate("teardown", "10.0.0.13", TOKEN)
+        .map(|_| "ACCEPTED")
+        .unwrap_or_else(|err| err.code);
+    e7.close_session(td);
+    let locked_after_teardown = e7
+        .authenticate("teardown", "10.0.0.13", TOKEN)
+        .map(|_| "ACCEPTED")
+        .unwrap_or_else(|err| err.code);
+    f.insert(
+        "lock_survives_session_teardown".into(),
+        json!(
+            locked_before_teardown == code::THROTTLED && locked_after_teardown == code::THROTTLED
+        ),
+    );
+    f.insert("code_after_teardown".into(), json!(locked_after_teardown));
+    // R7-N-6：长度前缀这条性质原先只有 1 根柱子且在单测里，契约面零期望。
+    // ("ab","c") 与 ("a","bc") 在不写长度的拼接式摘要下是同一段字节 ⇒ 后者会被前者的
+    // 锁定连坐；现在必须各自成键，而"确实锁过"由 teardown 那一把自证。
+    for _ in 0..e7.limits().lockout_after {
+        let _ = e7.authenticate("ab", "c", "nope");
+    }
+    let concat_other = e7
+        .authenticate("a", "bc", TOKEN)
+        .map(|_| "ACCEPTED")
+        .unwrap_or_else(|err| err.code);
+    f.insert(
+        "throttle_pair_concatenation_is_separate".into(),
+        json!(
+            e7.throttle_locked("ab", "c")
+                && concat_other == "ACCEPTED"
+                && e7.throttle_locked("teardown", "10.0.0.13")
+        ),
+    );
+    f.insert("concat_other_code".into(), json!(concat_other));
+    // R7-W-1：桶衰减把"整台引擎每窗口能记下多少条失败"从一次性消耗品变成**可续额度池**。
+    // 这句代价必须能在产品路径上红，而不是只写在契约里。夹具 = 8 行 × 每行
+    // `lockout_after - 1` 条失败 × 3 轮，轮间静置 1.5 个窗口，全程用**新**身份。
+    // 现状（有衰减）：48 条全是 AUTH_DENIED，一次都不武装。
+    // 变异 N6（`decay` 不回收桶）下的**真实**机制（r8 纠正了我上一版——不是"计数粘住、
+    // 每行第一条推到阈值"）：第 1 轮 8 行恰好灌满表且永不空，第 2、3 轮的新身份根本
+    // 拿不到行 ⇒ 全部走**溢出计数**分支；溢出计数自己的时钟没坏，于是每轮白送
+    // `lockout_after - 1` = 2 条 AUTH_DENIED，第 3 条武装全局窗口、其余被短路成
+    // THROTTLED ⇒ 实测 16 + 2 + 2 = **20** 条拒绝、**28** 条锁定。r7 §2.1 推的"约 16"
+    // 连机制带数字都不对，两个方向都红但只有这套机制解释得上数字。
+    let rows = 8usize;
+    let rounds = 3usize;
+    let mut e8 = engine_at(
+        &dir,
+        FileLimits {
+            max_throttle_buckets: rows,
+            lockout_after: 3,
+            lockout_window: std::time::Duration::from_millis(100),
+            ..Default::default()
+        },
+    )?;
+    let mut denied = 0usize;
+    let mut throttled = 0usize;
+    for round in 0..rounds {
+        for i in 0..rows {
+            for _ in 0..(e8.limits().lockout_after - 1) {
+                let seen = e8
+                    .authenticate(&format!("pool{round}-{i}"), "10.0.0.14", "nope")
+                    .map(|_| "NONE")
+                    .unwrap_or_else(|err| err.code);
+                if seen == code::AUTH_DENIED {
+                    denied += 1;
+                } else if seen == code::THROTTLED {
+                    throttled += 1;
+                } else {
+                    return Err(format!("unexpected throttle code {seen}"));
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+    f.insert("pool_denials_observed".into(), json!(denied));
+    f.insert("pool_lockouts_observed".into(), json!(throttled));
+    f.insert(
+        "throttle_sustainable_failure_budget".into(),
+        json!(
+            denied == rows * rounds * (e8.limits().lockout_after - 1)
+                && throttled == 0
+                && !e8.throttle_globally_locked()
+        ),
+    );
     cleanup(&dir);
     Ok(())
 }

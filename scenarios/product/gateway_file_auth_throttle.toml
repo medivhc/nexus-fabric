@@ -32,7 +32,11 @@ equals = "THROTTLED"
 field = "locked_after_attempts"
 equals = 6
 
-# 节流状态有界：不随伪造会话数线性增长
+# 节流状态有界：不随伪造会话数线性增长。口径要看准（评审 r7 §3.3）：探针读的
+# `throttle_buckets()` 是**按窗口过滤后的存活行**，不是底层 HashMap 的物理行数；
+# 物理行上界由 `record_failure` 的准入行门禁保证，不在本条射程内（那一类由单测
+# `expired_locks_are_reclaimed_instead_of_escalating_to_the_global_window` 钉）。
+# 杀伤力仍在：把门禁删掉 ⇒ 3073 条存活行 > 1024 ⇒ 红；写成 `>` 的 off-by-one ⇒ 1025 > 1024 ⇒ 也红。
 [[expect]]
 field = "throttle_entries_bounded"
 equals = true
@@ -51,4 +55,61 @@ equals = true
 # 同一判据在产品尺寸的引擎（max_throttle_buckets=1024）上也成立，不只是小表夹具
 [[expect]]
 field = "product_engine_fails_closed_when_flooded"
+equals = true
+
+# 评审 r6 NOTE-4 的裁决：节流键是身份摘要而不是裁剪后的标签。夹具是"同一 128 字节
+# 前缀 + 同一总长"的两个身份——旧写法下它们共用一个桶，于是伪造者用 `base+"bbbb"`
+# 的 5 条失败就能把一个从未出错的合法主体锁在门外（不需要淹没任何东西的定向锁定）。
+[[expect]]
+field = "throttle_identity_prefixes_are_separate_buckets"
+equals = true
+
+[[expect]]
+field = "victim_code_after_forged_prefix"
+equals = "ACCEPTED"
+
+# R4-W-6 的裁决：桶按窗口衰减。`flood_armed_before_quiet_window` 的作用**不是**防空转
+# （下一条的合成式第一项就是它，r7 R7-N-4 纠正了我上一片的说法），而是让读者能把
+# "从未武装"和"武装过又自愈"两种世界分开——只有本条为 true 时下一条才构成"自愈"证据。
+[[expect]]
+field = "flood_armed_before_quiet_window"
+equals = true
+
+[[expect]]
+field = "throttle_flood_self_heals_after_quiet_window"
+equals = true
+
+# 评审 r7 R7-W-2 → r8 R8-W-2 的落点：会话拆除既不清已武装的锁定，也不清失败计数。
+# 射程要写准：本字段只观测**锁定**有没有被拆除抹掉，所以它打得住最早那版 `forget`
+# （连锁一起删 ⇒ 这里回 ACCEPTED ⇒ 红），打不住中间那版"清计数不删锁"（锁还在 ⇒
+# 本字段仍 true）；后者由单测 `session_teardown_touches_no_throttle_state` 的 (a) 半打。
+[[expect]]
+field = "lock_survives_session_teardown"
+equals = true
+
+[[expect]]
+field = "code_after_teardown"
+equals = "THROTTLED"
+
+# r7 R7-N-6：长度前缀这条性质原先只有 1 根柱子且在单测里，契约面零期望。
+# ("ab","c") 与 ("a","bc") 在无长度前缀的拼接摘要下是同一段字节 ⇒ 后者被前者连坐。
+[[expect]]
+field = "throttle_pair_concatenation_is_separate"
+equals = true
+
+# 不同源不受同一身份的失败牵连（r7 R7-N-5：这条在单测里有两根柱子，但契约面原先
+# 零期望；变异"摘要少喂 source 半"在冻结期望上只打得中这一条 ⇒ 现在它是柱子）。
+[[expect]]
+field = "other_source_still_admitted"
+equals = true
+
+# r7 R7-W-1：桶衰减的**聚合侧**代价必须在产品路径上可红——8 行 × 每行
+# (lockout_after-1) 条失败 × 3 轮、轮间静置 1.5 个窗口、全程新身份：有衰减时 48 条
+# 全 AUTH_DENIED 且零武装；把桶回收改掉（变异 N6）之后行永不空，第 2、3 轮的新身份
+# 拿不到行 ⇒ 走溢出计数，每轮白送 2 条 AUTH_DENIED、第 3 条武装全局窗口、其余被短路
+# ⇒ 实测 20 拒绝 / 28 锁定 ⇒ 本条红。（机制与数字都由 r8 复核订正：原先写的
+# "计数粘住、每行第一条推到阈值、约 16 条"两者皆非。）
+# 这条量的是"可记录失败的额度"，不是墙上时钟速率；速率表达式与数值在 MODULE G15。
+[[expect]]
+field = "throttle_sustainable_failure_budget"
 equals = true

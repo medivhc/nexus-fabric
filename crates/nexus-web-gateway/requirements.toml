@@ -86,7 +86,7 @@ id = "REQ-010"
 title = "文件令牌鉴权与失败节流锁定"
 status = "doing"
 priority = "P0"
-acceptance = "独立于页面登录的配置令牌 + 常数时间比较；失败按（会话+源）两层键节流，达阈值锁定，锁定窗口内正确口令也不绕过；计数与表项有界，随会话回收清零（G15；product.gateway-file-auth-throttle）"
+acceptance = "独立于页面登录的配置令牌 + 常数时间比较；失败按（主体+源）成对键（定长 SHA-256 摘要，两半带长度前缀）节流，达阈值锁定，锁定窗口内正确口令也不绕过；计数与表项有界（行由准入行门禁有界、锁由 locked ≤ buckets ≤ max 有界且两侧各有读侧观测，键定长 32 字节），桶与溢出计数按 lockout_window 衰减 ⇒ 洪水不永久占位、停止注入一个窗口内自愈；close_session 与闲置回收都不清节流状态，计数只由成功认证与窗口衰减清理（G15；product.gateway-file-auth-throttle）"
 created = "2026-10-11"
 
 [[req]]

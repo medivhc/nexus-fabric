@@ -118,8 +118,13 @@ pub struct FileLimits {
     /// expiry path (re-lock after lapse, overflow counter decay) is testable
     /// without sleeping for a minute（评审 r3 R3-NEW-2 要求可验证）.
     pub lockout_window: Duration,
-    /// Entries kept in the throttle table; beyond that, oldest buckets are
-    /// merged into the global bucket so memory cannot grow with forged volume.
+    /// Rows kept in the throttle table. Beyond it a *new* identity gets no row of
+    /// its own: its failures accumulate in the overflow counter, which escalates
+    /// to the fail-closed global window (G15). Rows are neither merged nor evicted
+    /// — a row is dropped once that identity stays quiet for one `lockout_window`
+    /// (`Throttle::decay`), which is what stops forged volume from squatting the
+    /// table. 旧措辞 "oldest buckets are merged into the global bucket" 从来没有
+    /// 对应实现（评审 r7 R7-N-7）。
     pub max_throttle_buckets: usize,
     /// SCTP `max_buffered_amount` budget shared by the control and file channels.
     pub max_buffered_amount: usize,
@@ -666,19 +671,47 @@ pub struct FileSession {
     pub recycled: bool,
 }
 
+/// One throttle bucket: failures counted inside the **current** window, and when
+/// the last one arrived. `last` is what makes the bucket decay — a count that
+/// never goes stale is a count an attacker can keep warm forever, which is the
+/// thing 评审 r4 R4-W-6 asked to settle. Owner decision for this batch: implement
+/// the decay rather than write "legitimate users may be refused indefinitely" into
+/// the product as an accepted cost.
+#[derive(Debug, Clone, Copy)]
+struct BucketState {
+    count: usize,
+    last: Instant,
+}
+
+/// Bucket key: a fixed-size digest of the identity, see [`Throttle::identity_key`].
+type IdentityKey = [u8; 32];
+
+/// `from` is at least one window in the past, so a failure that old starts a
+/// **new** window instead of advancing the old count. A free function rather than
+/// a method because `HashMap::retain` holds the map mutably and a `&self` helper
+/// would collide with it.
+fn stale(window: Duration, from: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(from) >= window
+}
+
 /// Bounded authentication throttle (G15).
 #[derive(Debug, Default)]
 pub struct Throttle {
-    buckets: HashMap<(String, String), usize>,
-    /// Overflow sink: when the table is full, new failures land here instead of
-    /// growing memory with forged volume (so `throttle_entries_bounded` is real).
+    buckets: HashMap<IdentityKey, BucketState>,
+    /// Overflow sink: while the table is full, failures of *new* identities land
+    /// here instead of growing memory with forged volume (so
+    /// `throttle_entries_bounded` is real). It decays on its own clock
+    /// (`global_last`), so the fail-closed window must be **kept alive by
+    /// continuing to inject fresh identities** — stop for one window and both the
+    /// counter and the armed window are gone.
     global: usize,
-    /// Fail-closed window for the overflowing population. The旧行为 was
+    global_last: Option<Instant>,
+    /// Fail-closed window for the overflowing population. The 旧行为 was
     /// fail-**open**: overflow failures only moved a private counter, `locked`
     /// was never written, and `authenticate` still compared the token, so
     /// rotating principals bought an unlimited number of guesses (评审 r2 NEW-3).
     global_locked_until: Option<Instant>,
-    locked: HashMap<(String, String), Instant>,
+    locked: HashMap<IdentityKey, Instant>,
     max_buckets: usize,
     lockout: Duration,
     lockout_after: usize,
@@ -689,6 +722,7 @@ impl Throttle {
         Self {
             buckets: HashMap::new(),
             global: 0,
+            global_last: None,
             global_locked_until: None,
             locked: HashMap::new(),
             max_buckets,
@@ -707,34 +741,69 @@ impl Throttle {
             .or_else(|| now.checked_add(Duration::from_secs(3600)))
     }
 
-    fn bounded_key(&self, principal: &str, source: &str) -> (String, String) {
-        // "表项有界"只有在键也有界时才成立：键由未认证调用方给出，不裁长度就是
-        // 1024 项 × 任意长字符串（评审 r5 R5-W-4）。裁剪只影响归因精度，
-        // 不影响判定方向，且截断标记可见。
-        (
-            bounded_label(principal, IDENTITY_LABEL_MAX_BYTES),
-            bounded_label(source, IDENTITY_LABEL_MAX_BYTES),
-        )
+    /// The bucket key is a SHA-256 **digest** of the identity, not a truncated
+    /// copy of it. Two independent reasons, both raised in review:
+    /// - memory: a digest is 32 bytes, so `max_throttle_buckets` bounds *bytes*
+    ///   and not merely the number of rows. The previous scheme clipped both halves
+    ///   to a fixed label length (128 B, 评审 r5 R5-W-4 的处置), which bounded the
+    ///   *labels* while still allocating a `String` per half per bucket;
+    /// - attribution: a truncated key lets an attacker **aim** his failures at a
+    ///   victim. "Same first 128 bytes, same total length" put him in the victim's
+    ///   bucket, so `lockout_after` requests were enough to lock out one named
+    ///   legitimate principal（评审 r6 NOTE-4）。Sharing a digest bucket now requires
+    ///   a SHA-256 collision, which is not a "prefix + length" trick.
+    ///
+    /// Both halves are **length-prefixed** before hashing. Without that,
+    /// `("ab", "c")` and `("a", "bc")` hash the same concatenation — a collision
+    /// an attacker gets for free because he supplies both fields. Pinned by
+    /// `throttle_identity_keys_do_not_collide_on_prefix_or_concatenation`.
+    fn identity_key(principal: &str, source: &str) -> IdentityKey {
+        let mut h = Sha256::new();
+        h.update((principal.len() as u64).to_le_bytes());
+        h.update(principal.as_bytes());
+        h.update((source.len() as u64).to_le_bytes());
+        h.update(source.as_bytes());
+        h.finalize().into()
     }
 
-    /// Expire locks and the global window. Both are time-bounded: expired
-    /// `locked` entries are dropped so the table cannot fill up with dead locks,
-    /// and when the global window lapses the overflow counter resets too —
-    /// otherwise one flood would stay "armed" forever and a single extra
-    /// overflow failure per window would renew it indefinitely（评审 r3 R3-W-2）.
+    /// Expire locks and the global window, and drop idle buckets.
+    ///
+    /// All three decays are the same statement: a failure only counts against the
+    /// identity (or the overflowing population) that is *still* failing. Expired
+    /// `locked` entries are dropped so dead locks cannot occupy table rows, and
+    /// buckets whose last failure is a window old are dropped so (a) forged volume
+    /// cannot permanently squat the table — an honest newcomer gets its own bucket
+    /// again within one window — and (b) the overflow counter cannot be kept warm
+    /// by a trickle（评审 r3 R3-W-2 只要求全局窗口归零；R4-W-6 把同一条性质推到
+    /// 桶上，owner 决定实现衰减而不是登记为可接受代价）。
+    ///
+    /// 这里是**唯一**的衰减点：`record_failure` 先调它再计数，所以任何活到计数
+    /// 那一步的行都已经落在窗口内，不需要也不可能再判一次。
     fn decay(&mut self, now: Instant) {
+        let window = self.lockout;
         self.locked.retain(|_, until| *until > now);
+        self.buckets
+            .retain(|_, state| !stale(window, state.last, now));
         if let Some(until) = self.global_locked_until {
             if until <= now {
                 self.global_locked_until = None;
-                self.global = 0;
             }
+        }
+        if self
+            .global_last
+            .is_some_and(|last| stale(window, last, now))
+        {
+            self.global_last = None;
+            self.global = 0;
         }
     }
 
     pub fn is_locked(&self, principal: &str, source: &str) -> bool {
         let now = Instant::now();
-        let key = self.bounded_key(principal, source);
+        let key = Self::identity_key(principal, source);
+        // 读侧不跑 `decay`（它是 `&self`），所以可能看到过期项——方向是安全的：
+        // 过期锁在这里也判 false，而写侧的下一次 `record_failure` 会把它们清掉，
+        // 内存上界由写侧保证。
         if let Some(until) = self.locked.get(&key) {
             if *until > now {
                 return true;
@@ -746,13 +815,18 @@ impl Throttle {
         matches!(self.global_locked_until, Some(until) if until > now)
     }
 
-    /// Record a failure; returns true if this pushed the bucket into lockout.
+    /// Record a failure; returns true if this pushed the identity — or the
+    /// overflowing population — into a lockout window.
     pub fn record_failure(&mut self, principal: &str, source: &str) -> bool {
         let now = Instant::now();
         self.decay(now);
-        let key = self.bounded_key(principal, source);
+        let key = Self::identity_key(principal, source);
         if self.buckets.len() >= self.max_buckets && !self.buckets.contains_key(&key) {
-            self.global += 1;
+            // `decay()` above already zeroed `global` when `global_last` is a full
+            // window old, which is exactly why a flood must be **sustained** to
+            // keep the fail-closed window armed.
+            self.global = self.global.saturating_add(1);
+            self.global_last = Some(now);
             if self.global >= self.lockout_after {
                 if let Some(until) = self.lock_until(now) {
                     self.global_locked_until = Some(until);
@@ -761,11 +835,44 @@ impl Throttle {
             }
             return false;
         }
-        let n = self.buckets.entry(key.clone()).or_insert(0);
-        *n += 1;
-        if *n >= self.lockout_after {
-            // 每次达到阈值都重新上锁（锁可续期）；锁表满了才升级为全局窗口。
-            // 时钟边界（`None`）时不写持久锁，但这次调用仍按"已锁定"回给 authenticate。
+        // `decay` 已经用**同一个** `now`、同一个窗口谓词丢掉了过期行，所以活下来的
+        // 行按定义就在当前窗口内：在这里再判一次 `stale` 是结构上不可达的冗余分支
+        // （本批实测：把那条守卫改成恒真，61 条单测照样全绿 ⇒ 它零杀伤力）。衰减只有
+        // `decay` 一个机制，单点可杀（变异 M1）。
+        let count = match self.buckets.get(&key).copied() {
+            Some(previous) => previous.count.saturating_add(1),
+            None => 1,
+        };
+        self.buckets.insert(key, BucketState { count, last: now });
+        if count >= self.lockout_after {
+            // 每次达到阈值都重新上锁（锁可续期）。时钟边界（`None`）时不写持久锁，
+            // 但这次调用仍按"已锁定"回给 authenticate。
+            //
+            // `locked` 满了才升级为全局窗口这一支是**纵深防御，不是产品路径**。
+            // 三个前提缺一不可，写全在这里（r8 R8-W-3 指出我上一版漏了第一句，
+            // 于是"不可达"从证明退化成断言）：
+            // (a) 行与锁的死亡条件**逐字等价**：锁判 `until > now`（`until = arm + w`），
+            //     行判 `now - last >= w` 即作废，且武装那次两者写的是同一个 `now`；
+            //     锁定期内 `authenticate` 先短路、既不刷新行也不刷新锁。
+            // (b) 行只有两个消失途径：`decay`（按 (a) 与锁同时死）与 `succeed`
+            //     （它只在 `is_locked == false` 时才可达 ⇒ 有活锁的行不会被它删）。
+            //     会话拆除**不再**是第三个途径（r8 R8-W-2 之后 `close_session`
+            //     什么都不清，理由见 `Throttle::succeed` 的历史三段）。
+            // (c) 新行只在本函数开头那道 `buckets.len() >= max_buckets` 不成立时才产生。
+            // 由 (a)(b)：每条活锁都对应一行活行 ⇒ `locked.len() ≤ buckets.len()`；
+            // 由 (c)：`buckets.len() ≤ max_buckets`。所以 `locked.len() == max_buckets`
+            // 要求**所有在册行都带活锁**，而那时任何新身份都先撞 (c) 走溢出分支，
+            // 走不到这里 ⇒ 经 `authenticate` 不可达。r7 §3.2 证的是同一件事，我当时
+            // 把它抄过来当前提用，没有复核它对"forget 会删行"这一旧行为的依赖——
+            // 第八片删行不删锁的写法会把这条不变式弄假，第九片把删行整个去掉之后它才
+            // 重新成立，且现在有了新的观测面：`Throttle::locks()`/`FileEngine::throttle_locks()`
+            // （锁表大小此前全仓不可读，"表项有界"对锁表那一半是零可红对象，r8 R8-W-3）。
+            // 实测：把这支整个关掉 ⇒ 63 单测全绿、auth-throttle 的 18 条冻结期望字段
+            // 无一翻转（这与上面的不可达性一致，不是"测试没覆盖到"）；把 `decay` 的
+            // 过期锁回收改成恒真 ⇒ 只有
+            // `expired_locks_are_reclaimed_instead_of_escalating_to_the_global_window` 红，
+            // 也就是说它唯一的正向覆盖就是"回收坏了"那一类，正是这支要兜的缺陷。
+            // G15 里 fail-closed 的**实际**机制只有溢出计数那一条，措辞与此一致。
             if let Some(until) = self.lock_until(now) {
                 if self.locked.len() >= self.max_buckets {
                     self.global_locked_until = Some(until);
@@ -778,19 +885,44 @@ impl Throttle {
         false
     }
 
-    pub fn succeed(&mut self, principal: &str, source: &str) {
-        let key = self.bounded_key(principal, source);
-        self.buckets.remove(&key);
-    }
-
+    /// Live rows in the table. 观测口径按窗口过滤（读侧不跑 `decay`，它是 `&self`），
+    /// 所以这里报的是"还作数的失败"而不是底层 `HashMap` 的物理行数。
+    ///
+    /// 两个上界来源要分开，别混成一句（r7 R7-W-1/§3.2 的口径）：
+    /// (1) **物理行数有界**来自 `record_failure` 的准入行门禁（新行只在
+    /// `len < max_buckets` 时才产生），与回收无关；
+    /// (2) `decay` 的回收决定的是行**会不会死**（洪水占位能否自愈），不是行数上限。
+    ///
+    /// 探针与单测判的是存活值语义；`throttle_entries_bounded` 那条期望因此在慢 CI 上
+    /// 测不到"死行占位"这一类问题——那一类由
+    /// `expired_locks_are_reclaimed_instead_of_escalating_to_the_global_window` 钉。
     pub fn buckets(&self) -> usize {
-        self.buckets.len()
+        let (window, now) = (self.lockout, Instant::now());
+        self.buckets
+            .values()
+            .filter(|state| !stale(window, state.last, now))
+            .count()
     }
 
-    /// Overflow failures counted outside the bounded table (observability:
-    /// without this the fail-open path was invisible to the probe, r2 NEW-3).
+    /// Failures still counted in live buckets (observability for **bucket
+    /// decay**): a quiet identity's count must drop back to zero by itself, which
+    /// is what stops forged volume from permanently squatting the table.
+    pub fn failure_count(&self) -> usize {
+        let (window, now) = (self.lockout, Instant::now());
+        self.buckets
+            .values()
+            .filter(|state| !stale(window, state.last, now))
+            .map(|state| state.count)
+            .sum()
+    }
+
+    /// Live overflow failures (same read-side window filter as `buckets`).
     pub fn global(&self) -> usize {
-        self.global
+        let (window, now) = (self.lockout, Instant::now());
+        match self.global_last {
+            Some(last) if stale(window, last, now) => 0,
+            _ => self.global,
+        }
     }
 
     pub fn globally_locked(&self) -> bool {
@@ -798,18 +930,47 @@ impl Throttle {
             .is_some_and(|until| until > Instant::now())
     }
 
-    /// Called on session teardown: a recycled session must not leave state
-    /// behind, or the table grows with connection churn (asserted by the probe).
+    /// Live rows in `locked` (read side: expired entries count as zero).
     ///
-    /// 注意与 `sweep_idle` 的**不对称是有意的**（评审 r5 说我上一片的注释说反了，
-    /// 这里按代码实际语义重写）：只有显式 `close_session` 才清掉该 (主体,源) 的
-    /// 在途锁定与计数；闲置回收**不**清，否则"把会话挂到超时"就成了免费的
-    /// 解锁路径。今天两条都不可被无令牌者利用（开 session 必须先过一次成功认证，
-    /// 而那次成功已经清过桶），但语义差异必须写下来，不能靠读者猜。
-    pub fn forget(&mut self, principal: &str, source: &str) {
-        let key = self.bounded_key(principal, source);
+    /// 这条访问器存在的理由（评审 r8 R8-W-3）：G15 标题那句"计数与表项**有界**"此前
+    /// 只对 `buckets` 有可红对象，锁表大小全仓不可观测，于是"锁表会不会长大"这个问题
+    /// 在测试面上是空的。它和 `throttle_buckets()` 一起给出不变式
+    /// `locked.len() ≤ buckets.len() ≤ max_throttle_buckets` 的唯一观测面。
+    pub fn locks(&self) -> usize {
+        let now = Instant::now();
+        self.locked.values().filter(|until| **until > now).count()
+    }
+
+    /// The **only** explicit clearing path: a successful authentication drops this
+    /// identity's failure count (an armed lock can never reach this line, because
+    /// `authenticate` short-circuits on `is_locked` first — that is what keeps
+    /// `locked.len() ≤ buckets.len()` worth proving rather than assuming).
+    ///
+    /// 历史三段都留在这里，因为每一段都是上一段的前提被证伪之后的修正（会话拆除为什么
+    /// 什么也不清，见 `FileEngine::close_session`）：
+    /// 1. 最初有个 `forget()`，在会话拆除时同时删失败计数与已武装的锁。r7 实测把它的
+    ///    两行删空**谁都不红**，而它的注释写着"asserted by the probe"——那条
+    ///    `state_cleared_after_close` 跑在成功认证之后，成功早已由这里清过桶，
+    ///    探针根本观测不到那个函数。
+    /// 2. 第八片把行为翻成"只清计数、锁必须服完"，理由是会话号顺序自增、
+    ///    `close_session` 在 M2 接线前没有归属检查，"拆会话即解锁"等于无限猜测预算。
+    /// 3. r8 指出翻得不够：锁是由**计数**达到阈值才武装的，而清计数走的还是同一扇
+    ///    没有归属检查的门 ⇒ 攻击者每 `lockout_after - 1` 次猜密替被冒用的身份关一次
+    ///    会话，就把计数按定义钉在阈值之下，锁**永远不武装**——比解锁更省事。
+    ///
+    /// 于是这条路径整个被删掉（函数不存在了）：节流状态只由"这里的 `succeed`"与
+    /// "窗口衰减 `decay`"两途清理。`succeed` 已经覆盖了那个被删函数唯一的正当收益
+    /// （回来的合法主体不该背着旧账），删掉它不损失任何正向语义，反而把
+    /// "锁不会比行多"的前提补回来：行只能因衰减或因成功而消失，而成功在有活锁时
+    /// 根本走不到这里 ⇒ 孤锁没有来源。
+    ///
+    /// 残余照实登记：`close_session` 仍然没有归属检查（M2 的活），所以今天它至少还能
+    /// **终止别人的会话**；这项能力不再连带清除那个身份的节流状态。两侧都有断言：
+    /// `session_teardown_touches_no_throttle_state`、
+    /// `idle_recycle_clears_no_throttle_state`。
+    pub fn succeed(&mut self, principal: &str, source: &str) {
+        let key = Self::identity_key(principal, source);
         self.buckets.remove(&key);
-        self.locked.remove(&key);
     }
 }
 
@@ -999,11 +1160,14 @@ impl SendBudget {
     }
 }
 
-/// 调用方可控字符串的记账长度上限（评审 r5 R5-W-4）。"表项有界/审计环有界"只有在
-/// 值也有界时才是事实：认证主体名、源地址、审计里的 principal/root/rel 都来自
-/// 外部输入（其中 principal 在令牌校验**之前**就被写下），不裁长度就是
+/// 调用方可控字符串的记账长度上限（评审 r5 R5-W-4）。"审计环有界"只有在值也有界时
+/// 才是事实：认证主体名、源地址、审计里的 principal/root/rel 都来自外部输入
+/// （其中 principal 在令牌校验**之前**就被写下），不裁长度就是
 /// "行数 × 任意长字符串"。裁剪只损失归因精度，不改变任何判定方向，且带可见标记。
-const IDENTITY_LABEL_MAX_BYTES: usize = 128;
+///
+/// 节流表的键**不走**这条路径：它存的是身份的 32 字节摘要（`Throttle::identity_key`），
+/// 既不需要裁长度，也不再付 `String` 分配（评审 r6 NOTE-4 的裁决：摘要键让
+/// "前缀 + 总长可控"的身份碰撞变成"需要 SHA-256 碰撞"）。
 const AUDIT_FIELD_MAX_BYTES: usize = 256;
 
 /// Byte-bounded copy of a caller-supplied label, cutting on a char boundary and
@@ -1139,9 +1303,32 @@ impl FileEngine {
         self.throttle.global()
     }
 
+    /// Failures still counted in live buckets (G15 observability for **bucket
+    /// decay**): a quiet identity's count must drop back to zero by itself, which
+    /// is what stops forged volume from permanently squatting the table.
+    pub fn throttle_failures(&self) -> usize {
+        self.throttle.failure_count()
+    }
+
     /// True while the fail-closed global lockout window is active.
     pub fn throttle_globally_locked(&self) -> bool {
         self.throttle.globally_locked()
+    }
+
+    /// Is **this** (主体,源) pair inside an individual lockout right now? The
+    /// table itself only stores digests, so attribution goes through the audit
+    /// ring; this accessor exists so the contract probe can assert per-pair
+    /// separation (评审 r7 R7-N-6: the length-prefix property had a single unit
+    /// assertion and zero frozen expectations).
+    pub fn throttle_locked(&self, principal: &str, source: &str) -> bool {
+        self.throttle.is_locked(principal, source)
+    }
+
+    /// Live entries in the **lock** table (G15 "表项有界" 的另一半：这条之前锁表大小
+    /// 全仓不可读，所以 `locked.len() ≤ buckets.len() ≤ max_throttle_buckets` 里
+    /// 只有右半边有观测面，r8 R8-W-3）。
+    pub fn throttle_locks(&self) -> usize {
+        self.throttle.locks()
     }
 
     /// Read-only view of the shared send budget (probe/diagnostics).
@@ -1355,7 +1542,11 @@ impl FileEngine {
                 // 会话没了，它占着的预算条目必须一起释放，否则一次断线就把全节点
                 // 文件类发送预算永久钉死（r2 NEW-2 第 2 点）。
                 self.budget.release_session(session);
-                self.throttle.forget(&s.principal, &s.source);
+                // 节流状态**一个都不清**（r7 R7-W-2 → r8 R8-W-2 的两轮修正，完整理由
+                // 写在 `Throttle::succeed` 上）：会话号顺序自增且 M2 前 `close_session`
+                // 没有归属检查，所以拆除既不能删锁（=解锁），也不能删计数
+                // （=把计数按定义钉在阈值之下，锁永远武装不了）。
+                // 今天它仍能终止别人的会话——这一半要等 M2 的归属检查，已登记。
                 self.record(session, &s.principal, "", "close_session", "", "OK");
             }
             // 未知会话号也要留一行：否则"关不掉"在审计里是隐形的，G21 说的
@@ -2842,11 +3033,15 @@ mod tests {
         //  (b) `locked` 的到期项从不回收 ⇒ 灌满之后 record_failure 只能设全局窗口，
         //      叠加 (a) 就是"已在册主体永远锁不住"；
         //  (c) 溢出计数只增不减 ⇒ 一次洪水之后每窗口一条伪造失败就能无限续期。
+        // 窗口取 300 ms 而不是更小的值：本测试要跨四个阶段，衰减判据是"距上一次
+        // 失败满一个窗口"，窗口越小越容易被 CI 抖动假红（一次 >40 ms 的停顿就能让
+        // 后半段的溢出分支变成单桶分支）。
         let dir = tmp("throttle-rearm");
+        let window = Duration::from_millis(300);
         let l = FileLimits {
             max_throttle_buckets: 8,
             lockout_after: 2,
-            lockout_window: Duration::from_millis(40),
+            lockout_window: window,
             max_sessions: 8,
             max_browser_sessions: 8,
             ..Default::default()
@@ -2864,7 +3059,7 @@ mod tests {
                 .code,
             code::THROTTLED
         );
-        std::thread::sleep(Duration::from_millis(60));
+        std::thread::sleep(window * 2);
         for _ in 0..e.limits().lockout_after {
             let _ = e.authenticate("repeat", "10.0.0.1", "wrong");
         }
@@ -2889,7 +3084,7 @@ mod tests {
         assert_eq!(
             e.throttle_buckets(),
             e.limits().max_throttle_buckets,
-            "夹具前提：表已满，flood0..flood7 都在册且自身没有被锁"
+            "夹具前提：表已满，flood0 在册且自身没有被锁"
         );
         assert_eq!(
             e.authenticate("flood0", "10.0.0.2", "s3cret")
@@ -2905,7 +3100,7 @@ mod tests {
                 .code,
             code::THROTTLED
         );
-        std::thread::sleep(Duration::from_millis(60));
+        std::thread::sleep(window * 2);
         assert!(
             !e.throttle_globally_locked(),
             "窗口必须自行过期，不靠持续注入伪造失败"
@@ -2914,21 +3109,320 @@ mod tests {
             e.authenticate("late-comer", "10.0.0.3", "s3cret").is_ok(),
             "窗口过期后合法用户必须能进来（fail-closed 不等于永久拒绝服务）"
         );
-        // 窗口过期后**一条**溢出失败不得立刻重新武装；要重新武装必须再攒满
-        // `lockout_after` 条。评审 r5 R5-NEW-1：上一版这里喂的是 flood0，而它在
-        // buckets 里、走的是单桶分支，`global` 根本不参与判定 ⇒ 把 `decay` 的归零
-        // 整段删掉本测试照样绿，"溢出计数会衰减"这句话实际零覆盖。必须用**不在册**
-        // 的主体走溢出分支（表已满，off-a/off-b 进不去）。
-        let _ = e.authenticate("off-a", "10.0.0.2", "wrong");
-        assert!(
-            !e.throttle_globally_locked(),
-            "窗口刚过期就被 1 条失败重新武装 ⇒ decay 的 global 归零没生效（删掉它就红这里）"
+
+        // R4-W-6（owner 裁决：实现**桶衰减**，而不是把"合法用户可被长期拒服务"
+        // 写成可接受代价）。洪水停止满一个窗口之后，占位的伪造桶必须自己消失：
+        // 新来的合法主体重新拿到**自己的桶**，而不是被扫进 fail-closed 的溢出人群。
+        // 删掉 `decay` 里的桶回收，这里就会红（旧语义下表还被 8 个死桶占着，
+        // post-flood 进溢出分支 ⇒ `throttle_overflow() == 1`）。
+        assert_eq!(
+            e.throttle_overflow(),
+            0,
+            "停止注入一个窗口后溢出计数必须归零"
         );
-        assert_eq!(e.throttle_overflow(), 1, "溢出计数必须从 0 重新攒起");
-        let _ = e.authenticate("off-b", "10.0.0.2", "wrong");
+        assert_eq!(e.throttle_failures(), 0, "桶计数同样必须随窗口清干净");
+        let _ = e.authenticate("post-flood", "10.0.0.3", "wrong");
+        assert_eq!(
+            e.throttle_overflow(),
+            0,
+            "表已自愈 ⇒ 这条失败落进它自己的桶，不再进溢出人群"
+        );
+        assert_eq!(e.throttle_buckets(), 1);
+        assert_eq!(e.throttle_failures(), 1);
+
+        // 重新武装必须靠**持续注入**：先把表重新填满，再攒满 `lockout_after` 条
+        // 溢出失败。评审 r5 R5-NEW-1 的杀伤性保留：若 `global` 不随窗口归零，旧值
+        // （5）还挂着，下面第一条溢出失败就会立刻武装 ⇒ "不得武装"这条变红。
+        let free = e.limits().max_throttle_buckets - e.throttle_buckets();
+        for i in 0..free {
+            let _ = e.authenticate(&format!("again{i}"), "10.0.0.4", "wrong");
+        }
+        assert_eq!(e.throttle_buckets(), e.limits().max_throttle_buckets);
+        assert_eq!(e.throttle_overflow(), 0, "填满但未超阈值时不得武装");
+        for n in 1..e.limits().lockout_after {
+            let _ = e.authenticate(&format!("drip{n}"), "10.0.0.4", "wrong");
+            assert!(
+                !e.throttle_globally_locked(),
+                "攒够 lockout_after 条溢出失败之前不得武装"
+            );
+        }
+        let _ = e.authenticate("drip-final", "10.0.0.4", "wrong");
         assert!(
             e.throttle_globally_locked(),
             "攒满 lockout_after 条溢出失败后必须重新武装全局窗口"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lockout_requires_failures_inside_one_window() {
+        // 桶衰减换来的**另一侧**口径，必须写死在测试里而不是只写在契约里：
+        // `lockout_after` 条失败必须发生在同一个窗口内才会武装，所以"每窗口一条"
+        // 的慢滴不再锁死一个身份（R4-W-6 的取舍：锁定门槛从"累计 5 条"变成
+        // "一个窗口内 5 条"）。衰减只有 `decay` 一个机制：把它的桶回收改掉（变异 M1），
+        // 跨窗口的失败就一路累加到阈值，第三轮第一条直接锁定 ⇒ 这条立刻红。
+        let dir = tmp("throttle-drip");
+        let window = Duration::from_millis(200);
+        let l = FileLimits {
+            lockout_after: 3,
+            lockout_window: window,
+            ..Default::default()
+        };
+        let root = SandboxRoot::open("downloads", &dir, false).unwrap();
+        let mut e = FileEngine::new(l, vec![root], "s3cret").unwrap();
+        for round in 0..3 {
+            let err = e
+                .authenticate("drip", "10.0.0.7", "wrong")
+                .unwrap_err()
+                .code;
+            assert_eq!(
+                err,
+                code::AUTH_DENIED,
+                "第 {round} 轮：跨窗口的失败不得累计"
+            );
+            std::thread::sleep(window + window / 2);
+        }
+        // 反过来：一个窗口内攒满 3 条**必须**锁定，否则衰减就成了免死金牌。
+        for _ in 0..2 {
+            let _ = e.authenticate("drip", "10.0.0.7", "wrong");
+        }
+        assert_eq!(
+            e.authenticate("drip", "10.0.0.7", "wrong")
+                .unwrap_err()
+                .code,
+            code::THROTTLED,
+            "同一窗口内达到阈值必须锁定"
+        );
+        assert_eq!(
+            e.authenticate("drip", "10.0.0.7", "s3cret")
+                .unwrap_err()
+                .code,
+            code::THROTTLED
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn throttle_identity_keys_do_not_collide_on_prefix_or_concatenation() {
+        // 评审 r6 NOTE-4（owner 裁决：节流键改成身份摘要）。旧写法把两半各自裁到
+        // 固定长度（128 B），所以碰撞条件是"前 128 字节相同 **且总长相同**"——夹具
+        // 必须同时满足这两条，否则测的是字符串不等而不是摘要。
+        let mut t = Throttle::new(16, 3, Duration::from_secs(60));
+        let base = "b".repeat(200);
+        let victim = format!("{base}aaaa");
+        let forged = [
+            format!("{base}bbbb"),
+            format!("{base}cccc"),
+            format!("{base}dddd"),
+        ];
+        for f in &forged {
+            for _ in 0..t.lockout_after {
+                let _ = t.record_failure(f, "10.0.0.8");
+            }
+            assert!(t.is_locked(f, "10.0.0.8"), "{f} 自己必须被锁");
+            assert!(
+                !t.is_locked(&victim, "10.0.0.8"),
+                "同前缀同总长的伪造身份不得替受害者武装锁定（裁剪键下这里是 true）"
+            );
+        }
+        // 受害者随后自己也错一次：只能推进自己的桶，不得继承伪造者的计数。
+        // 裁剪键下这一条会把共用桶推到 10 并立刻重新武装 ⇒ 返回 true ⇒ 红。
+        assert!(
+            !t.record_failure(&victim, "10.0.0.8"),
+            "受害者自己的第一条失败不得复用伪造者的计数"
+        );
+        assert_eq!(t.buckets(), forged.len() + 1, "四条身份必须各自成桶");
+        assert_eq!(t.failure_count(), 3 * t.lockout_after + 1);
+        // 长度前缀缺了就会碰撞的拼接面：("ab","c") 与 ("a","bc") 是同一段拼接。
+        let mut u = Throttle::new(16, 2, Duration::from_secs(60));
+        for _ in 0..u.lockout_after {
+            let _ = u.record_failure("ab", "c");
+        }
+        assert!(u.is_locked("ab", "c"));
+        assert!(
+            !u.is_locked("a", "bc"),
+            "两半必须先写长度再哈希，否则拼接歧义给出免费碰撞"
+        );
+        // 这一条只是回归护栏：不写长度前缀时 `("ab","bc")` 也不会与上面两段同键，
+        // 真正有杀伤力的是上面那一对。
+        assert!(!u.is_locked("ab", "bc"), "源地址同样不得被并进同一条键");
+        // 定长摘要 ⇒ "项数有界"就是"字节有界"，不依赖任何裁剪（R5-W-4 的原始诉求）。
+        assert_eq!(u.buckets(), 1, "只有实际被喂过的那条身份在册");
+        assert_eq!(u.failure_count(), u.lockout_after);
+    }
+
+    #[test]
+    fn expired_locks_are_reclaimed_instead_of_escalating_to_the_global_window() {
+        // 过期的 `locked` 项必须真的被回收，而不是只靠时间戳比较"看起来没锁"。
+        // 两种写法在判定上等价，但内存与**升级路径**不等价：`record_failure` 只在
+        // `locked.len() >= max_buckets` 时才升级到全局窗口，所以死锁项占位会把后来者
+        // 的**个体锁定**偷偷换成**全局 fail-closed**——一批早就停手的伪造身份，
+        // 从此永久决定所有新身份的待遇。变异 M9（把 `locked.retain` 改成恒真）
+        // 在第一版这里全绿，所以两条断言都写上：全局窗口不得武装，且过期身份的
+        // 正确令牌必须重新能进来。
+        let dir = tmp("lock-reclaim");
+        let window = Duration::from_millis(200);
+        let l = FileLimits {
+            max_throttle_buckets: 2,
+            lockout_after: 2,
+            lockout_window: window,
+            ..Default::default()
+        };
+        let root = SandboxRoot::open("downloads", &dir, false).unwrap();
+        let mut e = FileEngine::new(l, vec![root], "s3cret").unwrap();
+        for who in ["first", "second"] {
+            for _ in 0..e.limits().lockout_after {
+                let _ = e.authenticate(who, "10.0.0.20", "wrong");
+            }
+            assert_eq!(
+                e.authenticate(who, "10.0.0.20", "s3cret").unwrap_err().code,
+                code::THROTTLED
+            );
+        }
+        assert!(
+            !e.throttle_globally_locked(),
+            "夹具前提：两条身份各自占满一个锁位，还没有升级"
+        );
+        std::thread::sleep(window * 2);
+        // 第三条身份到阈值：死锁项若不被回收，锁表在这里就"满了"，悄悄升级为全局窗口。
+        for _ in 0..e.limits().lockout_after {
+            let _ = e.authenticate("third", "10.0.0.21", "wrong");
+        }
+        assert!(
+            !e.throttle_globally_locked(),
+            "过期锁必须回收；升级为全局窗口是把个体锁定偷换成全体拒服务（M9）"
+        );
+        assert_eq!(
+            e.authenticate("third", "10.0.0.21", "s3cret")
+                .unwrap_err()
+                .code,
+            code::THROTTLED,
+            "第三条身份自己的锁要成立"
+        );
+        assert!(
+            e.authenticate("first", "10.0.0.20", "s3cret").is_ok(),
+            "已过期身份不得被死锁项继续拦在门外"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_teardown_touches_no_throttle_state() {
+        // 评审 r7 R7-W-2 → r8 R8-W-2 两轮修正的落点：**会话拆除不碰节流状态的任何一个
+        // 部分**（既不删锁，也不删计数），完整因果写在 `Throttle::succeed` 的三段历史
+        // 注释里。要点复述一遍，因为"为什么连清计数都不许"并不显然：
+        // 锁是由**计数**达到 `lockout_after` 才武装的，而 `close_session` 在 M2 接线前
+        // 没有归属检查、会话号顺序自增 ⇒ 只要拆会话还能清计数，一个能猜整数的第三方
+        // 每 `lockout_after - 1` 次替受害者关一次会话，就能把计数按定义钉在阈值之下，
+        // 锁**永远武装不了**——这比"拆会话即解锁"还省事。
+        // 两半都没有时间依赖。旧写法（第八片：清计数；更早：连锁一起清）在这里都红。
+        let dir = tmp("teardown-throttle");
+        let l = FileLimits {
+            lockout_after: 2,
+            ..Default::default()
+        };
+        let root = SandboxRoot::open("downloads", &dir, false).unwrap();
+        let mut e = FileEngine::new(l, vec![root], "s3cret").unwrap();
+
+        // (a) 计数不被清：成功认证 → 1 条失败（未武装）→ 关会话 → 再 1 条失败
+        //     ⇒ 计数仍在 ⇒ 第二条达到阈值 ⇒ 当场武装。
+        let sid = e
+            .authenticate("td-count", "10.0.0.30", "s3cret")
+            .unwrap_or_else(|_| panic!("夹具：正确令牌应放行"));
+        assert_eq!(
+            e.authenticate("td-count", "10.0.0.30", "wrong")
+                .unwrap_err()
+                .code,
+            code::AUTH_DENIED,
+            "夹具前提：第一条失败不该武装"
+        );
+        e.close_session(sid);
+        assert_eq!(
+            e.authenticate("td-count", "10.0.0.30", "wrong")
+                .unwrap_err()
+                .code,
+            code::THROTTLED,
+            "拆会话不得清计数：清了就等于让第三方把该身份的计数永远压在阈值下（r8 R8-W-2）"
+        );
+
+        // (b) 锁不被拆：持有会话 → 失败到武装 → 关会话 → 正确令牌仍必须被拒。
+        let sid2 = e.authenticate("td-lock", "10.0.0.31", "s3cret").unwrap();
+        for _ in 0..e.limits().lockout_after {
+            let _ = e.authenticate("td-lock", "10.0.0.31", "wrong");
+        }
+        assert_eq!(
+            e.authenticate("td-lock", "10.0.0.31", "s3cret")
+                .unwrap_err()
+                .code,
+            code::THROTTLED,
+            "夹具前提：已达阈值并武装"
+        );
+        e.close_session(sid2);
+        // 不变式见证（r8 R8-W-3：这条之前锁表大小全仓不可读，"表项有界"对锁表那一半
+        // 是零可红对象）：每条活锁都得有一行活着，行与计数都不许被拆除动过。
+        assert_eq!(
+            e.throttle_locks(),
+            e.throttle_buckets(),
+            "`locked.len() == buckets.len()`：孤锁没有来源，所以那支纵深防御经 authenticate 到不了"
+        );
+        assert!(
+            e.throttle_locks() <= e.limits().max_throttle_buckets,
+            "锁表同样有界（G15 标题那句现在两边都有观测面）"
+        );
+        assert_eq!(
+            e.throttle_failures(),
+            2 * e.limits().lockout_after,
+            "两次拆会话都没动过计数：td-count 与 td-lock 各自 2 条仍在册"
+        );
+        assert!(
+            e.throttle_locked("td-lock", "10.0.0.31"),
+            "锁还在——拆会话不是解锁路径"
+        );
+        let after_teardown = e
+            .authenticate("td-lock", "10.0.0.31", "s3cret")
+            .map(|_| "ACCEPTED")
+            .unwrap_or_else(|err| err.code);
+        assert_eq!(
+            after_teardown,
+            code::THROTTLED,
+            "拆除会话不是解锁路径：窗口必须服完（旧 forget 这里是 ACCEPTED）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn idle_recycle_clears_no_throttle_state() {
+        // 另一半柱子（`Throttle::succeed` 的历史三段）：显式 `close_session` 与闲置回收
+        // `sweep_idle` **都**不碰节流状态。上一条测试管 close 那一侧，本条管回收那一侧：
+        // 若 sweep_idle 去清计数，下面第二条失败就只是 AUTH_DENIED ⇒ 红；若它清锁，
+        // 同一夹具里 `throttle_locked` 变 false ⇒ 也红。
+        let dir = tmp("idle-throttle");
+        let l = FileLimits {
+            idle_timeout: Duration::from_millis(20),
+            lockout_after: 2,
+            ..Default::default()
+        };
+        let root = SandboxRoot::open("downloads", &dir, false).unwrap();
+        let mut e = FileEngine::new(l, vec![root], "s3cret").unwrap();
+        let s = e.authenticate("idle-td", "10.0.0.32", "s3cret").unwrap();
+        assert_eq!(
+            e.authenticate("idle-td", "10.0.0.32", "wrong")
+                .unwrap_err()
+                .code,
+            code::AUTH_DENIED
+        );
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(
+            e.sweep_idle(Instant::now()),
+            vec![s],
+            "夹具前提：会话确实被闲置回收"
+        );
+        assert_eq!(
+            e.authenticate("idle-td", "10.0.0.32", "wrong")
+                .unwrap_err()
+                .code,
+            code::THROTTLED,
+            "闲置回收不得清掉失败计数，否则'把会话挂到超时'就是免费的清账路径"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
