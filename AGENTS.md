@@ -2089,19 +2089,8 @@ pre-push    → nexus-harness verify --fast 不得 FAIL/BLOCKED；STALE Evidence
 
 ### 项目级 Agent Skills
 
-位于 `.agents/skills/`（任务开始时按匹配读取对应 `SKILL.md`）：
-
-
-
-```
-nexus-task            仓库内端到端工程任务流程（类型判定 → 上下文 → 契约先行 → 实现 → 验证 → 报告）
-
-nexus-contract-first  契约阶段 / 实现阶段 / Red Evidence / Contract Hash / Contract Conflict
-
-nexus-evidence        证据强度 E0–E5、绑定与 STALE 规则、Candidate Completion 报告模板
-```
-
-技能索引见 `harness.toml [skills]` 与 `.agents/skills/README.md`。
+位于 `.agents/skills/`（任务开始时按匹配读取对应 `SKILL.md`）。
+完整索引见 `harness.toml [skills]` 与 `.agents/skills/README.md`。
 
 ## 29. 多 Agent 协作约定（Multi-Agent Collaboration）
 
