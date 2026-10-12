@@ -12,6 +12,7 @@
 | `.agents/skills/nexus-multiagent/SKILL.md` | Project-level agent skill |
 | `.agents/skills/nexus-selfrepair/SKILL.md` | Project-level agent skill |
 | `.agents/skills/nexus-task/SKILL.md` | Project-level agent skill |
+| `.agents/skills/nexus-test-review/SKILL.md` | Project-level agent skill |
 | `.evidence/.gitignore` | Evidence store contract |
 | `.evidence/README.md` | Evidence store contract |
 | `.githooks/README.md` | Machine-enforced git gate hooks (documentation) |
