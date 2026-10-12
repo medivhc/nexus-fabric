@@ -194,8 +194,18 @@ impl Client {
     /// 连接 + hello。失败返回**结构化原因**：契约要求 `daemon_unavailable` 带可诊断的原因，
     /// "连不上"这种没有下一步信息的句子不算原因。
     pub fn connect(lease: &Lease) -> Result<Client, String> {
-        let mut stream = TcpStream::connect_timeout(&lease.addr(), Duration::from_secs(2))
-            .map_err(|e| format!("连不上 daemon {}：{e}", lease.addr()))?;
+        let mut stream = TcpStream::connect_timeout(&lease.addr(), Duration::from_secs(5))
+            .map_err(|e| {
+                // 把"端口上确实没人听"与"连不上但可能只是忙"分开：前者才允许删租约。
+                // OS 文案随宿主语言变（中文 Windows 是"由于连接方在一段时间后…"），所以
+                // 判据不能靠字符串本地化文本 —— 显式附加一个 ASCII 标记给调用方分类用。
+                let marker = if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                    " CONNECTION_REFUSED"
+                } else {
+                    ""
+                };
+                format!("连不上 daemon {}：{e}{marker}", lease.addr())
+            })?;
         stream
             .set_read_timeout(Some(CLIENT_READ_TIMEOUT))
             .map_err(|e| e.to_string())?;
@@ -278,23 +288,60 @@ struct PoolSession {
     last_used: u64,
 }
 
-/// daemon 服务端主体。返回 `(退出时会话数, 原因)`；会话数进 `sessions_after_stop` 口径。
-/// 注意这里返回的是**清理之后**的数量，恒为 0 —— 它证明的是"没有孤儿 RA 子进程"，
-/// 而不是"池子曾经有过几个"（后者由 pong 的 `sessions` 报）。
-pub fn serve(
+impl Drain {
+    /// 还没建过池子就失败时的中性值。
+    fn empty() -> Drain {
+        Drain {
+            lived: 0,
+            still_alive: 0,
+        }
+    }
+}
+
+/// 会话池的一次性回收结果。两个数都是**观测**：
+/// `lived` = 回收前池子里有几个会话，`still_alive` = 回收后操作系统仍认为活着的 provider 数。
+struct Drain {
+    lived: usize,
+    still_alive: usize,
+}
+
+/// 回收会话池：逐个走 provider 自己的有序关闭（shutdown → exit → 有界等待 → kill），
+/// 并把每个子进程"是否真的退出"收进 `still_alive`。
+///
+/// 这一层存在的理由是 B-1：`sessions_after_stop` 必须能变红。若有人把 `LspSession::shutdown`
+/// 里的等待/kill 删掉，provider 子进程仍在 ⇒ `still_alive > 0` ⇒ 探针与场景立刻不绿；
+/// 而旧实现报的是常量 0，那种回归会无声通过。
+fn drain_pool(pool: &mut Vec<PoolSession>) -> Drain {
+    let lived = pool.len();
+    let mut still_alive = 0usize;
+    for entry in pool.iter_mut() {
+        // `close_with_report` 走的是与 `ProviderSession::Drop` 相同的回收逻辑，只是多交回一个
+        // 由 `try_wait` 得到的结论；问不到（Err）算"仍活着"，与 `dirty_after_lifecycle` 同口径。
+        if matches!(entry.session.provider.close_with_report(), Some(false)) {
+            still_alive += 1;
+        }
+    }
+    pool.clear();
+    Drain { lived, still_alive }
+}
+
+/// daemon 服务端主体。返回回收观测与退出原因；`still_alive` 就是 `sessions_after_stop` 的口径。
+/// 曾经这里写着"恒为 0"，但那句话与代码不符（代码在 `clear()` 之前取 `pool.len()`），
+/// 独立评审 round 1 一并记为 B-1 的一部分。
+fn serve(
     namespace: &Path,
     repo_root: &Path,
     workspace_key: &str,
     idle_secs: u64,
     max_workspaces: usize,
-) -> (usize, String) {
+) -> (Drain, String) {
     let listener = match TcpListener::bind(("127.0.0.1", 0)) {
         Ok(l) => l,
-        Err(e) => return (0, format!("绑不上回环端口: {e}")),
+        Err(e) => return (Drain::empty(), format!("绑不上回环端口: {e}")),
     };
     let port = match listener.local_addr() {
         Ok(a) => a.port(),
-        Err(e) => return (0, format!("读不到监听端口: {e}")),
+        Err(e) => return (Drain::empty(), format!("读不到监听端口: {e}")),
     };
     let lease = Lease {
         pid: std::process::id(),
@@ -310,7 +357,7 @@ pub fn serve(
     };
     if let Err(e) = write_lease(namespace, &lease) {
         return (
-            0,
+            Drain::empty(),
             format!("写不出租约 {}: {e}", lease_path(namespace).display()),
         );
     }
@@ -346,13 +393,12 @@ pub fn serve(
             Err(e) => break format!("accept 失败: {e}"),
         }
     };
-    // 退出路径只有一条清理：先 Drop 会话池（`ProviderSession::Drop` 会关 provider，
-    // 这一条就是 `sessions_after_stop = 0` 的机制），再删自己写的租约与缓存目录。
-    let lived = pool.len();
-    pool.clear();
+    // 退出路径只有一条清理：`drain_pool`（观测每个 provider 是否真的被操作系统收掉）
+    // → 删自己写的租约 → 删缓存目录。idle 自退出与 stop 走同一条，不给它开后门。
+    let drain = drain_pool(&mut pool);
     remove_lease(namespace);
     cache::purge(&cache_dir(namespace));
-    (lived, reason)
+    (drain, reason)
 }
 
 enum Conn {
@@ -454,10 +500,16 @@ fn handle_conn(
                 }
             }
             "stop" => {
+                // **先回收、再回报**：两个数都来自 `drain_pool` 的真实观测
+                // （`still_alive` 靠操作系统对子进程的 `try_wait` 结果）。
+                // 之前这里是字面量 0 —— 独立评审 round 1 的 B-1：常量不可证伪，
+                // 关闭逻辑哪怕退化成不 kill/不等待，探针与场景仍双双照绿。
+                let drain = drain_pool(pool);
                 let _ = write_frame(
                     &mut stream,
                     &json!({"t": "stopped",
-                    "sessions_before_stop": pool.len(), "sessions_after_stop": 0}),
+                           "sessions_before_stop": drain.lived,
+                           "sessions_after_stop": drain.still_alive}),
                 );
                 return Conn::Stop;
             }
@@ -910,7 +962,7 @@ pub fn start_in(
     capacity: usize,
 ) -> Outcome {
     if let Some(lease) = read_lease(namespace) {
-        let (alive, pong, _) = probe(&lease);
+        let (alive, pong, why) = probe(&lease);
         if alive {
             let pong = pong.unwrap_or(Value::Null);
             let state = DaemonState {
@@ -930,6 +982,33 @@ pub fn start_in(
                 &state,
                 Vec::new(),
                 format!("daemon 已在 {}: 复用现有实例", lease.addr()),
+            );
+        }
+        // 残留租约（daemon 崩了没删文件）在这里被**覆盖**而不是拒绝启动：否则一次崩溃会永久挡住
+        // `start`。但"覆盖"的前提是有证据说它是残留 —— 没被拒只是没答上时，起第二个 daemon
+        // 会留下两个监听者与一份被踩掉的租约（第一个就此不可发现）。与 `stop` 同一判据。
+        if !why.contains("CONNECTION_REFUSED") {
+            let state = DaemonState {
+                running: false,
+                detected: false,
+                session_source: "in-process",
+                lease: Some(lease.clone()),
+                stale_lease: false,
+                unavailable: Some(why.clone()),
+                provider_sessions: 0,
+                capacity: lease.max_workspaces,
+                idle_secs: lease.idle_secs,
+                already_running: Some(false),
+            };
+            return unknown(
+                &state,
+                format!(
+                    "租约里的 daemon {} 这次没答上也没被拒（{why}）⇒ 不覆盖租约、不起第二个实例；\
+                     请稍后重试，或先确认 pid {} 已不在",
+                    lease.addr(),
+                    lease.pid
+                ),
+                Vec::new(),
             );
         }
     }
@@ -1074,7 +1153,7 @@ fn serve_command(args: &[String]) -> Outcome {
     let workspace = parsed.workspace.unwrap_or_else(|| ".".to_string());
     let ns = PathBuf::from(namespace);
     let root = PathBuf::from(repo_root);
-    let (sessions, reason) = serve(&ns, &root, &workspace, idle, capacity);
+    let (drain, reason) = serve(&ns, &root, &workspace, idle, capacity);
     let state = DaemonState {
         running: false,
         detected: false,
@@ -1082,7 +1161,7 @@ fn serve_command(args: &[String]) -> Outcome {
         lease: None,
         stale_lease: false,
         unavailable: None,
-        provider_sessions: sessions,
+        provider_sessions: drain.still_alive,
         capacity,
         idle_secs: idle,
         already_running: None,
@@ -1090,6 +1169,7 @@ fn serve_command(args: &[String]) -> Outcome {
     let mut f = fields(&state);
     f.push(("results".to_string(), json!([])));
     f.push(("count".to_string(), json!(0)));
+    f.push(("sessions_before_exit".to_string(), json!(drain.lived)));
     ("PASS".to_string(), reason, f)
 }
 
@@ -1147,32 +1227,40 @@ pub fn stop_in(namespace: &Path) -> Outcome {
                 std::thread::sleep(Duration::from_millis(100));
             }
             let gone = !lease_path(namespace).exists();
+            // 值**只从 daemon 的应答里取**。取不到就报 -1：问不到不等于证明没有，
+            // 而写死 0 会让"关闭逻辑退化"这类回归在探针与场景里双双隐身（B-1）。
+            let observed = reply
+                .as_ref()
+                .ok()
+                .and_then(|v| v.get("sessions_after_stop").and_then(Value::as_i64))
+                .unwrap_or(-1);
+            let extra = vec![
+                ("sessions_after_stop".to_string(), json!(observed)),
+                (
+                    "stop_reply".to_string(),
+                    reply.clone().unwrap_or_else(|e| json!({"error": e})),
+                ),
+            ];
             let state = DaemonState {
                 running: false,
                 detected: false,
                 session_source: "in-process",
                 lease: Some(lease.clone()),
                 stale_lease: false,
-                unavailable: if gone {
+                unavailable: if gone && observed == 0 {
                     None
                 } else {
-                    Some("daemon 应答了 stop 但租约没被删".to_string())
+                    Some(match reply.as_ref() {
+                        Ok(_) => format!("daemon 回报仍有 {observed} 个 provider 未退出"),
+                        Err(e) => format!("stop 应答取不到: {e}"),
+                    })
                 },
-                // 这里是"报 0"唯一诚实的位置：它是 daemon 在退出前把会话池清空之后自己数出来的，
-                // 而"曾经有会话"由 `sessions_before_stop` 同时带出 —— 只报 0 就是自证。
-                provider_sessions: 0,
+                provider_sessions: observed.max(0) as usize,
                 capacity: lease.max_workspaces,
                 idle_secs: lease.idle_secs,
                 already_running: None,
             };
-            let extra = vec![
-                ("sessions_after_stop".to_string(), json!(0)),
-                (
-                    "stop_reply".to_string(),
-                    reply.unwrap_or_else(|e| json!({"error": e})),
-                ),
-            ];
-            if gone {
+            if gone && observed == 0 {
                 pass(
                     &state,
                     extra,
@@ -1182,22 +1270,28 @@ pub fn stop_in(namespace: &Path) -> Outcome {
                 unknown(
                     &state,
                     format!(
-                        "daemon 应答了 stop 但租约 {} 仍在",
-                        lease_path(namespace).display()
+                        "stop 未能证明回收完成（租约已删={gone}，回报仍活着的 provider={observed}）"
                     ),
                     extra,
                 )
             }
         }
         Err(e) => {
-            remove_lease(namespace);
-            cache::purge(&cache_dir(namespace));
+            // 只有"确实没人监听"才够格把租约当残留删掉。负载宿主上一次 connect 超时**不是**
+            // "daemon 死了"：独立评审 round 1 的 OPEN-1 就是这个形状 —— 同机并发跑
+            // `verify --fast` 时一次 stop 把活着的 daemon 误判成残留并删了租约，
+            // 结果是 daemon 仍在跑但再也没人找得到它（比留一个孤儿进程更难收拾）。
+            let refused = e.contains("CONNECTION_REFUSED");
+            if refused {
+                remove_lease(namespace);
+                cache::purge(&cache_dir(namespace));
+            }
             let state = DaemonState {
                 running: false,
                 detected: false,
                 session_source: "in-process",
                 lease: Some(lease.clone()),
-                stale_lease: true,
+                stale_lease: refused,
                 unavailable: Some(e.clone()),
                 provider_sessions: 0,
                 capacity: lease.max_workspaces,
@@ -1206,11 +1300,21 @@ pub fn stop_in(namespace: &Path) -> Outcome {
             };
             unknown(
                 &state,
-                format!(
-                    "租约指向没人听的端口 {}: {e}；已删租约，未 kill pid {}",
-                    lease.addr(),
-                    lease.pid
-                ),
+                if refused {
+                    format!(
+                        "租约指向被拒的端口 {}: {e}；已删租约，未 kill pid {}",
+                        lease.addr(),
+                        lease.pid
+                    )
+                } else {
+                    format!(
+                        "daemon {} 这次没答上（{}），但没被拒 ⇒ 按可能只是繁忙处理：**未删租约**、未 kill pid {}；\
+                         稍后重试 stop，或确认进程已不在后手工删租约",
+                        lease.addr(),
+                        e,
+                        lease.pid
+                    )
+                },
                 Vec::new(),
             )
         }
@@ -1260,7 +1364,7 @@ pub fn status_in(namespace: &Path) -> Outcome {
         detected: alive,
         session_source: if alive { "daemon" } else { "in-process" },
         lease: Some(lease.clone()),
-        stale_lease: !alive,
+        stale_lease: !alive && why.contains("CONNECTION_REFUSED"),
         unavailable: (!alive).then_some(why.clone()),
         provider_sessions: pong.get("sessions").and_then(Value::as_u64).unwrap_or(0) as usize,
         capacity: pong
@@ -1323,8 +1427,8 @@ pub fn route(repo_root: &Path, allow_daemon: bool) -> Route {
                 detected: false,
                 session_source: "in-process",
                 lease: Some(lease.clone()),
-                // 租约在、端口没人听 ⇒ 这就是契约里的 `stale_lease`，不是"没有 daemon"。
-                stale_lease: true,
+                // 被拒才算"这份租约是残留"；没答上只是繁忙 ⇒ 不能把对外字段说成垃圾租约。
+                stale_lease: e.contains("CONNECTION_REFUSED"),
                 unavailable: Some(e.clone()),
                 provider_sessions: 0,
                 capacity: lease.max_workspaces,
@@ -1826,8 +1930,8 @@ fn selftest(args: &[String]) -> Outcome {
         reply_sessions,
         json!(0),
         format!(
-            "stop 后 daemon 侧会话数为 0（机制是 ProviderSession::Drop 关掉 RA 子进程；\
-             \"曾经有会话\"由 stop_reply.sessions_before_stop 同时带出，避免只报 0 的自证）：{}",
+            "stop 后仍活着的 provider 数（观测值：daemon 在回收每个会话后用子进程的 try_wait 判定，\
+             取不到应答时 CLI 报 -1 而不是 0；旧实现写死 0，独立评审 round 1 判为不可证伪）：{}",
             stopped.1
         ),
     ));
@@ -1916,13 +2020,26 @@ fn field_of_value(v: &Value, dotted: &str) -> Value {
     out
 }
 
+/// 一个"确定没人监听、且连接一定被判 **refused**"的端口。
+///
+/// 别用端口 1：实测 Windows 上连 `127.0.0.1:1` 得到的是 `connection timed out`（不是 refused），
+/// 而 `stop`/`start`/`route` 的"残留租约"分类按 refused 走 ⇒ 端口 1 会让同一份测试在两宿主上
+/// 走不同分支（Linux refused、Windows 超时）。做法是绑一个临时端口再立即释放：
+/// 两宿主对无人监听的回环端口都回 ECONNREFUSED。竞争窗口只会让测试变红，不会让它假绿。
+fn certainly_closed_port() -> u16 {
+    TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .unwrap_or(1)
+}
+
 /// 手写一份"没人听的端口"的租约，用来观测残留租约这条路。
-/// 端口取 1：任何宿主上都不会有 nexus daemon 在听它，所以既不会误连到真 daemon，
-/// 也不需要先造一个真进程再杀它（那是 `stop` 明确不肯做的事）。
+/// 端口来自 `certainly_closed_port()`：既不会误连到真 daemon，也不需要先造一个真进程再杀它
+/// （那是 `stop` 明确不肯做的事）。
 fn write_bogus_lease(namespace: &Path) {
     let lease = Lease {
         pid: 1,
-        port: 1,
+        port: certainly_closed_port(),
         token: "bogus".to_string(),
         started_at: now_secs(),
         last_heartbeat: now_secs(),
@@ -1999,8 +2116,8 @@ mod tests {
         let ns = unique_namespace_dir("unavailable-reason");
         let lease = Lease {
             pid: 1,
-            // 绑 1 端口在任何宿主上都不可能有 nexus daemon 在听（见 write_bogus_lease 的理由）。
-            port: 1,
+            // 一定回 ECONNREFUSED 的端口（见 `certainly_closed_port`：端口 1 在 Windows 上是超时）。
+            port: certainly_closed_port(),
             token: "bogus".to_string(),
             started_at: now_secs(),
             last_heartbeat: now_secs(),
@@ -2018,7 +2135,7 @@ mod tests {
         };
         assert!(!reason.is_empty(), "回落原因为空就是把失败说成了沉默");
         // 原因里必须能被认出是哪一步坏的：连不上 / 握手 / 版本，三者之一。
-        let mentions = ["连不上", "握手", "版本", "refused", "端口 1"]
+        let mentions = ["连不上", "握手", "版本", "refused"]
             .iter()
             .any(|m| reason.contains(m));
         assert!(mentions, "回落原因不可诊断：{reason}");
@@ -2030,6 +2147,29 @@ mod tests {
                 .is_some_and(|s| !s.is_empty()),
             "daemon_unavailable 必须带非空原因：{v}"
         );
+        let _ = std::fs::remove_dir_all(&ns);
+    }
+
+    /// B-1 的另一半：daemon 答不上来时，CLI **不许**替它把 `sessions_after_stop` 说成 0。
+    /// 用指向被拒端口的租约构造该分支（绑 1 端口需要特权，任何宿主上都不会有人在那儿听协议），
+    /// 断言 verdict 是 UNKNOWN 且**这个字段根本不存在**。
+    #[test]
+    fn stop_does_not_claim_zero_without_an_answer() {
+        let ns = unique_namespace_dir("stop-no-answer");
+        write_bogus_lease(&ns);
+        let outcome = stop_in(&ns);
+        assert_eq!(
+            outcome.0, "UNKNOWN",
+            "拿不到应答不是\"停成功了\"：{}",
+            outcome.1
+        );
+        assert!(
+            outcome.2.iter().all(|(k, _)| k != "sessions_after_stop"),
+            "daemon 没应答却报 sessions_after_stop=0 就是把无法证明折算成证明没有：{:?}",
+            outcome.2.iter().map(|(k, _)| k).collect::<Vec<_>>()
+        );
+        // 只有"被拒"才够格清掉残留租约（让下次 start 能重新占位），且不 kill 无法验证的 pid。
+        assert!(!lease_path(&ns).exists());
         let _ = std::fs::remove_dir_all(&ns);
     }
 

@@ -829,6 +829,13 @@ impl CodeIntelligenceProvider for RustAnalyzerProvider {
 }
 
 impl RustAnalyzerProvider {
+    /// 关闭会话并把"provider 子进程是否真的退出"交回调用方（daemon 的 `sessions_after_stop`
+    /// 靠它取观测值，而不是写常量）。`None` = 本来就没有会话（没得可关，也不算"活着"）。
+    pub fn close_with_report(&mut self) -> Option<bool> {
+        let session = self.session.take()?;
+        Some(session.shutdown_and_report_reaped())
+    }
+
     /// 把缓冲里的 publishDiagnostics 通知吸进 provider。
     fn pump_published(&mut self) {
         if let Some(session) = self.session.as_mut() {

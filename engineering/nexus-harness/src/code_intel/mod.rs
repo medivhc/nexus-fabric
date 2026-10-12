@@ -246,7 +246,8 @@ pub fn run_with_session(args: &[String], session: &mut Option<ProviderSession>) 
     if let Some(lease) = daemon::read_lease(&namespace) {
         let (alive, pong, reason) = daemon::probe(&lease);
         daemon_state.detected = alive;
-        daemon_state.stale_lease = !alive;
+        // 与 `stop`/`route` 同一判据：被拒才算残留，没答上只是繁忙（负载宿主上超时不是"死了"）。
+        daemon_state.stale_lease = !alive && reason.contains("CONNECTION_REFUSED");
         if !alive {
             daemon_state.unavailable = Some(reason);
         }

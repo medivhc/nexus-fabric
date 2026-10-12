@@ -377,7 +377,9 @@ nexus-harness code <verb> ──(daemon 在跑且握手成功)──▶ daemon(1
   它只接受 `start` 自己写出的参数，未知参数同样 `BLOCKED`。之所以在这里声明而不是让它悄悄存在：
   一个未声明的子命令既过不了"命令面即 Public API"的口径，也不该被场景当作可用能力来钉。
   `stop` 对不存在的 daemon 报 `UNKNOWN` + 原因（不假装停成功）；所有退出路径回收 provider，
-  `selftest` 断言 `sessions_after_stop=0`。空闲到点自行退出并删租约。
+  `selftest` 断言 `sessions_after_stop=0` —— **该值是观测而不是常量**：daemon 回收每个会话后
+  用子进程的 `try_wait` 问操作系统"退了没有"，CLI 侧拿不到应答时报 `-1`（独立 Review round 1
+  的 B-1：写死 0 时，关闭逻辑退化不会让任何探针变红）。空闲到点自行退出并删租约。
 - `code` / `context` 支持 **`--no-daemon`** 与 **`--no-cache`**：前者完全不问 daemon
   （`daemon.running=false` 且 `session_source` 只会是 `"in-process"` 或 `"cache"`，绝不会是
     `"daemon"` —— 给 CI 一个不受"环境里是否有人手起过 daemon"影响的确定口径），
@@ -520,7 +522,7 @@ nexus-harness code <verb> ──(daemon 在跑且握手成功)──▶ daemon(1
   idle_self_exit_observed              true         --idle-secs 注入后到点自行退出
   lease_removed_on_idle                true          自退出也删自己写的租约
   stop_absent_verdict                  "UNKNOWN"     stop 一个不存在的 daemon ⇒ 不是 PASS 也不是 FAIL
-  sessions_after_stop                  0             stop 后 daemon 侧会话数为 0（无孤儿 RA）
+  sessions_after_stop                  0             stop 后仍活着的 provider 数（观测值，见「生命周期」）
   lru_provider_sessions_at_capacity    1            --max-workspaces 1 下查两个 workspace，会话数仍是 1
   cache_second_run_tier                "disk"        结果层必须**真的命中过**（同指纹二次相同查询）
   cache_default_enabled                true          默认路径 cache.disabled=false
@@ -703,14 +705,16 @@ round 2 的教训就是"待办只写在提交说明里，下一轮没有承载�
 
 - 真实执行：workspace-tests / product-scenarios / regression / architecture-policy / dependency-governance（cargo-deny 0.20：`cargo deny --config policies/deny.toml check advisories licenses bans sources`，缺失则 UNKNOWN）/ coverage-summary（cargo-llvm-cov）/ platform-checks（portable-core 平台依赖静态扫描）/ feature-matrix（每成员 `--no-default-features` + `--all-features`）/ portable-core（`cargo check --target wasm32-wasip1`）。
 - 条件执行（无内容/无工具时 UNKNOWN）：integration（成员 tests/*.rs 存在时逐个运行）/ selected-fuzz（cargo-fuzz + fuzz targets）/ selected-concurrency（tests/concurrency 有测试时运行）/ performance-budgets（quality.toml `[performance]` 定义 baseline+blocking 后判定）。
-- 单元测试：`cargo test -p nexus-harness`（Windows/1.95.0 上 daemon/缓存实现落地后**实测 149 个 =
-  146 passed + 3 failed（串行）**；并行跑同一集会多红 2 条 —— `144 + 5`，那 2 条是 master 自带的
-  管道测试在负载宿主上不稳定（见 `.agents/green-evidence-code-intelligence.txt` §S），不是本区间
-  引入的，也没有被削弱。新增的 12 条 = `cache.rs` 6 + `daemon.rs` 6，数目与预期精确对上。
+- 单元测试：`cargo test -p nexus-harness`（Windows/1.95.0 上 daemon/缓存实现落地后**实测 150 个 =
+  147 passed + 3 failed（共 150 个）**；并行跑同一集会多红 2 条（`145 + 5` 那一档），那 2 条是
+  master 自带的管道测试在负载宿主上不稳定（见 `.agents/green-evidence-code-intelligence.txt` §S），
+  不是本区间引入的，也没有被削弱。新增的 13 条 = `cache.rs` 6 + `daemon.rs` 7
+  （B-1 整改补了 `stop_does_not_claim_zero_without_an_answer`）。
   Linux 只多 1 条 —— 差额是 `#[cfg(unix)]` 的真实符号链接越界回归在该宿主才编译；
   xc-pc-linux/1.98.1 在 rev `bdf2f767` **实测 138 passed / 0 failed**（§Q，不是从 Windows 推的），
-  本 rev 在该宿主的对应值应是 149 + 1 = 150，**待 §R 实测后才改口，这里不预填**。
-  **117/116 与"137 = 134+3"都只是历史声明而不是当前值**：本区间把测试数从 117 推到 137 再推到 149，
+  在 `0a42240` **实测 150 passed / 0 failed**（§R，当时 Windows 是 149）⇒ 差值 1 与口径吻合；
+  B-1 之后 Windows 变 150，**Linux 的对应值待 §U 复跑实测**，这里不预填。
+  **117/116 与"137 = 134+3"都只是历史声明而不是当前值**：本区间把测试数从 117 推到 137 再推到 150，
   每一次都有人没同步这行（N2/N-A4 抓过一次，本轮再次自纠并在此留痕）。
   `scenario::tests::run_single_*`/`run_parallel_*` 在本宿主假红，见 DEVELOPMENT.md §11.1；
   覆盖 scenario 求值、evidence 新鲜度/STALE、digest 确定性与锁竞争判定、containment 的归一化比较

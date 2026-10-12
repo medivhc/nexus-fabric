@@ -61,7 +61,7 @@
 | `.agents/red-evidence-mcp-round2.txt` | Red Evidence record（MCP stdout 通道泄漏、PASS 分支不可探针、`--provider-binary` 静默丢弃的修前实测） |
 | `.agents/provider-daemon-and-result-cache-plan.md` | Provider daemon 与结果缓存的设计与实施计划（授权范围、生命周期护栏、两层缓存定义、验收判据） |
 | `.agents/red-evidence-daemon.txt` | Red Evidence record（daemon 命令面与缓存字段实现前的四条红灯，含 evidence_id） |
-| `scenarios/engineering/code_intelligence_daemon_lifecycle.toml` | E4：daemon 显式生命周期与跨命令复用（selftest 13 探针、probe_count 钉死） |
+| `scenarios/engineering/code_intelligence_daemon_lifecycle.toml` | E4：daemon 显式生命周期与跨命令复用（逐条钉 selftest 的 23 枚字段值 + probe_count=23） |
 | `scenarios/engineering/code_intelligence_daemon_explicit_only.toml` | E4：`--no-daemon` 下 session_source=in-process，证明 CLI 不自动拉起 daemon |
 | `scenarios/engineering/code_intelligence_cache_disabled.toml` | E4：`--no-cache` 下 cache.disabled=true 且 tier=miss，键绑定仍可见 |
 | `scenarios/engineering/code_intelligence_daemon_command_surface.toml` | E4：daemon 未知子命令 BLOCKED，且 declined 输出仍带 authority 与 daemon.running |

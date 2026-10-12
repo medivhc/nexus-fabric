@@ -595,7 +595,18 @@ impl LspSession {
     }
 
     /// 有序关闭：shutdown 请求 -> exit 通知 -> 有限等待 -> kill。
-    pub fn shutdown(mut self) {
+    pub fn shutdown(self) {
+        let _ = self.shutdown_and_report_reaped();
+    }
+
+    /// `shutdown` 的**观测版**：同一套回收逻辑，额外把"这个子进程到底有没有退出"交回调用方。
+    ///
+    /// 为什么要这个返回值：`daemon` 的 `sessions_after_stop` 之前是写死的 0，
+    /// 独立评审 round 1 判为阻塞（常量不可证伪 —— 若关闭逻辑退化成不 kill/不等待，
+    /// 探针与场景仍双双照绿）。只有操作系统给出"已退出"的证据才算 0；
+    /// 问不到（`Err`）一律算没退出，与 `dirty_after_lifecycle` 的"不把无法证明
+    /// 折算成证明没有"同一口径。
+    pub fn shutdown_and_report_reaped(mut self) -> bool {
         let _ = self.request("shutdown", Value::Null, Duration::from_secs(5));
         let _ = self.notify("exit", Value::Null);
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -621,9 +632,16 @@ impl LspSession {
             }
             break;
         }
+        // kill 之后再问一次：Windows 上被 kill 的进程句柄会很快转为已退出，
+        // Unix 上 try_wait 会顺手收掉僵尸。仍问不到就如实报"没退出"。
+        let reaped = match &mut self.child {
+            Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+            None => true,
+        };
         if let Some(handle) = self.reader.take() {
             let _ = handle.join();
         }
+        reaped
     }
 }
 

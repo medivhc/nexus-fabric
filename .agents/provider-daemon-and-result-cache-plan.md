@@ -1,5 +1,17 @@
 # Provider Daemon 与结果缓存 —— 设计与实施计划（所有者 2026-10-12 授权）
 
+> **本文件是设计期的历史文档，不是契约。** 与 `engineering/nexus-harness/MODULE.md`
+> 「Provider Daemon & Result Cache」冲突时**一律以 MODULE.md 为准**。四处已被后续裁决取代：
+> ① § 里"缓存不得包含源码原文"（下文 69 行）被盲评 round 4 撤掉 —— 真前提是 `snippet`
+> 在白名单外**所有** verb 的条目上都可能出现，排除个别 verb 兑现不了它；安全来源改为
+> **摘要键 + 查询前后各取一次 digest + 只落按用户隔离的 temp**（MODULE.md「命中形状」②③）。
+> ② `cache.tier` 的 `"memory"` 值（下文 82 行）已删：会话内重复由 `provider.session_reused`
+> 表达，两个观测点不得互相冒充。
+> ③ 设计期的 selftest 清单是 30/32 项，现冻结为 **23** 项，撤下项的承载体是 MODULE.md
+> 正文里的「点名单测」名单（9 枚），不是清单里的探针。
+> ④ "复制夹具成 temp scratch workspace" 已被否决（冻结的作用域不变量要求 `--workspace`
+> 归一化后仍在仓库内），selftest 改为对仓库内夹具**只读不写**、命名空间每次运行唯一。
+
 ## 0. 授权范围与触发证据
 
 所有者 2026-10-12 决定实现三件事：**跨进程/跨命令会话复用（daemon）**、**结果缓存（digest 键控，落盘在仓库外）**、
