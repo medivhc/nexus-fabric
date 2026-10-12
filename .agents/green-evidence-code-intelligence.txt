@@ -858,3 +858,55 @@ Windows 的 `ef1a950b…`/`de50c865…` 来自含未提交改动的**脏**工作
 仍未验证（诚实边界）：第三方 MCP 客户端互操作；`verify --full` 对本 rev 无结论（余量不足）；
 结果缓存的收益只用"命中/冷跑"两组时延作**旁证**，不写进任何判据；
 daemon 场景在 Windows 上"等 EOF 的管道消费会挂住"这条已按已知效应写进契约，未修。
+
+================================================================================
+§U B-1 整改后的双宿主复跑 + 三处对 §R/§T 的公开更正（2026-10-13）
+================================================================================
+
+独立 Review round 1 判 CHANGES_REQUESTED，阻塞 1 条（B-1：sessions_after_stop 来自常量而非观测），
+整改在 rev f1575b5d。案卷 .evidence/review-qoder-independent-daemon-r1/（model=unbound）。
+
+Windows 冒烟（SH-YF-CX-PC，rustc 1.95.0，干净树）：
+
+    fmt --check 0 字节 / clippy --all-targets -D warnings 无输出 / cargo test 150 = 147+3
+    daemon selftest                     PASS 23/23  122239ms  red 0
+      dirty_after_lifecycle=0   sessions_after_stop=0（现在是观测值）
+    daemon start → 真查询 → stop         sessions_before_stop=1, sessions_after_stop=0, stop PASS
+    受 B-1 改动波及的 7 条场景重跑       全 PASS：
+      daemon-command-surface 207ms / daemon-unknown-flag 205ms / daemon-explicit-only 17994ms /
+      cache-disabled 18096ms / mcp-handshake 1312ms / mcp-real-query 20018ms / symbol 17780ms
+    lifecycle 单独一条：PASS，29 条期望全成立，scenario-9615b3a3db79，122104ms
+
+xc-pc-linux 结论级（rustc/clippy/rust-analyzer 1.98.1，rev f1575b5d，dirty=false）：
+
+    cargo test 串行 151 passed / 0 failed；并行同样 151/0 ⇒ 与 Windows 差 1 条 cfg(unix)
+    fmt 0 字节；clippy 0 字节
+    B-1 观测：start PASS → query PASS(source=daemon, 16035ms) → stop PASS，
+              reply {"sessions_before_stop":1,"sessions_after_stop":0}
+    daemon selftest 两轮 PASS 23/23（104146ms / 103018ms），red 0
+    26 条 code_intelligence_* 26/26 PASS（含 daemon-lifecycle 与两条 mcp）
+    verify --fast：9/9 门 PASS，无 UNKNOWN，Evidence 9221774f1958，
+              contract f8c85522d7ad3b46b65fb5630e22f763339d29bc（与 §R 同值 ⇒ 契约集未变，符合预期），
+              tree fc5249ce0c06e9ff630f1d07a0cc072073a8fa8f
+    收尾：daemon serve 残留 0、rust-analyzer 残留 0、git status --porcelain 0 行
+
+三处更正（我自己写错的记录，按"旧实测错了要公开更正"的规矩原样列出）：
+
+1. §R 把 Linux 那批假红归因给"PATH 上的 cargo install 旧版"，机制说错了。
+   scenario.rs 会把命令里的 nexus-harness 替换成 std::env::current_exe()，所以真正的来源是
+   "哪个二进制在跑 scenario run"：我执行的路径当时是旧构建，子进程就跟着是旧的，与 PATH 无关
+   （Windows 侧 PATH 上根本没有 nexus-harness）。结论不变（那批不作数、修法仍是冻结副本 +
+   核 md5/mtime），但机制要说对，否则下一个人会去查 PATH 而不是查被执行的二进制。
+2. §T 的"26/26 PASS"与"夹具冷启动 15–40s"缺宿主暖度前提。同一份代码本机 selftest 时长实测
+   121–331s（2.7 倍差），round 1 评审者在负载下复跑还看到 3 条场景 FAIL 与一次 220.8s 的
+   TIMEOUT/ready=false（与并行的 verify --fast 抢 CPU/磁盘很可能相关）。
+   ⇒ 冷启动时延一律只作旁证；E4 结论要注明当时有无并发构建/门禁在跑（§S 那条的延伸）。
+3. dirty_after_lifecycle 的差集判据在 B-1 复测里第一次就跑红了，报
+   新增：[" M .agents/provider-daemon-and-result-cache-plan.md"] —— 是我在 121s 探针窗口里改了
+   工作树，不是 daemon 写的。判据行为正确（"相对开始前有变更"为真），但暴露它**无法区分谁改的**：
+   任何并发编辑都会被算到生命周期头上。已在干净树复测取到 0，并把"跑 daemon selftest 期间
+   不得编辑工作树、也不得并发跑 git 写操作"并入 §S 的并发规矩。
+
+未验证边界不变（第三方 MCP 客户端互操作、本 rev 的 verify --full、多语言 provider）；
+新增一条：daemon 在负载宿主上的"connect 超时 vs 被拒"分类虽已按 ConnectionRefused 收紧，
+但 OPEN-1 的完整复现（活 daemon 被误判为残留）我**没有**再造出来一次，只做了机理修正。

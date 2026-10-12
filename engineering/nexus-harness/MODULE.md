@@ -713,7 +713,8 @@ round 2 的教训就是"待办只写在提交说明里，下一轮没有承载�
   Linux 只多 1 条 —— 差额是 `#[cfg(unix)]` 的真实符号链接越界回归在该宿主才编译；
   xc-pc-linux/1.98.1 在 rev `bdf2f767` **实测 138 passed / 0 failed**（§Q，不是从 Windows 推的），
   在 `0a42240` **实测 150 passed / 0 failed**（§R，当时 Windows 是 149）⇒ 差值 1 与口径吻合；
-  B-1 之后 Windows 变 150，**Linux 的对应值待 §U 复跑实测**，这里不预填。
+  B-1 之后 Windows 变 150、**Linux §U 实测 151 passed / 0 failed**（rev f1575b5d，串并与行一致，
+  差值仍是那 1 条 #[cfg(unix)] 回归）。
   **117/116 与"137 = 134+3"都只是历史声明而不是当前值**：本区间把测试数从 117 推到 137 再推到 150，
   每一次都有人没同步这行（N2/N-A4 抓过一次，本轮再次自纠并在此留痕）。
   `scenario::tests::run_single_*`/`run_parallel_*` 在本宿主假红，见 DEVELOPMENT.md §11.1；
