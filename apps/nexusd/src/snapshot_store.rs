@@ -35,6 +35,15 @@ pub struct SnapshotGcReport {
 }
 
 impl FileSnapshotStore {
+    /// Caller already owns the original acceptance lease. No open/initialize,
+    /// directory sync, root publication or GC is performed by this validation.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn validate_existing_roots(
+        root: &Path,
+        ledger: &nexus_compute::task::AcceptanceLedger,
+    ) -> Result<(), TaskError> {
+        linux::validate_roots_readonly(root, ledger)
+    }
     /// `root` is the same private root used for Task acceptance.
     pub fn open(root: &Path) -> Result<Self, TaskError> {
         #[cfg(target_os = "linux")]
@@ -318,18 +327,24 @@ mod linux {
     }
     pub(super) struct Content {
         dir: PathBuf,
+        readonly: bool,
     }
     impl Content {
         pub(super) fn open(root: &Path) -> Result<Self, TaskError> {
             Ok(Self {
                 dir: content_dir(root)?,
+                readonly: false,
             })
         }
         fn path(&self, digest: &Sha256Digest) -> PathBuf {
             self.dir.join(&digest.as_str()[7..])
         }
         fn read(&self, digest: &Sha256Digest) -> Result<Vec<u8>, TaskError> {
-            let bytes = regular_read(&self.path(digest))?;
+            let bytes = if self.readonly {
+                crate::artifact_fs::read(&self.path(digest), crate::artifact_fs::MAX_BYTES)?
+            } else {
+                regular_read(&self.path(digest))?
+            };
             verify_content(digest, bytes.len() as u64, &bytes, sha256)?;
             Ok(bytes)
         }
@@ -568,6 +583,38 @@ mod linux {
             roots.extend(frozen.files.into_iter().map(|f| f.sha256));
         }
         Ok(roots)
+    }
+    /// Validation uses an already-existing content namespace. It must never
+    /// create the missing namespace as the writable Content::open does.
+    pub(super) fn validate_roots_readonly(
+        root: &Path,
+        ledger: &AcceptanceLedger,
+    ) -> Result<(), TaskError> {
+        let catalog = load_catalog(root)?;
+        let dir = root.join("content-sha256-v1");
+        crate::artifact_fs::check_directory(&dir)?;
+        let content = Content {
+            dir,
+            readonly: true,
+        };
+        for snapshot in catalog
+            .staged
+            .iter()
+            .chain(&catalog.retained)
+            .chain(ledger.tasks.iter().map(|task| &task.input_pin_intent))
+        {
+            snapshot.verify_digest(sha256)?;
+            let files = Vec::<SnapshotFile>::from_value(parse_canonical_json(
+                &content.read(&snapshot.manifest_sha256)?,
+            )?)?;
+            let frozen = FrozenSnapshot {
+                reference: snapshot.clone(),
+                files,
+            };
+            frozen.validate(sha256)?;
+            frozen.verify_inputs(&content, sha256, ".")?;
+        }
+        Ok(())
     }
     pub(super) fn prepare(
         root: &Path,

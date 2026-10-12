@@ -224,6 +224,28 @@ pub(crate) struct CapacityImage {
 }
 codec!(CapacityImage {schema_version:u64,policy:ProviderCapacityPolicy,policy_digest:Sha256Digest,epoch:u64,ready:bool,owner:Option<OwnerBinding>,reservations:Vec<Reservation>});
 impl CapacityImage {
+    /// Validate immutable managed-init facts without acquiring a live owner or
+    /// publishing an epoch. The ledger validator remains the reservation owner.
+    pub(crate) fn verify_init_binding(
+        &self,
+        policy_digest: &str,
+        owner: (u64, u64),
+        fresh: bool,
+    ) -> Result<(), TaskError> {
+        let binding = self
+            .owner
+            .as_ref()
+            .ok_or_else(|| corrupt("capacity owner binding missing"))?;
+        if self.policy_digest.as_str() != policy_digest
+            || (binding.device, binding.inode) != owner
+            || (fresh && (self.epoch != 0 || self.ready || !self.reservations.is_empty()))
+        {
+            return Err(corrupt(
+                "managed initialization differs from original capacity authority",
+            ));
+        }
+        Ok(())
+    }
     pub(crate) fn validate(&self, ledger: &AcceptanceLedger) -> Result<(), TaskError> {
         let check = || {
             self.policy.validate()?;

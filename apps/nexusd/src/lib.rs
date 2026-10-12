@@ -48,3 +48,7 @@ pub mod task_capacity;
 mod task_capacity_recovery;
 #[cfg(target_os = "linux")]
 mod task_sessions;
+
+/// Local operator initialization; no Task protocol operation invokes it.
+#[cfg(target_os = "linux")]
+pub mod task_provider_init;
