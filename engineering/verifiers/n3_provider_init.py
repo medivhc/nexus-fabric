@@ -41,6 +41,18 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def encode_kv_key(key):
+    """FileKvStore address: safe ASCII bytes verbatim, others uppercase %XX."""
+    raw = key.encode('utf-8')
+    if not raw or len(raw) > 256 or raw.startswith(b'.'):
+        raise ValueError('invalid FileKvStore key')
+    safe = b'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-'
+    return ''.join(chr(byte) if byte in safe else f'%{byte:02X}' for byte in raw)
+
+
+IDENTITY_FILE = 'n2/' + encode_kv_key('n2/auth-identity')
+
+
 def tree(root):
     """Compare names, inode bindings, permissions and bytes; omit mutable atime."""
     result = {}
@@ -176,7 +188,7 @@ def observe():
             return {'verdict': 'FAIL', **facts, 'reason':
                     'formal init rejected or failed (old CLI usage exit 2 is RED)',
                     'observations': observations}
-        identity = json.loads((root / 'n2/auth-identity').read_text())
+        identity = json.loads((root / IDENTITY_FILE).read_text())
         principal = 'ed25519:' + sha(bytes.fromhex(identity['public_key_hex']))[:32]
         authority = root / 'data/n3/tasks'
         image = json.loads((authority / 'acceptance-v1.json').read_text())
@@ -224,7 +236,7 @@ def observe():
             live = tree(root)
             capacity = json.loads((authority / 'acceptance-v1.json').read_text())['capacity']
             facts['daemon_task_service_available'] &= (
-                live['n2/auth-identity'] == before['n2/auth-identity']
+                live[IDENTITY_FILE] == before[IDENTITY_FILE]
                 and capacity['ready'] is True and capacity['epoch'] > 0)
             repeated = invoke(root, 'init', 'live_duplicate')
             facts['postboot_init_preserved'] = (passed(repeated, 'init')
@@ -254,7 +266,7 @@ def observe():
             denied(scope_denied) and denied(workspace_denied)
             and denied(policy_denied) and tree(root) == after_boot)
         loss_ok, boot_ok = True, True
-        faults = [('n2/auth-identity',), (MARKER,), (RECEIPT,),
+        faults = [(IDENTITY_FILE,), (MARKER,), (RECEIPT,),
                   ('data/n3/tasks/acceptance-v1.json',),
                   ('data/n3/tasks/capacity-initialized-v1',),
                   (MARKER, RECEIPT, INIT_LOCK), ('corrupt-completion',)]
