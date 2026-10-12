@@ -211,3 +211,62 @@ verdict 仍 `CHANGES_REQUESTED`，4 条阻塞，且明确指出 r2 那 4 条只 
 需要留给下一轮看的一句话：本轮的 5 处修改里有 3 处是**减法**（撤场景、撤清单项、撤 scratch 规则）。
 如果盲评继续以"契约还能钉更多"为标准，就会推向过度规定；因此 r4 的判据应是
 "每条对外承诺是否 (a) 有可证伪承载体、(b) 不与既有冻结约束矛盾"，而不是断言条数。
+
+## 第五轮：盲评止于 r4（所有者裁决）+ 契约句子级修补后的红灯复测
+
+盲评 round 4 判 CHANGES_REQUESTED，但**范围已经很窄**：r3 的 5 处矛盾全部 RESOLVED，
+无假绿通道，只剩 3 处契约句子级问题。案卷
+`.evidence/test-review-branch-feature-code-intel-phase-234-2026-10-12-r4/`。
+**所有者 2026-10-12 裁决：按 AGENTS.md 的 3 轮上限止评，不再派 round 5，直接进入实现。**
+因此本轮修改**没有第 5 轮独立复核背书** —— 这句要原样留在案卷里，别让"改了"读成"被确认了"。
+
+r4 的 3 处阻塞 + 6 条前置条件逐项落点（全部是散文/清单级，实现零改动）：
+1. `:393-395`/`:398-400` 现在时宣称"由 selftest 探针 `absent_fields_when_not_running`/
+   `unavailable_reason_present` 机器钉住"，而两名已不在 23 枚清单 ⇒ 发探针机器红、不发散文为假。
+   改法＝按它的建议把承载体改指**契约内新增的「点名单测」清单**（本节上方场景注释里已点名，
+   现在正文也有名字了）。
+2. `:614-616` Verification 仍声称 lifecycle 覆盖"digest 变更 / 缓存有界且不含源码 / 线协议白名单"
+   三项 ⇒ 改写为"三项不在场景里，由点名单测承载"，并把四项逐名列出。
+3. `:409-410` 回放清单用了 DTO 词表之外的同义词（name/container/location/uri），且没覆盖
+   冻结场景在**可缓存 verb** 上钉值的 `results.0.range`、`results.0/1.qualified_name`、
+   `provider.ready` ⇒ 改用本文件词表逐名重写，并明确 `provider.kind/binary/version/ready`
+   **随条目回放**（命中路径不许要求重新解析 language server）。
+
+顺带按 r4 备注 1 撤掉我自己在 ③ 造的一条假前提：它指出 `snippet` 不只出现在 hover/diagnostics
+（`rust_analyzer.rs` 各 verb 都走 `snippet_of`），所以"排除这两个 verb 就能保证缓存不含源码"
+站不住。**裁决：撤销"缓存不得含源码原文"这条自设禁令**，安全来源改为摘要键 + 查询前后 digest
+检查 + 只落在按用户隔离的 temp 命名空间（与 token 一节同一口径）。连带改动三处：
+可缓存性条件补 `verdict=="PASS" && provider.ready==true` 门（否则 BLOCKED/`ready=false` 被回放，
+冻结的 `verdict` pin 会变红）、`snippet` 命中时按条目逐字回放（既不置空也不按 range 重切）、
+单测改名 `cache_payload_has_no_source_text` ⇒ `cache_stores_only_result_fields`。
+Side Effects ③ 的"不含源码原文"同步为"载荷只含查询结果字段"。
+
+前置条件销项：① `daemon.running` 从散文升为规范条目（两条场景钉它）；② `wire_refuses_non_whitelist`
+进点名单测清单（不再只活在提交说明里）；③ `failed_step` 词表补 `harness`（`scenario.rs:667` 真实值，
+我上一轮漏了）；④ 场景注释删旧 scratch 口径、`plan` §8 作废 `reuse_queries_total`；⑤ 命中时 snippet
+取值择一写明（逐字回放）；⑥ selftest 总时长入 600s 预算与跨宿主差异**必须等实现落地才能实测**，
+现登记为待办，不在这里宣称。
+
+勘误（§R1 原文保留，不改写历史）：那一段末句说"失败签名会移到 `probes_all_ok`/`cross_process_reuse`
+等字段" —— 这两个名字属于当时的 32 项草稿，现已不存在。以第五轮的实际签名为准。
+
+第五轮红灯（Windows `SH-YF-CX-PC`，rustc 1.95.0，实现零改动；5 条全在 `failed_step="expect"`，
+无 lookup 伪红；"pre-green"是该条 envelope 里**已经成立**的期望数，用来证明红在应红的地方）：
+
+    daemon-lifecycle        FAIL  expect  verdict        scenario-07c0f17ee68d  4687ms  2/29
+    daemon-explicit-only    FAIL  expect  verdict        scenario-85fd758d0928  1278ms  5/10
+    cache-disabled          FAIL  expect  verdict        scenario-810f321e3908   307ms  5/9
+    daemon-command-surface  FAIL  expect  daemon.running scenario-ec08e3ef5c2d   115ms  4/6
+    daemon-unknown-flag     FAIL  expect  daemon.running scenario-fb6fd7182a0f   105ms  4/6
+
+lifecycle 的首条失败仍是 `verdict`，actual 是兜底 envelope
+`{"command":"daemon","message":"supported commands: status, context, check, test, verify,
+explain, bench, replay, scenario, code","verdict":"BLOCKED"}` —— 这条顺带暴露一个**新问题**：
+兜底命令清单里没有 `mcp`（Phase 3 加的），而契约要求它含 `daemon`。实现时一起补，
+`commands_surface_lists_daemon` 那枚探针正好覆盖它；`mcp` 缺席属同一类漂移，登记为待办。
+
+自证一致性（本轮复算）：契约清单 **23** 枚 == `probe_count = 23` == lifecycle 场景同名期望；
+点名单测 **9** 枚（新增 `wire_refuses_non_whitelist`）；`code_intelligence_*` 落盘 26 个；
+`FILE_MANIFEST` 声明 193 == 表内 193 行（`cache.rs`/`daemon.rs` 待实现提交时登记）。
+Windows 契约号 **`de50c86566e702bddeaa041d72f97767b2696988`**（`status --json` 实读，工作树含本轮
+契约改动 ⇒ `dirty=true`）；Linux 侧同一内容会算出不同值（CRLF），照旧只与同宿主历史对账。

@@ -105,8 +105,9 @@ SCIP/repository-wide 落盘索引、多机或远程 daemon、非回环绑定、T
 
 - 两个**不同进程**各跑一次 `code symbol`：第二条 `session_source="daemon"`、
   `status.provider_sessions=1`（不是 2），且 `daemon selftest` 的
-  `second_process_session_source="daemon"` + `reuse_queries_total=2` + `reuse_provider_sessions=1`
-  三枚值断言（旧稿写的 `reuse_probe=true` 是不存在的名字，盲评 round 2 抓到这处第三漂移，已改）。
+  `second_process_session_source="daemon"` + `reuse_provider_sessions=1` 两枚值断言
+  （旧稿写的 `reuse_probe=true` 是不存在的名字，盲评 round 2 抓到这处第三漂移，已改；
+  `reuse_queries_total=2` 随 9 项撤下一并作废，盲评 round 4 前置条件 4 要求同步）。
 - `daemon stop` 之后 `status.running=false` 且 `selftest` 报 `sessions_after_stop=0`。
 - 未 start 时查询仍 `PASS`/照常失败，`session_source="in-process"` —— 证明没被自动拉起。
 - digest 不一致 ⇒ `cache.tier="miss"` 且绝不说成 `disk`；`key_digest` 恒等于当次

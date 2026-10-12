@@ -10,15 +10,19 @@ requirement = "engineering/nexus-harness/MODULE.md#provider-daemon--result-cache
 # 期望值逐条镜像 MODULE.md 的字段清单：契约改名/改值而实现与场景没跟上，这里就红。
 # 探针语义（每个 true 具体断言什么）也写在契约里，不是由实现自己解释。
 # 必须显式 --workspace：契约规定 selftest 没有缺省作用域，缺省即环境依赖。
-# 独立性与隔离：selftest 用自己的租约/缓存命名空间与 temp scratch workspace，
-# 因此既不碰开发者真实在跑的 daemon，也不在仓库工作树里造文件（dirty_after_lifecycle=0 钉这条）。
+# 独立性与隔离：selftest 用**自己那份每次运行唯一的**租约/缓存命名空间，作用域是契约指定的
+# 仓库内夹具且**只读不写**（round 3 否决了"复制成 temp scratch 再操作"：`--workspace` 归一化后
+# 必须仍在仓库内，仓库外副本让 verdict=PASS 永不可达；仓库内可写副本会造出运行期 dirty，并在
+# 默认并行调度下把别的 code_* 场景打成 SNAPSHOT_STALE）。因此既不碰开发者真实在跑的 daemon，
+# 也不在工作树里造文件（dirty_after_lifecycle=0 钉这条）。
 # 命名空间**每次运行唯一**：否则第二次跑会读到上一次的缓存条目，default_path_* 与
 # cache_second_run_tier 的含义就随运行次数漂移（契约「作用域与隔离」②）。
 # 本场景只钉"清单里 23 枚字段"，**其余同名性质改由点名单测承载**（求值器没有"字段缺席"算子，
 # 把自身输出形状塞进清单只会多出自证布尔）：daemon_decline_omits_absent_fields、
 # daemon_unavailable_carries_structured_reason、cache_key_misses_when_digest_differs、
-# cache_hit_restamps_run_metadata、cache_refuses_entries_beyond_cap、cache_payload_has_no_source_text、
-# session_reuse_key_rejects_changed_digest、daemon_selftest_field_list_matches_contract。
+# cache_hit_restamps_run_metadata、cache_refuses_entries_beyond_cap、cache_stores_only_result_fields、
+# session_reuse_key_rejects_changed_digest、wire_refuses_non_whitelist、
+# daemon_selftest_field_list_matches_contract。
 # 另两条硬性排除也在这里被兜住：mcp selftest --with-query 与 daemon selftest 强制不读不写缓存
 # （否则 Phase 4 复用判据可由回放满足）；selftest 对仓库内夹具只读不写（不复制成 temp scratch，
 # 那会撞冻结的 containment 不变量）。
