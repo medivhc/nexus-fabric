@@ -42,6 +42,12 @@ Nexus 的独立 Review 环节：自动化验证回答"代码对不对"，独立 
 - 有 `.evidence/test-review-<id>/` 且 Verdict=APPROVED 吗？
 - **没执行过测试用例评审的实现，直接判 CHANGES_REQUESTED，不审代码。**
 
+**适用边界（豁免）**：本门禁仅适用于按 `nexus-task` TDD 流程推进的功能/行为变更。以下类型豁免，无需测试用例评审证据：
+- 纯文档修改（不涉及代码行为）
+- 构建配置、CI 脚本变更
+- 依赖版本升级（无 API 行为变化）
+- 纯重构（无行为变更，有回归测试覆盖即可）
+
 ### 1. 契约一致性（contract-consistency）
 
 - 实现是否严格遵循对应 `crates/<crate>/MODULE.md` 的 Invariants 和边界？
