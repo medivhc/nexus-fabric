@@ -474,7 +474,10 @@ fn serve_http(
                 tls,
                 "application/x-pem-file",
                 shared.cert_pem.as_bytes(),
-                &[("Content-Disposition", "attachment; filename=\"nexus-ca.crt\"")],
+                &[(
+                    "Content-Disposition",
+                    "attachment; filename=\"nexus-ca.crt\"",
+                )],
             )
             .map_err(GatewayError::Io)?;
         }
@@ -1549,9 +1552,18 @@ fn create_session(
     let udp_addr = shared.udp.local_addr().map_err(GatewayError::Io)?;
     let udp_port = udp_addr.port();
     // Advertise all non-loopback interface addresses as host candidates so
-    // ICE can try each path (multi-homed hosts, mesh + LAN, etc.). The UDP
-    // socket is bound to the selected IP, but candidates cover all interfaces.
-    let mut added = 0;
+    // ICE can try each path (multi-homed hosts, mesh + LAN, etc.), then
+    // ALWAYS add the address the shared UDP socket is actually bound to.
+    //
+    // On Linux a socket bound to a concrete IP only receives datagrams sent
+    // to that IP: advertising other interfaces' addresses without the bound
+    // one produced unreachable candidates (observed with a loopback-bound
+    // gateway on a host that also has eth0: the answer listed only the eth0
+    // candidate and ICE never connected). The bound address is therefore
+    // mandatory, not a fallback used only when enumeration found nothing
+    // (review H1). `advertised` dedupes it against the enumerated set.
+    let mut advertised: std::collections::HashSet<std::net::SocketAddr> =
+        std::collections::HashSet::new();
     if let Ok(interfaces) = getifaddrs::getifaddrs() {
         for iface in interfaces {
             if iface.flags.contains(getifaddrs::InterfaceFlags::LOOPBACK) {
@@ -1571,15 +1583,16 @@ fn create_session(
                     continue;
                 }
                 let cand_addr = std::net::SocketAddr::new(ip, udp_port);
-                if let Ok(candidate) = Candidate::host(cand_addr, "udp") {
-                    rtc.add_local_candidate(candidate);
-                    added += 1;
+                if advertised.insert(cand_addr) {
+                    if let Ok(candidate) = Candidate::host(cand_addr, "udp") {
+                        rtc.add_local_candidate(candidate);
+                    }
                 }
             }
         }
     }
-    // Fallback: if no interface candidates were added, use the bound address
-    if added == 0 {
+    // Mandatory reachable candidate: the socket's own bound address.
+    if advertised.insert(udp_addr) {
         let candidate = Candidate::host(udp_addr, "udp")
             .map_err(|e| GatewayError::Rtc(format!("host candidate: {e}")))?;
         rtc.add_local_candidate(candidate);
