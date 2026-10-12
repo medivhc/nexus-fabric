@@ -371,15 +371,24 @@ nexus-harness code <verb> ──(daemon 在跑且握手成功)──▶ daemon(1
   **不多于** CLI 本来能做的事，因此拿到 token 不构成提权；token 的作用只是拒绝误连与
   让 `stop`/`status` 认对对象。Windows 上无法用 std 收紧 ACL，这一点不粉饰。
 - **生命周期**：`daemon start|stop|status|selftest [--workspace <root>] [--idle-secs N]
-  [--max-workspaces N]`，默认 `idle_secs=900`、`max_workspaces=2`（LRU 驱逐即关闭该会话的
-  RA 子进程）。`start` 幂等（已活着 ⇒ `PASS` + `already_running=true`，不起第二个）；
+  [--max-workspaces N] [--takeover]`，默认 `idle_secs=900`、`max_workspaces=2`（LRU 驱逐即关闭
+  该会话的 RA 子进程）。`start` 幂等（已活着 ⇒ `PASS` + `already_running=true`，不起第二个）；
+  **租约指向的 daemon 只是"没答话"而不是"被拒"时，`start` 报 `UNKNOWN` 且不覆盖租约**：没有
+  可移植手段区分"繁忙"与"已死"，而起第二个实例会留下两个监听者加一份被踩掉的租约（第一个就此
+  不可发现，正是 round 2 的 N-r2-2）。唯一允许清掉这种租约的路径是显式 **`--takeover`**，它仍然
+  **不去 kill 任何 pid**，只放弃旧租约、启新实例；那个进程是否真的还在由操作者自己确认。
+  这一枚 flag 的两面由单测 `takeover_flag_is_valueless_and_refused_on_serve_entry` 钉住：它是
+  **无值** flag（不得把后一个 token 当自己的值吞掉，那正是"参数被接受但不生效"的形状），且
+  `daemon serve` 内部入口**不接受**它（未知参数 ⇒ `BLOCKED`）。
   `start` 派生子进程用的入口是 **`daemon serve`（内部子命令，不面向 Agent、不进上方命令清单）**：
   它只接受 `start` 自己写出的参数，未知参数同样 `BLOCKED`。之所以在这里声明而不是让它悄悄存在：
   一个未声明的子命令既过不了"命令面即 Public API"的口径，也不该被场景当作可用能力来钉。
   `stop` 对不存在的 daemon 报 `UNKNOWN` + 原因（不假装停成功）；所有退出路径回收 provider，
   `selftest` 断言 `sessions_after_stop=0` —— **该值是观测而不是常量**：daemon 回收每个会话后
-  用子进程的 `try_wait` 问操作系统"退了没有"，CLI 侧拿不到应答时报 `-1`（独立 Review round 1
-  的 B-1：写死 0 时，关闭逻辑退化不会让任何探针变红）。空闲到点自行退出并删租约。
+  用子进程的 `try_wait` 问操作系统"退了没有"（独立 Review round 1 的 B-1：写死 0 时，关闭逻辑
+  退化不会让任何探针变红）。取值分两支，**两支都不许出现 0 的兜底**：① 连上了但没拿到应答
+  （或应答里没有这个量）⇒ `sessions_after_stop = -1` + `UNKNOWN`；② 根本没连上 ⇒ **不发这个字段**
+  + `UNKNOWN`（这里发 0 与发 -1 都不是证据，缺席才是事实）。空闲到点自行退出并删租约。
 - `code` / `context` 支持 **`--no-daemon`** 与 **`--no-cache`**：前者完全不问 daemon
   （`daemon.running=false` 且 `session_source` 只会是 `"in-process"` 或 `"cache"`，绝不会是
     `"daemon"` —— 给 CI 一个不受"环境里是否有人手起过 daemon"影响的确定口径），
@@ -429,6 +438,12 @@ nexus-harness code <verb> ──(daemon 在跑且握手成功)──▶ daemon(1
   - `daemon_unavailable` 只在本想用 daemon 却失败时出现，并带结构化原因（此时查询照常完成，
     不得 hang 在超时上，也不得把回落说成 PASS 之外的任何结论）；"原因必非空"的承载体是点名单测
     `daemon_unavailable_carries_structured_reason`，**不是** selftest 清单里的某一枚探针。
+    "不得 hang 在超时上"同样要有承载体：**握手与探活走独立的短预算**，与单次查询的读预算分开
+    （一个"连得上但不答话"的僵住 daemon 若共用查询预算，会把 `start` 的轮询、`status` 与每次
+    `code` 的路由选择都拖成同一档长等待）。载体是单测
+    `silent_daemon_probe_returns_within_the_probe_budget`：夹具是一个 accept 之后永不回帧的
+    监听者，断言的是**返回时长**而不是文案，所以把两档预算合并回去的实现会先让它变红。
+    具体秒数是实现自保、**不是契约时限**（写进契约就是把宿主负载写进契约）。
   - 默认值：`idle_secs=900` 是契约默认；`max_workspaces=2` 只是**出厂调优值**，不作兼容承诺
     （改它不该破坏任何场景），因此既不进 selftest 清单、也不被场景钉。`daemon status` 报告的
     是**生效值**（有活 daemon ⇒ 取租约值，否则取契约默认），且必须显式带 `--workspace` 指明
@@ -459,9 +474,13 @@ nexus-harness code <verb> ──(daemon 在跑且握手成功)──▶ daemon(1
      `provider.ready==true` 的运行结果入缓存；失败、超时、未收敛就绪（`ready=false`）与 BLOCKED
      一律不入 —— 否则缓存会把"没测到"永久化，并让冻结场景的 `verdict` pin 在命中路径变红。
      被截断的结果**可以**入缓存：`count` 与 `budget.truncated` 属结果本体，回放后仍如实显示截断。
-  ④ 命中条件：`cache.key_digest` 等于本次 `snapshot.working_tree_digest`，且查询前后各一次
-     digest 检查照旧执行；等式与 miss 判定由点名单测证伪（`cache_key_misses_when_digest_differs`、
-     `cache_hit_restamps_run_metadata`），不占 selftest 清单。
+  ④ **命中判据分两层，别把必要条件当成命中证据**：`cache.key_digest` 就是本次键里的
+     `working_tree_digest`，所以它在 **miss 路径上同样等于** `snapshot.working_tree_digest` ——
+     等式是"键没串到别的树"的**必要条件**，不是命中证据。唯一的命中证据是 `cache.tier="disk"`
+     （未命中为 `"miss"`；`--no-cache` 也是 `"miss"`，靠 `cache.disabled=true` 区分，见
+     `code_intelligence_cache_disabled`），selftest 与冻结场景钉的就是它。
+     等式与 miss 判定由点名单测证伪（`cache_key_misses_when_digest_differs`、
+     `cache_hit_restamps_run_metadata`），不占 selftest 清单。查询前后各一次 digest 检查照旧执行。
   ⑤ **`mcp serve` 与 `daemon selftest` 的复用类探针强制不读不写缓存，且 `mcp serve` 不问 daemon**：
      否则第二次查询可由回放满足，Phase 4 的复用判据（`provider.session_reused`/`session_queries`）
      会被我自己造的缓存糊成绿 —— 这是盲评 round 3 抓出的新假绿通道，属于硬性排除。
@@ -705,17 +724,23 @@ round 2 的教训就是"待办只写在提交说明里，下一轮没有承载�
 
 - 真实执行：workspace-tests / product-scenarios / regression / architecture-policy / dependency-governance（cargo-deny 0.20：`cargo deny --config policies/deny.toml check advisories licenses bans sources`，缺失则 UNKNOWN）/ coverage-summary（cargo-llvm-cov）/ platform-checks（portable-core 平台依赖静态扫描）/ feature-matrix（每成员 `--no-default-features` + `--all-features`）/ portable-core（`cargo check --target wasm32-wasip1`）。
 - 条件执行（无内容/无工具时 UNKNOWN）：integration（成员 tests/*.rs 存在时逐个运行）/ selected-fuzz（cargo-fuzz + fuzz targets）/ selected-concurrency（tests/concurrency 有测试时运行）/ performance-budgets（quality.toml `[performance]` 定义 baseline+blocking 后判定）。
-- 单元测试：`cargo test -p nexus-harness`（Windows/1.95.0 上 daemon/缓存实现落地后**实测 150 个 =
-  147 passed + 3 failed（共 150 个）**；并行跑同一集会多红 2 条（`145 + 5` 那一档），那 2 条是
+- 单元测试：`cargo test -p nexus-harness`（Windows/1.95.0 上 daemon/缓存实现落地后**实测 152 个 =
+  149 passed + 3 failed（共 152 个）**，串行 `--test-threads=1`；并行跑同一集会多红 2 条（`145 + 5` 那一档），那 2 条是
   master 自带的管道测试在负载宿主上不稳定（见 `.agents/green-evidence-code-intelligence.txt` §S），
-  不是本区间引入的，也没有被削弱。新增的 13 条 = `cache.rs` 6 + `daemon.rs` 7
+  不是本区间引入的，也没有被削弱。较上一档 150 的增量 = round 2 整改新增的 2 条
+  （`silent_daemon_probe_returns_within_the_probe_budget`、
+  `takeover_flag_is_valueless_and_refused_on_serve_entry`）；更早的 13 条 = `cache.rs` 6 + `daemon.rs` 7
   （B-1 整改补了 `stop_does_not_claim_zero_without_an_answer`）。
+  **新增的探活预算那条有反证**：把 `PROBE_READ_TIMEOUT` 临时从 10s 改成 61s（等价于"两档预算又被并回
+  一档"，用 900s 实测太贵）后该测试红，报 `探活等了 61.0s：握手档被换回查询预算（900s）了`，
+  随后已还原 ⇒ 它不是一条只会绿的断言。
   Linux 只多 1 条 —— 差额是 `#[cfg(unix)]` 的真实符号链接越界回归在该宿主才编译；
   xc-pc-linux/1.98.1 在 rev `bdf2f767` **实测 138 passed / 0 failed**（§Q，不是从 Windows 推的），
   在 `0a42240` **实测 150 passed / 0 failed**（§R，当时 Windows 是 149）⇒ 差值 1 与口径吻合；
   B-1 之后 Windows 变 150、**Linux §U 实测 151 passed / 0 failed**（rev f1575b5d，串并与行一致，
-  差值仍是那 1 条 #[cfg(unix)] 回归）。
-  **117/116 与"137 = 134+3"都只是历史声明而不是当前值**：本区间把测试数从 117 推到 137 再推到 150，
+  差值仍是那 1 条 #[cfg(unix)] 回归）。**本档（Windows 152）的 Linux 值要等 §W 的实测填补**，
+  没测到之前不许拿 152-1 当结论。
+  **117/116 与"137 = 134+3"都只是历史声明而不是当前值**：本区间把测试数从 117 推到 137 再推到 152，
   每一次都有人没同步这行（N2/N-A4 抓过一次，本轮再次自纠并在此留痕）。
   `scenario::tests::run_single_*`/`run_parallel_*` 在本宿主假红，见 DEVELOPMENT.md §11.1；
   覆盖 scenario 求值、evidence 新鲜度/STALE、digest 确定性与锁竞争判定、containment 的归一化比较

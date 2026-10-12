@@ -759,9 +759,13 @@ squash 之后没再碰过这些文件，且逐文件比对后 theirs 独有行�
     commands_surface_lists_daemon=true unknown_flag_blocked=true defaults_idle_secs=900
     dirty_after_lifecycle=0
 
-    时延就登记为时延，不作判据：同一份码同一台机器三次 330.7s / 268.9s / 172.5s（差 1.9 倍），
-    而 `scenario.rs` 的命令超时是硬编码 600s ⇒ 余量在负载宿主上只有 ~1.8x。
-    r4 前置条件 6 要的就是这个数，现在它有实测了：**够跑，但不宽裕**，Linux 侧另测。
+    时延就登记为时延，不作判据。上一段三个数**不是三个同量**（round 1 的 N-3 抓的就是我把它
+    写成"同一份码同一台机器三次"）：330.7s 与 268.9s 是两次独立的 `daemon selftest --json`
+    的 `duration_ms`，172.5s 是 `code_intelligence_daemon_lifecycle` 这条**场景**的端到端耗时
+    （它内部还要再跑一次 selftest 并做 29 条期望比对）。按"selftest 自身的时延"看只有两个
+    观测点，散布 1.23 倍，不是 1.9 倍。取上界 330.7s 与 `scenario.rs` 硬编码的 600s 命令超时
+    对齐 ⇒ 余量 ~1.8x。r4 前置条件 6 要的就是这个上界，现在它有实测了：**够跑，但不宽裕**，
+    Linux 侧另测。跨宿主时延散布与冷启动预热前置（N-1）仍未登记，不作判据也不作承诺。
 
 26 条 code_intelligence_* 场景（串行批次，逐条 evidence_id 见 .evidence/）：
 

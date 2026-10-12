@@ -461,3 +461,63 @@ round 2 的 N1-N7 + S1 **全部 CLOSED**（这次审查者跑了 29 条命令并
 - 建议的承载体（属 harness/门禁面，另开周期）：`scenario run` 与 `status` 的输出里带上
   **被执行二进制的路径与 mtime**（现在只有 `source_revision`/`working_tree_digest`，它们描述仓库，
   不描述跑的是哪个构建）。缺这一项，"新代码的结论"与"旧构建的结论"在案卷里长得一模一样。
+
+## daemon/缓存 独立 Review round 2（对象 `f075157`，案卷 `.evidence/review-qoder-independent-daemon-r2/`）
+
+B-1 已由审查者实测判 **CLOSED**（真生命周期链 + 四组假监听端反证）。本轮 1 条阻塞 + 6 条非阻塞，
+逐条处置如下；实测数字在 `.agents/green-evidence-code-intelligence.txt` §V。
+
+- **B-2（阻塞，已修）**：整改时我在 MODULE.md 写的"CLI 拿不到应答时报 `-1`"是**单一分支**的现时态
+  宣称，而实现（和同批新单测）在"根本没连上"这一支是**不发该字段** ⇒ 两处承载体无共同解。
+  修法按审查者要求只动契约文本，不动实现/语义/场景：把取值写成两支（① 连上但没应答 ⇒ `-1`+UNKNOWN；
+  ② 没连上 ⇒ 字段缺席+UNKNOWN），并写清"发 0 与发 -1 在这里都不是证据"。
+  教训与盲评 r4 同一条：**散文里的现时态行为描述必须与分支图同构**，写一支等于给另一支承诺了没有的东西。
+- **N-r2-1（已修）**：stop 分支已在回帧前 `drain_pool`，外层第二次 drain 是对空池做的 ⇒
+  我新加的 `sessions_before_exit` 与 `daemon serve` 自报的 `provider_sessions` 双双恒 0，
+  B-1 换来的可证伪性在这两个字段上被我自己抵消了。修法：`Conn::Stop` 从单元变成带 `Drain`
+  （回收观测只有**一个**出处），删掉 `sessions_before_exit`（无承载体就不许有字段），
+  `serve` 的退出 envelope 改用带出的那份 ⇒ `provider_sessions` 在 stop 路径上可以是真非 0。
+- **N-r2-2（已修）**：实测 `status` 对一个"连得上但不答话"的监听者 **25s 未返回**（exit 124），
+  根因是握手/探活与查询共用 `CLIENT_READ_TIMEOUT=900s`；同时 `start` 对"没答话"的租约拒绝覆盖，
+  于是僵住的 daemon 既等不起也清不掉。修法：拆出 `PROBE_READ_TIMEOUT`（长超时只在 `query`/`stop`
+  这两档打开）+ 契约级逃生口 `--takeover`（显式授权放弃旧租约，**仍不 kill pid**）。
+  两档预算的载体是单测 `silent_daemon_probe_returns_within_the_probe_budget`（夹具：accept 后
+  永不回帧的监听者；断言**时长**而不是文案，合并预算的实现会先让它红）。
+- **N-r2-3（已修，方向本来安全）**：`stop_in` 里"等租约消失"的 10s 轮询在负载宿主上是瞬时假红源。
+  两点处置：① 上限提到 30s 并把数值写进 reason 文案（`租约已删=?，等待上限 30s`），红的时候能自证
+  是"没等到"还是"daemon 报了未退出"；② **不**因为超时就去替 daemon 删租约 —— 猜着删就是把
+  "可能仍在收尾"的活 daemon 变成找不到主人的孤儿。
+- **N-r2-4（已修）**：plan 的取代指针用"下文 69 行/82 行"自指，而我插入的 12 行把它们推到了 81/94
+  —— 行号锚点在**被自己锚定的文件**里必然漂移。改成节名锚点（§4「两层"缓存"必须分开定义」/
+  §5「输出字段」）。通则：**指向会被本文件改动影响的行号 = 承诺一个自己维护不了的量**。
+- **N-r2-5（已修，且升级为记法要求）**：§U 只写了 rev 与 mtime 级信息，没落被执行二进制的 md5，
+  于是"冻结副本 + 核 md5"停在建议层（正是 F-新5 那条宿主陷阱的成因）。§V 起：Windows 与 Linux 的
+  运行记录都必须带**同一次**跑的二进制路径 + md5 + mtime，缺一项则该条结论按"未固定被测物"处理。
+- **N-r2-6（注释与事实不符，已改注释，不改行为）**：`drain_pool` 的注释写"问不到（Err）算仍活着"，
+  而代码用 `matches!(…, Some(false))`：`close_with_report` 是三档 —— `Some(true)` 操作系统确认已退、
+  `Some(false)` 仍活着**或最后一次 `try_wait` 问不到**（`lsp.rs` 的 `reaped` 只认 `Ok(Some(_))`，
+  "问不到"落在这档）、`None` 是这个条目根本没有会话可回收（从未开过或已被 `Drop` 收过）⇒ 不算泄漏。
+  同时如实写覆盖面：观测只到**直接持有的子进程**，rust-analyzer 自己再 spawn 的后代不在 std 能
+  枚举的范围（要 libc）⇒ `sessions_after_stop=0` 说的是"我们那批句柄都退了"。这条与
+  **F-新3 同源**，F-新3 说的边界就是它。
+
+### round 1 遗留五条在本轮一并销项
+
+- **N-3（已更正记录，数据未改）**：§T 把两个 `daemon selftest` 的 `duration_ms`（330.7s / 268.9s）
+  与一条**场景**的端到端耗时（172.5s，含 29 条期望比对）写成"同一份码三次"，因此 1.9 倍散布是
+  我算错量纲得到的。已在 §T 就地更正：selftest 自身的散布是 1.23 倍，命令超时余量按上界 330.7s
+  算仍是 ~1.8x（结论方向没变，数字的来源变了）。
+- **N-4（已修）**：`FILE_MANIFEST.md` 里 `..._daemon_explicit_only.toml` 的描述漏了 `--no-cache`
+  —— 该场景现在两个 flag 都给（MODULE.md「`--no-daemon`/`--no-cache`」一条写明了理由），
+  描述与命令行不一致会让下一个读清单的人以为只给一个。探针数目（23）上一轮已改。
+- **N-6（已修，改的是契约措辞）**：MODULE.md 原写"命中条件：`cache.key_digest` 等于本次
+  `snapshot.working_tree_digest`"，而 miss 路径上这个等式**同样成立**（key_digest 就是本次键里
+  的那个 digest）⇒ 等式是必要条件，不是命中证据。现改为两层：命中证据只有 `cache.tier="disk"`，
+  并如实写明 `--no-cache` 也发 `"miss"`、靠 `cache.disabled=true` 区分（这条由
+  `code_intelligence_cache_disabled` 钉）。**教训：把"键没串"写成"命中了"就是给假绿开一门。**
+- **N-7（按设计保留，作口径备忘）**：求值器没有"字段缺席"与"字段对字段"比较算子，所以
+  等式/缺席类性质只能活在点名单测里。这是 harness 的限制（与 F-新4、§后续项那条 fail-open 同域），
+  不在本周期改门禁面；MODULE.md 已就地披露"由点名单测承载"。
+- **N-9（已修，注释）**：`mod.rs` 说 target 分量是"argv 去掉两个策略 flag"，实际 `--json` 也不在
+  分量里 —— 但那是 `main.rs` 在分发前剥掉的，不是这里滤的。注释补齐第三个来源，并保留
+  "宁可多算一项而 miss"的原则句。

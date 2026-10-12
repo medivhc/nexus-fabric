@@ -210,8 +210,10 @@ pub fn run_with_session(args: &[String], session: &mut Option<ProviderSession>) 
     // 缓存没命中才去问 daemon —— 反过来就等于回放路径也要付一次握手成本。
     let namespace = daemon::namespace_from_env_or(&repo.root);
     let cache_dir_path = daemon::cache_dir(&namespace);
-    // target 分量取本次 argv（去掉两个策略 flag：它们改的是"怎么问"，不是"问什么"）。
-    // 宁可因为多算一项而 miss，也不能因为少算一项把两个不同查询当成同一个。
+    // target 分量 = 本次 argv **去掉 verb（`skip(1)`）与两个策略 flag**：后两者改的是"怎么问"，
+    // 不是"问什么"。还有第三点要如实写（独立评审 round 1 的 N-9）：`--json` 也不在分量里，但
+    // **不是这里滤的** —— `main.rs` 在分发前就剥掉了它，所以到这里的 argv 根本不含它。
+    // 原则不变：宁可因为多算一项而 miss，也不能因为少算一项把两个不同查询当成同一个。
     let target_component = args
         .iter()
         .skip(1)

@@ -37,9 +37,13 @@ pub const DEFAULT_MAX_WORKSPACES: usize = 2;
 pub const NAMESPACE_ENV: &str = "NEXUS_CODE_INTEL_NAMESPACE";
 
 const LEASE_FILE: &str = "lease.json";
-/// 一次 daemon 查询的上界。它不是场景里那条"不许 hang"的时间断言（那是把宿主负载写进契约），
-/// 只是客户端别永远卡在 read 上的自保。
+/// 一次 daemon **查询 / stop** 的读上界。它不是场景里那条"不许 hang"的时间断言（那是把宿主
+/// 负载写进契约），只是客户端别永远卡在 read 上的自保。stop 也走这一档：daemon 现在是
+/// "先把 provider 收干净再回帧"，最坏耗时按会话数线性增长。
 const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(900);
+/// 握手与探活的读上界。**不能**复用查询那一档：一个僵住但仍在 accept 的 daemon 会让
+/// `start` 的轮询、`status` 与每次 `code` 的路由选择都等满 900s（round 2 的 N-r2-2，实测 25s 未返回）。
+const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -207,7 +211,7 @@ impl Client {
                 format!("连不上 daemon {}：{e}{marker}", lease.addr())
             })?;
         stream
-            .set_read_timeout(Some(CLIENT_READ_TIMEOUT))
+            .set_read_timeout(Some(PROBE_READ_TIMEOUT))
             .map_err(|e| e.to_string())?;
         stream
             .set_write_timeout(Some(Duration::from_secs(60)))
@@ -250,6 +254,8 @@ impl Client {
         argv: &[String],
         digest: &str,
     ) -> Result<Value, String> {
+        // 握手是秒级的事，一次真查询可能要几分钟：长超时只在这一档打开。
+        self.stream.set_read_timeout(Some(CLIENT_READ_TIMEOUT)).ok();
         roundtrip(
             &mut self.stream,
             &json!({
@@ -263,6 +269,8 @@ impl Client {
     }
 
     pub fn stop(mut self) -> Result<Value, String> {
+        // daemon 收到 stop 后先回收 provider 再回帧 ⇒ 等的是"会话数 × 有序关闭上界"。
+        self.stream.set_read_timeout(Some(CLIENT_READ_TIMEOUT)).ok();
         roundtrip(
             &mut self.stream,
             &json!({"t": "stop", "token": self.lease.token}),
@@ -315,8 +323,13 @@ fn drain_pool(pool: &mut Vec<PoolSession>) -> Drain {
     let lived = pool.len();
     let mut still_alive = 0usize;
     for entry in pool.iter_mut() {
-        // `close_with_report` 走的是与 `ProviderSession::Drop` 相同的回收逻辑，只是多交回一个
-        // 由 `try_wait` 得到的结论；问不到（Err）算"仍活着"，与 `dirty_after_lifecycle` 同口径。
+        // `close_with_report` 是三档，不是布尔（rust_analyzer.rs:834 / lsp.rs:609-644）：
+        // `Some(true)` = 操作系统 `try_wait` 确认已退；`Some(false)` = 仍活着**或最后那次
+        // `try_wait` 问不到**（`reaped` 只认 `Ok(Some(_))`，所以"问不到"落在这一档）；
+        // `None` = 这个条目根本没有会话可回收（从未开过，或早已被 `Drop` 收过）⇒ 不算泄漏。
+        // 如实声明覆盖面：这个观测只到**我们直接持有的那个子进程**。rust-analyzer 自己再
+        // spawn 的后代不在 std 能枚举的范围（要 libc），所以 `sessions_after_stop=0` 说的是
+        // "我们持有的那批句柄都退了"，不是"这台机器上没有 rust-analyzer 在跑"。
         if matches!(entry.session.provider.close_with_report(), Some(false)) {
             still_alive += 1;
         }
@@ -364,6 +377,7 @@ fn serve(
     listener.set_nonblocking(true).ok();
 
     let mut pool: Vec<PoolSession> = Vec::new();
+    let mut stop_drain: Option<Drain> = None;
     let mut last_activity = now_secs();
     let mut last_beat = Instant::now();
 
@@ -380,10 +394,8 @@ fn serve(
         match listener.accept() {
             Ok((stream, _peer)) => {
                 last_activity = now_secs();
-                if matches!(
-                    handle_conn(stream, &lease, &mut pool, repo_root),
-                    Conn::Stop
-                ) {
+                if let Conn::Stop(drain) = handle_conn(stream, &lease, &mut pool, repo_root) {
+                    stop_drain = Some(drain);
                     break "收到 stop".to_string();
                 }
             }
@@ -395,7 +407,9 @@ fn serve(
     };
     // 退出路径只有一条清理：`drain_pool`（观测每个 provider 是否真的被操作系统收掉）
     // → 删自己写的租约 → 删缓存目录。idle 自退出与 stop 走同一条，不给它开后门。
-    let drain = drain_pool(&mut pool);
+    // stop 的回收已在连接处理里做过，观测由 `Conn::Stop` 带出；这里再 drain 一次对空池是
+    // no-op，所以**必须优先用带出的那份**，否则对外字段会退化成恒 0（N-r2-1）。
+    let drain = stop_drain.unwrap_or_else(|| drain_pool(&mut pool));
     remove_lease(namespace);
     cache::purge(&cache_dir(namespace));
     (drain, reason)
@@ -403,7 +417,10 @@ fn serve(
 
 enum Conn {
     Done,
-    Stop,
+    /// stop 已在这条连接里完成回收，**观测随返回值带出**：它就是 `sessions_after_stop` 与
+    /// `daemon serve` 退出 envelope 的共同出处。不带出的话，外层只能对空池再 drain 一次，
+    /// 那个数恒 0（round 2 的 N-r2-1：恒 0 的字段不是观测，B-1 的反证力在这里就没了）。
+    Stop(Drain),
 }
 
 fn write_frame(stream: &mut TcpStream, msg: &Value) -> std::io::Result<()> {
@@ -511,7 +528,7 @@ fn handle_conn(
                            "sessions_before_stop": drain.lived,
                            "sessions_after_stop": drain.still_alive}),
                 );
-                return Conn::Stop;
+                return Conn::Stop(drain);
             }
             "query" => {
                 let reply = serve_query(&msg, pool, lease, repo_root);
@@ -839,6 +856,10 @@ fn unknown(state: &DaemonState, message: String, extra: Vec<(String, Value)>) ->
 /// 已知的启动参数集合。未知参数一律 `BLOCKED`（本模块两次栽在"参数被接受但不生效"上，
 /// daemon 一次新增三个参数，同一漂移最可能复发的地方就是它）。
 struct StartArgs {
+    /// `--takeover`：租约指向一个"连得上但不答话"的 daemon 时，显式授权清掉那份租约
+    /// 再启新的。**仍不去 kill pid** —— 没有可移植手段判断那个 pid 是不是我们的 daemon
+    /// （契约禁止 `kill(pid,0)`，那要引 libc）。
+    takeover: bool,
     workspace: Option<String>,
     idle_secs: Option<u64>,
     max_workspaces: Option<usize>,
@@ -848,6 +869,7 @@ struct StartArgs {
 
 fn parse_args(args: &[String], serve_entry: bool) -> Result<StartArgs, String> {
     let mut out = StartArgs {
+        takeover: false,
         workspace: None,
         idle_secs: None,
         max_workspaces: None,
@@ -860,6 +882,13 @@ fn parse_args(args: &[String], serve_entry: bool) -> Result<StartArgs, String> {
             args.get(i + 1).ok_or_else(|| format!("{name} 缺值"))
         };
         match args[i].as_str() {
+            // 无值 flag 必须单独列出来：下面统一 `i += 2`，把它当带值 flag 处理会把后一个
+            // token 当值吞掉 —— 那正是"参数被接受但不生效"的形状。
+            "--takeover" if !serve_entry => {
+                out.takeover = true;
+                i += 1;
+                continue;
+            }
             "--workspace" => out.workspace = Some(take("--workspace")?.clone()),
             "--idle-secs" => {
                 let v = take("--idle-secs")?.clone();
@@ -948,6 +977,7 @@ fn start(args: &[String]) -> Outcome {
         parsed.workspace.as_deref().unwrap_or("."),
         parsed.idle_secs.unwrap_or(DEFAULT_IDLE_SECS),
         parsed.max_workspaces.unwrap_or(DEFAULT_MAX_WORKSPACES),
+        parsed.takeover,
     )
 }
 
@@ -960,6 +990,7 @@ pub fn start_in(
     workspace: &str,
     idle_secs: u64,
     capacity: usize,
+    takeover: bool,
 ) -> Outcome {
     if let Some(lease) = read_lease(namespace) {
         let (alive, pong, why) = probe(&lease);
@@ -987,7 +1018,7 @@ pub fn start_in(
         // 残留租约（daemon 崩了没删文件）在这里被**覆盖**而不是拒绝启动：否则一次崩溃会永久挡住
         // `start`。但"覆盖"的前提是有证据说它是残留 —— 没被拒只是没答上时，起第二个 daemon
         // 会留下两个监听者与一份被踩掉的租约（第一个就此不可发现）。与 `stop` 同一判据。
-        if !why.contains("CONNECTION_REFUSED") {
+        if !why.contains("CONNECTION_REFUSED") && !takeover {
             let state = DaemonState {
                 running: false,
                 detected: false,
@@ -1169,7 +1200,6 @@ fn serve_command(args: &[String]) -> Outcome {
     let mut f = fields(&state);
     f.push(("results".to_string(), json!([])));
     f.push(("count".to_string(), json!(0)));
-    f.push(("sessions_before_exit".to_string(), json!(drain.lived)));
     ("PASS".to_string(), reason, f)
 }
 
@@ -1222,7 +1252,12 @@ pub fn stop_in(namespace: &Path) -> Outcome {
     match Client::connect(&lease) {
         Ok(c) => {
             let reply = c.stop();
-            let deadline = Instant::now() + Duration::from_secs(10);
+            // daemon 是**先回收 provider、再删自己的租约**，所以这里等的是"它自己什么时候写完
+            // 收尾"。上限（`lease_removal_bound`）只是 CLI 的自保，不是契约时限；到点仍不消失只说明"没等到证据"，
+            // 因此结论是 UNKNOWN（不是 FAIL），且**不替 daemon 删租约** —— 猜着删就是把
+            // "可能仍在收尾"的活 daemon 变成找不到主人的孤儿（round 2 的 N-r2-3）。
+            let lease_removal_bound = Duration::from_secs(30);
+            let deadline = Instant::now() + lease_removal_bound;
             while Instant::now() < deadline && lease_path(namespace).exists() {
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -1251,7 +1286,15 @@ pub fn stop_in(namespace: &Path) -> Outcome {
                     None
                 } else {
                     Some(match reply.as_ref() {
-                        Ok(_) => format!("daemon 回报仍有 {observed} 个 provider 未退出"),
+                        // 应答里有这个数 ⇒ 直接说它说了什么；-1 是"应答里没这个量"，
+                        // 不能写成"回报仍有 -1 个未退出"（那是把缺证据伪装成一条反向证据）。
+                        Ok(_) if observed >= 0 => {
+                            format!("daemon 回报仍有 {observed} 个 provider 未退出")
+                        }
+                        Ok(_) => format!(
+                            "daemon 的 stopped 帧里没有 sessions_after_stop；租约在 {:?} 内消失={gone}",
+                            lease_removal_bound
+                        ),
                         Err(e) => format!("stop 应答取不到: {e}"),
                     })
                 },
@@ -1270,7 +1313,8 @@ pub fn stop_in(namespace: &Path) -> Outcome {
                 unknown(
                     &state,
                     format!(
-                        "stop 未能证明回收完成（租约已删={gone}，回报仍活着的 provider={observed}）"
+                        "stop 未能证明回收完成（租约已删={gone}，等待上限 {lease_removal_bound:?}，\
+                         回报仍活着的 provider={observed}）"
                     ),
                     extra,
                 )
@@ -1550,6 +1594,7 @@ fn selftest(args: &[String]) -> Outcome {
         &workspace,
         DEFAULT_IDLE_SECS,
         DEFAULT_MAX_WORKSPACES,
+        false,
     );
     probes.push(p_expect(
         "start_verdict",
@@ -1570,6 +1615,7 @@ fn selftest(args: &[String]) -> Outcome {
         &workspace,
         DEFAULT_IDLE_SECS,
         DEFAULT_MAX_WORKSPACES,
+        false,
     );
     probes.push(p_expect(
         "already_running",
@@ -1747,7 +1793,7 @@ fn selftest(args: &[String]) -> Outcome {
     // ---- 观测 6：LRU 到容量仍只有一个会话 ----
     let ns_lru = unique_namespace_dir("lru");
     scratch_dirs.push(ns_lru.clone());
-    let lru_start = start_in(&ns_lru, &root, &workspace, DEFAULT_IDLE_SECS, 1);
+    let lru_start = start_in(&ns_lru, &root, &workspace, DEFAULT_IDLE_SECS, 1, false);
     let src_workspace = format!("{workspace}/src");
     let q_a = run_cli(
         &[
@@ -1854,7 +1900,14 @@ fn selftest(args: &[String]) -> Outcome {
     // ---- 观测 8：空闲自退出（注入小 idle）----
     let ns_idle = unique_namespace_dir("idle-exit");
     scratch_dirs.push(ns_idle.clone());
-    let idle_start = start_in(&ns_idle, &root, &workspace, 3, DEFAULT_MAX_WORKSPACES);
+    let idle_start = start_in(
+        &ns_idle,
+        &root,
+        &workspace,
+        3,
+        DEFAULT_MAX_WORKSPACES,
+        false,
+    );
     let mut exited = false;
     let deadline = Instant::now() + Duration::from_secs(25);
     while Instant::now() < deadline {
@@ -2318,6 +2371,90 @@ mod tests {
         );
         // `probe_count` 也必须等于这个数：selftest 自己报的数字与清单同源。
         assert_eq!(declared.len(), 23, "清单条数变了要同步本测试与场景期望数");
+    }
+
+    /// round 2 的 N-r2-2 的判据载体：**探活/握手用短预算，不是查询那 900s**。
+    /// 夹具是"接了连接但永远不答话"的监听者 —— 就是"daemon 僵住但进程还在"的形状。
+    /// 断言的是**时长**而不是原因文案：把这一档换回 `CLIENT_READ_TIMEOUT` 时，`start` 的轮询、
+    /// `status` 与每次 `code` 的路由选择都会等满 15 分钟，而这条测试先变红。
+    #[test]
+    fn silent_daemon_probe_returns_within_the_probe_budget() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑临时端口做静默监听者");
+        let port = listener.local_addr().expect("取到监听端口").port();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            // 只 accept，不读不写：客户端的请求停在服务端接收缓冲里，永远没有回帧。
+            // 已接受的连接必须**抱着**，否则测试测的是"对端提前关闭"而不是"不答话"。
+            let mut held = Vec::new();
+            for stream in listener.incoming().take(1).flatten() {
+                held.push(stream);
+            }
+            let _ = stop_rx.recv();
+            held.len()
+        });
+        let ns = unique_namespace_dir("silent-probe");
+        let lease = Lease {
+            pid: std::process::id(),
+            port,
+            token: "bogus".to_string(),
+            started_at: now_secs(),
+            last_heartbeat: now_secs(),
+            idle_secs: DEFAULT_IDLE_SECS,
+            workspace_key: ".".to_string(),
+            version: daemon_version(),
+            max_workspaces: DEFAULT_MAX_WORKSPACES,
+            dir: ns.clone(),
+        };
+        let started = Instant::now();
+        let (alive, pong, why) = probe(&lease);
+        let elapsed = started.elapsed();
+        drop(stop_tx);
+        let _ = holder.join();
+        let _ = std::fs::remove_dir_all(&ns);
+        assert!(
+            !alive && pong.is_none(),
+            "不答话的监听者被判成活着，就是把沉默折算成就绪"
+        );
+        assert!(
+            elapsed <= Duration::from_secs(60),
+            "探活等了 {elapsed:?}：握手档被换回查询预算（{CLIENT_READ_TIMEOUT:?}）了"
+        );
+        assert!(
+            !why.contains("CONNECTION_REFUSED"),
+            "连得上但不答话不是\"被拒\"；分类成残留会让 start 起第二个实例：{why}"
+        );
+        assert!(!why.is_empty(), "探针没拿到应答却不给原因 = 把失败说成沉默");
+    }
+
+    /// `--takeover` 必须是**无值** flag，且不能从 `daemon serve` 那个内部入口进来。
+    /// 中间那段防的是本模块反复栽过的"参数被接受但不生效"：统一 `i += 2` 会把后一个 token
+    /// 当值吞掉，于是 `--takeover --idle-secs 30` 变成 idle 被吃、takeover 却没记录。
+    #[test]
+    fn takeover_flag_is_valueless_and_refused_on_serve_entry() {
+        let parsed =
+            parse_args(&["--takeover".to_string()], false).expect("--takeover 应被 start 接受");
+        assert!(parsed.takeover, "--takeover 被接受但没记下来 = 参数不生效");
+
+        let both = parse_args(
+            &[
+                "--takeover".to_string(),
+                "--idle-secs".to_string(),
+                "30".to_string(),
+            ],
+            false,
+        )
+        .expect("--takeover 后接带值参数应正常解析");
+        assert!(both.takeover, "--takeover 在多参数序列里被吞掉了");
+        assert_eq!(
+            both.idle_secs,
+            Some(30),
+            "--takeover 把后一个 token 当自己的值吃了（应为无值 flag）"
+        );
+
+        let err = parse_args(&["--takeover".to_string()], true)
+            .err()
+            .expect("daemon serve 内部入口不该接受 --takeover");
+        assert!(err.contains("未知参数"), "拒绝理由不可诊断：{err}");
     }
 
     fn is_ident(s: &str) -> bool {

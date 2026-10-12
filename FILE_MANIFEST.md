@@ -62,7 +62,7 @@
 | `.agents/provider-daemon-and-result-cache-plan.md` | Provider daemon 与结果缓存的设计与实施计划（授权范围、生命周期护栏、两层缓存定义、验收判据） |
 | `.agents/red-evidence-daemon.txt` | Red Evidence record（daemon 命令面与缓存字段实现前的四条红灯，含 evidence_id） |
 | `scenarios/engineering/code_intelligence_daemon_lifecycle.toml` | E4：daemon 显式生命周期与跨命令复用（逐条钉 selftest 的 23 枚字段值 + probe_count=23） |
-| `scenarios/engineering/code_intelligence_daemon_explicit_only.toml` | E4：`--no-daemon` 下 session_source=in-process，证明 CLI 不自动拉起 daemon |
+| `scenarios/engineering/code_intelligence_daemon_explicit_only.toml` | E4：`--no-daemon --no-cache` 下 session_source=in-process 且 cache.disabled=true，证明 CLI 不自动拉起 daemon |
 | `scenarios/engineering/code_intelligence_cache_disabled.toml` | E4：`--no-cache` 下 cache.disabled=true 且 tier=miss，键绑定仍可见 |
 | `scenarios/engineering/code_intelligence_daemon_command_surface.toml` | E4：daemon 未知子命令 BLOCKED，且 declined 输出仍带 authority 与 daemon.running |
 | `scenarios/engineering/code_intelligence_daemon_unknown_flag.toml` | E4：daemon 未知启动参数 BLOCKED（参数不接受即失败，不静默忽略） |

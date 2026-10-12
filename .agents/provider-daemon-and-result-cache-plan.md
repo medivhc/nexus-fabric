@@ -2,10 +2,10 @@
 
 > **本文件是设计期的历史文档，不是契约。** 与 `engineering/nexus-harness/MODULE.md`
 > 「Provider Daemon & Result Cache」冲突时**一律以 MODULE.md 为准**。四处已被后续裁决取代：
-> ① § 里"缓存不得包含源码原文"（下文 69 行）被盲评 round 4 撤掉 —— 真前提是 `snippet`
+> ① §4「两层"缓存"必须分开定义」里"缓存不得包含源码原文"那条硬约束被盲评 round 4 撤掉 —— 真前提是 `snippet`
 > 在白名单外**所有** verb 的条目上都可能出现，排除个别 verb 兑现不了它；安全来源改为
 > **摘要键 + 查询前后各取一次 digest + 只落按用户隔离的 temp**（MODULE.md「命中形状」②③）。
-> ② `cache.tier` 的 `"memory"` 值（下文 82 行）已删：会话内重复由 `provider.session_reused`
+> ② §5「输出字段」里 `cache.tier` 的 `"memory"` 值已删：会话内重复由 `provider.session_reused`
 > 表达，两个观测点不得互相冒充。
 > ③ 设计期的 selftest 清单是 30/32 项，现冻结为 **23** 项，撤下项的承载体是 MODULE.md
 > 正文里的「点名单测」名单（9 枚），不是清单里的探针。
