@@ -159,3 +159,55 @@ contract list=32，lifecycle pinned=32，probe_count=32，双向差集为空；
     daemon-command-surface FAIL  expect  daemon.running     scenario-a3d12d2f8bd0
     daemon-unknown-flag    FAIL  expect  daemon.running     scenario-a561b7c07a73
     daemon-status-defaults FAIL  expect  authority          scenario-2e368d679f32
+---
+
+## 第四轮红灯与裁决记录（盲评 round 3 推翻了我上一轮两处修法）
+
+round-3 案卷 `.evidence/test-review-branch-feature-code-intel-phase-234-2026-10-12-r3/`：
+verdict 仍 `CHANGES_REQUESTED`，4 条阻塞，且明确指出 r2 那 4 条只 **2 CLOSED / 2 PARTIAL**。
+三条最关键的不是"写得不够"，而是**与我自己的其他规则或系统里的冻结约束互相矛盾**：
+
+1. **"逐字回放" 与 "缓存不得含源码原文" 没有共同解** —— `results.0.snippet` 就是源码行，
+   而 `hover` / `diagnostics_item_shape` 两条**已冻结**场景钉它非空。
+   裁决：**含源码文本的 verb（hover/diagnostics）不入结果层缓存**，而不是去动冻结期望，
+   也不是放宽"不含源码"。
+2. **"不刷新任何字段" 撞上绑定与计数不变量** —— `working_tree_digest` 既不看提交历史也不看
+   工具链版本，空提交或 rustc 升级都不改它 ⇒ 连 `snapshot.source_revision` 一起回放就是
+   拿过期绑定冒充新鲜。裁决：字段分两类，**语义事实逐字回放、运行元数据一律按本次运行生成**
+   （`snapshot.*` revision/toolchain、`provider.duration_ms`/`session_*`、`daemon.*`、`cache.*`）。
+3. **缓存键不含策略位 ⇒ 回放串味** —— `code symbol` 与 `code symbol --no-daemon` 同键，
+   命中会把上一次的 `daemon.running` 带回来，本轮新场景自己变环境依赖红。裁决：键加策略位。
+4. **`mcp selftest --with-query` 落在缓存作用域内 ⇒ 新假绿通道**：第二次查询可由回放满足，
+   Phase 4 的复用判据（`session_reused`/`session_queries`）被我自己造的缓存糊过去。
+   裁决：**两个 selftest 的复用类探针强制不读不写缓存**（硬性排除，写进契约）。
+5. **我上轮加的"复制成 temp scratch"直接违反冻结的作用域不变量** —— `--workspace` 归一化后
+   必须在仓库内（越界 ⇒ `WORKSPACE_UNRESOLVED`），仓库外副本让 `verdict="PASS"` 永不可达；
+   仓库内可写副本又与 `dirty_after_lifecycle=0` 与并行调度冲突（会把别的 `code_*` 打成 STALE）。
+   裁决：撤掉复制规则，selftest 对仓库内夹具**只读不写**；`digest_invalidation_reason` 从清单
+   移除，改由点名单测承载（观测指纹变更必然要求真改工作树，与"不写仓库"互斥）。
+
+同时按它"契约被写胖了吗"的质疑撤下 9 项（32 → **23**）：4 项关于自身输出形状的布尔
+（字段缺席、原因非空、等式成立、有界且不含源码）改为**点名单测**——求值器根本没有"缺席"算子，
+房内先例（`workspace_escape.toml:44-47` 点名 `workspace_escape_is_rejected_before_provider_spawn`）
+就是这么分的；线协议/单端口拓扑两项撤回实现细节定位（契约自己说线协议是实现细节，就不该同时
+钉进对外清单）；`reuse_queries_total=2` 钉的是 selftest 脚本步长，撤；`max_workspaces=2` 属宿主
+调优不作兼容承诺；`cache.tier` 词表去掉 `memory`（会话内重复由 `provider.session_reused` 表达，
+两个观测点不得互相冒充）。另撤掉 `daemon-status-defaults` 场景本身：契约没写"检测到 daemon 时
+报默认值还是生效值"、也没定义不带 `--workspace` 探测哪个命名空间 ⇒ 期望值来源不在契约内。
+`probe_count` 不再由散文担保：改由单测 `daemon_selftest_field_list_matches_contract` 解析本文件
+清单块与实际键集合逐名对齐（多一名少一名都红），三处手写数字的耦合解开。
+
+第四轮红灯（5 条全在 `failed_step="expect"`，无 lookup 伪红；场景总数 26）：
+
+    daemon-lifecycle       FAIL  expect  verdict         scenario-5b1cbcc4995f
+    daemon-explicit-only   FAIL  expect  verdict         scenario-319a4a2a1378
+    cache-disabled         FAIL  expect  verdict         scenario-0ff1c48511d7
+    daemon-command-surface FAIL  expect  daemon.running  scenario-e77d54b513bb
+    daemon-unknown-flag    FAIL  expect  daemon.running  scenario-2ca7e790ba46
+
+自证一致性：契约清单 23 == 场景钉 23（双向差集为空）、`probe_count = 23`、
+`FILE_MANIFEST` 声明 193 == 表内 193 行、`code_intelligence_*` 落盘 26 个。
+
+需要留给下一轮看的一句话：本轮的 5 处修改里有 3 处是**减法**（撤场景、撤清单项、撤 scratch 规则）。
+如果盲评继续以"契约还能钉更多"为标准，就会推向过度规定；因此 r4 的判据应是
+"每条对外承诺是否 (a) 有可证伪承载体、(b) 不与既有冻结约束矛盾"，而不是断言条数。

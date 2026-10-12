@@ -14,6 +14,14 @@ requirement = "engineering/nexus-harness/MODULE.md#provider-daemon--result-cache
 # 因此既不碰开发者真实在跑的 daemon，也不在仓库工作树里造文件（dirty_after_lifecycle=0 钉这条）。
 # 命名空间**每次运行唯一**：否则第二次跑会读到上一次的缓存条目，default_path_* 与
 # cache_second_run_tier 的含义就随运行次数漂移（契约「作用域与隔离」②）。
+# 本场景只钉"清单里 23 枚字段"，**其余同名性质改由点名单测承载**（求值器没有"字段缺席"算子，
+# 把自身输出形状塞进清单只会多出自证布尔）：daemon_decline_omits_absent_fields、
+# daemon_unavailable_carries_structured_reason、cache_key_misses_when_digest_differs、
+# cache_hit_restamps_run_metadata、cache_refuses_entries_beyond_cap、cache_payload_has_no_source_text、
+# session_reuse_key_rejects_changed_digest、daemon_selftest_field_list_matches_contract。
+# 另两条硬性排除也在这里被兜住：mcp selftest --with-query 与 daemon selftest 强制不读不写缓存
+# （否则 Phase 4 复用判据可由回放满足）；selftest 对仓库内夹具只读不写（不复制成 temp scratch，
+# 那会撞冻结的 containment 不变量）。
 # 诚实边界：second_process_* / cache_second_run_tier / stale_fallback_verdict 要求宿主有可解析的
 # rust-analyzer；没有 RA 的宿主上本场景如实变红（与 provider_override_honored 同一口径）。
 
@@ -44,7 +52,7 @@ equals = "advisory"
 # 探针条数 = 契约清单条数；实现少跑一条就红（§N 那类"记错条数"不能靠人复查）。
 [[expect]]
 field = "probe_count"
-equals = 32
+equals = 23
 
 [[expect]]
 field = "start_verdict"
@@ -52,10 +60,6 @@ equals = "PASS"
 
 [[expect]]
 field = "status_running_after_start"
-equals = true
-
-[[expect]]
-field = "start_idempotent_same_port"
 equals = true
 
 [[expect]]
@@ -73,10 +77,6 @@ equals = true
 [[expect]]
 field = "second_process_session_source"
 equals = "daemon"
-
-[[expect]]
-field = "reuse_queries_total"
-equals = 2
 
 [[expect]]
 field = "reuse_provider_sessions"
@@ -119,16 +119,8 @@ field = "lru_provider_sessions_at_capacity"
 equals = 1
 
 [[expect]]
-field = "digest_invalidation_reason"
-equals = "digest_changed"
-
-[[expect]]
 field = "cache_second_run_tier"
 equals = "disk"
-
-[[expect]]
-field = "cache_hit_key_digest_bound"
-equals = true
 
 [[expect]]
 field = "cache_default_enabled"
@@ -136,14 +128,6 @@ equals = true
 
 [[expect]]
 field = "cache_disableable"
-equals = true
-
-[[expect]]
-field = "cache_bounded_and_source_free"
-equals = true
-
-[[expect]]
-field = "wire_refuses_non_whitelist"
 equals = true
 
 [[expect]]
@@ -155,22 +139,10 @@ field = "unknown_flag_blocked"
 equals = true
 
 # 未运行时的字段可得性必须是"不出现"，不是 null/0 占位（只在散文里规定等于没规定）。
-[[expect]]
-field = "absent_fields_when_not_running"
-equals = true
-
 # daemon_unavailable 出现时原因必非空且结构化（回落可见，不是静默降级）。
-[[expect]]
-field = "unavailable_reason_present"
-equals = true
-
 [[expect]]
 field = "defaults_idle_secs"
 equals = 900
-
-[[expect]]
-field = "defaults_max_workspaces"
-equals = 2
 
 [[expect]]
 field = "dirty_after_lifecycle"
