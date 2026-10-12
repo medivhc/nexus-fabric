@@ -130,4 +130,4 @@ block_on = ["FAIL", "BLOCKED"]
 # Project-level agent skills consumed by agents working in this repository.
 root = ".agents/skills"
 index = ".agents/skills/README.md"
-entries = ["nexus-task", "nexus-contract-first", "nexus-review", "nexus-knowledge", "nexus-evidence", "nexus-multiagent", "nexus-selfrepair"]
+entries = ["nexus-task", "nexus-contract-first", "nexus-review", "nexus-knowledge", "nexus-evidence", "nexus-multiagent", "nexus-selfrepair", "nexus-test-review"]
