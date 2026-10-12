@@ -44,6 +44,13 @@ description: 在 Nexus 仓库内执行一次端到端工程任务时使用（修
 
 3. **feature / requirement-change 必须走契约先行**：读取 `nexus-contract-first` 技能，完成契约阶段并拿到 Red Evidence 和 Contract Hash 后再进入实现。
 
+3.5. **TDD 测试用例评审**：测试用例写完后、实现开始前，必须经过独立的测试用例评审。读取 `nexus-test-review` 技能，由独立评审者（不同人、不同 session，子代理盲评）检查测试用例本身。
+
+   - Verdict=APPROVED → 测试用例冻结，进入第 4 步实现。
+   - Verdict=CHANGES_REQUESTED → 打回重写测试用例，不进入实现。
+
+   测试用例评审是 TDD 流程的门禁，不是可选项。没有走过测试用例评审的实现，第 6 步独立 Review 时直接打回。
+
 4. **实现**：
 
    - 遵守对应 crate 的 MODULE.md 契约与 `policies/architecture.toml` 依赖边界。
