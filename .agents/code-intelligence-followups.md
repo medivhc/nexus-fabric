@@ -442,3 +442,22 @@ round 2 的 N1-N7 + S1 **全部 CLOSED**（这次审查者跑了 29 条命令并
 - 建议的承载体（属契约面 + 测试面变更，另开周期）：把那枚单测升级成同时比对
   `(名字, 契约声明的值)` 与 `(名字, 探针期望的值)`，期望值从 inline 的 `json!(...)` 抽成
   一张 `const EXPECTED: [(&str, Value); 23]` 表 —— 表与清单不符即红，不需要跑冷启动。
+
+### F-新5：xc-pc-linux 上有两个"看起来是新构建"的旧二进制（§R 第一次整批作废的真实原因）
+
+- 症状：§R 首跑里 4 条 daemon/cache 场景在 ~100ms 内 FAIL、`daemon selftest` 直接 `BLOCKED`
+  （`supported commands: … code` —— 那句里根本没有 `daemon`）。看着像"Linux 上实现没生效"。
+- 真相是**宿主环境陷阱**，两条同时成立：
+  ① 远端 shell 里 `CARGO_TARGET_DIR=/work/nexus-dev/target` ⇒ `cargo build` 的新产物落在那儿，
+     而我的脚本执行的是仓库内**残留**的 `/work/nexus-ci/target/debug/nexus-harness`（mtime 10-12 19:31）；
+  ② `PATH` 上还有一个 10-12 00:58 的 `cargo install` 版（`/work/nexus-dev/.cargo/bin/nexus-harness`）。
+  同一份源码、三个不同世代的二进制同时存在，`cargo test` 报 150 passed 与 stale 二进制互不矛盾，
+  所以**光看 exit code 发现不了**。
+- 处理：§R 重跑一律用 `CARGO_TARGET_DIR` 下的新鲜路径，并在案卷里显式记 `ls -la $BIN` 的 mtime；
+  首跑的那批 FAIL 结论**不作数**，也不拿它当"Linux 回归"。已按 `nexus-review` 案卷硬要求写清宿主与工具链。
+- 后果之一（正好落在既有待办上）：重跑用同一场景 id 得到 PASS，而场景 evidence_id 是确定性的 ⇒
+  它**原地覆盖**了 stale 二进制的 FAIL 记录（`scenario-05ee009a7979` 先 FAIL 后 PASS）。
+  "先落盘再复跑"这条老规矩在这轮救了一次场：不落盘就没人知道那条 FAIL 发生过。
+- 建议的承载体（属 harness/门禁面，另开周期）：`scenario run` 与 `status` 的输出里带上
+  **被执行二进制的路径与 mtime**（现在只有 `source_revision`/`working_tree_digest`，它们描述仓库，
+  不描述跑的是哪个构建）。缺这一项，"新代码的结论"与"旧构建的结论"在案卷里长得一模一样。
