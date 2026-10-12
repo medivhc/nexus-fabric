@@ -1010,3 +1010,88 @@ apps/nexus/examples/discovery_mdns.rs 的 Unix-only std::os::fd），Linux 结�
 手工调 `pre-commit` 却在**提交之后**才调 `commit-msg`（4b61987 就是这样才发现的）。
 三笔都未推送，但按"不重写历史、破坏性动作先问"的规矩我没有原地改；要不要本地 rebase 改 subject
 归所有者定。往后我自己的口径：**commit-msg 必须在提交前用同一份消息文本跑通**。
+
+================================================================================
+§W round 2 整改后的 xc-pc-linux **结论级**复跑（2026-10-13，宿主 xc-pc-linux，
+   rustc/cargo 1.98.1，host triple x86_64-unknown-linux-gnu，rust-analyzer 1.98.1 在场，
+   node v10.19.0）
+   运行基线：rev `97ecbe59`（= 4b61987 的整改 + §V 台账提交），工作树 **clean**
+   被测二进制（一次跑一份，N-r2-5 记法）：
+     path  = /work/xc-v-bin/nexus-harness   （从 /work/nexus-dev/target 的构建**冻结副本**，
+              PATH 钉死 `which=/work/xc-v-bin/nexus-harness`，避开 §U/F-新5 那两个旧二进制陷阱）
+     md5   = 60819c3e508cbef90a9a9a63c3fd422f（复跑 N-r2-2 前后各核一次，两次一致）
+     mtime = 2026-10-13 07:20:24 +08:00
+     size  = 86044232 bytes
+   本机 contract_hash = f8c85522d7ad3b46b65fb5630e22f763339d29bc
+   本机 working_tree_digest（clean @ 97ecbe59）= 6159e482535d9c3481f32c922b570dfd1c7ad4d0
+   ⇒ 与 Windows §V 的 ef1a950b… / c1189dd8… 不是同一量的两次测量，**不要互相对账**。
+================================================================================
+
+门禁：
+
+    cargo fmt --all -- --check                     0 字节
+    cargo clippy -q -p nexus-harness --all-targets -- -D warnings
+                                                   exit 0，输出 0 字节
+    cargo test -q -p nexus-harness（串行）         **test result: ok. 153 passed; 0 failed** 20.44s
+    cargo test -q -p nexus-harness（并行）         **test result: ok. 153 passed; 0 failed** 10.03s
+    ⇒ 与 Windows 的 152 差 1 条，正好是 `#[cfg(unix)]` 的真实符号链接越界回归，口径吻合；
+      串并与行一致 ⇒ 这条不是被调度抖出来的。
+
+两枚新单测逐名实跑（`--bin nexus-harness`，串行）：
+
+    silent_daemon_probe_returns_within_the_probe_budget                ok  10.25s
+    takeover_flag_is_valueless_and_refused_on_serve_entry              ok  0.00s
+    ⇒ 探活预算在两宿主上都落在 ~10s 一档（Windows 10.00s），不是"只在某台机成立"的断言。
+
+N-r2-2 的真实 CLI 三档（**file stdio**；夹具 = accept 后永不回帧的监听者）：
+
+    status                     10.1s   UNKNOWN，daemon.running=false，原因带"握手失败…header read failed"
+    start（无 flag）           10.2s   UNKNOWN，**租约仍指向那个假端口**（没起第二个监听者）
+    start --takeover           20.7s   PASS，租约换代 33075 ⇒ 46255，daemon.running=true
+    code symbol Egress         16.7s   PASS，daemon.session_source="daemon"，reused=false，queries=1
+    code symbol Ingress        15.2s   PASS，reused=true，queries=2
+    daemon stop                 0.25s  PASS，sessions_after_stop=0，
+                                       stop_reply={sessions_before_stop:1, sessions_after_stop:0}，租约已删
+
+    这一档**第一版脚本没跑起来**（见文末"运行期缺陷"），上面数字是改脚本后重跑的；
+    重跑前后被测物 md5 复验一致 ⇒ 不是换了一份二进制再说话。
+
+B-2 / N-r2-1 的活 daemon 观测（默认命名空间，非 selftest 的私有命名空间）：
+
+    daemon start   ⇒ PASS running=true port=34621
+    code symbol Egress --no-cache ⇒ PASS，session_source=daemon，reused=false，16.5s
+    daemon stop    ⇒ PASS，after=0 / before=1，stopped 帧是唯一出处
+    CLI 侧 daemon.provider_sessions=0（**带出的观测**，不再是对空池二次 drain 的恒 0）
+
+`daemon selftest`（同一冻结二进制，跑两次）：
+
+    run1: verdict=PASS probe_count=23 红 0 枚 duration_ms=108561
+    run2: verdict=PASS probe_count=23 红 0 枚 duration_ms=106916
+    ⇒ 散布 1.02x；与 §V 的 Windows 126.7s 是**跨宿主**差，不是同量散布，不并成一个数。
+
+26 条 code_intelligence_* 场景：**26/26 PASS，0 条非 PASS**（串行批次）
+
+    关键条：daemon-lifecycle scenario-ea626adab72b 102765ms；
+    diagnostics-advisory scenario-835549786d4c 16710ms —— 这条在 §V 的 Windows 上是
+    **负载假红**（20s 取诊断超时），在本宿主新鲜跑通，且这里 `--no-cache` 路径与缓存路径都在
+    cache-disabled 场景里单独钉过 ⇒ Windows 那条 FAIL 的判因（宿主争用）成立。
+    其余 id 全在 /work/xc-v-linux.log 的 scenarios 段。
+
+`verify --fast`：**overall PASS，9/9 门，无 UNKNOWN**
+    Evidence id = c9a664695f85
+    bindings: contract f8c85522d7ad3b46b65fb5630e22f763339d29bc /
+              tree 6159e482535d9c3481f32c922b570dfd1c7ad4d0 /
+              rev 97ecbe590808d14920564c620db632b998145424 / dirty false /
+              triple x86_64-unknown-linux-gnu / toolchain 1.98.1
+
+`verify --full`：**本 rev 没跑，且不是忘了跑** —— /work 实测只剩 23G（上一轮记录要 ≥45G），
+    跑法会半途 OOS 掉磁盘并把 Evidence 写成残缺。宁可留"无 --full 结论"，不交一份会自毁的门禁。
+
+善后：daemon_serve_left=0，/tmp 下自建命名空间 0 个（清理是脚本自己做的，不是靠人记）。
+
+运行期缺陷（公开，属我这轮的工具使用错误而不是被测物缺陷）：N-r2-2 那档第一版脚本用了
+`fs.rmSync`，而远端是 **node v10.19.0**（没有该函数）⇒ 整块 `TypeError` 退出，
+**没有产生任何观测**（症状是那一段只留一行报错）。我按本机 node 24 的 API 假设了远端。
+处置：脚本自带递归 `rmrf` 后重跑，得到上面数字。教训两条：① 远端工具链版本必须**实测**，
+不能从"我们两台机都是开发机"推；② 观测缺失要在台账里写成"第一版没跑起来"，
+而不是事后只放一个数字 —— 否则读者会以为它一次就过了。
