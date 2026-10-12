@@ -1,0 +1,36 @@
+schema_version = 1
+id = "product.n2-session-watch-not-found"
+title = "session watch 未知 id：结构化 NOT_FOUND（不伪造会话）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#16-n2-resource-access"
+
+[given]
+# N2 收尾补场景（2026-10-12，post-freeze coverage addition；不属于 P0-0 冻结集）。
+# 契约依据：D1/D7（Session＝一次资源使用；状态查询是 N2 交付面）+
+# P0 完成标志 3（按 SessionId 查询）。既有 n2-session-watch 覆盖种子会话的
+# 正常查询；本场景覆盖查无此会话面：必须显式 NOT_FOUND（kind=session、
+# 回显被查 id），不得返回伪造的 Active 状态。期望对当前实现冻结。
+session_id = "sess-nope"
+
+[when]
+command = "cargo run --quiet -p nexus -- session watch sess-nope --json"
+
+# 冻结期望：
+# - verdict=FAIL（显式失败，非静默）
+# - error.code=NOT_FOUND；error.kind=session；error.id 精确回显被查 id
+#   （错误必须可定位到具体对象）
+[[expect]]
+field = "verdict"
+equals = "FAIL"
+
+[[expect]]
+field = "error.code"
+equals = "NOT_FOUND"
+
+[[expect]]
+field = "error.kind"
+equals = "session"
+
+[[expect]]
+field = "error.id"
+equals = "sess-nope"

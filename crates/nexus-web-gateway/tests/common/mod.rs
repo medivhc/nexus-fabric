@@ -81,6 +81,23 @@ pub struct TestSshd {
 }
 
 impl TestSshd {
+    /// Spawn a real sshd, or return `None` when the environment cannot run
+    /// it (no `sshd`/`ssh-keygen` on PATH). Tests MUST treat `None` as an
+    /// explicit environment skip (print a reason and return early), never as
+    /// a product failure (review H4). All other spawn errors still propagate.
+    pub fn spawn_if_available() -> Option<Self> {
+        if which_sshd().is_none() || which_ssh_keygen().is_none() {
+            eprintln!(
+                "skip: sshd/ssh-keygen not found on PATH; SSH gateway e2e tests require openssh-server"
+            );
+            return None;
+        }
+        match Self::spawn() {
+            Ok(s) => Some(s),
+            Err(e) => panic!("sshd available but spawn failed: {e}"),
+        }
+    }
+
     /// Spawn a real `sshd` on a loopback high port.
     pub fn spawn() -> Result<Self, Box<dyn std::error::Error>> {
         // Hold the lock for the whole spawn: the port is reserved by binding
@@ -140,6 +157,11 @@ impl TestSshd {
         let port = reserve_loopback_port();
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse()?;
         let user = whoami();
+        // The fixture connects as the current user (including root in
+        // containers); `PermitRootLogin no` + `AllowUsers root` made every
+        // SSH test fail as root. Adapt the policy to the effective uid
+        // (review H4).
+        let permit_root_login = if running_as_root() { "yes" } else { "no" };
         let config_path = dir.join("sshd_config");
         let config = format!(
             "Port {port}\n\
@@ -152,7 +174,7 @@ impl TestSshd {
              PubkeyAuthentication yes\n\
              StrictModes no\n\
              AuthorizedKeysFile {authorized_keys}\n\
-             PermitRootLogin no\n\
+             PermitRootLogin {permit_root_login}\n\
              AllowUsers {user}\n\
              UseDNS no\n\
              LogLevel VERBOSE\n",
@@ -247,6 +269,20 @@ fn whoami() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "root".to_string())
+}
+
+/// Whether tests execute as root (containers/CI). `id -u` is the primary
+/// signal on Unix; the USER variable is a fallback.
+fn running_as_root() -> bool {
+    if whoami() == "root" {
+        return true;
+    }
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .is_some_and(|s| s.trim() == "0")
 }
 
 /// Reserve a loopback TCP port by binding then releasing a listener.
@@ -453,14 +489,13 @@ impl Browser {
             sdp,
         })?;
 
-        // Drive until the relay answer arrives.
-        let relay_answer = loop {
-            self.drive_all(Duration::from_millis(50))?;
-            if let Some(NodeMessage::RelayAnswer { sdp, .. }) =
-                self.peers[0].take_message(|m| matches!(m, NodeMessage::RelayAnswer { .. }))
-            {
-                break sdp;
-            }
+        // Drive until the relay answer arrives (bounded: a missing answer is
+        // a failure, not an infinite hang — review H4).
+        let relay_answer = match self.wait_message_at(0, Duration::from_secs(10), |m| {
+            matches!(m, NodeMessage::RelayAnswer { .. })
+        })? {
+            NodeMessage::RelayAnswer { sdp, .. } => sdp,
+            _ => unreachable!("predicate matched RelayAnswer"),
         };
 
         let answer = relay_answer.to_answer().map_err(|e| e.to_string())?;
@@ -484,6 +519,31 @@ impl Browser {
             std::thread::sleep(Duration::from_millis(1));
         }
         Ok(())
+    }
+
+    /// Drive all peers until peer `peer_idx` receives a message matching
+    /// `predicate`, or until `timeout` elapses. All e2e waits must go through
+    /// this helper so a missing message fails with a deadline instead of
+    /// hanging the whole test binary until an external kill (review H4).
+    pub fn wait_message_at(
+        &mut self,
+        peer_idx: usize,
+        timeout: Duration,
+        predicate: impl Fn(&NodeMessage) -> bool,
+    ) -> Result<NodeMessage, Box<dyn std::error::Error>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.drive_all(Duration::from_millis(50))?;
+            if let Some(msg) = self.peers[peer_idx].take_message(&predicate) {
+                return Ok(msg);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for node message on peer {peer_idx}"
+                )
+                .into());
+            }
+        }
     }
 }
 

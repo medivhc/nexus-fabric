@@ -1,0 +1,28 @@
+schema_version = 1
+id = "product.n2-use-unknown-not-found"
+title = "nexus use 未知资源：结构化 NOT_FOUND（resolve 失败显式，不静默）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#16-n2-resource-access"
+
+[given]
+# N2 收尾补场景（2026-10-12，post-freeze coverage addition；不属于 P0-0 冻结集）。
+# 契约依据：D2（名字经本地解析；名字≠定位）+ §16.1（ResourceId 不透明）；
+# use_cli 模块契约"未知资源 → FAIL / NOT_FOUND"。
+# 既有 n2-grant-deny-audit 从"可解析但无权限"侧覆盖 D6；本场景覆盖它的
+# 前置面：名字不在目录中时必须在 resolve 阶段显式失败（结构化 NOT_FOUND），
+# 而不是伪造 session 或静默挂起。期望对当前实现冻结（加入即 Protected）。
+resource_name = "no-such-svc"
+
+[when]
+command = "cargo run --quiet -p nexus -- use no-such-svc --json"
+
+# 冻结期望：
+# - verdict=FAIL（显式失败，非静默）
+# - error.code=NOT_FOUND（结构化解析失败码）
+[[expect]]
+field = "verdict"
+equals = "FAIL"
+
+[[expect]]
+field = "error.code"
+equals = "NOT_FOUND"

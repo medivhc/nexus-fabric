@@ -1,0 +1,34 @@
+schema_version = 1
+id = "product.n2-revoked-resource-unusable"
+title = "撤销生效：资源 revoke 后不可再 use（名字不可解析，结构化 NOT_FOUND）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#16-n2-resource-access"
+
+[given]
+# N2 收尾补场景（2026-10-12，post-freeze coverage addition；不属于 P0-0 冻结集）。
+# 契约依据：白皮书 §7.3"发布入口必须能够撤销，并显示其当前生效状态"+
+# D6"`nexus resource revoke` 同时 tombstone 该资源的全部 grant——撤销只删
+# 广告不撤 grant 不算撤销生效"。
+# 既有 n2-resource-revoke 锁定撤销调用的显式回显（revoked=true）与
+# "撤销后 `resource list` 不得再列出它"的注释期望；本场景锁定撤销的**后续
+# 效果**：已发布（且自动自授权 Use）的资源在 revoke 后名字从目录消失，
+# `use` 必须干净 NOT_FOUND，而非沿用旧授权继续可用。
+fixture = [
+  "cargo run --quiet -p nexus -- node init --json",
+  "cargo run --quiet -p nexus -- resource publish --name dev-svc --kind service --locator 127.0.0.1:8080 --json",
+  "cargo run --quiet -p nexus -- resource revoke dev-svc --json",
+]
+
+[when]
+command = "cargo run --quiet -p nexus -- use dev-svc --json"
+
+# 冻结期望：
+# - verdict=FAIL（撤销后不可使用）
+# - error.code=NOT_FOUND（名字已从目录消失；干净解析失败，非假成功）
+[[expect]]
+field = "verdict"
+equals = "FAIL"
+
+[[expect]]
+field = "error.code"
+equals = "NOT_FOUND"
