@@ -9,6 +9,8 @@
 //! 路径约定（MODULE.md 冻结）：`--workspace`、位置参数里的 path、diagnostics
 //! 目标一律**相对仓库根**解析；目标必须落在 `--workspace` 范围内（提案 §14）。
 
+mod cache;
+pub(crate) mod daemon;
 mod dto;
 mod lsp;
 pub(crate) mod mcp;
@@ -36,6 +38,10 @@ struct Request {
     budget: Budget,
     timeouts: Timeouts,
     provider_override: Option<String>,
+    /// `--no-daemon`：完全不问 daemon（契约「`code` / `context` 支持 `--no-daemon`」）。
+    use_daemon: bool,
+    /// `--no-cache`：不读也不写结果缓存。
+    use_cache: bool,
 }
 
 /// 查询目标在**启动 provider 之前**就完成解析与存在性校验：
@@ -55,6 +61,11 @@ struct Envelope {
     budget: Option<Budget>,
     provider: Option<ProviderMeta>,
     snapshot: Option<Value>,
+    /// 经由 daemon 与否（`daemon.*`）。一旦确定就跟着 envelope 走，
+    /// 包括失败路径 —— "回落了"这件事必须在输出里看得见，而不是只在成功时有。
+    daemon: Option<Value>,
+    /// 结果缓存的本次观测（`cache.*`）。
+    cache: Option<Value>,
 }
 
 impl Envelope {
@@ -64,6 +75,8 @@ impl Envelope {
             budget: None,
             provider: None,
             snapshot: None,
+            daemon: None,
+            cache: None,
         }
     }
 
@@ -80,6 +93,12 @@ impl Envelope {
         }
         if let Some(s) = &self.snapshot {
             out.push(("snapshot".to_string(), s.clone()));
+        }
+        if let Some(d) = &self.daemon {
+            out.push(("daemon".to_string(), d.clone()));
+        }
+        if let Some(c) = &self.cache {
+            out.push(("cache".to_string(), c.clone()));
         }
         out
     }
@@ -186,6 +205,173 @@ pub fn run_with_session(args: &[String], session: &mut Option<ProviderSession>) 
         version: version.clone(),
         digest: bindings_before.working_tree_digest.clone(),
     };
+    // ---- 结果缓存与 daemon 选路（MODULE.md「Provider Daemon & Result Cache」）----
+    // 顺序是契约要求的：先有 provider 版本才能算键，先算键才能看缓存，
+    // 缓存没命中才去问 daemon —— 反过来就等于回放路径也要付一次握手成本。
+    let namespace = daemon::namespace_from_env_or(&repo.root);
+    let cache_dir_path = daemon::cache_dir(&namespace);
+    // target 分量取本次 argv（去掉两个策略 flag：它们改的是"怎么问"，不是"问什么"）。
+    // 宁可因为多算一项而 miss，也不能因为少算一项把两个不同查询当成同一个。
+    let target_component = args
+        .iter()
+        .skip(1)
+        .filter(|a| a.as_str() != "--no-daemon" && a.as_str() != "--no-cache")
+        .cloned()
+        .collect::<Vec<String>>()
+        .join("\u{1f}");
+    let cache_key = cache::CacheKey {
+        digest: bindings_before.working_tree_digest.clone(),
+        workspace: request.budget.workspace_scope.clone(),
+        verb: verb.name().to_string(),
+        target: target_component,
+        provider_version: version.clone(),
+        budget: format!(
+            "{}/{}/{}/{}",
+            request.budget.max_results,
+            request.budget.max_snippet_lines,
+            request.budget.max_result_bytes,
+            request.budget.workspace_scope
+        ),
+    };
+    let mut cache_view = CacheView {
+        tier: "miss",
+        key_digest: cache_key.digest.clone(),
+        entries: 0,
+        bytes: 0,
+        disabled: !request.use_cache,
+    };
+    let mut daemon_state = daemon::DaemonState::not_asked(None);
+    // `detected`（有没有可用 daemon）与 `running`（本次是否经由它）分开问：
+    // 合成一个字段的话，`--no-daemon` 下两种读法都自洽，场景就变成碰运气。
+    if let Some(lease) = daemon::read_lease(&namespace) {
+        let (alive, pong, reason) = daemon::probe(&lease);
+        daemon_state.detected = alive;
+        daemon_state.stale_lease = !alive;
+        if !alive {
+            daemon_state.unavailable = Some(reason);
+        }
+        if let Some(p) = pong.as_ref() {
+            daemon_state.provider_sessions =
+                p.get("sessions").and_then(Value::as_u64).unwrap_or(0) as usize;
+            daemon_state.capacity = p.get("capacity").and_then(Value::as_u64).unwrap_or(1) as usize;
+            daemon_state.idle_secs = p.get("idle_secs").and_then(Value::as_u64).unwrap_or(0);
+        }
+        daemon_state.lease = Some(lease);
+    }
+    cache_view.refresh(&cache_dir_path);
+    attach(&mut envelope, &daemon_state, &cache_view);
+
+    // ① 命中路径：不握手、不起 provider、不连 daemon。逐字回放结果本体，
+    //    运行元数据按本次重新生成（契约「缓存命中时返回什么」①②）。
+    if !cache_view.disabled {
+        if let Some(hit) = cache::lookup(&cache_dir_path, &cache_key) {
+            cache_view.tier = "disk";
+            cache_view.refresh(&cache_dir_path);
+            daemon_state.session_source = "cache";
+            // 命中不放宽指纹检查：这里取的是"查询后"那一次。
+            if let Some(f) = stale_after(&repo, &bindings_before) {
+                attach(&mut envelope, &daemon_state, &cache_view);
+                return fail(&envelope, &f);
+            }
+            let meta = ProviderMeta {
+                kind: text_field(&hit.provider, "kind"),
+                binary: text_field(&hit.provider, "binary"),
+                version: text_field(&hit.provider, "version"),
+                ready: hit
+                    .provider
+                    .get("ready")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                duration_ms: started.elapsed().as_millis(),
+                ..Default::default()
+            };
+            let mut budget = request.budget.clone();
+            budget.truncated = hit
+                .budget
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            envelope.provider = Some(meta);
+            envelope.budget = Some(budget);
+            attach(&mut envelope, &daemon_state, &cache_view);
+            let mut fields = envelope.fields();
+            fields.push(("results".to_string(), json!(hit.results)));
+            fields.push(("count".to_string(), json!(hit.count)));
+            if let Some(c) = &hit.continuation {
+                fields.push(("continuation".to_string(), c.clone()));
+            }
+            return (
+                "PASS".to_string(),
+                format!(
+                    "{}：命中 {} 条（结果缓存回放，未起 provider）",
+                    verb.name(),
+                    hit.count
+                ),
+                fields,
+            );
+        }
+    }
+
+    // ② daemon 路径。两种失败要分清楚：
+    //    - 通道坏了（连不上/握手失败）⇒ 回落进程内，并把回落原因写进输出；
+    //    - daemon 正常回答了一个业务错误 ⇒ 照实采用。重跑一遍等于把"daemon 说没有这个符号"
+    //      改成"我自己再问一次说有"，那才是真正的答案漂移。
+    if request.use_daemon {
+        match daemon::route(&repo.root, true) {
+            daemon::Route::Connected(mut client, lease) => {
+                match client.query(&repo.root, args, &want_key.digest) {
+                    Ok(reply) => {
+                        let ok = reply.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                        let mut meta = reply
+                            .get("provider")
+                            .map(ProviderMeta::from_json)
+                            .unwrap_or_default();
+                        meta.duration_ms = started.elapsed().as_millis();
+                        envelope.provider = Some(meta);
+                        daemon_state.running = ok;
+                        daemon_state.session_source = if ok { "daemon" } else { "in-process" };
+                        daemon_state.lease = Some(lease);
+                        attach(&mut envelope, &daemon_state, &cache_view);
+                        if !ok {
+                            let f = wire_failure(&reply);
+                            return fail(&envelope, &f);
+                        }
+                        let items: Vec<Value> = reply
+                            .get("results")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        return deliver(
+                            envelope,
+                            &daemon_state,
+                            &mut cache_view,
+                            &request,
+                            verb,
+                            items,
+                            &repo,
+                            &bindings_before,
+                            &cache_dir_path,
+                            &cache_key,
+                        );
+                    }
+                    Err(e) => {
+                        daemon_state.running = false;
+                        daemon_state.detected = false;
+                        daemon_state.stale_lease = true;
+                        daemon_state.unavailable = Some(e);
+                        attach(&mut envelope, &daemon_state, &cache_view);
+                    }
+                }
+            }
+            daemon::Route::Unavailable { state, reason } => {
+                daemon_state.stale_lease = state.stale_lease;
+                daemon_state.unavailable = Some(reason);
+                attach(&mut envelope, &daemon_state, &cache_view);
+            }
+            daemon::Route::NotAsked => {}
+        }
+    }
+
     let mut reused = false;
     let mut session_queries = 1usize;
     let mut invalidated: &'static str = "";
@@ -260,30 +446,163 @@ pub fn run_with_session(args: &[String], session: &mut Option<ProviderSession>) 
     };
 
     // 提案 §13：查询完成后再算一次 digest，工作树变了就不能当作当前事实。
-    let bindings_after = Bindings::current(&repo);
-    if digest_is_unusable(&bindings_after.working_tree_digest) {
-        let e = CodeIntelError::WorkspaceUnresolved.with_reason(
-            "查询结束后取不到可信的工作树指纹（git status/write-tree 失败或降级），无法证明结果仍绑定查询时的 revision"
-                .to_string(),
-        );
-        return fail(&envelope, &e);
-    }
-    if bindings_after.working_tree_digest != bindings_before.working_tree_digest {
-        let e = CodeIntelError::SnapshotStale
-            .with_reason("查询期间工作树发生变化（working_tree_digest 不一致）".to_string());
-        return fail(&envelope, &e);
+    // 这段判定连同预算裁剪一起进了 `deliver`，因为进程内、daemon、缓存三条路径
+    // 必须走同一个收尾 —— 复制两份"查询前后指纹一致"的检查，迟早只改一份。
+    deliver(
+        envelope,
+        &daemon_state,
+        &mut cache_view,
+        &request,
+        verb,
+        items,
+        &repo,
+        &bindings_before,
+        &cache_dir_path,
+        &cache_key,
+    )
+}
+
+/// `cache.*` 的本次观测。`key_digest` 报的是**键里的工作树指纹本身**：契约要求命中时它等于
+/// 当次 `snapshot.working_tree_digest`，所以它不能是条目文件名里那个哈希。
+struct CacheView {
+    tier: &'static str,
+    key_digest: String,
+    entries: usize,
+    bytes: u64,
+    disabled: bool,
+}
+
+impl CacheView {
+    /// 条目数与字节直接取目录实况：上限判定用的就是同一份统计，不另算一套。
+    fn refresh(&mut self, dir: &Path) {
+        let (n, b) = cache::stats(dir);
+        self.entries = n;
+        self.bytes = b;
     }
 
+    fn to_json(&self) -> Value {
+        json!({
+            "tier": if self.disabled { "miss" } else { self.tier },
+            "key_digest": self.key_digest,
+            "entries": self.entries,
+            "bytes": self.bytes,
+            "disabled": self.disabled,
+        })
+    }
+}
+
+/// 把 `daemon.*` 与 `cache.*` 挂到 envelope。三条路径的每个出口都调它，这样"回落了"
+/// 和"这次没缓存"在**失败**输出里同样看得见 —— 只在成功时才有这些字段，就等于
+/// 把回落藏成了普通失败。
+fn attach(envelope: &mut Envelope, d: &daemon::DaemonState, c: &CacheView) {
+    envelope.daemon = Some(d.to_json());
+    envelope.cache = Some(c.to_json());
+}
+
+fn text_field(v: &Value, key: &str) -> String {
+    v.get(key).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+/// 查询后的指纹复核。两个失败出口分开：取不到指纹 ≠ 指纹没变，
+/// 把前者说成后者就是把"无法证明"写成一条正面事实。
+fn stale_after(repo: &Repo, before: &Bindings) -> Option<Failure> {
+    let after = Bindings::current(repo);
+    if digest_is_unusable(&after.working_tree_digest) {
+        return Some(CodeIntelError::WorkspaceUnresolved.with_reason(
+            "查询结束后取不到可信的工作树指纹（git status/write-tree 失败或降级），无法证明结果仍绑定查询时的 revision"
+                .to_string(),
+        ));
+    }
+    if after.working_tree_digest != before.working_tree_digest {
+        return Some(
+            CodeIntelError::SnapshotStale
+                .with_reason("查询期间工作树发生变化（working_tree_digest 不一致）".to_string()),
+        );
+    }
+    None
+}
+
+/// daemon 业务错误帧 → `Failure`。错误码沿用那 10 个冻结码，daemon 不新造一套；
+/// 未知码按 PROVIDER_CRASHED 处理，而不是翻译成一个看起来"能用"的码。
+fn wire_failure(reply: &Value) -> Failure {
+    let e = &reply["error"];
+    let code = e.get("code").and_then(Value::as_str).unwrap_or("");
+    let reason = e
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("daemon 未给出原因")
+        .to_string();
+    let mapped = match code {
+        "WORKSPACE_UNRESOLVED" => CodeIntelError::WorkspaceUnresolved,
+        "QUERY_INVALID" => CodeIntelError::QueryInvalid,
+        "SYMBOL_NOT_FOUND" => CodeIntelError::SymbolNotFound,
+        "PROVIDER_UNAVAILABLE" => CodeIntelError::ProviderUnavailable,
+        "INITIALIZATION_FAILED" => CodeIntelError::InitializationFailed,
+        "TIMEOUT" => CodeIntelError::Timeout,
+        "SNAPSHOT_STALE" => CodeIntelError::SnapshotStale,
+        "UNSUPPORTED" => CodeIntelError::Unsupported,
+        "RESULT_TRUNCATED" => CodeIntelError::ResultTruncated,
+        _ => CodeIntelError::ProviderCrashed,
+    };
+    mapped.with_reason(format!("{reason}（经 daemon）"))
+}
+
+/// 进程内 / daemon / 缓存三条路径共用的收尾：指纹复核 → 预算裁剪 → 可缓存则落盘 → 组装字段。
+/// 收尾只有一份，因为"查询前后指纹一致"这条检查被复制出去迟早只改一份（round 2 的 `..`
+/// 绕过就是这么来的）。
+#[allow(
+    clippy::too_many_arguments,
+    reason = "三条路径共用的收尾，参数就是它需要的那些事实"
+)]
+fn deliver(
+    mut envelope: Envelope,
+    daemon_state: &daemon::DaemonState,
+    cache_view: &mut CacheView,
+    request: &Request,
+    verb: Verb,
+    items: Vec<Value>,
+    repo: &Repo,
+    bindings_before: &Bindings,
+    cache_dir: &Path,
+    cache_key: &cache::CacheKey,
+) -> Outcome {
+    if let Some(f) = stale_after(repo, bindings_before) {
+        attach(&mut envelope, daemon_state, cache_view);
+        return fail(&envelope, &f);
+    }
     let mut budget = request.budget.clone();
     let (kept, count, continuation) = apply_budget(items, &mut budget);
+    let continuation_json = continuation.map(|hint| json!({"refinement_hint": hint}));
+    envelope.budget = Some(budget.clone());
+    // 可缓存性条件（契约③）：只有 `provider.ready==true` 的结果入缓存。
+    // 把未就绪/失败的空结果落盘，就是给"没测到"建一台永久化的机器。
+    let cacheable = envelope.provider.as_ref().map(|m| m.ready).unwrap_or(false);
+    if !cache_view.disabled && cacheable {
+        let provider_json = envelope
+            .provider
+            .as_ref()
+            .map(ProviderMeta::to_json)
+            .unwrap_or(Value::Null);
+        let report = cache::store(
+            cache_dir,
+            cache_key,
+            &cache::build_payload(
+                &kept,
+                count,
+                &budget.to_json(),
+                &provider_json,
+                continuation_json.as_ref(),
+            ),
+        );
+        cache_view.entries = report.entries;
+        cache_view.bytes = report.bytes;
+    }
+    attach(&mut envelope, daemon_state, cache_view);
     let mut fields = envelope.fields();
     fields.push(("results".to_string(), json!(kept)));
     fields.push(("count".to_string(), json!(count)));
-    if let Some(existing) = fields.iter_mut().find(|(k, _)| k == "budget") {
-        existing.1 = budget.to_json();
-    }
-    if let Some(hint) = continuation {
-        fields.push(("continuation".to_string(), json!({"refinement_hint": hint})));
+    if let Some(c) = &continuation_json {
+        fields.push(("continuation".to_string(), c.clone()));
     }
     let message = format!(
         "{}：命中 {count} 条，返回 {} 条",
@@ -637,6 +956,8 @@ fn parse_request(verb: Verb, args: &[String], repo: &Repo) -> Result<Request, Fa
     let mut budget = Budget::default();
     let mut timeouts = Timeouts::default();
     let mut provider_override: Option<String> = None;
+    let mut use_daemon = true;
+    let mut use_cache = true;
     let mut index = 0usize;
 
     while index < args.len() {
@@ -670,6 +991,10 @@ fn parse_request(verb: Verb, args: &[String], repo: &Repo) -> Result<Request, Fa
             "--provider-binary" => {
                 provider_override = Some(take_option_arg(args, &mut index, "--provider-binary")?);
             }
+            // 两个策略 flag 不带值，也**不进缓存键的 target 分量**（见 run_with_session）：
+            // 它们改变的是"这次怎么问"，不是"问的是什么"。
+            "--no-daemon" => use_daemon = false,
+            "--no-cache" => use_cache = false,
             other if other.starts_with("--") => {
                 return Err(CodeIntelError::QueryInvalid.with_reason(format!("未知选项：{other}")));
             }
@@ -711,6 +1036,8 @@ fn parse_request(verb: Verb, args: &[String], repo: &Repo) -> Result<Request, Fa
         target,
         workspace,
         budget,
+        use_daemon,
+        use_cache,
         timeouts,
         provider_override,
     })

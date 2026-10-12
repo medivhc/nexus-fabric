@@ -89,6 +89,7 @@ fn dispatch(command: &str, rest: &[String]) -> Outcome {
         "scenario" => scenario_cmd::dispatch(rest),
         "code" => code_intel::run(rest),
         "mcp" => code_intel::mcp::dispatch(rest),
+        "daemon" => code_intel::daemon::dispatch(rest),
         "bench" => commands::bench(),
         "replay" => (
             "UNKNOWN".to_string(),
@@ -96,9 +97,13 @@ fn dispatch(command: &str, rest: &[String]) -> Outcome {
                 .to_string(),
             Vec::new(),
         ),
+        // 这份清单必须与上面的 match 一一对应。实现时实测它漏过 `mcp`（Phase 3 加的）与
+        // `daemon`，补的时候又漏过一次 `run` —— 同一漂移第三次出现，所以它不再靠人读：
+        // `daemon selftest` 的 `commands_surface_lists_daemon` 按 13 个全名逐个核对，缺哪个报哪个。
         _ => (
             "BLOCKED".to_string(),
-            "supported commands: status, context, check, test, verify, explain, bench, replay, scenario, code"
+            "supported commands: status, context, check, test, verify, explain, bench, replay, \
+             scenario, run, code, mcp, daemon"
                 .to_string(),
             Vec::new(),
         ),

@@ -723,3 +723,75 @@ squash 之后没再碰过这些文件，且逐文件比对后 theirs 独有行�
     处置：不削弱、不改（不动时间上界、不加 #[ignore]、不改期望）。它们在 master 自己的代码上跑，
     `git diff --stat origin/master...HEAD -- scenario.rs run_scenario.rs` 为空可证本分支没碰过那个文件。
     这是上游测试的隔离性问题，作为独立事项提给所有者，不混进本特性。
+
+================================================================================
+§T daemon + 结果缓存实现的 Windows 冒烟复跑（2026-10-13，宿主 SH-YF-CX-PC，
+   rustc/cargo 1.95.0，host triple x86_64-pc-windows-msvc，rust-analyzer 在场）
+   运行基线：rev `4ef8a5a` + 未提交的实现工作树（dirty_state=true ⇒ 下面的
+   working_tree_digest 与 contract_hash 都是"含未提交改动"的值，别拿它们当 rev 的绑定）
+================================================================================
+
+门禁（每条都是这轮实跑，不是引用上一轮）：
+
+    cargo fmt --all -- --check                exit 0，0 字节
+    cargo clippy -q -p nexus-harness --all-targets -- -D warnings
+                                              exit 0，无输出（含新增两模块与测试目标）
+    cargo test -q -p nexus-harness            149 个 = 146 passed + 3 failed（--test-threads=1）
+                                              并行：144 passed + 5 failed
+                                              多出的 2 条 = master 自带的 run_command_ignores_stderr…
+                                              与 run_command_orphaned_grandchild…，串行全过（§S 同一条）
+                                              3 条固定失败 = POSIX echo 那三条（DEVELOPMENT.md §11.1）
+                                              新增 12 条 = cache.rs 6 + daemon.rs 6，与预期数目对上
+
+`daemon selftest --workspace engineering/nexus-harness/fixtures/code-intel --json`：
+
+    第二轮（会话池缺陷修好后）      PASS  probe_count=23  duration_ms=330653
+    第三轮（两处弱断言加严后）      PASS  probe_count=23  duration_ms=268917
+    最终码（cache_default_enabled 修正后）由场景承载：lifecycle PASS 172532ms，29/29 期望成立
+
+    逐值：start_verdict=PASS status_running_after_start=true already_running=true
+    default_path_session_source=in-process default_path_lease_absent=true
+    second_process_session_source=daemon reuse_provider_sessions=1
+    stale_lease_detected=true stale_fallback_verdict=PASS stale_fallback_session_source=in-process
+    wrong_token_rejected=true idle_self_exit_observed=true lease_removed_on_idle=true
+    stop_absent_verdict=UNKNOWN sessions_after_stop=0 lru_provider_sessions_at_capacity=1
+    cache_second_run_tier=disk cache_default_enabled=true cache_disableable=true
+    commands_surface_lists_daemon=true unknown_flag_blocked=true defaults_idle_secs=900
+    dirty_after_lifecycle=0
+
+    时延就登记为时延，不作判据：同一份码同一台机器三次 330.7s / 268.9s / 172.5s（差 1.9 倍），
+    而 `scenario.rs` 的命令超时是硬编码 600s ⇒ 余量在负载宿主上只有 ~1.8x。
+    r4 前置条件 6 要的就是这个数，现在它有实测了：**够跑，但不宽裕**，Linux 侧另测。
+
+26 条 code_intelligence_* 场景（串行批次，逐条 evidence_id 见 .evidence/）：
+
+    批次首轮（缓存字段值修正前的二进制）：25 PASS + 1 FAIL
+      FAIL = daemon-lifecycle @ failed_step=expect / assertion=cache_default_enabled
+             scenario-50981b88bd47
+    修正后单独复跑 daemon-lifecycle        ：PASS（29 条期望全成立）scenario-50981b88bd47（同 id 被覆盖，
+             这正是台账里"场景证据 ID 确定性覆盖"那条待办的现实后果，案卷得先落盘再复跑）
+    ⇒ Windows 冒烟结论：**26/26 PASS**
+
+我在这轮里错了两处，都公开记下：
+
+1. **`cache_default_enabled` 的语义被我读反**。契约清单给的是"默认允许"这个性质值 `true`，
+   我第一版把 `cache.disabled` 的原始 `false` 当观测字段发出去 ⇒ selftest 自己自洽（我连期望值
+   都按 `false` 写），是**场景**把它钉成 `equals = true` 才暴露的。修的是探针不是场景。
+   连带结论：我的 `daemon_selftest_field_list_matches_contract` 只对齐**字段名**不对齐**值**，
+   值层面目前只剩场景这一个承载体 ⇒ 已登记为待办（要不要把契约的值列也做成机器核对）。
+2. **我把"没修好"写成了"已修"**：管道句柄那条（`.agents/code-intelligence-followups.md` F-新2）
+   我登记成"本轮已做"，随后三种写法逐个实测证明 stdio 写法管不住它 ⇒ 已在原处更正为
+   "这是 Windows 的可继承句柄传播，按 forbid(unsafe_code)+零依赖的约束不修，只写明消费口径"。
+
+会话池那个真缺陷（值得留在案卷里，因为它不会被"看起来对"的实现暴露）：
+
+    症状：reuse_provider_sessions=2、lru_provider_sessions_at_capacity=2（应为 1）
+    根因：非复用分支只在"别的 workspace"里找驱逐对象 ⇒ 同一个 workspace 的失效会话（最常见是
+          working_tree 指纹变了）被**并存**而不是替换，`--max-workspaces 1` 也能被撑到 2
+    修法：先按 workspace 换掉同树的旧会话（并 absorb 它的三个 refusal 计数），再按容量驱逐别的
+          workspace；顺带给 pong 加 `session_keys` 分量 —— 加之前"为什么没复用"只能靠猜
+    复测：第二轮起两枚探针都是 1
+
+对 Phase 3/4 没有回归：mcp-handshake PASS 1511ms、mcp-real-query PASS 21026ms。
+这轮我给 `mcp serve` 的 argv 强制加了 `--no-daemon --no-cache`（契约隔离 ⑤ 的落地），
+`warm_query_roundtrip`/`provider_session_reused` 因此不可能被我自己的缓存或环境里的 daemon 糊过去。

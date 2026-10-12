@@ -381,3 +381,64 @@ round 2 的 N1-N7 + S1 **全部 CLOSED**（这次审查者跑了 29 条命令并
      机器核对，少一条即 `UNKNOWN`/`FAIL` 并列出文件名；
   ③ 顺手把 `lookup` 与 `expect` 的区分写进 `DEVELOPMENT.md`（本模块已两次靠它辨认真红灯）。
 - 本轮不动它：属 harness 通用能力，与本特性无耦合；混在 daemon 提交里会让两件事都难审。
+
+## daemon 实现落地时新学到的三条（2026-10-13，Windows 冒烟宿主）
+
+### F-新1：daemon 在跑会锁住可执行文件，`cargo build` / `cargo run` 直接失败
+
+- 实测症状：`cargo build -q -p nexus-harness` 报
+  `error: failed to remove file D:\next\ci-p24\target\debug\nexus-harness.exe  拒绝访问。(os error 5)`；
+  另有一个 `cargo run -p nexus-harness -- verify --fast`（00:44 起）因为同样的锁**卡了 6 分钟没结束**。
+- 机理：Windows 给运行中的映像加文件锁。daemon 与 harness 是同一个 exe ⇒ 只要有一个 daemon 活着，
+  这个 exe 就编不动。Linux 上没有这件事（可覆盖已打开的 inode）。
+- 为什么不是"实现细节"而是流程：**冒烟宿主的整个验证顺序被它约束**。跑 `daemon selftest` 期间不能构建；
+  构建前必须 `daemon stop`（或等 idle 到期）。这与既有的"跑 E4 批次期间不许并发构建"是同族约束，
+  但成因不同：那条是 target 目录锁，这条是映像锁。
+- 建议的承载体（要另走契约周期，因为它改 `status` 的对外可得性）：
+  `daemon status` 增加一个 `exe_locked_by_daemon` 观测（比较租约里的 pid 与自身可执行文件路径是否同一镜像），
+  让"你现在编不动是因为你自己起了 daemon"成为可见事实而不是 os error 5 的谜。本轮**不动它**，先登记。
+
+### F-新2：`Stdio::null()` 在 Windows 上会把调用方的管道句柄漏给 daemon —— 已实现侧修复
+
+- 实测症状：`nexus-harness daemon start --json | cat` **不返回**（40s 超时被杀），但 envelope 已经打出来了；
+  同一命令把 stdout 重定向到文件则 464ms 返回。第二个观测：node 的 `execFileSync` 调 `daemon start`
+  永久挂住，而 daemon 本身健康（内部 ping 正常应答）。
+- 机理：daemon 继承了父进程那个**可继承的管道写端**。读端要等所有写端关闭才见 EOF ⇒
+  只要 daemon 活着，任何"用管道读子进程输出"的调用方都会挂住 —— 场景求值器正是这么读的。
+  这不是性能问题：**它会让 daemon 的 E4 场景永久挂住而不是变红**，正是本模块最坏的那种失效形状。
+- **更正（上一条写错了）**：我写完就登记了"修法（本轮已做）"，但**实测证伪了它**。三种写法逐个测：
+  ① 三句柄全 `Stdio::null()` ⇒ 挂 40s；② stdout/stderr 给 `serve.log`、stdin 仍 null ⇒ daemon
+  因目录不存在起不来（`create_dir_all` 补上后继续）；③ stdin/stdout/stderr **全部**给显式文件句柄
+  ⇒ 仍然挂满 25s 超时（rc=124），而同一命令 stdout 重定向到文件时 400ms 返回。
+  结论：这是 Windows 的**可继承句柄传播**，`std::process::Command` 的 stdio 写法决定不了它；
+  要挡它需要 Win32 handle list（`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`），而本 crate 顶部
+  `#![forbid(unsafe_code)]` 且零新依赖 ⇒ 这条路按现约束走不通。
+- 因此本轮的处理是"写明口径 + 不假装修好"：MODULE.md 的 daemon 一节新增一条 Windows 已知效应，
+  并指明消费方要么把 daemon 的输出重定向到文件，要么走 harness 已有的
+  `run_command_with_timeouts`（有界读，回归测试 `run_command_orphaned_grandchild_holding_pipe_returns`），
+  所以 daemon 的 E4 场景是"多花一次读超时"而不是"永久挂住"。`serve.log`/`stdin.devnull` 保留，
+  理由改成"崩溃有证据"，不再是"修管道"。
+- 留作下一个契约周期的候选（都是契约面变更，不混进本轮）：
+  ① 允许 `daemon start --no-spawn` 只写启动意图、由调用方自己后台化，从而彻底不产生孙进程；
+  ② 或把"daemon 必须脱离父进程句柄表"列为引依赖的例外，由所有者裁决。
+
+### F-新3：`sessions_after_stop = 0` 的可观测边界要说清
+
+- 机制是 `ProviderSession::Drop` 关掉 RA 子进程，selftest 报的 0 是 daemon **在退出路径上自己数出来的**。
+  "曾经有会话"由 `stop_reply.sessions_before_stop` 同时带出，避免只报 0 的自证。
+- 取不到的是**外部**证据：不用 libc 就没法可移植地问"pid N 还活着吗"（契约明确禁止 `kill(pid,0)`，
+  因为那要引依赖）。Windows 上可以 `tasklist /FI "PID eq N"`、Linux 上可以 `stat /proc/N`，
+  但那是两宿主两套实现 —— 与本特性"两宿主同一实现好冒烟"的决定相冲。
+- 所以这条的性质是"结构事实 + Drop 语义"，不是"进程表里查无此 pid"。要后者就得另开一个
+  带 cfg 分叉的契约周期；登记为待办，不混进本轮。
+
+### F-新4：selftest 的 23 枚字段，**值**层面只有一个承载体
+
+- 现状：`daemon_selftest_field_list_matches_contract` 解析 MODULE.md 的清单代码块，与实际发出的
+  键集合**逐名**对齐（多一名少一名都红）。但它不比对每行的**值**列。
+- 现实后果（本轮实测）：我把 `cache_default_enabled` 的语义读反，发的是 `cache.disabled=false`
+  而不是契约的"默认允许=true"；selftest 自己全绿，是 `code_intelligence_daemon_lifecycle`
+  把 `equals = true` 钉住才红的。也就是说：**名字有双重承载体，值只有场景一重**。
+- 建议的承载体（属契约面 + 测试面变更，另开周期）：把那枚单测升级成同时比对
+  `(名字, 契约声明的值)` 与 `(名字, 探针期望的值)`，期望值从 inline 的 `json!(...)` 抽成
+  一张 `const EXPECTED: [(&str, Value); 23]` 表 —— 表与清单不符即红，不需要跑冷启动。

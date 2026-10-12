@@ -2,7 +2,7 @@
 
 本包实现《Nexus 统一系统设计规范 v9》中的“统一仓库目录契约”。
 
-文件数（不含本清单）：193
+文件数（不含本清单）：195
 
 > 2026-10-10：原声明值 137 与表内实际行数（148）已不一致（既有漂移，含
 > `scenarios/engineering/bench_gate_verdicts.toml` 等未登记项）。本次登记
@@ -33,6 +33,10 @@
 >
 > 2026-10-11（Phase 2-4 开工）：登记 `.agents/code-intelligence-phase-2-4-plan.md`，声明值 177 -> 178。
 >
+> 2026-10-13（daemon/缓存实现落地）：新增 `code_intel/daemon.rs` 与 `code_intel/cache.rs` 两行，声明值 193 -> 195。
+> 实现期契约补记（所有者按 3 轮上限止评，无第 5 轮盲评背书）：`session_source` 词表补第三个值 `"cache"`、
+> 声明内部子命令 `daemon serve`、`daemon_explicit_only` 同时带 `--no-cache`（原写法把受缓存残留影响的
+> `session_source` 当成确定期望值），兜底命令清单补 `mcp`/`daemon`。
 > 2026-10-12（盲评 round 3 裁决矛盾而非加句子）：selftest 清单 32 -> 23（9 项改由点名单测承载）、撤下 status 默认值场景，场景总数 27 -> 26，声明值 194 -> 193。
 > 2026-10-12（测试盲评 round 2 打回后二次修订）：selftest 字段清单 30 -> 32、补缓存命中回放契约与 status 默认值场景，场景总数 26 -> 27，声明值 193 -> 194。
 > 2026-10-12（测试用例盲评打回后重写）：4 条 daemon 场景改为逐条钉契约字段值并新增 1 条未知参数场景，场景总数 25 -> 26，声明值 192 -> 193。
@@ -197,6 +201,8 @@
 | `engineering/nexus-harness/src/code_intel/lsp.rs` | Rust source (JSON-RPC/LSP framing、只读白名单、有界会话) |
 | `engineering/nexus-harness/src/code_intel/provider.rs` | Rust source (CodeIntelligenceProvider 契约与 binary 解析) |
 | `engineering/nexus-harness/src/code_intel/rust_analyzer.rs` | Rust source (rust-analyzer provider：生命周期/就绪收敛/语义映射) |
+| `engineering/nexus-harness/src/code_intel/daemon.rs` | Rust source (provider daemon：租约/回环线协议/会话池/LRU/idle 自退出，含 `daemon selftest` 23 枚探针) |
+| `engineering/nexus-harness/src/code_intel/cache.rs` | Rust source (digest 键控结果缓存：六元组键、载荷只含结果字段、条数与字节上限) |
 | `engineering/nexus-harness/src/commands.rs` | Rust source (harness CLI) |
 | `engineering/plugins/README.md` | Repository contract/documentation |
 | `engineering/plugins/plugin-contract.md` | Repository contract/documentation |

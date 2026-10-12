@@ -221,6 +221,31 @@ pub struct ProviderMeta {
 }
 
 impl ProviderMeta {
+    /// 从 daemon 的线格式读回。字段名与 `to_json` 同源（一处拼错另一处就红）；缺字段取零值
+    /// 而不是"未知"：这些计数是"该会话累计到多少"，没有那个会话就没有累计。
+    pub fn from_json(v: &Value) -> ProviderMeta {
+        let text = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        let num = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0) as usize;
+        ProviderMeta {
+            kind: text("kind"),
+            binary: text("binary"),
+            version: text("version"),
+            ready: v.get("ready").and_then(Value::as_bool).unwrap_or(false),
+            restart_count: num("restart_count"),
+            restart_reason: text("restart_reason"),
+            duration_ms: v.get("duration_ms").and_then(Value::as_u64).unwrap_or(0) as u128,
+            write_requests_refused: num("write_requests_refused"),
+            dropped_notifications: num("dropped_notifications"),
+            server_requests_unhandled: num("server_requests_unhandled"),
+            session_reused: v
+                .get("session_reused")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            session_queries: num("session_queries"),
+            session_invalidated_reason: text("session_invalidated_reason"),
+        }
+    }
+
     /// 累加一次会话的三个计数。重启会换新会话，替换旧会话前必须先把它 absorb 进来，
     /// 否则"重启前拒绝过 N 次写请求"随进程消失（MODULE.md：计数失真等于把拒绝能力藏起来）。
     pub fn absorb(&mut self, refused: usize, unhandled: usize, dropped: usize) {

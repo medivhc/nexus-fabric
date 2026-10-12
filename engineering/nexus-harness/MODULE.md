@@ -323,7 +323,8 @@ workspace 上 `symbol Task` 冷启动 `duration_ms=90535` 且 `provider.ready=fa
   `duration_ms` 仍然是**本次查询**的耗时（不是会话累计），否则 Agent 会把会话成本误读成查询成本。
 - **CLI 路径的跨命令复用要显式开启**（所有者 2026-10-12 决定，见下方「Provider Daemon & Result Cache」）：
   默认仍然是一次调用一个进程 —— `daemon` 未运行时查询照旧走进程内会话并报
-  `session_source="in-process"`；**CLI 永不自动拉起 daemon**，这条优先级高于"体验顺畅"。
+  `session_source="in-process"`（命中结果缓存的那一次是 `"cache"`，见下方「命中形状」②）；
+  **CLI 永不自动拉起 daemon**，这条优先级高于"体验顺畅"。
   `mcp serve` 依旧是自带会话的调用方，退出时必须关闭 provider，不留孤儿进程。
 - 曾经的"明确不做：跨进程缓存、后台 daemon、socket/端口、把索引落盘"已由实测证据解除否决，
   但**理由不作废** —— 作废的是"隐藏生命周期"这个风险，做法是给生命周期加可见护栏
@@ -356,6 +357,15 @@ nexus-harness code <verb> ──(daemon 在跑且握手成功)──▶ daemon(1
   daemon 定期刷新 `last_heartbeat`。存活与否**用端口握手判定，不用 `kill(pid,0)`**（那需要 libc，
   违反零新依赖）。daemon 崩溃留下的残留租约 ⇒ `status` 报 `stale_lease=true`，
   `stop` 只删文件、**不去 kill 一个无法验证的 pid**。
+- **Windows 已知效应（实测，未修）**：daemon 继承调用方可继承的 stdout 管道句柄，因此
+  `nexus-harness daemon start --json | cat` 这类"等 EOF 的管道消费"要等到 daemon 退出才返回
+  （实测 30s 超时被杀；同一命令把 stdout 重定向到文件时 400ms 返回）。三种写法逐个实测过：
+  全 `Stdio::null()`、stdout/stderr 给文件、以及 stdin/stdout/stderr 全给显式文件句柄 —— 都漏。
+  修它需要 Win32 handle list，而本 crate 顶部是 `#![forbid(unsafe_code)]` 且零新依赖，所以
+  **不假装能修，只把消费口径写明**：daemon 的调用方用文件重定向，或走 harness 的
+  `run_command_with_timeouts`（它对"孤儿孙进程持管道"是有界读，回归测试
+  `run_command_orphaned_grandchild_holding_pipe_returns`，因此 daemon 场景不会永久挂住）。
+  Linux 上没有这个问题（`Stdio` 只重排 0/1/2 三个 fd，不传播额外句柄）。
 - **token 是误用防护，不是安全边界**（必须照此声明）：租约在按用户隔离的 temp 目录里，
   而同用户下的任何进程本来就能直接运行 `nexus-harness code` —— daemon 经内部协议能做的事
   **不多于** CLI 本来能做的事，因此拿到 token 不构成提权；token 的作用只是拒绝误连与
@@ -363,11 +373,19 @@ nexus-harness code <verb> ──(daemon 在跑且握手成功)──▶ daemon(1
 - **生命周期**：`daemon start|stop|status|selftest [--workspace <root>] [--idle-secs N]
   [--max-workspaces N]`，默认 `idle_secs=900`、`max_workspaces=2`（LRU 驱逐即关闭该会话的
   RA 子进程）。`start` 幂等（已活着 ⇒ `PASS` + `already_running=true`，不起第二个）；
+  `start` 派生子进程用的入口是 **`daemon serve`（内部子命令，不面向 Agent、不进上方命令清单）**：
+  它只接受 `start` 自己写出的参数，未知参数同样 `BLOCKED`。之所以在这里声明而不是让它悄悄存在：
+  一个未声明的子命令既过不了"命令面即 Public API"的口径，也不该被场景当作可用能力来钉。
   `stop` 对不存在的 daemon 报 `UNKNOWN` + 原因（不假装停成功）；所有退出路径回收 provider，
   `selftest` 断言 `sessions_after_stop=0`。空闲到点自行退出并删租约。
 - `code` / `context` 支持 **`--no-daemon`** 与 **`--no-cache`**：前者完全不问 daemon
-  （必然 `session_source="in-process"`，给 CI 一个不受环境里是否有人手起过 daemon 影响的确定口径），
+  （`daemon.running=false` 且 `session_source` 只会是 `"in-process"` 或 `"cache"`，绝不会是
+    `"daemon"` —— 给 CI 一个不受"环境里是否有人手起过 daemon"影响的确定口径），
   后者不读也不写结果缓存（`cache.disabled=true`）。默认值都是"允许"。
+  两个口径各自独立，**要"既不受 ambient daemon 影响、也不受缓存残留影响"就得两个 flag 一起给**：
+  `code_intelligence_daemon_explicit_only` 钉的是 `session_source="in-process"`，命中路径上该值是
+  `"cache"`，所以它同时带 `--no-cache`；"默认为允许"这个承诺的机器对应物是 selftest 的
+  `cache_default_enabled`/`default_path_*`，不由该场景的默认路径承担。
 - **两层"缓存"不得混为一谈**：
   ① *会话层*（daemon）真正省掉冷启动，复用键沿用四项（provider 二进制 + workspace 根 +
      provider 版本 + **会话建立时的 `working_tree_digest`**），指纹变了就重建并记
@@ -385,7 +403,7 @@ nexus-harness code <verb> ──(daemon 在跑且握手成功)──▶ daemon(1
 - **字段与可得性**（缺字段即契约破坏，`null`/`0` 不得冒充"有但不知道"）：
 
   ```text
-  daemon   {running, detected, session_source: "daemon"|"in-process", lease_path, port, pid,
+  daemon   {running, detected, session_source: "daemon"|"in-process"|"cache", lease_path, port, pid,
             idle_secs, already_running, stale_lease, daemon_unavailable,
             provider_sessions, provider_session_capacity}
   cache    {tier: "miss"|"disk", key_digest, entries, bytes, disabled}
@@ -394,6 +412,10 @@ nexus-harness code <verb> ──(daemon 在跑且握手成功)──▶ daemon(1
     （独立盲评 round 2 抓的歧义：`--no-daemon` 时环境里可能真有一个别人的 daemon，
     此时 `running` 两种读法都自洽 ⇒ 场景变成碰运气）。"有没有可用 daemon"是另一个字段
     **`detected`**，`--no-daemon` 下它可以是 `true` 而 `running` 仍为 `false`，两问不互相覆盖。
+  - **`session_source` 说的是"本次查询的事实从哪来"**：`"daemon"` = 经 daemon 会话服务，
+    `"in-process"` = 本次自己起的进程内会话，`"cache"` = 回放缓存条目（本次既没问 daemon
+    也没起 provider）。第三个值是实现时补进词表的：命中路径上写 `"in-process"` 就是把"没做的事"
+    说成做过，与本模块"未解析出事实不得伪装 provider 块"的口径同源。
   - `running=false` 时 `port`/`pid`/`lease_path` **不出现**（不是 `null`/`0` 占位）。求值器没有
     "字段缺席"算子，selftest 清单里也没有这一枚（清单与实际键集合的逐名对齐会把它挡在清单外），所以它的
     机器承载体是下方「点名单测」里的 `daemon_decline_omits_absent_fields`。
@@ -438,9 +460,11 @@ nexus-harness code <verb> ──(daemon 在跑且握手成功)──▶ daemon(1
   ④ 命中条件：`cache.key_digest` 等于本次 `snapshot.working_tree_digest`，且查询前后各一次
      digest 检查照旧执行；等式与 miss 判定由点名单测证伪（`cache_key_misses_when_digest_differs`、
      `cache_hit_restamps_run_metadata`），不占 selftest 清单。
-  ⑤ **`mcp selftest --with-query` 与 `daemon selftest` 的复用类探针强制不读不写缓存**：
+  ⑤ **`mcp serve` 与 `daemon selftest` 的复用类探针强制不读不写缓存，且 `mcp serve` 不问 daemon**：
      否则第二次查询可由回放满足，Phase 4 的复用判据（`provider.session_reused`/`session_queries`）
      会被我自己造的缓存糊成绿 —— 这是盲评 round 3 抓出的新假绿通道，属于硬性排除。
+     `mcp serve` 连 daemon 也不问：它自己持有会话，让环境里某个别人手起的 daemon 来服务它，
+     `session_queries` 量的就不是"这次 serve 复用了几次"，而是"那个 daemon 一共服务过谁"。
   ⑥ 数值上界与载荷形状由单测证伪，不占 selftest 清单：`cache_refuses_entries_beyond_cap`（每
      workspace 512 条 / 8 MiB，超限不写入且 `cache.entries`/`cache.bytes` 可见）、
      `cache_stores_only_result_fields`（条目只含 ① 的 DTO 结果字段与 ② 的四个 provider 记事实字段，
@@ -473,8 +497,10 @@ nexus-harness code <verb> ──(daemon 在跑且握手成功)──▶ daemon(1
      `session_invalidated_reason="digest_changed"`）与 `cache_key_misses_when_digest_differs`
      （键含 digest ⇒ 不同 digest 必 miss）。
   ④ 空闲自退出用**注入的小 `--idle-secs`** 观测；默认 900s 大于场景超时，用默认值天然不可测。
-  ⑤ 全程只读仓库、只在私有命名空间里写，结束时 `git status --porcelain` 仍为 0 行
-     （`dirty_after_lifecycle = 0`）。
+  ⑤ 全程只读仓库、只在私有命名空间里写；`dirty_after_lifecycle` 的定义是
+     **生命周期前后 `git status --porcelain` 的新增行数**，不是"整棵树干净"。实现时按后者写会
+     假红：开发机上本来就有未提交的实现，把别人的工作算成 selftest 的副作用；两者在干净的 CI
+     上等值。git 问不到时报 `-1`（如实变红），不把"无法证明"折算成"证明没有"。
 - **`daemon selftest --json` 的字段清单**（`probe_count` 必须等于本清单条数；场景侧对每条钉**值**
   而不是笼统的"探针都过了"。字段名即对外承诺，改名要同步改场景 —— 之前
   `sessions_after_stop` / `provider_sessions_after_stop` 两处漂移就是这么来的）：
@@ -499,7 +525,7 @@ nexus-harness code <verb> ──(daemon 在跑且握手成功)──▶ daemon(1
   cache_second_run_tier                "disk"        结果层必须**真的命中过**（同指纹二次相同查询）
   cache_default_enabled                true          默认路径 cache.disabled=false
   cache_disableable                    true          --no-cache ⇒ disabled=true 且 tier="miss" 且查询仍 PASS
-  commands_surface_lists_daemon        true          兜底 BLOCKED 消息里的命令清单必须含 daemon
+  commands_surface_lists_daemon        true          兜底 BLOCKED 消息必须列出全部 13 个已分派命令名
   unknown_flag_blocked                 true          未知启动参数 BLOCKED（不接受"参数被忽略"）
   defaults_idle_secs                   900           契约默认值
   dirty_after_lifecycle                0             整个生命周期结束后工作树未被写入
@@ -585,7 +611,11 @@ nexus-harness code <verb> ──(daemon 在跑且握手成功)──▶ daemon(1
 - 新增副作用前必须更新本契约和 Scenario/Policy（如影响外部行为）。
 - **daemon 与缓存的写副作用（2026-10-12 新增，全部在仓库工作树之外）**：
   ① 只监听 `127.0.0.1` 的临时端口 —— 不做跨机、不做发现服务、不开放非回环接口；
-  ② `temp_dir()/nexus-code-intel-daemon-<fnv>/lease.json`（租约，daemon 自己刷新与删除）；
+  ② `temp_dir()/nexus-code-intel-daemon-<fnv>/lease.json`（租约，daemon 自己刷新与删除）与
+  `serve.log`（daemon 子进程自己的 stdout/stderr，另加 `stdin.devnull` 一个空文件当 stdin）。
+     **为什么落盘而不是 `Stdio::null()`**：让 daemon 崩溃有可读证据。它**不**是为了修管道继承 ——
+     实测三句柄全给显式文件后 Windows 上仍继承调用方的 stdout 管道句柄（见下条），所以这里
+     不许把换句柄写法说成修好了那件事。
   ③ `temp_dir()/nexus-code-intel-daemon-<fnv>/cache/`（digest 键控的结果缓存，有上限，
   载荷只含查询结果字段，可用 `--no-cache`/`cache.disabled` 关掉）。
   **仓库内不得出现 daemon/缓存文件**（`dirty_after=0` 与"仓库内无残留"是验收项，
@@ -598,7 +628,11 @@ nexus-harness code <verb> ──(daemon 在跑且握手成功)──▶ daemon(1
 - 命令面：`status` / `context` / `check` / `test` / `verify` / `explain` / `bench` / `replay` /
   `scenario` / `run` / `code <8 个只读 verb>` / `mcp serve|selftest` /
   **`daemon start|stop|status|selftest`**（2026-10-12 新增，见「Provider Daemon & Result Cache」）。
-  未知命令与未知参数一律 `BLOCKED`，不静默忽略、不"当成一次查询试一下"。
+  未知命令与未知参数一律 `BLOCKED`，不静默忽略、不"当成一次查询试一下"。兜底 `BLOCKED` 消息里的
+  清单必须与 `dispatch` 一一对应：**同一份清单实现时漏了三次**（`mcp`、`daemon`，以及补前两次时
+  又漏的 `run`），所以 `commands_surface_lists_daemon` 的口径不是"含 daemon"这种 `contains`，
+  而是按逗号切词后逐个**全名**核对 —— 短名的子串匹配（`code` 落在 `scenario` 之类的写法里）
+  会让漏名蒙混过关，而这条清单正是 Agent 拼错命令时唯一能读到的自述。
 - 默认最小 surface：`private -> pub(crate) -> pub`。
 
 ## Verification
@@ -647,8 +681,9 @@ stop 打不存在的 daemon ⇒ `UNKNOWN`、stop 后 `sessions_after_stop=0`、L
 `session_reuse_key_rejects_changed_digest`/`cache_key_misses_when_digest_differs`、
 `daemon_decline_omits_absent_fields`、`cache_refuses_entries_beyond_cap`/`cache_stores_only_result_fields`、
 `wire_refuses_non_whitelist`）
-`code_intelligence_daemon_explicit_only.toml`（`--no-daemon` 下 `session_source="in-process"`，
-证明 CLI 不自动 spawn，且该口径不受环境里是否有人手起过 daemon 影响）、
+`code_intelligence_daemon_explicit_only.toml`（`--no-daemon --no-cache` 下
+`session_source="in-process"` 且 `daemon.running=false`，证明 CLI 不自动 spawn；两个 flag 同时给
+是为了让这条结论既不受 ambient daemon 影响、也不受缓存残留影响 —— 见上方 `--no-daemon` 一条）、
 `code_intelligence_cache_disabled.toml`（`--no-cache` ⇒ `cache.disabled=true` 且 `tier="miss"`，
 键绑定字段仍可见）、`code_intelligence_daemon_command_surface.toml`（未知 daemon 子命令 `BLOCKED`
 且 declined 输出照样带 `authority`/`daemon.running`）、`code_intelligence_daemon_unknown_flag.toml`（daemon 的未知启动参数 `BLOCKED` —— 本模块两次栽在"参数被接受但不生效"上，daemon 一次新增三个参数，同一漂移最可能复发的地方就是它；参数被真实兑现由 selftest 的 `defaults_*`/`idle_self_exit_observed` 值探针钉）。共 **26** 个。
@@ -668,11 +703,15 @@ round 2 的教训就是"待办只写在提交说明里，下一轮没有承载�
 
 - 真实执行：workspace-tests / product-scenarios / regression / architecture-policy / dependency-governance（cargo-deny 0.20：`cargo deny --config policies/deny.toml check advisories licenses bans sources`，缺失则 UNKNOWN）/ coverage-summary（cargo-llvm-cov）/ platform-checks（portable-core 平台依赖静态扫描）/ feature-matrix（每成员 `--no-default-features` + `--all-features`）/ portable-core（`cargo check --target wasm32-wasip1`）。
 - 条件执行（无内容/无工具时 UNKNOWN）：integration（成员 tests/*.rs 存在时逐个运行）/ selected-fuzz（cargo-fuzz + fuzz targets）/ selected-concurrency（tests/concurrency 有测试时运行）/ performance-budgets（quality.toml `[performance]` 定义 baseline+blocking 后判定）。
-- 单元测试：`cargo test -p nexus-harness`（Windows/1.95.0 上**本轮实测 137 个 = 134 passed + 3 failed**；
-  Linux 只多 1 条 —— 差额是 `#[cfg(unix)]` 的真实符号链接越界回归在该宿主才编译，
-  xc-pc-linux/1.98.1 在 rev `bdf2f767` **实测 138 passed / 0 failed**（§Q，不是从 Windows 推的）；
-  **117/116 是 round 2 之前的陈旧声明，本区间把测试数从 117 一路推到 137 却没同步这行，
-  已由独立 Review 的 N2/N-A4 抓出并在此更正**。那 3 条失败是 master 自带、依赖 POSIX `echo` 的
+- 单元测试：`cargo test -p nexus-harness`（Windows/1.95.0 上 daemon/缓存实现落地后**实测 149 个 =
+  146 passed + 3 failed（串行）**；并行跑同一集会多红 2 条 —— `144 + 5`，那 2 条是 master 自带的
+  管道测试在负载宿主上不稳定（见 `.agents/green-evidence-code-intelligence.txt` §S），不是本区间
+  引入的，也没有被削弱。新增的 12 条 = `cache.rs` 6 + `daemon.rs` 6，数目与预期精确对上。
+  Linux 只多 1 条 —— 差额是 `#[cfg(unix)]` 的真实符号链接越界回归在该宿主才编译；
+  xc-pc-linux/1.98.1 在 rev `bdf2f767` **实测 138 passed / 0 failed**（§Q，不是从 Windows 推的），
+  本 rev 在该宿主的对应值应是 149 + 1 = 150，**待 §R 实测后才改口，这里不预填**。
+  **117/116 与"137 = 134+3"都只是历史声明而不是当前值**：本区间把测试数从 117 推到 137 再推到 149，
+  每一次都有人没同步这行（N2/N-A4 抓过一次，本轮再次自纠并在此留痕）。
   `scenario::tests::run_single_*`/`run_parallel_*` 在本宿主假红，见 DEVELOPMENT.md §11.1；
   覆盖 scenario 求值、evidence 新鲜度/STALE、digest 确定性与锁竞争判定、containment 的归一化比较
   （含 `#[cfg(unix)]` 真实符号链接形态）、workspace 成员解析、dependency-governance gate 语义、

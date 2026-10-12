@@ -270,6 +270,14 @@ fn handle_request(
                         argv.push("--provider-binary".to_string());
                         argv.push(binary.clone());
                     }
+                    // 契约「作用域与隔离」⑤：MCP 路径**不读不写结果缓存**，也不问 daemon。
+                    // 前者关掉的是假绿通道 —— 否则 `warm_query_roundtrip` 与
+                    // `provider_session_reused` 可以由回放满足，Phase 4 的复用判据就被我
+                    // 自己造的缓存糊成绿。后者关掉的是环境依赖：`mcp serve` 自己持有会话，
+                    // 让环境里某个别人手起的 daemon 来服务它，`session_queries` 量的就不是
+                    // "这次 serve 复用了几次"，而是"那个 daemon 一共服务过谁"。
+                    argv.push("--no-daemon".to_string());
+                    argv.push("--no-cache".to_string());
                     let command =
                         format!("code {}", argv.first().map(String::as_str).unwrap_or(""));
                     let outcome = super::run_with_session(&argv, session);

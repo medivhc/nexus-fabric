@@ -1,6 +1,6 @@
 schema_version = 1
 id = "engineering.code-intelligence-daemon-explicit-only"
-title = "--no-daemon 完全不问 daemon：会话来源 in-process、cache 默认可用、查询照常 PASS（MODULE.md Provider Daemon & Result Cache）"
+title = "--no-daemon --no-cache 完全不问 daemon、不碰缓存：会话来源 in-process、查询照常 PASS（MODULE.md Provider Daemon & Result Cache）"
 evidence_strength = "E4"
 requirement = "engineering/nexus-harness/MODULE.md#provider-daemon--result-cache"
 
@@ -9,15 +9,22 @@ requirement = "engineering/nexus-harness/MODULE.md#provider-daemon--result-cache
 # default_path_session_source / default_path_lease_absent 两枚值断言钉（selftest 控制起始状态）。
 # 契约把 daemon.running 定义为"本次查询经由 daemon"（不是"机器上有没有 daemon"），
 # 所以 running=false 在本场景里与环境里是否有别人的 daemon 无关；"有没有"另由 daemon.detected 暴露。
-# 本场景不钉 cache.tier：默认允许缓存时 tier 取决于是否已有同指纹条目，属环境既有状态，
-# 拿 one_of 容忍它不是断言。命中条件与真实命中由 selftest 的 cache_second_run_tier="disk" 负责。
+#
+# 为什么这里必须同时给 --no-cache（实现时才发现原写法不自洽）：本场景钉
+# daemon.session_source="in-process"，而命中缓存条目时该值是 "cache"（契约「命中形状」②——
+# 命中既没问 daemon 也没起 provider，写 in-process 就是把没做的事说成做过）。有没有条目
+# 属环境既有状态，与下面这段原话对 cache.tier 的判断是同一回事：
+#   "默认允许缓存时 tier 取决于是否已有同指纹条目，属环境既有状态，拿 one_of 容忍它不是断言。"
+# 既然 tier 因该状态被排除，由同一状态派生的 session_source 就不能留着缓存开。
+# "默认为允许"这个承诺另有机器对应物：selftest 的 cache_default_enabled=true 与
+# cache_disableable=true（生命周期场景逐条钉值），不由本场景承担。
 
 [given]
 repository = "initialized"
 network = "none (本地 rust-analyzer 子进程)"
 
 [when]
-command = "nexus-harness code symbol Egress --workspace engineering/nexus-harness/fixtures/code-intel --no-daemon --json"
+command = "nexus-harness code symbol Egress --workspace engineering/nexus-harness/fixtures/code-intel --no-daemon --no-cache --json"
 
 [[expect]]
 field = "command"
@@ -47,10 +54,10 @@ equals = false
 field = "daemon.session_source"
 equals = "in-process"
 
-# 默认路径：缓存是开的（契约"默认值都是允许"必须有机器对应物）。
+# 显式关闭的口径由本场景自己给出；"默认是开的"由 selftest 的 cache_default_enabled 钉。
 [[expect]]
 field = "cache.disabled"
-equals = false
+equals = true
 
 [[expect]]
 field = "cache.key_digest"
