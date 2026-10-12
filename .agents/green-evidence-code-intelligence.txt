@@ -696,6 +696,30 @@ bundle `c453a0b..bdf2f767` 传入后 `checkout -f FETCH_HEAD`。日志 `/work/xc
 - 复用倍率 255x（本轮 Linux）与 §P 的 233x、§O 的 40x 都**只是旁证**，判据是
   `session_reused`/`session_queries` 这三个结构字段 —— 三次倍率不一致恰恰证明当初把
   时延比值写进契约是错的。
+## S. 合并 origin/master 后的结论宿主验证（xc-pc-linux，rev `7689be78`）
 
+合并把 master 的 19 个提交带进本分支（`nexus-test-review` 技能线、9 条 `scenarios/product/n2-*`、
+web-gateway 修复、commitlint 工作流），9 处冲突全部取我方快照（依据见合并提交说明：master 在
+squash 之后没再碰过这些文件，且逐文件比对后 theirs 独有行都是同一处的旧版本）。
+合并**必须**在权威宿主重验，因为冲突解决动的是 `code_intel/*.rs`、`main.rs`、`MODULE.md`。
+脚本 `/work/xc-merge-check.sh`，日志 `/work/xc-merge-check.log`。
 
+    git rev            7689be78  dirty=0
+    cargo fmt --all -- --check                        exit 0（0 行输出）
+    cargo clippy -p nexus-harness --all-targets -D warnings   exit 0，error 行数 0
+    cargo test -p nexus-harness（默认并行）             **138 passed / 0 failed**
+    cargo test -p nexus-harness -- code_intel          74 passed / 0 failed
+    master 新带来的两条管道测试，单独重复 3 次          run1/run2/run3 全 ok（2 passed / 0 failed）
 
+把"Windows 并行下偶发红"的口径在这里钉住，别被误读成本模块的回归：
+
+    宿主          并行                 串行
+    Windows 冒烟   3 红 或 5 红（不稳）  3 红（两次一致）
+    Linux 结论     0 红                  —
+    常驻 3 红 = master 自带、依赖 POSIX `echo` 的 scenario::tests::run_single_* / run_parallel_*
+    偶发 2 红 = master 新写的 run_command_ignores_stderr_for_scenario_json 与
+              run_command_orphaned_grandchild_holding_pipe_returns；两条都靠 elapsed 时间上界判定，
+              在 Windows 并行调度下不满足 nexus-test-review §3.5 的"同一输入同一输出"。
+    处置：不削弱、不改（不动时间上界、不加 #[ignore]、不改期望）。它们在 master 自己的代码上跑，
+    `git diff --stat origin/master...HEAD -- scenario.rs run_scenario.rs` 为空可证本分支没碰过那个文件。
+    这是上游测试的隔离性问题，作为独立事项提给所有者，不混进本特性。

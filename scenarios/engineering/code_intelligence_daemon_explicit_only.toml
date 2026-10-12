@@ -1,13 +1,14 @@
 schema_version = 1
 id = "engineering.code-intelligence-daemon-explicit-only"
-title = "没有 daemon 时查询照常完成且如实报进程内会话：CLI 永不自动拉起，--no-daemon 给 CI 一个确定口径（MODULE.md Provider Daemon & Result Cache）"
+title = "--no-daemon 完全不问 daemon：会话来源 in-process、cache 默认可用、查询照常 PASS（MODULE.md Provider Daemon & Result Cache）"
 evidence_strength = "E4"
-requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#11-optional-persistent-index"
+requirement = "engineering/nexus-harness/MODULE.md#provider-daemon--result-cache"
 
-# 为什么命令里带 --no-daemon：契约承诺"CLI 永不自动 spawn"，但环境里可能有人手工起过 daemon，
-# 那样 daemon.running 就是 true 而非 false —— 场景会变绿/变红取决于宿主机上有没有别的进程，
-# 那不是被测性质的证据。--no-daemon 把这条场景钉成"完全不问 daemon 时的形状"，
-# 而"有 daemon 时确实走 daemon"由 daemon_lifecycle 的 selftest 探针负责（它自己控制状态）。
+# --no-daemon 是"契约授权的确定化口径"：环境里有没有人手工起过 daemon 都不影响本场景。
+# 它**不**用来证明"默认路径不自动 spawn" —— 那是同义反复；那条性质由 daemon selftest 的
+# default_path_session_source / default_path_lease_absent 两枚值断言钉（selftest 控制起始状态）。
+# 本场景不钉 cache.tier：默认允许缓存时 tier 取决于是否已有同指纹条目，属环境既有状态，
+# 拿 one_of 容忍它不是断言。命中条件与真实命中由 selftest 的 cache_second_run_tier="disk" 负责。
 
 [given]
 repository = "initialized"
@@ -21,8 +22,16 @@ field = "command"
 equals = "code symbol"
 
 [[expect]]
+field = "schema_version"
+equals = 1
+
+[[expect]]
 field = "verdict"
 equals = "PASS"
+
+[[expect]]
+field = "results"
+non_empty = true
 
 [[expect]]
 field = "authority"
@@ -36,15 +45,14 @@ equals = false
 field = "daemon.session_source"
 equals = "in-process"
 
-# 缓存键仍必须存在并绑定本次指纹（不问 daemon 不影响结果层缓存的可见性）。
+# 默认路径：缓存是开的（契约"默认值都是允许"必须有机器对应物）。
+[[expect]]
+field = "cache.disabled"
+equals = false
+
 [[expect]]
 field = "cache.key_digest"
 non_empty = true
-
-# tier 的取值是封闭词表，不能出现第四个值。
-[[expect]]
-field = "cache.tier"
-one_of = ["miss", "disk"]
 
 [[expect]]
 field = "snapshot.working_tree_digest"

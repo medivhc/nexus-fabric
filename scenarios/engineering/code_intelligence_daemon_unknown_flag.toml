@@ -1,0 +1,42 @@
+schema_version = 1
+id = "engineering.code-intelligence-daemon-unknown-flag"
+title = "daemon 的未知启动参数一律 BLOCKED，不接受『参数被接受但不生效』（MODULE.md：未知命令与未知参数一律 BLOCKED）"
+evidence_strength = "E4"
+requirement = "engineering/nexus-harness/MODULE.md#public-api"
+
+# 为什么单独一条：本模块历史上栽过两次"参数被接受但不生效"（--provider-binary 被 dispatch
+# 整个丢掉、给不给同形 exit 0）。daemon 一次新增 --workspace/--idle-secs/--max-workspaces 三个
+# 参数，同一类漂移最可能再次发生的地方就是这里。命令面与是否已有 daemon 无关，所以这条
+# 不受环境里有没有人起过进程影响。参数**被真实兑现**（--idle-secs 90 ⇒ idle_secs=90）由
+# selftest 的 defaults_* 与 idle_self_exit_observed 值探针钉住。
+
+[given]
+repository = "initialized"
+network = "none (不启动 daemon)"
+
+[when]
+command = "nexus-harness daemon status --bogus-flag --json"
+
+[[expect]]
+field = "command"
+equals = "daemon"
+
+[[expect]]
+field = "schema_version"
+equals = 1
+
+[[expect]]
+field = "verdict"
+equals = "BLOCKED"
+
+[[expect]]
+field = "message"
+non_empty = true
+
+[[expect]]
+field = "daemon.running"
+equals = false
+
+[[expect]]
+field = "authority"
+equals = "advisory"

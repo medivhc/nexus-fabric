@@ -388,7 +388,58 @@ nexus-harness code <verb> ──(daemon 在跑且握手成功)──▶ daemon(1
   ```
   `running=false` 时 `port`/`pid`/`lease_path` **不出现**；`daemon_unavailable` 只在
   本想用 daemon 却失败时出现，并带结构化原因（此时查询照常完成，不得 hang 在超时上，
-  也不得把回落说成 PASS 之外的任何结论）。
+  也不得把回落说成 PASS 之外的任何结论）。默认值也是契约：`idle_secs=900`、
+  `max_workspaces=2`，即使没有 daemon，`daemon status` 也要把这两个默认值报出来
+  （否则"默认值都是允许"这句话没有任何机器对应物）。
+- **`daemon selftest` 的作用域与隔离**（缺了就不可复现，故属契约）：
+  ① 必须显式给 `--workspace`，**没有缺省作用域**（不写就是环境依赖）；
+  ② 必须在**私有租约/缓存命名空间**里跑 —— 不得读写开发者真实在跑的 daemon 的
+     `lease.json`/cache 目录，也不得让环境里的 daemon 改变探针结果；
+  ③ 需要"无 daemon"前提的探针（`default_path_*`、`stop_absent_*`）必须自己确认起始状态，
+     不靠执行顺序碰运气；
+  ④ 空闲自退出用**注入的小 `--idle-secs`** 观测，默认 900s 大于场景 600s 超时，天然不可测；
+  ⑤ 全程只在自己的 temp scratch workspace 里跑，结束时 `git status --porcelain` 仍为 0 行。
+- **`daemon selftest --json` 的字段清单**（`probe_count` 必须等于本清单条数；场景侧对每条钉**值**
+  而不是笼统的"探针都过了"。字段名即对外承诺，改名要同步改场景 —— 之前
+  `sessions_after_stop` / `provider_sessions_after_stop` 两处漂移就是这么来的）：
+
+  ```text
+  start_verdict                        "PASS"        daemon start 的 verdict
+  status_running_after_start           true          start 后 status 报 running=true
+  start_idempotent_same_port           true          第二次 start 观察到同一个 port（不起第二个）
+  already_running                      true          第二次 start 的契约字段
+  default_path_session_source          "in-process"  不带任何 flag 的普通查询：会话来源
+  default_path_lease_absent            true          同一查询跑完后租约目录仍未出现 ⇒ 没被自动拉起
+  second_process_session_source        "daemon"      第二个 CLI 进程走 daemon
+  reuse_queries_total                  2             daemon 侧累计查询数（跨两个进程）
+  reuse_provider_sessions              1             复用观测点的会话数：是 1 不是 2
+  stale_lease_detected                 true          租约指向没人听的端口 ⇒ status 报 stale_lease=true
+  stale_fallback_verdict               "PASS"        残留租约下查询照常完成（不 hang、不谎报）
+  stale_fallback_session_source        "in-process"  回落确实是进程内会话
+  wrong_token_rejected                 true          token 不符的连接被拒（误用防护，见上文口径）
+  idle_self_exit_observed              true         --idle-secs 注入后到点自行退出
+  lease_removed_on_idle                true          自退出也删自己写的租约
+  stop_absent_verdict                  "UNKNOWN"     stop 一个不存在的 daemon ⇒ 不是 PASS 也不是 FAIL
+  sessions_after_stop                  0             stop 后 daemon 侧会话数为 0（无孤儿 RA）
+  lru_provider_sessions_at_capacity    1            --max-workspaces 1 下查两个 workspace，会话数仍是 1
+  digest_invalidation_reason           "digest_changed"  工作树变更后重建的原因值
+  cache_second_run_tier                "disk"        结果层必须**真的命中过**（同指纹二次相同查询）
+  cache_hit_key_digest_bound           true          命中那次 cache.key_digest == snapshot.working_tree_digest
+  cache_default_enabled                true          默认路径 cache.disabled=false
+  cache_disableable                    true          --no-cache ⇒ disabled=true 且 tier="miss" 且查询仍 PASS
+  cache_bounded_and_source_free        true          条目/字节不超过契约上限，且缓存内容不含源码原文
+  wire_refuses_non_whitelist           true          内部协议收到白名单外 verb ⇒ 拒绝且不改状态
+  commands_surface_lists_daemon        true          兜底 BLOCKED 消息里的命令清单必须含 daemon
+  unknown_flag_blocked                 true          未知启动参数 BLOCKED（不接受"参数被忽略"）
+  defaults_idle_secs                   900           契约默认值
+  defaults_max_workspaces              2             契约默认值
+  dirty_after_lifecycle                0             整个生命周期结束后工作树未被写入
+  ```
+  `probe_count = 30`。"不得 hang" 不用时间上界钉死（那是把宿主负载写进契约）：真卡住时
+  场景会以 `failed_step="run"`（超时）暴露，而不是被某条脆弱的毫秒断言误判。
+  部分探针（`second_process_*`、`cache_second_run_tier`、`stale_fallback_verdict`）要求宿主
+  有可解析的 rust-analyzer；在没有 RA 的宿主上它们**如实变红**，这是性质而非环境噪声
+  —— 与 `provider_override_honored` 同一口径。
 
 ## Non-Responsibilities
 
@@ -506,14 +557,20 @@ Code Intelligence 场景（E4，冻结于 2026-10-10 契约阶段，夹具为
 都没发就挂断 ⇒ `UNKNOWN`，畸形/半帧 ⇒ `FAIL`）、
 `code_intelligence_mcp_real_query.toml`（Phase 3/4：`tools/call` 走真实查询并返回 CLI 那套
 中立 DTO，且第二次查询必须复用同一 provider 会话）。
-`code_intelligence_daemon_lifecycle.toml`（daemon 的显式生命周期与跨命令复用：start 幂等、
-第二个进程真复用、digest 变更必失效、stale 租约回落不 hang、stop 后零会话零残留、线协议不越白名单 ——
-需要控制状态才能确定的性质一律走 `daemon selftest` 的 13 条探针，`probe_count` 由场景钉死）、
+`code_intelligence_daemon_lifecycle.toml`（daemon 的显式生命周期、跨命令复用与两层缓存：
+**逐条钉本文件 selftest 字段清单的值**（36 条期望，`probe_count = 30`），并显式传 `--workspace`
+—— 契约规定 selftest 没有缺省作用域，缺省即环境依赖。覆盖 start 幂等、默认路径不自动 spawn
+（`default_path_session_source` + `default_path_lease_absent` 两枚值断言，而非用 `--no-daemon`
+同义反复）、残留租约回落不谎报、错误 token 被拒、注入小 idle 后自退出并删租约、
+stop 打不存在的 daemon ⇒ `UNKNOWN`、stop 后 `sessions_after_stop=0`、LRU 到容量仍只 1 个会话、
+digest 变更 ⇒ `digest_invalidation_reason="digest_changed"`、结果层**真的命中过**
+（`cache_second_run_tier="disk"`）、缓存有界且不含源码原文、线协议不越白名单、
+命令清单含 `daemon`、生命周期全程 `dirty_after_lifecycle=0`）、
 `code_intelligence_daemon_explicit_only.toml`（`--no-daemon` 下 `session_source="in-process"`，
 证明 CLI 不自动 spawn，且该口径不受环境里是否有人手起过 daemon 影响）、
 `code_intelligence_cache_disabled.toml`（`--no-cache` ⇒ `cache.disabled=true` 且 `tier="miss"`，
 键绑定字段仍可见）、`code_intelligence_daemon_command_surface.toml`（未知 daemon 子命令 `BLOCKED`
-且 declined 输出照样带 `authority`/`daemon.running`）。共 **25** 个。
+且 declined 输出照样带 `authority`/`daemon.running`）、`code_intelligence_daemon_unknown_flag.toml`（daemon 的未知启动参数 `BLOCKED` —— 本模块两次栽在"参数被接受但不生效"上，daemon 一次新增三个参数，同一漂移最可能复发的地方就是它；参数被真实兑现由 selftest 的 `defaults_*`/`idle_self_exit_observed` 值探针钉）。共 **26** 个。
 
 ### Review 结论与待办承载体（2026-10-10）
 

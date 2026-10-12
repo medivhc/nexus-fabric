@@ -1,107 +1,168 @@
 schema_version = 1
 id = "engineering.code-intelligence-daemon-lifecycle"
-title = "provider daemon 的显式生命周期与跨命令复用可证：start 幂等、第二个进程真的复用、digest 变更必定失效、stop 后零会话零残留（MODULE.md Provider Daemon & Result Cache，提案 §11）"
+title = "provider daemon 的显式生命周期、跨命令复用与两层缓存：逐条钉契约字段的值（MODULE.md「Provider Daemon & Result Cache」selftest 字段清单）"
 evidence_strength = "E4"
-requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#11-optional-persistent-index"
+requirement = "engineering/nexus-harness/MODULE.md#provider-daemon--result-cache"
+# 授权门槛的旁证（不是行为期望的来源）：docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md §11 只说
+# cold start 成为瓶颈时可加持久索引、且不得另造第二套 Agent API；daemon 的每条行为期望
+# 都只来自 MODULE.md，本行不改加载行为（requirement 不被加载器读取），仅为人读锚点。
 
-# 这一条把 daemon 的全部生命周期断言收进 `daemon selftest`：它自己在 temp 里造 scratch workspace、
-# 自己 start/stop、自己留痕，所以**不受环境里是否有人手起过 daemon 的影响**，也不在仓库里造文件
-# （dirty_after=0 是门禁项）。探针清单与 MODULE.md 的字段可得性一一对应：
-# 场景引擎没有"字段必须缺席"这种断言算子，所以 `running=false 时 port/pid/lease_path 不出现`
-# 这类反向断言只能落在 selftest 的探针里，不能假装场景已经覆盖。
+# 期望值逐条镜像 MODULE.md 的字段清单：契约改名/改值而实现与场景没跟上，这里就红。
+# 探针语义（每个 true 具体断言什么）也写在契约里，不是由实现自己解释。
+# 必须显式 --workspace：契约规定 selftest 没有缺省作用域，缺省即环境依赖。
+# 独立性与隔离：selftest 用自己的租约/缓存命名空间与 temp scratch workspace，
+# 因此既不碰开发者真实在跑的 daemon，也不在仓库工作树里造文件（dirty_after_lifecycle=0 钉这条）。
+# 诚实边界：second_process_* / cache_second_run_tier / stale_fallback_verdict 要求宿主有可解析的
+# rust-analyzer；没有 RA 的宿主上本场景如实变红（与 provider_override_honored 同一口径）。
 
 [given]
 repository = "initialized"
 network = "none (只监听 127.0.0.1 的本地子进程)"
 
 [when]
-command = "nexus-harness daemon selftest --json"
+command = "nexus-harness daemon selftest --workspace engineering/nexus-harness/fixtures/code-intel --json"
 
 [[expect]]
 field = "command"
 equals = "daemon"
 
 [[expect]]
+field = "schema_version"
+equals = 1
+
+[[expect]]
 field = "verdict"
 equals = "PASS"
 
-# 适配器/daemon 都不拥有最终 PASS。
+# daemon 与缓存都不拥有最终 PASS。
 [[expect]]
 field = "authority"
 equals = "advisory"
 
-# 探针条数是机器可核的量（散文里说多少条就得对得上多少条）。
+# 探针条数 = 契约清单条数；实现少跑一条就红（§N 那类"记错条数"不能靠人复查）。
 [[expect]]
 field = "probe_count"
-equals = 13
+equals = 30
 
 [[expect]]
-field = "probes_all_ok"
-equals = true
-
-# ① 显式启动与幂等
-[[expect]]
-field = "start_is_running"
-equals = true
+field = "start_verdict"
+equals = "PASS"
 
 [[expect]]
-field = "start_idempotent"
-equals = true
-
-# ② 跨进程复用：另一个 CLI 进程必须走 daemon，且共享同一个 provider 会话
-[[expect]]
-field = "second_process_uses_daemon"
+field = "status_running_after_start"
 equals = true
 
 [[expect]]
-field = "cross_process_reuse"
+field = "start_idempotent_same_port"
 equals = true
 
 [[expect]]
-field = "provider_sessions"
+field = "already_running"
+equals = true
+
+[[expect]]
+field = "default_path_session_source"
+equals = "in-process"
+
+[[expect]]
+field = "default_path_lease_absent"
+equals = true
+
+[[expect]]
+field = "second_process_session_source"
+equals = "daemon"
+
+[[expect]]
+field = "reuse_queries_total"
+equals = 2
+
+[[expect]]
+field = "reuse_provider_sessions"
 equals = 1
 
-# ③ 没有 daemon 时绝不自动拉起，且如实报进程内会话
 [[expect]]
-field = "explicit_only_without_daemon"
+field = "stale_lease_detected"
 equals = true
 
-# ④ 租约残留（daemon 崩了/端口没人听）必须回落，不 hang、不谎报
 [[expect]]
-field = "stale_lease_falls_back"
+field = "stale_fallback_verdict"
+equals = "PASS"
+
+[[expect]]
+field = "stale_fallback_session_source"
+equals = "in-process"
+
+[[expect]]
+field = "wrong_token_rejected"
 equals = true
 
-# ⑤ digest 与会话失效：工作树变更后不得冒充新鲜
 [[expect]]
-field = "digest_change_invalidates"
+field = "idle_self_exit_observed"
 equals = true
 
-# ⑥ 结果缓存的键绑定与可关闭性
 [[expect]]
-field = "cache_key_bound_to_digest"
+field = "lease_removed_on_idle"
+equals = true
+
+[[expect]]
+field = "stop_absent_verdict"
+equals = "UNKNOWN"
+
+[[expect]]
+field = "sessions_after_stop"
+equals = 0
+
+[[expect]]
+field = "lru_provider_sessions_at_capacity"
+equals = 1
+
+[[expect]]
+field = "digest_invalidation_reason"
+equals = "digest_changed"
+
+[[expect]]
+field = "cache_second_run_tier"
+equals = "disk"
+
+[[expect]]
+field = "cache_hit_key_digest_bound"
+equals = true
+
+[[expect]]
+field = "cache_default_enabled"
 equals = true
 
 [[expect]]
 field = "cache_disableable"
 equals = true
 
-# ⑦ 内部线协议不写、不越白名单（不是第二套 Agent API）
+[[expect]]
+field = "cache_bounded_and_source_free"
+equals = true
+
 [[expect]]
 field = "wire_refuses_non_whitelist"
 equals = true
 
-# ⑧ stop 之后：零会话、租约文件已删、仓库工作树没被动过
 [[expect]]
-field = "sessions_zero_after_stop"
+field = "commands_surface_lists_daemon"
 equals = true
 
 [[expect]]
-field = "lease_removed_after_stop"
+field = "unknown_flag_blocked"
 equals = true
 
 [[expect]]
-field = "repo_untouched"
-equals = true
+field = "defaults_idle_secs"
+equals = 900
+
+[[expect]]
+field = "defaults_max_workspaces"
+equals = 2
+
+[[expect]]
+field = "dirty_after_lifecycle"
+equals = 0
 
 [[expect]]
 field = "snapshot.source_revision"

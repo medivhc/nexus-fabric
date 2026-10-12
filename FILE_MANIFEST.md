@@ -2,7 +2,7 @@
 
 本包实现《Nexus 统一系统设计规范 v9》中的“统一仓库目录契约”。
 
-文件数（不含本清单）：192
+文件数（不含本清单）：193
 
 > 2026-10-10：原声明值 137 与表内实际行数（148）已不一致（既有漂移，含
 > `scenarios/engineering/bench_gate_verdicts.toml` 等未登记项）。本次登记
@@ -33,6 +33,7 @@
 >
 > 2026-10-11（Phase 2-4 开工）：登记 `.agents/code-intelligence-phase-2-4-plan.md`，声明值 177 -> 178。
 >
+> 2026-10-12（测试用例盲评打回后重写）：4 条 daemon 场景改为逐条钉契约字段值并新增 1 条未知参数场景，场景总数 25 -> 26，声明值 192 -> 193。
 > 2026-10-12（daemon 与结果缓存开工，契约先行）：登记设计计划、4 条新 E4 场景与 Red Evidence，声明值 186 -> 192；Code Intelligence 场景总数由 21 增至 25。
 > 2026-10-11（独立 Review round 2 整改）：登记 `.agents/red-evidence-mcp-round2.txt`，声明值 185 -> 186。
 > 2026-10-11（Phase 2/3/4 契约与实现）：新增夹具 `MODULE.md`、`code_intel/mcp.rs` 与
@@ -58,6 +59,7 @@
 | `scenarios/engineering/code_intelligence_daemon_explicit_only.toml` | E4：`--no-daemon` 下 session_source=in-process，证明 CLI 不自动拉起 daemon |
 | `scenarios/engineering/code_intelligence_cache_disabled.toml` | E4：`--no-cache` 下 cache.disabled=true 且 tier=miss，键绑定仍可见 |
 | `scenarios/engineering/code_intelligence_daemon_command_surface.toml` | E4：daemon 未知子命令 BLOCKED，且 declined 输出仍带 authority 与 daemon.running |
+| `scenarios/engineering/code_intelligence_daemon_unknown_flag.toml` | E4：daemon 未知启动参数 BLOCKED（参数不接受即失败，不静默忽略） |
 | `.agents/skills/README.md` | Project-level agent skill index |
 | `.agents/skills/nexus-contract-first/SKILL.md` | Project-level agent skill |
 | `.agents/skills/nexus-evidence/SKILL.md` | Project-level agent skill |

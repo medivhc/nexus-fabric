@@ -1,14 +1,13 @@
 schema_version = 1
 id = "engineering.code-intelligence-cache-disabled"
-title = "--no-cache 时结果层缓存既不读也不写：cache.disabled=true 且 tier 只能是 miss（MODULE.md Provider Daemon & Result Cache 两层缓存之②）"
+title = "--no-cache 时结果层不读也不写，但语义结果与键绑定都还在：tier=miss、disabled=true、verdict=PASS（MODULE.md 两层缓存之②）"
 evidence_strength = "E4"
-requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#11-optional-persistent-index"
+requirement = "engineering/nexus-harness/MODULE.md#provider-daemon--result-cache"
 
-# 为什么单独钉这条：结果缓存最危险的失效形状是"悄悄用了一份不知道哪来的旧结果"。
-# --no-cache 给了一条可确定的反证路径 —— 关掉后必须是 miss，且 key_digest 仍然要说清
-# 这次查询绑定在哪个指纹上（键绑定关系不因关闭缓存而消失，否则消费方无法核对）。
-# 命中条件（当前工作树指纹 == 键里的指纹）由 daemon selftest 的
-# cache_key_bound_to_digest 探针负责，那条能控制状态所以可确定；这里钉的是对外可见的形状。
+# 最该被这条场景抓住的假绿是"关掉缓存顺手把查询也打死了"（verdict=FAIL、results 空）——
+# 所以这里直接钉 PASS + results 非空（与 code_intelligence_symbol.toml 同一环境前提、同一口径），
+# 而不是给 verdict 一个 one_of 容忍区间：one_of 里放进 FAIL 等于放弃断言，
+# 排除 BLOCKED 又会在没有 rust-analyzer 的宿主上把环境问题报成性质红。
 
 [given]
 repository = "initialized"
@@ -22,6 +21,18 @@ field = "command"
 equals = "code symbol"
 
 [[expect]]
+field = "schema_version"
+equals = 1
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "results"
+non_empty = true
+
+[[expect]]
 field = "authority"
 equals = "advisory"
 
@@ -29,12 +40,12 @@ equals = "advisory"
 field = "cache.disabled"
 equals = true
 
-# 关掉之后不存在第二种可能：命中必须为假。
+# 关掉之后不存在第二种可能。
 [[expect]]
 field = "cache.tier"
 equals = "miss"
 
-# 键绑定仍然可见：说清这次查询绑在哪个工作树指纹上。
+# 键绑定不因为关掉缓存而消失：仍要说清这次查询绑在哪个指纹上。
 [[expect]]
 field = "cache.key_digest"
 non_empty = true
@@ -42,8 +53,3 @@ non_empty = true
 [[expect]]
 field = "snapshot.working_tree_digest"
 non_empty = true
-
-# 缓存不是结论的所有者：语义结果照旧 advisory。
-[[expect]]
-field = "verdict"
-one_of = ["PASS", "FAIL", "UNKNOWN"]

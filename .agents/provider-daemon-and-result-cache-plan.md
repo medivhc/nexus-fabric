@@ -52,7 +52,8 @@ idle TTL + 可见的 `session_source` 字段正是把这件事变可见的做法
 - `start` 幂等：已有活 daemon ⇒ `PASS` + `already_running=true`，不起第二个。
 - `stop` 幂等：无 daemon ⇒ `UNKNOWN` + 原因（不是 FAIL，也没假装停成功）。
 - 退出路径都要回收 RA 子进程（沿用 `ProviderSession` 的 `Drop` 语义），`selftest` 里断言
-  `provider_sessions_after_stop == 0`。
+  `provider_sessions_after_stop == 0`（**契约名已统一为 `sessions_after_stop`**，见
+  `MODULE.md` 的 selftest 字段清单；两处漂移是独立盲评抓出来的，别再写回旧名）。
 - 崩溃：daemon 死后 `status`/查询都会探到，行为回落到 in-process，且输出带
   `daemon_unavailable` 的结构化原因；**不会**让查询 hang 在超时上。
 

@@ -365,6 +365,19 @@ round 2 的 N1-N7 + S1 **全部 CLOSED**（这次审查者跑了 29 条命令并
   `CARGO_TARGET_DIR` 指定的 scratch；此时执行 `cargo build` 会争 target 目录锁，
   让某条场景拿到 `BLOCKED`（本轮 `callees` 就这样假红过一次，单跑即 PASS）。
   已写进 §O 的过程事实；下次接手先确认没有构建在跑再开批次。
+### 后续项：一条语法错误的场景文件会**无声消失**（harness 自身的 fail-open）
 
-
-
+- 现象与载体：2026-10-12 写 `code_intelligence_daemon_unknown_flag.toml` 时 `title` 里嵌了裸
+  双引号 ⇒ TOML 非法；`scenario run <id>` 报 `unknown scenario id`（`failed_step="lookup"`，
+  `scenario-b349976b96b7`）。根因在 `scenario.rs:52-53`（`read_to_string(..).ok()?` +
+  `toml::from_str(..).ok()?`）与 `scenario.rs:168-189`（`load_all` 对 `None` 直接跳过）。
+- 为什么这是 fail-open：解析失败不产生任何 verdict、不减少任何门禁的绿度，
+  只让 pack 少一条场景。实测 `gates.rs` 里没有"声明条数 == 加载条数"的校验。
+  最坏情形不是"我的测试没跑"，而是**别人删坏/改坏一条场景后，门禁照绿**。
+- 修法（都要另走契约周期，因为改的是 Evidence/门禁语义）：
+  ① `load_all` 返回 `(scenarios, load_errors)`，`scenario run` 对已知文件名的 id 缺失时
+     把解析错误原文带进 `failure_signature`（现在只有 `unknown scenario id`）；
+  ② 场景 pack 的门（或 `MODULE.md` 声明的场景数）加一条"清单条数 == 实际加载条数"的
+     机器核对，少一条即 `UNKNOWN`/`FAIL` 并列出文件名；
+  ③ 顺手把 `lookup` 与 `expect` 的区分写进 `DEVELOPMENT.md`（本模块已两次靠它辨认真红灯）。
+- 本轮不动它：属 harness 通用能力，与本特性无耦合；混在 daemon 提交里会让两件事都难审。

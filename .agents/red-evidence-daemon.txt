@@ -81,3 +81,36 @@
 - 仍然承认的覆盖缺口（评审时请重点看这几处）：结果层缓存的**收益**没有场景证据（§4 已声明
   它只钉结构、不钉时延）；`--max-workspaces` 的 LRU 驱逐只由 selftest 的一条探针负责；
   跨宿主差异（Windows 的 temp ACL、Linux 的 socket 语义）只有 `daemon-lifecycle` 一条间接覆盖。
+---
+
+## 第二轮红灯（nexus-test-review 盲评判 CHANGES_REQUESTED、按契约重写测试之后）
+
+盲评案卷：`.evidence/test-review-branch-feature-code-intel-phase-234-2026-10-12/`
+（verdict `CHANGES_REQUESTED`，16 条发现 + 22 条契约主张未钉；模型 `unbound`）。
+按流程只改测试与契约、没碰实现。重写后 5 条场景的红灯（宿主 Windows，二进制仍是无实现的 `a75a919` 线）：
+
+    daemon-lifecycle      FAIL  step=expect  assertion=verdict        scenario-d3224ebec116
+    daemon-explicit-only  FAIL  step=expect  assertion=verdict        scenario-248baccfe138
+    cache-disabled        FAIL  step=expect  assertion=verdict        scenario-6520a8daeb6f
+    daemon-command-surface FAIL step=expect  assertion=daemon.running  scenario-4bad7d58d8da
+    daemon-unknown-flag   FAIL  step=expect  assertion=daemon.running  scenario-c1a0db1dc09a
+
+与前一轮的差别就是盲评要的那件事：现在红在**daemon 特有的性质**上（`verdict` 落在
+`daemon selftest`/`--no-daemon`/`--no-cache` 三条命令面上，`daemon.running` 落在字段可得性上），
+而不是"今天就已经成立"的断言。前一轮实测过 pre-green 比例：command-surface 3/5、
+cache-disabled 4/7、explicit-only 3/8、lifecycle 1/20 —— 那说明红灯几乎没有信息量。
+
+## 我自己第二次踩进同一格，值得原样记下
+
+`daemon-unknown-flag` 第一次跑出来是 `failed_step="lookup"`、`unknown scenario id`
+（`scenario-b349976b96b7`）—— 我第一反应又是"id 写错了"。真因是 `title` 里嵌了裸双引号
+（`不接受"参数被接受但不生效"`）使 TOML 非法，而 `scenario.rs:168-189` 的 `load_all`
+对解析失败的文件是 `if let Some(s) = load_file(..) { out.push(s) }` —— **静默跳过**，
+于是文件存在但从未被加载，症状却是"没有这个场景 id"。
+
+两点后果：
+1. 对作者：一次差点被当成"红灯成立"的**测试没在跑**。`lookup` 与 `expect` 的区分我上一段
+   刚写进档案，紧接着就靠自己踩回来才真正记住。
+2. 对门禁：实测无任何"声明条数 == 加载条数"的校验（`grep scenario_count gates.rs` 为空），
+   所以**一条语法错误的场景文件会从 pack 里无声消失**，场景数少 1 而全绿。
+   这属 harness 自己的 fail-open 形态，与本特性无关，已另登记为后续项。
