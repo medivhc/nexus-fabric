@@ -1,0 +1,51 @@
+schema_version = 1
+id = "engineering.code-intelligence-daemon-explicit-only"
+title = "没有 daemon 时查询照常完成且如实报进程内会话：CLI 永不自动拉起，--no-daemon 给 CI 一个确定口径（MODULE.md Provider Daemon & Result Cache）"
+evidence_strength = "E4"
+requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#11-optional-persistent-index"
+
+# 为什么命令里带 --no-daemon：契约承诺"CLI 永不自动 spawn"，但环境里可能有人手工起过 daemon，
+# 那样 daemon.running 就是 true 而非 false —— 场景会变绿/变红取决于宿主机上有没有别的进程，
+# 那不是被测性质的证据。--no-daemon 把这条场景钉成"完全不问 daemon 时的形状"，
+# 而"有 daemon 时确实走 daemon"由 daemon_lifecycle 的 selftest 探针负责（它自己控制状态）。
+
+[given]
+repository = "initialized"
+network = "none (本地 rust-analyzer 子进程)"
+
+[when]
+command = "nexus-harness code symbol Egress --workspace engineering/nexus-harness/fixtures/code-intel --no-daemon --json"
+
+[[expect]]
+field = "command"
+equals = "code symbol"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "authority"
+equals = "advisory"
+
+[[expect]]
+field = "daemon.running"
+equals = false
+
+[[expect]]
+field = "daemon.session_source"
+equals = "in-process"
+
+# 缓存键仍必须存在并绑定本次指纹（不问 daemon 不影响结果层缓存的可见性）。
+[[expect]]
+field = "cache.key_digest"
+non_empty = true
+
+# tier 的取值是封闭词表，不能出现第四个值。
+[[expect]]
+field = "cache.tier"
+one_of = ["miss", "disk"]
+
+[[expect]]
+field = "snapshot.working_tree_digest"
+non_empty = true

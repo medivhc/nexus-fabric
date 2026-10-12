@@ -1,0 +1,83 @@
+# Red Evidence —— Provider Daemon 与结果缓存（契约先行的红灯确认，实现开始前）
+
+宿主：Windows（冒烟宿主），rustc 1.95.0，rev `9c672a7` 之上的工作树（契约文件已写、实现未动）。
+可执行文件：`./target/debug/nexus-harness.exe`（`daemon` 子命令**不存在**）。
+流程依据：`.agents/skills/nexus-test-review/SKILL.md` 的"红灯确认"——测试必须可运行且处于失败态，
+不是"看起来对"；本文件就是那条红灯的载体（场景 `.toml` 是本模块的测试用例形态）。
+
+## R0 直接调用 daemon 命令面：能力缺席，且是 fail-closed 的缺席
+
+    nexus-harness daemon selftest --json   exit=2  {"command":"daemon","schema_version":1,
+      "verdict":"BLOCKED","message":"supported commands: status, context, check, test,
+      verify, explain, bench, replay, scenario, code"}
+    nexus-harness daemon status --json     exit=2  同上
+    nexus-harness daemon start --json      exit=2  同上
+
+三条都是 `BLOCKED` + 退出码 2：**没有**假装成功、**没有**空输出、也**没有**默默去跑别的命令。
+顺带记一处将在实现时一并修正的口径：这条兜底消息里的命令清单本身还不含 `daemon`
+（`main.rs` 的 `_` 分支硬编码），实现时若不同步更新，就会出现"命令存在但帮助说它不存在"。
+
+## R1 场景 `engineering.code-intelligence-daemon-lifecycle` ⇒ FAIL（红灯）
+
+    evidence_id = scenario-58363e9149c2   duration_ms = 105
+    failure_signature.failed_step = "expect"
+    failure_signature.assertion   = "verdict"        ← 卡在第一条断言，正是应卡的地方
+    key_log_lines = 上面那条 BLOCKED envelope
+
+契约点是 `MODULE.md`「Provider Daemon & Result Cache」的显式生命周期与跨命令复用；
+断言 `verdict == "PASS"` 在能力缺席时必须落空。**这条红灯同时证明它不是空断言**：
+如果 selftest 将来对不上探针清单，失败签名会移到对应的 `probes_all_ok`/`cross_process_reuse` 等字段。
+
+## R2 场景 `engineering.code-intelligence-daemon-explicit-only` ⇒ FAIL（红灯）
+
+    evidence_id = scenario-5c44b1ef66c9   duration_ms = 208
+    failure_signature.failed_step = "expect"
+    key_log_lines = {"command":"code symbol","verdict":"BLOCKED"?, "error":{"code":"QUERY_INVALID",
+                     "reason":"未知选项：--no-daemon"}, "results":[], "count":0, ...}
+
+这条红得比预期更"正"：`code` 的解析器**拒绝未知选项**（`QUERY_INVALID`），
+所以 `--no-daemon` 还没实现时就报错而不是被忽略 —— 正是本项目对"参数静默失效"的口径。
+它也顺带证明：`--no-daemon` 必须在实现里真实存在，否则这条场景永远红。
+
+## R3 场景 `engineering.code-intelligence-cache-disabled` ⇒ FAIL（红灯）
+
+    evidence_id = scenario-4f17519ac317   failed_step = "expect"
+    assertion   = "cache.disabled"        actual = <missing>
+
+`--no-cache` 这个 flag 与 `cache.*` 字段族都还不存在 ⇒ 断言直接落空在**第一个契约字段**上。
+注意它红的位置：`command`/`verdict`/`authority` 先过了，卡在 `cache.disabled` ——
+说明场景本身可运行、命令可执行，失败原因精确指向"缓存层没实现"。
+
+## R4 场景 `engineering.code-intelligence-daemon-command-surface` ⇒ FAIL（红灯）
+
+    evidence_id = scenario-fcd8f6fb1e53   failed_step = "expect"
+    assertion   = "daemon.running"        actual = <missing>
+    （此前 `command == "daemon"` 与 `verdict == "BLOCKED"` 两条已通过）
+
+这条红得最有信息量：兜底的 `BLOCKED` 恰好满足了"未知命令要被拒"，但**declined 输出里
+没有 `daemon.running` / `authority`** —— 正是 MODULE.md 字段可得性和 round 3 N-A1 立的那条规矩
+（declined 也要带 authority，决定 verdict 的量必须可见）。所以这条不只是"功能没实现"的红，
+它还把实现必须补的字段面钉住了。
+
+另记一次自己的错并说明它为什么值得留在红灯档案里：第一次跑这条场景时我按**文件名**猜场景 id
+（`...-command-surface-blocked`），runner 报 `unknown scenario id`（`scenario-b32431a4ac41`，
+`failed_step="lookup"`）。那不算红灯，只是我没按文件里声明的 `id` 引用。已把 id 统一成
+连字符形式 `engineering.code-intelligence-daemon-command-surface`，与其余 daemon 场景同一命名。
+区分这两种失败很重要：`failed_step=lookup` 是测试没跑起来，`failed_step=expect` 才是被测性质为假。
+
+## 这四条红灯共同说明什么
+
+- 红灯发生在 `failed_step="expect"` 而非 `"parse"`/`"run"`/`"lookup"` ⇒ 场景文件本身可解析、
+  命令可执行，失败原因纯粹是"被测能力不存在"。这是 nexus-test-review 要的红灯形态。
+- 覆盖分工是按"能不能确定化"划的，不是随手分的：
+  ① 能由单条命令确定观察的性质 → 独立场景：`daemon-explicit-only`（不问 daemon 的形状）、
+     `cache-disabled`（关掉缓存的形状）、`daemon-command-surface`（未知命令的形状）、
+     `daemon-lifecycle`（selftest 的整体形状）；
+  ② 需要**控制状态**才可确定的（start 幂等、第二个进程是否真复用、stale 租约回落、
+     digest 变更后不冒充新鲜、缓存键绑定、线协议越权拒绝、stop 后零会话零残留）
+     → 落在 `daemon selftest` 的 13 条探针里，由场景断言 `probe_count=13` 与
+     `probes_all_ok=true` 再整体钉住。理由：这些性质依赖"先有一个 daemon / 先改掉工作树 /
+     先杀进程"，放在普通场景里会变成依赖环境、别人一跑就假绿或假红的测试。
+- 仍然承认的覆盖缺口（评审时请重点看这几处）：结果层缓存的**收益**没有场景证据（§4 已声明
+  它只钉结构、不钉时延）；`--max-workspaces` 的 LRU 驱逐只由 selftest 的一条探针负责；
+  跨宿主差异（Windows 的 temp ACL、Linux 的 socket 语义）只有 `daemon-lifecycle` 一条间接覆盖。

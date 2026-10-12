@@ -321,13 +321,74 @@ workspace 上 `symbol Task` 冷启动 `duration_ms=90535` 且 `provider.ready=fa
   （与既有"跨重启计数合并"规则同源，不因复用而重置）。
 - **每条结果仍做查询前后 digest 对比**，`SNAPSHOT_STALE` 的判定不因复用放宽；
   `duration_ms` 仍然是**本次查询**的耗时（不是会话累计），否则 Agent 会把会话成本误读成查询成本。
-- CLI 路径（`nexus-harness code ...`）**不启用**跨命令复用：一次性进程里的会话复用没有意义，
-  而且引入后台/落盘状态会把隐藏生命周期带进 Engineering Plane。
-  `mcp serve` 是唯一持有会话的调用方，退出时必须关闭 provider，不留孤儿进程。
-- **明确不做**（本轮决定，理由写在这而不是藏在代码里）：跨进程缓存、后台 daemon、
-  socket/端口、把索引落盘或写进仓库。这些需要新的生命周期与副作用面，属提案 §11
-  "只在出现证据时再加"的另一半；`provider.session_reused` 就是判断要不要再加的可见判据。
-  相应地 `FILE_MANIFEST`/Side Effects 不新增写副作用。
+- **CLI 路径的跨命令复用要显式开启**（所有者 2026-10-12 决定，见下方「Provider Daemon & Result Cache」）：
+  默认仍然是一次调用一个进程 —— `daemon` 未运行时查询照旧走进程内会话并报
+  `session_source="in-process"`；**CLI 永不自动拉起 daemon**，这条优先级高于"体验顺畅"。
+  `mcp serve` 依旧是自带会话的调用方，退出时必须关闭 provider，不留孤儿进程。
+- 曾经的"明确不做：跨进程缓存、后台 daemon、socket/端口、把索引落盘"已由实测证据解除否决，
+  但**理由不作废** —— 作废的是"隐藏生命周期"这个风险，做法是给生命周期加可见护栏
+  （显式 start/stop/status、租约文件、idle TTL、输出里必带 `daemon.session_source` 与
+  `daemon.running`）。仍然不做：SCIP/repository-wide 落盘索引、把索引或缓存写进仓库、
+  非回环绑定、TLS/认证体系、任何新外部依赖、第二套 Agent-facing API。证据与决定记在
+  `.agents/provider-daemon-and-result-cache-plan.md`。
+
+## Provider Daemon & Result Cache（提案 §11、§15 Phase 4；所有者 2026-10-12 授权）
+
+触发证据（不是"以后可能有用"）：真仓库 47 crates 上 `symbol Task` `duration_ms=90535` 且
+`provider.ready=false`；`references` 给 `--ready-timeout-secs 300` 仍不收敛；夹具 workspace 每次
+冷启动 15–40s。§Q 的 69ms 只证明**同一进程内**已复用，跨命令仍从零开始。
+
+```text
+nexus-harness code <verb> ──(daemon 在跑且握手成功)──▶ daemon(127.0.0.1:<临时端口>)
+                                        │                    └─ 会话池：每 workspace 一个 rust-analyzer
+                                        └─(没在跑)──▶ 进程内冷启动，session_source="in-process"
+```
+
+- **只做回环**：`TcpListener` 绑 `127.0.0.1:0`。绝不绑非回环地址、不做 TLS、不做端口发现服务。
+  选 TCP 而不是 unix socket / named pipe 的理由要说清：两宿主同一实现 ⇒ Windows 冒烟宿主能跑
+  完整的 daemon E4，不需要 `cfg(unix)` 分叉留下一条"Linux 才测过"的路径。
+- **线协议是实现细节**：沿用 `code_intel/lsp.rs` 的 `Content-Length` 分帧（含 header/body 上限），
+  消息面只接受 Nexus 级查询（verb + target + workspace + 预算），服务端仍走同一套
+  verb 白名单、作用域 containment 与只读不变量。**不暴露 raw LSP**，也不新增 Agent-facing API
+  （提案 §11 的约束：cache/provider 是另一个 Provider，不是第二套契约）。
+- **租约与存活判定**：`std::env::temp_dir()/nexus-code-intel-daemon-<fnv>/lease.json`
+  记 `{pid, port, token, started_at, last_heartbeat, idle_secs, workspace_key, version}`；
+  daemon 定期刷新 `last_heartbeat`。存活与否**用端口握手判定，不用 `kill(pid,0)`**（那需要 libc，
+  违反零新依赖）。daemon 崩溃留下的残留租约 ⇒ `status` 报 `stale_lease=true`，
+  `stop` 只删文件、**不去 kill 一个无法验证的 pid**。
+- **token 是误用防护，不是安全边界**（必须照此声明）：租约在按用户隔离的 temp 目录里，
+  而同用户下的任何进程本来就能直接运行 `nexus-harness code` —— daemon 经内部协议能做的事
+  **不多于** CLI 本来能做的事，因此拿到 token 不构成提权；token 的作用只是拒绝误连与
+  让 `stop`/`status` 认对对象。Windows 上无法用 std 收紧 ACL，这一点不粉饰。
+- **生命周期**：`daemon start|stop|status|selftest [--workspace <root>] [--idle-secs N]
+  [--max-workspaces N]`，默认 `idle_secs=900`、`max_workspaces=2`（LRU 驱逐即关闭该会话的
+  RA 子进程）。`start` 幂等（已活着 ⇒ `PASS` + `already_running=true`，不起第二个）；
+  `stop` 对不存在的 daemon 报 `UNKNOWN` + 原因（不假装停成功）；所有退出路径回收 provider，
+  `selftest` 断言 `sessions_after_stop=0`。空闲到点自行退出并删租约。
+- `code` / `context` 支持 **`--no-daemon`** 与 **`--no-cache`**：前者完全不问 daemon
+  （必然 `session_source="in-process"`，给 CI 一个不受环境里是否有人手起过 daemon 影响的确定口径），
+  后者不读也不写结果缓存（`cache.disabled=true`）。默认值都是"允许"。
+- **两层"缓存"不得混为一谈**：
+  ① *会话层*（daemon）真正省掉冷启动，复用键沿用四项（provider 二进制 + workspace 根 +
+     provider 版本 + **会话建立时的 `working_tree_digest`**），指纹变了就重建并记
+     `provider.session_invalidated_reason` —— "宁可付冷启动也不冒充新鲜"的优先级不变；
+  ② *结果层*（落盘）键 =`(working_tree_digest, workspace 根, verb, target, provider 版本, 预算)`，
+     **仅当当前工作树指纹与键一致**才允许命中；查询前后各取一次 digest 的检查不因缓存放宽；
+     条目数与字节有上限、超限即不写且计数可见；**不得包含源码原文**。
+     命中时 `cache.key_digest` 必须等于当次 `snapshot.working_tree_digest` ——
+     把这个等式做成字段与断言，使"拿旧指纹的结果冒充新结果"在输出里就看得见。
+     结果层的收益**未经实测**（它省重复查询不省索引），所以验收只钉结构正确性，时延只作旁证。
+- **字段与可得性**（缺字段即契约破坏，`null`/`0` 不得冒充"有但不知道"）：
+
+  ```text
+  daemon   {running, session_source: "daemon"|"in-process", lease_path, port, pid,
+            idle_secs, already_running, stale_lease, daemon_unavailable,
+            provider_sessions, provider_session_capacity}
+  cache    {tier: "miss"|"memory"|"disk", key_digest, entries, bytes, disabled}
+  ```
+  `running=false` 时 `port`/`pid`/`lease_path` **不出现**；`daemon_unavailable` 只在
+  本想用 daemon 却失败时出现，并带结构化原因（此时查询照常完成，不得 hang 在超时上，
+  也不得把回落说成 PASS 之外的任何结论）。
 
 ## Non-Responsibilities
 
@@ -393,11 +454,22 @@ workspace 上 `symbol Task` 冷启动 `duration_ms=90535` 且 `provider.ready=fa
 - 允许：写入 `.evidence/verify-<id>/`（Evidence）；运行只读验证命令（cargo/git）；输出状态；为 Code Intelligence 启动长期本地子进程 `rust-analyzer`（工作目录限制在仓库/worktree 内，每请求有 timeout/cancellation，stdout 有单帧 64MiB + 单会话累计 256MiB 上限、stderr 有 64KiB 环形上限（超限即按崩溃处理，不静默截断后继续）；crash 最多重启一次且必须记入 `provider.restart_count` 与 `provider.restart_reason`，命令结束时发送 `shutdown`/`exit`）。
 - 禁止：修改业务代码；修改 `scenarios/` 或 `policies/` 内容；执行网络操作；修改 git index/HEAD。
 - 新增副作用前必须更新本契约和 Scenario/Policy（如影响外部行为）。
+- **daemon 与缓存的写副作用（2026-10-12 新增，全部在仓库工作树之外）**：
+  ① 只监听 `127.0.0.1` 的临时端口 —— 不做跨机、不做发现服务、不开放非回环接口；
+  ② `temp_dir()/nexus-code-intel-daemon-<fnv>/lease.json`（租约，daemon 自己刷新与删除）；
+  ③ `temp_dir()/nexus-code-intel-daemon-<fnv>/cache/`（digest 键控的结果缓存，有上限，
+  不含源码原文，可用 `--no-cache`/`cache.disabled` 关掉）。
+  **仓库内不得出现 daemon/缓存文件**（`dirty_after=0` 与"仓库内无残留"是验收项，
+  与 flycheck scratch 同一口径）；`daemon stop` 与 idle 到期都必须删掉自己写的文件。
 - 容量口径（照实说明，别把近似值当精确值）：上述 256MiB 量的是**读线程再序列化后累计的近似线上字节**（`serde_json::to_string` 后的长度），不是进程 RSS，也不是 `serde_json::Value` 的堆占用——后者通常是线上字节的好几倍，所以 256MiB 并不等于"最多用 256MiB 内存"。把口径做精确的前提是 `read_frame` 直接返回本帧消耗的字节数（round 3 待办 8），在此之前调小上限只是换一个同样含糊的数；因此本轮**不动数值**，只把口径写进契约，并把"降上限到 32–64MiB"留作带测量的独立契约周期（属契约数值变更，会影响超大 workspace 的可用性）。
 
 ## Public API
 
 - CLI 命令与 `--json` 输出为本模块 Public API，保持版本化与向后兼容。
+- 命令面：`status` / `context` / `check` / `test` / `verify` / `explain` / `bench` / `replay` /
+  `scenario` / `run` / `code <8 个只读 verb>` / `mcp serve|selftest` /
+  **`daemon start|stop|status|selftest`**（2026-10-12 新增，见「Provider Daemon & Result Cache」）。
+  未知命令与未知参数一律 `BLOCKED`，不静默忽略、不"当成一次查询试一下"。
 - 默认最小 surface：`private -> pub(crate) -> pub`。
 
 ## Verification
@@ -433,7 +505,15 @@ Code Intelligence 场景（E4，冻结于 2026-10-10 契约阶段，夹具为
 只读工具，未知方法/非法参数/写能力调用都被拒，并覆盖 **EOF 的两种形状** —— 客户端一条请求
 都没发就挂断 ⇒ `UNKNOWN`，畸形/半帧 ⇒ `FAIL`）、
 `code_intelligence_mcp_real_query.toml`（Phase 3/4：`tools/call` 走真实查询并返回 CLI 那套
-中立 DTO，且第二次查询必须复用同一 provider 会话）。共 **21** 个。
+中立 DTO，且第二次查询必须复用同一 provider 会话）。
+`code_intelligence_daemon_lifecycle.toml`（daemon 的显式生命周期与跨命令复用：start 幂等、
+第二个进程真复用、digest 变更必失效、stale 租约回落不 hang、stop 后零会话零残留、线协议不越白名单 ——
+需要控制状态才能确定的性质一律走 `daemon selftest` 的 13 条探针，`probe_count` 由场景钉死）、
+`code_intelligence_daemon_explicit_only.toml`（`--no-daemon` 下 `session_source="in-process"`，
+证明 CLI 不自动 spawn，且该口径不受环境里是否有人手起过 daemon 影响）、
+`code_intelligence_cache_disabled.toml`（`--no-cache` ⇒ `cache.disabled=true` 且 `tier="miss"`，
+键绑定字段仍可见）、`code_intelligence_daemon_command_surface.toml`（未知 daemon 子命令 `BLOCKED`
+且 declined 输出照样带 `authority`/`daemon.running`）。共 **25** 个。
 
 ### Review 结论与待办承载体（2026-10-10）
 

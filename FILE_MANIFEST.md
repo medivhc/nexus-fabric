@@ -2,7 +2,7 @@
 
 本包实现《Nexus 统一系统设计规范 v9》中的“统一仓库目录契约”。
 
-文件数（不含本清单）：186
+文件数（不含本清单）：192
 
 > 2026-10-10：原声明值 137 与表内实际行数（148）已不一致（既有漂移，含
 > `scenarios/engineering/bench_gate_verdicts.toml` 等未登记项）。本次登记
@@ -33,6 +33,7 @@
 >
 > 2026-10-11（Phase 2-4 开工）：登记 `.agents/code-intelligence-phase-2-4-plan.md`，声明值 177 -> 178。
 >
+> 2026-10-12（daemon 与结果缓存开工，契约先行）：登记设计计划、4 条新 E4 场景与 Red Evidence，声明值 186 -> 192；Code Intelligence 场景总数由 21 增至 25。
 > 2026-10-11（独立 Review round 2 整改）：登记 `.agents/red-evidence-mcp-round2.txt`，声明值 185 -> 186。
 > 2026-10-11（Phase 2/3/4 契约与实现）：新增夹具 `MODULE.md`、`code_intel/mcp.rs` 与
 > 5 个场景（context 语义锚点 3 条、MCP 2 条），声明值 178 -> 185；
@@ -51,6 +52,12 @@
 | `.agents/green-evidence-code-intelligence.txt` | Green Evidence record（Code Intelligence E4 场景全 PASS，正文记录其绑定的 source_revision） |
 | `.agents/red-evidence-code-intelligence.txt` | Red Evidence record（Code Intelligence 契约阶段 9/9 FAIL） |
 | `.agents/red-evidence-mcp-round2.txt` | Red Evidence record（MCP stdout 通道泄漏、PASS 分支不可探针、`--provider-binary` 静默丢弃的修前实测） |
+| `.agents/provider-daemon-and-result-cache-plan.md` | Provider daemon 与结果缓存的设计与实施计划（授权范围、生命周期护栏、两层缓存定义、验收判据） |
+| `.agents/red-evidence-daemon.txt` | Red Evidence record（daemon 命令面与缓存字段实现前的四条红灯，含 evidence_id） |
+| `scenarios/engineering/code_intelligence_daemon_lifecycle.toml` | E4：daemon 显式生命周期与跨命令复用（selftest 13 探针、probe_count 钉死） |
+| `scenarios/engineering/code_intelligence_daemon_explicit_only.toml` | E4：`--no-daemon` 下 session_source=in-process，证明 CLI 不自动拉起 daemon |
+| `scenarios/engineering/code_intelligence_cache_disabled.toml` | E4：`--no-cache` 下 cache.disabled=true 且 tier=miss，键绑定仍可见 |
+| `scenarios/engineering/code_intelligence_daemon_command_surface.toml` | E4：daemon 未知子命令 BLOCKED，且 declined 输出仍带 authority 与 daemon.running |
 | `.agents/skills/README.md` | Project-level agent skill index |
 | `.agents/skills/nexus-contract-first/SKILL.md` | Project-level agent skill |
 | `.agents/skills/nexus-evidence/SKILL.md` | Project-level agent skill |

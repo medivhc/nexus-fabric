@@ -1,0 +1,49 @@
+schema_version = 1
+id = "engineering.code-intelligence-cache-disabled"
+title = "--no-cache 时结果层缓存既不读也不写：cache.disabled=true 且 tier 只能是 miss（MODULE.md Provider Daemon & Result Cache 两层缓存之②）"
+evidence_strength = "E4"
+requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#11-optional-persistent-index"
+
+# 为什么单独钉这条：结果缓存最危险的失效形状是"悄悄用了一份不知道哪来的旧结果"。
+# --no-cache 给了一条可确定的反证路径 —— 关掉后必须是 miss，且 key_digest 仍然要说清
+# 这次查询绑定在哪个指纹上（键绑定关系不因关闭缓存而消失，否则消费方无法核对）。
+# 命中条件（当前工作树指纹 == 键里的指纹）由 daemon selftest 的
+# cache_key_bound_to_digest 探针负责，那条能控制状态所以可确定；这里钉的是对外可见的形状。
+
+[given]
+repository = "initialized"
+network = "none (本地 rust-analyzer 子进程)"
+
+[when]
+command = "nexus-harness code symbol Egress --workspace engineering/nexus-harness/fixtures/code-intel --no-cache --json"
+
+[[expect]]
+field = "command"
+equals = "code symbol"
+
+[[expect]]
+field = "authority"
+equals = "advisory"
+
+[[expect]]
+field = "cache.disabled"
+equals = true
+
+# 关掉之后不存在第二种可能：命中必须为假。
+[[expect]]
+field = "cache.tier"
+equals = "miss"
+
+# 键绑定仍然可见：说清这次查询绑在哪个工作树指纹上。
+[[expect]]
+field = "cache.key_digest"
+non_empty = true
+
+[[expect]]
+field = "snapshot.working_tree_digest"
+non_empty = true
+
+# 缓存不是结论的所有者：语义结果照旧 advisory。
+[[expect]]
+field = "verdict"
+one_of = ["PASS", "FAIL", "UNKNOWN"]

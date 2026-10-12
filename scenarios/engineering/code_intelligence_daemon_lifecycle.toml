@@ -1,0 +1,108 @@
+schema_version = 1
+id = "engineering.code-intelligence-daemon-lifecycle"
+title = "provider daemon 的显式生命周期与跨命令复用可证：start 幂等、第二个进程真的复用、digest 变更必定失效、stop 后零会话零残留（MODULE.md Provider Daemon & Result Cache，提案 §11）"
+evidence_strength = "E4"
+requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#11-optional-persistent-index"
+
+# 这一条把 daemon 的全部生命周期断言收进 `daemon selftest`：它自己在 temp 里造 scratch workspace、
+# 自己 start/stop、自己留痕，所以**不受环境里是否有人手起过 daemon 的影响**，也不在仓库里造文件
+# （dirty_after=0 是门禁项）。探针清单与 MODULE.md 的字段可得性一一对应：
+# 场景引擎没有"字段必须缺席"这种断言算子，所以 `running=false 时 port/pid/lease_path 不出现`
+# 这类反向断言只能落在 selftest 的探针里，不能假装场景已经覆盖。
+
+[given]
+repository = "initialized"
+network = "none (只监听 127.0.0.1 的本地子进程)"
+
+[when]
+command = "nexus-harness daemon selftest --json"
+
+[[expect]]
+field = "command"
+equals = "daemon"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+# 适配器/daemon 都不拥有最终 PASS。
+[[expect]]
+field = "authority"
+equals = "advisory"
+
+# 探针条数是机器可核的量（散文里说多少条就得对得上多少条）。
+[[expect]]
+field = "probe_count"
+equals = 13
+
+[[expect]]
+field = "probes_all_ok"
+equals = true
+
+# ① 显式启动与幂等
+[[expect]]
+field = "start_is_running"
+equals = true
+
+[[expect]]
+field = "start_idempotent"
+equals = true
+
+# ② 跨进程复用：另一个 CLI 进程必须走 daemon，且共享同一个 provider 会话
+[[expect]]
+field = "second_process_uses_daemon"
+equals = true
+
+[[expect]]
+field = "cross_process_reuse"
+equals = true
+
+[[expect]]
+field = "provider_sessions"
+equals = 1
+
+# ③ 没有 daemon 时绝不自动拉起，且如实报进程内会话
+[[expect]]
+field = "explicit_only_without_daemon"
+equals = true
+
+# ④ 租约残留（daemon 崩了/端口没人听）必须回落，不 hang、不谎报
+[[expect]]
+field = "stale_lease_falls_back"
+equals = true
+
+# ⑤ digest 与会话失效：工作树变更后不得冒充新鲜
+[[expect]]
+field = "digest_change_invalidates"
+equals = true
+
+# ⑥ 结果缓存的键绑定与可关闭性
+[[expect]]
+field = "cache_key_bound_to_digest"
+equals = true
+
+[[expect]]
+field = "cache_disableable"
+equals = true
+
+# ⑦ 内部线协议不写、不越白名单（不是第二套 Agent API）
+[[expect]]
+field = "wire_refuses_non_whitelist"
+equals = true
+
+# ⑧ stop 之后：零会话、租约文件已删、仓库工作树没被动过
+[[expect]]
+field = "sessions_zero_after_stop"
+equals = true
+
+[[expect]]
+field = "lease_removed_after_stop"
+equals = true
+
+[[expect]]
+field = "repo_untouched"
+equals = true
+
+[[expect]]
+field = "snapshot.source_revision"
+non_empty = true
