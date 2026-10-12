@@ -1,0 +1,266 @@
+{
+  "schema_version": 1,
+  "review_id": "review-gateway-file-r7",
+  "review_round": 7,
+  "previous_review_id": "review-gateway-file-r6",
+  "verdict": "COMMENTED",
+  "reviewer": {
+    "agent": "独立评审签发者／审计者（不是实现者，也不是 r7 案卷的作者）。本 summary 不是对 .evidence/review-gateway-file-r7/findings.md 的转录：6 条 WARN 逐条回到代码与场景文件复核并改判了 3 条，12 条 NOTE 逐条核了引用与算术（其中 R7-N-10 判为不成立），并按「安全语义变更」的方向做了漏判 FAIL 的反向检查。",
+    "model": "会话元数据把本会话的模型标识记为 qfmodel；QoderCN 未对外披露其底层基础模型名称，所以我能确认的只有会话元数据里的这个标识，无法确认更底层的模型名——不伪称。",
+    "host": "Windows 11 x64 (win32) + Git Bash",
+    "could_not_compile": "本评审未编译 nexus-web-gateway：它依赖 ssh2 0.9.6，其 userauth_pubkey_memory 受 cfg(any(unix, vendored-openssl, openssl-on-win32)) 门控，本机无 cl.exe/nasm。未运行本仓任何单测／clippy／harness／场景。实现方在 xc-pc-linux 上的实测数字（61 单测、clippy 零诊断、9 场景 90 期望全 PASS、verify --fast 9 门）我未复现，也未被用作任何「我能读到的东西」的替代证明。",
+    "static_only": true,
+    "what_i_did_execute": "静态阅读 + 仓内可复算的算术／grep + 两件事在本机真的跑了：(1) 按 engineering/nexus-harness/src/env.rs:187-216 的定义用 git hash-object --stdin 自行复算 contract_hash（见 bindings，成功复现 e166ea79…，并复现 r7 的 CRLF 变体与 r6 的 HEAD 数字）；(2) 运行了 r7 留在会话目录的仓外 std-only 复算台 r7rig（rustc/cargo 1.95.0，本机已有），复核其 M9／删 forget／删升级分支／M3／M6／M7／M8a／M8b 等变异断言。对被评审代码本身仍是 static_only：复算台跑的是 r7 摘录的实现，不是我编译的本仓。"
+  },
+  "source_revision": "af953af8849c5549f78f77add4ef5441faba4267",
+  "source_revision_note": "沿用 r1..r6 的申报值，但本评审核到它已不是本分支的真实基线：af953af 之后 bd2845c 已把 r1-r6 的代码落地、7fe1813/175e115 落地了案卷，HEAD = 175e115，本批 6 个文件的 diff 是相对 175e115 的（r7 §绑定信息与三棵 stash 树的父提交都是 175e115）。af953af 里既无 bounded_key 也无 IDENTITY_LABEL_MAX_BYTES，所以「被删的裁剪键」存在于 175e115 而不是 af953af。签发时未改这一字段以免与 r1..r6 断链，改判登记为 R7-AUDIT-5。",
+  "scope": [
+    "crates/nexus-web-gateway/src/file_service.rs（Throttle：BucketState/IdentityKey/stale/decay/identity_key/record_failure/is_locked/succeed/forget/四个读侧访问器，AUDIT_FIELD_MAX_BYTES 注释，FileEngine::throttle_* 访问器，节流测试区；本评审用 git diff 的 hunk 头逐块核过，改动确实只落在这四处）",
+    "crates/nexus-web-gateway/examples/gateway_file_contract.rs（探针 auth_throttle：新增 e5 摘要键夹具与 e6 衰减自愈夹具，未冻结字段 throttle_rows_before_victim_success）",
+    "crates/nexus-web-gateway/MODULE.md（G15 整段重写：摘要键 + 双层衰减 + 未证事项）",
+    "PRODUCT.md（§18.2「鉴权与节流」条目：两条 owner 裁决从「待裁决」改为已落地产品行为）",
+    "scenarios/product/gateway_file_auth_throttle.toml（[[expect]] 9 → 13，新增 4 条）",
+    ".agents/green-evidence-gateway-file-service-m1.txt（第八片自述：bindings、实测数字、变异表、两条裁决的代价与残余）",
+    "不在本批改动集内但被本批改到失真的：crates/nexus-web-gateway/requirements.toml（REQ-010 acceptance，见 R7-AUDIT-2）"
+  ],
+  "bindings": {
+    "reviewed_content": {
+      "content_tree": "916195f0a06861e002db274c1de3d1ca99f6c20c",
+      "content_tree_provenance": "实现方自报为「签发时冻结树」。本评审在 Windows 上独立核过其存在与内容：git cat-file -t 得 commit；父提交 = 175e115 + c6515c3（index on feature/gateway-file-service-contracts），是 git stash create 型；git diff 916195f0（无路径限定，即整棵树）对当前工作树为空 ⇒ 冻结树 == 本评审读到的工作树。",
+      "verified_trees": [
+        {
+          "tree": "b968081bc20247a44236b8e34355a435ffd7bba8",
+          "claim": "代码 + 契约树（Linux 上门禁数字的来源）",
+          "my_verification": "对象存在；父 = 175e115 + 83614b5；git diff b968081 -- src/examples/MODULE.md/scenarios/PRODUCT.md 为空，与工作树的唯一差异是 .agents/green-evidence…txt 少 90 行 ⇒ 代码与契约字节与工作树相同，本评审采信。"
+        },
+        {
+          "tree": "a9fad4d5616e2c95bee601919b4fd545d1770a8b",
+          "claim": "同一代码/契约 + 本文件第八片正文",
+          "my_verification": "对象存在；父 = 175e115 + 0494ff4；对 b968081 的差异仅 .agents/green-evidence…txt（+84 行）；代码/契约与工作树相同。"
+        },
+        {
+          "tree": "1ab58b1ff11d135fd43deb9d726c66b4a96d235c",
+          "claim": "bindings 最终取用树（dirty_state=false）",
+          "my_verification": "对象存在；父 = 175e115 + 42c1819；对 a9fad4d 差异仅证据文字（+6/-4）；代码/契约与工作树相同。三棵树代码/契约相同、差异只在证据文字 ⇒ 案卷那句话由本评审独立复现成立。"
+        }
+      ],
+      "verification_host": "xc-pc-linux",
+      "toolchain": "rustc/cargo 1.98.1",
+      "contract_hash": "e166ea79359b6559165e6b6af263fc3b74c5ee79",
+      "contract_hash_how_i_computed": "不是照抄：本评审在 Windows 上按 engineering/nexus-harness/src/env.rs:187-216 的定义自行复算并复现了它。方法 = 遍历 scenarios/<子目录>/*.toml（子目录名排序、文件名排序），每块拼 scenarios/{d}/{n}\\n + 文件原文，块间用 \\n===\\n 连接，把这段字节送 git hash-object --stdin。本工作树 4 个子目录 30 个 toml：LF 归一后 420070 字节 ⇒ e166ea79359b6559165e6b6af263fc3b74c5ee79（与实现方、r7 一致）；不归一行尾 ⇒ 433851 字节 ⇒ c3e352b7d87298826c144b8e40d13d7d803d6846（复现 r7 的 R7-N-2）；改用 HEAD(175e115) 的树 ⇒ 8f510129cd7d9bef054d2324a4517fc534ab9806（复现 r6 的数字，证方法与实现方同源）。",
+      "contract_hash_scope_limit": "contract_hash 只覆盖 scenarios/**/*.toml ⇒ requirements.toml 与本批之外的任何契约散文都不在这个digest 里（本评审读码确认；这是 R7-AUDIT-2 的一半依据）。",
+      "self_reported_measurements_not_reproduced": "working_tree_digest a8d2cda1ca9fd1a67df1ca8bbf76cbbdfe4947e0 / evidence dir verify-5f2f68a4d63f 与 verify-046ce58629e2 / 场景证据 scenario-54a3da9c0936、scenario-af9e5b6f765b：均为实现方自报，本评审在 Windows 上无法复现，也未用作替代证明。"
+    }
+  },
+  "counts": {
+    "fail": 0,
+    "warn": 3,
+    "note": 16,
+    "r7_live_warns_audited": 6,
+    "r7_withdrawn_warn_audited": 1,
+    "r7_notes_audited": 12,
+    "r7_items_rejected": 1
+  },
+  "r7_findings_audit": [
+    {
+      "id": "R7-W-1",
+      "verdict": "confirmed",
+      "reasoning": "算术与判据都核住了，两处订正。算术：默认参数 max_throttle_buckets=1024、lockout_after=5、lockout_window=60 s（file_service.rs:144-146）⇒ 接受锁定策略的聚合上界 = 1024×5/60 = 85.33 次/s ✓（每行第 5 条失败写 locked[k]=t+w 且桶 last=t，两者死亡条件逐字等价，锁定期间 authenticate:1380 短路不记失败 ⇒ 每行每窗口恰 5 条，界是紧的）；旧语义同口径 = 1024×1/60 = 17.07 ✓。订正 1：案卷把「绝不锁定」那一支写成表达式 (1024×4+4)/60 却报 68.27，4100/60 = 68.33，68.27 对应 4096/60 ⇒ 表达式与数字不同源（结论不受影响）。订正 2：它问的「是不是令牌比较次数的上界」——是，而且界还要略高一点：authenticate 在 is_locked 为真时于 :1380-1383 直接 return，不做 constant_time_eq；全局窗口武装期间 :810 让所有主体都短路 ⇒ 被短路的尝试一次都不比较，所以「有信息量的比较次数」== 落到 record_failure 的失败数（+ 成功数）。加上溢出人群那条分支每窗口最多 5 条（第 5 条即武装、此后短路），严格上界是 (1024×5+5)/60 ≈ 85.42 次/s，案卷的 85.33 是略偏低的近似，与 PRODUCT.md:3312 唯一的速率锚点「84.4 次认证/秒」的比较结论不变：默认参数下节流不在吞吐上界之下起作用。判据面：我逐字读了 MODULE.md G15:180-185 与 PRODUCT.md:3311-3321，两侧都只登记了「同一窗口内 lockout_after 条 ⇒ 慢滴者不会被锁死」这一每身份代价，没有任何一句登记聚合面 ⇒ 「没有说过比代码更强的话、但代价登记不完整」成立。因为抬率是 owner 裁决（实现衰减）的直接后果、且方向是可用性与猜测率的交换，不判 FAIL；契约完整性缺口判 WARN。r7 用仓外复算台量的 256.0／320.0 每窗口条数我在同一台机器上重跑复现（见 positive_verifications）。"
+    },
+    {
+      "id": "R7-W-2",
+      "verdict": "confirmed",
+      "reasoning": "三条子判据全部成立，但射程要比案卷写得更窄。(1) 杀伤力为零：全仓 grep 得 forget 只有 :908 定义与 :1467 一处调用；逐个读了 6 条节流单测（:2799/:2946/:3075/:3123/:3172/:3940）与全部 close_session 出现点（:2670/:2709/:2794/:3780/:3892/:3926/:4005/:4023）——它们断言的是审计行数、动作名、预算归还与会话配额，没有一条断言 close_session 之后的节流状态；sweep_idle 出现的三处（:3570/:3574/:3935）也在预算/审计面。⇒ 删掉 :910-911 两行，61 单测 + 90 期望不红；我在 r7 的复算台上实跑该变异，0/59 红，与本推演一致。(2) 注释 :901 的「(asserted by the probe)」不实：examples:569-575 的 state_cleared_after_close 跑的是「正确令牌认证 → close_session → 再认证成功」，而那次成功已在 :1407 走 succeed 清了桶，forget 在这里无事可做；并且该字段不在场景的 13 条 [[expect]] 里（我 grep 过整个 scenarios/，state_cleared_after_close 只出现在 examples:573 与案卷），连 E4 面都不在。(3) 注释 :906 给的理由对「成功 → 攒到锁定 → close」这条序列为假：succeed 清的是 t0 之前的账，t1 新写的锁要靠 forget 才没。判 WARN 而非 NOTE 的理由：这三点合起来是「被写成已有验证覆盖的安全语义实际零覆盖」，与 r6 对案卷诚实性判 WARN 的先例同级。判它不是 FAIL 的理由（我给案卷补上它没写清的一半）：不构成越权——close_session 不接 source 参数，forget 吃的是会话自己在 :1442-1443 记下的 (principal, source) 全串，只能拆自己那一对；forget 不碰 global_locked_until ⇒ 表满/溢出入群那条 fail-closed 大路拆不掉；而且这条语义与本批无关，175e115 的 forget 就是同样的两行（buckets.remove + locked.remove），本批只改了键的构造。真正的解锁前置是 t0 必须先持有一次正确令牌。会话归属检查缺失仍是 r2 N-8 的既登记 open 项。"
+    },
+    {
+      "id": "R7-W-3",
+      "verdict": "regrade",
+      "reasoning": "改判为 NOTE（本评审 R7-AUDIT-1）：不可达性证明成立、且与实现方新单测的前提并不冲突；但这条 WARN 的另一半——「G15 把它写成第二道 fail-closed 机制」——经查不实。逐帧推演（夹具 max=2、after=2、window=200 ms，走 FileEngine::authenticate）：正常实现下 first 第 1 条 buckets.len()=0<2 建行 count=1；第 2 条 count=2≥2 且 locked.len()=0<2 ⇒ 个体锁；second 第 1 条 buckets.len()=1<2 建行；第 2 条 buckets.contains(K_second) 为真 ⇒ 不走溢出分支，count=2 且 locked.len()=1<2 ⇒ 个体锁。此刻 buckets 物理 2、locked 物理 2、:3200 的 !globally_locked 为真。睡 400 ms 后 third 第 1 条：decay 同刻丢掉两条死锁与两行桶 ⇒ buckets.len()=0 → 建行 count=1；第 2 条：buckets.len()=1<2、locked.len()=0<2 ⇒ 仍走个体锁 ⇒ :3209 真、:3213 THROTTLED 真、:3220 first 正确令牌 OK 真。全程 :846 的判据被测过两次（0≥2、1≥2）但真侧从未触发。变异 M9（把 :779 的 locked.retain 改成恒真）：睡完 third 第 1 条 buckets.len()=0（桶回收没坏）→ 建行；第 2 条 count=2 命中阈值，此刻 locked.len()=2≥max=2 ⇒ 真侧首次触发 ⇒ global_locked_until 被写 ⇒ :3209 红；:3213 仍真（全局窗口对 third 同样短路，案卷这一点也判对了）；first 的正确令牌被全局窗口拒 ⇒ :3220 红。⇒ 实现方「retain 恒真则该测试变红」为真，r7「该分支经 authenticate 结构不可达」也为真，两者各占一半且互不矛盾：r7 自己在 §3.2 就把它列为「(b) locked.retain 坏掉（正是新单测抓的东西）」，所以这不是冲突而是被表述成了冲突。反向核对 r7 的契约侧指控：MODULE.md G15:167-170 的原话是「溢出人群没有自己的桶，因此累计失败达到阈值时升级为全局锁定窗口」，它归因的恰是可经 authenticate 到达的 :825 那条溢出分支，并没有把 :846 写成第二道机制；:843 的注释「锁表满了才升级为全局窗口」陈述的是该分支的条件而非可达性。⇒ 残余只有一条：这条纵深防御分支（仅当 locked 回收失效、或直接使用 pub record_failure 时可达，我按 :819 门禁与 L≤B≤max 不变式独立复证）没有任何正向断言，删掉它 0/59 全绿（复算台实跑复现）。这是覆盖/措辞缺口，不是机制被写成两条的失真 ⇒ NOTE。"
+    },
+    {
+      "id": "R7-W-4",
+      "verdict": "confirmed",
+      "reasoning": "成立，并且比案卷说的大一处。被删方案是 bounded_key = (bounded_label(principal,128), bounded_label(source,128))（我在 git show 175e115 的对应位置读到原码，bounded_label 仍活在 file_service.rs:1113-1122）：s.len() ≤ max 原样返回，否则在 char boundary 前截断并附「…[+NB]」⇒ 每个标签 ≤ 约 128+3+个位数 字节，所以旧方案同时封住了行数与每行标签长度。MODULE.md:159-161 现在写的「裁剪只让项数有界、标签本身仍按调用方给的长度分配」因此为假；同片 file_service.rs:742-744 的英文注释（bounded the labels while still allocating a String per half per bucket）才是对的，摘要键的真实收益是每行 ~300 B → 32 B 内联的常数收益 + 消除定向锁定面。加重情节：这句假话不是 MODULE 独有，.agents/green-evidence-gateway-file-service-m1.txt:495-496 逐字重复了同一句（「裁剪标签的键只让项数有界、标签仍按调用方长度分配」），修的时候要改两处。而本批删掉的 HEAD 版 G15 原话「键的两半同样按 IDENTITY_LABEL_MAX_BYTES 裁长度，否则表项有界只是项数有界而不是内存有界」本来就是正确的——本批把真话改成了假话 ⇒ 维持 WARN（理由与被删方案的历史描述失真，会让下一轮把 R5-W-4 误判为「本批才闭合」）。"
+    },
+    {
+      "id": "R7-W-5",
+      "verdict": "regrade",
+      "reasoning": "改判为 NOTE（本评审 R7-AUDIT-2）。事实核对：requirements.toml:89 的 REQ-010 acceptance 确实仍写「失败按（会话+源）两层键节流…计数与表项有界，随会话回收清零」，既没有「按窗口衰减」也没有「摘要键」，且「会话+源」应为「主体+源」——这些都对；contract_hash 只覆盖 scenarios/**/*.toml 也对（我读 env.rs:187-216 并据此自己复算了哈希）。但降到 NOTE 的两条理由：(a) 「随会话回收清零」在本仓词汇里是歧义而非反向——close_session 本身就是一种会话回收，MODULE.md:206 就用「会话拆除（close/闲置回收）」这种并列表述；而这条歧义在 175e115 就已存在（HEAD 的 forget 同样清两行、HEAD 的 sweep_idle 同样不调 forget，我逐字比对过），本批没有把它从真改成分裂，只是把不对称写进了注释；且 requirements.toml 不在本批 6 个改动文件里。(b) r7 把这条抬到 WARN 的一半重量压在 R7-N-10 的「§18 不在任何门禁解析范围内」上，而 R7-N-10 被我判为不成立（见下）。⇒ 残留的是一条应随下一片一起改的 acceptance 文案（把「按 lockout_window 衰减」「定长摘要」「显式 close_session 才清」写进去），NOTE。"
+    },
+    {
+      "id": "R7-W-6",
+      "verdict": "confirmed",
+      "reasoning": "这条是 r7 的自我撤销，我核它撤销得诚实、且撤得对。原判「三处时间夹具武装侧零余量」被否证：我在同一台 Windows 宿主上跑了它的复算台 rates 模式，夹具形状（6 次连续注入）在窗口 100/20/4/1 ms 下都照样武装 ⇒ 本机这段调用耗时 <1 ms，「零余量」不成立。降级为 R7-N-11 后残留的两点我认可：Throttle 六处硬编码 Instant::now()（:797/816/867/878/888/897）而 sweep_idle(:1480) 已示范可注入时钟；案卷只报了静置侧余量。它引用的知识条目也真实存在：.agents/knowledge/entries/2026-09-30-coverage-run-flaky-timing-test.md。没有别的条目该因这次否证而升降级（M9/删 forget/删升级分支这三个原「推演」结论我实跑复现，方向一致）。唯一要加的是我自己的一条：同一台复算台的绝对数字在两次运行之间会漂（它的 §5.6 报 96.9% 拒止、我这次跑出 97.3%；它报「每窗口只补 1 条溢出失败」0/6 轮武装、我这次读到 1/6 轮），见 R7-AUDIT-4。"
+    },
+    {
+      "id": "R7-W-7",
+      "verdict": "regrade",
+      "reasoning": "改判为 NOTE（本评审 R7-AUDIT-3）。事实核对了：摘要键之后节流表里确实不再有可读身份（IdentityKey = [u8;32]，:682），唯一归因面是审计环的 record(:2375) 用 bounded_label(principal, AUDIT_FIELD_MAX_BYTES=256) ⇒ 两条 principal 前 256 字节相同且总长相同就在审计里渲染成同一串（含 [+NB] 标记里的 N 也相同）而它们是两把不同的键，这条推理成立；G15/PRODUCT 通篇没写这个残余，也成立。但 r7 说「只登记在案卷自述里」要说得更准：.agents/green-evidence-gateway-file-service-m1.txt:487-489 明写了「残余：Throttle 不再保存可读身份…这是把归因从节流表移到审计面的显式取舍」——本批的落地证据里登记了，缺的是契约正文那一行。另外归因并没有失去落点：每一次 THROTTLED/AUTH_DENIED/OK 都在 :1381/:1386/:1450 记 principal，锁定事件可归因到 256 字节 + 长度这一近似类；丢的是「从表里读出被锁者」这一便利，以及长身份上的近似区分度。与 r6 NOTE-4（碰撞可被用来替他人招锁，是主动攻击面）不同级 ⇒ NOTE，随下一片把这一句补进 G15 即可。"
+    }
+  ],
+  "findings": [
+    {
+      "id": "R7-W-1",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:764-794, 815-855, 1380-1383; crates/nexus-web-gateway/MODULE.md:180-185; PRODUCT.md:3311-3321",
+      "summary": "（确认 r7 原判）衰减把桶位从一次性消耗品变成每窗口可续的额度池：默认参数下引擎可记录的失败（= 令牌真被比较的次数）聚合上界 1024×5/60 = 85.33 次/s（严格界含溢出分支为 ≈85.42），旧语义同口径 17.07 次/s，而 PRODUCT.md:3312 自己引用的唯一速率锚点是 V1 零节流的 84.4 次认证/秒 ⇒ 节流在聚合率上不再压得过吞吐。G15 与 PRODUCT 只登记了每身份侧的慢滴代价，没有任何一句登记聚合面，也没有任何期望测它；r4 的实测「94% 拒止」被整句删除而未换新量。订正：案卷写的 (1024×4+4)/60 = 68.27 与表达式不符（4100/60 = 68.33；68.27 = 4096/60），不影响结论。不是文档说过比代码更强的话，而是代价登记不完整。"
+    },
+    {
+      "id": "R7-W-2",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:900-912, 1458-1477, 1480-1499; crates/nexus-web-gateway/examples/gateway_file_contract.rs:569-575; scenarios/product/gateway_file_auth_throttle.toml:14-76",
+      "summary": "（确认 r7 原判，射程收紧）Throttle::forget 的两行零杀伤力：删掉之后 61 单测 + 90 期望全不红（forget 全仓唯一调用点是 :1467；没有任何测试断言 close_session/sweep_idle 之后的节流状态；复算台实跑 0/59 红）。而 :901 的注释写着「(asserted by the probe)」——探针那条 state_cleared_after_close 跑在成功认证之后（succeed 已清桶），且该字段根本不在 13 条 [[expect]] 里；:906 给的「那次成功已经清过桶」对「成功 → 攒到锁定 → close_session」序列为假（结论仍对：无令牌者拿不到会话）。不构成越权也不是本批引入：forget 只吃会话自己记录的 (principal, source)、不碰 global_locked_until，且 175e115 的 forget 行为与此相同。"
+    },
+    {
+      "id": "R7-W-4",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/MODULE.md:159-161; .agents/green-evidence-gateway-file-service-m1.txt:495-496; 对照 crates/nexus-web-gateway/src/file_service.rs:739-744, 1113-1122",
+      "summary": "（确认并加重）对被删方案的记忆描述为假：bounded_label(·,128) 恰恰封住了标签长度（128 + 「…[+NB]」），旧方案同时有界于行数与每行标签字节，不是「只让项数有界、标签仍按调用方给的长度分配」。同片代码注释 :742-744 是正确口径，两处文档互相矛盾；且这句假话在 MODULE.md 与 .agents 证据文件里各出现一次（r7 只报了前者）。本批删掉的 HEAD 版 G15 那句话原本是对的——真话被改成了假话，会让下一轮把 R5-W-4 误判为本批才闭合。"
+    },
+    {
+      "id": "R7-N-1",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:835; .agents/green-evidence-gateway-file-service-m1.txt（变异表 M8）",
+      "summary": "（确认）:835 注释「60 条单测照样全绿」与实际 61 不符（我逐文件 grep #[test]：file_service 36 + config 15 + protocol 6 + cert 2 + gateway 2 = 61）；证据文件把 M8 记成「RED 3 条」，复算台实测应为「只坏 :842 时 5 条测试 + 3 条冻结期望、t_full 不红；:825 与 :842 都坏时 23/59 红」。两处数字，不影响判定。"
+    },
+    {
+      "id": "R7-N-2",
+      "severity": "NOTE",
+      "location": "engineering/nexus-harness/src/env.rs:187-216; scenarios/product/*.toml",
+      "summary": "（确认并由本评审独立复现）contract_hash 对行尾敏感：harness 用 read_to_string 取裸字节，同一内容我算得 LF 归一 = e166ea79…（420070 B）、不归一 = c3e352b7…（433851 B）。案卷未声明「只在 LF 树上可复算」，Windows 脏树上 verify 会得到另一个号 ⇒ requirement-change 锚点随宿主行尾配置漂移。建议把归一化复算方法写进案卷，或在 env.rs 里做 \\r\\n → \\n 归一（后者属 harness 侧）。"
+    },
+    {
+      "id": "R7-N-3",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/MODULE.md:173",
+      "summary": "（确认）病句「同一个 lockout_window 既是对话被锁的时长」，应为「身份被锁的时长」。"
+    },
+    {
+      "id": "R7-N-4",
+      "severity": "NOTE",
+      "location": "scenarios/product/gateway_file_auth_throttle.toml:67-69; crates/nexus-web-gateway/examples/gateway_file_contract.rs:683",
+      "summary": "（确认）「先记录洪水确实武装（否则下一条会因『从未武装』而空转成立）」这句理由不成立：合成式第一项就是 armed_before（:683 json!(armed_before && lapsed && …) 我读到原句），删掉第 3 条期望第 4 条也不会空转；第 3 条的真实价值是定位（区分「没武装」与「没自愈」）。同族：证据文件末尾同一口径也要改。"
+    },
+    {
+      "id": "R7-N-5",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:2821, 3166; crates/nexus-web-gateway/examples/gateway_file_contract.rs:560-561",
+      "summary": "（确认，复算台实跑复现）「不同源不受牵连」在单测里有两根柱子（:2821 与 :3166——后者注释自称「只是回归护栏」，其实正是 M6 的第二根，案卷低估了自己），在 13 条冻结期望里零根：M6 下唯一会红的契约面字段 other_source_still_admitted 未被任何期望冻结。补一条 equals = true 即可让 M6 在 E4 面可红。"
+    },
+    {
+      "id": "R7-N-6",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:3160; scenarios/product/gateway_file_auth_throttle.toml",
+      "summary": "（确认）长度前缀性质只有一根柱子且在单测里：M3（两段长度前缀都不写）实测只有 :3160 一条红，其余 5 条测试与 13 条契约断言全绿 ⇒ 契约面对长度前缀失明。"
+    },
+    {
+      "id": "R7-N-7",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:121-123",
+      "summary": "（确认）FileLimits.max_throttle_buckets 的字段文档仍是旧语义「beyond that, oldest buckets are merged into the global bucket」；本批之后三处失真：进溢出人群的不是 oldest buckets 而是按对新建的行、不是 merged 而是另立全局计数、过期桶是被遗忘而非被并入。"
+    },
+    {
+      "id": "R7-N-8",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:755-762",
+      "summary": "（确认）identity_key 对调用方可控长度不设上界（任意长 principal ⇒ O(len) 摘要）。量级不足以立案，但它属「未认证者可决定的 CPU」，G15 无条目；建议随 files 配置接线（M1 剩余项）一起处理。"
+    },
+    {
+      "id": "R7-N-9",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:755-762; crates/nexus-web-gateway/MODULE.md:157-165",
+      "summary": "（确认）身份键字节精确、无 NFC/NFD/大小写/尾空格归一 ⇒ 同一自然人可造任意多桶，且在表满之前不受 fail-closed 约束；与 R7-W-1 同向，根因同样是缺 per-source 限额。source 的可信性前提（必须是不可被对端影响的传输地址）在 G15 重写后没随附引用，摘要键不改变该前提。"
+    },
+    {
+      "id": "R7-N-11",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/examples/gateway_file_contract.rs:653-682; crates/nexus-web-gateway/src/file_service.rs:2958-3071, 3083-3113, 797/816/867/878/888/897",
+      "summary": "（确认，含 r7 的自我撤销部分）三处夹具依赖真实墙钟、Throttle 六处硬编码 Instant::now()，而 sweep_idle(now) 已示范可注入时钟。复算台实测：窗口压到 1 ms 时 6 次连续注入照样武装 ⇒ 本机静置/武装两侧余量都够，「武装侧零余量」撤回；仍成立的是案卷只报了静置侧余量、且 llvm-cov 插桩运行按本仓知识条目 2026-09-30-coverage-run-flaky-timing-test 会放大约 20×，余量不是被门禁保证的性质。"
+    },
+    {
+      "id": "R7-N-12",
+      "severity": "NOTE",
+      "location": ".evidence/review-gateway-file-r7/findings.md:370-460, 606-612; 仓外会话目录 r7rig",
+      "summary": "（确认）r7 的实测产物在仓外会话目录，下一位评审者拿不到。本评审是唯一例外——我找到了那台复算台并跑了它（见 reviewer.what_i_did_execute），但这不等于可复核：仓门禁里仍然没有这两条配方的红/绿对象。补法照 r7：把「close_session 解除个体锁」与「经 authenticate 不可触达升级分支」固化成两条不依赖时钟的 #[test]，或把复算台落进 examples/ 或 fuzz/ 并登记进 FILE_MANIFEST.md。"
+    },
+    {
+      "id": "R7-AUDIT-1",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:843-851（对照 779, 819）; crates/nexus-web-gateway/MODULE.md:167-170",
+      "summary": "（原 R7-W-3，改判 NOTE，理由见 r7_findings_audit）不可达性证明成立、与新单测不冲突；G15 并没有把它写成第二道机制。残余只有一条：这条仅在「locked 回收失效」或「直接调用 pub record_failure」时可达的纵深防御分支没有任何正向断言（删之 0/59 全绿）。修法：在 :843 注释补一句「经 authenticate 不可达，保留作纵深防御」，并给「个体锁只能由锁表占满触发」补一条不依赖时钟的 #[test]。"
+    },
+    {
+      "id": "R7-AUDIT-2",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/requirements.toml:89",
+      "summary": "（原 R7-W-5，改判 NOTE）REQ-010 acceptance 未随本批更新：缺「按 lockout_window 衰减」与「定长摘要」、键描述仍写「（会话+源）」；「随会话回收清零」属歧义（close_session 也是一种会话回收）且在 175e115 就存在、该文件不在本批改动集内。contract_hash 不覆盖 requirements.toml（env.rs:187-216 我读码确认）⇒ 这条漂移门禁看不见。下一片一并改写。"
+    },
+    {
+      "id": "R7-AUDIT-3",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:682, 739-762, 2375; crates/nexus-web-gateway/MODULE.md:157-188; .agents/green-evidence-gateway-file-service-m1.txt:487-489",
+      "summary": "（原 R7-W-7，改判 NOTE）摘要键的归因残余（表里不再保存可读身份；唯一归因面把 principal 裁到 256 B ⇒ 前 256 字节相同且总长相同的两条身份在审计里渲染成同一串而它们是两把键）只写在 .agents 证据正文里，G15/PRODUCT 一句未提。归因没有失去落点（每次 THROTTLED/AUTH_DENIED/OK 都记 principal），丢的是长身份的近似区分度 ⇒ 补一句进 G15 即可。"
+    },
+    {
+      "id": "R7-AUDIT-4",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:688-690, 787-793; .evidence/review-gateway-file-r7/findings.md:424-440",
+      "summary": "（本评审新增）复算台类结论的绝对数字不可跨运行复现，引用时必须标成观测而非性质：我在同一台机器重跑，新语义拒止占空比得 97.3%（案卷 96.9%）、旧语义 99.8% 复现；「每窗口只补 1 条溢出失败」案卷报 0/6 轮、我这次读到 1/6 轮完成武装。这条差别指向真实语义边界：stale() 用 >= window，所以节奏严格小于一个窗口的涓流不会让 global 归零，可以跨窗口攒到 lockout_after 而武装。G15:175-176 与 PRODUCT:3319 那句「重新武装必须再攒满 lockout_after 条」字面仍为真（且武装后必须先重新灌满表），但「停止注入一个窗口内自愈」应读作「停止注入」而不是「每窗口一条也自愈」。建议 G15 加半句，并把这类比率标为未测观测。"
+    },
+    {
+      "id": "R7-AUDIT-5",
+      "severity": "NOTE",
+      "location": ".evidence/review-gateway-file-r6/summary.json:14; .agents/green-evidence-gateway-file-service-m1.txt:456-459",
+      "summary": "（本评审新增，provenance）source_revision 字段值 af953af 已是两提交之前的历史基线：r1-r6 的代码在 bd2845c 落地、案卷在 7fe1813/175e115 落地，本批 6 个文件的 diff 与三棵 stash 树的父都是 175e115；af953af 里根本没有被本批删除的 bounded_key/IDENTITY_LABEL_MAX_BYTES。为不断链本 summary 仍按链上惯例填 af953af，并在 source_revision_note 里写明真实基线；证据文件 456-459 行绑的 source_revision = 1ab58b1（dirty_state=false 的 stash 式提交）与本批代码/契约相同，可自洽。下一轮请统一改成「基线 = HEAD 175e115 + 工作树冻结树」。"
+    }
+  ],
+  "reverse_check_for_missed_fail": {
+    "result": "未发现 FAIL。四条「契约承诺的门」我按代码逐帧验过，方向都没被改反。",
+    "checks": [
+      "fail-closed 仍可达且仍有测：表满 → 溢出计数 → 全局窗口这条路径由 t_full(:3940，max=8/after=3)、lockout_rearms(:2946，max=8/after=2)、探针 e4(examples:505-552) 与产品尺寸 e(:580-610) 四条同时钉住；M5（:825 恒假）实测打红 2 条测试 + 4 条冻结期望 ⇒ 柱子最多，健康。",
+      "内存上界仍成立：:819 的写入门禁使新行只在 buckets.len() < max 或键已在册时产生 ⇒ 物理行 ≤ 1024；:846 的 else 分支只在 locked.len() < max 时插入 ⇒ 物理锁 ≤ 1024；键 32 B 内联 + BucketState{usize,Instant} ⇒ 每行常数。且不变式「decay 之后 locked.len() ≤ buckets.len() ≤ max」成立：锁与桶的死亡条件逐字等价（:779 retain 用 until > now、:780 与 :689 stale 用 now-last >= window、:803 读侧用 until > now），succeed 只在 is_locked 为假时可达、forget 两行都删。",
+      "锁定未被绕过：is_locked(:796-811) 对个体锁与全局窗口都做 before-comparison 短路，正确令牌在窗口内仍被拒（:1380-1383 在读码上确认位于 constant_time_eq 之前）；:810 已不再要求「不在 buckets 里」⇒ r3 R3-NEW-2 的成果没被本批改坏；forget 拆不掉 global_locked_until。",
+      "identity_key 读写点一致：:798(is_locked)、:818(record_failure)、:858(succeed)、:909(forget) 全部同一 Self::identity_key；全仓 grep bounded_key / IDENTITY_LABEL_MAX_BYTES 在工作树零命中 ⇒ 无残留元组键容器；:1198-1200 确认引擎把 max_throttle_buckets/lockout_after/lockout_window 原样喂给 Throttle::new；FileEngine::authenticate 的 held_by_peer(:1421-1425) 仍按原始 source 串比较，与摘要键不冲突（口径不同，无缺陷）。",
+      "摘要键确实消除了定向锁定面：碰撞条件从「前 128 字节相同且总长相同」变成需要 SHA-256 碰撞；长度前缀写法 f(P,S)=[8B len(P)][P][8B len(S)][S] 自解析 ⇒ 字节相等即 (P,S) 相等，用 str::len()（字节数）而非 chars().count() 正是自解析所需。M_TRUNCATED_LABEL_KEY 实测只打红 :3142/:3149/:3152/:3160 与两条冻结期望 ⇒ 这条裁决唯一由那两条期望背书，案卷的自述准确。",
+      "审计面 principal 与摘要键的归因差异已登记（在 .agents 证据 :487-489），只是没进 G15/PRODUCT ⇒ 记 R7-AUDIT-3，不升 FAIL。"
+    ]
+  },
+  "positive_verifications": [
+    "复算台忠实性（R7 §5.6 的边界我核过，判定：可用但不得越界读）：我读了 r7rig/src/main.rs 的 Throttle 转录（:95-270）与引擎转录（:324-390），与被评审代码逐语句对照一致——identity_key 的两段长度前缀、decay 的三个回收、record_failure 的 :819 门禁与两条阈值比较、is_locked 的双层判定、lock_until 的 checked_add 兜底、读侧四访问器的窗口过滤都同源；变异一律以 if m(...) 加在原语句之外，M_NONE 路径就是仓内路径。已知近似三处：constant_time_eq 被等值比较代替、引擎不含 max_sessions/max_browser_sessions 准入与审计落账、被删的裁剪键被建模成「标签拼成摘要」而非 (String,String) 元组（对所用夹具的碰撞类等价）。忠实性自检独立复现：M_NONE 下 59/59 全绿。",
+    "我据这台复算台复核并复现了 r7 的关键 [核] 行：M9 → 只有 :3209 与 :3220 红；删 :910-911 → 0/59；删 :846-847 → 0/59 且定向实验给出「经 authenticate 触发 = false、直接调 pub API 触发 = true（locked=3 桶物理=3）」；M3 → 仅 :3160；M6 → :2821 + :3166 + 未冻结字段；M7 → 3 条测试 + 6 条冻结期望；M8a → 5 条测试 + 3 条期望且 t_full 不红；M8b → 23/59；M_CAP_GATE_REMOVED / off-by-one → 存活值与 entries_bounded 红。",
+    "案卷数字全部对得上：61 单测（36/15/6/2/2）、9 场景 90 期望（13/7/10/6/16/9/15/5/9）、auth-throttle 13 条、HEAD 58 → 工作树 61 且 git diff 里恰好新增 3 条 #[test]（lockout_requires_failures_inside_one_window、throttle_identity_keys_do_not_collide_on_prefix_or_concatenation、expired_locks_are_reclaimed_instead_of_escalating_to_the_global_window）。三棵验证树的代码/契约与工作树字节相同（我逐棵 git diff 为空）。",
+    "R7-N-10 判为不成立（r7 唯一的假 [核]，也是我据此下调 R7-W-5 的依据）：它声称 harness.toml:65-67 把 9 条 gateway_file_* 场景配成 required_artifact_kinds = [ReviewRun]、gates.rs:675-683 见到 ReviewRun 就返回 BLOCKED、requirements.rs:107 只解析 ### 18.1。我核过：harness.toml:55-70 实际是 [affected_analysis]/[portable_core] 等块，没有任何场景条目；git grep -n ReviewRun 全仓（跟踪文件）零命中；engineering/nexus-harness/src/ 下没有 requirements.rs 这个文件；gates.rs:675-696 是 coverage_gate 的实现。相反，harness 确有 product-scenarios 门（commands.rs:250/291-297 的 verify 流程）并由 scenario.rs:190-216 逐条比对 [[expect]]、:568 报「command ran, all N expectations held」⇒ 实现方「9 场景 90 期望全 PASS」是被一条真实存在、会因期望失败而红的门禁产出的，不能按 r7 说的「其实是 BLOCKED」打折。r7 那条引文里的行号/文件名/字符串三样都对不上，属虚构或取自仓外状态。"
+  ],
+  "merge_decision": "可合并（verdict = COMMENTED，0 FAIL）。判定方向没有被本批改坏：fail-closed 仍可达且有四条独立柱子、内存上界仍由 :819 门禁 + L≤B≤max 不变式成立、正确令牌在个体锁与全局窗口内都被拒、摘要键确实消除了「前缀 + 总长」的定向锁定面、长度前缀挡住了拼接歧义；两条 owner 裁决（R4-W-6 实现衰减、r6 NOTE-4 改摘要键）都落到了代码 + G15 + PRODUCT + 4 条 E4 期望上。我签发的 WARN 只剩 3 条（R7-W-1 聚合代价未登记、R7-W-2 forget 零覆盖 + 注释不实、R7-W-4 对被删方案的假描述且重复在两处），全部是契约/测试诚实性而非判定缺陷；r7 的 6 条 WARN 里我改判 3 条（W-3、W-5、W-7）为 NOTE，并否决 1 条 NOTE（N-10）。待办按 non_blocking_followups 顺序随下一片或本批落地提交一起走，不构成阻塞。已声明为 open 的条目按原样结转：owner 两项裁决已闭合、不再重复计为待裁决；仍 open 的是 files 配置块接进 GatewayConfig::validate 与 kill-switch、capability-negotiation 零耦合、.part nonce、R3-N-4 未冻结字段（R7-N-5 欠账 +1）、/proc/self/fd 与 RSS 实测、fuzz 目标登记、错误码词表统一、G1 门禁绑定（fix/hook-review-evidence-binding 689f63a 未合入）、release_session 释放字节数被丢弃。落地提交请一并 git add -f .evidence/review-gateway-file-r7，并按 R7-N-2 在 LF 归一态确认 harness 报的仍是 e166ea79…。",
+  "blocking_issues_remaining": [],
+  "non_blocking_followups": [
+    "R7-W-1: G15 与 PRODUCT §18.2 各加一句聚合口径——默认参数下可记录失败（= 有信息量的令牌比较）速率上界 max_throttle_buckets × lockout_after / lockout_window ≈ 85.3 次/s（严格含溢出分支 ≈85.4），并标为未测；根治是给 source 单独设一道限额（整张表按「对」分桶，一个源地址可占满 1024 行）。",
+    "R7-W-2: forget 的注释改成真实理由（先持有正确令牌才可能有会话；个体锁可被 close_session 提前解除、全局窗口不可；闲置回收不清），并补两条不依赖时钟的单测——「close_session 解除个体锁」与「sweep_idle 不解除个体锁」；顺手把 other_source_still_admitted 冻一条期望（1 行，同时让 M6 在 E4 面可红，见 R7-N-5）。",
+    "R7-W-4: MODULE.md:159-161 与 .agents/green-evidence…txt:495-496 两处同句改写，与 file_service.rs:742-744 同口径（摘要键的收益是每行常数 ~300 B → 32 B + 消除定向锁定面，不是从无界变有界）。",
+    "R7-AUDIT-1: :843 注释明写「经 authenticate 不可达、仅当 locked 回收失效或直接使用 pub API 时可达，保留作纵深防御」，并给「锁表占满才能升级」补一条正向 #[test]。",
+    "R7-AUDIT-2: requirements.toml:89 acceptance 改写为「（主体+源）成对定长摘要键；桶与溢出计数按 lockout_window 衰减；显式 close_session 清该对在途状态，闲置回收不清」。",
+    "R7-AUDIT-3: G15 补归因残余一句（节流表不保存可读身份，归因依赖审计环的 256 B 截断，长身份只能归因到「前 256 字节 + 长度」这一近似类）。",
+    "R7-AUDIT-4: G15/PRODUCT 把「停止注入一个窗口内自愈」写清是「停止注入」而非「每窗口一条」，并把拒止占空比、85.3 次/s 这类比率标为未测观测；替换 r4 被删的「94%」时不要留空白。",
+    "R7-N-1/-3/-4/-7: 数字与措辞订正——:835 的 60 → 61、MODULE.md:173 病句、场景 :67-69 的「防空转」口径、:121-123 字段文档。",
+    "R7-N-11: 把时钟做成参数（读侧四访问器与 is_locked/record_failure 内部的 Instant::now()），或按 .agents/knowledge/entries/2026-09-30-coverage-run-flaky-timing-test.md 的格式登记 auth-throttle 三处判据依赖真实墙钟。",
+    "R7-N-12: 把复算台的两条配方固化进仓（#[test] 或 examples//fuzz/ + FILE_MANIFEST.md 登记），否则「0/59 全绿」这类结论对本仓门禁永远不可复核。",
+    "R7-AUDIT-5: 下一轮 bindings 的 source_revision 改绑 HEAD 175e115 + 冻结树，避免与 af953af 的两提交断层。"
+  ],
+  "not_machine_verifiable_this_round": [
+    "未编译本仓、未运行 61 条单测 / clippy / harness verify / 9 条 E4 场景（宿主缺 ssh2 的 openssl 门控与 cc 工具链，见 reviewer.could_not_compile）；实现方在 xc-pc-linux 报的 61 passed / 零诊断 / 90 期望全 PASS / 9 门全 PASS 与 scenario-* 证据号一律未被复现，也未被当作替代证明。",
+    "本评审唯一独立复算成功的实现方数字是 contract_hash（方法见 bindings，另复现行尾敏感变体与 r6 的 HEAD 数字）；三棵验证树与工作树的相同性是用 git diff 直接核到的，不是重新生成的 stash 提交。",
+    "「删 :910-911」「删 :846-847」「M9 :779 恒真」三条变异在本仓 61 单测上的红/绿仍未证——复算台复刻的是 46 条单测断言 + 13 条契约断言，其余 55 条与节流无关；请实现方在 Linux 上把这两条配方（forget-removed、escalation-removed）真跑一次以闭合（r7 §5.6 效力边界第 1 条同样提了这件事）。",
+    "R7-W-1 的聚合率、R7-AUDIT-4 的占空比与「每窗口一条溢出能否续期」都是比率/结构性结论，绝对值不可外推到产品（复算台是 in-process 循环，本机吞吐约 15 万次/s；我这次重跑与案卷的打印值在 0.4 个百分点与 1/6 轮这一档上已漂）。",
+    "Throttle::default()（lockout=0 ⇒ stale 恒真、计数恒为 1）仍按 r4 R4-N-5 携带，本批未触碰也未重测。",
+    "close_session 的会话归属检查（r2 N-8）属 M2 接线前提，本轮只在「它能解除自己那一对的锁」这一语义面登记，未重开「谁能关谁的会话」。"
+  ],
+  "rejected_r7_items": [
+    {
+      "id": "R7-N-10",
+      "verdict": "rejected",
+      "reasoning": "该 NOTE 的全部技术断言在本仓都找不到对应物：harness.toml:65-67 不是场景条目而是 [affected_analysis] 一带；gates.rs:675-683 是 coverage_gate 的代码，不是「ReviewRun ⇒ BLOCKED」；engineering/nexus-harness/src/requirements.rs 这个文件不存在；git grep ReviewRun 对全部跟踪文件零命中。真实情况相反：harness 有 product-scenarios 门（commands.rs:250/291-297）并在 scenario.rs:190-216 逐条求值 [[expect]]，:568/:572-576 分别在「全部期望成立」与「某条期望失败」两条路径上报 OK/FAIL ⇒ 「9 场景 90 期望全 PASS」是机器核过的，§18 的产品面也经由 requirement 字段（场景文件第 5 行 requirement = PRODUCT.md#18-gateway-file-service）与场景门相连。r7 用这条 NOTE 给「场景跑绿 = 产品契约被机器核过」打折、并支撑了 R7-W-5 的严重级，两处都需要收回；我据此把 R7-W-5 降为 NOTE（R7-AUDIT-2）。唯一真实残留在别处且已在 R7-N-2 登记：contract_hash 只覆盖 scenarios/**/*.toml。"
+    }
+  ],
+  "report_file": ".evidence/review-gateway-file-r7/findings.md",
+  "escalation_note": "第 7 轮 > AGENTS.md:1585 的默认 3 轮上限（「超过则升级为 BLOCKED，需要人工介入」），r4/r5/r6 已向 owner 报备三次，本轮延续该报备状态。本批的两条待裁决项均已由 owner 裁决并落地：R4-W-6 → 实现桶与溢出计数按 lockout_window 衰减；r6 NOTE-4 → 身份键改为 SHA-256 定长摘要，两者都写进了 G15、PRODUCT §18.2、4 条新 E4 期望与 .agents 证据，不再作为待裁决项携带。本轮新增的升级事项一条：R7-W-1 的聚合猜测率与 per-source 限额缺失属产品取舍（可用性与猜测率的交换），建议 owner 在批准「G15 补聚合口径一句」与「给 source 设独立限额」之间定一个方向；其余按 non_blocking_followups 处置。评审链 r1(6F) → r2(5F) → r3(2F) → r4(1F) → r5(1F) → r6(0F, COMMENTED) → r7(0F, COMMENTED，本签发：3 WARN + 16 NOTE，r7 原判 6 WARN 中 3 条改判、1 条 NOTE 否决)。"
+}

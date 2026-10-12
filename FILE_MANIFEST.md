@@ -2,7 +2,7 @@
 
 本包实现《Nexus 统一系统设计规范 v9》中的“统一仓库目录契约”。
 
-文件数（不含本清单）：202
+文件数（不含本清单）：206
 
 > 2026-10-10：原声明值 137 与表内实际行数（148）已不一致（既有漂移，含
 > `scenarios/engineering/bench_gate_verdicts.toml` 等未登记项）。本次登记
@@ -37,6 +37,16 @@
 > 已在 `plan-artifacts/review-gateway-file-r1.md` 的整改中被点名"自述数字不可信"，
 > 现按 `awk '/^\| /{n++}'` 减表头一行实测校准为 190，加上本片新落入的两份
 > Review 案卷（r1/r2 各 2 行）⇒ 194；第五片又落入 r3/r4/r5 三份案卷（各 2 行）⇒ 200。
+>
+> 2026-10-13（网关文件服务 M1 第七/九片）：把上一段补齐到当前实数——第七片落入 r6 案卷
+> 2 行 ⇒ 202（当时只改了头部声明值、没在这条注释链里留痕，本条就是补那条痕）；第九片
+> 落入 r7 案卷 2 行 ⇒ **204**，与 `awk '/^\| /{n++}'` 实测 205 减表头 1 行一致。
+> r7 案卷特殊之处：同一轮有**两份来源**（撰写者 findings + 签发者 summary），两者 verdict
+> 的 WARN 计数不同（6 vs 3），登记时按签发者版为准，分歧本身写进 `.agents/green-evidence`
+> 第八/九片，不在这里抹平。
+> 2026-10-13（第九片续）：r8 案卷 2 行 ⇒ **206**（实测 207 减表头）。r8 的三条 WARN 全部
+> 是第九片自己写进去的（两条算式算不出旁边的数、一次语义翻转只关了一半、一条不变式
+> 的缺前提与锁表零观测面），处置写在 `.agents/green-evidence` 的"第九片续"那节。
 >
 > 同时改变一条惯例：`.evidence/review-gateway-file-r1/` 与 `-r2/`（`summary.json` +
 > `findings.md`）按 `git add -f` **随分支携带**。理由是评审 r1 的 G1 项实测证明
@@ -248,6 +258,10 @@
 | `.evidence/review-gateway-file-r5/findings.md` | 第 5 轮：1 条 FAIL（衰减判据无杀伤力）+ 4 条 WARN |
 | `.evidence/review-gateway-file-r6/summary.json` | 第 6 轮处置审计，verdict `COMMENTED`（0 FAIL），`git add -f` 携带 |
 | `.evidence/review-gateway-file-r6/findings.md` | 第 6 轮：1 WARN + 4 NOTE，并判定本增量可合入 |
+| `.evidence/review-gateway-file-r7/summary.json` | 第 7 轮案卷（节流桶衰减 + 身份摘要键两条 owner 裁决），由**签发者**复核撰写者 findings 后签发：`COMMENTED`（0 FAIL / 3 WARN / 16 NOTE，含对撰写者 3 条 WARN 的改判与 1 条 NOTE 的否决），`git add -f` 携带 |
+| `.evidence/review-gateway-file-r7/findings.md` | 第 7 轮撰写者的 648 行取证：含仓外 std-only 变异复算台（18 变异 × 59 断言）、聚合猜测率算术、以及一条被自己实测否证后公开撤回的 WARN |
+| `.evidence/review-gateway-file-r8/summary.json` | 第 8 轮案卷（第九片：会话拆除语义、聚合率登记、不变式与观测面），verdict `COMMENTED`（0 FAIL / 3 WARN / 7 NOTE，三条 WARN 都是第九片自己写进去的错误），`git add -f` 携带 |
+| `.evidence/review-gateway-file-r8/findings.md` | 第 8 轮逐项取证（321 行）：`contract_hash` 在 Windows 上按 env.rs 复算复现、r7 三条 WARN 清偿判定、窄路径可达性的独立重推与 N7/N8 射程边界 |
 | `.agents/red-evidence-gateway-file-service.txt` | Contract-first Red Evidence (M0) |
 | `.agents/green-evidence-gateway-file-service-m1.txt` | Green Evidence for M1 slice 1 |
 

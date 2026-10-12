@@ -1,0 +1,234 @@
+{
+  "schema_version": 1,
+  "review_id": "review-gateway-file-r8",
+  "review_round": 8,
+  "previous_review_id": "review-gateway-file-r7",
+  "verdict": "COMMENTED",
+  "reviewer": {
+    "agent": "独立代码评审者兼签发者（不是实现者；未参与第八/九片任何编码或散文撰写）。本轮不复述 r7：3 条签发版 WARN 与 3 条降级 NOTE 逐条回到代码、契约与场景文件重新判，B 项的红/绿与数值一律按夹具自己重推（不复用实现方与 r7 的结论），并按漏判 FAIL 的方向做了反向检查。",
+    "model": "会话元数据把本会话的模型标识记为 qfmodel；QoderCN 未对外披露其底层基础模型名称，我能确认的只有会话元数据里这个标识，无法确认更底层的模型名——不伪称。",
+    "host": "Windows 11 x64 (win32) + Git Bash",
+    "could_not_compile": "本评审未编译 nexus-web-gateway：该 crate 依赖 ssh2 0.9.6，其 userauth_pubkey_memory 受 cfg(any(unix, vendored-openssl, openssl-on-win32)) 门控，本机无 cl.exe/nasm。未运行任何单测、clippy、harness verify、E4 场景。实现方在 xc-pc-linux 报的 63 passed / clippy 零诊断 / 9 场景 95 期望全 PASS / verify --fast 9 门（evidence dir verify-0ffee5f17190）一律未被复现，也未被用作任何我能读到的东西的替代证明。本轮的判据全部是纸面可复算的：逐帧读码、按夹具算数、grep/awk/git 实测。r7 留在会话目录的仓外 std-only 复算台本轮未使用（它复刻的是 r7 摘录的实现，对第九片的新语义已经失配）。",
+    "static_only": true,
+    "what_i_did_execute": "(1) 按 engineering/nexus-harness/src/env.rs:187-216 的定义在 Windows 上自行复算 contract_hash 并复现 750cbe0b70dc7fb9e6f7b97a09aa902dee48acef（方法见 bindings，含行尾归一声明）；(2) git diff 逐路径核实现方那句『3e8600b 之后 src/、examples/、scenarios/、MODULE.md、PRODUCT.md、requirements.toml 字节未变』——成立；(3) 逐棵树核 4d6223a / 6bf7691 / 3e8600b 与第八片树 1ab58b1 的期望数与单测数（61/90 与 63/95 各自与自己的树自洽）；(4) grep -c 实测 9 个场景文件与 63 条 #[test]、FILE_MANIFEST 的 awk 行数；(5) git grep ReviewRun 与 harness.toml / gates.rs / requirements.rs 三处引用逐个落点核对，独立复核实现方对 R7-N-10 的否决。"
+  },
+  "source_revision": "175e115",
+  "source_revision_note": "本分支真实基线 HEAD = 175e115e2435cf91dc8ee7452ebfc3a92c4f1544，三棵验证树与第八片树的父提交都是它。r7 summary 按链上惯例填的 af953af 落后两提交（该事实由 r7 自己登记为 R7-AUDIT-5），本轮起按 non_blocking_followups 的要求改绑真实基线。",
+  "scope": [
+    "crates/nexus-web-gateway/src/file_service.rs（Throttle::forget 改名 forget_failures 并去掉 locked.remove；record_failure:851-871 注释重写为两个上界各自成立 + L ≤ B 失效 + 窄路径可达；forget_failures 的 doc:934-957 重写；新增 FileEngine::throttle_locked:1310；FileLimits.max_throttle_buckets 字段文档:121-127 改掉从未存在的 merged 措辞；close_session:1525-1528 注释；新增 2 条单测 session_teardown_clears_the_count_but_serves_the_lockout:3289、idle_recycle_clears_no_throttle_state:3368）",
+    "crates/nexus-web-gateway/examples/gateway_file_contract.rs（auth_throttle 新增 e7 拆会话/拼接夹具与 e8 额度池夹具，新增 6 个 emit 字段）",
+    "scenarios/product/gateway_file_auth_throttle.toml（[[expect]] 13 → 18，新增 5 条冻结期望与 3 段口径注释）",
+    "crates/nexus-web-gateway/MODULE.md（G15:156-236 重写：摘要键裁决理由更正、锁表满那支改口径、会话拆言语义新增、代价 (1) 占空比表达式、代价 (3) 聚合率数值、代价 (4) 归因残余、未证事项新增 principal 长度/归一化/时钟三项；G16/G21 未改）",
+    "PRODUCT.md（§18.2 鉴权与节流条目:3311-3332 同步：拆会话不是解锁路径、代价说全、83% 指向 G15 表达式）",
+    "crates/nexus-web-gateway/requirements.toml（REQ-010:89 acceptance 整段重写）",
+    ".agents/green-evidence-gateway-file-service-m1.txt（第八片的公开更正标注 + 第九片全文，含第 8 条自抓）",
+    ".agents/knowledge/entries/2026-09-30-coverage-run-flaky-timing-test.md（新增『新实例』段：三处墙钟夹具）",
+    ".agents/knowledge/entries/2026-10-13-contract-hash-crlf-sensitivity.md（本批新增、未跟踪）与 .agents/knowledge/index.json",
+    "FILE_MANIFEST.md（r7 案卷 2 行 + 声明值 202 → 204 + 口径注释）"
+  ],
+  "bindings": {
+    "reviewed_content": {
+      "content_tree": "3e8600beabbf7e145e095855941f271996294e17",
+      "content_tree_provenance": "实现方自报为第九片的验证树（clean、dirty_state=false）。本评审独立核过：对象存在，类型 commit，git log 显示为『WIP on feature/gateway-file-service-contracts: 175e115』即 git stash create 型；git diff 3e8600b -- crates/nexus-web-gateway/src crates/nexus-web-gateway/examples crates/nexus-web-gateway/MODULE.md crates/nexus-web-gateway/requirements.toml scenarios PRODUCT.md 为空 ⇒ 本评审读到的工作树在该 digest 的代码/契约面上与它逐字节相同；git diff 3e8600b 全树只剩 .agents/green-evidence…txt 8 增 5 删 ⇒ 实现方那句『之后落地的改动只在 .agents/、FILE_MANIFEST.md、.agents/knowledge/**』成立。",
+      "verified_trees": [
+        {
+          "tree": "4d6223ac88821fa5311099d398964a0bbd645e12",
+          "claim": "第九片第一棵（digest 271ac805…，verify-7716a60e1951）",
+          "my_verification": "对象存在，父 = 175e115 + b579ec8；git diff 4d6223a -- scenarios 为空 ⇒ 场景字节与工作树相同（contract_hash 同源）；差异只在 file_service.rs 与 MODULE.md。重要发现：这棵树的 G15 与 record_failure 注释里写着『那支经 authenticate 不可达（不变式 locked.len() ≤ buckets.len() ≤ max_buckets 且行与锁同生同死）』，而同一棵树已经落地了只删行不删锁的 forget_failures ⇒ 该证明在这棵树上已被自己的改动改假；这条假话存在于全部门禁跑绿的树里，由本批第三棵树改掉。实现方在第九片第 8 条公开登记了这件事，其自述与本评审的 diff 一致。"
+        },
+        {
+          "tree": "6bf7691469a9179802456819f3e0b53c55f40485",
+          "claim": "第二棵（digest 70da18c9…，verify-1efb49b6c77f）",
+          "my_verification": "对象存在；4d6223a → 6bf7691 的差异逐行读过：MODULE.md G15 与 record_failure 注释改为两个上界各自成立、L ≤ B 不再成立、窄路径可达，并给 session_teardown 那条测试加了两条正面断言 ⇒ 实现方『差异只是那段注释与两条新断言』为真；场景字节仍相同。"
+        },
+        {
+          "tree": "3e8600beabbf7e145e095855941f271996294e17",
+          "claim": "bindings 取用树",
+          "my_verification": "6bf7691 → 3e8600b 只有 MODULE.md:179 一行与 file_service.rs:866 两行（把『63 单测 + 95 条期望零红』改成『63 单测全绿、18 条期望字段无一翻转』），无判定改动 ⇒ 实现方那句『只是把两处零红数字的措辞改成实测口径』为真。三棵树场景字节相同 ⇒ contract_hash 一直是 750cbe0b… 这句由本评审独立复现成立。"
+        }
+      ],
+      "verification_host": "xc-pc-linux",
+      "toolchain": "rustc/cargo 1.98.1",
+      "contract_hash": "750cbe0b70dc7fb9e6f7b97a09aa902dee48acef",
+      "contract_hash_how_i_computed": "不是照抄，本评审在 Windows 上独立复算并复现了它。方法 = 按 env.rs:187-216：遍历 scenarios/<子目录>/*.toml（子目录名排序、文件名排序），每块拼 scenarios/{d}/{n}\\n + 文件原文，块间用 \\n===\\n 连接，把该字节串送 git hash-object --stdin 等价物（node 内按 blob sha1 前缀算）。**行尾归一方式声明**：工作树是 Windows 脏树，我把每文件内容做 \\r\\n → \\n 归一后得 422343 字节 ⇒ 750cbe0b70dc7fb9e6f7b97a09aa902dee48acef，与实现方一致；**不归一行尾**直接算得 436124 字节 ⇒ ad71776317816bfabea64d220fc0c3395ff7e405，再次确认 2026-10-13 那条知识条目（本批新增，未跟踪）所述敏感成立。r7 树上的同一方法是 420070 字节 / e166ea79…，本批 +2273 字节对应 auth-throttle 从 13 条涨到 18 条。",
+      "contract_hash_scope_limit": "只覆盖 scenarios/**/*.toml ⇒ MODULE.md、PRODUCT.md、requirements.toml 的散文漂移不改变这个 digest（本轮 REQ-010 的同步因此只能靠人核，本评审已在 requirements.toml:89 逐字读到并与 G15/PRODUCT 三处对齐）。",
+      "self_reported_measurements_not_reproduced": "working_tree_digest e3eb7cee7a198c777b507431623e9c912f6b6127、evidence dir verify-0ffee5f17190 / verify-1efb49b6c77f / verify-7716a60e1951、63 passed、clippy 零诊断、95 期望全 PASS、9 门全 PASS：实现方自报，本评审未复现，也未当作替代证明。变异表 N1-N6/E/F 的红与绿本评审是**按夹具逐帧重推**（见 findings.md §2），不是实跑。"
+    }
+  },
+  "counts": {
+    "fail": 0,
+    "warn": 3,
+    "note": 7,
+    "r7_signed_warns_audited": 3,
+    "r7_downgraded_notes_audited": 3,
+    "r7_note_rejection_reaudited": 1,
+    "r7_notes_audited": 6,
+    "items_rejected": 0
+  },
+  "findings": [
+    {
+      "id": "R8-W-1",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/MODULE.md:206-207（G15 代价 (1)）、MODULE.md:212-216（代价 (3)）、PRODUCT.md:3330-3331",
+      "summary": "本批新写进契约的两条算式与它自己报的数值不同源。(a) 拒止占空比写成 w/(w + max_throttle_buckets·lockout_after/注入率) 并报『用 84.4 次/秒折算 ≈ 83%』：按这个式子算 60/(60+5120/84.4) = **49.73%**；83% 来自 r7 §2.3 的 60/(60+(1024+5)/84.4) = 83.11%（分子是**武装成本** max_buckets + lockout_after，不是它们的积）。PRODUCT.md:3330 说『表达式见 MODULE G15』⇒ 一个表达式错误毒化两份契约。(b) 代价 (3) 把避开锁定的策略写成 max_throttle_buckets × (lockout_after-1) 并报 68.33：该式给 1024×4/60 = **68.27**，68.33 对应 (1024×4+4)/60（r7 的严格式，多一项 +(lockout_after-1)）。85.33 与 17.07 两条我复算为真。这不是把实测说成算术——两处都明写了是可复算表达式/算术，这点做对了——而是复算式复算不出它旁边那个数，正是 r7 R7-W-1 订正 1 抓到过的同一类错误被抄进了契约。修法：占空比式改成 w/(w + (max_throttle_buckets + lockout_after)/注入率)，避开锁定那一支改成 (max_throttle_buckets + 1)×(lockout_after-1)/lockout_window 或直接写 4100/60。"
+    },
+    {
+      "id": "R8-W-2",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:944-946（forget_failures 的理由 (2)『清计数是无害的』）、940-944；MODULE.md:197-202；PRODUCT.md:3321-3323；requirements.toml:89",
+      "summary": "语义翻转的理由只覆盖了这个洞的一半，而保留下来的那一半在同一前提下给出同一条无限预算。翻转用的前提是：close_session 在 M2 前没有归属检查 + 会话号顺序自增 ⇒ 一个能猜整数的调用方能替被锁身份抹掉锁定。但我逐帧重走：锁定是由**计数**达到 lockout_after 才武装的，而 forget_failures 仍然清计数且仍然经同一个无归属检查的 close_session 可达。同一条链（攻击者的失败记在 (P,S) 上、(P,S) 的会话由合法持有者开着、会话号可猜）现在只需每 4 次猜密关一次会话，就把计数按定义钉在阈值之下 ⇒ 锁**永远不会武装**，比解锁更省事。成立前提与翻转理由所引的前提逐字相同（还需要攻击者的流量与受害者的 source 同一传输地址，即 R7-N-9 登记的 source 可信性前提；这一点两处文档都没写明）。后果：G15:166 那句『锁定窗口内正确口令也不得绕过』在**已武装**之后为真（比第八片强），但『同一窗口内 lockout_after 条 ⇒ 锁定』这条门槛在 M2 之前仍可被第三方清零。本批方向严格更安全，且 close_session 今天没有任何 wire 调用者（我 grep 过：src/gateway.rs:1215 那个 close_session_id 是 DataChannel 会话，与 FileEngine 无关），所以不判 FAIL。修法三选一并在契约里落字：(i) 把 forget_failures 整条挂到 M2 的归属检查之后（或删掉，让计数只由 succeed/decay 清）；(ii) 保留行为但在 G15 代价里明写这条残余 + 它需要的 source 前提；(iii) 把翻转理由改准（见 R8-N-1）。"
+    },
+    {
+      "id": "R8-W-3",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:861-871（窄路径可达 + max_sessions 界 + 实测数字）、MODULE.md:176-184、对照 file_service.rs:714/784/873-877 与 FileLimits::default():139/149-151",
+      "summary": "『窄路径可达』的两条界我给各自重推了一遍，结论：buckets 界成立、locked 界成立但**界错了对象且零可红对象**。(1) 无令牌者走不到：成立，但论证缺一句前提——行与锁的死亡条件确实逐字等价（:784 用 until > now、:786 与 :693 用 now-last >= window，且锁定期 authenticate:1438 先短路、不再刷新行），所以孤锁唯一的来源就是 forget_failures；漏了这半句，『让行消失只能靠 close_session』就不是证明而是断言。(2) 有令牌者的上界写成 max_sessions —— **不成立**：close_session 会释放会话槽（:1517 remove），next_session 单调自增（:1255 从 1 起），同一个会话额度可以顺序复用去拆 N 个不同身份 ⇒ 孤锁个数不受 max_sessions 限制，真正的界是『一个 lockout_window 内能造出多少条活锁』= 需要 max_buckets × (1 + lockout_after) 次认证落在一个窗口内；默认参数下 1024×6/60 s = **102.4 次/秒**，高于同一份 G15 代价 (3) 自己算的可记录失败聚合上界 85.33 次/秒 ⇒ 默认参数下那支经 authenticate 其实**仍然到不了**，本批从『结构不可达』降级为『窄路径可达』是往保守方向降，但给的界是错的，读者会据此以为小表配置下 max_sessions 就是天花板（max_throttle_buckets=8 的夹具里 8×6=48 次认证就够）。(3) 更要紧：L ≤ B 失效之后，:873 那句 if 成了 **locked 表唯一的内存防线**，而全仓没有任何读侧能观测锁表大小（访问器只有 buckets/failure_count/global/globally_locked/新 throttle_locked(principal,source)，没有 locked.len()），实现方自报的 E（关掉那支 ⇒ 63 单测全绿、18 条期望字段无一翻转）我按夹具逐条重推为真，也就是说 G15 标题那句『计数与表项有界』对锁表这一半**没有任何可红对象**；E 之下 locked 可长到 窗口内活身份数 × 每行一条 ≈ 85.33/s × 60 s = 5120 行（约 250 KB 量级，粗估不是实测）。修法：加一个 throttle_locks() 读侧访问器 + 一条 entries_bounded 同形状的期望，或把 :861-871 的界改写成『一个窗口内可造的活锁数受代价 (3) 的聚合上界约束』并明写锁表上界无观测面。"
+    },
+    {
+      "id": "R8-N-1",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:940-944; MODULE.md:197-201; 对照 .evidence/review-gateway-file-r7/findings.md §4.1/§4.2",
+      "summary": "翻转理由的因果说重了一层，而 r7 的因果说轻了一层，两边都不准。实现方写『拆会话即解锁 ⇒ 把每身份预算变成无限』：对**无令牌者自己**不成立——他要拆的是 (P,S) 的会话，而该会话的存在要求 (P,S) 先过一次成功认证，即要求持有全局共享令牌；他能猜整数拆的是**别人的**会话。准确的表述是『锁的完整性可被无归属检查的第三方破坏（替被锁者解锁），且不需要知道任何令牌』——这条本身就足够支撑翻转，不需要借猜测预算。反向：r7 §4.1/§4.2 说这条序列『只需要 t0 那次成功认证，即必须已经持有正确令牌』『不构成越权』，恰好把第三方那条更严重的读法漏掉了；本轮 R8-W-2 的残余正是从同一个漏读长出来的。行为无需回退（严格更安全），措辞要改。"
+    },
+    {
+      "id": "R8-N-2",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/examples/gateway_file_contract.rs:733-736; scenarios/product/gateway_file_auth_throttle.toml:104-108; .agents/green-evidence-gateway-file-service-m1.txt 第九片第 2 条",
+      "summary": "N6（桶不衰减）的机制描述错、预测数字也错，杀伤力结论本身成立。按夹具重推（rows=8、lockout_after=3、窗口 100 ms、每轮全程新身份、轮间睡 150 ms）：桶不衰减时表在 round 0 就满 8 行，round 1/2 的**新**身份根本拿不到行（它们不是在册键）⇒ 走 :824 溢出分支，是**全局溢出计数**在每轮的第 3 条失败处武装，不是注释写的『每行的第一条就把桶推到阈值』（计数粘住那一说在这里没有载体，因为身份每轮都换）。而全局计数自己的衰减在 N6 下没坏 ⇒ 每个静置窗口后先白送 2 条 AUTH_DENIED，第 3 条才武装 ⇒ denied = 16+2+2 = **20**、throttled = 28（48 总数守恒，与实现方实测一致 ✓）。r7 §2.1 推的『约 16』正是漏了那 2×2；examples:736 把 r7 的『约 16』原样抄进了代码注释，而案卷第九片已经实测到 20 ⇒ 注释与自己树上报的数字不同源。另：场景注释『第 2 轮起就武装』按 1-indexed 读是对的（首次武装在 round 1）。"
+    },
+    {
+      "id": "R8-N-3",
+      "severity": "NOTE",
+      "location": ".agents/knowledge/entries/2026-09-30-coverage-run-flaky-timing-test.md 新实例段（最后一句）、crates/nexus-web-gateway/examples/gateway_file_contract.rs:737-777、MODULE.md:229-233",
+      "summary": "登记做到了，但失败方向判反了，因此『必须判 WARN』我不判。e8 对**现实现**不可能假红，三条独立理由：(1) 每个身份恰 2 条失败、24 个身份互不相同 ⇒ 个体阈值 3 按定义到不了，无论多慢；(2) 静置侧 150 ms 的 sleep 只会超调不会欠调（OS 保证下界），窗口 100 ms 一定满足；(3) 运行越慢 ⇒ decay 越早丢掉旧行 ⇒ 表越不可能满 ⇒ 越不可能走溢出武装。真正的风险全在另一侧：N6 要红，需要 3 条注入落在同一个 100 ms 窗口内，慢到那个程度（每条 >33 ms，约 20× 插桩放大的百倍量）就**假绿**（变异逃逸），而这条期望是 R7-W-1 唯一的可红对象，逃逸是静默的。⇒ 该处应改成『现实现侧无假红；杀伤力侧依赖注入密度』，并把『假红』这句留给 e6（e6 的 armed_before 确实是假红侧，也正是它被单独冻结的原因，r7 R7-N-4 已核过合成式含它）。判据侧无需改夹具就能更稳：这条期望的窗口比是 1.5×，但方向上它不需要余量。D(3) 的等价配方：把时钟做成参数（读侧四访问器与 is_locked/record_failure 内的 Instant::now()，形态照 sweep_idle(now)），夹具就变成纯计数——t=0 灌 8 行 × 2 条、虚拟推进 1.5 个窗口、重复 3 轮，断言 recorded==48 且未武装；N6 下同一份虚拟推进确定性给出 20/28 ⇒ 红。不碰 API 的无 sleep 替代（把窗口缩到比一轮注入工作量还短，例如 10 µs）在原理上存在，但它是拿一个更短、更没人量的墙钟窗口换掉一个更长、可标的窗口，判得更差，不推荐。"
+    },
+    {
+      "id": "R8-N-4",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:840（对照 866、954、3291）; scenarios/product/gateway_file_auth_throttle.toml:82-87",
+      "summary": "自报数字随树滚动的残留：:840 仍写『本批实测…61 条单测照样全绿』，当前树是 63（r7-N-1 要求的 60→61 做了，61→63 没做）；:954 用了『当时的』限定，而 :3291 与场景注释里的『61 单测 + 90 条期望上实测零红』没有加限定——那句本身没错（那是第八片树的事实，本评审在 1ab58b1 上核到 61/90），但读者会把它当成对当前树的陈述，而当前树上这个变异是 N1 = 62 passed; 1 failed。三处统一加『第八片树上』即可。正面确认：:866 与 MODULE:179-180 已经按实测口径改成『63 单测全绿、18 条期望字段无一翻转』，与 3e8600b 树自洽。"
+    },
+    {
+      "id": "R8-N-5",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/examples/gateway_file_contract.rs:572, 634, 731, 768-769; scenarios/product/gateway_file_auth_throttle.toml",
+      "summary": "R3-N-4 欠账口径：本批探针 emit 28 个字段、场景冻结 18 条，未冻结的观测字段由 r7 时的 9 个涨到 12 个（新增 concat_other_code、pool_denials_observed、pool_lockouts_observed）。实质杀伤力不受影响——这三个值都已被各自的合成式冻结（throttle_pair_concatenation_is_separate / throttle_sustainable_failure_budget），state_cleared_after_close 仍是零杀伤力字段（forget_failures 的 doc:952-955 已把这一点写清，r7 R7-W-2 的第 2 小点已闭合）。登记为口径债而不是缺陷。"
+    },
+    {
+      "id": "R8-N-6",
+      "severity": "NOTE",
+      "location": ".agents/green-evidence-gateway-file-service-m1.txt:636-641（第九片第 7 条否决）",
+      "summary": "实现方对 R7-N-10 的否决**成立**（我独立复核：harness.toml:65-67 落在 [protection].implementation_phase_protected，不是场景条目；engineering/nexus-harness/src/ 下没有 requirements.rs；gates.rs:675 附近是 coverage_gate；全仓 grep required_artifact_kinds 零命中；product-scenarios 门真实存在于 commands.rs:291-297 并由 scenario.rs:201-216 逐条求值 [[expect]]、:568 报 all N expectations held、:572-576 报单条失败 ⇒ 95 条全 PASS 是机器核过的，不能打折）。两点技术性订正：(a) 『git grep ReviewRun 全仓零命中』在当前树上已不字面成立——否决文本自己把这个词写进了 .agents/green-evidence…txt:637/639（跟踪文件），命中 2 处；(b) .evidence/** 未随分支跟踪（.gitignore:3 + 需 git add -f），所以撰写者原文在 git grep 口径下本来就不可见。建议改成『harness 的配置与代码里没有任何 ReviewRun 语义』，把命中面写准。"
+    },
+    {
+      "id": "R8-N-7",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:1254-1255, 1465, 1516-1538; MODULE.md:252（G16）",
+      "summary": "两条容易被读错的句子我核过是干净的，正面登记：(1) G16:252『三处释放缺一不可…会话拆除（close/闲置回收）』讲的是**预算**释放，close_session 与 sweep_idle 确实都调 budget.release_session（:1524 / :1556），与新节流语义不冲突；r7 R7-AUDIT-2 担心的『会话回收』歧义在 REQ-010:89 重写后已消失。(2) next_session 从 **1** 起（:1255），r7 §4.1 写『从 0 起』是那一轮的一处笔误；顺序自增 ⇒ close_session 的可猜性判断不变。另核：succeed 只在 authenticate 的 :1465 一处被调，且 :1438 的 is_locked 预检在前 ⇒ 锁定中不可能被 succeed 间接清；除 :784 的 retain 之外没有任何删锁路径（grep 全仓 locked 只有 784/807/873/876 四处）。"
+    }
+  ],
+  "r7_disposition_audit": [
+    {
+      "id": "R7-W-1",
+      "verdict": "verified_with_new_defect",
+      "reasoning": "清偿面：G15 代价 (3)（MODULE:211-219）与 PRODUCT:3325-3331 都写出了聚合上界、三条数值（85.33 / 68.33 / 17.07）、并明写『节流器没有把 84.4 次/秒压下去』与『整节点认证成本属连接层限流与 RSS 计量，未闭环』，r7 判的『只登记了每身份侧代价』这一半闭合 ✓；并且新增了产品路径上的可红对象 throttle_sustainable_failure_budget（e8 夹具），这是 r7 的修法里我建议『加一条探针字段』的那一步，我按夹具重算 48/0 与 N6 下 20/28 ⇒ 该期望确实非空转、且是这条契约句唯一的机器对象 ✓。新缺陷：数值与表达式不同源（R8-W-1）；83% 那句把 r7 的算术结果搬过来时把式子抄错。E 项问『读者会不会当成实测』：不会——MODULE 明写『可复算表达式，不是实测』、PRODUCT 明写『那是算术而不是实测』，这一半做对了；残余是 84.4 这个唯一的锚点仍是 V1 时代实测、从未在当前引擎上重测，而现在它同时被当成『零节流吞吐』与『攻击者注入率』两用（占空比式里当注入率用，隐含单个客户端能吃满整节点吞吐），建议在式子旁加半句『注入率取 PRODUCT 的 V1 吞吐上界，是对单客户端的乐观假设』。"
+    },
+    {
+      "id": "R7-W-2",
+      "verdict": "verified",
+      "reasoning": "三条子判据全部闭合：(1) 零杀伤力 → 现在 N1（恢复旧语义）实测红 session_teardown_clears_the_count_but_serves_the_lockout（62 passed; 1 failed，实现方报；我按夹具推 :3351 与 :3359 两处会红）✓；(2) 注释里不实的 (asserted by the probe) → 已从 forget_failures 的 doc 删掉，改为明写那条观测不到本函数（:952-955）✓；(3) 结论对/论据错的那句 → 重写，并新增两侧柱子（close 清计数 / sweep_idle 什么都不清，两条无时间依赖 + 一条 20/40 ms 的 idle 夹具）✓。改名 forget → forget_failures 的调用点我 grep 全仓核对：唯一调用点 file_service.rs:1528，审计路径（:1529/:1535）、预算释放（:1524）、sweep_idle（:1554-1559）都不经过它，无漏改 ✓。分歧（补测试 vs 改语义）的裁决见 divergence_adjudication。"
+    },
+    {
+      "id": "R7-W-4",
+      "verdict": "verified",
+      "reasoning": "公开更正落在两处发生点：MODULE.md:158-163 改成『标签字节数其实是被封住的…它不是从无界变有界』，并把收益写成常数内存 + 消除定向锁定面；.agents 第八片原句旁就地标注（485-490 行）不抹历史 ✓。与 file_service.rs:744-754 的英文注释同口径 ✓。我额外核了实现方没提的一层：这次更正同时把『摘要键 = 从无界变有界』这个会被下一轮误引的说法摘掉了，因此 R5-W-4 的历史描述不再被本批改写 ✓。"
+    },
+    {
+      "id": "R7-W-3 → R7-AUDIT-1",
+      "verdict": "partly",
+      "reasoning": "做了：:851-871 注释与 G15:176-186 都改口径为『实际机制只有溢出计数，那支是纵深防御』，谎报那半闭合 ✓；并按第九片第 8 条把自己造的例外写进契约（L ≤ B 不再成立）✓，这一点我要给实现方记一功——它是本批唯一一次自我推翻且带 diff 可查（4d6223a 的 G15 里那句不可达性证明在本批自己的语义翻转下当场失效，我逐行核过）。没做：r7 修法里那条『给锁表占满才能升级补一条正向 #[test]』没有落地，且本批之后该支的正向覆盖**更少而不是更多**（今天唯一的柱子仍是 expired_locks_are_reclaimed… 那一类回收测试；E 自报零红我复核为真）。加上锁表上界无观测面（R8-W-3 第 (3) 点）⇒ 判 partly。"
+    },
+    {
+      "id": "R7-W-5 → R7-AUDIT-2",
+      "verdict": "verified",
+      "reasoning": "requirements.toml:89 REQ-010 acceptance 整段重写，四个缺口逐一补上：（主体+源）成对键 + 定长 SHA-256 摘要 + 长度前缀 ✓、按 lockout_window 衰减 ✓、物理行由准入行门禁有界 ✓、『显式 close_session 只清该对的失败计数、已武装的锁必须服完，闲置回收什么都不清』✓（『随会话回收清零』那句歧义已消失，会话+源改成了主体+源）。核过三处散文一致（G15 / PRODUCT §18.2 / REQ-010）与代码逐字节对得上。诚实边界仍然成立且实现方自己在第九片第 1 条写了：该文件不在 contract_hash 覆盖集内，这条同步只能靠人核——本评审就是那个人核。"
+    },
+    {
+      "id": "R7-W-7 → R7-AUDIT-3",
+      "verdict": "verified",
+      "reasoning": "G15 代价 (4)（MODULE:220-226）把归因残余写进契约：表里只剩摘要、归因走审计环、审计把 principal 裁到 AUDIT_FIELD_MAX_BYTES、前 256 字节 + 总长相同 ⇒ 渲染同一串但是两个桶，并明写『这条取舍登记在契约面，不允许只写在案卷自述里』✓。另核未证事项新增三条（principal 长度无上界 / 不做 NFC 大小写归一 / 时钟不可注入 ⇒ 三处墙钟夹具）✓ R7-N-8/N-9/N-11 的登记面闭合。涓流口径按 R7-AUDIT-4 改写为『每满一个窗口只滴一条者不被锁死；严格小于一个窗口的涓流仍会跨窗口累积到阈值（stale 用 >=）』✓，与我本轮独立重推一致。"
+    },
+    {
+      "id": "R7-N-10 的否决（实现方对 r7 撰写者）",
+      "verdict": "upheld",
+      "reasoning": "不因签发者已判而照抄，我重新落点核：见 R8-N-6。否决的技术结论成立，grep 字面口径需订正。"
+    },
+    {
+      "id": "R7-N-1 / N-3 / N-4 / N-7",
+      "verdict": "partly",
+      "reasoning": "N-3（MODULE:173 病句）改『既是锁定持续的时间、也是失败被遗忘的周期』✓；N-7（max_throttle_buckets 字段文档）改掉从未存在的 oldest buckets are merged 并明写旧措辞从来没有对应实现 ✓；N-4（场景防空转口径）改成『用于区分从未武装 / 武装后自愈』✓；N-1 只做完一半：:835 那处的 60→61 现在又落后成 61（R8-N-4）。"
+    },
+    {
+      "id": "R7-N-5 / N-6（契约面柱子）",
+      "verdict": "verified",
+      "reasoning": "other_source_still_admitted 与 throttle_pair_concatenation_is_separate 都冻结了 ✓，我按夹具重推 N5 与 N4 的契约面红点确实各落在这两条上（N5 只打得中 other_source_still_admitted，因为 e5 的两个合成式在丢 source 时仍真；N4 丢两段长度前缀时 (:3221 的单测断言 + concat_other = THROTTLED) 两侧同红）⇒ R7-N-5/N-6 的零期望局面闭合。"
+    },
+    {
+      "id": "R7-N-12（仓外复算台的两条配方进仓）",
+      "verdict": "partly",
+      "reasoning": "『close_session 解锁』那一侧现在仓内有两条 #[test]（含正面断言孤锁状态）✓；『经 authenticate 不可达/可达性』那一侧仍只有仓外证据 + 自报数字，且 r7 复算台对新语义已失配（它建模的是 forget 两行都删）。仍建议把复算台落进 examples/ 或 fuzz/ 并登记 FILE_MANIFEST。"
+    }
+  ],
+  "divergence_adjudication": {
+    "topic": "R7-W-2 的修法：r7 建议补两条无时间依赖的单测钉住现状，实现方改为把行为翻掉",
+    "who_is_right": "实现方的方向对，理由不准。",
+    "reasoning": "钉住现状 = 用 #[test] 把一条可被猜整数第三方破坏的锁定完整性固化成契约承诺，测试越绿洞越稳；翻掉 = 关掉可达的那一半并顺带把 r7 要的两侧柱子做出来。我独立核过翻转没有换来新洞：全仓只有 decay:784 一处删锁，succeed 删不掉锁（:1438 预检在前使它在锁定中不可达，且 :1465 是它唯一调用点），forget_failures 不碰 global_locked_until ⇒ 表满/溢出那条 fail-closed 大路拆不掉 ✓。但翻转是必要条件不是充分条件——保留的清计数在同一前提下给出同一条预算（R8-W-2），而实现方给的因果（无限猜测预算）对无令牌者自己并不成立（R8-N-1）。",
+    "is_divergence_flattened": "没有抹平，三处都有痕：.agents 第八片原句旁的公开更正标注、第九片第 1 条明写『评审者建议补两条单测，我判断现状本身是扇门』、第九片开头明写 r7 案卷有两个来源（撰写者 6W/12N 与签发者 3W/16N）且 FILE_MANIFEST:258 的登记注也写了『分歧本身写进 .agents，不在这里抹平』✓。我要加的是另一半：r7 撰写者与签发者在 §4.1/§4.2 都把这条序列框成『必须先持有正确令牌』，因而判『不构成越权』——那是比实现方现在的说法更接近错的读法，本批的翻转实际上是在修 r7 没认出来的那个面。"
+  },
+  "mutation_lethality_recomputed": {
+    "note": "B 项，全部 [算]+[读] 按夹具重推，未实跑；红点给到文件:行。",
+    "N1_close_also_removes_lock": "RED session_teardown…（先红 :3351 throttle_locked，再红 :3359 after_teardown=ACCEPTED；:3346 throttle_failures()==0 在 N1 下仍真，因为删行那半还在）+ 探针 lock_survives_session_teardown=false、code_after_teardown=ACCEPTED、throttle_pair_concatenation_is_separate=false（合成式第三项 :728）✓ 与实现方一致",
+    "N2_forget_failures_emptied": "RED 同一条测试，但**第一个红点是 :3322 而不是 :3346**——(a) 段那条 AUTH_DENIED 断言先炸（计数不清 ⇒ 第二条失败把桶推到 lockout_after=2 当场武装）；:3346 也会红（failures 残留 2）。实现方说『靠 throttle_failures()==0 那半』是**说少了红点**（不影响测试结论）。探针三字段不变 ✓：e7 的 (a) 段没有『关会话后再失败』那一跳，N2 下 locked 仍在 ⇒ lock_survives/code_after_teardown/pair_concatenation 全不变 ✓",
+    "N3_sweep_idle_also_clears": "RED idle_recycle_clears_no_throttle_state 的 :3397（该失败只推进到 count=1 ⇒ AUTH_DENIED ≠ THROTTLED）✓",
+    "N4_no_length_prefix": "RED 单测 :3221-3224（is_locked(a,bc) 变 true）+ 契约 throttle_pair_concatenation_is_separate=false（:727 concat_other=THROTTLED）✓ 其余 5 条节流测试与 17 条其它期望不变（(ab,bc) 那对不写前缀也不撞，:3225-3227 的自评仍然诚实）",
+    "N5_digest_drops_source": "RED 单测 :2882 + 契约 other_source_still_admitted=false ✓；e5 的两条合成式与 victim_code 不变（两条 principal 本就不同），throttle_full_fail_closed 不变 ✓ ⇒ 这条柱子确实是本批新加的",
+    "N6_buckets_never_decay": "RED 3 条单测 = lockout_rearms…（:3041 附近 6 条断言）、lockout_requires_failures_inside_one_window（第 3 轮第一条就撞阈值）、expired_locks_are_reclaimed…（:3270 与 :3282 两条；我复推的实现方没料到的第三条正是 r7 实测到的那一处）+ 契约 throttle_flood_self_heals_after_quiet_window=false（healed 项：新失败走溢出 ⇒ buckets()==0≠1）+ throttle_sustainable_failure_budget=false（20/28）。不变的是 throttle_entries_bounded（读侧过滤给 0）与 flood_armed_before_quiet_window ✓",
+    "E_escalation_branch_removed": "63 单测全绿 ✓、18 条期望字段无一翻转 ✓（我逐条核：没有任何断言触及 locked.len() 的上界语义；expired_locks 断言的是 !globally_locked，去掉那支同样成立）。代价是锁表内存上界失去唯一防线，而这条代价今天没有任何对象能红 ⇒ R8-W-3(3)",
+    "F_constant_time_eq_becomes_ne": "63 全绿 ✓ 且函数语义等价 ⇒ 『没有任何断言约束 authenticate 真的用常数时间比较』在当前树仍成立，实现方在第九片第 8 条与未清偿清单里都登记了 ✓（:4467 那条 constant_time_eq 自己的测试只测函数本身，不测调用点）"
+  },
+  "positive_verifications": [
+    "contract_hash 独立复现 = 750cbe0b70dc7fb9e6f7b97a09aa902dee48acef（LF 归一 422343 字节；不归一 = ad717763…），方法逐字按 env.rs:187-216，行尾归一方式已在 bindings 声明。",
+    "实现方那句『3e8600b 之后 src/、examples/、scenarios/、MODULE.md、PRODUCT.md、requirements.toml 字节未变』用 git diff 3e8600b -- 逐路径核为空 ⇒ 成立；全树差异只剩 .agents/green-evidence…txt（+8/-5）⇒ 与『后续改动只在 .agents/、FILE_MANIFEST.md、.agents/knowledge/**』一致。本链此前反复抓的『自报数字与树不自洽』这一项，本批**没有**抓到。",
+    "数字全对：9 个 gateway_file 场景的 [[expect]] = 18/7/10/6/16/9/15/5/9 = **95**，auth-throttle **18**；#[test] = file_service 38 + config 15 + protocol 6 + cert 2 + gateway 2 = **63**（tests/gateway_e2e.rs 另有 21，不属 --lib，口径正确）；FILE_MANIFEST 声明 204 vs awk 205 减表头 1 ✓。第八片的 61/90 在 1ab58b1 上逐棵树实测复现、第九片的 63/95 在 3e8600b/工作树上复现 ⇒ 两组数字各自与自己描述的树自洽，不是矛盾。",
+    "翻转后没有任何路径能清掉一个已武装的锁：grep 全仓 locked 只有 :784（decay 的 retain，按 until > now）、:807（读）、:873（上界判断）、:876（写）四处；succeed(:884)/forget_failures(:958) 都只 remove buckets；close_session 不再触锁；sweep_idle 什么都不清 ✓。",
+    "改名 forget → forget_failures 无漏改：唯一调用点 :1528；审计落账（:1529/:1535）、预算释放（:1524/:1556）、sweep_idle（:1554-1559）都不经过节流器；examples 里剩下的 after_forget 只是局部变量名，注释口径已改对。",
+    "三处契约散文与代码一致且互不打架：G15:197-202、PRODUCT:3321-3323、REQ-010:89 都写『close 只清计数、锁必须服完、闲置回收什么都不清』；G16:252 的 close/闲置回收并列属预算面 ✓；G21 只讲审计与 idle_timeout ✓ 没有残留『拆会话即清状态』的承诺。",
+    "反向漏判 FAIL 检查没有发现判定方向被改反：fail-closed 仍可达且有 4 条独立柱子（t_full、lockout_rearms 阶段 2、探针 e4、产品尺寸 e）；正确令牌在个体锁与全局窗口内都被拒（:1438 在 constant_time_eq 之前）；buckets.len() ≤ max 由 :824 准入门禁、locked.len() ≤ max 由 :873 自身；摘要键仍是长度前缀式；validate() 仍把 lockout_window 封在非 0 与 24 h 之间（:181/:204）。",
+    "案卷诚实性抽查：实现方对 r7 第 8 条（自己造的例外）的自述与三棵树的 diff 逐行吻合，包括『4d6223a 里注释与 G15 还写着结构不可达 / L ≤ B ≤ max』这一句——我确实在 4d6223a 的 G15 里读到了它，而那棵树已经有只删行不删锁的 forget_failures。把这条自抓写成第九片第 8 条而不是等评审抓，是这条链上第一次。"
+  ],
+  "merge_decision": "可合并（verdict = COMMENTED，0 FAIL / 3 WARN / 7 NOTE）。语义翻转的方向正确且严格更安全：它关掉的是『无归属检查的 close_session 可替被锁者抹掉锁定』这条锁完整性洞，代价只是把同一条链的另一半（清计数可阻止武装）留在原地——那半属于 r2 N-8 已 open 的同一件事，且 close_session 至今没有 wire 调用者。契约三处散文（G15 / PRODUCT §18.2 / REQ-010）与代码逐字对齐、两条新单测 + 五条新冻结期望给了这轮语义变更两侧的红/绿对象、r7 的 3 条 WARN 清偿为 verified/verified/verified_with_new_defect，两条 owner 裁决没被改坏。三条 WARN 全是散文与观测面对象问题，不是判定问题：R8-W-1 是契约里复算不出自己数值的两条式子（改两行字），R8-W-2 是翻转理由只落了一半、需要在 G15 代价里补一条残余（或把 forget_failures 一起挂到 M2 归属检查之后），R8-W-3 是给窄路径论证的界写错、且锁表上界没有任何可红对象（加一个读侧访问器 + 一条期望即可闭合）。随本批或下一片一起走 non_blocking_followups；落地提交请一并 git add -f .evidence/review-gateway-file-r7 与本轮 .evidence/review-gateway-file-r8，并按 R7-N-2 与本轮复算，在 LF 归一态确认 harness 报的仍是 750cbe0b…。",
+  "blocking_issues_remaining": [],
+  "non_blocking_followups": [
+    "R8-W-1: MODULE.md:206-207 的占空比式改成 w/(w + (max_throttle_buckets + lockout_after)/注入率)（这样才得 83%），:214 避开锁定那一支写成 (max_throttle_buckets + 1)×(lockout_after-1)/lockout_window（4100/60 = 68.33）或直接把两条式子的分子分母写全；PRODUCT:3330 随 G15 一起改；顺手在式子旁注明 84.4 是 V1 吞吐、当作单客户端注入率用是乐观假设。",
+    "R8-W-2: 在 G15 代价里补一条残余——『M2 的归属检查之前，第三方猜中会话号仍可清掉该 (主体,源) 的在途计数，从而阻止锁定武装；需要的前提是同一传输地址可被多主体共享』——或者把 forget_failures 整条推迟到 M2 之后（计数的清理只留 succeed 与 decay）；同时把 forget_failures doc:944-946 的『清计数是无害的』加上这条前提。",
+    "R8-W-3: 把 :864-865 的 max_sessions 界改成『一个窗口内可造的活锁数，受代价 (3) 的聚合上界约束』，并把无令牌者那半的前提（行与锁逐字同死，孤锁只来自 forget_failures）写全；新增 Throttle::lock_count()（按 until > now 过滤）+ FileEngine::throttle_locks() + 一条 throttle_locks_bounded 期望，让 G15 的『表项有界』对锁表也有可红对象（E 变异的正面判据）。",
+    "R8-N-1: forget_failures / G15:199-201 / PRODUCT:3322 的因果改为『锁的完整性可被无归属检查的第三方破坏』，不要再用『无限猜测预算』——那句需要攻击者与受害者共享 source 才成立，而那条前提该单独登记。",
+    "R8-N-2: examples:735-736 与场景注释改成 N6 的真实机制（新身份拿不到行 ⇒ 走溢出 ⇒ 全局计数在每轮第 3 条武装，每轮白送 2 条 AUTH_DENIED ⇒ 20/28），删掉抄来的『约 16』。",
+    "R8-N-3: 知识条目最后那句『1.5× 余量的那处最可能先假红』改成『e8 的现实现侧不可能假红（sleep 只超调、每身份恰 2 条失败），风险全在杀伤力侧；e6 的 armed_before 才是假红侧』；根治仍按 R7-N-11 把时钟做成参数（配方见 findings.md §4(3)）。",
+    "R8-N-4: :840 的 61 → 63，:3291 与场景注释的『61 单测 + 90 期望』加『第八片树上』限定；下一片起把这类自报数字统一写成『<树> 上实测』。",
+    "R8-N-5: 三条新未冻结观测字段（concat_other_code / pool_denials_observed / pool_lockouts_observed）在场景注释里标一句『值已由合成式冻结，此处仅作观测』，免得下一轮再当欠账数。",
+    "R8-N-6: 否决文本里的『全仓零命中』改成『harness 的配置与代码里没有 ReviewRun 语义』；并把 R7-N-12 的复算台落进 examples/ 或 fuzz/（对第九片语义要重写 forget 那一支的建模）。",
+    "结转不变（实现方已明写，本轮复核仍成立）：source 单独限额、Throttle 时钟注入、authenticate 的常数时间比较无断言约束、close_session 归属检查（M2）、files 配置块接进 GatewayConfig::validate 与 kill-switch、capability-negotiation 零耦合、.part nonce、/proc/self/fd 与 RSS 实测、release_session 释放字节数被丢弃、G1 门禁绑定（fix/hook-review-evidence-binding 689f63a 未合入）。"
+  ],
+  "not_machine_verifiable_this_round": [
+    "未编译本仓、未运行 63 条单测 / clippy / harness verify / 9 条 E4 场景（宿主缺 ssh2 的 openssl 门控与 cc 工具链）；实现方自报的 63 passed / 零诊断 / 95 期望全 PASS / 9 门全 PASS / 三棵树与 verify-* 证据号一律未复现，也未当作替代证明。",
+    "变异 N1-N6/E/F 的红与绿是本评审按夹具**逐帧重推**的结论（红点给到文件:行），不是实跑；实现方在 Linux 上的实测方向与我的重推一致，两处例外都是数字/机制描述（R8-N-2）而非红绿本身。",
+    "e8 夹具『现实现不可能假红』是结构性推演（sleep 的下界语义 + 每身份恰 2 条失败），本评审未在本机跑过该探针，也未量过插桩运行下的真实耗时。",
+    "锁表内存上界（R8-W-3 第 3 点）与 5120 行 ≈ 250 KB 是粗估，不是实测 RSS；本 crate 的 RSS 计量本身仍在 M1 剩余项里。",
+    "R7-W-1 的聚合率、83% 占空比、102.4 次/秒这些都是比率/结构性结论，绝对值不可外推到产品。",
+    "Throttle::default()（lockout=0 ⇒ stale 恒真、:824 恒走溢出、全局窗口写入即过期）仍按 r4 R4-N-5 携带，本批未触碰也未重测；FileEngine::new 会先 validate()，所以它只在单测里可达——这一点本评审读码确认，未重测。"
+  ],
+  "rejected_items": [],
+  "report_file": ".evidence/review-gateway-file-r8/findings.md",
+  "escalation_note": "第 8 轮 > AGENTS.md:1585 的默认 3 轮上限（超过则升级为 BLOCKED，需要人工介入），r4/r5/r6 已三次向 owner 报备，r7/r8 延续该报备状态，本轮不新报。r7 遗留的两条待裁决项 owner 已裁决并落地（R4-W-6 → 实现桶与溢出计数按 lockout_window 衰减；r6 NOTE-4 → 身份键改 SHA-256 定长摘要），本轮不再作为待裁决项携带。本轮新增的升级事项一条：R8-W-2 —— 语义翻转只关掉了一半，另一半（清计数可阻止武装）要么在 G15 代价里登记残余 + 它依赖的 source 前提，要么把 forget_failures 一起推迟到 M2 的归属检查之后；这是产品取舍（拆会话后重登是否该背旧账），建议 owner 定方向。评审链：r1(6F) → r2(5F) → r3(2F) → r4(1F) → r5(1F) → r6(0F, COMMENTED) → r7(0F, COMMENTED；撰写者 6W/12N，签发者改判 3W/16N 并否决 1 条 NOTE) → r8(0F, COMMENTED, 3W/7N；r7 三条 WARN 判 verified / verified / verified_with_new_defect，三条降级 NOTE 判 verified / verified / partly，实现方对 R7-N-10 的否决维持)。"
+}
