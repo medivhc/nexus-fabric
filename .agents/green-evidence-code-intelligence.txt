@@ -795,3 +795,66 @@ squash 之后没再碰过这些文件，且逐文件比对后 theirs 独有行�
 对 Phase 3/4 没有回归：mcp-handshake PASS 1511ms、mcp-real-query PASS 21026ms。
 这轮我给 `mcp serve` 的 argv 强制加了 `--no-daemon --no-cache`（契约隔离 ⑤ 的落地），
 `warm_query_roundtrip`/`provider_session_reused` 因此不可能被我自己的缓存或环境里的 daemon 糊过去。
+
+================================================================================
+§R daemon + 结果缓存在 xc-pc-linux 的结论级复跑（2026-10-13，宿主 xc-pc-linux，
+   rustc/cargo/rust-analyzer 1.98.1，x86_64-unknown-linux-gnu，
+   rev `0a42240c6d17aaab502d3bb8ac5f219a0a5b25ca`，**工作树干净 dirty=false**）
+================================================================================
+
+先记两条"差点拿到假结论"的宿主陷阱（都是实测，不是我推断的）：
+
+1. 该宿主 `CARGO_TARGET_DIR=/work/nexus-dev/target` ⇒ `cargo build` 的产物不在仓库内。
+   第一版脚本执行 `/work/nexus-ci/target/debug/nexus-harness`（10-12 19:31 的**残留旧构建**，
+   不含 `daemon`），于是 4 条 daemon/cache 场景在 ~100ms 内 FAIL、`daemon selftest` 直接 BLOCKED
+   （兜底消息里根本没有 `daemon`）。**这批 FAIL 全部作废，不作 Linux 结论。**
+2. 第二版仍失败 4 条，原因是场景命令里写的 `nexus-harness` 走 **PATH** 解析，而 PATH 上是
+   10-12 00:58 的 `cargo install` 旧版；共享 target 还在两次读取之间被别的构建覆盖过
+   （同一绝对路径 md5 从 `8f3707f8…` 变成 `bad8d5e1…`）。⇒ 第三次改成：`cargo build` 之后
+   **立刻**把产物拷成不可变副本 `/work/xc-r3-bin/nexus-harness`，把 `PATH` 钉到该目录，
+   并在案卷里留下 `ls -la` + `md5sum` + `git rev-parse HEAD`。
+   教训：**"新代码的结论"与"旧构建的结论"在只有 revision 的案卷里长得一模一样**，
+   所以被执行二进制的路径/哈希必须进案卷（已登记 F-新5，并给出承载体建议）。
+
+第三版（下面所有数字都来自这一次，被检对象 md5 `bad8d5e107e2cdad6c3233362e04d879`，
+`which nexus-harness` 确认解析到副本）：
+
+    cargo fmt --all -- --check                  exit 0，0 字节
+    cargo clippy -p nexus-harness --all-targets -- -D warnings   exit 0，无输出
+    cargo test -p nexus-harness                 串行 **150 passed / 0 failed**
+    cargo test -p nexus-harness                 并行 **150 passed / 0 failed**
+                                                （Windows 是 149 条，差 1 = #[cfg(unix)] symlink 回归，
+                                                 与既有口径吻合；Windows 上那 3+2 条假红在 Linux 不复现）
+    daemon selftest --workspace <夹具> --json   run1 **PASS probe_count=23 104784ms red 0**
+                                                run2 **PASS probe_count=23 104546ms red 0**
+    mcp selftest --json                         PASS 11 probes 177ms（eof=UNKNOWN malformed=FAIL
+                                                provider_override_honored=true stdout_frames_ok=true handled=1）
+    mcp selftest --with-query --json            PASS 14 probes 17597ms
+    verify --fast                               exit 0，**9/9 门 PASS，无 UNKNOWN**
+                                                Evidence `verify-504e9b753f70`，contract
+                                                `f8c85522d7ad3b46b65fb5630e22f763339d29bc`，
+                                                tree `d32494c7fb0973eabaf85bfe585841504bcf92b0`，
+                                                configuration `fa6c1bdb335a…`，platform `711a114fe73b…`
+    收尾健康度                                  `daemon serve` 残留 0，rust-analyzer 残留 0，
+                                                `git status --porcelain` 0 行
+
+26 条 code_intelligence_* 场景（Linux，PATH 钉住副本）：**26/26 PASS**。
+逐条要点不是"全绿"这句话，而是**两条路径都被覆盖到了**：
+
+    冷跑（真起 rust-analyzer）：cache-disabled 16818ms、daemon-explicit-only 16510ms、
+      definition 16511ms、hover 16711ms、implementations 16310ms、symbol 16610ms、
+      diagnostics-advisory 17210ms、diagnostics-item-shape 16910ms、mcp-real-query 17011ms
+      （mcp-real-query 没有被缓存代劳 ⇒ 隔离 ⑤ 在 Linux 上同样兑现）
+    回放（命中结果缓存）：budget-count / budget-truncation / callees / callers /
+      context-anchors / scope-* / read-only-counters / write-method-denied 等 **~100ms PASS**
+      —— 同一条批次的上一轮它们是 16–17s。⇒ 这就是缓存命中路径满足**冻结期望**的直接证据，
+      也是"重复 CI 复跑不再重复付索引成本"这个主张的现实数据。
+    daemon-lifecycle 104063ms（内部就是 23 枚探针，Linux 侧比 Windows 快约 2.5–3 倍）
+
+跨宿主对照（别互相对账，两套值各有语义）：Linux 的 contract/tree 来自**干净**工作树；
+Windows 的 `ef1a950b…`/`de50c865…` 来自含未提交改动的**脏**工作树且带 CRLF 口径。
+提交 marker 记 Windows 值、Linux 门禁记 Linux 值，这是既有约定，不是不一致。
+
+仍未验证（诚实边界）：第三方 MCP 客户端互操作；`verify --full` 对本 rev 无结论（余量不足）；
+结果缓存的收益只用"命中/冷跑"两组时延作**旁证**，不写进任何判据；
+daemon 场景在 Windows 上"等 EOF 的管道消费会挂住"这条已按已知效应写进契约，未修。
