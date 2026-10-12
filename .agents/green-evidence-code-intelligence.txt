@@ -647,5 +647,55 @@ Windows 复跑（最终二进制，串行；`dirty=0` 之前取）：
 根因是 `* text=auto` 的 CRLF 检出（DEVELOPMENT.md §11.1）。
 `verify --full` 仍**无结论**：`/work` 只有 27G 余量，实测需要 30G+（§J 同一口径），不重复冒险。
 
+## Q. round 3 整改后的结论级复跑（xc-pc-linux，rev `bdf2f767`）
+
+案卷 `.evidence/review-qoder-independent-p234-r3/`（末轮，verdict `COMMENTED`、0 阻塞；
+处置见 `.agents/code-intelligence-followups.md` 的 round 3 段）。宿主 `xc-pc-linux`
+（rustc/clippy/rust-analyzer **1.98.1**，`cargo-deny 0.20.2` 在场），`dirty=0`，
+bundle `c453a0b..bdf2f767` 传入后 `checkout -f FETCH_HEAD`。日志 `/work/xc-verify-p234e.log`。
+批次期间无并发构建。
+
+    cargo fmt --all -- --check                       exit 0（0 行输出）
+    cargo clippy --workspace --all-targets -D warn   exit 0，error 行数 0
+    cargo test -p nexus-harness                      138 passed / 0 failed
+        ⇒ 坐实 MODULE.md 的推算：Windows 137 + 1 条 `#[cfg(unix)]` = 138。
+          契约里那行现在写"Linux 以 §Q 实测为准、不预填"，填完就是这一行。
+    cargo test -p nexus --lib                        217 passed / 0 failed / 2 ignored
+    verify --fast --json                             overall PASS，9/9 门 PASS、无 UNKNOWN
+        Evidence dir=verify-qoder-xc-2845313dd25e  contract=3e6369ad6809
+        rev=bdf2f767fe88  dirty=False  toolchain=1.98.1  target=x8_64-unknown-linux-gnu
+        dependency-governance 真跑过：advisories/licenses/bans/sources PASS
+    21 个 E4 场景                                     PASS=21 FAIL=0
+    dirty_after=0   flycheck 残留(仓库内)=0   disk_after=27G 可用
+
+第 6b/6c 步（round 3 整改点的权威宿主复证）：
+
+    mcp selftest                 verdict=PASS  11/11 probes  probe_count=11  dur=172ms
+        eof_verdict=UNKNOWN  malformed_frame_verdict=FAIL
+        pass_verdict=PASS  pass_handled_requests=1  stdout_frames_ok=True
+        notification_no_reply=True  provider_override_honored=True
+        write_call_rejected=True（6/6 越权名）  write_tools_exposed=0
+    mcp selftest --with-query    verdict=PASS  probe_count=14  dur=17983ms
+        first=17593ms（reused=false, queries=1）
+        second=69ms（reused=true, queries=2）⇒ 255x，query_warm_reused=True
+    serve 通道纯度直测            干净 EOF ⇒ stdout **0 字节**（stderr 685，dirty=False）
+                                 1 帧 + EOF ⇒ stdout **230 字节、Content-Length 出现 1 次**
+        stderr verdict=PASS handled_requests=1
+                                 未知启动参数 ⇒ exit **2**、stdout 0 字节
+
+本轮相关场景的 evidence_id：
+
+    mcp-handshake              scenario-qoder-xc-510d7162b864（20 期望，含 probe_count=11）
+    mcp-real-query             scenario-qoder-xc-e2cd6efd6a65（20 期望，含 probe_count=14）
+    context-anchors            scenario-qoder-xc-5e896bcf5bc4
+
+数字口径（round 3 的 N-A4/N-A5 之后立的规矩，这里示范执行）：
+- 上面的 138 是 **Linux 实测**，不是从 Windows 推的；Windows 侧 137 记在 §Q 之前的
+  提交说明里并带 rev `bdf2f767`。
+- 685 这个字节数带 `dirty=False`；§O 的 682 是同一 envelope 在**脏树**上的读数，两处都已注明条件。
+- 复用倍率 255x（本轮 Linux）与 §P 的 233x、§O 的 40x 都**只是旁证**，判据是
+  `session_reused`/`session_queries` 这三个结构字段 —— 三次倍率不一致恰恰证明当初把
+  时延比值写进契约是错的。
+
 
 
