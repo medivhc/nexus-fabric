@@ -35,7 +35,7 @@ status: current
 | D | 记录与流程陷阱（踩过之后改成了口径） | 7 | 已入口径，非代码缺陷 |
 | E | harness 自身的 fail-open | 2 | 开放（属 harness 域） |
 | F | 未验证 | 6 | 开放 |
-| G | 治理与评审状态（含 G4b marker 缺口） | 7 | 开放 |
+| G | 治理与评审状态（含 G4b marker 缺口、G5 的 squash 误判更正） | 8 | 开放 |
 
 ---
 
@@ -197,9 +197,18 @@ status: current
   所以它不会拦住这种单笔缺口；发现方式是逐笔核 `git show --name-only` 对正文 marker。
   修法与 G4 同：**这一笔也已经在 `origin` 上**（推送之后不再是本地可改范围），是否补 marker
   （改写已发布历史 + force-push）归所有者决定。
-- **G5 stacking 决定 diff 归属**：本分支基座是**尚未合并**的 PR #12（head `df2049c`），
-  master 在其之后又前进了 4 笔 doc/skill 提交（与代码无重叠，仅 `FILE_MANIFEST.md` 可能小冲突）。
-  ⇒ 本 PR 的可见 diff 含 #12 的内容；合并顺序（#12 先、本分支后，或改基座）由所有者决定。
+- **G5 本分支与 master 的关系（这条我先前判错过，已更正）**：我原先写"基座是**尚未合并**的
+  PR #12（head `df2049c`）"，依据是 `git merge-base --is-ancestor df2049c origin/master` 返回否。
+  **那是错的判断方法**：AGENTS.md §30.2 规定 coordinator 用 **squash-merge**，被压缩的分支上
+  那些 commit 永远不会成为 master 的祖先，所以祖先测试对 squash 天然假阴性。
+  真值来自 GitHub API：PR #12 `merged=true`，`merged_at=2026-10-11T03:24:31Z`
+  （26 commits / 46 files 被压成一笔）。本分支后来又 `merge` 过 `origin/master@634771e`，
+  所以 `merge-base(master, HEAD) = 634771e` ⇒ **PR 的可见 diff 只有本轮新工作**
+  （实测 29 文件 +9805/−94，不含 #12 的 apps/nexus 与 env.rs/gates.rs 内容）。
+  仍开放的部分只剩一件：master 在本分支合并点之后又前进了 4 笔 doc/skill 提交
+  （`81b1029`/`534861a`/`edc2c5f`/`d3ae689`，与本模块代码无重叠，只有 `FILE_MANIFEST.md`
+  可能小冲突）⇒ 是否先把它们同步进来再合本 PR，归所有者定。
+  **口径教训记下来**：在这条流水线上判断"某个 PR 合了没有"只能看 PR 元数据，不能看 commit 祖先。
 
 ---
 
