@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 nexus = { path = "../nexus" }
 nexus-control-api = { path = "../../crates/nexus-control-api" }
+nexus-turn = { path = "../../crates/nexus-turn" }
 nexus-registry = { path = "../../crates/nexus-registry" }
 nexus-discovery = { path = "../../crates/nexus-discovery" }
 nexus-ingress = { path = "../../crates/nexus-ingress" }

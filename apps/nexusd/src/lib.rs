@@ -5,7 +5,9 @@
 pub mod assembly;
 pub mod config;
 pub mod dataplane;
+pub mod nat_stun;
 pub mod nat_switch;
+pub mod nat_turn;
 pub mod proxy_fwd;
 pub mod recovery;
 /// nexusd Workspace sync 传输适配（C2；fabric QUIC bi-stream）。

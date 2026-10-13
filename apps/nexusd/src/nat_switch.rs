@@ -46,6 +46,7 @@ fn peer_name(peer: &FabricPeerId) -> String {
 /// sink can call back (role updates) through a [`Weak`] — no reference cycle.
 pub struct NatSwitching {
     driver: Arc<Driver>,
+    my_id: FabricPeerId,
     punch: Arc<PunchManager>,
     link: Arc<Mutex<PathLink>>,
     monitor: QualityMonitor<Arc<ConnShared>>,
@@ -124,6 +125,7 @@ impl NatSwitching {
             let monitor = QualityMonitor::new(pm, sink);
             Self {
                 driver,
+                my_id,
                 punch,
                 link,
                 monitor,
@@ -186,7 +188,17 @@ impl NatSwitching {
         if !auto_punch {
             return; // responder side: the responder loop answers offers.
         }
-        eprintln!("[nat-switch] background punch starting for peer {name}");
+        // Tie-break (AC5/AC6): if both sides would punch simultaneously,
+        // only the larger PeerId initiates. This avoids duplicate direct
+        // connections and the need for post-hoc connection teardown.
+        // FabricPeerId is [u8; 32], lexicographic comparison is deterministic.
+        if self.my_id.0 < peer.0 {
+            eprintln!(
+                "[nat-switch] tie-break: peer {name} has larger PeerId, waiting for their punch"
+            );
+            return;
+        }
+        eprintln!("[nat-switch] background punch starting for peer {name} (tie-break won)");
         let this = Arc::clone(self);
         let relay_conn = relay.clone();
         thread::Builder::new()
@@ -206,6 +218,12 @@ impl NatSwitching {
     }
 
     /// Register a punched direct connection as a racing candidate.
+    ///
+    /// Register a punched direct connection as a racing candidate.
+    ///
+    /// Note: tie-break is enforced at punch initiation time (see
+    /// [`Self::on_relay_connected`]): only the larger PeerId initiates,
+    /// so duplicate simultaneous punches do not occur by construction.
     fn on_direct_ready(&self, peer: FabricPeerId, name: &str, addr: SocketAddr) {
         let Some(direct) = self.punch.direct_conn(&peer) else {
             eprintln!("[nat-switch] WARN: Migrated but no direct conn for peer {name}");

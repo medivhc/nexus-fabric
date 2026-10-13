@@ -70,6 +70,8 @@ pub struct DaemonConfig {
     pub qos: QosSection,
     /// `[tun]` 小节：TUN 设备开关与参数（默认启用）。
     pub tun: TunSection,
+    /// `[network.turn]` 小节：TURN 中继配置（可选；缺失 = NAT 打洞/turn 子系统禁用）。
+    pub turn: Option<TurnSection>,
 }
 
 /// `daemon.toml` 的 `[tun]` 小节（no-tun 模式，`docs/WINDOWS_TUN_DESIGN.md` §1）。
@@ -92,6 +94,40 @@ impl Default for TunSection {
             enabled: true,
             name: "nexus".to_string(),
             mtu: 1500,
+        }
+    }
+}
+
+/// `daemon.toml` 的 `[network.turn]` 小节（NAT switching daemon activation，AC2）。
+///
+/// 存在即启用 TURN 中继分配与 NAT 打洞；缺失时 daemon 不实例化 turn/打洞栈
+/// （启动时记录 WARN，punch disabled）。
+/// 热加载分类：任一字段变化 → `NeedsRestart`（TURN 客户端生命周期需重建）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnSection {
+    /// TURN 服务器 locator（如 `turn.example.org:3478`）。
+    pub server: String,
+    /// 长期凭证 realm（由 TURN 服务器下发，RFC 5389 §10.2）。
+    pub realm: String,
+    /// 长期凭证用户名。
+    pub username: String,
+    /// 长期凭证密码。
+    pub password: String,
+    /// 请求的分配生命周期 / 刷新间隔（秒；默认 300，必须 > 0）。
+    pub refresh_interval_sec: u64,
+    /// STUN 探测服务器（可选；缺失时回落到 `server` 做 STUN Binding 探测）。
+    pub stun_server: Option<String>,
+}
+
+impl Default for TurnSection {
+    fn default() -> Self {
+        Self {
+            server: String::new(),
+            realm: String::new(),
+            username: String::new(),
+            password: String::new(),
+            refresh_interval_sec: 300,
+            stun_server: None,
         }
     }
 }
@@ -184,6 +220,7 @@ pub fn load(dir: &ConfigDir) -> Result<LoadedConfig, String> {
             localapi_addr: DaemonConfig::default_addr(),
             qos: QosSection::default(),
             tun: TunSection::default(),
+            turn: None,
         },
         ..Default::default()
     };
@@ -253,6 +290,7 @@ fn parse_daemon_toml(text: &str) -> Result<DaemonConfig, String> {
         localapi_addr: DaemonConfig::default_addr(),
         qos: QosSection::default(),
         tun: TunSection::default(),
+        turn: None,
     };
     // 支持 `localapi_addr = "..."` 或 `[localapi] addr = "..."`
     if let Some(s) = v.get("localapi_addr").and_then(|x| x.as_str()) {
@@ -277,7 +315,74 @@ fn parse_daemon_toml(text: &str) -> Result<DaemonConfig, String> {
     if let Some(t) = v.get("tun") {
         cfg.tun = parse_tun_section(t)?;
     }
+    // [network.turn] 小节（可选；缺失 = turn/打洞子系统禁用）
+    if let Some(t) = v.get("network").and_then(|n| n.get("turn")) {
+        cfg.turn = Some(parse_turn_section(t)?);
+    }
     Ok(cfg)
+}
+
+/// 解析 `daemon.toml` 的 `[network.turn]` 小节（AC2）。
+///
+/// `server` / `realm` / `username` / `password` 为必填非空字符串；
+/// `refresh_interval_sec` 可选（默认 300，必须 > 0）；
+/// `stun_server` 可选（缺失时回落 `server` 做 STUN 探测）。
+fn parse_turn_section(t: &toml::Value) -> Result<TurnSection, String> {
+    let get_required = |k: &str| -> Result<String, String> {
+        let s = t
+            .get(k)
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| format!("{DAEMON_TOML}: [network.turn].{k} must be a string"))?;
+        if s.is_empty() {
+            return Err(format!(
+                "{DAEMON_TOML}: [network.turn].{k} must not be empty"
+            ));
+        }
+        Ok(s.to_string())
+    };
+    let server = get_required("server")?;
+    let realm = get_required("realm")?;
+    let username = get_required("username")?;
+    let password = get_required("password")?;
+    let refresh_interval_sec = match t.get("refresh_interval_sec") {
+        None => 300,
+        Some(x) => {
+            let n = x
+                .as_integer()
+                .and_then(|i| u64::try_from(i).ok())
+                .ok_or_else(|| {
+                    format!("{DAEMON_TOML}: [network.turn].refresh_interval_sec must be a positive integer")
+                })?;
+            if n == 0 {
+                return Err(format!(
+                    "{DAEMON_TOML}: [network.turn].refresh_interval_sec must be > 0"
+                ));
+            }
+            n
+        }
+    };
+    let stun_server = match t.get("stun_server") {
+        None => None,
+        Some(x) => {
+            let s = x.as_str().ok_or_else(|| {
+                format!("{DAEMON_TOML}: [network.turn].stun_server must be a string")
+            })?;
+            if s.is_empty() {
+                return Err(format!(
+                    "{DAEMON_TOML}: [network.turn].stun_server must not be empty"
+                ));
+            }
+            Some(s.to_string())
+        }
+    };
+    Ok(TurnSection {
+        server,
+        realm,
+        username,
+        password,
+        refresh_interval_sec,
+        stun_server,
+    })
 }
 
 /// 解析 `daemon.toml` 的 `[tun]` 小节（T1）。
@@ -536,6 +641,10 @@ pub fn classify_change(old: &LoadedConfig, new: &LoadedConfig) -> ChangeKind {
     if old.daemon.tun != new.daemon.tun {
         return ChangeKind::NeedsRestart;
     }
+    // daemon.toml：[network.turn] 小节变化需重启（TURN 客户端启停需重建）。
+    if old.daemon.turn != new.daemon.turn {
+        return ChangeKind::NeedsRestart;
+    }
     // R5：network.toml 内容变更 → NeedsRestart（mesh CIDR 可能变化）。
     if old.network_toml != new.network_toml {
         return ChangeKind::NeedsRestart;
@@ -789,5 +898,101 @@ mod tests {
         assert!(parse_dns_toml("not toml [[[").is_err());
         assert!(parse_dns_toml("[dns]\nfake_ip_range = \"999.1.1.0/24\"\n").is_err());
         assert!(parse_dns_toml("[dns.hosts]\nbad = \"not-an-ip\"\n").is_err());
+    }
+
+    // ---------- [network.turn] 小节（NAT switching daemon activation，AC2） ----------
+
+    #[test]
+    fn turn_section_absent_by_default() {
+        // 无 [network.turn] 小节 → turn=None（子系统不启用）。
+        let cfg = parse_daemon_toml("[localapi]\naddr = \"127.0.0.1:18080\"\n").unwrap();
+        assert!(cfg.turn.is_none());
+    }
+
+    #[test]
+    fn turn_section_parses_canonical_snippet() {
+        // 与规格 wire format 对齐：server/realm/username/password 必填，
+        // refresh_interval_sec / stun_server 可选。
+        let text = "[network.turn]\n\
+                    server = \"turn.example.org:3478\"\n\
+                    realm = \"example.org\"\n\
+                    username = \"nexus-node-a\"\n\
+                    password = \"secret\"\n\
+                    refresh_interval_sec = 300\n\
+                    stun_server = \"stun.example.org:3478\"\n";
+        let cfg = parse_daemon_toml(text).unwrap();
+        let turn = cfg.turn.expect("turn section should parse");
+        assert_eq!(turn.server, "turn.example.org:3478");
+        assert_eq!(turn.realm, "example.org");
+        assert_eq!(turn.username, "nexus-node-a");
+        assert_eq!(turn.password, "secret");
+        assert_eq!(turn.refresh_interval_sec, 300);
+        assert_eq!(turn.stun_server.as_deref(), Some("stun.example.org:3478"));
+    }
+
+    #[test]
+    fn turn_section_defaults_for_optional_fields() {
+        // 缺失 refresh_interval_sec → 300；缺失 stun_server → None。
+        let text = "[network.turn]\n\
+                    server = \"turn.example.org:3478\"\n\
+                    realm = \"example.org\"\n\
+                    username = \"u\"\n\
+                    password = \"p\"\n";
+        let cfg = parse_daemon_toml(text).unwrap();
+        let turn = cfg.turn.unwrap();
+        assert_eq!(turn.refresh_interval_sec, 300);
+        assert!(turn.stun_server.is_none());
+    }
+
+    #[test]
+    fn turn_section_rejects_missing_or_empty_required() {
+        // 缺失 server。
+        let text = "[network.turn]\nrealm = \"r\"\nusername = \"u\"\npassword = \"p\"\n";
+        assert!(parse_daemon_toml(text).is_err());
+        // 空 username。
+        let text =
+            "[network.turn]\nserver = \"s\"\nrealm = \"r\"\nusername = \"\"\npassword = \"p\"\n";
+        assert!(parse_daemon_toml(text).is_err());
+        // 空密码。
+        let text =
+            "[network.turn]\nserver = \"s\"\nrealm = \"r\"\nusername = \"u\"\npassword = \"\"\n";
+        assert!(parse_daemon_toml(text).is_err());
+        // 非字符串字段。
+        let text =
+            "[network.turn]\nserver = 42\nrealm = \"r\"\nusername = \"u\"\npassword = \"p\"\n";
+        assert!(parse_daemon_toml(text).is_err());
+    }
+
+    #[test]
+    fn turn_section_rejects_bad_refresh_interval() {
+        let base =
+            "[network.turn]\nserver = \"s\"\nrealm = \"r\"\nusername = \"u\"\npassword = \"p\"\n";
+        assert!(parse_daemon_toml(&format!("{base}refresh_interval_sec = 0\n")).is_err());
+        assert!(parse_daemon_toml(&format!("{base}refresh_interval_sec = -5\n")).is_err());
+        assert!(parse_daemon_toml(&format!("{base}refresh_interval_sec = \"fast\"\n")).is_err());
+        assert!(parse_daemon_toml(&format!("{base}refresh_interval_sec = 60\n")).is_ok());
+    }
+
+    #[test]
+    fn turn_change_needs_restart() {
+        // [network.turn] 字段变更 → NeedsRestart（TURN 客户端启停需重建）。
+        let d = std::env::temp_dir().join("nexusd-cfg-test-turn");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        write(
+            &d,
+            DAEMON_TOML,
+            "[network.turn]\nserver = \"turn.example.org:3478\"\nrealm = \"r\"\nusername = \"u\"\npassword = \"p\"\n",
+        );
+        let dir = ConfigDir::new(&d).unwrap();
+        let old = load(&dir).unwrap();
+        write(
+            &d,
+            DAEMON_TOML,
+            "[network.turn]\nserver = \"turn2.example.org:3478\"\nrealm = \"r\"\nusername = \"u\"\npassword = \"p\"\n",
+        );
+        let new = load(&dir).unwrap();
+        assert_eq!(classify_change(&old, &new), ChangeKind::NeedsRestart);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

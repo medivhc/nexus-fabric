@@ -241,18 +241,24 @@ fn tun_enabled() -> bool {
     *TUN_ENABLED.get().unwrap_or(&true)
 }
 
+mod nat_stun;
+mod nat_turn;
 mod watcher;
 
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use nexus_fabric::Driver;
+use nexus_nat_traversal::LocalCandidates;
+
 use nexusd::assembly;
-use nexusd::config::{self, ConfigDir, LoadedConfig};
+use nexusd::config::{self, ConfigDir, LoadedConfig, TurnSection};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -375,6 +381,169 @@ fn run_dataplane(
             }
         }
     }
+}
+
+/// NAT switching daemon runtime（AC5）。
+///
+/// 持有 `TurnManager` + `StunProber` + `NatSwitching`，在后台 worker 线程驱动：
+/// - 启动时懒分配 TURN（失败 → WARN + Disabled 降级，不阻断进程）；
+/// - 按节奏 Refresh 保活（AC3）；
+/// - 周期性 STUN 采样（5min），更新本地候选与 NAT 类型分支（AC4）。
+///
+/// 诚实边界：nexusd 的 N1 mesh 连接不暴露 `fabric::ConnShared`，因此
+/// `NatSwitching::on_relay_connected` 的生产喂入（D5）需要更深的 mesh/fabric
+/// 集成（超出本任务 5 文件范围）；本运行时先激活 NAT 路径决策引擎（AC5：
+/// 配置开关可验证开启/关闭），并保留 `sw` 供后续 relay 钩子调用。
+struct NatSwitchRuntime {
+    turn: nat_turn::TurnManager,
+    stun: nat_stun::StunProber,
+    sw: Arc<nexusd::nat_switch::NatSwitching>,
+    _driver: Arc<Driver>,
+    stop: Arc<AtomicBool>,
+}
+
+impl NatSwitchRuntime {
+    /// 从 `[network.turn]` 配置创建并启动运行时。
+    ///
+    /// `shutdown` 是 daemon 全局关闭标志：worker 在收到 SIGTERM/SIGINT 后
+    /// 协作式退出（与 dataplane/LocalAPI 线程同源）。返回 worker
+    /// `JoinHandle`（主线程在 [`shutdown_sequence`] 中 join）；运行时被移入 worker。
+    fn start(section: &TurnSection, shutdown: Arc<AtomicBool>) -> Option<JoinHandle<()>> {
+        // TURN 生命周期管理器（配置缺失时由调用方保证为 Some）。
+        let turn = nat_turn::TurnManager::new(Some(section.clone()));
+
+        // STUN 探测器：真实 UDP 传输。
+        let stun_transport: Box<dyn nat_stun::StunTransport> = match nat_stun::UdpStunTransport::new(
+            "0.0.0.0:0".parse().expect("0.0.0.0:0 parses"),
+        ) {
+            Ok(t) => Box::new(t),
+            Err(e) => {
+                eprintln!(
+                    "[nat-switch] WARN: STUN socket bind failed ({e}); stun disabled, punch disabled"
+                );
+                return None;
+            }
+        };
+        let stun = nat_stun::StunProber::new(stun_transport);
+
+        // NAT 打洞 fabric driver：独立 UDP socket + 随机 ed25519 身份。
+        // （真实部署应复用 mesh 的 fabric 身份/连接，属于后续集成。）
+        let driver = match Driver::new_server("0.0.0.0:0".parse().expect("0.0.0.0:0 parses")) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!(
+                    "[nat-switch] WARN: fabric driver bind failed ({e}); nat-switch disabled, punch disabled"
+                );
+                return None;
+            }
+        };
+        let Some(my_id) = driver.shared().peer_id else {
+            eprintln!(
+                "[nat-switch] WARN: fabric driver has no peer id; nat-switch disabled, punch disabled"
+            );
+            return None;
+        };
+
+        let local = LocalCandidates {
+            host: nexusd::nat_switch::gather_host_candidates(&driver),
+            srflx: None,
+            srflx_stun: None,
+            nat_type: nexus_connectivity::nat::NatType::Unknown,
+        };
+        let sw = nexusd::nat_switch::NatSwitching::new(
+            driver.clone(),
+            my_id,
+            local,
+            Vec::new(), // STUN 样本由 worker 周期性喂入
+        );
+
+        let runtime = NatSwitchRuntime {
+            turn,
+            stun,
+            sw,
+            _driver: driver,
+            stop: shutdown,
+        };
+
+        let stun_server = stun_server_addr(section);
+        let worker = std::thread::Builder::new()
+            .name("nexusd-nat-switch".to_string())
+            .spawn(move || {
+                runtime.run(stun_server);
+            })
+            .map_err(|e| format!("spawn nat-switch thread: {e}"))
+            .ok()?;
+        Some(worker)
+    }
+
+    /// Worker 主循环（单写入者；`stop` 置位后协作式退出）。
+    fn run(mut self, stun_server: Option<std::net::SocketAddr>) {
+        // 1. 懒初始化 TURN 分配（失败 → WARN + Disabled，中继照常）。
+        match self.turn.ensure_allocated() {
+            Ok(relayed) => eprintln!("[nat-switch] TURN relayed={relayed} (warm backup)"),
+            Err(e) => eprintln!("[nat-switch] WARN: TURN allocate failed: {e}; punch disabled"),
+        }
+
+        // 2. 初始 STUN 采样（失败不阻断）。
+        let mut last_stun = std::time::Instant::now();
+        if let Some(server) = stun_server {
+            self.sample_and_update(server);
+        }
+
+        // 3. 节奏循环：Refresh 保活 + 周期 STUN 重采样。
+        while !self.stop.load(Ordering::Relaxed) {
+            self.turn.refresh_if_needed();
+            if let Some(server) = stun_server {
+                if last_stun.elapsed() >= nat_stun::STUN_REFRESH_INTERVAL {
+                    self.sample_and_update(server);
+                    last_stun = std::time::Instant::now();
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+
+        // 4. 协作式退出：停止质量监控 + 释放 TURN 资源。
+        self.sw.shutdown();
+        self.turn.shutdown();
+        eprintln!("[nat-switch] worker exited");
+    }
+
+    /// 单次 STUN 采样并更新本地候选（AC4）。
+    fn sample_and_update(&mut self, server: std::net::SocketAddr) {
+        // 用完整映射获取公网 IP:port（srflx 候选），同时构造 PortSample 供预测器。
+        match self.stun.probe_once(server, nat_stun::STUN_PROBE_TIMEOUT) {
+            Ok(mapping) => {
+                let at_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let sample = nexus_nat_traversal::PortSample {
+                    port: mapping.public.port(),
+                    at_ms,
+                };
+                let local = LocalCandidates {
+                    host: nexusd::nat_switch::gather_host_candidates(&self._driver),
+                    srflx: Some(mapping.public),
+                    srflx_stun: Some(server),
+                    nat_type: nexus_connectivity::nat::NatType::Unknown,
+                };
+                self.sw.set_local(local, vec![sample]);
+                eprintln!(
+                    "[nat-switch] STUN sample: public={} at_ms={} (local={})",
+                    mapping.public, sample.at_ms, mapping.local
+                );
+            }
+            Err(e) => eprintln!(
+                "[nat-switch] WARN: STUN sample failed ({e}); keeping previous candidates"
+            ),
+        }
+    }
+}
+
+/// 解析 STUN 服务器地址：`stun_server` 缺失时回落 `[network.turn].server`。
+fn stun_server_addr(section: &TurnSection) -> Option<std::net::SocketAddr> {
+    let s = section.stun_server.as_deref().unwrap_or(&section.server);
+    s.parse().ok()
 }
 
 /// Daemon 主流程：加载配置 → 装配子系统 → 启动线程 → 事件循环 → 优雅关闭。
@@ -586,6 +755,16 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         }
     }
 
+    // 5.6. NAT switching daemon runtime（AC5）：TURN 生命周期 + STUN 采样 + 打洞决策。
+    //      `[network.turn]` 配置存在时启动后台 worker（daemon 共享 shutdown 标志，
+    //      收到 SIGTERM/SIGINT 后协作式退出）；启动/绑定失败 → WARN + 降级，
+    //      不阻断进程，LocalAPI 照常服务（诚实边界见 `NatSwitchRuntime` 文档）。
+    let nat_switch_handle = loaded
+        .daemon
+        .turn
+        .as_ref()
+        .and_then(|s| NatSwitchRuntime::start(s, Arc::clone(&shutdown)));
+
     // 6. 配置 watcher（后台线程；主线程拥有 JoinHandle，不直接改共享状态）。
     let (ev_tx, ev_rx) = channel();
     let _watcher = watcher::spawn(dir.clone(), loaded, ev_tx);
@@ -618,6 +797,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         dataplane_handle,
         n1_bridge,
         n2_sweeper_handle,
+        nat_switch_handle,
         &state_dir,
     );
     ExitCode::from(0)
@@ -625,13 +805,15 @@ fn run_daemon(config_dir: &str) -> ExitCode {
 
 /// R4：优雅关闭序列（§13.4）。
 ///
-/// 顺序：LocalAPI → Workspace unmount（D7）→ Dataplane（1s）→ N1（5s）→ TUN（随 dataplane 线程退出）。
+/// 顺序：LocalAPI → N2 sweeper → NAT switch（5s）→ Workspace unmount（D7）→
+/// Dataplane（1s）→ N1（5s）→ TUN（随 dataplane 线程退出）。
 /// 任一步超时 → warn 日志后强制继续，不无限等。
 fn shutdown_sequence(
     localapi_handle: std::thread::JoinHandle<()>,
     dataplane_handle: Option<std::thread::JoinHandle<()>>,
     n1_bridge: Option<Arc<nexus_network::n1::bridge::N1MeshBridge>>,
     n2_sweeper_handle: Option<std::thread::JoinHandle<()>>,
+    nat_switch_handle: Option<std::thread::JoinHandle<()>>,
     state_dir: &std::path::Path,
 ) {
     eprintln!("[nexusd] shutdown: stopping LocalAPI");
@@ -641,6 +823,13 @@ fn shutdown_sequence(
     // P1-1：N2 SessionManager 的唯一持有者（sweeper 线程）确认结束。
     if let Some(handle) = n2_sweeper_handle {
         assembly::join_with_timeout(handle, Duration::from_secs(2), "n2-session-sweeper");
+    }
+
+    // AC5：NAT switching worker 共享 daemon shutdown 标志（协作式退出），
+    // 但 TURN/STUN socket 是网络资源，优先于数据面释放（5s 超时强制继续）。
+    if let Some(handle) = nat_switch_handle {
+        eprintln!("[nexusd] shutdown: stopping nat-switch");
+        assembly::join_with_timeout(handle, Duration::from_secs(5), "nat-switch");
     }
 
     // D7（C1）：Workspace unmount 在 LocalAPI 之后、Dataplane 之前。
@@ -718,12 +907,23 @@ fn log_enabled_subsystems(cfg: &LoadedConfig) {
     if cfg.dns_toml.is_some() {
         enabled.push("dns");
     }
+    if cfg.daemon.turn.is_some() {
+        enabled.push("nat-switch (TURN relay)");
+        eprintln!(
+            "[nexusd] nat-stun: probe timeout {}s, refresh interval {}s",
+            nat_stun::STUN_PROBE_TIMEOUT.as_secs(),
+            nat_stun::STUN_REFRESH_INTERVAL.as_secs()
+        );
+    }
     if enabled.is_empty() {
         eprintln!("[nexusd] no subsystem configured (empty config dir); LocalAPI only");
     } else {
         eprintln!("[nexusd] subsystems configured: {}", enabled.join(", "));
     }
     eprintln!("[nexusd] localapi_addr={}", cfg.daemon.localapi_addr);
+    if cfg.daemon.turn.is_none() {
+        eprintln!("[nat-switch] turn unconfigured, punch disabled");
+    }
 }
 
 /// P1-15：单连接读写超时。`handle_localapi_request` 逐行读 request line /
