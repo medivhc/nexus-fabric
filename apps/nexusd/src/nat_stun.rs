@@ -24,12 +24,17 @@ use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nexus_connectivity::nat::{NatType, StunMapping};
-use nexus_nat_traversal::PortSample;
+use nexus_nat_traversal::{DefaultPredictor, PortSample, Predictability, PunchPredictor};
 
 /// 单次 STUN 探测超时（AC4：2s）。
 pub const STUN_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// STUN 重采样/刷新节奏（AC4：5min；调用方驱动）。
 pub const STUN_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// D2 有界端口预测：端口窗口半径（±16）。
+pub const BOUNDED_PUNCH_PORT_RADIUS: u16 = 16;
+/// D2 有界端口预测：时间盒（3s）。
+pub const BOUNDED_PUNCH_TIME_WINDOW: Duration = Duration::from_secs(3);
 
 /// STUN Binding Request 消息类型（RFC 5389）。
 const STUN_BINDING_REQUEST: u16 = 0x0001;
@@ -178,6 +183,25 @@ impl StunProber {
         })
     }
 
+    /// 双服务器探测：返回 server1 的公网映射 + 双映射对比的 NAT 类型。
+    ///
+    /// 一次调用只做两次 Binding 探测（调用方不再需要额外的 `probe_once`），
+    /// 适合 5min 刷新循环直接取映射与类型。
+    pub fn probe_and_detect(
+        &mut self,
+        server1: SocketAddr,
+        server2: SocketAddr,
+    ) -> Result<(StunMapping, NatType), StunError> {
+        let m1 = self.probe_once(server1, STUN_PROBE_TIMEOUT)?;
+        let m2 = self.probe_once(server2, STUN_PROBE_TIMEOUT)?;
+        let nat_type = if m1.public != m2.public {
+            NatType::Symmetric
+        } else {
+            NatType::RestrictedCone
+        };
+        Ok((m1, nat_type))
+    }
+
     /// 采集一个端口样本（供 `PunchManager` 有界预测）。
     pub fn sample(&mut self, server: SocketAddr) -> Result<PortSample, StunError> {
         let m = self.probe_once(server, STUN_PROBE_TIMEOUT)?;
@@ -188,19 +212,50 @@ impl StunProber {
     }
 }
 
-/// 基于 NAT 类型的打洞分支（AC4：symmetric/Cone 分支）。
+/// 打洞分支决策（AC4 + D2 有界端口预测决议）。
 ///
-/// Symmetric → 不打洞（走 relay）；Cone（及 Unknown）→ 打洞直连。
-/// 与 `nexus_connectivity::nat::nat_path_decision` 的路径语义一致，
-/// 但作为 daemon 侧是否启用打洞的布尔分支。
-pub fn should_punch(nat_type: NatType) -> bool {
-    match nat_type {
-        NatType::Symmetric => false,
-        NatType::FullCone
-        | NatType::RestrictedCone
-        | NatType::PortRestrictedCone
-        | NatType::Unknown => true,
+/// - 本地 Cone / Unknown → 常规打洞（`Punch`）；
+/// - 本地 Symmetric：仅当端口增量 Δ 稳定（≥3 样本、连续两两 Δ 相等，
+///   复用 `nexus_nat_traversal::DefaultPredictor` 的冻结判定逻辑）且对端为
+///   Cone 时，触发 D2 有界预测打洞（±16 端口窗口，3s 时间盒，只打对端单一 IP）；
+///   Δ 不规律、样本不足、STUN 超时或对端同为 Symmetric/Unknown → `NoPunch`，
+///   稳定维持 Relay 路径。
+pub fn should_punch(local: NatType, peer: NatType, samples: &[PortSample]) -> PunchDecision {
+    if local == NatType::Symmetric {
+        let delta_stable = matches!(
+            DefaultPredictor.assess(samples),
+            Predictability::Predictable { .. }
+        );
+        if delta_stable && is_cone(peer) {
+            return PunchDecision::BoundedPunch {
+                port_radius: BOUNDED_PUNCH_PORT_RADIUS,
+                time_window: BOUNDED_PUNCH_TIME_WINDOW,
+            };
+        }
+        return PunchDecision::NoPunch;
     }
+    // Cone / Unknown：常规打洞（Unknown 保持既有行为：打洞）。
+    PunchDecision::Punch
+}
+
+/// 打洞分支决策（AC4 + D2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PunchDecision {
+    /// Cone/Unknown NAT：常规打洞。
+    Punch,
+    /// 本地 Symmetric + Δ 稳定 + 对端 Cone：D2 有界预测打洞
+    /// （±16 端口窗口，3s 时间盒，只打对端单一 IP）。
+    BoundedPunch { port_radius: u16, time_window: Duration },
+    /// 其余情况：维持 Relay，不打洞。
+    NoPunch,
+}
+
+/// 是否为锥型 NAT（Full / Restricted / PortRestricted）。
+fn is_cone(t: NatType) -> bool {
+    matches!(
+        t,
+        NatType::FullCone | NatType::RestrictedCone | NatType::PortRestrictedCone
+    )
 }
 
 /// 当前 unix 毫秒（PortSample 时间戳）。
@@ -436,13 +491,96 @@ mod tests {
         assert!(s.at_ms > 0);
     }
 
+    fn port_samples(ports: &[u16]) -> Vec<PortSample> {
+        ports
+            .iter()
+            .enumerate()
+            .map(|(i, &port)| PortSample {
+                port,
+                at_ms: 1_000_000 + i as u64 * 100,
+            })
+            .collect()
+    }
+
     #[test]
     fn should_punch_branches() {
-        // Symmetric → 不打洞（走 relay）；Cone/Unknown → 打洞。
-        assert!(!should_punch(NatType::Symmetric));
-        assert!(should_punch(NatType::FullCone));
-        assert!(should_punch(NatType::RestrictedCone));
-        assert!(should_punch(NatType::PortRestrictedCone));
-        assert!(should_punch(NatType::Unknown));
+        let no_samples: Vec<PortSample> = vec![];
+        // Cone / Unknown → 常规打洞。
+        assert_eq!(
+            should_punch(NatType::FullCone, NatType::Symmetric, &no_samples),
+            PunchDecision::Punch
+        );
+        assert_eq!(
+            should_punch(NatType::RestrictedCone, NatType::FullCone, &no_samples),
+            PunchDecision::Punch
+        );
+        assert_eq!(
+            should_punch(NatType::PortRestrictedCone, NatType::Unknown, &no_samples),
+            PunchDecision::Punch
+        );
+        assert_eq!(
+            should_punch(NatType::Unknown, NatType::Symmetric, &no_samples),
+            PunchDecision::Punch
+        );
+        // Symmetric 本地 + 无样本 → 不打洞（维持 Relay）。
+        assert_eq!(
+            should_punch(NatType::Symmetric, NatType::FullCone, &no_samples),
+            PunchDecision::NoPunch
+        );
+    }
+
+    #[test]
+    fn d2_bounded_punch_on_stable_delta() {
+        // 本地 Symmetric + Δ 稳定（10000→10002→10004，Δ=2）+ 对端 Cone
+        // → D2 有界预测打洞（±16 端口，3s 时间盒）。
+        let samples = port_samples(&[10000, 10002, 10004]);
+        assert_eq!(
+            should_punch(NatType::Symmetric, NatType::FullCone, &samples),
+            PunchDecision::BoundedPunch {
+                port_radius: BOUNDED_PUNCH_PORT_RADIUS,
+                time_window: BOUNDED_PUNCH_TIME_WINDOW,
+            }
+        );
+        assert_eq!(
+            should_punch(NatType::Symmetric, NatType::PortRestrictedCone, &samples),
+            PunchDecision::BoundedPunch {
+                port_radius: 16,
+                time_window: Duration::from_secs(3),
+            }
+        );
+    }
+
+    #[test]
+    fn d2_no_punch_on_unstable_delta() {
+        // Δ 不规律（10000→10005→10003）→ 不打洞。
+        let samples = port_samples(&[10000, 10005, 10003]);
+        assert_eq!(
+            should_punch(NatType::Symmetric, NatType::FullCone, &samples),
+            PunchDecision::NoPunch
+        );
+    }
+
+    #[test]
+    fn d2_no_punch_when_peer_not_cone() {
+        // 对端同为 Symmetric → 不打洞；对端 Unknown → 不打洞（无法确认 Cone）。
+        let samples = port_samples(&[10000, 10002, 10004]);
+        assert_eq!(
+            should_punch(NatType::Symmetric, NatType::Symmetric, &samples),
+            PunchDecision::NoPunch
+        );
+        assert_eq!(
+            should_punch(NatType::Symmetric, NatType::Unknown, &samples),
+            PunchDecision::NoPunch
+        );
+    }
+
+    #[test]
+    fn d2_no_punch_on_too_few_samples() {
+        // 样本不足 3 个 → Δ 无法判定 → 不打洞。
+        let samples = port_samples(&[10000, 10002]);
+        assert_eq!(
+            should_punch(NatType::Symmetric, NatType::FullCone, &samples),
+            PunchDecision::NoPunch
+        );
     }
 }

@@ -117,6 +117,9 @@ pub struct TurnSection {
     pub refresh_interval_sec: u64,
     /// STUN 探测服务器（可选；缺失时回落到 `server` 做 STUN Binding 探测）。
     pub stun_server: Option<String>,
+    /// 第二 STUN 探测服务器（可选；用于双服务器 NAT 类型对比检测，
+    /// AC4/D2；缺失时只做单服务器采样，`nat_type` 保持 `Unknown`）。
+    pub stun_server2: Option<String>,
 }
 
 impl Default for TurnSection {
@@ -128,6 +131,7 @@ impl Default for TurnSection {
             password: String::new(),
             refresh_interval_sec: 300,
             stun_server: None,
+            stun_server2: None,
         }
     }
 }
@@ -326,7 +330,7 @@ fn parse_daemon_toml(text: &str) -> Result<DaemonConfig, String> {
 ///
 /// `server` / `realm` / `username` / `password` 为必填非空字符串；
 /// `refresh_interval_sec` 可选（默认 300，必须 > 0）；
-/// `stun_server` 可选（缺失时回落 `server` 做 STUN 探测）。
+/// `stun_server` / `stun_server2` 可选（缺失时回落 `server` 做 STUN 探测）。
 fn parse_turn_section(t: &toml::Value) -> Result<TurnSection, String> {
     let get_required = |k: &str| -> Result<String, String> {
         let s = t
@@ -361,20 +365,24 @@ fn parse_turn_section(t: &toml::Value) -> Result<TurnSection, String> {
             n
         }
     };
-    let stun_server = match t.get("stun_server") {
-        None => None,
-        Some(x) => {
-            let s = x.as_str().ok_or_else(|| {
-                format!("{DAEMON_TOML}: [network.turn].stun_server must be a string")
-            })?;
-            if s.is_empty() {
-                return Err(format!(
-                    "{DAEMON_TOML}: [network.turn].stun_server must not be empty"
-                ));
+    let opt_server = |k: &str| -> Result<Option<String>, String> {
+        match t.get(k) {
+            None => Ok(None),
+            Some(x) => {
+                let s = x.as_str().ok_or_else(|| {
+                    format!("{DAEMON_TOML}: [network.turn].{k} must be a string")
+                })?;
+                if s.is_empty() {
+                    return Err(format!(
+                        "{DAEMON_TOML}: [network.turn].{k} must not be empty"
+                    ));
+                }
+                Ok(Some(s.to_string()))
             }
-            Some(s.to_string())
         }
     };
+    let stun_server = opt_server("stun_server")?;
+    let stun_server2 = opt_server("stun_server2")?;
     Ok(TurnSection {
         server,
         realm,
@@ -382,6 +390,7 @@ fn parse_turn_section(t: &toml::Value) -> Result<TurnSection, String> {
         password,
         refresh_interval_sec,
         stun_server,
+        stun_server2,
     })
 }
 
@@ -919,7 +928,8 @@ mod tests {
                     username = \"nexus-node-a\"\n\
                     password = \"secret\"\n\
                     refresh_interval_sec = 300\n\
-                    stun_server = \"stun.example.org:3478\"\n";
+                    stun_server = \"stun.example.org:3478\"\n\
+                    stun_server2 = \"stun2.example.org:3478\"\n";
         let cfg = parse_daemon_toml(text).unwrap();
         let turn = cfg.turn.expect("turn section should parse");
         assert_eq!(turn.server, "turn.example.org:3478");
@@ -928,11 +938,24 @@ mod tests {
         assert_eq!(turn.password, "secret");
         assert_eq!(turn.refresh_interval_sec, 300);
         assert_eq!(turn.stun_server.as_deref(), Some("stun.example.org:3478"));
+        assert_eq!(turn.stun_server2.as_deref(), Some("stun2.example.org:3478"));
+    }
+
+    #[test]
+    fn turn_section_rejects_empty_stun_server2() {
+        // stun_server2 为空字符串 → 解析失败（与 stun_server 同规则）。
+        let text = "[network.turn]\n\
+                    server = \"turn.example.org:3478\"\n\
+                    realm = \"example.org\"\n\
+                    username = \"u\"\n\
+password=\"p\"\n\
+                    stun_server2 = \"\"\n";
+        assert!(parse_daemon_toml(text).is_err());
     }
 
     #[test]
     fn turn_section_defaults_for_optional_fields() {
-        // 缺失 refresh_interval_sec → 300；缺失 stun_server → None。
+        // 缺失 refresh_interval_sec → 300；缺失 stun_server/stun_server2 → None。
         let text = "[network.turn]\n\
                     server = \"turn.example.org:3478\"\n\
                     realm = \"example.org\"\n\
@@ -942,6 +965,7 @@ mod tests {
         let turn = cfg.turn.unwrap();
         assert_eq!(turn.refresh_interval_sec, 300);
         assert!(turn.stun_server.is_none());
+        assert!(turn.stun_server2.is_none());
     }
 
     #[test]

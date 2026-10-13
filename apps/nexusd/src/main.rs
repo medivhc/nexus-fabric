@@ -255,7 +255,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use nexus_fabric::{Driver, PeerId as FabricPeerId};
-use nexus_nat_traversal::LocalCandidates;
+use nexus_nat_traversal::{LocalCandidates, PortSample};
 // C1：权威 fabric 身份来自 daemon 自己的 `network.toml`（`peer_id` = 64-hex
 // ed25519 公钥）；解析发生在组合根，不在 NAT 运行时内部。
 use nexus_network::n1::{config::N1Config, N1PeerId};
@@ -412,7 +412,13 @@ struct NatSwitchRuntime {
     sw: Arc<nexusd::nat_switch::NatSwitching>,
     _driver: Arc<Driver>,
     stop: Arc<AtomicBool>,
+    /// STUN 端口样本滚动历史（供 D2 有界端口预测的 Δ 稳定性判定；上限
+    /// `MAX_PORT_SAMPLES`，由 5min 刷新循环追加）。
+    port_samples: Vec<PortSample>,
 }
+
+/// STUN 端口样本滚动历史上限（D2 判定最少需要 3 个；保留 8 个抗抖动）。
+const MAX_PORT_SAMPLES: usize = 8;
 
 impl NatSwitchRuntime {
     /// 从 `[network.turn]` 配置创建并启动运行时。
@@ -466,13 +472,14 @@ impl NatSwitchRuntime {
             sw,
             _driver: driver,
             stop: shutdown,
+            port_samples: Vec::new(),
         };
 
-        let stun_server = stun_server_addr(section);
+        let stun_servers = stun_servers(section);
         let worker = std::thread::Builder::new()
             .name("nexusd-nat-switch".to_string())
             .spawn(move || {
-                runtime.run(stun_server);
+                runtime.run(stun_servers);
             })
             .map_err(|e| format!("spawn nat-switch thread: {e}"))
             .ok()?;
@@ -480,7 +487,11 @@ impl NatSwitchRuntime {
     }
 
     /// Worker 主循环（单写入者；`stop` 置位后协作式退出）。
-    fn run(mut self, stun_server: Option<std::net::SocketAddr>) {
+    ///
+    /// `servers`: `(server1, server2)`；`server2` 为 `Some` 且与 `server1` 不同
+    /// 时做双服务器 NAT 类型检测（AC4），否则只做单服务器采样（`nat_type`
+    /// 保持 `Unknown`）。
+    fn run(mut self, servers: Option<(std::net::SocketAddr, Option<std::net::SocketAddr>)>) {
         // 1. 懒初始化 TURN 分配（失败 → WARN + Disabled，中继照常）。
         match self.turn.ensure_allocated() {
             Ok(relayed) => eprintln!("[nat-switch] TURN relayed={relayed} (warm backup)"),
@@ -489,16 +500,16 @@ impl NatSwitchRuntime {
 
         // 2. 初始 STUN 采样（失败不阻断）。
         let mut last_stun = std::time::Instant::now();
-        if let Some(server) = stun_server {
-            self.sample_and_update(server);
+        if let Some((s1, s2)) = servers {
+            self.sample_and_update(s1, s2);
         }
 
         // 3. 节奏循环：Refresh 保活 + 周期 STUN 重采样。
         while !self.stop.load(Ordering::Relaxed) {
             self.turn.refresh_if_needed();
-            if let Some(server) = stun_server {
+            if let Some((s1, s2)) = servers {
                 if last_stun.elapsed() >= nat_stun::STUN_REFRESH_INTERVAL {
-                    self.sample_and_update(server);
+                    self.sample_and_update(s1, s2);
                     last_stun = std::time::Instant::now();
                 }
             }
@@ -511,29 +522,59 @@ impl NatSwitchRuntime {
         eprintln!("[nat-switch] worker exited");
     }
 
-    /// 单次 STUN 采样并更新本地候选（AC4）。
-    fn sample_and_update(&mut self, server: std::net::SocketAddr) {
-        // 用完整映射获取公网 IP:port（srflx 候选），同时构造 PortSample 供预测器。
-        match self.stun.probe_once(server, nat_stun::STUN_PROBE_TIMEOUT) {
-            Ok(mapping) => {
-                let at_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                let sample = nexus_nat_traversal::PortSample {
+    /// STUN 采样并更新本地候选（AC4 + D2）。
+    ///
+    /// - `server2` 为 `Some` 时：双服务器映射对比做 NAT 类型检测
+    ///   （`detect_nat_type` 口径），`nat_type` 为真实检测结果；
+    /// - `server2` 为 `None` 时：只做单服务器采样，`nat_type` 保持 `Unknown`
+    ///  （如实标记，不做无依据的类型断言）。
+    /// 每次采样的公网端口追加到 `port_samples` 滚动历史（上限
+    /// `MAX_PORT_SAMPLES`），供 D2 有界端口预测做 Δ 稳定性判定。
+    fn sample_and_update(
+        &mut self,
+        server1: std::net::SocketAddr,
+        server2: Option<std::net::SocketAddr>,
+    ) {
+        // Tech debt (W-1)：时间源直接用 std；见模块级说明。
+        let at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let probed = match server2 {
+            Some(s2) => self.stun.probe_and_detect(server1, s2),
+            None => {
+                eprintln!(
+                    "[nat-switch] single STUN server; NAT-type detection skipped (nat_type=Unknown)"
+                );
+                self.stun
+                    .probe_once(server1, nat_stun::STUN_PROBE_TIMEOUT)
+                    .map(|m| (m, nexus_connectivity::nat::NatType::Unknown))
+            }
+        };
+        match probed {
+            Ok((mapping, nat_type)) => {
+                let sample = PortSample {
                     port: mapping.public.port(),
                     at_ms,
                 };
+                self.port_samples.push(sample);
+                if self.port_samples.len() > MAX_PORT_SAMPLES {
+                    let excess = self.port_samples.len() - MAX_PORT_SAMPLES;
+                    self.port_samples.drain(..excess);
+                }
                 let local = LocalCandidates {
                     host: nexusd::nat_switch::gather_host_candidates(&self._driver),
                     srflx: Some(mapping.public),
-                    srflx_stun: Some(server),
-                    nat_type: nexus_connectivity::nat::NatType::Unknown,
+                    srflx_stun: Some(server1),
+                    nat_type,
                 };
-                self.sw.set_local(local, vec![sample]);
+                self.sw.set_local(local, self.port_samples.clone());
                 eprintln!(
-                    "[nat-switch] STUN sample: public={} at_ms={} (local={})",
-                    mapping.public, sample.at_ms, mapping.local
+                    "[nat-switch] STUN sample: public={} nat_type={:?} samples={} (local={})",
+                    mapping.public,
+                    nat_type,
+                    self.port_samples.len(),
+                    mapping.local
                 );
             }
             Err(e) => eprintln!(
@@ -543,10 +584,28 @@ impl NatSwitchRuntime {
     }
 }
 
-/// 解析 STUN 服务器地址：`stun_server` 缺失时回落 `[network.turn].server`。
-fn stun_server_addr(section: &TurnSection) -> Option<std::net::SocketAddr> {
-    let s = section.stun_server.as_deref().unwrap_or(&section.server);
-    s.parse().ok()
+/// 解析 STUN 服务器地址（AC4 双服务器检测）。
+///
+/// 返回 `(server1, server2)`：
+/// - `server1` = `stun_server`，缺失时回落 `[network.turn].server`；
+/// - `server2` = `stun_server2`，且必须能解析、与 `server1` 不同，否则为 `None`
+///  （此时只做单服务器采样，`nat_type` 保持 `Unknown`）。
+/// `server1` 本身解析失败 → `None`（STUN 探测整体禁用）。
+fn stun_servers(
+    section: &TurnSection,
+) -> Option<(std::net::SocketAddr, Option<std::net::SocketAddr>)> {
+    let s1: std::net::SocketAddr = section
+        .stun_server
+        .as_deref()
+        .unwrap_or(&section.server)
+        .parse()
+        .ok()?;
+    let s2 = section
+        .stun_server2
+        .as_deref()
+        .and_then(|s| s.parse::<std::net::SocketAddr>().ok())
+        .filter(|s2| *s2 != s1);
+    Some((s1, s2))
 }
 
 /// Daemon 主流程：加载配置 → 装配子系统 → 启动线程 → 事件循环 → 优雅关闭。
