@@ -115,6 +115,10 @@ ack 放不进会话额度就意味着每次 list 都当场 CAPACITY——评审 
 `max_inflight_bytes_per_session ≤ max_buffered_amount`（in-flight 与共享预算由同一事件
 释放，高于预算的上限是够不到的死配置——取代了旧的 `×64` 魔数）、
 `max_browser_sessions ≤ max_sessions`、`max_read_handles ≥ max_sessions`、
+`lockout_after ≤ max_failures_per_source ≤ max_throttle_buckets × lockout_after`
+（低了就没有任何身份能先被锁、等于把两层键塌成一层；高于上界则"表满 → 全局窗口"这条
+大路永远先到，限额成了死配置——两条都有只违反自己的夹具。副作用是**缩小节流表的小
+夹具必须同时缩小这道额度**，否则拒启动，这不是 bug 而是要逼着夹具想清楚自己测哪道门）、
 任一数值上限不得为 0，**两个时长同样不得为 0**（`lockout_window = 0` 会让每次锁定
 写入即过期、`idle_timeout = 0` 会让会话刚建即回收——评审 r4 R4-NEW-1），
 且时长不得越过 24 h（它们参与 `Instant` 加法，病态大值不是"更宽松"而是把锁死推到
@@ -184,12 +188,23 @@ r5 R5-W-4 的诉求由**定长**满足而不是由"从不有界变有界"满足�
 写进实现，那会让 `locked.len() ≤ buckets.len()` 当场失效——第九片把拆除清状态整个
 去掉之后这条不变式重新成立。观测面补齐：`throttle_locks()`（锁表存活项数）与
 `throttle_buckets()` 一起让"表项有界"对**锁表那一半**也有可红对象（此前全仓不可读）。
-实测覆盖：关掉那支 ⇒ 63 单测全绿、auth-throttle 的 18 条期望字段无一翻转（这与上面的
+实测覆盖（本批 D 轮复验；树号与全量 bindings 只记在案卷《M1 第十一片》的 D 轮一节，契约里
+不写 sha，免得这一行自己改动就把它声称的那棵树弄没了）：关掉那支 ⇒ 72 单测全绿、auth-throttle 的 26 条期望字段无一翻转（这与上面的
 不可达性一致，不是"测试没覆盖到"）；把过期锁回收改成恒真 ⇒ 只有
 `expired_locks_are_reclaimed_instead_of_escalating_to_the_global_window` 红（评审 r7
 R7-W-3 改判 NOTE）。把两支并列写成"两道 fail-closed 机制"就是谎报。
 **桶与溢出计数都随窗口衰减**：每次写入前 `decay` 回收过期的锁、过期的桶与过期的
-溢出计数，一条身份静置满一个窗口就不再背失败，伪造量占住的桶位自己腾出来。同一个
+溢出计数，一条身份静置满一个窗口就不再背失败，伪造量占住的桶位自己腾出来。**衰减有四条腿，
+本批给每条都配了对象**（此前 `source_failures` 与 `source_locks` 那两条腿是零可红面——
+本轮把衰减族变异全量重跑才测出来，且**两条对偶测试的第一版自己也没杀伤力**：`M18` 在
+70 条那棵树上全绿、`M17` 连错两版（71 条与 72 条那两棵都全绿，都是"最后一条失败之后又睡
+过整整一个窗口"这同一个错），修到迭代之间才睡之后各自红 1 条）：
+桶衰减 = `lockout_requires_failures_inside_one_window` + `throttle_sustainable_failure_budget`，
+两层键锁回收 = `expired_locks_are_reclaimed_instead_of_escalating_to_the_global_window`，
+源账本衰减 = `source_ledger_budget_forgives_failures_from_older_windows`（慢滴不攒额度），
+源锁回收 = `expired_source_locks_are_reclaimed_instead_of_escalating_to_the_global_window`
+（不回收会把个体源锁偷偷升级成全局窗口，与 `locked` 那一半同形）。这四条腿的**内存**上界
+与**门槛**语义是两件事：前者由写侧回收保证、后者由这四条钉，别互相背书。同一个
 `lockout_window` 既是锁定持续的时间、也是失败被遗忘的周期（一物两用是有意选择：
 两个独立时钟只会让配置自相矛盾，也让 `validate()` 的交叉约束成倍增长）。于是
 维持 fail-closed 窗口需要攻击者**持续**注入新身份——停止注入后一个窗口内自愈，
@@ -205,7 +220,7 @@ R7-W-3 改判 NOTE）。把两支并列写成"两道 fail-closed 机制"就是�
 节流状态只由两处清理——成功认证（`succeed`）与窗口衰减（`decay`）。理由链条要写全，
 因为它不是一步想到的：
 (a) 最早的 `forget()` 连锁一起删 ⇒ 会话拆除即解锁；r7 实测把那个函数删空
-**谁都不红**（61 单测 + 90 条期望全绿），而它的注释写着"asserted by the probe"——
+**谁都不红**（r7 在第八片那棵树上实测：当时 61 单测 + 90 条期望全绿），而它的注释写着"asserted by the probe"——
 探针那条 `state_cleared_after_close` 跑在成功认证之后，成功早已由 `succeed` 清过桶，
 探针观测不到它。
 (b) 第九片第一版改成"只清计数、锁必须服完"。r8 指出这只关了一半：锁是由**计数**达到
@@ -213,13 +228,23 @@ R7-W-3 改判 NOTE）。把两支并列写成"两道 fail-closed 机制"就是�
 `close_session(session)` 不校验调用方是不是会话所有者 ⇒ 一个能猜整数的第三方每
 `lockout_after - 1` 次替被冒用的身份关一次会话，就能把计数按定义钉在阈值之下，
 锁**永远武装不了**，比解锁更省事。
-(c) 于是本批把拆除清状态整个去掉。`succeed` 已经覆盖了被删函数唯一的正当收益
-（回来的合法主体不该背着旧账），所以这不损失正向语义，还把上面 (a)(b) 那条不变式的
-前提补了回来。残余照实登记：`close_session` 今天仍能**终止别人的会话**，这一半要等
-M2 的归属检查（`src/gateway.rs` 那个 `close_session_id` 是 DataChannel 会话，
-与 `FileEngine` 无关，所以这条路径目前没有 wire 调用者）。两侧各有单测：
-`session_teardown_touches_no_throttle_state`、`idle_recycle_clears_no_throttle_state`。
-**显式声明的代价（四条，一条比一条贵）**：
+(c) 于是本批先把拆除清状态整个去掉（`succeed` 已经覆盖被删函数唯一的正当收益——
+回来的合法主体不该背着旧账——所以删它不损失正向语义），再把 (b) 那扇门本身关上：
+**`close_session(session, source)` 现在要求出示与会话相同的传输地址**，地址不符即
+`NOT_FOUND` 且**什么都不发生**——会话还在、别人的 `.part` 暂存文件还在、发送预算没被
+释放（归属检查之前，只猜到一个自增整数就能终止别人的上传，这是比"清计数"大得多的
+破坏面）。拒绝与"id 不存在"在返回值与审计行上**逐字同形**，所以这条入口不做会话
+存在性的 oracle；实现上这要求"先落审计行、再把会话放回原位"，因为 `record` 在
+principal 留空时会回查会话补上归属——顺序反了就变成泄露主体名的 oracle，本批的测试
+正是这样把自己的实现抓红的（`closing_another_peers_session_is_refused_and_leaves_it_intact`）。
+两侧各有单测：`session_teardown_touches_no_throttle_state`、
+`idle_recycle_clears_no_throttle_state`；契约面柱子：
+`foreign_close_refused_and_session_survives`。
+**残余（不是"已闭环"）**：源地址是**传输地址而不是凭证**。同一 NAT/同一出口下能看见
+彼此地址的调用方仍互相可判，真正的凭证化要等 M2 的 wire 层给每条会话发 capability。
+（`src/gateway.rs` 里的 `close_session_id` 是 DataChannel 的会话，与 `FileEngine` 无关，
+所以这条入口今天还没有 wire 调用者——那也意味着上述检查目前只有引擎与探针层面的效力。）
+**显式声明的代价（五条，一条比一条贵）**：
 (1) 全局窗口期内迟到的合法主体同样被拒——"内存有界"与"锁定不失效"之间选后者，
 不允许偷偷换成"只累加一个私有计数器、继续比令牌"的 fail-open（评审 r2 NEW-3）。
 按洪水节奏的拒止占空比可复算为
@@ -243,16 +268,69 @@ M2 的归属检查（`src/gateway.rs` 那个 `close_session_id` 是 DataChannel 
 衰减把可记录额度提高了 `lockout_after` 倍。聚合 QPS/成本的那道闸门属于 M2 的连接层
 限流与 RSS 计量，仍未闭环。额度侧（不是墙上速率）在产品路径上有可红对象：期望
 `throttle_sustainable_failure_budget`。
+**但这条聚合上界本批之后不再能被单个地址触及**：`max_failures_per_source`（默认 40）
+锁的是**地址本身**，一个源每窗口最多贡献 `max_failures_per_source` 条失败
+（40/60 s ≈ 0.67 次/秒，比"衰减之后、限额之前"的 5120 条/窗口小 128 倍）；要重新触及
+上面那条聚合上界，攻击者必须在**同一个窗口内**准备
+`ceil(max_throttle_buckets × lockout_after / max_failures_per_source)` = **128 个不同源地址**
+（5120/40，精确值）。但**武装全局窗口不需要那么多**：那道大路要的是
+`max_throttle_buckets + lockout_after` 条溢出失败 = 1029 条，而每个地址最多贡献 40 条，
+所以 `ceil(1029/40)` = **26 个地址**就够了；注入总条数没变，变的是必须同时握有的
+地址数。这两个数都要写出来——只写 128 会让人读成"表满那条大路被关上了"，而它仍然
+只要求一个低速率的多地址注入者（评审 r9 R9-N-8）。
+两道门在**表还有位置时**必须可区分：源限额锁的是地址本身，不升级为全体 fail-closed，
+所以契约面有两根柱子——`throttle_per_source_budget_scoped_to_address`（小夹具：6 条花完
+额度 ⇒ 只有 1 道源锁、第 6 条报 THROTTLED、同地址的新主体被拒、别的地址照常放行）与
+`single_address_cannot_fill_the_table`（产品尺寸引擎：一个地址灌 2048 条失败也只留下
+40 行，实测 `solo_rows_after_flood = 40`，且 `throttle_globally_locked()` 仍为 false）。
+`max_failures_per_source` 的内存口径：**四张表各自 ≤ `max_throttle_buckets`**（两层键的
+行、两层键的锁、源账本、源锁），键都是定长摘要。源锁表也有自己的门禁（评审 r9
+R9-W-2：它原先没有，于是"账本满 ⇒ 陌生地址第一条失败就锁"变成**每 1 次请求换 1 条
+表项**的内存放大路径，恰是最便宜的注入）——源锁表满时与两层键同一条大路一致：
+升级为全局窗口。所以"源限额绝不升级为全体 fail-closed"这句的准确形式是"**在源锁表
+还有位置时**不升级"，两条大路谁先满谁先全局。两支升级（`locked` 满与 `source_locks` 满）
+写的都是**同一个** `global_locked_until` 槽、且直写不取 max——这不是缺陷：所有 `until` 都等于
+各自 `now + lockout_window`，后写的 `now` 必然不早于先写的，所以覆盖只会延长不会缩短
+（评审 r10 R10-N-5；登记在此是因为这张表本批才有了第二条全局升级路径，后来的读者需要知道
+两支共用一个可覆盖的 Option 槽且覆盖方向安全）。断言面：
+`unknown_source_locked_on_first_failure_when_ledger_full`（账本满 ⇒ 陌生地址第一条就被锁）
+与 `throttle_source_locks() <= max_throttle_buckets`。
 (4) **归因残余（r7 R7-W-7）**：节流表里只剩摘要，"谁被锁了"只能靠审计环，而审计把
 principal 裁到 `AUDIT_FIELD_MAX_BYTES`——两条 principal 若前 256 字节相同且总长相同，
 在审计里渲染成同一串，它们的摘要却是两个桶。长身份面上归因精度只剩"前 256 字节 + 长度"
 这一近似类，反向也成立（看着同一条的两行可能来自两个桶）。
 这条取舍登记在契约面，不允许只写在案卷自述里。
+(5) **比较只有一个入口，且短路可验证（r10 自查 + r9 复核后改写，更早那版是过度声明）**：
+`authenticate` 的令牌比较全部经过 `FileEngine::token_eq`，计数也就挂在那一处。
+三件事的分层结论（**provenance 各自标明，r10 R10-N-2 抓到过这里两份文档打过架**）：
+删掉计数（P6）⇒ 单测与期望 `token_comparisons_short_circuit_when_locked` 红；删掉锁定
+预检（M10b）⇒ 在本批 D 轮复验树上是 **11 条单测红 + 11 条冻结期望翻转**——这两支由实现方
+在复验树上手跑（8a67e85 那一次是 10/10，多的那一条正是后来新增的地址表示漂移单测，它同样
+依赖"锁定先于比较"）。
+**绕开** `token_eq` 直接比较（F）实现方本轮**未**复跑，由评审 r10 在同一棵复验树上代跑
+证实：在这套 `[workspace.lints.rust] warnings = "deny"` 下 `token_eq` 成为 dead-code，
+**编译不过**（实测 `error: method `token_eq` is never used`，且 `cargo check
+--all-targets` 连 test profile 一起红），所以"多一个比较点"是构建期挡住的、不是靠测试
+（清单与逐条推导见 `.evidence/review-gateway-file-r9/findings.md` §3 与案卷第十一片的
+D 轮变异表）。
+这里要留一条诚实的痕迹：M10b 那个数字在本链出现过**五个**值——8 红/4 翻转（第十片正文）、
+8 红/5 翻转（同片变异表）、r9 静态重推 9/9、8a67e85 实测 10/10（r10 独立复现）、
+c5d0918 实测 11/11。`idle_recycle_clears_no_throttle_state` 一直是唯一不红的既有锁定测试，
+它的 THROTTLED 来自 `record_failure` 的武装返回值而非预检；9 → 10 的差集按名字逐条对过
+（对法：在 r9 读的那棵树里把它给的九个行号逐个回推到 fn 名），是为 R9-W-2 新增的那条源锁表
+门禁单测，而空地址那条在 M10b 下**不红**（守卫在预检之前）。按本链既定口径**以实测为准**，
+旧值保留在这里而不是抹掉。
+仍然**没有**被挡住的那一半要说清：把 `token_eq` **内部**的 `constant_time_eq` 换成
+`!=`（长度相关的比较）不会让任何测试红——时序侧信道只能由 `constant_time_eq` 自身的
+单测（区分长度/前缀）加评审目视负责，计数与入口唯一性都不背书这一点。
 **未证事项**：`lockout_window` 只校验"非 0"与"≤24h"，**没有下界**——把它配成毫秒级
-会同时缩短锁定和放宽涓流门槛（一物两用的直接后果）；principal/source 的长度在进入摘要
-前不设上界（任意长身份 ⇒ O(len) 摘要成本，r7 R7-N-8）；身份按字节精确比较，不做
-NFC/大小写归一，同一自然人可造任意多桶（r7 R7-N-9，与代价 (3) 同向）；`Throttle`
-六处硬编码 `Instant::now()`，时钟不可注入，因此本契约的三条时间夹具依赖真实墙钟
+会同时缩短锁定和放宽涓流门槛（一物两用的直接后果）；`max_failures_per_source` 同样
+只校验非 0 与两条交叉界，没有"相对 QPS 的下界"概念，因为它管的是爆炸半径不是速率；
+principal/source 的长度在进入摘要前不设上界（任意长身份 ⇒ O(len) 摘要成本，r7 R7-N-8）；
+身份按字节精确比较，不做 NFC/大小写归一，同一自然人可造任意多桶（r7 R7-N-9，
+与代价 (3) 同向；本批的源限额把"一个自然人"这一类收敛到地址粒度，但没有解决
+"同一地址下多个自然人"的反向问题）；`Throttle` 内部全部时间读取硬编码
+`Instant::now()`，时钟不可注入，因此本契约的时间夹具依赖真实墙钟
 （`sweep_idle(now)` 已示范可注入形态，登记为 M1 剩余项；flaky 面见
 `.agents/knowledge`）。本批不新增这些规则，也不谎称它们有测；它们随 `files` 配置接线
 一起在真实配置面上处理。
@@ -262,6 +340,11 @@ NFC/大小写归一，同一自然人可造任意多桶（r7 R7-N-9，与代价 
 **会话配额是准入检查**：`authenticate` 在全局 `max_sessions` 与单 peer
 `max_browser_sessions` 达到上限时直接 `CAPACITY_UNAVAILABLE` 拒（只在 `validate()`
 里两两比较等于没有上界，评审 r2 NEW-4），释放的额度必须可复用。
+**会话终止也要验归属**：`close_session(session, source)` 必须出示与该会话相同的传输
+地址，否则 `NOT_FOUND` 且**什么都不发生**——会话不被终止、别人的 `.part` 暂存文件不
+被删、其发送预算不被释放、节流状态不被清（评审 r8 R8-W-2 追到的根因面：会话号顺序自增，
+没有这一步时"猜一个整数"就能打断别人的上传）。未知 id 与不属于自己的 id 在返回值与
+审计行上逐字同形，不做会话存在性的 oracle；残余是地址不是凭证，凭证化等 M2。
 超预算回 `QUEUE_FULL`/`CAPACITY_UNAVAILABLE` 并**按消息条数显式计数**被拒绝或被挤掉的
 文件类消息（记"发生过一次挤占"等于没记：一条大消息与清空整条队列在账上必须可区分），
 终端（pty）字节流优先且零丢失。共享发送预算与单会话在途计数由**引擎自己持有**，
@@ -277,9 +360,24 @@ NFC/大小写归一，同一自然人可造任意多桶（r7 R7-N-9，与代价 
 评审 r2 NEW-2）。未知会话不得过账——无归属的条目没有释放路径；过账后的任何早退
 都必须回滚（r3 R3-W-1）。`settle_file` 只看队头，不得越过未落地的消息提前退额度
 （r3 R3-W-4）。`inflight_bytes == budget.file_buffered_for(session)` 是引擎自证的不变量。
-per-peer 配额以 `source` 为键，前提是 **wire 层送来的 `source` 不可被对端影响**
-（应为 DTLS 绑定的 transport address）；若该字符串可被对端拼散，配额就成了纸面约束
-（评审 r3 N-5，M2 接线时必须核）。
+`source` 这个键本批之后同时被**四件事**依赖：per-peer 会话配额、单源失败额度、源锁、
+以及 `close_session` 的归属证明。它们共享同一条前提，也必须一起登记：**wire 层送来的
+`source` 不可被对端影响**（应为 DTLS 绑定的 transport address），且**同一条会话在
+认证与终止两处必须是同一个字符串**——引擎既不解析也不归一化地址（不剥端口、不处理
+IPv6 方括号与 `%zone`），所以两种表示（带端口/不带、大小写、zone 差异）会让合法
+所有者关不掉自己的会话，只能等 `idle_timeout`；**这两种退化现在各有机验对象**（评审
+r10 R10-N-4：原先这整段是零对象的散文）——单测
+`address_representation_drift_arms_two_independent_source_locks` 钉归属那一格，冻结期望
+`address_representation_drift_splits_the_source_budget` 钉"一种写法一份额度"那一格。它们钉的是
+**后果**，不是给归一化背书：谁将来做了归一化，这两条会红，本段必须同步改；反过来，如果 `source` 里含临时端口且
+每连接都变，那么"单源额度"与"源锁"就被逐连接豁免，G15 代价 (3) 里那两个地址数
+（128 / 26）会退化成"128 / 26 个字符串"。空 `source` 在 `authenticate` 就被拒
+（它不能当归属凭证，见 `FileEngine::authenticate` 的注释）。这条前提早先只为配额
+登记过（评审 r3 N-5），现在四处共用它，M2 接线时必须逐处核。
+**归属证明的射程**：目前只有 `close_session` 有；`abort_upload`（删已暂存字节）、
+`remove`/`rename`/`commit_upload` 等按 id 动的动词仍不做归属检查，同一类"猜到自增整数
+即可破坏他人数据"的面保留到 M2 发 capability —— 不许把 G15/G16 里那句"拆会话不再
+清状态"读成这条面已经整体关闭。
 诚实边界：M1 的读是同步的（一次调用内 acquire+release），所以 `max_read_handles`
 在产品路径上当前**打不满**，防线由"读不落驻留"意外成立；注册表本身另有直接单测。
 OS 句柄层面（`/proc/self/fd`）与全局 RSS 上界仍未验（M1 剩余项）。

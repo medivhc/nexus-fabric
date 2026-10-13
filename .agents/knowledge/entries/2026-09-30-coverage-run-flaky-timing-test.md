@@ -55,9 +55,19 @@ flaky 面，改动它们时不要用"我这台机器跑绿了"当证据：
 - 单测 `lockout_requires_failures_inside_one_window`：窗口 200 ms，`sleep(window + window/2)`。
 - 探针 `auth-throttle` 的 e6/e8 夹具：窗口 100 ms 静置 400 ms（4× 余量），以及
   8 行 × 3 轮、轮间静置 150 ms（1.5× 余量，最薄的一处）。
+- 单测 `expired_source_locks_are_reclaimed_instead_of_escalating_to_the_global_window`：
+  窗口 200 ms，静置 `window * 2`（2× 余量）。它验的是"过期锁被回收"，所以慢只会让它
+  **更容易**通过；风险方向是变异逃逸而非假红。
+- 单测 `source_ledger_budget_forgives_failures_from_older_windows`：窗口 200 ms，两次
+  `sleep(window * 3 / 2)`（1.5× 余量，本仓目前最薄的时间夹具）。**它是这批里最容易误判的一条**：
+  节拍必须"最后一次失败正好越线、断言紧跟其后"，间隔放在迭代之间；写成"每轮之后睡"就会
+  让变异 M17 下刚武装的源锁在断言之前服完刑期 ⇒ 测试常绿但零杀伤力（连错两版，都是量出来的）。
+  时间夹具的"余量"不是效力的证明，效力只能靠变异实测——这条在此前只作为结论写着，本批
+  第一次由**测试自己的两次失效**把它钉住。
 
-`Throttle` 内部六处硬编码 `Instant::now()`，**时钟不可注入**，而 `FileEngine::sweep_idle(now)`
-已经示范了可注入形态——把时钟注入做进 `Throttle` 是这三处夹具脱开墙钟的唯一办法，
+`Throttle` 内部**每一个**时间读取都直接调 `Instant::now()`（这里故意不写数量：写死计数
+的散文会随着增删读点变成谎话，评审 r9 R9-N-9 就是抓的这一条），**时钟不可注入**，而 `FileEngine::sweep_idle(now)`
+已经示范了可注入形态——把时钟注入做进 `Throttle` 是上面这些夹具脱开墙钟的唯一办法，
 本批未做，记在 MODULE G15 的未证事项里。llvm-cov 插桩运行按本条目上面的实测先例
 约放大 20×，会把静置侧的余量吃掉——**但插桩放大的是"跑得更慢"，而 sleep 只有下界
 语义，所以放大带来的是假红风险（多睡不等于少睡）**。评审 r8 反过来核出另一件事：

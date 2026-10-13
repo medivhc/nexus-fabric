@@ -126,6 +126,16 @@ pub struct FileLimits {
     /// table. 旧措辞 "oldest buckets are merged into the global bucket" 从来没有
     /// 对应实现（评审 r7 R7-N-7）。
     pub max_throttle_buckets: usize,
+    /// Failures one **transport address** may contribute inside a window before
+    /// that address itself is locked (`Throttle::source_locks`). The pair key
+    /// (principal, source) means a single peer can otherwise mint
+    /// `max_throttle_buckets` distinct principals and spend the whole table's
+    /// guessing budget on identities it does not own（评审 r7 整改清单第 3 条 /
+    /// r8 R7-N-9：一个源就能占满额度池）。This bounds a peer's **blast radius**,
+    /// not the aggregate auth rate — that bound is `max_throttle_buckets ×
+    /// lockout_after / lockout_window` and belongs to M2's connection-layer
+    /// rate limiting (G15 代价 (3)).
+    pub max_failures_per_source: usize,
     /// SCTP `max_buffered_amount` budget shared by the control and file channels.
     pub max_buffered_amount: usize,
 }
@@ -149,6 +159,7 @@ impl Default for FileLimits {
             lockout_after: 5,
             lockout_window: Duration::from_secs(60),
             max_throttle_buckets: 1024,
+            max_failures_per_source: 40,
             max_buffered_amount: 128 * 1024,
         }
     }
@@ -166,6 +177,7 @@ impl FileLimits {
             || self.max_buffered_amount == 0
             || self.lockout_after == 0
             || self.max_throttle_buckets == 0
+            || self.max_failures_per_source == 0
         {
             return Err(FileError::new(
                 code::CONFIG,
@@ -220,6 +232,25 @@ impl FileLimits {
             return Err(FileError::new(
                 code::CONFIG,
                 "max_ack_bytes must be <= max_inflight_bytes_per_session, else a full-size ack can never be charged",
+            ));
+        }
+        // 单源失败额度必须落在"至少锁得住一个身份、又不至于比整张表还宽松"之间
+        //（G15：这是**爆炸半径**上限，不是 QPS 上限）。低于 `lockout_after` 的话，
+        // 任何身份都还没被锁、它的源就先被锁，等于把两层键塌成一层；高于
+        // `max_throttle_buckets × lockout_after` 的话，表满 → 全局窗口这条大路
+        // 永远先到，这条限额就是死配置。
+        if self.max_failures_per_source < self.lockout_after {
+            return Err(FileError::new(
+                code::CONFIG,
+                "max_failures_per_source must be >= lockout_after, else no identity can ever reach its own threshold",
+            ));
+        }
+        if self.max_failures_per_source
+            > self.max_throttle_buckets.saturating_mul(self.lockout_after)
+        {
+            return Err(FileError::new(
+                code::CONFIG,
+                "max_failures_per_source must be <= max_throttle_buckets * lockout_after, else the table-overflow gate always fires first and this one is dead config",
             ));
         }
         if self.max_browser_sessions > self.max_sessions {
@@ -686,6 +717,18 @@ struct BucketState {
 /// Bucket key: a fixed-size digest of the identity, see [`Throttle::identity_key`].
 type IdentityKey = [u8; 32];
 
+/// One transport address's failure ledger inside the current window.
+///
+/// 为什么需要它：节流键是 (主体,源) 的**对**，所以一个源地址可以为任意多个自己
+/// 不拥有的主体开桶，把 `max_throttle_buckets` 行额度池全部花掉（评审 r7 整改清单
+/// 第 3 条、r8 R7-N-9）。这条限额管的是**爆炸半径**：一个 peer 在一个窗口里最多
+/// 能贡献多少条失败，超过就锁这个源本身一个窗口。
+#[derive(Debug, Clone, Copy)]
+struct SourceLedger {
+    count: usize,
+    last: Instant,
+}
+
 /// `from` is at least one window in the past, so a failure that old starts a
 /// **new** window instead of advancing the old count. A free function rather than
 /// a method because `HashMap::retain` holds the map mutably and a `&self` helper
@@ -712,20 +755,37 @@ pub struct Throttle {
     /// rotating principals bought an unlimited number of guesses (评审 r2 NEW-3).
     global_locked_until: Option<Instant>,
     locked: HashMap<IdentityKey, Instant>,
+    /// Per-transport-address failure ledger (blast-radius limit, see [`SourceLedger`]).
+    source_failures: HashMap<[u8; 32], SourceLedger>,
+    /// Live locks on those addresses. A locked source cannot authenticate at all
+    /// during its window, so `succeed` can never be used to escape one.
+    ///
+    /// 这张表**也有**门禁（`arm_source`，r9 R9-W-2）：满了就升级为全局窗口，否则
+    /// "账本满 ⇒ 陌生地址第一条就锁"那条分支会变成每次请求换一条表项的内存放大。
+    source_locks: HashMap<[u8; 32], Instant>,
     max_buckets: usize,
+    max_source_failures: usize,
     lockout: Duration,
     lockout_after: usize,
 }
 
 impl Throttle {
-    pub fn new(max_buckets: usize, lockout_after: usize, lockout: Duration) -> Self {
+    pub fn new(
+        max_buckets: usize,
+        lockout_after: usize,
+        lockout: Duration,
+        max_source_failures: usize,
+    ) -> Self {
         Self {
             buckets: HashMap::new(),
             global: 0,
             global_last: None,
             global_locked_until: None,
             locked: HashMap::new(),
+            source_failures: HashMap::new(),
+            source_locks: HashMap::new(),
             max_buckets,
+            max_source_failures,
             lockout,
             lockout_after,
         }
@@ -766,6 +826,17 @@ impl Throttle {
         h.finalize().into()
     }
 
+    /// Address-only digest for the per-source ledger. Deliberately a **different**
+    /// key space from [`Throttle::identity_key`] (which mixes both halves), so a
+    /// source ledger can never alias a pair bucket.
+    fn source_key(source: &str) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(b"nexus-source");
+        h.update((source.len() as u64).to_le_bytes());
+        h.update(source.as_bytes());
+        h.finalize().into()
+    }
+
     /// Expire locks and the global window, and drop idle buckets.
     ///
     /// All three decays are the same statement: a failure only counts against the
@@ -784,6 +855,9 @@ impl Throttle {
         self.locked.retain(|_, until| *until > now);
         self.buckets
             .retain(|_, state| !stale(window, state.last, now));
+        self.source_failures
+            .retain(|_, ledger| !stale(window, ledger.last, now));
+        self.source_locks.retain(|_, until| *until > now);
         if let Some(until) = self.global_locked_until {
             if until <= now {
                 self.global_locked_until = None;
@@ -812,7 +886,13 @@ impl Throttle {
         // 全局窗口对**所有**主体生效。旧写法额外要求"该主体不在 buckets 里"，
         // 于是把表填满的那批 principal 恰好被豁免，成为永久绕开锁定点
         // （评审 r3 R3-NEW-2：换了人群的同一条 NEW-3）。
-        matches!(self.global_locked_until, Some(until) if until > now)
+        if matches!(self.global_locked_until, Some(until) if until > now) {
+            return true;
+        }
+        // 单源限额武装的地址锁：锁的是**这个传输地址**，不牵连别的源，也不升级为
+        // 全体拒服务（G15 代价 (3) 的爆炸半径那一道）。同样在令牌比较之前短路。
+        let skey = Self::source_key(source);
+        matches!(self.source_locks.get(&skey), Some(until) if *until > now)
     }
 
     /// Record a failure; returns true if this pushed the identity — or the
@@ -821,6 +901,9 @@ impl Throttle {
         let now = Instant::now();
         self.decay(now);
         let key = Self::identity_key(principal, source);
+        // 单源额度先记账：两层键的哪一条分支都不能豁免它（一个地址把失败摊到
+        // 很多主体上，正是这道限额要抓的形状）。
+        let source_armed = self.charge_source(source, now);
         if self.buckets.len() >= self.max_buckets && !self.buckets.contains_key(&key) {
             // `decay()` above already zeroed `global` when `global_last` is a full
             // window old, which is exactly why a flood must be **sustained** to
@@ -833,11 +916,11 @@ impl Throttle {
                 }
                 return true;
             }
-            return false;
+            return source_armed;
         }
         // `decay` 已经用**同一个** `now`、同一个窗口谓词丢掉了过期行，所以活下来的
         // 行按定义就在当前窗口内：在这里再判一次 `stale` 是结构上不可达的冗余分支
-        // （本批实测：把那条守卫改成恒真，61 条单测照样全绿 ⇒ 它零杀伤力）。衰减只有
+        // （第八片实测：把那条守卫改成恒真，当时 61 条单测照样全绿 ⇒ 它零杀伤力）。衰减只有
         // `decay` 一个机制，单点可杀（变异 M1）。
         let count = match self.buckets.get(&key).copied() {
             Some(previous) => previous.count.saturating_add(1),
@@ -867,7 +950,9 @@ impl Throttle {
             // 第八片删行不删锁的写法会把这条不变式弄假，第九片把删行整个去掉之后它才
             // 重新成立，且现在有了新的观测面：`Throttle::locks()`/`FileEngine::throttle_locks()`
             // （锁表大小此前全仓不可读，"表项有界"对锁表那一半是零可红对象，r8 R8-W-3）。
-            // 实测：把这支整个关掉 ⇒ 63 单测全绿、auth-throttle 的 18 条冻结期望字段
+            // 实测（本批 D 轮复验：72 单测 / 26 条本场景期望；树号与全量 bindings 只记在
+            // 案卷《M1 第十一片》的 D 轮一节，这里不写 sha，免得这行注释自己改动就把它
+            // 声称的那棵树弄没了）：把这支整个关掉 ⇒ 72 全绿、26 条冻结期望字段
             // 无一翻转（这与上面的不可达性一致，不是"测试没覆盖到"）；把 `decay` 的
             // 过期锁回收改成恒真 ⇒ 只有
             // `expired_locks_are_reclaimed_instead_of_escalating_to_the_global_window` 红，
@@ -882,7 +967,72 @@ impl Throttle {
             }
             return true;
         }
+        // 这一条失败没把这个**身份**推到阈值，但可能刚好花完它所在地址的额度 ⇒
+        // 调用者要拿到"被锁了"的真值，否则 authenticate 会把一次已经武装源锁的尝试
+        // 当成普通拒绝继续发令牌比较。
+        source_armed
+    }
+
+    /// Charge one failure to its transport address.
+    ///
+    /// 返回 `true` 表示这次记账**武装了源锁**（`authenticate` 据此回 THROTTLED）。
+    /// 额度位本身与两层键同一条原则：账本满时不给陌生地址建行而是**当场锁它**
+    /// （fail-closed），而 `arm_source` 对锁表做同样的事——满了就升级为全局窗口。
+    /// 所以节流结构的内存上界是**四张表各自 ≤ `max_throttle_buckets` + 定长键 +
+    /// `BucketState`**，不是"见过多少个源"（r9 R9-W-2 之前这句是假的：源锁表没门禁）。
+    fn charge_source(&mut self, source: &str, now: Instant) -> bool {
+        let skey = Self::source_key(source);
+        let count = match self.source_failures.get(&skey).copied() {
+            Some(previous) => previous.count.saturating_add(1),
+            None if self.source_failures.len() >= self.max_buckets => {
+                // 账本满：陌生地址的第一条失败就锁它（fail-closed），不给它建行。
+                // 返回值用不上：无论锁有没有落地，这次尝试都按"已锁"上报。
+                let _ = self.arm_source(skey, now);
+                return true;
+            }
+            None => 1,
+        };
+        self.source_failures
+            .insert(skey, SourceLedger { count, last: now });
+        if count >= self.max_source_failures {
+            // 额度花完。**只有锁真的落地才销账**——与 pair 侧同口径（r10 R10-W-1：上一版
+            // 只对齐了"返回值"那一半，`remove` 仍是无条件执行，于是 `lock_until` 取不到
+            // `until` 时源侧既没落地锁、账本又清空，等于白送一整份新额度；pair 侧在同样
+            // 那条分支上保留超限桶行，下一条失败当场再武装）。
+            // 上一版注释把"先算锁、再删行"说成已经修掉了白送额度重置，那是把没做完的写成
+            // 做完了；这次才是把状态半闭上。该分支经 `FileLimits::validate`（窗口上限 24h）
+            // 加上 `lock_until` 自带的一小时回退，实践**不可达**，因此这里没有测试对象——
+            // 别把这两句读成有测。
+            if self.arm_source(skey, now) {
+                self.source_failures.remove(&skey);
+            }
+            return true;
+        }
         false
+    }
+
+    /// Lock one transport address for a window, with the **same** two guarantees
+    /// the pair table gives: the table cannot grow without bound, and a clock
+    /// edge that yields no `until` still reports "armed" rather than falling back
+    /// to "go ahead and compare tokens" (`lock_until`'s own promise).
+    ///
+    /// 源锁表必须自己也有门禁，这点是 r9 R9-W-2 抓到的：上面"账本满 ⇒ 陌生地址
+    /// 第一条失败就锁"这条分支，若锁表无界，就成了**每 1 次请求换 1 条表项**的
+    /// 内存放大路径——恰恰是最便宜的那种注入。表满时与两层键同一条大路：升级为
+    /// 全局窗口（代价是那一窗口对所有人 fail-closed，与 `locked` 满时同形）。
+    ///
+    /// 返回值的意思是"**有没有落下状态**"（单源锁或全局窗口），不是"这次是不是该按锁定
+    /// 处理"——后者恒为真，是 `lock_until` 自己的承诺。调用方据此决定要不要销账。
+    fn arm_source(&mut self, skey: [u8; 32], now: Instant) -> bool {
+        let Some(until) = self.lock_until(now) else {
+            return false;
+        };
+        if self.source_locks.len() >= self.max_buckets {
+            self.global_locked_until = Some(until);
+            return true;
+        }
+        self.source_locks.insert(skey, until);
+        true
     }
 
     /// Live rows in the table. 观测口径按窗口过滤（读侧不跑 `decay`，它是 `&self`），
@@ -941,6 +1091,25 @@ impl Throttle {
         self.locked.values().filter(|until| **until > now).count()
     }
 
+    /// Live per-source locks (blast-radius gate, G15 代价 (3) 的配套限额).
+    pub fn source_locks_live(&self) -> usize {
+        let now = Instant::now();
+        self.source_locks
+            .values()
+            .filter(|until| **until > now)
+            .count()
+    }
+
+    /// Live per-source ledgers, i.e. how many addresses are currently spending
+    /// their allowance inside this window.
+    pub fn source_ledgers(&self) -> usize {
+        let (window, now) = (self.lockout, Instant::now());
+        self.source_failures
+            .values()
+            .filter(|ledger| !stale(window, ledger.last, now))
+            .count()
+    }
+
     /// The **only** explicit clearing path: a successful authentication drops this
     /// identity's failure count (an armed lock can never reach this line, because
     /// `authenticate` short-circuits on `is_locked` first — that is what keeps
@@ -952,11 +1121,12 @@ impl Throttle {
     ///    两行删空**谁都不红**，而它的注释写着"asserted by the probe"——那条
     ///    `state_cleared_after_close` 跑在成功认证之后，成功早已由这里清过桶，
     ///    探针根本观测不到那个函数。
-    /// 2. 第八片把行为翻成"只清计数、锁必须服完"，理由是会话号顺序自增、
-    ///    `close_session` 在 M2 接线前没有归属检查，"拆会话即解锁"等于无限猜测预算。
+    /// 2. 第八片把行为翻成"只清计数、锁必须服完"，理由是会话号顺序自增、而当时
+    ///    `close_session` 根本不校验调用方是不是会话所有者，"拆会话即解锁"等于
+    ///    无限猜测预算。
     /// 3. r8 指出翻得不够：锁是由**计数**达到阈值才武装的，而清计数走的还是同一扇
-    ///    没有归属检查的门 ⇒ 攻击者每 `lockout_after - 1` 次猜密替被冒用的身份关一次
-    ///    会话，就把计数按定义钉在阈值之下，锁**永远不武装**——比解锁更省事。
+    ///    当时没有归属检查的门 ⇒ 攻击者每 `lockout_after - 1` 次猜密替被冒用的身份
+    ///    关一次会话，就把计数按定义钉在阈值之下，锁**永远不武装**——比解锁更省事。
     ///
     /// 于是这条路径整个被删掉（函数不存在了）：节流状态只由"这里的 `succeed`"与
     /// "窗口衰减 `decay`"两途清理。`succeed` 已经覆盖了那个被删函数唯一的正当收益
@@ -964,10 +1134,16 @@ impl Throttle {
     /// "锁不会比行多"的前提补回来：行只能因衰减或因成功而消失，而成功在有活锁时
     /// 根本走不到这里 ⇒ 孤锁没有来源。
     ///
-    /// 残余照实登记：`close_session` 仍然没有归属检查（M2 的活），所以今天它至少还能
-    /// **终止别人的会话**；这项能力不再连带清除那个身份的节流状态。两侧都有断言：
+    /// 同批把**归属检查**补上（`close_session(session, source)` 必须出示与会话相同的
+    /// 传输地址），所以"替别人关会话"这一支从入口上就断了——**只这一支**：同一个
+    /// crate 里 `abort_upload` 等按 id 删除暂存字节的动词仍不做归属证明，同类破坏面
+    /// 原样保留（G16 明写这条边界，别把它读成"所有自增号入口都关上了"）。仍登记的
+    /// 残余还有：地址是传输地址而不是凭证，同一 NAT 下能看见彼此地址的调用方互相
+    /// 可判，凭证化要等 M2 给每条会话发 capability。两侧都有断言：
     /// `session_teardown_touches_no_throttle_state`、
-    /// `idle_recycle_clears_no_throttle_state`。
+    /// `idle_recycle_clears_no_throttle_state`；入口本身由
+    /// `closing_another_peers_session_is_refused_and_leaves_it_intact` 与冻结期望
+    /// `foreign_close_refused_and_session_survives` 钉住。
     pub fn succeed(&mut self, principal: &str, source: &str) {
         let key = Self::identity_key(principal, source);
         self.buckets.remove(&key);
@@ -1219,6 +1395,9 @@ pub struct FileEngine {
     throttle: Throttle,
     audit: VecDeque<AuditRecord>,
     audit_dropped: usize,
+    /// Incremented **only** where `constant_time_eq` runs (see
+    /// `FileEngine::token_comparisons`).
+    token_compares: usize,
     token: String,
     /// G16 共享发送预算。引擎**自己持有**它，页/ack 出门前必须先过账；
     /// 之前预算只在探针里手搓一份，`quota-backpressure` 案证明的是模型
@@ -1260,6 +1439,7 @@ impl FileEngine {
             limits.max_throttle_buckets,
             limits.lockout_after,
             limits.lockout_window,
+            limits.max_failures_per_source,
         );
         Ok(Self {
             limits,
@@ -1271,6 +1451,7 @@ impl FileEngine {
             throttle,
             audit: VecDeque::new(),
             audit_dropped: 0,
+            token_compares: 0,
             token,
             budget: SendBudget::new(buffered),
         })
@@ -1329,6 +1510,45 @@ impl FileEngine {
     /// 只有右半边有观测面，r8 R8-W-3）。
     pub fn throttle_locks(&self) -> usize {
         self.throttle.locks()
+    }
+
+    /// Live per-source locks and the addresses currently spending their allowance
+    /// (G15 的单源限额观测面)。
+    pub fn throttle_source_locks(&self) -> usize {
+        self.throttle.source_locks_live()
+    }
+
+    pub fn throttle_source_ledgers(&self) -> usize {
+        self.throttle.source_ledgers()
+    }
+
+    /// The **only** place that compares the presented token against the config
+    /// token, and the only place that advances `token_compares`. Folding the two
+    /// together is what makes the counter a real witness: routing the comparison
+    /// through anything else (e.g. `presented != self.token`) stops the counter and
+    /// therefore goes red, which it did not while the increment sat on a separate
+    /// line next to the call（r10 自查抓到的过度声明）.
+    ///
+    /// 更强的那一半其实是构建期给的：绕开这个函数直接比较，`token_eq` 就变成
+    /// never-used，`warnings = "deny"` 下**编不过**（实测 F 变异）。反过来，把本函数
+    /// **内部**的 `constant_time_eq` 换成 `!=` 不会被任何测试抓到——长度相关的时序
+    /// 仍只能由 `constant_time_eq` 自己的单测加评审目视负责，别把计数当时序证明。
+    fn token_eq(&mut self, presented: &str) -> bool {
+        self.token_compares = self.token_compares.saturating_add(1);
+        constant_time_eq(presented.as_bytes(), self.token.as_bytes())
+    }
+
+    /// How many times `authenticate` actually ran the constant-time token
+    /// comparison. This counter exists to make contract sentences machine
+    /// checkable instead of prose-only（评审 r1/r8 都登记过："没有任何断言约束
+    /// authenticate 真的用 `constant_time_eq`"）：
+    /// (1) 一次可比较令牌的尝试 ⇒ 恰好 +1；
+    /// (2) 锁定/源锁短路掉的尝试 ⇒ **不**增加，这正是"锁内不做令牌比较"的证据。
+    ///
+    /// 删掉锁定预检会让这条与冻结期望 `token_comparisons_short_circuit_when_locked`
+    /// 变红；试图绕开 `token_eq` 直接比较则根本编不过（dead code，见上面的 F 变异实测）。
+    pub fn token_comparisons(&self) -> usize {
+        self.token_compares
     }
 
     /// Read-only view of the shared send budget (probe/diagnostics).
@@ -1455,11 +1675,27 @@ impl FileEngine {
         source: &str,
         presented: &str,
     ) -> FileResult<u64> {
+        // `source` 在本批被升格成两样东西的凭证材料（`close_session` 的归属证明、
+        // 单源额度的键），所以空串不能当身份用：把它当成一条正常失败会留下一整桶
+        // ("", "") 的节流状态，谁都能往里灌失败、也谁都能替它"还清"。引擎不解析也不
+        // 归一化传输地址（见 `FileLimits::max_failures_per_source` 与 G16 的前提段），
+        // 但空值是唯一一种"必然无法验归属"的输入，直接在门外挡掉。
+        if source.is_empty() {
+            self.record(0, principal, "", "authenticate", "", code::AUTH_DENIED);
+            return Err(FileError::new(
+                code::AUTH_DENIED,
+                "a peer transport address is required",
+            ));
+        }
         if self.throttle.is_locked(principal, source) {
             self.record(0, principal, "", "authenticate", "", code::THROTTLED);
             return Err(FileError::new(code::THROTTLED, "locked out"));
         }
-        if !constant_time_eq(presented.as_bytes(), self.token.as_bytes()) {
+        // 比较必须走 `token_eq`：计数点在**唯一**那个调用 `constant_time_eq` 的地方，
+        // 所以"绕过它"与"少一次比较"是同一件事，测试红得下来（r10 自查：计数原先
+        // 挂在比较之前的一行上，把 `constant_time_eq(...)` 换成 `!=` 仍然全绿，
+        // 那句"换掉就会红"是过度声明）。
+        if !self.token_eq(presented) {
             let locked = self.throttle.record_failure(principal, source);
             self.record(
                 0,
@@ -1529,33 +1765,73 @@ impl FileEngine {
         Ok(id)
     }
 
-    /// Tear a session down. `source` is **not** a parameter on purpose
-    /// (评审 r2 N-8): clearing a throttle bucket by a caller-supplied source only
-    /// works if the caller happens to pass the right one, so the session's own
-    /// recorded source is used and a peer cannot wipe somebody else's lockout.
-    pub fn close_session(&mut self, session: u64) {
-        match self.sessions.remove(&session) {
-            Some(s) => {
-                for st in s.streams.into_values() {
-                    let _ = std::fs::remove_file(&st.part_path);
-                }
-                // 会话没了，它占着的预算条目必须一起释放，否则一次断线就把全节点
-                // 文件类发送预算永久钉死（r2 NEW-2 第 2 点）。
-                self.budget.release_session(session);
-                // 节流状态**一个都不清**（r7 R7-W-2 → r8 R8-W-2 的两轮修正，完整理由
-                // 写在 `Throttle::succeed` 上）：会话号顺序自增且 M2 前 `close_session`
-                // 没有归属检查，所以拆除既不能删锁（=解锁），也不能删计数
-                // （=把计数按定义钉在阈值之下，锁永远武装不了）。
-                // 今天它仍能终止别人的会话——这一半要等 M2 的归属检查，已登记。
-                self.record(session, &s.principal, "", "close_session", "", "OK");
-            }
+    /// Close one file session. The caller must present the **same transport
+    /// address** the session was authenticated from; otherwise the call is
+    /// indistinguishable from closing an unknown id.
+    ///
+    /// 历史：r2 N-8 的处置曾是"`source` **故意不是参数**"——因为那时唯一的用途是
+    /// "拆会话顺手清节流桶"，让调用方传地址等于让别人替别人清账。本批把它反过来：
+    /// 参数回来了，但用途变成**验证归属**，而节流状态彻底不从这条路清（见
+    /// `Throttle::succeed` 的三段历史）。为什么必须反过来（r8 R8-W-2 追到的根因入口）：
+    /// 会话号由 `next_session` 顺序自增、可枚举，在这个检查之前 `close_session(id)`
+    /// 会**删掉别人的 `.part` 暂存文件**并释放其发送预算——只猜到一个整数就能打断
+    /// 别人正在进行的上传，"替别人清计数"的后门也挂在这同一个入口上。
+    ///
+    /// 三条必须一起读的口径与残余：
+    /// - **同形性只管返回值与审计行**：未知 id 与"存在但不属于你"两分支的
+    ///   `record` 六格入参、返回码、消息字面量都相同（顺序敏感：审计行必须写在把会话
+    ///   `insert` 回去**之前**，否则 `record` 回查会话补 principal 就泄露了主体名）。
+    ///   这不是"完全不可区分"——被拒分支多一次 `sessions.insert`，时序上未必同形，
+    ///   地址比较本身也不是常数时间（这里与令牌比较口径不同：泄露的是"这个 id 属于
+    ///   这个地址"，而调用方已经知道自己在猜谁的地址；令牌那条不一样）。同形性有两根
+    ///   柱子：单测 `closing_another_peers_session_is_refused_and_leaves_it_intact` 与冻结
+    ///   期望 `foreign_close_audit_shape_is_indistinguishable`（点名写在这是为了读 doc 的
+    ///   人能直接跳到对象，不要求读者再去翻案卷）。
+    /// - **射程只到"替别人关会话"这一支**：同一个 crate 里 `abort_upload`（删已暂存
+    ///   字节）等动词仍只看 session id，不做归属证明，同类破坏面原样保留；G16 明写了
+    ///   这一条边界，别把这里读成"所有自增号入口都关上了"。
+    /// - **引擎不归一化地址**：auth 与 close 两处必须由**同一个** transport-address
+    ///   供给点给出同一字符串，否则合法所有者关不掉自己的会话（等 `idle_timeout`）；
+    ///   空串在 `authenticate` 就被拒。带不带端口、IPv6 方括号/zone 这类表示差异
+    ///   会同时影响归属检查、单源额度与 per-peer 配额——M2 接线时必须核（G16 前提段）。
+    pub fn close_session(&mut self, session: u64, source: &str) -> FileResult<()> {
+        let Some(s) = self.sessions.remove(&session) else {
             // 未知会话号也要留一行：否则"关不掉"在审计里是隐形的，G21 说的
             // "漏记在结构上不可发生"就只对已知会话成立（评审 r5 N-8）。
-            None => {
-                let label = session.to_string();
-                self.record(session, "", "", "close_session", &label, code::NOT_FOUND);
-            }
+            let label = session.to_string();
+            self.record(session, "", "", "close_session", &label, code::NOT_FOUND);
+            return Err(FileError::new(
+                code::NOT_FOUND,
+                "no such file session for this peer",
+            ));
+        };
+        if s.source != source {
+            // 顺序要紧：`record` 在调用方留空 principal 时会**回查会话**补上归属
+            // （F4 那一片为审计归因加的），所以必须先落审计行、再把会话放回去。
+            // 否则"不存在的 id"那行的 principal 是空串，而"存在但不属于你"那行会被
+            // 补成受害者主体名 ⇒ 这条入口自己变成会话枚举的 oracle。测试
+            // `closing_another_peers_session_is_refused_and_leaves_it_intact` 就是在
+            // 我第一版实现上把这一格抓红的（左 "" 右 "victim"）。
+            let label = session.to_string();
+            self.record(session, "", "", "close_session", &label, code::NOT_FOUND);
+            // 原样放回：没删会话、没删 `.part`、没释放预算、没碰节流状态。
+            self.sessions.insert(session, s);
+            return Err(FileError::new(
+                code::NOT_FOUND,
+                "no such file session for this peer",
+            ));
         }
+        for st in s.streams.into_values() {
+            let _ = std::fs::remove_file(&st.part_path);
+        }
+        // 会话没了，它占着的预算条目必须一起释放，否则一次断线就把全节点
+        // 文件类发送预算永久钉死（r2 NEW-2 第 2 点）。
+        self.budget.release_session(session);
+        // 节流状态**一个都不清**（r7 R7-W-2 → r8 R8-W-2 的两轮修正，完整理由
+        // 写在 `Throttle::succeed` 上）：拆除既不能删锁（=解锁），也不能删计数
+        // （=把计数按定义钉在阈值之下，锁永远武装不了）。
+        self.record(session, &s.principal, "", "close_session", "", "OK");
+        Ok(())
     }
 
     /// Sweep idle sessions (G21). Returns recycled ids.
@@ -2749,7 +3025,7 @@ mod tests {
             "naive single-canonicalize resolver was supposed to escape: {naive:?}"
         );
         assert!(std::fs::read(outside.join("secret.txt")).is_ok());
-        e.close_session(s);
+        e.close_session(s, "loopback").unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&outside);
     }
@@ -2788,7 +3064,7 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains("nexus-part"))
             .collect();
         assert_eq!(leftovers.len(), 0);
-        e.close_session(s);
+        e.close_session(s, "loopback").unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2873,7 +3149,7 @@ mod tests {
             0,
             "refused publish must not leave .part behind"
         );
-        e.close_session(s);
+        e.close_session(s, "loopback").unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2901,11 +3177,19 @@ mod tests {
         );
         // a different source is not locked by the attacker's bucket
         assert!(e.authenticate("attacker", "10.0.0.2", "s3cret").is_ok());
-        // forged volume must not grow the table linearly
+        // forged volume must not grow the table linearly.
+        // 地址必须轮换：全灌在一个地址上时，本批新加的单源额度会让表只长到 40 行，
+        // 那句 `<= max_throttle_buckets` 就变成"永远离上界很远"的空断言（r9 R9-N-1）。
+        // 顺带断言表**确实被灌满**，这条才有上下两侧。
         for i in 0..(e.limits().max_throttle_buckets * 3) {
             let forged = format!("p{i}");
-            let _ = e.authenticate(&forged, "10.0.0.9", "wrong");
+            let slot = i / 32;
+            let addr = format!("10.7.{}.{}", slot / 256, slot % 256);
+            let _ = e.authenticate(&forged, &addr, "wrong");
         }
+        assert_eq!(e.throttle_buckets(), e.limits().max_throttle_buckets);
+        assert!(e.throttle_overflow() > 0, "表满之后必须走溢出计数这条路");
+        assert!(e.throttle_globally_locked());
         assert!(e.throttle_buckets() <= e.limits().max_throttle_buckets);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3041,6 +3325,9 @@ mod tests {
         let l = FileLimits {
             max_throttle_buckets: 8,
             lockout_after: 2,
+            // 额度取交叉规则允许的上界 8×2，好让下面的单源洪水（12 条）仍然走
+            // 两层键的溢出分支，而不是先撞上源锁。
+            max_failures_per_source: 16,
             lockout_window: window,
             max_sessions: 8,
             max_browser_sessions: 8,
@@ -3207,7 +3494,7 @@ mod tests {
         // 评审 r6 NOTE-4（owner 裁决：节流键改成身份摘要）。旧写法把两半各自裁到
         // 固定长度（128 B），所以碰撞条件是"前 128 字节相同 **且总长相同**"——夹具
         // 必须同时满足这两条，否则测的是字符串不等而不是摘要。
-        let mut t = Throttle::new(16, 3, Duration::from_secs(60));
+        let mut t = Throttle::new(16, 3, Duration::from_secs(60), 12);
         let base = "b".repeat(200);
         let victim = format!("{base}aaaa");
         let forged = [
@@ -3234,7 +3521,7 @@ mod tests {
         assert_eq!(t.buckets(), forged.len() + 1, "四条身份必须各自成桶");
         assert_eq!(t.failure_count(), 3 * t.lockout_after + 1);
         // 长度前缀缺了就会碰撞的拼接面：("ab","c") 与 ("a","bc") 是同一段拼接。
-        let mut u = Throttle::new(16, 2, Duration::from_secs(60));
+        let mut u = Throttle::new(16, 2, Duration::from_secs(60), 8);
         for _ in 0..u.lockout_after {
             let _ = u.record_failure("ab", "c");
         }
@@ -3265,17 +3552,22 @@ mod tests {
         let l = FileLimits {
             max_throttle_buckets: 2,
             lockout_after: 2,
+            // 小表必须带一个小源额度（G12 的交叉规则：`max_failures_per_source` 不得
+            // 超过 `max_throttle_buckets × lockout_after`，否则它永远轮不到开火）。
+            // 也正因为额度只有 4，下面两条身份各用**自己的**源地址：共用一个地址的话，
+            // 第 4 条失败会先武装源锁，测试就变成在测源额度而不是个体锁定。
+            max_failures_per_source: 4,
             lockout_window: window,
             ..Default::default()
         };
         let root = SandboxRoot::open("downloads", &dir, false).unwrap();
         let mut e = FileEngine::new(l, vec![root], "s3cret").unwrap();
-        for who in ["first", "second"] {
+        for (who, addr) in [("first", "10.0.0.20"), ("second", "10.0.0.22")] {
             for _ in 0..e.limits().lockout_after {
-                let _ = e.authenticate(who, "10.0.0.20", "wrong");
+                let _ = e.authenticate(who, addr, "wrong");
             }
             assert_eq!(
-                e.authenticate(who, "10.0.0.20", "s3cret").unwrap_err().code,
+                e.authenticate(who, addr, "s3cret").unwrap_err().code,
                 code::THROTTLED
             );
         }
@@ -3304,6 +3596,84 @@ mod tests {
             "已过期身份不得被死锁项继续拦在门外"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expired_source_locks_are_reclaimed_instead_of_escalating_to_the_global_window() {
+        // 这条是本轮把**衰减那一族全量重跑**时测出来的洞：把 `source_locks.retain` 改成恒真
+        // （变异 M18）之后 70 条单测全绿、26 条冻结期望无一翻转——"源锁表项有界"这句在
+        // **过期回收**那一半原本是零可红对象，与 r8 R8-W-3 抓 `locked` 那一半的形状一模一样。
+        // 危害也同形：过期项不回收 ⇒ 满表分支把**个体源锁**偷偷换成**全局 fail-closed**，
+        // 一批早就停手的地址从此永久决定新地址的待遇。
+        let window = Duration::from_millis(200);
+        let mut t = Throttle::new(2, 3, window, 3);
+        for (who, addr) in [("a", "10.0.0.1"), ("b", "10.0.0.2")] {
+            for _ in 0..3 {
+                t.record_failure(who, addr);
+            }
+        }
+        assert!(
+            !t.is_locked("bystander", "10.0.0.9"),
+            "夹具前提：两道源锁各自成立，还没有升级到全局"
+        );
+        std::thread::sleep(window * 2);
+        for _ in 0..3 {
+            t.record_failure("c", "10.0.0.3");
+        }
+        assert!(
+            !t.is_locked("bystander", "10.0.0.9"),
+            "过期源锁必须被回收；否则满表分支把它升级成全局窗口（变异 M18 在这一格红）"
+        );
+        assert!(
+            t.is_locked("c", "10.0.0.3"),
+            "第三条地址自己的源锁要成立，不能只靠回收把锁定一起抹掉"
+        );
+        assert!(
+            !t.is_locked("a", "10.0.0.1"),
+            "静置满一个窗口的旧身份不再背源锁（G15 的衰减语义）"
+        );
+    }
+
+    #[test]
+    fn source_ledger_budget_forgives_failures_from_older_windows() {
+        // 这条同样是**测出来的洞**：把源账本的衰减关掉（变异 M17）之后全绿、26 条冻结期望
+        // 无一翻转——也就是说"单源额度是一个窗口内的额度"这句在源侧原本没有对象
+        // （pair 侧早有 `lockout_requires_failures_inside_one_window` 钉住同一形状）。
+        // 危害不是内存而是**门槛**：不衰减的话，一个每窗口只滴一条失败的地址会跨窗口
+        // 攒满额度被锁；衰减的语义是"慢滴不攒账"，所以那种节奏不该被锁。
+        let window = Duration::from_millis(200);
+        let mut t = Throttle::new(16, 3, window, 3);
+        // 节拍要"最后一次滴正好越线，且断言紧跟其后"：budget == 轮数 == 3，间隔 1.5 个窗口。
+        // 前两版都没杀伤力，且**都是量出来的**：v1（4 轮、每轮之后睡）在 71 条单测那棵树上
+        // 全绿——第 3 条武装的锁在第 4 轮之后已服完窗口；v2（改成 3 轮但仍在轮后睡）在 72 条
+        // 那棵树上仍全绿——断言前还挂着一次 1.5 窗口的睡。v3 把间隔挪到迭代**之间**、断言
+        // 紧跟最后一条失败，M17 才第一次变红（数见案卷《第十一片》的 D 轮变异表）。
+        for i in 0..3 {
+            // 间隔放在**迭代之间**而不是尾巴上：否则最后一条失败之后还睡了一整个窗口，
+            // M17 下刚武装的源锁在断言之前就过期，测试又变绿（这一版就是这么从 0 杀伤力
+            // 修成有杀伤力的，见案卷《第十一片》D 轮）。
+            if i > 0 {
+                std::thread::sleep(window * 3 / 2);
+            }
+            // 每次换一个**主体**：pair 侧阈值（3）永不触发，锁只可能来自源侧额度。
+            t.record_failure(&format!("drip{i}"), "10.0.0.1");
+        }
+        assert!(
+            !t.is_locked("late-comer", "10.0.0.1"),
+            "按窗口慢滴的地址不该被跨窗口攒满额度（M17 在这一格红）"
+        );
+        assert!(
+            t.source_ledgers() <= 1,
+            "每轮衰减都应把上一轮的账清掉，存活账本至多 1 行"
+        );
+        // 反向对照：同一个窗口内连打三条仍然立刻武装——本条不是"慢滴免死金牌"。
+        for i in 0..3 {
+            t.record_failure(&format!("burst{i}"), "10.0.0.2");
+        }
+        assert!(
+            t.is_locked("anyone", "10.0.0.2"),
+            "一个窗口内打满额度必须锁这个地址"
+        );
     }
 
     #[test]
@@ -3336,7 +3706,7 @@ mod tests {
             code::AUTH_DENIED,
             "夹具前提：第一条失败不该武装"
         );
-        e.close_session(sid);
+        e.close_session(sid, "10.0.0.30").unwrap();
         assert_eq!(
             e.authenticate("td-count", "10.0.0.30", "wrong")
                 .unwrap_err()
@@ -3357,7 +3727,7 @@ mod tests {
             code::THROTTLED,
             "夹具前提：已达阈值并武装"
         );
-        e.close_session(sid2);
+        e.close_session(sid2, "10.0.0.31").unwrap();
         // 不变式见证（r8 R8-W-3：这条之前锁表大小全仓不可读，"表项有界"对锁表那一半
         // 是零可红对象）：每条活锁都得有一行活着，行与计数都不许被拆除动过。
         assert_eq!(
@@ -3423,6 +3793,398 @@ mod tests {
                 .code,
             code::THROTTLED,
             "闲置回收不得清掉失败计数，否则'把会话挂到超时'就是免费的清账路径"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn closing_another_peers_session_is_refused_and_leaves_it_intact() {
+        // r8 R8-W-2 的根因就在这一半：在归属检查之前，`close_session(id)` 对任意调用方
+        // 都会删会话、删**别人的** `.part` 暂存文件并释放其预算，而会话号顺序自增、
+        // 可枚举。现在必须出示与会话相同的传输地址；且拒绝时不区分"这个 id 不存在"
+        // 与"这个 id 存在但不属于你"，否则这条入口自己就成了会话枚举的 oracle。
+        let dir = tmp("close-owner");
+        let root = SandboxRoot::open("downloads", &dir, false).unwrap();
+        let mut e = FileEngine::new(FileLimits::default(), vec![root], "s3cret").unwrap();
+        let victim = e
+            .authenticate("victim", "10.0.0.40", "s3cret")
+            .expect("fixture: correct token admits");
+        let _st = e.open_upload(victim, "downloads", "u.bin", None).unwrap();
+        e.stage_chunk(victim, _st, 0, b"abc").unwrap();
+        let parts = || {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .filter(|d| d.file_name().to_string_lossy().contains("nexus-part"))
+                .count()
+        };
+        assert_eq!(parts(), 1, "夹具前提：暂存文件在场");
+        let before_audit = e.audit().len();
+        assert_eq!(
+            e.close_session(victim, "10.0.0.41")
+                .map(|_| "OK")
+                .unwrap_err()
+                .code,
+            code::NOT_FOUND,
+            "地址不符必须拒，且不得泄露这个 id 是否存在"
+        );
+        assert_eq!(
+            e.audit().len(),
+            before_audit + 1,
+            "拒绝也要恰好留一行（G21）"
+        );
+        assert_eq!(
+            parts(),
+            1,
+            "被拒的拆除不得删掉别人的暂存文件（这才是真正的 DoS 面）"
+        );
+        assert!(
+            e.stat(victim, "downloads", ".").is_ok(),
+            "会话必须还活着：没被终止、预算没被释放"
+        );
+        // 不存在的 id 与不属于自己的 id：审计行的动作、码、principal 格必须逐字相同。
+        let _ = e.close_session(999_999, "10.0.0.41");
+        let rec_unknown = e.audit().back().unwrap().clone();
+        let _ = e.close_session(victim, "10.0.0.41");
+        let rec_foreign = e.audit().back().unwrap().clone();
+        assert_eq!(rec_unknown.result_code, rec_foreign.result_code);
+        assert_eq!(rec_unknown.action, rec_foreign.action);
+        assert_eq!(
+            rec_unknown.principal, rec_foreign.principal,
+            "泄露归属的那一格也必须相同"
+        );
+        e.close_session(victim, "10.0.0.40")
+            .expect("owner closes its own session");
+        assert_eq!(parts(), 0, "只有所有者关闭时才清暂存文件");
+        assert_eq!(
+            e.stat(victim, "downloads", ".")
+                .map(|_| "OK")
+                .unwrap_err()
+                .code,
+            code::NOT_FOUND,
+            "关闭之后会话确实没了"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn address_representation_drift_arms_two_independent_source_locks() {
+        // r10 R10-N-4（配方来自 r9 R9-W-1）：引擎**不**归一化传输地址，所以"同一条物理
+        // 地址的两种写法"在归属检查、单源额度、per-peer 配额三处都是**不同的键**。这条
+        // 不是给归一化背书，而是把两个后果钉成契约：(1) 合法所有者因为写法差异关不掉自己
+        // 的会话；(2) 单源额度按字符串分账，一种写法一份额度。将来谁加了归一化，这两格都会
+        // 红，G16/PRODUCT/REQ-010 的散文就必须同步——这才是本测试的作用。
+        let dir = tmp("close-drift");
+        let root = SandboxRoot::open("downloads", &dir, false).unwrap();
+        let mut e = FileEngine::new(
+            FileLimits {
+                // 4 == 4：G12 的交叉规则要求 `max_failures_per_source >= lockout_after`，
+                // 所以这道夹具里 pair 侧也会武装。为了不让"谁把这次请求拒了"含糊，最后的
+                // 断言换一个**从没失败过的主**体——它只可能被源锁挡住。
+                lockout_after: 4,
+                max_failures_per_source: 4,
+                ..Default::default()
+            },
+            vec![root],
+            "s3cret",
+        )
+        .unwrap();
+        let own = e
+            .authenticate("dual", "2001:db8::1", "s3cret")
+            .expect("fixture: correct token admits");
+        assert_eq!(
+            e.close_session(own, "[2001:db8::1]:44337")
+                .map(|_| "OK")
+                .unwrap_err()
+                .code,
+            code::NOT_FOUND,
+            "裸 IPv6 与带方括号+端口是两条键：所有者被自己的写法关在门外"
+        );
+        assert!(
+            e.stat(own, "downloads", ".").is_ok(),
+            "会话必须还活着（只能等 idle_timeout 回收）"
+        );
+        let budget = e.limits().max_failures_per_source;
+        for _ in 0..budget {
+            let _ = e.authenticate("probe", "2001:db8::1", "wrong");
+            let _ = e.authenticate("probe", "[2001:db8::1]:44337", "wrong");
+        }
+        assert_eq!(
+            e.throttle_source_locks(),
+            2,
+            "两种写法各自武装一道源锁：限额封的是字符串，不是物理地址"
+        );
+        assert_eq!(
+            e.throttle_source_ledgers(),
+            0,
+            "武装即销账（可达分支），额度从 0 重攒"
+        );
+        assert_eq!(
+            e.authenticate("dual", "2001:db8::1", "s3cret")
+                .map(|_| "OK")
+                .unwrap_err()
+                .code,
+            code::THROTTLED,
+            "锁定期内正确令牌也不得绕过（G15）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn per_source_budget_locks_the_address_not_the_whole_node() {
+        // 评审 r7 整改清单第 3 条 / r8 R7-N-9：键是 (主体,源) 的**对**，所以一个地址
+        // 本来可以替任意多个自己并不拥有的主体，把整张表的额度池花光。这条限额锁的是
+        // 这个地址本身，并且**不**升级为全体拒服务（后者是溢出计数那条大路的效果）。
+        let dir = tmp("source-budget");
+        let l = FileLimits {
+            lockout_after: 3,
+            max_failures_per_source: 6,
+            max_throttle_buckets: 64,
+            ..Default::default()
+        };
+        let root = SandboxRoot::open("downloads", &dir, false).unwrap();
+        let mut e = FileEngine::new(l, vec![root], "s3cret").unwrap();
+        // 同一地址、六个不同主体：每个都没到自己的阈值（3），但源额度正好在第 6 条花完。
+        for i in 0..6 {
+            let seen = e
+                .authenticate(&format!("p{i}"), "10.0.0.50", "wrong")
+                .map(|_| "NONE")
+                .unwrap_err()
+                .code;
+            assert_eq!(
+                seen,
+                if i == 5 {
+                    code::THROTTLED
+                } else {
+                    code::AUTH_DENIED
+                },
+                "第 {} 条：只有把额度花完的那一条才报锁定",
+                i + 1
+            );
+        }
+        assert_eq!(e.throttle_source_locks(), 1, "源锁必须真的武装了一道");
+        assert!(
+            !e.throttle_globally_locked(),
+            "单源超限不得升级为全体 fail-closed"
+        );
+        assert_eq!(
+            e.authenticate("fresh", "10.0.0.50", "s3cret")
+                .map(|_| "NONE")
+                .unwrap_err()
+                .code,
+            code::THROTTLED,
+            "同一地址的**新**主体也在门外：锁的是地址，不是那个主体"
+        );
+        assert!(
+            e.authenticate("fresh", "10.0.0.51", "s3cret").is_ok(),
+            "别的地址不受牵连——爆炸半径就到这台地址为止"
+        );
+        assert!(
+            e.throttle_buckets() < e.limits().max_throttle_buckets,
+            "夹具前提：离表满还远，所以这条限额不是溢出分支的替身"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_address_is_locked_when_the_source_ledger_is_full() {
+        // 源账本与两层键同一条原则：**不**为陌生地址无限建行，而是当场锁它
+        // （fail-closed）。这一条测的就是那个满表分支——把它改成"直接放过"
+        // （变异 P3）时，内存上界仍然成立，但一个用大量源地址低速率撒失败的攻击者
+        // 就可以让每个新地址都免费贡献失败，限额形同不存在。
+        let dir = tmp("source-ledger-full");
+        let l = FileLimits {
+            max_throttle_buckets: 2,
+            // 阈值抬高，确保下面没有任何一条失败撞上**个体**阈值，锁只可能来自源侧。
+            lockout_after: 9,
+            max_failures_per_source: 12,
+            ..Default::default()
+        };
+        let root = SandboxRoot::open("downloads", &dir, false).unwrap();
+        let mut e = FileEngine::new(l, vec![root], "s3cret").unwrap();
+        for i in 0..2 {
+            assert_eq!(
+                e.authenticate(&format!("known{i}"), &format!("10.0.0.6{i}"), "wrong")
+                    .unwrap_err()
+                    .code,
+                code::AUTH_DENIED,
+                "夹具前提：两个在册地址各花 1 条，账本刚好占满"
+            );
+        }
+        assert_eq!(e.throttle_source_ledgers(), 2);
+        assert_eq!(
+            e.authenticate("arrives-late", "10.0.0.63", "wrong")
+                .map(|_| "NONE")
+                .unwrap_err()
+                .code,
+            code::THROTTLED,
+            "账本满时陌生地址必须当场被锁，而不是免费记一条失败"
+        );
+        assert_eq!(e.throttle_source_locks(), 1);
+        assert_eq!(
+            e.throttle_source_ledgers(),
+            2,
+            "被锁的地址不占账本位（否则满表分支会自己把表撑大）"
+        );
+        assert!(
+            !e.throttle_globally_locked(),
+            "锁一个地址不等于锁全节点——这条与溢出计数那条大路必须可区分"
+        );
+        assert_eq!(
+            e.authenticate("arrives-late", "10.0.0.63", "s3cret")
+                .map(|_| "NONE")
+                .unwrap_err()
+                .code,
+            code::THROTTLED,
+            "正确口令也走不出源锁（与个体锁同一条口径）"
+        );
+        assert!(
+            e.authenticate("known0", "10.0.0.60", "s3cret").is_ok(),
+            "已在册地址不受牵连"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn source_lock_table_full_escalates_instead_of_growing_forever() {
+        // r9 R9-W-2 抓到的那条路：源锁表原先没有插入门禁，而"账本满 ⇒ 陌生地址
+        // 第一条失败就锁"恰恰是**最便宜**的填表方式（1 次请求换 1 条表项）。
+        // 现在锁表满了必须与两层键同形：升级为全局窗口。删掉那道门禁（把
+        // `arm_source` 里的 `>= max_buckets` 改成恒假）这条就红——它不会拒绝注入，
+        // 只会让表无界地长下去，所以断言的是"到点了必须换成全局 fail-closed"。
+        let dir = tmp("source-locks-full");
+        let l = FileLimits {
+            max_throttle_buckets: 2,
+            lockout_after: 9,
+            max_failures_per_source: 12,
+            ..Default::default()
+        };
+        let root = SandboxRoot::open("downloads", &dir, false).unwrap();
+        let mut e = FileEngine::new(l, vec![root], "s3cret").unwrap();
+        // 账本先灌满（2 个地址），之后每个新地址的第一条失败都会去插一道源锁。
+        for i in 0..2 {
+            let _ = e.authenticate(&format!("ledger{i}"), &format!("10.0.8.{i}"), "wrong");
+        }
+        assert_eq!(e.throttle_source_ledgers(), 2);
+        for i in 0..2 {
+            assert_eq!(
+                e.authenticate(&format!("fresh{i}"), &format!("10.0.9.{i}"), "wrong")
+                    .map(|_| "NONE")
+                    .unwrap_err()
+                    .code,
+                code::THROTTLED,
+                "账本满时陌生地址第一条就被锁"
+            );
+        }
+        assert_eq!(e.throttle_source_locks(), 2, "夹具前提：锁表也满了");
+        assert!(
+            !e.throttle_globally_locked(),
+            "满的那一刻还不该升级，升级属于下一条"
+        );
+        let _ = e.authenticate("one-too-many", "10.0.9.9", "wrong");
+        assert!(
+            e.throttle_globally_locked(),
+            "源锁表满后必须升级为全局窗口，而不是继续吃进表项（内存上界）"
+        );
+        assert!(e.throttle_source_locks() <= e.limits().max_throttle_buckets);
+        assert_eq!(
+            e.authenticate("anyone", "10.0.9.10", "s3cret")
+                .map(|_| "NONE")
+                .unwrap_err()
+                .code,
+            code::THROTTLED,
+            "全局窗口对所有主体生效，含正确令牌"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_transport_address_is_refused_before_the_throttle() {
+        // `source` 本批被升格成归属凭证与额度键，空串就不能当身份用：把它记进节流表
+        // 会留下一整桶 ("", "") 状态，谁都能往里灌失败、也谁都能替它还清。
+        let dir = tmp("empty-source");
+        let root = SandboxRoot::open("downloads", &dir, false).unwrap();
+        let mut e = FileEngine::new(FileLimits::default(), vec![root], "s3cret").unwrap();
+        assert_eq!(
+            e.authenticate("someone", "", "s3cret")
+                .map(|_| "ACCEPTED")
+                .unwrap_err()
+                .code,
+            code::AUTH_DENIED,
+            "空地址必须拒，哪怕令牌正确"
+        );
+        assert_eq!(e.throttle_buckets(), 0, "这条不进节流表");
+        assert_eq!(e.throttle_failures(), 0);
+        assert_eq!(
+            e.audit().back().unwrap().result_code,
+            code::AUTH_DENIED,
+            "拒绝也要留一行（G21）"
+        );
+        assert!(
+            e.authenticate("someone", "10.0.0.70", "s3cret").is_ok(),
+            "同一条令牌的正常路径不受影响"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn authenticate_compares_tokens_only_when_not_short_circuited() {
+        // r1 起挂着的那句"没有任何断言约束 authenticate 真的用 constant_time_eq"，
+        // 本批把**能被机器验证的那一半**闭掉：比较唯一入口是 `token_eq`，计数就在
+        // 那里，于是两个方向都有对象——可比较的尝试恰好 +1，被锁定短路的尝试 +0。
+        // 后者同时把"删掉锁定预检"（M10b）打红；"绕开唯一入口"（F）在这套 lints 下
+        // 直接编不过。剩下那一半——入口内部换成长度相关的比较——本测试**不**背书，
+        // 见 `token_eq` 文档与 G15 代价 (5)。
+        let dir = tmp("compare-count");
+        let l = FileLimits {
+            lockout_after: 2,
+            ..Default::default()
+        };
+        let root = SandboxRoot::open("downloads", &dir, false).unwrap();
+        let mut e = FileEngine::new(l, vec![root], "s3cret").unwrap();
+        let base = e.token_comparisons();
+        assert_eq!(
+            e.authenticate("u", "loopback", "nope")
+                .map(|_| "NONE")
+                .unwrap_err()
+                .code,
+            code::AUTH_DENIED
+        );
+        assert_eq!(
+            e.token_comparisons(),
+            base + 1,
+            "一次普通拒绝就做了一次比较"
+        );
+        let s = e.authenticate("u", "loopback", "s3cret").unwrap();
+        assert_eq!(e.token_comparisons(), base + 2, "成功认证同样只比较一次");
+        e.close_session(s, "loopback").unwrap();
+        assert_eq!(
+            e.authenticate("u", "loopback", "nope").unwrap_err().code,
+            code::AUTH_DENIED,
+            "夹具前提：第一条失败还没到阈值"
+        );
+        assert_eq!(
+            e.authenticate("u", "loopback", "nope")
+                .map(|_| "NONE")
+                .unwrap_err()
+                .code,
+            code::THROTTLED,
+            "第二条到阈值，报锁定"
+        );
+        assert_eq!(e.token_comparisons(), base + 4, "武装那一次仍然比较过");
+        for _ in 0..4 {
+            assert_eq!(
+                e.authenticate("u", "loopback", "s3cret")
+                    .map(|_| "NONE")
+                    .unwrap_err()
+                    .code,
+                code::THROTTLED
+            );
+        }
+        assert_eq!(
+            e.token_comparisons(),
+            base + 4,
+            "锁定窗口内一次令牌比较都不许做——这就是短路在比较**之前**的证据"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3980,7 +4742,7 @@ mod tests {
 
         // `close_session` 同样返回单元值，手写"恰好一行"的断言（同上）。
         let before_close = e.audit().len();
-        e.close_session(s);
+        e.close_session(s, "loopback").unwrap();
         assert_eq!(
             e.audit().len(),
             before_close + 1,
@@ -4036,7 +4798,7 @@ mod tests {
 
         // 未知会话号的 close 也要留一行（评审 r5 N-8：否则"漏记结构性不可发生"
         // 只对已知会话成立）。环此时已饱和 ⇒ 按**尾部内容**断言，不断言行数增长。
-        e.close_session(999_999);
+        let _ = e.close_session(999_999, "loopback");
         let rec = e.audit().back().unwrap();
         assert_eq!(rec.action, "close_session");
         assert_eq!(
@@ -4092,7 +4854,7 @@ mod tests {
             e.open_upload(s, "ro", "x.bin", None).unwrap_err().code,
             code::READ_ONLY
         );
-        e.close_session(s);
+        e.close_session(s, "loopback").unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&ro);
     }
@@ -4126,7 +4888,7 @@ mod tests {
             code::QUEUE_FULL,
             "预算被 s1 占满时第二个会话必须显式排队失败"
         );
-        e.close_session(s1);
+        e.close_session(s1, "10.0.0.1").unwrap();
         assert_eq!(e.budget().buffered(), 0, "会话拆除必须归还共享预算");
         assert!(e.read_page(s2, "downloads", "f.bin", 0, 64).is_ok());
 
@@ -4148,6 +4910,8 @@ mod tests {
         let l = FileLimits {
             max_throttle_buckets: 8,
             lockout_after: 3,
+            // 上界 8×3：单源洪水（12 条）要先撞上表满，而不是源锁。
+            max_failures_per_source: 24,
             ..Default::default()
         };
         let root = SandboxRoot::open("downloads", &dir, false).unwrap();
@@ -4205,9 +4969,9 @@ mod tests {
             "全局 max_sessions 同样必须拒"
         );
         // 释放的额度必须可复用，不是"一次性配额"。
-        e.close_session(a);
-        e.close_session(b);
-        e.close_session(c);
+        e.close_session(a, "10.0.0.1").unwrap();
+        e.close_session(b, "10.0.0.1").unwrap();
+        e.close_session(c, "10.0.0.2").unwrap();
         assert!(e.authenticate("u", "10.0.0.3", "s3cret").is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4223,7 +4987,7 @@ mod tests {
         assert_eq!(&rec, e.audit().back().unwrap());
         assert!(format!("{rec:?}").contains("authenticate"));
         assert_eq!(rec.principal, "u", "principal 必须是真实主体");
-        e.close_session(s);
+        e.close_session(s, "loopback").unwrap();
         assert_eq!(
             e.audit().back().unwrap().action,
             "close_session",
@@ -4331,6 +5095,23 @@ mod tests {
                 "max_browser_sessions must not exceed",
                 FileLimits {
                     max_browser_sessions: 8,
+                    ..Default::default()
+                },
+            ),
+            (
+                // 单源额度的两条交叉规则各有一个只违反自己的夹具（G12 的口径：
+                // 每条规则都要能被单独跑红，否则"逐条有测"又是空话）。
+                "max_failures_per_source must be >= lockout_after",
+                FileLimits {
+                    max_failures_per_source: 4,
+                    ..Default::default()
+                },
+            ),
+            (
+                "max_failures_per_source must be <= max_throttle_buckets * lockout_after",
+                FileLimits {
+                    max_throttle_buckets: 4,
+                    max_failures_per_source: 40,
                     ..Default::default()
                 },
             ),
