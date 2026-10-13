@@ -801,3 +801,92 @@ r7(0F；撰写者 6W/12N，签发者改判 3W/16N 并否决 1 条) → r8(0F, CO
 review 目录的 verdict），provenance/scope 绑定的修复在 fix/hook-review-evidence-binding
 （689f63a）未合入，所以 r8 案卷里 `scope` 写成数组、`source_revision` 用真实基线 175e115，
 是为那条分支合入后准备的，不是当前门禁的要求。
+
+================================================================================
+追加：M1 第十片（会话归属检查 + 单源爆炸半径限额 + 比较唯一入口），宿主 xc-pc-linux
+================================================================================
+# bindings（`nexus-harness status --json` 实测，clean 树，dirty_state=false）:
+#   source_revision       1c0f0a9cd3d7df9d282c597bdbd6c395ae7837af
+#   working_tree_digest   7be74c0a245529765d37d981115a5ec1cf28fdb9
+#   contract_hash         ef28949145af2b1490ca8a07653f13e9b33f976b
+#   toolchain             1.98.1 / x86_64-unknown-linux-gnu
+#   verify --fast         9 门全 PASS，evidence dir = verify-f5dbc7b07761
+实测：cargo test --lib = 67 passed; 0 failed / clippy --all-targets = 零诊断 /
+     9 条 E4 场景 = **99** 条期望全 PASS（6+10+9+5+9+22+16+7+15）
+
+公开更正本仓自报数字：E4 期望 95 → **99**（auth-throttle 18 → 22），单测 63 → **67**。
+
+这一片做三件事，都来自 r7/r8 明确结转的残余（任务 #35），不是顺手改：
+
+1) **`close_session` 要验归属**（r8 R8-W-2 追到的根因入口）。签名从
+   `close_session(session)` 变成 `close_session(session, source) -> FileResult<()>`：
+   地址不符 ⇒ `NOT_FOUND`，且**什么都不发生**——会话不终止、别人的 `.part` 不删、
+   发送预算不释放、节流状态不清。归属检查之前的实际破坏面比"清计数"大得多：会话号
+   `next_session` 顺序自增可枚举，猜到一个整数就能打断别人的上传。
+   未知 id 与不属于自己的 id 在返回值与审计行上逐字同形（不做会话存在性 oracle）。
+   **实现踩到的坑，被自己的测试抓红**：`record()` 在 principal 留空时会回查会话补归属，
+   所以"先把会话放回原位、再落审计行"会让拒绝行的 principal 变成受害者主体名，
+   与"id 不存在"那行的空串不一致 ⇒ 顺序必须反过来。测试
+   `closing_another_peers_session_is_refused_and_leaves_it_intact` 断言这两行的
+   principal 格相同；把顺序改回去（变异 P5）实测红这一条。
+2) **单源限额 `max_failures_per_source`（默认 40）**：一个传输地址在一个窗口里最多贡献
+   这么多条失败，超了锁**这个地址**，不牵连别的地址、不升级为全体 fail-closed。
+   它把 G15 代价 (3) 那条聚合上界从"一个地址就能烧掉"变成"需要同一窗口内约 128 个
+   不同源地址"；产品尺寸引擎上的直接实测是 `solo_rows_after_flood = 40`（一个地址灌
+   2048 条失败只留下 40 行）。源账本与源锁表也各自受 `max_throttle_buckets` 门禁，
+   账本满时陌生地址**当场被锁**（fail-closed，不给它建行）——这条分支由
+   `unknown_address_is_locked_when_the_source_ledger_is_full` 钉住（变异 P3 实测红）。
+   交叉规则两条并进 G12 且各有只违反自己的夹具（`>= lockout_after`、
+   `<= max_throttle_buckets × lockout_after`）；副作用是**缩小节流表的小夹具必须同时
+   缩小这道额度**，否则拒启动——本批 4 个夹具（两处单测、两处探针）因此显式写了
+   `max_failures_per_source`，并把洪水条数与额度的关系写在旁边。
+3) **令牌比较收敛成唯一入口 `FileEngine::token_eq`**，计数挂在它内部。三件事分层说清，
+   不再混着讲（我第一版把话说过了，见下面的自我更正）：
+   - 删掉计数（P6）⇒ 单测 + 冻结期望 `token_comparisons_short_circuit_when_locked` 红；
+   - 删掉锁定预检（M10b）⇒ 8 条单测红 + 4 条冻结期望翻转 ⇒ "锁内不做比较"确有对象；
+   - **绕开**这个入口去比较（F）⇒ `token_eq` 变 never-used，`warnings = "deny"` 下
+     **编不过**（实测输出 `error: method 'token_eq' is never used`）——所以"多一个比较点"
+     是构建期挡住的，不是测试挡住的；
+   - 仍然挡不住的：把 `token_eq` **内部**的 `constant_time_eq` 换成长度相关的 `!=`。
+     这一半只有 `constant_time_eq` 自己的单测（区分长度/前缀）加评审目视负责。
+     **自我更正**：我先前在 `token_comparisons` 的文档与 G15 代价 (5) 里写过"换成 `!=`
+     就会红"，那是过度声明——计数只证明"比较发生了几次、在哪做"，不证明比较的
+     时序形状。措辞已按实测分层改写，代码文档、G15、requirements 三处同步。
+
+契约面：MODULE G12（两条新交叉规则）、G15（源限额、比较入口的分层口径、未证事项更新：
+删掉"六处硬编码"这种会说谎的具体计数、改成"内部全部时间读取硬编码 `Instant::now()`"）、
+G16（会话终止验归属 + 同形拒绝 + 残余是"地址不是凭证"）；PRODUCT §18.2 加"一个地址
+烧不掉整池额度"与"会话终止要验归属"两段；requirements.toml REQ-010 acceptance 重写。
+G15 的"显式声明的代价"从四条变五条，第五条就是上面第 3 点的分层结论。
+
+变异表（第十片，全部 Linux 真树实测，`cargo test --lib` + auth-throttle 探针 JSON）：
+  P1 限额记账但从不武装   → RED per_source_budget_... + unknown_address_is_locked_...
+                            + 期望 single_address_cannot_fill_the_table=false、
+                              throttle_per_source_budget_scoped_to_address=false
+  P2 源锁升级为全局窗口   → RED 同上两条 + 那两条期望翻转（限额牵连全节点这件事有对象）
+  P3 账本满时 fail-open   → RED unknown_address_is_locked_when_the_source_ledger_is_full
+  P4 去掉归属检查         → RED closing_another_peers_... + foreign_close_refused_...=false
+  P5 审计行写在放回之后   → RED closing_another_peers_...（principal 泄露，oracle 成立）
+  P6 去掉比较计数         → RED authenticate_compares_tokens_only_... + 期望 false
+  F  绕开唯一入口比较     → 编译失败（dead code），见上面第 3 点
+  回归复核：N5 摘要少喂 source → RED + other_source_still_admitted=false；
+  N6 桶不衰减 → RED 3 条 + sustainable/self_heals 双 false（pool_denials 48→20、
+  pool_lockouts 0→28）；M9 过期锁不回收 → RED 唯一那条；E 关掉纵深防御那支 → 66 全绿
+  （与"经 authenticate 不可达"一致）；M10b 去掉锁定预检 → 8 条单测红 + 5 条期望翻转。
+
+探针一处**有意**的夹具改动：`throttle_sustainable_failure_budget` 原来把 8 行 × 3 轮
+全灌在同一个源地址上，本批加了单源限额之后那量的就是限额而不是"表位可续额度池"，
+所以改成**一个主体配一个地址**（每地址每轮 2 条、三轮 6 条 < 额度 8），并在旁边写明
+两道门必须各测各的；额度那道由新的 `throttle_per_source_budget_scoped_to_address` 与
+`single_address_cannot_fill_the_table` 负责。同理，两处产品尺寸引擎的洪水循环从
+`10.0.0.9` 改成 `10.0.9.{i/32}` 轮转（每地址 32 条 < 默认额度 40），否则
+`product_engine_fails_closed_when_flooded` 会被源锁提前截断而假红。
+
+仍未闭的（写进 G15 未证事项，不谎称已解）：时钟注入没做，时间夹具仍吃墙钟；
+principal/source 长度进摘要前无上界；身份不做 NFC/大小写归一；`lockout_window` 无下界；
+源地址是传输地址而非凭证（M2 发 capability 才能关死）；`max_failures_per_source`
+只校验非 0 与两条交叉界，没有"相对速率的下界"概念——它管爆炸半径不管速率，
+速率那道门仍属 M2 的连接层限流与 RSS 计量。
+
+评审链：r1(6F) → … → r6(0F) → r7(0F) → r8(0F, COMMENTED) → r9（本片：归属检查、
+单源限额、比较唯一入口）。

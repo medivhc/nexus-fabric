@@ -507,6 +507,8 @@ fn auth_throttle(f: &mut Map<String, Value>) -> Result<(), String> {
         FileLimits {
             max_throttle_buckets: 8,
             lockout_after: 3,
+            // 取交叉规则的上界 8×3：让下面 11 条单源洪水先撞上"表满"这条大路。
+            max_failures_per_source: 24,
             ..Default::default()
         },
     )?;
@@ -560,27 +562,33 @@ fn auth_throttle(f: &mut Map<String, Value>) -> Result<(), String> {
     let other = e.authenticate("attacker", "10.0.0.2", TOKEN);
     f.insert("other_source_still_admitted".into(), json!(other.is_ok()));
     if let Ok(sid) = other {
-        e.close_session(sid);
+        let _ = e.close_session(sid, "10.0.0.2");
     }
-    // Session teardown clears the bucket for that principal+source pair.
+    // 会话拆除现在**不**清节流状态（`Throttle::succeed` 上记着为什么）：这里验的是
+    // "成功认证过一对身份之后，同一对的下一条失败从 0 数起"，也就是 succeed 那条路。
     // 顺序是**有意的**：它必须跑在下面的伪造量淹没之前——NEW-3 把表满改成
     // fail-closed 之后，淹没过的引擎会对任何未在册主体拒认证，这段就会假红
     // （第一次 Linux 跑正是这样红的）。
     let sid = auth(&mut e)?;
-    e.close_session(sid);
+    e.close_session(sid, "127.0.0.1")
+        .map_err(|x| x.to_string())?;
     let after_forget = e.authenticate("probe", "127.0.0.1", TOKEN);
     f.insert(
         "state_cleared_after_close".into(),
         json!(after_forget.is_ok()),
     );
     if let Ok(x) = after_forget {
-        e.close_session(x);
+        let _ = e.close_session(x, "127.0.0.1");
     }
     // Forged volume must not grow the table with the volume.
+    // 地址轮换着灌：每个地址只花 32 条（< 默认 `max_failures_per_source` = 40），
+    // 这样这条判据量的仍然是"表位是否随伪造量线性增长"，而不是被单源限额提前截断。
+    // 单源那条大路下面另有一道观测（`single_address_cannot_fill_the_table`）。
     let buckets_before = e.throttle_buckets();
+    let addr_for = |i: usize| format!("10.0.9.{}", i / 32);
     for i in 0..(e.limits().max_throttle_buckets * 2) {
         let principal = format!("p{i}");
-        let _ = e.authenticate(&principal, "10.0.0.9", "nope");
+        let _ = e.authenticate(&principal, &addr_for(i), "nope");
     }
     f.insert(
         "throttle_entries_bounded".into(),
@@ -591,13 +599,14 @@ fn auth_throttle(f: &mut Map<String, Value>) -> Result<(), String> {
     f.insert("max_buckets".into(), json!(e.limits().max_throttle_buckets));
     // 同一台引擎在淹没之后必须 fail-closed（r2 NEW-3 在产品引擎上的直接观测，
     // 不只是 e4 那台小表引擎）。两个群体都断言：`p0` 已在册（旧豁免逻辑下这里
-    // 是 ACCEPTED，评审 r5 N-7），`fresh-after-flood` 不在册。
+    // 是 ACCEPTED，评审 r5 N-7），`fresh-after-flood` 不在册。地址必须与建桶时同一个，
+    // 否则查的就不是那条身份了。
     let in_table_post_flood = e
-        .authenticate("p0", "10.0.0.9", TOKEN)
+        .authenticate("p0", &addr_for(0), TOKEN)
         .map(|_| "ACCEPTED")
         .unwrap_or_else(|err| err.code);
     let post_flood = e
-        .authenticate("fresh-after-flood", "10.0.0.9", TOKEN)
+        .authenticate("fresh-after-flood", &addr_for(0), TOKEN)
         .map(|_| "ACCEPTED")
         .unwrap_or_else(|err| err.code);
     f.insert(
@@ -606,6 +615,31 @@ fn auth_throttle(f: &mut Map<String, Value>) -> Result<(), String> {
             e.throttle_globally_locked()
                 && in_table_post_flood == code::THROTTLED
                 && post_flood == code::THROTTLED
+        ),
+    );
+    // 单源限额在产品尺寸引擎上的直接观测（r7 整改清单第 3 条 / r8 R7-N-9）：一个
+    // 地址即使狂灌 2048 条失败，也占不满 1024 行的表——它自己在第 40 条就被锁到
+    // 窗口结束。表满那条大路仍然可达（上面用轮转地址证明了），但"一个 peer 花掉
+    // 整池额度"这条路被这道门关上了。
+    let mut e_cap = engine_at(&dir, FileLimits::default())?;
+    for i in 0..(e_cap.limits().max_throttle_buckets * 2) {
+        let _ = e_cap.authenticate(&format!("solo{i}"), "10.0.0.99", "nope");
+    }
+    f.insert(
+        "solo_rows_after_flood".into(),
+        json!(e_cap.throttle_buckets()),
+    );
+    f.insert(
+        "single_address_cannot_fill_the_table".into(),
+        json!(
+            e_cap.throttle_buckets() < e_cap.limits().max_throttle_buckets
+                && e_cap.throttle_source_locks() == 1
+                && !e_cap.throttle_globally_locked()
+                && e_cap
+                    .authenticate("solo-late", "10.0.0.99", TOKEN)
+                    .map(|_| false)
+                    .unwrap_or_else(|err| err.code == code::THROTTLED)
+                && e_cap.authenticate("other-addr", "10.0.0.98", TOKEN).is_ok()
         ),
     );
     // 评审 r6 NOTE-4（owner 裁决：节流键改为身份摘要）。旧写法把两半裁到 128 字节，
@@ -655,6 +689,9 @@ fn auth_throttle(f: &mut Map<String, Value>) -> Result<(), String> {
         FileLimits {
             max_throttle_buckets: 4,
             lockout_after: 2,
+            // 交叉规则的上界 4×2；下面的洪水是 6 条，故意留在源额度之下，
+            // 这样"自愈"量的仍是表位与溢出计数，不是源锁。
+            max_failures_per_source: 8,
             lockout_window: std::time::Duration::from_millis(100),
             ..Default::default()
         },
@@ -671,7 +708,7 @@ fn auth_throttle(f: &mut Map<String, Value>) -> Result<(), String> {
     let late = e6.authenticate("late-comer", "10.0.0.12", TOKEN);
     let admitted = late.is_ok();
     if let Ok(sid) = late {
-        e6.close_session(sid);
+        let _ = e6.close_session(sid, "10.0.0.12");
     }
     let _ = e6.authenticate("fresh-failure", "10.0.0.12", "nope");
     let healed = e6.throttle_buckets() == 1 && e6.throttle_overflow() == 0;
@@ -703,7 +740,8 @@ fn auth_throttle(f: &mut Map<String, Value>) -> Result<(), String> {
         .authenticate("teardown", "10.0.0.13", TOKEN)
         .map(|_| "ACCEPTED")
         .unwrap_or_else(|err| err.code);
-    e7.close_session(td);
+    e7.close_session(td, "10.0.0.13")
+        .map_err(|x| x.to_string())?;
     let locked_after_teardown = e7
         .authenticate("teardown", "10.0.0.13", TOKEN)
         .map(|_| "ACCEPTED")
@@ -751,6 +789,10 @@ fn auth_throttle(f: &mut Map<String, Value>) -> Result<(), String> {
         FileLimits {
             max_throttle_buckets: rows,
             lockout_after: 3,
+            // 每个地址一个窗口只花 (lockout_after-1) × rounds = 6 条，故意留在源额度
+            // 之下——否则这里量到的就是"单源限额开火"而不是"表位可续额度池"。
+            // 两层键的池子与单源额度是两道不同的门，各自要有自己的对象。
+            max_failures_per_source: 8,
             lockout_window: std::time::Duration::from_millis(100),
             ..Default::default()
         },
@@ -760,8 +802,9 @@ fn auth_throttle(f: &mut Map<String, Value>) -> Result<(), String> {
     for round in 0..rounds {
         for i in 0..rows {
             for _ in 0..(e8.limits().lockout_after - 1) {
+                // 一个主体配一个地址：额度池这条判据要的是"很多身份各花一点"。
                 let seen = e8
-                    .authenticate(&format!("pool{round}-{i}"), "10.0.0.14", "nope")
+                    .authenticate(&format!("pool{round}-{i}"), &format!("10.0.16.{i}"), "nope")
                     .map(|_| "NONE")
                     .unwrap_or_else(|err| err.code);
                 if seen == code::AUTH_DENIED {
@@ -784,6 +827,203 @@ fn auth_throttle(f: &mut Map<String, Value>) -> Result<(), String> {
                 && throttled == 0
                 && !e8.throttle_globally_locked()
         ),
+    );
+    // 评审 r7 整改清单第 3 条 / r8 R7-N-9：键是按对分的，所以一个源地址本来可以为
+    // 任意多个自己 not 拥有的主体把整张表的额度花光。单源额度把这件事变成"这个地址
+    // 自己锁一个窗口"，并且**不**牵连别的地址、也不升级为全体 fail-closed。
+    let mut e9 = engine_at(
+        &dir,
+        FileLimits {
+            max_throttle_buckets: 64,
+            lockout_after: 3,
+            max_failures_per_source: 6,
+            ..Default::default()
+        },
+    )?;
+    let mut cap_codes = Vec::new();
+    for i in 0..6 {
+        cap_codes.push(
+            e9.authenticate(&format!("many{i}"), "10.0.0.15", "nope")
+                .map(|_| "NONE")
+                .unwrap_or_else(|err| err.code),
+        );
+    }
+    let same_addr_new_principal = e9
+        .authenticate("fresh-same-addr", "10.0.0.15", TOKEN)
+        .map(|_| "ACCEPTED")
+        .unwrap_or_else(|err| err.code);
+    let other_addr_new_principal = e9
+        .authenticate("fresh-other-addr", "10.0.0.16", TOKEN)
+        .map(|_| "ACCEPTED")
+        .unwrap_or_else(|err| err.code);
+    if let Ok(sid) = e9.authenticate("fresh-other-addr", "10.0.0.16", TOKEN) {
+        let _ = e9.close_session(sid, "10.0.0.16");
+    }
+    f.insert("per_source_cap_codes".into(), json!(cap_codes));
+    f.insert(
+        "throttle_per_source_budget_scoped_to_address".into(),
+        json!(
+            cap_codes
+                .iter()
+                .filter(|c| **c == code::AUTH_DENIED)
+                .count()
+                == 5
+                && cap_codes.last().map(|c| *c == code::THROTTLED) == Some(true)
+                && e9.throttle_source_locks() == 1
+                && !e9.throttle_globally_locked()
+                && same_addr_new_principal == code::THROTTLED
+                && other_addr_new_principal == "ACCEPTED"
+        ),
+    );
+    // r8 R8-W-2 的根因这一半：`close_session` 现在要出示与会话相同的传输地址。
+    // 拒绝时必须什么都没发生（会话还在、`.part` 还在），且审计行与"id 不存在"同形。
+    let mut e10 = engine_at(&dir, FileLimits::default())?;
+    let owned = e10
+        .authenticate("owner", "10.0.0.17", TOKEN)
+        .map_err(|x| x.to_string())?;
+    let stream = e10
+        .open_upload(owned, "downloads", "keep.bin", None)
+        .map_err(|x| x.to_string())?;
+    e10.stage_chunk(owned, stream, 0, b"abc")
+        .map_err(|x| x.to_string())?;
+    let foreign = e10
+        .close_session(owned, "10.0.0.18")
+        .map(|_| "ACCEPTED")
+        .map_err(|err| err.code)
+        .unwrap_or_else(|c| c);
+    let parts_after = std::fs::read_dir(&dir)
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .filter(|d| d.file_name().to_string_lossy().contains("nexus-part"))
+        .count();
+    let still_usable = e10.stat(owned, "downloads", ".").is_ok();
+    // 同形性必须**在审计面上**也成立，否则"不做存在性 oracle"这句只是返回值层面：
+    // 未知 id 与不属于自己的 id 两行的 action/principal/root/result_code 逐格相同，
+    // rel 两处都必须是那个数字 id（它本来就不同，形如 "999999" vs "1"）。
+    let rows_before = e10.audit().len();
+    let _ = e10.close_session(999_999, "10.0.0.18");
+    let unknown_row = e10
+        .audit()
+        .back()
+        .expect("fixture: refusal recorded")
+        .clone();
+    let _ = e10.close_session(owned, "10.0.0.18");
+    let foreign_row = e10
+        .audit()
+        .back()
+        .expect("fixture: refusal recorded")
+        .clone();
+    let same_shape = unknown_row.action == foreign_row.action
+        && unknown_row.principal == foreign_row.principal
+        && unknown_row.root == foreign_row.root
+        && unknown_row.result_code == foreign_row.result_code
+        && unknown_row.principal.is_empty()
+        && foreign_row.result_code == code::NOT_FOUND
+        && e10.audit().len() == rows_before + 2;
+    let owned_close = e10.close_session(owned, "10.0.0.17");
+    f.insert(
+        "foreign_close_audit_shape_is_indistinguishable".into(),
+        json!(same_shape),
+    );
+    f.insert(
+        "audit_rows_for_refused_closes".into(),
+        json!([unknown_row.result_code, foreign_row.result_code]),
+    );
+    f.insert(
+        "foreign_close_refused_and_session_survives".into(),
+        json!(
+            foreign == code::NOT_FOUND
+                // 被拒的拆除不许删掉别人的暂存文件——这才是真正的破坏面
+                && parts_after == 1
+                && still_usable
+                && owned_close.is_ok()
+                && e10.stat(owned, "downloads", ".").is_err()
+        ),
+    );
+    // 从 r1 挂到现在的残余："没有任何断言约束 authenticate 真的用 constant_time_eq"。
+    // 现在有了计数：可比较的尝试恰好 +1，被锁定短路的尝试 +0。
+    let mut e11 = engine_at(
+        &dir,
+        FileLimits {
+            lockout_after: 2,
+            ..Default::default()
+        },
+    )?;
+    let base_compares = e11.token_comparisons();
+    let _ = e11.authenticate("meter", "10.0.0.19", "nope");
+    let after_one = e11.token_comparisons();
+    for _ in 0..(e11.limits().lockout_after - 1) {
+        let _ = e11.authenticate("meter", "10.0.0.19", "nope");
+    }
+    let after_armed = e11.token_comparisons();
+    let locked_code = e11
+        .authenticate("meter", "10.0.0.19", TOKEN)
+        .map(|_| "ACCEPTED")
+        .unwrap_or_else(|err| err.code);
+    let after_locked_attempts = e11.token_comparisons();
+    f.insert(
+        "token_comparisons_short_circuit_when_locked".into(),
+        json!(
+            after_one == base_compares + 1
+                && after_armed == base_compares + e11.limits().lockout_after
+                && locked_code == code::THROTTLED
+                && after_locked_attempts == after_armed
+        ),
+    );
+    // 空传输地址在**进入节流器之前**就被拒（评审 r9 R9-W-1：本批两个新机制都键在地址串
+    // 上，空串会让归属检查、单源额度与 per-peer 配额三处共用同一个退化键）。契约面要的不
+    // 只是返回码：它一次令牌比较都不做，也不在节流的两张源表里留下任何东西。
+    let empty_compares = e11.token_comparisons();
+    let empty_buckets = e11.throttle_buckets();
+    let empty_ledgers = e11.throttle_source_ledgers();
+    let empty_code = e11
+        .authenticate("nolist", "", TOKEN)
+        .map(|_| "ACCEPTED")
+        .unwrap_or_else(|err| err.code);
+    f.insert(
+        "empty_source_is_refused_before_the_throttle".into(),
+        json!(
+            empty_code == code::AUTH_DENIED
+                && e11.token_comparisons() == empty_compares
+                && e11.throttle_buckets() == empty_buckets
+                && e11.throttle_source_ledgers() == empty_ledgers
+        ),
+    );
+    // 源账本满 ⇒ 陌生地址的**第一条**失败就被锁（fail-closed，不给它建行），并且
+    // 锁表自己也有门禁：满了就与两层键同一条大路一致，升级为全局窗口
+    // （评审 r9 R9-W-2：没有这道门禁时，"每条失败换一条表项"是最便宜的内存放大）。
+    let mut e12 = engine_at(
+        &dir,
+        FileLimits {
+            max_throttle_buckets: 2,
+            lockout_after: 9,
+            max_failures_per_source: 12,
+            ..Default::default()
+        },
+    )?;
+    for i in 0..2 {
+        let _ = e12.authenticate(&format!("ledger{i}"), &format!("10.0.8.{i}"), "nope");
+    }
+    let ledger_full = e12.throttle_source_ledgers() == 2;
+    let first_two_locked = (0..2)
+        .filter(|i| {
+            e12.authenticate(&format!("fresh{i}"), &format!("10.0.9.{i}"), "nope")
+                .map(|_| false)
+                .unwrap_or_else(|err| err.code == code::THROTTLED)
+        })
+        .count();
+    let escalated_to_global = {
+        let _ = e12.authenticate("one-too-many", "10.0.9.9", "nope");
+        e12.throttle_globally_locked()
+            && e12.throttle_source_locks() <= e12.limits().max_throttle_buckets
+            && e12
+                .authenticate("anyone", "10.0.9.10", TOKEN)
+                .map(|_| false)
+                .unwrap_or_else(|err| err.code == code::THROTTLED)
+    };
+    f.insert(
+        "unknown_source_locked_on_first_failure_when_ledger_full".into(),
+        json!(ledger_full && first_two_locked == 2 && escalated_to_global),
     );
     cleanup(&dir);
     Ok(())
@@ -907,7 +1147,8 @@ fn quota_backpressure(f: &mut Map<String, Value>) -> Result<(), String> {
     let st_ = auth(&mut et)?;
     et.send_file_message(st_, 8).map_err(|x| x.to_string())?;
     let held = et.budget().buffered();
-    et.close_session(st_);
+    et.close_session(st_, "127.0.0.1")
+        .map_err(|x| x.to_string())?;
     f.insert("teardown_held_bytes".into(), json!(held));
     f.insert(
         "teardown_releases_budget".into(),

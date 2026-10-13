@@ -113,3 +113,53 @@ equals = true
 [[expect]]
 field = "throttle_sustainable_failure_budget"
 equals = true
+
+# r7 整改清单第 3 条 / r8 R7-N-9：键是按 (主体,源) 对的，所以一个源地址本来可以替
+# 任意多个自己并不拥有的主体把整张表的额度池花光。这道限额锁的是**这个地址**：
+# 产品尺寸引擎上，一个地址狂灌 2048 条失败也占不满 1024 行，且不会牵连别的地址、
+# 也不升级为全体 fail-closed（表满那条大路仍由上面的轮换地址案例证明可达）。
+[[expect]]
+field = "single_address_cannot_fill_the_table"
+equals = true
+
+# 同一道限额在小夹具上的正面观测：6 条失败花完一个地址的额度 ⇒ 只有 1 道源锁、
+# 第 6 条报 THROTTLED、同地址的新主体被拒、别的地址照常放行。
+[[expect]]
+field = "throttle_per_source_budget_scoped_to_address"
+equals = true
+
+# r8 R8-W-2 的根因这一半：`close_session` 必须出示与会话相同的传输地址。拒绝时
+# 会话还在、别人的 `.part` 还在、预算没被释放，且审计行与"id 不存在"同形
+# （否则这条入口自己就是会话枚举的 oracle）。
+[[expect]]
+field = "foreign_close_refused_and_session_survives"
+equals = true
+
+# r1 起挂着的残余现在有了对象：可比较的尝试恰好 +1，锁定短路掉的尝试 +0。
+[[expect]]
+field = "token_comparisons_short_circuit_when_locked"
+equals = true
+
+# r9 R9-N-2：契约里"未知 id 与不属于自己的 id 逐字同形"这句原先**只**由返回值与
+# `.part`/会话状态观测，审计面零对象 ⇒ 变异 P5（把审计行写在把会话 insert 回去**之后**，
+# 于是 principal 被 record() 回查补成受害者主体名）在 99 条期望上零红。本条读的是
+# 两行审计的 action/principal/root/result_code 四格全等且为空 principal、码为 NOT_FOUND。
+[[expect]]
+field = "foreign_close_audit_shape_is_indistinguishable"
+equals = true
+
+# r9 R9-W-2：源锁表原先没有插入门禁，而"账本满 ⇒ 陌生地址第一条就锁"恰是最便宜的
+# 内存放大（1 次请求换 1 条表项）。本条同时钉两件事：账本满时陌生地址第一条被锁，
+# 以及锁表满时**升级为全局窗口**而不是继续吃表项（`throttle_source_locks()` 仍 ≤ 上界）。
+[[expect]]
+field = "unknown_source_locked_on_first_failure_when_ledger_full"
+equals = true
+
+# r9 R9-W-1：空传输地址若在比较之后才被节流器拒，它就已经用掉一次比较、并在三张以地址
+# 为键的表里（归属、单源额度、per-peer 配额）留下一个**退化键**。本条钉的是"短路发生在
+# 比较之前"：码为 AUTH_DENIED、比较计数不增、源账本与两层键表都不长。变异 P8（去掉
+# `authenticate` 里那道空地址守卫）在本批第一次复测时只有 1 条单测红、契约面零对象，
+# 这条期望就是补上的那个对象。
+[[expect]]
+field = "empty_source_is_refused_before_the_throttle"
+equals = true
