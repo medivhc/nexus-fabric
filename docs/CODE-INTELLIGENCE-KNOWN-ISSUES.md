@@ -31,11 +31,11 @@ status: current
 |---|---|---|---|
 | A | 契约面待办（须另开 Contract-First 周期） | 6 | 全部开放，本分支刻意不动 |
 | B | 平台/宿主结构性障碍（不属本模块） | 4 | 开放 3，已缓解 1 |
-| C | 可观测性边界（已如实写进契约） | 5 | 开放 4，已修 1 |
+| C | 可观测性边界（已如实写进契约） | 6 | 开放 4，已修 2 |
 | D | 记录与流程陷阱（踩过之后改成了口径） | 7 | 已入口径，非代码缺陷 |
 | E | harness 自身的 fail-open | 2 | 开放（属 harness 域） |
 | F | 未验证 | 6 | 开放 |
-| G | 治理与评审状态 | 5 | 开放 |
+| G | 治理与评审状态（含 G4b marker 缺口） | 7 | 开放 |
 
 ---
 
@@ -186,6 +186,12 @@ status: current
   注意 **`bug` 不是合法 type**——我 §V 的更正本身写错过一次，§X 再更正）。三笔都未推送，
   但按"不重写历史"未原地改，是否 rebase 归所有者。现行口径：消息文本先过 `pre-commit` 与
   `commit-msg`，两个都 exit 0 才 `git commit -F`。
+- **G4b 保护路径的 marker 有一笔历史缺口**：`f075157`（§U 台账提交）改了
+  `engineering/nexus-harness/MODULE.md`（属 AGENTS.md §7 的 Protected 路径）但正文**没有
+  `contract:` marker** —— 内容只是把"Linux 对应值待 §U 复跑实测"换成实测数字，契约语义未变，
+  但按路径规则这是机械违规。`pre-push` 的 marker 检查是**按整个 range** 判"有没有任一 marker"，
+  所以它不会拦住这种单笔缺口；发现方式是逐笔核 `git show --name-only` 对正文 marker。
+  修法与 G4 同：三笔历史都在未推送区间，是否补 marker（amend 或 rebase）归所有者决定。
 - **G5 stacking 决定 diff 归属**：本分支基座是**尚未合并**的 PR #12（head `df2049c`），
   master 在其之后又前进了 4 笔 doc/skill 提交（与代码无重叠，仅 `FILE_MANIFEST.md` 可能小冲突）。
   ⇒ 本 PR 的可见 diff 含 #12 的内容；合并顺序（#12 先、本分支后，或改基座）由所有者决定。

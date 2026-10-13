@@ -569,3 +569,17 @@ verdict `CHANGES_REQUESTED`：1 阻塞（B-3）+ 11 非阻塞。**这是本对�
    在退出时把接手者的状态清掉 —— 这不是理论风险，是实测到的。
 3. **把判定抽成私有函数 + `-D warnings` 的 dead_code** 是低成本拿到"承载体的牙齿"的办法：
    调用点绕开它，构建就红。
+
+### 推送前自查：一笔我自己造成的 Protected 路径 marker 缺口
+
+`f075157`（§U 台账提交）改了 `engineering/nexus-harness/MODULE.md` —— 那是 AGENTS.md §7 的
+Protected 路径 —— 而提交正文**没有** `contract:` marker。内容只是把"Linux 对应值待 §U 复跑实测"
+换成实测数字，契约语义没变，但按路径规则这是机械违规，记在这里而不是等评审来抓。
+
+顺带一条机制观察（比这条违规本身更值得留）：**`pre-push` 的 marker 检查是按整个 range 判
+"区间内是否存在任一 marker"**，所以它天然拦不住"某一笔缺 marker"这种缺口；要抓只能逐笔
+`git show --name-only` 对正文核。这与 G4 同源：`.githooks` 未安装，本机没有机器门禁，
+"我以为 hook 会拦"是不成立的。
+
+处置：它与三笔不合规 subject 都在**未推送**区间，按"不重写历史"不原地改，是否补（amend/rebase）
+归所有者。已登记进 `docs/CODE-INTELLIGENCE-KNOWN-ISSUES.md` 的 G4b。
