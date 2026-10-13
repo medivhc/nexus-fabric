@@ -1010,6 +1010,10 @@ apps/nexus/examples/discovery_mdns.rs 的 Unix-only std::os::fd），Linux 结�
 手工调 `pre-commit` 却在**提交之后**才调 `commit-msg`（4b61987 就是这样才发现的）。
 三笔都未推送，但按"不重写历史、破坏性动作先问"的规矩我没有原地改；要不要本地 rebase 改 subject
 归所有者定。往后我自己的口径：**commit-msg 必须在提交前用同一份消息文本跑通**。
+【2026-10-13 推送后更新】本分支已推到 `origin/feature/code-intel-phase-234`（tip `697e9a1`），
+上面那句"未推送/本地 rebase"当时为真、现已过期：修正这三笔现在需要**改写已发布历史 + force-push**。
+合法 type 的正确值也已在 §X 更正为 `bugfix`（我第一次写成了 `bug`）。当前口径与状态见
+`docs/CODE-INTELLIGENCE-KNOWN-ISSUES.md` 的 G4/G4b。
 
 ================================================================================
 §W round 2 整改后的 xc-pc-linux **结论级**复跑（2026-10-13，宿主 xc-pc-linux，

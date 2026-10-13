@@ -581,5 +581,7 @@ Protected 路径 —— 而提交正文**没有** `contract:` marker。内容只
 `git show --name-only` 对正文核。这与 G4 同源：`.githooks` 未安装，本机没有机器门禁，
 "我以为 hook 会拦"是不成立的。
 
-处置：它与三笔不合规 subject 都在**未推送**区间，按"不重写历史"不原地改，是否补（amend/rebase）
-归所有者。已登记进 `docs/CODE-INTELLIGENCE-KNOWN-ISSUES.md` 的 G4b。
+处置：它与三笔不合规 subject 当时都在**未推送**区间，按"不重写历史"不原地改。
+**2026-10-13 推送后更新**：分支已推到 `origin/feature/code-intel-phase-234`（tip `697e9a1`），
+所以修正它们现在意味着**改写已发布历史 + force-push** —— 技术代价低（无 PR、无协作、hooks 未装），
+但性质变了，仍归所有者决定，我没有做。已登记进 `docs/CODE-INTELLIGENCE-KNOWN-ISSUES.md` 的 G4/G4b。

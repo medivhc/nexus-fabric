@@ -3,7 +3,7 @@ doc-id: code-intelligence-known-issues
 layer: L2
 owner: coordinator
 last-verified: 2026-10-13
-verified-against: 9244085
+verified-against: 697e9a1
 status: current
 ---
 
@@ -183,15 +183,20 @@ status: current
 - **G4 `.githooks` 未安装**（`core.hooksPath` 未设，装它属所有者决定）⇒ `commit-msg` 的 type
   分类法在本地没有机器承载体，提交靠手工调用 hook。本分支历史上三笔 subject 不合规
   （`0a42240 feat`、`f1575b5 fix`、`4b61987 fix`；正确值是 `feature`/`bugfix`/`bugfix`，
-  注意 **`bug` 不是合法 type**——我 §V 的更正本身写错过一次，§X 再更正）。三笔都未推送，
-  但按"不重写历史"未原地改，是否 rebase 归所有者。现行口径：消息文本先过 `pre-commit` 与
-  `commit-msg`，两个都 exit 0 才 `git commit -F`。
+  注意 **`bug` 不是合法 type**——我 §V 的更正本身写错过一次，§X 再更正）。
+  **状态更新（2026-10-13 推送后）**：这三笔已随 `feature/code-intel-phase-234` 推到
+  `origin`（tip `697e9a1`），所以修正它们不再是"本地 rebase"而是**改写已发布历史 + force-push**。
+  该分支目前没有 PR、没有他人协作、`.githooks` 也未安装，技术上 force-push 代价低；
+  但这属"改写已发布历史"的破坏性动作 ⇒ 归所有者决定，我没有做。
+  现行口径（`97ecbe5` 起执行）：消息文本先过 `pre-commit` 与 `commit-msg`，两个都 exit 0
+  才 `git commit -F`。
 - **G4b 保护路径的 marker 有一笔历史缺口**：`f075157`（§U 台账提交）改了
   `engineering/nexus-harness/MODULE.md`（属 AGENTS.md §7 的 Protected 路径）但正文**没有
   `contract:` marker** —— 内容只是把"Linux 对应值待 §U 复跑实测"换成实测数字，契约语义未变，
   但按路径规则这是机械违规。`pre-push` 的 marker 检查是**按整个 range** 判"有没有任一 marker"，
   所以它不会拦住这种单笔缺口；发现方式是逐笔核 `git show --name-only` 对正文 marker。
-  修法与 G4 同：三笔历史都在未推送区间，是否补 marker（amend 或 rebase）归所有者决定。
+  修法与 G4 同：**这一笔也已经在 `origin` 上**（推送之后不再是本地可改范围），是否补 marker
+  （改写已发布历史 + force-push）归所有者决定。
 - **G5 stacking 决定 diff 归属**：本分支基座是**尚未合并**的 PR #12（head `df2049c`），
   master 在其之后又前进了 4 笔 doc/skill 提交（与代码无重叠，仅 `FILE_MANIFEST.md` 可能小冲突）。
   ⇒ 本 PR 的可见 diff 含 #12 的内容；合并顺序（#12 先、本分支后，或改基座）由所有者决定。
