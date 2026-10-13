@@ -1194,6 +1194,15 @@ r11 落地之后的复验（同一宿主与工具链，`status --json` 实测，
 # 顺序要说清：本节最后这几段（含本行）是在 12c9825 **之后**写进去的，属案卷文字，不参与编译、
 # 也不在 `scenarios/**` 里，所以上面那组数对随之落地的提交同样成立；后来人要复现整棵最终态，
 # 直接取 `refs/heads/m0-verify`（本批最后一次推送的就是它），别拿本节的 sha 列表当链。
+# 落地后复验（把**已提交的整棵树**推上通道，再在那一棵上跑一遍，这样第三方不必信我的散文）：
+#   source_revision       7e71e3ab76c078d8a0faad5275e70f0f7667a032  ← 现在 `m0-verify` 就是它
+#   working_tree_digest   00278ca980089bc0656c93ad0c5b84a04e197112
+#   contract_hash         2219448ed81870cbf67d1b4bd6cf93c63e5c51f4
+#   cargo test --lib      72 passed; 0 failed / verify --fast = 9 门全 PASS
+#   status verdict = PASS，evidence dir = verify-c18dcfd17b67，dirty_state = false
+# ⇒ 上一段那句"12c9825 之后还有案卷文字"的悬空状态已被消掉：通道上的 ref 现在与分支 HEAD
+#   逐字节相同，任何评审者 `git fetch` 就能拿到带本案卷的整棵树。
+
 
 
 
