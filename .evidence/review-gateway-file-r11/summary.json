@@ -1,0 +1,199 @@
+{
+  "schema_version": 1,
+  "review_id": "review-gateway-file-r11",
+  "review_round": 11,
+  "previous_review_id": "review-gateway-file-r10",
+  "verdict": "COMMENTED",
+  "reviewer": {
+    "agent": "独立代码/契约评审者（第 11 轮），未参与被评审内容的任何编码或写作。本轮做了实测：(1) Windows 纸面复核（读码、grep/awk、按 env.rs:188-216 复算、案卷逐句对账）；(2) xc-pc-linux 上评审者自有临时克隆的基线复跑（单测 / clippy / 9 条场景 / verify --fast / status --json）；(3) 同树与后继树上的变异实测（baseline、E、P8、D1、M10b、N14、M17、M18）；(4) harness 哨兵 flaky 的复现与单线程对照。不采信实现方的提交说明与案卷自述作为依据。",
+    "model": "本会话的元数据把模型标识记为 qfmodel；QoderCN 未对外披露其底层基础模型名称，我能确认的只有会话元数据里这个标识，无法确认更底层的模型名——不伪称。",
+    "host": "Windows 11 x64 (win32) + Git Bash（纸面复核、pre-commit 字典序实测）；xc-pc-linux（appen@10.144.144.4，全部编译/测试/场景/门禁结论）",
+    "could_not_compile": "Windows 侧未编译本 crate（ssh2 0.9.6 的 userauth_pubkey_memory 受 cfg(any(unix, vendored-openssl, openssl-on_win32)) 门控，本机无 cl.exe/nasm）。本轮不需要它：所有编译/测试/clippy/场景/门禁数字都改由 Linux 实测给出。另注：Windows 工作树里多数 scenarios/*.toml 是 CRLF（`od -c` 实测 `\\r\\n`），在 Windows 上按 env.rs 复算 contract_hash 会得到另一个值（我拿到 0f809e94…），这不是仓库缺陷而是 `2026-10-13-contract-hash-crlf-sensitivity` 那条知识条目说的坑。",
+    "executed_on_linux": "宿主 xc-pc-linux，rustc/cargo 1.98.1（x86_64-unknown-linux-gnu）。评审者自有临时克隆 /work/r11-qoder（`git clone /work/m0-verify`，HEAD = a0ce15f77a7bd3a052939b72e44c39b47e864f90，跑完 `git status --short` 归零）；未 push、未改动 /work/m0-verify 与 /work/nexus-dev/target；用我自己的三份 target：/work/r11-qoder-target（基线/场景/verify/status）、/work/r11-flake-target（harness flaky 复现）、/work/r11-mut-target（变异），CARGO_INCREMENTAL=0。实测清单：(1) `cargo test --lib -p nexus-web-gateway` ⇒ 70 passed; 0 failed；(2) `cargo clippy -p nexus-web-gateway --all-targets` ⇒ 零诊断、exit 0；(3) 9 条 product.gateway-file-* 场景逐条 `nexus-harness scenario run --json` ⇒ 9/9 PASS；(4) `verify --fast --json` ⇒ verdict PASS、9 门全 PASS、evidence dir = verify-404018b6b95c（与实现方自报同名，bindings 内容定位可证同源）；(5) `status --json` ⇒ contract_hash 2219448ed81870cbf67d1b4bd6cf93c63e5c51f4、working_tree_digest a76f554fccdf0d91b85a60887f3af56f41dcecc1、dirty_state=false、source_revision a0ce15f、toolchain 1.98.1 x86_64-unknown-linux-gnu——五项与实现方声明逐字相同；(6) 我自己按 env.rs 的算法在 Linux 上重拼输入（303 个 scenarios/*.toml，LF，426043 字节含前缀）并 `git hash-object --stdin` ⇒ 2219448e…（不是只调 harness 自己算）；(7) 变异实测（见 mutation_lethality_recomputed）；(8) flaky 复现：`touch engineering/nexus-harness/src/env.rs` + `cargo test -q -p nexus-harness` 10 个周期中 1 次红（cycle 9），失败测试名 `env::tests::digests_deterministic_and_sha1_length`，panic 在 env.rs:317、left=\"tree-unknown\"、right=a76f554f…；对照组 `-- --test-threads=1` 同样强制重建连跑 4 轮全绿。",
+    "mid_round_object_move": "被评审对象在本轮进行中原地移动了两次：案卷最初（= 已推送的 a0ce15f）写的是 70 单测 / c5d0918 口径；我在审计过程中工作树新增了 `expired_source_locks_are_reclaimed_instead_of_escalating_to_the_global_window` 与 `source_ledger_budget_forgives_failures_from_older_windows` 两条测试（file_service.rs 由 45 个 #[test] 变 47 个），案卷改口为「唯一口径 = 最终树 d0ace31，72 条单测」，变异表由 14 行扩到 18 行，N14 那一行由 5 红改成 6 红。我因此对两棵树分别实测：a0ce15f（验证通道上那棵）与工作树快照（`git hash-object` = cb826f8e06c84ed36e677a99e491780ae4c04500，我 scp 到自己的克隆里跑，字节一致可证）。",
+    "static_only": false
+  },
+  "source_revision": "a0ce15f77a7bd3a052939b72e44c39b47e864f90",
+  "scope": [
+    ".agents/green-evidence-gateway-file-service-m1.txt 的「追加：M1 第十一片」整节，重点是 `D 轮（r10 回来之后的落地，全部重新实测）` 子节与「D 轮变异表」",
+    "crates/nexus-web-gateway/src/file_service.rs：Throttle::lock_until / charge_source / arm_source / record_failure / is_locked / decay / identity_key / source_key / authenticate / close_session 与本批新增单测",
+    "crates/nexus-web-gateway/examples/gateway_file_contract.rs 的 e11/e13 段与 scenarios/product/gateway_file_auth_throttle.toml 最后两条期望",
+    "crates/nexus-web-gateway/MODULE.md 的 G12/G15/G16、PRODUCT.md §18.2、crates/nexus-web-gateway/requirements.toml REQ-010、FILE_MANIFEST.md",
+    ".agents/knowledge/entries/2026-10-13-harness-digest-sentinel-flake.md 与 .agents/knowledge/index.json、.githooks/pre-commit 第 4 关",
+    "engineering/nexus-harness/src/env.rs（contract_hash 算法与那条哨兵测试）、gates.rs（selected-properties 门）、evidence.rs（证据覆写）"
+  ],
+  "bindings": {
+    "verified_on_linux_clone": "/work/r11-qoder（评审者自有，HEAD a0ce15f，跑完 git status 归零）",
+    "source_revision": "a0ce15f77a7bd3a052939b72e44c39b47e864f90",
+    "working_tree_digest": "a76f554fccdf0d91b85a60887f3af56f41dcecc1",
+    "contract_hash": "2219448ed81870cbf67d1b4bd6cf93c63e5c51f4",
+    "contract_hash_reproduced_by_reviewer_own_reconstruction": true,
+    "dirty_state": false,
+    "verify_fast_evidence_dir": "verify-404018b6b95c",
+    "verify_fast_gates": "9/9 PASS（whitespace/format/check/clippy/architecture-policy/dependency-governance/resource-type-neutrality/affected-tests/selected-properties）",
+    "toolchain": "1.98.1 / x86_64-unknown-linux-gnu",
+    "shared_verification_ref": "/work/m0-verify 实测仍指向 a0ce15f（`git -C /work/m0-verify rev-parse HEAD`），案卷新宣布的唯一口径树 d0ace31 与 verify-e6f5aabdd251 / working_tree_digest 3fa1185a 尚未进入评审方可达的通道",
+    "worktree_snapshot_audited": "file_service.rs blob cb826f8e06c84ed36e677a99e491780ae4c04500（72 条 #[test]；examples 与 scenarios 与 a0ce15f 逐字节相同，故 contract_hash 与 26/103 两个数同样适用）",
+    "casebook_line_number_caveat": "本案卷里所有指向 .agents/green-evidence-gateway-file-service-m1.txt 的行号都按评审者最后一次读取（工作树 file_service.rs blob 仍为 cb826f8e）标注；该文件在本轮进行中被实现方连续编辑过三次（行号整体下移约 11 行、数字滚动了两处），引用时以句子的引文为准。代码行号（file_service.rs / MODULE.md / requirements.toml）在最后一次读取时逐条 grep 复核过。"
+  },
+  "counts": {
+    "fail": 0,
+    "warn": 2,
+    "note": 4,
+    "r10_warns_audited": 2,
+    "r10_notes_audited": 5,
+    "lib_tests_measured_on_pushed_tree": 70,
+    "lib_tests_measured_on_worktree_snapshot": 72,
+    "lib_tests_ran_green": 72,
+    "expectations_auth_throttle_measured": 26,
+    "expectations_total_measured": 103,
+    "expectations_total_method": "grep -c '^\\[\\[expect\\]\\]' 九条场景求和 26+7+10+6+16+9+15+5+9 = 103；与 9 条 `scenario run` 全 PASS 各自独立",
+    "test_attribute_count": "grep -c '#\\[test\\]'：cert 2 + config 15 + file_service 45 + gateway 2 + protocol 6 = 70（a0ce15f）；file_service 47 ⇒ 72（工作树快照）",
+    "file_manifest_declared": 210,
+    "file_manifest_measured": 210,
+    "file_manifest_method": "awk '/^\\| /{n++}' FILE_MANIFEST.md = 211，减表头 = 210（FILE_MANIFEST.md:5 与 :53 的口径一致）",
+    "mutation_rows_recomputed_by_reviewer": 8,
+    "mutation_rows_in_table": 18
+  },
+  "findings": [
+    {
+      "id": "R11-W-1",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/requirements.toml:89（REQ-010 acceptance 写死「把源摘要改成不吃地址 ⇒ 实测 5 条单测红 + 6 条期望翻转」，不带树限定）；.agents/green-evidence-gateway-file-service-m1.txt:1230（「本批不受它影响：gateway 的 70 条单测」，同段 103 条期望对得上、单测数对不上）与 :1037-1038（D1 那格保留 c5d0918 的 70 条数，而 :1076-1078 的表头宣布「中途 c5d0918 那一张的数不再引用」）；对照 :1076（唯一口径 = 最终树 d0ace31，72 条单测）、:1097（N14 ⇒ RED 6 + 6 翻转）、:1105（D1 ⇒ 72 全绿）",
+      "summary": "案卷把「唯一口径」换成最终树 d0ace31（72 条单测、N14 ⇒ 6 红 + 6 翻转），并且同一轮内已经自己滚好了两处：滚动链 :945-949 追到 72，未闭事项 :1218-1219 把 N14 写成「c5d0918 上 5 条单测红 + 6 条期望翻转，在最终树 d0ace31 上是 6 条红 + 6 条翻转」——这正是本链要求的「历史值 + 限定语」写法，我照实记为已修。剩下三处没跟上，其中只有一处要紧：**requirements.toml:89 是契约文件**，它不带任何树限定地写死「实测 5 条单测红 + 6 条期望翻转」，而案卷同一节宣布另一个数才是唯一口径 ⇒ 后来人按契约文件核就核不上（我实测：a0ce15f 上 5 红 + 6 翻转，工作树快照 cb826f8e 上 6 红 + 6 翻转，多出的那条正是新加的 `expired_source_locks_are_reclaimed_…`——两个数都真实，缺的是限定语）。另两处是引用纪律：:1230 那句「70 条单测」在本段语境里没说是哪棵（103 条期望倒是对得上当前树），:1037-1038 的 D1 那格带着「复验树 c5d0918」的限定语、数值无误，但表头 :1076-1078 明写那张的数不再引用，同一节里两套口径并存会逼下一个读者重新推一遍。修法：REQ-010 那句改成「最终树 6 红 + 6 翻转（70 条那棵树为 5 红）」或干脆不写数（G15 未证事项已经有不写数量的先例）；:1230 补限定语；:1037 与 :1105 二选一。",
+      "reproduction": "Linux：`git clone /work/m0-verify /work/r11-x && cd /work/r11-x && CARGO_TARGET_DIR=/work/r11-x-target cargo test --lib -p nexus-web-gateway`（70 passed）；把 `source_key` 里 `h.update((source.len() as u64).to_le_bytes()); h.update(source.as_bytes());` 换成 `let _ = source; h.update((0u64).to_le_bytes()); h.update(b\"source-blind\");` ⇒ 5 failed（名单含 address_representation_drift_arms_two_independent_source_locks），auth-throttle 26 条期望翻转 6 条。再换成工作树快照的 file_service.rs（`git hash-object` 应为 cb826f8e06c84ed36e677a99e491780ae4c04500）重复同一变异 ⇒ 6 failed + 6 翻转。数字核对：`grep -c '^\\[\\[expect\\]\\]' scenarios/product/gateway_file_auth_throttle.toml`、`grep -rc '#\\[test\\]' crates/nexus-web-gateway/src/file_service.rs`（45 对 47）。"
+    },
+    {
+      "id": "R11-W-2",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/MODULE.md:363-364（G16 前提段「同时被**四件事**依赖」）；.agents/green-evidence-gateway-file-service-m1.txt:963-964（「四个用途…**一次登记齐**」，名单与 MODULE 不同）；crates/nexus-web-gateway/src/file_service.rs:1796（close_session doc 写「归属检查、单源额度与 per-peer 配额」三处）；crates/nexus-web-gateway/examples/gateway_file_contract.rs:974（探针注释同样写三处）；缺的那个消费点：crates/nexus-web-gateway/src/file_service.rs:820-826（identity_key 的 source 半进摘要）与其调用点 :877（is_locked）/:903（record_failure）/:1148（succeed）",
+      "summary": "同一条 transport-address 字符串的依赖面被三处文档数成了三种答案：代码 doc 与探针注释说**三处**（归属、单源额度、per-peer 配额，漏了源锁表），MODULE G16 说**四件事**（配额、单源额度、源锁、归属，漏了两层键的摘要半），案卷 R9-W-1 那条处置说**四个用途**并且换了一份名单（归属、单源额度、per-peer 配额、摘要键，漏了源锁），还配一句「G16 前提段把这条字符串的四个用途**一次登记齐**」。真实消费点是**五个**——`source` 还作为 `identity_key` 的一半进 (主体,源) 摘要，所以表示漂移同样会把**单个身份的 pair 侧额度翻倍**（两种写法 = 两个桶 = 2×`lockout_after` 次猜测才武装 pair 锁），这一格既不在任何一份清单里，也没有机验对象（本轮新增的两条对象钉的是归属与源额度那两格）。G16 这条的用途是「M2 接线时必须逐处核」的清单，清单少一处就是这条前提没登记齐——与 r9 R9-W-1 抓的「前提原先只为 per-peer 配额登记过」是同一个形状。不构成运行时缺陷（代码本身五个消费点行为一致），故判 WARN 而非 FAIL；也不是「已做完」——案卷那句「一次登记齐」是把没做全的说成做全了。",
+      "reproduction": "`grep -n 'Self::identity_key' crates/nexus-web-gateway/src/file_service.rs` ⇒ :877/:903/:1148 三处把 `source` 喂进两层键摘要；`grep -n '四件事\\|四个用途\\|三处\\|归属检查、单源额度' crates/nexus-web-gateway/MODULE.md crates/nexus-web-gateway/src/file_service.rs crates/nexus-web-gateway/examples/gateway_file_contract.rs .agents/green-evidence-gateway-file-service-m1.txt` ⇒ 同一件事三份不同名单与计数。修法：把 G16 那句改成五处（补「(主体,源) 两层键的摘要半」），三处 doc/注释口径同步，或按 MODULE 自己那条「不许写会说谎的计数」的口径干脆不写数量。"
+    },
+    {
+      "id": "R11-N-1",
+      "severity": "NOTE",
+      "location": ".agents/green-evidence-gateway-file-service-m1.txt:1052（D 轮第 2 点「baseline 当场报 1 条单测红 + 25 条期望全 MISSING」）与 :934-935（bindings 侧同一件事的写法，未写条数）",
+      "summary": "机制我复现了、方向也对，条数差一：fbcac2e 自带的 scenarios/product/gateway_file_auth_throttle.toml 里有 **26** 条 `[[expect]]`（`git show fbcac2e:… | grep -c`），其中已经包含 `address_representation_drift_splits_the_source_budget`；探针在 e13 的 `engine_at(...)?` 上带 CONFIG_INVALID 提前退出，实测 stdout 只有 `{\"case\":\"auth-throttle\",\"error\":\"CONFIG_INVALID: max_failures_per_source must be >= lockout_after…\",\"verdict\":\"FAIL\"}`，没有字段 dump ⇒  MISSING 应是 26 条而不是 25 条。同一格的单测数（1 条红，正是那条漂移测试）我复现无误。小错，但这段是「本轮自己红出来的」自我纠错记录，越该按实测写死。",
+      "reproduction": "`git show fbcac2e:crates/nexus-web-gateway/src/file_service.rs | grep -n 'lockout_after: 9'`（夹具确为 9/4）；`git show fbcac2e:scenarios/product/gateway_file_auth_throttle.toml | grep -c '^\\[\\[expect\\]\\]'` = 26；在 Linux 上 `git checkout fbcac2e -- crates/nexus-web-gateway/src/file_service.rs crates/nexus-web-gateway/examples/gateway_file_contract.rs` 后 `cargo test --lib` ⇒ 69 passed/1 failed，`cargo run -q -p nexus-web-gateway --example gateway_file_contract -- --case auth-throttle --json` ⇒ 只有 CONFIG_INVALID 那一行（我实测输出 221 字节）。"
+    },
+    {
+      "id": "R11-N-2",
+      "severity": "NOTE",
+      "location": ".agents/green-evidence-gateway-file-service-m1.txt:1060-1108（D 轮变异表 18 行）",
+      "summary": "本轮我独立复跑的只有 8 行（两棵树合计）：baseline、E、P8、D1、M10b、N14，加快照上的 M17、M18。未复跑 10 行：P1、P2、P3、P4、P5、P6、P7、N13、M15、M16，以及 F（F 由 r10 在 8a67e85 代跑，案卷已按 r10 R10-N-2 分开署名，署名与 r10 案卷一致，无需再动）。复跑过的 8 行**全部对上**，包括红/翻数目与名单（M10b 11+11、N14 6+6 且名单含两条新测试、D1 72+0、M17 1+0、M18 1+0 且红点正是各自那条新测试、P8 1+1、E 72+0）。因此我对这张表的整体可信度判断是「已复跑部分零分歧」，不是「整张表被证伪」；未复跑那十行仍是实现方单方面的自报，引用时需要评审者自己的 target。",
+      "reproduction": "变异配方与红名单见本文件 mutation_lethality_recomputed；工具：`python3 /work/r11-mut.py <名>` 与 `/work/r11-check.py`（对照 26 条冻结期望逐字段 diff），每支跑完 `git checkout -- crates/nexus-web-gateway/src/file_service.rs` 复原。"
+    },
+    {
+      "id": "R11-N-3",
+      "severity": "NOTE",
+      "location": "共享验证通道 `ssh appen@10.144.144.4`：`git -C /work/m0-verify rev-parse HEAD`；.agents/green-evidence-gateway-file-service-m1.txt:914-920（d0ace31 的 bindings 段）",
+      "summary": "案卷把口径换到 d0ace31 并写下 `verify --fast 连跑 2 次全 PASS、evidence dir = verify-e6f5aabdd251、working_tree_digest 3fa1185a…`，但评审方可达的验证通道 `/work/m0-verify` 实测仍停在 a0ce15f。也就是说：**这一节最新宣布的那组 bindings 目前无法被第三方在门禁通道上复核**（我只能在 Windows 侧读到案卷文字，并靠 scp 工作树快照自建等价树）。a0ce15f 那组我是逐字复现的（contract_hash、working_tree_digest、dirty_state、verify-404018b6b95c、9 门、70 单测、103 期望）。落地前请把最终树 `git push -f … <sha>:refs/heads/m0-verify` 一次，否则案卷会出现「只有实现方自己能证」的一段——这与本链 r10 起「评审方实测优先」的既定口径不符。",
+      "reproduction": "`ssh appen@10.144.144.4 'git -C /work/m0-verify rev-parse HEAD'` ⇒ a0ce15f…；`ls /work` 无 d0ace31 对应克隆。"
+    },
+    {
+      "id": "R11-N-4",
+      "severity": "NOTE",
+      "location": ".agents/green-evidence-gateway-file-service-m1.txt:1165-1196（「然后本轮把它逼出来了」那段）与 .agents/knowledge/entries/2026-10-13-harness-digest-sentinel-flake.md:11-14",
+      "summary": "这条是确认，不是质疑，只欠样本量措辞：配方（`touch engineering/nexus-harness/src/env.rs` + `cargo test -p nexus-harness`）我在**另一棵树**（a0ce15f）上独立复现了同一条 panic——红的是 `env::tests::digests_deterministic_and_sha1_length`，env.rs:317，`left: \"tree-unknown\"` / `right: a76f554fccdf0d91b85a60887f3af56f41dcecc1`（正是这棵树的 working_tree_digest，与 status --json 实测同值），10 个并行周期中 1 次；对照组 `-- --test-threads=1` 4 轮全绿。实现方自报的频率是「3 周期中 1、8 周期中 1」（≈18%），我这边是 1/10（10%）——同一数量级、都不排除偶然，所以「已定位机制」站得住（机制我另外静态核实：env.rs:144-153 在 `git write-tree` 失败时 `unwrap_or_else` 成 `tree-unknown`，正是并行测试对同一 live repo 并发调 git 的那条降级路），但两处频率都该标成小样本，不要读成 1/4 或 1/10 的稳态率。",
+      "reproduction": "在 Linux 克隆里：`for i in 1..10; do touch engineering/nexus-harness/src/env.rs; cargo test -q -p nexus-harness; done`；对照 `cargo test -q -p nexus-harness -- --test-threads=1` ×4。我另核实 `engineering/nexus-harness/src/gates.rs:278-285` 的 selected-properties 门确实是 `cargo test -p nexus-harness`，与案卷说的一致。"
+    }
+  ],
+  "r10_disposition_audit": {
+    "R10-W-1": {
+      "claimed": "arm_source 返回值语义改成「有没有落下状态」，调用方只在落下时销账；None 分支实践不可达，故修法零红对象。",
+      "verdict": "真闭上（状态半），并诚实自报零杀伤力",
+      "evidence": "crates/nexus-web-gateway/src/file_service.rs:1016-1035 `arm_source` 现在唯一返回 false 的条件是 `lock_until` 取不到 until（:1026-1028），doc :1021-1025 明写「返回值的意思是‘有没有落下状态’，不是‘这次是不是该按锁定处理’」；:1006-1008 销账改成 `if self.arm_source(skey, now) { self.source_failures.remove(&skey); }`。终态与 pair 侧对齐：pair 侧 :946-947 先写桶行、:961-968 只有拿到 until 才落锁/升级，取不到时超限桶行保留 ⇒ 下一条失败当场再试；源侧现在同样保留账本行 ⇒ 下一条失败当场再试（`source_failures.remove` 全仓只有 :1007 一处，`source_locks.insert` 只有 arm_source :1034 一处，我逐个 grep 过）。`None if source_failures.len() >= max_buckets` 那支（:987-992）丢弃返回值是安全的：那条分支上**没有该地址的账本行可销**（它本来就不许建行），返回值唯一用途就是门销账；且无论锁有没有落地都 `return true` ⇒ 本次仍按锁定处理，与 :793-797 `lock_until` 的承诺、与 pair 侧溢出分支 :953-958 的 `return true` 同形；None 时既不插账本行也不插锁行 ⇒ 内存不增长，不存在 fail-open（最坏情况是「同一地址下一次带正确令牌的尝试被放行」，与 pair 侧 None 时的行为一致）。杀伤力我自己复跑：D1_always_clear_ledger（改回无条件 remove）⇒ 70 条全绿 / 26 条期望零翻转（a0ce15f），72 条全绿 / 零翻转（工作树快照）——与「零红对象」的自报一致。",
+      "residual": "该分支不可达性我独立核实：:798-801 `lock_until` 的 `checked_add(lockout)` 失败还有 `checked_add(3600s)` 回退，两支同时失败需要 `Instant` 距平台上界不足一小时；:214-227 把 `lockout_window`/`idle_timeout` 封在 24h 内、:1414 `FileEngine::new` 走 `limits.validate()?`，所以没有任何配置或调用序列能把它逼出来（我构造不出来 ⇒ 不是 FAIL）。时钟不可注入这条继续登记在 G15 未证事项，未谎称已解。"
+    },
+    "R10-W-2": {
+      "claimed": "selected-properties 间歇红已定位到 harness 自己的哨兵降级，本轮不修，三条待办登记。",
+      "verdict": "定性成立、未把没做的写成做完；定位我独立复现",
+      "evidence": "见 R11-N-4（我复现 panic 与对照组）；覆写机制静态核实：engineering/nexus-harness/src/evidence.rs:126-162 目录名 = `verify-<按 bindings 算的 id>`，`write_json` 对 summary.json/gates.json/metadata.json 无条件覆写 ⇒ 同树复跑必然销毁前一次 FAIL 的取证。三条待办 (a)(b)(c) 都落在 .agents/knowledge/entries/2026-10-13-harness-digest-sentinel-flake.md 的 (1)(2)(3) 段并已进 index.json（id `hsh-digest-sentinel-flake-001`，我 `JSON.parse` 过 index.json，合法）。"
+    },
+    "R10-N-1_and_N-2": {
+      "claimed": "provenance 更正：轮转地址属 8a67e85；F 由 r10 代跑、P6/M10b 由实现方跑，署名分开。",
+      "verdict": "两条更正都属实",
+      "evidence": "`git show 1c0f0a9:crates/nexus-web-gateway/src/file_service.rs`:3124 仍是单地址 `10.0.0.9`，轮转 `10.7.{slot/256}.{slot%256}` 出现在 `git show 8a67e85:…`:3172 ⇒ 案卷把「本批改掉」写成「本轮之前已改掉」的原错已按 r10 的抓取改正；MODULE.md:300-306 现在按「P6/M10b 实现方跑、F 由 r10 在复验树代跑」分开署名，与 r10 findings §4 的实测一致（我在 a0ce15f 上重跑 M10b/P6 同类锚点未遇反例）。"
+    },
+    "R10-N-3": {
+      "claimed": "整张变异表在同一棵树上重跑，每个数只属于那一棵。",
+      "verdict": "方向对，但本轮内已再次失效（见 R11-W-1）",
+      "evidence": "表头两次改口（c5d0918/70 条 ⇒ d0ace31/72 条），而 REQ-010 与案卷三处散文没跟上；「每个数各自属于自己那棵树」这条纪律本身我复跑过的 8 行都成立。"
+    },
+    "R10-N-4": {
+      "claimed": "补上「两种表示」退化的两个机验对象（单测 + 冻结期望），并把源摘要改成不吃地址就能让它们红。",
+      "verdict": "真闭上，对象有效，因果干净",
+      "evidence": "夹具合法性我按 G12 逐条核：`lockout_after: 4` + `max_failures_per_source: 4` ⇒ :242-246 的 `>= lockout_after` 与 :248-256 的 `<= max_throttle_buckets × lockout_after` 都过（第一版 9/4 确实会被 validate 拒，我复现了那次红，见 R11-N-1）。因果：最终那一次 authenticate 的主体在单测里是 `dual`、在探针里是 `bystander`，两者在整个夹具里**从没失败过** ⇒ 它的 (主体,源) 桶行与锁都不存在；该夹具总共 8 条失败、2 个身份 ⇒ 表远没满（1024），全局窗口不可能武装 ⇒ THROTTLED 只能来自 source_locks 那一道地址锁。断言 `throttle_source_locks() == 2` + `throttle_source_ledgers() == 0` 钉的是「两种写法各一份额度、武装即销账」。杀伤力：N14（source_key 不吃地址）⇒ 单测 5 红（a0ce15f）/6 红（快照），两条新对象都在红名单里；期望翻转 6 条，含 `address_representation_drift_splits_the_source_budget`。所以 MODULE G16 那句「谁做归一化这两条会红」是实测，不是推断。"
+    },
+    "R10-N-5": {
+      "claimed": "两支表满升级共用同一个 `global_locked_until` 槽且直写不取 max，不是缺陷，写进 G15 正文。",
+      "verdict": "成立",
+      "evidence": "file_service.rs:962-964 与 :1030-1032 两处都写同一个 Option 槽；`until` 恒为 `各自 now + lockout_window`（:798-801），后一次调用的 `now` 不早于前一次 ⇒ 覆盖只会延长；MODULE.md:291-297 已把这条写进正文。我另核实 `decay` :862-866 只在到期后清该槽，不与升级分支冲突。"
+    }
+  },
+  "mutation_lethality_recomputed": {
+    "method": "在自己的克隆 /work/r11-qoder 里按锚点做精确字符串替换（锚点计数断言 ==1，替换前先核存在），跑 `cargo test --lib -p nexus-web-gateway` 收红名单，再用 python 把 26 条 `[[expect]]` 的 field/equals 与探针 `--case auth-throttle --json` 的字段逐项比对得翻转数；每支跑完立即 `git checkout -- crates/nexus-web-gateway/src/file_service.rs` 复原（每次输出 `reverted; git status: clean`，最终整树 `git status --short` 空）。",
+    "tree_a0ce15f_pushed": {
+      "baseline": "70 passed; 0 failed / 26 条期望零翻转（探测器有效）",
+      "E_关掉纵深防御那支": "70 全绿 / 0 翻转 —— 与实现方表内数字一致",
+      "P8_去掉空地址守卫": "1 红（empty_transport_address_is_refused_before_the_throttle）+ 1 翻转（empty_source_is_refused_before_the_throttle）—— 一致",
+      "D1_always_clear_ledger": "70 全绿 + 0 翻转 —— 一致（R10-W-1 零红对象为真）",
+      "M10b_去掉锁定预检": "11 红 + 11 翻转 —— 一致，红名单含新增漂移单测，11 条翻转名单与实现方自报逐条对上（locked_after_attempts 6→0、correct_token_bypasses_lockout false→true、code_after_teardown THROTTLED→ACCEPTED 等）",
+      "N14_source_key_collapses": "5 红 + 6 翻转 —— 与 c5d0918/a0ce15f 口径一致；红名单含 address_representation_drift_arms_two_independent_source_locks"
+    },
+    "tree_worktree_snapshot_cb826f8e": {
+      "baseline": "72 passed; 0 failed / 26 条期望零翻转",
+      "N14_source_key_collapses": "6 红 + 6 翻转 —— 与案卷新表一致；多出的那条红正是 expired_source_locks_are_reclaimed_…",
+      "D1_always_clear_ledger": "72 全绿 + 0 翻转 —— 与新表一致",
+      "M10b_去掉锁定预检": "11 红 + 11 翻转 —— 与新表一致（两条新测试不依赖锁定预检，故未从 11 变 13）",
+      "M17_源账本不随窗口衰减": "1 红 + 0 翻转，红点 = source_ledger_budget_forgives_failures_from_older_windows —— 与新表一致（说明那条测试确有杀伤力）",
+      "M18_源锁过期不回收": "1 红 + 0 翻转，红点 = expired_source_locks_are_reclaimed_instead_of_escalating_to_the_global_window —— 与新表一致"
+    },
+    "not_recomputed_by_reviewer": ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "N13", "M15", "M16", "F（r10 已在 8a67e85 代跑，与本轮署名口径一致）"]
+  },
+  "positive_verifications": [
+    "实现方自报的六个可机验数字我在它自报的那棵树上**逐项复现、零分歧**：70 passed/0 failed、clippy --all-targets 零诊断且 exit 0、9 条 product.gateway-file-* 场景全 PASS、期望 26（auth-throttle）/103（九条和）、verify --fast 9 门全 PASS 且 evidence dir = verify-404018b6b95c（内容定位 id 相同 ⇒ 同源）、status --json 的 contract_hash 2219448e / working_tree_digest a76f554f / dirty_state=false / source_revision a0ce15f 逐字相同。",
+    "contract_hash 我没有只调 harness 自己算：按 env.rs:188-216 的目录序 + 文件名序（LC_ALL=C sort）+ `scenarios/<dir>/<file>\\n<内容>` + `\\n===\\n` 分隔在 Linux 上重拼 303 个文件（426043 字节含前缀）后 `git hash-object --stdin` ⇒ 2219448ed81870cbf67d1b4bd6cf93c63e5c51f4。同时确证 CRLF 敏感性是真的：同一算法在 Windows 工作树（多数场景文件是 CRLF）算出 0f809e94…，与知识条目一致。",
+    "「落地提交与 c5d0918 的差只有散文」为真：`git diff --numstat c5d0918 a0ce15f -- crates/nexus-web-gateway/src examples scenarios` ⇒ 只有 file_service.rs 3+/2-，且 `git diff -U0 … | grep -E '^[+-][^+-]' | grep -vE '^[+-][[:space:]]*(//|///)'` 输出为空；examples 与 scenarios 逐字节相同 ⇒ D 轮变异表的数在 a0ce15f 上同样成立（我就是这样实测到的）。",
+    "四张表内存上界逐张核过且各只有一个插入点：buckets（:936-947 准入门禁后 :947 insert）、locked（:962-964 满则升级）、source_failures（:987 满则不建行、:995 insert）、source_locks（arm_source :1030-1034 满则升级）；`grep -n 'source_locks\\.\\|source_failures'` 无第二个写点。`arm_source` 是 source_locks 唯一 insert 入口（全仓调用点只有 :990 与 :1006）。",
+    "「在源锁表还有位置时不升级」与代码逐字一致（MODULE.md:281-292、PRODUCT.md:3322-3325「地址表还有位置时不牵连别的地址」、REQ-010 同一句）；升级路径两支共用槽的口径见 R10-N-5。",
+    "三个速率数与两个地址数我独立复算：60/(60+1029/84.4) = 0.8311 ⇒ 83.1%；1024×5/60 = 85.33；1025×4/60 = 68.33；1024×1/60 = 17.07；40/60 = 0.667；5120/40 = 128（精确）；⌈1029/40⌉ = 26（25.725 上取整）。MODULE 与 PRODUCT 现在 128 与 26 两个数都写，且都注明「算术而非实测」——没有把 83.1% 说成测过。",
+    "「同形性只管返回值与审计行」这句在代码里站得住：close_session 两分支的 `record` 六格入参 (:1802, :1813) 与错误码/消息字面量相同，且审计行写在 `sessions.insert` 之前（:1811-1816），doc :1779-1786 明写被拒分支多一次 insert、时序侧不背书——与 G15 (c) 段口径一致。",
+    "R9-N-9 那条「会说谎的计数」确实删了：.agents/knowledge/entries/2026-09-30-coverage-run-flaky-timing-test.md 现在写「每一个时间读取都直接调 Instant::now()（这里故意不写数量）」，无「六处」字样。",
+    "pre-commit 第 4 关那句实测为真（我在 Windows 本机跑）：`ls -1d .evidence/review-* | sort | tail -1` ⇒ `.evidence/review-gateway-file-r9`，`sort -V` ⇒ `.evidence/review-gateway-file-r10`；钩子第 4 关用的正是 `sort | tail -1`（.githooks/pre-commit:56-59）。知识条目 (3) 与此一致。注意：本轮我建好 r11 目录后，字典序取到的仍是 r9（r10/r11 都排在 r9 之前），这条待办的杀伤面还在。",
+    "harness 三条待办是被正当登记的，没有被悄悄吞掉：知识条目三段各带文件行号（env.rs 的 tree-unknown 分支、evidence.rs:128-162 覆写、pre-commit 字典序），.agents/knowledge/index.json 有对应行（`hsh-digest-sentinel-flake-001`）且文件 JSON 合法；案卷 :1121-1123 明写「本轮不修」，未宣称已修。",
+    "新单测的因果我逐行核过：`authenticate` 空地址在进节流器前拒（:1683-1690），`is_locked` 预检在比较前（:1690-1693），`token_eq` 是唯一比较入口；漂移那条测试的最后一次 authenticate 主体从没失败过，pair 侧不可能贡献那次 THROTTLED。",
+    "REQ-010/G15/G16/PRODUCT 之间没有出现「契约说了而代码没做」的反向缺口：本轮新增的两条对象在两处契约里都被点名（MODULE.md:370-371、requirements.toml:89），点名与实测一致（除 R11-W-1 那个数字归属问题）。"
+  ],
+  "merge_decision": "可合并（COMMENTED）。本轮没有任何 FAIL：实现方在 D 轮里说的每一句可机验的话我都复现了，两处「没有红对象」的自报（R10-W-1 的不可达分支、E 那支纵深防御）我用变异实测证伪失败——它们确实零杀伤力并且案卷把这一点写成未证事项而不是写成修好了。落地提交前请做三件小事实性收口：(1) 把 R11-W-1 列的那几处数字统一到它自己宣布的唯一口径（或补树限定语），(2) 把 R11-W-2 的五处消费点清单补齐并统一三处口径、把「一次登记齐」那句改准，(3) 把最终树推到 refs/heads/m0-verify 让 d0ace31 那组 bindings 变成第三方复核得到的东西。",
+  "blocking_issues_remaining": [],
+  "non_blocking_followups": [
+    "requirements.toml:89 补树限定或滚到 6+6；案卷 :1037-1038 与 :1230 两处按表头「c5d0918 的数不再引用」的口径统一（R11-W-1。同轮内实现方已把 :945-949 的滚动链与 :1218-1219 的未闭事项改成双树并记，那两处不必再动）。",
+    "G16 前提段的 `source` 消费点清单补第五处并统一三处 doc 的计数（R11-W-2）；若要连 pair 侧漂移一起钉，可把断言加在现有两条对象里（同一夹具已具备条件），但那是可选加强，不是缺口。",
+    "案卷 :1052 的 D0 MISSING 数改 26（:934-935 那格没写条数，可不动；R11-N-1）。",
+    "最终树推 m0-verify，使 verify-e6f5aabdd251 / 3fa1185a 进入评审通道（R11-N-3）。",
+    "FILE_MANIFEST 需在 r11 案卷落地时 +2 行（r10 那次的口径是 `awk /^\\| /{n++}` 减表头）；`.agents/knowledge/entries/2026-10-13-harness-digest-sentinel-flake.md` 按 FILE_MANIFEST.md:58 的声明不进清单，无需登记。",
+    "harness 侧 (a) 哨兵不静默降级、(b) 证据不原地覆写、(c) pre-commit 改 `sort -V`：跨 crate，本轮不修，已由知识条目 + 案卷待办登记，跟进人仍是 `fix/nexus-harness-evidence-binding` 那一摊。",
+    "时钟注入（Throttle 全部读 Instant::now()）仍是 G15 未证事项，M1 剩余项；本轮两处「不可达分支零红对象」的定性都依赖它继续不可达。"
+  ],
+  "not_machine_verifiable_this_round": [
+    "`lock_until` 的 None 分支与「一小时回退」那条终态对齐：时钟不可注入，且我构造不出可达配置（validate :214-227 封 24h；Instant 溢出需距平台上界不足一小时）⇒ 只能静态核 + 用 D1 的零杀伤力反向佐证，不能算有测（与实现方自报同口径）。",
+    "`constant_time_eq` 的时序形状那一半仍无断言（本轮未新增对象，也不该假装能测）。",
+    "D 轮变异表 18 行中 P1/P2/P3/P4/P5/P6/P7/N13/M15/M16 共 10 行本轮未独立复跑（轮次预算），引用时仍以实现方自报为准；F 那行按案卷署名属 r10 代跑，本轮不重复。",
+    "案卷新宣布的 d0ace31 那组 bindings（verify-e6f5aabdd251、working_tree_digest 3fa1185a）：评审通道 /work/m0-verify 未指向该树，我没有直接在实现方意义上复跑 verify，只是用 scp 的字节一致快照复跑了单测/期望/变异 ⇒ 该组 verify 数字本轮仍属自报。",
+    "RSS/OS 句柄上界、`files` 配置接线、地址成为凭证（M2 capability）、`max_failures_per_source` 的速率侧：本批未做，契约里也明写未做，本轮无新增证据。"
+  ],
+  "rejected_items": [
+    {
+      "item": "「D 轮把 R10-W-1 修好了，所以那条时钟边界分支现在有测试保护」",
+      "reason": "实现方自己没这么写，我也把它列为已拒：D1_always_clear_ledger 在两棵树上都是全绿 + 零翻转（我实测），修法只买到了散文诚实，G15/案卷 :1216-1222 已明写「不许读成修掉了某个运行时问题」。这条预设立场不成立。"
+    },
+    {
+      "item": "「案卷里的自我更正（R9-N-1 树号、F 署名、flaky 定位）是把推断写成实测」",
+      "reason": "逐条反驳：轮转地址的归属我用 `git show 1c0f0a9:…`:3124 与 `git show 8a67e85:…`:3172 独立证实；F 的拆开署名与 r10 案卷一致；flaky 的定位我在另一棵树上复现出同一条 panic 与单线程对照全绿。三处更正都比原句更保守，没有反向过度声明。"
+    }
+  ],
+  "report_file": ".evidence/review-gateway-file-r11/findings.md",
+  "escalation_note": "第 11 轮继续超出 AGENTS.md §19.1 的默认 3 轮上限（r4/r5/r6 已向仓库所有者报备并延续，所有者口径为「子代理独立评审即可，不必等我操作」）。本轮新出现的流程事实：被评审对象在同一次评审进行中原地移动（70 ⇒ 72 单测、变异表 14 ⇒ 18 行、口径树 c5d0918 ⇒ d0ace31），而共享验证 ref 仍停在 a0ce15f；建议后续轮次在派发前把「本轮冻结的 sha」写进任务书，否则评审者与实现方会各自量不同的树（本轮我靠双树各跑一遍避免误判，代价是 R11-N-2/N-3 两条只能记为未复跑/不可复核）。"
+}

@@ -971,7 +971,8 @@ fn auth_throttle(f: &mut Map<String, Value>) -> Result<(), String> {
         ),
     );
     // 空传输地址在**进入节流器之前**就被拒（评审 r9 R9-W-1：本批两个新机制都键在地址串
-    // 上，空串会让归属检查、单源额度与 per-peer 配额三处共用同一个退化键）。契约面要的不
+    // 上，空串会让五个消费点共用同一个退化键——归属、单源额度、源锁、per-peer 配额、
+    // `(主体,源)` 摘要键的源那一半；r11 R11-W-2 把早先"三处"的说法对齐）。契约面要的不
     // 只是返回码：它一次令牌比较都不做，也不在节流的两张源表里留下任何东西。
     let empty_compares = e11.token_comparisons();
     let empty_buckets = e11.throttle_buckets();

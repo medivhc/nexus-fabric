@@ -2,7 +2,7 @@
 
 本包实现《Nexus 统一系统设计规范 v9》中的“统一仓库目录契约”。
 
-文件数（不含本清单）：210
+文件数（不含本清单）：212
 
 > 2026-10-10：原声明值 137 与表内实际行数（148）已不一致（既有漂移，含
 > `scenarios/engineering/bench_gate_verdicts.toml` 等未登记项）。本次登记
@@ -59,6 +59,12 @@
 > 只在 `index.json` 登记，先例见上面那条惯例说明）。期望同轮 102 → **103**（地址表示漂移），
 > 单测 69 → **72**（地址漂移、源锁过期回收、源账本过期衰减——后两条是本轮全量重跑衰减族时
 > 发现原本零可红对象才补的，写在案卷《第十一片》D 轮第 6 点）。
+> 2026-10-13（r11 落地）：r11 案卷 2 行 ⇒ **212**（`awk '/^\| /{n++}'` 实测 213 减表头）。
+> r11 开出的两条 WARN 都是口径：契约文件里一条不带树限定的变异红数（改成双树并记），以及
+> 同一条 transport-address 串的消费点被四处文档数成三样（真实是**五处**，漏的是 `(主体,源)`
+> 摘要键的源那一半，其代价是单个身份两种写法 ⇒ pair 侧门槛翻倍）。"四个用途一次登记齐"那句
+> 作废并改写；摘要键那一半的机验对象是**既有**的 `other_source_still_admitted` 一系（继承关系，
+> 不是点名覆盖），这一点也照实写清，不冒充专门为漂移写的夹具。
 >
 > 同时改变一条惯例：`.evidence/review-gateway-file-r1/` 与 `-r2/`（`summary.json` +
 > `findings.md`）按 `git add -f` **随分支携带**。理由是评审 r1 的 G1 项实测证明
@@ -278,6 +284,8 @@
 | `.evidence/review-gateway-file-r9/findings.md` | 第 9 轮取证（257 行）：Windows 侧纸面复核（未编译、未跑门禁），自行复算并复现 `contract_hash` ef289491、逐格核对两分支审计同形性、按夹具重推杀伤力表（M10b 的 9/9 是静态重推，实现方在 Linux 复跑后定稿为 10/10） |
 | `.evidence/review-gateway-file-r10/summary.json` | 第 10 轮案卷（D 轮：r9 处置的复核），verdict `COMMENTED`（0 FAIL / 2 WARN / 5 NOTE，`blocking_issues_remaining` 为空、`items_rejected` 1）；**本链第一次由评审方在 xc-pc-linux 上实测**（自有临时克隆与隔离 target，复现 69 单测/102 期望/clippy 零诊断/M10b 10 红 10 翻转/P8 1+1/F 编译失败），`git add -f` 携带 |
 | `.evidence/review-gateway-file-r10/findings.md` | 第 10 轮取证（157 行）：三张声明的绑定复核（`git diff 8a67e85` 脏差是否只有散文）、r9 六条 WARN 的逐条判定、R10-W-1 状态侧口径（时钟边界分支只对齐了返回值半）、R10-W-2 独立复现 selected-properties 偶发红与证据覆写销毁诊断 |
+| `.evidence/review-gateway-file-r11/summary.json` | 第 11 轮案卷（D 轮：r10 处置的复核），verdict `COMMENTED`（0 FAIL / 2 WARN / 4 NOTE，blocking 空，`rejected_items` 2 条都是评审方拒绝替实现方预设的结论），评审方第二次在 xc-pc-linux 实测；因实现方本轮连改三次树，它另 scp 一份工作树快照自建等价树，两棵树的数各自写明，`git add -f` 携带 |
+| `.evidence/review-gateway-file-r11/findings.md` | 第 11 轮取证（130 行）：18 行变异表里独立复跑 8 行（baseline/E/P8/D1/M10b/N14 + 快照上 M17/M18）**零分歧**、其余 10 行明确标为仍是实现方自报；两条 WARN = 契约数字缺树限定、同一条地址串的消费点被三处文档数成三样（真实五处）；另实测 `git checkout fbcac2e` 复现本轮那次夹具红 |
 | `.agents/red-evidence-gateway-file-service.txt` | Contract-first Red Evidence (M0) |
 | `.agents/green-evidence-gateway-file-service-m1.txt` | Green Evidence for M1 slice 1 |
 

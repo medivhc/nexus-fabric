@@ -981,8 +981,14 @@ r9 未复现本仓任何数字（它是 Windows 侧纸面复核），但它**独
 六条 WARN 的处置（每条给落点与可红对象）：
   R9-W-1 新机制键在未归一、未校验的地址串上，而"同一条地址串"这个前提原先只为 per-peer
           配额登记过。处置：`authenticate` 在进节流器**之前**拒空串（AUTH_DENIED，不比较、
-          不记账），G16 前提段把这条字符串的四个用途（归属、单源额度、per-peer 配额、
-          摘要键）一次登记齐，并明写"引擎不做归一化、M2 接线时必须核表示稳定性"。
+          不记账），G16 前提段把这条字符串的用途登记成清单，并明写"引擎不做归一化、M2 接线时
+          必须核表示稳定性"。**但当时那份清单少算了两处**：它写"四个用途（归属、单源额度、
+          per-peer 配额、摘要键）一次登记齐"，而漏了源锁表、并且把摘要键与源账本混成一项——
+          r11 R11-W-2 复核出真实消费点是**五个**（归属、单源额度、源锁、per-peer 配额、
+          `(主体,源)` 摘要键的源那一半），且同一处文档/代码/探针各数各的（三处、四处、四件事）。
+          现已全部对齐成五处；"一次登记齐"这句作废，因为它本身就是没登记齐的说成登记齐——
+          与 r9 抓我"前提原先只为配额登记过"是同一个形状。摘要键那一半的后果此前无人写过：
+          单个身份在两种写法下有两个桶 ⇒ pair 侧 `lockout_after` 门槛翻倍。
           对象：单测 `empty_transport_address_is_refused_before_the_throttle` + 期望
           `empty_source_is_refused_before_the_throttle`（变异 P8 实测 1 红 + 1 翻转）。
   R9-W-2 契约与代码 doc 都在说"源锁表受 max_throttle_buckets 门禁"，而代码没有——"账本满 ⇒
@@ -1034,8 +1040,10 @@ D 轮（r10 回来之后的落地，全部重新实测）：
    `arm_source` 的返回值语义改成"**有没有落下状态**"（单源锁或全局窗口），调用方只在
    落下时才销账；"这次按锁定处理"的承诺改由调用点显式 `return true` 承担（doc 里两句话
    分开写，不再让一个 bool 兼职两个意思）。
-   可达性与杀伤力（**实测**，不靠推）：把条件删除改回无条件 ⇒ 70 条单测全绿、26 条期望
-   无一翻转（复验树 c5d0918 上的变异 `D1_always_clear_ledger`）——因为 `lock_until` 除了
+   可达性与杀伤力（**实测**，不靠推）：把条件删除改回无条件 ⇒ **72 条单测全绿、26 条期望
+   无一翻转**（最终复验树 d0ace31 上的变异 `D1_always_clear_ledger`；早一遍在 c5d0918 那棵
+   70 条的树上也一样全绿，两处都成立，口径以最终树为准，见下面 D 轮变异表的表头说明）——
+   因为 `lock_until` 除了
    `checked_add` 失败还有一小时回退，那条 None 分支实践不可达。所以 R10-W-1 的修法
    **没有**红对象，它的价值只在"注释与契约不再把没做完的写成做完"这一层；这一条明确
    写进未证事项，不伪装成有测。
@@ -1048,10 +1056,14 @@ D 轮（r10 回来之后的落地，全部重新实测）：
    必须同步。
    **这两条夹具是本轮自己红出来的**：第一版写成 `lockout_after: 9, max_failures_per_source: 4`，
    直接撞 G12 的交叉规则（额度必须 ≥ pair 阈值），`FileEngine::new` 在单测里 panic、
-   `engine_at(...)?` 在探针里把整个 auth-throttle 用例炸成"无 JSON"——复验树 fbcac2e 的
-   baseline 当场报 1 条单测红 + 25 条期望全 MISSING。改成 4 == 4 之后，为了不让"这次拒绝
+   `engine_at(...)?` 在探针里把整个 auth-throttle 用例炸成"无 JSON"（实测 stdout 只剩
+   `{"case":"auth-throttle","error":"CONFIG_INVALID: max_failures_per_source must be >=
+   lockout_after…","verdict":"FAIL"}`，没有字段 dump）——复验树 fbcac2e 的 baseline 当场报
+   **1 条单测红 + 26 条期望全 MISSING**（条数是 r11 R11-N-1 替我纠的：我那句原本写 25，
+   而 `git show fbcac2e:…auth_throttle.toml | grep -c '^\\[\\[expect\\]\\]'` 实测为 26，
+   其中已含漂移那条）。改成 4 == 4 之后，为了不让"这次拒绝
    是谁给的"含糊，断言改用从未失败过的主体（只可能被源锁挡）。教训：夹具也必须实测，
-   不能按记忆写参数。
+   不能按记忆写参数——**连"我红了几条"这种自己刚制造出来的数也要数过**。
 3) **R10-N-1/N-2（provenance）**：案卷里"R9-N-1 本轮之前已改掉"这句是错的，已按上面的
    写法改成"本批改掉 + 落在哪棵树"；MODULE G15 代价 (5) 原先把 F 说成"在同一棵树上手跑
    实测的三件事之一"，而案卷变异表又把 F 列为"本轮未复跑"——两份文档各说各话，现在
@@ -1125,6 +1137,66 @@ D 轮变异表（**唯一口径 = 最终树 d0ace31**，72 条单测 / 26 条 au
   F  绕开唯一入口比较          → 由 r10 在 8a67e85 上代跑：`error: method 'token_eq' is
                                 never used`，`cargo check --all-targets`（含 test profile）同红
 
+r11 的签发结论：**COMMENTED / 0 FAIL / 2 WARN / 4 NOTE**，可合入，blocking 为空，
+`rejected_items` 2 条（都是"别把预设结论塞给评审者"：一条是"D 轮修好了 ⇒ 那条分支现在有
+测试保护"，一条是"案卷里的自我更正等于把推断写成实测"——r11 逐条反驳了后者并给出取证方式）。
+案卷 `.evidence/review-gateway-file-r11/`（summary.json + findings.md 130 行）。它这轮实测的
+对象横跨三棵树（实现方在本轮进行中被我改了三次：新增两条单测 ⇒ 72 条；口径树 c5d0918→d0ace31；
+N14 从 5 红变 6 红），所以它另外 scp 了一份工作树快照自建等价树来跑，并把两棵树的数各自写明。
+
+r11 两条 WARN 的处置（都是**口径**问题，不是判定错）：
+  R11-W-1 契约文件 `requirements.toml` 的 REQ-010 里"实测 5 条单测红 + 6 条期望翻转"不带树
+          限定，而同一轮案卷已经宣布唯一口径是最终树（6 红 + 6 翻转）。r11 在 a0ce15f 上量到
+          5+6、在快照上量到 6+6，**两个数都真**，缺的是限定语——多出来的那条正是后来新增的
+          源锁过期回收测试。修法：契约改成"最终复验树 6+6（70 条那棵树是 5+6）"，同节里
+          `D1_always_clear_ledger` 的 70/72 两写也都补上树名。附带一条引用纪律：同一节里
+          并存两套口径会逼下一个读者重推一遍，所以表头那句"旧表的数不再引用"下面，正文里
+          凡是沿用旧表的地方都必须显式标树。
+  R11-W-2 同一条 transport-address 串的**消费点数**被四处文档数成三样答案：代码 doc 与探针
+          注释说三处、MODULE G16 说四件事、案卷 R9-W-1 那条换了份名单还说"四个用途一次登记
+          齐"。真实是**五个**：per-peer 配额、单源额度、源锁、`close_session` 归属、
+          `(主体,源)` 摘要键的源那一半。漏掉最后一处的代价不是文字：它意味着**单个身份**在
+          两种写法下拿到两个桶，pair 侧 `lockout_after` 门槛被翻倍——这正是 r9 R9-W-1 抓我
+          "前提原先只为配额登记过"的同一个形状，只是这一回漏的是我自己新写的清单。
+          修法：四处文档（G16 前提段、PRODUCT §18.2、REQ-010、`close_session` doc 与探针
+          注释）全部对齐成五处，并把"一次登记齐"那句作废、改成"当时少算两处，r11 复核补齐"。
+          摘要键那一半的机验对象是**既有**的 `throttle_identity_keys_do_not_collide_on_prefix_
+          or_concatenation` 与冻结期望 `other_source_still_admitted`（N13 变异实测红/翻的那对），
+          这里要说清：那两条钉的是"不同 source 串 ⇒ 不同桶"这一机制，**不是**专为"同一地址
+          两种写法"写的夹具；把它们当那一格的证据是继承关系，不是点名覆盖。
+r11 四条 NOTE：N-1 把我那句"25 条期望 MISSING"纠成 **26**（`git show fbcac2e:… | grep -c`
+实测，且探针在无 JSON 那次只剩 `CONFIG_INVALID` 一行），已按实测改；N-2 是可信度分级——
+18 行变异表里评审方独立复跑了 8 行（baseline/E/P8/D1/M10b/N14 + 快照上的 M17/M18），
+**复跑部分零分歧**，其余 10 行仍是实现方自报，引用时需要评审者自己的 target，这条分级写进
+本节而不是假装整张表被外部证过；N-3 指出我最后宣布的那组 bindings 当时在共享通道上取不到
+（`/work/m0-verify` 还停在 a0ce15f）⇒ **规则补一条：落地前必须把最终复验树推一次
+`refs/heads/m0-verify`**，否则案卷会出现只有实现方自己能证的一段——本轮已在提交前推送；
+N-4 是确认（flaky 机制独立复现）外加一句措辞纠正：两处频率都是小样本，不许读成稳态率。
+
+评审链：… → r10(0F/2W/5N) → r11(0F/2W/4N，评审方第二次实测，并把对象横跨三棵树这件事写明)
+→ r12（r11 处置的独立复核，待派）。
+
+r11 落地之后的复验（同一宿主与工具链，`status --json` 实测，dirty_state=false）：
+#   source_revision       12c9825d9b203affc88161e29cfd620eb7feda0f
+#   working_tree_digest   8cef9d315016331c6e0be3fd229220bee90fc859
+#   contract_hash         2219448ed81870cbf67d1b4bd6cf93c63e5c51f4（与 e6dd256 相同：r11 的
+#                         处置只动 requirements/MODULE/PRODUCT 的散文与 src/examples 的注释，
+#                         `scenarios/**` 一字节未改）
+#   cargo test --lib      72 passed; 0 failed
+#   clippy --all-targets  诊断行数 0
+#   9 条 E4 场景          PASS=9/9，期望合计 103
+#   verify --fast         9 门全 PASS；status verdict = PASS，evidence dir = verify-ae8576aa9da4
+# 共享通道已按 r11 R11-N-3 的要求把这一棵推上 `refs/heads/m0-verify`（`git -C /work/m0-origin.git
+# rev-parse m0-verify` 现在就是 12c9825），所以下一轮评审者不必再自建快照。
+# 上面 digest 的第一版是我凭上下文手抄出来的，抄成了把两棵树尾巴拼起来的假值；改成"照主机
+# 输出逐字抄"之后才是现在这串。这条恰好是本节开头"先问主机再落笔"那条规矩的又一次灵验，
+# 所以连同错处一起留着。
+# 顺序要说清：本节最后这几段（含本行）是在 12c9825 **之后**写进去的，属案卷文字，不参与编译、
+# 也不在 `scenarios/**` 里，所以上面那组数对随之落地的提交同样成立；后来人要复现整棵最终态，
+# 直接取 `refs/heads/m0-verify`（本批最后一次推送的就是它），别拿本节的 sha 列表当链。
+
+
+
 **r10 R10-W-2 的复现**：r10 在自己的克隆、自己的 target 上遇到同一棵 8a67e85 的 verify
 **首跑 FAIL（selected-properties，`cargo test -p nexus-harness` exit 101）**，随后同树复跑
 3 次全 PASS、单独跑该 crate 共 10 次全绿（117 passed/次，含一次与 gateway 构建并发的负载
@@ -1180,6 +1252,10 @@ target 各中一次**，而失败测试名两次都没留下。实现方侧随�
 
 **然后本轮把它逼出来了，并且推翻了自己早先的定性。**配方：`touch engineering/nexus-harness/src/env.rs`
 强制重建后 `cargo test -p nexus-harness`，3 个周期里中 1 次；再 8 个周期里中 1 次（第三次 attempt）。
+**这两个数都是小样本**（实现方 2 次命中 / 约 11 个周期，评审 r11 独立复现是 1 次 / 10 个周期），
+只够说明"可达、且复现配方有效"，**不许读成稳态发生率**；r11 还在另一棵树上复现出同一条 panic，
+并把 `right` 那一格对上它所测那棵树的 `working_tree_digest`（`a76f554f…`），也就是"退化的正是
+那个指纹本身"。评审方实测见 `.evidence/review-gateway-file-r11/`。
 抓到的 panic 是：
 ```
 thread 'env::tests::digests_deterministic_and_sha1_length' panicked at env.rs:317:13
@@ -1189,7 +1265,8 @@ assertion `left == right` failed: working_tree_digest 两次取值不一致
 ```
 对照组：同一份代码加 `-- --test-threads=1` 连跑 4 轮（每轮都强制重建）**全绿**。所以
 - 红的是 **nexus-harness 自己的** `env::tests::digests_deterministic_and_sha1_length`，
-  不是 gateway 的夹具；本批 70 条 gateway 单测与 9 条场景与它无关，各自都绿。
+  不是 gateway 的夹具；本批在被评审的那棵树（8a67e85）上是 70 条 gateway 单测，与 9 条场景
+各自都绿。
 - 机制**不是**墙钟/时间夹具（我早先写的"静态嫌疑：`run_parallel_keeps_order_and_verdicts`
   的 sleep 交错"那条是猜的，且猜错了对象），而是**并行测试里对同一个 live repo 并发调
   git**，`working_tree_digest()` 那一路拿不到结果 ⇒ **降级成哨兵 `tree-unknown`**，而这条
@@ -1222,12 +1299,13 @@ c5d0918 上 5 条单测红 + 6 条期望翻转，在最终树 d0ace31 上是 6 �
 归属检查只覆盖 `close_session`，`abort_upload` 等按 id 删除的动词同型破坏面原样保留；
 `close_session` 目前还没有 wire 调用方（M2 接线）；`constant_time_eq` 的时序形状那一半仍无断言；
 **R10-W-1 的修法没有红对象**——那条时钟边界分支经 `lock_until` 的一小时回退实践不可达，
-`D1_always_clear_ledger` 实测 70 全绿 + 26 条期望无一翻转，所以它的价值只在"注释与契约不再把
-没做完的写成做完"这一层，不许读成修掉了某个运行时问题。
+`D1_always_clear_ledger` 在最终树 d0ace31 上实测 72 全绿 + 26 条期望无一翻转（c5d0918 那棵
+70 条的树也是全绿），所以它的价值只在"注释与契约不再把没做完的写成做完"这一层，不许读成
+修掉了某个运行时问题。
 `selected-properties` 的间歇红**已定位**（见上面"逼出来了"那段）：红的是 harness 自己的
 `env::tests::digests_deterministic_and_sha1_length`，根因是并行测试对同一 live repo 并发调
 git 时 `working_tree_digest()` 退化成哨兵 `tree-unknown`；**未修**（跨 crate，且会动到正在被
-评审的门），三条修法方向已写进 harness 待办 (a)(b)(c)。本批不受它影响：gateway 的 70 条单测、
+评审的门），三条修法方向已写进 harness 待办 (a)(b)(c)。本批不受它影响：gateway 的 72 条单测、
 clippy、9 条场景 103 条期望、verify 其余 8 门都各自复跑为绿，且这条 flaky 与"本批代码是否
 正确"没有因果关系——但它确实说明 **`verify --fast` 全绿不是可传递的单次事实**，所以本节的
 bindings 只报"在这棵树上、这一轮跑出来的值"。
