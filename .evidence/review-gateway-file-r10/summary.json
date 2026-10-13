@@ -1,0 +1,176 @@
+{
+  "schema_version": 1,
+  "review_id": "review-gateway-file-r10",
+  "review_round": 10,
+  "previous_review_id": "review-gateway-file-r9",
+  "verdict": "COMMENTED",
+  "reviewer": {
+    "agent": "独立代码/契约评审者（第 10 轮），未参与被评审内容的任何编码或写作。本轮与 r1-r9 中部分轮次不同：**做了实测**。绑定纪律、r9 六条 WARN 的闭合并否证尝试全部按三条线走：(1) Windows 纸面复核（git diff、读码、grep/awk、按 env.rs 复算 contract_hash）；(2) xc-pc-linux 上**评审者自有临时克隆**的基线复跑（单测/clippy/9 场景/verify --fast）；(3) 同树变异实测（M10b、P8、P7、F）。不采信实现方提交说明与案卷自述作为依据。",
+    "model": "会话元数据把本会话的模型标识记为 qfmodel；QoderCN 未对外披露其底层基础模型名称，我能确认的只有会话元数据里这个标识，无法确认更底层的模型名——不伪称。",
+    "host": "Windows 11 x64 (win32) + Git Bash（纸面复核）；xc-pc-linux（appen@10.144.144.4，实测复跑）",
+    "could_not_compile": "Windows 侧仍未编译本 crate（ssh2 0.9.6 的 userauth_pubkey_memory 受 cfg(any(unix, vendored-openssl, openssl-on_win32)) 门控，本机无 cl.exe/nasm）——但本轮不需要它：所有编译/测试/clippy/场景结论都改由 Linux 实测给出。",
+    "executed_on_linux": "宿主 xc-pc-linux，rustc/cargo 1.98.1（x86_64-unknown-linux-gnu），树 = /work/r10-verify-clone（评审者自有临时克隆：`git clone /work/m0-verify && checkout 8a67e85`，跑完 git status 归零，未触碰 /work/m0-verify 与 /work/nexus-dev/target，CARGO_TARGET_DIR=/work/r10-review-target，CARGO_INCREMENTAL=0）。实测清单：(1) cargo test -p nexus-web-gateway --lib ⇒ **69 passed; 0 failed**；(2) cargo clippy -p nexus-web-gateway --all-targets ⇒ **零诊断、exit 0**；(3) 9 条 product.gateway-file-* 场景逐条 harness scenario run ⇒ 全 PASS，期望 **25+7+10+6+16+9+15+5+9 = 102** 条全 holds；(4) verify --fast 同一棵树首跑 **FAIL（唯一失败门 selected-properties = cargo test -p nexus-harness，exit 101）**，之后同树复跑 3 次全 PASS、直接 cargo test -p nexus-harness 共 10 次全绿（117 passed/次）——实现方报的门运行事故被评审者**独立复现**，且失败测试名再次未捕获；(5) 变异实测四支：M10b ⇒ 10 条单测红 + 10 条冻结期望翻转（名单逐条核对）；P8（去空地址守卫）⇒ 1 红 + 1 翻转；P7（去 arm_source 门禁）⇒ 1 红 + 1 翻转；F（绕开 token_eq 直接比较）⇒ 编译失败 `error: method `token_eq` is never used`。",
+    "static_only": false,
+    "what_i_did_execute": "(1) git diff --stat/--name-status 8a67e85 对当前工作树 ⇒ 脏差只有 .agents/green-evidence…txt(+114)、FILE_MANIFEST.md(+7/-2)、MODULE.md(1 行)、file_service.rs(2 行，全部是 // 注释行的锚定句)；场景、探针、requirements、PRODUCT 字节零差异；(2) 按 env.rs:188-216 在 Windows 独立复算 contract_hash（LF 归一）⇒ **4f28580bd3c9bd568e62863be1976755044d4fd2**（303 个文件 / 425483 字节；不归一 ⇒ 3d3dc88f…）；(3) grep -c 数 #[test]=44+15+6+2+2=69、9 场景期望=102、auth-throttle=25、awk FILE_MANIFEST `^\\| ` 行 209 减表头 = 208 与声明一致；(4) Linux 实测清单见 executed_on_linux；(5) 变异红点用 baseline-vs-mutant JSON 逐字段 diff 得出，不靠数红字。",
+    "not_executed_by_me": "N4/N5/N6/M9/P1/P2/P3/P4/P5/P6/E 未在 8a67e85 上复跑（案卷自己声明其中 P2/N5/N6/M9/F 本轮未复跑，我另核 P6/P4/P5 的杀伤力与 r9 静态推导一致，未实跑）；Throttle 时钟注入仍不存在，故 R10-W-1 的 None 分支不可实测触发，判据是静态读码 + 夹具算术。"
+  },
+  "source_revision": "8a67e85d4e6b2176872050c8491a78a13c3b6824（复验树；当前 Windows 工作树与其只差散文，见 bindings）",
+  "scope": [
+    "落地处置审计：r9 六条 WARN + 九条 NOTE 的清偿判定（r9_disposition_audit）",
+    "crates/nexus-web-gateway/src/file_service.rs（Throttle::arm_source:1014-1024 / charge_source:982-1003 / record_failure:900-973 / is_locked:875-896 / decay:853-873 / FileEngine::authenticate 空地址守卫:1671-1677 / token_eq:1524-1527 / close_session:1756-1820 / 新单测 3778/3834/3893/3946/3975）",
+    "crates/nexus-web-gateway/examples/gateway_file_contract.rs（e10 审计同形段:878-931、e11 比较计数与空地址段:943-991、e12 源锁满表段:995-1027）",
+    "scenarios/product/gateway_file_auth_throttle.toml（25 条 [[expect]]，新增 foreign_close_audit_shape_is_indistinguishable / unknown_source_locked_on_first_failure_when_ledger_full / empty_source_is_refused_before_the_throttle）",
+    "crates/nexus-web-gateway/MODULE.md（G12:99-131、G15:161-314、G16:315-357）、PRODUCT.md §18.2:3300-3354、crates/nexus-web-gateway/requirements.toml REQ-010:85-91、.agents/green-evidence-gateway-file-service-m1.txt:893-1006（第十一片）",
+    "engineering/nexus-harness/src/evidence.rs:118-162（门事故定性所涉的覆写机制）"
+  ],
+  "bindings": {
+    "reviewed_content": {
+      "content_tree": "8a67e85d4e6b2176872050c8491a78a13c3b6824",
+      "content_tree_provenance": "stash 型复验提交（WIP on feature/gateway-file-service-contracts，父 e992014 + index d252d61），实现方推到 Linux /work/m0-verify，branch m0-verify 指向它；本轮实测与纸面读码都锚在这棵树。",
+      "claim_i_checked": "『当前脏树与 8a67e85 只差锚定句、案卷、FILE_MANIFEST 几处散文』。",
+      "how_i_checked": "git diff --name-status 8a67e85 ⇒ 只有 4 个 M：.agents/green-evidence…txt、FILE_MANIFEST.md、MODULE.md、file_service.rs；逐文件看 diff 正文 ⇒ file_service.rs 的 2 处 hunk 全在 `//` 注释行（把 ada41e4/24 条的旧锚换成 8a67e85/25 条），MODULE.md 同一句锚定，PRODUCT/requirements/全部 scenarios/*/examples 字节与 8a67e85 相同。**结论：该句成立，本轮没有抓到代码/场景/契约字节的暗差**。",
+      "verification_host": "xc-pc-linux（实现方报的 + 评审者自有克隆 /work/r10-verify-clone 的复跑）",
+      "toolchain": "rustc/cargo 1.98.1 x86_64-unknown-linux-gnu（评审者实测同一）",
+      "working_tree_digest_of_the_tree_i_ran": "7e8c4fc7dc537dd68204acf31e496361a0a08e8c（我在 /work/r10-verify-clone checkout 8a67e85 后 verify --fast 实测得到，与案卷 bindings 逐字一致，dirty_state=false）",
+      "contract_hash": "4f28580bd3c9bd568e62863be1976755044d4fd2",
+      "contract_hash_how_i_computed": "不是照抄：Windows 上按 env.rs:188-216 遍历式（scenarios/<子目录>/*.toml，目录名与文件名各排序，块 = scenarios/{d}/{n}\\n + 原文，块间 \\n===\\n，git blob sha1）独立复算；工作树含 CRLF 的文件先做 \\r\\n→\\n 归一 ⇒ 303 文件 / 425483 字节 ⇒ 4f28580b…（与实现方、与我 Linux verify 输出三方一致；不归一直接算 = 3d3dc88f…，再次印证 CRLF 敏感）。",
+      "contract_hash_scope_limit": "digest 仍只覆盖 scenarios/**/*.toml ⇒ MODULE/PRODUCT/requirements 的散文与代码不同步对它不可见，本轮 R10-W-1/R10-N-1/R10-N-2 都属于这种只能人核的面。",
+      "self_reported_measurements_reproduced_by_me": "69 passed ✓ / clippy --all-targets 零诊断 ✓ / 9 场景 102 期望全 PASS（auth-throttle 25 ✓）/ contract_hash 4f28580b ✓ / working_tree_digest 7e8c4fc7 ✓ / M10b ⇒ 10 红 + 10 翻转 ✓（名单逐条）/ P8 ⇒ 1+1 ✓ / P7 ⇒ 1+1 ✓ / F ⇒ 编译失败 error: method `token_eq` is never used ✓（8a67e85 上）。未复现/未复跑：P1/P2/P3/P4/P5/P6/E/N5/N6/M9 本轮名单值（案卷已声明部分未复跑，见 R10-N-3）。"
+    }
+  },
+  "counts": {
+    "fail": 0,
+    "warn": 2,
+    "note": 5,
+    "r9_warns_audited": 6,
+    "r9_notes_audited": 9,
+    "expectations_total_measured": 102,
+    "expectations_auth_throttle_measured": 25,
+    "lib_tests_measured": 69,
+    "lib_tests_ran_green": 69,
+    "file_manifest_declared": 208,
+    "file_manifest_measured": 208,
+    "mutation_recomputed_M10b": "10 单测红 / 10 期望翻转（实测，与实现方声明一致）",
+    "items_rejected": 1
+  },
+  "findings": [
+    {
+      "id": "R10-W-1",
+      "severity": "WARN",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:994-1001（charge_source 额度耗尽分支）与 1005-1008（arm_source 的 doc 承诺）、对照 960-967（pair 侧 None 分支）与 1014-1017（arm_source None ⇒ return true 不落锁）",
+      "summary": "r9 R9-N-3 的『时钟边界 None 分支源侧与 pair 侧同口径』这一半**只修了返回值，没修状态**，而 :995-997 的注释把没修完的写成修完了。逐帧：pair 侧 None（:960 取不到 until）⇒ 桶行保留在 :929 刚写的 count ≥ lockout_after 上 ⇒ 下一条失败**当场再按锁定处理**；源侧 :998-999 `let armed = self.arm_source(skey, now); self.source_failures.remove(&skey);` —— arm_source 在 None 时（:1015-1017）不落锁直接 return true，remove 却**无条件执行** ⇒ None 后状态 = 无锁 + 无账本行，与旧写法（先删行再试插锁、None 时同样两者皆空）**终态完全相同**，唯一的差别是本次返回值从 false 变 true。r9 给的原方是『先算 until、**拿到才删账本行**』——条件删除没有落。后果（该分支若可达）：该地址被白送一整份新额度（再攒 max_failures_per_source 条期间每条失败都做真令牌比较），而 :1005-1008 的 doc 却承诺『a clock edge that yields no until still reports armed **rather than falling back to go ahead and compare tokens**』——下一条失败恰恰 fall back 到比令牌。可达性我复核与 r9 一致：要 now+lockout 与 now+3600s 双双越 Instant 上界，validate() 已封窗口 ≤ 24h（:214-227），只有平台时钟逼近上限才可能，所以这是**判据不可达的散文过报**而不是运行时缺陷——判 WARN 的依据是『把没做的事说成已做』（本链 r8/r9 反复抓的同一形状），不是缺陷本身的杀伤力。复现方式（静态，两分钟）：读 :994-1000 确认 remove 不在任何 if 之内；再读 :1014-1017 确认 None ⇒ 只 return true 不写表；对照 :960（Some 才写、行保留）即见不对称。实测侧我无法在本树触发（时钟不可注入，G15 未证事项自己写明），Linux 上可做的闭档动作：改成 `let armed = self.arm_source(skey, now); if armed_and_landed { remove }` 语义（arm_source 需回报是否真落了锁/落了全局），或把 :995-997 与 :1005-1008 的承诺改准（『None 时本次报锁定，但账本行仍被删，额度会重置——与 pair 侧不同口径，登记为时钟边界残余』）。顺带：arm_source 所有分支都 return true，`armed` 恒真，:998 的绑定与 :988 的早退实际只是 `return true`——不是错，但它正是『条件没接上』的痕迹。"
+    },
+    {
+      "id": "R10-W-2",
+      "severity": "WARN",
+      "location": "engineering/nexus-harness/src/evidence.rs:128-131 与 146-162（write_evidence：目录 = verify-<按 bindings 的 id>，write_json 无条件覆写 summary.json/gates.json）；.agents/green-evidence-gateway-file-service-m1.txt:995-1006（门运行事故段）；实现在案场景 = xc-pc-linux 上 /work/r10-verify-clone 的 verify --fast",
+      "summary": "实现方记录的『首跑 FAIL、复跑 PASS、失败测试名未捕获』本轮被评审者**独立复现**，且证据覆写机制把失败诊断再次销毁——这次销毁的是评审者自己的取证。实测（宿主 xc-pc-linux，树 8a67e85 干净克隆，CARGO_TARGET_DIR=/work/r10-review-target）：verify --fast 首跑 FAIL，唯一失败门 selected-properties（`cargo test -p nexus-harness` exit 101），门的 detail 只截到编译行加 `error: test failed`，**失败测试名没有进证据**；随后同树复跑 verify --fast 3 次全 PASS、单独 `cargo test -p nexus-harness` 共 10 次全绿（117 passed/次，含一次与 gateway 构建并发的负载样本）。verify-<id> 目录按 bindings 定位 ⇒ 我的 FAIL 首跑的 gates.json/summary.json 被后续 PASS 跑**原地覆写**（.evidence/verify-1f1eeff0a910/ 文件时间戳 11:16，晚于 11:14 的 FAIL 目录创建），与实现方那次的机制逐字相同。定性两点：(1) 这条 flake 是**活的**（同一棵树、同一宿主上评审方也撞上 1/4 首跑失败；两次事故都没拿到名字），不是实现方案卷里『原因未知』可以就地结账的一次性事件；(2) 覆写设计被实证证明会主动销毁失败取证——两次事故、两个不同操作者、同一销毁路径。实现方的**处置本身诚实**（没声称 9 门全 PASS、事故单列、覆写登记为 harness 缺陷），所以本片结论不需要降级——我逐一复跑了本片依赖的 constituent 门（单测/clippy/9 场景全绿，见 reviewer.executed_on_linux）；但该缺陷应从『顺带登记』升格为本链的 WARN 级待办：证据链的门本身不可复现地间歇失败且取证面结构性丢失，这直接侵蚀『verify 绿』作为机验封印的效力。复现命令：`ssh appen@10.144.144.4` → `cd /work/r10-verify-clone && CARGO_TARGET_DIR=/work/r10-review-target cargo run -q -p nexus-harness -- verify --fast --json`（观察 1/4 量级 FAIL 与 .evidence/verify-1f1eeff0a910 被覆写）。修法（harness 侧）：verify-<id> 改为 verify-<id>-<seq 或 UTC 时间戳>，或对已存在目录先归档再写；门 detail 至少捕获 `failures:` 测试名单行段。"
+    },
+    {
+      "id": "R10-N-1",
+      "severity": "NOTE",
+      "location": ".agents/green-evidence-gateway-file-service-m1.txt:977（『R9-N-1……本轮之前已按轮转地址改掉』）；对照 crates/nexus-web-gateway/src/file_service.rs:3167-3174（注释自署 (r9 R9-N-1)）与 git show 1c0f0a9:…file_service.rs:3124（单地址 10.0.0.9）",
+      "summary": "时序错置：单测洪水的轮转地址（10.7.x.y、每地址 32 条）是 **8a67e85 这棵树才出现的**——r9 读的第十片树（1c0f0a9）里 :3124 还是单地址 10.0.0.9，且代码注释自己署的名就是 (r9 R9-N-1)。案卷写『本轮之前已改掉』把一个本轮的处置说成了先前的既成事实，方向虽无害（改动真实存在、判据被救回：断言升级为 throttle_buckets() == max 的两侧夹逼），但按本链『数字与处置各自标明属于哪棵树』的口径这句应改成『第十一片按 r9 R9-N-1 改掉』。"
+    },
+    {
+      "id": "R10-N-2",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/MODULE.md:288-300（G15 代价 (5)『在同一棵树上手跑实测的三件事』含 F）；对照 .agents/green-evidence…txt:985-987（变异表把 F 列入『本轮未复跑、仍属第八/九/十片树』）",
+      "summary": "两份文档对 F 变异的 provenance 互相打架：G15 说三件事（P6/F/M10b）都在同一棵树上手跑实测，案卷第十一片又明写 F 本轮未复跑。实质无害——我在 8a67e85 上把 F 复跑了一遍，`error: method `token_eq` is never used` + lib/lib test 双双编译失败，G15 那句话的内容对当前树**为真**；但该标成『复验于 8a67e85（评审 r10 代跑）』而不是让 G15 与案卷各说各话。顺带正面确认：r9 R9-N-6 留的那个射程问题（若 cfg(test) 里留一处 token_eq 引用则 test 门不红）在本树不存在——cargo check --all-targets（含 test profile）同样红，因为现测试只经 token_comparisons() 计数访问，不直接调 token_eq。"
+    },
+    {
+      "id": "R10-N-3",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/MODULE.md:295-296 与 .agents/green-evidence…txt:981-993（变异表）；r9 findings.md §3",
+      "summary": "案卷第十一页的变异表把 P2/N5/N6/M9/P1 标为『未复跑，引用它们时看当时那棵树的 bindings』——诚实；但它同时报 P1 ⇒ RED 3 条 + 3 翻转，而 P1（限额记账从不武装）在第十一片树里**语义已随 arm_source 改动**（charge_source 的返回现在经由 arm_source，P1 的注入点若打在 arm_source 首行则满表分支也失守，打到额度分支则 e12 也红），3+3 这个数是在哪棵树上量的没有写。引用侧建议给 P1 那行补树限定。本轮未复核该数（我没复跑 P1）。"
+    },
+    {
+      "id": "R10-N-4",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:1671-1677（空地址守卫）；crates/nexus-web-gateway/examples/gateway_file_contract.rs:976-991（e11 空地址段）；对照 r9 R9-W-1 修法 (iii) 尾部『补一条带端口两种表示的单测』",
+      "summary": "r9 W-1 三选一处置走了 (ii)+(iii) 主体（空串 fail-closed + G16:341-350 四用途前提登记 + close_session doc 第三条口径），处方尾巴没落：**仓内仍没有**任何钉『同一地址两种表示（裸 IP vs ip:port / IPv6 方括号 / %zone）』退化的单测或期望——全部夹具一律同形字符串。G16/PRODUCT/REQ-010 现在都明写了这个退化会发生的后果（合法所有者关不掉自己的会话），所以它不是隐瞒；但这条句子在机验面上仍是零对象。配方沿用 r9 给的：authenticate(source = \"2001:db8::1\") + close_session(source = \"[2001:db8::1]:44337\") ⇒ 断言现在返回 NOT_FOUND，把『退化是已知行为』钉成契约，M2 接线改动时该测试会强制散文同步。"
+    },
+    {
+      "id": "R10-N-5",
+      "severity": "NOTE",
+      "location": "crates/nexus-web-gateway/src/file_service.rs:960-966 与 1014-1024（两支表满升级共用 `global_locked_until = Some(until)` 直写）；对照 853-873（decay 每窗口头一次清全局窗口的条件是 global_last 满窗，不看 global_locked_until）",
+      "summary": "源锁表满升级（arm_source :1018-1020）写全局窗口时**不与既有 global_locked_until 取 max**——我逐条核过这不是缺陷：所有 until 都等于各自 now + w，后写的 now 必然 ≥ 先写的，故直写只会延长不会缩短（与 locked 满升级支 :961-962 同口径、同性质）。登记在此只因为 MODULE:279-280『两条大路谁先满谁先全局』之后这张表第一次真的有了第二条全局升级路径，未来的读者需要知道两支共用一个可覆盖的 Option 槽且覆盖方向安全。非缺陷。"
+    }
+  ],
+  "r9_disposition_audit": [
+    {
+      "id": "R9-W-1（新机制键在未归一未校验的地址串上、前提未为全部用途登记）",
+      "verdict": "verified_with_residual",
+      "reasoning": "处方 (ii) 落了：authenticate:1671-1677 空 source 进门即拒（AUTH_DENIED + 审计行，不比较令牌、不进任何节流表——我在 e11 上用 P8 变异实测：去掉守卫后该尝试 ACCEPTED 且会话被创建，守卫是唯一的门）。处方 (iii) 落了：G16:341-350 把 source 的**四个**用途（per-peer 配额/单源额度/源锁/归属证明）一并登记在同一条前提下，close_session doc:1778-1781 与 PRODUCT:3340-3343、REQ-010 同步。没落的：处方 (iii) 尾部的『带端口两种表示』单测/期望（R10-N-4）；处方 (i) 引擎侧归一化被明示拒绝并写成口径——这是允许的选择。方向没有把没做的说成做了：三处散文都明写『引擎不归一化、M2 必须核』。"
+    },
+    {
+      "id": "R9-W-2（契约声称源锁表受 max_throttle_buckets 门禁而代码没有）",
+      "verdict": "verified",
+      "reasoning": "这次是**代码追着契约补齐**：新增 arm_source（:1014-1024），source_locks 唯一插入点 :1022 受 :1018 门禁，满则升级为全局窗口——我核过全仓 source_locks 只有这一个 insert（grep 复现 :786 初始化、:860 retain、:1022 insert），所以『每一条插入路径都有门禁』成立。『四张表各自 ≤ max_throttle_buckets』我逐张重验：buckets（:907 准入）、locked（:961 自门禁）、source_failures（:986 None-if-full 早退 + Some 分支只更新既有键）、source_locks（:1018）✓。观测面：单测 :3933 与探针 :1018 都有 `throttle_source_locks() <= max_throttle_buckets`，期望对象 unknown_source_locked_on_first_failure_when_ledger_full 实测钉住升级分支（P7 ⇒ 1 红 + 1 翻转，我在 8a67e85 上复跑）。『源限额绝不升级为全体 fail-closed』加了限定语『在源锁表还有位置时』（MODULE:270/279-280、PRODUCT:3331、REQ-010）之后与代码逐字一致，站得住。"
+    },
+    {
+      "id": "R9-W-3（PRODUCT 同一 bullet 并存互斥陈述）",
+      "verdict": "verified",
+      "reasoning": "PRODUCT:3325-3327 的旧句已改成带括注的历史口径（『第二个前提在本批被直接关掉了……这里保留的是当时的判断而不是今天的状态』），3338 用过去时『在这一步之前』，现在时只剩 3336-3337 一条 ✓。"
+    },
+    {
+      "id": "R9-W-4（close_session doc 头段是被取代的旧理由）",
+      "verdict": "verified",
+      "reasoning": "file_service.rs:1760-1766 现在把头段写成三段历史（r2 N-8 旧处置 → 被本批推翻 → 为什么必须推翻），旧口径明确标成历史 ✓，与 Throttle::succeed:1106-1124 的三段历史同构。"
+    },
+    {
+      "id": "R9-W-5（归属检查射程比自己给的理由窄）",
+      "verdict": "verified",
+      "reasoning": "走了 r9 给的 (甲)+登记路线：succeed doc:1126『从入口上就断了——**只这一支**』、close_session doc:1775-1777『射程只到替别人关会话』、G16:351-354 把 abort_upload/remove/rename/commit_upload 的同型破坏面明写为『保留到 M2 发 capability，不许读成整体关闭』、PRODUCT:3339-3340 (1) 与 REQ-010 同口径。没给其它动词加检查是决定而不是隐瞒 ✓。（abort_upload 仍零证明这一事实本身仍是 M2 待办，结转。）"
+    },
+    {
+      "id": "R9-W-6（同一变异杀伤力同一批三处报 4/5/9 三个数）",
+      "verdict": "verified",
+      "reasoning": "定稿为实测口径且我**独立复现**：M10b 在 8a67e85 上 = 10 条单测红 + 10 条期望翻转。我的红名单（cargo test 实测）：lockout_refuses_even_the_correct_token_and_stays_bounded、lockout_rearms_after_expiry_and_flood_arms_are_not_exempt、lockout_requires_failures_inside_one_window、expired_locks_are_reclaimed_…、session_teardown_touches_no_throttle_state、throttle_fails_closed_when_the_table_is_full、per_source_budget_locks_the_address_not_the_whole_node、unknown_address_is_locked_when_the_source_ledger_is_full、authenticate_compares_tokens_only_when_not_short_circuited、source_lock_table_full_escalates_instead_of_growing_forever；idle_recycle_clears_no_throttle_state 与 empty_transport_address_… 不红（后者守卫在预检之前，两支互不影响——案卷这句我实测为真）。翻转名单（baseline-vs-mutant JSON 逐字段 diff）：locked_after_attempts 6→0、correct_token_bypasses_lockout false→true、throttle_full_fail_closed、product_engine_fails_closed_when_flooded、lock_survives_session_teardown、code_after_teardown THROTTLED→ACCEPTED、single_address_cannot_fill_the_table、throttle_per_source_budget_scoped_to_address、token_comparisons_short_circuit_when_locked、unknown_source_locked_on_first_failure_when_ledger_full。G15:294 与案卷都写 10/10 并把 8/4、8/5、9/9 留痕不抹 ✓——处置方式与数字都对。"
+    },
+    {
+      "id": "R9-N-1 … R9-N-9（逐条）",
+      "verdict": "N-1 verified（但案卷时序错置见 R10-N-1）；N-2 verified（两个补上的 E4 对象我实测各钉住 P5/升级分支一类变异）；N-3 partly（返回值同口径落了、状态口径没落，注释过报 ⇒ 新开 R10-W-1）；N-4/N-5/N-6 verified（r9 的肯定回答被记录为记录，G16『同形性只管返回值与审计行』与代码逐字一致：两分支 record 六格入参、返回码、消息字面量相同，时序差与 != 口径都明写在 doc:1769-1774）；N-7 verified（:923/:953/MODULE:191/212 的 61/63/66 全数改成带树限定的历史或当前树实测值，我复点当前树 69/25 ✓）；N-8 verified（128 与 26 都在 MODULE:260-269 与 PRODUCT:3332-3335 并列）；N-9 verified（知识条目把『六处』换成『每一个……故意不写数量』）。",
+      "reasoning": "见各条括注；R10-W-1 是唯一没闭干净的。"
+    }
+  ],
+  "mutation_lethality_recomputed": {
+    "note": "本轮不是纸面重推：M10b/P8/P7/F 四支在 8a67e85（评审者自有克隆 /work/r10-verify-clone，工具链 1.98.1）实测；其余沿用案卷/前轮并给 provenance 警示。",
+    "M10b": "实测 10 红 + 10 翻转，名单见 R9-W-6 条目，与实现方声明**逐条一致**（配方：sed 把 :1678 的预检改成 `… && false`，跑 cargo test --lib 与 --case auth-throttle --json，对基线 JSON 逐字段 diff，之后 git checkout 还原）。",
+    "P8_去掉空地址守卫": "实测 1 红（empty_transport_address_is_refused_before_the_throttle）+ 1 翻转（empty_source_is_refused_before_the_throttle true→false）。**新 P8 对象的杀伤力推导成立**：守卫摘掉后 authenticate(\"nolist\",\"\",TOKEN) 走完整路径——is_locked 无记录 → token_eq 命中 → succeed → 会话数 0 < max_sessions → ACCEPTED 且建会话，合成式第一格 `empty_code == AUTH_DENIED` 即假；就算探针喂错令牌，token_comparisons 也会 +1、空键会进节流表，后三格同样封死。配方：`if source.is_empty() {` → `if false && source.is_empty() {`。",
+    "P7_去掉源锁表门禁": "实测 1 红（source_lock_table_full_escalates_instead_of_growing_forever）+ 1 翻转（unknown_source_locked_on_first_failure_when_ledger_full：third 地址插进第 3 道锁 ⇒ `<= max_buckets` 格假且全局窗不武装）。r9 R9-W-2 的『零可红对象』至此两面都有对象。配方：:1018 条件 && false。",
+    "F_绕开唯一入口": "实测（8a67e85，r9 与实现方都只在更早的树上报过）：把 :1686 换成 `presented.as_bytes() != self.token.as_bytes()` ⇒ cargo check --all-targets 报 `error: method `token_eq` is never used`，lib 与 lib test 双双编不过——G15:291-293 的分层句对当前树为真（provenance 标注问题见 R10-N-2）。",
+    "P1_P2_P3_P4_P5_P6_E_N5_N6_M9": "未复跑。案卷对 P2/N5/N6/M9/F 已声明未复跑 ✓；P1 的 3+3 没标树限定（R10-N-3）。"
+  },
+  "positive_verifications": [
+    "三张声明的绑定纪律成立：8a67e85 与工作树的差异全部是散文/注释（file_service.rs 的 2 行是 // 注释锚定句），代码、探针、场景、requirements、PRODUCT 字节零差；我在 Linux 实测的 working_tree_digest 7e8c4fc7…/dirty_state=false 与案卷 bindings 逐字一致。",
+    "实现方的六个自报数字本轮全部被评审者独立复现：69 单测绿 / clippy 零诊断 / 102 期望（含 auth-throttle 25）全 PASS / contract_hash 4f28580b… / M10b 10/10 / P8 1+1 / P7 1+1 / F 编译失败。",
+    "数字自洽：#[test] 44+15+6+2+2 = 69 ✓；9 条场景期望 25+7+10+6+16+9+15+5+9 = 102 ✓；auth-throttle [[expect]] = 25 ✓（逐条数过）；FILE_MANIFEST awk `^\\| ` = 209 减表头 = 208 = 声明值 ✓；e8 的 20/28、e4 的 pool、solo_rows=40 等探针值由本轮 102 全 PASS 间接封住。",
+    "散文的算式全部可由旁边声明的夹具参数复算：83.1% = 60/(60+1029/84.4)、85.33 = 1024×5/60、68.33 = 1025×4/60、17.07 = 1024/60、0.67 = 40/60、128 = 5120/40（精确）、26 = ceil(1029/40)；默认参数 max_throttle_buckets=1024 / lockout_after=5 / window=60s / max_failures_per_source=40 我在 :153-165 逐字核过。",
+    "G12 的交叉约束清单与 validate()（:170-260）逐条对上（含两条 max_failures_per_source 界、非 0 名单含 max_failures_per_source、24h 封顶）；空 source 的审计行为与 AUTH_DENIED 正常失败行同形（:1672），不留隐形拒绝。",
+    "案卷第十一页的诚实性抽查通过：公开更正（8/4→8/5→9/9→10/10 留痕）、自报『r9 没抓到、我复测才发现 P8 零对象』并当场补期望、门运行事故单列且拒绝写『9 门全 PASS』、未复跑变异逐条标树——这四处都与我实测一致或至少不可证伪其自贬。"
+  ],
+  "merge_decision": "可合并（verdict = COMMENTED，0 FAIL / 2 WARN / 5 NOTE）。r9 六条 WARN 里五条 verified_with_residual 或 verified、一条（N-3 侧）新开 R10-W-1；实现方本轮报的每一个可机验数字都被我在同一棵树上复现，绑定纪律成立，三条新契约对象（P8/P7/P5 类变异）都有实测杀伤力。两条 WARN：R10-W-1（时钟边界分支的状态口径没跟上返回值口径，且注释把没修完的写成修完了——判据不可达，属散文诚实问题，改注释或补条件删除二选一）；R10-W-2（selected-properties 门的间歇失败被评审方独立复现且证据覆写再次销毁取证——不构成对本片结论的降级，因为本片依赖的 constituent 门全部被我单独复跑为绿，但必须升格为链上待办并给出 harness 侧修法）。随本批或下一片按 non_blocking_followups 走。",
+  "blocking_issues_remaining": [],
+  "non_blocking_followups": [
+    "R10-W-1：arm_source 回报『锁是否真的落了』（Option 或第二返回值），charge_source 只在落了锁/落了全局时删账本行；或者退一步把 :995-997 与 :1005-1008 的承诺改成如实口径（None 时源侧仍白送额度，登记为与时钟注入一并处理的残余）。",
+    "R10-W-2（harness 侧）：verify-<id> 目录加序号/时间戳或对既有目录先归档，杜绝同 bindings 覆写；selected-properties 门的 detail 至少捕获 `failures:` 名单段；给这台宿主的 flake 立一条复现记录（本轮样本：评审方 1 FAIL / 4 verify runs，实现方 1 FAIL / 至少 1 PASS）。",
+    "R10-N-1：案卷『本轮之前已改掉』改为『第十一片按 r9 R9-N-1 改掉』。",
+    "R10-N-2：G15(5) 里 F 的实测补一个树限定（『复验于 8a67e85，评审 r10 代跑』），消除与案卷『F 未复跑』的表面矛盾。",
+    "R10-N-3：案卷 P1 行补树 provenance。",
+    "R10-N-4：补一条把『两种表示退化』钉成契约的单测/期望（r9 已给配方），或把该退化并入 capability-negotiation 场景。",
+    "结转不变（本轮复核仍成立，且都已被诚实登记）：Throttle 时钟注入、abort_upload/remove/rename/commit_upload 的归属证明、source 表示归一化、M2 连接层限流与 RSS、files 配置接线与 kill-switch、R7-N-12 复算台进仓、84.4 次/秒仍非当前引擎实测、G1 门禁绑定分支未合入。"
+  ],
+  "not_machine_verifiable_this_round": [
+    "R10-W-1 的 None 分支不可触发（时钟不可注入 + validate 封 24h），判定来自静态读码与状态终局对比，非实测。",
+    "selected-properties flake 的**根因**仍未定位：本轮共 4 次 verify --fast（1 FAIL/3 PASS）+ 10 次直接 cargo test -p nexus-harness（全绿，含一次负载样本），两次 FAIL 的测试名都因 detail 截断 + 覆写而丢失；『首跑（冷 target 目录、门内先编译再跑测）更容易红』是我观察到的一致模式（两次 FAIL 都紧跟全新编译），不是结论。",
+    "84.4 次/秒（注入率锚点）与由其折算的 83.1% 仍是 V1 时代实测上的算术，当前引擎未重测（结转 R8-W-1 残余）。",
+    "P1/P2/P3/P4/P5/P6/E/N5/N6/M9 在 8a67e85 上的数值本轮未复跑，引用时按各自行标注的树。"
+  ],
+  "rejected_items": [
+    "把 R10-W-2 的 flake 定性成『实现方未如实记录』——不成立：案卷把首跑 FAIL、名字丢失、不声称 9 门全 PASS 三件事都写足，处置诚实；本条 WARN 的对象是覆写机制与门的可复现性，不是案卷的诚信。",
+    "把 M10b 的 10/10 与 r9 的 9/9 之差算成实现方计数错误——不成立：差集是第十一片新增的 source_lock_table_full_escalates…，r9 数的是它自己那棵树，两边都对，且 G15:297-300 已按留痕口径写清。"
+  ],
+  "report_file": ".evidence/review-gateway-file-r10/findings.md",
+  "escalation_note": "第 10 轮 > AGENTS.md:1585 的默认 3 轮上限，r4 起持续报备，本轮继续在该报备下签发。评审链：r1(6F) → r2(5F) → r3(2F) → r4(1F) → r5(1F) → r6(0F) → r7(0F, 6W/12N→改判 3W/16N) → r8(0F, 3W/7N) → r9(0F, 6W/9N) → r10(0F, 2W/5N；r9 六条 WARN 判定 verified_with_residual×1 / verified×4 / 部分清偿另开 1 条新 WARN；首次由评审方在 Linux 复跑基线与四支变异)。"
+}

@@ -801,3 +801,438 @@ r7(0F；撰写者 6W/12N，签发者改判 3W/16N 并否决 1 条) → r8(0F, CO
 review 目录的 verdict），provenance/scope 绑定的修复在 fix/hook-review-evidence-binding
 （689f63a）未合入，所以 r8 案卷里 `scope` 写成数组、`source_revision` 用真实基线 175e115，
 是为那条分支合入后准备的，不是当前门禁的要求。
+
+================================================================================
+追加：M1 第十片（会话归属检查 + 单源爆炸半径限额 + 比较唯一入口），宿主 xc-pc-linux
+================================================================================
+# bindings（`nexus-harness status --json` 实测，clean 树，dirty_state=false）:
+#   source_revision       1c0f0a9cd3d7df9d282c597bdbd6c395ae7837af
+#   working_tree_digest   7be74c0a245529765d37d981115a5ec1cf28fdb9
+#   contract_hash         ef28949145af2b1490ca8a07653f13e9b33f976b
+#   toolchain             1.98.1 / x86_64-unknown-linux-gnu
+#   verify --fast         9 门全 PASS，evidence dir = verify-f5dbc7b07761
+实测：cargo test --lib = 67 passed; 0 failed / clippy --all-targets = 零诊断 /
+     9 条 E4 场景 = **99** 条期望全 PASS（6+10+9+5+9+22+16+7+15）
+
+公开更正本仓自报数字：E4 期望 95 → **99**（auth-throttle 18 → 22），单测 63 → **67**。
+
+这一片做三件事，都来自 r7/r8 明确结转的残余（任务 #35），不是顺手改：
+
+1) **`close_session` 要验归属**（r8 R8-W-2 追到的根因入口）。签名从
+   `close_session(session)` 变成 `close_session(session, source) -> FileResult<()>`：
+   地址不符 ⇒ `NOT_FOUND`，且**什么都不发生**——会话不终止、别人的 `.part` 不删、
+   发送预算不释放、节流状态不清。归属检查之前的实际破坏面比"清计数"大得多：会话号
+   `next_session` 顺序自增可枚举，猜到一个整数就能打断别人的上传。
+   未知 id 与不属于自己的 id 在返回值与审计行上逐字同形（不做会话存在性 oracle）。
+   **实现踩到的坑，被自己的测试抓红**：`record()` 在 principal 留空时会回查会话补归属，
+   所以"先把会话放回原位、再落审计行"会让拒绝行的 principal 变成受害者主体名，
+   与"id 不存在"那行的空串不一致 ⇒ 顺序必须反过来。测试
+   `closing_another_peers_session_is_refused_and_leaves_it_intact` 断言这两行的
+   principal 格相同；把顺序改回去（变异 P5）实测红这一条。
+2) **单源限额 `max_failures_per_source`（默认 40）**：一个传输地址在一个窗口里最多贡献
+   这么多条失败，超了锁**这个地址**，不牵连别的地址、不升级为全体 fail-closed。
+   它把 G15 代价 (3) 那条聚合上界从"一个地址就能烧掉"变成"需要同一窗口内约 128 个
+   不同源地址"；产品尺寸引擎上的直接实测是 `solo_rows_after_flood = 40`（一个地址灌
+   2048 条失败只留下 40 行）。源账本与源锁表也各自受 `max_throttle_buckets` 门禁，
+   账本满时陌生地址**当场被锁**（fail-closed，不给它建行）——这条分支由
+   `unknown_address_is_locked_when_the_source_ledger_is_full` 钉住（变异 P3 实测红）。
+   交叉规则两条并进 G12 且各有只违反自己的夹具（`>= lockout_after`、
+   `<= max_throttle_buckets × lockout_after`）；副作用是**缩小节流表的小夹具必须同时
+   缩小这道额度**，否则拒启动——本批 4 个夹具（两处单测、两处探针）因此显式写了
+   `max_failures_per_source`，并把洪水条数与额度的关系写在旁边。
+3) **令牌比较收敛成唯一入口 `FileEngine::token_eq`**，计数挂在它内部。三件事分层说清，
+   不再混着讲（我第一版把话说过了，见下面的自我更正）：
+   - 删掉计数（P6）⇒ 单测 + 冻结期望 `token_comparisons_short_circuit_when_locked` 红；
+   - 删掉锁定预检（M10b）⇒ 8 条单测红 + 4 条冻结期望翻转 ⇒ "锁内不做比较"确有对象；
+   - **绕开**这个入口去比较（F）⇒ `token_eq` 变 never-used，`warnings = "deny"` 下
+     **编不过**（实测输出 `error: method 'token_eq' is never used`）——所以"多一个比较点"
+     是构建期挡住的，不是测试挡住的；
+   - 仍然挡不住的：把 `token_eq` **内部**的 `constant_time_eq` 换成长度相关的 `!=`。
+     这一半只有 `constant_time_eq` 自己的单测（区分长度/前缀）加评审目视负责。
+     **自我更正**：我先前在 `token_comparisons` 的文档与 G15 代价 (5) 里写过"换成 `!=`
+     就会红"，那是过度声明——计数只证明"比较发生了几次、在哪做"，不证明比较的
+     时序形状。措辞已按实测分层改写，代码文档、G15、requirements 三处同步。
+
+契约面：MODULE G12（两条新交叉规则）、G15（源限额、比较入口的分层口径、未证事项更新：
+删掉"六处硬编码"这种会说谎的具体计数、改成"内部全部时间读取硬编码 `Instant::now()`"）、
+G16（会话终止验归属 + 同形拒绝 + 残余是"地址不是凭证"）；PRODUCT §18.2 加"一个地址
+烧不掉整池额度"与"会话终止要验归属"两段；requirements.toml REQ-010 acceptance 重写。
+G15 的"显式声明的代价"从四条变五条，第五条就是上面第 3 点的分层结论。
+
+变异表（第十片，全部 Linux 真树实测，`cargo test --lib` + auth-throttle 探针 JSON）：
+  P1 限额记账但从不武装   → RED per_source_budget_... + unknown_address_is_locked_...
+                            + 期望 single_address_cannot_fill_the_table=false、
+                              throttle_per_source_budget_scoped_to_address=false
+  P2 源锁升级为全局窗口   → RED 同上两条 + 那两条期望翻转（限额牵连全节点这件事有对象）
+  P3 账本满时 fail-open   → RED unknown_address_is_locked_when_the_source_ledger_is_full
+  P4 去掉归属检查         → RED closing_another_peers_... + foreign_close_refused_...=false
+  P5 审计行写在放回之后   → RED closing_another_peers_...（principal 泄露，oracle 成立）
+  P6 去掉比较计数         → RED authenticate_compares_tokens_only_... + 期望 false
+  F  绕开唯一入口比较     → 编译失败（dead code），见上面第 3 点
+  回归复核：N5 摘要少喂 source → RED + other_source_still_admitted=false；
+  N6 桶不衰减 → RED 3 条 + sustainable/self_heals 双 false（pool_denials 48→20、
+  pool_lockouts 0→28）；M9 过期锁不回收 → RED 唯一那条；E 关掉纵深防御那支 → 66 全绿
+  （与"经 authenticate 不可达"一致）；M10b 去掉锁定预检 → 8 条单测红 + 5 条期望翻转。
+
+探针一处**有意**的夹具改动：`throttle_sustainable_failure_budget` 原来把 8 行 × 3 轮
+全灌在同一个源地址上，本批加了单源限额之后那量的就是限额而不是"表位可续额度池"，
+所以改成**一个主体配一个地址**（每地址每轮 2 条、三轮 6 条 < 额度 8），并在旁边写明
+两道门必须各测各的；额度那道由新的 `throttle_per_source_budget_scoped_to_address` 与
+`single_address_cannot_fill_the_table` 负责。同理，两处产品尺寸引擎的洪水循环从
+`10.0.0.9` 改成 `10.0.9.{i/32}` 轮转（每地址 32 条 < 默认额度 40），否则
+`product_engine_fails_closed_when_flooded` 会被源锁提前截断而假红。
+
+仍未闭的（写进 G15 未证事项，不谎称已解）：时钟注入没做，时间夹具仍吃墙钟；
+principal/source 长度进摘要前无上界；身份不做 NFC/大小写归一；`lockout_window` 无下界；
+源地址是传输地址而非凭证（M2 发 capability 才能关死）；`max_failures_per_source`
+只校验非 0 与两条交叉界，没有"相对速率的下界"概念——它管爆炸半径不管速率，
+速率那道门仍属 M2 的连接层限流与 RSS 计量。
+
+评审链：r1(6F) → … → r6(0F) → r7(0F) → r8(0F, COMMENTED) → r9（本片：归属检查、
+单源限额、比较唯一入口）。
+
+================================================================================
+追加：M1 第十一片（r9 回来之后的落地：源锁门禁、空地址短路、两个补上的契约对象），宿主 xc-pc-linux
+================================================================================
+r9 的签发结论：**COMMENTED / 0 FAIL / 6 WARN / 9 NOTE**，判定"可合并"，
+`blocking_issues_remaining = []`、`rejected_items = []`。案卷在
+`.evidence/review-gateway-file-r9/`（summary.json + findings.md 257 行；撰写与签发是同一个
+独立 agent，它按本链固定动作先写 summary.json 再写 findings）。r9 自己的定性要照抄一句：
+"六条 WARN 全是散文与射程问题，没有一条是判定写错"——这句与下面每条处置的落点一致。
+r9 未复现本仓任何数字（它是 Windows 侧纸面复核），但它**独立复算了 contract_hash**
+（ef289491…，与主机报告一致），并按夹具重推了本批的杀伤力。
+
+# bindings（复验于干净树 8a67e85，`nexus-harness status --json` 实测，dirty_state=false）:
+#   source_revision       8a67e85d4e6b2176872050c8491a78a13c3b6824
+#   working_tree_digest   7e8c4fc7dc537dd68204acf31e496361a0a08e8c
+#   contract_hash         4f28580bd3c9bd568e62863be1976755044d4fd2
+#   toolchain             1.98.1 / x86_64-unknown-linux-gnu
+实测：cargo test --lib = 69 passed; 0 failed / clippy --all-targets = 零诊断 /
+     9 条 E4 场景 = **102** 条期望全 PASS（6+10+9+5+9+25+16+7+15）
+
+# r10 处置之后的复验（D 轮，宿主 xc-pc-linux，rustc/cargo 1.98.1 / x86_64-unknown-linux-gnu，
+# `nexus-harness status --json` 实测，dirty_state=false）:
+#   变异表那棵        source_revision d0ace31a824e309f46e3ce708055f788332a3b83
+#                   working_tree_digest 3fa1185a82ed49c6583ad029c8242a370f772e13
+#                   contract_hash         2219448ed81870cbf67d1b4bd6cf93c63e5c51f4
+#                   verify --fast 连跑 2 次全 PASS（9 门），evidence dir = verify-e6f5aabdd251
+#                   status --json verdict = PASS（"latest evidence is fresh and PASS"）
+#   落地前最后一道门  source_revision e6dd2568cb18adf7a60238c87803df2573e7a25e
+#                   working_tree_digest dbcf237a91a2413b991b69392dcae28dacd04d08
+#                   contract_hash 2219448ed81870cbf67d1b4bd6cf93c63e5c51f4（与上相同：这一棵
+#                   与 d0ace31 的差是纯注释/散文，`git diff -U0 d0ace31 e6dd256 --
+#                   crates/nexus-web-gateway/src crates/nexus-web-gateway/examples scenarios`
+#                   滤掉 `//`/`///` 行之后为空，本轮实测）
+#                   cargo test --lib = 72 passed; 0 failed / clippy 无诊断输出 /
+#                   9 条 E4 场景全 PASS = 103 条期望（逐条 6+10+9+5+9+26+16+7+15）/
+#                   verify --fast = 9 门全 PASS，evidence dir = verify-eaac31203670 /
+#                   status --json verdict = PASS（"latest evidence is fresh and PASS"）
+实测（两棵都跑过同一套）：cargo test --lib = **72 passed; 0 failed** / clippy --all-targets 无诊断
+输出（并由 verify 的 clippy 门 PASS 背书；我自己那条 `echo $?` 拿的是管道尾命令的退码，
+不算证据）/ 9 条 E4 场景 = **103** 条期望全 PASS（6+10+9+5+9+26+16+7+15）
+# D 轮中途的几棵，全部留下而不是抹平，因为**每棵都红过不同的东西**：
+#   fbcac2e  地址漂移夹具参数不合法（撞 G12 的 `max_failures_per_source >= lockout_after`），
+#            baseline 就 1 条单测红 + 探针整个用例无 JSON ⇒ 该树全部数字作废。
+#   c5d0918  矩阵 14 项的那一棵（70 单测 / 26 期望）；verify 连跑 3 次全 PASS，
+#            evidence dir = verify-b4e6d030bf9c。
+#   a0ce15f  补上"源锁过期回收"那条测试之前（70 单测）；selected-properties 的 FAIL 在这里
+#            被抓到名字与 panic（见本节末段）。
+#   7459e74  71 单测：加了 `expired_source_locks_are_reclaimed_…`，M18 从 0 红变成 1 红。
+#   cc2b3c8  72 单测：加了 `source_ledger_budget_forgives_…` 的第一、二版节拍，M17 仍 0 红。
+#   d0ace31  72 单测：节拍改成"间隔在迭代之间"，M17 终于 1 红 ⇒ 下面这张表以此为唯一口径。
+# 锚回落地提交：本节描述的那 9 个文件（src/examples/MODULE/PRODUCT/requirements/scenarios/
+# 两条知识条目 + index.json）落在 `5b8c16b`。它与复验树 e6dd256 的关系是**逐字节证明过的**，
+# 不是断言：
+#   git diff e6dd256 5b8c16b -- crates/nexus-web-gateway/examples scenarios \
+#       crates/nexus-web-gateway/requirements.toml PRODUCT.md            ⇒ 空（提交前实测为空）
+#   git diff e6dd256 5b8c16b -- crates/nexus-web-gateway/src/file_service.rs
+#       再滤掉 `//` 行                                                  ⇒ 空（提交前实测为空）
+# 所以 72 单测 / 26 条本场景期望 / 103 条总期望 / contract_hash 2219448e / verify 9 门 PASS
+# 这组数对 5b8c16b 成立。本节本身与 FILE_MANIFEST、`.evidence/review-gateway-file-r9|r10/`
+# 随**下一个** docs 提交携带（`.evidence` 被 `.gitignore:3` 排除，靠 `git add -f` 放行），
+# 因此本节文字不在被测量的那棵树里——这是有意的顺序：先代码+契约，后案卷，不用 --no-verify。
+
+公开更正与滚动（"先问主机再落笔"，每个数各自属于自己那棵树）：
+  E4 期望 99（第十片，1c0f0a9）→ 101（r9 落地后两条：`foreign_close_audit_shape_is_indistinguishable`
+        与 `unknown_source_locked_on_first_failure_when_ledger_full`）→ 102（补
+        `empty_source_is_refused_before_the_throttle`）→ **103**（D 轮补
+        `address_representation_drift_splits_the_source_budget`）；auth-throttle 单场景
+        22 → 24 → 25 → **26**。
+  单测 67 → 69（`source_lock_table_full_escalates_instead_of_growing_forever`、
+        `empty_transport_address_is_refused_before_the_throttle`）→ 70
+        （`address_representation_drift_arms_two_independent_source_locks`）→ **72**
+        （`expired_source_locks_are_reclaimed_instead_of_escalating_to_the_global_window`、
+        `source_ledger_budget_forgives_failures_from_older_windows`，后一条改了三版节拍才有
+        杀伤力，见 D 轮变异表 M17 那一行）。
+  contract_hash ef289491 → 13a86e2e（24 条）→ 4f28580b（25 条）→ **2219448e**（26 条）。
+  M10b（去掉 `authenticate` 的锁定预检）的杀伤力在本链出现过**五个**值：**8 红/4 翻转**
+        （第十片正文）、**8 红/5 翻转**（第十片变异表）、r9 静态重推 **9/9**、
+        8a67e85 实测 **10/10**（r10 独立复现，名单逐条对上）、D 轮（c5d0918）实测
+        **11 红 + 11 翻转**——多的那一条正是新增的地址漂移单测，它同样依赖"锁定先于比较"。
+        按本链既定口径以**实测**为准；前四个值都保留在案，不抹。r9 对"为何它的 9 比我的 8
+        多一条"的解释是对的：`idle_recycle_clears_no_throttle_state` 不红，它的 THROTTLED 来自
+        `record_failure` 的武装返回值而不是预检。9 → 10 的差集按名字逐条对过（对法：
+        `git show 36e2755` 那份 file_service.rs 里 r9 给的九个行号逐个回推到 fn 名），
+        就是为本批 R9-W-2 新增的那条 `source_lock_table_full_escalates_instead_of_growing_forever`；
+        而 `empty_transport_address_is_refused_before_the_throttle` 在 M10b 下**不红**（空地址
+        守卫在锁定预检之前，两支互不影响）——这一格是我原本会顺手写错的地方，按实测名单核过
+        才落笔。
+
+六条 WARN 的处置（每条给落点与可红对象）：
+  R9-W-1 新机制键在未归一、未校验的地址串上，而"同一条地址串"这个前提原先只为 per-peer
+          配额登记过。处置：`authenticate` 在进节流器**之前**拒空串（AUTH_DENIED，不比较、
+          不记账），G16 前提段把这条字符串的四个用途（归属、单源额度、per-peer 配额、
+          摘要键）一次登记齐，并明写"引擎不做归一化、M2 接线时必须核表示稳定性"。
+          对象：单测 `empty_transport_address_is_refused_before_the_throttle` + 期望
+          `empty_source_is_refused_before_the_throttle`（变异 P8 实测 1 红 + 1 翻转）。
+  R9-W-2 契约与代码 doc 都在说"源锁表受 max_throttle_buckets 门禁"，而代码没有——"账本满 ⇒
+          陌生地址第一条就锁"因此是**每 1 次请求换 1 条表项**的内存放大路径（这个缺陷是
+          我自己那条 fail-closed 意图造出来的）。处置：新增 `arm_source`，锁表满时与两层键
+          同一条大路一致——升级为全局窗口；doc 与 G15 的"四张表各自 ≤ 上界"改成有对象的陈述，
+          "源限额绝不升级为全体 fail-closed"更正为"**在源锁表还有位置时**不升级"。
+          对象：单测 `source_lock_table_full_escalates_instead_of_growing_forever` + 期望
+          `unknown_source_locked_on_first_failure_when_ledger_full`（变异 P7 实测 1 红 + 1 翻转）。
+  R9-W-3 PRODUCT 同一个 bullet 里并存两句互斥陈述（旧的那句说"今天它仍能终止别人的会话"）。
+          处置：旧的改成过去时并写明"本批之前"，只留一条现在时为真。
+  R9-W-4 `close_session` 的 doc 头一段还是被本批取代的旧理由（"source 故意不是参数"）却没标
+          历史。处置：改写成三段历史（r2 N-8 → r8 R8-W-2 → 本批），并补三条口径：同形性只管
+          返回值与审计行、射程只到 close_session、引擎不归一化地址。
+  R9-W-5 归属检查的射程比它自己给的理由窄：`abort_upload` 等按 id 删除的动词保留同样的破坏面。
+          处置：不假装扩大——MODULE G16、PRODUCT §18.2、REQ-010 acceptance 三处同一口径写明
+          "只覆盖 close_session，其余同型入口的残余结转 M2"。
+  R9-W-6 同一条变异在同一批的三个位置报了两个不同数（4 与 5），r9 重推第三个（9/9）。处置见上面
+          的公开更正：以本轮实测 10/10 为准，MODULE G15 代价 (5) 同步，三个旧值留在案里。
+
+九条 NOTE：R9-N-1（单测洪水漏了一处同型降权）**本批**改掉——轮转地址 `10.7.{slot/256}.
+{slot%256}` 与那行"每地址恰好花满 32 条 < 默认额度 40"的算术是第十一轮 r10 复跑时重新
+数过的，它落在复验树 8a67e85 这一侧（**不是**"本轮之前"：r10 R10-N-1 就是抓我这个 provenance
+说反了——1c0f0a9 上 :3124 仍是单地址 10.0.0.9，那句"已在上一片改掉"会把本批的处置写成
+既成事实）；R9-N-2（审计同形性在契约面零对象）⇒ 新增探针字段与期望，变异 P5 现在有 E4
+对象；R9-N-3（时钟边界分支源侧与 pair 侧口径不一致）⇒ 当时**只改了返回值半**，状态半
+是 r10 R10-W-1 抓出来的，见下面 D 轮；R9-N-4/R9-N-5/R9-N-6 是 r9 对我三个提问的
+**肯定回答**（无抖动、两分支逐字同形、分层措辞站得住），按记录处理；R9-N-7
+（自报实测数有三处没随树滚动）⇒ 全部改成"历史值 + 限定语"或当前树实测值；R9-N-8（只写 128 会被
+读成"表满大路被关上"）⇒ G15 代价 (3) 现在同时写 128 与 26 两个数；R9-N-9（知识条目仍写"六处
+硬编码"）⇒ 删掉这个会说谎的计数。
+
+r10 的签发结论：**COMMENTED / 0 FAIL / 2 WARN / 5 NOTE**，判定可合入，blocking 为空。
+案卷 `.evidence/review-gateway-file-r10/`（summary.json + findings.md 157 行）。这一轮的
+分量与前面不同：**r10 自己在 xc-pc-linux 上跑了门禁**（宿主 appen@10.144.144.4，rustc/cargo
+1.98.1，自有临时克隆 `/work/r10-verify-clone`，树 = 8a67e85，`CARGO_TARGET_DIR=/work/r10-review-target`，
+不碰实现方的克隆与共享 target），复现了 69 单测全绿 / clippy 零诊断 / 9 场景 102 条期望全
+PASS / M10b=10 红+10 翻转（红与翻转名单逐条对上）/ P8=1+1 / P7=1+1，并代跑了 F（dead-code
+编译失败）。它还在 Windows 侧按 `env.rs:188-216` 独立复算 contract_hash 并复现
+`4f28580bd3c9bd568e62863be1976755044d4fd2`（303 个文件 / 425483 字节；**不做 LF 归一**则是
+`3d3dc88f…`——这条与知识条目 `2026-10-13-contract-hash-crlf-sensitivity` 一致）。
+本链第一次由评审方给出实测而非纸面重推，所以下面的处置以它的实测为准。
+
+D 轮（r10 回来之后的落地，全部重新实测）：
+1) **R10-W-1（状态半没跟上返回值半）**：`charge_source` 在额度耗尽时**无条件**
+   `source_failures.remove`，而 `arm_source` 在 `lock_until` 取不到 `until` 时不落地——
+   于是那条分支的终态是"无锁 + 无账本行"，与它原先批评的"删行在前"写法**完全相同**，
+   差别只在本次返回值；r9 的原方是"拿到 until 才删账本行"，条件删除当时没落。修法：
+   `arm_source` 的返回值语义改成"**有没有落下状态**"（单源锁或全局窗口），调用方只在
+   落下时才销账；"这次按锁定处理"的承诺改由调用点显式 `return true` 承担（doc 里两句话
+   分开写，不再让一个 bool 兼职两个意思）。
+   可达性与杀伤力（**实测**，不靠推）：把条件删除改回无条件 ⇒ 70 条单测全绿、26 条期望
+   无一翻转（复验树 c5d0918 上的变异 `D1_always_clear_ledger`）——因为 `lock_until` 除了
+   `checked_add` 失败还有一小时回退，那条 None 分支实践不可达。所以 R10-W-1 的修法
+   **没有**红对象，它的价值只在"注释与契约不再把没做完的写成做完"这一层；这一条明确
+   写进未证事项，不伪装成有测。
+2) **R10-N-4（"两种表示"退化的机验面）**：新增单测
+   `address_representation_drift_arms_two_independent_source_locks`（裸 IPv6 与
+   带方括号+端口 ⇒ 合法所有者关不掉自己的会话 = NOT_FOUND，会话仍活）与探针字段 +
+   冻结期望 `address_representation_drift_splits_the_source_budget`（两种写法各武装一道
+   源锁、账本归零、锁定期内换一个从没失败过的主体出示正确令牌仍是 THROTTLED）。
+   这两条钉的是**后果**而不是归一化：将来谁做了归一化，它们会红，G16/PRODUCT/REQ-010
+   必须同步。
+   **这两条夹具是本轮自己红出来的**：第一版写成 `lockout_after: 9, max_failures_per_source: 4`，
+   直接撞 G12 的交叉规则（额度必须 ≥ pair 阈值），`FileEngine::new` 在单测里 panic、
+   `engine_at(...)?` 在探针里把整个 auth-throttle 用例炸成"无 JSON"——复验树 fbcac2e 的
+   baseline 当场报 1 条单测红 + 25 条期望全 MISSING。改成 4 == 4 之后，为了不让"这次拒绝
+   是谁给的"含糊，断言改用从未失败过的主体（只可能被源锁挡）。教训：夹具也必须实测，
+   不能按记忆写参数。
+3) **R10-N-1/N-2（provenance）**：案卷里"R9-N-1 本轮之前已改掉"这句是错的，已按上面的
+   写法改成"本批改掉 + 落在哪棵树"；MODULE G15 代价 (5) 原先把 F 说成"在同一棵树上手跑
+   实测的三件事之一"，而案卷变异表又把 F 列为"本轮未复跑"——两份文档各说各话，现在
+   MODULE 里按 `P6/M10b 实现方跑、F 由 r10 代跑` 分开署名。
+4) **R10-N-5**：两支表满升级（`locked` 满与 `source_locks` 满）写的是同一个
+   `global_locked_until` 槽且直写不取 max。r10 逐条核过这不是缺陷（所有 `until` 都是
+   `now + window`，后写的 now 不早于先写的 ⇒ 覆盖只会延长），G15 已把这条写进正文，
+   省得下一个读者重新推一遍。
+5) **R10-N-3（P1 那行的数是哪棵树量的）**：见下面 D 轮变异表——本轮把整张表在最终树上
+   **全部重跑**（18 项自跑 + F 那项由 r10 代跑），所以表里每个数都只属于那一棵树；旧表
+   （c5d0918、8a67e85）的数不再被引用，只在"滚动"那段里留痕。
+6) **r10 之后由我自己复跑发现的两条零对象（不在 r10 名单里）**：把衰减那一族四条腿逐个
+   做坏之后，`source_failures` 与 `source_locks` 的过期回收各自**全绿**——也就是说
+   "四张表都按窗口回收"这句契约在源侧两条腿上是零可红对象（与 r8 R8-W-3 抓 `locked`
+   那一半是同一个形状，本轮第一次把这一族全量跑）。补了两条对偶测试：
+   `expired_source_locks_are_reclaimed_instead_of_escalating_to_the_global_window`（M18 由
+   0 红变 1 红）与 `source_ledger_budget_forgives_failures_from_older_windows`（M17 改了
+   **三版节拍**才有杀伤力：v1 4 轮、v2 3 轮都仍在每轮之后睡，两版实测全绿；v3 把间隔挪到
+   迭代之间、断言紧跟最后一条失败，才红）。单测 70 → **72**。教训与 R9-N-2/P8 同一条，
+   但这次是**测试自身的杀伤力**要量：新写一条测试不等于它钉住了什么。
+
+D 轮变异表（**唯一口径 = 最终树 d0ace31**，72 条单测 / 26 条 auth-throttle 冻结期望；工具
+/work/mm3.py、/work/mm4.py、/work/mm5.py；每个锚点先断言存在，缺锚直接退出而不是静默 no-op。
+中途 c5d0918 那一张的数不再引用——它属 70 条那棵树，红数与新加的测试无关部分相同、相关部分
+少一到两条）：
+  baseline                     → 72 全绿、26 条期望无一翻转（探测器有效）
+  E  纵深防御那支关掉          → 72 全绿、0 翻转（与"经 authenticate 不可达"一致）
+  P1 限额记账但从不武装        → RED 5 条 + 4 翻转（single_address_cannot_fill_the_table、
+                                throttle_per_source_budget_scoped_to_address、
+                                unknown_source_locked_on_first_failure_when_ledger_full、
+                                address_representation_drift_splits_the_source_budget）
+  P2 源锁顺手锁全节点          → RED 5 条 + 3 翻转（本轮**复跑**，上一片没跑；爆炸半径牵连
+                                全节点这件事有对象，而它不翻 ledger-full 那条是设计如此）
+  P3 账本满时 fail-open        → RED 2 条 + 1 翻转
+  P4 去掉归属检查              → RED 2 条 + 1 翻转（漂移单测红在"NOT_FOUND 变 OK"那一格）
+  P5 审计行写在放回之后        → RED 1 条 + 1 翻转（foreign_close_audit_shape_…）
+  P6 去掉比较计数              → RED 1 条 + 1 翻转
+  P7 去掉源锁表门禁            → RED 1 条 + 1 翻转
+  P8 去掉空地址守卫            → RED 1 条 + 1 翻转（本轮补的那个对象生效）
+  N13 两层键摘要少喂 source    → RED 1 条（lockout_refuses_even_the_correct_token_…）
+                                + 1 翻转（other_source_still_admitted）——这就是 r9 的 N5，
+                                本轮重跑，不再引用第八片的数
+  N14 源摘要吃掉地址差异        → RED 6 条 + 6 翻转：红名单含
+                                `address_representation_drift_arms_two_independent_source_locks`
+                                与 `expired_source_locks_are_reclaimed_…`，翻转含
+                                `address_representation_drift_splits_the_source_budget`
+                                ⇒ G16 那句"谁做归一化这两条会红"是**实测**，不是推断。
+                                （这一支第一版把锚点写成断裂的字符串字面量 ⇒ 语法错、
+                                `lib: NO RESULT`；那是编译失败而不是变异，作废后重跑才得到
+                                本行的数——记在这里，因为"变异工具自己也要有杀伤力证据"）
+  D1 条件删除改回无条件        → 72 全绿 + 0 翻转 ⇒ **R10-W-1 的修法零红对象**（不可达分支），
+                                这条红/绿的"负结果"本身就是它该有的证据形态
+  M15 桶不随窗口衰减（旧 N6）  → RED 4 条 + 2 翻转（throttle_flood_self_heals_after_quiet_window、
+                                throttle_sustainable_failure_budget）
+  M16 两层键的过期锁不回收     → RED 2 条 + 0 翻转：除了 `expired_locks_are_reclaimed_…`
+                                之外**新加的源锁那条也红**——因为源锁测试的夹具里 pair 侧也
+                                会武装，两条腿在同一个满表分支上互相作证（不是重复覆盖：
+                                两条断言的红点不同）
+  M17 源账本不随窗口衰减        → RED 1 条 + 0 翻转 ⇒ **这条红是本轮第三次才拿到的**：
+                                v1（4 轮、每轮后睡）在 71 条那棵树上全绿，v2（3 轮、仍每轮后
+                                睡）在 72 条那棵树上仍全绿——两版的共同错误是"最后一条失败
+                                之后又睡过整整一个窗口"，于是 M17 下刚武装的源锁在断言之前就
+                                服完刑期。v3 把间隔挪到迭代**之间**、断言紧跟最后一条失败，
+                                才拿到这一红。两版都没杀伤力是**量出来**的，不是我推出来的；
+                                它同时说明：光"加了一条测试"不等于那条测试有用。
+  M18 源锁过期不回收            → RED 1 条 + 0 翻转（`expired_source_locks_are_reclaimed_…`）
+                                ——这条测试补上之前，它在 70 条那棵树上全绿（与 r8 R8-W-3
+                                抓 `locked` 那一半的形状一模一样）
+  M10b 去掉锁定预检            → RED 11 条 + 11 翻转（本链对该值出现过 8/4、8/5、9/9、10/10，
+                                现在同树实测 11/11；名单逐条见 r9 findings §3 与本行翻转列表）
+  F  绕开唯一入口比较          → 由 r10 在 8a67e85 上代跑：`error: method 'token_eq' is
+                                never used`，`cargo check --all-targets`（含 test profile）同红
+
+**r10 R10-W-2 的复现**：r10 在自己的克隆、自己的 target 上遇到同一棵 8a67e85 的 verify
+**首跑 FAIL（selected-properties，`cargo test -p nexus-harness` exit 101）**，随后同树复跑
+3 次全 PASS、单独跑该 crate 共 10 次全绿（117 passed/次，含一次与 gateway 构建并发的负载
+样本）。也就是**两个操作者、两套 target 各中一次**，而我这边 10 次同类复跑一次都没再遇到。
+r10 拿到的信息比我多一格：门的 detail 只截到编译行加 `error: test failed`，**失败测试名仍然
+没进证据**——因为它的 FAIL 首跑也被后续 PASS 按同一个 bindings id 原地覆写。所以这条 flake
+是**活的**（可复发）、失败面是**别的 crate 的测试**（nexus-harness 自己的单测，不在本批的
+被测面里），而本批结论不受它影响：我依赖的各门（format/check/clippy/architecture/
+dependency-governance/resource-type-neutrality/affected-tests）与 9 条场景、69→70 条 lib
+单测都被分别独立复跑为绿。本轮不修 nexus-harness（那是 harness 侧的活，与
+`fix/nexus-harness-evidence-binding` 那一摊并列），但把"哪个 harness 单测在抖"记成未闭项，
+不谎称已定位。
+
+
+**本轮自己发现的一条（r9 没抓到，是我复测变异时发现的）**：P8（去掉空地址守卫）在 24 条期望上
+**零翻转**——也就是说 R9-W-1 的修法只有单测柱子，契约面是空的。这与 r9 R9-N-2 抓的是同一个形状
+（"契约里写了、探针没读"），所以补了 `empty_source_is_refused_before_the_throttle` 这条期望，
+补完 P8 变成 1 红 + 1 翻转。教训照旧：**判据的效力只能靠变异实测，不能靠"我加了测试"**。
+
+变异表（第十一片，全部在复验树 8a67e85 上真跑，`cargo test --lib` + auth-throttle 探针 JSON 对照
+25 条冻结期望；工具 /work/mm2.py，锚点先做过一次"全部 FOUND"的自检）：
+  baseline               → 69 全绿、25 条期望字段无一翻转（探测器本身有效）
+  E  关掉纵深防御那支    → 69 全绿、0 翻转（与"经 authenticate 不可达"一致，不是漏覆盖）
+  P1 限额记账但从不武装  → RED 3 条 + 3 翻转（single_address_cannot_fill_the_table、
+                          throttle_per_source_budget_scoped_to_address、
+                          unknown_source_locked_on_first_failure_when_ledger_full）
+  P3 账本满时 fail-open  → RED 2 条 + 1 翻转
+  P4 去掉归属检查        → RED 1 条 + 1 翻转（foreign_close_refused_and_session_survives）
+  P5 审计行写在放回之后  → RED 1 条 + 1 翻转（foreign_close_audit_shape_is_indistinguishable）
+  P6 去掉比较计数        → RED 1 条 + 1 翻转（token_comparisons_short_circuit_when_locked）
+  P7 去掉源锁表门禁      → RED 1 条 + 1 翻转
+  P8 去掉空地址守卫      → RED 1 条 + 1 翻转（本轮补上的那个对象）
+  M10b 去掉锁定预检      → RED 10 条 + 10 翻转（清单见 MODULE G15 代价 (5) 与 r9 findings §3）
+  本轮未复跑、仍属第八/九/十片树的：N5 摘要少喂 source、N6 桶不衰减、M9 过期锁不回收、
+  P2 源锁升级为全局窗口、F 绕开唯一入口（编译期 dead-code）。这些结论没有被本批推翻，
+  但引用它们时要看的是当时那棵树的 bindings，不是 8a67e85。
+  （**本表整体已被下面的"D 轮变异表"取代**：那一张在同一棵树 c5d0918 上把 14 项全重跑了，
+  其中 P2、N5（本轮记作 N13）、F 三支的"未复跑"限定只对这一张表当时的状态成立。）
+
+一处必须记下来的门运行事故（不能写成"9 门全 PASS"就完）：同一棵 8a67e85 上
+`verify --fast` **首跑 FAIL，唯一失败门 selected-properties**（该门 = `cargo test -p
+nexus-harness`），紧接着同树复跑 **PASS（9 门全过）**；之后单独跑 `cargo test -p
+nexus-harness` 5/5 全绿。失败的**测试名没拿到**：harness 的证据目录按 bindings 定位
+（verify-1f1eeff0a910），同树复跑把首跑的 gates.json/summary.json **原地覆写**成 PASS，
+诊断随文件一起没了。所以本批只能说"复跑为绿、首跑原因未知"，不能说"偶发已排除"。
+（**这两句是本节早些时候的状态**，随后同一节末段把它推翻并定位了，见"然后本轮把它逼出来了"。）
+**这一条后来被 r10 独立复现**（见上面 D 轮第 5 点）：评审者在自己的临时克隆、自己的
+target 上，同一棵 8a67e85 的 verify 首跑**又是** selected-properties FAIL（exit 101），
+复跑 3 次全绿，且它那次 FAIL 的证据也被后续 PASS 按同一个 id 覆写——**两个操作者、两套
+target 各中一次**，而失败测试名两次都没留下。实现方侧随后又跑了 10 次 `verify --fast`
+（8a67e85 上 4 次含一次 FAIL、c5d0918 上 3 次全绿、另开隔离 target 的冷构建 3 次全绿）与
+15 次 `cargo test -p nexus-harness`，全部绿，未再复现。
+
+**然后本轮把它逼出来了，并且推翻了自己早先的定性。**配方：`touch engineering/nexus-harness/src/env.rs`
+强制重建后 `cargo test -p nexus-harness`，3 个周期里中 1 次；再 8 个周期里中 1 次（第三次 attempt）。
+抓到的 panic 是：
+```
+thread 'env::tests::digests_deterministic_and_sha1_length' panicked at env.rs:317:13
+assertion `left == right` failed: working_tree_digest 两次取值不一致
+  left:  "tree-unknown"
+ right:  "c1f6c3ed255ea67a49c4fc3824b136886201b5a3"
+```
+对照组：同一份代码加 `-- --test-threads=1` 连跑 4 轮（每轮都强制重建）**全绿**。所以
+- 红的是 **nexus-harness 自己的** `env::tests::digests_deterministic_and_sha1_length`，
+  不是 gateway 的夹具；本批 70 条 gateway 单测与 9 条场景与它无关，各自都绿。
+- 机制**不是**墙钟/时间夹具（我早先写的"静态嫌疑：`run_parallel_keeps_order_and_verdicts`
+  的 sleep 交错"那条是猜的，且猜错了对象），而是**并行测试里对同一个 live repo 并发调
+  git**，`working_tree_digest()` 那一路拿不到结果 ⇒ **降级成哨兵 `tree-unknown`**，而这条
+  测试恰恰是"哨兵不得算作一次确定取值"的守卫（env.rs:302-303 的注释就是它自己写的）。
+  换句话说：**门是守卫正常工作，被守卫抓住的是 harness 自身的静默降级。**
+- 因此更要紧的一条是：**生产路径上 `working_tree_digest` 会间歇退化成 `tree-unknown`，
+  而 harness 不报错**——退化的值会被写进 evidence 的 bindings 里当指纹用。这与已立案的
+  dirty `working_tree_digest` **内容盲**（分支 fix/nexus-harness-evidence-binding）是同一个
+  函数的两个不同缺陷：一个是"算出来了但对内容不敏感"，一个是"有时根本算不出来却照发"。
+
+harness 侧待办（本轮不修，跨 crate 且会动到正在评审的门；三条一起给方向）：
+ (a) digest 取不到时**不要静默降级**：返回 Err，让门禁判 UNKNOWN/FAIL 而不是把
+     `tree-unknown` 当指纹；或者把 `GIT_LOCK_RETRIES=4`（退避最多约 225 ms）在 live-repo
+     路径上提高到足以扛住并发测试的量。
+ (b) 同 bindings 的 `verify` **覆写上一份证据** ⇒ 偶发失败取证面丢失；写前先看目录里有没有
+     记录，有则按序落 `verify-<id>-N.json`，或把 `gates[].detail` 的原始输出尾巴另存成
+     `gate-logs/<gate>.txt`。
+ (c) `.githooks/pre-commit` 第 4 关的 `ls .evidence/review-* | sort | tail -1` 是**字典序**，
+     r10 之后它取到的是 r9 而不是 r10（本机实测：`sort` ⇒ r9，`sort -V` ⇒ r10）。修法 =
+     `sort -V`，或按 summary.json 里的 `review_round` 取最大。
+
+仍未闭的（写进 G15/G16 未证事项，不谎称已解）：`Throttle` 时钟注入没做，本节与知识条目里
+登记的那些时间夹具继续吃墙钟（知识条目已把"六处"这种会说谎的计数删掉，D 轮又新增两条
+200 ms 窗口的夹具并一并登记）；principal/source 长度进摘要前无上界；身份不做
+NFC/大小写归一——但**漂移的后果有机验对象了**（D 轮 N14：把源摘要改成"不吃地址"，在
+c5d0918 上 5 条单测红 + 6 条期望翻转，在最终树 d0ace31 上是 6 条红 + 6 条翻转——多的那条
+正是新加的源锁过期回收测试，见 D 轮变异表）；
+`lockout_window` 无下界；地址不是凭证（M2 发 capability 才关死）；
+`max_failures_per_source` 只管爆炸半径不管速率，速率那道门属 M2 连接层限流与 RSS 计量；
+归属检查只覆盖 `close_session`，`abort_upload` 等按 id 删除的动词同型破坏面原样保留；
+`close_session` 目前还没有 wire 调用方（M2 接线）；`constant_time_eq` 的时序形状那一半仍无断言；
+**R10-W-1 的修法没有红对象**——那条时钟边界分支经 `lock_until` 的一小时回退实践不可达，
+`D1_always_clear_ledger` 实测 70 全绿 + 26 条期望无一翻转，所以它的价值只在"注释与契约不再把
+没做完的写成做完"这一层，不许读成修掉了某个运行时问题。
+`selected-properties` 的间歇红**已定位**（见上面"逼出来了"那段）：红的是 harness 自己的
+`env::tests::digests_deterministic_and_sha1_length`，根因是并行测试对同一 live repo 并发调
+git 时 `working_tree_digest()` 退化成哨兵 `tree-unknown`；**未修**（跨 crate，且会动到正在被
+评审的门），三条修法方向已写进 harness 待办 (a)(b)(c)。本批不受它影响：gateway 的 70 条单测、
+clippy、9 条场景 103 条期望、verify 其余 8 门都各自复跑为绿，且这条 flaky 与"本批代码是否
+正确"没有因果关系——但它确实说明 **`verify --fast` 全绿不是可传递的单次事实**，所以本节的
+bindings 只报"在这棵树上、这一轮跑出来的值"。
+
+评审链：… → r8(0F/3W/7N) → r9(0F/6W/9N) → r10(0F/2W/5N；评审方首次在 xc-pc-linux 上实测，
+本链第一次由非实现者给出红/绿与名单) → r11（D 轮处置的独立复核，待派）。第 10 轮已远超
+AGENTS.md:1585 的默认 3 轮上限，r4/r5/r6 三次向仓库所有者报备后延续该状态；所有者口径是
+"子代理独立评审即可，不要等我操作"，故本轮不等绑定、直接派。
