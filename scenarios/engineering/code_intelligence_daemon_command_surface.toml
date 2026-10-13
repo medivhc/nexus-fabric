@@ -1,0 +1,43 @@
+schema_version = 1
+id = "engineering.code-intelligence-daemon-command-surface"
+title = "未知 daemon 子命令 BLOCKED，且 declined 输出仍带 authority 与 daemon.running（MODULE.md Public API 与字段可得性）"
+evidence_strength = "E4"
+requirement = "engineering/nexus-harness/MODULE.md#public-api"
+
+# 本场景只钉它能钉的：命令面的拒绝 + declined 形状的字段可得性。
+# 曾经写在这里的"命令清单必须含 daemon"这条**场景格式表达不了** —— 求值器只有
+# equals / one_of / non_empty 三种算子，没有子串断言（独立盲评指出：今天的兜底消息不含
+# daemon，而 `message non_empty` 为绿，等于核心性质 0 覆盖）。该断言已移到
+# daemon selftest 的 commands_surface_lists_daemon 值探针，由 lifecycle 场景钉住。
+
+[given]
+repository = "initialized"
+network = "none (不启动 daemon，也不启动 language server)"
+
+[when]
+command = "nexus-harness daemon bogus-subcommand --json"
+
+[[expect]]
+field = "command"
+equals = "daemon"
+
+[[expect]]
+field = "schema_version"
+equals = 1
+
+[[expect]]
+field = "verdict"
+equals = "BLOCKED"
+
+[[expect]]
+field = "message"
+non_empty = true
+
+# declined 也要自述状态：不能"因为没跑起来就什么字段都不给"。
+[[expect]]
+field = "daemon.running"
+equals = false
+
+[[expect]]
+field = "authority"
+equals = "advisory"

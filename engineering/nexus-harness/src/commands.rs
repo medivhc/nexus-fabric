@@ -105,7 +105,25 @@ pub fn status() -> Outcome {
     (verdict, message, extras)
 }
 
-pub fn context(target: &str) -> Outcome {
+pub fn context(args: &[String]) -> Outcome {
+    // `context <target> [--provider-binary <path>]`。`--provider-binary` 存在的唯一理由
+    // 是让"provider 不可用"这条降级路径可被 E4 确定性地演练（MODULE.md 不变量 6）：
+    // 它不接受写能力参数，也不改变任何既有字段语义。
+    let mut target = String::new();
+    let mut provider_override: Option<String> = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if arg == "--provider-binary" {
+            provider_override = args.get(index + 1).cloned();
+            index += 2;
+            continue;
+        }
+        if !arg.starts_with("--") && target.is_empty() {
+            target = arg.to_string();
+        }
+        index += 1;
+    }
     if target.is_empty() {
         return (
             "BLOCKED".to_string(),
@@ -119,16 +137,16 @@ pub fn context(target: &str) -> Outcome {
     };
 
     let mut dirs: Vec<std::path::PathBuf> = Vec::new();
-    let t = std::path::Path::new(target);
+    let t = std::path::Path::new(&target);
     if t.is_absolute() || target.contains('/') || target.contains('\\') {
-        dirs.push(repo.resolve(target));
+        dirs.push(repo.resolve(&target));
     } else {
         for base in [
             &config.crates_dir,
             &config.engineering_dir,
             &repo.root.join("apps"),
         ] {
-            dirs.push(base.join(target));
+            dirs.push(base.join(&target));
         }
     }
     let found = dirs.into_iter().find(|d| d.is_dir());
@@ -144,21 +162,47 @@ pub fn context(target: &str) -> Outcome {
                         .collect()
                 })
                 .unwrap_or_default();
-            let mapped = mapped_scenarios(&config, target);
+            let mapped = mapped_scenarios(&config, &target);
+            // Phase 2：附加**有界**语义锚点。语义层的任何结果都不改变上面这些字段，
+            // 也不改变 verdict —— 见 MODULE.md「Context Semantic Anchoring」不变量 1。
+            let semantic = crate::code_intel::anchors(&repo, &dir, provider_override.as_deref());
+            let mut extras: Vec<(String, Value)> = vec![
+                (
+                    "module_contract".to_string(),
+                    json!(contract.to_string_lossy()),
+                ),
+                ("headings".to_string(), json!(headings)),
+                ("mapped_scenarios".to_string(), json!(mapped)),
+                ("authority".to_string(), json!("advisory")),
+                ("semantic_status".to_string(), json!(semantic.status)),
+                ("semantic_anchors".to_string(), json!(semantic.anchors)),
+                (
+                    "semantic_budget".to_string(),
+                    json!({
+                        "max_results": semantic.max_results,
+                        "truncated": semantic.truncated,
+                        "candidate_queries": semantic.candidate_queries,
+                        "candidate_spans": semantic.candidate_spans,
+                        "workspace_scope": semantic.workspace_scope,
+                    }),
+                ),
+                ("snapshot".to_string(), semantic.snapshot),
+            ];
+            if let Some((code, reason)) = &semantic.reason {
+                extras.push((
+                    "semantic_reason".to_string(),
+                    json!({"code": code, "reason": reason}),
+                ));
+            }
             (
                 "PASS".to_string(),
                 format!(
-                    "context for {target}: module contract + {} mapped scenario(s)",
-                    mapped.len()
+                    "context for {target}: module contract + {} mapped scenario(s) + {} semantic anchor(s) [{}]",
+                    mapped.len(),
+                    extras_anchor_count(&extras),
+                    semantic.status
                 ),
-                vec![
-                    (
-                        "module_contract".to_string(),
-                        json!(contract.to_string_lossy()),
-                    ),
-                    ("headings".to_string(), json!(headings)),
-                    ("mapped_scenarios".to_string(), json!(mapped)),
-                ],
+                extras,
             )
         }
         None => (
@@ -167,6 +211,16 @@ pub fn context(target: &str) -> Outcome {
             Vec::new(),
         ),
     }
+}
+
+/// 只用于 message 文案，不参与判定。
+fn extras_anchor_count(extras: &[(String, Value)]) -> usize {
+    extras
+        .iter()
+        .find(|(k, _)| k == "semantic_anchors")
+        .and_then(|(_, v)| v.as_array())
+        .map(Vec::len)
+        .unwrap_or(0)
 }
 
 /// Scenarios whose id or requirement references the target name.

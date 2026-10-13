@@ -1,0 +1,119 @@
+schema_version = 1
+id = "engineering.code-intelligence-mcp-handshake"
+title = "MCP 薄适配只暴露 8 个只读工具，握手/未知方法/非法参数的失败形状正确，且不声明任何写能力（提案 §10/§6/§12/§16.8）"
+evidence_strength = "E4"
+requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#10-mcp-integration"
+
+# selftest 用 current_exe() 把自身作为子进程拉起 `mcp serve`，经**真实 stdio 管道**跑协议。
+# 默认不触发 language server 冷启动：第三条 tools/call 故意用非法参数，验证的是
+# "协议层错误走 JSON-RPC error，而不是伪装成 Nexus verdict"。
+# 诚实边界：这条场景证明的是"我们的 server 与我们的 client 互操作正确"；第三方 MCP 客户端
+# 在本仓库两个宿主上都不存在，与真实客户端的互操作**未经验证**（MODULE.md 已照此声明）。
+
+[given]
+repository = "initialized"
+network = "none (本地 stdio 子进程)"
+
+[when]
+command = "nexus-harness mcp selftest --json"
+
+[[expect]]
+field = "command"
+equals = "mcp"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+# 适配器本身不拥有最终 PASS 权。
+[[expect]]
+field = "authority"
+equals = "advisory"
+
+[[expect]]
+field = "protocol_version"
+non_empty = true
+
+[[expect]]
+field = "initialized_ok"
+equals = true
+
+# 8 个只读 verb 一一对应，且**没有任何写能力工具**。
+[[expect]]
+field = "tools_count"
+equals = 8
+
+[[expect]]
+field = "write_tools_exposed"
+equals = 0
+
+# 未知方法与非法参数都必须被拒绝（不是静默返回空结果）。
+[[expect]]
+field = "unknown_method_rejected"
+equals = true
+
+[[expect]]
+field = "bad_arguments_rejected"
+equals = true
+
+# 负向清单的真正落点：按名请求写能力工具必须被**结构化**拒绝。
+# selftest 侧的判据不止"回了个 error"，而是 code == -32602 且 message 以 UNSUPPORTED 开头，
+# 这里再钉一次，防止将来拒绝文案漂成自然语言而探测仍然绿。
+[[expect]]
+field = "write_call_rejected"
+equals = true
+
+# serve 的退出形状（不需要 language server，默认路径即跑）：
+# 零请求就挂断 ⇒ UNKNOWN（不伪装成 PASS，也不谎报崩溃）；畸形帧 ⇒ FAIL。
+[[expect]]
+field = "eof_verdict"
+equals = "UNKNOWN"
+
+[[expect]]
+field = "malformed_frame_verdict"
+equals = "FAIL"
+
+# 通道划分（独立 Review round 2 的 N5）：stdout 只承载 MCP 帧，退出 envelope 走 stderr。
+# 处理过一条请求后正常挂断必须是 PASS，且 handled_requests 记 1 —— round 1 修好的那条
+# PASS 分支此前只能靠人工 printf 看见（裸 JSON 混在同一个 stdout 里让探针解析不出来），
+# 所以这里同时钉"帧流可被完整消费且无多余字节"，把它变成有回归保护的事实。
+[[expect]]
+field = "pass_verdict"
+equals = "PASS"
+
+[[expect]]
+field = "pass_handled_requests"
+equals = 1
+
+[[expect]]
+field = "stdout_frames_ok"
+equals = true
+
+# notification 不产生回复必须是**序列证明**（下一条响应就是随后那条请求的 id），
+# 而不是"往管道写成功了就算过"。
+[[expect]]
+field = "notification_no_reply"
+equals = true
+
+# 契约承诺的启动参数必须端到端兑现：`mcp serve --provider-binary <不存在的路径>`
+# 要因为**这个 flag** 报 PROVIDER_UNAVAILABLE，而不是静默回退到 PATH 上的 server
+# （round 2 的 N1：当时 dispatch 把 args 整个丢掉，给了与不给完全同形、exit 0）。
+[[expect]]
+field = "provider_override_honored"
+equals = true
+
+# 探针条数是机器可核的量，不是散文（round 2 的 N3 把默认路径的 8 记成了 11；
+# round 3 的 N-A6 要求把它钉住）。默认路径 = 11 条。
+[[expect]]
+field = "probe_count"
+equals = 11
+
+# 不触发 provider：这条把"selftest 默认是便宜的"钉成契约，
+# 否则将来有人给 selftest 加了全仓查询，场景会悄悄变慢而不被察觉。
+[[expect]]
+field = "query_skipped"
+equals = true
+
+[[expect]]
+field = "snapshot.source_revision"
+non_empty = true

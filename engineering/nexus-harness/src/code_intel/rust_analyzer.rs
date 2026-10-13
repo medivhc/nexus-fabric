@@ -107,6 +107,11 @@ impl RustAnalyzerProvider {
                 write_requests_refused: 0,
                 server_requests_unhandled: 0,
                 dropped_notifications: 0,
+                // 会话层字段由 CLI/适配层在每次查询结束时覆盖（mod.rs）。
+                // 这里给的是"还不知道"的保守初值：未复用、零次查询、无失效原因。
+                session_reused: false,
+                session_queries: 0,
+                session_invalidated_reason: String::new(),
             },
             timeouts,
             // connect() 前尚未就绪；保守值使空结果被判不可信。
@@ -824,6 +829,13 @@ impl CodeIntelligenceProvider for RustAnalyzerProvider {
 }
 
 impl RustAnalyzerProvider {
+    /// 关闭会话并把"provider 子进程是否真的退出"交回调用方（daemon 的 `sessions_after_stop`
+    /// 靠它取观测值，而不是写常量）。`None` = 本来就没有会话（没得可关，也不算"活着"）。
+    pub fn close_with_report(&mut self) -> Option<bool> {
+        let session = self.session.take()?;
+        Some(session.shutdown_and_report_reaped())
+    }
+
     /// 把缓冲里的 publishDiagnostics 通知吸进 provider。
     fn pump_published(&mut self) {
         if let Some(session) = self.session.as_mut() {

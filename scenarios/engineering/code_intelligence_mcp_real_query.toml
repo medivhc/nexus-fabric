@@ -1,0 +1,103 @@
+schema_version = 1
+id = "engineering.code-intelligence-mcp-real-query"
+title = "经 MCP tools/call 走一次真实语义查询，返回的就是 CLI 那套中立 DTO（不另造 schema，也不泄露 LSP 原文）"
+evidence_strength = "E4"
+requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#4-agent-facing-api"
+
+# 作用域限定在夹具 workspace（3 个源文件、独立 cargo workspace root），
+# 因此冷启动面与命中集合都是确定的；换成仓库根 workspace 会让这条场景变成网速竞赛。
+
+[given]
+repository = "initialized"
+network = "none (本地 language server 子进程)"
+
+[when]
+command = "nexus-harness mcp selftest --with-query --json"
+
+[[expect]]
+field = "command"
+equals = "mcp"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "authority"
+equals = "advisory"
+
+[[expect]]
+field = "query_skipped"
+equals = false
+
+# 真实两次 tools/call → code_intel::run → **同一个** rust-analyzer 进程。
+[[expect]]
+field = "query_first_verdict"
+equals = "PASS"
+
+[[expect]]
+field = "query_first_results"
+non_empty = true
+
+[[expect]]
+field = "query_second_verdict"
+equals = "PASS"
+
+[[expect]]
+field = "query_second_results"
+non_empty = true
+
+# Phase 4 的判定数据：第二次查询必须落在**同一个 provider 会话**里（不重新 initialize/索引）。
+# 判据用结构事实（`provider.session_reused` / `session_queries`），不用时延比值——
+# 绝对毫秒随宿主负载漂移，钉时延只会造出与语义无关的脆弱红。时延仍由 selftest 输出当旁证。
+[[expect]]
+field = "query_first_session_reused"
+equals = false
+
+[[expect]]
+field = "query_first_session_queries"
+equals = 1
+
+[[expect]]
+field = "query_second_session_reused"
+equals = true
+
+[[expect]]
+field = "query_second_session_queries"
+equals = 2
+
+# 复用生效时会话没有被判失效：失效原因必须是空串，否则"复用了"与"重建了"分不开。
+[[expect]]
+field = "query_second_invalidated"
+equals = ""
+
+[[expect]]
+field = "query_warm_reused"
+equals = true
+
+[[expect]]
+field = "query_provider_kind"
+equals = "rust-analyzer"
+
+# MCP 侧不得把 authority 洗掉：工具结果里仍然是 advisory，而不是"PASS 权"。
+[[expect]]
+field = "query_authority"
+equals = "advisory"
+
+[[expect]]
+field = "query_workspace_scope"
+equals = "engineering/nexus-harness/fixtures/code-intel"
+
+[[expect]]
+field = "query_snapshot_bound"
+equals = true
+
+[[expect]]
+field = "snapshot.source_revision"
+non_empty = true
+
+# `--with-query` 的探针条数同样是机器可核的：11 条默认 + 3 条查询相关 = 14。
+# 与握手场景的 11 一起，把"声称跑过多少条探针"从散文变成断言（round 3 的 N-A6）。
+[[expect]]
+field = "probe_count"
+equals = 14

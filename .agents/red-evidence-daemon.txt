@@ -1,0 +1,272 @@
+# Red Evidence —— Provider Daemon 与结果缓存（契约先行的红灯确认，实现开始前）
+
+宿主：Windows（冒烟宿主），rustc 1.95.0，rev `9c672a7` 之上的工作树（契约文件已写、实现未动）。
+可执行文件：`./target/debug/nexus-harness.exe`（`daemon` 子命令**不存在**）。
+流程依据：`.agents/skills/nexus-test-review/SKILL.md` 的"红灯确认"——测试必须可运行且处于失败态，
+不是"看起来对"；本文件就是那条红灯的载体（场景 `.toml` 是本模块的测试用例形态）。
+
+## R0 直接调用 daemon 命令面：能力缺席，且是 fail-closed 的缺席
+
+    nexus-harness daemon selftest --json   exit=2  {"command":"daemon","schema_version":1,
+      "verdict":"BLOCKED","message":"supported commands: status, context, check, test,
+      verify, explain, bench, replay, scenario, code"}
+    nexus-harness daemon status --json     exit=2  同上
+    nexus-harness daemon start --json      exit=2  同上
+
+三条都是 `BLOCKED` + 退出码 2：**没有**假装成功、**没有**空输出、也**没有**默默去跑别的命令。
+顺带记一处将在实现时一并修正的口径：这条兜底消息里的命令清单本身还不含 `daemon`
+（`main.rs` 的 `_` 分支硬编码），实现时若不同步更新，就会出现"命令存在但帮助说它不存在"。
+
+## R1 场景 `engineering.code-intelligence-daemon-lifecycle` ⇒ FAIL（红灯）
+
+    evidence_id = scenario-58363e9149c2   duration_ms = 105
+    failure_signature.failed_step = "expect"
+    failure_signature.assertion   = "verdict"        ← 卡在第一条断言，正是应卡的地方
+    key_log_lines = 上面那条 BLOCKED envelope
+
+契约点是 `MODULE.md`「Provider Daemon & Result Cache」的显式生命周期与跨命令复用；
+断言 `verdict == "PASS"` 在能力缺席时必须落空。**这条红灯同时证明它不是空断言**：
+如果 selftest 将来对不上探针清单，失败签名会移到对应的 `probes_all_ok`/`cross_process_reuse` 等字段。
+
+## R2 场景 `engineering.code-intelligence-daemon-explicit-only` ⇒ FAIL（红灯）
+
+    evidence_id = scenario-5c44b1ef66c9   duration_ms = 208
+    failure_signature.failed_step = "expect"
+    key_log_lines = {"command":"code symbol","verdict":"BLOCKED"?, "error":{"code":"QUERY_INVALID",
+                     "reason":"未知选项：--no-daemon"}, "results":[], "count":0, ...}
+
+这条红得比预期更"正"：`code` 的解析器**拒绝未知选项**（`QUERY_INVALID`），
+所以 `--no-daemon` 还没实现时就报错而不是被忽略 —— 正是本项目对"参数静默失效"的口径。
+它也顺带证明：`--no-daemon` 必须在实现里真实存在，否则这条场景永远红。
+
+## R3 场景 `engineering.code-intelligence-cache-disabled` ⇒ FAIL（红灯）
+
+    evidence_id = scenario-4f17519ac317   failed_step = "expect"
+    assertion   = "cache.disabled"        actual = <missing>
+
+`--no-cache` 这个 flag 与 `cache.*` 字段族都还不存在 ⇒ 断言直接落空在**第一个契约字段**上。
+注意它红的位置：`command`/`verdict`/`authority` 先过了，卡在 `cache.disabled` ——
+说明场景本身可运行、命令可执行，失败原因精确指向"缓存层没实现"。
+
+## R4 场景 `engineering.code-intelligence-daemon-command-surface` ⇒ FAIL（红灯）
+
+    evidence_id = scenario-fcd8f6fb1e53   failed_step = "expect"
+    assertion   = "daemon.running"        actual = <missing>
+    （此前 `command == "daemon"` 与 `verdict == "BLOCKED"` 两条已通过）
+
+这条红得最有信息量：兜底的 `BLOCKED` 恰好满足了"未知命令要被拒"，但**declined 输出里
+没有 `daemon.running` / `authority`** —— 正是 MODULE.md 字段可得性和 round 3 N-A1 立的那条规矩
+（declined 也要带 authority，决定 verdict 的量必须可见）。所以这条不只是"功能没实现"的红，
+它还把实现必须补的字段面钉住了。
+
+另记一次自己的错并说明它为什么值得留在红灯档案里：第一次跑这条场景时我按**文件名**猜场景 id
+（`...-command-surface-blocked`），runner 报 `unknown scenario id`（`scenario-b32431a4ac41`，
+`failed_step="lookup"`）。那不算红灯，只是我没按文件里声明的 `id` 引用。已把 id 统一成
+连字符形式 `engineering.code-intelligence-daemon-command-surface`，与其余 daemon 场景同一命名。
+区分这两种失败很重要：`failed_step=lookup` 是测试没跑起来，`failed_step=expect` 才是被测性质为假。
+
+## 这四条红灯共同说明什么
+
+- 红灯发生在 `failed_step="expect"` 而非 `"parse"`/`"run"`/`"lookup"` ⇒ 场景文件本身可解析、
+  命令可执行，失败原因纯粹是"被测能力不存在"。这是 nexus-test-review 要的红灯形态。
+- 覆盖分工是按"能不能确定化"划的，不是随手分的：
+  ① 能由单条命令确定观察的性质 → 独立场景：`daemon-explicit-only`（不问 daemon 的形状）、
+     `cache-disabled`（关掉缓存的形状）、`daemon-command-surface`（未知命令的形状）、
+     `daemon-lifecycle`（selftest 的整体形状）；
+  ② 需要**控制状态**才可确定的（start 幂等、第二个进程是否真复用、stale 租约回落、
+     digest 变更后不冒充新鲜、缓存键绑定、线协议越权拒绝、stop 后零会话零残留）
+     → 落在 `daemon selftest` 的 13 条探针里，由场景断言 `probe_count=13` 与
+     `probes_all_ok=true` 再整体钉住。理由：这些性质依赖"先有一个 daemon / 先改掉工作树 /
+     先杀进程"，放在普通场景里会变成依赖环境、别人一跑就假绿或假红的测试。
+- 仍然承认的覆盖缺口（评审时请重点看这几处）：结果层缓存的**收益**没有场景证据（§4 已声明
+  它只钉结构、不钉时延）；`--max-workspaces` 的 LRU 驱逐只由 selftest 的一条探针负责；
+  跨宿主差异（Windows 的 temp ACL、Linux 的 socket 语义）只有 `daemon-lifecycle` 一条间接覆盖。
+---
+
+## 第二轮红灯（nexus-test-review 盲评判 CHANGES_REQUESTED、按契约重写测试之后）
+
+盲评案卷：`.evidence/test-review-branch-feature-code-intel-phase-234-2026-10-12/`
+（verdict `CHANGES_REQUESTED`，16 条发现 + 22 条契约主张未钉；模型 `unbound`）。
+按流程只改测试与契约、没碰实现。重写后 5 条场景的红灯（宿主 Windows，二进制仍是无实现的 `a75a919` 线）：
+
+    daemon-lifecycle      FAIL  step=expect  assertion=verdict        scenario-d3224ebec116
+    daemon-explicit-only  FAIL  step=expect  assertion=verdict        scenario-248baccfe138
+    cache-disabled        FAIL  step=expect  assertion=verdict        scenario-6520a8daeb6f
+    daemon-command-surface FAIL step=expect  assertion=daemon.running  scenario-4bad7d58d8da
+    daemon-unknown-flag   FAIL  step=expect  assertion=daemon.running  scenario-c1a0db1dc09a
+
+与前一轮的差别就是盲评要的那件事：现在红在**daemon 特有的性质**上（`verdict` 落在
+`daemon selftest`/`--no-daemon`/`--no-cache` 三条命令面上，`daemon.running` 落在字段可得性上），
+而不是"今天就已经成立"的断言。前一轮实测过 pre-green 比例：command-surface 3/5、
+cache-disabled 4/7、explicit-only 3/8、lifecycle 1/20 —— 那说明红灯几乎没有信息量。
+
+## 我自己第二次踩进同一格，值得原样记下
+
+`daemon-unknown-flag` 第一次跑出来是 `failed_step="lookup"`、`unknown scenario id`
+（`scenario-b349976b96b7`）—— 我第一反应又是"id 写错了"。真因是 `title` 里嵌了裸双引号
+（`不接受"参数被接受但不生效"`）使 TOML 非法，而 `scenario.rs:168-189` 的 `load_all`
+对解析失败的文件是 `if let Some(s) = load_file(..) { out.push(s) }` —— **静默跳过**，
+于是文件存在但从未被加载，症状却是"没有这个场景 id"。
+
+两点后果：
+1. 对作者：一次差点被当成"红灯成立"的**测试没在跑**。`lookup` 与 `expect` 的区分我上一段
+   刚写进档案，紧接着就靠自己踩回来才真正记住。
+2. 对门禁：实测无任何"声明条数 == 加载条数"的校验（`grep scenario_count gates.rs` 为空），
+   所以**一条语法错误的场景文件会从 pack 里无声消失**，场景数少 1 而全绿。
+   这属 harness 自己的 fail-open 形态，与本特性无关，已另登记为后续项。
+---
+
+## 第三轮红灯（盲评 round 2 打回后的第二次修订；4 条阻塞 + 若干 nit）
+
+round-2 案卷 `.evidence/test-review-branch-feature-code-intel-phase-234-2026-10-12-r2/`：
+verdict 仍 `CHANGES_REQUESTED`，但**收窄到 4 条**，并确认 r1 的 16 条里 11 CLOSED / 5 PARTIAL、
+根因（契约没枚举 selftest 字段）已修、两个假绿现在都能被抓。仍然只改测试与契约。
+
+四条阻塞与处置
+1. **命名空间必须每次运行唯一**（不只是"私有"）：否则第二次跑会命中上一次的缓存条目，
+   `default_path_*` 与 `cache_second_run_tier` 的含义随运行次数漂移。契约「作用域与隔离」②已改写。
+2. **缓存命中时返回什么，契约一字未写** —— 这条最狠：命中若跳过 provider，已冻结的 16 条
+   `code_*` 场景（如 `code_intelligence_symbol.toml:31` 钉 `provider.kind`）就会变红，
+   实现方会被冻结测试绑架 —— 正是技能禁止的双向调和。已规定：命中 = **逐字回放**录得的
+   envelope（含 `provider`/`snapshot`/`budget`），`cache.tier` 属**追加**字段而非替换，
+   命中前仍与当前工作树指纹比对、前后 digest 检查不放宽。
+3. **`daemon.running` 在 `--no-daemon` 下两义合法**（"本次经由 daemon" vs "机器上有 daemon"），
+   而 explicit-only 钉 `false` 就成了碰运气。已把语义钉死为前者，另设 `daemon.detected`
+   暴露"有没有可用 daemon"，两问分离。
+4. **`daemon *` 输出的可得性锚点缺失**（`command="daemon"`、`authority`、`snapshot` 在
+   BLOCKED/selftest 路径上没有条款要求）。已补"所有 daemon 输出都带这三项"。
+
+一并收掉的 nit：契约里"真卡住以 `failed_step="run"` 暴露"是**错的**（求值器词表是
+`lookup`/`fixture`/`command`/`parse`/`expect`，没有 `run`）⇒ 改成 `command`；
+提交说明声称已补"未运行时 port/pid/lease_path 不出现"但清单里根本没有对应探针 ⇒
+现在真有 `absent_fields_when_not_running`；`cache_bounded_and_source_free` 的"有界"没有数 ⇒
+契约写死每 workspace 512 条 / 8 MiB；plan 文档残留第三处漂移名 `reuse_probe` 已改。
+字段清单 30 → **32**，`probe_count = 32`，lifecycle 期望 36 → 38。
+新增第 7 条场景 `daemon-status-defaults`：钉 `provider_session_capacity=2` 与 `idle_secs=900`，
+**故意不钉 verdict**（verdict 随环境有没有 daemon 变，那不是被测性质）—— 这是盲评指出
+"契约说了 status 要报默认值，但场景层零触达"的补丁。
+
+自证一致性检查（不靠人读）：契约清单条数、场景钉的探针数、`probe_count` 三者必须相等；
+所有场景里 `daemon.x` / `cache.x` 的名字必须在契约命名空间里声明。实测：
+contract list=32，lifecycle pinned=32，probe_count=32，双向差集为空；
+6 条场景的 ns 引用 12 处全部已声明。
+
+第三轮红灯（6 条，全在 `failed_step="expect"`；新文件也能被加载 ⇒ 上一轮的静默跳过陷阱已避开）：
+
+    daemon-lifecycle       FAIL  expect  verdict            scenario-f50c7a7bde0c
+    daemon-explicit-only   FAIL  expect  verdict            scenario-aabea75ead19
+    cache-disabled         FAIL  expect  verdict            scenario-d94b446a983a
+    daemon-command-surface FAIL  expect  daemon.running     scenario-a3d12d2f8bd0
+    daemon-unknown-flag    FAIL  expect  daemon.running     scenario-a561b7c07a73
+    daemon-status-defaults FAIL  expect  authority          scenario-2e368d679f32
+---
+
+## 第四轮红灯与裁决记录（盲评 round 3 推翻了我上一轮两处修法）
+
+round-3 案卷 `.evidence/test-review-branch-feature-code-intel-phase-234-2026-10-12-r3/`：
+verdict 仍 `CHANGES_REQUESTED`，4 条阻塞，且明确指出 r2 那 4 条只 **2 CLOSED / 2 PARTIAL**。
+三条最关键的不是"写得不够"，而是**与我自己的其他规则或系统里的冻结约束互相矛盾**：
+
+1. **"逐字回放" 与 "缓存不得含源码原文" 没有共同解** —— `results.0.snippet` 就是源码行，
+   而 `hover` / `diagnostics_item_shape` 两条**已冻结**场景钉它非空。
+   裁决：**含源码文本的 verb（hover/diagnostics）不入结果层缓存**，而不是去动冻结期望，
+   也不是放宽"不含源码"。
+2. **"不刷新任何字段" 撞上绑定与计数不变量** —— `working_tree_digest` 既不看提交历史也不看
+   工具链版本，空提交或 rustc 升级都不改它 ⇒ 连 `snapshot.source_revision` 一起回放就是
+   拿过期绑定冒充新鲜。裁决：字段分两类，**语义事实逐字回放、运行元数据一律按本次运行生成**
+   （`snapshot.*` revision/toolchain、`provider.duration_ms`/`session_*`、`daemon.*`、`cache.*`）。
+3. **缓存键不含策略位 ⇒ 回放串味** —— `code symbol` 与 `code symbol --no-daemon` 同键，
+   命中会把上一次的 `daemon.running` 带回来，本轮新场景自己变环境依赖红。裁决：键加策略位。
+4. **`mcp selftest --with-query` 落在缓存作用域内 ⇒ 新假绿通道**：第二次查询可由回放满足，
+   Phase 4 的复用判据（`session_reused`/`session_queries`）被我自己造的缓存糊过去。
+   裁决：**两个 selftest 的复用类探针强制不读不写缓存**（硬性排除，写进契约）。
+5. **我上轮加的"复制成 temp scratch"直接违反冻结的作用域不变量** —— `--workspace` 归一化后
+   必须在仓库内（越界 ⇒ `WORKSPACE_UNRESOLVED`），仓库外副本让 `verdict="PASS"` 永不可达；
+   仓库内可写副本又与 `dirty_after_lifecycle=0` 与并行调度冲突（会把别的 `code_*` 打成 STALE）。
+   裁决：撤掉复制规则，selftest 对仓库内夹具**只读不写**；`digest_invalidation_reason` 从清单
+   移除，改由点名单测承载（观测指纹变更必然要求真改工作树，与"不写仓库"互斥）。
+
+同时按它"契约被写胖了吗"的质疑撤下 9 项（32 → **23**）：4 项关于自身输出形状的布尔
+（字段缺席、原因非空、等式成立、有界且不含源码）改为**点名单测**——求值器根本没有"缺席"算子，
+房内先例（`workspace_escape.toml:44-47` 点名 `workspace_escape_is_rejected_before_provider_spawn`）
+就是这么分的；线协议/单端口拓扑两项撤回实现细节定位（契约自己说线协议是实现细节，就不该同时
+钉进对外清单）；`reuse_queries_total=2` 钉的是 selftest 脚本步长，撤；`max_workspaces=2` 属宿主
+调优不作兼容承诺；`cache.tier` 词表去掉 `memory`（会话内重复由 `provider.session_reused` 表达，
+两个观测点不得互相冒充）。另撤掉 `daemon-status-defaults` 场景本身：契约没写"检测到 daemon 时
+报默认值还是生效值"、也没定义不带 `--workspace` 探测哪个命名空间 ⇒ 期望值来源不在契约内。
+`probe_count` 不再由散文担保：改由单测 `daemon_selftest_field_list_matches_contract` 解析本文件
+清单块与实际键集合逐名对齐（多一名少一名都红），三处手写数字的耦合解开。
+
+第四轮红灯（5 条全在 `failed_step="expect"`，无 lookup 伪红；场景总数 26）：
+
+    daemon-lifecycle       FAIL  expect  verdict         scenario-5b1cbcc4995f
+    daemon-explicit-only   FAIL  expect  verdict         scenario-319a4a2a1378
+    cache-disabled         FAIL  expect  verdict         scenario-0ff1c48511d7
+    daemon-command-surface FAIL  expect  daemon.running  scenario-e77d54b513bb
+    daemon-unknown-flag    FAIL  expect  daemon.running  scenario-2ca7e790ba46
+
+自证一致性：契约清单 23 == 场景钉 23（双向差集为空）、`probe_count = 23`、
+`FILE_MANIFEST` 声明 193 == 表内 193 行、`code_intelligence_*` 落盘 26 个。
+
+需要留给下一轮看的一句话：本轮的 5 处修改里有 3 处是**减法**（撤场景、撤清单项、撤 scratch 规则）。
+如果盲评继续以"契约还能钉更多"为标准，就会推向过度规定；因此 r4 的判据应是
+"每条对外承诺是否 (a) 有可证伪承载体、(b) 不与既有冻结约束矛盾"，而不是断言条数。
+
+## 第五轮：盲评止于 r4（所有者裁决）+ 契约句子级修补后的红灯复测
+
+盲评 round 4 判 CHANGES_REQUESTED，但**范围已经很窄**：r3 的 5 处矛盾全部 RESOLVED，
+无假绿通道，只剩 3 处契约句子级问题。案卷
+`.evidence/test-review-branch-feature-code-intel-phase-234-2026-10-12-r4/`。
+**所有者 2026-10-12 裁决：按 AGENTS.md 的 3 轮上限止评，不再派 round 5，直接进入实现。**
+因此本轮修改**没有第 5 轮独立复核背书** —— 这句要原样留在案卷里，别让"改了"读成"被确认了"。
+
+r4 的 3 处阻塞 + 6 条前置条件逐项落点（全部是散文/清单级，实现零改动）：
+1. `:393-395`/`:398-400` 现在时宣称"由 selftest 探针 `absent_fields_when_not_running`/
+   `unavailable_reason_present` 机器钉住"，而两名已不在 23 枚清单 ⇒ 发探针机器红、不发散文为假。
+   改法＝按它的建议把承载体改指**契约内新增的「点名单测」清单**（本节上方场景注释里已点名，
+   现在正文也有名字了）。
+2. `:614-616` Verification 仍声称 lifecycle 覆盖"digest 变更 / 缓存有界且不含源码 / 线协议白名单"
+   三项 ⇒ 改写为"三项不在场景里，由点名单测承载"，并把四项逐名列出。
+3. `:409-410` 回放清单用了 DTO 词表之外的同义词（name/container/location/uri），且没覆盖
+   冻结场景在**可缓存 verb** 上钉值的 `results.0.range`、`results.0/1.qualified_name`、
+   `provider.ready` ⇒ 改用本文件词表逐名重写，并明确 `provider.kind/binary/version/ready`
+   **随条目回放**（命中路径不许要求重新解析 language server）。
+
+顺带按 r4 备注 1 撤掉我自己在 ③ 造的一条假前提：它指出 `snippet` 不只出现在 hover/diagnostics
+（`rust_analyzer.rs` 各 verb 都走 `snippet_of`），所以"排除这两个 verb 就能保证缓存不含源码"
+站不住。**裁决：撤销"缓存不得含源码原文"这条自设禁令**，安全来源改为摘要键 + 查询前后 digest
+检查 + 只落在按用户隔离的 temp 命名空间（与 token 一节同一口径）。连带改动三处：
+可缓存性条件补 `verdict=="PASS" && provider.ready==true` 门（否则 BLOCKED/`ready=false` 被回放，
+冻结的 `verdict` pin 会变红）、`snippet` 命中时按条目逐字回放（既不置空也不按 range 重切）、
+单测改名 `cache_payload_has_no_source_text` ⇒ `cache_stores_only_result_fields`。
+Side Effects ③ 的"不含源码原文"同步为"载荷只含查询结果字段"。
+
+前置条件销项：① `daemon.running` 从散文升为规范条目（两条场景钉它）；② `wire_refuses_non_whitelist`
+进点名单测清单（不再只活在提交说明里）；③ `failed_step` 词表补 `harness`（`scenario.rs:667` 真实值，
+我上一轮漏了）；④ 场景注释删旧 scratch 口径、`plan` §8 作废 `reuse_queries_total`；⑤ 命中时 snippet
+取值择一写明（逐字回放）；⑥ selftest 总时长入 600s 预算与跨宿主差异**必须等实现落地才能实测**，
+现登记为待办，不在这里宣称。
+
+勘误（§R1 原文保留，不改写历史）：那一段末句说"失败签名会移到 `probes_all_ok`/`cross_process_reuse`
+等字段" —— 这两个名字属于当时的 32 项草稿，现已不存在。以第五轮的实际签名为准。
+
+第五轮红灯（Windows `SH-YF-CX-PC`，rustc 1.95.0，实现零改动；5 条全在 `failed_step="expect"`，
+无 lookup 伪红；"pre-green"是该条 envelope 里**已经成立**的期望数，用来证明红在应红的地方）：
+
+    daemon-lifecycle        FAIL  expect  verdict        scenario-07c0f17ee68d  4687ms  2/29
+    daemon-explicit-only    FAIL  expect  verdict        scenario-85fd758d0928  1278ms  5/10
+    cache-disabled          FAIL  expect  verdict        scenario-810f321e3908   307ms  5/9
+    daemon-command-surface  FAIL  expect  daemon.running scenario-ec08e3ef5c2d   115ms  4/6
+    daemon-unknown-flag     FAIL  expect  daemon.running scenario-fb6fd7182a0f   105ms  4/6
+
+lifecycle 的首条失败仍是 `verdict`，actual 是兜底 envelope
+`{"command":"daemon","message":"supported commands: status, context, check, test, verify,
+explain, bench, replay, scenario, code","verdict":"BLOCKED"}` —— 这条顺带暴露一个**新问题**：
+兜底命令清单里没有 `mcp`（Phase 3 加的），而契约要求它含 `daemon`。实现时一起补，
+`commands_surface_lists_daemon` 那枚探针正好覆盖它；`mcp` 缺席属同一类漂移，登记为待办。
+
+自证一致性（本轮复算）：契约清单 **23** 枚 == `probe_count = 23` == lifecycle 场景同名期望；
+点名单测 **9** 枚（新增 `wire_refuses_non_whitelist`）；`code_intelligence_*` 落盘 26 个；
+`FILE_MANIFEST` 声明 193 == 表内 193 行（`cache.rs`/`daemon.rs` 待实现提交时登记）。
+Windows 契约号 **`de50c86566e702bddeaa041d72f97767b2696988`**（`status --json` 实读，工作树含本轮
+契约改动 ⇒ `dirty=true`）；Linux 侧同一内容会算出不同值（CRLF），照旧只与同宿主历史对账。

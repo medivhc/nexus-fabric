@@ -2,7 +2,7 @@
 
 本包实现《Nexus 统一系统设计规范 v9》中的“统一仓库目录契约”。
 
-文件数（不含本清单）：177
+文件数（不含本清单）：195
 
 > 2026-10-10：原声明值 137 与表内实际行数（148）已不一致（既有漂移，含
 > `scenarios/engineering/bench_gate_verdicts.toml` 等未登记项）。本次登记
@@ -31,6 +31,21 @@
 > 本轮先跑出新场景的 Red（`scenario-edf5bdf1d4b8`，夹具文件尚不存在 ⇒ `verdict` 期望落空），
 > 再加夹具转 Green——契约先行，不是先看输出再补期望。
 >
+> 2026-10-11（Phase 2-4 开工）：登记 `.agents/code-intelligence-phase-2-4-plan.md`，声明值 177 -> 178。
+>
+> 2026-10-13（daemon/缓存实现落地）：新增 `code_intel/daemon.rs` 与 `code_intel/cache.rs` 两行，声明值 193 -> 195。
+> 实现期契约补记（所有者按 3 轮上限止评，无第 5 轮盲评背书）：`session_source` 词表补第三个值 `"cache"`、
+> 声明内部子命令 `daemon serve`、`daemon_explicit_only` 同时带 `--no-cache`（原写法把受缓存残留影响的
+> `session_source` 当成确定期望值），兜底命令清单补 `mcp`/`daemon`。
+> 2026-10-12（盲评 round 3 裁决矛盾而非加句子）：selftest 清单 32 -> 23（9 项改由点名单测承载）、撤下 status 默认值场景，场景总数 27 -> 26，声明值 194 -> 193。
+> 2026-10-12（测试盲评 round 2 打回后二次修订）：selftest 字段清单 30 -> 32、补缓存命中回放契约与 status 默认值场景，场景总数 26 -> 27，声明值 193 -> 194。
+> 2026-10-12（测试用例盲评打回后重写）：4 条 daemon 场景改为逐条钉契约字段值并新增 1 条未知参数场景，场景总数 25 -> 26，声明值 192 -> 193。
+> 2026-10-12（daemon 与结果缓存开工，契约先行）：登记设计计划、4 条新 E4 场景与 Red Evidence，声明值 186 -> 192；Code Intelligence 场景总数由 21 增至 25。
+> 2026-10-11（独立 Review round 2 整改）：登记 `.agents/red-evidence-mcp-round2.txt`，声明值 185 -> 186。
+> 2026-10-11（Phase 2/3/4 契约与实现）：新增夹具 `MODULE.md`、`code_intel/mcp.rs` 与
+> 5 个场景（context 语义锚点 3 条、MCP 2 条），声明值 178 -> 185；
+> Code Intelligence 场景总数由 16 增至 21（Phase 2 三条、Phase 3 两条）。
+>
 > 既有缺口（非本次引入，保留待仓库所有者裁决）：`.evidence/.gitignore`、
 > `.evidence/README.md` 两行来自基线（`7d2e643`），但这两个文件已在
 > `5694faa`（"untrack generated .evidence artifacts"）中被取消跟踪，磁盘上也不
@@ -39,9 +54,18 @@
 
 | Path | Purpose |
 |---|---|
+| `.agents/code-intelligence-phase-2-4-plan.md` | 提案 §15 Phase 2/3/4 的工作计划与判据（含多语言/冷启动的实测证据与逐项做/不做的判断台账） |
 | `.agents/code-intelligence-followups.md` | 独立 Review round 3（`COMMENTED`）的 12 条后续待办，逐条带 `文件:行` 与验收动作；作为"机器可见的待办承载体" |
 | `.agents/green-evidence-code-intelligence.txt` | Green Evidence record（Code Intelligence E4 场景全 PASS，正文记录其绑定的 source_revision） |
 | `.agents/red-evidence-code-intelligence.txt` | Red Evidence record（Code Intelligence 契约阶段 9/9 FAIL） |
+| `.agents/red-evidence-mcp-round2.txt` | Red Evidence record（MCP stdout 通道泄漏、PASS 分支不可探针、`--provider-binary` 静默丢弃的修前实测） |
+| `.agents/provider-daemon-and-result-cache-plan.md` | Provider daemon 与结果缓存的设计与实施计划（授权范围、生命周期护栏、两层缓存定义、验收判据） |
+| `.agents/red-evidence-daemon.txt` | Red Evidence record（daemon 命令面与缓存字段实现前的四条红灯，含 evidence_id） |
+| `scenarios/engineering/code_intelligence_daemon_lifecycle.toml` | E4：daemon 显式生命周期与跨命令复用（逐条钉 selftest 的 23 枚字段值 + probe_count=23） |
+| `scenarios/engineering/code_intelligence_daemon_explicit_only.toml` | E4：`--no-daemon --no-cache` 下 session_source=in-process 且 cache.disabled=true，证明 CLI 不自动拉起 daemon |
+| `scenarios/engineering/code_intelligence_cache_disabled.toml` | E4：`--no-cache` 下 cache.disabled=true 且 tier=miss，键绑定仍可见 |
+| `scenarios/engineering/code_intelligence_daemon_command_surface.toml` | E4：daemon 未知子命令 BLOCKED，且 declined 输出仍带 authority 与 daemon.running |
+| `scenarios/engineering/code_intelligence_daemon_unknown_flag.toml` | E4：daemon 未知启动参数 BLOCKED（参数不接受即失败，不静默忽略） |
 | `.agents/skills/README.md` | Project-level agent skill index |
 | `.agents/skills/nexus-contract-first/SKILL.md` | Project-level agent skill |
 | `.agents/skills/nexus-evidence/SKILL.md` | Project-level agent skill |
@@ -165,17 +189,21 @@
 | `engineering/nexus-harness/fixtures/code-intel/src/lib.rs` | Rust source (fixture: re-export/cfg/probe) |
 | `engineering/nexus-harness/fixtures/code-intel/src/transport.rs` | Rust source (fixture: trait + multi-impl + generic dispatch) |
 | `engineering/nexus-harness/fixtures/code-intel/src/diagnostic_probe.rs` | Rust source (fixture: 刻意一处类型错误，供诊断条目形状 E4 断言) |
+| `engineering/nexus-harness/fixtures/code-intel/MODULE.md` | 夹具自身的模块契约（context 的语义候选只从这里取，反引号标识符即候选） |
 | `engineering/nexus-harness/src/main.rs` | Minimal compile/bootstrap source |
 | `engineering/nexus-harness/src/env.rs` | Rust source (harness CLI) |
 | `engineering/nexus-harness/src/config.rs` | Rust source (harness CLI) |
 | `engineering/nexus-harness/src/gates.rs` | Rust source (harness CLI) |
 | `engineering/nexus-harness/src/scenario.rs` | Rust source (harness CLI) |
 | `engineering/nexus-harness/src/evidence.rs` | Rust source (harness CLI) |
+| `engineering/nexus-harness/src/code_intel/mcp.rs` | Rust source (MCP stdio 薄适配：tools/list + tools/call 映射到 8 个只读 verb，含 selftest) |
 | `engineering/nexus-harness/src/code_intel/mod.rs` | Rust source (Code Intelligence CLI 层：参数/预算/snapshot/envelope) |
 | `engineering/nexus-harness/src/code_intel/dto.rs` | Rust source (Code Intelligence 语言中立 DTO 与错误码) |
 | `engineering/nexus-harness/src/code_intel/lsp.rs` | Rust source (JSON-RPC/LSP framing、只读白名单、有界会话) |
 | `engineering/nexus-harness/src/code_intel/provider.rs` | Rust source (CodeIntelligenceProvider 契约与 binary 解析) |
 | `engineering/nexus-harness/src/code_intel/rust_analyzer.rs` | Rust source (rust-analyzer provider：生命周期/就绪收敛/语义映射) |
+| `engineering/nexus-harness/src/code_intel/daemon.rs` | Rust source (provider daemon：租约/回环线协议/会话池/LRU/idle 自退出，含 `daemon selftest` 23 枚探针) |
+| `engineering/nexus-harness/src/code_intel/cache.rs` | Rust source (digest 键控结果缓存：六元组键、载荷只含结果字段、条数与字节上限) |
 | `engineering/nexus-harness/src/commands.rs` | Rust source (harness CLI) |
 | `engineering/plugins/README.md` | Repository contract/documentation |
 | `engineering/plugins/plugin-contract.md` | Repository contract/documentation |
@@ -194,7 +222,12 @@
 | `scenarios/engineering/code_intelligence_callers.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/code_intelligence_definition.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/code_intelligence_diagnostics_advisory.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_context_anchors.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_context_no_fake_semantics.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_context_scope_guard.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/code_intelligence_diagnostics_item_shape.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_mcp_handshake.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/engineering/code_intelligence_mcp_real_query.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/code_intelligence_hover.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/code_intelligence_implementations.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/engineering/code_intelligence_provider_unavailable.toml` | Machine-readable contract/policy/scenario |
