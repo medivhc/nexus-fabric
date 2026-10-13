@@ -1095,3 +1095,118 @@ B-2 / N-r2-1 的活 daemon 观测（默认命名空间，非 selftest 的私有�
 处置：脚本自带递归 `rmrf` 后重跑，得到上面数字。教训两条：① 远端工具链版本必须**实测**，
 不能从"我们两台机都是开发机"推；② 观测缺失要在台账里写成"第一版没跑起来"，
 而不是事后只放一个数字 —— 否则读者会以为它一次就过了。
+
+================================================================================
+§X 独立评审 round 3（末轮）的整改与双宿主复跑（2026-10-13）
+   对象 rev：`76cb129`（bugfix：B-3 + 租约归属 + 3 枚新承载体）
+   案卷：`.evidence/review-qoder-independent-daemon-r3/`（CHANGES_REQUESTED，
+   1 阻塞 B-3 / 11 非阻塞 / 10 条明写未复现；model=unbound；审查宿主 SH-YF-CX-PC，
+   rustc/cargo 1.95.0）。**§19.1 的 3 轮在这一对象上用尽 ⇒ 本笔整改没有第 4 轮独立复核，
+   完成判定归所有者。**
+================================================================================
+
+被测物（两宿主各一份，跑前跑后各核一次 md5）：
+
+    Windows  D:/next/ci-p24/target/debug/nexus-harness.exe
+             md5 3303a35e36cac030e390056f46d3e6d8  mtime 2026-10-13 08:30  size 6570496
+    Linux    /work/xc-x-bin/nexus-harness（冻结副本 + PATH 钉死）
+             md5 536eae9e99f7144fc8634113c74b2234  mtime 08:46:09+08:00  size 86053616
+
+Windows 冒烟（rustc 1.95.0；工作树内容即本提交，测量在提交前一刻的同一份源码上）：
+
+    fmt 0 字节；clippy --all-targets -D warnings exit 0 / 0 字节
+    串行 155 = **152 passed + 3 failed** 75.93s；并行 155 = 152 + 3 30.15s
+    ⇒ 本轮**并行没有多红**：`145 + 5` 那一档是负载相关的间歇现象，不是固定差值
+      （MODULE.md 里写死的那句已改掉）。3 条固定失败仍是 master 自带 POSIX echo。
+    12 枚 code_intel::daemon 单测逐名 ok（含新增 3 枚）。
+    `daemon selftest`（干净树，rev 76cb129）：PASS 23/23 红 0，duration_ms=134587，
+      sessions_after_stop=0，dirty_after_lifecycle=0，cache_second_run_tier=disk。
+    26 条场景 **26/26 PASS**（Windows 上 `diagnostics-advisory` 本轮 18515ms 新鲜 PASS，
+      §V 那条负载假红未复现；批次里 `daemon-lifecycle` 121675ms）。
+      逐条 id：budget-count 1930becd948e / budget-truncation 08d03453a14e / cache-disabled
+      450e2db98486 / callees 213847867079 / callers 837293f7c02d / context-anchors
+      5cf32f0a292d / context-no-fake-semantics 0ce7b9b7cdb5 / context-scope-guard
+      c61ebe1fa4ae / daemon-command-surface c3cdcc249a05 / daemon-explicit-only
+      6e4fc4ca9b2d / daemon-lifecycle 65515e220eac / daemon-unknown-flag 7bf234319a0e /
+      definition a71b87e239f7 / diagnostics-advisory 07d765ab0901 / diagnostics-item-shape
+      b79199890f93 / hover 3b2ce95cea16 / implementations 26e9110fddb1 / mcp-handshake
+      8f452fcc9b35 / mcp-real-query 9da41414824c / provider-unavailable 6df3984ef795 /
+      read-only-counters 59d5355cf157 / scope-escape 269069b4f93f / scope-violation
+      1b9a767dcb5a / symbol 2369d6b6388c / workspace-escape 4838dcda2701 /
+      write-method-denied 204fd31c9866。
+
+Linux 结论级（rustc/clippy/RA 1.98.1，rev 76cb129，工作树 clean）：
+
+    串行 **156 passed / 0 failed** 50.35s；并行 156 / 0 30.04s；fmt 0 字节；clippy exit 0/0 字节
+    12 枚 daemon 单测 ok；`daemon selftest` 两轮 23/23 红 0（104959ms / 103558ms）
+    26 条场景 **26/26 PASS**
+    `verify --fast` **PASS，9/9 门，无 UNKNOWN** ⇒ Evidence **5f1621fa5f1f**，
+      contract f8c85522d7ad3b46b65fb5630e22f763339d29bc / tree 4f729a57ef2538a4417a968cdcbc897951ba9920 /
+      rev 76cb129… / dirty false / x86_64-unknown-linux-gnu / 1.98.1
+    善后：daemon_serve_left=0，临时命名空间 0 个，/work 剩 23G。
+
+**对既有口径的精确化**（更正的是说法，不是数字）：同一 rev 的**干净树**上两宿主的
+`working_tree_digest` **相同**（都是 `4f729a57ef25…`），而 `contract_hash` 仍不同
+（Windows `ef1a950b…` / Linux `f8c85522…`）。⇒ 跨宿主无条件不同的是 **contract_hash**
+（按工作树字节算，Windows 是 CRLF）；`working_tree_digest` 只在**脏树**上分叉。
+§V/§W 那句"两套值别互相对账"仍然成立，但成立理由只对 contract_hash 是无条件的。
+
+B-3 的四个形状（评审实测；本轮**只改契约文本**，实现/单测/场景期望都没动）：
+
+    ready 之后 stop 无应答（EOF）  ⇒ sessions_after_stop = -1 + UNKNOWN              （①）
+    连上但永不回帧                 ⇒ 字段缺席 + UNKNOWN，未删租约                     （②）
+    连上但答 refused / 不合格帧     ⇒ 字段缺席 + UNKNOWN，未删租约                     （②）
+    端口被拒                       ⇒ 字段缺席 + UNKNOWN + stale_lease=true + 删租约    （②）
+    新承载体 `stop_after_a_ready_frame_reports_minus_one` —— ①原先在仓内**没有任何**承载体。
+    夹具约束记下来以免后人重踩：必须**先正确应答 hello**，再在 stop 请求上关连接；
+    用"永不答话"会落到 ②，而 stop 档读预算是 900s ⇒ 那种形状做单测会挂 15 分钟而不是变红。
+
+N-r3-5 / N-r3-6 的归属守卫：**两宿主各跑了一次"两个真 daemon 交接"的活体实验**
+（造法：A 正在服务一条 15-25s 的真查询 ⇒ 单线程 accept 被占住 ⇒ 探活 10s 超时 ⇒
+ 看起来"连得上但不答话" ⇒ 这时 `--takeover` 才够格换代）：
+
+    Windows：A 50774/3e12a463 → B takeover 50817/d10e1767（11.7s PASS）→ B 查询写 1 个缓存文件
+             → 等 40s（A 的 idle=25s 到点自退出）→ lease 仍在且 token 仍是 B ✅，
+             B status PASS running=true sessions=1，**缓存文件仍在**（1 个）✅
+             → stop B：PASS after=0，由持有者清掉租约与缓存 ✅
+    Linux：  A 36827/3548eb14 → B 39427/c597e042（10.3s PASS）→ 同样 token 保持 B、
+             cache 文件数 1 不变 → stop B 后 lease_gone=true cache_gone=true ✅
+    对照（整改前，评审案卷 tk2-status.json）：旧实例 idle 退出后 `lease.json` 消失、
+    `ns/cache` 消失，而留守 daemon 仍在监听 ⇒ `daemon status` 报"没有 daemon 在跑"。
+    **这一条有前后对照，不是只改了代码就算修好。**
+
+N-r3-8：探活预算测试移到工作线程 + 60s 有界等待 ⇒ "干脆不设读超时"这种回归现在会**红**而不是
+把 `cargo test` 挂住。61s 代理反证仍有效（案卷判它可接受：60s 上界严格夹在 10s 与 900s 之间）。
+
+11 条非阻塞的逐条处置（能修的修，修不了的不写成已修）：
+
+    N-r3-1  **只声明不改动**：契约新增 `daemon.provider_sessions` 的 0 有两种出处（观测 / 本次没问到），
+            并禁止把后者读成"池子为空"。改成"无出处即缺席"要动 DTO 形状（15 处构造点），
+            按本模块规矩另开 Contract-First 周期。**这条没被修好，只是不再被隐瞒。**
+    N-r3-2  已修：负数原样透传，`daemon_unavailable` 分成"有非负值 / 帧内是负数 / 帧内没有这个量"
+            三种说法，同一 envelope 不再自相矛盾。
+    N-r3-3  已修（新承载体，见上）。
+    N-r3-4  已修：`may_replace_unanswered_lease` + 四格真值表单测；牙齿在于调用点若绕开这个私有函数，
+            它就成了未使用项 ⇒ `clippy -D warnings` 的 dead_code 直接红。
+            诚实边界：钉住的是**判定**，不是"真的换掉了活 daemon 的租约"那条端到端路径；
+            后者由活体实验覆盖（实测记录，不是门禁）。
+    N-r3-5  已修 + 两宿主活体反证。
+    N-r3-6  已修：心跳走同一归属判定，被换代后不再写回。
+    N-r3-7  **未修，也不写成已修**：`daemon serve` 的 `provider_sessions` 现在取自带出的观测
+            （不再是对空池二次 drain 的恒 0），但"它可以是真的非 0"仍**无承载体** —— 要证它得造一个
+            "有序关闭后仍活着"的子进程，两宿主都造不出（评审同样造不出，其 unverified 第 4 条）。
+            把 `unwrap_or_else` 改回无条件 drain 会不会全绿，只能静态推定。
+    N-r3-8  已修（见上）。
+    N-r3-9  未改，登记待办：daemon 握手超时/沉默复用 `PROVIDER_CRASHED` 码，读起来像 provider 崩了。
+            改它要动错误码词表（契约面），与 N-r3-1 同类，另开周期；本轮只在文案里保留真实出处
+            （"握手失败…header read failed"）。
+    N-r3-10 ① `core.hooksPath` 未设 ⇒ 分类法在本地没有机器承载体（装 hooks 属所有者决定，我没装）。
+            ② **§V 的更正本身写错了**：合法 type 是 `bugfix` 而不是我写的 `bug`
+            （`.githooks/hook-common.sh:25`：`feature|bugfix|refactor|test|docs|performance|dependency|
+            requirement-change`）。故 `f1575b5`/`4b61987` 的正确 type 应是 `bugfix`；
+            本笔 `76cb129` 起用 `bugfix` 并在提交前过 commit-msg。
+    N-r3-11 已修：MODULE.md 给 §W 加了 provenance 段（被审方一手实跑，独立案卷标为未复现）。
+
+仍未验证（不当作已通过）：第三方 MCP 客户端互操作；本区间 `verify --full` 无结论（/work 23G，
+需 ≥45G）；真非 0 的回收观测在两宿主都未出现过；`--takeover` 的端到端路径只有活体实验而无门禁；
+**§X 之后没有第 4 轮独立复核可用** —— 本笔整改的完成判定归所有者。
