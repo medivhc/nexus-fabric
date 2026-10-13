@@ -386,9 +386,25 @@ nexus-harness code <verb> ──(daemon 在跑且握手成功)──▶ daemon(1
   `stop` 对不存在的 daemon 报 `UNKNOWN` + 原因（不假装停成功）；所有退出路径回收 provider，
   `selftest` 断言 `sessions_after_stop=0` —— **该值是观测而不是常量**：daemon 回收每个会话后
   用子进程的 `try_wait` 问操作系统"退了没有"（独立 Review round 1 的 B-1：写死 0 时，关闭逻辑
-  退化不会让任何探针变红）。取值分两支，**两支都不许出现 0 的兜底**：① 连上了但没拿到应答
-  （或应答里没有这个量）⇒ `sessions_after_stop = -1` + `UNKNOWN`；② 根本没连上 ⇒ **不发这个字段**
-  + `UNKNOWN`（这里发 0 与发 -1 都不是证据，缺席才是事实）。空闲到点自行退出并删租约。
+  退化不会让任何探针变红）。取值分两支，**两支都不许出现 0 的兜底**。分界不是"TCP 连没连上"，
+  而是**握手有没有拿到 `ready` 帧**（round 3 的 B-3：上一版写"连上了但没拿到应答"，而实现里
+  "连上但永不回帧""连上但回 `refused`/不合格帧"这两支发的是**缺席**，同一段话自相矛盾）：
+  ① **握手成功后**这次 `stop` 没得到应答，或 `stopped` 帧里没有这个量 ⇒ `sessions_after_stop = -1`
+  + `UNKNOWN`（承载体：单测 `stop_after_a_ready_frame_reports_minus_one`）；
+  ② **握手没成功**——含 TCP 被拒、连上但不答话、连上但答不合格帧、版本不符 ⇒ **不发这个字段**
+  + `UNKNOWN`（这里发 0 与发 -1 都不是证据，缺席才是事实；承载体：`stop_does_not_claim_zero_without_an_answer`
+  钉被拒那一形，`silent_daemon_probe_returns_within_the_probe_budget` 钉"不答话"那一形）。
+  两支都**不删租约**，除非被拒（那是唯一可证明的残留，见「租约归属」一条）。
+  `stopped` 帧若报的是负数，原样透传（不折算成 0，也不当作"没答"），且 `daemon_unavailable`
+  必须如实说这个负数来自帧内 —— 不许把它写成"帧里没有"。空闲到点自行退出并删租约。
+- **租约归属（`--takeover` 的后半段义务）**：一份租约被 `--takeover` 换代之後，旧实例对它
+  **没有任何处置权**：心跳不得把 `lease.json` 写回自己名下（否则换代不持久，接手方随时被踩掉），
+  退出清理（删租约 + purge 该命名空间的共享结果缓存）也必须整体跳过。理由是实测过的危害：被放弃的
+  旧实例 idle 到点自退出时删掉了留守 daemon 正在用的租约与缓存，`daemon status` 于是报"没有 daemon
+  在跑"而那个 daemon 其实仍在监听——**共享缓存是跨命令资产，被第三方清掉是真损失**。
+  归属判定按 token（不按 pid：pid 会被复用，而且我们没有权利处置别人的文件）。
+  承载体：单测 `superseded_lease_is_not_ours_to_touch`；效果判据（被拒 或 `--takeover` 才允许换）
+  由 `only_refusal_or_takeover_may_replace_an_unanswered_lease` 钉真值表。
 - `code` / `context` 支持 **`--no-daemon`** 与 **`--no-cache`**：前者完全不问 daemon
   （`daemon.running=false` 且 `session_source` 只会是 `"in-process"` 或 `"cache"`，绝不会是
     `"daemon"` —— 给 CI 一个不受"环境里是否有人手起过 daemon"影响的确定口径），
@@ -430,6 +446,12 @@ nexus-harness code <verb> ──(daemon 在跑且握手成功)──▶ daemon(1
   - `running=false` 时 `port`/`pid`/`lease_path` **不出现**（不是 `null`/`0` 占位）。求值器没有
     "字段缺席"算子，selftest 清单里也没有这一枚（清单与实际键集合的逐名对齐会把它挡在清单外），所以它的
     机器承载体是下方「点名单测」里的 `daemon_decline_omits_absent_fields`。
+  - **`daemon.provider_sessions` 的 `0` 有两种出处，读法不同**（round 3 的 N-r3-1 抓到的口径缺口，
+    这里如实声明而不是假装它和上面那条同规矩）：① 有 pong 的会话计数或 `stopped` 帧 ⇒ 这是**观测**；
+    ② 没有任何出处（没连上、没答话、declined 路径）⇒ 恒发 `0`，含义是**"本次没问到"**，
+    不是"池子为空"。把它改成"无出处即缺席"要动 DTO 形状（15 处构造点 + 词表），属独立
+    Contract-First 周期，不在本区间顺手改；在此之前，任何读者/场景都**不得**用 `provider_sessions=0`
+    推断"daemon 里没有会话"。
   - **所有 `daemon *` 输出**（含 `BLOCKED`、`selftest` 与**被拒的**输出）都带 `command="daemon"`、
     `authority`、`snapshot` 与 `daemon.running`：declined 也要说清绑在哪棵树上、这一次问没问 daemon，
     与 `code`/`context`/`serve` 同一规矩。`daemon.running` 在此从散文升为规范条目 ——
@@ -724,16 +746,23 @@ round 2 的教训就是"待办只写在提交说明里，下一轮没有承载�
 
 - 真实执行：workspace-tests / product-scenarios / regression / architecture-policy / dependency-governance（cargo-deny 0.20：`cargo deny --config policies/deny.toml check advisories licenses bans sources`，缺失则 UNKNOWN）/ coverage-summary（cargo-llvm-cov）/ platform-checks（portable-core 平台依赖静态扫描）/ feature-matrix（每成员 `--no-default-features` + `--all-features`）/ portable-core（`cargo check --target wasm32-wasip1`）。
 - 条件执行（无内容/无工具时 UNKNOWN）：integration（成员 tests/*.rs 存在时逐个运行）/ selected-fuzz（cargo-fuzz + fuzz targets）/ selected-concurrency（tests/concurrency 有测试时运行）/ performance-budgets（quality.toml `[performance]` 定义 baseline+blocking 后判定）。
-- 单元测试：`cargo test -p nexus-harness`（Windows/1.95.0 上 daemon/缓存实现落地后**实测 152 个 =
-  149 passed + 3 failed（共 152 个）**，串行 `--test-threads=1`；并行跑同一集会多红 2 条（`145 + 5` 那一档），那 2 条是
-  master 自带的管道测试在负载宿主上不稳定（见 `.agents/green-evidence-code-intelligence.txt` §S），
-  不是本区间引入的，也没有被削弱。较上一档 150 的增量 = round 2 整改新增的 2 条
+- 单元测试：`cargo test -p nexus-harness`（Windows/1.95.0 上 daemon/缓存实现落地后**实测 155 个 =
+  152 passed + 3 failed（共 155 个）**，串行 `--test-threads=1` 与并行本轮**同为 152+3**（75.9s / 30.2s）。
+  那 3 条固定失败是 master 自带、依赖 POSIX `echo` 的 `scenario::tests::run_single_*` / `run_parallel_*`
+  （机制见 DEVELOPMENT.md §11.1，本区间既没引入也没削弱）。**原先"并行比串行多红 2 条"是写死的**：
+  它在总数 150 时实测过（`145 + 5`，§S/§T），本轮并行却是 `152 + 3` ⇒ 那是**负载相关的间歇现象**，
+  不是固定差值，别再当常量引用。较上一档 152 的增量 = round 3 整改新增的 3 条
+  （`stop_after_a_ready_frame_reports_minus_one`、
+  `only_refusal_or_takeover_may_replace_an_unanswered_lease`、
+  `superseded_lease_is_not_ours_to_touch`）；再往前 150→152 是 round 2 新增的 2 条
   （`silent_daemon_probe_returns_within_the_probe_budget`、
   `takeover_flag_is_valueless_and_refused_on_serve_entry`）；更早的 13 条 = `cache.rs` 6 + `daemon.rs` 7
   （B-1 整改补了 `stop_does_not_claim_zero_without_an_answer`）。
   **新增的探活预算那条有反证**：把 `PROBE_READ_TIMEOUT` 临时从 10s 改成 61s（等价于"两档预算又被并回
   一档"，用 900s 实测太贵）后该测试红，报 `探活等了 61.0s：握手档被换回查询预算（900s）了`，
-  随后已还原 ⇒ 它不是一条只会绿的断言。
+  随后已还原 ⇒ 它不是一条只会绿的断言。round 3 的 N-r3-8 又指出它对"干脆不设读超时"这种形式是
+  **挂住而不是变红**（libtest 没有 per-test 超时），所以探针改到工作线程 + 60s 有界等待上：
+  无预算时这条直接红，不再拖死整个 `cargo test`。
   Linux 只多 1 条 —— 差额是 `#[cfg(unix)]` 的真实符号链接越界回归在该宿主才编译；
   xc-pc-linux/1.98.1 在 rev `bdf2f767` **实测 138 passed / 0 failed**（§Q，不是从 Windows 推的），
   在 `0a42240` **实测 150 passed / 0 failed**（§R，当时 Windows 是 149）⇒ 差值 1 与口径吻合；
@@ -741,7 +770,11 @@ round 2 的教训就是"待办只写在提交说明里，下一轮没有承载�
   差值仍是那 1 条 #[cfg(unix)] 回归）。本档（Windows 152）的 Linux 值已在 §W 实跑填补：
   xc-pc-linux/1.98.1 @ rev `97ecbe59` **153 passed / 0 failed**（串并与并行同值），
   与"Windows + 1"的口径吻合；两枚新单测在该宿主逐名跑过（探活那条 10.25s，与 Windows 10.00s 同档）。
-  **117/116 与"137 = 134+3"都只是历史声明而不是当前值**：本区间把测试数从 117 推到 137 再推到 152，
+  **§W 的 provenance 要写清**（round 3 的 N-r3-11：独立评审在本宿主无 ssh 通道，那些数字它复现不了）：
+  它们是被审方在真实 Linux 宿主实跑的一手证据，原始日志 `/work/xc-v-linux.log` 与被测物
+  md5 `60819c3e508cbef90a9a9a63c3fd422f` 都记在 §W，但**独立案卷把它们标为"未复现，属被审方自述"** ⇒
+  引用时按这个强度引用，别当成双宿主各自独立确认过。
+  **117/116 与"137 = 134+3"都只是历史声明而不是当前值**：本区间把测试数从 117 推到 137 再推到 155，
   每一次都有人没同步这行（N2/N-A4 抓过一次，本轮再次自纠并在此留痕）。
   `scenario::tests::run_single_*`/`run_parallel_*` 在本宿主假红，见 DEVELOPMENT.md §11.1；
   覆盖 scenario 求值、evidence 新鲜度/STALE、digest 确定性与锁竞争判定、containment 的归一化比较

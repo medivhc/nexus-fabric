@@ -166,6 +166,30 @@ pub fn remove_lease(namespace: &Path) {
     let _ = std::fs::remove_file(lease_path(namespace));
 }
 
+/// 命名空间里那份租约**还是不是我们这一份**（按 token 判，不按 pid：pid 会被复用，
+/// 而且被 `--takeover` 换代之后，我们对那个文件已经没有任何处置权）。
+/// 读不到租约时算"是我们的"——要么还没写，要么本来就该由我们把收尾做完。
+///
+/// 这一层存在的理由是 round 3 的 N-r3-5/N-r3-6：被放弃的旧 daemon 会
+/// ① 每 2s 无条件 `write_lease` ⇒ 把接手方的租约**踩回去**（换代不持久），
+/// ② 退出时 `remove_lease` + `cache::purge` ⇒ 删掉**留守 daemon 正在用**的租约与共享结果缓存
+/// （实测：B 按 idle 自退出后 `daemon status` 报"没有 daemon 在跑"，而 A 仍在监听）。
+/// 判据本身是纯函数 ⇒ 由单测 `superseded_lease_is_not_ours_to_touch` 钉住。
+fn lease_is_ours(namespace: &Path, token: &str) -> bool {
+    match read_lease(namespace) {
+        Some(current) => current.token == token,
+        None => true,
+    }
+}
+
+/// `start` 遇到"租约在场、daemon 没答话"时，允不允许换掉那份租约。
+/// 纯函数是为了让它**有承载体**（round 3 的 N-r3-4：只钉 flag 解析不够，
+/// 把调用点的 `|| takeover` 删掉，两宿主 152 单测与 26 场景仍全绿）。
+/// 调用点若不再经过这里，这个私有函数就变成未使用项 ⇒ `clippy -D warnings` 的 `dead_code` 直接红。
+fn may_replace_unanswered_lease(refused: bool, takeover: bool) -> bool {
+    refused || takeover
+}
+
 /// token 是**误用防护，不是安全边界**（契约要求照此声明）：目录按用户隔离，同用户本来就能
 /// 直接跑 `nexus-harness code`，daemon 能做的事不多于 CLI 能做的事。
 fn mint_token(seed: &str) -> String {
@@ -384,9 +408,13 @@ fn serve(
     let reason: String = loop {
         if last_beat.elapsed() >= Duration::from_secs(2) {
             last_beat = Instant::now();
-            let mut beat = lease.clone();
-            beat.last_heartbeat = now_secs();
-            let _ = write_lease(namespace, &beat);
+            // 只在**这份租约还是我们的**时候续写。被 `--takeover` 换代之后还照原样写，
+            // 等于把接手方的租约踩回自己名下（N-r3-6：换代因此可能不持久）。
+            if lease_is_ours(namespace, &lease.token) {
+                let mut beat = lease.clone();
+                beat.last_heartbeat = now_secs();
+                let _ = write_lease(namespace, &beat);
+            }
         }
         if now_secs().saturating_sub(last_activity) >= idle_secs {
             break format!("idle {idle_secs}s 到期，daemon 自行退出");
@@ -407,11 +435,16 @@ fn serve(
     };
     // 退出路径只有一条清理：`drain_pool`（观测每个 provider 是否真的被操作系统收掉）
     // → 删自己写的租约 → 删缓存目录。idle 自退出与 stop 走同一条，不给它开后门。
-    // stop 的回收已在连接处理里做过，观测由 `Conn::Stop` 带出；这里再 drain 一次对空池是
-    // no-op，所以**必须优先用带出的那份**，否则对外字段会退化成恒 0（N-r2-1）。
+    // stop 的回收观测由 `Conn::Stop` 带出，所以这里**优先用带出的那份**，否则对外字段会退化成
+    // 恒 0（N-r2-1）。
     let drain = stop_drain.unwrap_or_else(|| drain_pool(&mut pool));
-    remove_lease(namespace);
-    cache::purge(&cache_dir(namespace));
+    // 清理只在**租约还归我们**时做（N-r3-5 实测：被 takeover 放弃的旧实例后来 idle 退出，
+    // 把接手方那份租约和整个命名空间的共享结果缓存一起删了 ⇒ 活着的 daemon 变成"没人起过"，
+    // 而缓存是跨命令资产，被第三方踩掉是真损失）。不是我们的就别动。
+    if lease_is_ours(namespace, &lease.token) {
+        remove_lease(namespace);
+        cache::purge(&cache_dir(namespace));
+    }
     (drain, reason)
 }
 
@@ -1018,7 +1051,8 @@ pub fn start_in(
         // 残留租约（daemon 崩了没删文件）在这里被**覆盖**而不是拒绝启动：否则一次崩溃会永久挡住
         // `start`。但"覆盖"的前提是有证据说它是残留 —— 没被拒只是没答上时，起第二个 daemon
         // 会留下两个监听者与一份被踩掉的租约（第一个就此不可发现）。与 `stop` 同一判据。
-        if !why.contains("CONNECTION_REFUSED") && !takeover {
+        // 判定走 `may_replace_unanswered_lease`（纯函数 + 单测真值表），不写在这里就地展开。
+        if !may_replace_unanswered_lease(why.contains("CONNECTION_REFUSED"), takeover) {
             let state = DaemonState {
                 running: false,
                 detected: false,
@@ -1285,15 +1319,19 @@ pub fn stop_in(namespace: &Path) -> Outcome {
                 unavailable: if gone && observed == 0 {
                     None
                 } else {
+                    // 三种"没凑齐证据"的形状要分开说（round 3 的 N-r3-2：原先把"帧里报了个负数"
+                    // 和"帧里根本没这个量"都写成后者，同一个 envelope 自相矛盾 ——
+                    // `sessions_after_stop=-5` 明明透传着，reason 却说"帧里没有"）。
                     Some(match reply.as_ref() {
-                        // 应答里有这个数 ⇒ 直接说它说了什么；-1 是"应答里没这个量"，
-                        // 不能写成"回报仍有 -1 个未退出"（那是把缺证据伪装成一条反向证据）。
                         Ok(_) if observed >= 0 => {
                             format!("daemon 回报仍有 {observed} 个 provider 未退出")
                         }
+                        Ok(v) if v.get("sessions_after_stop").is_some() => format!(
+                            "daemon 的 stopped 帧报了这个负数：{observed}（原样透传，不折算成 0，也不当成没答）；\
+                             租约在 {lease_removal_bound:?} 内消失={gone}"
+                        ),
                         Ok(_) => format!(
-                            "daemon 的 stopped 帧里没有 sessions_after_stop；租约在 {:?} 内消失={gone}",
-                            lease_removal_bound
+                            "daemon 的 stopped 帧里没有 sessions_after_stop；租约在 {lease_removal_bound:?} 内消失={gone}"
                         ),
                         Err(e) => format!("stop 应答取不到: {e}"),
                     })
@@ -1314,7 +1352,7 @@ pub fn stop_in(namespace: &Path) -> Outcome {
                     &state,
                     format!(
                         "stop 未能证明回收完成（租约已删={gone}，等待上限 {lease_removal_bound:?}，\
-                         回报仍活着的 provider={observed}）"
+                         sessions_after_stop 本次取到 {observed}）；这个数的出处见 daemon_unavailable"
                     ),
                     extra,
                 )
@@ -2406,8 +2444,21 @@ mod tests {
             dir: ns.clone(),
         };
         let started = Instant::now();
-        let (alive, pong, why) = probe(&lease);
+        // 探活放进工作线程 + **有界等待**：万一哪天连读超时都不设了（`set_read_timeout(None)`），
+        // 这条测试要变红而不是把整个 `cargo test` 挂死 —— libtest 没有 per-test 超时
+        // （round 3 的 N-r3-8：原写法对这种回归形式是"挂住"，不是"红"）。
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<(bool, Option<Value>, String)>();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(probe(&lease));
+        });
+        let (alive, pong, why) = match done_rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(v) => v,
+            Err(_) => {
+                panic!("探活 60s 没返回：读超时可能整档被去掉（那时无预算可红，只能靠这层界）")
+            }
+        };
         let elapsed = started.elapsed();
+        // 探针已经有结论了，这时才释放夹具里被抱住的连接（早一步关会让"沉默"变成"EOF"，形状就变了）。
         drop(stop_tx);
         let _ = holder.join();
         let _ = std::fs::remove_dir_all(&ns);
@@ -2424,6 +2475,140 @@ mod tests {
             "连得上但不答话不是\"被拒\"；分类成残留会让 start 起第二个实例：{why}"
         );
         assert!(!why.is_empty(), "探针没拿到应答却不给原因 = 把失败说成沉默");
+    }
+
+    /// 契约 ①（**握手成功之后**没了应答 ⇒ `-1`）的承载体。round 3 的 N-r3-3 指出这一支原先
+    /// 在仓内没有任何承载体：selftest 与场景钉的都是"有应答"的路，而
+    /// `stop_does_not_claim_zero_without_an_answer` 用的是被拒端口（那是 ②）。
+    /// 夹具必须**先正确应答 hello**，再在第二个请求上关连接：单纯不答话走的是 ②（字段缺席），
+    /// 而且 `stop` 档的读预算是 900s —— 拿那个形状做单测会挂 15 分钟而不是变红。
+    #[test]
+    fn stop_after_a_ready_frame_reports_minus_one() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("绑 ready 夹具端口");
+        let port = listener.local_addr().expect("取 ready 夹具端口").port();
+        let version = daemon_version();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(1).flatten() {
+                let mut stream = stream;
+                stream.set_nonblocking(false).ok();
+                stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+                let hello = {
+                    let mut reader = BufReader::new(&stream);
+                    lsp::read_frame_result(&mut reader)
+                };
+                let greeted = matches!(
+                    hello,
+                    FrameIn::Message(ref v)
+                        if v.get("t").and_then(Value::as_str) == Some("hello")
+                );
+                if !greeted {
+                    break;
+                }
+                let _ = write_frame(&mut stream, &json!({"t": "ready", "version": version}));
+                {
+                    let mut reader = BufReader::new(&stream);
+                    let _ = lsp::read_frame_result(&mut reader);
+                }
+                // 收到 stop 就关连接、一个字节都不回 ⇒ 连上了、握手成了、应答没了。
+                drop(stream);
+            }
+        });
+        let ns = unique_namespace_dir("stop-after-ready");
+        let lease = Lease {
+            pid: std::process::id(),
+            port,
+            token: "fixture-token".to_string(),
+            started_at: now_secs(),
+            last_heartbeat: now_secs(),
+            idle_secs: DEFAULT_IDLE_SECS,
+            workspace_key: ".".to_string(),
+            version: daemon_version(),
+            max_workspaces: DEFAULT_MAX_WORKSPACES,
+            dir: ns.clone(),
+        };
+        write_lease(&ns, &lease).expect("写夹具租约");
+        let outcome = stop_in(&ns);
+        let got = outcome
+            .2
+            .iter()
+            .find(|(k, _)| k == "sessions_after_stop")
+            .map(|(_, v)| v.clone());
+        assert_eq!(
+            outcome.0, "UNKNOWN",
+            "拿不到应答不是停成功了：{}",
+            outcome.1
+        );
+        assert_eq!(
+            got,
+            Some(json!(-1)),
+            "契约 ①：握手成功之后没了应答必须发 -1；发缺席是 ② 的形状（混两支就是 B-3）"
+        );
+        assert!(
+            lease_path(&ns).exists(),
+            "握手成功那一支不许顺手删租约：只有被拒才算残留，删了会让活着的 daemon 不可发现"
+        );
+        let _ = std::fs::remove_dir_all(&ns);
+    }
+
+    /// `--takeover` 的**效果**判据（round 3 的 N-r3-4：只钉解析不够 —— 把调用点的
+    /// `|| takeover` 删掉，两宿主 152 单测与 26 场景仍全绿）。真值表四格逐格钉：
+    /// 被拒 ⇒ 有无 flag 都能换（否则一次崩溃永久挡住 `start`）；没被拒 ⇒ 只有显式 flag 能换。
+    /// 判定抽成 `may_replace_unanswered_lease` 之后，调用点若绕开它，这个私有函数就成了未使用项
+    /// ⇒ `clippy -D warnings` 的 dead_code 直接把那种漂移变成构建失败。
+    #[test]
+    fn only_refusal_or_takeover_may_replace_an_unanswered_lease() {
+        assert!(
+            may_replace_unanswered_lease(true, false),
+            "被拒的残留租约必须允许覆盖，不然崩一次就永久起不来"
+        );
+        assert!(may_replace_unanswered_lease(true, true));
+        assert!(
+            may_replace_unanswered_lease(false, true),
+            "显式 --takeover 的授权必须真的生效"
+        );
+        assert!(
+            !may_replace_unanswered_lease(false, false),
+            "只是没答话就覆盖租约 = 可能把还在监听的 daemon 变成不可发现"
+        );
+    }
+
+    /// 被换代之后**没有处置权**（N-r3-5 / N-r3-6 的承载体）。评审实测过的危害：旧实例 idle
+    /// 到点自己退出时，把接手方的 lease.json 与整个命名空间的共享结果缓存一起删掉，
+    /// `daemon status` 于是报「没有 daemon 在跑」，而那个 daemon 仍在监听。心跳同理会把
+    /// 新租约踩回旧名下（换代不持久）。
+    #[test]
+    fn superseded_lease_is_not_ours_to_touch() {
+        let ns = unique_namespace_dir("superseded-lease");
+        assert!(
+            lease_is_ours(&ns, "whoever"),
+            "读不到租约时按「还是我的」处理：收尾本来就该幂等，不该因此跳过清理"
+        );
+        let mut lease = Lease {
+            pid: std::process::id(),
+            port: 1,
+            token: "owner-a".to_string(),
+            started_at: now_secs(),
+            last_heartbeat: now_secs(),
+            idle_secs: DEFAULT_IDLE_SECS,
+            workspace_key: ".".to_string(),
+            version: daemon_version(),
+            max_workspaces: DEFAULT_MAX_WORKSPACES,
+            dir: ns.clone(),
+        };
+        write_lease(&ns, &lease).expect("写 a 的租约");
+        assert!(lease_is_ours(&ns, "owner-a"), "自己那份必须认得");
+        assert!(
+            !lease_is_ours(&ns, "owner-b"),
+            "别人那份不许认得 —— 认了就等于允许 idle 退出删掉留守 daemon 的租约与缓存"
+        );
+        lease.token = "owner-b".to_string();
+        write_lease(&ns, &lease).expect("模拟 takeover 换代");
+        assert!(
+            !lease_is_ours(&ns, "owner-a"),
+            "换代后旧主必须同时跳过心跳与清理，否则 takeover 不持久、缓存被第三方清掉"
+        );
+        assert!(lease_is_ours(&ns, "owner-b"));
+        let _ = std::fs::remove_dir_all(&ns);
     }
 
     /// `--takeover` 必须是**无值** flag，且不能从 `daemon serve` 那个内部入口进来。
