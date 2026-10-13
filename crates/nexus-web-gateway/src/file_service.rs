@@ -950,9 +950,9 @@ impl Throttle {
             // 第八片删行不删锁的写法会把这条不变式弄假，第九片把删行整个去掉之后它才
             // 重新成立，且现在有了新的观测面：`Throttle::locks()`/`FileEngine::throttle_locks()`
             // （锁表大小此前全仓不可读，"表项有界"对锁表那一半是零可红对象，r8 R8-W-3）。
-            // 实测（本批 D 轮复验：72 单测 / 26 条本场景期望；树号与全量 bindings 只记在
+            // 实测（本批 D 轮复验：73 单测 / 27 条本场景期望；树号与全量 bindings 只记在
             // 案卷《M1 第十一片》的 D 轮一节，这里不写 sha，免得这行注释自己改动就把它
-            // 声称的那棵树弄没了）：把这支整个关掉 ⇒ 72 全绿、26 条冻结期望字段
+            // 声称的那棵树弄没了）：把这支整个关掉 ⇒ 73 全绿、27 条冻结期望字段
             // 无一翻转（这与上面的不可达性一致，不是"测试没覆盖到"）；把 `decay` 的
             // 过期锁回收改成恒真 ⇒ 只有
             // `expired_locks_are_reclaimed_instead_of_escalating_to_the_global_window` 红，
@@ -3603,7 +3603,7 @@ mod tests {
     #[test]
     fn expired_source_locks_are_reclaimed_instead_of_escalating_to_the_global_window() {
         // 这条是本轮把**衰减那一族全量重跑**时测出来的洞：把 `source_locks.retain` 改成恒真
-        // （变异 M18）之后 70 条单测全绿、26 条冻结期望无一翻转——"源锁表项有界"这句在
+        // （变异 M18）之后 70 条单测全绿、当时 26 条冻结期望无一翻转——"源锁表项有界"这句在
         // **过期回收**那一半原本是零可红对象，与 r8 R8-W-3 抓 `locked` 那一半的形状一模一样。
         // 危害也同形：过期项不回收 ⇒ 满表分支把**个体源锁**偷偷换成**全局 fail-closed**，
         // 一批早就停手的地址从此永久决定新地址的待遇。
@@ -3638,7 +3638,7 @@ mod tests {
 
     #[test]
     fn source_ledger_budget_forgives_failures_from_older_windows() {
-        // 这条同样是**测出来的洞**：把源账本的衰减关掉（变异 M17）之后全绿、26 条冻结期望
+        // 这条同样是**测出来的洞**：把源账本的衰减关掉（变异 M17）之后全绿、当时 26 条冻结期望
         // 无一翻转——也就是说"单源额度是一个窗口内的额度"这句在源侧原本没有对象
         // （pair 侧早有 `lockout_requires_failures_inside_one_window` 钉住同一形状）。
         // 危害不是内存而是**门槛**：不衰减的话，一个每窗口只滴一条失败的地址会跨窗口
@@ -3676,6 +3676,58 @@ mod tests {
             t.is_locked("anyone", "10.0.0.2"),
             "一个窗口内打满额度必须锁这个地址"
         );
+    }
+
+    #[test]
+    fn same_principal_with_two_address_spellings_doubles_the_pair_threshold() {
+        // r12 R12-W-1：既有的两条漂移对象钉的是**机制**（摘要吃不吃 source），没有对象钉
+        // **数量**后果——同一 principal 在两种写法下拿到两个桶，于是 pair 侧要攒两倍的失败
+        // 才武装。方向必须与"共享桶 ⇒ 提前武装"相反，所以这里断言的是"翻倍条数仍未被锁"，
+        // 并配一条同总量的单写法对照（那一侧必须被锁）。若把 `identity_key` 里喂 source
+        // 的那半去掉（变异 N13 的"整半不吃"配方），两写法并进同一个桶 ⇒ 第一格当场红。
+        let dir = tmp("pair-drift-quantity");
+        let root = SandboxRoot::open("downloads", &dir, false).unwrap();
+        // 单源额度设成 8 > 4：源侧绝不先开火，"没被锁"只能归因于 pair 侧还没攒满。
+        let limits = FileLimits {
+            lockout_after: 3,
+            max_failures_per_source: 8,
+            ..Default::default()
+        };
+        const A: &str = "2001:db8::7";
+        const B: &str = "[2001:db8::7]:44337";
+        let mut split = FileEngine::new(limits.clone(), vec![root.clone()], "s3cret").unwrap();
+        // 交替喂 lockout_after-1 轮（每写法各 2 条，都差一条才到阈值）。
+        for _ in 0..(split.limits().lockout_after - 1) {
+            let _ = split.authenticate("split", A, "wrong");
+            let _ = split.authenticate("split", B, "wrong");
+        }
+        assert_eq!(
+            split.throttle_buckets(),
+            2,
+            "同一 principal 的两种写法必须落在两个桶里"
+        );
+        assert_eq!(
+            split
+                .authenticate("split", A, "s3cret")
+                .map(|_| "ACCEPTED")
+                .unwrap_or_else(|err| err.code),
+            "ACCEPTED",
+            "翻倍条数（2×(lockout_after-1)）不该武装 pair 锁——这就是被翻倍的那一半"
+        );
+        // 对照：同样条数、同 principal、单一写法 ⇒ 已经越过阈值，必须被锁。
+        let mut single = FileEngine::new(limits, vec![root], "s3cret").unwrap();
+        for _ in 0..(2 * (single.limits().lockout_after - 1)) {
+            let _ = single.authenticate("split", A, "wrong");
+        }
+        assert_eq!(
+            single
+                .authenticate("split", A, "s3cret")
+                .map(|_| "ACCEPTED")
+                .unwrap_or_else(|err| err.code),
+            code::THROTTLED,
+            "单写法攒满 2×(lockout_after-1) 条早就该武装：与上面一格合起来才叫翻倍"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

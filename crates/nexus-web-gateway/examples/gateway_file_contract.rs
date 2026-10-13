@@ -1025,6 +1025,50 @@ fn auth_throttle(f: &mut Map<String, Value>) -> Result<(), String> {
                 && drift_locked_code == code::THROTTLED
         ),
     );
+    // r12 R12-W-1：上面 e13 钉的是**机制**（摘要吃不吃地址），这条钉**数量**——同一 principal
+    // 用两种写法 ⇒ 两个桶 ⇒ pair 侧门槛翻倍。方向与"共享桶提前武装"相反，所以两格一起读才
+    // 不失真：交替喂 2×(lockout_after-1) 条不该武装，同总量的单写法必须已经武装。
+    let mut e14 = engine_at(
+        &dir,
+        FileLimits {
+            lockout_after: 3,
+            max_failures_per_source: 8,
+            ..Default::default()
+        },
+    )?;
+    const DRIFT_A: &str = "2001:db8::7";
+    const DRIFT_B: &str = "[2001:db8::7]:44337";
+    for _ in 0..(e14.limits().lockout_after - 1) {
+        let _ = e14.authenticate("split", DRIFT_A, "wrong");
+        let _ = e14.authenticate("split", DRIFT_B, "wrong");
+    }
+    // **必须在出示正确令牌之前取桶数**：成功认证会 `succeed()` 清掉它自己那一格，
+    // 事后读就成了 1 而不是 2。这一格是 E4 期望当场把我抓红的——单测里同样的夹具因为
+    // 断言顺序正确而一直是绿的，两个对象对同一个顺序错误只有一边有杀伤力。
+    let spread_buckets = e14.throttle_buckets();
+    let spread_code = e14
+        .authenticate("split", DRIFT_A, TOKEN)
+        .map(|_| "ACCEPTED")
+        .unwrap_or_else(|err| err.code);
+    let mut e14b = engine_at(
+        &dir,
+        FileLimits {
+            lockout_after: 3,
+            max_failures_per_source: 8,
+            ..Default::default()
+        },
+    )?;
+    for _ in 0..(2 * (e14b.limits().lockout_after - 1)) {
+        let _ = e14b.authenticate("split", DRIFT_A, "wrong");
+    }
+    let single_code = e14b
+        .authenticate("split", DRIFT_A, TOKEN)
+        .map(|_| "ACCEPTED")
+        .unwrap_or_else(|err| err.code);
+    f.insert(
+        "pair_threshold_doubles_across_address_spellings".into(),
+        json!(spread_buckets == 2 && spread_code == "ACCEPTED" && single_code == code::THROTTLED),
+    );
     // 源账本满 ⇒ 陌生地址的**第一条**失败就被锁（fail-closed，不给它建行），并且
     // 锁表自己也有门禁：满了就与两层键同一条大路一致，升级为全局窗口
     // （评审 r9 R9-W-2：没有这道门禁时，"每条失败换一条表项"是最便宜的内存放大）。

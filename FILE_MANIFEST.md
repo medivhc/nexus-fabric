@@ -2,7 +2,7 @@
 
 本包实现《Nexus 统一系统设计规范 v9》中的“统一仓库目录契约”。
 
-文件数（不含本清单）：212
+文件数（不含本清单）：214
 
 > 2026-10-10：原声明值 137 与表内实际行数（148）已不一致（既有漂移，含
 > `scenarios/engineering/bench_gate_verdicts.toml` 等未登记项）。本次登记
@@ -286,6 +286,8 @@
 | `.evidence/review-gateway-file-r10/findings.md` | 第 10 轮取证（157 行）：三张声明的绑定复核（`git diff 8a67e85` 脏差是否只有散文）、r9 六条 WARN 的逐条判定、R10-W-1 状态侧口径（时钟边界分支只对齐了返回值半）、R10-W-2 独立复现 selected-properties 偶发红与证据覆写销毁诊断 |
 | `.evidence/review-gateway-file-r11/summary.json` | 第 11 轮案卷（D 轮：r10 处置的复核），verdict `COMMENTED`（0 FAIL / 2 WARN / 4 NOTE，blocking 空，`rejected_items` 2 条都是评审方拒绝替实现方预设的结论），评审方第二次在 xc-pc-linux 实测；因实现方本轮连改三次树，它另 scp 一份工作树快照自建等价树，两棵树的数各自写明，`git add -f` 携带 |
 | `.evidence/review-gateway-file-r11/findings.md` | 第 11 轮取证（130 行）：18 行变异表里独立复跑 8 行（baseline/E/P8/D1/M10b/N14 + 快照上 M17/M18）**零分歧**、其余 10 行明确标为仍是实现方自报；两条 WARN = 契约数字缺树限定、同一条地址串的消费点被三处文档数成三样（真实五处）；另实测 `git checkout fbcac2e` 复现本轮那次夹具红 |
+| `.evidence/review-gateway-file-r12/summary.json` | 第 12 轮案卷（r11 处置的复核），verdict `COMMENTED`（0 FAIL / 1 WARN / 3 NOTE，blocking 空），本链第二次由评审方在 Linux 实测。**第一次派出的同轮评审者被模型中断：24 次工具调用、约 175 万 token，没留下任何交付物**——本轮是重派，复用前一位留下的已编译克隆 `/work/r12-audit` 并在案卷里写明这不是自己从零建的树，`git add -f` 携带 |
+| `.evidence/review-gateway-file-r12/findings.md` | 第 12 轮取证（98 行）：三个必答各给判定——地址串消费点确为**五处**（两个第六处候选逐项否决：审计行不吃 source、会话字段只有两个已列读点）；pair 侧"门槛翻倍"只有机制对象、没有数量对象（判 WARN，附自己的有界变异实测红名单与处方）；绑定与数字在 HEAD 上逐条对上。含一条自我坦白：只复跑 18 行变异表里的 1 行且配方与表中不同 ⇒ 判"不可比"，既不算分歧也不算证实 |
 | `.agents/red-evidence-gateway-file-service.txt` | Contract-first Red Evidence (M0) |
 | `.agents/green-evidence-gateway-file-service-m1.txt` | Green Evidence for M1 slice 1 |
 

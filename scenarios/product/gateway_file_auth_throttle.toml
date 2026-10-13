@@ -171,3 +171,11 @@ equals = true
 [[expect]]
 field = "address_representation_drift_splits_the_source_budget"
 equals = true
+
+# r12 R12-W-1：上一条钉的是**机制**（同一摘要键吃不吃地址），这一条钉**数量**——同一 principal
+# 用两种写法 ⇒ 落在两个桶 ⇒ pair 侧门槛翻倍。两格必须一起读：交替喂 2×(lockout_after-1) 条
+# **不该**武装（左），同总量的单一写法**必须**已武装（右）。若把 identity_key 里喂 source 的那
+# 半去掉（"整半不吃"配方），两写法并进同一桶 ⇒ 左格当场红——这就是本条的红对象。
+[[expect]]
+field = "pair_threshold_doubles_across_address_spellings"
+equals = true

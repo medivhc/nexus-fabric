@@ -917,7 +917,7 @@ r9 未复现本仓任何数字（它是 Windows 侧纸面复核），但它**独
 #                   contract_hash         2219448ed81870cbf67d1b4bd6cf93c63e5c51f4
 #                   verify --fast 连跑 2 次全 PASS（9 门），evidence dir = verify-e6f5aabdd251
 #                   status --json verdict = PASS（"latest evidence is fresh and PASS"）
-#   落地前最后一道门  source_revision e6dd2568cb18adf7a60238c87803df2573e7a25e
+#   r11 处置那道门        source_revision e6dd2568cb18adf7a60238c87803df2573e7a25e
 #                   working_tree_digest dbcf237a91a2413b991b69392dcae28dacd04d08
 #                   contract_hash 2219448ed81870cbf67d1b4bd6cf93c63e5c51f4（与上相同：这一棵
 #                   与 d0ace31 的差是纯注释/散文，`git diff -U0 d0ace31 e6dd256 --
@@ -927,7 +927,7 @@ r9 未复现本仓任何数字（它是 Windows 侧纸面复核），但它**独
 #                   9 条 E4 场景全 PASS = 103 条期望（逐条 6+10+9+5+9+26+16+7+15）/
 #                   verify --fast = 9 门全 PASS，evidence dir = verify-eaac31203670 /
 #                   status --json verdict = PASS（"latest evidence is fresh and PASS"）
-实测（两棵都跑过同一套）：cargo test --lib = **72 passed; 0 failed** / clippy --all-targets 无诊断
+实测（r11 那两棵都跑过同一套，r12 之后的现值见上面 b9ebbe4 那一行）：cargo test --lib = 72 passed; 0 failed / clippy --all-targets 无诊断
 输出（并由 verify 的 clippy 门 PASS 背书；我自己那条 `echo $?` 拿的是管道尾命令的退码，
 不算证据）/ 9 条 E4 场景 = **103** 条期望全 PASS（6+10+9+5+9+26+16+7+15）
 # D 轮中途的几棵，全部留下而不是抹平，因为**每棵都红过不同的东西**：
@@ -939,7 +939,19 @@ r9 未复现本仓任何数字（它是 Windows 侧纸面复核），但它**独
 #            被抓到名字与 panic（见本节末段）。
 #   7459e74  71 单测：加了 `expired_source_locks_are_reclaimed_…`，M18 从 0 红变成 1 红。
 #   cc2b3c8  72 单测：加了 `source_ledger_budget_forgives_…` 的第一、二版节拍，M17 仍 0 红。
-#   d0ace31  72 单测：节拍改成"间隔在迭代之间"，M17 终于 1 红 ⇒ 下面这张表以此为唯一口径。
+#   d0ace31  72 单测：节拍改成"间隔在迭代之间"，M17 终于 1 红 ⇒ D 轮那张表的口径。
+#   b9ebbe4  **r12 之后的口径树**：73 单测（新增 pair 侧数量对象
+#            `same_principal_with_two_address_spellings_doubles_the_pair_threshold`）/ auth-throttle
+#            27 条期望 / 9 场景 104 条全 PASS / clippy 诊断 0 行 / `verify --fast` 连跑 2 次
+#            9 门全 PASS / `status --json` verdict PASS、dirty_state=false、contract_hash
+#            **dd4926c2963ca5be9bbeda2ebcd5b45ac397e05b**、working_tree_digest
+#            f21bdb098b32adf5ebc14eac3daf6dbab10f9807、evidence dir = verify-064f210b5743。
+#            下面那张 D 轮变异表已按这一棵重跑（18 项），落地提交与它的差只有注释与散文
+#            （`git diff -U0 b9ebbe4 HEAD -- crates/nexus-web-gateway/src
+#            crates/nexus-web-gateway/examples scenarios` 滤掉 `//`/`///` 行为 0 行，实测）。
+#   e6dd256 / 12c9825 / 7e71e3a  r11 处置的三道门（同一组数：72 单测 / 26 / 103 / 2219448e；
+#            evidence dir 依次 verify-404018b6b95c、verify-eaac31203670、verify-c18dcfd17b67），
+#            保留是为了让"期望从 26 涨到 27"这一步有前后对照，不是为了并列两套现值。
 # 锚回落地提交：本节描述的那 9 个文件（src/examples/MODULE/PRODUCT/requirements/scenarios/
 # 两条知识条目 + index.json）落在 `5b8c16b`。它与复验树 e6dd256 的关系是**逐字节证明过的**，
 # 不是断言：
@@ -957,14 +969,16 @@ r9 未复现本仓任何数字（它是 Windows 侧纸面复核），但它**独
         与 `unknown_source_locked_on_first_failure_when_ledger_full`）→ 102（补
         `empty_source_is_refused_before_the_throttle`）→ **103**（D 轮补
         `address_representation_drift_splits_the_source_budget`）；auth-throttle 单场景
-        22 → 24 → 25 → **26**。
+        22 → 24 → 25 → 26 → **27**；r12 之后再加 pair 侧数量对象
+        `pair_threshold_doubles_across_address_spellings` ⇒ 总数 **104**。
   单测 67 → 69（`source_lock_table_full_escalates_instead_of_growing_forever`、
         `empty_transport_address_is_refused_before_the_throttle`）→ 70
         （`address_representation_drift_arms_two_independent_source_locks`）→ **72**
         （`expired_source_locks_are_reclaimed_instead_of_escalating_to_the_global_window`、
         `source_ledger_budget_forgives_failures_from_older_windows`，后一条改了三版节拍才有
         杀伤力，见 D 轮变异表 M17 那一行）。
-  contract_hash ef289491 → 13a86e2e（24 条）→ 4f28580b（25 条）→ **2219448e**（26 条）。
+  contract_hash ef289491 → 13a86e2e（24 条）→ 4f28580b（25 条）→ 2219448e（26 条）→
+        **dd4926c2**（27 条）。
   M10b（去掉 `authenticate` 的锁定预检）的杀伤力在本链出现过**五个**值：**8 红/4 翻转**
         （第十片正文）、**8 红/5 翻转**（第十片变异表）、r9 静态重推 **9/9**、
         8a67e85 实测 **10/10**（r10 独立复现，名单逐条对上）、D 轮（c5d0918）实测
@@ -1085,12 +1099,13 @@ D 轮（r10 回来之后的落地，全部重新实测）：
    迭代之间、断言紧跟最后一条失败，才红）。单测 70 → **72**。教训与 R9-N-2/P8 同一条，
    但这次是**测试自身的杀伤力**要量：新写一条测试不等于它钉住了什么。
 
-D 轮变异表（**唯一口径 = 最终树 d0ace31**，72 条单测 / 26 条 auth-throttle 冻结期望；工具
-/work/mm3.py、/work/mm4.py、/work/mm5.py；每个锚点先断言存在，缺锚直接退出而不是静默 no-op。
-中途 c5d0918 那一张的数不再引用——它属 70 条那棵树，红数与新加的测试无关部分相同、相关部分
-少一到两条）：
-  baseline                     → 72 全绿、26 条期望无一翻转（探测器有效）
-  E  纵深防御那支关掉          → 72 全绿、0 翻转（与"经 authenticate 不可达"一致）
+D 轮变异表（**唯一口径 = 树 b9ebbe4**，73 条单测 / 27 条 auth-throttle 冻结期望；工具
+/work/mm3.py、/work/mm4.py、/work/mm5.py、/work/mm6.py；每个锚点先断言存在，缺锚直接退出
+而不是静默 no-op。落地提交与该树只差注释/散文：`git diff -U0 b9ebbe4 HEAD -- src examples
+scenarios` 滤掉 `//`/`///` 行后为 0 行（本轮实测），所以这张表对 HEAD 同样成立。
+中途 d0ace31/c5d0918 两张的数不再引用，只在"滚动"那段留痕）：
+  baseline                     → 73 全绿、27 条期望无一翻转（探测器有效）
+  E  纵深防御那支关掉          → 73 全绿、0 翻转（与"经 authenticate 不可达"一致）
   P1 限额记账但从不武装        → RED 5 条 + 4 翻转（single_address_cannot_fill_the_table、
                                 throttle_per_source_budget_scoped_to_address、
                                 unknown_source_locked_on_first_failure_when_ledger_full、
@@ -1103,6 +1118,15 @@ D 轮变异表（**唯一口径 = 最终树 d0ace31**，72 条单测 / 26 条 au
   P6 去掉比较计数              → RED 1 条 + 1 翻转
   P7 去掉源锁表门禁            → RED 1 条 + 1 翻转
   P8 去掉空地址守卫            → RED 1 条 + 1 翻转（本轮补的那个对象生效）
+  N15 pair 侧数量对象被打红    → RED 4 条 + 3 翻转（配方=把 `identity_key` 里喂 source 的
+                                **整半去掉**，与 N13 的"只去掉长度前缀"是两种不同变异，红数
+                                自然不同）：红名单含
+                                `same_principal_with_two_address_spellings_doubles_the_pair_threshold`、
+                                `throttle_identity_keys_do_not_collide_on_prefix_or_concatenation`、
+                                `address_representation_drift_arms_two_independent_source_locks`、
+                                `lockout_refuses_even_the_correct_token_and_stays_bounded`；翻转含
+                                `pair_threshold_doubles_across_address_spellings` ⇒ r12 R12-W-1
+                                要的那个数量对象确实有杀伤力，不是又一条常绿测试
   N13 两层键摘要少喂 source    → RED 1 条（lockout_refuses_even_the_correct_token_…）
                                 + 1 翻转（other_source_still_admitted）——这就是 r9 的 N5，
                                 本轮重跑，不再引用第八片的数
@@ -1114,7 +1138,7 @@ D 轮变异表（**唯一口径 = 最终树 d0ace31**，72 条单测 / 26 条 au
                                 （这一支第一版把锚点写成断裂的字符串字面量 ⇒ 语法错、
                                 `lib: NO RESULT`；那是编译失败而不是变异，作废后重跑才得到
                                 本行的数——记在这里，因为"变异工具自己也要有杀伤力证据"）
-  D1 条件删除改回无条件        → 72 全绿 + 0 翻转 ⇒ **R10-W-1 的修法零红对象**（不可达分支），
+  D1 条件删除改回无条件        → 73 全绿 + 0 翻转 ⇒ **R10-W-1 的修法零红对象**（不可达分支），
                                 这条红/绿的"负结果"本身就是它该有的证据形态
   M15 桶不随窗口衰减（旧 N6）  → RED 4 条 + 2 翻转（throttle_flood_self_heals_after_quiet_window、
                                 throttle_sustainable_failure_budget）
@@ -1174,7 +1198,40 @@ r11 四条 NOTE：N-1 把我那句"25 条期望 MISSING"纠成 **26**（`git sho
 N-4 是确认（flaky 机制独立复现）外加一句措辞纠正：两处频率都是小样本，不许读成稳态率。
 
 评审链：… → r10(0F/2W/5N) → r11(0F/2W/4N，评审方第二次实测，并把对象横跨三棵树这件事写明)
-→ r12（r11 处置的独立复核，待派）。
+→ r12（r11 处置的独立复核）。
+
+r12 的签发结论：**COMMENTED / 0 FAIL / 1 WARN / 3 NOTE**，可合入。案卷
+`.evidence/review-gateway-file-r12/`（summary.json + findings.md 98 行）。这一轮有两个记录点：
+(1) **第一次派出的评审者被模型中断，烧掉约 175 万 token、24 次工具调用，一个交付物都没留下**——
+不是"跑坏了"而是"什么也没写"，所以重派时给了硬预算（≤60 次工具调用、第 25 次必须先落
+summary.json）与收窄的三个必答问题；教训与本链早前那条"先写 summary.json 再写 findings"是同
+一条：**交付物顺序决定一次评审是否存在**。(2) 重派者复用了前一位留下的已编译克隆
+`/work/r12-audit`（HEAD 6e7bd09、跑完 status 归零）并如实写明"这不是我自己从零建的树"。
+
+它的一条 WARN 与我的落地：
+  R12-W-1 —— 判得对，而且是这一族反复出现的形状：**我把"机制被钉住"当成了"数量被钉住"**。
+    既有的摘要键对象钉的是"摘要吃不吃 source 串"（机制），没有任何断言说过"同一 principal 的
+    两种写法 ⇒ 两个桶 ⇒ pair 侧要攒两倍失败才武装"（数量）。它实测过：把 `identity_key` 里
+    喂 source 的整半去掉 ⇒ 那两条既有对象确实红/翻，所以机制那一半不是空口；但红的原因是
+    "两写法并进同一桶后**提前**武装、把源额度短路"——那是翻倍的**反面**，不能拿来当翻倍的证据。
+    补的对象：单测 `same_principal_with_two_address_spellings_doubles_the_pair_threshold` +
+    探针字段与冻结期望 `pair_threshold_doubles_across_address_spellings`，三格一起断言
+    （交替喂 2×(lockout_after-1) 条**不武装** ∥ 同总量单写法**必须已武装** ∥ 桶数恰为 2），
+    方向与"共享桶提前武装"相反。杀伤力在口径树 b9ebbe4 上实测：变异
+    `N15_identity_digest_drops_source_half` ⇒ **4 条单测红 + 3 条期望翻转**，红与翻名单里
+    都有新补这一条 ⇒ 它不是又一条常绿测试。
+    顺手记一处自己的错：探针第一版把 `throttle_buckets()` 读在"出示正确令牌"之后，而成功认证
+    会 `succeed()` 清掉自己那一格 ⇒ 新期望当场 FAIL（27 条里只它红）；单测里同样的夹具因为
+    取值顺序在前一直绿。**同一个顺序错误，两个对象只有一个有杀伤力**——这条不写成"两处都覆盖"。
+三条 NOTE：N-1 我那句"PRODUCT 也对齐成五处"是多走一步（PRODUCT 本来不写任何消费点计数），
+已改成"不写计数的就说不写"；N-2 变异表只写结果不写配方，N13 与 N15 正是"同一函数、两种配方"
+（只去长度前缀 ⇒ 1 红 + 1 翻；整半不吃 ⇒ 4 红 + 3 翻），表里两行现在都写清配方差异，另把
+r12 复跑过的 6 行与仍是自报的 12 行分开标；N-3 契约文件里的树限定改成带短 sha（案卷不进
+contract_hash，描述性限定会先失去指代）。另外它独立撞到我推 ref 不及时——**这是同一条毛病
+第二次被同一原因打断**，说明"落地前推一次"不够，必须是"每个提交之后都推一次"，本轮已照做。
+
+评审链：… → r11(0F/2W/4N) → r12(0F/1W/3N；第一次中断未交付、第二次复用其克隆完成) →
+r13（r12 处置的独立复核，待派）。
 
 r11 落地之后的复验（同一宿主与工具链，`status --json` 实测，dirty_state=false）：
 #   source_revision       12c9825d9b203affc88161e29cfd620eb7feda0f
@@ -1184,7 +1241,7 @@ r11 落地之后的复验（同一宿主与工具链，`status --json` 实测，
 #                         `scenarios/**` 一字节未改）
 #   cargo test --lib      72 passed; 0 failed
 #   clippy --all-targets  诊断行数 0
-#   9 条 E4 场景          PASS=9/9，期望合计 103
+（占位）
 #   verify --fast         9 门全 PASS；status verdict = PASS，evidence dir = verify-ae8576aa9da4
 # 共享通道已按 r11 R11-N-3 的要求把这一棵推上 `refs/heads/m0-verify`（`git -C /work/m0-origin.git
 # rev-parse m0-verify` 现在就是 12c9825），所以下一轮评审者不必再自建快照。
@@ -1282,7 +1339,7 @@ assertion `left == right` failed: working_tree_digest 两次取值不一致
 对照组：同一份代码加 `-- --test-threads=1` 连跑 4 轮（每轮都强制重建）**全绿**。所以
 - 红的是 **nexus-harness 自己的** `env::tests::digests_deterministic_and_sha1_length`，
   不是 gateway 的夹具；本批在被评审的那棵树（8a67e85）上是 70 条 gateway 单测，与 9 条场景
-各自都绿。
+各自都绿（最终树上已经是 73 条，见上面 bindings 与 D 轮表头）。
 - 机制**不是**墙钟/时间夹具（我早先写的"静态嫌疑：`run_parallel_keeps_order_and_verdicts`
   的 sleep 交错"那条是猜的，且猜错了对象），而是**并行测试里对同一个 live repo 并发调
   git**，`working_tree_digest()` 那一路拿不到结果 ⇒ **降级成哨兵 `tree-unknown`**，而这条

@@ -189,7 +189,7 @@ r5 R5-W-4 的诉求由**定长**满足而不是由"从不有界变有界"满足�
 去掉之后这条不变式重新成立。观测面补齐：`throttle_locks()`（锁表存活项数）与
 `throttle_buckets()` 一起让"表项有界"对**锁表那一半**也有可红对象（此前全仓不可读）。
 实测覆盖（本批 D 轮复验；树号与全量 bindings 只记在案卷《M1 第十一片》的 D 轮一节，契约里
-不写 sha，免得这一行自己改动就把它声称的那棵树弄没了）：关掉那支 ⇒ 72 单测全绿、auth-throttle 的 26 条期望字段无一翻转（这与上面的
+不写 sha，免得这一行自己改动就把它声称的那棵树弄没了）：关掉那支 ⇒ 73 单测全绿、auth-throttle 的 27 条期望字段无一翻转（这与上面的
 不可达性一致，不是"测试没覆盖到"）；把过期锁回收改成恒真 ⇒ 只有
 `expired_locks_are_reclaimed_instead_of_escalating_to_the_global_window` 红（评审 r7
 R7-W-3 改判 NOTE）。把两支并列写成"两道 fail-closed 机制"就是谎报。
@@ -304,18 +304,18 @@ principal 裁到 `AUDIT_FIELD_MAX_BYTES`——两条 principal 若前 256 字节
 `authenticate` 的令牌比较全部经过 `FileEngine::token_eq`，计数也就挂在那一处。
 三件事的分层结论（**provenance 各自标明，r10 R10-N-2 抓到过这里两份文档打过架**）：
 删掉计数（P6）⇒ 单测与期望 `token_comparisons_short_circuit_when_locked` 红；删掉锁定
-预检（M10b）⇒ 在本批 D 轮复验树上是 **11 条单测红 + 11 条冻结期望翻转**——这两支由实现方
-在复验树上手跑（8a67e85 那一次是 10/10，多的那一条正是后来新增的地址表示漂移单测，它同样
-依赖"锁定先于比较"）。
+预检（M10b）⇒ 在本批 D 轮复验树上是 **12 条单测红 + 12 条冻结期望翻转**——这两支由实现方
+在复验树上手跑（8a67e85 那一次是 10/10、加漂移单测后 11/11、再加 pair 侧数量对象后 12/12；
+每多一条都是因为新测试同样依赖"锁定先于比较"）。
 **绕开** `token_eq` 直接比较（F）实现方本轮**未**复跑，由评审 r10 在同一棵复验树上代跑
 证实：在这套 `[workspace.lints.rust] warnings = "deny"` 下 `token_eq` 成为 dead-code，
 **编译不过**（实测 `error: method `token_eq` is never used`，且 `cargo check
 --all-targets` 连 test profile 一起红），所以"多一个比较点"是构建期挡住的、不是靠测试
 （清单与逐条推导见 `.evidence/review-gateway-file-r9/findings.md` §3 与案卷第十一片的
 D 轮变异表）。
-这里要留一条诚实的痕迹：M10b 那个数字在本链出现过**五个**值——8 红/4 翻转（第十片正文）、
+这里要留一条诚实的痕迹：M10b 那个数字在本链出现过**六个**值——8 红/4 翻转（第十片正文）、
 8 红/5 翻转（同片变异表）、r9 静态重推 9/9、8a67e85 实测 10/10（r10 独立复现）、
-c5d0918 实测 11/11。`idle_recycle_clears_no_throttle_state` 一直是唯一不红的既有锁定测试，
+c5d0918 实测 11/11、最终 D 轮树 b9ebbe4 实测 12/12。`idle_recycle_clears_no_throttle_state` 一直是唯一不红的既有锁定测试，
 它的 THROTTLED 来自 `record_failure` 的武装返回值而非预检；9 → 10 的差集按名字逐条对过
 （对法：在 r9 读的那棵树里把它给的九个行号逐个回推到 fn 名），是为 R9-W-2 新增的那条源锁表
 门禁单测，而空地址那条在 M10b 下**不红**（守卫在预检之前）。按本链既定口径**以实测为准**，
@@ -361,7 +361,9 @@ principal/source 的长度在进入摘要前不设上界（任意长身份 ⇒ O
 都必须回滚（r3 R3-W-1）。`settle_file` 只看队头，不得越过未落地的消息提前退额度
 （r3 R3-W-4）。`inflight_bytes == budget.file_buffered_for(session)` 是引擎自证的不变量。
 `source` 这个键本批之后同时被**五件事**依赖（评审 r11 R11-W-2：早先三份文档各数各的——代码
-doc 与探针注释数成三处、本节数成四件事、案卷又换了一份名单，全都少算了同一摘要键里的另一半）：
+doc 与探针注释数成三处、本节数成四件事、案卷又换了一份名单，全都少算了同一摘要键里的另一半；
+r12 R12-W-1 接着指出"另一半"的后果只钉住了机制、没钉住数量，于是补了
+`same_principal_with_two_address_spellings_doubles_the_pair_threshold` 与同名冻结期望）：
 per-peer 会话配额、单源失败额度、源锁、`close_session` 的归属证明，以及 `(主体,源)` **摘要键的
 源那一半**——最后这一处最容易漏：表示漂移不只把额度按字符串分账，它同样让**单个身份**在两种
 写法下拿到两个桶，于是 pair 侧的 `lockout_after` 门槛被翻倍。它们共享同一条前提，也必须一起登记：**wire 层送来的
