@@ -105,6 +105,8 @@ impl std::error::Error for TurnError {}
 pub trait TurnHandle: Send {
     /// 发送 Refresh 续租。
     fn refresh(&self) -> io::Result<()>;
+    /// 显式释放 TURN Allocation（RFC 5766 LIFETIME=0）；best-effort。
+    fn release(&mut self) -> io::Result<()>;
     /// 中继分配地址。
     fn relayed_addr(&self) -> SocketAddr;
     /// 服务器观察到的 reflexive 地址（打洞候选）。
@@ -118,6 +120,10 @@ pub trait TurnHandle: Send {
 impl TurnHandle for TurnClient {
     fn refresh(&self) -> io::Result<()> {
         TurnClient::refresh(self)
+    }
+
+    fn release(&mut self) -> io::Result<()> {
+        TurnClient::deallocate(self)
     }
 
     fn relayed_addr(&self) -> SocketAddr {
@@ -385,7 +391,14 @@ impl TurnManager {
             eprintln!(
                 "[nat-switch] WARN: TURN refresh failed {n} consecutive times ({e}); warm backup dead, releasing allocation"
             );
-            self.client = None;
+            // C2：显式 Deallocate（RFC 5766 §7.3：Refresh LIFETIME=0），best-effort。
+            // `take()` 已把 `self.client` 置为 `None`；失败时服务端也会在自身计时器到期后
+            // 过期该 allocation，因此这里只记录 WARN，不阻断降级。
+            if let Some(mut c) = self.client.take() {
+                if let Err(e) = c.release() {
+                    eprintln!("[nat-switch] WARN: TURN deallocate (LIFETIME=0) failed ({e}); server-side allocation will expire on its own timer");
+                }
+            }
             self.state = TurnState::Expired;
             self.next_refresh_at = None;
         } else {
@@ -417,7 +430,12 @@ impl TurnManager {
 
     /// 释放 TURN 资源并进入 `Disabled`（退出路径，幂等）。
     pub fn shutdown(&mut self) {
-        self.client = None;
+        // C2：显式 Deallocate（RFC 5766 LIFETIME=0），best-effort。
+        if let Some(mut c) = self.client.take() {
+            if let Err(e) = c.release() {
+                eprintln!("[nat-switch] WARN: TURN deallocate (LIFETIME=0) failed ({e}); server-side allocation will expire on its own timer");
+            }
+        }
         self.state = TurnState::Disabled;
         self.consecutive_refresh_failures = 0;
         self.next_refresh_at = None;
@@ -438,6 +456,8 @@ mod tests {
     use super::*;
     use nexus_turn::client::TurnCredentials;
     use nexus_turn::server::TurnServer;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     fn creds() -> TurnCredentials {
         TurnCredentials {
@@ -499,6 +519,9 @@ mod tests {
             fn refresh(&self) -> io::Result<()> {
                 Err(io::Error::other("turn server unreachable"))
             }
+            fn release(&mut self) -> io::Result<()> {
+                Ok(())
+            }
             fn relayed_addr(&self) -> SocketAddr {
                 "192.0.2.1:54320".parse().unwrap()
             }
@@ -547,6 +570,9 @@ mod tests {
                 Err(io::Error::other(
                     "turn refresh: unexpected response 0x0113 438 Stale Nonce",
                 ))
+            }
+            fn release(&mut self) -> io::Result<()> {
+                Ok(())
             }
             fn relayed_addr(&self) -> SocketAddr {
                 "192.0.2.1:54320".parse().unwrap()
@@ -607,6 +633,115 @@ mod tests {
         assert!(mgr.ensure_allocated().is_err());
         assert_eq!(mgr.state(), TurnState::Disabled);
         assert!(!mgr.is_active());
+        assert_eq!(mgr.refresh_if_needed(), RefreshOutcome::Inactive);
+    }
+
+    /// C2：`shutdown()` 显式释放 Allocation（LIFETIME=0 Deallocate），状态 → Disabled。
+    #[test]
+    fn shutdown_releases_allocation() {
+        struct RecordingHandle {
+            released: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl TurnHandle for RecordingHandle {
+            fn refresh(&self) -> io::Result<()> {
+                Ok(())
+            }
+            fn release(&mut self) -> io::Result<()> {
+                self.released.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+            fn relayed_addr(&self) -> SocketAddr {
+                "192.0.2.1:54320".parse().unwrap()
+            }
+            fn mapped_addr(&self) -> Option<SocketAddr> {
+                None
+            }
+            fn is_expired(&self) -> bool {
+                false
+            }
+            fn as_turn_client(&self) -> Option<TurnClient> {
+                None
+            }
+        }
+
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let released_for_factory = released.clone();
+        let factory: TurnFactory = Box::new(move || {
+            Ok(Box::new(RecordingHandle {
+                released: released_for_factory.clone(),
+            }))
+        });
+        let cfg = section("127.0.0.1:3478".parse().unwrap(), 300);
+        let mut mgr = TurnManager::with_factory(Some(cfg), factory);
+        mgr.ensure_allocated().expect("allocate should succeed");
+        assert!(mgr.is_active());
+
+        mgr.shutdown();
+        assert!(
+            released.load(Ordering::Relaxed),
+            "shutdown must send LIFETIME=0 Deallocate"
+        );
+        assert_eq!(mgr.state(), TurnState::Disabled);
+        assert!(!mgr.is_active());
+    }
+
+    /// C2：3-strike 死亡判定时显式释放 Allocation（LIFETIME=0 Deallocate）。
+    #[test]
+    fn three_strikes_send_deallocate() {
+        struct FailingHandle {
+            released: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl TurnHandle for FailingHandle {
+            fn refresh(&self) -> io::Result<()> {
+                Err(io::Error::other("turn server unreachable"))
+            }
+            fn release(&mut self) -> io::Result<()> {
+                self.released.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+            fn relayed_addr(&self) -> SocketAddr {
+                "192.0.2.1:54320".parse().unwrap()
+            }
+            fn mapped_addr(&self) -> Option<SocketAddr> {
+                None
+            }
+            fn is_expired(&self) -> bool {
+                true
+            }
+            fn as_turn_client(&self) -> Option<TurnClient> {
+                None
+            }
+        }
+
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let released_for_factory = released.clone();
+        let factory: TurnFactory = Box::new(move || {
+            Ok(Box::new(FailingHandle {
+                released: released_for_factory.clone(),
+            }))
+        });
+        let cfg = section("127.0.0.1:3478".parse().unwrap(), 300);
+        let mut mgr = TurnManager::with_factory(Some(cfg), factory);
+        mgr.ensure_allocated().expect("allocate should succeed");
+        assert!(mgr.is_active());
+
+        mgr.next_refresh_at = Some(Instant::now());
+        assert_eq!(mgr.refresh_if_needed(), RefreshOutcome::Failed(1));
+        assert!(mgr.is_active(), "still warm backup after 1st failure");
+
+        mgr.next_refresh_at = Some(Instant::now());
+        assert_eq!(mgr.refresh_if_needed(), RefreshOutcome::Failed(2));
+        assert!(mgr.is_active(), "still warm backup after 2nd failure");
+
+        mgr.next_refresh_at = Some(Instant::now());
+        assert_eq!(mgr.refresh_if_needed(), RefreshOutcome::Failed(3));
+        assert_eq!(mgr.state(), TurnState::Expired);
+        assert!(!mgr.is_active());
+        assert!(mgr.client.is_none(), "allocation must be released");
+        assert!(
+            released.load(Ordering::Relaxed),
+            "3-strike path must send LIFETIME=0 Deallocate"
+        );
         assert_eq!(mgr.refresh_if_needed(), RefreshOutcome::Inactive);
     }
 }

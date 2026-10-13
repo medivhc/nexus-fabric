@@ -256,6 +256,36 @@ impl TurnClient {
         Ok(())
     }
 
+    /// Delete the allocation (RFC 5766 §7.3): Refresh with LIFETIME = 0.
+    /// Best-effort: returns Err on transport failure; the server will
+    /// additionally expire the allocation on its own timer.
+    pub fn deallocate(&self) -> io::Result<()> {
+        let req = StunMessage::new(REFRESH_REQUEST).attr(Attribute::Lifetime(0));
+        let mut inner = self.lock()?;
+        let resp = match inner.transact(req, REQUEST_TIMEOUT) {
+            Ok(r) => r,
+            Err(e) => {
+                inner.expires_at = Instant::now();
+                inner
+                    .stats
+                    .allocation_expired
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(e);
+            }
+        };
+        if resp.msg_type != REFRESH_SUCCESS {
+            inner.expires_at = Instant::now();
+            inner
+                .stats
+                .allocation_expired
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(unexpected(&resp, "refresh"));
+        }
+        // LIFETIME=0 成功：分配已删除，标记为立即过期（不续租）。
+        inner.expires_at = Instant::now();
+        Ok(())
+    }
+
     /// 中继分配地址（`TurnSocket::local_addr` 与 E4 拨号目标用它）。
     pub fn relayed_addr(&self) -> SocketAddr {
         self.lock()
