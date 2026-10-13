@@ -93,6 +93,19 @@ description: 在 Nexus 仓库内执行一次端到端工程任务时使用（修
 
 9. **输出 Candidate Completion 报告**：格式见 `nexus-evidence` 技能。报告不是 Final PASS——最终 PASS 必须由 Harness/Verifier 产生。
 
+10. **记录人工插手清单**：任务收尾时（Candidate Completion 报告之后），记录本轮任务中人类替 Agent 做了哪些"本该 Agent 自己做"的事。清单附在任务总结里（或 `.evidence/` 下的 `intervention-<task-id>.md`），格式：
+
+    ```text
+    人工插手清单：
+    - 人工纠正：……（如转录抄错、逻辑偏差被当场纠正）
+    - 重讲背景：……（同一背景讲了 2 遍以上）
+    - 工具/数据源转述：……（替 Agent 在工具或数据源之间搬运信息）
+    - 手动验证：……（人工替 Agent 跑了验证、对比、readback）
+    原因分类：传话筒 / 反复纠正 / 重讲背景 / 手动验证
+    ```
+
+    记录原则：只记真实发生的，不记"本该但没发生"的；一条插手若同时符合多类，只归最主因的一类。同一类人工插手在 3 个以上任务里重复出现 → 提议固化为 skill 条目或 lint 规则（参考 `nexus-multiagent` 协调者的扫描职责）。
+
 ## 关键规则
 
 - 遇到以下情况必须停止实现并报告 BLOCKED/UNKNOWN：契约与 Scenario 冲突；必须修改冻结期望才能实现；新依赖产生未批准架构边；Portable Core 被迫直接调用平台 API；唯一通过方式是删除独立验证；无法产生 fresh Evidence；Workspace 修改可能删除仍可达数据；并发设计无法确定 Outcome 唯一 Owner；新持久状态没有 Crash Recovery 语义。
