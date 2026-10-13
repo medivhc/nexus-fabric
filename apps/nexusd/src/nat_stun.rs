@@ -9,6 +9,11 @@
 //!
 //! 5 分钟重采样由调用方（`main.rs`）驱动：本模块只声明 `STUN_REFRESH_INTERVAL`
 //! 节奏，不自行创建长期任务（§13 结构化并发：Worker 由组合根拥有）。
+
+//! Tech debt (W-1)：`unix_ms` / 事务 ID 熵 / `UdpStunTransport` 累计超时直接使用
+//! `SystemTime`/`Instant`。DESIGN.md §11 决议 6 的时钟注入约束针对协议 core
+//! crate；本模块是 daemon-edge 的 STUN 探测（端口样本时间戳仅用于 Δ 排序，
+//! 无需虚拟时间确定性）。工作区统一 `Clock` 抽象落地后随之迁移。
 //!
 //! # 临时说明（BLOCKED）
 //! `main.rs` 的完整 NAT 接线依赖 `nat_turn.rs`（TURN 客户端依赖尚未获批，
@@ -113,11 +118,20 @@ impl StunTransport for UdpStunTransport {
         self.socket.set_read_timeout(Some(timeout))?;
         self.socket.send_to(request, server)?;
         let mut buf = [0u8; 1024];
+        // W-4：累计超时——`set_read_timeout` 是每 syscall 重启计时的，公网脏包
+        // flood 会让总耗时远超 `timeout`；循环外记录起点，累计超时即返回。
+        // （时间源说明见 W-1 tech-debt 注释。）
+        let start = std::time::Instant::now();
         loop {
             match self.socket.recv_from(&mut buf) {
                 // 只接受来自目标服务器的响应（丢弃脏包/迟到包，继续等）。
                 Ok((n, from)) if from == server => return Ok(buf[..n].to_vec()),
-                Ok((_, _)) => continue,
+                Ok((_, _)) => {
+                    if start.elapsed() >= timeout {
+                        return Err(StunError::Timeout);
+                    }
+                    continue;
+                }
                 Err(e)
                     if e.kind() == io::ErrorKind::WouldBlock
                         || e.kind() == io::ErrorKind::TimedOut =>

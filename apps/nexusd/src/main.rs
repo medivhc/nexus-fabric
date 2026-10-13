@@ -411,6 +411,11 @@ struct NatSwitchRuntime {
     stun: nat_stun::StunProber,
     sw: Arc<nexusd::nat_switch::NatSwitching>,
     _driver: Arc<Driver>,
+    /// Tech debt (W-2)：协作式退出标志。未用 `CancellationToken` 是因为 nexusd
+    /// 没有 tokio/tokio-util 依赖，为这一个标志引入异步运行时不划算。AC5 的
+    /// 5s 优雅退出仍有界：worker 内所有阻塞操作都有超时（TURN 请求 3s、STUN
+    /// 探测 2s、主循环 500ms 轮询），且退出前只做 best-effort 的释放调用；
+    /// 最坏情况 SIGTERM → 线程退出 < 5s。
     stop: Arc<AtomicBool>,
     /// STUN 端口样本滚动历史（供 D2 有界端口预测的 Δ 稳定性判定；上限
     /// `MAX_PORT_SAMPLES`，由 5min 刷新循环追加）。

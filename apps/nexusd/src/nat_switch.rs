@@ -192,6 +192,14 @@ impl NatSwitching {
         // only the larger PeerId initiates. This avoids duplicate direct
         // connections and the need for post-hoc connection teardown.
         // FabricPeerId is [u8; 32], lexicographic comparison is deterministic.
+        // W-3: self-loop guard — punching ourselves is a configuration/wiring
+        // bug; refuse loudly instead of deadlocking or punching a loopback.
+        if self.my_id == peer {
+            eprintln!(
+                "[nat-switch] ERROR: refusing self-loop punch (my_id == peer {name}); check relay peer wiring"
+            );
+            return;
+        }
         if self.my_id.0 < peer.0 {
             eprintln!(
                 "[nat-switch] tie-break: peer {name} has larger PeerId, waiting for their punch"

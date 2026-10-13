@@ -14,6 +14,11 @@
 //! 可测试性：`TurnHandle` trait 把真实 `TurnClient` 与测试替身分成两个独立变化
 //! 维度（Deletion Test：真实 TURN 服务器与离线 mock 都需要被策略层驱动）。
 
+//! Tech debt (W-1)：本模块直接使用 `std::time::Instant::now()` 做 Refresh
+//! 节奏调度。DESIGN.md §11 决议 6 的时钟注入约束针对协议 core crate；本模块是
+//! daemon-edge 的生命周期管理（非协议 core），且时间为单调时钟（无墙钟语义）。
+//! 若工作区后续统一引入 `Clock` trait（已分流为待决策项），本模块随之迁移。
+
 #![allow(dead_code)]
 
 use std::io;
@@ -475,10 +480,15 @@ impl TurnManager {
 
 /// 判断 Refresh 错误是否为 438 Stale Nonce。
 ///
-/// `nexus_turn::client` 的 `refresh` 在收到非成功响应时返回的 `io::Error`
-/// Display 包含错误码（如 `438 Stale Nonce`）。
+/// W-5：不用裸 `contains("438")`（会误命中如端口 1438 之类的数字），而是匹配
+/// 完整词组 `"438 Stale Nonce"`。依据的格式契约：`nexus_turn::client` 的
+/// `unexpected()` 把错误响应格式化为
+/// `"turn {op}: unexpected response 0x{msg:04x} {class}{num:02} {reason}"`，
+/// 其中 438 的 reason 为 RFC 5389 标准词组 "Stale Nonce"。
+/// 完全类型化的 `TurnError::StaleNonce` 需要把 `TurnClient::refresh` 的公开
+/// `io::Result` 签名改掉——超出本次范围，记为后续工作。
 fn is_stale_nonce(e: &io::Error) -> bool {
-    e.to_string().contains("438")
+    e.to_string().contains("438 Stale Nonce")
 }
 
 #[cfg(test)]
@@ -505,6 +515,7 @@ mod tests {
             password: "test-secret".into(),
             refresh_interval_sec,
             stun_server: None,
+            stun_server2: None,
         }
     }
 
@@ -644,6 +655,7 @@ mod tests {
             password: "secret".into(),
             refresh_interval_sec: 300,
             stun_server: None,
+            stun_server2: None,
         };
         let mgr = TurnManager::new(Some(cfg));
         assert_eq!(mgr.state(), TurnState::Disabled);
