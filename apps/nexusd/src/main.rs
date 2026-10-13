@@ -254,8 +254,11 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use nexus_fabric::Driver;
+use nexus_fabric::{Driver, PeerId as FabricPeerId};
 use nexus_nat_traversal::LocalCandidates;
+// C1：权威 fabric 身份来自 daemon 自己的 `network.toml`（`peer_id` = 64-hex
+// ed25519 公钥）；解析发生在组合根，不在 NAT 运行时内部。
+use nexus_network::n1::{config::N1Config, N1PeerId};
 
 use nexusd::assembly;
 use nexusd::config::{self, ConfigDir, LoadedConfig, TurnSection};
@@ -390,10 +393,19 @@ fn run_dataplane(
 /// - 按节奏 Refresh 保活（AC3）；
 /// - 周期性 STUN 采样（5min），更新本地候选与 NAT 类型分支（AC4）。
 ///
-/// 诚实边界：nexusd 的 N1 mesh 连接不暴露 `fabric::ConnShared`，因此
-/// `NatSwitching::on_relay_connected` 的生产喂入（D5）需要更深的 mesh/fabric
-/// 集成（超出本任务 5 文件范围）；本运行时先激活 NAT 路径决策引擎（AC5：
-/// 配置开关可验证开启/关闭），并保留 `sw` 供后续 relay 钩子调用。
+/// 诚实边界：
+/// - 本运行时的 fabric 身份（`my_id`）与 punch `Driver` 由组合根（`run_daemon`）
+///   在启动时一次性解析并注入：`my_id` 来自 daemon 自己的 `network.toml`
+///   `peer_id`（64-hex ed25519 公钥），**不会**在运行时内部铸造随机身份。
+/// - punch `Driver` 同时充当 punch responder 的 server 端点；N1 mesh 的
+///   dialer 使用 per-dial 临时 socket（`FabricDialer` 每次拨号新建 socket），
+///   不暴露共享 server socket，因此 mesh 数据面与打洞共用同一 UDP socket
+///   （AC6 严格字面）需要更深的 mesh/fabric 集成——作为跨模块后续工作记录，
+///   不在本任务内静默模拟。
+/// - nexusd 的 N1 mesh 连接不暴露 `fabric::ConnShared`，因此
+///   `NatSwitching::on_relay_connected` 的生产喂入（D5）需要更深的 mesh/fabric
+///   集成（超出本任务 5 文件范围）；本运行时先激活 NAT 路径决策引擎（AC5：
+///   配置开关可验证开启/关闭），并保留 `sw` 供后续 relay 钩子调用。
 struct NatSwitchRuntime {
     turn: nat_turn::TurnManager,
     stun: nat_stun::StunProber,
@@ -408,7 +420,16 @@ impl NatSwitchRuntime {
     /// `shutdown` 是 daemon 全局关闭标志：worker 在收到 SIGTERM/SIGINT 后
     /// 协作式退出（与 dataplane/LocalAPI 线程同源）。返回 worker
     /// `JoinHandle`（主线程在 [`shutdown_sequence`] 中 join）；运行时被移入 worker。
-    fn start(section: &TurnSection, shutdown: Arc<AtomicBool>) -> Option<JoinHandle<()>> {
+    ///
+    /// `driver` 与 `my_id` 由组合根注入（见 [`NatSwitchRuntime`] 诚实边界）：
+    /// `driver` 是 punch responder 的 fabric server 端点，`my_id` 是 daemon 的
+    /// 权威 mesh 身份（来自 `network.toml` 的 `peer_id`）。
+    fn start(
+        section: &TurnSection,
+        shutdown: Arc<AtomicBool>,
+        driver: Arc<Driver>,
+        my_id: FabricPeerId,
+    ) -> Option<JoinHandle<()>> {
         // TURN 生命周期管理器（配置缺失时由调用方保证为 Some）。
         let turn = nat_turn::TurnManager::new(Some(section.clone()));
 
@@ -425,24 +446,6 @@ impl NatSwitchRuntime {
             }
         };
         let stun = nat_stun::StunProber::new(stun_transport);
-
-        // NAT 打洞 fabric driver：独立 UDP socket + 随机 ed25519 身份。
-        // （真实部署应复用 mesh 的 fabric 身份/连接，属于后续集成。）
-        let driver = match Driver::new_server("0.0.0.0:0".parse().expect("0.0.0.0:0 parses")) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!(
-                    "[nat-switch] WARN: fabric driver bind failed ({e}); nat-switch disabled, punch disabled"
-                );
-                return None;
-            }
-        };
-        let Some(my_id) = driver.shared().peer_id else {
-            eprintln!(
-                "[nat-switch] WARN: fabric driver has no peer id; nat-switch disabled, punch disabled"
-            );
-            return None;
-        };
 
         let local = LocalCandidates {
             host: nexusd::nat_switch::gather_host_candidates(&driver),
@@ -759,11 +762,44 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     //      `[network.turn]` 配置存在时启动后台 worker（daemon 共享 shutdown 标志，
     //      收到 SIGTERM/SIGINT 后协作式退出）；启动/绑定失败 → WARN + 降级，
     //      不阻断进程，LocalAPI 照常服务（诚实边界见 `NatSwitchRuntime` 文档）。
-    let nat_switch_handle = loaded
-        .daemon
-        .turn
-        .as_ref()
-        .and_then(|s| NatSwitchRuntime::start(s, Arc::clone(&shutdown)));
+    //
+    // C1：权威 fabric 身份在组合根一次性解析——`network.toml` 的 `peer_id`
+    // （必需字段，64-hex ed25519 公钥）经 `N1Config::parse_toml` 取出并转换为
+    // `FabricPeerId`；punch `Driver` 也在组合根创建。`network.toml` 缺失或
+    // 解析失败 → WARN + 跳过 nat-switch（无权威身份时打洞无法关联 offer）。
+    let nat_switch_handle = loaded.daemon.turn.as_ref().and_then(|section| {
+        let n1_peer_id = match loaded.network_toml.as_deref() {
+            Some(text) => match N1Config::parse_toml(text) {
+                Ok(cfg) => {
+                    let n1_peer_id: N1PeerId = cfg.peer_id;
+                    n1_peer_id
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[nat-switch] WARN: network.toml parse failed ({e}); nat-switch disabled (no authoritative fabric identity)"
+                    );
+                    return None;
+                }
+            },
+            None => {
+                eprintln!(
+                    "[nat-switch] WARN: network.toml absent; nat-switch disabled (no authoritative fabric identity)"
+                );
+                return None;
+            }
+        };
+        let my_id = FabricPeerId(n1_peer_id.0);
+        let driver = match Driver::new_server("0.0.0.0:0".parse().expect("0.0.0.0:0 parses")) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!(
+                    "[nat-switch] WARN: fabric driver bind failed ({e}); nat-switch disabled, punch disabled"
+                );
+                return None;
+            }
+        };
+        NatSwitchRuntime::start(section, Arc::clone(&shutdown), driver, my_id)
+    });
 
     // 6. 配置 watcher（后台线程；主线程拥有 JoinHandle，不直接改共享状态）。
     let (ev_tx, ev_rx) = channel();

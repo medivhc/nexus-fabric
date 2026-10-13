@@ -1693,6 +1693,7 @@ dependencies = [
  "nexus-service",
  "nexus-session",
  "nexus-storage",
+ "nexus-turn",
  "nexus-workspace",
  "serde_json",
  "sha1",
