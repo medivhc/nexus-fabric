@@ -227,8 +227,6 @@ impl NatSwitching {
 
     /// Register a punched direct connection as a racing candidate.
     ///
-    /// Register a punched direct connection as a racing candidate.
-    ///
     /// Note: tie-break is enforced at punch initiation time (see
     /// [`Self::on_relay_connected`]): only the larger PeerId initiates,
     /// so duplicate simultaneous punches do not occur by construction.
