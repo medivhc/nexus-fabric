@@ -1200,8 +1200,15 @@ r11 落地之后的复验（同一宿主与工具链，`status --json` 实测，
 #   contract_hash         2219448ed81870cbf67d1b4bd6cf93c63e5c51f4
 #   cargo test --lib      72 passed; 0 failed / verify --fast = 9 门全 PASS
 #   status verdict = PASS，evidence dir = verify-c18dcfd17b67，dirty_state = false
-# ⇒ 上一段那句"12c9825 之后还有案卷文字"的悬空状态已被消掉：通道上的 ref 现在与分支 HEAD
-#   逐字节相同，任何评审者 `git fetch` 就能拿到带本案卷的整棵树。
+# ⇒ 上一段那句"12c9825 之后还有案卷文字"的悬空状态已被消掉。**规则也一并改成相对写法**，
+#   因为绝对写法必然过期：每落一个提交就执行一次
+#   `git push -f ssh://appen@10.144.144.4/work/m0-origin.git HEAD:refs/heads/m0-verify`，
+#   于是通道上的 ref **恒等于分支 HEAD**，评审者 fetch 一次就拿到带全部案卷的整棵树，不必
+#   scp 快照自建等价树。上面那组数（72 / 9 门 PASS / digest 00278ca9… / verify-c18dcfd17b67）
+#   是在 7e71e3a 那一棵上量的；其后若 ref 前移，判据不变的前提是差值只有案卷文字——这条
+#   每次都要用 `git diff <被量的树> HEAD -- crates/nexus-web-gateway/src
+#   crates/nexus-web-gateway/examples scenarios` 滤掉注释行后为空来核，不靠"应该是散文吧"。
+
 
 
 
