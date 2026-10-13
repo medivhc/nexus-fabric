@@ -69,6 +69,8 @@ pub enum RefreshOutcome {
     Refreshed,
     /// 收到 438 Stale Nonce，已携带新 Nonce 自动重试成功。
     StaleNonceRetried,
+    /// 438 重试中的重新 Allocate 失败 → 已走分配失败路径（Disabled 降级）。
+    ReallocateFailed,
     /// 刷新失败（参数为当前连续失败次数）。
     Failed(u32),
     /// 管理器处于非活动状态（Disabled/Expired/未分配）。
@@ -170,6 +172,9 @@ pub struct TurnManager {
     factory: TurnFactory,
     /// 连续 Refresh 失败次数（AC3 3-strike）。
     consecutive_refresh_failures: u32,
+    /// 本轮 438 Stale Nonce 是否已重试过（C-3：单次 Refresh 周期最多重试 1 次，
+    /// 防恶意/故障服务端 438 死循环；仅在干净 Refresh 成功后复位）。
+    stale_nonce_retried: bool,
     /// 下次 Refresh 时间点。
     next_refresh_at: Option<Instant>,
     /// 分配的保活间隔（来自配置的 refresh_interval_sec）。
@@ -191,6 +196,7 @@ impl TurnManager {
                     Err(io::Error::new(io::ErrorKind::NotFound, "turn unconfigured"))
                 }),
                 consecutive_refresh_failures: 0,
+                stale_nonce_retried: false,
                 next_refresh_at: None,
                 refresh_interval: Duration::from_secs(300),
             },
@@ -210,6 +216,7 @@ impl TurnManager {
                             client: None,
                             factory: real_factory(server, creds),
                             consecutive_refresh_failures: 0,
+                            stale_nonce_retried: false,
                             next_refresh_at: None,
                             refresh_interval,
                         }
@@ -231,6 +238,7 @@ impl TurnManager {
                                 ))
                             }),
                             consecutive_refresh_failures: 0,
+                            stale_nonce_retried: false,
                             next_refresh_at: None,
                             refresh_interval,
                         }
@@ -259,6 +267,7 @@ impl TurnManager {
             client: None,
             factory,
             consecutive_refresh_failures: 0,
+            stale_nonce_retried: false,
             next_refresh_at: None,
             refresh_interval,
         }
@@ -316,6 +325,7 @@ impl TurnManager {
                 self.client = Some(client);
                 self.state = TurnState::Active;
                 self.consecutive_refresh_failures = 0;
+                self.stale_nonce_retried = false;
                 self.next_refresh_at = self.schedule_next_refresh();
                 eprintln!(
                     "[nat-switch] TURN allocation active: relayed={relayed} refresh_in={:?}",
@@ -356,20 +366,37 @@ impl TurnManager {
             Ok(()) => {
                 self.state = TurnState::Active;
                 self.consecutive_refresh_failures = 0;
+                self.stale_nonce_retried = false;
                 self.next_refresh_at = self.schedule_next_refresh();
                 RefreshOutcome::Refreshed
             }
             Err(e) if is_stale_nonce(&e) => {
-                eprintln!(
-                    "[nat-switch] TURN refresh got 438 Stale Nonce; re-allocating with fresh nonce"
-                );
-                self.retry_stale_nonce()
+                // C-3：单次 Refresh 周期内 438 只重试 1 次；已重试过则按普通
+                // Refresh 失败处理（计入 3-strike），防 438 死循环。
+                if self.stale_nonce_retried {
+                    eprintln!(
+                        "[nat-switch] TURN refresh got 438 Stale Nonce again after retry; treating as ordinary refresh failure"
+                    );
+                    self.handle_refresh_failure(&e)
+                } else {
+                    self.stale_nonce_retried = true;
+                    eprintln!(
+                        "[nat-switch] TURN refresh got 438 Stale Nonce; re-allocating with fresh nonce"
+                    );
+                    self.retry_stale_nonce()
+                }
             }
             Err(e) => self.handle_refresh_failure(&e),
         }
     }
 
-    /// 438 Stale Nonce：重新 Allocate 获取新 Nonce。
+    /// 438 Stale Nonce：重新 Allocate 获取新 Nonce（单次 Refresh 周期最多 1 次）。
+    ///
+    /// 重试成功 → Active；重试失败说明分配本身不可达/认证失败，走分配失败
+    /// 路径（`handle_auth_failure` → Disabled），绝不回退到 Active（C-3）。
+    /// 注意：成功时不复位 `stale_nonce_retried`——若服务端持续返回 438，
+    /// 后续 438 会流入普通 Refresh 失败（3-strike），避免每周期泄漏一个
+    /// 服务端 allocation；仅干净 Refresh 成功才复位。
     fn retry_stale_nonce(&mut self) -> RefreshOutcome {
         match (self.factory)() {
             Ok(new_client) => {
@@ -379,7 +406,10 @@ impl TurnManager {
                 self.next_refresh_at = self.schedule_next_refresh();
                 RefreshOutcome::StaleNonceRetried
             }
-            Err(e) => self.handle_refresh_failure(&e),
+            Err(e) => {
+                self.handle_auth_failure(&e);
+                RefreshOutcome::ReallocateFailed
+            }
         }
     }
 
@@ -618,6 +648,116 @@ mod tests {
         let mgr = TurnManager::new(Some(cfg));
         assert_eq!(mgr.state(), TurnState::Disabled);
         assert!(!mgr.is_active());
+    }
+
+    /// C-3：438 重试中重新 Allocate 失败 → 走分配失败路径（Disabled），
+    /// 绝不回退到 Active；outcome 为 ReallocateFailed。
+    #[test]
+    fn stale_nonce_retry_failure_disables() {
+        struct AlwaysStale;
+        impl TurnHandle for AlwaysStale {
+            fn refresh(&self) -> io::Result<()> {
+                Err(io::Error::other(
+                    "turn refresh: unexpected response 0x0113 438 Stale Nonce",
+                ))
+            }
+            fn release(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+            fn relayed_addr(&self) -> SocketAddr {
+                "192.0.2.1:54320".parse().unwrap()
+            }
+            fn mapped_addr(&self) -> Option<SocketAddr> {
+                None
+            }
+            fn is_expired(&self) -> bool {
+                true
+            }
+            fn as_turn_client(&self) -> Option<TurnClient> {
+                None
+            }
+        }
+
+        let cfg = section("127.0.0.1:3478".parse().unwrap(), 300);
+        // allocate 成功（拿到旧 client），但后续 factory（重分配）恒失败。
+        let factory: TurnFactory = Box::new({
+            let n = std::sync::atomic::AtomicU32::new(0);
+            move || {
+                let c = n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if c == 0 {
+                    Ok(Box::new(AlwaysStale) as Box<dyn TurnHandle>)
+                } else {
+                    Err(io::Error::other("turn allocate: network unreachable"))
+                }
+            }
+        });
+        let mut mgr = TurnManager::with_factory(Some(cfg), factory);
+        mgr.ensure_allocated().expect("allocate should succeed");
+        assert!(mgr.is_active());
+
+        mgr.next_refresh_at = Some(Instant::now());
+        let outcome = mgr.refresh_if_needed();
+        assert_eq!(outcome, RefreshOutcome::ReallocateFailed);
+        assert_eq!(
+            mgr.state(),
+            TurnState::Disabled,
+            "re-allocate failure must go to Disabled, never back to Active"
+        );
+        assert!(!mgr.is_active());
+        assert!(mgr.client.is_none());
+    }
+
+    /// C-3：单次 Refresh 周期内 438 只重试 1 次；第二次 438 走普通失败路径，
+    /// 工厂只被调用一次（无 438 死循环）。
+    #[test]
+    fn stale_nonce_second_438_is_ordinary_failure() {
+        struct AlwaysStale;
+        impl TurnHandle for AlwaysStale {
+            fn refresh(&self) -> io::Result<()> {
+                Err(io::Error::other(
+                    "turn refresh: unexpected response 0x0113 438 Stale Nonce",
+                ))
+            }
+            fn release(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+            fn relayed_addr(&self) -> SocketAddr {
+                "192.0.2.1:54320".parse().unwrap()
+            }
+            fn mapped_addr(&self) -> Option<SocketAddr> {
+                None
+            }
+            fn is_expired(&self) -> bool {
+                true
+            }
+            fn as_turn_client(&self) -> Option<TurnClient> {
+                None
+            }
+        }
+
+        let factory_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let factory_calls2 = factory_calls.clone();
+        let factory: TurnFactory = Box::new(move || {
+            factory_calls2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(Box::new(AlwaysStale) as Box<dyn TurnHandle>)
+        });
+        let cfg = section("127.0.0.1:3478".parse().unwrap(), 300);
+        let mut mgr = TurnManager::with_factory(Some(cfg), factory);
+        mgr.ensure_allocated().expect("allocate should succeed");
+        assert_eq!(factory_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        // 第一次 438 → 重试一次，成功。
+        mgr.next_refresh_at = Some(Instant::now());
+        assert_eq!(mgr.refresh_if_needed(), RefreshOutcome::StaleNonceRetried);
+        assert!(mgr.is_active());
+        assert_eq!(factory_calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+        // 新 client 的 refresh 同样 438 → 不再重分配，走普通失败路径。
+        mgr.next_refresh_at = Some(Instant::now());
+        assert_eq!(mgr.refresh_if_needed(), RefreshOutcome::Failed(1));
+        assert_eq!(factory_calls.load(std::sync::atomic::Ordering::Relaxed), 2,
+            "no second re-allocate within the 438 episode");
+        assert!(mgr.is_active(), "still warm backup after 1st ordinary failure");
     }
 
     /// 认证失败（工厂返回 401 风格错误）→ Disabled 降级。
