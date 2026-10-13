@@ -3,7 +3,7 @@ doc-id: code-intelligence-known-issues
 layer: L2
 owner: coordinator
 last-verified: 2026-10-13
-verified-against: 697e9a1
+verified-against: 76cb129
 status: current
 ---
 
@@ -185,7 +185,7 @@ status: current
   （`0a42240 feat`、`f1575b5 fix`、`4b61987 fix`；正确值是 `feature`/`bugfix`/`bugfix`，
   注意 **`bug` 不是合法 type**——我 §V 的更正本身写错过一次，§X 再更正）。
   **状态更新（2026-10-13 推送后）**：这三笔已随 `feature/code-intel-phase-234` 推到
-  `origin`（tip `697e9a1`），所以修正它们不再是"本地 rebase"而是**改写已发布历史 + force-push**。
+  `origin`，所以修正它们不再是"本地 rebase"而是**改写已发布历史 + force-push**。
   该分支目前没有 PR、没有他人协作、`.githooks` 也未安装，技术上 force-push 代价低；
   但这属"改写已发布历史"的破坏性动作 ⇒ 归所有者决定，我没有做。
   现行口径（`97ecbe5` 起执行）：消息文本先过 `pre-commit` 与 `commit-msg`，两个都 exit 0
