@@ -758,6 +758,10 @@ mod tests {
         let mut cfg = valid_config();
         cfg.files = enabled_files(&dir);
         cfg.files.chunk_bytes = 4096;
+        // 窗口也要偏离默认值：变异 MC17（给 `lockout_window_secs` 加 `skip_serializing`）
+        // 在只改 `chunk_bytes` 的夹具上**零单测红**——往返后仍等于默认值，这一格就藏在
+        // 默认值里（覆盖率那节实测到的分层空档：场景抓到了，单测没抓到）。
+        cfg.files.lockout_window_secs = MIN_FILE_LOCKOUT_WINDOW_SECS + 7;
         let json = serde_json::to_string(&cfg).expect("serialize");
         let parsed = GatewayConfig::from_json_str(&json).expect("parse");
         assert_eq!(parsed.files, cfg.files);

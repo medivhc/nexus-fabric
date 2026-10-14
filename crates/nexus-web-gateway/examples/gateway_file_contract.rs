@@ -1653,8 +1653,11 @@ fn gateway_config(f: &mut Map<String, Value>) -> Result<(), String> {
     let ghost = base_config(ghost_root);
     // `FileEngine` 不实现 Debug，所以这里不能 `{other:?}`——探针本身也编译不过就等于
     // 没有这条对象。分三支把"拿到的是什么"写成可执行的错误信息。
+    // 收紧（覆盖率那节的空档）：只写 `Err(Config(_)) => true` 的话，"被别的原因拒"也算过——
+    // 变异 MC18（打开根失败就静默丢掉这个根，最后由"至少要有一个根"兜住）照样给
+    // `Err(Config)`，那一格就不会翻。红因必须是**路径检查本身**。
     let missing_path_rejected = match ghost.file_engine() {
-        Err(GatewayError::Config(_)) => true,
+        Err(GatewayError::Config(msg)) => msg.contains("files.roots"),
         Err(other) => {
             return Err(format!("不存在的根必须以 Config 错误被拒，拿到 {other}"));
         }

@@ -1,0 +1,197 @@
+{
+  "schema_version": 1,
+  "review": "nexus-web-gateway 文件面配置接线 · 独立评审 r13",
+  "round": "r13",
+  "reviewer": "independent-subagent",
+  "model_actual": "qmodel_latest（运行时给的模型标识即此；会话环境行写的是 'Model: qmodel_latest'。我没有更细的标识可报，不猜底层型号。）",
+  "verdict": "COMMENTED",
+  "head_reviewed": "290c6f4a7c4d36e53daf6143fff804eb0fccaf57",
+  "parent": "89b7047",
+  "branch": "feature/gateway-file-service-contracts",
+  "hosts": {
+    "windows": {
+      "os": "Windows 10.0.19045 (MINGW64_NT-10.0-19045, Git Bash 3.4.10-2e2ef940.x86_64)",
+      "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+      "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)",
+      "git": "git version 2.46.0.windows.1",
+      "note": "本机不用于编译该 crate（ssh2 0.9.6 userauth_pubkey_memory 的 cfg 门）。只读文件与跑 grep/python 无。"
+    },
+    "linux_gate": {
+      "host": "ssh appen@10.144.144.4 (xc-pc-linux) Linux 5.15.0-139-generic #149~20.04.1-Ubuntu SMP x86_64",
+      "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+      "cargo": "cargo 1.98.1 (797e8a9bc 2026-08-05)",
+      "git": "git version 2.25.1",
+      "python3": "3.8.10（无 tomllib，用 tomli）",
+      "isolation": "git clone --no-hardlinks --branch m0-verify /work/m0-origin.git /work/r13-audit（自建，未复用他人树）；所有 cargo 命令带 CARGO_TARGET_DIR=/work/r13-target（自建隔离 target）",
+      "ref_verified": "refs/heads/m0-verify = 290c6f4a7c4d36e53daf6143fff804eb0fccaf57，与 Windows 工作树 HEAD 一致",
+      "wsl": "未使用 WSL 出任何门禁结论"
+    }
+  },
+  "questions": [
+    {
+      "id": "Q1",
+      "question": "补上来的对象到底有没有杀伤",
+      "answer": "有杀伤（但为『标签型杀伤』，见 WARN-1）",
+      "measured": true
+    },
+    {
+      "id": "Q2",
+      "question": "现时态宣称与实现是否逐条对上",
+      "answer": "三处新写的句子逐条对上，且『Gateway::start 还没消费 file_engine()』是真的（零调用点实测）；唯一过界的是『唯一构造入口』的措辞，见 WARN-2。无 FAIL。",
+      "measured": true
+    },
+    {
+      "id": "Q3",
+      "question": "requirements.toml 缺陷的处置是否闭环",
+      "answer": "闭环：修复前后实测对比成立、literal string 转换无损、9 道门的成因陈述与 harness 源码一致、harness 未被顺手改动。",
+      "measured": true
+    }
+  ],
+  "findings": [
+    {
+      "id": "F-1",
+      "type": "KILL-CONFIRMED",
+      "severity": "PASS",
+      "q": "Q1",
+      "claim": "MC07（把 file_engine() 开头的 self.validate()? 变成永不执行）确实打红 an_inconsistent_enabled_table_cannot_launch_an_engine，并让冻结期望 invalid_table_yields_no_engine 翻转",
+      "file_line": "crates/nexus-web-gateway/src/config.rs:492-493（缝本体）、crates/nexus-web-gateway/src/config.rs:692（单测）、crates/nexus-web-gateway/examples/gateway_file_contract.rs:1763（探针断言）、scenarios/product/gateway_file_config.toml:119（期望）",
+      "evidence": "基线：`test result: ok. 83 passed; 0 failed`。变异（`if false { self.validate()?; }`）：`test result: FAILED. 82 passed; 1 failed`，失败项 `config::tests::an_inconsistent_enabled_table_cannot_launch_an_engine`。探针 --case config 的 JSON diff：`\"invalid_table_yields_no_engine\":true` → `false`，且其余 18 个布尔字段一个没动（diff 只有 1 行）。",
+      "repro": "ssh appen@10.144.144.4 'cd /work/r13-audit && CARGO_TARGET_DIR=/work/r13-target cargo test -p nexus-web-gateway --lib'（基线）；变异由 /work/r13-mutate.py iffalse 施加，跑完 git checkout -- 还原，还原后 git status --porcelain 行数 = 0"
+    },
+    {
+      "id": "F-2",
+      "type": "TAG-UNIQUENESS",
+      "severity": "PASS",
+      "q": "Q1",
+      "claim": "『别的分支也能产出 files limits 这个子串，从而让对象在缝没检验时仍然绿』——不成立",
+      "file_line": "crates/nexus-web-gateway/src/config.rs:261",
+      "evidence": "`grep -rn \"files limits\" crates/ scenarios/` 在 src 下的**产生点只有 1 处**：config.rs:261 `format!(\"files limits: {e}\")`（FilesConfig::validate 委托 FileLimits::validate 的唯一包装）。其余命中全是注释/断言（config.rs:592、696、709；gateway_file_contract.rs:78、1708、1763；MODULE.md:123；场景注释 116）。file_service.rs 里 `files limits` 出现 0 次，所以引擎原文不可能自带这个标签。相邻两个包装点分别是 `files.roots: `（config.rs:501）与 `file engine: `（config.rs:505），都不含该子串。",
+      "repro": "cd E:/nexus-fabric-m0 && grep -rn \"files limits\" crates/ scenarios/"
+    },
+    {
+      "id": "W-1",
+      "type": "WARN",
+      "severity": "WARN",
+      "q": "Q1",
+      "claim": "MC07 的红是**词法**的而非**行为**的：删掉缝之后不合法的表仍然起不出引擎，只是错误前缀从 `files limits:` 变成 `file engine:`。所以这条对象钉住的是『哪一层答的话』，钉不住『缝不存在时会不会放行』。",
+      "file_line": "crates/nexus-web-gateway/src/file_service.rs:1414（`FileEngine::new` 自己调 `limits.validate()?`）、crates/nexus-web-gateway/src/config.rs:505、crates/nexus-web-gateway/src/config.rs:237",
+      "evidence": "实测的失败信息形状：变异后 file_engine 走 `SandboxRoot::open`（夹具目录存在 ⇒ 成功）→ `FileEngine::new` 在第 1414 行自己复检 limits ⇒ 仍返回 Err，包装成 `file engine: ...`（config.rs:505），不含 `files limits` ⇒ contains 断言红。反过来：缝真正不可替代的那半是 config.rs:237 的**配置层专属下界** `MIN_FILE_LOCKOUT_WINDOW_SECS`（config.rs:33 = 1；引擎层故意不设下界，见 config.rs:231-233 注释），而这条下界**从来没有被从 file_engine() 这个入口跑过**——探针的 sub_second_window_rejected_by_config 是直接调 `base_config(c).validate()`（gateway_file_contract.rs:1712），新补的这条用的是 chunk_bytes=0（引擎层也拒）。",
+      "suggestion": "把 invalid_table_yields_no_engine 与同名单测的故障换成 `files.lockout_window_secs = 0`（只违反配置层下界）：删缝 ⇒ `FileEngine::new` 放行 ⇒ `Ok(Some(engine))` ⇒ 期望翻成 false、单测走 `Ok(_) => panic!`。那样红就是行为性的，且对错误串的措辞免疫。",
+      "repro": "见 F-1 的命令；把 /work/r13-mutate.py 的夹具字段从 chunk_bytes 换成 lockout_window_secs 即测（本轮未跑该变体，本条的建议部分不构成实测）"
+    },
+    {
+      "id": "W-2",
+      "type": "WARN",
+      "severity": "WARN",
+      "q": "Q2",
+      "claim": "『`GatewayConfig::file_engine()` 是唯一构造入口』这句在 PRODUCT.md/MODULE.md/REQ-014 三处都**没带限定词**，而它在字面上不成立：`FileEngine::new` 是 `pub`、`file_service` 是 `pub mod`，crate 外可以直接构造并绕过配置层专属下界。",
+      "file_line": "PRODUCT.md:3386、crates/nexus-web-gateway/MODULE.md:101、crates/nexus-web-gateway/requirements.toml:121（三处『唯一构造入口』）、crates/nexus-web-gateway/src/lib.rs:20（`pub mod file_service;`）、crates/nexus-web-gateway/src/file_service.rs:1409（`pub fn new(`）",
+      "evidence": "PRODUCT.md:3386 原文「`GatewayConfig::file_engine()` 是唯一构造入口且关断时返回 `None`」；MODULE.md:101 同句式；REQ-014 acceptance 内嵌同一句。而 lib.rs:20 把 file_service 整个公开、file_service.rs:1409 的 `pub fn new(limits, roots, token)` 就在其上——`grep -rn \"FileEngine::new\" crates/nexus-web-gateway/src` 除 config.rs:504 外还有 file_service.rs 自己 40+ 处测试直接调它，证明『不经缝也能建』在树内是常态用法。",
+      "suggestion": "把三处改成「唯一**从 GatewayConfig 出发**的构造入口」或「配置面上唯一的构造入口」；若要真的结构性唯一，就得把 FileEngine::new 收成 pub(crate)（那是业务改动，本轮只登记不改）。",
+      "note": "该句的『承载体』（先 validate 再逐根 open）本身是存在的：config.rs:493→501→505 顺序实测。所以按 WARN 不按 FAIL。",
+      "repro": "cd E:/nexus-fabric-m0 && grep -rn \"pub fn new(\" crates/nexus-web-gateway/src/file_service.rs | tail -3 && grep -n \"^pub mod\" crates/nexus-web-gateway/src/lib.rs"
+    },
+    {
+      "id": "W-3",
+      "type": "WARN",
+      "severity": "WARN",
+      "q": "Q1/案卷形状",
+      "claim": "探针的 `verdict:\"PASS\"` 与退出码**都不是**期望成立的证据：dispatch 只要不 panic/不返回 Err 就无条件塞 PASS，main 永远返回 ExitCode::SUCCESS。本轮我自己就被这个形状骗过一次。",
+      "file_line": "crates/nexus-web-gateway/examples/gateway_file_contract.rs:84-103（main）、:125（无条件 insert verdict=PASS）",
+      "evidence": "变异跑里 `MUT_PROBE_EXIT=0`，看着像『没杀伤』；实际 diff JSON 才发现 `invalid_table_yields_no_engine` true→false。另一侧证据：还原后的树上 10 个 case 全部 verdict=PASS，其中 8 个 case 的布尔字段里有 false（download-page 1、list-pagination 1、upload-resume 1、upload-no-replace 1、auth-throttle 1、capability-negotiation 4、sftp-boundary 6），这些 false 与场景里 `equals = false` 的条数一一对上（见 N-2），说明 PASS 只是『程序跑通了』。",
+      "suggestion": "凡引用探针做绿证，必须落 diff 后的**逐字段值**，不能只落 verdict/exit code。",
+      "repro": "ssh appen@10.144.144.4 'diff /work/r13-probe-base.json /work/r13-mut-probe.json'"
+    },
+    {
+      "id": "W-4",
+      "type": "WARN",
+      "severity": "WARN",
+      "q": "Q3/变异表承载体",
+      "claim": "REQ-014 与变异表把「MC01–MC13 全数有杀伤」钉在树 `fa2f81d` 上，而 `fa2f81d` 是一个 **stash 提交（不可达对象）**，不是分支祖先；今天还能取到，一次 gc 就永久失去可复现性。",
+      "file_line": "crates/nexus-web-gateway/requirements.toml:121（『树 fa2f81d 实测全数有杀伤』）、.agents/green-evidence-gateway-file-service-m1.txt",
+      "evidence": "`git log -1 fa2f81d` ⇒ `fa2f81d WIP on feature/gateway-file-service-contracts: 89b7047 ...`（stash 形态的标题）；`git merge-base --is-ancestor fa2f81d HEAD` ⇒ 非祖先；`git rev-list --count fa2f81d..HEAD` = 2。在验证用的全新克隆里：`git cat-file -t fa2f81d` = commit（对象在），但 `git for-each-ref` 只列出 refs/heads/m0-verify、refs/remotes/origin/m0、refs/remotes/origin/m0-verify 三条；**可达性补测（决定性）：克隆与 bare origin 上 `git for-each-ref --contains fa2f81d` 双双返回空，且 `git merge-base --is-ancestor fa2f81d refs/remotes/origin/m0` rc=1** ⇒ 它确实不被任何 ref 包含，只是裸仓库里残留的对象，一次 `git gc --prune=now` 之后就取不到了。另外该树基座是 89b7047（= 被评审提交的父提交），也就是『全数有杀伤』是在**改动尚未落成提交之前**量的；同日的 `d71e007`（docs，仅 +22 行进 .agents 绿证日志）把 **83 单测 / 21 条期望 / verify --fast 9 门** 锚回了 `290c6f4`，但**没有**动 `requirements.toml`，也就**没有**重跑变异表。",
+      "scope_note": "本轮我只复跑了 MC07 一条（有杀伤，见 F-1）。其余 12 条配方未复跑，本条不构成对『全数』的验证。",
+      "suggestion": "把变异表重新跑在当前提交树上并把树号换成提交号（或给 stash 打一个 refs/mutation/* 之类的可达 ref）。",
+      "repro": "ssh appen@10.144.144.4 'cd /work/r13-audit && git cat-file -t fa2f81d; git for-each-ref'"
+    },
+    {
+      "id": "N-1",
+      "type": "PASS-CLAIM-VERIFIED",
+      "severity": "NOTE",
+      "q": "Q2",
+      "claim": "『Gateway::start 还没消费 file_engine()』这句现时态的否定式宣称是真的",
+      "file_line": "crates/nexus-web-gateway/src/gateway.rs:295（`pub fn start(cfg: GatewayConfig)`）",
+      "evidence": "`grep -rn \"file_engine|FileEngine\" crates/nexus-web-gateway/src --include=*.rs | grep -v src/config.rs` ⇒ 命中全部落在 file_service.rs（结构体定义 :1388/:1408 与它自己的 #[cfg(test)] 夹具 :2878 起 40+ 处），**`.file_engine()` 的调用点为 0**。gateway.rs/http.rs/protocol.rs/mesh.rs 无一命中。",
+      "repro": "见上 grep",
+      "conclusion": "PRODUCT.md:3388 与 MODULE.md:102-105 与 REQ-014 三处都把这段如实写成『仍未证的那半』，没有把构造缝的成立写成运行时保护。本条不报 FAIL。"
+    },
+    {
+      "id": "N-2",
+      "type": "NOTE",
+      "severity": "NOTE",
+      "q": "Q2/自报数字",
+      "claim": "§18.4 与 G12 里的自报计数经我这边复核成立",
+      "file_line": "PRODUCT.md:3386-3387、crates/nexus-web-gateway/MODULE.md:105-116",
+      "evidence": "逐文件 `grep -c '^field = '`：auth_throttle 27 / capability_negotiation 7 / config 21 / download_page 10 / list_pagination 6 / quota_backpressure 16 / sandbox_symlink 9 / sftp_boundary 15 / upload_no_replace 5 / upload_resume 9 ⇒ 合计 125，与 PRODUCT.md 写的 9+6+10+5+9+27+16+7+15+21 = 125 一致；gateway_file_config.toml 的 21 条与 REQ-014 的『21 条期望，E4』一致（21 = 探针的 19 个布尔 + verdict + case）。MODULE.md 点名的 10 条单测**全部存在**（逐个 `grep -c \"fn <名字>()\"` = 1；config.rs 总测试数 25，另 15 条不属本契约）。",
+      "not_verified": "我没有跑 harness 的 E4 逐字段对账（`verify --full` 的 product-scenarios 门）。我只做到：10 个 case 探针全部跑通、且 observed-false 布尔与场景 `equals = false` 条数逐一吻合（sftp 6/6、capability 4/4、auth 1/1、download 1/1、list 1/1、resume 1/1、config 0/0、quota 0/0、sandbox 0/0、no-replace 0/0）。所以『10 条场景跑绿』我只复验了布尔子集。"
+    },
+    {
+      "id": "N-3",
+      "type": "Q3-CLOSED",
+      "severity": "NOTE",
+      "q": "Q3",
+      "claim": "①修复前失败/修复后通过；②literal string 转换无损",
+      "file_line": "crates/nexus-web-gateway/requirements.toml:121",
+      "evidence": "①host python3 3.8.10 + tomli：`PARSE_FAIL parent 290c6f4^ TOMLDecodeError Expected newline or end of document after a statement (at line 89, column 577)` / `PARSE_OK head 290c6f4 top_keys=['req'] n_req=14` —— 行列与实现者声称的 line 89 col 577 逐字吻合。②成因可见：父版第 89 行长度 1237 的 basic string，col 550-640 处是 `...只数\"四处\"的旧写法已作废）...`，内嵌 ASCII 双引号提前终止。③修复后 14/14 条 acceptance 全是 literal string（`grep -c \"^acceptance = '\"` = 14，`grep -c 'acceptance = \"'` = 0），且逐条扫描**没有任何一条正文含 `'` 或 `\\`** ⇒ literal 语义与原 basic string 完全等价，没有丢转义也没有撞定界符；14 条全都有 acceptance 键，REQ-014 仍 status=doing / P0。",
+      "repro": "ssh appen@10.144.144.4 'python3 - <<PY ... tomli.load(open(p,\"rb\")) ...'（脚本 /work/r13c.py，父版从 `git show 290c6f4^:...requirements.toml` 落到 /work/r13-req-parent.toml）"
+    },
+    {
+      "id": "N-4",
+      "type": "Q3-CLOSED",
+      "severity": "NOTE",
+      "q": "Q3",
+      "claim": "③『本地 9 道门不含 requirements 校验、只有 CI 校验』与 harness 门定义一致",
+      "file_line": "engineering/nexus-harness/src/commands.rs:264-272、policies/quality.toml:19-28、policies/quality.toml:30-45、.github/workflows/gateway-ci.yml:25",
+      "evidence": "数门（源码不是文档）：`verify --fast` 的门集 = `commands.rs:270` 硬塞的 `whitespace_gate` + `config.declared_gates(\"fast\")`，后者读 JSON-pointer `/verification/fast/gates`（config.rs:84-95），在 policies/quality.toml:20-27 声明 8 条（format, check, clippy, architecture-delta, dependency-delta, resource-type-neutrality, affected-tests, selected-properties）⇒ **1 + 8 = 9 道**，与『本地 9 道门』吻合；`[verification.full]`（:30-45）14 条里也没有 requirements 校验。`grep -rn requirements engineering/nexus-harness/src/*.rs` = 0 命中，`.githooks/*.sh` 亦 0 命中；`validate-requirements` 的引用者只有 .github/workflows/gateway-ci.yml（:25 job + :38 执行 tools/validate-requirements.py）与文档/工具。",
+      "repro": "cd E:/nexus-fabric-m0 && sed -n '18,45p' policies/quality.toml && grep -rn \"requirements\" engineering/nexus-harness/src/*.rs"
+    },
+    {
+      "id": "N-5",
+      "type": "Q3-CLOSED",
+      "severity": "NOTE",
+      "q": "Q3",
+      "claim": "④实现者没有在本片里顺手改 harness，建议是登记为待办",
+      "file_line": ".agents/knowledge/entries/2026-10-14-requirements-toml-invisible-quote-and-ci-only-gate.md",
+      "evidence": "`git show --stat 290c6f4` 的 11 个文件里 engineering/ 与 .githooks/ **一个都没有**（config/场景/文档/探针/证据/知识条目），`git show --name-only 290c6f4 | grep -Ei \"harness|gates|\\.githooks\"` ⇒ NONE。建议以知识条目形式落档（同提交 +56 行）。",
+      "repro": "cd E:/nexus-fabric-m0 && git show --name-only --format= 290c6f4"
+    },
+    {
+      "id": "N-6",
+      "type": "NOT-RUN",
+      "severity": "NOTE",
+      "q": "范围",
+      "claim": "以下未跑成，本条不构成证据",
+      "items": [
+        "MC01–MC06、MC08–MC13 共 12 条配方未复跑（本轮范围只要求至少 MC07 那条）",
+        "workspace 级 `cargo test --workspace` / 9 道本地门整体未跑（与三问无关，且 ssh 时间与预算不允许）",
+        "Windows 侧编译该 crate：按既有事实本就编不动，未尝试，也没有用它出任何结论",
+        "harness 的 E4 逐字段对账（product-scenarios 门）未跑，见 N-2 的 not_verified"
+      ]
+    },
+    {
+      "id": "N-7",
+      "type": "MID-AUDIT-CHANNEL-MOVE",
+      "severity": "NOTE",
+      "q": "范围/通道",
+      "claim": "评审期间 `m0-verify` 通道 ref 动过一次；我的全部证据钉在 `290c6f4`，不受影响",
+      "file_line": ".agents/green-evidence-gateway-file-service-m1.txt（d71e007 追加的 +22 行）",
+      "evidence": "克隆时 `refs/heads/m0-verify` = 290c6f4a7c4d...（我在脚本里打过 REF check，与 Windows HEAD 逐字相同）；评审末段再查 bare origin ⇒ `refs/heads/m0-verify` = d71e007 `docs(gateway): 把第十二片的复验数字锚回落地提交 290c6f4`（09:50:43，就在我的克隆前后），`290c6f4` 是它的祖先，`git diff --stat 290c6f4..m0-verify` = **只有 .agents/green-evidence-...txt +22 行**（代码/探针/场景/契约零改动）。我的 /work/r13-audit 仍在 290c6f4。",
+      "cross_check": "该新日志自报 `cargo test --lib 83 passed; 0 failed` 与 `verify --fast 9 门全 PASS` —— 与我**独立**量的基线（83 passed; 0 failed，见 F-1）和 9 道门（见 N-4）吻合，是相互印证而非继承。",
+      "repro": "ssh appen@10.144.144.4 'git -C /work/m0-origin.git log --oneline -2 refs/heads/m0-verify; git -C /work/m0-origin.git diff --stat 290c6f4 refs/heads/m0-verify; git -C /work/r13-audit rev-parse HEAD'"
+    }
+  ],
+  "worktree_hygiene": {
+    "business_files_touched": "无。评审只读；写入仅限 .evidence/review-gateway-file-r13/",
+    "linux_clone_restored": "/work/r13-audit 变异后 `git checkout -- crates/nexus-web-gateway/src/config.rs`，还原后 `git status --porcelain | wc -l` = 0"
+  }
+}

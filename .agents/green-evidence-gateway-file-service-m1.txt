@@ -1557,3 +1557,135 @@ contract_hash 从 `dd4926c2…`（9 场景）→ `f127b5f5…`（新增第 10 �
 逐条对上（尤其"唯一构造入口"与"`Gateway::start` 还没消费它"两句的互相限定是否足够）、
 requirements.toml 的处置是否闭环（修复前后实际解析输出、14 条 literal string 有无语义副作用、
 "9 门不含它"是否真的是门定义而非文档口径）。
+
+================================================================================
+追加：第十二片续（r13 独立评审回来之后的处置：补"缝上不可替代的那半"两条对象，
+并把变异表整张重跑在可达提交上），宿主 xc-pc-linux
+（rustc/cargo 1.98.1，x86_64-unknown-linux-gnu；表跑在隔离克隆 /work/mm7 +
+隔离 CARGO_TARGET_DIR=/work/mm7-target）
+================================================================================
+
+r13 = `COMMENTED`（0 FAIL / 4 WARN / 7 NOTE），案卷随分支携带在
+`.evidence/review-gateway-file-r13/`（summary.json + review.md + review.json 三份）。
+逐条处置：
+
+**W-1（最重，且是对我方法的一记纠正）**：我上一片补的 `invalid_table_yields_no_engine`
+被评审方复跑证明**只红在词法层**——`FileEngine::new`（file_service.rs:1414）第一句就是
+`limits.validate()?`，所以把 `file_engine()` 里那句 `self.validate()?` 删掉，坏数值表
+仍然被拒，只是错误串从 `files limits: ` 换成 `file engine: `。我原来的断言
+（`contains("files limits")`）恰好把这种"照样拒了"读成了"缝有杀伤"。
+⇒ 补两条**只有配置层才有、且必须从缝上走一遍**的规则：
+  ① `blank_token_yields_no_engine`：只含空白但非空的令牌——引擎只查 `token.is_empty()`，
+     "   " 照收，而它上线后会去匹配一个同样空白出示的串；
+  ② `blank_alias_yields_no_engine`：空白根别名——`SandboxRoot::open` 与 `FileEngine::new`
+     都不检查别名内容（只查重复、非空根集合）。
+  单测 `blank_credential_and_alias_are_refused_at_the_construction_seam` 断两半的红因都
+  来自配置层的串（`files.token` / `empty alias`），不是引擎包装。
+  实测（下面 MC07 行）：删掉缝里那句 ⇒ 2 条单测红 + **3 条期望翻转**（含新补的两条）。
+  这条教训推广成一句：**"补了对象" ≠ "补对了不可替代的那半"**；对象要问的是
+  "如果这行代码不存在，产品行为会不会真的不同"，而不是"错误信息会不会变"。
+
+**W-2**：三处"唯一构造入口"的现时态句子缺边界。`FileEngine::new` 仍是 `pub`
+（`lib.rs:20` 公开 `file_service`，探针与引擎单测直接调它）。MODULE.md G12、PRODUCT.md
+§18.4、REQ-014 全部改成"**从配置起引擎的唯一入口**，只约束这条路；绕过配置的构造不在覆盖内"。
+
+**W-3**：探针的进程退码与 `verdict=PASS` 字样**不构成杀伤判据**。评审方实测：变异跑里
+`MUT_PROBE_EXIT=0`（探针正常退出），杀伤只在逐字段 JSON diff 里看得见；反过来，还原后的树
+上 10 个 case 全部 verdict=PASS，其中 8 个 case 的布尔字段里就有 `false`——因为场景里本来
+就有 `equals = false` 的期望（例如 sftp-boundary 6 条）。⇒ 本文件以后所有变异表一律记
+"翻转的期望名 + 红掉的单测名"，不记退码也不记 PASS 字样。
+
+**W-4**：上一片变异表的口径 `fa2f81d` 是 `git stash create` 形态的提交，两侧
+`for-each-ref --contains` 皆空 ⇒ 别人取不到那张表，"可复现"只是我这边的一句话。
+⇒ **整张表在可达提交 `294c4d3a6e5fc52674627a0a7e0011bf643a9989`（分支上的真实提交，
+`git branch --contains` 命中）上重跑**，新表以此是唯一口径。旧表（MC01–MC13，树 fa2f81d）
+不删，只降级标注为"不可由 ref 取到的中间态"，两表在 MC01/MC02/MC07 之外逐行一致——
+这本身也是这张表可信度的一个交叉证据。
+
+—— 新变异表 MC01–MC14（唯一口径 = 提交 `294c4d3`，14 条配方 + baseline + restored）——
+每行：配方 → `--lib` 红数与红名单 → `config` 场景（23 条冻结期望）翻转的期望名。
+`auth-throttle`（27 条）在全部 14 行恒为 0 翻转。
+
+MC00 baseline            84 passed / config flips=0 / auth-throttle flips=0
+MC01 亚秒下界永不触发      1 红 sub_second_window_is_rejected_at_the_config_layer
+                         1 翻转 sub_second_window_rejected_by_config
+MC02 配置层 24h 上界永不触发
+                         1 红 over_24h_window_is_rejected_in_both_layers
+                         1 翻转 over_24h_window_rejected_by_config
+MC03 不再委托引擎表        2 红 an_inconsistent_enabled_table_cannot_launch_an_engine,
+                         disabled_section_still_rejects_an_inconsistent_table
+                         5 翻转 disabled_still_rejects_inconsistent_table,
+                          disabled_still_rejects_zero_ceiling,
+                          source_budget_below_pair_threshold_rejected,
+                          source_budget_above_table_capacity_rejected,
+                          invalid_table_yields_no_engine
+MC04 文件段只在 enabled 时才校验
+                         3 红 disabled_section_still_rejects_an_inconsistent_table,
+                          sub_second_window_is_rejected_at_the_config_layer,
+                          over_24h_window_is_rejected_in_both_layers
+                         2 翻转 disabled_still_rejects_inconsistent_table,
+                          disabled_still_rejects_zero_ceiling
+MC05 存在性检查不受 enabled 门控（过严方向）
+                         5 红 absent_files_section_is_disabled, mesh_wss_roundtrips,
+                          oversized_max_terminals_rejected, valid_config_roundtrips,
+                          sub_second_window_is_rejected_at_the_config_layer
+                         config 场景 verdict FAIL + 21 条字段缺席（探针在 legacy 解析处
+                          早退；按 W-3 只记这个形状，不记退码）
+MC06 kill-switch 失效     1 红 absent_files_section_is_disabled
+                         config 场景 verdict FAIL + 21 条缺席
+MC07 缝里不再先 validate   2 红 an_inconsistent_enabled_table_cannot_launch_an_engine,
+                         blank_credential_and_alias_are_refused_at_the_construction_seam
+                         **3 翻转 invalid_table_yields_no_engine,
+                          blank_token_yields_no_engine, blank_alias_yields_no_engine**
+                         （这一行就是 W-1 要的判据：没有新补的两条时，这里只有 1 翻转，
+                          且那 1 条的红因是错误串换了标签而非行为变了）
+MC08 重复别名检查拆掉      1 红 duplicate_or_blank_root_alias_is_rejected
+                         1 翻转 duplicate_root_alias_rejected
+MC09 空别名检查拆掉        2 红 blank_credential_and_alias_are_refused_at_the_construction_seam,
+                         duplicate_or_blank_root_alias_is_rejected
+                         2 翻转 blank_root_alias_rejected, blank_alias_yields_no_engine
+MC10 镜像漂移             2 红 limits_mirror_is_field_by_field_exact,
+                         over_24h_window_is_rejected_in_both_layers
+                         3 翻转 limits_round_trip_is_exact, durations_map_to_engine_units,
+                          over_24h_window_rejected_by_config
+MC11 去掉 files 字段的 serde default
+                         1 红 absent_files_section_is_disabled
+                         config 场景 verdict FAIL + 21 条缺席（老配置解析不过）
+MC12 Default 把 enabled 置 true
+                         5 红（同 MC05 名单）
+                         config 场景 verdict FAIL + 21 条缺席
+MC13 引擎层 24h 上界拆掉   2 红 over_24h_window_is_rejected_in_both_layers,
+                         file_service::tests::every_validate_rule_has_a_red_test
+                         1 翻转 over_24h_window_rejected_by_config
+MC14 空白令牌检查拆掉      2 红 blank_credential_and_alias_are_refused_at_the_construction_seam,
+                         enabled_without_credential_or_roots_is_rejected
+                         3 翻转 enabled_without_token_rejected,
+                          whitespace_only_token_rejected, blank_token_yields_no_engine
+MC99 restored            84 passed / flips=0（每条配方回写后断言与原文逐字节相等）
+
+覆盖率（按 mm8 的逐行名单实数算，`node` 解析 `/work/mm8.log` 的 FLIP 行与场景里的
+23 个 `field =`）：14 条配方全数有杀伤；被点到名的期望名共 **16** 个（其中 `verdict`
+是场景整体状态，不算断言 ⇒ 实质期望 **15** 条），另有 **7** 条从未以"字段翻转"的形式出现：
+`case`（形参，不是断言）、`absent_section_is_disabled`、`disabled_yields_no_engine`、
+`enabled_without_roots_rejected`、`missing_root_path_rejected`、
+`valid_config_launches_engine`、`files_section_survives_json_round_trip`。
+其中前两条是 MC05/06/11/12 这四行**把探针打进整体 FAIL**（`verdict` 翻 + 21 条字段缺席），
+所以它们不是"没对象"，而是"对象的红法是把场景打死，不是翻自己那一格"——这两种红法在
+判据上不等价，必须分开写。**剩下五条是这张表当前的真空**：没有任何配方去动
+"根集合非空""起得出引擎""JSON 往返"这三处代码。这句话是量纲声明，所以它的对象是
+上面这个逐名清单，不是"测试存在"或"表跑完了"。
+（本节早先写过一句"22 条至少被一条配方打到"——那是**没算就落笔**的话，实际按名字数出来
+只有 15 条实质期望被翻过；按 [[先跑再写]] 的既有规矩，错句保留在此说明而不是静默删掉。）
+
+—— 本片的数字与门禁（都是先跑再写）——
+提交 `294c4d3`（代码+契约+文档，含 W-1/W-2 的处置）：
+  188fc84 那轮（同一内容、提交前）实测：clippy 无诊断输出 / 84 passed; 0 failed /
+  product.gateway-file-config PASS 23 条 / verify --fast 9 门全 PASS
+  （evidence verify-af3ef937d95c）/ status --json verdict PASS, dirty_state=false /
+  contract_hash 9da69cbc3ee293bed03e4ff5f14f732a5fd08c16（提交正文带的就是这个号，
+  取自验证机 `status --json` 而非本地复算）
+场景期望合计 104 + 23 = **127**；`--lib` 84（第十二片的 83 + 本片的 1）。
+FILE_MANIFEST 声明值 215 → **218**（r13 案卷 3 行；口径改成"该轮实际产出几份就登几份"）。
+登记时我差点把 r12 的 findings.md 那一行**覆盖掉**（Edit 的 new_string 没把被替换行带上），
+靠 `awk '/^\| `/ {n++}'` 与 `grep -c "^| \`"` 双口径对账发现少一行才发现，已补回；
+这条也说明"声明值必须等于实数"这个习惯本身在救场。

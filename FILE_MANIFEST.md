@@ -2,7 +2,7 @@
 
 本包实现《Nexus 统一系统设计规范 v9》中的“统一仓库目录契约”。
 
-文件数（不含本清单）：215
+文件数（不含本清单）：218
 
 > 2026-10-10：原声明值 137 与表内实际行数（148）已不一致（既有漂移，含
 > `scenarios/engineering/bench_gate_verdicts.toml` 等未登记项）。本次登记
@@ -100,6 +100,13 @@
 > literal string，并用 `tomli` + shim 实测修复前 exit=1 / 修复后 `OK: requirements.toml valid`
 > exit=0；取证与配方见 `.agents/knowledge/entries/2026-10-14-requirements-toml-invisible-quote-and-ci-only-gate.md`
 > （知识条目不进本清单，只在 `index.json` 登记，先例见上面那条惯例说明）。
+> 2026-10-14（第十二片续，r13 落地）：r13 案卷 **3** 行（`summary.json` + `review.md` +
+> `review.json`）⇒ **218**（`awk '/^| ` /{n++}'` 实测 218 与新声明值一致）。登记口径从每轮 2 行
+> 改成"该轮实际产出几份就登几份"：前 12 轮是 summary+findings 两份，r13 是三份——不改口径的话
+> 清单又会退回"声明值靠手工减法"的样子。
+> 同轮的代码处置 `294c4d3`：期望 21 → **23**、config 单测 10 → **11**、`--lib` 83 → **84**、
+> E4 总期望 125 → **127**。理由写在案卷 r13 段——实现者自己补的对象只红在**词法层**
+> （`FileEngine::new` 第一句就复检 limits），缝不可替代的那半必须由"只有配置层才有"的规则去钉。
 
 | Path | Purpose |
 |---|---|
@@ -312,6 +319,9 @@
 | `.evidence/review-gateway-file-r11/findings.md` | 第 11 轮取证（130 行）：18 行变异表里独立复跑 8 行（baseline/E/P8/D1/M10b/N14 + 快照上 M17/M18）**零分歧**、其余 10 行明确标为仍是实现方自报；两条 WARN = 契约数字缺树限定、同一条地址串的消费点被三处文档数成三样（真实五处）；另实测 `git checkout fbcac2e` 复现本轮那次夹具红 |
 | `.evidence/review-gateway-file-r12/summary.json` | 第 12 轮案卷（r11 处置的复核），verdict `COMMENTED`（0 FAIL / 1 WARN / 3 NOTE，blocking 空），本链第二次由评审方在 Linux 实测。**第一次派出的同轮评审者被模型中断：24 次工具调用、约 175 万 token，没留下任何交付物**——本轮是重派，复用前一位留下的已编译克隆 `/work/r12-audit` 并在案卷里写明这不是自己从零建的树，`git add -f` 携带 |
 | `.evidence/review-gateway-file-r12/findings.md` | 第 12 轮取证（98 行）：三个必答各给判定——地址串消费点确为**五处**（两个第六处候选逐项否决：审计行不吃 source、会话字段只有两个已列读点）；pair 侧"门槛翻倍"只有机制对象、没有数量对象（判 WARN，附自己的有界变异实测红名单与处方）；绑定与数字在 HEAD 上逐条对上。含一条自我坦白：只复跑 18 行变异表里的 1 行且配方与表中不同 ⇒ 判"不可比"，既不算分歧也不算证实 |
+| `.evidence/review-gateway-file-r13/summary.json` | 第 13 轮案卷（第十二片"配置接线 + kill-switch"的独立复核），verdict `COMMENTED`（0 FAIL / 4 WARN / 7 NOTE，blocking 空），评审方第三次在 xc-pc-linux 上自建克隆 + 隔离 target 实测，`git add -f` 携带。**W-1 是本链新形态**：实现者自己补的对象被复跑证明只红在**词法层**（`FileEngine::new` 第一句就复检 limits，删掉构造缝里那句 `self.validate()?` 照样拒），即"补了对象"不等于"补对了不可替代的那半" |
+| `.evidence/review-gateway-file-r13/review.md` | 第 13 轮叙述卷：三个必答（补对象是否有杀伤 / 现时态宣称与实现是否逐条对上 / requirements.toml 处置是否闭环）各给判定，并列出**自己没跑成**的项（MC01–06、08–13 的复跑、harness E4 逐字段对账、workspace 级 9 门）与"通道 ref 在评审期间被移到 d71e007"的核实过程 |
+| `.evidence/review-gateway-file-r13/review.json` | 第 13 轮结构化 findings（13 条，带顶层 `verdict`）：W-2「唯一构造入口」缺边界（`FileEngine::new` 仍是 pub）、W-3 探针退码与 PASS 字样不构成杀伤判据（还原后的树上 10 个 case 有 8 个含合法 `false` 字段）、W-4 变异表口径 `fa2f81d` 是 stash 形态、两侧 `for-each-ref --contains` 皆空 ⇒ 别人取不到那张表 |
 | `.agents/red-evidence-gateway-file-service.txt` | Contract-first Red Evidence (M0) |
 | `.agents/green-evidence-gateway-file-service-m1.txt` | Green Evidence for M1 slice 1 |
 
