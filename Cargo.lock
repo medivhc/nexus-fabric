@@ -1663,6 +1663,7 @@ version = "0.1.0"
 dependencies = [
  "chacha20poly1305",
  "hkdf",
+ "libc",
  "nexus",
  "nexus-compute",
  "nexus-connectivity",
