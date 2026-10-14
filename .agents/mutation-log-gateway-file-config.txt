@@ -1,0 +1,227 @@
+# 变异跑原始输出（入库理由：评审 r14 W-2 —— 证据只躺在实现者的 Linux 机路径上时，
+# 第三方仅靠仓库重算不出覆盖率，减法就只剩"信我"）
+#
+# 口径树   8b07af8154fdf93abc9e1f264150c07690b1c37e（分支 feature/gateway-file-service-contracts 上的
+#          真实提交，`git branch --contains` 实测非空；不是 stash 形态）
+# 跑法     git clone --no-hardlinks --branch m0-verify /work/m0-origin.git /work/mm7
+#          cd /work/mm7 && CARGO_TARGET_DIR=/work/mm7-target \
+#            python3 crates/nexus-web-gateway/tools/mutation-gateway-file-config.py
+# 宿主     xc-pc-linux appen@10.144.144.4，rustc/cargo 1.98.1，x86_64-unknown-linux-gnu，
+#          feature_set workspace:default，跑前跑后 `git status --porcelain` = 0
+#          （脚本每行回写后断言与原文逐字节相等，见 MC99_restored）
+# 判据     红单测名单 + 逐字段 JSON diff。**不用**探针退码，也不用 harness 的 PASS 字样
+#          （评审 r13 W-3：退码为 0 的那一行实际翻了字段；反之还原后的树上有 8 个 case
+#          verdict=PASS 而字段里合法地含 false）。
+# 覆盖率   场景 product.gateway-file-config 25 个 field 里，23 个是断言（另两个 `verdict`/`case`
+#          是元信息与形参），这 23 个**每一个都至少被一条配方以"翻自己那一格"的方式打过**；
+#          20 条配方没有一条是零杀伤。重算命令见脚本头部。
+#
+TREE=8b07af8154fdf93abc9e1f264150c07690b1c37e dirty=0
+diff-vs-measured-046c39e:
+fatal: bad object 046c39e321934e4f5185adad3243db2ed3eb014e
+anchor precheck ok: 20 recipes
+=== MC00_baseline  [baseline] ===
+  lib: test result: ok. 85 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+  red tests (0):
+  probe config       : frozen=25 flips=0 missing=0
+  probe auth-throttle: frozen=27 flips=0 missing=0
+=== MC01_window_floor_off  [MUTATED] ===
+  lib: test result: FAILED. 84 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+  build: error: test failed, to rerun pass `-p nexus-web-gateway --lib`
+  red tests (1):
+    config::tests::sub_second_window_is_rejected_at_the_config_layer
+  probe config       : frozen=25 flips=1 missing=0
+    FLIP sub_second_window_rejected_by_config         want=true   got=false
+  probe auth-throttle: frozen=27 flips=0 missing=0
+=== MC02_window_ceiling_off  [MUTATED] ===
+  lib: test result: FAILED. 84 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+  build: error: test failed, to rerun pass `-p nexus-web-gateway --lib`
+  red tests (1):
+    config::tests::over_24h_window_is_rejected_in_both_layers
+  probe config       : frozen=25 flips=1 missing=0
+    FLIP over_24h_window_rejected_by_config           want=true   got=false
+  probe auth-throttle: frozen=27 flips=0 missing=0
+=== MC03_engine_table_not_delegated  [MUTATED] ===
+  lib: test result: FAILED. 83 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+  build: error: test failed, to rerun pass `-p nexus-web-gateway --lib`
+  red tests (2):
+    config::tests::an_inconsistent_enabled_table_cannot_launch_an_engine
+    config::tests::disabled_section_still_rejects_an_inconsistent_table
+  probe config       : frozen=25 flips=5 missing=0
+    FLIP disabled_still_rejects_inconsistent_table    want=true   got=false
+    FLIP disabled_still_rejects_zero_ceiling          want=true   got=false
+    FLIP source_budget_below_pair_threshold_rejected  want=true   got=false
+    FLIP source_budget_above_table_capacity_rejected  want=true   got=false
+    FLIP invalid_table_yields_no_engine               want=true   got=false
+  probe auth-throttle: frozen=27 flips=0 missing=0
+=== MC04_files_checked_only_when_on  [MUTATED] ===
+  lib: test result: FAILED. 81 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+  build: error: test failed, to rerun pass `-p nexus-web-gateway --lib`
+  red tests (4):
+    config::tests::disabled_section_still_rejects_an_inconsistent_table
+    config::tests::idle_time_bounds_are_rejected_at_the_config_layer
+    config::tests::over_24h_window_is_rejected_in_both_layers
+    config::tests::sub_second_window_is_rejected_at_the_config_layer
+  probe config       : frozen=25 flips=2 missing=0
+    FLIP disabled_still_rejects_inconsistent_table    want=true   got=false
+    FLIP disabled_still_rejects_zero_ceiling          want=true   got=false
+  probe auth-throttle: frozen=27 flips=0 missing=0
+=== MC05_presence_not_gated  [MUTATED] ===
+  lib: test result: FAILED. 79 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+  build: error: test failed, to rerun pass `-p nexus-web-gateway --lib`
+  red tests (6):
+    config::tests::absent_files_section_is_disabled
+    config::tests::idle_time_bounds_are_rejected_at_the_config_layer
+    config::tests::mesh_wss_roundtrips
+    config::tests::oversized_max_terminals_rejected
+    config::tests::sub_second_window_is_rejected_at_the_config_layer
+    config::tests::valid_config_roundtrips
+  probe config       : frozen=25 flips=2 missing=0
+    FLIP absent_section_is_disabled                   want=true   got=false
+    FLIP disabled_yields_no_engine                    want=true   got=false
+  probe auth-throttle: frozen=27 flips=0 missing=0
+=== MC06_kill_switch_inert  [MUTATED] ===
+  lib: test result: FAILED. 84 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+  build: error: test failed, to rerun pass `-p nexus-web-gateway --lib`
+  red tests (1):
+    config::tests::absent_files_section_is_disabled
+  probe config       : frozen=25 flips=1 missing=0
+    FLIP disabled_yields_no_engine                    want=true   got=false
+  probe auth-throttle: frozen=27 flips=0 missing=0
+=== MC07_launch_skips_validate  [MUTATED] ===
+  lib: test result: FAILED. 83 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+  build: error: test failed, to rerun pass `-p nexus-web-gateway --lib`
+  red tests (2):
+    config::tests::an_inconsistent_enabled_table_cannot_launch_an_engine
+    config::tests::blank_credential_and_alias_are_refused_at_the_construction_seam
+  probe config       : frozen=25 flips=3 missing=0
+    FLIP invalid_table_yields_no_engine               want=true   got=false
+    FLIP blank_token_yields_no_engine                 want=true   got=false
+    FLIP blank_alias_yields_no_engine                 want=true   got=false
+  probe auth-throttle: frozen=27 flips=0 missing=0
+=== MC08_dup_alias_off  [MUTATED] ===
+  lib: test result: FAILED. 84 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+  build: error: test failed, to rerun pass `-p nexus-web-gateway --lib`
+  red tests (1):
+    config::tests::duplicate_or_blank_root_alias_is_rejected
+  probe config       : frozen=25 flips=1 missing=0
+    FLIP duplicate_root_alias_rejected                want=true   got=false
+  probe auth-throttle: frozen=27 flips=0 missing=0
+=== MC09_blank_alias_off  [MUTATED] ===
+  lib: test result: FAILED. 83 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+  build: error: test failed, to rerun pass `-p nexus-web-gateway --lib`
+  red tests (2):
+    config::tests::blank_credential_and_alias_are_refused_at_the_construction_seam
+    config::tests::duplicate_or_blank_root_alias_is_rejected
+  probe config       : frozen=25 flips=2 missing=0
+    FLIP blank_root_alias_rejected                    want=true   got=false
+    FLIP blank_alias_yields_no_engine                 want=true   got=false
+  probe auth-throttle: frozen=27 flips=0 missing=0
+=== MC10_mirror_drift  [MUTATED] ===
+  lib: test result: FAILED. 83 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+  build: error: test failed, to rerun pass `-p nexus-web-gateway --lib`
+  red tests (2):
+    config::tests::limits_mirror_is_field_by_field_exact
+    config::tests::over_24h_window_is_rejected_in_both_layers
+  probe config       : frozen=25 flips=3 missing=0
+    FLIP limits_round_trip_is_exact                   want=true   got=false
+    FLIP durations_map_to_engine_units                want=true   got=false
+    FLIP over_24h_window_rejected_by_config           want=true   got=false
+  probe auth-throttle: frozen=27 flips=0 missing=0
+=== MC11_no_serde_default  [MUTATED] ===
+  lib: test result: FAILED. 84 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+  build: error: test failed, to rerun pass `-p nexus-web-gateway --lib`
+  red tests (1):
+    config::tests::absent_files_section_is_disabled
+  probe config       : frozen=25 flips=2 missing=0
+    FLIP absent_section_is_disabled                   want=true   got=false
+    FLIP disabled_yields_no_engine                    want=true   got=false
+  probe auth-throttle: frozen=27 flips=0 missing=0
+=== MC12_default_enables_files  [MUTATED] ===
+  lib: test result: FAILED. 79 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+  build: error: test failed, to rerun pass `-p nexus-web-gateway --lib`
+  red tests (6):
+    config::tests::absent_files_section_is_disabled
+    config::tests::idle_time_bounds_are_rejected_at_the_config_layer
+    config::tests::mesh_wss_roundtrips
+    config::tests::oversized_max_terminals_rejected
+    config::tests::sub_second_window_is_rejected_at_the_config_layer
+    config::tests::valid_config_roundtrips
+  probe config       : frozen=25 flips=2 missing=0
+    FLIP absent_section_is_disabled                   want=true   got=false
+    FLIP disabled_yields_no_engine                    want=true   got=false
+  probe auth-throttle: frozen=27 flips=0 missing=0
+=== MC13_engine_window_ceiling_off  [MUTATED] ===
+  lib: test result: FAILED. 83 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+  build: error: test failed, to rerun pass `-p nexus-web-gateway --lib`
+  red tests (2):
+    config::tests::over_24h_window_is_rejected_in_both_layers
+    file_service::tests::every_validate_rule_has_a_red_test
+  probe config       : frozen=25 flips=1 missing=0
+    FLIP over_24h_window_rejected_by_config           want=true   got=false
+  probe auth-throttle: frozen=27 flips=0 missing=0
+=== MC14_blank_token_off  [MUTATED] ===
+  lib: test result: FAILED. 83 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+  build: error: test failed, to rerun pass `-p nexus-web-gateway --lib`
+  red tests (2):
+    config::tests::blank_credential_and_alias_are_refused_at_the_construction_seam
+    config::tests::enabled_without_credential_or_roots_is_rejected
+  probe config       : frozen=25 flips=3 missing=0
+    FLIP enabled_without_token_rejected               want=true   got=false
+    FLIP whitespace_only_token_rejected               want=true   got=false
+    FLIP blank_token_yields_no_engine                 want=true   got=false
+  probe auth-throttle: frozen=27 flips=0 missing=0
+=== MC15_roots_nonempty_off  [MUTATED] ===
+  lib: test result: FAILED. 84 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+  build: error: test failed, to rerun pass `-p nexus-web-gateway --lib`
+  red tests (1):
+    config::tests::enabled_without_credential_or_roots_is_rejected
+  probe config       : frozen=25 flips=1 missing=0
+    FLIP enabled_without_roots_rejected               want=true   got=false
+  probe auth-throttle: frozen=27 flips=0 missing=0
+=== MC16_seam_always_none  [MUTATED] ===
+  lib: test result: FAILED. 84 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+  build: error: test failed, to rerun pass `-p nexus-web-gateway --lib`
+  red tests (1):
+    config::tests::enabled_config_launches_an_engine_and_missing_path_does_not
+  probe config       : frozen=25 flips=1 missing=0
+    FLIP valid_config_launches_engine                 want=true   got=false
+  probe auth-throttle: frozen=27 flips=0 missing=0
+=== MC17_skip_serializing_window  [MUTATED] ===
+  lib: test result: FAILED. 84 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+  build: error: test failed, to rerun pass `-p nexus-web-gateway --lib`
+  red tests (1):
+    config::tests::files_section_round_trips_through_json
+  probe config       : frozen=25 flips=1 missing=0
+    FLIP files_section_survives_json_round_trip       want=true   got=false
+  probe auth-throttle: frozen=27 flips=0 missing=0
+=== MC18_open_errors_swallowed  [MUTATED] ===
+  lib: test result: FAILED. 84 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+  build: error: test failed, to rerun pass `-p nexus-web-gateway --lib`
+  red tests (1):
+    config::tests::enabled_config_launches_an_engine_and_missing_path_does_not
+  probe config       : frozen=25 flips=1 missing=0
+    FLIP missing_root_path_rejected                   want=true   got=false
+  probe auth-throttle: frozen=27 flips=0 missing=0
+=== MC19_idle_floor_off  [MUTATED] ===
+  lib: test result: FAILED. 84 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+  build: error: test failed, to rerun pass `-p nexus-web-gateway --lib`
+  red tests (1):
+    config::tests::idle_time_bounds_are_rejected_at_the_config_layer
+  probe config       : frozen=25 flips=1 missing=0
+    FLIP idle_floor_rejected_by_config_layer          want=true   got=false
+  probe auth-throttle: frozen=27 flips=0 missing=0
+=== MC20_idle_ceiling_off  [MUTATED] ===
+  lib: test result: FAILED. 84 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+  build: error: test failed, to rerun pass `-p nexus-web-gateway --lib`
+  red tests (1):
+    config::tests::idle_time_bounds_are_rejected_at_the_config_layer
+  probe config       : frozen=25 flips=1 missing=0
+    FLIP idle_ceiling_rejected_by_config_layer        want=true   got=false
+  probe auth-throttle: frozen=27 flips=0 missing=0
+=== MC99_restored  [baseline] ===
+  lib: test result: ok. 85 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+  red tests (0):
+  probe config       : frozen=25 flips=0 missing=0
+  probe auth-throttle: frozen=27 flips=0 missing=0
+=== MM RUN DONE ===

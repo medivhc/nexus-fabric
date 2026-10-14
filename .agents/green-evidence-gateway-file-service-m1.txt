@@ -1753,3 +1753,100 @@ findings.json for the final line-by-line evidence"——那两个文件**根本�
 它已经建好的 `/work/r14-audit` 克隆与 `/work/r14-target` 编译产物**保留**，第二次派单直接复用
 并须在案卷里写明"这不是我自己从零建的树"（与 r12 重派同一口径）。
 第二次派单把必答从三问收窄成两问，并把硬预算降到 ≤45 次调用、第 20 次前必须落 verdict。
+
+================================================================================
+追加：第十二片再续（r14 第二次派单回来之后的处置：idle 两侧界的层标签对象、
+覆盖率改成第三方可重算、探针的两处早退改成指名红），宿主 xc-pc-linux
+（rustc/cargo 1.98.1；变异跑在隔离克隆 /work/mm7 + 隔离 target /work/mm7-target）
+================================================================================
+
+r14 = `COMMENTED`（0 FAIL / 2 WARN / 3 NOTE），案卷 `.evidence/review-gateway-file-r14/`
+（`summary.json` + `review.md`）。派单过程本身也记着：第一次派单在 37 次调用时中断、
+只留下三条全 pending 的临时件（改名保留，见 8b6b0d0 与上一节），本轮评的是第二次；
+第二次复用了中断者留下的 `/work/r14-audit` + `/work/r14-target`，并在案卷里写明
+"这不是它自己从零建的树"（N-2）。
+
+**W-1（评审方自设配方 NEW20 打中的）**：`config.rs` 那条**配置层 idle 24h 上界**先前
+0 红 0 翻——和 r13 W-1 同一形状（委托让引擎那条 `idle_timeout must be <= 24h` 替它答话，
+而我只给 `lockout_window` 写过带层标签的对象）。补法：
+- 冻结期望 `idle_floor_rejected_by_config_layer`（要求串里含 `files.idle_timeout_secs`，
+  并额外要求"1 秒本身可用"，免得红因来自别的规则）与
+  `idle_ceiling_rejected_by_config_layer`（配置层串 + 引擎 `to_limits()` 直调，两侧各钉一次）。
+- 单测 `idle_time_bounds_are_rejected_at_the_config_layer`。
+- 配方 MC19 / MC20（MC20 就是 NEW20 的等价物）入库，跑出来各 **1 红 1 翻**。
+⇒ 这一条也是给"逐条都有红测试"那句 G12 现时态话补的：先前它对 idle 上界是**未豁免的假话**。
+
+**W-2（案卷重算不出来）**：三条都改。①配方脚本入库
+`crates/nexus-web-gateway/tools/mutation-gateway-file-config.py`；②原始输出入库
+`.agents/mutation-log-gateway-file-config.txt`；③MODULE.md 引用的节名《第十二片再续》
+当时**全仓不存在**（我写的是《第十二片续》和几个 `—— … ——` 子题），已改成真实路径与真实题名。
+
+**N-1 登记的必答（探针早退）也照做了**：老配置那一步原来 `map_err(...)?`，于是
+`absent_section_is_disabled` 与 `disabled_yields_no_engine` 只能以"整体 FAIL + 其余字段缺席"
+被覆盖。改成记 `false` 继续跑之后，MC05/MC11/MC12 这三行现在都**指名翻这两格**。
+
+—— 最终变异表 MC01–MC20（唯一口径 = 提交 `8b07af8154fdf93abc9e1f264150c07690b1c37e`）——
+逐行给红单测数与**翻转的期望名**（W-2 要求的就是名单，不再只给计数）。
+MC00 baseline            85 passed / 0 翻 / 0 缺席
+MC01 亚秒下界拆掉         1 红  sub_second_window_rejected_by_config
+MC02 配置层窗口上界拆掉    1 红  over_24h_window_rejected_by_config
+MC03 不再委托引擎表       2 红  disabled_still_rejects_inconsistent_table,
+                        disabled_still_rejects_zero_ceiling,
+                        source_budget_below_pair_threshold_rejected,
+                        source_budget_above_table_capacity_rejected, invalid_table_yields_no_engine
+MC04 文件段只在开时校验    4 红  disabled_still_rejects_inconsistent_table,
+                        disabled_still_rejects_zero_ceiling
+MC05 存在性检查不门控      6 红  absent_section_is_disabled, disabled_yields_no_engine
+                        （**这两格以前不翻**，早退改掉之后才指名）
+MC06 kill-switch 失效     1 红  disabled_yields_no_engine
+MC07 缝里不先 validate     2 红  invalid_table_yields_no_engine, blank_token_yields_no_engine,
+                        blank_alias_yields_no_engine
+MC08 重复别名拆掉         1 红  duplicate_root_alias_rejected
+MC09 空别名拆掉           2 红  blank_root_alias_rejected, blank_alias_yields_no_engine
+MC10 镜像漂移            2 红  limits_round_trip_is_exact, durations_map_to_engine_units,
+                        over_24h_window_rejected_by_config
+MC11 去掉 serde default    1 红  absent_section_is_disabled, disabled_yields_no_engine
+MC12 Default 置 enabled     6 红  absent_section_is_disabled, disabled_yields_no_engine
+MC13 引擎层窗口上界拆掉    2 红  over_24h_window_rejected_by_config
+MC14 空白令牌拆掉         2 红  enabled_without_token_rejected, whitespace_only_token_rejected,
+                        blank_token_yields_no_engine
+MC15 根集合非空拆掉       1 红  enabled_without_roots_rejected
+MC16 缝永远交不出引擎      1 红  valid_config_launches_engine
+MC17 序列化藏窗口字段      1 红  files_section_survives_json_round_trip
+MC18 打开失败静默丢根      1 红  missing_root_path_rejected
+MC19 配置层 idle 下界拆掉   1 红  idle_floor_rejected_by_config_layer
+MC20 配置层 idle 上界拆掉   1 红  idle_ceiling_rejected_by_config_layer（= 评审方 NEW20）
+MC99 restored            85 passed / 0 翻
+
+覆盖率实数：场景 25 个 `field =` 里 23 个是断言（`verdict` 是整体状态、`case` 是形参），
+**这 23 条每一个都至少被一条配方以"翻自己那一格"的方式打过**；20 条配方无一零杀伤；
+"NO JSON / 整体早退"这一行在本表里出现 **0 次**（上一版有 4 行是那种红法）。
+上一节写的"19 条有指名杀伤"是**当时那张 18 行表**的实数，不是本节口径，两数并存是对的，
+不抹旧数。
+
+—— 口径可达性的一点自嘲 ——
+本节复验用的提交前树 `046c39e…`（stash 形态）在推上 `8b07af8` 之后**立刻变成不可取**
+（`git diff --name-only 046c39e HEAD` ⇒ `fatal: bad object`，正是 r14 W-4 指认的现象）。
+两棵树的等价在这里是**构造性**的：`git stash create` 与随后 `git commit` 用的是同一个索引，
+中间我没有再 `git add`。这条等价性不是重新跑出来的，所以写清楚来源；本节的口径一律用
+可取到的 `8b07af8`。
+
+—— 又一处自己的笔误（提交前抓到）——
+`8b07af8` 的提交信息初稿把 evidence 目录写成 `verify-479b5dc99993`，实测是
+`verify-479b5dc996d2`（一位数字之差）。因为这条数是**提交前**在验证机上跑出来的，
+`git commit -F` 前对了一眼就改掉了；记在这儿是因为这类"手抄一位"正是案卷里最贵的那种错。
+
+—— 本节的数字与门禁（先跑再写）——
+提交前那棵（内容与 `8b07af8` 同索引）：clippy `--all-targets` 无诊断输出 /
+85 passed / 0 failed / product.gateway-file-config **25 条全绿** / verify --fast 9 门全 PASS
+（evidence `verify-479b5dc996d2`）/ dirty_state=false /
+contract_hash **553987ffff303942f3ef868de5734eab24ba05e2**（提交正文带的就是这个号）。
+E4 期望合计：104 + 25 = **129**。`--lib` 85。
+第十三片那条新契约（`product.gateway-file-resource-accounting`，11 条）在同一棵树上仍
+**FAIL**，红在 `unknown case "resource-accounting"`——这是契约先行的应有红法，且它
+**不影响那 9 道门**（门集不含产品场景；`policies/quality.toml` 声明 8 条 +
+`commands.rs:270` 硬塞 whitespace，见知识条目那条 r14 N-4 复核）。
+
+评审链：… → r12(0F/1W/3N) → r13(0F/4W/7N，本链第一次抓到"补的对象只红在词法层") →
+r14(0F/2W/3N，本链第一次由**评审方自设配方**打中我漏钉的规则；同轮第一次派单中断零交付) →
+r15（第十二片再续的复核 + 第十三片实现，待派）。

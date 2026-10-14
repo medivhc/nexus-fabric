@@ -104,8 +104,8 @@
 "从配置构造"这条路，不约束绕过配置的构造。**"拒启动"目前成立在构造缝上**：`Gateway::start` 还没消费
 `file_engine()`，线上也没有文件动词的分发，所以本条现在钉住的是"没有可寻址的引擎"，
 而"关断时连动词都到不了"要等 M2 接线补对象（`REQ-014` 把这条残差点名挂着）。
-配置层的承载体是 `product.gateway-file-config`（23 条期望，E4）加 `config.rs` 的
-11 条单测（`absent_files_section_is_disabled`、
+配置层的承载体是 `product.gateway-file-config`（25 条期望，E4）加 `config.rs` 的
+12 条单测（`absent_files_section_is_disabled`、
 `disabled_section_still_rejects_an_inconsistent_table`、
 `sub_second_window_is_rejected_at_the_config_layer`、
 `over_24h_window_is_rejected_in_both_layers`、
@@ -114,7 +114,8 @@
 `enabled_config_launches_an_engine_and_missing_path_does_not`、
 `files_section_round_trips_through_json`、`limits_mirror_is_field_by_field_exact`、
 `an_inconsistent_enabled_table_cannot_launch_an_engine`、
-`blank_credential_and_alias_are_refused_at_the_construction_seam`）。
+`blank_credential_and_alias_are_refused_at_the_construction_seam`、
+`idle_time_bounds_are_rejected_at_the_config_layer`）。
 窗口那两条各钉**一层答的话**（配置层看错误串里的 `files.lockout_window_secs` 字段名——
 不是开头，`GatewayError::Config` 的 Display 会加 `config error: ` 前缀；引擎层由
 `to_limits().validate()` 直接调）：只断言 `is_err()` 时委托让"删掉哪一层"不可分辨，

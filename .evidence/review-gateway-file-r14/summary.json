@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "round": "review-gateway-file-r14",
+  "attempt": 2,
+  "verdict": "COMMENTED",
+  "reviewer": {
+    "model_as_reported_by_runtime": "qfmodel",
+    "hosts": {
+      "windows": "Git Bash, git 2.46.0.windows.1, node v24.14.1; no Windows compile attempted (crates/nexus-web-gateway cannot build on Windows by repo-documented ssh2 cfg gate)",
+      "linux": "xc-pc-linux via ssh appen@10.144.144.4, rustc/cargo 1.98.1, git 2.25.1, host python3; WSL not used for any conclusion",
+      "cargo_invocation": "ssh + CARGO_TARGET_DIR=/work/r14-target, cwd=/work/r14-audit (clone LEFT BY the interrupted attempt-1 reviewer; not built by me from zero), probe = cargo run -q -p nexus-web-gateway --example gateway_file_contract -- --case config --json"
+    },
+    "tree_provenance": "audit tree HEAD = 66edcc4; mutation-table口径 in the ledger is 0dbc1d2; my anchor precheck (count==1 for every recipe on config.rs/file_service.rs) passed on 66edcc4, and git diff 0dbc1d2..66edcc4 shows no change to probe/config/file_service code (only requirements.toml + docs), so reruns on this tree are comparable to the 0dbc1d2 table. Attempt-1 left only summary.provisional-attempt1-interrupted.json (all findings pending); nothing in it was used as evidence.",
+    "subject": "commits 294c4d3 / 0dbc1d2 / 66edcc4, branch feature/gateway-file-service-contracts, channel ref m0-verify = 8b6b0d0"
+  },
+  "questions": {
+    "Q1": {
+      "answer": "作者说对了（就现有措辞而言成立，不构成新错话）",
+      "measured_by_me": [
+        "MC06 rerun on /work/r14-audit (66edcc4): probe config flips=1 only [verdict PASS->FAIL], missing=21; lib red=1 (config::tests::absent_files_section_is_disabled)",
+        "MC11 rerun: identical shape (flips=1 verdict, missing=21, 1 red lib)",
+        "code read: probe examples/gateway_file_contract.rs lines 1565-1570 - both cells are inserted only AFTER two early-returning `?` sites (legacy parse map_err? and file_engine().map_err?), so neither cell can ever flip by itself; dispatch() inserts verdict=PASS only after all fields (line 125) and main() emits verdict=FAIL with case echo on Err (lines 92-101) - so `case` can never flip either",
+        "MODULE.md:99-105 (G12) and PRODUCT.md:3384-3391 sentences are written WITH their boundaries (拒启动成立在构造缝 / 只约束从配置构造这条路 / FileEngine::new 仍 pub), and MC06 provides a named-red unit test for the disabled->no-engine behavior at lib level; therefore the present-tense sentences are supported by a指名杀伤 at test level even though the probe cell has only the whole-FAIL red. I judge整体FAIL+bounded wording sufficient AS WRITTEN; the probe improvement (record false instead of early-return) is already registered as next-round must-answer by the ledger (line 1735 area) - I agree with deferring it, and with NOT calling the coverage 全覆盖"
+      ]
+    },
+    "Q2": {
+      "coverage_19": "CONFIRMED by my own recomputation. I parsed /work/mm10.log FLIP lines with my own node parser (not the implementer script): flipped names = 20 = 19 substantive expectations + verdict; never-flipped = case, absent_section_is_disabled, disabled_yields_no_engine. 23 field names were taken from scenarios/product/gateway_file_config.toml (I count 23 `field =` there). The 19-substantive + verdict split is self-consistent: verdict flips ONLY in the whole-FAIL shape (MC05/06/11/12) which is not a per-cell kill, and `case` is argv echo, not an assertion",
+      "reruns_vs_ledger_table": "MC07: 2 red + 3 flips (invalid_table_yields_no_engine, blank_token_yields_no_engine, blank_alias_yields_no_engine) = ledger; MC18: 1 red + flip missing_root_path_rejected = ledger count row (ledger count table records no NAME for MC18 - see W-2); MC06/MC11: 1 red + verdict flip + 21 missing = ledger; baseline 84 lib green / 23 expectations 0 flips; tree restored git status 0",
+      "my_new_recipe_NEW20": "disable config-layer idle-timeout 24h ceiling: config.rs `if self.idle_timeout_secs > MAX_FILE_WINDOW_SECS {` -> append `&& false` (this claim is NOT hit by any of the 18 recipes: MC02/MC13 only touch lockout ceilings, over_24h test at config.rs only sets lockout_window_secs). Measured result: 84 lib tests PASS, probe config flips=0 missing=0 => the config-layer idle ceiling (crates/nexus-web-gateway/src/config.rs:252) has ZERO named-red surface anywhere; behavior is still refused via delegation to engine validate (file_service.rs:222), only under a different error label. First attempt of this recipe was botched by my own shell escaping and produced a compile-error run; discarded and rerun clean (see N-2)",
+      "three_present_tense_checks": "FileEngine::new still pub (probe imports and calls it from example scope, compiles => externally reachable; file_service.rs `pub fn new`) - MODULE/PRODUCT bounded sentence TRUE; Gateway::start still does not consume file_engine() (grep file_engine() call sites: only config.rs tests + probe) - the 还没消费 admission TRUE; recomputable-source check FAILS STRICTLY: see W-2"
+    }
+  },
+  "findings": [
+    {"id": "W-1", "severity": "WARN", "title": "配置层 idle_timeout 24h 上界零可红对象，MODULE.md 的『除注明外逐条都有单测把它跑红』未注明豁免这一条", "file_line": "crates/nexus-web-gateway/src/config.rs:252 and crates/nexus-web-gateway/MODULE.md:139,160-163", "repro": "on /work/r14-audit: sed-insert ' && false' into 'if self.idle_timeout_secs > MAX_FILE_WINDOW_SECS {' then cargo test -p nexus-web-gateway --lib && cargo run -q -p nexus-web-gateway --example gateway_file_contract -- --case config --json", "measured": "0 red tests (84 passed), 0 flips, 0 missing"},
+    {"id": "W-2", "severity": "WARN", "title": "MODULE.md 引用的案卷《第十二片再续》标题不存在（案卷实际节名是『第十二片续』/『覆盖率（最终口径…）』），且 MC15-MC18 四行只有计数没有翻转名单名，mm10.py/mm10.log 只存在于实现者 Linux 机路径未入库 => 第三方仅靠案卷不能重算出 19，只能重算『23-2=21 再信 3 个未翻名字』的减法", "file_line": "crates/nexus-web-gateway/MODULE.md:133; .agents/green-evidence-gateway-file-service-m1.txt:1602,1693,1720-1723", "repro": "git grep -l 再续 => 仅 MODULE.md; grep -n MC15 .agents/green-evidence-gateway-file-service-m1.txt (count rows without names); my own node parse of /work/mm10.log on the Linux box (names recoverable only there)"},
+    {"id": "N-1", "severity": "NOTE", "title": "Q1 判定：作者立场实测成立；两格确无自翻对象；两句现时态描述因带边界且有指名红的单测而可保留；探针早退改指名已登记为下一轮必答"},
+    {"id": "N-2", "severity": "NOTE", "title": "出处：复用了中断的第一次派单留下的 /work/r14-audit(66edcc4)+/work/r14-target，不是我自己从零建的树；我自己的 NEW20 第一次跑因 bash 转义坏了，作废重跑；结束后 audit 树 git status 为 0"},
+    {"id": "N-3", "severity": "NOTE", "title": "r13 四条 WARN 处置复核：W-1 已闭环（MC07 复跑 3 翻转含两条新对象）、W-2 已闭环（边界句已写且与 FileEngine::new pub 实测一致）、W-3 已闭环（名单按字段 diff 记，我也只用字段 diff）、W-4 已闭环（口径为可达提交 0dbc1d2，我在 66edcc4 复跑 4 条全对得上）"}
+  ],
+  "counts": {"fail": 0, "warn": 2, "note": 3},
+  "not_run": []
+}
