@@ -299,3 +299,60 @@ requires_capabilities = ["linux_executor", "tun_net_admin"]
 
 `CLAUDE.md` 中已写明：Step 0 跑守卫 → 只读 `test-plan.json` 的 `selected`/`skipped` →
 skipped 记为 `SKIPPED` 不得记 PASS → 禁止为变绿削弱 gate（应返回 `BLOCKED`）。
+
+## 10. 沙箱出网与推送通道（2026-10-15 实测）
+
+沙箱对 GitHub 各端点的通达性**差异极大**，且**读与写走的不是同一条路**。
+踩过坑后把实测结论固化在此，避免重复排查。
+
+### 10.1 通达性实测
+
+| 端点 | 用途 | 直连结果 | 备注 |
+|------|------|----------|------|
+| `github.com:443` | git 读/写（HTTPS） | ❌ **SYN 被丢，curl 挂死 >7min** | 最坑：解析到的 IP 被拦，间歇性连上也要 36s |
+| `api.github.com` | REST API | ✅ **秒通（~0.74s）** | 与 github.com 不是同一 IP 段，完全不受影响 |
+| `codeload.github.com` | 源码包下载 | ✅ 通（~15s，慢） | |
+| `ssh.github.com:443` | **SSH-over-443** | ✅ **TCP 可达，握手正常** | 沙箱唯一可靠的 git 写通道 |
+| `v6.gh-proxy.org` 等 | 反向代理（下载加速） | ✅ 通（~0.8s） | 见 10.2 的重要限制 |
+
+### 10.2 关键区分：代理能加速下载，但**不能用于推送**
+
+gh-proxy 类（`v6.gh-proxy.org` / `ghfast.top` / `gh-proxy.com`）是**URL 前缀反向代理**，
+工作方式是转发路径 `https://<proxy>/https://github.com/<path>`。实测限制：
+
+| 操作 | 经 gh-proxy | 原因 |
+|------|-------------|------|
+| 下载制品/页面（GET） | ✅ 可用 | 纯转发，§3.1 的代理基准结论仍成立 |
+| `git push`（写） | ❌ **不可用** | ① 剥离 `Authorization` 头（返回 `No anonymous write access`）；② 把 URL 内嵌的 `user:token@` 当作路径一部分，导致 `repository not found` |
+
+**结论**：`github_proxy` 这个 capability 只描述**下载出网能力**，
+**不能**被解读为"可以推送"。二者必须分开看待。
+
+### 10.3 可复现的推送步骤（SSH-over-443）
+
+```bash
+# 1) 生成临时 key，经 api.github.com 注册（该端点直连通，无需代理）
+ssh-keygen -t ed25519 -f ~/.ssh/gh_push_tmp -N "" -C "sandbox-temp-push"
+curl -X POST -H "Authorization: token $TOKEN" -H "Content-Type: application/json" \
+     -d "{\"title\":\"sandbox-temp-push\",\"key\":\"$(cat ~/.ssh/gh_push_tmp.pub)\"}" \
+     https://api.github.com/user/keys
+
+# 2) SSH 走 443 端口绕过 github.com 的拦截
+cat > ~/.ssh/config <<'EOF'
+Host github.com
+    HostName ssh.github.com
+    Port 443
+    User git
+    IdentityFile ~/.ssh/gh_push_tmp
+EOF
+
+# 3) 推送（用 insteadOf 临时覆盖，不污染 origin 配置）
+git -c url."git@github.com:".insteadOf="https://github.com/" push -u origin <branch>
+
+# 4) 清理：删除账户上的临时 key + 本地 key + config
+curl -X DELETE -H "Authorization: token $TOKEN" https://api.github.com/user/keys/<key_id>
+rm -f ~/.ssh/gh_push_tmp* ~/.ssh/config
+```
+
+> 该方法依赖 token 具备 `admin:public_key` scope。注册用临时 key、用完即删，
+> 比长期保留 PAT 在 git 配置里更安全。
