@@ -49,6 +49,11 @@ metadata:
 - 给 nexus-harness 提第 4 条门：**requirements.toml 校验应进 `verify` 的门禁集**
   （现在它是 CI-only，等价于本地永远绿）。与已有的三条（digest 静默降级、
   evidence 覆写、pre-commit 第 4 关字典序）同批立案，见任务 #36。
+- 门的**真实来源**（r13 N-4 复核）：`verify --fast` 的门集 = `commands.rs:270` 硬塞的
+  `whitespace_gate` ⊕ `config.declared_gates("fast")`，后者读
+  `policies/quality.toml` 的 `/verification/fast/gates`（声明 8 条）。
+  ⇒ 真要加 requirements 这道门，**加在 `policies/quality.toml` 的声明里**并按声明实现，
+  不要往 `commands.rs` 里硬塞第二条——硬塞的那条正是"声明与实跑会分叉"的成因本身。
 - 推广一句：**任何只被"外部系统"读、不被本地门读的文件都会腐烂**。写文档型契约时先问
   "谁解析它，解析器在我这边跑不跑"，答不出来就顺手加一个本地校验对象。
 
