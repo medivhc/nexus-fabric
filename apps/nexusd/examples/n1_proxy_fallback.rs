@@ -139,9 +139,7 @@ impl Socks5Server {
             .read_exact(&mut greet)
             .map_err(|e| format!("greeting read: {e}"))?;
         if greet[0] != 5 || greet[1] != 1 || greet[2] != 0 {
-            return Err(format!(
-                "bad socks5 greeting: {greet:?} (expected no-auth)"
-            ));
+            return Err(format!("bad socks5 greeting: {greet:?} (expected no-auth)"));
         }
         client
             .write_all(&[5, 0])
@@ -243,8 +241,8 @@ fn child_main(cfg: ChildCfg) -> Result<(), String> {
     let b_addr: SocketAddr = format!("{CHILD_IP}:{PORT}").parse().unwrap();
 
     // B：直连 UDP 监听（端口开放；iptables DROP 使 A 永远连不上）。
-    let direct_listener = FabricListener::bind(b_addr)
-        .map_err(|e| format!("direct listen: {e}"))?;
+    let direct_listener =
+        FabricListener::bind(b_addr).map_err(|e| format!("direct listen: {e}"))?;
     let direct_accepted = Arc::new(AtomicBool::new(false));
     let da = Arc::clone(&direct_accepted);
     std::thread::spawn(move || {
@@ -255,8 +253,7 @@ fn child_main(cfg: ChildCfg) -> Result<(), String> {
     });
 
     // B：TCP 代理入向监听。
-    let tcp_listener = TcpListener::bind(b_addr)
-        .map_err(|e| format!("tcp bind: {e}"))?;
+    let tcp_listener = TcpListener::bind(b_addr).map_err(|e| format!("tcp bind: {e}"))?;
     let proxy_accepted = Arc::new(AtomicBool::new(false));
     let pa = Arc::clone(&proxy_accepted);
     let (done_tx, done_rx) = mpsc::channel::<()>();
@@ -265,15 +262,12 @@ fn child_main(cfg: ChildCfg) -> Result<(), String> {
             .accept()
             .map_err(|e| format!("tcp accept: {e}"))?;
         let transport = ProxyTransport::new(stream, b_addr);
-        let listener = FabricListener::bind_with_transport_identity(Box::new(transport), &b_identity)
-            .map_err(|e| format!("bind_with_transport_identity: {e}"))?;
+        let listener =
+            FabricListener::bind_with_transport_identity(Box::new(transport), &b_identity)
+                .map_err(|e| format!("bind_with_transport_identity: {e}"))?;
         pa.store(true, Ordering::SeqCst);
-        let conn = listener
-            .accept()
-            .map_err(|e| format!("quic accept: {e}"))?;
-        let (mut send, mut recv) = conn
-            .accept_bi()
-            .map_err(|e| format!("accept_bi: {e}"))?;
+        let conn = listener.accept().map_err(|e| format!("quic accept: {e}"))?;
+        let (mut send, mut recv) = conn.accept_bi().map_err(|e| format!("accept_bi: {e}"))?;
         let mut buf = [0u8; ECHO_LEN];
         let mut off = 0;
         while off < ECHO_LEN {
@@ -304,7 +298,16 @@ fn child_main(cfg: ChildCfg) -> Result<(), String> {
     });
 
     // A：iptables DROP 直连 UDP。
-    sudo_iptables(&["-A", "OUTPUT", "-p", "udp", "--dport", &PORT.to_string(), "-j", "DROP"])?;
+    sudo_iptables(&[
+        "-A",
+        "OUTPUT",
+        "-p",
+        "udp",
+        "--dport",
+        &PORT.to_string(),
+        "-j",
+        "DROP",
+    ])?;
     eprintln!("[child] iptables DROP udp dport {PORT} installed");
 
     // A：network.toml + proxy 配置 → build_session_manager → dial(B)。
@@ -363,13 +366,12 @@ fn child_main(cfg: ChildCfg) -> Result<(), String> {
     b_res?;
 
     // 诚实判定 winner：只有代理路径被接受且直连未被接受 → winner=proxy。
-    let winner_kind = if proxy_accepted.load(Ordering::SeqCst)
-        && !direct_accepted.load(Ordering::SeqCst)
-    {
-        "proxy"
-    } else {
-        "direct"
-    };
+    let winner_kind =
+        if proxy_accepted.load(Ordering::SeqCst) && !direct_accepted.load(Ordering::SeqCst) {
+            "proxy"
+        } else {
+            "direct"
+        };
     let pass = winner_kind == "proxy" && echo_ok;
     let result = format!(
         "{{\"verdict\":\"{}\",\"winner_kind\":\"{}\",\"echo_ok\":{},\"dial_elapsed_ms\":{},\"direct_elapsed_ms\":5000,\"proxy_elapsed_ms\":{}}}",
@@ -494,16 +496,15 @@ fn parent_main() -> Result<String, String> {
     });
 
     sudo_ip(&[
-        "link",
-        "add",
-        &veth_a,
-        "type",
-        "veth",
-        "peer",
-        "name",
-        &veth_b,
+        "link", "add", &veth_a, "type", "veth", "peer", "name", &veth_b,
     ])?;
-    sudo_ip(&["addr", "add", &format!("{PARENT_IP}/{CIDR}"), "dev", &veth_a])?;
+    sudo_ip(&[
+        "addr",
+        "add",
+        &format!("{PARENT_IP}/{CIDR}"),
+        "dev",
+        &veth_a,
+    ])?;
     sudo_ip(&["link", "set", &veth_a, "up"])?;
 
     let result = parent_run(&veth_b);
@@ -560,10 +561,7 @@ fn parent_run(veth_b: &str) -> Result<String, String> {
     let v: serde_json::Value = serde_json::from_str(&child_json)
         .map_err(|e| format!("bad child json {child_json:?}: {e}"))?;
     let child_pass = v.get("verdict").and_then(|x| x.as_str()) == Some("PASS");
-    let winner_kind = v
-        .get("winner_kind")
-        .and_then(|x| x.as_str())
-        .unwrap_or("?");
+    let winner_kind = v.get("winner_kind").and_then(|x| x.as_str()).unwrap_or("?");
     let echo_ok = v.get("echo_ok").and_then(|x| x.as_bool()).unwrap_or(false);
     let dial_elapsed_ms = v
         .get("dial_elapsed_ms")
@@ -642,17 +640,12 @@ fn main() {
                 .map(|a| a.trim_start_matches(&format!("--{k}=")).to_string())
                 .unwrap_or_default()
         };
-        let cfg = ChildCfg {
-            veth: get("veth"),
-        };
+        let cfg = ChildCfg { veth: get("veth") };
         match child_main(cfg) {
             Ok(()) => (String::new(), true),
             Err(e) => {
                 // 父进程轮询 DONE 文件；出错时也写 FAIL，避免父进程等到超时。
-                let fail = format!(
-                    "{{\"verdict\":\"FAIL\",\"detail\":\"child: {}\"}}",
-                    esc(&e)
-                );
+                let fail = format!("{{\"verdict\":\"FAIL\",\"detail\":\"child: {}\"}}", esc(&e));
                 let _ = std::fs::write(DONE_FILE, &fail);
                 (fail, false)
             }
