@@ -374,7 +374,7 @@ fn parse_proxy_section(t: &toml::Value) -> Result<ProxySection, String> {
         None => {
             return Err(format!(
                 "{DAEMON_TOML}: [network.proxy].type is required (socks5|shadowsocks|trojan)"
-            ))
+            ));
         }
     };
 
@@ -395,7 +395,7 @@ fn parse_proxy_section(t: &toml::Value) -> Result<ProxySection, String> {
         None => {
             return Err(format!(
                 "{DAEMON_TOML}: [network.proxy].server is required (host:port)"
-            ))
+            ));
         }
     };
 
@@ -403,13 +403,14 @@ fn parse_proxy_section(t: &toml::Value) -> Result<ProxySection, String> {
         match t.get(key) {
             None => Ok(10),
             Some(x) => {
-                let n = x.as_integer().and_then(|i| u64::try_from(i).ok()).ok_or_else(
-                    || format!("{DAEMON_TOML}: [network.proxy].{key} must be a positive integer"),
-                )?;
+                let n = x
+                    .as_integer()
+                    .and_then(|i| u64::try_from(i).ok())
+                    .ok_or_else(|| {
+                        format!("{DAEMON_TOML}: [network.proxy].{key} must be a positive integer")
+                    })?;
                 if n == 0 {
-                    return Err(format!(
-                        "{DAEMON_TOML}: [network.proxy].{key} must be > 0"
-                    ));
+                    return Err(format!("{DAEMON_TOML}: [network.proxy].{key} must be > 0"));
                 }
                 Ok(n)
             }
@@ -449,7 +450,7 @@ fn parse_proxy_section(t: &toml::Value) -> Result<ProxySection, String> {
                     return Err(format!(
                         "{DAEMON_TOML}: [network.proxy].password is required (non-empty) for {}",
                         proxy_type.as_str()
-                    ))
+                    ));
                 }
             }
         }
@@ -459,9 +460,7 @@ fn parse_proxy_section(t: &toml::Value) -> Result<ProxySection, String> {
     if proxy_type == ProxyType::Shadowsocks {
         if let Some(m) = method.as_deref() {
             nexus_proxy_transport::SsMethod::parse(m).map_err(|e| {
-                format!(
-                    "{DAEMON_TOML}: [network.proxy].method unsupported for shadowsocks: {e:?}"
-                )
+                format!("{DAEMON_TOML}: [network.proxy].method unsupported for shadowsocks: {e:?}")
             })?;
         }
     }
@@ -995,9 +994,7 @@ mod tests {
     // ---------- [network.proxy]（#3 fabric-over-proxy，AC3） ----------
 
     fn socks5_section(type_line: &str, extra: &str) -> String {
-        format!(
-            "[network.proxy]\ntype = \"{type_line}\"\nserver = \"127.0.0.1:1080\"\n{extra}"
-        )
+        format!("[network.proxy]\ntype = \"{type_line}\"\nserver = \"127.0.0.1:1080\"\n{extra}")
     }
 
     #[test]
@@ -1044,11 +1041,7 @@ mod tests {
 
     #[test]
     fn proxy_shadowsocks_default_method_ok() {
-        let cfg = parse_daemon_toml(&socks5_section(
-            "shadowsocks",
-            "password = \"pw\"\n",
-        ))
-        .unwrap();
+        let cfg = parse_daemon_toml(&socks5_section("shadowsocks", "password = \"pw\"\n")).unwrap();
         let p = cfg.proxy.expect("proxy");
         assert_eq!(p.proxy_type, ProxyType::Shadowsocks);
         assert!(p.method.is_none());
@@ -1067,11 +1060,8 @@ mod tests {
 
     #[test]
     fn proxy_trojan_ok() {
-        let cfg = parse_daemon_toml(&socks5_section(
-            "trojan",
-            "password = \"trojan-secret\"\n",
-        ))
-        .unwrap();
+        let cfg =
+            parse_daemon_toml(&socks5_section("trojan", "password = \"trojan-secret\"\n")).unwrap();
         let p = cfg.proxy.expect("proxy");
         assert_eq!(p.proxy_type, ProxyType::Trojan);
     }
@@ -1094,17 +1084,21 @@ mod tests {
 
     #[test]
     fn proxy_server_not_socket_addr_is_err() {
-        assert!(parse_daemon_toml(&socks5_section("socks5", "server = \"proxy.example\"\n")).is_err());
+        assert!(
+            parse_daemon_toml(&socks5_section("socks5", "server = \"proxy.example\"\n")).is_err()
+        );
         assert!(parse_daemon_toml(&socks5_section("socks5", "server = \"\"\n")).is_err());
     }
 
     #[test]
     fn proxy_bad_method_is_err() {
-        assert!(parse_daemon_toml(&socks5_section(
-            "shadowsocks",
-            "password = \"pw\"\nmethod = \"aes-256-gcm\"\n",
-        ))
-        .is_err());
+        assert!(
+            parse_daemon_toml(&socks5_section(
+                "shadowsocks",
+                "password = \"pw\"\nmethod = \"aes-256-gcm\"\n",
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1120,39 +1114,33 @@ mod tests {
 
     #[test]
     fn proxy_timeout_zero_is_err() {
-        assert!(parse_daemon_toml(&socks5_section(
-            "socks5",
-            "connect_timeout_sec = 0\n",
-        ))
-        .is_err());
-        assert!(parse_daemon_toml(&socks5_section(
-            "socks5",
-            "handshake_timeout_sec = 0\n",
-        ))
-        .is_err());
+        assert!(
+            parse_daemon_toml(&socks5_section("socks5", "connect_timeout_sec = 0\n",)).is_err()
+        );
+        assert!(
+            parse_daemon_toml(&socks5_section("socks5", "handshake_timeout_sec = 0\n",)).is_err()
+        );
     }
 
     #[test]
     fn proxy_timeout_negative_is_err() {
-        assert!(parse_daemon_toml(&socks5_section(
-            "socks5",
-            "connect_timeout_sec = -1\n",
-        ))
-        .is_err());
-        assert!(parse_daemon_toml(&socks5_section(
-            "socks5",
-            "handshake_timeout_sec = -1\n",
-        ))
-        .is_err());
+        assert!(
+            parse_daemon_toml(&socks5_section("socks5", "connect_timeout_sec = -1\n",)).is_err()
+        );
+        assert!(
+            parse_daemon_toml(&socks5_section("socks5", "handshake_timeout_sec = -1\n",)).is_err()
+        );
     }
 
     #[test]
     fn proxy_timeout_non_integer_is_err() {
-        assert!(parse_daemon_toml(&socks5_section(
-            "socks5",
-            "connect_timeout_sec = \"fast\"\n",
-        ))
-        .is_err());
+        assert!(
+            parse_daemon_toml(&socks5_section(
+                "socks5",
+                "connect_timeout_sec = \"fast\"\n",
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1164,11 +1152,7 @@ mod tests {
 
     #[test]
     fn proxy_socks5_username_without_password_is_err() {
-        assert!(parse_daemon_toml(&socks5_section(
-            "socks5",
-            "username = \"nexus\"\n",
-        ))
-        .is_err());
+        assert!(parse_daemon_toml(&socks5_section("socks5", "username = \"nexus\"\n",)).is_err());
     }
 
     #[test]

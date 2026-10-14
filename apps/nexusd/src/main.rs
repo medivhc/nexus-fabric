@@ -491,15 +491,17 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         .network_toml
         .as_deref()
     {
-        Some(text) => match assembly::assemble_n1(text) {
-            Ok(bridge) => Some(bridge),
-            Err(e) => {
-                eprintln!(
-                    "[nexusd] ERROR: N1 assembly failed ({e}); degraded (mesh packets counted, not sent)"
-                );
-                None
+        Some(text) => {
+            match assembly::assemble_n1(text, loaded.daemon.proxy.as_ref(), Arc::clone(&shutdown)) {
+                Ok(bridge) => Some(bridge),
+                Err(e) => {
+                    eprintln!(
+                        "[nexusd] ERROR: N1 assembly failed ({e}); degraded (mesh packets counted, not sent)"
+                    );
+                    None
+                }
             }
-        },
+        }
         None => None,
     };
     let n1_sender: Option<Arc<dyn nexus_network::n1::bridge::N1Sender>> = n1_bridge
@@ -708,15 +710,23 @@ fn register_shutdown_flag(_flag: &Arc<AtomicBool>) {
 
 /// 启动时日志：哪些子系统被配置启用。
 fn log_enabled_subsystems(cfg: &LoadedConfig) {
-    let mut enabled: Vec<&str> = Vec::new();
+    let mut enabled: Vec<String> = Vec::new();
     if cfg.network_toml.is_some() {
-        enabled.push("network (N1 mesh)");
+        enabled.push("network (N1 mesh)".to_string());
     }
     if cfg.proxy_yaml.is_some() {
-        enabled.push("proxy");
+        enabled.push("proxy".to_string());
+    }
+    if let Some(p) = cfg.daemon.proxy.as_ref() {
+        // #3：只报协议与服务器地址，密码永不落日志（AC3）。
+        enabled.push(format!(
+            "network.proxy ({} @ {})",
+            p.proxy_type.as_str(),
+            p.server
+        ));
     }
     if cfg.dns_toml.is_some() {
-        enabled.push("dns");
+        enabled.push("dns".to_string());
     }
     if enabled.is_empty() {
         eprintln!("[nexusd] no subsystem configured (empty config dir); LocalAPI only");

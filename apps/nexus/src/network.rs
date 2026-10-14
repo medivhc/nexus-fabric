@@ -28,18 +28,18 @@ use nexus_network::n1::{
 #[cfg(target_os = "linux")]
 use nexus_network::n1::pump::{Ipv4Route, PeerConnLookup, VpiPump};
 use nexus_path::{CandidatePath, FallbackChain, FallbackConfig, PathKind, ProxyEndpoint};
+#[cfg(target_os = "linux")]
+use nexus_platform::VirtualPacketInterface;
 use nexus_proxy_transport::{
     ProxyTransport, Socks5ProxyConfig, SsProxyConfig, SsTransport, TrojanProxyConfig,
     TrojanTransport,
 };
-#[cfg(target_os = "linux")]
-use nexus_platform::VirtualPacketInterface;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "linux")]
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 // ---------- #3 fabric-over-proxy：超时预算（AC1） ----------
@@ -307,7 +307,11 @@ fn fallback_dial(
             return Err(N1Error::Closed);
         }
         let chain = FallbackChain::expand(&config, local_bind, *addr);
-        let chain_desc: Vec<&str> = chain.candidates().iter().map(|c| kind_label(c.kind)).collect();
+        let chain_desc: Vec<&str> = chain
+            .candidates()
+            .iter()
+            .map(|c| kind_label(c.kind))
+            .collect();
         eprintln!(
             "[path-fallback] chain expanded: {} (peer={peer_hex}, local={local_bind})",
             chain_desc.join(" -> ")

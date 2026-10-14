@@ -10,10 +10,11 @@
 //! 只有 TUN 失败是致命的（由 main.rs 处理）。
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use nexus_network::n1::bridge::N1MeshBridge;
 
-use super::config::LoadedConfig;
+use super::config::{self, LoadedConfig};
 use super::dataplane::DataplaneConfig;
 
 /// 从 `network.toml` 文本派生 mesh CIDR 列表（R2）。
@@ -79,13 +80,25 @@ pub fn mesh_bypass_overlap(mesh: &[String], bypass: &[String]) -> Vec<String> {
 /// - 各 peer `dial()` 在后台线程尽力而为（不阻塞 daemon 启动；单 peer
 ///   失败记 warn，不中断，降级语义）。
 ///
+/// `proxy` 为 `[network.proxy]` 配置（#3 fabric-over-proxy）；`shutdown` 是
+/// daemon 关闭标志，用于 fallback 的协作式取消。
+///
 /// # Errors
 /// - 配置解析失败；
+/// - `[network.proxy]` 映射为可拨号 `ProxyConfig` 失败；
 /// - SessionManager 构造失败。
 ///
 /// 调用方按 §13.3 降级：不调 `set_n1_sender`，dataplane 照常跑。
-pub fn assemble_n1(network_toml: &str) -> Result<Arc<N1MeshBridge>, String> {
-    let (config, mgr) = nexus::network::build_session_manager(network_toml)?;
+pub fn assemble_n1(
+    network_toml: &str,
+    proxy: Option<&config::ProxySection>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<Arc<N1MeshBridge>, String> {
+    let proxy_cfg = match proxy {
+        Some(section) => Some(proxy_config_from(section)?),
+        None => None,
+    };
+    let (config, mgr) = nexus::network::build_session_manager(network_toml, proxy_cfg, shutdown)?;
     // Arc 共享：bridge 持有 mgr 做路由，dial 线程持有 mgr 做尽力拨号。
     // dial 线程有界（N peers × 10s 握手超时），随进程退出而终止，无需显式回收。
     let mgr = Arc::new(mgr);
@@ -114,6 +127,58 @@ pub fn assemble_n1(network_toml: &str) -> Result<Arc<N1MeshBridge>, String> {
         })
         .map_err(|e| format!("spawn n1 dial thread: {e}"))?;
     Ok(bridge)
+}
+
+/// 把 `[network.proxy]` 配置节映射为 `nexus::network::ProxyConfig`（#3 AC3）。
+///
+/// # Errors
+/// - `method` 非法（仅 shadowsocks 校验）。
+pub fn proxy_config_from(
+    section: &config::ProxySection,
+) -> Result<nexus::network::ProxyConfig, String> {
+    use nexus_proxy_transport::{
+        Socks5Auth, Socks5ProxyConfig, SsMethod, SsProxyConfig, TrojanProxyConfig,
+    };
+
+    let connect_timeout = std::time::Duration::from_secs(section.connect_timeout_sec);
+    let handshake_timeout = std::time::Duration::from_secs(section.handshake_timeout_sec);
+    match section.proxy_type {
+        config::ProxyType::Socks5 => {
+            // socks5：username+password 同时存在 → RFC1929 认证；否则无认证。
+            let auth = match (&section.username, &section.password) {
+                (Some(u), Some(p)) => Some(Socks5Auth {
+                    username: u.clone(),
+                    password: p.clone(),
+                }),
+                _ => None,
+            };
+            Ok(nexus::network::ProxyConfig::Socks5(Socks5ProxyConfig {
+                server: section.server,
+                auth,
+                connect_timeout,
+                handshake_timeout,
+            }))
+        }
+        config::ProxyType::Shadowsocks => {
+            let method = match section.method.as_deref() {
+                Some(m) => SsMethod::parse(m).map_err(|e| format!("bad ss method: {e:?}"))?,
+                None => SsMethod::Chacha20IetfPoly1305,
+            };
+            Ok(nexus::network::ProxyConfig::Shadowsocks(SsProxyConfig {
+                server: section.server,
+                method,
+                password: section.password.clone().unwrap_or_default(),
+                connect_timeout,
+                handshake_timeout,
+            }))
+        }
+        config::ProxyType::Trojan => Ok(nexus::network::ProxyConfig::Trojan(TrojanProxyConfig {
+            server: section.server,
+            password: section.password.clone().unwrap_or_default(),
+            connect_timeout,
+            handshake_timeout,
+        })),
+    }
 }
 
 /// 从 `LoadedConfig` 组装 `DataplaneConfig`（R2/R3；原 main.rs 逻辑下沉）。
@@ -431,7 +496,28 @@ mod tests {
     #[test]
     fn assemble_n1_bad_config_is_err() {
         // R1 降级路径：非法配置 → Err（调用方降级，不调 set_n1_sender）。
-        assert!(assemble_n1("[[[unclosed").is_err());
+        assert!(assemble_n1("[[[unclosed", None, Arc::new(AtomicBool::new(false))).is_err());
+    }
+
+    #[test]
+    fn assemble_n1_with_proxy_ok() {
+        // #3：合法 [network.proxy]（socks5）+ 合法 network.toml → Ok，route_count==1。
+        let section = crate::config::ProxySection {
+            proxy_type: crate::config::ProxyType::Socks5,
+            server: "127.0.0.1:1080".parse().unwrap(),
+            username: None,
+            password: None,
+            method: None,
+            connect_timeout_sec: 10,
+            handshake_timeout_sec: 10,
+        };
+        let bridge = assemble_n1(
+            &network_toml_with_routes(),
+            Some(&section),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("assemble_n1 with proxy should succeed");
+        assert_eq!(bridge.route_count(), 1);
     }
 
     fn loaded_with(network_toml: Option<&str>, qos: bool) -> LoadedConfig {

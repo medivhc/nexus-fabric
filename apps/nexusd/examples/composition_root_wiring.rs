@@ -94,12 +94,21 @@ fn run() -> serde_json::Value {
     let dns_bad_err = config::parse_dns_toml("[dns]\nfake_ip_range = \"not-a-cidr\"\n").is_err();
 
     // R1：N1 装配成功（dial 尽力而为，无真实对端时 warn 不失败）。
-    let n1_ok = match assembly::assemble_n1(&network_toml_good()) {
+    let n1_ok = match assembly::assemble_n1(
+        &network_toml_good(),
+        None,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    ) {
         Ok(bridge) => bridge.route_count() == 1,
         Err(_) => false,
     };
     // R1：非法配置 → Err（降级路径）。
-    let n1_bad_err = assembly::assemble_n1("[[[unclosed").is_err();
+    let n1_bad_err = assembly::assemble_n1(
+        "[[[unclosed",
+        None,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .is_err();
 
     // R5：热加载分类。
     let mut loaded_new = loaded.clone();
