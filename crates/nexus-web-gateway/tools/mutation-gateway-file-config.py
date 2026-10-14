@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gateway file-service config-surface mutation harness (MC01-MC20).
+"""Gateway file-service config-surface mutation harness (MC01-MC22).
 
 Why this file is in the repo (review r14 W-2): the kill-power table's evidence used to
 live only on the implementer's Linux box (`/work/mm10.log`), so a third party could not
@@ -115,6 +115,15 @@ RECIPES = [
     ("MC20_idle_ceiling_off", CFG,
      C + "if self.idle_timeout_secs > MAX_FILE_WINDOW_SECS {",
      C + "if self.idle_timeout_secs > MAX_FILE_WINDOW_SECS && false {"),
+    # MC21/MC22 是评审 r15 的 R15B 一族：上界写成 `>=`（把边界值本身也误杀）。
+    # "越界必须拒"那几格对这种改动是**盲的**（两层同集合，删一侧不改判定），
+    # 所以对象必须是"边界值可用"本身——这就是 `*_ceiling_boundary_is_usable` 两格。
+    ("MC21_window_ceiling_off_by_one", CFG,
+     C + "if self.lockout_window_secs > MAX_FILE_WINDOW_SECS {",
+     C + "if self.lockout_window_secs >= MAX_FILE_WINDOW_SECS {"),
+    ("MC22_idle_ceiling_off_by_one", CFG,
+     C + "if self.idle_timeout_secs > MAX_FILE_WINDOW_SECS {",
+     C + "if self.idle_timeout_secs >= MAX_FILE_WINDOW_SECS {"),
 ]
 
 PATHS = sorted({r[1] for r in RECIPES})

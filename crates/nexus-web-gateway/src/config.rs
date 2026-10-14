@@ -783,6 +783,30 @@ mod tests {
     }
 
     #[test]
+    fn both_duration_ceilings_leave_the_boundary_value_usable() {
+        // 评审 r15 R15B：把上界写成 `>=`（连 24h 本身一起拒）时，"越界必须被拒"那几条
+        // 对象照样绿——配置层与引擎层这两道界的判定集合相同，删或改一侧都不改变"拒什么"，
+        // 于是差别只在"边界值还在不在可用集合里"。这一格必须自己有条对象，两层各测一次。
+        let mut cfg = valid_config();
+        cfg.files.lockout_window_secs = MAX_FILE_WINDOW_SECS;
+        cfg.files.idle_timeout_secs = MAX_FILE_WINDOW_SECS;
+        assert!(
+            cfg.validate().is_ok(),
+            "恰好 24 h 是合法配置：上界是排他的，不是闭的"
+        );
+        assert!(
+            cfg.files.to_limits().validate().is_ok(),
+            "引擎层同一条也得放行边界值"
+        );
+
+        cfg.files.lockout_window_secs += 1;
+        assert!(cfg.validate().is_err(), "越界一格就必须拒");
+        cfg.files.lockout_window_secs = MAX_FILE_WINDOW_SECS;
+        cfg.files.idle_timeout_secs += 1;
+        assert!(cfg.validate().is_err(), "另一侧同理");
+    }
+
+    #[test]
     fn files_section_round_trips_through_json() {
         // 热更新写出去再读回来，文件段必须原样在——否则一次序列化就把模块静默关回默认。
         let dir = std::env::temp_dir().join("nexus-files-cfg-roundtrip");

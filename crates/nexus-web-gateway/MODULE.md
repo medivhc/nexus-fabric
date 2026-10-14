@@ -116,10 +116,22 @@
 `an_inconsistent_enabled_table_cannot_launch_an_engine`、
 `blank_credential_and_alias_are_refused_at_the_construction_seam`、
 `idle_time_bounds_are_rejected_at_the_config_layer`）。
-窗口那两条各钉**一层答的话**（配置层看错误串里的 `files.lockout_window_secs` 字段名——
-不是开头，`GatewayError::Config` 的 Display 会加 `config error: ` 前缀；引擎层由
-`to_limits().validate()` 直接调）：只断言 `is_err()` 时委托让"删掉哪一层"不可分辨，
-这个形状是变异 MC01/MC02 实测出来的，不是推出来的。
+窗口的两条界先前写成"各钉**一层答的话**"，评审 r15 W-1 判这个说法**过界**并给了配方
+R15A（删掉配置层那条 + 把字段名搬进引擎的错误文本）：实测 0 红 0 翻，而两处改动之间
+唯一可观测的差别是**消息文本**——因为两层的判定集合相同，删任一侧都不改变"拒什么值"。
+所以这里钉的其实是两件不同的事，分开写：
+① **可诊断性**：错误串必须点名坏掉的旋钮（`files.lockout_window_secs`；不是开头匹配，
+`GatewayError::Config` 的 Display 会加 `config error: ` 前缀）——R15A 能骗过的只有这一件，
+因为它把名字搬到了另一处，运维仍然读得到该改哪一行；
+② **安全性**：越界的时长起不出引擎。这条**不要求"知道是谁答的"**，两层同集合是有意的
+冗余；它真正的对象是 MC03（拆掉委托）与 MC04（只在打开时校验）——那两条一改，两侧就同时
+不拦，5 条 / 2 条期望立刻翻。
+③ 还有第三件先前根本没对象的事：**边界值本身必须可用**。评审 r15 的 R15B（把上界写成
+`>=`，连恰好 24 h 一起误杀）在①②的对象上全绿——因为"越界要拒"这一看是盲的。
+新加冻结期望 `window_ceiling_boundary_is_usable` / `idle_ceiling_boundary_is_usable` 与
+单测 `both_duration_ceilings_leave_the_boundary_value_usable`，配方 MC21/MC22 就是这一族。
+**这条教训的形状与 r13/r14 那两条同一个**（补了对象 ≠ 补对了不可替代的那半；连续三轮都是
+同一种过界），所以这里保留"当时怎么想的"而不是只留结论。
 顺序性那句（"先 validate 再构造"）也一样：删掉 `file_engine()` 里 `self.validate()?`
 的变异 MC07 在**第一版对象集上 0 红 0 翻转**（没有任何期望拿"不合法的开启态表"去调这条
 缝），`an_inconsistent_enabled_table_cannot_launch_an_engine` 与同名冻结期望
@@ -163,8 +175,10 @@ ack 放不进会话额度就意味着每次 list 都当场 CAPACITY——评审 
 写入即过期、`idle_timeout = 0` 会让会话刚建即回收——评审 r4 R4-NEW-1），
 且时长不得越过 24 h（它们参与 `Instant` 加法，病态大值不是"更宽松"而是把锁死推到
 时钟边界之外——评审 r5 R5-W-2；数值型上限没有这种后果，仍只封低边）。24 h 这条
-**两层各写一次**（配置层 `MAX_FILE_WINDOW_SECS`、引擎层 `MAX_WINDOW_SECS`），因为配置层
-把整张表委托给引擎，只在一层写就等于另一层没有规则。
+**两层各写一次**（配置层 `MAX_FILE_WINDOW_SECS`、引擎层 `MAX_WINDOW_SECS`）：这是**有意的
+冗余**，不是"少一层就没规则"——两层判定集合相同，删任一侧拦的东西一模一样（评审 r15
+R15A 实测如此），写两层的目的是一侧被改坏时另一侧仍然兜住。真正"少一层就没规则"的
+对象是委托本身：MC03（不再委托）与 MC04（只在打开时校验）一改就红 5 条 / 2 条。
 根的非空与别名不重复在**打开态**由配置层校验（`enabled_without_*`、`*_root_alias_*`），
 路径的合法性则由 `file_engine()` 逐根 `SandboxRoot::open` 在启动前挡下——不留
 "配置通过、启动随机失败"这种两段式；`read_only` 组合仍是引擎侧校验。

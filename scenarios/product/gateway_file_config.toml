@@ -112,6 +112,17 @@ equals = true
 field = "idle_ceiling_rejected_by_config_layer"
 equals = true
 
+# 评审 r15 的 R15B 形状：把上界写成 `>=`（恰好 24h 也拒）时，"越界必须被拒"那几格照样绿——
+# 配置层与引擎层这两道界的判定集合相同，删一侧不改判定。所以**边界值可用**要自己的对象。
+# 这两条是加法，不动任何已冻结的期望。
+[[expect]]
+field = "window_ceiling_boundary_is_usable"
+equals = true
+
+[[expect]]
+field = "idle_ceiling_boundary_is_usable"
+equals = true
+
 # 单源额度的两条交叉界（G12）走的是引擎层 validate，这里证明配置路径真的调到了它。
 [[expect]]
 field = "source_budget_below_pair_threshold_rejected"

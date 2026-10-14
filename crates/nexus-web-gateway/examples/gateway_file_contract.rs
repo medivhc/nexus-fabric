@@ -1709,11 +1709,15 @@ fn gateway_config(f: &mut Map<String, Value>) -> Result<(), String> {
     f.insert("limits_round_trip_is_exact".into(), json!(mirrored));
     f.insert("durations_map_to_engine_units".into(), json!(units));
 
-    // 6) 窗口两侧边界：亚秒在**配置层**被拒（引擎层故意不设下界，时间夹具要毫秒窗口），
-    //    24h 以上两层都拒。两条各钉各的层——委托让"删任一层"在只看 `is_err()` 的
-    //    对象面前不可分辨（变异 MC01/MC02 实测过这条），所以配置层这半必须看错误串：
-    //    只有配置层的界会给 `files.lockout_window_secs ...`，委托进来的引擎检查是
-    //    `files limits: ...`。
+    // 6) 窗口两侧界。这里钉的其实是**两件事**，评审 r15 W-1 要求把它们分开写：
+    //    ① 可诊断性：错误串必须点名坏掉的那个旋钮（`files.lockout_window_secs`），
+    //       运维才知道改哪一行；
+    //    ② 安全性：越界值起不出引擎——这一条**不依赖"是哪一层答的"**，因为配置层与
+    //       引擎层这两道界的判定集合相同，删掉任一侧都还是拒（评审方的 R15A 正是
+    //       "删配置层那条 + 把标签搬进引擎消息"，实测 0 红 0 翻，而行为只差在文本上）。
+    //    所以"各钉一层"这个说法先前是**写过界的**，现已在 MODULE/PRODUCT/REQ 三处降级成
+    //    上面这两条；配对的真正杀伤对象是 MC03/MC04（拆委托 / 只在开时校验）。
+    //    引擎那半仍由 `to_limits().validate()` 直调钉住——它是"至少一层要拦"的对象，不是"层身份"的对象。
     let mut on_files = base_files();
     on_files.enabled = true;
     on_files.token = "s3cret".into();
@@ -1769,6 +1773,30 @@ fn gateway_config(f: &mut Map<String, Value>) -> Result<(), String> {
     f.insert(
         "idle_ceiling_rejected_by_config_layer".into(),
         json!(rejected_idle_ceiling),
+    );
+
+    // 6c) 边界**本身必须可用**（评审 r15 R15B 的形状：把上界写成 `>=` 之后，
+    //     恰好等于 24h 的合法配置也被拒，而"越界必须被拒"那几格照样绿——因为它们的
+    //     红是引擎替它红的话，两侧同集合时删任一侧都不改变判定）。
+    //     这两格是**加法**，不动任何已冻结的期望：冻结的那几条继续只管"越界要拒"，
+    //     新加的两条专门管"边界值不许被误杀"。
+    let window_ceiling_is_usable = {
+        let mut c = on_files.clone();
+        c.lockout_window_secs = MAX_FILE_WINDOW_SECS;
+        base_config(c).validate().is_ok()
+    };
+    let idle_ceiling_is_usable = {
+        let mut c = on_files.clone();
+        c.idle_timeout_secs = MAX_FILE_WINDOW_SECS;
+        base_config(c).validate().is_ok()
+    };
+    f.insert(
+        "window_ceiling_boundary_is_usable".into(),
+        json!(window_ceiling_is_usable),
+    );
+    f.insert(
+        "idle_ceiling_boundary_is_usable".into(),
+        json!(idle_ceiling_is_usable),
     );
 
     // 7) 单源额度的两条交叉界必须在真实配置路径上跑到（G12）。
