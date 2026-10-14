@@ -31,8 +31,8 @@ use nexus_path::{CandidatePath, FallbackChain, FallbackConfig, PathKind, ProxyEn
 #[cfg(target_os = "linux")]
 use nexus_platform::VirtualPacketInterface;
 use nexus_proxy_transport::{
-    ProxyTransport, Socks5ProxyConfig, SsProxyConfig, SsTransport, TrojanProxyConfig,
-    TrojanTransport,
+    ProxyTransport, Socks5ProxyConfig, SsProxyConfig, SsTransport, TlsTrojanTransport,
+    TrojanTlsConfig,
 };
 
 use std::net::{IpAddr, SocketAddr};
@@ -56,8 +56,8 @@ pub enum ProxyConfig {
     Socks5(Socks5ProxyConfig),
     /// Shadowsocks（AEAD session）。
     Shadowsocks(SsProxyConfig),
-    /// Trojan。
-    Trojan(TrojanProxyConfig),
+    /// Trojan-over-TLS（#3 BLOCKER：真实 trojan 服务端一律在 TLS 内握手）。
+    Trojan(TrojanTlsConfig),
 }
 
 impl ProxyConfig {
@@ -247,13 +247,13 @@ impl FabricDialer {
                 Box::new(t)
             }
             ProxyConfig::Trojan(cfg) => {
-                let c = TrojanProxyConfig {
-                    server: cfg.server,
-                    password: cfg.password.clone(),
-                    connect_timeout: min_timeout(cfg.connect_timeout, remaining()),
-                    handshake_timeout: min_timeout(cfg.handshake_timeout, remaining()),
-                };
-                let t = TrojanTransport::connect(&c, peer_addr)
+                // #3 BLOCKER：TLS + trojan 握手（TlsTrojanTransport），非明文。
+                let mut c = TrojanTlsConfig::new(cfg.server, cfg.password.clone(), cfg.sni.clone());
+                c.skip_cert_verify = cfg.skip_cert_verify;
+                c.alpn = cfg.alpn.clone();
+                c.connect_timeout = min_timeout(cfg.connect_timeout, remaining());
+                c.handshake_timeout = min_timeout(cfg.handshake_timeout, remaining());
+                let t = TlsTrojanTransport::connect(&c, peer_addr)
                     .map_err(|e| N1Error::Transport(format!("proxy: {e}")))?;
                 Box::new(t)
             }

@@ -137,7 +137,7 @@ pub fn proxy_config_from(
     section: &config::ProxySection,
 ) -> Result<nexus::network::ProxyConfig, String> {
     use nexus_proxy_transport::{
-        Socks5Auth, Socks5ProxyConfig, SsMethod, SsProxyConfig, TrojanProxyConfig,
+        Socks5Auth, Socks5ProxyConfig, SsMethod, SsProxyConfig, TrojanTlsConfig,
     };
 
     let connect_timeout = std::time::Duration::from_secs(section.connect_timeout_sec);
@@ -172,12 +172,31 @@ pub fn proxy_config_from(
                 handshake_timeout,
             }))
         }
-        config::ProxyType::Trojan => Ok(nexus::network::ProxyConfig::Trojan(TrojanProxyConfig {
-            server: section.server,
-            password: section.password.clone().unwrap_or_default(),
-            connect_timeout,
-            handshake_timeout,
-        })),
+        config::ProxyType::Trojan => {
+            // #3 BLOCKER：真实 trojan 服务端一律在 TLS 内握手；代理 tier 恒走
+            // `TlsTrojanTransport`（明文 `TrojanTransport` 对真实节点永远连不上）。
+            // SNI 缺省从 server 推导（config 层已补，这里是防御性回退）。
+            let sni = section
+                .sni
+                .clone()
+                .unwrap_or_else(|| section.server.ip().to_string());
+            let mut cfg = TrojanTlsConfig::new(
+                section.server,
+                section.password.clone().unwrap_or_default(),
+                sni,
+            );
+            cfg.skip_cert_verify = section.skip_cert_verify;
+            cfg.alpn = section
+                .alpn
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(String::into_bytes)
+                .collect();
+            cfg.connect_timeout = connect_timeout;
+            cfg.handshake_timeout = handshake_timeout;
+            Ok(nexus::network::ProxyConfig::Trojan(cfg))
+        }
     }
 }
 
