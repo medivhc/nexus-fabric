@@ -98,8 +98,10 @@
 
 **G12（文件面默认关闭，配置不自洽即拒启动）**：`files.enabled` 缺省 `false`，
 且这一段**已接入配置面**（不再是契约声明）：`GatewayConfig::validate` 末尾无条件调用
-`self.files.validate()`（开关不免责），`GatewayConfig::file_engine()` 是唯一构造入口——
-先 validate，关断时返回 `None`。**"拒启动"目前成立在构造缝上**：`Gateway::start` 还没消费
+`self.files.validate()`（开关不免责），`GatewayConfig::file_engine()` 是**从配置起引擎的
+唯一入口**——先 validate，关断时返回 `None`。边界要写清（评审 r13 W-2）：`FileEngine::new`
+本身仍是 `pub`（`lib.rs:20` 公开 `file_service`，探针与引擎单测直接调它），所以这句只约束
+"从配置构造"这条路，不约束绕过配置的构造。**"拒启动"目前成立在构造缝上**：`Gateway::start` 还没消费
 `file_engine()`，线上也没有文件动词的分发，所以本条现在钉住的是"没有可寻址的引擎"，
 而"关断时连动词都到不了"要等 M2 接线补对象（`REQ-014` 把这条残差点名挂着）。
 配置层的承载体是 `product.gateway-file-config`（21 条期望，E4）加 `config.rs` 的
@@ -111,7 +113,8 @@
 `duplicate_or_blank_root_alias_is_rejected`、
 `enabled_config_launches_an_engine_and_missing_path_does_not`、
 `files_section_round_trips_through_json`、`limits_mirror_is_field_by_field_exact`、
-`an_inconsistent_enabled_table_cannot_launch_an_engine`）。
+`an_inconsistent_enabled_table_cannot_launch_an_engine`、
+`blank_credential_and_alias_are_refused_at_the_construction_seam`）。
 窗口那两条各钉**一层答的话**（配置层看错误串里的 `files.lockout_window_secs` 字段名——
 不是开头，`GatewayError::Config` 的 Display 会加 `config error: ` 前缀；引擎层由
 `to_limits().validate()` 直接调）：只断言 `is_err()` 时委托让"删掉哪一层"不可分辨，
@@ -121,6 +124,11 @@
 缝），`an_inconsistent_enabled_table_cannot_launch_an_engine` 与同名冻结期望
 `invalid_table_yields_no_engine` 是补上去才有对象的——它同时断言拒它的是带委托标签
 `files limits` 的那条错，而不是 `SandboxRoot::open` 的路径检查。
+**但这条红只到词法层**（评审 r13 W-1，评审方在 Linux 上实测）：`FileEngine::new`
+第一句就 `limits.validate()?`，所以把缝里那句删掉，坏数值表仍然被拒，只是错误串换了标签。
+缝**不可替代**的那半只能是"配置层独有、且从 `file_engine()` 走一遍"的规则，两条各有对象：
+只含空白但非空的令牌（引擎只查 `is_empty()`）与空白根别名（`SandboxRoot::open` 和
+`FileEngine::new` 都不看别名内容，只查重复与非空集合）。
 `FileLimits` 的交叉约束任一校验不过 ⇒ **拒绝启动**，绝不"半启用"或静默放宽
 （fail-closed）。当前 enforced 的交叉约束（除注明外逐条都有单测把它跑红，
 且夹具只违反自己那一条）：

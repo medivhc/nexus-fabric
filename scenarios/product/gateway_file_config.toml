@@ -119,6 +119,20 @@ equals = true
 field = "invalid_table_yields_no_engine"
 equals = true
 
+# 评审 r13 W-1：上面那条的红是**词法**的——`FileEngine::new` 第一句就复检 limits，
+# 所以删掉缝里 `self.validate()?` 之后坏数值表仍然被拒，只是错误串换了标签。缝真正
+# 不可替代的那半只有"配置层独有的规则"，且必须从 `file_engine()` 走过去才成立：
+# ① 只含空白但非空的令牌（引擎只查 `is_empty()`，"   " 照收，而它会去匹配一个同样
+#    空白出示的串）；② 空白根别名（`SandboxRoot::open` 与 `FileEngine::new` 都不看
+#    别名内容）。两条各钉一次，红因必须是配置层的串。
+[[expect]]
+field = "blank_token_yields_no_engine"
+equals = true
+
+[[expect]]
+field = "blank_alias_yields_no_engine"
+equals = true
+
 [[expect]]
 field = "valid_config_launches_engine"
 equals = true

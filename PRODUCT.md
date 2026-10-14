@@ -3383,8 +3383,11 @@ portable-core/WASI 门），代之以双向一致性测试保证不漂移。
   `requirements.toml` 里仍保持 `doing`。
   `files.enabled` 缺省关闭这句**从 2026-10-14 起是 enforced 的**，不再是契约声明：
   `config.rs` 的 `FilesConfig` 段由 `GatewayConfig::validate` 无条件校验（开关不免责），
-  `GatewayConfig::file_engine()` 是唯一构造入口且关断时返回 `None`，承载体是
-  `product.gateway-file-config`（21 条期望）与 `config.rs` 的 10 条单测（`REQ-014`）。
+  `GatewayConfig::file_engine()` 是**从配置起引擎的唯一入口**且关断时返回 `None`——
+  这句只约束"从配置构造"这条路：`FileEngine::new` 本身仍是 `pub`（`lib.rs` 公开
+  `file_service`，探针与引擎单测直接调它），绕过配置去构造引擎不在这句的覆盖范围内
+  （评审 r13 W-2 要求写明这个边界）。承载体是 `product.gateway-file-config`（23 条期望）
+  与 `config.rs` 的 11 条单测（`REQ-014`）。
   **仍未证的那半**：`Gateway::start` 还没消费 `file_engine()`，线上也没有文件动词的
   分发，所以"拒启动"当前成立在构造缝上而不是进程路径上；M2 接线时必须补
   "关断时动词根本到不了"的对象，届时 r2 W-7 才算真正关闭。

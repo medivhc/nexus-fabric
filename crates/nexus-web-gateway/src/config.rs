@@ -713,6 +713,44 @@ mod tests {
     }
 
     #[test]
+    fn blank_credential_and_alias_are_refused_at_the_construction_seam() {
+        // 评审 r13 W-1：`invalid_table_yields_no_engine` 的红是**词法**的——`FileEngine::new`
+        // 第一句就 `limits.validate()?`（file_service.rs:1414），所以把缝里那句
+        // `self.validate()?` 删掉，坏数值表仍然被拒，只是错误串换了标签。缝真正不可替代的
+        // 那半是**只有配置层才有的规则**，而且必须从 `file_engine()` 走过去才成立：
+        // ① `token.trim().is_empty()` —— 引擎只查 `is_empty()`，"   " 这种非空但空白的
+        //    令牌引擎照收（它会去匹配一个同样空白出示的串）；
+        // ② 根别名的 `trim().is_empty()` —— `SandboxRoot::open` 与 `FileEngine::new`
+        //    都不检查别名是否为空白（只查重复与非空根集合）。
+        // 两条各配一个对象，红因必须是配置层的串，而不是引擎的包装。
+        let dir = std::env::temp_dir().join("nexus-files-cfg-seam-blank");
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+
+        let mut blank_token = valid_config();
+        blank_token.files = enabled_files(&dir);
+        blank_token.files.token = "   ".into();
+        let err = match blank_token.file_engine() {
+            Err(GatewayError::Config(msg)) => msg,
+            Err(other) => panic!("必须是 Config 类错误，拿到 {other:?}"),
+            Ok(None) => panic!("enabled=true 不该拿到 None，那会把拒绝藏起来"),
+            Ok(Some(_)) => panic!("只含空白的令牌必须在缝上就被拒，引擎不会替它拒"),
+        };
+        assert!(err.contains("files.token"), "要指到配置层的令牌规则: {err}");
+
+        let mut blank_alias = valid_config();
+        blank_alias.files = enabled_files(&dir);
+        blank_alias.files.roots[0].alias = "  ".into();
+        let err = match blank_alias.file_engine() {
+            Err(GatewayError::Config(msg)) => msg,
+            Err(other) => panic!("必须是 Config 类错误，拿到 {other:?}"),
+            Ok(Some(_)) => panic!("空白别名必须在缝上就被拒，两处引擎都不查它"),
+            Ok(None) => panic!("enabled=true 不该拿到 None"),
+        };
+        assert!(err.contains("empty alias"), "要指到别名规则: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn files_section_round_trips_through_json() {
         // 热更新写出去再读回来，文件段必须原样在——否则一次序列化就把模块静默关回默认。
         let dir = std::env::temp_dir().join("nexus-files-cfg-roundtrip");

@@ -1771,6 +1771,40 @@ fn gateway_config(f: &mut Map<String, Value>) -> Result<(), String> {
         json!(engine_refused),
     );
 
+    // 7c) 缝上**只有配置层才有**的两条规则。评审 r13 W-1 指出 7b 的红是词法性的：
+    //     `FileEngine::new` 第一句就 `limits.validate()?`，所以删掉缝里那句 `self.validate()?`
+    //     之后坏数值表仍然被拒（只是错误串换了标签）。真正不可替代这条缝的是：
+    //     ① 只含空白但非空的令牌——引擎只查 `is_empty()`，照收 "   "；
+    //     ② 空白根别名——`SandboxRoot::open` 与 `FileEngine::new` 都不检查别名内容。
+    let mut blank_token_cfg = on_files.clone();
+    blank_token_cfg.token = "   ".into();
+    let blank_token_refused = match base_config(blank_token_cfg).file_engine() {
+        Err(GatewayError::Config(msg)) => msg.contains("files.token"),
+        Err(other) => {
+            return Err(format!("空白令牌必须以 Config 类错误被拒，拿到 {other}"));
+        }
+        Ok(None) => return Err("enabled=true 时缝不该返回 None，那会把拒绝藏起来".into()),
+        Ok(Some(_)) => false,
+    };
+    let mut blank_alias_cfg = on_files.clone();
+    blank_alias_cfg.roots[0].alias = "  ".into();
+    let blank_alias_refused = match base_config(blank_alias_cfg).file_engine() {
+        Err(GatewayError::Config(msg)) => msg.contains("empty alias"),
+        Err(other) => {
+            return Err(format!("空白别名必须以 Config 类错误被拒，拿到 {other}"));
+        }
+        Ok(None) => return Err("enabled=true 时缝不该返回 None".into()),
+        Ok(Some(_)) => false,
+    };
+    f.insert(
+        "blank_token_yields_no_engine".into(),
+        json!(blank_token_refused),
+    );
+    f.insert(
+        "blank_alias_yields_no_engine".into(),
+        json!(blank_alias_refused),
+    );
+
     // 8) 合法配置必须真的起得出引擎，且 JSON 往返不丢这一段。
     let good = base_config(on_files.clone());
     let launched = match good.file_engine() {
