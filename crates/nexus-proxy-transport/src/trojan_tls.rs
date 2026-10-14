@@ -33,7 +33,7 @@ use rustls::pki_types::ServerName;
 use crate::{Counters, ProxyError, FRAME_HEADER_LEN, MAX_DATAGRAM};
 
 /// Trojan-over-TLS proxy server configuration (T7).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TrojanTlsConfig {
     /// `ip:port` of the trojan server (IP only — no DNS in the transport).
     pub server: SocketAddr,
@@ -49,6 +49,21 @@ pub struct TrojanTlsConfig {
     pub connect_timeout: Duration,
     /// I/O timeout during TLS + trojan handshake.
     pub handshake_timeout: Duration,
+}
+
+/// 手动 `Debug`：`password` 只输出 `***`，永不落日志（#3 BLOCKER 硬性约束 5）。
+impl std::fmt::Debug for TrojanTlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrojanTlsConfig")
+            .field("server", &self.server)
+            .field("password", &"***")
+            .field("sni", &self.sni)
+            .field("skip_cert_verify", &self.skip_cert_verify)
+            .field("alpn", &self.alpn)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("handshake_timeout", &self.handshake_timeout)
+            .finish()
+    }
 }
 
 impl TrojanTlsConfig {
@@ -350,6 +365,18 @@ mod tests {
         assert!(!cfg.skip_cert_verify);
         assert!(cfg.alpn.is_empty());
         assert_eq!(cfg.sni, "example.com");
+    }
+
+    #[test]
+    fn tls_config_debug_masks_password() {
+        let cfg = TrojanTlsConfig::new(
+            "127.0.0.1:443".parse().unwrap(),
+            "supersecret".to_string(),
+            "example.com".to_string(),
+        );
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("supersecret"));
+        assert!(dbg.contains("\"***\""));
     }
 
     #[test]
