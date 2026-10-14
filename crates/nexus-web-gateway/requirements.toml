@@ -7,7 +7,7 @@ id = "REQ-001"
 title = "/cert 下载被浏览器拦截"
 status = "done"
 priority = "P0"
-acceptance = "Chrome 无拦截下载 nexus-ca.pem"
+acceptance = 'Chrome 无拦截下载 nexus-ca.pem'
 created = "2026-10-10"
 
 [[req]]
@@ -15,7 +15,7 @@ id = "REQ-002"
 title = "身份偏好持久化"
 status = "done"
 priority = "P0"
-acceptance = "多网卡机器上所有非 loopback IP 都成为 ICE host candidate"
+acceptance = '多网卡机器上所有非 loopback IP 都成为 ICE host candidate'
 created = "2026-10-10"
 
 [[req]]
@@ -23,7 +23,7 @@ id = "REQ-003"
 title = "访问认证"
 status = "done"
 priority = "P0"
-acceptance = "延迟最低的 candidate 被选中；session 中可迁移到更优路径"
+acceptance = '延迟最低的 candidate 被选中；session 中可迁移到更优路径'
 created = "2026-10-10"
 
 [[req]]
@@ -31,7 +31,7 @@ id = "REQ-004"
 title = "网关身份持久化"
 status = "todo"
 priority = "P0"
-acceptance = "重启后 node_id 不变，无需重新配置"
+acceptance = '重启后 node_id 不变，无需重新配置'
 created = "2026-10-10"
 
 # ---- 网关文件服务（PRODUCT.md#18-gateway-file-service，契约先行，2026-10-11 M0）----
@@ -46,7 +46,7 @@ id = "REQ-005"
 title = "文件浏览：root 清单与分页列表"
 status = "doing"
 priority = "P0"
-acceptance = "列表按服务端硬上限分页；超限回 TRUNCATED+next_offset 且 next_offset 单调；截断结果不得被标记为完整列表（G12/G17；product.gateway-file-list-pagination）"
+acceptance = '列表按服务端硬上限分页；超限回 TRUNCATED+next_offset 且 next_offset 单调；截断结果不得被标记为完整列表（G12/G17；product.gateway-file-list-pagination）'
 created = "2026-10-11"
 
 [[req]]
@@ -54,7 +54,7 @@ id = "REQ-006"
 title = "文件下载：按 offset/max_bytes 拉字节页"
 status = "doing"
 priority = "P0"
-acceptance = "回 next_offset/eof；逐页拼接与源逐字节一致；超过页硬上限的请求显式拒绝（PAGE_TOO_LARGE）而不是静默夹取；字段语义对齐 N3-9（G17/G18；product.gateway-file-download-page）"
+acceptance = '回 next_offset/eof；逐页拼接与源逐字节一致；超过页硬上限的请求显式拒绝（PAGE_TOO_LARGE）而不是静默夹取；字段语义对齐 N3-9（G17/G18；product.gateway-file-download-page）'
 created = "2026-10-11"
 
 [[req]]
@@ -62,7 +62,7 @@ id = "REQ-007"
 title = "文件上传与续传：ack 只承认已连续落盘字节"
 status = "doing"
 priority = "P0"
-acceptance = "重复旧页必须逐字节匹配才接受；跳跃/重叠页拒绝且不重写已承认前缀；完整 SHA-256+长度校验通过后才提交；提交后不残留 .nexus-part.*（G18；product.gateway-file-upload-resume）"
+acceptance = '重复旧页必须逐字节匹配才接受；跳跃/重叠页拒绝且不重写已承认前缀；完整 SHA-256+长度校验通过后才提交；提交后不残留 .nexus-part.*（G18；product.gateway-file-upload-resume）'
 created = "2026-10-11"
 
 [[req]]
@@ -70,7 +70,7 @@ id = "REQ-008"
 title = "上传不覆盖已存在目标（requirement-change）"
 status = "doing"
 priority = "P0"
-acceptance = "目标已存在回 OUTPUT_EXISTS 且原字节一字未动；本地同文件系统 hard_link 原子发布；发布被拒时不留 .part 残留（G14；product.gateway-file-upload-no-replace + gateway_file_sftp_boundary 的 local_upload_supported=true）。写路径不适用于 SFTP 后端（见 REQ-013）。本条是用户可见语义变更，走 AGENTS.md §5 requirement-change，不用实现细节回避"
+acceptance = '目标已存在回 OUTPUT_EXISTS 且原字节一字未动；本地同文件系统 hard_link 原子发布；发布被拒时不留 .part 残留（G14；product.gateway-file-upload-no-replace + gateway_file_sftp_boundary 的 local_upload_supported=true）。写路径不适用于 SFTP 后端（见 REQ-013）。本条是用户可见语义变更，走 AGENTS.md §5 requirement-change，不用实现细节回避'
 created = "2026-10-11"
 
 [[req]]
@@ -78,7 +78,7 @@ id = "REQ-009"
 title = "root 沙箱：逐分量拒绝符号链接，删除不递归出界"
 status = "doing"
 priority = "P0"
-acceptance = "root 必须 canonicalize；逐段 lstat/readlink 拒绝逃逸；打开后重解析核实；list/read/write/remove 四条路径各自拒绝且 root 外文件仍在场；非规范 root 拒启动（G13；product.gateway-file-sandbox-symlink）"
+acceptance = 'root 必须 canonicalize；逐段 lstat/readlink 拒绝逃逸；打开后重解析核实；list/read/write/remove 四条路径各自拒绝且 root 外文件仍在场；非规范 root 拒启动（G13；product.gateway-file-sandbox-symlink）'
 created = "2026-10-11"
 
 [[req]]
@@ -86,7 +86,7 @@ id = "REQ-010"
 title = "文件令牌鉴权与失败节流锁定"
 status = "doing"
 priority = "P0"
-acceptance = "独立于页面登录的配置令牌 + 常数时间比较，且短路发生在比较之前（token_comparisons 计数可证：可比较的尝试恰好 +1，锁定/源锁短路的尝试 +0）；失败按（主体+源）成对键（定长 SHA-256 摘要，两半带长度前缀）节流，达阈值锁定，锁定窗口内正确口令也不绕过；计数与表项有界（行由准入行门禁有界、锁由 locked ≤ buckets ≤ max 有界且两侧各有读侧观测，键定长 32 字节），桶与溢出计数按 lockout_window 衰减 ⇒ 洪水不永久占位、停止注入一个窗口内自愈；单地址每窗口失败受 max_failures_per_source 限额：源锁表还有位置时只锁这个地址、不牵连他人也不升级为全体拒服务，而源账本与源锁表各自也受 max_throttle_buckets 门禁（锁表满时与两层键同形，升级为全局窗口——不留无界表项）；空 source 在认证处即拒（它不能当归属凭证），且引擎不归一化地址：认证与终止两处必须由同一供给点给出同一字符串，否则合法所有者关不掉自己的会话，两种写法还各拿一份单源额度（r11 R11-W-2：这条字符串实际有**五个**消费点——(主体,源) 摘要键的一半、源账本、源锁、per-peer 配额、close_session 归属；只数"四处"的旧写法已作废）。这两格都有机验对象：把地址差异从源摘要里去掉 ⇒ 最终复验树实测 6 条单测红 + 6 条期望翻转（70 条单测那棵树是 5 + 6，多的那条正是后来新增的源锁过期回收测试）。**pair 侧那一半也一样有对象**（r12 R12-W-1：先前只钉住"摘要吃不吃地址"这个机制，没钉"门槛翻倍"这个数量后果）：单测 `same_principal_with_two_address_spellings_doubles_the_pair_threshold` 与同名冻结期望 `pair_threshold_doubles_across_address_spellings` 断言"交替喂 2×(lockout_after-1) 条不武装、同总量的单一写法必须已武装、且桶数恰为 2"，把 `identity_key` 里喂 source 的那半整块去掉即打红它（配方与红数记在案卷《第十一片》的 r12 段）；M2 接线时按这份五点清单逐处核；close_session 必须出示与会话相同的传输地址（未知与不属于自己在返回值与审计行四格上逐字同形），被拒时不终止会话、不删他人 .part、不释放其预算；close_session 与闲置回收都不清节流状态，计数只由成功认证与窗口衰减清理；归属检查目前只覆盖 close_session，abort_upload 等按 id 删除的动词保留同一残余到 M2（G15/G16；product.gateway-file-auth-throttle）"
+acceptance = '独立于页面登录的配置令牌 + 常数时间比较，且短路发生在比较之前（token_comparisons 计数可证：可比较的尝试恰好 +1，锁定/源锁短路的尝试 +0）；失败按（主体+源）成对键（定长 SHA-256 摘要，两半带长度前缀）节流，达阈值锁定，锁定窗口内正确口令也不绕过；计数与表项有界（行由准入行门禁有界、锁由 locked ≤ buckets ≤ max 有界且两侧各有读侧观测，键定长 32 字节），桶与溢出计数按 lockout_window 衰减 ⇒ 洪水不永久占位、停止注入一个窗口内自愈；单地址每窗口失败受 max_failures_per_source 限额：源锁表还有位置时只锁这个地址、不牵连他人也不升级为全体拒服务，而源账本与源锁表各自也受 max_throttle_buckets 门禁（锁表满时与两层键同形，升级为全局窗口——不留无界表项）；空 source 在认证处即拒（它不能当归属凭证），且引擎不归一化地址：认证与终止两处必须由同一供给点给出同一字符串，否则合法所有者关不掉自己的会话，两种写法还各拿一份单源额度（r11 R11-W-2：这条字符串实际有**五个**消费点——(主体,源) 摘要键的一半、源账本、源锁、per-peer 配额、close_session 归属；只数"四处"的旧写法已作废）。这两格都有机验对象：把地址差异从源摘要里去掉 ⇒ 最终复验树实测 6 条单测红 + 6 条期望翻转（70 条单测那棵树是 5 + 6，多的那条正是后来新增的源锁过期回收测试）。**pair 侧那一半也一样有对象**（r12 R12-W-1：先前只钉住"摘要吃不吃地址"这个机制，没钉"门槛翻倍"这个数量后果）：单测 `same_principal_with_two_address_spellings_doubles_the_pair_threshold` 与同名冻结期望 `pair_threshold_doubles_across_address_spellings` 断言"交替喂 2×(lockout_after-1) 条不武装、同总量的单一写法必须已武装、且桶数恰为 2"，把 `identity_key` 里喂 source 的那半整块去掉即打红它（配方与红数记在案卷《第十一片》的 r12 段）；M2 接线时按这份五点清单逐处核；close_session 必须出示与会话相同的传输地址（未知与不属于自己在返回值与审计行四格上逐字同形），被拒时不终止会话、不删他人 .part、不释放其预算；close_session 与闲置回收都不清节流状态，计数只由成功认证与窗口衰减清理；归属检查目前只覆盖 close_session，abort_upload 等按 id 删除的动词保留同一残余到 M2（G15/G16；product.gateway-file-auth-throttle）'
 created = "2026-10-11"
 
 [[req]]
@@ -94,7 +94,7 @@ id = "REQ-011"
 title = "配额、背压与终端优先"
 status = "doing"
 priority = "P0"
-acceptance = "stream_id 由服务端签发，分片不新开读句柄；读句柄/会话/在途字节/RSS/重哈希字节有上界；超预算显式 QUEUE_FULL 且文件类丢弃有计数；终端字节流零丢失；配置交叉约束不自洽拒启动（G12/G16；product.gateway-file-quota-backpressure）"
+acceptance = 'stream_id 由服务端签发，分片不新开读句柄；读句柄/会话/在途字节/RSS/重哈希字节有上界；超预算显式 QUEUE_FULL 且文件类丢弃有计数；终端字节流零丢失；配置交叉约束不自洽拒启动（G12/G16；product.gateway-file-quota-backpressure）'
 created = "2026-10-11"
 
 [[req]]
@@ -102,7 +102,7 @@ id = "REQ-013"
 title = "SFTP 后端不提供写操作（无覆盖原语不可得，fail-closed）"
 status = "doing"
 priority = "P0"
-acceptance = "SFTP 根的 open_upload/mkdir/rename/remove 一律 UNSUPPORTED_CAPABILITY；在该传输真正实现前，其 list/read/stat 同样拒绝而不是返回误导性 NOT_FOUND；后端能力是 BackendKind 的静态属性（BackendKind::Sftp.allows_mutation()==false）；相对或含 .. 的远端根配置拒启动（G14/G13；product.gateway-file-sftp-boundary）。依据：libssh2 钳在 SFTP v3、rename flags 仅在 version>=5 入包，ssh2 0.9.6 未绑定 posix_rename；owner 2026-10-11 选定 fail-closed 选项"
+acceptance = 'SFTP 根的 open_upload/mkdir/rename/remove 一律 UNSUPPORTED_CAPABILITY；在该传输真正实现前，其 list/read/stat 同样拒绝而不是返回误导性 NOT_FOUND；后端能力是 BackendKind 的静态属性（BackendKind::Sftp.allows_mutation()==false）；相对或含 .. 的远端根配置拒启动（G14/G13；product.gateway-file-sftp-boundary）。依据：libssh2 钳在 SFTP v3、rename flags 仅在 version>=5 入包，ssh2 0.9.6 未绑定 posix_rename；owner 2026-10-11 选定 fail-closed 选项'
 created = "2026-10-11"
 
 [[req]]
@@ -110,5 +110,13 @@ id = "REQ-012"
 title = "能力协商、混版本退化与 /api/config 返回面收缩"
 status = "doing"
 priority = "P0"
-acceptance = "files 字段缺失＝旧版 ⇒ 无文件模式（不报错不卡连接）；版本不认识不静默建通道；/api/config 的文件面只声明能力与限制，TURN 段只回 urls，凭据经建立连接前的一次性短时效通道下发（G19；product.gateway-file-capability-negotiation）"
+acceptance = 'files 字段缺失＝旧版 ⇒ 无文件模式（不报错不卡连接）；版本不认识不静默建通道；/api/config 的文件面只声明能力与限制，TURN 段只回 urls，凭据经建立连接前的一次性短时效通道下发（G19；product.gateway-file-capability-negotiation）'
 created = "2026-10-11"
+
+[[req]]
+id = "REQ-014"
+title = "文件面配置接线与 kill switch（files 段进 GatewayConfig）"
+status = "doing"
+priority = "P0"
+acceptance = '`files` 段缺省存在且 `enabled=false`（升级二进制前写过的配置不得因新功能报错——absent_section_is_disabled）；关断不是免责：数值自洽性（含 G12 全部交叉约束与两侧时长界）在 enabled=false 时同样被拒（disabled_still_rejects_*，r2 W-7 与 r9 R9-W-2 的"开关不当检验豁免"口径）；enabled=true 时令牌、根、别名非空且不重名（enabled_without_*/*_root_alias_*）；`GatewayConfig::file_engine()` 是唯一构造入口，先 validate 再逐根 SandboxRoot::open，关断时返回 None 即"没有可寻址的引擎"而不是"有引擎但每次记得查标志"（disabled_yields_no_engine/valid_config_launches_engine）；数值镜像逐字段精确、时长按秒换算成引擎 Duration（limits_round_trip_is_exact/durations_map_to_engine_units）；JSON 往返不丢这一段（files_section_survives_json_round_trip）。承载体：product.gateway-file-config（21 条期望，E4）+ config.rs 的 10 条单测；变异表 MC01–MC13（13 条配方，树 fa2f81d 实测全数有杀伤）记在 .agents/green-evidence-gateway-file-service-m1.txt——其中 MC07（删掉缝里那句先 validate）在第一版对象集上实测 0 红 0 翻转，invalid_table_yields_no_engine 是补上去才有对象的；MC01/MC02 也一样，只断言 is_err() 时零杀伤，改成断言错误串带层标签才各自 1 红 1 翻转。**尚未证的那半**：Gateway::start 还没消费 file_engine()，线上也没有文件动词分发，所以"拒启动"当前成立在构造缝上而非进程路径上，M2 接线时必须补"关断时动词到不了"的对象（G12/M2 残差）（G12；product.gateway-file-config）'
+created = "2026-10-14"

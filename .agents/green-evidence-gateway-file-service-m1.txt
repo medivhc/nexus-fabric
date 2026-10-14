@@ -1384,6 +1384,154 @@ clippy、9 条场景 103 条期望、verify 其余 8 门都各自复跑为绿，
 bindings 只报"在这棵树上、这一轮跑出来的值"。
 
 评审链：… → r8(0F/3W/7N) → r9(0F/6W/9N) → r10(0F/2W/5N；评审方首次在 xc-pc-linux 上实测，
-本链第一次由非实现者给出红/绿与名单) → r11（D 轮处置的独立复核，待派）。第 10 轮已远超
+本链第一次由非实现者给出红/绿与名单) → r11(0F/2W/4N，D 轮处置的独立复核，两条 WARN 都是
+口径类) → r12(0F/1W/3N，"pair 侧门槛翻倍"从机制对象升到数量对象；本轮第一次出现
+"派出的评审者中断且零交付物"，重派时才把范围与交付顺序写死) → r13（第十二片：配置接线
+与 CI-only 门的独立复核，待派）。第 10 轮已远超
 AGENTS.md:1585 的默认 3 轮上限，r4/r5/r6 三次向仓库所有者报备后延续该状态；所有者口径是
 "子代理独立评审即可，不要等我操作"，故本轮不等绑定、直接派。
+
+================================================================================
+追加：M1 第十二片（`files` 配置接线 + kill-switch + 一条 CI-only 门的腐烂），
+宿主 xc-pc-linux（rustc/cargo 1.98.1，x86_64-unknown-linux-gnu，变异跑在隔离克隆
+/work/mm7 + 隔离 CARGO_TARGET_DIR=/work/mm7-target；门禁跑在 /work/m0-flake +
+共享 /work/nexus-dev/target）
+================================================================================
+
+本片三件事：
+1) `FilesConfig`/`FileRootConfig` 进 `GatewayConfig`；`GatewayConfig::validate` 末尾
+   **无条件**调用文件段校验（开关不免责）；新增唯一构造缝
+   `GatewayConfig::file_engine()`（先 validate，关断时 `Ok(None)`）。
+2) 新 E4 场景 `scenarios/product/gateway_file_config.toml`：契约先行，先写期望跑红
+   （RED = scenario-5255ab7c3dd6，失败签名 `unknown case "config"`，探针还不认这条 case），
+   实现落定后第一版 20 条期望全绿（scenario-f449860a94e0），补对象后 21 条（见下）。
+3) 被本片撞出来的一处**与本片无关的既有缺陷**：`requirements.toml` 不是合法 TOML。
+
+—— 期望计数为什么从 20 变成 21（未提交前扩容，不是事后放宽）——
+20 条那版跑绿之后，我用变异表去问"每一条宣称有没有红对象"，MC07（删掉 `file_engine()`
+里 `self.validate()?` 那句）**0 条单测红、0 条期望翻转** —— 也就是"先 validate 再构造"
+这句只活在注释和函数名里：没有任何期望拿"不合法的开启态表"去调这条缝。
+补的对象 = 冻结期望 `invalid_table_yields_no_engine` + 单测
+`an_inconsistent_enabled_table_cannot_launch_an_engine`，两者都要求拒它的错误串带
+**委托标签 `files limits`**，否则 `SandboxRoot::open` 的路径检查会冒充同一条结论。
+场景文件此时尚未提交（`git status` = `A scenarios/...`），所以这是同一份契约的定稿，
+不是对已冻结期望的改动。
+
+—— 变异表 MC01–MC13（口径树 `fa2f81d05720bd47cb57a0e478376319a694818d`）——
+每行给：配方（把哪个条件改成永不成立/替换成什么）→ `--lib` 红数与红名单 → `config`
+场景翻转的冻结期望名。`auth-throttle`（27 条）在全部 13 行里恒为 0 翻转，说明配置面的
+变异没有渗到引擎面。
+
+MC00 baseline            83 passed / config 21 条 flips=0 / auth-throttle 27 条 flips=0
+MC01 亚秒下界永不触发     1 红 sub_second_window_is_rejected_at_the_config_layer
+                         1 翻转 sub_second_window_rejected_by_config
+MC02 配置层 24h 上界永不  1 红 over_24h_window_is_rejected_in_both_layers
+   触发                   1 翻转 over_24h_window_rejected_by_config
+MC03 不再委托引擎表       1 红 disabled_section_still_rejects_an_inconsistent_table
+   （`limits.validate()`  4 翻转 disabled_still_rejects_inconsistent_table,
+    换成永不 Err）         disabled_still_rejects_zero_ceiling,
+                          source_budget_below_pair_threshold_rejected,
+                          source_budget_above_table_capacity_rejected
+MC04 文件段只在 enabled   3 红 disabled_section_still_rejects_an_inconsistent_table,
+   时才校验               sub_second_window_is_rejected_at_the_config_layer,
+                          over_24h_window_is_rejected_in_both_layers
+                         2 翻转 disabled_still_rejects_inconsistent_table,
+                          disabled_still_rejects_zero_ceiling
+MC05 存在性检查不受       5 红 absent_files_section_is_disabled, mesh_wss_roundtrips,
+   enabled 门控（过严）    oversized_max_terminals_rejected, valid_config_roundtrips,
+                          sub_second_window_is_rejected_at_the_config_layer
+                         config 场景整体 FAIL（探针在 legacy 解析处早退，21 条里 19 条
+                          字段缺席 ⇒ 记为 flips=1(verdict) missing=19，不当成"只翻一条"）
+MC06 kill-switch 失效     1 红 absent_files_section_is_disabled
+   （关断也构造引擎）      config 场景 verdict FAIL + missing=19（同上口径）
+MC07 缝里不再先 validate  1 红 an_inconsistent_enabled_table_cannot_launch_an_engine
+                         1 翻转 invalid_table_yields_no_engine
+                         **第一版对象集上这一行是 0 红 0 翻转**，红名单是补对象之后的
+                         复跑值；两次数都留着，只留后者就是把"自己发现空洞"这步抹掉
+MC08 重复别名检查拆掉     1 红 duplicate_or_blank_root_alias_is_rejected
+                         1 翻转 duplicate_root_alias_rejected
+MC09 空别名检查拆掉       1 红 duplicate_or_blank_root_alias_is_rejected
+                         1 翻转 blank_root_alias_rejected
+                         （MC08/MC09 打红同一条单测但翻转不同期望 ⇒ 那条单测一次覆盖
+                          两个条件，是**合并对象**，不是冗余）
+MC10 镜像漂移（引擎的     2 红 limits_mirror_is_field_by_field_exact,
+   lockout_window 改吃     over_24h_window_is_rejected_in_both_layers
+   配置的 idle 秒数）      3 翻转 limits_round_trip_is_exact, durations_map_to_engine_units,
+                          over_24h_window_rejected_by_config
+MC11 去掉 `files` 字段     1 红 absent_files_section_is_disabled
+   的 `#[serde(default)]`  config 场景 verdict FAIL + missing=19（老配置解析不过）
+MC12 Default 把 enabled    5 红 absent_files_section_is_disabled, mesh_wss_roundtrips,
+   置 true                 oversized_max_terminals_rejected, valid_config_roundtrips,
+                          sub_second_window_is_rejected_at_the_config_layer
+                         config 场景 verdict FAIL + missing=19
+MC13 引擎层 24h 上界拆掉  2 红 over_24h_window_is_rejected_in_both_layers,
+   （file_service.rs）     file_service::tests::every_validate_rule_has_a_red_test
+                         1 翻转 over_24h_window_rejected_by_config
+MC99 restored            83 passed / 0 flips（配方回写后逐字节断言与原文相等）
+
+结论：13 条配方**全数有杀伤**，其中两条（MC01、MC02）是先跑出来发现零杀伤、把对象改成
+"断言是哪一层答的话"之后才有的杀伤；一条（MC07）是发现零杀伤之后**补的对象**。
+分层断言这件事的形状与 r12 R12-W-1（机制对象冒充数量对象）是同一类：委托链上
+"谁拒的"不是"有没有拒"的可见属性，必须把层标签写进期望。
+
+—— 本片自己的两次工具事故（都留下，不抹）——
+1) 变异脚本第一版用 `open(p,"w").write(open(p).read().replace(...))` 做恢复：外层
+   `open(p,"w")` 先求值 ⇒ **文件被截成 0 字节**，`/work/mm7/.../config.rs` 变空。
+   靠"变异跑在隔离克隆"这条既有纪律挡住了事故外溢（`/work/m0-flake`、`/work/m0-verify`
+   未受影响）。恢复改成：动手前把原文读进内存字典，回写那份 buffer 并断言逐字节相等
+   （MC99 行就是这个断言的输出）。
+2) 第一版探针把 `cargo run --example ... 2>/dev/null` 的 stderr 丢了，于是所有行都只剩
+   "NO JSON"，看不到真实原因是 `E0382: borrow of moved value: c`（我把 `base_config(c)`
+   少写了一次 clone，而 `c` 后面还要用）。改成连 stderr 一起收并打印末两行之后，
+   基线行立刻从"NO JSON"变成可用的 flips 计数。
+   ⇒ 与既有那条"管道尾命令的退码不算证据"是同一条：**丢掉失败输出的测量不是测量**。
+
+—— requirements.toml：一条只在 CI 有门的文件坏了若干个提交 ——
+RED（修复前，host `python3 -c` + `tomli` 直接解析 `/work/mm7` 的 `ec3e069` 版）：
+  TOMLDecodeError: Expected newline or end of document after a statement
+                   (at line 89, column 577)
+跑真正的校验脚本（`tools/validate-requirements.py`，经 shim 注入 tomli 与
+`from __future__ import annotations` 才能在 python 3.8.10 上执行）：
+  ERROR: parse error: ... / FAILED: 1 error(s) / exit code: 1
+成因：`acceptance = "…"` 是 TOML basic string，而我沿用中文行文习惯在串里写了未转义的
+ASCII 双引号（REQ-010 有 8 个内层引号）。REQ-014 又带了 10 个 —— 同一个习惯第二次写进去
+才被撞到。
+为什么活了这么久：`verify --fast` 的 9 道门（whitespace/format/check/clippy/
+architecture-policy/dependency-governance/resource-type-neutrality/affected-tests/
+selected-properties）**没有任何一道解析它**；唯一解析者是
+`.github/workflows/gateway-ci.yml:25` 的 `validate-requirements` job，而本仓库匿名 API
+取不到 CI 日志 ⇒ 我这边没有任何路径真的读成功过这个文件。校验脚本自身还需要
+python ≥3.11（`tomllib`）与 ≥3.9（模块级 `list[str]`），验证机是 3.8.10，
+所以连"手动跑一次"这条路也不存在。
+GREEN（修复后，14 条 `acceptance` 全改为 literal string `'…'`；改前确认文本不含 `'`
+与 `\`，14 条全部满足、skipped=none）：
+  OK: requirements.toml valid / exit code: 0
+`contract_hash` 不受影响（哈希只覆盖 `scenarios/**/*.toml`）。
+harness 第 4 条立案并入本批待办：**requirements 校验应当是一道本地门**，
+CI-only 的校验等价于本地永远绿（与 digest 静默降级、证据覆写、第 4 关字典序同批，
+见任务 #36）。
+推广一句进知识条目：任何**只被外部系统读、不被本地门读**的文件都会腐烂；写文档型契约时
+先问"谁解析它，解析器在我这边跑不跑"。
+
+—— 第十二片落地前的整树复验（文档滚数之后，口径树 `d58ce4e0f4d4e6fb0991d4253241812011596c0d`，
+`nexus-harness status --json` 实测，dirty_state=false）——
+先证变异表可以转移到这棵树上（文档滚数之后的树与跑表的树在代码面逐字节相同）：
+  git diff fa2f81d d58ce4e -- crates/nexus-web-gateway/src crates/nexus-web-gateway/examples \
+      crates/nexus-web-gateway/tests scenarios   ⇒ 空（本轮实测为空）
+所以 MC01–MC13 那张表描述的就是本树的行为，不是上一棵树的行为。
+同一棵树上重跑（都是本轮实测输出，不是引用上一轮）：
+  cargo clippy --all-targets -p nexus-web-gateway ⇒ 无诊断输出（并由 verify 的 clippy 门 PASS 背书；
+    自己 `echo $?` 拿的是管道尾命令退码，不算证据——这条既有提醒仍然有效）
+  cargo test --lib -p nexus-web-gateway          ⇒ 83 passed; 0 failed
+  10 条 E4 场景逐条全 PASS                       ⇒ 9+6+10+5+9+27+16+7+15+21 = **125** 条期望
+  verify --fast                                  ⇒ 9 门全 PASS，evidence dir = verify-a3647d973573
+  status --json                                  ⇒ verdict PASS（"latest evidence is fresh and PASS"）
+  bindings: source_revision d58ce4e0f4d4e6fb0991d4253241812011596c0d
+            working_tree_digest c9ea5ee9593638a5b214d51fc2825e93803581ac
+            contract_hash 7d478e586452778f218020c091503344a5660920
+            toolchain 1.98.1 / x86_64-unknown-linux-gnu / feature_set workspace:default
+contract_hash 从 `dd4926c2…`（9 场景）→ `f127b5f5…`（新增第 10 个场景文件）→ 本值
+（该场景文件补了第 21 条期望）。这一段是**先跑再写**：三个号都来自上面这条实测输出，
+没有一个是从上一轮继承或手推的。
+上一片的计数（104 条期望 / 73 单测）与本片的关系是**同一场景集加了第 10 个场景**，
+不是把旧场景改宽：旧 9 条场景的期望数一条没动（9/6/10/5/9/27/16/7/15 与 D 轮记录逐条相同）。

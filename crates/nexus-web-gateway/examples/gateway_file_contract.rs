@@ -17,13 +17,69 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
+use nexus_web_gateway::config::{
+    FileRootConfig, FilesConfig, GatewayConfig, MAX_FILE_WINDOW_SECS, MIN_FILE_LOCKOUT_WINDOW_SECS,
+    MeshConfig, MeshNodeInfo, SshConfig, TlsConfig,
+};
+use nexus_web_gateway::error::GatewayError;
 use nexus_web_gateway::file_service::{
     BackendKind, FileEngine, FileLimits, FileResult, SandboxRoot, code,
 };
 use serde_json::{Map, Value, json};
 
 const TOKEN: &str = "probe-token";
+
+/// A `files` section that is numerically self-consistent and *disabled*, which is
+/// the state a pre-file-service config parses into. Each case flips exactly the
+/// field under test so a pass can't come from an unrelated violation.
+fn base_files() -> FilesConfig {
+    FilesConfig::default()
+}
+
+/// Wrap a `files` section in an otherwise valid gateway config.
+fn base_config(files: FilesConfig) -> GatewayConfig {
+    GatewayConfig {
+        listen_addr: "127.0.0.1:8443".parse().expect("static"),
+        node_id: "probe-node".into(),
+        node_name: "probe-node".into(),
+        node_list: vec![MeshNodeInfo {
+            peer_id: "probe-node".into(),
+            name: "probe-node".into(),
+            addrs: vec!["127.0.0.1:8443".into()],
+            services: vec!["ssh".into()],
+        }],
+        ice_servers: vec![],
+        tls: TlsConfig::AutoGenerate {
+            names: vec!["localhost".into()],
+            ips: vec!["127.0.0.1".parse().expect("static")],
+            cert_dir: None,
+        },
+        ssh: SshConfig::default(),
+        files,
+        mesh: MeshConfig::InMemory,
+    }
+}
+
+/// The validation error string, empty when the config is accepted. Some
+/// expectations claim **which layer** refuses; `is_err()` alone cannot tell a
+/// config bound apart of the delegated engine table, because
+/// `FilesConfig::validate` runs `FileLimits::validate` too (measured as
+/// mutations MC01/MC02, which left an `is_err()`-only object green).
+fn config_err(cfg: &GatewayConfig) -> String {
+    match cfg.validate() {
+        Ok(()) => String::new(),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// True when the **config layer's own** window bound refused rather than the
+/// delegated engine table (whose text is `files limits: lockout_window must ...`).
+/// Substring, not prefix: `GatewayError::Config`'s Display prepends `config error: `.
+fn refused_by_config_bound(msg: &str) -> bool {
+    msg.contains("files.lockout_window_secs")
+}
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
@@ -63,6 +119,7 @@ fn dispatch(case: &str) -> Result<Value, String> {
         "quota-backpressure" => quota_backpressure(&mut fields)?,
         "capability-negotiation" => capability_negotiation(&mut fields)?,
         "sftp-backend-boundary" => sftp_backend_boundary(&mut fields)?,
+        "config" => gateway_config(&mut fields)?,
         other => return Err(format!("unknown case {other:?}")),
     }
     fields.insert("verdict".into(), json!("PASS"));
@@ -1487,6 +1544,250 @@ fn symlink_dir(target: &Path, link: &Path) -> Result<(), String> {
 #[cfg(windows)]
 fn symlink_dir(target: &Path, link: &Path) -> Result<(), String> {
     std::os::windows::fs::symlink_dir(target, link).map_err(|e| e.to_string())
+}
+
+/// 配置接线面（`files` 段）的对象集合：关断默认、关断不免责、开起来必须自洽、
+/// 数值镜像必须逐字段精确、以及"合法配置真的能起出引擎"。
+///
+/// 与单测的分工：单测管因果与错误信息可执行，这里管**同一批性质在 JSON 路径上成立**
+/// （运维面上到的是 JSON，不是 Rust 字面量）。
+fn gateway_config(f: &mut Map<String, Value>) -> Result<(), String> {
+    let dir = fixture("config")?;
+    let root_path = dir.display().to_string();
+
+    // 1) 老配置（没有 files 段）必须等价于关断，并且结构性地起不出引擎。
+    let legacy: GatewayConfig = GatewayConfig::from_json_str(
+        r#"{"listen_addr":"127.0.0.1:8443","node_id":"a","node_name":"a",
+            "node_list":[{"peer_id":"a","name":"a"}],
+            "tls":{"mode":"auto_generate","names":[],"ips":[]}}"#,
+    )
+    .map_err(|e| format!("legacy config must still parse: {e}"))?;
+    let absent_disabled = !legacy.files.enabled;
+    let disabled_no_engine = legacy
+        .file_engine()
+        .map_err(|e| format!("disabled config must not fail: {e}"))?
+        .is_none();
+    f.insert("absent_section_is_disabled".into(), json!(absent_disabled));
+    f.insert(
+        "disabled_yields_no_engine".into(),
+        json!(disabled_no_engine),
+    );
+
+    // 2) 关断不免责：坏表在 `enabled = false` 时也必须拒（否则打开的那天静默上线）。
+    let mut off_bad_pairing = base_files();
+    off_bad_pairing.enabled = false;
+    off_bad_pairing.max_ack_bytes = off_bad_pairing.max_inflight_bytes_per_session + 1;
+    let disabled_rejects_pairing = base_config(off_bad_pairing).validate().is_err();
+    let mut off_zero_ceiling = base_files();
+    off_zero_ceiling.enabled = false;
+    off_zero_ceiling.chunk_bytes = 0;
+    let disabled_rejects_zero = base_config(off_zero_ceiling).validate().is_err();
+    f.insert(
+        "disabled_still_rejects_inconsistent_table".into(),
+        json!(disabled_rejects_pairing),
+    );
+    f.insert(
+        "disabled_still_rejects_zero_ceiling".into(),
+        json!(disabled_rejects_zero),
+    );
+
+    // 3) 打开时的必备项：令牌（含只含空白的）、根列表、别名。
+    let mut no_token = base_files();
+    no_token.enabled = true;
+    no_token.roots = vec![FileRootConfig {
+        alias: "downloads".into(),
+        path: root_path.clone(),
+        read_only: false,
+    }];
+    no_token.token = String::new();
+    let rejected_no_token = base_config(no_token.clone()).validate().is_err();
+    no_token.token = "   ".into();
+    let rejected_blank_token = base_config(no_token.clone()).validate().is_err();
+    let mut no_roots = no_token.clone();
+    no_roots.token = "s3cret".into();
+    no_roots.roots.clear();
+    let rejected_no_roots = base_config(no_roots).validate().is_err();
+    let mut blank_alias = no_token.clone();
+    blank_alias.token = "s3cret".into();
+    blank_alias.roots[0].alias = " ".into();
+    let rejected_blank_alias = base_config(blank_alias).validate().is_err();
+    let mut dup_alias = no_token.clone();
+    dup_alias.token = "s3cret".into();
+    dup_alias.roots.push(FileRootConfig {
+        alias: "downloads".into(),
+        path: root_path.clone(),
+        read_only: true,
+    });
+    let rejected_dup_alias = base_config(dup_alias).validate().is_err();
+    f.insert(
+        "enabled_without_token_rejected".into(),
+        json!(rejected_no_token),
+    );
+    f.insert(
+        "whitespace_only_token_rejected".into(),
+        json!(rejected_blank_token),
+    );
+    f.insert(
+        "enabled_without_roots_rejected".into(),
+        json!(rejected_no_roots),
+    );
+    f.insert(
+        "blank_root_alias_rejected".into(),
+        json!(rejected_blank_alias),
+    );
+    f.insert(
+        "duplicate_root_alias_rejected".into(),
+        json!(rejected_dup_alias),
+    );
+
+    // 4) 别名/路径的**存在性**在启动前挡下：配置面允许一个不存在的目录通过 validate，
+    //    但 `file_engine()` 必须失败——否则变成随机启动失败。
+    let mut ghost_root = base_files();
+    ghost_root.enabled = true;
+    ghost_root.token = "s3cret".into();
+    ghost_root.roots = vec![FileRootConfig {
+        alias: "downloads".into(),
+        path: dir.join("does-not-exist").display().to_string(),
+        read_only: false,
+    }];
+    let ghost = base_config(ghost_root);
+    // `FileEngine` 不实现 Debug，所以这里不能 `{other:?}`——探针本身也编译不过就等于
+    // 没有这条对象。分三支把"拿到的是什么"写成可执行的错误信息。
+    let missing_path_rejected = match ghost.file_engine() {
+        Err(GatewayError::Config(_)) => true,
+        Err(other) => {
+            return Err(format!("不存在的根必须以 Config 错误被拒，拿到 {other}"));
+        }
+        Ok(Some(_)) => {
+            return Err("不存在的根必须被拒，却起出了引擎".into());
+        }
+        Ok(None) => {
+            return Err("enabled=true 的配置必须起得出引擎，却拿到 None".into());
+        }
+    };
+    f.insert(
+        "missing_root_path_rejected".into(),
+        json!(missing_path_rejected),
+    );
+
+    // 5) 数值镜像必须逐字段相等；时长换算成引擎的 Duration 单位。
+    let mirrored = {
+        let d = base_files();
+        let l = d.to_limits();
+        let e = FileLimits::default();
+        l.chunk_bytes == e.chunk_bytes
+            && l.max_entries_per_page == e.max_entries_per_page
+            && l.max_ack_bytes == e.max_ack_bytes
+            && l.max_sessions == e.max_sessions
+            && l.max_browser_sessions == e.max_browser_sessions
+            && l.max_read_handles == e.max_read_handles
+            && l.max_inflight_bytes_per_session == e.max_inflight_bytes_per_session
+            && l.max_upload_bytes == e.max_upload_bytes
+            && l.max_rehash_bytes_per_stream == e.max_rehash_bytes_per_stream
+            && l.idle_timeout == e.idle_timeout
+            && l.lockout_after == e.lockout_after
+            && l.lockout_window == e.lockout_window
+            && l.max_throttle_buckets == e.max_throttle_buckets
+            && l.max_failures_per_source == e.max_failures_per_source
+            && l.max_buffered_amount == e.max_buffered_amount
+    };
+    let units = {
+        let mut c = base_files();
+        c.idle_timeout_secs = 77;
+        c.lockout_window_secs = 13;
+        let l = c.to_limits();
+        l.idle_timeout == Duration::from_secs(77) && l.lockout_window == Duration::from_secs(13)
+    };
+    f.insert("limits_round_trip_is_exact".into(), json!(mirrored));
+    f.insert("durations_map_to_engine_units".into(), json!(units));
+
+    // 6) 窗口两侧边界：亚秒在**配置层**被拒（引擎层故意不设下界，时间夹具要毫秒窗口），
+    //    24h 以上两层都拒。两条各钉各的层——委托让"删任一层"在只看 `is_err()` 的
+    //    对象面前不可分辨（变异 MC01/MC02 实测过这条），所以配置层这半必须看错误串：
+    //    只有配置层的界会给 `files.lockout_window_secs ...`，委托进来的引擎检查是
+    //    `files limits: ...`。
+    let mut on_files = base_files();
+    on_files.enabled = true;
+    on_files.token = "s3cret".into();
+    on_files.roots = no_token.roots.clone();
+    on_files.lockout_window_secs = MIN_FILE_LOCKOUT_WINDOW_SECS;
+    let rejected_sub_second = {
+        let mut c = on_files.clone();
+        c.lockout_window_secs = 0;
+        refused_by_config_bound(&config_err(&base_config(c)))
+    };
+    let floor_is_usable = base_config(on_files.clone()).validate().is_ok();
+    let rejected_over_24h = {
+        let mut c = on_files.clone();
+        c.lockout_window_secs = MAX_FILE_WINDOW_SECS + 1;
+        let cfg_err = config_err(&base_config(c.clone()));
+        let over = refused_by_config_bound(&cfg_err);
+        // 引擎层单独调，不经委托：删引擎那条 24h 也会翻这里。
+        over && c.to_limits().validate().is_err()
+    };
+    f.insert(
+        "sub_second_window_rejected_by_config".into(),
+        json!(rejected_sub_second && floor_is_usable),
+    );
+    f.insert(
+        "over_24h_window_rejected_by_config".into(),
+        json!(rejected_over_24h),
+    );
+
+    // 7) 单源额度的两条交叉界必须在真实配置路径上跑到（G12）。
+    let rejected_low = {
+        let mut c = on_files.clone();
+        c.max_failures_per_source = c.lockout_after - 1;
+        base_config(c).validate().is_err()
+    };
+    let rejected_huge = {
+        let mut c = on_files.clone();
+        c.max_failures_per_source = c.max_throttle_buckets * c.lockout_after + 1;
+        base_config(c).validate().is_err()
+    };
+    f.insert(
+        "source_budget_below_pair_threshold_rejected".into(),
+        json!(rejected_low),
+    );
+    f.insert(
+        "source_budget_above_table_capacity_rejected".into(),
+        json!(rejected_huge),
+    );
+
+    // 7b) 构造缝自己必须检验：**不合法的开启态表不能起出引擎**。
+    // "先 validate 再构造"这句话在没有这条期望之前只是注释——变异 MC07（把缝里那句
+    // `self.validate()?` 删掉）在第一版对象集上实测 0 条单测红、0 条期望翻转。
+    let mut inconsistent = on_files.clone();
+    inconsistent.chunk_bytes = 0;
+    let engine_refused = match base_config(inconsistent).file_engine() {
+        Err(GatewayError::Config(msg)) => msg.contains("files limits"),
+        Err(other) => {
+            return Err(format!("不合法的表必须以 Config 类错误被拒，拿到 {other}"));
+        }
+        Ok(_) => false,
+    };
+    f.insert(
+        "invalid_table_yields_no_engine".into(),
+        json!(engine_refused),
+    );
+
+    // 8) 合法配置必须真的起得出引擎，且 JSON 往返不丢这一段。
+    let good = base_config(on_files.clone());
+    let launched = match good.file_engine() {
+        Ok(Some(engine)) => engine.limits().max_sessions == on_files.max_sessions,
+        Ok(None) => false,
+        Err(err) => return Err(format!("合法配置起不来: {err}")),
+    };
+    let json = serde_json::to_string(&good).map_err(|e| e.to_string())?;
+    let back = GatewayConfig::from_json_str(&json).map_err(|e| e.to_string())?;
+    let survived = back.files == on_files && back.files.enabled;
+    f.insert("valid_config_launches_engine".into(), json!(launched));
+    f.insert(
+        "files_section_survives_json_round_trip".into(),
+        json!(survived),
+    );
+    cleanup(&dir);
+    Ok(())
 }
 
 fn cleanup(dir: &Path) {

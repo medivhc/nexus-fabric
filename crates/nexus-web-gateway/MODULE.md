@@ -96,9 +96,31 @@
 > 因此本分支上 `G12..G16` 是空的。这里一次性把文件面的不变量落成 `G12..G21`，
 > 语义与 V2 §2-§9 一一对应，后续期次不再重排号。
 
-**G12（文件面默认关闭，配置不自洽即拒启动）**：`files.enabled` 缺省 `false`
-（**契约声明**：`config.rs` 尚无 `files` 字段，把它接进 `GatewayConfig::validate`
-与 kill-switch 属 M1 剩余项，当前 enforced 的是引擎侧的 `FileLimits::validate`）；
+**G12（文件面默认关闭，配置不自洽即拒启动）**：`files.enabled` 缺省 `false`，
+且这一段**已接入配置面**（不再是契约声明）：`GatewayConfig::validate` 末尾无条件调用
+`self.files.validate()`（开关不免责），`GatewayConfig::file_engine()` 是唯一构造入口——
+先 validate，关断时返回 `None`。**"拒启动"目前成立在构造缝上**：`Gateway::start` 还没消费
+`file_engine()`，线上也没有文件动词的分发，所以本条现在钉住的是"没有可寻址的引擎"，
+而"关断时连动词都到不了"要等 M2 接线补对象（`REQ-014` 把这条残差点名挂着）。
+配置层的承载体是 `product.gateway-file-config`（21 条期望，E4）加 `config.rs` 的
+10 条单测（`absent_files_section_is_disabled`、
+`disabled_section_still_rejects_an_inconsistent_table`、
+`sub_second_window_is_rejected_at_the_config_layer`、
+`over_24h_window_is_rejected_in_both_layers`、
+`enabled_without_credential_or_roots_is_rejected`、
+`duplicate_or_blank_root_alias_is_rejected`、
+`enabled_config_launches_an_engine_and_missing_path_does_not`、
+`files_section_round_trips_through_json`、`limits_mirror_is_field_by_field_exact`、
+`an_inconsistent_enabled_table_cannot_launch_an_engine`）。
+窗口那两条各钉**一层答的话**（配置层看错误串里的 `files.lockout_window_secs` 字段名——
+不是开头，`GatewayError::Config` 的 Display 会加 `config error: ` 前缀；引擎层由
+`to_limits().validate()` 直接调）：只断言 `is_err()` 时委托让"删掉哪一层"不可分辨，
+这个形状是变异 MC01/MC02 实测出来的，不是推出来的。
+顺序性那句（"先 validate 再构造"）也一样：删掉 `file_engine()` 里 `self.validate()?`
+的变异 MC07 在**第一版对象集上 0 红 0 翻转**（没有任何期望拿"不合法的开启态表"去调这条
+缝），`an_inconsistent_enabled_table_cannot_launch_an_engine` 与同名冻结期望
+`invalid_table_yields_no_engine` 是补上去才有对象的——它同时断言拒它的是带委托标签
+`files limits` 的那条错，而不是 `SandboxRoot::open` 的路径检查。
 `FileLimits` 的交叉约束任一校验不过 ⇒ **拒绝启动**，绝不"半启用"或静默放宽
 （fail-closed）。当前 enforced 的交叉约束（除注明外逐条都有单测把它跑红，
 且夹具只违反自己那一条）：
@@ -122,8 +144,12 @@ ack 放不进会话额度就意味着每次 list 都当场 CAPACITY——评审 
 任一数值上限不得为 0，**两个时长同样不得为 0**（`lockout_window = 0` 会让每次锁定
 写入即过期、`idle_timeout = 0` 会让会话刚建即回收——评审 r4 R4-NEW-1），
 且时长不得越过 24 h（它们参与 `Instant` 加法，病态大值不是"更宽松"而是把锁死推到
-时钟边界之外——评审 r5 R5-W-2；数值型上限没有这种后果，仍只封低边）。
-root 非空且不重复、`read_only` 组合同样校验。
+时钟边界之外——评审 r5 R5-W-2；数值型上限没有这种后果，仍只封低边）。24 h 这条
+**两层各写一次**（配置层 `MAX_FILE_WINDOW_SECS`、引擎层 `MAX_WINDOW_SECS`），因为配置层
+把整张表委托给引擎，只在一层写就等于另一层没有规则。
+根的非空与别名不重复在**打开态**由配置层校验（`enabled_without_*`、`*_root_alias_*`），
+路径的合法性则由 `file_engine()` 逐根 `SandboxRoot::open` 在启动前挡下——不留
+"配置通过、启动随机失败"这种两段式；`read_only` 组合仍是引擎侧校验。
 **G13（root 是唯一授权面，逐分量解析 + 打开后重核实）**：root 必须是 `canonicalize`
 后的真实路径（非规范 root 在 Windows/macOS 上会回显错误路径并使越界检查失效）；
 自 root 起对每一段做 `lstat`/`readlink`，任一段是符号链接即拒绝；**解析不得因某段

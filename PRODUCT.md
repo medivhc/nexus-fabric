@@ -3375,14 +3375,19 @@ portable-core/WASI 门），代之以双向一致性测试保证不漂移。
 ### 18.4 非目标与未证事项
 
 - 不做跨节点的 Artifact 分发、不引入 `storage_ref` 作为凭证、不做浏览器端文件系统访问。
-- 不在本节宣称 E4/E5 为**已验收**：9 条 `gateway_file_*` 场景自 M1 起在 xc-pc-linux 上
-  跑绿（计数与命令见 `.agents/green-evidence-gateway-file-service-m1.txt`），
+- 不在本节宣称 E4/E5 为**已验收**：10 条 `gateway_file_*` 场景自 M1 起在 xc-pc-linux 上
+  跑绿（逐条 9+6+10+5+9+27+16+7+15+21 = 125 条期望，命令与计数见
+  `.agents/green-evidence-gateway-file-service-m1.txt`），
   M0 阶段的 Red Evidence 记录保留在 `.agents/red-evidence-gateway-file-service.txt`；
-  "场景跑绿"只证明引擎层不变量，不等于 E5 端到端验收，网关文件能力在
-  `requirements.toml` 里仍保持 `doing`，且 `files.enabled` 缺省关闭——但这句话当前是
-  **契约声明**：`config.rs` 还没有 `files` 字段，把它接进 `GatewayConfig::validate`
-  与运行时 kill-switch 属 M1 剩余项（r2 W-7），在那之前"默认关闭"靠的是没有入口可开，
-  而不是配置校验 enforced。
+  "场景跑绿"只证明引擎与配置面不变量，不等于 E5 端到端验收，网关文件能力在
+  `requirements.toml` 里仍保持 `doing`。
+  `files.enabled` 缺省关闭这句**从 2026-10-14 起是 enforced 的**，不再是契约声明：
+  `config.rs` 的 `FilesConfig` 段由 `GatewayConfig::validate` 无条件校验（开关不免责），
+  `GatewayConfig::file_engine()` 是唯一构造入口且关断时返回 `None`，承载体是
+  `product.gateway-file-config`（21 条期望）与 `config.rs` 的 10 条单测（`REQ-014`）。
+  **仍未证的那半**：`Gateway::start` 还没消费 `file_engine()`，线上也没有文件动词的
+  分发，所以"拒启动"当前成立在构造缝上而不是进程路径上；M2 接线时必须补
+  "关断时动词根本到不了"的对象，届时 r2 W-7 才算真正关闭。
 - **目录改名**的"目标存在即失败"只有前置检查：std 下目录拿不到原子无覆盖原语
   （`hard_link` 对目录失败），并发窗口内目标出现仍可能被 `rename(2)` 替换。
   文件改名走 `hard_link`+unlink，是原子的。该窗口属 §18.4 的未证事项。

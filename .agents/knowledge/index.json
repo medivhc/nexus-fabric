@@ -350,5 +350,13 @@
     "module": "engineering/nexus-harness",
     "category": "implementation-pitfall",
     "summary": "selected-properties 门偶发红＝并行测试并发调 git 时 working_tree_digest() 静默退化成 tree-unknown（强制重建才易中，--test-threads=1 对照全绿）；另有 verify 同 bindings 覆写证据、pre-commit 第4关字典序取到 r9 而非 r10 两条"
+  },
+  {
+    "id": "req-toml-ci-only-gate-001",
+    "file": "entries/2026-10-14-requirements-toml-invisible-quote-and-ci-only-gate.md",
+    "date": "2026-10-14",
+    "module": "nexus-web-gateway",
+    "category": "process-defect",
+    "summary": "requirements.toml 自 REQ-010 起就不是合法 TOML（acceptance 串内嵌未转义 ASCII 双引号，tomli 报 line 89 col 577）；本地 9 门不含它的校验、只有 CI 跑且日志读不到 ⇒ 坏了几个提交无人知。修复=14 条 acceptance 全改 literal string，附 python3.8 可用的 shim 与 RED(exit1)/GREEN(exit0)"
   }
 ]

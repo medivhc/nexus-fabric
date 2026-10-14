@@ -2,7 +2,7 @@
 
 本包实现《Nexus 统一系统设计规范 v9》中的“统一仓库目录契约”。
 
-文件数（不含本清单）：214
+文件数（不含本清单）：215
 
 > 2026-10-10：原声明值 137 与表内实际行数（148）已不一致（既有漂移，含
 > `scenarios/engineering/bench_gate_verdicts.toml` 等未登记项）。本次登记
@@ -77,6 +77,29 @@
 > `5694faa`（"untrack generated .evidence artifacts"）中被取消跟踪，磁盘上也不
 > 存在，因此按"表内行数"统计的值比按 `git ls-files` 口径多 2。本清单未按
 > `git ls-files` 口径校准，此处如实标注差异而不是静默改数。
+>
+> 2026-10-13（r12 落地，**补记**）：r12 案卷 2 行 ⇒ **214**，当时只改了头部声明值、
+> 没在这条注释链里留痕（第七片也犯过一次），本条就是补那条痕。r12 verdict `COMMENTED`
+> （0 FAIL / 1 WARN / 3 NOTE），那条 WARN 是"pair 侧门槛翻倍只有机制对象、没有数量对象"。
+>
+> 2026-10-14（第十二片：`files` 配置接线 + kill-switch）：新增
+> `scenarios/product/gateway_file_config.toml` 1 行 ⇒ **215**。统计口径本轮从
+> `awk '/^\| /{n++}'` 改成 `awk '/^\| `/ {n++}'`（旧口径把表头 `| Path | Purpose |`
+> 也算进去，每次要手工减 1；新口径直接等于声明值，省掉这一步。本清单历史上确实出过一次
+> 声明值与行数不一致的漂移，见上面 2026-10-10 那条，但**那次的成因不是表头**，不要把
+> 两件事并成一件写），新口径实测 215 与声明值一致。同轮：`config.rs` 的 `FilesConfig`/`GatewayConfig::file_engine()`
+> 落地，`--lib` 单测 73 → **83**，E4 期望 104 → **125**（逐条 9+6+10+5+9+27+16+7+15+21）。
+>
+> 同一轮里一处**与文件数无关的缺陷修复**在此登记（因为它改了清单外的仓库文件）：
+> `crates/nexus-web-gateway/requirements.toml` 自 REQ-010 起就**不是合法 TOML**——
+> `acceptance` 串里嵌了未转义的 ASCII 双引号，`tomli` 报 `line 89, column 577`。
+> 它活了多个提交无人发现的原因是：`verify --fast` 的 9 道门里**没有任何一道解析它**，
+> 唯一解析者 `.github/workflows/gateway-ci.yml:25` 的 `validate-requirements` job 日志
+> 又取不到，而校验脚本自身需要 python ≥3.11（`tomllib`）+ ≥3.9（模块级 `list[str]`），
+> 验证机是 3.8.10，连"本地跑一次"这条路都不存在。本轮把 14 条 `acceptance` 全改为
+> literal string，并用 `tomli` + shim 实测修复前 exit=1 / 修复后 `OK: requirements.toml valid`
+> exit=0；取证与配方见 `.agents/knowledge/entries/2026-10-14-requirements-toml-invisible-quote-and-ci-only-gate.md`
+> （知识条目不进本清单，只在 `index.json` 登记，先例见上面那条惯例说明）。
 
 | Path | Purpose |
 |---|---|
@@ -255,6 +278,7 @@
 | `scenarios/regression/session_outcome_exactly_once.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/product/gateway_file_auth_throttle.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/product/gateway_file_capability_negotiation.toml` | Machine-readable contract/policy/scenario |
+| `scenarios/product/gateway_file_config.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/product/gateway_file_download_page.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/product/gateway_file_list_pagination.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/product/gateway_file_quota_backpressure.toml` | Machine-readable contract/policy/scenario |
@@ -263,7 +287,7 @@
 | `scenarios/product/gateway_file_upload_no_replace.toml` | Machine-readable contract/policy/scenario |
 | `scenarios/product/gateway_file_upload_resume.toml` | Machine-readable contract/policy/scenario |
 | `crates/nexus-web-gateway/src/file_service.rs` | Implementation under the gateway file contract (G12-G21) |
-| `crates/nexus-web-gateway/examples/gateway_file_contract.rs` | E4 probe for the 9 gateway_file_* scenarios |
+| `crates/nexus-web-gateway/examples/gateway_file_contract.rs` | E4 probe for the 10 gateway_file_* scenarios |
 | `.evidence/review-gateway-file-r1/summary.json` | 引擎+探针独立评审第 1 轮（`CHANGES_REQUESTED`，6 条 FAIL）的机器可读案卷，`git add -f` 携带 |
 | `.evidence/review-gateway-file-r1/findings.md` | 上述评审的逐项取证（含本机复算探针与门禁复现） |
 | `.evidence/review-gateway-file-r2/summary.json` | 第 2 轮复评（针对 F1/F2/F3/F4/F5 修复）的机器可读案卷，`git add -f` 携带 |

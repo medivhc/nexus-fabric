@@ -1,0 +1,129 @@
+schema_version = 1
+id = "product.gateway-file-config"
+title = "文件服务配置接线：默认关断、关断不免责、开起来必须自洽且可启动引擎"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#18-gateway-file-service"
+
+[given]
+config_source = "gateway.json"
+file_channel = "unwired-at-transport-layer"
+
+[when]
+command = "cargo run --quiet -p nexus-web-gateway --example gateway_file_contract -- --case config --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "case"
+equals = "config"
+
+# ---- 关断开关：默认必须是关 ----------------------------------------------------
+# 老配置里没有 `files` 段等价于 `enabled = false`：向后兼容不能变成"新模块默认上线"。
+[[expect]]
+field = "absent_section_is_disabled"
+equals = true
+
+# 关断时不构造引擎（结构性关断，不是"构造了但每个动词自己判断"）。wire 层还没有调用方，
+# 所以"动词被拒"这一格要到 M2 接线才有真对象；这里钉的是"没有可寻址的引擎"。
+[[expect]]
+field = "disabled_yields_no_engine"
+equals = true
+
+# ---- 关断不免责（评审链反复抓的形状：把开关当免检牌）--------------------------
+# 表自洽性检查与开关无关：一份"关掉但坏掉"的配置会在下一次打开时静默上线。
+# 这里刻意让 max_ack_bytes > max_inflight_bytes_per_session（G12 的配对规则）。
+[[expect]]
+field = "disabled_still_rejects_inconsistent_table"
+equals = true
+
+# 同一棵开关下的低边：零上限等于把那道门拆了，关断状态下也必须拒。
+[[expect]]
+field = "disabled_still_rejects_zero_ceiling"
+equals = true
+
+# ---- 打开时的必备项 ------------------------------------------------------------
+[[expect]]
+field = "enabled_without_token_rejected"
+equals = true
+
+# 只含空白的令牌与空令牌同罪：比较会拿它去匹配一个同样空白出示的串。
+[[expect]]
+field = "whitespace_only_token_rejected"
+equals = true
+
+[[expect]]
+field = "enabled_without_roots_rejected"
+equals = true
+
+[[expect]]
+field = "blank_root_alias_rejected"
+equals = true
+
+[[expect]]
+field = "duplicate_root_alias_rejected"
+equals = true
+
+# 引擎自己会拒重复别名与不存在的目录；配置层必须在启动前把它挡下来，
+# 否则"配置通过、启动失败"分成两段，运维面上等价于随机启动失败。
+[[expect]]
+field = "missing_root_path_rejected"
+equals = true
+
+# ---- 数值面：镜像必须精确，交叉规则必须在真实配置路径上跑一遍 -----------------
+# 探针把配置里的每个数值与 FileLimits 的字段逐个比对，任何"顺手写的默认值"都会红。
+[[expect]]
+field = "limits_round_trip_is_exact"
+equals = true
+
+# 令牌/时长单位换算：配置面用秒（和 ssh 段一致），引擎面用 Duration。
+[[expect]]
+field = "durations_map_to_engine_units"
+equals = true
+
+# `lockout_window` 在引擎层没有下界（夹具需要毫秒级窗口才能测过期/衰减），
+# 但**配置层有**：亚秒窗口会同时缩短锁定与放宽涓流门槛（G15 代价 (2) 的一物两用）。
+# 这一条把 G15 未证事项里"随 files 配置接线一起处理"的那半落到真实配置面上。
+# 钉的是"配置层答的话"：探针要求错误串里含 `files.lockout_window_secs`（不是开头——
+# `GatewayError::Config` 的 Display 会加 `config error: ` 前缀）。只看 `is_err()` 不够——
+# 委托给引擎的零时长检查在窗口=0 时也会拒，删掉配置层这条下界时对象照样绿
+#（变异 MC01 在第一版只断言 `is_err()` 的对象上实测 0 红）。
+[[expect]]
+field = "sub_second_window_rejected_by_config"
+equals = true
+
+# 高边同样在配置面复现，且**分两层各钉一次**：配置层看 `files.lockout_window_secs`
+# 前缀的错误串，引擎层由探针直接调 `FileLimits::validate`（不经委托）。这样删任一层的
+# 24 h 都会红；引擎那条另有 `file_service` 的 `every_validate_rule_has_a_red_test` 表格行。
+[[expect]]
+field = "over_24h_window_rejected_by_config"
+equals = true
+
+# 单源额度的两条交叉界（G12）走的是引擎层 validate，这里证明配置路径真的调到了它。
+[[expect]]
+field = "source_budget_below_pair_threshold_rejected"
+equals = true
+
+[[expect]]
+field = "source_budget_above_table_capacity_rejected"
+equals = true
+
+# ---- 合法配置必须真的能起来 ----------------------------------------------------
+# 先钉反面：**不合法的开启态表不能起出引擎**。`GatewayConfig::file_engine()` 里那句
+# `self.validate()?` 在这一条写出来之前没有任何对象——把变异 MC07（删掉那句）打在
+# 第一版场景上，实测 0 条单测红、0 条期望翻转，也就是"先检验再构造"只活在注释里。
+# 期望同时要求错误串带委托标签 `files limits`，这样红的原因是"缝检验了"而不是
+# "别处碰巧也拒了"。
+[[expect]]
+field = "invalid_table_yields_no_engine"
+equals = true
+
+[[expect]]
+field = "valid_config_launches_engine"
+equals = true
+
+# 序列化往返：配置面写出去再读回来，文件段必须原样存在（否则热更新会把模块静默关回默认）。
+[[expect]]
+field = "files_section_survives_json_round_trip"
+equals = true

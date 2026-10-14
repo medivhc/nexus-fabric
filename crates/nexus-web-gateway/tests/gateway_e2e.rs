@@ -12,7 +12,7 @@ use std::time::Duration;
 use common::{Browser, TestSshd};
 use nexus_web_gateway::Gateway;
 use nexus_web_gateway::config::{
-    GatewayConfig, IceServer, MeshConfig, MeshNodeInfo, MeshPeer, SshConfig, TlsConfig,
+    FilesConfig, GatewayConfig, IceServer, MeshConfig, MeshNodeInfo, MeshPeer, SshConfig, TlsConfig,
 };
 use nexus_web_gateway::protocol::{BrowserMessage, NodeMessage};
 
@@ -77,6 +77,9 @@ fn test_config(
             max_terminals: 5,
             idle_timeout_secs: 600,
         },
+        // 文件服务在这批网关测试里保持关断：`files.enabled` 默认 false，
+        // `file_engine()` 返回 `None`，所以配置面的改动不会影响既有 e2e 语义。
+        files: FilesConfig::default(),
         mesh: MeshConfig::InMemory,
     }
 }
@@ -988,6 +991,7 @@ fn gateway_cfg_wss(
             max_terminals: 5,
             idle_timeout_secs: 600,
         },
+        files: FilesConfig::default(),
         mesh: MeshConfig::Wss {
             token: token.into(),
             peers: vec![MeshPeer {
