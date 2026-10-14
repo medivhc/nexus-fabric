@@ -2,7 +2,7 @@
 
 本包实现《Nexus 统一系统设计规范 v9》中的“统一仓库目录契约”。
 
-文件数（不含本清单）：223
+文件数（不含本清单）：225
 
 > 2026-10-10：原声明值 137 与表内实际行数（148）已不一致（既有漂移，含
 > `scenarios/engineering/bench_gate_verdicts.toml` 等未登记项）。本次登记
@@ -327,6 +327,8 @@
 | `.evidence/review-gateway-file-r14/review.md` | 第 14 轮取证卷：Q1 实测确认"两格只被整体 FAIL 覆盖"为真且两句现时态描述因带边界可保留；Q2 用自己的解析复算出 19 并复跑 MC07/MC18/MC06/MC11 全对上班表；W-2 判"案卷第三方重算不出来"（引用了不存在的节名、MC15–18 只有计数没有名单、log/脚本只在实现者机器上）；N-3 逐条复核 r13 四条 WARN 均闭环；并声明复用中断者的树与 target、非自建 |
 | `crates/nexus-web-gateway/tools/mutation-gateway-file-config.py` | 配置面变异跑配方（MC01–MC20）入库件。评审 r14 W-2 的处置：证据此前只躺在 `/work/mm10.log`，第三方仅靠仓库重算不出覆盖率。头部写清隔离克隆+隔离 target 的跑法，以及"退码与 PASS 字样不算杀伤判据"（r13 W-3）|
 | `.agents/mutation-log-gateway-file-config.txt` | 上述配方的原始输出入库件（口径 = 可达提交 `8b07af8`，宿主 xc-pc-linux，rustc/cargo 1.98.1）。逐行含红单测数与**翻转的期望名单**；覆盖率实数：25 个 field 里 23 个是断言，这 23 条每一个都至少被一条配方翻过自己那一格，20 条配方无一零杀伤 |
+| `.evidence/review-gateway-file-r15/summary.json` | 第 15 轮案卷（第十二片再续的处置复核），verdict `COMMENTED`（0 FAIL / 1 WARN / 4 NOTE）。**Q1 三件全 PASS**：评审方在自己从零建的 `/work/r15-audit` + `/work/r15-target` 上把入库脚本整张跑完 22 行、与入库日志逐行 diff 全等，并只靠仓库文件重算出覆盖率（`verdict`/`case` 的剔除能自证）⇒ r14 W-2 的"第三方重算不出来"就此闭环 |
+| `.evidence/review-gateway-file-r15/review.md` | 第 15 轮取证卷：W-1 打在方法论上——评审配方 R15A（删配置层那条界 + 把字段名搬进引擎错误文本）实测 0 红 0 翻，证明"两层判定集合相同时层身份在行为上不可观测"，我上一轮"各钉一层答的话"是过界宣称；R15B 又抓出"上界写成 `>=` 时越界断言天生盲"⇒ 本轮把宣称拆成可诊断性/安全性两件事，并新增两格"边界值可用"对象与配方 MC21/MC22；N-2 明确写的是**它自己从零建的** `/work/r15-audit` + `/work/r15-target`（与 r14 第二次派单复用中断者 leftover 不同），并交代它自己第一次 R15A 配方因 bash 转义坏掉而作废重跑|
 | `.evidence/review-gateway-file-r14/summary.provisional-attempt1-interrupted.json` | r14 第一次派单中断（第 37 次工具调用、约 210 万 token）留下的**临时快照**：三条 finding 全标 pending、且它引用的 review.md/findings.json 不存在 ⇒ 不是可采信的 verdict。改名保留（证明这一轮跑过但没交付），并保证没有任何文件被误读成签发 |
 | `.agents/green-evidence-gateway-file-service-m1.txt` | Green Evidence for M1 slice 1 |
 

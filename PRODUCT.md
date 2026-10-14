@@ -3376,7 +3376,7 @@ portable-core/WASI 门），代之以双向一致性测试保证不漂移。
 
 - 不做跨节点的 Artifact 分发、不引入 `storage_ref` 作为凭证、不做浏览器端文件系统访问。
 - 不在本节宣称 E4/E5 为**已验收**：10 条 `gateway_file_*` 场景自 M1 起在 xc-pc-linux 上
-  跑绿（逐条 9+6+10+5+9+27+16+7+15+25 = 129 条期望，命令与计数见
+  跑绿（逐条 9+6+10+5+9+27+16+7+15+27 = 131 条期望，命令与计数见
   `.agents/green-evidence-gateway-file-service-m1.txt`），
   M0 阶段的 Red Evidence 记录保留在 `.agents/red-evidence-gateway-file-service.txt`；
   "场景跑绿"只证明引擎与配置面不变量，不等于 E5 端到端验收，网关文件能力在
@@ -3386,8 +3386,8 @@ portable-core/WASI 门），代之以双向一致性测试保证不漂移。
   `GatewayConfig::file_engine()` 是**从配置起引擎的唯一入口**且关断时返回 `None`——
   这句只约束"从配置构造"这条路：`FileEngine::new` 本身仍是 `pub`（`lib.rs` 公开
   `file_service`，探针与引擎单测直接调它），绕过配置去构造引擎不在这句的覆盖范围内
-  （评审 r13 W-2 要求写明这个边界）。承载体是 `product.gateway-file-config`（25 条期望）
-  与 `config.rs` 的 12 条单测（`REQ-014`）。
+  （评审 r13 W-2 要求写明这个边界）。承载体是 `product.gateway-file-config`（27 条期望）
+  与 `config.rs` 的 13 条单测（`REQ-014`）。
   **仍未证的那半**：`Gateway::start` 还没消费 `file_engine()`，线上也没有文件动词的
   分发，所以"拒启动"当前成立在构造缝上而不是进程路径上；M2 接线时必须补
   "关断时动词根本到不了"的对象，届时 r2 W-7 才算真正关闭。

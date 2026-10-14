@@ -1866,3 +1866,64 @@ green-evidence、mutation-log、r14 案卷两份、FILE_MANIFEST、PRODUCT、MOD
 r15 已按长期授权派出（两个必答：入库的脚本+日志是否真能让第三方重算出覆盖率；新补的
 idle 层标签对象会不会又是一条"只红在词法层"的对象），案卷落在
 `.evidence/review-gateway-file-r15/`，本轮结论回来之前不自签。
+
+================================================================================
+追加：第十二片再续二（r15 回来之后的处置：把"各钉一层"这句过界的宣称拆成
+两件分别可证的事，并补上"边界值可用"的第三条），宿主 xc-pc-linux
+（rustc/cargo 1.98.1；变异跑在隔离克隆 /work/mm7 + 隔离 /work/mm7-target）
+================================================================================
+
+r15 = `COMMENTED`（0 FAIL / 1 WARN / 4 NOTE），案卷 `.evidence/review-gateway-file-r15/`。
+这轮先说它**证实**的部分，因为那才是我这次改动的验收线：评审方在**自己从零建的树**
+`/work/r15-audit`（clone `m0-verify` = `c88f15d`）+ 自建 `/work/r15-target` 上，
+把我入库的配方脚本整张跑完 22 行，与我入库的日志**逐行 diff 全等**（F-03：
+`committed rows: 22 / my rows: 22 / MISMATCH rows: []`），并且只靠仓库文件重算出
+"25 field / 23 断言 / 每格至少翻一次"，连 `verdict`、`case` 的剔除都能自证
+（F-02：它们的 equals 值不是布尔）。⇒ r14 W-2 那条"第三方重算不出来"到这里是真闭环了，
+不是我说一句"已入库"。
+
+WARN-1 打在方法论上，而且打的是**我上一轮的修法本身**：
+评审配方 R15A = 删掉配置层那条 idle 上界 + 把 `files.idle_timeout_secs` 这个名字搬进
+引擎的错误文本 ⇒ 实测 **0 条单测红、0 条期望翻转**。两处改动之间唯一可观测的差别是文本。
+根因不在配方，在我上一轮写的那句"各钉一层答的话"：**两层判定集合相同的时候，
+"是谁答的"在行为上根本不可观测**，用错误串去"钉层"钉住的只是字符串。
+这是本链连续第三轮同一类过界（r12 机制冒充数量、r13 补的对象只红在词法层、r15 层身份不可观测），
+所以这次不再留"当时以为可以"的说法，直接把宣称拆开：
+① **可诊断性**——错误串点名坏掉的旋钮。R15A 能骗过的只有这一件；它不算安全洞，因为运维
+   仍然读得到该改哪一行。
+② **安全性**——越界的时长起不出引擎。这条**不要求**知道是谁答的；两层同集合是有意的冗余，
+   一侧被改坏时另一侧兜住。它真正的对象是配对配方：MC03（拆委托）红 5 条、MC04（只在打开时
+   校验）红 2 条——那两条才证明"这层在干活"。
+③ **边界值可用**（r15 R15B 抓出的第三件，先前根本没对象）——上界写成 `>=`（把恰好 24h
+   一起误杀）在①②的对象上全绿，因为"越界要拒"这种断言对它天生盲。新增冻结期望
+   `window_ceiling_boundary_is_usable` / `idle_ceiling_boundary_is_usable`（**纯加法**，
+   不动任何已冻结期望的语义）与单测 `both_duration_ceilings_leave_the_boundary_value_usable`，
+   并加配方 MC21 / MC22。
+
+—— 新变异表 MC01–MC22（唯一口径 = 可达提交 `41fe3c5ec2ed164b94fbf7d4111c92e04d6be5b4`）——
+完整逐行输出入库在 `.agents/mutation-log-gateway-file-config.txt`（脚本
+`crates/nexus-web-gateway/tools/mutation-gateway-file-config.py`），这里只记新增与结论：
+MC00 baseline        86 passed / 27 field / 0 翻
+MC21 窗口上界 off-by-one  1 红 both_duration_ceilings_leave_the_boundary_value_usable
+                          1 翻 window_ceiling_boundary_is_usable
+MC22 idle 上界 off-by-one 2 红 both_duration_ceilings_leave_the_boundary_value_usable,
+                          idle_time_bounds_are_rejected_at_the_config_layer
+                          1 翻 idle_ceiling_boundary_is_usable
+MC99 restored        86 passed / 0 翻（每行回写后断言与原文逐字节相等）
+22 条配方**无一零杀伤**；27 个 field 里 25 个是断言，**这 25 个每一个都至少被一条配方
+以"翻自己那一格"的方式打过**（`verdict` 是整体状态、`case` 是形参，不计入）。
+上一节"23 条断言全部有指名对象"是 20 条配方那一版的实数，两数并存不抹。
+
+—— 本节数字与门禁（先跑再写）——
+提交前那棵（与 `41fe3c5` 同索引）：clippy `--all-targets` 无诊断 / 86 passed / 0 failed /
+product.gateway-file-config **27 条全绿** / verify --fast 9 门全 PASS
+（evidence verify-56e676e5397b）/ dirty_state=false /
+contract_hash **21a1554aca8d3e5287d8292c8e0c1165c7361859**（`41fe3c5` 的提交正文带的就是这个号）。
+E4 期望合计 104 + 27 = **131**；`--lib` 86。
+残差登记（不当已完成）：层身份要拿到**结构承载体**（错误枚举变体，例如
+`ConfigBound{knob}` vs `DelegatedLimits(..)`）才能真正可钉，字符串标签只能证到①；
+这条挂在任务 #39，与 #32 的错误码词汇表统一同批做，免得动两次公共 API。
+
+评审链：… → r13(0F/4W/7N) → r14(0F/2W/3N；第一次派单中断零交付) →
+r15(0F/1W/4N；Q1 三件全 PASS 闭环 r14 W-2，W-1 判我上一轮的"钉层"说法过界) →
+r16（再续二的处置复核 + 第十三片实现，待派）。

@@ -1,0 +1,110 @@
+{
+  "round": "r15",
+  "subject": "nexus-fabric / feature/gateway-file-service-contracts, 第十二片再续 8b07af8 + c88f15d (channel ref m0-verify = c88f15d)",
+  "verdict": "COMMENTED",
+  "verdict_written_at_tool_call": 20,
+  "verdict_changed_after_evidence": false,
+  "severity_tally": { "fail": 0, "warn": 1, "note": 4 },
+  "reviewer_model": "qfmodel (runtime-reported identifier, copied verbatim; not inferred)",
+  "hosts": {
+    "windows": {
+      "role": "reading the working tree + writing the case file; NOT used for any compile/test claim",
+      "cwd": "E:\\nexus-fabric-m0",
+      "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+      "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)",
+      "git": "git version 2.46.0.windows.1",
+      "python": "none usable (Microsoft Store stub only) - all python recompute done on Linux"
+    },
+    "linux": {
+      "role": "the only source of compile/test/mutation evidence",
+      "host": "ssh appen@10.144.144.4 (xc-pc-linux, x86_64-unknown-linux-gnu)",
+      "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+      "cargo": "cargo 1.98.1 (797e8a9bc 2026-08-05)",
+      "git": "git version 2.25.1",
+      "python": "Python 3.8.10, tomli present, tomllib absent",
+      "wsl_used": false,
+      "tree": "reviewer's OWN from-scratch clone: git clone --no-hardlinks --branch m0-verify /work/m0-origin.git /work/r15-audit (HEAD c88f15d, git status --porcelain = 0 lines); all cargo runs with CARGO_TARGET_DIR=/work/r15-target. Not /work/mm7, not /work/r14-audit, not the implementer's tree."
+    }
+  },
+  "findings": [
+    {
+      "id": "F-01",
+      "severity": "PASS",
+      "q": "Q1-1",
+      "claim": "the committed harness runs verbatim in a third party's own isolated clone",
+      "evidence": "cd /work/r15-audit && CARGO_TARGET_DIR=/work/r15-target timeout 620 python3 crates/nexus-web-gateway/tools/mutation-gateway-file-config.py -> 'anchor precheck ok: 20 recipes', then 22 rows (MC00_baseline + MC01-MC20 + MC99_restored). The header's own instructions were sufficient; nothing had to be added.",
+      "files": ["crates/nexus-web-gateway/tools/mutation-gateway-file-config.py"]
+    },
+    {
+      "id": "F-02",
+      "severity": "PASS",
+      "q": "Q1-2",
+      "claim": "the committed raw log IS enough to recompute the coverage number, with only the scenario TOML from the repo for field definitions",
+      "evidence": "python3 /work/r15-recompute.py: 'config fields with equals: 25', 'non-bool equals: [(verdict,\"PASS\"),(case,\"config\")]', 'flip lines: 35 distinct names: 23', 'flip names NOT in scenario: []', 'scenario fields never flipped: [verdict, case]', zero-kill recipe rows: none. So 23 assertion fields each flipped >=1 time, and the verdict/case exclusion is independently re-derivable (their equals value is not a bool), not just asserted in the header."
+    },
+    {
+      "id": "F-03",
+      "severity": "PASS",
+      "q": "Q1-3",
+      "claim": "the committed log reproduces exactly on the reviewer's tree - all 22 rows, not just samples",
+      "evidence": "python3 /work/r15-diff.py (committed log vs /work/r15-orig.log): 'committed rows: 22 my rows: 22', 'tags only in committed: []', 'tags only in mine: []', 'MISMATCH rows: []', 'common rows identical: 22'. Compared per row: test-result word, red unit-test names, FLIP field names, missing counts. Samples explicitly re-checked: MC20 (r14's own NEW20 equivalent) 1 red / 1 flip, MC19, MC07 2 red / 3 flips, baseline 85 passed."
+    },
+    {
+      "id": "F-04",
+      "severity": "WARN",
+      "q": "Q2",
+      "file": "crates/nexus-web-gateway/examples/gateway_file_contract.rs:1749-1772; crates/nexus-web-gateway/src/config.rs:247-256 and 755-782; crates/nexus-web-gateway/src/file_service.rs:222-226",
+      "claim": "the newly added layer-label objects still pin 'who answered' only lexically: a compound mutant that deletes the config-layer idle ceiling AND copies the label text into the engine's message survives with 0 red tests and 0 flipped expectations",
+      "evidence": "reviewer recipe R15A_layer_migration_with_label_copy in /work/r15-mut.log: 'lib: test result: ok. 85 passed; 0 failed', 'red tests (0)', 'probe config: frozen=25 flips=0 missing=0', 'KILL: reds=0 flips=0 -> SURVIVED'. Observable behaviour did change (idle=86401 is now rejected by the engine table, message 'files limits: idle_timeout must be <= 24h (files.idle_timeout_secs): ...' instead of 'files.idle_timeout_secs must be <= 24h'), and the existing engine-message test at file_service.rs:5225 keeps passing because its substring was preserved. Classification: conditional kill - single-edit mutants MC19/MC20 are killed (measured), so this is not a zero-kill row in the committed table, but it is the third consecutive round where the layer tag is defeated by moving the tag text.",
+      "suggested_fix": "add the reverse half to both fields: assert the engine's own error does NOT contain the config-layer label, e.g. !c.to_limits().validate().unwrap_err().contains(\"files.idle_timeout_secs\"); that would also harden the inherited lockout_window family."
+    },
+    {
+      "id": "F-05",
+      "severity": "NOTE",
+      "q": "Q2",
+      "file": "crates/nexus-web-gateway/examples/gateway_file_contract.rs:1754-1771",
+      "claim": "floor and ceiling fields are asymmetric: the ceiling field has no 'the 24h value itself is usable' half, so a boundary off-by-one flips 0 expectations at scenario level",
+      "evidence": "reviewer recipe R15B (config.rs:252 '>' -> '>='): 'red tests (1): config::tests::idle_time_bounds_are_rejected_at_the_config_layer', 'probe config: frozen=25 flips=0 missing=0' -> killed only by the unit test's edge.validate().is_ok() (config.rs:780-782), not by the frozen expectation. The floor field does carry '&& idle_floor_is_usable'. Not a false statement in the committed log (the chain's criterion counts red test names too)."
+    },
+    {
+      "id": "F-06",
+      "severity": "NOTE",
+      "q": "Q2",
+      "file": "crates/nexus-web-gateway/examples/gateway_file_contract.rs:1556-1580 (probe legacy step)",
+      "claim": "the no-early-return change does NOT manufacture fake kills; it merges three causes into one false value, which is disclosed in the code comment, and it is a net improvement over the old '?' path",
+      "evidence": "reviewer recipe R15C_parse_gate_only (from_json_str rejects JSON lacking the literal 'files'): 'red tests (1): config::tests::absent_files_section_is_disabled' plus 'FLIP absent_section_is_disabled want=true got=false' + 'FLIP disabled_yields_no_engine want=true got=false' -> the field and the unit test move together, so nothing looks named while nothing is wrong. Under the previous '?' form the same mutant would have produced 'probe config: NO JSON', which by r13 W-3 is not kill evidence at all."
+    },
+    {
+      "id": "F-07",
+      "severity": "NOTE",
+      "q": "Q1-2",
+      "file": ".agents/mutation-log-gateway-file-config.txt:15-17",
+      "claim": "all 20 recipes kill 0 of the 27 auth-throttle expectations (every row says 'probe auth-throttle: frozen=27 flips=0'); the coverage sentence is scoped to product.gateway-file-config so this is not a false claim, but the log header could say explicitly that the auth-throttle surface is not covered by this table"
+    },
+    {
+      "id": "F-08",
+      "severity": "PASS",
+      "q": "doc numbers",
+      "claim": "the count roll-up in c88f15d is right: 25 expectations, 27, 129, 12 named unit tests, 85 lib tests, FILE_MANIFEST 223",
+      "evidence": "grep -c '^field = ' gateway_file_config.toml = 25; gateway_file_auth_throttle.toml = 27; 9+6+10+5+9+27+16+7+15+25 = 129 (= previous 127 + the 2 added expectations); MODULE.md's named test list extracted by script = 12 names, all 12 present as 'fn <name>(' in src/config.rs (config.rs holds 27 '#[test]' in total, so '12 条单测' reads as the named carrier subset and the names follow in the same sentence); my own baseline: 'test result: ok. 85 passed'; grep -c '^| `' FILE_MANIFEST.md = 223 and the declared value is 223 (a header-inclusive awk gives 224, which FILE_MANIFEST.md:87 itself documents as the retired口径 - my first suspicion there was my own wrong pattern, withdrawn, not filed as a finding)."
+    }
+  ],
+  "not_run_this_round": [
+    "verify --fast 9 gates",
+    "the thirteenth-slice resource-accounting RED",
+    "R15A' (same construction on the idle floor) - stated as inferred risk only",
+    "re-derivation of the other 8 E4 addends (they belong to earlier slices)"
+  ],
+  "verdict_rule": "COMMENTED = no FAIL-grade false statement in the two commits; the content is about discrimination strength of the newly added objects (WARN-1) and four precision notes.",
+  "artifacts": {
+    "case_dir": "E:\\nexus-fabric-m0\\.evidence\\review-gateway-file-r15",
+    "files": ["summary.json", "review.md"],
+    "business_code_touched": false,
+    "windows_worktree": "git status --porcelain = empty output (no modified, no untracked paths reported). The case dir E:\\nexus-fabric-m0\\.evidence\\review-gateway-file-r15\\ holds exactly two files (summary.json, review.md); it is not listed by git status, which means .evidence is covered by this repo's ignore rules and earlier rounds' case files were force-added by their authors - so the case files are on disk and uncommitted, nothing else in the tree changed. No business code, scenario or document was modified."
+  },
+  "logs": {
+    "reviewer_driver": "/work/r15-mut.log (driver /work/r15-mut.py, own recipes R15A/R15B/R15C + committed MC19/MC20/MC07)",
+    "committed_harness_replay": "/work/r15-orig.log (22 rows, compared by /work/r15-diff.py)",
+    "tree_after_run": "/work/r15-audit git status --porcelain = 0 lines, HEAD c88f15d"
+  }
+}
