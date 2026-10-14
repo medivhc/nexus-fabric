@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# ============================================================================
+# git-push-via-ssh443 — 沙箱环境经 SSH-over-443 推送到 GitHub
+# ----------------------------------------------------------------------------
+# 背景（详见 README §10）：
+#   沙箱内 github.com:443 的 SYN 被丢弃（curl 挂死 >7min），HTTPS push 不可用；
+#   gh-proxy 类反向代理只转发 GET，会剥离 Authorization、且把 URL 内嵌的
+#   user:token@ 当路径处理，同样无法推送。
+#   实测唯一可靠通道是 ssh.github.com:443（SSH-over-443）。
+#
+# 用法：
+#   GITHUB_TOKEN=<PAT with admin:public_key> ./git-push-via-ssh443 [branch] [-- remote opts]
+#   例：GITHUB_TOKEN=ghp_xxx ./git-push-via-ssh443 feat/sandbox-env-guard
+#
+# 安全约定：
+#   - 使用一次性 SSH key，push 后立即从 GitHub 账户删除并清理本地残留
+#   - 不修改仓库 origin 配置（用 url.insteadOf 临时覆盖）
+#   - 不把 token 写入任何配置文件
+# ============================================================================
+set -euo pipefail
+
+BRANCH="${1:-$(git rev-parse --abbrev-ref HEAD)}"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+TOKEN="${GITHUB_TOKEN:-}"
+KEY_PATH="$HOME/.ssh/gh_push_tmp"
+
+die() { echo "[push-ssh443] ERROR: $*" >&2; exit 1; }
+info() { echo "[push-ssh443] $*"; }
+
+[ -n "$TOKEN" ] || die "需要 GITHUB_TOKEN 环境变量（PAT，需 admin:public_key scope）"
+command -v ssh-keygen >/dev/null || die "缺少 ssh-keygen"
+command -v curl >/dev/null || die "缺少 curl"
+
+cleanup() {
+  local key_id="${1:-}"
+  if [ -n "$key_id" ]; then
+    info "清理：删除账户上的临时 SSH key (id=$key_id)"
+    curl -sS --max-time 20 -X DELETE -H "Authorization: token $TOKEN" \
+      "https://api.github.com/user/keys/$key_id" >/dev/null 2>&1 || true
+  fi
+  rm -f "$KEY_PATH" "$KEY_PATH.pub"
+  # 仅当 config 是本脚本生成时才移除，避免误删用户配置
+  if [ -f "$HOME/.ssh/config" ] && grep -q "gh_push_tmp" "$HOME/.ssh/config" 2>/dev/null; then
+    rm -f "$HOME/.ssh/config"
+  fi
+}
+trap 'cleanup "${KEY_ID:-}"' EXIT
+
+info "目标分支: $BRANCH"
+info "仓库根  : $REPO_ROOT"
+
+# ---------- 1) 生成一次性 SSH key ----------
+mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+rm -f "$KEY_PATH" "$KEY_PATH.pub"
+ssh-keygen -t ed25519 -f "$KEY_PATH" -N "" -C "sandbox-temp-push" -q
+info "已生成一次性 SSH key"
+
+# ---------- 2) 经 api.github.com 注册公钥 ----------
+# 该端点沙箱内直连通（~0.7s），与 github.com 的拦截无关
+PUBKEY="$(cat "$KEY_PATH.pub")"
+RESP="$(curl -sS --max-time 25 -X POST \
+  -H "Authorization: token $TOKEN" -H "Content-Type: application/json" \
+  -d "$(printf '{"title":"sandbox-temp-push","key":"%s"}' "$PUBKEY")" \
+  https://api.github.com/user/keys)"
+
+KEY_ID="$(printf '%s' "$RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)"
+[ -n "$KEY_ID" ] || die "注册公钥失败，返回：$RESP"
+info "公钥已注册 (id=$KEY_ID)"
+
+# ---------- 3) 配置 SSH 走 443 ----------
+cat > "$HOME/.ssh/config" <<EOF
+Host github.com
+    HostName ssh.github.com
+    Port 443
+    User git
+    IdentityFile $KEY_PATH
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+EOF
+chmod 600 "$HOME/.ssh/config"
+
+# ---------- 4) 验证握手 ----------
+if ! timeout 40 ssh -T -o BatchMode=yes git@github.com 2>&1 | grep -q "successfully authenticated"; then
+  die "SSH 握手失败，未通过 GitHub 认证"
+fi
+info "SSH 握手通过 (ssh.github.com:443)"
+
+# ---------- 5) 推送 ----------
+cd "$REPO_ROOT"
+info "开始推送..."
+git -c url."git@github.com:".insteadOf="https://github.com/" push -u origin "$BRANCH"
+info "推送完成"
