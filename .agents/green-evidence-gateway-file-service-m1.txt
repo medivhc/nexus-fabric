@@ -1927,3 +1927,17 @@ E4 期望合计 104 + 27 = **131**；`--lib` 86。
 评审链：… → r13(0F/4W/7N) → r14(0F/2W/3N；第一次派单中断零交付) →
 r15(0F/1W/4N；Q1 三件全 PASS 闭环 r14 W-2，W-1 判我上一轮的"钉层"说法过界) →
 r16（再续二的处置复核 + 第十三片实现，待派）。
+
+—— 锚回记录提交 `4ffe8db09bf43b9d259f68ef89907f2584526b2a`（宿主 xc-pc-linux）——
+与跑表的树 `41fe3c5` 的差异实测只有 8 个文档/案卷/日志件（`git diff --name-only` 列出：
+green-evidence、mutation-log、r15 案卷两份、FILE_MANIFEST、PRODUCT、MODULE、requirements），
+代码与 scenarios/ 一字未动。在记录树上重跑：86 passed / 0 failed、
+product.gateway-file-config PASS（**27** 条全成立）、verify --fast 9 门全 PASS
+（evidence dir = verify-61f403210912）、status --json verdict PASS 且 dirty_state=false、
+working_tree_digest 31dacee8e1605fa1455d87c8a148411cde5b3e0；
+contract_hash **21a1554aca8d3e5287d8292c8e0c1165c7361859** 与 `41fe3c5` 那轮同号——
+同号就是"这一笔没动契约文件"的机器证据，不靠我口头说。
+通道 ref `m0-verify` = 本提交 = 分支 HEAD。
+r16 已按长期授权派出（必答：③"边界值可用"在下界那一侧补得够不够，以及"两层判定集合相同"
+这句要不要限定在配置层可表达的定义域内；②复算材料与可达性按第三方标准核），
+结论回来之前不自签；第十三片（资源核算）的实现仍压在它后面，等 r16 的口径判定一起写。
