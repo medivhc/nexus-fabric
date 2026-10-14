@@ -1535,3 +1535,25 @@ contract_hash 从 `dd4926c2…`（9 场景）→ `f127b5f5…`（新增第 10 �
 没有一个是从上一轮继承或手推的。
 上一片的计数（104 条期望 / 73 单测）与本片的关系是**同一场景集加了第 10 个场景**，
 不是把旧场景改宽：旧 9 条场景的期望数一条没动（9/6/10/5/9/27/16/7/15 与 D 轮记录逐条相同）。
+
+—— 锚回落地提交（`290c6f4a7c4d36e53daf6143fff804eb0fccaf57`），宿主 xc-pc-linux ——
+上面那段复验跑在**提交前**的树 `d58ce4e…` 上，所以它描述的不是这个提交本身；两者之间的差异
+本轮实测过，只有一处：
+  git diff --name-only d58ce4e 290c6f4  ⇒  `.agents/green-evidence-gateway-file-service-m1.txt`
+也就是说代码、探针、场景、契约文件逐字节相同，差的只是我随后追加的那段散文。
+在这个提交上重跑一遍，把数字钉在提交号上（不是引用上一段）：
+  source_revision      290c6f4a7c4d36e53daf6143fff804eb0fccaf57
+  working_tree_digest  432b347589612afe5abfd1f2ecff3251c86e3894
+  contract_hash        7d478e586452778f218020c091503344a5660920（与 d58ce4e 那轮**同号**，
+                       这就是"只差散文"的机器证据：哈希只吃 scenarios/**/*.toml）
+  cargo test --lib     83 passed; 0 failed
+  product.gateway-file-config  PASS，21 条期望全成立
+  verify --fast        9 门全 PASS，evidence dir = verify-732b47f1ce12
+  status --json        verdict PASS（"latest evidence (732b47f1ce12) is fresh and PASS"），
+                       dirty_state=false
+通道口径：`m0-verify` 现在**等于本提交**（落地后按"通道 ref 恒等于分支 HEAD"重推过一次）。
+评审链 r13（第十二片的独立复核）已按长期授权派出，必答三问是：补上来的对象是否真有杀伤
+（含 `files limits` 标签会不会被别的分支满足）、G12/§18.4/REQ-014 三处现时态宣称与实现是否
+逐条对上（尤其"唯一构造入口"与"`Gateway::start` 还没消费它"两句的互相限定是否足够）、
+requirements.toml 的处置是否闭环（修复前后实际解析输出、14 条 literal string 有无语义副作用、
+"9 门不含它"是否真的是门定义而非文档口径）。
