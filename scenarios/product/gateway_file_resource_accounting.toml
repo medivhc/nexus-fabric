@@ -1,0 +1,73 @@
+schema_version = 1
+id = "product.gateway-file-resource-accounting"
+title = "文件面资源核算：读侧观测必须是纯读、缺口要显式降级、释放要报出归还的字节"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#18-gateway-file-service"
+
+[given]
+engine = "FileEngine with a local sandbox root"
+host_capability = "proc-self-readable-or-not"
+
+[when]
+command = "cargo run --quiet -p nexus-web-gateway --example gateway_file_contract -- --case resource-accounting --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "case"
+equals = "resource-accounting"
+
+# ---- 观测面本身的形状 ----------------------------------------------------------
+# 快照里 engine_* 六格必须与引擎自己的 getter 逐字相等：观测面一旦自己算一份，
+# 它报的就是"第二真值"，越用越偏（这是 §16 的"可观测不得变成另一份状态"）。
+[[expect]]
+field = "snapshot_matches_engine_counters"
+equals = true
+
+# 取快照是**纯读**：连取两次之间不做任何动作，六格引擎计数必须一字不变。
+# 若读 RSS 的路径顺手做过一次清扫/结算，这里就红。
+[[expect]]
+field = "snapshot_is_pure_read"
+equals = true
+
+# 不支持的宿主上必须报"取不到"而不是 0：0 会被读成"一个 fd 都没有"，那是假安心。
+# 探针按能力分支断言（Linux 上 Some(>0)，取不到时 source 必须是 "unavailable"），
+# 因此这条在两种宿主上都有对象，而不是"只有 Linux 能测"。
+[[expect]]
+field = "missing_capability_degrades_explicitly"
+equals = true
+
+# ---- fd 计数：进程全局量只能给下界，不能假装是引擎私有量 ----------------------
+# 同进程的别的线程随时可能开/关 fd，所以契约只钉两条：
+# ①快照里的 fd 数**不小于**引擎自己登记的读句柄数（引擎的句柄必然在进程 fd 里）；
+# ②登记数与打开次数对得上。任何"恰好等于 N"的断言都会随机红，那是契约写错不是实现错。
+[[expect]]
+field = "fd_count_is_process_global_lower_bound"
+equals = true
+
+[[expect]]
+field = "read_handle_registry_matches_opens"
+equals = true
+
+# ---- release_session 的释放必须报得出字节，且只报一次 --------------------------
+# 这条取代"释放悄悄发生"：返回的字节数必须等于释放前后 `file_buffered` 的差，
+# 并且同一 session 再放一次返回 0（不重复入账，否则运维面上会看到凭空多还的预算）。
+[[expect]]
+field = "release_reports_exact_freed_bytes"
+equals = true
+
+[[expect]]
+field = "double_release_reports_zero"
+equals = true
+
+# 未知 session 释放：返回 0，且不动任何一格计数（不能因为查不到就把别人的预算清了）。
+[[expect]]
+field = "release_unknown_session_is_inert"
+equals = true
+
+# 会话内预算归还到 0：释放后该会话的 file_buffered_for 必须是 0，全局缓冲只剩别人的。
+[[expect]]
+field = "session_budget_returns_to_zero"
+equals = true
