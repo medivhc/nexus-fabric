@@ -1,0 +1,4 @@
+schema_version = 1
+id = "product.web-gateway-ssh"
+title = "Web Gateway 浏览器 SSH 端到端（示例，演示命中 openssh_e2e → skip，因未装 openssh-server）"
+evidence_strength = "E4"

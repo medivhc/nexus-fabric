@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+# ============================================================================
+# env-check — 沙箱环境能力探测
+# ----------------------------------------------------------------------------
+# 探测维度：host / toolchain / system-libraries / capabilities
+# 输出：JSON 到 stdout；同时写入 $ENV_REPORT_DIR/env-report.json（默认 .env-report）
+# capability.status 取值：
+#   ok        环境满足，对应测试可运行
+#   unsupported  宿主/平台根本不具备（如 linux 沙箱不支持 windows executor）
+#   missing   能力可安装但当前未装（如 openssh-server）
+#   degraded  部分具备/受限（如 /dev/net/tun 不存在 → 网络类测试降级）
+#   unknown   探测失败，保守按不支持处理
+# ============================================================================
+import json, shutil, subprocess, os, sys, datetime, platform, re, fnmatch, time, socket
+
+VERBOSE = os.environ.get("VERBOSE") == "1"
+
+# GitHub 加速代理（基准测试 v2026-10-14 选出的最快节点；详见 README §代理基准）。
+# 可用环境变量 GITHUB_PROXY 覆盖。格式：https://<host>（末尾不带斜杠）。
+DEFAULT_GITHUB_PROXY = "https://v6.gh-proxy.org"
+
+
+def run_cmd(cmd, *args, timeout=20):
+    try:
+        r = subprocess.run([cmd, *args], capture_output=True, text=True, timeout=timeout)
+        out = (r.stdout + r.stderr).strip()
+        return out if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def has_bin(b):
+    return shutil.which(b) is not None
+
+
+def dpkg_ver(pkg):
+    """Debian/Ubuntu 包版本查询；非 Debian 系（含 Windows）返回 None（不报错）。
+
+    跨平台要点：Windows 没有 dpkg-query，直接 shell 调用会抛异常被吞成 None，
+    但显式短路更清晰，也避免在无 dpkg 的发行版上做无谓调用。
+    """
+    if os.name != "posix" or not shutil.which("dpkg-query"):
+        return None
+    return run_cmd("dpkg-query", "-W", "-f=${Version}", pkg)
+
+
+def extract_ver(text):
+    if not text:
+        return None
+    m = re.search(r"(\d+\.\d+(?:\.\d+)?)", text)
+    return m.group(1) if m else text
+
+
+def cap(status, **kw):
+    d = {"status": status}
+    d.update(kw)
+    return d
+
+
+def probe_github_proxy():
+    """探测「能否经代理访问 GitHub」（用于决定需要拉取外部制品/仓库的测试是否可跑）。
+
+    状态：
+      ok        代理可达且延迟 < 15s（可正常拉取）
+      degraded  代理可达但慢（> 15s，仍可用但应降级/限时）
+      missing   代理与直连均不可达（应跳过依赖 GitHub 的测试）
+    """
+    proxy = (os.environ.get("GITHUB_PROXY") or DEFAULT_GITHUB_PROXY).rstrip("/")
+    target = f"{proxy}/https://raw.githubusercontent.com/jdx/mise/main/README.md"
+    t0 = time.time()
+    try:
+        r = subprocess.run(
+            ["curl", "-sS", "-L", "--connect-timeout", "8", "--max-time", "25",
+             "-o", "/dev/null", "-w", "%{http_code} %{time_total} %{size_download}", target],
+            capture_output=True, text=True, timeout=35)
+        parts = r.stdout.split()
+        code = parts[0] if parts else "000"
+        elapsed = float(parts[1]) if len(parts) > 1 else None
+    except Exception:
+        code, elapsed = "000", None
+    latency_ms = int((elapsed or 0) * 1000)
+    if code in ("200", "206"):
+        if elapsed is not None and elapsed < 15:
+            return cap("ok", endpoint=proxy, http=code, latency_ms=latency_ms,
+                       note="GitHub 经代理可达（快）")
+        return cap("degraded", endpoint=proxy, http=code, latency_ms=latency_ms,
+                   note="GitHub 经代理可达但较慢，建议对拉取类测试限时")
+    return cap("missing", endpoint=proxy, http=code,
+               reason="经代理无法访问 GitHub（直连亦超时），依赖 GitHub 的测试应跳过")
+
+
+# 出网探测用的参考端点（可用环境变量覆盖）。
+# UDP 探测**多个**公共 DNS：真实网络常"选择性可达"（如本沙箱 8.8.8.8/223.5.5.5
+# 通、1.1.1.1 不通），只测一个会失真。
+EGRESS_UDP_HOSTS = [h.strip() for h in
+                    (os.environ.get("EGRESS_UDP_HOSTS") or "8.8.8.8,223.5.5.5").split(",")
+                    if h.strip()]
+EGRESS_UDP_PORT = int(os.environ.get("EGRESS_UDP_PORT") or 53)
+EGRESS_TCP_HOST = os.environ.get("EGRESS_TCP_HOST") or "mirrors.tuna.tsinghua.edu.cn"
+EGRESS_TCP_PORT = int(os.environ.get("EGRESS_TCP_PORT") or 443)
+
+
+def _udp_loopback_ok(timeout=2.0):
+    """回环 UDP：bind 两个 socket 并互发一包。"""
+    try:
+        a = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        b = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        a.bind(("127.0.0.1", 0))
+        b.bind(("127.0.0.1", 0))
+        a.sendto(b"x", b.getsockname())
+        b.settimeout(timeout)
+        b.recvfrom(8)
+        a.close()
+        b.close()
+        return True
+    except Exception:
+        return False
+
+
+def _udp_external_ok(timeout=5.0):
+    """出网 UDP：向多个公共 DNS 发**真实 DNS 查询**，返回 (是否任一可达, 可达列表)。
+
+    注意：必须发合法 DNS 查询。裸发一字节到 53 端口无人回应，会**误判为
+    "出网 UDP 被封"**（2026-10-14 实测踩坑：裸字节超时，但合法查询 8.8.8.8 正常回包）。
+    """
+    # example.com 的 A 记录查询（最小合法 DNS 报文）
+    q = (b"\xab\xcd" + b"\x01\x00" + b"\x00\x01" + b"\x00\x00" * 3
+         + b"\x07example\x03com\x00" + b"\x00\x01" + b"\x00\x01")
+    responders = []
+    for host in EGRESS_UDP_HOSTS:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(timeout)
+            s.sendto(q, (host, EGRESS_UDP_PORT))
+            _data, addr = s.recvfrom(512)
+            s.close()
+            responders.append(addr[0])
+        except Exception:
+            pass
+    return (len(responders) > 0), responders
+
+
+def _tcp_external_ok(timeout=8.0):
+    try:
+        s = socket.create_connection((EGRESS_TCP_HOST, EGRESS_TCP_PORT), timeout=timeout)
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
+def probe_internet_egress():
+    """探测出网能力（真远端类场景所需）。
+
+    与 TUN 不同：真远端类场景契约是 `equals="PASS"`（严格），环境不具备时
+    **硬 FAIL 而非优雅降级**，因此必须由能力门控决定 skip，否则会把"环境限制"
+    误记成"代码失败"。
+
+      ok        出网 UDP + TCP 均可达 → 真远端场景可跑
+      degraded  仅回环/TCP 可达、出网 UDP 不可达 → 真远端场景会硬 FAIL，应 skip
+      missing   连回环 socket 都不可用（极端沙箱）→ 相关场景应 skip
+    """
+    loopback_udp = _udp_loopback_ok()
+    external_udp, udp_responders = _udp_external_ok()
+    external_tcp = _tcp_external_ok()
+    detail = {
+        "loopback_udp": loopback_udp,
+        "external_udp": external_udp,
+        "udp_responders": udp_responders,
+        "external_tcp": external_tcp,
+        "udp_probe": f"{','.join(EGRESS_UDP_HOSTS)}:{EGRESS_UDP_PORT}",
+        "tcp_probe": f"{EGRESS_TCP_HOST}:{EGRESS_TCP_PORT}",
+    }
+    if not loopback_udp:
+        return cap("missing", **detail, reason="连回环 socket 都不可用（极端受限沙箱）")
+    if external_udp and external_tcp:
+        return cap("ok", **detail, note="出网 UDP/TCP 均可达，真远端类场景可运行")
+    return cap("degraded", **detail,
+               note="出网 UDP 不可达（仅回环/TCP）：真远端类场景会硬 FAIL，应 skip 而非记 FAIL")
+
+
+def main():
+    report = {
+        "schema_version": "1",
+        "generator": "sandbox-env-guard",
+        "checked_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+
+    # ---- host ----
+    host = {"os": platform.system().lower(), "arch": platform.machine(), "distro": ""}
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if line.startswith("PRETTY_NAME="):
+                    host["distro"] = line.split("=", 1)[1].strip().strip('"')
+    except Exception:
+        pass
+    is_linux = host["os"] == "linux"
+    report["host"] = host
+
+    # ---- toolchain ----
+    cargo_cfg = os.path.expanduser("~/.cargo/config.toml")
+    report["toolchain"] = {
+        "rust": extract_ver(run_cmd("rustc", "--version")),
+        "cargo": extract_ver(run_cmd("cargo", "--version")),
+        "rustup": extract_ver(run_cmd("rustup", "--version")),
+        "cargo_mirror": "rsproxy.cn" if os.path.exists(cargo_cfg) else "unknown",
+    }
+
+    # ---- system libraries ----
+    report["libraries"] = {
+        "libssl_dev": dpkg_ver("libssl-dev"),
+        "clang": extract_ver(run_cmd("clang", "--version")),
+        "cmake": extract_ver(run_cmd("cmake", "--version")),
+        "pkg_config": run_cmd("pkg-config", "--version"),
+    }
+
+    # ---- capabilities ----
+    caps = {}
+    caps["linux_executor"] = cap("ok" if is_linux else "unsupported", host=host["os"])
+    caps["windows_executor"] = cap("ok" if host["os"] == "windows" else "unsupported",
+                                   reason="host OS is not windows")
+    caps["macos_executor"] = cap("unsupported", reason="host OS is not macos")
+    caps["ios_executor"] = cap("unsupported", reason="no iOS SDK in sandbox")
+    caps["android_cross"] = cap("unsupported", reason="no Android NDK/SDK in sandbox")
+    # 跨平台：Windows 的 OpenSSH Server 提供 sshd.exe（在 PATH 中可查），
+    # Debian 系用 dpkg 查询；两者都取不到才算 missing。
+    sshd_found = shutil.which("sshd") is not None or dpkg_ver("openssh-server") is not None
+    caps["openssh_e2e"] = (cap("ok", detail="sshd available")
+                           if sshd_found
+                           else cap("missing", need="openssh-server (sshd)"))
+    # 跨平台：/dev/net/tun 只存在于 posix；Windows 的 TUN 走 wintun.dll。
+    # Windows 上不做真机断言，交由场景自身的结构化降级（TUN_ERROR / SKIP）处理。
+    if os.name == "posix":
+        caps["tun_net_admin"] = (cap("ok", note="/dev/net/tun present")
+                                 if os.path.exists("/dev/net/tun")
+                                 else cap("degraded", reason="no /dev/net/tun"))
+    else:
+        caps["tun_net_admin"] = cap(
+            "degraded",
+            reason="non-posix host: TUN via wintun, /dev/net/tun not applicable",
+            note="真机 TUN 能力由场景的结构化降级契约自行判定")
+    caps["confidential_transport"] = cap("unsupported",
+                                         reason="N3 cross-node confidential channel deferred")
+    caps["github_proxy"] = probe_github_proxy()
+    caps["internet_egress"] = probe_internet_egress()
+    caps["crates_fetched"] = cap("ok" if os.path.exists(
+        os.path.expanduser("~/.cargo/registry/cache")) else "missing")
+    report["capabilities"] = caps
+
+    # ---- 汇总索引（harness 可直接消费）----
+    report["unsupported_capabilities"] = [k for k, v in caps.items() if v["status"] == "unsupported"]
+    report["missing_capabilities"] = [k for k, v in caps.items() if v["status"] == "missing"]
+    report["degraded_capabilities"] = [k for k, v in caps.items() if v["status"] == "degraded"]
+
+    # ---- 写出 ----
+    out_dir = os.environ.get("ENV_REPORT_DIR", ".env-report")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "env-report.json")
+    with open(out_path, "w") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    if VERBOSE:
+        sys.stderr.write(f"[env-check] wrote {out_path}\n")
+
+
+if __name__ == "__main__":
+    main()

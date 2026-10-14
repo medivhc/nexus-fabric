@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+# ============================================================================
+# harness-select — 依据环境能力矩阵筛选本次应运行的测试
+# ----------------------------------------------------------------------------
+# 输入：
+#   --env-report PATH      env-check 产出的能力矩阵 JSON
+#   --map PATH             capability 映射表 (TOML)：声明每个测试所需 capability
+#   --scenarios-dir DIR    候选测试清单来源（扫描 *.toml，读取顶层 id 字段）
+#                          （不传则仅基于 map 的 key 做演示）
+# 输出：
+#   stdout: JSON { selected:[...], skipped:[...], summary:{...} }
+#   文件:   .env-report/test-plan.json （harness 直接读取此文件决定跑哪些）
+# 判定规则：
+#   测试所需的每个 capability.status 必须为 "ok"，否则该测试 skip；
+#   skip 原因记载首个未满足的 capability（unsupported/missing/degraded/unknown）。
+# ============================================================================
+import json, os, sys, glob, argparse, fnmatch
+
+try:
+    import tomllib
+except ImportError:  # pragma: no cover
+    import tomli as tomllib
+
+
+def load_toml(path):
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def load_env_report(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def discover_tests(scenarios_dir):
+    """扫描 scenario toml，返回测试 id 列表（顶层 id 字段）。"""
+    ids = []
+    if not scenarios_dir or not os.path.isdir(scenarios_dir):
+        return ids
+    for p in sorted(glob.glob(os.path.join(scenarios_dir, "*.toml"))):
+        try:
+            doc = load_toml(p)
+            tid = doc.get("id")
+            if tid:
+                ids.append(tid)
+        except Exception as e:
+            sys.stderr.write(f"[harness-select] WARN cannot parse {p}: {e}\n")
+    return ids
+
+
+def match_required(test_id, tests_map):
+    """返回该测试所需 capability 列表（按 pattern 合并，顺序稳定）。"""
+    required = []
+    for pattern, spec in tests_map.items():
+        if fnmatch.fnmatch(test_id, pattern):
+            for c in spec.get("requires", []):
+                if c not in required:
+                    required.append(c)
+    return required
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--env-report", default=".env-report/env-report.json")
+    ap.add_argument("--map", default="test-capability-map.toml")
+    ap.add_argument("--scenarios-dir", default=None)
+    ap.add_argument("--out", default=".env-report/test-plan.json")
+    args = ap.parse_args()
+
+    env = load_env_report(args.env_report)
+    caps = env.get("capabilities", {})
+    tests_map = load_toml(args.map).get("tests", {})
+    candidates = discover_tests(args.scenarios_dir)
+    if not candidates:
+        # 无 scenario 源时，用 map 的 key 作为候选（演示用）
+        candidates = list(tests_map.keys())
+
+    selected, skipped = [], []
+    for tid in candidates:
+        required = match_required(tid, tests_map)
+        if not required:
+            # 未声明能力依赖 → 默认运行（保守）
+            selected.append(tid)
+            continue
+        blocker = None
+        for c in required:
+            st = caps.get(c, {}).get("status", "unknown")
+            if st != "ok":
+                blocker = {"capability": c, "status": st,
+                           "reason": caps.get(c, {}).get("reason", "")}
+                break
+        if blocker:
+            skipped.append({"id": tid, "required": required, "blocked_by": blocker})
+        else:
+            selected.append(tid)
+
+    plan = {
+        "schema_version": "1",
+        "generator": "sandbox-env-guard/harness-select",
+        "env_report": args.env_report,
+        "selected": selected,
+        "skipped": skipped,
+        "summary": {
+            "total": len(candidates),
+            "runnable": len(selected),
+            "skipped": len(skipped),
+        },
+    }
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump(plan, f, indent=2, ensure_ascii=False)
+    print(json.dumps(plan, indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

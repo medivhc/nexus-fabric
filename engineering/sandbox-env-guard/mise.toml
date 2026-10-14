@@ -1,0 +1,55 @@
+# ============================================================================
+# sandbox-env-guard — 沙箱环境守卫方案 (mise 驱动)
+# ----------------------------------------------------------------------------
+# 作用：
+#   1. agent 进入沙箱/项目目录时自动探测环境能力（mise enter hook）
+#   2. 输出结构化 JSON 能力矩阵 (.env-report/env-report.json)
+#   3. harness-select 依据能力矩阵筛选【本次应运行 / 应跳过】的测试
+# 设计原则（对齐 nexus-fabric AGENTS.md）：仓库即 API、机器约束、
+# 独立验证、持久化证据。环境能力是 Evidence 的绑定维度之一。
+# ============================================================================
+
+[tools]
+# 本方案脚本为 Python，不依赖 mise 管理 rust；环境 rust 由 rustup 提供。
+# 若希望 mise 统一管理工具版本，取消下一行注释（将自动安装/切换 1.93.0，走国内镜像）：
+# rust = "1.93.0"
+
+# ---------------------------------------------------------------------------
+# 任务：环境探测
+# ---------------------------------------------------------------------------
+# 跨平台说明：本任务命令用于 Unix shell（bash/zsh/sh），统一用 `python`。
+# Windows 没有 `python`，只有 `py` 启动器，故 Windows 用户请用 `scripts/guard.ps1`
+# （自动探测 py -3 / py / python3），不要直接 `mise run guard`。
+# 脚本本身是纯 Python，不含 bash 语法，guard.ps1 在 PowerShell 下即可运行，无需 bash。
+[tasks.check-env]
+description = "探测沙箱环境能力，输出结构化 JSON 报告到 stdout 与 .env-report/env-report.json"
+run = "python scripts/env-check"
+env = { ENV_REPORT_DIR = ".env-report" }
+
+# ---------------------------------------------------------------------------
+# 任务：测试筛选（harness 消费入口）
+# ---------------------------------------------------------------------------
+[tasks.test-plan]
+description = "依据环境能力矩阵筛选本次应运行的测试，输出 .env-report/test-plan.json"
+run = "python scripts/harness-select --env-report .env-report/env-report.json --map test-capability-map.toml --scenarios-dir samples/scenarios"
+
+# ---------------------------------------------------------------------------
+# 组合任务：完整守卫流程
+# ---------------------------------------------------------------------------
+# 用 mise 的 `depends` 串联，而不是 `cmd1 && cmd2`——
+# `&&` 在 bash/cmd 可用但 PowerShell 5.x 不支持，depends 与 shell 无关。
+[tasks.guard]
+description = "完整守卫流程：环境探测 -> 测试筛选"
+depends = ["check-env", "test-plan"]
+
+# ---------------------------------------------------------------------------
+# Hook：agent 进入项目目录时自动运行环境探测
+# 生效前提：在 shell rc 启用 mise shell hook（`eval "$(mise activate bash)"` /
+# `mise activate zsh`），并对本项目执行 `mise trust`（mise 安全模型默认不执行
+# 未信任项目的 hook / task）。enter hook 在部分 mise 版本为实验特性，需 experimental。
+# ---------------------------------------------------------------------------
+[hooks]
+enter = "mise run check-env"
+
+[settings]
+experimental = true

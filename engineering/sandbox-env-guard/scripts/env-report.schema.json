@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "sandbox-env-guard env-report",
+  "description": "沙箱环境能力矩阵；harness 依据 capabilities 的 status 决定测试运行/跳过",
+  "type": "object",
+  "required": ["schema_version", "generator", "checked_at", "host", "toolchain", "capabilities"],
+  "properties": {
+    "schema_version": { "const": "1" },
+    "generator": { "const": "sandbox-env-guard" },
+    "checked_at": { "type": "string", "format": "date-time" },
+    "host": {
+      "type": "object",
+      "properties": {
+        "os": { "type": "string", "examples": ["linux", "windows", "macos"] },
+        "arch": { "type": "string" },
+        "distro": { "type": "string" }
+      }
+    },
+    "toolchain": {
+      "type": "object",
+      "properties": {
+        "rust": { "type": ["string", "null"] },
+        "cargo": { "type": ["string", "null"] },
+        "rustup": { "type": ["string", "null"] },
+        "cargo_mirror": { "type": "string" }
+      }
+    },
+    "libraries": { "type": "object" },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": ["ok", "unsupported", "missing", "degraded", "unknown"]
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "unsupported_capabilities": { "type": "array", "items": { "type": "string" } },
+    "missing_capabilities": { "type": "array", "items": { "type": "string" } },
+    "degraded_capabilities": { "type": "array", "items": { "type": "string" } }
+  }
+}
