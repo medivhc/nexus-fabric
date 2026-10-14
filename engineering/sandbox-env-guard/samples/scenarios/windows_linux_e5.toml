@@ -1,0 +1,4 @@
+schema_version = 1
+id = "product.windows_linux_e5"
+title = "Windows → Linux 真实 E5 验收（示例，演示命中 windows_executor → skip）"
+evidence_strength = "E5"
