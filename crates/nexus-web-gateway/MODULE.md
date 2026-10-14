@@ -129,12 +129,15 @@
 缝**不可替代**的那半只能是"配置层独有、且从 `file_engine()` 走一遍"的规则，两条各有对象：
 只含空白但非空的令牌（引擎只查 `is_empty()`）与空白根别名（`SandboxRoot::open` 和
 `FileEngine::new` 都不看别名内容，只查重复与非空集合）。
-覆盖率是**数名字数出来的**，不是推的（18 条配方、口径 = 可达提交 `0dbc1d2`，逐行红数与
-翻转名单记在案卷《第十二片再续》）：本场景 23 条里 **19 条有指名杀伤**；
-`absent_section_is_disabled` 与 `disabled_yields_no_engine` 只有"整体 FAIL"这一种红法
-（探针在这两步上早退，那两格来不及自己翻），`case` 是形参不是断言。
-这两种红法在判据上不等价——整体 FAIL 只证明"配置面坏了会响"，不证明"这一格被单独看着"，
-所以这里不写成"全覆盖"。
+覆盖率是**数名字数出来的**，不是推的。逐行红数与**翻转名单名**记在案卷
+`.agents/green-evidence-gateway-file-service-m1.txt` 的《覆盖率》一节；配方脚本与它的
+原始输出一并入库（`crates/nexus-web-gateway/tools/mutation-gateway-file-config.py` ⊕
+`.agents/mutation-log-gateway-file-config.txt`）——评审 r14 W-2 指出：证据只躺在我 Linux 机
+的 `/work/mm10.log` 上，第三方仅靠仓库重算不出那个数，减法就只剩"信我"。
+两种红法不等价这件事也照做：`absent_section_is_disabled` 与 `disabled_yields_no_engine`
+先前只有"探针整体 FAIL、其余字段缺席"这一种覆盖（探针在这两步早退，来不及翻自己那一格），
+评审 r14 N-1 把"改成记 `false` 继续跑"登记为必答，本笔已照做，这两格现在各自会翻。
+`case` 是形参不是断言，不计入杀伤。
 `FileLimits` 的交叉约束任一校验不过 ⇒ **拒绝启动**，绝不"半启用"或静默放宽
 （fail-closed）。当前 enforced 的交叉约束（除注明外逐条都有单测把它跑红，
 且夹具只违反自己那一条）：

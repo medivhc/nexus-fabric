@@ -1556,17 +1556,22 @@ fn gateway_config(f: &mut Map<String, Value>) -> Result<(), String> {
     let root_path = dir.display().to_string();
 
     // 1) 老配置（没有 files 段）必须等价于关断，并且结构性地起不出引擎。
-    let legacy: GatewayConfig = GatewayConfig::from_json_str(
+    //
+    // 这两格**故意不早退**（评审 r14 N-1 登记的那条改进）：以前这里用 `map_err(...)?`，
+    // 于是 MC05/MC06/MC11/MC12 四条配方只能以"探针整体 FAIL、21 个字段缺席"的形式被拦住——
+    // 第三方从翻转名单里看不出是哪一条宣称坏了。改成记 `false` 继续跑，杀伤就落在自己那一格上。
+    // 语义不变：解析不过 / 关断态起出了引擎 / 关断态构造报错，三种都算这格为假。
+    let legacy: Option<GatewayConfig> = GatewayConfig::from_json_str(
         r#"{"listen_addr":"127.0.0.1:8443","node_id":"a","node_name":"a",
             "node_list":[{"peer_id":"a","name":"a"}],
             "tls":{"mode":"auto_generate","names":[],"ips":[]}}"#,
     )
-    .map_err(|e| format!("legacy config must still parse: {e}"))?;
-    let absent_disabled = !legacy.files.enabled;
+    .ok();
+    let absent_disabled = legacy.as_ref().is_some_and(|c| !c.files.enabled);
     let disabled_no_engine = legacy
-        .file_engine()
-        .map_err(|e| format!("disabled config must not fail: {e}"))?
-        .is_none();
+        .as_ref()
+        .and_then(|c| c.file_engine().ok())
+        .is_some_and(|engine| engine.is_none());
     f.insert("absent_section_is_disabled".into(), json!(absent_disabled));
     f.insert(
         "disabled_yields_no_engine".into(),
@@ -1735,6 +1740,35 @@ fn gateway_config(f: &mut Map<String, Value>) -> Result<(), String> {
     f.insert(
         "over_24h_window_rejected_by_config".into(),
         json!(rejected_over_24h),
+    );
+
+    // 6b) `idle_timeout` 的两侧界同样各钉一层。评审 r14 W-1 的 NEW20 配方把配置层那条
+    //     idle 24h 上界拆掉，实测 **0 条单测红、0 条期望翻转**——委托让引擎那条同规则
+    //     替它答话，而我先前只给 `lockout_window` 写过带层标签的对象。这里补上：
+    //     串里含 `files.idle_timeout_secs` 才算配置层答的；引擎那半由 `to_limits()` 直接调。
+    let rejected_idle_floor = {
+        let mut c = on_files.clone();
+        c.idle_timeout_secs = 0;
+        config_err(&base_config(c)).contains("files.idle_timeout_secs")
+    };
+    let idle_floor_is_usable = {
+        let mut c = on_files.clone();
+        c.idle_timeout_secs = 1;
+        base_config(c).validate().is_ok()
+    };
+    let rejected_idle_ceiling = {
+        let mut c = on_files.clone();
+        c.idle_timeout_secs = MAX_FILE_WINDOW_SECS + 1;
+        config_err(&base_config(c.clone())).contains("files.idle_timeout_secs")
+            && c.to_limits().validate().is_err()
+    };
+    f.insert(
+        "idle_floor_rejected_by_config_layer".into(),
+        json!(rejected_idle_floor && idle_floor_is_usable),
+    );
+    f.insert(
+        "idle_ceiling_rejected_by_config_layer".into(),
+        json!(rejected_idle_ceiling),
     );
 
     // 7) 单源额度的两条交叉界必须在真实配置路径上跑到（G12）。

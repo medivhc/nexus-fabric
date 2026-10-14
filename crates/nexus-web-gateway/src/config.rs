@@ -751,6 +751,38 @@ mod tests {
     }
 
     #[test]
+    fn idle_time_bounds_are_rejected_at_the_config_layer() {
+        // 评审 r14 W-1：配置层这两条界先前**没有任何带层标签的对象**——评审方自己设计的
+        // NEW20（把 `idle_timeout_secs > MAX_FILE_WINDOW_SECS` 拆掉）实测 0 条单测红、
+        // 0 条期望翻转，因为 `FilesConfig::validate` 委托给引擎，而引擎那条
+        // `idle_timeout must be <= 24h` 会替配置层答话（下界同理，引擎那条是
+        // `idle_timeout must not be zero`）。所以这里钉的是"谁答的话"，不是"有没有被拒"。
+        let mut cfg = valid_config();
+        cfg.files.idle_timeout_secs = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("files.idle_timeout_secs"),
+            "零时长要由配置层的下界拒，而不是靠委托进来的引擎检查: {err}"
+        );
+
+        let mut over = valid_config();
+        over.files.idle_timeout_secs = MAX_FILE_WINDOW_SECS + 1;
+        let err = over.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("files.idle_timeout_secs"),
+            "24h 以上要由配置层的上界拒: {err}"
+        );
+        assert!(
+            over.files.to_limits().validate().is_err(),
+            "引擎层那条同规则也还在——删它会让这一格红"
+        );
+
+        let mut edge = valid_config();
+        edge.files.idle_timeout_secs = MAX_FILE_WINDOW_SECS;
+        assert!(edge.validate().is_ok(), "边界本身必须可用");
+    }
+
+    #[test]
     fn files_section_round_trips_through_json() {
         // 热更新写出去再读回来，文件段必须原样在——否则一次序列化就把模块静默关回默认。
         let dir = std::env::temp_dir().join("nexus-files-cfg-roundtrip");

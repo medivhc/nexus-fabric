@@ -100,6 +100,18 @@ equals = true
 field = "over_24h_window_rejected_by_config"
 equals = true
 
+# 评审 r14 W-1：`idle_timeout` 的两侧界先前**没有**带层标签的对象——评审方自己设计的配方
+# NEW20（拆掉配置层那条 idle 24h 上界）实测 0 条单测红、0 条期望翻转，因为委托让引擎那条
+# `idle_timeout must be <= 24h` 替配置层答了话。补两条，红因同样要求串里含
+# `files.idle_timeout_secs`（下界那条还要求"1 秒本身可用"，否则红的是别的规则）。
+[[expect]]
+field = "idle_floor_rejected_by_config_layer"
+equals = true
+
+[[expect]]
+field = "idle_ceiling_rejected_by_config_layer"
+equals = true
+
 # 单源额度的两条交叉界（G12）走的是引擎层 validate，这里证明配置路径真的调到了它。
 [[expect]]
 field = "source_budget_below_pair_threshold_rejected"
