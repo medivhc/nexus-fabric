@@ -80,8 +80,14 @@ EOF
 chmod 600 "$HOME/.ssh/config"
 
 # ---------- 4) 验证握手 ----------
-if ! timeout 40 ssh -T -o BatchMode=yes git@github.com 2>&1 | grep -q "successfully authenticated"; then
-  die "SSH 握手失败，未通过 GitHub 认证"
+# 注意：ssh -T 认证成功时 GitHub 仍返回 exit 1（不提供 shell access），
+# 在 set -o pipefail 下会让「ssh | grep」整体返回 1，即便 grep 匹配成功也会被
+# `!` 取反误判为失败。故先捕获输出（|| true 吞掉退出码），再单独判断内容。
+SSH_OUT="$(timeout 40 ssh -T -o BatchMode=yes git@github.com 2>&1 || true)"
+if ! printf '%s' "$SSH_OUT" | grep -q "successfully authenticated"; then
+  echo "--- ssh -T 原始输出 ---" >&2
+  printf '%s\n' "$SSH_OUT" >&2
+  die "SSH 握手失败，未通过 GitHub 认证（若提示 Permission denied，可能是新注册的 key 尚未生效，稍后重试）"
 fi
 info "SSH 握手通过 (ssh.github.com:443)"
 
