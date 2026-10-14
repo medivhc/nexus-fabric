@@ -27,15 +27,64 @@ use nexus_network::n1::{
 // 不加 cfg 的话，非 Linux 构建会因 workspace 的 deny(warnings) 直接编译失败。
 #[cfg(target_os = "linux")]
 use nexus_network::n1::pump::{Ipv4Route, PeerConnLookup, VpiPump};
-use nexus_path::{CandidatePath, FallbackChain, FallbackConfig, PathKind};
+use nexus_path::{CandidatePath, FallbackChain, FallbackConfig, PathKind, ProxyEndpoint};
+use nexus_proxy_transport::{
+    ProxyTransport, Socks5ProxyConfig, SsProxyConfig, SsTransport, TrojanProxyConfig,
+    TrojanTransport,
+};
 #[cfg(target_os = "linux")]
 use nexus_platform::VirtualPacketInterface;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "linux")]
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+// ---------- #3 fabric-over-proxy：超时预算（AC1） ----------
+
+/// 直连 tier 单次 QUIC 握手超时（fallback 链启用时）。
+const DIRECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// 代理 tier 总预算：TCP connect + 代理协议握手 + QUIC 握手。
+const PROXY_TIER_BUDGET: Duration = Duration::from_secs(10);
+
+/// `[network.proxy]` 映射到 `nexus-proxy-transport` 的可拨号配置（AC1/AC3）。
+#[derive(Debug, Clone)]
+pub enum ProxyConfig {
+    /// SOCKS5（RFC 1928/1929）。
+    Socks5(Socks5ProxyConfig),
+    /// Shadowsocks（AEAD session）。
+    Shadowsocks(SsProxyConfig),
+    /// Trojan。
+    Trojan(TrojanProxyConfig),
+}
+
+impl ProxyConfig {
+    /// 代理服务器地址（`FallbackChain::expand` 的 ProxyEndpoint）。
+    pub fn server(&self) -> SocketAddr {
+        match self {
+            Self::Socks5(c) => c.server,
+            Self::Shadowsocks(c) => c.server,
+            Self::Trojan(c) => c.server,
+        }
+    }
+}
+
+/// `PathKind` 的日志标签（AC4 `[path-fallback]` 文本）。
+fn kind_label(kind: PathKind) -> &'static str {
+    match kind {
+        PathKind::Direct => "direct",
+        PathKind::Mesh => "mesh",
+        PathKind::Turn => "turn",
+        PathKind::Proxy => "proxy",
+    }
+}
+
+/// 单阶段超时 = min(配置值, tier 剩余时间)（Q1：字段超时是单阶段上限）。
+fn min_timeout(configured: Duration, remaining: Duration) -> Duration {
+    configured.min(remaining)
+}
 
 // ---------- 注入 trait 适配器 ----------
 
@@ -129,6 +178,8 @@ impl N1KeepaliveIo for FabricKaStream {
 struct FabricDialer {
     local_bind: SocketAddr,
     handshake_timeout: Duration,
+    proxy: Option<ProxyConfig>,
+    cancel: Arc<AtomicBool>,
 }
 
 impl FabricDialer {
@@ -141,14 +192,172 @@ impl FabricDialer {
             StdUdpTransport::bind(cand.local_addr)
                 .map_err(|e| N1Error::Transport(format!("bind {}: {e}", cand.local_addr)))?,
         );
+        // Q2（coordinator 裁定）：proxy 已配置 → 直连 5s（AC1 不让用户久等）；
+        // proxy 未配置 → 保持现有 10s（AC3 零回归）。
+        let handshake_timeout = if self.proxy.is_some() {
+            DIRECT_HANDSHAKE_TIMEOUT
+        } else {
+            self.handshake_timeout
+        };
         let cfg = ConnConfig {
             addrs: vec![cand.remote_addr],
-            handshake_timeout: self.handshake_timeout,
+            handshake_timeout,
         };
         let conn =
             FabricConn::connect_with_transport(peer, &cfg, transport).map_err(map_fabric_err)?;
         Ok(Box::new(FabricConnAdapter { inner: conn }))
     }
+
+    /// 经代理 tier 建连（AC1）：总预算 `PROXY_TIER_BUDGET`（10s）固定 deadline，
+    /// `connect_timeout_sec`/`handshake_timeout_sec` 是单阶段上限并被剩余时间裁剪。
+    fn dial_proxy(
+        &self,
+        peer: FabricPeerId,
+        peer_addr: SocketAddr,
+    ) -> Result<Box<dyn N1Connection>, N1Error> {
+        let proxy = self
+            .proxy
+            .as_ref()
+            .ok_or_else(|| N1Error::Transport("proxy not configured".into()))?;
+        let deadline = Instant::now() + PROXY_TIER_BUDGET;
+        let remaining = || deadline.saturating_duration_since(Instant::now());
+
+        let transport: Box<dyn UdpTransport> = match proxy {
+            ProxyConfig::Socks5(cfg) => {
+                let c = Socks5ProxyConfig {
+                    server: cfg.server,
+                    auth: cfg.auth.clone(),
+                    connect_timeout: min_timeout(cfg.connect_timeout, remaining()),
+                    handshake_timeout: min_timeout(cfg.handshake_timeout, remaining()),
+                };
+                let t = ProxyTransport::connect(&c, peer_addr)
+                    .map_err(|e| N1Error::Transport(format!("proxy: {e}")))?;
+                Box::new(t)
+            }
+            ProxyConfig::Shadowsocks(cfg) => {
+                let c = SsProxyConfig {
+                    server: cfg.server,
+                    method: cfg.method,
+                    password: cfg.password.clone(),
+                    connect_timeout: min_timeout(cfg.connect_timeout, remaining()),
+                    handshake_timeout: min_timeout(cfg.handshake_timeout, remaining()),
+                };
+                let t = SsTransport::connect(&c, peer_addr)
+                    .map_err(|e| N1Error::Transport(format!("proxy: {e}")))?;
+                Box::new(t)
+            }
+            ProxyConfig::Trojan(cfg) => {
+                let c = TrojanProxyConfig {
+                    server: cfg.server,
+                    password: cfg.password.clone(),
+                    connect_timeout: min_timeout(cfg.connect_timeout, remaining()),
+                    handshake_timeout: min_timeout(cfg.handshake_timeout, remaining()),
+                };
+                let t = TrojanTransport::connect(&c, peer_addr)
+                    .map_err(|e| N1Error::Transport(format!("proxy: {e}")))?;
+                Box::new(t)
+            }
+        };
+
+        // QUIC 握手预算 = 剩余时间（严格兜底：即使代理握手超支也立即 Timeout）。
+        let quic_budget = remaining();
+        if quic_budget.is_zero() {
+            return Err(N1Error::Timeout);
+        }
+        let cfg = ConnConfig {
+            addrs: vec![peer_addr],
+            handshake_timeout: quic_budget,
+        };
+        let conn =
+            FabricConn::connect_with_transport(peer, &cfg, transport).map_err(map_fabric_err)?;
+        Ok(Box::new(FabricConnAdapter { inner: conn }))
+    }
+}
+
+/// 顺序 fallback 拨号（#3 抽取的纯逻辑，可单测）。
+///
+/// 对每个 addr 展开 `FallbackChain`（Direct → Proxy；Turn 未配置恒被 F4 跳过），
+/// 按链顺序调用 `dial_tier`；失败立即尝试下一 tier（无 hysteresis）。
+/// 每 tier 尝试前检查 `cancel`（协作式取消，AC1）。
+fn fallback_dial(
+    local_bind: SocketAddr,
+    proxy_server: Option<SocketAddr>,
+    addrs: &[SocketAddr],
+    cancel: &AtomicBool,
+    peer_hex: &str,
+    mut dial_tier: impl FnMut(
+        PathKind,
+        &CandidatePath,
+        SocketAddr,
+    ) -> Result<Box<dyn N1Connection>, N1Error>,
+) -> Result<(PathKind, Box<dyn N1Connection>), N1Error> {
+    let config = FallbackConfig {
+        proxy: proxy_server.map(|s| ProxyEndpoint { server: s }),
+        turn: None,
+    };
+    let start = Instant::now();
+    let mut last_err = N1Error::PeerUnknown;
+    let mut attempts: u64 = 0;
+
+    for addr in addrs {
+        if cancel.load(Ordering::Relaxed) {
+            eprintln!(
+                "[path-fallback] WARN: all tiers failed (peer={peer_hex}, last_error=cancelled, attempts={attempts})"
+            );
+            return Err(N1Error::Closed);
+        }
+        let chain = FallbackChain::expand(&config, local_bind, *addr);
+        let chain_desc: Vec<&str> = chain.candidates().iter().map(|c| kind_label(c.kind)).collect();
+        eprintln!(
+            "[path-fallback] chain expanded: {} (peer={peer_hex}, local={local_bind})",
+            chain_desc.join(" -> ")
+        );
+        for &kind in chain.skipped() {
+            eprintln!(
+                "[path-fallback] tier skipped: {} (reason=unconfigured)",
+                kind_label(kind)
+            );
+        }
+        for cand in chain.candidates() {
+            if cancel.load(Ordering::Relaxed) {
+                eprintln!(
+                    "[path-fallback] WARN: all tiers failed (peer={peer_hex}, last_error=cancelled, attempts={attempts})"
+                );
+                return Err(N1Error::Closed);
+            }
+            attempts += 1;
+            let tier_start = Instant::now();
+            match dial_tier(cand.kind, cand, *addr) {
+                Ok(conn) => {
+                    eprintln!(
+                        "[path-fallback] winner: {} (peer={peer_hex}, attempts={attempts}, elapsed_ms={})",
+                        kind_label(cand.kind),
+                        start.elapsed().as_millis()
+                    );
+                    return Ok((cand.kind, conn));
+                }
+                Err(e) => {
+                    last_err = e.clone();
+                    let reason = if matches!(e, N1Error::Timeout) {
+                        "timeout"
+                    } else {
+                        "connect_error"
+                    };
+                    eprintln!(
+                        "[path-fallback] WARN: tier failed: {} (reason={reason}, error={}, elapsed_ms={})",
+                        kind_label(cand.kind),
+                        e,
+                        tier_start.elapsed().as_millis()
+                    );
+                }
+            }
+        }
+    }
+    eprintln!(
+        "[path-fallback] WARN: all tiers failed (peer={peer_hex}, last_error={}, attempts={attempts})",
+        last_err
+    );
+    Err(last_err)
 }
 
 impl N1Dialer for FabricDialer {
@@ -158,24 +367,24 @@ impl N1Dialer for FabricDialer {
         addrs: &[SocketAddr],
     ) -> Result<Box<dyn N1Connection>, N1Error> {
         let fabric_peer = FabricPeerId(peer.0);
-        let config = FallbackConfig {
-            proxy: None,
-            turn: None,
-        };
-        let mut last_err = N1Error::PeerUnknown;
-        for addr in addrs {
-            let chain = FallbackChain::expand(&config, self.local_bind, *addr);
-            for cand in chain.candidates() {
-                match cand.kind {
-                    PathKind::Direct => match self.dial_direct(fabric_peer, cand) {
-                        Ok(c) => return Ok(c),
-                        Err(e) => last_err = e,
-                    },
-                    _ => continue,
-                }
-            }
-        }
-        Err(last_err)
+        let peer_hex = peer.to_hex();
+        let peer_hex8: String = peer_hex.chars().take(8).collect();
+        let proxy_server = self.proxy.as_ref().map(|p| p.server());
+        let (kind, conn) = fallback_dial(
+            self.local_bind,
+            proxy_server,
+            addrs,
+            &self.cancel,
+            &peer_hex8,
+            |kind, cand, peer_addr| match kind {
+                PathKind::Direct => self.dial_direct(fabric_peer, cand),
+                PathKind::Proxy => self.dial_proxy(fabric_peer, peer_addr),
+                // Turn/Mesh 不会出现在 chain 中（turn: None 已被 F4 跳过）。
+                _ => Err(N1Error::PeerUnknown),
+            },
+        )?;
+        let _ = kind;
+        Ok(conn)
     }
 }
 
@@ -254,6 +463,8 @@ impl PeerConnLookup for ManagerLookup {
 /// - `network.toml` 解析失败 → `Err(String)`。
 pub fn build_session_manager(
     config_text: &str,
+    proxy: Option<ProxyConfig>,
+    cancel: Arc<AtomicBool>,
 ) -> Result<(N1Config, Arc<N1SessionManager>), String> {
     let config =
         N1Config::parse_toml(config_text).map_err(|e| format!("parse network.toml: {e:?}"))?;
@@ -277,6 +488,8 @@ pub fn build_session_manager(
     let dialer = Arc::new(FabricDialer {
         local_bind: "0.0.0.0:0".parse().expect("0.0.0.0:0 parses"),
         handshake_timeout: Duration::from_secs(10),
+        proxy,
+        cancel,
     });
     let mgr = Arc::new(N1SessionManager::new(
         dialer,
@@ -371,6 +584,8 @@ fn network_up_linux(config_text: &str) -> i32 {
     let dialer = Arc::new(FabricDialer {
         local_bind: "0.0.0.0:0".parse().unwrap(),
         handshake_timeout: Duration::from_secs(10),
+        proxy: None,
+        cancel: Arc::new(AtomicBool::new(false)),
     });
     let mgr = Arc::new(N1SessionManager::new(
         dialer,
@@ -512,4 +727,168 @@ pub fn status_json(config_path: Option<&str>) -> serde_json::Value {
         }
     }
     obj
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(port: u16) -> SocketAddr {
+        format!("127.0.0.1:{port}").parse().unwrap()
+    }
+
+    /// 最小 `N1Connection` 替身（`fallback_dial` 单测用）。
+    struct MockN1Conn;
+
+    impl N1Connection for MockN1Conn {
+        fn send_datagram(&self, _data: &[u8]) -> Result<(), N1Error> {
+            Ok(())
+        }
+        fn recv_datagram(&self) -> Result<Vec<u8>, N1Error> {
+            Ok(Vec::new())
+        }
+        fn open_keepalive(&self) -> Result<N1KeepaliveStream, N1Error> {
+            Err(N1Error::Transport("mock has no keepalive".into()))
+        }
+        fn accept_keepalive(&self) -> Result<N1KeepaliveStream, N1Error> {
+            Err(N1Error::Transport("mock has no keepalive".into()))
+        }
+        fn rebind(&self) -> Result<(), N1Error> {
+            Ok(())
+        }
+        fn connection_id(&self) -> u64 {
+            1
+        }
+        fn peer(&self) -> N1PeerId {
+            N1PeerId([0u8; 32])
+        }
+        fn close(&self) {}
+    }
+
+    #[test]
+    fn fallback_direct_refused_proxy_wins() {
+        // Direct 返回 ConnectionRefused 语义错误 → Proxy tier 胜出（AC1）。
+        let cancel = AtomicBool::new(false);
+        let mut calls: Vec<PathKind> = Vec::new();
+        let (kind, _conn) = fallback_dial(
+            addr(1),
+            Some(addr(1080)),
+            &[addr(9000)],
+            &cancel,
+            "aabbccdd",
+            |kind, _cand, _peer_addr| {
+                calls.push(kind);
+                match kind {
+                    PathKind::Direct => Err(N1Error::Transport("refused".into())),
+                    PathKind::Proxy => Ok(Box::new(MockN1Conn) as Box<dyn N1Connection>),
+                    _ => Err(N1Error::PeerUnknown),
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(kind, PathKind::Proxy);
+        assert_eq!(calls, vec![PathKind::Direct, PathKind::Proxy]);
+    }
+
+    #[test]
+    fn fallback_no_proxy_pure_direct() {
+        // 未配置 proxy → chain 只含 Direct（AC3 零回归）。
+        let cancel = AtomicBool::new(false);
+        let mut calls: Vec<PathKind> = Vec::new();
+        let (kind, _conn) = fallback_dial(
+            addr(1),
+            None,
+            &[addr(9000)],
+            &cancel,
+            "aabbccdd",
+            |kind, _cand, _peer_addr| {
+                calls.push(kind);
+                match kind {
+                    PathKind::Direct => Ok(Box::new(MockN1Conn) as Box<dyn N1Connection>),
+                    _ => Err(N1Error::PeerUnknown),
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(kind, PathKind::Direct);
+        assert_eq!(calls, vec![PathKind::Direct]);
+    }
+
+    #[test]
+    fn fallback_all_tiers_fail_returns_last_error() {
+        // 直连与代理都失败 → 返回最后一次错误（AC1 异常语义）。
+        let cancel = AtomicBool::new(false);
+        let err = match fallback_dial(
+            addr(1),
+            Some(addr(1080)),
+            &[addr(9000)],
+            &cancel,
+            "aabbccdd",
+            |kind, _cand, _peer_addr| match kind {
+                PathKind::Direct => Err(N1Error::Transport("refused".into())),
+                PathKind::Proxy => Err(N1Error::Timeout),
+                _ => Err(N1Error::PeerUnknown),
+            },
+        ) {
+            Ok(_) => panic!("expected fallback to fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err, N1Error::Timeout);
+    }
+
+    #[test]
+    fn fallback_cancel_prevents_next_tier() {
+        // Direct 失败后置位 cancel → 整体中止，Proxy 闭包不被调用（AC1 协作式取消）。
+        let cancel = AtomicBool::new(false);
+        let mut calls: Vec<PathKind> = Vec::new();
+        let err = match fallback_dial(
+            addr(1),
+            Some(addr(1080)),
+            &[addr(9000)],
+            &cancel,
+            "aabbccdd",
+            |kind, _cand, _peer_addr| {
+                calls.push(kind);
+                match kind {
+                    PathKind::Direct => {
+                        cancel.store(true, Ordering::Relaxed);
+                        Err(N1Error::Transport("refused".into()))
+                    }
+                    PathKind::Proxy => Ok(Box::new(MockN1Conn) as Box<dyn N1Connection>),
+                    _ => Err(N1Error::PeerUnknown),
+                }
+            },
+        ) {
+            Ok(_) => panic!("expected fallback to cancel"),
+            Err(e) => e,
+        };
+        assert_eq!(err, N1Error::Closed);
+        assert_eq!(calls, vec![PathKind::Direct]);
+    }
+
+    #[test]
+    fn fallback_turn_never_attempted() {
+        // turn: None → chain 只含 Direct+Proxy，Turn 闭包不被调用（AC2/F4）。
+        let cancel = AtomicBool::new(false);
+        let mut calls: Vec<PathKind> = Vec::new();
+        let (kind, _conn) = fallback_dial(
+            addr(1),
+            Some(addr(1080)),
+            &[addr(9000)],
+            &cancel,
+            "aabbccdd",
+            |kind, _cand, _peer_addr| {
+                calls.push(kind);
+                match kind {
+                    PathKind::Direct => Err(N1Error::Transport("refused".into())),
+                    PathKind::Proxy => Ok(Box::new(MockN1Conn) as Box<dyn N1Connection>),
+                    _ => Err(N1Error::PeerUnknown),
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(kind, PathKind::Proxy);
+        assert_eq!(calls, vec![PathKind::Direct, PathKind::Proxy]);
+        assert!(!calls.contains(&PathKind::Turn));
+    }
 }
