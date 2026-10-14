@@ -70,6 +70,8 @@ pub struct DaemonConfig {
     pub qos: QosSection,
     /// `[tun]` 小节：TUN 设备开关与参数（默认启用）。
     pub tun: TunSection,
+    /// `[network.proxy]` 小节：fabric-over-proxy 代理配置（缺失 = 不启用）。
+    pub proxy: Option<ProxySection>,
 }
 
 /// `daemon.toml` 的 `[tun]` 小节（no-tun 模式，`docs/WINDOWS_TUN_DESIGN.md` §1）。
@@ -92,6 +94,78 @@ impl Default for TunSection {
             enabled: true,
             name: "nexus".to_string(),
             mtu: 1500,
+        }
+    }
+}
+
+/// `daemon.toml` 的 `[network.proxy]` 小节（#3 fabric-over-proxy）。
+///
+/// 缺失 `[network.proxy]` → `proxy: None`（daemon 正常启动，chain 跳过 proxy tier）。
+/// 任一字段非法 → 配置加载失败（daemon exit 1 + CONFIG 错误），不是运行时降级。
+/// 热加载分类：任一字段变化 → `NeedsRestart`（代理客户端生命周期需重建）。
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProxySection {
+    /// 代理协议类型（`socks5 | shadowsocks | trojan`）。
+    pub proxy_type: ProxyType,
+    /// 代理服务器地址（`host:port`，必须可解析为 `SocketAddr`）。
+    pub server: std::net::SocketAddr,
+    /// SOCKS5 RFC 1929 认证用户名（可选；shadowsocks/trojan 忽略）。
+    pub username: Option<String>,
+    /// 密码（shadowsocks/trojan 必填；socks5 可选，缺省 = 无认证）。
+    pub password: Option<String>,
+    /// 仅 shadowsocks 使用（默认 `chacha20-ietf-poly1305`）。
+    pub method: Option<String>,
+    /// TCP connect 超时（秒，默认 10，必须 > 0）。
+    pub connect_timeout_sec: u64,
+    /// 代理协议握手超时（秒，默认 10，必须 > 0）。
+    pub handshake_timeout_sec: u64,
+}
+
+/// 手动 `Debug`：密码字段只输出 `***`，永不落日志（AC3）。
+impl std::fmt::Debug for ProxySection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxySection")
+            .field("proxy_type", &self.proxy_type)
+            .field("server", &self.server)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "***"))
+            .field("method", &self.method)
+            .field("connect_timeout_sec", &self.connect_timeout_sec)
+            .field("handshake_timeout_sec", &self.handshake_timeout_sec)
+            .finish()
+    }
+}
+
+/// `[network.proxy]` 的 `type` 枚举值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyType {
+    /// SOCKS5（RFC 1928/1929）。
+    Socks5,
+    /// Shadowsocks（AEAD session）。
+    Shadowsocks,
+    /// Trojan。
+    Trojan,
+}
+
+impl ProxyType {
+    /// 稳定标签（与 `daemon.toml` 的 `type` 字段一致）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Socks5 => "socks5",
+            Self::Shadowsocks => "shadowsocks",
+            Self::Trojan => "trojan",
+        }
+    }
+
+    /// 解析 `type` 标签；非法值返回 `Err`。
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "socks5" => Ok(Self::Socks5),
+            "shadowsocks" => Ok(Self::Shadowsocks),
+            "trojan" => Ok(Self::Trojan),
+            other => Err(format!(
+                "{DAEMON_TOML}: [network.proxy].type must be one of socks5|shadowsocks|trojan (got '{other}')"
+            )),
         }
     }
 }
@@ -184,6 +258,7 @@ pub fn load(dir: &ConfigDir) -> Result<LoadedConfig, String> {
             localapi_addr: DaemonConfig::default_addr(),
             qos: QosSection::default(),
             tun: TunSection::default(),
+            proxy: None,
         },
         ..Default::default()
     };
@@ -253,6 +328,7 @@ fn parse_daemon_toml(text: &str) -> Result<DaemonConfig, String> {
         localapi_addr: DaemonConfig::default_addr(),
         qos: QosSection::default(),
         tun: TunSection::default(),
+        proxy: None,
     };
     // 支持 `localapi_addr = "..."` 或 `[localapi] addr = "..."`
     if let Some(s) = v.get("localapi_addr").and_then(|x| x.as_str()) {
@@ -277,7 +353,128 @@ fn parse_daemon_toml(text: &str) -> Result<DaemonConfig, String> {
     if let Some(t) = v.get("tun") {
         cfg.tun = parse_tun_section(t)?;
     }
+    // [network.proxy] 小节（可选；缺失 = 不启用，不报错）
+    if let Some(t) = v.get("network").and_then(|n| n.get("proxy")) {
+        cfg.proxy = Some(parse_proxy_section(t)?);
+    }
     Ok(cfg)
+}
+
+/// 解析 `daemon.toml` 的 `[network.proxy]` 小节（#3 AC3 字段契约）。
+///
+/// 任一校验失败 → `Err`（daemon exit 1 + CONFIG 错误），不是运行时降级。
+fn parse_proxy_section(t: &toml::Value) -> Result<ProxySection, String> {
+    let proxy_type = match t.get("type") {
+        Some(x) => {
+            let s = x
+                .as_str()
+                .ok_or_else(|| format!("{DAEMON_TOML}: [network.proxy].type must be a string"))?;
+            ProxyType::parse(s)?
+        }
+        None => {
+            return Err(format!(
+                "{DAEMON_TOML}: [network.proxy].type is required (socks5|shadowsocks|trojan)"
+            ))
+        }
+    };
+
+    let server = match t.get("server") {
+        Some(x) => {
+            let s = x
+                .as_str()
+                .ok_or_else(|| format!("{DAEMON_TOML}: [network.proxy].server must be a string"))?;
+            if s.is_empty() {
+                return Err(format!(
+                    "{DAEMON_TOML}: [network.proxy].server must not be empty"
+                ));
+            }
+            s.parse::<std::net::SocketAddr>().map_err(|e| {
+                format!("{DAEMON_TOML}: [network.proxy].server must be a SocketAddr: {e}")
+            })?
+        }
+        None => {
+            return Err(format!(
+                "{DAEMON_TOML}: [network.proxy].server is required (host:port)"
+            ))
+        }
+    };
+
+    let get_timeout = |key: &str| -> Result<u64, String> {
+        match t.get(key) {
+            None => Ok(10),
+            Some(x) => {
+                let n = x.as_integer().and_then(|i| u64::try_from(i).ok()).ok_or_else(
+                    || format!("{DAEMON_TOML}: [network.proxy].{key} must be a positive integer"),
+                )?;
+                if n == 0 {
+                    return Err(format!(
+                        "{DAEMON_TOML}: [network.proxy].{key} must be > 0"
+                    ));
+                }
+                Ok(n)
+            }
+        }
+    };
+    let connect_timeout_sec = get_timeout("connect_timeout_sec")?;
+    let handshake_timeout_sec = get_timeout("handshake_timeout_sec")?;
+
+    let username = t
+        .get("username")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+    let password = t
+        .get("password")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+
+    let method = t
+        .get("method")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+
+    match proxy_type {
+        ProxyType::Socks5 => {
+            // socks5：username 有值而 password 缺失 → 认证不完整，Err。
+            if username.is_some() && password.is_none() {
+                return Err(format!(
+                    "{DAEMON_TOML}: [network.proxy].password is required when username is set (socks5 RFC1929 auth)"
+                ));
+            }
+        }
+        ProxyType::Shadowsocks | ProxyType::Trojan => {
+            // shadowsocks/trojan：password 必填非空。
+            match password.as_deref() {
+                Some(p) if !p.is_empty() => {}
+                _ => {
+                    return Err(format!(
+                        "{DAEMON_TOML}: [network.proxy].password is required (non-empty) for {}",
+                        proxy_type.as_str()
+                    ))
+                }
+            }
+        }
+    }
+
+    // method：仅 shadowsocks 校验；非 ss 协议配置了 method 则忽略（不报错）。
+    if proxy_type == ProxyType::Shadowsocks {
+        if let Some(m) = method.as_deref() {
+            nexus_proxy_transport::SsMethod::parse(m).map_err(|e| {
+                format!(
+                    "{DAEMON_TOML}: [network.proxy].method unsupported for shadowsocks: {e:?}"
+                )
+            })?;
+        }
+    }
+
+    Ok(ProxySection {
+        proxy_type,
+        server,
+        username,
+        password,
+        method,
+        connect_timeout_sec,
+        handshake_timeout_sec,
+    })
 }
 
 /// 解析 `daemon.toml` 的 `[tun]` 小节（T1）。
@@ -536,6 +733,10 @@ pub fn classify_change(old: &LoadedConfig, new: &LoadedConfig) -> ChangeKind {
     if old.daemon.tun != new.daemon.tun {
         return ChangeKind::NeedsRestart;
     }
+    // daemon.toml：[network.proxy] 小节变化需重启（#3：代理客户端生命周期需重建）
+    if old.daemon.proxy != new.daemon.proxy {
+        return ChangeKind::NeedsRestart;
+    }
     // R5：network.toml 内容变更 → NeedsRestart（mesh CIDR 可能变化）。
     if old.network_toml != new.network_toml {
         return ChangeKind::NeedsRestart;
@@ -789,5 +990,218 @@ mod tests {
         assert!(parse_dns_toml("not toml [[[").is_err());
         assert!(parse_dns_toml("[dns]\nfake_ip_range = \"999.1.1.0/24\"\n").is_err());
         assert!(parse_dns_toml("[dns.hosts]\nbad = \"not-an-ip\"\n").is_err());
+    }
+
+    // ---------- [network.proxy]（#3 fabric-over-proxy，AC3） ----------
+
+    fn socks5_section(type_line: &str, extra: &str) -> String {
+        format!(
+            "[network.proxy]\ntype = \"{type_line}\"\nserver = \"127.0.0.1:1080\"\n{extra}"
+        )
+    }
+
+    #[test]
+    fn proxy_absent_when_no_section() {
+        let cfg = parse_daemon_toml("[localapi]\naddr = \"127.0.0.1:18080\"\n").unwrap();
+        assert!(cfg.proxy.is_none());
+    }
+
+    #[test]
+    fn proxy_socks5_no_auth_ok() {
+        let cfg = parse_daemon_toml(&socks5_section("socks5", "")).unwrap();
+        let p = cfg.proxy.expect("proxy");
+        assert_eq!(p.proxy_type, ProxyType::Socks5);
+        assert_eq!(p.server.to_string(), "127.0.0.1:1080");
+        assert!(p.username.is_none());
+        assert!(p.password.is_none());
+        assert_eq!(p.connect_timeout_sec, 10);
+        assert_eq!(p.handshake_timeout_sec, 10);
+    }
+
+    #[test]
+    fn proxy_socks5_with_auth_ok() {
+        let cfg = parse_daemon_toml(&socks5_section(
+            "socks5",
+            "username = \"nexus\"\npassword = \"changeme\"\n",
+        ))
+        .unwrap();
+        let p = cfg.proxy.expect("proxy");
+        assert_eq!(p.username.as_deref(), Some("nexus"));
+        assert_eq!(p.password.as_deref(), Some("changeme"));
+    }
+
+    #[test]
+    fn proxy_socks5_timeouts_parsed() {
+        let cfg = parse_daemon_toml(&socks5_section(
+            "socks5",
+            "connect_timeout_sec = 3\nhandshake_timeout_sec = 7\n",
+        ))
+        .unwrap();
+        let p = cfg.proxy.expect("proxy");
+        assert_eq!(p.connect_timeout_sec, 3);
+        assert_eq!(p.handshake_timeout_sec, 7);
+    }
+
+    #[test]
+    fn proxy_shadowsocks_default_method_ok() {
+        let cfg = parse_daemon_toml(&socks5_section(
+            "shadowsocks",
+            "password = \"pw\"\n",
+        ))
+        .unwrap();
+        let p = cfg.proxy.expect("proxy");
+        assert_eq!(p.proxy_type, ProxyType::Shadowsocks);
+        assert!(p.method.is_none());
+    }
+
+    #[test]
+    fn proxy_shadowsocks_explicit_method_ok() {
+        let cfg = parse_daemon_toml(&socks5_section(
+            "shadowsocks",
+            "password = \"pw\"\nmethod = \"chacha20-ietf-poly1305\"\n",
+        ))
+        .unwrap();
+        let p = cfg.proxy.expect("proxy");
+        assert_eq!(p.method.as_deref(), Some("chacha20-ietf-poly1305"));
+    }
+
+    #[test]
+    fn proxy_trojan_ok() {
+        let cfg = parse_daemon_toml(&socks5_section(
+            "trojan",
+            "password = \"trojan-secret\"\n",
+        ))
+        .unwrap();
+        let p = cfg.proxy.expect("proxy");
+        assert_eq!(p.proxy_type, ProxyType::Trojan);
+    }
+
+    #[test]
+    fn proxy_missing_type_is_err() {
+        assert!(parse_daemon_toml("[network.proxy]\nserver = \"127.0.0.1:1080\"\n").is_err());
+    }
+
+    #[test]
+    fn proxy_bad_type_is_err() {
+        assert!(parse_daemon_toml(&socks5_section("http", "")).is_err());
+        assert!(parse_daemon_toml(&socks5_section("", "")).is_err());
+    }
+
+    #[test]
+    fn proxy_missing_server_is_err() {
+        assert!(parse_daemon_toml("[network.proxy]\ntype = \"socks5\"\n").is_err());
+    }
+
+    #[test]
+    fn proxy_server_not_socket_addr_is_err() {
+        assert!(parse_daemon_toml(&socks5_section("socks5", "server = \"proxy.example\"\n")).is_err());
+        assert!(parse_daemon_toml(&socks5_section("socks5", "server = \"\"\n")).is_err());
+    }
+
+    #[test]
+    fn proxy_bad_method_is_err() {
+        assert!(parse_daemon_toml(&socks5_section(
+            "shadowsocks",
+            "password = \"pw\"\nmethod = \"aes-256-gcm\"\n",
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn proxy_non_ss_method_ignored() {
+        // 非 ss 协议配置 method → 忽略不报错（A8）。
+        let cfg = parse_daemon_toml(&socks5_section(
+            "socks5",
+            "method = \"chacha20-ietf-poly1305\"\n",
+        ))
+        .unwrap();
+        assert_eq!(cfg.proxy.expect("proxy").proxy_type, ProxyType::Socks5);
+    }
+
+    #[test]
+    fn proxy_timeout_zero_is_err() {
+        assert!(parse_daemon_toml(&socks5_section(
+            "socks5",
+            "connect_timeout_sec = 0\n",
+        ))
+        .is_err());
+        assert!(parse_daemon_toml(&socks5_section(
+            "socks5",
+            "handshake_timeout_sec = 0\n",
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn proxy_timeout_negative_is_err() {
+        assert!(parse_daemon_toml(&socks5_section(
+            "socks5",
+            "connect_timeout_sec = -1\n",
+        ))
+        .is_err());
+        assert!(parse_daemon_toml(&socks5_section(
+            "socks5",
+            "handshake_timeout_sec = -1\n",
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn proxy_timeout_non_integer_is_err() {
+        assert!(parse_daemon_toml(&socks5_section(
+            "socks5",
+            "connect_timeout_sec = \"fast\"\n",
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn proxy_ss_missing_password_is_err() {
+        assert!(parse_daemon_toml(&socks5_section("shadowsocks", "")).is_err());
+        assert!(parse_daemon_toml(&socks5_section("shadowsocks", "password = \"\"\n")).is_err());
+        assert!(parse_daemon_toml(&socks5_section("trojan", "")).is_err());
+    }
+
+    #[test]
+    fn proxy_socks5_username_without_password_is_err() {
+        assert!(parse_daemon_toml(&socks5_section(
+            "socks5",
+            "username = \"nexus\"\n",
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn proxy_debug_masks_password() {
+        let cfg = parse_daemon_toml(&socks5_section(
+            "socks5",
+            "username = \"nexus\"\npassword = \"supersecret\"\n",
+        ))
+        .unwrap();
+        let dbg = format!("{:?}", cfg.proxy.expect("proxy"));
+        assert!(!dbg.contains("supersecret"));
+        assert!(dbg.contains("\"***\""));
+    }
+
+    #[test]
+    fn proxy_change_needs_restart() {
+        let d = std::env::temp_dir().join("nexusd-cfg-test-proxy");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        write(
+            &d,
+            DAEMON_TOML,
+            "[network.proxy]\ntype = \"socks5\"\nserver = \"127.0.0.1:1080\"\n",
+        );
+        let dir = ConfigDir::new(&d).unwrap();
+        let old = load(&dir).unwrap();
+        write(
+            &d,
+            DAEMON_TOML,
+            "[network.proxy]\ntype = \"socks5\"\nserver = \"127.0.0.1:1081\"\n",
+        );
+        let new = load(&dir).unwrap();
+        assert_eq!(classify_change(&old, &new), ChangeKind::NeedsRestart);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

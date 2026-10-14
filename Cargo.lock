@@ -1184,6 +1184,7 @@ dependencies = [
  "nexus-policy",
  "nexus-proxy",
  "nexus-proxy-config",
+ "nexus-proxy-transport",
  "nexus-registry",
  "nexus-scheduler",
  "nexus-service",
