@@ -119,3 +119,40 @@ V1 从未合入 master，本分支上 G12..G16 为空，故一次性落成 **G12
 4. `harness.toml` 的 `[contract_first]` 只要求 RED 证据存在，未规定存放路径；
    本文件按仓库现存惯例落在 `.agents/red-evidence-<feature>.txt`（对照
    `red-evidence-code-intelligence.txt` 等 20+ 个同类文件）。
+
+================================================================================
+追加：第十三片（资源核算 / release_session 释放可观测）契约先行的 RED，
+宿主 xc-pc-linux（rustc/cargo 1.98.1，x86_64-unknown-linux-gnu），2026-10-14
+================================================================================
+契约文件：`scenarios/product/gateway_file_resource_accounting.toml`
+场景 id：  `product.gateway-file-resource-accounting`（E4，11 条期望）
+口径树：    `ecc4a7d32114c46e0e33aacfe314e90dde8e420b`（只含这份新契约，实现一行未写）
+命令：      `cargo run -q --bin nexus-harness -- scenario run
+             product.gateway-file-resource-accounting`
+实测输出：
+  nexus-harness scenario: FAIL - scenario product.gateway-file-resource-accounting:
+  FAIL (expect product.gateway-file-resource-accounting.verdict failed (actual: "FAIL"))
+  evidence_id: "scenario-d21bfe210dec"
+  failure_signature: {"assertion":"verdict","failed_step":"expect",
+    "key_log_lines":["{\"case\":\"resource-accounting\",\"command\":\"gateway-file-contract\",
+      \"error\":\"unknown case \\\"resource-accounting\\\"\",\"schema_version\":1,
+      \"verdict\":\"FAIL\"}"]}
+⇒ 红在"探针还不认这条 case"，正是契约先行该有的第一格红法（与 M0 那 9 条同形）。
+这一笔推的是**独立 ref `m0-red`**，不是 `m0-verify`：同一时间 r14 的评审者正在用它自己的
+克隆（`/work/r14-audit`）复跑那张变异表，动它的通道 ref 会让"评审期间 ref 动过"这件事
+第二次发生（r13 N-7 就是这么来的）。这条纪律写在这儿，不是为了好看，是为了下一次不踩。
+
+这片要钉的三条口径（都是"数得出来"的形状，避免又写成现时态空话）：
+1. **观测面不得变成第二份真值**：快照里的引擎计数六格必须逐字等于各 getter 的返回值
+   （`snapshot_matches_engine_counters`），且连取两次之间不做动作时六格一字不变
+   （`snapshot_is_pure_read`）——读 RSS 的路上顺手清扫过一次，这里就红。
+2. **取不到要显式降级**：不支持的宿主上必须报"取不到"而不是 0；0 会被运维读成
+   "一个 fd 都没有"，那是假安心（`missing_capability_degrades_explicitly`）。
+3. **进程全局量只给下界**：fd 计数是同进程别的线程随时会动的量，契约只钉
+   "不小于引擎登记的读句柄数"与"登记数与打开次数对得上"，任何"恰好等于 N"都会随机红——
+   **那种红是契约写错，不是实现错**（`fd_count_is_process_global_lower_bound`、
+   `read_handle_registry_matches_opens`）。
+另外三条钉 `release_session` 的算术：返回的字节数必须等于释放前后 `file_buffered` 之差、
+同一 session 再放一次返回 0（不重复入账）、未知 session 返回 0 且不动任何一格
+（`release_reports_exact_freed_bytes`、`double_release_reports_zero`、
+`release_unknown_session_is_inert`），加上"释放后该会话预算归零"一条。
