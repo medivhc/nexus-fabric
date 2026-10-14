@@ -115,6 +115,12 @@ pub struct ProxySection {
     pub password: Option<String>,
     /// 仅 shadowsocks 使用（默认 `chacha20-ietf-poly1305`）。
     pub method: Option<String>,
+    /// 仅 trojan 使用：TLS SNI（缺省从 `server` 的 IP 字符串推导，#4 行为一致）。
+    pub sni: Option<String>,
+    /// 仅 trojan 使用：跳过证书链/主机名校验（自签/内网，默认 false）。
+    pub skip_cert_verify: bool,
+    /// 仅 trojan 使用：ALPN 协议列表（默认空）。
+    pub alpn: Option<Vec<String>>,
     /// TCP connect 超时（秒，默认 10，必须 > 0）。
     pub connect_timeout_sec: u64,
     /// 代理协议握手超时（秒，默认 10，必须 > 0）。
@@ -130,6 +136,9 @@ impl std::fmt::Debug for ProxySection {
             .field("username", &self.username)
             .field("password", &self.password.as_ref().map(|_| "***"))
             .field("method", &self.method)
+            .field("sni", &self.sni)
+            .field("skip_cert_verify", &self.skip_cert_verify)
+            .field("alpn", &self.alpn)
             .field("connect_timeout_sec", &self.connect_timeout_sec)
             .field("handshake_timeout_sec", &self.handshake_timeout_sec)
             .finish()
@@ -433,6 +442,49 @@ fn parse_proxy_section(t: &toml::Value) -> Result<ProxySection, String> {
         .and_then(|x| x.as_str())
         .map(|s| s.to_string());
 
+    // Trojan-only TLS 字段（#3 BLOCKER：trojan 真实服务端一律在 TLS 内握手）。
+    let sni = match t.get("sni") {
+        None => None,
+        Some(x) => {
+            let s = x
+                .as_str()
+                .ok_or_else(|| format!("{DAEMON_TOML}: [network.proxy].sni must be a string"))?;
+            if s.is_empty() {
+                return Err(format!(
+                    "{DAEMON_TOML}: [network.proxy].sni must not be empty"
+                ));
+            }
+            Some(s.to_string())
+        }
+    };
+    let skip_cert_verify = match t.get("skip_cert_verify") {
+        None => false,
+        Some(x) => x.as_bool().ok_or_else(|| {
+            format!("{DAEMON_TOML}: [network.proxy].skip_cert_verify must be a boolean")
+        })?,
+    };
+    let alpn = match t.get("alpn") {
+        None => None,
+        Some(x) => {
+            let arr = x.as_array().ok_or_else(|| {
+                format!("{DAEMON_TOML}: [network.proxy].alpn must be an array of strings")
+            })?;
+            let mut protos = Vec::with_capacity(arr.len());
+            for item in arr {
+                let s = item.as_str().ok_or_else(|| {
+                    format!("{DAEMON_TOML}: [network.proxy].alpn must be an array of strings")
+                })?;
+                if s.is_empty() {
+                    return Err(format!(
+                        "{DAEMON_TOML}: [network.proxy].alpn entries must be non-empty"
+                    ));
+                }
+                protos.push(s.to_string());
+            }
+            Some(protos)
+        }
+    };
+
     match proxy_type {
         ProxyType::Socks5 => {
             // socks5：username 有值而 password 缺失 → 认证不完整，Err。
@@ -456,6 +508,32 @@ fn parse_proxy_section(t: &toml::Value) -> Result<ProxySection, String> {
         }
     }
 
+    // sni/skip_cert_verify/alpn 仅对 trojan 有效；其他类型配置了 → 配置期报错
+    // （不是静默忽略，#3 BLOCKER：避免"配了却永远不生效"）。
+    if proxy_type != ProxyType::Trojan {
+        let offending = if sni.is_some() {
+            Some("sni")
+        } else if t.get("skip_cert_verify").is_some() {
+            Some("skip_cert_verify")
+        } else if alpn.is_some() {
+            Some("alpn")
+        } else {
+            None
+        };
+        if let Some(field) = offending {
+            return Err(format!(
+                "{DAEMON_TOML}: [network.proxy].{field} is only valid when type = \"trojan\" (got '{}')",
+                proxy_type.as_str()
+            ));
+        }
+    }
+
+    // synth：trojan 缺省 SNI 从 server 的 IP 字符串推导（#4 TrojanTlsConfig::try_from 一致）。
+    let sni = match proxy_type {
+        ProxyType::Trojan => Some(sni.unwrap_or_else(|| server.ip().to_string())),
+        _ => None,
+    };
+
     // method：仅 shadowsocks 校验；非 ss 协议配置了 method 则忽略（不报错）。
     if proxy_type == ProxyType::Shadowsocks {
         if let Some(m) = method.as_deref() {
@@ -471,6 +549,9 @@ fn parse_proxy_section(t: &toml::Value) -> Result<ProxySection, String> {
         username,
         password,
         method,
+        sni,
+        skip_cert_verify,
+        alpn,
         connect_timeout_sec,
         handshake_timeout_sec,
     })
@@ -1064,6 +1145,80 @@ mod tests {
             parse_daemon_toml(&socks5_section("trojan", "password = \"trojan-secret\"\n")).unwrap();
         let p = cfg.proxy.expect("proxy");
         assert_eq!(p.proxy_type, ProxyType::Trojan);
+        // #3 BLOCKER：缺省 SNI 从 server 的 IP 字符串推导（#4 行为一致）。
+        assert_eq!(p.sni.as_deref(), Some("127.0.0.1"));
+        assert!(!p.skip_cert_verify);
+        assert!(p.alpn.is_none());
+    }
+
+    #[test]
+    fn proxy_trojan_tls_fields_parsed() {
+        let cfg = parse_daemon_toml(&socks5_section(
+            "trojan",
+            "password = \"pw\"\nsni = \"node.example.com\"\nskip_cert_verify = true\nalpn = [\"h2\", \"http/1.1\"]\n",
+        ))
+        .unwrap();
+        let p = cfg.proxy.expect("proxy");
+        assert_eq!(p.sni.as_deref(), Some("node.example.com"));
+        assert!(p.skip_cert_verify);
+        assert_eq!(
+            p.alpn.as_deref(),
+            Some(&["h2".to_string(), "http/1.1".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn proxy_trojan_sni_defaults_to_server_ip() {
+        // 显式 server 是 IPv4 字面量 → SNI 缺省取 IP 字符串。
+        let cfg = parse_daemon_toml(
+            "[network.proxy]\ntype = \"trojan\"\nserver = \"203.0.113.7:443\"\npassword = \"pw\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.proxy.expect("proxy").sni.as_deref(),
+            Some("203.0.113.7")
+        );
+    }
+
+    #[test]
+    fn proxy_non_trojan_tls_fields_rejected() {
+        // 非 trojan 配置 sni/skip_cert_verify/alpn → 配置期报错（不静默忽略）。
+        assert!(parse_daemon_toml(&socks5_section("socks5", "sni = \"x\"\n")).is_err());
+        assert!(
+            parse_daemon_toml(&socks5_section(
+                "shadowsocks",
+                "password = \"pw\"\nsni = \"x\"\n"
+            ))
+            .is_err()
+        );
+        assert!(parse_daemon_toml(&socks5_section("socks5", "skip_cert_verify = true\n")).is_err());
+        assert!(parse_daemon_toml(&socks5_section("socks5", "alpn = [\"h2\"]\n")).is_err());
+    }
+
+    #[test]
+    fn proxy_trojan_bad_tls_field_types_rejected() {
+        assert!(
+            parse_daemon_toml(&socks5_section(
+                "trojan",
+                "password = \"pw\"\nskip_cert_verify = \"yes\"\n",
+            ))
+            .is_err()
+        );
+        assert!(
+            parse_daemon_toml(&socks5_section(
+                "trojan",
+                "password = \"pw\"\nalpn = \"h2\"\n"
+            ))
+            .is_err()
+        );
+        assert!(
+            parse_daemon_toml(&socks5_section("trojan", "password = \"pw\"\nalpn = [1]\n"))
+                .is_err()
+        );
+        assert!(
+            parse_daemon_toml(&socks5_section("trojan", "password = \"pw\"\nsni = \"\"\n"))
+                .is_err()
+        );
     }
 
     #[test]

@@ -508,6 +508,9 @@ mod tests {
             username: None,
             password: None,
             method: None,
+            sni: None,
+            skip_cert_verify: false,
+            alpn: None,
             connect_timeout_sec: 10,
             handshake_timeout_sec: 10,
         };
