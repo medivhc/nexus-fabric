@@ -1850,3 +1850,19 @@ E4 期望合计：104 + 25 = **129**。`--lib` 85。
 评审链：… → r12(0F/1W/3N) → r13(0F/4W/7N，本链第一次抓到"补的对象只红在词法层") →
 r14(0F/2W/3N，本链第一次由**评审方自设配方**打中我漏钉的规则；同轮第一次派单中断零交付) →
 r15（第十二片再续的复核 + 第十三片实现，待派）。
+
+—— 锚回记录提交 `c88f15d982e1585c368b7072d26db3ae9a222223`（宿主 xc-pc-linux）——
+与跑表的树 `8b07af8` 的差异实测只有 8 个文档/案卷/入库件（`git diff --name-only` 列出：
+green-evidence、mutation-log、r14 案卷两份、FILE_MANIFEST、PRODUCT、MODULE、requirements），
+**代码与 scenarios/ 一字未动**。在这棵记录树上重跑一遍，把数字钉到它自己：
+  85 passed / 0 failed；product.gateway-file-config PASS，**25** 条期望全成立；
+  verify --fast 9 门全 PASS，evidence dir = verify-71205b3a42d6；
+  status --json verdict PASS（"latest evidence (71205b3a42d6) is fresh and PASS"）、
+  dirty_state=false、source_revision = c88f15d、working_tree_digest 7aaf67bf09050c8d9ba000a732cf7cdfaaa64f7c；
+  contract_hash **553987ffff303942f3ef868de5734eab24ba05e2** 与 `8b07af8` 那轮同号
+  ——同号本身就是"只动了文档"的机器证据（哈希只吃 scenarios/**/*.toml）；
+  requirements.toml 用 shim 重跑校验：`OK: requirements.toml valid`，exit 0。
+通道 ref `m0-verify` = 本提交 = 分支 HEAD。
+r15 已按长期授权派出（两个必答：入库的脚本+日志是否真能让第三方重算出覆盖率；新补的
+idle 层标签对象会不会又是一条"只红在词法层"的对象），案卷落在
+`.evidence/review-gateway-file-r15/`，本轮结论回来之前不自签。
