@@ -1,0 +1,22 @@
+{
+  "round": "r14",
+  "verdict": "COMMENTED",
+  "status_note": "provisional snapshot written before the reruns finished; see review.md and findings.json for the final line-by-line evidence",
+  "subject": {
+    "branch": "feature/gateway-file-service-contracts",
+    "commits_reviewed": ["294c4d3", "0dbc1d2", "66edcc4"],
+    "audit_tree": "66edcc43024bad876bee575f4681b7aa3d54672f",
+    "clone": "/work/r14-audit (git clone --no-hardlinks --branch m0-verify /work/m0-origin.git, created by this reviewer)",
+    "cargo_target_dir": "/work/r14-target"
+  },
+  "hosts": {
+    "windows": "rustc 1.95.0, cargo 1.95.0, git 2.46.0.windows.1 (no Linux gate claim from this host)",
+    "linux": "xc-pc-linux appen@10.144.144.4: rustc 1.98.1, cargo 1.98.1, git 2.25.1, python 3.8.10"
+  },
+  "reviewer_model": "qfmodel",
+  "open_findings": [
+    {"id": "W-1", "sev": "WARN", "title": "Q1: probe early-exit leaves two scenario fields with no individual flip; final judgement pending rerun of MC06"},
+    {"id": "W-2", "sev": "WARN", "title": "Q2: rerun of MC07/MC17/MC18 + one new recipe, comparison against the ledger table (pending)"},
+    {"id": "N-1", "sev": "NOTE", "title": "Q3: present-tense sentences in MODULE.md G12 / PRODUCT.md 18.4 / REQ-014 (pending code check)"}
+  ]
+}

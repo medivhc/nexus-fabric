@@ -1740,3 +1740,16 @@ legacy 解析/关断构造那一步就早退，于是场景整体 FAIL（`verdic
   git branch --contains 0dbc1d2 ⇒ `feature/gateway-file-service-contracts`（非空）
   通道 ref `m0-verify` 已重推成等于该提交；`294c4d3` 同样在分支上可达。
   也就是说这张表现在是别人能取到、能重跑的东西，不再是我机器上的孤对象。
+
+—— r14 第一次派单：中断，本轮等于没有发生（照 r12 的先例记，不照它瞒）——
+10:52 派出的 r14 评审者跑到第 37 次工具调用时模型中断（约 210 万 token，15 分 34 秒）。
+它按"先落 summary.json"的交付顺序留下了一个文件，但内容是**临时快照**：三条 finding 全部
+标着 pending（W-1 "final judgement pending rerun of MC06"、W-2 "comparison against the
+ledger table (pending)"、N-1 "pending code check"），且它自己写着"see review.md and
+findings.json for the final line-by-line evidence"——那两个文件**根本不存在**。
+⇒ 这不是一份可采信的 verdict。处置：把该文件改名成
+`.evidence/review-gateway-file-r14/summary.provisional-attempt1-interrupted.json`
+（改名而不是删除：留证据说"这一轮跑过但没交付"，同时保证没有任何东西被误读成签发）。
+它已经建好的 `/work/r14-audit` 克隆与 `/work/r14-target` 编译产物**保留**，第二次派单直接复用
+并须在案卷里写明"这不是我自己从零建的树"（与 r12 重派同一口径）。
+第二次派单把必答从三问收窄成两问，并把硬预算降到 ≤45 次调用、第 20 次前必须落 verdict。

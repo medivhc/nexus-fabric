@@ -2,7 +2,7 @@
 
 本包实现《Nexus 统一系统设计规范 v9》中的“统一仓库目录契约”。
 
-文件数（不含本清单）：218
+文件数（不含本清单）：219
 
 > 2026-10-10：原声明值 137 与表内实际行数（148）已不一致（既有漂移，含
 > `scenarios/engineering/bench_gate_verdicts.toml` 等未登记项）。本次登记
@@ -323,6 +323,7 @@
 | `.evidence/review-gateway-file-r13/review.md` | 第 13 轮叙述卷：三个必答（补对象是否有杀伤 / 现时态宣称与实现是否逐条对上 / requirements.toml 处置是否闭环）各给判定，并列出**自己没跑成**的项（MC01–06、08–13 的复跑、harness E4 逐字段对账、workspace 级 9 门）与"通道 ref 在评审期间被移到 d71e007"的核实过程 |
 | `.evidence/review-gateway-file-r13/review.json` | 第 13 轮结构化 findings（13 条，带顶层 `verdict`）：W-2「唯一构造入口」缺边界（`FileEngine::new` 仍是 pub）、W-3 探针退码与 PASS 字样不构成杀伤判据（还原后的树上 10 个 case 有 8 个含合法 `false` 字段）、W-4 变异表口径 `fa2f81d` 是 stash 形态、两侧 `for-each-ref --contains` 皆空 ⇒ 别人取不到那张表 |
 | `.agents/red-evidence-gateway-file-service.txt` | Contract-first Red Evidence (M0) |
+| `.evidence/review-gateway-file-r14/summary.provisional-attempt1-interrupted.json` | r14 第一次派单中断（第 37 次工具调用、约 210 万 token）留下的**临时快照**：三条 finding 全标 pending、且它引用的 review.md/findings.json 不存在 ⇒ 不是可采信的 verdict。改名保留（证明这一轮跑过但没交付），并保证没有任何文件被误读成签发 |
 | `.agents/green-evidence-gateway-file-service-m1.txt` | Green Evidence for M1 slice 1 |
 
 | `tests/README.md` | Repository contract/documentation |
