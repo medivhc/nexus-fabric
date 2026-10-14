@@ -81,6 +81,21 @@ fn refused_by_config_bound(msg: &str) -> bool {
     msg.contains("files.lockout_window_secs")
 }
 
+/// 构造缝的"被拒"判定（评审 r16 MC23 的处置）：非预期的三种形状——别的错误类型、
+/// `Ok(None)`、干脆起出了引擎——一律折成 `false` **记进自己那一格**，而不是 `return Err`
+/// 把整场探针打早退。只要还剩一处早退，一次改动就会让其余字段集体缺席，杀伤又退化成
+/// "整体 FAIL"，名单里看不出是谁坏的（与 r14 N-1 是同一条规矩的第二半）。
+/// `Ok(None)` 记 false 是刻意的：`enabled = true` 的配置走这条路拿到 None，等于把"拒"
+/// 藏进开关，不能拿来当"这条规则拦住了"的证据。
+fn seam_refuses_by_knob(res: Result<Option<FileEngine>, GatewayError>, needle: &str) -> bool {
+    match res {
+        Err(GatewayError::Config(msg)) => msg.contains(needle),
+        Err(_) => false,
+        Ok(None) => false,
+        Ok(Some(_)) => false,
+    }
+}
+
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
     let case = argv
@@ -1661,18 +1676,7 @@ fn gateway_config(f: &mut Map<String, Value>) -> Result<(), String> {
     // 收紧（覆盖率那节的空档）：只写 `Err(Config(_)) => true` 的话，"被别的原因拒"也算过——
     // 变异 MC18（打开根失败就静默丢掉这个根，最后由"至少要有一个根"兜住）照样给
     // `Err(Config)`，那一格就不会翻。红因必须是**路径检查本身**。
-    let missing_path_rejected = match ghost.file_engine() {
-        Err(GatewayError::Config(msg)) => msg.contains("files.roots"),
-        Err(other) => {
-            return Err(format!("不存在的根必须以 Config 错误被拒，拿到 {other}"));
-        }
-        Ok(Some(_)) => {
-            return Err("不存在的根必须被拒，却起出了引擎".into());
-        }
-        Ok(None) => {
-            return Err("enabled=true 的配置必须起得出引擎，却拿到 None".into());
-        }
-    };
+    let missing_path_rejected = seam_refuses_by_knob(ghost.file_engine(), "files.roots");
     f.insert(
         "missing_root_path_rejected".into(),
         json!(missing_path_rejected),
@@ -1799,6 +1803,30 @@ fn gateway_config(f: &mut Map<String, Value>) -> Result<(), String> {
         json!(idle_ceiling_is_usable),
     );
 
+    // 6d) 下界那一侧的**边界值可用**也各配一格，把对称补上（评审 r16 W-1）：配方 MC24
+    //     把 `idle_timeout_secs < 1` 写成 `<= 1`（连合法的 1 秒一起误杀）时，
+    //     0 条单测红、只有 `idle_floor_rejected_by_config_layer` 翻——而那格的名字读起来
+    //     讲的是"拒绝"，等于把"改严"这种反向改动混进同一个名字里。可用与拒绝是两件事，
+    //     各配一格，名字也各说各的。
+    let window_floor_usable_cell = {
+        let mut c = on_files.clone();
+        c.lockout_window_secs = MIN_FILE_LOCKOUT_WINDOW_SECS;
+        base_config(c).validate().is_ok()
+    };
+    let idle_floor_usable_cell = {
+        let mut c = on_files.clone();
+        c.idle_timeout_secs = 1;
+        base_config(c).validate().is_ok()
+    };
+    f.insert(
+        "window_floor_boundary_is_usable".into(),
+        json!(window_floor_usable_cell),
+    );
+    f.insert(
+        "idle_floor_boundary_is_usable".into(),
+        json!(idle_floor_usable_cell),
+    );
+
     // 7) 单源额度的两条交叉界必须在真实配置路径上跑到（G12）。
     let rejected_low = {
         let mut c = on_files.clone();
@@ -1824,13 +1852,8 @@ fn gateway_config(f: &mut Map<String, Value>) -> Result<(), String> {
     // `self.validate()?` 删掉）在第一版对象集上实测 0 条单测红、0 条期望翻转。
     let mut inconsistent = on_files.clone();
     inconsistent.chunk_bytes = 0;
-    let engine_refused = match base_config(inconsistent).file_engine() {
-        Err(GatewayError::Config(msg)) => msg.contains("files limits"),
-        Err(other) => {
-            return Err(format!("不合法的表必须以 Config 类错误被拒，拿到 {other}"));
-        }
-        Ok(_) => false,
-    };
+    let engine_refused =
+        seam_refuses_by_knob(base_config(inconsistent).file_engine(), "files limits");
     f.insert(
         "invalid_table_yields_no_engine".into(),
         json!(engine_refused),
@@ -1843,24 +1866,12 @@ fn gateway_config(f: &mut Map<String, Value>) -> Result<(), String> {
     //     ② 空白根别名——`SandboxRoot::open` 与 `FileEngine::new` 都不检查别名内容。
     let mut blank_token_cfg = on_files.clone();
     blank_token_cfg.token = "   ".into();
-    let blank_token_refused = match base_config(blank_token_cfg).file_engine() {
-        Err(GatewayError::Config(msg)) => msg.contains("files.token"),
-        Err(other) => {
-            return Err(format!("空白令牌必须以 Config 类错误被拒，拿到 {other}"));
-        }
-        Ok(None) => return Err("enabled=true 时缝不该返回 None，那会把拒绝藏起来".into()),
-        Ok(Some(_)) => false,
-    };
+    let blank_token_refused =
+        seam_refuses_by_knob(base_config(blank_token_cfg).file_engine(), "files.token");
     let mut blank_alias_cfg = on_files.clone();
     blank_alias_cfg.roots[0].alias = "  ".into();
-    let blank_alias_refused = match base_config(blank_alias_cfg).file_engine() {
-        Err(GatewayError::Config(msg)) => msg.contains("empty alias"),
-        Err(other) => {
-            return Err(format!("空白别名必须以 Config 类错误被拒，拿到 {other}"));
-        }
-        Ok(None) => return Err("enabled=true 时缝不该返回 None".into()),
-        Ok(Some(_)) => false,
-    };
+    let blank_alias_refused =
+        seam_refuses_by_knob(base_config(blank_alias_cfg).file_engine(), "empty alias");
     f.insert(
         "blank_token_yields_no_engine".into(),
         json!(blank_token_refused),
@@ -1872,14 +1883,19 @@ fn gateway_config(f: &mut Map<String, Value>) -> Result<(), String> {
 
     // 8) 合法配置必须真的起得出引擎，且 JSON 往返不丢这一段。
     let good = base_config(on_files.clone());
+    // 起不出引擎就记 false。原先这里是 `return Err`：评审 r16 的 MC23（把下界写成 `<=`，
+    // 连合法的 1 秒一起误杀）会从这里把整场探针打早退，其余格子全部缺席，杀伤又退回
+    // "整体 FAIL"——r14 N-1 立过的规矩我当时只改了一半（只改 legacy 解析那一处）。
     let launched = match good.file_engine() {
         Ok(Some(engine)) => engine.limits().max_sessions == on_files.max_sessions,
-        Ok(None) => false,
-        Err(err) => return Err(format!("合法配置起不来: {err}")),
+        _ => false,
     };
-    let json = serde_json::to_string(&good).map_err(|e| e.to_string())?;
-    let back = GatewayConfig::from_json_str(&json).map_err(|e| e.to_string())?;
-    let survived = back.files == on_files && back.files.enabled;
+    let round_trip = (|| -> Option<bool> {
+        let json = serde_json::to_string(&good).ok()?;
+        let back = GatewayConfig::from_json_str(&json).ok()?;
+        Some(back.files == on_files && back.files.enabled)
+    })();
+    let survived = round_trip.unwrap_or(false);
     f.insert("valid_config_launches_engine".into(), json!(launched));
     f.insert(
         "files_section_survives_json_round_trip".into(),

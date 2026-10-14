@@ -124,6 +124,17 @@ RECIPES = [
     ("MC22_idle_ceiling_off_by_one", CFG,
      C + "if self.idle_timeout_secs > MAX_FILE_WINDOW_SECS {",
      C + "if self.idle_timeout_secs >= MAX_FILE_WINDOW_SECS {"),
+    # MC23-MC25 是评审 r16 自己设计的三条，收编进这张表（其中两条暴露了我的空档：
+    # 下界那一侧没有独立的"边界值可用"格；"两层同集合"这句话在整秒定义域外不成立）。
+    ("MC23_window_floor_off_by_one", CFG,
+     C + "if self.lockout_window_secs < MIN_FILE_LOCKOUT_WINDOW_SECS {",
+     C + "if self.lockout_window_secs <= MIN_FILE_LOCKOUT_WINDOW_SECS {"),
+    ("MC24_idle_floor_off_by_one", CFG,
+     C + "if self.idle_timeout_secs < 1 {",
+     C + "if self.idle_timeout_secs <= 1 {"),
+    ("MC25_engine_floor_to_one_second", FS,
+     C + "if self.lockout_window.is_zero() {",
+     C + "if self.lockout_window < Duration::from_secs(1) {"),
 ]
 
 PATHS = sorted({r[1] for r in RECIPES})

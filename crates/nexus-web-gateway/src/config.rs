@@ -783,10 +783,11 @@ mod tests {
     }
 
     #[test]
-    fn both_duration_ceilings_leave_the_boundary_value_usable() {
-        // 评审 r15 R15B：把上界写成 `>=`（连 24h 本身一起拒）时，"越界必须被拒"那几条
-        // 对象照样绿——配置层与引擎层这两道界的判定集合相同，删或改一侧都不改变"拒什么"，
-        // 于是差别只在"边界值还在不在可用集合里"。这一格必须自己有条对象，两层各测一次。
+    fn both_duration_bounds_leave_the_boundary_value_usable() {
+        // 评审 r15 R15B（上界写成 `>=`，连 24h 本身一起拒）与 r16 W-1（下界写成 `<= 1`，
+        // 连合法的 1 秒一起拒）是同一族："越界必须被拒"这类断言对**反向**改动天生盲——
+        // 两层判定集合相同，改一侧不改"拒什么"，差别只在边界值还在不在可用集合里。
+        // 所以上下界各配对象，两层各测一次。
         let mut cfg = valid_config();
         cfg.files.lockout_window_secs = MAX_FILE_WINDOW_SECS;
         cfg.files.idle_timeout_secs = MAX_FILE_WINDOW_SECS;
@@ -804,6 +805,17 @@ mod tests {
         cfg.files.lockout_window_secs = MAX_FILE_WINDOW_SECS;
         cfg.files.idle_timeout_secs += 1;
         assert!(cfg.validate().is_err(), "另一侧同理");
+
+        // 下界那一侧（r16 W-1）：MIN 本身可用，写成 `<= MIN` 的改动必须在这里红。
+        let mut low = valid_config();
+        low.files.lockout_window_secs = MIN_FILE_LOCKOUT_WINDOW_SECS;
+        low.files.idle_timeout_secs = MIN_FILE_LOCKOUT_WINDOW_SECS;
+        assert!(
+            low.validate().is_ok(),
+            "1 秒是合法下界值：下界也是排他的，写成 `<= 1` 会把它一起误杀"
+        );
+        low.files.lockout_window_secs -= 1;
+        assert!(low.validate().is_err(), "窗口下界越界一格必须拒");
     }
 
     #[test]

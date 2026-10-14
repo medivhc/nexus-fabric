@@ -123,6 +123,17 @@ equals = true
 field = "idle_ceiling_boundary_is_usable"
 equals = true
 
+# 评审 r16 W-1：下界那一侧先前没有**独立**的"边界值可用"格——MC24（把 `< 1` 写成 `<= 1`，
+# 连合法的 1 秒一起误杀）只翻动名字讲的是"拒绝"的那一格，等于把反向改动混进同一个名字。
+# 可用与拒绝是两件事，各配一格，四格补齐成对称。
+[[expect]]
+field = "window_floor_boundary_is_usable"
+equals = true
+
+[[expect]]
+field = "idle_floor_boundary_is_usable"
+equals = true
+
 # 单源额度的两条交叉界（G12）走的是引擎层 validate，这里证明配置路径真的调到了它。
 [[expect]]
 field = "source_budget_below_pair_threshold_rejected"
