@@ -104,7 +104,7 @@
 "从配置构造"这条路，不约束绕过配置的构造。**"拒启动"目前成立在构造缝上**：`Gateway::start` 还没消费
 `file_engine()`，线上也没有文件动词的分发，所以本条现在钉住的是"没有可寻址的引擎"，
 而"关断时连动词都到不了"要等 M2 接线补对象（`REQ-014` 把这条残差点名挂着）。
-配置层的承载体是 `product.gateway-file-config`（27 条期望，E4）加 `config.rs` 的
+配置层的承载体是 `product.gateway-file-config`（29 条期望，E4）加 `config.rs` 的
 13 条单测（`absent_files_section_is_disabled`、
 `disabled_section_still_rejects_an_inconsistent_table`、
 `sub_second_window_is_rejected_at_the_config_layer`、

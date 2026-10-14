@@ -1941,3 +1941,67 @@ contract_hash **21a1554aca8d3e5287d8292c8e0c1165c7361859** 与 `41fe3c5` 那轮�
 r16 已按长期授权派出（必答：③"边界值可用"在下界那一侧补得够不够，以及"两层判定集合相同"
 这句要不要限定在配置层可表达的定义域内；②复算材料与可达性按第三方标准核），
 结论回来之前不自签；第十三片（资源核算）的实现仍压在它后面，等 r16 的口径判定一起写。
+
+================================================================================
+追加：第十二片再续三（r16 回来之后的处置：下界补齐对称格、限定"两层同集合"的
+定义域、把我自己没执行完的"不要早退"规矩执行完），宿主 xc-pc-linux
+================================================================================
+
+r16 = `COMMENTED`（0 FAIL / 2 WARN / 4 NOTE），案卷 `.evidence/review-gateway-file-r16/`。
+它 Q2 那一半把我这次的复算材料**按第三方标准**核过了：入库日志的 MC00/MC01/MC21/MC22
+在它自己从零建的 `/work/r16-audit` + `/work/r16-target` 上逐行 IDENTICAL；两提交对
+`m0-verify` 可达；27 field / 25 断言 / 每格至少翻一次只靠仓库文件重算得出；
+86 / 27 / 131 / 225 四个数全对上（清单用可复现命令核，含自披露的 2 行幽灵）。
+
+W-1（**下界那一侧不对称**，我上一轮只补了上界）：配方 MC24（`idle_timeout_secs < 1` 写成
+`<= 1`，连合法的 1 秒一起拒）实测 0 条单测红、只翻 `idle_floor_rejected_by_config_layer`
+一格，而那格的名字讲的是"拒绝"——反向改动（改严）被混进同一个名字里。
+补法：`window_floor_boundary_is_usable` / `idle_floor_boundary_is_usable` 两格（**纯加法**），
+四格凑成对称；承载体单测改名 `both_duration_bounds_leave_the_boundary_value_usable`
+并扩到下界。实测 MC23 → 2 红 + 11 翻、MC24 → 1 红 + 2 翻，上下界两层都有对象。
+
+W-2（**"两层判定集合相同"写得过宽**）：这只在配置层能表达的**整秒定义域**内成立。
+下界那一侧两层不同形——引擎是 `Duration::is_zero()`（毫秒窗口收得到），配置层是 `< 1` 秒；
+分叉可观测：MC25 把引擎那条改成 `< 1s`，实测 3 条时间夹具单测红
+（`expired_locks_are_reclaimed_…`、`lockout_rearms_after_expiry_and_flood_arms_are_not_exempt`、
+`lockout_requires_failures_inside_one_window`）。MODULE.md 那句已加限定；上界那一对称保留为
+精确（两层都是 `> 24 h`）。
+
+第三件是 r16 顺带撞出来、**我自己没做完**的：MC23（窗口下界 `<=`）当时让探针在
+`valid_config_launches_engine` 那一步 `return Err`，整场早退、其余 25 格缺席。
+r14 N-1 我立过"不要早退"的规矩，但当时**只改了 legacy 解析那一处**——规矩执行了一半。
+本笔把 `gateway_config` 里剩下的 6 处早退全部换成"记 false 到自己那一格"，新增
+`seam_refuses_by_knob` 统一判定（`Ok(None)` 在 enabled 配置上记 false 是刻意的：
+那等于把"拒"藏进开关里）。执行完之后的直接证据就是 MC23 这一行：
+`flips=11 missing=0`——11 个名字各自翻，不再有整场缺席。
+**还有一处没做完，写成残差不写成已完成**：`auth-throttle` 那个 case 仍有早退路径，
+MC25 在它上面是 `verdict FAIL + missing=25` 而不是指名（登记为任务 #40）。
+
+—— 新变异表 MC01–MC25（唯一口径 = 可达提交 `bbb4732`，与复验树 `b04fb0c` 逐字节相同）——
+逐行输出入库在 `.agents/mutation-log-gateway-file-config.txt`；这里记结论与三行新增：
+MC23 窗口下界写成 `<=`     2 红 both_duration_bounds_leave_the_boundary_value_usable,
+                          sub_second_window_is_rejected_at_the_config_layer
+                          11 翻（含 window_floor_boundary_is_usable 与级联的 10 格——
+                          共享夹具 `on_files` 用的正是 MIN 值，改严会把它整张打非法，
+                          这是"一个配方翻很多格"的正常形状，不是对象重复计数）
+MC24 idle 下界写成 `<=`     1 红 both_duration_bounds_leave_the_boundary_value_usable
+                          2 翻 idle_floor_rejected_by_config_layer, idle_floor_boundary_is_usable
+MC25 引擎下界改成 `< 1s`    3 红（引擎侧时间夹具）；config 场景 0 翻；
+                          auth-throttle 场景 verdict FAIL + missing=25（那侧还没改成指名，见上）
+覆盖率实数：29 个 field 里 27 个是断言，**这 27 条每一个都至少被一条配方以翻自己那一格的
+方式打过**（只有形参 `case` 没有）；25 条配方无一零杀伤。
+上一节"25 条断言 / 22 配方"与更早"23 / 20"、"19 / 18"是各自那张表的实数，全部保留不抹。
+
+—— 本节数字与门禁（先跑再写）——
+`b04fb0c`（与提交 `bbb4732` 逐字节相同，`git diff --name-only` 为空）：clippy 无诊断、
+86 passed / 0 failed、product.gateway-file-config **29 条全绿**、verify --fast 9 门全 PASS
+（evidence verify-0d7dccaed1dc）、dirty_state=false、
+contract_hash **938e7581c84d88dab072ae63e806ac12a758e492**（`bbb4732` 提交正文带的就是这个号）。
+E4 期望合计 104 + 29 = **133**；`--lib` 86（本笔只扩了一条既有单测，没加条数）。
+另记一次工具环境的抖：写提交信息的 heredoc 撞上 Git Bash `Out of memory / child_copy 失败`，
+消息文件被写成 0 字节，`commit-msg` 因此报"type 非法"——那次提交**没有发生**（`git log` 核实），
+改用 Write 落文件再跑钩子才提交成功。这类"shell 写文件失败"不会报错只会留个空文件，
+所以提交前 `wc -c` 看一眼消息文件是必要的，不是洁癖。
+
+评审链：… → r14(0F/2W/3N) → r15(0F/1W/4N) → r16(0F/2W/4N；把我"只改一半规矩"抓出来了) →
+r17（再续三的处置复核 + 第十三片实现，待派）。

@@ -2,7 +2,7 @@
 
 本包实现《Nexus 统一系统设计规范 v9》中的“统一仓库目录契约”。
 
-文件数（不含本清单）：225
+文件数（不含本清单）：227
 
 > 2026-10-10：原声明值 137 与表内实际行数（148）已不一致（既有漂移，含
 > `scenarios/engineering/bench_gate_verdicts.toml` 等未登记项）。本次登记
@@ -107,6 +107,12 @@
 > 同轮的代码处置 `294c4d3`：期望 21 → **23**、config 单测 10 → **11**、`--lib` 83 → **84**、
 > E4 总期望 125 → **127**。理由写在案卷 r13 段——实现者自己补的对象只红在**词法层**
 > （`FileEngine::new` 第一句就复检 limits），缝不可替代的那半必须由"只有配置层才有"的规则去钉。
+> 2026-10-14（再续二/三，r15 与 r16 落地）：r14 案卷 2 行 + 配方脚本 1 行 + 变异日志 1 行 ⇒
+> 219 → **223**；r15 案卷 2 行 ⇒ **225**；r16 案卷 2 行 ⇒ **227**。每一步都用
+> `awk '/^\| `/ {n++}'` 与 `grep -c "^| \`"` 双口径对齐声明值。
+> 本笔插入时把自己的行首 `|` 吃掉过一次（node 拼接时 `indexOf("\n", i) + 2` 越过了下一行的两个
+> 字符），**是双口径把 226 与 227 的差异抓出来的**——单口径就会静默少一行。同轮代码处置
+> `bbb4732`：期望 27 → **29**、配方 22 → **25**（下界那一侧先前不对称，r16 W-1）。
 
 | Path | Purpose |
 |---|---|
@@ -323,6 +329,8 @@
 | `.evidence/review-gateway-file-r13/review.md` | 第 13 轮叙述卷：三个必答（补对象是否有杀伤 / 现时态宣称与实现是否逐条对上 / requirements.toml 处置是否闭环）各给判定，并列出**自己没跑成**的项（MC01–06、08–13 的复跑、harness E4 逐字段对账、workspace 级 9 门）与"通道 ref 在评审期间被移到 d71e007"的核实过程 |
 | `.evidence/review-gateway-file-r13/review.json` | 第 13 轮结构化 findings（13 条，带顶层 `verdict`）：W-2「唯一构造入口」缺边界（`FileEngine::new` 仍是 pub）、W-3 探针退码与 PASS 字样不构成杀伤判据（还原后的树上 10 个 case 有 8 个含合法 `false` 字段）、W-4 变异表口径 `fa2f81d` 是 stash 形态、两侧 `for-each-ref --contains` 皆空 ⇒ 别人取不到那张表 |
 | `.agents/red-evidence-gateway-file-service.txt` | Contract-first Red Evidence (M0) |
+| `.evidence/review-gateway-file-r16/summary.json` | 第 16 轮案卷（第十二片再续二的处置复核），verdict `COMMENTED`（0 FAIL / 2 WARN / 4 NOTE）。评审方**从零自建** `/work/r16-audit` + `/work/r16-target`；Q2 那半边按第三方标准核死：入库日志 MC00/MC01/MC21/MC22 在它自己树上逐行 IDENTICAL、两提交对 m0-verify 可达、覆盖率只靠仓库文件重算得出、86/27/131/225 四个数全对上 |
+| `.evidence/review-gateway-file-r16/review.md` | 第 16 轮取证卷：W-1 用配方 MC24 证明**下界那一侧不对称**（0 红只翻一格，且那格名字讲"拒绝"、把"改严"混进同一个名字）；W-2 用 MC25 证明"两层判定集合相同"只在配置层可表达的整秒定义域内成立（引擎 `is_zero()` 收毫秒窗口，改 `< 1s` 会红 3 条时间夹具单测）；MC23 还撞出我自己没执行完的"不要早退"规矩（探针另一处 `return Err` 造成整场早退）|
 | `.evidence/review-gateway-file-r14/summary.json` | 第 14 轮案卷（第十二片续的处置复核），verdict `COMMENTED`（0 FAIL / 2 WARN / 3 NOTE，blocking 空）。**本链第一次由评审方自己设计的配方（NEW20）打中实现者漏钉的规则**：配置层 idle 24h 上界先前 0 红 0 翻，与 r13 W-1 同形（委托替它答话）|
 | `.evidence/review-gateway-file-r14/review.md` | 第 14 轮取证卷：Q1 实测确认"两格只被整体 FAIL 覆盖"为真且两句现时态描述因带边界可保留；Q2 用自己的解析复算出 19 并复跑 MC07/MC18/MC06/MC11 全对上班表；W-2 判"案卷第三方重算不出来"（引用了不存在的节名、MC15–18 只有计数没有名单、log/脚本只在实现者机器上）；N-3 逐条复核 r13 四条 WARN 均闭环；并声明复用中断者的树与 target、非自建 |
 | `crates/nexus-web-gateway/tools/mutation-gateway-file-config.py` | 配置面变异跑配方（MC01–MC20）入库件。评审 r14 W-2 的处置：证据此前只躺在 `/work/mm10.log`，第三方仅靠仓库重算不出覆盖率。头部写清隔离克隆+隔离 target 的跑法，以及"退码与 PASS 字样不算杀伤判据"（r13 W-3）|

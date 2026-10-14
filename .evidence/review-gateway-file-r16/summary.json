@@ -1,0 +1,109 @@
+{
+  "round": "r16",
+  "verdict": "COMMENTED",
+  "subject": {
+    "code_commit": "41fe3c5",
+    "case_commit": "4ffe8db",
+    "branch": "feature/gateway-file-service-contracts",
+    "linux_ref": "m0-verify"
+  },
+  "reviewer_environment": {
+    "host_local": "Windows 11 (win32) Git Bash, working tree E:/nexus-fabric-m0 (read-only for code)",
+    "host_gate": "xc-pc-linux appen@10.144.144.4 (real Linux, not WSL)",
+    "gate_rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+    "gate_cargo": "cargo 1.98.1 (797e8a9bc 2026-08-05)",
+    "gate_git": "git version 2.25.1",
+    "gate_python": "Python 3.8.10 (has tomli, no tomllib)",
+    "tree": "built from scratch by this reviewer: git clone --no-hardlinks --branch m0-verify /work/m0-origin.git /work/r16-audit (HEAD 4ffe8db09bf43b9d259f68ef89907f2584526b2a, git status --porcelain = 0 lines)",
+    "target": "CARGO_TARGET_DIR=/work/r16-target (isolated, never shared with /work/mm7 or /work/r15-audit)",
+    "cargo_invocation": "ssh appen@10.144.144.4 -> cd /work/r16-audit && CARGO_TARGET_DIR=/work/r16-target cargo test -p nexus-web-gateway --lib (warm-up via cargo test --lib --no-run, background, log /work/r16-bootstrap.log); mutation harness run in background to /work/r16-mut.log",
+    "harness": "/work/r16-harness-r16.py = copy of committed tools/mutation-gateway-file-config.py with 3 reviewer recipes appended and RECIPES filtered to MC01/MC21/MC22/MC23/MC24/MC25 (repo file untouched)",
+    "model_id": "qfmodel (as given by the runtime; not guessed)"
+  },
+  "criteria": "kill = red unit-test list + per-field JSON diff; probe exit code and the word PASS from the harness are NOT used (r13 W-3)",
+  "Q1": {
+    "question": "is claim (3) 'boundary value usable' complete, i.e. is the LOWER-bound side an object?",
+    "measured": [
+      {
+        "recipe": "MC23_r16_window_floor_ge",
+        "mutation": "config.rs:237 'if self.lockout_window_secs < MIN_FILE_LOCKOUT_WINDOW_SECS' -> '<='",
+        "result": "KILLED: 1 red unit test config::tests::sub_second_window_is_rejected_at_the_config_layer; probe case config flips verdict PASS->FAIL with missing=25 (fixture aborts before reporting fields)",
+        "note": "the cell named sub_second_window_rejected_by_config is MISSING here, not flipped - the kill comes from the unit test + case abort, not from the folded-in field"
+      },
+      {
+        "recipe": "MC24_r16_idle_floor_ge",
+        "mutation": "config.rs:247 'if self.idle_timeout_secs < 1' -> '<= 1'",
+        "result": "KILLED but only at the field layer: --lib 86 passed / 0 failed, probe case config flips exactly idle_floor_rejected_by_config_layer want=true got=false"
+      },
+      {
+        "recipe": "MC25_r16_engine_floor_1s",
+        "mutation": "file_service.rs:193 'if self.lockout_window.is_zero()' -> '< Duration::from_secs(1)'",
+        "result": "3 red unit tests (file_service::tests::expired_locks_are_reclaimed_instead_of_escalating_to_the_global_window, lockout_rearms_after_a_new_window, lockout_requires_failures_inside_one_window); probe auth-throttle flips verdict PASS->FAIL missing=25"
+      }
+    ],
+    "conclusion_Q1_a": "(3) is NOT a hole on the lower side: both off-by-one floor mutations die. But coverage is asymmetric and the folded-in cells are the wrong shape - see W-1.",
+    "conclusion_Q1_b": "The sentence 'two layers have the same decision set, deleting either side does not change what is rejected' is written too wide on the floor side. For the 24h ceiling pair it is exact (both layers use > 24h); for the floor pair the engine uses is_zero() over Duration and the config uses < 1 over u64 seconds, so the sets coincide only on the config-expressible domain (whole seconds). MC25 is the measurement that shows the divergence is behaviourally observable (3 red tests), so the claim needs the qualifier, not a rewrite."
+  },
+  "Q2": {
+    "reachability": "PASS - see review.md for the printed branch lists",
+    "log_recompute": "PASS - MC00/MC01/MC21/MC22 blocks reproduced line-for-line in this reviewer's own tree",
+    "coverage_self_proof": "27 fields / 25 boolean assertions confirmed from the scenario file alone; the 'every assertion hit at least once' claim is recomputable from the log with one caveat (see W-2)",
+    "counts": {
+      "lib_tests": "86 - reproduced in this reviewer's baseline run",
+      "config_scenario_fields": "27 - grep -c '^field = ' scenarios/product/gateway_file_config.toml",
+      "file_manifest_declared_vs_rows": "declared 225 == 226 lines matching '^| ' minus 1 header row ('| Path | Purpose |', line 111)"
+    }
+  },
+  "warnings": [
+    {
+      "id": "W-1",
+      "severity": "WARN",
+      "title": "lower-bound 'boundary usable' has no dedicated cell; the idle floor is guarded only by a conjunction whose name reads the opposite way",
+      "evidence": [
+        "crates/nexus-web-gateway/examples/gateway_file_contract.rs:1731 + :1742 (floor_is_usable folded into sub_second_window_rejected_by_config)",
+        "crates/nexus-web-gateway/examples/gateway_file_contract.rs:1758-1771 (idle_floor_is_usable folded into idle_floor_rejected_by_config_layer)",
+        "scenarios/product/gateway_file_config.toml:108 (the only idle floor cell)",
+        "MC24 measured: '--lib: test result: ok. 86 passed; 0 failed' + 'FLIP idle_floor_rejected_by_config_layer want=true got=false'"
+      ],
+      "why_it_matters": "under MC24 the diff line literally says the rejection became true->false, i.e. it reads as 'the guard stopped working' while the mutation makes the guard stricter. This is the r12 shape (one cell carrying two propositions) at the naming layer, and the upper side got two dedicated *_ceiling_boundary_is_usable cells (config.rs:786 test + 2 fields) while the lower side got neither a cell nor (for idle) a unit test.",
+      "ask": "add idle_floor_boundary_is_usable / window_floor_boundary_is_usable cells (or a unit test asserting validate().is_ok() at exactly MIN/1 for idle) so the floor side has the same shape as the ceiling side"
+    },
+    {
+      "id": "W-2",
+      "severity": "WARN",
+      "title": "'the two layers' decision sets are identical' is unqualified in two places where the sentence covers the floor as well",
+      "evidence": [
+        "crates/nexus-web-gateway/MODULE.md:122 (paragraph opens with '窗口的两条界', then asserts '两层的判定集合相同，删任一侧都不改变拒什么值')",
+        "crates/nexus-web-gateway/examples/gateway_file_contract.rs:1716 (block header at :1712 is '6) 窗口两侧界', sentence says '这两道界的判定集合相同')",
+        "crates/nexus-web-gateway/src/file_service.rs:193 (engine floor is is_zero()) vs crates/nexus-web-gateway/src/config.rs:237 (config floor is < 1 sec)",
+        "MC25 measured output: 3 red file_service tests + auth-throttle verdict FAIL"
+      ],
+      "ask": "scope the sentence to '配置层能表达的定义域（整秒）' or to '24h 这一对' only; MODULE.md:180 and config.rs:788 already do this correctly, so it is a two-line wording fix, not a design change"
+    },
+    {
+      "id": "W-3",
+      "severity": "NOTE",
+      "title": "log truncation caps in the harness are a latent blind spot only - measured: nothing was hidden in this log",
+      "evidence": [
+        "crates/nexus-web-gateway/tools/mutation-gateway-file-config.py run() prints 'reds[:14]' and 'fl[:14]'",
+        "MEASURED on the committed .agents/mutation-log-gateway-file-config.txt: distinct FLIP field names = 25, assertions never flipped = 0 (empty set), and NO row has flips>14 or missing>0 -> this log is fully third-party recomputable",
+        "same arithmetic reproduced independently on the scenario file: grep -c '^field = ' = 27, grep -c 'equals = true' = 25, non-boolean equals fields = verdict, case"
+      ],
+      "ask": "print all flips (or '…(+K more)') so a future all-red recipe cannot silently hide cells"
+    },
+    {
+      "id": "W-4",
+      "severity": "NOTE",
+      "title": "the 'every assertion hit by flipping its own cell' claim has an unwritten extension limit",
+      "evidence": [
+        "MC23 measured 'frozen=27 flips=1 missing=25' with FLIP verdict PASS->FAIL: an over-strict lower-bound mutation kills through the red-test list + case abort, NOT by flipping its own cell",
+        ".agents/green-evidence-gateway-file-service-m1.txt:1914-1916 states the claim for the 22 committed recipes; it does not claim it for arbitrary floor tightenings"
+      ]
+    }
+  ],
+  "not_measured": [
+    "the full 22-recipe sweep was NOT rerun by this reviewer (budget); baseline + MC01 + MC21 + MC22 + MC23 + MC24 + MC25 only",
+    "E4 total 131: recomputed separately, see review.md"
+  ],
+  "workspace_hygiene": "Windows working tree touched only under .evidence/review-gateway-file-r16/; no business code, scenario, doc or test file modified by this review"
+}
