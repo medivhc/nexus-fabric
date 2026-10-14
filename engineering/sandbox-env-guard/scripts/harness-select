@@ -33,11 +33,20 @@ def load_env_report(path):
 
 
 def discover_tests(scenarios_dir):
-    """扫描 scenario toml，返回测试 id 列表（顶层 id 字段）。"""
+    """递归扫描 scenario toml，返回测试 id 列表（顶层 id 字段）。
+
+    必须递归：真实仓库的 scenario 按类别分目录存放，例如
+        scenarios/product/*.toml  scenarios/engineering/*.toml
+    顶层 scenarios/ 通常没有 toml。若只扫一层会得到空清单，
+    进而触发"用 map 的 pattern 冒充测试 id"的错误行为。
+    """
     ids = []
     if not scenarios_dir or not os.path.isdir(scenarios_dir):
         return ids
-    for p in sorted(glob.glob(os.path.join(scenarios_dir, "*.toml"))):
+    pattern = os.path.join(scenarios_dir, "**", "*.toml")
+    for p in sorted(glob.glob(pattern, recursive=True)):
+        if os.sep + ".git" + os.sep in p:
+            continue
         try:
             doc = load_toml(p)
             tid = doc.get("id")
@@ -70,10 +79,34 @@ def main():
     env = load_env_report(args.env_report)
     caps = env.get("capabilities", {})
     tests_map = load_toml(args.map).get("tests", {})
-    candidates = discover_tests(args.scenarios_dir)
-    if not candidates:
-        # 无 scenario 源时，用 map 的 key 作为候选（演示用）
+    # 反静默降级：显式指定了 scenarios-dir 却一条都没扫到，说明路径错了。
+    # 此时绝不能退回"用 map 的 pattern 当测试 id"——那会产出一份看似正常
+    # （runnable>0）实则完全没覆盖真实测试、且 selected 里全是通配符的
+    # test-plan，让下游 agent 基于幻觉判断。宁可失败，不可伪造。
+    if args.scenarios_dir:
+        candidates = discover_tests(args.scenarios_dir)
+        if not candidates:
+            sys.stderr.write(
+                "[harness-select] BLOCKED: --scenarios-dir 下未发现任何 scenario toml\n"
+                f"  path: {args.scenarios_dir}\n"
+                "  常见原因：\n"
+                "    1) 路径写成了顶层 scenarios/，而实际 toml 在 scenarios/<category>/*.toml；\n"
+                "    2) 目录不存在或拼写错误；\n"
+                "    3) toml 文件缺少顶层 id 字段。\n"
+                "  守卫拒绝生成 test-plan（不静默降级为 map pattern 清单）。\n"
+            )
+            sys.exit(2)
+        mode = "scenarios"
+    else:
+        # 未指定 scenario 源：演示模式，用 map 的 key 作为候选。
+        # 必须显式标注 mode=demo，避免下游把 pattern 误当成真实测试 id。
         candidates = list(tests_map.keys())
+        mode = "demo"
+        sys.stderr.write(
+            "[harness-select] WARN: 未指定 --scenarios-dir，进入 DEMO 模式；\n"
+            "  selected/skipped 中的条目是 test-capability-map.toml 的 pattern，"
+            "不是真实测试 id，不可用于驱动真实运行。\n"
+        )
 
     selected, skipped = [], []
     for tid in candidates:
@@ -97,6 +130,10 @@ def main():
     plan = {
         "schema_version": "1",
         "generator": "sandbox-env-guard/harness-select",
+        # mode 必须显式化：demo 模式下 selected 里是 pattern 而非真实测试 id，
+        # 下游（agent/harness）应拒绝用 demo 产物驱动真实运行。
+        "mode": mode,
+        "scenarios_dir": args.scenarios_dir,
         "env_report": args.env_report,
         "selected": selected,
         "skipped": skipped,

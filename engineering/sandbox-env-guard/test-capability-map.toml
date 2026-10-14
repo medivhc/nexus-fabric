@@ -14,7 +14,9 @@
 requires = ["linux_executor"]
 
 # 真实产物/workspace 快照类场景：需要 Linux executor + 已拉取 crates
-[tests."product.cli_workspace_*"]
+# 注意命名：真实 scenario id 用连字符（product.cli-workspace-cache），
+# 曾用下划线写成 cli_workspace_* 导致一条都匹配不上，门控形同虚设。
+[tests."product.cli-workspace-*"]
 requires = ["linux_executor", "crates_fetched"]
 
 # Windows → Linux 真实 E5 验收：沙箱是 Linux，必然 unsupported
@@ -37,6 +39,9 @@ requires = ["openssh_e2e"]
 # verdict=SKIP，被 one_of=["PASS","SKIP"] 接受，同样不会 FAIL）。
 #
 # 网络连通/打洞类（依赖 tun 数据面的端到端）：保留门控
+# 现状（2026-10-15 核对）：真实仓库暂无 product.net-* 场景（命中 0），
+# 此处为预防性声明；真正的打洞/子网场景是 product.virtual-subnet-* 系列，
+# 它们是否依赖真实 tun 数据面尚待复核（见下方"待复核"注释），暂不门控。
 [tests."product.net-*"]
 requires = ["tun_net_admin"]
 
