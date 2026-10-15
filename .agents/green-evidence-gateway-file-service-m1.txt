@@ -2004,7 +2004,8 @@ E4 期望合计 104 + 29 = **133**；`--lib` 86（本笔只扩了一条既有单
 所以提交前 `wc -c` 看一眼消息文件是必要的，不是洁癖。
 
 评审链：… → r14(0F/2W/3N) → r15(0F/1W/4N) → r16(0F/2W/4N；把我"只改一半规矩"抓出来了) →
-r17（再续三的处置复核 + 第十三片实现，待派）。
+→
+r17（再续三的处置复核；交付了 verdict + 五条 finding，`review.md` 因配额未写）
 
 —— 锚回记录提交 `13e56e0246cce354589d0609341935950be7687f`（宿主 xc-pc-linux）——
 与跑表的树 `bbb4732` 的差异实测只有 8 个文档/案卷/日志件（`git diff --name-only` 列全），
@@ -2024,3 +2025,55 @@ r17 已按长期授权派出，必答是两件不好看的：①MC23 一条配�
 提交前按 `grep -o "wtd=[0-9a-f]*" /work/m0a5.log` 回读宿主输出改回真实值
 `b00a1c65538918f89c4b5274bc22b17e5cf58550`。这类"手抄 hash"是本案卷已经错过三次的同一件事，
 所以规矩不是"抄的时候小心点"，而是**写 hash 之前先 grep 一遍宿主输出**，别靠记忆。
+
+================================================================================
+追加：第十二片再续四（r17 回来之后的处置：名册指向的对象不存在 = FAIL 一条，
+其余四条全是我自己写过头；覆盖率改成工具自打）
+================================================================================
+
+r17 的过程先记，因为它改变"怎么派单"这件事：**评审者跑到第 20 次调用被每日配额截断**
+（"daily usage limit for Chat"），`review.md` 没来得及写。但它按派单里"第 20 次之前先落
+`summary.json`、verdict 写死后不再改"的顺序要求，已经把 `verdict = CHANGES_REQUESTED` 和
+五条 finding（各带 `file:line` 与 repro）写完了 ⇒ 这一轮**是可采信的**，与 r14 第一次
+"三条全 pending"的空壳是两种结局。差别就是交付顺序，不是运气。以后派单继续带这条，
+并且新增一条：**评审者的题量要按"可能只有 summary 没有叙述"来设计**（每条 finding
+自带 repro 命令，第三方不必依赖叙述就能复核）。
+
+五条我逐条复算，**全部成立**（这次没有一条需要打回）：
+- **N-1（FAIL）**：MODULE.md 的单测名册还写着 `both_duration_ceilings_leave_the_boundary_value_usable`，
+  而那个名字正是**同一批里我自己改名后不再存在**的对象（现名 `..._bounds_...`，
+  config.rs:786）。复算：`grep -c 'fn both_duration_ceilings…' → 0`。现时态名册指向不存在
+  的承载体，按 FAIL 报是对的，且这是本链第一次 FAIL 落在"名册"而不是行为上。名册已改；
+  全仓再 grep 旧名只剩案卷史（那里是当时的真名，保留）。
+- **N-2**：REQ-014 同一句里"25 个 field 里 23 个是断言"与"27 条"并存 = 旧口径残留。
+  改成 29/27，并把历史口径逐个列明（41fe3c5 25/22、8b07af8 23/20、0dbc1d2 19/18）。
+- **N-3**：PRODUCT.md 的 133 没写口径边界——它只含 10 个探针案子；第 11 个文件
+  `gateway_file_resource_accounting.toml` 的 11 条是**已跑红、实现未写**的下一期契约，
+  不计入 133 也不在任何"已跑绿"集合里。数没错，边界没写。已补。
+- **N-4（本轮最有价值的一条）**：一条配方翻多格时，光看 FLIP 名单分不清谁是靶格 ⇒
+  "每条断言各有专属配方"在日志里**不可机检**。修法不是在散文里再声明一遍，而是让工具
+  自己打 COVERAGE 段：每条配方在 `TARGETS` 里声明靶格，逐格输出
+  `targets=` / `flipped_by=` / `cascade_only_in=`，末尾直接报
+  `UNTARGETED` 与 `STALE_TARGETS`。本轮（口径 `3537e5c`）两者均为 **none**：
+  27 条断言全部有专属配方；MC23 的 11 次翻转里 10 格被明确标成级联——这正是 r17 问的
+  "级联会不会虚增覆盖率"，答案是"以前会，现在机器能分开"。
+  同时去掉两处 `[:14]` 截断（那本身就是"看着全其实被切"的写法）。
+- **N-5**：MODULE 那句"可用与拒绝各配一格、名字各说各的"过宽——
+  `sub_second_window_rejected_by_config` 与 `idle_floor_rejected_by_config_layer` 是
+  **合取格**（体里含 `*_is_usable`，名字只讲"拒绝"），它们是冻结期望不能拆，
+  所以 MC23/MC24 各翻两格。现在 MODULE 直接写"合取格是遗留"，不再写"各说各的"。
+
+—— 本节的门禁与覆盖率（先跑再写，口径 = 可达提交 `3537e5c2f0d67d933201cb573a479732a8f34d6e`）——
+  clippy `--all-targets` 无诊断；86 passed / 0 failed；
+  product.gateway-file-config PASS（**29** 条全成立）；verify --fast 9 门全 PASS
+  （evidence dir = verify-034bbf3244da）、status --json verdict PASS、dirty_state=false、
+  working_tree_digest bac15bbde8bcf656ed591b4284a3bf36344b57fc；
+  contract_hash **938e7581c84d88dab072ae63e806ac12a758e492** 与 `bbb4732` 同号
+  （本批没动 scenarios/，同号即机器证据）；requirements.toml 校验 exit 0。
+  变异：25 条配方 + baseline + restored，`anchor precheck ok: 25 recipes`，
+  UNTARGETED=none、STALE_TARGETS=none。E4 期望合计 104 + 29 = **133**（口径边界见 N-3）。
+
+残差状态（不写成已完成）：#39 层身份的结构承载体（错误枚举变体）、#40 `auth-throttle`
+case 的早退、#36 harness 四条立案、#32 fuzz/V2 欠账、第十三片实现。
+下一轮 r18（复核本节 + 第十三片）因**当日子代理配额已耗尽**未能派出，留到配额恢复后派；
+这属于外部限制，不是"已派在跑"。

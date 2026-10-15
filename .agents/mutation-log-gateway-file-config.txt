@@ -1,26 +1,20 @@
 # 变异跑原始输出（入库理由：评审 r14 W-2 —— 证据只躺在实现者的 Linux 机路径上时，
 # 第三方仅靠仓库重算不出覆盖率，减法就只剩"信我"）
 #
-# 口径树   bbb473229dd27175a4bf0e85ac4993488227d22e（分支 feature/gateway-file-service-contracts 上
-#          的真实提交；`git diff --name-only b04fb0c bbb4732` 为空 ⇒ 复验树与本提交逐字节相同）
-# 跑法     git clone --no-hardlinks --branch m0-verify /work/m0-origin.git /work/mm7
-#          cd /work/mm7 && CARGO_TARGET_DIR=/work/mm7-target \
+# 口径树   3537e5c2f0d67d933201cb573a479732a8f34d6e（分支上的真实提交，
+#          `git branch --contains` 非空；本文件与日志同批入库，第三方 clone 后可原样重跑）
+# 跑法     git clone --no-hardlinks --branch m0-verify /work/m0-origin.git /work/mm
+#          cd /work/mm && CARGO_TARGET_DIR=/work/mm-target \
 #            python3 crates/nexus-web-gateway/tools/mutation-gateway-file-config.py
 # 宿主     xc-pc-linux appen@10.144.144.4，rustc/cargo 1.98.1，x86_64-unknown-linux-gnu，
 #          feature_set workspace:default；跑前跑后 `git status --porcelain` = 0
 # 判据     红单测名单 + 逐字段 JSON diff。**不用**探针退码，也不用 harness 的 PASS 字样
-#          （评审 r13 W-3）。
-# 覆盖率   场景 product.gateway-file-config 的 29 个 field 里 27 个是断言（`verdict` 是整体状态、
-#          `case` 是形参）：**这 27 条每一个都至少被一条配方以"翻自己那一格"的方式打过**；
-#          25 条配方（MC01–MC25）无一零杀伤。
-# 与上一版（22 条 / 25 断言，口径 41fe3c5）的差别来自评审 r16 的两条 WARN：
-#   MC23/MC24（下界写成 `<=`，把合法值一起误杀）——上一版下界那一侧没有独立的"边界值可用"格；
-#   MC25（引擎下界改成 `< 1s`）——证明"两层同集合"只在配置层可表达的整秒定义域内成立。
-# 一处诚实的限制：MC25 在 config 场景是 flips=0（引擎那条与配置层不同形，配置侧不感知），
-#   它的杀伤落在引擎侧 3 条时间夹具单测 + auth-throttle 场景**整体早退**（missing=25）。
-#   `auth_throttle` 那个 case 还有早退路径没改成"记 false 继续跑"，本链的规矩（r14 N-1）
-#   在它身上只执行了一半——这条登记成残差，不写成已完成。
-TREE=bbb473229dd27175a4bf0e85ac4993488227d22e dirty=0
+#          （评审 r13 W-3）。名单不截断（r17 之后去掉了两处 [:14]）。
+# 覆盖率   由工具自打的 COVERAGE 段负责（评审 r17 N-4）：每条配方在 TARGETS 里声明靶格，
+#          逐格输出 targets= / flipped_by= / cascade_only_in=，并直接报
+#          UNTARGETED 与 STALE_TARGETS —— 本轮两者均为 none，即 27 条断言全部有专属配方，
+#          MC23 那种"一条翻 11 格"里 10 格被明确标为级联，不再靠散文声明。
+MUT TREE=3537e5c2f0d67d933201cb573a479732a8f34d6e dirty=0
 anchor precheck ok: 25 recipes
 === MC00_baseline  [baseline] ===
   lib: test result: ok. 86 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
@@ -284,4 +278,34 @@ anchor precheck ok: 25 recipes
   red tests (0):
   probe config       : frozen=29 flips=0 missing=0
   probe auth-throttle: frozen=27 flips=0 missing=0
-=== MM3 RUN DONE ===
+=== COVERAGE 段（工具自打，不靠散文声明）===
+  absent_section_is_disabled                     targets=MC05_presence_not_gated,MC11_no_serde_default,MC12_default_enables_files | flipped_by=MC05_presence_not_gated,MC11_no_serde_default,MC12_default_enables_files
+  disabled_yields_no_engine                      targets=MC05_presence_not_gated,MC06_kill_switch_inert | flipped_by=MC05_presence_not_gated,MC06_kill_switch_inert,MC11_no_serde_default,MC12_default_enables_files | cascade_only_in=MC11_no_serde_default,MC12_default_enables_files
+  disabled_still_rejects_inconsistent_table      targets=MC03_engine_table_not_delegated,MC04_files_checked_only_when_on | flipped_by=MC03_engine_table_not_delegated,MC04_files_checked_only_when_on
+  disabled_still_rejects_zero_ceiling            targets=MC03_engine_table_not_delegated,MC04_files_checked_only_when_on | flipped_by=MC03_engine_table_not_delegated,MC04_files_checked_only_when_on
+  enabled_without_token_rejected                 targets=MC14_blank_token_off | flipped_by=MC14_blank_token_off
+  whitespace_only_token_rejected                 targets=MC14_blank_token_off | flipped_by=MC14_blank_token_off
+  enabled_without_roots_rejected                 targets=MC15_roots_nonempty_off | flipped_by=MC15_roots_nonempty_off
+  blank_root_alias_rejected                      targets=MC09_blank_alias_off | flipped_by=MC09_blank_alias_off
+  duplicate_root_alias_rejected                  targets=MC08_dup_alias_off | flipped_by=MC08_dup_alias_off
+  missing_root_path_rejected                     targets=MC18_open_errors_swallowed | flipped_by=MC18_open_errors_swallowed
+  limits_round_trip_is_exact                     targets=MC10_mirror_drift | flipped_by=MC10_mirror_drift
+  durations_map_to_engine_units                  targets=MC10_mirror_drift | flipped_by=MC10_mirror_drift
+  sub_second_window_rejected_by_config           targets=MC01_window_floor_off | flipped_by=MC01_window_floor_off,MC23_window_floor_off_by_one | cascade_only_in=MC23_window_floor_off_by_one
+  over_24h_window_rejected_by_config             targets=MC02_window_ceiling_off,MC13_engine_window_ceiling_off | flipped_by=MC02_window_ceiling_off,MC10_mirror_drift,MC13_engine_window_ceiling_off | cascade_only_in=MC10_mirror_drift
+  idle_floor_rejected_by_config_layer            targets=MC19_idle_floor_off | flipped_by=MC19_idle_floor_off,MC23_window_floor_off_by_one,MC24_idle_floor_off_by_one | cascade_only_in=MC23_window_floor_off_by_one,MC24_idle_floor_off_by_one
+  idle_ceiling_rejected_by_config_layer          targets=MC20_idle_ceiling_off | flipped_by=MC20_idle_ceiling_off,MC23_window_floor_off_by_one | cascade_only_in=MC23_window_floor_off_by_one
+  window_ceiling_boundary_is_usable              targets=MC21_window_ceiling_off_by_one | flipped_by=MC21_window_ceiling_off_by_one
+  idle_ceiling_boundary_is_usable                targets=MC22_idle_ceiling_off_by_one | flipped_by=MC22_idle_ceiling_off_by_one,MC23_window_floor_off_by_one | cascade_only_in=MC23_window_floor_off_by_one
+  window_floor_boundary_is_usable                targets=MC23_window_floor_off_by_one | flipped_by=MC23_window_floor_off_by_one
+  idle_floor_boundary_is_usable                  targets=MC24_idle_floor_off_by_one | flipped_by=MC23_window_floor_off_by_one,MC24_idle_floor_off_by_one | cascade_only_in=MC23_window_floor_off_by_one
+  source_budget_below_pair_threshold_rejected    targets=MC03_engine_table_not_delegated | flipped_by=MC03_engine_table_not_delegated
+  source_budget_above_table_capacity_rejected    targets=MC03_engine_table_not_delegated | flipped_by=MC03_engine_table_not_delegated
+  invalid_table_yields_no_engine                 targets=MC03_engine_table_not_delegated,MC07_launch_skips_validate | flipped_by=MC03_engine_table_not_delegated,MC07_launch_skips_validate,MC23_window_floor_off_by_one | cascade_only_in=MC23_window_floor_off_by_one
+  blank_token_yields_no_engine                   targets=MC07_launch_skips_validate,MC14_blank_token_off | flipped_by=MC07_launch_skips_validate,MC14_blank_token_off,MC23_window_floor_off_by_one | cascade_only_in=MC23_window_floor_off_by_one
+  blank_alias_yields_no_engine                   targets=MC07_launch_skips_validate,MC09_blank_alias_off | flipped_by=MC07_launch_skips_validate,MC09_blank_alias_off,MC23_window_floor_off_by_one | cascade_only_in=MC23_window_floor_off_by_one
+  valid_config_launches_engine                   targets=MC16_seam_always_none | flipped_by=MC16_seam_always_none,MC23_window_floor_off_by_one | cascade_only_in=MC23_window_floor_off_by_one
+  files_section_survives_json_round_trip         targets=MC17_skip_serializing_window | flipped_by=MC17_skip_serializing_window,MC23_window_floor_off_by_one | cascade_only_in=MC23_window_floor_off_by_one
+  UNTARGETED（没有专属配方，只有级联或根本没翻）: none
+  STALE_TARGETS（声明了但场景里没这格）: none
+=== MM5 ALL DONE ===
