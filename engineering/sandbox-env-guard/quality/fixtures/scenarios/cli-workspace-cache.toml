@@ -1,0 +1,2 @@
+# 回归测试 fixture 场景（仅用于 harness-select 扫描/门控实测）
+id = "product.cli-workspace-cache"

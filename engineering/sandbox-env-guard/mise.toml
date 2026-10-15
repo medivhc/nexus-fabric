@@ -43,6 +43,13 @@ description = "完整守卫流程：环境探测 -> 测试筛选"
 depends = ["check-env", "test-plan"]
 
 # ---------------------------------------------------------------------------
+# 任务：守卫自回归测试（darwin 工作流「实测表现」维度）
+# ---------------------------------------------------------------------------
+[tasks.test]
+description = "运行守卫自回归套件：用确定性能力矩阵 fixture 实测 harness-select 门控"
+run = "python scripts/run_tests.py"
+
+# ---------------------------------------------------------------------------
 # Hook：agent 进入项目目录时自动运行环境探测
 # 生效前提：在 shell rc 启用 mise shell hook（`eval "$(mise activate bash)"` /
 # `mise activate zsh`），并对本项目执行 `mise trust`（mise 安全模型默认不执行
