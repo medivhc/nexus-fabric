@@ -1,0 +1,55 @@
+{
+  "verdict": "CHANGES_REQUESTED",
+  "round": "r17",
+  "reviewer": "independent reviewer (nexus-fabric review chain), self-built tree",
+  "written_at_calls": "summary.json 在第 20 次工具调用前落盘；verdict 此后不再修改",
+  "subject": {
+    "branch": "feature/gateway-file-service-contracts",
+    "commits_reviewed": ["bbb4732 (code+contracts)", "13e56e0 (case files)"],
+    "linux_ref": "ssh://appen@10.144.144.4/work/m0-origin.git m0-verify = 13e56e0246cce354589d0609341935950be7687f"
+  },
+  "host_and_toolchain": {
+    "model_identity_runtime_given": "qfmodel",
+    "windows_side": "Windows 工作树 E:/nexus-fabric-m0，HEAD=13e56e0，git status --porcelain 在我接手时为空（clean）；本笔评审只新增 .evidence/review-gateway-file-r17/ 两份案卷",
+    "linux_side": "ssh appen@10.144.144.4 实测 rustc 1.98.1 (48a229cea 2026-09-01)、cargo 1.98.1 (797e8a9bc 2026-08-05)、host python3（有 tomli，import 实测成功）",
+    "git_versions": "写本文件前未单独实测 git --version，两侧版本记录在 review.md 开头",
+    "tree_ownership": "自建：git clone --no-hardlinks --branch m0-verify /work/m0-origin.git /work/r17-audit（我亲自执行，rev-parse HEAD = 13e56e0），编译一律 CARGO_TARGET_DIR=/work/r17-target；未复用 /work/r15-audit、/work/r16-audit、/work/mm7 或它们的 target",
+    "how_cargo_is_run": "cd /work/r17-audit && CARGO_TARGET_DIR=/work/r17-target cargo test -p nexus-web-gateway --lib ；探针 cargo run -q -p nexus-web-gateway --example gateway_file_contract -- --case <case> --json",
+    "not_used_as_evidence": "探针退码、harness 的 PASS 字样、WSL、Windows 侧编译"
+  },
+  "numbers_i_measured": {
+    "lib_tests": "86 passed; 0 failed —— 我自己这棵 /work/r17-audit 的 baseline 实跑输出（非引用入库日志）",
+    "config_scenario_expectations": "29（awk 数 scenarios/product/gateway_file_config.toml 的 field= 行，我自己的数）",
+    "auth_throttle_scenario_expectations": "27（同口径）",
+    "E4_total_133": "成立，但口径是 10 个 gateway_file_contract 案子：9+6+10+5+9+27+16+7+15+29=133；仓库里另有 scenarios/product/gateway_file_resource_accounting.toml（11 条）不在这 133 内，PRODUCT 的这句没写明这个排除",
+    "FILE_MANIFEST_227": "双口径核过：awk '/^\\| /' = 228，其中 1 行是表头 `| Path | Purpose |` ⇒ 数据行 227；grep -c '^| `' = 227；与 FILE_MANIFEST.md:5 声明的 227 一致"
+  },
+  "Q1": {
+    "1_causal_explanation": "成立（代码级可确定）：examples/gateway_file_contract.rs:1729 把共享夹具 on_files 的 lockout_window_secs 直接写成 MIN_FILE_LOCKOUT_WINDOW_SECS，而 11 个格子里的 10 个都把 base_config(on_files) 的有效性或错误串标签吃进自己的合取式（1746 floor_is_usable、1775 idle_floor_is_usable、1767-1772、1787-1796、1853-1856 seam 标签 needle、1869-1874、1885-1898）。MC23 把 config.rs:237 的 `<` 写成 `<=` 后这份夹具整体非法，于是级联为假。我自己的 MC23 复跑与夹具去共享（MIN+1）对照实验在 verdict 之后回报，见 review.md。",
+    "2_is_the_coverage_claim_inflated_by_cascade": "未被虚增：对 27 个 config 断言格逐条对齐后，每一格都另有一条**不以夹具非法为机制**的专属配方（MC01/MC02/MC03/MC04/MC06/MC07/MC08/MC09/MC10/MC11/MC12/MC14/MC15/MC16/MC17/MC18/MC19/MC20/MC21/MC22/MC23/MC24/MC25），没有哪一格的唯一杀伤是 MC23 这种级联；但**入库日志本身不足以证伪这个问题**——日志只有 recipe→flip-list，没有 recipe→设计靶格 的映射，而 MC23 那 11 行里只有 1 行是它自己的靶格，其余 10 行是级联。因此 requirements.toml:121 那句『这 27 条每一个都至少被一条配方以翻自己那一格的方式打过』的『翻自己那一格』目前**没有对象**可机检，只有我这份评审的映射在读它。",
+    "3_minimal_fix": "①examples/gateway_file_contract.rs:1729 把 on_files.lockout_window_secs 改成 MIN+1（严格内点），把 MIN 这个边界值只留给 window_floor_boundary_is_usable（1811-1815 已经在自己内部写 MIN，删掉那行的重复赋值即可）——预期 MC23 从 11 翻收缩到 1 翻；②1746 与 1775 两个名字里讲『rejected』的格子还各自 AND 了一个可用性谓词（floor_is_usable / idle_floor_is_usable），是 r16 W-1 那条『名字讲拒绝、实际还量可用』的残留，把合取拆掉后 MC23/MC24 各自只翻自己那一格；③给变异表加一列 designed_target_field（recipe→靶格），让覆盖率那句变成第三方可重算的对象。"
+  },
+  "Q2": {
+    "40_auth_throttle_residual": "名副其实。入库日志 MC25 行对 auth-throttle 是 frozen=27 flips=1 missing=25（verdict want=PASS got=FAIL），这正是早退形状而不是『记 false 到自己那一格』；我自己的静态计数：gateway_config 函数体（examples/gateway_file_contract.rs:1569-1906）残留早退点 4 处，auth_throttle（:531-1182）残留 24 处——本轮『6 处早退改记 false』只落在 config 案上，auth-throttle 那条规矩确实没做完。MC25 的 3 条红单测名字（file_service::tests::expired_locks_are_reclaimed_…、lockout_rearms_after_expiry_and_flood_arms_are_not_exempt、lockout_requires_failures_inside_one_window）在树里存在性由我 grep 复核，见 review.md。",
+    "39_layer_identity_string_label": "名副其实：错误枚举变体这个结构承载体没有做（config.rs:237-256 仍是 GatewayError::Config(format!) 串），MODULE.md:120-145 的 ①②③ 我逐条对过：①可诊断性、②安全性带『只在配置层能表达的整秒定义域内』限定后与对象相符（下界两层不同形由 MC25 证），③边界值可用四格对称后各配一格。残留过宽之处在 MODULE.md:119 的单测名册（见 N-1），不在 ①②③ 本身。",
+    "third_item_i_found": ["N-1 MODULE.md:119 名单里的 both_duration_ceilings_leave_the_boundary_value_usable 在改名后已不存在（config.rs:786 实名 both_duration_bounds_leave_the_boundary_value_usable），grep -c 实测 0", "N-2 requirements.toml:121 同一句里『25 个 field 里 23 个是断言』与实数 29/27 冲突（25/23 是 8b07af8 时期的旧口径残留）", "N-3 PRODUCT.md:3379 的 133 是 10 个案子的和，未说明 gateway_file_resource_accounting.toml（11 条）为何不在内", "N-4 requirements.toml:121 的『以翻自己那一格的方式打过』缺 recipe→靶格 对象（Q1②）"]
+  },
+  "findings": [
+    {"id": "N-1", "severity": "FAIL", "where": "crates/nexus-web-gateway/MODULE.md:119", "claim": "『config.rs 的 13 条单测（…both_duration_ceilings_leave_the_boundary_value_usable）』", "repro": "cd /e/nexus-fabric-m0 && grep -c 'fn both_duration_ceilings_leave_the_boundary_value_usable' crates/nexus-web-gateway/src/config.rs  → 0；实际名 crates/nexus-web-gateway/src/config.rs:786 = both_duration_bounds_leave_the_boundary_value_usable；同档 :145 已用新名，:119 名册漏改", "note": "本笔正是做这次改名的提交；现时态名册指向一个不存在的对象"},
+    {"id": "N-2", "severity": "WARN", "where": "crates/nexus-web-gateway/requirements.toml:121", "claim": "『25 个 field 里 23 个是断言（verdict/case 是元信息与形参），这 27 条每一个都至少被一条配方…』", "repro": "grep -cE '^\\s*field\\s*=' scenarios/product/gateway_file_config.toml → 29；其中 case/verdict 2 条元信息 ⇒ 断言 27。25/23 与 27 同句并存=旧口径残留"},
+    {"id": "N-3", "severity": "WARN", "where": "PRODUCT.md:3379", "claim": "『逐条 9+6+10+5+9+27+16+7+15+29 = 133 条期望』", "repro": "对 11 个 scenarios/product/gateway_file_*.toml 数 field= 行：133 只覆盖 gateway_file_contract 的 10 个案子；gateway_file_resource_accounting.toml 的 11 条不在内且句中未说明", "note": "数本身不错，口径边界未写"},
+    {"id": "N-4", "severity": "WARN", "where": ".agents/mutation-log-gateway-file-config.txt:244-262 + crates/nexus-web-gateway/requirements.toml:121", "claim": "覆盖率『每条规则各有对象』在日志里不可机检", "repro": "grep -A18 '=== MC23' .agents/mutation-log-gateway-file-config.txt | grep -c FLIP → 11，其中靶格只有 window_floor_boundary_is_usable 一个"},
+    {"id": "N-5", "severity": "WARN", "where": "crates/nexus-web-gateway/examples/gateway_file_contract.rs:1746,1775", "claim": "『可用与拒绝是两件事，各配一格，名字也各说各的』（MODULE.md:143-145）", "repro": "两格仍是 rejected_* && *_is_usable 的合取：sub_second_window_rejected_by_config 与 idle_floor_rejected_by_config_layer 名字讲拒绝、体里含可用谓词，MC23/MC24 因此各翻两格而非一格"}
+  ],
+  "confirmed_ok_by_my_own_measurement": [
+    "baseline --lib = 86 passed 0 failed（我自己的 Linux 树）",
+    "克隆隔离性：/work/r17-audit rev-parse HEAD = 13e56e0，target=/work/r17-target，全程未借别人的树",
+    "FILE_MANIFEST 227 双口径一致（228 减表头）",
+    "config 场景 29 条 / auth-throttle 27 条（我自己的 awk）",
+    "工作树除案卷外 clean（restore 后 git status --porcelain 为空）"
+  ],
+  "not_run_or_not_evidence": [
+    "MC23/MC25 复跑与夹具对照实验在我写完本文件时仍在编译，结果与其是否推翻任何一行都记录在 review.md，不改本 verdict",
+    "全 25 条配方的 recipe→flip 矩阵若未跑完，则『未跑成，不构成证据』，Q1② 的对齐以代码级映射为准"
+  ]
+}

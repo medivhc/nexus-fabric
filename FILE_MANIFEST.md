@@ -2,7 +2,7 @@
 
 本包实现《Nexus 统一系统设计规范 v9》中的“统一仓库目录契约”。
 
-文件数（不含本清单）：227
+文件数（不含本清单）：228
 
 > 2026-10-10：原声明值 137 与表内实际行数（148）已不一致（既有漂移，含
 > `scenarios/engineering/bench_gate_verdicts.toml` 等未登记项）。本次登记
@@ -331,6 +331,7 @@
 | `.agents/red-evidence-gateway-file-service.txt` | Contract-first Red Evidence (M0) |
 | `.evidence/review-gateway-file-r16/summary.json` | 第 16 轮案卷（第十二片再续二的处置复核），verdict `COMMENTED`（0 FAIL / 2 WARN / 4 NOTE）。评审方**从零自建** `/work/r16-audit` + `/work/r16-target`；Q2 那半边按第三方标准核死：入库日志 MC00/MC01/MC21/MC22 在它自己树上逐行 IDENTICAL、两提交对 m0-verify 可达、覆盖率只靠仓库文件重算得出、86/27/131/225 四个数全对上 |
 | `.evidence/review-gateway-file-r16/review.md` | 第 16 轮取证卷：W-1 用配方 MC24 证明**下界那一侧不对称**（0 红只翻一格，且那格名字讲"拒绝"、把"改严"混进同一个名字）；W-2 用 MC25 证明"两层判定集合相同"只在配置层可表达的整秒定义域内成立（引擎 `is_zero()` 收毫秒窗口，改 `< 1s` 会红 3 条时间夹具单测）；MC23 还撞出我自己没执行完的"不要早退"规矩（探针另一处 `return Err` 造成整场早退）|
+| `.evidence/review-gateway-file-r17/summary.json` | 第 17 轮案卷（第十二片再续三的处置复核），verdict `CHANGES_REQUESTED`（1 FAIL / 4 WARN）。**这一轮评审者撞到每日配额、在第 20 次调用中断，`review.md` 没写**——但它按交付顺序要求先把 summary 落盘，verdict 与五条 finding（各带 `file:line` + repro）都在，因此可采信；实现方逐条复算后 5 条全部成立：N-1 MODULE 名册指向被我改名的单测、N-2 覆盖率句子混了新旧口径、N-3 133 没写口径边界、N-4 覆盖率不可机检、N-5 "名字各说各的"过宽（合取格遗留）|
 | `.evidence/review-gateway-file-r14/summary.json` | 第 14 轮案卷（第十二片续的处置复核），verdict `COMMENTED`（0 FAIL / 2 WARN / 3 NOTE，blocking 空）。**本链第一次由评审方自己设计的配方（NEW20）打中实现者漏钉的规则**：配置层 idle 24h 上界先前 0 红 0 翻，与 r13 W-1 同形（委托替它答话）|
 | `.evidence/review-gateway-file-r14/review.md` | 第 14 轮取证卷：Q1 实测确认"两格只被整体 FAIL 覆盖"为真且两句现时态描述因带边界可保留；Q2 用自己的解析复算出 19 并复跑 MC07/MC18/MC06/MC11 全对上班表；W-2 判"案卷第三方重算不出来"（引用了不存在的节名、MC15–18 只有计数没有名单、log/脚本只在实现者机器上）；N-3 逐条复核 r13 四条 WARN 均闭环；并声明复用中断者的树与 target、非自建 |
 | `crates/nexus-web-gateway/tools/mutation-gateway-file-config.py` | 配置面变异跑配方（MC01–MC20）入库件。评审 r14 W-2 的处置：证据此前只躺在 `/work/mm10.log`，第三方仅靠仓库重算不出覆盖率。头部写清隔离克隆+隔离 target 的跑法，以及"退码与 PASS 字样不算杀伤判据"（r13 W-3）|

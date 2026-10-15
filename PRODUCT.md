@@ -3376,7 +3376,10 @@ portable-core/WASI 门），代之以双向一致性测试保证不漂移。
 
 - 不做跨节点的 Artifact 分发、不引入 `storage_ref` 作为凭证、不做浏览器端文件系统访问。
 - 不在本节宣称 E4/E5 为**已验收**：10 条 `gateway_file_*` 场景自 M1 起在 xc-pc-linux 上
-  跑绿（逐条 9+6+10+5+9+27+16+7+15+29 = 133 条期望，命令与计数见
+  跑绿（逐条 9+6+10+5+9+27+16+7+15+29 = 133 条期望；**这个 133 只含这 10 个探针案子**——
+  第 11 个文件 `gateway_file_resource_accounting.toml` 的 11 条是本期契约先行、已跑红而实现未写，
+  不计入 133，也不在任何"已跑绿"的集合里（评审 r17 N-3 要求写明这条口径边界）。
+  命令与计数见
   `.agents/green-evidence-gateway-file-service-m1.txt`），
   M0 阶段的 Red Evidence 记录保留在 `.agents/red-evidence-gateway-file-service.txt`；
   "场景跑绿"只证明引擎与配置面不变量，不等于 E5 端到端验收，网关文件能力在

@@ -140,6 +140,75 @@ RECIPES = [
 PATHS = sorted({r[1] for r in RECIPES})
 PRISTINE = {p: open(p, encoding="utf-8").read() for p in PATHS}
 
+# 靶格声明（评审 r17 N-4）：一条配方常常翻好几格——有的是它专门打的，有的是共享夹具被
+# 改严之后的级联。光看 FLIP 名单分不清这两种，于是"每条断言各有专属对象"这句话在日志里
+# 不可机检。这里显式声明每条配方**专门**打哪几格，脚本末尾自己打 COVERAGE 段：
+# 每格列出打它的配方，没有专属配方的格直接报 UNTARGETED。
+# MC25 的靶在引擎侧（3 条时间夹具单测），不在本场景，故 targets 留空并注明。
+TARGETS = {
+    "MC01_window_floor_off": ["sub_second_window_rejected_by_config"],
+    "MC02_window_ceiling_off": ["over_24h_window_rejected_by_config"],
+    "MC03_engine_table_not_delegated": [
+        "disabled_still_rejects_inconsistent_table", "disabled_still_rejects_zero_ceiling",
+        "source_budget_below_pair_threshold_rejected", "source_budget_above_table_capacity_rejected",
+        "invalid_table_yields_no_engine"],
+    "MC04_files_checked_only_when_on": [
+        "disabled_still_rejects_inconsistent_table", "disabled_still_rejects_zero_ceiling"],
+    "MC05_presence_not_gated": ["absent_section_is_disabled", "disabled_yields_no_engine"],
+    "MC06_kill_switch_inert": ["disabled_yields_no_engine"],
+    "MC07_launch_skips_validate": [
+        "invalid_table_yields_no_engine", "blank_token_yields_no_engine",
+        "blank_alias_yields_no_engine"],
+    "MC08_dup_alias_off": ["duplicate_root_alias_rejected"],
+    "MC09_blank_alias_off": ["blank_root_alias_rejected", "blank_alias_yields_no_engine"],
+    "MC10_mirror_drift": ["limits_round_trip_is_exact", "durations_map_to_engine_units"],
+    "MC11_no_serde_default": ["absent_section_is_disabled"],
+    "MC12_default_enables_files": ["absent_section_is_disabled"],
+    "MC13_engine_window_ceiling_off": ["over_24h_window_rejected_by_config"],
+    "MC14_blank_token_off": [
+        "whitespace_only_token_rejected", "blank_token_yields_no_engine",
+        "enabled_without_token_rejected"],
+    "MC15_roots_nonempty_off": ["enabled_without_roots_rejected"],
+    "MC16_seam_always_none": ["valid_config_launches_engine"],
+    "MC17_skip_serializing_window": ["files_section_survives_json_round_trip"],
+    "MC18_open_errors_swallowed": ["missing_root_path_rejected"],
+    "MC19_idle_floor_off": ["idle_floor_rejected_by_config_layer"],
+    "MC20_idle_ceiling_off": ["idle_ceiling_rejected_by_config_layer"],
+    "MC21_window_ceiling_off_by_one": ["window_ceiling_boundary_is_usable"],
+    "MC22_idle_ceiling_off_by_one": ["idle_ceiling_boundary_is_usable"],
+    "MC23_window_floor_off_by_one": ["window_floor_boundary_is_usable"],
+    "MC24_idle_floor_off_by_one": ["idle_floor_boundary_is_usable"],
+    "MC25_engine_floor_to_one_second": [],
+}
+
+
+def coverage_report(flips_by_recipe, assertion_fields):
+    """Machine-checkable coverage: which recipes target each assertion, and which
+    assertions are only ever hit as collateral (or never at all)."""
+    targeted = {}
+    for recipe, cells in TARGETS.items():
+        for c in cells:
+            targeted.setdefault(c, []).append(recipe)
+    print("=== COVERAGE 段（工具自打，不靠散文声明）===")
+    for cell in assertion_fields:
+        owns = sorted(targeted.get(cell, []))
+        hits = sorted(r for r, fl in flips_by_recipe.items() if cell in fl)
+        cascade = [r for r in hits if r not in owns]
+        print("  %-46s targets=%s | flipped_by=%s%s" % (
+            cell, ",".join(owns) or "NONE", ",".join(hits) or "-",
+            (" | cascade_only_in=" + ",".join(cascade)) if cascade else ""))
+    untargeted = [c for c in assertion_fields if not targeted.get(c)]
+    print("  UNTARGETED（没有专属配方，只有级联或根本没翻）: %s"
+          % (",".join(untargeted) or "none"))
+    unknown = sorted({c for cells in TARGETS.values() for c in cells} - set(assertion_fields))
+    print("  STALE_TARGETS（声明了但场景里没这格）: %s" % (",".join(unknown) or "none"))
+    sys.stdout.flush()
+
+
+def assertion_fields():
+    return [f for f, want in EXPECT["config"] if want.strip('"').lower() not in ("pass",)
+            and f != "case"]
+
 
 def apply(path, orig, mut):
     body = PRISTINE[path]
@@ -190,8 +259,11 @@ def run(tag, mutated):
     for b in build:
         print("  build:", b[:160])
     print("  red tests (%d):" % len(reds))
-    for r in reds[:14]:
+    # 不截断名单：r17 N-4 的一半问题是日志读不出全貌，`[:14]` 正是那种"看着全其实被切"
+    # 的写法。配方最多红 6 条，全打不贵。
+    for r in reds:
         print("   ", r)
+    hits = []
     for case, _p in CASES:
         data, why = probe(case)
         exp = EXPECT[case]
@@ -200,9 +272,12 @@ def run(tag, mutated):
             print("  probe %-13s: NO JSON (frozen=%d)  why: %s" % (case, len(exp), why[:200]))
             continue
         print("  probe %-13s: frozen=%d flips=%d missing=%d" % (case, len(exp), len(fl), missing))
-        for field, want, got in fl[:14]:
+        for field, want, got in fl:
             print("    FLIP %-44s want=%-6s got=%s" % (field, want, got[:36]))
+        if case == "config":
+            hits = [f for f, _w, _g in fl]
     sys.stdout.flush()
+    return hits
 
 
 bad = {n: PRISTINE[p].count(o) for n, p, o, _m in RECIPES if PRISTINE[p].count(o) != 1}
@@ -211,10 +286,12 @@ if bad:
 print("anchor precheck ok: %d recipes" % len(RECIPES))
 
 run("MC00_baseline", False)
+FLIPS = {}
 for name, path, orig, mut in RECIPES:
     apply(path, orig, mut)
     try:
-        run(name, True)
+        FLIPS[name] = run(name, True)
     finally:
         restore_all()
 run("MC99_restored", False)
+coverage_report(FLIPS, assertion_fields())

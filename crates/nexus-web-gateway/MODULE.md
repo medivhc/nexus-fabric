@@ -116,7 +116,7 @@
 `an_inconsistent_enabled_table_cannot_launch_an_engine`、
 `blank_credential_and_alias_are_refused_at_the_construction_seam`、
 `idle_time_bounds_are_rejected_at_the_config_layer`、
-`both_duration_ceilings_leave_the_boundary_value_usable`）。
+`both_duration_bounds_leave_the_boundary_value_usable`）。
 窗口的两条界先前写成"各钉**一层答的话**"，评审 r15 W-1 判这个说法**过界**并给了配方
 R15A（删掉配置层那条 + 把字段名搬进引擎的错误文本）：实测 0 红 0 翻，而两处改动之间
 唯一可观测的差别是**消息文本**——在**配置层能表达的整秒定义域**里两层的判定集合相同，
@@ -137,8 +137,17 @@ MC21/MC22）；评审 r16 W-1 又指出**下界那一侧不对称**：MC24（`id
 `<= 1`）0 条单测红、只翻动一格名字讲的是"拒绝"的 `idle_floor_rejected_by_config_layer`，
 等于把"改严"混进同一个名字里。本笔再补 `window_floor_boundary_is_usable` /
 `idle_floor_boundary_is_usable` 两格与配方 MC23/MC24，四格凑成对称——可用与拒绝是两件事，
-各配一格、名字各说各的。承载体单测 `both_duration_bounds_leave_the_boundary_value_usable`
-（原名只覆盖上界，已扩到下界）。
+新加的这四格名字与体一致。**但要说清两件遗留**（评审 r17 N-5）：
+① `sub_second_window_rejected_by_config` 与 `idle_floor_rejected_by_config_layer` 是
+**合取格**（体里 = "越界被拒" ∧ "边界值可用"），名字只讲了前一半——它们是已冻结的期望，
+不能拆，所以 MC23/MC24 各翻**两**格（合取格 + 专属可用格）而不是各翻一格；
+② 因此"覆盖率 = 每条断言各有专属配方"这句话先前在日志里**不可机检**（一条配方翻多格时，
+光看 FLIP 名单分不清谁是靶格）。修法已经落地（评审 r17 N-4）：脚本里每条配方声明 `TARGETS`
+（它专门打哪几格），跑完由工具自己打 COVERAGE 段，逐格输出 `targets=` / `flipped_by=` /
+`cascade_only_in=`，并直接报 `UNTARGETED` 与 `STALE_TARGETS`——本批实测两者均为 `none`
+（27 条断言全部有专属配方；MC23 的 11 次翻转里 10 格被标为级联）。结果记在
+.agents/mutation-log-gateway-file-config.txt 末尾，不靠我在散文里声明"各有对象"。
+承载体单测 `both_duration_bounds_leave_the_boundary_value_usable`（原名只覆盖上界，已扩到下界）。
 **这条教训的形状与 r12/r13/r14/r15 同一个**（补了对象 ≠ 补对了不可替代的那半；连续四轮
 都是同一种过界），所以这里保留"当时怎么想的"而不是只留结论。
 顺序性那句（"先 validate 再构造"）也一样：删掉 `file_engine()` 里 `self.validate()?`
