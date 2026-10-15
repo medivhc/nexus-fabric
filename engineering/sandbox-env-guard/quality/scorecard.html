@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>sandbox-env-guard · 质量评分卡</title>
+<style>
+  :root { --ink:#1a1a1a; --sub:#6b7280; --line:#e5e7eb; --ok:#16a34a; --accent:#ea580c; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:#fafaf9; font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; color:var(--ink); }
+  .wrap { max-width: 880px; margin: 32px auto; padding: 0 20px; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:14px; padding:28px 30px; box-shadow:0 1px 3px rgba(0,0,0,.04); }
+  .brand { display:flex; justify-content:space-between; align-items:baseline; border-bottom:2px solid var(--ink); padding-bottom:12px; margin-bottom:18px; }
+  .brand h1 { font-size:20px; margin:0; letter-spacing:.3px; }
+  .brand .date { font-size:12px; color:var(--sub); }
+  .headline { display:flex; gap:28px; align-items:center; margin:8px 0 22px; }
+  .score-big { font-size:46px; font-weight:700; line-height:1; }
+  .score-big small { font-size:16px; color:var(--sub); font-weight:500; }
+  .delta { font-size:15px; font-weight:600; color:var(--ok); background:#dcfce7; padding:4px 10px; border-radius:999px; }
+  .delta.zero { color:var(--sub); background:#f3f4f6; }
+  table { width:100%; border-collapse:collapse; font-size:13.5px; }
+  th { text-align:left; color:var(--sub); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.4px; padding:8px 6px; border-bottom:1px solid var(--line); }
+  td { padding:9px 6px; border-bottom:1px solid #f1f1ef; vertical-align:middle; }
+  .dim { font-weight:600; }
+  .wt { color:var(--sub); font-size:12px; }
+  .bars { display:flex; gap:6px; align-items:center; min-width:220px; }
+  .bar { height:9px; border-radius:5px; background:#e5e7eb; position:relative; flex:1; overflow:hidden; }
+  .bar > i { position:absolute; left:0; top:0; bottom:0; border-radius:5px; }
+  .bar.before > i { background:#cbd5e1; }
+  .bar.after  > i { background:var(--accent); }
+  .sc { font-variant-numeric:tabular-nums; font-weight:600; width:54px; text-align:right; }
+  .up { color:var(--ok); font-weight:700; }
+  .foot { margin-top:22px; padding-top:14px; border-top:1px dashed var(--line); font-size:12px; color:var(--sub); display:flex; justify-content:space-between; }
+  .foot b { color:var(--ink); }
+  .improve { font-size:13px; color:#374151; margin-top:6px; }
+  .improve li { margin:3px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card" id="card">
+    <div class="brand">
+      <h1>sandbox-env-guard · 质量评分卡</h1>
+      <span class="date">2026-10-15 · darwin 工作流 Round 1</span>
+    </div>
+    <div class="headline">
+      <div class="score-big">86.0<small> / 100</small></div>
+      <div class="delta">▲ +6.4 vs 基线 79.6</div>
+    </div>
+
+    <table>
+      <thead>
+        <tr><th>维度</th><th>权重</th><th style="width:240px">基线 → Round1</th><th class="sc">Δ</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="dim">接口契约质量 <span class="wt">#1</span></td><td class="wt">8</td>
+          <td><div class="bars"><div class="bar before"><i style="width:70%"></i></div><div class="bar after"><i style="width:70%"></i></div></div></td><td class="sc">7→7</td></tr>
+        <tr><td class="dim">流程清晰度 <span class="wt">#2</span></td><td class="wt">12</td>
+          <td><div class="bars"><div class="bar before"><i style="width:90%"></i></div><div class="bar after"><i style="width:90%"></i></div></div></td><td class="sc">9→9</td></tr>
+        <tr><td class="dim">边界条件覆盖 <span class="wt">#3</span></td><td class="wt">14</td>
+          <td><div class="bars"><div class="bar before"><i style="width:60%"></i></div><div class="bar after"><i style="width:70%"></i></div></div></td><td class="sc up">6→7</td></tr>
+        <tr><td class="dim">检查点/契约设计 <span class="wt">#4</span></td><td class="wt">10</td>
+          <td><div class="bars"><div class="bar before"><i style="width:80%"></i></div><div class="bar after"><i style="width:80%"></i></div></div></td><td class="sc">8→8</td></tr>
+        <tr><td class="dim">指令/输出具体性 <span class="wt">#5</span></td><td class="wt">12</td>
+          <td><div class="bars"><div class="bar before"><i style="width:100%"></i></div><div class="bar after"><i style="width:100%"></i></div></div></td><td class="sc">10→10</td></tr>
+        <tr><td class="dim">资源整合度 <span class="wt">#6</span></td><td class="wt">6</td>
+          <td><div class="bars"><div class="bar before"><i style="width:50%"></i></div><div class="bar after"><i style="width:50%"></i></div></div></td><td class="sc">5→5</td></tr>
+        <tr><td class="dim">整体架构 <span class="wt">#7</span></td><td class="wt">13</td>
+          <td><div class="bars"><div class="bar before"><i style="width:110%"></i></div><div class="bar after"><i style="width:110%"></i></div></div></td><td class="sc">11→11</td></tr>
+        <tr><td class="dim">实测表现 <span class="wt">#8</span></td><td class="wt">25</td>
+          <td><div class="bars"><div class="bar before"><i style="width:70%"></i></div><div class="bar after"><i style="width:90%"></i></div></div></td><td class="sc up">7→9</td></tr>
+      </tbody>
+    </table>
+
+    <div class="improve">
+      <b>Round 1 主要改进：</b>
+      <ul>
+        <li>新增 <code>scripts/run_tests.py</code> 回归套件（8 组能力矩阵 fixture + 错误路径），维度8 由「零自测」升至可复跑。</li>
+        <li>边界条件（维度3）被编码为断言：missing / unsupported / exit 2 / demo 模式均有确定性验证。</li>
+        <li>套件即在编写中抓出 1 处 fixture 格式 bug，反证其价值。</li>
+      </ul>
+    </div>
+
+    <div class="foot">
+      <span>棘轮：<b>keep</b> · commit <b>85f0509</b></span>
+      <span>Train your Skills like you train your models · darwin × sandbox-env-guard</span>
+    </div>
+  </div>
+</div>
+</body>
+</html>
