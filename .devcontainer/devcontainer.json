@@ -1,0 +1,48 @@
+{
+  "name": "nexus-fabric",
+  "image": "mcr.microsoft.com/devcontainers/ubuntu:24.04",
+
+  "postCreateCommand": "bash .devcontainer/setup.sh",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "redhat.vscode-yaml"
+      ],
+      "settings": {
+        "rust-analyzer.procMacro.enable": true,
+        "rust-analyzer.checkOnSave.command": "clippy",
+        "editor.formatOnSave": true,
+        "[rust]": {
+          "editor.defaultFormatter": "rust-lang.rustfmt"
+        }
+      }
+    }
+  },
+
+  "forwardPorts": [8000, 8080, 9224],
+  "portsAttributes": {
+    "8000": { "label": "nexus-dashboard", "onAutoForward": "notify" },
+    "9224": { "label": "CDP debug", "onAutoForward": "silent" }
+  },
+
+  "remoteEnv": {
+    "NEXUS_AGENT": "${localEnv:NEXUS_AGENT:agent-devcontainer}",
+    "CARGO_TARGET_DIR": "${containerEnv:CARGO_TARGET_DIR:-${containerEnv:WORKSPACE_ROOT}/target}",
+    "RUSTUP_HOME": "/work/nexus-dev/.rustup",
+    "CARGO_HOME": "/work/nexus-dev/.cargo"
+  },
+
+  "remoteUser": "appen",
+  "updateRemoteUserDefault": false,
+  "mountPermissions": "cached",
+  "workspaceFolder": "/work/nexus-dev/nexus",
+
+  "features": {
+    "ghcr.io/devcontainers/features/git:1": {},
+    "ghcr.io/devcontainers/features/common-utils:2": {},
+    "ghcr.io/devcontainers/features/sshd:1": {}
+  }
+}

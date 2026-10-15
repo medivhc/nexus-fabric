@@ -1,0 +1,266 @@
+# ci-verify.yml — 全 workspace verify --fast CI 门禁
+#
+# 目的：
+#   所有 PR 在合并前必须在标准化 GitHub Actions runner 上通过 verify --fast。
+#   解决各沙箱环境不一致导致的验证结果不可比问题。
+#
+# 与 AGENTS.md §19 标准验证流程对齐：
+#   format → check → clippy → architecture-delta → dependency-delta
+#   → affected-tests → selected-properties
+#
+# Evidence 上传为 artifact（保留 7 天），PR comment 附上下载链接。
+
+name: CI Verify
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: ci-verify-${{ github.event.pull_request.number }}
+  cancel-in-progress: false  # 排队，不取消（PR 场景排队是安全的）
+
+# 最小权限默认：只读。仅在明确需要写入的 job 上按需提升。
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  # 快速反馈门：只检查 PR 改动的 crate，2-3 分钟内给出编译结果
+  # 云端 agent 本地环境可能不一致，先在 CI 上快速暴露编译错误。
+  quick-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # job 级权限提升：仅此 job 需要写 PR comment（issues: write）
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 工具链由 rust-toolchain.toml 自动锁定（1.98.1）
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # 缓存加速（按 Cargo.lock 内容寻址）
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-
+
+      - name: Quick check affected crates
+        id: quick
+        run: |
+          # 只检查 PR 中改动的 crate，避免全量编译等待
+          CHANGED=$(git diff --name-only origin/master...HEAD 2>/dev/null | \
+            sed -n 's|^crates/\([^/]*\)/.*|\1|p' | sort -u)
+
+          if [ -z "$CHANGED" ]; then
+            echo "No crates changed, skipping quick check"
+            echo "status=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          STATUS=0
+          for crate in $CHANGED; do
+            echo "=== cargo check -p $crate --all-targets ==="
+            # 单 crate 日志单独落盘，失败时可按 crate 直读
+            set +e
+            cargo check -p "$crate" --all-targets 2>&1 | tee "/tmp/quick-err-${crate}.log"
+            RC=${PIPESTATUS[0]}
+            set -e
+            if [ "${RC}" -ne 0 ]; then
+              STATUS=1
+              # 摘录：每个失败 crate 取最后 25 行，拼进汇总文件供 PR comment 直读
+              {
+                echo ""
+                echo "### crate: ${crate} (exit ${RC})"
+                tail -n 25 "/tmp/quick-err-${crate}.log"
+              } >> /tmp/quick-err-excerpts.txt
+            fi
+          done
+          echo "status=${STATUS}" >> "$GITHUB_OUTPUT"
+          echo "crates=${CHANGED}" >> "$GITHUB_OUTPUT"
+          exit $STATUS
+
+      # 上传 quick-check 日志（即使成功也保留，便于排查环境差异）
+      - name: Upload quick-check logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quick-check-logs-pr-${{ github.event.pull_request.number }}
+          path: /tmp/quick-err-*.log
+          retention-days: 3
+
+      # 失败时 PR comment 立即反馈，agent 无需等待全量 verify
+      - name: Comment PR on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.issue.number;
+            const url = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const fs = require('fs');
+
+            // 读取摘录文件（失败时一定存在）
+            let excerpts = '';
+            try {
+              excerpts = fs.readFileSync('/tmp/quick-err-excerpts.txt', 'utf8');
+            } catch (e) {
+              excerpts = '(无法读取摘录，请查看完整日志)';
+            }
+
+            const body = `## ⚡ Quick Check Failed
+
+            受影响 crate 存在编译错误，请先修复再推送：
+
+            \`\`\`
+            ${{ steps.quick.outputs.crates }}
+            \`\`\`
+
+            ### 错误摘录（每个 crate 末 25 行）
+
+            \`\`\`
+            ${excerpts}
+            \`\`\`
+
+            [查看完整日志](${url})
+
+            > 修复后重新 push 即可触发新的检查。
+            > 也可以先本地运行 \`./scripts/agent-local-check.sh <crate>\` 预检。`;
+
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr,
+              body: body,
+            });
+
+  verify-fast:
+    needs: quick-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # job 级权限提升：此 job 需要写 PR comment（issues: write）
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 工具链由 rust-toolchain.toml 自动锁定（1.98.1）
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # 系统依赖（与 DEV-ENV.md 中 xc-pc-linux 对齐）
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libssl-dev \
+            pkg-config \
+            clang \
+            llvm \
+            libdbus-1-dev \
+            libxcb1-dev
+
+      # 缓存加速（按 Cargo.lock 内容寻址）
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-
+
+      # 安装 git hooks（worktree 会丢 +x，CI 需要显式安装）
+      - name: Install git hooks
+        run: ./.githooks/install.sh
+
+      # 核心验证：nexus-harness verify --fast
+      - name: Verify Fast
+        id: verify
+        run: |
+          set +e
+          cargo run -p nexus-harness -- verify --fast --json 2>&1 | tee /tmp/verify-out.txt
+          STATUS=${PIPESTATUS[0]}
+          set -e
+
+          # 提取 verdict
+          VERDICT=$(grep -o '"verdict"[[:space:]]*:[[:space:]]*"[^"]*"' /tmp/verify-out.txt | head -1 | sed 's/.*"verdict"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+          echo "verdict=${VERDICT}" >> "$GITHUB_OUTPUT"
+          echo "status=${STATUS}" >> "$GITHUB_OUTPUT"
+
+          echo "verdict=${VERDICT} status=${STATUS}"
+          exit $STATUS
+
+      # 上传 Evidence artifact（即使失败也上传，便于诊断）
+      - name: Upload Evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-pr-${{ github.event.pull_request.number }}
+          path: .evidence/
+          retention-days: 7
+
+      # PR comment 附上 Evidence 链接和验证结果
+      - name: Comment PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const verdict = '${{ steps.verify.outputs.verdict }}';
+            const status = '${{ steps.verify.outputs.status }}';
+            const pr = context.issue.number;
+            const artifactUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            let emoji = '✅';
+            if (verdict !== 'PASS') emoji = '❌';
+
+            const body = `## ${emoji} CI Verify Fast
+
+            | 项 | 值 |
+            |---|---|
+            | Verdict | \`${verdict}\` |
+            | Exit Code | \`${status}\` |
+            | Evidence | [下载](${artifactUrl}) |
+
+            > 验证由 GitHub Actions runner（ubuntu-latest）执行，环境标准化。
+            > 详见 \`.github/workflows/ci-verify.yml\`。`;
+
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr,
+              body: body,
+            });
