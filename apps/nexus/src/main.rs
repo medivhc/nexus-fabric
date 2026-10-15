@@ -29,6 +29,9 @@ use nexus::subnet_cli::{
 };
 use nexus_control_api::{ControlCommand, ResourceId, SessionId};
 use serde_json::Value;
+// Windows 侧 system-proxy / autostart 分支使用裸 `json!` 宏。
+#[cfg(windows)]
+use serde_json::json;
 use std::path::PathBuf;
 
 const USAGE: &str = "\
@@ -1495,6 +1498,12 @@ fn run_proxy(args: &[String]) -> i32 {
         }
     }
 }
+/// 系统代理快照的 JSON 形态（PRODUCT §13.1：`enabled` + `server`，未设置为 null）。
+#[cfg(windows)]
+fn proxy_state_json(state: &nexus_platform::SystemProxyState) -> Value {
+    serde_json::json!({"enabled": state.enabled, "server": state.server})
+}
+
 /// PRODUCT §13.1：Windows 系统代理查询/设置/清除/自清理闭环。
 ///
 /// 所有输出为单个 JSON 对象（stdout）；错误也以 JSON 表达（exit 0 = 请求已处理）。

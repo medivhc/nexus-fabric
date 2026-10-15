@@ -100,6 +100,12 @@ pub fn authorize_contract(
 
 /// N3 adds credential-directory checks without changing v0's identity protocol.
 fn private_store_root(node_dir: &Path) -> Result<(), TaskError> {
+    // 目录权限检查依赖 Unix 权限位；非 Unix 上无目录私有性可校验，
+    // 显式消费参数以保持签名与调用点一致（而不是改用 `_node_dir` 掩盖差异）。
+    #[cfg(not(unix))]
+    {
+        let _ = node_dir;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};

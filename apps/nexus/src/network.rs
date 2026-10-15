@@ -21,16 +21,20 @@ use nexus_fabric::{
 };
 use nexus_network::n1::{
     N1Connection, N1Dialer, N1Discovery, N1Error, N1Event, N1EventSink, N1KeepaliveIo,
-    N1KeepaliveStream, N1PeerId,
-    config::N1Config,
-    pump::{Ipv4Route, PeerConnLookup, VpiPump},
-    session::N1SessionManager,
+    N1KeepaliveStream, N1PeerId, config::N1Config, session::N1SessionManager,
 };
+// 包泵与路由类型只被 `network_up_linux`（#[cfg(target_os = "linux")]）消费；
+// 不加 cfg 的话，非 Linux 构建会因 workspace 的 deny(warnings) 直接编译失败。
+#[cfg(target_os = "linux")]
+use nexus_network::n1::pump::{Ipv4Route, PeerConnLookup, VpiPump};
 use nexus_path::{CandidatePath, FallbackChain, FallbackConfig, PathKind};
+#[cfg(target_os = "linux")]
 use nexus_platform::VirtualPacketInterface;
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::Mutex;
 use std::time::Duration;
 
 // ---------- 注入 trait 适配器 ----------
@@ -223,8 +227,10 @@ impl N1EventSink for LogSink {
     }
 }
 
+#[cfg(target_os = "linux")]
 struct ManagerLookup(Arc<N1SessionManager>);
 
+#[cfg(target_os = "linux")]
 impl PeerConnLookup for ManagerLookup {
     fn connection_for(&self, peer: &N1PeerId) -> Option<Arc<dyn N1Connection>> {
         self.0.connection_for(peer)
@@ -307,7 +313,7 @@ pub fn network_up(config_text: &str, _json_mode: bool) -> i32 {
         eprintln!(
             "error: `nexus network up` is Linux-only in this build (N1 诚实边界：首期 Linux only)"
         );
-        return 2;
+        2
     }
     #[cfg(target_os = "linux")]
     {
