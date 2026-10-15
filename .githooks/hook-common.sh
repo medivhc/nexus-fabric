@@ -25,7 +25,7 @@ log_error() { printf '[nexus-hook] %bERROR%b %s\n' "$C_RED" "$C_RST" "$*" >&2; }
 NEXUS_TASK_TYPES="feature|bugfix|refactor|test|docs|performance|dependency|requirement-change"
 
 # --- protected contract paths (AGENTS.md §7 + harness.toml [hooks.protected]) -
-PROTECTED_PATTERN='^(PRODUCT\.md|ARCHITECTURE\.md|policies/|scenarios/|harness\.toml|.*/MODULE\.md)$'
+PROTECTED_PATTERN='^(PRODUCT\.md|ARCHITECTURE\.md|policies/|scenarios/|harness\.toml|.*/MODULE\.md|DEV-ENV\.md)$'
 
 # Contract marker required in commit body when protected paths change.
 CONTRACT_MARKER_PATTERN='^(contract|requirement-change):[[:space:]]*[A-Za-z0-9]{8,64}'
