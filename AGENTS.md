@@ -496,6 +496,8 @@ policies/
 scenarios/
 
 crates/\*\*/MODULE.md
+
+DEV-ENV.md
 ```
 
 Implementation Phase 中：
@@ -2259,3 +2261,185 @@ Coordinator：squash merge → 删除任务分支（仓库已开 delete_branch_o
 
 生产事故等必须绕行时：仍走 PR 流程，标题加 `emergency:` 前缀，事后 24h 内补齐
 evidence；"禁止 `--no-verify`、禁止削弱门禁"的铁律不变——门禁失败就修，不绕行。
+
+***
+
+## 31. 云端 Agent 开发指引（Cloud Agent Development Guide）
+
+多个云端 agent（Trae / Copilot / opencode 等）并行开发同一仓库时的环境一致性方案。
+
+核心问题：各沙箱环境不一致（工具链/系统库/性能），无 Docker 权限，导致验证结果不可信、
+Evidence 不可比。
+
+### 31.1 环境一致性三层方案
+
+> **版本单一来源**：Rust 工具链版本的唯一真值是 `DEV-ENV.md` §"Rust 工具链"
+> （stable **1.98.1** / nightly 1.100.0-nightly / rustup 1.29.1）。
+> `rust-toolchain.toml` 是它的机器可读镜像。本机 Windows cargo 1.95.0 仅作兜底，
+> agent 沙箱跑 `cargo check` 时 rustup 会自动按 `rust-toolchain.toml` 切换到 1.98.1，
+> 无需手动干预。详见 §31.7。
+
+```
+Layer 1: 远程统一开发机（xc-pc-linux）
+  - 所有云端 agent 通过 SSH 在同一台远程机上工作
+  - 解决：工具链、系统库、性能一致性
+  - 脚本：scripts/remote-dev-setup.sh
+  - 补充入口：.devcontainer/devcontainer.json（Codespaces / dev container）
+
+Layer 2: CI 标准化验证（GitHub Actions）
+  - 所有 PR 在 ubuntu-latest runner 上跑 verify --fast
+  - 解决：验证基线一致、Evidence 可比
+  - 配置：.github/workflows/ci-verify.yml
+
+Layer 3: 工具链版本锁定（rust-toolchain.toml）
+  - 所有 agent 强制使用相同 Rust 版本（1.98.1）
+  - 解决：编译/验证结果跨平台可比
+  - 配置：rust-toolchain.toml
+```
+
+### 31.2 远程开发机工作流
+
+云端 agent 不在本地沙箱工作，而是 SSH 到 xc-pc-linux：
+
+```bash
+# 一键配置远程开发环境
+./scripts/remote-dev-setup.sh --agent-name trae-18 --crate nexus-auth
+
+# 后续所有操作在远程机上执行
+ssh xc-pc-linux 'cd /work/nexus-dev/worktrees/trae-18 && \
+  export NEXUS_AGENT=trae-18 && \
+  export CARGO_TARGET_DIR=/work/nexus-dev/worktrees/trae-18/target && \
+  export RUSTUP_HOME=/work/nexus-dev/.rustup && \
+  export CARGO_HOME=/work/nexus-dev/.cargo && \
+  export PATH=${CARGO_HOME}/bin:${PATH} && \
+  nexus-harness verify --fast'
+```
+
+环境变量模板（每个 agent 必须设置）：
+
+```bash
+export NEXUS_AGENT=<agent-name>          # 证据命名空间（§29.2）
+export CARGO_TARGET_DIR=$PWD/target     # 独立构建目录（防并发锁冲突）
+export RUSTUP_HOME=/work/nexus-dev/.rustup
+export CARGO_HOME=/work/nexus-dev/.cargo
+export PATH=${CARGO_HOME}/bin:${PATH}
+```
+
+### 31.3 推送前分级本地预检（Push-Time Local Precheck）
+
+云端 agent 在推送前**必须**先做轻量本地预检，避免把编译错误直接推到 CI
+浪费 5-15 分钟反馈周期。使用脚本 `scripts/agent-local-check.sh`：
+
+```bash
+# 基本预检（L1 check + L2 clippy + fmt）——所有推送前必须通过
+./scripts/agent-local-check.sh <crate>
+
+# 涉及 FFI / 平台代码时追加 L3 build（捕获链接错误）
+./scripts/agent-local-check.sh <crate> --full
+```
+
+| 级别 | 命令 | 捕获内容 | 适用 |
+|---|---|---|---|
+| L1 | `cargo check -p <crate> --all-targets` | 语法/import/类型/借用（80% 编译错误） | 所有推送 |
+| L2 | `cargo clippy -p <crate> --all-targets -- -D warnings` | 潜在 bug + 项目 lint | 所有推送 |
+| fmt | `cargo fmt -p <crate> -- --check` | 格式 | 所有推送 |
+| L3 | `cargo build -p <crate> --all-targets` | 链接错误（FFI/静态库） | 涉及 FFI/平台代码 |
+
+若沙箱没有 Rust 工具链，无法本地预检，**直接推送后依赖 CI quick-check 兜底**（见 §31.4）。
+
+> **小空间沙箱（<1GB）替代方案**：若沙箱剩余空间不足以跑 `cargo check`，
+> 改用 `scripts/agent-zero-deps-check.sh` 做零依赖契约预检（Cargo.toml 语法、
+> protected/forbidden paths、secrets-pattern 扫描）——它不下载依赖、不编译，
+> 但**不能**捕获编译错误，编译正确性仍由 CI quick-check 作为第二道门兜底。
+> 详见 §31.9 L1。
+
+### 31.4 CI 验证门禁
+
+所有 PR 必须通过 `ci-verify.yml`：
+
+1. **quick-check job**（前置快速门，2-3 分钟）：
+   - 只检查 PR 改动的 crate，运行 `cargo check -p <crate> --all-targets`
+   - 失败时 PR comment 立即反馈，agent 无需等待全量 verify
+2. **verify-fast job**（全量门禁，quick-check 通过后才运行）：
+   - 环境：ubuntu-latest + rust-toolchain.toml 锁定的工具链
+   - 运行 `nexus-harness verify --fast`
+   - 产出：`.evidence/` 上传为 artifact（保留 7 天）
+   - PR comment 自动附验证结果和 Evidence 下载链接
+
+### 31.5 分支命名约定
+
+```
+云端 agent:  agent/remote/<agent-name>   (如 agent/remote/trae-18)
+本地 agent:  task/<run-id>-<slug>          (如 task/001-add-auth)
+CI 触发:     ci/<workflow>/<run-number>
+```
+
+### 31.6 验证分层
+
+| 层 | 环境 | 跑什么 | 说明 |
+|---|---|---|---|
+| 本地预检 | agent 沙箱 | `agent-local-check.sh`（check/clippy/fmt） | 推送前自检，可选 |
+| CI quick-check | ubuntu-latest | `cargo check` 受影响 crate | 编译错误快速反馈（2-3min） |
+| CI verify-fast | ubuntu-latest | `nexus-harness verify --fast` | PR 合并门禁，Evidence 可比 |
+| 真机 | xc-pc-linux / NU-SH-1217 | `verify --full` | 沙盒 UDP 被禁的场景 |
+
+### 31.7 版本单一来源（Source of Truth）
+
+所有 agent 必须以 **DEV-ENV.md** 为 Rust 工具链版本的唯一真值；`rust-toolchain.toml`
+是它的机器可读镜像，agent 沙箱由 rustup 自动按 channel 安装。
+
+| 来源 | 用途 | 谁可写 |
+|---|---|---|
+| `DEV-ENV.md` §"Rust 工具链" | **版本唯一真值**（stable 1.98.1 / nightly 1.100.0 / rustup 1.29.1） | maintainer（受保护路径） |
+| `rust-toolchain.toml` | 机器可读镜像（channel / components / targets） | 任何人（改版本需同步 DEV-ENV.md） |
+| `Cargo.toml` `[workspace.package]` | edition / rust-version / license | 任何人 |
+| `binary_context`（运行时） | 沙箱实际可用的 python/node 版本 | 系统（只读） |
+
+**版本漂移防护**：任何工具链 bump 必须先更新 `DEV-ENV.md`，再改
+`rust-toolchain.toml`，最后在 CI 上跑一次 verify --fast 确认。
+agent 沙箱若 cargo 版本与真值不符，rustup 会自动切换到 `rust-toolchain.toml`
+指定的 channel（1.98.1），无需手动干预。
+
+### 31.8 Agent 侧 allow / deny Matrix
+
+| 操作 | 允许 | 说明 |
+|---|---|---|
+| 读取仓库任意文件 | ✅ allow | 含 AGENTS.md / policies / scenarios |
+| 修改 `crates/`、`apps/`、`engineering/` | ✅ allow | 普通代码改动 |
+| 修改 `scripts/*.sh` | ✅ allow | agent 辅助脚本 |
+| 修改 `.github/workflows/*.yml` | ⚠️ require-review | CI 配置需 maintainer 评审 |
+| 修改 `policies/`、`scenarios/`、`harness.toml`、`PRODUCT.md`、`ARCHITECTURE.md`、`*/MODULE.md` | ❌ deny（除非带 contract/requirement-change marker） | 受保护路径（AGENTS.md §7） |
+| 修改 `DEV-ENV.md` | ⚠️ require-review | §31.7 版本唯一真值，仅 maintainer 可写（受保护路径 §7） |
+| 修改 `AGENTS.md` | ⚠️ require-review | 受保护路径（AGENTS.md §7） |
+| 新增 `target/`、`.evidence/` 内容 | ❌ deny | 构建产物 / Evidence，由 `.gitignore` 拦截 |
+| 提交密钥 / token / 私钥 | ❌ deny | secrets-pattern 扫描拦截 |
+| 推送非 `agent/remote/<name>` 分支 | ⚠️ require-review | 见 §31.5 分支命名 |
+
+### 31.9 Known Limitations & Fallback（送拖车）
+
+以下为已知限制，agent 遇到时按 fallback 处理，不阻塞推送：
+
+| # | 限制 | Fallback |
+|---|---|---|
+| L1 | 沙箱无 Rust 工具链 / 空间 <1GB | 跳过 `agent-local-check.sh`，改用 `scripts/agent-zero-deps-check.sh` 做契约预检，编译正确性由 CI quick-check 兜底 |
+| L2 | 沙箱无 SSH 到 xc-pc-linux | 跳过远程开发机工作流，直接在本地沙箱改代码 + 推送，依赖 CI verify-fast 统一验证 |
+| L3 | 沙箱 UDP 被禁（无法跑真机 P2P 场景） | `verify --full` 只能在 xc-pc-linux / NU-SH-1217 上跑；沙箱只跑 `verify --fast` |
+| L4 | CI runner 与本地环境可能有 system lib 差异 | CI 安装 `libssl-dev / pkg-config / clang / llvm / libdbus-1-dev / libxcb1-dev` 对齐；首次 CI 若失败，按 PR comment 摘录修复 |
+| L5 | `agent-local-check.sh` 与 CI quick-check 可能 diverge | 两者都用 `cargo check -p <crate> --all-targets`，工具链同为 1.98.1；差异只在 system lib，CI 为权威 |
+| L6 | shellcheck 未在沙箱安装 | 脚本语法自检用 `bash -n`；CI 建议加 `shellcheck scripts/*.sh` 作为 pre-step（backlog） |
+| L7 | `agent-zero-deps-check.sh` 不能 catch 编译错误 | intentional：它只做 zero-dependency gate；编译正确性由 CI quick-check 作为第二道门 |
+| L8 | 版本漂移（DEV-ENV.md 未及时更新） | risk-based：每次 toolchain bump 必须先更新 DEV-ENV.md（§31.7 SSOT discipline） |
+
+### 31.10 清理
+
+任务完成后清理远程 worktree（幂等：worktree 不存在时 `git worktree remove`
+与 `git branch -D` 均为 no-op，不会报错）：
+
+```bash
+ssh xc-pc-linux 'cd /work/nexus-dev/nexus && \
+  git worktree remove /work/nexus-dev/worktrees/<agent-name> 2>/dev/null || true && \
+  git branch -D agent/remote/<agent-name> 2>/dev/null || true'
+```
+
+> 也可直接运行 `scripts/remote-dev-setup.sh`（不带参数会报错 exit 2），
+> 它在创建 worktree 前会先清理同名残留（见脚本内 `trap ... EXIT`）。
