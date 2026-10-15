@@ -1,0 +1,2 @@
+﻿timestamp	commit	asset	old_score	new_score	status	dimension	note	eval_mode
+2026-10-15T00:00	baseline	sandbox-env-guard	-	79.6	baseline	-	初始基线评估（结构 7 维 + 实测 1 维；实测=7 因零自测）	full_test
