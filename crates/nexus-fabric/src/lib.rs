@@ -19,6 +19,7 @@ mod cert;
 mod driver;
 pub mod transport;
 
+use crate::cert::Identity;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::{Arc, mpsc};
@@ -340,6 +341,24 @@ impl FabricListener {
         })
     }
 
+    /// Bind the listener on a caller-provided transport with an **explicit
+    /// identity**（#3 fabric-over-proxy）。`bind_with_transport` 每次生成随机
+    /// 身份，无法与拨号方配置里的 PeerId 对齐；经代理建连时服务端身份必须可
+    /// 预测，否则 `FabricConn::connect_with_transport` 的 PeerPin 校验失败。
+    pub fn bind_with_transport_identity(
+        transport: Box<dyn UdpTransport>,
+        identity: &FabricIdentity,
+    ) -> Result<Self, FabricError> {
+        let id = Identity {
+            peer_id: identity.inner.peer_id,
+            cert_der: identity.inner.cert_der.clone(),
+            key_der: identity.inner.key_der.clone(),
+        };
+        Ok(Self {
+            driver: Driver::new_server_with_transport_identity(transport, id)?,
+        })
+    }
+
     /// TLS1.3 listener requiring a verified client key from the explicit allowlist.
     /// An empty allowlist rejects every client; no identity is learned implicitly.
     pub fn bind_mtls(
@@ -574,5 +593,39 @@ mod tests {
     fn peer_id_debug_is_short() {
         let s = format!("{:?}", PeerId([0xabu8; 32]));
         assert!(s.starts_with("PeerId(abababab"));
+    }
+
+    #[test]
+    fn bind_with_transport_identity_pins_peer_id() {
+        // #3：经代理的服务端必须能用显式身份建 listener，使拨号方配置中的
+        // PeerId 与握手校验目标一致（PeerPin）。
+        let id = FabricIdentity::from_ed25519_seed([42; 32]).expect("identity");
+        let expected = id.peer_id();
+
+        // 最小 UdpTransport 替身：recv_from 立即返回错误，驱动线程快速退出，
+        // 避免真实 TCP 阻塞导致测试挂起（身份在构造时已写入 DriverShared）。
+        struct StubTransport;
+        impl UdpTransport for StubTransport {
+            fn recv_from(&mut self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "stub",
+                ))
+            }
+            fn send_to(&self, _buf: &[u8], _target: SocketAddr) -> std::io::Result<usize> {
+                Ok(0)
+            }
+            fn set_read_timeout(&self, _timeout: Option<Duration>) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn local_addr(&self) -> std::io::Result<SocketAddr> {
+                "127.0.0.1:0".parse().map_err(std::io::Error::other)
+            }
+        }
+
+        let fl = FabricListener::bind_with_transport_identity(Box::new(StubTransport), &id)
+            .expect("bind_with_transport_identity");
+        assert_eq!(fl.peer_id(), expected);
+        drop(fl);
     }
 }

@@ -395,6 +395,17 @@ impl Driver {
         Self::spawn_with_transport(transport, Some((cfg, id)))
     }
 
+    /// Server endpoint on a caller-provided transport with an **explicit
+    /// identity**（#3 fabric-over-proxy：经代理的 QUIC 服务端必须 pin 配置中的
+    /// PeerId，不能每次生成随机身份）。
+    pub fn new_server_with_transport_identity(
+        transport: Box<dyn UdpTransport>,
+        identity: Identity,
+    ) -> Result<Arc<Self>, FabricError> {
+        let cfg = build_server_config(&identity)?;
+        Self::spawn_with_transport(transport, Some((cfg, identity)))
+    }
+
     pub(crate) fn new_mtls_client() -> Result<Arc<Self>, FabricError> {
         let transport = StdUdpTransport::bind("0.0.0.0:0".parse().unwrap())
             .map_err(|e| FabricError::Transport(e.to_string()))?;

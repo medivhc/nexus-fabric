@@ -1,0 +1,41 @@
+schema_version = 1
+id = "product.fabric-over-proxy"
+title = "N1 建连自动回退：直连 QUIC 被 iptables DROP 黑洞后，自动经 SOCKS5 代理建连并打通数据通路"
+evidence_strength = "E4"
+requirement = "docs/foundation/DESIGN.md#3.5 fabric-over-proxy"
+requires_root = true
+
+[given]
+topology = "xc-pc-linux 真机 + root；父进程建 veth 对并起本地 SOCKS5（10.200.0.254:1080）；子进程 unshare(CLONE_NEWNET) 持 veth 另一端（10.200.0.1/24），同一 netns 内跑 A/B 两个逻辑节点"
+failure_injection = "A 侧 `sudo iptables -A OUTPUT -p udp --dport 9000 -j DROP`：直连 QUIC 包有去无回（无 ICMP），5s 直连预算内无法握手"
+proxy = "父进程 SOCKS5（TCP 可达，不受 DROP 影响）；A 经 build_session_manager(ProxyConfig::Socks5) 走真实拨号路径"
+identity_pinning = "B 的 proxied QUIC listener 用 FabricIdentity::from_ed25519_seed 显式身份（nexus-fabric bind_with_transport_identity，#3 新增 API），使服务端 PeerId 与 A 配置中的对端一致"
+
+# 可执行 E4：直连 UDP 被 DROP → 5s 超时 → 自动回退 SOCKS5 代理 QUIC →
+# keepalive echo 端到端打通 → 父进程 SOCKS5 中继字节 > 0。
+[when]
+command = "cargo run --quiet -p nexusd --example n1_proxy_fallback -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+# fallback 链生效：胜出者是代理 tier。
+[[expect]]
+field = "winner_kind"
+equals = "proxy"
+
+# 数据面：keepalive echo 真实走通。
+[[expect]]
+field = "echo_ok"
+equals = true
+
+# 代理真的中继了字节（>0 由 example 计入 verdict；此处断言字段存在）。
+[[expect]]
+field = "proxy_relayed_bytes"
+non_empty = true
+
+# 直连确实先被尝试并超时（5s），不是被跳过。
+[[expect]]
+field = "dial_elapsed_ms"
+non_empty = true
