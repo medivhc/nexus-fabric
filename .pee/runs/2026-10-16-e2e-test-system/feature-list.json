@@ -2,7 +2,7 @@
   "run_id": "2026-10-16-e2e-test-system",
   "created": "2026-10-16T02:10:00+08:00",
   "branch": "pipeline/2026-10-16-e2e-test-system",
-  "updated": null,
+  "updated": "2026-10-16T21:30:00+08:00",
   "features": [
     {
       "id": "001-e2e-contract-schema",
@@ -14,14 +14,15 @@
         "engineering/nexus-harness/src/commands.rs",
         "engineering/nexus-harness/src/gates.rs"
       ],
-      "current_stage": "100",
-      "attempts": {},
+      "current_stage": "800",
+      "attempts": { "100": 1, "200": 4, "300": 1, "310": 1 },
       "skipped_reason": null,
       "stages": {
-        "100": { "passes": false, "score": null, "evidence": null, "commit": null },
-        "200": { "passes": false, "score": null, "evidence": null, "commit": null },
-        "300": { "passes": false, "score": null, "evidence": null, "commit": null },
-        "310": { "passes": false, "score": null, "evidence": null, "commit": null }
+        "100": { "passes": true, "score": 100, "evidence": { "cmd": "bash gate.sh 100 <repo> 2026-10-16-e2e-test-system", "exit": 0, "artifact": ".pee/runs/2026-10-16-e2e-test-system/logs/100-feature-list-schema.log" }, "commit": "82cc53466127d4a7f5c9b61f086dbba244c6cc4d" },
+        "200": { "passes": true, "score": 92, "evidence": { "cmd": "bash gate.sh 200 <repo> 2026-10-16-e2e-test-system + Evaluator round-4", "exit": 0, "artifact": ".pee/runs/2026-10-16-e2e-test-system/logs/200-contract-present.log" }, "commit": "33c925dceb3c6df078c82f30c1eb544c7bc44e86" },
+        "300": { "passes": true, "score": 95, "evidence": { "cmd": "cargo test -p nexus-harness + clippy + fmt + Evaluator 审查", "exit": 0, "artifact": ".pee/runs/2026-10-16-e2e-test-system/logs/" }, "commit": "76bf36cb7e7358b882d966e2c899f9fa6e259942" },
+        "310": { "passes": true, "score": 98, "evidence": { "cmd": "cargo test -p nexus-harness (77 passed) + Evaluator 审查", "exit": 0, "artifact": ".pee/runs/2026-10-16-e2e-test-system/logs/" }, "commit": "76bf36cb7e7358b882d966e2c899f9fa6e259942" },
+        "800": { "passes": true, "score": 100, "evidence": { "cmd": "Evaluator 汇总报告", "exit": 0, "artifact": ".pee/runs/2026-10-16-e2e-test-system/report.md" }, "commit": "809c3f8a73cee02c9d1796cc24f842da2ab281f1" }
       }
     },
     {
