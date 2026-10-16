@@ -673,6 +673,31 @@ mod tests {
         assert_eq!(evidence_missing_required_fields(&s, &c), vec!["checks"]);
     }
 
+    /// 契约 §5.1 fail-closed：evidence 目录下 summary.json / gates.json 缺失
+    /// （不可读）时 `evidence_conformance` 必须返回 Some——verify 据此 BLOCKED，
+    /// 而不是放行一份绑定不全的证据（STALE 判定的根基）。
+    #[test]
+    fn evidence_conformance_blocks_unreadable_evidence() {
+        let repo = Repo::discover().expect("must run inside the nexus repository");
+        let base = Config::load(&repo).expect("config must load");
+        let tmp = temp_dir("evidence-unreadable");
+        // evidence 目录故意不写任何文件。
+        let config = Config {
+            evidence_dir: tmp.join("evidence"),
+            ..base
+        };
+        let problem = evidence_conformance(&config, "missing-id");
+        assert!(
+            problem.is_some(),
+            "不可读 evidence 必须 fail-closed 返回 Some"
+        );
+        assert!(
+            problem.unwrap().contains("unreadable"),
+            "诊断必须点名 unreadable"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// 契约 §5.1：verify 真实落盘的 evidence 必须填满 10 个 required 字段
     /// （用真实 repo + 临时 evidence 目录跑一次 write_evidence 后回读）。
     #[test]

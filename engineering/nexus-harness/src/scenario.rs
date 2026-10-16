@@ -1026,6 +1026,56 @@ mod tests {
         );
     }
 
+    /// 契约 §2 / §4.5：`schema_version` 缺省或非 1 时 `load_file` 返回 Err，
+    /// `load_all` 跳过该场景（不 panic、不静默入库）。
+    ///
+    /// 覆盖 82cc534 引入的拒绝分支：此前该字段根本不校验，异构/旧版场景
+    /// 会被当合法场景加载，expect 与实现脱钩也无法察觉。
+    #[test]
+    fn load_rejects_invalid_schema_version() {
+        for (label, toml) in [
+            ("absent", "id = \"t.nover\"\n[when]\ncommand = \"true\"\n"),
+            (
+                "wrong",
+                "schema_version = 2\nid = \"t.v2\"\n[when]\ncommand = \"true\"\n",
+            ),
+            (
+                "non_integer",
+                "schema_version = \"1\"\nid = \"t.str\"\n[when]\ncommand = \"true\"\n",
+            ),
+        ] {
+            let dir =
+                std::env::temp_dir().join(format!("harness-sv-{label}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("tmpdir");
+            std::fs::write(dir.join("s.toml"), toml).expect("write toml");
+            let scenarios = load_all(&dir, &[""]);
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(
+                scenarios.is_empty(),
+                "schema_version {label} 必须被拒绝，实际加载了 {} 个场景",
+                scenarios.len()
+            );
+        }
+    }
+
+    /// 契约 §2：`schema_version = 1` 是合法值，不得被上面的规则误伤。
+    #[test]
+    fn load_accepts_schema_version_one() {
+        let dir = std::env::temp_dir().join(format!("harness-sv1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        std::fs::write(
+            dir.join("s.toml"),
+            "schema_version = 1\nid = \"t.v1\"\n[when]\ncommand = \"true\"\n",
+        )
+        .expect("write toml");
+        let scenarios = load_all(&dir, &[""]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(scenarios.len(), 1);
+        assert_eq!(scenarios[0].id, "t.v1");
+    }
+
     /// E4 夹具（P0-6）：`[given].fixture` 字符串数组被解析进 Scenario。
     #[test]
     fn fixture_parsed_from_given() {
