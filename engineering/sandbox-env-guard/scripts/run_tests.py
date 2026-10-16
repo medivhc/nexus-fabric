@@ -13,13 +13,25 @@
 #
 # 用法：python scripts/run_tests.py   （exit 0=全绿，非0=有失败）
 # ============================================================================
-import json, os, sys, subprocess, tempfile
+import json, os, sys, subprocess, tempfile, importlib.util, importlib.machinery
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 SCENARIOS_DIR = os.path.join(PROJECT_ROOT, "quality", "fixtures", "scenarios")
 MAP = os.path.join(PROJECT_ROOT, "test-capability-map.toml")
 HARNESS = os.path.join(SCRIPT_DIR, "harness-select")
+ENV_CHECK = os.path.join(SCRIPT_DIR, "env-check")
+
+
+def load_env_check():
+    """以模块方式加载 env-check（无 .py 后缀，用 SourceFileLoader 加载），供单元测试。
+    env-check 的 main() 受 `if __name__ == "__main__"` 保护，import 不会触发运行。
+    """
+    loader = importlib.machinery.SourceFileLoader("env_check_mod", ENV_CHECK)
+    spec = importlib.util.spec_from_loader("env_check_mod", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
 
 
 # ----------------------------------------------------------------------------
@@ -175,8 +187,61 @@ def main():
     if demo_mode != "demo":
         failures.append(f"[demo] 期望 mode=demo，实际 {demo_mode}")
 
+    # ---- 4) env-check：run_cmd 异常显式化（R2：不再静默吞）----
+    ec = load_env_check()
+    # 4a) 二进制不存在 → 返回 None（预期的「不存在」，不应触发 unknown）
+    if ec.run_cmd("this_binary_does_not_exist_xyz") is not None:
+        failures.append("[run_cmd] 不存在的二进制应返回 None，实际非 None")
+    # 4b) 探测期操作失败（超时）→ 应抛 ProbeError，而非静默吞成 None/假绿
+    try:
+        ec.run_cmd("sleep", "5", timeout=1)
+        failures.append("[run_cmd] 超时命令应抛 ProbeError，实际未抛（被静默吞了）")
+    except ec.ProbeError:
+        pass  # 期望：异常被显式抛出
+    except Exception as e:
+        failures.append(f"[run_cmd] 超时命令抛出的异常类型错误：{type(e).__name__}: {e}")
+
+    # ---- 5) env-check 集成：TUN 三分支 + SKIP_NETWORK_PROBES（R2）----
+    def run_env_check(extra_env):
+        env = dict(os.environ, SKIP_NETWORK_PROBES="1")
+        env.update(extra_env)
+        p = subprocess.run([sys.executable, ENV_CHECK], capture_output=True, text=True,
+                           env=env, timeout=60)
+        try:
+            return json.loads(p.stdout)
+        except Exception:
+            return None
+
+    rep = run_env_check({})
+    if rep is None:
+        failures.append("[env-check] 正常跑未产出 JSON（stdout 异常）")
+    else:
+        # 本沙箱无 /dev/net/tun → missing（R2：无设备节点判 missing 而非 degraded）
+        tun = rep["capabilities"]["tun_net_admin"]["status"]
+        if tun != "missing":
+            failures.append(f"[env-check] 无 /dev/net/tun 应判 missing，实际 {tun}")
+        # SKIP_NETWORK_PROBES → 网络类能力记 unknown（「未探测」≠「缺失」）
+        if rep["capabilities"]["github_proxy"]["status"] != "unknown":
+            failures.append("[env-check] SKIP_NETWORK_PROBES 下 github_proxy 应 unknown")
+        if rep["capabilities"]["internet_egress"]["status"] != "unknown":
+            failures.append("[env-check] SKIP_NETWORK_PROBES 下 internet_egress 应 unknown")
+
+    # 5b) TUN_DEVICE_PATH=/nonexistent → missing
+    rep = run_env_check({"TUN_DEVICE_PATH": "/nonexistent"})
+    if rep is None or rep["capabilities"]["tun_net_admin"]["status"] != "missing":
+        got = rep["capabilities"]["tun_net_admin"]["status"] if rep else "N/A"
+        failures.append(f"[env-check] TUN_DEVICE_PATH=/nonexistent 应 missing，实际 {got}")
+
+    # 5c) TUN_DEVICE_PATH=普通文件 → 可 open 但 TUNSETIFF 失败 → degraded（避免假 ok）
+    tmpf = tempfile.NamedTemporaryFile(delete=False).name
+    rep = run_env_check({"TUN_DEVICE_PATH": tmpf})
+    os.unlink(tmpf)
+    if rep is None or rep["capabilities"]["tun_net_admin"]["status"] != "degraded":
+        got = rep["capabilities"]["tun_net_admin"]["status"] if rep else "N/A"
+        failures.append(f"[env-check] 普通文件应 degraded（非假 ok），实际 {got}")
+
     # ---- 汇报 ----
-    total = len(FIXTURES) + 2
+    total = len(FIXTURES) + 2 + 1 + 3  # 门控矩阵 + bad_dir + demo + run_cmd + TUN三分支
     passed = total - len(failures)
     print(f"[run_tests] 用例 {total}  通过 {passed}  失败 {len(failures)}")
     for f in failures:

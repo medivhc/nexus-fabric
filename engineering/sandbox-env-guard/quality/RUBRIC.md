@@ -60,6 +60,23 @@
 
 ---
 
+## R2 评分（2026-10-15，round 1 后）
+
+| # | 维度 | 分 | 说明 |
+|---|------|----|------|
+| 1 | 接口契约质量 | 7 | 同 R1 |
+| 2 | 流程清晰度 | 9 | 同 R1 |
+| 3 | 边界条件覆盖 | **8** | `tun_net_admin` 从「stat 存在」升级为「实际 open + TUNSETIFF ioctl」，区分 missing(无节点)/degraded(可开不可建，缺 CAP_NET_ADMIN)/ok(可建)；`run_cmd` 异常显式抛 `ProbeError`（不再静默吞成 None 假绿）；`SKIP_NETWORK_PROBES` 让网络探测可确定性跳过 |
+| 4 | 检查点/契约设计 | 8 | 同 R1 |
+| 5 | 指令/输出具体性 | 10 | TUN 三态均带 reason/detail |
+| 6 | 资源整合度 | 5 | 同 R1 |
+| 7 | 整体架构 | 11 | 同 R1 |
+| 8 | 实测表现 | 9 | 新增 env-check 组件测试（`run_cmd` 异常语义 + TUN 三分支 + `SKIP_NETWORK_PROBES`），回归套件 10→14 用例全绿 |
+
+**R2 总分 = (7×8 + 9×12 + 8×14 + 8×10 + 10×12 + 5×6 + 11×13 + 9×25)/10 = 874/10 = 87.4**（较 R1 +1.4，棘轮成立）
+
+---
+
 ## 优化流程（darwin Phase 0-3 适配）
 
 - **Phase 0**：在 `feat/sandbox-env-guard` 分支工作；初始化 `quality/results.tsv`。
@@ -80,5 +97,5 @@
 ---
 
 ## 后续候选轮次（待用户确认先后）
-- **R2（dim 3 边界覆盖）**：`tun_net_admin` 探测从「stat 存在」升级为「实际 open `/dev/net/tun`」，避免设备存在但不可用的假 ok；`env-check` 内 `run_cmd` 异常不再静默吞（探测失败应记 `unknown` 而非沿用默认）。
-- **R3（dim 6/7 集成度）**：新增 `.github/workflows/guard.yml` 在 PR 上跑守卫；`mise.toml` 增加 `[tasks.test]`。
+- ~~**R2（dim 3 边界覆盖）**：`tun_net_admin` 探测从「stat 存在」升级为「实际 open `/dev/net/tun`」，避免设备存在但不可用的假 ok；`env-check` 内 `run_cmd` 异常不再静默吞（探测失败应记 `unknown` 而非沿用默认）。~~ ✅ 已完成（见上）
+- **R3（dim 6/7 集成度）**：新增 `.github/workflows/guard.yml` 在 PR 上跑守卫；`mise.toml` 已加 `[tasks.test]`。
