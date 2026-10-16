@@ -22,15 +22,16 @@
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `schema_version` | int | 是 | 固定 1 |
+| `schema_version` | int | 是 | 固定 1，非 1 时拒绝加载（`scenario.rs:62`） |
 | `id` | string | 是 | 全局唯一，`<subdir>.<name>` |
-| `title` | string | 否 | 人类可读描述 |
-| `evidence_strength` | string | 否 | E1–E5 |
-| `requirement` | string | 否 | 指向 PRODUCT.md 锚点 |
-| `[given]` | table | 是 | 环境声明 |
+| `title` | string | 否 | 人类可读描述，缺省空串 |
+| `requires_root` | bool | 否 | 顶层字段（不在 `[given]` 内），缺省 false；true→`real-device` |
+| `evidence_strength` | string | 否 | E1–E5；缺省/非法时由 `evidence_strength()` 推导或 fail-safe 降 E1 |
+| `[given].platform` | string | 否 | 平台声明（如 `windows`/`linux`） |
 | `[given].fixture` | string[] | 否 | E4 夹具命令，按序执行，任一失败→FAIL |
-| `[when].command` | string | 是 | 被测命令；缺省→静态契约（UNKNOWN） |
-| `[[expect]]` | array | 是 | 断言：`equals` / `one_of` / `non_empty` |
+| `[when].command` | string | 否 | 被测命令；缺省→静态契约（UNKNOWN） |
+| `[[expect]]` | array | 否 | 断言：`equals` / `one_of` / `non_empty`；缺省→仅命令 smoke |
+| `requirement` | string | 否 | 文档标注（指向 PRODUCT.md 锚点），**parser 不解析**，仅供人类阅读 |
 
 ## 3. 分层证据模型
 
@@ -62,6 +63,22 @@
 | `BLOCKED` | 场景未找到 / 用法错误 / n3 contract-first 未实现 | 门禁 FAIL |
 | `STALE` | 证据与当前 revision 不匹配 | 推送被阻断（`harness.toml [hooks.verify]`） |
 
+**场景失败步骤枚举**（`ScenarioRunReport.failed_step`，`scenario.rs`）：
+
+| 值 | 含义 |
+|----|------|
+| `""` | 未失败 |
+| `fixture` | `[given].fixture` 某条命令非 0 |
+| `command` | 主命令 spawn 失败 / 超时 / 非 0 |
+| `expect` | 某条 `[[expect]]` 断言不成立 |
+| `parse` | 命令 stdout 非合法 JSON |
+| `lookup` | `scenario run <id>` 未找到该 id |
+
+**evidence 校验的 BLOCKED 路径**：`verify` 回读刚落盘的 evidence，核对
+`evidence.schema.json` 的 10 个 required 字段全部被真实填充；残缺即返回
+`BLOCKED`（fail-closed，宁堵一次验证也不放行绑定不全的证据——STALE 判定
+依赖这些绑定字段）。
+
 ## 5. 接口契约（E2E 系统对外）
 
 ### 5.1 主入口
@@ -80,11 +97,11 @@
 |------|------|--------|
 | `status` | 工作区状态摘要 | PASS |
 | `context <target>` | 最小上下文（契约→实现） | PASS |
-| `check` | 受影响 crate 的 `cargo check --all-targets` | PASS/FAIL |
+| `check` | workspace 级 `cargo check --workspace --all-targets`（`gates.rs:254`） | PASS/FAIL |
 | `test affected` | 受影响 crate 的测试 | PASS/FAIL |
 | `verify --fast` | 快速门禁（format/check/clippy/affected-tests） | PASS/FAIL |
 | `verify --full` | 全量门禁（+workspace-tests/integration/product-scenarios/regression） | PASS/FAIL |
-| `explain <anchor>` | 解释 PRODUCT.md 锚点的实现位置 | PASS |
+| `explain` | 解释**最新一次 evidence 的 gates 判定**（无参数；非 PRODUCT.md 锚点查询，`commands.rs:383`） | PASS |
 | `bench` | 基准测试 | PASS/FAIL |
 | `replay <id>` | 回放历史 evidence | UNKNOWN（未实现） |
 
@@ -92,25 +109,29 @@
 
 | 命令 | 用途 | 判定值 |
 |------|------|--------|
-| `scenario list` | 列出全部场景（id/subdir/summary/requires） | PASS |
+| `scenario list` | 列出全部场景（输出字段：`name`/`subdir`/`summary`/`requires`，`scenario_cmd.rs:51`） | PASS |
 | `scenario run <id>` | 单场景执行，输出失败签名 | PASS/FAIL/UNKNOWN/BLOCKED |
 
 ## 6. 示例（可直接使用）
 
 ### 6.1 场景 TOML（最小可运行）
 
+> 注意：`[when].command` 由 `split_whitespace()` 切分后**直接 exec，不经 shell**
+> （`scenario.rs:374-383`），因此**不支持 shell 引号/重定向/管道**。输出 JSON
+> 用 `printf %s <json>`，不要用 `echo '<json>'`（单引号会被当字面字符输出，
+> 导致 JSON parse FAIL）。需要复杂逻辑时写临时脚本再调 `sh <script>`。
+
 ```toml
 schema_version = 1
 id = "product.echo-json"
-title = "E2E 最小场景：echo 输出 JSON 并校验"
+title = "E2E 最小场景：printf 输出 JSON 并校验"
 evidence_strength = "E3"
-requirement = "PRODUCT.md#00-echo"
 
 [given]
-fixture = ["echo ready"]
+fixture = ["printf %s ready"]
 
 [when]
-command = "echo '{\"verdict\":\"PASS\",\"n\":1}'"
+command = "printf %s {\"verdict\":\"PASS\",\"n\":1}"
 
 [[expect]]
 field = "verdict"
@@ -121,11 +142,15 @@ field = "n"
 equals = 1
 ```
 
-### 6.2 evidence JSON（`engineering/evidence-schema/evidence.schema.json` 子集）
+### 6.2 evidence JSON
+
+> 对应 `engineering/evidence-schema/evidence.schema.json`：`schema_version`
+> 是 `const: 1` 的**整型**（不是字符串）；`checks[]` 每项必填 `id` + `status`，
+> 可选 `duration_ms` / `artifact` / `message`；顶层 `additionalProperties: false`。
 
 ```json
 {
-  "schema_version": "1",
+  "schema_version": 1,
   "verification_id": "product.echo-json",
   "verdict": "PASS",
   "source_revision": "abc123def456",
