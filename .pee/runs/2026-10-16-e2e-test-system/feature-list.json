@@ -1,0 +1,98 @@
+{
+  "run_id": "2026-10-16-e2e-test-system",
+  "created": "2026-10-16T02:10:00+08:00",
+  "branch": "pipeline/2026-10-16-e2e-test-system",
+  "updated": null,
+  "features": [
+    {
+      "id": "001-e2e-contract-schema",
+      "title": "E2E 场景契约层：fix e2e_gate 声明 + 真机/sandbox 分层 + evidence 绑定契约",
+      "priority": "P0",
+      "dependencies": [],
+      "path_claims": [
+        "engineering/nexus-harness/src/scenario.rs",
+        "engineering/nexus-harness/src/commands.rs",
+        "engineering/nexus-harness/src/gates.rs"
+      ],
+      "current_stage": "100",
+      "attempts": {},
+      "skipped_reason": null,
+      "stages": {
+        "100": { "passes": false, "score": null, "evidence": null, "commit": null },
+        "200": { "passes": false, "score": null, "evidence": null, "commit": null },
+        "300": { "passes": false, "score": null, "evidence": null, "commit": null },
+        "310": { "passes": false, "score": null, "evidence": null, "commit": null }
+      }
+    },
+    {
+      "id": "002-e2e-stability-scenarios",
+      "title": "E2E 覆盖缺口 P0：persist-recover / idempotency / observe-adapt 三个未覆盖锚点的 E4 场景",
+      "priority": "P0",
+      "dependencies": ["001-e2e-contract-schema"],
+      "path_claims": [
+        "scenarios/product/persist_recover_scenario.toml",
+        "scenarios/product/idempotency_scenario.toml",
+        "scenarios/product/observe_adapt_scenario.toml",
+        ".evidence/red-e2e-p0-scenarios/"
+      ],
+      "current_stage": "100",
+      "attempts": {},
+      "skipped_reason": null,
+      "stages": {
+        "100": { "passes": false, "score": null, "evidence": null, "commit": null },
+        "200": { "passes": false, "score": null, "evidence": null, "commit": null },
+        "300": { "passes": false, "score": null, "evidence": null, "commit": null },
+        "310": { "passes": false, "score": null, "evidence": null, "commit": null },
+        "700": { "passes": false, "score": null, "evidence": null, "commit": null }
+      }
+    },
+    {
+      "id": "003-e2e-proxy-scenarios",
+      "title": "E2E 覆盖缺口 P1：代理内核 11.x 未覆盖锚点（outbound-tunnel-dataplane / rule-provider / geosite-nex / speedtest / vmess / subscription-update）的 E4 场景",
+      "priority": "P1",
+      "dependencies": ["001-e2e-contract-schema"],
+      "path_claims": [
+        "scenarios/product/outbound_tunnel_dataplane.toml",
+        "scenarios/product/rule_provider_online.toml",
+        "scenarios/product/geosite_nex_format.toml",
+        "scenarios/product/speedtest_loopback.toml",
+        "scenarios/product/vmess_adapter.toml",
+        "scenarios/product/subscription_online_update.toml",
+        ".evidence/red-e2e-p1-scenarios/"
+      ],
+      "current_stage": "100",
+      "attempts": {},
+      "skipped_reason": null,
+      "stages": {
+        "100": { "passes": false, "score": null, "evidence": null, "commit": null },
+        "200": { "passes": false, "score": null, "evidence": null, "commit": null },
+        "300": { "passes": false, "score": null, "evidence": null, "commit": null },
+        "310": { "passes": false, "score": null, "evidence": null, "commit": null },
+        "700": { "passes": false, "score": null, "evidence": null, "commit": null }
+      }
+    },
+    {
+      "id": "004-e2e-acceptance-checklist",
+      "title": "E2E 验收清单化：生成 PRODUCT.md 锚点×场景覆盖矩阵 + 可执行验收 todo + verify --full 报告聚合",
+      "priority": "P2",
+      "dependencies": ["002-e2e-stability-scenarios", "003-e2e-proxy-scenarios"],
+      "path_claims": [
+        "engineering/e2e/coverage_matrix.md",
+        "engineering/e2e/acceptance_todo.md",
+        "engineering/e2e/generate_coverage.sh",
+        ".evidence/e2e-acceptance/"
+      ],
+      "current_stage": "100",
+      "attempts": {},
+      "skipped_reason": null,
+      "stages": {
+        "100": { "passes": false, "score": null, "evidence": null, "commit": null },
+        "200": { "passes": false, "score": null, "evidence": null, "commit": null },
+        "300": { "passes": false, "score": null, "evidence": null, "commit": null },
+        "310": { "passes": false, "score": null, "evidence": null, "commit": null },
+        "700": { "passes": false, "score": null, "evidence": null, "commit": null },
+        "710": { "passes": false, "score": null, "evidence": null, "commit": null }
+      }
+    }
+  ]
+}

@@ -48,10 +48,20 @@ pub struct ScenarioResult {
     pub detail: String,
 }
 
-fn load_file(path: &PathBuf, subdir: &str) -> Option<Scenario> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let v: toml::Value = toml::from_str(&text).ok()?;
-    let id = v.get("id")?.as_str()?.to_string();
+fn load_file(path: &PathBuf, subdir: &str) -> Result<Scenario, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let v: toml::Value = toml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    // schema_version 契约校验（docs/e2e-test-system-contract.md §2）：
+    // 缺省或非 1 都拒绝加载，避免旧版/异构场景被静默丢弃。
+    let sv = v.get("schema_version").and_then(toml::Value::as_integer);
+    if sv != Some(1) {
+        return Err(format!(
+            "schema_version 校验失败: {:?}（契约要求 schema_version = 1）",
+            sv
+        ));
+    }
+    let id = v.get("id").ok_or_else(|| format!("缺 id 字段: {}", path.display()))?.as_str().ok_or_else(|| format!("id 非字符串: {}", path.display()))?.to_string();
     let title = v
         .get("title")
         .and_then(toml::Value::as_str)
@@ -179,8 +189,11 @@ pub fn load_all(scenarios_dir: &Path, subdirs: &[&str]) -> Vec<Scenario> {
             .collect();
         files.sort();
         for f in files {
-            if let Some(s) = load_file(&f, sub) {
-                out.push(s);
+            match load_file(&f, sub) {
+                Ok(s) => out.push(s),
+                // 契约校验失败的场景不静默丢弃：记录日志后跳过，
+                // 由 verify --full 的 product-scenarios gate 汇总为 FAIL。
+                Err(e) => eprintln!("[scenario] 跳过 {}: {e}", f.display()),
             }
         }
     }
