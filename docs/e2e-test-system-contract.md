@@ -72,7 +72,8 @@
 | `command` | 主命令 spawn 失败 / 超时 / 非 0 |
 | `expect` | 某条 `[[expect]]` 断言不成立 |
 | `parse` | 命令 stdout 非合法 JSON |
-| `lookup` | `scenario run <id>` 未找到该 id |
+| `lookup` | `scenario run <id>` 未找到该 id，或平台不匹配（`scenario.rs:572`） |
+| `harness` | 并行执行 worker panic / harness 内部故障（`scenario.rs:743`） |
 
 **evidence 校验的 BLOCKED 路径**：`verify` 回读刚落盘的 evidence，核对
 `evidence.schema.json` 的 10 个 required 字段全部被真实填充；残缺即返回
@@ -95,13 +96,13 @@
 
 | 命令 | 用途 | 判定值 |
 |------|------|--------|
-| `status` | 工作区状态摘要 | PASS |
-| `context <target>` | 最小上下文（契约→实现） | PASS |
+| `status` | 工作区状态摘要 | PASS（可能 UNKNOWN/STALE/BLOCKED） |
+| `context <target>` | 最小上下文（契约→实现） | PASS（可能 UNKNOWN/STALE/BLOCKED） |
 | `check` | workspace 级 `cargo check --workspace --all-targets`（`gates.rs:254`） | PASS/FAIL |
 | `test affected` | 受影响 crate 的测试 | PASS/FAIL |
 | `verify --fast` | 快速门禁（format/check/clippy/affected-tests） | PASS/FAIL |
 | `verify --full` | 全量门禁（+workspace-tests/integration/product-scenarios/regression） | PASS/FAIL |
-| `explain` | 解释**最新一次 evidence 的 gates 判定**（无参数；非 PRODUCT.md 锚点查询，`commands.rs:383`） | PASS |
+| `explain` | 解释**最新一次 evidence 的 gates 判定**（无参数；非 PRODUCT.md 锚点查询，`commands.rs:383`） | PASS（可能 UNKNOWN/STALE/BLOCKED） |
 | `bench` | 基准测试 | PASS/FAIL |
 | `replay <id>` | 回放历史 evidence | UNKNOWN（未实现） |
 
