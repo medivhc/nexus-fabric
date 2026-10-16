@@ -39,6 +39,10 @@ pub struct Scenario {
     pub fixtures: Vec<String>,
     pub command: Option<String>,
     pub expects: Vec<ScenarioExpect>,
+    /// 顶层 `evidence_strength` 声明原文（契约 §2：E1–E5，可选）。
+    /// None = 未声明或非字符串；分层由 `evidence_strength()` 推导/校验，
+    /// 加载不因该字段缺失或非法而失败（契约 §4.5：不静默丢弃场景）。
+    pub evidence_strength: Option<String>,
 }
 
 #[derive(Clone)]
@@ -49,9 +53,10 @@ pub struct ScenarioResult {
 }
 
 fn load_file(path: &PathBuf, subdir: &str) -> Result<Scenario, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
-    let v: toml::Value = toml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let v: toml::Value =
+        toml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
     // schema_version 契约校验（docs/e2e-test-system-contract.md §2）：
     // 缺省或非 1 都拒绝加载，避免旧版/异构场景被静默丢弃。
     let sv = v.get("schema_version").and_then(toml::Value::as_integer);
@@ -61,7 +66,12 @@ fn load_file(path: &PathBuf, subdir: &str) -> Result<Scenario, String> {
             sv
         ));
     }
-    let id = v.get("id").ok_or_else(|| format!("缺 id 字段: {}", path.display()))?.as_str().ok_or_else(|| format!("id 非字符串: {}", path.display()))?.to_string();
+    let id = v
+        .get("id")
+        .ok_or_else(|| format!("缺 id 字段: {}", path.display()))?
+        .as_str()
+        .ok_or_else(|| format!("id 非字符串: {}", path.display()))?
+        .to_string();
     let title = v
         .get("title")
         .and_then(toml::Value::as_str)
@@ -71,6 +81,12 @@ fn load_file(path: &PathBuf, subdir: &str) -> Result<Scenario, String> {
         .get("requires_root")
         .and_then(toml::Value::as_bool)
         .unwrap_or(false);
+    // 证据分层声明（契约 §2/§3）：可选字符串 E1–E5；缺省或非法时由
+    // `evidence_strength()` 推导 / fail-safe 降级，加载不因此失败。
+    let evidence_strength = v
+        .get("evidence_strength")
+        .and_then(toml::Value::as_str)
+        .map(str::to_string);
     let file_stem = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -94,8 +110,8 @@ fn load_file(path: &PathBuf, subdir: &str) -> Result<Scenario, String> {
         })
         .unwrap_or_default();
     let command = v
-        .get("when")?
-        .get("command")
+        .get("when")
+        .and_then(|w| w.get("command"))
         .and_then(toml::Value::as_str)
         .map(str::to_string);
     let expects = v
@@ -119,7 +135,7 @@ fn load_file(path: &PathBuf, subdir: &str) -> Result<Scenario, String> {
                 .collect()
         })
         .unwrap_or_default();
-    Some(Scenario {
+    Ok(Scenario {
         id,
         subdir: subdir.to_string(),
         title,
@@ -129,6 +145,7 @@ fn load_file(path: &PathBuf, subdir: &str) -> Result<Scenario, String> {
         fixtures,
         command,
         expects,
+        evidence_strength,
     })
 }
 
@@ -150,6 +167,52 @@ pub fn scenario_requires(s: &Scenario) -> &'static str {
         return "real-device";
     }
     "sandbox"
+}
+
+/// 场景的证据分层（契约 §3 分层证据模型 E1–E5），与 `scenario_requires`
+/// 的真机/sandbox 二值分层显式关联，供报告层按强度聚合。
+///
+/// 判定顺序：
+/// 1. 显式声明且合法（`E1`–`E5`）→ 原样返回声明值；
+/// 2. 显式声明非法（拼错/异构值，如 `e3` / `E9`）→ **fail-safe 降级 E1**：
+///    非法声明不得获得比推导更强的强度（与 `load_file` 拒绝
+///    `schema_version != 1` 的"不静默接受异构值"同一哲学）；
+/// 3. 缺省推导（按 requires / fixture / command 有无；subdir 不单独升级强度——
+///    强度取决于场景**实际执行什么**，而非它住在哪个目录）：
+///    - `scenario_requires == "real-device"` → `E4`（真机/隔离环境）；
+///    - 声明了 `[given].fixture` → `E4`（"scenario + fixture，离线可复现"）；
+///    - 有 `[when].command` → `E3`（沙箱场景，harness verify 的
+///      product-scenarios gate 执行）；
+///    - 静态契约（无 command）→ `E1`（仅契约声明、无运行时断言，最弱层；
+///      可执行性由 `run_single` 记 UNKNOWN）。
+pub fn evidence_strength(s: &Scenario) -> &'static str {
+    if let Some(declared) = s.evidence_strength.as_deref() {
+        return match declared {
+            "E1" => "E1",
+            "E2" => "E2",
+            "E3" => "E3",
+            "E4" => "E4",
+            "E5" => "E5",
+            // 非法声明：fail-safe 落到最弱层，绝不静默放大。
+            _ => "E1",
+        };
+    }
+    derive_evidence_strength(s)
+}
+
+/// 缺省推导（纯函数；显式声明路径见 `evidence_strength`）。
+fn derive_evidence_strength(s: &Scenario) -> &'static str {
+    if scenario_requires(s) == "real-device" {
+        return "E4";
+    }
+    if !s.fixtures.is_empty() {
+        return "E4";
+    }
+    if s.command.is_some() {
+        return "E3";
+    }
+    // 静态契约：无 [when].command，运行时不可执行（run_single 记 UNKNOWN）。
+    "E1"
 }
 
 /// TOML 期望值 → JSON 期望值。数组递归转换；标量逐一映射。
@@ -724,9 +787,21 @@ pub fn run_gate(config: &Config, gate_name: &str, subdirs: &[&str]) -> (Vec<Scen
             detail: rep.detail,
         });
     }
-    let detail: Vec<String> = results
+    // 契约 §3：Gate detail 逐场景带上真机/sandbox 分层（requires）与证据
+    // 分层（evidence=E1–E5），报告层据此按强度聚合，而不是只看到 verdict。
+    let detail: Vec<String> = scenarios
         .iter()
-        .map(|r| format!("{}: {} ({})", r.id, r.verdict, r.detail))
+        .zip(results.iter())
+        .map(|(s, r)| {
+            format!(
+                "{}: {} (requires={}, evidence={}; {})",
+                r.id,
+                r.verdict,
+                scenario_requires(s),
+                evidence_strength(s),
+                r.detail
+            )
+        })
         .collect();
     let detail = detail.join("\n");
     if failed {
@@ -752,6 +827,7 @@ mod tests {
             fixtures: Vec::new(),
             command: None,
             expects,
+            evidence_strength: None,
         }
     }
 
@@ -1049,6 +1125,128 @@ mod tests {
         assert_eq!(scenario_requires(&s), "real-device");
     }
 
+    /// 证据分层（契约 §3）：显式声明 E1–E5 原样返回。
+    #[test]
+    fn evidence_strength_explicit_declaration() {
+        for declared in ["E1", "E2", "E3", "E4", "E5"] {
+            let mut s = scenario(vec![]);
+            s.evidence_strength = Some(declared.to_string());
+            assert_eq!(evidence_strength(&s), declared);
+        }
+    }
+
+    /// 证据分层推导（契约 §3 与 scenario_requires 的显式关联）：
+    /// real-device → E4；fixture → E4；command → E3；静态契约 → E1。
+    #[test]
+    fn evidence_strength_derived_when_absent() {
+        let mut s = scenario(vec![]);
+        s.evidence_strength = None;
+        // 沙箱 + 有命令 → E3（harness verify 的 product-scenarios gate 执行）。
+        s.command = Some("echo hi".to_string());
+        assert_eq!(evidence_strength(&s), "E3");
+        // 带 E4 夹具 → E4（契约 §3："scenario + fixture，离线可复现"）。
+        s.fixtures = vec!["true".to_string()];
+        assert_eq!(evidence_strength(&s), "E4");
+        s.fixtures = Vec::new();
+        // real-device（requires_root）→ E4（真机/隔离环境）。
+        s.requires_root = true;
+        assert_eq!(evidence_strength(&s), "E4");
+        s.requires_root = false;
+        // 静态契约（无 [when].command）→ E1（仅契约声明，最弱层）。
+        s.command = None;
+        assert_eq!(evidence_strength(&s), "E1");
+    }
+
+    /// 证据分层非法值 fail-safe：拼错/异构声明降级 E1，不得获得比推导
+    /// 更强的强度（与 load_file 拒绝 schema_version != 1 同哲学）。
+    #[test]
+    fn evidence_strength_invalid_value_fails_safe_to_e1() {
+        let mut s = scenario(vec![]);
+        s.command = Some("echo hi".to_string());
+        for bad in ["E9", "e3", "E", "E44", "STRONG", ""] {
+            s.evidence_strength = Some(bad.to_string());
+            assert_eq!(
+                evidence_strength(&s),
+                "E1",
+                "invalid declaration {bad:?} must fail safe to E1"
+            );
+        }
+    }
+
+    /// 证据分层从 toml 解析（契约 §2 的 evidence_strength 字段）。
+    #[test]
+    fn evidence_strength_parsed_from_toml() {
+        let (dir, scenarios) = synthetic_scenario(
+            "ev",
+            "schema_version = 1\nid = \"t.ev\"\nevidence_strength = \"E4\"\n[given]\nfixture = [\"true\"]\n[when]\ncommand = \"echo {\\\"verdict\\\":\\\"PASS\\\"}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(scenarios.len(), 1);
+        assert_eq!(scenarios[0].evidence_strength.as_deref(), Some("E4"));
+        assert_eq!(evidence_strength(&scenarios[0]), "E4");
+        // fixture 场景若未显式声明也会推导到 E4；此处显式优先。
+        assert_eq!(scenario_requires(&scenarios[0]), "sandbox");
+    }
+
+    /// run_gate 的 Gate detail 必须带每个场景的 requires + evidence_strength
+    /// （契约 §3：报告层按分层聚合，而不是只看到 verdict）。
+    #[test]
+    fn run_gate_detail_includes_requires_and_evidence() {
+        let dir = std::env::temp_dir().join(format!("harness-gate-detail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        // 命令经 sh 脚本产出 JSON（裸 echo 在 Windows 的 MSYS2 echo.exe 下
+        // 会丢参数只输出空行；sh 在 Linux 与 Git Bash 下均可用）。
+        let script = dir.join("emit.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' '{\"verdict\":\"PASS\"}'\n",
+        )
+        .expect("write script");
+        let cmd = format!("sh {}", script.display());
+        // 场景 A：沙箱 + 命令 → E3。
+        std::fs::write(
+            dir.join("a.toml"),
+            format!(
+                "schema_version = 1\nid = \"t.a\"\n[when]\ncommand = \"{}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
+                toml_escape(&cmd)
+            ),
+        )
+        .expect("write a.toml");
+        // 场景 B：real-device + 命令 → E4。
+        std::fs::write(
+            dir.join("b.toml"),
+            format!(
+                "schema_version = 1\nid = \"t.b\"\nrequires_root = true\n[when]\ncommand = \"{}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
+                toml_escape(&cmd)
+            ),
+        )
+        .expect("write b.toml");
+        let config = Config {
+            policies_dir: dir.join("policies"),
+            scenarios_dir: dir.clone(),
+            evidence_dir: dir.join("evidence"),
+            crates_dir: dir.join("crates"),
+            engineering_dir: dir.join("engineering"),
+            quality: serde_json::json!({}),
+            portable_core: vec![],
+        };
+        let (results, gate) = run_gate(&config, "product-scenarios", &[""]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(results.len(), 2);
+        assert_eq!(gate.verdict, "PASS", "{}", gate.detail);
+        assert!(gate.detail.contains("t.a: PASS"), "{}", gate.detail);
+        assert!(gate.detail.contains("requires=sandbox"), "{}", gate.detail);
+        assert!(gate.detail.contains("evidence=E3"), "{}", gate.detail);
+        assert!(gate.detail.contains("t.b: PASS"), "{}", gate.detail);
+        assert!(
+            gate.detail.contains("requires=real-device"),
+            "{}",
+            gate.detail
+        );
+        assert!(gate.detail.contains("evidence=E4"), "{}", gate.detail);
+    }
+
     /// 场景包：title / subdir / requires_root 从 toml 解析。
     #[test]
     fn scenario_meta_parsed_from_toml() {
@@ -1090,12 +1288,52 @@ mod tests {
         (dir, scenarios)
     }
 
+    /// TOML 基本字符串转义：Windows 路径的反斜杠是 TOML 转义符，嵌入场景
+    /// TOML 前必须翻倍，否则生成的 toml 在 Windows 上解析失败
+    /// （run_parallel 2026-10-16 真实踩坑）；双引号同样转义。Linux 路径
+    /// 不含这两类字符，等价于无操作。
+    fn toml_escape(s: &str) -> String {
+        s.replace('\\', "\\\\").replace('"', "\\\"")
+    }
+
+    /// 合成"脚本场景"：写一个打印固定 JSON 的 sh 脚本 + 引用它的场景 toml。
+    ///
+    /// 为什么命令经 `sh <script>` 而不是裸 `echo`：Windows 上 PATH 里的
+    /// echo.exe（MSYS2 构建）在非 MSYS 父进程下会丢弃参数、只输出一个空行，
+    /// `echo {"verdict":"PASS"}` 因此产出空 stdout（2026-10-16 实测），场景
+    /// 判定变成 parse 失败。`sh` 在 Linux 与 Git Bash 下均可用（本文件
+    /// `run_command_ignores_stderr_for_scenario_json` 已依赖该模式）。
+    fn synthetic_script_scenario(
+        id: &str,
+        json: &str,
+        expects: &str,
+    ) -> (std::path::PathBuf, Vec<Scenario>) {
+        let dir = std::env::temp_dir().join(format!("harness-single-{id}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let script = dir.join(format!("{id}.sh"));
+        std::fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' '{json}'\n"))
+            .expect("write script");
+        let cmd = format!("sh {}", script.display());
+        std::fs::write(
+            dir.join(format!("{id}.toml")),
+            format!(
+                "schema_version = 1\nid = \"t.{id}\"\n[when]\ncommand = \"{}\"\n{expects}",
+                toml_escape(&cmd)
+            ),
+        )
+        .expect("write toml");
+        let scenarios = load_all(&dir, &[""]);
+        (dir, scenarios)
+    }
+
     /// 场景包：run_single 在合成场景上产出结构化失败签名（expect 失败）。
     #[test]
     fn run_single_expect_failure_signature() {
-        let (dir, scenarios) = synthetic_scenario(
+        let (dir, scenarios) = synthetic_script_scenario(
             "sig",
-            "schema_version = 1\nid = \"t.sig\"\ntitle = \"签名测试\"\n[when]\ncommand = \"echo {\\\"verdict\\\":\\\"PASS\\\"}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"FAIL\"\n",
+            "{\"verdict\":\"PASS\"}",
+            "[[expect]]\nfield = \"verdict\"\nequals = \"FAIL\"\n",
         );
         assert_eq!(scenarios.len(), 1);
         let rep = run_single(&scenarios[0]);
@@ -1151,9 +1389,10 @@ mod tests {
     /// 场景包：run_single 的 PASS 路径（duration_ms 有界、签名为空）。
     #[test]
     fn run_single_pass_report() {
-        let (dir, scenarios) = synthetic_scenario(
+        let (dir, scenarios) = synthetic_script_scenario(
             "ok",
-            "schema_version = 1\nid = \"t.ok\"\n[when]\ncommand = \"echo {\\\"verdict\\\":\\\"PASS\\\"}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
+            "{\"verdict\":\"PASS\"}",
+            "[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
         );
         let rep = run_single(&scenarios[0]);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1223,9 +1462,12 @@ mod tests {
                 )
             };
             std::fs::write(&script, body).expect("write script");
+            // 路径嵌入 TOML 前必须转义反斜杠：Windows 上 `C:\Users\...` 的
+            // `\U` 是 TOML 非法 unicode 转义，六个场景会全部解析失败被跳过。
+            let cmd = format!("sh {}", script.display());
             let toml_body = format!(
-                "schema_version = 1\nid = \"t.par{i}\"\n[when]\ncommand = \"sh {}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
-                script.display()
+                "schema_version = 1\nid = \"t.par{i}\"\n[when]\ncommand = \"{}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
+                toml_escape(&cmd)
             );
             std::fs::write(dir.join(format!("s{i}.toml")), toml_body).expect("write toml");
         }
