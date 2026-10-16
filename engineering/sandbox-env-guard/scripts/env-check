@@ -12,6 +12,7 @@
 #   unknown   探测失败，保守按不支持处理
 # ============================================================================
 import json, shutil, subprocess, os, sys, datetime, platform, re, fnmatch, time, socket
+import fcntl, struct  # TUNSETIFF ioctl 需要
 
 VERBOSE = os.environ.get("VERBOSE") == "1"
 
@@ -20,13 +21,32 @@ VERBOSE = os.environ.get("VERBOSE") == "1"
 DEFAULT_GITHUB_PROXY = "https://v6.gh-proxy.org"
 
 
+class ProbeError(Exception):
+    """探测命令在执行期失败（超时 / 权限 / 操作系统错误），与「二进制不存在」
+    明确区分。调用方据此把对应能力记为 unknown，而非静默吞成 None 误判为可用。
+    """
+
+
 def run_cmd(cmd, *args, timeout=20):
+    """运行命令。
+
+    返回：rc==0 时返回去尾空白的 stdout；否则返回 None。
+    异常：
+      - FileNotFoundError（二进制未安装）→ 返回 None（这是预期的「不存在」，
+        不应触发 unknown，因为能力本身就依赖「装了没」）。
+      - TimeoutExpired / OSError（探测期操作失败）→ 抛 ProbeError，让调用方
+        能把该能力标记为 unknown，杜绝「吞异常 → 静默当可用」的假绿。
+    """
     try:
         r = subprocess.run([cmd, *args], capture_output=True, text=True, timeout=timeout)
-        out = (r.stdout + r.stderr).strip()
-        return out if r.returncode == 0 else None
-    except Exception:
+    except FileNotFoundError:
         return None
+    except subprocess.TimeoutExpired:
+        raise ProbeError(f"{cmd} 超时（>{timeout}s），探测失败")
+    except OSError as e:
+        raise ProbeError(f"{cmd} 执行失败：{e}")
+    out = (r.stdout + r.stderr).strip()
+    return out if r.returncode == 0 else None
 
 
 def has_bin(b):
@@ -38,10 +58,23 @@ def dpkg_ver(pkg):
 
     跨平台要点：Windows 没有 dpkg-query，直接 shell 调用会抛异常被吞成 None，
     但显式短路更清晰，也避免在无 dpkg 的发行版上做无谓调用。
+
+    dpkg-query 存在但运行期抛 ProbeError（如沙箱杀进程）→ 视为无法确定，返回 None。
     """
     if os.name != "posix" or not shutil.which("dpkg-query"):
         return None
-    return run_cmd("dpkg-query", "-W", "-f=${Version}", pkg)
+    try:
+        return run_cmd("dpkg-query", "-W", "-f=${Version}", pkg)
+    except ProbeError:
+        return None
+
+
+def ver(cmd):
+    """安全取版本：命令探测失败（ProbeError）时返回 None 而非崩溃。"""
+    try:
+        return extract_ver(run_cmd(cmd, "--version"))
+    except ProbeError:
+        return None
 
 
 def extract_ver(text):
@@ -60,11 +93,15 @@ def cap(status, **kw):
 def probe_github_proxy():
     """探测「能否经代理访问 GitHub」（用于决定需要拉取外部制品/仓库的测试是否可跑）。
 
+    测试/CI 可用环境变量 SKIP_NETWORK_PROBES=1 跳过真实出网探测，返回 unknown。
+
     状态：
       ok        代理可达且延迟 < 15s（可正常拉取）
       degraded  代理可达但慢（> 15s，仍可用但应降级/限时）
       missing   代理与直连均不可达（应跳过依赖 GitHub 的测试）
     """
+    if os.environ.get("SKIP_NETWORK_PROBES") == "1":
+        return cap("unknown", reason="SKIP_NETWORK_PROBES=1，未实际探测 GitHub 代理可达性")
     proxy = (os.environ.get("GITHUB_PROXY") or DEFAULT_GITHUB_PROXY).rstrip("/")
     target = f"{proxy}/https://raw.githubusercontent.com/jdx/mise/main/README.md"
     t0 = time.time()
@@ -152,6 +189,8 @@ def _tcp_external_ok(timeout=8.0):
 def probe_internet_egress():
     """探测出网能力（真远端类场景所需）。
 
+    测试/CI 可用环境变量 SKIP_NETWORK_PROBES=1 跳过真实出网探测，返回 unknown。
+
     与 TUN 不同：真远端类场景契约是 `equals="PASS"`（严格），环境不具备时
     **硬 FAIL 而非优雅降级**，因此必须由能力门控决定 skip，否则会把"环境限制"
     误记成"代码失败"。
@@ -160,6 +199,8 @@ def probe_internet_egress():
       degraded  仅回环/TCP 可达、出网 UDP 不可达 → 真远端场景会硬 FAIL，应 skip
       missing   连回环 socket 都不可用（极端沙箱）→ 相关场景应 skip
     """
+    if os.environ.get("SKIP_NETWORK_PROBES") == "1":
+        return cap("unknown", reason="SKIP_NETWORK_PROBES=1，未实际探测出网能力")
     loopback_udp = _udp_loopback_ok()
     external_udp, udp_responders = _udp_external_ok()
     external_tcp = _tcp_external_ok()
@@ -177,6 +218,59 @@ def probe_internet_egress():
         return cap("ok", **detail, note="出网 UDP/TCP 均可达，真远端类场景可运行")
     return cap("degraded", **detail,
                note="出网 UDP 不可达（仅回环/TCP）：真远端类场景会硬 FAIL，应 skip 而非记 FAIL")
+
+
+def probe_tun():
+    """探测 TUN 数据面能力（网络/打洞类场景所需）。
+
+    跨平台：Windows 的 TUN 走 wintun.dll，/dev/net/tun 不适用；不做真机断言，
+    交由场景自身的结构化降级（TUN_ERROR / SKIP）契约处理。
+
+    关键改进（dim 3 边界覆盖）：不再只 `os.path.exists("/dev/net/tun")`
+    做"文件存在即 ok"的弱判定——那会在「设备节点存在但当前无法创建 tun」
+    （缺 CAP_NET_ADMIN / SELinux / 容器未授权）时给出**假 ok**。改为真正
+    `open()` 设备并下发 `TUNSETIFF` ioctl 试建一个临时 tun 接口，据此区分：
+
+      ok         能打开且能创建 tun 接口（具备 CAP_NET_ADMIN）
+      degraded   设备节点存在可打开，但 TUNSETIFF 失败（缺特权/受限）→ 降级
+      missing    设备节点根本不存在 → 能力缺失（与 degraded 区分，语义更准）
+
+    设备路径可用环境变量 TUN_DEVICE_PATH 覆盖（默认 /dev/net/tun），便于测试。
+
+    注意：试建的 tun 是非持久接口，close(fd) 后由内核自动回收，不在宿主机
+    留下残留网络接口。
+    """
+    dev = os.environ.get("TUN_DEVICE_PATH", "/dev/net/tun")
+    if os.name != "posix":
+        return cap(
+            "degraded",
+            reason="non-posix host: TUN via wintun, /dev/net/tun not applicable",
+            note="真机 TUN 能力由场景的结构化降级契约自行判定")
+    if not os.path.exists(dev):
+        return cap("missing", reason=f"{dev} 不存在（无 TUN 设备节点），TUN 数据面测试应 skip")
+    # 节点存在：尝试真正打开并创建临时 tun
+    try:
+        fd = os.open(dev, os.O_RDWR)
+    except OSError as e:
+        # 节点在但打不开（权限 / SELinux）：能力存在但不可用
+        return cap("degraded", reason=f"{dev} 存在但 open 失败（权限/SELinux）：{e}",
+                   note="TUN 设备节点存在但当前无权限打开，TUN 数据面测试应降级")
+    try:
+        TUNSETIFF = 0x400454ca  # linux/if_tun.h
+        IFF_TUN = 0x0001
+        IFF_NO_PI = 0x1000
+        # 名称传空 → 由内核分配（如 tun0）；IFF_NO_PI 不带额外协议头
+        req = struct.pack("16sH", b"", IFF_TUN | IFF_NO_PI)
+        iface = fcntl.ioctl(fd, TUNSETIFF, req)
+        name = iface.decode("ascii", "ignore").strip("\x00").strip() or "(内核分配)"
+        return cap("ok", note=f"可创建 tun 接口（{name}），具备 TUN 数据面能力")
+    except OSError as e:
+        # 打开成功但无法创建（典型：缺 CAP_NET_ADMIN）→ 降级而非假 ok
+        return cap("degraded",
+                   reason=f"{dev} 可打开但 TUNSETIFF 失败（通常缺 CAP_NET_ADMIN）：{e}",
+                   note="TUN 设备节点存在但当前无法创建 tun 接口，TUN 数据面测试应降级")
+    finally:
+        os.close(fd)
 
 
 def main():
@@ -201,18 +295,18 @@ def main():
     # ---- toolchain ----
     cargo_cfg = os.path.expanduser("~/.cargo/config.toml")
     report["toolchain"] = {
-        "rust": extract_ver(run_cmd("rustc", "--version")),
-        "cargo": extract_ver(run_cmd("cargo", "--version")),
-        "rustup": extract_ver(run_cmd("rustup", "--version")),
+        "rust": ver("rustc"),
+        "cargo": ver("cargo"),
+        "rustup": ver("rustup"),
         "cargo_mirror": "rsproxy.cn" if os.path.exists(cargo_cfg) else "unknown",
     }
 
     # ---- system libraries ----
     report["libraries"] = {
         "libssl_dev": dpkg_ver("libssl-dev"),
-        "clang": extract_ver(run_cmd("clang", "--version")),
-        "cmake": extract_ver(run_cmd("cmake", "--version")),
-        "pkg_config": run_cmd("pkg-config", "--version"),
+        "clang": ver("clang"),
+        "cmake": ver("cmake"),
+        "pkg_config": ver("pkg-config"),
     }
 
     # ---- capabilities ----
@@ -229,17 +323,9 @@ def main():
     caps["openssh_e2e"] = (cap("ok", detail="sshd available")
                            if sshd_found
                            else cap("missing", need="openssh-server (sshd)"))
-    # 跨平台：/dev/net/tun 只存在于 posix；Windows 的 TUN 走 wintun.dll。
-    # Windows 上不做真机断言，交由场景自身的结构化降级（TUN_ERROR / SKIP）处理。
-    if os.name == "posix":
-        caps["tun_net_admin"] = (cap("ok", note="/dev/net/tun present")
-                                 if os.path.exists("/dev/net/tun")
-                                 else cap("degraded", reason="no /dev/net/tun"))
-    else:
-        caps["tun_net_admin"] = cap(
-            "degraded",
-            reason="non-posix host: TUN via wintun, /dev/net/tun not applicable",
-            note="真机 TUN 能力由场景的结构化降级契约自行判定")
+    # 跨平台：Windows 的 TUN 走 wintun.dll，/dev/net/tun 不适用；
+    # 非 posix 时 probe_tun 内部直接返回 degraded。
+    caps["tun_net_admin"] = probe_tun()
     caps["confidential_transport"] = cap("unsupported",
                                          reason="N3 cross-node confidential channel deferred")
     caps["github_proxy"] = probe_github_proxy()
