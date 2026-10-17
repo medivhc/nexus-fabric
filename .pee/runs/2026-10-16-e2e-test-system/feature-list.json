@@ -2,7 +2,7 @@
   "run_id": "2026-10-16-e2e-test-system",
   "created": "2026-10-16T02:10:00+08:00",
   "branch": "pipeline/2026-10-16-e2e-test-system",
-  "updated": "2026-10-16T21:30:00+08:00",
+  "updated": "2026-10-17T18:20:30+08:00",
   "features": [
     {
       "id": "001-e2e-contract-schema",
@@ -15,21 +15,73 @@
         "engineering/nexus-harness/src/gates.rs"
       ],
       "current_stage": "800",
-      "attempts": { "100": 1, "200": 4, "300": 1, "310": 1 },
+      "attempts": {
+        "100": 1,
+        "200": 4,
+        "300": 1,
+        "310": 1
+      },
       "skipped_reason": null,
       "stages": {
-        "100": { "passes": true, "score": 100, "evidence": { "cmd": "bash gate.sh 100 <repo> 2026-10-16-e2e-test-system", "exit": 0, "artifact": ".pee/runs/2026-10-16-e2e-test-system/logs/100-feature-list-schema.log" }, "commit": "82cc53466127d4a7f5c9b61f086dbba244c6cc4d" },
-        "200": { "passes": true, "score": 92, "evidence": { "cmd": "bash gate.sh 200 <repo> 2026-10-16-e2e-test-system + Evaluator round-4", "exit": 0, "artifact": ".pee/runs/2026-10-16-e2e-test-system/logs/200-contract-present.log" }, "commit": "33c925dceb3c6df078c82f30c1eb544c7bc44e86" },
-        "300": { "passes": true, "score": 95, "evidence": { "cmd": "cargo test -p nexus-harness + clippy + fmt + Evaluator 审查", "exit": 0, "artifact": ".pee/runs/2026-10-16-e2e-test-system/logs/" }, "commit": "76bf36cb7e7358b882d966e2c899f9fa6e259942" },
-        "310": { "passes": true, "score": 98, "evidence": { "cmd": "cargo test -p nexus-harness (77 passed) + Evaluator 审查", "exit": 0, "artifact": ".pee/runs/2026-10-16-e2e-test-system/logs/" }, "commit": "76bf36cb7e7358b882d966e2c899f9fa6e259942" },
-        "800": { "passes": true, "score": 100, "evidence": { "cmd": "Evaluator 汇总报告", "exit": 0, "artifact": ".pee/runs/2026-10-16-e2e-test-system/report.md" }, "commit": "809c3f8a73cee02c9d1796cc24f842da2ab281f1" }
+        "100": {
+          "passes": true,
+          "score": 100,
+          "evidence": {
+            "cmd": "bash gate.sh 100 <repo> 2026-10-16-e2e-test-system",
+            "exit": 0,
+            "artifact": ".pee/runs/2026-10-16-e2e-test-system/logs/100-feature-list-schema.log"
+          },
+          "commit": "82cc53466127d4a7f5c9b61f086dbba244c6cc4d"
+        },
+        "200": {
+          "passes": true,
+          "score": 92,
+          "evidence": {
+            "cmd": "bash gate.sh 200 <repo> 2026-10-16-e2e-test-system + Evaluator round-4",
+            "exit": 0,
+            "artifact": ".pee/runs/2026-10-16-e2e-test-system/logs/200-contract-present.log"
+          },
+          "commit": "33c925dceb3c6df078c82f30c1eb544c7bc44e86"
+        },
+        "300": {
+          "passes": true,
+          "score": 95,
+          "evidence": {
+            "cmd": "cargo test -p nexus-harness + clippy + fmt + Evaluator 审查",
+            "exit": 0,
+            "artifact": ".pee/runs/2026-10-16-e2e-test-system/logs/"
+          },
+          "commit": "76bf36cb7e7358b882d966e2c899f9fa6e259942"
+        },
+        "310": {
+          "passes": true,
+          "score": 98,
+          "evidence": {
+            "cmd": "cargo test -p nexus-harness (77 passed) + Evaluator 审查",
+            "exit": 0,
+            "artifact": ".pee/runs/2026-10-16-e2e-test-system/logs/"
+          },
+          "commit": "76bf36cb7e7358b882d966e2c899f9fa6e259942"
+        },
+        "800": {
+          "passes": true,
+          "score": 100,
+          "evidence": {
+            "cmd": "Evaluator 汇总报告",
+            "exit": 0,
+            "artifact": ".pee/runs/2026-10-16-e2e-test-system/report.md"
+          },
+          "commit": "809c3f8a73cee02c9d1796cc24f842da2ab281f1"
+        }
       }
     },
     {
       "id": "002-e2e-stability-scenarios",
       "title": "E2E 覆盖缺口 P0：persist-recover / idempotency / observe-adapt 三个未覆盖锚点的 E4 场景",
       "priority": "P0",
-      "dependencies": ["001-e2e-contract-schema"],
+      "dependencies": [
+        "001-e2e-contract-schema"
+      ],
       "path_claims": [
         "scenarios/product/persist_recover_scenario.toml",
         "scenarios/product/idempotency_scenario.toml",
@@ -40,18 +92,45 @@
       "attempts": {},
       "skipped_reason": null,
       "stages": {
-        "100": { "passes": false, "score": null, "evidence": null, "commit": null },
-        "200": { "passes": false, "score": null, "evidence": null, "commit": null },
-        "300": { "passes": false, "score": null, "evidence": null, "commit": null },
-        "310": { "passes": false, "score": null, "evidence": null, "commit": null },
-        "700": { "passes": false, "score": null, "evidence": null, "commit": null }
+        "100": {
+          "passes": false,
+          "score": null,
+          "evidence": null,
+          "commit": null
+        },
+        "200": {
+          "passes": false,
+          "score": null,
+          "evidence": null,
+          "commit": null
+        },
+        "300": {
+          "passes": false,
+          "score": null,
+          "evidence": null,
+          "commit": null
+        },
+        "310": {
+          "passes": false,
+          "score": null,
+          "evidence": null,
+          "commit": null
+        },
+        "700": {
+          "passes": false,
+          "score": null,
+          "evidence": null,
+          "commit": null
+        }
       }
     },
     {
       "id": "003-e2e-proxy-scenarios",
       "title": "E2E 覆盖缺口 P1：代理内核 11.x 未覆盖锚点（outbound-tunnel-dataplane / rule-provider / geosite-nex / speedtest / vmess / subscription-update）的 E4 场景",
       "priority": "P1",
-      "dependencies": ["001-e2e-contract-schema"],
+      "dependencies": [
+        "001-e2e-contract-schema"
+      ],
       "path_claims": [
         "scenarios/product/outbound_tunnel_dataplane.toml",
         "scenarios/product/rule_provider_online.toml",
@@ -65,18 +144,46 @@
       "attempts": {},
       "skipped_reason": null,
       "stages": {
-        "100": { "passes": false, "score": null, "evidence": null, "commit": null },
-        "200": { "passes": false, "score": null, "evidence": null, "commit": null },
-        "300": { "passes": false, "score": null, "evidence": null, "commit": null },
-        "310": { "passes": false, "score": null, "evidence": null, "commit": null },
-        "700": { "passes": false, "score": null, "evidence": null, "commit": null }
+        "100": {
+          "passes": false,
+          "score": null,
+          "evidence": null,
+          "commit": null
+        },
+        "200": {
+          "passes": false,
+          "score": null,
+          "evidence": null,
+          "commit": null
+        },
+        "300": {
+          "passes": false,
+          "score": null,
+          "evidence": null,
+          "commit": null
+        },
+        "310": {
+          "passes": false,
+          "score": null,
+          "evidence": null,
+          "commit": null
+        },
+        "700": {
+          "passes": false,
+          "score": null,
+          "evidence": null,
+          "commit": null
+        }
       }
     },
     {
       "id": "004-e2e-acceptance-checklist",
       "title": "E2E 验收清单化：生成 PRODUCT.md 锚点×场景覆盖矩阵 + 可执行验收 todo + verify --full 报告聚合",
       "priority": "P2",
-      "dependencies": ["002-e2e-stability-scenarios", "003-e2e-proxy-scenarios"],
+      "dependencies": [
+        "002-e2e-stability-scenarios",
+        "003-e2e-proxy-scenarios"
+      ],
       "path_claims": [
         "engineering/e2e/coverage_matrix.md",
         "engineering/e2e/acceptance_todo.md",
@@ -84,15 +191,51 @@
         ".evidence/e2e-acceptance/"
       ],
       "current_stage": "100",
-      "attempts": {},
+      "attempts": {
+        "100": 1
+      },
       "skipped_reason": null,
       "stages": {
-        "100": { "passes": false, "score": null, "evidence": null, "commit": null },
-        "200": { "passes": false, "score": null, "evidence": null, "commit": null },
-        "300": { "passes": false, "score": null, "evidence": null, "commit": null },
-        "310": { "passes": false, "score": null, "evidence": null, "commit": null },
-        "700": { "passes": false, "score": null, "evidence": null, "commit": null },
-        "710": { "passes": false, "score": null, "evidence": null, "commit": null }
+        "100": {
+          "passes": true,
+          "score": 100,
+          "evidence": {
+            "cmd": "bash engineering/e2e/generate_coverage.sh",
+            "exit": 0,
+            "artifact": "engineering/e2e/coverage_matrix.md + engineering/e2e/acceptance_todo.md + .evidence/e2e-acceptance/<run>.json"
+          },
+          "commit": "fed8a42"
+        },
+        "200": {
+          "passes": false,
+          "score": null,
+          "evidence": null,
+          "commit": null
+        },
+        "300": {
+          "passes": false,
+          "score": null,
+          "evidence": null,
+          "commit": null
+        },
+        "310": {
+          "passes": false,
+          "score": null,
+          "evidence": null,
+          "commit": null
+        },
+        "700": {
+          "passes": false,
+          "score": null,
+          "evidence": null,
+          "commit": null
+        },
+        "710": {
+          "passes": false,
+          "score": null,
+          "evidence": null,
+          "commit": null
+        }
       }
     }
   ]
