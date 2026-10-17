@@ -2,7 +2,7 @@
   "run_id": "2026-10-16-e2e-test-system",
   "created": "2026-10-16T02:10:00+08:00",
   "branch": "pipeline/2026-10-16-e2e-test-system",
-  "updated": "2026-10-17T18:20:30+08:00",
+  "updated": "2026-10-17T22:20:00+08:00",
   "features": [
     {
       "id": "001-e2e-contract-schema",
@@ -190,9 +190,10 @@
         "engineering/e2e/generate_coverage.sh",
         ".evidence/e2e-acceptance/"
       ],
-      "current_stage": "100",
+      "current_stage": "200",
       "attempts": {
-        "100": 1
+        "100": 1,
+        "200": 1
       },
       "skipped_reason": null,
       "stages": {
@@ -202,15 +203,20 @@
           "evidence": {
             "cmd": "bash engineering/e2e/generate_coverage.sh",
             "exit": 0,
-            "artifact": "engineering/e2e/coverage_matrix.md + engineering/e2e/acceptance_todo.md + .evidence/e2e-acceptance/<run>.json"
+            "artifact": "engineering/e2e/coverage_matrix.md + engineering/e2e/acceptance_todo.md + .evidence/e2e-acceptance/<run>.json",
+            "commit": "eaed1de"
           },
           "commit": "fed8a42"
         },
         "200": {
-          "passes": false,
-          "score": null,
-          "evidence": null,
-          "commit": null
+          "passes": true,
+          "score": 90,
+          "evidence": {
+            "cmd": "bash engineering/e2e/generate_coverage.sh (committed HEAD)",
+            "exit": 0,
+            "artifact": "engineering/e2e/coverage_matrix.md + engineering/e2e/acceptance_todo.md + engineering/e2e/generate_coverage.sh"
+          },
+          "commit": "eaed1de"
         },
         "300": {
           "passes": false,
