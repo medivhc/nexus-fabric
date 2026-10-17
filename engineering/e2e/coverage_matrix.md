@@ -1,7 +1,7 @@
 # E2E 覆盖矩阵（PRODUCT 锚点 × 场景）
 
-生成时间：2026-10-17T18:03:27  run_id=20261017-180326
-场景总数：275（product 子目录：262）  PRODUCT 锚点总数：97
+生成时间：2026-10-17T23:53:56  run_id=20261017-235354
+场景总数：275（product-scenarios 门禁子目录 product+engineering+platform：273）  PRODUCT 锚点总数：97
 
 | PRODUCT 锚点 | 覆盖场景数 | 场景 IDs |
 |---|---:|---|
@@ -29,7 +29,7 @@
 | `12-auto-reconnect` | 1 | product.auto-reconnect |
 | `12-bandwidth-policy` | 1 | product.bandwidth-policy |
 | `12-bandwidth-qos` | 1 | product.bandwidth-qos |
-| `12-bench-gate` | 0 | — 无覆盖 — |
+| `12-bench-gate` | 1 | engineering.bench-gate-verdicts |
 | `12-certificate-manager` | 1 | product.certificate-manager |
 | `12-compression` | 1 | product.compression |
 | `12-config-hot-reload` | 1 | product.config-hot-reload |
@@ -69,7 +69,7 @@
 | `12-nat-probe` | 1 | product.virtual-subnet-nat-probe |
 | `12-node-priority` | 0 | — 无覆盖 — |
 | `12-node-tags` | 1 | product.node-tags |
-| `12-os-assemble` | 0 | — 无覆盖 — |
+| `12-os-assemble` | 1 | platform.os-assemble |
 | `12-perf-benchmark` | 1 | product.performance-benchmark |
 | `12-psk-admission` | 1 | product.psk-handshake-admission |
 | `12-punch-cli` | 2 | product.subnet-punch-cli, product.subnet-punch-status |
@@ -86,14 +86,14 @@
 | `12-tun-dataplane` | 1 | product.tun-dataplane |
 | `12-turn` | 1 | product.turn-relay-allocate |
 | `12-virtual-subnet-networking` | 2 | product.virtual-subnet-encrypted-3node, product.virtual-subnet-tunnel |
-| `13-system-proxy` | 0 | — 无覆盖 — |
+| `13-system-proxy` | 1 | platform.windows-system-proxy |
 | `14-schedule` | 3 | product.schedule-cli, product.schedule-cli-reachable, product.schedule-flow |
 | `15-persist-recover` | 0 | — 无覆盖 — |
 | `16-n2-resource-access` | 12 | product.daemon-run-with-command, product.n2-grant-deny-audit, product.n2-plan-preview, product.n2-provider-offline, product.n2-resource-list, product.n2-resource-publish, product.n2-resource-revoke, product.n2-resource-show, product.n2-session-close, product.n2-session-list, product.n2-session-watch, product.n2-use-loop |
 | `17-n3-task` | 24 | product.fabric-mutual-auth, product.n3-acceptance-crash, product.n3-artifact-integrity, product.n3-artifact-missing, product.n3-artifact-resume, product.n3-authorization, product.n3-cancel-pending, product.n3-cancel-race, product.n3-client-reattach, product.n3-crash-reconcile, product.n3-environment-mismatch, product.n3-gc-roots, product.n3-idempotency-conflict, product.n3-idempotency-expiry, product.n3-idempotency, product.n3-input-integrity, product.n3-localapi-v1-boundary, product.n3-log-limit, product.n3-nonzero-exit, product.n3-path-safety, product.n3-snapshot-immutable, product.n3-submit, product.n3-timeout, product.n3-unsupported-isolation |
 | `9-observability` | 24 | product.cli-compute-jobs, product.cli-connectivity-candidates, product.cli-connectivity-links, product.cli-connectivity-probe, product.cli-diagnose, product.cli-dns-providers, product.cli-dns-resolve, product.cli-workspace-cache, product.cli-workspace-conflicts, product.observability-compute-jobs, product.observability-connectivity-candidates, product.observability-connectivity-links, product.observability-connectivity-probe, product.observability-diagnose, product.observability-dns-cache, product.observability-dns-providers, product.observability-dns-resolve, product.observability-plan-explain, product.observability-session-watch, product.observability-status, product.observability-unsupported, product.observability-workspace-cache, product.observability-workspace-conflicts, product.observability-workspace-heads |
 | `cli` | 1 | product.cli-run-command |
-| `cross-platform` | 0 | — 无覆盖 — |
+| `cross-platform` | 1 | platform.virtual-packet-interface |
 | `devices` | 0 | — 无覆盖 — |
 | `idempotency` | 0 | — 无覆盖 — |
 | `network` | 4 | product.connectivity-carrier-split, product.dns-exit-binding, product.internet-access-flow, product.socks5-handshake |
@@ -101,8 +101,8 @@
 | `remote` | 24 | product.auto-discovery, product.daemon-real-host-auth-denied, product.daemon-real-host-flow, product.daemon-real-relay-flow, product.daemon-rejects-unknown-resource, product.daemon-run-remote-service-flow, product.daemon-run-workspace-flow, product.link-encryption, product.nat-hole-punching, product.relay-fallback, product.remote-compute-job-flow, product.remote-compute-rejected-rollback, product.remote-connectivity-failure-rollback, product.remote-internet-access-flow, product.remote-nat-relay-fallback-flow, product.remote-network-auth-rejected-rollback, product.remote-presence-dynamic-flow, product.remote-presence-expired-rollback, product.remote-presence-network-discovery-flow, product.remote-presence-network-unknown-rollback, product.remote-relay-unavailable-rollback, product.remote-service-access-flow, product.remote-workspace-commit-flow, product.remote-workspace-rejected-rollback |
 | `session` | 2 | product.connectivity-failure-rollback, product.resource-session-lifecycle |
 | `tun-ingress-session-chain` | 1 | product.flow-session-mapping |
-| `workspace` | 1 | product.workspace-offline-merge |
+| `workspace` | 3 | product.workspace-offline-merge, platform.workspace-projection-channels, platform.workspace-projection-fallback |
 
-未映射到任何锚点的 product 场景数：67
+未映射到任何锚点的门禁场景数：72
 
 未映射场景：product.boost-v1, product.bootstrap-join, product.composition-root, product.connectivity-evaluation, product.crash-recovery-boot-reconcile, product.daemon-workspace-mount, product.dataplane-unified, product.discovery-mdns, product.discovery-static, product.dns-unified, product.fabric-conn-basic, product.fabric-conn-roam, product.fabric-egress-basic, product.fabric-egress-domain, product.fabric-egress-real-udp, product.fabric-egress-remote, product.fabric-egress-tcp, product.fabric-path-basic, product.fabric-path-rebind, product.fabric-path-roam, product.fabric-process-qos, product.fabric-projection-basic, product.fabric-projection-roam, product.fabric-semantic-ingress, product.fabric-tun-device, product.fabric-turn-relay, product.fib-forwarding, product.fib-manager-shared, product.multipath, product.multipath-quic-seq, product.n1-connectivity-roam, product.n1-connectivity-roam-realnet, product.n1-wireup, product.n3-10-operator-grant, product.n3-8-foundation-boundary, product.n3-9-artifact-cli, product.node-disjoint, product.pairing, product.path-fallback, product.path-fallback-skip …

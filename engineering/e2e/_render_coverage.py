@@ -3,23 +3,30 @@ list_path, root, run_id = sys.argv[1], sys.argv[2], sys.argv[3]
 root = pathlib.Path(root)
 data = json.loads(pathlib.Path(list_path).read_text(encoding="utf-8"))
 scenarios = data.get("scenarios", [])
+# verify --full 的 product-scenarios 门禁实际执行的子目录，与
+# engineering/nexus-harness/src/commands.rs:295 保持一致。
+# `scenario list` 额外扫到 regression，但它由独立的 regression 门禁执行，
+# 不在 product-scenarios 覆盖范围内，故不计入本覆盖率（避免虚增）。
+GATE_SUBDIRS = ["product", "engineering", "platform"]
+gated = [s for s in scenarios if s.get("subdir") in GATE_SUBDIRS]
 product = [s for s in scenarios if s.get("subdir") == "product"]
 prod_text = (root / "PRODUCT.md").read_text(encoding="utf-8")
 anchors = set(re.findall(r"\{#([a-z0-9-]+)\}", prod_text))
 scenario_anchor = {}
-for toml_path in sorted((root / "scenarios" / "product").glob("*.toml")):
-    try:
-        v = tomllib.loads(toml_path.read_text(encoding="utf-8"))
-    except Exception:
-        continue
-    sid = v.get("id")
-    req = v.get("requirement", "")
-    m = re.search(r"#([a-z0-9-]+)", req)
-    if sid and m:
-        scenario_anchor[sid] = m.group(1)
+for sub in GATE_SUBDIRS:
+    for toml_path in sorted((root / "scenarios" / sub).glob("*.toml")):
+        try:
+            v = tomllib.loads(toml_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        sid = v.get("id")
+        req = v.get("requirement", "")
+        m = re.search(r"#([a-z0-9-]+)", req)
+        if sid and m:
+            scenario_anchor[sid] = m.group(1)
 anchor_to_scn = {a: [] for a in anchors}
 unmapped = []
-for s in product:
+for s in gated:
     a = scenario_anchor.get(s["name"])
     if a in anchor_to_scn:
         anchor_to_scn[a].append(s["name"])
@@ -28,7 +35,7 @@ for s in product:
 out = root / "engineering" / "e2e" / "coverage_matrix.md"
 lines = ["# E2E 覆盖矩阵（PRODUCT 锚点 × 场景）", ""]
 lines.append("生成时间：" + datetime.datetime.now().isoformat(timespec="seconds") + "  run_id=" + run_id)
-lines.append("场景总数：" + str(len(scenarios)) + "（product 子目录：" + str(len(product)) + "）  PRODUCT 锚点总数：" + str(len(anchors)))
+lines.append("场景总数：" + str(len(scenarios)) + "（product-scenarios 门禁子目录 product+engineering+platform：" + str(len(gated)) + "）  PRODUCT 锚点总数：" + str(len(anchors)))
 lines.append("")
 lines.append("| PRODUCT 锚点 | 覆盖场景数 | 场景 IDs |")
 lines.append("|---|---:|---|")
@@ -36,7 +43,7 @@ for a in sorted(anchors):
     scns = anchor_to_scn.get(a, [])
     lines.append("| `" + a + "` | " + str(len(scns)) + " | " + (", ".join(scns) if scns else "— 无覆盖 —") + " |")
 lines.append("")
-lines.append("未映射到任何锚点的 product 场景数：" + str(len(unmapped)))
+lines.append("未映射到任何锚点的门禁场景数：" + str(len(unmapped)))
 if unmapped:
     lines.append("")
     lines.append("未映射场景：" + ", ".join(unmapped[:40]) + (" …" if len(unmapped)>40 else ""))
@@ -52,6 +59,7 @@ for a in zero:
     todo_lines.append("- [ ] `" + a + "` — 需补充 E4 场景或 requirement-change 说明")
 todo.write_text("\n".join(todo_lines) + "\n", encoding="utf-8")
 snap = {"run_id": run_id, "scenario_count": len(scenarios), "product_count": len(product),
+        "gated_count": len(gated), "gate_subdirs": GATE_SUBDIRS,
         "anchor_count": len(anchors), "covered_anchor_count": len(anchors)-len(zero),
         "zero_coverage_anchors": zero, "unmapped_scenario_count": len(unmapped)}
 (root / ".evidence" / "e2e-acceptance" / (run_id + ".json")).write_text(json.dumps(snap, ensure_ascii=False, indent=2), encoding="utf-8")
