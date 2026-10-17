@@ -2,4 +2,4 @@
 2026-10-15T00:00	baseline	sandbox-env-guard	-	79.6	baseline	-	初始基线评估（结构 7 维 + 实测 1 维；实测=7 因零自测）	full_test
 2026-10-15T10:20	85f0509	sandbox-env-guard	79.6	86.0	keep	实测表现/边界覆盖	引入回归测试套件+fixtures：维度8 7->9、维度3 6->7；10 用例全绿	full_test
 2026-10-15T11:30	f19432b	sandbox-env-guard	86.0	87.4	keep	边界覆盖	tun_net_admin 真实 open+TUNSETIFF（missing/degraded/ok 三态）、run_cmd 抛 ProbeError 不再静默吞、SKIP_NETWORK_PROBES；env-check 组件测试加入回归套件（14 用例全绿）	full_test
-2026-10-16T00:00	<r3-commit>	sandbox-env-guard	87.4	89.9	keep	资源整合度	新增 .github/workflows/guard.yml：PR/push(master) 触及 guard 目录时跑回归套件+全流程（SKIP_NETWORK_PROBES 保确定性、mode=scenarios 断言、产物上传+STEP_SUMMARY）；README §11 CI 节	full_test
+2026-10-16T00:00	9a276d5	sandbox-env-guard	87.4	89.9	keep	资源整合度	新增 .github/workflows/guard.yml：PR/push(master) 触及 guard 目录时跑回归套件+全流程（SKIP_NETWORK_PROBES 保确定性、mode=scenarios 断言、产物上传+STEP_SUMMARY）；README §11 CI 节	full_test
