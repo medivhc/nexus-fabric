@@ -41,16 +41,16 @@
   <div class="card" id="card">
     <div class="brand">
       <h1>sandbox-env-guard · 质量评分卡</h1>
-      <span class="date">2026-10-15 · darwin 工作流 Round 2</span>
+      <span class="date">2026-10-16 · darwin 工作流 Round 3</span>
     </div>
     <div class="headline">
-      <div class="score-big">87.4<small> / 100</small></div>
-      <div class="delta">▲ +1.4 vs Round1 86.0</div>
+      <div class="score-big">89.9<small> / 100</small></div>
+      <div class="delta">▲ +2.5 vs Round2 87.4</div>
     </div>
 
     <table>
       <thead>
-        <tr><th>维度</th><th>权重</th><th style="width:240px">Round1 → Round2</th><th class="sc">Δ</th></tr>
+        <tr><th>维度</th><th>权重</th><th style="width:240px">Round2 → Round3</th><th class="sc">Δ</th></tr>
       </thead>
       <tbody>
         <tr><td class="dim">接口契约质量 <span class="wt">#1</span></td><td class="wt">8</td>
@@ -58,13 +58,13 @@
         <tr><td class="dim">流程清晰度 <span class="wt">#2</span></td><td class="wt">12</td>
           <td><div class="bars"><div class="bar before"><i style="width:90%"></i></div><div class="bar after"><i style="width:90%"></i></div></div></td><td class="sc">9→9</td></tr>
         <tr><td class="dim">边界条件覆盖 <span class="wt">#3</span></td><td class="wt">14</td>
-          <td><div class="bars"><div class="bar before"><i style="width:70%"></i></div><div class="bar after"><i style="width:80%"></i></div></div></td><td class="sc up">7→8</td></tr>
+          <td><div class="bars"><div class="bar before"><i style="width:80%"></i></div><div class="bar after"><i style="width:80%"></i></div></div></td><td class="sc">8→8</td></tr>
         <tr><td class="dim">检查点/契约设计 <span class="wt">#4</span></td><td class="wt">10</td>
           <td><div class="bars"><div class="bar before"><i style="width:80%"></i></div><div class="bar after"><i style="width:80%"></i></div></div></td><td class="sc">8→8</td></tr>
         <tr><td class="dim">指令/输出具体性 <span class="wt">#5</span></td><td class="wt">12</td>
           <td><div class="bars"><div class="bar before"><i style="width:100%"></i></div><div class="bar after"><i style="width:100%"></i></div></div></td><td class="sc">10→10</td></tr>
         <tr><td class="dim">资源整合度 <span class="wt">#6</span></td><td class="wt">6</td>
-          <td><div class="bars"><div class="bar before"><i style="width:50%"></i></div><div class="bar after"><i style="width:50%"></i></div></div></td><td class="sc">5→5</td></tr>
+          <td><div class="bars"><div class="bar before"><i style="width:50%"></i></div><div class="bar after"><i style="width:70%"></i></div></div></td><td class="sc up">5→7</td></tr>
         <tr><td class="dim">整体架构 <span class="wt">#7</span></td><td class="wt">13</td>
           <td><div class="bars"><div class="bar before"><i style="width:110%"></i></div><div class="bar after"><i style="width:110%"></i></div></div></td><td class="sc">11→11</td></tr>
         <tr><td class="dim">实测表现 <span class="wt">#8</span></td><td class="wt">25</td>
@@ -73,17 +73,17 @@
     </table>
 
     <div class="improve">
-      <b>Round 2 主要改进（dim 3 边界覆盖）：</b>
+      <b>Round 3 主要改进（dim 6 资源整合度）：</b>
       <ul>
-        <li><code>tun_net_admin</code> 探测从「<code>os.path.exists</code> 存在即 ok」升级为「实际 <code>open()</code> + <code>TUNSETIFF</code> ioctl 试建临时 tun」，区分 <b>missing</b>（无节点）/ <b>degraded</b>（可开不可建，缺 CAP_NET_ADMIN）/ <b>ok</b>（可建），杜绝假 ok。</li>
-        <li><code>run_cmd</code> 探测期异常（超时 / OSError）显式抛 <code>ProbeError</code>，不再静默吞成 <code>None</code> 误判可用；二进制缺失仍返回 <code>None</code>。</li>
-        <li>新增 <code>SKIP_NETWORK_PROBES</code> 让网络探测可确定性跳过（记 <code>unknown</code>，「未探测」≠「缺失」），使 env-check 进入回归套件。</li>
-        <li>回归套件 10→14 用例：覆盖 <code>run_cmd</code> 异常语义与 TUN 三分支。</li>
+        <li>新增 <code>.github/workflows/guard.yml</code>：PR / push(master) 触及 guard 目录时自动跑守卫——<code>guard-tests</code>（14 用例门控契约）+ <code>guard-flow</code>（env-check → harness-select 扫真实 scenarios）。</li>
+        <li>确定性优先：CI 里 <code>SKIP_NETWORK_PROBES=1</code> 跳过出网探测，避免网络能力随 CI 网络抖动导致 test-plan 不稳定。</li>
+        <li><code>mode=scenarios</code> 显式断言 + 产物上传（env-report / test-plan）+ <code>$GITHUB_STEP_SUMMARY</code> 摘要，防止 demo 幻觉悄悄发生。</li>
+        <li>README §11 补齐 CI 节，本地等价命令可直接复现。</li>
       </ul>
     </div>
 
     <div class="foot">
-      <span>棘轮：<b>keep</b> · commit <b>f19432b</b></span>
+      <span>棘轮：<b>keep</b> · commit <b>__R3_COMMIT__</b></span>
       <span>Train your Skills like you train your models · darwin × sandbox-env-guard</span>
     </div>
   </div>
