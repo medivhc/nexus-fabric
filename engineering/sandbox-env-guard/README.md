@@ -356,3 +356,29 @@ rm -f ~/.ssh/gh_push_tmp* ~/.ssh/config
 
 > 该方法依赖 token 具备 `admin:public_key` scope。注册用临时 key、用完即删，
 > 比长期保留 PAT 在 git 配置里更安全。
+
+## 11. CI 集成（guard.yml）
+
+守卫自身也接入 CI（`.github/workflows/guard.yml`），在 PR / push(master) 触及
+`engineering/sandbox-env-guard/**` 时自动运行，防止门控契约被回归破坏：
+
+| job | 内容 |
+|-----|------|
+| `guard-tests` | 跑 `python scripts/run_tests.py`（14 用例门控契约 + 错误路径 + env-check 组件测试），非零退出即 CI 失败 |
+| `guard-flow` | 跑 `env-check`（`SKIP_NETWORK_PROBES=1` 保确定性）→ `harness-select` 扫真实 `scenarios/` → 断言 `mode=scenarios` → 上传 `env-report.json` + `test-plan.json` 作 artifact，并写入 `$GITHUB_STEP_SUMMARY` |
+
+要点：
+- **确定性优先**：CI 里 env-check 用 `SKIP_NETWORK_PROBES=1` 跳过出网探测——否则网络类能力在 ok/degraded/missing 间随 CI 网络抖动跳变，test-plan 不稳定。回归套件本身不依赖真实网络。
+- **mode 断言**：`guard-flow` 显式校验 test-plan 的 `mode == scenarios`，防止「扫到空 → demo 幻觉」或「扫空 → BLOCKED」悄悄发生。
+- Python 用 `actions/setup-python@v5` 锁 3.11（`tomllib` 依赖），不依赖 runner 预装版本。
+
+本地等价（无需 mise / GitHub Actions）：
+
+```bash
+cd engineering/sandbox-env-guard
+python scripts/run_tests.py                                   # guard-tests
+SKIP_NETWORK_PROBES=1 python scripts/env-check                # guard-flow step 1
+python scripts/harness-select --env-report .env-report/env-report.json \
+  --map test-capability-map.toml --scenarios-dir ../../scenarios \
+  --out .env-report/test-plan.json                            # guard-flow step 2
+```

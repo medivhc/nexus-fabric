@@ -77,6 +77,23 @@
 
 ---
 
+## R3 评分（2026-10-16，round 2 后）
+
+| # | 维度 | 分 | 说明 |
+|---|------|----|------|
+| 1 | 接口契约质量 | 7 | 同 R2 |
+| 2 | 流程清晰度 | 9 | 同 R2 |
+| 3 | 边界条件覆盖 | 8 | 同 R2 |
+| 4 | 检查点/契约设计 | 8 | 同 R2 |
+| 5 | 指令/输出具体性 | 10 | CI 写 `$GITHUB_STEP_SUMMARY`（能力矩阵 + test-plan 摘要） |
+| 6 | 资源整合度 | **7** | 新增 `.github/workflows/guard.yml`：mise/guard.ps1/README/CLAUDE.md 之外补齐 CI 层；守卫回归套件与全流程在 PR 自动运行，入口引用从「仅本地」扩展到「本地 + CI」一致 |
+| 7 | 整体架构 | 11 | 同 R2 |
+| 8 | 实测表现 | 9 | 同 R2（CI 已就位，但其描述含 CI，留待后续微轮上调以严格遵循「一轮一维」） |
+
+**R3 总分 = (7×8 + 9×12 + 8×14 + 8×10 + 10×12 + 7×6 + 11×13 + 9×25)/10 = 899/10 = 89.9**（较 R2 +2.5，棘轮成立）
+
+---
+
 ## 优化流程（darwin Phase 0-3 适配）
 
 - **Phase 0**：在 `feat/sandbox-env-guard` 分支工作；初始化 `quality/results.tsv`。
@@ -98,4 +115,5 @@
 
 ## 后续候选轮次（待用户确认先后）
 - ~~**R2（dim 3 边界覆盖）**：`tun_net_admin` 探测从「stat 存在」升级为「实际 open `/dev/net/tun`」，避免设备存在但不可用的假 ok；`env-check` 内 `run_cmd` 异常不再静默吞（探测失败应记 `unknown` 而非沿用默认）。~~ ✅ 已完成（见上）
-- **R3（dim 6/7 集成度）**：新增 `.github/workflows/guard.yml` 在 PR 上跑守卫；`mise.toml` 已加 `[tasks.test]`。
+- ~~**R3（dim 6/7 集成度）**：新增 `.github/workflows/guard.yml` 在 PR 上跑守卫；`mise.toml` 已加 `[tasks.test]`。~~ ✅ 已完成（见上）
+- **R4（dim 1 接口契约，候选）**：`env-check`/`harness-select` 补 `--version`/`--help` 显式化；`mise.toml` 对 `harness-select` 的 exit 2（BLOCKED）给出显式处理而非默认传播。
