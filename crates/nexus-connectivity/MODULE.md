@@ -159,6 +159,8 @@ NAT/中继场景的物理建连（组合根 transport::connect）发生在激活
 
 ### 冻结契约（tunnel 级双向打洞状态机 P4.2，PRODUCT §12.9.3）
 
+> 退役记录（2026-10-18，#1 运行时所有权归一）：本节提及的 `HolePuncher::punch` 已删除；tunnel 级打洞状态机本身（`VirtualSubnetTunnel` + `VirtualSubnetEvent::HolePunch*`）仍在生产使用，未受影响。
+
 - `HolePunchConfig { max_attempts: u32 = 10, attempt_timeout: Duration = 500ms,
   magic: [u8;4] = b"NXHP" }`（默认总预算 ~5s，与 `HolePuncher::punch` 对齐）。
 - `VirtualSubnetTunnel` 新增：
@@ -189,6 +191,8 @@ NAT/中继场景的物理建连（组合根 transport::connect）发生在激活
   打洞 E5。
 
 ### 冻结契约（NAT 类型驱动的路径选择 P4.2，PRODUCT §12.9.4）
+
+> 退役记录（2026-10-18，#1 运行时所有权归一）：本节记载的 `nat_path_decision` / `PathDecision` / `StunClient::detect_nat_type` 已删除；NAT 类型驱动的路径决策现由 `nexusd` 的 `should_punch`（`nat_stun.rs`）与 `nexus-nat-traversal` 承担，`nat.rs` 仅保留 `NatType` 等词汇。
 
 - `nexus-connectivity::nat` 新增纯函数决策表：
   `nat_path_decision(nat_type: NatType) -> PathDecision { Direct | Relay }`：

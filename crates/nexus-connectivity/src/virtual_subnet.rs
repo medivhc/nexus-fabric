@@ -171,14 +171,6 @@ pub(crate) struct PendingPunch {
     pub(crate) attempts: u32,
 }
 
-/// 连通性计划（P4.2 §12.9.4，NAT 类型驱动路径选择的输出）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConnectivityPlan {
-    /// 打洞直连（目标 locator，调用方继续 `begin_hole_punch`）。
-    Direct { target: String },
-    /// 走 relay（TURN 中继 locator，§12.9.2）。
-    Relay { locator: String },
-}
 
 /// 铏氭嫙瀛愮綉缁撴瀯鍖栦簨浠讹紙鐢ㄤ簬鍙娴嬫€у拰閲嶆斁锛夈€?
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,17 +253,6 @@ pub enum VirtualSubnetEvent {
         reason: String,
         /// Candidate target locators attempted (P4.2 §12.9.5).
         targets: Vec<String>,
-    },
-    /// Path decision emitted from NAT-type-driven selection (P4.2 §12.9.4).
-    PathDecided {
-        /// Tunnel ID.
-        tunnel_id: String,
-        /// Peer virtual IP.
-        peer_vip: String,
-        /// Detected NAT type.
-        nat_type: crate::nat::NatType,
-        /// Chosen path decision.
-        decision: crate::nat::PathDecision,
     },
     /// 鏁版嵁鍖呭凡鍙戦€併€?
     PacketSent {
@@ -1205,50 +1186,6 @@ impl VirtualSubnetTunnel {
         }
     }
 
-    /// NAT 类型驱动的路径选择（P4.2 §12.9.4）。
-    ///
-    /// 由决策表（`nat::nat_path_decision`）决定打洞直连还是直达 relay：
-    /// - Direct → `ConnectivityPlan::Direct { target }`（调用方继续
-    ///   `begin_hole_punch`）；
-    /// - Relay → `ConnectivityPlan::Relay { locator }`（取 `relay_locator`
-    ///   配置；未配置 → Err(`RELAY_NOT_CONFIGURED`)）。
-    ///
-    /// 两种决策均发 `PathDecided` 事件（tunnel_id 贯通）。
-    pub fn plan_connectivity(
-        &mut self,
-        peer_virtual_ip: &str,
-        nat_type: crate::nat::NatType,
-        direct_target: &str,
-    ) -> Result<ConnectivityPlan, ConnectivityError> {
-        self.peers
-            .get(peer_virtual_ip)
-            .ok_or_else(|| ConnectivityError::Invalid {
-                message: format!("PEER_NOT_FOUND: peer {peer_virtual_ip} not found"),
-            })?;
-        let decision = crate::nat::nat_path_decision(nat_type);
-        self.events.push(VirtualSubnetEvent::PathDecided {
-            tunnel_id: self.tunnel_id.clone(),
-            peer_vip: peer_virtual_ip.to_string(),
-            nat_type,
-            decision,
-        });
-        match decision {
-            crate::nat::PathDecision::Direct => Ok(ConnectivityPlan::Direct {
-                target: direct_target.to_string(),
-            }),
-            crate::nat::PathDecision::Relay => {
-                if let Some(locator) = self.relay_locators.get(peer_virtual_ip).cloned() {
-                    Ok(ConnectivityPlan::Relay { locator })
-                } else {
-                    Err(ConnectivityError::Invalid {
-                        message: format!(
-                            "RELAY_NOT_CONFIGURED: peer {peer_virtual_ip} has no relay locator"
-                        ),
-                    })
-                }
-            }
-        }
-    }
 
     /// 处理打洞帧（P4.2 §12.9.3）：`ph` 请求 → 学习来源 + 回 `pa` 到来源；
     /// `pa` 确认 → 学习来源 + 若本端发起中（Probing）则落账 Connected。
@@ -2853,148 +2790,6 @@ mod tests {
         // A 无回包（B 未回 pa）
         let r2 = ta.recv_and_deliver(&mut buf, 1000).unwrap();
         assert!(r2.is_none());
-    }
-
-    // ---------- P4.2 §12.9.4 NAT 类型驱动的路径选择 ----------
-
-    #[test]
-    fn test_plan_connectivity_direct_continues_hole_punch() {
-        // RestrictedCone → Direct plan：可继续 begin_hole_punch（打洞流程不受阻）。
-        let config = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
-        let (ca, cb) = MemoryCarrier::connected_pair();
-        let mut ta = VirtualSubnetTunnel::new(config, Box::new(MemoryVpi::new()), Box::new(ca));
-        let mut tb = VirtualSubnetTunnel::new(
-            VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.2"),
-            Box::new(MemoryVpi::new()),
-            Box::new(cb),
-        );
-        ta.add_peer(TunnelPeer::new("10.0.0.2", "mem-b")).unwrap();
-        tb.add_peer(TunnelPeer::new("10.0.0.1", "mem-a")).unwrap();
-
-        let plan = ta
-            .plan_connectivity("10.0.0.2", crate::nat::NatType::RestrictedCone, "mem-b")
-            .unwrap();
-        assert_eq!(
-            plan,
-            ConnectivityPlan::Direct {
-                target: "mem-b".to_string()
-            }
-        );
-        assert!(ta.events().iter().any(|e| matches!(
-            e,
-            VirtualSubnetEvent::PathDecided {
-                peer_vip,
-                nat_type,
-                decision,
-                ..
-            } if peer_vip == "10.0.0.2"
-                && *nat_type == crate::nat::NatType::RestrictedCone
-                && *decision == crate::nat::PathDecision::Direct
-        )));
-
-        // Direct plan 后可继续打洞：完整 ph→pa→Connected
-        ta.begin_hole_punch("10.0.0.2", "mem-b").unwrap();
-        let mut buf = [0u8; 4096];
-        for _ in 0..10 {
-            tb.recv_and_deliver(&mut buf, 1000).unwrap();
-            ta.recv_and_deliver(&mut buf, 1000).unwrap();
-            if ta.peer_state("10.0.0.2") == Some(TunnelState::Connected) {
-                break;
-            }
-            ta.punch_tick("10.0.0.2").unwrap();
-        }
-        assert_eq!(ta.peer_state("10.0.0.2"), Some(TunnelState::Connected));
-    }
-
-    #[test]
-    fn test_plan_connectivity_relay_with_configured_locator() {
-        // Symmetric → Relay plan：直达 relay，不发起打洞。
-        let config = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
-        let carrier = MemoryCarrier::new();
-        let mut tunnel =
-            VirtualSubnetTunnel::new(config, Box::new(MemoryVpi::new()), Box::new(carrier));
-        tunnel
-            .add_peer(TunnelPeer::new("10.0.0.2", "dead"))
-            .unwrap();
-        tunnel.set_relay_locator("10.0.0.2", "relay://relay.example.org:443");
-
-        let plan = tunnel
-            .plan_connectivity(
-                "10.0.0.2",
-                crate::nat::NatType::Symmetric,
-                "udp://127.0.0.1:9",
-            )
-            .unwrap();
-        assert_eq!(
-            plan,
-            ConnectivityPlan::Relay {
-                locator: "relay://relay.example.org:443".to_string()
-            }
-        );
-        assert!(tunnel.events().iter().any(|e| matches!(
-            e,
-            VirtualSubnetEvent::PathDecided {
-                peer_vip,
-                nat_type,
-                decision,
-                ..
-            } if peer_vip == "10.0.0.2"
-                && *nat_type == crate::nat::NatType::Symmetric
-                && *decision == crate::nat::PathDecision::Relay
-        )));
-        // Symmetric 路径不发打洞帧（无 HolePunchStarted）
-        assert!(
-            !tunnel
-                .events()
-                .iter()
-                .any(|e| matches!(e, VirtualSubnetEvent::HolePunchStarted { .. }))
-        );
-    }
-
-    #[test]
-    fn test_plan_connectivity_relay_without_locator_errors() {
-        // Symmetric + 无 relay 配置 → Err(RELAY_NOT_CONFIGURED)。
-        let config = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
-        let carrier = MemoryCarrier::new();
-        let mut tunnel =
-            VirtualSubnetTunnel::new(config, Box::new(MemoryVpi::new()), Box::new(carrier));
-        tunnel
-            .add_peer(TunnelPeer::new("10.0.0.2", "dead"))
-            .unwrap();
-
-        let err = tunnel
-            .plan_connectivity(
-                "10.0.0.2",
-                crate::nat::NatType::Symmetric,
-                "udp://127.0.0.1:9",
-            )
-            .unwrap_err();
-        assert!(err.to_string().contains("RELAY_NOT_CONFIGURED"));
-        // PathDecided 事件仍已发出（决策本身可观测；Err 路径先发事件后返回）
-        assert!(tunnel.events().iter().any(|e| matches!(
-            e,
-            VirtualSubnetEvent::PathDecided {
-                peer_vip,
-                nat_type,
-                decision,
-                ..
-            } if peer_vip == "10.0.0.2"
-                && *nat_type == crate::nat::NatType::Symmetric
-                && *decision == crate::nat::PathDecision::Relay
-        )));
-    }
-
-    #[test]
-    fn test_plan_connectivity_unknown_peer_rejected() {
-        // 未注册 peer → PEER_NOT_FOUND。
-        let config = VirtualSubnetConfig::new("10.0.0.0/24", "10.0.0.1");
-        let carrier = MemoryCarrier::new();
-        let mut tunnel =
-            VirtualSubnetTunnel::new(config, Box::new(MemoryVpi::new()), Box::new(carrier));
-        let err = tunnel
-            .plan_connectivity("10.0.0.99", crate::nat::NatType::FullCone, "x")
-            .unwrap_err();
-        assert!(err.to_string().contains("PEER_NOT_FOUND"));
     }
 
     // ---------- P4.2 §12.9.5 多候选并发打洞 ----------

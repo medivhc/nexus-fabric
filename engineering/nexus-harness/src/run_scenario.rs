@@ -290,9 +290,53 @@ fn run_virtual_subnet_mesh() -> Outcome {
 /// nat.type=RestrictedCone / hole_punch.success=true（假）。现改为确定性编解码自检：
 /// 构造并解析合成 XOR-MAPPED-ADDRESS 响应；不伪造公网映射，真实两 peer 打洞置 deferred。
 fn run_nat_hole_punching() -> Outcome {
-    use nexus_connectivity::nat::codec_self_test;
+    // 离线 STUN 编解码自检（`nexus-turn::stun` 为 canonical codec，
+    // #1 运行时所有权归一后 `nat::codec_self_test` 已退役）：
+    // 构造 Binding Request（20 字节）+ 合成带 XOR-MAPPED-ADDRESS 的
+    // Binding Success Response 并解码；不伪造公网映射。
+    fn self_test() -> Result<(usize, std::net::SocketAddr), String> {
+        use nexus_turn::stun::{Attribute, StunMessage};
+        let txid = [0xABu8; 12];
+        let req = StunMessage {
+            msg_type: 0x0001, // STUN Binding Request
+            txn: txid,
+            attrs: vec![],
+        }
+        .encode();
+        if req.len() != 20 {
+            return Err(format!("request not 20 bytes: {}", req.len()));
+        }
+        // 合成响应（测试夹具，与 nexusd `nat_stun` 单测同构）。
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0x0101u16.to_be_bytes()); // Binding Success Response
+        buf.extend_from_slice(&12u16.to_be_bytes()); // msg len = attr block
+        buf.extend_from_slice(&nexus_turn::stun::MAGIC_COOKIE.to_be_bytes());
+        buf.extend_from_slice(&txid);
+        buf.extend_from_slice(&0x0020u16.to_be_bytes()); // XOR-MAPPED-ADDRESS
+        buf.extend_from_slice(&8u16.to_be_bytes());
+        buf.extend_from_slice(&[0x00, 0x01]); // reserved + family IPv4
+        let xor_port = 54321u16 ^ ((nexus_turn::stun::MAGIC_COOKIE >> 16) as u16);
+        buf.extend_from_slice(&xor_port.to_be_bytes());
+        let xor_ip = u32::from_be_bytes([1, 2, 3, 4]) ^ nexus_turn::stun::MAGIC_COOKIE;
+        buf.extend_from_slice(&xor_ip.to_be_bytes());
 
-    match codec_self_test() {
+        let msg =
+            nexus_turn::stun::decode(&buf).map_err(|e| format!("decode: {e:?}"))?;
+        if msg.msg_type != 0x0101 {
+            return Err(format!("unexpected message type: 0x{:04x}", msg.msg_type));
+        }
+        if msg.txn != txid {
+            return Err("transaction id mismatch".into());
+        }
+        for attr in &msg.attrs {
+            if let Attribute::XorMappedAddress(addr) = attr {
+                return Ok((req.len(), *addr));
+            }
+        }
+        Err("xor-mapped-address not found".into())
+    }
+
+    match self_test() {
         Ok((req_len, parsed)) => (
             "PASS".to_string(),
             "nat-hole-punching: offline STUN codec self-test passed (real punch deferred to P3)"

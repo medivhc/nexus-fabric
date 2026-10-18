@@ -1,4 +1,4 @@
-//! P4.2 E4 驱动：tunnel 级双向打洞状态机（HolePuncher 挂接）——成功直连 / 失败 Relay 回退。
+//! P4.2 E4 驱动：tunnel 级双向打洞状态机——成功直连 / 失败 Relay 回退。
 //!
 //! 单进程双 tunnel（MemoryCarrier 回环）离线确定性驱动：
 //! - 成功路径：A.begin_hole_punch(B) → B 收 `ph` 自动回 `pa` + 学习来源 → A 收 `pa`
