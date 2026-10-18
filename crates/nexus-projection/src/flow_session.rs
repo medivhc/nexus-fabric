@@ -735,8 +735,24 @@ fn listener_loop(shared: Arc<HubShared>) {
                         }
                     })
                     .expect("spawn inbound accept");
-                shared.inbound_conns.lock().unwrap().push(conn);
+                shared.inbound_conns.lock().unwrap().push(conn.clone());
                 shared.threads.lock().unwrap().push(h);
+                // Inbound connections also carry service datagrams (AC2):
+                // pump them with the same R3 dispatch as dialed peers.
+                let shared3 = Arc::clone(&shared);
+                let conn3 = conn;
+                let hd = thread::Builder::new()
+                    .name(format!("flow-dgram-in-{id}"))
+                    .spawn(move || {
+                        while let Ok(d) = conn3.recv_datagram() {
+                            if shared3.shutdown.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            shared3.dispatch_datagram(peer, d);
+                        }
+                    })
+                    .expect("spawn inbound datagram pump");
+                shared.threads.lock().unwrap().push(hd);
             }
             Err(_) => continue,
         }
@@ -942,8 +958,19 @@ mod tests {
         hub_a.dial(peer_b, &[addr_b]).expect("dial");
         let _res = accept_thread.join().expect("accept thread");
 
+        // The driver publishes RTT samples on its pump loop after the
+        // handshake; poll briefly (honest: `Some` only once a sample exists).
+        let mut rtt_seen = false;
+        for _ in 0..100 {
+            let s = hub_a.stats(peer_b).expect("stats for connected peer");
+            if s.rtt_ms.is_some() {
+                rtt_seen = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(rtt_seen, "connected peer must have rtt samples");
         let s = hub_a.stats(peer_b).expect("stats for connected peer");
-        assert!(s.rtt_ms.is_some(), "connected peer must have rtt samples");
         // Unsampled fields stay None (S8: honest).
         assert!(s.loss_rate.is_none());
         assert!(s.jitter_ms.is_none());
