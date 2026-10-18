@@ -15,10 +15,11 @@
 //!    dial 时的代理 tier（#3 fabric-over-proxy，翻墙/中继建链）；
 //! 2. `proxy.yaml` = **TUN 出站经代理**：互联网出口策略
 //!    （Clash 风格规则引擎，管出向流量）；
-//! 3. `daemon.toml [network.turn]`（`TurnSection`）= **TURN+STUN**：
-//!    NAT switching 用（打洞候选与中继分配），与代理无关。
-//! 注：`nexus proxy` CLI 子命令（one-shot SOCKS5/数据面组合根）是
-//! 第三个含义的 "proxy"——本轮仅记录观察项，不处理（OQ4）。
+//! 3. `nexus proxy` CLI 子命令（one-shot SOCKS5/数据面组合根）——
+//!    本轮仅记录观察项，不处理（OQ4）。
+//! 另：`daemon.toml [network.turn]`（`TurnSection`）= **TURN+STUN**：
+//!    NAT switching 用（打洞候选与中继分配），与代理无关
+//!    （常被混淆，特此并列）。
 //!
 //! 热加载分级（见 `watcher.rs`）：
 //! - 热生效：代理规则、peer 列表、DNS 规则等纯数据变更

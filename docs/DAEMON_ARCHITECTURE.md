@@ -68,7 +68,7 @@
 | `proxy.yaml` | **TUN 出站经代理** | 互联网出口策略（Clash 风格） |
 | `daemon.toml [network.turn]` | **TURN+STUN** | NAT switching（与代理无关） |
 
-注：`nexus proxy` CLI 子命令（§4.3）是第三个含义的 "proxy"——本轮仅记录，不处理。
+注：上表第 3 行 `[network.turn]` 与代理无关（仅因常被混淆而并列）；`nexus proxy` CLI 子命令（§4.3）才是第三个 "proxy" 含义——本轮仅记录，不处理。
 
 ### 2.1 `daemon.toml`（可选）
 
