@@ -60,6 +60,16 @@
 
 **优雅降级**：任一文件缺失 = 对应子系统不启用，daemon 正常启动其他子系统。
 
+**三个 "proxy" 的语义区分**（#1 命名澄清；键名不动，与 `config.rs` 模块文档同步）：
+
+| 配置项 | 语义 | 管辖 |
+|--------|------|------|
+| `daemon.toml [network.proxy]` | **N1 建连经代理** | dial 时的代理 tier（#3 fabric-over-proxy） |
+| `proxy.yaml` | **TUN 出站经代理** | 互联网出口策略（Clash 风格） |
+| `daemon.toml [network.turn]` | **TURN+STUN** | NAT switching（与代理无关） |
+
+注：`nexus proxy` CLI 子命令（§4.3）是第三个含义的 "proxy"——本轮仅记录，不处理。
+
 ### 2.1 `daemon.toml`（可选）
 
 ```toml
