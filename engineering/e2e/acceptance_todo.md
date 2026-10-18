@@ -1,8 +1,8 @@
 # E2E 验收 Todo（无覆盖锚点）
 
-生成时间：2026-10-18T16:14:58  run_id=20261018-161449
+生成时间：2026-10-18T17:03:33  run_id=20261018-170312
 
-无 E4 覆盖的锚点数：20 / 97
+无 E4 覆盖的锚点数：20 / 98
 
 - [ ] `11-clash-subscription-parse` — 需补充 E4 场景或 requirement-change 说明
 - [ ] `11-dns-ipcidr` — 需补充 E4 场景或 requirement-change 说明

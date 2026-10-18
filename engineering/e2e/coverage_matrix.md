@@ -1,7 +1,7 @@
 # E2E 覆盖矩阵（PRODUCT 锚点 × 场景）
 
-生成时间：2026-10-18T16:14:58  run_id=20261018-161449
-场景总数：277（product-scenarios 门禁子目录 product+engineering+platform：275）  PRODUCT 锚点总数：97
+生成时间：2026-10-18T17:03:33  run_id=20261018-170312
+场景总数：278（product-scenarios 门禁子目录 product+engineering+platform：276）  PRODUCT 锚点总数：98
 
 | PRODUCT 锚点 | 覆盖场景数 | 场景 IDs |
 |---|---:|---|
@@ -25,6 +25,7 @@
 | `11-trojan-node-config` | 1 | product.proxy-trojan-node-config |
 | `11-trojan-real-tls` | 1 | product.proxy-trojan-real-tls-params |
 | `11-tun-transparent-inbound` | 1 | product.proxy-tun-inbound |
+| `11-vless-dataplane` | 1 | product.proxy-outbound-vless-flow |
 | `11-vmess` | 0 | — 无覆盖 — |
 | `12-auto-reconnect` | 1 | product.auto-reconnect |
 | `12-bandwidth-policy` | 1 | product.bandwidth-policy |
