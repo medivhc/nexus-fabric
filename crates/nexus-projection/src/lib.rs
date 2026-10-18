@@ -16,6 +16,7 @@ pub mod boost;
 pub mod classifier;
 pub mod dns;
 pub mod egress;
+pub mod flow_session;
 pub mod multipath;
 pub mod path_link;
 pub mod process;
@@ -32,6 +33,10 @@ pub use dns::{
 pub use egress::{
     DEFAULT_MAX_NAT_ENTRIES, DomainMatch, DomainRule, EgressNat, FlowKey, NatStats,
     RealEgressStats, RealUdpEgress, Rule, SimpleRuleEngine,
+};
+pub use flow_session::{
+    DatagramHandler, FlowError, FlowSessionHub, MAX_DATAGRAM_PAYLOAD, MAX_STREAM_WRITE, RecvStream,
+    SendStream, StreamHandler,
 };
 /// Re-exported domain types for unified routing (defined in `nexus-domain`,
 /// used — not modified — here).
@@ -62,6 +67,9 @@ pub const INTENT_MESH: u8 = 0x00;
 pub const INTENT_EGRESS: u8 = 0x01;
 /// 3b-5 (S22): TCP byte-stream frames (see `tcp::encode_stream_frame`).
 pub const INTENT_STREAM: u8 = 0x02;
+/// Upper-layer service datagram channel (D4, flow_session): the payload's
+/// second byte is the service sub-id (`u8`); bits 2-5 keep hop semantics.
+pub const INTENT_SERVICE: u8 = 0x03;
 
 /// Encode the intent byte.
 pub fn encode_intent(is_egress: bool, hops: u8) -> u8 {

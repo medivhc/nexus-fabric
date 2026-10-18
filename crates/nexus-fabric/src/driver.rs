@@ -722,6 +722,21 @@ impl Loop {
                     lc.quic
                         .close(Instant::now(), VarInt::from_u32(code), Bytes::from(reason));
                 }
+                // E-3 lesson: local close must unblock blocked readers
+                // (`accept_bi` / `recv_datagram` / `open_bi`) immediately,
+                // otherwise a session layer that joins its pump threads
+                // after `close()` deadlocks. The QUIC close frame alone
+                // only emits `ConnectionLost` after the close timer, which
+                // is too late for synchronous join-based shutdown.
+                if let Some(sh) = self.shared.conns.lock().unwrap().get(&conn) {
+                    let mut st = sh.state.lock().unwrap();
+                    if st.closed.is_none() {
+                        st.closed = Some(FabricError::Closed(code));
+                    }
+                    sh.accepted_cv.notify_all();
+                    sh.dgram_cv.notify_all();
+                    sh.state_cv.notify_all();
+                }
             }
         }
         false

@@ -292,7 +292,7 @@ layer = "delivery"
 
 [[crate]]
 name = "nexus-projection"
-allowed_internal_dependencies = ["nexus-domain", "nexus-fabric", "nexus-ingress", "nexus-path"]
+allowed_internal_dependencies = ["nexus-domain", "nexus-fabric", "nexus-ingress", "nexus-path", "nexus-nat-wireup"]
 portable = false
 layer = "delivery"
 
