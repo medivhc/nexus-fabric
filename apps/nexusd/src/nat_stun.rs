@@ -15,11 +15,6 @@
 //! crate；本模块是 daemon-edge 的 STUN 探测（端口样本时间戳仅用于 Δ 排序，
 //! 无需虚拟时间确定性）。工作区统一 `Clock` 抽象落地后随之迁移。
 //!
-//! # 临时说明（BLOCKED）
-//! `main.rs` 的完整 NAT 接线依赖 `nat_turn.rs`（TURN 客户端依赖尚未获批，
-//! 见实现报告的 BLOCKED 依赖缺口）。本模块已就绪并通过单测，但生产路径
-//! 尚未实例化 `StunProber`，故暂以 `#![allow(dead_code)]` 抑制 dead_code；
-//! 依赖决策后接线时会移除该属性。
 
 #![allow(dead_code)]
 
