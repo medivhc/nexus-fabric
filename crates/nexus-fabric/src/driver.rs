@@ -1255,20 +1255,25 @@ impl Loop {
                 if self.mutual_auth {
                     return;
                 }
-                let sh = match self.live.get_mut(&id) {
-                    Some(lc) => match lc.quic.streams().accept(Dir::Bi) {
-                        Some(qid) => {
-                            let sh = Arc::new(StreamShared::new(id, self.tx.clone()));
-                            lc.streams.insert(qid, sh.clone());
-                            sh
-                        }
-                        None => return,
-                    },
-                    None => return,
-                };
-                if let Some(lc) = self.live.get(&id) {
+                // quinn-proto emits one `Opened` event per direction per poll
+                // batch (a single flag), not one per stream. Drain the whole
+                // accept queue so several streams opened in the same packet
+                // all reach the `accepted` queue (flow-session AC5: 6 streams
+                // in a tight loop must all be delivered).
+                let mut notified = false;
+                while let Some(lc) = self.live.get_mut(&id) {
+                    let Some(qid) = lc.quic.streams().accept(Dir::Bi) else {
+                        break;
+                    };
+                    let sh = Arc::new(StreamShared::new(id, self.tx.clone()));
+                    lc.streams.insert(qid, sh.clone());
                     lc.shared.accepted.lock().unwrap().push_back(sh);
-                    lc.shared.accepted_cv.notify_all();
+                    notified = true;
+                }
+                if notified {
+                    if let Some(lc) = self.live.get(&id) {
+                        lc.shared.accepted_cv.notify_all();
+                    }
                 }
             }
             // Readable/Writable/Finished/Stopped/Available/Datagram*: the pump
