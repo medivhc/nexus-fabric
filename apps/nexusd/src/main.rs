@@ -258,7 +258,7 @@ use nexus_fabric::{Driver, PeerId as FabricPeerId};
 use nexus_nat_traversal::{LocalCandidates, PortSample};
 // C1：权威 fabric 身份来自 daemon 自己的 `network.toml`（`peer_id` = 64-hex
 // ed25519 公钥）；解析发生在组合根，不在 NAT 运行时内部。
-use nexus_network::n1::{config::N1Config, N1PeerId};
+use nexus_network::n1::{N1PeerId, config::N1Config};
 
 use nexusd::assembly;
 use nexusd::config::{self, ConfigDir, LoadedConfig, TurnSection};
@@ -532,7 +532,8 @@ impl NatSwitchRuntime {
     /// - `server2` 为 `Some` 时：双服务器映射对比做 NAT 类型检测
     ///   （`detect_nat_type` 口径），`nat_type` 为真实检测结果；
     /// - `server2` 为 `None` 时：只做单服务器采样，`nat_type` 保持 `Unknown`
-    ///  （如实标记，不做无依据的类型断言）。
+    ///   （如实标记，不做无依据的类型断言）。
+    ///
     /// 每次采样的公网端口追加到 `port_samples` 滚动历史（上限
     /// `MAX_PORT_SAMPLES`），供 D2 有界端口预测做 Δ 稳定性判定。
     fn sample_and_update(
@@ -594,7 +595,8 @@ impl NatSwitchRuntime {
 /// 返回 `(server1, server2)`：
 /// - `server1` = `stun_server`，缺失时回落 `[network.turn].server`；
 /// - `server2` = `stun_server2`，且必须能解析、与 `server1` 不同，否则为 `None`
-///  （此时只做单服务器采样，`nat_type` 保持 `Unknown`）。
+///   （此时只做单服务器采样，`nat_type` 保持 `Unknown`）。
+///
 /// `server1` 本身解析失败 → `None`（STUN 探测整体禁用）。
 fn stun_servers(
     section: &TurnSection,
