@@ -2,8 +2,8 @@
 //!
 //! 职责：
 //! - 单次 STUN Binding 探测（默认 2s 超时，经注入的 `StunTransport` 零网络可测）；
-//! - NAT 类型检测（双服务器公网映射对比：对称 vs 锥型，与
-//!   `nexus_connectivity::nat::StunClient::detect_nat_type` 同口径）；
+//! - NAT 类型检测（双服务器公网映射对比：对称 vs 锥型）；STUN 消息
+//!   编解码经 `nexus-turn::stun` 归一（codec 单一来源）；
 //! - 基于 NAT 类型的打洞分支决策（`should_punch`）；
 //! - 输出 `PortSample` 供 `PunchManager` 的有界端口预测（±16/3s）使用。
 //!
@@ -25,11 +25,12 @@
 
 use std::fmt;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nexus_connectivity::nat::{NatType, StunMapping};
 use nexus_nat_traversal::{DefaultPredictor, PortSample, Predictability, PunchPredictor};
+use nexus_turn::stun::{self, Attribute, StunMessage};
 
 /// 单次 STUN 探测超时（AC4：2s）。
 pub const STUN_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -40,15 +41,6 @@ pub const STUN_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub const BOUNDED_PUNCH_PORT_RADIUS: u16 = 16;
 /// D2 有界端口预测：时间盒（3s）。
 pub const BOUNDED_PUNCH_TIME_WINDOW: Duration = Duration::from_secs(3);
-
-/// STUN Binding Request 消息类型（RFC 5389）。
-const STUN_BINDING_REQUEST: u16 = 0x0001;
-/// STUN Binding Success Response 消息类型。
-const STUN_BINDING_RESPONSE: u16 = 0x0101;
-/// STUN Magic Cookie。
-const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
-/// XOR-MAPPED-ADDRESS 属性类型。
-const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 
 /// STUN 探测错误（类型化，不 panic）。
 #[derive(Debug)]
@@ -171,7 +163,12 @@ impl StunProber {
         timeout: Duration,
     ) -> Result<StunMapping, StunError> {
         let txid = random_transaction_id();
-        let request = build_binding_request(&txid);
+        let request = StunMessage {
+            msg_type: 0x0001, // STUN Binding Request; nexus-turn 未导出该常量
+            txn: txid,
+            attrs: vec![],
+        }
+        .encode();
         let response = self.transport.send_recv(&request, server, timeout)?;
         let public = parse_binding_response(&response, &txid)?;
         let local = self.transport.local_addr()?;
@@ -259,7 +256,10 @@ pub enum PunchDecision {
     Punch,
     /// 本地 Symmetric + Δ 稳定 + 对端 Cone：D2 有界预测打洞
     /// （±16 端口窗口，3s 时间盒，只打对端单一 IP）。
-    BoundedPunch { port_radius: u16, time_window: Duration },
+    BoundedPunch {
+        port_radius: u16,
+        time_window: Duration,
+    },
     /// 其余情况：维持 Relay，不打洞。
     NoPunch,
 }
@@ -292,66 +292,34 @@ fn random_transaction_id() -> [u8; 12] {
     id
 }
 
-/// 构造 STUN Binding Request（20 字节，无属性）。
-fn build_binding_request(txid: &[u8; 12]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(20);
-    msg.extend_from_slice(&STUN_BINDING_REQUEST.to_be_bytes());
-    msg.extend_from_slice(&0u16.to_be_bytes());
-    msg.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
-    msg.extend_from_slice(txid);
-    msg
-}
-
 /// 解析 STUN Binding Success Response，提取 XOR-MAPPED-ADDRESS。
 ///
-/// 校验消息类型、Magic Cookie 与事务 ID（拒绝脏包/迟到包）。
+/// 经 `nexus-turn::stun` 解码；校验消息类型、Magic Cookie 与事务 ID
+/// （拒绝脏包/迟到包）。`stun::decode` 本身不校验 `msg_type`，此处自查
+/// 以保留旧行为；Magic Cookie 由 decode 校验（`DecodeError::BadMagic`→`Parse`）。
 fn parse_binding_response(buf: &[u8], txid: &[u8; 12]) -> Result<SocketAddr, StunError> {
-    if buf.len() < 20 {
-        return Err(StunError::Parse("message too short".into()));
-    }
-    let msg_type = u16::from_be_bytes([buf[0], buf[1]]);
-    if msg_type != STUN_BINDING_RESPONSE {
+    let msg = stun::decode(buf).map_err(|e| StunError::Parse(format!("stun decode: {e:?}")))?;
+    // STUN Binding Success Response（RFC 5389 §7.3.1）；字面量因
+    // nexus-turn 未导出该常量。
+    if msg.msg_type != 0x0101 {
         return Err(StunError::Parse(format!(
-            "unexpected message type: 0x{msg_type:04x}"
+            "unexpected message type: 0x{:04x}",
+            msg.msg_type
         )));
     }
-    let cookie = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-    if cookie != STUN_MAGIC_COOKIE {
-        return Err(StunError::Parse("invalid magic cookie".into()));
-    }
-    if &buf[8..20] != txid {
+    if msg.txn != *txid {
         return Err(StunError::Parse("transaction id mismatch".into()));
     }
-
-    let mut offset = 20;
-    while offset + 4 <= buf.len() {
-        let attr_type = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
-        let attr_len = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]) as usize;
-        offset += 4;
-        if offset + attr_len > buf.len() {
-            break;
-        }
-        if attr_type == ATTR_XOR_MAPPED_ADDRESS {
-            if attr_len < 8 {
-                return Err(StunError::Parse("xor-mapped-address too short".into()));
-            }
-            let family = buf[offset + 1];
-            if family != 0x01 {
+    for attr in &msg.attrs {
+        if let Attribute::XorMappedAddress(addr) = attr {
+            // 旧 codec 只接受 IPv4（family 0x01）；保持行为一致。
+            if !addr.is_ipv4() {
                 return Err(StunError::Parse(
                     "only IPv4 xor-mapped-address supported".into(),
                 ));
             }
-            let port = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]])
-                ^ (STUN_MAGIC_COOKIE >> 16) as u16;
-            let ip = u32::from_be_bytes([
-                buf[offset + 4],
-                buf[offset + 5],
-                buf[offset + 6],
-                buf[offset + 7],
-            ]) ^ STUN_MAGIC_COOKIE;
-            return Ok(SocketAddr::from((Ipv4Addr::from(ip), port)));
+            return Ok(*addr);
         }
-        offset += (attr_len + 3) & !3;
     }
     Err(StunError::Parse("xor-mapped-address not found".into()))
 }
@@ -359,6 +327,7 @@ fn parse_binding_response(buf: &[u8], txid: &[u8; 12]) -> Result<SocketAddr, Stu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     /// 测试用 STUN 传输替身：回显 txid，按顺序返回可配置的公网映射。
     struct MockStunTransport {
@@ -408,26 +377,55 @@ mod tests {
             std::net::IpAddr::V6(_) => u32::from(std::net::Ipv4Addr::new(192, 0, 2, 1)),
         };
         let mut buf = Vec::new();
-        buf.extend_from_slice(&STUN_BINDING_RESPONSE.to_be_bytes());
-        buf.extend_from_slice(&8u16.to_be_bytes());
-        buf.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        buf.extend_from_slice(&0x0101u16.to_be_bytes()); // Binding Success Response
+        buf.extend_from_slice(&12u16.to_be_bytes()); // msg len = attr block (2+2+8); old codec ignored this field
+        buf.extend_from_slice(&stun::MAGIC_COOKIE.to_be_bytes());
         buf.extend_from_slice(txid);
-        buf.extend_from_slice(&ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
+        buf.extend_from_slice(&0x0020u16.to_be_bytes()); // XOR-MAPPED-ADDRESS
         buf.extend_from_slice(&8u16.to_be_bytes());
         buf.extend_from_slice(&[0x00, 0x01]); // reserved + family IPv4
-        let port = public.port() ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
+        let port = public.port() ^ ((stun::MAGIC_COOKIE >> 16) as u16);
         buf.extend_from_slice(&port.to_be_bytes());
-        buf.extend_from_slice(&(ip ^ STUN_MAGIC_COOKIE).to_be_bytes());
+        buf.extend_from_slice(&(ip ^ stun::MAGIC_COOKIE).to_be_bytes());
         buf
     }
 
     #[test]
     fn binding_request_is_20_bytes() {
         let txid = [0x12; 12];
-        let req = build_binding_request(&txid);
+        let req = StunMessage {
+            msg_type: 0x0001, // STUN Binding Request
+            txn: txid,
+            attrs: vec![],
+        }
+        .encode();
         assert_eq!(req.len(), 20);
-        assert_eq!(&req[0..2], &STUN_BINDING_REQUEST.to_be_bytes());
+        assert_eq!(&req[0..2], &0x0001u16.to_be_bytes());
         assert_eq!(&req[8..20], &txid);
+    }
+
+    /// AC1 回归门：`nexus-turn::stun` 编码输出必须与退役前的私有 codec
+    /// 逐字节一致（3 组固定 txid 的 golden vector，删前抓取）。
+    #[test]
+    fn stun_codec_byte_equivalence() {
+        const GOLDEN: [([u8; 12], &str); 3] = [
+            ([0x01; 12], "000100002112a442010101010101010101010101"),
+            ([0xab; 12], "000100002112a442abababababababababababab"),
+            ([0x5c; 12], "000100002112a4425c5c5c5c5c5c5c5c5c5c5c5c"),
+        ];
+        for (txid, hex) in GOLDEN {
+            let got = StunMessage {
+                msg_type: 0x0001,
+                txn: txid,
+                attrs: vec![],
+            }
+            .encode();
+            let want: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            assert_eq!(got, want, "golden mismatch for txid {txid:02x?}");
+        }
     }
 
     #[test]
