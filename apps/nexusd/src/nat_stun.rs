@@ -69,7 +69,7 @@ impl From<io::Error> for StunError {
 /// STUN 传输接缝（真实 UDP 与测试替身构成独立变化维度）。
 ///
 /// Deletion Test：`UdpStunTransport` 需要真实网络，而单测/E4 需要离线确定性
-/// 回环；trait 分离两个维度，与 `nexus_connectivity::turn::TurnTransport` 同构。
+/// 回环；trait 分离两个维度（传输接缝的设计意图：真实实现与测试替身可独立变化）。
 pub trait StunTransport: Send {
     /// 发送请求并等待响应；`timeout` 内无响应 → `StunError::Timeout`。
     fn send_recv(

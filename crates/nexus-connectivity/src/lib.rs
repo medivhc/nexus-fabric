@@ -51,10 +51,6 @@ pub mod bootstrap_server;
 
 pub mod relay;
 
-// ---------- TURN 中继分配（RFC 5766，PRODUCT §12.9.2） ----------
-
-pub mod turn;
-
 // ---------- 链路加密（WireGuard 风格 X25519 + ChaCha20Poly1305） ----------
 
 pub mod encryption;

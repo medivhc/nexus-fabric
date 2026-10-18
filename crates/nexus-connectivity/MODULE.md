@@ -618,6 +618,8 @@ v9 §15.2/§15.3（Connectivity link 范围，`feature/crash-recovery`）：
 
 ### 冻结契约（TURN 中继分配 RFC5766 P2.5，scenarios/product/turn_relay_allocate.toml）
 
+> 退役记录（2026-10-18，#1 运行时所有权归一）：本节记载的 `nexus-connectivity::turn` 模块（919 行）已删除，TURN 中继能力由 `nexus-turn` crate 唯一提供；E4 `turn-relay-allocate` 演示已改走进程内 `TurnServer` + 真实 `TurnClient::allocate`（见 `apps/nexus/src/lib.rs::turn_relay_allocate_flow`）。
+
 - 新模块 `nexus-connectivity::turn`（Portable Core：零真实网络、零新增第三方依赖，可编译 WASI；
   复用 `nat.rs` 的 STUN 基础头：magic cookie 0x2112A442 / 12 字节 transaction id / XOR 地址）。
 - `TurnClientConfig { server, username, password, realm, nonce, lifetime_secs }`：
