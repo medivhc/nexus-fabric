@@ -243,7 +243,9 @@ fn ac3_roam_rebind_keeps_conn_and_data() {
             }
         }
         let digest: [u8; 32] = hasher.finalize().into();
-        let _ = b_result_tx.send(Ok((cid, digest, max_gap)));
+        // AC3: ConnectionId must be unchanged across the path switch.
+        let cid_stable = conn.id() == cid;
+        let _ = b_result_tx.send(Ok((cid, cid_stable, digest, max_gap)));
     });
 
     hub_a.dial(peer_b, &[addr_b]).expect("dial");
@@ -318,12 +320,13 @@ fn ac3_roam_rebind_keeps_conn_and_data() {
     }
 
     write_thread.join().expect("write thread");
-    let (cid, digest, max_gap) = b_result_rx
+    let (cid, cid_stable, digest, max_gap) = b_result_rx
         .recv_timeout(Duration::from_secs(30))
         .expect("B must report the transfer")
         .expect("B read must not error");
     assert_eq!(digest, expected, "payload hash must match after roaming");
     assert!(cid.0 != 0, "ConnectionId must be present");
+    assert!(cid_stable, "ConnectionId must be unchanged across rebind");
     assert!(
         max_gap < Duration::from_secs(5),
         "app-visible pause during rebind must be < 5000 ms, was {max_gap:?}"
