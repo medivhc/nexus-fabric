@@ -1191,6 +1191,7 @@ dependencies = [
  "nexus-session",
  "nexus-storage",
  "nexus-transport",
+ "nexus-turn",
  "nexus-workspace",
  "nexus-workspace-intel",
  "quinn-proto",

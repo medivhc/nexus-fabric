@@ -23,6 +23,7 @@ nexus-planner = { path = "../../crates/nexus-planner" }
 nexus-scheduler = { path = "../../crates/nexus-scheduler" }
 nexus-session = { path = "../../crates/nexus-session" }
 nexus-connectivity = { path = "../../crates/nexus-connectivity" }
+nexus-turn = { path = "../../crates/nexus-turn" }
 nexus-discovery = { path = "../../crates/nexus-discovery" }
 nexus-transport = { path = "../../crates/nexus-transport" }
 nexus-auth = { path = "../../crates/nexus-auth" }
