@@ -240,8 +240,53 @@ def main():
         got = rep["capabilities"]["tun_net_admin"]["status"] if rep else "N/A"
         failures.append(f"[env-check] 普通文件应 degraded（非假 ok），实际 {got}")
 
+    # ---- 6) 接口契约（R4）：--version / --help / 退出码 / guard-plan ----
+    def run_tool(script, *args):
+        return subprocess.run([sys.executable, os.path.join(SCRIPT_DIR, script), *args],
+                              capture_output=True, text=True, timeout=60)
+
+    # 6a) --version：应显式报错版本 + schema，exit 0
+    for tool, name in (("env-check", "env-check"), ("harness-select", "harness-select")):
+        p = run_tool(tool, "--version")
+        if p.returncode != 0 or name not in p.stdout:
+            failures.append(f"[{tool} --version] exit={p.returncode} stdout={p.stdout[:80]!r}")
+        if "schema" not in p.stdout:
+            failures.append(f"[{tool} --version] 输出未含 schema 版本：{p.stdout[:80]!r}")
+
+    # 6b) --help：应列出关键参数，exit 0（env-check 此前无 argparse，根本没有 --help）
+    for tool, expect in (("env-check", "--out-dir"), ("harness-select", "--scenarios-dir")):
+        p = run_tool(tool, "--help")
+        if p.returncode != 0 or expect not in p.stdout:
+            failures.append(f"[{tool} --help] exit={p.returncode}，未列出 {expect}")
+
+    # 6c) guard-plan 退出码显式翻译：坏路径 -> exit 2 且输出 BLOCKED（且不改 0）
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
+        json.dump({"capabilities": caps()}, tf)
+        env_path = tf.name
+    p = subprocess.run(
+        [sys.executable, os.path.join(SCRIPT_DIR, "guard-plan"),
+         "--env-report", env_path, "--map", MAP,
+         "--out", os.path.join(tempfile.gettempdir(), "gp_bad.json"),
+         "--scenarios-dir", "/nonexistent-scenarios-dir"],
+        capture_output=True, text=True, timeout=60)
+    if p.returncode != 2:
+        failures.append(f"[guard-plan BLOCKED] 期望 exit=2（严格透传），实际 {p.returncode}")
+    if "BLOCKED" not in p.stdout:
+        failures.append(f"[guard-plan BLOCKED] 输出未显式标注 BLOCKED：{p.stdout[:120]!r}")
+
+    # 6d) guard-plan 正常路径 -> exit 0 且输出 OK
+    p = subprocess.run(
+        [sys.executable, os.path.join(SCRIPT_DIR, "guard-plan"),
+         "--env-report", env_path, "--map", MAP,
+         "--out", os.path.join(tempfile.gettempdir(), "gp_ok.json"),
+         "--scenarios-dir", SCENARIOS_DIR],
+        capture_output=True, text=True, timeout=60)
+    os.unlink(env_path)
+    if p.returncode != 0 or "OK" not in p.stdout:
+        failures.append(f"[guard-plan OK] exit={p.returncode} stdout={p.stdout[:120]!r}")
+
     # ---- 汇报 ----
-    total = len(FIXTURES) + 2 + 1 + 3  # 门控矩阵 + bad_dir + demo + run_cmd + TUN三分支
+    total = len(FIXTURES) + 2 + 1 + 3 + 6  # 门控矩阵 + bad_dir + demo + run_cmd + TUN三分支 + 接口契约
     passed = total - len(failures)
     print(f"[run_tests] 用例 {total}  通过 {passed}  失败 {len(failures)}")
     for f in failures:

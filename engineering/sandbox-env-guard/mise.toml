@@ -23,15 +23,25 @@
 # 脚本本身是纯 Python，不含 bash 语法，guard.ps1 在 PowerShell 下即可运行，无需 bash。
 [tasks.check-env]
 description = "探测沙箱环境能力，输出结构化 JSON 报告到 stdout 与 .env-report/env-report.json"
-run = "python scripts/env-check"
-env = { ENV_REPORT_DIR = ".env-report" }
+# 显式用 --out-dir（优先于环境变量 ENV_REPORT_DIR），让输出位置在命令行可见。
+# 退出码：0=正常 / 1=无法写出报告（环境状态未知，不得继续）
+run = "python scripts/env-check --out-dir .env-report"
 
 # ---------------------------------------------------------------------------
 # 任务：测试筛选（harness 消费入口）
 # ---------------------------------------------------------------------------
+# 经 scripts/guard-plan 包装：把 harness-select 的退出码显式翻译成可判定结论，
+# 避免调用方（agent/CI）把 BLOCKED 与「脚本崩溃」混为一谈。退出码严格透传。
+#
+# 退出码契约（显式说明，非默认传播）：
+#   0   OK      test-plan 已产出（.env-report/test-plan.json）
+#   1   ERROR   参数或 IO 错误：map / env-report 缺失或不可解析
+#   2   BLOCKED --scenarios-dir 下未发现任何 scenario toml，守卫拒绝产出
+#               test-plan（绝不降级为「用 map pattern 冒充测试 id」）。
+#               处置：修正 --scenarios-dir 路径；不得为变绿削弱 map / gate。
 [tasks.test-plan]
 description = "依据环境能力矩阵筛选本次应运行的测试，输出 .env-report/test-plan.json"
-run = "python scripts/harness-select --env-report .env-report/env-report.json --map test-capability-map.toml --scenarios-dir samples/scenarios"
+run = "python scripts/guard-plan --env-report .env-report/env-report.json --map test-capability-map.toml --out .env-report/test-plan.json --scenarios-dir samples/scenarios"
 
 # ---------------------------------------------------------------------------
 # 组合任务：完整守卫流程

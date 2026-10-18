@@ -3,7 +3,18 @@
 # env-check — 沙箱环境能力探测
 # ----------------------------------------------------------------------------
 # 探测维度：host / toolchain / system-libraries / capabilities
-# 输出：JSON 到 stdout；同时写入 $ENV_REPORT_DIR/env-report.json（默认 .env-report）
+# 输出：JSON 到 stdout；同时写入 <out-dir>/env-report.json（默认 .env-report）
+#
+# CLI：
+#   python scripts/env-check [--out-dir DIR] [--version] [--help]
+#   --out-dir 优先于环境变量 ENV_REPORT_DIR（显式参数 > 环境变量）
+#
+# 退出码（接口契约，供 harness / CI 判定）：
+#   0   正常：已探测并写出 env-report.json
+#   1   异常：无法写出报告（目录不可写 / IO 错误）——环境状态未知，不得继续
+#   2   未使用（保留给 BLOCKED 语义，与 harness-select 对齐；env-check 本身
+#       不做「拒绝产出」判定，探测失败一律记为 capability.status=unknown）
+#
 # capability.status 取值：
 #   ok        环境满足，对应测试可运行
 #   unsupported  宿主/平台根本不具备（如 linux 沙箱不支持 windows executor）
@@ -12,7 +23,13 @@
 #   unknown   探测失败，保守按不支持处理
 # ============================================================================
 import json, shutil, subprocess, os, sys, datetime, platform, re, fnmatch, time, socket
+import argparse
 import fcntl, struct  # TUNSETIFF ioctl 需要
+
+# 工具版本（--version 输出）与产物 schema 版本（写入 JSON 的 schema_version）。
+# 二者分离：工具迭代不一定改 schema；下游应校验 schema_version 而非工具版本。
+VERSION = "1.0"
+SCHEMA_VERSION = "1"
 
 VERBOSE = os.environ.get("VERBOSE") == "1"
 
@@ -274,9 +291,19 @@ def probe_tun():
 
 
 def main():
+    ap = argparse.ArgumentParser(
+        prog="env-check",
+        description="沙箱环境能力探测：产出结构化 env-report.json（给 harness-select 消费）",
+        epilog="退出码：0=正常 / 1=无法写出报告 / 2=未使用（保留 BLOCKED 语义）")
+    ap.add_argument("--out-dir", default=None,
+                    help="报告输出目录（优先于环境变量 ENV_REPORT_DIR；默认 .env-report）")
+    ap.add_argument("--version", action="version",
+                    version=f"env-check {VERSION} (schema {SCHEMA_VERSION})")
+    args = ap.parse_args()
+
     report = {
-        "schema_version": "1",
-        "generator": "sandbox-env-guard",
+        "schema_version": SCHEMA_VERSION,
+        "generator": f"sandbox-env-guard/env-check {VERSION}",
         "checked_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
 
@@ -340,11 +367,18 @@ def main():
     report["degraded_capabilities"] = [k for k, v in caps.items() if v["status"] == "degraded"]
 
     # ---- 写出 ----
-    out_dir = os.environ.get("ENV_REPORT_DIR", ".env-report")
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, "env-report.json")
-    with open(out_path, "w") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
+    # 显式参数 --out-dir 优先于环境变量 ENV_REPORT_DIR
+    out_dir = args.out_dir or os.environ.get("ENV_REPORT_DIR", ".env-report")
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, "env-report.json")
+        with open(out_path, "w") as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+    except OSError as e:
+        # 退出码契约：写不出报告 = 环境状态未知，必须显式失败（exit 1），
+        # 不能静默继续——否则下游会拿着旧报告做门控判断。
+        sys.stderr.write(f"[env-check] ERROR 无法写出报告到 {out_dir}：{e}\n")
+        sys.exit(1)
     print(json.dumps(report, indent=2, ensure_ascii=False))
     if VERBOSE:
         sys.stderr.write(f"[env-check] wrote {out_path}\n")

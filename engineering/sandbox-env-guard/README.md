@@ -42,10 +42,37 @@ agent 进入沙箱
 | `scripts/env-check` | 能力探测（host/toolchain/libs/capabilities）→ 结构化 JSON |
 | `scripts/env-report.schema.json` | env-report 的 JSON Schema（harness 可校验） |
 | `scripts/harness-select` | 读能力矩阵 + 映射表，输出应运行/应跳过测试清单 |
+| `scripts/guard-plan` | `harness-select` 的退出码显式包装（供 mise/CI 调用，退出码严格透传） |
+| `scripts/run_tests.py` | 守卫自回归套件（门控矩阵 + 错误路径 + env-check 组件 + 接口契约） |
+| `scripts/git-push-via-ssh443` | 沙箱内推送（一次性 SSH key 经 api 注册 → 走 443 → 自动清理） |
 | `test-capability-map.toml` | **测试 → 所需 capability** 映射（维护入口，无需改代码） |
 | `samples/scenarios/*.toml` | 演示用 scenario（id 命中不同映射分支） |
 | `.env-report/env-report.json` | 探测产物（运行后生成） |
 | `.env-report/test-plan.json` | 筛选产物（运行后生成，harness 读取） |
+
+### 2.1 CLI 与退出码契约（接口契约，供 harness / CI 判定）
+
+| 命令 | 退出码 | 含义 |
+|------|--------|------|
+| `env-check` | `0` | 正常：已探测并写出 `env-report.json` |
+| `env-check` | `1` | 无法写出报告（目录不可写 / IO 错误）→ 环境状态未知，**不得继续** |
+| `env-check` | `2` | 未使用（保留 BLOCKED 语义，与 harness-select 对齐） |
+| `harness-select` | `0` | 正常：已产出 test-plan（`mode=scenarios` 或 `demo`） |
+| `harness-select` | `1` | 参数 / IO 错误：map 或 env-report 缺失、不可解析 |
+| `harness-select` | `2` | **BLOCKED**：`--scenarios-dir` 下无 scenario toml → 拒绝产出 test-plan（绝不降级为「用 map pattern 冒充测试 id」） |
+| `run_tests.py` | `0` / `1` | 全绿 / 有用例失败 |
+
+两个脚本均支持 `--version` 与 `--help`：
+
+```bash
+python scripts/env-check --version        # env-check 1.0 (schema 1)
+python scripts/harness-select --version   # harness-select 1.0 (schema 1)
+python scripts/env-check --help           # 含退出码说明
+python scripts/env-check --out-dir DIR    # 显式输出目录（优先于环境变量 ENV_REPORT_DIR）
+```
+
+> `--version` 输出**工具版本**与**产物 schema 版本**两个值。二者分离：工具迭代不一定改
+> schema，下游应校验 `schema_version` 而非工具版本。
 
 ---
 

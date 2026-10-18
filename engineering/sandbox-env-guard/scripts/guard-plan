@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+# ============================================================================
+# guard-plan — harness-select 的显式退出码包装（供 mise task / CI 调用）
+# ----------------------------------------------------------------------------
+# 为什么需要这一层（dim 1 接口契约）：
+#   harness-select 本身已按契约 exit 2 = BLOCKED 并打印诊断。但调用方
+#   （mise task / agent / CI）直接拿到的只是一个非零退出码——无法区分
+#   「BLOCKED（守卫**正确**拒绝产出，属预期行为）」与「脚本崩溃（真 bug）」。
+#   本包装把退出码显式翻译成一行可判定结论，让调用方无需解析 stderr 即可判定。
+#
+# 关键红线：退出码**严格透传**。绝不把 BLOCKED(2) 映射成 0——那等于让守卫的
+#   「拒绝静默降级」契约在最外层失效。
+#
+# 退出码（与 harness-select 完全一致）：
+#   0   正常：test-plan 已产出
+#   1   参数/IO 错误：map 或 env-report 缺失、不可解析
+#   2   BLOCKED：--scenarios-dir 下未发现任何 scenario toml，拒绝产出 test-plan
+# ============================================================================
+import subprocess, sys, os
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+HARNESS = os.path.join(SCRIPT_DIR, "harness-select")
+
+
+def main():
+    # 参数原样透传给 harness-select（stdin/stderr 不捕获，诊断直接流向调用方）
+    r = subprocess.run([sys.executable, HARNESS, *sys.argv[1:]])
+    code = r.returncode
+    if code == 0:
+        print("[guard-plan] OK：test-plan 已产出")
+    elif code == 2:
+        print("[guard-plan] BLOCKED：守卫拒绝产出 test-plan（诊断见上方 stderr）")
+        print("[guard-plan] 处置：修正 --scenarios-dir 路径后重试；"
+              "不得为让它变绿而削弱 map / gate（应返回 BLOCKED）。")
+    elif code == 1:
+        print("[guard-plan] ERROR：参数或 IO 错误（详见上方 stderr）")
+    else:
+        print(f"[guard-plan] ERROR：harness-select 异常退出 code={code}")
+    sys.exit(code)
+
+
+if __name__ == "__main__":
+    main()
