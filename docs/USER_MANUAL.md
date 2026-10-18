@@ -178,7 +178,7 @@ cargo build --workspace
 | 32 | Windows VPI 能力声明（wintun）                                | `platform.virtual-packet-interface` (10)                                                                                                                                                    | `nexus-platform-host vpi-capabilities --json`               |
 | 33 | 虚拟子网隧道（Virtual Subnet）                                  | `product.virtual-subnet-tunnel` (7)                                                                                                                                                         | example / SDK                                               |
 | 34 | 三节点虚拟子网静态路由（mesh）                                       | `product.virtual-subnet-mesh-3node` (10)                                                                                                                                                    | `nexus-harness run virtual-subnet-mesh --json` / SDK        |
-| 35 | NAT 打洞（STUN + UDP 打洞）                                   | `product.nat-hole-punching` (6)                                                                                                                                                       | example / SDK                                               |
+| 35 | NAT 打洞（STUN + UDP 打洞）                                   | `nat-hole-punching`（harness 驱动；product TOML 已随 AC2 退役）                                                                                                                                                       | `nexus-harness run nat-hole-punching --json` / SDK |
 | 36 | Proxy 节点测速（tcp /http204）                                | `proxy-speedtest` (8) / `proxy-speedtest-loopback` (6) / `proxy-speedtest-http204` (8) / `proxy-speedtest-http204-bad-status` (5) / `proxy-speedtest-http204-loopback` (6)                  | `nexus proxy speedtest --json` / example                   |
 | 37 | Proxy 规则路由内核                                            | `proxy-*` 场景族（见 §4.1.10）                                                                                                                                                                    | `nexus proxy --addr <ip:port> [--config <path>]` / example |
 | 38 | 出站适配器（SS / VMess / Trojan）                              | `proxy-*-adapter` 等 8 场景（见 §4.1.10）                                                                                                                                                         | example                                                     |
@@ -316,11 +316,11 @@ cargo build --workspace
 * **用户用法**：
 
 
-  * example：`cargo run --quiet -p nexus --example nat_hole_punching -- --json`（可运行，输出 PASS JSON）
+  * harness：`nexus-harness run nat-hole-punching --json`（离线确定性编解码自检，输出 PASS/FAIL JSON；真实跨主机打洞 P3 deferred）
 
-  * SDK：`nexus_connectivity::nat::StunClient` / `nexus_connectivity::nat::HolePuncher`
+  * SDK：`nexus_connectivity::nat::{NatEvent, NatType, StunMapping}`（canonical codec：`nexus_turn::stun`；`StunClient`/`HolePuncher` 已随 #1 退役）
 
-* **代码级校验**：场景 `product.nat-hole-punching`（6 期望：verdict PASS、local/public mapping 非空、NAT 类型 RestrictedCone、打洞成功、RTT 非空）→ PASS（2026-09-20 修复非法 TOML 后进入门禁求值）；驱动 example 可运行；单元测试 7 项。真实 STUN 服务器集成测试待完善。
+* **代码级校验**：`nexus-harness run nat-hole-punching` → PASS（2026-10-18：RFC5389 Binding Request 构造 + XOR-MAPPED-ADDRESS 解析确定性自检）；单元测试 `cargo test -p nexusd nat_stun` 12/12。真实 STUN 服务器集成测试待完善。
 
 #### 4.1.9 Proxy 节点测速（tcp /http204，§11.10）
 
