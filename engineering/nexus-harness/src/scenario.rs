@@ -19,6 +19,12 @@ pub enum ExpectKind {
     Equals(Value),
     OneOf(Vec<Value>),
     NonEmpty,
+    /// 「字段缺失或为 JSON null」。TOML 没有 null 字面量，
+    /// `equals = null` 会直接让整个文件解析失败而被静默跳过
+    /// （node_priority / traffic_stats 两个场景即此故障，2026-10-18）。
+    /// 断言"返回 None"这类语义必须用 `absent = true` 表达，
+    /// 不得因缺少表达手段而删掉断言。
+    Absent,
 }
 
 #[derive(Clone)]
@@ -127,6 +133,8 @@ fn load_file(path: &PathBuf, subdir: &str) -> Result<Scenario, String> {
                         ExpectKind::OneOf(list.iter().map(toml_value_to_json).collect())
                     } else if e.get("non_empty").and_then(toml::Value::as_bool) == Some(true) {
                         ExpectKind::NonEmpty
+                    } else if e.get("absent").and_then(toml::Value::as_bool) == Some(true) {
+                        ExpectKind::Absent
                     } else {
                         return None;
                     };
@@ -286,6 +294,8 @@ fn evaluate(scenario: &Scenario, output: &Value) -> Result<(), ExpectFailure> {
                 Value::Null => false,
                 _ => true,
             }),
+            // 缺失（None）或显式 null 都算满足；其它一律失败。
+            ExpectKind::Absent => matches!(actual, None | Some(Value::Null)),
         };
         if !ok {
             return Err(ExpectFailure {
@@ -914,6 +924,53 @@ mod tests {
             kind: ExpectKind::Equals(json!(1)),
         }]);
         assert!(evaluate(&s, &json!({"schema_version": 1})).is_ok());
+    }
+
+    /// 回归：TOML 无 null 字面量，`equals = null` 曾让 node_priority /
+    /// traffic_stats 两个场景文件整体解析失败被静默跳过（2026-10-18 审计发现）。
+    /// `absent = true` 必须同时接受「字段缺失」与「显式 JSON null」，
+    /// 且不得接受任何其它值。
+    #[test]
+    fn evaluate_absent_accepts_missing_and_null_only() {
+        let s = scenario(vec![ScenarioExpect {
+            path: "empty_candidates.selected_node_id".to_string(),
+            kind: ExpectKind::Absent,
+        }]);
+        // 字段缺失 → 满足
+        assert!(evaluate(&s, &json!({"empty_candidates": {}})).is_ok());
+        // 显式 null → 满足
+        assert!(evaluate(&s, &json!({"empty_candidates": {"selected_node_id": null}})).is_ok());
+        // 整条父路径缺失 → 满足
+        assert!(evaluate(&s, &json!({})).is_ok());
+        // 有值 → 失败，且失败签名带上实际值便于取证
+        let err = evaluate(
+            &s,
+            &json!({"empty_candidates": {"selected_node_id": "node-1"}}),
+        )
+        .unwrap_err();
+        assert_eq!(err.path, "empty_candidates.selected_node_id");
+        assert_eq!(err.actual, "\"node-1\"");
+        // 空串 / 0 都不算 absent
+        assert!(evaluate(&s, &json!({"empty_candidates": {"selected_node_id": ""}})).is_err());
+    }
+
+    /// 回归：`absent = true` 的 TOML 形态必须能被 load_file 解析出来
+    ///（否则与 `equals = null` 一样是静默跳过）。
+    #[test]
+    fn load_parses_absent_expect() {
+        let dir = std::env::temp_dir().join(format!("harness-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        std::fs::write(
+            dir.join("s.toml"),
+            "schema_version = 1\nid = \"t.absent\"\n[when]\ncommand = \"{}\"\n[[expect]]\nfield = \"a.b\"\nabsent = true\n",
+        )
+        .expect("write toml");
+        let loaded = load_file(&dir.join("s.toml"), "product").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(loaded.expects.len(), 1);
+        assert_eq!(loaded.expects[0].path, "a.b");
+        assert!(matches!(loaded.expects[0].kind, ExpectKind::Absent));
     }
 
     /// 回归：数组 equals 期望必须按数组比较，不能静默变成 Null 永远判 FAIL

@@ -2,7 +2,7 @@
   "run_id": "2026-10-16-e2e-test-system",
   "created": "2026-10-16T02:10:00+08:00",
   "branch": "pipeline/2026-10-16-e2e-test-system",
-  "updated": "2026-10-17T22:20:00+08:00",
+  "updated": "2026-10-17T23:35:00+08:00",
   "features": [
     {
       "id": "001-e2e-contract-schema",
@@ -83,25 +83,37 @@
         "001-e2e-contract-schema"
       ],
       "path_claims": [
-        "scenarios/product/persist_recover_scenario.toml",
-        "scenarios/product/idempotency_scenario.toml",
-        "scenarios/product/observe_adapt_scenario.toml",
+        "scenarios/regression/crash_recovery.toml",
+        "scenarios/product/crash_recovery_boot_reconcile.toml",
+        "scenarios/product/schedule_flow.toml",
+        "scenarios/product/n3-idempotency.toml",
         ".evidence/red-e2e-p0-scenarios/"
       ],
-      "current_stage": "100",
-      "attempts": {},
+      "current_stage": "200",
+      "attempts": {
+        "100": 1,
+        "200": 1
+      },
       "skipped_reason": null,
       "stages": {
         "100": {
-          "passes": false,
-          "score": null,
-          "evidence": null,
+          "passes": true,
+          "score": 95,
+          "evidence": {
+            "cmd": "只读覆盖审计：锚点->场景->example 语义映射",
+            "exit": 0,
+            "artifact": "engineering/e2e/coverage_audit.md"
+          },
           "commit": null
         },
         "200": {
-          "passes": false,
-          "score": null,
-          "evidence": null,
+          "passes": true,
+          "score": 88,
+          "evidence": {
+            "cmd": "等价场景实跑：regression.crash-recovery PASS(7.9s)；idempotency/observe-adapt 仅部分侧有覆盖",
+            "exit": 0,
+            "artifact": "engineering/e2e/coverage_audit.md"
+          },
           "commit": null
         },
         "300": {
@@ -132,28 +144,41 @@
         "001-e2e-contract-schema"
       ],
       "path_claims": [
-        "scenarios/product/outbound_tunnel_dataplane.toml",
-        "scenarios/product/rule_provider_online.toml",
-        "scenarios/product/geosite_nex_format.toml",
-        "scenarios/product/speedtest_loopback.toml",
-        "scenarios/product/vmess_adapter.toml",
-        "scenarios/product/subscription_online_update.toml",
-        ".evidence/red-e2e-p1-scenarios/"
+        "scenarios/product/proxy_outbound_shadowsocks_flow.toml",
+        "scenarios/product/proxy_outbound_trojan_flow.toml",
+        "scenarios/product/proxy_rule_provider_fetch.toml",
+        "scenarios/product/proxy_rule_provider_fetch_https.toml",
+        "scenarios/product/geosite_nex_roundtrip.toml",
+        "scenarios/product/proxy_speedtest_loopback.toml",
+        "scenarios/product/proxy_speedtest_http204_loopback.toml",
+        "scenarios/product/proxy_vmess_adapter.toml",
+        "scenarios/product/proxy_subscription_online_update.toml"
       ],
-      "current_stage": "100",
-      "attempts": {},
+      "current_stage": "200",
+      "attempts": {
+        "100": 1,
+        "200": 1
+      },
       "skipped_reason": null,
       "stages": {
         "100": {
-          "passes": false,
-          "score": null,
-          "evidence": null,
+          "passes": true,
+          "score": 95,
+          "evidence": {
+            "cmd": "只读覆盖审计：6 个计划文件的等价实现核对",
+            "exit": 0,
+            "artifact": "engineering/e2e/coverage_audit.md"
+          },
           "commit": null
         },
         "200": {
-          "passes": false,
-          "score": null,
-          "evidence": null,
+          "passes": true,
+          "score": 90,
+          "evidence": {
+            "cmd": "9 个等价 example 全部构建通过 + 实跑 PASS",
+            "exit": 0,
+            "artifact": "engineering/e2e/coverage_audit.md"
+          },
           "commit": null
         },
         "300": {

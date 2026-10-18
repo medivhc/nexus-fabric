@@ -1,7 +1,7 @@
 # E2E 覆盖矩阵（PRODUCT 锚点 × 场景）
 
-生成时间：2026-10-17T23:53:56  run_id=20261017-235354
-场景总数：275（product-scenarios 门禁子目录 product+engineering+platform：273）  PRODUCT 锚点总数：97
+生成时间：2026-10-18T16:14:58  run_id=20261018-161449
+场景总数：277（product-scenarios 门禁子目录 product+engineering+platform：275）  PRODUCT 锚点总数：97
 
 | PRODUCT 锚点 | 覆盖场景数 | 场景 IDs |
 |---|---:|---|
@@ -67,7 +67,7 @@
 | `12-multihop-routing` | 1 | product.multihop-routing |
 | `12-nat-path` | 1 | product.path-decision |
 | `12-nat-probe` | 1 | product.virtual-subnet-nat-probe |
-| `12-node-priority` | 0 | — 无覆盖 — |
+| `12-node-priority` | 1 | product.node-priority |
 | `12-node-tags` | 1 | product.node-tags |
 | `12-os-assemble` | 1 | platform.os-assemble |
 | `12-perf-benchmark` | 1 | product.performance-benchmark |
@@ -82,7 +82,7 @@
 | `12-static-routing` | 1 | product.virtual-subnet-mesh-3node |
 | `12-subnet-cli` | 1 | product.cli-subnet |
 | `12-subnet-daemon` | 1 | product.subnet-daemon |
-| `12-traffic-stats` | 0 | — 无覆盖 — |
+| `12-traffic-stats` | 1 | product.traffic-stats |
 | `12-tun-dataplane` | 1 | product.tun-dataplane |
 | `12-turn` | 1 | product.turn-relay-allocate |
 | `12-virtual-subnet-networking` | 2 | product.virtual-subnet-encrypted-3node, product.virtual-subnet-tunnel |
