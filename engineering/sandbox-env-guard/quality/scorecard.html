@@ -79,7 +79,8 @@
           断言复用 <code>run_tests.py</code>（<b>单一真源</b>，避免两份门控逻辑漂移）。</li>
         <li>CI 新增 <code>guard-tests-windows</code> job（<b>windows-latest 真机</b>）：
           跑 <code>.\scripts\guard.ps1</code>（env-check → harness-select）
-          与 <code>.\scriptsun_tests.ps1</code>，使此前<b>只做静态改造、从未实跑</b>
+          与 <code>.\scripts
+un_tests.ps1</code>，使此前<b>只做静态改造、从未实跑</b>
           的 Windows 路径首次被真实验证。</li>
         <li><code>mise.toml</code> 加 <code>[tasks.test-win]</code>；README §8 补
           Windows 验证路径与命令。</li>
@@ -90,7 +91,7 @@
     </div>
 
     <div class="foot">
-      <span>棘轮：<b>keep</b> · commit <b>__R5_COMMIT__</b></span>
+      <span>棘轮：<b>keep</b> · commit <b>98f9931</b></span>
       <span>Train your Skills like you train your models · darwin × sandbox-env-guard</span>
     </div>
   </div>
