@@ -17,7 +17,6 @@
   .score-big { font-size:46px; font-weight:700; line-height:1; }
   .score-big small { font-size:16px; color:var(--sub); font-weight:500; }
   .delta { font-size:15px; font-weight:600; color:var(--ok); background:#dcfce7; padding:4px 10px; border-radius:999px; }
-  .delta.zero { color:var(--sub); background:#f3f4f6; }
   table { width:100%; border-collapse:collapse; font-size:13.5px; }
   th { text-align:left; color:var(--sub); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.4px; padding:8px 6px; border-bottom:1px solid var(--line); }
   td { padding:9px 6px; border-bottom:1px solid #f1f1ef; vertical-align:middle; }
@@ -41,22 +40,22 @@
   <div class="card" id="card">
     <div class="brand">
       <h1>sandbox-env-guard · 质量评分卡</h1>
-      <span class="date">2026-10-19 · darwin 工作流 Round 4</span>
+      <span class="date">2026-10-19 · darwin 工作流 Round 5</span>
     </div>
     <div class="headline">
-      <div class="score-big">90.2<small> / 100</small></div>
-      <div class="delta">▲ +1.6 vs Round3 88.6</div>
+      <div class="score-big">91.4<small> / 100</small></div>
+      <div class="delta">▲ +1.2 vs Round4 90.2</div>
     </div>
 
     <table>
       <thead>
-        <tr><th>维度</th><th>权重</th><th style="width:240px">Round3 → Round4</th><th class="sc">Δ</th></tr>
+        <tr><th>维度</th><th>权重</th><th style="width:240px">Round4 → Round5</th><th class="sc">Δ</th></tr>
       </thead>
       <tbody>
         <tr><td class="dim">接口契约质量 <span class="wt">#1</span></td><td class="wt">8</td>
-          <td><div class="bars"><div class="bar before"><i style="width:70%"></i></div><div class="bar after"><i style="width:90%"></i></div></div></td><td class="sc up">7→9</td></tr>
-        <tr><td class="dim">流程清晰度 <span class="wt">#2</span></td><td class="wt">12</td>
           <td><div class="bars"><div class="bar before"><i style="width:90%"></i></div><div class="bar after"><i style="width:90%"></i></div></div></td><td class="sc">9→9</td></tr>
+        <tr><td class="dim">流程清晰度 <span class="wt">#2</span></td><td class="wt">12</td>
+          <td><div class="bars"><div class="bar before"><i style="width:90%"></i></div><div class="bar after"><i style="width:100%"></i></div></div></td><td class="sc up">9→10</td></tr>
         <tr><td class="dim">边界条件覆盖 <span class="wt">#3</span></td><td class="wt">14</td>
           <td><div class="bars"><div class="bar before"><i style="width:80%"></i></div><div class="bar after"><i style="width:80%"></i></div></div></td><td class="sc">8→8</td></tr>
         <tr><td class="dim">检查点/契约设计 <span class="wt">#4</span></td><td class="wt">10</td>
@@ -73,20 +72,25 @@
     </table>
 
     <div class="improve">
-      <b>Round 4 主要改进（dim 1 接口契约）：</b>
+      <b>Round 5 主要改进（dim 2 流程清晰度）：</b>
       <ul>
-        <li><b>CLI 显式化</b>：<code>env-check</code> 此前<b>完全没有 CLI</b>（只靠环境变量），现已加 argparse，支持 <code>--help</code> / <code>--version</code> / <code>--out-dir</code>；<code>harness-select</code> 补 <code>--version</code>。</li>
-        <li><b>退出码契约</b>：两脚本均把语义写进 <code>--help</code> epilog 与 README §2.1——<code>env-check</code> 0/1/2，<code>harness-select</code> 0/1/<b>2=BLOCKED</b>；输入缺失/不可解析显式 <code>exit 1</code>，不再让下游拿到半成品。</li>
-        <li><b>guard-plan 包装</b>：把 <code>harness-select</code> 的退出码翻译成一行可判定结论（<code>OK</code>/<code>ERROR</code>/<code>BLOCKED</code>），<b>退出码严格透传</b>——绝不把 BLOCKED 映射成 0（否则「拒绝静默降级」契约在最外层失效）。</li>
-        <li><code>mise.toml</code> 的 <code>test-plan</code> 改调 <code>guard-plan</code> 并显式化退出码；<code>check-env</code> 改用显式 <code>--out-dir</code>。</li>
-        <li>回归套件 14→20 用例（新增接口契约 6 例）。</li>
+        <li>新增 <code>scripts/run_tests.ps1</code>：Windows 侧回归入口，自动探测
+          <code>py -3</code> → <code>python</code> → <code>python3</code>，
+          断言复用 <code>run_tests.py</code>（<b>单一真源</b>，避免两份门控逻辑漂移）。</li>
+        <li>CI 新增 <code>guard-tests-windows</code> job（<b>windows-latest 真机</b>）：
+          跑 <code>.\scripts\guard.ps1</code>（env-check → harness-select）
+          与 <code>.\scriptsun_tests.ps1</code>，使此前<b>只做静态改造、从未实跑</b>
+          的 Windows 路径首次被真实验证。</li>
+        <li><code>mise.toml</code> 加 <code>[tasks.test-win]</code>；README §8 补
+          Windows 验证路径与命令。</li>
+        <li>回归套件 20→22 用例（新增 Windows 入口静态一致性检查）。</li>
       </ul>
       <b style="color:var(--accent)">勘误：</b>Round 3 总分原记 89.9 系求和笔误（维度7 <code>11×13</code> 误计为 156），
       已重算修正为 <b>88.6</b>。棘轮结论不变（仍 &gt; R2 的 87.4）。
     </div>
 
     <div class="foot">
-      <span>棘轮：<b>keep</b> · commit <b>00035c6</b></span>
+      <span>棘轮：<b>keep</b> · commit <b>__R5_COMMIT__</b></span>
       <span>Train your Skills like you train your models · darwin × sandbox-env-guard</span>
     </div>
   </div>
