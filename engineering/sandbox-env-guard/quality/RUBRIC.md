@@ -132,6 +132,23 @@
 
 ---
 
+## R6 评分（2026-10-20，round 5 后）
+
+| # | 维度 | 分 | 说明 |
+|---|------|----|------|
+| 1 | 接口契约质量 | 9 | 同 R5（guard-verify 亦支持 `--version`/`--help`） |
+| 2 | 流程清晰度 | 10 | 同 R5（`env-check → harness-select → guard-verify → evidence` 全链路贯通） |
+| 3 | 边界条件覆盖 | 8 | 同 R5 |
+| 4 | 检查点/契约设计 | 8 | 同 R5 |
+| 5 | 指令/输出具体性 | 10 | 结果含 `exit_code`/`verdict`/`duration_ms`/`output_tail`，失败可诊断 |
+| 6 | 资源整合度 | 7 | 同 R5（mise `verify`/`verify-dry` + CI dry-run 步骤） |
+| 7 | 整体架构 | 11 | 同 R5（职责单一：只做执行桥接，不改判定逻辑） |
+| 8 | 实测表现 | **10** | 守卫从「只产出计划」升级为「**驱动执行并落证据**」：`guard-verify.py` 执行 test-plan 的 selected 并写出 `verify-results.json`；回归套件 22→24 例覆盖 PASS/FAIL/SKIP/NO_COMMAND 与退出码 0/1/2/3 |
+
+**R6 总分 = (9×8 + 10×12 + 8×14 + 8×10 + 10×12 + 7×6 + 11×13 + 10×25)/10 = 939/10 = 93.9**（较 R5 +2.5，棘轮成立）
+
+---
+
 ## 优化流程（darwin Phase 0-3 适配）
 
 - **Phase 0**：在 `feat/sandbox-env-guard` 分支工作；初始化 `quality/results.tsv`。
@@ -156,4 +173,5 @@
 - ~~**R3（dim 6/7 集成度）**：新增 `.github/workflows/guard.yml` 在 PR 上跑守卫；`mise.toml` 已加 `[tasks.test]`。~~ ✅ 已完成（见上）
 - ~~**R4（dim 1 接口契约，候选）**：`env-check`/`harness-select` 补 `--version`/`--help` 显式化；`mise.toml` 对 `harness-select` 的 exit 2（BLOCKED）给出显式处理而非默认传播。~~ ✅ 已完成（见上）
 - ~~**R5（dim 2 流程清晰度，候选）**：`guard.ps1` 目前仍是静态改造、未在真实 Windows 实跑；可补一个 Windows 侧的确定性验证（或用 PS 版回归套件镜像 `run_tests.py` 的门控断言）。~~ ✅ 已完成（见上：新增 `scripts/run_tests.ps1` + CI `windows-latest` 真机 job）
-- **R6（候选）**：待用户指定——可将 `verify --full` 真正接入守卫（当前 `guard` 只跑 env-check → harness-select，未驱动 nexus-harness 实际执行 selected 测试）。
+- ~~**R6（候选）**：将 `verify` 真正接入守卫（原 `guard` 只跑 env-check → harness-select，未驱动执行 selected 测试）。~~ ✅ 已完成（见上：新增 `scripts/guard-verify.py` 执行桥接，落 `verify-results.json` 证据；mise `verify`/`verify-dry`；CI dry-run 步骤）
+- **R7（候选）**：待用户指定——可将 `verify --full` 的**真实 gate 结果**（nexus-harness 的 gates 输出）纳入 evidence 聚合，或把守卫接入 `red-evidence` 门禁。

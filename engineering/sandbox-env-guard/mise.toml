@@ -70,6 +70,21 @@ description = "Windows 入口：自动探测 py -3 / python / python3 后运行�
 run = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_tests.ps1"
 
 # ---------------------------------------------------------------------------
+# 任务：执行桥接（判定 -> 执行 -> 证据）
+# ---------------------------------------------------------------------------
+# guard-plan 只产出 test-plan（"能跑哪些"）；guard-verify 真正驱动执行
+# selected 里的测试，并把结果写成 evidence（.env-report/verify-results.json）。
+# 退出码：0=无FAIL / 1=有FAIL / 2=BLOCKED / 3=参数或IO错误
+[tasks.verify]
+description = "执行 test-plan 中 selected 的测试并产出证据"
+run = "python scripts/guard-verify.py --scenarios-dir samples/scenarios"
+
+# 只列计划不执行（快，适合 PR smoke test）
+[tasks.verify-dry]
+description = "dry-run：只打印将执行的测试清单，不实际运行"
+run = "python scripts/guard-verify.py --scenarios-dir samples/scenarios --dry-run"
+
+# ---------------------------------------------------------------------------
 # Hook：agent 进入项目目录时自动运行环境探测
 # 生效前提：在 shell rc 启用 mise shell hook（`eval "$(mise activate bash)"` /
 # `mise activate zsh`），并对本项目执行 `mise trust`（mise 安全模型默认不执行

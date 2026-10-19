@@ -43,6 +43,7 @@ agent 进入沙箱
 | `scripts/env-report.schema.json` | env-report 的 JSON Schema（harness 可校验） |
 | `scripts/harness-select` | 读能力矩阵 + 映射表，输出应运行/应跳过测试清单 |
 | `scripts/guard-plan` | `harness-select` 的退出码显式包装（供 mise/CI 调用，退出码严格透传） |
+| `scripts/guard-verify.py` | **执行桥接**：驱动执行 test-plan 中 `selected` 的测试，产出证据 |
 | `scripts/run_tests.py` | 守卫自回归套件（门控矩阵 + 错误路径 + env-check 组件 + 接口契约 + Win 入口） |
 | `scripts/run_tests.ps1` | 同一套回归测试的 **Windows 入口**（自动探测 `py -3`/`python`/`python3`，无需 bash / mise） |
 | `scripts/git-push-via-ssh443` | 沙箱内推送（一次性 SSH key 经 api 注册 → 走 443 → 自动清理） |
@@ -421,3 +422,62 @@ python scripts/harness-select --env-report .env-report/env-report.json \
   --map test-capability-map.toml --scenarios-dir ../../scenarios \
   --out .env-report/test-plan.json                            # guard-flow step 2
 ```
+
+## 12. 执行桥接：guard-verify（判定 → 执行 → 证据）
+
+`guard-plan` 只回答「本次能跑哪些」；**`guard-verify.py` 负责真正驱动执行**并落成证据。
+
+```
+env-check ──▶ env-report.json ──▶ harness-select ──▶ test-plan.json ──▶ guard-verify ──▶ verify-results.json
+  探测能力                            筛选                                  执行+证据
+```
+
+```bash
+# dry-run：只列计划，不执行（快，CI 用它做 smoke test）
+python scripts/guard-verify.py --scenarios-dir ../../scenarios --dry-run
+
+# 实际执行（按需，重测试较多）
+python scripts/guard-verify.py --scenarios-dir ../../scenarios
+
+# 抽样 / 超时控制
+python scripts/guard-verify.py --scenarios-dir ../../scenarios --filter "product.n3-*" --limit 3 --timeout 600
+```
+
+### 12.1 判定规则
+
+| 情况 | verdict | 说明 |
+|------|---------|------|
+| 命令退出码 0 | `PASS` | 通过 |
+| 命令退出码非 0 | `FAIL` | 失败，整体退出码 `1` |
+| 被能力门控跳过 | `SKIPPED` | **绝不计为 PASS**；整体不算失败 |
+| scenario 无 `command` | `NO_COMMAND` | 显式标注，不静默当通过 |
+| 计划里找不到该 id 的 scenario | `NO_SCENARIO` | 同上 |
+
+### 12.2 退出码
+
+| 码 | 含义 |
+|----|------|
+| `0` | 无 FAIL（PASS + SKIPPED） |
+| `1` | 至少一个测试 FAIL |
+| `2` | BLOCKED：`harness-select` 拒绝产出 test-plan，或 test-plan 的 `mode != scenarios`（demo 幻觉防护），**严格透传不降级** |
+| `3` | 参数或 IO 错误 |
+
+### 12.3 两个执行要点
+
+- **工作目录 = 仓库根**：scenario 的 `command` 按仓库根相对路径编写（如
+  `python3 engineering/verifiers/n3_x.py`），故执行时 `cwd` 固定为仓库根。
+- **`python3` 规范化**：命令中的 `python3` / `python` 会被替换为当前解释器——
+  Windows 常无 `python3`（只有 `py` 启动器），不做规范化会直接执行失败。
+
+### 12.4 已知问题（bridging 实测发现）
+
+首次用 `guard-verify` 真实驱动 `scenarios/` 时暴露：
+
+| 场景 | 契约声明 | 实际行为 | 判定 |
+|------|----------|----------|------|
+| `platform.os-assemble` | `one_of = ["PASS","SKIP"]`（容忍无 TUN） | 缺 `/dev/net/tun` 时输出 `{"verdict":"FAIL","reason":"open tun: ..."}` | **场景违背自身契约**：应降级为 `SKIP`/`TUN_ERROR`，却判 `FAIL` |
+
+> 这正是守卫的价值：把「环境限制」与「代码失败」分开归因时，能顺带暴露
+> 场景契约与实现不一致。修复点在 nexus-fabric 侧（`os_assemble` example
+> 应在 `open tun` 失败时输出 `SKIP`），守卫侧**不**用 `tun_net_admin`
+> 门控它——否则会把这个真实缺陷藏进 SKIPPED。
