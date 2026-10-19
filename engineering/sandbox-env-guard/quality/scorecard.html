@@ -40,22 +40,22 @@
   <div class="card" id="card">
     <div class="brand">
       <h1>sandbox-env-guard · 质量评分卡</h1>
-      <span class="date">2026-10-19 · darwin 工作流 Round 5</span>
+      <span class="date">2026-10-20 · darwin 工作流 Round 6</span>
     </div>
     <div class="headline">
-      <div class="score-big">91.4<small> / 100</small></div>
-      <div class="delta">▲ +1.2 vs Round4 90.2</div>
+      <div class="score-big">93.9<small> / 100</small></div>
+      <div class="delta">▲ +2.5 vs Round5 91.4</div>
     </div>
 
     <table>
       <thead>
-        <tr><th>维度</th><th>权重</th><th style="width:240px">Round4 → Round5</th><th class="sc">Δ</th></tr>
+        <tr><th>维度</th><th>权重</th><th style="width:240px">Round5 → Round6</th><th class="sc">Δ</th></tr>
       </thead>
       <tbody>
         <tr><td class="dim">接口契约质量 <span class="wt">#1</span></td><td class="wt">8</td>
           <td><div class="bars"><div class="bar before"><i style="width:90%"></i></div><div class="bar after"><i style="width:90%"></i></div></div></td><td class="sc">9→9</td></tr>
         <tr><td class="dim">流程清晰度 <span class="wt">#2</span></td><td class="wt">12</td>
-          <td><div class="bars"><div class="bar before"><i style="width:90%"></i></div><div class="bar after"><i style="width:100%"></i></div></div></td><td class="sc up">9→10</td></tr>
+          <td><div class="bars"><div class="bar before"><i style="width:100%"></i></div><div class="bar after"><i style="width:100%"></i></div></div></td><td class="sc">10→10</td></tr>
         <tr><td class="dim">边界条件覆盖 <span class="wt">#3</span></td><td class="wt">14</td>
           <td><div class="bars"><div class="bar before"><i style="width:80%"></i></div><div class="bar after"><i style="width:80%"></i></div></div></td><td class="sc">8→8</td></tr>
         <tr><td class="dim">检查点/契约设计 <span class="wt">#4</span></td><td class="wt">10</td>
@@ -67,31 +67,36 @@
         <tr><td class="dim">整体架构 <span class="wt">#7</span></td><td class="wt">13</td>
           <td><div class="bars"><div class="bar before"><i style="width:110%"></i></div><div class="bar after"><i style="width:110%"></i></div></div></td><td class="sc">11→11</td></tr>
         <tr><td class="dim">实测表现 <span class="wt">#8</span></td><td class="wt">25</td>
-          <td><div class="bars"><div class="bar before"><i style="width:90%"></i></div><div class="bar after"><i style="width:90%"></i></div></div></td><td class="sc">9→9</td></tr>
+          <td><div class="bars"><div class="bar before"><i style="width:90%"></i></div><div class="bar after"><i style="width:100%"></i></div></div></td><td class="sc up">9→10</td></tr>
       </tbody>
     </table>
 
     <div class="improve">
-      <b>Round 5 主要改进（dim 2 流程清晰度）：</b>
+      <b>Round 6 主要改进（dim 8 实测表现）：</b>
       <ul>
-        <li>新增 <code>scripts/run_tests.ps1</code>：Windows 侧回归入口，自动探测
-          <code>py -3</code> → <code>python</code> → <code>python3</code>，
-          断言复用 <code>run_tests.py</code>（<b>单一真源</b>，避免两份门控逻辑漂移）。</li>
-        <li>CI 新增 <code>guard-tests-windows</code> job（<b>windows-latest 真机</b>）：
-          跑 <code>.\scripts\guard.ps1</code>（env-check → harness-select）
-          与 <code>.\scripts
-un_tests.ps1</code>，使此前<b>只做静态改造、从未实跑</b>
-          的 Windows 路径首次被真实验证。</li>
-        <li><code>mise.toml</code> 加 <code>[tasks.test-win]</code>；README §8 补
-          Windows 验证路径与命令。</li>
-        <li>回归套件 20→22 用例（新增 Windows 入口静态一致性检查）。</li>
+        <li>新增 <code>scripts/guard-verify.py</code> 执行桥接：读 test-plan 的
+          <code>selected</code> → 定位 scenario toml → 取 <code>[when].command</code>
+          → 在<b>仓库根</b>执行 → 落 <code>.env-report/verify-results.json</code> 证据。</li>
+        <li>守卫闭环补齐：此前只有「判定（能跑哪些）」，现在打通
+          <b>判定 → 执行 → 证据</b> 三段。</li>
+        <li>判据显式：<code>PASS</code>/<code>FAIL</code>/<code>SKIPPED</code>/
+          <code>NO_COMMAND</code>/<code>NO_SCENARIO</code>；<b>被门控跳过的绝不计为 PASS</b>。</li>
+        <li>退出码契约 0=无FAIL / 1=有FAIL / 2=BLOCKED（含 <code>mode!=scenarios</code> 的
+          demo 幻觉防护）/ 3=参数或IO错，与 harness-select 对齐。</li>
+        <li>支持 <code>--filter</code> / <code>--limit</code> / <code>--timeout</code> /
+          <code>--refresh-env</code> / <code>--dry-run</code>，便于 CI 做轻量 smoke test。</li>
+        <li>跨平台：命令中的 <code>python3</code>/<code>python</code> 规范化为当前解释器
+          （Windows 常无 <code>python3</code>，只有 <code>py</code> 启动器）。</li>
+        <li>mise 加 <code>[tasks.verify]</code> / <code>[tasks.verify-dry]</code>；
+          CI <code>guard-flow</code> 加 dry-run 步骤（真实仓库 300+ 场景全跑代价过高）。</li>
+        <li>回归套件 22→24 用例。</li>
       </ul>
       <b style="color:var(--accent)">勘误：</b>Round 3 总分原记 89.9 系求和笔误（维度7 <code>11×13</code> 误计为 156），
       已重算修正为 <b>88.6</b>。棘轮结论不变（仍 &gt; R2 的 87.4）。
     </div>
 
     <div class="foot">
-      <span>棘轮：<b>keep</b> · commit <b>98f9931</b></span>
+      <span>棘轮：<b>keep</b> · commit <b>__R6_COMMIT__</b></span>
       <span>Train your Skills like you train your models · darwin × sandbox-env-guard</span>
     </div>
   </div>

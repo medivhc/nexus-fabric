@@ -104,6 +104,13 @@ jobs:
           MODE=$(python -c "import json;print(json.load(open('.env-report/test-plan.json'))['mode'])")
           echo "test-plan mode = $MODE"
           [ "$MODE" = "scenarios" ] || { echo "::error::guard-flow mode 非 scenarios（$MODE），流程异常"; exit 1; }
+
+      - name: guard-verify dry-run（校验 test-plan 可执行性，不跑重测试）
+        working-directory: engineering/sandbox-env-guard
+        # 真实仓库有 300+ 场景，逐个执行代价过高；PR 上只做 dry-run，
+        # 确保「计划可产出且条目是真实测试 id」这一环不回归。
+        # 完整执行由本地按需触发：mise run verify -- --scenarios-dir ../../scenarios
+        run: python scripts/guard-verify.py --scenarios-dir ../../scenarios --dry-run
       - name: 写 $GITHUB_STEP_SUMMARY（能力矩阵 + test-plan 摘要）
         working-directory: engineering/sandbox-env-guard
         run: |

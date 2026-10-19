@@ -302,8 +302,80 @@ def main():
         if missing:
             failures.append(f"[win-entry] {rel} 未引用 {missing}（入口可能已失效）")
 
+    # ---- 8) 执行桥接 guard-verify（R6：判定 -> 执行 -> 证据）----
+    # 用带真实 command 的临时 fixture 验证：PASS/FAIL 分类、门控跳过不计 PASS、
+    # 以及退出码契约（0=无FAIL / 1=有FAIL / 2=BLOCKED）。
+    def cmd_for(code):
+        exe = sys.executable
+        if os.name == "nt":
+            exe = subprocess.list2cmdline([exe])
+        else:
+            import shlex
+            exe = shlex.quote(exe)
+        return f'{exe} -c "import sys; sys.exit({code})"'
+
+    gv_dir = tempfile.mkdtemp(prefix="guard_verify_")
+    gv_sd = os.path.join(gv_dir, "scenarios")
+    os.makedirs(gv_sd)
+
+    def write_scen(fn, tid, code):
+        with open(os.path.join(gv_sd, fn), "w") as fh:
+            fh.write(f'id = "{tid}"\n[when]\ncommand = \'{cmd_for(code)}\'\n')
+
+    write_scen("pass.toml", "verify.pass", 0)
+    write_scen("fail.toml", "verify.fail", 3)
+
+    gv_env = os.path.join(gv_dir, "env.json")
+    with open(gv_env, "w") as fh:
+        json.dump({"capabilities": FIXTURES["normal_linux"]}, fh)
+    gv_empty_map = os.path.join(gv_dir, "empty-map.toml")
+    with open(gv_empty_map, "w") as fh:
+        fh.write("# 空 map：不门控任何测试\n")
+    gv_gated_map = os.path.join(gv_dir, "gated-map.toml")
+    with open(gv_gated_map, "w") as fh:
+            fh.write('[tests."verify.fail"]\nrequires = ["confidential_transport"]\n')
+
+    GV = os.path.join(SCRIPT_DIR, "guard-verify.py")
+
+    def run_gv(*extra):
+        return subprocess.run([sys.executable, GV, *extra],
+                              capture_output=True, text=True, timeout=180)
+
+    # 8a) 空 map -> 两个测试都执行：pass=PASS, fail=FAIL -> exit 1
+    r = run_gv("--scenarios-dir", gv_sd, "--map", gv_empty_map,
+               "--env-report", gv_env, "--out", os.path.join(gv_dir, "r1.json"))
+    if r.returncode != 1:
+        failures.append(f"[guard-verify FAIL路径] 期望 exit=1，实际 {r.returncode}\n{r.stderr[-200:]}")
+    try:
+        d1 = json.load(open(os.path.join(gv_dir, "r1.json")))
+        v1 = {x["id"]: x["verdict"] for x in d1["results"]}
+        if v1.get("verify.pass") != "PASS":
+            failures.append(f"[guard-verify] 期望 verify.pass=PASS，实际 {v1.get('verify.pass')}")
+        if v1.get("verify.fail") != "FAIL":
+            failures.append(f"[guard-verify] 期望 verify.fail=FAIL，实际 {v1.get('verify.fail')}")
+    except Exception as e:
+        failures.append(f"[guard-verify] 结果解析失败: {e}")
+
+    # 8b) 门控生效 -> verify.fail 被 skip，整体 exit 0，且不得记为 PASS
+    r = run_gv("--scenarios-dir", gv_sd, "--map", gv_gated_map,
+               "--env-report", gv_env, "--out", os.path.join(gv_dir, "r2.json"))
+    if r.returncode != 0:
+        failures.append(f"[guard-verify SKIP路径] 期望 exit=0，实际 {r.returncode}\n{r.stderr[-200:]}")
+    try:
+        d2 = json.load(open(os.path.join(gv_dir, "r2.json")))
+        sk = {x["id"] for x in d2["skipped"]}
+        v2 = {x["id"]: x["verdict"] for x in d2["results"]}
+        if "verify.fail" not in sk:
+            failures.append(f"[guard-verify] 门控未生效：verify.fail 应在 skipped，实际 {sk}")
+        if "verify.fail" in v2:
+            failures.append("[guard-verify] 被门控的测试不得出现在执行结果中")
+        if v2.get("verify.pass") != "PASS":
+            failures.append(f"[guard-verify] verify.pass 应仍为 PASS，实际 {v2.get('verify.pass')}")
+    except Exception as e:
+        failures.append(f"[guard-verify] 结果解析失败: {e}")
+
     # ---- 汇报 ----
-    total = len(FIXTURES) + 2 + 1 + 3 + 6 + 2  # 门控矩阵+bad_dir+demo+run_cmd+TUN三分支+接口契约+Win入口
+    total = (len(FIXTURES) + 2 + 1 + 3 + 6 + 2 + 2)
     passed = total - len(failures)
     print(f"[run_tests] 用例 {total}  通过 {passed}  失败 {len(failures)}")
     for f in failures:
