@@ -44,6 +44,37 @@ jobs:
         # 非零退出即 CI 失败。
         run: python scripts/run_tests.py
 
+  # Windows 侧：验证「无需 bash / 无需 mise」的入口确实可用。
+  # 重点跑 guard.ps1 —— 这是 Windows 的真实入口，此前只做过静态改造、
+  # 从未在真实 Windows 上执行过；CI 真机运行是唯一能证明它的方式。
+  guard-tests-windows:
+    name: Windows 入口（guard.ps1 + 回归套件）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python 3.11+（tomllib 依赖）
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 运行 Windows 守卫全流程（guard.ps1）
+        shell: pwsh
+        working-directory: engineering/sandbox-env-guard
+        # guard.ps1 内部自动探测 py -3 / python / python3，再驱动
+        # env-check -> harness-select；退出码透传（0/1/2）。
+        run: .\scripts\guard.ps1
+      - name: 运行守卫自回归套件（run_tests.ps1）
+        shell: pwsh
+        working-directory: engineering/sandbox-env-guard
+        # 与 Linux `mise run test` 跑的是同一套断言（run_tests.py 为唯一真源）
+        run: .\scripts\run_tests.ps1
+      - name: 上传 Windows 守卫产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: guard-artifacts-windows
+          path: engineering/sandbox-env-guard/.env-report/
+          retention-days: 7
+
   guard-flow:
     name: 全流程（env-check → harness-select）
     runs-on: ubuntu-latest

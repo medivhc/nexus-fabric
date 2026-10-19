@@ -43,7 +43,8 @@ agent 进入沙箱
 | `scripts/env-report.schema.json` | env-report 的 JSON Schema（harness 可校验） |
 | `scripts/harness-select` | 读能力矩阵 + 映射表，输出应运行/应跳过测试清单 |
 | `scripts/guard-plan` | `harness-select` 的退出码显式包装（供 mise/CI 调用，退出码严格透传） |
-| `scripts/run_tests.py` | 守卫自回归套件（门控矩阵 + 错误路径 + env-check 组件 + 接口契约） |
+| `scripts/run_tests.py` | 守卫自回归套件（门控矩阵 + 错误路径 + env-check 组件 + 接口契约 + Win 入口） |
+| `scripts/run_tests.ps1` | 同一套回归测试的 **Windows 入口**（自动探测 `py -3`/`python`/`python3`，无需 bash / mise） |
 | `scripts/git-push-via-ssh443` | 沙箱内推送（一次性 SSH key 经 api 注册 → 走 443 → 自动清理） |
 | `test-capability-map.toml` | **测试 → 所需 capability** 映射（维护入口，无需改代码） |
 | `samples/scenarios/*.toml` | 演示用 scenario（id 命中不同映射分支） |
@@ -285,6 +286,16 @@ requires_capabilities = ["linux_executor", "tun_net_admin"]
 
 `guard.ps1` 可选参数：`-ScenariosDir <目录>`、`-ReportDir <目录>`。
 
+**Windows 上的回归验证**（与 Linux `mise run test` 跑同一套断言）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_tests.ps1
+```
+
+> `run_tests.ps1` 只负责定位可用的 Python 3.11+（`py -3` → `python` → `python3`），
+> 断言仍由 `run_tests.py` 执行——**单一真源**，避免两份门控逻辑漂移。
+> 退出码透传（`0`=全绿 / `1`=失败 / `2`=BLOCKED）。
+
 ### 8.2 已做的跨平台处理
 
 | 位置 | 原问题 | 处理 |
@@ -389,10 +400,11 @@ rm -f ~/.ssh/gh_push_tmp* ~/.ssh/config
 守卫自身也接入 CI（`.github/workflows/guard.yml`），在 PR / push(master) 触及
 `engineering/sandbox-env-guard/**` 时自动运行，防止门控契约被回归破坏：
 
-| job | 内容 |
-|-----|------|
-| `guard-tests` | 跑 `python scripts/run_tests.py`（14 用例门控契约 + 错误路径 + env-check 组件测试），非零退出即 CI 失败 |
-| `guard-flow` | 跑 `env-check`（`SKIP_NETWORK_PROBES=1` 保确定性）→ `harness-select` 扫真实 `scenarios/` → 断言 `mode=scenarios` → 上传 `env-report.json` + `test-plan.json` 作 artifact，并写入 `$GITHUB_STEP_SUMMARY` |
+| job | runner | 内容 |
+|-----|--------|------|
+| `guard-tests` | `ubuntu-latest` | 跑 `python scripts/run_tests.py`（门控契约 + 错误路径 + env-check 组件 + 接口契约），非零退出即 CI 失败 |
+| **`guard-tests-windows`** | `windows-latest` | **真机验证 Windows 入口**：先跑 `.\scripts\guard.ps1`（env-check → harness-select），再跑 `.\scripts\run_tests.ps1`（同一套断言）。此前 `guard.ps1` 只做过静态改造、从未在真实 Windows 上执行过——CI 真机运行是唯一能证明它的方式 |
+| `guard-flow` | `ubuntu-latest` | 跑 `env-check`（`SKIP_NETWORK_PROBES=1` 保确定性）→ `harness-select` 扫真实 `scenarios/` → 断言 `mode=scenarios` → 上传 `env-report.json` + `test-plan.json` 作 artifact，并写入 `$GITHUB_STEP_SUMMARY` |
 
 要点：
 - **确定性优先**：CI 里 env-check 用 `SKIP_NETWORK_PROBES=1` 跳过出网探测——否则网络类能力在 ok/degraded/missing 间随 CI 网络抖动跳变，test-plan 不稳定。回归套件本身不依赖真实网络。

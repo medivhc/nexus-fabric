@@ -115,6 +115,23 @@
 
 ---
 
+## R5 评分（2026-10-19，round 4 后）
+
+| # | 维度 | 分 | 说明 |
+|---|------|----|------|
+| 1 | 接口契约质量 | 9 | 同 R4 |
+| 2 | 流程清晰度 | **10** | 补齐 Windows 侧确定性验证：`scripts/run_tests.ps1` 作为 Windows 入口（自动探测 `py -3`/`python`/`python3`），断言仍复用 `run_tests.py`（单一真源）；CI 新增 `guard-tests-windows` job 在 **windows-latest 真机**跑 `guard.ps1` + `run_tests.ps1`，使此前「只做静态改造、从未实跑」的 Windows 路径首次被真实验证 |
+| 3 | 边界条件覆盖 | 8 | 同 R4 |
+| 4 | 检查点/契约设计 | 8 | 同 R4 |
+| 5 | 指令/输出具体性 | 10 | 同 R4 |
+| 6 | 资源整合度 | 7 | 同 R4（CI 已有 Windows job） |
+| 7 | 整体架构 | 11 | 同 R4 |
+| 8 | 实测表现 | 9 | 回归套件 20→22 用例（新增 Windows 入口静态一致性检查）；真机 Windows 执行由 CI 覆盖 |
+
+**R5 总分 = (9×8 + 10×12 + 8×14 + 8×10 + 10×12 + 7×6 + 11×13 + 9×25)/10 = 914/10 = 91.4**（较 R4 +1.2，棘轮成立）
+
+---
+
 ## 优化流程（darwin Phase 0-3 适配）
 
 - **Phase 0**：在 `feat/sandbox-env-guard` 分支工作；初始化 `quality/results.tsv`。
@@ -138,4 +155,5 @@
 - ~~**R2（dim 3 边界覆盖）**：`tun_net_admin` 探测从「stat 存在」升级为「实际 open `/dev/net/tun`」，避免设备存在但不可用的假 ok；`env-check` 内 `run_cmd` 异常不再静默吞（探测失败应记 `unknown` 而非沿用默认）。~~ ✅ 已完成（见上）
 - ~~**R3（dim 6/7 集成度）**：新增 `.github/workflows/guard.yml` 在 PR 上跑守卫；`mise.toml` 已加 `[tasks.test]`。~~ ✅ 已完成（见上）
 - ~~**R4（dim 1 接口契约，候选）**：`env-check`/`harness-select` 补 `--version`/`--help` 显式化；`mise.toml` 对 `harness-select` 的 exit 2（BLOCKED）给出显式处理而非默认传播。~~ ✅ 已完成（见上）
-- **R5（dim 2 流程清晰度，候选）**：`guard.ps1` 目前仍是静态改造、未在真实 Windows 实跑；可补一个 Windows 侧的确定性验证（或用 PS 版回归套件镜像 `run_tests.py` 的门控断言）。
+- ~~**R5（dim 2 流程清晰度，候选）**：`guard.ps1` 目前仍是静态改造、未在真实 Windows 实跑；可补一个 Windows 侧的确定性验证（或用 PS 版回归套件镜像 `run_tests.py` 的门控断言）。~~ ✅ 已完成（见上：新增 `scripts/run_tests.ps1` + CI `windows-latest` 真机 job）
+- **R6（候选）**：待用户指定——可将 `verify --full` 真正接入守卫（当前 `guard` 只跑 env-check → harness-select，未驱动 nexus-harness 实际执行 selected 测试）。

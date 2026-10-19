@@ -285,8 +285,25 @@ def main():
     if p.returncode != 0 or "OK" not in p.stdout:
         failures.append(f"[guard-plan OK] exit={p.returncode} stdout={p.stdout[:120]!r}")
 
+    # ---- 7) Windows 入口一致性（R5，dim 2 流程清晰度）----
+    # 目标：guard.ps1 / run_tests.ps1 是 Windows「无需 bash / 无需 mise」的入口。
+    # 静态检查确保它们始终指向正确的 Python 脚本（防止重命名后入口失效）。
+    # 真机执行由 CI 的 windows-latest job 覆盖（本机通常无 pwsh）。
+    for rel, must in (
+        ("scripts/guard.ps1", ("scripts/env-check", "scripts/harness-select", "py")),
+        ("scripts/run_tests.ps1", ("scripts/run_tests.py", "py")),
+    ):
+        p = os.path.join(PROJECT_ROOT, rel)
+        if not os.path.isfile(p):
+            failures.append(f"[win-entry] 缺少 {rel}")
+            continue
+        txt = open(p, encoding="utf-8").read()
+        missing = [m for m in must if m not in txt]
+        if missing:
+            failures.append(f"[win-entry] {rel} 未引用 {missing}（入口可能已失效）")
+
     # ---- 汇报 ----
-    total = len(FIXTURES) + 2 + 1 + 3 + 6  # 门控矩阵 + bad_dir + demo + run_cmd + TUN三分支 + 接口契约
+    total = len(FIXTURES) + 2 + 1 + 3 + 6 + 2  # 门控矩阵+bad_dir+demo+run_cmd+TUN三分支+接口契约+Win入口
     passed = total - len(failures)
     print(f"[run_tests] 用例 {total}  通过 {passed}  失败 {len(failures)}")
     for f in failures:
