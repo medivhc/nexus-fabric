@@ -37,16 +37,35 @@ fn main() {
 }
 
 fn run() -> Result<(String, bool), String> {
+    run_with_connect(
+        |peer, config| FabricConn::connect(peer, config).map_err(|e| format!("connect: {e}")),
+        || {},
+    )
+}
+
+// Injection only: admission, client work and joining below are the actual
+// example path. The default factory preserves the original connect behavior.
+fn run_with_connect(
+    connect: impl FnOnce(nexus_fabric::PeerId, &ConnConfig) -> Result<FabricConn, String>,
+    server_exited: impl FnOnce() + Send + 'static,
+) -> Result<(String, bool), String> {
     let listener =
         FabricListener::bind("127.0.0.1:0".parse().unwrap()).map_err(|e| format!("bind: {e}"))?;
     let server_peer = listener.peer_id();
     let server_addr: SocketAddr = listener
         .local_addr()
         .map_err(|e| format!("local_addr: {e}"))?;
+    let handshake_timeout = Duration::from_secs(10);
+    // Queuing echo bytes and FIN does not confirm delivery. Keep the server
+    // driver alive through the client's complete echo/EOF and worker join.
+    let server_owner = listener.clone();
 
     // Server: accept -> echo the stream -> count datagrams.
     let server = thread::spawn(move || -> Result<(usize, usize), String> {
-        let conn = listener.accept().map_err(|e| format!("accept: {e}"))?;
+        let _exit = WorkerExit(Some(server_exited));
+        let conn = listener
+            .accept_timeout(handshake_timeout)
+            .map_err(|e| format!("accept: {e}"))?;
         let (mut send, mut recv) = conn.accept_bi().map_err(|e| format!("accept_bi: {e}"))?;
         let mut data = Vec::new();
         let mut buf = [0u8; 65536];
@@ -76,42 +95,41 @@ fn run() -> Result<(String, bool), String> {
         Ok((dcount, data.len()))
     });
 
-    // Client.
-    let config = ConnConfig {
-        addrs: vec![server_addr],
-        handshake_timeout: Duration::from_secs(10),
-    };
-    let conn = FabricConn::connect(server_peer, &config).map_err(|e| format!("connect: {e}"))?;
-    let (mut send, mut recv) = conn.open_bi().map_err(|e| format!("open_bi: {e}"))?;
-    let payload = payload();
-    let mut off = 0;
-    while off < payload.len() {
-        off += send
-            .write(&payload[off..])
-            .map_err(|e| format!("write: {e}"))?;
-    }
-    send.finish().map_err(|e| format!("finish: {e}"))?;
-    for i in 0..DATAGRAMS as u8 {
-        let mut d = vec![0u8; 200];
-        d[0] = i;
-        d[199] = i.wrapping_mul(7);
-        conn.send_datagram(&d)
-            .map_err(|e| format!("dgram send: {e}"))?;
-    }
-    let mut echo = Vec::new();
-    let mut buf = [0u8; 65536];
-    loop {
-        let n = recv.read(&mut buf).map_err(|e| format!("echo read: {e}"))?;
-        if n == 0 {
-            break;
+    // Enclose every client Result path, including failures before open_bi,
+    // so the server handle is consumed before the example returns an error.
+    let ((conn, echo, payload), (dcount, _slen)) = with_server_owner(server_owner, server, || {
+        let config = ConnConfig {
+            addrs: vec![server_addr],
+            handshake_timeout,
+        };
+        let conn = connect(server_peer, &config)?;
+        let (mut send, mut recv) = conn.open_bi().map_err(|e| format!("open_bi: {e}"))?;
+        let payload = payload();
+        let mut off = 0;
+        while off < payload.len() {
+            off += send
+                .write(&payload[off..])
+                .map_err(|e| format!("write: {e}"))?;
         }
-        echo.extend_from_slice(&buf[..n]);
-    }
-
-    let (dcount, _slen) = server
-        .join()
-        .map_err(|_| "server thread panicked".to_string())?
-        .map_err(|e| format!("server: {e}"))?;
+        send.finish().map_err(|e| format!("finish: {e}"))?;
+        for i in 0..DATAGRAMS as u8 {
+            let mut d = vec![0u8; 200];
+            d[0] = i;
+            d[199] = i.wrapping_mul(7);
+            conn.send_datagram(&d)
+                .map_err(|e| format!("dgram send: {e}"))?;
+        }
+        let mut echo = Vec::new();
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = recv.read(&mut buf).map_err(|e| format!("echo read: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            echo.extend_from_slice(&buf[..n]);
+        }
+        Ok((conn, echo, payload))
+    })?;
 
     // Checks (match the frozen scenario fields).
     let echo_bytes_match = echo == payload;
@@ -140,3 +158,36 @@ fn run() -> Result<(String, bool), String> {
         pass,
     ))
 }
+
+struct WorkerExit<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Drop for WorkerExit<F> {
+    fn drop(&mut self) {
+        if let Some(exited) = self.0.take() {
+            exited();
+        }
+    }
+}
+
+fn with_server_owner<O, C, S>(
+    owner: O,
+    server: thread::JoinHandle<Result<S, String>>,
+    client: impl FnOnce() -> Result<C, String>,
+) -> Result<(C, S), String> {
+    let client_result = client();
+    let server_result = match server.join() {
+        Ok(result) => result.map_err(|error| format!("server: {error}")),
+        Err(_) => Err("server thread panicked".to_string()),
+    };
+    drop(owner);
+    match (client_result, server_result) {
+        (Ok(client), Ok(server)) => Ok((client, server)),
+        (Err(client), Ok(_)) => Err(client),
+        (Ok(_), Err(server)) => Err(server),
+        (Err(client), Err(server)) => Err(format!("{client}; {server}")),
+    }
+}
+
+#[cfg(test)]
+#[path = "basic/owner_tests.rs"]
+mod owner_tests;
