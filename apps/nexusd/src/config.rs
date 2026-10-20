@@ -458,9 +458,9 @@ fn parse_turn_section(t: &toml::Value) -> Result<TurnSection, String> {
         match t.get(k) {
             None => Ok(None),
             Some(x) => {
-                let s = x.as_str().ok_or_else(|| {
-                    format!("{DAEMON_TOML}: [network.turn].{k} must be a string")
-                })?;
+                let s = x
+                    .as_str()
+                    .ok_or_else(|| format!("{DAEMON_TOML}: [network.turn].{k} must be a string"))?;
                 if s.is_empty() {
                     return Err(format!(
                         "{DAEMON_TOML}: [network.turn].{k} must not be empty"

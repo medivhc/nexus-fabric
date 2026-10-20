@@ -431,7 +431,9 @@ impl TurnManager {
             // 过期该 allocation，因此这里只记录 WARN，不阻断降级。
             if let Some(mut c) = self.client.take() {
                 if let Err(e) = c.release() {
-                    eprintln!("[nat-switch] WARN: TURN deallocate (LIFETIME=0) failed ({e}); server-side allocation will expire on its own timer");
+                    eprintln!(
+                        "[nat-switch] WARN: TURN deallocate (LIFETIME=0) failed ({e}); server-side allocation will expire on its own timer"
+                    );
                 }
             }
             self.state = TurnState::Expired;
@@ -468,7 +470,9 @@ impl TurnManager {
         // C2：显式 Deallocate（RFC 5766 LIFETIME=0），best-effort。
         if let Some(mut c) = self.client.take() {
             if let Err(e) = c.release() {
-                eprintln!("[nat-switch] WARN: TURN deallocate (LIFETIME=0) failed ({e}); server-side allocation will expire on its own timer");
+                eprintln!(
+                    "[nat-switch] WARN: TURN deallocate (LIFETIME=0) failed ({e}); server-side allocation will expire on its own timer"
+                );
             }
         }
         self.state = TurnState::Disabled;
@@ -767,9 +771,15 @@ mod tests {
         // 新 client 的 refresh 同样 438 → 不再重分配，走普通失败路径。
         mgr.next_refresh_at = Some(Instant::now());
         assert_eq!(mgr.refresh_if_needed(), RefreshOutcome::Failed(1));
-        assert_eq!(factory_calls.load(std::sync::atomic::Ordering::Relaxed), 2,
-            "no second re-allocate within the 438 episode");
-        assert!(mgr.is_active(), "still warm backup after 1st ordinary failure");
+        assert_eq!(
+            factory_calls.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "no second re-allocate within the 438 episode"
+        );
+        assert!(
+            mgr.is_active(),
+            "still warm backup after 1st ordinary failure"
+        );
     }
 
     /// 认证失败（工厂返回 401 风格错误）→ Disabled 降级。

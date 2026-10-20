@@ -8,7 +8,7 @@
 //!   each pumped by a background thread into a shared inbox.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 /// Error sending via a transport.
@@ -130,9 +130,15 @@ impl DatagramTransport for MockTransport {
 /// `FabricConn::recv_datagram` and forwards `(peer_name, datagram)` into a
 /// shared inbox. `Drop` closes the connections (unblocking the pumps);
 /// pump threads are detached and exit on close.
+///
+/// R3/D5: the pump splits datagrams by intent kind after `recv_datagram`.
+/// `0x03` (SERVICE) datagrams are dispatched to the upper-layer handler
+/// registered for the second byte (service sub-id); `0x00/0x01/0x02`
+/// continue to the TUN inbox unchanged (wire compatibility, AC7).
 pub struct FabricTransport {
     conns: HashMap<String, nexus_fabric::FabricConn>,
     inbox_rx: Mutex<mpsc::Receiver<(String, Vec<u8>)>>,
+    service_table: Arc<Mutex<HashMap<u8, crate::flow_session::DatagramHandler>>>,
 }
 
 impl FabricTransport {
@@ -140,14 +146,30 @@ impl FabricTransport {
     /// discovery integration is later).
     pub fn new(peers: HashMap<String, nexus_fabric::FabricConn>) -> Self {
         let (tx, rx) = mpsc::channel();
+        let service_table: Arc<Mutex<HashMap<u8, crate::flow_session::DatagramHandler>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         for (name, conn) in &peers {
             let tx = tx.clone();
             let conn = conn.clone();
             let name = name.clone();
+            let peer_id = conn.peer();
+            let service_table = Arc::clone(&service_table);
             thread::Builder::new()
                 .name(format!("fabric-pump-{name}"))
                 .spawn(move || {
                     while let Ok(d) = conn.recv_datagram() {
+                        // R3/D5: 0x03 service datagrams go to the upper-layer
+                        // handler; 0x00/0x01/0x02 keep the TUN inbox path.
+                        if d.len() >= 2
+                            && crate::decode_intent_kind(d[0]).0 == crate::INTENT_SERVICE
+                        {
+                            let svc = d[1];
+                            let handler = service_table.lock().unwrap().get(&svc).cloned();
+                            if let Some(h) = handler {
+                                h(peer_id, &d[2..]);
+                                continue;
+                            }
+                        }
                         if tx.send((name.clone(), d)).is_err() {
                             break; // inbox gone
                         }
@@ -158,7 +180,15 @@ impl FabricTransport {
         Self {
             conns: peers,
             inbox_rx: Mutex::new(rx),
+            service_table,
         }
+    }
+
+    /// Register an upper-layer datagram service handler (R3/D5): a
+    /// `0x03`-intent datagram whose second byte equals `svc` is delivered
+    /// to `h` and never enters the TUN inbox (AC7).
+    pub fn register_datagram_service(&self, svc: u8, h: crate::flow_session::DatagramHandler) {
+        self.service_table.lock().unwrap().insert(svc, h);
     }
 }
 

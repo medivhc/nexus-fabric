@@ -722,6 +722,21 @@ impl Loop {
                     lc.quic
                         .close(Instant::now(), VarInt::from_u32(code), Bytes::from(reason));
                 }
+                // E-3 lesson: local close must unblock blocked readers
+                // (`accept_bi` / `recv_datagram` / `open_bi`) immediately,
+                // otherwise a session layer that joins its pump threads
+                // after `close()` deadlocks. The QUIC close frame alone
+                // only emits `ConnectionLost` after the close timer, which
+                // is too late for synchronous join-based shutdown.
+                if let Some(sh) = self.shared.conns.lock().unwrap().get(&conn) {
+                    let mut st = sh.state.lock().unwrap();
+                    if st.closed.is_none() {
+                        st.closed = Some(FabricError::Closed(code));
+                    }
+                    sh.accepted_cv.notify_all();
+                    sh.dgram_cv.notify_all();
+                    sh.state_cv.notify_all();
+                }
             }
         }
         false
@@ -1240,20 +1255,25 @@ impl Loop {
                 if self.mutual_auth {
                     return;
                 }
-                let sh = match self.live.get_mut(&id) {
-                    Some(lc) => match lc.quic.streams().accept(Dir::Bi) {
-                        Some(qid) => {
-                            let sh = Arc::new(StreamShared::new(id, self.tx.clone()));
-                            lc.streams.insert(qid, sh.clone());
-                            sh
-                        }
-                        None => return,
-                    },
-                    None => return,
-                };
-                if let Some(lc) = self.live.get(&id) {
+                // quinn-proto emits one `Opened` event per direction per poll
+                // batch (a single flag), not one per stream. Drain the whole
+                // accept queue so several streams opened in the same packet
+                // all reach the `accepted` queue (flow-session AC5: 6 streams
+                // in a tight loop must all be delivered).
+                let mut notified = false;
+                while let Some(lc) = self.live.get_mut(&id) {
+                    let Some(qid) = lc.quic.streams().accept(Dir::Bi) else {
+                        break;
+                    };
+                    let sh = Arc::new(StreamShared::new(id, self.tx.clone()));
+                    lc.streams.insert(qid, sh.clone());
                     lc.shared.accepted.lock().unwrap().push_back(sh);
-                    lc.shared.accepted_cv.notify_all();
+                    notified = true;
+                }
+                if notified {
+                    if let Some(lc) = self.live.get(&id) {
+                        lc.shared.accepted_cv.notify_all();
+                    }
                 }
             }
             // Readable/Writable/Finished/Stopped/Available/Datagram*: the pump

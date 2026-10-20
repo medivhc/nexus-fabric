@@ -259,7 +259,10 @@ pub enum PunchDecision {
     Punch,
     /// 本地 Symmetric + Δ 稳定 + 对端 Cone：D2 有界预测打洞
     /// （±16 端口窗口，3s 时间盒，只打对端单一 IP）。
-    BoundedPunch { port_radius: u16, time_window: Duration },
+    BoundedPunch {
+        port_radius: u16,
+        time_window: Duration,
+    },
     /// 其余情况：维持 Relay，不打洞。
     NoPunch,
 }

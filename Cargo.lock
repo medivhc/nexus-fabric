@@ -1526,8 +1526,10 @@ dependencies = [
  "nexus-domain",
  "nexus-fabric",
  "nexus-ingress",
+ "nexus-nat-wireup",
  "nexus-network",
  "nexus-path",
+ "sha2",
  "smoltcp",
  "tun-rs",
 ]
