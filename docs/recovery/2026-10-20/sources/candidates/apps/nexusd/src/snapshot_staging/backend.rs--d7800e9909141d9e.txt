@@ -1,0 +1,324 @@
+use super::*;
+use nexus::n3_acceptance::{new_task_id, parse_canonical_json, sha256};
+use nexus_control_api::snapshot::{UploadBlob, UploadId, UploadState};
+use nexus_domain::task::{
+    MAX_INTEGER, Sha256Digest, SnapshotRef, TaskId,
+    codec::{CanonicalDto, Value},
+};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ffi::OsStr,
+    path::PathBuf,
+    sync::Mutex,
+};
+#[path = "init.rs"]
+mod init;
+#[path = "io.rs"]
+mod io;
+#[path = "ledger.rs"]
+mod ledger;
+#[path = "model.rs"]
+mod model;
+#[path = "ops.rs"]
+mod ops;
+#[path = "recovery.rs"]
+mod recovery;
+use model::*;
+fn corrupt(reason: impl Into<String>) -> TaskError {
+    TaskError::new(TaskErrorCode::StateCorrupt, reason, false)
+}
+fn persistence(reason: impl Into<String>) -> TaskError {
+    TaskError::new(TaskErrorCode::PersistenceFailed, reason, true)
+}
+fn capacity(reason: impl Into<String>) -> TaskError {
+    TaskError::new(TaskErrorCode::CapacityUnavailable, reason, true)
+}
+fn integrity(reason: impl Into<String>) -> TaskError {
+    TaskError::new(TaskErrorCode::InputIntegrityFailed, reason, false)
+}
+fn name(s: &str) -> &OsStr {
+    OsStr::new(s)
+}
+fn required<T>(v: Option<T>) -> Result<T, TaskError> {
+    v.ok_or_else(|| corrupt("required staging authority is missing"))
+}
+fn file(
+    d: &io::Directory,
+    n: &str,
+    limit: u64,
+    id: Option<io::NodeId>,
+) -> Result<io::Regular, TaskError> {
+    required(io::open_regular(
+        d,
+        name(n),
+        io::ReadPolicy::PrivateAuthority,
+        limit,
+        id,
+    )?)
+}
+fn child(d: &io::Directory, n: &str, id: Option<io::NodeId>) -> Result<io::Directory, TaskError> {
+    required(d.child(name(n), id)?)
+}
+fn inventory(d: &io::Directory, allowed: &[String]) -> Result<(), TaskError> {
+    for n in d.children()? {
+        if !allowed.iter().any(|x| name(x) == n) {
+            return Err(corrupt("unknown staging entry"));
+        }
+    }
+    Ok(())
+}
+fn request_id(r: &SnapshotRequest) -> Option<&UploadId> {
+    match r {
+        SnapshotRequest::Begin { .. } => None,
+        SnapshotRequest::PutChunk { upload_id, .. }
+        | SnapshotRequest::Get { upload_id }
+        | SnapshotRequest::Seal { upload_id }
+        | SnapshotRequest::Cancel { upload_id } => Some(upload_id),
+    }
+}
+fn lock<T>(m: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, TaskError> {
+    m.lock()
+        .map_err(|_| corrupt("staging synchronization poisoned"))
+}
+pub struct FileSnapshotStaging {
+    config: PathBuf,
+    root: io::Directory,
+    binding: Binding,
+    policy: Policy,
+    #[cfg(test)]
+    fault: Mutex<&'static str>,
+    #[cfg(test)]
+    time: Mutex<Option<u64>>,
+    #[cfg(test)]
+    last: Mutex<Option<UploadId>>,
+    #[cfg(test)]
+    before_lease: Mutex<Option<TestBeforeLease>>,
+}
+impl std::fmt::Debug for FileSnapshotStaging {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileSnapshotStaging")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+impl FileSnapshotStaging {
+    pub fn open(config: &Path) -> Result<Option<Self>, TaskError> {
+        Self::open_at(config, None)
+    }
+    fn open_at(config: &Path, now: Option<u64>) -> Result<Option<Self>, TaskError> {
+        let Some(service) = init::load(config, now)? else {
+            return Ok(None);
+        };
+        let nodes = service.nodes()?;
+        let lease = io::try_exclusive(
+            &nodes.namespace,
+            name(LOCK),
+            required(service.binding.lock)?,
+        )?;
+        let mut ledger = ledger::load(&service, &nodes, true)?;
+        recovery::validate_all(&service, &nodes, &ledger)?;
+        recovery::recover_all(&service, &nodes, &mut ledger)?;
+        ops::expire(&service, &nodes, &mut ledger)?;
+        lease.check()?;
+        service.root.check()?;
+        Ok(Some(service))
+    }
+    #[cfg(test)]
+    pub(super) fn open_with_test_time(config: &Path, now: u64) -> Result<Option<Self>, TaskError> {
+        Self::open_at(config, Some(now))
+    }
+    fn now(&self) -> u64 {
+        #[cfg(test)]
+        if let Ok(v) = self.time.lock() {
+            if let Some(n) = *v {
+                return n.min(MAX_INTEGER);
+            }
+        }
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs().min(MAX_INTEGER))
+    }
+    fn hit(&self, point: &str) -> Result<(), TaskError> {
+        #[cfg(test)]
+        if *lock(&self.fault)? == point {
+            return Err(persistence(format!("test interruption at {point}")));
+        }
+        let _ = point;
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(super) fn set_fault(&self, point: &'static str) {
+        if let Ok(mut x) = self.fault.lock() {
+            *x = point
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn set_time(&self, now: u64) {
+        if let Ok(mut x) = self.time.lock() {
+            *x = Some(now)
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn set_test_before_lease(&self, gate: TestBeforeLease) {
+        if let Ok(mut x) = self.before_lease.lock() {
+            *x = Some(gate)
+        }
+    }
+    fn gate(&self) -> Result<(), TaskError> {
+        #[cfg(test)]
+        if let Some(g) = lock(&self.before_lease)?.take() {
+            g.arrived
+                .send(())
+                .map_err(|_| persistence("test gate receiver lost"))?;
+            lock(&g.release)?
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .map_err(|_| persistence("test gate release deadline"))?
+        }
+        Ok(())
+    }
+    pub fn execute_local(&self, request: SnapshotRequest) -> SnapshotEnvelope {
+        let id = request_id(&request).cloned();
+        let result = (|| {
+            self.verify_identity()?;
+            let c = TaskCallContext::from_authenticated(
+                self.binding.principal.clone(),
+                self.binding.workspace.clone(),
+            )?;
+            self.execute(&c, request)
+        })();
+        match result {
+            Ok(v) => SnapshotEnvelope::Upload(v),
+            Err(error) => SnapshotEnvelope::Error {
+                error,
+                upload_id: id,
+            },
+        }
+    }
+    fn refuse(&self, context: &TaskCallContext, reason: &str) -> TaskError {
+        match nexus::task_authorization::audit_refusal(
+            &self.config,
+            context.principal(),
+            context.workspace(),
+            None,
+            reason,
+        ) {
+            Ok(()) => TaskError::new(TaskErrorCode::AuthDenied, reason, false),
+            Err(e) => e,
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn test_observe(&self, id: &UploadId) -> Result<TestDurableObservation, TaskError> {
+        let nodes = self.observer_nodes()?;
+        let l = ledger::load(self, &nodes, false)?;
+        let r = l
+            .records
+            .iter()
+            .find(|r| &r.id == id)
+            .ok_or_else(|| corrupt("unknown observed upload"))?;
+        Ok(TestDurableObservation {
+            view: r.view(&l.binding),
+            chunk: match &r.intent {
+                Some(Intent::Chunk(c)) => Some(TestChunkIntent {
+                    old_offset: c.old,
+                    next_offset: c.next,
+                    chunk_sha256: c.hash.clone(),
+                }),
+                _ => None,
+            },
+            future_ceiling_bytes: r.ceiling,
+            actual_record_bytes: r.to_value().canonical_bytes().len() as u64,
+        })
+    }
+    #[cfg(test)]
+    pub(super) fn test_metadata_allowance(&self) -> Result<(u64, usize), TaskError> {
+        let n = self.observer_nodes()?;
+        let l = ledger::load(self, &n, false)?;
+        Ok((ledger::allowance(&l)?, l.records.len()))
+    }
+    #[cfg(test)]
+    pub(super) fn test_last_generated_upload_id(&self) -> Result<UploadId, TaskError> {
+        required(lock(&self.last)?.clone())
+    }
+}
+impl SnapshotService for FileSnapshotStaging {
+    fn execute(
+        &self,
+        context: &TaskCallContext,
+        request: SnapshotRequest,
+    ) -> Result<UploadView, TaskError> {
+        self.verify_identity()?;
+        crate::task_provider_init::check(&self.config).map_err(|e| e.error)?;
+        request.validate()?;
+        let nodes = self.nodes()?;
+        let authorized = if let SnapshotRequest::Begin {
+            provider,
+            workspace,
+            resource,
+            ..
+        } = &request
+        {
+            if provider != &self.binding.provider
+                || workspace != &self.binding.workspace
+                || context.workspace() != self.binding.workspace
+            {
+                return Err(self.refuse(context, "snapshot configured scope mismatch"));
+            }
+            resource.clone()
+        } else {
+            let l = ledger::load(self, &nodes, false)?;
+            let r = l
+                .records
+                .iter()
+                .find(|r| Some(&r.id) == request_id(&request))
+                .ok_or_else(|| self.refuse(context, "snapshot upload is not owned"))?;
+            if context.workspace() != self.binding.workspace || context.principal() != r.owner {
+                return Err(self.refuse(context, "snapshot upload owner mismatch"));
+            }
+            r.resource.clone()
+        };
+        nexus::task_authorization::authorize_use(
+            &self.config,
+            context.principal(),
+            &self.binding.workspace,
+            &authorized,
+        )?;
+        self.gate()?;
+        let lease = io::try_exclusive(&nodes.namespace, name(LOCK), required(self.binding.lock)?)?;
+        let mut l = ledger::load(
+            self,
+            &nodes,
+            !matches!(request, SnapshotRequest::Get { .. }),
+        )?;
+        if let Some(id) = request_id(&request) {
+            let r = l.records.iter().find(|r| &r.id == id).ok_or_else(|| {
+                TaskError::new(TaskErrorCode::AuthDenied, "unknown snapshot upload", false)
+            })?;
+            if r.owner != context.principal()
+                || r.resource != authorized
+                || context.workspace() != self.binding.workspace
+            {
+                return Err(TaskError::new(
+                    TaskErrorCode::AuthDenied,
+                    "snapshot binding changed",
+                    false,
+                ));
+            }
+        }
+        recovery::validate_all(self, &nodes, &l)?;
+        let result = ops::execute(self, &nodes, &mut l, context, &request)?;
+        lease.check()?;
+        self.verify_identity()?;
+        Ok(result)
+    }
+}
+pub fn initialize(config: &Path, budget: &Path) -> Result<StagingStatus, InitFailure> {
+    init::initialize(config, budget, "")
+}
+#[cfg(test)]
+pub(super) fn initialize_with_test_fault(
+    config: &Path,
+    budget: &Path,
+    point: &'static str,
+) -> Result<StagingStatus, InitFailure> {
+    init::initialize(config, budget, point)
+}

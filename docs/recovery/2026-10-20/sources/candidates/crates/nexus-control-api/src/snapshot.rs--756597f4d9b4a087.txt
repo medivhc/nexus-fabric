@@ -1,0 +1,138 @@
+//! N3-12 TDD interface stubs. No production codec or validation is implemented.
+pub use crate::task::TaskCallContext;
+pub use nexus_domain::task::codec::{CanonicalDto, Value};
+pub use nexus_domain::task::{Sha256Digest, SnapshotRef, TaskError, TaskErrorCode};
+
+pub const MAX_MANIFEST_BYTES: usize = 65_536;
+pub const MAX_CHUNK_BYTES: usize = 65_536;
+pub const MAX_SNAPSHOT_FILES: u64 = 1_024;
+pub const MAX_SNAPSHOT_BYTES: u64 = 67_108_864;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UploadId(String);
+impl UploadId {
+    // A data holder only: validation deliberately remains absent for RED tests.
+    pub fn new(value: String) -> Result<Self, TaskError> {
+        Ok(Self(value))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadState {
+    Receiving,
+    Staged,
+    Cancelling,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadBlob {
+    pub sha256: Sha256Digest,
+    pub size_bytes: u64,
+    pub durable_offset: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadView {
+    pub schema_version: u64,
+    pub upload_id: UploadId,
+    pub provider: String,
+    pub workspace: String,
+    pub resource: String,
+    pub snapshot: SnapshotRef,
+    pub state: UploadState,
+    pub reserved_bytes: u64,
+    pub blobs: Vec<UploadBlob>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotRequest {
+    Begin {
+        provider: String,
+        workspace: String,
+        resource: String,
+        upload_key: String,
+        snapshot: Box<SnapshotRef>,
+        manifest_json: String,
+    },
+    PutChunk {
+        upload_id: UploadId,
+        blob_sha256: Sha256Digest,
+        offset: u64,
+        bytes: Vec<u8>,
+        chunk_sha256: Sha256Digest,
+    },
+    Get {
+        upload_id: UploadId,
+    },
+    Seal {
+        upload_id: UploadId,
+    },
+    Cancel {
+        upload_id: UploadId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotEnvelope {
+    Upload(UploadView),
+    Error {
+        error: TaskError,
+        upload_id: Option<UploadId>,
+    },
+}
+
+/// Deletion couples portable clients to authenticated daemon persistence.
+pub trait SnapshotService: Send + Sync {
+    fn execute(
+        &self,
+        context: &TaskCallContext,
+        request: SnapshotRequest,
+    ) -> Result<UploadView, TaskError>;
+}
+
+fn pending() -> TaskError {
+    TaskError::invalid("N3-12 TDD interface stub")
+}
+impl UploadBlob {
+    pub fn validate(&self) -> Result<(), TaskError> {
+        Err(pending())
+    }
+}
+impl UploadView {
+    pub fn validate(&self) -> Result<(), TaskError> {
+        Err(pending())
+    }
+}
+impl SnapshotRequest {
+    pub fn validate(&self) -> Result<(), TaskError> {
+        Err(pending())
+    }
+}
+impl SnapshotEnvelope {
+    pub fn validate(&self) -> Result<(), TaskError> {
+        Err(pending())
+    }
+    pub fn validate_for(&self, _request: &SnapshotRequest) -> Result<(), TaskError> {
+        Err(pending())
+    }
+}
+macro_rules! stub_codec {
+    ($($ty:ty),+ $(,)?) => {$ (
+        impl CanonicalDto for $ty {
+            fn to_value(&self) -> Value { Value::Null }
+            fn from_value(_value: Value) -> Result<Self, TaskError> { Err(pending()) }
+        }
+    )+ };
+}
+stub_codec!(
+    UploadId,
+    UploadState,
+    UploadBlob,
+    UploadView,
+    SnapshotRequest,
+    SnapshotEnvelope
+);

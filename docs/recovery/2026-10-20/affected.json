@@ -1,0 +1,13 @@
+{
+  "command": "test",
+  "gates": [
+    {
+      "detail": "tested: nexus, nexus-connectivity, nexus-harness, nexus-nat-traversal, nexus-nat-wireup, nexus-outbound-anytls, nexus-outbound-hysteria2, nexus-outbound-shadowsocks, nexus-outbound-trojan, nexus-outbound-vless, nexus-outbound-vmess, nexus-proxy, nexusd",
+      "name": "affected-tests",
+      "verdict": "PASS"
+    }
+  ],
+  "message": "tested: nexus, nexus-connectivity, nexus-harness, nexus-nat-traversal, nexus-nat-wireup, nexus-outbound-anytls, nexus-outbound-hysteria2, nexus-outbound-shadowsocks, nexus-outbound-trojan, nexus-outbound-vless, nexus-outbound-vmess, nexus-proxy, nexusd",
+  "schema_version": 1,
+  "verdict": "PASS"
+}

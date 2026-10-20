@@ -1,0 +1,127 @@
+//! N3-12 interface-only TDD stub. Production persistence is deliberately absent.
+use crate::task_provider_init::InitFailure;
+use nexus_control_api::snapshot::{SnapshotEnvelope, SnapshotRequest, SnapshotService, UploadView};
+use nexus_control_api::task::TaskCallContext;
+use nexus_domain::task::{TaskError, TaskErrorCode};
+use std::path::Path;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagingStatus {
+    pub provider: String,
+    pub workspace: String,
+    pub principal: String,
+    pub policy_digest: String,
+    pub changed: bool,
+}
+fn pending() -> TaskError {
+    TaskError::new(
+        TaskErrorCode::UnsupportedCapability,
+        "N3-12 TDD adapter stub",
+        false,
+    )
+}
+pub fn initialize(_config: &Path, _budget: &Path) -> Result<StagingStatus, InitFailure> {
+    Err(pending().into())
+}
+#[derive(Debug)]
+pub struct FileSnapshotStaging;
+impl FileSnapshotStaging {
+    pub fn open(_config: &Path) -> Result<Option<Self>, TaskError> {
+        Err(pending())
+    }
+    #[cfg(test)]
+    fn open_with_test_time(_config: &Path, _now: u64) -> Result<Option<Self>, TaskError> {
+        Err(pending())
+    }
+    pub fn execute_local(&self, _request: SnapshotRequest) -> SnapshotEnvelope {
+        SnapshotEnvelope::Error {
+            error: pending(),
+            upload_id: None,
+        }
+    }
+    #[cfg(test)]
+    fn set_fault(&self, _cutpoint: &'static str) {}
+    #[cfg(test)]
+    fn set_time(&self, _now: u64) {}
+    // One-shot, instance-owned test rendezvous immediately before execute's
+    // real staging lease acquisition, after identity/scope/current Use audit.
+    // No mutable ledger read/key/admission/offset decision may occur between
+    // this rendezvous and that acquisition (all such decisions need the lease).
+    // Real implementations send arrived, then use a bounded recv_timeout on
+    // release; neither the gate nor the setter exists in production builds.
+    #[cfg(test)]
+    fn set_test_before_lease(&self, gate: TestBeforeLease) {
+        // Interface-only ErrStub does not retain or signal a fake rendezvous.
+        let TestBeforeLease { arrived, release } = gate;
+        drop((arrived, release));
+    }
+    // Read-only test projections of actual checksummed durable records
+    // (including the uniquely provable next-transition tmp). Never authorize,
+    // recover, read an in-memory substitute or write. Filesystem corruption
+    // outside the ledger does not prevent inspecting its retained reservation.
+    #[cfg(test)]
+    fn test_observe(
+        &self,
+        _id: &nexus_control_api::snapshot::UploadId,
+    ) -> Result<TestDurableObservation, TaskError> {
+        Err(pending())
+    }
+    #[cfg(test)]
+    // (Persisted future record ceilings + reserved global envelope, index count)
+    // including unexpired Cancelled records. Read real ledger bytes only.
+    fn test_metadata_allowance(&self) -> Result<(u64, usize), TaskError> {
+        Err(pending())
+    }
+    // Captured from the real generator before a fault, not a test-supplied ID.
+    #[cfg(test)]
+    fn test_last_generated_upload_id(
+        &self,
+    ) -> Result<nexus_control_api::snapshot::UploadId, TaskError> {
+        Err(pending())
+    }
+}
+impl SnapshotService for FileSnapshotStaging {
+    fn execute(
+        &self,
+        _context: &TaskCallContext,
+        _request: SnapshotRequest,
+    ) -> Result<UploadView, TaskError> {
+        Err(pending())
+    }
+}
+#[cfg(test)]
+fn initialize_with_test_fault(
+    config: &Path,
+    budget: &Path,
+    _cutpoint: &'static str,
+) -> Result<StagingStatus, InitFailure> {
+    initialize(config, budget)
+}
+#[cfg(test)]
+#[path = "snapshot_staging_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TestChunkIntent {
+    old_offset: u64,
+    next_offset: u64,
+    chunk_sha256: nexus_domain::task::Sha256Digest,
+}
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TestDurableObservation {
+    view: UploadView,
+    chunk: Option<TestChunkIntent>,
+    // The original admitted ceiling retained in the actual ledger record.
+    future_ceiling_bytes: u64,
+    // Actual canonical bytes of that complete private record, not UploadView
+    // size and not a fabricated test estimate. No private JSON layout is frozen.
+    actual_record_bytes: u64,
+}
+
+#[cfg(test)]
+struct TestBeforeLease {
+    arrived: std::sync::mpsc::Sender<()>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}

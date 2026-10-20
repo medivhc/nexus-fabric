@@ -2753,9 +2753,9 @@ pub fn turn_relay_allocate_flow() -> Result<Value, NexusError> {
     synth.txn = synth_txid;
     let synth_bytes = synth
         .attr(Attribute::XorRelayedAddress(
-            "192.0.2.1:54320".parse().map_err(|e| {
-                internal(format!("synthetic relayed address parse failed: {e}"))
-            })?,
+            "192.0.2.1:54320"
+                .parse()
+                .map_err(|e| internal(format!("synthetic relayed address parse failed: {e}")))?,
         ))
         .attr(Attribute::Lifetime(600))
         .encode();

@@ -1,0 +1,67 @@
+//! One atomic checksummed ledger and a single provable next replacement.
+use super::*;
+use init::Nodes;
+pub(super) fn allowance(l:&Ledger)->Result<u64,TaskError>{let mut header=l.clone();header.records.clear();header.generation=MAX_INTEGER;header.predecessor=Some(sha256(&[]));header.transition=Transition{kind:"cleanup_durable".into(),id:Some(UploadId::new(format!("task-{}","f".repeat(64)))?),before:Some(sha256(&[])),after:Some(sha256(&[])),at:MAX_INTEGER};let mut n=seal(&header).len() as u64+512;for r in &l.records{n=n.checked_add(r.ceiling+1).ok_or_else(||corrupt("metadata allowance overflow"))?}Ok(n)}
+fn validate(l:&Ledger,s:&FileSnapshotStaging)->Result<(),TaskError>{
+    if l.schema_version!=1||l.binding!=s.binding||l.generation>MAX_INTEGER||l.records.len()>1024||allowance(l)?>LEDGER_LIMIT{return Err(corrupt("invalid ledger envelope or metadata allowance"))}
+    if l.generation==0 {if l.predecessor.is_some()||l.transition.kind!="initial"||!l.records.is_empty(){return Err(corrupt("invalid initial ledger"))}} else if l.predecessor.is_none()||l.transition.before.is_none()&&l.transition.kind!="begin" {return Err(corrupt("invalid ledger predecessor proof"))}
+    let mut ids=BTreeSet::new();let mut keys=BTreeSet::new();let mut reserved=GLOBAL;let mut active=0;for r in &l.records{r.validate(&l.binding)?;if !ids.insert(&r.id)||!keys.insert((&r.owner,&r.resource,&r.key)){return Err(corrupt("duplicate ledger index"))}if r.state!=UploadState::Cancelled{reserved=reserved.checked_add(r.charge).filter(|x|*x<=s.policy.max_reserved_bytes).ok_or_else(||corrupt("ledger reservations exceed policy"))?;active+=1;}}
+    if active>s.policy.max_active_uploads{return Err(corrupt("ledger active count exceeds policy"))}Ok(())
+}
+fn record_hash(r:Option<&Record>)->Option<Sha256Digest>{r.map(checksum)}
+fn immutable(a:&Record,b:&Record)->bool {a.id==b.id&&a.owner==b.owner&&a.resource==b.resource&&a.key==b.key&&a.snapshot==b.snapshot&&a.manifest==b.manifest&&a.charge==b.charge&&a.ceiling==b.ceiling&&a.blobs.len()==b.blobs.len()&&a.blobs.iter().zip(&b.blobs).all(|(x,y)|x.digest==y.digest&&x.size==y.size)}
+fn replace_only(a:&Record,b:&Record,edit:impl FnOnce(&mut Record))->bool{let mut x=a.clone();edit(&mut x);x==*b}
+fn legal_record(kind:&str,a:&Record,b:&Record)->bool{
+    if !immutable(a,b){return false}
+    match kind {
+        "begin_bind"=>matches!(a.intent,Some(Intent::Begin))&&replace_only(a,b,|x|{x.directory=b.directory;x.blob_directory=b.blob_directory;x.manifest_inode=b.manifest_inode;for (p,q) in x.blobs.iter_mut().zip(&b.blobs){p.inode=q.inode}})&&a.directory.is_none_or(|x|Some(x)==b.directory)&&a.blob_directory.is_none_or(|x|Some(x)==b.blob_directory)&&a.manifest_inode.is_none_or(|x|Some(x)==b.manifest_inode)&&a.blobs.iter().zip(&b.blobs).all(|(x,y)|x.inode.is_none_or(|i|Some(i)==y.inode)),
+        "begin_done"=>matches!(a.intent,Some(Intent::Begin))&&replace_only(a,b,|x|x.intent=None),
+        "chunk_intent"=>a.state==UploadState::Receiving&&a.intent.is_none()&&matches!(&b.intent,Some(Intent::Chunk(c)) if c.phase=="writing"&&c.scratch.is_none())&&replace_only(a,b,|x|x.intent=b.intent.clone()),
+        "chunk_bind"|"chunk_ready"|"chunk_commit"|"chunk_clear"=>{
+            let Some(Intent::Chunk(c))=&a.intent else{return false};
+            if kind=="chunk_clear" {return (c.phase=="cleanup"||c.phase=="writing")&&b.intent.is_none()&&replace_only(a,b,|x|x.intent=None)}
+            let Some(Intent::Chunk(d))=&b.intent else{return false};
+            if c.blob!=d.blob||c.old!=d.old||c.next!=d.next||c.hash!=d.hash||c.old_prefix!=d.old_prefix{return false}
+            match kind {
+                "chunk_bind"=>c.phase=="writing"&&d.phase=="writing"&&c.scratch.is_none()&&d.scratch.is_some()&&replace_only(a,b,|x|x.intent=b.intent.clone()),
+                "chunk_ready"=>c.phase=="writing"&&d.phase=="ready"&&c.scratch==d.scratch&&c.scratch.is_some()&&replace_only(a,b,|x|x.intent=b.intent.clone()),
+                _=>c.phase=="ready"&&d.phase=="cleanup"&&c.scratch==d.scratch&&replace_only(a,b,|x|{x.intent=b.intent.clone();for p in &mut x.blobs{if p.digest==c.blob{p.offset=c.next;if let Some(q)=b.blobs.iter().find(|q|q.digest==p.digest){p.prefix=q.prefix.clone()}}}}),
+            }
+        },
+        "seal_intent"=>a.state==UploadState::Receiving&&a.intent.is_none()&&matches!(b.intent,Some(Intent::Seal))&&a.blobs.iter().all(|x|x.offset==x.size)&&replace_only(a,b,|x|x.intent=b.intent.clone()),
+        "seal_commit"=>matches!(a.intent,Some(Intent::Seal))&&b.state==UploadState::Staged&&replace_only(a,b,|x|{x.state=UploadState::Staged;x.intent=None}),
+        "cancel_intent"=>matches!(a.state,UploadState::Receiving|UploadState::Staged)&&a.intent.is_none()&&b.state==UploadState::Cancelling&&matches!(&b.intent,Some(Intent::Cleanup(c)) if c.deleted.is_empty()&&c.deleting.is_none()&&!c.directories_durable)&&replace_only(a,b,|x|{x.state=b.state;x.intent=b.intent.clone()}),
+        "delete_intent"|"delete_done"|"cleanup_durable"=>{
+            let (Some(Intent::Cleanup(c)),Some(Intent::Cleanup(d)))=(&a.intent,&b.intent) else{return false};
+            if !replace_only(a,b,|x|x.intent=b.intent.clone()){return false}
+            match kind{"delete_intent"=>c.deleting.is_none()&&d.deleting.is_some()&&c.deleted==d.deleted&&!c.directories_durable&&!d.directories_durable,"delete_done"=>c.deleting.is_some()&&d.deleting.is_none()&&d.deleted.len()==c.deleted.len()+1&&d.deleted.starts_with(&c.deleted)&&d.deleted.last()==c.deleting.as_ref()&&!c.directories_durable&&!d.directories_durable,_=>c.deleting.is_none()&&d.deleting.is_none()&&c.deleted==d.deleted&&!c.directories_durable&&d.directories_durable&&d.deleted.contains(&".".into())}
+        },
+        "cancel_commit"=>matches!(&a.intent,Some(Intent::Cleanup(c)) if c.directories_durable)&&b.state==UploadState::Cancelled&&b.cancelled_at.is_some()&&replace_only(a,b,|x|{x.state=UploadState::Cancelled;x.intent=None;x.cancelled_at=b.cancelled_at}),
+        _=>false,
+    }
+}
+pub(super) fn prove(old:&Ledger,next:&Ledger)->Result<(),TaskError>{
+    let t=&next.transition;
+    if next.binding!=old.binding||next.schema_version!=old.schema_version||old.generation.checked_add(1)!=Some(next.generation)||next.predecessor!=Some(checksum(old)){return Err(corrupt("replacement is not the unique next generation"))}
+    if t.kind=="expire" {
+        if t.id.is_some()||t.before!=Some(sha256(&old.records.to_value().canonical_bytes()))||t.after!=Some(sha256(&next.records.to_value().canonical_bytes())){return Err(corrupt("invalid expiry transition proof"))}
+        let expected=old.records.iter().filter(|r|!expired(r,t.at)).cloned().collect::<Vec<_>>();if expected==old.records||expected!=next.records{return Err(corrupt("invalid tombstone removal"))}return Ok(())
+    }
+    let id=t.id.as_ref().ok_or_else(||corrupt("missing transition upload"))?;let a=old.records.iter().find(|r|&r.id==id);let b=next.records.iter().find(|r|&r.id==id);
+    if t.before!=record_hash(a)||t.after!=record_hash(b)||old.records.iter().filter(|r|&r.id!=id).ne(next.records.iter().filter(|r|&r.id!=id)){return Err(corrupt("unrelated records changed"))}
+    match (a,b){(None,Some(r)) if t.kind=="begin"&&next.records.len()==old.records.len()+1&&r.state==UploadState::Receiving&&matches!(r.intent,Some(Intent::Begin))&&r.directory.is_none()&&r.blob_directory.is_none()&&r.manifest_inode.is_none()&&r.blobs.iter().all(|b|b.inode.is_none())=>Ok(()),(Some(a),Some(b)) if legal_record(&t.kind,a,b)=>Ok(()),_=>Err(corrupt("illegal next ledger transition"))}
+}
+pub(super) fn expired(r:&Record,now:u64)->bool{r.state==UploadState::Cancelled&&r.cancelled_at.is_some_and(|at|now>=at&&now-at>=86400)}
+pub(super) fn load(s:&FileSnapshotStaging,n:&Nodes,publish:bool)->Result<Ledger,TaskError>{
+    let current=file(&n.namespace,LEDGER,LEDGER_LIMIT,None)?;let old:Ledger=unseal(&current.read_all()?)?;validate(&old,s)?;
+    let Some(temp)=io::open_regular(&n.namespace,name(TEMP),io::ReadPolicy::PrivateAuthority,LEDGER_LIMIT,None)? else{return Ok(old)};
+    let next:Ledger=unseal(&temp.read_all()?)?;validate(&next,s)?;prove(&old,&next)?;
+    if publish {recovery::validate_all(s,n,&next)?;io::publish(temp,&n.namespace,name(LEDGER),Some(&current))?;io::sync_directory(&n.namespace)?;}Ok(next)
+}
+pub(super) fn save(s:&FileSnapshotStaging,n:&Nodes,l:&mut Ledger,mut next:Ledger,kind:&str,id:Option<&UploadId>)->Result<(),TaskError>{
+    next.generation=l.generation.checked_add(1).filter(|x|*x<=MAX_INTEGER).ok_or_else(||capacity("ledger generation exhausted"))?;next.predecessor=Some(checksum(l));next.transition=Transition{kind:kind.into(),id:id.cloned(),before:id.and_then(|i|record_hash(l.records.iter().find(|r|&r.id==i))).or_else(||if kind=="expire"{Some(sha256(&l.records.to_value().canonical_bytes()))}else{None}),after:id.and_then(|i|record_hash(next.records.iter().find(|r|&r.id==i))).or_else(||if kind=="expire"{Some(sha256(&next.records.to_value().canonical_bytes()))}else{None}),at:s.now()};
+    validate(&next,s)?;prove(l,&next)?;let bytes=seal(&next);if bytes.len() as u64>LEDGER_LIMIT{return Err(corrupt("admitted ledger exceeds serialization bound"))}
+    let current=file(&n.namespace,LEDGER,LEDGER_LIMIT,None)?;let actual:Ledger=unseal(&current.read_all()?)?;if actual!=*l{return Err(corrupt("ledger changed inside lease"))}
+    let temp=io::create_file(&n.namespace,name(TEMP),LEDGER_LIMIT)?;io::write_new(&temp,&bytes)?;io::sync_file(&temp)?;s.hit("ledger_tmp_durable")?;io::publish(temp,&n.namespace,name(LEDGER),Some(&current))?;s.hit("ledger_replaced")?;io::sync_directory(&n.namespace)?;s.hit("ledger_directory_durable")?;*l=next;Ok(())
+}
+pub(super) fn edit(s:&FileSnapshotStaging,n:&Nodes,l:&mut Ledger,id:&UploadId,kind:&str,f:impl FnOnce(&mut Record))->Result<(),TaskError>{let mut next=l.clone();let r=next.records.iter_mut().find(|r|&r.id==id).ok_or_else(||corrupt("missing transaction record"))?;f(r);save(s,n,l,next,kind,Some(id))}

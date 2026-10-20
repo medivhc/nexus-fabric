@@ -1,0 +1,232 @@
+//! Validate before mutation; replay only the original owned transaction.
+use super::*;
+use init::Nodes;
+fn cleanup(r: &Record) -> Option<&Cleanup> {
+    match &r.intent {
+        Some(Intent::Cleanup(c)) => Some(c),
+        _ => None,
+    }
+}
+fn may_be_absent(r: &Record, _path: &str) -> bool { cleanup(r).is_some() }
+fn must_be_absent(r: &Record, _path: &str) -> bool {
+    cleanup(r).is_some_and(|c| c.directories_durable)
+}
+fn regular(
+    d: &io::Directory,
+    n: &str,
+    limit: u64,
+    id: Option<io::NodeId>,
+    r: &Record,
+    path: &str,
+) -> Result<Option<io::Regular>, TaskError> {
+    let f = io::open_regular(d, name(n), io::ReadPolicy::PrivateAuthority, limit, id)?;
+    if f.is_some() && (id.is_none() || must_be_absent(r, path)) {
+        return Err(corrupt("unbound or resurrected payload"));
+    }
+    if f.is_none() && id.is_some() && !may_be_absent(r, path) {
+        return Err(corrupt("original payload missing"));
+    }
+    Ok(f)
+}
+pub(super) fn upload(n: &Nodes, r: &Record) -> Result<Option<io::Directory>, TaskError> {
+    let d = n.uploads.child(name(r.id.as_str()), r.directory)?;
+    if d.is_some()
+        && (r.directory.is_none() || r.state == UploadState::Cancelled || must_be_absent(r, "."))
+    {
+        return Err(corrupt("unbound or resurrected upload directory"));
+    }
+    if d.is_none()
+        && r.directory.is_some()
+        && r.state != UploadState::Cancelled
+        && !may_be_absent(r, ".")
+    {
+        return Err(corrupt("original upload directory missing"));
+    }
+    Ok(d)
+}
+pub(super) fn validate_all(
+    _s: &FileSnapshotStaging,
+    n: &Nodes,
+    l: &Ledger,
+) -> Result<(), TaskError> {
+    inventory(
+        &n.namespace,
+        &[
+            POLICY.into(),
+            LOCK.into(),
+            LEDGER.into(),
+            TEMP.into(),
+            "uploads".into(),
+        ],
+    )?;
+    inventory(
+        &n.uploads,
+        &l.records
+            .iter()
+            .filter(|r| r.state != UploadState::Cancelled)
+            .map(|r| r.id.as_str().into())
+            .collect::<Vec<_>>(),
+    )?;
+    for r in &l.records {
+        validate_record(n, r)?
+    }
+    Ok(())
+}
+pub(super) fn validate_record(n: &Nodes, r: &Record) -> Result<(), TaskError> {
+    let Some(d) = upload(n, r)? else {
+        return Ok(());
+    };
+    inventory(&d, &[MANIFEST.into(), "blobs".into(), SCRATCH.into()])?;
+    if let Some(f) = regular(&d, MANIFEST, 65536, r.manifest_inode, r, MANIFEST)? {
+        let bytes = f.read_all()?;
+        if bytes != r.manifest.as_bytes()
+            && !(matches!(r.intent, Some(Intent::Begin)) && bytes.is_empty())
+        {
+            return Err(corrupt("original manifest bytes changed"));
+        }
+    }
+    let blobs = d.child(name("blobs"), r.blob_directory)?;
+    if blobs.is_some() && (r.blob_directory.is_none() || must_be_absent(r, "blobs")) {
+        return Err(corrupt("unbound or resurrected blobs directory"));
+    }
+    if blobs.is_none() && r.blob_directory.is_some() && !may_be_absent(r, "blobs") {
+        return Err(corrupt("original blobs directory missing"));
+    }
+    let chunk = match &r.intent {
+        Some(Intent::Chunk(c)) => Some(c),
+        _ => None,
+    };
+    let scratch = regular(
+        &d,
+        SCRATCH,
+        65536,
+        chunk.and_then(|c| c.scratch),
+        r,
+        SCRATCH,
+    );
+    // CommittedCleanup proves the single original scratch unlink can be replayed.
+    let scratch = match scratch {
+        Err(e) if chunk.is_some_and(|c| c.phase == "cleanup") => {
+            let c = chunk.ok_or_else(|| corrupt("missing cleanup chunk"))?;
+            let f = io::open_regular(
+                &d,
+                name(SCRATCH),
+                io::ReadPolicy::PrivateAuthority,
+                65536,
+                c.scratch,
+            )?;
+            if f.is_some() {
+                return Err(e);
+            }
+            None
+        }
+        x => x?,
+    };
+    if let Some(c) = chunk {
+        if c.phase != "writing" {
+            if let Some(f) = &scratch {
+                if f.len()? != c.next - c.old || f.hash_prefix(c.next - c.old)? != c.hash {
+                    return Err(corrupt("ScratchReady bytes/hash changed"));
+                }
+            } else if c.phase != "cleanup" {
+                return Err(corrupt("ScratchReady scratch missing"));
+            }
+        } else if scratch
+            .as_ref()
+            .is_some_and(|f| f.len().is_ok_and(|v| v > c.next - c.old))
+        {
+            return Err(corrupt("unconfirmed scratch length exceeds intent"));
+        }
+    }
+    if let Some(bd) = blobs {
+        inventory(
+            &bd,
+            &r.blobs
+                .iter()
+                .map(|b| basename(&b.digest).into())
+                .collect::<Vec<_>>(),
+        )?;
+        for b in &r.blobs {
+            let path = format!("blobs/{}", basename(&b.digest));
+            let Some(f) = regular(&bd, basename(&b.digest), b.size, b.inode, r, &path)? else {
+                continue;
+            };
+            let len = f.len()?;
+            if len < b.offset || f.hash_prefix(b.offset)? != b.prefix {
+                return Err(corrupt("confirmed prefix missing or changed"));
+            }
+            if let Some(c) = chunk.filter(|c| c.blob == b.digest) {
+                if c.phase == "writing" {
+                    if len != c.old {
+                        return Err(corrupt("tail exists before ScratchReady"));
+                    }
+                } else {
+                    if len < c.old || len > c.next || f.hash_prefix(c.old)? != c.old_prefix {
+                        return Err(corrupt("pending blob range changed"));
+                    }
+                    let actual = (len - c.old) as usize;
+                    if actual > 0 {
+                        let bytes = f.read_range(c.old, actual)?;
+                        if c.phase == "ready" {
+                            let sf = scratch
+                                .as_ref()
+                                .ok_or_else(|| corrupt("pending scratch missing"))?;
+                            if bytes != sf.read_range(0, actual)? {
+                                return Err(corrupt("pending tail differs from original scratch"));
+                            }
+                        } else if len != c.next
+                            || sha256(&f.read_range(c.old, (c.next - c.old) as usize)?) != c.hash
+                        {
+                            return Err(corrupt("committed chunk changed"));
+                        }
+                    }
+                    if c.phase == "cleanup"
+                        && (len != c.next
+                            || sha256(&f.read_range(c.old, (c.next - c.old) as usize)?) != c.hash)
+                    {
+                        return Err(corrupt("committed chunk missing"));
+                    }
+                }
+            } else if len != b.offset {
+                return Err(corrupt("unexplained payload tail"));
+            }
+        }
+    }
+    Ok(())
+}
+pub(super) fn recover_all(
+    s: &FileSnapshotStaging,
+    n: &Nodes,
+    l: &mut Ledger,
+) -> Result<(), TaskError> {
+    let ids = l
+        .records
+        .iter()
+        .filter(|r| r.intent.is_some())
+        .map(|r| r.id.clone())
+        .collect::<Vec<_>>();
+    for id in ids {
+        recover(s, n, l, &id)?
+    }
+    Ok(())
+}
+pub(super) fn recover(
+    s: &FileSnapshotStaging,
+    n: &Nodes,
+    l: &mut Ledger,
+    id: &UploadId,
+) -> Result<(), TaskError> {
+    let r = l
+        .records
+        .iter()
+        .find(|r| &r.id == id)
+        .ok_or_else(|| corrupt("missing recovery record"))?
+        .clone();
+    match r.intent {
+        Some(Intent::Begin) => ops::finish_begin(s, n, l, id),
+        Some(Intent::Chunk(_)) => ops::finish_chunk(s, n, l, id),
+        Some(Intent::Seal) => ops::finish_seal(s, n, l, id),
+        Some(Intent::Cleanup(_)) => ops::finish_cancel(s, n, l, id),
+        None => Ok(()),
+    }
+}

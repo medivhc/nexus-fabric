@@ -1,0 +1,54 @@
+schema_version = 1
+id = "product.n3-12-snapshot-staging"
+title = "真实固定Commit冻结、本机认证有界上传及durable续传"
+evidence_strength = "E4"
+platform = "linux"
+requirement = "PRODUCT.md#179-n3-12"
+[given]
+[when]
+command = "python3 engineering/verifiers/n3_snapshot_staging.py"
+[[expect]]
+field = "verdict"
+equals = "PASS"
+[[expect]]
+field = "fixed_commit_source_readonly"
+equals = true
+[[expect]]
+field = "immutable_bundle_verified"
+equals = true
+[[expect]]
+field = "formal_staging_init"
+equals = true
+[[expect]]
+field = "authenticated_upload"
+equals = true
+[[expect]]
+field = "restart_prefix_preserved"
+equals = true
+[[expect]]
+field = "same_key_preserved"
+equals = true
+[[expect]]
+field = "key_conflict_denied"
+equals = true
+[[expect]]
+field = "current_grant_enforced"
+equals = true
+[[expect]]
+field = "budget_bound"
+equals = true
+[[expect]]
+field = "cancel_physical_cleanup"
+equals = true
+[[expect]]
+field = "damaged_boot_denied"
+equals = true
+[[expect]]
+field = "decoy_untouched"
+equals = true
+[[expect]]
+field = "no_task_session_engine"
+equals = true
+[[expect]]
+field = "shutdown_reaped"
+equals = true

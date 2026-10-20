@@ -1,0 +1,14 @@
+{
+  "command": "scenario run",
+  "duration_ms": 1703,
+  "evidence_id": "scenario-n311-restore20-e5835d6e186d",
+  "failure_signature": {
+    "assertion": "",
+    "failed_step": "",
+    "key_log_lines": []
+  },
+  "message": "scenario product.n3-11-provider-init: PASS (command ran, all 12 expectations held)",
+  "scenario": "product.n3-11-provider-init",
+  "schema_version": 1,
+  "verdict": "PASS"
+}

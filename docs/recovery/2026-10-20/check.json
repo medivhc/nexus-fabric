@@ -1,0 +1,28 @@
+{
+  "command": "check",
+  "gates": [
+    {
+      "detail": "no whitespace errors",
+      "name": "whitespace",
+      "verdict": "PASS"
+    },
+    {
+      "detail": "ok",
+      "name": "format",
+      "verdict": "PASS"
+    },
+    {
+      "detail": "ok",
+      "name": "check",
+      "verdict": "PASS"
+    },
+    {
+      "detail": "ok",
+      "name": "clippy",
+      "verdict": "PASS"
+    }
+  ],
+  "message": "check: 4 gate(s) passed",
+  "schema_version": 1,
+  "verdict": "PASS"
+}

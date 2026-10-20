@@ -1,0 +1,569 @@
+{
+  "scope": "Oct17 manifest recovery only. Not proof of Oct19 final revision. No production sources modified, no historical commands executed, no implementation tests or independent review performed.",
+  "entries": [
+    {
+      "repo_path": "Cargo.lock",
+      "sha256": "bfbac735ae5291a918e5f2fa12c974c2efaae9c84a9d4933b3ad314da570b317",
+      "bytes": 78843,
+      "status": "exact Oct17 manifest bytes; not proof of Oct19 final revision",
+      "evidence": [
+        {
+          "status": "exact historical bytes recovered from available Git blob",
+          "git_blob": "e2dae4db05c8f518e7865457138453333133fce3",
+          "historical_revision": "a97cfc0b63766a585d0194cebf5568be3092f92a"
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/exact/Cargo.lock.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "Cargo.toml",
+      "sha256": "1c4cd08bc635669a7307f5730f8b6cd0084fb979e65792a0f51c76c9592d15c5",
+      "bytes": 2696,
+      "status": "exact Oct17 manifest bytes; not proof of Oct19 final revision",
+      "evidence": [
+        {
+          "status": "exact historical bytes recovered from available Git blob",
+          "git_blob": "c85705874a3eee3ac0a108a61a63f023a40be235",
+          "historical_revision": "a97cfc0b63766a585d0194cebf5568be3092f92a"
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/exact/Cargo.toml.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexus/src/lib.rs",
+      "sha256": "27e715c97b99d135366414dcc54335497629607fedb4c1681e994ff80773aa53",
+      "bytes": 478352,
+      "status": "exact Oct17 manifest bytes; not proof of Oct19 final revision",
+      "evidence": [
+        {
+          "status": "exact historical bytes recovered from available Git blob",
+          "git_blob": "ebc04a1806e6f021db4c204eed6e5cfa05033b6c",
+          "historical_revision": "a97cfc0b63766a585d0194cebf5568be3092f92a"
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/exact/apps/nexus/src/lib.rs.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexus/src/main.rs",
+      "sha256": "45897f75209a8ab5e4bfe6937c1fb8a02b058f2d5561b1692bdd222867df8528",
+      "bytes": 80924,
+      "status": "exact Oct17 manifest bytes; not proof of Oct19 final revision",
+      "evidence": [
+        {
+          "status": "exact historical bytes recovered from available Git blob",
+          "git_blob": "9b6034c4ecaf2c3726acd449319c97e4339bc6c9",
+          "historical_revision": "a97cfc0b63766a585d0194cebf5568be3092f92a"
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/exact/apps/nexus/src/main.rs.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexus/src/n3_acceptance.rs",
+      "sha256": "e013aaff5c02baa950689f14ce671d58d9dbff43c97d9db02aa7f1f65f5e4550",
+      "bytes": 5085,
+      "status": "exact Oct17 manifest bytes; not proof of Oct19 final revision",
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147bd-4f0b-7392-a77e-dc3d795ab3aa",
+          "turn_started_at": 1792204952,
+          "item": "exec-f7d735e3-bb27-41c6-9557-c5ed2d72584d",
+          "item_index": 17,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 13862,
+          "output_byte_end": 18947
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/exact/apps/nexus/src/n3_acceptance.rs.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/Cargo.toml",
+      "sha256": "731eeb8a89cccdd0e185e9b6d1b08aea2409a38b9f5fbc2174f2fc5db418bdd2",
+      "bytes": 3079,
+      "status": "exact Oct17 manifest bytes; not proof of Oct19 final revision",
+      "evidence": [
+        {
+          "source_json": "page3-outputs20000.json",
+          "source_json_sha256": "7e57eba37c23a9e4b2653e4c8ff662a4586d4c79086c0f7086cc257321db00a2",
+          "thread": "01a101d7-5238-7224-8087-fee42ce4c092",
+          "turn": "01a130b1-e4b5-7293-b85e-729f85e012dc",
+          "turn_started_at": 1791818328,
+          "item": "exec-d88408a1-0905-43ab-b35d-169f44f4f5b5",
+          "item_index": 28,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 4466,
+          "output_byte_end": 7545
+        },
+        {
+          "source_json": "staging-r8-outputs-all.json",
+          "source_json_sha256": "b1de36fb547d4f4182e611216b9df9107c5e971114522a823455a7e431465587",
+          "thread": "01a14265-e6b7-75a4-9de8-1f10f4a37083",
+          "turn": "01a1426d-4230-71aa-bd67-2f816f57ef7c",
+          "turn_started_at": 1792115819,
+          "item": "exec-1c859a70-3b40-4584-8e0b-9ff71b6bbca3",
+          "item_index": 10,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 10213,
+          "output_byte_end": 13292
+        },
+        {
+          "source_json": "staging-r8-outputs-all.json",
+          "source_json_sha256": "b1de36fb547d4f4182e611216b9df9107c5e971114522a823455a7e431465587",
+          "thread": "01a14265-e6b7-75a4-9de8-1f10f4a37083",
+          "turn": "01a1426d-4230-71aa-bd67-2f816f57ef7c",
+          "turn_started_at": 1792115819,
+          "item": "exec-6e4d9ec5-129c-4ffd-a3d4-828d8fd5d8f2",
+          "item_index": 13,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 1622,
+          "output_byte_end": 4701
+        },
+        {
+          "source_json": "daemon-plan-outputs-all.json",
+          "source_json_sha256": "0caf77203fa62e500644312db2d2e174fb299ab11b29cdc9d8b08416f3d000de",
+          "thread": "01a14273-730f-7702-88bb-e1bc0829d090",
+          "turn": "01a14273-7d05-7507-a010-0da27147a10b",
+          "turn_started_at": 1792116228,
+          "item": "exec-6af41204-8641-4fc1-9c79-87c3b1b619b7",
+          "item_index": 28,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 15832,
+          "output_byte_end": 18911
+        },
+        {
+          "source_json": "staging-io-outputs-all.json",
+          "source_json_sha256": "a8b35d51e6a15298b181ccd61b65ae95ed43d08dbed974f45d3f0f7b39148761",
+          "thread": "01a147bd-ffb2-7349-aaae-891d104930be",
+          "turn": "01a147c2-2efa-7511-b8b1-8406389d2ee3",
+          "turn_started_at": 1792205271,
+          "item": "exec-c9be5b6d-22f4-49df-a067-7e2963a833a9",
+          "item_index": 21,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 5165,
+          "output_byte_end": 8244
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/exact/apps/nexusd/Cargo.toml.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_service.rs",
+      "sha256": "df800ed8633479422ff4c60c648246fb2c39e69406430e8e298fed0c1c3fee12",
+      "bytes": 2703,
+      "status": "exact Oct17 manifest bytes; not proof of Oct19 final revision",
+      "evidence": [
+        {
+          "source_json": "daemon-resume-outputs-all.json",
+          "source_json_sha256": "8bfb863aa6802dd4aa7c0a087a847fd6832f446fdbeebf315b612bd673b7c556",
+          "thread": "01a147c8-f023-7768-852b-b7f3dc0590a6",
+          "turn": "01a147c8-facd-708a-b78f-4739f326cb56",
+          "turn_started_at": 1792205716,
+          "item": "exec-376be8c6-5194-4149-ac96-7d5633cac2a4",
+          "item_index": 12,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 13862,
+          "output_byte_end": 16565
+        },
+        {
+          "source_json": "n312-protocol-diagnose.json",
+          "source_json_sha256": "f532bcf31ba5bbdaf2e7d5f336e2404b54bf32762f71e0eeb8c9c2e704aedd51",
+          "thread": "01a14e32-1e61-7600-a5f5-c93589fd20ac",
+          "turn": "01a14e42-689a-7567-9ebd-0fb015578778",
+          "turn_started_at": 1792314338,
+          "item": "exec-2173a14c-e61b-4302-b4a2-5bf642a47961",
+          "item_index": 9,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 13723,
+          "output_byte_end": 16426
+        },
+        {
+          "source_json": "n312-protocol-diagnose.json",
+          "source_json_sha256": "f532bcf31ba5bbdaf2e7d5f336e2404b54bf32762f71e0eeb8c9c2e704aedd51",
+          "thread": "01a14e32-1e61-7600-a5f5-c93589fd20ac",
+          "turn": "01a14e42-689a-7567-9ebd-0fb015578778",
+          "turn_started_at": 1792314338,
+          "item": "exec-6ebab144-c613-44e2-bcfd-00f25d788d48",
+          "item_index": 11,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 0,
+          "output_byte_end": 2703
+        },
+        {
+          "source_json": "n312-aggregate-review-latest.json",
+          "source_json_sha256": "8d0c715b265568df5a15123134389971fce5d9500c948c3556ebe01773cb819f",
+          "thread": "01a154b2-cc38-70ea-ae0c-cdca32c4c0a4",
+          "turn": "01a154b2-d969-7772-b194-ec41bb4435fd",
+          "turn_started_at": 1792422370,
+          "item": "exec-79265d2b-ac06-470d-a40b-094c468d92df",
+          "item_index": 27,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 14589,
+          "output_byte_end": 17292
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/exact/apps/nexusd/src/snapshot_service.rs.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging.rs",
+      "sha256": "7984da06f238a4fb546d16bdac9f5bd44d22cb01c4a750a50a18bcfba3bb0648",
+      "bytes": 3547,
+      "status": "exact Oct17 manifest bytes; not proof of Oct19 final revision",
+      "evidence": [
+        {
+          "source_json": "staging-r8-outputs-all.json",
+          "source_json_sha256": "b1de36fb547d4f4182e611216b9df9107c5e971114522a823455a7e431465587",
+          "thread": "01a14265-e6b7-75a4-9de8-1f10f4a37083",
+          "turn": "01a14265-f0c0-753b-a5a2-955db5b3528e",
+          "turn_started_at": 1792115340,
+          "item": "exec-5b27b394-83f9-4e01-a50a-3e35fb842b9a",
+          "item_index": 18,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 8623,
+          "output_byte_end": 12170
+        },
+        {
+          "source_json": "staging-r8-outputs-all.json",
+          "source_json_sha256": "b1de36fb547d4f4182e611216b9df9107c5e971114522a823455a7e431465587",
+          "thread": "01a14265-e6b7-75a4-9de8-1f10f4a37083",
+          "turn": "01a1426d-4230-71aa-bd67-2f816f57ef7c",
+          "turn_started_at": 1792115819,
+          "item": "exec-c1c8bbd3-1a5c-42c9-881a-ff4d8ffd5b28",
+          "item_index": 2,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 0,
+          "output_byte_end": 3547
+        },
+        {
+          "source_json": "staging-r8-outputs-all.json",
+          "source_json_sha256": "b1de36fb547d4f4182e611216b9df9107c5e971114522a823455a7e431465587",
+          "thread": "01a14265-e6b7-75a4-9de8-1f10f4a37083",
+          "turn": "01a14273-07d3-748d-9a50-11377d8a29a9",
+          "turn_started_at": 1792116198,
+          "item": "exec-41d5fe4e-e2d0-460c-9201-dabdc828061e",
+          "item_index": 3,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 9801,
+          "output_byte_end": 13348
+        },
+        {
+          "source_json": "daemon-resume-outputs-all.json",
+          "source_json_sha256": "8bfb863aa6802dd4aa7c0a087a847fd6832f446fdbeebf315b612bd673b7c556",
+          "thread": "01a147c8-f023-7768-852b-b7f3dc0590a6",
+          "turn": "01a147c8-facd-708a-b78f-4739f326cb56",
+          "turn_started_at": 1792205716,
+          "item": "exec-376be8c6-5194-4149-ac96-7d5633cac2a4",
+          "item_index": 12,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 16565,
+          "output_byte_end": 20112
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/exact/apps/nexusd/src/snapshot_staging.rs.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging_tests.rs",
+      "sha256": "d21979f97d985690f0750653921dcb7921e0b867ab2dce40d01c4e0b7741c801",
+      "bytes": 11757,
+      "status": "exact Oct17 manifest bytes; not proof of Oct19 final revision",
+      "evidence": [
+        {
+          "source_json": "staging-r8-outputs-all.json",
+          "source_json_sha256": "b1de36fb547d4f4182e611216b9df9107c5e971114522a823455a7e431465587",
+          "thread": "01a14265-e6b7-75a4-9de8-1f10f4a37083",
+          "turn": "01a14265-f0c0-753b-a5a2-955db5b3528e",
+          "turn_started_at": 1792115340,
+          "item": "exec-da2bb6b6-99af-4710-af10-6558d2fc590e",
+          "item_index": 10,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 0,
+          "output_byte_end": 11757
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/exact/apps/nexusd/src/snapshot_staging_tests.rs.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/task_provider_init.rs",
+      "sha256": "8be7ed996220c8b6de1d1c0b4c6ecf21d0b0cb3bae4f270fb46a1be2e80961b7",
+      "bytes": 31907,
+      "status": "exact Oct17 manifest bytes; not proof of Oct19 final revision",
+      "evidence": [
+        {
+          "status": "exact historical bytes recovered from available Git blob",
+          "git_blob": "b0143dffcaa73a3913dd5ff867e2fec106c3300b",
+          "historical_revision": "a97cfc0b63766a585d0194cebf5568be3092f92a"
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/exact/apps/nexusd/src/task_provider_init.rs.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/task_service.rs",
+      "sha256": "470ff2222df78b7384ed3b0b80ccfc372c7ea5231f2930f6881e76856bb2d070",
+      "bytes": 6282,
+      "status": "exact Oct17 manifest bytes; not proof of Oct19 final revision",
+      "evidence": [
+        {
+          "source_json": "page3-outputs20000.json",
+          "source_json_sha256": "7e57eba37c23a9e4b2653e4c8ff662a4586d4c79086c0f7086cc257321db00a2",
+          "thread": "01a101d7-5238-7224-8087-fee42ce4c092",
+          "turn": "01a130b1-e4b5-7293-b85e-729f85e012dc",
+          "turn_started_at": 1791818328,
+          "item": "exec-1840b5b3-6e1b-4249-af28-a9a34edfd203",
+          "item_index": 71,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 0,
+          "output_byte_end": 6282
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/exact/apps/nexusd/src/task_service.rs.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "crates/nexus-control-api/src/snapshot.rs",
+      "sha256": "4a188c517dea91ab308368a09d52c4ddf16deef44e34a7d9052185d10d0f62a2",
+      "bytes": 19457,
+      "status": "exact Oct17 manifest bytes; not proof of Oct19 final revision",
+      "evidence": [
+        {
+          "source_json": "dto-implementation.json",
+          "source_json_sha256": "4404ad39eb305cda30a5d81ce7bbce3627062436161ce150d895a89d8d1cd5c1",
+          "thread": "01a13fdd-6924-7551-a24b-222fa5edc000",
+          "turn": "01a13fdd-769b-71a2-bf91-9cb7fae539b0",
+          "turn_started_at": 1792072841,
+          "item": "exec-de45b390-7988-464f-b710-182192440bd9",
+          "item_index": 21,
+          "kind": "python-reconstructed",
+          "reconstruction": "allowlisted literal operations against complete same-child prior baseline"
+        },
+        {
+          "source_json": "dto-implementation.json",
+          "source_json_sha256": "4404ad39eb305cda30a5d81ce7bbce3627062436161ce150d895a89d8d1cd5c1",
+          "thread": "01a13fdd-6924-7551-a24b-222fa5edc000",
+          "turn": "01a13fdd-769b-71a2-bf91-9cb7fae539b0",
+          "turn_started_at": 1792072841,
+          "item": "exec-972b73d1-0116-4d25-b3cc-5ab29c657856",
+          "item_index": 46,
+          "kind": "local-format-derived",
+          "historical_formatter_identity_proven": false
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/exact/crates/nexus-control-api/src/snapshot.rs.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "docs/N3-11-PROVIDER-INIT-CONTRACT.md",
+      "sha256": "a5924f6a7c3dd819d331b1a79ae95c84db09d75f4277583e827232dd131429e1",
+      "bytes": 13862,
+      "status": "exact Oct17 manifest bytes; not proof of Oct19 final revision",
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147bd-4f0b-7392-a77e-dc3d795ab3aa",
+          "turn_started_at": 1792204952,
+          "item": "exec-729c1912-2014-4212-8147-23eb98bd42ac",
+          "item_index": 9,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 0,
+          "output_byte_end": 13862
+        },
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147bd-4f0b-7392-a77e-dc3d795ab3aa",
+          "turn_started_at": 1792204952,
+          "item": "exec-f7d735e3-bb27-41c6-9557-c5ed2d72584d",
+          "item_index": 17,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 0,
+          "output_byte_end": 13862
+        },
+        {
+          "source_json": "staging-io-outputs-all.json",
+          "source_json_sha256": "a8b35d51e6a15298b181ccd61b65ae95ed43d08dbed974f45d3f0f7b39148761",
+          "thread": "01a147bd-ffb2-7349-aaae-891d104930be",
+          "turn": "01a147be-0ae3-735c-a317-9c7a26104c9a",
+          "turn_started_at": 1792205000,
+          "item": "exec-e6f80f0c-a082-4be9-a80c-91e08354d537",
+          "item_index": 12,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 0,
+          "output_byte_end": 13862
+        },
+        {
+          "source_json": "staging-io-outputs-all.json",
+          "source_json_sha256": "a8b35d51e6a15298b181ccd61b65ae95ed43d08dbed974f45d3f0f7b39148761",
+          "thread": "01a147bd-ffb2-7349-aaae-891d104930be",
+          "turn": "01a147be-0ae3-735c-a317-9c7a26104c9a",
+          "turn_started_at": 1792205000,
+          "item": "exec-ce52b39f-d39f-4600-837c-feec47868a03",
+          "item_index": 14,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 9916,
+          "output_byte_end": 23778
+        },
+        {
+          "source_json": "daemon-resume-outputs-all.json",
+          "source_json_sha256": "8bfb863aa6802dd4aa7c0a087a847fd6832f446fdbeebf315b612bd673b7c556",
+          "thread": "01a147c8-f023-7768-852b-b7f3dc0590a6",
+          "turn": "01a147c8-facd-708a-b78f-4739f326cb56",
+          "turn_started_at": 1792205716,
+          "item": "exec-376be8c6-5194-4149-ac96-7d5633cac2a4",
+          "item_index": 12,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 0,
+          "output_byte_end": 13862
+        },
+        {
+          "source_json": "n311-lease-tests-latest.json",
+          "source_json_sha256": "40826cd8a4ea6a66b9eef2e62a422791d70ed2f04c880eae5b0874fd524f672a",
+          "thread": "01a151c2-b4cc-741e-8161-c93e4e22c085",
+          "turn": "01a151c2-c054-741f-a292-fc4bb7444122",
+          "turn_started_at": 1792373080,
+          "item": "exec-5023f5be-1377-48f3-b514-79193c5c2cbe",
+          "item_index": 11,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 0,
+          "output_byte_end": 13862
+        },
+        {
+          "source_json": "n312-aggregate-review-latest.json",
+          "source_json_sha256": "8d0c715b265568df5a15123134389971fce5d9500c948c3556ebe01773cb819f",
+          "thread": "01a154b2-cc38-70ea-ae0c-cdca32c4c0a4",
+          "turn": "01a154b2-d969-7772-b194-ec41bb4435fd",
+          "turn_started_at": 1792422370,
+          "item": "exec-c2c21845-6060-4e7c-8cee-af5eb98e5918",
+          "item_index": 21,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 11067,
+          "output_byte_end": 24929
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/exact/docs/N3-11-PROVIDER-INIT-CONTRACT.md.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "docs/N3-12-SNAPSHOT-STAGING-CONTRACT.md",
+      "sha256": "072d8d8832e2df1caef48eba1840582158b5cf263b4dd7d53b34b45f91fb8bf9",
+      "bytes": 31478,
+      "status": "exact Oct17 manifest bytes; not proof of Oct19 final revision",
+      "evidence": [
+        {
+          "status": "complete matching source not recovered",
+          "historical_revision": "a97cfc0b63766a585d0194cebf5568be3092f92a"
+        },
+        {
+          "path": "docs/N3-12-SNAPSHOT-STAGING-CONTRACT.md",
+          "bytes": 31478,
+          "sha256": "072d8d8832e2df1caef48eba1840582158b5cf263b4dd7d53b34b45f91fb8bf9",
+          "manifest_match": true,
+          "complete_source": true,
+          "overlap_characters": 256,
+          "overlap_unique": true,
+          "historical_commands_executed": false,
+          "pieces": [
+            {
+              "source": "children/cli-implementation-outputs-all.json",
+              "source_json_sha256": "51e4b693944050e550049f608a5dbddcdfd61408497fbb321e11190737147b8f",
+              "thread": "01a14265-9c17-7477-a4ed-92579eb26083",
+              "turn": "01a14265-a68e-7199-be9f-a0ec545cc6d2",
+              "item": "exec-ad8135e3-a785-47de-84b9-4d6952dc5c4e",
+              "output_char_range": [
+                0,
+                20000
+              ]
+            },
+            {
+              "source": "page3-outputs20000.json",
+              "source_json_sha256": "7e57eba37c23a9e4b2653e4c8ff662a4586d4c79086c0f7086cc257321db00a2",
+              "thread": "01a101d7-5238-7224-8087-fee42ce4c092",
+              "turn": "01a133e8-36fb-71e5-9bf5-4e8504593159",
+              "item": "exec-31dfd4a9-6d46-4f6d-885f-3ede5e9fadf7",
+              "output_char_range": [
+                10948,
+                12804
+              ]
+            }
+          ]
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/exact/docs/N3-12-SNAPSHOT-STAGING-CONTRACT.md.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "scenarios/product/n3-12-snapshot-staging.toml",
+      "sha256": "2492703f1d35f01fab9ac701409e0468b65389407014164469d246560447967a",
+      "bytes": 1126,
+      "status": "exact Oct17 manifest bytes; not proof of Oct19 final revision",
+      "evidence": [
+        {
+          "source_json": "page3-outputs20000.json",
+          "source_json_sha256": "7e57eba37c23a9e4b2653e4c8ff662a4586d4c79086c0f7086cc257321db00a2",
+          "thread": "01a101d7-5238-7224-8087-fee42ce4c092",
+          "turn": "01a130b1-e4b5-7293-b85e-729f85e012dc",
+          "turn_started_at": 1791818328,
+          "item": "exec-4d393dc5-8ebb-43f8-8c7f-6c6ba6ff053a",
+          "item_index": 95,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 49,
+          "output_byte_end": 1175
+        },
+        {
+          "source_json": "binary-repair-outputs-all.json",
+          "source_json_sha256": "794b324e7d1c736a728a3e0d0f9c955ee6c5232898af2918a2ff02361acf8d57",
+          "thread": "01a13ec2-a340-72c4-8de9-bc60ebaef0b0",
+          "turn": "01a13edf-c297-7211-a0a3-5f7deeeaec20",
+          "turn_started_at": 1792056215,
+          "item": "exec-fcb4bdcf-7d20-42d2-8f2d-2d60eaeb2551",
+          "item_index": 3,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 0,
+          "output_byte_end": 1126
+        },
+        {
+          "source_json": "cli-implementation-outputs-all.json",
+          "source_json_sha256": "51e4b693944050e550049f608a5dbddcdfd61408497fbb321e11190737147b8f",
+          "thread": "01a14265-9c17-7477-a4ed-92579eb26083",
+          "turn": "01a14265-a68e-7199-be9f-a0ec545cc6d2",
+          "turn_started_at": 1792115321,
+          "item": "exec-7dcb3aa4-3cce-4aea-9c68-fdbbd1803380",
+          "item_index": 27,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 3385,
+          "output_byte_end": 4511
+        },
+        {
+          "source_json": "n312-aggregate-review-latest.json",
+          "source_json_sha256": "8d0c715b265568df5a15123134389971fce5d9500c948c3556ebe01773cb819f",
+          "thread": "01a154b2-cc38-70ea-ae0c-cdca32c4c0a4",
+          "turn": "01a154b2-d969-7772-b194-ec41bb4435fd",
+          "turn_started_at": 1792422370,
+          "item": "exec-c2c21845-6060-4e7c-8cee-af5eb98e5918",
+          "item_index": 21,
+          "kind": "manifest-matching-output-range",
+          "output_byte_start": 9941,
+          "output_byte_end": 11067
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/exact/scenarios/product/n3-12-snapshot-staging.toml.txt",
+      "active_source": false
+    }
+  ],
+  "file_count": 15,
+  "contains_raw_history": false,
+  "production_sources_modified": false,
+  "original_local_manifest_sha256": "d93716cb299cdeacbd17bc74174795bbd07b68d1d4e121863a0884ec950fe038",
+  "archive_note": "Source-only recovery evidence; .txt payloads are excluded from active Rust/Python/scenario discovery. Historical exactness does not establish Oct19 final-source equivalence or current product qualification."
+}

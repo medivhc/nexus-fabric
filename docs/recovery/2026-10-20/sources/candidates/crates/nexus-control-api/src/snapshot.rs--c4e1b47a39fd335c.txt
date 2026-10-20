@@ -1,0 +1,450 @@
+//! Portable snapshot staging messages. These checks validate structure and
+//! correlation only; adapters own hashing, manifest parsing and authorization.
+use nexus_domain::task::{TaskId, MAX_INTEGER};
+use std::collections::BTreeMap;
+pub use crate::task::TaskCallContext;
+pub use nexus_domain::task::codec::{CanonicalDto, Value};
+pub use nexus_domain::task::{Sha256Digest, SnapshotRef, TaskError, TaskErrorCode};
+
+/// Maximum UTF-8 manifest size accepted by the v1 staging adapter.
+pub const MAX_MANIFEST_BYTES: usize = 65_536;
+/// Maximum payload bytes in one PutChunk request.
+pub const MAX_CHUNK_BYTES: usize = 65_536;
+/// Maximum logical files in a v1 snapshot upload.
+pub const MAX_SNAPSHOT_FILES: u64 = 1_024;
+/// Maximum logical snapshot bytes, including repeated file content.
+pub const MAX_SNAPSHOT_BYTES: u64 = 67_108_864;
+
+/// An upload index key, using TaskId grammar; it is not a filesystem basename.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UploadId(String);
+impl UploadId {
+    /// Validate the inherited 1..256 Unicode scalar, non-NUL grammar.
+    pub fn new(value: String) -> Result<Self, TaskError> {
+        TaskId::new(value.clone())?;
+        Ok(Self(value))
+    }
+    /// Return the original identifier without path or Unicode normalization.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Public staging lifecycle; Staged does not imply task acceptance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadState {
+    Receiving,
+    Staged,
+    Cancelling,
+    Cancelled,
+}
+
+/// Declared unique content and its confirmed durable prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadBlob {
+    pub sha256: Sha256Digest,
+    pub size_bytes: u64,
+    pub durable_offset: u64,
+}
+
+/// Versioned authoritative upload progress, without authentication claims.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadView {
+    pub schema_version: u64,
+    pub upload_id: UploadId,
+    pub provider: String,
+    pub workspace: String,
+    pub resource: String,
+    pub snapshot: SnapshotRef,
+    pub state: UploadState,
+    pub reserved_bytes: u64,
+    pub blobs: Vec<UploadBlob>,
+}
+
+/// Separate snapshot operations; the original TaskRequest wire is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotRequest {
+    Begin {
+        provider: String,
+        workspace: String,
+        resource: String,
+        upload_key: String,
+        snapshot: Box<SnapshotRef>,
+        manifest_json: String,
+    },
+    PutChunk {
+        upload_id: UploadId,
+        blob_sha256: Sha256Digest,
+        offset: u64,
+        bytes: Vec<u8>,
+        chunk_sha256: Sha256Digest,
+    },
+    Get {
+        upload_id: UploadId,
+    },
+    Seal {
+        upload_id: UploadId,
+    },
+    Cancel {
+        upload_id: UploadId,
+    },
+}
+
+/// PASS describes the operation, not execution; failures carry an optional upload ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotEnvelope {
+    Upload(UploadView),
+    Error {
+        error: TaskError,
+        upload_id: Option<UploadId>,
+    },
+}
+
+/// Authenticated adapter boundary. Each operation must recheck current grants.
+/// Deletion couples portable clients to authenticated daemon persistence.
+pub trait SnapshotService: Send + Sync {
+    fn execute(
+        &self,
+        context: &TaskCallContext,
+        request: SnapshotRequest,
+    ) -> Result<UploadView, TaskError>;
+}
+
+fn version(value: u64) -> Result<(), TaskError> {
+    if value != 1 {
+        return Err(TaskError::new(
+            TaskErrorCode::UnsupportedVersion,
+            "snapshot schema_version must be 1",
+            false,
+        ));
+    }
+    Ok(())
+}
+fn identifier(value: &str) -> Result<(), TaskError> {
+    TaskId::new(value.to_owned()).map(|_| ())
+}
+fn snapshot_limits(snapshot: &SnapshotRef) -> Result<(), TaskError> {
+    snapshot.validate()?;
+    if snapshot.file_count > MAX_SNAPSHOT_FILES || snapshot.total_bytes > MAX_SNAPSHOT_BYTES {
+        return Err(TaskError::new(
+            TaskErrorCode::CapacityUnavailable,
+            "snapshot exceeds v1 file or byte limit",
+            false,
+        ));
+    }
+    Ok(())
+}
+impl UploadBlob {
+    /// Check exact, bounded size and confirmed prefix. Content hashes are adapter work.
+    pub fn validate(&self) -> Result<(), TaskError> {
+        if self.size_bytes > MAX_SNAPSHOT_BYTES || self.durable_offset > self.size_bytes {
+            return Err(TaskError::invalid("invalid blob size or durable prefix"));
+        }
+        Ok(())
+    }
+}
+impl UploadView {
+    /// Check the complete intrinsic view, independent of any request correlation.
+    pub fn validate(&self) -> Result<(), TaskError> {
+        version(self.schema_version)?;
+        for value in [&self.provider, &self.workspace, &self.resource] {
+            identifier(value)?;
+        }
+        snapshot_limits(&self.snapshot)?;
+        if self.workspace != self.snapshot.workspace {
+            return Err(TaskError::invalid("upload and snapshot workspace differ"));
+        }
+        if self.reserved_bytes > MAX_INTEGER {
+            return Err(TaskError::invalid("upload reservation exceeds exact integer limit"));
+        }
+        // This relation also holds for terminal tombstones retaining SnapshotRef.
+        if self.snapshot.file_count == 0 && self.snapshot.total_bytes != 0 {
+            return Err(TaskError::invalid("zero snapshot files require zero total bytes"));
+        }
+        if self.state == UploadState::Cancelled {
+            if self.reserved_bytes != 0 || !self.blobs.is_empty() {
+                return Err(TaskError::invalid("Cancelled upload must release charge and blobs"));
+            }
+            return Ok(());
+        }
+        if self.reserved_bytes == 0 {
+            return Err(TaskError::invalid("non-Cancelled upload requires positive reservation"));
+        }
+        if self.blobs.len() as u64 > self.snapshot.file_count
+            || (self.snapshot.file_count > 0 && self.blobs.is_empty())
+        {
+            return Err(TaskError::invalid("blob count disagrees with snapshot file count"));
+        }
+        let mut total = 0u64;
+        let mut previous = None;
+        for blob in &self.blobs {
+            blob.validate()?;
+            if previous.is_some_and(|digest| digest >= &blob.sha256) {
+                return Err(TaskError::invalid("blob digests must be sorted and unique"));
+            }
+            previous = Some(&blob.sha256);
+            total = total.checked_add(blob.size_bytes)
+                .filter(|total| *total <= self.snapshot.total_bytes)
+                .ok_or_else(|| TaskError::invalid("unique blob bytes exceed snapshot total"))?;
+            if self.state == UploadState::Staged && blob.durable_offset != blob.size_bytes {
+                return Err(TaskError::invalid("Staged upload has an incomplete blob"));
+            }
+        }
+        Ok(())
+    }
+}
+impl SnapshotRequest {
+    /// Validate shape-independent v1 limits; manifest and chunk hashes remain unchecked.
+    pub fn validate(&self) -> Result<(), TaskError> {
+        match self {
+            Self::Begin { provider, workspace, resource, upload_key, snapshot, manifest_json } => {
+                for value in [provider, workspace, resource, upload_key] {
+                    identifier(value)?;
+                }
+                snapshot_limits(snapshot)?;
+                if workspace != &snapshot.workspace {
+                    return Err(TaskError::invalid("Begin and snapshot workspace differ"));
+                }
+                if manifest_json.len() > MAX_MANIFEST_BYTES {
+                    return Err(TaskError::new(TaskErrorCode::CapacityUnavailable,
+                        "manifest exceeds v1 byte limit", false));
+                }
+            }
+            Self::PutChunk { offset, bytes, .. } => {
+                if bytes.is_empty() || bytes.len() > MAX_CHUNK_BYTES {
+                    return Err(TaskError::invalid("chunk length must be 1..65536 bytes"));
+                }
+                offset.checked_add(bytes.len() as u64)
+                    .filter(|end| *end <= MAX_INTEGER)
+                    .ok_or_else(|| TaskError::invalid("chunk byte range exceeds exact integer limit"))?;
+            }
+            Self::Get { .. } | Self::Seal { .. } | Self::Cancel { .. } => {}
+        }
+        Ok(())
+    }
+}
+impl SnapshotEnvelope {
+    /// Check intrinsic payload validity without inferring a request or authority.
+    pub fn validate(&self) -> Result<(), TaskError> {
+        match self {
+            Self::Upload(view) => view.validate(),
+            Self::Error { error, .. } => error.validate(),
+        }
+    }
+    /// Bind a valid response to the entire original operation and durable range.
+    pub fn validate_for(&self, request: &SnapshotRequest) -> Result<(), TaskError> {
+        request.validate()?;
+        self.validate()?;
+        let request_id = match request {
+            SnapshotRequest::Begin { .. } => None,
+            SnapshotRequest::PutChunk { upload_id, .. }
+            | SnapshotRequest::Get { upload_id }
+            | SnapshotRequest::Seal { upload_id }
+            | SnapshotRequest::Cancel { upload_id } => Some(upload_id),
+        };
+        let view = match self {
+            Self::Error { upload_id, .. } => {
+                if upload_id.as_ref().is_some_and(|id| Some(id) != request_id) {
+                    return Err(TaskError::invalid("failure upload ID differs from request"));
+                }
+                return Ok(());
+            }
+            Self::Upload(view) => view,
+        };
+        if request_id.is_some_and(|id| id != &view.upload_id) {
+            return Err(TaskError::invalid("response upload ID differs from request"));
+        }
+        match request {
+            SnapshotRequest::Begin { provider, workspace, resource, snapshot, .. } => {
+                if provider != &view.provider || workspace != &view.workspace
+                    || resource != &view.resource || snapshot.as_ref() != &view.snapshot {
+                    return Err(TaskError::invalid("Begin response differs from original scope or snapshot"));
+                }
+            }
+            SnapshotRequest::PutChunk { blob_sha256, offset, bytes, .. } => {
+                let end = offset.checked_add(bytes.len() as u64)
+                    .ok_or_else(|| TaskError::invalid("chunk byte range overflow"))?;
+                if !matches!(view.state, UploadState::Receiving | UploadState::Staged)
+                    || !view.blobs.iter().any(|blob| &blob.sha256 == blob_sha256
+                        && blob.durable_offset >= end) {
+                    return Err(TaskError::invalid("PutChunk response does not confirm original durable range"));
+                }
+            }
+            SnapshotRequest::Seal { .. } if view.state != UploadState::Staged => {
+                return Err(TaskError::invalid("Seal response must be Staged"));
+            }
+            SnapshotRequest::Cancel { .. } if view.state != UploadState::Cancelled => {
+                return Err(TaskError::invalid("Cancel response must be Cancelled"));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+fn object(value: Value) -> Result<BTreeMap<String, Value>, TaskError> {
+    if let Value::Object(fields) = value {
+        Ok(fields)
+    } else {
+        Err(TaskError::invalid("expected snapshot object"))
+    }
+}
+fn take<T: CanonicalDto>(fields: &mut BTreeMap<String, Value>, name: &str) -> Result<T, TaskError> {
+    T::from_value(fields.remove(name)
+        .ok_or_else(|| TaskError::invalid(format!("missing snapshot field {name}")))?)
+}
+fn end(fields: &BTreeMap<String, Value>) -> Result<(), TaskError> {
+    if fields.is_empty() {
+        Ok(())
+    } else {
+        Err(TaskError::invalid("unknown snapshot object field"))
+    }
+}
+impl CanonicalDto for UploadId {
+    fn to_value(&self) -> Value { self.0.to_value() }
+    fn from_value(value: Value) -> Result<Self, TaskError> {
+        Self::new(String::from_value(value)?)
+    }
+}
+impl CanonicalDto for UploadState {
+    fn to_value(&self) -> Value {
+        match self {
+            Self::Receiving => "Receiving",
+            Self::Staged => "Staged",
+            Self::Cancelling => "Cancelling",
+            Self::Cancelled => "Cancelled",
+        }.to_owned().to_value()
+    }
+    fn from_value(value: Value) -> Result<Self, TaskError> {
+        match String::from_value(value)?.as_str() {
+            "Receiving" => Ok(Self::Receiving),
+            "Staged" => Ok(Self::Staged),
+            "Cancelling" => Ok(Self::Cancelling),
+            "Cancelled" => Ok(Self::Cancelled),
+            _ => Err(TaskError::invalid("unknown upload state")),
+        }
+    }
+}
+macro_rules! record_codec {
+    ($ty:ty, {$($field:ident),+}) => {
+        impl CanonicalDto for $ty {
+            fn to_value(&self) -> Value {
+                Value::Object(BTreeMap::from([
+                    $((stringify!($field).into(), self.$field.to_value())),+
+                ]))
+            }
+            fn from_value(value: Value) -> Result<Self, TaskError> {
+                let mut fields = object(value)?;
+                let result = Self { $($field: take(&mut fields, stringify!($field))?),+ };
+                end(&fields)?;
+                result.validate()?;
+                Ok(result)
+            }
+        }
+    };
+}
+record_codec!(UploadBlob, {sha256, size_bytes, durable_offset});
+record_codec!(UploadView, {schema_version, upload_id, provider, workspace, resource,
+    snapshot, state, reserved_bytes, blobs});
+impl CanonicalDto for SnapshotRequest {
+    fn to_value(&self) -> Value {
+        let mut fields = BTreeMap::from([("schema_version".into(), 1u64.to_value())]);
+        let operation = match self {
+            Self::Begin { provider, workspace, resource, upload_key, snapshot, manifest_json } => {
+                fields.extend([
+                    ("provider".into(), provider.to_value()),
+                    ("workspace".into(), workspace.to_value()),
+                    ("resource".into(), resource.to_value()),
+                    ("upload_key".into(), upload_key.to_value()),
+                    ("snapshot".into(), snapshot.to_value()),
+                    ("manifest_json".into(), manifest_json.to_value()),
+                ]);
+                "Begin"
+            }
+            Self::PutChunk { upload_id, blob_sha256, offset, bytes, chunk_sha256 } => {
+                fields.extend([
+                    ("upload_id".into(), upload_id.to_value()),
+                    ("blob_sha256".into(), blob_sha256.to_value()),
+                    ("offset".into(), offset.to_value()),
+                    ("bytes".into(), bytes.to_value()),
+                    ("chunk_sha256".into(), chunk_sha256.to_value()),
+                ]);
+                "PutChunk"
+            }
+            Self::Get { upload_id } => {
+                fields.insert("upload_id".into(), upload_id.to_value());
+                "Get"
+            }
+            Self::Seal { upload_id } => {
+                fields.insert("upload_id".into(), upload_id.to_value());
+                "Seal"
+            }
+            Self::Cancel { upload_id } => {
+                fields.insert("upload_id".into(), upload_id.to_value());
+                "Cancel"
+            }
+        };
+        fields.insert("operation".into(), operation.to_owned().to_value());
+        Value::Object(fields)
+    }
+    fn from_value(value: Value) -> Result<Self, TaskError> {
+        let mut fields = object(value)?;
+        version(take(&mut fields, "schema_version")?)?;
+        let result = match take::<String>(&mut fields, "operation")?.as_str() {
+            "Begin" => Self::Begin {
+                provider: take(&mut fields, "provider")?,
+                workspace: take(&mut fields, "workspace")?,
+                resource: take(&mut fields, "resource")?,
+                upload_key: take(&mut fields, "upload_key")?,
+                snapshot: Box::new(take(&mut fields, "snapshot")?),
+                manifest_json: take(&mut fields, "manifest_json")?,
+            },
+            "PutChunk" => Self::PutChunk {
+                upload_id: take(&mut fields, "upload_id")?,
+                blob_sha256: take(&mut fields, "blob_sha256")?,
+                offset: take(&mut fields, "offset")?,
+                bytes: take(&mut fields, "bytes")?,
+                chunk_sha256: take(&mut fields, "chunk_sha256")?,
+            },
+            "Get" => Self::Get { upload_id: take(&mut fields, "upload_id")? },
+            "Seal" => Self::Seal { upload_id: take(&mut fields, "upload_id")? },
+            "Cancel" => Self::Cancel { upload_id: take(&mut fields, "upload_id")? },
+            _ => return Err(TaskError::invalid("unknown snapshot operation")),
+        };
+        end(&fields)?;
+        result.validate()?;
+        Ok(result)
+    }
+}
+impl CanonicalDto for SnapshotEnvelope {
+    fn to_value(&self) -> Value {
+        let mut fields = BTreeMap::from([("schema_version".into(), 1u64.to_value())]);
+        let verdict = match self {
+            Self::Upload(view) => {
+                fields.insert("upload".into(), view.to_value());
+                "PASS"
+            }
+            Self::Error { error, upload_id } => {
+                fields.insert("error".into(), error.to_value());
+                fields.insert("upload_id".into(), upload_id.to_value());
+                "FAIL"
+            }
+        };
+        fields.insert("verdict".into(), verdict.to_owned().to_value());
+        Value::Object(fields)
+    }
+    fn from_value(value: Value) -> Result<Self, TaskError> {
+        let mut fields = object(value)?;
+        version(take(&mut fields, "schema_version")?)?;
+        let result = match take::<String>(&mut fields, "verdict")?.as_str() {
+            "PASS" => Self::Upload(take(&mut fields, "upload")?),
+            "FAIL" => Self::Error {
+                error: take(&mut fields, "error")?,
+                upload_id: take(&mut fields, "upload_id")?,
+            },
+            _ => return Err(TaskError::invalid("snapshot verdict must be PASS or FAIL")),
+        };
+        end(&fields)?;
+        result.validate()?;
+        Ok(result)
+    }
+}

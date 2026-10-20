@@ -171,7 +171,6 @@ pub(crate) struct PendingPunch {
     pub(crate) attempts: u32,
 }
 
-
 /// 铏氭嫙瀛愮綉缁撴瀯鍖栦簨浠讹紙鐢ㄤ簬鍙娴嬫€у拰閲嶆斁锛夈€?
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VirtualSubnetEvent {
@@ -1185,7 +1184,6 @@ impl VirtualSubnetTunnel {
             })
         }
     }
-
 
     /// 处理打洞帧（P4.2 §12.9.3）：`ph` 请求 → 学习来源 + 回 `pa` 到来源；
     /// `pa` 确认 → 学习来源 + 若本端发起中（Probing）则落账 Connected。
