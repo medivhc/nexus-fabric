@@ -3248,3 +3248,9 @@ Linux artifact get 接通真实分页服务与已有持久断点接收器：先�
 ### 17.7 N3-10 本地提供方 Use 授权运维
 
 新增 `nexus task-provider grant add|revoke|list --config <absolute-private-config>`，从既存 `task-api.toml` 的 provider/workspace 固定本机授权范围，直接管理该 Workspace 中显式 resource/主体的真实 N2 Use grant。命令不依赖 default Workspace 目录解析，不创建身份、Task、Session 或提供方容量，不改变既有 generic grant CLI 和 Task schema1。list 只读；mutation 保留非 Use 权限与其他 Workspace，先持久审计 intent，再原子更新 grant 并持久 applied。普通 daemon 下一次请求按当前 grant 决定授权；本批不通知远端，不接通 Submit/输入上传。冻结细节、真实 CLI/daemon/Engine E4 与失败语义见 docs/N3-10-OPERATOR-GRANT-CONTRACT.md。
+
+### 17.8 N3-11 正式提供方初始化与检查 {#178-n3-11}
+
+契约草案，待实际 Red Evidence 与冻结后实现。新增 Linux 本机 `nexusd task-provider init --config <absolute-private-root> --provider <id> --workspace <id> --capacity <absolute-policy-json>` 及 `task-provider check --config <root>`。fresh init从显式既存私有空根（仅允许运维者明确no-TUN的daemon.toml）建立固定真实N2身份、原容量authority与两字段task-api.toml；不创建授权、广告、Task、Session、Engine或token。初始化journal绑定scope、policy及原身份/根inode，完整检查点可恢复；丢失或损坏authority明确拒绝，绝不换身份或重建空池。启动前后相同init保持原记录并changed=false，check零写入核实完成binding；initialized不代表活Ready。
+
+完整核实的managed provider可以独立作为正常config-folder daemon的subsystem，无需假proxy/network/workspace配置；旧普通空根拒绝不变。managed初始化在身份ensure与reconciliation之前检查，pending/损坏root不READY，正常daemon继续由原owner恢复容量。详见docs/N3-11-PROVIDER-INIT-CONTRACT.md；有限E4不接通Submit/输入上传，不替代完整N3 E4/E5。

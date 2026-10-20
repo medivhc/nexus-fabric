@@ -23,7 +23,7 @@ const AUTH_IDENTITY_VERSION: u32 = 1;
 /// Decode an already privately-read identity without touching storage or
 /// generating credentials. The existing N2 ensure path retains its behavior.
 #[cfg(target_os = "linux")]
-pub(crate) fn principal_from_existing_bytes(bytes: &[u8]) -> Result<Principal, String> {
+pub fn principal_from_existing_bytes(bytes: &[u8]) -> Result<Principal, String> {
     let canonical = crate::n3_acceptance::parse_canonical_json(bytes)
         .map_err(|_| "invalid existing identity JSON")?
         .canonical_bytes();
@@ -71,6 +71,28 @@ pub(crate) fn principal_from_existing_bytes(bytes: &[u8]) -> Result<Principal, S
 // 同进程首次创建必须只有一个 writer；已有身份的读取不经过此锁。
 // 跨进程共享节点目录的初始化仍需由节点所有者协调。
 static AUTH_IDENTITY_INITIALIZATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Prepare the existing N2 record without opening storage. The returned bytes
+/// contain private key material: only a private composition-root publisher may
+/// retain them, and must never log or render them. Callers own durable staging.
+#[cfg(target_os = "linux")]
+pub fn generate_auth_identity_record(created_at_unix: u64) -> Result<Vec<u8>, String> {
+    if created_at_unix > nexus_domain::task::MAX_INTEGER {
+        return Err("identity timestamp exceeds the exact integer range".into());
+    }
+    let mut seed = [0u8; 32];
+    getrandom::getrandom(&mut seed).map_err(|e| format!("identity randomness failed: {e}"))?;
+    let keypair =
+        Ed25519KeyPair::from_seed_unchecked(&seed).map_err(|_| "invalid generated Ed25519 seed")?;
+    let seed_hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+    let public_hex: String = keypair
+        .public_key()
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Ok(format!("{{\"version\":{AUTH_IDENTITY_VERSION},\"seed_hex\":\"{seed_hex}\",\"public_key_hex\":\"{public_hex}\",\"created_at_unix\":{created_at_unix}}}").into_bytes())
+}
 
 /// 确保本节点 ed25519 授权身份存在（不存在则生成并落盘；幂等）。
 ///
