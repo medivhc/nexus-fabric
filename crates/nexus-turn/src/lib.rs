@@ -12,7 +12,7 @@ pub(crate) mod auth;
 pub mod client;
 pub mod server;
 pub mod socket;
-pub(crate) mod stun;
+pub mod stun;
 
 pub use client::{TurnClient, TurnCredentials, TurnStats};
 pub use server::TurnServer;

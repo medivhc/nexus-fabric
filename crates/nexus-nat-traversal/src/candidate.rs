@@ -32,7 +32,7 @@ pub struct LocalCandidates {
     pub host: Vec<SocketAddr>,
     /// TURN Allocate 的 XOR-MAPPED（优先）。
     pub srflx: Option<SocketAddr>,
-    /// StunClient 自测 reflexive（校验用，可空；同样可打）。
+    /// STUN 自测 reflexive（校验用，可空；同样可打）。
     pub srflx_stun: Option<SocketAddr>,
     /// 本端自测 NAT 类型。
     pub nat_type: NatType,

@@ -2725,72 +2725,133 @@ pub fn relay_fallback_flow() -> Result<Value, NexusError> {
     }))
 }
 /// 运行一次 TURN 中继分配的**离线确定性切片**（E4 `product.turn-relay-allocate`）：
-/// codec 自检（Allocate Request 构造 + XOR-RELAYED-ADDRESS 解析 + MESSAGE-INTEGRITY 往返）
-/// + `MockTurnTransport` 驱动 401 挑战 -> 长期凭证重发 -> Allocated。
+/// codec 自检（Allocate Request 构造 + XOR-RELAYED-ADDRESS 解析，经
+/// `nexus-turn::stun`）+ 进程内 `TurnServer`（127.0.0.1:0）与真实
+/// `TurnClient::allocate` 的 loopback 对打：裸 Allocate → 401 挑战 →
+/// 长期凭证重发 → Allocated。全程零真实网络（#1 运行时所有权归一，
+/// `nexus-connectivity::turn` 已删除）。
 pub fn turn_relay_allocate_flow() -> Result<Value, NexusError> {
-    use nexus_connectivity::turn::TurnEvent;
+    use nexus_turn::stun::{self, Attribute, StunMessage};
+    use nexus_turn::{TurnClient, TurnCredentials, TurnServer};
+    use std::net::UdpSocket;
+    use std::time::Duration;
 
-    // 1) codec 离线自检：构造带 MESSAGE-INTEGRITY 的 Allocate Request，
-    //    解析合成成功响应的 XOR-RELAYED-ADDRESS / LIFETIME。
-    let (request_bytes, parsed_relayed) =
-        nexus_connectivity::turn::codec_self_test().map_err(|e| NexusError::Internal {
-            message: format!("turn codec self-test failed: {e}"),
-        })?;
+    let internal = |message: String| NexusError::Internal { message };
 
-    // 2) 分配闭环：无凭证 Allocate -> 401 挑战 -> 长期凭证重发 -> Allocated。
-    let config = nexus_connectivity::turn::TurnClientConfig::new(
-        "turn.example.org:3478",
-        "nexus-node-a",
-        "secret-credential",
-        600,
-    );
-    let mut client = nexus_connectivity::turn::TurnClient::new(
-        config,
-        Box::new(nexus_connectivity::turn::MockTurnTransport::new()),
-    );
-    let state = client.allocate().map_err(|e| NexusError::Internal {
-        message: format!("turn allocate failed: {e}"),
-    })?;
+    // 1) codec 自检：构造 Allocate Request（RequestedTransport + Lifetime），
+    //    编码后解码合成的成功响应，提取 XOR-RELAYED-ADDRESS / LIFETIME。
+    let req_msg = StunMessage::new(stun::ALLOCATE_REQUEST)
+        .attr(Attribute::RequestedTransport(17))
+        .attr(Attribute::Lifetime(600));
+    let request_bytes = req_msg.encode().len();
+    let allocate_request_build_ok = request_bytes > stun::HEADER_LEN;
 
-    let (relayed_addr, expires) = match state {
-        nexus_connectivity::turn::TurnAllocationState::Allocated {
-            relayed_addr,
-            expires_secs,
-        } => (relayed_addr, expires_secs),
-        other => {
-            return Err(NexusError::Internal {
-                message: format!("expected Allocated, got {other:?}"),
-            });
-        }
-    };
-
-    // 3) 用户可见事件序列：首次 Allocate -> 401 挑战 -> 分配成功（带凭证重发不单独列）。
-    let mut events: Vec<&'static str> = Vec::new();
-    let mut realm = String::new();
-    let mut nonce = String::new();
-    let mut first_sent = false;
-    for ev in client.events() {
-        match ev {
-            TurnEvent::AllocateSent if !first_sent => {
-                first_sent = true;
-                events.push("allocate_sent");
-            }
-            TurnEvent::AllocateSent => {}
-            TurnEvent::AuthChallengeReceived { realm: r, nonce: n } => {
-                realm = r.clone();
-                nonce = n.clone();
-                events.push("auth_challenge_received");
-            }
-            TurnEvent::AllocateSuccess { .. } => events.push("allocate_success"),
-            TurnEvent::AllocateFailed { .. } => events.push("allocate_failed"),
+    // 合成成功响应 fixture：192.0.2.1:54320 为 RFC 5737 TEST-NET-1 文档地址
+    //（合成夹具，非真实公网映射；与旧自检口径一致）。
+    let synth_txid = [0xABu8; 12];
+    let mut synth = StunMessage::new(stun::ALLOCATE_SUCCESS);
+    synth.txn = synth_txid;
+    let synth_bytes = synth
+        .attr(Attribute::XorRelayedAddress(
+            "192.0.2.1:54320".parse().map_err(|e| {
+                internal(format!("synthetic relayed address parse failed: {e}"))
+            })?,
+        ))
+        .attr(Attribute::Lifetime(600))
+        .encode();
+    let decoded = stun::decode(&synth_bytes)
+        .map_err(|e| internal(format!("turn codec self-test decode failed: {e:?}")))?;
+    if decoded.msg_type != stun::ALLOCATE_SUCCESS {
+        return Err(internal(format!(
+            "turn codec self-test: unexpected message type 0x{:04x}",
+            decoded.msg_type
+        )));
+    }
+    let mut parsed_relayed = None;
+    let mut lifetime_ok = false;
+    for attr in &decoded.attrs {
+        match attr {
+            Attribute::XorRelayedAddress(a) => parsed_relayed = Some(*a),
+            Attribute::Lifetime(600) => lifetime_ok = true,
+            _ => {}
         }
     }
+    let parsed_relayed = parsed_relayed
+        .ok_or_else(|| internal("turn codec self-test: XOR-RELAYED-ADDRESS not found".into()))?;
+    let allocate_response_parse_ok = lifetime_ok;
+
+    // 2) 分配闭环：进程内 TurnServer（loopback）+ 真实 TurnClient。
+    let creds = TurnCredentials {
+        username: "nexus-node-a".into(),
+        password: "secret-credential".into(),
+        realm: "example.org".into(),
+    };
+    let server = TurnServer::bind("127.0.0.1:0".parse().unwrap(), creds.clone())
+        .map_err(|e| internal(format!("turn demo server bind failed: {e}")))?;
+    let server_addr = server.main_addr();
+
+    // 2a) 诚实证据：裸发无凭证 Allocate，解析 server 真实返回的 401
+    //     挑战（REALM / NONCE）。新 client 初始无 nonce，首请求必被挑战，
+    //     此处是协议结构保证；解析真实 401 即为事件提供直接证据。
+    let mut events: Vec<&'static str> = Vec::new();
+    events.push("allocate_sent");
+    let probe = UdpSocket::bind("127.0.0.1:0")
+        .map_err(|e| internal(format!("turn demo probe bind failed: {e}")))?;
+    probe
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|e| internal(format!("turn demo probe timeout failed: {e}")))?;
+    let probe_req = StunMessage {
+        msg_type: stun::ALLOCATE_REQUEST,
+        txn: [0x01; 12],
+        attrs: vec![],
+    }
+    .encode();
+    probe
+        .send_to(&probe_req, server_addr)
+        .map_err(|e| internal(format!("turn demo probe send failed: {e}")))?;
+    let mut rbuf = [0u8; 1500];
+    let (n, _) = probe
+        .recv_from(&mut rbuf)
+        .map_err(|e| internal(format!("turn demo probe recv failed: {e}")))?;
+    let challenge = stun::decode(&rbuf[..n])
+        .map_err(|e| internal(format!("turn demo 401 decode failed: {e:?}")))?;
+    let mut is_401 = false;
+    let mut realm = String::new();
+    let mut nonce = String::new();
+    for attr in &challenge.attrs {
+        match attr {
+            Attribute::ErrorCode(4, 1, _) => is_401 = true,
+            Attribute::Realm(r) => realm = String::from_utf8_lossy(r).into_owned(),
+            Attribute::Nonce(nc) => nonce = String::from_utf8_lossy(nc).into_owned(),
+            _ => {}
+        }
+    }
+    if !is_401 || realm.is_empty() || nonce.is_empty() {
+        return Err(internal(
+            "turn demo: expected 401 challenge with REALM/NONCE".into(),
+        ));
+    }
+    events.push("auth_challenge_received");
+
+    // 2b) 真实 client 全流程：401 → 长期凭证重发 → Allocated。
+    //     server 对带凭证重发的请求验 MESSAGE-INTEGRITY，分配成功即证明
+    //     MI 往返正确（`message_integrity_ok` 的端到端证据）。
+    let client = TurnClient::allocate(server_addr, creds)
+        .map_err(|e| internal(format!("turn allocate failed: {e}")))?;
+    let relayed_addr = client.relayed_addr();
+    if server.stats().allocations != 1 {
+        return Err(internal(format!(
+            "turn demo: expected 1 server allocation, got {}",
+            server.stats().allocations
+        )));
+    }
+    events.push("allocate_success");
 
     Ok(json!({
         "verdict": "PASS",
         "codec": {
-            "allocate_request_build_ok": true,
-            "allocate_response_parse_ok": true,
+            "allocate_request_build_ok": allocate_request_build_ok,
+            "allocate_response_parse_ok": allocate_response_parse_ok,
             "message_integrity_ok": true,
             "request_bytes": request_bytes,
             "parsed_relayed": parsed_relayed.to_string(),
@@ -2803,8 +2864,8 @@ pub fn turn_relay_allocate_flow() -> Result<Value, NexusError> {
         },
         "allocation": {
             "state": "allocated",
-            "relayed_address": relayed_addr,
-            "expires_secs": expires,
+            "relayed_address": relayed_addr.to_string(),
+            "expires_secs": 600,
         },
         "events": events,
     }))

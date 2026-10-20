@@ -10,6 +10,17 @@
 //! └── workspace.toml # Workspace 生产接线（可选；存在即启用 workspace FUSE 挂载，C1）
 //! ```
 //!
+//! 三个 "proxy" 的语义区分（#1 命名澄清，键名不动）：
+//! 1. `daemon.toml [network.proxy]`（`ProxySection`）= **N1 建连经代理**：
+//!    dial 时的代理 tier（#3 fabric-over-proxy，翻墙/中继建链）；
+//! 2. `proxy.yaml` = **TUN 出站经代理**：互联网出口策略
+//!    （Clash 风格规则引擎，管出向流量）；
+//! 3. `nexus proxy` CLI 子命令（one-shot SOCKS5/数据面组合根）——
+//!    本轮仅记录观察项，不处理（OQ4）。
+//! 另：`daemon.toml [network.turn]`（`TurnSection`）= **TURN+STUN**：
+//!    NAT switching 用（打洞候选与中继分配），与代理无关
+//!    （常被混淆，特此并列）。
+//!
 //! 热加载分级（见 `watcher.rs`）：
 //! - 热生效：代理规则、peer 列表、DNS 规则等纯数据变更
 //! - 需重启：监听端口、TUN 设备名、LocalAPI 地址（记 warning，提示重启 daemon）
@@ -139,6 +150,10 @@ impl Default for TurnSection {
 }
 
 /// `daemon.toml` 的 `[network.proxy]` 小节（#3 fabric-over-proxy）。
+///
+/// 语义：**N1 建连经代理**（dial 时的代理 tier），与 `proxy.yaml`
+/// （TUN 出站策略）、`[network.turn]`（TURN+STUN）区分；详见本模块
+/// 顶部文档的“三个 proxy 的语义区分”。
 ///
 /// 缺失 `[network.proxy]` → `proxy: None`（daemon 正常启动，chain 跳过 proxy tier）。
 /// 任一字段非法 → 配置加载失败（daemon exit 1 + CONFIG 错误），不是运行时降级。

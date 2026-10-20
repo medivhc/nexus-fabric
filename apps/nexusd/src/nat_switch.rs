@@ -16,9 +16,11 @@
 //! sw.shutdown();
 //! ```
 //!
-//! 诚实边界：nexusd 尚无 TURN 客户端（配 schema 与凭证管理是独立 gap），
-//! 因此 `main.rs` 暂不实例化本模块；`on_relay_connected` 是留给中继连接器的
-//! 钩子。E4（`crates/nexus-nat-wireup/examples/e4_prod_switch.rs`）用真实
+//! 诚实边界：`main.rs` 的 `NatSwitchRuntime`（:409）已持有 `NatSwitching`
+//! （`TurnManager` + `StunProber` + `NatSwitching`），`NatSwitchRuntime::start`
+//! （`main.rs`:438 定义、:867 调用）已实例化；`on_relay_connected`
+//! 待 D5 mesh/fabric 喂入（`main.rs`:406），当前为留给中继连接器的钩子。
+//! E4（`crates/nexus-nat-wireup/examples/e4_prod_switch.rs`）用真实
 //! TURN + NAT 模拟证明整条链路。
 
 use std::net::SocketAddr;
