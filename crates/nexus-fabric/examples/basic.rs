@@ -60,7 +60,7 @@ fn run_with_connect(
     // driver alive through the client's complete echo/EOF and worker join.
     let server_owner = listener.clone();
 
-    // Server: accept -> echo the stream -> count datagrams.
+    // Server: accept -> echo the stream -> observe a valid datagram.
     let server = thread::spawn(move || -> Result<(usize, usize), String> {
         let _exit = WorkerExit(Some(server_exited));
         let conn = listener
@@ -83,15 +83,9 @@ fn run_with_connect(
                 .map_err(|e| format!("echo write: {e}"))?;
         }
         send.finish().map_err(|e| format!("echo finish: {e}"))?;
-        let mut dcount = 0;
-        for _ in 0..DATAGRAMS {
-            let d = conn
-                .recv_datagram()
-                .map_err(|e| format!("dgram recv: {e}"))?;
-            if d.len() == 200 {
-                dcount += 1;
-            }
-        }
+        let dcount = receive_example_datagrams(|| {
+            conn.recv_datagram().map_err(|e| format!("dgram recv: {e}"))
+        })?;
         Ok((dcount, data.len()))
     });
 
@@ -159,6 +153,20 @@ fn run_with_connect(
     ))
 }
 
+// S5 permits loss: the example only needs to witness one valid arrival.
+// The separate server owner keeps the driver alive through echo delivery.
+fn receive_example_datagrams(
+    mut receive: impl FnMut() -> Result<Vec<u8>, String>,
+) -> Result<usize, String> {
+    for _ in 0..DATAGRAMS {
+        let datagram = receive()?;
+        if datagram.len() == 200 {
+            return Ok(1);
+        }
+    }
+    Ok(0)
+}
+
 struct WorkerExit<F: FnOnce()>(Option<F>);
 
 impl<F: FnOnce()> Drop for WorkerExit<F> {
@@ -191,3 +199,7 @@ fn with_server_owner<O, C, S>(
 #[cfg(test)]
 #[path = "basic/owner_tests.rs"]
 mod owner_tests;
+
+#[cfg(test)]
+#[path = "basic/datagram_tests.rs"]
+mod datagram_tests;

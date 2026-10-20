@@ -34,6 +34,10 @@ task_type: feature
 直到客户端读完完整回显与 EOF，并在客户端失败时也消费 server JoinHandle。
 早期建连失败还需要有界 accept，避免持有 owner 后永远等不到 server join。
 
+也不能把接收全部数据报当作生命周期屏障：S5 允许丢包，正式 basic 场景只要求
+至少收到一个有效 200B 包。收到首个有效包即可结束该检查，回显交付由独立 owner
+保证；没有有效包时不得报告成功。回归应同时覆盖部分丢失和错误长度输入。
+
 ## 解决方案
 
 E4 的 B 线程在 `send.finish()` 后**等待 A 确认**（mpsc channel 显式握手），
