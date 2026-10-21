@@ -146,3 +146,7 @@ workspace 检查，不依赖 default Workspace；错配/审计失败拒绝。协
 ### N3-10 提供方范围 Use grant 运维
 
 按 docs/N3-10-OPERATOR-GRANT-CONTRACT.md 分派本地 task-provider grant；配置路径必须显式，不使用环境/default Workspace/daemon目标代替。严格核实既存 scope、私有 N2 身份和真实 grant 编码；list 不创建或清理文件，add/revoke 只改变单个 Use-only grant。专用 Linux lease/审计与原子 IO 由组合根拥有，保持 forbid(unsafe_code)；不创建 Task/Session/identity、无 outbox 或新增依赖。业务失败按 schema1 显式报告 phase/可能已生效，用法错误 exit2。冻结状态未知时拒绝 mutation，读列表仍可取证。
+
+### N3-12 Snapshot CLI 与只读输入适配
+
+按 docs/N3-12-SNAPSHOT-STAGING-CONTRACT.md §1/2/3/8，新增 snapshot freeze/upload/status/cancel。freeze 从显式私有 config 的正规 Workspace anchor/CAS bounded read，仅写新 bundle，no-replace helper 归属 Linux platform；upload 验证完整原 bundle后按原key/已确认offset续传，status/cancel只调用本机认证API。纯语法/非本机target拒绝先于IO，forbid(unsafe_code)、无 TaskOwner/新依赖/远端明文token。

@@ -1,0 +1,5 @@
+nexus-workspace-state v2
+id n312-source
+commit b06b020a76caf915 6a9e12a170547cc6 parents:e56d994c89c61ec6 author:fixture-author ts:1791818761
+commit e56d994c89c61ec6 cbf29ce484222325 parents: author:fixture-author ts:1791818761
+head b06b020a76caf915

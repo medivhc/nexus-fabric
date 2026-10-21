@@ -1,0 +1,14 @@
+{
+  "command": "scenario run",
+  "duration_ms": 1802,
+  "evidence_id": "scenario-n311-restore20-ed7ab8759d1c",
+  "failure_signature": {
+    "assertion": "",
+    "failed_step": "",
+    "key_log_lines": []
+  },
+  "message": "scenario product.fabric-conn-basic: PASS (command ran, all 6 expectations held)",
+  "scenario": "product.fabric-conn-basic",
+  "schema_version": 1,
+  "verdict": "PASS"
+}

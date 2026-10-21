@@ -376,3 +376,13 @@ docs/N3-6-LOCALAPI-SECURITY-CONTRACT.md；不能把本批局部服务称为完�
 ### N3-9 接收器复用
 
 本地 GetArtifact 继续原有逐页当前 Use、accepted scope、审计与真实内容校验。ArtifactDownload 迁到 nexus 组合根，原 nexusd::artifact_download 路径兼容 re-export；provider 私有 artifact authority IO 不扩大 public surface。验证 example 通过真实现有 Engine/TaskOwner 产生并发布产物，随后由正常 daemon 冷启动复核，禁止 production fixture API 或伪造终态。范围见 docs/N3-9-ARTIFACT-CLI-CONTRACT.md；Submit 仍明确拒绝。
+
+### N3-11 正式提供方初始化与检查（契约草案）
+
+按docs/N3-11-PROVIDER-INIT-CONTRACT.md新增本机task-provider init/check，先于config-folder参数分派。init仅fresh显式既存私有根，从原N2身份record和FileTaskAcceptanceStore::provision_capacity建立原authority，不添加反向app依赖、第二套capacity owner或wire操作。journal及固定inode lease绑定原root、scope、canonical policy和原identity；qualified中断仅恢复原字节，缺失/损坏authority拒绝重建。完成后相同init启动前后changed=false，不reprovision或推进epoch；check直接核实既有文件且零写入，不调用会初始化/清理的storage open。
+
+managed marker在身份ensure、N2 assembly、reconciliation和token创建前核实，pending/corrupt不READY；compatibility serve及Task loader同样检查，legacy unmanaged保持原行为。核实完成managed provider是正常config-folder合法subsystem，N3-only需要运维者明确no-TUN；原普通空根拒绝不变，不生成占位proxy/network。初始Pending不是活Ready，daemon仍经原owner恢复；不创建grant/name/ad/Task/Session/Engine/token或开放Submit/上传。仅Linux、Rust1.85，无新deps/crate/unsafe；输出schema1与phase/mutation_may_have_applied，具体权限、inode、恢复和有限E4见草案。实现须等待实际RED及冻结摘要。
+
+### N3-12 显式暂存预算与 durable upload owner
+
+按 docs/N3-12-SNAPSHOT-STAGING-CONTRACT.md，新增 task-provider staging-init 与独立 /localapi/v1/snapshot 路由。固定原身份/root/scope，namespace外保留初始化marker；single authoritative ledger记录reservation/owner/key/manifest/durableprefix/transactionintent，预算和serialization cap在任何payload前保证。当前Use/audit先于staging lease；confirmed prefix不得重置，Cancel物理清理fsync后返还charge。normal/serve在identity ensure/启动写入/token/READY前恢复，损坏拒绝READY。原任务capacity/receipt/GC catalog/wire不变，Staged不是Task接受，不装配执行/远端认证。

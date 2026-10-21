@@ -32,7 +32,7 @@
 ## Invariants
 
 - 只实现 nexus-platform capability traits。
-- N3-9 的宿主文件 lease primitive 例外：`file_lease::try_lock_exclusive(&std::fs::File) -> std::io::Result<()>`，仅封装已有 Linux flock 站点、非阻塞返回 WouldBlock/其他 IO 错误，不包含 Task/Artifact/授权策略。调用方持有 File 保持锁；不新增 portable trait 或依赖边。它服务组合根 receiver 并维持其 forbid(unsafe_code) 与 Rust 1.85；具体平台 primitive 不向 portable core 泄漏。契约见 docs/N3-9-ARTIFACT-CLI-CONTRACT.md。
+- N3-9 的宿主文件 lease primitive 例外：`file_lease::try_lock_exclusive(&std::fs::File) -> std::io::Result<()>`，仅封装已有 Linux flock 站点、非阻塞返回 WouldBlock/其他 IO 错误，不包含 Task/Artifact/授权策略。调用方持有 File 保持锁；不新增 portable trait 或依赖边。它服务组合根 receiver 并维持其 forbid(unsafe_code) 与 Rust 1.85；具体平台 primitive 不向 portable core 泄漏。契约见 docs/N3-9-ARTIFACT-CLI-CONTRACT.md。私有短期逻辑 owner 可使用 `file_lease::unlock_exclusive(&std::fs::File) -> std::io::Result<()>` 显式结束同一 open file description 的锁，包括其克隆/继承描述符；独立 open 的 owner 不受影响。普通 File 克隆及最后描述符关闭的原语义不变，调用方负责只在逻辑 owner 的保护操作结束后释放。
 
 ### OS 装配不变量（O1–O6，feature/os-assemble）
 
@@ -98,3 +98,7 @@ cargo clippy -p nexus-platform-linux --all-targets -- -D warnings
 ## Platform Constraints
 
 平台专有代码只允许存在于 `nexus-platform-*` 或 Composition Root。Portable crate 必须通过相应 portability gate。
+
+### N3-12 原子目录无覆盖发布
+
+Linux adapter 提供安全 publish_directory_no_replace(source,destination) -> std::io::Result<()>，封装 renameat2(RENAME_NOREPLACE)。调用方负责源/目标父目录的权限、inode绑定及文件/目录fsync；primitive保证存在目标原子拒绝，EINVAL/ENOSYS不退回覆盖rename。最小unsafe仅OS FFI指针有效期、不保留指针，portable app保持forbid(unsafe_code)，无新增依赖。

@@ -1,0 +1,72 @@
+{
+  "command": "verify",
+  "evidence": {
+    "bindings": {
+      "configuration_digest": "d0ace8009728a7dc482e5d9ca03ceb8f4945ef3a",
+      "contract_hash": "c472fcdf15a919a1180165673b18a452bdcfc34a",
+      "dirty_state": true,
+      "feature_set": [
+        "workspace:default"
+      ],
+      "harness_schema_version": 1,
+      "platform_capability_digest": "711a114fe73b9bf0c371c2a2809389611af3ba8a",
+      "source_revision": "1beb960076bc2df6ef7bfc2408e5fed6d6bd0b1e",
+      "target_triple": "x86_64-unknown-linux-gnu",
+      "toolchain_version": "1.98.1",
+      "working_tree_digest": "49c59fe0c54bc329ea960fa64ec8a1bc1b49d398"
+    },
+    "dir": "verify-n311-restore20-b5ce8ecbcea2",
+    "id": "n311-restore20-b5ce8ecbcea2",
+    "verdict": "PASS"
+  },
+  "gates": [
+    {
+      "detail": "no whitespace errors",
+      "name": "whitespace",
+      "verdict": "PASS"
+    },
+    {
+      "detail": "ok",
+      "name": "format",
+      "verdict": "PASS"
+    },
+    {
+      "detail": "ok",
+      "name": "check",
+      "verdict": "PASS"
+    },
+    {
+      "detail": "ok",
+      "name": "clippy",
+      "verdict": "PASS"
+    },
+    {
+      "detail": "49 crates declared",
+      "name": "architecture-policy",
+      "verdict": "PASS"
+    },
+    {
+      "detail": "cargo-deny: advisories/licenses/bans/sources PASS",
+      "name": "dependency-governance",
+      "verdict": "PASS"
+    },
+    {
+      "detail": "4 crate(s) [[\"nexus-registry\", \"nexus-planner\", \"nexus-session\", \"nexus-auth\"]], 6 file(s): no resource-type-specialized branches",
+      "name": "resource-type-neutrality",
+      "verdict": "PASS"
+    },
+    {
+      "detail": "tested: nexus, nexus-connectivity, nexus-harness, nexus-nat-traversal, nexus-nat-wireup, nexus-outbound-anytls, nexus-outbound-hysteria2, nexus-outbound-shadowsocks, nexus-outbound-trojan, nexus-outbound-vless, nexus-outbound-vmess, nexus-proxy, nexusd",
+      "name": "affected-tests",
+      "verdict": "PASS"
+    },
+    {
+      "detail": "ok",
+      "name": "selected-properties",
+      "verdict": "PASS"
+    }
+  ],
+  "message": "fast verify: 9 gates, 9 pass, 0 fail, 0 unknown",
+  "schema_version": 1,
+  "verdict": "PASS"
+}

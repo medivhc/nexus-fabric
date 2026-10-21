@@ -11804,6 +11804,8 @@ mod bufferbloat_tests {
     }
 }
 
+/// N3-12 offline freeze and authenticated local staging client.
+pub mod snapshot_cli;
 /// N3 task front-end parsing; service adapter remains unavailable.
 pub mod task_cli;
 

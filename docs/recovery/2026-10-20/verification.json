@@ -1,0 +1,212 @@
+{
+  "schema_version": 1,
+  "scope": "Integrated N311/Fabric code after rebase onto master5d70709 and five mechanical format/rustdoc fixes. Recorded before adding this recovery documentation/archive. No Full, Windows or E5 certification.",
+  "source_revision": "1beb960076bc2df6ef7bfc2408e5fed6d6bd0b1e",
+  "working_tree_source_sha256_compact_json": "0992a086c45d3a71b7ffab025704831a850b60a7dffa6e0409c0cb6e1a361d38",
+  "base_revision": "5d707092acbfd6b3085e86f49841e814d87e10f4",
+  "stages": [
+    {
+      "label": "build-harness",
+      "argv": [
+        "cargo",
+        "build",
+        "--locked",
+        "-p",
+        "nexus-harness",
+        "--message-format=json"
+      ],
+      "exit_code": 0,
+      "started_at": "2026-10-20T15:01:04.738152+00:00",
+      "ended_at": "2026-10-20T15:01:11.562392+00:00",
+      "source_revision": "1beb960076bc2df6ef7bfc2408e5fed6d6bd0b1e",
+      "source_digest": "0992a086c45d3a71b7ffab025704831a850b60a7dffa6e0409c0cb6e1a361d38",
+      "source_unchanged": true,
+      "actor": "n311-restore20"
+    },
+    {
+      "label": "check",
+      "argv": [
+        "/workspace/ws-n3-delivery20/target/debug/nexus-harness",
+        "check",
+        "--json"
+      ],
+      "exit_code": 0,
+      "started_at": "2026-10-20T15:01:11.645278+00:00",
+      "ended_at": "2026-10-20T15:02:41.148503+00:00",
+      "source_revision": "1beb960076bc2df6ef7bfc2408e5fed6d6bd0b1e",
+      "source_digest": "0992a086c45d3a71b7ffab025704831a850b60a7dffa6e0409c0cb6e1a361d38",
+      "source_unchanged": true,
+      "actor": "n311-restore20",
+      "verdict": "PASS",
+      "native_evidence": null
+    },
+    {
+      "label": "affected",
+      "argv": [
+        "/workspace/ws-n3-delivery20/target/debug/nexus-harness",
+        "test",
+        "affected",
+        "--json"
+      ],
+      "exit_code": 0,
+      "started_at": "2026-10-20T15:02:41.205946+00:00",
+      "ended_at": "2026-10-20T15:06:23.217736+00:00",
+      "source_revision": "1beb960076bc2df6ef7bfc2408e5fed6d6bd0b1e",
+      "source_digest": "0992a086c45d3a71b7ffab025704831a850b60a7dffa6e0409c0cb6e1a361d38",
+      "source_unchanged": true,
+      "actor": "n311-restore20",
+      "verdict": "PASS",
+      "native_evidence": null
+    },
+    {
+      "label": "fast",
+      "argv": [
+        "/workspace/ws-n3-delivery20/target/debug/nexus-harness",
+        "verify",
+        "--fast",
+        "--json"
+      ],
+      "exit_code": 0,
+      "started_at": "2026-10-20T15:06:23.274250+00:00",
+      "ended_at": "2026-10-20T15:07:51.778153+00:00",
+      "source_revision": "1beb960076bc2df6ef7bfc2408e5fed6d6bd0b1e",
+      "source_digest": "0992a086c45d3a71b7ffab025704831a850b60a7dffa6e0409c0cb6e1a361d38",
+      "source_unchanged": true,
+      "actor": "n311-restore20",
+      "verdict": "PASS",
+      "native_evidence": {
+        "bindings": {
+          "configuration_digest": "d0ace8009728a7dc482e5d9ca03ceb8f4945ef3a",
+          "contract_hash": "c472fcdf15a919a1180165673b18a452bdcfc34a",
+          "dirty_state": true,
+          "feature_set": [
+            "workspace:default"
+          ],
+          "harness_schema_version": 1,
+          "platform_capability_digest": "711a114fe73b9bf0c371c2a2809389611af3ba8a",
+          "source_revision": "1beb960076bc2df6ef7bfc2408e5fed6d6bd0b1e",
+          "target_triple": "x86_64-unknown-linux-gnu",
+          "toolchain_version": "1.98.1",
+          "working_tree_digest": "49c59fe0c54bc329ea960fa64ec8a1bc1b49d398"
+        },
+        "dir": "verify-n311-restore20-b5ce8ecbcea2",
+        "id": "n311-restore20-b5ce8ecbcea2",
+        "verdict": "PASS"
+      }
+    },
+    {
+      "label": "focused-provider",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "nexusd",
+        "--test",
+        "task_provider_init",
+        "--test",
+        "task_provider_relative_startup"
+      ],
+      "exit_code": 0,
+      "started_at": "2026-10-20T15:07:51.843317+00:00",
+      "ended_at": "2026-10-20T15:07:54.948495+00:00",
+      "source_revision": "1beb960076bc2df6ef7bfc2408e5fed6d6bd0b1e",
+      "source_digest": "0992a086c45d3a71b7ffab025704831a850b60a7dffa6e0409c0cb6e1a361d38",
+      "source_unchanged": true,
+      "actor": "n311-restore20"
+    },
+    {
+      "label": "focused-fabric",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "nexus-fabric",
+        "--example",
+        "basic"
+      ],
+      "exit_code": 0,
+      "started_at": "2026-10-20T15:07:55.027999+00:00",
+      "ended_at": "2026-10-20T15:08:09.786327+00:00",
+      "source_revision": "1beb960076bc2df6ef7bfc2408e5fed6d6bd0b1e",
+      "source_digest": "0992a086c45d3a71b7ffab025704831a850b60a7dffa6e0409c0cb6e1a361d38",
+      "source_unchanged": true,
+      "actor": "n311-restore20"
+    },
+    {
+      "label": "build-products",
+      "argv": [
+        "cargo",
+        "build",
+        "--locked",
+        "-p",
+        "nexus",
+        "-p",
+        "nexusd",
+        "-p",
+        "nexus-fabric",
+        "--bins",
+        "--example",
+        "basic",
+        "--message-format=json"
+      ],
+      "exit_code": 0,
+      "started_at": "2026-10-20T15:08:09.851896+00:00",
+      "ended_at": "2026-10-20T15:08:10.356120+00:00",
+      "source_revision": "1beb960076bc2df6ef7bfc2408e5fed6d6bd0b1e",
+      "source_digest": "0992a086c45d3a71b7ffab025704831a850b60a7dffa6e0409c0cb6e1a361d38",
+      "source_unchanged": true,
+      "actor": "n311-restore20"
+    },
+    {
+      "label": "e4-provider-init",
+      "argv": [
+        "/workspace/ws-n3-delivery20/target/debug/nexus-harness",
+        "scenario",
+        "run",
+        "product.n3-11-provider-init",
+        "--json"
+      ],
+      "exit_code": 0,
+      "started_at": "2026-10-20T15:08:10.422492+00:00",
+      "ended_at": "2026-10-20T15:08:12.384972+00:00",
+      "source_revision": "1beb960076bc2df6ef7bfc2408e5fed6d6bd0b1e",
+      "source_digest": "0992a086c45d3a71b7ffab025704831a850b60a7dffa6e0409c0cb6e1a361d38",
+      "source_unchanged": true,
+      "actor": "n311-restore20",
+      "verdict": "PASS",
+      "native_evidence": "scenario-n311-restore20-e5835d6e186d"
+    },
+    {
+      "label": "e4-fabric-basic",
+      "argv": [
+        "/workspace/ws-n3-delivery20/target/debug/nexus-harness",
+        "scenario",
+        "run",
+        "product.fabric-conn-basic",
+        "--json"
+      ],
+      "exit_code": 0,
+      "started_at": "2026-10-20T15:08:12.457264+00:00",
+      "ended_at": "2026-10-20T15:08:14.497823+00:00",
+      "source_revision": "1beb960076bc2df6ef7bfc2408e5fed6d6bd0b1e",
+      "source_digest": "0992a086c45d3a71b7ffab025704831a850b60a7dffa6e0409c0cb6e1a361d38",
+      "source_unchanged": true,
+      "actor": "n311-restore20",
+      "verdict": "PASS",
+      "native_evidence": "scenario-n311-restore20-ed7ab8759d1c"
+    }
+  ],
+  "focused_regressions": {
+    "provider_init": 23,
+    "relative_startup": 4,
+    "fabric_owner_datagram": 18,
+    "failed": 0,
+    "ignored": 0
+  },
+  "full": "PAUSED_NOT_RUN",
+  "windows_e5": "PAUSED_NOT_RUN",
+  "candidate_completion": false,
+  "final_verdict": "NOT_CLAIMED"
+}

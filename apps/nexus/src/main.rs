@@ -66,6 +66,11 @@ nexus — Nexus 统一 Resource Fabric 控制面 CLI（瘦客户端）
   workspace conflicts <workspace>         未合并冲突
   workspace cache <workspace>             Workspace 缓存状态
   workspace commit <workspace>            提交 Workspace 暂存变更（经 daemon）
+  snapshot freeze <workspace> --config <absolute-dir> --commit <id>
+      --include <path> [--exclude <path>] [--executable <path>] --output <absolute-new-dir>
+                                        离线冻结指定 Commit；selection 可重复且不覆盖目标
+  snapshot upload --bundle <absolute-dir> --provider <id> --resource <id> --key <id>
+  snapshot status|cancel <upload-id>       本机认证 staging；Staged 不表示任务执行
   task submit --request <json-file>       N3 提交（完整执行接线尚未装配）
   task show|cancel|artifacts <id>          查询或取消本地提供方任务
   task logs <id> --stream <stdout|stderr> --offset <n>
@@ -198,6 +203,18 @@ fn extract_remote_target(args: &[String]) -> Result<(RemoteTarget, Vec<String>),
 }
 
 fn run(args: &[String]) -> i32 {
+    if nexus::snapshot_cli::handles(args) {
+        return match nexus::snapshot_cli::run(args) {
+            Ok(output) => {
+                println!("{output}");
+                0
+            }
+            Err(reason) => {
+                eprintln!("error: {reason}");
+                2
+            }
+        };
+    }
     // Local operator commands must inspect the raw global options before the
     // remote parser consumes them. This branch never selects a daemon target.
     if is_task_provider_command(args) {

@@ -334,5 +334,45 @@
     "module": "engineering",
     "category": "implementation-pattern",
     "summary": "Skill 挖掘五步法（Lauren Tan/pstack 播客提炼）：记痛点→翻记录找重复→分类（传话筒/反复纠正/重讲背景）→拆分确定性→buffer 再固化；自下而上、自己的刀"
+  },
+  {
+    "id": "n3-neg-ctrl",
+    "file": "entries/2026-10-16-n3-negative-controls.md",
+    "date": "2026-10-16",
+    "module": "apps/nexusd",
+    "category": "test-review",
+    "summary": "授权和DTO负例应先证明合法业务/HTTP正控，仅改变一个条件，避免更早拒绝遮蔽目标检查。"
+  },
+  {
+    "id": "n3-final-pin",
+    "file": "entries/2026-10-17-n3-upload-terminal-integrity.md",
+    "date": "2026-10-17",
+    "module": "apps/nexus",
+    "category": "implementation-pitfall",
+    "summary": "上传成功出口须在最终响应后复核原bundle身份及内容，覆盖幂等快捷返回和等待窗口篡改"
+  },
+  {
+    "id": "scoped-lease-inherited-fd",
+    "file": "entries/2026-10-19-scoped-lease-inherited-fd.md",
+    "date": "2026-10-19",
+    "module": "apps/nexusd / nexus-platform-linux",
+    "category": "implementation-pitfall",
+    "summary": "CLOEXEC仍允许fork到exec窗口继承flock；私有短期owner作用域释放与raw File clone语义须分开，回归用owned child确定性验证并回收。"
+  },
+  {
+    "id": "n3-expiry-err",
+    "file": "entries/2026-10-19-expiry-error-classification.md",
+    "date": "2026-10-19",
+    "module": "apps/nexusd",
+    "category": "implementation-pitfall",
+    "summary": "正常TTL清理后目标可能消失，恢复前返回非泄漏缺失拒绝；测试按独立观察区分可选清理的保留/移除分支，不能强制must-prune。"
+  },
+  {
+    "id": "n3-ledger-cost",
+    "file": "entries/2026-10-21-n3-staging-ledger-validation-cost.md",
+    "date": "2026-10-21",
+    "module": "apps/nexusd",
+    "category": "review",
+    "summary": "保留Cancelled索引后的重复全表验证有累计成本；以未插桩基准定位优化，保持完整校验与原测试规模。"
   }
 ]

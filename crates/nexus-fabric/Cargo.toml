@@ -16,3 +16,7 @@ rcgen = "0.13"
 ring = "0.17"
 
 [dev-dependencies]
+
+[[example]]
+name = "basic"
+test = true

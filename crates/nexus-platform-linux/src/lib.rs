@@ -13,6 +13,9 @@ pub mod addr;
 pub mod assemble;
 /// 自研 daemon：PID 文件、信号处理、退出清理。
 pub mod daemon;
+/// Atomic Linux no-replace publication primitive.
+#[cfg(target_os = "linux")]
+pub mod directory_publish;
 /// 内置 DNS server（只服务 TUN 网段，不碰 /etc/resolv.conf）。
 pub mod dns;
 /// Nonblocking Linux file leases; callers retain the owning file descriptor.

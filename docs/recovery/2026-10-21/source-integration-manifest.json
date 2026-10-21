@@ -1,0 +1,603 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-21",
+  "task_type": "bugfix",
+  "integration_baseline": "731e659a49068d56c580ce8e7e986d1c333592fc",
+  "historical_merge_ancestor": "37e0cff0e528e5d09691b9a3bc698372f5df44e7",
+  "master_baseline": "5d707092acbfd6b3085e86f49841e814d87e10f4",
+  "files": [
+    {
+      "repo_path": "apps/nexus/src/lib.rs",
+      "recovered_sha256": "d8511b528fb7d4ddd396773f63408619765c09ddcebd581f01244101124f76d8",
+      "integrated_sha256": "7edbfde8e9d9adde4666491fa74c63597b785fc67352ac81b4bfbccd1ae318c7",
+      "integrated_bytes": 481473,
+      "method": "historical-source-restore",
+      "basis": "CLI completed R2 six-file owned_source_sha256 map",
+      "differs_from_recovered": true
+    },
+    {
+      "repo_path": "apps/nexus/src/main.rs",
+      "recovered_sha256": "cf49165cbff821f6b526a11cc8e4e96c9a99785c5aaec42cd17d87177487935c",
+      "integrated_sha256": "cf49165cbff821f6b526a11cc8e4e96c9a99785c5aaec42cd17d87177487935c",
+      "integrated_bytes": 81690,
+      "method": "historical-source-restore",
+      "basis": "CLI completed R2 six-file owned_source_sha256 map",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "apps/nexus/src/n3_acceptance.rs",
+      "recovered_sha256": "b05cc677b165defccfc397583c954d3de255b7518f1a638b9a634f1ebbfdfb8b",
+      "integrated_sha256": "b05cc677b165defccfc397583c954d3de255b7518f1a638b9a634f1ebbfdfb8b",
+      "integrated_bytes": 8046,
+      "method": "historical-source-restore",
+      "basis": "CLI completed R2 six-file owned_source_sha256 map",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "apps/nexus/src/task_localapi.rs",
+      "recovered_sha256": "99fa54d38571f1eeb49b9613c163c34ed1f2be6e336abb0fde098044d8b77b55",
+      "integrated_sha256": "99fa54d38571f1eeb49b9613c163c34ed1f2be6e336abb0fde098044d8b77b55",
+      "integrated_bytes": 16202,
+      "method": "historical-source-restore",
+      "basis": "CLI completed R2 six-file owned_source_sha256 map",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "apps/nexus/src/snapshot_cli.rs",
+      "recovered_sha256": "051b94d8db50cdce28b5f10a32553c0075a86d1ee6f2a416ead609afb17c6f29",
+      "integrated_sha256": "051b94d8db50cdce28b5f10a32553c0075a86d1ee6f2a416ead609afb17c6f29",
+      "integrated_bytes": 15526,
+      "method": "historical-source-restore",
+      "basis": "CLI completed R2 six-file owned_source_sha256 map",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "apps/nexus/src/snapshot_cli/linux.rs",
+      "recovered_sha256": "7ac02a7464b8a010f7d74711ce32871aa8f202246b36fb2e22c6b526fe2fb417",
+      "integrated_sha256": "7ac02a7464b8a010f7d74711ce32871aa8f202246b36fb2e22c6b526fe2fb417",
+      "integrated_bytes": 27502,
+      "method": "historical-source-restore",
+      "basis": "CLI completed R2 six-file owned_source_sha256 map",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/main.rs",
+      "recovered_sha256": "fc8b5d7faeee44bac0bd288398e92adfdfe8d9a7e7cff878a25d00af9e6d077f",
+      "integrated_sha256": "3004fcb6a679c4f0bcd5213a1dd10f75aa996368697c862306230d8a6f7d04f7",
+      "integrated_bytes": 73659,
+      "method": "historical-source-restore",
+      "basis": "Daemon completed five-file owned_source_files map, daemon-resume exec-c0eb3e17",
+      "differs_from_recovered": true
+    },
+    {
+      "repo_path": "apps/nexusd/src/lib.rs",
+      "recovered_sha256": "df475be89bd3ebc9420150b853476e84fa7237b997e1455b6a61e2e9a375e281",
+      "integrated_sha256": "8cb485b09d5cc33dbb3059049b0008491aaca4cb94dcfd02ec55531c76f47963",
+      "integrated_bytes": 1912,
+      "method": "historical-source-restore",
+      "basis": "Daemon completed five-file owned_source_files map, daemon-resume exec-c0eb3e17",
+      "differs_from_recovered": true
+    },
+    {
+      "repo_path": "apps/nexusd/src/task_http.rs",
+      "recovered_sha256": "f012ca9d6f0cd3bc7c75669458b04d486f672b13ed54f6bc1935f67fdb0665f7",
+      "integrated_sha256": "f012ca9d6f0cd3bc7c75669458b04d486f672b13ed54f6bc1935f67fdb0665f7",
+      "integrated_bytes": 15976,
+      "method": "historical-source-restore",
+      "basis": "Daemon completed five-file owned_source_files map, daemon-resume exec-c0eb3e17",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/task_provider_command.rs",
+      "recovered_sha256": "43fd511ec99c96b5739c4bdc10da280c8e52fb908f35c147bbd9ebcd3220ce0f",
+      "integrated_sha256": "43fd511ec99c96b5739c4bdc10da280c8e52fb908f35c147bbd9ebcd3220ce0f",
+      "integrated_bytes": 9114,
+      "method": "historical-source-restore",
+      "basis": "Daemon completed five-file owned_source_files map, daemon-resume exec-c0eb3e17",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_service.rs",
+      "recovered_sha256": "df800ed8633479422ff4c60c648246fb2c39e69406430e8e298fed0c1c3fee12",
+      "integrated_sha256": "df800ed8633479422ff4c60c648246fb2c39e69406430e8e298fed0c1c3fee12",
+      "integrated_bytes": 2703,
+      "method": "historical-source-restore",
+      "basis": "Daemon completed five-file owned_source_files map and Oct19 aggregate R1 source SHA",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging.rs",
+      "recovered_sha256": "510aa44eb867787980933bf37d5b43b65480350cf483874459984eb1d7740ede",
+      "integrated_sha256": "510aa44eb867787980933bf37d5b43b65480350cf483874459984eb1d7740ede",
+      "integrated_bytes": 3026,
+      "method": "historical-source-restore",
+      "basis": "Oct19 actual implementation 7c3035 plus cfg(test) expiry wiring; explicit before/after source_delta in root exec-19a0795d; excludes RED ErrStub 7984da",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/backend.rs",
+      "recovered_sha256": "7280c82c69f29ec1087230352400708e389132ae6e75d1dc2cacfbf0e890a4b7",
+      "integrated_sha256": "3c24aadfeb452a07d2894530b5ee55bf089405507646b99de6c72360a5673783",
+      "integrated_bytes": 11578,
+      "method": "historical-source-restore",
+      "basis": "Completed backend eight-file map, page2 exec-d0a82af5",
+      "differs_from_recovered": true
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/init.rs",
+      "recovered_sha256": "c86587b6e43c9be360d46b89c2a7106345976ec22e887d77692d717e82909320",
+      "integrated_sha256": "c86587b6e43c9be360d46b89c2a7106345976ec22e887d77692d717e82909320",
+      "integrated_bytes": 13464,
+      "method": "historical-source-restore",
+      "basis": "Completed backend eight-file map, page2 exec-d0a82af5",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/io.rs",
+      "recovered_sha256": "c46b32983547da6f4a031af6e474ffabf04caed3e14d4ed295c6c40012a076db",
+      "integrated_sha256": "c46b32983547da6f4a031af6e474ffabf04caed3e14d4ed295c6c40012a076db",
+      "integrated_bytes": 28315,
+      "method": "historical-source-restore",
+      "basis": "Completed IO author SHA and completed backend eight-file map; original cat/sed overlap reconstruction",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/ledger.rs",
+      "recovered_sha256": "acfaa9a17902852dd02435e4b5fd492dc4ceb5d0fb1bfdfdfa5f2c953f4d55bb",
+      "integrated_sha256": "acfaa9a17902852dd02435e4b5fd492dc4ceb5d0fb1bfdfdfa5f2c953f4d55bb",
+      "integrated_bytes": 13939,
+      "method": "historical-source-restore",
+      "basis": "Completed backend eight-file map, page2 exec-d0a82af5",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/model.rs",
+      "recovered_sha256": "2c66149072d316a40f6bf9fdf649a4619101792c1085bfccb94dda9b0b9551db",
+      "integrated_sha256": "2c66149072d316a40f6bf9fdf649a4619101792c1085bfccb94dda9b0b9551db",
+      "integrated_bytes": 18612,
+      "method": "historical-source-restore",
+      "basis": "Completed backend eight-file map, page2 exec-d0a82af5",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/ops.rs",
+      "recovered_sha256": "8b3acc1ea94ef4bbd2d90fb753ab4a2f9f57ec20b505603bd1b83e07a20769cc",
+      "integrated_sha256": "8b3acc1ea94ef4bbd2d90fb753ab4a2f9f57ec20b505603bd1b83e07a20769cc",
+      "integrated_bytes": 17785,
+      "method": "historical-source-restore",
+      "basis": "Oct19 TTL fix on completed backend e3676b; explicit before/after source_delta in root exec-19a0795d",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/recovery.rs",
+      "recovered_sha256": "125abaa760ac0d1fb91225e902edd27d79a452869a1397c0daf8fd9b4be4f921",
+      "integrated_sha256": "125abaa760ac0d1fb91225e902edd27d79a452869a1397c0daf8fd9b4be4f921",
+      "integrated_bytes": 7779,
+      "method": "historical-source-restore",
+      "basis": "Completed backend eight-file map; Oct19 aggregate R1 original cat byte window",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "crates/nexus-workspace/src/snapshot.rs",
+      "recovered_sha256": "ee4a04f32a5f9df32db6037a1d1a7b311adb5089a35468b3222e08b10cd41efd",
+      "integrated_sha256": "ee4a04f32a5f9df32db6037a1d1a7b311adb5089a35468b3222e08b10cd41efd",
+      "integrated_bytes": 18842,
+      "method": "historical-source-restore",
+      "basis": "Completed freeze implementation three-file map; Oct19 aggregate R1 exact reuse map",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "crates/nexus-platform-linux/src/directory_publish.rs",
+      "recovered_sha256": "73270d0b877e9d2aca165df08bb65552335c0387ff91bb95366ea9b3928af457",
+      "integrated_sha256": "73270d0b877e9d2aca165df08bb65552335c0387ff91bb95366ea9b3928af457",
+      "integrated_bytes": 3822,
+      "method": "historical-source-restore",
+      "basis": "Completed freeze implementation three-file map; excludes earlier syscall stub 2a8bda",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "crates/nexus-platform-linux/src/lib.rs",
+      "recovered_sha256": "05923ca641f89503dd952ba86f2bfcc8e809ea1dce842e8741b3bb1e36039278",
+      "integrated_sha256": "05923ca641f89503dd952ba86f2bfcc8e809ea1dce842e8741b3bb1e36039278",
+      "integrated_bytes": 1658,
+      "method": "historical-source-restore",
+      "basis": "Completed freeze implementation three-file map; Oct19 aggregate R1 exact reuse map",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "crates/nexus-workspace/src/snapshot_bounded_tests.rs",
+      "recovered_sha256": "d95d5065a5aad1cfacf7b3436861e2b834b07b0354d54df3c4d140091c30d78d",
+      "integrated_sha256": "d95d5065a5aad1cfacf7b3436861e2b834b07b0354d54df3c4d140091c30d78d",
+      "integrated_bytes": 21689,
+      "method": "historical-source-restore",
+      "basis": "Approved repaired frozen tests; independent freeze code review exec-e34aecde after_sha256 unchanged",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "crates/nexus-platform-linux/src/directory_publish_tests.rs",
+      "recovered_sha256": "a9d92de5fa5321bde08ad7a86c6cdc93cae659cd17d6bfbc8f687cf89f5e8ed7",
+      "integrated_sha256": "a9d92de5fa5321bde08ad7a86c6cdc93cae659cd17d6bfbc8f687cf89f5e8ed7",
+      "integrated_bytes": 11763,
+      "method": "historical-source-restore",
+      "basis": "Approved repaired frozen tests; independent freeze code review exec-e34aecde after_sha256 unchanged",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/task_provider_init_io.rs",
+      "recovered_sha256": "7d9e63b2c00f8ef65db1f3246bf48b29d8283248007c87bf4083f51e29cb348a",
+      "integrated_sha256": "7d9e63b2c00f8ef65db1f3246bf48b29d8283248007c87bf4083f51e29cb348a",
+      "integrated_bytes": 26826,
+      "method": "historical-source-restore",
+      "basis": "Oct19 complete R2 approved c78130 baseline plus original untruncated production patch exec-6117e0cf; no independent final whole-file SHA recovered",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "crates/nexus-platform-linux/src/file_lease.rs",
+      "recovered_sha256": "255665927daa18abac679137a8ecca77ec0cc37b49c808a7313e23a83489c331",
+      "integrated_sha256": "255665927daa18abac679137a8ecca77ec0cc37b49c808a7313e23a83489c331",
+      "integrated_bytes": 1952,
+      "method": "historical-source-restore",
+      "basis": "Oct19 exact ea20a6 baseline plus original untruncated primitive patch exec-6117e0cf; no independent final whole-file SHA recovered",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging_expiry_tests.rs",
+      "recovered_sha256": "08e4fc10838e49f0fd7d8ea4ca0a48a57314ec5539825110dfeae7425a804ab8",
+      "integrated_sha256": "08e4fc10838e49f0fd7d8ea4ca0a48a57314ec5539825110dfeae7425a804ab8",
+      "integrated_bytes": 24202,
+      "method": "historical-source-restore",
+      "basis": "Oct19 repaired expiry regression R2 APPROVED freeze.test SHA; original numbered source outputs from independent case R2",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging_tests.rs",
+      "recovered_sha256": "d21979f97d985690f0750653921dcb7921e0b867ab2dce40d01c4e0b7741c801",
+      "integrated_sha256": "d21979f97d985690f0750653921dcb7921e0b867ab2dce40d01c4e0b7741c801",
+      "integrated_bytes": 11757,
+      "method": "final-frozen-tests-or-adopted-observer",
+      "basis": "R11 actual frozen backend tests, confirmed by subsequent GREEN backend frozen-sha-check",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging_tests/authority.rs",
+      "recovered_sha256": "f89cb392a0779f99656d49848767cd89714447d5f0d5029c9902d16762021a84",
+      "integrated_sha256": "f89cb392a0779f99656d49848767cd89714447d5f0d5029c9902d16762021a84",
+      "integrated_bytes": 70943,
+      "method": "final-frozen-tests-or-adopted-observer",
+      "basis": "R11 actual frozen backend tests, confirmed by subsequent GREEN backend frozen-sha-check",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging_tests/core.rs",
+      "recovered_sha256": "9d0a539dcd4d8384aaf9ce7bd18e45479b8dab902d318b2881ed4664daa5b8ae",
+      "integrated_sha256": "9d0a539dcd4d8384aaf9ce7bd18e45479b8dab902d318b2881ed4664daa5b8ae",
+      "integrated_bytes": 57365,
+      "method": "final-frozen-tests-or-adopted-observer",
+      "basis": "R11 actual frozen backend tests, confirmed by subsequent GREEN backend frozen-sha-check",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging_tests/pressure.rs",
+      "recovered_sha256": "c63e1592003e23545c52a4c99ce9d45897b72ffe41de433da203d85a3333cedc",
+      "integrated_sha256": "c63e1592003e23545c52a4c99ce9d45897b72ffe41de433da203d85a3333cedc",
+      "integrated_bytes": 40903,
+      "method": "final-frozen-tests-or-adopted-observer",
+      "basis": "R11 actual frozen backend tests, confirmed by subsequent GREEN backend frozen-sha-check",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging_tests/recovery.rs",
+      "recovered_sha256": "ec3342068965c50a9dd3c067ee7c9e7a628d990b6fbd6d012a5658b227257f6f",
+      "integrated_sha256": "a0e97e2e0138edee449754a6dcda20cf56c7b3a96111585ce9fa55b02654170e",
+      "integrated_bytes": 22882,
+      "method": "final-frozen-tests-or-adopted-observer",
+      "basis": "R11 actual frozen backend tests, confirmed by subsequent GREEN backend frozen-sha-check",
+      "differs_from_recovered": true,
+      "additional_independent_binding": {
+        "historical_review": "test-review-branch-task-n312-expiry19-2026-10-19/r2",
+        "field": "freeze.existing_five_test_files",
+        "sha256": "a0e97e2e0138edee449754a6dcda20cf56c7b3a96111585ce9fa55b02654170e",
+        "match": true
+      }
+    },
+    {
+      "repo_path": "crates/nexus-control-api/tests/snapshot_contract.rs",
+      "recovered_sha256": "5bab6b34bccdd4e58919ab442526c3799d14ce5401484f6aeda246f1615d4e21",
+      "integrated_sha256": "5bab6b34bccdd4e58919ab442526c3799d14ce5401484f6aeda246f1615d4e21",
+      "integrated_bytes": 146888,
+      "method": "final-frozen-tests-or-adopted-observer",
+      "basis": "approved DTO source after observed final edition2024 formatting, reused unchanged in Oct19 review materials",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "engineering/verifiers/n3_snapshot_staging.py",
+      "recovered_sha256": "2ff0b82c8705697c179d479ece5702b908ddd9378892bfc5be1d3de26e4a619d",
+      "integrated_sha256": "2ff0b82c8705697c179d479ece5702b908ddd9378892bfc5be1d3de26e4a619d",
+      "integrated_bytes": 78060,
+      "method": "final-frozen-tests-or-adopted-observer",
+      "basis": "actual adopted fixture-only correction, independently confirmed in Oct19 aggregate review; original R8 frozen assertions preserved",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "apps/nexusd/tests/n3_snapshot_staging_binary.py",
+      "recovered_sha256": "961a58c9610444ae8d53704ee35727eb61347c21e3c5cba4b7fc3f8ad48f46c7",
+      "integrated_sha256": "961a58c9610444ae8d53704ee35727eb61347c21e3c5cba4b7fc3f8ad48f46c7",
+      "integrated_bytes": 83727,
+      "method": "final-frozen-tests-or-adopted-observer",
+      "basis": "actual adopted fixture-only correction, independently confirmed in Oct19 aggregate review; original R8 frozen assertions preserved",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "scenarios/fixtures/n3-12-requester/README.md",
+      "recovered_sha256": "e15ede4a2f4393354bfa0a43651706ed80f3157fd37a56b7ffae2fa57e9b9a55",
+      "integrated_sha256": "e15ede4a2f4393354bfa0a43651706ed80f3157fd37a56b7ffae2fa57e9b9a55",
+      "integrated_bytes": 1233,
+      "method": "exact-historical-fixture",
+      "basis": "exact-history-segment",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "scenarios/fixtures/n3-12-requester/config/data/cas/107d6a15dd6dd9c5",
+      "recovered_sha256": "e709d67eb71886c17d5fb89d737405c65187a4dfd88f11bf4f5bc5f2839ea9a7",
+      "integrated_sha256": "e709d67eb71886c17d5fb89d737405c65187a4dfd88f11bf4f5bc5f2839ea9a7",
+      "integrated_bytes": 276,
+      "method": "exact-historical-fixture",
+      "basis": "deterministic-original-input-and-hash-identical-SDK-serialization",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "scenarios/fixtures/n3-12-requester/config/data/cas/143768107773e65c",
+      "recovered_sha256": "87b766d9ed6ec17b1aae1c643cb22f0e65ff4147ea6fcf86678adf80a825aa4a",
+      "integrated_sha256": "87b766d9ed6ec17b1aae1c643cb22f0e65ff4147ea6fcf86678adf80a825aa4a",
+      "integrated_bytes": 250,
+      "method": "exact-historical-fixture",
+      "basis": "deterministic-original-input-and-hash-identical-SDK-serialization",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "scenarios/fixtures/n3-12-requester/config/data/cas/365cd47d660ad54e",
+      "recovered_sha256": "ee5ab33a5dfa7f87486aeba59b80c668b268ba47062c0874bd3ed9cc4a3e059e",
+      "integrated_sha256": "ee5ab33a5dfa7f87486aeba59b80c668b268ba47062c0874bd3ed9cc4a3e059e",
+      "integrated_bytes": 175,
+      "method": "exact-historical-fixture",
+      "basis": "deterministic-original-input-and-hash-identical-SDK-serialization",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "scenarios/fixtures/n3-12-requester/config/data/cas/59b545e938ad7f6b",
+      "recovered_sha256": "5a32fc00d330fc8c244fd9da8a84222d30349df4fdc852461391e1d43476e89c",
+      "integrated_sha256": "5a32fc00d330fc8c244fd9da8a84222d30349df4fdc852461391e1d43476e89c",
+      "integrated_bytes": 98317,
+      "method": "exact-historical-fixture",
+      "basis": "deterministic-original-input-and-hash-identical-SDK-serialization",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "scenarios/fixtures/n3-12-requester/config/data/cas/64f417ebbba5d00d",
+      "recovered_sha256": "46559f8330390eaeb70aa3227d1b99bd53b6f3d76ec201bd72852adf71a85486",
+      "integrated_sha256": "46559f8330390eaeb70aa3227d1b99bd53b6f3d76ec201bd72852adf71a85486",
+      "integrated_bytes": 52,
+      "method": "exact-historical-fixture",
+      "basis": "deterministic-original-input-and-hash-identical-SDK-serialization",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "scenarios/fixtures/n3-12-requester/config/data/cas/6a9e12a170547cc6",
+      "recovered_sha256": "f7bf3114e993169fd1120de7069a14afaa3d3bad20af18f2b7abc671f0bc5db3",
+      "integrated_sha256": "f7bf3114e993169fd1120de7069a14afaa3d3bad20af18f2b7abc671f0bc5db3",
+      "integrated_bytes": 137,
+      "method": "exact-historical-fixture",
+      "basis": "deterministic-original-input-and-hash-identical-SDK-serialization",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "scenarios/fixtures/n3-12-requester/config/data/cas/82f3c98ae62811aa",
+      "recovered_sha256": "53ced8f837851f68bbb78fbc214f03992c7ba6403704844396279738034b70a5",
+      "integrated_sha256": "53ced8f837851f68bbb78fbc214f03992c7ba6403704844396279738034b70a5",
+      "integrated_bytes": 19,
+      "method": "exact-historical-fixture",
+      "basis": "deterministic-original-input-and-hash-identical-SDK-serialization",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "scenarios/fixtures/n3-12-requester/config/data/cas/8a317d032f737d49",
+      "recovered_sha256": "18093d2d9a4be37078cb8e3d9c9a2e50662fb9cd4f3df7e5498e273849914dfd",
+      "integrated_sha256": "18093d2d9a4be37078cb8e3d9c9a2e50662fb9cd4f3df7e5498e273849914dfd",
+      "integrated_bytes": 352,
+      "method": "exact-historical-fixture",
+      "basis": "deterministic-original-input-and-hash-identical-SDK-serialization",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "scenarios/fixtures/n3-12-requester/config/data/cas/97ea2576dd8d16e3",
+      "recovered_sha256": "2b5b9a3a100422068006a3c6b83a5849c03a7a5e832b77ed5c5a5123274869b5",
+      "integrated_sha256": "2b5b9a3a100422068006a3c6b83a5849c03a7a5e832b77ed5c5a5123274869b5",
+      "integrated_bytes": 148,
+      "method": "exact-historical-fixture",
+      "basis": "deterministic-original-input-and-hash-identical-SDK-serialization",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "scenarios/fixtures/n3-12-requester/config/data/cas/a5a0be02d8050458",
+      "recovered_sha256": "ce1796015cdd83a71ca782b083219ddac15dbe2470ee89ed0409a7aa2f2c3501",
+      "integrated_sha256": "ce1796015cdd83a71ca782b083219ddac15dbe2470ee89ed0409a7aa2f2c3501",
+      "integrated_bytes": 378,
+      "method": "exact-historical-fixture",
+      "basis": "deterministic-original-input-and-hash-identical-SDK-serialization",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "scenarios/fixtures/n3-12-requester/config/data/cas/cbf29ce484222325",
+      "recovered_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "integrated_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "integrated_bytes": 0,
+      "method": "exact-historical-fixture",
+      "basis": "deterministic-original-input-and-hash-identical-SDK-serialization",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "scenarios/fixtures/n3-12-requester/config/data/cas/e84b6705e76222a3",
+      "recovered_sha256": "6271227e08ae5ae128e4e834ae48e17cc77093cdf665833b7e9a6cde2afb099d",
+      "integrated_sha256": "6271227e08ae5ae128e4e834ae48e17cc77093cdf665833b7e9a6cde2afb099d",
+      "integrated_bytes": 35,
+      "method": "exact-historical-fixture",
+      "basis": "deterministic-original-input-and-hash-identical-SDK-serialization",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "scenarios/fixtures/n3-12-requester/config/data/cas/fede85f6fd8ed662",
+      "recovered_sha256": "ed54e010d993410f18e8f4e1bab9ba0aec2ab838ee0a1f779d0f6393826f5da3",
+      "integrated_sha256": "ed54e010d993410f18e8f4e1bab9ba0aec2ab838ee0a1f779d0f6393826f5da3",
+      "integrated_bytes": 27,
+      "method": "exact-historical-fixture",
+      "basis": "deterministic-original-input-and-hash-identical-SDK-serialization",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "scenarios/fixtures/n3-12-requester/config/data/mounts/n312-source/inputs/data.bin",
+      "recovered_sha256": "606b3696bb66402784b5fb83754136ac1a088605ae31bc70e946b8fdb273091c",
+      "integrated_sha256": "606b3696bb66402784b5fb83754136ac1a088605ae31bc70e946b8fdb273091c",
+      "integrated_bytes": 48,
+      "method": "exact-historical-fixture",
+      "basis": "deterministic-original-input-and-hash-identical-SDK-serialization",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "scenarios/fixtures/n3-12-requester/config/data/workspaces/n312-source/state_root",
+      "recovered_sha256": "8cca7f9b6d10a3b6ea2a40b34939d78a7a3f245c6d2784f76f3be309d974511d",
+      "integrated_sha256": "8cca7f9b6d10a3b6ea2a40b34939d78a7a3f245c6d2784f76f3be309d974511d",
+      "integrated_bytes": 16,
+      "method": "exact-historical-fixture",
+      "basis": "deterministic-original-input-and-hash-identical-SDK-serialization",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "scenarios/fixtures/n3-12-requester/config/workspace.toml",
+      "recovered_sha256": "ba5112b7ba6bb5538c082c6dcf8efa1ea16600ec7823f9a2824d398d68946915",
+      "integrated_sha256": "ba5112b7ba6bb5538c082c6dcf8efa1ea16600ec7823f9a2824d398d68946915",
+      "integrated_bytes": 80,
+      "method": "exact-historical-fixture",
+      "basis": "deterministic-original-input-and-hash-identical-SDK-serialization",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "scenarios/fixtures/n3-12-requester/facts.txt",
+      "recovered_sha256": "34ec788b7a73306ced32308378310ad196c45581b3142829728d10480a451576",
+      "integrated_sha256": "34ec788b7a73306ced32308378310ad196c45581b3142829728d10480a451576",
+      "integrated_bytes": 244,
+      "method": "exact-historical-fixture",
+      "basis": "deterministic-original-input-and-hash-identical-SDK-serialization",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "scenarios/fixtures/n3-12-requester/generate.rs",
+      "recovered_sha256": "dea2bafdcc2d8513af044f75f528c5693feb4b31b153d9e2bef6c9837bba7615",
+      "integrated_sha256": "dea2bafdcc2d8513af044f75f528c5693feb4b31b153d9e2bef6c9837bba7615",
+      "integrated_bytes": 3373,
+      "method": "exact-historical-fixture",
+      "basis": "exact-history-segment",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "scenarios/fixtures/n3-12-requester/metadata.json",
+      "recovered_sha256": "f4358a8eae80c0cf563eb83500c5a5c4838c61115b5093bf980c6c143c2e0c2c",
+      "integrated_sha256": "f4358a8eae80c0cf563eb83500c5a5c4838c61115b5093bf980c6c143c2e0c2c",
+      "integrated_bytes": 11893,
+      "method": "exact-historical-fixture",
+      "basis": "exact-history-segment",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "scenarios/fixtures/n3-12-requester/verify_export.py",
+      "recovered_sha256": "468c434e0959d9e697a339d74c13146c57fa486a174588f591e4124d86b546ba",
+      "integrated_sha256": "468c434e0959d9e697a339d74c13146c57fa486a174588f591e4124d86b546ba",
+      "integrated_bytes": 3031,
+      "method": "exact-historical-fixture",
+      "basis": "exact-history-segment",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "crates/nexus-control-api/src/lib.rs",
+      "recovered_sha256": "260ab0644511a73be30eb55cd2a8be709da1d8489fdb044619cd5f705d68864f",
+      "integrated_sha256": "260ab0644511a73be30eb55cd2a8be709da1d8489fdb044619cd5f705d68864f",
+      "integrated_bytes": 5436,
+      "method": "three-way-integrated",
+      "basis": "Exact daemon/control source match from restored native chain",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "crates/nexus-control-api/src/snapshot.rs",
+      "recovered_sha256": "4a188c517dea91ab308368a09d52c4ddf16deef44e34a7d9052185d10d0f62a2",
+      "integrated_sha256": "4a188c517dea91ab308368a09d52c4ddf16deef44e34a7d9052185d10d0f62a2",
+      "integrated_bytes": 19457,
+      "method": "new-file-exact-restore",
+      "basis": "Historical exact source; test helper final-phase comparison pending separately",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "PRODUCT.md",
+      "recovered_sha256": "4972265b62b4fd64f3ac526324ec7b73828761b640be13c62315e3304941e250",
+      "integrated_sha256": "4972265b62b4fd64f3ac526324ec7b73828761b640be13c62315e3304941e250",
+      "integrated_bytes": 230011,
+      "method": "three-way-formal-contract",
+      "basis": "Original formal contract merged using baseline 37e0cff; later master changes preserved",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "crates/nexus-control-api/MODULE.md",
+      "recovered_sha256": "b16b9284ea9221d73739769668c6ce3b506dd073c38082d64a6f33d519e5f8a5",
+      "integrated_sha256": "b16b9284ea9221d73739769668c6ce3b506dd073c38082d64a6f33d519e5f8a5",
+      "integrated_bytes": 4512,
+      "method": "three-way-formal-contract",
+      "basis": "Original formal contract merged using baseline 37e0cff; later master changes preserved",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "crates/nexus-workspace/MODULE.md",
+      "recovered_sha256": "abe6f9ec54d6d9c2d40603c489d017518466da2b4904b6cd8179e421d0d62a9b",
+      "integrated_sha256": "abe6f9ec54d6d9c2d40603c489d017518466da2b4904b6cd8179e421d0d62a9b",
+      "integrated_bytes": 15766,
+      "method": "three-way-formal-contract",
+      "basis": "Original formal contract merged using baseline 37e0cff; later master changes preserved",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "crates/nexus-platform-linux/MODULE.md",
+      "recovered_sha256": "726879485dfc68a9160758e3f63e169d1d1fcd316d031e1ac34f8a549673e945",
+      "integrated_sha256": "726879485dfc68a9160758e3f63e169d1d1fcd316d031e1ac34f8a549673e945",
+      "integrated_bytes": 5224,
+      "method": "three-way-formal-contract",
+      "basis": "Original formal contract merged using baseline 37e0cff; later master changes preserved",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "apps/nexus/MODULE.md",
+      "recovered_sha256": "c214e2aa93264e1e1b66ff4ae96629b2cd4a2cefb12d8933eab8f1934e145bd9",
+      "integrated_sha256": "c214e2aa93264e1e1b66ff4ae96629b2cd4a2cefb12d8933eab8f1934e145bd9",
+      "integrated_bytes": 9453,
+      "method": "three-way-formal-contract",
+      "basis": "Original formal contract merged using baseline 37e0cff; later master changes preserved",
+      "differs_from_recovered": false
+    },
+    {
+      "repo_path": "apps/nexusd/MODULE.md",
+      "recovered_sha256": "421e921b7ef60261318e411de3438f8ca30677104e9562690a42b67cb5239ebc",
+      "integrated_sha256": "421e921b7ef60261318e411de3438f8ca30677104e9562690a42b67cb5239ebc",
+      "integrated_bytes": 26362,
+      "method": "three-way-formal-contract",
+      "basis": "Original formal contract merged using baseline 37e0cff; later master changes preserved",
+      "differs_from_recovered": false
+    }
+  ],
+  "file_count": 64,
+  "original_whole_worktree_identity_verified": false,
+  "original_aggregate_digest": "68c9515475da2f547126fa62e807678ce19b6b393163aea7dd5e74adbed3164a",
+  "original_aggregate_count": 1317,
+  "limitations": [
+    "Complete original 1317-path SHA map was not recovered; this manifest authenticates selected component sources and integration results, not the entire original worktree.",
+    "N311 final lease files use known original baseline plus complete original patch; frozen test module SHA independently verified.",
+    "backend.rs integration adds cfg(test) to test-only Mutex import/helper to satisfy current -D warnings; frozen tests unchanged.",
+    "Full and external Windows-to-Linux E5 remain paused; N3-13/14 not accepted.",
+    "Frozen recovery.rs has one semantic-equivalent PathBuf::from to Path::new comparison change for Rust 1.98 Clippy cmp_owned; original bytes retained in forensic evidence and hash recorded separately."
+  ]
+}

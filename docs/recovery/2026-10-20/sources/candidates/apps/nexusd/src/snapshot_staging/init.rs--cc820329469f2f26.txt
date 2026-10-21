@@ -1,0 +1,350 @@
+//! Explicit provisioning and original managed-provider binding checks.
+use super::*;
+pub(super) struct Nodes {
+    pub namespace: io::Directory,
+    pub uploads: io::Directory,
+}
+fn existing(d: &io::Directory, n: &str) -> Result<bool, TaskError> {
+    Ok(d.children()?.iter().any(|x| x == name(n)))
+}
+fn identity_name() -> Result<String, TaskError> {
+    nexus_storage::FileKvStore::file_name_for("n2/auth-identity")
+        .ok_or_else(|| corrupt("invalid existing identity filename"))
+}
+fn base(root: &io::Directory) -> Result<(io::Directory, io::Directory, io::Directory), TaskError> {
+    let n2 = child(root, "n2", None)?;
+    let data = child(root, "data", None)?;
+    let n3 = child(&data, "n3", None)?;
+    Ok((n2, data, n3))
+}
+fn capture(
+    root: &io::Directory,
+    status: &crate::task_provider_init::ProviderStatus,
+    policy: &Policy,
+) -> Result<Binding, TaskError> {
+    let (n2, data, n3) = base(root)?;
+    let id = file(&n2, &identity_name()?, SMALL, None)?;
+    let idbytes = id.read_all()?;
+    let principal = nexus::n2_identity::principal_from_existing_bytes(&idbytes)
+        .map_err(|_| corrupt("invalid original identity"))?;
+    let scope = required(io::open_regular(
+        root,
+        name("task-api.toml"),
+        io::ReadPolicy::ExistingScope,
+        SMALL,
+        None,
+    )?)?;
+    let scopebytes = scope.read_all()?;
+    if principal.0 != status.principal {
+        return Err(corrupt("managed principal changed"));
+    }
+    Ok(Binding {
+        root: root.id(),
+        n2: n2.id(),
+        data: data.id(),
+        n3: n3.id(),
+        identity: id.id(),
+        identity_digest: sha256(&idbytes),
+        scope: scope.id(),
+        scope_digest: sha256(&scopebytes),
+        provider: status.provider.clone(),
+        workspace: status.workspace.clone(),
+        principal: status.principal.clone(),
+        policy_digest: checksum(policy),
+        namespace: None,
+        uploads: None,
+        lock: None,
+        policy: None,
+    })
+}
+fn policy_input(path: &Path) -> Result<Policy, TaskError> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(TaskError::invalid(
+            "absolute budget path without parent traversal required",
+        ));
+    }
+    let parse = (|| {
+        let parent = io::open_external_parent(
+            path.parent()
+                .ok_or_else(|| TaskError::invalid("budget parent missing"))?,
+        )?;
+        let f = io::open_regular(
+            &parent,
+            path.file_name()
+                .ok_or_else(|| TaskError::invalid("budget filename missing"))?,
+            io::ReadPolicy::ExternalBudget,
+            SMALL,
+            None,
+        )?
+        .ok_or_else(|| persistence("budget input missing"))?;
+        let p = Policy::from_value(parse_canonical_json(&f.read_all()?)?)?;
+        p.validate()?;
+        f.check()?;
+        Ok(p)
+    })();
+    parse.map_err(|e: TaskError| {
+        if e.code == TaskErrorCode::StateCorrupt {
+            TaskError::invalid(e.reason)
+        } else {
+            e
+        }
+    })
+}
+fn status(b: &Binding, changed: bool) -> StagingStatus {
+    StagingStatus {
+        provider: b.provider.clone(),
+        workspace: b.workspace.clone(),
+        principal: b.principal.clone(),
+        policy_digest: b.policy_digest.as_str().into(),
+        changed,
+    }
+}
+fn make(
+    config: &Path,
+    root: io::Directory,
+    binding: Binding,
+    policy: Policy,
+    now: Option<u64>,
+) -> FileSnapshotStaging {
+    let _ = now;
+    FileSnapshotStaging {
+        config: config.to_path_buf(),
+        root,
+        binding,
+        policy,
+        #[cfg(test)]
+        fault: Mutex::new(""),
+        #[cfg(test)]
+        time: Mutex::new(now),
+        #[cfg(test)]
+        last: Mutex::new(None),
+        #[cfg(test)]
+        before_lease: Mutex::new(None),
+    }
+}
+pub(super) fn load(
+    config: &Path,
+    now: Option<u64>,
+) -> Result<Option<FileSnapshotStaging>, TaskError> {
+    let root = io::open_config_root(config)?;
+    let has_marker = existing(&root, MARKER)?;
+    let data = root.child(name("data"), None)?;
+    let n3 = match &data {
+        Some(d) => d.child(name("n3"), None)?,
+        None => None,
+    };
+    let has_namespace = match &n3 {
+        Some(d) => existing(d, NAMESPACE)?,
+        None => false,
+    };
+    if !has_marker && !has_namespace {
+        return Ok(None);
+    }
+    if !has_marker || !has_namespace {
+        return Err(corrupt("staging retained marker/namespace missing"));
+    }
+    crate::task_provider_init::check(config).map_err(|e| e.error)?;
+    let marker: Marker = unseal(&file(&root, MARKER, SMALL, None)?.read_all()?)?;
+    if marker.schema_version != 1
+        || marker.phase != "complete"
+        || marker.binding.namespace.is_none()
+        || marker.binding.uploads.is_none()
+        || marker.binding.lock.is_none()
+        || marker.binding.policy.is_none()
+    {
+        return Err(corrupt("staging initialization is not Complete"));
+    }
+    let ns = child(
+        n3.as_ref().ok_or_else(|| corrupt("missing n3"))?,
+        NAMESPACE,
+        marker.binding.namespace,
+    )?;
+    let pfile = file(&ns, POLICY, SMALL, marker.binding.policy)?;
+    let policy: Policy = unseal(&pfile.read_all()?)?;
+    policy
+        .validate()
+        .map_err(|_| corrupt("invalid retained budget"))?;
+    if checksum(&policy) != marker.binding.policy_digest {
+        return Err(corrupt("policy digest changed"));
+    }
+    let s = make(config, root, marker.binding, policy, now);
+    s.nodes()?;
+    Ok(Some(s))
+}
+impl FileSnapshotStaging {
+    pub(super) fn observer_nodes(&self) -> Result<Nodes, TaskError> {
+        self.root.check()?;
+        let data = child(&self.root, "data", Some(self.binding.data))?;
+        let n3 = child(&data, "n3", Some(self.binding.n3))?;
+        let namespace = child(&n3, NAMESPACE, self.binding.namespace)?;
+        let uploads = child(&namespace, "uploads", self.binding.uploads)?;
+        Ok(Nodes { namespace, uploads })
+    }
+    pub(super) fn verify_identity(&self) -> Result<(), TaskError> {
+        self.root.check()?;
+        if self.root.id() != self.binding.root {
+            return Err(corrupt("original root changed"));
+        }
+        let n2 = child(&self.root, "n2", Some(self.binding.n2))?;
+        let f = file(&n2, &identity_name()?, SMALL, Some(self.binding.identity))?;
+        let bytes = f.read_all()?;
+        if sha256(&bytes) != self.binding.identity_digest
+            || nexus::n2_identity::principal_from_existing_bytes(&bytes)
+                .map_err(|_| corrupt("invalid identity material"))?
+                .0
+                != self.binding.principal
+        {
+            return Err(corrupt("original identity changed"));
+        }
+        let scope = required(io::open_regular(
+            &self.root,
+            name("task-api.toml"),
+            io::ReadPolicy::ExistingScope,
+            SMALL,
+            Some(self.binding.scope),
+        )?)?;
+        if sha256(&scope.read_all()?) != self.binding.scope_digest {
+            return Err(corrupt("original scope changed"));
+        }
+        Ok(())
+    }
+    pub(super) fn nodes(&self) -> Result<Nodes, TaskError> {
+        self.verify_identity()?;
+        let marker: Marker = unseal(&file(&self.root, MARKER, SMALL, None)?.read_all()?)?;
+        if marker.schema_version != 1
+            || marker.phase != "complete"
+            || marker.binding != self.binding
+        {
+            return Err(corrupt("retained Complete binding changed"));
+        }
+        let nodes = self.observer_nodes()?;
+        inventory(
+            &nodes.namespace,
+            &[
+                POLICY.into(),
+                LOCK.into(),
+                LEDGER.into(),
+                TEMP.into(),
+                "uploads".into(),
+            ],
+        )?;
+        let f = file(&nodes.namespace, POLICY, SMALL, self.binding.policy)?;
+        let policy: Policy = unseal(&f.read_all()?)?;
+        if policy != self.policy || checksum(&policy) != self.binding.policy_digest {
+            return Err(corrupt("original staging policy changed"));
+        }
+        if file(&nodes.namespace, LOCK, 0, self.binding.lock)?.len()? != 0 {
+            return Err(corrupt("nonempty staging lease"));
+        }
+        file(&nodes.namespace, LEDGER, LEDGER_LIMIT, None)?;
+        Ok(nodes)
+    }
+}
+pub(super) fn initialize(
+    config: &Path,
+    budget: &Path,
+    cutpoint: &str,
+) -> Result<StagingStatus, InitFailure> {
+    let mut mutated = false;
+    let result = (|| {
+        let root = io::open_config_root(config)?;
+        let managed = crate::task_provider_init::check(config).map_err(|e| e.error)?;
+        let p = policy_input(budget)?;
+        let init_lock = file(&root, "task-provider-init.lock", 0, None)?;
+        let lease = io::try_exclusive(&root, name("task-provider-init.lock"), init_lock.id())?;
+        let (_, _, n3) = base(&root)?;
+        let marker_present = existing(&root, MARKER)?;
+        let namespace_present = existing(&n3, NAMESPACE)?;
+        if marker_present || namespace_present {
+            let s = load(config, None)?.ok_or_else(|| corrupt("partial staging anchors"))?;
+            if s.policy != p {
+                return Err(corrupt("staging policy cannot be replaced"));
+            }
+            let nodes = s.nodes()?;
+            let staging_lease =
+                io::try_exclusive(&nodes.namespace, name(LOCK), required(s.binding.lock)?)?;
+            ledger::load(&s, &nodes, false)?;
+            staging_lease.check()?;
+            lease.check()?;
+            return Ok(status(&s.binding, false));
+        }
+        let binding = capture(&root, &managed, &p)?;
+        let pending = Marker {
+            schema_version: 1,
+            phase: "pending".into(),
+            binding,
+        };
+        let bytes = seal(&pending);
+        if bytes.len() as u64 > SMALL {
+            return Err(TaskError::invalid("initialization binding too large"));
+        }
+        mutated = true;
+        let retained = io::create_file(&root, name(MARKER), SMALL)?;
+        io::write_new(&retained, &bytes)?;
+        io::sync_file(&retained)?;
+        io::sync_directory(&root)?;
+        if cutpoint == "init_pending_durable" {
+            return Err(persistence("test interruption at init_pending_durable"));
+        }
+        let ns = io::create_directory(&n3, name(NAMESPACE))?;
+        io::sync_directory(&n3)?;
+        let uploads = io::create_directory(&ns, name("uploads"))?;
+        io::sync_directory(&ns)?;
+        let lockfile = io::create_file(&ns, name(LOCK), 0)?;
+        io::sync_file(&lockfile)?;
+        io::sync_directory(&ns)?;
+        let policyfile = io::create_file(&ns, name(POLICY), SMALL)?;
+        io::write_new(&policyfile, &seal(&p))?;
+        io::sync_file(&policyfile)?;
+        io::sync_directory(&ns)?;
+        let mut complete = pending;
+        complete.phase = "complete".into();
+        complete.binding.namespace = Some(ns.id());
+        complete.binding.uploads = Some(uploads.id());
+        complete.binding.lock = Some(lockfile.id());
+        complete.binding.policy = Some(policyfile.id());
+        let initial = Ledger {
+            schema_version: 1,
+            binding: complete.binding.clone(),
+            generation: 0,
+            predecessor: None,
+            transition: Transition {
+                kind: "initial".into(),
+                id: None,
+                before: None,
+                after: None,
+                at: 0,
+            },
+            records: vec![],
+        };
+        let lf = io::create_file(&ns, name(LEDGER), LEDGER_LIMIT)?;
+        io::write_new(&lf, &seal(&initial))?;
+        io::sync_file(&lf)?;
+        io::sync_directory(&uploads)?;
+        io::sync_directory(&ns)?;
+        let tmp = io::create_file(&ns, name(TEMP), SMALL)?;
+        io::write_new(&tmp, &seal(&complete))?;
+        io::sync_file(&tmp)?;
+        io::publish(tmp, &root, name(MARKER), Some(&retained))?;
+        io::sync_directory(&ns)?;
+        io::sync_directory(&root)?;
+        lease.check()?;
+        if cutpoint == "init_complete_durable" {
+            return Err(persistence("test interruption at init_complete_durable"));
+        }
+        Ok(status(&complete.binding, true))
+    })();
+    result.map_err(|error| InitFailure {
+        error,
+        phase: if mutated {
+            "staging-initialize"
+        } else {
+            "preflight"
+        },
+        mutation_may_have_applied: mutated,
+    })
+}

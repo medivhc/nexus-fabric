@@ -1,0 +1,1006 @@
+{
+  "schema_version": 1,
+  "scope": "Only paths actually printed by original Oct17-19 machine records; directory presence is not a complete leaf-file inventory. No original 1317-path SHA-map identity claim.",
+  "sources": [
+    {
+      "sha256": "25e79c073abd0ac903880beeb67d381759dea7000df8d7daf39acee3171075a2"
+    },
+    {
+      "sha256": "0291f282bf1685c7cb2621b75ecd62e48d70ca181dedb2e2f8e813e2e9d89276"
+    }
+  ],
+  "original_counts": {
+    "unique_printed_paths": 83,
+    "changed_code_test_fixture_paths": 56,
+    "changed_doc_knowledge_paths": 15,
+    "missing_code_test_fixture_paths": 0,
+    "missing_doc_knowledge_paths": 9,
+    "physically_missing_doc_knowledge_files": 6,
+    "baseline_unchanged_doc_content_gaps": 3
+  },
+  "paths": [
+    {
+      "path": ".agents/knowledge/entries/2026-10-05-worktree-hooks-and-test-binaries.md",
+      "category": "formal-doc-or-knowledge",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "db5d44965a3e3f346943e92bc0fa65eb016246ef4d7dd71da3c7b83f66798d64",
+      "historical_printed_sha256": [
+        "db5d44965a3e3f346943e92bc0fa65eb016246ef4d7dd71da3c7b83f66798d64"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "historically-modified-content-still-at-37e0cff-baseline"
+    },
+    {
+      "path": ".agents/knowledge/entries/2026-10-16-n3-negative-controls.md",
+      "category": "formal-doc-or-knowledge",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "606ab3610fb2c8a23267e91e1625b7b6551a88de4002fa8ad8b5a2456c4383c8",
+      "historical_printed_sha256": [],
+      "matches_some_printed_sha": false,
+      "original_audit_state": "missing-historically-changed-path"
+    },
+    {
+      "path": ".agents/knowledge/entries/2026-10-17-n3-upload-terminal-integrity.md",
+      "category": "formal-doc-or-knowledge",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "04db673fda286fcfdf272f56e6603b9acf18cb56676ea86def6e1beb738e913a",
+      "historical_printed_sha256": [],
+      "matches_some_printed_sha": false,
+      "original_audit_state": "missing-historically-changed-path"
+    },
+    {
+      "path": ".agents/knowledge/entries/2026-10-19-expiry-error-classification.md",
+      "category": "formal-doc-or-knowledge",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "ae9dbb351830bfec33d076ce0f84d81ad8658ed89be88c0332e5300093d00182",
+      "historical_printed_sha256": [],
+      "matches_some_printed_sha": false,
+      "original_audit_state": "missing-historically-changed-path"
+    },
+    {
+      "path": ".agents/knowledge/entries/2026-10-19-scoped-lease-inherited-fd.md",
+      "category": "formal-doc-or-knowledge",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "bb7b667ded28c6d51997199f8208132f39a8a77240d8ecb461fe2375da83542f",
+      "historical_printed_sha256": [],
+      "matches_some_printed_sha": false,
+      "original_audit_state": "missing-historically-changed-path"
+    },
+    {
+      "path": ".agents/knowledge/index.json",
+      "category": "formal-doc-or-knowledge",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "ffec88df99aded421bb3cbb97823340a3e3701773e1f4913533efffa4c2ea661",
+      "historical_printed_sha256": [],
+      "matches_some_printed_sha": false,
+      "original_audit_state": "historically-modified-content-still-at-37e0cff-baseline"
+    },
+    {
+      "path": ".agents/skills/nexus-review/SKILL.md",
+      "category": "formal-doc-or-knowledge",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "435168689a5ad89f5ce88eca5f9ceba62ccc835fcad4f650790ee5b5bf31fa71",
+      "historical_printed_sha256": [
+        "435168689a5ad89f5ce88eca5f9ceba62ccc835fcad4f650790ee5b5bf31fa71"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "present-with-direct-historical-printed-sha-match"
+    },
+    {
+      "path": ".agents/skills/nexus-test-review/SKILL.md",
+      "category": "formal-doc-or-knowledge",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "f3c699c1be0e078f2e9f981e030925fed779f9fec91d00e33ee8e600364487c4",
+      "historical_printed_sha256": [
+        "f3c699c1be0e078f2e9f981e030925fed779f9fec91d00e33ee8e600364487c4"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "present-with-direct-historical-printed-sha-match"
+    },
+    {
+      "path": "ARCHITECTURE.md",
+      "category": "formal-doc-or-knowledge",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "2da69e6edecc74167289652f4769aba4b46c78989c1d7c313e5b411dc705976a",
+      "historical_printed_sha256": [
+        "2da69e6edecc74167289652f4769aba4b46c78989c1d7c313e5b411dc705976a"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "present-with-direct-historical-printed-sha-match"
+    },
+    {
+      "path": "PRODUCT.md",
+      "category": "formal-doc-or-knowledge",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "4972265b62b4fd64f3ac526324ec7b73828761b640be13c62315e3304941e250",
+      "historical_printed_sha256": [
+        "4972265b62b4fd64f3ac526324ec7b73828761b640be13c62315e3304941e250"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexus/MODULE.md",
+      "category": "formal-doc-or-knowledge",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "c214e2aa93264e1e1b66ff4ae96629b2cd4a2cefb12d8933eab8f1934e145bd9",
+      "historical_printed_sha256": [
+        "c214e2aa93264e1e1b66ff4ae96629b2cd4a2cefb12d8933eab8f1934e145bd9"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexus/src/lib.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "7edbfde8e9d9adde4666491fa74c63597b785fc67352ac81b4bfbccd1ae318c7",
+      "historical_printed_sha256": [
+        "d8511b528fb7d4ddd396773f63408619765c09ddcebd581f01244101124f76d8"
+      ],
+      "matches_some_printed_sha": false,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexus/src/main.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "cf49165cbff821f6b526a11cc8e4e96c9a99785c5aaec42cd17d87177487935c",
+      "historical_printed_sha256": [
+        "cf49165cbff821f6b526a11cc8e4e96c9a99785c5aaec42cd17d87177487935c"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexus/src/n2_identity.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "317db09a60f3b01de56a1772861748c5103631283fa41da359d1521064817738",
+      "historical_printed_sha256": [
+        "317db09a60f3b01de56a1772861748c5103631283fa41da359d1521064817738"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "present-with-direct-historical-printed-sha-match"
+    },
+    {
+      "path": "apps/nexus/src/n3_acceptance.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "b05cc677b165defccfc397583c954d3de255b7518f1a638b9a634f1ebbfdfb8b",
+      "historical_printed_sha256": [
+        "b05cc677b165defccfc397583c954d3de255b7518f1a638b9a634f1ebbfdfb8b",
+        "e013aaff5c02baa950689f14ce671d58d9dbff43c97d9db02aa7f1f65f5e4550"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexus/src/snapshot_cli.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "051b94d8db50cdce28b5f10a32553c0075a86d1ee6f2a416ead609afb17c6f29",
+      "historical_printed_sha256": [
+        "051b94d8db50cdce28b5f10a32553c0075a86d1ee6f2a416ead609afb17c6f29"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexus/src/snapshot_cli/",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "directory",
+      "current_sha256": null,
+      "historical_printed_sha256": [],
+      "matches_some_printed_sha": null,
+      "original_audit_state": "present-directory-only-no-complete-leaf-list"
+    },
+    {
+      "path": "apps/nexus/src/snapshot_cli/linux.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "7ac02a7464b8a010f7d74711ce32871aa8f202246b36fb2e22c6b526fe2fb417",
+      "historical_printed_sha256": [
+        "7ac02a7464b8a010f7d74711ce32871aa8f202246b36fb2e22c6b526fe2fb417"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexus/src/task_authorization.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "2ed97873232af79801500723d0a815c3537d85507cc384ff2a8738d0f7f44c76",
+      "historical_printed_sha256": [
+        "2ed97873232af79801500723d0a815c3537d85507cc384ff2a8738d0f7f44c76"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "present-with-direct-historical-printed-sha-match"
+    },
+    {
+      "path": "apps/nexus/src/task_localapi.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "99fa54d38571f1eeb49b9613c163c34ed1f2be6e336abb0fde098044d8b77b55",
+      "historical_printed_sha256": [
+        "99fa54d38571f1eeb49b9613c163c34ed1f2be6e336abb0fde098044d8b77b55"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexusd/Cargo.toml",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "a2e7b913bb509ab4507d087a2bfb1bbc91dad4fccedd5df14a935c09ff5f9f63",
+      "historical_printed_sha256": [
+        "731eeb8a89cccdd0e185e9b6d1b08aea2409a38b9f5fbc2174f2fc5db418bdd2"
+      ],
+      "matches_some_printed_sha": false,
+      "original_audit_state": "unchanged-baseline-context-not-a-recovery-gap"
+    },
+    {
+      "path": "apps/nexusd/MODULE.md",
+      "category": "formal-doc-or-knowledge",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "421e921b7ef60261318e411de3438f8ca30677104e9562690a42b67cb5239ebc",
+      "historical_printed_sha256": [
+        "421e921b7ef60261318e411de3438f8ca30677104e9562690a42b67cb5239ebc"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexusd/src/lib.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "8cb485b09d5cc33dbb3059049b0008491aaca4cb94dcfd02ec55531c76f47963",
+      "historical_printed_sha256": [
+        "52cb6662a847b98e98e1aaf15bda8572f6279afe3998b5a8a1a35c5fe8d6fff9"
+      ],
+      "matches_some_printed_sha": false,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexusd/src/main.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "3004fcb6a679c4f0bcd5213a1dd10f75aa996368697c862306230d8a6f7d04f7",
+      "historical_printed_sha256": [],
+      "matches_some_printed_sha": false,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexusd/src/snapshot_service.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "df800ed8633479422ff4c60c648246fb2c39e69406430e8e298fed0c1c3fee12",
+      "historical_printed_sha256": [],
+      "matches_some_printed_sha": false,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexusd/src/snapshot_staging.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "510aa44eb867787980933bf37d5b43b65480350cf483874459984eb1d7740ede",
+      "historical_printed_sha256": [
+        "7984da06f238a4fb546d16bdac9f5bd44d22cb01c4a750a50a18bcfba3bb0648",
+        "7c303518ab7c52894421bd9e0f05400a3be0b9f4b8f2bca68f8ee68ffd9d1eec",
+        "e07949bfbe06340af44d7d34440d2fa9eb487d955beea244f0e72fb00ee043e4",
+        "e51f5ac1f2b42079843139fed89144bae6d9b9915955378841eb1a54e48ca4f1"
+      ],
+      "matches_some_printed_sha": false,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexusd/src/snapshot_staging/",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "directory",
+      "current_sha256": null,
+      "historical_printed_sha256": [],
+      "matches_some_printed_sha": null,
+      "original_audit_state": "present-directory-only-no-complete-leaf-list"
+    },
+    {
+      "path": "apps/nexusd/src/snapshot_staging/backend.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "3c24aadfeb452a07d2894530b5ee55bf089405507646b99de6c72360a5673783",
+      "historical_printed_sha256": [
+        "7280c82c69f29ec1087230352400708e389132ae6e75d1dc2cacfbf0e890a4b7"
+      ],
+      "matches_some_printed_sha": false,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexusd/src/snapshot_staging/init.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "c86587b6e43c9be360d46b89c2a7106345976ec22e887d77692d717e82909320",
+      "historical_printed_sha256": [
+        "c86587b6e43c9be360d46b89c2a7106345976ec22e887d77692d717e82909320"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexusd/src/snapshot_staging/io.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "c46b32983547da6f4a031af6e474ffabf04caed3e14d4ed295c6c40012a076db",
+      "historical_printed_sha256": [
+        "c46b32983547da6f4a031af6e474ffabf04caed3e14d4ed295c6c40012a076db"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexusd/src/snapshot_staging/ledger.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "acfaa9a17902852dd02435e4b5fd492dc4ceb5d0fb1bfdfdfa5f2c953f4d55bb",
+      "historical_printed_sha256": [
+        "acfaa9a17902852dd02435e4b5fd492dc4ceb5d0fb1bfdfdfa5f2c953f4d55bb"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexusd/src/snapshot_staging/model.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "2c66149072d316a40f6bf9fdf649a4619101792c1085bfccb94dda9b0b9551db",
+      "historical_printed_sha256": [
+        "2c66149072d316a40f6bf9fdf649a4619101792c1085bfccb94dda9b0b9551db"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexusd/src/snapshot_staging/ops.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "8b3acc1ea94ef4bbd2d90fb753ab4a2f9f57ec20b505603bd1b83e07a20769cc",
+      "historical_printed_sha256": [
+        "e3676bf27b23ff4c8da7c704504d54965d33ae34cf470a8f5181e6a01cde52f5"
+      ],
+      "matches_some_printed_sha": false,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexusd/src/snapshot_staging/recovery.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "125abaa760ac0d1fb91225e902edd27d79a452869a1397c0daf8fd9b4be4f921",
+      "historical_printed_sha256": [
+        "125abaa760ac0d1fb91225e902edd27d79a452869a1397c0daf8fd9b4be4f921"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexusd/src/snapshot_staging_expiry_tests.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "08e4fc10838e49f0fd7d8ea4ca0a48a57314ec5539825110dfeae7425a804ab8",
+      "historical_printed_sha256": [
+        "08e4fc10838e49f0fd7d8ea4ca0a48a57314ec5539825110dfeae7425a804ab8",
+        "4c73f291007018682033e27cc69ad41ff458233455d5ff34ea08549320e2a324"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexusd/src/snapshot_staging_tests.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "d21979f97d985690f0750653921dcb7921e0b867ab2dce40d01c4e0b7741c801",
+      "historical_printed_sha256": [
+        "d21979f97d985690f0750653921dcb7921e0b867ab2dce40d01c4e0b7741c801"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexusd/src/snapshot_staging_tests/",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "directory",
+      "current_sha256": null,
+      "historical_printed_sha256": [],
+      "matches_some_printed_sha": null,
+      "original_audit_state": "present-directory-only-no-complete-leaf-list"
+    },
+    {
+      "path": "apps/nexusd/src/snapshot_staging_tests/authority.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "f89cb392a0779f99656d49848767cd89714447d5f0d5029c9902d16762021a84",
+      "historical_printed_sha256": [
+        "65593b7fc34962dcedd56924b1efc6638f8c1254b6323ad867f1cacbac700912",
+        "f89cb392a0779f99656d49848767cd89714447d5f0d5029c9902d16762021a84"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexusd/src/snapshot_staging_tests/core.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "9d0a539dcd4d8384aaf9ce7bd18e45479b8dab902d318b2881ed4664daa5b8ae",
+      "historical_printed_sha256": [
+        "9d0a539dcd4d8384aaf9ce7bd18e45479b8dab902d318b2881ed4664daa5b8ae",
+        "9feae69abcd512d44c8010f17fad618d95257cfad7e3481b6516994c2fb57b05"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexusd/src/snapshot_staging_tests/pressure.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "c63e1592003e23545c52a4c99ce9d45897b72ffe41de433da203d85a3333cedc",
+      "historical_printed_sha256": [
+        "aaf5301866b42026b82ddd2cfa7255a6e99a578ca1452b22149d6567d6e26897",
+        "c63e1592003e23545c52a4c99ce9d45897b72ffe41de433da203d85a3333cedc"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexusd/src/snapshot_staging_tests/recovery.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "a0e97e2e0138edee449754a6dcda20cf56c7b3a96111585ce9fa55b02654170e",
+      "historical_printed_sha256": [
+        "a0e97e2e0138edee449754a6dcda20cf56c7b3a96111585ce9fa55b02654170e",
+        "ec3342068965c50a9dd3c067ee7c9e7a628d990b6fbd6d012a5658b227257f6f"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexusd/src/task_capacity.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "91b56e71f5a2fff85433d156b40308c351ce30c6627e142d72ff59b3479e2058",
+      "historical_printed_sha256": [
+        "91b56e71f5a2fff85433d156b40308c351ce30c6627e142d72ff59b3479e2058"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "present-with-direct-historical-printed-sha-match"
+    },
+    {
+      "path": "apps/nexusd/src/task_http.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "f012ca9d6f0cd3bc7c75669458b04d486f672b13ed54f6bc1935f67fdb0665f7",
+      "historical_printed_sha256": [],
+      "matches_some_printed_sha": false,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexusd/src/task_provider_command.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "43fd511ec99c96b5739c4bdc10da280c8e52fb908f35c147bbd9ebcd3220ce0f",
+      "historical_printed_sha256": [],
+      "matches_some_printed_sha": false,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexusd/src/task_provider_init.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "8be7ed996220c8b6de1d1c0b4c6ecf21d0b0cb3bae4f270fb46a1be2e80961b7",
+      "historical_printed_sha256": [
+        "8be7ed996220c8b6de1d1c0b4c6ecf21d0b0cb3bae4f270fb46a1be2e80961b7"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "present-with-direct-historical-printed-sha-match"
+    },
+    {
+      "path": "apps/nexusd/src/task_provider_init_io.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "7d9e63b2c00f8ef65db1f3246bf48b29d8283248007c87bf4083f51e29cb348a",
+      "historical_printed_sha256": [
+        "07eb6b658b3c702f42897b460c8bea205ae1e3cbb32f33ddae53ea2a58c3520b",
+        "75b072e780b9b50934c0e89578a3cf5c0d58573ffb04e1bb22e4be5df4df4aa2",
+        "c78130a20b70248b88eac9e52404592f827aa93e5785b9653d992084a51a966d",
+        "f127e75756ad1dac5ee40bef38d83daaa985b619bd6a5f52b0d4b43ba46dae7e"
+      ],
+      "matches_some_printed_sha": false,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "apps/nexusd/src/task_store.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "025a5a97f5e033707331f5e8d63f7c6bd831588728e6e89056ed57e5db35d995",
+      "historical_printed_sha256": [
+        "025a5a97f5e033707331f5e8d63f7c6bd831588728e6e89056ed57e5db35d995"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "present-with-direct-historical-printed-sha-match"
+    },
+    {
+      "path": "apps/nexusd/tests/n3_snapshot_staging_binary.py",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "961a58c9610444ae8d53704ee35727eb61347c21e3c5cba4b7fc3f8ad48f46c7",
+      "historical_printed_sha256": [
+        "fc050ce05bec2dfb1dabecde4f24200ce97be7efed52cb3caf9c3ae972e17295"
+      ],
+      "matches_some_printed_sha": false,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "crates/nexus-control-api/src/lib.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "260ab0644511a73be30eb55cd2a8be709da1d8489fdb044619cd5f705d68864f",
+      "historical_printed_sha256": [
+        "260ab0644511a73be30eb55cd2a8be709da1d8489fdb044619cd5f705d68864f"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "crates/nexus-control-api/src/snapshot.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "4a188c517dea91ab308368a09d52c4ddf16deef44e34a7d9052185d10d0f62a2",
+      "historical_printed_sha256": [
+        "756597f4d9b4a087a0da01b1ee7b8f84ca91085fbcfadc02dd88cfe3c8c386fa"
+      ],
+      "matches_some_printed_sha": false,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "crates/nexus-control-api/tests/",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "directory",
+      "current_sha256": null,
+      "historical_printed_sha256": [],
+      "matches_some_printed_sha": null,
+      "original_audit_state": "present-directory-only-no-complete-leaf-list"
+    },
+    {
+      "path": "crates/nexus-platform-linux/MODULE.md",
+      "category": "formal-doc-or-knowledge",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "726879485dfc68a9160758e3f63e169d1d1fcd316d031e1ac34f8a549673e945",
+      "historical_printed_sha256": [
+        "c56b8f551a5ac53e4ffdcec069be49bdd0cc9be2842e80f4a948cf38259174af"
+      ],
+      "matches_some_printed_sha": false,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "crates/nexus-platform-linux/src/file_lease.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "255665927daa18abac679137a8ecca77ec0cc37b49c808a7313e23a83489c331",
+      "historical_printed_sha256": [
+        "ea20a6e314022e2d855df30ba72f9d3f7a93d6c5ed582579326e086b75db0f56"
+      ],
+      "matches_some_printed_sha": false,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "docs/N3-11-14-EXECUTION-PLAN.md",
+      "category": "formal-doc-or-knowledge",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "1ef7b3e62b307e42d5d3d11db454a7cff92d30dfdeb1543ba04908679eef6c93",
+      "historical_printed_sha256": [
+        "09aa6d6c387fad5225c59c6ee6f0c1a4dc4f658b6fd7a4d84109d5b20fcbcb09",
+        "1ef7b3e62b307e42d5d3d11db454a7cff92d30dfdeb1543ba04908679eef6c93"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "historically-modified-content-still-at-37e0cff-baseline"
+    },
+    {
+      "path": "docs/N3-11-PROVIDER-INIT-CONTRACT.md",
+      "category": "formal-doc-or-knowledge",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "a5924f6a7c3dd819d331b1a79ae95c84db09d75f4277583e827232dd131429e1",
+      "historical_printed_sha256": [
+        "a5924f6a7c3dd819d331b1a79ae95c84db09d75f4277583e827232dd131429e1"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "present-with-direct-historical-printed-sha-match"
+    },
+    {
+      "path": "docs/N3-12-SNAPSHOT-STAGING-CONTRACT.md",
+      "category": "formal-doc-or-knowledge",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "072d8d8832e2df1caef48eba1840582158b5cf263b4dd7d53b34b45f91fb8bf9",
+      "historical_printed_sha256": [
+        "072d8d8832e2df1caef48eba1840582158b5cf263b4dd7d53b34b45f91fb8bf9"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "present-with-direct-historical-printed-sha-match"
+    },
+    {
+      "path": "docs/N3-13-REMOTE-TASK-CONTRACT.md",
+      "category": "formal-doc-or-knowledge",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "b212369db70844268618304101a481af51be93831b03d8d7848f877d5650a37b",
+      "historical_printed_sha256": [
+        "b212369db70844268618304101a481af51be93831b03d8d7848f877d5650a37b",
+        "ff39d2e40ef4f8f3a05cc5169cd27eac3b97f8c3171ce7ebaecd909dce797a4a"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "missing-historically-changed-path"
+    },
+    {
+      "path": "docs/N3-13A-BOUNDED-MTLS-CONTRACT-DRAFT.md",
+      "category": "formal-doc-or-knowledge",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "b7478f759757a6ab20cfac61b6864f44a46eabc94c9e82c1c49531a86f291953",
+      "historical_printed_sha256": [],
+      "matches_some_printed_sha": false,
+      "original_audit_state": "missing-historically-changed-path"
+    },
+    {
+      "path": "engineering/nexus-harness/src/env.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "4031ef49f9aa3f2cb794f079380a7e2a8775547dc7cba6411dff5e8650ed5ee2",
+      "historical_printed_sha256": [
+        "4031ef49f9aa3f2cb794f079380a7e2a8775547dc7cba6411dff5e8650ed5ee2"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "present-with-direct-historical-printed-sha-match"
+    },
+    {
+      "path": "engineering/verifiers/n3_provider_init.py",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "2519fbaeb8a35191b4ed900ed8ad9c2b19ff3eef6dd8f7199ff8b389a00ada26",
+      "historical_printed_sha256": [
+        "2519fbaeb8a35191b4ed900ed8ad9c2b19ff3eef6dd8f7199ff8b389a00ada26"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "present-with-direct-historical-printed-sha-match"
+    },
+    {
+      "path": "engineering/verifiers/n3_snapshot_staging.py",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "2ff0b82c8705697c179d479ece5702b908ddd9378892bfc5be1d3de26e4a619d",
+      "historical_printed_sha256": [
+        "bf81032b78e8fc1e4113b52700fff18d19ca5ac9adb1b6b1c625f98788349c6d"
+      ],
+      "matches_some_printed_sha": false,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "scenarios/fixtures/n3-12-requester/README.md",
+      "category": "formal-doc-or-knowledge",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "e15ede4a2f4393354bfa0a43651706ed80f3157fd37a56b7ffae2fa57e9b9a55",
+      "historical_printed_sha256": [
+        "e15ede4a2f4393354bfa0a43651706ed80f3157fd37a56b7ffae2fa57e9b9a55"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "scenarios/fixtures/n3-12-requester/config/data/cas/107d6a15dd6dd9c5",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "e709d67eb71886c17d5fb89d737405c65187a4dfd88f11bf4f5bc5f2839ea9a7",
+      "historical_printed_sha256": [
+        "e709d67eb71886c17d5fb89d737405c65187a4dfd88f11bf4f5bc5f2839ea9a7"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "scenarios/fixtures/n3-12-requester/config/data/cas/143768107773e65c",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "87b766d9ed6ec17b1aae1c643cb22f0e65ff4147ea6fcf86678adf80a825aa4a",
+      "historical_printed_sha256": [
+        "87b766d9ed6ec17b1aae1c643cb22f0e65ff4147ea6fcf86678adf80a825aa4a"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "scenarios/fixtures/n3-12-requester/config/data/cas/365cd47d660ad54e",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "ee5ab33a5dfa7f87486aeba59b80c668b268ba47062c0874bd3ed9cc4a3e059e",
+      "historical_printed_sha256": [
+        "ee5ab33a5dfa7f87486aeba59b80c668b268ba47062c0874bd3ed9cc4a3e059e"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "scenarios/fixtures/n3-12-requester/config/data/cas/59b545e938ad7f6b",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "5a32fc00d330fc8c244fd9da8a84222d30349df4fdc852461391e1d43476e89c",
+      "historical_printed_sha256": [
+        "5a32fc00d330fc8c244fd9da8a84222d30349df4fdc852461391e1d43476e89c"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "scenarios/fixtures/n3-12-requester/config/data/cas/64f417ebbba5d00d",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "46559f8330390eaeb70aa3227d1b99bd53b6f3d76ec201bd72852adf71a85486",
+      "historical_printed_sha256": [
+        "46559f8330390eaeb70aa3227d1b99bd53b6f3d76ec201bd72852adf71a85486"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "scenarios/fixtures/n3-12-requester/config/data/cas/6a9e12a170547cc6",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "f7bf3114e993169fd1120de7069a14afaa3d3bad20af18f2b7abc671f0bc5db3",
+      "historical_printed_sha256": [
+        "f7bf3114e993169fd1120de7069a14afaa3d3bad20af18f2b7abc671f0bc5db3"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "scenarios/fixtures/n3-12-requester/config/data/cas/82f3c98ae62811aa",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "53ced8f837851f68bbb78fbc214f03992c7ba6403704844396279738034b70a5",
+      "historical_printed_sha256": [
+        "53ced8f837851f68bbb78fbc214f03992c7ba6403704844396279738034b70a5"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "scenarios/fixtures/n3-12-requester/config/data/cas/8a317d032f737d49",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "18093d2d9a4be37078cb8e3d9c9a2e50662fb9cd4f3df7e5498e273849914dfd",
+      "historical_printed_sha256": [
+        "18093d2d9a4be37078cb8e3d9c9a2e50662fb9cd4f3df7e5498e273849914dfd"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "scenarios/fixtures/n3-12-requester/config/data/cas/97ea2576dd8d16e3",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "2b5b9a3a100422068006a3c6b83a5849c03a7a5e832b77ed5c5a5123274869b5",
+      "historical_printed_sha256": [
+        "2b5b9a3a100422068006a3c6b83a5849c03a7a5e832b77ed5c5a5123274869b5"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "scenarios/fixtures/n3-12-requester/config/data/cas/a5a0be02d8050458",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "ce1796015cdd83a71ca782b083219ddac15dbe2470ee89ed0409a7aa2f2c3501",
+      "historical_printed_sha256": [
+        "ce1796015cdd83a71ca782b083219ddac15dbe2470ee89ed0409a7aa2f2c3501"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "scenarios/fixtures/n3-12-requester/config/data/cas/cbf29ce484222325",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "historical_printed_sha256": [
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "scenarios/fixtures/n3-12-requester/config/data/cas/e84b6705e76222a3",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "6271227e08ae5ae128e4e834ae48e17cc77093cdf665833b7e9a6cde2afb099d",
+      "historical_printed_sha256": [
+        "6271227e08ae5ae128e4e834ae48e17cc77093cdf665833b7e9a6cde2afb099d"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "scenarios/fixtures/n3-12-requester/config/data/cas/fede85f6fd8ed662",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "ed54e010d993410f18e8f4e1bab9ba0aec2ab838ee0a1f779d0f6393826f5da3",
+      "historical_printed_sha256": [
+        "ed54e010d993410f18e8f4e1bab9ba0aec2ab838ee0a1f779d0f6393826f5da3"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "scenarios/fixtures/n3-12-requester/config/data/mounts/n312-source/inputs/data.bin",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "606b3696bb66402784b5fb83754136ac1a088605ae31bc70e946b8fdb273091c",
+      "historical_printed_sha256": [
+        "606b3696bb66402784b5fb83754136ac1a088605ae31bc70e946b8fdb273091c"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "scenarios/fixtures/n3-12-requester/config/data/workspaces/n312-source/state_root",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "8cca7f9b6d10a3b6ea2a40b34939d78a7a3f245c6d2784f76f3be309d974511d",
+      "historical_printed_sha256": [
+        "8cca7f9b6d10a3b6ea2a40b34939d78a7a3f245c6d2784f76f3be309d974511d"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "scenarios/fixtures/n3-12-requester/config/workspace.toml",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "ba5112b7ba6bb5538c082c6dcf8efa1ea16600ec7823f9a2824d398d68946915",
+      "historical_printed_sha256": [
+        "ba5112b7ba6bb5538c082c6dcf8efa1ea16600ec7823f9a2824d398d68946915"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "scenarios/fixtures/n3-12-requester/facts.txt",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "34ec788b7a73306ced32308378310ad196c45581b3142829728d10480a451576",
+      "historical_printed_sha256": [
+        "34ec788b7a73306ced32308378310ad196c45581b3142829728d10480a451576"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "scenarios/fixtures/n3-12-requester/generate.rs",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "dea2bafdcc2d8513af044f75f528c5693feb4b31b153d9e2bef6c9837bba7615",
+      "historical_printed_sha256": [
+        "dea2bafdcc2d8513af044f75f528c5693feb4b31b153d9e2bef6c9837bba7615"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "scenarios/fixtures/n3-12-requester/metadata.json",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "f4358a8eae80c0cf563eb83500c5a5c4838c61115b5093bf980c6c143c2e0c2c",
+      "historical_printed_sha256": [
+        "f4358a8eae80c0cf563eb83500c5a5c4838c61115b5093bf980c6c143c2e0c2c"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "scenarios/fixtures/n3-12-requester/verify_export.py",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "468c434e0959d9e697a339d74c13146c57fa486a174588f591e4124d86b546ba",
+      "historical_printed_sha256": [
+        "468c434e0959d9e697a339d74c13146c57fa486a174588f591e4124d86b546ba"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "covered-integration-manifest-current-sha-match"
+    },
+    {
+      "path": "scenarios/product/n3-12-snapshot-staging.toml",
+      "category": "code-test-fixture",
+      "exists": true,
+      "kind": "file",
+      "current_sha256": "2492703f1d35f01fab9ac701409e0468b65389407014164469d246560447967a",
+      "historical_printed_sha256": [
+        "2492703f1d35f01fab9ac701409e0468b65389407014164469d246560447967a"
+      ],
+      "matches_some_printed_sha": true,
+      "original_audit_state": "present-with-direct-historical-printed-sha-match"
+    }
+  ],
+  "current_physically_missing_paths": []
+}

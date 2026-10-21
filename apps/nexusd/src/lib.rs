@@ -38,6 +38,8 @@ pub mod task_artifacts;
 #[cfg(target_os = "linux")]
 pub mod task_requester_store;
 
+/// Separately provisioned snapshot staging; independent of the Task wire.
+pub mod snapshot_service;
 /// Bounded versioned LocalAPI protocol.
 pub mod task_http;
 /// Optional N3 local provider application service.
@@ -50,3 +52,11 @@ pub mod task_capacity;
 mod task_capacity_recovery;
 #[cfg(target_os = "linux")]
 mod task_sessions;
+
+/// Local operator initialization; no Task protocol operation invokes it.
+#[cfg(target_os = "linux")]
+pub mod task_provider_init;
+
+/// N3-12 Linux snapshot staging adapter.
+#[cfg(target_os = "linux")]
+pub mod snapshot_staging;

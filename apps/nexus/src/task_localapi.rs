@@ -38,6 +38,47 @@ pub(crate) fn execute(
 ) -> Result<TaskEnvelope, TaskError> {
     request.validate()?;
     let bytes = request.to_value().canonical_bytes();
+    let (status, body) = exchange(target, "/localapi/v1/task", &bytes)?;
+    decode_task(status, &body, request)
+}
+
+/// The snapshot protocol shares only bounded transport and credentials with
+/// Task. Its DTO, correlation and operation semantics remain separate.
+#[cfg(target_os = "linux")]
+pub(crate) fn execute_snapshot(
+    target: &LocalApiTarget,
+    request: &nexus_control_api::snapshot::SnapshotRequest,
+) -> Result<nexus_control_api::snapshot::SnapshotEnvelope, TaskError> {
+    use nexus_control_api::snapshot::SnapshotEnvelope;
+    request.validate()?;
+    let (status, body) = exchange(
+        target,
+        "/localapi/v1/snapshot",
+        &request.to_value().canonical_bytes(),
+    )?;
+    let envelope: SnapshotEnvelope = crate::n3_acceptance::decode_dto(&body).map_err(bad)?;
+    envelope.validate_for(request).map_err(bad)?;
+    if let SnapshotEnvelope::Upload(view) = &envelope {
+        view.snapshot
+            .verify_digest(crate::n3_acceptance::sha256)
+            .map_err(bad)?;
+    }
+    if status != 200 {
+        let expected = status_error(status);
+        if !matches!(&envelope, SnapshotEnvelope::Error { error, .. }
+            if error.code == expected && !error.retryable)
+        {
+            return Err(bad("HTTP status and snapshot envelope disagree"));
+        }
+    }
+    Ok(envelope)
+}
+
+fn exchange(
+    target: &LocalApiTarget,
+    route: &str,
+    bytes: &[u8],
+) -> Result<(u16, Vec<u8>), TaskError> {
     if bytes.len() > REQUEST_LIMIT {
         return Err(capacity("LocalAPI request exceeds 1 MiB"));
     }
@@ -69,7 +110,7 @@ pub(crate) fn execute(
             )
             .map_err(unavailable)?;
             let token = bearer_token()?;
-            execute_over(&mut stream, &bytes, request, &token, deadline)
+            exchange_over(&mut stream, bytes, route, &token, deadline)
         }
         #[cfg(unix)]
         LocalApiTarget::Socket(path) => {
@@ -86,7 +127,7 @@ pub(crate) fn execute(
             let descriptor: std::os::fd::OwnedFd = socket.into();
             let mut stream = std::os::unix::net::UnixStream::from(descriptor);
             let token = bearer_token()?;
-            execute_over(&mut stream, &bytes, request, &token, deadline)
+            exchange_over(&mut stream, bytes, route, &token, deadline)
         }
         #[cfg(not(unix))]
         LocalApiTarget::Socket(_) => Err(TaskError::new(
@@ -170,6 +211,7 @@ fn read_some(
         }
     }
 }
+#[cfg(test)]
 fn execute_over(
     stream: &mut dyn TaskStreamIo,
     bytes: &[u8],
@@ -177,8 +219,18 @@ fn execute_over(
     token: &str,
     deadline: Instant,
 ) -> Result<TaskEnvelope, TaskError> {
+    let (status, body) = exchange_over(stream, bytes, "/localapi/v1/task", token, deadline)?;
+    decode_task(status, &body, request)
+}
+fn exchange_over(
+    stream: &mut dyn TaskStreamIo,
+    bytes: &[u8],
+    route: &str,
+    token: &str,
+    deadline: Instant,
+) -> Result<(u16, Vec<u8>), TaskError> {
     let header = format!(
-        "POST /localapi/v1/task HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nAccept: application/json\r\n\r\n",
+        "POST {route} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nAccept: application/json\r\n\r\n",
         bytes.len()
     );
     let data = [header.as_bytes(), bytes].concat();
@@ -218,7 +270,10 @@ fn execute_over(
     if read_some(stream, &mut byte, deadline)? != 0 {
         return Err(bad("trailing bytes / pipelined response"));
     }
-    let envelope: TaskEnvelope = crate::n3_acceptance::decode_dto(&body).map_err(bad)?;
+    Ok((status, body))
+}
+fn decode_task(status: u16, body: &[u8], request: &TaskRequest) -> Result<TaskEnvelope, TaskError> {
+    let envelope: TaskEnvelope = crate::n3_acceptance::decode_dto(body).map_err(bad)?;
     validate_status(status, &envelope)?;
     validate_correlated_response(request, &envelope)?;
     Ok(envelope)
@@ -303,14 +358,17 @@ fn validate_status(status: u16, envelope: &TaskEnvelope) -> Result<(), TaskError
     if status == 200 {
         return Ok(());
     }
-    let expected = match status {
-        401 => TaskErrorCode::AuthDenied,
-        413 => TaskErrorCode::CapacityUnavailable,
-        _ => TaskErrorCode::InvalidRequest,
-    };
+    let expected = status_error(status);
     match envelope {
         TaskEnvelope::Error { error, .. } if error.code == expected && !error.retryable => Ok(()),
         _ => Err(bad("HTTP status and business envelope disagree")),
+    }
+}
+fn status_error(status: u16) -> TaskErrorCode {
+    match status {
+        401 => TaskErrorCode::AuthDenied,
+        413 => TaskErrorCode::CapacityUnavailable,
+        _ => TaskErrorCode::InvalidRequest,
     }
 }
 fn validate_correlated_response(

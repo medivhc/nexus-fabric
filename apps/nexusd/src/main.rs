@@ -243,6 +243,7 @@ fn tun_enabled() -> bool {
 
 mod nat_stun;
 mod nat_turn;
+mod task_provider_command;
 mod watcher;
 
 use std::process::ExitCode;
@@ -263,9 +264,59 @@ use nexus_network::n1::{N1PeerId, config::N1Config};
 use nexusd::assembly;
 use nexusd::config::{self, ConfigDir, LoadedConfig, TurnSection};
 
+/// Verify managed bindings before any startup operation can create durable state.
+fn validate_task_provider_startup(config_root: &std::path::Path) -> Result<bool, ExitCode> {
+    #[cfg(target_os = "linux")]
+    {
+        nexusd::task_provider_init::validate_managed_root(config_root).map_err(|error| {
+            eprintln!(
+                "{}",
+                json!({"schema_version":1, "verdict":"FAIL", "error":{
+                    "code":error.code.as_str(), "reason":error.reason, "retryable":error.retryable
+                }, "phase":"managed-provider-preflight", "mutation_may_have_applied":false})
+            );
+            ExitCode::from(1)
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = config_root;
+        Ok(false)
+    }
+}
+
+/// Recovery must finish before identity, Task recovery, token or socket writes.
+fn open_snapshot_service(
+    config_root: &std::path::Path,
+) -> Result<nexusd::snapshot_service::LocalSnapshotService, ExitCode> {
+    nexusd::snapshot_service::LocalSnapshotService::open(config_root).map_err(|error| {
+        eprintln!(
+            "{}",
+            json!({"schema_version":1, "verdict":"FAIL", "error":{
+                "code":error.code.as_str(), "reason":error.reason, "retryable":error.retryable
+            }, "phase":"snapshot-staging-recovery"})
+        );
+        ExitCode::from(1)
+    })
+}
+
+fn validate_token_authority(authority: &nexusd::task_http::TokenAuthority) -> Result<(), ExitCode> {
+    if authority.valid() {
+        return Ok(());
+    }
+    eprintln!(
+        "{}",
+        json!({"schema_version":1, "verdict":"FAIL", "error":{
+            "code":"AUTH_DENIED", "reason":"LocalAPI token authority is invalid", "retryable":false
+        }, "phase":"localapi-token-authority"})
+    );
+    Err(ExitCode::from(1))
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("task-provider") => task_provider_command::run(&args[1..]),
         // 新入口：nexusd <config-folder>
         Some(path) if !path.starts_with('-') && path != "serve" => {
             if args.len() != 1 {
@@ -622,7 +673,27 @@ fn stun_servers(
 /// 关闭顺序（§13.4/R4/D7）：SIGTERM/SIGINT → LocalAPI → Workspace unmount → Dataplane（1s 超时）
 /// → N1（5s 超时）→ TUN（随线程退出）→ exit 0。
 fn run_daemon(config_dir: &str) -> ExitCode {
-    let dir = match ConfigDir::new(std::path::Path::new(config_dir)) {
+    // Anchor relative daemon input once without resolving symlinks or removing
+    // parent components: managed preflight must retain its path safety checks.
+    let config_root = match std::path::absolute(config_dir) {
+        Ok(root) => root,
+        Err(error) => {
+            eprintln!(
+                "{}",
+                json!({"verdict":"FAIL", "error":{"code":"CONFIG", "message":error.to_string()}})
+            );
+            return ExitCode::from(1);
+        }
+    };
+    let managed_provider = match validate_task_provider_startup(&config_root) {
+        Ok(managed) => managed,
+        Err(exit) => return exit,
+    };
+    let snapshots = match open_snapshot_service(&config_root) {
+        Ok(snapshots) => snapshots,
+        Err(exit) => return exit,
+    };
+    let dir = match ConfigDir::new(&config_root) {
         Ok(d) => d,
         Err(e) => {
             eprintln!(
@@ -646,6 +717,19 @@ fn run_daemon(config_dir: &str) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let no_other_subsystem = loaded.proxy_yaml.is_none()
+        && loaded.network_toml.is_none()
+        && loaded.workspace_toml.is_none();
+    if managed_provider
+        && no_other_subsystem
+        && (!loaded.meta.contains_key(config::DAEMON_TOML) || loaded.daemon.tun.enabled)
+    {
+        eprintln!(
+            "{}",
+            json!({"verdict":"FAIL", "error":{"code":"CONFIG", "message":"N3-only startup requires explicit daemon.toml [tun] enabled=false"}})
+        );
+        return ExitCode::from(1);
+    }
     log_enabled_subsystems(&loaded);
 
     // F1：orphan FUSE 挂载收敛进 boot_reconcile 统一报告。挂载点在 reconcile
@@ -655,10 +739,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     #[cfg(target_os = "linux")]
     let orphan_mountpoints: Vec<std::path::PathBuf> = match loaded.workspace_toml.as_deref() {
         Some(text) => {
-            match nexusd::workspace::WorkspaceManager::resolve_mountpoints(
-                std::path::Path::new(config_dir),
-                text,
-            ) {
+            match nexusd::workspace::WorkspaceManager::resolve_mountpoints(&config_root, text) {
                 Ok(mps) => mps,
                 Err(e) => {
                     eprintln!(
@@ -699,11 +780,8 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     ensure_n2_session_manager(&dir.root);
     let n2_sweeper_handle = spawn_n2_session_sweeper(&shutdown);
 
-    // T3：缺 proxy.yaml 且缺 network.toml 且缺 workspace.toml → 拒绝启动（无意义）。
-    if loaded.proxy_yaml.is_none()
-        && loaded.network_toml.is_none()
-        && loaded.workspace_toml.is_none()
-    {
+    // T3: a validated managed provider is also an effective subsystem.
+    if no_other_subsystem && !managed_provider {
         eprintln!(
             "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"CONFIG\",\"message\":\"no subsystem configured: need proxy.yaml and/or network.toml and/or workspace.toml\"}}}}"
         );
@@ -781,7 +859,13 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     let localapi_handle = std::thread::Builder::new()
         .name("nexusd-localapi".to_string())
         .spawn(move || {
-            serve_localapi(&localapi_addr, ready_tx, api_shutdown, &task_config_root);
+            serve_localapi(
+                &localapi_addr,
+                ready_tx,
+                api_shutdown,
+                &task_config_root,
+                snapshots,
+            );
         })
         .expect("spawn localapi thread");
     // 等 LocalAPI 就绪（最多 5 秒）。
@@ -810,7 +894,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     // 挂载失败 → 拒绝启动（fail-fast，诚实）。
     #[cfg(target_os = "linux")]
     if let Some(text) = loaded.workspace_toml.as_deref() {
-        match nexusd::workspace::WorkspaceManager::start(std::path::Path::new(config_dir), text) {
+        match nexusd::workspace::WorkspaceManager::start(&config_root, text) {
             Ok(mgr) => {
                 if !mgr.fuse_available {
                     eprintln!("[nexusd] workspace subsystem disabled (no /dev/fuse)");
@@ -1063,7 +1147,11 @@ fn serve_localapi(
     ready_tx: std::sync::mpsc::Sender<String>,
     shutdown: Arc<AtomicBool>,
     config_root: &std::path::Path,
+    snapshots: nexusd::snapshot_service::LocalSnapshotService,
 ) {
+    if validate_task_provider_startup(config_root).is_err() {
+        return;
+    }
     let sessions = ensure_n2_session_manager(config_root);
     let tasks = nexusd::task_service::LocalTaskService::open_with_sessions(config_root, sessions);
     let addr: std::net::SocketAddr = match addr_raw.parse() {
@@ -1088,7 +1176,6 @@ fn serve_localapi(
         .local_addr()
         .map(|a| a.to_string())
         .unwrap_or_default();
-    let _ = ready_tx.send(actual);
     let token = match assembly::load_localapi_token(config_root) {
         Ok(t) => t,
         Err(e) => {
@@ -1100,6 +1187,10 @@ fn serve_localapi(
         &token,
         assembly::localapi_token_path(config_root),
     );
+    if validate_token_authority(&token_authority).is_err() {
+        return;
+    }
+    let _ = ready_tx.send(actual);
     loop {
         if shutdown.load(Ordering::Relaxed) {
             eprintln!("[nexusd] localapi: shutdown signal, exiting");
@@ -1113,6 +1204,7 @@ fn serve_localapi(
                     &token,
                     addr.ip().is_loopback(),
                     &tasks,
+                    &snapshots,
                     &token_authority,
                 ) {
                     eprintln!("[nexusd] localapi error: {e}");
@@ -1162,19 +1254,45 @@ fn serve_resource(args: &[String]) -> ExitCode {
     // P1-1：`serve` 形态也必须持有 daemon 内唯一的 N2 SessionManager，否则
     // `/localapi/v0/n2/session/*` 会报 N2_UNAVAILABLE（D1 只在 `run_daemon`
     // 路径装配）。token 与 N2 存储同源于 node_dir，这里沿用同一口径。
-    let config_root = task_config_root();
-    ensure_n2_session_manager(&config_root);
+    let config_root = match task_config_root() {
+        Ok(root) => root,
+        Err(exit) => return exit,
+    };
+    let managed = match validate_task_provider_startup(&config_root) {
+        Ok(managed) => managed,
+        Err(exit) => return exit,
+    };
+    let snapshots = match open_snapshot_service(&config_root) {
+        Ok(snapshots) => snapshots,
+        Err(exit) => return exit,
+    };
+    if managed {
+        let loaded = ConfigDir::new(&config_root).and_then(|dir| config::load(&dir));
+        match loaded {
+            Ok(loaded)
+                if loaded.meta.contains_key(config::DAEMON_TOML) && !loaded.daemon.tun.enabled => {}
+            _ => {
+                eprintln!(
+                    "{}",
+                    json!({"verdict":"FAIL", "error":{"code":"CONFIG", "message":"managed provider serve requires explicit daemon.toml [tun] enabled=false"}})
+                );
+                return ExitCode::from(1);
+            }
+        }
+    }
     match flags.get("--addr").and_then(|v| v.as_deref()) {
-        Some(raw) => serve_over_tcp(raw),
+        Some(raw) => serve_over_tcp(raw, &config_root, snapshots),
         None => match flags.get("--socket").and_then(|v| v.as_deref()) {
-            Some(path) => serve_over_socket(path),
+            Some(path) => serve_over_socket(path, &config_root, snapshots),
             // D8（N2 P0-1）：默认 unix socket（与 CLI `default_socket_path` 一致）。
             // P1-15：socket 路径必须来自 `$XDG_RUNTIME_DIR`（0700、per-user、
             // 不可预测）；未设置时**不**回落到可预测的 `/tmp` 路径，改用 TCP
             // loopback 并告警（bearer token 仍是唯一屏障）。
             #[cfg(unix)]
             None => match nexus::localapi_client::default_socket_path() {
-                Some(sock) => serve_over_socket(&sock.display().to_string()),
+                Some(sock) => {
+                    serve_over_socket(&sock.display().to_string(), &config_root, snapshots)
+                }
                 // P1-15：无安全的 socket 目录 → 回退 TCP loopback（而不是
                 // 落到世界可写、可被抢占的 temp socket）。
                 None => {
@@ -1182,11 +1300,15 @@ fn serve_resource(args: &[String]) -> ExitCode {
                         "[nexusd] WARN: no safe unix socket dir; falling back to TCP loopback {}",
                         nexus::localapi_client::DEFAULT_LOCALAPI_ADDR
                     );
-                    serve_over_tcp(nexus::localapi_client::DEFAULT_LOCALAPI_ADDR)
+                    serve_over_tcp(
+                        nexus::localapi_client::DEFAULT_LOCALAPI_ADDR,
+                        &config_root,
+                        snapshots,
+                    )
                 }
             },
             #[cfg(not(unix))]
-            None => serve_over_tcp("127.0.0.1:0"),
+            None => serve_over_tcp("127.0.0.1:0", &config_root, snapshots),
         },
     }
 }
@@ -1202,11 +1324,14 @@ fn localapi_bearer_token(config_root: &std::path::Path) -> Result<String, ExitCo
 }
 
 /// TCP loopback 监听 + 服务循环（既有行为）。
-fn serve_over_tcp(addr_raw: &str) -> ExitCode {
-    let config_root = task_config_root();
-    let sessions = ensure_n2_session_manager(&config_root);
-    let tasks = nexusd::task_service::LocalTaskService::open_with_sessions(&config_root, sessions);
-    let token = match localapi_bearer_token(&config_root) {
+fn serve_over_tcp(
+    addr_raw: &str,
+    config_root: &std::path::Path,
+    snapshots: nexusd::snapshot_service::LocalSnapshotService,
+) -> ExitCode {
+    let sessions = ensure_n2_session_manager(config_root);
+    let tasks = nexusd::task_service::LocalTaskService::open_with_sessions(config_root, sessions);
+    let token = match localapi_bearer_token(config_root) {
         Ok(t) => t,
         Err(code) => return code,
     };
@@ -1229,13 +1354,20 @@ fn serve_over_tcp(addr_raw: &str) -> ExitCode {
         }
     };
     let actual_addr = listener.local_addr().expect("local_addr");
+    let token_authority = nexusd::task_http::TokenAuthority::open_at(
+        &token,
+        assembly::localapi_token_path(config_root),
+    );
+    if let Err(exit) = validate_token_authority(&token_authority) {
+        return exit;
+    }
     println!(
         "{{\"verdict\":\"READY\",\"daemon\":{{\"entry\":\"nexusd\",\"command\":\"serve\",\"addr\":\"{actual_addr}\"}}}}"
     );
-    let token_authority = nexusd::task_http::TokenAuthority::open_at(
-        &token,
-        assembly::localapi_token_path(&config_root),
-    );
+    {
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+    }
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
@@ -1245,6 +1377,7 @@ fn serve_over_tcp(addr_raw: &str) -> ExitCode {
                     &token,
                     addr.ip().is_loopback(),
                     &tasks,
+                    &snapshots,
                     &token_authority,
                 ) {
                     eprintln!("serve connection error: {e}");
@@ -1260,21 +1393,31 @@ fn serve_over_tcp(addr_raw: &str) -> ExitCode {
 }
 
 #[cfg(unix)]
-fn serve_over_socket(path: &str) -> ExitCode {
+fn serve_over_socket(
+    path: &str,
+    config_root: &std::path::Path,
+    snapshots: nexusd::snapshot_service::LocalSnapshotService,
+) -> ExitCode {
     use std::os::unix::{fs::PermissionsExt, net::UnixListener};
-    let config_root = task_config_root();
-    let sessions = ensure_n2_session_manager(&config_root);
-    let tasks = nexusd::task_service::LocalTaskService::open_with_sessions(&config_root, sessions);
+    let sessions = ensure_n2_session_manager(config_root);
+    let tasks = nexusd::task_service::LocalTaskService::open_with_sessions(config_root, sessions);
     let private_parent = std::path::Path::new(path)
         .parent()
         .and_then(|p| std::fs::symlink_metadata(p).ok())
         .is_some_and(|m| {
             m.is_dir() && !m.file_type().is_symlink() && m.permissions().mode() & 0o077 == 0
         });
-    let token = match localapi_bearer_token(&config_root) {
+    let token = match localapi_bearer_token(config_root) {
         Ok(t) => t,
         Err(code) => return code,
     };
+    let token_authority = nexusd::task_http::TokenAuthority::open_at(
+        &token,
+        assembly::localapi_token_path(config_root),
+    );
+    if let Err(exit) = validate_token_authority(&token_authority) {
+        return exit;
+    }
     let _ = std::fs::remove_file(path);
     let listener = match UnixListener::bind(path) {
         Ok(l) => l,
@@ -1298,10 +1441,10 @@ fn serve_over_socket(path: &str) -> ExitCode {
     println!(
         "{{\"verdict\":\"READY\",\"daemon\":{{\"entry\":\"nexusd\",\"command\":\"serve\",\"socket\":\"{path}\"}}}}"
     );
-    let token_authority = nexusd::task_http::TokenAuthority::open_at(
-        &token,
-        assembly::localapi_token_path(&config_root),
-    );
+    {
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+    }
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
@@ -1311,6 +1454,7 @@ fn serve_over_socket(path: &str) -> ExitCode {
                     &token,
                     private_parent,
                     &tasks,
+                    &snapshots,
                     &token_authority,
                 ) {
                     eprintln!("serve connection error: {e}");
@@ -1335,18 +1479,30 @@ fn harden_socket_permissions(path: &str) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn serve_over_socket(path: &str) -> ExitCode {
+fn serve_over_socket(
+    path: &str,
+    config_root: &std::path::Path,
+    snapshots: nexusd::snapshot_service::LocalSnapshotService,
+) -> ExitCode {
     println!(
         "{{\"verdict\":\"FAIL\",\"error\":{{\"code\":\"UNSUPPORTED\",\"message\":\"named-pipe not implemented; use --addr\"}}}}"
     );
-    let _ = path;
+    let _ = (path, config_root, snapshots);
     ExitCode::SUCCESS
 }
 
 use nexusd::task_http::HttpIo as LocalIo;
 
-fn task_config_root() -> std::path::PathBuf {
-    nexus::node_cli::node_dir()
+fn task_config_root() -> Result<std::path::PathBuf, ExitCode> {
+    // Give N2, token setup and Task adapters one lexical startup root.
+    // Preflight still rejects managed symlinks and parent components.
+    std::path::absolute(nexus::node_cli::node_dir()).map_err(|error| {
+        eprintln!(
+            "{}",
+            json!({"verdict":"FAIL", "error":{"code":"CONFIG", "message":error.to_string()}})
+        );
+        ExitCode::from(1)
+    })
 }
 
 /// C1：`GET /localapi/v0/workspace/mounts` — 已挂载 workspace 状态快照。
@@ -1398,13 +1554,15 @@ fn handle_localapi_request(
     expected_token: &str,
     local_transport: bool,
     tasks: &nexusd::task_service::LocalTaskService,
+    snapshots: &nexusd::snapshot_service::LocalSnapshotService,
     token_authority: &nexusd::task_http::TokenAuthority,
 ) -> Result<(), String> {
-    let Some(head) = nexusd::task_http::dispatch(
+    let Some(head) = nexusd::task_http::dispatch_with_snapshots(
         stream,
         expected_token,
         local_transport,
         tasks,
+        snapshots,
         token_authority,
     )?
     else {

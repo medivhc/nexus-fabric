@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "code_revision": "dbb511a41023f207f7eada9bda5287286abd33ca",
+  "restored_original_documents": 9,
+  "records": [
+    {
+      "repo_path": ".agents/knowledge/entries/2026-10-16-n3-negative-controls.md",
+      "recovered_sha256": "606ab3610fb2c8a23267e91e1625b7b6551a88de4002fa8ad8b5a2456c4383c8",
+      "integrated_sha256": "606ab3610fb2c8a23267e91e1625b7b6551a88de4002fa8ad8b5a2456c4383c8",
+      "before_sha256": null,
+      "bytes": 2552,
+      "method": "exact-source-restore",
+      "source_status": "COMPLETE_LITERAL_DATA_CHAIN_NO_INDEPENDENT_FINAL_WHOLE_FILE_SHA",
+      "historical_whole_file_sha_verified": false
+    },
+    {
+      "repo_path": ".agents/knowledge/entries/2026-10-17-n3-upload-terminal-integrity.md",
+      "recovered_sha256": "04db673fda286fcfdf272f56e6603b9acf18cb56676ea86def6e1beb738e913a",
+      "integrated_sha256": "04db673fda286fcfdf272f56e6603b9acf18cb56676ea86def6e1beb738e913a",
+      "before_sha256": null,
+      "bytes": 1661,
+      "method": "exact-source-restore",
+      "source_status": "COMPLETE_LITERAL_DATA_CHAIN_NO_INDEPENDENT_FINAL_WHOLE_FILE_SHA",
+      "historical_whole_file_sha_verified": false
+    },
+    {
+      "repo_path": "docs/N3-13-REMOTE-TASK-CONTRACT.md",
+      "recovered_sha256": "b212369db70844268618304101a481af51be93831b03d8d7848f877d5650a37b",
+      "integrated_sha256": "b212369db70844268618304101a481af51be93831b03d8d7848f877d5650a37b",
+      "before_sha256": null,
+      "bytes": 43625,
+      "method": "exact-source-restore",
+      "source_status": "COMPLETE_HISTORICAL_WHOLE_FILE_SHA_MATCH",
+      "historical_whole_file_sha_verified": true
+    },
+    {
+      "repo_path": ".agents/knowledge/entries/2026-10-19-scoped-lease-inherited-fd.md",
+      "recovered_sha256": "bb7b667ded28c6d51997199f8208132f39a8a77240d8ecb461fe2375da83542f",
+      "integrated_sha256": "bb7b667ded28c6d51997199f8208132f39a8a77240d8ecb461fe2375da83542f",
+      "before_sha256": null,
+      "bytes": 2165,
+      "method": "exact-source-restore",
+      "source_status": "COMPLETE_LITERAL_DATA_CHAIN_NO_INDEPENDENT_FINAL_WHOLE_FILE_SHA",
+      "historical_whole_file_sha_verified": false
+    },
+    {
+      "repo_path": ".agents/knowledge/entries/2026-10-19-expiry-error-classification.md",
+      "recovered_sha256": "ae9dbb351830bfec33d076ce0f84d81ad8658ed89be88c0332e5300093d00182",
+      "integrated_sha256": "ae9dbb351830bfec33d076ce0f84d81ad8658ed89be88c0332e5300093d00182",
+      "before_sha256": null,
+      "bytes": 1581,
+      "method": "exact-source-restore",
+      "source_status": "COMPLETE_LITERAL_DATA_CHAIN_NO_INDEPENDENT_FINAL_WHOLE_FILE_SHA",
+      "historical_whole_file_sha_verified": false
+    },
+    {
+      "repo_path": "docs/N3-13A-BOUNDED-MTLS-CONTRACT-DRAFT.md",
+      "recovered_sha256": "b7478f759757a6ab20cfac61b6864f44a46eabc94c9e82c1c49531a86f291953",
+      "integrated_sha256": "b7478f759757a6ab20cfac61b6864f44a46eabc94c9e82c1c49531a86f291953",
+      "before_sha256": null,
+      "bytes": 50319,
+      "method": "exact-source-restore",
+      "source_status": "COMPLETE_HISTORICAL_WHOLE_FILE_SHA_MATCH",
+      "historical_whole_file_sha_verified": true
+    },
+    {
+      "repo_path": "docs/N3-11-14-EXECUTION-PLAN.md",
+      "recovered_sha256": "1ef7b3e62b307e42d5d3d11db454a7cff92d30dfdeb1543ba04908679eef6c93",
+      "integrated_sha256": "1ef7b3e62b307e42d5d3d11db454a7cff92d30dfdeb1543ba04908679eef6c93",
+      "before_sha256": "8e3f2754de7e7b3f5114e467397f6da9e943d8a101e2f8fd1bed233d69ed074a",
+      "bytes": 6216,
+      "method": "exact-source-restore",
+      "source_status": "COMPLETE_HISTORICAL_WHOLE_FILE_SHA_MATCH",
+      "historical_whole_file_sha_verified": true
+    },
+    {
+      "repo_path": ".agents/knowledge/entries/2026-10-05-worktree-hooks-and-test-binaries.md",
+      "recovered_sha256": "db5d44965a3e3f346943e92bc0fa65eb016246ef4d7dd71da3c7b83f66798d64",
+      "integrated_sha256": "db5d44965a3e3f346943e92bc0fa65eb016246ef4d7dd71da3c7b83f66798d64",
+      "before_sha256": "842e3342b2e0a9d1f9ad9306805f8e7a4bdfe13ed5775118cc3f30058fba9292",
+      "bytes": 4169,
+      "method": "exact-source-restore",
+      "source_status": "COMPLETE_HISTORICAL_WHOLE_FILE_SHA_MATCH",
+      "historical_whole_file_sha_verified": true
+    },
+    {
+      "repo_path": ".agents/knowledge/index.json",
+      "recovered_sha256": "13d21c2bd948be1b5a2d92ca61b6656d3d25a499d6920fd74a0e957491194e94",
+      "integrated_sha256": "ffec88df99aded421bb3cbb97823340a3e3701773e1f4913533efffa4c2ea661",
+      "before_sha256": "e2a5047bbccccdac84ebe998911565c29ae8ed5907d45caa71d39824587b1b86",
+      "bytes": 18516,
+      "method": "structured-merge-original-four-index-values-preserving-current-entries",
+      "source_status": "BASELINE_PLUS_FOUR_ORIGINAL_APPEND_VALUES_NO_INDEPENDENT_FINAL_INDEX_SHA",
+      "historical_whole_file_sha_verified": false,
+      "additional_current_review_entry": "n3-ledger-cost"
+    }
+  ],
+  "new_review_knowledge": {
+    "path": ".agents/knowledge/entries/2026-10-21-n3-staging-ledger-validation-cost.md",
+    "sha256": "ab3d2214883c2187693f769d2e21ee91eb98871a19931ac3585519e020c80ab1",
+    "source_review_id": "n312rec20r1a"
+  },
+  "remaining_document_text_gaps": [],
+  "original_full_1317_sha_map_recovered": false
+}

@@ -12,15 +12,30 @@ use std::{fs::File, io, os::unix::io::AsRawFd};
 /// This primitive does not validate paths, permissions, or file identity, and
 /// an advisory lease cannot prevent non-cooperating processes from writing.
 pub fn try_lock_exclusive(file: &File) -> io::Result<()> {
+    const LOCK_EX: std::ffi::c_int = 2;
+    const LOCK_NB: std::ffi::c_int = 4;
+    flock_operation(file, LOCK_EX | LOCK_NB)
+}
+
+/// Releases the advisory lease on this open file description.
+///
+/// This also releases the lease shared by cloned or inherited descriptors.
+/// Call only when their logical owner has finished its protected operation;
+/// another independently opened description's lease is unaffected. Ordinary
+/// `File` drop and clone semantics are unchanged.
+pub fn unlock_exclusive(file: &File) -> io::Result<()> {
+    const LOCK_UN: std::ffi::c_int = 8;
+    flock_operation(file, LOCK_UN)
+}
+
+fn flock_operation(file: &File, operation: std::ffi::c_int) -> io::Result<()> {
     unsafe extern "C" {
         fn flock(fd: std::ffi::c_int, op: std::ffi::c_int) -> std::ffi::c_int;
     }
-    const LOCK_EX: std::ffi::c_int = 2;
-    const LOCK_NB: std::ffi::c_int = 4;
     loop {
         // SAFETY: `file` owns a live descriptor throughout this call. Linux
         // flock accepts these integer operation flags and retains no pointers.
-        if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+        if unsafe { flock(file.as_raw_fd(), operation) } == 0 {
             return Ok(());
         }
         let error = io::Error::last_os_error();

@@ -1,0 +1,2329 @@
+{
+  "scope": "Source-only archive candidates. Intermediate source payloads only; no completeness claim for N3-12 or its frozen tests. Do not silently integrate.",
+  "entries": [
+    {
+      "repo_path": "apps/nexus/src/task_localapi.rs",
+      "sha256": "a28ce5f36eda2b634b6c8101e8abcca2ee848a25b2153de8e2f0c5c9481577d6",
+      "bytes": 14246,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "cli-implementation-outputs-all.json",
+          "source_json_sha256": "51e4b693944050e550049f608a5dbddcdfd61408497fbb321e11190737147b8f",
+          "thread": "01a14265-9c17-7477-a4ed-92579eb26083",
+          "turn": "01a1426d-6356-7577-bfec-6b04aaf3bf00",
+          "turn_started_at": 1792115828,
+          "item": "exec-c1db743e-dfd5-4968-9b1a-e0c15de8f5e8",
+          "item_index": 5,
+          "kind": "single-cat-baseline",
+          "boundary": "single successful cat command; output explicitly not truncated"
+        }
+      ],
+      "uncertainties": [],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexus/src/task_localapi.rs--a28ce5f36eda2b63.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging.rs",
+      "sha256": "621d6c385de4f438a8a1b4f08eb19671078d789fccbbd65ff58d0fb68f7eb12c",
+      "bytes": 2674,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-719150bb-89e1-4b4e-8771-eceef5e7e77b",
+          "item_index": 10,
+          "kind": "python-reconstructed",
+          "reconstruction": "allowlisted literal operations against complete same-child prior baseline"
+        }
+      ],
+      "uncertainties": [],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging.rs--621d6c385de4f438.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging.rs",
+      "sha256": "7c303518ab7c52894421bd9e0f05400a3be0b9f4b8f2bca68f8ee68ffd9d1eec",
+      "bytes": 2923,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-e48867f7-fd56-48d5-87da-d538b1a374e8",
+          "item_index": 37,
+          "kind": "local-format-derived",
+          "historical_formatter_identity_proven": false
+        },
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-525341f9-6cea-47f0-9b01-de2da455b1b3",
+          "item_index": 107,
+          "kind": "local-format-derived",
+          "historical_formatter_identity_proven": false
+        }
+      ],
+      "uncertainties": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "item": "exec-e48867f7-fd56-48d5-87da-d538b1a374e8",
+          "reason": "local formatter derivative; historical formatter identity not independently proven"
+        },
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "item": "exec-525341f9-6cea-47f0-9b01-de2da455b1b3",
+          "reason": "local formatter derivative; historical formatter identity not independently proven"
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging.rs--7c303518ab7c5289.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging.rs",
+      "sha256": "e07949bfbe06340af44d7d34440d2fa9eb487d955beea244f0e72fb00ee043e4",
+      "bytes": 4415,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147bd-4f0b-7392-a77e-dc3d795ab3aa",
+          "turn_started_at": 1792204952,
+          "item": "exec-dd9d1d20-4137-43c6-bb24-3ce521c2b7c0",
+          "item_index": 10,
+          "kind": "cat-before-markdown-baseline",
+          "output_char_start": 0,
+          "output_char_end": 4415,
+          "boundary": "next explicitly named Markdown cat begins with H1"
+        }
+      ],
+      "uncertainties": [],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging.rs--e07949bfbe06340a.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/backend.rs",
+      "sha256": "4489f0baf3de233f63c2b65bb4ef0875f9889d38e87c0951fc7692c657b60469",
+      "bytes": 8075,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-719150bb-89e1-4b4e-8771-eceef5e7e77b",
+          "item_index": 10,
+          "kind": "literal-heredoc"
+        }
+      ],
+      "uncertainties": [],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/backend.rs--4489f0baf3de233f.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/backend.rs",
+      "sha256": "66e4c760783a78a3c0a3d935f7909084f2ec3b49217c93b30e4a89b59acb4b5c",
+      "bytes": 11362,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-71b5042a-6958-4696-a535-90d38d05690c",
+          "item_index": 45,
+          "kind": "python-reconstructed",
+          "reconstruction": "allowlisted literal operations against complete same-child prior baseline"
+        }
+      ],
+      "uncertainties": [],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/backend.rs--66e4c760783a78a3.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/backend.rs",
+      "sha256": "7280c82c69f29ec1087230352400708e389132ae6e75d1dc2cacfbf0e890a4b7",
+      "bytes": 11547,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-062f52ec-890d-4a47-a7d0-d069b1de8789",
+          "item_index": 80,
+          "kind": "local-format-derived",
+          "historical_formatter_identity_proven": false
+        }
+      ],
+      "uncertainties": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "item": "exec-062f52ec-890d-4a47-a7d0-d069b1de8789",
+          "reason": "local formatter derivative; historical formatter identity not independently proven"
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/backend.rs--7280c82c69f29ec1.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/backend.rs",
+      "sha256": "9534bb519675ccfeee16b8e05ff852297c69135ae0e1591ab2166dfc9ae047e4",
+      "bytes": 11578,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-525341f9-6cea-47f0-9b01-de2da455b1b3",
+          "item_index": 107,
+          "kind": "python-reconstructed",
+          "reconstruction": "allowlisted literal operations against complete same-child prior baseline"
+        },
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-525341f9-6cea-47f0-9b01-de2da455b1b3",
+          "item_index": 107,
+          "kind": "local-format-derived",
+          "historical_formatter_identity_proven": false
+        }
+      ],
+      "uncertainties": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "item": "exec-525341f9-6cea-47f0-9b01-de2da455b1b3",
+          "unreplayed_operations": [
+            {
+              "line": 3,
+              "reason": "unsupported Starred"
+            },
+            {
+              "line": 4,
+              "reason": "unsupported DictComp"
+            }
+          ]
+        },
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "item": "exec-525341f9-6cea-47f0-9b01-de2da455b1b3",
+          "reason": "local formatter derivative; historical formatter identity not independently proven"
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/backend.rs--9534bb519675ccfe.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/backend.rs",
+      "sha256": "d7800e9909141d9e836de6aa4df2918d6376cc6aff912792c9198c288e6be496",
+      "bytes": 10826,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-e48867f7-fd56-48d5-87da-d538b1a374e8",
+          "item_index": 37,
+          "kind": "local-format-derived",
+          "historical_formatter_identity_proven": false
+        }
+      ],
+      "uncertainties": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "item": "exec-e48867f7-fd56-48d5-87da-d538b1a374e8",
+          "reason": "local formatter derivative; historical formatter identity not independently proven"
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/backend.rs--d7800e9909141d9e.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/backend.rs",
+      "sha256": "e5f3e5f224a6bb947265163469215672a33a5cf7081d734db111f0d4443523f6",
+      "bytes": 10816,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-5c1c16fb-851e-47bb-9c5a-2af765bc579b",
+          "item_index": 39,
+          "kind": "python-reconstructed",
+          "reconstruction": "allowlisted literal operations against complete same-child prior baseline"
+        }
+      ],
+      "uncertainties": [],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/backend.rs--e5f3e5f224a6bb94.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/init.rs",
+      "sha256": "1c77ec810df09f2ef27a2adaff8830e54bbaea63621429969d9ab88133d9f428",
+      "bytes": 13666,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-525341f9-6cea-47f0-9b01-de2da455b1b3",
+          "item_index": 107,
+          "kind": "python-reconstructed",
+          "reconstruction": "allowlisted literal operations against complete same-child prior baseline"
+        },
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-525341f9-6cea-47f0-9b01-de2da455b1b3",
+          "item_index": 107,
+          "kind": "local-format-derived",
+          "historical_formatter_identity_proven": false
+        }
+      ],
+      "uncertainties": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "item": "exec-525341f9-6cea-47f0-9b01-de2da455b1b3",
+          "unreplayed_operations": [
+            {
+              "line": 3,
+              "reason": "unsupported Starred"
+            },
+            {
+              "line": 4,
+              "reason": "unsupported DictComp"
+            }
+          ]
+        },
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "item": "exec-525341f9-6cea-47f0-9b01-de2da455b1b3",
+          "reason": "local formatter derivative; historical formatter identity not independently proven"
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/init.rs--1c77ec810df09f2e.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/init.rs",
+      "sha256": "50824b21ca07e0d3018569ebe07d65e687ff8f15d23cd4b7643e90276a4a8e5b",
+      "bytes": 13464,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-5c1c16fb-851e-47bb-9c5a-2af765bc579b",
+          "item_index": 39,
+          "kind": "python-reconstructed",
+          "reconstruction": "allowlisted literal operations against complete same-child prior baseline"
+        }
+      ],
+      "uncertainties": [],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/init.rs--50824b21ca07e0d3.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/init.rs",
+      "sha256": "c07580bf4fd696d19cb0d1b17d5455fc14bae452dc472f5147b7b94b54c1bf25",
+      "bytes": 13730,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-3a1564aa-bd9e-4172-a7e5-a3ebb78e6c53",
+          "item_index": 127,
+          "kind": "python-reconstructed",
+          "reconstruction": "allowlisted literal operations against complete same-child prior baseline"
+        },
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-3a1564aa-bd9e-4172-a7e5-a3ebb78e6c53",
+          "item_index": 127,
+          "kind": "local-format-derived",
+          "historical_formatter_identity_proven": false
+        }
+      ],
+      "uncertainties": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "item": "exec-3a1564aa-bd9e-4172-a7e5-a3ebb78e6c53",
+          "reason": "local formatter derivative; historical formatter identity not independently proven"
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/init.rs--c07580bf4fd696d1.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/init.rs",
+      "sha256": "c4b6ba2aa2df059faad214f4d0d09ecdbc7641f2e49ecb384b53cbb232b940f7",
+      "bytes": 9424,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-d855d660-02cd-48f6-8603-665d7ae15635",
+          "item_index": 21,
+          "kind": "literal-heredoc"
+        }
+      ],
+      "uncertainties": [],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/init.rs--c4b6ba2aa2df059f.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/init.rs",
+      "sha256": "c86587b6e43c9be360d46b89c2a7106345976ec22e887d77692d717e82909320",
+      "bytes": 13464,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-062f52ec-890d-4a47-a7d0-d069b1de8789",
+          "item_index": 80,
+          "kind": "local-format-derived",
+          "historical_formatter_identity_proven": false
+        }
+      ],
+      "uncertainties": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "item": "exec-062f52ec-890d-4a47-a7d0-d069b1de8789",
+          "reason": "local formatter derivative; historical formatter identity not independently proven"
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/init.rs--c86587b6e43c9be3.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/init.rs",
+      "sha256": "cc820329469f2f26cf0da46c72649ef058fe426515e020b535c9f76d37197c33",
+      "bytes": 12518,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-e48867f7-fd56-48d5-87da-d538b1a374e8",
+          "item_index": 37,
+          "kind": "local-format-derived",
+          "historical_formatter_identity_proven": false
+        }
+      ],
+      "uncertainties": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "item": "exec-e48867f7-fd56-48d5-87da-d538b1a374e8",
+          "reason": "local formatter derivative; historical formatter identity not independently proven"
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/init.rs--cc820329469f2f26.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/ledger.rs",
+      "sha256": "169109cd87330a9f8230f4afb6108ea2dba0defb7c9ded178fab60a465c39975",
+      "bytes": 13854,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-062f52ec-890d-4a47-a7d0-d069b1de8789",
+          "item_index": 80,
+          "kind": "python-reconstructed",
+          "reconstruction": "allowlisted literal operations against complete same-child prior baseline"
+        }
+      ],
+      "uncertainties": [],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/ledger.rs--169109cd87330a9f.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/ledger.rs",
+      "sha256": "26c28ebcd7a3a3438bed979a9984548e3f57a7fe306cc968a9852f586f0f26ef",
+      "bytes": 13983,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-062f52ec-890d-4a47-a7d0-d069b1de8789",
+          "item_index": 80,
+          "kind": "local-format-derived",
+          "historical_formatter_identity_proven": false
+        },
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-525341f9-6cea-47f0-9b01-de2da455b1b3",
+          "item_index": 107,
+          "kind": "local-format-derived",
+          "historical_formatter_identity_proven": false
+        }
+      ],
+      "uncertainties": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "item": "exec-062f52ec-890d-4a47-a7d0-d069b1de8789",
+          "reason": "local formatter derivative; historical formatter identity not independently proven"
+        },
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "item": "exec-525341f9-6cea-47f0-9b01-de2da455b1b3",
+          "reason": "local formatter derivative; historical formatter identity not independently proven"
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/ledger.rs--26c28ebcd7a3a343.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/ledger.rs",
+      "sha256": "910f7cc8faac4da8ee69997837f15eaab800bd5b03d9851f8eb69eabab7058d3",
+      "bytes": 9934,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-47e01d4b-9fcb-4177-9764-dba1bd69a438",
+          "item_index": 17,
+          "kind": "literal-heredoc"
+        }
+      ],
+      "uncertainties": [],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/ledger.rs--910f7cc8faac4da8.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/ledger.rs",
+      "sha256": "acfaa9a17902852dd02435e4b5fd492dc4ceb5d0fb1bfdfdfa5f2c953f4d55bb",
+      "bytes": 13939,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-d33c4775-0557-480d-a804-ea3cfda37dcf",
+          "item_index": 119,
+          "kind": "python-reconstructed",
+          "reconstruction": "allowlisted literal operations against complete same-child prior baseline"
+        }
+      ],
+      "uncertainties": [],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/ledger.rs--acfaa9a17902852d.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/ledger.rs",
+      "sha256": "b65c12cf7da8b8452b5ba59803d06919df725b98786a9fdd43e429fb38dbcf9d",
+      "bytes": 15000,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-e48867f7-fd56-48d5-87da-d538b1a374e8",
+          "item_index": 37,
+          "kind": "local-format-derived",
+          "historical_formatter_identity_proven": false
+        }
+      ],
+      "uncertainties": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "item": "exec-e48867f7-fd56-48d5-87da-d538b1a374e8",
+          "reason": "local formatter derivative; historical formatter identity not independently proven"
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/ledger.rs--b65c12cf7da8b845.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/model.rs",
+      "sha256": "2c66149072d316a40f6bf9fdf649a4619101792c1085bfccb94dda9b0b9551db",
+      "bytes": 18612,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-062f52ec-890d-4a47-a7d0-d069b1de8789",
+          "item_index": 80,
+          "kind": "local-format-derived",
+          "historical_formatter_identity_proven": false
+        },
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-525341f9-6cea-47f0-9b01-de2da455b1b3",
+          "item_index": 107,
+          "kind": "local-format-derived",
+          "historical_formatter_identity_proven": false
+        }
+      ],
+      "uncertainties": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "item": "exec-062f52ec-890d-4a47-a7d0-d069b1de8789",
+          "reason": "local formatter derivative; historical formatter identity not independently proven"
+        },
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "item": "exec-525341f9-6cea-47f0-9b01-de2da455b1b3",
+          "reason": "local formatter derivative; historical formatter identity not independently proven"
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/model.rs--2c66149072d316a4.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/model.rs",
+      "sha256": "e914a3c406d6e7d0e7ccfae3a71bc4149fe6b988332da17aa1c0c1e77d72e279",
+      "bytes": 18356,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-062f52ec-890d-4a47-a7d0-d069b1de8789",
+          "item_index": 80,
+          "kind": "python-reconstructed",
+          "reconstruction": "allowlisted literal operations against complete same-child prior baseline"
+        }
+      ],
+      "uncertainties": [],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/model.rs--e914a3c406d6e7d0.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/model.rs",
+      "sha256": "ebbb7b0ab1117698fb8443bd1392bd6707b844683b625416f2ba78ab810296b5",
+      "bytes": 13990,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-679fd071-1637-481f-a472-9f554d662e2c",
+          "item_index": 6,
+          "kind": "literal-heredoc"
+        }
+      ],
+      "uncertainties": [],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/model.rs--ebbb7b0ab1117698.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/model.rs",
+      "sha256": "f387180941526dfe59983ee27adce8458b2386594f6300e9b348beb12099972d",
+      "bytes": 18270,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-e48867f7-fd56-48d5-87da-d538b1a374e8",
+          "item_index": 37,
+          "kind": "local-format-derived",
+          "historical_formatter_identity_proven": false
+        }
+      ],
+      "uncertainties": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "item": "exec-e48867f7-fd56-48d5-87da-d538b1a374e8",
+          "reason": "local formatter derivative; historical formatter identity not independently proven"
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/model.rs--f387180941526dfe.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/ops.rs",
+      "sha256": "3c0efd64835fcd9d5c5d4c60fe1ab6bfe78e520d2c44df8641f6d5769c3f1a5f",
+      "bytes": 17399,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-062f52ec-890d-4a47-a7d0-d069b1de8789",
+          "item_index": 80,
+          "kind": "python-reconstructed",
+          "reconstruction": "allowlisted literal operations against complete same-child prior baseline"
+        }
+      ],
+      "uncertainties": [],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/ops.rs--3c0efd64835fcd9d.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/ops.rs",
+      "sha256": "5c769ac24259a28c527dc825d7826a44b71636c96dd59b7c69cb2f555c7fb9e9",
+      "bytes": 19209,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-e48867f7-fd56-48d5-87da-d538b1a374e8",
+          "item_index": 37,
+          "kind": "local-format-derived",
+          "historical_formatter_identity_proven": false
+        },
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-71b5042a-6958-4696-a535-90d38d05690c",
+          "item_index": 45,
+          "kind": "python-reconstructed",
+          "reconstruction": "allowlisted literal operations against complete same-child prior baseline"
+        }
+      ],
+      "uncertainties": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "item": "exec-e48867f7-fd56-48d5-87da-d538b1a374e8",
+          "reason": "local formatter derivative; historical formatter identity not independently proven"
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/ops.rs--5c769ac24259a28c.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/ops.rs",
+      "sha256": "6192f18a5f2623d00989306030d681b1921bdf324142ec57070d45d6bd5c0d3a",
+      "bytes": 13243,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-66102342-4737-4de5-919d-933e51926b5d",
+          "item_index": 25,
+          "kind": "literal-heredoc"
+        }
+      ],
+      "uncertainties": [],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/ops.rs--6192f18a5f2623d0.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/ops.rs",
+      "sha256": "a3e0ba84d8109fd1ec617ecb5807a7104b588d6bc5803ea9b3c6ea53925d78ac",
+      "bytes": 17578,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-d33c4775-0557-480d-a804-ea3cfda37dcf",
+          "item_index": 119,
+          "kind": "python-reconstructed",
+          "reconstruction": "allowlisted literal operations against complete same-child prior baseline"
+        }
+      ],
+      "uncertainties": [],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/ops.rs--a3e0ba84d8109fd1.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/ops.rs",
+      "sha256": "fcde0071cf32423eeb9ba708a0767f58fc19e36f3e7b5ba804d99211d2ab5462",
+      "bytes": 17659,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-062f52ec-890d-4a47-a7d0-d069b1de8789",
+          "item_index": 80,
+          "kind": "local-format-derived",
+          "historical_formatter_identity_proven": false
+        },
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-525341f9-6cea-47f0-9b01-de2da455b1b3",
+          "item_index": 107,
+          "kind": "local-format-derived",
+          "historical_formatter_identity_proven": false
+        }
+      ],
+      "uncertainties": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "item": "exec-062f52ec-890d-4a47-a7d0-d069b1de8789",
+          "reason": "local formatter derivative; historical formatter identity not independently proven"
+        },
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "item": "exec-525341f9-6cea-47f0-9b01-de2da455b1b3",
+          "reason": "local formatter derivative; historical formatter identity not independently proven"
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/ops.rs--fcde0071cf32423e.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/recovery.rs",
+      "sha256": "5adca4854cb3dbd29ed20f6636dc449802a6bdd769eb45be06a1423e1477282e",
+      "bytes": 7946,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-062f52ec-890d-4a47-a7d0-d069b1de8789",
+          "item_index": 80,
+          "kind": "python-reconstructed",
+          "reconstruction": "allowlisted literal operations against complete same-child prior baseline"
+        }
+      ],
+      "uncertainties": [],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/recovery.rs--5adca4854cb3dbd2.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/recovery.rs",
+      "sha256": "95951f1250a23d295bbc2f5f579bc42c14a7d770664889a66770e5e72f7a68ec",
+      "bytes": 8053,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-e48867f7-fd56-48d5-87da-d538b1a374e8",
+          "item_index": 37,
+          "kind": "local-format-derived",
+          "historical_formatter_identity_proven": false
+        },
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-71b5042a-6958-4696-a535-90d38d05690c",
+          "item_index": 45,
+          "kind": "python-reconstructed",
+          "reconstruction": "allowlisted literal operations against complete same-child prior baseline"
+        }
+      ],
+      "uncertainties": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "item": "exec-e48867f7-fd56-48d5-87da-d538b1a374e8",
+          "reason": "local formatter derivative; historical formatter identity not independently proven"
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/recovery.rs--95951f1250a23d29.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/recovery.rs",
+      "sha256": "a6fa6b0da74ae9560fd472e17907f31ef788f6d6c7214aa19ce09856cf98965a",
+      "bytes": 7950,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-062f52ec-890d-4a47-a7d0-d069b1de8789",
+          "item_index": 80,
+          "kind": "local-format-derived",
+          "historical_formatter_identity_proven": false
+        },
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-525341f9-6cea-47f0-9b01-de2da455b1b3",
+          "item_index": 107,
+          "kind": "local-format-derived",
+          "historical_formatter_identity_proven": false
+        }
+      ],
+      "uncertainties": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "item": "exec-062f52ec-890d-4a47-a7d0-d069b1de8789",
+          "reason": "local formatter derivative; historical formatter identity not independently proven"
+        },
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "item": "exec-525341f9-6cea-47f0-9b01-de2da455b1b3",
+          "reason": "local formatter derivative; historical formatter identity not independently proven"
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/recovery.rs--a6fa6b0da74ae956.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging/recovery.rs",
+      "sha256": "b13f5afc29396c9e3d0bd5ea12ce19967b28d5c7d9f63f6652be0bcb39ca5022",
+      "bytes": 5519,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-implementation-outputs-all.json",
+          "source_json_sha256": "a869dc36788e7278d1a36858fcf5b8c4edb109b782fb92b8376853ba52cc2917",
+          "thread": "01a147bd-4440-755c-8159-5343fdf510a7",
+          "turn": "01a147c2-0468-7664-b436-e48a6b4701b1",
+          "turn_started_at": 1792205260,
+          "item": "exec-17b12804-a86d-4214-9f37-3d08d786572d",
+          "item_index": 23,
+          "kind": "literal-heredoc"
+        }
+      ],
+      "uncertainties": [],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/snapshot_staging/recovery.rs--b13f5afc29396c9e.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/task_http.rs",
+      "sha256": "b21dded93ce7591686c468b986a87490bf222920055f0e4340ebfbaaa8eb453f",
+      "bytes": 13232,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "daemon-plan-outputs-all.json",
+          "source_json_sha256": "0caf77203fa62e500644312db2d2e174fb299ab11b29cdc9d8b08416f3d000de",
+          "thread": "01a14273-730f-7702-88bb-e1bc0829d090",
+          "turn": "01a14273-7d05-7507-a010-0da27147a10b",
+          "turn_started_at": 1792116228,
+          "item": "exec-51803c08-60f3-476c-8195-5d8e36593342",
+          "item_index": 12,
+          "kind": "single-cat-baseline",
+          "boundary": "single successful cat command; output explicitly not truncated"
+        }
+      ],
+      "uncertainties": [],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/task_http.rs--b21dded93ce75916.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "apps/nexusd/src/task_provider_init_io.rs",
+      "sha256": "75b072e780b9b50934c0e89578a3cf5c0d58573ffb04e1bb22e4be5df4df4aa2",
+      "bytes": 14427,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "staging-r8-outputs-all.json",
+          "source_json_sha256": "b1de36fb547d4f4182e611216b9df9107c5e971114522a823455a7e431465587",
+          "thread": "01a14265-e6b7-75a4-9de8-1f10f4a37083",
+          "turn": "01a1426d-4230-71aa-bd67-2f816f57ef7c",
+          "turn_started_at": 1792115819,
+          "item": "exec-68d4b1f9-2cbf-4e68-8583-41f3fdf37cbd",
+          "item_index": 4,
+          "kind": "single-cat-baseline",
+          "boundary": "single successful cat command; output explicitly not truncated"
+        }
+      ],
+      "uncertainties": [],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/apps/nexusd/src/task_provider_init_io.rs--75b072e780b9b509.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "crates/nexus-control-api/src/snapshot.rs",
+      "sha256": "756597f4d9b4a087a0da01b1ee7b8f84ca91085fbcfadc02dd88cfe3c8c386fa",
+      "bytes": 3386,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "dto-implementation.json",
+          "source_json_sha256": "4404ad39eb305cda30a5d81ce7bbce3627062436161ce150d895a89d8d1cd5c1",
+          "thread": "01a13fdd-6924-7551-a24b-222fa5edc000",
+          "turn": "01a13fdd-769b-71a2-bf91-9cb7fae539b0",
+          "turn_started_at": 1792072841,
+          "item": "exec-73fa7cc7-c5ee-4184-bc81-fb9e5cbbcf1c",
+          "item_index": 3,
+          "kind": "cat-baseline",
+          "output_byte_end": 3386,
+          "output_char_start": 0,
+          "output_char_end": 3386,
+          "boundary": "next cat/sed file unique module header; full first file precedes truncation"
+        }
+      ],
+      "uncertainties": [],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/crates/nexus-control-api/src/snapshot.rs--756597f4d9b4a087.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "crates/nexus-control-api/src/snapshot.rs",
+      "sha256": "ac0a9f327a5fbd30016cefbf91584325572d238c3b71325eb739f26096365ac6",
+      "bytes": 19340,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "dto-implementation.json",
+          "source_json_sha256": "4404ad39eb305cda30a5d81ce7bbce3627062436161ce150d895a89d8d1cd5c1",
+          "thread": "01a13fdd-6924-7551-a24b-222fa5edc000",
+          "turn": "01a13fdd-769b-71a2-bf91-9cb7fae539b0",
+          "turn_started_at": 1792072841,
+          "item": "exec-1e409b53-1086-4f16-99a2-41d248021428",
+          "item_index": 14,
+          "kind": "local-format-derived",
+          "historical_formatter_identity_proven": false
+        }
+      ],
+      "uncertainties": [
+        {
+          "source_json": "dto-implementation.json",
+          "item": "exec-1e409b53-1086-4f16-99a2-41d248021428",
+          "reason": "local formatter derivative; historical formatter identity not independently proven"
+        }
+      ],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/crates/nexus-control-api/src/snapshot.rs--ac0a9f327a5fbd30.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "crates/nexus-control-api/src/snapshot.rs",
+      "sha256": "c4e1b47a39fd335cf9f1c534f33ded6ee61a94629e1fdbaee9449968e7e7f25b",
+      "bytes": 18123,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "dto-implementation.json",
+          "source_json_sha256": "4404ad39eb305cda30a5d81ce7bbce3627062436161ce150d895a89d8d1cd5c1",
+          "thread": "01a13fdd-6924-7551-a24b-222fa5edc000",
+          "turn": "01a13fdd-769b-71a2-bf91-9cb7fae539b0",
+          "turn_started_at": 1792072841,
+          "item": "exec-1e409b53-1086-4f16-99a2-41d248021428",
+          "item_index": 14,
+          "kind": "python-reconstructed",
+          "reconstruction": "allowlisted literal operations against complete same-child prior baseline"
+        }
+      ],
+      "uncertainties": [],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/crates/nexus-control-api/src/snapshot.rs--c4e1b47a39fd335c.txt",
+      "active_source": false
+    },
+    {
+      "repo_path": "crates/nexus-workspace/src/snapshot.rs",
+      "sha256": "b6785d1ba73c0186442d996f6b2f7cca02629de5e54ed4f1cdd1221cb0ba69df",
+      "bytes": 13040,
+      "status": "full intermediate payload candidate; final historical hash unconfirmed",
+      "final_historical_hash_verified": false,
+      "evidence": [
+        {
+          "source_json": "freeze-implementation-outputs-all.json",
+          "source_json_sha256": "2f054100dff053529b53745f00a788e6bc5a84121c850d1bd82f7bb1a1eb1ea7",
+          "thread": "01a134d5-983c-72ea-bd20-633ee2139010",
+          "turn": "01a134d5-a5a4-7537-82b3-eade20f6ca01",
+          "turn_started_at": 1791887780,
+          "item": "exec-11edc15e-de29-44f6-92bb-b08ae970bec1",
+          "item_index": 9,
+          "kind": "single-cat-baseline",
+          "boundary": "single successful cat command; output explicitly not truncated"
+        }
+      ],
+      "uncertainties": [],
+      "archive_path": "docs/recovery/2026-10-20/sources/candidates/crates/nexus-workspace/src/snapshot.rs--b6785d1ba73c0186.txt",
+      "active_source": false
+    }
+  ],
+  "candidate_count": 40,
+  "missing_manifest_sources": [
+    {
+      "repo_path": "apps/nexusd/src/main.rs",
+      "expected_bytes": 59673,
+      "expected_sha256": "fc8b5d7faeee44bac0bd288398e92adfdfe8d9a7e7cff878a25d00af9e6d077f",
+      "status": "complete matching historical source not recovered"
+    },
+    {
+      "repo_path": "apps/nexusd/src/task_http.rs",
+      "expected_bytes": 15976,
+      "expected_sha256": "f012ca9d6f0cd3bc7c75669458b04d486f672b13ed54f6bc1935f67fdb0665f7",
+      "status": "complete matching historical source not recovered"
+    },
+    {
+      "repo_path": "apps/nexusd/src/task_provider_command.rs",
+      "expected_bytes": 9114,
+      "expected_sha256": "43fd511ec99c96b5739c4bdc10da280c8e52fb908f35c147bbd9ebcd3220ce0f",
+      "status": "complete matching historical source not recovered"
+    },
+    {
+      "repo_path": "apps/nexusd/src/lib.rs",
+      "expected_bytes": 1876,
+      "expected_sha256": "df475be89bd3ebc9420150b853476e84fa7237b997e1455b6a61e2e9a375e281",
+      "status": "complete matching historical source not recovered"
+    },
+    {
+      "repo_path": "crates/nexus-control-api/src/lib.rs",
+      "expected_bytes": 5436,
+      "expected_sha256": "260ab0644511a73be30eb55cd2a8be709da1d8489fdb044619cd5f705d68864f",
+      "status": "complete matching historical source not recovered"
+    },
+    {
+      "repo_path": "crates/nexus-control-api/tests/snapshot_contract.rs",
+      "expected_bytes": 146888,
+      "expected_sha256": "5bab6b34bccdd4e58919ab442526c3799d14ce5401484f6aeda246f1615d4e21",
+      "status": "complete matching historical source not recovered"
+    },
+    {
+      "repo_path": "apps/nexusd/tests/n3_snapshot_staging_binary.py",
+      "expected_bytes": 83677,
+      "expected_sha256": "fc050ce05bec2dfb1dabecde4f24200ce97be7efed52cb3caf9c3ae972e17295",
+      "status": "complete matching historical source not recovered"
+    },
+    {
+      "repo_path": "engineering/verifiers/n3_snapshot_staging.py",
+      "expected_bytes": 78043,
+      "expected_sha256": "bf81032b78e8fc1e4113b52700fff18d19ca5ac9adb1b6b1c625f98788349c6d",
+      "status": "complete matching historical source not recovered"
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging_tests/authority.rs",
+      "expected_bytes": 54002,
+      "expected_sha256": "65593b7fc34962dcedd56924b1efc6638f8c1254b6323ad867f1cacbac700912",
+      "status": "complete matching historical source not recovered"
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging_tests/core.rs",
+      "expected_bytes": 54394,
+      "expected_sha256": "9feae69abcd512d44c8010f17fad618d95257cfad7e3481b6516994c2fb57b05",
+      "status": "complete matching historical source not recovered"
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging_tests/pressure.rs",
+      "expected_bytes": 30228,
+      "expected_sha256": "aaf5301866b42026b82ddd2cfa7255a6e99a578ca1452b22149d6567d6e26897",
+      "status": "complete matching historical source not recovered"
+    },
+    {
+      "repo_path": "apps/nexusd/src/snapshot_staging_tests/recovery.rs",
+      "expected_bytes": 22927,
+      "expected_sha256": "ec3342068965c50a9dd3c067ee7c9e7a628d990b6fbd6d012a5658b227257f6f",
+      "status": "complete matching historical source not recovered"
+    }
+  ],
+  "missing_patch_payloads": [
+    {
+      "source_json": "page3-outputs20000.json",
+      "source_json_sha256": "7e57eba37c23a9e4b2653e4c8ff662a4586d4c79086c0f7086cc257321db00a2",
+      "thread": "01a101d7-5238-7224-8087-fee42ce4c092",
+      "turn": "01a12c0f-632c-77ab-b826-8cdb1b06ee72",
+      "turn_started_at": 1791740569,
+      "item": "exec-78a61e4b-71b3-4b26-8a03-a7c45bab79a5",
+      "item_index": 49,
+      "repo_path": "crates/nexus-web-gateway/src/gateway.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "page3-outputs20000.json",
+      "source_json_sha256": "7e57eba37c23a9e4b2653e4c8ff662a4586d4c79086c0f7086cc257321db00a2",
+      "thread": "01a101d7-5238-7224-8087-fee42ce4c092",
+      "turn": "01a12c0f-632c-77ab-b826-8cdb1b06ee72",
+      "turn_started_at": 1791740569,
+      "item": "exec-260bff2a-a742-4986-865f-0e5028c956e8",
+      "item_index": 66,
+      "repo_path": "crates/nexus-web-gateway/src/cert.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "page3-outputs20000.json",
+      "source_json_sha256": "7e57eba37c23a9e4b2653e4c8ff662a4586d4c79086c0f7086cc257321db00a2",
+      "thread": "01a101d7-5238-7224-8087-fee42ce4c092",
+      "turn": "01a12c0f-632c-77ab-b826-8cdb1b06ee72",
+      "turn_started_at": 1791740569,
+      "item": "exec-112f688f-a9d1-41c6-9614-affd74b54807",
+      "item_index": 91,
+      "repo_path": "docs/N3-11-PROVIDER-INIT-CONTRACT.md",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "page3-outputs20000.json",
+      "source_json_sha256": "7e57eba37c23a9e4b2653e4c8ff662a4586d4c79086c0f7086cc257321db00a2",
+      "thread": "01a101d7-5238-7224-8087-fee42ce4c092",
+      "turn": "01a12c0f-632c-77ab-b826-8cdb1b06ee72",
+      "turn_started_at": 1791740569,
+      "item": "exec-6cca0e72-5ecc-46a5-b793-baa111cc54b6",
+      "item_index": 152,
+      "repo_path": "docs/N3-11-14-EXECUTION-PLAN.md",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "page3-outputs20000.json",
+      "source_json_sha256": "7e57eba37c23a9e4b2653e4c8ff662a4586d4c79086c0f7086cc257321db00a2",
+      "thread": "01a101d7-5238-7224-8087-fee42ce4c092",
+      "turn": "01a12c0f-632c-77ab-b826-8cdb1b06ee72",
+      "turn_started_at": 1791740569,
+      "item": "exec-f6cd28e2-ceac-4572-8d12-47e8d3311dbc",
+      "item_index": 185,
+      "repo_path": "engineering/nexus-harness/MODULE.md",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "dto-tests-outputs-all.json",
+      "source_json_sha256": "450d125715ebbaba8791f01eea97880036173bf97ddc97b32e0c37328877b303",
+      "thread": "01a130b8-a3f5-754a-a65a-1917e58ae03f",
+      "turn": "01a130b8-b184-7487-b1e8-b13839b7e3f4",
+      "turn_started_at": 1791818773,
+      "item": "exec-269417d9-07e4-456f-a9fa-1b8bf5b47689",
+      "item_index": 12,
+      "repo_path": "crates/nexus-control-api/src/lib.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "dto-tests-outputs-all.json",
+      "source_json_sha256": "450d125715ebbaba8791f01eea97880036173bf97ddc97b32e0c37328877b303",
+      "thread": "01a130b8-a3f5-754a-a65a-1917e58ae03f",
+      "turn": "01a130b8-b184-7487-b1e8-b13839b7e3f4",
+      "turn_started_at": 1791818773,
+      "item": "exec-269417d9-07e4-456f-a9fa-1b8bf5b47689",
+      "item_index": 12,
+      "repo_path": "crates/nexus-control-api/src/snapshot.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "dto-tests-outputs-all.json",
+      "source_json_sha256": "450d125715ebbaba8791f01eea97880036173bf97ddc97b32e0c37328877b303",
+      "thread": "01a130b8-a3f5-754a-a65a-1917e58ae03f",
+      "turn": "01a130b8-b184-7487-b1e8-b13839b7e3f4",
+      "turn_started_at": 1791818773,
+      "item": "exec-363865bf-1930-4311-ae8d-028035982b11",
+      "item_index": 15,
+      "repo_path": "crates/nexus-control-api/tests/snapshot_contract.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "dto-tests-outputs-all.json",
+      "source_json_sha256": "450d125715ebbaba8791f01eea97880036173bf97ddc97b32e0c37328877b303",
+      "thread": "01a130b8-a3f5-754a-a65a-1917e58ae03f",
+      "turn": "01a130b8-b184-7487-b1e8-b13839b7e3f4",
+      "turn_started_at": 1791818773,
+      "item": "exec-d41598ae-56fb-4730-bf09-401e2091ea0c",
+      "item_index": 20,
+      "repo_path": "crates/nexus-control-api/tests/snapshot_contract.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "dto-tests-outputs-all.json",
+      "source_json_sha256": "450d125715ebbaba8791f01eea97880036173bf97ddc97b32e0c37328877b303",
+      "thread": "01a130b8-a3f5-754a-a65a-1917e58ae03f",
+      "turn": "01a130b8-b184-7487-b1e8-b13839b7e3f4",
+      "turn_started_at": 1791818773,
+      "item": "exec-305e2bbc-f1c2-47d7-8aa3-54006eae256f",
+      "item_index": 37,
+      "repo_path": "crates/nexus-control-api/tests/snapshot_contract.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "dto-tests-outputs-all.json",
+      "source_json_sha256": "450d125715ebbaba8791f01eea97880036173bf97ddc97b32e0c37328877b303",
+      "thread": "01a130b8-a3f5-754a-a65a-1917e58ae03f",
+      "turn": "01a130c9-3802-722a-8712-802e93a36f95",
+      "turn_started_at": 1791819856,
+      "item": "exec-4cb4d701-39ec-4bdc-bf06-8600eff4f943",
+      "item_index": 2,
+      "repo_path": "crates/nexus-control-api/tests/snapshot_contract.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "dto-tests-outputs-all.json",
+      "source_json_sha256": "450d125715ebbaba8791f01eea97880036173bf97ddc97b32e0c37328877b303",
+      "thread": "01a130b8-a3f5-754a-a65a-1917e58ae03f",
+      "turn": "01a130c9-3802-722a-8712-802e93a36f95",
+      "turn_started_at": 1791819856,
+      "item": "exec-35d47af7-e3ad-40f5-aa1c-7cb280ae9d9e",
+      "item_index": 4,
+      "repo_path": "crates/nexus-control-api/tests/snapshot_contract.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "dto-tests-outputs-all.json",
+      "source_json_sha256": "450d125715ebbaba8791f01eea97880036173bf97ddc97b32e0c37328877b303",
+      "thread": "01a130b8-a3f5-754a-a65a-1917e58ae03f",
+      "turn": "01a130c9-3802-722a-8712-802e93a36f95",
+      "turn_started_at": 1791819856,
+      "item": "exec-2e3f4fcf-10df-4120-97e7-a240a929ac48",
+      "item_index": 6,
+      "repo_path": "crates/nexus-control-api/tests/snapshot_contract.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "observer-tests-outputs-all.json",
+      "source_json_sha256": "b7fe33003b3d064a5ffd3e332af7613537a5a2aff957fba3634b34a32f057022",
+      "thread": "01a130bd-4c0c-743a-9ebc-bd8d38f1902b",
+      "turn": "01a130bd-5c34-746f-ac29-02719207ab78",
+      "turn_started_at": 1791819079,
+      "item": "exec-9a5c3e53-c230-40c2-b9d9-c85e6faa45b5",
+      "item_index": 10,
+      "repo_path": "engineering/verifiers/n3_snapshot_staging.py",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "observer-tests-outputs-all.json",
+      "source_json_sha256": "b7fe33003b3d064a5ffd3e332af7613537a5a2aff957fba3634b34a32f057022",
+      "thread": "01a130bd-4c0c-743a-9ebc-bd8d38f1902b",
+      "turn": "01a130bd-5c34-746f-ac29-02719207ab78",
+      "turn_started_at": 1791819079,
+      "item": "exec-9a5c3e53-c230-40c2-b9d9-c85e6faa45b5",
+      "item_index": 10,
+      "repo_path": "scenarios/product/n3-12-snapshot-staging.toml",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "observer-tests-outputs-all.json",
+      "source_json_sha256": "b7fe33003b3d064a5ffd3e332af7613537a5a2aff957fba3634b34a32f057022",
+      "thread": "01a130bd-4c0c-743a-9ebc-bd8d38f1902b",
+      "turn": "01a130bd-5c34-746f-ac29-02719207ab78",
+      "turn_started_at": 1791819079,
+      "item": "exec-6af4f9f8-9863-4906-a499-4419bc8286f5",
+      "item_index": 16,
+      "repo_path": "apps/nexusd/tests/n3_snapshot_staging_binary.py",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "observer-tests-outputs-all.json",
+      "source_json_sha256": "b7fe33003b3d064a5ffd3e332af7613537a5a2aff957fba3634b34a32f057022",
+      "thread": "01a130bd-4c0c-743a-9ebc-bd8d38f1902b",
+      "turn": "01a130bd-5c34-746f-ac29-02719207ab78",
+      "turn_started_at": 1791819079,
+      "item": "exec-6af4f9f8-9863-4906-a499-4419bc8286f5",
+      "item_index": 16,
+      "repo_path": "engineering/verifiers/n3_snapshot_staging.py",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "observer-tests-outputs-all.json",
+      "source_json_sha256": "b7fe33003b3d064a5ffd3e332af7613537a5a2aff957fba3634b34a32f057022",
+      "thread": "01a130bd-4c0c-743a-9ebc-bd8d38f1902b",
+      "turn": "01a130bd-5c34-746f-ac29-02719207ab78",
+      "turn_started_at": 1791819079,
+      "item": "exec-bf45aa03-ce07-4df0-a7e0-8f8c3119ffe0",
+      "item_index": 22,
+      "repo_path": "apps/nexusd/tests/n3_snapshot_staging_binary.py",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "observer-tests-outputs-all.json",
+      "source_json_sha256": "b7fe33003b3d064a5ffd3e332af7613537a5a2aff957fba3634b34a32f057022",
+      "thread": "01a130bd-4c0c-743a-9ebc-bd8d38f1902b",
+      "turn": "01a130bd-5c34-746f-ac29-02719207ab78",
+      "turn_started_at": 1791819079,
+      "item": "exec-0bc2f7e2-d10e-4ed3-92aa-6f67a6830023",
+      "item_index": 33,
+      "repo_path": "apps/nexusd/tests/n3_snapshot_staging_binary.py",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "observer-tests-outputs-all.json",
+      "source_json_sha256": "b7fe33003b3d064a5ffd3e332af7613537a5a2aff957fba3634b34a32f057022",
+      "thread": "01a130bd-4c0c-743a-9ebc-bd8d38f1902b",
+      "turn": "01a130bd-5c34-746f-ac29-02719207ab78",
+      "turn_started_at": 1791819079,
+      "item": "exec-4ef42d22-8504-4ece-8bd5-2f75aeba43d9",
+      "item_index": 37,
+      "repo_path": "apps/nexusd/tests/n3_snapshot_staging_binary.py",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "observer-tests-outputs-all.json",
+      "source_json_sha256": "b7fe33003b3d064a5ffd3e332af7613537a5a2aff957fba3634b34a32f057022",
+      "thread": "01a130bd-4c0c-743a-9ebc-bd8d38f1902b",
+      "turn": "01a130bd-5c34-746f-ac29-02719207ab78",
+      "turn_started_at": 1791819079,
+      "item": "exec-b6ac4e64-5da7-48c0-bc6f-1e39f6c68ae1",
+      "item_index": 41,
+      "repo_path": "apps/nexusd/tests/n3_snapshot_staging_binary.py",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "observer-tests-outputs-all.json",
+      "source_json_sha256": "b7fe33003b3d064a5ffd3e332af7613537a5a2aff957fba3634b34a32f057022",
+      "thread": "01a130bd-4c0c-743a-9ebc-bd8d38f1902b",
+      "turn": "01a130bd-5c34-746f-ac29-02719207ab78",
+      "turn_started_at": 1791819079,
+      "item": "exec-08a1c44f-d9ec-4691-8da2-fbd659ef37ff",
+      "item_index": 44,
+      "repo_path": "apps/nexusd/tests/n3_snapshot_staging_binary.py",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "staging-tests-outputs-all.json",
+      "source_json_sha256": "f7e11fe09659db79c24e9f20ae6a6cda166f14eba32154ef0c3646dc6244dfb4",
+      "thread": "01a130bf-a616-7265-8612-e68c19d8800e",
+      "turn": "01a130bf-b377-7421-a994-edc1eb68a7a9",
+      "turn_started_at": 1791819233,
+      "item": "exec-8e3ade3c-0b9a-4cc8-b897-cf8838d19ce2",
+      "item_index": 17,
+      "repo_path": "apps/nexusd/src/lib.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "staging-tests-outputs-all.json",
+      "source_json_sha256": "f7e11fe09659db79c24e9f20ae6a6cda166f14eba32154ef0c3646dc6244dfb4",
+      "thread": "01a130bf-a616-7265-8612-e68c19d8800e",
+      "turn": "01a130bf-b377-7421-a994-edc1eb68a7a9",
+      "turn_started_at": 1791819233,
+      "item": "exec-8e3ade3c-0b9a-4cc8-b897-cf8838d19ce2",
+      "item_index": 17,
+      "repo_path": "apps/nexusd/src/snapshot_staging.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "staging-tests-outputs-all.json",
+      "source_json_sha256": "f7e11fe09659db79c24e9f20ae6a6cda166f14eba32154ef0c3646dc6244dfb4",
+      "thread": "01a130bf-a616-7265-8612-e68c19d8800e",
+      "turn": "01a130bf-b377-7421-a994-edc1eb68a7a9",
+      "turn_started_at": 1791819233,
+      "item": "exec-98475c0e-86e1-46d2-a1bd-7f895929bbf0",
+      "item_index": 19,
+      "repo_path": "apps/nexusd/src/snapshot_staging_tests.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "staging-tests-outputs-all.json",
+      "source_json_sha256": "f7e11fe09659db79c24e9f20ae6a6cda166f14eba32154ef0c3646dc6244dfb4",
+      "thread": "01a130bf-a616-7265-8612-e68c19d8800e",
+      "turn": "01a130bf-b377-7421-a994-edc1eb68a7a9",
+      "turn_started_at": 1791819233,
+      "item": "exec-f00818cb-02a6-42da-b5a5-e96b24e66c71",
+      "item_index": 22,
+      "repo_path": "apps/nexusd/src/snapshot_staging_tests.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "staging-tests-outputs-all.json",
+      "source_json_sha256": "f7e11fe09659db79c24e9f20ae6a6cda166f14eba32154ef0c3646dc6244dfb4",
+      "thread": "01a130bf-a616-7265-8612-e68c19d8800e",
+      "turn": "01a130bf-b377-7421-a994-edc1eb68a7a9",
+      "turn_started_at": 1791819233,
+      "item": "exec-d940759a-376d-4048-9257-464dd5c90c0e",
+      "item_index": 25,
+      "repo_path": "apps/nexusd/src/snapshot_staging_tests.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "staging-tests-outputs-all.json",
+      "source_json_sha256": "f7e11fe09659db79c24e9f20ae6a6cda166f14eba32154ef0c3646dc6244dfb4",
+      "thread": "01a130bf-a616-7265-8612-e68c19d8800e",
+      "turn": "01a130bf-b377-7421-a994-edc1eb68a7a9",
+      "turn_started_at": 1791819233,
+      "item": "exec-8f895930-5d09-4a48-9095-e1b25d71d915",
+      "item_index": 29,
+      "repo_path": "apps/nexusd/src/snapshot_staging_tests.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "staging-tests-outputs-all.json",
+      "source_json_sha256": "f7e11fe09659db79c24e9f20ae6a6cda166f14eba32154ef0c3646dc6244dfb4",
+      "thread": "01a130bf-a616-7265-8612-e68c19d8800e",
+      "turn": "01a130bf-b377-7421-a994-edc1eb68a7a9",
+      "turn_started_at": 1791819233,
+      "item": "exec-da1270fd-2e7a-49a7-baa9-c8aa58c5aa56",
+      "item_index": 32,
+      "repo_path": "apps/nexusd/src/snapshot_staging_tests.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "staging-tests-outputs-all.json",
+      "source_json_sha256": "f7e11fe09659db79c24e9f20ae6a6cda166f14eba32154ef0c3646dc6244dfb4",
+      "thread": "01a130bf-a616-7265-8612-e68c19d8800e",
+      "turn": "01a130bf-b377-7421-a994-edc1eb68a7a9",
+      "turn_started_at": 1791819233,
+      "item": "exec-1f900333-ded4-46ec-a346-7820a053a69e",
+      "item_index": 37,
+      "repo_path": "apps/nexusd/src/snapshot_staging_tests.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "staging-tests-outputs-all.json",
+      "source_json_sha256": "f7e11fe09659db79c24e9f20ae6a6cda166f14eba32154ef0c3646dc6244dfb4",
+      "thread": "01a130bf-a616-7265-8612-e68c19d8800e",
+      "turn": "01a130bf-b377-7421-a994-edc1eb68a7a9",
+      "turn_started_at": 1791819233,
+      "item": "exec-54f65397-dcd9-4d76-b31d-2f2cd6b8095a",
+      "item_index": 41,
+      "repo_path": "apps/nexusd/src/snapshot_staging_tests.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "staging-tests-outputs-all.json",
+      "source_json_sha256": "f7e11fe09659db79c24e9f20ae6a6cda166f14eba32154ef0c3646dc6244dfb4",
+      "thread": "01a130bf-a616-7265-8612-e68c19d8800e",
+      "turn": "01a130bf-b377-7421-a994-edc1eb68a7a9",
+      "turn_started_at": 1791819233,
+      "item": "exec-776abf20-7714-48fd-8230-c7b469d89e0f",
+      "item_index": 44,
+      "repo_path": "apps/nexusd/src/snapshot_staging_tests.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "staging-tests-outputs-all.json",
+      "source_json_sha256": "f7e11fe09659db79c24e9f20ae6a6cda166f14eba32154ef0c3646dc6244dfb4",
+      "thread": "01a130bf-a616-7265-8612-e68c19d8800e",
+      "turn": "01a130bf-b377-7421-a994-edc1eb68a7a9",
+      "turn_started_at": 1791819233,
+      "item": "exec-022b788b-af4e-4edf-99d3-dc032b5646ef",
+      "item_index": 47,
+      "repo_path": "apps/nexusd/src/snapshot_staging_tests.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "freeze-tests-outputs-all.json",
+      "source_json_sha256": "e96fce89a496ec02055504510dc9c572f86641faa2711d01108ffd77ebdc4f77",
+      "thread": "01a130c0-4c03-70d3-8f7e-4fec99c8601f",
+      "turn": "01a130c0-5979-74e0-a9ae-dd4cc7d4bcd3",
+      "turn_started_at": 1791819275,
+      "item": "exec-bb29459a-a518-4f8e-93f0-d1497e0d496b",
+      "item_index": 17,
+      "repo_path": "crates/nexus-platform-linux/src/directory_publish.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "freeze-tests-outputs-all.json",
+      "source_json_sha256": "e96fce89a496ec02055504510dc9c572f86641faa2711d01108ffd77ebdc4f77",
+      "thread": "01a130c0-4c03-70d3-8f7e-4fec99c8601f",
+      "turn": "01a130c0-5979-74e0-a9ae-dd4cc7d4bcd3",
+      "turn_started_at": 1791819275,
+      "item": "exec-bb29459a-a518-4f8e-93f0-d1497e0d496b",
+      "item_index": 17,
+      "repo_path": "crates/nexus-platform-linux/src/lib.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "freeze-tests-outputs-all.json",
+      "source_json_sha256": "e96fce89a496ec02055504510dc9c572f86641faa2711d01108ffd77ebdc4f77",
+      "thread": "01a130c0-4c03-70d3-8f7e-4fec99c8601f",
+      "turn": "01a130c0-5979-74e0-a9ae-dd4cc7d4bcd3",
+      "turn_started_at": 1791819275,
+      "item": "exec-bb29459a-a518-4f8e-93f0-d1497e0d496b",
+      "item_index": 17,
+      "repo_path": "crates/nexus-workspace/src/snapshot.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "freeze-tests-outputs-all.json",
+      "source_json_sha256": "e96fce89a496ec02055504510dc9c572f86641faa2711d01108ffd77ebdc4f77",
+      "thread": "01a130c0-4c03-70d3-8f7e-4fec99c8601f",
+      "turn": "01a130c0-5979-74e0-a9ae-dd4cc7d4bcd3",
+      "turn_started_at": 1791819275,
+      "item": "exec-d4c4c902-c4eb-4d72-94d4-8feea957caba",
+      "item_index": 19,
+      "repo_path": "crates/nexus-workspace/src/snapshot_bounded_tests.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "freeze-tests-outputs-all.json",
+      "source_json_sha256": "e96fce89a496ec02055504510dc9c572f86641faa2711d01108ffd77ebdc4f77",
+      "thread": "01a130c0-4c03-70d3-8f7e-4fec99c8601f",
+      "turn": "01a130c0-5979-74e0-a9ae-dd4cc7d4bcd3",
+      "turn_started_at": 1791819275,
+      "item": "exec-2967f679-b688-41e7-a525-f9a7584571f4",
+      "item_index": 26,
+      "repo_path": "crates/nexus-platform-linux/src/directory_publish_tests.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "freeze-tests-outputs-all.json",
+      "source_json_sha256": "e96fce89a496ec02055504510dc9c572f86641faa2711d01108ffd77ebdc4f77",
+      "thread": "01a130c0-4c03-70d3-8f7e-4fec99c8601f",
+      "turn": "01a130c0-5979-74e0-a9ae-dd4cc7d4bcd3",
+      "turn_started_at": 1791819275,
+      "item": "exec-2967f679-b688-41e7-a525-f9a7584571f4",
+      "item_index": 26,
+      "repo_path": "crates/nexus-workspace/src/snapshot_bounded_tests.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "freeze-tests-outputs-all.json",
+      "source_json_sha256": "e96fce89a496ec02055504510dc9c572f86641faa2711d01108ffd77ebdc4f77",
+      "thread": "01a130c0-4c03-70d3-8f7e-4fec99c8601f",
+      "turn": "01a130c0-5979-74e0-a9ae-dd4cc7d4bcd3",
+      "turn_started_at": 1791819275,
+      "item": "exec-849d31d4-233c-4d27-85dc-f05779d05cbb",
+      "item_index": 32,
+      "repo_path": "crates/nexus-workspace/src/snapshot_bounded_tests.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "freeze-implementation-outputs-all.json",
+      "source_json_sha256": "2f054100dff053529b53745f00a788e6bc5a84121c850d1bd82f7bb1a1eb1ea7",
+      "thread": "01a134d5-983c-72ea-bd20-633ee2139010",
+      "turn": "01a134d5-a5a4-7537-82b3-eade20f6ca01",
+      "turn_started_at": 1791887780,
+      "item": "exec-8930f5b5-72d4-41b0-ac46-0e3b5af1d090",
+      "item_index": 18,
+      "repo_path": "crates/nexus-workspace/src/snapshot.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "freeze-implementation-outputs-all.json",
+      "source_json_sha256": "2f054100dff053529b53745f00a788e6bc5a84121c850d1bd82f7bb1a1eb1ea7",
+      "thread": "01a134d5-983c-72ea-bd20-633ee2139010",
+      "turn": "01a134d5-a5a4-7537-82b3-eade20f6ca01",
+      "turn_started_at": 1791887780,
+      "item": "exec-aad392fd-acb0-4ce7-9e76-569ec4331283",
+      "item_index": 19,
+      "repo_path": "crates/nexus-platform-linux/src/directory_publish.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "freeze-implementation-outputs-all.json",
+      "source_json_sha256": "2f054100dff053529b53745f00a788e6bc5a84121c850d1bd82f7bb1a1eb1ea7",
+      "thread": "01a134d5-983c-72ea-bd20-633ee2139010",
+      "turn": "01a134d5-a5a4-7537-82b3-eade20f6ca01",
+      "turn_started_at": 1791887780,
+      "item": "exec-2b83d136-f00c-4df1-b5fd-d0b5f521cf7a",
+      "item_index": 29,
+      "repo_path": "crates/nexus-workspace/src/snapshot.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "freeze-implementation-outputs-all.json",
+      "source_json_sha256": "2f054100dff053529b53745f00a788e6bc5a84121c850d1bd82f7bb1a1eb1ea7",
+      "thread": "01a134d5-983c-72ea-bd20-633ee2139010",
+      "turn": "01a134d5-a5a4-7537-82b3-eade20f6ca01",
+      "turn_started_at": 1791887780,
+      "item": "exec-55f4cda8-566a-4a78-bba8-e28683b5c07f",
+      "item_index": 32,
+      "repo_path": "crates/nexus-workspace/src/snapshot.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "freeze-implementation-outputs-all.json",
+      "source_json_sha256": "2f054100dff053529b53745f00a788e6bc5a84121c850d1bd82f7bb1a1eb1ea7",
+      "thread": "01a134d5-983c-72ea-bd20-633ee2139010",
+      "turn": "01a134d5-a5a4-7537-82b3-eade20f6ca01",
+      "turn_started_at": 1791887780,
+      "item": "exec-5a9a05b9-ded1-47a9-ab2f-3c452b8c2e72",
+      "item_index": 33,
+      "repo_path": "crates/nexus-platform-linux/src/directory_publish.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "cli-implementation-outputs-all.json",
+      "source_json_sha256": "51e4b693944050e550049f608a5dbddcdfd61408497fbb321e11190737147b8f",
+      "thread": "01a14265-9c17-7477-a4ed-92579eb26083",
+      "turn": "01a14265-a68e-7199-be9f-a0ec545cc6d2",
+      "turn_started_at": 1792115321,
+      "item": "exec-36b4f7b7-b2f8-4c4a-9248-516fc9cc048c",
+      "item_index": 38,
+      "repo_path": "apps/nexusd/tests/n3_snapshot_staging_binary.py",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "cli-implementation-outputs-all.json",
+      "source_json_sha256": "51e4b693944050e550049f608a5dbddcdfd61408497fbb321e11190737147b8f",
+      "thread": "01a14265-9c17-7477-a4ed-92579eb26083",
+      "turn": "01a14272-4f52-74e5-a836-259889cf404c",
+      "turn_started_at": 1792116150,
+      "item": "exec-8f17863d-385c-46dc-9968-ce9f59169be3",
+      "item_index": 3,
+      "repo_path": "apps/nexus/src/n3_acceptance.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "cli-implementation-outputs-all.json",
+      "source_json_sha256": "51e4b693944050e550049f608a5dbddcdfd61408497fbb321e11190737147b8f",
+      "thread": "01a14265-9c17-7477-a4ed-92579eb26083",
+      "turn": "01a14272-4f52-74e5-a836-259889cf404c",
+      "turn_started_at": 1792116150,
+      "item": "exec-e39a06a0-4e8b-4c68-b73d-52a957149c98",
+      "item_index": 11,
+      "repo_path": "apps/nexus/src/task_localapi.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "cli-implementation-outputs-all.json",
+      "source_json_sha256": "51e4b693944050e550049f608a5dbddcdfd61408497fbb321e11190737147b8f",
+      "thread": "01a14265-9c17-7477-a4ed-92579eb26083",
+      "turn": "01a14272-4f52-74e5-a836-259889cf404c",
+      "turn_started_at": 1792116150,
+      "item": "exec-06966d56-cc0c-4960-b038-f24738235976",
+      "item_index": 13,
+      "repo_path": "apps/nexus/src/lib.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "cli-implementation-outputs-all.json",
+      "source_json_sha256": "51e4b693944050e550049f608a5dbddcdfd61408497fbb321e11190737147b8f",
+      "thread": "01a14265-9c17-7477-a4ed-92579eb26083",
+      "turn": "01a14272-4f52-74e5-a836-259889cf404c",
+      "turn_started_at": 1792116150,
+      "item": "exec-06966d56-cc0c-4960-b038-f24738235976",
+      "item_index": 13,
+      "repo_path": "apps/nexus/src/main.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "cli-implementation-outputs-all.json",
+      "source_json_sha256": "51e4b693944050e550049f608a5dbddcdfd61408497fbb321e11190737147b8f",
+      "thread": "01a14265-9c17-7477-a4ed-92579eb26083",
+      "turn": "01a14272-4f52-74e5-a836-259889cf404c",
+      "turn_started_at": 1792116150,
+      "item": "exec-06966d56-cc0c-4960-b038-f24738235976",
+      "item_index": 13,
+      "repo_path": "apps/nexus/src/snapshot_cli.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "cli-implementation-outputs-all.json",
+      "source_json_sha256": "51e4b693944050e550049f608a5dbddcdfd61408497fbb321e11190737147b8f",
+      "thread": "01a14265-9c17-7477-a4ed-92579eb26083",
+      "turn": "01a14272-4f52-74e5-a836-259889cf404c",
+      "turn_started_at": 1792116150,
+      "item": "exec-1767739b-4345-4326-959a-8d4e97ca7b6a",
+      "item_index": 19,
+      "repo_path": "apps/nexus/src/snapshot_cli/linux.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "cli-implementation-outputs-all.json",
+      "source_json_sha256": "51e4b693944050e550049f608a5dbddcdfd61408497fbb321e11190737147b8f",
+      "thread": "01a14265-9c17-7477-a4ed-92579eb26083",
+      "turn": "01a14272-4f52-74e5-a836-259889cf404c",
+      "turn_started_at": 1792116150,
+      "item": "exec-1aa6225f-f445-4d7e-b8b3-ad64fea9c7a6",
+      "item_index": 22,
+      "repo_path": "apps/nexus/src/snapshot_cli.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "cli-implementation-outputs-all.json",
+      "source_json_sha256": "51e4b693944050e550049f608a5dbddcdfd61408497fbb321e11190737147b8f",
+      "thread": "01a14265-9c17-7477-a4ed-92579eb26083",
+      "turn": "01a14272-4f52-74e5-a836-259889cf404c",
+      "turn_started_at": 1792116150,
+      "item": "exec-1aa6225f-f445-4d7e-b8b3-ad64fea9c7a6",
+      "item_index": 22,
+      "repo_path": "apps/nexus/src/snapshot_cli/linux.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "cli-implementation-outputs-all.json",
+      "source_json_sha256": "51e4b693944050e550049f608a5dbddcdfd61408497fbb321e11190737147b8f",
+      "thread": "01a14265-9c17-7477-a4ed-92579eb26083",
+      "turn": "01a14272-4f52-74e5-a836-259889cf404c",
+      "turn_started_at": 1792116150,
+      "item": "exec-01db2b93-e8d0-488d-a48d-69e44bf31a70",
+      "item_index": 30,
+      "repo_path": "apps/nexus/src/main.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "cli-implementation-outputs-all.json",
+      "source_json_sha256": "51e4b693944050e550049f608a5dbddcdfd61408497fbb321e11190737147b8f",
+      "thread": "01a14265-9c17-7477-a4ed-92579eb26083",
+      "turn": "01a14272-4f52-74e5-a836-259889cf404c",
+      "turn_started_at": 1792116150,
+      "item": "exec-01db2b93-e8d0-488d-a48d-69e44bf31a70",
+      "item_index": 30,
+      "repo_path": "apps/nexus/src/n3_acceptance.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "cli-implementation-outputs-all.json",
+      "source_json_sha256": "51e4b693944050e550049f608a5dbddcdfd61408497fbb321e11190737147b8f",
+      "thread": "01a14265-9c17-7477-a4ed-92579eb26083",
+      "turn": "01a14272-4f52-74e5-a836-259889cf404c",
+      "turn_started_at": 1792116150,
+      "item": "exec-01db2b93-e8d0-488d-a48d-69e44bf31a70",
+      "item_index": 30,
+      "repo_path": "apps/nexus/src/snapshot_cli/linux.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "cli-implementation-outputs-all.json",
+      "source_json_sha256": "51e4b693944050e550049f608a5dbddcdfd61408497fbb321e11190737147b8f",
+      "thread": "01a14265-9c17-7477-a4ed-92579eb26083",
+      "turn": "01a14272-4f52-74e5-a836-259889cf404c",
+      "turn_started_at": 1792116150,
+      "item": "exec-a5d3029a-2903-40fa-b46c-a932ee0e946f",
+      "item_index": 36,
+      "repo_path": "apps/nexus/src/n3_acceptance.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "cli-implementation-outputs-all.json",
+      "source_json_sha256": "51e4b693944050e550049f608a5dbddcdfd61408497fbb321e11190737147b8f",
+      "thread": "01a14265-9c17-7477-a4ed-92579eb26083",
+      "turn": "01a1439e-60c6-7053-82d1-3893b07bd043",
+      "turn_started_at": 1792135816,
+      "item": "exec-930d87c4-5bb8-4ba3-9797-642f0653e633",
+      "item_index": 12,
+      "repo_path": "apps/nexus/src/snapshot_cli.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "cli-implementation-outputs-all.json",
+      "source_json_sha256": "51e4b693944050e550049f608a5dbddcdfd61408497fbb321e11190737147b8f",
+      "thread": "01a14265-9c17-7477-a4ed-92579eb26083",
+      "turn": "01a1439e-60c6-7053-82d1-3893b07bd043",
+      "turn_started_at": 1792135816,
+      "item": "exec-76d906df-48c9-49a5-8523-7f495fac22cf",
+      "item_index": 30,
+      "repo_path": "apps/nexus/src/snapshot_cli.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "cli-implementation-outputs-all.json",
+      "source_json_sha256": "51e4b693944050e550049f608a5dbddcdfd61408497fbb321e11190737147b8f",
+      "thread": "01a14265-9c17-7477-a4ed-92579eb26083",
+      "turn": "01a1439e-60c6-7053-82d1-3893b07bd043",
+      "turn_started_at": 1792135816,
+      "item": "exec-76d906df-48c9-49a5-8523-7f495fac22cf",
+      "item_index": 30,
+      "repo_path": "apps/nexus/src/snapshot_cli/linux.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "cli-implementation-outputs-all.json",
+      "source_json_sha256": "51e4b693944050e550049f608a5dbddcdfd61408497fbb321e11190737147b8f",
+      "thread": "01a14265-9c17-7477-a4ed-92579eb26083",
+      "turn": "01a1439e-60c6-7053-82d1-3893b07bd043",
+      "turn_started_at": 1792135816,
+      "item": "exec-3fbb1c90-d07f-4704-a555-de1b9653be41",
+      "item_index": 34,
+      "repo_path": "apps/nexus/src/snapshot_cli.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "cli-implementation-outputs-all.json",
+      "source_json_sha256": "51e4b693944050e550049f608a5dbddcdfd61408497fbb321e11190737147b8f",
+      "thread": "01a14265-9c17-7477-a4ed-92579eb26083",
+      "turn": "01a1439e-60c6-7053-82d1-3893b07bd043",
+      "turn_started_at": 1792135816,
+      "item": "exec-3fbb1c90-d07f-4704-a555-de1b9653be41",
+      "item_index": 34,
+      "repo_path": "apps/nexus/src/task_localapi.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "staging-r8-outputs-all.json",
+      "source_json_sha256": "b1de36fb547d4f4182e611216b9df9107c5e971114522a823455a7e431465587",
+      "thread": "01a14265-e6b7-75a4-9de8-1f10f4a37083",
+      "turn": "01a14265-f0c0-753b-a5a2-955db5b3528e",
+      "turn_started_at": 1792115340,
+      "item": "exec-4f8bfcf6-60c3-4fd3-9234-3bcb48957e06",
+      "item_index": 29,
+      "repo_path": "apps/nexusd/src/snapshot_staging_tests/authority.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "staging-r8-outputs-all.json",
+      "source_json_sha256": "b1de36fb547d4f4182e611216b9df9107c5e971114522a823455a7e431465587",
+      "thread": "01a14265-e6b7-75a4-9de8-1f10f4a37083",
+      "turn": "01a14273-07d3-748d-9a50-11377d8a29a9",
+      "turn_started_at": 1792116198,
+      "item": "exec-9726104f-9a26-4671-bbb9-5db04dc00ba6",
+      "item_index": 16,
+      "repo_path": "apps/nexusd/src/snapshot_staging.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "staging-r8-outputs-all.json",
+      "source_json_sha256": "b1de36fb547d4f4182e611216b9df9107c5e971114522a823455a7e431465587",
+      "thread": "01a14265-e6b7-75a4-9de8-1f10f4a37083",
+      "turn": "01a14273-07d3-748d-9a50-11377d8a29a9",
+      "turn_started_at": 1792116198,
+      "item": "exec-ee2c1384-1a08-457e-9106-77911282f785",
+      "item_index": 23,
+      "repo_path": "apps/nexusd/src/snapshot_staging_tests/authority.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "staging-r8-outputs-all.json",
+      "source_json_sha256": "b1de36fb547d4f4182e611216b9df9107c5e971114522a823455a7e431465587",
+      "thread": "01a14265-e6b7-75a4-9de8-1f10f4a37083",
+      "turn": "01a14273-07d3-748d-9a50-11377d8a29a9",
+      "turn_started_at": 1792116198,
+      "item": "exec-80166f35-0e6a-4cee-8936-7e60a7dafb91",
+      "item_index": 35,
+      "repo_path": "apps/nexusd/src/snapshot_staging.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "staging-r8-outputs-all.json",
+      "source_json_sha256": "b1de36fb547d4f4182e611216b9df9107c5e971114522a823455a7e431465587",
+      "thread": "01a14265-e6b7-75a4-9de8-1f10f4a37083",
+      "turn": "01a14273-07d3-748d-9a50-11377d8a29a9",
+      "turn_started_at": 1792116198,
+      "item": "exec-d8659f57-6442-49ec-9343-cdd4c55e8826",
+      "item_index": 43,
+      "repo_path": "apps/nexusd/src/snapshot_staging_tests/pressure.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "daemon-plan-outputs-all.json",
+      "source_json_sha256": "0caf77203fa62e500644312db2d2e174fb299ab11b29cdc9d8b08416f3d000de",
+      "thread": "01a14273-730f-7702-88bb-e1bc0829d090",
+      "turn": "01a14273-7d05-7507-a010-0da27147a10b",
+      "turn_started_at": 1792116228,
+      "item": "exec-f5dfe37d-0d69-4432-b64c-512e944302d5",
+      "item_index": 48,
+      "repo_path": "apps/nexusd/src/lib.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "daemon-plan-outputs-all.json",
+      "source_json_sha256": "0caf77203fa62e500644312db2d2e174fb299ab11b29cdc9d8b08416f3d000de",
+      "thread": "01a14273-730f-7702-88bb-e1bc0829d090",
+      "turn": "01a14273-7d05-7507-a010-0da27147a10b",
+      "turn_started_at": 1792116228,
+      "item": "exec-f5dfe37d-0d69-4432-b64c-512e944302d5",
+      "item_index": 48,
+      "repo_path": "apps/nexusd/src/snapshot_service.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "daemon-plan-outputs-all.json",
+      "source_json_sha256": "0caf77203fa62e500644312db2d2e174fb299ab11b29cdc9d8b08416f3d000de",
+      "thread": "01a14273-730f-7702-88bb-e1bc0829d090",
+      "turn": "01a14273-7d05-7507-a010-0da27147a10b",
+      "turn_started_at": 1792116228,
+      "item": "exec-d4813299-c32a-46e5-b338-bd053919ccac",
+      "item_index": 49,
+      "repo_path": "apps/nexusd/src/task_http.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "daemon-plan-outputs-all.json",
+      "source_json_sha256": "0caf77203fa62e500644312db2d2e174fb299ab11b29cdc9d8b08416f3d000de",
+      "thread": "01a14273-730f-7702-88bb-e1bc0829d090",
+      "turn": "01a14273-7d05-7507-a010-0da27147a10b",
+      "turn_started_at": 1792116228,
+      "item": "exec-3f213e2e-ad4c-479e-a628-93e507150787",
+      "item_index": 51,
+      "repo_path": "apps/nexusd/src/task_http.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "daemon-plan-outputs-all.json",
+      "source_json_sha256": "0caf77203fa62e500644312db2d2e174fb299ab11b29cdc9d8b08416f3d000de",
+      "thread": "01a14273-730f-7702-88bb-e1bc0829d090",
+      "turn": "01a14273-7d05-7507-a010-0da27147a10b",
+      "turn_started_at": 1792116228,
+      "item": "exec-f3e4a6e1-c193-46ca-b640-f5f9573d002c",
+      "item_index": 53,
+      "repo_path": "apps/nexusd/src/main.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "daemon-plan-outputs-all.json",
+      "source_json_sha256": "0caf77203fa62e500644312db2d2e174fb299ab11b29cdc9d8b08416f3d000de",
+      "thread": "01a14273-730f-7702-88bb-e1bc0829d090",
+      "turn": "01a14273-7d05-7507-a010-0da27147a10b",
+      "turn_started_at": 1792116228,
+      "item": "exec-8136550a-aa5a-4e33-880c-f5df2cff0dcc",
+      "item_index": 55,
+      "repo_path": "apps/nexusd/src/task_provider_command.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "daemon-plan-outputs-all.json",
+      "source_json_sha256": "0caf77203fa62e500644312db2d2e174fb299ab11b29cdc9d8b08416f3d000de",
+      "thread": "01a14273-730f-7702-88bb-e1bc0829d090",
+      "turn": "01a14273-7d05-7507-a010-0da27147a10b",
+      "turn_started_at": 1792116228,
+      "item": "exec-6dd25711-58d1-4113-aacb-7b3fdd099a5b",
+      "item_index": 64,
+      "repo_path": "apps/nexusd/src/task_provider_command.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "cli-fix-outputs-all.json",
+      "source_json_sha256": "3dfa15599df1ea31d29dcb3768dfe409662295b76b2a2d5e68d873da4229fa85",
+      "thread": "01a147bc-e18c-7017-92f6-a3490fdc30a1",
+      "turn": "01a147bc-ece7-72b1-97c9-5c026bd70960",
+      "turn_started_at": 1792204926,
+      "item": "exec-f9eb0cb8-b6ac-4dd8-a1ff-4ea962bcb398",
+      "item_index": 29,
+      "repo_path": "apps/nexus/src/n3_acceptance.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "cli-fix-outputs-all.json",
+      "source_json_sha256": "3dfa15599df1ea31d29dcb3768dfe409662295b76b2a2d5e68d873da4229fa85",
+      "thread": "01a147bc-e18c-7017-92f6-a3490fdc30a1",
+      "turn": "01a147bc-ece7-72b1-97c9-5c026bd70960",
+      "turn_started_at": 1792204926,
+      "item": "exec-f9eb0cb8-b6ac-4dd8-a1ff-4ea962bcb398",
+      "item_index": 29,
+      "repo_path": "apps/nexus/src/snapshot_cli/linux.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "staging-io-outputs-all.json",
+      "source_json_sha256": "a8b35d51e6a15298b181ccd61b65ae95ed43d08dbed974f45d3f0f7b39148761",
+      "thread": "01a147bd-ffb2-7349-aaae-891d104930be",
+      "turn": "01a147c2-2efa-7511-b8b1-8406389d2ee3",
+      "turn_started_at": 1792205271,
+      "item": "exec-856e72ab-61d4-4ac2-bb14-3f60b395c860",
+      "item_index": 14,
+      "repo_path": "apps/nexusd/src/snapshot_staging/io.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "staging-io-outputs-all.json",
+      "source_json_sha256": "a8b35d51e6a15298b181ccd61b65ae95ed43d08dbed974f45d3f0f7b39148761",
+      "thread": "01a147bd-ffb2-7349-aaae-891d104930be",
+      "turn": "01a147c2-2efa-7511-b8b1-8406389d2ee3",
+      "turn_started_at": 1792205271,
+      "item": "exec-fde0b88e-08e7-47df-ad0a-7935b00ddefb",
+      "item_index": 25,
+      "repo_path": "apps/nexusd/src/snapshot_staging/io.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "staging-io-outputs-all.json",
+      "source_json_sha256": "a8b35d51e6a15298b181ccd61b65ae95ed43d08dbed974f45d3f0f7b39148761",
+      "thread": "01a147bd-ffb2-7349-aaae-891d104930be",
+      "turn": "01a147c2-2efa-7511-b8b1-8406389d2ee3",
+      "turn_started_at": 1792205271,
+      "item": "exec-2512d403-eea7-4c78-9d58-95bef5b06642",
+      "item_index": 36,
+      "repo_path": "apps/nexusd/src/snapshot_staging/io.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "n313-contract-author.json",
+      "source_json_sha256": "a8ff26a07f98e3ae7654604548621e6cea2b8280fc44333772e216d26c7fd8da",
+      "thread": "01a14e48-f259-7173-892b-e7ad4396f0b8",
+      "turn": "01a14e48-fd01-74ec-9756-9e6328c12a89",
+      "turn_started_at": 1792314769,
+      "item": "exec-154e00f7-2400-4c0e-ae97-2e31f1903623",
+      "item_index": 26,
+      "repo_path": "docs/N3-13-REMOTE-TASK-CONTRACT.md",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "n313-contract-author.json",
+      "source_json_sha256": "a8ff26a07f98e3ae7654604548621e6cea2b8280fc44333772e216d26c7fd8da",
+      "thread": "01a14e48-f259-7173-892b-e7ad4396f0b8",
+      "turn": "01a14e48-fd01-74ec-9756-9e6328c12a89",
+      "turn_started_at": 1792314769,
+      "item": "exec-fd511c8c-c61b-4646-98ef-33e713aebedf",
+      "item_index": 31,
+      "repo_path": "docs/N3-13-REMOTE-TASK-CONTRACT.md",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "n311-lease-tests-latest.json",
+      "source_json_sha256": "40826cd8a4ea6a66b9eef2e62a422791d70ed2f04c880eae5b0874fd524f672a",
+      "thread": "01a151c2-b4cc-741e-8161-c93e4e22c085",
+      "turn": "01a151c2-c054-741f-a292-fc4bb7444122",
+      "turn_started_at": 1792373080,
+      "item": "exec-2bbc33f4-5f10-4d77-8367-2eec6cfcfeee",
+      "item_index": 19,
+      "repo_path": "apps/nexusd/src/task_provider_init_io.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "n311-lease-tests-latest.json",
+      "source_json_sha256": "40826cd8a4ea6a66b9eef2e62a422791d70ed2f04c880eae5b0874fd524f672a",
+      "thread": "01a151c2-b4cc-741e-8161-c93e4e22c085",
+      "turn": "01a151cb-db57-739a-a875-bad6a5e1763a",
+      "turn_started_at": 1792373677,
+      "item": "exec-429725f4-73be-4156-b89a-64a7e2e213cc",
+      "item_index": 5,
+      "repo_path": "apps/nexusd/src/task_provider_init_io.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "n313-contract-latest.json",
+      "source_json_sha256": "d2e533bc3d448482da94f4742e4b7b795fa57cfdcd7c5cc96bee7e93a39b6856",
+      "thread": "01a1530d-5a51-71ec-9ac1-3eb5ae566097",
+      "turn": "01a1530d-66d5-7096-8d58-ce2af7148236",
+      "turn_started_at": 1792394750,
+      "item": "exec-f3b296cd-2dfc-4e55-a3da-a58ef23429ca",
+      "item_index": 26,
+      "repo_path": "docs/N3-13A-BOUNDED-MTLS-CONTRACT-DRAFT.md",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "n313-contract-latest.json",
+      "source_json_sha256": "d2e533bc3d448482da94f4742e4b7b795fa57cfdcd7c5cc96bee7e93a39b6856",
+      "thread": "01a1530d-5a51-71ec-9ac1-3eb5ae566097",
+      "turn": "01a1533e-9e12-7458-b4fc-833d1cf1ca98",
+      "turn_started_at": 1792397975,
+      "item": "exec-bfc7bdc7-2463-498e-98d8-81ab0f026a16",
+      "item_index": 18,
+      "repo_path": "docs/N3-13A-BOUNDED-MTLS-CONTRACT-DRAFT.md",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "n313-contract-latest.json",
+      "source_json_sha256": "d2e533bc3d448482da94f4742e4b7b795fa57cfdcd7c5cc96bee7e93a39b6856",
+      "thread": "01a1530d-5a51-71ec-9ac1-3eb5ae566097",
+      "turn": "01a1533e-9e12-7458-b4fc-833d1cf1ca98",
+      "turn_started_at": 1792397975,
+      "item": "exec-09bfe314-7e3e-442f-9475-465404681845",
+      "item_index": 28,
+      "repo_path": "docs/N3-13A-BOUNDED-MTLS-CONTRACT-DRAFT.md",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "n313-contract-latest.json",
+      "source_json_sha256": "d2e533bc3d448482da94f4742e4b7b795fa57cfdcd7c5cc96bee7e93a39b6856",
+      "thread": "01a1530d-5a51-71ec-9ac1-3eb5ae566097",
+      "turn": "01a15495-6ded-71ec-be01-3c0e35472175",
+      "turn_started_at": 1792420442,
+      "item": "exec-95793a46-9e89-4853-b351-9a7465f31ecf",
+      "item_index": 4,
+      "repo_path": "docs/N3-13A-BOUNDED-MTLS-CONTRACT-DRAFT.md",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "n313-contract-latest.json",
+      "source_json_sha256": "d2e533bc3d448482da94f4742e4b7b795fa57cfdcd7c5cc96bee7e93a39b6856",
+      "thread": "01a1530d-5a51-71ec-9ac1-3eb5ae566097",
+      "turn": "01a15495-6ded-71ec-be01-3c0e35472175",
+      "turn_started_at": 1792420442,
+      "item": "exec-c7a887c2-9ac7-4978-b029-f207ad6b9ba0",
+      "item_index": 10,
+      "repo_path": "docs/N3-13A-BOUNDED-MTLS-CONTRACT-DRAFT.md",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "n313-contract-latest.json",
+      "source_json_sha256": "d2e533bc3d448482da94f4742e4b7b795fa57cfdcd7c5cc96bee7e93a39b6856",
+      "thread": "01a1530d-5a51-71ec-9ac1-3eb5ae566097",
+      "turn": "01a154a4-3d10-757e-b494-e370a63bc77b",
+      "turn_started_at": 1792421413,
+      "item": "exec-bc49822d-6190-45b0-b50e-ff74b0b47ad1",
+      "item_index": 24,
+      "repo_path": "docs/N3-13A-BOUNDED-MTLS-CONTRACT-DRAFT.md",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "n313-contract-latest.json",
+      "source_json_sha256": "d2e533bc3d448482da94f4742e4b7b795fa57cfdcd7c5cc96bee7e93a39b6856",
+      "thread": "01a1530d-5a51-71ec-9ac1-3eb5ae566097",
+      "turn": "01a154a4-3d10-757e-b494-e370a63bc77b",
+      "turn_started_at": 1792421413,
+      "item": "exec-65e3dc64-1f26-4af7-a4b8-913127ea88d8",
+      "item_index": 28,
+      "repo_path": "docs/N3-13A-BOUNDED-MTLS-CONTRACT-DRAFT.md",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "n312-expiry-tests-latest.json",
+      "source_json_sha256": "03fc90ddcf568568defacd86a4c000d943cac0a192bb05abc7a223da071fd68f",
+      "thread": "01a15320-948f-7419-b6a2-3917084430b0",
+      "turn": "01a15320-a005-7120-bcfe-7977118e05d4",
+      "turn_started_at": 1792396010,
+      "item": "exec-547abae6-4ef1-463e-b147-ad443ec2b434",
+      "item_index": 28,
+      "repo_path": "apps/nexusd/src/snapshot_staging.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "n312-expiry-tests-latest.json",
+      "source_json_sha256": "03fc90ddcf568568defacd86a4c000d943cac0a192bb05abc7a223da071fd68f",
+      "thread": "01a15320-948f-7419-b6a2-3917084430b0",
+      "turn": "01a15320-a005-7120-bcfe-7977118e05d4",
+      "turn_started_at": 1792396010,
+      "item": "exec-547abae6-4ef1-463e-b147-ad443ec2b434",
+      "item_index": 28,
+      "repo_path": "apps/nexusd/src/snapshot_staging_expiry_tests.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "n312-expiry-tests-latest.json",
+      "source_json_sha256": "03fc90ddcf568568defacd86a4c000d943cac0a192bb05abc7a223da071fd68f",
+      "thread": "01a15320-948f-7419-b6a2-3917084430b0",
+      "turn": "01a15320-a005-7120-bcfe-7977118e05d4",
+      "turn_started_at": 1792396010,
+      "item": "exec-d0642f61-bba9-4bbe-b7e9-c5f04cdebc54",
+      "item_index": 57,
+      "repo_path": "apps/nexusd/src/snapshot_staging_expiry_tests.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "n312-expiry-tests-latest.json",
+      "source_json_sha256": "03fc90ddcf568568defacd86a4c000d943cac0a192bb05abc7a223da071fd68f",
+      "thread": "01a15320-948f-7419-b6a2-3917084430b0",
+      "turn": "01a1532c-3f6d-7403-9baa-2c3358825ca3",
+      "turn_started_at": 1792396771,
+      "item": "exec-7eb2bc15-38b6-47c2-9f18-b54f1ff521bd",
+      "item_index": 5,
+      "repo_path": "apps/nexusd/src/snapshot_staging_expiry_tests.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    },
+    {
+      "source_json": "n312-expiry-tests-latest.json",
+      "source_json_sha256": "03fc90ddcf568568defacd86a4c000d943cac0a192bb05abc7a223da071fd68f",
+      "thread": "01a15320-948f-7419-b6a2-3917084430b0",
+      "turn": "01a1532c-3f6d-7403-9baa-2c3358825ca3",
+      "turn_started_at": 1792396771,
+      "item": "exec-2e074291-82d9-4876-89d8-61cc598164ce",
+      "item_index": 10,
+      "repo_path": "apps/nexusd/src/snapshot_staging_expiry_tests.rs",
+      "reason": "fileChange has no original diff/patch payload; ancestor invalidated"
+    }
+  ],
+  "n312_source_complete": false,
+  "frozen_tests_complete": false,
+  "contains_raw_history": false,
+  "original_local_manifest_sha256": "f3f3c2c8a5ecad330b542cf4fb7051e69c1e73d84fba27d2e55797d465a13f72",
+  "archive_note": "Source-only recovery evidence; .txt payloads are excluded from active Rust/Python/scenario discovery. Historical exactness does not establish Oct19 final-source equivalence or current product qualification."
+}

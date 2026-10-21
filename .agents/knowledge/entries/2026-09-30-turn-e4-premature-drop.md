@@ -28,8 +28,15 @@ task_type: feature
 - 小包能过是因为数据量小，driver 在 app 线程退出前已 pump 完（竞态恰好赢）。
 - 加 instrumentation“修复”了它，纯粹是时序扰动改变了竞态结果（heisenbug）。
 
-对比：`basic.rs` 的 B 线程在 echo 后还要收 100 个 datagram，意外地保持了
-连接存活，所以一直没暴露这个问题。
+对比：`basic.rs` 的 B 线程在 echo 后还要收 100 个 datagram，曾意外地保持
+连接存活。2026-10-20 补充：若这些 datagram 已缓存，接收循环可立即结束，
+仍不能证明反方向 echo/FIN 已交付。应显式保留 listener/connection owner，
+直到客户端读完完整回显与 EOF，并在客户端失败时也消费 server JoinHandle。
+早期建连失败还需要有界 accept，避免持有 owner 后永远等不到 server join。
+
+也不能把接收全部数据报当作生命周期屏障：S5 允许丢包，正式 basic 场景只要求
+至少收到一个有效 200B 包。收到首个有效包即可结束该检查，回显交付由独立 owner
+保证；没有有效包时不得报告成功。回归应同时覆盖部分丢失和错误长度输入。
 
 ## 解决方案
 

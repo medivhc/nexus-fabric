@@ -1,0 +1,409 @@
+{
+  "schema_version": 1,
+  "recorded_at_utc": "2026-10-21T03:35:01.075233+00:00",
+  "task_type": "bugfix recovery + docs",
+  "source_code_revision": "dbb511a41023f207f7eada9bda5287286abd33ca",
+  "branch": "feat/n3-restored-code-20261020",
+  "records": {
+    "check": {
+      "result": {
+        "command": "check",
+        "gates": [
+          {
+            "detail": "no whitespace errors",
+            "name": "whitespace",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "ok",
+            "name": "format",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "ok",
+            "name": "check",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "ok",
+            "name": "clippy",
+            "verdict": "PASS"
+          }
+        ],
+        "message": "check: 4 gate(s) passed",
+        "schema_version": 1,
+        "verdict": "PASS"
+      },
+      "record_sha256": "7c25517f87d64dc475677de628cd92b25f877f115e70e1ae4564b53ec62ffff5"
+    },
+    "affected": {
+      "result": {
+        "command": "test",
+        "gates": [
+          {
+            "detail": "tested: nexus, nexus-compute, nexus-control-api, nexus-network, nexus-platform-host, nexus-platform-linux, nexus-workspace, nexus-workspace-intel, nexusd",
+            "name": "affected-tests",
+            "verdict": "PASS"
+          }
+        ],
+        "message": "tested: nexus, nexus-compute, nexus-control-api, nexus-network, nexus-platform-host, nexus-platform-linux, nexus-workspace, nexus-workspace-intel, nexusd",
+        "schema_version": 1,
+        "verdict": "PASS"
+      },
+      "record_sha256": "27a63d09f2638af6d869759cdc4af3efca34b969fbfddcd9901e1cc897c7e8a3"
+    },
+    "precommit_fast": {
+      "result": {
+        "command": "verify",
+        "evidence": {
+          "bindings": {
+            "configuration_digest": "d0ace8009728a7dc482e5d9ca03ceb8f4945ef3a",
+            "contract_hash": "3eab703cb6a7f74ce25959edadcf45a926238301",
+            "dirty_state": true,
+            "feature_set": [
+              "workspace:default"
+            ],
+            "harness_schema_version": 1,
+            "platform_capability_digest": "711a114fe73b9bf0c371c2a2809389611af3ba8a",
+            "source_revision": "731e659a49068d56c580ce8e7e986d1c333592fc",
+            "target_triple": "x86_64-unknown-linux-gnu",
+            "toolchain_version": "1.98.1",
+            "working_tree_digest": "4de4413e3d2209b2b1f6f743e65851dfc840db7c"
+          },
+          "dir": "verify-n311-restore20-e6d40284b7f3",
+          "id": "n311-restore20-e6d40284b7f3",
+          "verdict": "PASS"
+        },
+        "gates": [
+          {
+            "detail": "no whitespace errors",
+            "name": "whitespace",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "ok",
+            "name": "format",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "ok",
+            "name": "check",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "ok",
+            "name": "clippy",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "49 crates declared",
+            "name": "architecture-policy",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "cargo-deny: advisories/licenses/bans/sources PASS",
+            "name": "dependency-governance",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "4 crate(s) [[\"nexus-registry\", \"nexus-planner\", \"nexus-session\", \"nexus-auth\"]], 6 file(s): no resource-type-specialized branches",
+            "name": "resource-type-neutrality",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "tested: nexus, nexus-compute, nexus-control-api, nexus-network, nexus-platform-host, nexus-platform-linux, nexus-workspace, nexus-workspace-intel, nexusd",
+            "name": "affected-tests",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "ok",
+            "name": "selected-properties",
+            "verdict": "PASS"
+          }
+        ],
+        "message": "fast verify: 9 gates, 9 pass, 0 fail, 0 unknown",
+        "schema_version": 1,
+        "verdict": "PASS"
+      },
+      "record_sha256": "da3a248399191536d7f557ee55136493da56546ba1fdecbca63d91ff42c7ce9b"
+    },
+    "postcommit_fast": {
+      "result": {
+        "command": "verify",
+        "evidence": {
+          "bindings": {
+            "configuration_digest": "d0ace8009728a7dc482e5d9ca03ceb8f4945ef3a",
+            "contract_hash": "3eab703cb6a7f74ce25959edadcf45a926238301",
+            "dirty_state": false,
+            "feature_set": [
+              "workspace:default"
+            ],
+            "harness_schema_version": 1,
+            "platform_capability_digest": "711a114fe73b9bf0c371c2a2809389611af3ba8a",
+            "source_revision": "dbb511a41023f207f7eada9bda5287286abd33ca",
+            "target_triple": "x86_64-unknown-linux-gnu",
+            "toolchain_version": "1.98.1",
+            "working_tree_digest": "bf8ef395d02e6e781e629013f9cc727f2edf4af4"
+          },
+          "dir": "verify-n311-restore20-9ed6830eaa6f",
+          "id": "n311-restore20-9ed6830eaa6f",
+          "verdict": "PASS"
+        },
+        "gates": [
+          {
+            "detail": "no whitespace errors",
+            "name": "whitespace",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "ok",
+            "name": "format",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "ok",
+            "name": "check",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "ok",
+            "name": "clippy",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "49 crates declared",
+            "name": "architecture-policy",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "cargo-deny: advisories/licenses/bans/sources PASS",
+            "name": "dependency-governance",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "4 crate(s) [[\"nexus-registry\", \"nexus-planner\", \"nexus-session\", \"nexus-auth\"]], 6 file(s): no resource-type-specialized branches",
+            "name": "resource-type-neutrality",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "no affected crates changed",
+            "name": "affected-tests",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "ok",
+            "name": "selected-properties",
+            "verdict": "PASS"
+          }
+        ],
+        "message": "fast verify: 9 gates, 9 pass, 0 fail, 0 unknown",
+        "schema_version": 1,
+        "verdict": "PASS"
+      },
+      "record_sha256": "2bf8b5f29c6183243b8305f00ee1acdd41d7759628828533f91e74045be1b1cc"
+    },
+    "publication_fast": {
+      "result": {
+        "command": "verify",
+        "evidence": {
+          "bindings": {
+            "configuration_digest": "d0ace8009728a7dc482e5d9ca03ceb8f4945ef3a",
+            "contract_hash": "3eab703cb6a7f74ce25959edadcf45a926238301",
+            "dirty_state": false,
+            "feature_set": [
+              "workspace:default"
+            ],
+            "harness_schema_version": 1,
+            "platform_capability_digest": "711a114fe73b9bf0c371c2a2809389611af3ba8a",
+            "source_revision": "dbb511a41023f207f7eada9bda5287286abd33ca",
+            "target_triple": "x86_64-unknown-linux-gnu",
+            "toolchain_version": "1.98.1",
+            "working_tree_digest": "bf8ef395d02e6e781e629013f9cc727f2edf4af4"
+          },
+          "dir": "verify-n311-restore20-9ed6830eaa6f",
+          "id": "n311-restore20-9ed6830eaa6f",
+          "verdict": "PASS"
+        },
+        "gates": [
+          {
+            "detail": "no whitespace errors",
+            "name": "whitespace",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "ok",
+            "name": "format",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "ok",
+            "name": "check",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "ok",
+            "name": "clippy",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "49 crates declared",
+            "name": "architecture-policy",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "cargo-deny: advisories/licenses/bans/sources PASS",
+            "name": "dependency-governance",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "4 crate(s) [[\"nexus-registry\", \"nexus-planner\", \"nexus-session\", \"nexus-auth\"]], 6 file(s): no resource-type-specialized branches",
+            "name": "resource-type-neutrality",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "no affected crates changed",
+            "name": "affected-tests",
+            "verdict": "PASS"
+          },
+          {
+            "detail": "ok",
+            "name": "selected-properties",
+            "verdict": "PASS"
+          }
+        ],
+        "message": "fast verify: 9 gates, 9 pass, 0 fail, 0 unknown",
+        "schema_version": 1,
+        "verdict": "PASS"
+      },
+      "record_sha256": "2bf8b5f29c6183243b8305f00ee1acdd41d7759628828533f91e74045be1b1cc"
+    },
+    "n311_e4": {
+      "result": {
+        "command": "scenario run",
+        "duration_ms": 1702,
+        "evidence_id": "scenario-n311-restore20-19f4fc01b02d",
+        "failure_signature": {
+          "assertion": "",
+          "failed_step": "",
+          "key_log_lines": []
+        },
+        "message": "scenario product.n3-11-provider-init: PASS (command ran, all 12 expectations held)",
+        "scenario": "product.n3-11-provider-init",
+        "schema_version": 1,
+        "verdict": "PASS"
+      },
+      "record_sha256": "a15300fb6dd081050b278978d2cad232e8b30357cacc6078d333806f76c8413d"
+    },
+    "n312_e4": {
+      "result": {
+        "command": "scenario run",
+        "duration_ms": 65089,
+        "evidence_id": "scenario-n311-restore20-65ef68996f0e",
+        "failure_signature": {
+          "assertion": "",
+          "failed_step": "",
+          "key_log_lines": []
+        },
+        "message": "scenario product.n3-12-snapshot-staging: PASS (command ran, all 15 expectations held)",
+        "scenario": "product.n3-12-snapshot-staging",
+        "schema_version": 1,
+        "verdict": "PASS"
+      },
+      "record_sha256": "ac8179787755aacac8e51b803b2bc86aa9f8357a591012e0ae77ba485729ab86"
+    }
+  },
+  "binary_e3": {
+    "verdict": "PASS",
+    "tests_run": 51,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "duration_seconds": 3199.795,
+    "exit_code": 0,
+    "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stderr_sha256": "64635a617544da2440213a5ec952b37f3402e917a2bb0a05e2a774877eb57b26",
+    "binary_start_end": {
+      "nexus": {
+        "initial_sha256": "0129d5a12cf6639dc5d4c5b54abda6a48ca482e9a52d735d40ed70a62c38f62f",
+        "at_completion_sha256": "36a20de28ac42d2c14b0290c4d8debd0985a673c466bbfa03f2a7a6c3f8de6c9",
+        "same": false
+      },
+      "nexusd": {
+        "initial_sha256": "191a506f290600d902a926585483264f9a55b2c580ef4f55d623dd6cf993984e",
+        "at_completion_sha256": "191a506f290600d902a926585483264f9a55b2c580ef4f55d623dd6cf993984e",
+        "same": true
+      }
+    },
+    "qualification": "51-method source-bound E3 passed while Cargo validations rebuilt executable aliases. Do not describe that run as a single immutable-binary qualification. Separate fixed-artifact regression uses independent copies and verifies SHA before/after.",
+    "runtime_inputs_unchanged": true,
+    "runtime_inputs_checked": 1052
+  },
+  "fixed_artifact_regression": {
+    "verdict": "PASS",
+    "tests_run": 10,
+    "exit_code": 0,
+    "skipped": 0,
+    "duration_seconds": 112.037,
+    "methods": [
+      "test_cli_adapter_strict_envelopes_scope_snapshot_id_range_state_and_fail_correlation",
+      "test_same_key_same_id_offsets_and_changed_valid_binding_conflict",
+      "test_unreachable_daemon_keeps_bundle_and_original_prefix_then_same_key_resumes",
+      "test_cancelled_get_repeat_cancel_and_same_key_begin_recheck_current_use",
+      "test_cold_unexplained_tail_missing_confirmed_prefix_and_corruption_deny_without_reset",
+      "test_completed_staging_init_fails_closed_on_each_lost_or_damaged_authority",
+      "test_cli_upload_seal_then_cancel_releases_only_owned_namespace_and_preserves_tombstone",
+      "test_snapshot_route_missing_wrong_token_and_changed_inode_or_bytes_denied",
+      "test_wire_unknown_duplicate_float_exponent_version_are_real_typed_denials",
+      "test_staging_init_requires_original_completed_provider_and_is_idempotent"
+    ],
+    "artifact_sha256": {
+      "nexus": "ad3158bccd8c78d5dff2532b99bb6cf87f4ea377ebd1b5ccafa4df605d72ec86",
+      "nexusd": "883f799fd3358d314346997096f58fea2789f1586b5163593e87f81a558a8b62"
+    },
+    "before_after_sha_identical": true,
+    "stderr_sha256": "6e3df2a3d77a9c26506183d011b2a4148cfa9a5e861b63fea4ad2000089ad01e"
+  },
+  "portable_wasi": {
+    "verdict": "PASS",
+    "packages": [
+      "nexus-control-api",
+      "nexus-workspace"
+    ],
+    "target": "wasm32-wasip1",
+    "exit_code": 0
+  },
+  "review": {
+    "review_id": "n312rec20r1a",
+    "reviewer": "/root/n312_recovery_code_review21_r1",
+    "verdict": "COMMENTED",
+    "blocking_issues": [],
+    "historical_review_binding": {
+      "configuration_digest": "d0ace8009728a7dc482e5d9ca03ceb8f4945ef3a",
+      "contract_hash": "3eab703cb6a7f74ce25959edadcf45a926238301",
+      "dirty_state": true,
+      "feature_set": [
+        "workspace:default"
+      ],
+      "harness_schema_version": 1,
+      "platform_capability_digest": "711a114fe73b9bf0c371c2a2809389611af3ba8a",
+      "source_revision": "731e659a49068d56c580ce8e7e986d1c333592fc",
+      "target_triple": "x86_64-unknown-linux-gnu",
+      "toolchain_version": "1.98.1",
+      "working_tree_digest": "4de4413e3d2209b2b1f6f743e65851dfc840db7c"
+    },
+    "retained_suggestion": "R1-W1: establish uninstrumented ledger benchmarks without reducing validation or frozen tests",
+    "e3_evidence_limitation_R1_W2": "Full source-bound suite exit0, plus 10 fixed-artifact regressions exit0. CLI alias changed during full run; daemon stable. Original review preserved unchanged; no single immutable-binary full-suite claim."
+  },
+  "build_profile": {
+    "toolchain": "1.98.1",
+    "dev_and_test_opt_level": 1,
+    "debug_assertions": true,
+    "overflow_checks": true,
+    "panic": "unwind"
+  },
+  "interrupted_runs": "Preserved as INTERRUPTED; not counted as success",
+  "source_scope": "Known printed code paths and component sources restored; no original full1317-path SHA-map identity claim",
+  "full": "PAUSED_NOT_RUN",
+  "external_windows_to_linux_e5": "PAUSED_NOT_CERTIFIED",
+  "complete_n3_acceptance_claimed": false
+}

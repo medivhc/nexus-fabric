@@ -48,3 +48,20 @@ N3-7 发现留存 basic 输出 packets/reverse，而当前 verifier 要求 strea
 并发冷节点身份生成会产生多个 seed，导致握手看到的公钥与签名密钥不一致。
 16并发回归明确复现后，首次创建由同进程锁和二次读取保护；已有身份读取不加锁。
 保留原冷 idle-client 测试，不用预初始化夹具掩盖竞态；跨进程初始化仍需节点所有者协调。
+
+## 当前工具版本与源码内容绑定
+
+2026-10-18 的 N3-12 组合验证再次发现 activate 后 PATH 指向主仓库旧 Harness，
+即使 cwd 与 CARGO_TARGET_DIR 正确也仍可运行旧工程规则。当前工作区重新构建
+Harness 后显式使用其绝对路径；记录工具 ELF SHA、构建输入与 Cargo 日志。
+旧工具的 PASS 保留为历史观察，不能由同 revision/dirty 状态自动提升为当前工具 PASS。
+
+Git porcelain 的路径与状态相同不证明工作区内容相同，未追踪 Rust 文件也可能承载
+实际实现。补充 tracked + untracked 源文件逐项 SHA 清单，并在执行前后比较；
+明确排除生成 target 与 evidence 的清单范围，避免把不同计数误判为源码变化。
+工具 SHA 同样须前后检查。Cargo 合法重建的产品 ELF 需记录新构建出处与新 SHA，
+不能自动把旧产品场景观测绑定到新 ELF。
+
+案例证据：`.evidence/n312-integration-20261017/tool-revision-mismatch-20261018/`
+与 `dev-current18/`。当前工具 affected FAIL 不由旧 verify ID 的 status/explain PASS 覆盖；
+独立 test 命令未写 verify ID 时，应引用该次命令的实际 stdout、Cargo 日志与 exit。
