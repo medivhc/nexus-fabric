@@ -36,11 +36,13 @@ cargo run -p nexus-web-gateway --example gateway -- ./gateway.json
 Page: https://192.168.1.10:8443/  (download the local CA at https://192.168.1.10:8443/cert ...)
 ```
 
-如果 `listen_addr` 填了 `0.0.0.0`，启动日志会额外打印一行
-`note: listen_addr is unspecified; binding the WebRTC UDP socket to <IP> ...`，
-告诉浏览器实际使用的 ICE 地址。若打印的是
-`warning: no non-loopback network interface found ...`，说明机器没有可路由网卡，
-浏览器将无法连接，必须把 `listen_addr` 改成具体 IP。
+`listen_addr` 为 `0.0.0.0` 时不会再打印额外提示：UDP socket 绑该族的通配地址
+（因此能收到发往任意网卡的包），SDP 里通告的是本机全部可路由网卡地址（G11）。
+只有当这台机器**根本没有**可路由网卡时，启动才会打
+`warning: 'listen_addr' is unspecified and no non-loopback network interface was found ...`，
+此时 ICE 只能给出 loopback 候选、远端浏览器必然连不上，必须把 `listen_addr`
+改成具体网卡 IP 或换机器。`page_addr`（页面提示的那个地址）永远是可路由的具体 IP，
+不会是 `0.0.0.0`。
 
 ### 3. 安装本地 CA 证书
 
@@ -123,9 +125,13 @@ HTTPS/WSS 监听地址，同时决定 WebRTC UDP socket 绑定的 IP。
 
 ## 常见问题
 
-- **页面一直停在 “P2P ICE 失败”**：检查 `listen_addr` 是否填了 `127.0.0.1`；
-  确认启动日志没有 “no non-loopback network interface found” 告警；确认访问的是
-  `https://<可路由IP>:<端口>/` 而不是 `https://0.0.0.0:.../`。
+- **页面一直停在 “P2P ICE 失败”**：先看 `listen_addr`。网关只通告**自己的 UDP socket
+  真能收包**的地址（G11）：`listen_addr=127.0.0.1` 时只通告 loopback（本机测试可用，
+  远程浏览器连不上）；`listen_addr=<某网卡IP>` 时只通告那个 IP；要让局域网/网格都能连，
+  填 `0.0.0.0`（绑通配地址并通告全部可路由网卡）或直接填那块网卡的 IP。
+  确认访问的是 `https://<可路由IP>:<端口>/` 而不是 `https://0.0.0.0:.../`；
+  启动日志出现 “`listen_addr` is unspecified and no non-loopback network interface was found”
+  说明这台机器根本没有可路由网卡，必须改网络或换节点。
 - **浏览器证书警告**：下载 `/cert` 安装本地 CA，并把机器 IP 加入 `tls.ips`
   后重新启动网关（证书会重新生成并持久化）。
 - **节点列表为空**：访问地址的 host 必须是网关所在机器的可路由 IP；`0.0.0.0`

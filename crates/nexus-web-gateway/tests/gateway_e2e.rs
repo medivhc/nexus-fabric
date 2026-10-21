@@ -1276,3 +1276,142 @@ fn ice_answer_advertises_bound_address_candidate() -> TestResult {
     );
     Ok(())
 }
+
+/// Extract the addresses of all `typ host` ICE candidates in an SDP.
+///
+/// Parsed relative to the `typ` keyword (`... <address> <port> typ host`) so it
+/// does not depend on how many leading fields a given stack emits.
+fn host_candidate_addresses(sdp: &str) -> Vec<String> {
+    sdp.lines()
+        .filter(|line| line.starts_with("a=candidate:") && line.contains(" typ host"))
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let typ = fields.iter().position(|field| *field == "typ")?;
+            fields.get(typ.checked_sub(2)?).copied().map(str::to_string)
+        })
+        .collect()
+}
+
+/// Routable (non-loopback, non-unspecified, non-multicast) IPv4 addresses of
+/// this host, as the gateway enumerates them.
+fn routable_ipv4s() -> Vec<String> {
+    let mut ips = Vec::new();
+    for iface in getifaddrs::getifaddrs().expect("getifaddrs failed") {
+        if iface.flags.contains(getifaddrs::InterfaceFlags::LOOPBACK) {
+            continue;
+        }
+        let Some(ip) = iface.address.ip_addr() else {
+            continue;
+        };
+        // The gateway matches the candidate family against the listen address
+        // (`0.0.0.0` here), so only IPv4 may appear in its candidate set.
+        let std::net::IpAddr::V4(v4) = ip else {
+            continue;
+        };
+        if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+            continue;
+        }
+        let s = v4.to_string();
+        if !ips.contains(&s) {
+            ips.push(s);
+        }
+    }
+    ips
+}
+
+/// G11 regression: a gateway whose UDP socket is bound to `127.0.0.1` must
+/// advertise *only* the loopback host candidate. Advertising the host's LAN/mesh
+/// IPs instead (what the multi-homed fix used to do unconditionally) gives ICE
+/// candidates the bound socket can never receive on, so the connection times
+/// out — that is what broke every DataChannel test and the gateway-ci pipeline.
+#[test]
+fn loopback_bound_gateway_advertises_only_loopback_candidates() -> TestResult {
+    let cfg = test_config(
+        "node-a",
+        "node-a",
+        "127.0.0.1:0".parse()?,
+        dead_ssh_target(),
+    );
+    let handle = Gateway::start(cfg)?;
+
+    let mut browser = Browser::connect_first(
+        &handle.cert_der,
+        handle.local_addr,
+        "node-a",
+        "sess-ice-loopback",
+    )?;
+    browser.drive_all(Duration::from_secs(5))?;
+
+    let addrs = host_candidate_addresses(&browser.answer_sdp);
+    assert!(
+        !addrs.is_empty(),
+        "answer advertised no host candidate:\n{}",
+        browser.answer_sdp
+    );
+    assert!(
+        addrs.iter().all(|a| a == "127.0.0.1"),
+        "loopback-bound gateway must advertise only 127.0.0.1, got {addrs:?}"
+    );
+    assert!(
+        browser.peers[0].connected,
+        "ICE must connect on a loopback-bound gateway (candidates: {addrs:?})"
+    );
+    Ok(())
+}
+
+/// REQ-002 intent, now with a real assertion: an unspecified `listen_addr` binds
+/// the wildcard, which *does* receive on every interface, so every routable
+/// interface address becomes a host candidate (multi-homed hosts: LAN + mesh).
+/// A wildcard/`0.0.0.0` address itself must never be advertised.
+#[test]
+fn wildcard_bound_gateway_advertises_all_routable_interfaces() -> TestResult {
+    let cfg = test_config("node-a", "node-a", "0.0.0.0:0".parse()?, dead_ssh_target());
+    let handle = Gateway::start(cfg)?;
+
+    // The listener is on the wildcard address, but the test certificate only
+    // covers `localhost`/`127.0.0.1`, so signal over loopback (`page_addr` would
+    // be the derived LAN IP and rustls would reject it as a name mismatch).
+    let dial = std::net::SocketAddr::new(
+        std::net::Ipv4Addr::LOCALHOST.into(),
+        handle.local_addr.port(),
+    );
+    let browser = Browser::connect_first(&handle.cert_der, dial, "node-a", "sess-ice-wildcard")?;
+
+    let addrs = host_candidate_addresses(&browser.answer_sdp);
+    assert!(
+        !addrs.is_empty(),
+        "answer advertised no host candidate:\n{}",
+        browser.answer_sdp
+    );
+    let leaked: Vec<&String> = addrs
+        .iter()
+        .filter(|a| {
+            a.parse::<std::net::IpAddr>()
+                .map_or(true, |ip| ip.is_unspecified())
+        })
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "wildcard address leaked into ICE candidates: {leaked:?}"
+    );
+
+    let iface_ips = routable_ipv4s();
+    if iface_ips.is_empty() {
+        // Host without any routable IPv4 interface: loopback fallback, and the
+        // gateway must have warned the operator that browsers cannot reach it.
+        assert_eq!(addrs, vec!["127.0.0.1".to_string()], "{addrs:?}");
+    } else {
+        for expected in &iface_ips {
+            assert!(
+                addrs.contains(expected),
+                "interface IP {expected} missing from candidates {addrs:?}"
+            );
+        }
+        assert_eq!(
+            addrs.len(),
+            iface_ips.len(),
+            "candidates {addrs:?} must match the routable interfaces {iface_ips:?}"
+        );
+    }
+    Ok(())
+}

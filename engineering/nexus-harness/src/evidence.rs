@@ -24,11 +24,19 @@ pub struct Bindings {
 }
 
 impl Bindings {
-    pub fn current(repo: &Repo) -> Bindings {
+    pub fn current(repo: &Repo, config: &Config) -> Bindings {
         let (toolchain, target) = crate::env::toolchain();
+        // harness.toml [evidence].bind_working_tree_digest 兑现点：
+        // false → 记录哨兵值 "unbound"（status/explain JSON 可见，且 id
+        // seed 里该分量退化为常量）；true → 内容绑定 digest。
+        let working_tree_digest = if config.bind_working_tree_digest {
+            repo.working_tree_digest()
+        } else {
+            "unbound".to_string()
+        };
         Bindings {
             source_revision: repo.revision(),
-            working_tree_digest: repo.working_tree_digest(),
+            working_tree_digest,
             dirty_state: repo.dirty_state(),
             configuration_digest: repo.configuration_digest(),
             feature_set: vec!["workspace:default".to_string()],
@@ -60,14 +68,33 @@ impl Bindings {
     }
 }
 
-/// verify-<id> short id: first 12 chars of hash(revision|config|contract),
+/// verify-<id> short id: first 12 chars of
+/// hash(revision|configuration|contract[|working_tree_digest when dirty]),
 /// namespaced by the current agent (env `NEXUS_AGENT`) so multiple agents
 /// working on the same revision do not overwrite each other's evidence.
+///
+/// digest 进 seed 的条件是 `dirty_state != Some(false)`：脏树**和**"git 问不出
+/// 脏净"两种情况都进（后者带的是 `dirty-unknown` 哨兵 digest，因此既不会折叠成
+/// 干净树的 id，也不会与任何真实内容 id 相同）。刻意**不在干净树上加入**：
+/// CI/干净树的 id 因此与旧实现逐字节一致，既有 `verify-<id>` 引用、
+/// `nexus-sync.sh`（fetch→rebase→verify→push）流程与可复现性全部不受影响；
+/// 脏树则"每份内容一个 id"，内容漂移自然产生新目录，旧证据被
+/// `mark_stale_others` 标 STALE，而不是被同 id 的 `fs::write` 静默覆写
+/// （缺陷 EXP4 的直接成因）。
+///
+/// **为什么 id 里没有墙钟时间戳**：`.evidence/` 目录是入库对象，AGENTS.md
+/// 与技能文档以 `verify-<id>` 作为可追溯标识引用；时间戳进 seed 会让每次
+/// run 都产生新目录、文档引用当场失效、跨机复现不可能。取证需求的运行
+/// 时刻属于 summary/metadata 字段，不属于身份。
 pub fn verify_id(repo: &Repo, b: &Bindings) -> String {
-    let seed = format!(
+    let mut seed = format!(
         "{}\n{}\n{}",
         b.source_revision, b.configuration_digest, b.contract_hash
     );
+    if b.dirty_state != Some(false) {
+        seed.push('\n');
+        seed.push_str(&b.working_tree_digest);
+    }
     let h = repo
         .hash_stdin(&seed)
         .unwrap_or_else(|_| "unknown".to_string());
@@ -113,6 +140,89 @@ fn write_json(path: &PathBuf, value: &Value) -> Result<(), String> {
     fs::write(path, text).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
+/// days-since-epoch → (year, month, day)（Howard Hinnant civil_from_days，
+/// 无新依赖；见 https://howardhinnant.github.io/date_algorithms.html）。
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
+}
+
+/// UTC 墙钟 ISO-8601（毫秒精度）。运行时刻写进 summary 供取证——它是
+/// 字段而不是 id 分量（见 `verify_id` 文档注释对时间戳为何不入 id 的说明）。
+fn created_at_iso8601() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let secs = ms.div_euclid(1000);
+    let millis = ms.rem_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (y, mo, dd) = civil_from_days(days);
+    format!(
+        "{y:04}-{mo:02}-{dd:02}T{:02}:{:02}:{:02}.{millis:03}Z",
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60
+    )
+}
+
+/// Read a verify dir's summary.json if present and parsable.
+fn read_summary(dir: &std::path::Path) -> Option<Value> {
+    let text = fs::read_to_string(dir.join("summary.json")).ok()?;
+    serde_json::from_str::<Value>(&text).ok()
+}
+
+/// 同 id 覆写保护：`verify-<id>` 目录已存在、且其中记录的 bindings 与本次
+/// 不同（id seed 只含 revision/configuration/contract[+脏树 digest]，
+/// toolchain、target 等分量变化仍可能撞进同一 id）时，**不静默覆写**：
+/// 把旧证据整体移入兄弟目录 `verify-<id>-stale-<hash>` 并把其 summary
+/// 标为 STALE 后保留（删除证据属人工决定，harness 无权销毁历史），再让
+/// 本次 run 写入正主目录。
+/// bindings 完全相同 → 幂等刷新（同一精确状态的重跑，覆写无害，允许）。
+/// summary.json 缺失/不可解析（崩溃残留的半成品）→ 直接覆写修复。
+fn preserve_stale_if_bindings_differ(
+    repo: &Repo,
+    dir: &std::path::Path,
+    current_bindings: &Value,
+) -> Result<(), String> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    let Some(mut old) = read_summary(dir) else {
+        return Ok(());
+    };
+    let previous = old.get("bindings").cloned().unwrap_or(Value::Null);
+    if previous == *current_bindings {
+        return Ok(());
+    }
+    let h = repo
+        .hash_stdin(&previous.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    let short = if h.len() > 12 { &h[..12] } else { h.as_str() };
+    let base = PathBuf::from(format!("{}-stale-{short}", dir.to_string_lossy()));
+    let mut target = base.clone();
+    let mut n: u32 = 1;
+    while target.is_dir() {
+        target = PathBuf::from(format!("{}-{n}", base.display()));
+        n += 1;
+    }
+    fs::rename(dir, &target).map_err(|e| format!("preserve {}: {e}", dir.display()))?;
+    old["verdict"] = json!("STALE");
+    old["message"] = json!(
+        "same evidence id produced with different bindings; preserved here by the newer run instead of being silently overwritten"
+    );
+    write_json(&target.join("summary.json"), &old)
+}
+
 /// Write full evidence for a verify run; marks prior evidence with differing
 /// bindings as STALE; refreshes .evidence/latest.json.
 pub fn write_evidence(
@@ -126,6 +236,8 @@ pub fn write_evidence(
 ) -> Result<String, String> {
     let id = verify_id(repo, bindings);
     let dir = config.evidence_dir.join(format!("verify-{id}"));
+    let bindings_json = bindings.to_json();
+    preserve_stale_if_bindings_differ(repo, &dir, &bindings_json)?;
     fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
 
     let summary = json!({
@@ -134,7 +246,8 @@ pub fn write_evidence(
         "verdict": verdict,
         "message": message,
         "id": id,
-        "bindings": bindings.to_json(),
+        "created_at": created_at_iso8601(),
+        "bindings": bindings_json,
     });
     let gates_json: Vec<Value> = gates
         .iter()
@@ -150,7 +263,7 @@ pub fn write_evidence(
     write_json(&dir.join("gates.json"), &checks)?;
     write_json(
         &dir.join("metadata.json"),
-        &json!({"bindings": bindings.to_json(), "env": {
+        &json!({"bindings": bindings_json, "env": {
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
         }}),
@@ -316,6 +429,22 @@ mod tests {
         }
     }
 
+    /// `Config` for tests that need `Bindings::current` (which reads the
+    /// `[evidence].bind_working_tree_digest` flag). All directories point under
+    /// `dir`; bind defaults to `true` so the sentinel/unknown paths stay reachable.
+    fn test_config(dir: &std::path::Path) -> Config {
+        Config {
+            policies_dir: dir.join("policies"),
+            scenarios_dir: dir.join("scenarios"),
+            evidence_dir: dir.to_path_buf(),
+            crates_dir: dir.join("crates"),
+            engineering_dir: dir.join("engineering"),
+            quality: json!({}),
+            portable_core: vec![],
+            bind_working_tree_digest: true,
+        }
+    }
+
     #[test]
     fn same_as_true_for_equal_bindings() {
         let a = bindings("r1");
@@ -358,7 +487,7 @@ mod tests {
             repo.git(&["rev-parse", "--show-toplevel"]).is_err(),
             "本测试需要一个不在任何 git 仓库内的临时目录"
         );
-        let b = Bindings::current(&repo);
+        let b = Bindings::current(&repo, &test_config(&root));
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(b.dirty_state, None, "git 失败时不得产出脏/净判断");
         assert!(
@@ -389,6 +518,7 @@ mod tests {
             engineering_dir: tmp.join("engineering"),
             quality: json!({}),
             portable_core: vec![],
+            bind_working_tree_digest: true,
         };
         let old_dir = tmp.join("verify-old");
         std::fs::create_dir_all(&old_dir).unwrap();
@@ -460,6 +590,7 @@ mod tests {
             engineering_dir: tmp.join("engineering"),
             quality: json!({}),
             portable_core: vec![],
+            bind_working_tree_digest: true,
         };
         let write_summary = |dir: &str, id: &str, rev: &str| {
             let d = tmp.join(format!("verify-{dir}"));
@@ -498,5 +629,150 @@ mod tests {
         assert_eq!(read_verdict("agent-b-old"), "PASS");
 
         std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn verify_id_binds_digest_only_when_dirty() {
+        let repo = Repo::discover().expect("must run inside the nexus repository");
+        // 脏树：仅 digest 不同 → id 必须不同（旧实现同 id → 静默覆写的根因）。
+        let mut a = bindings("r1");
+        a.dirty_state = Some(true);
+        a.working_tree_digest = "digest-A".to_string();
+        let mut b = bindings("r1");
+        b.dirty_state = Some(true);
+        b.working_tree_digest = "digest-B".to_string();
+        assert_ne!(verify_id(&repo, &a), verify_id(&repo, &b));
+        // 干净树：digest 不进 seed → 与旧实现逐字节一致（向后兼容）。
+        let mut c = bindings("r1");
+        c.dirty_state = Some(false);
+        c.working_tree_digest = "digest-A".to_string();
+        let mut d = bindings("r1");
+        d.dirty_state = Some(false);
+        d.working_tree_digest = "digest-B".to_string();
+        assert_eq!(verify_id(&repo, &c), verify_id(&repo, &d));
+        // 旧 seed 手算比对：hash(revision|configuration|contract) 前 12 hex。
+        let legacy = repo.hash_stdin("r1\ncfg\nc").unwrap();
+        let expected = format_verify_id(agent_tag().as_deref(), &legacy[..12]);
+        assert_eq!(verify_id(&repo, &c), expected);
+    }
+
+    #[test]
+    fn verify_id_keeps_unknown_dirty_state_distinct_from_clean() {
+        // #12 把 dirty_state 变成 Option<bool>；`None` = git 问不出脏净。
+        // 此时 digest 是哨兵值，必须进 seed：否则一次 git 失败会拿到与"干净树
+        // run"完全相同的 id，把"不知道"折叠成"干净"——正是本轮收口的 fail-open 形态。
+        let repo = Repo::discover().expect("must run inside the nexus repository");
+        let mut clean = bindings("r1");
+        clean.dirty_state = Some(false);
+        clean.working_tree_digest = "dirty-unknown".to_string();
+        let mut unknown = bindings("r1");
+        unknown.dirty_state = None;
+        unknown.working_tree_digest = "dirty-unknown".to_string();
+        assert_ne!(
+            verify_id(&repo, &unknown),
+            verify_id(&repo, &clean),
+            "None 不得与 Some(false) 同 id"
+        );
+        // 同一个 None 状态仍然确定：id 里不掺墙钟、不掺随机。
+        let mut unknown2 = bindings("r1");
+        unknown2.dirty_state = None;
+        unknown2.working_tree_digest = "dirty-unknown".to_string();
+        assert_eq!(verify_id(&repo, &unknown), verify_id(&repo, &unknown2));
+        // 哨兵 digest 与真实内容 digest 也不同 id（未知 ≠ 任一已知内容）。
+        let mut dirty = bindings("r1");
+        dirty.dirty_state = Some(true);
+        dirty.working_tree_digest = "real-content-digest".to_string();
+        assert_ne!(verify_id(&repo, &unknown), verify_id(&repo, &dirty));
+    }
+
+    #[test]
+    fn same_id_different_bindings_not_silently_overwritten() {
+        // 缺陷 EXP4 的守门测试：id 相同但 bindings 不同（如 toolchain 变化）
+        // 时，旧证据必须被保留并标 STALE，而不是被 fs::write 原地抹掉；
+        // bindings 完全相同则幂等刷新、不产生额外目录。
+        let repo = crate::env::tests::init_temp_repo("ovr");
+        let ev_dir = repo.root.join("evidence");
+        std::fs::create_dir_all(&ev_dir).unwrap();
+        let config = Config {
+            policies_dir: ev_dir.join("policies"),
+            scenarios_dir: ev_dir.join("scenarios"),
+            evidence_dir: ev_dir.clone(),
+            crates_dir: ev_dir.join("crates"),
+            engineering_dir: ev_dir.join("engineering"),
+            quality: json!({}),
+            portable_core: vec![],
+            bind_working_tree_digest: true,
+        };
+        let mut b1 = bindings("rev-same");
+        b1.toolchain_version = "1.0.0".to_string();
+        let mut b2 = bindings("rev-same");
+        b2.toolchain_version = "1.1.0".to_string();
+        // toolchain 不在 id seed 里 → 同 id、不同 bindings。
+        let id = verify_id(&repo, &b1);
+        assert_eq!(id, verify_id(&repo, &b2));
+
+        write_evidence(&repo, &config, "PASS", "run-1", &[], &[], &b1).unwrap();
+        write_evidence(&repo, &config, "PASS", "run-2", &[], &[], &b2).unwrap();
+
+        // 正主目录是 run-2 的新 bindings。
+        let cur: Value = serde_json::from_str(
+            &std::fs::read_to_string(ev_dir.join(format!("verify-{id}/summary.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cur["bindings"], b2.to_json());
+        assert_eq!(cur["verdict"], json!("PASS"));
+        // run-1 被保留为 STALE 兄弟目录，bindings 仍是旧的。
+        let preserved = std::fs::read_dir(&ev_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("verify-{id}-stale-"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(preserved.len(), 1, "old evidence must survive exactly once");
+        let old: Value = serde_json::from_str(
+            &std::fs::read_to_string(preserved[0].path().join("summary.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(old["verdict"], json!("STALE"));
+        assert_eq!(old["bindings"], b1.to_json());
+        assert!(
+            std::fs::read(preserved[0].path().join("gates.json")).is_ok(),
+            "preserved dir keeps its full evidence files"
+        );
+
+        // 幂等刷新：同 bindings 再跑一次 → 不新增 stale 目录，正主目录更新。
+        write_evidence(&repo, &config, "PASS", "run-3", &[], &[], &b2).unwrap();
+        let stale_now = std::fs::read_dir(&ev_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("verify-{id}-stale-"))
+            })
+            .count();
+        assert_eq!(
+            stale_now, 1,
+            "identical bindings must refresh in place, not preserve again"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo.root);
+    }
+
+    #[test]
+    fn created_at_field_written_to_summary() {
+        // 取证时间戳是 summary 字段而非 id 分量（id 必须可引用、可复现）。
+        let repo = Repo::discover().expect("must run inside the nexus repository");
+        let s = created_at_iso8601();
+        assert_eq!(s.len(), 24, "YYYY-MM-DDThh:mm:ss.mmmZ");
+        assert!(s.ends_with('Z'));
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+        // 2000-02-29（闰日）= epoch day 11016。
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29));
+        let _ = repo;
     }
 }

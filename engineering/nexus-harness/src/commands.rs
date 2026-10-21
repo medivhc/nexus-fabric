@@ -41,7 +41,7 @@ pub fn status() -> Outcome {
         Ok(x) => x,
         Err(o) => return o,
     };
-    let bindings = Bindings::current(&repo);
+    let bindings = Bindings::current(&repo, &config);
     let latest = evidence::read_latest_summary(&config);
 
     let (verdict, message, extra) = match &latest {
@@ -165,7 +165,8 @@ pub fn context(args: &[String]) -> Outcome {
             let mapped = mapped_scenarios(&config, &target);
             // Phase 2：附加**有界**语义锚点。语义层的任何结果都不改变上面这些字段，
             // 也不改变 verdict —— 见 MODULE.md「Context Semantic Anchoring」不变量 1。
-            let semantic = crate::code_intel::anchors(&repo, &dir, provider_override.as_deref());
+            let semantic =
+                crate::code_intel::anchors(&repo, &config, &dir, provider_override.as_deref());
             let mut extras: Vec<(String, Value)> = vec![
                 (
                     "module_contract".to_string(),
@@ -317,7 +318,7 @@ pub fn verify(sub: &str) -> Outcome {
         Ok(x) => x,
         Err(o) => return o,
     };
-    let bindings = Bindings::current(&repo);
+    let bindings = Bindings::current(&repo, &config);
 
     // Gates are driven by policies/quality.toml declarations (single source of
     // truth); declared-but-unimplemented gates surface as UNKNOWN, never skipped.

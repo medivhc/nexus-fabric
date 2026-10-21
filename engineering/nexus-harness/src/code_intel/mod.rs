@@ -128,8 +128,8 @@ pub fn run_with_session(args: &[String], session: &mut Option<ProviderSession>) 
     // 字段存在与否判断就会把"未确定"读成"就是仓库根"。独立 Review round 3 待办 4
     // 要求取消这一双含义：未确定作用域时该字段不出现（见 MODULE.md 字段可得性规则）。
     let setup = commands::setup();
-    if let Ok((early_repo, _)) = &setup {
-        base.snapshot = Some(Bindings::current(early_repo).to_json());
+    if let Ok((early_repo, early_config)) = &setup {
+        base.snapshot = Some(Bindings::current(early_repo, early_config).to_json());
     }
 
     if verb_raw.is_empty() {
@@ -150,7 +150,7 @@ pub fn run_with_session(args: &[String], session: &mut Option<ProviderSession>) 
         );
     };
 
-    let (repo, _config) = match setup {
+    let (repo, config) = match setup {
         Ok(pair) => pair,
         Err(outcome) => return enrich(outcome, &base),
     };
@@ -166,7 +166,7 @@ pub fn run_with_session(args: &[String], session: &mut Option<ProviderSession>) 
         return fail(&envelope, &e);
     }
 
-    let bindings_before = Bindings::current(&repo);
+    let bindings_before = Bindings::current(&repo, &config);
     // `Repo::working_tree_digest()` 在 git 调用失败时会降级成哨兵值（`tree-unknown` /
     // `dirty-unknown`）。若不加检查，"前后两次都失败"会被当成"工作树没变"，
     // 于是把"无法证明绑定"说成"绑定成立"——这正是提案 §12 禁止的伪 PASS。
@@ -272,7 +272,7 @@ pub fn run_with_session(args: &[String], session: &mut Option<ProviderSession>) 
             cache_view.refresh(&cache_dir_path);
             daemon_state.session_source = "cache";
             // 命中不放宽指纹检查：这里取的是"查询后"那一次。
-            if let Some(f) = stale_after(&repo, &bindings_before) {
+            if let Some(f) = stale_after(&repo, &config, &bindings_before) {
                 attach(&mut envelope, &daemon_state, &cache_view);
                 return fail(&envelope, &f);
             }
@@ -352,6 +352,7 @@ pub fn run_with_session(args: &[String], session: &mut Option<ProviderSession>) 
                             verb,
                             items,
                             &repo,
+                            &config,
                             &bindings_before,
                             &cache_dir_path,
                             &cache_key,
@@ -459,6 +460,7 @@ pub fn run_with_session(args: &[String], session: &mut Option<ProviderSession>) 
         verb,
         items,
         &repo,
+        &config,
         &bindings_before,
         &cache_dir_path,
         &cache_key,
@@ -508,8 +510,8 @@ fn text_field(v: &Value, key: &str) -> String {
 
 /// 查询后的指纹复核。两个失败出口分开：取不到指纹 ≠ 指纹没变，
 /// 把前者说成后者就是把"无法证明"写成一条正面事实。
-fn stale_after(repo: &Repo, before: &Bindings) -> Option<Failure> {
-    let after = Bindings::current(repo);
+fn stale_after(repo: &Repo, config: &crate::config::Config, before: &Bindings) -> Option<Failure> {
+    let after = Bindings::current(repo, config);
     if digest_is_unusable(&after.working_tree_digest) {
         return Some(CodeIntelError::WorkspaceUnresolved.with_reason(
             "查询结束后取不到可信的工作树指纹（git status/write-tree 失败或降级），无法证明结果仍绑定查询时的 revision"
@@ -565,11 +567,12 @@ fn deliver(
     verb: Verb,
     items: Vec<Value>,
     repo: &Repo,
+    config: &crate::config::Config,
     bindings_before: &Bindings,
     cache_dir: &Path,
     cache_key: &cache::CacheKey,
 ) -> Outcome {
-    if let Some(f) = stale_after(repo, bindings_before) {
+    if let Some(f) = stale_after(repo, config, bindings_before) {
         attach(&mut envelope, daemon_state, cache_view);
         return fail(&envelope, &f);
     }
@@ -782,7 +785,12 @@ fn status_for_error(code: &str) -> &'static str {
 /// `authority = advisory` 与全部错误码映射。另起一条路径就等于把这些不变量复制一份
 /// ——而复制出去的不变量迟早漂移（round 2 的 `..` 绕过就是这么来的）。
 /// 代价是要合成一次 argv，比暴露一个 typed 入口丑，但它换来的是"只有一套真相"。
-pub fn anchors(repo: &Repo, module_dir: &Path, provider_override: Option<&str>) -> SemanticReport {
+pub fn anchors(
+    repo: &Repo,
+    config: &crate::config::Config,
+    module_dir: &Path,
+    provider_override: Option<&str>,
+) -> SemanticReport {
     let scope_rel = dto::relative_path(&repo.root, module_dir);
     // 顺序是契约要求的，不是可以"优化"掉的：`context <成员目录>` 即使 declined（门 1
     // `unsupported_scope`）也必须带出 `snapshot`，Agent 才能判断这份 declination 绑在哪棵树上
@@ -790,7 +798,7 @@ pub fn anchors(repo: &Repo, module_dir: &Path, provider_override: Option<&str>) 
     // `snapshot.source_revision` 的 non_empty 期望）。把 `Bindings::current` 挪到门 1 之后
     // 看着省一次 git 调用，实际会让 declined 结果失去绑定 —— 而"没有绑定的事实"正是本模块
     // 最不允许的输出形态。
-    let bindings = Bindings::current(repo);
+    let bindings = Bindings::current(repo, config);
     let digest = bindings.working_tree_digest.clone();
     let mut rep = SemanticReport {
         status: "ok",
@@ -1760,6 +1768,7 @@ mod tests {
     #[test]
     fn anchors_refuses_non_workspace_scope_without_spawning_provider() {
         let repo = Repo::discover().expect("must run inside the nexus repository");
+        let config = crate::config::Config::load(&repo).expect("test: load harness config");
         for (tag, manifest) in [
             ("package-only", Some("[package]\nname = \"scratch\"\n")),
             ("no-manifest", None),
@@ -1770,7 +1779,7 @@ mod tests {
             }
             std::fs::write(dir.join("MODULE.md"), "- `Egress` 出向网关\n").expect("写 MODULE.md");
 
-            let rep = anchors(&repo, &dir, Some(BOGUS_PROVIDER));
+            let rep = anchors(&repo, &config, &dir, Some(BOGUS_PROVIDER));
             assert_eq!(
                 rep.status, "unsupported_scope",
                 "{tag}：status 实际为 {}",
@@ -1807,6 +1816,7 @@ mod tests {
     #[test]
     fn anchors_without_contract_candidates_reports_no_candidates() {
         let repo = Repo::discover().expect("must run inside the nexus repository");
+        let config = crate::config::Config::load(&repo).expect("test: load harness config");
         let dir = scratch_dir("no-candidates");
         std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = []\n")
             .expect("写 Cargo.toml");
@@ -1816,7 +1826,7 @@ mod tests {
         )
         .expect("写 MODULE.md");
 
-        let rep = anchors(&repo, &dir, Some(BOGUS_PROVIDER));
+        let rep = anchors(&repo, &config, &dir, Some(BOGUS_PROVIDER));
         assert!(rep.anchors.is_empty(), "候选缺失时不得有锚点");
         assert_eq!(rep.candidate_queries, 0, "候选为空即返回，不得尝试任何查询");
         assert!(!rep.truncated);
@@ -1853,9 +1863,10 @@ mod tests {
     #[test]
     fn anchors_checks_workspace_scope_before_candidate_extraction() {
         let repo = Repo::discover().expect("must run inside the nexus repository");
+        let config = crate::config::Config::load(&repo).expect("test: load harness config");
         let dir = scratch_dir("scope-before-candidates");
 
-        let bare = anchors(&repo, &dir, Some(BOGUS_PROVIDER));
+        let bare = anchors(&repo, &config, &dir, Some(BOGUS_PROVIDER));
         assert_eq!(
             bare.status, "unsupported_scope",
             "作用域门必须先于候选门命中"
@@ -1867,7 +1878,7 @@ mod tests {
 
         std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = []\n")
             .expect("写 Cargo.toml");
-        let after = anchors(&repo, &dir, Some(BOGUS_PROVIDER));
+        let after = anchors(&repo, &config, &dir, Some(BOGUS_PROVIDER));
         assert_ne!(
             after.status, "unsupported_scope",
             "补上 [workspace] 后必须穿过作用域门"

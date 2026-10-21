@@ -839,8 +839,10 @@ impl DaemonState {
 }
 
 fn snapshot_json() -> Value {
-    match Repo::discover() {
-        Ok(repo) => Bindings::current(&repo).to_json(),
+    match Repo::discover()
+        .and_then(|repo| crate::config::Config::load(&repo).map(|config| (repo, config)))
+    {
+        Ok((repo, config)) => Bindings::current(&repo, &config).to_json(),
         // 取不到绑定时如实说"取不到"：空串 + error 字段，比伪造一个 revision 强
         // （与 `mcp serve` 的 degraded snapshot 同一形状）。
         Err(e) => json!({"source_revision": "", "working_tree_digest": "", "error": e}),

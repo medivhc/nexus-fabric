@@ -1154,8 +1154,10 @@ pub fn dispatch(args: &[String]) -> Outcome {
 /// 仓库发现失败时留空串而**不是**编一个值 —— 场景断言 `snapshot.source_revision` 非空，
 /// 于是"没绑定"会表现为场景变红，而不是被静默吞掉。
 fn cli_snapshot() -> Value {
-    match crate::env::Repo::discover() {
-        Ok(repo) => crate::evidence::Bindings::current(&repo).to_json(),
+    match crate::env::Repo::discover()
+        .and_then(|repo| crate::config::Config::load(&repo).map(|config| (repo, config)))
+    {
+        Ok((repo, config)) => crate::evidence::Bindings::current(&repo, &config).to_json(),
         Err(e) => json!({"source_revision": "", "working_tree_digest": "", "error": e}),
     }
 }

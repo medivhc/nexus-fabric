@@ -14,6 +14,11 @@ pub struct Config {
     pub quality: Value,
     /// harness.toml [portable_core].crates (WASI/portability gate targets).
     pub portable_core: Vec<String>,
+    /// harness.toml [evidence].bind_working_tree_digest —— 该标志此前是
+    /// 死配置（源码零读取）。现由 `Bindings::current` 兑现：false 时
+    /// bindings 的 digest 字段写 `"unbound"`（status/explain JSON 可见），
+    /// true（缺省）时按内容绑定语义计算。
+    pub bind_working_tree_digest: bool,
 }
 
 fn toml_file_to_json(path: PathBuf, what: &str) -> Result<Value, String> {
@@ -69,6 +74,12 @@ impl Config {
                     .collect()
             })
             .unwrap_or_default();
+        let bind_working_tree_digest = harness
+            .pointer("/evidence/bind_working_tree_digest")
+            .and_then(Value::as_bool)
+            // 缺省取"绑定"：AGENTS.md §20 无条件要求 working tree digest 在
+            // 绑定内，未声明等于放弃绑定是反向安全。
+            .unwrap_or(true);
         Ok(Config {
             policies_dir,
             scenarios_dir,
@@ -77,6 +88,7 @@ impl Config {
             engineering_dir,
             quality,
             portable_core,
+            bind_working_tree_digest,
         })
     }
 
