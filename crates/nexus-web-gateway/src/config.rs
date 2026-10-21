@@ -98,6 +98,105 @@ impl Default for SshConfig {
     }
 }
 
+/// Default file-transfer chunk payload (bytes).
+pub const DEFAULT_FILE_CHUNK_BYTES: usize = 64 * 1024;
+/// Hard ceiling for a negotiated chunk size: a WebRTC DataChannel message must
+/// stay inside the SCTP user-data limit.
+pub const MAX_FILE_CHUNK_BYTES: usize = 256 * 1024;
+/// Default concurrent file sessions per browser session.
+pub const DEFAULT_MAX_FILE_SESSIONS: usize = 4;
+/// Default upload ceiling per file session (2 GiB).
+pub const DEFAULT_MAX_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Default idle timeout for a file session.
+pub const DEFAULT_FILE_IDLE_TIMEOUT_SECS: u64 = 300;
+
+/// One node-local directory the file module may expose (REQ-008).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileRoot {
+    /// Stable name the browser selects; unique within `files.roots`.
+    pub name: String,
+    /// Absolute path of the exposed directory (the sandbox root).
+    pub path: String,
+    /// A read-only root rejects write / mkdir / rename / remove.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// File access and upload configuration (REQ-005..REQ-008).
+///
+/// Disabled by default: exposing a filesystem is strictly opt-in, and enabling
+/// it *requires* a bearer token, because browser identity on this node is still
+/// ephemeral and unverified (G2; REQ-003 access authentication is not
+/// implemented). Fail-closed: `validate()` rejects an enabled config without a
+/// token rather than silently exposing files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileConfig {
+    /// Master switch for the file module (control messages + data channel).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bearer token every `file_open` must present (required when enabled).
+    #[serde(default)]
+    pub auth_token: String,
+    /// Node-local directories exposed as roots. May be empty, which leaves the
+    /// module in SFTP-only mode (targets the node's configured SSH target).
+    #[serde(default)]
+    pub roots: Vec<FileRoot>,
+    /// Chunk payload size used for reads and writes.
+    #[serde(default = "default_file_chunk_bytes")]
+    pub chunk_bytes: usize,
+    /// Maximum concurrent file sessions per browser session.
+    #[serde(default = "default_max_file_sessions")]
+    pub max_sessions: usize,
+    /// Maximum accepted upload size per file session.
+    #[serde(default = "default_max_upload_bytes")]
+    pub max_upload_bytes: u64,
+    /// Idle timeout (seconds) after which a file session is closed.
+    #[serde(default = "default_file_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+}
+
+fn default_file_chunk_bytes() -> usize {
+    DEFAULT_FILE_CHUNK_BYTES
+}
+
+fn default_max_file_sessions() -> usize {
+    DEFAULT_MAX_FILE_SESSIONS
+}
+
+fn default_max_upload_bytes() -> u64 {
+    DEFAULT_MAX_UPLOAD_BYTES
+}
+
+fn default_file_idle_timeout_secs() -> u64 {
+    DEFAULT_FILE_IDLE_TIMEOUT_SECS
+}
+
+impl Default for FileConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auth_token: String::new(),
+            roots: Vec::new(),
+            chunk_bytes: default_file_chunk_bytes(),
+            max_sessions: default_max_file_sessions(),
+            max_upload_bytes: default_max_upload_bytes(),
+            idle_timeout_secs: default_file_idle_timeout_secs(),
+        }
+    }
+}
+
+impl FileConfig {
+    /// The node-local root exposed under `name`, if configured.
+    pub fn root(&self, name: &str) -> Option<&FileRoot> {
+        self.roots.iter().find(|r| r.name == name)
+    }
+
+    /// Idle timeout as a `Duration`.
+    pub fn idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.idle_timeout_secs.max(1))
+    }
+}
+
 /// Mesh signaling backend configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "mode", rename_all = "snake_case")]
@@ -154,6 +253,9 @@ pub struct GatewayConfig {
     /// SSH terminal bridge configuration.
     #[serde(default)]
     pub ssh: SshConfig,
+    /// File access / upload module (opt-in and token-protected).
+    #[serde(default)]
+    pub files: FileConfig,
     /// Mesh signaling backend.
     #[serde(default)]
     pub mesh: MeshConfig,
@@ -262,6 +364,54 @@ impl GatewayConfig {
                 "ssh.idle_timeout_secs must be >= 1".into(),
             ));
         }
+        // Files (REQ-005..REQ-008): fail-closed. An enabled module without a
+        // token would expose the filesystem to any browser that can complete
+        // ICE, since node-side browser identity is still unverified (G2).
+        if self.files.enabled && self.files.auth_token.trim().is_empty() {
+            return Err(GatewayError::Config(
+                "files.auth_token must not be empty when files.enabled".into(),
+            ));
+        }
+        if self.files.enabled {
+            if self.files.chunk_bytes == 0 || self.files.chunk_bytes > MAX_FILE_CHUNK_BYTES {
+                return Err(GatewayError::Config(format!(
+                    "files.chunk_bytes must be in 1..={MAX_FILE_CHUNK_BYTES}, got {}",
+                    self.files.chunk_bytes
+                )));
+            }
+            if self.files.max_sessions == 0 {
+                return Err(GatewayError::Config(
+                    "files.max_sessions must be >= 1".into(),
+                ));
+            }
+            if self.files.idle_timeout_secs == 0 {
+                return Err(GatewayError::Config(
+                    "files.idle_timeout_secs must be >= 1".into(),
+                ));
+            }
+        }
+        // Root hygiene is validated even while the module is disabled, so a
+        // sandbox cannot be misconfigured and switched on later.
+        let mut root_names = std::collections::HashSet::new();
+        for root in &self.files.roots {
+            if root.name.trim().is_empty() {
+                return Err(GatewayError::Config(
+                    "files.roots entry has empty name".into(),
+                ));
+            }
+            if !Path::new(&root.path).is_absolute() {
+                return Err(GatewayError::Config(format!(
+                    "files.roots.{} path must be absolute, got {}",
+                    root.name, root.path
+                )));
+            }
+            if !root_names.insert(root.name.as_str()) {
+                return Err(GatewayError::Config(format!(
+                    "duplicate files.roots name: {}",
+                    root.name
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -292,6 +442,7 @@ mod tests {
                 cert_dir: None,
             },
             ssh: SshConfig::default(),
+            files: FileConfig::default(),
             mesh: MeshConfig::InMemory,
         }
     }
@@ -421,5 +572,89 @@ mod tests {
         let json = serde_json::to_string(&cfg).expect("serialize");
         let parsed = GatewayConfig::from_json_str(&json).expect("parse");
         assert_eq!(parsed.mesh, cfg.mesh);
+    }
+
+    #[test]
+    fn files_disabled_by_default_and_needs_no_token() {
+        let cfg = valid_config();
+        assert!(!cfg.files.enabled);
+        cfg.validate().expect("default files config is valid");
+    }
+
+    #[test]
+    fn files_enabled_without_token_rejected() {
+        let mut cfg = valid_config();
+        cfg.files.enabled = true;
+        cfg.files.auth_token = String::new();
+        assert!(
+            matches!(cfg.validate(), Err(GatewayError::Config(_))),
+            "an enabled file module with no token must fail closed"
+        );
+    }
+
+    #[test]
+    fn files_enabled_with_token_accepted() {
+        let mut cfg = valid_config();
+        cfg.files.enabled = true;
+        cfg.files.auth_token = "s3cret-token".into();
+        cfg.validate().expect("valid file config");
+    }
+
+    #[test]
+    fn files_chunk_bytes_bounds_rejected() {
+        for bad in [0usize, MAX_FILE_CHUNK_BYTES + 1] {
+            let mut cfg = valid_config();
+            cfg.files.enabled = true;
+            cfg.files.auth_token = "t".into();
+            cfg.files.chunk_bytes = bad;
+            assert!(
+                matches!(cfg.validate(), Err(GatewayError::Config(_))),
+                "chunk_bytes {bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn files_root_path_must_be_absolute_and_unique() {
+        let mut cfg = valid_config();
+        cfg.files.roots = vec![FileRoot {
+            name: "tmp".into(),
+            path: "relative/dir".into(),
+            read_only: false,
+        }];
+        assert!(matches!(cfg.validate(), Err(GatewayError::Config(_))));
+
+        let mut cfg = valid_config();
+        cfg.files.roots = vec![
+            FileRoot {
+                name: "a".into(),
+                path: "/srv/a".into(),
+                read_only: false,
+            },
+            FileRoot {
+                name: "a".into(),
+                path: "/srv/b".into(),
+                read_only: true,
+            },
+        ];
+        assert!(
+            matches!(cfg.validate(), Err(GatewayError::Config(_))),
+            "duplicate root names must be rejected"
+        );
+    }
+
+    #[test]
+    fn files_absent_from_json_still_parses() {
+        // Configs written before the file module must keep loading.
+        let json = r#"{
+            "listen_addr":"127.0.0.1:8443",
+            "node_id":"node-a",
+            "node_name":"node-a",
+            "node_list":[{"peer_id":"node-a","name":"node-a"}],
+            "tls":{"mode":"auto_generate","names":["localhost"],"ips":["127.0.0.1"]}
+        }"#;
+        let cfg = GatewayConfig::from_json_str(json).expect("parse legacy config");
+        assert!(!cfg.files.enabled);
+        assert_eq!(cfg.files.chunk_bytes, DEFAULT_FILE_CHUNK_BYTES);
     }
 }

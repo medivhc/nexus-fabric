@@ -33,3 +33,47 @@ status = "todo"
 priority = "P0"
 acceptance = "重启后 node_id 不变，无需重新配置"
 created = "2026-10-10"
+
+# 文件访问与上传模块（REQ-005..REQ-008）+ ICE 候选一致性回归（REQ-009）。
+# 状态口径：实现与测试已在 xc-pc-linux（与 CI 同平台）通过，
+# 但尚未走完独立 Review + 合入 master，因此一律标 doing，不预支 done。
+
+[[req]]
+id = "REQ-005"
+title = "文件浏览与下载"
+status = "doing"
+priority = "P1"
+acceptance = "网页可列出目标主机 SFTP 目录与已启用的节点本地 root 内容，按分块下载文件且落地字节与源文件一致"
+created = "2026-10-10"
+
+[[req]]
+id = "REQ-006"
+title = "文件上传与断点续传"
+status = "doing"
+priority = "P1"
+acceptance = "网页选择本地文件上传到当前目录；中断重连后可从节点回执的连续字节位置继续；完成后目标路径只有完整文件，无 .nexus-part 残留"
+created = "2026-10-10"
+
+[[req]]
+id = "REQ-007"
+title = "目录管理（新建/改名/删除）"
+status = "doing"
+priority = "P2"
+acceptance = "可在当前目录新建子目录、重命名文件、删除文件或递归删除目录；删除前有确认；改名目标已存在时失败而不覆盖"
+created = "2026-10-10"
+
+[[req]]
+id = "REQ-008"
+title = "文件面鉴权与路径沙箱"
+status = "doing"
+priority = "P0"
+acceptance = "files.enabled=false 或 bearer token 不匹配时所有文件请求被显式拒绝；含 .. 或经符号链接指向 root 外的路径被拒绝；read_only root 拒绝一切写操作"
+created = "2026-10-10"
+
+[[req]]
+id = "REQ-009"
+title = "ICE host 候选与 UDP 绑定地址一致"
+status = "doing"
+priority = "P0"
+acceptance = "监听 127.0.0.1 的网关只通告 loopback 候选并且测试端能真正完成 ICE 连通；监听 0.0.0.0 时通告集合等于可路由网卡集合；cargo test -p nexus-web-gateway 退出码为 0"
+created = "2026-10-10"

@@ -17,13 +17,17 @@
 pub mod cert;
 pub mod config;
 pub mod error;
+pub mod file;
 pub mod gateway;
 pub mod http;
 pub mod mesh;
 pub mod protocol;
 pub mod ssh_client;
 
-pub use config::{GatewayConfig, IceServer, MeshNodeInfo, SshConfig, TlsConfig};
+pub use config::{
+    FileConfig, FileRoot, GatewayConfig, IceServer, MeshNodeInfo, SshConfig, TlsConfig,
+};
 pub use error::GatewayError;
+pub use file::{FileBackend, FileCommand, FileLimits, FileReply, LocalSandbox, SftpBackend};
 pub use gateway::{Gateway, GatewayHandle};
-pub use protocol::{BrowserMessage, NodeMessage, SdpPayload, SshAuth};
+pub use protocol::{BrowserMessage, FileEntry, FileTarget, NodeMessage, SdpPayload, SshAuth};

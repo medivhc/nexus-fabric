@@ -59,6 +59,29 @@ Page: https://192.168.1.10:8443/  (download the local CA at https://192.168.1.10
 3. 填写用户名和密码（或粘贴 OpenSSH 私钥）。
 4. 连接后即可执行命令；关闭页面即断开，凭证不落盘。
 
+### 5. 文件访问与上传（REQ-005..REQ-008）
+
+点节点的 **Files** 按钮展开文件面板：
+
+1. **访问目标**二选一：
+   - `目标主机 SFTP（复用上方 SSH 凭据）`：走节点侧 ssh2 的 SFTP 子系统，会话根是
+     远端账号的 **home 目录**，不暴露网关自身文件系统。
+   - `节点本地目录 <name>`：仅当配置里 `files.enabled=true` 且该 root 存在时可选；
+     `read_only` 的 root 只能看和下载。
+2. 填 **访问令牌**（= 配置里的 `files.auth_token`），点“连接文件会话”。
+   令牌缺失或不匹配会被直接拒绝；`files.enabled=false` 时面板显示“未启用”。
+3. 目录表格支持进入子目录、`../` 返回上级、地址栏输入路径回车跳转；
+   每行有 **下载 / 重命名 / 删除**（目录提供递归删除，删除前有确认）。
+4. **上传**写入当前目录：文件按 `chunk_bytes` 分块走独立的二进制通道，
+   进度条显示节点已确认的连续字节数。通道断了就重新“连接文件会话”后再次点上传，
+   同一目标路径会从已确认位置续传；已确认过的分块被重放也不会破坏文件。
+5. 上传完成前文件不可见：节点先写同目录的 `.nexus-part` 暂存文件，全部字节到位后
+   rename 到位；失败或关闭会话会清掉暂存文件。
+
+> 传输细节：控制通道只走 JSON 元数据，文件字节走 label 为 `nexus.file` 的二进制
+> DataChannel（14 字节帧头：kind / stream_id / offset / flags）。读是浏览器按 offset
+> 拉取，写是节点按连续前缀回执，所以两端都不需要维护大缓冲。
+
 ## 配置字段说明
 
 ### `listen_addr`
@@ -121,11 +144,40 @@ HTTPS/WSS 监听地址，同时决定 WebRTC UDP socket 绑定的 IP。
 - `max_terminals`：每个浏览器会话同时打开的终端上限。
 - `idle_timeout_secs`：终端空闲多少秒后自动断开。
 
+### `files`
+
+文件访问与上传（REQ-005..REQ-008）。整节可省略，缺省即关闭。
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `enabled` | `false` | 总开关。`false` 时任何 `file_open` 被显式拒绝。 |
+| `auth_token` | 空 | 每个文件会话必须出示的 bearer 令牌。**`enabled=true` 时必须非空**，否则启动即被 `validate()` 拒绝（fail-closed：浏览器身份在本节点不可验证）。 |
+| `roots` | `[]` | 节点本地暴露目录白名单：`{ name, path, read_only }`。`path` 必须绝对、`name` 不可重复；空数组即“只允许 SFTP”。 |
+| `chunk_bytes` | `65536` | 分块载荷上限，允许 `1..=262144`（需留在 SCTP 单消息上限内）。 |
+| `max_sessions` | `4` | 每个浏览器会话的文件会话上限。 |
+| `max_upload_bytes` | `2147483648` | 单个上传流的字节上限，超限即中止并清理暂存文件。 |
+| `idle_timeout_secs` | `300` | 文件会话空闲回收时间。 |
+
+安全边界：路径一律相对会话根、`..`/`\`/NUL 直接拒绝；解析时对根与最近存在的祖先做
+canonicalize，因此根内的符号链接也出不去（G13）。SFTP 的根由远端账号 home 约束。
+
 ## 常见问题
 
-- **页面一直停在 “P2P ICE 失败”**：检查 `listen_addr` 是否填了 `127.0.0.1`；
-  确认启动日志没有 “no non-loopback network interface found” 告警；确认访问的是
-  `https://<可路由IP>:<端口>/` 而不是 `https://0.0.0.0:.../`。
+- **页面一直停在 “P2P ICE 失败”**：先看 `listen_addr`。网关只通告**自己的 UDP socket
+  真能收包**的地址（G11）：`listen_addr=127.0.0.1` 时只通告 loopback（本机测试可用，
+  远程浏览器连不上）；`listen_addr=<某网卡IP>` 时只通告那个 IP；要让局域网/网格都能连，
+  填 `0.0.0.0`（绑通配地址并通告全部可路由网卡）或直接填那块网卡的 IP。
+  确认访问的是 `https://<可路由IP>:<端口>/` 而不是 `https://0.0.0.0:.../`；
+  启动日志出现 “`listen_addr` is unspecified and no non-loopback network interface was found”
+  说明这台机器根本没有可路由网卡，必须改网络或换节点。
+- **文件面板显示“未启用”**：`files.enabled` 为 `false`（缺省）。
+- **提示 “invalid file token”**：面板里的访问令牌与 `files.auth_token` 不一致。
+  注意 `files.enabled=true` 而 token 为空时，网关启动阶段就会被配置校验拒绝。
+- **提示 “path escapes root” / “path traversal”**：路径含 `..`，或根内符号链接指向根外。
+  这是设计如此（G13），把需要的目录加进 `files.roots` 而不是绕路。
+- **上传报 “read-only root”**：该 root 配了 `read_only=true`。
+- **上传中断后要不要重传全部**：不用。重新“连接文件会话”后对同一路径再次上传，
+  节点已确认的连续字节位置会体现在进度里（G14）。
 - **浏览器证书警告**：下载 `/cert` 安装本地 CA，并把机器 IP 加入 `tls.ips`
   后重新启动网关（证书会重新生成并持久化）。
 - **节点列表为空**：访问地址的 host 必须是网关所在机器的可路由 IP；`0.0.0.0`

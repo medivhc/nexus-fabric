@@ -155,6 +155,7 @@ impl TestSshd {
              PermitRootLogin no\n\
              AllowUsers {user}\n\
              UseDNS no\n\
+             Subsystem sftp internal-sftp\n\
              LogLevel VERBOSE\n",
             host_key = host_key.display(),
             pid = dir.join("sshd.pid").display(),
@@ -264,9 +265,13 @@ pub struct BrowserPeer {
     pub rtc: Rtc,
     pub udp: UdpSocket,
     pub channel: Option<ChannelId>,
+    /// The binary file DataChannel (`nexus.file`), when this peer offered one.
+    pub file_channel: Option<ChannelId>,
     pub last: Instant,
     pub connected: bool,
     pub messages: Vec<NodeMessage>,
+    /// Binary frames received on the file channel, in arrival order.
+    pub binary_frames: Vec<Vec<u8>>,
     /// UDP packets received from the gateway but not yet fed to str0m.
     pending_recv: VecDeque<(SocketAddr, Vec<u8>)>,
 }
@@ -279,11 +284,32 @@ impl BrowserPeer {
             rtc,
             udp,
             channel: None,
+            file_channel: None,
             last: Instant::now(),
             connected: false,
             messages: Vec::new(),
+            binary_frames: Vec::new(),
             pending_recv: VecDeque::new(),
         }
+    }
+
+    /// Send a binary frame over the file DataChannel.
+    pub fn send_file_frame(&mut self, bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+        let cid = self
+            .file_channel
+            .ok_or_else(|| -> Box<dyn std::error::Error> { "no file channel open".into() })?;
+        let mut ch = self
+            .rtc
+            .channel(cid)
+            .ok_or_else(|| -> Box<dyn std::error::Error> { "file channel gone".into() })?;
+        let _ = ch.write(true, bytes)?;
+        Ok(())
+    }
+
+    /// Pop the first received binary frame satisfying `predicate`.
+    pub fn take_binary_frame(&mut self, predicate: impl Fn(&[u8]) -> bool) -> Option<Vec<u8>> {
+        let idx = self.binary_frames.iter().position(|f| predicate(f));
+        idx.map(|i| self.binary_frames.remove(i))
     }
 
     /// Send a browser message over the control DataChannel.
@@ -357,14 +383,19 @@ impl BrowserPeer {
 
     fn handle_event(&mut self, event: Event) {
         match event {
-            Event::ChannelOpen(cid, _) => {
-                self.channel = Some(cid);
+            Event::ChannelOpen(cid, label) => {
+                if label == nexus_web_gateway::file::FILE_CHANNEL_LABEL {
+                    self.file_channel = Some(cid);
+                } else {
+                    self.channel = Some(cid);
+                    // Announce the browser's temporary identity on the control
+                    // channel only.
+                    let _ = self.send(&BrowserMessage::Hello {
+                        peer_id: self.peer_id.clone(),
+                        name: "test-browser".into(),
+                    });
+                }
                 self.connected = true;
-                // Announce the browser's temporary identity.
-                let _ = self.send(&BrowserMessage::Hello {
-                    peer_id: self.peer_id.clone(),
-                    name: "test-browser".into(),
-                });
             }
             Event::ChannelData(data) => self.handle_channel_data(&data),
             Event::IceConnectionStateChange(state) if state.is_connected() => {
@@ -376,6 +407,7 @@ impl BrowserPeer {
 
     fn handle_channel_data(&mut self, data: &ChannelData) {
         if data.binary {
+            self.binary_frames.push(data.data.to_vec());
             return;
         }
         if let Ok(msg) = serde_json::from_slice::<NodeMessage>(&data.data) {
@@ -390,6 +422,9 @@ pub struct Browser {
     pub peer_id: String,
     pub ws: WssClient,
     pub peers: Vec<BrowserPeer>,
+    /// Raw SDP of the answer to the first offer, so tests can assert on the
+    /// advertised ICE candidates.
+    pub answer_sdp: String,
 }
 
 impl Browser {
@@ -420,9 +455,10 @@ impl Browser {
         )?))?;
 
         let answer_msg = read_ws_json(&mut ws)?;
-        let answer_sdp: SdpPayload =
+        let answer_payload: SdpPayload =
             serde_json::from_value(answer_msg.get("sdp").ok_or("answer missing sdp")?.clone())?;
-        let answer = answer_sdp.to_answer().map_err(|e| e.to_string())?;
+        let answer_sdp = answer_payload.sdp.clone();
+        let answer = answer_payload.to_answer().map_err(|e| e.to_string())?;
         rtc.sdp_api().accept_answer(pending, answer)?;
 
         let peer = BrowserPeer::new(node_id.to_string(), peer_id.to_string(), rtc, udp);
@@ -432,6 +468,7 @@ impl Browser {
             peer_id: peer_id.to_string(),
             ws,
             peers: vec![peer],
+            answer_sdp,
         })
     }
 
@@ -487,7 +524,8 @@ impl Browser {
     }
 }
 
-/// Create a browser-side Rtc with a control DataChannel and a host candidate.
+/// Create a browser-side Rtc with a control DataChannel, a file DataChannel and
+/// a host candidate.
 pub fn create_rtc_with_channel() -> Result<
     (
         Rtc,
@@ -506,6 +544,9 @@ pub fn create_rtc_with_channel() -> Result<
 
     let mut changes = rtc.sdp_api();
     changes.add_channel("control".into());
+    // The binary channel must be offered in the same SDP: the gateway does not
+    // support renegotiation, so a second offer later would be rejected.
+    changes.add_channel(nexus_web_gateway::file::FILE_CHANNEL_LABEL.into());
     let (offer, pending) = changes.apply().ok_or("failed to apply channel offer")?;
     Ok((rtc, udp, offer, pending))
 }

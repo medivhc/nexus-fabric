@@ -68,6 +68,46 @@
     </div>
     <div id="terminal-container"></div>
   </section>
+
+  <!-- 文件访问与上传 (REQ-005..REQ-008)：浏览/下载/上传/目录管理 -->
+  <section id="files-card" hidden>
+    <h2>文件 <span id="files-node" class="mono"></span></h2>
+    <div id="files-error" class="terminal-error" hidden></div>
+    <div class="files-controls">
+      <label>访问目标
+        <select id="files-target"></select>
+      </label>
+      <label>访问令牌
+        <input id="files-token" type="password" autocomplete="off" placeholder="files.auth_token">
+      </label>
+      <button id="files-open" type="button">连接文件会话</button>
+      <span id="files-session" class="node-meta">未连接</span>
+    </div>
+    <div class="files-pathbar">
+      <input id="files-path" type="text" value="/" autocomplete="off" spellcheck="false" aria-label="当前目录">
+      <button id="files-refresh" type="button" disabled>刷新</button>
+      <button id="files-mkdir" type="button" disabled>新建目录</button>
+      <button id="files-upload" type="button" disabled>上传文件</button>
+      <input id="files-upload-input" type="file" multiple hidden>
+    </div>
+    <div id="files-progress" class="files-progress" hidden>
+      <div class="files-progress-track"><div id="files-progress-fill" class="files-progress-fill"></div></div>
+      <span id="files-progress-text" class="mono"></span>
+    </div>
+    <table class="files-table">
+      <thead>
+        <tr><th>名称</th><th>大小</th><th>修改时间</th><th>权限</th><th>操作</th></tr>
+      </thead>
+      <tbody id="files-body">
+        <tr class="files-empty"><td colspan="5">连接文件会话后显示目录内容</td></tr>
+      </tbody>
+    </table>
+    <p class="cert-desc">
+      字节走独立的二进制 DataChannel（label <code>nexus.file</code>，14 字节帧头 + 分块），
+      不占用终端通道；上传按节点确认的连续字节数断点续传，提交时先写 <code>.nexus-part</code> 再改名。
+      凭据复用上方终端的用户名/密码或私钥，仅在节点内存中使用。
+    </p>
+  </section>
 </main>
 
 <script src="/xterm.js"></script>

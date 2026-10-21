@@ -214,3 +214,81 @@ header #retry-btn:not([hidden]) ~ .theme-toggle {
 .reconnect-notice strong {
   color: var(--fg);
 }
+
+/* Files panel (REQ-005..REQ-008) */
+.files-controls,
+.files-pathbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: flex-end;
+  margin-bottom: 10px;
+}
+.files-controls label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.files-pathbar input[type="text"] {
+  flex: 1 1 240px;
+  min-width: 180px;
+}
+#files-session {
+  font-size: 12px;
+  color: var(--muted);
+}
+.files-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.files-table th,
+.files-table td {
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+.files-table th {
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 12px;
+}
+.files-actions {
+  white-space: nowrap;
+  text-align: right;
+}
+.files-actions button {
+  margin-left: 6px;
+}
+.files-danger {
+  color: var(--err);
+  border-color: var(--err);
+}
+.files-empty td {
+  color: var(--muted);
+  text-align: center;
+  padding: 16px;
+}
+.files-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.files-progress-track {
+  flex: 1 1 auto;
+  height: 6px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.files-progress-fill {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  transition: width 0.15s ease;
+}

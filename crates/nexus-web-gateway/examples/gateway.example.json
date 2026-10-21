@@ -31,6 +31,26 @@
     "max_terminals": 5,
     "idle_timeout_secs": 600
   },
+  "files": {
+    "enabled": false,
+    "auth_token": "change-me-file-token",
+    "roots": [
+      {
+        "name": "downloads",
+        "path": "/var/lib/nexus/downloads",
+        "read_only": false
+      },
+      {
+        "name": "logs",
+        "path": "/var/log",
+        "read_only": true
+      }
+    ],
+    "chunk_bytes": 65536,
+    "max_sessions": 4,
+    "max_upload_bytes": 2147483648,
+    "idle_timeout_secs": 300
+  },
   "mesh": {
     "mode": "wss",
     "token": "change-me-local-token",

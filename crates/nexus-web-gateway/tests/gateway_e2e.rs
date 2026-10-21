@@ -12,9 +12,10 @@ use std::time::Duration;
 use common::{Browser, TestSshd};
 use nexus_web_gateway::Gateway;
 use nexus_web_gateway::config::{
-    GatewayConfig, IceServer, MeshConfig, MeshNodeInfo, MeshPeer, SshConfig, TlsConfig,
+    FileConfig, FileRoot, GatewayConfig, IceServer, MeshConfig, MeshNodeInfo, MeshPeer, SshConfig,
+    TlsConfig,
 };
-use nexus_web_gateway::protocol::{BrowserMessage, NodeMessage};
+use nexus_web_gateway::protocol::{BrowserMessage, FileTarget, NodeMessage};
 
 static CERT_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -77,6 +78,7 @@ fn test_config(
             max_terminals: 5,
             idle_timeout_secs: 600,
         },
+        files: FileConfig::default(),
         mesh: MeshConfig::InMemory,
     }
 }
@@ -988,6 +990,7 @@ fn gateway_cfg_wss(
             max_terminals: 5,
             idle_timeout_secs: 600,
         },
+        files: FileConfig::default(),
         mesh: MeshConfig::Wss {
             token: token.into(),
             peers: vec![MeshPeer {
@@ -1204,31 +1207,875 @@ fn b64decode_for_test(s: &str) -> Vec<u8> {
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-/// Test: ICE advertises multiple host candidates on multi-homed hosts.
-/// Regression test for single-candidate bug where only the bound UDP address
-/// was advertised, breaking ICE on hosts with multiple interfaces
-/// (e.g. LAN + EasyTier mesh).
-#[test]
-fn ice_advertises_multiple_host_candidates() {
-    // This test verifies the candidate enumeration logic by checking that
-    // getifaddrs returns multiple non-loopback addresses on this host.
-    // The actual gateway code now iterates all interfaces.
-    let interfaces = getifaddrs::getifaddrs().expect("getifaddrs failed");
-    let mut non_loopback_v4 = 0;
-    for iface in interfaces {
+/// Extract the addresses of all `typ host` ICE candidates in an SDP.
+///
+/// Parsed relative to the `typ` keyword (`... <address> <port> typ host`) so it
+/// does not depend on how many leading fields a given stack emits.
+fn host_candidate_addresses(sdp: &str) -> Vec<String> {
+    sdp.lines()
+        .filter(|line| line.starts_with("a=candidate:") && line.contains(" typ host"))
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let typ = fields.iter().position(|field| *field == "typ")?;
+            fields.get(typ.checked_sub(2)?).copied().map(str::to_string)
+        })
+        .collect()
+}
+
+/// Routable (non-loopback, non-unspecified, non-multicast) IPv4 addresses of
+/// this host, as the gateway enumerates them.
+fn routable_ipv4s() -> Vec<String> {
+    let mut ips = Vec::new();
+    for iface in getifaddrs::getifaddrs().expect("getifaddrs failed") {
         if iface.flags.contains(getifaddrs::InterfaceFlags::LOOPBACK) {
             continue;
         }
-        if let Some(std::net::IpAddr::V4(_)) = iface.address.ip_addr() {
-            if let Some(ip) = iface.address.ip_addr() {
-                if !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast() {
-                    non_loopback_v4 += 1;
-                }
-            }
+        let Some(ip) = iface.address.ip_addr() else {
+            continue;
+        };
+        // The gateway matches the candidate family against the listen address
+        // (`0.0.0.0` here), so only IPv4 may appear in its candidate set.
+        let std::net::IpAddr::V4(v4) = ip else {
+            continue;
+        };
+        if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+            continue;
+        }
+        let s = v4.to_string();
+        if !ips.contains(&s) {
+            ips.push(s);
         }
     }
-    // Test host should have at least loopback; multi-homed hosts have more.
-    // This test documents the expectation that multiple candidates are possible.
-    println!("Found {} non-loopback IPv4 interfaces", non_loopback_v4);
-    // The fix ensures ALL such addresses become ICE candidates, not just one.
+    ips
+}
+
+/// G11 regression: a gateway whose UDP socket is bound to `127.0.0.1` must
+/// advertise *only* the loopback host candidate. Advertising the host's LAN/mesh
+/// IPs instead (what the multi-homed fix used to do unconditionally) gives ICE
+/// candidates the bound socket can never receive on, so the connection times
+/// out — that is what broke every DataChannel test and the gateway-ci pipeline.
+#[test]
+fn loopback_bound_gateway_advertises_only_loopback_candidates() -> TestResult {
+    let cfg = test_config(
+        "node-a",
+        "node-a",
+        "127.0.0.1:0".parse()?,
+        dead_ssh_target(),
+    );
+    let handle = Gateway::start(cfg)?;
+
+    let mut browser = Browser::connect_first(
+        &handle.cert_der,
+        handle.local_addr,
+        "node-a",
+        "sess-ice-loopback",
+    )?;
+    browser.drive_all(Duration::from_secs(5))?;
+
+    let addrs = host_candidate_addresses(&browser.answer_sdp);
+    assert!(
+        !addrs.is_empty(),
+        "answer advertised no host candidate:\n{}",
+        browser.answer_sdp
+    );
+    assert!(
+        addrs.iter().all(|a| a == "127.0.0.1"),
+        "loopback-bound gateway must advertise only 127.0.0.1, got {addrs:?}"
+    );
+    assert!(
+        browser.peers[0].connected,
+        "ICE must connect on a loopback-bound gateway (candidates: {addrs:?})"
+    );
+    Ok(())
+}
+
+/// REQ-002 intent, now with a real assertion: an unspecified `listen_addr` binds
+/// the wildcard, which *does* receive on every interface, so every routable
+/// interface address becomes a host candidate (multi-homed hosts: LAN + mesh).
+/// A wildcard/`0.0.0.0` address itself must never be advertised.
+#[test]
+fn wildcard_bound_gateway_advertises_all_routable_interfaces() -> TestResult {
+    let cfg = test_config("node-a", "node-a", "0.0.0.0:0".parse()?, dead_ssh_target());
+    let handle = Gateway::start(cfg)?;
+
+    // The listener is on the wildcard address, but the test certificate only
+    // covers `localhost`/`127.0.0.1`, so signal over loopback (`page_addr` would
+    // be the derived LAN IP and rustls would reject it as a name mismatch).
+    let dial = std::net::SocketAddr::new(
+        std::net::Ipv4Addr::LOCALHOST.into(),
+        handle.local_addr.port(),
+    );
+    let browser = Browser::connect_first(&handle.cert_der, dial, "node-a", "sess-ice-wildcard")?;
+
+    let addrs = host_candidate_addresses(&browser.answer_sdp);
+    assert!(
+        !addrs.is_empty(),
+        "answer advertised no host candidate:\n{}",
+        browser.answer_sdp
+    );
+    let leaked: Vec<&String> = addrs
+        .iter()
+        .filter(|a| {
+            a.parse::<std::net::IpAddr>()
+                .map_or(true, |ip| ip.is_unspecified())
+        })
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "wildcard address leaked into ICE candidates: {leaked:?}"
+    );
+
+    let iface_ips = routable_ipv4s();
+    if iface_ips.is_empty() {
+        // Host without any routable IPv4 interface: loopback fallback, and the
+        // gateway must have warned the operator that browsers cannot reach it.
+        assert_eq!(addrs, vec!["127.0.0.1".to_string()], "{addrs:?}");
+    } else {
+        for expected in &iface_ips {
+            assert!(
+                addrs.contains(expected),
+                "interface IP {expected} missing from candidates {addrs:?}"
+            );
+        }
+        assert_eq!(
+            addrs.len(),
+            iface_ips.len(),
+            "candidates {addrs:?} must match the routable interfaces {iface_ips:?}"
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// File access and upload (REQ-005..REQ-008)
+// ---------------------------------------------------------------------------
+
+/// Gateway config with the file module enabled.
+fn file_test_config(
+    listen: SocketAddr,
+    ssh_target: SocketAddr,
+    roots: Vec<FileRoot>,
+    token: &str,
+) -> GatewayConfig {
+    let mut cfg = test_config("node-a", "node-a", listen, ssh_target);
+    cfg.files = FileConfig {
+        enabled: true,
+        auth_token: token.into(),
+        roots,
+        chunk_bytes: 1024,
+        max_sessions: 2,
+        max_upload_bytes: 1 << 20,
+        idle_timeout_secs: 600,
+    };
+    cfg
+}
+
+/// Drive the browser until a node message satisfies `predicate`.
+fn wait_for_message(
+    browser: &mut Browser,
+    predicate: impl Fn(&NodeMessage) -> bool,
+    secs: u64,
+) -> Option<NodeMessage> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        if browser.drive_all(Duration::from_millis(60)).is_err() {
+            return None;
+        }
+        if let Some(msg) = browser.peers[0].take_message(&predicate) {
+            return Some(msg);
+        }
+        if std::time::Instant::now() > deadline {
+            return None;
+        }
+    }
+}
+
+/// Drive the browser until a binary file frame satisfies `predicate`.
+fn wait_for_frame(
+    browser: &mut Browser,
+    predicate: impl Fn(nexus_web_gateway::file::Frame<'_>) -> bool,
+    secs: u64,
+) -> Option<Vec<u8>> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        if browser.drive_all(Duration::from_millis(60)).is_err() {
+            return None;
+        }
+        let hit = browser.peers[0]
+            .binary_frames
+            .iter()
+            .position(|f| nexus_web_gateway::file::decode_frame(f).is_ok_and(&predicate));
+        if let Some(idx) = hit {
+            return Some(browser.peers[0].binary_frames.remove(idx));
+        }
+        if std::time::Instant::now() > deadline {
+            return None;
+        }
+    }
+}
+
+/// A connected browser with one opened file session on a node-local root.
+fn browser_with_local_file_session(
+    handle: &nexus_web_gateway::GatewayHandle,
+    token: &str,
+    root: &str,
+    session_id: &str,
+) -> Result<Browser, Box<dyn std::error::Error>> {
+    let mut browser =
+        Browser::connect_first(&handle.cert_der, handle.local_addr, "node-a", session_id)?;
+    browser.drive_all(Duration::from_secs(3))?;
+    if !browser.peers[0].connected {
+        return Err("browser did not connect".into());
+    }
+    browser.peers[0].send(&BrowserMessage::FileOpen {
+        session_id: session_id.into(),
+        token: token.into(),
+        target: FileTarget::Local { root: root.into() },
+    })?;
+    match wait_for_message(
+        &mut browser,
+        |m| matches!(m, NodeMessage::FileOpenAck { .. }),
+        10,
+    ) {
+        Some(NodeMessage::FileOpenAck { status, .. }) if status == "ok" => Ok(browser),
+        Some(NodeMessage::FileOpenAck { error, .. }) => {
+            Err(format!("file open failed: {error:?}").into())
+        }
+        other => Err(format!("no file_open_ack, got {other:?}").into()),
+    }
+}
+
+/// A temp dir exposed as a named root, pre-populated with one file.
+fn local_root_with_file(tag: &str) -> (FileRoot, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "nexus-gw-e2e-{tag}-{}-{}",
+        std::process::id(),
+        CERT_DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).expect("create root");
+    std::fs::write(dir.join("hello.txt"), b"hello nexus gateway file").expect("seed file");
+    (
+        FileRoot {
+            name: "files".into(),
+            path: dir.display().to_string(),
+            read_only: false,
+        },
+        dir,
+    )
+}
+
+/// Unique per-test directory name used inside the remote SFTP home.
+fn sftp_work_dir() -> String {
+    format!(
+        "nexus-e2e-{}-{}",
+        std::process::id(),
+        CERT_DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+#[test]
+fn file_module_disabled_refuses_open() -> TestResult {
+    // Default config: the module is off, so a file_open must be refused.
+    let cfg = test_config(
+        "node-a",
+        "node-a",
+        "127.0.0.1:0".parse()?,
+        dead_ssh_target(),
+    );
+    let handle = Gateway::start(cfg)?;
+    let mut browser = Browser::connect_first(
+        &handle.cert_der,
+        handle.local_addr,
+        "node-a",
+        "sess-file-off",
+    )?;
+    browser.drive_all(Duration::from_secs(2))?;
+    browser.peers[0].send(&BrowserMessage::FileOpen {
+        session_id: "fs-1".into(),
+        token: "whatever".into(),
+        target: FileTarget::Local {
+            root: "files".into(),
+        },
+    })?;
+
+    match wait_for_message(
+        &mut browser,
+        |m| matches!(m, NodeMessage::FileOpenAck { .. }),
+        10,
+    ) {
+        Some(NodeMessage::FileOpenAck { status, error, .. }) => {
+            assert_eq!(status, "error");
+            assert_eq!(error.as_deref(), Some("file module disabled"));
+        }
+        other => return Err(format!("expected file_open_ack, got {other:?}").into()),
+    }
+    Ok(())
+}
+
+#[test]
+fn file_open_with_wrong_token_is_refused() -> TestResult {
+    let (root, dir) = local_root_with_file("token");
+    let cfg = file_test_config(
+        "127.0.0.1:0".parse()?,
+        dead_ssh_target(),
+        vec![root],
+        "right-token",
+    );
+    let handle = Gateway::start(cfg)?;
+
+    let mut browser = Browser::connect_first(
+        &handle.cert_der,
+        handle.local_addr,
+        "node-a",
+        "sess-file-token",
+    )?;
+    browser.drive_all(Duration::from_secs(2))?;
+    browser.peers[0].send(&BrowserMessage::FileOpen {
+        session_id: "fs-1".into(),
+        token: "wrong-token".into(),
+        target: FileTarget::Local {
+            root: "files".into(),
+        },
+    })?;
+    let result = wait_for_message(
+        &mut browser,
+        |m| matches!(m, NodeMessage::FileOpenAck { .. }),
+        10,
+    );
+    let ack = match result {
+        Some(ack @ NodeMessage::FileOpenAck { .. }) => ack,
+        other => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(format!("expected file_open_ack, got {other:?}").into());
+        }
+    };
+    match ack {
+        NodeMessage::FileOpenAck { status, error, .. } => {
+            assert_eq!(status, "error");
+            assert_eq!(error.as_deref(), Some("invalid file token"));
+        }
+        _ => unreachable!(),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[test]
+fn file_local_session_lists_stats_and_downloads_over_binary_channel() -> TestResult {
+    let (root, dir) = local_root_with_file("dl");
+    let cfg = file_test_config("127.0.0.1:0".parse()?, dead_ssh_target(), vec![root], "tok");
+    let handle = Gateway::start(cfg)?;
+    let sid = "sess-file-dl".to_string();
+    let mut browser = match browser_with_local_file_session(&handle, "tok", "files", &sid) {
+        Ok(browser) => browser,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+    };
+
+    // List.
+    browser.peers[0].send(&BrowserMessage::FileList {
+        session_id: sid.clone(),
+        path: "/".into(),
+    })?;
+    let listed = wait_for_message(
+        &mut browser,
+        |m| matches!(m, NodeMessage::FileListAck { session_id, .. } if *session_id == sid),
+        10,
+    );
+    match listed {
+        Some(NodeMessage::FileListAck { entries, error, .. }) => {
+            assert_eq!(error, None);
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| e.name == "hello.txt" && e.size == 24),
+                "entries: {entries:?}"
+            );
+        }
+        other => return Err(format!("expected file_list_ack, got {other:?}").into()),
+    }
+
+    // Stat.
+    browser.peers[0].send(&BrowserMessage::FileStat {
+        session_id: sid.clone(),
+        path: "/hello.txt".into(),
+    })?;
+    let statted = wait_for_message(
+        &mut browser,
+        |m| matches!(m, NodeMessage::FileStatAck { session_id, .. } if *session_id == sid),
+        10,
+    );
+    assert!(
+        matches!(
+            statted,
+            Some(NodeMessage::FileStatAck { entry: Some(_), .. })
+        ),
+        "stat: {statted:?}"
+    );
+
+    // Download: the chunk must arrive as a binary frame, never as JSON.
+    browser.peers[0].send(&BrowserMessage::FileRead {
+        session_id: sid.clone(),
+        stream_id: 11,
+        path: "/hello.txt".into(),
+        offset: 0,
+        len: 1024,
+    })?;
+    let raw = wait_for_frame(&mut browser, |f| f.stream_id == 11 && f.offset == 0, 10)
+        .ok_or("no read chunk frame received")?;
+    let frame = nexus_web_gateway::file::decode_frame(&raw)?;
+    assert_eq!(frame.kind, nexus_web_gateway::file::FRAME_READ_CHUNK);
+    assert_eq!(frame.data, b"hello nexus gateway file");
+    assert!(frame.final_block, "a short read must mark the final chunk");
+
+    // A second pull at an offset resumes exactly there.
+    browser.peers[0].send(&BrowserMessage::FileRead {
+        session_id: sid.clone(),
+        stream_id: 12,
+        path: "/hello.txt".into(),
+        offset: 6,
+        len: 6,
+    })?;
+    let raw = wait_for_frame(&mut browser, |f| f.stream_id == 12, 10).ok_or("no second frame")?;
+    let frame = nexus_web_gateway::file::decode_frame(&raw)?;
+    assert_eq!(frame.data, b"nexus ");
+    assert!(!frame.final_block, "6 bytes of 6 requested is not EOF");
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[test]
+fn file_local_upload_round_trip_with_resume() -> TestResult {
+    let root_dir = std::env::temp_dir().join(format!(
+        "nexus-gw-e2e-up-{}-{}",
+        std::process::id(),
+        CERT_DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root_dir)?;
+    let root = FileRoot {
+        name: "up".into(),
+        path: root_dir.display().to_string(),
+        read_only: false,
+    };
+    let cfg = file_test_config("127.0.0.1:0".parse()?, dead_ssh_target(), vec![root], "tok");
+    let handle = Gateway::start(cfg)?;
+    let sid = "sess-file-up".to_string();
+    let mut browser = browser_with_local_file_session(&handle, "tok", "up", &sid)?;
+
+    browser.peers[0].send(&BrowserMessage::FileWriteBegin {
+        session_id: sid.clone(),
+        stream_id: 21,
+        path: "/up.txt".into(),
+    })?;
+    let begin = wait_for_message(
+        &mut browser,
+        |m| matches!(m, NodeMessage::FileWriteAck { session_id, .. } if *session_id == sid),
+        10,
+    );
+    assert!(
+        matches!(
+            begin,
+            Some(NodeMessage::FileWriteAck {
+                received: 0,
+                error: None,
+                ..
+            })
+        ),
+        "write_begin: {begin:?}"
+    );
+
+    // Out of order first: buffered, and the ack still reports the front (0).
+    browser.peers[0].send_file_frame(&nexus_web_gateway::file::encode_frame(
+        nexus_web_gateway::file::FRAME_WRITE_CHUNK,
+        21,
+        5,
+        false,
+        b"WORLD",
+    ))?;
+    let ack = wait_for_message(
+        &mut browser,
+        |m| matches!(m, NodeMessage::FileWriteAck { stream_id: 21, .. }),
+        10,
+    );
+    assert!(
+        matches!(
+            ack,
+            Some(NodeMessage::FileWriteAck {
+                received: 0,
+                error: None,
+                ..
+            })
+        ),
+        "a buffered chunk must ack the contiguous front: {ack:?}"
+    );
+
+    // Filling the front drains both chunks.
+    browser.peers[0].send_file_frame(&nexus_web_gateway::file::encode_frame(
+        nexus_web_gateway::file::FRAME_WRITE_CHUNK,
+        21,
+        0,
+        false,
+        b"HELLO",
+    ))?;
+    let ack = wait_for_message(
+        &mut browser,
+        |m| {
+            matches!(
+                m,
+                NodeMessage::FileWriteAck {
+                    stream_id: 21,
+                    received: 10,
+                    ..
+                }
+            )
+        },
+        10,
+    );
+    assert!(ack.is_some(), "drain to 10 bytes was not acked");
+
+    // A replay of already-acked bytes is tolerated (a reconnect resumes).
+    browser.peers[0].send_file_frame(&nexus_web_gateway::file::encode_frame(
+        nexus_web_gateway::file::FRAME_WRITE_CHUNK,
+        21,
+        0,
+        false,
+        b"HELLO",
+    ))?;
+    let ack = wait_for_message(
+        &mut browser,
+        |m| {
+            matches!(
+                m,
+                NodeMessage::FileWriteAck {
+                    stream_id: 21,
+                    received: 10,
+                    error: None,
+                    ..
+                }
+            )
+        },
+        10,
+    );
+    assert!(
+        ack.is_some(),
+        "a replay must neither error nor move the front"
+    );
+
+    browser.peers[0].send(&BrowserMessage::FileWriteEnd {
+        session_id: sid.clone(),
+        stream_id: 21,
+        path: "/up.txt".into(),
+    })?;
+    let done = wait_for_message(
+        &mut browser,
+        |m| {
+            matches!(m, NodeMessage::FileOpAck { session_id, op, .. }
+            if *session_id == sid && op == "write_end")
+        },
+        10,
+    );
+    assert!(
+        matches!(done, Some(NodeMessage::FileOpAck { ok: true, .. })),
+        "write_end: {done:?}"
+    );
+    assert_eq!(
+        std::fs::read(root_dir.join("up.txt"))?,
+        b"HELLOWORLD",
+        "the commit must land the bytes in order"
+    );
+
+    // No staging leftovers.
+    let leftovers: Vec<String> = std::fs::read_dir(&root_dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(leftovers, vec!["up.txt".to_string()], "{leftovers:?}");
+    let _ = std::fs::remove_dir_all(&root_dir);
+    Ok(())
+}
+
+#[test]
+fn file_local_session_blocks_traversal_over_channel() -> TestResult {
+    let (root, dir) = local_root_with_file("trav");
+    let cfg = file_test_config("127.0.0.1:0".parse()?, dead_ssh_target(), vec![root], "tok");
+    let handle = Gateway::start(cfg)?;
+    let sid = "sess-file-trav".to_string();
+    let mut browser = browser_with_local_file_session(&handle, "tok", "files", &sid)?;
+
+    browser.peers[0].send(&BrowserMessage::FileList {
+        session_id: sid.clone(),
+        path: "/../..".into(),
+    })?;
+    let listed = wait_for_message(
+        &mut browser,
+        |m| matches!(m, NodeMessage::FileListAck { session_id, .. } if *session_id == sid),
+        10,
+    );
+    let ack = match listed {
+        Some(ack @ NodeMessage::FileListAck { .. }) => ack,
+        other => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(format!("expected file_list_ack, got {other:?}").into());
+        }
+    };
+    match ack {
+        NodeMessage::FileListAck { error, entries, .. } => {
+            assert!(entries.is_empty(), "an escape attempt returned entries");
+            assert!(
+                error.as_deref().unwrap_or_default().contains("traversal"),
+                "expected a traversal error, got {error:?}"
+            );
+        }
+        _ => unreachable!(),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[test]
+fn file_local_session_honours_max_sessions() -> TestResult {
+    let (root, dir) = local_root_with_file("max");
+    let cfg = file_test_config("127.0.0.1:0".parse()?, dead_ssh_target(), vec![root], "tok");
+    let handle = Gateway::start(cfg)?;
+    let mut browser = browser_with_local_file_session(&handle, "tok", "files", "sess-file-max")?;
+
+    // The helper already opened one; a second is allowed (max 2), a third must
+    // be refused.
+    browser.peers[0].send(&BrowserMessage::FileOpen {
+        session_id: "fs-second".into(),
+        token: "tok".into(),
+        target: FileTarget::Local {
+            root: "files".into(),
+        },
+    })?;
+    let second = wait_for_message(
+        &mut browser,
+        |m| matches!(m, NodeMessage::FileOpenAck { session_id, .. } if session_id == "fs-second"),
+        10,
+    );
+    match second {
+        Some(NodeMessage::FileOpenAck { status, error, .. }) => {
+            assert_eq!(status, "ok", "second session refused: {error:?}");
+        }
+        other => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(format!("expected file_open_ack, got {other:?}").into());
+        }
+    }
+
+    browser.peers[0].send(&BrowserMessage::FileOpen {
+        session_id: "fs-third".into(),
+        token: "tok".into(),
+        target: FileTarget::Local {
+            root: "files".into(),
+        },
+    })?;
+    let third = wait_for_message(
+        &mut browser,
+        |m| matches!(m, NodeMessage::FileOpenAck { session_id, .. } if session_id == "fs-third"),
+        10,
+    );
+    let ack = match third {
+        Some(ack @ NodeMessage::FileOpenAck { .. }) => ack,
+        other => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(format!("expected file_open_ack, got {other:?}").into());
+        }
+    };
+    match ack {
+        NodeMessage::FileOpenAck { status, error, .. } => {
+            assert_eq!(status, "error");
+            assert_eq!(error.as_deref(), Some("max file sessions reached"));
+        }
+        _ => unreachable!(),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[test]
+fn file_sftp_session_round_trip_against_real_sshd() -> TestResult {
+    let sshd = TestSshd::spawn()?;
+    let work = sftp_work_dir();
+
+    let cfg = file_test_config("127.0.0.1:0".parse()?, sshd.addr, vec![], "tok");
+    let handle = Gateway::start(cfg)?;
+    let sid = "sess-file-sftp".to_string();
+
+    let mut browser = Browser::connect_first(&handle.cert_der, handle.local_addr, "node-a", &sid)?;
+    browser.drive_all(Duration::from_secs(3))?;
+    browser.peers[0].send(&BrowserMessage::FileOpen {
+        session_id: sid.clone(),
+        token: "tok".into(),
+        target: FileTarget::Sftp {
+            auth: Some(sshd.key_auth()),
+        },
+    })?;
+    let opened = wait_for_message(
+        &mut browser,
+        |m| matches!(m, NodeMessage::FileOpenAck { session_id, .. } if *session_id == sid),
+        20,
+    );
+    match opened {
+        Some(NodeMessage::FileOpenAck {
+            status,
+            kind,
+            error,
+            ..
+        }) => {
+            assert_eq!(kind, "sftp", "open ack: {status} {error:?}");
+            assert_eq!(status, "ok", "sftp open failed: {error:?}");
+        }
+        other => return Err(format!("expected file_open_ack, got {other:?}").into()),
+    }
+
+    // mkdir over the real SFTP subsystem.
+    browser.peers[0].send(&BrowserMessage::FileMkdir {
+        session_id: sid.clone(),
+        path: format!("/{work}"),
+    })?;
+    let mk = wait_for_message(
+        &mut browser,
+        |m| {
+            matches!(m, NodeMessage::FileOpAck { session_id, op, .. }
+            if *session_id == sid && op == "mkdir")
+        },
+        20,
+    );
+    assert!(
+        matches!(mk, Some(NodeMessage::FileOpAck { ok: true, .. })),
+        "mkdir: {mk:?}"
+    );
+
+    // Upload through the binary channel.
+    browser.peers[0].send(&BrowserMessage::FileWriteBegin {
+        session_id: sid.clone(),
+        stream_id: 31,
+        path: format!("/{work}/remote.txt"),
+    })?;
+    let begin = wait_for_message(
+        &mut browser,
+        |m| matches!(m, NodeMessage::FileWriteAck { stream_id: 31, .. }),
+        20,
+    );
+    assert!(
+        matches!(begin, Some(NodeMessage::FileWriteAck { error: None, .. })),
+        "write_begin: {begin:?}"
+    );
+    browser.peers[0].send_file_frame(&nexus_web_gateway::file::encode_frame(
+        nexus_web_gateway::file::FRAME_WRITE_CHUNK,
+        31,
+        0,
+        false,
+        b"sftp-over-webrtc",
+    ))?;
+    let acked = wait_for_message(
+        &mut browser,
+        |m| {
+            matches!(
+                m,
+                NodeMessage::FileWriteAck {
+                    stream_id: 31,
+                    received: 16,
+                    ..
+                }
+            )
+        },
+        20,
+    );
+    assert!(acked.is_some(), "upload was not acked at 16 bytes");
+    browser.peers[0].send(&BrowserMessage::FileWriteEnd {
+        session_id: sid.clone(),
+        stream_id: 31,
+        path: format!("/{work}/remote.txt"),
+    })?;
+    let ended = wait_for_message(
+        &mut browser,
+        |m| matches!(m, NodeMessage::FileOpAck { op, .. } if op == "write_end"),
+        20,
+    );
+    assert!(
+        matches!(ended, Some(NodeMessage::FileOpAck { ok: true, .. })),
+        "write_end: {ended:?}"
+    );
+
+    // List the directory, then download the file back over the binary channel.
+    browser.peers[0].send(&BrowserMessage::FileList {
+        session_id: sid.clone(),
+        path: format!("/{work}"),
+    })?;
+    let listed = wait_for_message(
+        &mut browser,
+        |m| matches!(m, NodeMessage::FileListAck { path, .. } if path == &format!("/{work}")),
+        20,
+    );
+    match listed {
+        Some(NodeMessage::FileListAck { entries, error, .. }) => {
+            assert_eq!(error, None, "list failed");
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| e.name == "remote.txt" && e.size == 16),
+                "entries: {entries:?}"
+            );
+        }
+        other => return Err(format!("expected file_list_ack, got {other:?}").into()),
+    }
+
+    browser.peers[0].send(&BrowserMessage::FileRead {
+        session_id: sid.clone(),
+        stream_id: 32,
+        path: format!("/{work}/remote.txt"),
+        offset: 4,
+        len: 8,
+    })?;
+    let raw =
+        wait_for_frame(&mut browser, |f| f.stream_id == 32, 20).ok_or("no sftp read frame")?;
+    let frame = nexus_web_gateway::file::decode_frame(&raw)?;
+    assert_eq!(frame.offset, 4);
+    assert_eq!(frame.data, b"-over-we");
+    assert!(!frame.final_block, "8 of 8 requested bytes is not EOF");
+
+    // Rename, then recursive remove, leaving the remote home clean.
+    browser.peers[0].send(&BrowserMessage::FileRename {
+        session_id: sid.clone(),
+        from: format!("/{work}/remote.txt"),
+        to: format!("/{work}/renamed.txt"),
+    })?;
+    let renamed = wait_for_message(
+        &mut browser,
+        |m| matches!(m, NodeMessage::FileOpAck { op, .. } if op == "rename"),
+        20,
+    );
+    assert!(
+        matches!(renamed, Some(NodeMessage::FileOpAck { ok: true, .. })),
+        "rename: {renamed:?}"
+    );
+    browser.peers[0].send(&BrowserMessage::FileRemove {
+        session_id: sid.clone(),
+        path: format!("/{work}"),
+        recursive: true,
+    })?;
+    let removed = wait_for_message(
+        &mut browser,
+        |m| matches!(m, NodeMessage::FileOpAck { op, .. } if op == "remove"),
+        20,
+    );
+    assert!(
+        matches!(removed, Some(NodeMessage::FileOpAck { ok: true, .. })),
+        "remove: {removed:?}"
+    );
+
+    browser.peers[0].send(&BrowserMessage::FileClose {
+        session_id: sid.clone(),
+    })?;
+    let closed = wait_for_message(
+        &mut browser,
+        |m| matches!(m, NodeMessage::FileClosed { session_id, .. } if *session_id == sid),
+        15,
+    );
+    assert!(closed.is_some(), "the file session did not close");
+    Ok(())
 }

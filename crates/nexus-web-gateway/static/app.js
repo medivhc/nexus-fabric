@@ -106,6 +106,26 @@ const ICE_CONNECT_TIMEOUT_MS = 15000;
 // direct channel to the target node late-connects).
 const sshRoutes = {}; // session_id -> { channel, node }
 
+/* ---------------- Files (REQ-005..REQ-008) ----------------
+ * Frame layout on the binary channel: kind(1) | stream_id(4) | offset(8) |
+ * flags(1) | payload. Reads are pull-based (the page asks for each offset), so
+ * the gateway never blocks the event loop waiting for the browser to drain.
+ */
+const FILE_CHANNEL_LABEL = 'nexus.file';
+const FRAME_READ_CHUNK = 0x01;
+const FRAME_WRITE_CHUNK = 0x81;
+const FRAME_HEADER_LEN = 14;
+const FRAME_FLAG_FINAL = 0x01;
+const FILE_WRITE_WINDOW = 2; // chunks in flight before waiting for an ack
+
+let fileChannel = null;   // binary DataChannel to the first-touch node
+let fileSession = null;   // { id, kind, root, chunkBytes, readOnly }
+let fileNode = null;      // node the file panel is currently bound to
+let fileStreamSeq = 1;
+let fileBusy = false;     // one metadata/transfer operation at a time
+const fileReads = new Map();  // stream_id -> { resolve, reject, timer }
+const fileWaiters = [];       // { match, resolve, reject, timer }
+
 // True once the first-touch node's hello_ack arrives. After that the mesh runs
 // over WebRTC DataChannels, so a closed signaling WebSocket is no longer an
 // error (the old unconditional "Signaling closed" banner was a false alarm that
@@ -307,6 +327,8 @@ async function init() {
   } catch (e) {
     console.warn('failed to fetch /api/config', e);
   }
+  // The file panel only offers targets this node actually exposes.
+  renderFileTargets();
   await joinMesh();
 }
 
@@ -360,6 +382,9 @@ function joinMesh() {
       await wsOpened;
       firstPc = createPc();
       controlChannel = openChannel(firstPc, 'control', onControlOpen, onControlMessage);
+      // The binary file channel must be offered in the *same* SDP as the
+      // control channel: the gateway rejects re-offers (no renegotiation).
+      fileChannel = openFileChannel(firstPc);
       const offer = await firstPc.createOffer();
       await firstPc.setLocalDescription(offer);
       ws.send(JSON.stringify({
@@ -517,6 +542,22 @@ function onControlMessage(ev) {
     case 'ssh_close':
       handleSshClose(msg);
       break;
+    case 'file_open_ack':
+      handleFileOpenAck(msg);
+      break;
+    case 'file_closed':
+      pumpFileWaiters(msg);
+      handleFileClosed(msg);
+      break;
+    case 'file_list_ack':
+    case 'file_stat_ack':
+    case 'file_write_ack':
+    case 'file_op_ack':
+      pumpFileWaiters(msg);
+      if (msg.type === 'file_op_ack' && msg.op === 'read' && !msg.ok) {
+        rejectAllFileReads(msg.error || 'read failed');
+      }
+      break;
   }
 }
 
@@ -565,7 +606,10 @@ function renderNodes(nodeList) {
     const btn = document.createElement('button');
     btn.textContent = 'Terminal';
     btn.onclick = () => showTerminal(node);
-    actions.append(conn, btn);
+    const filesBtn = document.createElement('button');
+    filesBtn.textContent = 'Files';
+    filesBtn.onclick = () => showFiles(node);
+    actions.append(conn, btn, filesBtn);
     li.append(info, actions);
     ul.appendChild(li);
   }
@@ -712,13 +756,7 @@ $('ssh-connect').onclick = () => {
     return;
   }
   const user = $('ssh-user').value.trim();
-  const authRaw = $('ssh-auth').value;
-  let auth;
-  if (authRaw.includes('PRIVATE KEY')) {
-    auth = { type: 'key', username: user, private_key: authRaw };
-  } else {
-    auth = { type: 'password', username: user, password: authRaw };
-  }
+  const auth = sshAuthFromForm();
   const sid = randomHex(16);
   // Bind the session to this channel: all subsequent terminal bytes for this
   // session go through the same route (direct or relay), never switching.
@@ -765,3 +803,619 @@ if ($('ssh-user')) $('ssh-user').addEventListener('change', () => {
 });
 
 init();
+/* ---------------- Files (REQ-005..REQ-008) ---------------- */
+
+/** Build the SSH credential payload from the terminal form (shared with SFTP).
+ *  Credentials stay in memory only: they travel over the encrypted control
+ *  channel and are never written to localStorage (G4). */
+function sshAuthFromForm() {
+  const username = $('ssh-user').value.trim();
+  const raw = $('ssh-auth').value;
+  if (raw.includes('PRIVATE KEY')) {
+    return { type: 'key', username, private_key: raw };
+  }
+  return { type: 'password', username, password: raw };
+}
+
+function openFileChannel(pc) {
+  const ch = pc.createDataChannel(FILE_CHANNEL_LABEL);
+  ch.binaryType = 'arraybuffer';
+  ch.onmessage = (ev) => onFileFrame(ev.data);
+  ch.onclose = () => {
+    if (fileSession) setFilesError('文件通道已关闭');
+    resetFileSession();
+  };
+  return ch;
+}
+
+function encodeFileFrame(kind, streamId, offset, finalBlock, bytes) {
+  const out = new Uint8Array(FRAME_HEADER_LEN + bytes.length);
+  const dv = new DataView(out.buffer);
+  dv.setUint8(0, kind);
+  dv.setUint32(1, streamId);
+  // 64-bit big-endian offset, split by hand: `setUint64` is not part of the
+  // language (no browser ships it), and offsets are exact below 2^53 anyway.
+  dv.setUint32(5, Math.floor(offset / 0x100000000));
+  dv.setUint32(9, offset % 0x100000000);
+  dv.setUint8(13, finalBlock ? FRAME_FLAG_FINAL : 0);
+  out.set(bytes, FRAME_HEADER_LEN);
+  return out;
+}
+
+function decodeFileFrame(buffer) {
+  if (!buffer || buffer.byteLength < FRAME_HEADER_LEN) return null;
+  const dv = new DataView(buffer);
+  return {
+    kind: dv.getUint8(0),
+    streamId: dv.getUint32(1),
+    offset: dv.getUint32(5) * 0x100000000 + dv.getUint32(9),
+    finalBlock: (dv.getUint8(13) & FRAME_FLAG_FINAL) !== 0,
+    data: new Uint8Array(buffer, FRAME_HEADER_LEN),
+  };
+}
+
+function onFileFrame(raw) {
+  const frame = decodeFileFrame(raw);
+  if (!frame || frame.kind !== FRAME_READ_CHUNK) return;
+  const pending = fileReads.get(frame.streamId);
+  if (!pending) return;
+  fileReads.delete(frame.streamId);
+  clearTimeout(pending.timer);
+  pending.resolve(frame);
+}
+
+function rejectAllFileReads(message) {
+  for (const entry of [...fileReads.entries()]) {
+    const [id, pending] = entry;
+    fileReads.delete(id);
+    clearTimeout(pending.timer);
+    pending.reject(new Error(message));
+  }
+}
+
+/** Await the next control message satisfying `match`. Requests must register
+ *  the waiter *before* sending, or a fast node can answer into the void. */
+function waitForFile(match, ms, label) {
+  let waiter = null;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      const idx = fileWaiters.indexOf(waiter);
+      if (idx >= 0) fileWaiters.splice(idx, 1);
+      reject(new Error(`等待${label}超时（${ms}ms）`));
+    }, ms);
+    waiter = {
+      match,
+      resolve: (msg) => resolve(msg),
+      reject,
+      timer,
+    };
+    fileWaiters.push(waiter);
+  });
+}
+
+function pumpFileWaiters(msg) {
+  for (let i = fileWaiters.length - 1; i >= 0; i -= 1) {
+    const w = fileWaiters[i];
+    let hit = false;
+    try {
+      hit = !!w.match(msg);
+    } catch (e) {
+      hit = false;
+    }
+    if (!hit) continue;
+    clearTimeout(w.timer);
+    fileWaiters.splice(i, 1);
+    w.resolve(msg);
+  }
+}
+
+function fileCapability() {
+  return (config && config.files) || { enabled: false, roots: [], chunk_bytes: 65536 };
+}
+
+function renderFileTargets() {
+  const sel = $('files-target');
+  if (!sel) return;
+  const cap = fileCapability();
+  sel.textContent = '';
+  if (!cap.enabled) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = '文件模块未启用（files.enabled）';
+    sel.append(opt);
+    sel.disabled = true;
+    $('files-open').disabled = true;
+    return;
+  }
+  sel.disabled = false;
+  $('files-open').disabled = false;
+  const sftp = document.createElement('option');
+  sftp.value = 'sftp';
+  sftp.textContent = '目标主机 SFTP（复用上方 SSH 凭据）';
+  sel.append(sftp);
+  for (const root of cap.roots || []) {
+    const opt = document.createElement('option');
+    opt.value = `local:${root.name}`;
+    opt.textContent = `节点本地目录 ${root.name}${root.read_only ? '（只读）' : ''}`;
+    sel.append(opt);
+  }
+}
+
+function currentTargetSpec() {
+  const value = $('files-target').value;
+  if (value.startsWith('local:')) {
+    return { kind: 'local', root: value.slice('local:'.length) };
+  }
+  return { kind: 'sftp', auth: sshAuthFromForm() };
+}
+
+function currentTargetReadOnly() {
+  const value = $('files-target').value;
+  if (!value.startsWith('local:')) return false;
+  const name = value.slice('local:'.length);
+  const root = (fileCapability().roots || []).find((r) => r.name === name);
+  return !!(root && root.read_only);
+}
+
+function setFilesError(text) {
+  const el = $('files-error');
+  if (!el) return;
+  el.textContent = text || '';
+  el.hidden = !text;
+}
+
+function showFiles(node) {
+  fileNode = node;
+  $('files-card').hidden = false;
+  $('files-node').textContent = `· ${node.name || node.peer_id.slice(0, 16)}…`;
+  setFilesError('');
+  // A file session is bound to the node that hosts it; switching nodes means
+  // opening a new session.
+  if (fileSession && node && fileSession.nodeId !== node.peer_id) resetFileSession();
+  renderFileTargets();
+  $('files-card').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function resetFileSession() {
+  fileSession = null;
+  for (const w of fileWaiters.splice(0)) clearTimeout(w.timer);
+  rejectAllFileReads('文件会话已关闭');
+  const label = $('files-session');
+  if (label) label.textContent = '未连接';
+  for (const id of ['files-refresh', 'files-mkdir', 'files-upload']) {
+    if ($(id)) $(id).disabled = true;
+  }
+  hideProgress();
+}
+
+function handleFileOpenAck(msg) {
+  pumpFileWaiters(msg);
+  if (msg.status !== 'ok') return;
+  fileSession = {
+    id: msg.session_id,
+    nodeId: fileNode ? fileNode.peer_id : (config ? config.node_id : ''),
+    kind: msg.kind,
+    chunkBytes: msg.chunk_bytes || 65536,
+    readOnly: currentTargetReadOnly(),
+  };
+  $('files-session').textContent =
+    `已连接 ${msg.kind} · 分块 ${msg.chunk_bytes} B${fileSession.readOnly ? ' · 只读' : ''}`;
+  $('files-refresh').disabled = false;
+  $('files-mkdir').disabled = fileSession.readOnly;
+  $('files-upload').disabled = fileSession.readOnly;
+  fileLs($('files-path').value || '/').catch((e) => setFilesError(e.message));
+}
+
+function handleFileClosed(msg) {
+  if (fileSession && msg.session_id === fileSession.id) {
+    setFilesError(`文件会话已关闭：${msg.reason}`);
+    resetFileSession();
+  }
+}
+
+async function fileOpen() {
+  setFilesError('');
+  if (!controlChannel || controlChannel.readyState !== 'open') {
+    setFilesError('控制通道未打开，无法建立文件会话');
+    return;
+  }
+  if (!fileChannel || fileChannel.readyState !== 'open') {
+    setFilesError('文件二进制通道尚未打开（等待 ICE 连通）');
+    return;
+  }
+  if (fileSession) {
+    await fileCloseSession().catch(() => {});
+  }
+  const id = randomHex(8);
+  const wait = waitForFile(
+    (m) => m.type === 'file_open_ack' && m.session_id === id,
+    25000,
+    '文件会话应答'
+  );
+  sendJson(controlChannel, {
+    type: 'file_open',
+    session_id: id,
+    token: $('files-token').value,
+    target: currentTargetSpec(),
+  });
+  const ack = await wait;
+  if (ack.status !== 'ok') throw new Error(ack.error || '文件会话建立失败');
+  // handleFileOpenAck already applied the ack; make the path absolute again.
+  $('files-path').value = '/';
+}
+
+async function fileCloseSession() {
+  if (!fileSession) return;
+  const id = fileSession.id;
+  const wait = waitForFile(
+    (m) => m.type === 'file_closed' && m.session_id === id,
+    10000,
+    '文件会话关闭'
+  ).catch(() => null);
+  sendJson(controlChannel, { type: 'file_close', session_id: id });
+  await wait;
+  resetFileSession();
+}
+
+async function fileLs(path) {
+  if (!fileSession) throw new Error('未连接文件会话');
+  const wait = waitForFile(
+    (m) =>
+      m.type === 'file_list_ack' && m.session_id === fileSession.id && m.path === path,
+    20000,
+    '目录列表'
+  );
+  sendJson(controlChannel, { type: 'file_list', session_id: fileSession.id, path });
+  const ack = await wait;
+  if (ack.error) throw new Error(ack.error);
+  $('files-path').value = ack.path;
+  renderFileRows(ack.entries || []);
+}
+
+function fmtSize(bytes) {
+  if (!bytes && bytes !== 0) return '-';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1048576).toFixed(1)} MiB`;
+  return `${(bytes / 1073741824).toFixed(2)} GiB`;
+}
+
+function fmtTime(secs) {
+  if (!secs) return '-';
+  const d = new Date(secs * 1000);
+  return d.toLocaleString();
+}
+
+function fmtMode(entry) {
+  if (!entry.mode && entry.mode !== 0) return '-';
+  const bits = (entry.mode & 0o777).toString(8).padStart(3, '0');
+  return `${entry.kind === 'dir' ? 'd' : entry.kind === 'symlink' ? 'l' : '-'}${bits}`;
+}
+
+function joinPath(dir, name) {
+  const base = !dir || dir === '/' ? '' : dir.replace(/\/+$/, '');
+  return `${base}/${name}`;
+}
+
+function parentPath(path) {
+  const parts = (path || '/').split('/').filter((p) => p && p !== '.');
+  parts.pop();
+  return parts.length ? `/${parts.join('/')}` : '/';
+}
+
+function renderFileRows(entries) {
+  const body = $('files-body');
+  body.textContent = '';
+  const path = $('files-path').value || '/';
+  if (path !== '/') {
+    const up = document.createElement('tr');
+    const td = document.createElement('td');
+    td.colSpan = 5;
+    const link = document.createElement('a');
+    link.href = '#';
+    link.textContent = '../ （返回上级）';
+    link.onclick = (ev) => {
+      ev.preventDefault();
+      fileLs(parentPath(path)).catch((e) => setFilesError(e.message));
+    };
+    td.append(link);
+    up.append(td);
+    body.append(up);
+  }
+  if (!entries.length) {
+    const tr = document.createElement('tr');
+    tr.className = 'files-empty';
+    const td = document.createElement('td');
+    td.colSpan = 5;
+    td.textContent = '空目录';
+    tr.append(td);
+    body.append(tr);
+    return;
+  }
+  for (const entry of entries) body.append(fileRow(entry));
+}
+
+function fileRow(entry) {
+  const tr = document.createElement('tr');
+
+  const nameCell = document.createElement('td');
+  if (entry.kind === 'dir') {
+    const link = document.createElement('a');
+    link.href = '#';
+    link.textContent = entry.name;
+    link.onclick = (ev) => {
+      ev.preventDefault();
+      fileLs(entry.path).catch((e) => setFilesError(e.message));
+    };
+    nameCell.append(link);
+  } else {
+    nameCell.textContent = entry.name;
+    nameCell.title = entry.path;
+  }
+
+  const sizeCell = document.createElement('td');
+  sizeCell.className = 'mono';
+  sizeCell.textContent = entry.kind === 'dir' ? '-' : fmtSize(entry.size);
+
+  const timeCell = document.createElement('td');
+  timeCell.className = 'mono';
+  timeCell.textContent = fmtTime(entry.mtime);
+
+  const modeCell = document.createElement('td');
+  modeCell.className = 'mono';
+  modeCell.textContent = fmtMode(entry);
+
+  const actions = document.createElement('td');
+  actions.className = 'files-actions';
+  if (entry.kind === 'file') {
+    const dl = document.createElement('button');
+    dl.textContent = '下载';
+    dl.onclick = () => fileDownload(entry).catch((e) => setFilesError(e.message));
+    actions.append(dl);
+  }
+  if (!fileSession || !fileSession.readOnly) {
+    if (entry.kind !== 'dir') {
+      const rn = document.createElement('button');
+      rn.textContent = '重命名';
+      rn.onclick = () => fileRename(entry).catch((e) => setFilesError(e.message));
+      actions.append(rn);
+    }
+    const rm = document.createElement('button');
+    rm.textContent = '删除';
+    rm.className = 'files-danger';
+    rm.onclick = () => fileRemove(entry).catch((e) => setFilesError(e.message));
+    actions.append(rm);
+  }
+
+  tr.append(nameCell, sizeCell, timeCell, modeCell, actions);
+  return tr;
+}
+
+function fileReadChunk(path, offset, len) {
+  if (!fileSession) return Promise.reject(new Error('未连接文件会话'));
+  const streamId = fileStreamSeq++;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      fileReads.delete(streamId);
+      reject(new Error('读取分片超时'));
+    }, 30000);
+    fileReads.set(streamId, { resolve, reject, timer });
+    sendJson(controlChannel, {
+      type: 'file_read',
+      session_id: fileSession.id,
+      stream_id: streamId,
+      path,
+      offset,
+      len,
+    });
+  });
+}
+
+async function fileDownload(entry) {
+  if (!fileSession) throw new Error('未连接文件会话');
+  if (fileBusy) throw new Error('另一个文件操作正在进行');
+  fileBusy = true;
+  const parts = [];
+  let offset = 0;
+  try {
+    showProgress(entry.size ? 0 : 1, `下载 ${entry.name} …`);
+    for (;;) {
+      const frame = await fileReadChunk(entry.path, offset, fileSession.chunkBytes);
+      if (frame.offset !== offset) {
+        throw new Error(`分片位置异常：请求 ${offset} 收到 ${frame.offset}`);
+      }
+      parts.push(frame.data);
+      offset += frame.data.length;
+      setProgress(
+        entry.size ? offset / entry.size : 1,
+        `下载 ${entry.name} ${fmtSize(offset)}${entry.size ? `/${fmtSize(entry.size)}` : ''}`
+      );
+      if (frame.finalBlock || frame.data.length === 0) break;
+    }
+    const blob = new Blob(parts);
+    const a = document.createElement('a');
+    const url = URL.createObjectURL(blob);
+    a.href = url;
+    a.download = entry.name;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    hideProgress();
+  } finally {
+    fileBusy = false;
+  }
+}
+
+/** Upload one file. Chunks go out on the binary channel with at most
+ *  FILE_WRITE_WINDOW in flight; the node acks the contiguous front, which is
+ *  also the resume point after a reconnect. */
+async function fileUploadOne(file, dir) {
+  if (!fileSession) throw new Error('未连接文件会话');
+  if (!fileChannel || fileChannel.readyState !== 'open') {
+    throw new Error('文件通道已关闭');
+  }
+  const target = joinPath(dir, file.name);
+  const streamId = fileStreamSeq++;
+  const begin = waitForFile(
+    (m) => m.type === 'file_write_ack' && m.stream_id === streamId,
+    20000,
+    '开始上传'
+  );
+  sendJson(controlChannel, {
+    type: 'file_write_begin',
+    session_id: fileSession.id,
+    stream_id: streamId,
+    path: target,
+  });
+  const ack0 = await begin;
+  if (ack0.error) throw new Error(ack0.error);
+
+  const chunkBytes = fileSession.chunkBytes;
+  let sent = ack0.received || 0;
+  let acked = ack0.received || 0;
+  showProgress(file.size ? 0 : 1, `上传 ${file.name} 0/${fmtSize(file.size)}`);
+  while (acked < file.size) {
+    if (sent < file.size && sent - acked < chunkBytes * FILE_WRITE_WINDOW) {
+      const len = Math.min(chunkBytes, file.size - sent);
+      const buf = new Uint8Array(await file.slice(sent, sent + len).arrayBuffer());
+      if (!fileChannel || fileChannel.readyState === 'closed') {
+        throw new Error('文件通道已关闭，可重新连接后从已确认位置续传');
+      }
+      fileChannel.send(encodeFileFrame(FRAME_WRITE_CHUNK, streamId, sent, false, buf));
+      sent += len;
+      continue;
+    }
+    const wait = waitForFile(
+      (m) => m.type === 'file_write_ack' && m.stream_id === streamId,
+      60000,
+      '上传确认'
+    );
+    const ack = await wait;
+    if (ack.error) throw new Error(ack.error);
+    if (ack.received > acked) {
+      acked = ack.received;
+      setProgress(
+        file.size ? acked / file.size : 1,
+        `上传 ${file.name} ${fmtSize(acked)}/${fmtSize(file.size)}`
+      );
+    }
+  }
+
+  const done = waitForFile(
+    (m) => m.type === 'file_op_ack' && m.op === 'write_end' && m.path === target,
+    30000,
+    '提交上传'
+  );
+  sendJson(controlChannel, {
+    type: 'file_write_end',
+    session_id: fileSession.id,
+    stream_id: streamId,
+    path: target,
+  });
+  const ack = await done;
+  if (!ack.ok) throw new Error(ack.error || '提交上传失败');
+}
+
+async function fileUploadSelected(files) {
+  if (fileBusy) throw new Error('另一个文件操作正在进行');
+  fileBusy = true;
+  const dir = $('files-path').value || '/';
+  const failures = [];
+  try {
+    for (const file of files) {
+      try {
+        await fileUploadOne(file, dir);
+      } catch (e) {
+        failures.push(`${file.name}: ${e.message}`);
+      }
+    }
+  } finally {
+    fileBusy = false;
+    hideProgress();
+  }
+  await fileLs(dir).catch(() => {});
+  if (failures.length) throw new Error(failures.join('；'));
+}
+
+async function fileSimpleOp(type, payload, op, label) {
+  if (!fileSession) throw new Error('未连接文件会话');
+  const wait = waitForFile(
+    (m) => m.type === 'file_op_ack' && m.op === op,
+    20000,
+    label
+  );
+  sendJson(controlChannel, {
+    type,
+    session_id: fileSession.id,
+    ...payload,
+  });
+  const ack = await wait;
+  if (!ack.ok) throw new Error(ack.error || `${label}失败`);
+  return ack;
+}
+
+async function fileMkdir() {
+  const name = window.prompt('新建目录名（相对当前目录）');
+  if (!name) return;
+  const dir = $('files-path').value || '/';
+  await fileSimpleOp('file_mkdir', { path: joinPath(dir, name) }, 'mkdir', '新建目录');
+  await fileLs(dir);
+}
+
+async function fileRename(entry) {
+  const name = window.prompt('新的名称', entry.name);
+  if (!name || name === entry.name) return;
+  const dir = parentPath(entry.path);
+  await fileSimpleOp(
+    'file_rename',
+    { from: entry.path, to: joinPath(dir, name) },
+    'rename',
+    '重命名'
+  );
+  await fileLs(dir);
+}
+
+async function fileRemove(entry) {
+  const recursive = entry.kind === 'dir';
+  const hint = recursive ? '（目录及其内容）' : '';
+  if (!window.confirm(`确认删除 ${entry.name}${hint}？此操作不可恢复。`)) return;
+  const dir = parentPath(entry.path);
+  await fileSimpleOp('file_remove', { path: entry.path, recursive }, 'remove', '删除');
+  await fileLs(dir);
+}
+
+function showProgress(frac, text) {
+  $('files-progress').hidden = false;
+  setProgress(frac, text);
+}
+
+function setProgress(frac, text) {
+  const clamped = Math.max(0, Math.min(1, frac || 0));
+  $('files-progress-fill').style.width = `${Math.round(clamped * 100)}%`;
+  $('files-progress-text').textContent = text || '';
+}
+
+function hideProgress() {
+  const el = $('files-progress');
+  if (el) el.hidden = true;
+}
+
+$('files-open').onclick = () => fileOpen().catch((e) => setFilesError(e.message));
+$('files-refresh').onclick = () =>
+  fileLs($('files-path').value || '/').catch((e) => setFilesError(e.message));
+$('files-mkdir').onclick = () => fileMkdir().catch((e) => setFilesError(e.message));
+$('files-upload').onclick = () => $('files-upload-input').click();
+$('files-upload-input').onchange = (ev) => {
+  const files = [...((ev.target && ev.target.files) || [])];
+  ev.target.value = '';
+  if (!files.length) return;
+  fileUploadSelected(files).catch((e) => setFilesError(e.message));
+};
+$('files-path').addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter') {
+    ev.preventDefault();
+    fileLs($('files-path').value || '/').catch((e) => setFilesError(e.message));
+  }
+});
+renderFileTargets();

@@ -161,7 +161,10 @@ pub fn run_ssh_client(
 }
 
 /// Authenticate the SSH session with the browser-provided credentials.
-fn authenticate(sess: &ssh2::Session, auth: Option<SshAuth>) -> Result<(), String> {
+///
+/// Shared with the SFTP file backend (REQ-005) so both the terminal and the
+/// file module accept exactly the same credential shapes.
+pub(crate) fn authenticate(sess: &ssh2::Session, auth: Option<SshAuth>) -> Result<(), String> {
     match auth {
         Some(SshAuth::Password { username, password }) => sess
             .userauth_password(&username, &password)

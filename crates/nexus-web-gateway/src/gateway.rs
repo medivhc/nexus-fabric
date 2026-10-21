@@ -27,46 +27,97 @@ use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
 use crate::cert;
 use crate::config::GatewayConfig;
 use crate::error::GatewayError;
+use crate::file::{
+    self, FILE_CHANNEL_LABEL, FRAME_READ_CHUNK, FRAME_WRITE_CHUNK, FileBackend, FileCommand,
+    FileLimits, FileReply, LocalSandbox, SftpBackend, decode_frame, encode_frame,
+};
 use crate::http;
 use crate::mesh::{InMemoryMeshSignaler, MeshDataConnection, MeshSignaler, WssMeshSignaler};
-use crate::protocol::{BrowserMessage, MeshMessage, NodeMessage, SdpPayload, SshAuth};
+use crate::protocol::{
+    BrowserMessage, FileEntry, FileTarget, MeshMessage, NodeMessage, SdpPayload, SshAuth,
+};
 use crate::ssh_client::{self, SshInput};
 
-/// Pick the IP address the shared WebRTC UDP socket binds to.
-///
-/// A concrete `listen_addr` binds the UDP socket to the same IP so the SDP
-/// host candidate is reachable from browsers. An unspecified address
-/// (`0.0.0.0` / `::`) has no single routable IP, so we derive the first
-/// non-loopback address from the local interfaces; otherwise the socket would
-/// only carry a loopback host candidate that real browsers never collect
-/// (the `0.0.0.0` example-config dead end). When no non-loopback address
-/// exists we fall back to loopback and warn loudly.
-fn udp_bind_ip(listen_ip: std::net::IpAddr) -> std::net::IpAddr {
-    if !listen_ip.is_unspecified() {
-        return listen_ip;
-    }
+/// Enumerate routable interface addresses of the same family as `for_ip`
+/// (skipping loopback, unspecified and multicast), deduplicated.
+fn routable_iface_ips(for_ip: std::net::IpAddr) -> Vec<std::net::IpAddr> {
     let Ok(interfaces) = getifaddrs::getifaddrs() else {
-        return loopback_for(listen_ip);
+        return Vec::new();
     };
+    let mut ips: Vec<std::net::IpAddr> = Vec::new();
     for iface in interfaces {
         if iface.flags.contains(getifaddrs::InterfaceFlags::LOOPBACK) {
             continue;
         }
-        if let Some(ip) = iface.address.ip_addr() {
-            if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
-                continue;
-            }
-            let same_family = matches!(
-                (listen_ip, ip),
-                (std::net::IpAddr::V4(_), std::net::IpAddr::V4(_))
-                    | (std::net::IpAddr::V6(_), std::net::IpAddr::V6(_))
-            );
-            if same_family {
-                return ip;
-            }
+        let Some(ip) = iface.address.ip_addr() else {
+            continue;
+        };
+        if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+            continue;
+        }
+        let same_family = matches!(
+            (for_ip, ip),
+            (std::net::IpAddr::V4(_), std::net::IpAddr::V4(_))
+                | (std::net::IpAddr::V6(_), std::net::IpAddr::V6(_))
+        );
+        if same_family && !ips.contains(&ip) {
+            ips.push(ip);
         }
     }
-    loopback_for(listen_ip)
+    ips
+}
+
+/// How the shared WebRTC UDP socket is bound, and which addresses the SDP may
+/// advertise as ICE host candidates.
+///
+/// **G11 (candidate/receive coherence)**: every advertised host candidate must
+/// be an address the bound socket can actually receive on. A UDP socket bound to
+/// a concrete IP only receives datagrams whose destination is that IP, so a
+/// gateway listening on `127.0.0.1` must advertise the loopback address and
+/// nothing else. Advertising the host's LAN/mesh IPs instead — which is what the
+/// multi-homed fix used to do unconditionally — yields candidates that always
+/// time out: ICE never connected, and every DataChannel test failed with
+/// "no control channel open".
+///
+/// An unspecified `listen_addr` is therefore bound to the family's wildcard
+/// address, which *does* receive on every interface. That is exactly the
+/// configuration where advertising all non-loopback interface IPs (multi-homed
+/// hosts: LAN + mesh) is both valid and necessary.
+struct IceBindPlan {
+    /// Address to bind the shared UDP socket to.
+    bind_ip: std::net::IpAddr,
+    /// Addresses the bound socket can receive on, in advertisement order.
+    candidate_ips: Vec<std::net::IpAddr>,
+    /// Browser-facing address for the page URL (never unspecified).
+    page_ip: std::net::IpAddr,
+    /// An unspecified `listen_addr` with no routable interface at all: ICE can
+    /// only offer a loopback candidate, which no remote browser can reach.
+    no_routable_interface: bool,
+}
+
+/// Derive the UDP bind address and the host-candidate set for a `listen_addr`.
+fn ice_bind_plan(listen_ip: std::net::IpAddr) -> IceBindPlan {
+    if !listen_ip.is_unspecified() {
+        // Concrete bind: the socket receives on this address only, so this is
+        // also the only candidate we may advertise.
+        return IceBindPlan {
+            bind_ip: listen_ip,
+            candidate_ips: vec![listen_ip],
+            page_ip: listen_ip,
+            no_routable_interface: false,
+        };
+    }
+    let ifaces = routable_iface_ips(listen_ip);
+    let no_routable_interface = ifaces.is_empty();
+    IceBindPlan {
+        bind_ip: listen_ip,
+        candidate_ips: ifaces.clone(),
+        page_ip: ifaces
+            .first()
+            .copied()
+            .unwrap_or_else(|| loopback_for(listen_ip)),
+        no_routable_interface,
+    }
 }
 
 /// Loopback fallback for an unspecified `listen_addr` with no usable
@@ -80,6 +131,9 @@ fn loopback_for(ip: std::net::IpAddr) -> std::net::IpAddr {
 
 /// Maximum UDP datagram payload the gateway reads from the shared socket.
 const UDP_BUF_SIZE: usize = 2048;
+
+/// Label of the JSON control DataChannel the browser opens first.
+const CONTROL_CHANNEL_LABEL: &str = "control";
 
 /// A command/notification delivered to the gateway event loop.
 pub(crate) enum GatewayEvent {
@@ -132,6 +186,61 @@ pub(crate) enum GatewayEvent {
         status: String,
         error: Option<String>,
     },
+    /// File worker: the session opened (or failed to open).
+    FileOpened {
+        session_id: String,
+        file_id: String,
+        kind: String,
+        error: Option<String>,
+    },
+    /// File worker: a directory listing.
+    FileListed {
+        session_id: String,
+        file_id: String,
+        path: String,
+        entries: Vec<FileEntry>,
+        error: Option<String>,
+    },
+    /// File worker: a single entry.
+    FileStatted {
+        session_id: String,
+        file_id: String,
+        entry: Option<FileEntry>,
+        error: Option<String>,
+    },
+    /// File worker: bytes for a download, delivered as a binary frame (or an
+    /// error message when `error` is set).
+    FileChunk {
+        session_id: String,
+        file_id: String,
+        stream_id: u32,
+        offset: u64,
+        data: Vec<u8>,
+        final_block: bool,
+        error: Option<String>,
+    },
+    /// File worker: upload progress.
+    FileWriteAck {
+        session_id: String,
+        file_id: String,
+        stream_id: u32,
+        received: u64,
+        error: Option<String>,
+    },
+    /// File worker: mkdir / remove / rename / write_end finished.
+    FileOpDone {
+        session_id: String,
+        file_id: String,
+        op: String,
+        path: String,
+        error: Option<String>,
+    },
+    /// File worker: the session closed.
+    FileClosed {
+        session_id: String,
+        file_id: String,
+        reason: String,
+    },
 }
 
 /// Shared, clone-able gateway state.
@@ -141,6 +250,9 @@ struct Shared {
     mesh: Arc<dyn MeshSignaler>,
     event_tx: Sender<GatewayEvent>,
     udp: Arc<UdpSocket>,
+    /// ICE host candidates to advertise: exactly the addresses the shared UDP
+    /// socket can receive on (G11). Computed once at startup.
+    host_candidate_ips: Vec<std::net::IpAddr>,
     /// PEM-encoded self-signed certificate, served at `/cert`.
     cert_pem: String,
     /// SHA256 fingerprint of the certificate, for /cert HTML page (REQ-001).
@@ -155,8 +267,17 @@ struct Session {
     rtc: Rtc,
     channel: Option<ChannelId>,
     send_queue: VecDeque<Vec<u8>>,
+    /// Binary DataChannel carrying file chunks (label `nexus.file`).
+    file_channel: Option<ChannelId>,
+    file_send_queue: VecDeque<Vec<u8>>,
     ssh_bridges: HashMap<String, SshBridge>,
     ssh_relays: HashMap<String, SshRelay>,
+    /// Open file sessions, keyed by the browser's `session_id`.
+    file_sessions: HashMap<String, FileBridge>,
+    /// Claimed chunk streams: stream id -> owning file session id. The binary
+    /// frame header carries only the stream id, so this maps a chunk back to the
+    /// session that must receive it.
+    file_streams: HashMap<u32, String>,
 }
 
 impl Session {
@@ -168,8 +289,12 @@ impl Session {
             rtc,
             channel: None,
             send_queue: VecDeque::new(),
+            file_channel: None,
+            file_send_queue: VecDeque::new(),
             ssh_bridges: HashMap::new(),
             ssh_relays: HashMap::new(),
+            file_sessions: HashMap::new(),
+            file_streams: HashMap::new(),
         }
     }
 
@@ -184,6 +309,17 @@ impl Session {
         };
         self.send_queue.push_back(bytes);
     }
+
+    /// Queue a binary frame for delivery over the file DataChannel (G15:
+    /// file bytes never travel on the JSON control channel). Frames are dropped
+    /// (never queued forever) while the file channel is closed.
+    fn send_file(&mut self, bytes: Vec<u8>) {
+        if self.file_channel.is_none() {
+            tracing::debug!("file frame dropped: no file data channel open");
+            return;
+        }
+        self.file_send_queue.push_back(bytes);
+    }
 }
 
 impl Drop for Session {
@@ -197,6 +333,14 @@ impl Drop for Session {
         // Close every relayed terminal's mesh data connection.
         for (_, relay) in self.ssh_relays.drain() {
             relay.data.close();
+        }
+        // Stop every file worker the same way.
+        for (_, bridge) in self.file_sessions.drain() {
+            bridge.stop.store(true, Ordering::Relaxed);
+            let _ = bridge.tx.send(FileCommand::Close {
+                session_id: bridge.id.clone(),
+                reason: "session closed".into(),
+            });
         }
     }
 }
@@ -217,6 +361,18 @@ struct SshRelay {
     /// Persistent bidirectional mesh data connection to the target gateway.
     data: MeshDataConnection,
     /// Last activity (used for idle timeout).
+    last_activity: Instant,
+}
+
+/// A file session bridge to one backend, driven by a dedicated worker thread.
+struct FileBridge {
+    /// The file session id the browser assigned.
+    id: String,
+    /// Channel to the file worker thread.
+    tx: Sender<FileCommand>,
+    /// Set when the bridge must close; the worker checks it each loop.
+    stop: Arc<AtomicBool>,
+    /// Last activity (used for the file idle timeout).
     last_activity: Instant,
 }
 
@@ -290,22 +446,18 @@ impl Gateway {
         };
         let tls = Arc::new(cert::server_config(&identity)?);
 
-        let udp_ip = udp_bind_ip(cfg.listen_addr.ip());
-        if cfg.listen_addr.ip().is_unspecified() {
-            if udp_ip.is_loopback() {
-                eprintln!(
-                    "warning: no non-loopback network interface found; WebRTC UDP socket bound \
-                     to {udp_ip} only. Browsers cannot reach a loopback ICE candidate — set \
-                     `listen_addr` to a routable IP address."
-                );
-            } else {
-                eprintln!(
-                    "note: `listen_addr` is unspecified; binding the WebRTC UDP socket to \
-                     {udp_ip} so browsers can reach the ICE host candidate."
-                );
-            }
+        let plan = ice_bind_plan(cfg.listen_addr.ip());
+        if plan.no_routable_interface {
+            eprintln!(
+                "warning: `listen_addr` is unspecified and no non-loopback network interface was \
+                 found; ICE can only offer the loopback candidate {ip}, which remote browsers \
+                 cannot reach — set `listen_addr` to a routable IP address.",
+                ip = plan.page_ip
+            );
         }
-        let udp = Arc::new(UdpSocket::bind((udp_ip, 0)).map_err(GatewayError::Io)?);
+        // Wildcard bind (unspecified listen_addr) receives on every interface,
+        // which is what makes the multi-candidate advertisement below valid.
+        let udp = Arc::new(UdpSocket::bind((plan.bind_ip, 0)).map_err(GatewayError::Io)?);
         udp.set_read_timeout(Some(Duration::from_millis(50)))
             .map_err(GatewayError::Io)?;
 
@@ -315,7 +467,7 @@ impl Gateway {
         let local_addr = listener.local_addr().map_err(GatewayError::Io)?;
         // The address browsers should actually open (never `0.0.0.0`/`::`).
         // Use the actually bound port so `listen_addr: "0.0.0.0:0"` works.
-        let page_addr = std::net::SocketAddr::new(udp_ip, local_addr.port());
+        let page_addr = std::net::SocketAddr::new(plan.page_ip, local_addr.port());
 
         let shared = Arc::new(Shared {
             cfg: cfg.clone(),
@@ -323,6 +475,7 @@ impl Gateway {
             mesh: mesh.clone(),
             event_tx: event_tx.clone(),
             udp: udp.clone(),
+            host_candidate_ips: plan.candidate_ips,
             cert_pem: identity.cert_pem()?,
             cert_fingerprint: identity.fingerprint_sha256(),
         });
@@ -449,6 +602,17 @@ fn serve_http(
             "node_name": shared.cfg.node_name,
             "node_list": shared.cfg.node_list,
             "ice_servers": shared.cfg.ice_servers,
+            // File module capability discovery for the page: whether it is
+            // enabled and which local roots exist. The bearer token is never
+            // exposed here.
+            "files": {
+                "enabled": shared.cfg.files.enabled,
+                "chunk_bytes": shared.cfg.files.chunk_bytes,
+                "roots": shared.cfg.files.roots.iter().map(|r| serde_json::json!({
+                    "name": r.name,
+                    "read_only": r.read_only,
+                })).collect::<Vec<_>>(),
+            },
         }))
         .map_err(|e| GatewayError::Protocol(e.to_string()))?;
         http::write_http_response(tls, "application/json", &body, &[]).map_err(GatewayError::Io)?;
@@ -474,7 +638,10 @@ fn serve_http(
                 tls,
                 "application/x-pem-file",
                 shared.cert_pem.as_bytes(),
-                &[("Content-Disposition", "attachment; filename=\"nexus-ca.crt\"")],
+                &[(
+                    "Content-Disposition",
+                    "attachment; filename=\"nexus-ca.crt\"",
+                )],
             )
             .map_err(GatewayError::Io)?;
         }
@@ -989,20 +1156,36 @@ fn poll_session_outputs(shared: &Arc<Shared>, sess: &mut Session, now: Instant) 
 }
 
 fn flush_send_queue(sess: &mut Session) {
-    let Some(cid) = sess.channel else {
-        return;
-    };
-    while let Some(bytes) = sess.send_queue.front().cloned() {
-        let Some(mut ch) = sess.rtc.channel(cid) else {
-            break;
-        };
-        match ch.write(false, &bytes) {
-            Ok(true) => {
-                sess.send_queue.pop_front();
+    if let Some(cid) = sess.channel {
+        while let Some(bytes) = sess.send_queue.front().cloned() {
+            let Some(mut ch) = sess.rtc.channel(cid) else {
+                break;
+            };
+            match ch.write(false, &bytes) {
+                Ok(true) => {
+                    sess.send_queue.pop_front();
+                }
+                Ok(false) => break,
+                Err(_) => {
+                    sess.send_queue.pop_front();
+                }
             }
-            Ok(false) => break,
-            Err(_) => {
-                sess.send_queue.pop_front();
+        }
+    }
+    if let Some(cid) = sess.file_channel {
+        while let Some(bytes) = sess.file_send_queue.front().cloned() {
+            let Some(mut ch) = sess.rtc.channel(cid) else {
+                break;
+            };
+            match ch.write(true, &bytes) {
+                Ok(true) => {
+                    sess.file_send_queue.pop_front();
+                }
+                // Backpressure: keep the frame queued and try again next tick.
+                Ok(false) => break,
+                Err(_) => {
+                    sess.file_send_queue.pop_front();
+                }
             }
         }
     }
@@ -1010,8 +1193,15 @@ fn flush_send_queue(sess: &mut Session) {
 
 fn handle_rtc_event(shared: &Arc<Shared>, sess: &mut Session, event: Event, now: Instant) {
     match event {
-        Event::ChannelOpen(cid, _) => {
-            sess.channel = Some(cid);
+        Event::ChannelOpen(cid, label) => {
+            if label == FILE_CHANNEL_LABEL {
+                sess.file_channel = Some(cid);
+            } else if sess.channel.is_none() || label == CONTROL_CHANNEL_LABEL {
+                // The channel explicitly labeled `control` wins; otherwise the
+                // first channel to open is the control channel (peers that open
+                // a single unnamed channel keep working).
+                sess.channel = Some(cid);
+            }
             flush_send_queue(sess);
         }
         Event::ChannelData(data) => {
@@ -1022,8 +1212,14 @@ fn handle_rtc_event(shared: &Arc<Shared>, sess: &mut Session, event: Event, now:
                 sess.rtc.disconnect();
             }
         }
-        Event::ChannelClose(cid) if sess.channel == Some(cid) => {
-            sess.channel = None;
+        Event::ChannelClose(cid) => {
+            if sess.channel == Some(cid) {
+                sess.channel = None;
+            }
+            if sess.file_channel == Some(cid) {
+                sess.file_channel = None;
+                sess.file_send_queue.clear();
+            }
         }
         _ => {}
     }
@@ -1031,6 +1227,7 @@ fn handle_rtc_event(shared: &Arc<Shared>, sess: &mut Session, event: Event, now:
 
 fn handle_channel_data(shared: &Arc<Shared>, sess: &mut Session, data: &ChannelData, now: Instant) {
     if data.binary {
+        handle_file_frame(sess, data, now);
         return;
     }
     let text = match std::str::from_utf8(&data.data) {
@@ -1105,6 +1302,212 @@ fn handle_channel_data(shared: &Arc<Shared>, sess: &mut Session, data: &ChannelD
         }
         BrowserMessage::SshClose { session_id } => {
             close_ssh_terminal(sess, &session_id, "client closed");
+        }
+        BrowserMessage::FileOpen {
+            session_id,
+            token,
+            target,
+        } => {
+            open_file_session(shared, sess, &session_id, &token, target, now);
+        }
+        BrowserMessage::FileList { session_id, path } => {
+            let for_cmd = path.clone();
+            forward_to_file(
+                sess,
+                now,
+                &session_id,
+                FileCommand::List {
+                    session_id: session_id.clone(),
+                    path: for_cmd,
+                },
+                |id| NodeMessage::FileListAck {
+                    session_id: id,
+                    path,
+                    entries: Vec::new(),
+                    error: Some(UNKNOWN_FILE_SESSION.into()),
+                },
+            );
+        }
+        BrowserMessage::FileStat { session_id, path } => {
+            let for_cmd = path.clone();
+            forward_to_file(
+                sess,
+                now,
+                &session_id,
+                FileCommand::Stat {
+                    session_id: session_id.clone(),
+                    path: for_cmd,
+                },
+                |id| NodeMessage::FileStatAck {
+                    session_id: id,
+                    entry: None,
+                    error: Some(UNKNOWN_FILE_SESSION.into()),
+                },
+            );
+        }
+        BrowserMessage::FileRead {
+            session_id,
+            stream_id,
+            path,
+            offset,
+            len,
+        } => {
+            if let Err(e) = claim_stream(sess, stream_id, &session_id) {
+                sess.send(&NodeMessage::FileOpAck {
+                    session_id,
+                    op: "read".into(),
+                    path,
+                    ok: false,
+                    error: Some(e),
+                });
+                return;
+            }
+            let for_cmd = path.clone();
+            forward_to_file(
+                sess,
+                now,
+                &session_id,
+                FileCommand::Read {
+                    session_id: session_id.clone(),
+                    stream_id,
+                    path: for_cmd,
+                    offset,
+                    len,
+                },
+                |id| NodeMessage::FileOpAck {
+                    session_id: id,
+                    op: "read".into(),
+                    path,
+                    ok: false,
+                    error: Some(UNKNOWN_FILE_SESSION.into()),
+                },
+            );
+        }
+        BrowserMessage::FileWriteBegin {
+            session_id,
+            stream_id,
+            path,
+        } => {
+            if let Err(e) = claim_stream(sess, stream_id, &session_id) {
+                sess.send(&NodeMessage::FileWriteAck {
+                    session_id,
+                    stream_id,
+                    received: 0,
+                    error: Some(e),
+                });
+                return;
+            }
+            let for_cmd = path.clone();
+            forward_to_file(
+                sess,
+                now,
+                &session_id,
+                FileCommand::WriteBegin {
+                    session_id: session_id.clone(),
+                    stream_id,
+                    path: for_cmd,
+                },
+                |id| NodeMessage::FileWriteAck {
+                    session_id: id,
+                    stream_id,
+                    received: 0,
+                    error: Some(UNKNOWN_FILE_SESSION.into()),
+                },
+            );
+        }
+        BrowserMessage::FileWriteEnd {
+            session_id,
+            stream_id,
+            path,
+        } => {
+            let for_cmd = path.clone();
+            forward_to_file(
+                sess,
+                now,
+                &session_id,
+                FileCommand::WriteEnd {
+                    session_id: session_id.clone(),
+                    stream_id,
+                    path: for_cmd,
+                },
+                |id| NodeMessage::FileOpAck {
+                    session_id: id,
+                    op: "write_end".into(),
+                    path,
+                    ok: false,
+                    error: Some(UNKNOWN_FILE_SESSION.into()),
+                },
+            );
+        }
+        BrowserMessage::FileMkdir { session_id, path } => {
+            let for_cmd = path.clone();
+            forward_to_file(
+                sess,
+                now,
+                &session_id,
+                FileCommand::Mkdir {
+                    session_id: session_id.clone(),
+                    path: for_cmd,
+                },
+                |id| NodeMessage::FileOpAck {
+                    session_id: id,
+                    op: "mkdir".into(),
+                    path,
+                    ok: false,
+                    error: Some(UNKNOWN_FILE_SESSION.into()),
+                },
+            );
+        }
+        BrowserMessage::FileRemove {
+            session_id,
+            path,
+            recursive,
+        } => {
+            let for_cmd = path.clone();
+            forward_to_file(
+                sess,
+                now,
+                &session_id,
+                FileCommand::Remove {
+                    session_id: session_id.clone(),
+                    path: for_cmd,
+                    recursive,
+                },
+                |id| NodeMessage::FileOpAck {
+                    session_id: id,
+                    op: "remove".into(),
+                    path,
+                    ok: false,
+                    error: Some(UNKNOWN_FILE_SESSION.into()),
+                },
+            );
+        }
+        BrowserMessage::FileRename {
+            session_id,
+            from,
+            to,
+        } => {
+            let (for_cmd, to_cmd) = (from.clone(), to.clone());
+            forward_to_file(
+                sess,
+                now,
+                &session_id,
+                FileCommand::Rename {
+                    session_id: session_id.clone(),
+                    from: for_cmd,
+                    to: to_cmd,
+                },
+                |id| NodeMessage::FileOpAck {
+                    session_id: id,
+                    op: "rename".into(),
+                    path: to,
+                    ok: false,
+                    error: Some(UNKNOWN_FILE_SESSION.into()),
+                },
+            );
+        }
+        BrowserMessage::FileClose { session_id } => {
+            close_file_session(sess, &session_id, "client closed");
         }
         BrowserMessage::Ping => {
             sess.send(&NodeMessage::Pong);
@@ -1357,6 +1760,280 @@ fn close_ssh_terminal(sess: &mut Session, bridge_id: &str, reason: &str) {
     }
 }
 
+/// Reply text used when a file command names a session that is not open.
+const UNKNOWN_FILE_SESSION: &str = "unknown file session";
+
+/// Route an upload chunk from the binary file channel to its worker.
+///
+/// The frame header carries only the stream id, so [`Session::file_streams`]
+/// resolves it back to the owning file session. Unknown streams are answered
+/// explicitly (never dropped silently, per G9 and G16).
+fn handle_file_frame(sess: &mut Session, data: &ChannelData, now: Instant) {
+    let Some(file_cid) = sess.file_channel else {
+        tracing::debug!("binary frame ignored: no file data channel");
+        return;
+    };
+    if data.id != file_cid {
+        tracing::debug!("binary frame on unexpected channel {:?}", data.id);
+        return;
+    }
+    let frame = match decode_frame(&data.data) {
+        Ok(frame) => frame,
+        Err(e) => {
+            tracing::debug!("malformed file frame: {e}");
+            sess.send(&NodeMessage::FileWriteAck {
+                session_id: String::new(),
+                stream_id: 0,
+                received: 0,
+                error: Some(format!("malformed file frame: {e}")),
+            });
+            return;
+        }
+    };
+    if frame.kind != FRAME_WRITE_CHUNK {
+        tracing::debug!("unexpected file frame kind {:#04x}", frame.kind);
+        return;
+    }
+    let Some(file_id) = sess.file_streams.get(&frame.stream_id).cloned() else {
+        sess.send(&NodeMessage::FileWriteAck {
+            session_id: String::new(),
+            stream_id: frame.stream_id,
+            received: 0,
+            error: Some("unknown upload stream".into()),
+        });
+        return;
+    };
+    let Some(bridge) = sess.file_sessions.get_mut(&file_id) else {
+        sess.file_streams.remove(&frame.stream_id);
+        return;
+    };
+    bridge.last_activity = now;
+    let cmd = FileCommand::WriteChunk {
+        session_id: file_id.clone(),
+        stream_id: frame.stream_id,
+        offset: frame.offset,
+        data: frame.data.to_vec(),
+    };
+    if bridge.tx.send(cmd).is_err() {
+        close_file_session(sess, &file_id, "worker gone");
+    }
+}
+
+/// Claim a stream id for a file session (reads and uploads share the space).
+fn claim_stream(sess: &mut Session, stream_id: u32, file_id: &str) -> Result<(), String> {
+    if let Some(owner) = sess.file_streams.get(&stream_id) {
+        return if owner == file_id {
+            Ok(())
+        } else {
+            Err(format!(
+                "stream {stream_id} already used by session {owner}"
+            ))
+        };
+    }
+    if !sess.file_sessions.contains_key(file_id) {
+        return Err(UNKNOWN_FILE_SESSION.into());
+    }
+    sess.file_streams.insert(stream_id, file_id.to_string());
+    Ok(())
+}
+
+/// Forward one command to a file worker, replying explicitly when the session
+/// is gone.
+fn forward_to_file(
+    sess: &mut Session,
+    now: Instant,
+    file_id: &str,
+    cmd: FileCommand,
+    on_missing: impl FnOnce(String) -> NodeMessage,
+) {
+    match sess.file_sessions.get_mut(file_id) {
+        Some(bridge) => {
+            bridge.last_activity = now;
+            if bridge.tx.send(cmd).is_err() {
+                close_file_session(sess, file_id, "worker gone");
+            }
+        }
+        None => sess.send(&on_missing(file_id.to_string())),
+    }
+}
+
+/// Open a file session.
+///
+/// The gate (module enabled, bearer token, limits) is checked here on the event
+/// loop; the backend itself is built on the worker thread so a slow SFTP
+/// handshake cannot stall every other session. G12: an enabled module without a
+/// token is a configuration error, so this can only ever accept a matching token.
+fn open_file_session(
+    shared: &Arc<Shared>,
+    sess: &mut Session,
+    file_id: &str,
+    token: &str,
+    target: FileTarget,
+    now: Instant,
+) {
+    let cfg = &shared.cfg.files;
+    let reject = |reason: String| NodeMessage::FileOpenAck {
+        session_id: file_id.to_string(),
+        kind: String::new(),
+        status: "error".into(),
+        error: Some(reason),
+        chunk_bytes: 0,
+        roots: Vec::new(),
+    };
+    if !cfg.enabled {
+        sess.send(&reject("file module disabled".into()));
+        return;
+    }
+    if token.is_empty() || !constant_time_eq(token.as_bytes(), cfg.auth_token.as_bytes()) {
+        tracing::debug!("file open refused for {file_id}: bearer token mismatch");
+        sess.send(&reject("invalid file token".into()));
+        return;
+    }
+    if sess.file_sessions.len() >= cfg.max_sessions {
+        sess.send(&reject("max file sessions reached".into()));
+        return;
+    }
+    if sess.file_sessions.contains_key(file_id) {
+        sess.send(&reject("file session already open".into()));
+        return;
+    }
+
+    let (tx, rx) = channel::<FileCommand>();
+    let stop = Arc::new(AtomicBool::new(false));
+    sess.file_sessions.insert(
+        file_id.to_string(),
+        FileBridge {
+            id: file_id.to_string(),
+            tx,
+            stop: stop.clone(),
+            last_activity: now,
+        },
+    );
+
+    let limits = FileLimits::from(cfg);
+    let roots = cfg.roots.clone();
+    let ssh_target = shared.cfg.ssh.target;
+    let event_tx = shared.event_tx.clone();
+    let file_session_id = file_id.to_string();
+    let rtc_session_id = sess.id.clone();
+    thread::spawn(move || {
+        let built: Result<Box<dyn FileBackend>, String> = match &target {
+            FileTarget::Sftp { auth } => SftpBackend::connect(ssh_target, auth.clone(), limits)
+                .map(|engine| Box::new(engine) as Box<dyn FileBackend>),
+            FileTarget::Local { root } => match roots.iter().find(|r| &r.name == root) {
+                Some(root_cfg) => {
+                    LocalSandbox::new(root_cfg, limits).map(|engine| Box::new(engine) as _)
+                }
+                None => Err(format!("unknown local root: {root}")),
+            },
+        };
+        let event_tx = event_tx.clone();
+        file::run_file_worker(built, file_session_id, rx, stop, limits, move |reply| {
+            let _ = event_tx.send(to_file_event(rtc_session_id.clone(), reply));
+        });
+    });
+}
+
+/// Close a file session, release its streams and tell the browser.
+fn close_file_session(sess: &mut Session, file_id: &str, reason: &str) {
+    if let Some(bridge) = sess.file_sessions.remove(file_id) {
+        bridge.stop.store(true, Ordering::Relaxed);
+        let _ = bridge.tx.send(FileCommand::Close {
+            session_id: file_id.to_string(),
+            reason: reason.to_string(),
+        });
+    }
+    sess.file_streams.retain(|_, owner| owner != file_id);
+    sess.send(&NodeMessage::FileClosed {
+        session_id: file_id.to_string(),
+        reason: reason.to_string(),
+    });
+}
+
+/// Map a worker reply onto an event-loop event. `rtc_session_id` is the WebRTC
+/// session the worker belongs to; the reply carries the file session id.
+fn to_file_event(rtc_session_id: String, reply: FileReply) -> GatewayEvent {
+    match reply {
+        FileReply::Opened {
+            session_id,
+            kind,
+            error,
+        } => GatewayEvent::FileOpened {
+            session_id: rtc_session_id,
+            file_id: session_id,
+            kind,
+            error,
+        },
+        FileReply::Listed {
+            session_id,
+            path,
+            entries,
+            error,
+        } => GatewayEvent::FileListed {
+            session_id: rtc_session_id,
+            file_id: session_id,
+            path,
+            entries,
+            error,
+        },
+        FileReply::Statted {
+            session_id,
+            entry,
+            error,
+        } => GatewayEvent::FileStatted {
+            session_id: rtc_session_id,
+            file_id: session_id,
+            entry,
+            error,
+        },
+        FileReply::ReadChunk {
+            session_id,
+            stream_id,
+            offset,
+            data,
+            final_block,
+            error,
+        } => GatewayEvent::FileChunk {
+            session_id: rtc_session_id,
+            file_id: session_id,
+            stream_id,
+            offset,
+            data,
+            final_block,
+            error,
+        },
+        FileReply::WriteAck {
+            session_id,
+            stream_id,
+            received,
+            error,
+        } => GatewayEvent::FileWriteAck {
+            session_id: rtc_session_id,
+            file_id: session_id,
+            stream_id,
+            received,
+            error,
+        },
+        FileReply::OpDone {
+            session_id,
+            op,
+            path,
+            error,
+        } => GatewayEvent::FileOpDone {
+            session_id: rtc_session_id,
+            file_id: session_id,
+            op,
+            path,
+            error,
+        },
+        FileReply::Closed { session_id, reason } => GatewayEvent::FileClosed {
+            session_id: rtc_session_id,
+            file_id: session_id,
+            reason,
+        },
+    }
+}
+
 /// Close SSH bridges that have been idle for longer than the configured
 /// timeout. Called once per event-loop iteration.
 fn enforce_idle_timeouts(
@@ -1381,6 +2058,20 @@ fn enforce_idle_timeouts(
         for bridge_id in idle {
             tracing::debug!("ssh terminal {bridge_id} idle timeout");
             close_ssh_terminal(sess, &bridge_id, "idle timeout");
+        }
+    }
+    // Then idle file sessions, on the file module's own timeout (REQ-005).
+    let file_timeout = shared.cfg.files.idle_timeout();
+    for sess in sessions.values_mut() {
+        let idle: Vec<String> = sess
+            .file_sessions
+            .iter()
+            .filter(|(_, b)| now.duration_since(b.last_activity) >= file_timeout)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for file_id in idle {
+            tracing::debug!("file session {file_id} idle timeout");
+            close_file_session(sess, &file_id, "idle timeout");
         }
     }
 }
@@ -1521,6 +2212,156 @@ fn handle_gateway_event(
                 });
             }
         }
+        GatewayEvent::FileOpened {
+            session_id,
+            file_id,
+            kind,
+            error,
+        } => {
+            if let Some(sess) = sessions.get_mut(&session_id) {
+                if error.is_some() {
+                    // The backend never came up: drop the bridge so it does not
+                    // linger until the idle timeout.
+                    sess.file_sessions.remove(&file_id);
+                    sess.file_streams.retain(|_, owner| *owner != file_id);
+                }
+                let status = if error.is_none() { "ok" } else { "error" };
+                sess.send(&NodeMessage::FileOpenAck {
+                    session_id: file_id,
+                    kind,
+                    status: status.to_string(),
+                    error,
+                    chunk_bytes: shared.cfg.files.chunk_bytes as u32,
+                    roots: shared
+                        .cfg
+                        .files
+                        .roots
+                        .iter()
+                        .map(|r| r.name.clone())
+                        .collect(),
+                });
+            }
+        }
+        GatewayEvent::FileListed {
+            session_id,
+            file_id,
+            path,
+            entries,
+            error,
+        } => {
+            if let Some(sess) = sessions.get_mut(&session_id) {
+                touch_file(sess, &file_id);
+                sess.send(&NodeMessage::FileListAck {
+                    session_id: file_id,
+                    path,
+                    entries,
+                    error,
+                });
+            }
+        }
+        GatewayEvent::FileStatted {
+            session_id,
+            file_id,
+            entry,
+            error,
+        } => {
+            if let Some(sess) = sessions.get_mut(&session_id) {
+                touch_file(sess, &file_id);
+                sess.send(&NodeMessage::FileStatAck {
+                    session_id: file_id,
+                    entry,
+                    error,
+                });
+            }
+        }
+        GatewayEvent::FileChunk {
+            session_id,
+            file_id,
+            stream_id,
+            offset,
+            data,
+            final_block,
+            error,
+        } => {
+            if let Some(sess) = sessions.get_mut(&session_id) {
+                touch_file(sess, &file_id);
+                match error {
+                    Some(e) => sess.send(&NodeMessage::FileOpAck {
+                        session_id: file_id,
+                        op: "read".into(),
+                        path: String::new(),
+                        ok: false,
+                        error: Some(e),
+                    }),
+                    None => sess.send_file(encode_frame(
+                        FRAME_READ_CHUNK,
+                        stream_id,
+                        offset,
+                        final_block,
+                        &data,
+                    )),
+                }
+            }
+        }
+        GatewayEvent::FileWriteAck {
+            session_id,
+            file_id,
+            stream_id,
+            received,
+            error,
+        } => {
+            if let Some(sess) = sessions.get_mut(&session_id) {
+                touch_file(sess, &file_id);
+                sess.send(&NodeMessage::FileWriteAck {
+                    session_id: file_id,
+                    stream_id,
+                    received,
+                    error,
+                });
+            }
+        }
+        GatewayEvent::FileOpDone {
+            session_id,
+            file_id,
+            op,
+            path,
+            error,
+        } => {
+            if let Some(sess) = sessions.get_mut(&session_id) {
+                touch_file(sess, &file_id);
+                let ok = error.is_none();
+                sess.send(&NodeMessage::FileOpAck {
+                    session_id: file_id,
+                    op,
+                    path,
+                    ok,
+                    error,
+                });
+            }
+        }
+        GatewayEvent::FileClosed {
+            session_id,
+            file_id,
+            reason,
+        } => {
+            if let Some(sess) = sessions.get_mut(&session_id) {
+                // Only report a close the gateway has not already reported.
+                if sess.file_sessions.remove(&file_id).is_some() {
+                    sess.file_streams.retain(|_, owner| *owner != file_id);
+                    sess.send(&NodeMessage::FileClosed {
+                        session_id: file_id,
+                        reason,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Keep a file session's idle timer fresh after worker activity.
+fn touch_file(sess: &mut Session, file_id: &str) {
+    if let Some(bridge) = sess.file_sessions.get_mut(file_id) {
+        bridge.last_activity = Instant::now();
     }
 }
 
@@ -1548,39 +2389,25 @@ fn create_session(
     let mut rtc = Rtc::builder().build(now);
     let udp_addr = shared.udp.local_addr().map_err(GatewayError::Io)?;
     let udp_port = udp_addr.port();
-    // Advertise all non-loopback interface addresses as host candidates so
-    // ICE can try each path (multi-homed hosts, mesh + LAN, etc.). The UDP
-    // socket is bound to the selected IP, but candidates cover all interfaces.
+    // G11: advertise exactly the addresses the shared socket can receive on —
+    // the single bound address for a concrete `listen_addr`, or every routable
+    // interface address when it is unspecified (multi-homed hosts: LAN + mesh,
+    // so ICE can try each path).
     let mut added = 0;
-    if let Ok(interfaces) = getifaddrs::getifaddrs() {
-        for iface in interfaces {
-            if iface.flags.contains(getifaddrs::InterfaceFlags::LOOPBACK) {
-                continue;
-            }
-            if let Some(ip) = iface.address.ip_addr() {
-                if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
-                    continue;
-                }
-                // Match address family with the bound socket
-                let same_family = matches!(
-                    (udp_addr.ip(), ip),
-                    (std::net::IpAddr::V4(_), std::net::IpAddr::V4(_))
-                        | (std::net::IpAddr::V6(_), std::net::IpAddr::V6(_))
-                );
-                if !same_family {
-                    continue;
-                }
-                let cand_addr = std::net::SocketAddr::new(ip, udp_port);
-                if let Ok(candidate) = Candidate::host(cand_addr, "udp") {
-                    rtc.add_local_candidate(candidate);
-                    added += 1;
-                }
-            }
+    for ip in &shared.host_candidate_ips {
+        if let Ok(candidate) = Candidate::host(std::net::SocketAddr::new(*ip, udp_port), "udp") {
+            rtc.add_local_candidate(candidate);
+            added += 1;
         }
     }
-    // Fallback: if no interface candidates were added, use the bound address
+    // Defensive fallback: never answer an offer with no host candidate at all.
     if added == 0 {
-        let candidate = Candidate::host(udp_addr, "udp")
+        let fallback = if udp_addr.ip().is_unspecified() {
+            std::net::SocketAddr::new(loopback_for(udp_addr.ip()), udp_port)
+        } else {
+            udp_addr
+        };
+        let candidate = Candidate::host(fallback, "udp")
             .map_err(|e| GatewayError::Rtc(format!("host candidate: {e}")))?;
         rtc.add_local_candidate(candidate);
     }
@@ -1603,4 +2430,61 @@ fn create_session(
     });
     sessions.insert(session_id.to_string(), session);
     Ok(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// G11: a concrete `listen_addr` binds that address, so the socket can only
+    /// receive datagrams addressed to it — it must be the only host candidate.
+    /// Advertising this host's other interface IPs here is precisely the bug
+    /// that made every ICE connection time out on loopback-bound gateways.
+    #[test]
+    fn concrete_listen_addr_advertises_only_the_bound_address() {
+        for listen in ["127.0.0.1", "192.168.7.13", "10.144.144.4"] {
+            let ip: std::net::IpAddr = listen.parse().expect("parse listen ip");
+            let plan = ice_bind_plan(ip);
+            assert_eq!(plan.bind_ip, ip, "{listen} must bind itself");
+            assert_eq!(plan.candidate_ips, vec![ip], "{listen} candidate set");
+            assert_eq!(plan.page_ip, ip, "{listen} page ip");
+            assert!(!plan.no_routable_interface, "{listen} needs no warning");
+        }
+    }
+
+    /// G11: an unspecified `listen_addr` is the one configuration where a socket
+    /// receives on every interface, so it must bind the wildcard (not one derived
+    /// interface IP) and advertise the routable interfaces rather than `0.0.0.0`
+    /// itself. The page address stays concrete so browsers get a usable URL.
+    #[test]
+    fn unspecified_listen_addr_widens_bind_and_candidates() {
+        let ip: std::net::IpAddr = "0.0.0.0".parse().expect("parse wildcard ip");
+        let plan = ice_bind_plan(ip);
+
+        assert!(
+            plan.bind_ip.is_unspecified(),
+            "wildcard bind is what makes multi-interface candidates reachable"
+        );
+        assert!(
+            !plan.candidate_ips.is_empty(),
+            "an offer must never be candidate-less"
+        );
+        assert!(
+            !plan.candidate_ips.iter().any(|c| c.is_unspecified()),
+            "0.0.0.0 leaked into candidates: {:?}",
+            plan.candidate_ips
+        );
+        assert!(
+            !plan.page_ip.is_unspecified(),
+            "page_addr must be browser-openable, got {}",
+            plan.page_ip
+        );
+        if !plan.no_routable_interface {
+            assert!(
+                plan.candidate_ips.iter().all(|c| !c.is_loopback()),
+                "loopback candidate offered on a routable host: {:?}",
+                plan.candidate_ips
+            );
+        }
+    }
 }
