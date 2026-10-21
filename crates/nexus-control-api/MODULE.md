@@ -97,3 +97,7 @@ TaskRequest/TaskEnvelope 作为 POST /localapi/v1/task 的 schema1 线协议；�
 由 daemon token/本地身份/配置作用域构造，不反序列化任意主体。HTTP framing、
 容量、错误与相关性按 docs/N3-6-LOCALAPI-SECURITY-CONTRACT.md 冻结；本 crate
 仍无 OS/Transport/存储副作用，六类 DTO 不变。
+
+### N3-12 独立 Snapshot staging DTO
+
+按 docs/N3-12-SNAPSHOT-STAGING-CONTRACT.md §3/8 新增 snapshot 模块的 UploadId/State/Blob/View、五类 SnapshotRequest、独立 SnapshotEnvelope 与 SnapshotService。复用已认证 TaskCallContext 和 domain SnapshotRef/TaskError/CanonicalDto；严格纯字段验证及请求响应相关性，无 manifest算法/授权/IO，无 workspace 依赖，六类 TaskRequest 不变。

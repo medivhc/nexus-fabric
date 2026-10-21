@@ -211,7 +211,7 @@ cargo clippy -p nexus-workspace --all-targets -- -D warnings
 - `sweep` 跳过 in-flight fetch 的对象；超 `max_sweep_per_run` 限速；pin/hold
   阻止删除并计数。
 - 默认保留期 `DEFAULT_RETENTION_SECS` = 14 天（v9 §20 移动端默认值）。
-- DurableState 格式 v2（向前兼容 v1 解析）：新增 `tombstone` / `retain` /
+- DurableState 格式 v2（按本模块 Invariants 拒绝 v1 解析）：新增 `tombstone` / `retain` /
   `hold` / `shallow` 行；tombstone/retain/hold/shallow_frontier 持久化。
 - Shallow/Sparse：`ReplicaPolicy { max_depth, sparse_paths }`；
   `shallow_clone` 按老→新导入并做内容寻址校验（id 不匹配 → `CorruptState`）；
@@ -247,3 +247,7 @@ reconcile 无副作用。孤儿会话归类见 `nexus-session` 的 `reconcile_se
 ## Platform Constraints
 
 平台专有代码只允许存在于 `nexus-platform-*` 或 Composition Root。Portable crate 必须通过相应 portability gate。
+
+### N3-12 有界固定 Commit freeze
+
+按 docs/N3-12-SNAPSHOT-STAGING-CONTRACT.md，新增有界 freeze 路径，保持原 freeze API/选择与 SHA-256 清单语义。只读取指定现存 DAG Commit，不选 Head/WorkingSet，不自动创建 Workspace/修补 anchor；bounded ContentStore 的 descriptor 分配前检查归属 app adapter。Portable workspace 保持无 OS 副作用，不执行命令、不拥有 upload预算/授权。旧 anchor 非 fsync 写入边界不扩大为 power-loss 保证。

@@ -1,0 +1,9 @@
+workspace=n312-source
+genesis=e56d994c89c61ec6
+old_commit=b06b020a76caf915
+new_commit=2c8d5558b2981294
+old_state_root=143768107773e65c
+state_root=8a317d032f737d49
+old_manifest=6a9e12a170547cc6
+new_manifest=365cd47d660ad54e
+reopen_verified=true

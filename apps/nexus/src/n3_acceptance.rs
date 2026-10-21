@@ -17,6 +17,27 @@ pub fn sha256(bytes: &[u8]) -> Sha256Digest {
     raw.copy_from_slice(digest.as_ref());
     Sha256Digest::from_bytes(raw)
 }
+/// Shared composition-root SHA-256 for the CLI and nexusd staging adapter,
+/// exposed so nexusd can reuse the established crypto dependency through
+/// `nexus::n3_acceptance` rather than adding a separate ring/sha2 dependency.
+/// Scratch space is bounded; input length and IO duration are not: this reads
+/// until EOF. Callers must bound the reader (for example with `Read::take`) and
+/// enforce declared size, file identity, content and authorization checks.
+pub fn sha256_reader(mut reader: impl std::io::Read) -> std::io::Result<Sha256Digest> {
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buffer = [0u8; 65_536];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => context.update(&buffer[..count]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    let mut raw = [0u8; 32];
+    raw.copy_from_slice(context.finish().as_ref());
+    Ok(Sha256Digest::from_bytes(raw))
+}
 /// Opaque provider-generated TaskId, independent of requester/session identifiers.
 pub fn new_task_id() -> Result<TaskId, TaskError> {
     let mut random = [0u8; 32];
@@ -135,3 +156,61 @@ pub fn decode_dto<T: CanonicalDto>(bytes: &[u8]) -> Result<T, TaskError> {
 #[cfg(test)]
 #[path = "n3_acceptance_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod stream_hash_tests {
+    use super::sha256_reader;
+    use std::io::{self, Read};
+
+    #[test]
+    fn known_vectors_short_reads_and_interrupted_do_not_change_digest() {
+        struct Fragmented {
+            remaining: &'static [u8],
+            interrupted: bool,
+        }
+        impl Read for Fragmented {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                if self.remaining.is_empty() {
+                    return Ok(0);
+                }
+                out[0] = self.remaining[0];
+                self.remaining = &self.remaining[1..];
+                Ok(1)
+            }
+        }
+        assert_eq!(
+            sha256_reader(io::empty()).unwrap().as_str(),
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_reader(Fragmented {
+                remaining: b"abc",
+                interrupted: false
+            })
+            .unwrap()
+            .as_str(),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+    #[test]
+    fn stream_error_is_propagated_and_range_is_owned_by_caller() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::PermissionDenied.into())
+            }
+        }
+        assert_eq!(
+            sha256_reader(Broken).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            sha256_reader((&b"abcEXTRA"[..]).take(3)).unwrap().as_str(),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+}

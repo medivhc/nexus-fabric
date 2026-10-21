@@ -218,6 +218,11 @@ impl Lease {
                             persistence(e)
                         }
                     })?;
+                    // The retry return still ends a successfully acquired scope.
+                    let _lease = Self {
+                        file,
+                        path: path.to_owned(),
+                    };
                     return Err(InitFailure::new(
                         TaskErrorCode::CapacityUnavailable,
                         "provider initialization appeared concurrently; retry from its durable state",
@@ -274,6 +279,15 @@ impl Lease {
     pub(super) fn check(&self, root: &Root) -> Result<()> {
         root.check()?;
         check_file(&self.file, &self.path, true)
+    }
+}
+impl Drop for Lease {
+    fn drop(&mut self) {
+        // An unrelated child can inherit this OFD until exec even with CLOEXEC.
+        // End the private operation's lease now, rather than waiting for that
+        // child's descriptor to close. Drop cannot return an IO error or panic
+        // during unwind; on failure, closing our File remains the fallback.
+        let _ = nexus_platform_linux::file_lease::unlock_exclusive(&self.file);
     }
 }
 pub(super) fn create_directory(root: &Root, path: &Path) -> Result<(u64, u64)> {
@@ -423,4 +437,289 @@ pub(super) fn sentinel(root: &Root, path: &Path, expected: &[u8]) -> Result<Reco
     }
     root.check()?;
     Ok(after)
+}
+
+#[cfg(test)]
+mod scoped_owner_lease_release_tests {
+    use super::*;
+    use std::process::{Child, Command, Stdio};
+
+    // These E2 tests exercise only the real private IO owner. The fixture is
+    // deliberately not a fabricated initialized provider/staging authority.
+    struct Fixture {
+        root: Root,
+        path: PathBuf,
+        expected_bytes: &'static [u8],
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "n311-scoped-owner-{}",
+                nexus::n3_acceptance::new_task_id().unwrap().as_str()
+            ));
+            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            let root = Root::open(&path).unwrap();
+            Self {
+                path: path.join("task-provider-init.lock"),
+                root,
+                expected_bytes: b"",
+            }
+        }
+        fn acquire(&self, create: bool) -> Result<Lease> {
+            Lease::acquire(&self.root, &self.path, create)
+        }
+        fn unchanged(&self, binding: (u64, u64)) {
+            self.root.check().unwrap();
+            let meta = fs::symlink_metadata(&self.path).unwrap();
+            assert_eq!(identity(&meta), binding, "fixed lock inode changed");
+            assert!(meta.is_file());
+            assert_eq!(meta.nlink(), 1);
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+            assert_eq!(fs::read(&self.path).unwrap(), self.expected_bytes);
+            assert_eq!(fs::read_dir(&self.root.path).unwrap().count(), 1);
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root.path);
+        }
+    }
+
+    // A single owned process (no shell/grandchild) retains only a cloned OFD on
+    // stdin. spawn's completed exec, /proc/fd identity, and try_wait are the
+    // barriers; no elapsed sleep or scheduler race is used for test ordering.
+    struct OwnedChild {
+        child: Child,
+    }
+    impl OwnedChild {
+        fn inheriting(file: &File) -> Self {
+            let child = Command::new("/bin/sleep")
+                .arg("600")
+                .stdin(Stdio::from(file.try_clone().unwrap()))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut owned = Self { child };
+            owned.assert_holds(identity(&file.metadata().unwrap()));
+            eprintln!("owned-child spawned pid={}", owned.child.id());
+            owned
+        }
+        fn assert_holds(&mut self, binding: (u64, u64)) {
+            assert!(self.child.try_wait().unwrap().is_none(), "child exited");
+            let fd = PathBuf::from(format!("/proc/{}/fd/0", self.child.id()));
+            assert_eq!(identity(&fs::metadata(fd).unwrap()), binding);
+            assert!(self.child.try_wait().unwrap().is_none(), "child exited");
+        }
+        fn stop(&mut self) {
+            let pid = self.child.id();
+            let _ = self.child.kill();
+            self.child
+                .wait()
+                .expect("reap owned descriptor-holder child");
+            assert!(!PathBuf::from(format!("/proc/{pid}")).exists());
+            eprintln!("owned-child reaped pid={pid}");
+        }
+    }
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            // Drop must also reap when a regression assertion unwinds. Avoid
+            // double-panic, but record both operations for cleanup evidence.
+            let pid = self.child.id();
+            let killed = self.child.kill();
+            let waited = self.child.wait();
+            eprintln!(
+                "owned-child drop pid={pid} kill={killed:?} wait={waited:?} proc_exists={}",
+                PathBuf::from(format!("/proc/{pid}")).exists()
+            );
+        }
+    }
+
+    fn assert_busy(result: Result<Lease>) {
+        let failure = match result {
+            Ok(_) => panic!("independent contender acquired an owned lease"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.error.code, TaskErrorCode::CapacityUnavailable);
+        assert!(failure.error.retryable);
+    }
+    fn assert_raw_busy(path: &Path) {
+        let contender = File::open(path).unwrap();
+        let error = nexus_platform_linux::file_lease::try_lock_exclusive(&contender)
+            .expect_err("independent raw contender acquired an owned lease");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    enum Exit {
+        Normal,
+        Error,
+        Unwind,
+    }
+    fn release_on_exit(exit: Exit, existing: bool) {
+        let mut fixture = Fixture::new();
+        let owner = if existing {
+            // Establish the fixed inode through real private IO, then end the
+            // initial owner without an inherited child. These prescribed bytes
+            // are test input, never inferred from production output.
+            let initial = fixture.acquire(true).unwrap();
+            let original_binding = initial.binding().unwrap();
+            drop(initial);
+            fixture.expected_bytes = b"n311-scoped-owner-regression-sentinel-v1\n";
+            fs::write(&fixture.path, fixture.expected_bytes).unwrap();
+            fixture.unchanged(original_binding);
+            let owner = fixture.acquire(false).unwrap();
+            assert_eq!(owner.binding().unwrap(), original_binding);
+            fixture.unchanged(original_binding);
+            owner
+        } else {
+            fixture.acquire(true).unwrap()
+        };
+        let binding = owner.binding().unwrap();
+        let mut old_child = OwnedChild::inheriting(&owner.file);
+        assert_busy(fixture.acquire(false));
+        // Failed acquisition must not release this legitimate owner.
+        assert_raw_busy(&fixture.path);
+        owner.check(&fixture.root).unwrap();
+        fixture.unchanged(binding);
+        match exit {
+            Exit::Normal => drop(owner),
+            Exit::Error => {
+                fn fail_after_acquire(_owner: Lease) -> Result<()> {
+                    Err(corrupt("test operation fails while owning its lease"))
+                }
+                let error = fail_after_acquire(owner).unwrap_err();
+                assert_eq!(error.error.code, TaskErrorCode::StateCorrupt);
+            }
+            Exit::Unwind => {
+                let unwound = std::panic::catch_unwind(move || {
+                    let _owner = owner;
+                    panic!("test operation unwinds while owning its lease");
+                });
+                assert!(unwound.is_err());
+            }
+        }
+        old_child.assert_holds(binding);
+        fixture.unchanged(binding);
+        // R1: logical operation ended. An unrelated inherited descriptor must
+        // not retain the short-lived private owner's exclusive authority.
+        let new_owner = fixture.acquire(false).unwrap_or_else(|failure| {
+            panic!("R1: owner ended but live inherited child retains lease: {failure:?}")
+        });
+        assert_eq!(new_owner.binding().unwrap(), binding);
+        fixture.unchanged(binding);
+        old_child.assert_holds(binding);
+        assert_busy(fixture.acquire(false));
+        fixture.unchanged(binding);
+        // R2: closing the old child's OFD cannot unlock the new independent
+        // owner. Its original fixed inode and exclusivity remain intact.
+        old_child.stop();
+        assert_busy(fixture.acquire(false));
+        fixture.unchanged(binding);
+        new_owner.check(&fixture.root).unwrap();
+        drop(new_owner);
+        let final_owner = fixture.acquire(false).unwrap();
+        assert_eq!(final_owner.binding().unwrap(), binding);
+        fixture.unchanged(binding);
+    }
+
+    #[test]
+    fn r1_normal_drop_releases_private_owner_while_inherited_child_lives() {
+        release_on_exit(Exit::Normal, false);
+    }
+    #[test]
+    fn r1_error_return_releases_private_owner_while_inherited_child_lives() {
+        release_on_exit(Exit::Error, false);
+    }
+    #[test]
+    fn r1_unwind_releases_private_owner_while_inherited_child_lives() {
+        release_on_exit(Exit::Unwind, false);
+    }
+
+    #[test]
+    fn r1_existing_nonempty_normal_drop_releases_owner_while_inherited_child_lives() {
+        release_on_exit(Exit::Normal, true);
+    }
+    #[test]
+    fn r1_existing_nonempty_error_return_releases_owner_while_inherited_child_lives() {
+        release_on_exit(Exit::Error, true);
+    }
+    #[test]
+    fn r1_existing_nonempty_unwind_releases_owner_while_inherited_child_lives() {
+        release_on_exit(Exit::Unwind, true);
+    }
+
+    #[test]
+    fn r2_failed_acquire_preserves_independently_owned_external_lock() {
+        let fixture = Fixture::new();
+        drop(fixture.acquire(true).unwrap());
+        let raw_owner = File::open(&fixture.path).unwrap();
+        nexus_platform_linux::file_lease::try_lock_exclusive(&raw_owner).unwrap();
+        let binding = identity(&raw_owner.metadata().unwrap());
+        let mut child = OwnedChild::inheriting(&raw_owner);
+        // Only the external child owns the generic lock now, independently
+        // of every failed private guard construction below.
+        drop(raw_owner);
+        for create in [false, true] {
+            assert_busy(fixture.acquire(create));
+            child.assert_holds(binding);
+            assert_raw_busy(&fixture.path);
+        }
+        fixture.unchanged(binding);
+        child.stop();
+        let owner = fixture.acquire(false).unwrap();
+        assert_eq!(owner.binding().unwrap(), binding);
+    }
+
+    #[test]
+    fn r2_generic_file_clone_retains_lock_until_last_descriptor_closes() {
+        let fixture = Fixture::new();
+        drop(fixture.acquire(true).unwrap());
+        let raw_owner = File::open(&fixture.path).unwrap();
+        nexus_platform_linux::file_lease::try_lock_exclusive(&raw_owner).unwrap();
+        let binding = identity(&raw_owner.metadata().unwrap());
+        let clone = raw_owner.try_clone().unwrap();
+        let mut child = OwnedChild::inheriting(&clone);
+        drop(raw_owner);
+        assert_raw_busy(&fixture.path);
+        drop(clone);
+        child.assert_holds(binding);
+        assert_raw_busy(&fixture.path);
+        child.stop();
+        let fresh = File::open(&fixture.path).unwrap();
+        nexus_platform_linux::file_lease::try_lock_exclusive(&fresh).unwrap();
+        assert_raw_busy(&fixture.path);
+        fixture.unchanged(binding);
+    }
+
+    #[test]
+    fn r2_existing_file_create_failure_allows_immediate_reacquire() {
+        let fixture = Fixture::new();
+        let owner = fixture.acquire(true).unwrap();
+        let binding = owner.binding().unwrap();
+        drop(owner);
+        // The AlreadyExists branch can acquire the raw flock, then return
+        // retryable Err before constructing Lease. This checks its ordinary
+        // return path, not the uninstrumented transient inheritance window.
+        assert_busy(fixture.acquire(true));
+        let next = fixture.acquire(false).unwrap();
+        assert_eq!(next.binding().unwrap(), binding);
+        fixture.unchanged(binding);
+    }
+
+    #[test]
+    fn r2_owned_child_drop_kills_and_reaps_during_panic() {
+        let fixture = Fixture::new();
+        let owner = fixture.acquire(true).unwrap();
+        let child = OwnedChild::inheriting(&owner.file);
+        let pid = child.child.id();
+        let unwound = std::panic::catch_unwind(move || {
+            let _child = child;
+            panic!("verify child cleanup on assertion unwind");
+        });
+        assert!(unwound.is_err());
+        assert!(!PathBuf::from(format!("/proc/{pid}")).exists());
+        assert_busy(fixture.acquire(false));
+        drop(owner);
+        assert!(fixture.acquire(false).is_ok());
+    }
 }

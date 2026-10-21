@@ -1,0 +1,161 @@
+{
+  "schema_version": 1,
+  "facts": {
+    "workspace": "n312-source",
+    "genesis": "e56d994c89c61ec6",
+    "old_commit": "b06b020a76caf915",
+    "new_commit": "2c8d5558b2981294",
+    "old_state_root": "143768107773e65c",
+    "state_root": "8a317d032f737d49",
+    "old_manifest": "6a9e12a170547cc6",
+    "new_manifest": "365cd47d660ad54e",
+    "reopen_verified": "true"
+  },
+  "selection": {
+    "schema_version": 1,
+    "matching": "exact-or-directory-prefix",
+    "include": [
+      "."
+    ],
+    "exclude": [
+      "private"
+    ],
+    "executable": [
+      "scripts/run.sh"
+    ]
+  },
+  "expected_manifest": [
+    {
+      "path": "inputs/data.bin",
+      "sha256": "sha256:5a32fc00d330fc8c244fd9da8a84222d30349df4fdc852461391e1d43476e89c",
+      "size_bytes": 98317,
+      "executable": false
+    },
+    {
+      "path": "inputs/empty.txt",
+      "sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size_bytes": 0,
+      "executable": false
+    },
+    {
+      "path": "scripts/run.sh",
+      "sha256": "sha256:6271227e08ae5ae128e4e834ae48e17cc77093cdf665833b7e9a6cde2afb099d",
+      "size_bytes": 35,
+      "executable": true
+    }
+  ],
+  "expected_snapshot": {
+    "schema_version": 1,
+    "workspace": "n312-source",
+    "commit_id": "b06b020a76caf915",
+    "root_manifest_id": "6a9e12a170547cc6",
+    "manifest_sha256": "sha256:b6d4246b4b54d6e1aa3566c8d8752a49df19d6162d7f79f2d14d976c934b4127",
+    "selection_digest": "sha256:e9c9f719bdab656d49e22c478e150d77df2176b9ac9e9dc21f61ff49c964061b",
+    "file_count": 3,
+    "total_bytes": 98352,
+    "snapshot_id": "sha256:7cc283ef17633a7db748c75b557956c4bfbf578f3e39db8a287124f874bcbb9d"
+  },
+  "fixture_files_sha256": {
+    "config/data/cas/107d6a15dd6dd9c5": "e709d67eb71886c17d5fb89d737405c65187a4dfd88f11bf4f5bc5f2839ea9a7",
+    "config/data/cas/143768107773e65c": "87b766d9ed6ec17b1aae1c643cb22f0e65ff4147ea6fcf86678adf80a825aa4a",
+    "config/data/cas/365cd47d660ad54e": "ee5ab33a5dfa7f87486aeba59b80c668b268ba47062c0874bd3ed9cc4a3e059e",
+    "config/data/cas/59b545e938ad7f6b": "5a32fc00d330fc8c244fd9da8a84222d30349df4fdc852461391e1d43476e89c",
+    "config/data/cas/64f417ebbba5d00d": "46559f8330390eaeb70aa3227d1b99bd53b6f3d76ec201bd72852adf71a85486",
+    "config/data/cas/6a9e12a170547cc6": "f7bf3114e993169fd1120de7069a14afaa3d3bad20af18f2b7abc671f0bc5db3",
+    "config/data/cas/82f3c98ae62811aa": "53ced8f837851f68bbb78fbc214f03992c7ba6403704844396279738034b70a5",
+    "config/data/cas/8a317d032f737d49": "18093d2d9a4be37078cb8e3d9c9a2e50662fb9cd4f3df7e5498e273849914dfd",
+    "config/data/cas/97ea2576dd8d16e3": "2b5b9a3a100422068006a3c6b83a5849c03a7a5e832b77ed5c5a5123274869b5",
+    "config/data/cas/a5a0be02d8050458": "ce1796015cdd83a71ca782b083219ddac15dbe2470ee89ed0409a7aa2f2c3501",
+    "config/data/cas/cbf29ce484222325": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "config/data/cas/e84b6705e76222a3": "6271227e08ae5ae128e4e834ae48e17cc77093cdf665833b7e9a6cde2afb099d",
+    "config/data/cas/fede85f6fd8ed662": "ed54e010d993410f18e8f4e1bab9ba0aec2ab838ee0a1f779d0f6393826f5da3",
+    "config/data/mounts/n312-source/inputs/data.bin": "606b3696bb66402784b5fb83754136ac1a088605ae31bc70e946b8fdb273091c",
+    "config/data/workspaces/n312-source/state_root": "8cca7f9b6d10a3b6ea2a40b34939d78a7a3f245c6d2784f76f3be309d974511d",
+    "config/workspace.toml": "ba5112b7ba6bb5538c082c6dcf8efa1ea16600ec7823f9a2824d398d68946915",
+    "facts.txt": "34ec788b7a73306ced32308378310ad196c45581b3142829728d10480a451576"
+  },
+  "source_binding": {
+    "source_revision": "e772dedb8f7f0f8b3f4350382ee81aeabdb58ff3",
+    "source_files_sha256": {
+      "AGENTS.md": "bdf87d3db985b163d1b7849447a1749192a8fe81e25791bb7c52b6fd8b5c6eef",
+      "ARCHITECTURE.md": "2da69e6edecc74167289652f4769aba4b46c78989c1d7c313e5b411dc705976a",
+      "Cargo.lock": "bfbac735ae5291a918e5f2fa12c974c2efaae9c84a9d4933b3ad314da570b317",
+      "Cargo.toml": "1c4cd08bc635669a7307f5730f8b6cd0084fb979e65792a0f51c76c9592d15c5",
+      "PRODUCT.md": "4972265b62b4fd64f3ac526324ec7b73828761b640be13c62315e3304941e250",
+      "apps/nexusd/src/workspace.rs": "b8312ad9ad2c326dbfb10af83b17550f9a8a168052fbcd3d45124941fc0f59fb",
+      "crates/nexus-domain/Cargo.toml": "0de7b0a8e2ca9d655f16576a210eeff4bf236b8afd229d508ccce6e1b43842cf",
+      "crates/nexus-domain/MODULE.md": "b1551b44005f82fabda01a99b0a600de31f0b955aeb40b9e51ce5138692398f1",
+      "crates/nexus-domain/src/lib.rs": "a8cd1d81f51b897682f1e1f1f63fd8145c295b6f2ccfd3e828dc1782f9dd4b0b",
+      "crates/nexus-domain/src/task/codec.rs": "5f1d065348d5b87621173d2b53f01463e282842f38bd342e78c6c3b99036d3ff",
+      "crates/nexus-domain/src/task/mod.rs": "03ce43cc220c79362369737afb6f5ed78b6b2ed8cdbecb6d160c58dee738834a",
+      "crates/nexus-domain/src/task/tests.rs": "52c9485a1f1df182d7e025b743761f2a3fa2c1d2864e843279f79a5b0fd23ed9",
+      "crates/nexus-domain/src/task/validation.rs": "c725a02dc81129e73e9975c930f4e800360d3f6783aab28ba617f0c22c4eebc8",
+      "crates/nexus-platform/Cargo.toml": "40d7cb094f18e4ade14d28686d6e6f224cada248b7c272621a1716e99b09eeb3",
+      "crates/nexus-platform/MODULE.md": "7603bd6dfa4a2fef818f38acf7ce031ca80e4c4327b965c7d5347a13b3e29cfc",
+      "crates/nexus-platform/src/lib.rs": "67de41194b1f725c8143e6d79795d6c903290ea04bbedd4234e102338dcb0188",
+      "crates/nexus-platform/src/projected.rs": "c229979a948f1ddf1404eb2609b600749cc883d20580342d1fb400b2d0db8518",
+      "crates/nexus-platform/src/secure_store.rs": "f74f01873906ff151602809d55cd305d3b9b2bb77591646fc0dddbaf82227aeb",
+      "crates/nexus-platform/src/udp_carrier.rs": "f7721d4c7c3b7ddaacc34d62ce35db053427dce43ceed5b9bdefeae027843d03",
+      "crates/nexus-session/Cargo.toml": "bc183625b87886779371bdd1d1ccf802ac6951c3671ee63485051f0fb5e49fdd",
+      "crates/nexus-session/MODULE.md": "c808c015093f29d34666fd1d4cdf7d466de7326e288c7bcb39a02cd5d465c3da",
+      "crates/nexus-session/amendments/2026-10-03-b1-disposed-record-gate.md": "0ae4492a0b624006cf57c496b2893f8ae98becbc690e6d37e19e5c3d36c19d32",
+      "crates/nexus-session/amendments/2026-10-03-b2-terminal-cleanup-replay.md": "23e6467d399c1275e57df6ffde7bffa61714ee64592c0cb041128bc022b7c952",
+      "crates/nexus-session/examples/session_outcome_exactly_once.rs": "dae7122853044c0ae797567ed81d5a4c20b3728416badb4888a0abe7ae5f6a52",
+      "crates/nexus-session/src/lib.rs": "760367490d70ab9ce40e010c0060782447518b0459a69036cdc65ec09369a232",
+      "crates/nexus-storage/Cargo.toml": "c1a98230a550c8e31ab6c0bbae1f7d244fd588a4294e813e11c00b0b7295ae2c",
+      "crates/nexus-storage/MODULE.md": "88fad6e18b291aeb586e60000ed3dbdc3c65a64040f0464d3f192c6e3eb65bc3",
+      "crates/nexus-storage/src/fs.rs": "5af8cc43ba054534898c78784194ca467b74186e3d6e92ada99df17db921a706",
+      "crates/nexus-storage/src/kv.rs": "88d08c9cdbf15cedeca29dab2920016650b5bdcfaf63b3af84693aba95943ba4",
+      "crates/nexus-storage/src/lib.rs": "65620b5378503bc91ead0d4645e4de5290ba3f41c261de2102a40c1f41ad1099",
+      "crates/nexus-storage/src/strong.rs": "48897f66d722a9e8d4bf3c0eaf56b1bead96dd6937d223a40fcfa81dca658fb1",
+      "crates/nexus-workspace/Cargo.toml": "00e7b49e7641e74acededeb7c6654bf58d2660fae50bc9f985bf0f02ed1cccf3",
+      "crates/nexus-workspace/MODULE.md": "9baf76479128c8678d6259138ceb9fe370dba1a29b62448ba4200c8d877b8ee1",
+      "crates/nexus-workspace/examples/cache_eviction.rs": "f4b55bf3f1b622d87e13e417626ecdd9d7df9698ab330cd5e2b8274798a4bba0",
+      "crates/nexus-workspace/examples/crash_recovery.rs": "2cd680325081040b194389ae4bf5d66acefd0fa0c1637fd35da71bb759fa38df",
+      "crates/nexus-workspace/examples/workspace_authority_v2.rs": "05b066d7f948023942717228a05cc05f45ef2680dcd4fe6ad6bfe2ea1969e49f",
+      "crates/nexus-workspace/examples/workspace_gc.rs": "90b26ef2edeb97cf41e06fc3205e04c102de447df40f350a0946feb0f08492d1",
+      "crates/nexus-workspace/examples/workspace_offline_merge.rs": "3d48adbd8bd2a13ca544564189d08e5013805afedc39534c4017fbbaa27fd5a7",
+      "crates/nexus-workspace/examples/workspace_projection_channels.rs": "20dc825ae396d0efc58255b7fa407b950609f03ec4afdc3a5cfcfbda48fbe67b",
+      "crates/nexus-workspace/examples/workspace_projection_fallback.rs": "d3463684ad430ad3ef167a2c12d4645140954c581fee08a13943470390e189cc",
+      "crates/nexus-workspace/examples/workspace_shallow.rs": "d12d7684bc35f36a79698d6ddfa0985431b963140a374860c1f1e167b07e1f39",
+      "crates/nexus-workspace/src/cache.rs": "f7aa27a8667aa0e2de8e4ac6ff61e9f6d132ce99b6016fca6fbbfc60c627ced8",
+      "crates/nexus-workspace/src/gc.rs": "5e13b966f25d5e22a0ee3106b8acf881155dc87205c651e45926f766cd471ae9",
+      "crates/nexus-workspace/src/lib.rs": "a8677171067aa35ada42283caec1d4b3c44d1422419c729b4d5267ac6b8a1584",
+      "crates/nexus-workspace/src/projection_adapt.rs": "1378fbaa33b50a24d646275b23126a0933e40df48da7995e719d6405084bf668",
+      "crates/nexus-workspace/src/snapshot.rs": "f0dcaf1a2fcd5b65c6658431316386a2fa7fab78ff19274c3b996131eb203c9b"
+    },
+    "generator_files_sha256": {
+      "generator/Cargo.lock": "fe54a705bb159d72daea15a982d1e4ba71d5f67a1ee370b8fbade3fb14460f3f",
+      "generator/Cargo.toml": "839f8102fc540287e9bcc88a5ea707b25b6027cb2082483c8b41f66b3f06580d",
+      "generator/src/bin/verify_export.rs": "a9974bc701cf2c2853c7c1374dce7eb7c8d120cb0c8cfed68c7fbff0e1b73b0b",
+      "generator/src/main.rs": "dea2bafdcc2d8513af044f75f528c5693feb4b31b153d9e2bef6c9837bba7615"
+    },
+    "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+    "generation_command": "CARGO_TARGET_DIR=/workspace/n312-probes/source/target cargo run --manifest-path /workspace/n312-probes/source/generator/Cargo.toml -- /workspace/n312-probes/source/requester-fixture",
+    "regeneration_command": "CARGO_TARGET_DIR=/workspace/n312-probes/source/target cargo run --manifest-path /workspace/n312-probes/source/generator/Cargo.toml --bin n312-requester-fixture-generator -- NEW_ABS_OUTPUT",
+    "source_dirty_status_at_binding": " M PRODUCT.md\n M apps/nexus/MODULE.md\n M apps/nexusd/MODULE.md\n M crates/nexus-control-api/MODULE.md\n M crates/nexus-platform-linux/MODULE.md\n M crates/nexus-workspace/MODULE.md\n?? docs/N3-12-SNAPSHOT-STAGING-CONTRACT.md\n?? scenarios/fixtures/\n",
+    "evidence_sha256": {
+      "generation.log": "7f0ffd81cde3261be84452b2ce3578f150803afae55e88b3257fdee0808155cd",
+      "verify-export.log": "26da43328dd1cc8b2035f479091c8dfd2b7ea3439063a1486b2a0bc7becb562a"
+    },
+    "generator_binary_sha256": "56c6f9d6f1630f4cda78399cb4c784c2ced47d1c7b166ee8c790cfebea39792d",
+    "notes": [
+      "Only requester Workspace APIs are used. No provider identity, capacity, staging, grant, Task, Session, or Engine is seeded.",
+      "Commit timestamps are real generation time; regeneration changes CommitIds. Checked-in exports are immutable and bound by SHA-256.",
+      "The generator writes a requester anchor; this is a fixture export, not a claim about power-loss durability of the existing daemon anchor."
+    ]
+  },
+  "expected_wire_correction": {
+    "date": "2026-10-13",
+    "existing_api_revision": "37e0cff0e528e5d09691b9a3bc698372f5df44e7",
+    "existing_api_source_dirty_status": "",
+    "probe_source_sha256": "2d2eaa16171c7cb0b1b909c8beecac90c5016fe3d02a14ec242ca33d564309e9",
+    "probe_binary_sha256": "fbcef08b672d7db0da58504e57121e217918065cba5bef4bdafa3c9f9e7cfb7e",
+    "manifest_canonical_sha256": "b6d4246b4b54d6e1aa3566c8d8752a49df19d6162d7f79f2d14d976c934b4127",
+    "snapshot_canonical_sha256": "e27aff187003a150cfabee83d9a8877990481c07d06087436f6c2b26659d5e30",
+    "independent_python_matches_existing_freeze_snapshot": true,
+    "export_bytes_changed": false,
+    "evidence_directory": "/workspace/n312-probes/source/wire-correction",
+    "reason": "Correct domain Sha256Digest wire encoding to sha256: prefix and recompute nested manifest/SnapshotRef hashes; previous expectations are STALE, not implementation-conforming values."
+  }
+}

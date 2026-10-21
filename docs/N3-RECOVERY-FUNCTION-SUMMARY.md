@@ -2,16 +2,16 @@
 doc-id: n3-recovery-function-summary
 layer: L2
 owner: coordinator
-last-verified: 2026-10-20
-verified-against: 1beb960
+last-verified: 2026-10-21
+verified-against: 731e659 + N3-12 recovery working tree
 status: current
 ---
 
 # N3 功能与代码恢复总结
 
-核实日期：2026-10-20（Asia/Shanghai）。本文依据正式契约、可读源码和机器记录说明能力边界，不改写历史 PROJECT-STATUS。发布基线为远端 master `5d70709`，发布分支为 `feat/n3-restored-code-20261020`；实际推送状态以远端引用为准。
+核实日期：2026-10-21（Asia/Shanghai）。本文依据正式契约、可读源码和机器记录说明能力边界，不改写历史 PROJECT-STATUS。发布基线为远端 master `5d70709`，发布分支为 `feat/n3-restored-code-20261020`；实际推送状态以远端引用为准。
 
-现有代码已具备 Task/Snapshot/Artifact 的持久基础、Linux 隔离执行适配器、本机 Task 查询与取消、Linux Artifact 断点下载、scoped Use 授权运维，以及恢复的 N3-11 提供方初始化/检查与 managed daemon 启动。它们尚未构成用户从 CLI 提交新任务、上传固定输入并经远端提供方执行的完整链路：当前生产 `Submit` 分支仍明确拒绝。N3-12 正在取证恢复，不能认定已集成；N3-13/14 未验收，Full 与 Windows→Linux E5 暂停。
+现有代码已具备 Task/Snapshot/Artifact 的持久基础、Linux 隔离执行适配器、本机 Task 查询与取消、Linux Artifact 断点下载、scoped Use 授权运维，以及恢复的 N3-11 提供方初始化/检查与 managed daemon 启动。它们尚未构成用户从 CLI 提交新任务、上传固定输入并经远端提供方执行的完整链路：当前生产 `Submit` 分支仍明确拒绝。N3-12 的固定输入 freeze、独立预算、本机认证分片上传、断点恢复与取消代码已恢复到活跃源码，原冻结测试与 requester fixture 已补齐；当前验证状态见第5节。N3-13/14 未验收，Full 与 Windows→Linux E5 暂停。
 
 ## 1. 如何理解能力边界
 
@@ -20,6 +20,7 @@ status: current
 | 库与提供方内部适配器 | 严格 DTO/规范摘要、持久接受与幂等、固定 Commit Snapshot、运行 journal、Linux Engine 执行/冷核实、产物登记、容量与已有 Session 绑定、请求方只读镜像/取消 outbox | 内部 Rust 调用需要真实认证、授权、输入与容量前置；存在库 API 不表示 CLI 已接通 |
 | daemon LocalAPI | `POST /localapi/v1/task`；真实既有 Task 的 Get、ReadLogs、Cancel、ListArtifacts、GetArtifact；逐次当前 Use 检查 | Linux 提供方、显式 `task-api.toml` 与真实 authority；Submit 校验/授权后仍返回 `UNSUPPORTED_CAPABILITY` |
 | CLI | `task show/logs/cancel/artifacts`；Linux `artifact get`；本机 grant 运维；`nexusd task-provider init/check` | CLI 为 daemon 薄客户端；`task submit` 可解析请求并收到真实拒绝，不启动工作负载 |
+| N3-12 本机输入准备 | `snapshot freeze/upload/status/cancel`；`task-provider staging-init`；独立预算与 durable prefix；每次当前 Use 检查 | 仅 Linux 本机认证 LocalAPI；Staged 不表示 Task Accepted，不创建 Task/Session/Engine |
 | 远端执行产品闭环 | Fabric 显式 mTLS 安全基础；Linux 内部执行适配器可以核实真实 Engine 执行 | 尚无已验收的跨节点 Task RPC、输入上传与提交装配；未完成真实 Windows→Linux 两机验收 |
 
 正式依据：[PRODUCT §17](../PRODUCT.md)、[ARCHITECTURE §12](../ARCHITECTURE.md)、[N3 模型契约](N3-MODEL-CONTRACT.md)。实际边界：[LocalTaskService](../apps/nexusd/src/task_service.rs)、[ProviderService 的 Submit 拒绝分支](../apps/nexusd/src/task_service_provider.rs)、[CLI 解析和下载](../apps/nexus/src/task_cli.rs)。
@@ -90,35 +91,33 @@ datagram 观察按已有 S5 尽力而为契约：示例发送100个200B数据报
 
 正式依据：[Fabric MODULE S4/S5/S10/S11](../crates/nexus-fabric/MODULE.md)、[basic 冻结场景](../scenarios/product/fabric_conn_basic.toml)。实际修复：[basic example](../crates/nexus-fabric/examples/basic.rs)；验证边界：[owner regression](../crates/nexus-fabric/examples/basic/owner_tests.rs)、[datagram regression](../crates/nexus-fabric/examples/basic/datagram_tests.rs)。mTLS/原 driver owner 与 reaper 的实现另见[driver](../crates/nexus-fabric/src/driver.rs)；该基础安全能力不等于远端 Task RPC 已集成。
 
-## 5. 本轮验证与恢复边界
+## 5. N3-12 恢复后的功能
 
-本轮集成代码在最新 master 上通过 Check 4/4、受影响测试、Fast 9/9；真实二进制回归为 init 23 + relative-startup 4，Fabric owner/datagram 回归18，全部45项通过、0忽略。`product.n3-11-provider-init` 的12项期望与 `product.fabric-conn-basic` 的6项期望均通过。首轮 Check 的格式/rustdoc 失败保留在本地证据中，修复后重新执行；没有修改冻结期望、增补 skip 或绕过 hooks。
+- `nexus snapshot freeze` 只读正规 Workspace 的明确 Commit 和选定路径，生成 SHA-256 bundle；不扫描 WorkingSet、不自动选 Head、不创建源 Workspace。读取、文件数、总量与清单均有上限，Linux 原子无覆盖发布保留已有目标。
+- `nexusd task-provider staging-init` 在已初始化提供方上建立独立暂存预算与绑定，不占用或重建 Task 执行容量。namespace 外 retained marker、原 inode lease、checksummed ledger 使丢失和损坏 authority 失败关闭。
+- `nexus snapshot upload` 先核实原 bundle，再经认证本机 LocalAPI 按 chunk 上传；相同 owner/key/内容返回原 UploadId，内容冲突拒绝。只确认已 durable 的连续前缀，daemon 重启后续传而不清空进度。
+- `snapshot status/cancel` 每次重新核实当前 Use 与 owner；Cancel 持久记录 intent，实际删除并同步后才返还 payload 预算；Cancelled tombstone 继续计 metadata 并保留86,400秒，只在启动或合法变更时清理过期索引，Get不清理。活动和Staged输入不自动过期。无授权、损坏或未知状态不能伪装为成功。
+- 正常 daemon 在身份、token、READY 等启动写入前恢复暂存；Staged 与 Task Accepted/执行结果分开。原 Task wire、Submit 拒绝和安全边界保持。
+- N3-11 scoped owner lease 恢复了操作结束时显式释放语义：子进程继承的 fd 不延长该操作的租约；普通 File clone 的原锁语义仍保持。
 
-可持久核对的[机器验证摘要](recovery/2026-10-20/verification.json)及同目录 Check/Affected/Fast/E4 JSON，绑定于 `1beb960` 的已测试工作树 SHA-256 `0992a086c45d3a71b7ffab025704831a850b60a7dffa6e0409c0cb6e1a361d38`；这是添加本文及源码归档之前的集成代码验证，不冒充最终提交的全量验收。发布时仍须在最终提交上运行正常 Fast/推送门禁。完整 Full 与 Windows→Linux E5 按原决定暂停；本轮不声明 Candidate Completion 或 Final PASS。
+源码入口：[CLI](../apps/nexus/src/snapshot_cli.rs)、[只读 Linux adapter](../apps/nexus/src/snapshot_cli/linux.rs)、[Snapshot DTO](../crates/nexus-control-api/src/snapshot.rs)、[LocalAPI service](../apps/nexusd/src/snapshot_service.rs)、[staging backend](../apps/nexusd/src/snapshot_staging/backend.rs)、[TTL/取消](../apps/nexusd/src/snapshot_staging/ops.rs)。正式边界见[冻结契约](N3-12-SNAPSHOT-STAGING-CONTRACT.md)。该契约保留原冻结字节及历史阶段说明，当前恢复状态以本文和新验证记录为准。
 
-恢复范围必须区分：
+## 6. 验证与恢复边界
 
-- 活跃构建中恢复的是远端已提交的 N3-11 `37e0cff`，保留最新 master 的 runtime、flow-session、NAT 更新和 Fabric 修复；它不是已丢失的10月19日未提交工作树。
-- 27项历史清单中有15项文件逐字节匹配10月17日哈希，包括完整 N3-12 冻结契约、DTO实现、staging入口/测试入口和场景。另保留40个完整中间代码候选，均未证明等于最后版本。
-- 仍缺12项清单文件，外加完整 backend/CLI/freeze 的最终来源证明、部分测试、10月19日 N3-11 lease 与 N3-12 TTL/expiry 修复；27项清单本身也不是全部源码清单。不能宣称所有代码已恢复。
-- 尚未集成的源码以 `.txt` 形式存于[恢复归档](recovery/2026-10-20/README.md)，每份都有原路径、大小、SHA-256与来源标识；不参与编译、测试或场景发现。归档不是可安装的 N3-12，实现与冻结测试必须恢复完整并重新审查后才能装配。
+本批恢复与集成的来源哈希见[2026-10-21清单](recovery/2026-10-21/source-integration-manifest.json)，验证状态见[恢复记录](recovery/2026-10-21/README.md)。保留最新 master 的 runtime、flow-session、NAT 更新及前批 N3-11/Fabric 修复；既有文件使用 `37e0cff` 为共同祖先三方合并，新文件逐字节恢复。
 
-## 6. 里程碑与下一步优先级
+前轮解析器漏读原生对象形式的 `diff.text`，曾将实际可恢复的补丁误判为缺失。本批修正读取后补齐 backend、CLI、daemon、最终冻结测试、21个 requester fixture、N3-11 lease 及 N3-12 TTL/expiry 原始代码。旧[10月20日归档](recovery/2026-10-20/README.md)保留原字节作为历史证据，不再作为当前缺口清单；RED 骨架与中间候选未当作生产实现。
 
-| 里程碑 | 当前定位 | 下一完成条件 |
+仍未取得原10月19日完整1317路径的 SHA 映射；只能核对组件原始哈希、完整补丁链及本次集成差异，不能据此宣称整个原工作树逐字节恢复。当前构建需要对 staging 的测试辅助锁加 `cfg(test)`，另对原测试中的一次路径比较去掉临时分配，以满足 Rust 1.98 Clippy；两项机械差异均单独记录，不改变断言、期望或场景。完整 Full、Windows→Linux E5按原决定暂停；本批不声明完整N3验收或 Final PASS。
+
+## 7. 里程碑与后续任务
+
+| 里程碑 | 当前定位 | 后续条件 |
 |---|---|---|
-| N3-1..4 | 模型、固定输入、运行、日志与产物持久基础存在 | 保持 authority、唯一 owner、完整性及不重执行不变量 |
-| N3-5..10 | 本机协议、查询/取消、容量/Session 基础、Linux 下载、grant 运维存在 | 不把有限 E4 扩大为完整 Submit 或远端计算验收 |
-| N3-11 + Fabric 修复恢复 | 代码已恢复到当前交付线；有上述独立 revision 的历史验证 | 适用门禁已通过；独立审查与最终提交后的 Fast/推送状态以交付记录为准 |
-| N3-12 | 15项精确历史文件及40个中间候选已归档，未完整集成 | 恢复完整来源、原冻结契约/摘要、核心 staging/上传/恢复文件与证据；先核实边界再集成 |
-| N3-13 | 未验收 | 保密双向认证通道中绑定真实 peer/grant/输入/容量及唯一 SessionManager；装配 Submit 与真实执行；闭合完整 N3 E4 verifier |
-| N3-14 | 未验收；Windows E5 暂停 | 真实 Windows requester→Linux provider 双机，记录平台/Engine digest、固定输入、日志/退出码、产物摘要和恢复观察 |
+| N3-1..10 | 模型、持久运行、日志/产物、本机查询取消、容量/Session、Linux下载和grant运维存在 | 保持 authority、唯一 owner、完整性与不重执行不变量 |
+| N3-11 | 提供方初始化/check/managed startup 已恢复；本批补回 scoped lease 修复 | 有限本机验收不能替代 Engine/跨机执行资格 |
+| N3-12 | 固定 Commit bundle、预算、认证本机分片上传、恢复/取消及原测试已恢复并集成 | 当前门禁、独立 review 与推送结果见恢复记录；保留原始完整工作树映射限制 |
+| N3-13 | 未验收 | 保密双向认证 peer context，绑定真实 grant/输入/容量与唯一 SessionManager，再装配 Submit、执行和完整 verifier |
+| N3-14 | 未验收；Windows E5 暂停 | 平台适配与真实 Windows requester→Linux provider 验收，记录环境、输入、日志/退出码、产物与恢复观察 |
 
-优先级：
-
-1. 保留本轮 N3-11/Fabric 已恢复代码、来源清单和验证；正常审查/提交后推送新 feat 分支。不得以当前有限门禁替代完整 N3 验收。
-2. N3-12 先完成来源与完整性取证。原方案涉及固定 Commit Snapshot staging、独立接受前预算、durable receipt、分片上传/断点恢复、manifest/blob 校验与 GC roots；这些目前是待核实范围，不列为已交付能力。
-3. 在 N3-12 可信基础上推进 N3-13 的实际安全提交与执行装配，保留 Submit 旧拒绝直到新契约与真实产品路径具备证据；不借 principal 字符串、明文 N2 或放宽 LocalAPI 地址绕过身份安全。
-4. 恢复 Full 与 N3-14 两机 E5 前，核实受支持 Engine/镜像/隔离能力和真实 Windows 测试条件；现阶段保留暂停与未验收状态。
-
-路线图依据：[N3-11..14 执行计划](N3-11-14-EXECUTION-PLAN.md)。其中“当前进度”是2026-10-11的历史快照；本文仅增补恢复交付视角，不回写旧快照，也不把恢复中的文件数量或设计描述当作完整功能验收。
+下一步先完成本批恢复验证、独立审查和远端交付，然后按[N3-11..14执行计划](N3-11-14-EXECUTION-PLAN.md)推进 N3-13。路线图中的旧进度保留其历史语境；不能用有限本机 E4 代替完整 N3 E4/E5。

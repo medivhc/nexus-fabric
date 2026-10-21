@@ -152,3 +152,6 @@ pub trait ControlService: Send + Sync {
 
 /// Versioned N3 Application Service contracts; no transport or TaskOwner.
 pub mod task;
+
+/// Bounded N3 snapshot upload contracts, independent of Task submission.
+pub mod snapshot;

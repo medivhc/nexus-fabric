@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: nexusd task-provider init --config <absolute-root> --provider <id> --workspace <id> --capacity <absolute-policy-json> [--json]\n       nexusd task-provider check --config <absolute-root> [--json]";
+const USAGE: &str = "usage: nexusd task-provider init --config <absolute-root> --provider <id> --workspace <id> --capacity <absolute-policy-json> [--json]\n       nexusd task-provider check --config <absolute-root> [--json]\n       nexusd task-provider staging-init --config <absolute-root> --budget <absolute-policy-json> [--json]";
 
 enum Command {
     Init {
@@ -16,6 +16,10 @@ enum Command {
     Check {
         config: PathBuf,
     },
+    StagingInit {
+        config: PathBuf,
+        budget: PathBuf,
+    },
 }
 
 impl Command {
@@ -23,6 +27,7 @@ impl Command {
         match self {
             Self::Init { .. } => "task-provider init",
             Self::Check { .. } => "task-provider check",
+            Self::StagingInit { .. } => "task-provider staging-init",
         }
     }
 }
@@ -40,11 +45,13 @@ fn absolute_path(value: String) -> Result<PathBuf, String> {
 
 fn parse(args: &[String]) -> Result<Command, String> {
     let action = args.first().map(String::as_str);
-    if !matches!(action, Some("init" | "check")) {
-        return Err("expected init or check".into());
+    if !matches!(action, Some("init" | "check" | "staging-init")) {
+        return Err("expected init, check or staging-init".into());
     }
     let init = action == Some("init");
-    let (mut config, mut provider, mut workspace, mut capacity) = (None, None, None, None);
+    let staging_init = action == Some("staging-init");
+    let (mut config, mut provider, mut workspace, mut capacity, mut budget) =
+        (None, None, None, None, None);
     let mut json_seen = false;
     let mut at = 1;
     while at < args.len() {
@@ -66,6 +73,7 @@ fn parse(args: &[String]) -> Result<Command, String> {
             "--provider" if init => &mut provider,
             "--workspace" if init => &mut workspace,
             "--capacity" if init => &mut capacity,
+            "--budget" if staging_init => &mut budget,
             _ => return Err(format!("unknown or inapplicable option: {flag}")),
         };
         if slot.is_some() {
@@ -88,6 +96,12 @@ fn parse(args: &[String]) -> Result<Command, String> {
         at += 1;
     }
     let config = absolute_path(config.ok_or("missing --config")?)?;
+    if staging_init {
+        return Ok(Command::StagingInit {
+            config,
+            budget: absolute_path(budget.ok_or("missing --budget")?)?,
+        });
+    }
     if !init {
         return Ok(Command::Check { config });
     }
@@ -124,38 +138,53 @@ fn execute(command: &Command) -> Value {
             provider,
             workspace,
             capacity,
-        } => nexusd::task_provider_init::init(config, provider, workspace, capacity),
-        Command::Check { config } => nexusd::task_provider_init::check(config),
-    };
-    match result {
-        Ok(status) => {
-            let mut value = json!({
+        } => {
+            nexusd::task_provider_init::init(config, provider, workspace, capacity).map(|status| {
+                json!({
+                    "schema_version":1, "verdict":"PASS", "command":command.name(),
+                    "scope":{"provider":status.provider, "workspace":status.workspace},
+                    "principal":status.principal,
+                    "changed":status.changed,
+                })
+            })
+        }
+        Command::Check { config } => nexusd::task_provider_init::check(config).map(|status| {
+            json!({
                 "schema_version":1, "verdict":"PASS", "command":command.name(),
                 "scope":{"provider":status.provider, "workspace":status.workspace},
-                "principal":status.principal,
-            });
-            match command {
-                Command::Init { .. } => value["changed"] = json!(status.changed),
-                Command::Check { .. } => {
-                    value["initialized"] = json!(true);
-                    value["policy_digest"] = json!(status.policy_digest);
-                }
-            }
-            value
+                "principal":status.principal, "initialized":true,
+                "policy_digest":status.policy_digest,
+            })
+        }),
+        Command::StagingInit { config, budget } => {
+            nexusd::snapshot_staging::initialize(config, budget).map(|status| {
+                json!({
+                    "schema_version":1, "verdict":"PASS", "command":command.name(),
+                    "scope":{"provider":status.provider, "workspace":status.workspace},
+                    "principal":status.principal, "policy_digest":status.policy_digest,
+                    "changed":status.changed,
+                })
+            })
         }
-        Err(failure) => json!({
+    };
+    result.unwrap_or_else(|failure| {
+        json!({
             "schema_version":1, "verdict":"FAIL", "command":command.name(),
             "error":{"code":failure.error.code.as_str(), "reason":failure.error.reason,
                 "retryable":failure.error.retryable},
             "phase":failure.phase,
             "mutation_may_have_applied":failure.mutation_may_have_applied,
-        }),
-    }
+        })
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
 fn execute(command: &Command) -> Value {
     // The unsupported branch deliberately does not inspect any supplied path.
+    let reason = match command {
+        Command::StagingInit { .. } => "task-provider staging-init requires Linux",
+        _ => "task-provider init/check requires Linux",
+    };
     match command {
         Command::Init {
             config,
@@ -168,10 +197,13 @@ fn execute(command: &Command) -> Value {
         Command::Check { config } => {
             let _ = config;
         }
+        Command::StagingInit { config, budget } => {
+            let _ = (config, budget);
+        }
     }
     json!({
         "schema_version":1, "verdict":"FAIL", "command":command.name(),
-        "error":{"code":"UNSUPPORTED_CAPABILITY", "reason":"task-provider init/check requires Linux",
+        "error":{"code":"UNSUPPORTED_CAPABILITY", "reason":reason,
             "retryable":false},
         "phase":"platform", "mutation_may_have_applied":false,
     })

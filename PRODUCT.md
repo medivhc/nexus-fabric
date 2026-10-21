@@ -3254,3 +3254,7 @@ Linux artifact get 接通真实分页服务与已有持久断点接收器：先�
 契约草案，待实际 Red Evidence 与冻结后实现。新增 Linux 本机 `nexusd task-provider init --config <absolute-private-root> --provider <id> --workspace <id> --capacity <absolute-policy-json>` 及 `task-provider check --config <root>`。fresh init从显式既存私有空根（仅允许运维者明确no-TUN的daemon.toml）建立固定真实N2身份、原容量authority与两字段task-api.toml；不创建授权、广告、Task、Session、Engine或token。初始化journal绑定scope、policy及原身份/根inode，完整检查点可恢复；丢失或损坏authority明确拒绝，绝不换身份或重建空池。启动前后相同init保持原记录并changed=false，check零写入核实完成binding；initialized不代表活Ready。
 
 完整核实的managed provider可以独立作为正常config-folder daemon的subsystem，无需假proxy/network/workspace配置；旧普通空根拒绝不变。managed初始化在身份ensure与reconciliation之前检查，pending/损坏root不READY，正常daemon继续由原owner恢复容量。详见docs/N3-11-PROVIDER-INIT-CONTRACT.md；有限E4不接通Submit/输入上传，不替代完整N3 E4/E5。
+
+### 17.9 N3-12 固定快照与有界本机暂存 {#179-n3-12}
+
+Linux 请求方从已有正规 Workspace 的指定 Commit 离线只读冻结可搬运 SHA-256 bundle；经本机认证 LocalAPI 分片上传、查询与取消。提供方先显式 staging-init，采用独立预算、owner/key 幂等索引与单一 checksummed ledger；只确认 durable prefix，冷恢复原输入及预算，未知/损坏状态失败关闭。当前 Use grant 每次检查，Staged 不等于 Accepted/Ready/执行完成。正常 daemon 在启动写入/token/READY 前恢复暂存；旧六类 Task wire 与执行容量不变。详见 docs/N3-12-SNAPSHOT-STAGING-CONTRACT.md；新 product.n3-12-snapshot-staging 是本机有限 E4，远端保密双向认证提交与 Windows E5 分别属于 N3-13/14。

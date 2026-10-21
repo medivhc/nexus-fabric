@@ -1,6 +1,9 @@
 //! Strict N3 HTTP framing with a single total read budget; v0 dispatch is retained.
+use crate::snapshot_service::LocalSnapshotService;
 use crate::task_service::LocalTaskService;
+use nexus_control_api::snapshot::{SnapshotEnvelope, SnapshotRequest};
 use nexus_control_api::task::{CanonicalDto, TaskEnvelope, TaskRequest};
+use nexus_domain::task::codec::Value;
 use nexus_domain::task::{TaskError, TaskErrorCode};
 use std::{
     io::{Read, Write},
@@ -69,8 +72,14 @@ fn budget(stream: &dyn HttpIo, deadline: Instant) -> Result<(), Refusal> {
         .read_timeout(remaining)
         .map_err(|_| invalid("cannot bound request read"))
 }
-fn read_head(stream: &mut dyn HttpIo, deadline: Instant) -> Result<LegacyHead, Refusal> {
+fn read_head(
+    stream: &mut dyn HttpIo,
+    deadline: Instant,
+    route: &mut Route,
+    snapshots_enabled: bool,
+) -> Result<LegacyHead, Refusal> {
     let mut bytes = Vec::new();
+    let mut request_line_seen = false;
     while !bytes.ends_with(b"\r\n\r\n") {
         if bytes.len() == MAX_HEADER {
             return Err(capacity("request headers exceed 16 KiB"));
@@ -81,6 +90,17 @@ fn read_head(stream: &mut dyn HttpIo, deadline: Instant) -> Result<LegacyHead, R
             .read_exact(&mut byte)
             .map_err(|_| invalid("truncated headers or request deadline"))?;
         bytes.push(byte[0]);
+        if !request_line_seen && bytes.ends_with(b"\r\n") {
+            request_line_seen = true;
+            if snapshots_enabled
+                && std::str::from_utf8(&bytes)
+                    .ok()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    == Some("/localapi/v1/snapshot")
+            {
+                *route = Route::Snapshot;
+            }
+        }
     }
     let text = std::str::from_utf8(&bytes).map_err(|_| invalid("headers must be UTF-8"))?;
     let mut lines = text.split("\r\n");
@@ -118,20 +138,44 @@ fn body(stream: &mut dyn HttpIo, deadline: Instant, size: usize) -> Result<Vec<u
     }
     Ok(bytes)
 }
-fn envelope(stream: &mut dyn HttpIo, status: u16, value: TaskEnvelope) -> Result<(), String> {
-    let bytes = value.to_value().canonical_bytes();
+#[derive(Clone, Copy)]
+enum Route {
+    Task,
+    Snapshot,
+}
+impl Route {
+    fn error(self, error: TaskError) -> Value {
+        match self {
+            Self::Task => TaskEnvelope::Error {
+                error,
+                task_id: None,
+            }
+            .to_value(),
+            Self::Snapshot => SnapshotEnvelope::Error {
+                error,
+                upload_id: None,
+            }
+            .to_value(),
+        }
+    }
+}
+fn envelope(
+    stream: &mut dyn HttpIo,
+    status: u16,
+    value: Value,
+    route: Route,
+) -> Result<(), String> {
+    let bytes = value.canonical_bytes();
     if bytes.len() > MAX_RESPONSE {
         return envelope(
             stream,
             413,
-            TaskEnvelope::Error {
-                error: TaskError::new(
-                    TaskErrorCode::CapacityUnavailable,
-                    "response exceeds 2 MiB",
-                    false,
-                ),
-                task_id: None,
-            },
+            route.error(TaskError::new(
+                TaskErrorCode::CapacityUnavailable,
+                "response exceeds 2 MiB",
+                false,
+            )),
+            route,
         );
     }
     let reason = match status {
@@ -177,18 +221,49 @@ pub fn dispatch(
     service: &LocalTaskService,
     token_authority: &TokenAuthority,
 ) -> Result<Option<LegacyHead>, String> {
+    dispatch_inner(
+        stream,
+        expected_token,
+        local_transport,
+        service,
+        None,
+        token_authority,
+    )
+}
+
+/// Snapshot-aware daemon entry; the original Task-only dispatch remains available.
+pub fn dispatch_with_snapshots(
+    stream: &mut dyn HttpIo,
+    expected_token: &str,
+    local_transport: bool,
+    service: &LocalTaskService,
+    snapshots: &LocalSnapshotService,
+    token_authority: &TokenAuthority,
+) -> Result<Option<LegacyHead>, String> {
+    dispatch_inner(
+        stream,
+        expected_token,
+        local_transport,
+        service,
+        Some(snapshots),
+        token_authority,
+    )
+}
+
+fn dispatch_inner(
+    stream: &mut dyn HttpIo,
+    expected_token: &str,
+    local_transport: bool,
+    service: &LocalTaskService,
+    snapshots: Option<&LocalSnapshotService>,
+    token_authority: &TokenAuthority,
+) -> Result<Option<LegacyHead>, String> {
     let deadline = Instant::now() + READ_BUDGET;
-    let head = match read_head(stream, deadline) {
+    let mut route = Route::Task;
+    let head = match read_head(stream, deadline, &mut route, snapshots.is_some()) {
         Ok(head) => head,
         Err(refusal) => {
-            envelope(
-                stream,
-                refusal.status,
-                TaskEnvelope::Error {
-                    error: refusal.error,
-                    task_id: None,
-                },
-            )?;
+            envelope(stream, refusal.status, route.error(refusal.error), route)?;
             return Ok(None);
         }
     };
@@ -197,8 +272,16 @@ pub fn dispatch(
     if !target.starts_with("/localapi/v1/") {
         return Ok(Some(head));
     }
+    let route = if target == "/localapi/v1/snapshot" && snapshots.is_some() {
+        Route::Snapshot
+    } else {
+        Route::Task
+    };
     let result = (|| {
-        if parts.len() != 3 || parts[2] != "HTTP/1.1" || target != "/localapi/v1/task" {
+        if parts.len() != 3
+            || parts[2] != "HTTP/1.1"
+            || !(target == "/localapi/v1/task" || matches!(route, Route::Snapshot))
+        {
             return Err(invalid(
                 "N3 requires exact HTTP/1.1 route without query or aliases",
             ));
@@ -270,23 +353,28 @@ pub fn dispatch(
             return Err(capacity("body exceeds 1 MiB"));
         }
         let bytes = body(stream, deadline, size)?;
+        if let Route::Snapshot = route {
+            let value = nexus::n3_acceptance::parse_canonical_json(&bytes)
+                .map_err(|error| Refusal { status: 400, error })?;
+            if value.canonical_bytes() != bytes {
+                return Err(invalid("snapshot body must use exact canonical JSON bytes"));
+            }
+            let request = SnapshotRequest::from_value(value)
+                .map_err(|error| Refusal { status: 400, error })?;
+            return snapshots
+                .map(|snapshots| snapshots.execute(request).to_value())
+                .ok_or_else(|| invalid("snapshot service is unavailable"));
+        }
         let request =
             nexus::n3_acceptance::decode_dto::<TaskRequest>(&bytes).map_err(|e| Refusal {
                 status: 400,
                 error: TaskError::invalid(format!("request DTO rejected: {}", e.reason)),
             })?;
-        Ok(service.execute(request))
+        Ok(service.execute(request).to_value())
     })();
     match result {
-        Ok(value) => envelope(stream, 200, value)?,
-        Err(refusal) => envelope(
-            stream,
-            refusal.status,
-            TaskEnvelope::Error {
-                error: refusal.error,
-                task_id: None,
-            },
-        )?,
+        Ok(value) => envelope(stream, 200, value, route)?,
+        Err(refusal) => envelope(stream, refusal.status, route.error(refusal.error), route)?,
     }
     Ok(None)
 }
@@ -312,7 +400,8 @@ impl TokenAuthority {
             path,
         }
     }
-    fn valid(&self) -> bool {
+    /// Startup must verify authority before announcing listener readiness.
+    pub fn valid(&self) -> bool {
         #[cfg(unix)]
         {
             self.identity.is_some()
