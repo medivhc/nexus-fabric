@@ -336,6 +336,78 @@
     "summary": "Skill 挖掘五步法（Lauren Tan/pstack 播客提炼）：记痛点→翻记录找重复→分类（传话筒/反复纠正/重讲背景）→拆分确定性→buffer 再固化；自下而上、自己的刀"
   },
   {
+    "id": "datachannel-label-routing-001",
+    "file": "entries/2026-10-11-datachannel-label-routing-version-skew.md",
+    "date": "2026-10-11",
+    "module": "nexus-web-gateway",
+    "category": "implementation-pitfall",
+    "summary": "新增第二条 DataChannel 会打死旧功能：旧节点忽略 ChannelOpen 的 label，按\"后开者赢\"路由 ⇒ 多通道必须配 capability 协商，且混版本要先测"
+  },
+  {
+    "id": "js-binary-dual-fixture-001",
+    "file": "entries/2026-10-11-dataview-setuint64-dual-side-fixture.md",
+    "date": "2026-10-11",
+    "module": "nexus-web-gateway",
+    "category": "implementation-pitfall",
+    "summary": "DataView.setUint64/getUint64 不是标准 API（JS 侧静默 undefined）；跨语言二进制协议要双侧共享同一 golden fixture，并把 node 测试真跑进 CI"
+  },
+  {
+    "id": "harness-dirty-digest-blind-001",
+    "file": "entries/2026-10-11-harness-dirty-working-tree-digest-blind.md",
+    "date": "2026-10-11",
+    "module": "engineering/nexus-harness",
+    "category": "implementation-pitfall",
+    "summary": "dirty 态 working_tree_digest 曾是 git status --porcelain 文本的 hash，对文件内容盲；evidence id 可被异内容树同 id 覆写（已由 fix/nexus-harness-evidence-binding 修复，待合入）"
+  },
+  {
+    "id": "ice-candidate-bind-set-001",
+    "file": "entries/2026-10-11-ice-host-candidate-bind-set-equality.md",
+    "date": "2026-10-11",
+    "module": "nexus-web-gateway",
+    "category": "implementation-pitfall",
+    "summary": "ICE host candidate 集合必须 ⊆ 绑定的 UDP socket 实际能收包的地址：绑具体 IP 就只通告那个 IP，未指定才绑通配并通告全部可路由网卡"
+  },
+  {
+    "id": "libssh2-sftp-pitfalls-001",
+    "file": "entries/2026-10-11-libssh2-sftp-readdir-lstat-cfg-gates.md",
+    "date": "2026-10-11",
+    "module": "nexus-web-gateway",
+    "category": "implementation-pitfall",
+    "summary": "ssh2/libssh2 三个坑：readdir 回显被查询目录前缀、sftp.stat 跟随符号链接（越界与递归删除外逃的根因）、userauth_pubkey_memory 被 cfg 门控使 Windows 编不出来"
+  },
+  {
+    "id": "panic-abort-external-arith-001",
+    "file": "entries/2026-10-11-panic-abort-external-arithmetic-overflow.md",
+    "date": "2026-10-11",
+    "module": "nexus-web-gateway",
+    "category": "implementation-pitfall",
+    "summary": "外部可控的 offset+len 算术溢出 × release panic=\"abort\" = 一条畸形帧 SIGABRT 整个节点；catch_unwind 在该 profile 下不存在，只能 panic-free-by-construction + fuzz"
+  },
+  {
+    "id": "pre-push-stale-tombstone-after-every-verify",
+    "file": "entries/2026-10-11-pre-push-stale-tombstone-after-every-verify.md",
+    "date": "2026-10-11",
+    "module": ".githooks / engineering/nexus-harness",
+    "category": "environment-pitfall",
+    "summary": "mark_stale_others 使同一 agent 第二次 verify 必留 STALE 墓碑，而 pre-push 第 2 条\"有 STALE 即拒推\"；rebase/force-push 又让钩子的 remote_sha..HEAD range 判定失效"
+  },
+  {
+    "id": "resource-quota-audit-gate-001",
+    "file": "entries/2026-10-11-resource-quota-audit-before-independent-review.md",
+    "date": "2026-10-11",
+    "module": "engineering / nexus-web-gateway",
+    "category": "implementation-pattern",
+    "summary": "全部门禁绿 + 74 个测试通过仍漏掉\"单会话打挂节点\"：高风险网络/文件变更在独立评审之前必须先做 fd/RSS/消息大小/认证速率的资源核算"
+  },
+  {
+    "id": "send-queue-hol-block-001",
+    "file": "entries/2026-10-11-single-loop-send-queue-head-blocking.md",
+    "date": "2026-10-11",
+    "module": "nexus-web-gateway",
+    "category": "implementation-pitfall",
+    "summary": "单事件循环 + 无上限发送队列：一条超过通道可用缓冲的消息会永久头阻塞其后所有消息（含终端流），Ok(false) 分支 break 即死锁"
+  },
+  {
     "id": "n3-neg-ctrl",
     "file": "entries/2026-10-16-n3-negative-controls.md",
     "date": "2026-10-16",
