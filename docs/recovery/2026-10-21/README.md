@@ -1,5 +1,7 @@
 # 2026-10-21 N3 恢复集成记录
 
+追加检查发现并恢复了原 aggregate R2 的一行并发测试调度修改，完整文件 SHA 与原独立评审记录一致；另补强一条知识记录的原始 SHA 来源。详见[历史来源追加检查](followup-search.md)。以下内容保留原恢复批次的验证截点与来源分类。
+
 代码提交 `dbb511a` 将 N3-12 原始生产代码、最终冻结测试、21个 requester fixture 与10月19日 lease/TTL修复恢复到活跃源码。[功能总结](../../N3-RECOVERY-FUNCTION-SUMMARY.md)说明实际入口与阶段边界；[来源及集成清单](source-integration-manifest.json)记录原始与集成后SHA，旧归档不覆盖。
 
 恢复方法是读取完整原生补丁和原始输出，核对已记录组件SHA及原冻结测试SHA；没有执行历史脚本。既有文件从37e0cff三方合并，保留master后续更新。当前构建适配包括测试辅助Mutex/lock的cfg(test)，以及原recovery测试中PathBuf::from与Path::new的等价比较替换；保留原SHA，不修改断言/期望或场景。后者完整SHA还匹配原10月19日expiry R2 summary的existing_five_test_files，补强最终来源绑定。

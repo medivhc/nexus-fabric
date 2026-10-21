@@ -896,10 +896,10 @@ fn ordered_real_competitors(
         let (arrived_a, resume_a) = arm(first);
         let (arrived_b, resume_b) = arm(second);
         let a = scope.spawn(|| after_contention(first, &c, first_request));
-        let b = scope.spawn(|| after_contention(second, &c, second_request));
         arrived_a
             .recv_timeout(Duration::from_secs(5))
             .expect("first real execute reached immediately before its staging lease");
+        let b = scope.spawn(|| after_contention(second, &c, second_request));
         arrived_b
             .recv_timeout(Duration::from_secs(5))
             .expect("second real execute reached immediately before its staging lease");

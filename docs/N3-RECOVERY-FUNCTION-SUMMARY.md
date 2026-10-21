@@ -9,6 +9,8 @@ status: current
 
 # N3 功能与代码恢复总结
 
+后续[历史来源追加检查](recovery/2026-10-21/followup-search.md)找回并恢复原 aggregate R2 的一行并发测试调度修改，匹配原最终文件 SHA；另补强一条知识记录的来源。以下验证记录保留其原提交截点，完整历史文件映射仍未恢复。
+
 核实日期：2026-10-21（Asia/Shanghai）。本文依据正式契约、可读源码和机器记录说明能力边界，不改写历史 PROJECT-STATUS。本次集成基线为 master `5d70709`，发布分支为 `feat/n3-restored-code-20261020`；实际推送状态以远端引用为准。
 
 现有代码已具备 Task/Snapshot/Artifact 的持久基础、Linux 隔离执行适配器、本机 Task 查询与取消、Linux Artifact 断点下载、scoped Use 授权运维，以及恢复的 N3-11 提供方初始化/检查与 managed daemon 启动。它们尚未构成用户从 CLI 提交新任务、上传固定输入并经远端提供方执行的完整链路：当前生产 `Submit` 分支仍明确拒绝。N3-12 的固定输入 freeze、独立预算、本机认证分片上传、断点恢复与取消代码已恢复到活跃源码，原冻结测试与 requester fixture 已补齐；当前验证状态见第5节。N3-13 仅恢复未冻结的设计草案，尚未实现；N3-13/14 未验收，Full 与 Windows→Linux E5 暂停。
