@@ -75,9 +75,10 @@ error              失败时 {code,reason}
 ```
 
 `kind` 是 provider 声明的 LSP `SymbolKind` 对应字符串，`kind_id` 是该数值原文
-（0 = provider 未给出）。两者都给是因为 rust-analyzer 对 trait/impl 方法有时
-上报 `property`(6) 或 `variable`(12) 而非 `method`(5)：只给字符串会误导 Agent，
-而 harness 不擅自纠正 language server 的语义声明，交由调用方判断。
+（0 = provider 未给出）。`kind` 按 LSP 3.17 枚举转换，例如 `package`(4)、
+`method`(6)、`property`(7)、`variable`(13)、`struct`(23)；未声明或未知数值
+沿用 `default`。harness 保留原 `kind_id`，不擅自纠正 language server 的语义声明，
+交由调用方判断。
 
 错误码（提案 §12 冻结）：
 
