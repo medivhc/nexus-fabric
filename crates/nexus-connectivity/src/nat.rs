@@ -6,9 +6,7 @@
 //! `nat_path_decision`、`codec_self_test`及 `NatEvent` 的打洞三变体）
 //! 已退役（#1 运行时所有权归一）。
 
-
 use std::net::SocketAddr;
-
 
 /// NAT 事件（结构化日志，支持 replay）
 #[derive(Debug, Clone)]
@@ -51,7 +49,6 @@ pub enum NatType {
     Unknown,
 }
 
-
 /// STUN 映射结果
 #[derive(Debug, Clone)]
 pub struct StunMapping {
@@ -60,8 +57,6 @@ pub struct StunMapping {
     /// 公网映射地址
     pub public: SocketAddr,
 }
-
-
 
 /// NAT 错误类型
 #[derive(Debug)]
@@ -110,6 +105,5 @@ mod tests {
         let s = format!("{:?}", event);
         assert!(s.contains("NatTypeDetected"));
     }
-
 }
 // test

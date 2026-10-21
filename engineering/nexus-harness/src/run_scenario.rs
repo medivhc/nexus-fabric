@@ -320,8 +320,7 @@ fn run_nat_hole_punching() -> Outcome {
         let xor_ip = u32::from_be_bytes([1, 2, 3, 4]) ^ nexus_turn::stun::MAGIC_COOKIE;
         buf.extend_from_slice(&xor_ip.to_be_bytes());
 
-        let msg =
-            nexus_turn::stun::decode(&buf).map_err(|e| format!("decode: {e:?}"))?;
+        let msg = nexus_turn::stun::decode(&buf).map_err(|e| format!("decode: {e:?}"))?;
         if msg.msg_type != 0x0101 {
             return Err(format!("unexpected message type: 0x{:04x}", msg.msg_type));
         }

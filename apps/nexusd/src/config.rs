@@ -17,7 +17,7 @@
 //!    （Clash 风格规则引擎，管出向流量）；
 //! 3. `nexus proxy` CLI 子命令（one-shot SOCKS5/数据面组合根）——
 //!    本轮仅记录观察项，不处理（OQ4）。
-//! 另：`daemon.toml [network.turn]`（`TurnSection`）= **TURN+STUN**：
+//!    另：`daemon.toml [network.turn]`（`TurnSection`）= **TURN+STUN**：
 //!    NAT switching 用（打洞候选与中继分配），与代理无关
 //!    （常被混淆，特此并列）。
 //!
