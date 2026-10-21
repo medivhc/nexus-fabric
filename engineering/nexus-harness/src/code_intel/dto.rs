@@ -209,9 +209,43 @@ pub struct ProviderMeta {
     /// 未识别的 server→client 请求数；与写能力分开计数，
     /// 否则正常只读查询也会让 refused 恒为非 0，信号失真。
     pub server_requests_unhandled: usize,
+    /// 本次查询是否**复用**了已有 provider 会话（MODULE.md「Provider Session Reuse」）。
+    /// CLI 一次性路径恒为 false —— 那里没有可复用的对象，写 true 就是撒谎。
+    pub session_reused: bool,
+    /// 该会话到本次为止服务过几次查询（1 = 本次即首次）。
+    pub session_queries: usize,
+    /// 为什么会重建会话：`digest_changed` / `workspace_changed` / `binary_changed` /
+    /// `provider_restarted`，空串表示未重建。复用失效必须是**可见事件**，
+    /// 否则"每次都很慢"会被读成"复用没生效"，而真相可能是"每次都被判失效"。
+    pub session_invalidated_reason: String,
 }
 
 impl ProviderMeta {
+    /// 从 daemon 的线格式读回。字段名与 `to_json` 同源（一处拼错另一处就红）；缺字段取零值
+    /// 而不是"未知"：这些计数是"该会话累计到多少"，没有那个会话就没有累计。
+    pub fn from_json(v: &Value) -> ProviderMeta {
+        let text = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        let num = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0) as usize;
+        ProviderMeta {
+            kind: text("kind"),
+            binary: text("binary"),
+            version: text("version"),
+            ready: v.get("ready").and_then(Value::as_bool).unwrap_or(false),
+            restart_count: num("restart_count"),
+            restart_reason: text("restart_reason"),
+            duration_ms: v.get("duration_ms").and_then(Value::as_u64).unwrap_or(0) as u128,
+            write_requests_refused: num("write_requests_refused"),
+            dropped_notifications: num("dropped_notifications"),
+            server_requests_unhandled: num("server_requests_unhandled"),
+            session_reused: v
+                .get("session_reused")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            session_queries: num("session_queries"),
+            session_invalidated_reason: text("session_invalidated_reason"),
+        }
+    }
+
     /// 累加一次会话的三个计数。重启会换新会话，替换旧会话前必须先把它 absorb 进来，
     /// 否则"重启前拒绝过 N 次写请求"随进程消失（MODULE.md：计数失真等于把拒绝能力藏起来）。
     pub fn absorb(&mut self, refused: usize, unhandled: usize, dropped: usize) {
@@ -232,6 +266,9 @@ impl ProviderMeta {
             "write_requests_refused": self.write_requests_refused,
             "server_requests_unhandled": self.server_requests_unhandled,
             "dropped_notifications": self.dropped_notifications,
+            "session_reused": self.session_reused,
+            "session_queries": self.session_queries,
+            "session_invalidated_reason": self.session_invalidated_reason,
         })
     }
 }

@@ -1,0 +1,60 @@
+schema_version = 1
+id = "engineering.code-intelligence-context-scope-guard"
+title = "成员目录（非 cargo workspace root）上 context 明说不跑语义层，而不是静默给一份偏低的锚点集合（MODULE.md Context Semantic Anchoring 不变量 3）"
+evidence_strength = "E4"
+requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#14-security-and-resource-control"
+
+# 这条不需要 language server：目标 engineering/nexus-harness 是根 workspace 的**成员**，
+# 它的 Cargo.toml 没有 [workspace] 声明。契约规定此时不启动 provider，
+# 而是把"为什么不跑"写成可见状态 —— 因为从成员目录启动会把 47 个 crate 全灌进索引
+# （实测冷启动 30–90s 且 ready 常常不收敛），有界预算兜不住，
+# 与其给一份"少得看起来像结论"的锚点，不如明说这次没有语义证据。
+
+[given]
+repository = "initialized"
+network = "none (不启动任何 language server)"
+
+[when]
+command = "nexus-harness context engineering/nexus-harness --json"
+
+[[expect]]
+field = "command"
+equals = "context"
+
+# 模块契约本身能找到，verdict 不受语义层缺席影响。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "authority"
+equals = "advisory"
+
+[[expect]]
+field = "headings"
+non_empty = true
+
+[[expect]]
+field = "semantic_status"
+equals = "unsupported_scope"
+
+[[expect]]
+field = "semantic_reason.code"
+equals = "UNSUPPORTED"
+
+[[expect]]
+field = "semantic_reason.reason"
+non_empty = true
+
+# 一次 provider 调用都没发起；candidate_queries 必须是 0。
+[[expect]]
+field = "semantic_budget.candidate_queries"
+equals = 0
+
+[[expect]]
+field = "semantic_anchors"
+equals = []
+
+[[expect]]
+field = "snapshot.source_revision"
+non_empty = true

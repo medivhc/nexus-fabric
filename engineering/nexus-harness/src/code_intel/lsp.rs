@@ -117,54 +117,92 @@ pub fn encode_frame(message: &Value) -> Vec<u8> {
 }
 
 /// 读一帧。header 大小与 body 长度都有硬上限。
-pub fn read_frame<R: BufRead>(reader: &mut R) -> Result<Value, Failure> {
+/// 一次入站读取的结果。"对端在帧边界上正常挂断"**不是一种失败**，所以它不能挤在 `Failure` 里
+/// 冒充 `PROVIDER_CRASHED` —— 独立 Review 的 B1 就是这个混淆：客户端关掉 stdin 之后，
+/// server 侧一切正常也会被报成 provider 崩溃。
+pub enum FrameIn {
+    Message(Value),
+    /// 停在帧边界上的 EOF（本帧一个字节都没读到）。
+    CleanEof,
+    /// 半帧断开、超限、畸形 —— 只有这些才是失败。
+    Failed(Failure),
+}
+
+/// `read_frame` 的实现体，多一个"帧边界 EOF"出口。
+pub fn read_frame_result<R: BufRead>(reader: &mut R) -> FrameIn {
     let mut content_length: Option<usize> = None;
     let mut header_bytes = 0usize;
     loop {
         let mut line = String::new();
-        let read = reader
-            .read_line(&mut line)
-            .map_err(|e| protocol_failure(format!("header read failed: {e}")))?;
+        let read = match reader.read_line(&mut line) {
+            Ok(n) => n,
+            Err(e) => {
+                return FrameIn::Failed(protocol_failure(format!("header read failed: {e}")));
+            }
+        };
         if read == 0 {
-            return Err(protocol_failure(
-                "stream closed while reading headers".to_string(),
-            ));
+            // header_bytes == 0 ⇒ 正好停在帧边界上 = 客户端正常挂断；
+            // 否则是"头读到一半对端没了"，属畸形，必须与前者分开报告。
+            return if header_bytes == 0 {
+                FrameIn::CleanEof
+            } else {
+                FrameIn::Failed(protocol_failure("stream closed mid-headers".to_string()))
+            };
         }
         header_bytes += read;
         if header_bytes > MAX_HEADER_BYTES {
-            return Err(protocol_failure("header exceeded 64KiB limit".to_string()));
+            return FrameIn::Failed(protocol_failure("header exceeded 64KiB limit".to_string()));
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break;
         }
         let Some((name, value)) = trimmed.split_once(':') else {
-            return Err(protocol_failure(format!(
+            return FrameIn::Failed(protocol_failure(format!(
                 "malformed header line: {trimmed}"
             )));
         };
         if name.trim().eq_ignore_ascii_case("content-length") {
-            content_length = Some(
-                value
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|e| protocol_failure(format!("bad Content-Length: {e}")))?,
-            );
+            let parsed = value.trim().parse::<usize>();
+            match parsed {
+                Ok(v) => content_length = Some(v),
+                Err(e) => {
+                    return FrameIn::Failed(protocol_failure(format!("bad Content-Length: {e}")));
+                }
+            }
         }
     }
-    let len = content_length
-        .ok_or_else(|| protocol_failure("missing Content-Length header".to_string()))?;
+    let Some(len) = content_length else {
+        return FrameIn::Failed(protocol_failure(
+            "missing Content-Length header".to_string(),
+        ));
+    };
     if len > MAX_BODY_BYTES {
-        return Err(protocol_failure(format!(
+        return FrameIn::Failed(protocol_failure(format!(
             "body length {len} exceeded limit"
         )));
     }
     let mut buf = vec![0u8; len];
-    reader
-        .read_exact(&mut buf)
-        .map_err(|e| protocol_failure(format!("body read failed: {e}")))?;
-    serde_json::from_slice::<Value>(&buf)
-        .map_err(|e| protocol_failure(format!("body is not valid JSON-RPC: {e}")))
+    if let Err(e) = reader.read_exact(&mut buf) {
+        return FrameIn::Failed(protocol_failure(format!("body read failed: {e}")));
+    }
+    match serde_json::from_slice::<Value>(&buf) {
+        Ok(v) => FrameIn::Message(v),
+        Err(e) => FrameIn::Failed(protocol_failure(format!("body is not valid JSON-RPC: {e}"))),
+    }
+}
+
+/// 客户端（LSP）侧的入口：**保持既有语义不变** —— 对 server 而言，管道在帧边界上关闭
+/// 就是 server 死了，必须按 `PROVIDER_CRASHED` 处理，不能当"正常退出"。
+/// 只有 MCP server 侧需要区分这两者，所以它直接用 `read_frame_result`。
+pub fn read_frame<R: BufRead>(reader: &mut R) -> Result<Value, Failure> {
+    match read_frame_result(reader) {
+        FrameIn::Message(value) => Ok(value),
+        FrameIn::Failed(failure) => Err(failure),
+        FrameIn::CleanEof => Err(protocol_failure(
+            "stream closed while reading headers".to_string(),
+        )),
+    }
 }
 
 /// stderr 有界缓冲。
@@ -557,7 +595,18 @@ impl LspSession {
     }
 
     /// 有序关闭：shutdown 请求 -> exit 通知 -> 有限等待 -> kill。
-    pub fn shutdown(mut self) {
+    pub fn shutdown(self) {
+        let _ = self.shutdown_and_report_reaped();
+    }
+
+    /// `shutdown` 的**观测版**：同一套回收逻辑，额外把"这个子进程到底有没有退出"交回调用方。
+    ///
+    /// 为什么要这个返回值：`daemon` 的 `sessions_after_stop` 之前是写死的 0，
+    /// 独立评审 round 1 判为阻塞（常量不可证伪 —— 若关闭逻辑退化成不 kill/不等待，
+    /// 探针与场景仍双双照绿）。只有操作系统给出"已退出"的证据才算 0；
+    /// 问不到（`Err`）一律算没退出，与 `dirty_after_lifecycle` 的"不把无法证明
+    /// 折算成证明没有"同一口径。
+    pub fn shutdown_and_report_reaped(mut self) -> bool {
         let _ = self.request("shutdown", Value::Null, Duration::from_secs(5));
         let _ = self.notify("exit", Value::Null);
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -583,9 +632,16 @@ impl LspSession {
             }
             break;
         }
+        // kill 之后再问一次：Windows 上被 kill 的进程句柄会很快转为已退出，
+        // Unix 上 try_wait 会顺手收掉僵尸。仍问不到就如实报"没退出"。
+        let reaped = match &mut self.child {
+            Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+            None => true,
+        };
         if let Some(handle) = self.reader.take() {
             let _ = handle.join();
         }
+        reaped
     }
 }
 

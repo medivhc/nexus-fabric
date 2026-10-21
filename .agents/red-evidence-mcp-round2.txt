@@ -1,0 +1,62 @@
+# Red Evidence —— MCP 传输通道与启动参数（独立 Review round 2 的 N1/N4/N5 落地前实测）
+
+宿主：Windows（冒烟宿主），rustc 1.95.0，rev `a3af128`（HEAD，工作树 clean）。
+可执行文件：`./target/debug/nexus-harness.exe`。
+这一组实测在**修任何代码之前**取，逐条给出字节与退出码；修后同命令复跑记在
+`.agents/green-evidence-code-intelligence.txt` §P。
+审查者的独立测量见 `.evidence/review-qoder-independent-p234-r2/review.md`（同形态，不同会话）。
+
+## R1 `mcp serve` 的退出 envelope 落在协议通道上（N5）
+
+    printf '' | nexus-harness mcp serve --json
+    exit=0  stdout_bytes=194  stderr_bytes=0
+    stdout: {"authority":"advisory","command":"mcp","handled_requests":0,
+             "message":"MCP stdin 立即 EOF：未收到任何请求，本结果不代表适配层可用",
+             "schema_version":1,"verdict":"UNKNOWN"}
+
+stdout 对 MCP 而言**就是协议通道**，这里却出现了一段无 `Content-Length` 帧的裸 JSON。
+`main.rs:41-53` 对所有命令一律 `println!` 是根因。
+
+## R2 同一泄漏使 PASS 分支不可探针（N4b：round 1 那条死分支现在活着，但没人能自动证明）
+
+    一帧 initialize + 关管道 | nexus-harness mcp serve --json
+    exit=0  stdout_bytes=390
+    前 60 字节: "Content-Length: 150\r\nContent-Type: application/vscode-jsonrp"
+    末 120 字节: "\"handled_requests\":1,\"message\":\"MCP stdin 已关闭，处理 1 条请求后退出\",
+                 \"schema_version\":1,\"verdict\":\"PASS\"}\n"
+    stdout 里 Content-Length 出现次数 = 1（一帧响应 + 尾部裸 JSON，两者之间没有分隔）
+    取"最后一个以 { 开头的行"再 JSON.parse ⇒ 失败：
+        Unexpected non-whitespace character after JSON at position 150
+
+`serve_exit_shape`（`mcp.rs:975-1010`）正是靠"最后一行以 { 开头"来取 verdict 的，
+所以它能覆盖 `handled == 0`（UNKNOWN）与畸形帧（FAIL）两种形态，
+**唯独覆盖不到 `handled > 0 ⇒ PASS`** —— 也就是 round 1 B1 里那条原本不可达、
+现在可达的分支。人工 `printf` 能看见（审查者与我各测一次），自动探针看不见。
+
+## R3 `--provider-binary` 在 `mcp serve` 上被静默丢弃（N1）
+
+    printf '' | nexus-harness mcp serve --provider-binary /definitely/not/ra --json   exit=0
+    printf '' | nexus-harness mcp serve --json                                        exit=0
+    diff 两个输出 ⇒ 完全相同
+
+`MODULE.md:212-213` 声明"provider 二进制只能在 `mcp serve` 启动时由 `--provider-binary` 指定"，
+而 `dispatch`（`mcp.rs:948-952`）的 `serve` 分支把 `args` **整个丢掉**，`serve()` 无参数。
+于是被契约承诺的 Public API 静默失效 —— 用户以为换了 server，其实没换。
+真正生效的入口是环境变量 `NEXUS_RUST_ANALYZER`（`provider.rs:185`），MCP 段落从未提及。
+
+## R4 未知参数同样静默（N1 的附带面）
+
+    printf '' | nexus-harness mcp serve --totally-made-up --json
+    exit=0  stdout: {"authority":"advisory",...,"verdict":"UNKNOWN"}
+
+`mcp` 的**未知子命令**会 BLOCKED（`mcp.rs:947-952`，规则来自 `code` 的"参数错误先于子进程"），
+但**已知子命令的未知 flag** 无人管 ⇒ 同一类问题在同一个命令里只堵了一半。
+
+## 为什么这几条值得修而不是记为"已知限制"
+
+- R1/R2 是**传输层正确性**：提案 §10 的 MCP 适配层唯一的对外承诺就是"能按 MCP 协议被调用"。
+  裸 JSON 混进 stdout 会让严格客户端把会话结尾读成畸形帧；而"我们自己写的探针看不见 PASS 分支"
+  意味着这条分支只靠人工 `printf` 保证，等于没有回归保护。
+- R3/R4 是**契约与实现的形状不一致**：文档承诺了一个不存在的开关，并且失败方式是"看起来成功"。
+  本项目对这类形状问题的一贯口径是宁可 BLOCKED 也不要静默（`code` 的预算参数、
+  `context` 的作用域判定都是同一逻辑）。

@@ -1,0 +1,50 @@
+schema_version = 1
+id = "engineering.code-intelligence-context-no-fake-semantics"
+title = "provider 不可用时 context 仍给出原 verdict 并显式标注语义缺失，不伪造锚点也不把失败说成没有实现（提案 §12 / MODULE.md Context Semantic Anchoring 不变量 1、4）"
+evidence_strength = "E4"
+requirement = "docs/SEMANTIC-CODE-INTELLIGENCE-PROPOSAL.md#12-failure-semantics"
+
+# 把 provider 二进制指到一个不存在的路径，使"语义层挂了"成为确定事件。
+# 这条场景钉的是最容易被做坏的一点：实现者为了不让 context 失败，
+# 把语义查询的失败悄悄吞掉、或反过来把"查不到"写成"该模块没有实现"。
+
+[given]
+repository = "initialized"
+network = "none (不启动任何 language server)"
+
+[when]
+command = "nexus-harness context engineering/nexus-harness/fixtures/code-intel --provider-binary definitely-not-a-real-language-server --json"
+
+[[expect]]
+field = "command"
+equals = "context"
+
+# 语义层挂了，context 自己的结论不受影响（目标目录确实存在）。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "authority"
+equals = "advisory"
+
+[[expect]]
+field = "semantic_status"
+equals = "unavailable"
+
+[[expect]]
+field = "semantic_reason.code"
+equals = "PROVIDER_UNAVAILABLE"
+
+[[expect]]
+field = "semantic_reason.reason"
+non_empty = true
+
+# 挂了也必须有 snapshot：Agent 要能判断这份 context 属于哪个工作树。
+[[expect]]
+field = "snapshot.source_revision"
+non_empty = true
+
+[[expect]]
+field = "module_contract"
+non_empty = true

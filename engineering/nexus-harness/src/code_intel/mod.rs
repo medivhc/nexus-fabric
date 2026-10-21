@@ -9,8 +9,11 @@
 //! 路径约定（MODULE.md 冻结）：`--workspace`、位置参数里的 path、diagnostics
 //! 目标一律**相对仓库根**解析；目标必须落在 `--workspace` 范围内（提案 §14）。
 
+mod cache;
+pub(crate) mod daemon;
 mod dto;
 mod lsp;
+pub(crate) mod mcp;
 mod provider;
 mod rust_analyzer;
 
@@ -35,6 +38,10 @@ struct Request {
     budget: Budget,
     timeouts: Timeouts,
     provider_override: Option<String>,
+    /// `--no-daemon`：完全不问 daemon（契约「`code` / `context` 支持 `--no-daemon`」）。
+    use_daemon: bool,
+    /// `--no-cache`：不读也不写结果缓存。
+    use_cache: bool,
 }
 
 /// 查询目标在**启动 provider 之前**就完成解析与存在性校验：
@@ -54,6 +61,11 @@ struct Envelope {
     budget: Option<Budget>,
     provider: Option<ProviderMeta>,
     snapshot: Option<Value>,
+    /// 经由 daemon 与否（`daemon.*`）。一旦确定就跟着 envelope 走，
+    /// 包括失败路径 —— "回落了"这件事必须在输出里看得见，而不是只在成功时有。
+    daemon: Option<Value>,
+    /// 结果缓存的本次观测（`cache.*`）。
+    cache: Option<Value>,
 }
 
 impl Envelope {
@@ -63,6 +75,8 @@ impl Envelope {
             budget: None,
             provider: None,
             snapshot: None,
+            daemon: None,
+            cache: None,
         }
     }
 
@@ -80,11 +94,28 @@ impl Envelope {
         if let Some(s) = &self.snapshot {
             out.push(("snapshot".to_string(), s.clone()));
         }
+        if let Some(d) = &self.daemon {
+            out.push(("daemon".to_string(), d.clone()));
+        }
+        if let Some(c) = &self.cache {
+            out.push(("cache".to_string(), c.clone()));
+        }
         out
     }
 }
 
+/// CLI 一次性入口：不持有任何跨调用状态，provider 在本次调用内建立并关闭。
 pub fn run(args: &[String]) -> Outcome {
+    let mut session: Option<ProviderSession> = None;
+    run_with_session(args, &mut session)
+}
+
+/// 带可复用会话的入口（`mcp serve` 用；契约见 MODULE.md「Provider Session Reuse」）。
+///
+/// `session` 由**调用方**持有：命中复用键就复用，否则重建（旧会话在替换时被 Drop 关掉）。
+/// CLI 传一个用完即丢的局部 `None`，行为与从前完全一致 —— 复用绝不能变成
+/// "默认悄悄留一个活进程"。
+pub fn run_with_session(args: &[String], session: &mut Option<ProviderSession>) -> Outcome {
     let verb_raw = args.first().map(String::as_str).unwrap_or("");
     let command = format!("code {verb_raw}");
     let mut base = Envelope::new(&command);
@@ -166,35 +197,250 @@ pub fn run(args: &[String]) -> Outcome {
         Err(e) => return fail(&envelope, &e),
     };
     let version = provider::probe_version(&binary);
-    let mut session = match RustAnalyzerProvider::start(
-        &binary,
-        &request.workspace,
-        &repo.root,
-        &version,
-        request.timeouts,
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            envelope.provider = Some(ProviderMeta {
-                kind: "rust-analyzer".to_string(),
-                binary: binary.to_string_lossy().replace('\\', "/"),
-                version,
-                ready: false,
-                restart_count: 0,
-                restart_reason: String::new(),
-                duration_ms: started.elapsed().as_millis(),
-                write_requests_refused: 0,
-                server_requests_unhandled: 0,
-                dropped_notifications: 0,
-            });
-            return fail(&envelope, &e);
-        }
+    // 复用键。四项全等才复用；**指纹一致**是"索引还描述当前工作树"的前提，
+    // 不一致就重建 —— 宁可付一次冷启动，也不拿旧树的结果冒充新鲜（MODULE.md 该节第 2 条）。
+    let want_key = SessionKey {
+        binary: binary.to_string_lossy().replace('\\', "/"),
+        workspace: request.budget.workspace_scope.clone(),
+        version: version.clone(),
+        digest: bindings_before.working_tree_digest.clone(),
     };
+    // ---- 结果缓存与 daemon 选路（MODULE.md「Provider Daemon & Result Cache」）----
+    // 顺序是契约要求的：先有 provider 版本才能算键，先算键才能看缓存，
+    // 缓存没命中才去问 daemon —— 反过来就等于回放路径也要付一次握手成本。
+    let namespace = daemon::namespace_from_env_or(&repo.root);
+    let cache_dir_path = daemon::cache_dir(&namespace);
+    // target 分量 = 本次 argv **去掉 verb（`skip(1)`）与两个策略 flag**：后两者改的是"怎么问"，
+    // 不是"问什么"。还有第三点要如实写（独立评审 round 1 的 N-9）：`--json` 也不在分量里，但
+    // **不是这里滤的** —— `main.rs` 在分发前就剥掉了它，所以到这里的 argv 根本不含它。
+    // 原则不变：宁可因为多算一项而 miss，也不能因为少算一项把两个不同查询当成同一个。
+    let target_component = args
+        .iter()
+        .skip(1)
+        .filter(|a| a.as_str() != "--no-daemon" && a.as_str() != "--no-cache")
+        .cloned()
+        .collect::<Vec<String>>()
+        .join("\u{1f}");
+    let cache_key = cache::CacheKey {
+        digest: bindings_before.working_tree_digest.clone(),
+        workspace: request.budget.workspace_scope.clone(),
+        verb: verb.name().to_string(),
+        target: target_component,
+        provider_version: version.clone(),
+        budget: format!(
+            "{}/{}/{}/{}",
+            request.budget.max_results,
+            request.budget.max_snippet_lines,
+            request.budget.max_result_bytes,
+            request.budget.workspace_scope
+        ),
+    };
+    let mut cache_view = CacheView {
+        tier: "miss",
+        key_digest: cache_key.digest.clone(),
+        entries: 0,
+        bytes: 0,
+        disabled: !request.use_cache,
+    };
+    let mut daemon_state = daemon::DaemonState::not_asked(None);
+    // `detected`（有没有可用 daemon）与 `running`（本次是否经由它）分开问：
+    // 合成一个字段的话，`--no-daemon` 下两种读法都自洽，场景就变成碰运气。
+    if let Some(lease) = daemon::read_lease(&namespace) {
+        let (alive, pong, reason) = daemon::probe(&lease);
+        daemon_state.detected = alive;
+        // 与 `stop`/`route` 同一判据：被拒才算残留，没答上只是繁忙（负载宿主上超时不是"死了"）。
+        daemon_state.stale_lease = !alive && reason.contains("CONNECTION_REFUSED");
+        if !alive {
+            daemon_state.unavailable = Some(reason);
+        }
+        if let Some(p) = pong.as_ref() {
+            daemon_state.provider_sessions =
+                p.get("sessions").and_then(Value::as_u64).unwrap_or(0) as usize;
+            daemon_state.capacity = p.get("capacity").and_then(Value::as_u64).unwrap_or(1) as usize;
+            daemon_state.idle_secs = p.get("idle_secs").and_then(Value::as_u64).unwrap_or(0);
+        }
+        daemon_state.lease = Some(lease);
+    }
+    cache_view.refresh(&cache_dir_path);
+    attach(&mut envelope, &daemon_state, &cache_view);
 
-    let execution = execute(&request, &mut session, &repo.root);
-    let mut meta = session.finish_meta();
+    // ① 命中路径：不握手、不起 provider、不连 daemon。逐字回放结果本体，
+    //    运行元数据按本次重新生成（契约「缓存命中时返回什么」①②）。
+    if !cache_view.disabled {
+        if let Some(hit) = cache::lookup(&cache_dir_path, &cache_key) {
+            cache_view.tier = "disk";
+            cache_view.refresh(&cache_dir_path);
+            daemon_state.session_source = "cache";
+            // 命中不放宽指纹检查：这里取的是"查询后"那一次。
+            if let Some(f) = stale_after(&repo, &bindings_before) {
+                attach(&mut envelope, &daemon_state, &cache_view);
+                return fail(&envelope, &f);
+            }
+            let meta = ProviderMeta {
+                kind: text_field(&hit.provider, "kind"),
+                binary: text_field(&hit.provider, "binary"),
+                version: text_field(&hit.provider, "version"),
+                ready: hit
+                    .provider
+                    .get("ready")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                duration_ms: started.elapsed().as_millis(),
+                ..Default::default()
+            };
+            let mut budget = request.budget.clone();
+            budget.truncated = hit
+                .budget
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            envelope.provider = Some(meta);
+            envelope.budget = Some(budget);
+            attach(&mut envelope, &daemon_state, &cache_view);
+            let mut fields = envelope.fields();
+            fields.push(("results".to_string(), json!(hit.results)));
+            fields.push(("count".to_string(), json!(hit.count)));
+            if let Some(c) = &hit.continuation {
+                fields.push(("continuation".to_string(), c.clone()));
+            }
+            return (
+                "PASS".to_string(),
+                format!(
+                    "{}：命中 {} 条（结果缓存回放，未起 provider）",
+                    verb.name(),
+                    hit.count
+                ),
+                fields,
+            );
+        }
+    }
+
+    // ② daemon 路径。两种失败要分清楚：
+    //    - 通道坏了（连不上/握手失败）⇒ 回落进程内，并把回落原因写进输出；
+    //    - daemon 正常回答了一个业务错误 ⇒ 照实采用。重跑一遍等于把"daemon 说没有这个符号"
+    //      改成"我自己再问一次说有"，那才是真正的答案漂移。
+    if request.use_daemon {
+        match daemon::route(&repo.root, true) {
+            daemon::Route::Connected(mut client, lease) => {
+                match client.query(&repo.root, args, &want_key.digest) {
+                    Ok(reply) => {
+                        let ok = reply.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                        let mut meta = reply
+                            .get("provider")
+                            .map(ProviderMeta::from_json)
+                            .unwrap_or_default();
+                        meta.duration_ms = started.elapsed().as_millis();
+                        envelope.provider = Some(meta);
+                        daemon_state.running = ok;
+                        daemon_state.session_source = if ok { "daemon" } else { "in-process" };
+                        daemon_state.lease = Some(lease);
+                        attach(&mut envelope, &daemon_state, &cache_view);
+                        if !ok {
+                            let f = wire_failure(&reply);
+                            return fail(&envelope, &f);
+                        }
+                        let items: Vec<Value> = reply
+                            .get("results")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        return deliver(
+                            envelope,
+                            &daemon_state,
+                            &mut cache_view,
+                            &request,
+                            verb,
+                            items,
+                            &repo,
+                            &bindings_before,
+                            &cache_dir_path,
+                            &cache_key,
+                        );
+                    }
+                    Err(e) => {
+                        daemon_state.running = false;
+                        daemon_state.detected = false;
+                        daemon_state.stale_lease = true;
+                        daemon_state.unavailable = Some(e);
+                        attach(&mut envelope, &daemon_state, &cache_view);
+                    }
+                }
+            }
+            daemon::Route::Unavailable { state, reason } => {
+                daemon_state.stale_lease = state.stale_lease;
+                daemon_state.unavailable = Some(reason);
+                attach(&mut envelope, &daemon_state, &cache_view);
+            }
+            daemon::Route::NotAsked => {}
+        }
+    }
+
+    let mut reused = false;
+    let mut session_queries = 1usize;
+    let mut invalidated: &'static str = "";
+    match session.as_mut() {
+        // 命中复用键：本次不新建 provider，计数累加到整个会话。
+        Some(state) if state.key == want_key => {
+            state.queries += 1;
+            session_queries = state.queries;
+            reused = true;
+        }
+        // 键不同 ⇒ 重建。旧会话在赋值时被 Drop 关闭（不手动 close，避免双重回收）。
+        Some(state) => {
+            invalidated = session_invalidated_reason(&state.key, &want_key);
+            match RustAnalyzerProvider::start(
+                &binary,
+                &request.workspace,
+                &repo.root,
+                &version,
+                request.timeouts,
+            ) {
+                Ok(provider) => {
+                    *state = ProviderSession {
+                        provider,
+                        key: want_key.clone(),
+                        queries: 1,
+                    };
+                }
+                Err(e) => {
+                    envelope.provider = Some(startup_failure_meta(&want_key, &version, &started));
+                    return fail(&envelope, &e);
+                }
+            }
+        }
+        // 调用方没给会话槽（CLI 一次性路径）：新建一个用完即丢的，Drop 负责收尾。
+        None => {
+            match RustAnalyzerProvider::start(
+                &binary,
+                &request.workspace,
+                &repo.root,
+                &version,
+                request.timeouts,
+            ) {
+                Ok(provider) => {
+                    *session = Some(ProviderSession {
+                        provider,
+                        key: want_key.clone(),
+                        queries: 1,
+                    });
+                }
+                Err(e) => {
+                    envelope.provider = Some(startup_failure_meta(&want_key, &version, &started));
+                    return fail(&envelope, &e);
+                }
+            }
+        }
+    }
+
+    let state = session.as_mut().expect("上面每个分支都建立了会话");
+    let execution = execute(&request, &mut state.provider, &repo.root);
+    let mut meta = state.provider.finish_meta();
+    // duration_ms 是**本次查询**的耗时，不是会话累计：混进来会让 Agent 把"复用了"
+    // 读成"这次很快"，或把"会话很久"读成"单次查询很慢"。
     meta.duration_ms = started.elapsed().as_millis();
-    session.close();
+    meta.session_reused = reused;
+    meta.session_queries = session_queries;
+    meta.session_invalidated_reason = invalidated.to_string();
     envelope.provider = Some(meta);
 
     let items = match execution {
@@ -203,30 +449,163 @@ pub fn run(args: &[String]) -> Outcome {
     };
 
     // 提案 §13：查询完成后再算一次 digest，工作树变了就不能当作当前事实。
-    let bindings_after = Bindings::current(&repo);
-    if digest_is_unusable(&bindings_after.working_tree_digest) {
-        let e = CodeIntelError::WorkspaceUnresolved.with_reason(
-            "查询结束后取不到可信的工作树指纹（git status/write-tree 失败或降级），无法证明结果仍绑定查询时的 revision"
-                .to_string(),
-        );
-        return fail(&envelope, &e);
-    }
-    if bindings_after.working_tree_digest != bindings_before.working_tree_digest {
-        let e = CodeIntelError::SnapshotStale
-            .with_reason("查询期间工作树发生变化（working_tree_digest 不一致）".to_string());
-        return fail(&envelope, &e);
+    // 这段判定连同预算裁剪一起进了 `deliver`，因为进程内、daemon、缓存三条路径
+    // 必须走同一个收尾 —— 复制两份"查询前后指纹一致"的检查，迟早只改一份。
+    deliver(
+        envelope,
+        &daemon_state,
+        &mut cache_view,
+        &request,
+        verb,
+        items,
+        &repo,
+        &bindings_before,
+        &cache_dir_path,
+        &cache_key,
+    )
+}
+
+/// `cache.*` 的本次观测。`key_digest` 报的是**键里的工作树指纹本身**：契约要求命中时它等于
+/// 当次 `snapshot.working_tree_digest`，所以它不能是条目文件名里那个哈希。
+struct CacheView {
+    tier: &'static str,
+    key_digest: String,
+    entries: usize,
+    bytes: u64,
+    disabled: bool,
+}
+
+impl CacheView {
+    /// 条目数与字节直接取目录实况：上限判定用的就是同一份统计，不另算一套。
+    fn refresh(&mut self, dir: &Path) {
+        let (n, b) = cache::stats(dir);
+        self.entries = n;
+        self.bytes = b;
     }
 
+    fn to_json(&self) -> Value {
+        json!({
+            "tier": if self.disabled { "miss" } else { self.tier },
+            "key_digest": self.key_digest,
+            "entries": self.entries,
+            "bytes": self.bytes,
+            "disabled": self.disabled,
+        })
+    }
+}
+
+/// 把 `daemon.*` 与 `cache.*` 挂到 envelope。三条路径的每个出口都调它，这样"回落了"
+/// 和"这次没缓存"在**失败**输出里同样看得见 —— 只在成功时才有这些字段，就等于
+/// 把回落藏成了普通失败。
+fn attach(envelope: &mut Envelope, d: &daemon::DaemonState, c: &CacheView) {
+    envelope.daemon = Some(d.to_json());
+    envelope.cache = Some(c.to_json());
+}
+
+fn text_field(v: &Value, key: &str) -> String {
+    v.get(key).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+/// 查询后的指纹复核。两个失败出口分开：取不到指纹 ≠ 指纹没变，
+/// 把前者说成后者就是把"无法证明"写成一条正面事实。
+fn stale_after(repo: &Repo, before: &Bindings) -> Option<Failure> {
+    let after = Bindings::current(repo);
+    if digest_is_unusable(&after.working_tree_digest) {
+        return Some(CodeIntelError::WorkspaceUnresolved.with_reason(
+            "查询结束后取不到可信的工作树指纹（git status/write-tree 失败或降级），无法证明结果仍绑定查询时的 revision"
+                .to_string(),
+        ));
+    }
+    if after.working_tree_digest != before.working_tree_digest {
+        return Some(
+            CodeIntelError::SnapshotStale
+                .with_reason("查询期间工作树发生变化（working_tree_digest 不一致）".to_string()),
+        );
+    }
+    None
+}
+
+/// daemon 业务错误帧 → `Failure`。错误码沿用那 10 个冻结码，daemon 不新造一套；
+/// 未知码按 PROVIDER_CRASHED 处理，而不是翻译成一个看起来"能用"的码。
+fn wire_failure(reply: &Value) -> Failure {
+    let e = &reply["error"];
+    let code = e.get("code").and_then(Value::as_str).unwrap_or("");
+    let reason = e
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("daemon 未给出原因")
+        .to_string();
+    let mapped = match code {
+        "WORKSPACE_UNRESOLVED" => CodeIntelError::WorkspaceUnresolved,
+        "QUERY_INVALID" => CodeIntelError::QueryInvalid,
+        "SYMBOL_NOT_FOUND" => CodeIntelError::SymbolNotFound,
+        "PROVIDER_UNAVAILABLE" => CodeIntelError::ProviderUnavailable,
+        "INITIALIZATION_FAILED" => CodeIntelError::InitializationFailed,
+        "TIMEOUT" => CodeIntelError::Timeout,
+        "SNAPSHOT_STALE" => CodeIntelError::SnapshotStale,
+        "UNSUPPORTED" => CodeIntelError::Unsupported,
+        "RESULT_TRUNCATED" => CodeIntelError::ResultTruncated,
+        _ => CodeIntelError::ProviderCrashed,
+    };
+    mapped.with_reason(format!("{reason}（经 daemon）"))
+}
+
+/// 进程内 / daemon / 缓存三条路径共用的收尾：指纹复核 → 预算裁剪 → 可缓存则落盘 → 组装字段。
+/// 收尾只有一份，因为"查询前后指纹一致"这条检查被复制出去迟早只改一份（round 2 的 `..`
+/// 绕过就是这么来的）。
+#[allow(
+    clippy::too_many_arguments,
+    reason = "三条路径共用的收尾，参数就是它需要的那些事实"
+)]
+fn deliver(
+    mut envelope: Envelope,
+    daemon_state: &daemon::DaemonState,
+    cache_view: &mut CacheView,
+    request: &Request,
+    verb: Verb,
+    items: Vec<Value>,
+    repo: &Repo,
+    bindings_before: &Bindings,
+    cache_dir: &Path,
+    cache_key: &cache::CacheKey,
+) -> Outcome {
+    if let Some(f) = stale_after(repo, bindings_before) {
+        attach(&mut envelope, daemon_state, cache_view);
+        return fail(&envelope, &f);
+    }
     let mut budget = request.budget.clone();
     let (kept, count, continuation) = apply_budget(items, &mut budget);
+    let continuation_json = continuation.map(|hint| json!({"refinement_hint": hint}));
+    envelope.budget = Some(budget.clone());
+    // 可缓存性条件（契约③）：只有 `provider.ready==true` 的结果入缓存。
+    // 把未就绪/失败的空结果落盘，就是给"没测到"建一台永久化的机器。
+    let cacheable = envelope.provider.as_ref().map(|m| m.ready).unwrap_or(false);
+    if !cache_view.disabled && cacheable {
+        let provider_json = envelope
+            .provider
+            .as_ref()
+            .map(ProviderMeta::to_json)
+            .unwrap_or(Value::Null);
+        let report = cache::store(
+            cache_dir,
+            cache_key,
+            &cache::build_payload(
+                &kept,
+                count,
+                &budget.to_json(),
+                &provider_json,
+                continuation_json.as_ref(),
+            ),
+        );
+        cache_view.entries = report.entries;
+        cache_view.bytes = report.bytes;
+    }
+    attach(&mut envelope, daemon_state, cache_view);
     let mut fields = envelope.fields();
     fields.push(("results".to_string(), json!(kept)));
     fields.push(("count".to_string(), json!(count)));
-    if let Some(existing) = fields.iter_mut().find(|(k, _)| k == "budget") {
-        existing.1 = budget.to_json();
-    }
-    if let Some(hint) = continuation {
-        fields.push(("continuation".to_string(), json!({"refinement_hint": hint})));
+    if let Some(c) = &continuation_json {
+        fields.push(("continuation".to_string(), c.clone()));
     }
     let message = format!(
         "{}：命中 {count} 条，返回 {} 条",
@@ -234,6 +613,294 @@ pub fn run(args: &[String]) -> Outcome {
         kept_count(&fields)
     );
     ("PASS".to_string(), message, fields)
+}
+
+/// provider 的复用键（MODULE.md「Provider Session Reuse」）。四项全等才算同一个会话。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionKey {
+    /// 解析后的可执行文件路径（`\\` 归一化成 `/`）。
+    binary: String,
+    /// 相对仓库根的 workspace 作用域。
+    workspace: String,
+    /// provider 版本：换了 server 不能拿旧索引冒充新 server 的结论。
+    version: String,
+    /// **会话建立时**的工作树指纹。
+    digest: String,
+}
+
+/// 可跨查询持有的 provider 会话。目前唯一的持有者是 `mcp serve`。
+///
+/// `Drop` 里关闭 provider：这样"忘了关"不会留下孤儿 language server 进程，
+/// 而重建路径（`*state = ProviderSession { .. }`）也自动回收旧进程。
+pub struct ProviderSession {
+    provider: RustAnalyzerProvider,
+    key: SessionKey,
+    queries: usize,
+}
+
+impl Drop for ProviderSession {
+    fn drop(&mut self) {
+        self.provider.close();
+    }
+}
+
+/// 会话为什么被重建。顺序有意：指纹变化最危险，先报它。
+fn session_invalidated_reason(saved: &SessionKey, want: &SessionKey) -> &'static str {
+    if saved.digest != want.digest {
+        "digest_changed"
+    } else if saved.workspace != want.workspace {
+        "workspace_changed"
+    } else if saved.binary != want.binary {
+        "binary_changed"
+    } else {
+        // 只剩版本（或内部状态）不同：一律算"换了 provider 进程"。
+        "provider_restarted"
+    }
+}
+
+/// provider 起不来时的元数据。`session_queries = 0` 是刻意的：
+/// 一次都没服务成功，报 1 就是把失败说成发生过查询。
+fn startup_failure_meta(key: &SessionKey, version: &str, started: &Instant) -> ProviderMeta {
+    ProviderMeta {
+        kind: "rust-analyzer".to_string(),
+        binary: key.binary.clone(),
+        version: version.to_string(),
+        ready: false,
+        restart_count: 0,
+        restart_reason: String::new(),
+        duration_ms: started.elapsed().as_millis(),
+        write_requests_refused: 0,
+        server_requests_unhandled: 0,
+        dropped_notifications: 0,
+        session_reused: false,
+        session_queries: 0,
+        session_invalidated_reason: String::new(),
+    }
+}
+
+/// `context` 语义层的产物（提案 §15 Phase 2，契约见 MODULE.md「Context Semantic Anchoring」）。
+pub struct SemanticReport {
+    /// `ok` | `no_candidates` | `not_found` | `unavailable` | `timeout` | `stale`
+    /// | `unsupported_scope`
+    pub status: &'static str,
+    /// 非 `ok` 时的结构化原因（`code` 沿用 `code` 命令的 10 个冻结错误码，不新造）。
+    pub reason: Option<(String, String)>,
+    /// 复用 `ResultItem` 的语言中立形状，不另造 DTO。
+    pub anchors: Vec<Value>,
+    pub candidate_queries: usize,
+    /// 模块契约里看到的 code span 总数（>= candidate_queries 的取材上限），
+    /// 用于让"写法不合规则被跳过"成为可见数字。
+    pub candidate_spans: usize,
+    pub max_results: usize,
+    pub truncated: bool,
+    pub workspace_scope: String,
+    pub snapshot: Value,
+}
+
+/// `context` 的语义预算：比 `code` 小得多，因为它默认会被 Agent 当作"入口"反复调用。
+pub const CONTEXT_MAX_RESULTS: usize = 8;
+/// 最多尝试几个候选符号；**首个产出锚点的候选即停**（每次尝试都是一次冷启动，实测 30–90s）。
+const CONTEXT_MAX_CANDIDATES: usize = 3;
+
+/// 从模块契约里取候选符号名：只认反引号**成对包裹**的、首字母大写的 Rust 风格标识符。
+/// 刻意不猜、不扫源码 —— 扫源码就把"语义层"退化成又一次文本匹配（提案 §1 要避免的东西）。
+///
+/// 返回 `(候选, 看到的 span 数)`：后者让"没被采用的格子"成为可见数字，
+/// 否则 MODULE.md 写法不合规则漏收时，消费方只看到"锚点少"而分不清是没写还是没查到。
+fn contract_candidates(module_md: &Path) -> (Vec<String>, usize) {
+    let Ok(text) = std::fs::read_to_string(module_md) else {
+        return (Vec::new(), 0);
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut spans = 0usize;
+    // 用状态机取"成对反引号之间"的内容。早先用 `split('`').skip(1)` 是把首个反引号之后的
+    // 每一段都当作 code span，于是两个 span 之间的普通散文里一个首字母大写的单词也会漏进来
+    // ——那不是候选符号，是散文（独立子代理实测指出）。
+    let mut in_code = false;
+    let mut span = String::new();
+    for ch in text.chars() {
+        if ch == '`' {
+            if in_code {
+                spans += 1;
+                push_candidate(&mut out, &span);
+                span.clear();
+            }
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            span.push(ch);
+        }
+    }
+    (out, spans)
+}
+
+/// 只收**整段就是一个标识符**的 code span。
+///
+/// 刻意不做"取词首"那种截断：`Cargo.toml` 会变成 `Cargo`、`Context-Builder` 会变成 `Context`，
+/// 而这些截断片段完全可能命中**另一个**符号，把 Agent 领到错地方 —— 比漏收更糟。
+/// 代价是一格子里写多个名字（`Foo, Bar`）不会被采用，这必须写进 MODULE.md 的契约里，
+/// 而不是让作者去猜；同时把"看到几个 span、采用几个"通过 `semantic_budget` 暴露出来，
+/// 让漏收是可观测的（提案 §5：禁止静默丢弃）。
+fn push_candidate(out: &mut Vec<String>, span: &str) {
+    let word = span.trim();
+    if word.len() < 3 || !word.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return;
+    }
+    if !word.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return;
+    }
+    if !out.iter().any(|s| *s == word) {
+        out.push(word.to_string());
+    }
+}
+
+/// 错误码 → `semantic_status`。保持与 `code` 一致的可观测语义：
+/// "工具不在场"是 `unavailable`，"索引没收敛完"是 `timeout`，"确实没有这个符号"才是 `not_found`。
+/// 10 个冻结错误码逐个表态，不留 catch-all 把"我们自己的用法错了"糊成"工具不可用"。
+fn status_for_error(code: &str) -> &'static str {
+    match code {
+        "PROVIDER_UNAVAILABLE" | "INITIALIZATION_FAILED" | "PROVIDER_CRASHED" => "unavailable",
+        "TIMEOUT" => "timeout",
+        "SYMBOL_NOT_FOUND" => "not_found",
+        "SNAPSHOT_STALE" => "stale",
+        "WORKSPACE_UNRESOLVED" => "unsupported_scope",
+        // 参数不合法是我们的用法问题，不是工具不在场：单独一个状态，便于场景与排查分辨。
+        "QUERY_INVALID" => "invalid_query",
+        // 截断本身由 `semantic_budget.truncated` 表达，不该作为失败码出现。
+        // 真出现在失败路径上就说明实现有问题 —— 宁可"什么都不宣称"(unavailable)，
+        // 也不把它翻译成 ok/not_found 这类看起来像结论的状态。
+        "RESULT_TRUNCATED" => "unavailable",
+        _ => "unavailable",
+    }
+}
+
+/// 供 `context` 复用的入口（Phase 2）。
+///
+/// 这里刻意**复用 `run()`** 而不是另写一条语义查询路径：`run()` 里已经钉住了
+/// 作用域归一化判定、"参数错误不得先起子进程"、指纹哨兵值拒用、预算截断可见、
+/// `authority = advisory` 与全部错误码映射。另起一条路径就等于把这些不变量复制一份
+/// ——而复制出去的不变量迟早漂移（round 2 的 `..` 绕过就是这么来的）。
+/// 代价是要合成一次 argv，比暴露一个 typed 入口丑，但它换来的是"只有一套真相"。
+pub fn anchors(repo: &Repo, module_dir: &Path, provider_override: Option<&str>) -> SemanticReport {
+    let scope_rel = dto::relative_path(&repo.root, module_dir);
+    // 顺序是契约要求的，不是可以"优化"掉的：`context <成员目录>` 即使 declined（门 1
+    // `unsupported_scope`）也必须带出 `snapshot`，Agent 才能判断这份 declination 绑在哪棵树上
+    // （见 `scenarios/engineering/code_intelligence_context_scope_guard.toml` 对
+    // `snapshot.source_revision` 的 non_empty 期望）。把 `Bindings::current` 挪到门 1 之后
+    // 看着省一次 git 调用，实际会让 declined 结果失去绑定 —— 而"没有绑定的事实"正是本模块
+    // 最不允许的输出形态。
+    let bindings = Bindings::current(repo);
+    let digest = bindings.working_tree_digest.clone();
+    let mut rep = SemanticReport {
+        status: "ok",
+        reason: None,
+        anchors: Vec::new(),
+        candidate_queries: 0,
+        candidate_spans: 0,
+        max_results: CONTEXT_MAX_RESULTS,
+        truncated: false,
+        workspace_scope: scope_rel.clone(),
+        snapshot: bindings.to_json(),
+    };
+
+    // 1) 语义作用域必须是 cargo workspace root。理由写在契约里，不是实现细节：
+    //    从成员目录启动 rust-analyzer 会把整个仓库 workspace 灌进索引（实测 30–90s 且
+    //    `ready` 常常不收敛），有界预算兜不住，与其静默给一份偏低的锚点集合，
+    //    不如明确说"这次不跑语义层"。
+    let is_workspace_root = std::fs::read_to_string(module_dir.join("Cargo.toml"))
+        .map(|text| text.lines().any(|l| l.trim().starts_with("[workspace]")))
+        .unwrap_or(false);
+    if !is_workspace_root {
+        rep.status = "unsupported_scope";
+        rep.reason = Some((
+            "UNSUPPORTED".to_string(),
+            format!(
+                "{scope_rel} 不是 cargo workspace root（其 Cargo.toml 没有 [workspace] 声明），\
+                 在此启动 rust-analyzer 会加载整个仓库 workspace；要语义锚点请对小作用域直接跑 \
+                 `nexus-harness code symbol <Name> --workspace <workspace-root> --json`"
+            ),
+        ));
+        return rep;
+    }
+
+    // 2) 指纹不可用 ⇒ 不起 provider（与 `code` 同一规则：不把"无法证明绑定"说成"绑定成立"）。
+    if digest_is_unusable(&digest) {
+        rep.status = "stale";
+        rep.reason = Some((
+            "SNAPSHOT_STALE".to_string(),
+            "查询开始前取不到可信的工作树指纹（git status/write-tree 失败或降级）".to_string(),
+        ));
+        return rep;
+    }
+
+    // 3) 候选只来自模块契约。
+    let (candidates, spans) = contract_candidates(&module_dir.join("MODULE.md"));
+    rep.candidate_spans = spans;
+    if candidates.is_empty() {
+        rep.status = "no_candidates";
+        rep.reason = Some((
+            "SYMBOL_NOT_FOUND".to_string(),
+            "模块契约 MODULE.md 里没有可解析的反引号标识符；语义层不猜名字也不扫源码".to_string(),
+        ));
+        return rep;
+    }
+
+    // 4) 逐个尝试，首个产出的即停；全部空手时保留**最后一条**失败原因（不编造）。
+    let mut last_reason: Option<(String, String)> = None;
+    for name in candidates.iter().take(CONTEXT_MAX_CANDIDATES) {
+        rep.candidate_queries += 1;
+        let mut args: Vec<String> = vec![
+            "symbol".to_string(),
+            name.clone(),
+            "--workspace".to_string(),
+            scope_rel.clone(),
+            "--max-results".to_string(),
+            CONTEXT_MAX_RESULTS.to_string(),
+            // context 是入口，不是下钻工具：片段压到 1 行，要看细节再用 `code hover`。
+            "--max-snippet-lines".to_string(),
+            "1".to_string(),
+        ];
+        if let Some(binary) = provider_override {
+            args.push("--provider-binary".to_string());
+            args.push(binary.to_string());
+        }
+
+        let (verdict, _message, fields) = run(&args);
+        let map: serde_json::Map<String, Value> = fields.into_iter().collect();
+        let results = map
+            .get("results")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if verdict == "PASS" && !results.is_empty() {
+            rep.anchors = results.into_iter().take(CONTEXT_MAX_RESULTS).collect();
+            rep.truncated = map
+                .get("budget")
+                .and_then(|b| b.get("truncated"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            rep.status = "ok";
+            rep.reason = None;
+            return rep;
+        }
+        let code = map
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(Value::as_str)
+            .unwrap_or("SYMBOL_NOT_FOUND")
+            .to_string();
+        let reason_text = map
+            .get("error")
+            .and_then(|e| e.get("reason"))
+            .and_then(Value::as_str)
+            .unwrap_or("语义查询未产出锚点")
+            .to_string();
+        rep.status = status_for_error(&code);
+        last_reason = Some((code, reason_text));
+    }
+    rep.reason = last_reason;
+    rep
 }
 
 fn kept_count(fields: &[(String, Value)]) -> usize {
@@ -292,6 +959,8 @@ fn parse_request(verb: Verb, args: &[String], repo: &Repo) -> Result<Request, Fa
     let mut budget = Budget::default();
     let mut timeouts = Timeouts::default();
     let mut provider_override: Option<String> = None;
+    let mut use_daemon = true;
+    let mut use_cache = true;
     let mut index = 0usize;
 
     while index < args.len() {
@@ -325,6 +994,10 @@ fn parse_request(verb: Verb, args: &[String], repo: &Repo) -> Result<Request, Fa
             "--provider-binary" => {
                 provider_override = Some(take_option_arg(args, &mut index, "--provider-binary")?);
             }
+            // 两个策略 flag 不带值，也**不进缓存键的 target 分量**（见 run_with_session）：
+            // 它们改变的是"这次怎么问"，不是"问的是什么"。
+            "--no-daemon" => use_daemon = false,
+            "--no-cache" => use_cache = false,
             other if other.starts_with("--") => {
                 return Err(CodeIntelError::QueryInvalid.with_reason(format!("未知选项：{other}")));
             }
@@ -366,6 +1039,8 @@ fn parse_request(verb: Verb, args: &[String], repo: &Repo) -> Result<Request, Fa
         target,
         workspace,
         budget,
+        use_daemon,
+        use_cache,
         timeouts,
         provider_override,
     })
@@ -854,5 +1529,355 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 每个用例独占的临时目录：测试在同一进程里并发跑，名字必须带用例标签与 pid；
+    /// 一律落在 `std::env::temp_dir()` 下，绝不在仓库工作树里造文件。
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("nexus-context-{tag}-{pid}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)
+            .unwrap_or_else(|e| panic!("建临时目录 {} 失败：{e}", dir.display()));
+        dir
+    }
+
+    /// `anchors` 的候选门之后就是 `run()`，一旦门次出错就会去找 language server。
+    /// 传一个必然不存在的 binary 名，把"不该发生 provider 调用"变成可观测的断言：
+    /// 真走到那一步的话 `resolve_binary` 报 `PROVIDER_UNAVAILABLE`，status 变成
+    /// `unavailable` 且 `candidate_queries >= 1`，绝不再是预期的那个门状态。
+    const BOGUS_PROVIDER: &str = "definitely-not-a-real-language-server";
+
+    /// 候选只认反引号里的 Rust 风格标识符：首字母大写、长度 >= 3、逐字符是 ASCII
+    /// 字母数字或下划线；重复项去重并保留首次出现顺序。
+    ///
+    /// `Foo, Bar` 的形状要说清：实现先做"整段逐字符合法"过滤，再取词首连续 run，
+    /// 所以同一个反引号对里的列表**整体被丢弃**——既不产 `Foo` 也不产 `Bar`。
+    /// 这与"取词首"的意图不符（也正因此那段 take_while 实际不可达）。这里按现状
+    /// 钉死形状：生产侧改成先取词首时，本断言会立刻红，不会被静默放过。
+    /// 复用键的四个维度必须**逐个**能单独触发重建，且原因串分辨得出是哪一维变了。
+    /// 顺序也有意义：指纹变化最危险，所以它优先于 workspace/binary/version 被报出来。
+    #[test]
+    fn session_key_invalidation_reports_the_first_changed_dimension() {
+        let base = SessionKey {
+            binary: "rust-analyzer".to_string(),
+            workspace: "crates/nexus-domain".to_string(),
+            version: "1.98.1".to_string(),
+            digest: "aaaa".to_string(),
+        };
+        assert_eq!(
+            session_invalidated_reason(&base, &base.clone()),
+            "provider_restarted"
+        );
+
+        let mut digest_changed = base.clone();
+        digest_changed.digest = "bbbb".to_string();
+        assert_eq!(
+            session_invalidated_reason(&base, &digest_changed),
+            "digest_changed",
+            "工作树指纹变化必须最先报，它决定索引是否还描述当前代码"
+        );
+
+        // 指纹与 workspace 同时变时，仍先报 digest_changed（更危险的那一个优先）。
+        let mut both = digest_changed.clone();
+        both.workspace = "crates/nexus-network".to_string();
+        assert_eq!(session_invalidated_reason(&base, &both), "digest_changed");
+
+        let mut ws_only = base.clone();
+        ws_only.workspace = "apps/nexus".to_string();
+        assert_eq!(
+            session_invalidated_reason(&base, &ws_only),
+            "workspace_changed"
+        );
+
+        let mut bin_only = base.clone();
+        bin_only.binary = "D:/other/rust-analyzer".to_string();
+        assert_eq!(
+            session_invalidated_reason(&base, &bin_only),
+            "binary_changed"
+        );
+
+        // 版本不同没有独立标签（同一 binary/workspace 换 server 版本 = 进程换了），
+        // 但绝不能被判成"可以复用"——键本身不相等。
+        let mut ver_only = base.clone();
+        ver_only.version = "1.95.0".to_string();
+        assert_ne!(
+            base, ver_only,
+            "版本不同必须使键不等，否则旧索引冒充新 server 的结论"
+        );
+        assert_eq!(
+            session_invalidated_reason(&base, &ver_only),
+            "provider_restarted"
+        );
+    }
+
+    /// provider 没起来时的元数据不许谎报会话状态：复用 false、查询次数 **0**、无失效原因。
+    /// （0 而不是 1：一次都没成功服务过查询。）
+    #[test]
+    fn startup_failure_meta_claims_no_session_activity() {
+        let key = SessionKey {
+            binary: "rust-analyzer".to_string(),
+            workspace: "crates/nexus-domain".to_string(),
+            version: "1.98.1".to_string(),
+            digest: "aaaa".to_string(),
+        };
+        let meta = startup_failure_meta(&key, "1.98.1", &Instant::now());
+        assert!(!meta.ready, "起不来不得自称就绪");
+        assert!(!meta.session_reused);
+        assert_eq!(meta.session_queries, 0, "没起来就是零次查询");
+        assert!(meta.session_invalidated_reason.is_empty());
+        let json = meta.to_json();
+        for field in [
+            "session_reused",
+            "session_queries",
+            "session_invalidated_reason",
+        ] {
+            assert!(
+                json.get(field).is_some(),
+                "{field} 必须出现在 provider 输出里，否则消费方看不见复用状态"
+            );
+        }
+    }
+
+    #[test]
+    fn contract_candidates_keeps_only_deduped_uppercase_identifiers() {
+        let dir = scratch_dir("candidates");
+        let md = dir.join("MODULE.md");
+        std::fs::write(
+            &md,
+            "- `Egress` 出向网关\n\
+             - `Scheduler` 调度\n\
+             - `Foo, Bar` 一个反引号里的列表\n\
+             - `run_static` 小写开头\n\
+             - `AB` 长度不足 3\n\
+             - `not a symbol` 含空格\n\
+             - `Egress` 重复出现\n\
+             - `Snapshot_1` 下划线与数字合法\n\
+             - `Context-Builder` 含连字符\n",
+        )
+        .expect("写 MODULE.md");
+        let (raw, spans) = contract_candidates(&md);
+        let got: Vec<&str> = raw.iter().map(String::as_str).collect();
+        assert_eq!(
+            got,
+            ["Egress", "Scheduler", "Snapshot_1"],
+            "只留合法标识符并按首次顺序去重"
+        );
+        // 看到的 code span 总数必须如实上报：漏收要能被看见，而不是悄悄少几个锚点。
+        assert_eq!(spans, 9, "成对反引号的格子总数");
+        assert_eq!(
+            got.iter().filter(|s| **s == "Egress").count(),
+            1,
+            "重复项必须去重"
+        );
+        // 一格里写多个名字（Foo, Bar）整格作废：刻意不做「取词首」，因为那会把
+        // Cargo.toml 变成 Cargo、把 Context-Builder 变成 Context，而截断片段可能命中
+        // 另一个符号、把 Agent 领到错的地方。取舍与代价都写在 MODULE.md 的契约里。
+        for leak in [
+            "Foo",
+            "Bar",
+            "run_static",
+            "AB",
+            "not a symbol",
+            "Context-Builder",
+        ] {
+            assert!(!got.contains(&leak), "{leak:?} 不该成为候选");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 读不到 MODULE.md（文件不存在 / 该路径是目录 / 父目录都不在）一律返回空 Vec：
+    /// 候选集不许靠猜，IO 失败也不许 panic——上层据此报 `no_candidates`。
+    #[test]
+    fn contract_candidates_without_readable_module_md_is_empty() {
+        let dir = scratch_dir("missing-md");
+        let absent = dir.join("MODULE.md");
+        assert!(
+            contract_candidates(&absent).0.is_empty(),
+            "文件不存在时必须为空"
+        );
+        std::fs::create_dir_all(&absent).expect("把 MODULE.md 的位置做成目录");
+        assert!(
+            contract_candidates(&absent).0.is_empty(),
+            "路径是目录时必须为空"
+        );
+        let deep = dir.join("no-such-dir").join("MODULE.md");
+        assert!(
+            contract_candidates(&deep).0.is_empty(),
+            "父目录不存在时同样为空"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 映射表逐臂钉死，兜底必须是悲观值 `unavailable`：空串、拼错的码、大小写不符
+    /// 都不许落到 `ok` / `no_candidates` / `not_found` 这类看起来像结论的状态——
+    /// "我们没映射上这个码"不等于"查过了确实没有"。
+    #[test]
+    fn status_for_error_maps_every_arm_and_fails_closed() {
+        for code in [
+            "PROVIDER_UNAVAILABLE",
+            "INITIALIZATION_FAILED",
+            "PROVIDER_CRASHED",
+        ] {
+            assert_eq!(status_for_error(code), "unavailable", "{code} 是工具不在场");
+        }
+        assert_eq!(
+            status_for_error("TIMEOUT"),
+            "timeout",
+            "索引未收敛不等于没有符号"
+        );
+        assert_eq!(status_for_error("SYMBOL_NOT_FOUND"), "not_found");
+        assert_eq!(status_for_error("SNAPSHOT_STALE"), "stale");
+        assert_eq!(
+            status_for_error("WORKSPACE_UNRESOLVED"),
+            "unsupported_scope"
+        );
+        // QUERY_INVALID 有独立状态：那是"我们自己的用法错了"，不能被糊成"工具不可用"。
+        assert_eq!(status_for_error("QUERY_INVALID"), "invalid_query");
+        // 剩下的冻结码（RESULT_TRUNCATED）与一切未知码都走悲观兜底。
+        for code in [
+            "",
+            " ",
+            "ok",
+            "OK",
+            "snapshot_stale",
+            "RESULT_TRUNCATED",
+            "BOGUS_CODE",
+        ] {
+            let got = status_for_error(code);
+            assert_eq!(got, "unavailable", "未知码 {code:?} 必须落到悲观值");
+            assert_ne!(got, "ok", "未知码 {code:?} 不得伪造成成功");
+            assert_ne!(got, "no_candidates", "未知码 {code:?} 不得伪装成契约缺候选");
+            assert_ne!(got, "not_found", "未知码 {code:?} 不得伪装成查过没有");
+        }
+    }
+
+    /// 语义作用域门（gate 1）必须先于候选门与 provider：非 workspace root 只回
+    /// `unsupported_scope` + `UNSUPPORTED`，且一次 `run()` 都不发起。
+    /// MODULE.md 里刻意放一个合法候选——万一作用域门被挪到候选之后，代码就会走到
+    /// `run()`，届时 status 变成 `unavailable`（假 binary 名）、`candidate_queries`
+    /// 变成 1，下面关于这两项的断言会同时抓住它，不会静默起真的 rust-analyzer。
+    #[test]
+    fn anchors_refuses_non_workspace_scope_without_spawning_provider() {
+        let repo = Repo::discover().expect("must run inside the nexus repository");
+        for (tag, manifest) in [
+            ("package-only", Some("[package]\nname = \"scratch\"\n")),
+            ("no-manifest", None),
+        ] {
+            let dir = scratch_dir(&format!("scope-{tag}"));
+            if let Some(text) = manifest {
+                std::fs::write(dir.join("Cargo.toml"), text).expect("写 Cargo.toml");
+            }
+            std::fs::write(dir.join("MODULE.md"), "- `Egress` 出向网关\n").expect("写 MODULE.md");
+
+            let rep = anchors(&repo, &dir, Some(BOGUS_PROVIDER));
+            assert_eq!(
+                rep.status, "unsupported_scope",
+                "{tag}：status 实际为 {}",
+                rep.status
+            );
+            let reason = rep.reason.as_ref().expect("非 ok 状态必须带结构化原因");
+            assert_eq!(reason.0, "UNSUPPORTED", "{tag}：原因码沿用 code 的冻结表");
+            assert!(
+                reason.1.contains("cargo workspace root"),
+                "{tag}：{}",
+                reason.1
+            );
+            assert!(rep.anchors.is_empty(), "{tag}：作用域被拒时不得有锚点");
+            assert_eq!(
+                rep.candidate_queries, 0,
+                "{tag}：0 次尝试才等于没起 language server"
+            );
+            assert!(!rep.truncated, "{tag}：没有查询就没有截断可报");
+            assert_eq!(rep.max_results, CONTEXT_MAX_RESULTS, "{tag}");
+            assert!(
+                rep.snapshot.is_object(),
+                "{tag}：仓库发现已完成，snapshot 必须在场"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// 候选集为空 ⇒ `no_candidates` + `SYMBOL_NOT_FOUND`，同样一次查询都不发起。
+    /// 门次提醒：作用域门之后、候选门之前还有一道指纹门（gate 2），git 调用降级成
+    /// 哨兵值时本用例只能观测到 `stale`（并发跑测试时的真实形态，见 env.rs 的
+    /// index.lock 说明）。分支判定只允许用**这次调用产出的 snapshot**，不许再问一次
+    /// git —— 二次取值会带来"实现降级了但测试没看出来"的假红。两个分支都写断言，
+    /// 不用 early return 跳过——"没测到"不能伪装成"测过了"。
+    #[test]
+    fn anchors_without_contract_candidates_reports_no_candidates() {
+        let repo = Repo::discover().expect("must run inside the nexus repository");
+        let dir = scratch_dir("no-candidates");
+        std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = []\n")
+            .expect("写 Cargo.toml");
+        std::fs::write(
+            dir.join("MODULE.md"),
+            "- 只有小写 `run_static` 与短名 `AB`，无合法候选\n",
+        )
+        .expect("写 MODULE.md");
+
+        let rep = anchors(&repo, &dir, Some(BOGUS_PROVIDER));
+        assert!(rep.anchors.is_empty(), "候选缺失时不得有锚点");
+        assert_eq!(rep.candidate_queries, 0, "候选为空即返回，不得尝试任何查询");
+        assert!(!rep.truncated);
+        let reason = rep.reason.as_ref().expect("非 ok 状态必须带结构化原因");
+        // 判据只能来自**这次调用自己的产物**：再问一次 git 会引入二次竞态
+        // ——并发跑时 `anchors()` 里那次 `git write-tree` 可能因 index.lock 降级成哨兵值，
+        // 而测试随后再问一次却拿到了正常指纹，于是走进 else 分支断言 `no_candidates`
+        // 并假红（Linux 上实测过；Windows 单跑永远复现不出来）。
+        let digest = rep.snapshot["working_tree_digest"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if digest_is_unusable(&digest) {
+            assert_eq!(
+                rep.status, "stale",
+                "这次调用的指纹是哨兵值时，门 2 必须先命中（digest={digest}）"
+            );
+            assert_eq!(reason.0, "SNAPSHOT_STALE");
+        } else {
+            assert_eq!(rep.status, "no_candidates", "status 实际为 {}", rep.status);
+            assert_eq!(
+                reason.0, "SYMBOL_NOT_FOUND",
+                "不猜名字不等于'库里没有这个符号'"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 门次回归护栏：既没有 Cargo.toml 也没有 MODULE.md 时必须报 `unsupported_scope`，
+    /// 而不是看似无害的 `no_candidates`——后者会被 Agent 读成"契约里没符号"而跑去改
+    /// MODULE.md，真正该说的是"这个作用域压根不该跑语义层"。反向对照（补上 `[workspace]`
+    /// 声明后落回后续门）证明 unsupported_scope 来自 Cargo.toml 判定，
+    /// 不是"目录空无一物"的巧合。
+    #[test]
+    fn anchors_checks_workspace_scope_before_candidate_extraction() {
+        let repo = Repo::discover().expect("must run inside the nexus repository");
+        let dir = scratch_dir("scope-before-candidates");
+
+        let bare = anchors(&repo, &dir, Some(BOGUS_PROVIDER));
+        assert_eq!(
+            bare.status, "unsupported_scope",
+            "作用域门必须先于候选门命中"
+        );
+        let reason = bare.reason.as_ref().expect("非 ok 状态必须带结构化原因");
+        assert_eq!(reason.0, "UNSUPPORTED", "空目录不得被说成契约缺候选");
+        assert_eq!(bare.candidate_queries, 0, "门 1 命中时不该有任何语义尝试");
+        assert!(bare.anchors.is_empty());
+
+        std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = []\n")
+            .expect("写 Cargo.toml");
+        let after = anchors(&repo, &dir, Some(BOGUS_PROVIDER));
+        assert_ne!(
+            after.status, "unsupported_scope",
+            "补上 [workspace] 后必须穿过作用域门"
+        );
+        assert!(
+            matches!(after.status, "no_candidates" | "stale"),
+            "只允许落到候选门或指纹门，实际 {}",
+            after.status
+        );
+        assert_eq!(after.candidate_queries, 0, "两道门都在 run() 之前返回");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

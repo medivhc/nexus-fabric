@@ -347,3 +347,870 @@ rev `54010f8` 上启动 `verify --full --json`（`/work/xc-verify-full.sh`，
 `contract=3652314f9c21` 与 §I（`54010f8`）**相同**、`cfg=fa6c1bdb335a` 亦相同 —— 这正好是
 "docs-only 提交不改变契约输入面"的实测旁证；变化的只有 `tree`（工作树指纹），因为它按字节算，
 任何文件改动都会动它。要记住 §J 那条：本轮**没有** `verify --full` 结论。
+
+## K. Phase 2/3/4（context 语义锚点 + MCP 适配 + 同进程会话复用）
+
+执行宿主：Windows（rustc/clippy 1.95.0、rust-analyzer 1.95.0、`D:
+extci-p24` worktree，
+分支 `feature/code-intel-phase-234`）。**这是冒烟宿主，不是结论宿主**；同一批在
+xc-pc-linux 的复跑见 §L。工作树起点 `df2049c`（PR #12 head）。
+
+21 个 E4 场景逐个 verdict 与 evidence_id（串行，每场景一个全新 provider 进程）：
+
+    budget-count                 PASS
+    budget-truncation            PASS
+    callees                      PASS
+    callers                      PASS
+    context-anchors              PASS
+    context-no-fake-semantics    PASS
+    context-scope-guard          PASS
+    definition                   PASS
+    diagnostics-advisory         PASS
+    diagnostics-item-shape       PASS
+    hover                        PASS
+    implementations              PASS
+    mcp-handshake                PASS
+    mcp-real-query               PASS
+    provider-unavailable         PASS
+    read-only-counters           PASS
+    scope-escape                 PASS
+    scope-violation              PASS
+    symbol                       PASS
+    workspace-escape             PASS
+    write-method-denied          PASS
+
+合计 PASS=21 FAIL=0。Phase 4 的 Red→Green 链：
+  Red   scenario-9e6b63057174  first=18352ms second=17817ms，`provider.session_reused` 读为 null
+        ⇒ 同一个 `mcp serve` 进程内也没复用（`run()` 每次新建 provider）
+  Green scenario-61696a369a4c  first=18029ms second=486ms（37x），`session_reused=true`、
+        `session_queries=2`、`session_invalidated_reason=""`，19 条期望全过
+判据从时延比值改成**结构事实**的理由写在 MODULE.md「Provider Session Reuse」与
+.agents/code-intelligence-phase-2-4-plan.md 附录 A：时延绝对值随宿主负载漂移，
+把它写进契约就是造脆弱红（round 2/3 同类教训）。
+
+Phase 2 三条场景的 Red→Green：
+  context-anchors            Red scenario-d0ed41450b95（`authority` 字段 <missing>）
+                             → Green scenario-d0a714197aeb
+  context-no-fake-semantics  Red scenario-6ba4e0adc515 → Green scenario-d12053b9f176
+  context-scope-guard        （契约先行新增，无 Red：实现即 Green）scenario-89ac9a572677
+Phase 3：mcp-handshake Red scenario-922202299c25（verdict 实得 BLOCKED）→ Green scenario-fe203f567c59
+
+CLI 一次性路径的会话卫生实测：跑 `code symbol Egress ...` 前后 `rust-analyzer` 进程数都是 0，
+输出 `session_reused=false / session_queries=1` ⇒ 复用只在调用方显式持有会话时发生。
+
+## L. Phase 2/3/4 的结论级复跑（xc-pc-linux，rev `f3cc6234`）
+
+宿主：`xc-pc-linux`（Ubuntu 5.15.0-139，rustc/clippy/rust-analyzer **1.98.1**，
+`cargo-deny 0.20.2` **在场** ⇒ dependency-governance 是真跑过的 PASS）。
+工作树起点 `f3cc6234`（= PR #12 head `df2049c` + Phase 2/3/4 五个提交），
+`dirty=0`。日志 `/work/xc-verify-p234b.log`。
+
+    fmt --all -- --check                       exit 0
+    clippy --workspace --all-targets -D warn   exit 0
+    cargo test -p nexus-harness                133 passed / 0 failed
+    cargo test -p nexus --lib                  217 / 0 / 2 ignored
+    verify --fast --json                       overall PASS，9/9 门 PASS、无 UNKNOWN
+        Evidence dir=verify-qoder-xc-0ef59d73c701  contract=4682a05f32c2
+        rev=f3cc62344cad  dirty=False  tree=e8966722c743  cfg=fa6c1bdb335a
+        toolchain=1.98.1  target=x86_64-unknown-linux-gnu
+    21 个 E4 场景                               PASS=21 FAIL=0
+    四种越界形态                                 仍在 spawn provider 之前被拒（envelope 无 provider 字段）
+    dirty_after=0   flycheck 残留(仓库内)=0
+
+本轮新增 5 条场景在 Linux 的 evidence_id：
+
+    context-anchors            scenario-qoder-xc-3b3029e45de0
+    context-no-fake-semantics  scenario-qoder-xc-30e1a342e353
+    context-scope-guard        scenario-qoder-xc-169dbf244780
+    mcp-handshake              scenario-qoder-xc-fca56a2877bc
+    mcp-real-query             scenario-qoder-xc-b2e96e267fac   <- Phase 4 复用判据（结构层）
+
+一条必须由 Linux 才抓得到的事：`f8f41d9c` 那一版 `anchors_without_contract_candidates…`
+在并发下 FAILED（单独跑必过、Windows 上从未复现）。根因是**测试自己**二次取 git 判分支，
+与 `git write-tree` 的 `index.lock` 降级形成竞态。修复见提交 `f3cc6234`
+（判据只用这次调用产出的 snapshot digest）。教训留档：
+"再测一次来选断言分支"在并发下等于没测。
+
+同一 rev 上 `verify --full` 仍**没有结论**：`/work` 只有 27G 余量，而上一轮实测
+`--full` 需要 30G+ 才打得满得安全（见 §J）。不重复冒险。
+
+## M. 独立 Review round 1 的修复复跑（Windows 冒烟宿主，对象 `aba6de2` 之上的修复）
+
+案卷 `.evidence/review-qoder-independent-p234-r1/`（verdict `CHANGES_REQUESTED`；
+审查者只静态阅读、未跑 cargo、`model=unbound`）。修复 2 条阻塞（B1、G1）+
+4 条非阻塞（A1/A2/A3/G2），minor 4 条逐条表态（1 条**不能改**，理由见
+`.agents/code-intelligence-followups.md` 第 8 条）。
+
+改动面：`code_intel/lsp.rs`（`FrameIn` / `read_frame_result`，`read_frame` 原语义保留给
+LSP 客户端）、`code_intel/mcp.rs`（serve 退出形状、serve_exit_shape 探测、负向清单逐个试、
+`build_argv` 白名单门前移 + `UNSUPPORTED: ` 前缀）、`code_intel/mod.rs`（anchors 顺序理由注释）、
+`MODULE.md`（21 场景、`invalid_query`、`candidate_spans`、EOF 形状、拒绝形态）、
+`FILE_MANIFEST.md`（changelog 叙述）、`code_intelligence_mcp_handshake.toml`（+3 期望 = 14）。
+
+Windows 复跑（同一 worktree，串行）：
+
+    cargo fmt --all                          exit 0
+    cargo clippy -p nexus-harness --all-targets -D warnings   exit 0
+    nexus-harness mcp selftest --json        PASS，8/8 probes，duration_ms=75
+        eof_verdict=UNKNOWN  malformed_frame_verdict=FAIL
+        write_call_rejected=true（6 个越权名全部按 -32602 + UNSUPPORTED 拒绝）
+    cargo test -p nexus-harness              129 passed / 3 failed
+        3 条失败 = master 自带依赖 POSIX `echo` 的 scenario 单测（DEVELOPMENT.md §11.1），
+        与本模块无关，Windows 结构性假红，未削弱
+    21 个 E4 场景                             PASS=21 FAIL=0
+        关键 evidence_id：
+          mcp-handshake           scenario-105d6362e944（14 期望全过，含新增 3 条）
+          context-anchors         scenario-30e3e615b40a（15 期望）
+          mcp-real-query          scenario-8c78f08d4ea7
+        日志 /d/next/win-scenarios-p4b.log（工作树外，不入库）
+
+B1 的修复不是"读一遍代码确认改了"：`serve_exit_shape` 会把**自己**作为子进程拉起
+`mcp serve`，喂真实字节流（空输入 = 干净 EOF；`Content-Length: 9\r\n\r\n{}` = 畸形帧），
+再看它返回的 verdict。修复前这条探测把 clean EOF 报成 FAIL 且 PASS 分支不可达，
+修复后 `UNKNOWN` / `FAIL` 分别为真。
+
+## N. 修复后的结论级复跑（xc-pc-linux，rev `3c3bb97e`）
+
+宿主：`xc-pc-linux`（Ubuntu，rustc/clippy **1.98.1**，rust-analyzer 1.98.1，
+`cargo-deny` **在场** ⇒ dependency-governance 是真跑过的 PASS）。
+工作树 `dirty=0`，起点由 thin bundle（`f3cc6234..3c3bb97e`，20KB）传入后 `checkout -f FETCH_HEAD`。
+日志 `/work/xc-verify-p234c.log`。
+
+    cargo fmt --all -- --check                 exit 0（0 行输出）
+    cargo clippy --workspace --all-targets -D warnings   exit 0，error 行数 0
+    cargo test -p nexus-harness                133 passed / 0 failed / 0 ignored
+    cargo test -p nexus --lib                  217 passed / 0 failed / 2 ignored
+    verify --fast --json                       overall PASS，9/9 门 PASS、无 UNKNOWN
+        Evidence dir=verify-qoder-xc-91061967a275  contract=7a80ceaa3cf9
+        rev=3c3bb97e4e93  dirty=False  tree=a1a9696d88c4  cfg=fa6c1bdb335a
+        toolchain=1.98.1  target=x8_64-unknown-linux-gnu
+    21 个 E4 场景                               PASS=21 FAIL=0
+    四种越界形态                                 仍在 spawn provider 之前被拒（provider_present=False）
+    mcp selftest（第 6b 步）                    PASS，11/11 probes，duration_ms=52
+        eof_verdict=UNKNOWN  malformed_frame_verdict=FAIL
+        write_call_rejected=true（6 个越权名全部按 -32602 + UNSUPPORTED 拒绝）
+    dirty_after=0   flycheck 残留(仓库内)=0   disk_after=27G 可用
+
+Phase 4 的复用判据在权威宿主上单独量了一次（`mcp selftest --with-query --json`）：
+
+    verdict=PASS  duration_ms=16401  probes_ok=11/11
+    query_first_ms=16128   query_first_session_reused=false   query_first_session_queries=1
+    query_second_ms=69     query_second_session_reused=true   query_second_session_queries=2
+    ⇒ 同一个 `mcp serve` 进程内第二次查询便宜 **233 倍**（Windows 侧同结构判据是 18029→486ms）
+
+本轮新增 5 条场景（Phase 2/3/4）在 Linux 的 evidence_id：
+
+    context-anchors            scenario-qoder-xc-f94ace920f28
+    context-no-fake-semantics  scenario-qoder-xc-27c2eb5af838
+    context-scope-guard        scenario-qoder-xc-190a5e9caaa3
+    mcp-handshake              scenario-qoder-xc-f38d8598ddfa（14 期望，含 eof/malformed/write_call_rejected）
+    mcp-real-query             scenario-qoder-xc-be7c21cccdac
+
+两条口径必须记清：
+- **contract hash 按宿主不同**：同一内容 Windows 工作树算出 `dd7774489400…`（提交说明里的那个），
+  Linux 算出 `7a80ceaa3cf9`。根因是 `* text=auto` 的 CRLF checkout，见 DEVELOPMENT.md §11.1。
+  提交标记记的是 Windows 值，Linux 门禁记的是 Linux 值 —— 两者不是同一个量的两次测量，别混用。
+- 第 6b 步在脚本末尾跑（在"副作用与工作树"之后），但 `mcp selftest` 不带 `--with-query` 时
+  根本不启动 provider，只跑 stdio 协议与参数校验，因此不影响 `dirty_after=0` 的读数；
+  单独那次 `--with-query` 是在复跑结束之后跑的，也不写仓库（flycheck 走 `/tmp/nexus-code-intel-*`）。
+
+### N3 勘误（round 2 由独立审查抓出，2026-10-11）
+
+上面 §N 第 6b 步那行写的 **`11/11 probes` 是错的**：默认路径（不带 `--with-query`）的
+`mcp selftest` 当时只发 **8** 条探针，11/11 属于**另一次** `--with-query` 的运行，我把两次的数
+混记成了一条。正确记录以本文件 §O 为准（整改后默认路径发 11 条、`--with-query` 发 14 条 ——
+新增探针使然，两个数各归各的口径）。§M:454 的 `8/8` 是对的，不动。
+这条错误的性质值得留着：**把没跑过的探针算进结论**正是提案 §12 禁止的形状，而它出现在
+"结论级证据"段落里，比出现在代码注释里危险得多。
+
+## O. 独立 Review round 2 的整改复跑（Windows 冒烟宿主，rev `a3af128` 之上的整改）
+
+案卷 `.evidence/review-qoder-independent-p234-r2/`（verdict `COMMENTED`，0 阻塞；
+round 1 的 B1/G1/A1/A2/A3/G2 全部 CLOSED，H1 与 4 条 minor 处置被接受；`model=unbound`）。
+整改对象是 round 2 新提的 N1/N2/N3/N4/N5/N6/N7 + 自查项 S1（`handled_requests` 从未写进契约）。
+修前实测：`.agents/red-evidence-mcp-round2.txt`（stdout 裸 JSON 194 字节、PASS 分支不可探针、
+`--provider-binary` 与未知参数双双静默丢弃）。
+
+Windows 复跑（最终二进制，串行；`dirty=0` 之前取）：
+
+    cargo fmt --all -- --check                             exit 0
+    cargo clippy -p nexus-harness --all-targets -D warn    exit 0
+    cargo test -p nexus-harness                            132 passed / 3 failed（共 135）
+        3 条 = master 自带依赖 POSIX `echo` 的 scenario 单测（DEVELOPMENT.md §11.1）
+        注：`cargo clippy --workspace` 在本宿主 exit 101，原因是 `nexus-platform-linux`
+        要 `fuser`（PR #12 记录的结构性限制），不是本模块引入
+    cargo test -p nexus-harness -- code_intel              72 passed / 0 failed
+    nexus-harness mcp selftest --json                      PASS，11/11 probes，dur≈1.0s
+        eof_verdict=UNKNOWN  malformed_frame_verdict=FAIL
+        pass_verdict=PASS  pass_handled_requests=1  stdout_frames_ok=true
+        notification_no_reply=true  provider_override_honored=true
+        write_call_rejected=true（6/6 越权名 -32602 + UNSUPPORTED）
+    nexus-harness mcp selftest --with-query --json          PASS，14/14 probes，dur 19221ms
+        first=17590ms（session_reused=false, queries=1）
+        second=444ms（session_reused=true, queries=2）⇒ 40x，query_warm_reused=true
+    手工通道核对（这些正是 N5/N1 的直接复证）：
+        printf '' | mcp serve --json            ⇒ stdout **0 字节**，stderr 682 字节 envelope
+              （该字节数取自 rev `a3af128` 之上、**dirty_state=true** 的工作树；
+               同一 envelope 在 clean 树上是 683 字节，round 3 的 N-A5 实测换算过。
+               字节数不是契约量，但它会随 dirty/宿主三元组变化 —— 所以这里把条件写全，
+               别让两个宿主的 682 vs 685 看起来像行为差异）
+                                                  （verdict=UNKNOWN handled_requests=0 带 snapshot）
+        一帧 initialize + 关管道                 ⇒ stdout 230 字节 = **恰好 1 帧**，
+                                                  stderr verdict=PASS handled_requests=1
+        mcp serve --totally-made-up             ⇒ BLOCKED，exit 2（不再静默丢弃）
+        mcp selftest --bogus-flag               ⇒ BLOCKED，exit 2
+        mcp serve --provider-binary <不存在路径> ⇒ 真实 tools/call 回
+                                                  PROVIDER_UNAVAILABLE 且原因点名 --provider-binary
+    21 个 E4 场景                                PASS=21 FAIL=0
+
+本轮三个新事实的实测载体：
+
+    mcp-handshake（现 19 条期望）        scenario-23a2a68499f0
+    mcp-real-query（现 19 条期望）        scenario-5f802a9bb856
+    callees（11 条期望）                  scenario-8eed2a7b113c
+
+### 两条必须一起记下的过程事实
+
+1. **`callees` 第一次是 FAIL（verdict 实得 BLOCKED），是我的操作造成的，不是代码回归**：
+   批量场景还在跑的时候我并发执行了 `cargo build -q -p nexus-harness`，两者争同一个
+   `target/` 目录（cargo 的 build directory lock），使那一次 provider 侧未能起来 ⇒ BLOCKED。
+   单独复跑即 PASS（`scenario-8eed2a7b113c`，11 条期望全过）。教训：**跑 E4 批次期间不许并发构建**。
+2. **场景证据 id 是确定性的，复跑会覆盖前一条记录**：`scenario_run_id`
+   （`evidence.rs:218-231`）的种子只有 `source_revision + scenario_id + configuration_digest +
+   contract_hash`，**不含工作树指纹**，所以同一 rev 上脏树的两次运行会算出同一个 id
+   （上面那次 FAIL 与 PASS 都是 `scenario-8eed2a7b113c`，磁盘上只剩 PASS）。
+   后果很实际：Red→Green 若在同一 rev 上完成，`.evidence/` 里**留不下 Red** ——
+   本模块之所以每次把 verdict/输出逐条抄进 `.agents/*evidence*.txt`，正是因为这个覆盖行为，
+   而不是巧合。已登记为后续项（见 `.agents/code-intelligence-followups.md`）。
+3. **本节第一次记的单测总数是少的（写成 134），已更正为 135**：那次 `cargo test -p nexus-harness`
+   跑在第 3 条新测试（`selftest_rejects_unknown_arguments_before_spawning_anything`）落地之前。
+   发现方式是**跨宿主对账**：Linux 实测 136，Windows 若是 134 就差 2 条，而两宿主之间唯一的
+   已知差异是 1 条 `#[cfg(unix)]` 测试 ⇒ 算术不成立；回 Windows 重跑得 132 passed + 3 failed = 135。
+   这正是 N2/N3 那类错误的成因，也是为什么记下来的数字必须带宿主和测量时点。
+
+### N7 与 S1 的实测依据
+
+- `context engineering/nexus-harness --json` ⇒ `verdict=PASS`、`semantic_status=unsupported_scope`、
+  `mapped_scenarios=20`（而 `MODULE.md` 场景清单是 21）。这坐实了 N7：`mapped_scenarios`
+  是子串启发式，不能当"场景总数"用，也不能与清单数互相验证；口径已写进 MODULE.md。
+- S1：`handled_requests` 此前只在输出里、契约从没定义它，而它正是 `PASS`/`UNKNOWN` 的判据本身
+  （`mcp.rs` serve 的 `handled > 0`）。现在 MODULE.md 定义了它（含"notification 不计"），
+  且探针断言 `pass_handled_requests=1` 与"stdout 帧数=1"必须同时成立。
+
+## P. round 2 整改后的结论级复跑（xc-pc-linux，rev `52184e96`）
+
+宿主 `xc-pc-linux`（rustc/clippy/rust-analyzer **1.98.1**，`cargo-deny 0.20.2` 在场）；
+`dirty=0`；起点由 thin bundle（`a3af128..52184e96`，28KB）传入后 `checkout -f FETCH_HEAD`。
+日志 `/work/xc-verify-p234d.log`。**批次期间没有任何并发构建**（§O 过程事实 1 的教训已执行）。
+
+    cargo fmt --all -- --check                       exit 0
+    cargo clippy --workspace --all-targets -D warn   exit 0，error 行数 0
+    cargo test -p nexus-harness                      136 passed / 0 failed
+        与 Windows 135 的差 1 条 = `#[cfg(unix)]` 的真实符号链接越界回归（跨宿主对账见 §O 第 3 条）
+    cargo test -p nexus --lib                        217 passed / 0 failed / 2 ignored
+    verify --fast --json                             overall PASS，9/9 门 PASS、无 UNKNOWN
+        Evidence dir=verify-qoder-xc-488a84ca265c  contract=78981c3f32f0
+        rev=52184e96c682  dirty=False  tree=ae674a94a16e  cfg=fa6c1bdb335a
+        toolchain=1.98.1  target=x8_64-unknown-linux-gnu
+        dependency-governance 真跑过（cargo-deny 在场）：advisories/licenses/bans/sources PASS
+    21 个 E4 场景                                     PASS=21 FAIL=0
+    四种越界形态                                       仍在 spawn provider 之前被拒
+    dirty_after=0   flycheck 残留(仓库内)=0   disk_after=27G 可用
+
+第 6b 步（默认 `mcp selftest`，权威宿主）—— round 2 整改点的直接复证：
+
+    verdict=PASS  authority=advisory  tools=8  probes_ok=11/11  duration_ms=172
+      eof_verdict=UNKNOWN      malformed_frame_verdict=FAIL
+      pass_verdict=PASS        pass_handled_requests=1     stdout_frames_ok=True
+      notification_no_reply=True（期望下一条响应 id=2，实得 2）
+      provider_override_honored=True（BLOCKED / PROVIDER_UNAVAILABLE / 原因点名 --provider-binary）
+      write_call_rejected=True（6 个越权名全部按 -32602 + UNSUPPORTED 拒绝）
+
+第 6c 步（N5 通道纯度的直接复证，手工喂字节流）：
+
+    printf '' | mcp serve --json                 exit=0  stdout_bytes=**0**  stderr_bytes=685
+    一帧 initialize + 关管道                       exit=0  stdout_bytes=230
+                                                 Content-Length 出现次数=**1**（恰好一帧、无尾字节）
+                                                 stderr: verdict=PASS handled_requests=1
+    mcp serve --totally-made-up --json           exit=**2**  stdout_bytes=0（不再静默丢弃）
+
+本轮 5 条相关场景在 Linux 的 evidence_id：
+
+    context-anchors            scenario-qoder-xc-def0690d3cf5
+    context-no-fake-semantics  scenario-qoder-xc-51cc6326fd94
+    context-scope-guard        scenario-qoder-xc-885fac35b175
+    mcp-handshake              scenario-qoder-xc-f512d7d0079e（19 期望全过）
+    mcp-real-query             scenario-qoder-xc-723a9049cd7d（19 期望全过）
+
+口径重申（别把两宿主的数当一个量）：contract hash 随宿主不同 —— 同一内容 Windows 工作树
+算出 `b9242a09eefd…`（本轮提交 marker 记的就是它），Linux 算出 `78981c3f32f0`，
+根因是 `* text=auto` 的 CRLF 检出（DEVELOPMENT.md §11.1）。
+`verify --full` 仍**无结论**：`/work` 只有 27G 余量，实测需要 30G+（§J 同一口径），不重复冒险。
+
+## Q. round 3 整改后的结论级复跑（xc-pc-linux，rev `bdf2f767`）
+
+案卷 `.evidence/review-qoder-independent-p234-r3/`（末轮，verdict `COMMENTED`、0 阻塞；
+处置见 `.agents/code-intelligence-followups.md` 的 round 3 段）。宿主 `xc-pc-linux`
+（rustc/clippy/rust-analyzer **1.98.1**，`cargo-deny 0.20.2` 在场），`dirty=0`，
+bundle `c453a0b..bdf2f767` 传入后 `checkout -f FETCH_HEAD`。日志 `/work/xc-verify-p234e.log`。
+批次期间无并发构建。
+
+    cargo fmt --all -- --check                       exit 0（0 行输出）
+    cargo clippy --workspace --all-targets -D warn   exit 0，error 行数 0
+    cargo test -p nexus-harness                      138 passed / 0 failed
+        ⇒ 坐实 MODULE.md 的推算：Windows 137 + 1 条 `#[cfg(unix)]` = 138。
+          契约里那行现在写"Linux 以 §Q 实测为准、不预填"，填完就是这一行。
+    cargo test -p nexus --lib                        217 passed / 0 failed / 2 ignored
+    verify --fast --json                             overall PASS，9/9 门 PASS、无 UNKNOWN
+        Evidence dir=verify-qoder-xc-2845313dd25e  contract=3e6369ad6809
+        rev=bdf2f767fe88  dirty=False  toolchain=1.98.1  target=x8_64-unknown-linux-gnu
+        dependency-governance 真跑过：advisories/licenses/bans/sources PASS
+    21 个 E4 场景                                     PASS=21 FAIL=0
+    dirty_after=0   flycheck 残留(仓库内)=0   disk_after=27G 可用
+
+第 6b/6c 步（round 3 整改点的权威宿主复证）：
+
+    mcp selftest                 verdict=PASS  11/11 probes  probe_count=11  dur=172ms
+        eof_verdict=UNKNOWN  malformed_frame_verdict=FAIL
+        pass_verdict=PASS  pass_handled_requests=1  stdout_frames_ok=True
+        notification_no_reply=True  provider_override_honored=True
+        write_call_rejected=True（6/6 越权名）  write_tools_exposed=0
+    mcp selftest --with-query    verdict=PASS  probe_count=14  dur=17983ms
+        first=17593ms（reused=false, queries=1）
+        second=69ms（reused=true, queries=2）⇒ 255x，query_warm_reused=True
+    serve 通道纯度直测            干净 EOF ⇒ stdout **0 字节**（stderr 685，dirty=False）
+                                 1 帧 + EOF ⇒ stdout **230 字节、Content-Length 出现 1 次**
+        stderr verdict=PASS handled_requests=1
+                                 未知启动参数 ⇒ exit **2**、stdout 0 字节
+
+本轮相关场景的 evidence_id：
+
+    mcp-handshake              scenario-qoder-xc-510d7162b864（20 期望，含 probe_count=11）
+    mcp-real-query             scenario-qoder-xc-e2cd6efd6a65（20 期望，含 probe_count=14）
+    context-anchors            scenario-qoder-xc-5e896bcf5bc4
+
+数字口径（round 3 的 N-A4/N-A5 之后立的规矩，这里示范执行）：
+- 上面的 138 是 **Linux 实测**，不是从 Windows 推的；Windows 侧 137 记在 §Q 之前的
+  提交说明里并带 rev `bdf2f767`。
+- 685 这个字节数带 `dirty=False`；§O 的 682 是同一 envelope 在**脏树**上的读数，两处都已注明条件。
+- 复用倍率 255x（本轮 Linux）与 §P 的 233x、§O 的 40x 都**只是旁证**，判据是
+  `session_reused`/`session_queries` 这三个结构字段 —— 三次倍率不一致恰恰证明当初把
+  时延比值写进契约是错的。
+## S. 合并 origin/master 后的结论宿主验证（xc-pc-linux，rev `7689be78`）
+
+合并把 master 的 19 个提交带进本分支（`nexus-test-review` 技能线、9 条 `scenarios/product/n2-*`、
+web-gateway 修复、commitlint 工作流），9 处冲突全部取我方快照（依据见合并提交说明：master 在
+squash 之后没再碰过这些文件，且逐文件比对后 theirs 独有行都是同一处的旧版本）。
+合并**必须**在权威宿主重验，因为冲突解决动的是 `code_intel/*.rs`、`main.rs`、`MODULE.md`。
+脚本 `/work/xc-merge-check.sh`，日志 `/work/xc-merge-check.log`。
+
+    git rev            7689be78  dirty=0
+    cargo fmt --all -- --check                        exit 0（0 行输出）
+    cargo clippy -p nexus-harness --all-targets -D warnings   exit 0，error 行数 0
+    cargo test -p nexus-harness（默认并行）             **138 passed / 0 failed**
+    cargo test -p nexus-harness -- code_intel          74 passed / 0 failed
+    master 新带来的两条管道测试，单独重复 3 次          run1/run2/run3 全 ok（2 passed / 0 failed）
+
+把"Windows 并行下偶发红"的口径在这里钉住，别被误读成本模块的回归：
+
+    宿主          并行                 串行
+    Windows 冒烟   3 红 或 5 红（不稳）  3 红（两次一致）
+    Linux 结论     0 红                  —
+    常驻 3 红 = master 自带、依赖 POSIX `echo` 的 scenario::tests::run_single_* / run_parallel_*
+    偶发 2 红 = master 新写的 run_command_ignores_stderr_for_scenario_json 与
+              run_command_orphaned_grandchild_holding_pipe_returns；两条都靠 elapsed 时间上界判定，
+              在 Windows 并行调度下不满足 nexus-test-review §3.5 的"同一输入同一输出"。
+    处置：不削弱、不改（不动时间上界、不加 #[ignore]、不改期望）。它们在 master 自己的代码上跑，
+    `git diff --stat origin/master...HEAD -- scenario.rs run_scenario.rs` 为空可证本分支没碰过那个文件。
+    这是上游测试的隔离性问题，作为独立事项提给所有者，不混进本特性。
+
+================================================================================
+§T daemon + 结果缓存实现的 Windows 冒烟复跑（2026-10-13，宿主 SH-YF-CX-PC，
+   rustc/cargo 1.95.0，host triple x86_64-pc-windows-msvc，rust-analyzer 在场）
+   运行基线：rev `4ef8a5a` + 未提交的实现工作树（dirty_state=true ⇒ 下面的
+   working_tree_digest 与 contract_hash 都是"含未提交改动"的值，别拿它们当 rev 的绑定）
+================================================================================
+
+门禁（每条都是这轮实跑，不是引用上一轮）：
+
+    cargo fmt --all -- --check                exit 0，0 字节
+    cargo clippy -q -p nexus-harness --all-targets -- -D warnings
+                                              exit 0，无输出（含新增两模块与测试目标）
+    cargo test -q -p nexus-harness            149 个 = 146 passed + 3 failed（--test-threads=1）
+                                              并行：144 passed + 5 failed
+                                              多出的 2 条 = master 自带的 run_command_ignores_stderr…
+                                              与 run_command_orphaned_grandchild…，串行全过（§S 同一条）
+                                              3 条固定失败 = POSIX echo 那三条（DEVELOPMENT.md §11.1）
+                                              新增 12 条 = cache.rs 6 + daemon.rs 6，与预期数目对上
+
+`daemon selftest --workspace engineering/nexus-harness/fixtures/code-intel --json`：
+
+    第二轮（会话池缺陷修好后）      PASS  probe_count=23  duration_ms=330653
+    第三轮（两处弱断言加严后）      PASS  probe_count=23  duration_ms=268917
+    最终码（cache_default_enabled 修正后）由场景承载：lifecycle PASS 172532ms，29/29 期望成立
+
+    逐值：start_verdict=PASS status_running_after_start=true already_running=true
+    default_path_session_source=in-process default_path_lease_absent=true
+    second_process_session_source=daemon reuse_provider_sessions=1
+    stale_lease_detected=true stale_fallback_verdict=PASS stale_fallback_session_source=in-process
+    wrong_token_rejected=true idle_self_exit_observed=true lease_removed_on_idle=true
+    stop_absent_verdict=UNKNOWN sessions_after_stop=0 lru_provider_sessions_at_capacity=1
+    cache_second_run_tier=disk cache_default_enabled=true cache_disableable=true
+    commands_surface_lists_daemon=true unknown_flag_blocked=true defaults_idle_secs=900
+    dirty_after_lifecycle=0
+
+    时延就登记为时延，不作判据。上一段三个数**不是三个同量**（round 1 的 N-3 抓的就是我把它
+    写成"同一份码同一台机器三次"）：330.7s 与 268.9s 是两次独立的 `daemon selftest --json`
+    的 `duration_ms`，172.5s 是 `code_intelligence_daemon_lifecycle` 这条**场景**的端到端耗时
+    （它内部还要再跑一次 selftest 并做 29 条期望比对）。按"selftest 自身的时延"看只有两个
+    观测点，散布 1.23 倍，不是 1.9 倍。取上界 330.7s 与 `scenario.rs` 硬编码的 600s 命令超时
+    对齐 ⇒ 余量 ~1.8x。r4 前置条件 6 要的就是这个上界，现在它有实测了：**够跑，但不宽裕**，
+    Linux 侧另测。跨宿主时延散布与冷启动预热前置（N-1）仍未登记，不作判据也不作承诺。
+
+26 条 code_intelligence_* 场景（串行批次，逐条 evidence_id 见 .evidence/）：
+
+    批次首轮（缓存字段值修正前的二进制）：25 PASS + 1 FAIL
+      FAIL = daemon-lifecycle @ failed_step=expect / assertion=cache_default_enabled
+             scenario-50981b88bd47
+    修正后单独复跑 daemon-lifecycle        ：PASS（29 条期望全成立）scenario-50981b88bd47（同 id 被覆盖，
+             这正是台账里"场景证据 ID 确定性覆盖"那条待办的现实后果，案卷得先落盘再复跑）
+    ⇒ Windows 冒烟结论：**26/26 PASS**
+
+我在这轮里错了两处，都公开记下：
+
+1. **`cache_default_enabled` 的语义被我读反**。契约清单给的是"默认允许"这个性质值 `true`，
+   我第一版把 `cache.disabled` 的原始 `false` 当观测字段发出去 ⇒ selftest 自己自洽（我连期望值
+   都按 `false` 写），是**场景**把它钉成 `equals = true` 才暴露的。修的是探针不是场景。
+   连带结论：我的 `daemon_selftest_field_list_matches_contract` 只对齐**字段名**不对齐**值**，
+   值层面目前只剩场景这一个承载体 ⇒ 已登记为待办（要不要把契约的值列也做成机器核对）。
+2. **我把"没修好"写成了"已修"**：管道句柄那条（`.agents/code-intelligence-followups.md` F-新2）
+   我登记成"本轮已做"，随后三种写法逐个实测证明 stdio 写法管不住它 ⇒ 已在原处更正为
+   "这是 Windows 的可继承句柄传播，按 forbid(unsafe_code)+零依赖的约束不修，只写明消费口径"。
+
+会话池那个真缺陷（值得留在案卷里，因为它不会被"看起来对"的实现暴露）：
+
+    症状：reuse_provider_sessions=2、lru_provider_sessions_at_capacity=2（应为 1）
+    根因：非复用分支只在"别的 workspace"里找驱逐对象 ⇒ 同一个 workspace 的失效会话（最常见是
+          working_tree 指纹变了）被**并存**而不是替换，`--max-workspaces 1` 也能被撑到 2
+    修法：先按 workspace 换掉同树的旧会话（并 absorb 它的三个 refusal 计数），再按容量驱逐别的
+          workspace；顺带给 pong 加 `session_keys` 分量 —— 加之前"为什么没复用"只能靠猜
+    复测：第二轮起两枚探针都是 1
+
+对 Phase 3/4 没有回归：mcp-handshake PASS 1511ms、mcp-real-query PASS 21026ms。
+这轮我给 `mcp serve` 的 argv 强制加了 `--no-daemon --no-cache`（契约隔离 ⑤ 的落地），
+`warm_query_roundtrip`/`provider_session_reused` 因此不可能被我自己的缓存或环境里的 daemon 糊过去。
+
+================================================================================
+§R daemon + 结果缓存在 xc-pc-linux 的结论级复跑（2026-10-13，宿主 xc-pc-linux，
+   rustc/cargo/rust-analyzer 1.98.1，x86_64-unknown-linux-gnu，
+   rev `0a42240c6d17aaab502d3bb8ac5f219a0a5b25ca`，**工作树干净 dirty=false**）
+================================================================================
+
+先记两条"差点拿到假结论"的宿主陷阱（都是实测，不是我推断的）：
+
+1. 该宿主 `CARGO_TARGET_DIR=/work/nexus-dev/target` ⇒ `cargo build` 的产物不在仓库内。
+   第一版脚本执行 `/work/nexus-ci/target/debug/nexus-harness`（10-12 19:31 的**残留旧构建**，
+   不含 `daemon`），于是 4 条 daemon/cache 场景在 ~100ms 内 FAIL、`daemon selftest` 直接 BLOCKED
+   （兜底消息里根本没有 `daemon`）。**这批 FAIL 全部作废，不作 Linux 结论。**
+2. 第二版仍失败 4 条，原因是场景命令里写的 `nexus-harness` 走 **PATH** 解析，而 PATH 上是
+   10-12 00:58 的 `cargo install` 旧版；共享 target 还在两次读取之间被别的构建覆盖过
+   （同一绝对路径 md5 从 `8f3707f8…` 变成 `bad8d5e1…`）。⇒ 第三次改成：`cargo build` 之后
+   **立刻**把产物拷成不可变副本 `/work/xc-r3-bin/nexus-harness`，把 `PATH` 钉到该目录，
+   并在案卷里留下 `ls -la` + `md5sum` + `git rev-parse HEAD`。
+   教训：**"新代码的结论"与"旧构建的结论"在只有 revision 的案卷里长得一模一样**，
+   所以被执行二进制的路径/哈希必须进案卷（已登记 F-新5，并给出承载体建议）。
+
+第三版（下面所有数字都来自这一次，被检对象 md5 `bad8d5e107e2cdad6c3233362e04d879`，
+`which nexus-harness` 确认解析到副本）：
+
+    cargo fmt --all -- --check                  exit 0，0 字节
+    cargo clippy -p nexus-harness --all-targets -- -D warnings   exit 0，无输出
+    cargo test -p nexus-harness                 串行 **150 passed / 0 failed**
+    cargo test -p nexus-harness                 并行 **150 passed / 0 failed**
+                                                （Windows 是 149 条，差 1 = #[cfg(unix)] symlink 回归，
+                                                 与既有口径吻合；Windows 上那 3+2 条假红在 Linux 不复现）
+    daemon selftest --workspace <夹具> --json   run1 **PASS probe_count=23 104784ms red 0**
+                                                run2 **PASS probe_count=23 104546ms red 0**
+    mcp selftest --json                         PASS 11 probes 177ms（eof=UNKNOWN malformed=FAIL
+                                                provider_override_honored=true stdout_frames_ok=true handled=1）
+    mcp selftest --with-query --json            PASS 14 probes 17597ms
+    verify --fast                               exit 0，**9/9 门 PASS，无 UNKNOWN**
+                                                Evidence `verify-504e9b753f70`，contract
+                                                `f8c85522d7ad3b46b65fb5630e22f763339d29bc`，
+                                                tree `d32494c7fb0973eabaf85bfe585841504bcf92b0`，
+                                                configuration `fa6c1bdb335a…`，platform `711a114fe73b…`
+    收尾健康度                                  `daemon serve` 残留 0，rust-analyzer 残留 0，
+                                                `git status --porcelain` 0 行
+
+26 条 code_intelligence_* 场景（Linux，PATH 钉住副本）：**26/26 PASS**。
+逐条要点不是"全绿"这句话，而是**两条路径都被覆盖到了**：
+
+    冷跑（真起 rust-analyzer）：cache-disabled 16818ms、daemon-explicit-only 16510ms、
+      definition 16511ms、hover 16711ms、implementations 16310ms、symbol 16610ms、
+      diagnostics-advisory 17210ms、diagnostics-item-shape 16910ms、mcp-real-query 17011ms
+      （mcp-real-query 没有被缓存代劳 ⇒ 隔离 ⑤ 在 Linux 上同样兑现）
+    回放（命中结果缓存）：budget-count / budget-truncation / callees / callers /
+      context-anchors / scope-* / read-only-counters / write-method-denied 等 **~100ms PASS**
+      —— 同一条批次的上一轮它们是 16–17s。⇒ 这就是缓存命中路径满足**冻结期望**的直接证据，
+      也是"重复 CI 复跑不再重复付索引成本"这个主张的现实数据。
+    daemon-lifecycle 104063ms（内部就是 23 枚探针，Linux 侧比 Windows 快约 2.5–3 倍）
+
+跨宿主对照（别互相对账，两套值各有语义）：Linux 的 contract/tree 来自**干净**工作树；
+Windows 的 `ef1a950b…`/`de50c865…` 来自含未提交改动的**脏**工作树且带 CRLF 口径。
+提交 marker 记 Windows 值、Linux 门禁记 Linux 值，这是既有约定，不是不一致。
+
+仍未验证（诚实边界）：第三方 MCP 客户端互操作；`verify --full` 对本 rev 无结论（余量不足）；
+结果缓存的收益只用"命中/冷跑"两组时延作**旁证**，不写进任何判据；
+daemon 场景在 Windows 上"等 EOF 的管道消费会挂住"这条已按已知效应写进契约，未修。
+
+================================================================================
+§U B-1 整改后的双宿主复跑 + 三处对 §R/§T 的公开更正（2026-10-13）
+================================================================================
+
+独立 Review round 1 判 CHANGES_REQUESTED，阻塞 1 条（B-1：sessions_after_stop 来自常量而非观测），
+整改在 rev f1575b5d。案卷 .evidence/review-qoder-independent-daemon-r1/（model=unbound）。
+
+Windows 冒烟（SH-YF-CX-PC，rustc 1.95.0，干净树）：
+
+    fmt --check 0 字节 / clippy --all-targets -D warnings 无输出 / cargo test 150 = 147+3
+    daemon selftest                     PASS 23/23  122239ms  red 0
+      dirty_after_lifecycle=0   sessions_after_stop=0（现在是观测值）
+    daemon start → 真查询 → stop         sessions_before_stop=1, sessions_after_stop=0, stop PASS
+    受 B-1 改动波及的 7 条场景重跑       全 PASS：
+      daemon-command-surface 207ms / daemon-unknown-flag 205ms / daemon-explicit-only 17994ms /
+      cache-disabled 18096ms / mcp-handshake 1312ms / mcp-real-query 20018ms / symbol 17780ms
+    lifecycle 单独一条：PASS，29 条期望全成立，scenario-9615b3a3db79，122104ms
+
+xc-pc-linux 结论级（rustc/clippy/rust-analyzer 1.98.1，rev f1575b5d，dirty=false）：
+
+    cargo test 串行 151 passed / 0 failed；并行同样 151/0 ⇒ 与 Windows 差 1 条 cfg(unix)
+    fmt 0 字节；clippy 0 字节
+    B-1 观测：start PASS → query PASS(source=daemon, 16035ms) → stop PASS，
+              reply {"sessions_before_stop":1,"sessions_after_stop":0}
+    daemon selftest 两轮 PASS 23/23（104146ms / 103018ms），red 0
+    26 条 code_intelligence_* 26/26 PASS（含 daemon-lifecycle 与两条 mcp）
+    verify --fast：9/9 门 PASS，无 UNKNOWN，Evidence 9221774f1958，
+              contract f8c85522d7ad3b46b65fb5630e22f763339d29bc（与 §R 同值 ⇒ 契约集未变，符合预期），
+              tree fc5249ce0c06e9ff630f1d07a0cc072073a8fa8f
+    收尾：daemon serve 残留 0、rust-analyzer 残留 0、git status --porcelain 0 行
+
+三处更正（我自己写错的记录，按"旧实测错了要公开更正"的规矩原样列出）：
+
+1. §R 把 Linux 那批假红归因给"PATH 上的 cargo install 旧版"，机制说错了。
+   scenario.rs 会把命令里的 nexus-harness 替换成 std::env::current_exe()，所以真正的来源是
+   "哪个二进制在跑 scenario run"：我执行的路径当时是旧构建，子进程就跟着是旧的，与 PATH 无关
+   （Windows 侧 PATH 上根本没有 nexus-harness）。结论不变（那批不作数、修法仍是冻结副本 +
+   核 md5/mtime），但机制要说对，否则下一个人会去查 PATH 而不是查被执行的二进制。
+2. §T 的"26/26 PASS"与"夹具冷启动 15–40s"缺宿主暖度前提。同一份代码本机 selftest 时长实测
+   121–331s（2.7 倍差），round 1 评审者在负载下复跑还看到 3 条场景 FAIL 与一次 220.8s 的
+   TIMEOUT/ready=false（与并行的 verify --fast 抢 CPU/磁盘很可能相关）。
+   ⇒ 冷启动时延一律只作旁证；E4 结论要注明当时有无并发构建/门禁在跑（§S 那条的延伸）。
+3. dirty_after_lifecycle 的差集判据在 B-1 复测里第一次就跑红了，报
+   新增：[" M .agents/provider-daemon-and-result-cache-plan.md"] —— 是我在 121s 探针窗口里改了
+   工作树，不是 daemon 写的。判据行为正确（"相对开始前有变更"为真），但暴露它**无法区分谁改的**：
+   任何并发编辑都会被算到生命周期头上。已在干净树复测取到 0，并把"跑 daemon selftest 期间
+   不得编辑工作树、也不得并发跑 git 写操作"并入 §S 的并发规矩。
+
+未验证边界不变（第三方 MCP 客户端互操作、本 rev 的 verify --full、多语言 provider）；
+新增一条：daemon 在负载宿主上的"connect 超时 vs 被拒"分类虽已按 ConnectionRefused 收紧，
+但 OPEN-1 的完整复现（活 daemon 被误判为残留）我**没有**再造出来一次，只做了机理修正。
+
+================================================================================
+§V round 2 整改后的 Windows 冒烟复跑（2026-10-13，宿主 SH-YF-CX-PC，
+   rustc/cargo 1.95.0，host triple x86_64-pc-windows-msvc，rust-analyzer 1.95.0 在场）
+   运行基线：rev `4b61987`（round 2 整改提交），工作树 **clean**
+   被测二进制（N-r2-5 起的新记法：每条运行结论都必须带同一次跑的路径+md5+mtime）：
+     path  = D:/next/ci-p24/target/debug/nexus-harness.exe
+     md5   = 0f610087190b40fdc733a754478035e7
+     mtime = 2026-10-13 06:43（还原 61s 反证补丁之后重新 build 的那一份）
+     size  = 6569984 bytes
+   本机 contract_hash = ef1a950bca55d2ffb7729ac700c051be684f65c3
+   本机 working_tree_digest（clean @ 4b61987）= c1189dd845c35205eabce77c1ec65ad4b7914dc0
+   ⇒ 与 Linux 侧 §U 的 f8c85522… / §R 的 78981c3f… **不是同一量的两次测量**（工作树字节 + 行尾差异），
+     不要互相对账；口径见 DEVELOPMENT.md §11.1。
+================================================================================
+
+门禁（本轮实跑，逐条取退出码而不是看尾巴输出）：
+
+    cargo fmt --all -- --check                0 字节（干净）
+    cargo build -q -p nexus-harness           exit 0
+    cargo clippy -q -p nexus-harness --all-targets -- -D warnings
+                                              exit 0，输出 0 字节
+    cargo test -q -p nexus-harness -- --test-threads=1
+                                              **152 个 = 149 passed + 3 failed**，46.89s
+                                              3 条固定失败 = master 自带、依赖 POSIX echo 的
+                                              `scenario::tests::run_single_*`/`run_parallel_*`
+                                              （DEVELOPMENT.md §11.1 已披露，未削弱）
+                                              较上一档 150 的增量 = 本轮新增的 2 条单测
+
+两枚新单测**逐名实跑**（不是只在源码里存在）：
+
+    code_intel::daemon::tests::silent_daemon_probe_returns_within_the_probe_budget  ok  10.00s
+    code_intel::daemon::tests::takeover_flag_is_valueless_and_refused_on_serve_entry  ok  0.00s
+
+    反证（这条测试能不能变红）：把 `PROBE_READ_TIMEOUT` 从 10s 临时改成 **61s**
+    ——"两档预算并回一档"的等价代理，真用 900s 跑一次太贵——该测试
+    FAILED：`探活等了 61.0098391s：握手档被换回查询预算（900s）了`，随后从
+    /tmp/daemon.rs.bak-v 还原并重新 build（还原后 md5 见上）。它不是一条只会绿的断言。
+
+N-r2-2 的真实 CLI 三档观测（**stdout 走文件而不是管道**，见下方 F-新2 那条计时警告）：
+夹具 = 一个 accept 之后永不回帧的监听者，租约手工写进私有命名空间指向它。
+
+    status                     10.2s   UNKNOWN，daemon.running=false，
+                                       daemon_unavailable 带"握手失败…header read failed"
+    start（无 flag）           10.2s   UNKNOWN，**租约仍是那份假的**（不起第二个监听者）
+    start --takeover           20.3s   PASS，租约换代 61735 ⇒ 61900，daemon.running=true
+    code symbol Egress         18.1s   PASS，daemon.session_source="daemon"，
+                                       provider.session_reused=false，session_queries=1
+    code symbol Ingress（同池）15.6s   PASS，session_reused=true，session_queries=2
+    daemon stop                 0.42s  PASS，sessions_after_stop=0，
+                                       stop_reply={sessions_before_stop:1, sessions_after_stop:0}
+                                       （回收观测仍是**唯一出处** stopped 帧 ⇒ N-r2-1 生效），租约已删
+
+    同一步骤在**管道 stdio** 下测到 240s（那是脚本自己的 timeout 到点，不是命令耗时）⇒ 这就是
+    F-新2 记的"daemon 继承调用方可继承的 stdout 管道句柄"的效应。以后凡是给 daemon 相关命令计时，
+    **必须以文件 stdio 为准**，管道里的数字是句柄生命周期，不是延迟。
+
+`daemon selftest --workspace engineering/nexus-harness/fixtures/code-intel --json`（干净树）：
+
+    verdict=PASS  probe_count=23  红 0 枚  duration_ms=126721（2m10s）
+    sessions_after_stop=0  dirty_after_lifecycle=0  cache_second_run_tier=disk
+    snapshot.source_revision=4b61987292e4d1ac9aa109946b629e319a159d50  dirty_state=false
+
+26 条 code_intelligence_* 场景（串行批次，Windows 冒烟口径，非结论级）：
+
+    **25 PASS + 1 FAIL**
+    FAIL = engineering.code-intelligence-diagnostics-advisory @ failed_step=expect /
+           assertion=verdict，41308ms，evidence_id=scenario-913ca46600cd
+      载荷实况：`error.code=TIMEOUT`，reason="textDocument/diagnostic 在 20s 内未响应，
+      已发送 $/cancelRequest"；`provider.ready=true`、`duration_ms=37585`、
+      `server_requests_unhandled=2`、`count=0` ⇒ 不是"没就绪就采信空结果"，是**取诊断这一步超时**。
+      期望是 `verdict one_of ["PASS","FAIL"]`，实际得 UNKNOWN ⇒ 断言失败（方向安全：它红了）。
+    复跑与判因（三步，别把第一步当独立重复）：
+      ① 单条 `scenario run` ⇒ PASS 1007ms —— **这条是缓存回放**（同参数手工 `code diagnostics`
+         实测 `cache.tier=disk`、`provider.duration_ms=364`），回放不能算一次独立重复。
+      ② 独立重复 = `code diagnostics … --no-cache` ⇒ **PASS**，tier=miss + disabled=true，
+         22.0s，count=1，ready=true ⇒ 新鲜路径本身是通的。
+      ③ 负载来源：本机同时有**另一个会话**的 `nexus-harness.exe verify --fast`（PID 40100，
+         跑在 D:\next\nexus，不是本任务的进程，我没有动它）在跑，rust-analyzer flycheck 与它
+         争 CPU/target 锁。与 §T 的 N-1（"冷启动/负载前置条件未登记"）同域。
+    处置：**不改判据、不降超时、不削断言**，只如实登记为"负载宿主上这条可假红"。
+    记录警告：FAIL 与复跑 PASS 的 evidence_id **同为** scenario-913ca46600cd（确定性 id，
+    种子不含工作树指纹）⇒ PASS 已原地覆盖 FAIL 的落盘记录，FAIL 的数值只存在于本段。
+
+Windows 结构性限制不变：`verify --fast` 在本宿主不可跑（nexus-platform-linux 的 fuser 依赖 +
+apps/nexus/examples/discovery_mdns.rs 的 Unix-only std::os::fd），Linux 结论级复跑另见 §W。
+
+公开更正（对**我自己的历史记录**，不是对测量值）：`.githooks/commit-msg` 的 type 分类法是
+`feature|bug|refactor|test|docs|performance|dependency|requirement-change`，而这三笔不合：
+    0a42240 `feat(...)`   应为 `feature(...)`
+    f1575b5 `fix(...)`    应为 `bug(...)`
+    4b61987 `fix(...)`    应为 `bug(...)`
+`fix` 还正好落在它的模糊主题黑名单里。根因是仓库没装 hooks（`core.hooksPath` 未设），而我
+手工调 `pre-commit` 却在**提交之后**才调 `commit-msg`（4b61987 就是这样才发现的）。
+三笔都未推送，但按"不重写历史、破坏性动作先问"的规矩我没有原地改；要不要本地 rebase 改 subject
+归所有者定。往后我自己的口径：**commit-msg 必须在提交前用同一份消息文本跑通**。
+【2026-10-13 推送后更新】本分支已推到 `origin/feature/code-intel-phase-234`，
+上面那句"未推送/本地 rebase"当时为真、现已过期：修正这三笔现在需要**改写已发布历史 + force-push**。
+合法 type 的正确值也已在 §X 更正为 `bugfix`（我第一次写成了 `bug`）。当前口径与状态见
+`docs/CODE-INTELLIGENCE-KNOWN-ISSUES.md` 的 G4/G4b。
+
+================================================================================
+§W round 2 整改后的 xc-pc-linux **结论级**复跑（2026-10-13，宿主 xc-pc-linux，
+   rustc/cargo 1.98.1，host triple x86_64-unknown-linux-gnu，rust-analyzer 1.98.1 在场，
+   node v10.19.0）
+   运行基线：rev `97ecbe59`（= 4b61987 的整改 + §V 台账提交），工作树 **clean**
+   被测二进制（一次跑一份，N-r2-5 记法）：
+     path  = /work/xc-v-bin/nexus-harness   （从 /work/nexus-dev/target 的构建**冻结副本**，
+              PATH 钉死 `which=/work/xc-v-bin/nexus-harness`，避开 §U/F-新5 那两个旧二进制陷阱）
+     md5   = 60819c3e508cbef90a9a9a63c3fd422f（复跑 N-r2-2 前后各核一次，两次一致）
+     mtime = 2026-10-13 07:20:24 +08:00
+     size  = 86044232 bytes
+   本机 contract_hash = f8c85522d7ad3b46b65fb5630e22f763339d29bc
+   本机 working_tree_digest（clean @ 97ecbe59）= 6159e482535d9c3481f32c922b570dfd1c7ad4d0
+   ⇒ 与 Windows §V 的 ef1a950b… / c1189dd8… 不是同一量的两次测量，**不要互相对账**。
+================================================================================
+
+门禁：
+
+    cargo fmt --all -- --check                     0 字节
+    cargo clippy -q -p nexus-harness --all-targets -- -D warnings
+                                                   exit 0，输出 0 字节
+    cargo test -q -p nexus-harness（串行）         **test result: ok. 153 passed; 0 failed** 20.44s
+    cargo test -q -p nexus-harness（并行）         **test result: ok. 153 passed; 0 failed** 10.03s
+    ⇒ 与 Windows 的 152 差 1 条，正好是 `#[cfg(unix)]` 的真实符号链接越界回归，口径吻合；
+      串并与行一致 ⇒ 这条不是被调度抖出来的。
+
+两枚新单测逐名实跑（`--bin nexus-harness`，串行）：
+
+    silent_daemon_probe_returns_within_the_probe_budget                ok  10.25s
+    takeover_flag_is_valueless_and_refused_on_serve_entry              ok  0.00s
+    ⇒ 探活预算在两宿主上都落在 ~10s 一档（Windows 10.00s），不是"只在某台机成立"的断言。
+
+N-r2-2 的真实 CLI 三档（**file stdio**；夹具 = accept 后永不回帧的监听者）：
+
+    status                     10.1s   UNKNOWN，daemon.running=false，原因带"握手失败…header read failed"
+    start（无 flag）           10.2s   UNKNOWN，**租约仍指向那个假端口**（没起第二个监听者）
+    start --takeover           20.7s   PASS，租约换代 33075 ⇒ 46255，daemon.running=true
+    code symbol Egress         16.7s   PASS，daemon.session_source="daemon"，reused=false，queries=1
+    code symbol Ingress        15.2s   PASS，reused=true，queries=2
+    daemon stop                 0.25s  PASS，sessions_after_stop=0，
+                                       stop_reply={sessions_before_stop:1, sessions_after_stop:0}，租约已删
+
+    这一档**第一版脚本没跑起来**（见文末"运行期缺陷"），上面数字是改脚本后重跑的；
+    重跑前后被测物 md5 复验一致 ⇒ 不是换了一份二进制再说话。
+
+B-2 / N-r2-1 的活 daemon 观测（默认命名空间，非 selftest 的私有命名空间）：
+
+    daemon start   ⇒ PASS running=true port=34621
+    code symbol Egress --no-cache ⇒ PASS，session_source=daemon，reused=false，16.5s
+    daemon stop    ⇒ PASS，after=0 / before=1，stopped 帧是唯一出处
+    CLI 侧 daemon.provider_sessions=0（**带出的观测**，不再是对空池二次 drain 的恒 0）
+
+`daemon selftest`（同一冻结二进制，跑两次）：
+
+    run1: verdict=PASS probe_count=23 红 0 枚 duration_ms=108561
+    run2: verdict=PASS probe_count=23 红 0 枚 duration_ms=106916
+    ⇒ 散布 1.02x；与 §V 的 Windows 126.7s 是**跨宿主**差，不是同量散布，不并成一个数。
+
+26 条 code_intelligence_* 场景：**26/26 PASS，0 条非 PASS**（串行批次）
+
+    关键条：daemon-lifecycle scenario-ea626adab72b 102765ms；
+    diagnostics-advisory scenario-835549786d4c 16710ms —— 这条在 §V 的 Windows 上是
+    **负载假红**（20s 取诊断超时），在本宿主新鲜跑通，且这里 `--no-cache` 路径与缓存路径都在
+    cache-disabled 场景里单独钉过 ⇒ Windows 那条 FAIL 的判因（宿主争用）成立。
+    其余 id 全在 /work/xc-v-linux.log 的 scenarios 段。
+
+`verify --fast`：**overall PASS，9/9 门，无 UNKNOWN**
+    Evidence id = c9a664695f85
+    bindings: contract f8c85522d7ad3b46b65fb5630e22f763339d29bc /
+              tree 6159e482535d9c3481f32c922b570dfd1c7ad4d0 /
+              rev 97ecbe590808d14920564c620db632b998145424 / dirty false /
+              triple x86_64-unknown-linux-gnu / toolchain 1.98.1
+
+`verify --full`：**本 rev 没跑，且不是忘了跑** —— /work 实测只剩 23G（上一轮记录要 ≥45G），
+    跑法会半途 OOS 掉磁盘并把 Evidence 写成残缺。宁可留"无 --full 结论"，不交一份会自毁的门禁。
+
+善后：daemon_serve_left=0，/tmp 下自建命名空间 0 个（清理是脚本自己做的，不是靠人记）。
+
+运行期缺陷（公开，属我这轮的工具使用错误而不是被测物缺陷）：N-r2-2 那档第一版脚本用了
+`fs.rmSync`，而远端是 **node v10.19.0**（没有该函数）⇒ 整块 `TypeError` 退出，
+**没有产生任何观测**（症状是那一段只留一行报错）。我按本机 node 24 的 API 假设了远端。
+处置：脚本自带递归 `rmrf` 后重跑，得到上面数字。教训两条：① 远端工具链版本必须**实测**，
+不能从"我们两台机都是开发机"推；② 观测缺失要在台账里写成"第一版没跑起来"，
+而不是事后只放一个数字 —— 否则读者会以为它一次就过了。
+
+================================================================================
+§X 独立评审 round 3（末轮）的整改与双宿主复跑（2026-10-13）
+   对象 rev：`76cb129`（bugfix：B-3 + 租约归属 + 3 枚新承载体）
+   案卷：`.evidence/review-qoder-independent-daemon-r3/`（CHANGES_REQUESTED，
+   1 阻塞 B-3 / 11 非阻塞 / 10 条明写未复现；model=unbound；审查宿主 SH-YF-CX-PC，
+   rustc/cargo 1.95.0）。**§19.1 的 3 轮在这一对象上用尽 ⇒ 本笔整改没有第 4 轮独立复核，
+   完成判定归所有者。**
+================================================================================
+
+被测物（两宿主各一份，跑前跑后各核一次 md5）：
+
+    Windows  D:/next/ci-p24/target/debug/nexus-harness.exe
+             md5 3303a35e36cac030e390056f46d3e6d8  mtime 2026-10-13 08:30  size 6570496
+    Linux    /work/xc-x-bin/nexus-harness（冻结副本 + PATH 钉死）
+             md5 536eae9e99f7144fc8634113c74b2234  mtime 08:46:09+08:00  size 86053616
+
+Windows 冒烟（rustc 1.95.0；工作树内容即本提交，测量在提交前一刻的同一份源码上）：
+
+    fmt 0 字节；clippy --all-targets -D warnings exit 0 / 0 字节
+    串行 155 = **152 passed + 3 failed** 75.93s；并行 155 = 152 + 3 30.15s
+    ⇒ 本轮**并行没有多红**：`145 + 5` 那一档是负载相关的间歇现象，不是固定差值
+      （MODULE.md 里写死的那句已改掉）。3 条固定失败仍是 master 自带 POSIX echo。
+    12 枚 code_intel::daemon 单测逐名 ok（含新增 3 枚）。
+    `daemon selftest`（干净树，rev 76cb129）：PASS 23/23 红 0，duration_ms=134587，
+      sessions_after_stop=0，dirty_after_lifecycle=0，cache_second_run_tier=disk。
+    26 条场景 **26/26 PASS**（Windows 上 `diagnostics-advisory` 本轮 18515ms 新鲜 PASS，
+      §V 那条负载假红未复现；批次里 `daemon-lifecycle` 121675ms）。
+      逐条 id：budget-count 1930becd948e / budget-truncation 08d03453a14e / cache-disabled
+      450e2db98486 / callees 213847867079 / callers 837293f7c02d / context-anchors
+      5cf32f0a292d / context-no-fake-semantics 0ce7b9b7cdb5 / context-scope-guard
+      c61ebe1fa4ae / daemon-command-surface c3cdcc249a05 / daemon-explicit-only
+      6e4fc4ca9b2d / daemon-lifecycle 65515e220eac / daemon-unknown-flag 7bf234319a0e /
+      definition a71b87e239f7 / diagnostics-advisory 07d765ab0901 / diagnostics-item-shape
+      b79199890f93 / hover 3b2ce95cea16 / implementations 26e9110fddb1 / mcp-handshake
+      8f452fcc9b35 / mcp-real-query 9da41414824c / provider-unavailable 6df3984ef795 /
+      read-only-counters 59d5355cf157 / scope-escape 269069b4f93f / scope-violation
+      1b9a767dcb5a / symbol 2369d6b6388c / workspace-escape 4838dcda2701 /
+      write-method-denied 204fd31c9866。
+
+Linux 结论级（rustc/clippy/RA 1.98.1，rev 76cb129，工作树 clean）：
+
+    串行 **156 passed / 0 failed** 50.35s；并行 156 / 0 30.04s；fmt 0 字节；clippy exit 0/0 字节
+    12 枚 daemon 单测 ok；`daemon selftest` 两轮 23/23 红 0（104959ms / 103558ms）
+    26 条场景 **26/26 PASS**
+    `verify --fast` **PASS，9/9 门，无 UNKNOWN** ⇒ Evidence **5f1621fa5f1f**，
+      contract f8c85522d7ad3b46b65fb5630e22f763339d29bc / tree 4f729a57ef2538a4417a968cdcbc897951ba9920 /
+      rev 76cb129… / dirty false / x86_64-unknown-linux-gnu / 1.98.1
+    善后：daemon_serve_left=0，临时命名空间 0 个，/work 剩 23G。
+
+**对既有口径的精确化**（更正的是说法，不是数字）：同一 rev 的**干净树**上两宿主的
+`working_tree_digest` **相同**（都是 `4f729a57ef25…`），而 `contract_hash` 仍不同
+（Windows `ef1a950b…` / Linux `f8c85522…`）。⇒ 跨宿主无条件不同的是 **contract_hash**
+（按工作树字节算，Windows 是 CRLF）；`working_tree_digest` 只在**脏树**上分叉。
+§V/§W 那句"两套值别互相对账"仍然成立，但成立理由只对 contract_hash 是无条件的。
+
+B-3 的四个形状（评审实测；本轮**只改契约文本**，实现/单测/场景期望都没动）：
+
+    ready 之后 stop 无应答（EOF）  ⇒ sessions_after_stop = -1 + UNKNOWN              （①）
+    连上但永不回帧                 ⇒ 字段缺席 + UNKNOWN，未删租约                     （②）
+    连上但答 refused / 不合格帧     ⇒ 字段缺席 + UNKNOWN，未删租约                     （②）
+    端口被拒                       ⇒ 字段缺席 + UNKNOWN + stale_lease=true + 删租约    （②）
+    新承载体 `stop_after_a_ready_frame_reports_minus_one` —— ①原先在仓内**没有任何**承载体。
+    夹具约束记下来以免后人重踩：必须**先正确应答 hello**，再在 stop 请求上关连接；
+    用"永不答话"会落到 ②，而 stop 档读预算是 900s ⇒ 那种形状做单测会挂 15 分钟而不是变红。
+
+N-r3-5 / N-r3-6 的归属守卫：**两宿主各跑了一次"两个真 daemon 交接"的活体实验**
+（造法：A 正在服务一条 15-25s 的真查询 ⇒ 单线程 accept 被占住 ⇒ 探活 10s 超时 ⇒
+ 看起来"连得上但不答话" ⇒ 这时 `--takeover` 才够格换代）：
+
+    Windows：A 50774/3e12a463 → B takeover 50817/d10e1767（11.7s PASS）→ B 查询写 1 个缓存文件
+             → 等 40s（A 的 idle=25s 到点自退出）→ lease 仍在且 token 仍是 B ✅，
+             B status PASS running=true sessions=1，**缓存文件仍在**（1 个）✅
+             → stop B：PASS after=0，由持有者清掉租约与缓存 ✅
+    Linux：  A 36827/3548eb14 → B 39427/c597e042（10.3s PASS）→ 同样 token 保持 B、
+             cache 文件数 1 不变 → stop B 后 lease_gone=true cache_gone=true ✅
+    对照（整改前，评审案卷 tk2-status.json）：旧实例 idle 退出后 `lease.json` 消失、
+    `ns/cache` 消失，而留守 daemon 仍在监听 ⇒ `daemon status` 报"没有 daemon 在跑"。
+    **这一条有前后对照，不是只改了代码就算修好。**
+
+N-r3-8：探活预算测试移到工作线程 + 60s 有界等待 ⇒ "干脆不设读超时"这种回归现在会**红**而不是
+把 `cargo test` 挂住。61s 代理反证仍有效（案卷判它可接受：60s 上界严格夹在 10s 与 900s 之间）。
+
+11 条非阻塞的逐条处置（能修的修，修不了的不写成已修）：
+
+    N-r3-1  **只声明不改动**：契约新增 `daemon.provider_sessions` 的 0 有两种出处（观测 / 本次没问到），
+            并禁止把后者读成"池子为空"。改成"无出处即缺席"要动 DTO 形状（15 处构造点），
+            按本模块规矩另开 Contract-First 周期。**这条没被修好，只是不再被隐瞒。**
+    N-r3-2  已修：负数原样透传，`daemon_unavailable` 分成"有非负值 / 帧内是负数 / 帧内没有这个量"
+            三种说法，同一 envelope 不再自相矛盾。
+    N-r3-3  已修（新承载体，见上）。
+    N-r3-4  已修：`may_replace_unanswered_lease` + 四格真值表单测；牙齿在于调用点若绕开这个私有函数，
+            它就成了未使用项 ⇒ `clippy -D warnings` 的 dead_code 直接红。
+            诚实边界：钉住的是**判定**，不是"真的换掉了活 daemon 的租约"那条端到端路径；
+            后者由活体实验覆盖（实测记录，不是门禁）。
+    N-r3-5  已修 + 两宿主活体反证。
+    N-r3-6  已修：心跳走同一归属判定，被换代后不再写回。
+    N-r3-7  **未修，也不写成已修**：`daemon serve` 的 `provider_sessions` 现在取自带出的观测
+            （不再是对空池二次 drain 的恒 0），但"它可以是真的非 0"仍**无承载体** —— 要证它得造一个
+            "有序关闭后仍活着"的子进程，两宿主都造不出（评审同样造不出，其 unverified 第 4 条）。
+            把 `unwrap_or_else` 改回无条件 drain 会不会全绿，只能静态推定。
+    N-r3-8  已修（见上）。
+    N-r3-9  未改，登记待办：daemon 握手超时/沉默复用 `PROVIDER_CRASHED` 码，读起来像 provider 崩了。
+            改它要动错误码词表（契约面），与 N-r3-1 同类，另开周期；本轮只在文案里保留真实出处
+            （"握手失败…header read failed"）。
+    N-r3-10 ① `core.hooksPath` 未设 ⇒ 分类法在本地没有机器承载体（装 hooks 属所有者决定，我没装）。
+            ② **§V 的更正本身写错了**：合法 type 是 `bugfix` 而不是我写的 `bug`
+            （`.githooks/hook-common.sh:25`：`feature|bugfix|refactor|test|docs|performance|dependency|
+            requirement-change`）。故 `f1575b5`/`4b61987` 的正确 type 应是 `bugfix`；
+            本笔 `76cb129` 起用 `bugfix` 并在提交前过 commit-msg。
+    N-r3-11 已修：MODULE.md 给 §W 加了 provenance 段（被审方一手实跑，独立案卷标为未复现）。
+
+仍未验证（不当作已通过）：第三方 MCP 客户端互操作；本区间 `verify --full` 无结论（/work 23G，
+需 ≥45G）；真非 0 的回收观测在两宿主都未出现过；`--takeover` 的端到端路径只有活体实验而无门禁；
+**§X 之后没有第 4 轮独立复核可用** —— 本笔整改的完成判定归所有者。
