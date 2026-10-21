@@ -1,0 +1,11 @@
+# Nexus Fabric 工具链版本锁定
+# 所有 agent（本地 / 云端 / CI）必须使用相同 Rust 版本，
+# 确保编译结果、clippy 告警、verify Evidence 跨平台可比。
+#
+# 与 DEV-ENV.md 中远程 Linux 环境一致（rustc 1.98.1）。
+# cargo-fuzz 仍显式使用 +nightly，不受此锁定影响。
+
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]
+targets = ["x86_64-unknown-linux-gnu"]

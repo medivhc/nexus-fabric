@@ -1,0 +1,76 @@
+schema_version = 1
+id = "product.proxy-outbound-vless-flow"
+title = "节点加密出站数据面：SOCKS5 会话经 VLESS 明文隧道出站（loopback vless 节点 + echo 目标）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-vless-dataplane"
+
+[given]
+topology = "same-process loopback 127.0.0.1: echo target + local VLESS plaintext node (tls=false) + nexus proxy (outbound=vless-node) + raw SOCKS5 client"
+offline = "no public network; std::net::TcpStream + threads, joined"
+config = "outbound kind=vless, uuid=123e4567-e89b-12d3-a456-426614174000, tls=false, flow=''"
+
+# 可执行 E4：nexus proxy 数据面（PRODUCT §11.20，retrospective）配置 outbound=vless 指向
+# 本地 VLESS 明文节点；原始 SOCKS5 客户端经 proxy 访问 loopback echo。断言：VLESS 节点
+# 实际收到连接（vless_server.connected）、请求头目标送达（target_delivered_ok，
+# target_label=ipv4:127.0.0.1）、payload 经隧道往返、routing.selected_outbound_tag=vless-node、
+# routing.outbound_kind=vless。旧实现（vless 走 ConnectivityEstablishmentFailed 兜底）下
+# proxy 直接结构化失败 -> verdict FAIL（Red Evidence）。
+[when]
+command = "cargo run --quiet -p nexus --example proxy_outbound_vless_flow -- --json"
+
+# 冻结期望（Spec-Freeze）：明文路径 tls=false、flow=''，不涉及证书。
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "vless_server.connected"
+equals = true
+
+[[expect]]
+field = "vless_server.target_delivered_ok"
+equals = true
+
+[[expect]]
+field = "vless_server.target_label"
+equals = "ipv4:127.0.0.1"
+
+[[expect]]
+field = "client.auth_ok"
+equals = true
+
+[[expect]]
+field = "client.connect_ok"
+equals = true
+
+[[expect]]
+field = "client.payload_roundtrip_ok"
+equals = true
+
+[[expect]]
+field = "routing.selected_outbound_tag"
+equals = "vless-node"
+
+[[expect]]
+field = "routing.outbound_kind"
+equals = "vless"
+
+[[expect]]
+field = "outbound.kind"
+equals = "vless"
+
+[[expect]]
+field = "outbound.tls"
+equals = false
+
+[[expect]]
+field = "outbound.flow"
+equals = ""
+
+[[expect]]
+field = "bytes.to_upstream"
+non_empty = true
+
+[[expect]]
+field = "bytes.to_client"
+non_empty = true

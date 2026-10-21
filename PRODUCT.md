@@ -1053,6 +1053,47 @@ TCP accept（apps/nexus，非 portable I/O）
   到上游的完整 body/chunked 处理（本期透传字节）、HTTP/2、端口复用之外的独立 HTTP 监听口。
 
 
+### 11.20 VLESS 明文出站数据面（retrospective，2026-10-18） {#11-vless-dataplane}
+
+> **追认性规范（retrospective）**：本节是**规范追上现实**的追认性补充，不是"先有规范
+> 后有实现"的契约先行交付。VLESS 明文出站数据面的实现（`apps/nexus/src/lib.rs` 的
+> `OutboundKind::Vless` 分派分支，`nexus-outbound-vless` crate）与 crate 层测试
+> （35/35 通过）均先于本节存在。本节只将既有实现的可观察语义固化为规范文本，供 E4
+> 场景引用，不新增任何实现承诺。
+
+§11.16 声明的节点加密出站数据面按 `selected_outbound.kind` 分派真实隧道；其中 VLESS
+分支由本节独立固化。数据面链路（`tls: false` 明文路径）：
+
+```text
+SOCKS5 入站（Socks5Handshake，§11.4 不变）
+  -> FlowContext -> 规则路由（§11.1 纯决策，零改动）
+  -> 选定 outbound kind=vless（tls=false）：
+       TcpStream::connect(node.locator)                   建连
+       + 编码 VLESS 请求头（UUID + flow addon + TCP 命令 + 目标地址）
+       + 写请求头（vless_handshake_stream）
+       + 阻塞读一次消费响应头（version 0 + addon）
+       + 双向透明中继（vless_pump_stream；client <-> 节点）
+  -> 双向字节中继（客户端 <-> 节点隧道）
+```
+
+- **配置**：复用 `OutboundConfig` 既有字段。`kind: vless` 必填 `locator`（节点
+  host:port）与 `uuid`（标准带连字符或 32 位纯 hex，大小写不敏感）；`tls` 缺省
+  `false`（走明文路径）；`flow` 缺省空（`xtls-rprx-vision` 要求 `tls: true`，
+  否则结构化失败）；`servername` 可选，作 SNI（缺省取 locator host）；`skip_cert_verify`、
+  `obfs` / `obfs_key` 可选。Vision 传输层 splice 未实现，`flow=xtls-rprx-vision`
+  当前仅编码握手 addon 并做普通中继（后续增强）。
+- **可观察**（与 §11.16 一致）：`routing.outbound_kind` = `vless`、
+  `routing.selected_outbound_tag` = 选定出站 tag；`outbound` 输出 `{ kind, node_locator,
+  tls, sni, skip_cert_verify, flow }`。
+- **失败语义**：节点建连失败 / 请求头编码失败 / 握手失败 / 中继失败 →
+  `ConnectivityEstablishmentFailed { provider: <selected outbound tag> }`，会话级
+  结构化 FAIL，不静默直连。
+- **E4 场景**：`scenarios/product/proxy_outbound_vless_flow.toml`——loopback：echo
+  目标 + 本地 VLESS 明文节点（`tls: false`）+ nexus proxy（配置 outbound=vless →
+  本地节点）+ 原始 SOCKS5 客户端经 proxy 访问 echo；断言 VLESS 节点收到连接、
+  请求头目标送达、payload 经隧道往返、`routing.outbound_kind=vless`。
+
+
 ## 12. 虚拟子网组网（Virtual Subnet Networking） {#12-virtual-subnet-networking}
 
 在既有远程资源访问闭环（§6）和代理内核（§11）之外，新增第三条产品线：

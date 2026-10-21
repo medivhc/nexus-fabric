@@ -410,6 +410,16 @@ pub fn verify(sub: &str) -> Outcome {
             );
         }
     };
+    // 契约 §5.1 / evidence.schema.json：回读刚落盘的 evidence，核对 10 个
+    // required 字段全部被真实填充。残缺即 BLOCKED（fail-closed）——宁堵一次
+    // 验证，也不放行绑定不全的证据（STALE 判定依赖这些绑定字段）。
+    if let Some(problem) = evidence_conformance(&config, &id) {
+        return (
+            "BLOCKED".to_string(),
+            problem,
+            vec![("gates".to_string(), gates_json(&gates))],
+        );
+    }
 
     let extras = vec![
         ("gates".to_string(), gates_json(&gates)),
@@ -535,5 +545,363 @@ fn aggregate(cmd: &str, gates: &[Gate]) -> Outcome {
             ),
             vec![("gates".to_string(), gates_json(gates))],
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// evidence 绑定契约（docs/e2e-test-system-contract.md §5.1）：
+// engineering/evidence-schema/evidence.schema.json 的 10 个顶层 required
+// 字段必须被真实填充，否则 STALE / status 等下游判定失去根基。
+// ---------------------------------------------------------------------------
+
+/// evidence.schema.json 顶层 10 个 required 字段的填充校验。
+///
+/// 实际落盘布局（evidence.rs）：`summary.json` 持 `schema_version` /
+/// `verdict` / `id`（schema 的 `verification_id`）与 `bindings{...}`
+/// （`source_revision` / `working_tree_digest` / `configuration_digest` /
+/// `feature_set` / `target_triple` / `toolchain_version`）；`gates.json`
+/// 持 `checks`（`gates` + `scenarios` 两个数组）。
+///
+/// 返回缺失/空/非法的字段清单（按 schema 字段名）；空 vec = 全部填充。
+fn evidence_missing_required_fields(summary: &Value, checks: &Value) -> Vec<String> {
+    let mut missing: Vec<String> = Vec::new();
+    let non_empty_str =
+        |v: Option<&Value>| v.and_then(Value::as_str).is_some_and(|s| !s.is_empty());
+
+    if summary.get("schema_version").and_then(Value::as_i64) != Some(1) {
+        missing.push("schema_version".to_string());
+    }
+    // verdict：存在、非空且属于 harness.toml [evidence].verdicts 枚举。
+    match summary.get("verdict").and_then(Value::as_str) {
+        Some("PASS" | "FAIL" | "STALE" | "UNKNOWN" | "BLOCKED") => {}
+        _ => missing.push("verdict".to_string()),
+    }
+    if !non_empty_str(summary.get("id")) {
+        missing.push("verification_id".to_string());
+    }
+    let bindings = summary.get("bindings");
+    for field in [
+        "source_revision",
+        "working_tree_digest",
+        "configuration_digest",
+        "target_triple",
+        "toolchain_version",
+    ] {
+        if !non_empty_str(bindings.and_then(|b| b.get(field))) {
+            missing.push(field.to_string());
+        }
+    }
+    let feature_set = bindings
+        .and_then(|b| b.get("feature_set"))
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty());
+    if !feature_set {
+        missing.push("feature_set".to_string());
+    }
+    // checks：verify 至少常驻 whitespace gate，故 gates 数组必非空。
+    let has_checks = checks
+        .get("gates")
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty());
+    if !has_checks {
+        missing.push("checks".to_string());
+    }
+    missing
+}
+
+/// 回读刚落盘的 evidence（`verify-<id>/summary.json` + `gates.json`）并核对
+/// 契约 §5.1 的 required 字段。`Some(problem)` = 证据残缺（调用方 BLOCKED）。
+fn evidence_conformance(config: &Config, id: &str) -> Option<String> {
+    let dir = config.evidence_dir.join(format!("verify-{id}"));
+    let read_json = |name: &str| -> Option<Value> {
+        let text = std::fs::read_to_string(dir.join(name)).ok()?;
+        serde_json::from_str::<Value>(&text).ok()
+    };
+    let (Some(summary), Some(checks)) = (read_json("summary.json"), read_json("gates.json")) else {
+        return Some(format!(
+            "evidence verify-{id} unreadable after write (summary.json / gates.json)"
+        ));
+    };
+    let missing = evidence_missing_required_fields(&summary, &checks);
+    if missing.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "evidence verify-{id} missing required fields (evidence.schema.json): {}",
+            missing.join(", ")
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("nexus-cmd-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        dir
+    }
+
+    /// 与 write_evidence 落盘形状一致的最小完整 evidence。
+    fn complete_evidence() -> (Value, Value) {
+        let summary = json!({
+            "schema_version": 1,
+            "command": "verify",
+            "verdict": "PASS",
+            "message": "fast verify: 8 gates, 8 pass, 0 fail, 0 unknown",
+            "id": "abc123",
+            "bindings": {
+                "source_revision": "rev-1",
+                "working_tree_digest": "wt-1",
+                "dirty_state": false,
+                "configuration_digest": "cfg-1",
+                "feature_set": ["workspace:default"],
+                "target_triple": "x86_64-pc-windows-msvc",
+                "toolchain_version": "1.98.1",
+                "harness_schema_version": 1,
+                "platform_capability_digest": "p-1",
+                "contract_hash": "c-1",
+            },
+        });
+        let checks = json!({"gates": [{"name": "whitespace", "verdict": "PASS", "detail": "ok"}], "scenarios": []});
+        (summary, checks)
+    }
+
+    #[test]
+    fn evidence_missing_required_fields_accepts_complete_bindings() {
+        let (summary, checks) = complete_evidence();
+        assert!(evidence_missing_required_fields(&summary, &checks).is_empty());
+    }
+
+    /// 契约 §5.1：10 个 required 字段逐一被清空/破坏时，校验必须点名该字段。
+    #[test]
+    fn evidence_missing_required_fields_flags_each_required_field() {
+        let (mut s, c) = complete_evidence();
+        s["schema_version"] = json!(0);
+        assert_eq!(
+            evidence_missing_required_fields(&s, &c),
+            vec!["schema_version"]
+        );
+
+        let (mut s, c) = complete_evidence();
+        s["verdict"] = json!("MAYBE");
+        assert_eq!(evidence_missing_required_fields(&s, &c), vec!["verdict"]);
+
+        let (mut s, c) = complete_evidence();
+        s["verdict"] = json!("");
+        assert_eq!(evidence_missing_required_fields(&s, &c), vec!["verdict"]);
+
+        let (mut s, c) = complete_evidence();
+        s["id"] = json!("");
+        assert_eq!(
+            evidence_missing_required_fields(&s, &c),
+            vec!["verification_id"]
+        );
+
+        for field in [
+            "source_revision",
+            "working_tree_digest",
+            "configuration_digest",
+            "target_triple",
+            "toolchain_version",
+        ] {
+            let (mut s, c) = complete_evidence();
+            s["bindings"][field] = json!("");
+            assert_eq!(
+                evidence_missing_required_fields(&s, &c),
+                vec![field.to_string()],
+                "empty bindings.{field} must be flagged"
+            );
+        }
+
+        let (mut s, c) = complete_evidence();
+        s["bindings"]["feature_set"] = json!([]);
+        assert_eq!(
+            evidence_missing_required_fields(&s, &c),
+            vec!["feature_set"]
+        );
+
+        let (s, mut c) = complete_evidence();
+        c["gates"] = json!([]);
+        assert_eq!(evidence_missing_required_fields(&s, &c), vec!["checks"]);
+    }
+
+    /// 契约 §5.1 fail-closed：evidence 目录下 summary.json / gates.json 缺失
+    /// （不可读）时 `evidence_conformance` 必须返回 Some——verify 据此 BLOCKED，
+    /// 而不是放行一份绑定不全的证据（STALE 判定的根基）。
+    #[test]
+    fn evidence_conformance_blocks_unreadable_evidence() {
+        let repo = Repo::discover().expect("must run inside the nexus repository");
+        let base = Config::load(&repo).expect("config must load");
+        let tmp = temp_dir("evidence-unreadable");
+        // evidence 目录故意不写任何文件。
+        let config = Config {
+            evidence_dir: tmp.join("evidence"),
+            ..base
+        };
+        let problem = evidence_conformance(&config, "missing-id");
+        assert!(
+            problem.is_some(),
+            "不可读 evidence 必须 fail-closed 返回 Some"
+        );
+        assert!(
+            problem.unwrap().contains("unreadable"),
+            "诊断必须点名 unreadable"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 契约 §5.1：verify 真实落盘的 evidence 必须填满 10 个 required 字段
+    /// （用真实 repo + 临时 evidence 目录跑一次 write_evidence 后回读）。
+    #[test]
+    fn written_evidence_fills_all_schema_required_fields() {
+        let repo = Repo::discover().expect("must run inside the nexus repository");
+        let base = Config::load(&repo).expect("config must load");
+        let tmp = temp_dir("evidence-write");
+        let config = Config {
+            evidence_dir: tmp.join("evidence"),
+            ..base
+        };
+        let bindings = Bindings::current(&repo, &config);
+        let gates = vec![Gate::ok("whitespace", "no whitespace errors")];
+        let id =
+            evidence::write_evidence(&repo, &config, "PASS", "unit test", &gates, &[], &bindings)
+                .expect("write_evidence must succeed");
+        assert!(
+            evidence_conformance(&config, &id).is_none(),
+            "written evidence must fill all schema-required fields"
+        );
+        // 回读的绑定必须与当前 repo 状态一致（STALE 判定的根基）。
+        let text = std::fs::read_to_string(
+            config
+                .evidence_dir
+                .join(format!("verify-{id}"))
+                .join("summary.json"),
+        )
+        .expect("summary.json");
+        let v: Value = serde_json::from_str(&text).expect("summary json");
+        assert_eq!(v["bindings"]["source_revision"], json!(repo.revision()));
+        assert_eq!(
+            v["bindings"]["working_tree_digest"],
+            json!(repo.working_tree_digest())
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 契约 §5.1「契约哈希」的代码侧落地：`source_revision` 随提交变化、
+    /// `working_tree_digest` 随工作区内容变化——evidence 绑定因此能识别
+    /// "证据与当前 revision 不匹配"（STALE，契约 §4b）。
+    #[test]
+    fn evidence_bindings_track_source_and_worktree_changes() {
+        let tmp = temp_dir("bindings-git");
+        let repo = Repo { root: tmp.clone() };
+        let commit = |msg: &str| {
+            repo.git(&["add", "f.txt"]).expect("git add");
+            repo.git(&[
+                "-c",
+                "user.name=harness-test",
+                "-c",
+                "user.email=harness-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                msg,
+            ])
+            .expect("git commit");
+        };
+        let config = Config {
+            policies_dir: tmp.join("policies"),
+            scenarios_dir: tmp.join("scenarios"),
+            evidence_dir: tmp.join("evidence"),
+            crates_dir: tmp.join("crates"),
+            engineering_dir: tmp.join("engineering"),
+            quality: serde_json::json!({}),
+            portable_core: vec![],
+            bind_working_tree_digest: true,
+        };
+        repo.git(&["init", "-q"]).expect("git init");
+        std::fs::write(tmp.join("f.txt"), "one\n").expect("write");
+        commit("one");
+
+        let b1 = Bindings::current(&repo, &config);
+        assert_eq!(b1.dirty_state, Some(false), "clean tree after commit");
+        assert!(!b1.source_revision.is_empty());
+        assert_ne!(b1.source_revision, "no-commit");
+        assert!(!b1.working_tree_digest.is_empty());
+
+        // 未提交的工作区变更：digest 变、revision 不变。
+        std::fs::write(tmp.join("f.txt"), "two\n").expect("rewrite");
+        let b2 = Bindings::current(&repo, &config);
+        assert_eq!(b2.dirty_state, Some(true));
+        assert_eq!(
+            b1.source_revision, b2.source_revision,
+            "uncommitted change must not move revision"
+        );
+        assert_ne!(
+            b1.working_tree_digest, b2.working_tree_digest,
+            "worktree digest must track content"
+        );
+
+        // 提交：revision 变（旧证据随之 STALE）。
+        commit("two");
+        let b3 = Bindings::current(&repo, &config);
+        assert_eq!(b3.dirty_state, Some(false));
+        assert_ne!(
+            b2.source_revision, b3.source_revision,
+            "commit must move revision"
+        );
+        assert_ne!(
+            b1.working_tree_digest, b3.working_tree_digest,
+            "committed content must move tree digest"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 契约 §4.4 的镜像守卫：quality.toml 声明的每个 gate 都必须在 verify()
+    /// 的 match 里有确定路由。新增声明忘记路由时此处 FAIL（而不是运行时落
+    /// `unimplemented()` 兜底记 UNKNOWN）。
+    #[test]
+    fn every_declared_gate_is_routed_in_verify() {
+        let repo = Repo::discover().expect("must run inside the nexus repository");
+        let config = Config::load(&repo).expect("config must load");
+        const ROUTED: &[&str] = &[
+            // fast
+            "format",
+            "check",
+            "clippy",
+            "architecture-delta",
+            "dependency-delta",
+            "resource-type-neutrality",
+            "affected-tests",
+            "selected-properties",
+            // full
+            "workspace-tests",
+            "integration",
+            "product-scenarios",
+            "regression",
+            "architecture-policy",
+            "dependency-governance",
+            "coverage-summary",
+            "selected-fuzz",
+            "selected-concurrency",
+            "performance-budgets",
+            "bench",
+            "platform-checks",
+            "feature-matrix",
+            "portable-core",
+        ];
+        for level in ["fast", "full"] {
+            for name in config.declared_gates(level) {
+                assert!(
+                    ROUTED.contains(&name.as_str()),
+                    "gate '{name}' declared in policies/quality.toml [{level}] but not routed in verify() — add a deterministic implementation in gates.rs or record the specific UNKNOWN reason"
+                );
+            }
+        }
     }
 }

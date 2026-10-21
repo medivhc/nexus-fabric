@@ -947,7 +947,10 @@ pub fn feature_matrix_gate(repo: &Repo) -> Gate {
 /// Portable core: every harness.toml [portable_core] crate must compile for
 /// wasm32-wasip1; target not installed => UNKNOWN.
 pub fn portable_core_gate(repo: &Repo, config: &Config) -> Gate {
-    let (ok, out) = run_at(&repo.root, "rustup", &["target", "list", "--installed"]);
+    // 必须用全量输出：`rustup target list --installed` 在装了很多 target 的
+    // 机器上超过 12 行，run_at 的 tail 会把 wasm32-wasip1 截掉，导致"已安装"
+    // 被误判为缺失（UNKNOWN）。
+    let (ok, out) = run_at_full(&repo.root, "rustup", &["target", "list", "--installed"]);
     if !ok || !out.contains("wasm32-wasip1") {
         return Gate::unknown(
             "portable-core",
@@ -974,6 +977,23 @@ pub fn portable_core_gate(repo: &Repo, config: &Config) -> Gate {
     }
 }
 
+/// 未实现 gate 的兜底判定（契约 §4.4）：记 UNKNOWN 并带原因，绝不静默 PASS。
+///
+/// 现状（2026-10-16 e2e-contract-schema 逐个复核）：`policies/quality.toml`
+/// 声明的全部 gate（fast 8 个 + full 14 个）都已在 `commands.rs` 的 verify()
+/// match 中路由到本文件的确定性实现，没有声明落在此兜底上。其中依赖外部
+/// 工具/真机、工具缺失时必须保持 UNKNOWN 的 gate，在各自函数体内已带具体
+/// 原因（而非空泛 TODO）：
+/// - coverage-summary：需 cargo-llvm-cov（`coverage_gate`）；
+/// - selected-fuzz：需 cargo-fuzz 且声明 `fuzz/Cargo.toml`（`fuzz_gate`）；
+/// - portable-core：需 `rustup target add wasm32-wasip1`（`portable_core_gate`）；
+/// - dependency-governance：静态检查之外的真跑需 cargo-deny（`dependency_gate`）；
+/// - performance-budgets：需 quality.toml `[performance]` 的 baseline+blocking
+///   完整阈值（`performance_budgets_gate`）；
+/// - integration：cargo metadata 未声明任何 integration 目标（`integration_gate`）。
+///
+/// 因此本函数只在"quality.toml 新增了未路由的 gate 声明"时触发——那是契约
+/// 与实现的脱耦；正确处置是在 commands.rs 补路由，而不是放行。
 pub fn unimplemented(name: &str) -> Gate {
     Gate::unknown(
         name,
@@ -1941,5 +1961,213 @@ mod tests {
             "UNKNOWN 必须写明原因：{}",
             gate.detail
         );
+    }
+
+    // --- full gates：UNKNOWN 必须带具体原因；确定性判定必须可单测 ---
+
+    #[test]
+    fn unimplemented_gate_records_unknown_with_reason() {
+        // 契约 §4.4：未实现 gate 记 UNKNOWN 且带原因，绝不静默 PASS。
+        let g = unimplemented("some-future-gate");
+        assert_eq!(g.name, "some-future-gate");
+        assert_eq!(g.verdict, "UNKNOWN");
+        assert!(g.detail.contains("not implemented"), "{}", g.detail);
+    }
+
+    #[test]
+    fn performance_budgets_gate_requires_complete_thresholds() {
+        let tmp = std::env::temp_dir().join(format!("harness-perf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cfg = |quality: Value| Config {
+            policies_dir: tmp.join("policies"),
+            scenarios_dir: tmp.join("scenarios"),
+            evidence_dir: tmp.join("evidence"),
+            crates_dir: tmp.join("crates"),
+            engineering_dir: tmp.join("engineering"),
+            quality,
+            portable_core: vec![],
+            bind_working_tree_digest: true,
+        };
+        // 完整 [performance]（baseline + blocking，对齐 policies/quality.toml）→ PASS。
+        let g = performance_budgets_gate(&cfg(serde_json::json!({
+            "performance": {
+                "baseline": {"policy_evaluate_ns": 1000},
+                "blocking": {"policy_evaluate_ns": 50000}
+            }
+        })));
+        assert_eq!(g.verdict, "PASS", "{}", g.detail);
+        assert!(g.detail.contains("baseline"), "{}", g.detail);
+        // 无 [performance] → UNKNOWN（无预算可查，不静默 PASS）。
+        let g = performance_budgets_gate(&cfg(serde_json::json!({})));
+        assert_eq!(g.verdict, "UNKNOWN");
+        assert!(
+            g.detail.contains("no [performance] section"),
+            "{}",
+            g.detail
+        );
+        // 不完整（缺 blocking）→ UNKNOWN。
+        let g =
+            performance_budgets_gate(&cfg(serde_json::json!({"performance": {"baseline": {}}})));
+        assert_eq!(g.verdict, "UNKNOWN");
+        assert!(g.detail.contains("incomplete"), "{}", g.detail);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn platform_checks_gate_detects_platform_specific_dependencies() {
+        // portable-core crate 不得依赖平台专属 crate（平台 VPI 隔离）；
+        // manifest 缺失 → FAIL（fail-closed，不静默跳过）。
+        let tmp = std::env::temp_dir().join(format!("harness-plat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let crates = tmp.join("crates");
+        std::fs::create_dir_all(crates.join("clean/src")).unwrap();
+        std::fs::write(
+            crates.join("clean/Cargo.toml"),
+            "[package]\nname = \"clean\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(crates.join("win/src")).unwrap();
+        std::fs::write(
+            crates.join("win/Cargo.toml"),
+            "[package]\nname = \"win\"\nversion = \"0.1.0\"\n\n[dependencies]\nwinapi = \"0.3\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(crates.join("tgt/src")).unwrap();
+        std::fs::write(
+            crates.join("tgt/Cargo.toml"),
+            "[package]\nname = \"tgt\"\nversion = \"0.1.0\"\n\n[target.'cfg(windows)'.dependencies]\nfoo = \"1\"\n",
+        )
+        .unwrap();
+        let cfg = |names: Vec<String>| Config {
+            policies_dir: tmp.join("policies"),
+            scenarios_dir: tmp.join("scenarios"),
+            evidence_dir: tmp.join("evidence"),
+            crates_dir: crates.clone(),
+            engineering_dir: tmp.join("engineering"),
+            quality: serde_json::json!({}),
+            portable_core: names,
+            bind_working_tree_digest: true,
+        };
+        // 干净 crate → PASS。
+        let g = platform_checks_gate(&cfg(vec!["clean".to_string()]));
+        assert_eq!(g.verdict, "PASS", "{}", g.detail);
+        // 平台专属依赖 → FAIL 且点名依赖。
+        let g = platform_checks_gate(&cfg(vec!["clean".to_string(), "win".to_string()]));
+        assert_eq!(g.verdict, "FAIL");
+        assert!(g.detail.contains("winapi"), "{}", g.detail);
+        // [target.'cfg(...)'.dependencies] → FAIL。
+        let g = platform_checks_gate(&cfg(vec!["tgt".to_string()]));
+        assert_eq!(g.verdict, "FAIL");
+        assert!(g.detail.contains("cfg("), "{}", g.detail);
+        // manifest 缺失 → FAIL。
+        let g = platform_checks_gate(&cfg(vec!["ghost".to_string()]));
+        assert_eq!(g.verdict, "FAIL");
+        assert!(g.detail.contains("ghost"), "{}", g.detail);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn architecture_gate_fails_closed_on_missing_or_malformed_policy() {
+        // policy 缺失/不可解析 → FAIL（fail-closed）。该路径在 cargo metadata
+        // 之前返回，不依赖 workspace 元数据，确定性可测。
+        let tmp = std::env::temp_dir().join(format!("harness-arch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cfg = Config {
+            policies_dir: tmp.clone(),
+            scenarios_dir: tmp.join("scenarios"),
+            evidence_dir: tmp.join("evidence"),
+            crates_dir: tmp.join("crates"),
+            engineering_dir: tmp.join("engineering"),
+            quality: serde_json::json!({}),
+            portable_core: vec![],
+            bind_working_tree_digest: true,
+        };
+        let g = architecture_gate(&cfg);
+        assert_eq!(g.verdict, "FAIL", "{}", g.detail);
+        assert!(g.detail.contains("read failed"), "{}", g.detail);
+        std::fs::write(tmp.join("architecture.toml"), "not = = toml").unwrap();
+        let g = architecture_gate(&cfg);
+        assert_eq!(g.verdict, "FAIL", "{}", g.detail);
+        assert!(g.detail.contains("parse failed"), "{}", g.detail);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn concurrency_gate_unknown_when_no_tests_declared() {
+        // tests/concurrency/ 无声明 → UNKNOWN 且带具体原因（不静默 PASS）。
+        let tmp = std::env::temp_dir().join(format!("harness-conc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let repo = Repo { root: tmp.clone() };
+        let g = concurrency_gate(&repo);
+        assert_eq!(g.verdict, "UNKNOWN", "{}", g.detail);
+        assert!(g.detail.contains("tests/concurrency"), "{}", g.detail);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn fuzz_gate_unknown_with_specific_reason() {
+        // cargo-fuzz 未安装 → UNKNOWN（含安装提示）；已安装但临时目录无
+        // fuzz/Cargo.toml → UNKNOWN（无 fuzz 目标）。两者都绝不静默 PASS。
+        let tmp = std::env::temp_dir().join(format!("harness-fuzz-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let repo = Repo { root: tmp.clone() };
+        let g = fuzz_gate(&repo);
+        assert_eq!(g.verdict, "UNKNOWN", "{}", g.detail);
+        if cargo_tool_available(&repo, "fuzz") {
+            assert!(g.detail.contains("no fuzz targets"), "{}", g.detail);
+        } else {
+            assert!(
+                g.detail.contains("cargo-fuzz not installed"),
+                "{}",
+                g.detail
+            );
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn coverage_gate_unknown_with_specific_reason() {
+        // cargo-llvm-cov 未安装 → UNKNOWN（含安装提示）；已安装但临时目录不是
+        // cargo workspace → UNKNOWN（coverage run failed）。不静默 PASS。
+        let tmp = std::env::temp_dir().join(format!("harness-cov-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let repo = Repo { root: tmp.clone() };
+        let g = coverage_gate(&repo);
+        assert_eq!(g.verdict, "UNKNOWN", "{}", g.detail);
+        if cargo_tool_available(&repo, "llvm-cov") {
+            assert!(g.detail.contains("coverage run failed"), "{}", g.detail);
+        } else {
+            assert!(
+                g.detail.contains("cargo-llvm-cov not installed"),
+                "{}",
+                g.detail
+            );
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn portable_core_gate_unknown_when_wasm_target_missing() {
+        // wasm32-wasip1 未安装 → UNKNOWN（含安装提示）。已安装时跳过：
+        // 真机编译路径缓慢，由 verify --full 覆盖。注意用全量输出判断
+        // （run_at 的 12 行 tail 会在多 target 机器上漏掉 wasm32-wasip1）。
+        let repo = Repo::discover().expect("repo must be discoverable");
+        let installed = Command::new("rustup")
+            .args(["target", "list", "--installed"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("wasm32-wasip1"))
+            .unwrap_or(false);
+        if installed {
+            return;
+        }
+        let config = Config::load(&repo).expect("config must load");
+        let g = portable_core_gate(&repo, &config);
+        assert_eq!(g.verdict, "UNKNOWN", "{}", g.detail);
+        assert!(g.detail.contains("wasm32-wasip1"), "{}", g.detail);
     }
 }

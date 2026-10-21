@@ -250,3 +250,16 @@
 | `tests/concurrency/README.md` | Repository contract/documentation |
 | `tests/integration/README.md` | Repository contract/documentation |
 | `tests/regression/README.md` | Repository contract/documentation |
+
+## Cloud Agent Engineering（云端 Agent 开发工程）
+
+| Path | Purpose |
+|---|---|
+| `rust-toolchain.toml` | Rust 工具链版本单一来源（channel = 1.98.1，components/targets 锁定） |
+| `.github/workflows/ci-verify.yml` | CI 验证门禁（quick-check + verify-fast，ubuntu-latest 标准化 runner） |
+| `scripts/remote-dev-setup.sh` | 远程开发机一键 worktree 配置（环境一致性 Layer 1） |
+| `scripts/agent-local-check.sh` | 推送前分级本地预检 L1/L2/fmt/L3 |
+| `scripts/agent-zero-deps-check.sh` | 小空间沙箱（<1GB）零依赖契约预检 |
+| `.devcontainer/devcontainer.json` | Dev Container / Codespaces 入口（环境一致性 Layer 1 补充） |
+| `.devcontainer/setup.sh` | Dev Container Post Create Command（rustup + 系统依赖 + git hooks） |
+| `.agents/code-quality-review-2026-10-16.md` | 云端 Agent 工程的对抗性审查报告（Code Complete 原则） |

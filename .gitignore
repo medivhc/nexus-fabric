@@ -4,3 +4,6 @@
 # Code Intelligence 夹具（独立 workspace）：构建产物与 lock 不入库
 /engineering/nexus-harness/fixtures/code-intel/target/
 /engineering/nexus-harness/fixtures/code-intel/Cargo.lock
+
+# PEE Harness 运行时产物（日志由 gate.sh 生成，不入仓库）
+.poe/runs/*/logs/

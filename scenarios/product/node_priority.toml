@@ -50,10 +50,13 @@ equals = "high-bw"
 field = "same_priority_same_latency_higher_bandwidth.selected_bandwidth_mbps"
 equals = 1000
 
-# 空候选列表返回 None
+# 空候选列表返回 None。
+# 注意：TOML 没有 null 字面量，`equals = null` 会让整个文件解析失败而被
+# harness 静默跳过（2026-10-18 审计发现该文件长期未执行）。用 `absent = true`
+# 表达"缺失或 JSON null"语义。
 [[expect]]
 field = "empty_candidates.selected_node_id"
-equals = null
+absent = true
 
 # 越界优先级被拒绝
 [[expect]]

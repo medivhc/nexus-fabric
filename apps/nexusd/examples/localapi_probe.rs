@@ -24,6 +24,20 @@ use std::net::TcpStream;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// 目标 daemon 二进制的文件名（Windows 上 cargo 产出 `nexusd.exe`）。
+///
+/// **必须显式带扩展名**：Rust 的 `Path::exists()` 在 Windows 上**不做**
+/// PATHEXT 补全，只有 `Command::new()` 会补。所以做存在性检查时漏掉 `.exe`
+/// 会恒定失败——2026-10-18 审计发现本 probe 长期因此报
+/// "nexusd not found"，拖垮一整批 daemon 场景的真实 verdict。
+fn nexusd_bin_name() -> &'static str {
+    if cfg!(windows) {
+        "nexusd.exe"
+    } else {
+        "nexusd"
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Err(e) = run(&args) {
@@ -51,7 +65,7 @@ fn run(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("current_exe: {e}"))?
         .parent()
         .and_then(|p| p.parent())
-        .map(|p| p.join("nexusd"))
+        .map(|p| p.join(nexusd_bin_name()))
         .ok_or("cannot resolve nexusd path")?;
     if !nexusd_bin.exists() {
         return Err(format!("nexusd not found at {}", nexusd_bin.display()));

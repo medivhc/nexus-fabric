@@ -1,3 +1,17 @@
+# 这不是一个可加载的 E2E 场景 —— 它是一份**多主机真机测试计划**。
+#
+# 2026-10-18 从 `scenarios/product/` 移出。原因：本文件用的是
+# `[scenario]` + `[[steps]]` + `assert = [...]` 形态，与 harness 的
+# `id` / `[when].command` / `[[expect]]` schema 完全不同（docs/e2e-test-system-contract.md §2），
+# `load_all`（engineering/nexus-harness/src/scenario.rs:241）每次运行都把它当
+# 解析失败跳过并打印噪声。且它表达的是 5 个跨主机步骤（T1 Linux 真机 /
+# T5 Windows 真机），当前单命令 schema 无法承载。
+#
+# 对应的可执行 E4 在 `apps/nexusd/examples/e4_tcp_termination_wireup.rs`
+# （输出 JSON verdict，需 root / cap_net_admin）。
+# 若要把它变成真正的门禁场景，需走 Contract Phase：用 `[when].command`
+# 包住该 example 并声明 `[[expect]]`，属新增 expectation，不可静默添加。
+#
 # E4: TCP 终结接线（GAP-5）
 # 场景：TUN 来的 TCP 包经 smoltcp 终结为 stream，按分类送 N1/proxy。
 # 冻结契约：apps/nexusd/MODULE.md §TCP 终结接线（S1-S11）

@@ -99,15 +99,31 @@ fn wait_victim_ready(child: &mut Child) {
 /// 定位预编译的 nexusd binary：与本 example 同一 target dir 下。
 /// （`current_exe` 反推在共享 CARGO_TARGET_DIR 下对 workspace 无效，
 /// 但对"同一 target dir 下的 binary"有效——example 和 binary 总是在同一 target 里。）
+///
+/// **必须显式带扩展名**：Rust 的 `Path::exists()` 在 Windows 上**不做**
+/// PATHEXT 补全，只有 `Command::new()` 会补。漏掉 `.exe` 会让下面的
+/// `.exists()` 恒定返回 false → 返回 None → 上层两次各等 300s 撞满
+/// 600s 硬上限判 FAIL（2026-10-18 审计发现，`product.crash-recovery-boot-reconcile`
+/// 长期因此红）。
 fn nexusd_bin() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let debug_dir = exe.parent()?.parent()?;
-    let cand = debug_dir.join("nexusd");
+    let cand = debug_dir.join(nexusd_bin_name());
     if cand.exists() {
         return Some(cand);
     }
-    let rel = debug_dir.parent()?.join("release").join("nexusd");
+    let rel = debug_dir.parent()?.join("release").join(nexusd_bin_name());
     rel.exists().then_some(rel)
+}
+
+/// 目标 daemon 二进制的文件名（Windows 上 cargo 产出 `nexusd.exe`）。
+/// 见 `nexusd_bin()` 上方关于 PATHEXT 的说明。
+fn nexusd_bin_name() -> &'static str {
+    if cfg!(windows) {
+        "nexusd.exe"
+    } else {
+        "nexusd"
+    }
 }
 
 /// 启动一次 nexusd，等待 boot-reconcile 行 + READY 行，返回 reconcile JSON。
