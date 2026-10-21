@@ -3,15 +3,15 @@ doc-id: n3-recovery-function-summary
 layer: L2
 owner: coordinator
 last-verified: 2026-10-21
-verified-against: 731e659 + N3-12 recovery working tree
+verified-against: dbb511a
 status: current
 ---
 
 # N3 功能与代码恢复总结
 
-核实日期：2026-10-21（Asia/Shanghai）。本文依据正式契约、可读源码和机器记录说明能力边界，不改写历史 PROJECT-STATUS。发布基线为远端 master `5d70709`，发布分支为 `feat/n3-restored-code-20261020`；实际推送状态以远端引用为准。
+核实日期：2026-10-21（Asia/Shanghai）。本文依据正式契约、可读源码和机器记录说明能力边界，不改写历史 PROJECT-STATUS。本次集成基线为 master `5d70709`，发布分支为 `feat/n3-restored-code-20261020`；实际推送状态以远端引用为准。
 
-现有代码已具备 Task/Snapshot/Artifact 的持久基础、Linux 隔离执行适配器、本机 Task 查询与取消、Linux Artifact 断点下载、scoped Use 授权运维，以及恢复的 N3-11 提供方初始化/检查与 managed daemon 启动。它们尚未构成用户从 CLI 提交新任务、上传固定输入并经远端提供方执行的完整链路：当前生产 `Submit` 分支仍明确拒绝。N3-12 的固定输入 freeze、独立预算、本机认证分片上传、断点恢复与取消代码已恢复到活跃源码，原冻结测试与 requester fixture 已补齐；当前验证状态见第5节。N3-13/14 未验收，Full 与 Windows→Linux E5 暂停。
+现有代码已具备 Task/Snapshot/Artifact 的持久基础、Linux 隔离执行适配器、本机 Task 查询与取消、Linux Artifact 断点下载、scoped Use 授权运维，以及恢复的 N3-11 提供方初始化/检查与 managed daemon 启动。它们尚未构成用户从 CLI 提交新任务、上传固定输入并经远端提供方执行的完整链路：当前生产 `Submit` 分支仍明确拒绝。N3-12 的固定输入 freeze、独立预算、本机认证分片上传、断点恢复与取消代码已恢复到活跃源码，原冻结测试与 requester fixture 已补齐；当前验证状态见第5节。N3-13 仅恢复未冻结的设计草案，尚未实现；N3-13/14 未验收，Full 与 Windows→Linux E5 暂停。
 
 ## 1. 如何理解能力边界
 
@@ -104,11 +104,13 @@ datagram 观察按已有 S5 尽力而为契约：示例发送100个200B数据报
 
 ## 6. 验证与恢复边界
 
+本批通过Check 4/4、受影响测试9个包、Fast 9/9、源码版本绑定的真实E3 51项（0 skip）、固定发布产物关键回归10项、N3-12 E4 15/15、N3-11 E4 12/12及Control API/Workspace WASI检查。独立八维review为COMMENTED、无阻塞项；满表重复校验成本留待基准与优化。全套E3期间CLI被Cargo重建，daemon与源码输入保持一致；固定副本补充10项的前后SHA相同。两组记录不混作单一固定CLI产物的完整认证。E3插桩运行耗时3199.795秒，不作为未插桩性能基准。原始结果、source revision和绑定见[验证记录](recovery/2026-10-21/verification.json)。
+
 本批恢复与集成的来源哈希见[2026-10-21清单](recovery/2026-10-21/source-integration-manifest.json)，验证状态见[恢复记录](recovery/2026-10-21/README.md)。保留最新 master 的 runtime、flow-session、NAT 更新及前批 N3-11/Fabric 修复；既有文件使用 `37e0cff` 为共同祖先三方合并，新文件逐字节恢复。
 
 前轮解析器漏读原生对象形式的 `diff.text`，曾将实际可恢复的补丁误判为缺失。本批修正读取后补齐 backend、CLI、daemon、最终冻结测试、21个 requester fixture、N3-11 lease 及 N3-12 TTL/expiry 原始代码。旧[10月20日归档](recovery/2026-10-20/README.md)保留原字节作为历史证据，不再作为当前缺口清单；RED 骨架与中间候选未当作生产实现。
 
-仍未取得原10月19日完整1317路径的 SHA 映射；只能核对组件原始哈希、完整补丁链及本次集成差异，不能据此宣称整个原工作树逐字节恢复。当前构建需要对 staging 的测试辅助锁加 `cfg(test)`，另对原测试中的一次路径比较去掉临时分配，以满足 Rust 1.98 Clippy；两项机械差异均单独记录，不改变断言、期望或场景。完整 Full、Windows→Linux E5按原决定暂停；本批不声明完整N3验收或 Final PASS。
+仍未取得原10月19日完整1317路径的 SHA 映射；只能核对组件原始哈希、完整补丁链及本次集成差异，不能据此宣称整个原工作树逐字节恢复。当前构建需要对 staging 的测试辅助锁加 `cfg(test)`，另对原测试中的一次路径比较去掉临时分配，以满足 Rust 1.98 Clippy；两项机械差异均单独记录，不改变断言、期望或场景。另外已恢复原 N3-13/N3-13A 草案、10月19日执行计划和知识条目；两份草案保留DRAFT/pending状态，没有冻结新需求或装配远端Submit。原记录实际打印的83个路径现均可定位，其中56个代码/测试/fixture候选项没有已知物理缺项；目录项不构成完整leaf清单。详见[路径核对](recovery/2026-10-21/printed-path-coverage.json)及[文档来源](recovery/2026-10-21/document-integration-manifest.json)。完整 Full、Windows→Linux E5按原决定暂停；本批不声明完整N3验收或 Final PASS。
 
 ## 7. 里程碑与后续任务
 
@@ -117,7 +119,7 @@ datagram 观察按已有 S5 尽力而为契约：示例发送100个200B数据报
 | N3-1..10 | 模型、持久运行、日志/产物、本机查询取消、容量/Session、Linux下载和grant运维存在 | 保持 authority、唯一 owner、完整性与不重执行不变量 |
 | N3-11 | 提供方初始化/check/managed startup 已恢复；本批补回 scoped lease 修复 | 有限本机验收不能替代 Engine/跨机执行资格 |
 | N3-12 | 固定 Commit bundle、预算、认证本机分片上传、恢复/取消及原测试已恢复并集成 | 当前门禁、独立 review 与推送结果见恢复记录；保留原始完整工作树映射限制 |
-| N3-13 | 未验收 | 保密双向认证 peer context，绑定真实 grant/输入/容量与唯一 SessionManager，再装配 Submit、执行和完整 verifier |
+| N3-13 | 两份原设计草案已恢复；未冻结、未实现、未验收 | 保密双向认证 peer context，绑定真实 grant/输入/容量与唯一 SessionManager，再装配 Submit、执行和完整 verifier |
 | N3-14 | 未验收；Windows E5 暂停 | 平台适配与真实 Windows requester→Linux provider 验收，记录环境、输入、日志/退出码、产物与恢复观察 |
 
-下一步先完成本批恢复验证、独立审查和远端交付，然后按[N3-11..14执行计划](N3-11-14-EXECUTION-PLAN.md)推进 N3-13。路线图中的旧进度保留其历史语境；不能用有限本机 E4 代替完整 N3 E4/E5。
+下一步先完成本批恢复验证、独立审查和远端交付，然后按[N3-11..14执行计划](N3-11-14-EXECUTION-PLAN.md)、[N3-13远端Task草案](N3-13-REMOTE-TASK-CONTRACT.md)及[N3-13A有界mTLS草案](N3-13A-BOUNDED-MTLS-CONTRACT-DRAFT.md)推进契约、RED与冻结，再实施N3-13。满表请求的重复全表验证成本另需建立未插桩基准后优化，保留完整校验和原测试规模。路线图中的旧进度保留其历史语境；不能用有限本机 E4 代替完整 N3 E4/E5。
