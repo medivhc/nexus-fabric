@@ -1,0 +1,136 @@
+# guard.yml — sandbox-env-guard 自守卫 CI
+#
+# 目的（darwin 工作流 dim6/7 集成度）：把守卫接入 CI，在 PR / push(master)
+# 触及 guard 目录时，自动跑守卫自身的回归套件与全流程，确保：
+#   - 门控契约（run_tests.py 的 14 用例）不被回归破坏
+#   - env-check → harness-select 全流程可复现，并产出 test-plan 供检视
+#
+# 设计要点：
+#   - 确定性优先：env-check 用 SKIP_NETWORK_PROBES=1 跳过出网探测（CI 网络
+#     抖动会让网络类能力在 ok/degraded/missing 间跳变，导致 test-plan 不稳定），
+#     回归套件本身不依赖真实网络。
+#   - Python 3.11+：harness-select/env-check 依赖 tomllib（3.11 起标准库）。
+#   - harness-select 扫真实 scenarios/，产出的 test-plan 作为 artifact 上传，
+#     mode 必须为 scenarios（若为 demo 或 exit 2，说明流程坏了，直接失败）。
+name: guard
+
+on:
+  pull_request:
+    paths:
+      - 'engineering/sandbox-env-guard/**'
+      - '.github/workflows/guard.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'engineering/sandbox-env-guard/**'
+      - '.github/workflows/guard.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  guard-tests:
+    name: 回归套件（门控契约）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python 3.11+（tomllib 依赖）
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Run guard regression suite
+        working-directory: engineering/sandbox-env-guard
+        # 这是守卫自身最强的质量信号：门控矩阵 + 错误路径 + env-check 组件测试。
+        # 非零退出即 CI 失败。
+        run: python scripts/run_tests.py
+
+  # Windows 侧：验证「无需 bash / 无需 mise」的入口确实可用。
+  # 重点跑 guard.ps1 —— 这是 Windows 的真实入口，此前只做过静态改造、
+  # 从未在真实 Windows 上执行过；CI 真机运行是唯一能证明它的方式。
+  guard-tests-windows:
+    name: Windows 入口（guard.ps1 + 回归套件）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python 3.11+（tomllib 依赖）
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 运行 Windows 守卫全流程（guard.ps1）
+        shell: pwsh
+        working-directory: engineering/sandbox-env-guard
+        # guard.ps1 内部自动探测 py -3 / python / python3，再驱动
+        # env-check -> harness-select；退出码透传（0/1/2）。
+        run: .\scripts\guard.ps1
+      - name: 运行守卫自回归套件（run_tests.ps1）
+        shell: pwsh
+        working-directory: engineering/sandbox-env-guard
+        # 与 Linux `mise run test` 跑的是同一套断言（run_tests.py 为唯一真源）
+        run: .\scripts\run_tests.ps1
+      - name: 上传 Windows 守卫产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: guard-artifacts-windows
+          path: engineering/sandbox-env-guard/.env-report/
+          retention-days: 7
+
+  guard-flow:
+    name: 全流程（env-check → harness-select）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python 3.11+
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: env-check（确定性：跳过网络探测）
+        working-directory: engineering/sandbox-env-guard
+        env:
+          SKIP_NETWORK_PROBES: '1'
+          ENV_REPORT_DIR: .env-report
+        run: python scripts/env-check
+      - name: harness-select（扫真实 scenarios）
+        working-directory: engineering/sandbox-env-guard
+        run: |
+          python scripts/harness-select \
+            --env-report .env-report/env-report.json \
+            --map test-capability-map.toml \
+            --scenarios-dir ../../scenarios \
+            --out .env-report/test-plan.json
+      - name: 断言 mode=scenarios（防止 demo 幻觉 / 扫空降级）
+        working-directory: engineering/sandbox-env-guard
+        run: |
+          MODE=$(python -c "import json;print(json.load(open('.env-report/test-plan.json'))['mode'])")
+          echo "test-plan mode = $MODE"
+          [ "$MODE" = "scenarios" ] || { echo "::error::guard-flow mode 非 scenarios（$MODE），流程异常"; exit 1; }
+
+      - name: guard-verify dry-run（校验 test-plan 可执行性，不跑重测试）
+        working-directory: engineering/sandbox-env-guard
+        # 真实仓库有 300+ 场景，逐个执行代价过高；PR 上只做 dry-run，
+        # 确保「计划可产出且条目是真实测试 id」这一环不回归。
+        # 完整执行由本地按需触发：mise run verify -- --scenarios-dir ../../scenarios
+        run: python scripts/guard-verify.py --scenarios-dir ../../scenarios --dry-run
+      - name: 写 $GITHUB_STEP_SUMMARY（能力矩阵 + test-plan 摘要）
+        working-directory: engineering/sandbox-env-guard
+        run: |
+          {
+            echo "## sandbox-env-guard · CI 守卫摘要"
+            echo
+            echo "### 能力矩阵（SKIP_NETWORK_PROBES=1）"
+            echo '```'
+            python -c "import json;d=json.load(open('.env-report/env-report.json'));[print(f'  {k:22s} {v[\"status\"]}') for k,v in d['capabilities'].items()]"
+            echo '```'
+            echo
+            echo "### test-plan（扫真实 scenarios/）"
+            echo '```'
+            python -c "import json;d=json.load(open('.env-report/test-plan.json'));s=d['summary'];print(f\"  total={s['total']} runnable={s['runnable']} skipped={s['skipped']}\");[print('  SKIP',x['id'],'<-',x['blocked_by']['capability']) for x in d['skipped'][:20]]"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: 上传守卫产物（env-report + test-plan）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: guard-artifacts
+          path: engineering/sandbox-env-guard/.env-report/
+          retention-days: 7

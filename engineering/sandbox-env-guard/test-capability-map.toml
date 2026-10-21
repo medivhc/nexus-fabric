@@ -1,0 +1,80 @@
+# ============================================================================
+# test-capability-map.toml — 测试 → 所需 capability 映射
+# ----------------------------------------------------------------------------
+# 每个键是一个 fnmatch 模式（匹配 scenario 的 id，如 product.n3-10-operator-grant）；
+# requires 列出该测试运行前必须满足（status=="ok"）的环境能力。
+# 维护约定：
+#   - 新增一类测试时在此声明其 capability 依赖，无需改动 env-check
+#   - capability 名称必须与 scripts/env-check 中 capabilities 的键一致
+#   - 未在此声明的测试默认运行（保守策略）
+# ============================================================================
+
+# N3 分布式工作空间：核心 executor 跑在 Linux 沙箱，需要 Linux executor
+[tests."product.n3-*"]
+requires = ["linux_executor"]
+
+# 真实产物/workspace 快照类场景：需要 Linux executor + 已拉取 crates
+# 注意命名：真实 scenario id 用连字符（product.cli-workspace-cache），
+# 曾用下划线写成 cli_workspace_* 导致一条都匹配不上，门控形同虚设。
+[tests."product.cli-workspace-*"]
+requires = ["linux_executor", "crates_fetched"]
+
+# Windows → Linux 真实 E5 验收：沙箱是 Linux，必然 unsupported
+[tests."product.windows_linux_e5"]
+requires = ["windows_executor"]
+
+# Web Gateway 零安装浏览器 SSH：需要 openssh-server 端到端
+[tests."product.web-gateway-*"]
+requires = ["openssh_e2e"]
+
+# ⚠️ TUN 场景的特殊性（2026-10-14 核对 nexus-fabric 真实契约）：
+# 仓库的 TUN 场景**内建降级契约**——无 /dev/net/tun 时断言结构化 TUN_ERROR 或
+# SKIP，绝不静默降级回 mock。因此它们在「无 TUN 环境」**也应运行并通过**
+# （正是为了验证降级契约成立）：
+#   product.tun-dataplane        → 断言 tun.assembly_error_kind = TUN_ERROR
+#   product.daemon-tun-dataplane → 断言 verdict_ok（两环境下均为 true）
+#   product.proxy-tun-inbound    → 进程内 MemoryVpi 闭环，不依赖真实驱动
+# 故**不要用 tun_net_admin 门控以上场景**，否则会丢失本应跑的真实覆盖。
+# 真正需要真实 TUN 设备的只有 fabric-tun-device（且它自身无设备时输出
+# verdict=SKIP，被 one_of=["PASS","SKIP"] 接受，同样不会 FAIL）。
+#
+# 网络连通/打洞类（依赖 tun 数据面的端到端）：保留门控
+# 现状（2026-10-15 核对）：真实仓库暂无 product.net-* 场景（命中 0），
+# 此处为预防性声明；真正的打洞/子网场景是 product.virtual-subnet-* 系列，
+# 它们是否依赖真实 tun 数据面尚待复核（见下方"待复核"注释），暂不门控。
+[tests."product.net-*"]
+requires = ["tun_net_admin"]
+
+# ============================================================================
+# 真远端类（需要真实出网：远端 peer / realnet 漫游）
+# ----------------------------------------------------------------------------
+# 与 TUN 相反：这些场景契约是 `equals="PASS"`（严格，**不接受 SKIP**），
+# 环境不具备出网能力时会**硬 FAIL**（把"环境限制"误记成"代码失败"）。
+# 因此必须由 internet_egress 门控 → 无出网能力时记 SKIPPED 而非 FAIL。
+# ============================================================================
+[tests."product.fabric-egress-remote"]
+requires = ["internet_egress"]
+
+[tests."product.n1-connectivity-roam-realnet"]
+requires = ["internet_egress"]
+
+# 同类自动纳入（新增 remote/realnet 场景时无需改代码）
+[tests."product.*-remote"]
+requires = ["internet_egress"]
+
+[tests."product.*realnet*"]
+requires = ["internet_egress"]
+
+# ⚠️ 待复核（不门控）：打洞类 nat-hole-punching / virtual-subnet-holepunch /
+# virtual-subnet-nat-probe / hole-punch-multi / subnet-punch-* 等，需确认它们
+# 用的是回环模拟还是真实出网。若仅为回环模拟则不依赖出网（本沙箱回环 OK 可跑），
+# 误门控会白白丢覆盖。
+
+# 跨节点保密传输类：N3 当前 deferred，必然 unsupported
+[tests."product.confidential-*"]
+requires = ["confidential_transport"]
+
+# 需要经代理从 GitHub 拉取外部制品/仓库的端到端场景：
+# 沙箱直连 GitHub 超时，必须走 GITHUB_PROXY；代理不可达则跳过。
+[tests."product.fetch-external-*"]
+requires = ["github_proxy"]

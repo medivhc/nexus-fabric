@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>sandbox-env-guard · 质量评分卡</title>
+<style>
+  :root { --ink:#1a1a1a; --sub:#6b7280; --line:#e5e7eb; --ok:#16a34a; --accent:#ea580c; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:#fafaf9; font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; color:var(--ink); }
+  .wrap { max-width: 880px; margin: 32px auto; padding: 0 20px; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:14px; padding:28px 30px; box-shadow:0 1px 3px rgba(0,0,0,.04); }
+  .brand { display:flex; justify-content:space-between; align-items:baseline; border-bottom:2px solid var(--ink); padding-bottom:12px; margin-bottom:18px; }
+  .brand h1 { font-size:20px; margin:0; letter-spacing:.3px; }
+  .brand .date { font-size:12px; color:var(--sub); }
+  .headline { display:flex; gap:28px; align-items:center; margin:8px 0 22px; }
+  .score-big { font-size:46px; font-weight:700; line-height:1; }
+  .score-big small { font-size:16px; color:var(--sub); font-weight:500; }
+  .delta { font-size:15px; font-weight:600; color:var(--ok); background:#dcfce7; padding:4px 10px; border-radius:999px; }
+  table { width:100%; border-collapse:collapse; font-size:13.5px; }
+  th { text-align:left; color:var(--sub); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.4px; padding:8px 6px; border-bottom:1px solid var(--line); }
+  td { padding:9px 6px; border-bottom:1px solid #f1f1ef; vertical-align:middle; }
+  .dim { font-weight:600; }
+  .wt { color:var(--sub); font-size:12px; }
+  .bars { display:flex; gap:6px; align-items:center; min-width:220px; }
+  .bar { height:9px; border-radius:5px; background:#e5e7eb; position:relative; flex:1; overflow:hidden; }
+  .bar > i { position:absolute; left:0; top:0; bottom:0; border-radius:5px; }
+  .bar.before > i { background:#cbd5e1; }
+  .bar.after  > i { background:var(--accent); }
+  .sc { font-variant-numeric:tabular-nums; font-weight:600; width:54px; text-align:right; }
+  .up { color:var(--ok); font-weight:700; }
+  .foot { margin-top:22px; padding-top:14px; border-top:1px dashed var(--line); font-size:12px; color:var(--sub); display:flex; justify-content:space-between; }
+  .foot b { color:var(--ink); }
+  .improve { font-size:13px; color:#374151; margin-top:6px; }
+  .improve li { margin:3px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card" id="card">
+    <div class="brand">
+      <h1>sandbox-env-guard · 质量评分卡</h1>
+      <span class="date">2026-10-20 · darwin 工作流 Round 6</span>
+    </div>
+    <div class="headline">
+      <div class="score-big">93.9<small> / 100</small></div>
+      <div class="delta">▲ +2.5 vs Round5 91.4</div>
+    </div>
+
+    <table>
+      <thead>
+        <tr><th>维度</th><th>权重</th><th style="width:240px">Round5 → Round6</th><th class="sc">Δ</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="dim">接口契约质量 <span class="wt">#1</span></td><td class="wt">8</td>
+          <td><div class="bars"><div class="bar before"><i style="width:90%"></i></div><div class="bar after"><i style="width:90%"></i></div></div></td><td class="sc">9→9</td></tr>
+        <tr><td class="dim">流程清晰度 <span class="wt">#2</span></td><td class="wt">12</td>
+          <td><div class="bars"><div class="bar before"><i style="width:100%"></i></div><div class="bar after"><i style="width:100%"></i></div></div></td><td class="sc">10→10</td></tr>
+        <tr><td class="dim">边界条件覆盖 <span class="wt">#3</span></td><td class="wt">14</td>
+          <td><div class="bars"><div class="bar before"><i style="width:80%"></i></div><div class="bar after"><i style="width:80%"></i></div></div></td><td class="sc">8→8</td></tr>
+        <tr><td class="dim">检查点/契约设计 <span class="wt">#4</span></td><td class="wt">10</td>
+          <td><div class="bars"><div class="bar before"><i style="width:80%"></i></div><div class="bar after"><i style="width:80%"></i></div></div></td><td class="sc">8→8</td></tr>
+        <tr><td class="dim">指令/输出具体性 <span class="wt">#5</span></td><td class="wt">12</td>
+          <td><div class="bars"><div class="bar before"><i style="width:100%"></i></div><div class="bar after"><i style="width:100%"></i></div></div></td><td class="sc">10→10</td></tr>
+        <tr><td class="dim">资源整合度 <span class="wt">#6</span></td><td class="wt">6</td>
+          <td><div class="bars"><div class="bar before"><i style="width:70%"></i></div><div class="bar after"><i style="width:70%"></i></div></div></td><td class="sc">7→7</td></tr>
+        <tr><td class="dim">整体架构 <span class="wt">#7</span></td><td class="wt">13</td>
+          <td><div class="bars"><div class="bar before"><i style="width:110%"></i></div><div class="bar after"><i style="width:110%"></i></div></div></td><td class="sc">11→11</td></tr>
+        <tr><td class="dim">实测表现 <span class="wt">#8</span></td><td class="wt">25</td>
+          <td><div class="bars"><div class="bar before"><i style="width:90%"></i></div><div class="bar after"><i style="width:100%"></i></div></div></td><td class="sc up">9→10</td></tr>
+      </tbody>
+    </table>
+
+    <div class="improve">
+      <b>Round 6 主要改进（dim 8 实测表现）：</b>
+      <ul>
+        <li>新增 <code>scripts/guard-verify.py</code> 执行桥接：读 test-plan 的
+          <code>selected</code> → 定位 scenario toml → 取 <code>[when].command</code>
+          → 在<b>仓库根</b>执行 → 落 <code>.env-report/verify-results.json</code> 证据。</li>
+        <li>守卫闭环补齐：此前只有「判定（能跑哪些）」，现在打通
+          <b>判定 → 执行 → 证据</b> 三段。</li>
+        <li>判据显式：<code>PASS</code>/<code>FAIL</code>/<code>SKIPPED</code>/
+          <code>NO_COMMAND</code>/<code>NO_SCENARIO</code>；<b>被门控跳过的绝不计为 PASS</b>。</li>
+        <li>退出码契约 0=无FAIL / 1=有FAIL / 2=BLOCKED（含 <code>mode!=scenarios</code> 的
+          demo 幻觉防护）/ 3=参数或IO错，与 harness-select 对齐。</li>
+        <li>支持 <code>--filter</code> / <code>--limit</code> / <code>--timeout</code> /
+          <code>--refresh-env</code> / <code>--dry-run</code>，便于 CI 做轻量 smoke test。</li>
+        <li>跨平台：命令中的 <code>python3</code>/<code>python</code> 规范化为当前解释器
+          （Windows 常无 <code>python3</code>，只有 <code>py</code> 启动器）。</li>
+        <li>mise 加 <code>[tasks.verify]</code> / <code>[tasks.verify-dry]</code>；
+          CI <code>guard-flow</code> 加 dry-run 步骤（真实仓库 300+ 场景全跑代价过高）。</li>
+        <li>回归套件 22→24 用例。</li>
+      </ul>
+      <b style="color:var(--accent)">勘误：</b>Round 3 总分原记 89.9 系求和笔误（维度7 <code>11×13</code> 误计为 156），
+      已重算修正为 <b>88.6</b>。棘轮结论不变（仍 &gt; R2 的 87.4）。
+    </div>
+
+    <div class="foot">
+      <span>棘轮：<b>keep</b> · commit <b>5334100</b></span>
+      <span>Train your Skills like you train your models · darwin × sandbox-env-guard</span>
+    </div>
+  </div>
+</div>
+</body>
+</html>

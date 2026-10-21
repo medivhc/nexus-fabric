@@ -1,0 +1,4 @@
+schema_version = 1
+id = "product.n3-10-operator-grant"
+title = "真实产物通过本地 scoped Use 运维撤权（示例，演示 n3-* 命中 linux_executor）"
+evidence_strength = "E4"
