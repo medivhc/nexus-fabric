@@ -24,7 +24,9 @@
 # ============================================================================
 import json, shutil, subprocess, os, sys, datetime, platform, re, fnmatch, time, socket
 import argparse
-import fcntl, struct  # TUNSETIFF ioctl 需要
+import struct
+if os.name == "posix":
+    import fcntl  # TUNSETIFF ioctl 需要；Windows 无此模块，probe_tun 仅在 posix 分支使用
 
 # 工具版本（--version 输出）与产物 schema 版本（写入 JSON 的 schema_version）。
 # 二者分离：工具迭代不一定改 schema；下游应校验 schema_version 而非工具版本。

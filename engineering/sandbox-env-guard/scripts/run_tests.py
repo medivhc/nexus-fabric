@@ -216,29 +216,34 @@ def main():
     if rep is None:
         failures.append("[env-check] 正常跑未产出 JSON（stdout 异常）")
     else:
-        # 本沙箱无 /dev/net/tun → missing（R2：无设备节点判 missing 而非 degraded）
+        # 默认 TUN 设备探测：结果必须落在三态枚举内。
+        # 注意（CI 实测修正）：不能断言 "missing"——GitHub ubuntu runner 上
+        # /dev/net/tun 存在但无 CAP_NET_ADMIN，会正确返回 degraded。
+        # missing/degraded 两态的确定性覆盖见下方 5b/5c（用 TUN_DEVICE_PATH 控制）。
         tun = rep["capabilities"]["tun_net_admin"]["status"]
-        if tun != "missing":
-            failures.append(f"[env-check] 无 /dev/net/tun 应判 missing，实际 {tun}")
+        if tun not in ("missing", "degraded", "ok"):
+            failures.append(f"[env-check] 默认 TUN 探测应落在三态枚举内，实际 {tun}")
         # SKIP_NETWORK_PROBES → 网络类能力记 unknown（「未探测」≠「缺失」）
         if rep["capabilities"]["github_proxy"]["status"] != "unknown":
             failures.append("[env-check] SKIP_NETWORK_PROBES 下 github_proxy 应 unknown")
         if rep["capabilities"]["internet_egress"]["status"] != "unknown":
             failures.append("[env-check] SKIP_NETWORK_PROBES 下 internet_egress 应 unknown")
 
-    # 5b) TUN_DEVICE_PATH=/nonexistent → missing
-    rep = run_env_check({"TUN_DEVICE_PATH": "/nonexistent"})
-    if rep is None or rep["capabilities"]["tun_net_admin"]["status"] != "missing":
-        got = rep["capabilities"]["tun_net_admin"]["status"] if rep else "N/A"
-        failures.append(f"[env-check] TUN_DEVICE_PATH=/nonexistent 应 missing，实际 {got}")
+    # 5b) TUN_DEVICE_PATH=/nonexistent → missing（仅 posix：Windows 无 fcntl/ioctl，
+    #     probe_tun 走 non-posix 分支恒返 degraded，missing/degraded 语义不适用）
+    if os.name == "posix":
+        rep = run_env_check({"TUN_DEVICE_PATH": "/nonexistent"})
+        if rep is None or rep["capabilities"]["tun_net_admin"]["status"] != "missing":
+            got = rep["capabilities"]["tun_net_admin"]["status"] if rep else "N/A"
+            failures.append(f"[env-check] TUN_DEVICE_PATH=/nonexistent 应 missing，实际 {got}")
 
-    # 5c) TUN_DEVICE_PATH=普通文件 → 可 open 但 TUNSETIFF 失败 → degraded（避免假 ok）
-    tmpf = tempfile.NamedTemporaryFile(delete=False).name
-    rep = run_env_check({"TUN_DEVICE_PATH": tmpf})
-    os.unlink(tmpf)
-    if rep is None or rep["capabilities"]["tun_net_admin"]["status"] != "degraded":
-        got = rep["capabilities"]["tun_net_admin"]["status"] if rep else "N/A"
-        failures.append(f"[env-check] 普通文件应 degraded（非假 ok），实际 {got}")
+        # 5c) TUN_DEVICE_PATH=普通文件 → 可 open 但 TUNSETIFF 失败 → degraded（避免假 ok）
+        tmpf = tempfile.NamedTemporaryFile(delete=False).name
+        rep = run_env_check({"TUN_DEVICE_PATH": tmpf})
+        os.unlink(tmpf)
+        if rep is None or rep["capabilities"]["tun_net_admin"]["status"] != "degraded":
+            got = rep["capabilities"]["tun_net_admin"]["status"] if rep else "N/A"
+            failures.append(f"[env-check] 普通文件应 degraded（非假 ok），实际 {got}")
 
     # ---- 6) 接口契约（R4）：--version / --help / 退出码 / guard-plan ----
     def run_tool(script, *args):
