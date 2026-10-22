@@ -109,7 +109,7 @@ cargo build --workspace
 
 ### 3.1 命令面总览（按 `nexus` CLI 实际分发，2026-10-05 复核）
 
-下表为 `apps/nexus/src/main.rs` 分发逻辑中**实际可达**的全部命令。全局选项 `--json` / `--addr <ip:port>` / `--socket <path>` 在分发前统一剥离（`--json` 任意位置；`--addr`/`--socket` 亦为全局剥离，**这会与 `proxy` 子命令自己的 `--addr` 冲突，见 §6.1**）；**退出码三档语义见 §4.9.2**。
+下表为 `apps/nexus/src/main.rs` 分发逻辑中**实际可达**的全部命令。全局选项 `--json` / `--addr <ip:port>` / `--socket <path>` 在分发前统一剥离（`--json` 任意位置；`--addr`/`--socket` 作为 daemon 目标剥离）。**例外**：`proxy` 数据面（`proxy` / `proxy host` / `proxy relay`）与 `pair` 的**尾随** `--addr` 是本地监听地址，不参与全局剥离；出现在命令**之前**的 `--addr` 仍按 daemon 目标剥离；前置 `--json` 不影响识别。这两族对 `--addr=<v>` / `--socket=<v>` 等号形式会显式报错（exit 2）；**其他命令仍不支持 `=` 形式**（`nexus status --addr=…` 会被当作未知 token，不会切换传输目标）。详见 §4.6.3 / §6.6；**退出码三档语义见 §4.9.2**。
 
 | 命令族 | 语法 | 路由/实现 | 产出 |
 | --- | --- | --- | --- |
@@ -643,7 +643,7 @@ cargo build --workspace
 
 * **用户用法**：`nexus proxy host service --addr 127.0.0.1:8787 --token <t>`；`nexus proxy relay --addr 127.0.0.1:8788`；`nexus proxy --addr 127.0.0.1:1080`
 
-* **已知缺陷（`--addr` 失效）**：`nexus proxy [host|relay] --addr <ip:port>` 的 `--addr` **当前不生效**——全局选项剥离器（`main.rs::extract_remote_target`）在分发前把 `--addr` 当作 thin-client 目标吞掉，子命令收不到，实际监听**默认端口**（SOCKS5 `1080`、host `8787`；`ss` 实测确认）。上面的示例恰用默认端口，故看似正常；换成别的端口即可复现（监听仍在默认端口）。**不在文档层改写成"预期行为"，已在 §6.1 登记为待修缺陷**；当前规避：只能用默认端口（`proxy` 的 `--config` / `--token` / `--tun` 不受影响）。
+* **`--addr` 定位（2026-10-22 已修复）**：此前 `nexus proxy [host|relay] --addr <ip:port>` 的 `--addr` 会被全局选项剥离器（`main.rs::extract_remote_target`）在分发前当作 thin-client 目标吞掉，子命令收不到、实际监听**默认端口**（SOCKS5 `1080`、host `8787`、relay `8788`）。现改为分流：`proxy` 族的 `--addr` 归子命令自身（`main.rs::command_owns_addr` + `plan_global_options`），原样保留，取值缺失时仍按用法错误 exit 2。实测：`proxy host --addr 127.0.0.1:19099` → `"addr":"127.0.0.1:19099"`；`proxy relay --addr 127.0.0.1:19098` → `ss` 确认监听该端口；`proxy --addr 127.0.0.1:19097` → `"addr":"127.0.0.1:19097"`。
 
 * **代码级校验**：`product.daemon-real-host-flow` (9) / `daemon-real-host-auth-denied` (5) / `daemon-real-relay-flow` (9) / `daemon-real-socks-proxy-flow` (11) → 全部 PASS；错误 token 透传 `AUTH_DENIED`，host 为持续服务循环
 
@@ -828,7 +828,7 @@ whitespace、format、check、clippy、architecture-policy（fast 侧 delta）�
 | Workspace Projection 通道（NativeApi + MaterializedDirectory） | 已实现 | 三通道选择 + NativeApi WorkingSet 读写/commit + MaterializedDirectory 物化目录均已落地（E4 `platform.workspace-projection-channels` 16 期望 PASS，2026-09-20）；NativeMountDirectory 真实目录挂载仍为 API 声明待落地 |
 | nexus CLI 观察命令                          | thin-client | 路由表 **8 条**（静态 5 + 动态 3；CLI 实际经 daemon 为 5 静态 + `workspace commit`，`plan`/`session` 先被 N2 模块接管）；默认 **unix socket 优先**（TCP `127.0.0.1:18080` 为回退/显式）；其余 10 命令本地显式 UNSUPPORTED；`--socket` 在 Windows 构建不可用 |
 | nexus CLI 退出码                            | 三档          | `0` 已处理（含 daemon FAIL / 本地 UNSUPPORTED / `run`）；`1` N2 进程内 `verdict=FAIL`（NOT_FOUND / AUTH_DENIED / ALREADY_TERMINATED）；`2` 用法错误。**不要只按 0/非 0 判定，须读 `verdict`**（见 §4.9.2） |
-| `nexus proxy [host\|relay] --addr`         | **待修缺陷**   | `--addr` 被全局选项剥离器在分发前吞掉，子命令收不到，实际监听默认端口（SOCKS5 1080 / host 8787）；手册与 CLI 自带帮助均承诺该 flag 生效。规避：只能用默认端口（见 §4.6.3） |
+| `nexus proxy [host\|relay] --addr`         | 已修复（2026-10-22） | 曾因全局选项剥离器在分发前吞掉 `--addr`，回落到默认端口（1080/8787/8788）；现 `proxy` 族保留自有 `--addr`（`plan_global_options`），缺值仍 exit 2。见 §4.6.3 / §6.6 |
 | `nexusd --help` / `nexusd serve --help`    | 帮助缺口       | `nexusd --help` 只列 `nexusd <config-folder>`，**不含 `serve`**（exit 2）；`nexusd serve --help` **不显示帮助、会直接启动 daemon** |
 | `nexus-platform-host vpi-capabilities`     | 需 feature   | 仅在 `--features platform-windows` 构建下输出能力 JSON；默认构建只打印 stub 文本（见 §4.8.1） |
 | `nexus subnet status` 的 verdict           | 含 `DOWN`    | 无隧道/状态文件缺失或损坏时返回 `verdict:"DOWN"`（并非 PASS/FAIL 二分）；脚本须容忍 `DOWN` / `STORE_ERROR` / `TUN_ERROR` |
@@ -945,3 +945,33 @@ thin-client 架构下的契约收敛（进程内观察快照仍由 SDK `nexus::o
 
 > 走查中未重跑 `nexus-harness verify --full`，因此本手册**不新增、不复用任何完成证据**；
 > 上述条目均可用对应 CLI 在目标 revision 直接复现。Final PASS 只由 Harness 产生。
+
+### 6.6 修复记录（2026-10-22：bugfix + dependency，`verify --fast` 9/9 全绿）
+
+本轮先把 master 上**一直没真正跑通**的门禁跑通，再修掉 §6.1 登记的待修缺陷。三项变更：
+
+1. **`nexus proxy [host|relay] --addr` 失效 → 已修复（bugfix）**：`apps/nexus/src/main.rs` 新增
+   `default_remote_target()` / `command_index()` / `command_owns_addr()` / `flag_value()` /
+   `plan_global_options()` / `first_positional()` / `split_proxy_subcommand()`；`run()` 的分发改用
+   `plan_global_options`——对 `proxy` / `pair` 只剥离**命令 token 之前**的 `--addr`/`--socket`
+   （仍作 daemon 目标，保证 `nexus --addr <a> proxy ...` 能正常分发），命令之后的 `--addr` 原样
+   交给子命令。取值缺失、`--addr=<v>` 等号形式均显式 exit 2，不静默回落默认端口。
+   `run_proxy` 用 `split_proxy_subcommand()` 识别子命令，使 `proxy --addr <a> host <res>` 与
+   `proxy host <res> --addr <a>` 等价；资源名改由 `first_positional()` 取，缺资源名时仍打印 usage。
+   实测：`proxy host --addr 127.0.0.1:19099`、`proxy host service --addr 127.0.0.1:19094`、
+   `proxy --addr 127.0.0.1:19095 host service`、`proxy --addr 127.0.0.1:19092`、
+   `nexus --json proxy --addr 127.0.0.1:19096`、`nexus --addr 127.0.0.1:18080 proxy --addr 127.0.0.1:19088`
+   均按指定端口 READY；`proxy relay --addr 127.0.0.1:19087` 由 `ss` 确认监听；
+   `proxy --addr 127.0.0.1:19075 host`（缺资源名）→ usage exit 2。
+   顺带修掉同类缺陷 `nexus pair join <code> --addr <ip:port>`（`pair_cli::parse_addr` 自己消费该 flag）。
+   配套单测 10 个，`cargo test -p nexus --bin nexus` 35 passed。
+2. **依赖安全告警 → 已修复（dependency）**：`cargo-deny` 真跑后暴露 5 条 RUSTSEC 告警
+   （`rustls` 4 条：RUSTSEC-2026-0346/0347/0348/0349；`rustls-webpki` 1 条：RUSTSEC-2026-0382）。
+   按 advisory 建议做 **patch 级**升级：`rustls 0.23.45 → 0.23.46`、`rustls-webpki 0.103.15 → 0.103.16`
+   （仅 `Cargo.lock`，未改任何 `Cargo.toml`，feature 与 API 不变）。
+3. **clippy 门禁红 → 已修复（test 域机械修正）**：`crates/nexus-platform-linux/src/directory_publish_tests.rs`
+   的 `clippy::redundant_iter_cloned`（`.iter().cloned()` → `sources.clone().into_iter()`），零行为变化。
+
+> 说明：此前 §6.1 的 `dependency-governance` 长期是 UNKNOWN（`cargo-deny` 未装 / advisory-db 未拉取），
+> 等于该门禁**从未真正评估**；本轮装齐工具并拉取 RustSec 数据库后才暴露上述告警。
+> `verify --fast` 结果：**9 gates, 9 pass, 0 fail, 0 unknown**。

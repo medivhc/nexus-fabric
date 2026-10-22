@@ -166,31 +166,102 @@ impl RemoteTarget {
     }
 }
 
+/// daemon 目标默认值（D8：默认 unix socket，TCP 为回退/显式）。
+fn default_remote_target() -> RemoteTarget {
+    match localapi_client::default_target() {
+        localapi_client::LocalApiTarget::Socket(p) => RemoteTarget::Socket(p.display().to_string()),
+        localapi_client::LocalApiTarget::Tcp(a) => RemoteTarget::Tcp(a),
+    }
+}
+
+/// 跳过前置全局 flag（`--json`）与全局选项（`--addr` / `--socket` 及其取值），
+/// 返回命令 token 在 args 中的下标。
+fn command_index(args: &[String]) -> Option<usize> {
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => i += 1,
+            "--addr" | "--socket" => i += 2,
+            _ => return Some(i),
+        }
+    }
+    None
+}
+
+/// 命令族是否自己解析**尾随** `--addr`：`proxy` 数据面与 `pair` 的 `--addr`
+/// 是本地监听地址，不是 thin-client 的 daemon 目标。
+fn command_owns_addr(args: &[String]) -> bool {
+    matches!(
+        command_index(args).map(|i| args[i].as_str()),
+        Some("proxy" | "pair")
+    )
+}
+
+/// 取 `--flag <value>` 的值；缺失或以另一个 flag 开头都算用法错误。
+fn flag_value(args: &[String], i: usize, flag: &str) -> Result<String, String> {
+    args.get(i + 1)
+        .filter(|v| !v.starts_with("--"))
+        .cloned()
+        .ok_or_else(|| format!("missing value for {flag}"))
+}
+
+/// 全局选项分流：`--addr` / `--socket` 表示 daemon 目标时剥离并返回剩余 args。
+/// 对 `command_owns_addr` 的命令族（`proxy` / `pair`），只剥离**命令 token 之前**的
+/// 全局选项，命令之后的 `--addr` 原样交给子命令（见 §4.6.3 / §6.6）。
+fn plan_global_options(args: &[String]) -> Result<(RemoteTarget, Vec<String>), String> {
+    if !command_owns_addr(args) {
+        return extract_remote_target(args);
+    }
+    let command_at = command_index(args).unwrap_or(args.len());
+    let mut remote = default_remote_target();
+    let mut rest = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < command_at {
+        match args[i].as_str() {
+            "--addr" => {
+                remote = RemoteTarget::Tcp(flag_value(args, i, "--addr")?);
+                i += 2;
+            }
+            "--socket" => {
+                remote = RemoteTarget::Socket(flag_value(args, i, "--socket")?);
+                i += 2;
+            }
+            other => {
+                rest.push(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    rest.extend_from_slice(&args[command_at..]);
+    // 命令之后（子命令自有）的取值缺失仍是用法错误，不允许静默回落默认端口。
+    for i in command_at..args.len() {
+        let arg = args[i].as_str();
+        for flag in ["--addr", "--socket"] {
+            if let Some(value) = arg.strip_prefix(flag).and_then(|r| r.strip_prefix('=')) {
+                return Err(format!("use `{flag} {value}` form, not `{arg}`"));
+            }
+        }
+        if matches!(arg, "--addr" | "--socket") {
+            flag_value(args, i, arg)?;
+        }
+    }
+    Ok((remote, rest))
+}
+
 /// 从参数中剥离全局 `--addr <ip:port>` / `--socket <path>`（D8：默认 unix socket）。
 /// 返回 (remote, 剩余 args)。
 fn extract_remote_target(args: &[String]) -> Result<(RemoteTarget, Vec<String>), String> {
-    let mut remote = match localapi_client::default_target() {
-        localapi_client::LocalApiTarget::Socket(p) => RemoteTarget::Socket(p.display().to_string()),
-        localapi_client::LocalApiTarget::Tcp(a) => RemoteTarget::Tcp(a),
-    };
+    let mut remote = default_remote_target();
     let mut rest = Vec::with_capacity(args.len());
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--addr" => {
-                let value = args
-                    .get(i + 1)
-                    .filter(|v| !v.starts_with("--"))
-                    .ok_or_else(|| "missing value for --addr".to_string())?;
-                remote = RemoteTarget::Tcp(value.clone());
+                remote = RemoteTarget::Tcp(flag_value(args, i, "--addr")?);
                 i += 2;
             }
             "--socket" => {
-                let value = args
-                    .get(i + 1)
-                    .filter(|v| !v.starts_with("--"))
-                    .ok_or_else(|| "missing value for --socket".to_string())?;
-                remote = RemoteTarget::Socket(value.clone());
+                remote = RemoteTarget::Socket(flag_value(args, i, "--socket")?);
                 i += 2;
             }
             other => {
@@ -231,7 +302,7 @@ fn run(args: &[String]) -> i32 {
         let (json_mode, local_args) = split_json_flag(args);
         return nexus::task_provider_grant::run(&local_args[1..], json_mode);
     }
-    let (target, args) = match extract_remote_target(args) {
+    let (target, args) = match plan_global_options(args) {
         Ok(v) => v,
         Err(msg) => {
             eprintln!("error: {msg}");
@@ -1111,7 +1182,7 @@ fn proxy_bufferbloat_test_cli(args: &[String]) -> i32 {
 }
 /// 路由资源名到 SDK 组合根闭环；带 `--endpoint` 时走真实网络访问（real transport）。
 fn proxy_run_resource(args: &[String]) -> i32 {
-    let Some(resource) = args.first() else {
+    let Some(resource) = first_positional(args) else {
         eprintln!(
             "usage: nexus proxy run <service|internet-access|compute|workspace> [--endpoint <ip:port>] [--relay <ip:port>] [--token <t>] [--json]"
         );
@@ -1173,7 +1244,7 @@ fn proxy_run_resource(args: &[String]) -> i32 {
                     .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
             }
         }
-        None => match resource.as_str() {
+        None => match resource {
             "service" => nexus::remote_service_access_flow()
                 .map(|v| enrich("service", v))
                 .map_err(|e| ("INTERNAL".to_string(), e.to_string())),
@@ -1198,9 +1269,27 @@ fn proxy_run_resource(args: &[String]) -> i32 {
     print_json_result(result)
 }
 
+/// 第一个位置参数（跳过 `--flag` 与其取值，判定口径与 `parse_flags` 一致）。
+/// `proxy` 族允许全局 flag 前置，资源名不能简单取 `args.first()`。
+fn first_positional(args: &[String]) -> Option<&str> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg.starts_with("--") || arg == "-h" {
+            i += match args.get(i + 1) {
+                Some(next) if !next.starts_with("--") => 2,
+                _ => 1,
+            };
+        } else {
+            return Some(arg);
+        }
+    }
+    None
+}
+
 /// 提供方入口：真实地址持续监听，服务端 AUTH 门控 + 按资源执行业务（服务循环）。
 fn proxy_host_resource(args: &[String]) -> i32 {
-    let Some(resource) = args.first() else {
+    let Some(resource) = first_positional(args) else {
         eprintln!(
             "usage: nexus proxy host <service|internet-access|compute> --addr <ip:port> [--token <t>]"
         );
@@ -1413,15 +1502,42 @@ fn run_config(args: &[String]) -> i32 {
     }
 }
 
+/// 识别 `proxy` 子命令，允许全局 flag 前置（`nexus proxy --addr <a> host <res>`
+/// 与 `nexus proxy host <res> --addr <a>` 等价）。返回 (子命令, 去掉子命令 token 的 args)；
+/// 其余 token 保持原有相对顺序，资源名一律由 `first_positional` 取。
+fn split_proxy_subcommand(args: &[String]) -> (Option<&str>, Vec<String>) {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if matches!(arg, "--help" | "-h") {
+            return (Some(arg), args.to_vec());
+        }
+        if arg.starts_with("--") {
+            // 与 `parse_flags` 同口径：下一个 token 不以 `--` 开头即视为该 flag 的取值。
+            i += match args.get(i + 1) {
+                Some(next) if !next.starts_with("--") => 2,
+                _ => 1,
+            };
+            continue;
+        }
+        let mut rest = args[..i].to_vec();
+        rest.extend_from_slice(&args[i + 1..]);
+        return (Some(arg), rest);
+    }
+    (None, args.to_vec())
+}
+
 /// 真实 SOCKS5 数据面入口：监听后逐会话完成握手 → 规则路由 → Session →
 /// 真实出站 → 字节中继；每会话输出一条结构化 JSON（Ctrl-C 停止）。
 /// `nexus proxy` 分发：speedtest/--tun/--addr 监听/run/host/relay 子命令。
 fn run_proxy(args: &[String]) -> i32 {
-    // 子命令路由（自 nexusd run/host/relay 迁移，避免与 `nexus run` 冲突）
-    match args.first().map(String::as_str) {
-        Some("run") => return proxy_run_resource(&args[1..]),
-        Some("host") => return proxy_host_resource(&args[1..]),
-        Some("relay") => return proxy_relay_resource(&args[1..]),
+    // 子命令路由（自 nexusd run/host/relay 迁移，避免与 `nexus run` 冲突）。
+    // 先跳过前置 flag 再识别：`proxy --addr <a> host <res>` 与文档顺序等价。
+    let (subcommand, rest) = split_proxy_subcommand(args);
+    match subcommand {
+        Some("run") => return proxy_run_resource(&rest),
+        Some("host") => return proxy_host_resource(&rest),
+        Some("relay") => return proxy_relay_resource(&rest),
         Some("--help") | Some("-h") => {
             println!(
                 "usage: nexus proxy [--addr <ip:port>] [--config <path>] [--tun] [--tun-name <n>]\n\
@@ -1436,7 +1552,7 @@ fn run_proxy(args: &[String]) -> i32 {
         _ => {}
     }
     // 节点测速子命令（PRODUCT §11.10）：loopback 自检真实 TcpLatencyProbe。
-    if args.first().map(|a| a.as_str()) == Some("speedtest") {
+    if subcommand == Some("speedtest") {
         match nexus::proxy_speedtest() {
             Ok(json) => println!("{json}"),
             Err(e) => println!(
@@ -1446,8 +1562,8 @@ fn run_proxy(args: &[String]) -> i32 {
         return 0;
     }
     // bufferbloat 诊断：空载基准 vs 打满负载的延迟对比，定位拥塞段。
-    if args.first().map(|a| a.as_str()) == Some("bufferbloat-test") {
-        return proxy_bufferbloat_test_cli(&args[1..]);
+    if subcommand == Some("bufferbloat-test") {
+        return proxy_bufferbloat_test_cli(&rest);
     }
     let flags = parse_flags(args);
     // §11.18 TUN 透明入站：--tun 走真实 wintun adapter 开卡（E5，需管理员 + wintun.dll
@@ -1865,6 +1981,176 @@ mod tests {
     fn socket_flag_missing_value_is_usage_error() {
         let args = vec!["--socket".to_string()];
         assert!(extract_remote_target(&args).is_err());
+    }
+
+    // §6.1 缺陷修复：`proxy` 数据面的 `--addr` 是子命令自己的监听地址，
+    // 必须在全局剥离前保留，否则实际监听回落到默认端口。
+    #[test]
+    fn proxy_subcommands_keep_their_own_addr_flag() {
+        for tail in [
+            vec!["host".to_string(), "svc".to_string()],
+            vec!["relay".to_string()],
+            Vec::new(),
+        ] {
+            let mut args = vec!["proxy".to_string()];
+            args.extend(tail);
+            args.extend(["--addr".to_string(), "127.0.0.1:9999".to_string()]);
+            let (_, rest) = plan_global_options(&args).unwrap();
+            let flags = parse_flags(&rest[1..]);
+            assert_eq!(
+                flags.get("--addr").and_then(|v| v.as_deref()),
+                Some("127.0.0.1:9999"),
+                "proxy 族必须收到 --addr：{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_addr_missing_value_is_still_usage_error() {
+        let args = vec![
+            "proxy".to_string(),
+            "host".to_string(),
+            "--addr".to_string(),
+        ];
+        assert!(plan_global_options(&args).is_err());
+    }
+
+    #[test]
+    fn json_flag_before_proxy_still_keeps_addr() {
+        // 评审 r1 阻断项：`nexus --json proxy --addr <a>` 前置 --json 时
+        // 不能被全局剥离器吞掉，否则静默监听默认端口 1080。
+        let args = vec![
+            "--json".to_string(),
+            "proxy".to_string(),
+            "--addr".to_string(),
+            "127.0.0.1:19096".to_string(),
+        ];
+        let (_, rest) = plan_global_options(&args).unwrap();
+        let flags = parse_flags(&rest[1..]);
+        assert_eq!(
+            flags.get("--addr").and_then(|v| v.as_deref()),
+            Some("127.0.0.1:19096")
+        );
+    }
+
+    #[test]
+    fn proxy_subcommand_is_recognized_after_leading_flags() {
+        // `proxy --addr <a> host <res>` 与 `proxy host <res> --addr <a>` 等价；
+        // 修复前者的顺序敏感会让它误跑成主 SOCKS5 代理。
+        let args = vec![
+            "--addr".to_string(),
+            "127.0.0.1:19099".to_string(),
+            "host".to_string(),
+            "service".to_string(),
+        ];
+        let (sub, rest) = split_proxy_subcommand(&args);
+        assert_eq!(sub, Some("host"));
+        // 其余 token 保持原顺序；资源名交给 first_positional 取。
+        assert_eq!(
+            rest,
+            vec![
+                "--addr".to_string(),
+                "127.0.0.1:19099".to_string(),
+                "service".to_string()
+            ]
+        );
+        assert_eq!(first_positional(&rest), Some("service"));
+        let plain: Vec<String> = vec!["--addr".to_string(), "127.0.0.1:19097".to_string()];
+        let (sub, rest) = split_proxy_subcommand(&plain);
+        assert_eq!(sub, None);
+        assert_eq!(rest, plain);
+    }
+
+    #[test]
+    fn leading_addr_before_proxy_stays_daemon_target() {
+        // `nexus --addr <a> proxy --addr <b>`：前面的按 daemon 目标剥离（保证能分发到 proxy），
+        // 后面的归 proxy 自己；修复前全部被吞，proxy 回落到默认端口。
+        let args = vec![
+            "--addr".to_string(),
+            "127.0.0.1:18080".to_string(),
+            "proxy".to_string(),
+            "--addr".to_string(),
+            "127.0.0.1:19091".to_string(),
+        ];
+        let (target, rest) = plan_global_options(&args).unwrap();
+        assert_eq!(target, RemoteTarget::Tcp("127.0.0.1:18080".into()));
+        assert_eq!(
+            rest,
+            vec![
+                "proxy".to_string(),
+                "--addr".to_string(),
+                "127.0.0.1:19091".to_string()
+            ]
+        );
+        let flags = parse_flags(&rest[1..]);
+        assert_eq!(
+            flags.get("--addr").and_then(|v| v.as_deref()),
+            Some("127.0.0.1:19091")
+        );
+    }
+
+    #[test]
+    fn pair_keeps_its_trailing_addr() {
+        // 与 proxy 同类：`pair` 的 `--addr` 是本地监听地址（pair_cli::parse_addr 自己消费）。
+        let args = vec![
+            "pair".to_string(),
+            "join".to_string(),
+            "code".to_string(),
+            "--addr".to_string(),
+            "127.0.0.1:19999".to_string(),
+        ];
+        let (_, rest) = plan_global_options(&args).unwrap();
+        assert_eq!(rest, args);
+    }
+
+    #[test]
+    fn first_positional_skips_preceding_flags() {
+        // 评审 r2：缺资源名时不能把 `--addr` 当资源名。
+        let args = vec![
+            "--addr".to_string(),
+            "127.0.0.1:19075".to_string(),
+            "service".to_string(),
+        ];
+        assert_eq!(first_positional(&args), Some("service"));
+        let no_resource = vec!["--addr".to_string(), "127.0.0.1:19075".to_string()];
+        assert_eq!(first_positional(&no_resource), None);
+        let resource_first = vec![
+            "service".to_string(),
+            "--addr".to_string(),
+            "127.0.0.1:19075".to_string(),
+        ];
+        assert_eq!(first_positional(&resource_first), Some("service"));
+    }
+
+    #[test]
+    fn proxy_rejects_equals_form_and_keeps_pre_flag_routing() {
+        // `--addr=<v>` 等号形式不允许静默回落默认端口（proxy/pair 族）。
+        let equals = vec!["proxy".to_string(), "--addr=127.0.0.1:19063".to_string()];
+        assert!(plan_global_options(&equals).is_err());
+        let socket_equals = vec!["proxy".to_string(), "--socket=/tmp/x.sock".to_string()];
+        let err = plan_global_options(&socket_equals).unwrap_err();
+        assert!(err.contains("--socket"), "错误文案应指向 --socket：{err}");
+        // 带取值的前置 flag 不得被误当成子命令（bufferbloat-test 的 `--proxy` 等）。
+        let pre_flag = vec![
+            "--proxy".to_string(),
+            "127.0.0.1:1".to_string(),
+            "bufferbloat-test".to_string(),
+        ];
+        let (sub, rest) = split_proxy_subcommand(&pre_flag);
+        assert_eq!(sub, Some("bufferbloat-test"));
+        assert_eq!(rest, vec!["--proxy".to_string(), "127.0.0.1:1".to_string()]);
+    }
+
+    #[test]
+    fn daemon_commands_still_strip_addr_as_target() {
+        let args = vec![
+            "status".to_string(),
+            "--addr".to_string(),
+            "127.0.0.1:18080".to_string(),
+        ];
+        let (target, rest) = plan_global_options(&args).unwrap();
+        assert_eq!(target, RemoteTarget::Tcp("127.0.0.1:18080".into()));
+        assert_eq!(rest, vec!["status".to_string()]);
     }
 
     #[test]
