@@ -702,8 +702,10 @@ fn shutdown_sequence(
     }
 }
 
-/// R4：注册 Unix 信号处理（SIGTERM/SIGINT → 置位关闭标志）。
-/// 非 Unix 平台为 no-op（诚实：优雅关闭仅 Unix）。
+/// R4：注册关闭信号（SIGTERM/SIGINT → 置位关闭标志）。
+/// Unix 注册 SIGTERM/SIGINT；Windows 注册 SIGINT/SIGBREAK（Ctrl+C/Ctrl+Break），
+/// 使 Windows daemon 也支持优雅关闭（n3-8 shutdown_reaped 平台可达）。
+/// 其他平台为 no-op（诚实：优雅关闭仅 Unix/Windows）。
 #[cfg(unix)]
 fn register_shutdown_flag(flag: &Arc<AtomicBool>) {
     use signal_hook::consts::{SIGINT, SIGTERM};
@@ -714,7 +716,18 @@ fn register_shutdown_flag(flag: &Arc<AtomicBool>) {
     }
 }
 
-#[cfg(not(unix))]
+/// R4（Windows）：Ctrl+C / Ctrl+Break → 置位关闭标志，走完整优雅关闭序列。
+#[cfg(windows)]
+fn register_shutdown_flag(flag: &Arc<AtomicBool>) {
+    use signal_hook::consts::{SIGBREAK, SIGINT};
+    for sig in [SIGINT, SIGBREAK] {
+        if let Err(e) = signal_hook::flag::register(sig, Arc::clone(flag)) {
+            eprintln!("[nexusd] WARN: failed to register signal handler for {sig}: {e}");
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn register_shutdown_flag(_flag: &Arc<AtomicBool>) {
     eprintln!("[nexusd] WARN: graceful shutdown on signal not supported on this platform");
 }

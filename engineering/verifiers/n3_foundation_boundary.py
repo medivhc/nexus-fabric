@@ -7,8 +7,28 @@ from pathlib import Path
 import queue
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
+
+
+def terminate(child):
+    """Send a graceful shutdown signal; Windows uses Ctrl+Break so the daemon's
+    console handler can run the clean shutdown sequence (exit 0), matching Unix
+    SIGTERM semantics. `CREATE_NEW_PROCESS_GROUP` isolates the event."""
+    if child.poll() is not None:
+        return
+    if sys.platform == 'win32':
+        child.send_signal(signal.CTRL_BREAK_EVENT)
+    else:
+        child.send_signal(signal.SIGTERM)
+
+
+def popen_kwargs():
+    """Windows needs a new process group so Ctrl+Break reaches only the daemon."""
+    if sys.platform == 'win32':
+        return {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {}
 
 
 def observe():
@@ -31,7 +51,7 @@ def observe():
         stderr_path = base / 'daemon.stderr'
         lines = queue.Queue()
         with stderr_path.open('w') as stderr:
-            child = subprocess.Popen([str(daemon), str(root)], env=env, stdout=subprocess.PIPE, stderr=stderr, text=True)
+            child = subprocess.Popen([str(daemon), str(root)], env=env, stdout=subprocess.PIPE, stderr=stderr, text=True, **popen_kwargs())
             def read_stdout():
                 for line in child.stdout:
                     lines.put(line)
@@ -73,7 +93,7 @@ def observe():
                 observations = {'http_status': status, 'sessions': session_list, 'submit': submit, 'download': download}
             finally:
                 if child.poll() is None:
-                    child.send_signal(signal.SIGTERM)
+                    terminate(child)
                 try:
                     child.wait(timeout=12)
                 except subprocess.TimeoutExpired:
