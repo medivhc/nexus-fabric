@@ -284,8 +284,8 @@ fn no_replace_two_concurrent_directory_publishers_have_exactly_one_winner() {
     ];
     let barrier = Arc::new(Barrier::new(3));
     let handles: Vec<_> = sources
-        .iter()
-        .cloned()
+        .clone()
+        .into_iter()
         .map(|source| {
             let target = target.clone();
             let barrier = barrier.clone();
