@@ -286,7 +286,7 @@ n3-* 那批场景能在 example 从未交付的情况下长期挂仓库而不阻
 | P1 | `generate_coverage.sh` 改 fail-fast | ✅ **已修**（§4.4）|
 | P1 | 修 4 个真红门禁场景 | ✅ **已修 2 个真红**（`n3-8` / `n3-localapi-v1-boundary`，§7.4）；`n3-9`/`n3-10` 为 UNKNOWN 环境门控不红 |
 | P1 | 修 `13-system-proxy` 过期命令（`-p nexusd` → `-p nexus`）| ⏳ 未做；且**执行前必须先确认副作用**——它会真实改写 HKCU 系统代理，失败会残留 `127.0.0.1:7898` 致断网 |
-| P1 | 修 harness「坏场景文件静默消失」 | ⏳ 未做；`load_all` 注释（`scenario.rs:257-258`）称"汇总为 FAIL"但实现无此路径，违反 fail-closed |
+| P1 | 修 harness「坏场景文件静默消失」 | ✅ **已修**（`a3eb10f`）：`load_all` 错误写入累计器，`run_gate` fail-closed FAIL；新增 2 个测试 |
 | P2 | 补 PRODUCT.md 规范段（vless）| 🔜 已批准 vless 明文路径一个点，须显式标注 retrospective；anytls 待 vless 验完再派 |
 | P2 | 定门禁豁免规则 | ⚠️ 已明确**不推荐**改 `scenario.rs:656` 前缀白名单——门禁代码本身是 Protected，改它需自身先走 Contract-First |
 | P3 | 补 vless 隧道 E4 场景 | 🔜 已派单（明文路径 `tls: false`，不碰证书）|
