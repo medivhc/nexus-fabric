@@ -293,10 +293,15 @@ pub fn dispatch(
 
 /// Pins the private token's initial inode and verifies it before every N3 body.
 /// v0 retains its existing token behavior.
+///
+/// The identity pin is cross-platform: Unix uses `(dev, ino)`, Windows uses
+/// `(VolumeSerialNumber, FileIndex)`. A `cfg(not(unix))` stub that always
+/// refused made every N3 request on Windows fail with AUTH_DENIED before the
+/// service layer could answer (2026-10-22 gate run: n3-8-foundation-boundary
+/// expected `UNSUPPORTED_CAPABILITY` from Submit, got 401).
 pub struct TokenAuthority {
     expected: String,
     path: std::path::PathBuf,
-    #[cfg(unix)]
     identity: Option<(u64, u64)>,
 }
 impl TokenAuthority {
@@ -307,22 +312,12 @@ impl TokenAuthority {
     pub fn open_at(expected: &str, path: std::path::PathBuf) -> Self {
         Self {
             expected: expected.to_owned(),
-            #[cfg(unix)]
             identity: private_token(&path, expected).ok(),
             path,
         }
     }
     fn valid(&self) -> bool {
-        #[cfg(unix)]
-        {
-            self.identity.is_some()
-                && private_token(&self.path, &self.expected).ok() == self.identity
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (&self.path, &self.expected);
-            false
-        }
+        self.identity.is_some() && private_token(&self.path, &self.expected).ok() == self.identity
     }
 }
 #[cfg(unix)]
@@ -363,5 +358,181 @@ fn private_token(path: &std::path::Path, expected: &str) -> Result<(u64, u64), (
             return Err(());
         }
         Ok((fd.dev(), fd.ino()))
+    }
+}
+
+/// Windows counterpart: `(VolumeSerialNumber, FileId)` is the platform's
+/// analogue of `(dev, ino)`, pinned at startup and re-verified per request so
+/// a replaced token file fails closed. Reparse points (symlink/junction) are
+/// rejected before any read, mirroring the Unix `O_NOFOLLOW` + `is_symlink`
+/// pair. Unix-only checks without a portable equivalent (`nlink == 1`,
+/// mode `0600`) are covered here by the identity pin plus constant-time
+/// content comparison; DACL inspection is intentionally out of scope.
+///
+/// `GetFileInformationByHandleEx(FileIdInfo)` is used instead of the unstable
+/// `MetadataExt::file_index`/`volume_serial_number` and instead of
+/// `GetFileInformationByHandle`'s `nFileIndex*`, which is only stable while a
+/// handle to the file is open (the system may reuse the index afterwards).
+/// `FILE_ID_INFO` carries the filesystem-persistent 128-bit file ID, which
+/// remains stable for the file's lifetime and changes after deletion/recreation.
+#[cfg(not(unix))]
+fn private_token(path: &std::path::Path, expected: &str) -> Result<(u64, u64), ()> {
+    use std::io::Read;
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::io::AsRawHandle;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    // Inspect the link itself first: never follow a reparse point.
+    let link = std::fs::symlink_metadata(path).map_err(|_| ())?;
+    if !link.is_file() || link.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(());
+    }
+    // Read content and take identity from the opened handle so the checked
+    // bytes and the pinned identity come from the same file.
+    let mut file = std::fs::File::open(path).map_err(|_| ())?;
+    let metadata = file.metadata().map_err(|_| ())?;
+    if metadata.len() > 128 {
+        return Err(());
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(129)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ())?;
+    let value = std::str::from_utf8(&bytes).map_err(|_| ())?.trim();
+    if !equal_token(value.as_bytes(), expected.as_bytes()) {
+        return Err(());
+    }
+    let mut id_info = std::mem::MaybeUninit::<FILE_ID_INFO>::uninit();
+    // SAFETY: `file` is an open handle to a regular file; `id_info` is a valid
+    // out-pointer for FileIdInfo. `GetFileInformationByHandleEx` returns BOOL.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FILE_INFO_BY_HANDLE_CLASS_FILE_ID_INFO,
+            id_info.as_mut_ptr().cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(());
+    }
+    // SAFETY: the API succeeded, so `id_info` is initialized.
+    let id_info = unsafe { id_info.assume_init() };
+    Ok((id_info.volume_serial_number, file_id_lo(id_info.file_id)))
+}
+
+/// `FILE_ID_INFO` layout (Winbase.h, FileIdInfo class, Win8+).
+#[cfg(not(unix))]
+#[repr(C)]
+struct FILE_ID_INFO {
+    volume_serial_number: u64,
+    file_id: [u8; 16],
+}
+
+/// FileIdInfo class for `GetFileInformationByHandleEx`.
+#[cfg(not(unix))]
+const FILE_INFO_BY_HANDLE_CLASS_FILE_ID_INFO: u32 = 18;
+
+/// Extract the low 64 bits of the 128-bit file ID for the identity pin.
+#[cfg(not(unix))]
+fn file_id_lo(id: [u8; 16]) -> u64 {
+    u64::from_le_bytes(id[..8].try_into().unwrap())
+}
+
+// kernel32!GetFileInformationByHandleEx：文件句柄 → 持久文件 ID。
+#[cfg(not(unix))]
+unsafe extern "system" {
+    fn GetFileInformationByHandleEx(
+        h_file: *mut core::ffi::c_void,
+        file_info_class: u32,
+        lp_file_information: *mut core::ffi::c_void,
+        dw_buffer_size: u32,
+    ) -> i32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nexusd-token-authority-{tag}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_token(dir: &std::path::Path, name: &str, value: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, value).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn accepts_pinned_private_token() {
+        let dir = unique_dir("accept");
+        let token = "t".repeat(64);
+        let path = write_token(&dir, "localapi.token", &token);
+        let authority = TokenAuthority::open_at(&token, path);
+        assert!(authority.valid(), "pinned token file must validate");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejects_wrong_expected_token() {
+        let dir = unique_dir("wrong-expected");
+        let path = write_token(&dir, "localapi.token", &"t".repeat(64));
+        let authority = TokenAuthority::open_at(&"x".repeat(64), path);
+        assert!(!authority.valid(), "mismatched expectation must fail");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejects_missing_token_file() {
+        let dir = unique_dir("missing");
+        let authority = TokenAuthority::open_at(&"t".repeat(64), dir.join("does-not-exist.token"));
+        assert!(!authority.valid(), "absent token file must fail closed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejects_replaced_token_file() {
+        // Same content, new inode/file index: identity pin must fail closed.
+        let dir = unique_dir("replaced");
+        let token = "t".repeat(64);
+        let path = write_token(&dir, "localapi.token", &token);
+        let authority = TokenAuthority::open_at(&token, path.clone());
+        assert!(authority.valid());
+        std::fs::remove_file(&path).unwrap();
+        let path = write_token(&dir, "localapi.token", &token);
+        let repinned = TokenAuthority::open_at(&token, path.clone());
+        // Build a stale authority that still points at the *old* pin while the
+        // file has been replaced (simulates an attacker swapping the file).
+        let stale = TokenAuthority {
+            expected: token.clone(),
+            path: path.clone(),
+            identity: authority.identity,
+        };
+        assert!(
+            repinned.valid(),
+            "repinned authority over identical content must pass"
+        );
+        assert!(!stale.valid(), "stale pin over replaced file must fail");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejects_oversized_token_file() {
+        let dir = unique_dir("oversized");
+        let path = write_token(&dir, "localapi.token", &"t".repeat(200));
+        let authority = TokenAuthority::open_at(&"t".repeat(200), path);
+        assert!(!authority.valid(), "token over 128 bytes must fail");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

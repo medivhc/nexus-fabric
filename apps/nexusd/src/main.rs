@@ -547,8 +547,21 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     // 等 LocalAPI 就绪（最多 5 秒）。
     match ready_rx.recv_timeout(Duration::from_secs(5)) {
         Ok(addr) => {
+            // READY 行必须用 json! 宏构造而非手拼 format!：config_dir 是
+            // Windows 路径（含反斜杠），直接嵌入会产出非法 JSON（Invalid \escape），
+            // 导致所有解析 daemon stdout 的 verifier/example 失败
+            // （2026-10-22 实测定位：n3-8 foundation-boundary 等 4 个门禁场景
+            // 因此长期真红）。serde 自动转义反斜杠与引号。
             println!(
-                "{{\"verdict\":\"READY\",\"daemon\":{{\"entry\":\"nexusd\",\"config_dir\":\"{config_dir}\",\"localapi\":\"{addr}\"}}}}"
+                "{}",
+                json!({
+                    "verdict": "READY",
+                    "daemon": {
+                        "entry": "nexusd",
+                        "config_dir": config_dir,
+                        "localapi": addr,
+                    }
+                })
             );
             // 同上：READY 行必须立即 flush（块缓冲坑）。
             {
