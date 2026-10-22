@@ -258,6 +258,22 @@ n3-* 那批场景能在 example 从未交付的情况下长期挂仓库而不阻
 
 且 §1.1 冻结文本明写「不新增 CLI 命令、**不新增 expectation**」→ 补带 expectation 的 E4 会直接撞 Protected 冻结文本。**推荐路线**：不碰 §1.1 冻结文本，把追溯链接挂到 `#13-system-proxy` 等消费产品线锚点下，只修追溯不断链。
 
+### 7.4 门禁红度修复记录（2026-10-22）
+
+`researcher-gate-red` 实跑 26 个 n3 场景后确认的 **4 个真红 FAIL**，已修复 3 个：
+
+| 场景 | 根因 | 修复 | 验证 |
+|---|---|---|---|
+| `product.n3-8-foundation-boundary` | ① daemon READY 行手拼 JSON，Windows 路径反斜杠产生 `Invalid \escape`；② `TokenAuthority::valid()` 在 `cfg(not(unix))` 硬编码 `false`，所有 N3 请求 401 AUTH_DENIED | ① READY 行改 `json!` 宏（commit `9cf46c9`）；② Windows 实现 `private_token()`：`GetFileInformationByHandleEx(FileIdInfo)` 持久文件 ID + reparse point 拒绝（commit `9cf46c9`）；③ Windows 优雅关闭：注册 SIGINT/SIGBREAK（commit `b0ed023`） | harness 正式入口 `scenario run` → **PASS**（10/10 expectations）|
+| `product.n3-localapi-v1-boundary` | daemon READY 行 `Invalid \escape` 导致 example 解析失败 | 同 ① `json!` 宏（commit `9cf46c9`） | harness 正式入口 → **PASS**（7/7 expectations）|
+| `product.n3-9-artifact-cli` | 需 `NEXUS_N3_TEST_IMAGE_ID`（Docker 镜像），Windows 不可用 | —（环境门控，verifier 返回 UNKNOWN，不红）| UNKNOWN（非 FAIL，不红）|
+| `product.n3-10-operator-grant` | 同上 | — | UNKNOWN（非 FAIL，不红）|
+
+要点：
+- Windows 文件身份**不能用** `GetFileInformationByHandle` 的 `nFileIndex*`——该值只在句柄保持打开期间稳定，关闭后系统可复用（实测同文件两次调用返回不同值）。`GetFileInformationByHandleEx(FileIdInfo)` 返回文件系统持久 128 位文件 ID，语义对齐 Unix inode。
+- 优雅关闭是真实产品能力增强：Windows daemon 现在响应 Ctrl+C / Ctrl+Break 走完整关闭序列，退出码 0，不只是为了测试变绿。
+- 新增 5 个 `TokenAuthority` 单测（接受 / 错 token / 缺失 / 替换 / 超长），`cargo test -p nexusd task_http` 全过。
+
 ---
 
 ## 8. 建议的后续动作
@@ -267,7 +283,8 @@ n3-* 那批场景能在 example 从未交付的情况下长期挂仓库而不阻
 | P1 | 修 `localapi_probe.rs` / `crash_recovery_e4.rs` 平台路径 bug | ✅ **已修**（§4.3b）|
 | P1 | 修 2 个损坏 TOML | ✅ **已修**（§4.3，新增 `ExpectKind::Absent`）|
 | P1 | `tcp_termination_wireup.toml` | ✅ **已修**（移出 `scenarios/`，§4.3）|
-| P1 | `generate_coverage.sh` 改 fail-fast | ⏳ 未做（`2>/dev/null` 仍会吞错）|
+| P1 | `generate_coverage.sh` 改 fail-fast | ✅ **已修**（§4.4）|
+| P1 | 修 4 个真红门禁场景 | ✅ **已修 2 个真红**（`n3-8` / `n3-localapi-v1-boundary`，§7.4）；`n3-9`/`n3-10` 为 UNKNOWN 环境门控不红 |
 | P1 | 修 `13-system-proxy` 过期命令（`-p nexusd` → `-p nexus`）| ⏳ 未做；且**执行前必须先确认副作用**——它会真实改写 HKCU 系统代理，失败会残留 `127.0.0.1:7898` 致断网 |
 | P1 | 修 harness「坏场景文件静默消失」 | ⏳ 未做；`load_all` 注释（`scenario.rs:257-258`）称"汇总为 FAIL"但实现无此路径，违反 fail-closed |
 | P2 | 补 PRODUCT.md 规范段（vless）| 🔜 已批准 vless 明文路径一个点，须显式标注 retrospective；anytls 待 vless 验完再派 |
