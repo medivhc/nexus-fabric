@@ -43,6 +43,9 @@ fn list() -> Outcome {
         Err(o) => return o,
     };
     let scenarios = scenario::load_all(&config.scenarios_dir, SCAN_SUBDIRS);
+    // `scenario list` 只做枚举，不构成 gate：消费并丢弃加载错误，避免污染
+    // 后续 `run_gate` 的 fail-closed 判定。
+    let _ = scenario::take_load_errors();
     let arr: Vec<Value> = scenarios
         .iter()
         .map(|s| {
@@ -86,6 +89,8 @@ fn run_one(name: &str) -> Outcome {
         Err(o) => return o,
     };
     let scenarios = scenario::load_all(&config.scenarios_dir, SCAN_SUBDIRS);
+    // `scenario run` 只执行单个场景，不构成 gate：消费并丢弃加载错误。
+    let _ = scenario::take_load_errors();
     let Some(target) = scenarios.iter().find(|s| s.id == name) else {
         return blocked_unknown(
             &repo,

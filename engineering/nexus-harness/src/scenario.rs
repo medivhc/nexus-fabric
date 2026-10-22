@@ -7,6 +7,16 @@ use crate::gates::Gate;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+
+/// 场景加载错误累计器：`load_all` 遇到坏文件不静默丢弃，而是记录在这里，
+/// 由 `run_gate` 消费并使 gate FAIL（fail-closed）。用 `OnceLock` 避免静态
+/// 初始化顺序问题。
+static LOAD_ERRORS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+fn load_errors() -> &'static Mutex<Vec<String>> {
+    LOAD_ERRORS.get_or_init(|| Mutex::new(Vec::new()))
+}
 
 #[derive(Clone)]
 pub struct ScenarioExpect {
@@ -246,6 +256,10 @@ fn toml_value_to_json(v: &toml::Value) -> Value {
 }
 
 /// Load all scenario files under scenarios/<subdir>/.
+///
+/// 契约校验失败的场景**不静默丢弃**：记录日志并写入 `LOAD_ERRORS` 累计器，
+/// 由 `run_gate` 消费后使 gate FAIL（fail-closed，修复前坏文件会被静默跳过、
+/// gate 无从感知）。
 pub fn load_all(scenarios_dir: &Path, subdirs: &[&str]) -> Vec<Scenario> {
     let mut out = Vec::new();
     for sub in subdirs {
@@ -262,13 +276,24 @@ pub fn load_all(scenarios_dir: &Path, subdirs: &[&str]) -> Vec<Scenario> {
         for f in files {
             match load_file(&f, sub) {
                 Ok(s) => out.push(s),
-                // 契约校验失败的场景不静默丢弃：记录日志后跳过，
-                // 由 verify --full 的 product-scenarios gate 汇总为 FAIL。
-                Err(e) => eprintln!("[scenario] 跳过 {}: {e}", f.display()),
+                Err(e) => {
+                    eprintln!("[scenario] 跳过 {}: {e}", f.display());
+                    if let Ok(mut errors) = load_errors().lock() {
+                        errors.push(format!("{}: {e}", f.display()));
+                    }
+                }
             }
         }
     }
     out
+}
+
+/// Drain 并返回累积的场景加载错误（`run_gate` 调用，消费后清零）。
+pub fn take_load_errors() -> Vec<String> {
+    load_errors()
+        .lock()
+        .map(|mut errors| std::mem::take(&mut *errors))
+        .unwrap_or_default()
 }
 
 /// 单个 expect 失败的结构化信息（供失败签名使用）。
@@ -772,6 +797,18 @@ fn run_parallel(scenarios: &[Scenario], jobs: usize) -> Vec<ScenarioRunReport> {
 /// 无共享可变状态；结果按场景声明顺序收集，保证输出确定性。
 pub fn run_gate(config: &Config, gate_name: &str, subdirs: &[&str]) -> (Vec<ScenarioResult>, Gate) {
     let scenarios = load_all(&config.scenarios_dir, subdirs);
+    // fail-closed：任何契约校验失败的场景文件都使 gate 直接 FAIL，
+    // 避免坏文件被静默跳过、门禁表面转绿（`load_all` 不再吞错）。
+    let load_errors = take_load_errors();
+    if !load_errors.is_empty() {
+        let detail = format!(
+            "{} 个场景文件契约校验失败（fail-closed）：\n{}",
+            load_errors.len(),
+            load_errors.join("\n")
+        );
+        eprintln!("[scenario] {detail}");
+        return (Vec::new(), Gate::fail(gate_name, &detail));
+    }
     if scenarios.is_empty() {
         return (
             Vec::new(),
@@ -825,6 +862,10 @@ pub fn run_gate(config: &Config, gate_name: &str, subdirs: &[&str]) -> (Vec<Scen
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 串行锁：`LOAD_ERRORS` 是全局共享状态，涉及它的测试必须串行执行，
+    /// 避免并行测试间的写入/清空竞态。
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn scenario(expects: Vec<ScenarioExpect>) -> Scenario {
         Scenario {
@@ -1090,6 +1131,7 @@ mod tests {
     /// 会被当合法场景加载，expect 与实现脱钩也无法察觉。
     #[test]
     fn load_rejects_invalid_schema_version() {
+        let _guard = TEST_LOCK.lock().unwrap();
         for (label, toml) in [
             ("absent", "id = \"t.nover\"\n[when]\ncommand = \"true\"\n"),
             (
@@ -1114,11 +1156,14 @@ mod tests {
                 scenarios.len()
             );
         }
+        // 清空累计器，避免污染后续 run_gate 测试的 fail-closed 判定。
+        let _ = take_load_errors();
     }
 
     /// 契约 §2：`schema_version = 1` 是合法值，不得被上面的规则误伤。
     #[test]
     fn load_accepts_schema_version_one() {
+        let _guard = TEST_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("harness-sv1-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("tmpdir");
@@ -1131,6 +1176,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(scenarios.len(), 1);
         assert_eq!(scenarios[0].id, "t.v1");
+        // 无坏文件，累计器应为空。
+        assert!(take_load_errors().is_empty());
+    }
+
+    /// fail-closed：`load_all` 遇到契约校验失败的场景文件必须记录到累计器，
+    /// `take_load_errors` 能取回（修复前坏文件被静默跳过，gate 无从感知）。
+    #[test]
+    fn load_all_records_contract_errors() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("harness-fc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        std::fs::write(
+            dir.join("bad.toml"),
+            "schema_version = 2\nid = \"t.bad\"\n[when]\ncommand = \"true\"\n",
+        )
+        .expect("write toml");
+        std::fs::write(
+            dir.join("good.toml"),
+            "schema_version = 1\nid = \"t.good\"\n[when]\ncommand = \"true\"\n",
+        )
+        .expect("write toml");
+        let scenarios = load_all(&dir, &[""]);
+        let errors = take_load_errors();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(scenarios.len(), 1, "合法场景应加载");
+        assert_eq!(scenarios[0].id, "t.good");
+        assert_eq!(errors.len(), 1, "坏文件必须记录到累计器");
+        assert!(
+            errors[0].contains("bad.toml"),
+            "错误应包含坏文件路径: {}",
+            errors[0]
+        );
     }
 
     /// E4 夹具（P0-6）：`[given].fixture` 字符串数组被解析进 Scenario。
@@ -1352,6 +1430,52 @@ mod tests {
             gate.detail
         );
         assert!(gate.detail.contains("evidence=E4"), "{}", gate.detail);
+    }
+
+    /// fail-closed 集成：`run_gate` 遇到契约校验失败的场景文件必须返回 FAIL，
+    /// 而不是静默跳过坏文件后表面转绿。
+    #[test]
+    fn run_gate_fails_closed_on_contract_error() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("harness-gate-fc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        // 合法场景。
+        std::fs::write(
+            dir.join("good.toml"),
+            "schema_version = 1\nid = \"t.good\"\n[when]\ncommand = \"true\"\n",
+        )
+        .expect("write good.toml");
+        // 坏场景：schema_version 非 1。
+        std::fs::write(
+            dir.join("bad.toml"),
+            "schema_version = 2\nid = \"t.bad\"\n[when]\ncommand = \"true\"\n",
+        )
+        .expect("write bad.toml");
+        let config = Config {
+            policies_dir: dir.join("policies"),
+            scenarios_dir: dir.clone(),
+            evidence_dir: dir.join("evidence"),
+            crates_dir: dir.join("crates"),
+            engineering_dir: dir.join("engineering"),
+            quality: serde_json::json!({}),
+            portable_core: vec![],
+        };
+        let (results, gate) = run_gate(&config, "product-scenarios", &[""]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            gate.verdict, "FAIL",
+            "坏文件必须使 gate FAIL: {}",
+            gate.detail
+        );
+        assert!(
+            gate.detail.contains("bad.toml"),
+            "gate detail 必须包含坏文件路径: {}",
+            gate.detail
+        );
+        assert!(results.is_empty(), "坏文件存在时不返回任何场景结果");
+        // 清空累计器，避免污染后续测试。
+        let _ = take_load_errors();
     }
 
     /// 场景包：title / subdir / requires_root 从 toml 解析。
