@@ -2,7 +2,7 @@
 //! declare a [when].command, evaluating [[expect]] entries against the JSON
 //! output. Scenarios without a command are static contracts (recorded UNKNOWN).
 
-use crate::config::Config;
+use crate::config::{Config, ScenarioTimeouts};
 use crate::gates::Gate;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -56,6 +56,8 @@ pub struct ScenarioResult {
     pub id: String,
     pub verdict: String,
     pub detail: String,
+    pub duration_ms: u64,
+    pub timed_out: bool,
 }
 
 fn load_file(path: &PathBuf, subdir: &str) -> Result<Scenario, String> {
@@ -347,16 +349,18 @@ fn get_path<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
 /// 阻塞），区别是透出进程退出码：夹具命令必须 exit 0 才算成功。
 fn run_command_checked(
     command: &str,
+    scenario_timeout: std::time::Duration,
+    drain_timeout: std::time::Duration,
     node_dir: Option<&std::path::Path>,
-) -> (bool, String, String) {
-    use std::time::Duration;
-    let (outcome, stdout, stderr_tail) = run_checked_with_timeouts(
-        command,
-        Duration::from_secs(600),
-        Duration::from_secs(10),
-        node_dir,
-    );
-    (outcome == RunOutcome::Exited(true), stdout, stderr_tail)
+) -> (bool, bool, String, String) {
+    let (outcome, stdout, stderr_tail) =
+        run_checked_with_timeouts(command, scenario_timeout, drain_timeout, node_dir);
+    (
+        outcome == RunOutcome::Exited(true),
+        outcome == RunOutcome::TimedOut,
+        stdout,
+        stderr_tail,
+    )
 }
 
 /// 见 run_command 注释。timeout 参数化仅供回归测试注入短超时。
@@ -521,6 +525,8 @@ pub struct ScenarioRunReport {
     pub key_log_lines: Vec<String>,
     /// 单场景墙钟毫秒数（含 fixture）。
     pub duration_ms: u64,
+    /// 主命令或 fixture 是否因 tier 超时被 kill。
+    pub timed_out: bool,
     /// 人类可读明细（与旧 ScenarioResult.detail 同格式）。
     pub detail: String,
 }
@@ -552,10 +558,10 @@ fn current_platform() -> &'static str {
 /// 执行单个场景。执行语义与旧 run_gate 逐场景循环完全一致
 /// （fixture 顺序执行、有界超时、场景级 NEXUS_CONFIG_DIR 隔离、
 /// n3 contract-first 的 UNKNOWN 特例），只是把失败信息结构化。
-pub fn run_single(s: &Scenario) -> ScenarioRunReport {
+pub fn run_single(s: &Scenario, timeouts: &ScenarioTimeouts) -> ScenarioRunReport {
     use std::time::Instant;
     let start = Instant::now();
-    let mut rep = run_single_inner(s);
+    let mut rep = run_single_inner(s, timeouts);
     rep.duration_ms = start.elapsed().as_millis() as u64;
     rep
 }
@@ -567,13 +573,12 @@ fn unknown_report(failed_step: &str, assertion: String, detail: String) -> Scena
         assertion,
         key_log_lines: Vec::new(),
         duration_ms: 0,
+        timed_out: false,
         detail,
     }
 }
 
-fn run_single_inner(s: &Scenario) -> ScenarioRunReport {
-    use std::time::Duration;
-
+fn run_single_inner(s: &Scenario, timeouts: &ScenarioTimeouts) -> ScenarioRunReport {
     // 平台门：与旧 run_gate 语义一致（不匹配记 UNKNOWN，不阻塞）。
     if let Some(plat) = &s.platform {
         let current_plat = current_platform();
@@ -606,8 +611,24 @@ fn run_single_inner(s: &Scenario) -> ScenarioRunReport {
     let node_dir = Some(scenario_node_dir.as_path());
     // E4 夹具（P0-6）：先按序跑 `[given].fixture`，全部 exit 0 才跑
     // 场景命令；任一夹具失败 → 场景 FAIL（夹具是 E4 环境声明）。
+    let scenario_timeout = timeouts.for_scenario(s);
     for fixture in &s.fixtures {
-        let (ok, _out, err_tail) = run_command_checked(fixture, node_dir);
+        let (ok, timed_out, _out, err_tail) =
+            run_command_checked(fixture, scenario_timeout, timeouts.drain, node_dir);
+        if timed_out {
+            return ScenarioRunReport {
+                verdict: "FAIL".to_string(),
+                failed_step: "fixture".to_string(),
+                assertion: "timed_out".to_string(),
+                key_log_lines: tail_lines(&err_tail, 10),
+                duration_ms: 0,
+                timed_out: true,
+                detail: format!(
+                    "fixture command timed out after {}s: {fixture}",
+                    scenario_timeout.as_secs()
+                ),
+            };
+        }
         if !ok {
             return ScenarioRunReport {
                 verdict: "FAIL".to_string(),
@@ -615,17 +636,14 @@ fn run_single_inner(s: &Scenario) -> ScenarioRunReport {
                 assertion: fixture.clone(),
                 key_log_lines: tail_lines(&err_tail, 10),
                 duration_ms: 0,
+                timed_out: false,
                 detail: format!("fixture failed: {fixture} (stderr: {err_tail})"),
             };
         }
     }
     // 主命令：有界执行，透出 RunOutcome 以区分"命令失败"与"输出解析失败"。
-    let (outcome, stdout, stderr_tail) = run_checked_with_timeouts(
-        &cmd,
-        Duration::from_secs(600),
-        Duration::from_secs(10),
-        node_dir,
-    );
+    let (outcome, stdout, stderr_tail) =
+        run_checked_with_timeouts(&cmd, scenario_timeout, timeouts.drain, node_dir);
     match outcome {
         RunOutcome::TimedOut => ScenarioRunReport {
             verdict: "FAIL".to_string(),
@@ -633,7 +651,11 @@ fn run_single_inner(s: &Scenario) -> ScenarioRunReport {
             assertion: "timed_out".to_string(),
             key_log_lines: tail_lines(&format!("{stdout}\n{stderr_tail}"), 10),
             duration_ms: 0,
-            detail: "scenario command timed out after 600s".to_string(),
+            timed_out: true,
+            detail: format!(
+                "scenario command timed out after {}s",
+                scenario_timeout.as_secs()
+            ),
         },
         RunOutcome::SpawnFailed => ScenarioRunReport {
             verdict: "FAIL".to_string(),
@@ -641,6 +663,7 @@ fn run_single_inner(s: &Scenario) -> ScenarioRunReport {
             assertion: "spawn_failed".to_string(),
             key_log_lines: tail_lines(&stderr_tail, 10),
             duration_ms: 0,
+            timed_out: false,
             detail: format!("cannot run scenario command: {stderr_tail}"),
         },
         RunOutcome::Exited(_) => match serde_json::from_str::<Value>(&stdout) {
@@ -651,6 +674,7 @@ fn run_single_inner(s: &Scenario) -> ScenarioRunReport {
                     assertion: String::new(),
                     key_log_lines: Vec::new(),
                     duration_ms: 0,
+                    timed_out: false,
                     detail: format!("command ran, all {} expectations held", s.expects.len()),
                 },
                 Err(f) => ScenarioRunReport {
@@ -659,6 +683,7 @@ fn run_single_inner(s: &Scenario) -> ScenarioRunReport {
                     assertion: f.path.clone(),
                     key_log_lines: tail_lines(&stdout, 10),
                     duration_ms: 0,
+                    timed_out: false,
                     detail: format!("expect {}.{} failed (actual: {})", s.id, f.path, f.actual),
                 },
             },
@@ -681,6 +706,7 @@ fn run_single_inner(s: &Scenario) -> ScenarioRunReport {
                         assertion: String::new(),
                         key_log_lines: tail_lines(&stdout, 10),
                         duration_ms: 0,
+                        timed_out: false,
                         detail: format!("output not JSON ({e}): {}", stdout.trim()),
                     }
                 }
@@ -712,7 +738,11 @@ fn parallel_jobs_from_env(v: Option<String>) -> usize {
 /// 按下标回填。`Scenario` 是纯数据（Send+Sync），`run_single` 内只有
 /// 进程隔离的副作用（独立目录/端口），无跨场景共享可变状态。
 /// 任一 worker panic 时 scope 会传播 panic（与串行版行为一致：整轮中止）。
-fn run_parallel(scenarios: &[Scenario], jobs: usize) -> Vec<ScenarioRunReport> {
+fn run_parallel(
+    scenarios: &[Scenario],
+    jobs: usize,
+    timeouts: &ScenarioTimeouts,
+) -> Vec<ScenarioRunReport> {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex, mpsc};
 
@@ -732,7 +762,7 @@ fn run_parallel(scenarios: &[Scenario], jobs: usize) -> Vec<ScenarioRunReport> {
                         Some(i) => i,
                         None => break,
                     };
-                    let rep = run_single(&scenarios[idx]);
+                    let rep = run_single(&scenarios[idx], timeouts);
                     // 主线程一定在收（rx 在 scope 内消费），send 不会阻塞。
                     let _ = tx.send((idx, rep));
                 }
@@ -754,6 +784,7 @@ fn run_parallel(scenarios: &[Scenario], jobs: usize) -> Vec<ScenarioRunReport> {
                     assertion: String::new(),
                     key_log_lines: Vec::new(),
                     duration_ms: 0,
+                    timed_out: false,
                     detail: format!(
                         "scenario worker produced no report for '{}' (worker panic?)",
                         scenarios[i].id
@@ -770,7 +801,14 @@ fn run_parallel(scenarios: &[Scenario], jobs: usize) -> Vec<ScenarioRunReport> {
 /// 逐场景执行委托给 run_single（单一执行路径）；本函数只做聚合与 Gate 判定。
 /// 场景之间并行执行：每个场景是独立子进程（独立 NEXUS_CONFIG_DIR、临时端口），
 /// 无共享可变状态；结果按场景声明顺序收集，保证输出确定性。
-pub fn run_gate(config: &Config, gate_name: &str, subdirs: &[&str]) -> (Vec<ScenarioResult>, Gate) {
+pub fn run_gate(
+    config: &Config,
+    gate_name: &str,
+    subdirs: &[&str],
+    timeouts: &ScenarioTimeouts,
+) -> (Vec<ScenarioResult>, Gate) {
+    use std::time::Instant;
+    let started = Instant::now();
     let scenarios = load_all(&config.scenarios_dir, subdirs);
     if scenarios.is_empty() {
         return (
@@ -780,9 +818,9 @@ pub fn run_gate(config: &Config, gate_name: &str, subdirs: &[&str]) -> (Vec<Scen
     }
     let jobs = parallel_jobs();
     let reports: Vec<ScenarioRunReport> = if jobs <= 1 || scenarios.len() <= 1 {
-        scenarios.iter().map(run_single).collect()
+        scenarios.iter().map(|s| run_single(s, timeouts)).collect()
     } else {
-        run_parallel(&scenarios, jobs)
+        run_parallel(&scenarios, jobs, timeouts)
     };
     let mut results: Vec<ScenarioResult> = Vec::new();
     let mut failed = false;
@@ -795,6 +833,8 @@ pub fn run_gate(config: &Config, gate_name: &str, subdirs: &[&str]) -> (Vec<Scen
             id: s.id.clone(),
             verdict: rep.verdict,
             detail: rep.detail,
+            duration_ms: rep.duration_ms,
+            timed_out: rep.timed_out,
         });
     }
     // 契约 §3：Gate detail 逐场景带上真机/sandbox 分层（requires）与证据
@@ -814,11 +854,13 @@ pub fn run_gate(config: &Config, gate_name: &str, subdirs: &[&str]) -> (Vec<Scen
         })
         .collect();
     let detail = detail.join("\n");
-    if failed {
-        (results.clone(), Gate::fail(gate_name, &detail))
+    let mut gate = if failed {
+        Gate::fail(gate_name, &detail)
     } else {
-        (results, Gate::ok(gate_name, &detail))
-    }
+        Gate::ok(gate_name, &detail)
+    };
+    gate.duration_ms = started.elapsed().as_millis() as u64;
+    (results, gate)
 }
 
 #[cfg(test)]
@@ -1171,11 +1213,14 @@ mod tests {
     /// E4 夹具（P0-6）：run_command_checked 透出退出码（夹具成败判据）。
     #[test]
     fn run_command_checked_reports_exit_status() {
-        let (ok, _, _) = run_command_checked("true", None);
+        let timeout = std::time::Duration::from_secs(10);
+        let drain = std::time::Duration::from_secs(1);
+        let (ok, _, _, _) = run_command_checked("true", timeout, drain, None);
         assert!(ok, "exit 0 must be ok");
-        let (ok, _, err) = run_command_checked("false", None);
+        let (ok, _, _, err) = run_command_checked("false", timeout, drain, None);
         assert!(!ok, "exit 1 must not be ok: {err}");
-        let (ok, _, err) = run_command_checked("definitely-not-a-real-command-xyz", None);
+        let (ok, _, _, err) =
+            run_command_checked("definitely-not-a-real-command-xyz", timeout, drain, None);
         assert!(!ok, "spawn failure must not be ok: {err}");
     }
 
@@ -1338,8 +1383,14 @@ mod tests {
             quality: serde_json::json!({}),
             portable_core: vec![],
             bind_working_tree_digest: true,
+            verify_timeouts: crate::config::VerifyTimeouts::defaults(),
         };
-        let (results, gate) = run_gate(&config, "product-scenarios", &[""]);
+        let (results, gate) = run_gate(
+            &config,
+            "product-scenarios",
+            &[""],
+            &ScenarioTimeouts::legacy(),
+        );
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(results.len(), 2);
         assert_eq!(gate.verdict, "PASS", "{}", gate.detail);
@@ -1444,7 +1495,7 @@ mod tests {
             "[[expect]]\nfield = \"verdict\"\nequals = \"FAIL\"\n",
         );
         assert_eq!(scenarios.len(), 1);
-        let rep = run_single(&scenarios[0]);
+        let rep = run_single(&scenarios[0], &ScenarioTimeouts::legacy());
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(rep.verdict, "FAIL");
         assert_eq!(rep.failed_step, "expect");
@@ -1461,7 +1512,7 @@ mod tests {
             "fx",
             "schema_version = 1\nid = \"t.fx\"\n[given]\nfixture = [\"false\"]\n[when]\ncommand = \"echo {\\\"verdict\\\":\\\"PASS\\\"}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
         );
-        let rep = run_single(&scenarios[0]);
+        let rep = run_single(&scenarios[0], &ScenarioTimeouts::legacy());
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(rep.verdict, "FAIL");
         assert_eq!(rep.failed_step, "fixture");
@@ -1475,7 +1526,7 @@ mod tests {
             "st",
             "schema_version = 1\nid = \"t.st\"\ntitle = \"静态契约\"\n[when]\n",
         );
-        let rep = run_single(&scenarios[0]);
+        let rep = run_single(&scenarios[0], &ScenarioTimeouts::legacy());
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(rep.verdict, "UNKNOWN");
         assert_eq!(rep.failed_step, "lookup");
@@ -1488,7 +1539,7 @@ mod tests {
             "pl",
             "schema_version = 1\nid = \"t.pl\"\n[given]\nplatform = \"definitely-not-this-os\"\n[when]\ncommand = \"echo hi\"\n",
         );
-        let rep = run_single(&scenarios[0]);
+        let rep = run_single(&scenarios[0], &ScenarioTimeouts::legacy());
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(rep.verdict, "UNKNOWN");
         assert!(rep.detail.contains("platform contract"));
@@ -1502,7 +1553,7 @@ mod tests {
             "{\"verdict\":\"PASS\"}",
             "[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
         );
-        let rep = run_single(&scenarios[0]);
+        let rep = run_single(&scenarios[0], &ScenarioTimeouts::legacy());
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(rep.verdict, "PASS");
         assert!(rep.failed_step.is_empty());
@@ -1520,7 +1571,7 @@ mod tests {
             "np",
             "schema_version = 1\nid = \"t.parse\"\n[when]\ncommand = \"echo not-json\"\n",
         );
-        let rep = run_single(&scenarios[0]);
+        let rep = run_single(&scenarios[0], &ScenarioTimeouts::legacy());
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(rep.verdict, "FAIL");
         assert_eq!(rep.failed_step, "parse");
@@ -1540,7 +1591,7 @@ mod tests {
             "sf",
             "schema_version = 1\nid = \"t.spawn\"\n[when]\ncommand = \"nexus-harness-no-such-binary-zzz\"\n",
         );
-        let rep = run_single(&scenarios[0]);
+        let rep = run_single(&scenarios[0], &ScenarioTimeouts::legacy());
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(rep.verdict, "FAIL");
         assert_eq!(rep.failed_step, "command");
@@ -1581,7 +1632,7 @@ mod tests {
         }
         let scenarios = load_all(&dir, &[""]);
         assert_eq!(scenarios.len(), 6);
-        let reports = run_parallel(&scenarios, 3);
+        let reports = run_parallel(&scenarios, 3, &ScenarioTimeouts::legacy());
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(reports.len(), 6);
         for (i, rep) in reports.iter().enumerate() {
@@ -1610,5 +1661,84 @@ mod tests {
         assert!((1..=16).contains(&d2));
         // 真实环境变量路径不断言具体值（机器相关），只断言不 panic
         let _ = parallel_jobs();
+    }
+
+    #[test]
+    fn scenario_timeouts_legacy_and_tier() {
+        let legacy = ScenarioTimeouts::legacy();
+        assert_eq!(legacy.sandbox.as_secs(), 600);
+        assert_eq!(legacy.real_device.as_secs(), 600);
+        assert_eq!(legacy.drain.as_secs(), 10);
+        let custom = ScenarioTimeouts {
+            sandbox: std::time::Duration::from_secs(7),
+            real_device: std::time::Duration::from_secs(11),
+            drain: std::time::Duration::from_secs(3),
+        };
+        let mut s = scenario(vec![]);
+        s.requires_root = false;
+        assert_eq!(custom.for_scenario(&s), std::time::Duration::from_secs(7));
+        s.requires_root = true;
+        assert_eq!(custom.for_scenario(&s), std::time::Duration::from_secs(11));
+    }
+
+    #[test]
+    fn scenario_result_carries_duration_and_timed_out() {
+        let (dir, _scenarios) = synthetic_script_scenario(
+            "dur",
+            "{\"verdict\":\"PASS\"}",
+            "[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
+        );
+        let config = Config {
+            policies_dir: dir.join("policies"),
+            scenarios_dir: dir.clone(),
+            evidence_dir: dir.join("evidence"),
+            crates_dir: dir.join("crates"),
+            engineering_dir: dir.join("engineering"),
+            quality: serde_json::json!({}),
+            portable_core: vec![],
+            bind_working_tree_digest: true,
+            verify_timeouts: crate::config::VerifyTimeouts::defaults(),
+        };
+        let (results, gate) = run_gate(
+            &config,
+            "product-scenarios",
+            &[""],
+            &ScenarioTimeouts::legacy(),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].verdict, "PASS");
+        assert!(results[0].duration_ms < 60_000);
+        assert!(!results[0].timed_out);
+        assert!(gate.duration_ms < 60_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixture_timeout_sets_timed_out() {
+        let dir = std::env::temp_dir().join(format!("harness-fixture-to-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let script = dir.join("slow-fixture.sh");
+        std::fs::write(&script, "#!/bin/sh\nsleep 5\n").expect("write script");
+        let body = format!(
+            "schema_version = 1\nid = \"t.fxto\"\n[given]\nfixture = [\"sh {}\"]\n[when]\ncommand = \"echo {{\\\"verdict\\\":\\\"PASS\\\"}}\"\n",
+            toml_escape(&script.to_string_lossy())
+        );
+        std::fs::write(dir.join("fxto.toml"), body).expect("write toml");
+        let scenarios = load_all(&dir, &[""]);
+        assert_eq!(scenarios.len(), 1);
+        let timeouts = ScenarioTimeouts {
+            sandbox: std::time::Duration::from_millis(100),
+            real_device: std::time::Duration::from_millis(100),
+            drain: std::time::Duration::from_secs(1),
+        };
+        let rep = run_single(&scenarios[0], &timeouts);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(rep.verdict, "FAIL");
+        assert_eq!(rep.failed_step, "fixture");
+        assert_eq!(rep.assertion, "timed_out");
+        assert!(rep.timed_out);
+        assert!(rep.detail.contains("timed out after 0s"), "{}", rep.detail);
     }
 }

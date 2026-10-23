@@ -12,6 +12,9 @@ pub struct Gate {
     pub name: String,
     pub verdict: String,
     pub detail: String,
+    pub duration_ms: u64,
+    pub timed_out: bool,
+    pub skipped_by_deadline: bool,
 }
 
 impl Gate {
@@ -20,6 +23,9 @@ impl Gate {
             name: name.to_string(),
             verdict: "PASS".to_string(),
             detail: detail.to_string(),
+            duration_ms: 0,
+            timed_out: false,
+            skipped_by_deadline: false,
         }
     }
     pub fn fail(name: &str, detail: &str) -> Gate {
@@ -27,6 +33,9 @@ impl Gate {
             name: name.to_string(),
             verdict: "FAIL".to_string(),
             detail: detail.to_string(),
+            duration_ms: 0,
+            timed_out: false,
+            skipped_by_deadline: false,
         }
     }
     pub fn unknown(name: &str, detail: &str) -> Gate {
@@ -34,11 +43,171 @@ impl Gate {
             name: name.to_string(),
             verdict: "UNKNOWN".to_string(),
             detail: detail.to_string(),
+            duration_ms: 0,
+            timed_out: false,
+            skipped_by_deadline: false,
+        }
+    }
+    /// 全局截止导致的未执行/被中断门：fail-closed，绝不当作 PASS。
+    pub fn blocked(name: &str, detail: &str) -> Gate {
+        Gate {
+            name: name.to_string(),
+            verdict: "BLOCKED".to_string(),
+            detail: detail.to_string(),
+            duration_ms: 0,
+            timed_out: false,
+            skipped_by_deadline: true,
         }
     }
 }
 
+/// 单次命令/单门的有效预算。`deadline` 为绝对时刻；`None` = 无限制。
+#[derive(Clone, Copy)]
+pub struct GateBudget {
+    pub deadline: Option<std::time::Instant>,
+}
+
+impl GateBudget {
+    pub fn unlimited() -> GateBudget {
+        GateBudget { deadline: None }
+    }
+    pub fn from_limit(limit: Option<std::time::Duration>) -> GateBudget {
+        GateBudget {
+            deadline: limit.map(|d| std::time::Instant::now() + d),
+        }
+    }
+    pub fn remaining(&self) -> Option<std::time::Duration> {
+        self.deadline
+            .map(|d| d.saturating_duration_since(std::time::Instant::now()))
+    }
+    pub fn expired(&self) -> bool {
+        self.remaining().is_some_and(|r| r.is_zero())
+    }
+}
+
+/// 有界子进程执行结果。`TimedOut.text` 为已抽干的输出（尽力而为）。
+pub enum CommandOutcome {
+    Exited { success: bool, text: String },
+    TimedOut { text: String },
+    SpawnFailed { detail: String },
+}
+
+/// 用预算包住一次门执行并写入 `duration_ms`（只计时，不参与判定）。
+pub(crate) fn timed<F: FnOnce() -> Gate>(f: F) -> Gate {
+    let start = std::time::Instant::now();
+    let mut g = f();
+    g.duration_ms = start.elapsed().as_millis() as u64;
+    g
+}
+
+/// 在 repo 根目录有界执行命令；超时只 kill 直接子进程（孙进程不等待，
+/// 与 `scenario.rs` 的既有语义一致），读线程以 10s drain 超时收尾。
+pub fn run_bounded(
+    root: &PathBuf,
+    program: &str,
+    args: &[&str],
+    budget: GateBudget,
+) -> CommandOutcome {
+    run_bounded_env(root, program, args, budget, &[])
+}
+
+fn run_bounded_env(
+    root: &PathBuf,
+    program: &str,
+    args: &[&str],
+    budget: GateBudget,
+    envs: &[(&str, &std::path::Path)],
+) -> CommandOutcome {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return CommandOutcome::SpawnFailed {
+                detail: format!("failed to run {program}: {e}"),
+            };
+        }
+    };
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, Vec<u8>)>();
+    if let Some(mut p) = child.stdout.take() {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = p.read_to_end(&mut buf);
+            let _ = tx.send((true, buf));
+        });
+    }
+    if let Some(mut p) = child.stderr.take() {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = p.read_to_end(&mut buf);
+            let _ = tx.send((false, buf));
+        });
+    }
+    drop(tx);
+
+    let mut exit_status = None;
+    let mut timed_out = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit_status = Some(status);
+                break;
+            }
+            Ok(None) => {
+                if budget.expired() {
+                    let _ = child.kill();
+                    let _ = child.try_wait();
+                    timed_out = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => break,
+        }
+    }
+    // 判定用退出状态：超时 / 等待失败的进程一律不视为成功。
+    let success = exit_status.is_some_and(|status| status.success()) && !timed_out;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    for _ in 0..2 {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match rx.recv_timeout(deadline - now) {
+            Ok((true, b)) => stdout = b,
+            Ok((false, b)) => stderr = b,
+            Err(_) => break,
+        }
+    }
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    if timed_out {
+        CommandOutcome::TimedOut { text }
+    } else {
+        CommandOutcome::Exited { success, text }
+    }
+}
+
 /// Run a command in the repo root; returns (success, trimmed output tail).
+#[allow(dead_code)]
 fn run_at(root: &PathBuf, program: &str, args: &[&str]) -> (bool, String) {
     let (ok, text) = run_at_full(root, program, args);
     let tail: Vec<&str> = text.lines().rev().take(12).collect();
@@ -47,22 +216,13 @@ fn run_at(root: &PathBuf, program: &str, args: &[&str]) -> (bool, String) {
 }
 
 /// Run a command in the repo root; returns (success, full combined output).
+/// 无预算调用（辅助探测/不需要门预算的旧路径）：内部走 `run_bounded` 的无限制预算。
 fn run_at_full(root: &PathBuf, program: &str, args: &[&str]) -> (bool, String) {
-    let out = match Command::new(program).args(args).current_dir(root).output() {
-        Ok(o) => o,
-        Err(e) => return (false, format!("failed to run {program}: {e}")),
-    };
-    let ok = out.status.success();
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    (ok, text)
-}
-
-fn cargo(repo: &Repo, args: &[&str]) -> Gate {
-    test_cargo(repo, args, None)
+    match run_bounded(root, program, args, GateBudget::unlimited()) {
+        CommandOutcome::Exited { success, text } => (success, text),
+        CommandOutcome::TimedOut { text } => (false, text),
+        CommandOutcome::SpawnFailed { detail } => (false, detail),
+    }
 }
 
 /// Current Cargo artifacts, passed only to child test commands (never PATH).
@@ -75,14 +235,42 @@ fn product_binaries(
     repo: &Repo,
     meta: &Value,
     packages: &[String],
-) -> Result<Option<ProductBinaries>, String> {
+    gate_name: &str,
+    budget: GateBudget,
+) -> Result<Option<ProductBinaries>, GateFailure> {
     if !packages
         .iter()
         .any(|name| name == "nexus" || name == "nexusd")
     {
         return Ok(None);
     }
-    build_product_binaries(repo, meta, "cargo").map(Some)
+    build_product_binaries(repo, meta, gate_name, "cargo", budget).map(Some)
+}
+
+/// 把内部失败映射为门结果：超时保留 `timed_out=true`（fail-closed）。
+fn fail_from(name: &str, e: GateFailure) -> Gate {
+    let mut g = Gate::fail(name, &e.detail);
+    g.timed_out = e.timed_out;
+    g
+}
+
+/// 带 fail-closed 标记的内部失败：`timed_out` 决定门是否记 `timed_out=true`。
+struct GateFailure {
+    detail: String,
+    timed_out: bool,
+}
+
+impl GateFailure {
+    fn new(detail: String) -> GateFailure {
+        GateFailure {
+            detail,
+            timed_out: false,
+        }
+    }
+}
+
+fn budget_secs(budget: GateBudget) -> u64 {
+    budget.remaining().map(|d| d.as_secs()).unwrap_or(0)
 }
 
 /// Always ask Cargo to build, even if executables exist: Cargo owns freshness.
@@ -90,8 +278,10 @@ fn product_binaries(
 fn build_product_binaries(
     repo: &Repo,
     meta: &Value,
+    gate_name: &str,
     program: &str,
-) -> Result<ProductBinaries, String> {
+    budget: GateBudget,
+) -> Result<ProductBinaries, GateFailure> {
     let args = [
         "build",
         "-p",
@@ -104,21 +294,36 @@ fn build_product_binaries(
         "nexusd",
         "--message-format=json",
     ];
-    let output = Command::new(program)
-        .args(args)
-        .current_dir(&repo.root)
-        .output()
-        .map_err(|e| format!("current CLI/daemon prebuild: cargo {}: {e}", args.join(" ")))?;
-    if !output.status.success() {
-        return Err(format!(
-            "current CLI/daemon prebuild: cargo {} failed ({}):\n{}{}",
-            args.join(" "),
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        ));
-    }
-    binaries_from_artifacts(repo, meta, &output.stdout)
+    let secs = budget_secs(budget);
+    let stdout = match run_bounded(&repo.root, program, &args, budget) {
+        CommandOutcome::Exited {
+            success: true,
+            text,
+        } => text,
+        CommandOutcome::Exited {
+            success: false,
+            text,
+        } => {
+            return Err(GateFailure::new(format!(
+                "current CLI/daemon prebuild: cargo {} failed:\n{}",
+                args.join(" "),
+                text
+            )));
+        }
+        CommandOutcome::TimedOut { .. } => {
+            return Err(GateFailure {
+                detail: format!("gate '{gate_name}' timed out after {secs}s"),
+                timed_out: true,
+            });
+        }
+        CommandOutcome::SpawnFailed { detail } => {
+            return Err(GateFailure::new(format!(
+                "current CLI/daemon prebuild: cargo {}: {detail}",
+                args.join(" ")
+            )));
+        }
+    };
+    binaries_from_artifacts(repo, meta, stdout.as_bytes()).map_err(GateFailure::new)
 }
 
 fn binaries_from_artifacts(
@@ -183,47 +388,55 @@ fn binaries_from_artifacts(
     })
 }
 
-fn test_cargo(repo: &Repo, args: &[&str], binaries: Option<&ProductBinaries>) -> Gate {
-    let mut command = Command::new("cargo");
-    command.args(args).current_dir(&repo.root);
-    if let Some(binaries) = binaries {
-        command
-            .env("NEXUS_N3_TEST_CLI_BIN", &binaries.cli)
-            .env("NEXUS_N3_TEST_DAEMON_BIN", &binaries.daemon);
-    }
-    let output = match command.output() {
-        Ok(output) => output,
-        Err(e) => return Gate::fail("", &format!("cargo {}: {e}", args.join(" "))),
-    };
-    if output.status.success() {
-        Gate::ok("", "ok")
-    } else {
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let tail = text
-            .lines()
-            .rev()
-            .take(12)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n");
-        Gate::fail(
-            "",
-            &format!(
-                "cargo {} failed ({}):\n{tail}",
-                args.join(" "),
-                output.status
-            ),
-        )
+fn cargo_gate(repo: &Repo, name: &str, args: &[&str], budget: GateBudget) -> Gate {
+    cargo_test_gate(repo, name, args, None, budget)
+}
+
+/// 执行一条 cargo 命令并映射为门结果。超时 = FAIL + `timed_out=true`
+/// （fail-closed），detail 固定为 `gate '<name>' timed out after <n>s`。
+fn cargo_test_gate(
+    repo: &Repo,
+    name: &str,
+    args: &[&str],
+    binaries: Option<&ProductBinaries>,
+    budget: GateBudget,
+) -> Gate {
+    let secs = budget_secs(budget);
+    let envs: Vec<(&str, &std::path::Path)> = binaries
+        .map(|b| {
+            vec![
+                ("NEXUS_N3_TEST_CLI_BIN", b.cli.as_path()),
+                ("NEXUS_N3_TEST_DAEMON_BIN", b.daemon.as_path()),
+            ]
+        })
+        .unwrap_or_default();
+    match run_bounded_env(&repo.root, "cargo", args, budget, &envs) {
+        CommandOutcome::Exited { success: true, .. } => Gate::ok(name, "ok"),
+        CommandOutcome::Exited {
+            success: false,
+            text,
+        } => {
+            let tail = text
+                .lines()
+                .rev()
+                .take(12)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            Gate::fail(name, &format!("cargo {} failed:\n{tail}", args.join(" ")))
+        }
+        CommandOutcome::TimedOut { .. } => {
+            let mut g = Gate::fail(name, &format!("gate '{name}' timed out after {secs}s"));
+            g.timed_out = true;
+            g
+        }
+        CommandOutcome::SpawnFailed { detail } => Gate::fail(name, &detail),
     }
 }
 
-pub fn whitespace_gate(repo: &Repo) -> Gate {
+pub fn whitespace_gate(repo: &Repo, _budget: GateBudget) -> Gate {
     let mut problems: Vec<String> = Vec::new();
     for check in [
         &["diff", "--check"][..],
@@ -242,25 +455,23 @@ pub fn whitespace_gate(repo: &Repo) -> Gate {
     }
 }
 
-pub fn format_gate(repo: &Repo) -> Gate {
-    let g = cargo(repo, &["fmt", "--all", "--", "--check"]);
-    Gate {
-        name: "format".to_string(),
-        ..g
-    }
+pub fn format_gate(repo: &Repo, budget: GateBudget) -> Gate {
+    cargo_gate(repo, "format", &["fmt", "--all", "--", "--check"], budget)
 }
 
-pub fn check_gate(repo: &Repo) -> Gate {
-    let g = cargo(repo, &["check", "--workspace", "--all-targets"]);
-    Gate {
-        name: "check".to_string(),
-        ..g
-    }
-}
-
-pub fn clippy_gate(repo: &Repo) -> Gate {
-    let g = cargo(
+pub fn check_gate(repo: &Repo, budget: GateBudget) -> Gate {
+    cargo_gate(
         repo,
+        "check",
+        &["check", "--workspace", "--all-targets"],
+        budget,
+    )
+}
+
+pub fn clippy_gate(repo: &Repo, budget: GateBudget) -> Gate {
+    cargo_gate(
+        repo,
+        "clippy",
         &[
             "clippy",
             "--workspace",
@@ -269,32 +480,37 @@ pub fn clippy_gate(repo: &Repo) -> Gate {
             "-D",
             "warnings",
         ],
-    );
-    Gate {
-        name: "clippy".to_string(),
-        ..g
-    }
+        budget,
+    )
 }
 
 /// Unit tests of the harness itself (selected properties gate).
-pub fn selected_properties_gate(repo: &Repo) -> Gate {
-    let g = cargo(repo, &["test", "-p", "nexus-harness"]);
-    Gate {
-        name: "selected-properties".to_string(),
-        ..g
-    }
+pub fn selected_properties_gate(repo: &Repo, budget: GateBudget) -> Gate {
+    cargo_gate(
+        repo,
+        "selected-properties",
+        &["test", "-p", "nexus-harness"],
+        budget,
+    )
 }
 
-pub fn workspace_tests_gate(repo: &Repo) -> Gate {
+pub fn workspace_tests_gate(repo: &Repo, budget: GateBudget) -> Gate {
     let meta = match cargo_metadata() {
         Ok(meta) => meta,
         Err(e) => return Gate::unknown("workspace-tests", &format!("cargo metadata failed: {e}")),
     };
-    let binaries = match product_binaries(repo, &meta, &member_names(&meta)) {
-        Ok(binaries) => binaries,
-        Err(e) => return Gate::fail("workspace-tests", &e),
-    };
-    let g = test_cargo(repo, &["test", "--workspace"], binaries.as_ref());
+    let binaries =
+        match product_binaries(repo, &meta, &member_names(&meta), "workspace-tests", budget) {
+            Ok(binaries) => binaries,
+            Err(e) => return fail_from("workspace-tests", e),
+        };
+    let g = cargo_test_gate(
+        repo,
+        "workspace-tests",
+        &["test", "--workspace"],
+        binaries.as_ref(),
+        budget,
+    );
     Gate {
         name: "workspace-tests".to_string(),
         ..g
@@ -303,7 +519,7 @@ pub fn workspace_tests_gate(repo: &Repo) -> Gate {
 
 /// Affected analysis: changed files -> owning crates -> direct reverse deps.
 /// Tests every affected crate; no changes => PASS.
-pub fn affected_tests_gate(repo: &Repo, _config: &Config) -> Gate {
+pub fn affected_tests_gate(repo: &Repo, _config: &Config, budget: GateBudget) -> Gate {
     let meta = match cargo_metadata() {
         Ok(m) => m,
         Err(e) => return Gate::unknown("affected-tests", &format!("cargo metadata failed: {e}")),
@@ -316,13 +532,19 @@ pub fn affected_tests_gate(repo: &Repo, _config: &Config) -> Gate {
     if affected.is_empty() {
         return Gate::ok("affected-tests", "no affected crates changed");
     }
-    let binaries = match product_binaries(repo, &meta, &affected) {
+    let binaries = match product_binaries(repo, &meta, &affected, "affected-tests", budget) {
         Ok(binaries) => binaries,
-        Err(e) => return Gate::fail("affected-tests", &e),
+        Err(e) => return fail_from("affected-tests", e),
     };
     let mut failures: Vec<String> = Vec::new();
     for name in &affected {
-        let g = test_cargo(repo, &["test", "-p", name], binaries.as_ref());
+        let g = cargo_test_gate(
+            repo,
+            "affected-tests",
+            &["test", "-p", name],
+            binaries.as_ref(),
+            budget,
+        );
         if g.verdict == "FAIL" {
             failures.push(format!("{name}: {}", g.detail));
         }
@@ -457,7 +679,7 @@ fn changed_member_names(
 
 /// Light architecture gate: every `crates/*` workspace member must be declared
 /// in policies/architecture.toml [[crate]] (apps/engineering are hosts/tooling).
-pub fn architecture_gate(config: &Config) -> Gate {
+pub fn architecture_gate(config: &Config, _budget: GateBudget) -> Gate {
     let policy = config.policies_dir.join("architecture.toml");
     let text = match std::fs::read_to_string(&policy) {
         Ok(t) => t,
@@ -514,7 +736,7 @@ pub fn architecture_gate(config: &Config) -> Gate {
 /// Dependency governance: static checks (lockfile + policy parse) AND real
 /// cargo-deny execution (advisories / licenses / bans / sources) against
 /// policies/deny.toml. cargo-deny missing => UNKNOWN, never a silent PASS.
-pub fn dependency_gate(repo: &Repo, config: &Config) -> Gate {
+pub fn dependency_gate(repo: &Repo, config: &Config, budget: GateBudget) -> Gate {
     if !repo.root.join("Cargo.lock").exists() {
         return Gate::fail(
             "dependency-governance",
@@ -529,14 +751,15 @@ pub fn dependency_gate(repo: &Repo, config: &Config) -> Gate {
     if let Err(e) = toml::from_str::<toml::Value>(&text) {
         return Gate::fail("dependency-governance", &format!("parse failed: {e}"));
     }
-    if !cargo_tool_available(repo, "deny") {
+    if !cargo_tool_available(repo, "deny", budget) {
         return Gate::unknown(
             "dependency-governance",
             "static checks passed; cargo-deny not installed (install with: cargo install cargo-deny --locked)",
         );
     }
     let deny_cfg = config.policies_dir.join("deny.toml");
-    let (ok, out) = run_at_full(
+    let secs = budget_secs(budget);
+    let out = match run_bounded(
         &repo.root,
         "cargo",
         &[
@@ -550,20 +773,36 @@ pub fn dependency_gate(repo: &Repo, config: &Config) -> Gate {
             "bans",
             "sources",
         ],
-    );
-    if ok {
-        Gate::ok(
-            "dependency-governance",
-            "cargo-deny: advisories/licenses/bans/sources PASS",
-        )
-    } else {
-        let tail: Vec<&str> = out.lines().rev().take(20).collect();
-        let tail = tail.iter().rev().cloned().collect::<Vec<_>>().join("\n");
-        Gate::fail(
-            "dependency-governance",
-            &format!("cargo-deny check FAILED:\n{tail}"),
-        )
-    }
+        budget,
+    ) {
+        CommandOutcome::Exited { success: true, .. } => {
+            return Gate::ok(
+                "dependency-governance",
+                "cargo-deny: advisories/licenses/bans/sources PASS",
+            );
+        }
+        CommandOutcome::Exited {
+            success: false,
+            text,
+        } => text,
+        CommandOutcome::TimedOut { .. } => {
+            let mut g = Gate::fail(
+                "dependency-governance",
+                &format!("gate 'dependency-governance' timed out after {secs}s"),
+            );
+            g.timed_out = true;
+            return g;
+        }
+        CommandOutcome::SpawnFailed { detail } => {
+            return Gate::fail("dependency-governance", &detail);
+        }
+    };
+    let tail: Vec<&str> = out.lines().rev().take(20).collect();
+    let tail = tail.iter().rev().cloned().collect::<Vec<_>>().join("\n");
+    Gate::fail(
+        "dependency-governance",
+        &format!("cargo-deny check FAILED:\n{tail}"),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -589,9 +828,11 @@ fn rs_files_under(dir: &PathBuf) -> Vec<PathBuf> {
 }
 
 /// True if `cargo <subcmd> --version` succeeds (subcommand installed).
-fn cargo_tool_available(repo: &Repo, subcmd: &str) -> bool {
-    let (ok, _) = run_at(&repo.root, "cargo", &[subcmd, "--version"]);
-    ok
+fn cargo_tool_available(repo: &Repo, subcmd: &str, budget: GateBudget) -> bool {
+    matches!(
+        run_bounded(&repo.root, "cargo", &[subcmd, "--version"], budget),
+        CommandOutcome::Exited { success: true, .. }
+    )
 }
 
 /// Declared Cargo test targets only: helper files are not independent targets.
@@ -625,7 +866,7 @@ fn integration_targets(meta: &Value) -> Vec<(String, String)> {
 
 /// Runs each real target via `cargo test -p <member> --test <name>`.
 /// None declared => UNKNOWN.
-pub fn integration_gate(repo: &Repo) -> Gate {
+pub fn integration_gate(repo: &Repo, budget: GateBudget) -> Gate {
     let meta = match cargo_metadata() {
         Ok(m) => m,
         Err(e) => return Gate::unknown("integration", &format!("cargo metadata failed: {e}")),
@@ -641,16 +882,18 @@ pub fn integration_gate(repo: &Repo) -> Gate {
         .iter()
         .map(|(member, _)| member.clone())
         .collect::<Vec<_>>();
-    let binaries = match product_binaries(repo, &meta, &packages) {
+    let binaries = match product_binaries(repo, &meta, &packages, "integration", budget) {
         Ok(binaries) => binaries,
-        Err(e) => return Gate::fail("integration", &e),
+        Err(e) => return fail_from("integration", e),
     };
     let mut failures: Vec<String> = Vec::new();
     for (member, test) in &targets {
-        let g = test_cargo(
+        let g = cargo_test_gate(
             repo,
+            "integration",
             &["test", "-p", member, "--test", test],
             binaries.as_ref(),
+            budget,
         );
         if g.verdict == "FAIL" {
             failures.push(format!("{member}::{test}: {}", g.detail));
@@ -669,21 +912,45 @@ pub fn integration_gate(repo: &Repo) -> Gate {
 /// Coverage summary via cargo-llvm-cov; tool missing or run failure => UNKNOWN.
 /// Parses the TOTAL row from the full output (the table can be followed by
 /// per-binary test progress lines, so a tail-trimmed capture misses it).
-pub fn coverage_gate(repo: &Repo) -> Gate {
-    if !cargo_tool_available(repo, "llvm-cov") {
+pub fn coverage_gate(repo: &Repo, budget: GateBudget) -> Gate {
+    if !cargo_tool_available(repo, "llvm-cov", budget) {
         return Gate::unknown(
             "coverage-summary",
             "cargo-llvm-cov not installed (install with: cargo install cargo-llvm-cov)",
         );
     }
-    let (ok, out) = run_at_full(
+    let secs = budget_secs(budget);
+    let out = match run_bounded(
         &repo.root,
         "cargo",
         &["llvm-cov", "--workspace", "--summary-only"],
-    );
-    if !ok {
-        return Gate::unknown("coverage-summary", &format!("coverage run failed: {}", out));
-    }
+        budget,
+    ) {
+        CommandOutcome::Exited {
+            success: true,
+            text,
+        } => text,
+        CommandOutcome::Exited {
+            success: false,
+            text,
+        } => {
+            return Gate::unknown("coverage-summary", &format!("coverage run failed: {text}"));
+        }
+        CommandOutcome::TimedOut { .. } => {
+            let mut g = Gate::fail(
+                "coverage-summary",
+                &format!("gate 'coverage-summary' timed out after {secs}s"),
+            );
+            g.timed_out = true;
+            return g;
+        }
+        CommandOutcome::SpawnFailed { detail } => {
+            return Gate::unknown(
+                "coverage-summary",
+                &format!("coverage run failed: {detail}"),
+            );
+        }
+    };
     let total = out
         .lines()
         .rfind(|l| l.contains("TOTAL") && l.contains('%'))
@@ -701,8 +968,8 @@ pub fn coverage_gate(repo: &Repo) -> Gate {
 }
 
 /// Fuzz: cargo-fuzz installed + targets declared. Missing either => UNKNOWN.
-pub fn fuzz_gate(repo: &Repo) -> Gate {
-    if !cargo_tool_available(repo, "fuzz") {
+pub fn fuzz_gate(repo: &Repo, budget: GateBudget) -> Gate {
+    if !cargo_tool_available(repo, "fuzz", budget) {
         return Gate::unknown(
             "selected-fuzz",
             "cargo-fuzz not installed (install with: cargo install cargo-fuzz)",
@@ -715,23 +982,45 @@ pub fn fuzz_gate(repo: &Repo) -> Gate {
         );
     }
     // cargo-fuzz 依赖 libfuzzer 的 nightly `-Z` 选项；显式使用 +nightly 工具链。
-    let (ok, out) = run_at(&repo.root, "cargo", &["+nightly", "fuzz", "check"]);
-    if ok {
-        Gate::ok("selected-fuzz", "ok")
-    } else {
-        Gate::fail(
-            "selected-fuzz",
-            if out.is_empty() {
-                "command failed"
-            } else {
-                &out
-            },
-        )
+    let secs = budget_secs(budget);
+    match run_bounded(&repo.root, "cargo", &["+nightly", "fuzz", "check"], budget) {
+        CommandOutcome::Exited { success: true, .. } => Gate::ok("selected-fuzz", "ok"),
+        CommandOutcome::Exited {
+            success: false,
+            text,
+        } => {
+            let tail = text
+                .lines()
+                .rev()
+                .take(12)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            Gate::fail(
+                "selected-fuzz",
+                if tail.is_empty() {
+                    "command failed"
+                } else {
+                    &tail
+                },
+            )
+        }
+        CommandOutcome::TimedOut { .. } => {
+            let mut g = Gate::fail(
+                "selected-fuzz",
+                &format!("gate 'selected-fuzz' timed out after {secs}s"),
+            );
+            g.timed_out = true;
+            g
+        }
+        CommandOutcome::SpawnFailed { detail } => Gate::fail("selected-fuzz", &detail),
     }
 }
 
 /// Concurrency tests under tests/concurrency/; none declared => UNKNOWN.
-pub fn concurrency_gate(repo: &Repo) -> Gate {
+pub fn concurrency_gate(repo: &Repo, budget: GateBudget) -> Gate {
     let files = rs_files_under(&repo.root.join("tests/concurrency"));
     if files.is_empty() {
         return Gate::unknown(
@@ -745,7 +1034,12 @@ pub fn concurrency_gate(repo: &Repo) -> Gate {
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
-        let g = cargo(repo, &["test", "--test", &stem]);
+        let g = cargo_gate(
+            repo,
+            "selected-concurrency",
+            &["test", "--test", &stem],
+            budget,
+        );
         if g.verdict == "FAIL" {
             failures.push(format!("{stem}: {}", g.detail));
         }
@@ -766,8 +1060,9 @@ pub fn concurrency_gate(repo: &Repo) -> Gate {
 /// FAIL => gate FAIL (regression blocks); run/parse failure => UNKNOWN (never
 /// silently passed). Baseline comparison happens inside the driver
 /// (PRODUCT §12.36 / §12.37).
-pub fn bench_gate(repo: &Repo, _config: &Config) -> Gate {
-    let (ok, text) = run_at_full(
+pub fn bench_gate(repo: &Repo, _config: &Config, budget: GateBudget) -> Gate {
+    let secs = budget_secs(budget);
+    let text = match run_bounded(
         &repo.root,
         "cargo",
         &[
@@ -780,13 +1075,30 @@ pub fn bench_gate(repo: &Repo, _config: &Config) -> Gate {
             "--",
             "--json",
         ],
-    );
-    if !ok {
-        return Gate::unknown(
-            "bench",
-            &format!("perf_bench run failed (exit != 0): {}", text.trim()),
-        );
-    }
+        budget,
+    ) {
+        CommandOutcome::Exited {
+            success: true,
+            text,
+        } => text,
+        CommandOutcome::Exited {
+            success: false,
+            text,
+        } => {
+            return Gate::unknown(
+                "bench",
+                &format!("perf_bench run failed (exit != 0): {}", text.trim()),
+            );
+        }
+        CommandOutcome::TimedOut { .. } => {
+            let mut g = Gate::fail("bench", &format!("gate 'bench' timed out after {secs}s"));
+            g.timed_out = true;
+            return g;
+        }
+        CommandOutcome::SpawnFailed { detail } => {
+            return Gate::unknown("bench", &format!("perf_bench run failed: {detail}"));
+        }
+    };
     bench_verdict_gate(&text)
 }
 
@@ -828,7 +1140,7 @@ fn bench_verdict_gate(text: &str) -> Gate {
 
 /// Performance budgets: require machine-readable thresholds in
 /// policies/quality.toml [performance]; absent => UNKNOWN (no budget to check).
-pub fn performance_budgets_gate(config: &Config) -> Gate {
+pub fn performance_budgets_gate(config: &Config, _budget: GateBudget) -> Gate {
     let Some(perf) = config.quality.get("performance") else {
         return Gate::unknown(
             "performance-budgets",
@@ -861,7 +1173,7 @@ pub fn performance_budgets_gate(config: &Config) -> Gate {
 
 /// Platform checks: portable-core crates must be free of platform-specific
 /// dependencies (target-specific tables or known OS-only crates).
-pub fn platform_checks_gate(config: &Config) -> Gate {
+pub fn platform_checks_gate(config: &Config, _budget: GateBudget) -> Gate {
     const PLATFORM_CRATES: &[&str] = &[
         "winapi",
         "windows-sys",
@@ -913,7 +1225,7 @@ pub fn platform_checks_gate(config: &Config) -> Gate {
 
 /// Feature matrix: for each workspace member, `cargo check` with
 /// --no-default-features and --all-features (per quality.toml [features]).
-pub fn feature_matrix_gate(repo: &Repo) -> Gate {
+pub fn feature_matrix_gate(repo: &Repo, budget: GateBudget) -> Gate {
     let meta = match cargo_metadata() {
         Ok(m) => m,
         Err(e) => return Gate::unknown("feature-matrix", &format!("cargo metadata failed: {e}")),
@@ -927,7 +1239,7 @@ pub fn feature_matrix_gate(repo: &Repo) -> Gate {
     let mut checked = 0usize;
     for name in &names {
         for flag in ["--no-default-features", "--all-features"] {
-            let g = cargo(repo, &["check", "-p", name, flag]);
+            let g = cargo_gate(repo, "feature-matrix", &["check", "-p", name, flag], budget);
             checked += 1;
             if g.verdict == "FAIL" {
                 failures.push(format!("{name} {flag}: {}", g.detail));
@@ -946,12 +1258,23 @@ pub fn feature_matrix_gate(repo: &Repo) -> Gate {
 
 /// Portable core: every harness.toml [portable_core] crate must compile for
 /// wasm32-wasip1; target not installed => UNKNOWN.
-pub fn portable_core_gate(repo: &Repo, config: &Config) -> Gate {
+pub fn portable_core_gate(repo: &Repo, config: &Config, budget: GateBudget) -> Gate {
     // 必须用全量输出：`rustup target list --installed` 在装了很多 target 的
     // 机器上超过 12 行，run_at 的 tail 会把 wasm32-wasip1 截掉，导致"已安装"
     // 被误判为缺失（UNKNOWN）。
-    let (ok, out) = run_at_full(&repo.root, "rustup", &["target", "list", "--installed"]);
-    if !ok || !out.contains("wasm32-wasip1") {
+    let installed = match run_bounded(
+        &repo.root,
+        "rustup",
+        &["target", "list", "--installed"],
+        budget,
+    ) {
+        CommandOutcome::Exited {
+            success: true,
+            text,
+        } => text,
+        _ => String::new(),
+    };
+    if !installed.contains("wasm32-wasip1") {
         return Gate::unknown(
             "portable-core",
             "wasm32-wasip1 target not installed (install with: rustup target add wasm32-wasip1)",
@@ -959,7 +1282,12 @@ pub fn portable_core_gate(repo: &Repo, config: &Config) -> Gate {
     }
     let mut failures: Vec<String> = Vec::new();
     for name in &config.portable_core {
-        let g = cargo(repo, &["check", "-p", name, "--target", "wasm32-wasip1"]);
+        let g = cargo_gate(
+            repo,
+            "portable-core",
+            &["check", "-p", name, "--target", "wasm32-wasip1"],
+            budget,
+        );
         if g.verdict == "FAIL" {
             failures.push(format!("{name}: {}", g.detail));
         }
@@ -1230,7 +1558,7 @@ fn allow_covers(allow: &[AllowEntry], file: &str, span: LineSpan, code: &str) ->
 ///
 /// fail-closed：policy 缺失/字段缺失 → FAIL；**crate 目录不存在或零 `.rs`
 /// 文件 → FAIL**（P1-6：写错 crate 名曾得到"4 crate(s), 0 file(s): PASS"）。
-pub fn resource_kind_neutrality_gate(config: &Config) -> Gate {
+pub fn resource_kind_neutrality_gate(config: &Config, _budget: GateBudget) -> Gate {
     const GATE: &str = "resource-type-neutrality";
     let policy = config.policies_dir.join("architecture.toml");
     let text = match std::fs::read_to_string(&policy) {
@@ -1464,9 +1792,9 @@ mod tests {
     fn dependency_gate_runs_cargo_deny_when_available() {
         let repo = Repo::discover().expect("repo must be discoverable");
         let config = Config::load(&repo).expect("config must load from harness.toml");
-        let g = dependency_gate(&repo, &config);
+        let g = dependency_gate(&repo, &config, GateBudget::unlimited());
         assert_ne!(g.verdict, "FAIL", "dependency gate failed: {}", g.detail);
-        if cargo_tool_available(&repo, "deny") {
+        if cargo_tool_available(&repo, "deny", GateBudget::unlimited()) {
             assert_eq!(
                 g.verdict, "PASS",
                 "cargo-deny installed but gate not PASS: {}",
@@ -1601,7 +1929,7 @@ mod tests {
         // 当前契约四 crate 无资源类型专属分支（仅 as_str 规范序列化，已 allow）。
         let repo = crate::env::Repo::discover().expect("repo must be discoverable");
         let config = crate::config::Config::load(&repo).expect("config must load");
-        let g = resource_kind_neutrality_gate(&config);
+        let g = resource_kind_neutrality_gate(&config, GateBudget::unlimited());
         assert_eq!(g.verdict, "PASS", "gate failed: {}", g.detail);
         // P1-5：断言具体 crate 名（只验数量＝侥幸通过）。
         for expected in [
@@ -1791,7 +2119,7 @@ mod tests {
             policies_dir: tmp.clone(),
             ..config
         };
-        let g = resource_kind_neutrality_gate(&cfg);
+        let g = resource_kind_neutrality_gate(&cfg, GateBudget::unlimited());
         assert_eq!(
             g.verdict, "FAIL",
             "missing crate dir must fail: {}",
@@ -1823,7 +2151,7 @@ mod tests {
             policies_dir: tmp.clone(),
             ..config
         };
-        let g = resource_kind_neutrality_gate(&cfg);
+        let g = resource_kind_neutrality_gate(&cfg, GateBudget::unlimited());
         assert_eq!(g.verdict, "FAIL", "{}", g.detail);
         assert!(g.detail.contains("missing 'line'"), "{}", g.detail);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1948,7 +2276,7 @@ mod tests {
         let repo = crate::env::Repo { root: root.clone() };
         let config = crate::config::Config::load(&crate::env::Repo::discover().expect("repo"))
             .expect("config");
-        let gate = affected_tests_gate(&repo, &config);
+        let gate = affected_tests_gate(&repo, &config, GateBudget::unlimited());
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(gate.name, "affected-tests");
         assert_eq!(
@@ -1988,18 +2316,22 @@ mod tests {
             quality,
             portable_core: vec![],
             bind_working_tree_digest: true,
+            verify_timeouts: crate::config::VerifyTimeouts::defaults(),
         };
         // 完整 [performance]（baseline + blocking，对齐 policies/quality.toml）→ PASS。
-        let g = performance_budgets_gate(&cfg(serde_json::json!({
-            "performance": {
-                "baseline": {"policy_evaluate_ns": 1000},
-                "blocking": {"policy_evaluate_ns": 50000}
-            }
-        })));
+        let g = performance_budgets_gate(
+            &cfg(serde_json::json!({
+                "performance": {
+                    "baseline": {"policy_evaluate_ns": 1000},
+                    "blocking": {"policy_evaluate_ns": 50000}
+                }
+            })),
+            GateBudget::unlimited(),
+        );
         assert_eq!(g.verdict, "PASS", "{}", g.detail);
         assert!(g.detail.contains("baseline"), "{}", g.detail);
         // 无 [performance] → UNKNOWN（无预算可查，不静默 PASS）。
-        let g = performance_budgets_gate(&cfg(serde_json::json!({})));
+        let g = performance_budgets_gate(&cfg(serde_json::json!({})), GateBudget::unlimited());
         assert_eq!(g.verdict, "UNKNOWN");
         assert!(
             g.detail.contains("no [performance] section"),
@@ -2007,8 +2339,10 @@ mod tests {
             g.detail
         );
         // 不完整（缺 blocking）→ UNKNOWN。
-        let g =
-            performance_budgets_gate(&cfg(serde_json::json!({"performance": {"baseline": {}}})));
+        let g = performance_budgets_gate(
+            &cfg(serde_json::json!({"performance": {"baseline": {}}})),
+            GateBudget::unlimited(),
+        );
         assert_eq!(g.verdict, "UNKNOWN");
         assert!(g.detail.contains("incomplete"), "{}", g.detail);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2048,20 +2382,24 @@ mod tests {
             quality: serde_json::json!({}),
             portable_core: names,
             bind_working_tree_digest: true,
+            verify_timeouts: crate::config::VerifyTimeouts::defaults(),
         };
         // 干净 crate → PASS。
-        let g = platform_checks_gate(&cfg(vec!["clean".to_string()]));
+        let g = platform_checks_gate(&cfg(vec!["clean".to_string()]), GateBudget::unlimited());
         assert_eq!(g.verdict, "PASS", "{}", g.detail);
         // 平台专属依赖 → FAIL 且点名依赖。
-        let g = platform_checks_gate(&cfg(vec!["clean".to_string(), "win".to_string()]));
+        let g = platform_checks_gate(
+            &cfg(vec!["clean".to_string(), "win".to_string()]),
+            GateBudget::unlimited(),
+        );
         assert_eq!(g.verdict, "FAIL");
         assert!(g.detail.contains("winapi"), "{}", g.detail);
         // [target.'cfg(...)'.dependencies] → FAIL。
-        let g = platform_checks_gate(&cfg(vec!["tgt".to_string()]));
+        let g = platform_checks_gate(&cfg(vec!["tgt".to_string()]), GateBudget::unlimited());
         assert_eq!(g.verdict, "FAIL");
         assert!(g.detail.contains("cfg("), "{}", g.detail);
         // manifest 缺失 → FAIL。
-        let g = platform_checks_gate(&cfg(vec!["ghost".to_string()]));
+        let g = platform_checks_gate(&cfg(vec!["ghost".to_string()]), GateBudget::unlimited());
         assert_eq!(g.verdict, "FAIL");
         assert!(g.detail.contains("ghost"), "{}", g.detail);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2083,12 +2421,13 @@ mod tests {
             quality: serde_json::json!({}),
             portable_core: vec![],
             bind_working_tree_digest: true,
+            verify_timeouts: crate::config::VerifyTimeouts::defaults(),
         };
-        let g = architecture_gate(&cfg);
+        let g = architecture_gate(&cfg, GateBudget::unlimited());
         assert_eq!(g.verdict, "FAIL", "{}", g.detail);
         assert!(g.detail.contains("read failed"), "{}", g.detail);
         std::fs::write(tmp.join("architecture.toml"), "not = = toml").unwrap();
-        let g = architecture_gate(&cfg);
+        let g = architecture_gate(&cfg, GateBudget::unlimited());
         assert_eq!(g.verdict, "FAIL", "{}", g.detail);
         assert!(g.detail.contains("parse failed"), "{}", g.detail);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2101,7 +2440,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let repo = Repo { root: tmp.clone() };
-        let g = concurrency_gate(&repo);
+        let g = concurrency_gate(&repo, GateBudget::unlimited());
         assert_eq!(g.verdict, "UNKNOWN", "{}", g.detail);
         assert!(g.detail.contains("tests/concurrency"), "{}", g.detail);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2115,9 +2454,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let repo = Repo { root: tmp.clone() };
-        let g = fuzz_gate(&repo);
+        let g = fuzz_gate(&repo, GateBudget::unlimited());
         assert_eq!(g.verdict, "UNKNOWN", "{}", g.detail);
-        if cargo_tool_available(&repo, "fuzz") {
+        if cargo_tool_available(&repo, "fuzz", GateBudget::unlimited()) {
             assert!(g.detail.contains("no fuzz targets"), "{}", g.detail);
         } else {
             assert!(
@@ -2137,9 +2476,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let repo = Repo { root: tmp.clone() };
-        let g = coverage_gate(&repo);
+        let g = coverage_gate(&repo, GateBudget::unlimited());
         assert_eq!(g.verdict, "UNKNOWN", "{}", g.detail);
-        if cargo_tool_available(&repo, "llvm-cov") {
+        if cargo_tool_available(&repo, "llvm-cov", GateBudget::unlimited()) {
             assert!(g.detail.contains("coverage run failed"), "{}", g.detail);
         } else {
             assert!(
@@ -2166,8 +2505,45 @@ mod tests {
             return;
         }
         let config = Config::load(&repo).expect("config must load");
-        let g = portable_core_gate(&repo, &config);
+        let g = portable_core_gate(&repo, &config, GateBudget::unlimited());
         assert_eq!(g.verdict, "UNKNOWN", "{}", g.detail);
         assert!(g.detail.contains("wasm32-wasip1"), "{}", g.detail);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_times_out() {
+        let root = std::env::temp_dir();
+        let start = std::time::Instant::now();
+        let outcome = run_bounded(
+            &root,
+            "sleep",
+            &["5"],
+            GateBudget::from_limit(Some(std::time::Duration::from_millis(50))),
+        );
+        assert!(
+            matches!(outcome, CommandOutcome::TimedOut { .. }),
+            "expected TimedOut"
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_captures_output() {
+        let root = std::env::temp_dir();
+        let outcome = run_bounded(
+            &root,
+            "sh",
+            &["-c", "printf hello-out"],
+            GateBudget::unlimited(),
+        );
+        match outcome {
+            CommandOutcome::Exited { success, text } => {
+                assert!(success);
+                assert!(text.contains("hello-out"), "{text}");
+            }
+            _ => panic!("expected Exited"),
+        }
     }
 }

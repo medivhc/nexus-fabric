@@ -157,6 +157,10 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 
 /// UTC 墙钟 ISO-8601（毫秒精度）。运行时刻写进 summary 供取证——它是
 /// 字段而不是 id 分量（见 `verify_id` 文档注释对时间戳为何不入 id 的说明）。
+pub(crate) fn now_iso8601() -> String {
+    created_at_iso8601()
+}
+
 fn created_at_iso8601() -> String {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -223,8 +227,20 @@ fn preserve_stale_if_bindings_differ(
     write_json(&target.join("summary.json"), &old)
 }
 
+/// 一次 verify 的计时快照（evidence `summary.timing`）。
+///
+/// 门级 `duration_ms` 不可直接累加求和；整轮总耗时只认 `total_ms`。
+pub struct VerifyTiming {
+    pub total_ms: u64,
+    pub started_at: String,
+    pub deadline_ms: Option<u64>,
+    pub deadline_exceeded: bool,
+    pub prebuild_ms: u64,
+}
+
 /// Write full evidence for a verify run; marks prior evidence with differing
 /// bindings as STALE; refreshes .evidence/latest.json.
+#[allow(clippy::too_many_arguments)]
 pub fn write_evidence(
     repo: &Repo,
     config: &Config,
@@ -233,6 +249,7 @@ pub fn write_evidence(
     gates: &[Gate],
     scenarios: &[ScenarioResult],
     bindings: &Bindings,
+    timing: &VerifyTiming,
 ) -> Result<String, String> {
     let id = verify_id(repo, bindings);
     let dir = config.evidence_dir.join(format!("verify-{id}"));
@@ -248,14 +265,38 @@ pub fn write_evidence(
         "id": id,
         "created_at": created_at_iso8601(),
         "bindings": bindings_json,
+        "timing": {
+            "total_ms": timing.total_ms,
+            "started_at": timing.started_at,
+            "deadline_ms": timing.deadline_ms,
+            "deadline_exceeded": timing.deadline_exceeded,
+            "prebuild_ms": timing.prebuild_ms,
+        },
     });
     let gates_json: Vec<Value> = gates
         .iter()
-        .map(|g| json!({"name": g.name, "verdict": g.verdict, "detail": g.detail}))
+        .map(|g| {
+            json!({
+                "name": g.name,
+                "verdict": g.verdict,
+                "detail": g.detail,
+                "duration_ms": g.duration_ms,
+                "timed_out": g.timed_out,
+                "skipped_by_deadline": g.skipped_by_deadline,
+            })
+        })
         .collect();
     let scenarios_json: Vec<Value> = scenarios
         .iter()
-        .map(|s| json!({"id": s.id, "verdict": s.verdict, "detail": s.detail}))
+        .map(|s| {
+            json!({
+                "id": s.id,
+                "verdict": s.verdict,
+                "detail": s.detail,
+                "duration_ms": s.duration_ms,
+                "timed_out": s.timed_out,
+            })
+        })
         .collect();
     let checks = json!({"gates": gates_json, "scenarios": scenarios_json});
 
@@ -432,6 +473,16 @@ mod tests {
     /// `Config` for tests that need `Bindings::current` (which reads the
     /// `[evidence].bind_working_tree_digest` flag). All directories point under
     /// `dir`; bind defaults to `true` so the sentinel/unknown paths stay reachable.
+    fn test_timing() -> VerifyTiming {
+        VerifyTiming {
+            total_ms: 1,
+            started_at: "2026-01-01T00:00:00.000Z".to_string(),
+            deadline_ms: None,
+            deadline_exceeded: false,
+            prebuild_ms: 0,
+        }
+    }
+
     fn test_config(dir: &std::path::Path) -> Config {
         Config {
             policies_dir: dir.join("policies"),
@@ -442,6 +493,7 @@ mod tests {
             quality: json!({}),
             portable_core: vec![],
             bind_working_tree_digest: true,
+            verify_timeouts: crate::config::VerifyTimeouts::defaults(),
         }
     }
 
@@ -519,6 +571,7 @@ mod tests {
             quality: json!({}),
             portable_core: vec![],
             bind_working_tree_digest: true,
+            verify_timeouts: crate::config::VerifyTimeouts::defaults(),
         };
         let old_dir = tmp.join("verify-old");
         std::fs::create_dir_all(&old_dir).unwrap();
@@ -591,6 +644,7 @@ mod tests {
             quality: json!({}),
             portable_core: vec![],
             bind_working_tree_digest: true,
+            verify_timeouts: crate::config::VerifyTimeouts::defaults(),
         };
         let write_summary = |dir: &str, id: &str, rev: &str| {
             let d = tmp.join(format!("verify-{dir}"));
@@ -702,6 +756,7 @@ mod tests {
             quality: json!({}),
             portable_core: vec![],
             bind_working_tree_digest: true,
+            verify_timeouts: crate::config::VerifyTimeouts::defaults(),
         };
         let mut b1 = bindings("rev-same");
         b1.toolchain_version = "1.0.0".to_string();
@@ -711,8 +766,28 @@ mod tests {
         let id = verify_id(&repo, &b1);
         assert_eq!(id, verify_id(&repo, &b2));
 
-        write_evidence(&repo, &config, "PASS", "run-1", &[], &[], &b1).unwrap();
-        write_evidence(&repo, &config, "PASS", "run-2", &[], &[], &b2).unwrap();
+        write_evidence(
+            &repo,
+            &config,
+            "PASS",
+            "run-1",
+            &[],
+            &[],
+            &b1,
+            &test_timing(),
+        )
+        .unwrap();
+        write_evidence(
+            &repo,
+            &config,
+            "PASS",
+            "run-2",
+            &[],
+            &[],
+            &b2,
+            &test_timing(),
+        )
+        .unwrap();
 
         // 正主目录是 run-2 的新 bindings。
         let cur: Value = serde_json::from_str(
@@ -744,7 +819,17 @@ mod tests {
         );
 
         // 幂等刷新：同 bindings 再跑一次 → 不新增 stale 目录，正主目录更新。
-        write_evidence(&repo, &config, "PASS", "run-3", &[], &[], &b2).unwrap();
+        write_evidence(
+            &repo,
+            &config,
+            "PASS",
+            "run-3",
+            &[],
+            &[],
+            &b2,
+            &test_timing(),
+        )
+        .unwrap();
         let stale_now = std::fs::read_dir(&ev_dir)
             .unwrap()
             .flatten()
@@ -774,5 +859,67 @@ mod tests {
         // 2000-02-29（闰日）= epoch day 11016。
         assert_eq!(civil_from_days(11_016), (2000, 2, 29));
         let _ = repo;
+    }
+
+    #[test]
+    fn write_evidence_includes_timing() {
+        let repo = Repo::discover().expect("must run inside the nexus repository");
+        let base = Config::load(&repo).expect("config must load");
+        let tmp =
+            std::env::temp_dir().join(format!("harness-evidence-timing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let config = Config {
+            evidence_dir: tmp.join("evidence"),
+            ..base
+        };
+        let bindings = Bindings::current(&repo, &config);
+        let gates = vec![Gate::ok("whitespace", "ok")];
+        let scenarios = vec![ScenarioResult {
+            id: "s.one".to_string(),
+            verdict: "PASS".to_string(),
+            detail: "ok".to_string(),
+            duration_ms: 5,
+            timed_out: false,
+        }];
+        let timing = VerifyTiming {
+            total_ms: 42,
+            started_at: "2026-01-01T00:00:00.000Z".to_string(),
+            deadline_ms: Some(7_200_000),
+            deadline_exceeded: false,
+            prebuild_ms: 7,
+        };
+        let id = write_evidence(
+            &repo,
+            &config,
+            "PASS",
+            "timing test",
+            &gates,
+            &scenarios,
+            &bindings,
+            &timing,
+        )
+        .unwrap();
+        let dir = config.evidence_dir.join(format!("verify-{id}"));
+        let summary: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("summary.json")).unwrap())
+                .unwrap();
+        assert_eq!(summary["timing"]["total_ms"], json!(42));
+        assert_eq!(
+            summary["timing"]["started_at"],
+            json!("2026-01-01T00:00:00.000Z")
+        );
+        assert_eq!(summary["timing"]["deadline_ms"], json!(7_200_000));
+        assert_eq!(summary["timing"]["deadline_exceeded"], json!(false));
+        assert_eq!(summary["timing"]["prebuild_ms"], json!(7));
+        let checks: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("gates.json")).unwrap())
+                .unwrap();
+        assert_eq!(checks["gates"][0]["duration_ms"], json!(0));
+        assert_eq!(checks["gates"][0]["timed_out"], json!(false));
+        assert_eq!(checks["gates"][0]["skipped_by_deadline"], json!(false));
+        assert_eq!(checks["scenarios"][0]["duration_ms"], json!(5));
+        assert_eq!(checks["scenarios"][0]["timed_out"], json!(false));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

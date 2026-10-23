@@ -1,9 +1,9 @@
 //! Command implementations: status / context / check / test / verify / explain.
 
-use crate::config::Config;
+use crate::config::{Config, VerifyTimeouts};
 use crate::env::Repo;
 use crate::evidence::{self, Bindings};
-use crate::gates::{self, Gate};
+use crate::gates::{self, Gate, GateBudget};
 use crate::scenario::ScenarioResult;
 use serde_json::{Value, json};
 
@@ -13,7 +13,14 @@ fn gates_json(gates: &[Gate]) -> Value {
     json!(
         gates
             .iter()
-            .map(|g| json!({"name": g.name, "verdict": g.verdict, "detail": g.detail}))
+            .map(|g| json!({
+                "name": g.name,
+                "verdict": g.verdict,
+                "detail": g.detail,
+                "duration_ms": g.duration_ms,
+                "timed_out": g.timed_out,
+                "skipped_by_deadline": g.skipped_by_deadline,
+            }))
             .collect::<Vec<_>>()
     )
 }
@@ -264,10 +271,10 @@ pub fn check() -> Outcome {
         Err(o) => return o,
     };
     let gates = vec![
-        gates::whitespace_gate(&repo),
-        gates::format_gate(&repo),
-        gates::check_gate(&repo),
-        gates::clippy_gate(&repo),
+        gates::whitespace_gate(&repo, GateBudget::unlimited()),
+        gates::format_gate(&repo, GateBudget::unlimited()),
+        gates::check_gate(&repo, GateBudget::unlimited()),
+        gates::clippy_gate(&repo, GateBudget::unlimited()),
     ];
     aggregate("check", &gates)
 }
@@ -277,7 +284,7 @@ pub fn test_affected() -> Outcome {
         Ok(x) => x,
         Err(o) => return o,
     };
-    let gate = gates::affected_tests_gate(&repo, &config);
+    let gate = gates::affected_tests_gate(&repo, &config, GateBudget::unlimited());
     let verdict = gate.verdict.clone();
     let message = gate.detail.clone();
     let extras = vec![("gates".to_string(), gates_json(&[gate]))];
@@ -292,7 +299,7 @@ pub fn bench() -> Outcome {
         Ok(x) => x,
         Err(o) => return o,
     };
-    let gate = gates::bench_gate(&repo, &config);
+    let gate = gates::bench_gate(&repo, &config, GateBudget::unlimited());
     let verdict = gate.verdict.clone();
     let message = gate.detail.clone();
     let extras = vec![(
@@ -302,79 +309,76 @@ pub fn bench() -> Outcome {
     (verdict, message, extras)
 }
 
-pub fn verify(sub: &str) -> Outcome {
-    let mode = match sub {
-        "" | "--fast" => "fast",
-        "--full" => "full",
-        _ => {
-            return (
-                "BLOCKED".to_string(),
-                "usage: nexus-harness verify [--fast|--full]".to_string(),
-                Vec::new(),
-            );
-        }
-    };
-    let (repo, config) = match setup() {
-        Ok(x) => x,
-        Err(o) => return o,
-    };
-    let bindings = Bindings::current(&repo, &config);
+pub struct VerifyRun {
+    pub gates: Vec<Gate>,
+    pub scenarios: Vec<ScenarioResult>,
+    pub timing: evidence::VerifyTiming,
+}
 
-    // Gates are driven by policies/quality.toml declarations (single source of
-    // truth); declared-but-unimplemented gates surface as UNKNOWN, never skipped.
-    let mut gates: Vec<Gate> = vec![gates::whitespace_gate(&repo)];
-    for name in config.declared_gates("fast") {
-        gates.push(match name.as_str() {
-            "format" => gates::format_gate(&repo),
-            "check" => gates::check_gate(&repo),
-            "clippy" => gates::clippy_gate(&repo),
-            "architecture-delta" => gates::architecture_gate(&config),
-            "dependency-delta" => gates::dependency_gate(&repo, &config),
-            "resource-type-neutrality" => gates::resource_kind_neutrality_gate(&config),
-            "affected-tests" => gates::affected_tests_gate(&repo, &config),
-            "selected-properties" => gates::selected_properties_gate(&repo),
-            other => gates::unimplemented(other),
-        });
-    }
-    let mut scenarios: Vec<ScenarioResult> = Vec::new();
-
+/// 门名序列：`whitespace` + fast 声明 + （full 时）full 声明，顺序不变。
+fn gate_sequence(config: &Config, mode: &str) -> Vec<String> {
+    let mut names = vec!["whitespace".to_string()];
+    names.extend(config.declared_gates("fast"));
     if mode == "full" {
-        for name in config.declared_gates("full") {
-            gates.push(match name.as_str() {
-                "workspace-tests" => gates::workspace_tests_gate(&repo),
-                "integration" => gates::integration_gate(&repo),
-                "product-scenarios" => {
-                    let (sr, g) = scenario_run(
-                        &config,
-                        "product-scenarios",
-                        &["product", "engineering", "platform"],
-                    );
-                    scenarios.extend(sr);
-                    g
-                }
-                "regression" => {
-                    let (sr, g) = scenario_run(&config, "regression", &["regression"]);
-                    scenarios.extend(sr);
-                    g
-                }
-                "architecture-policy" => gates::architecture_gate(&config),
-                "dependency-governance" => gates::dependency_gate(&repo, &config),
-                "coverage-summary" => gates::coverage_gate(&repo),
-                "selected-fuzz" => gates::fuzz_gate(&repo),
-                "selected-concurrency" => gates::concurrency_gate(&repo),
-                "performance-budgets" => gates::performance_budgets_gate(&config),
-                "bench" => gates::bench_gate(&repo, &config),
-                "platform-checks" => gates::platform_checks_gate(&config),
-                "feature-matrix" => gates::feature_matrix_gate(&repo),
-                "portable-core" => gates::portable_core_gate(&repo, &config),
-                other => gates::unimplemented(other),
-            });
+        names.extend(config.declared_gates("full"));
+    }
+    names
+}
+
+/// 串行门编排（可注入，供 AC7/AC8 单测）：
+/// - 全局截止已过 → 当前门记 BLOCKED/skipped（duration 0），不再调用 invoke；
+/// - 门超时且此刻全局已过期 → 覆写为 BLOCKED/skipped（保留实际 duration）；
+/// - 其余原样保留。
+fn run_gate_sequence(
+    names: &[String],
+    global: GateBudget,
+    deadline_secs: u64,
+    budget_for: &dyn Fn(&str, GateBudget) -> GateBudget,
+    invoke: &mut dyn FnMut(&str, GateBudget) -> Gate,
+) -> (Vec<Gate>, bool) {
+    let mut gates = Vec::new();
+    let mut deadline_exceeded = false;
+    for name in names {
+        if global.expired() {
+            deadline_exceeded = true;
+            gates.push(Gate::blocked(
+                name,
+                &format!("not run: full verify deadline ({deadline_secs}s) exceeded"),
+            ));
+            continue;
+        }
+        let budget = budget_for(name, global);
+        let gate = invoke(name, budget);
+        if gate.timed_out && global.expired() {
+            let mut blocked = Gate::blocked(
+                name,
+                &format!(
+                    "gate '{name}' interrupted: full verify deadline ({deadline_secs}s) exceeded"
+                ),
+            );
+            blocked.duration_ms = gate.duration_ms;
+            deadline_exceeded = true;
+            gates.push(blocked);
+        } else {
+            gates.push(gate);
         }
     }
+    (gates, deadline_exceeded)
+}
 
+/// 聚合顺序（E1 冻结）：任一 BLOCKED → BLOCKED；否则任一 FAIL → FAIL；否则 PASS。
+/// UNKNOWN 仍不阻塞（既有语义）。
+fn aggregate_verdict(gates: &[Gate], mode: &str) -> (String, String) {
+    let blocked = gates.iter().filter(|g| g.verdict == "BLOCKED").count();
+    if blocked > 0 {
+        return (
+            "BLOCKED".to_string(),
+            format!("{mode} verify: {blocked} gate(s) not completed (deadline exceeded)"),
+        );
+    }
     let failed: Vec<&Gate> = gates.iter().filter(|g| g.verdict == "FAIL").collect();
     let unknown = gates.iter().filter(|g| g.verdict == "UNKNOWN").count();
-    let (verdict, message) = if failed.is_empty() {
+    if failed.is_empty() {
         (
             "PASS".to_string(),
             format!(
@@ -396,17 +400,132 @@ pub fn verify(sub: &str) -> Outcome {
                     .join(", ")
             ),
         )
+    }
+}
+
+fn execute_verify(
+    repo: &Repo,
+    config: &Config,
+    mode: &str,
+    timeouts: &VerifyTimeouts,
+) -> VerifyRun {
+    use std::time::Instant;
+    let started_at = evidence::now_iso8601();
+    let started = Instant::now();
+    let global = if mode == "full" {
+        GateBudget::from_limit(timeouts.full_deadline)
+    } else {
+        GateBudget::unlimited()
+    };
+    let deadline_ms = if mode == "full" {
+        timeouts.full_deadline.map(|d| d.as_millis() as u64)
+    } else {
+        None
+    };
+    let deadline_secs = timeouts.full_deadline.map(|d| d.as_secs()).unwrap_or(0);
+    let names = gate_sequence(config, mode);
+    let mut scenarios: Vec<ScenarioResult> = Vec::new();
+
+    let mut invoke = |name: &str, budget: GateBudget| -> Gate {
+        gates::timed(|| match name {
+            "whitespace" => gates::whitespace_gate(repo, budget),
+            "format" => gates::format_gate(repo, budget),
+            "check" => gates::check_gate(repo, budget),
+            "clippy" => gates::clippy_gate(repo, budget),
+            "architecture-delta" => gates::architecture_gate(config, budget),
+            "dependency-delta" => gates::dependency_gate(repo, config, budget),
+            "resource-type-neutrality" => gates::resource_kind_neutrality_gate(config, budget),
+            "affected-tests" => gates::affected_tests_gate(repo, config, budget),
+            "selected-properties" => gates::selected_properties_gate(repo, budget),
+            "workspace-tests" => gates::workspace_tests_gate(repo, budget),
+            "integration" => gates::integration_gate(repo, budget),
+            "product-scenarios" => {
+                let (sr, g) = scenario_run(
+                    config,
+                    "product-scenarios",
+                    &["product", "engineering", "platform"],
+                    &timeouts.scenarios,
+                );
+                scenarios.extend(sr);
+                g
+            }
+            "regression" => {
+                let (sr, g) =
+                    scenario_run(config, "regression", &["regression"], &timeouts.scenarios);
+                scenarios.extend(sr);
+                g
+            }
+            "architecture-policy" => gates::architecture_gate(config, budget),
+            "dependency-governance" => gates::dependency_gate(repo, config, budget),
+            "coverage-summary" => gates::coverage_gate(repo, budget),
+            "selected-fuzz" => gates::fuzz_gate(repo, budget),
+            "selected-concurrency" => gates::concurrency_gate(repo, budget),
+            "performance-budgets" => gates::performance_budgets_gate(config, budget),
+            "bench" => gates::bench_gate(repo, config, budget),
+            "platform-checks" => gates::platform_checks_gate(config, budget),
+            "feature-matrix" => gates::feature_matrix_gate(repo, budget),
+            "portable-core" => gates::portable_core_gate(repo, config, budget),
+            other => gates::unimplemented(other),
+        })
     };
 
+    let (gates, deadline_exceeded) = run_gate_sequence(
+        &names,
+        global,
+        deadline_secs,
+        &|name, global| config.gate_budget(name, global),
+        &mut invoke,
+    );
+    let timing = evidence::VerifyTiming {
+        total_ms: started.elapsed().as_millis() as u64,
+        started_at,
+        deadline_ms,
+        deadline_exceeded,
+        prebuild_ms: 0,
+    };
+    VerifyRun {
+        gates,
+        scenarios,
+        timing,
+    }
+}
+
+pub fn verify(sub: &str) -> Outcome {
+    let mode = match sub {
+        "" | "--fast" => "fast",
+        "--full" => "full",
+        _ => {
+            return (
+                "BLOCKED".to_string(),
+                "usage: nexus-harness verify [--fast|--full]".to_string(),
+                Vec::new(),
+            );
+        }
+    };
+    let (repo, config) = match setup() {
+        Ok(x) => x,
+        Err(o) => return o,
+    };
+    let bindings = Bindings::current(&repo, &config);
+    let run = execute_verify(&repo, &config, mode, &config.verify_timeouts);
+    let (verdict, message) = aggregate_verdict(&run.gates, mode);
+
     let id = match evidence::write_evidence(
-        &repo, &config, &verdict, &message, &gates, &scenarios, &bindings,
+        &repo,
+        &config,
+        &verdict,
+        &message,
+        &run.gates,
+        &run.scenarios,
+        &bindings,
+        &run.timing,
     ) {
         Ok(id) => id,
         Err(e) => {
             return (
                 "BLOCKED".to_string(),
                 format!("evidence write failed: {e}"),
-                vec![("gates".to_string(), gates_json(&gates))],
+                vec![("gates".to_string(), gates_json(&run.gates))],
             );
         }
     };
@@ -417,12 +536,12 @@ pub fn verify(sub: &str) -> Outcome {
         return (
             "BLOCKED".to_string(),
             problem,
-            vec![("gates".to_string(), gates_json(&gates))],
+            vec![("gates".to_string(), gates_json(&run.gates))],
         );
     }
 
     let extras = vec![
-        ("gates".to_string(), gates_json(&gates)),
+        ("gates".to_string(), gates_json(&run.gates)),
         (
             "evidence".to_string(),
             json!({"id": id, "dir": format!("verify-{id}"), "verdict": verdict, "bindings": bindings.to_json()}),
@@ -431,8 +550,13 @@ pub fn verify(sub: &str) -> Outcome {
     (verdict, message, extras)
 }
 
-fn scenario_run(config: &Config, gate_name: &str, subdirs: &[&str]) -> (Vec<ScenarioResult>, Gate) {
-    crate::scenario::run_gate(config, gate_name, subdirs)
+fn scenario_run(
+    config: &Config,
+    gate_name: &str,
+    subdirs: &[&str],
+    timeouts: &crate::config::ScenarioTimeouts,
+) -> (Vec<ScenarioResult>, Gate) {
+    crate::scenario::run_gate(config, gate_name, subdirs, timeouts)
 }
 
 pub fn explain() -> Outcome {
@@ -622,7 +746,8 @@ fn evidence_conformance(config: &Config, id: &str) -> Option<String> {
             "evidence verify-{id} unreadable after write (summary.json / gates.json)"
         ));
     };
-    let missing = evidence_missing_required_fields(&summary, &checks);
+    let mut missing = evidence_missing_required_fields(&summary, &checks);
+    missing.extend(evidence_timing_fields_missing(&summary, &checks));
     if missing.is_empty() {
         None
     } else {
@@ -631,6 +756,67 @@ fn evidence_conformance(config: &Config, id: &str) -> Option<String> {
             missing.join(", ")
         ))
     }
+}
+
+/// timing / duration_ms / timed_out / skipped_by_deadline 的字段级校验
+/// （E2.4，缺失即 fail-closed）。
+fn evidence_timing_fields_missing(summary: &Value, checks: &Value) -> Vec<String> {
+    let mut missing = Vec::new();
+    let Some(timing) = summary.get("timing") else {
+        missing.push("timing".to_string());
+        return missing;
+    };
+    if !timing.get("total_ms").is_some_and(Value::is_u64) {
+        missing.push("timing.total_ms".to_string());
+    }
+    if !timing
+        .get("started_at")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty())
+    {
+        missing.push("timing.started_at".to_string());
+    }
+    if !timing
+        .get("deadline_exceeded")
+        .is_some_and(Value::is_boolean)
+    {
+        missing.push("timing.deadline_exceeded".to_string());
+    }
+    if !timing.get("prebuild_ms").is_some_and(Value::is_u64) {
+        missing.push("timing.prebuild_ms".to_string());
+    }
+    match timing.get("deadline_ms") {
+        Some(Value::Null) => {}
+        Some(v) if v.is_u64() => {}
+        _ => missing.push("timing.deadline_ms".to_string()),
+    }
+    if let Some(gates) = checks.get("gates").and_then(Value::as_array) {
+        for (i, gate) in gates.iter().enumerate() {
+            if !gate.get("duration_ms").is_some_and(Value::is_u64) {
+                missing.push(format!("gates[{i}].duration_ms"));
+            }
+            if !gate.get("timed_out").is_some_and(Value::is_boolean) {
+                missing.push(format!("gates[{i}].timed_out"));
+            }
+            if !gate
+                .get("skipped_by_deadline")
+                .is_some_and(Value::is_boolean)
+            {
+                missing.push(format!("gates[{i}].skipped_by_deadline"));
+            }
+        }
+    }
+    if let Some(scenarios) = checks.get("scenarios").and_then(Value::as_array) {
+        for (i, scenario) in scenarios.iter().enumerate() {
+            if !scenario.get("duration_ms").is_some_and(Value::is_u64) {
+                missing.push(format!("scenarios[{i}].duration_ms"));
+            }
+            if !scenario.get("timed_out").is_some_and(Value::is_boolean) {
+                missing.push(format!("scenarios[{i}].timed_out"));
+            }
+        }
+    }
+    missing
 }
 
 #[cfg(test)]
@@ -664,8 +850,25 @@ mod tests {
                 "platform_capability_digest": "p-1",
                 "contract_hash": "c-1",
             },
+            "timing": {
+                "total_ms": 1000,
+                "started_at": "2026-01-01T00:00:00.000Z",
+                "deadline_ms": null,
+                "deadline_exceeded": false,
+                "prebuild_ms": 0,
+            },
         });
-        let checks = json!({"gates": [{"name": "whitespace", "verdict": "PASS", "detail": "ok"}], "scenarios": []});
+        let checks = json!({
+            "gates": [{
+                "name": "whitespace",
+                "verdict": "PASS",
+                "detail": "ok",
+                "duration_ms": 1,
+                "timed_out": false,
+                "skipped_by_deadline": false,
+            }],
+            "scenarios": []
+        });
         (summary, checks)
     }
 
@@ -766,9 +969,24 @@ mod tests {
         };
         let bindings = Bindings::current(&repo, &config);
         let gates = vec![Gate::ok("whitespace", "no whitespace errors")];
-        let id =
-            evidence::write_evidence(&repo, &config, "PASS", "unit test", &gates, &[], &bindings)
-                .expect("write_evidence must succeed");
+        let timing = evidence::VerifyTiming {
+            total_ms: 1,
+            started_at: evidence::now_iso8601(),
+            deadline_ms: None,
+            deadline_exceeded: false,
+            prebuild_ms: 0,
+        };
+        let id = evidence::write_evidence(
+            &repo,
+            &config,
+            "PASS",
+            "unit test",
+            &gates,
+            &[],
+            &bindings,
+            &timing,
+        )
+        .expect("write_evidence must succeed");
         assert!(
             evidence_conformance(&config, &id).is_none(),
             "written evidence must fill all schema-required fields"
@@ -822,6 +1040,7 @@ mod tests {
             quality: serde_json::json!({}),
             portable_core: vec![],
             bind_working_tree_digest: true,
+            verify_timeouts: crate::config::VerifyTimeouts::defaults(),
         };
         repo.git(&["init", "-q"]).expect("git init");
         std::fs::write(tmp.join("f.txt"), "one\n").expect("write");
@@ -903,5 +1122,186 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn seq_timeouts() -> VerifyTimeouts {
+        VerifyTimeouts::defaults()
+    }
+
+    #[test]
+    fn run_gate_sequence_timeout_continues() {
+        let names = vec!["a".to_string(), "b".to_string()];
+        let timeouts = seq_timeouts();
+        let mut calls = 0usize;
+        let (gates, deadline_exceeded) = run_gate_sequence(
+            &names,
+            GateBudget::unlimited(),
+            3600,
+            &|name, global| crate::config::gate_budget_for(&timeouts, name, global),
+            &mut |name: &str, _budget: GateBudget| -> Gate {
+                calls += 1;
+                if name == "a" {
+                    let mut g = Gate::fail(name, "gate 'a' timed out after 1s");
+                    g.timed_out = true;
+                    g
+                } else {
+                    Gate::ok(name, "ok")
+                }
+            },
+        );
+        assert_eq!(calls, 2, "timeout must not stop later gates");
+        assert!(!deadline_exceeded);
+        assert_eq!(gates[0].verdict, "FAIL");
+        assert!(gates[0].timed_out);
+        assert!(!gates[0].skipped_by_deadline);
+        assert_eq!(gates[1].verdict, "PASS");
+        assert_eq!(aggregate_verdict(&gates, "full").0, "FAIL");
+    }
+
+    #[test]
+    fn run_gate_sequence_deadline_blocks_remaining() {
+        let names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let timeouts = seq_timeouts();
+        let global = GateBudget::from_limit(Some(std::time::Duration::from_millis(1)));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let mut calls = 0usize;
+        let (gates, deadline_exceeded) = run_gate_sequence(
+            &names,
+            global,
+            3600,
+            &|name, global| crate::config::gate_budget_for(&timeouts, name, global),
+            &mut |name: &str, _budget: GateBudget| -> Gate {
+                calls += 1;
+                Gate::ok(name, "should not run")
+            },
+        );
+        assert_eq!(calls, 0, "no gate may run after the deadline");
+        assert!(deadline_exceeded);
+        assert_eq!(gates.len(), 3);
+        for gate in &gates {
+            assert_eq!(gate.verdict, "BLOCKED");
+            assert!(gate.skipped_by_deadline);
+            assert!(!gate.timed_out);
+            assert_eq!(gate.duration_ms, 0);
+            assert!(gate.detail.contains("not run"), "{}", gate.detail);
+        }
+        assert_eq!(aggregate_verdict(&gates, "full").0, "BLOCKED");
+    }
+
+    #[test]
+    fn run_gate_sequence_interrupts_current_gate() {
+        let names = vec!["a".to_string(), "b".to_string()];
+        let timeouts = seq_timeouts();
+        let global = GateBudget::from_limit(Some(std::time::Duration::from_millis(300)));
+        let (gates, deadline_exceeded) = run_gate_sequence(
+            &names,
+            global,
+            3600,
+            &|name, global| crate::config::gate_budget_for(&timeouts, name, global),
+            &mut |name: &str, _budget: GateBudget| -> Gate {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                let mut g = Gate::fail(name, "gate 'a' timed out after 0s");
+                g.timed_out = true;
+                g.duration_ms = 400;
+                g
+            },
+        );
+        assert!(deadline_exceeded);
+        assert_eq!(gates.len(), 2);
+        assert_eq!(gates[0].verdict, "BLOCKED");
+        assert!(gates[0].skipped_by_deadline);
+        assert!(!gates[0].timed_out);
+        assert!(gates[0].duration_ms > 0);
+        assert_eq!(gates[1].verdict, "BLOCKED");
+        assert!(gates[1].skipped_by_deadline);
+    }
+
+    #[test]
+    fn aggregate_prefers_blocked_over_fail() {
+        let blocked = Gate::blocked("a", "not run");
+        let fail = Gate::fail("b", "boom");
+        let pass = Gate::ok("c", "ok");
+        let unknown = Gate::unknown("d", "unknown");
+        assert_eq!(
+            aggregate_verdict(&[blocked.clone(), fail.clone()], "full").0,
+            "BLOCKED"
+        );
+        assert_eq!(aggregate_verdict(&[fail, pass.clone()], "full").0, "FAIL");
+        assert_eq!(
+            aggregate_verdict(&[pass, unknown], "full").0,
+            "PASS",
+            "UNKNOWN must not block (existing semantics)"
+        );
+    }
+
+    #[test]
+    fn evidence_conformance_rejects_missing_timing() {
+        let (summary, checks) = complete_evidence();
+        assert!(evidence_timing_fields_missing(&summary, &checks).is_empty());
+
+        let mut no_timing = summary.clone();
+        no_timing.as_object_mut().unwrap().remove("timing");
+        assert_eq!(
+            evidence_timing_fields_missing(&no_timing, &checks),
+            vec!["timing".to_string()]
+        );
+
+        for (pointer, expected) in [
+            ("/timing/total_ms", "timing.total_ms"),
+            ("/timing/started_at", "timing.started_at"),
+            ("/timing/deadline_exceeded", "timing.deadline_exceeded"),
+            ("/timing/prebuild_ms", "timing.prebuild_ms"),
+        ] {
+            let mut broken = summary.clone();
+            if let Some(obj) = broken.pointer_mut(pointer) {
+                *obj = Value::Null;
+            }
+            assert!(
+                evidence_timing_fields_missing(&broken, &checks)
+                    .iter()
+                    .any(|m| m == expected),
+                "{pointer} removal must be flagged"
+            );
+        }
+
+        let mut no_gate_duration = checks.clone();
+        no_gate_duration["gates"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("duration_ms");
+        assert!(
+            evidence_timing_fields_missing(&summary, &no_gate_duration)
+                .iter()
+                .any(|m| m == "gates[0].duration_ms")
+        );
+
+        let tmp = temp_dir("conf-timing");
+        let config = Config {
+            policies_dir: tmp.clone(),
+            scenarios_dir: tmp.clone(),
+            evidence_dir: tmp.clone(),
+            crates_dir: tmp.clone(),
+            engineering_dir: tmp.clone(),
+            quality: json!({}),
+            portable_core: vec![],
+            bind_working_tree_digest: true,
+            verify_timeouts: VerifyTimeouts::defaults(),
+        };
+        let id = "abc123";
+        let dir = tmp.join(format!("verify-{id}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("summary.json"),
+            serde_json::to_string(&no_timing).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("gates.json"),
+            serde_json::to_string(&checks).unwrap(),
+        )
+        .unwrap();
+        let problem = evidence_conformance(&config, id).expect("must be blocked");
+        assert!(problem.contains("timing"), "{problem}");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
