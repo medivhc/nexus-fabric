@@ -3,7 +3,8 @@
 //! output. Scenarios without a command are static contracts (recorded UNKNOWN).
 
 use crate::config::{Config, ScenarioTimeouts};
-use crate::gates::Gate;
+use crate::env::{Repo, cargo_metadata};
+use crate::gates::{CommandOutcome, Gate, GateBudget, run_bounded};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -58,6 +59,758 @@ pub struct ScenarioResult {
     pub detail: String,
     pub duration_ms: u64,
     pub timed_out: bool,
+}
+
+/// `cargo run --example <name>` 的产物键：features 为规范化（排序去重）集合，
+/// `locked` 参与键，避免 `--locked` 与非 `--locked` 复用同一预编结果。
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct ExampleKey {
+    pub package: String,
+    pub example: String,
+    pub features: Vec<String>,
+    pub locked: bool,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct BinKey {
+    pub package: String,
+    pub bin: String,
+    pub features: Vec<String>,
+    pub locked: bool,
+}
+
+pub struct ArtifactBuildFailure {
+    pub package: String,
+    pub kind: String,
+    pub target: String,
+    pub detail: String,
+}
+
+#[derive(Default)]
+pub struct ScenarioArtifacts {
+    pub examples: std::collections::BTreeMap<ExampleKey, PathBuf>,
+    pub bins: std::collections::BTreeMap<BinKey, PathBuf>,
+    pub failures: Vec<ArtifactBuildFailure>,
+    /// 场景引用但 metadata 中**不存在**的 target（如 contract-first 的
+    /// `nexusd --example n3_task_e4`）。不预编、不判 prebuild 失败；
+    /// 运行时保留基线语义（n3 → UNKNOWN）。
+    pub missing: Vec<(String, String, String)>,
+    pub build_ms: u64,
+}
+
+pub enum ResolvedCommand {
+    Direct {
+        program: PathBuf,
+        args: Vec<String>,
+        current_dir: Option<PathBuf>,
+    },
+    Unchanged {
+        command: String,
+    },
+    Unavailable {
+        reason: String,
+    },
+    MissingTarget {
+        package: String,
+        kind: String,
+        target: String,
+    },
+}
+
+struct ParsedCargoRun {
+    package: String,
+    example: Option<String>,
+    bin: Option<String>,
+    features: Vec<String>,
+    locked: bool,
+    args: Vec<String>,
+}
+
+fn normalize_features(raw: &str) -> Vec<String> {
+    let mut features: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .map(str::to_string)
+        .collect();
+    features.sort();
+    features.dedup();
+    features
+}
+
+/// 只接受整条命令就是 `cargo run ...` 的形态；shell 组合（`cd`/`&&`/管道/
+/// 命令替换）、env 前缀、`--release` 或未知 cargo flag 一律返回 None →
+/// 调用方走旧路径（宁可慢，不猜语义）。
+fn parse_cargo_run(command: &str) -> Option<ParsedCargoRun> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    if tokens.first() != Some(&"cargo") {
+        return None;
+    }
+    if tokens
+        .iter()
+        .any(|t| t.contains('`') || t.contains("$(") || matches!(*t, "&&" | "||" | "|" | ";"))
+    {
+        return None;
+    }
+    if tokens.get(1) != Some(&"run") {
+        return None;
+    }
+    let mut package: Option<String> = None;
+    let mut example: Option<String> = None;
+    let mut bin: Option<String> = None;
+    let mut features: Vec<String> = Vec::new();
+    let mut locked = false;
+    let mut args: Vec<String> = Vec::new();
+    let mut i = 2;
+    while i < tokens.len() {
+        let token = tokens[i];
+        if token == "--" {
+            args = tokens[i + 1..].iter().map(|s| s.to_string()).collect();
+            break;
+        }
+        if token == "--quiet" || token == "-q" {
+            i += 1;
+            continue;
+        }
+        if token == "--locked" {
+            locked = true;
+            i += 1;
+            continue;
+        }
+        if token == "-p" || token == "--package" {
+            package = Some(tokens.get(i + 1)?.to_string());
+            i += 2;
+            continue;
+        }
+        if let Some(v) = token.strip_prefix("--package=") {
+            package = Some(v.to_string());
+            i += 1;
+            continue;
+        }
+        if token == "--example" {
+            example = Some(tokens.get(i + 1)?.to_string());
+            i += 2;
+            continue;
+        }
+        if let Some(v) = token.strip_prefix("--example=") {
+            example = Some(v.to_string());
+            i += 1;
+            continue;
+        }
+        if token == "--bin" {
+            bin = Some(tokens.get(i + 1)?.to_string());
+            i += 2;
+            continue;
+        }
+        if let Some(v) = token.strip_prefix("--bin=") {
+            bin = Some(v.to_string());
+            i += 1;
+            continue;
+        }
+        if token == "--features" {
+            features = normalize_features(tokens.get(i + 1)?);
+            i += 2;
+            continue;
+        }
+        if let Some(v) = token.strip_prefix("--features=") {
+            features = normalize_features(v);
+            i += 1;
+            continue;
+        }
+        return None;
+    }
+    if example.is_some() && bin.is_some() {
+        return None;
+    }
+    Some(ParsedCargoRun {
+        package: package?,
+        example,
+        bin,
+        features,
+        locked,
+        args,
+    })
+}
+
+fn artifact_failure<'a>(
+    artifacts: &'a ScenarioArtifacts,
+    kind: &str,
+    package: &str,
+    target: &str,
+) -> Option<&'a ArtifactBuildFailure> {
+    artifacts
+        .failures
+        .iter()
+        .find(|f| f.kind == kind && f.package == package && f.target == target)
+}
+
+fn is_missing(artifacts: &ScenarioArtifacts, kind: &str, package: &str, target: &str) -> bool {
+    artifacts
+        .missing
+        .iter()
+        .any(|(k, p, t)| k == kind && p == package && t == target)
+}
+
+pub fn resolve_scenario_command(command: &str, artifacts: &ScenarioArtifacts) -> ResolvedCommand {
+    let Some(parsed) = parse_cargo_run(command) else {
+        return ResolvedCommand::Unchanged {
+            command: command.to_string(),
+        };
+    };
+    if let Some(example) = parsed.example {
+        let key = ExampleKey {
+            package: parsed.package.clone(),
+            example: example.clone(),
+            features: parsed.features,
+            locked: parsed.locked,
+        };
+        return match artifacts.examples.get(&key) {
+            Some(path) => ResolvedCommand::Direct {
+                program: path.clone(),
+                args: parsed.args,
+                current_dir: None,
+            },
+            None => {
+                if is_missing(artifacts, "example", &parsed.package, &example) {
+                    ResolvedCommand::MissingTarget {
+                        package: parsed.package,
+                        kind: "example".to_string(),
+                        target: example,
+                    }
+                } else if let Some(failure) =
+                    artifact_failure(artifacts, "example", &parsed.package, &example)
+                {
+                    ResolvedCommand::Unavailable {
+                        reason: format!("{}:example:{example}\n{}", parsed.package, failure.detail),
+                    }
+                } else {
+                    // 未预编（如不同的 --locked/features 变体）→ 旧路径。
+                    ResolvedCommand::Unchanged {
+                        command: command.to_string(),
+                    }
+                }
+            }
+        };
+    }
+    if let Some(bin) = parsed.bin {
+        let key = BinKey {
+            package: parsed.package.clone(),
+            bin: bin.clone(),
+            features: parsed.features,
+            locked: parsed.locked,
+        };
+        return match artifacts.bins.get(&key) {
+            Some(path) => ResolvedCommand::Direct {
+                program: path.clone(),
+                args: parsed.args,
+                current_dir: None,
+            },
+            None => {
+                if is_missing(artifacts, "bin", &parsed.package, &bin) {
+                    ResolvedCommand::MissingTarget {
+                        package: parsed.package,
+                        kind: "bin".to_string(),
+                        target: bin,
+                    }
+                } else if let Some(failure) =
+                    artifact_failure(artifacts, "bin", &parsed.package, &bin)
+                {
+                    ResolvedCommand::Unavailable {
+                        reason: format!("{}:bin:{bin}\n{}", parsed.package, failure.detail),
+                    }
+                } else {
+                    ResolvedCommand::Unchanged {
+                        command: command.to_string(),
+                    }
+                }
+            }
+        };
+    }
+    // 无 `--example`/`--bin`：cargo 选择包内唯一 bin（feature 组合参与键）。
+    // 无法唯一确定时回退旧路径（绝不猜 target）。
+    let mut candidates: Vec<&BinKey> = artifacts
+        .bins
+        .keys()
+        .filter(|k| {
+            k.package == parsed.package
+                && k.features == parsed.features
+                && k.locked == parsed.locked
+        })
+        .collect();
+    if candidates.len() != 1 {
+        return ResolvedCommand::Unchanged {
+            command: command.to_string(),
+        };
+    }
+    let key = candidates.pop().expect("one candidate").clone();
+    match artifacts.bins.get(&key) {
+        Some(path) => ResolvedCommand::Direct {
+            program: path.clone(),
+            args: parsed.args,
+            current_dir: None,
+        },
+        None => ResolvedCommand::Unchanged {
+            command: command.to_string(),
+        },
+    }
+}
+
+fn default_bin(meta: &Value, package: &str) -> Option<String> {
+    let member_ids: Vec<&str> = meta["workspace_members"]
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let pkg = meta["packages"].as_array()?.iter().find(|p| {
+        p["name"].as_str() == Some(package)
+            && p["id"].as_str().is_some_and(|id| member_ids.contains(&id))
+    })?;
+    let mut bins: Vec<String> = pkg["targets"]
+        .as_array()?
+        .iter()
+        .filter(|t| {
+            t["kind"]
+                .as_array()
+                .is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin"))
+        })
+        .filter_map(|t| t["name"].as_str().map(str::to_string))
+        .collect();
+    bins.sort();
+    bins.dedup();
+    if bins.len() == 1 { bins.pop() } else { None }
+}
+
+fn target_declared(meta: &Value, package: &str, kind: &str, name: &str) -> bool {
+    let member_ids: Vec<&str> = meta["workspace_members"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    meta["packages"]
+        .as_array()
+        .and_then(|packages| {
+            packages.iter().find(|p| {
+                p["name"].as_str() == Some(package)
+                    && p["id"].as_str().is_some_and(|id| member_ids.contains(&id))
+            })
+        })
+        .and_then(|p| p["targets"].as_array())
+        .is_some_and(|targets| {
+            targets.iter().any(|t| {
+                t["name"].as_str() == Some(name)
+                    && t["kind"]
+                        .as_array()
+                        .is_some_and(|kinds| kinds.iter().any(|k| k == kind))
+            })
+        })
+}
+
+type MissingTargets = Vec<(String, String, String)>;
+type CollectedKeys = (
+    std::collections::BTreeSet<ExampleKey>,
+    std::collections::BTreeSet<BinKey>,
+    MissingTargets,
+);
+
+fn collect_scenario_keys(scenarios: &[Scenario], meta: &Value) -> CollectedKeys {
+    let mut examples = std::collections::BTreeSet::new();
+    let mut bins = std::collections::BTreeSet::new();
+    let mut missing: Vec<(String, String, String)> = Vec::new();
+    for scenario in scenarios {
+        let mut commands: Vec<&String> = scenario.fixtures.iter().collect();
+        if let Some(command) = &scenario.command {
+            commands.push(command);
+        }
+        for command in commands {
+            let Some(parsed) = parse_cargo_run(command) else {
+                continue;
+            };
+            if let Some(example) = parsed.example {
+                if !target_declared(meta, &parsed.package, "example", &example) {
+                    missing.push(("example".to_string(), parsed.package, example));
+                    continue;
+                }
+                examples.insert(ExampleKey {
+                    package: parsed.package,
+                    example,
+                    features: parsed.features,
+                    locked: parsed.locked,
+                });
+                continue;
+            }
+            if let Some(bin) = parsed.bin {
+                if !target_declared(meta, &parsed.package, "bin", &bin) {
+                    missing.push(("bin".to_string(), parsed.package, bin));
+                    continue;
+                }
+                bins.insert(BinKey {
+                    package: parsed.package,
+                    bin,
+                    features: parsed.features,
+                    locked: parsed.locked,
+                });
+                continue;
+            }
+            if let Some(bin) = default_bin(meta, &parsed.package) {
+                bins.insert(BinKey {
+                    package: parsed.package,
+                    bin,
+                    features: parsed.features,
+                    locked: parsed.locked,
+                });
+            }
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    (examples, bins, missing)
+}
+
+struct BuildGroup {
+    package: String,
+    kind: &'static str,
+    targets: Vec<String>,
+    features: Vec<String>,
+    locked: bool,
+}
+
+fn build_groups(
+    examples: &std::collections::BTreeSet<ExampleKey>,
+    bins: &std::collections::BTreeSet<BinKey>,
+) -> Vec<BuildGroup> {
+    let mut groups: std::collections::BTreeMap<
+        (String, &'static str, Vec<String>, bool),
+        Vec<String>,
+    > = std::collections::BTreeMap::new();
+    for key in examples {
+        groups
+            .entry((
+                key.package.clone(),
+                "example",
+                key.features.clone(),
+                key.locked,
+            ))
+            .or_default()
+            .push(key.example.clone());
+    }
+    for key in bins {
+        groups
+            .entry((key.package.clone(), "bin", key.features.clone(), key.locked))
+            .or_default()
+            .push(key.bin.clone());
+    }
+    groups
+        .into_iter()
+        .map(|((package, kind, features, locked), mut targets)| {
+            targets.sort();
+            targets.dedup();
+            BuildGroup {
+                package,
+                kind,
+                targets,
+                features,
+                locked,
+            }
+        })
+        .collect()
+}
+
+fn duplicate_targets(
+    examples: &std::collections::BTreeSet<ExampleKey>,
+    bins: &std::collections::BTreeSet<BinKey>,
+) -> std::collections::BTreeSet<(String, String)> {
+    let mut packages: std::collections::BTreeMap<
+        (String, String),
+        std::collections::BTreeSet<String>,
+    > = std::collections::BTreeMap::new();
+    for key in examples {
+        packages
+            .entry(("example".to_string(), key.example.clone()))
+            .or_default()
+            .insert(key.package.clone());
+    }
+    for key in bins {
+        packages
+            .entry(("bin".to_string(), key.bin.clone()))
+            .or_default()
+            .insert(key.package.clone());
+    }
+    packages
+        .into_iter()
+        .filter(|(_, pkgs)| pkgs.len() > 1)
+        .map(|(key, _)| key)
+        .collect()
+}
+
+fn safe_component(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// 同名 example 的 per-package 快照路径：cargo 对不同包的同名 example
+/// 共用 `target/debug/examples/<name>` 规范路径，直接使用会串包。预编时
+/// 强制重建并在同目录复制一份包私有文件（进程内映射，不写跨 run 映射文件）。
+fn unique_artifact_path(
+    path: &std::path::Path,
+    package: &str,
+    kind: &str,
+    target: &str,
+    features: &[String],
+    locked: bool,
+) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    features.hash(&mut hasher);
+    locked.hash(&mut hasher);
+    let suffix = hasher.finish();
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    dir.join(format!(
+        ".nexus-harness-{}-{}-{}-{suffix:x}",
+        safe_component(package),
+        kind,
+        safe_component(target)
+    ))
+}
+
+fn force_canonical_relink(meta: &Value, kind: &str, target: &str) {
+    if kind != "example" {
+        return;
+    }
+    let Some(dir) = meta["target_directory"]
+        .as_str()
+        .map(|t| Path::new(t).join("debug/examples"))
+    else {
+        return;
+    };
+    let _ = std::fs::remove_file(dir.join(target));
+}
+
+fn group_args(group: &BuildGroup) -> Vec<String> {
+    let mut args = vec!["build".to_string(), "-p".to_string(), group.package.clone()];
+    for target in &group.targets {
+        args.push(format!("--{}", group.kind));
+        args.push(target.clone());
+    }
+    if !group.features.is_empty() {
+        args.push("--features".to_string());
+        args.push(group.features.join(","));
+    }
+    if group.locked {
+        args.push("--locked".to_string());
+    }
+    args.push("--message-format=json".to_string());
+    args
+}
+
+fn record_failure(
+    artifacts: &mut ScenarioArtifacts,
+    group: &BuildGroup,
+    target: &str,
+    detail: &str,
+) {
+    let tail: Vec<&str> = detail.lines().rev().take(20).collect();
+    let detail = tail.iter().rev().cloned().collect::<Vec<_>>().join("\n");
+    artifacts.failures.push(ArtifactBuildFailure {
+        package: group.package.clone(),
+        kind: group.kind.to_string(),
+        target: target.to_string(),
+        detail,
+    });
+}
+
+fn map_group_artifacts(
+    group: &BuildGroup,
+    meta: &Value,
+    repo: &Repo,
+    duplicates: &std::collections::BTreeSet<(String, String)>,
+    text: &str,
+    artifacts: &mut ScenarioArtifacts,
+) -> Result<(), String> {
+    let member_ids: Vec<&str> = meta["workspace_members"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let mut mapped = 0usize;
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value["reason"] != "compiler-artifact" || value["profile"]["test"] != false {
+            continue;
+        }
+        let Some(executable) = value["executable"].as_str() else {
+            continue;
+        };
+        let Some(target_name) = value["target"]["name"].as_str() else {
+            continue;
+        };
+        if !group.targets.iter().any(|t| t == target_name) {
+            continue;
+        }
+        let Some(package_id) = value["package_id"].as_str() else {
+            continue;
+        };
+        if !member_ids.contains(&package_id) {
+            continue;
+        }
+        let package_name = meta["packages"]
+            .as_array()
+            .and_then(|packages| {
+                packages
+                    .iter()
+                    .find(|p| p["id"].as_str() == Some(package_id))
+                    .and_then(|p| p["name"].as_str())
+            })
+            .unwrap_or_default()
+            .to_string();
+        if package_name != group.package {
+            continue;
+        }
+        let path = repo.root.join(executable);
+        if !path.is_file() {
+            return Err(format!("executable missing: {}", path.display()));
+        }
+        let path = if duplicates.contains(&(group.kind.to_string(), target_name.to_string())) {
+            let snapshot = unique_artifact_path(
+                &path,
+                &group.package,
+                group.kind,
+                target_name,
+                &group.features,
+                group.locked,
+            );
+            std::fs::copy(&path, &snapshot)
+                .map_err(|e| format!("snapshot artifact {}: {e}", snapshot.display()))?;
+            snapshot
+        } else {
+            path
+        };
+        if group.kind == "example" {
+            artifacts.examples.insert(
+                ExampleKey {
+                    package: group.package.clone(),
+                    example: target_name.to_string(),
+                    features: group.features.clone(),
+                    locked: group.locked,
+                },
+                path,
+            );
+        } else {
+            artifacts.bins.insert(
+                BinKey {
+                    package: group.package.clone(),
+                    bin: target_name.to_string(),
+                    features: group.features.clone(),
+                    locked: group.locked,
+                },
+                path,
+            );
+        }
+        mapped += 1;
+    }
+    if mapped == 0 {
+        return Err("cargo returned no matching compiler-artifact executables".to_string());
+    }
+    Ok(())
+}
+
+fn run_build_group(
+    group: &BuildGroup,
+    meta: &Value,
+    repo: &Repo,
+    duplicates: &std::collections::BTreeSet<(String, String)>,
+    budget: GateBudget,
+    artifacts: &mut ScenarioArtifacts,
+) -> Result<(), String> {
+    for target in &group.targets {
+        if duplicates.contains(&(group.kind.to_string(), target.clone())) {
+            force_canonical_relink(meta, group.kind, target);
+        }
+    }
+    let args = group_args(group);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    match run_bounded(&repo.root, "cargo", &arg_refs, budget) {
+        CommandOutcome::Exited {
+            success: true,
+            text,
+        } => map_group_artifacts(group, meta, repo, duplicates, &text, artifacts),
+        CommandOutcome::Exited {
+            success: false,
+            text,
+        } => Err(text),
+        CommandOutcome::TimedOut { text } => Err(format!(
+            "cargo build timed out after {}s\n{text}",
+            budget.remaining().map(|d| d.as_secs()).unwrap_or(0)
+        )),
+        CommandOutcome::SpawnFailed { detail } => Err(detail),
+    }
+}
+
+/// 预编场景实际引用的 example/bin（一次），只编引用的 target；失败按单个
+/// key 重试一次，仍失败写入 failures（fail-closed，不静默跳过场景）。
+pub fn prebuild_scenario_artifacts(
+    scenarios: &[Scenario],
+    repo: &Repo,
+    budget: GateBudget,
+) -> ScenarioArtifacts {
+    use std::time::Instant;
+    let started = Instant::now();
+    let mut artifacts = ScenarioArtifacts::default();
+    let meta = match cargo_metadata() {
+        Ok(meta) => meta,
+        Err(e) => {
+            artifacts.failures.push(ArtifactBuildFailure {
+                package: "*".to_string(),
+                kind: "*".to_string(),
+                target: "*".to_string(),
+                detail: format!("cargo metadata failed: {e}"),
+            });
+            artifacts.build_ms = started.elapsed().as_millis() as u64;
+            return artifacts;
+        }
+    };
+    let (examples, bins, missing) = collect_scenario_keys(scenarios, &meta);
+    artifacts.missing = missing;
+    let duplicates = duplicate_targets(&examples, &bins);
+    let groups = build_groups(&examples, &bins);
+    for group in groups {
+        if budget.expired() {
+            for target in &group.targets {
+                record_failure(&mut artifacts, &group, target, "prebuild budget exhausted");
+            }
+            continue;
+        }
+        if run_build_group(&group, &meta, repo, &duplicates, budget, &mut artifacts).is_ok() {
+            continue;
+        }
+        // 整组失败 → 按单个 key 重试一次，缩小失败影响面（AC9）。
+        for target in &group.targets {
+            if budget.expired() {
+                record_failure(&mut artifacts, &group, target, "prebuild budget exhausted");
+                continue;
+            }
+            let single = BuildGroup {
+                package: group.package.clone(),
+                kind: group.kind,
+                targets: vec![target.clone()],
+                features: group.features.clone(),
+                locked: group.locked,
+            };
+            if let Err(detail) =
+                run_build_group(&single, &meta, repo, &duplicates, budget, &mut artifacts)
+            {
+                record_failure(&mut artifacts, &group, target, &detail);
+            }
+        }
+    }
+    artifacts.build_ms = started.elapsed().as_millis() as u64;
+    artifacts
 }
 
 fn load_file(path: &PathBuf, subdir: &str) -> Result<Scenario, String> {
@@ -381,9 +1134,6 @@ fn run_checked_with_timeouts(
     drain_timeout: std::time::Duration,
     node_dir: Option<&std::path::Path>,
 ) -> (RunOutcome, String, String) {
-    use std::io::Read;
-    use std::time::{Duration, Instant};
-
     let mut parts = command.split_whitespace();
     let program = parts.next().unwrap_or("");
     let args: Vec<&str> = parts.collect();
@@ -395,29 +1145,68 @@ fn run_checked_with_timeouts(
         program.to_string()
     };
     let mut cmd = Command::new(&program);
-    cmd.args(&args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+    cmd.args(&args);
     // 场景隔离：每个场景用独立的节点目录，fixture 与主命令共享同一目录，
     // 场景之间互不可见。`nexus` 经 `NEXUS_CONFIG_DIR` 读取节点目录
     // （apps/nexus/src/node_cli.rs::node_dir）。
     if let Some(dir) = node_dir {
         cmd.env("NEXUS_CONFIG_DIR", dir);
     }
+    run_prepared(cmd, scenario_timeout, drain_timeout, &program)
+}
+
+/// 直调产物执行器：与 `run_checked_with_timeouts` 共用 spawn/reader/kill/drain
+/// 语义；`current_dir` 为 `None` 时**不调用** `Command::current_dir`，继承
+/// harness 自身 CWD（与旧 `cargo run` 路径逐项等价）。
+#[allow(clippy::too_many_arguments)]
+fn run_resolved(
+    program: &std::path::Path,
+    args: &[String],
+    current_dir: Option<&std::path::Path>,
+    scenario_timeout: std::time::Duration,
+    drain_timeout: std::time::Duration,
+    node_dir: Option<&std::path::Path>,
+) -> (RunOutcome, String, String) {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    if let Some(dir) = current_dir {
+        cmd.current_dir(dir);
+    }
+    if let Some(dir) = node_dir {
+        cmd.env("NEXUS_CONFIG_DIR", dir);
+    }
+    run_prepared(
+        cmd,
+        scenario_timeout,
+        drain_timeout,
+        &program.display().to_string(),
+    )
+}
+
+fn run_prepared(
+    mut cmd: Command,
+    scenario_timeout: std::time::Duration,
+    drain_timeout: std::time::Duration,
+    label: &str,
+) -> (RunOutcome, String, String) {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             return (
                 RunOutcome::SpawnFailed,
                 String::new(),
-                format!("cannot run {program}: {e}"),
+                format!("cannot run {label}: {e}"),
             );
         }
     };
     // 读线程：并发抽干 pipe；孤儿进程持有写端时它们可能永不 EOF，
     // 主线程只按 drain_timeout 有限等待，不依赖它们结束。
     let (tx, rx) = std::sync::mpsc::channel::<(bool, Vec<u8>)>();
-    // stdout 读线程。
     if let Some(mut p) = child.stdout.take() {
         let tx = tx.clone();
         std::thread::spawn(move || {
@@ -426,7 +1215,6 @@ fn run_checked_with_timeouts(
             let _ = tx.send((true, buf));
         });
     }
-    // stderr 读线程。
     if let Some(mut p) = child.stderr.take() {
         let tx = tx.clone();
         std::thread::spawn(move || {
@@ -465,8 +1253,6 @@ fn run_checked_with_timeouts(
         }
         match rx.recv_timeout(deadline - now) {
             Ok((true, b)) => stdout = b,
-            // stderr 照常抽干（避免 pipe 背压阻塞子进程）；场景判定不用它，
-            // 但夹具失败时取尾部作诊断。
             Ok((false, b)) => stderr = b,
             Err(_) => break,
         }
@@ -478,7 +1264,7 @@ fn run_checked_with_timeouts(
             RunOutcome::TimedOut,
             text,
             format!(
-                "scenario command timed out after {}s: {program}",
+                "scenario command timed out after {}s: {label}",
                 scenario_timeout.as_secs()
             ),
         ),
@@ -558,10 +1344,14 @@ fn current_platform() -> &'static str {
 /// 执行单个场景。执行语义与旧 run_gate 逐场景循环完全一致
 /// （fixture 顺序执行、有界超时、场景级 NEXUS_CONFIG_DIR 隔离、
 /// n3 contract-first 的 UNKNOWN 特例），只是把失败信息结构化。
-pub fn run_single(s: &Scenario, timeouts: &ScenarioTimeouts) -> ScenarioRunReport {
+pub fn run_single(
+    s: &Scenario,
+    artifacts: Option<&ScenarioArtifacts>,
+    timeouts: &ScenarioTimeouts,
+) -> ScenarioRunReport {
     use std::time::Instant;
     let start = Instant::now();
-    let mut rep = run_single_inner(s, timeouts);
+    let mut rep = run_single_inner(s, artifacts, timeouts);
     rep.duration_ms = start.elapsed().as_millis() as u64;
     rep
 }
@@ -578,7 +1368,11 @@ fn unknown_report(failed_step: &str, assertion: String, detail: String) -> Scena
     }
 }
 
-fn run_single_inner(s: &Scenario, timeouts: &ScenarioTimeouts) -> ScenarioRunReport {
+fn run_single_inner(
+    s: &Scenario,
+    artifacts: Option<&ScenarioArtifacts>,
+    timeouts: &ScenarioTimeouts,
+) -> ScenarioRunReport {
     // 平台门：与旧 run_gate 语义一致（不匹配记 UNKNOWN，不阻塞）。
     if let Some(plat) = &s.platform {
         let current_plat = current_platform();
@@ -613,8 +1407,60 @@ fn run_single_inner(s: &Scenario, timeouts: &ScenarioTimeouts) -> ScenarioRunRep
     // 场景命令；任一夹具失败 → 场景 FAIL（夹具是 E4 环境声明）。
     let scenario_timeout = timeouts.for_scenario(s);
     for fixture in &s.fixtures {
-        let (ok, timed_out, _out, err_tail) =
-            run_command_checked(fixture, scenario_timeout, timeouts.drain, node_dir);
+        let resolved = artifacts.map(|a| resolve_scenario_command(fixture, a));
+        let (ok, timed_out, _out, err_tail) = match resolved {
+            Some(ResolvedCommand::Unavailable { reason }) => {
+                return ScenarioRunReport {
+                    verdict: "FAIL".to_string(),
+                    failed_step: "fixture".to_string(),
+                    assertion: reason.lines().next().unwrap_or_default().to_string(),
+                    key_log_lines: tail_lines(&reason, 10),
+                    duration_ms: 0,
+                    timed_out: false,
+                    detail: reason,
+                };
+            }
+            Some(ResolvedCommand::MissingTarget {
+                package,
+                kind,
+                target,
+            }) => {
+                let assertion = format!("{package}:{kind}:{target}");
+                return ScenarioRunReport {
+                    verdict: "FAIL".to_string(),
+                    failed_step: "fixture".to_string(),
+                    key_log_lines: Vec::new(),
+                    assertion: assertion.clone(),
+                    duration_ms: 0,
+                    timed_out: false,
+                    detail: format!("fixture target not declared: {assertion}"),
+                };
+            }
+            Some(ResolvedCommand::Direct {
+                program,
+                args,
+                current_dir,
+            }) => {
+                let (outcome, out, err) = run_resolved(
+                    &program,
+                    &args,
+                    current_dir.as_deref(),
+                    scenario_timeout,
+                    timeouts.drain,
+                    node_dir,
+                );
+                (
+                    outcome == RunOutcome::Exited(true),
+                    outcome == RunOutcome::TimedOut,
+                    out,
+                    err,
+                )
+            }
+            Some(ResolvedCommand::Unchanged { command }) => {
+                run_command_checked(&command, scenario_timeout, timeouts.drain, node_dir)
+            }
+            None => run_command_checked(fixture, scenario_timeout, timeouts.drain, node_dir),
+        };
         if timed_out {
             return ScenarioRunReport {
                 verdict: "FAIL".to_string(),
@@ -642,8 +1488,60 @@ fn run_single_inner(s: &Scenario, timeouts: &ScenarioTimeouts) -> ScenarioRunRep
         }
     }
     // 主命令：有界执行，透出 RunOutcome 以区分"命令失败"与"输出解析失败"。
-    let (outcome, stdout, stderr_tail) =
-        run_checked_with_timeouts(&cmd, scenario_timeout, timeouts.drain, node_dir);
+    // artifacts=Some 时先解析为直调产物；不可用即 FAIL（fail-closed，不静默跳过）。
+    let resolved = artifacts.map(|a| resolve_scenario_command(&cmd, a));
+    let (outcome, stdout, stderr_tail) = match resolved {
+        Some(ResolvedCommand::MissingTarget {
+            package,
+            kind,
+            target,
+        }) => {
+            let assertion = format!("{package}:{kind}:{target}");
+            // contract-first：基线里 `cargo run` 找不到该 target，stdout 为空，
+            // 场景被记为 UNKNOWN（master 既有 Red）。缺失 target 不是预编失败，
+            // 保持同一语义且不再 spawn cargo。
+            if s.id.starts_with("product.n3-") {
+                return unknown_report(
+                    "parse",
+                    String::new(),
+                    "contract-first: n3_task_e4 not implemented (master Red)".to_string(),
+                );
+            }
+            return ScenarioRunReport {
+                verdict: "FAIL".to_string(),
+                failed_step: "prebuild".to_string(),
+                key_log_lines: Vec::new(),
+                assertion,
+                duration_ms: 0,
+                timed_out: false,
+                detail: format!("target not declared: {package}:{kind}:{target}"),
+            };
+        }
+        Some(ResolvedCommand::Unavailable { reason }) => {
+            return ScenarioRunReport {
+                verdict: "FAIL".to_string(),
+                failed_step: "prebuild".to_string(),
+                assertion: reason.lines().next().unwrap_or_default().to_string(),
+                key_log_lines: tail_lines(&reason, 10),
+                duration_ms: 0,
+                timed_out: false,
+                detail: reason,
+            };
+        }
+        Some(ResolvedCommand::Direct {
+            program,
+            args,
+            current_dir,
+        }) => run_resolved(
+            &program,
+            &args,
+            current_dir.as_deref(),
+            scenario_timeout,
+            timeouts.drain,
+            node_dir,
+        ),
+        _ => run_checked_with_timeouts(&cmd, scenario_timeout, timeouts.drain, node_dir),
+    };
     match outcome {
         RunOutcome::TimedOut => ScenarioRunReport {
             verdict: "FAIL".to_string(),
@@ -741,6 +1639,7 @@ fn parallel_jobs_from_env(v: Option<String>) -> usize {
 fn run_parallel(
     scenarios: &[Scenario],
     jobs: usize,
+    artifacts: Option<&ScenarioArtifacts>,
     timeouts: &ScenarioTimeouts,
 ) -> Vec<ScenarioRunReport> {
     use std::collections::VecDeque;
@@ -762,7 +1661,7 @@ fn run_parallel(
                         Some(i) => i,
                         None => break,
                     };
-                    let rep = run_single(&scenarios[idx], timeouts);
+                    let rep = run_single(&scenarios[idx], artifacts, timeouts);
                     // 主线程一定在收（rx 在 scope 内消费），send 不会阻塞。
                     let _ = tx.send((idx, rep));
                 }
@@ -805,6 +1704,7 @@ pub fn run_gate(
     config: &Config,
     gate_name: &str,
     subdirs: &[&str],
+    artifacts: Option<&ScenarioArtifacts>,
     timeouts: &ScenarioTimeouts,
 ) -> (Vec<ScenarioResult>, Gate) {
     use std::time::Instant;
@@ -818,9 +1718,12 @@ pub fn run_gate(
     }
     let jobs = parallel_jobs();
     let reports: Vec<ScenarioRunReport> = if jobs <= 1 || scenarios.len() <= 1 {
-        scenarios.iter().map(|s| run_single(s, timeouts)).collect()
+        scenarios
+            .iter()
+            .map(|s| run_single(s, artifacts, timeouts))
+            .collect()
     } else {
-        run_parallel(&scenarios, jobs, timeouts)
+        run_parallel(&scenarios, jobs, artifacts, timeouts)
     };
     let mut results: Vec<ScenarioResult> = Vec::new();
     let mut failed = false;
@@ -1389,6 +2292,7 @@ mod tests {
             &config,
             "product-scenarios",
             &[""],
+            None,
             &ScenarioTimeouts::legacy(),
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1495,7 +2399,7 @@ mod tests {
             "[[expect]]\nfield = \"verdict\"\nequals = \"FAIL\"\n",
         );
         assert_eq!(scenarios.len(), 1);
-        let rep = run_single(&scenarios[0], &ScenarioTimeouts::legacy());
+        let rep = run_single(&scenarios[0], None, &ScenarioTimeouts::legacy());
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(rep.verdict, "FAIL");
         assert_eq!(rep.failed_step, "expect");
@@ -1512,7 +2416,7 @@ mod tests {
             "fx",
             "schema_version = 1\nid = \"t.fx\"\n[given]\nfixture = [\"false\"]\n[when]\ncommand = \"echo {\\\"verdict\\\":\\\"PASS\\\"}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
         );
-        let rep = run_single(&scenarios[0], &ScenarioTimeouts::legacy());
+        let rep = run_single(&scenarios[0], None, &ScenarioTimeouts::legacy());
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(rep.verdict, "FAIL");
         assert_eq!(rep.failed_step, "fixture");
@@ -1526,7 +2430,7 @@ mod tests {
             "st",
             "schema_version = 1\nid = \"t.st\"\ntitle = \"静态契约\"\n[when]\n",
         );
-        let rep = run_single(&scenarios[0], &ScenarioTimeouts::legacy());
+        let rep = run_single(&scenarios[0], None, &ScenarioTimeouts::legacy());
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(rep.verdict, "UNKNOWN");
         assert_eq!(rep.failed_step, "lookup");
@@ -1539,7 +2443,7 @@ mod tests {
             "pl",
             "schema_version = 1\nid = \"t.pl\"\n[given]\nplatform = \"definitely-not-this-os\"\n[when]\ncommand = \"echo hi\"\n",
         );
-        let rep = run_single(&scenarios[0], &ScenarioTimeouts::legacy());
+        let rep = run_single(&scenarios[0], None, &ScenarioTimeouts::legacy());
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(rep.verdict, "UNKNOWN");
         assert!(rep.detail.contains("platform contract"));
@@ -1553,7 +2457,7 @@ mod tests {
             "{\"verdict\":\"PASS\"}",
             "[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
         );
-        let rep = run_single(&scenarios[0], &ScenarioTimeouts::legacy());
+        let rep = run_single(&scenarios[0], None, &ScenarioTimeouts::legacy());
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(rep.verdict, "PASS");
         assert!(rep.failed_step.is_empty());
@@ -1571,7 +2475,7 @@ mod tests {
             "np",
             "schema_version = 1\nid = \"t.parse\"\n[when]\ncommand = \"echo not-json\"\n",
         );
-        let rep = run_single(&scenarios[0], &ScenarioTimeouts::legacy());
+        let rep = run_single(&scenarios[0], None, &ScenarioTimeouts::legacy());
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(rep.verdict, "FAIL");
         assert_eq!(rep.failed_step, "parse");
@@ -1591,7 +2495,7 @@ mod tests {
             "sf",
             "schema_version = 1\nid = \"t.spawn\"\n[when]\ncommand = \"nexus-harness-no-such-binary-zzz\"\n",
         );
-        let rep = run_single(&scenarios[0], &ScenarioTimeouts::legacy());
+        let rep = run_single(&scenarios[0], None, &ScenarioTimeouts::legacy());
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(rep.verdict, "FAIL");
         assert_eq!(rep.failed_step, "command");
@@ -1632,7 +2536,7 @@ mod tests {
         }
         let scenarios = load_all(&dir, &[""]);
         assert_eq!(scenarios.len(), 6);
-        let reports = run_parallel(&scenarios, 3, &ScenarioTimeouts::legacy());
+        let reports = run_parallel(&scenarios, 3, None, &ScenarioTimeouts::legacy());
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(reports.len(), 6);
         for (i, rep) in reports.iter().enumerate() {
@@ -1703,6 +2607,7 @@ mod tests {
             &config,
             "product-scenarios",
             &[""],
+            None,
             &ScenarioTimeouts::legacy(),
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1733,12 +2638,392 @@ mod tests {
             real_device: std::time::Duration::from_millis(100),
             drain: std::time::Duration::from_secs(1),
         };
-        let rep = run_single(&scenarios[0], &timeouts);
+        let rep = run_single(&scenarios[0], None, &timeouts);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(rep.verdict, "FAIL");
         assert_eq!(rep.failed_step, "fixture");
         assert_eq!(rep.assertion, "timed_out");
         assert!(rep.timed_out);
         assert!(rep.detail.contains("timed out after 0s"), "{}", rep.detail);
+    }
+
+    fn artifacts_with_example(package: &str, example: &str) -> ScenarioArtifacts {
+        let mut artifacts = ScenarioArtifacts::default();
+        artifacts.examples.insert(
+            ExampleKey {
+                package: package.to_string(),
+                example: example.to_string(),
+                features: Vec::new(),
+                locked: false,
+            },
+            PathBuf::from("/tmp/direct-example"),
+        );
+        artifacts
+    }
+
+    #[test]
+    fn parse_example_command_to_direct() {
+        let artifacts = artifacts_with_example("nexus", "foo");
+        match resolve_scenario_command(
+            "cargo run --quiet -p nexus --example foo -- --json",
+            &artifacts,
+        ) {
+            ResolvedCommand::Direct {
+                program,
+                args,
+                current_dir,
+            } => {
+                assert_eq!(program, PathBuf::from("/tmp/direct-example"));
+                assert_eq!(args, vec!["--json".to_string()]);
+                assert!(current_dir.is_none());
+            }
+            _ => panic!("expected Direct"),
+        }
+    }
+
+    #[test]
+    fn parse_bin_default_target() {
+        let mut artifacts = ScenarioArtifacts::default();
+        artifacts.bins.insert(
+            BinKey {
+                package: "nexusd".to_string(),
+                bin: "nexusd".to_string(),
+                features: Vec::new(),
+                locked: false,
+            },
+            PathBuf::from("/tmp/direct-bin"),
+        );
+        match resolve_scenario_command(
+            "cargo run --quiet -p nexusd -- system-proxy e2e --json",
+            &artifacts,
+        ) {
+            ResolvedCommand::Direct { program, args, .. } => {
+                assert_eq!(program, PathBuf::from("/tmp/direct-bin"));
+                assert_eq!(
+                    args,
+                    vec![
+                        "system-proxy".to_string(),
+                        "e2e".to_string(),
+                        "--json".to_string()
+                    ]
+                );
+            }
+            _ => panic!("expected Direct"),
+        }
+    }
+
+    #[test]
+    fn parse_locked_and_features_keys() {
+        let mut artifacts = ScenarioArtifacts::default();
+        artifacts.examples.insert(
+            ExampleKey {
+                package: "nexus-platform-host".to_string(),
+                example: "windows".to_string(),
+                features: vec!["platform-windows".to_string()],
+                locked: true,
+            },
+            PathBuf::from("/tmp/direct-windows"),
+        );
+        let hit = resolve_scenario_command(
+            "cargo run -p nexus-platform-host --features platform-windows --locked --example windows -- --json",
+            &artifacts,
+        );
+        assert!(
+            matches!(hit, ResolvedCommand::Direct { .. }),
+            "locked+features key must hit"
+        );
+        // 同一个 example 但不带 --locked → 不同 key（未预编）→ 回退旧路径。
+        let miss = resolve_scenario_command(
+            "cargo run -p nexus-platform-host --features platform-windows --example windows -- --json",
+            &artifacts,
+        );
+        assert!(matches!(miss, ResolvedCommand::Unchanged { .. }));
+    }
+
+    #[test]
+    fn parse_unknown_forms_unchanged() {
+        let artifacts = ScenarioArtifacts::default();
+        for command in [
+            "cd x && cargo run --example foo",
+            "FOO=1 cargo run --example foo",
+            "cargo run --release --example foo",
+            "cargo test --workspace",
+            "nexus-harness run x",
+            "cargo run --example foo | tee out",
+        ] {
+            assert!(
+                matches!(
+                    resolve_scenario_command(command, &artifacts),
+                    ResolvedCommand::Unchanged { .. }
+                ),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_returns_none_current_dir_for_all_268() {
+        let repo = Repo::discover().expect("repo must be discoverable");
+        let config = Config::load(&repo).expect("config must load");
+        let scenarios = load_all(
+            &config.scenarios_dir,
+            &["product", "engineering", "platform", "regression"],
+        );
+        let meta = cargo_metadata().expect("cargo metadata");
+        let (examples, bins, missing) = collect_scenario_keys(&scenarios, &meta);
+        let mut artifacts = ScenarioArtifacts {
+            missing,
+            ..ScenarioArtifacts::default()
+        };
+        for key in &examples {
+            artifacts
+                .examples
+                .insert(key.clone(), PathBuf::from("/tmp/direct-example"));
+        }
+        for key in &bins {
+            artifacts
+                .bins
+                .insert(key.clone(), PathBuf::from("/tmp/direct-bin"));
+        }
+        let commands: Vec<&String> = scenarios
+            .iter()
+            .filter_map(|s| s.command.as_ref())
+            .collect();
+        let mut parseable = 0usize;
+        let mut direct = 0usize;
+        let mut missing_target = 0usize;
+        for command in commands {
+            if parse_cargo_run(command).is_none() {
+                continue;
+            }
+            parseable += 1;
+            match resolve_scenario_command(command, &artifacts) {
+                ResolvedCommand::Direct { current_dir, .. } => {
+                    assert!(current_dir.is_none(), "{command}");
+                    direct += 1;
+                }
+                ResolvedCommand::MissingTarget { .. } => missing_target += 1,
+                other => panic!(
+                    "cargo run command must resolve to Direct/MissingTarget: {command} ({})",
+                    match other {
+                        ResolvedCommand::Unchanged { .. } => "unchanged",
+                        ResolvedCommand::Unavailable { .. } => "unavailable",
+                        _ => "other",
+                    }
+                ),
+            }
+        }
+        assert_eq!(parseable, 268, "268 cargo-run [when].command");
+        assert_eq!(
+            missing_target, 22,
+            "n3_task_e4 is not declared (contract-first)"
+        );
+        assert_eq!(direct, 246, "all declared targets resolve to Direct");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_execution_inherits_harness_cwd() {
+        let timeout = std::time::Duration::from_secs(10);
+        let drain = std::time::Duration::from_secs(1);
+        let (outcome, stdout, _) =
+            run_resolved(Path::new("/bin/pwd"), &[], None, timeout, drain, None);
+        assert_eq!(outcome, RunOutcome::Exited(true));
+        let expected = std::env::current_dir().expect("cwd");
+        assert_eq!(
+            stdout.trim(),
+            expected.to_string_lossy(),
+            "current_dir=None must inherit harness cwd"
+        );
+        let tmp = std::env::temp_dir().join(format!("harness-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let (outcome, stdout, _) =
+            run_resolved(Path::new("/bin/pwd"), &[], Some(&tmp), timeout, drain, None);
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(outcome, RunOutcome::Exited(true));
+        let canonical = tmp.canonicalize().unwrap_or(tmp);
+        assert_eq!(stdout.trim(), canonical.to_string_lossy());
+    }
+
+    #[test]
+    fn prebuild_plan_groups() {
+        let repo = Repo::discover().expect("repo must be discoverable");
+        let config = Config::load(&repo).expect("config must load");
+        let scenarios = load_all(
+            &config.scenarios_dir,
+            &["product", "engineering", "platform", "regression"],
+        );
+        let meta = cargo_metadata().expect("cargo metadata");
+        let (examples, bins, _missing) = collect_scenario_keys(&scenarios, &meta);
+        assert_eq!(
+            examples.len() + bins.len(),
+            190,
+            "186 declared examples + 4 bins (n3_task_e4 is missing/contract-first)"
+        );
+        assert_eq!(examples.len(), 186);
+        assert_eq!(bins.len(), 4);
+        let groups = build_groups(&examples, &bins);
+        assert_eq!(
+            groups.len(),
+            16,
+            "16 groups after excluding the undeclared n3_task_e4 target (plan expected 17 when counting it)"
+        );
+        for group in &groups {
+            assert!(!group.targets.is_empty());
+            for target in &group.targets {
+                if group.kind == "example" {
+                    assert!(examples.contains(&ExampleKey {
+                        package: group.package.clone(),
+                        example: target.clone(),
+                        features: group.features.clone(),
+                        locked: group.locked,
+                    }));
+                } else {
+                    assert!(bins.contains(&BinKey {
+                        package: group.package.clone(),
+                        bin: target.clone(),
+                        features: group.features.clone(),
+                        locked: group.locked,
+                    }));
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prebuild_failure_isolated() {
+        let dir = std::env::temp_dir().join(format!("harness-prebuild-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (id, example) in [("a", "a"), ("b", "b")] {
+            std::fs::write(
+                dir.join(format!("{id}.toml")),
+                format!(
+                    "schema_version = 1\nid = \"t.{id}\"\n[when]\ncommand = \"cargo run --quiet -p pkg --example {example} -- {{\\\"verdict\\\":\\\"PASS\\\"}}\"\n[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        let scenarios = load_all(&dir, &[""]);
+        let mut artifacts = ScenarioArtifacts::default();
+        artifacts.examples.insert(
+            ExampleKey {
+                package: "pkg".to_string(),
+                example: "a".to_string(),
+                features: Vec::new(),
+                locked: false,
+            },
+            PathBuf::from("/bin/echo"),
+        );
+        artifacts.failures.push(ArtifactBuildFailure {
+            package: "pkg".to_string(),
+            kind: "example".to_string(),
+            target: "b".to_string(),
+            detail: "compile error".to_string(),
+        });
+        let a = scenarios.iter().find(|s| s.id == "t.a").unwrap();
+        let b = scenarios.iter().find(|s| s.id == "t.b").unwrap();
+        let rep_a = run_single(a, Some(&artifacts), &ScenarioTimeouts::legacy());
+        let rep_b = run_single(b, Some(&artifacts), &ScenarioTimeouts::legacy());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(rep_a.verdict, "PASS", "{}", rep_a.detail);
+        assert_eq!(rep_b.verdict, "FAIL");
+        assert_eq!(rep_b.failed_step, "prebuild");
+        assert_eq!(rep_b.assertion, "pkg:example:b");
+        assert!(rep_b.detail.contains("compile error"), "{}", rep_b.detail);
+    }
+
+    #[test]
+    fn run_gate_none_artifacts_keeps_legacy() {
+        let (dir, scenarios) = synthetic_script_scenario(
+            "legacy",
+            "{\"verdict\":\"PASS\"}",
+            "[[expect]]\nfield = \"verdict\"\nequals = \"PASS\"\n",
+        );
+        let config = Config {
+            policies_dir: dir.join("policies"),
+            scenarios_dir: dir.clone(),
+            evidence_dir: dir.join("evidence"),
+            crates_dir: dir.join("crates"),
+            engineering_dir: dir.join("engineering"),
+            quality: serde_json::json!({}),
+            portable_core: vec![],
+            bind_working_tree_digest: true,
+            verify_timeouts: crate::config::VerifyTimeouts::defaults(),
+        };
+        let (none_results, none_gate) = run_gate(
+            &config,
+            "product-scenarios",
+            &[""],
+            None,
+            &ScenarioTimeouts::legacy(),
+        );
+        let empty = ScenarioArtifacts::default();
+        let (some_results, some_gate) = run_gate(
+            &config,
+            "product-scenarios",
+            &[""],
+            Some(&empty),
+            &ScenarioTimeouts::legacy(),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(scenarios.len(), 1);
+        assert_eq!(none_results[0].verdict, "PASS");
+        assert_eq!(none_gate.verdict, some_gate.verdict);
+        assert_eq!(none_results[0].verdict, some_results[0].verdict);
+    }
+
+    #[test]
+    fn prebuild_never_runs_examples_all() {
+        let repo = Repo::discover().expect("repo must be discoverable");
+        let config = Config::load(&repo).expect("config must load");
+        let scenarios = load_all(
+            &config.scenarios_dir,
+            &["product", "engineering", "platform", "regression"],
+        );
+        let meta = cargo_metadata().expect("cargo metadata");
+        let (examples, bins, _missing) = collect_scenario_keys(&scenarios, &meta);
+        for group in build_groups(&examples, &bins) {
+            let args = group_args(&group);
+            assert!(!args.iter().any(|a| a == "--examples" || a == "--bins"));
+            let mut i = 0;
+            while i < args.len() {
+                if args[i] == format!("--{}", group.kind) {
+                    assert!(
+                        group.targets.contains(&args[i + 1]),
+                        "unreferenced target in build command: {}",
+                        args[i + 1]
+                    );
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_example_names_get_unique_snapshots() {
+        let mut examples = std::collections::BTreeSet::new();
+        for package in ["nexus-fabric", "nexus-path"] {
+            examples.insert(ExampleKey {
+                package: package.to_string(),
+                example: "basic".to_string(),
+                features: Vec::new(),
+                locked: false,
+            });
+        }
+        let bins = std::collections::BTreeSet::new();
+        let duplicates = duplicate_targets(&examples, &bins);
+        assert_eq!(
+            duplicates,
+            std::collections::BTreeSet::from([("example".to_string(), "basic".to_string())])
+        );
+        let canonical = PathBuf::from("/tmp/examples/basic");
+        let a = unique_artifact_path(&canonical, "nexus-fabric", "example", "basic", &[], false);
+        let b = unique_artifact_path(&canonical, "nexus-path", "example", "basic", &[], false);
+        assert_ne!(a, b, "same-name examples must not share an executable path");
+        assert_eq!(a.parent(), canonical.parent());
     }
 }

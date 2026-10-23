@@ -1,10 +1,10 @@
 //! Command implementations: status / context / check / test / verify / explain.
 
-use crate::config::{Config, VerifyTimeouts};
+use crate::config::{Config, ScenarioTimeouts, VerifyTimeouts};
 use crate::env::Repo;
 use crate::evidence::{self, Bindings};
 use crate::gates::{self, Gate, GateBudget};
-use crate::scenario::ScenarioResult;
+use crate::scenario::{ScenarioArtifacts, ScenarioResult};
 use serde_json::{Value, json};
 
 type Outcome = (String, String, Vec<(String, Value)>);
@@ -423,6 +423,24 @@ fn execute_verify(
         None
     };
     let deadline_secs = timeouts.full_deadline.map(|d| d.as_secs()).unwrap_or(0);
+    // full 模式、门循环前预编一次场景实际引用的 example/bin；fast 不预编。
+    let mut prebuild_ms = 0u64;
+    let artifacts = if mode == "full" && !global.expired() {
+        let all = crate::scenario::load_all(
+            &config.scenarios_dir,
+            &["product", "engineering", "platform", "regression"],
+        );
+        let built = crate::scenario::prebuild_scenario_artifacts(
+            &all,
+            repo,
+            config.gate_budget("product-scenarios", global),
+        );
+        prebuild_ms = built.build_ms;
+        Some(built)
+    } else {
+        None
+    };
+    let artifacts_ref = artifacts.as_ref();
     let names = gate_sequence(config, mode);
     let mut scenarios: Vec<ScenarioResult> = Vec::new();
 
@@ -439,22 +457,24 @@ fn execute_verify(
             "selected-properties" => gates::selected_properties_gate(repo, budget),
             "workspace-tests" => gates::workspace_tests_gate(repo, budget),
             "integration" => gates::integration_gate(repo, budget),
-            "product-scenarios" => {
-                let (sr, g) = scenario_run(
-                    config,
-                    "product-scenarios",
-                    &["product", "engineering", "platform"],
-                    &timeouts.scenarios,
-                );
-                scenarios.extend(sr);
-                g
-            }
-            "regression" => {
-                let (sr, g) =
-                    scenario_run(config, "regression", &["regression"], &timeouts.scenarios);
-                scenarios.extend(sr);
-                g
-            }
+            "product-scenarios" => scenario_gate_with_budget(
+                config,
+                name,
+                &["product", "engineering", "platform"],
+                artifacts_ref,
+                budget,
+                &timeouts.scenarios,
+                &mut scenarios,
+            ),
+            "regression" => scenario_gate_with_budget(
+                config,
+                name,
+                &["regression"],
+                artifacts_ref,
+                budget,
+                &timeouts.scenarios,
+                &mut scenarios,
+            ),
             "architecture-policy" => gates::architecture_gate(config, budget),
             "dependency-governance" => gates::dependency_gate(repo, config, budget),
             "coverage-summary" => gates::coverage_gate(repo, budget),
@@ -481,7 +501,7 @@ fn execute_verify(
         started_at,
         deadline_ms,
         deadline_exceeded,
-        prebuild_ms: 0,
+        prebuild_ms,
     };
     VerifyRun {
         gates,
@@ -554,9 +574,39 @@ fn scenario_run(
     config: &Config,
     gate_name: &str,
     subdirs: &[&str],
-    timeouts: &crate::config::ScenarioTimeouts,
+    artifacts: Option<&ScenarioArtifacts>,
+    timeouts: &ScenarioTimeouts,
 ) -> (Vec<ScenarioResult>, Gate) {
-    crate::scenario::run_gate(config, gate_name, subdirs, timeouts)
+    crate::scenario::run_gate(config, gate_name, subdirs, artifacts, timeouts)
+}
+
+/// 场景门级预算 fail-closed：`run_gate` 不含 budget（逐场景 tier 超时仍硬生效），
+/// 调用后按墙钟判定；超过有效预算即覆写为 FAIL + `timed_out=true`（不中断
+/// worker，但绝不静默 PASS）。
+#[allow(clippy::too_many_arguments)]
+fn scenario_gate_with_budget(
+    config: &Config,
+    gate_name: &str,
+    subdirs: &[&str],
+    artifacts: Option<&ScenarioArtifacts>,
+    budget: GateBudget,
+    timeouts: &ScenarioTimeouts,
+    scenarios: &mut Vec<ScenarioResult>,
+) -> Gate {
+    let limit = budget.remaining();
+    let started = std::time::Instant::now();
+    let (results, mut gate) = scenario_run(config, gate_name, subdirs, artifacts, timeouts);
+    scenarios.extend(results);
+    if let Some(limit) = limit {
+        if started.elapsed() > limit {
+            gate = Gate::fail(
+                gate_name,
+                &format!("gate '{gate_name}' timed out after {}s", limit.as_secs()),
+            );
+            gate.timed_out = true;
+        }
+    }
+    gate
 }
 
 pub fn explain() -> Outcome {

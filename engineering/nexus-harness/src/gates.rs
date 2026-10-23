@@ -331,14 +331,18 @@ fn binaries_from_artifacts(
     meta: &Value,
     stdout: &[u8],
 ) -> Result<ProductBinaries, String> {
-    let artifacts: Vec<Value> = String::from_utf8_lossy(stdout)
-        .lines()
-        .map(|line| {
-            serde_json::from_str(line).map_err(|e| {
-                format!("current CLI/daemon prebuild: malformed Cargo artifact JSON: {e}")
-            })
-        })
-        .collect::<Result<_, _>>()?;
+    // run_bounded 合并 stdout+stderr；只解析 JSON 对象行（cargo 的进度
+    // 行在 stderr），但 JSON 行本身解析失败仍然 fail-closed。
+    let mut artifacts: Vec<Value> = Vec::new();
+    for line in String::from_utf8_lossy(stdout).lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        artifacts.push(serde_json::from_str(line).map_err(|e| {
+            format!("current CLI/daemon prebuild: malformed Cargo artifact JSON: {e}")
+        })?);
+    }
     let executable = |name: &str| -> Result<PathBuf, String> {
         let package = meta["packages"]
             .as_array()

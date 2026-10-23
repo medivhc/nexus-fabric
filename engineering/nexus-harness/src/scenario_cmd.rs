@@ -96,7 +96,7 @@ fn run_one(name: &str) -> Outcome {
             format!("unknown scenario id: {name}"),
         );
     };
-    let rep = scenario::run_single(target, &crate::config::ScenarioTimeouts::legacy());
+    let rep = scenario::run_single(target, None, &crate::config::ScenarioTimeouts::legacy());
     // 机器接口只允许 PASS | FAIL | BLOCKED：UNKNOWN（平台不匹配/静态契约/
     // n3 contract-first 未实现）映射为 BLOCKED。
     let verdict = match rep.verdict.as_str() {
