@@ -1229,19 +1229,62 @@ pub fn platform_checks_gate(config: &Config, _budget: GateBudget) -> Gate {
 
 /// Feature matrix: for each workspace member, `cargo check` with
 /// --no-default-features and --all-features (per quality.toml [features]).
+/// 只检查 metadata 中声明了非空 `[features]` 映射的 workspace 成员。
+/// 无 feature 的成员，`--no-default-features` / `--all-features` 与普通
+/// check 等价，已由 `check --workspace --all-targets` 覆盖。
+/// 返回（成员列表，被跳过的成员数）。
+fn feature_matrix_plan(meta: &Value) -> (Vec<String>, usize) {
+    let members = member_names(meta);
+    if members.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let member_ids: Vec<&str> = meta["workspace_members"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let mut with_features: Vec<String> = meta["packages"]
+        .as_array()
+        .map(|packages| {
+            packages
+                .iter()
+                .filter(|p| p["id"].as_str().is_some_and(|id| member_ids.contains(&id)))
+                .filter(|p| {
+                    p["features"]
+                        .as_object()
+                        .is_some_and(|features| !features.is_empty())
+                })
+                .filter_map(|p| p["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    with_features.sort();
+    with_features.dedup();
+    let skipped = members.len().saturating_sub(with_features.len());
+    (with_features, skipped)
+}
+
+fn feature_matrix_success_detail(checked: usize, members: &[String], skipped: usize) -> String {
+    format!(
+        "{checked} member×feature checks passed; members=[{}]; skipped_no_features={skipped} (no [features] map; covered by check)",
+        members.join(", ")
+    )
+}
+
 pub fn feature_matrix_gate(repo: &Repo, budget: GateBudget) -> Gate {
     let meta = match cargo_metadata() {
         Ok(m) => m,
         Err(e) => return Gate::unknown("feature-matrix", &format!("cargo metadata failed: {e}")),
     };
-    let mut names: Vec<String> = member_manifests(&meta)
-        .into_iter()
-        .map(|(n, _)| n)
-        .collect();
-    names.sort();
+    let (members, skipped) = feature_matrix_plan(&meta);
+    if members.is_empty() {
+        return Gate::ok(
+            "feature-matrix",
+            &feature_matrix_success_detail(0, &members, skipped),
+        );
+    }
     let mut failures: Vec<String> = Vec::new();
     let mut checked = 0usize;
-    for name in &names {
+    for name in &members {
         for flag in ["--no-default-features", "--all-features"] {
             let g = cargo_gate(repo, "feature-matrix", &["check", "-p", name, flag], budget);
             checked += 1;
@@ -1253,7 +1296,7 @@ pub fn feature_matrix_gate(repo: &Repo, budget: GateBudget) -> Gate {
     if failures.is_empty() {
         Gate::ok(
             "feature-matrix",
-            &format!("{checked} member×feature checks passed ({})", names.len()),
+            &feature_matrix_success_detail(checked, &members, skipped),
         )
     } else {
         Gate::fail("feature-matrix", &failures.join("\n"))
@@ -2549,5 +2592,65 @@ mod tests {
             }
             _ => panic!("expected Exited"),
         }
+    }
+
+    #[test]
+    fn feature_matrix_plan_real_metadata() {
+        let meta = crate::env::cargo_metadata().expect("cargo metadata");
+        let (members, skipped) = feature_matrix_plan(&meta);
+        assert_eq!(
+            members,
+            vec![
+                "nexus-platform-host".to_string(),
+                "nexus-plugin".to_string(),
+                "nexus-turn".to_string()
+            ]
+        );
+        assert_eq!(members.len() * 2, 6, "3 members × 2 flags");
+        assert_eq!(skipped, 49, "52 workspace members - 3 with features");
+    }
+
+    #[test]
+    fn feature_matrix_plan_includes_new_feature_member() {
+        let mut meta = serde_json::json!({
+            "workspace_members": ["a", "b", "c"],
+            "packages": [
+                {"id": "a", "name": "a", "features": {}},
+                {"id": "b", "name": "b", "features": {"x": []}},
+                {"id": "c", "name": "c", "features": {}}
+            ]
+        });
+        let (members, skipped) = feature_matrix_plan(&meta);
+        assert_eq!(members, vec!["b".to_string()]);
+        assert_eq!(skipped, 2);
+        meta["packages"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"id": "d", "name": "d", "features": {"y": []}}));
+        meta["workspace_members"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!("d"));
+        let (members, skipped) = feature_matrix_plan(&meta);
+        assert_eq!(members, vec!["b".to_string(), "d".to_string()]);
+        assert_eq!(skipped, 2);
+    }
+
+    #[test]
+    fn feature_matrix_detail_lists_members() {
+        let members = vec![
+            "nexus-platform-host".to_string(),
+            "nexus-plugin".to_string(),
+            "nexus-turn".to_string(),
+        ];
+        let detail = feature_matrix_success_detail(6, &members, 49);
+        for member in &members {
+            assert!(detail.contains(member), "{detail}");
+        }
+        assert!(
+            detail.contains("6 member×feature checks passed"),
+            "{detail}"
+        );
+        assert!(detail.contains("skipped_no_features=49"), "{detail}");
     }
 }
