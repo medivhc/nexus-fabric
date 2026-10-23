@@ -112,6 +112,9 @@ jobs:
       # 失败时 PR comment 立即反馈，agent 无需等待全量 verify
       - name: Comment PR on failure
         if: failure()
+        # 评论只是通知：仓库级 default_workflow_permissions=read 会把 token 压成只读，
+        # 评论 403 不许翻转本 job 的判定（2026-10-23 PR #23 实证）。
+        continue-on-error: true
         uses: actions/github-script@v7
         with:
           script: |
@@ -236,6 +239,8 @@ jobs:
       # PR comment 附上 Evidence 链接和验证结果
       - name: Comment PR
         if: always()
+        # 同上：评论失败不许翻转 verify 的判定。
+        continue-on-error: true
         uses: actions/github-script@v7
         with:
           script: |
