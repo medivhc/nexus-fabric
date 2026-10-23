@@ -22,10 +22,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
-          components: llvm-tools-preview
+      # Toolchain is locked by rust-toolchain.toml (1.98.1, components
+      # include llvm-tools-preview). Do NOT pass an explicit
+      # `toolchain: stable` here: that makes this step install the floating
+      # stable toolchain, splitting the job across two toolchains — test
+      # binaries get built by newer stable while cargo-llvm-cov merges
+      # profiles with the pinned toolchain's llvm-profdata, which then
+      # rejects the newer profraw encoding ("unrecognized instrumentation
+      # profile encoding format" / "no profile can be merged").
+      # Shape mirrors ci-verify.yml.
+      - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
