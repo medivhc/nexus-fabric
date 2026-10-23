@@ -443,6 +443,8 @@ fn execute_verify(
     let artifacts_ref = artifacts.as_ref();
     let names = gate_sequence(config, mode);
     let mut scenarios: Vec<ScenarioResult> = Vec::new();
+    // 共享测试会话：门循环前构造一次，跨门存活（不写 evidence、不跨 run）。
+    let mut shared_session = gates::SharedTestSession::new();
 
     let mut invoke = |name: &str, budget: GateBudget| -> Gate {
         gates::timed(|| match name {
@@ -455,8 +457,20 @@ fn execute_verify(
             "resource-type-neutrality" => gates::resource_kind_neutrality_gate(config, budget),
             "affected-tests" => gates::affected_tests_gate(repo, config, budget),
             "selected-properties" => gates::selected_properties_gate(repo, budget),
-            "workspace-tests" => gates::workspace_tests_gate(repo, budget),
-            "integration" => gates::integration_gate(repo, budget),
+            "workspace-tests" => gates::shared_gate(
+                &mut shared_session,
+                gates::SharedGateKind::WorkspaceTests,
+                repo,
+                budget,
+                global,
+            ),
+            "integration" => gates::shared_gate(
+                &mut shared_session,
+                gates::SharedGateKind::Integration,
+                repo,
+                budget,
+                global,
+            ),
             "product-scenarios" => scenario_gate_with_budget(
                 config,
                 name,
@@ -479,7 +493,13 @@ fn execute_verify(
             "dependency-governance" => gates::dependency_gate(repo, config, budget),
             "coverage-summary" => gates::coverage_gate(repo, budget),
             "selected-fuzz" => gates::fuzz_gate(repo, budget),
-            "selected-concurrency" => gates::concurrency_gate(repo, budget),
+            "selected-concurrency" => gates::shared_gate(
+                &mut shared_session,
+                gates::SharedGateKind::SelectedConcurrency,
+                repo,
+                budget,
+                global,
+            ),
             "performance-budgets" => gates::performance_budgets_gate(config, budget),
             "bench" => gates::bench_gate(repo, config, budget),
             "platform-checks" => gates::platform_checks_gate(config, budget),

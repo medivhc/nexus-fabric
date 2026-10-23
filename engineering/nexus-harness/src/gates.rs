@@ -111,6 +111,20 @@ pub fn run_bounded(
     run_bounded_env(root, program, args, budget, &[])
 }
 
+struct BoundedStreams {
+    outcome: BoundedOutcome,
+    stdout: String,
+    stderr: String,
+    /// 按到达顺序记录的 (is_stderr, line)；用于需要跨流配对输出的解析。
+    ordered_lines: Vec<(bool, String)>,
+}
+
+enum BoundedOutcome {
+    Exited(bool),
+    TimedOut,
+    SpawnFailed(String),
+}
+
 fn run_bounded_env(
     root: &PathBuf,
     program: &str,
@@ -118,6 +132,22 @@ fn run_bounded_env(
     budget: GateBudget,
     envs: &[(&str, &std::path::Path)],
 ) -> CommandOutcome {
+    let streams = run_bounded_streams(root, program, args, budget, envs);
+    let text = format!("{}{}", streams.stdout, streams.stderr);
+    match streams.outcome {
+        BoundedOutcome::Exited(success) => CommandOutcome::Exited { success, text },
+        BoundedOutcome::TimedOut => CommandOutcome::TimedOut { text },
+        BoundedOutcome::SpawnFailed(detail) => CommandOutcome::SpawnFailed { detail },
+    }
+}
+
+fn run_bounded_streams(
+    root: &PathBuf,
+    program: &str,
+    args: &[&str],
+    budget: GateBudget,
+    envs: &[(&str, &std::path::Path)],
+) -> BoundedStreams {
     use std::io::Read;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
@@ -133,26 +163,55 @@ fn run_bounded_env(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            return CommandOutcome::SpawnFailed {
-                detail: format!("failed to run {program}: {e}"),
+            return BoundedStreams {
+                outcome: BoundedOutcome::SpawnFailed(format!("failed to run {program}: {e}")),
+                stdout: String::new(),
+                stderr: String::new(),
+                ordered_lines: Vec::new(),
             };
         }
     };
-    let (tx, rx) = std::sync::mpsc::channel::<(bool, Vec<u8>)>();
+    // 按块流式转发：孤儿孙进程可能长期持有 pipe 写端导致 reader 永不 EOF，
+    // 因此不能等 read_to_end 结束才交付（会丢掉全部输出）。读到多少转发多少，
+    // EOF 后发结束标记。
+    enum Chunk {
+        Out(Vec<u8>),
+        Err(Vec<u8>),
+        Eof,
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<Chunk>();
     if let Some(mut p) = child.stdout.take() {
         let tx = tx.clone();
         std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = p.read_to_end(&mut buf);
-            let _ = tx.send((true, buf));
+            let mut buf = [0u8; 8192];
+            loop {
+                match p.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.send(Chunk::Out(buf[..n].to_vec())).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            let _ = tx.send(Chunk::Eof);
         });
     }
     if let Some(mut p) = child.stderr.take() {
         let tx = tx.clone();
         std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = p.read_to_end(&mut buf);
-            let _ = tx.send((false, buf));
+            let mut buf = [0u8; 8192];
+            loop {
+                match p.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.send(Chunk::Err(buf[..n].to_vec())).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            let _ = tx.send(Chunk::Eof);
         });
     }
     drop(tx);
@@ -181,28 +240,63 @@ fn run_bounded_env(
     let success = exit_status.is_some_and(|status| status.success()) && !timed_out;
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    for _ in 0..2 {
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    let mut ordered_lines: Vec<(bool, String)> = Vec::new();
+    let mut out_partial: Vec<u8> = Vec::new();
+    let mut err_partial: Vec<u8> = Vec::new();
+    let mut eofs = 0usize;
+    while eofs < 2 {
         let now = Instant::now();
         if now >= deadline {
             break;
         }
         match rx.recv_timeout(deadline - now) {
-            Ok((true, b)) => stdout = b,
-            Ok((false, b)) => stderr = b,
+            Ok(Chunk::Out(b)) => {
+                stdout.extend_from_slice(&b);
+                collect_lines(&mut out_partial, &b, false, &mut ordered_lines);
+            }
+            Ok(Chunk::Err(b)) => {
+                stderr.extend_from_slice(&b);
+                collect_lines(&mut err_partial, &b, true, &mut ordered_lines);
+            }
+            Ok(Chunk::Eof) => eofs += 1,
             Err(_) => break,
         }
     }
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&stdout),
-        String::from_utf8_lossy(&stderr)
-    );
-    if timed_out {
-        CommandOutcome::TimedOut { text }
-    } else {
-        CommandOutcome::Exited { success, text }
+    for (partial, is_stderr) in [(&out_partial, false), (&err_partial, true)] {
+        if !partial.is_empty() {
+            ordered_lines.push((
+                is_stderr,
+                String::from_utf8_lossy(partial).trim_end().to_string(),
+            ));
+        }
+    }
+    BoundedStreams {
+        outcome: if timed_out {
+            BoundedOutcome::TimedOut
+        } else {
+            BoundedOutcome::Exited(success)
+        },
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        ordered_lines,
+    }
+}
+
+fn collect_lines(
+    partial: &mut Vec<u8>,
+    chunk: &[u8],
+    is_stderr: bool,
+    out: &mut Vec<(bool, String)>,
+) {
+    for &byte in chunk {
+        if byte == b'\n' {
+            out.push((is_stderr, String::from_utf8_lossy(partial).to_string()));
+            partial.clear();
+        } else {
+            partial.push(byte);
+        }
     }
 }
 
@@ -1056,6 +1150,622 @@ pub fn concurrency_gate(repo: &Repo, budget: GateBudget) -> Gate {
     } else {
         Gate::fail("selected-concurrency", &failures.join("\n"))
     }
+}
+
+// ---------------------------------------------------------------------------
+// 共享测试执行（stage 4）：workspace-tests / integration / selected-concurrency
+// 复用同一次 `cargo test --workspace --no-fail-fast`，逐 target 派生 verdict。
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct TestTargetResult {
+    pub package: String,
+    pub target: String,
+    pub kind: String,
+    pub verdict: String,
+    pub duration_ms: u64,
+    pub detail: String,
+}
+
+#[derive(Clone)]
+pub struct SharedTestRun {
+    pub targets: Vec<TestTargetResult>,
+    pub total_ms: u64,
+    pub timed_out: bool,
+    pub process_success: bool,
+    pub raw_tail: String,
+}
+
+fn target_owners(meta: &Value) -> std::collections::BTreeMap<String, (String, String)> {
+    let member_ids: Vec<&str> = meta["workspace_members"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let mut owners = std::collections::BTreeMap::new();
+    if let Some(packages) = meta["packages"].as_array() {
+        for package in packages {
+            if !package["id"]
+                .as_str()
+                .is_some_and(|id| member_ids.contains(&id))
+            {
+                continue;
+            }
+            let Some(name) = package["name"].as_str() else {
+                continue;
+            };
+            if let Some(targets) = package["targets"].as_array() {
+                for target in targets {
+                    let kinds: Vec<&str> = target["kind"]
+                        .as_array()
+                        .map(|k| k.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    let kind = if kinds.contains(&"test") {
+                        "test"
+                    } else if kinds.contains(&"lib") {
+                        "lib"
+                    } else if kinds.contains(&"bin") {
+                        "bin"
+                    } else if kinds.contains(&"bench") {
+                        "bench"
+                    } else {
+                        "other"
+                    };
+                    if let Some(target_name) = target["name"].as_str() {
+                        owners.insert(
+                            target_name.to_string(),
+                            (name.to_string(), kind.to_string()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    owners
+}
+
+/// 解析 `cargo test --workspace --no-fail-fast` 输出：
+/// - `Running <src> (<target-path>)` 建立当前 target；从括号内文件名去 `-<hash>`
+///   得到 target 名；
+/// - 紧随其后的 `test result: ok|FAILED ... finished in X.XXs` 归属该 target；
+/// - `Doc-tests` 的 test result 不归属 target（只影响 process_success）；
+/// - 同一 target 多次出现以最后一次为准。
+fn running_line(line: &str) -> Option<(String, String)> {
+    let rest = line.trim().strip_prefix("Running ")?;
+    let open = rest.rfind('(')?;
+    let path = rest[open + 1..].trim_end_matches(')').trim();
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let stem = file.split('.').next().unwrap_or(file);
+    let stripped = match stem.rsplit_once('-') {
+        Some((head, hash)) if hash.len() == 16 && hash.chars().all(|c| c.is_ascii_hexdigit()) => {
+            head
+        }
+        _ => stem,
+    };
+    Some((file.to_string(), stripped.to_string()))
+}
+
+/// 解析共享测试输出（跨流、按到达顺序）。
+///
+/// cargo 的 `Running ...` / `Doc-tests ...` 在 stderr，libtest 的 `test result:`
+/// 在 stdout；且子测试进程（如 `--ignored --exact` 探针）会把自己的
+/// `test result` 打到同一 stdout。因此按**有序行**切段：每个 Running 开启一段，
+/// 段内取「0 filtered out」的 result（外层运行全部测试）作为该 target 的结果，
+/// 没有则取最后一个。段间数量不齐/无结果 → 该 target 缺失 → 上层 fail-closed。
+fn flush_shared_segment(
+    current: &mut Option<(String, String)>,
+    segment: &mut Vec<String>,
+    owners: &std::collections::BTreeMap<String, (String, String)>,
+    order: &mut Vec<(String, String)>,
+    results: &mut std::collections::BTreeMap<(String, String), TestTargetResult>,
+) {
+    let Some((package, target)) = current.take() else {
+        segment.clear();
+        return;
+    };
+    if let Some(trimmed) = segment
+        .iter()
+        .rev()
+        .find(|line| line.contains("0 filtered out"))
+        .or_else(|| segment.last())
+    {
+        let trimmed = trimmed.trim();
+        let verdict = if trimmed.starts_with("test result: ok") {
+            "PASS".to_string()
+        } else {
+            "FAIL".to_string()
+        };
+        let duration_ms = trimmed
+            .split("finished in ")
+            .nth(1)
+            .and_then(|t| t.trim_end_matches('s').parse::<f64>().ok())
+            .map(|secs| (secs * 1000.0) as u64)
+            .unwrap_or(0);
+        let kind = owners
+            .get(&target)
+            .map(|(_, k)| k.clone())
+            .unwrap_or_else(|| "test".to_string());
+        if !results.contains_key(&(package.clone(), target.clone())) {
+            order.push((package.clone(), target.clone()));
+        }
+        results.insert(
+            (package.clone(), target.clone()),
+            TestTargetResult {
+                package,
+                target,
+                kind,
+                verdict,
+                duration_ms,
+                detail: trimmed.to_string(),
+            },
+        );
+    }
+    segment.clear();
+}
+
+fn parse_shared_output(
+    lines: &[(bool, String)],
+    total_ms: u64,
+    process_success: bool,
+    meta: &Value,
+    exec_map: &std::collections::BTreeMap<String, (String, String)>,
+) -> SharedTestRun {
+    let owners = target_owners(meta);
+    let mut order: Vec<(String, String)> = Vec::new();
+    let mut results: std::collections::BTreeMap<(String, String), TestTargetResult> =
+        std::collections::BTreeMap::new();
+    let mut current: Option<(String, String)> = None;
+    let mut segment: Vec<String> = Vec::new();
+    for (is_stderr, line) in lines {
+        if *is_stderr {
+            let trimmed = line.trim();
+            if trimmed.starts_with("Doc-tests ") {
+                flush_shared_segment(
+                    &mut current,
+                    &mut segment,
+                    &owners,
+                    &mut order,
+                    &mut results,
+                );
+                continue;
+            }
+            if let Some((file, stem)) = running_line(line) {
+                flush_shared_segment(
+                    &mut current,
+                    &mut segment,
+                    &owners,
+                    &mut order,
+                    &mut results,
+                );
+                let identity = exec_map
+                    .get(&file)
+                    .cloned()
+                    .or_else(|| owners.get(&stem).cloned().map(|(p, _)| (p, stem.clone())))
+                    .unwrap_or_else(|| (String::new(), stem));
+                current = Some(identity);
+            }
+            continue;
+        }
+        if line.trim().starts_with("test result:") && current.is_some() {
+            segment.push(line.clone());
+        }
+    }
+    flush_shared_segment(
+        &mut current,
+        &mut segment,
+        &owners,
+        &mut order,
+        &mut results,
+    );
+    let targets: Vec<TestTargetResult> = order
+        .into_iter()
+        .filter_map(|name| results.remove(&name))
+        .collect();
+    let raw_tail: Vec<&str> = lines
+        .iter()
+        .filter(|(is_stderr, _)| *is_stderr)
+        .map(|(_, line)| line.as_str())
+        .rev()
+        .take(20)
+        .collect();
+    let raw_tail = raw_tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+    SharedTestRun {
+        targets,
+        total_ms,
+        timed_out: false,
+        process_success,
+        raw_tail,
+    }
+}
+
+/// `cargo test --no-run --message-format=json`：可执行文件名 → (package,target)。
+/// 同名 target（实测 `dataplane_mock` 出现在两个包）也能正确归属。
+fn test_executable_map(
+    repo: &Repo,
+    meta: &Value,
+    budget: GateBudget,
+) -> Result<std::collections::BTreeMap<String, (String, String)>, String> {
+    let text = match run_bounded(
+        &repo.root,
+        "cargo",
+        &["test", "--workspace", "--no-run", "--message-format=json"],
+        budget,
+    ) {
+        CommandOutcome::Exited {
+            success: true,
+            text,
+        } => text,
+        CommandOutcome::Exited {
+            success: false,
+            text,
+        } => return Err(format!("cargo test --no-run failed:\n{text}")),
+        CommandOutcome::TimedOut { .. } => {
+            return Err("cargo test --no-run timed out".to_string());
+        }
+        CommandOutcome::SpawnFailed { detail } => return Err(detail),
+    };
+    let mut map = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value["reason"] != "compiler-artifact" {
+            continue;
+        }
+        let Some(executable) = value["executable"].as_str() else {
+            continue;
+        };
+        let Some(target_name) = value["target"]["name"].as_str() else {
+            continue;
+        };
+        let Some(package_id) = value["package_id"].as_str() else {
+            continue;
+        };
+        let package_name = meta["packages"]
+            .as_array()
+            .and_then(|packages| {
+                packages
+                    .iter()
+                    .find(|p| p["id"].as_str() == Some(package_id))
+                    .and_then(|p| p["name"].as_str())
+            })
+            .unwrap_or_default()
+            .to_string();
+        let file = executable.rsplit('/').next().unwrap_or(executable);
+        map.insert(file.to_string(), (package_name, target_name.to_string()));
+    }
+    Ok(map)
+}
+
+pub fn run_shared_tests(repo: &Repo, budget: GateBudget) -> Result<SharedTestRun, String> {
+    use std::time::Instant;
+    let meta = cargo_metadata().map_err(|e| format!("cargo metadata failed: {e}"))?;
+    let members = member_names(&meta);
+    let binaries =
+        product_binaries(repo, &meta, &members, "shared-tests", budget).map_err(|e| e.detail)?;
+    let envs: Vec<(&str, &std::path::Path)> = binaries
+        .as_ref()
+        .map(|b| {
+            vec![
+                ("NEXUS_N3_TEST_CLI_BIN", b.cli.as_path()),
+                ("NEXUS_N3_TEST_DAEMON_BIN", b.daemon.as_path()),
+            ]
+        })
+        .unwrap_or_default();
+    let exec_map = test_executable_map(repo, &meta, budget)?;
+    let started = Instant::now();
+    let streams = run_bounded_streams(
+        &repo.root,
+        "cargo",
+        &["test", "--workspace", "--no-fail-fast"],
+        budget,
+        &envs,
+    );
+    let total_ms = started.elapsed().as_millis() as u64;
+    match streams.outcome {
+        BoundedOutcome::Exited(success) => Ok(parse_shared_output(
+            &streams.ordered_lines,
+            total_ms,
+            success,
+            &meta,
+            &exec_map,
+        )),
+        BoundedOutcome::TimedOut => {
+            let mut run =
+                parse_shared_output(&streams.ordered_lines, total_ms, false, &meta, &exec_map);
+            run.timed_out = true;
+            Ok(run)
+        }
+        BoundedOutcome::SpawnFailed(detail) => Err(detail),
+    }
+}
+
+pub fn shared_run_complete(run: &SharedTestRun, expected: &[(String, String)]) -> bool {
+    !run.timed_out
+        && expected.iter().all(|(package, target)| {
+            run.targets
+                .iter()
+                .any(|r| &r.package == package && &r.target == target)
+        })
+}
+
+pub fn derive_workspace_tests(run: &SharedTestRun) -> Gate {
+    let mut gate = if run.process_success && !run.timed_out {
+        Gate::ok(
+            "workspace-tests",
+            &format!("shared run passed ({} targets)", run.targets.len()),
+        )
+    } else {
+        Gate::fail(
+            "workspace-tests",
+            &format!(
+                "cargo test --workspace --no-fail-fast failed{}{}:\n{}",
+                if run.timed_out { " (timed out)" } else { "" },
+                "",
+                run.raw_tail
+            ),
+        )
+    };
+    gate.duration_ms = run.total_ms;
+    gate.timed_out = run.timed_out;
+    gate
+}
+
+pub fn derive_integration(run: &SharedTestRun, expected: &[(String, String)]) -> Gate {
+    let mut failures: Vec<String> = Vec::new();
+    let mut detail: Vec<String> = Vec::new();
+    let mut duration_ms = 0u64;
+    for (package, target) in expected {
+        match run
+            .targets
+            .iter()
+            .find(|r| &r.package == package && &r.target == target)
+        {
+            Some(result) => {
+                duration_ms += result.duration_ms;
+                if result.verdict != "PASS" {
+                    failures.push(format!("{package}::{target}: {}", result.detail));
+                }
+                detail.push(format!(
+                    "{package}::{target}: {} ({})",
+                    result.verdict, result.kind
+                ));
+            }
+            None => {
+                failures.push(format!("{package}::{target}: missing from shared run"));
+                detail.push(format!("{package}::{target}: MISSING"));
+            }
+        }
+    }
+    let mut gate = if failures.is_empty() {
+        Gate::ok("integration", &detail.join("\n"))
+    } else {
+        Gate::fail(
+            "integration",
+            &format!("{}\n{}", failures.join("\n"), detail.join("\n")),
+        )
+    };
+    gate.duration_ms = duration_ms;
+    gate.timed_out = run.timed_out;
+    gate
+}
+
+pub fn derive_concurrency(run: &SharedTestRun, expected_stems: &[String]) -> Gate {
+    let mut failures: Vec<String> = Vec::new();
+    let mut detail: Vec<String> = Vec::new();
+    let mut duration_ms = 0u64;
+    for stem in expected_stems {
+        match run.targets.iter().find(|r| &r.target == stem) {
+            Some(result) => {
+                duration_ms += result.duration_ms;
+                if result.verdict != "PASS" {
+                    failures.push(format!("{stem}: {}", result.detail));
+                }
+                detail.push(format!("{stem}: {}", result.verdict));
+            }
+            None => {
+                failures.push(format!("{stem}: missing from shared run"));
+                detail.push(format!("{stem}: MISSING"));
+            }
+        }
+    }
+    let mut gate = if failures.is_empty() {
+        Gate::ok("selected-concurrency", &detail.join("\n"))
+    } else {
+        Gate::fail(
+            "selected-concurrency",
+            &format!("{}\n{}", failures.join("\n"), detail.join("\n")),
+        )
+    };
+    gate.duration_ms = duration_ms;
+    gate.timed_out = run.timed_out;
+    gate
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SharedGateKind {
+    WorkspaceTests,
+    Integration,
+    SelectedConcurrency,
+}
+
+impl SharedGateKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            SharedGateKind::WorkspaceTests => "workspace-tests",
+            SharedGateKind::Integration => "integration",
+            SharedGateKind::SelectedConcurrency => "selected-concurrency",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum SharedTestState {
+    Unrun,
+    Completed(SharedTestRun),
+    FallbackRequired { reason: String },
+}
+
+pub struct SharedTestSession {
+    pub state: SharedTestState,
+}
+
+impl SharedTestSession {
+    pub fn new() -> SharedTestSession {
+        SharedTestSession {
+            state: SharedTestState::Unrun,
+        }
+    }
+    pub fn cached(&self) -> Option<&SharedTestRun> {
+        match &self.state {
+            SharedTestState::Completed(run) => Some(run),
+            _ => None,
+        }
+    }
+    pub fn fallback_reason(&self) -> Option<&str> {
+        match &self.state {
+            SharedTestState::FallbackRequired { reason } => Some(reason),
+            _ => None,
+        }
+    }
+    pub fn record_completed(&mut self, run: SharedTestRun) {
+        self.state = SharedTestState::Completed(run);
+    }
+    pub fn record_fallback(&mut self, reason: String) {
+        self.state = SharedTestState::FallbackRequired { reason };
+    }
+}
+
+fn derive_kind(
+    kind: SharedGateKind,
+    run: &SharedTestRun,
+    expected: &[(String, String)],
+    expected_stems: &[String],
+) -> Gate {
+    match kind {
+        SharedGateKind::WorkspaceTests => derive_workspace_tests(run),
+        SharedGateKind::Integration => derive_integration(run, expected),
+        SharedGateKind::SelectedConcurrency => derive_concurrency(run, expected_stems),
+    }
+}
+
+fn native_gate(kind: SharedGateKind, repo: &Repo, budget: GateBudget) -> Gate {
+    match kind {
+        SharedGateKind::WorkspaceTests => workspace_tests_gate(repo, budget),
+        SharedGateKind::Integration => integration_gate(repo, budget),
+        SharedGateKind::SelectedConcurrency => concurrency_gate(repo, budget),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shared_gate_with_runner(
+    session: &mut SharedTestSession,
+    kind: SharedGateKind,
+    repo: &Repo,
+    budget: GateBudget,
+    global: GateBudget,
+    expected: &[(String, String)],
+    expected_stems: &[String],
+    run: &mut dyn FnMut(&Repo, GateBudget) -> Result<SharedTestRun, String>,
+    native: &mut dyn FnMut(SharedGateKind, &Repo, GateBudget) -> Gate,
+) -> Gate {
+    let name = kind.name();
+    if global.expired() {
+        return Gate::blocked(name, "not run: full verify deadline exceeded");
+    }
+    loop {
+        if let Some(cached) = session.cached() {
+            let cached = cached.clone();
+            if shared_run_complete(&cached, expected) {
+                return derive_kind(kind, &cached, expected, expected_stems);
+            }
+            let reason = format!(
+                "incomplete: {}",
+                expected
+                    .iter()
+                    .find(|(package, target)| !cached
+                        .targets
+                        .iter()
+                        .any(|r| &r.package == package && &r.target == target))
+                    .map(|(p, t)| format!("{p}::{t}"))
+                    .unwrap_or_else(|| "unknown".to_string())
+            );
+            session.record_fallback(reason);
+            continue;
+        }
+        if let Some(fallback_reason) = session.fallback_reason().map(str::to_string) {
+            let mut gate = native(kind, repo, budget);
+            if gate.verdict != "PASS" {
+                gate.detail = format!("{} (fallback: {fallback_reason})", gate.detail);
+            }
+            return gate;
+        }
+        match run(repo, budget) {
+            Ok(shared) => {
+                if shared.timed_out && global.expired() {
+                    return Gate::blocked(name, "not run: full verify deadline exceeded");
+                }
+                if shared.timed_out {
+                    session.record_fallback("shared run timed out".to_string());
+                    continue;
+                }
+                if !shared_run_complete(&shared, expected) {
+                    let reason = format!(
+                        "incomplete: {}",
+                        expected
+                            .iter()
+                            .find(|(package, target)| !shared
+                                .targets
+                                .iter()
+                                .any(|r| &r.package == package && &r.target == target))
+                            .map(|(p, t)| format!("{p}::{t}"))
+                            .unwrap_or_else(|| "unknown".to_string())
+                    );
+                    session.record_fallback(reason);
+                    continue;
+                }
+                session.record_completed(shared.clone());
+                return derive_kind(kind, &shared, expected, expected_stems);
+            }
+            Err(reason) => {
+                session.record_fallback(format!("spawn failed: {reason}"));
+            }
+        }
+    }
+}
+
+pub fn shared_gate(
+    session: &mut SharedTestSession,
+    kind: SharedGateKind,
+    repo: &Repo,
+    budget: GateBudget,
+    global: GateBudget,
+) -> Gate {
+    let meta = match cargo_metadata() {
+        Ok(meta) => meta,
+        Err(e) => {
+            return Gate::unknown(kind.name(), &format!("cargo metadata failed: {e}"));
+        }
+    };
+    let expected = integration_targets(&meta);
+    let expected_stems: Vec<String> = rs_files_under(&repo.root.join("tests/concurrency"))
+        .iter()
+        .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+        .collect();
+    shared_gate_with_runner(
+        session,
+        kind,
+        repo,
+        budget,
+        global,
+        &expected,
+        &expected_stems,
+        &mut |r, b| run_shared_tests(r, b),
+        &mut |k, r, b| native_gate(k, r, b),
+    )
 }
 
 /// Bench gate: run the encrypted-dataplane performance benchmark (P3.6
@@ -2652,5 +3362,493 @@ mod tests {
             "{detail}"
         );
         assert!(detail.contains("skipped_no_features=49"), "{detail}");
+    }
+
+    type OrderedLines = Vec<(bool, String)>;
+    type ExecMap = std::collections::BTreeMap<String, (String, String)>;
+
+    fn sample_shared_output(
+        expected: &[(String, String)],
+        verdict: &str,
+    ) -> (OrderedLines, ExecMap) {
+        let mut lines: Vec<(bool, String)> = Vec::new();
+        let mut exec_map = std::collections::BTreeMap::new();
+        for (i, (package, target)) in expected.iter().enumerate() {
+            let hash = format!("{i:016x}");
+            let file = format!("{target}-{hash}");
+            exec_map.insert(file.clone(), (package.clone(), target.clone()));
+            lines.push((
+                true,
+                format!("     Running unittests src/lib.rs (target/debug/deps/{file})"),
+            ));
+            lines.push((
+                false,
+                format!(
+                    "test result: {verdict}. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s"
+                ),
+            ));
+        }
+        lines.push((true, "   Doc-tests nexus".to_string()));
+        lines.push((
+            false,
+            "test result: ok. 3 passed; 0 failed; finished in 9.99s".to_string(),
+        ));
+        (lines, exec_map)
+    }
+
+    fn synthetic_run(
+        targets: Vec<TestTargetResult>,
+        process_success: bool,
+        timed_out: bool,
+    ) -> SharedTestRun {
+        let total_ms = targets.iter().map(|t| t.duration_ms).sum::<u64>() + 10;
+        SharedTestRun {
+            targets,
+            total_ms,
+            timed_out,
+            process_success,
+            raw_tail: "tail".to_string(),
+        }
+    }
+
+    fn target_result(
+        package: &str,
+        target: &str,
+        verdict: &str,
+        duration_ms: u64,
+    ) -> TestTargetResult {
+        TestTargetResult {
+            package: package.to_string(),
+            target: target.to_string(),
+            kind: "test".to_string(),
+            verdict: verdict.to_string(),
+            duration_ms,
+            detail: "test result".to_string(),
+        }
+    }
+
+    fn two_expected() -> Vec<(String, String)> {
+        vec![
+            ("nexus".to_string(), "a".to_string()),
+            ("nexus".to_string(), "b".to_string()),
+        ]
+    }
+
+    #[test]
+    fn parse_shared_output_targets_and_durations() {
+        let meta = crate::env::cargo_metadata().expect("cargo metadata");
+        let expected = integration_targets(&meta);
+        assert_eq!(expected.len(), 25);
+        let (lines, exec_map) = sample_shared_output(&expected, "ok");
+        let run = parse_shared_output(&lines, 1234, true, &meta, &exec_map);
+        assert_eq!(
+            run.targets.len(),
+            25,
+            "duplicate target names must stay distinct"
+        );
+        assert_eq!(
+            run.targets
+                .iter()
+                .filter(|t| t.target == "dataplane_mock")
+                .count(),
+            2
+        );
+        for target in &run.targets {
+            assert_eq!(target.duration_ms, 250, "{}", target.target);
+            assert_eq!(target.verdict, "PASS");
+        }
+        assert_eq!(run.total_ms, 1234);
+        assert!(!run.timed_out);
+    }
+
+    #[test]
+    fn parse_shared_output_duplicate_last_wins() {
+        let meta = serde_json::json!({"workspace_members":["w"],"packages":[{"id":"w","name":"nexus","features":{},"targets":[{"name":"dup","kind":["test"]}]}]});
+        let lines = vec![
+            (
+                true,
+                "     Running tests/dup.rs (target/debug/deps/dup-0123456789abcdef)".to_string(),
+            ),
+            (
+                false,
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s".to_string(),
+            ),
+            (
+                true,
+                "     Running tests/dup.rs (target/debug/deps/dup-0123456789abcdef)".to_string(),
+            ),
+            (
+                false,
+                "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s".to_string(),
+            ),
+        ];
+        let empty = std::collections::BTreeMap::new();
+        let run = parse_shared_output(&lines, 100, false, &meta, &empty);
+        assert_eq!(run.targets.len(), 1);
+        assert_eq!(run.targets[0].verdict, "FAIL");
+        assert_eq!(run.targets[0].duration_ms, 200);
+        assert_eq!(run.targets[0].package, "nexus");
+    }
+
+    #[test]
+    fn shared_run_complete_requires_all_expected() {
+        let expected = two_expected();
+        let missing = synthetic_run(vec![target_result("nexus", "a", "PASS", 1)], true, false);
+        assert!(!shared_run_complete(&missing, &expected));
+        let complete = synthetic_run(
+            vec![
+                target_result("nexus", "a", "PASS", 1),
+                target_result("nexus", "b", "PASS", 1),
+            ],
+            true,
+            false,
+        );
+        assert!(shared_run_complete(&complete, &expected));
+        let timed_out = synthetic_run(complete.targets.clone(), false, true);
+        assert!(!shared_run_complete(&timed_out, &expected));
+    }
+
+    #[test]
+    fn derive_three_gates_verdicts() {
+        let expected = two_expected();
+        let stems = vec!["a".to_string(), "b".to_string()];
+        let all_pass = synthetic_run(
+            vec![
+                target_result("nexus", "a", "PASS", 100),
+                target_result("nexus", "b", "PASS", 50),
+            ],
+            true,
+            false,
+        );
+        assert_eq!(derive_workspace_tests(&all_pass).verdict, "PASS");
+        assert_eq!(derive_integration(&all_pass, &expected).verdict, "PASS");
+        assert_eq!(derive_concurrency(&all_pass, &stems).verdict, "PASS");
+
+        let one_fail = synthetic_run(
+            vec![
+                target_result("nexus", "a", "PASS", 100),
+                target_result("nexus", "b", "FAIL", 50),
+            ],
+            false,
+            false,
+        );
+        assert_eq!(derive_workspace_tests(&one_fail).verdict, "FAIL");
+        assert_eq!(derive_integration(&one_fail, &expected).verdict, "FAIL");
+        assert_eq!(derive_concurrency(&one_fail, &stems).verdict, "FAIL");
+        assert!(
+            derive_integration(&one_fail, &expected)
+                .detail
+                .contains("nexus::b: FAIL")
+        );
+    }
+
+    #[test]
+    fn derive_durations_are_subsets() {
+        let expected = two_expected();
+        let run = synthetic_run(
+            vec![
+                target_result("nexus", "a", "PASS", 100),
+                target_result("nexus", "b", "PASS", 50),
+            ],
+            true,
+            false,
+        );
+        let integration = derive_integration(&run, &expected);
+        let stems: Vec<String> = expected.iter().map(|(_, t)| t.clone()).collect();
+        let concurrency = derive_concurrency(&run, &stems);
+        assert_eq!(integration.duration_ms, 150);
+        assert_eq!(concurrency.duration_ms, 150);
+        assert!(integration.duration_ms <= run.total_ms);
+        assert!(concurrency.duration_ms <= run.total_ms);
+    }
+
+    #[test]
+    fn shared_gate_caches_completed() {
+        let expected = two_expected();
+        let stems = expected.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>();
+        let mut session = SharedTestSession::new();
+        let mut runs = 0usize;
+        let mut natives = 0usize;
+        let complete = synthetic_run(
+            vec![
+                target_result("nexus", "a", "PASS", 1),
+                target_result("nexus", "b", "PASS", 1),
+            ],
+            true,
+            false,
+        );
+        let first = shared_gate_with_runner(
+            &mut session,
+            SharedGateKind::WorkspaceTests,
+            &Repo {
+                root: std::env::temp_dir(),
+            },
+            GateBudget::unlimited(),
+            GateBudget::unlimited(),
+            &expected,
+            &stems,
+            &mut |_, _| {
+                runs += 1;
+                Ok(complete.clone())
+            },
+            &mut |_, _, _| {
+                natives += 1;
+                Gate::fail("native", "must not run")
+            },
+        );
+        assert_eq!(first.verdict, "PASS");
+        assert_eq!(runs, 1);
+        let second = shared_gate_with_runner(
+            &mut session,
+            SharedGateKind::Integration,
+            &Repo {
+                root: std::env::temp_dir(),
+            },
+            GateBudget::unlimited(),
+            GateBudget::unlimited(),
+            &expected,
+            &stems,
+            &mut |_, _| {
+                runs += 1;
+                Ok(complete.clone())
+            },
+            &mut |_, _, _| {
+                natives += 1;
+                Gate::fail("native", "must not run")
+            },
+        );
+        assert_eq!(second.verdict, "PASS");
+        assert_eq!(runs, 1, "completed run must be reused");
+        assert_eq!(natives, 0);
+    }
+
+    #[test]
+    fn shared_gate_falls_back_on_incomplete() {
+        let expected = two_expected();
+        let mut session = SharedTestSession::new();
+        let mut runs = 0usize;
+        let mut natives = 0usize;
+        let incomplete = synthetic_run(vec![target_result("nexus", "a", "PASS", 1)], true, false);
+        let gate = shared_gate_with_runner(
+            &mut session,
+            SharedGateKind::WorkspaceTests,
+            &Repo {
+                root: std::env::temp_dir(),
+            },
+            GateBudget::unlimited(),
+            GateBudget::unlimited(),
+            &expected,
+            &[],
+            &mut |_, _| {
+                runs += 1;
+                Ok(incomplete.clone())
+            },
+            &mut |_, _, _| {
+                natives += 1;
+                Gate::ok("workspace-tests", "native")
+            },
+        );
+        assert_eq!(gate.verdict, "PASS");
+        assert_eq!(runs, 1);
+        assert_eq!(natives, 1);
+        assert!(session.fallback_reason().unwrap().contains("incomplete"));
+        // 后续门不再触发共享执行。
+        let second = shared_gate_with_runner(
+            &mut session,
+            SharedGateKind::Integration,
+            &Repo {
+                root: std::env::temp_dir(),
+            },
+            GateBudget::unlimited(),
+            GateBudget::unlimited(),
+            &expected,
+            &[],
+            &mut |_, _| {
+                runs += 1;
+                Ok(incomplete.clone())
+            },
+            &mut |_, _, _| {
+                natives += 1;
+                Gate::ok("integration", "native")
+            },
+        );
+        assert_eq!(second.verdict, "PASS");
+        assert_eq!(runs, 1);
+        assert_eq!(natives, 2);
+    }
+
+    #[test]
+    fn shared_gate_falls_back_on_err() {
+        let expected = two_expected();
+        let mut session = SharedTestSession::new();
+        let mut natives = 0usize;
+        let gate = shared_gate_with_runner(
+            &mut session,
+            SharedGateKind::WorkspaceTests,
+            &Repo {
+                root: std::env::temp_dir(),
+            },
+            GateBudget::unlimited(),
+            GateBudget::unlimited(),
+            &expected,
+            &[],
+            &mut |_, _| Err("boom".to_string()),
+            &mut |_, _, _| {
+                natives += 1;
+                Gate::fail("workspace-tests", "native")
+            },
+        );
+        assert_eq!(gate.verdict, "FAIL");
+        assert_eq!(natives, 1);
+        assert!(session.fallback_reason().unwrap().contains("spawn failed"));
+    }
+
+    #[test]
+    fn shared_gate_timeout_global_blocks_not_fallback() {
+        let expected = two_expected();
+        let complete = synthetic_run(
+            vec![
+                target_result("nexus", "a", "PASS", 1),
+                target_result("nexus", "b", "PASS", 1),
+            ],
+            true,
+            false,
+        );
+        let mut session = SharedTestSession::new();
+        session.record_completed(complete.clone());
+        let mut runs = 0usize;
+        let mut natives = 0usize;
+        let global = GateBudget::from_limit(Some(std::time::Duration::from_millis(1)));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let gate = shared_gate_with_runner(
+            &mut session,
+            SharedGateKind::Integration,
+            &Repo {
+                root: std::env::temp_dir(),
+            },
+            GateBudget::unlimited(),
+            global,
+            &expected,
+            &[],
+            &mut |_, _| {
+                runs += 1;
+                Ok(complete.clone())
+            },
+            &mut |_, _, _| {
+                natives += 1;
+                Gate::ok("integration", "native")
+            },
+        );
+        assert_eq!(gate.verdict, "BLOCKED");
+        assert!(gate.skipped_by_deadline);
+        assert!(!gate.timed_out);
+        assert_eq!(runs, 0, "deadline must win over cached run");
+        assert_eq!(natives, 0, "no fallback after deadline");
+    }
+
+    #[test]
+    fn shared_gate_deadline_between_gates_blocks() {
+        let expected = two_expected();
+        let mut session = SharedTestSession::new();
+        let complete = synthetic_run(
+            vec![
+                target_result("nexus", "a", "PASS", 1),
+                target_result("nexus", "b", "PASS", 1),
+            ],
+            true,
+            false,
+        );
+        let first = shared_gate_with_runner(
+            &mut session,
+            SharedGateKind::WorkspaceTests,
+            &Repo {
+                root: std::env::temp_dir(),
+            },
+            GateBudget::unlimited(),
+            GateBudget::unlimited(),
+            &expected,
+            &[],
+            &mut |_, _| Ok(complete.clone()),
+            &mut |_, _, _| Gate::fail("native", "must not run"),
+        );
+        assert_eq!(first.verdict, "PASS");
+        let global = GateBudget::from_limit(Some(std::time::Duration::from_millis(1)));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second = shared_gate_with_runner(
+            &mut session,
+            SharedGateKind::Integration,
+            &Repo {
+                root: std::env::temp_dir(),
+            },
+            GateBudget::unlimited(),
+            global,
+            &expected,
+            &[],
+            &mut |_, _| panic!("must not run"),
+            &mut |_, _, _| panic!("must not run"),
+        );
+        assert_eq!(second.verdict, "BLOCKED");
+        assert!(second.skipped_by_deadline);
+    }
+
+    #[test]
+    fn shared_gate_reuses_same_budget_on_fallback() {
+        let expected = two_expected();
+        let mut session = SharedTestSession::new();
+        let budget = GateBudget::from_limit(Some(std::time::Duration::from_millis(1)));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let incomplete = synthetic_run(vec![target_result("nexus", "a", "PASS", 1)], true, false);
+        let mut native_saw_expired = false;
+        let gate = shared_gate_with_runner(
+            &mut session,
+            SharedGateKind::WorkspaceTests,
+            &Repo {
+                root: std::env::temp_dir(),
+            },
+            budget,
+            GateBudget::unlimited(),
+            &expected,
+            &[],
+            &mut |_, _| Ok(incomplete.clone()),
+            &mut |_, _, native_budget| {
+                native_saw_expired = native_budget.expired();
+                let mut g = Gate::fail(
+                    "workspace-tests",
+                    "gate 'workspace-tests' timed out after 0s",
+                );
+                g.timed_out = true;
+                g
+            },
+        );
+        assert!(native_saw_expired, "fallback must reuse the same budget");
+        assert_eq!(gate.verdict, "FAIL");
+        assert!(gate.timed_out);
+    }
+
+    #[test]
+    fn parse_shared_output_misalignment_is_incomplete() {
+        let meta = serde_json::json!({"workspace_members":["w"],"packages":[{"id":"w","name":"nexus","features":{},"targets":[{"name":"a","kind":["test"]},{"name":"b","kind":["test"]}]}]});
+        let lines = vec![
+            (
+                true,
+                "     Running tests/a.rs (target/debug/deps/a-0123456789abcdef)".to_string(),
+            ),
+            (
+                false,
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s".to_string(),
+            ),
+            (
+                true,
+                "     Running tests/b.rs (target/debug/deps/b-0123456789abcdef)".to_string(),
+            ),
+            // b 崩溃：该段没有 result → b 缺失（fail-closed），a 仍有效。
+        ];
+        let run = parse_shared_output(&lines, 100, true, &meta, &std::collections::BTreeMap::new());
+        assert_eq!(run.targets.len(), 1);
+        assert_eq!(run.targets[0].target, "a");
+        assert!(!shared_run_complete(
+            &run,
+            &[("nexus".to_string(), "b".to_string())]
+        ));
     }
 }
