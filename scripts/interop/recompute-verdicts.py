@@ -42,6 +42,21 @@ BLOCKING_CLASSES = {
 BANNED_WORDS = ["probably", "maybe", "待观察", "应该支持", "完全支持", "fully supported"]
 FAILURE_CELLS = {"BadCredential", "BadConfig"}
 
+PROTOCOL_ORDER = ["Vless", "Anytls", "Hysteria2", "Trojan", "Shadowsocks"]
+
+
+def truncate_notes(text, limit=220):
+    """按分隔符截断，避免把 class/classification 等关键令牌从词中间切断。"""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    for sep in ("; ", "；", ", ", "，", " "):
+        idx = cut.rfind(sep)
+        if idx > limit // 2:
+            cut = cut[:idx]
+            break
+    return cut.rstrip() + " …"
+
 
 class RecomputeError(RuntimeError):
     pass
@@ -344,27 +359,119 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial):
     lines.append("# 出站协议互操作证据总表（MATRIX）")
     lines.append("")
     lines.append("> 本文件由 `scripts/interop/recompute-verdicts.py` 从证据机械生成；人工零编辑。")
+    lines.append("> 修复顺序、依赖与复验口径见人工维护的 [NEXT-STEPS.md](NEXT-STEPS.md)。")
     lines.append("")
-    lines.append("| 项 | 值 |")
-    lines.append("|---|---|")
-    lines.append(f"| run | protocol-interop-verification |")
-    lines.append(f"| baseline | 0539169e8195944fcd183e7831e5d5ac746f3f40 |")
-    lines.append("| spec | frozen v1.1（sha256 23c7e4e797ee9edbf0eb645bfc20a7c97cfacb30e1a67bd8fee77ccbc527de4f） |")
-    lines.append(f"| sing-box | 1.13.16（{read_first(ref / 'sing-box-sha256.txt')}） |")
-    lines.append(f"| Xray | 26.10.21（{read_first(ref / 'xray-sha256.txt')}） |")
-    lines.append(f"| test window | {window} |")
     lines.append(
-        "| archive | "
-        + (", ".join(str(p) for p in archive) if archive else "（S30 归档后追加）")
-        + " |"
+        f"- run `protocol-interop-verification`；baseline `0539169e8195944fcd183e7831e5d5ac746f3f40`；"
+        f"spec frozen v1.1（sha256 `23c7e4e797ee9edbf0eb645bfc20a7c97cfacb30e1a67bd8fee77ccbc527de4f`）；"
+        f"test window `{window}`。"
+    )
+    lines.append(
+        f"- 参照实现：sing-box 1.13.16（sha256 `{read_first(ref / 'sing-box-sha256.txt').split()[0]}`）；"
+        f"Xray 26.10.21（sha256 `{read_first(ref / 'xray-sha256.txt').split()[0]}`）。"
+    )
+    lines.append(
+        "- archive（主机归档路径）："
+        + (", ".join(f"`{p}`" for p in archive) if archive else "（S30 归档后追加）")
+        + "。"
+    )
+    lines.append("")
+    lines.append("## 先读：范围 / 结论 / 图例")
+    lines.append("")
+    lines.append(
+        "- **覆盖**：5 个出站代理协议（VLESS、AnyTLS、Hysteria2、Trojan、Shadowsocks）"
+        "共 46 个证据格。TCP 成功型格走产品 SOCKS5 出口路径；`UdpEcho` 与 VLESS Vision "
+        "部分格为 crate 直调（`CrateDirect`），不代表产品入口可用。"
+    )
+    lines.append(
+        "- **不覆盖**：VMess（本轮暂缓）、direct/relay/socks5 出站、TUN/VPN、"
+        "Android 统一 VPN 入口、UI/诊断呈现。"
+    )
+    lines.append(
+        "- **本表不回答**：直连/中继回退是否可用（属 N1 整体结论）；也不把"
+        "「产品级 UDP 未实现」扩大成「Hy2 的 QUIC 出站传输不可用」（见产品级 UDP 节）。"
+    )
+    lines.append("- **结论 1**：五协议全部 `BROKEN / NOT_USABLE`，当前无任何协议可宣称可用。")
+    lines.append(
+        "- **结论 2**：阻断分属产品装配、跨协议传输、协议编解码、协议线格式与产品安全语义；"
+        "`root_cause_class` 只是规则代表类，不是完整根因。"
+    )
+    lines.append(
+        "- **结论 3**：AnyTLS 只差跨协议 T2；VLESS 是产品装配 bug；SS 是协议重写；"
+        "Hy2 是 QPACK 编解码；Trojan 是安全语义 + 共性 T2。"
+    )
+    lines.append(
+        "- **结论 4**：即使修复完成，Trojan/SS 因本 run `UdpEcho` 固定 `NOT_IMPLEMENTED`，"
+        "上限仍为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（spec E1 规则 6/R11）。"
+    )
+    lines.append(
+        "- **结论 5**：五协议当前均可在产品配置面选择，且无「实验性/未验证」标注；"
+        "是否继续暴露由产品负责人决定（本 run 不改产品代码）。"
+    )
+    lines.append(
+        "- **优先级**：① P0 安全止血（文档/配置面，0 代码）先公开并限制 Trojan fallback；"
+        "② P1 transport 批量写（唯一一格修多协议，预期 AnyTLS 首先可用）；"
+        "③ P2 VLESS fix 合入复验 → Hy2 QPACK Huffman → SS SIP004 AEAD → Trojan fallback "
+        "完整语义（依赖/成本/复验口径见 [NEXT-STEPS.md](NEXT-STEPS.md)）。"
+    )
+    lines.append(
+        "- **字段**：`verdict` = `VERIFIED`（规则 8，全 required PASS）/ `PARTIAL`"
+        "（规则 3–7/9，非阻断缺口）/ `BROKEN`（规则 1/2，阻断性 Nexus 失败）；"
+        "`scope` = `PROTOCOL_SUBSET` / `FULL` / `TCP_ONLY`；`claim` = `USABLE` / "
+        "`USABLE_WITH_GAPS` / `NOT_USABLE` / `NOT_CLAIMED`；`carrier` = `ProductSocks5`"
+        "（产品 SOCKS5 出口路径）/ `CrateDirect`（crate 直调，非产品入口）。"
+    )
+    lines.append(
+        "- **规则 1**：失败格（BadCredential/BadConfig）判 FAIL 且表现为有效 echo/静默成功"
+        "（`E_NEXUS_FRAMING`）或挂死（`E_TIMEOUT_HANG`）→ `BROKEN`。"
+    )
+    lines.append(
+        "- **规则 2**：任一 required 格 FAIL 且 class 属 `E_NEXUS_*` / `E_TIMEOUT_HANG` → `BROKEN`。"
+    )
+    lines.append(
+        "- **错误类**：`E_NEXUS_*` = Nexus 侧失败（握手/线格式、认证编码、帧/静默成功、"
+        "传输、UDP、编解码、未实现），判 FAIL；`E_TIMEOUT_HANG` = 挂死/超时，判 FAIL；"
+        "`E_EXPECTED_*` = 预期认证/配置拒绝，负向格判 PASS；`E_REF_*` / `E_NETWORK_ENV` / "
+        "`E_TOOL_BUG` / `E_EVIDENCE_GAP` = 参照端/环境/证据缺口，判 BLOCKED"
+        "（`E_REF_LIMITATION` 判 FAIL，须带 `ref_source`/`ref_version`）。"
+    )
+    lines.append(
+        "- **Xray**：26.10.21 仅用于 VLESS Vision 争议裁决，本轮未触发；"
+        "五协议结论全部来自 sing-box 1.13.16 参照。"
+    )
+    lines.append("")
+    lines.append("## ⚠ 安全警示：Trojan fallback fail-open")
+    lines.append("")
+    lines.append(
+        "- **触发条件**：Trojan 密码错误、服务端被劫持，或服务端配置了 fallback"
+        "（本 run 参照端 fallback → HTTP 404）。"
+    )
+    lines.append(
+        "- **用户所见**：SOCKS5 CONNECT 已回 success，服务端 fallback 的 HTTP 响应被当作"
+        "隧道数据交给应用（404 页面内容），用户误以为代理成功。"
+    )
+    lines.append(
+        "- **白皮书映射**：违背 §6.2「路径失效时按配置阻断或回退，并向用户显示实际行为」"
+        "与 §16.1 N1「失败与恢复可观察」。"
+    )
+    lines.append(
+        "- **当前临时缓解（仅文档层）**：把含 fallback 的 Trojan 出站视为实验性/不安全；"
+        "产品负责人决定是否默认禁用。本 run 不改产品代码。"
+    )
+    lines.append(
+        "- **完整修复成本**：延迟 SOCKS5 success 至上游就绪或等价 fail-closed 方案，"
+        ">400 行 / >2 人日，触及 `proxy_serve_once` 全部出站路径，应另立 run。"
+    )
+    lines.append(
+        "- **证据**：`TrojanFallback/BadCredential`（FAIL，`E_NEXUS_FRAMING`），"
+        "根因见 [fix/trojan/root-cause.md](fix/trojan/root-cause.md)。"
     )
     lines.append("")
     lines.append("## 协议 verdict（按 spec E1 复算）")
     lines.append("")
     lines.append("| 协议 | verdict | scope | claim | root_cause_class | missing_cells | 命中规则 |")
     lines.append("|---|---|---|---|---|---|---|")
-    order = ["Vless", "Anytls", "Hysteria2", "Trojan", "Shadowsocks"]
-    for proto in order:
+    for proto in PROTOCOL_ORDER:
         v = verdicts.get(proto)
         if not v:
             lines.append(f"| {proto} | NOT_RUN | — | NOT_CLAIMED | — | — | allow-partial |")
@@ -375,18 +482,84 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial):
             f"{v['root_cause_class']} | {missing} | {v['rule']} |"
         )
     lines.append("")
-    for proto in order:
+    lines.append("## 阻塞层、归属与修复后上限")
+    lines.append("")
+    lines.append(
+        "`root_cause_class` 是 E1 首个命中规则所取的**代表类**，不是完整根因；"
+        "下表按 fix 根因文档给出直接阻塞层与归属，不改变上表 verdict。"
+    )
+    lines.append("")
+    lines.append(
+        "| 协议 | 直接阻塞层 | 归属 | 剩余阻塞格（相对可用） | 单协议可解？ | 修复后本 run schema 上限 |"
+    )
+    lines.append("|---|---|---|---|---|---|")
+    lines.append(
+        "| VLESS | 产品装配（eager read）+ 跨协议 T2 | 产品装配 bug + 跨协议数据面共性缺陷 | "
+        "H/T1/L/R 由 fix 解决；T2 需 transport | 否，依赖 transport | "
+        "`VERIFIED / PROTOCOL_SUBSET`（Vision 仅 crate 级，产品 splice 未实现） |"
+    )
+    lines.append(
+        "| AnyTLS | 跨协议 T2 | 跨协议数据面共性缺陷 | 仅 T2 | 是（transport 一处） | "
+        "`VERIFIED / FULL` |"
+    )
+    lines.append(
+        "| Hysteria2 | 认证响应 QPACK Huffman + T2 | 协议编解码实现错误 + 跨协议数据面共性缺陷 | "
+        "Handshake/Handshake[Hy2Salamander]/TcpSmall/TcpThroughput/LongLived/Reconnect/UdpEcho/"
+        "BadCredential 共 8 格 | 否，依赖 transport | `VERIFIED / FULL` |"
+    )
+    lines.append(
+        "| Trojan | fallback 静默接受 + T2 | 产品安全语义 + 跨协议数据面共性缺陷 | "
+        "fallback + T2；U 固定未实现 | 否，依赖 transport + fallback 架构 | "
+        "本 run 最高 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（U 未实现，规则 6） |"
+    )
+    lines.append(
+        "| Shadowsocks | 线格式/SIP004 AEAD + T2 | 协议实现错误 + 跨协议数据面共性缺陷 | "
+        "H/T1/T2/L/R；U 固定未实现 | 否，依赖 transport | "
+        "本 run 最高 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（U 未实现，规则 6） |"
+    )
+    lines.append("")
+    lines.append(
+        "**参照端生态**：本轮未发现参照端生态缺陷——sing-box 1.13.16 的行为符合规范；"
+        "Xray 26.10.21 仅用于 Vision 争议裁决，本轮未触发。五协议 verdict 均无 "
+        "`E_REF_*` 根因。"
+    )
+    lines.append("")
+    for proto in PROTOCOL_ORDER:
         proto_rows = [r for r in rows if r["protocol"] == proto]
         if not proto_rows:
             continue
         lines.append(f"## {proto}")
         lines.append("")
-        lines.append("| Cell | 状态 | carrier | scope | evidence_id | 关键数字/错误 | 证据路径 | notes |")
-        lines.append("|---|---|---|---|---|---|---|---|")
+        v = verdicts.get(proto)
+        if v:
+            lines.append(
+                f"> **verdict={v['verdict']} / claim={v['claim']}**"
+                f"（scope={v['scope']}，root_cause_class={v['root_cause_class']}）"
+            )
+        else:
+            lines.append("> **verdict=NOT_RUN / claim=NOT_CLAIMED**（allow-partial）")
+        lines.append(">")
+        lines.append(
+            "> 本节任一 PASS 不改变协议 verdict；单格 PASS 只在所列 carrier/scope 下成立。"
+        )
+        if proto == "Vless":
+            lines.append(
+                "> VlessVision 行为 crate 级证据，产品 Vision splice 未实现。"
+            )
+        if proto == "Anytls":
+            lines.append("> PaddingDiag 为诊断格，不参与 verdict。")
+        if proto == "Hysteria2":
+            lines.append("> QpackDiag 为诊断格，不参与 verdict。")
+        lines.append("")
+        lines.append(
+            "| Cell | 状态 | carrier | scope | evidence_id | class | 关键数字 | 证据路径 | notes |"
+        )
+        lines.append("|---|---|---|---|---|---|---|---|---|")
         for r in proto_rows:
             if not r["present"]:
                 lines.append(
-                    f"| {r['variant']}/{r['cell']} | MISSING | — | — | — | 缺格 | — | E_EVIDENCE_GAP |"
+                    f"| {r['variant']}/{r['cell']} | MISSING | — | — | — | E_EVIDENCE_GAP | "
+                    f"缺格 | — | 证据缺口，不参与 verdict |"
                 )
                 continue
             ev = r["evidence"]
@@ -401,20 +574,29 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial):
                 detail = f"reconnects={m.get('reconnects_ok', 0)}"
             else:
                 detail = f"up={m.get('bytes_up', 0)}B down={m.get('bytes_down', 0)}B"
-            err = r["class"] or ""
-            notes = "; ".join(ev.get("notes", []))[:220].replace("|", "/")
-            if (
-                proto in ("Vless", "Shadowsocks")
-                and r["cell"] in FAILURE_CELLS
-                and r["status"] == "PASS"
-            ):
-                qualifier = (
-                    "限定：正向路径不通时本格仅证明无静默成功，不独立证明认证拒绝语义"
-                )
-                notes = f"{notes}; {qualifier}" if notes else qualifier
+            err = r["class"] or "NONE"
+            notes = truncate_notes("; ".join(ev.get("notes", [])).replace("|", "/"))
+            qualifiers = []
+            if r.get("diag"):
+                qualifiers.append("诊断格，不参与 verdict")
+            if proto == "Vless" and r["variant"] == "VlessVision":
+                qualifiers.append("crate 级，产品 splice 未实现")
+            if r["cell"] in FAILURE_CELLS and r["status"] == "PASS":
+                if proto in ("Vless", "Shadowsocks"):
+                    qualifiers.append(
+                        "限定：正向路径不通时本格仅证明无静默成功，不独立证明认证拒绝语义"
+                    )
+                elif proto == "Hysteria2":
+                    qualifiers.append(
+                        "限定：正向路径被 CODEC 阻断时本格 PASS 仅证明无静默成功，"
+                        "不独立证明配置拒绝语义"
+                    )
+            if qualifiers:
+                joined = "；".join(qualifiers)
+                notes = f"{notes}; {joined}" if notes else joined
             lines.append(
                 f"| {r['variant']}/{r['cell']} | {r['status']} | {ev.get('carrier')} | "
-                f"{ev.get('scope')} | {ev.get('evidence_id')} | {detail} {err} | "
+                f"{ev.get('scope')} | {ev.get('evidence_id')} | {err} | {detail} | "
                 f"{r['evidence_path']} | {notes} |"
             )
         lines.append("")
@@ -426,12 +608,25 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial):
         "不进入五协议 verdict；crate 级 UDP 结论见各协议 `UdpEcho` 行。"
     )
     lines.append("")
+    lines.append(
+        "**区分**：本项指产品 SOCKS5 UDP relay 入口/出站帧路径缺失，"
+        "不等于所有 UDP/QUIC 路径不可用——Hy2 出站到代理服务器仍走 QUIC/UDP 传输，"
+        "其失败点是认证响应编解码（`E_NEXUS_CODEC`），不是 UDP 传输本身。"
+    )
+    lines.append("")
     lines.append("## 产品能力缺口")
     lines.append("")
     lines.append("- 产品级 UDP：未实现（上节）。")
     lines.append("- Vision：产品路径只编码 addon，不实现 splice；本 run 的 Vision 结论来自 crate 直调。")
     lines.append("- Hysteria2：端口跳跃/Brutal/gecko/分片不在范围。")
     lines.append("- AnyTLS：session 池/心跳定时器/padding 写路径不单独验。")
+    lines.append(
+        "- Trojan fallback fail-open（安全语义）：错凭据/被劫持/服务端 fallback 时，"
+        "SOCKS5 仍回 success，fallback 的 HTTP 内容被当隧道数据。"
+    )
+    lines.append(
+        "- 代理失败可观察性：上述场景下产品不显示实际行为，不满足白皮书 §6.2/§16.1。"
+    )
     lines.append("")
     lines.append("## fix 支线与复验")
     lines.append("")
@@ -439,7 +634,14 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial):
     if fix_dir.exists():
         for root in sorted(fix_dir.glob("*/root-cause.md")):
             title = root.read_text(encoding="utf-8").splitlines()[0].lstrip("# ").strip()
-            lines.append(f"- `fix/{root.parent.name}/root-cause.md`：{title}")
+            repo_path = f"docs/protocols/interop/fix/{root.parent.name}/root-cause.md"
+            lines.append(f"- [`{repo_path}`](fix/{root.parent.name}/root-cause.md)：{title}")
+        lines.append("")
+        lines.append(
+            "根因文档内的 `evidence/...` 路径相对主机证据根 "
+            "`$RUN_DIR=/work/interop-run/protocol-interop-verification`（非仓库内路径）；"
+            "仓库内可打开的是根因文档本身。spec 原文不在仓库，规则 1/2 的判定摘要见顶部「先读」。"
+        )
         reverify = fix_dir / "vless/reverify-run/evidence"
         if reverify.exists():
             lines.append("")
@@ -450,8 +652,9 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial):
                 lines.append(f"| {ev['cell']} | {normalize_status(ev['verdict'])} | {ev['evidence_id']} |")
             lines.append("")
             lines.append(
-                "复验基于 fix 分支 `fix/protocol-interop-vless-lazy-response`，独立 review 未完成前"
-                "不改变上表 verdict（上表只用 verify 分支基线证据）。"
+                "复验基于 fix 分支 `fix/protocol-interop-vless-lazy-response`；review 与 re-verify "
+                "已完成（R-01 PASS）。合入与 verdict 更新待 fix 流程另行裁决；即使合入，"
+                "T2 仍受 transport 阻塞——上表 verdict 只用 verify 分支基线证据。"
             )
     else:
         lines.append("- （无）")
