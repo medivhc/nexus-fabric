@@ -1836,6 +1836,28 @@ password=\"p\"\n\
     const TUN_PROXY_YAML: &str = "schema_version: 1\ninbounds:\n  - tag: t\n    kind: tun\n    sessions: enabled\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
 
     #[test]
+    fn load_exposes_flow_sessions_and_tun_surfaces() {
+        let d = std::env::temp_dir().join("nexusd-cfg-test-expose-surfaces");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        write(
+            &d,
+            DAEMON_TOML,
+            "[tun]\ndefault_route = true\nexclude_server_routes = false\n[flow_sessions]\nenabled = \"auto\"\nidle_timeout_secs = 120\n",
+        );
+        let dir = ConfigDir::new(&d).unwrap();
+        let cfg = load(&dir).unwrap();
+        assert!(cfg.daemon.tun.default_route);
+        assert!(!cfg.daemon.tun.exclude_server_routes);
+        assert_eq!(
+            cfg.daemon.flow_sessions.enabled,
+            Some(nexus_proxy_config::FlowSessionsMode::Auto)
+        );
+        assert_eq!(cfg.daemon.flow_sessions.idle_timeout_secs, Some(120));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn flow_sessions_defaults_when_absent() {
         let cfg = parse_daemon_toml("[localapi]\naddr = \"127.0.0.1:18080\"\n").unwrap();
         assert_eq!(cfg.flow_sessions, FlowSessionsSection::default());
