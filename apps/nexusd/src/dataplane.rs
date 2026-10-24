@@ -29,12 +29,13 @@ use nexus_path::{CandidatePath, PathConfig, PathManager};
 use nexus_projection::TunDevice;
 use nexus_projection::classifier::DropReason;
 use nexus_projection::classifier::{Classification, PacketClassifier};
-use nexus_projection::egress::{Rule, SimpleRuleEngine};
+use nexus_projection::egress::{EgressNat, RealUdpEgress, Rule, SimpleRuleEngine};
 use nexus_projection::routing::Cidr;
 use nexus_projection::tcp::{
     FourTuple, STREAM_FIN, STREAM_RST, STREAM_SYN, TcpEvent, TcpTermStats, TcpTerminator,
     decode_stream_frame, encode_stream_frame, encode_syn_payload,
 };
+use nexus_projection::transparent::direct::{DirectEgressConfig, DirectTcpEvent, DirectTcpRelay};
 use nexus_proxy_config::FlowSessionsMode;
 
 mod chain_wiring;
@@ -70,6 +71,10 @@ pub struct DataplaneStats {
     pub proxy_tcp_streams: u64,
     /// Proxy 分类的应用字节数（GAP-1 前只计数）。
     pub proxy_tcp_bytes: u64,
+    /// Direct 不支持协议丢弃（ICMP/分片/非 TCP-UDP）。
+    pub direct_dropped_unsupported: u64,
+    /// Direct UDP 真实发送数。
+    pub direct_udp_sent: u64,
 }
 
 /// S4: 终结流记录（事件分发用）。
@@ -211,6 +216,10 @@ pub struct Dataplane {
     production_chain_deps: Option<ProductionChainDeps>,
     /// 流会话状态（state/reason/providers；LocalAPI 读）。
     flow_sessions: FlowSessionsState,
+    /// Direct TCP 中继（§9.10.1：终结器归 Dataplane，中继只持真实 socket）。
+    direct_tcp: DirectTcpRelay,
+    /// Direct UDP 真实出口（共享 NAT 语义，不复制 NAT 表）。
+    direct_udp: Option<RealUdpEgress>,
 }
 
 /// 流会话可见状态（spec §9.16 / §11.3）。
@@ -322,6 +331,8 @@ impl Dataplane {
             ),
             production_chain_deps: None,
             flow_sessions: FlowSessionsState::default(),
+            direct_tcp: DirectTcpRelay::new(DirectEgressConfig::default()),
+            direct_udp: RealUdpEgress::new(Arc::new(Mutex::new(EgressNat::default()))).ok(),
         })
     }
 
@@ -723,13 +734,123 @@ impl Dataplane {
                 }
             }
             Classification::Direct => {
-                self.with_stats(|s| s.direct_forwarded += 1);
+                self.handle_direct(&packet);
             }
             Classification::Drop { .. } => {
                 self.with_stats(|s| s.dropped += 1);
             }
         }
         Ok(true)
+    }
+
+    /// Direct 真转发（spec §9.9 / AC-G6-01..03）。
+    ///
+    /// - TCP：Dataplane 终结器 + `DirectTcpRelay`（同一终结器实例，§9.10.1）；
+    /// - UDP：`RealUdpEgress` 真实发送，回包由 `drain_direct_replies` 写回；
+    /// - ICMP/分片/非 TCP-UDP：计数 `direct_dropped_unsupported`，不 forwarding。
+    fn handle_direct(&mut self, packet: &[u8]) {
+        if packet.len() < 20 {
+            self.with_stats(|s| s.direct_dropped_unsupported += 1);
+            return;
+        }
+        // 分片包（MF 或 fragment offset != 0）不支持。
+        let frag = u16::from_be_bytes([packet[6], packet[7]]);
+        if frag & 0x3fff != 0 {
+            self.with_stats(|s| s.direct_dropped_unsupported += 1);
+            return;
+        }
+        match packet[9] {
+            6 => self.handle_direct_tcp(packet),
+            17 => {
+                if let Some(egress) = self.direct_udp.as_ref() {
+                    if egress.send(packet, "self") {
+                        self.with_stats(|s| {
+                            s.direct_forwarded += 1;
+                            s.direct_udp_sent += 1;
+                        });
+                    } else {
+                        self.with_stats(|s| s.dropped += 1);
+                    }
+                } else {
+                    self.with_stats(|s| s.dropped += 1);
+                }
+            }
+            _ => self.with_stats(|s| s.direct_dropped_unsupported += 1),
+        }
+    }
+
+    fn handle_direct_tcp(&mut self, packet: &[u8]) {
+        let mut out = self.tcp.handle_uplink(packet, "direct");
+        for event in self.tcp.poll() {
+            match event {
+                TcpEvent::Syn { stream_id, dst, .. } => {
+                    if self.direct_tcp.open(stream_id, dst).is_err() {
+                        out.extend(self.tcp.handle_fabric_rst(stream_id));
+                    }
+                }
+                TcpEvent::Data {
+                    stream_id, bytes, ..
+                } => {
+                    let _ = self.direct_tcp.write(stream_id, &bytes);
+                }
+                TcpEvent::Closed {
+                    stream_id, reset, ..
+                } => self.direct_tcp.close(stream_id, reset),
+                TcpEvent::TunPacket(pkt) => out.push(pkt),
+            }
+        }
+        // Direct 下行 → 注入 Dataplane 终结器 → TUN。
+        for event in self.direct_tcp.poll() {
+            match event {
+                DirectTcpEvent::Data { stream_id, bytes } => {
+                    out.extend(self.tcp.handle_fabric_data(stream_id, &bytes));
+                }
+                DirectTcpEvent::Closed { stream_id, reset } => {
+                    if reset {
+                        out.extend(self.tcp.handle_fabric_rst(stream_id));
+                    } else {
+                        out.extend(self.tcp.handle_fabric_fin(stream_id));
+                    }
+                }
+                DirectTcpEvent::Failed { stream_id, error } => {
+                    let _ = error;
+                    out.extend(self.tcp.handle_fabric_rst(stream_id));
+                }
+            }
+        }
+        let mut wrote = 0u64;
+        for pkt in out {
+            if self.tun.write(&pkt).is_ok() {
+                wrote += 1;
+            }
+        }
+        self.with_stats(|s| {
+            s.tun_written += wrote;
+            if wrote > 0 {
+                s.direct_forwarded += 1;
+            }
+        });
+    }
+
+    /// 把 Direct UDP 回包写回 TUN；返回写入数。
+    pub fn drain_direct_replies(&mut self) -> usize {
+        let Some(egress) = self.direct_udp.as_ref() else {
+            return 0;
+        };
+        let mut replies = Vec::new();
+        while let Some((pkt, _peer)) = egress.recv_reply() {
+            replies.push(pkt);
+        }
+        let mut wrote = 0;
+        for pkt in replies {
+            if self.tun.write(&pkt).is_ok() {
+                wrote += 1;
+            }
+        }
+        if wrote > 0 {
+            self.with_stats(|s| s.tun_written += wrote as u64);
+        }
+        wrote
     }
 
     /// D4 QoS 准入检查（S1 复用：终结路径同样先整形）。
@@ -2028,6 +2149,71 @@ mod tests {
         let dropped_before = dp.stats().dropped;
         dp.inject_stream_frame_from_n1("x", &[0x00, 0x01]);
         assert_eq!(dp.stats().dropped, dropped_before + 1);
+    }
+
+    /// S27：Direct UDP 真实往返 + ICMP 不支持计数。
+    #[test]
+    fn direct_forwarding_udp_and_unsupported() {
+        use std::net::UdpSocket;
+
+        let server = UdpSocket::bind(("127.0.0.1", 0)).expect("bind");
+        let server_addr = server.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            if let Ok((n, from)) = server.recv_from(&mut buf) {
+                let _ = server.send_to(&buf[..n], from);
+            }
+        });
+
+        let mock = Arc::new(Mutex::new(nexus_projection::MockTun::new("test0")));
+        let tun = Box::new(SharedTun {
+            inner: Arc::clone(&mock),
+        });
+        let config = DataplaneConfig {
+            bypass_cidrs: vec!["127.0.0.0/8".to_string()],
+            ..Default::default()
+        };
+        let mut dp = Dataplane::new(tun, config).expect("dataplane new");
+        let dst = match server_addr {
+            std::net::SocketAddr::V4(v4) => [
+                v4.ip().octets()[0],
+                v4.ip().octets()[1],
+                v4.ip().octets()[2],
+                v4.ip().octets()[3],
+            ],
+            std::net::SocketAddr::V6(_) => panic!("v4"),
+        };
+        let port = server_addr.port();
+        let pkt = craft_udp([10, 0, 0, 2], dst, 40000, port, b"echo");
+        mock.lock().unwrap().inject(pkt);
+        assert!(dp.process_one().expect("udp"));
+        assert_eq!(dp.stats().direct_udp_sent, 1);
+        assert_eq!(dp.stats().direct_forwarded, 1);
+
+        let mut replied = 0;
+        for _ in 0..2_000 {
+            replied += dp.drain_direct_replies();
+            if replied > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(replied, 1, "Direct UDP reply must be written back to TUN");
+        assert_eq!(dp.stats().direct_dropped_unsupported, 0);
+        handle.join().unwrap();
+
+        // ICMP（proto=1）→ 不支持，direct_forwarded 不增。
+        let before = dp.stats().direct_forwarded;
+        let mut icmp = craft_udp([10, 0, 0, 2], dst, 0, 0, &[]);
+        icmp[9] = 1;
+        mock.lock().unwrap().inject(icmp);
+        assert!(dp.process_one().expect("icmp"));
+        assert_eq!(dp.stats().direct_dropped_unsupported, 1);
+        assert_eq!(
+            dp.stats().direct_forwarded,
+            before,
+            "unsupported must not count as forwarded"
+        );
     }
 
     /// S25：enabled / auto+provider / auto-no-provider / disabled 四分支。
