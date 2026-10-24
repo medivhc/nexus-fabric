@@ -17,6 +17,9 @@
 
 use std::collections::BTreeSet;
 
+/// TPROXY 透明入站默认监听地址（spec §11.1 冻结端口 7895）。
+pub const TPROXY_DEFAULT_LISTEN: &str = "0.0.0.0:7895";
+
 // ---------------------------------------------------------------------------
 // 结构化配置错误（不以日志文本代替错误类型，MODULE.md Outputs）
 // ---------------------------------------------------------------------------
@@ -73,14 +76,58 @@ pub struct ProxyConfig {
     pub rule_providers: Vec<RuleProviderConfig>,
 }
 
+/// 入站协议类型（显式代理与透明入站）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundKind {
+    /// SOCKS5 显式代理入口。
+    Socks5,
+    /// SOCKS5/HTTP 混合显式代理入口。
+    Mixed,
+    /// TUN 透明入站（系统级接管）。
+    Tun,
+    /// TPROXY 透明入站（Linux 捕获前端）。
+    Tproxy,
+}
+
+impl InboundKind {
+    /// 解析 YAML 的 `kind` 取值；未知值结构化报错。
+    ///
+    /// # Errors
+    ///
+    /// 返回 `CONFIG_INVALID [kind]`，调用方负责补全 `inbounds[i]` 字段路径。
+    pub fn parse(s: &str) -> Result<Self, ConfigError> {
+        match s {
+            "socks5" => Ok(Self::Socks5),
+            "mixed" => Ok(Self::Mixed),
+            "tun" => Ok(Self::Tun),
+            "tproxy" => Ok(Self::Tproxy),
+            other => Err(ConfigError::new(
+                "kind",
+                format!("unknown inbound kind '{other}' (supports socks5/mixed/tun/tproxy)"),
+            )),
+        }
+    }
+
+    /// 稳定的机器可读标签（与配置取值一致）。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Socks5 => "socks5",
+            Self::Mixed => "mixed",
+            Self::Tun => "tun",
+            Self::Tproxy => "tproxy",
+        }
+    }
+}
+
 /// 入站监听配置。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundConfig {
     /// 入站标识。
     pub tag: String,
-    /// 入站协议（P0 仅 `"socks5"`）。
-    pub kind: String,
-    /// 监听地址（host:port）。
+    /// 入站协议。
+    pub kind: InboundKind,
+    /// 监听地址（host:port；tun 不使用，tproxy 缺省 `0.0.0.0:7895`）。
     pub listen: String,
 }
 
@@ -980,14 +1027,19 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
         for (i, item) in seq.iter().enumerate() {
             let field = format!("inbounds[{i}]");
             let tag = req_str(item, "tag", &field)?.to_string();
-            let kind = req_str(item, "kind", &field)?.to_string();
-            if kind != "socks5" && kind != "mixed" {
-                return Err(ConfigError::new(
-                    format!("{field}.kind"),
-                    format!("supports 'socks5' or 'mixed', got '{kind}'"),
-                ));
-            }
-            let listen = req_str(item, "listen", &field)?.to_string();
+            let kind_s = req_str(item, "kind", &field)?;
+            let kind = InboundKind::parse(kind_s).map_err(|mut e| {
+                e.field = format!("{field}.kind");
+                e
+            })?;
+            let listen = match kind {
+                InboundKind::Socks5 | InboundKind::Mixed => {
+                    req_str(item, "listen", &field)?.to_string()
+                }
+                InboundKind::Tun => opt_str(item, "listen").unwrap_or_default(),
+                InboundKind::Tproxy => opt_str(item, "listen")
+                    .unwrap_or_else(|| crate::TPROXY_DEFAULT_LISTEN.to_string()),
+            };
             inbounds.push(InboundConfig { tag, kind, listen });
         }
     }
@@ -2356,5 +2408,43 @@ mod warn5_obfs_validation_tests {
         assert!(parse(&hy2_yaml("none")).is_ok());
         // 空串同样表示无混淆（Obfs::parse: "" | "none" => None）。
         assert!(parse(&hy2_yaml("")).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod inbound_kind_tests {
+    use super::*;
+
+    #[test]
+    fn inbound_kind_as_str_roundtrip() {
+        for (raw, kind) in [
+            ("socks5", InboundKind::Socks5),
+            ("mixed", InboundKind::Mixed),
+            ("tun", InboundKind::Tun),
+            ("tproxy", InboundKind::Tproxy),
+        ] {
+            assert_eq!(InboundKind::parse(raw).unwrap(), kind);
+            assert_eq!(kind.as_str(), raw);
+        }
+    }
+
+    #[test]
+    fn unknown_inbound_kind_is_structured() {
+        let yaml = "schema_version: 1\ninbounds:\n  - tag: in\n    kind: wireguard\n    listen: 127.0.0.1:1080\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
+        let err = parse(yaml).expect_err("unknown kind must fail");
+        assert_eq!(err.field, "inbounds[0].kind");
+        assert!(err.reason.contains("wireguard"), "got: {}", err.reason);
+    }
+
+    #[test]
+    fn explicit_inbound_kinds_parse() {
+        let yaml = "schema_version: 1\ninbounds:\n  - tag: a\n    kind: socks5\n    listen: 127.0.0.1:1080\n  - tag: b\n    kind: mixed\n    listen: 127.0.0.1:1081\n  - tag: c\n    kind: tun\n  - tag: e\n    kind: tproxy\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
+        let cfg = parse(yaml).expect("valid config");
+        assert_eq!(cfg.inbounds[0].kind, InboundKind::Socks5);
+        assert_eq!(cfg.inbounds[1].kind, InboundKind::Mixed);
+        assert_eq!(cfg.inbounds[2].kind, InboundKind::Tun);
+        assert_eq!(cfg.inbounds[3].kind, InboundKind::Tproxy);
+        assert_eq!(cfg.inbounds[2].listen, "");
+        assert_eq!(cfg.inbounds[3].listen, TPROXY_DEFAULT_LISTEN);
     }
 }
