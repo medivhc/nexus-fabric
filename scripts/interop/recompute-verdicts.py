@@ -252,6 +252,12 @@ def protocol_verdict(proto, rows, allow_partial):
         }
 
     # rule 1: failure cell FAIL 且表现为有效 echo / 静默成功 / 挂死
+    # 现象 → class 映射（spec E1 规则 1：现象式判定，白名单是 D1 词表内的代理）：
+    #   有效 echo / 静默成功 → E_NEXUS_FRAMING
+    #     （probe 负向格：错凭据仍返回有效 echo，或非 echo 字节被当隧道载荷上交；
+    #     见 apps/nexus/examples/interop/product.rs 的 negative-case 块）
+    #   挂死 → E_TIMEOUT_HANG（D1 映射 FAIL）
+    # 新增 error class 时必须在此显式归类，否则规则 1 会静默漏检。
     for r in non_diag:
         if (
             r["present"]
@@ -397,6 +403,15 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial):
                 detail = f"up={m.get('bytes_up', 0)}B down={m.get('bytes_down', 0)}B"
             err = r["class"] or ""
             notes = "; ".join(ev.get("notes", []))[:220].replace("|", "/")
+            if (
+                proto in ("Vless", "Shadowsocks")
+                and r["cell"] in FAILURE_CELLS
+                and r["status"] == "PASS"
+            ):
+                qualifier = (
+                    "限定：正向路径不通时本格仅证明无静默成功，不独立证明认证拒绝语义"
+                )
+                notes = f"{notes}; {qualifier}" if notes else qualifier
             lines.append(
                 f"| {r['variant']}/{r['cell']} | {r['status']} | {ev.get('carrier')} | "
                 f"{ev.get('scope')} | {ev.get('evidence_id')} | {detail} {err} | "
@@ -478,6 +493,44 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial):
     lines.append("- 目标端口：26200 echo / 26201 sink+source / 26202 udp / 26203 http fallback。")
     lines.append("- 抓包：dumpcap -P（pcap），T2 用 `-a filesize:102400` 封顶 100 MiB。")
     lines.append("")
+    lines.append("## 附录 D：终局 T2 证据构建来源")
+    lines.append("")
+    lines.append("| 协议 | evidence_id | nexus.commit | cargo_target_dir | binary_sha256 |")
+    lines.append("|---|---|---|---|---|")
+    for r in rows:
+        if not r["present"] or r["cell"] != "TcpThroughput":
+            continue
+        ev = r["evidence"]
+        nexus = ev.get("nexus") or {}
+        lines.append(
+            f"| {r['protocol']} | {ev['evidence_id']} | {nexus.get('commit') or 'MISSING'} | "
+            f"{nexus.get('cargo_target_dir') or 'MISSING'} | {nexus.get('binary_sha256') or 'MISSING'} |"
+        )
+    lines.append("")
+    lines.append(
+        "AnyTLS/Trojan 终局 T2 由 fix 分支 `b7acb32` 的 fix worktree 构建（fix 仅改 VLESS 响应头泵，"
+        "产品 `apps/nexus/src/lib.rs` 本表基线未被改动）；同格 FAIL 另有主 worktree 构建记录。"
+    )
+    lines.append("")
+    superseded_path = run_dir / "analysis/superseded.json"
+    if superseded_path.exists():
+        superseded = json.loads(superseded_path.read_text(encoding="utf-8")).get("entries", [])
+        if superseded:
+            lines.append("## 附录 E：被替代运行")
+            lines.append("")
+            lines.append("| evidence_id | 原结论 | 替代者 | 弃用理由 |")
+            lines.append("|---|---|---|---|")
+            for entry in superseded:
+                lines.append(
+                    f"| {entry['evidence_id']} | {entry['original_verdict']} | "
+                    f"{entry['superseded_by']} | {entry['reason']} |"
+                )
+            lines.append("")
+            lines.append(
+                "复算的选择规则是同格取最新 evidence_id；被替代运行仍保留在证据树与"
+                " `analysis/progress.tsv`，不覆盖历史结论。"
+            )
+            lines.append("")
     if findings:
         lines.append("## 校验发现")
         lines.append("")

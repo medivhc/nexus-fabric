@@ -159,6 +159,41 @@ class RecomputeTests(unittest.TestCase):
             payload, _ = self.build(Path(tmp))
             self.assertEqual(payload["protocols"]["Vless"]["verdict"], "BROKEN")
 
+    def test_rule1_covers_all_three_failure_phenomena(self):
+        # S-01：spec E1 规则 1 的三种现象各固定一个算例，防止新增 error class
+        # 或 probe 负向格分支变化时静默漏检。
+        phenomena = {
+            "valid echo silently accepted": {
+                "status": "FAIL",
+                "cls": "E_NEXUS_FRAMING",
+                "notes": ["negative case silently accepted: valid echo returned"],
+            },
+            "non-echo data surfaced": {
+                "status": "FAIL",
+                "cls": "E_NEXUS_FRAMING",
+                "notes": [
+                    "negative case returned non-echo bytes; silently surfaced as tunnel payload"
+                ],
+            },
+            "hang": {
+                "status": "FAIL",
+                "cls": "E_TIMEOUT_HANG",
+                "notes": ["negative case hung without echo"],
+            },
+        }
+        for name, override in phenomena.items():
+            with self.subTest(phenomenon=name), tempfile.TemporaryDirectory() as tmp:
+                make_run(
+                    Path(tmp),
+                    "Vless",
+                    {("Default", "BadCredential"): override},
+                )
+                payload, _ = self.build(Path(tmp))
+                verdict = payload["protocols"]["Vless"]
+                self.assertEqual(verdict["verdict"], "BROKEN")
+                self.assertEqual(verdict["rule"], "1")
+                self.assertEqual(verdict["missing_cells"][0], f"BadCredential(FAIL,{override['cls']})")
+
     def test_illegal_carrier_scope_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             make_run(
