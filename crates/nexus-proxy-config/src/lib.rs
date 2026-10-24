@@ -3374,3 +3374,89 @@ mod tag_validation_tests {
         assert!(err.reason.contains("64"), "{err:?}");
     }
 }
+
+#[cfg(test)]
+mod config_error_matrix_tests {
+    use super::*;
+
+    fn base(extra_inbounds: &str) -> String {
+        format!(
+            "schema_version: 1\ninbounds:\n{extra_inbounds}rules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n"
+        )
+    }
+
+    #[test]
+    fn config_error_matrix_no_outbounds() {
+        let yaml = "schema_version: 1\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\n";
+        let err = parse(yaml).unwrap_err();
+        assert_eq!(err.field, "outbounds");
+    }
+
+    #[test]
+    fn config_error_matrix_all_direct_is_legal() {
+        let cfg = parse(&base("")).expect("all-direct outbounds are legal");
+        assert_eq!(cfg.outbounds.len(), 1);
+        assert_eq!(cfg.outbounds[0].kind, OutboundKind::Direct);
+    }
+
+    #[test]
+    fn config_error_matrix_unknown_inbound_kind() {
+        let yaml = base("  - tag: in\n    kind: wireguard\n");
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].kind");
+    }
+
+    #[test]
+    fn config_error_matrix_two_tun() {
+        let yaml = base("  - tag: a\n    kind: tun\n  - tag: b\n    kind: tun\n");
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "inbounds");
+        assert!(err.reason.contains("only one tun"), "{err:?}");
+    }
+
+    #[test]
+    fn config_error_matrix_two_tproxy() {
+        let yaml = base("  - tag: a\n    kind: tproxy\n  - tag: b\n    kind: tproxy\n");
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "inbounds");
+        assert!(err.reason.contains("only one tproxy"), "{err:?}");
+    }
+
+    #[test]
+    fn config_error_matrix_ipv6_true_tun() {
+        let yaml = base("  - tag: a\n    kind: tun\n    ipv6: true\n");
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].ipv6");
+    }
+
+    #[test]
+    fn config_error_matrix_ipv6_true_tproxy() {
+        let yaml = base("  - tag: a\n    kind: tproxy\n    ipv6: true\n");
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].ipv6");
+    }
+
+    #[test]
+    fn config_error_matrix_duplicate_tag() {
+        let yaml = "schema_version: 1\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n  - tag: d\n    kind: direct\n";
+        let err = parse(yaml).unwrap_err();
+        assert_eq!(err.field, "outbounds[1].tag");
+        assert!(err.reason.contains("duplicate"), "{err:?}");
+    }
+
+    #[test]
+    fn config_error_matrix_reserved_tag() {
+        let yaml = "schema_version: 1\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: DIRECT\n    kind: socks5\n    locator: 127.0.0.1:1080\n";
+        let err = parse(yaml).unwrap_err();
+        assert_eq!(err.field, "outbounds[0].tag");
+        assert!(err.reason.contains("reserved"), "{err:?}");
+    }
+
+    #[test]
+    fn config_error_matrix_invalid_tag_text() {
+        let yaml = "schema_version: 1\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: \"a b\"\n    kind: direct\n";
+        let err = parse(yaml).unwrap_err();
+        assert_eq!(err.field, "outbounds[0].tag");
+        assert!(err.reason.contains("whitespace"), "{err:?}");
+    }
+}

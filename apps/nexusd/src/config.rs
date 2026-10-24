@@ -1129,6 +1129,31 @@ pub enum ChangeKind {
     NeedsRestart,
 }
 
+/// 入站装配签名：只覆盖影响数据面装配的字段（spec §10.8）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InboundSignature {
+    kind: nexus_proxy_config::InboundKind,
+    tun: Option<nexus_proxy_config::TunInboundConfig>,
+    tproxy: Option<nexus_proxy_config::TproxyInboundConfig>,
+}
+
+/// 从 `proxy.yaml` 原文提取入站签名；缺失或解析失败时返回 `None`
+/// （解析失败由 `load` 先行拒绝，这里只做变更分类）。
+fn inbound_signatures(yaml: Option<&str>) -> Option<Vec<InboundSignature>> {
+    let parsed = nexus_proxy_config::parse(yaml?).ok()?;
+    Some(
+        parsed
+            .inbounds
+            .iter()
+            .map(|inbound| InboundSignature {
+                kind: inbound.kind,
+                tun: inbound.tun.clone(),
+                tproxy: inbound.tproxy.clone(),
+            })
+            .collect(),
+    )
+}
+
 /// 对比新旧配置，判断变更类型。
 ///
 /// 保守策略：目前仅做文件级判断——
@@ -1169,6 +1194,13 @@ pub fn classify_change(old: &LoadedConfig, new: &LoadedConfig) -> ChangeKind {
     }
     // C1/D1：workspace.toml 内容变更 → NeedsRestart（挂载点/工作区集合变化需重新装配）。
     if old.workspace_toml != new.workspace_toml {
+        return ChangeKind::NeedsRestart;
+    }
+    // proxy.yaml 的 tun/tproxy 入站增删或参数（端口/设备/MTU/默认路由）变化 →
+    // NeedsRestart；规则/组/出站仍按 Hot 处理（spec §10.8）。
+    if inbound_signatures(old.proxy_yaml.as_deref())
+        != inbound_signatures(new.proxy_yaml.as_deref())
+    {
         return ChangeKind::NeedsRestart;
     }
     // 任一文件的增删 → 需重启（子系统启停）
@@ -1895,6 +1927,55 @@ password=\"p\"\n\
         let dir = ConfigDir::new(&d).unwrap();
         assert!(load(&dir).is_ok());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    const TPROXY_PROXY_YAML: &str = "schema_version: 1\ninbounds:\n  - tag: t\n    kind: tproxy\n    listen: 127.0.0.1:7895\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
+
+    fn classify_pair(dir_name: &str, old_yaml: &str, new_yaml: &str) -> ChangeKind {
+        let d = std::env::temp_dir().join(dir_name);
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        write(&d, PROXY_YAML, old_yaml);
+        let dir = ConfigDir::new(&d).unwrap();
+        let old = load(&dir).unwrap();
+        write(&d, PROXY_YAML, new_yaml);
+        let new = load(&dir).unwrap();
+        let kind = classify_change(&old, &new);
+        let _ = std::fs::remove_dir_all(&d);
+        kind
+    }
+
+    #[test]
+    fn classify_change_tproxy_listen_port_needs_restart() {
+        let new_yaml = TPROXY_PROXY_YAML.replace("7895", "7896");
+        assert_eq!(
+            classify_pair(
+                "nexusd-cfg-test-classify-tproxy-port",
+                TPROXY_PROXY_YAML,
+                &new_yaml
+            ),
+            ChangeKind::NeedsRestart
+        );
+    }
+
+    #[test]
+    fn classify_change_tun_inbound_name_needs_restart() {
+        let old_yaml = "schema_version: 1\ninbounds:\n  - tag: t\n    kind: tun\n    name: nexus\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
+        let new_yaml = old_yaml.replace("name: nexus", "name: nexus2");
+        assert_eq!(
+            classify_pair("nexusd-cfg-test-classify-tun-name", old_yaml, &new_yaml),
+            ChangeKind::NeedsRestart
+        );
+    }
+
+    #[test]
+    fn classify_change_outbound_only_is_hot() {
+        let old_yaml = "schema_version: 1\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
+        let new_yaml = "schema_version: 1\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d2\noutbounds:\n  - tag: d2\n    kind: direct\n";
+        assert_eq!(
+            classify_pair("nexusd-cfg-test-classify-outbound-hot", old_yaml, new_yaml),
+            ChangeKind::Hot
+        );
     }
 
     #[test]
