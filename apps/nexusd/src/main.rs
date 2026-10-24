@@ -241,6 +241,7 @@ fn tun_enabled() -> bool {
     *TUN_ENABLED.get().unwrap_or(&true)
 }
 
+mod nat_gather;
 mod nat_stun;
 mod nat_turn;
 mod task_provider_command;
@@ -459,7 +460,9 @@ fn run_dataplane(
 ///   配置开关可验证开启/关闭），并保留 `sw` 供后续 relay 钩子调用。
 struct NatSwitchRuntime {
     turn: nat_turn::TurnManager,
-    stun: nat_stun::StunProber,
+    // B14 fix: the gatherer owns the sampling prober (probing goes through
+    // gatherer.stun_prober()); candidate composition goes through gather().
+    gatherer: nat_gather::CandidateGatherer,
     sw: Arc<nexusd::nat_switch::NatSwitching>,
     _driver: Arc<Driver>,
     /// BLOCKED-1 (a): injected fabric identity for the relay provider.
@@ -522,12 +525,34 @@ impl NatSwitchRuntime {
         };
         let stun = nat_stun::StunProber::new(stun_transport);
 
-        let local = LocalCandidates {
-            host: nexusd::nat_switch::gather_host_candidates(&driver),
-            srflx: None,
-            srflx_stun: None,
-            srflx_turn: None,
-            nat_type: nexus_connectivity::nat::NatType::Unknown,
+        // B14 fix: initial candidates go through the gatherer, not a
+        // hardcoded literal. No TURN allocation exists yet at this point, so
+        // turn_mapped is None by rule (not by literal); the first
+        // sample_and_update overwrites this with the real mapping. Hosts are
+        // overlaid with the G3 interface enumeration either way.
+        let hosts = nexusd::nat_switch::gather_host_candidates(&driver);
+        let bind_for_gather = hosts
+            .first()
+            .copied()
+            .unwrap_or_else(|| "0.0.0.0:0".parse().expect("0.0.0.0:0 parses"));
+        let mut gatherer = nat_gather::CandidateGatherer::new(stun, bind_for_gather);
+        let local = match gatherer.gather(None, false, &mut Vec::new()) {
+            Ok(mut c) => {
+                c.host = hosts;
+                c
+            }
+            Err(e) => {
+                eprintln!("[nat-switch] WARN: initial gather failed ({e}); using bare hosts");
+                LocalCandidates {
+                    host: hosts,
+                    srflx: None,
+                    srflx_stun: None,
+                    // Computed, not hardcoded: no TURN allocation exists yet,
+                    // so this is None by rule (same as the gather path).
+                    srflx_turn: turn.mapped_addr(),
+                    nat_type: nexus_connectivity::nat::NatType::Unknown,
+                }
+            }
         };
         let sw = nexusd::nat_switch::NatSwitching::new(
             driver.clone(),
@@ -540,7 +565,7 @@ impl NatSwitchRuntime {
         nexusd::nat_status::publish_nat_status_source(Box::new(Arc::clone(&sw)));
         let runtime = NatSwitchRuntime {
             turn,
-            stun,
+            gatherer,
             sw,
             _driver: driver,
             identity,
@@ -589,7 +614,10 @@ impl NatSwitchRuntime {
                     }
                 }
             }
-            Err(e) => eprintln!("[nat-switch] WARN: TURN allocate failed: {e}; punch disabled"),
+            Err(e) => eprintln!(
+                "[nat-switch] WARN: {}; punch disabled",
+                nat_gather::GatherError::Turn(e)
+            ),
         }
 
         // 2. 初始 STUN 采样（失败不阻断）。
@@ -636,12 +664,13 @@ impl NatSwitchRuntime {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         let probed = match server2 {
-            Some(s2) => self.stun.probe_and_detect(server1, s2),
+            Some(s2) => self.gatherer.stun_prober().probe_and_detect(server1, s2),
             None => {
                 eprintln!(
                     "[nat-switch] single STUN server; NAT-type detection skipped (nat_type=Unknown)"
                 );
-                self.stun
+                self.gatherer
+                    .stun_prober()
                     .probe_once(server1, nat_stun::STUN_PROBE_TIMEOUT)
                     .map(|m| (m, nexus_connectivity::nat::NatType::Unknown))
             }
@@ -659,13 +688,44 @@ impl NatSwitchRuntime {
                     let excess = self.port_samples.len() - MAX_PORT_SAMPLES;
                     self.port_samples.drain(..excess);
                 }
-                let local = LocalCandidates {
-                    host: nexusd::nat_switch::gather_host_candidates(&self._driver),
-                    srflx: Some(mapping.public),
-                    srflx_stun: Some(server1),
-                    srflx_turn: None,
-                    nat_type,
+                // B14 fix: the TURN mapping flows through the gatherer.
+                // Composition-root assertion (spec §4.1 item 3): the
+                // TurnManager owns a separate UDP socket, never the punch
+                // driver socket, so turn_same_socket is false until a
+                // shared-socket TURN path exists. The gatherer therefore
+                // records srflx_turn as diagnostic here; the copy path is
+                // proven by nat_gather quadrant tests and activates if/when
+                // TURN shares the punch socket.
+                let turn_mapped = self.turn.mapped_addr();
+                self.gatherer.set_nat_type(nat_type);
+                let mut local = match self.gatherer.gather(
+                    turn_mapped,
+                    false,
+                    &mut self.port_samples,
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!(
+                            "[nat-switch] WARN: candidate gather failed ({e}); keeping STUN-derived candidates"
+                        );
+                        LocalCandidates {
+                            host: nexusd::nat_switch::gather_host_candidates(&self._driver),
+                            srflx: None,
+                            srflx_stun: None,
+                            srflx_turn: turn_mapped,
+                            nat_type,
+                        }
+                    }
                 };
+                // STUN-derived values are primary; the gatherer copy (if any)
+                // agrees with them under same-socket+cone. Hosts always come
+                // from the G3 enumeration.
+                if local.srflx.is_none() {
+                    local.srflx = Some(mapping.public);
+                }
+                local.srflx_stun = Some(server1);
+                local.host = nexusd::nat_switch::gather_host_candidates(&self._driver);
+                local.nat_type = nat_type;
                 self.sw.set_local(local, self.port_samples.clone());
                 eprintln!(
                     "[nat-switch] STUN sample: public={} nat_type={:?} samples={} (local={})",
@@ -676,7 +736,8 @@ impl NatSwitchRuntime {
                 );
             }
             Err(e) => eprintln!(
-                "[nat-switch] WARN: STUN sample failed ({e}); keeping previous candidates"
+                "[nat-switch] WARN: {}; keeping previous candidates",
+                nat_gather::GatherError::Stun(e)
             ),
         }
     }
