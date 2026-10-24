@@ -4485,14 +4485,13 @@ fn anytls_take_complete_frame(buf: &[u8]) -> Option<(nexus_outbound_anytls::AnyT
     nexus_outbound_anytls::decode_frame_bytes(buf).ok()
 }
 
-// VLESS 握手 + 响应头消费（§11.16 vless 数据面装配 glue；帧编解码仍在
+// VLESS 握手（§11.16 vless 数据面装配 glue；帧编解码仍在
 // nexus-outbound-vless）。
 //
 // 在已建立的字节流（明文 TCP 或外层 TLS）上执行：`VlessConn::handshake` 只写
 // 请求头（UUID + flow addon + TCP 命令 + 目标地址），随后把 `seed_to_upstream`
-// （§11.19 首段字节）一并写出，最后阻塞读一次消费响应头——server 收到请求头
-// 后即回送响应头（请求处理与拨号目标并发，不等待目标首字节），此时阻塞读不会
-// 死锁；必须先消费掉响应头才能开始透明中继，否则响应字节会泄漏进 client 流。
+// （§11.19 首段字节）一并写出并 flush。响应头留到中继泵惰性消费（由
+// `VlessResponseSkipper` 在 node→client 方向丢弃），本函数不得阻塞读它。
 fn vless_handshake_stream<S: std::io::Read + std::io::Write>(
     stream: &mut S,
     req: &nexus_outbound_vless::VlessRequest,
@@ -5766,7 +5765,7 @@ pub fn proxy_serve_once(
         nexus_proxy_config::OutboundKind::Vless => {
             // §11.16 vless 数据面：TCP → 可选 rustls TLS（SNI 取配置 servername，
             // 缺省节点域名；skip-cert-verify 按配置；tls 缺省 false）→ VLESS 握手
-            // （UUID + flow addon + TCP 命令 + 目标地址；响应头随后阻塞读一次消费）
+            // （UUID + flow addon + TCP 命令 + 目标地址；响应头由中继泵惰性消费）
             // → 双向透明中继 client<->节点。
             //
             // 传输：仅 TCP/TLS direct；WS/gRPC 等传输链为后续增强（未实现）。
