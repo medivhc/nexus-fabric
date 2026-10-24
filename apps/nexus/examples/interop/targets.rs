@@ -182,10 +182,26 @@ fn echo_conn(mut stream: TcpStream, stats: &Stats, close_after: usize) {
                 stats.tcp_bytes_down.fetch_add(n as u64, Ordering::Relaxed);
                 total += n;
                 if total >= close_after {
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    graceful_close(&mut stream);
                     break;
                 }
             }
+        }
+    }
+}
+
+/// 优雅收尾：先发 FIN 让已写数据全部送达，再等对端关闭（最多 2s）。
+///
+/// 直接 `shutdown(Both)` 会在尾部数据仍在途时发 RST，导致客户端在 32 MiB
+/// 级下载的最后几 MB 看到 EOF（T2 证据被工具自身截断）。
+fn graceful_close(stream: &mut TcpStream) {
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let mut sink = [0u8; 1024];
+    loop {
+        match stream.read(&mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
         }
     }
 }
@@ -195,7 +211,7 @@ fn sink_conn(mut stream: TcpStream, stats: &Stats, close_after: usize) {
     let mut ops = 0usize;
     loop {
         if ops >= close_after {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
+            graceful_close(&mut stream);
             break;
         }
         let mut op = [0u8; 1];

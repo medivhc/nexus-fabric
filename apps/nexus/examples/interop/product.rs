@@ -261,8 +261,9 @@ fn run_t2(stream: &mut TcpStream, cfg: &InteropProbeConfig) -> Result<Metrics, S
 fn upload_sink(
     stream: &mut TcpStream,
     payload: &[u8],
-    _outer: &mut ring::digest::Context,
+    outer: &mut ring::digest::Context,
 ) -> Result<String, String> {
+    outer.update(payload);
     stream.write_all(&[0x55]).map_err(|e| e.to_string())?;
     stream
         .write_all(&(payload.len() as u64).to_be_bytes())
@@ -278,7 +279,7 @@ fn upload_sink(
 fn download_sink(
     stream: &mut TcpStream,
     len: usize,
-    _outer: &mut ring::digest::Context,
+    outer: &mut ring::digest::Context,
 ) -> Result<String, String> {
     stream.write_all(&[0x44]).map_err(|e| e.to_string())?;
     stream
@@ -293,6 +294,7 @@ fn download_sink(
             Ok(0) => return Err(format!("source eof after {got} / {len} bytes")),
             Ok(n) => {
                 ctx.update(&buf[..n]);
+                outer.update(&buf[..n]);
                 got += n;
             }
             Err(e) => return Err(format!("source read: {e} after {got} / {len} bytes")),
@@ -435,6 +437,28 @@ pub fn run_cell(cfg: &InteropProbeConfig) -> Result<Outcome, String> {
         cfg.timeouts.cell_ms
     });
     let mut conn = ProxyConn::open(cfg, timeout)?;
+    if cfg.cell == Cell::PaddingDiag {
+        let (proxy_json, proxy_error) = conn.finish(Duration::from_secs(3));
+        let workload = WorkloadResult {
+            echo_ok: false,
+            echoed: Vec::new(),
+            errors: Vec::new(),
+            metrics: Metrics::default(),
+        };
+        let mut outcome = judge(
+            cfg,
+            &workload,
+            proxy_json.as_ref(),
+            proxy_error.as_deref(),
+            0,
+        );
+        if proxy_json.is_none() {
+            if let Some(err) = proxy_error {
+                outcome.notes.push(format!("proxy_error={err}"));
+            }
+        }
+        return Ok(outcome);
+    }
     let workload = match run_workload(cfg, &mut conn.stream) {
         Ok(workload) => workload,
         Err(err) => WorkloadResult {
