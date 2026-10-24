@@ -1588,3 +1588,52 @@ password=\"p\"\n\
         let _ = std::fs::remove_dir_all(&d);
     }
 }
+
+#[cfg(test)]
+mod punch_gap_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn g12_punch_config_defaults() {
+        let p = PunchSection::default();
+        assert!(p.enabled);
+        assert!(p.relay_provider_enabled);
+        assert_eq!(p.punch_timeout_ms, 5_000);
+        assert_eq!(p.coord_skew_ms, 200);
+        assert_eq!(p.spray_k, 16);
+        assert_eq!(p.spray_interval_ms, 50);
+        assert_eq!(p.spray_time_budget_ms, 3_000);
+        assert_eq!(p.repunch_interval_sec, 300);
+        assert_eq!(p.repunch_jitter_sec, 0);
+        assert_eq!(p.prediction_samples, 3);
+        assert_eq!(p.max_sample_age_sec, 900);
+        assert_eq!(p.max_stable_delta, 8);
+        assert_eq!(p.mapping_probe_count, 3);
+        assert_eq!(p.mapping_probe_interval_ms, 50);
+        let c = p.to_punch_config();
+        assert_eq!(c.punch_timeout, Duration::from_millis(5_000));
+        assert_eq!(c.repunch_interval, Duration::from_secs(300));
+        assert_eq!(c.mapping_probe_count, 3);
+        assert_eq!(c.mapping_probe_interval_ms, 50);
+        assert_eq!(c.repunch_jitter, Duration::ZERO);
+    }
+
+    #[test]
+    fn punch_rejects_illegal_combination() {
+        let p = PunchSection {
+            spray_k: 32,
+            spray_interval_ms: 500,
+            spray_time_budget_ms: 3_000,
+            ..PunchSection::default()
+        };
+        let err = p.validate().expect_err("combination must be rejected");
+        assert!(matches!(
+            err,
+            nexus_nat_traversal::PunchConfigError::InvalidCombination {
+                field: "spray_interval_ms",
+                ..
+            }
+        ));
+    }
+}

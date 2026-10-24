@@ -314,3 +314,37 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    fn pid(byte: u8) -> FabricPeerId {
+        FabricPeerId([byte; 32])
+    }
+
+    #[test]
+    fn g3_host_candidates_enumerated() {
+        let driver = Driver::new_server("0.0.0.0:0".parse().unwrap()).expect("bind");
+        let port = driver.shared().local_addr.lock().unwrap().port();
+        let addrs = gather_host_candidates(&driver);
+        assert!(!addrs.is_empty(), "at least one host candidate");
+        assert!(
+            addrs.iter().all(|a| !a.ip().is_unspecified()),
+            "never advertise 0.0.0.0: {addrs:?}"
+        );
+        assert!(
+            addrs.iter().all(|a| a.port() == port),
+            "host candidate port must equal driver port"
+        );
+    }
+
+    #[test]
+    fn g9_both_sides_initiate() {
+        let a = pid(1);
+        let b = pid(2);
+        assert!(should_initiate(&a, &b), "smaller PeerId still initiates");
+        assert!(should_initiate(&b, &a), "larger PeerId initiates");
+        assert!(!should_initiate(&a, &a), "never punch self");
+    }
+}

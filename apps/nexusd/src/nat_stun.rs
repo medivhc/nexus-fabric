@@ -591,3 +591,21 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+    use nexus_fabric::Driver;
+
+    #[test]
+    fn g1_stun_samples_share_punch_socket() {
+        let driver = Driver::new_server("127.0.0.1:0".parse().unwrap()).expect("bind driver");
+        let local = *driver.shared().local_addr.lock().unwrap();
+        let transport = DriverStunTransport::new(driver.clone()).expect("install tap");
+        assert_eq!(
+            transport.local_addr(),
+            local,
+            "STUN must be observed on the punch driver socket"
+        );
+    }
+}
