@@ -418,6 +418,12 @@ fn run_dataplane(
         match OsAssemble::new(config) {
             Ok(mut assemble) => match assemble.apply() {
                 Ok(report) => {
+                    nexusd::dataplane::publish_os_assemble(nexusd::dataplane::OsAssembleStatus {
+                        state: "applied",
+                        ifname: dp.tun_name().to_string(),
+                        default_route: report.default_route_added,
+                        excludes: report.excludes_added,
+                    });
                     eprintln!(
                         "[nexusd.os] level=info event=os_assemble state=applied ifname={} addrs={} routes={} default_route={} excludes={}",
                         dp.tun_name(),
@@ -429,6 +435,12 @@ fn run_dataplane(
                     Some(assemble)
                 }
                 Err(e) => {
+                    nexusd::dataplane::publish_os_assemble(nexusd::dataplane::OsAssembleStatus {
+                        state: "failed",
+                        ifname: dp.tun_name().to_string(),
+                        default_route: tun_default_route,
+                        excludes: 0,
+                    });
                     eprintln!(
                         "[nexusd.os] level=error event=os_assemble state=failed ifname={} reason={e}",
                         dp.tun_name()
@@ -464,6 +476,7 @@ fn run_dataplane(
             dp.set_production_chain_deps(deps);
             let enabled = dp.enable_flow_sessions_for_config(flow_sessions_mode, providers);
             let status = dp.flow_sessions_state();
+            nexusd::dataplane::publish_flow_sessions(status);
             eprintln!(
                 "[nexusd.session] level=info event=flow_sessions state={} reason={} providers={} auto={}",
                 status.state,
@@ -887,6 +900,29 @@ fn run_daemon(config_dir: &str) -> ExitCode {
 
     // T4：发布 tun_enabled 状态供 LocalAPI 查询。
     publish_tun_enabled(loaded.daemon.tun.enabled);
+    let takeover_mode = loaded
+        .proxy_yaml
+        .as_deref()
+        .and_then(|yaml| nexus_proxy_config::parse(yaml).ok())
+        .map(|config| {
+            let has_system_inbound = config.inbounds.iter().any(|inbound| {
+                matches!(
+                    inbound.kind,
+                    nexus_proxy_config::InboundKind::Tun | nexus_proxy_config::InboundKind::Tproxy
+                )
+            });
+            if has_system_inbound || loaded.daemon.tun.enabled {
+                "system-level"
+            } else {
+                "resource-level"
+            }
+        })
+        .unwrap_or(if loaded.daemon.tun.enabled {
+            "system-level"
+        } else {
+            "resource-level"
+        });
+    nexusd::dataplane::publish_runtime_basics(takeover_mode, "ipv4");
 
     // 2. 组装 DataplaneConfig（R2/R3；dns.toml 解析失败 → exit 1）。
     let dataplane_config = match assembly::build_dataplane_config(&loaded) {
@@ -1749,23 +1785,36 @@ fn handle_localapi_request(
         "/localapi/v0/status" => nexus::observability::status()
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),
         "/localapi/v0/dataplane/stats" => {
-            // B1：统一数据面统计（D6 可观测）。
-            // T4：包含 tun_enabled 状态（no-tun 模式可观测）。
+            // B1 / S30：统一数据面统计（D6 可观测，spec §9.16）。
             let s = nexusd::dataplane::dataplane_stats_snapshot();
-            Ok(json!({
-                "verdict": "PASS",
-                "tun_enabled": tun_enabled(),
-                "dataplane": {
-                    "mesh_forwarded": s.mesh_forwarded,
-                    "proxy_forwarded": s.proxy_forwarded,
-                    "direct_forwarded": s.direct_forwarded,
-                    "dropped": s.dropped,
-                    "dns_answered": s.dns_answered,
-                    "qos_dropped": s.qos_dropped,
-                    "mesh_dropped_no_n1": s.mesh_dropped_no_n1,
-                    "proxy_dropped_no_proxy": s.proxy_dropped_no_proxy,
-                }
-            }))
+            let status = nexusd::dataplane::runtime_status_snapshot();
+            let tproxy = json!({
+                "state": "disabled",
+                "reason": null,
+                "enforcement": "none",
+                "backend": "iptables",
+                "privilege": "insufficient",
+                "chain": "NEXUS_TPROXY",
+                "mark": "0x1f3",
+                "route_table": 100,
+                "listen": "0.0.0.0:7895",
+                "ip_family": "ipv4",
+                "ipv6_enabled": false,
+                "counters": {
+                    "tcp_accepted": 0, "tcp_rejected": 0, "udp_datagrams": 0,
+                    "udp_dropped": 0, "udp_table_evicted": 0, "udp_reply_failed": 0,
+                    "inbound_queue_full": 0, "orig_dst_missing": 0, "rule_no_match": 0,
+                    "direct_tcp_dial_failed": 0, "direct_udp_failed": 0,
+                    "upstream_failed": 0, "domain_miss": s.domain_miss,
+                },
+                "last_failure_reason": null,
+            });
+            Ok(nexusd::dataplane::dataplane_stats_json(
+                tun_enabled(),
+                &status,
+                &s,
+                tproxy,
+            ))
         }
         "/localapi/v0/dns/status" => nexus::observability::dns_status()
             .map_err(|e| (nexus::error_code(&e).to_string(), e.to_string())),

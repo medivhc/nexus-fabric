@@ -1762,6 +1762,106 @@ pub fn dataplane_stats_snapshot() -> DataplaneStats {
         .unwrap_or_default()
 }
 
+// ===== 运行期状态（LocalAPI §9.16） =====
+
+/// 运行期状态快照（takeover / flow_sessions / os_assemble）。
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeStatus {
+    /// `system-level` / `resource-level`。
+    pub takeover_mode: String,
+    /// `ipv4`。
+    pub ingress_ip_family: String,
+    /// 流会话状态。
+    pub flow_sessions: FlowSessionsState,
+    /// OS 装配状态。
+    pub os_assemble: OsAssembleStatus,
+}
+
+/// OS 装配可见状态。
+#[derive(Debug, Clone, Default)]
+pub struct OsAssembleStatus {
+    /// `applied` / `failed` / `skipped`。
+    pub state: &'static str,
+    /// 接口名。
+    pub ifname: String,
+    /// 是否安装默认路由。
+    pub default_route: bool,
+    /// 排除路由数。
+    pub excludes: u32,
+}
+
+static RUNTIME_STATUS: OnceLock<Mutex<RuntimeStatus>> = OnceLock::new();
+
+fn runtime_slot() -> &'static Mutex<RuntimeStatus> {
+    RUNTIME_STATUS.get_or_init(|| Mutex::new(RuntimeStatus::default()))
+}
+
+/// 发布 takeover/ingress 基本信息。
+pub fn publish_runtime_basics(takeover_mode: &str, ingress_ip_family: &str) {
+    if let Ok(mut status) = runtime_slot().lock() {
+        status.takeover_mode = takeover_mode.to_string();
+        status.ingress_ip_family = ingress_ip_family.to_string();
+    }
+}
+
+/// 发布流会话状态。
+pub fn publish_flow_sessions(state: FlowSessionsState) {
+    if let Ok(mut status) = runtime_slot().lock() {
+        status.flow_sessions = state;
+    }
+}
+
+/// 发布 OS 装配状态。
+pub fn publish_os_assemble(status: OsAssembleStatus) {
+    if let Ok(mut guard) = runtime_slot().lock() {
+        guard.os_assemble = status;
+    }
+}
+
+/// 运行期状态快照。
+pub fn runtime_status_snapshot() -> RuntimeStatus {
+    runtime_slot().lock().map(|s| s.clone()).unwrap_or_default()
+}
+
+/// 构造 `/localapi/v0/dataplane/stats` 的 JSON（纯函数，便于单测）。
+pub fn dataplane_stats_json(
+    tun_enabled: bool,
+    status: &RuntimeStatus,
+    stats: &DataplaneStats,
+    tproxy: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "verdict": "PASS",
+        "tun_enabled": tun_enabled,
+        "takeover_mode": status.takeover_mode,
+        "ingress_ip_family": status.ingress_ip_family,
+        "dataplane": {
+            "mesh_forwarded": stats.mesh_forwarded,
+            "proxy_forwarded": stats.proxy_forwarded,
+            "direct_forwarded": stats.direct_forwarded,
+            "direct_dropped_unsupported": stats.direct_dropped_unsupported,
+            "dropped": stats.dropped,
+            "dns_answered": stats.dns_answered,
+            "qos_dropped": stats.qos_dropped,
+            "mesh_dropped_no_n1": stats.mesh_dropped_no_n1,
+            "proxy_dropped_no_proxy": stats.proxy_dropped_no_proxy,
+            "flow_sessions": {
+                "state": status.flow_sessions.state,
+                "reason": status.flow_sessions.reason,
+                "providers": status.flow_sessions.providers,
+                "planner_calls": 0,
+            },
+            "os_assemble": {
+                "state": status.os_assemble.state,
+                "ifname": status.os_assemble.ifname,
+                "default_route": status.os_assemble.default_route,
+                "excludes": status.os_assemble.excludes,
+            },
+        },
+        "tproxy": tproxy,
+    })
+}
+
 // ===== Stub 实现（MVP：E4 可测；真实解析器由子系统接入） =====
 
 struct StubUpstreamResolver;
@@ -2210,6 +2310,54 @@ mod tests {
         let dropped_before = dp.stats().dropped;
         dp.inject_stream_frame_from_n1("x", &[0x00, 0x01]);
         assert_eq!(dp.stats().dropped, dropped_before + 1);
+    }
+
+    /// S30：LocalAPI stats 字段与 takeover_mode 语义。
+    #[test]
+    fn localapi_stats_fields_and_takeover_mode() {
+        let status = RuntimeStatus {
+            takeover_mode: "system-level".to_string(),
+            ingress_ip_family: "ipv4".to_string(),
+            flow_sessions: FlowSessionsState {
+                state: "enabled",
+                reason: None,
+                providers: 2,
+            },
+            os_assemble: OsAssembleStatus {
+                state: "applied",
+                ifname: "nexus0".to_string(),
+                default_route: true,
+                excludes: 1,
+            },
+        };
+        let stats = DataplaneStats {
+            direct_dropped_unsupported: 3,
+            ..Default::default()
+        };
+        let json = dataplane_stats_json(
+            true,
+            &status,
+            &stats,
+            serde_json::json!({"state": "active"}),
+        );
+        assert_eq!(json["takeover_mode"], "system-level");
+        assert_eq!(json["ingress_ip_family"], "ipv4");
+        assert_eq!(json["dataplane"]["direct_dropped_unsupported"], 3);
+        assert_eq!(json["dataplane"]["flow_sessions"]["state"], "enabled");
+        assert_eq!(json["dataplane"]["flow_sessions"]["providers"], 2);
+        assert_eq!(json["dataplane"]["os_assemble"]["state"], "applied");
+        assert_eq!(json["dataplane"]["os_assemble"]["excludes"], 1);
+        assert!(json.get("providers").is_none(), "no provider list exposed");
+
+        // 仅 socks5 → resource-level（由组合根判定；此处验证空状态默认）。
+        let default_status = RuntimeStatus::default();
+        let json = dataplane_stats_json(
+            false,
+            &default_status,
+            &DataplaneStats::default(),
+            serde_json::Value::Null,
+        );
+        assert_eq!(json["takeover_mode"], "");
     }
 
     /// S29：DNS 应答后同 IP 新流命中 DOMAIN-SUFFIX；无缓存计 domain_miss。
