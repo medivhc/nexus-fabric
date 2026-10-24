@@ -1,0 +1,40 @@
+{
+  "log": {
+    "level": "debug",
+    "timestamp": true,
+    "output": "${RUN_DIR}/evidence/ref/trojan-fallback/sing-box.log"
+  },
+  "inbounds": [
+    {
+      "type": "trojan",
+      "tag": "trojan-fallback",
+      "listen": "127.0.0.1",
+      "listen_port": 26115,
+      "users": [
+        {
+          "name": "interop",
+          "password": "${TROJAN_PASSWORD}"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "localhost",
+        "certificate_path": "${RUN_DIR}/pki/cert.pem",
+        "key_path": "${RUN_DIR}/pki/key.pem"
+      },
+      "fallback": {
+        "server": "127.0.0.1",
+        "server_port": 26203
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct"
+  }
+}

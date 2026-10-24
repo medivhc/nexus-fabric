@@ -1,0 +1,43 @@
+{
+  "log": {
+    "level": "debug",
+    "timestamp": true,
+    "output": "${RUN_DIR}/evidence/ref/anytls-custom-padding/sing-box.log"
+  },
+  "inbounds": [
+    {
+      "type": "anytls",
+      "tag": "anytls-custom-padding",
+      "listen": "127.0.0.1",
+      "listen_port": 26102,
+      "users": [
+        {
+          "name": "interop",
+          "password": "${ANYTLS_PASSWORD}"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "localhost",
+        "certificate_path": "${RUN_DIR}/pki/cert.pem",
+        "key_path": "${RUN_DIR}/pki/key.pem"
+      },
+      "padding_scheme": [
+        "stop=4",
+        "0=64-64",
+        "1=128-128",
+        "2=256-256",
+        "3=512-512"
+      ]
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct"
+  }
+}

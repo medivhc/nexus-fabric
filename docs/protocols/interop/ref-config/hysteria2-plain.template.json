@@ -1,0 +1,36 @@
+{
+  "log": {
+    "level": "debug",
+    "timestamp": true,
+    "output": "${RUN_DIR}/evidence/ref/hysteria2-plain/sing-box.log"
+  },
+  "inbounds": [
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-plain",
+      "listen": "127.0.0.1",
+      "listen_port": 26103,
+      "users": [
+        {
+          "name": "interop",
+          "password": "${HY2_PASSWORD}"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "localhost",
+        "certificate_path": "${RUN_DIR}/pki/cert.pem",
+        "key_path": "${RUN_DIR}/pki/key.pem"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct"
+  }
+}
