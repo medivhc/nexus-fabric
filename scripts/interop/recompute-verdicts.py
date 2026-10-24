@@ -251,13 +251,18 @@ def protocol_verdict(proto, rows, allow_partial):
             "rule": rule,
         }
 
-    # rule 1: failure cell FAIL（有效 echo/静默成功/挂死）
+    # rule 1: failure cell FAIL 且表现为有效 echo / 静默成功 / 挂死
     for r in non_diag:
-        if r["present"] and r["cell"] in FAILURE_CELLS and r["status"] == "FAIL":
+        if (
+            r["present"]
+            and r["cell"] in FAILURE_CELLS
+            and r["status"] == "FAIL"
+            and r["class"] in ("E_NEXUS_FRAMING", "E_TIMEOUT_HANG")
+        ):
             return result(
                 "BROKEN",
                 proto_scope(proto, "BROKEN"),
-                root_cause=r["class"] or "E_NEXUS_FRAMING",
+                root_cause=r["class"],
                 rule="1",
             )
     # rule 2: required FAIL 且 Nexus 族 / timeout
