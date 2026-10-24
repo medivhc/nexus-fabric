@@ -493,3 +493,39 @@ fn symmetric_unpredictable_stays_on_relay() {
     );
     assert_eq!(s.stats().failed_unpredictable, 0);
 }
+
+#[test]
+fn spray_k_clamped_to_32_with_warn() {
+    // m-4 (review): PunchSession::new used to clamp spray_k silently.
+    // The clamp now logs `[nat-punch] WARN: config_clamped` (stderr, daemon
+    // log channel); the value assertion below pins the clamp itself.
+    let mut cfg = test_config();
+    cfg.spray_k = 64;
+    let s = PunchSession::new(
+        PeerId([7u8; 32]),
+        local_fullcone(),
+        NatType::FullCone,
+        Vec::new(),
+        cfg,
+        Arc::new(FakeChannel::new(vec![])),
+        Arc::new(FakeSocket::new(vec![])),
+        Arc::new(NoopPredictor),
+        Arc::new(TestClock::default()),
+    );
+    assert_eq!(s.config().spray_k, 32);
+    // No-clamp control: in-range values pass through untouched.
+    let mut cfg2 = test_config();
+    cfg2.spray_k = 16;
+    let s2 = PunchSession::new(
+        PeerId([7u8; 32]),
+        local_fullcone(),
+        NatType::FullCone,
+        Vec::new(),
+        cfg2,
+        Arc::new(FakeChannel::new(vec![])),
+        Arc::new(FakeSocket::new(vec![])),
+        Arc::new(NoopPredictor),
+        Arc::new(TestClock::default()),
+    );
+    assert_eq!(s2.config().spray_k, 16);
+}

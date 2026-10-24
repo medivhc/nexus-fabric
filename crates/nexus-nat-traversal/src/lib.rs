@@ -447,6 +447,16 @@ impl PunchSession {
         clock: Arc<dyn PunchClock>,
     ) -> Self {
         let mut config = config;
+        if config.spray_k > 32 {
+            // m-4 (review): previously a silent clamp; the daemon log now
+            // carries the event on the [nat-punch] channel (stderr, like
+            // the other [nat-*] daemon logs). Diagnostic only: it does
+            // not touch the data path, time, or randomness.
+            eprintln!(
+                "[nat-punch] WARN: config_clamped spray_k {} -> 32",
+                config.spray_k
+            );
+        }
         config.spray_k = config.spray_k.min(32);
         let nonce = fresh_nonce(clock.now_ms());
         Self {
@@ -467,6 +477,11 @@ impl PunchSession {
 
     pub fn phase(&self) -> PunchPhase {
         self.phase
+    }
+
+    /// Effective config (post-clamp); used by the m-4 regression test.
+    pub fn config(&self) -> &PunchConfig {
+        &self.config
     }
     pub fn peer(&self) -> PeerId {
         self.peer
