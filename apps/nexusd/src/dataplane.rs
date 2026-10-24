@@ -29,8 +29,9 @@ use nexus_path::{CandidatePath, PathConfig, PathManager};
 use nexus_projection::TunDevice;
 use nexus_projection::classifier::DropReason;
 use nexus_projection::classifier::{Classification, PacketClassifier};
+use nexus_projection::dns::{DEFAULT_DNS_CACHE_ENTRIES, DnsCache};
 use nexus_projection::egress::{EgressNat, RealUdpEgress, Rule, SimpleRuleEngine};
-use nexus_projection::routing::Cidr;
+use nexus_projection::routing::{Cidr, parse_ipv4_dst};
 use nexus_projection::tcp::{
     FourTuple, STREAM_FIN, STREAM_RST, STREAM_SYN, TcpEvent, TcpTermStats, TcpTerminator,
     decode_stream_frame, encode_stream_frame, encode_syn_payload,
@@ -75,6 +76,8 @@ pub struct DataplaneStats {
     pub direct_dropped_unsupported: u64,
     /// Direct UDP 真实发送数。
     pub direct_udp_sent: u64,
+    /// 新流没有域名缓存命中（spec §9.16 `domain_miss`）。
+    pub domain_miss: u64,
 }
 
 /// S4: 终结流记录（事件分发用）。
@@ -220,6 +223,8 @@ pub struct Dataplane {
     direct_tcp: DirectTcpRelay,
     /// Direct UDP 真实出口（共享 NAT 语义，不复制 NAT 表）。
     direct_udp: Option<RealUdpEgress>,
+    /// 共享 DNS 缓存（DNS 应答写入 → 后续新流按 dst IP 反查域名）。
+    dns_cache: Arc<Mutex<DnsCache>>,
 }
 
 /// 流会话可见状态（spec §9.16 / §11.3）。
@@ -333,6 +338,7 @@ impl Dataplane {
             flow_sessions: FlowSessionsState::default(),
             direct_tcp: DirectTcpRelay::new(DirectEgressConfig::default()),
             direct_udp: RealUdpEgress::new(Arc::new(Mutex::new(EgressNat::default()))).ok(),
+            dns_cache: Arc::new(Mutex::new(DnsCache::new(DEFAULT_DNS_CACHE_ENTRIES))),
         })
     }
 
@@ -359,6 +365,31 @@ impl Dataplane {
     /// 决策缓存计数器快照。
     pub fn decision_cache_stats(&self) -> FlowDecisionCacheStats {
         self.decision_cache.stats()
+    }
+
+    /// 写入一条 DNS 应答映射（SNI/应答写入路径）。
+    pub fn record_dns_answer(&mut self, domain: &str, ip: Ipv4Addr) {
+        if let Ok(mut cache) = self.dns_cache.lock() {
+            cache.insert(domain, IpAddr::V4(ip), 300);
+        }
+    }
+
+    /// 共享 DNS 缓存句柄（与 UnifiedDns 同源）。
+    pub fn dns_cache_handle(&self) -> Arc<Mutex<DnsCache>> {
+        Arc::clone(&self.dns_cache)
+    }
+
+    /// 某包的缓存出站（测试/可观测用）。
+    pub fn cached_outbound(&mut self, packet: &[u8]) -> Option<String> {
+        let flow = nexus_projection::egress::FlowKey::parse(packet)?;
+        let now = u64::try_from(self.qos_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let key = FlowDecisionKey {
+            flow,
+            frontend: Frontend::Tun,
+        };
+        self.decision_cache
+            .get(&key, now)
+            .map(|d| d.selected_outbound.clone())
     }
 
     /// 注入组合根构建的 ProductionChainDeps。
@@ -571,6 +602,18 @@ impl Dataplane {
                 return classification_from_target(&cached.target);
             }
         }
+        let domain = parse_ipv4_dst(packet).and_then(|dst| {
+            let ip = IpAddr::V4(Ipv4Addr::from(dst));
+            let hit = self
+                .dns_cache
+                .lock()
+                .ok()
+                .and_then(|mut cache| cache.lookup(&ip));
+            if hit.is_none() {
+                self.with_stats(|s| s.domain_miss += 1);
+            }
+            hit
+        });
         let candidates: &[CandidatePath] = if self.config.boost_enabled {
             &self.candidates
         } else {
@@ -586,7 +629,7 @@ impl Dataplane {
                 candidates,
                 0.0, // degrade_threshold：MVP 用 0（不触发 degraded）
             );
-            classifier.classify(packet, None)
+            classifier.classify(packet, domain.as_deref())
         };
         if let Some(key) = cache_key {
             let decision = decision_from_classification(&classification, now_millis);
@@ -918,6 +961,18 @@ impl Dataplane {
 
     /// Phase C：转发 Active 后 flush 的 UDP 缓冲包（重分类后按 Mesh/Proxy 转发）。
     fn forward_buffered_udp(&mut self, packet: &[u8]) {
+        let domain = parse_ipv4_dst(packet).and_then(|dst| {
+            let ip = IpAddr::V4(Ipv4Addr::from(dst));
+            let hit = self
+                .dns_cache
+                .lock()
+                .ok()
+                .and_then(|mut cache| cache.lookup(&ip));
+            if hit.is_none() {
+                self.with_stats(|s| s.domain_miss += 1);
+            }
+            hit
+        });
         let candidates: &[CandidatePath] = if self.config.boost_enabled {
             &self.candidates
         } else {
@@ -933,7 +988,7 @@ impl Dataplane {
                 candidates,
                 0.0,
             );
-            classifier.classify(packet, None)
+            classifier.classify(packet, domain.as_deref())
         };
         match classification {
             Classification::Mesh { .. } => {
@@ -1375,6 +1430,7 @@ impl Dataplane {
                     IpAddr::V6(_) => None,
                 }) {
                     if let Some(response) = build_dns_response(packet, query_id, &query_name, ip) {
+                        self.record_dns_answer(&query_name, ip);
                         if self.tun.write(&response).is_ok() {
                             self.with_stats(|s| {
                                 s.dns_answered += 1;
@@ -2154,6 +2210,42 @@ mod tests {
         let dropped_before = dp.stats().dropped;
         dp.inject_stream_frame_from_n1("x", &[0x00, 0x01]);
         assert_eq!(dp.stats().dropped, dropped_before + 1);
+    }
+
+    /// S29：DNS 应答后同 IP 新流命中 DOMAIN-SUFFIX；无缓存计 domain_miss。
+    #[test]
+    fn dns_cache_domain_suffix_and_miss() {
+        use nexus_domain::RouteTarget;
+        use nexus_projection::egress::{Rule, SimpleRuleEngine};
+
+        let (mut dp, mock) = test_dataplane();
+        let mut engine = SimpleRuleEngine::new(vec![Rule {
+            cidr: "0.0.0.0/0".parse().unwrap(),
+            target: RouteTarget::Egress {
+                peer: "p2".to_string(),
+            },
+        }]);
+        engine.add_domain_suffix_rule(
+            "example.com",
+            RouteTarget::Egress {
+                peer: "p1".to_string(),
+            },
+        );
+        dp.set_rule_engine(Box::new(engine));
+
+        dp.record_dns_answer("api.example.com", Ipv4Addr::new(203, 0, 113, 7));
+        let pkt = craft_udp([192, 168, 1, 5], [203, 0, 113, 7], 40_000, 443, b"z");
+        mock.lock().unwrap().inject(pkt.clone());
+        assert!(dp.process_one().expect("packet"));
+        assert_eq!(dp.cached_outbound(&pkt).as_deref(), Some("p1"));
+        assert_eq!(dp.stats().domain_miss, 0);
+
+        // 无缓存：IP 规则命中，domain_miss 增加。
+        let fresh = craft_udp([192, 168, 1, 5], [203, 0, 113, 8], 40_001, 443, b"z");
+        mock.lock().unwrap().inject(fresh.clone());
+        assert!(dp.process_one().expect("fresh packet"));
+        assert_eq!(dp.cached_outbound(&fresh).as_deref(), Some("p2"));
+        assert_eq!(dp.stats().domain_miss, 1);
     }
 
     /// S27：Direct UDP 真实往返 + ICMP 不支持计数。
