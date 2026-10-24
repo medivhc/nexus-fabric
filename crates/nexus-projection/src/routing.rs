@@ -556,7 +556,8 @@ mod tests {
 
     #[test]
     fn route_packet_fills_explicit_ports() {
-        struct Recorder(std::sync::Arc<std::sync::Mutex<Option<(Option<u16>, Option<u16>)>>>);
+        type Ports = (Option<u16>, Option<u16>);
+        struct Recorder(std::sync::Arc<std::sync::Mutex<Option<Ports>>>);
         impl Router for Recorder {
             fn route(&self, req: &RouteRequest) -> RouteTarget {
                 *self.0.lock().unwrap() = Some((req.src_port, req.dst_port));
