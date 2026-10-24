@@ -436,13 +436,13 @@ fn run_dataplane(
     // P1-P5：注入 Proxy 转发引擎（有可用出站则真发，无则 D2 计数降级）。
     if let Some(yaml) = proxy_yaml.as_deref() {
         match nexusd::proxy_fwd::ProxyEngine::new(yaml) {
-            Some(engine) => {
+            Ok(engine) => {
                 dp.set_proxy_engine(engine);
                 eprintln!("[nexusd] dataplane: ProxyEngine wired (proxy_engine_ready=true)");
             }
-            None => {
+            Err(e) => {
                 eprintln!(
-                    "[nexusd] dataplane: proxy.yaml has no usable outbound; proxy packets counted"
+                    "[nexusd] dataplane: ProxyEngine unavailable ({e}); proxy packets counted"
                 );
             }
         }

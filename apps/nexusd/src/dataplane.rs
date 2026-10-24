@@ -601,12 +601,7 @@ impl Dataplane {
         let classification = self.classify_with_cache(&packet);
 
         // S1：TCP + Mesh/Proxy → smoltcp 终结（不再走 raw-datagram 路径）。
-        if is_tcp_packet(&packet)
-            && matches!(
-                classification,
-                Classification::Mesh { .. } | Classification::Proxy { .. }
-            )
-        {
+        if is_tcp_packet(&packet) && matches!(classification, Classification::Mesh { .. }) {
             if !self.qos_admit(&packet) {
                 return Ok(true);
             }
@@ -658,25 +653,25 @@ impl Dataplane {
                     self.with_stats(|s| s.mesh_dropped_no_n1 += 1);
                 }
             }
-            Classification::Proxy { outbound: _ } => {
-                // P1-P5：engine 已注入 → 真实转发；否则走 D2 计数路径。
-                // 先取出 engine 处理结果（避免 borrow 冲突）。
-                let engine_outcome: Option<(Vec<Vec<u8>>, bool)> =
-                    self.proxy_engine.as_mut().map(|e| e.handle_packet(&packet));
-                match engine_outcome {
-                    Some((tun_pkts, forwarded)) => {
-                        for pkt in tun_pkts {
+            Classification::Proxy { ref outbound } => {
+                // P1-P5 / S26：engine 已注入 → 按规则 tag 真实转发；否则计数降级。
+                let outcome = self
+                    .proxy_engine
+                    .as_mut()
+                    .map(|e| e.handle_packet(&packet, outbound));
+                match outcome {
+                    Some(Ok(result)) => {
+                        for pkt in result.tun_packets {
                             if self.tun.write(&pkt).is_ok() {
                                 self.with_stats(|s| s.tun_written += 1);
                             } else {
                                 self.with_stats(|s| s.dropped += 1);
                             }
                         }
-                        // 驱动 engine（回包/重传/事件）。
-                        let more: Vec<Vec<u8>> = self
+                        let more = self
                             .proxy_engine
                             .as_mut()
-                            .map(|e| e.poll())
+                            .map(|e| e.poll().tun_packets)
                             .unwrap_or_default();
                         for pkt in more {
                             if self.tun.write(&pkt).is_ok() {
@@ -685,20 +680,10 @@ impl Dataplane {
                                 self.with_stats(|s| s.dropped += 1);
                             }
                         }
-                        // P1：proxy_forwarded 仅在真实转发发生时计数。
-                        // - UDP：handle_packet 返回真实发送结果 → 按包计数。
-                        // - TCP：dial 异步，转发尚未确认；计数由下方
-                        //   engine.stats() 的 tcp_dials_ok/failed 增量驱动，
-                        //   此处不按包计数。
-                        if packet.get(9) == Some(&17) {
-                            if forwarded {
-                                self.with_stats(|s| s.proxy_forwarded += 1);
-                            } else {
-                                self.with_stats(|s| s.proxy_dropped_no_proxy += 1);
-                            }
+                        if packet.get(9) == Some(&17) && result.forwarded {
+                            self.with_stats(|s| s.proxy_forwarded += 1);
                         }
-                        // P1：同步 TCP dial 结果增量（dial 成功 → proxy_forwarded；
-                        // dial 失败 → proxy_dropped_no_proxy）。
+                        // 同步 TCP dial 结果增量。
                         let eng_stats = self
                             .proxy_engine
                             .as_ref()
@@ -717,9 +702,21 @@ impl Dataplane {
                             s.proxy_dropped_no_proxy += fail_delta;
                         });
                     }
-                    // P3：engine 未注入（无可用出站或未配置）→
-                    // proxy_dropped_no_proxy。旧"兼容"分支（计 proxy_forwarded）
-                    // 已删除：那是契约废除的纯分类计数。
+                    Some(Err(crate::proxy_fwd::ProxyEngineError::UnknownOutbound { .. }))
+                    | Some(Err(crate::proxy_fwd::ProxyEngineError::UnsupportedOutboundKind {
+                        ..
+                    }))
+                    | Some(Err(crate::proxy_fwd::ProxyEngineError::DialFailed { .. })) => {
+                        self.with_stats(|s| {
+                            s.proxy_dropped_no_proxy += 1;
+                            s.dropped += 1;
+                        });
+                    }
+                    Some(Err(crate::proxy_fwd::ProxyEngineError::UnsupportedProtocol {
+                        ..
+                    })) => {
+                        self.with_stats(|s| s.dropped += 1);
+                    }
                     None => {
                         self.with_stats(|s| s.proxy_dropped_no_proxy += 1);
                     }
@@ -828,16 +825,20 @@ impl Dataplane {
                     self.with_stats(|s| s.mesh_dropped_no_n1 += 1);
                 }
             }
-            Classification::Proxy { outbound: _ } => {
+            Classification::Proxy { ref outbound } => {
                 if let Some(engine) = self.proxy_engine.as_mut() {
-                    let (tun_pkts, forwarded) = engine.handle_packet(packet);
-                    for pkt in tun_pkts {
-                        if self.tun.write(&pkt).is_ok() {
-                            self.with_stats(|s| s.tun_written += 1);
+                    match engine.handle_packet(packet, outbound) {
+                        Ok(result) => {
+                            for pkt in result.tun_packets {
+                                if self.tun.write(&pkt).is_ok() {
+                                    self.with_stats(|s| s.tun_written += 1);
+                                }
+                            }
+                            if result.forwarded {
+                                self.with_stats(|s| s.proxy_forwarded += 1);
+                            }
                         }
-                    }
-                    if forwarded {
-                        self.with_stats(|s| s.proxy_forwarded += 1);
+                        Err(_) => self.with_stats(|s| s.proxy_dropped_no_proxy += 1),
                     }
                 } else {
                     self.with_stats(|s| s.proxy_dropped_no_proxy += 1);
@@ -1945,7 +1946,7 @@ mod tests {
         let tun = Box::new(SharedTun {
             inner: Arc::clone(&mock),
         });
-        // 8.8.8.8：不在 mesh CIDR、不在 bypass → Proxy（MVP 回落）。
+        // 8.8.8.8：不在 mesh CIDR、不在 bypass → Proxy。
         let config = DataplaneConfig {
             mesh_cidrs: vec!["10.200.0.0/24".to_string()],
             bypass_cidrs: vec!["192.168.0.0/16".to_string()],
@@ -1959,82 +1960,18 @@ mod tests {
             frames: Arc::clone(&frames),
         }));
 
-        // SYN → SYN-ACK（终结仍发生，S1）。
+        // S26：Proxy TCP 由 ProxyEngine 终结/中继；未注入 engine → 计数降级，
+        // 不再走 Dataplane 的 Mesh 终结器（§9.10.1 归属）。
         let syn = craft_tcp([10, 0, 0, 2], [8, 8, 8, 8], 40001, 443, 2000, 0, 0x02, &[]);
         mock.lock().unwrap().inject(syn);
         assert!(dp.process_one().expect("syn"));
-        let written = mock.lock().unwrap().take_written();
-        assert_eq!(written.len(), 1, "S1: proxy TCP also terminated");
-        let srv_seq = syn_ack_srv_seq(&written[0]);
-
-        // ACK → 握手完成 → 只计数，不经 N1。
-        let ack = craft_tcp(
-            [10, 0, 0, 2],
-            [8, 8, 8, 8],
-            40001,
-            443,
-            2001,
-            srv_seq + 1,
-            0x10,
-            &[],
-        );
-        mock.lock().unwrap().inject(ack);
-        assert!(dp.process_one().expect("ack"));
-        assert_eq!(dp.stats().proxy_tcp_streams, 1, "S4-Proxy: counted");
         assert!(
-            frames.lock().unwrap().is_empty(),
-            "S4-Proxy: no N1 frames (GAP-1)"
+            mock.lock().unwrap().take_written().is_empty(),
+            "S26: Dataplane terminator no longer owns Proxy TCP"
         );
-
-        // DATA → proxy_tcp_bytes 计数。
-        let data = craft_tcp(
-            [10, 0, 0, 2],
-            [8, 8, 8, 8],
-            40001,
-            443,
-            2001,
-            srv_seq + 1,
-            0x18,
-            b"world!",
-        );
-        mock.lock().unwrap().inject(data);
-        assert!(dp.process_one().expect("data"));
-        assert_eq!(dp.stats().proxy_tcp_bytes, 6, "S5-Proxy: 6 bytes counted");
-        assert_eq!(dp.stats().mesh_tcp_frames, 0, "no mesh frames");
-    }
-
-    /// S8：Direct 分类的 TCP 永不进终结器（零回归）。
-    #[test]
-    fn tcp_direct_untouched() {
-        // 192.168.1.1 需 bypass 配置 → Direct。
-        let mock2 = Arc::new(Mutex::new(nexus_projection::MockTun::new("test0")));
-        let tun = Box::new(SharedTun {
-            inner: Arc::clone(&mock2),
-        });
-        let config = DataplaneConfig {
-            mesh_cidrs: vec!["10.200.0.0/24".to_string()],
-            bypass_cidrs: vec!["192.168.0.0/16".to_string()],
-            ..Default::default()
-        };
-        let mut dp = Dataplane::new(tun, config).expect("dataplane new");
-        let syn = craft_tcp(
-            [192, 168, 1, 2],
-            [192, 168, 1, 1],
-            40002,
-            80,
-            3000,
-            0,
-            0x02,
-            &[],
-        );
-        mock2.lock().unwrap().inject(syn);
-        assert!(dp.process_one().expect("process_one"));
-        assert_eq!(dp.stats().direct_forwarded, 1, "S8: direct counted");
-        assert_eq!(dp.stats().tcp_handshakes, 0, "S8: not terminated");
-        assert!(
-            mock2.lock().unwrap().take_written().is_empty(),
-            "S8: no TUN write"
-        );
+        assert_eq!(dp.stats().tcp_handshakes, 0);
+        assert_eq!(dp.stats().proxy_dropped_no_proxy, 1);
+        assert!(frames.lock().unwrap().is_empty(), "Proxy must not use N1");
     }
 
     /// S9：下行 STREAM 帧注入 → terminator → TUN 包。

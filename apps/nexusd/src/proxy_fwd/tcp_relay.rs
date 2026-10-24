@@ -18,6 +18,15 @@ use nexus_projection::tcp::{TcpEvent, TcpTerminator};
 use super::ss_std::SsTcpClient;
 use super::{ProxyDialConfig, ProxyFwdStats};
 
+/// dial 失败事件（ProxyEngine 转为 `ProxyStreamEvent::Failed`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpFailure {
+    /// stream_id。
+    pub stream_id: u32,
+    /// 原因。
+    pub reason: String,
+}
+
 /// 中继线程 → dataplane 线程的事件。
 #[derive(Debug)]
 pub enum TcpFwdEvent {
@@ -56,7 +65,10 @@ const RELAY_READ_TIMEOUT: Duration = Duration::from_millis(100);
 /// TCP 转发器（dataplane 线程拥有）。
 pub struct TcpForwarder {
     terminator: TcpTerminator,
-    dial_config: ProxyDialConfig,
+    outbounds: HashMap<String, ProxyDialConfig>,
+    /// 当前正在喂给终结器的包的出站 tag（Syn 事件消费）。
+    current_tag: Option<String>,
+    failures: Vec<TcpFailure>,
     event_tx: Sender<TcpFwdEvent>,
     event_rx: Receiver<TcpFwdEvent>,
     /// stream_id → 中继句柄（dial 成功后）。
@@ -69,11 +81,13 @@ pub struct TcpForwarder {
 }
 
 impl TcpForwarder {
-    pub fn new(dial_config: ProxyDialConfig) -> Self {
+    pub fn new(outbounds: HashMap<String, ProxyDialConfig>) -> Self {
         let (event_tx, event_rx) = mpsc::channel();
         Self {
             terminator: TcpTerminator::new(),
-            dial_config,
+            outbounds,
+            current_tag: None,
+            failures: Vec::new(),
             event_tx,
             event_rx,
             relays: HashMap::new(),
@@ -84,9 +98,10 @@ impl TcpForwarder {
     }
 
     /// 处理一个 proxy 分类的 TCP 包；返回待写回 TUN 的包。
-    pub fn handle_packet(&mut self, packet: &[u8]) -> Vec<Vec<u8>> {
+    pub fn handle_packet(&mut self, packet: &[u8], outbound_tag: &str) -> Vec<Vec<u8>> {
         // 先排空 proxy 事件（dial 完成/数据/关闭）。
         self.drain_events();
+        self.current_tag = Some(outbound_tag.to_string());
         // 喂给 smoltcp。
         let mut out = self.terminator.handle_uplink(packet, "proxy");
         // 驱动 smoltcp 并处理事件。
@@ -120,6 +135,10 @@ impl TcpForwarder {
                     Err(e) => {
                         self.pending.remove(&stream_id);
                         self.stats.tcp_dials_failed += 1;
+                        self.failures.push(TcpFailure {
+                            stream_id,
+                            reason: e.clone(),
+                        });
                         // RST smoltcp 侧。
                         let pkts = self.terminator.handle_fabric_rst(stream_id);
                         let _ = self.event_tx.send(TcpFwdEvent::TunPackets(pkts));
@@ -159,7 +178,22 @@ impl TcpForwarder {
             TcpEvent::Syn { stream_id, dst, .. } => {
                 let target = SocketAddr::V4(dst);
                 self.pending.insert(stream_id, target);
-                let config = self.dial_config.clone();
+                let Some(config) = self
+                    .current_tag
+                    .as_deref()
+                    .and_then(|tag| self.outbounds.get(tag))
+                    .cloned()
+                else {
+                    self.pending.remove(&stream_id);
+                    self.stats.tcp_dials_failed += 1;
+                    let reason = format!(
+                        "unknown outbound tag '{}'",
+                        self.current_tag.as_deref().unwrap_or("")
+                    );
+                    self.failures.push(TcpFailure { stream_id, reason });
+                    out.extend(self.terminator.handle_fabric_rst(stream_id));
+                    return;
+                };
                 let tx = self.event_tx.clone();
                 std::thread::spawn(move || {
                     let result = dial_through_proxy(&config, target)
@@ -195,6 +229,12 @@ impl TcpForwarder {
         }
         // 带上之前暂存的 TUN 包。
         out.append(&mut self.pending_tun);
+        self.current_tag = None;
+    }
+
+    /// 取走 dial 失败事件。
+    pub fn take_failures(&mut self) -> Vec<TcpFailure> {
+        std::mem::take(&mut self.failures)
     }
 
     pub fn stats(&self) -> ProxyFwdStats {
