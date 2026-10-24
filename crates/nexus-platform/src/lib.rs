@@ -99,10 +99,13 @@ pub trait PacketCarrier: Send {
     }
 }
 
-pub trait TransparentIngressProvider: Send {
-    fn start(&mut self) -> Result<(), PlatformError>;
-    fn stop(&mut self) -> Result<(), PlatformError>;
-}
+/// 透明入站与捕获规则的平台抽象（spec §9.1 / §9.2）。
+pub mod transparent;
+pub use transparent::{
+    AcceptedTcpStream, CaptureBackend, CaptureRuleError, CaptureRuleSpec, ReceivedDatagram,
+    RuleApplyReport, RuleCleanupReport, TransparentCaptureRules, TransparentIngressError,
+    TransparentTcpIngress, TransparentUdpIngress,
+};
 pub use udp_carrier::UdpCarrier;
 
 /// SecureStore 平台无关核心（machine-id 解析 / NEXSEC1 格式 / AEAD 记录）。
