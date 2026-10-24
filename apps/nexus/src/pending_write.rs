@@ -36,13 +36,12 @@ impl PendingWrite {
         }
     }
 
-    /// 追加待写字节。调用点保证只在 [`Self::ready_for_read`] 时读，因此正常路径
-    /// 不会在未清空时追加；即使误用，追加也保持字节顺序。
+    /// 追加待写字节（追加保序）。
+    ///
+    /// 调用点通常在 [`Self::ready_for_read`] 时入队；但控制帧（如 AnyTLS
+    /// HeartResponse）可能在尾部尚未写完时到达，追加语义必须允许这种交错：
+    /// 新字节排在未写尾部之后，`pos` 不动，最终写出的顺序仍是「旧尾部 → 新字节」。
     pub(crate) fn enqueue(&mut self, data: &[u8]) {
-        debug_assert!(
-            self.buffered().is_empty(),
-            "enqueue while pending tail is non-empty"
-        );
         self.buf.extend_from_slice(data);
     }
 
@@ -51,7 +50,7 @@ impl PendingWrite {
         self.pos >= self.buf.len() && !self.flush_blocked
     }
 
-    /// 尚未写出的尾部（测试与额度断言用）。
+    /// 尚未写出的尾部（写路径与测试共用）。
     pub(crate) fn buffered(&self) -> &[u8] {
         &self.buf[self.pos..]
     }
@@ -74,8 +73,8 @@ impl PendingWrite {
         dst: &mut W,
     ) -> std::io::Result<(WriteProgress, usize)> {
         let mut advanced = 0usize;
-        if self.pos < self.buf.len() {
-            match dst.write(&self.buf[self.pos..]) {
+        if !self.buffered().is_empty() {
+            match dst.write(self.buffered()) {
                 Ok(0) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::WriteZero,
@@ -92,7 +91,7 @@ impl PendingWrite {
                 Err(e) => return Err(e),
             }
         }
-        if self.pos < self.buf.len() {
+        if !self.buffered().is_empty() {
             return Ok((WriteProgress::Blocked, advanced));
         }
         self.buf.clear();
@@ -288,6 +287,47 @@ mod tests {
         }
         assert_eq!(offset, DATA.len());
         assert_eq!(w.rec.out, DATA, "最终拼出的字节序列等于输入");
+        assert!(drained(&pending));
+    }
+
+    /// AnyTLS 控制帧（HeartResponse）同轮到达时，等同 7 字节帧头的最小形状。
+    const CONTROL_FRAME: &[u8] = b"\x01\x00\x00\x00\x00\x00\x00";
+
+    #[test]
+    fn control_frame_appends_behind_unwritten_tail() {
+        let mut pending = PendingWrite::new();
+        pending.enqueue(DATA);
+        let mut w = Capped {
+            cap: 5,
+            rec: Recorder::new(),
+        };
+        let (progress, written) = pending.try_write(&mut w).expect("部分写不是错误");
+        assert_eq!(progress, WriteProgress::Blocked);
+        assert!(written > 0 && written < DATA.len());
+        assert!(!pending.ready_for_read());
+
+        // 尾部非空时追加控制帧：追加语义必须允许，debug 构建不得 panic。
+        pending.enqueue(CONTROL_FRAME);
+        let mut expected_tail = DATA[written..].to_vec();
+        expected_tail.extend_from_slice(CONTROL_FRAME);
+        assert_eq!(
+            pending.buffered(),
+            expected_tail.as_slice(),
+            "控制帧必须排在未写尾部之后"
+        );
+
+        let mut rounds = 0u32;
+        loop {
+            rounds += 1;
+            assert!(rounds < 10_000, "状态机不得无限循环");
+            let (progress, _) = pending.try_write(&mut w).expect("部分写不是错误");
+            if progress == WriteProgress::Drained {
+                break;
+            }
+        }
+        let mut expected_out = DATA.to_vec();
+        expected_out.extend_from_slice(CONTROL_FRAME);
+        assert_eq!(w.rec.out, expected_out, "写出顺序必须是 先尾部、后控制帧");
         assert!(drained(&pending));
     }
 
