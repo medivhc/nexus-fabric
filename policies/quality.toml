@@ -45,6 +45,40 @@ gates = [
   "portable-core"
 ]
 
+[verification.timeouts]
+default_gate_ms = 900000
+full_deadline_ms = 7200000
+
+[verification.timeouts.gates]
+whitespace = 60000
+format = 180000
+check = 1800000
+clippy = 1800000
+architecture-delta = 120000
+dependency-delta = 600000
+resource-type-neutrality = 120000
+affected-tests = 1800000
+selected-properties = 1200000
+workspace-tests = 2400000
+integration = 2400000
+product-scenarios = 2700000
+regression = 600000
+architecture-policy = 120000
+dependency-governance = 600000
+coverage-summary = 3600000
+selected-fuzz = 900000
+selected-concurrency = 2400000
+performance-budgets = 60000
+bench = 600000
+platform-checks = 120000
+feature-matrix = 900000
+portable-core = 1800000
+
+[verification.timeouts.scenarios]
+sandbox_ms = 180000
+real_device_ms = 600000
+drain_ms = 10000
+
 [evidence]
 verdicts = ["PASS", "FAIL", "STALE", "UNKNOWN", "BLOCKED"]
 candidate_completion_is_pass = false
