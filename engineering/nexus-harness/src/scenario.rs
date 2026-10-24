@@ -1138,9 +1138,11 @@ fn run_checked_with_timeouts(
     let program = parts.next().unwrap_or("");
     let args: Vec<&str> = parts.collect();
     let program = if program == "nexus-harness" {
-        std::env::current_exe()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default()
+        // 用启动时确立的稳定路径，而不是每次现读 `current_exe()`：运行期
+        // `cargo build` 会重链原路径，现读会得到 `(deleted)` 字面量。
+        crate::self_exe::stable_self_exe()
+            .to_string_lossy()
+            .to_string()
     } else {
         program.to_string()
     };

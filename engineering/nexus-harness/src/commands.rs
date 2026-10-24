@@ -313,6 +313,9 @@ pub struct VerifyRun {
     pub gates: Vec<Gate>,
     pub scenarios: Vec<ScenarioResult>,
     pub timing: evidence::VerifyTiming,
+    /// 场景门前发现自身映像已被替换（稳定路径建立失败的回退态）：整轮 fail-closed。
+    pub self_exe_replaced: bool,
+    pub self_exe_detail: Option<String>,
 }
 
 /// 门名序列：`whitespace` + fast 声明 + （full 时）full 声明，顺序不变。
@@ -445,6 +448,8 @@ fn execute_verify(
     let mut scenarios: Vec<ScenarioResult> = Vec::new();
     // 共享测试会话：门循环前构造一次，跨门存活（不写 evidence、不跨 run）。
     let mut shared_session = gates::SharedTestSession::new();
+    let mut self_exe_replaced = false;
+    let mut self_exe_detail: Option<String> = None;
 
     let mut invoke = |name: &str, budget: GateBudget| -> Gate {
         gates::timed(|| match name {
@@ -471,24 +476,38 @@ fn execute_verify(
                 budget,
                 global,
             ),
-            "product-scenarios" => scenario_gate_with_budget(
-                config,
-                name,
-                &["product", "engineering", "platform"],
-                artifacts_ref,
-                budget,
-                &timeouts.scenarios,
-                &mut scenarios,
-            ),
-            "regression" => scenario_gate_with_budget(
-                config,
-                name,
-                &["regression"],
-                artifacts_ref,
-                budget,
-                &timeouts.scenarios,
-                &mut scenarios,
-            ),
+            "product-scenarios" => match crate::self_exe::replacement_problem() {
+                Some(problem) => {
+                    self_exe_replaced = true;
+                    self_exe_detail = Some(problem.clone());
+                    self_exe_blocked_gate(name, &problem)
+                }
+                None => scenario_gate_with_budget(
+                    config,
+                    name,
+                    &["product", "engineering", "platform"],
+                    artifacts_ref,
+                    budget,
+                    &timeouts.scenarios,
+                    &mut scenarios,
+                ),
+            },
+            "regression" => match crate::self_exe::replacement_problem() {
+                Some(problem) => {
+                    self_exe_replaced = true;
+                    self_exe_detail = Some(problem.clone());
+                    self_exe_blocked_gate(name, &problem)
+                }
+                None => scenario_gate_with_budget(
+                    config,
+                    name,
+                    &["regression"],
+                    artifacts_ref,
+                    budget,
+                    &timeouts.scenarios,
+                    &mut scenarios,
+                ),
+            },
             "architecture-policy" => gates::architecture_gate(config, budget),
             "dependency-governance" => gates::dependency_gate(repo, config, budget),
             "coverage-summary" => gates::coverage_gate(repo, budget),
@@ -527,7 +546,36 @@ fn execute_verify(
         gates,
         scenarios,
         timing,
+        self_exe_replaced,
+        self_exe_detail,
     }
+}
+
+/// 场景门 fail-closed：稳定路径建立失败（回退原路径）且运行映像已被替换时，
+/// 39 个自调用场景只会产出同签名的伪 FAIL。这里把整轮改成明确诊断的 BLOCKED，
+/// 不把"环境自伤"写成"产品失败"。
+fn self_exe_blocked_gate(name: &str, problem: &str) -> Gate {
+    let mut gate = Gate::blocked(
+        name,
+        &format!(
+            "self_exe_replaced=true: own executable image was replaced mid-run; \
+             refusing to run self-invoking scenarios instead of reporting bogus FAILs: {problem}"
+        ),
+    );
+    // 这不是全局截止导致的跳过，evidence 里不要伪装成 skipped_by_deadline。
+    gate.skipped_by_deadline = false;
+    gate
+}
+
+/// 落盘 `self_exe.json`（fail-closed 探针命中的事实记录）。写前先建目录：
+/// 极端情形下（首个场景门即触发 fail-closed）本轮 evidence 目录可能尚未建
+/// 好，直接 write 会 ENOENT——fail-closed 的证据本身不能丢。
+fn write_self_exe_record(dir: &std::path::Path, payload: &Value) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(
+        dir.join("self_exe.json"),
+        serde_json::to_string_pretty(payload).unwrap_or_default(),
+    )
 }
 
 pub fn verify(sub: &str) -> Outcome {
@@ -579,14 +627,34 @@ pub fn verify(sub: &str) -> Outcome {
             vec![("gates".to_string(), gates_json(&run.gates))],
         );
     }
+    if run.self_exe_replaced {
+        // 场景门前的 fail-closed 探针命中：把事实写进 evidence，而不是只留在内存里。
+        // 独立文件避免改动 evidence.schema.json 的 required 字段集合。
+        let payload = json!({
+            "self_exe_replaced": true,
+            "detail": run.self_exe_detail,
+            "probe": crate::self_exe::describe_json(),
+        });
+        let dir = config.evidence_dir.join(format!("verify-{id}"));
+        let path = dir.join("self_exe.json");
+        if let Err(e) = write_self_exe_record(&dir, &payload) {
+            eprintln!(
+                "nexus-harness: cannot record self_exe_replaced evidence at {}: {e}",
+                path.display()
+            );
+        }
+    }
 
-    let extras = vec![
+    let mut extras = vec![
         ("gates".to_string(), gates_json(&run.gates)),
         (
             "evidence".to_string(),
             json!({"id": id, "dir": format!("verify-{id}"), "verdict": verdict, "bindings": bindings.to_json()}),
         ),
     ];
+    if run.self_exe_replaced {
+        extras.push(("self_exe_replaced".to_string(), json!(true)));
+    }
     (verdict, message, extras)
 }
 
@@ -898,6 +966,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("tmpdir");
         dir
+    }
+
+    /// TRIAGE 小修回归：本轮 evidence 目录（多层）尚不存在时，self_exe.json
+    /// 兜底记录仍须写出——否则 fail-closed（整门 BLOCKED）的证据本身会因
+    /// ENOENT 丢失。此处只改落盘路径，BLOCKED 语义由探针与
+    /// self_exe_blocked_gate 决定、不受本函数影响。
+    #[test]
+    fn self_exe_record_creates_missing_evidence_dir() {
+        let base = temp_dir("self-exe-record");
+        let dir = base.join("verify-missing").join("nested");
+        assert!(!dir.exists());
+        let payload = json!({"self_exe_replaced": true, "detail": "probe hit"});
+        write_self_exe_record(&dir, &payload).expect("record must be written");
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("self_exe.json")).unwrap())
+                .unwrap();
+        assert_eq!(written["self_exe_replaced"], json!(true));
+        assert_eq!(written["detail"], json!("probe hit"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// 与 write_evidence 落盘形状一致的最小完整 evidence。
