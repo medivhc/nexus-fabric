@@ -7,6 +7,7 @@
 //! 不接触平台句柄或系统调用（平台 socket 由组合根经 trait/组合注入）。
 
 pub mod decision;
+pub mod direct;
 
 use std::io;
 use std::net::{SocketAddrV4, TcpStream};
@@ -298,6 +299,8 @@ impl Default for TransparentConfig {
 pub struct TransparentDeps {
     /// 代理出口适配器；`None` 表示无代理配置（Proxy 决策报错/降级）。
     pub proxy_egress: Option<Box<dyn ProxyFlowEgress>>,
+    /// Direct 真转发出口。
+    pub direct: direct::DirectEgress,
     /// 前端配置。
     pub config: TransparentConfig,
 }
