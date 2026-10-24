@@ -12,6 +12,9 @@
 
 #![forbid(unsafe_code)]
 
+/// 非阻塞中继写状态机（relay pump 共享；crate 私有，不扩大 public surface）。
+mod pending_write;
+
 /// Linux durable Artifact receiver shared by the CLI and daemon composition roots.
 #[cfg(target_os = "linux")]
 pub mod artifact_download;
