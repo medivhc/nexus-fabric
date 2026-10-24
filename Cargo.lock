@@ -1492,9 +1492,11 @@ name = "nexus-platform-linux"
 version = "0.1.0"
 dependencies = [
  "fuser",
+ "libc",
  "nexus-platform",
  "nexus-storage",
  "nexus-workspace",
+ "socket2",
 ]
 
 [[package]]

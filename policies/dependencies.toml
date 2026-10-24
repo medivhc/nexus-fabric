@@ -627,3 +627,29 @@ os_transitive_deps = "libc (already in tree), bitflags, windows-sys"
 approved = true
 approved_date = "2026-10-10"
 review_basis = "修复 B-R1：0.0.0.0 时按网卡派生可路由 UDP 地址，避免 SDP 只带 loopback 候选导致真实浏览器零连接"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-platform-linux"
+crate = "socket2"
+version = "0.6"
+default_features = false
+features = []
+architecture_layer = "Linux platform adapter only; TPROXY capture socket helpers. No new internal architecture edge and nothing added to portable core."
+feature_scope = "default features disabled; only the always-on std socket glue is used"
+license = "MIT OR Apache-2.0 (allowlisted)"
+security = "0.6.5 already present in Cargo.lock via apps/nexus; no known advisories"
+portability = "Linux-only adapter (nexus-platform-linux); not in portable_core and never re-exported to portable crates"
+supply_chain = "version pinned by Cargo.lock (0.6.5); no new transitive crates beyond those already in the workspace"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-platform-linux"
+crate = "libc"
+version = "0.2"
+default_features = true
+features = []
+architecture_layer = "Linux platform adapter only; raw IP_TRANSPARENT / IP_RECVORIGDSTADDR / IP_PKTINFO setsockopt and sendmsg/recvmsg ancillary structs. No new internal architecture edge."
+feature_scope = "libc default (std) surface; no extra features"
+license = "MIT OR Apache-2.0 (allowlisted)"
+security = "0.2.189 already present in Cargo.lock; no known advisories"
+portability = "Linux-only adapter (nexus-platform-linux); portable core keeps #![forbid(unsafe_code)] and never links libc"
+supply_chain = "version pinned by Cargo.lock (0.2.189); already a workspace dependency (nexus-network/apps/nexusd)"
