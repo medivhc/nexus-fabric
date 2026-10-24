@@ -72,8 +72,10 @@ fn coord_wait_uses_virtual_time() {
     a.nonce = 0; // replaced below from captured offer
     let ch = FakeChannel::new(clock.clone(), Vec::new());
     let sock = FakeSocket::new(clock.clone(), Some(direct()));
-    let mut cfg = PunchConfig::default();
-    cfg.coord_skew_ms = 200;
+    let cfg = PunchConfig {
+        coord_skew_ms: 200,
+        ..PunchConfig::default()
+    };
     let mut s = PunchSession::new(
         nexus_nat_traversal::PeerId([1; 32]),
         cands(NatType::FullCone, 5000),
@@ -132,9 +134,11 @@ fn spray_pacing_50ms() {
     let clock = ManualPunchClock::at(0);
     let ch = FakeChannel::new(clock.clone(), Vec::new());
     let sock = FakeSocket::new(clock.clone(), Some(direct()));
-    let mut cfg = PunchConfig::default();
-    cfg.spray_k = 2;
-    cfg.coord_skew_ms = 0;
+    let cfg = PunchConfig {
+        spray_k: 2,
+        coord_skew_ms: 0,
+        ..PunchConfig::default()
+    };
     let hint = nexus_nat_traversal::PredictionHint {
         base_port: 40001,
         delta: 1,
@@ -165,11 +169,13 @@ fn spray_budget_3s() {
     let clock = ManualPunchClock::at(0);
     let ch = FakeChannel::new(clock.clone(), Vec::new());
     let sock = FakeSocket::new(clock.clone(), Some(direct()));
-    let mut cfg = PunchConfig::default();
-    cfg.spray_k = 32;
-    cfg.spray_interval_ms = 50;
-    cfg.spray_time_budget = Duration::from_millis(100);
-    cfg.coord_skew_ms = 0;
+    let cfg = PunchConfig {
+        spray_k: 32,
+        spray_interval_ms: 50,
+        spray_time_budget: Duration::from_millis(100),
+        coord_skew_ms: 0,
+        ..PunchConfig::default()
+    };
     let hint = nexus_nat_traversal::PredictionHint {
         base_port: 40001,
         delta: 1,
@@ -259,10 +265,12 @@ fn mapping_probe_count_bounded() {
     let clock = ManualPunchClock::at(0);
     let ch = FakeChannel::new(clock.clone(), Vec::new());
     let sock = FakeSocket::new(clock.clone(), Some(direct()));
-    let mut cfg = PunchConfig::default();
-    cfg.coord_skew_ms = 0;
-    cfg.mapping_probe_count = 3;
-    cfg.mapping_probe_interval_ms = 50;
+    let cfg = PunchConfig {
+        coord_skew_ms: 0,
+        mapping_probe_count: 3,
+        mapping_probe_interval_ms: 50,
+        ..PunchConfig::default()
+    };
     let mut s = PunchSession::new(
         nexus_nat_traversal::PeerId([1; 32]),
         cands(NatType::Symmetric, 5000),

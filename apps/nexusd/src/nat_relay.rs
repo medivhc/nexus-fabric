@@ -177,13 +177,16 @@ fn parse_hex32(s: &str) -> Result<[u8; 32], ()> {
     Ok(out)
 }
 
+/// Per-peer sink lists.
+type SinkMap = HashMap<[u8; 32], Vec<Arc<dyn RelayConnSink>>>;
+
 /// Production TURN relay provider.
 pub struct TurnRelayProvider {
     my_id: FabricPeerId,
     identity: FabricIdentity,
     turn: Mutex<TurnManager>,
     book: Arc<dyn RelayAddressBook>,
-    sinks: Mutex<HashMap<[u8; 32], Vec<Arc<dyn RelayConnSink>>>>,
+    sinks: Mutex<SinkMap>,
     up: AtomicBool,
 }
 

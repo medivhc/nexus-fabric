@@ -3311,13 +3311,14 @@ mod tests {
         assert_eq!(
             members,
             vec![
+                "nexus-nat-traversal".to_string(),
                 "nexus-platform-host".to_string(),
                 "nexus-plugin".to_string(),
                 "nexus-turn".to_string()
             ]
         );
-        assert_eq!(members.len() * 2, 6, "3 members × 2 flags");
-        assert_eq!(skipped, 49, "52 workspace members - 3 with features");
+        assert_eq!(members.len() * 2, 8, "4 members × 2 flags");
+        assert_eq!(skipped, 48, "52 workspace members - 4 with features");
     }
 
     #[test]
@@ -3438,12 +3439,12 @@ mod tests {
     fn parse_shared_output_targets_and_durations() {
         let meta = crate::env::cargo_metadata().expect("cargo metadata");
         let expected = integration_targets(&meta);
-        assert_eq!(expected.len(), 25);
+        assert_eq!(expected.len(), 35);
         let (lines, exec_map) = sample_shared_output(&expected, "ok");
         let run = parse_shared_output(&lines, 1234, true, &meta, &exec_map);
         assert_eq!(
             run.targets.len(),
-            25,
+            35,
             "duplicate target names must stay distinct"
         );
         assert_eq!(

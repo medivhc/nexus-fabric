@@ -100,6 +100,7 @@ impl PunchPredictor for DefaultPredictor {
 }
 
 /// 组合根/测试使用的方向决策 helper（不读全局状态）。
+#[allow(clippy::too_many_arguments)]
 pub fn default_plan(
     local_symmetric: bool,
     remote_symmetric: bool,

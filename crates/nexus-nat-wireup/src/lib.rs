@@ -1020,6 +1020,7 @@ fn conn_closed(conn: &Arc<ConnShared>) -> bool {
 /// One-shot convenience: build an ephemeral manager, register the relay,
 /// run the punch. (The responder thread outlives the call, which is
 /// required for the both-initiate case.)
+#[allow(clippy::too_many_arguments)]
 pub fn punch_peer(
     driver: &Arc<Driver>,
     my_id: FabricPeerId,

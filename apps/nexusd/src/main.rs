@@ -457,11 +457,6 @@ fn run_dataplane(
 ///   `NatSwitching::on_relay_connected` 的生产喂入（D5）需要更深的 mesh/fabric
 ///   集成（超出本任务 5 文件范围）；本运行时先激活 NAT 路径决策引擎（AC5：
 ///   配置开关可验证开启/关闭），并保留 `sw` 供后续 relay 钩子调用。
-/// Relay provider enabled flag (read from the config file boundary once).
-fn punch_relay_enabled() -> bool {
-    true
-}
-
 struct NatSwitchRuntime {
     turn: nat_turn::TurnManager,
     stun: nat_stun::StunProber,
@@ -502,13 +497,12 @@ impl NatSwitchRuntime {
     ) -> Option<JoinHandle<()>> {
         if let Some(id) = &identity {
             eprintln!(
-                "[nat-relay] provider_ready identity={} relay_provider_enabled={}",
+                "[nat-relay] provider_ready identity={}",
                 id.peer_id()
                     .0
                     .iter()
                     .map(|b| format!("{b:02x}"))
-                    .collect::<String>(),
-                punch_relay_enabled()
+                    .collect::<String>()
             );
         }
         // TURN 生命周期管理器（配置缺失时由调用方保证为 Some）。

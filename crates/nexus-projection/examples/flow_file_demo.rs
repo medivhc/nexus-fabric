@@ -60,7 +60,11 @@ fn make_hub() -> Option<(FlowSessionHub, PeerId, SocketAddr)> {
     let local = listener.local_addr().ok()?;
     let pm = Arc::new(Mutex::new(PathManager::new(fast_config())));
     let link = PathLink::new(pm);
-    let punch = PunchManager::new(Driver::new_client().ok()?, PeerId([9u8; 32]));
+    let punch = PunchManager::new(
+        Driver::new_client().ok()?,
+        PeerId([9u8; 32]),
+        std::sync::Arc::new(nexus_nat_wireup::SystemPunchClock::new()),
+    );
     let hub = FlowSessionHub::new(listener, link, punch);
     Some((hub, peer, local))
 }

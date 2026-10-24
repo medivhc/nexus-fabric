@@ -83,9 +83,11 @@ fn run_session(
     let ch = FakeChannel::new(clock.clone(), Vec::new());
     *ch.auto_answer.lock().unwrap() = Some(answer(remote_nat, prediction));
     let sock = FakeSocket::new(clock.clone(), Some("198.51.100.9:40000".parse().unwrap()));
-    let mut cfg = PunchConfig::default();
-    cfg.coord_skew_ms = 0;
-    cfg.spray_k = 2;
+    let cfg = PunchConfig {
+        coord_skew_ms: 0,
+        spray_k: 2,
+        ..PunchConfig::default()
+    };
     let mut s = PunchSession::new(
         nexus_nat_traversal::PeerId([7; 32]),
         cands(local_nat, 5000),
