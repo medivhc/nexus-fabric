@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """证据收尾（B-8）：只追加 artifacts 与 notes，不改 verdict/error/metrics。
 
+ProbeJson 自引用：probe.json 无法在自己的 artifacts 里记录自身的最终哈希（追加
+Pcap/ClientLog 条目与 notes 后哈希必然变化）。因此 ProbeJson 不进入 artifacts；
+probe.json 的最终 sha256/bytes 写入 finalize.log（`probe_json_final_*`），避免
+自引用条目与最终文件长期不符。
+
 唯一例外（计划 §8.1 规则 4 / AC-23）：失败格（bad-credential/bad-config）缺 pcap 或
 pcap 无包 → 降为 BLOCKED + E_EVIDENCE_GAP。该降级显式写入 finalize.log。
 """
@@ -52,7 +57,9 @@ def main():
         )
         log.append(f"artifact kind={kind} path={rel} bytes={p.stat().st_size}")
 
-    add("ProbeJson", probe_path)
+    evidence["artifacts"] = [
+        x for x in evidence.get("artifacts", []) if x.get("kind") != "ProbeJson"
+    ]
     if a.pcap:
         add("Pcap", a.pcap)
     if a.cell_log:
@@ -88,6 +95,8 @@ def main():
         log.append(f"DOWNGRADE {old}->Blocked reason=pcap_missing packets={pcap_packets}")
 
     probe_path.write_text(json.dumps(evidence, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    log.append(f"probe_json_final_sha256={sha256(probe_path)}")
+    log.append(f"probe_json_final_bytes={probe_path.stat().st_size}")
     (Path(a.cell_dir) / "finalize.log").write_text(
         f"utc={__import__('datetime').datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
         + "\n".join(log)
