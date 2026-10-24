@@ -167,6 +167,7 @@ fn run() -> serde_json::Value {
         boost_enabled: false,
         n1_configured: true,
         proxy_configured: false,
+        ..Default::default()
     };
     let mut dp = Dataplane::new(Box::new(SharedTun(tun_clone)), config).expect("new");
     // 注入 mock N1 → establish 成功（会话可进 Active）。
@@ -296,6 +297,7 @@ fn run() -> serde_json::Value {
         boost_enabled: false,
         n1_configured: false,
         proxy_configured: false,
+        ..Default::default()
     };
     let mut dp3 = Dataplane::new(Box::new(SharedTun3(tun3_clone)), config3).expect("new3");
     dp3.enable_flow_sessions_with_establisher(Box::new(BlockingEstablisher));
@@ -336,6 +338,7 @@ fn run() -> serde_json::Value {
         boost_enabled: false,
         n1_configured: false, // 无上游
         proxy_configured: false,
+        ..Default::default()
     };
     let mut dp2 = Dataplane::new(Box::new(SharedTun2(tun2_clone)), config2).expect("new2");
     dp2.enable_flow_sessions();

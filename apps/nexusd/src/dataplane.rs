@@ -27,12 +27,16 @@ use nexus_flow_session::{
 use nexus_network::n1::bridge::N1Sender;
 use nexus_path::{CandidatePath, PathConfig, PathManager};
 use nexus_projection::TunDevice;
+use nexus_projection::classifier::DropReason;
 use nexus_projection::classifier::{Classification, PacketClassifier};
 use nexus_projection::egress::{Rule, SimpleRuleEngine};
 use nexus_projection::routing::Cidr;
 use nexus_projection::tcp::{
     FourTuple, STREAM_FIN, STREAM_RST, STREAM_SYN, TcpEvent, TcpTermStats, TcpTerminator,
     decode_stream_frame, encode_stream_frame, encode_syn_payload,
+};
+use nexus_projection::transparent::decision::{
+    CachedDecision, FlowDecisionCache, FlowDecisionCacheStats, FlowDecisionKey, Frontend,
 };
 
 /// 数据面统计（D6 可观测）。
@@ -71,7 +75,7 @@ struct TcpStreamInfo {
 }
 
 /// 数据面配置（从 daemon.toml / network.toml / dns.toml 组装）。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DataplaneConfig {
     /// Mesh 网段 CIDR（字符串，如 "10.144.144.0/24"）。
     pub mesh_cidrs: Vec<String>,
@@ -91,6 +95,31 @@ pub struct DataplaneConfig {
     pub n1_configured: bool,
     /// Proxy 是否已配置。
     pub proxy_configured: bool,
+    /// fake-IP 是否启用（本 run 恒为 false，spec §10.6）。
+    pub fake_ip_enabled: bool,
+    /// 决策缓存容量（spec §11.1：16384）。
+    pub decision_cache_capacity: usize,
+    /// 决策缓存空闲老化秒数（spec §11.1：300s）。
+    pub decision_cache_idle_secs: u64,
+}
+
+impl Default for DataplaneConfig {
+    fn default() -> Self {
+        Self {
+            mesh_cidrs: Vec::new(),
+            bypass_cidrs: Vec::new(),
+            dns_enabled: false,
+            dns_config: None,
+            qos_enabled: false,
+            qos_config: CakeConfig::default(),
+            boost_enabled: false,
+            n1_configured: false,
+            proxy_configured: false,
+            fake_ip_enabled: false,
+            decision_cache_capacity: 16_384,
+            decision_cache_idle_secs: 300,
+        }
+    }
 }
 
 /// 统一数据面：单个 TUN 的完整处理管线。
@@ -169,6 +198,8 @@ pub struct Dataplane {
     /// 规则引擎（S17 过渡：默认把未命中流量送回 Proxy 分支；S24 注入
     /// `DomainRuleEngine` 后按真实 tag 分流）。
     rules: Box<dyn nexus_domain::RuleEngine>,
+    /// TUN/TPROXY 共享的 5 元组决策缓存（spec §9.13）。
+    decision_cache: FlowDecisionCache,
 }
 
 impl Dataplane {
@@ -224,6 +255,8 @@ impl Dataplane {
             None
         };
 
+        let decision_cache_capacity = config.decision_cache_capacity;
+        let decision_cache_idle_secs = config.decision_cache_idle_secs;
         Ok(Self {
             tun,
             manager,
@@ -250,15 +283,32 @@ impl Dataplane {
             flow_pending_data: HashMap::new(),
             flow_pending: HashMap::new(),
             flow_upstream: Arc::new(UpstreamFlags::default()),
-            rules: Box::new(SimpleRuleEngine::new(vec![Rule {
-                cidr: "0.0.0.0/0"
-                    .parse()
-                    .map_err(|e| format!("compat rule CIDR: {e}"))?,
-                target: nexus_domain::RouteTarget::Egress {
-                    peer: "proxy".to_string(),
-                },
-            }])),
+            rules: Box::new(default_simple_engine()?),
+            decision_cache: FlowDecisionCache::new(
+                decision_cache_capacity,
+                std::time::Duration::from_secs(decision_cache_idle_secs),
+            ),
         })
+    }
+
+    /// 注入规则引擎（组合根：有 `proxy.yaml` → `DomainRuleEngine`）。
+    pub fn set_rule_engine(&mut self, rules: Box<dyn nexus_domain::RuleEngine>) {
+        self.rules = rules;
+    }
+
+    /// 注入无代理配置默认引擎（`SimpleRuleEngine`，全部流量交 `proxy` 标签）。
+    ///
+    /// # Errors
+    ///
+    /// 内置 CIDR 非法（不应发生）。
+    pub fn set_default_simple_engine(&mut self) -> Result<(), String> {
+        self.rules = Box::new(default_simple_engine()?);
+        Ok(())
+    }
+
+    /// 决策缓存计数器快照。
+    pub fn decision_cache_stats(&self) -> FlowDecisionCacheStats {
+        self.decision_cache.stats()
     }
 
     /// Phase B：启用流→会话映射（E4/生产按需调用；默认关闭保持旧行为）。
@@ -437,6 +487,43 @@ impl Dataplane {
     ///
     /// 管线：读 TUN → DNS 短路（UDP dport 53）→ 分类 → [S1: TCP 终结] →
     /// QoS → 计数转发。
+    /// 分类并缓存 5 元组决策；命中缓存时不再调用规则引擎（spec §9.13）。
+    fn classify_with_cache(&mut self, packet: &[u8]) -> Classification {
+        let now_millis = u64::try_from(self.qos_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let cache_key =
+            nexus_projection::egress::FlowKey::parse(packet).map(|flow| FlowDecisionKey {
+                flow,
+                frontend: Frontend::Tun,
+            });
+        if let Some(key) = cache_key {
+            if let Some(cached) = self.decision_cache.get(&key, now_millis) {
+                return classification_from_target(&cached.target);
+            }
+        }
+        let candidates: &[CandidatePath] = if self.config.boost_enabled {
+            &self.candidates
+        } else {
+            &[]
+        };
+        let classification = {
+            let classifier = PacketClassifier::new(
+                self.mesh_cidrs.clone(),
+                self.bypass_cidrs.clone(),
+                &*self.rules,
+                self.config.fake_ip_enabled,
+                &self.manager,
+                candidates,
+                0.0, // degrade_threshold：MVP 用 0（不触发 degraded）
+            );
+            classifier.classify(packet, None)
+        };
+        if let Some(key) = cache_key {
+            let decision = decision_from_classification(&classification, now_millis);
+            self.decision_cache.insert(key, decision, now_millis);
+        }
+        classification
+    }
+
     pub fn process_one(&mut self) -> io::Result<bool> {
         // Phase B/C：每轮先回填建连事件（即使无包，保证 Allocating→Active 推进）。
         self.flow_pump();
@@ -456,21 +543,7 @@ impl Dataplane {
         // D2：分类。
         // D6：boost_enabled 时分类器经 PathManager 做 EWMA 只读选路（S30）；
         // 禁用时 candidates 为空（回落默认转发）。
-        let candidates: &[CandidatePath] = if self.config.boost_enabled {
-            &self.candidates
-        } else {
-            &[]
-        };
-        let classifier = PacketClassifier::new(
-            self.mesh_cidrs.clone(),
-            self.bypass_cidrs.clone(),
-            self.rules.as_ref(),
-            false, // fake_ip_enabled：本 run 不启用（spec §10.6）
-            &self.manager,
-            candidates,
-            0.0, // degrade_threshold：MVP 用 0（不触发 degraded）
-        );
-        let classification = classifier.classify(&packet, None);
+        let classification = self.classify_with_cache(&packet);
 
         // S1：TCP + Mesh/Proxy → smoltcp 终结（不再走 raw-datagram 路径）。
         if is_tcp_packet(&packet)
@@ -671,16 +744,19 @@ impl Dataplane {
         } else {
             &[]
         };
-        let classifier = PacketClassifier::new(
-            self.mesh_cidrs.clone(),
-            self.bypass_cidrs.clone(),
-            self.rules.as_ref(),
-            false,
-            &self.manager,
-            candidates,
-            0.0,
-        );
-        match classifier.classify(packet, None) {
+        let classification = {
+            let classifier = PacketClassifier::new(
+                self.mesh_cidrs.clone(),
+                self.bypass_cidrs.clone(),
+                &*self.rules,
+                self.config.fake_ip_enabled,
+                &self.manager,
+                candidates,
+                0.0,
+            );
+            classifier.classify(packet, None)
+        };
+        match classification {
             Classification::Mesh { .. } => {
                 if self.config.n1_configured {
                     let sent = match (&self.n1_sender, ipv4_dst_of(packet)) {
@@ -1472,6 +1548,68 @@ impl nexus_dns::ProxyClassifier for StubProxyClassifier {
         true // MVP：默认走 proxy（触发 fake-IP）
     }
 }
+/// 无代理配置时的默认规则实现（spec §5 G2/D2.3）。
+fn default_simple_engine() -> Result<SimpleRuleEngine, String> {
+    let cidr = "0.0.0.0/0"
+        .parse()
+        .map_err(|e| format!("compat rule CIDR: {e}"))?;
+    Ok(SimpleRuleEngine::new(vec![Rule {
+        cidr,
+        target: nexus_domain::RouteTarget::Egress {
+            peer: "proxy".to_string(),
+        },
+    }]))
+}
+
+fn classification_from_target(target: &nexus_domain::RouteTarget) -> Classification {
+    match target {
+        nexus_domain::RouteTarget::Egress { peer } if peer == "self" => Classification::Direct,
+        nexus_domain::RouteTarget::Egress { peer } => Classification::Proxy {
+            outbound: peer.clone(),
+        },
+        nexus_domain::RouteTarget::Drop => Classification::Drop {
+            reason: DropReason::RuleRejected,
+        },
+        nexus_domain::RouteTarget::MeshPeer { .. } => Classification::Mesh {
+            path: None,
+            degraded: false,
+        },
+    }
+}
+
+fn decision_from_classification(
+    classification: &Classification,
+    now_millis: u64,
+) -> CachedDecision {
+    let (target, selected_outbound) = match classification {
+        Classification::Mesh { .. } => (
+            nexus_domain::RouteTarget::MeshPeer {
+                peer: "mesh".to_string(),
+            },
+            "mesh".to_string(),
+        ),
+        Classification::Proxy { outbound } => (
+            nexus_domain::RouteTarget::Egress {
+                peer: outbound.clone(),
+            },
+            outbound.clone(),
+        ),
+        Classification::Direct => (
+            nexus_domain::RouteTarget::Egress {
+                peer: "self".to_string(),
+            },
+            "self".to_string(),
+        ),
+        Classification::Drop { .. } => (nexus_domain::RouteTarget::Drop, "drop".to_string()),
+    };
+    CachedDecision {
+        target,
+        matched_rule: String::new(),
+        selected_outbound,
+        last_seen_millis: now_millis,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1549,6 +1687,29 @@ mod tests {
         pkt[40..].copy_from_slice(payload);
         let tc = tcp_checksum(src_ip, dst_ip, &pkt[20..]);
         pkt[36..38].copy_from_slice(&tc.to_be_bytes());
+        pkt
+    }
+
+    /// 构造最小 IPv4/UDP 包（端口/地址可辨；校验和本层不校验）。
+    fn craft_udp(
+        src_ip: [u8; 4],
+        dst_ip: [u8; 4],
+        src_port: u16,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut pkt = vec![0u8; 20 + 8 + payload.len()];
+        pkt[0] = 0x45;
+        let tot = (20 + 8 + payload.len()) as u16;
+        pkt[2..4].copy_from_slice(&tot.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 17;
+        pkt[12..16].copy_from_slice(&src_ip);
+        pkt[16..20].copy_from_slice(&dst_ip);
+        pkt[20..22].copy_from_slice(&src_port.to_be_bytes());
+        pkt[22..24].copy_from_slice(&dst_port.to_be_bytes());
+        pkt[24..26].copy_from_slice(&(8 + payload.len() as u16).to_be_bytes());
+        pkt[28..].copy_from_slice(payload);
         pkt
     }
 
@@ -1865,6 +2026,70 @@ mod tests {
         let dropped_before = dp.stats().dropped;
         dp.inject_stream_frame_from_n1("x", &[0x00, 0x01]);
         assert_eq!(dp.stats().dropped, dropped_before + 1);
+    }
+
+    /// S24：同 5 元组第二包命中决策缓存，规则引擎调用次数不增。
+    #[test]
+    fn dataplane_decision_cache_hits_skip_rule_engine() {
+        use nexus_domain::{RouteRequest, RouteTarget, RuleEngine};
+        use std::sync::atomic::AtomicUsize;
+
+        struct Counting(Arc<AtomicUsize>);
+        impl RuleEngine for Counting {
+            fn decide(&self, _req: &RouteRequest<'_>) -> RouteTarget {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                RouteTarget::Egress {
+                    peer: "p1".to_string(),
+                }
+            }
+        }
+
+        let (mut dp, mock) = test_dataplane();
+        let calls = Arc::new(AtomicUsize::new(0));
+        dp.set_rule_engine(Box::new(Counting(Arc::clone(&calls))));
+
+        let pkt = craft_udp([192, 168, 1, 5], [8, 8, 8, 8], 40_000, 443, b"x");
+        mock.lock().unwrap().inject(pkt.clone());
+        assert!(dp.process_one().expect("first packet"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(dp.decision_cache_stats().misses, 1);
+
+        // 同 5 元组第二包：缓存命中，不再调用规则引擎。
+        mock.lock().unwrap().inject(pkt);
+        assert!(dp.process_one().expect("second packet"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "cache hit must skip rules");
+        let stats = dp.decision_cache_stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.entries, 1);
+    }
+
+    /// S24：fake_ip_enabled=false 时 198.18/15 按普通 IP 走规则。
+    #[test]
+    fn dataplane_fake_ip_disabled_uses_rules() {
+        use nexus_domain::{RouteRequest, RouteTarget, RuleEngine};
+
+        struct Recording(Arc<Mutex<Option<RouteRequestOwned>>>);
+        #[derive(Debug, Clone)]
+        struct RouteRequestOwned {
+            domain: Option<String>,
+        }
+        impl RuleEngine for Recording {
+            fn decide(&self, req: &RouteRequest<'_>) -> RouteTarget {
+                *self.0.lock().unwrap() = Some(RouteRequestOwned {
+                    domain: req.domain.map(str::to_string),
+                });
+                RouteTarget::Drop
+            }
+        }
+
+        let (mut dp, mock) = test_dataplane();
+        let seen = Arc::new(Mutex::new(None));
+        dp.set_rule_engine(Box::new(Recording(Arc::clone(&seen))));
+        let pkt = craft_udp([192, 168, 1, 5], [198, 18, 0, 5], 40_001, 443, b"y");
+        mock.lock().unwrap().inject(pkt);
+        assert!(dp.process_one().expect("packet"));
+        assert_eq!(seen.lock().unwrap().as_ref().unwrap().domain, None);
+        assert_eq!(dp.stats().dropped, 1);
     }
 
     /// 性能基线（R4）：`process_one()` 现状每包成本。

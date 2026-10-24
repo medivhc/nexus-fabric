@@ -69,6 +69,7 @@ fn run() -> serde_json::Value {
         boost_enabled: false,
         n1_configured: true,
         proxy_configured: false,
+        ..Default::default()
     };
     let mut dp = match Dataplane::new(tun, config) {
         Ok(dp) => dp,

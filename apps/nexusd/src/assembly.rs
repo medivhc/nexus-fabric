@@ -289,6 +289,7 @@ pub fn build_dataplane_config(loaded: &LoadedConfig) -> Result<DataplaneConfig, 
         boost_enabled,
         n1_configured: loaded.network_toml.is_some(),
         proxy_configured: loaded.proxy_yaml.is_some(),
+        ..DataplaneConfig::default()
     })
 }
 
