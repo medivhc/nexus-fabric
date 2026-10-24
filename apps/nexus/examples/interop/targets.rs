@@ -209,6 +209,7 @@ fn sink_conn(mut stream: TcpStream, stats: &Stats, close_after: usize) {
         let len = u64::from_be_bytes(len_buf);
         let Ok(len) = usize::try_from(len) else { break };
         ops += 1;
+        eprintln!("[target-sink] op#{ops} kind={:#04x} len={len}", op[0]);
         match op[0] {
             OP_UPLOAD => {
                 let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);

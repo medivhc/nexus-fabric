@@ -9,6 +9,9 @@ import json
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import labels  # noqa: E402
+
 REPO = Path(__file__).resolve().parents[2]
 MATRIX = REPO / "scripts/interop/cell-matrix.json"
 OUT_DIR = REPO / "docs/protocols/interop/probe-config"
@@ -137,17 +140,11 @@ def build(entry):
 
 
 def file_name(entry):
-    def kebab(value):
-        out = []
-        for ch in value:
-            if ch.isupper():
-                out.append("-")
-                out.append(ch.lower())
-            else:
-                out.append(ch)
-        return "".join(out).lstrip("-")
-
-    return f"{kebab(entry['protocol'])}-{kebab(entry['variant'])}-{kebab(entry['cell'])}.json"
+    return (
+        f"{labels.label('protocol', entry['protocol'])}-"
+        f"{labels.label('variant', entry['variant'])}-"
+        f"{labels.label('cell', entry['cell'])}.json"
+    )
 
 
 def main():

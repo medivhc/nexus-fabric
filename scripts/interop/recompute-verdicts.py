@@ -16,6 +16,9 @@ import sys
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR / "lib"))
+import labels  # noqa: E402
+
 REPO = SCRIPT_DIR.parents[1]
 DEFAULT_CELL_MATRIX = SCRIPT_DIR / "cell-matrix.json"
 
@@ -107,16 +110,12 @@ def load_rows(run_dir, matrix):
         variant = entry["variant"]
         cell = entry["cell"]
 
-        def kebab(value):
-            out = []
-            for ch in value:
-                if ch.isupper():
-                    out += ["-", ch.lower()]
-                else:
-                    out.append(ch)
-            return "".join(out).lstrip("-")
-
-        cell_dir = evidence_root / kebab(proto) / kebab(variant) / kebab(cell)
+        cell_dir = (
+            evidence_root
+            / labels.label("protocol", proto)
+            / labels.label("variant", variant)
+            / labels.label("cell", cell)
+        )
         candidates = sorted(
             [p for p in cell_dir.glob("PIV-*") if (p / "probe.json").exists()]
         )
@@ -316,18 +315,6 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial):
             return path.read_text(encoding="utf-8").splitlines()[0].strip()
         except OSError:
             return "MISSING"
-
-    def cell_matrix_name(proto, variant, cell):
-        def kebab(value):
-            out = []
-            for ch in value:
-                if ch.isupper():
-                    out += ["-", ch.lower()]
-                else:
-                    out.append(ch)
-            return "".join(out).lstrip("-")
-
-        return f"{kebab(proto)}-{kebab(variant)}-{kebab(cell)}"
 
     times = sorted(
         r["evidence"]["started_at_utc"] for r in rows if r["present"]

@@ -30,22 +30,19 @@ export RUN_DIR PROBE_BIN REF_BIN
 : "${VARIANT:?--variant required}"
 : "${CELL:?--cell required}"
 
-ENTRY="$(python3 - "$MATRIX" "$PROTOCOL" "$VARIANT" "$CELL" <<'PY'
+ENTRY="$(python3 - "$MATRIX" "$PROTOCOL" "$VARIANT" "$CELL" "$SCRIPT_DIR/lib" <<'PYEOF'
 import json,sys
-matrix,proto,variant,cell=sys.argv[1:5]
-def kebab(v):
-    out=[]
-    for ch in v:
-        if ch.isupper(): out+=["-",ch.lower()]
-        else: out.append(ch)
-    return "".join(out).lstrip("-")
-def norm(v): return v.replace("-","").replace("_","").lower()
+matrix,proto,variant,cell,libdir=sys.argv[1:6]
+sys.path.insert(0, libdir)
+import labels
 data=json.load(open(matrix))
 for e in data["cells"]:
-    if kebab(e["protocol"])==proto and kebab(e["variant"])==variant and kebab(e["cell"])==cell:
+    if (labels.label("protocol", e["protocol"])==proto
+            and labels.label("variant", e["variant"])==variant
+            and labels.label("cell", e["cell"])==cell):
         print(json.dumps(e)); sys.exit(0)
 print(f"no matrix entry for {proto}/{variant}/{cell}", file=sys.stderr); sys.exit(2)
-PY
+PYEOF
 )"
 REF_VARIANT="$(jq -r '.ref_variant // empty' <<<"$ENTRY")"
 IMPL="$(jq -r '.impl // empty' <<<"$ENTRY")"
@@ -132,14 +129,17 @@ fi
 python3 "$SCRIPT_DIR/lib/render_probe_config.py" --template "$TEMPLATE" --out "$CONFIG" --run-dir "$RUN_DIR" >/dev/null
 
 if [[ -n "$REF_VARIANT" ]]; then
-  "$SCRIPT_DIR/lib/ref.sh" start_ref "$REF_VARIANT" --impl "${IMPL:-sing-box}" > "$STAGE/$BASE.ref-start.txt" 2>&1
-  REF_STARTED=1
-  REF_PORT="$(sed -n 's/^port=//p' "$RUN_DIR/evidence/ref/$REF_VARIANT/start.txt")"
   BPF="port $REF_PORT"
   if [[ "$REF_VARIANT" == "trojan-fallback" ]]; then BPF="$BPF or port 26203"; fi
   MAX_KB=0; [[ "$T2" == "true" ]] && MAX_KB=102400
   pcap_start lo "$BPF" "$PCAP_STAGE" "$MAX_KB" >/dev/null
   PCAP_STARTED=1
+  # dumpcap 打开文件到真正进入捕获有短窗口；先起抓包再起参照端，并留 settle 时间，
+  # 避免秒级 F 格抓到 0 包（否则会被误降 E_EVIDENCE_GAP）。
+  sleep 0.6
+  "$SCRIPT_DIR/lib/ref.sh" start_ref "$REF_VARIANT" --impl "${IMPL:-sing-box}" > "$STAGE/$BASE.ref-start.txt" 2>&1
+  REF_STARTED=1
+  REF_PORT="$(sed -n 's/^port=//p' "$RUN_DIR/evidence/ref/$REF_VARIANT/start.txt")"
 fi
 
 TIMEOUT_S=200

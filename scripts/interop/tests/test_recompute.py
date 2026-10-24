@@ -12,14 +12,16 @@ recompute = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(recompute)
 
 
+import sys as _sys
+_sys.path.insert(0, str(ROOT / "scripts/interop/lib"))
+import labels as _labels
+
+
 def kebab(value):
-    out = []
-    for ch in value:
-        if ch.isupper():
-            out += ["-", ch.lower()]
-        else:
-            out.append(ch)
-    return "".join(out).lstrip("-")
+    for kind, table in (("protocol", _labels.PROTOCOL), ("variant", _labels.VARIANT), ("cell", _labels.CELL)):
+        if value in table:
+            return table[value]
+    raise KeyError(value)
 
 
 def entry_key(entry):

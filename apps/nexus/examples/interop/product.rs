@@ -285,15 +285,18 @@ fn download_sink(
         .write_all(&(len as u64).to_be_bytes())
         .map_err(|e| e.to_string())?;
     let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
-    let mut remaining = len;
+    let mut got = 0usize;
     let mut buf = vec![0u8; 64 * 1024];
-    while remaining > 0 {
-        let want = remaining.min(buf.len());
-        stream
-            .read_exact(&mut buf[..want])
-            .map_err(|e| format!("source read: {e}"))?;
-        ctx.update(&buf[..want]);
-        remaining -= want;
+    while got < len {
+        let want = (len - got).min(buf.len());
+        match std::io::Read::read(stream, &mut buf[..want]) {
+            Ok(0) => return Err(format!("source eof after {got} / {len} bytes")),
+            Ok(n) => {
+                ctx.update(&buf[..n]);
+                got += n;
+            }
+            Err(e) => return Err(format!("source read: {e} after {got} / {len} bytes")),
+        }
     }
     Ok(util::to_hex(ctx.finish().as_ref()))
 }
