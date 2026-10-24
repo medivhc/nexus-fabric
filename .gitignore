@@ -10,3 +10,7 @@
 
 # 本 run 的独立构建目录（CARGO_TARGET_DIR）
 /target-interop
+
+# Python 脚本测试缓存
+__pycache__/
+*.pyc
