@@ -5,11 +5,17 @@
 真实 `nexus-fabric` driver 上。提供：
 - `FabricPunchChannel`：中继连接上的信令通道（`PunchChannel`）。
 - `DriverPunchSocket`：同一 punch driver 上的 QUIC 建连扇出（`PunchSocket`）。
-- `PunchManager`：responder、去重、tie-break、direct 登记。
+- `PunchManager`：responder、去重、tie-break、direct 登记、per-peer registry、
+  重打洞调度、prediction 贯通、可观测。
+- `SystemPunchClock`：生产时钟注入（`Instant` 基准 + `SystemTime` wall）。
 
 ## Non-Responsibilities
 - 打洞决策/状态机（`nexus-nat-traversal`）。
-- QUIC 传输（`nexus-fabric`，零改动；仅 additive re-export）。
+- `RelayConnProvider` 的 TURN 生命周期与身份（`nexusd::nat_turn`）；本 crate 只接收
+  `on_relay_connected` 的生产喂入。
+- QUIC 传输（`nexus-fabric`）。本 crate 只通过 **additive** 接口使用它：
+  STUN 事务 tap（`install_stun_tap`/`send_stun_request`/`StunSink`）与
+  `FabricConn::shared()`；不改 quinn-proto、不改现有 `on_udp` 的 QUIC 行为。
 - 路径层选路（`nexus-path`；本 crate 只做登记=日志+计数）。
 
 ## Inputs
@@ -20,6 +26,7 @@
 ## Outputs
 - `PunchResult::{Migrated{addr}, StayedOnRelay{reason}}`。
 - 存活的直连 `Arc<ConnShared>`（tie-break 后唯一，登记在 manager）。
+- `PunchPeerStatus`/`TunnelProto`/`RelaySource` 的 per-peer 快照（`status`/`all_status`）。
 - 中继连接永不关闭（warm backup，D4）。
 
 ## Allowed Dependencies
@@ -35,11 +42,17 @@
 > 实现代码仍不许触碰。
 
 ## Invariants
-- 打洞包永远从 punch driver 的同一 UDP socket 发出。
+- 打洞包永远从 punch driver 的同一 UDP socket 发出；STUN 样本
+  `observed_from == driver.local_addr()`。
 - `run()` 的 `Migrated` 语义：直连 QUIC 握手已完成（`Driver::connect`
   返回），不是"包发出去了"。
-- tie-break 确定性：PeerId 大者发起的连接保留；小者关闭自己的
-  发起连接。两端独立计算，无需协商。
+- **双方都发起**（C-14）：两端 `PunchManager` 都发起打洞；tie-break 确定性：
+  PeerId 大者发起的连接保留，小者关闭自己的发起连接。两端独立计算，无需协商。
+  不许因 `my_id < peer` 提前 return 等待。
+- `DirectConn.addr` = **存活连接实际 remote 地址**（adopt 路径取 `ConnShared.remote_addr`，
+  发起路径取 winner target）；不是信令里抄来的地址。
+- `PathLink::register_nat_direct` 是唯一真实登记点；`LoggingFeed` 只计数/日志，
+  不参与选路（C-13）。
 - 中继连接在 Migrated 后不关闭。
 - Stream 类型前缀（D5）：wireup 的 stream 帧为 `u8 type | u32 BE len |
   payload`；`0x01`=punch 信令，`0x02`=bind。responder 只 peek 类型，
@@ -63,18 +76,28 @@
   不硬造消费者。
 
 ## Side Effects
-- 后台线程：connect 扇出（自限时）、responder accept 循环。
-- 度量：`PunchStats`（尝试/迁移/失败计数）、drop 计数（E4 sim）。
+- 后台线程：connect 扇出（自限时）、responder accept 循环、repunch scheduler
+  （tick 1000ms，`Weak<PunchManager>`，manager drop 即退出）。
+- 度量：`PunchStats`（尝试/迁移/失败/spray/probe/hint 计数）、`signal_decode_errors_total`、
+  `LoggingFeed` 计数。
 
 ## Public API
-`PunchManager::{new, set_local, register_relay, punch_peer, direct_conn, stats,
-take_unclaimed}`、`punch_peer(driver, my_id, relay_conn, peer, local, remote_nat, config)`、
-`FabricPunchChannel::open`、`DriverPunchSocket::{new, take_winner, punch_attempts}`、
-`SeededPredictor`、`LoggingFeed`。
+`PunchManager::{new, set_config, set_local, set_samples, register_relay, punch_peer,
+repunch, on_reflexive_changed, on_relay_degraded, direct_conn, take_unclaimed,
+punch_attempts, status, all_status, set_tunnel_proto, set_relay_source}`、
+`punch_peer(driver, my_id, relay_conn, peer, local, remote_nat, config, clock)`、
+`FabricPunchChannel::{open, wrap, last_offer_nonce, decode_errors}`、
+`PreAnsweredChannel::{new, captured_nonce}`、
+`DriverPunchSocket::{new, take_winner, punch_attempts}`、
+`FabricPunchChannel`/`DirectConn`/`PunchPeerStatus`/`PunchState`/`TunnelProto`/
+`RelaySource`/`RepunchTrigger`、`SeededPredictor`、`LoggingFeed`、`SystemPunchClock`。
 
 ## Verification
-- 单测：类型前缀 framing 往返、bind 编解码、per-peer nonce 验证、
-  tie-break 规则、first-wins、preanswered nonce。
+- 单测/集成：类型前缀 framing 往返、bind 编解码、per-peer nonce 验证、
+  tie-break 规则、first-wins、preanswered nonce、prediction 贯通、
+  `DirectConn.addr` adopt 取实际 remote、repunch 299/300s 与 5s 合并、
+  Symmetric 全禁、registry 聚合与 `signal_decode_errors_total`、
+  `await_direct` 全失败归 `TimedOut`、8 个虚拟时间测试之一 `repunch_after_300s`。
 - E4（真机）：relay-first / symmetric-spray / unpredictable-fallback，
   经 userspace NAT 模拟器的真实丢包/映射语义；生产流量切换不断流。
 
@@ -87,7 +110,12 @@ take_unclaimed}`、`punch_peer(driver, my_id, relay_conn, peer, local, remote_na
 
 ## Recovery Semantics
 - 打洞失败 → `StayedOnRelay`，中继不断。
-- 悬挂的 connect 线程随各自 handshake timeout 自行结束（≤ punch_timeout）。
+- 重打洞三触发：periodic（300s + jitter）、reflexive changed、relay degraded
+  （3 miss / loss≥0.30×3 / RTT EWMA≥2× 60s-min）；同 peer in-flight ≤1，
+  事件触发 5s 内合并，periodic 每 interval ≤1；任一端 Symmetric → 所有自动重打禁用。
+- 旧 direct 在新 direct 验证成功前不拆；`repunch` 不重置统计，只累加。
+- 悬挂的 connect 线程随各自 handshake timeout 自行结束（≤ punch_timeout）；
+  responder bind 30s 上限；STUN pending TTL 2000ms。
 
 ## Platform Constraints
 std-only，无平台相关代码。
