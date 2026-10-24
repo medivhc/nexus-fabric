@@ -26,6 +26,7 @@ use nexus_flow_session::{
 };
 use nexus_network::n1::bridge::N1Sender;
 use nexus_path::{CandidatePath, PathConfig, PathManager};
+use nexus_platform::{AcceptedTcpStream, ReceivedDatagram, TransparentIngressError};
 use nexus_projection::TunDevice;
 use nexus_projection::classifier::DropReason;
 use nexus_projection::classifier::{Classification, PacketClassifier};
@@ -47,6 +48,37 @@ pub use chain_wiring::{
 use nexus_projection::transparent::decision::{
     CachedDecision, FlowDecisionCache, FlowDecisionCacheStats, FlowDecisionKey, Frontend,
 };
+
+/// TPROXY 跨线程消息（spec §9.14）。
+#[derive(Debug)]
+pub enum TransparentInbound {
+    /// 一条已 accept 的透明 TCP 连接。
+    Tcp(AcceptedTcpStream),
+    /// 一条透明 UDP 数据报。
+    Udp(ReceivedDatagram),
+    /// listener/socket 捕获失败。
+    CaptureFailed(TransparentIngressError),
+    /// listener 已停止。
+    Stopped,
+}
+
+/// TPROXY 计数器（spec §9.16 `tproxy.counters`）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TproxyCounters {
+    pub tcp_accepted: u64,
+    pub tcp_rejected: u64,
+    pub udp_datagrams: u64,
+    pub udp_dropped: u64,
+    pub udp_table_evicted: u64,
+    pub udp_reply_failed: u64,
+    pub inbound_queue_full: u64,
+    pub orig_dst_missing: u64,
+    pub rule_no_match: u64,
+    pub direct_tcp_dial_failed: u64,
+    pub direct_udp_failed: u64,
+    pub upstream_failed: u64,
+    pub domain_miss: u64,
+}
 
 /// 数据面统计（D6 可观测）。
 #[derive(Debug, Default, Clone)]
@@ -226,6 +258,14 @@ pub struct Dataplane {
     direct_udp: Option<RealUdpEgress>,
     /// 共享 DNS 缓存（DNS 应答写入 → 后续新流按 dst IP 反查域名）。
     dns_cache: Arc<Mutex<DnsCache>>,
+    /// TPROXY → owner 有界 channel（spec §9.14）。
+    transparent_rx: Option<std::sync::mpsc::Receiver<TransparentInbound>>,
+    /// owner → listener 的失败回报通道。
+    transparent_failure_tx: Option<std::sync::mpsc::SyncSender<TransparentInbound>>,
+    /// TPROXY 计数器（listener 与 owner 共享）。
+    tproxy_counters: Arc<Mutex<TproxyCounters>>,
+    /// 最近一次捕获失败原因（spec §9.16）。
+    tproxy_last_failure: Option<String>,
 }
 
 /// 流会话可见状态（spec §9.16 / §11.3）。
@@ -340,6 +380,10 @@ impl Dataplane {
             direct_tcp: DirectTcpRelay::new(DirectEgressConfig::default()),
             direct_udp: RealUdpEgress::new(Arc::new(Mutex::new(EgressNat::default()))).ok(),
             dns_cache: Arc::new(Mutex::new(DnsCache::new(DEFAULT_DNS_CACHE_ENTRIES))),
+            transparent_rx: None,
+            transparent_failure_tx: None,
+            tproxy_counters: Arc::new(Mutex::new(TproxyCounters::default())),
+            tproxy_last_failure: None,
         })
     }
 
@@ -647,9 +691,96 @@ impl Dataplane {
         self.epoch + std::time::Duration::from_millis(now_millis)
     }
 
-    /// 单个 tick：驱动 owner 线程（S41 前无 transparent_rx，直接读 TUN 一包）。
+    /// 注入 TPROXY 入站 channel（spec §9.14）。
+    pub fn set_transparent_rx(
+        &mut self,
+        rx: std::sync::mpsc::Receiver<TransparentInbound>,
+        tx_failure: std::sync::mpsc::SyncSender<TransparentInbound>,
+    ) {
+        self.transparent_rx = Some(rx);
+        self.transparent_failure_tx = Some(tx_failure);
+    }
+
+    /// TPROXY 计数器句柄（listener 线程用于记录 `inbound_queue_full`）。
+    pub fn tproxy_counters_handle(&self) -> Arc<Mutex<TproxyCounters>> {
+        Arc::clone(&self.tproxy_counters)
+    }
+
+    /// 当前 TPROXY 计数器快照。
+    pub fn tproxy_counters(&self) -> TproxyCounters {
+        *self
+            .tproxy_counters
+            .lock()
+            .expect("tproxy counters poisoned")
+    }
+
+    /// 最近一次捕获失败原因。
+    pub fn tproxy_last_failure(&self) -> Option<&str> {
+        self.tproxy_last_failure.as_deref()
+    }
+
+    /// 单个 tick：先 drain TPROXY channel（最多 256 条），再读 TUN 一包。
     pub fn tick(&mut self, now_millis: u64) -> io::Result<bool> {
-        self.process_one_at(now_millis)
+        let drained = self.drain_transparent_inbound(now_millis);
+        match self.process_one_at(now_millis) {
+            Ok(processed) => Ok(processed || drained > 0),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// 排空透明入站 channel；每 tick 最多 256 条（spec §11.1）。
+    pub fn drain_transparent_inbound(&mut self, _now_millis: u64) -> usize {
+        let Some(rx) = self.transparent_rx.as_ref() else {
+            return 0;
+        };
+        let mut batch = Vec::new();
+        while batch.len() < 256 {
+            match rx.try_recv() {
+                Ok(TransparentInbound::Stopped) => break,
+                Ok(message) => batch.push(message),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        let drained = batch.len();
+        for message in batch {
+            match message {
+                TransparentInbound::CaptureFailed(error) => self.record_capture_failure(error),
+                TransparentInbound::Tcp(accepted) => {
+                    drop(accepted);
+                    self.with_stats(|s| s.dropped += 1);
+                    self.with_tproxy_counters(|c| c.tcp_rejected += 1);
+                }
+                TransparentInbound::Udp(datagram) => {
+                    drop(datagram);
+                    self.with_stats(|s| s.dropped += 1);
+                    self.with_tproxy_counters(|c| c.udp_dropped += 1);
+                }
+                TransparentInbound::Stopped => {}
+            }
+        }
+        drained
+    }
+
+    fn record_capture_failure(&mut self, error: TransparentIngressError) {
+        self.tproxy_last_failure = Some(error.to_string());
+        match &error {
+            TransparentIngressError::OrigDstMissing { .. } => {
+                self.with_tproxy_counters(|c| c.orig_dst_missing += 1);
+            }
+            TransparentIngressError::OrigDstInvalid { .. } => {
+                self.with_tproxy_counters(|c| c.udp_dropped += 1);
+            }
+            _ => {}
+        }
+    }
+
+    fn with_tproxy_counters(&self, update: impl FnOnce(&mut TproxyCounters)) {
+        let mut guard = self
+            .tproxy_counters
+            .lock()
+            .expect("tproxy counters poisoned");
+        update(&mut guard);
     }
 
     /// 兼容入口：driver 采集当前单调毫秒后调用 [`Self::tick`]。
@@ -1822,6 +1953,177 @@ pub struct OsAssembleStatus {
     pub excludes: u32,
 }
 
+/// TPROXY 运行期可见状态（spec §9.16）。
+#[derive(Debug, Clone, Default)]
+pub struct TproxyStatus {
+    /// `disabled` / `active` / `degraded` / `cleanup_failed`。
+    pub state: &'static str,
+    /// 失败原因（§11.2 reason 枚举）。
+    pub reason: Option<&'static str>,
+    /// `active` / `block` / `none` / `impossible`。
+    pub enforcement: &'static str,
+    /// `iptables` / `nftables` / `external`。
+    pub backend: &'static str,
+    /// `root` / `cap_net_admin` / `insufficient`。
+    pub privilege: &'static str,
+    /// 专用链名。
+    pub chain: String,
+    /// fwmark（十六进制文本）。
+    pub mark: String,
+    /// 策略路由表。
+    pub route_table: u32,
+    /// 监听地址。
+    pub listen: String,
+    /// `ipv4`。
+    pub ip_family: &'static str,
+    /// 本 run 恒为 false。
+    pub ipv6_enabled: bool,
+    /// 计数器。
+    pub counters: TproxyCounters,
+    /// 最近失败原因（自由文本）。
+    pub last_failure_reason: Option<String>,
+}
+
+static TPROXY_STATUS: OnceLock<Mutex<TproxyStatus>> = OnceLock::new();
+
+fn tproxy_slot() -> &'static Mutex<TproxyStatus> {
+    TPROXY_STATUS.get_or_init(|| {
+        Mutex::new(TproxyStatus {
+            state: "disabled",
+            reason: None,
+            enforcement: "none",
+            backend: "iptables",
+            privilege: "insufficient",
+            chain: "NEXUS_TPROXY".to_string(),
+            mark: "0x1f3".to_string(),
+            route_table: 100,
+            listen: "0.0.0.0:7895".to_string(),
+            ip_family: "ipv4",
+            ipv6_enabled: false,
+            counters: TproxyCounters::default(),
+            last_failure_reason: None,
+        })
+    })
+}
+
+/// 发布 TPROXY 状态。
+pub fn publish_tproxy_status(status: TproxyStatus) {
+    if let Ok(mut guard) = tproxy_slot().lock() {
+        *guard = status;
+    }
+}
+
+/// TPROXY 状态快照。
+pub fn tproxy_status_snapshot() -> TproxyStatus {
+    tproxy_slot().lock().map(|s| s.clone()).unwrap_or_default()
+}
+
+/// 构造 `tproxy` JSON 段（spec §9.16）。
+pub fn tproxy_status_json() -> serde_json::Value {
+    let status = tproxy_status_snapshot();
+    serde_json::json!({
+        "state": status.state,
+        "reason": status.reason,
+        "enforcement": status.enforcement,
+        "backend": status.backend,
+        "privilege": status.privilege,
+        "chain": status.chain,
+        "mark": status.mark,
+        "route_table": status.route_table,
+        "listen": status.listen,
+        "ip_family": status.ip_family,
+        "ipv6_enabled": status.ipv6_enabled,
+        "counters": {
+            "tcp_accepted": status.counters.tcp_accepted,
+            "tcp_rejected": status.counters.tcp_rejected,
+            "udp_datagrams": status.counters.udp_datagrams,
+            "udp_dropped": status.counters.udp_dropped,
+            "udp_table_evicted": status.counters.udp_table_evicted,
+            "udp_reply_failed": status.counters.udp_reply_failed,
+            "inbound_queue_full": status.counters.inbound_queue_full,
+            "orig_dst_missing": status.counters.orig_dst_missing,
+            "rule_no_match": status.counters.rule_no_match,
+            "direct_tcp_dial_failed": status.counters.direct_tcp_dial_failed,
+            "direct_udp_failed": status.counters.direct_udp_failed,
+            "upstream_failed": status.counters.upstream_failed,
+            "domain_miss": status.counters.domain_miss,
+        },
+        "last_failure_reason": status.last_failure_reason,
+    })
+}
+
+/// 捕获失败后的 enforcement 语义（spec §10.5）。
+#[must_use]
+pub fn capture_failure_enforcement(
+    mode: nexus_proxy_config::CaptureFailureMode,
+    backend_available: bool,
+) -> &'static str {
+    match (mode, backend_available) {
+        (nexus_proxy_config::CaptureFailureMode::Bypass, _) => "none",
+        (nexus_proxy_config::CaptureFailureMode::Block, true) => "block",
+        (nexus_proxy_config::CaptureFailureMode::Block, false) => "impossible",
+    }
+}
+
+/// 捕获失败状态（state=degraded；reason 为 §11.2 枚举值）。
+#[must_use]
+pub fn capture_failure_status(
+    reason: &'static str,
+    privilege: &'static str,
+    mode: nexus_proxy_config::CaptureFailureMode,
+    backend_available: bool,
+) -> TproxyStatus {
+    TproxyStatus {
+        state: "degraded",
+        reason: Some(reason),
+        enforcement: capture_failure_enforcement(mode, backend_available),
+        privilege,
+        ..TproxyStatus::default()
+    }
+}
+
+/// 当前进程权限自检（root 视为具备 CAP_NET_ADMIN + CAP_NET_RAW）。
+#[must_use]
+pub fn detect_privilege() -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: geteuid(2) has no pointer arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return "root";
+        }
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            if let Some(caps) = status
+                .lines()
+                .find_map(|line| line.strip_prefix("CapEff:	"))
+                .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+            {
+                let net_admin = caps & (1 << 12) != 0;
+                let net_raw = caps & (1 << 13) != 0;
+                if net_admin && net_raw {
+                    return "cap_net_admin";
+                }
+            }
+        }
+    }
+    "insufficient"
+}
+
+/// 创建 TPROXY inbound 有界 channel（容量 1024，spec §11.1）。
+#[must_use]
+pub fn inbound_channel() -> (
+    std::sync::mpsc::SyncSender<TransparentInbound>,
+    std::sync::mpsc::Receiver<TransparentInbound>,
+) {
+    std::sync::mpsc::sync_channel(1024)
+}
+
+/// listener 侧 `try_send` 失败时记录 `inbound_queue_full`。
+pub fn record_inbound_queue_full(counters: &Arc<Mutex<TproxyCounters>>) {
+    if let Ok(mut guard) = counters.lock() {
+        guard.inbound_queue_full += 1;
+    }
+}
+
 static RUNTIME_STATUS: OnceLock<Mutex<RuntimeStatus>> = OnceLock::new();
 
 fn runtime_slot() -> &'static Mutex<RuntimeStatus> {
@@ -2602,6 +2904,79 @@ mod tests {
         assert!(dp.process_one().expect("packet"));
         assert_eq!(seen.lock().unwrap().as_ref().unwrap().domain, None);
         assert_eq!(dp.stats().dropped, 1);
+    }
+
+    #[test]
+    fn transparent_queue_drains_at_most_256_per_tick() {
+        let (mut dp, _mock) = test_dataplane();
+        let (tx, rx) = inbound_channel();
+        let (failure_tx, _failure_rx) = inbound_channel();
+        for _ in 0..300 {
+            tx.try_send(TransparentInbound::CaptureFailed(
+                TransparentIngressError::Io {
+                    operation: "recvmsg",
+                    message: "probe".to_string(),
+                },
+            ))
+            .expect("channel capacity 1024");
+        }
+        dp.set_transparent_rx(rx, failure_tx);
+        assert_eq!(dp.drain_transparent_inbound(1), 256);
+        assert_eq!(dp.drain_transparent_inbound(2), 44);
+        assert_eq!(
+            dp.tproxy_last_failure(),
+            Some("TRANSPARENT_IO: recvmsg: probe")
+        );
+    }
+
+    #[test]
+    fn transparent_queue_full_is_counted() {
+        let (_mut_dp, _mock) = test_dataplane();
+        let (tx, _rx) = inbound_channel();
+        for _ in 0..1024 {
+            tx.try_send(TransparentInbound::Stopped)
+                .expect("channel capacity 1024");
+        }
+        assert!(tx.try_send(TransparentInbound::Stopped).is_err());
+        let counters = Arc::new(Mutex::new(TproxyCounters::default()));
+        record_inbound_queue_full(&counters);
+        assert_eq!(counters.lock().unwrap().inbound_queue_full, 1);
+    }
+
+    #[test]
+    fn transparent_capture_failure_policy_branches() {
+        use nexus_proxy_config::CaptureFailureMode;
+        assert_eq!(
+            capture_failure_enforcement(CaptureFailureMode::Block, true),
+            "block"
+        );
+        assert_eq!(
+            capture_failure_enforcement(CaptureFailureMode::Block, false),
+            "impossible"
+        );
+        assert_eq!(
+            capture_failure_enforcement(CaptureFailureMode::Bypass, true),
+            "none"
+        );
+        let status = capture_failure_status(
+            "bind_failed",
+            "insufficient",
+            CaptureFailureMode::Block,
+            false,
+        );
+        assert_eq!(status.state, "degraded");
+        assert_eq!(status.reason, Some("bind_failed"));
+        assert_eq!(status.enforcement, "impossible");
+        assert_eq!(status.privilege, "insufficient");
+    }
+
+    #[test]
+    fn transparent_privilege_status_is_one_of_allowed() {
+        let privilege = detect_privilege();
+        assert!(matches!(
+            privilege,
+            "root" | "cap_net_admin" | "insufficient"
+        ));
     }
 
     /// 性能基线（R4）：`process_one()` 现状每包成本。
