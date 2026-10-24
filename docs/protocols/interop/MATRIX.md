@@ -10,7 +10,7 @@
 | sing-box | 1.13.16（9ff0345fde4157a6bdab45a615668d41ccc93f6d0f361108042a48b8a49a9baa  sing-box-1.13.16-linux-amd64-musl.tar.gz） |
 | Xray | 26.10.21（0eec3ed4163c273d8c8bf821f7d219e257921cf584aa3fb970715e458e631978  Xray-linux-64.zip） |
 | test window | 2026-10-24T17:22:49Z .. 2026-10-24T18:06:45Z |
-| archive | （S30 归档后追加） |
+| archive | /work/interop-run/protocol-interop-verification/archive/protocol-interop-verification-20261024T184740Z.tar.zst |
 
 ## 协议 verdict（按 spec E1 复算）
 
