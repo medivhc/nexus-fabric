@@ -6,10 +6,16 @@
 
 pub mod sockaddr;
 pub mod tcp;
+pub mod udp;
 
 pub use tcp::{TproxyTcpConfig, TproxyTcpListener};
+pub use udp::{TproxyUdpConfig, TproxyUdpSocket};
 
 /// Linux `IP_TRANSPARENT`（uapi/linux/in.h；libc 未导出）。
 pub(crate) const IP_TRANSPARENT: libc::c_int = 19;
+/// Linux `IP_RECVORIGDSTADDR`（uapi/linux/in.h）。
+pub(crate) const IP_RECVORIGDSTADDR: libc::c_int = 20;
 /// Linux `IP_ORIGDSTADDR`（ancillary cmsg type）。
 pub(crate) const IP_ORIGDSTADDR: libc::c_int = 20;
+/// Linux `IP_PKTINFO`（uapi/linux/in.h）。
+pub(crate) const IP_PKTINFO: libc::c_int = 8;
