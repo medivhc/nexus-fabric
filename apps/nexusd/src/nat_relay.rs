@@ -347,6 +347,10 @@ pub fn identity_from_seed(
 mod tests {
     use super::*;
     use crate::config::TurnSection;
+    use crate::nat_switch::{NatSwitching, gather_host_candidates};
+    use nexus_connectivity::nat::NatType;
+    use nexus_nat_traversal::LocalCandidates;
+    use nexus_nat_wireup::SystemPunchClock;
     use nexus_turn::client::TurnCredentials;
     use nexus_turn::server::TurnServer;
     use std::sync::mpsc;
@@ -465,5 +469,147 @@ mod tests {
         }
         assert_eq!(load_seed_file(&path).unwrap(), [7u8; 32]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// D5 loopback acceptance (O5): the PRODUCTION sink, not the g13 test
+    /// Sink. Two switches + two providers over one loopback TURN server:
+    /// provider event -> `NatSwitching::on_relay_available` ->
+    /// `on_relay_connected(auto_punch: true)` must register the relay on
+    /// both switches. `on_relay_lost` must leave the relay registered
+    /// (state only, no close, no punch). This is the new wiring evidence
+    /// for AC-13's `production_trigger_path` -- it replaces the g13 lib
+    /// test as evidence, and it is NOT device evidence (row stays
+    /// ENV_NOT_READY until the V-section runs).
+    #[test]
+    fn d5_production_sink_triggers_on_relay_connected() {
+        let server = TurnServer::bind("127.0.0.1:0".parse().unwrap(), creds()).unwrap();
+        let c = creds();
+        let section = TurnSection {
+            server: server.main_addr().to_string(),
+            realm: c.realm,
+            username: c.username,
+            password: c.password,
+            refresh_interval_sec: 300,
+            stun_server: None,
+            stun_server2: None,
+            bind_addr: "0.0.0.0:0".into(),
+        };
+        let id_a = FabricIdentity::from_ed25519_seed([1; 32]).unwrap();
+        let id_b = FabricIdentity::from_ed25519_seed([2; 32]).unwrap();
+        let a_id = id_a.peer_id();
+        let b_id = id_b.peer_id();
+
+        let book_path = std::env::temp_dir().join(format!(
+            "nexus-relay-book-d5-{}-{:02x}.toml",
+            std::process::id(),
+            a_id.0[0]
+        ));
+        let book = Arc::new(FileRelayAddressBook::new(&book_path).unwrap());
+
+        let mut ta = TurnManager::new(Some(section.clone()));
+        let mut tb = TurnManager::new(Some(section));
+        let relayed_a = ta.ensure_allocated().expect("allocate a");
+        let relayed_b = tb.ensure_allocated().expect("allocate b");
+        book.publish(a_id.0, relayed_a).unwrap();
+        book.publish(b_id.0, relayed_b).unwrap();
+
+        let pa = TurnRelayProvider::new(a_id, id_a, ta, book.clone());
+        let pb = TurnRelayProvider::new(b_id, id_b, tb, book.clone());
+
+        let driver_a = Driver::new_server("127.0.0.1:0".parse().unwrap()).expect("bind a");
+        let driver_b = Driver::new_server("127.0.0.1:0".parse().unwrap()).expect("bind b");
+        let driver_c = Driver::new_server("127.0.0.1:0".parse().unwrap()).expect("bind c");
+        let local_a = LocalCandidates {
+            host: gather_host_candidates(&driver_a),
+            srflx: None,
+            srflx_stun: None,
+            srflx_turn: None,
+            nat_type: NatType::Unknown,
+        };
+        let local_b = LocalCandidates {
+            host: gather_host_candidates(&driver_b),
+            srflx: None,
+            srflx_stun: None,
+            srflx_turn: None,
+            nat_type: NatType::Unknown,
+        };
+        let local_c = LocalCandidates {
+            host: gather_host_candidates(&driver_c),
+            srflx: None,
+            srflx_stun: None,
+            srflx_turn: None,
+            nat_type: NatType::Unknown,
+        };
+        let swa = NatSwitching::new(
+            driver_a,
+            a_id,
+            local_a,
+            Vec::new(),
+            Arc::new(SystemPunchClock::new()),
+        );
+        let swb = NatSwitching::new(
+            driver_b,
+            b_id,
+            local_b,
+            Vec::new(),
+            Arc::new(SystemPunchClock::new()),
+        );
+        let swc = NatSwitching::new(
+            driver_c,
+            a_id,
+            local_c,
+            Vec::new(),
+            Arc::new(SystemPunchClock::new()),
+        );
+
+        // Fail-closed: subscribing with no provider attached refuses.
+        assert!(!swc.subscribe_relay_peer(a_id));
+
+        swa.attach_relay_provider(pa.clone());
+        swb.attach_relay_provider(pb.clone());
+        assert!(swa.subscribe_relay_peer(b_id));
+        assert!(swb.subscribe_relay_peer(a_id));
+
+        let ha = {
+            let pa = pa.clone();
+            std::thread::spawn(move || pa.on_turn_allocated(b_id, relayed_b))
+        };
+        let hb = {
+            let pb = pb.clone();
+            std::thread::spawn(move || pb.on_turn_allocated(a_id, relayed_a))
+        };
+        let ra = hb.join().expect("join b");
+        let rb = ha.join().expect("join a");
+        assert!(ra.is_ok(), "provider side B failed: {:?}", ra.err());
+        assert!(rb.is_ok(), "provider side A failed: {:?}", rb.err());
+
+        // Production trigger delivered: each switch registered the peer's
+        // relay (synchronous in on_relay_available, so no polling needed).
+        let hex_a: String = a_id.0.iter().map(|b| format!("{b:02x}")).collect();
+        let hex_b: String = b_id.0.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(
+            swa.active_conn(&hex_b).is_some(),
+            "A's switch must have B's relay registered via production sink"
+        );
+        assert!(
+            swb.active_conn(&hex_a).is_some(),
+            "B's switch must have A's relay registered via production sink"
+        );
+
+        // on_relay_lost is state only: relay stays, no punch triggered.
+        RelayConnSink::on_relay_lost(swa.as_ref(), b_id);
+        assert!(
+            swa.active_conn(&hex_b).is_some(),
+            "lost must not close the relay"
+        );
+        assert!(
+            swa.relay_lost_peers().contains(&b_id),
+            "lost peer must be recorded"
+        );
+
+        swa.shutdown();
+        swb.shutdown();
+        swc.shutdown();
+        let _ = std::fs::remove_file(&book_path);
     }
 }
