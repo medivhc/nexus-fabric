@@ -129,6 +129,84 @@ pub struct InboundConfig {
     pub kind: InboundKind,
     /// 监听地址（host:port；tun 不使用，tproxy 缺省 `0.0.0.0:7895`）。
     pub listen: String,
+    /// `kind: tun` 的子配置；非 tun 入站为 `None`。
+    pub tun: Option<TunInboundConfig>,
+}
+
+/// 流会话开关模式（Q2 定案默认 `auto`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowSessionsMode {
+    /// 有 provider 源时启用，无源禁用。
+    Auto,
+    /// 强制启用。
+    Enabled,
+    /// 强制禁用。
+    Disabled,
+}
+
+impl FlowSessionsMode {
+    /// 解析配置取值（`auto` / `enabled` / `disabled`）。
+    ///
+    /// # Errors
+    ///
+    /// 未知取值返回 `CONFIG_INVALID [kind]`，调用方补全字段路径。
+    pub fn parse(s: &str) -> Result<Self, ConfigError> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "enabled" => Ok(Self::Enabled),
+            "disabled" => Ok(Self::Disabled),
+            other => Err(ConfigError::new(
+                "kind",
+                format!("unknown flow sessions mode '{other}' (supports auto/enabled/disabled)"),
+            )),
+        }
+    }
+
+    /// 稳定的机器可读标签。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+/// `kind: tun` 入站子配置（spec §10.3）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunInboundConfig {
+    /// TUN 设备名（默认 `nexus`）。
+    pub name: String,
+    /// MTU（默认 1500，范围 `[1280, 9000]`）。
+    pub mtu: u16,
+    /// 设备地址（默认 `10.99.0.1/24`，IPv4 CIDR）。
+    pub address: String,
+    /// 是否接管默认路由（默认 `false`，必须显式 opt-in）。
+    pub default_route: bool,
+    /// 是否自动排除代理服务器路由（默认 `true`）。
+    pub exclude_server_routes: bool,
+    /// fake-IP（本 run 必须 `false`）。
+    pub fake_ip: bool,
+    /// IPv6（本 run 必须 `false`）。
+    pub ipv6: bool,
+    /// 流会话模式（默认 `auto`）。
+    pub sessions: FlowSessionsMode,
+}
+
+impl Default for TunInboundConfig {
+    fn default() -> Self {
+        Self {
+            name: "nexus".to_string(),
+            mtu: 1500,
+            address: "10.99.0.1/24".to_string(),
+            default_route: false,
+            exclude_server_routes: true,
+            fake_ip: false,
+            ipv6: false,
+            sessions: FlowSessionsMode::Auto,
+        }
+    }
 }
 
 /// 规则类型（P0 冻结为四类；2026-10-01 新增端口/进程三类）。
@@ -759,6 +837,108 @@ fn refield(mut e: ConfigError, field: &str) -> ConfigError {
     e
 }
 
+/// 宽松数值字段：存在时必须能解析为 `u64`，不静默回退默认值。
+fn req_opt_u64(node: &Node, key: &str, base: &str) -> Result<Option<u64>, ConfigError> {
+    let Some(raw) = node.get(key) else {
+        return Ok(None);
+    };
+    let text = raw
+        .as_str()
+        .ok_or_else(|| ConfigError::new(format!("{base}.{key}"), "expected an integer scalar"))?;
+    let value = text.trim().parse::<u64>().map_err(|_| {
+        ConfigError::new(
+            format!("{base}.{key}"),
+            format!("expected an integer, got '{text}'"),
+        )
+    })?;
+    Ok(Some(value))
+}
+
+/// 校验 IPv4 CIDR（`a.b.c.d/prefix`，prefix ∈ `[0, 32]`）。
+fn validate_ipv4_cidr(value: &str) -> Result<(), String> {
+    let (addr, prefix) = value
+        .split_once('/')
+        .ok_or_else(|| format!("must be IPv4 CIDR (a.b.c.d/prefix), got '{value}'"))?;
+    addr.parse::<std::net::Ipv4Addr>()
+        .map_err(|_| format!("invalid IPv4 address '{addr}'"))?;
+    let prefix: u8 = prefix
+        .parse()
+        .map_err(|_| format!("invalid CIDR prefix '{prefix}'"))?;
+    if prefix > 32 {
+        return Err(format!("CIDR prefix out of range: {prefix}"));
+    }
+    Ok(())
+}
+
+/// 校验 TUN 设备名（Linux `IFNAMSIZ` 上限 15 字节）。
+fn validate_tun_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    if name.len() > 15 {
+        return Err(format!("must be at most 15 bytes, got {}", name.len()));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        return Err(format!("contains invalid character in '{name}'"));
+    }
+    Ok(())
+}
+
+fn parse_tun_inbound(node: &Node, base: &str) -> Result<TunInboundConfig, ConfigError> {
+    let mut cfg = TunInboundConfig::default();
+    if let Some(name) = opt_str(node, "name") {
+        validate_tun_name(&name)
+            .map_err(|reason| ConfigError::new(format!("{base}.name"), reason))?;
+        cfg.name = name;
+    }
+    if let Some(mtu) = req_opt_u64(node, "mtu", base)? {
+        let mtu = u16::try_from(mtu).map_err(|_| {
+            ConfigError::new(
+                format!("{base}.mtu"),
+                format!("must be in [1280, 9000], got {mtu}"),
+            )
+        })?;
+        if !(1280..=9000).contains(&mtu) {
+            return Err(ConfigError::new(
+                format!("{base}.mtu"),
+                format!("must be in [1280, 9000], got {mtu}"),
+            ));
+        }
+        cfg.mtu = mtu;
+    }
+    if let Some(address) = opt_str(node, "address") {
+        validate_ipv4_cidr(&address)
+            .map_err(|reason| ConfigError::new(format!("{base}.address"), reason))?;
+        cfg.address = address;
+    }
+    if let Some(value) = opt_bool(node, "default_route") {
+        cfg.default_route = value;
+    }
+    if let Some(value) = opt_bool(node, "exclude_server_routes") {
+        cfg.exclude_server_routes = value;
+    }
+    if opt_bool(node, "fake_ip") == Some(true) {
+        return Err(ConfigError::new(
+            format!("{base}.fake_ip"),
+            "fake-IP is not supported in this release; must be false",
+        ));
+    }
+    if opt_bool(node, "ipv6") == Some(true) {
+        return Err(ConfigError::new(
+            format!("{base}.ipv6"),
+            "IPv6 is not supported in this release; must be false",
+        ));
+    }
+    if let Some(mode) = opt_str(node, "sessions") {
+        cfg.sessions = FlowSessionsMode::parse(&mode)
+            .map_err(|e| ConfigError::new(format!("{base}.sessions"), e.reason))?;
+    }
+    Ok(cfg)
+}
+
 // ---------------------------------------------------------------------------
 // 公开解析入口
 // ---------------------------------------------------------------------------
@@ -1040,8 +1220,29 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
                 InboundKind::Tproxy => opt_str(item, "listen")
                     .unwrap_or_else(|| crate::TPROXY_DEFAULT_LISTEN.to_string()),
             };
-            inbounds.push(InboundConfig { tag, kind, listen });
+            let tun = if kind == InboundKind::Tun {
+                Some(parse_tun_inbound(item, &field)?)
+            } else {
+                None
+            };
+            inbounds.push(InboundConfig {
+                tag,
+                kind,
+                listen,
+                tun,
+            });
         }
+    }
+    if inbounds
+        .iter()
+        .filter(|i| i.kind == InboundKind::Tun)
+        .count()
+        > 1
+    {
+        return Err(ConfigError::new(
+            "inbounds",
+            "only one tun inbound is supported",
+        ));
     }
 
     // ---- rules ----
@@ -2446,5 +2647,90 @@ mod inbound_kind_tests {
         assert_eq!(cfg.inbounds[3].kind, InboundKind::Tproxy);
         assert_eq!(cfg.inbounds[2].listen, "");
         assert_eq!(cfg.inbounds[3].listen, TPROXY_DEFAULT_LISTEN);
+    }
+}
+
+#[cfg(test)]
+mod tun_inbound_tests {
+    use super::*;
+
+    fn yaml_with_tun(extra: &str) -> String {
+        format!(
+            "schema_version: 1\ninbounds:\n  - tag: tun-in\n    kind: tun\n{extra}rules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n"
+        )
+    }
+
+    #[test]
+    fn tun_inbound_defaults_match_spec() {
+        let cfg = parse(&yaml_with_tun("")).expect("valid tun inbound");
+        let tun = cfg.inbounds[0].tun.as_ref().expect("tun sub config");
+        assert_eq!(tun.name, "nexus");
+        assert_eq!(tun.mtu, 1500);
+        assert_eq!(tun.address, "10.99.0.1/24");
+        assert!(!tun.default_route);
+        assert!(tun.exclude_server_routes);
+        assert!(!tun.fake_ip);
+        assert!(!tun.ipv6);
+        assert_eq!(tun.sessions, FlowSessionsMode::Auto);
+    }
+
+    #[test]
+    fn tun_inbound_overrides_parse() {
+        let extra = "    name: nexus-test\n    mtu: 9000\n    address: 10.42.0.1/16\n    default_route: true\n    exclude_server_routes: false\n    sessions: enabled\n";
+        let cfg = parse(&yaml_with_tun(extra)).expect("valid tun inbound");
+        let tun = cfg.inbounds[0].tun.as_ref().unwrap();
+        assert_eq!(tun.name, "nexus-test");
+        assert_eq!(tun.mtu, 9000);
+        assert_eq!(tun.address, "10.42.0.1/16");
+        assert!(tun.default_route);
+        assert!(!tun.exclude_server_routes);
+        assert_eq!(tun.sessions, FlowSessionsMode::Enabled);
+    }
+
+    #[test]
+    fn tun_inbound_rejects_bad_mtu_range() {
+        for mtu in ["1279", "9001"] {
+            let err = parse(&yaml_with_tun(&format!("    mtu: {mtu}\n"))).unwrap_err();
+            assert_eq!(err.field, "inbounds[0].mtu", "{err:?}");
+            assert!(err.reason.contains("1280"), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn tun_inbound_rejects_bad_address() {
+        let err = parse(&yaml_with_tun("    address: 10.99.0.1/33\n")).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].address");
+        let err = parse(&yaml_with_tun("    address: not-a-cidr\n")).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].address");
+    }
+
+    #[test]
+    fn tun_inbound_rejects_bad_name() {
+        let err = parse(&yaml_with_tun("    name: bad name\n")).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].name");
+        let err = parse(&yaml_with_tun(&format!("    name: {}\n", "a".repeat(16)))).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].name");
+    }
+
+    #[test]
+    fn tun_inbound_rejects_fake_ip_and_ipv6() {
+        let err = parse(&yaml_with_tun("    fake_ip: true\n")).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].fake_ip");
+        let err = parse(&yaml_with_tun("    ipv6: true\n")).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].ipv6");
+    }
+
+    #[test]
+    fn tun_inbound_rejects_unknown_sessions_mode() {
+        let err = parse(&yaml_with_tun("    sessions: sometimes\n")).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].sessions");
+    }
+
+    #[test]
+    fn only_one_tun_inbound_is_supported() {
+        let yaml = "schema_version: 1\ninbounds:\n  - tag: a\n    kind: tun\n  - tag: b\n    kind: tun\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
+        let err = parse(yaml).unwrap_err();
+        assert_eq!(err.field, "inbounds");
+        assert!(err.reason.contains("only one tun"), "{err:?}");
     }
 }
