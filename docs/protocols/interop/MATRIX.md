@@ -3,9 +3,9 @@
 > 本文件由 `scripts/interop/recompute-verdicts.py` 从证据机械生成；人工零编辑。
 > 修复顺序、依赖与复验口径见人工维护的 [NEXT-STEPS.md](NEXT-STEPS.md)。
 
-- run `protocol-interop-verification`；baseline `0539169e8195944fcd183e7831e5d5ac746f3f40`；spec frozen v1.1（sha256 `23c7e4e797ee9edbf0eb645bfc20a7c97cfacb30e1a67bd8fee77ccbc527de4f`）；test window `2026-10-24T17:22:49Z .. 2026-10-24T21:42:32Z`。
+- run `protocol-interop-verification`；baseline `0539169e8195944fcd183e7831e5d5ac746f3f40`；spec frozen v1.1（sha256 `23c7e4e797ee9edbf0eb645bfc20a7c97cfacb30e1a67bd8fee77ccbc527de4f`）；test window `2026-10-24T17:30:39Z .. 2026-10-24T21:50:48Z`。
 - 参照实现：sing-box 1.13.16（sha256 `8da901e7b6eb0d2f6f6e701f19d5f78af235d038ae078b37a70739db5895d262`）；Xray 26.10.21（sha256 `a27e3f95ab6ce270956d0cecd32eda4686a811afc71c64a6a734a3dede14883e`）。
-- archive（主机归档路径）：`/work/interop-run/protocol-interop-fixes-1/archive/protocol-interop-fixes-1-20261024T214322Z.tar.zst`。
+- archive（主机归档路径）：`/work/interop-run/protocol-interop-fixes-1/archive/protocol-interop-fixes-1-20261024T214322Z.tar.zst`, `/work/interop-run/protocol-interop-fixes-1/archive/protocol-interop-fixes-1-20261024T215059Z.tar.zst`。
 
 ## 先读：范围 / 结论 / 图例
 
@@ -39,7 +39,7 @@
 
 | 协议 | verdict | scope | claim | root_cause_class | missing_cells | 命中规则 |
 |---|---|---|---|---|---|---|
-| Vless | BROKEN | PROTOCOL_SUBSET | NOT_USABLE | E_NEXUS_HANDSHAKE_WIRE | Handshake(FAIL,E_NEXUS_HANDSHAKE_WIRE), TcpSmall(FAIL,E_NEXUS_FRAMING), TcpThroughput(FAIL,E_NEXUS_FRAMING), LongLived(FAIL,E_NEXUS_FRAMING), Reconnect(FAIL,E_NEXUS_FRAMING) | 2 |
+| Vless | VERIFIED | PROTOCOL_SUBSET | USABLE | NONE | NONE | 8 |
 | Anytls | VERIFIED | FULL | USABLE | NONE | NONE | 8 |
 | Hysteria2 | BROKEN | PROTOCOL_SUBSET | NOT_USABLE | E_NEXUS_CODEC | TcpSmall(FAIL,E_NEXUS_CODEC), TcpThroughput(FAIL,E_NEXUS_CODEC), LongLived(FAIL,E_NEXUS_CODEC), Reconnect(FAIL,E_NEXUS_CODEC), Handshake(FAIL,E_NEXUS_CODEC), Handshake[Hy2Salamander](FAIL,E_NEXUS_CODEC), UdpEcho(FAIL,E_NEXUS_CODEC), BadCredential(FAIL,E_NEXUS_CODEC) | 2 |
 | Trojan | BROKEN | TCP_ONLY | NOT_USABLE | E_NEXUS_FRAMING | UdpEcho(NOT_IMPLEMENTED,E_NEXUS_NOT_IMPLEMENTED), BadCredential[TrojanFallback](FAIL,E_NEXUS_FRAMING) | 1 |
@@ -61,23 +61,23 @@
 
 ## Vless
 
-> **verdict=BROKEN / claim=NOT_USABLE**（scope=PROTOCOL_SUBSET，root_cause_class=E_NEXUS_HANDSHAKE_WIRE）
+> **verdict=VERIFIED / claim=USABLE**（scope=PROTOCOL_SUBSET，root_cause_class=NONE）
 >
 > 本节任一 PASS 不改变协议 verdict；单格 PASS 只在所列 carrier/scope 下成立。
 > VlessVision 行为 crate 级证据，产品 Vision splice 未实现。
 
 | Cell | 状态 | carrier | scope | evidence_id | class | 关键数字 | 证据路径 | notes |
 |---|---|---|---|---|---|---|---|---|
-| Default/Handshake | FAIL | ProductSocks5 | ProductPath | PIV-vless-default-handshake-20261024T172249Z-001 | E_NEXUS_HANDSHAKE_WIRE | up=0B down=0B | evidence/vless/default/handshake/PIV-vless-default-handshake-20261024T172249Z-001/probe.json | proxy_error=ConnectivityEstablishmentFailed { provider: ProviderId("ref"), reason: "vless response read failed: vless io error" }; workload_error=tunnel read: Connection reset by peer (os error 104) … |
-| Default/TcpSmall | FAIL | ProductSocks5 | ProductPath | PIV-vless-default-tcp-small-20261024T213608Z-001 | E_NEXUS_FRAMING | up=0B down=0B | evidence/vless/default/tcp-small/PIV-vless-default-tcp-small-20261024T213608Z-001/probe.json | proxy_error=ConnectivityEstablishmentFailed { provider: ProviderId("ref"), reason: "vless response read failed: vless io error" }; workload_error=tunnel read: Connection reset by peer (os error 104) … |
-| Default/TcpThroughput | FAIL | ProductSocks5 | ProductPath | PIV-vless-default-tcp-throughput-20261024T213621Z-001 | E_NEXUS_FRAMING | median=0B/s samples=0 | evidence/vless/default/tcp-throughput/PIV-vless-default-tcp-throughput-20261024T213621Z-001/probe.json | proxy_error=ConnectivityEstablishmentFailed { provider: ProviderId("ref"), reason: "vless response read failed: vless io error" }; workload_error=sink digest read: Connection reset by peer (os error 104) … |
-| Default/LongLived | FAIL | ProductSocks5 | ProductPath | PIV-vless-default-long-lived-20261024T213635Z-001 | E_NEXUS_FRAMING | heartbeats=0 | evidence/vless/default/long-lived/PIV-vless-default-long-lived-20261024T213635Z-001/probe.json | proxy_error=ConnectivityEstablishmentFailed { provider: ProviderId("ref"), reason: "vless response read failed: vless io error" }; workload_error=heartbeat 0: tunnel read: Connection reset by peer (os error 104) … |
-| Default/Reconnect | FAIL | ProductSocks5 | ProductPath | PIV-vless-default-reconnect-20261024T213648Z-001 | E_NEXUS_FRAMING | reconnects=0 | evidence/vless/default/reconnect/PIV-vless-default-reconnect-20261024T213648Z-001/probe.json | workload_error=cycle 0: tunnel read: Connection reset by peer (os error 104); workload_error=cycle 0: proxy ConnectivityEstablishmentFailed { provider: ProviderId("ref") … |
-| Default/UdpEcho | PASS | CrateDirect | ProtocolWire | PIV-vless-default-udp-echo-20261024T174211Z-001 | NONE | udp 1000/1000 corrupt=0 | evidence/vless/default/udp-echo/PIV-vless-default-udp-echo-20261024T174211Z-001/probe.json | udp_seq_and_hash_ok; target_stats={"tcp_bytes_down":0,"tcp_bytes_up":0,"tcp_connections":0,"udp_bytes":512064,"udp_datagrams":1001} … |
-| Default/BadCredential | PASS | ProductSocks5 | ProductPath | PIV-vless-default-bad-credential-20261024T191726Z-001 | E_EXPECTED_AUTH_REJECT | up=0B down=0B | evidence/vless/default/bad-credential/PIV-vless-default-bad-credential-20261024T191726Z-001/probe.json | proxy_error=ConnectivityEstablishmentFailed { provider: ProviderId("ref"), reason: "vless response read failed: vless io error" }; workload_error=read: Connection reset by peer (os error 104) …; 限定：正向路径不通时本格仅证明无静默成功，不独立证明认证拒绝语义 |
-| Default/BadConfig | PASS | ProductSocks5 | ProductPath | PIV-vless-default-bad-config-20261024T191736Z-001 | E_EXPECTED_CONFIG_REJECT | up=0B down=0B | evidence/vless/default/bad-config/PIV-vless-default-bad-config-20261024T191736Z-001/probe.json | proxy_error=ConnectivityEstablishmentFailed { provider: ProviderId("ref"), reason: "vless response read failed: vless io error" }; workload_error=read: Connection reset by peer (os error 104) …; 限定：正向路径不通时本格仅证明无静默成功，不独立证明认证拒绝语义 |
-| VlessVision/Handshake | PASS | CrateDirect | ProtocolWire | PIV-vless-vless-vision-handshake-20261024T172418Z-001 | NONE | up=1B down=1B | evidence/vless/vless-vision/handshake/PIV-vless-vless-vision-handshake-20261024T172418Z-001/probe.json | vision_commands=["continue"]; target_stats={"tcp_bytes_down":2,"tcp_bytes_up":2,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} …; crate 级，产品 splice 未实现 |
-| VlessVision/TcpSmall | PASS | CrateDirect | ProtocolWire | PIV-vless-vless-vision-tcp-small-20261024T172419Z-001 | NONE | up=65536B down=65536B | evidence/vless/vless-vision/tcp-small/PIV-vless-vless-vision-tcp-small-20261024T172419Z-001/probe.json | vision_commands=["continue", "continue", "end"]; target_stats={"tcp_bytes_down":65537,"tcp_bytes_up":65537,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} …; crate 级，产品 splice 未实现 |
+| Default/Handshake | PASS | ProductSocks5 | ProductPath | PIV-vless-default-handshake-20261024T214820Z-001 | NONE | up=1B down=1B | evidence/vless/default/handshake/PIV-vless-default-handshake-20261024T214820Z-001/probe.json | proxy_json routing.outbound_kind=vless outbound.kind=vless; target_stats={"tcp_bytes_down":2,"tcp_bytes_up":2,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} … |
+| Default/TcpSmall | PASS | ProductSocks5 | ProductPath | PIV-vless-default-tcp-small-20261024T214824Z-001 | NONE | up=65536B down=65536B | evidence/vless/default/tcp-small/PIV-vless-default-tcp-small-20261024T214824Z-001/probe.json | proxy_json routing.outbound_kind=vless outbound.kind=vless; target_stats={"tcp_bytes_down":65537,"tcp_bytes_up":65537,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} … |
+| Default/TcpThroughput | PASS | ProductSocks5 | ProductPath | PIV-vless-default-tcp-throughput-20261024T214827Z-001 | NONE | median=1388514117B/s samples=3 | evidence/vless/default/tcp-throughput/PIV-vless-default-tcp-throughput-20261024T214827Z-001/probe.json | proxy_json routing.outbound_kind=vless outbound.kind=vless; target_stats={"tcp_bytes_down":101716128,"tcp_bytes_up":101712896,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} … |
+| Default/LongLived | PASS | ProductSocks5 | ProductPath | PIV-vless-default-long-lived-20261024T214832Z-001 | NONE | heartbeats=12 | evidence/vless/default/long-lived/PIV-vless-default-long-lived-20261024T214832Z-001/probe.json | proxy_json routing.outbound_kind=vless outbound.kind=vless; target_stats={"tcp_bytes_down":13,"tcp_bytes_up":13,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} … |
+| Default/Reconnect | PASS | ProductSocks5 | ProductPath | PIV-vless-default-reconnect-20261024T215026Z-001 | NONE | reconnects=3 | evidence/vless/default/reconnect/PIV-vless-default-reconnect-20261024T215026Z-001/probe.json | proxy_json routing.outbound_kind=vless outbound.kind=vless; target_stats={"tcp_bytes_down":4,"tcp_bytes_up":4,"tcp_connections":4,"udp_bytes":0,"udp_datagrams":0} … |
+| Default/UdpEcho | PASS | CrateDirect | ProtocolWire | PIV-vless-default-udp-echo-20261024T215033Z-001 | NONE | udp 1000/1000 corrupt=0 | evidence/vless/default/udp-echo/PIV-vless-default-udp-echo-20261024T215033Z-001/probe.json | udp_seq_and_hash_ok; target_stats={"tcp_bytes_down":0,"tcp_bytes_up":0,"tcp_connections":0,"udp_bytes":512064,"udp_datagrams":1001} … |
+| Default/BadCredential | PASS | ProductSocks5 | ProductPath | PIV-vless-default-bad-credential-20261024T215038Z-001 | E_EXPECTED_AUTH_REJECT | up=0B down=0B | evidence/vless/default/bad-credential/PIV-vless-default-bad-credential-20261024T215038Z-001/probe.json | proxy_json routing.outbound_kind=vless outbound.kind=vless; workload_error=eof; classification=E_EXPECTED_AUTH_REJECT; reference closed the session on the negative case …; 限定：正向路径不通时本格仅证明无静默成功，不独立证明认证拒绝语义 |
+| Default/BadConfig | PASS | ProductSocks5 | ProductPath | PIV-vless-default-bad-config-20261024T215041Z-001 | E_EXPECTED_CONFIG_REJECT | up=0B down=0B | evidence/vless/default/bad-config/PIV-vless-default-bad-config-20261024T215041Z-001/probe.json | proxy_json routing.outbound_kind=vless outbound.kind=vless; workload_error=eof; classification=E_EXPECTED_CONFIG_REJECT; reference closed the session on the negative case …; 限定：正向路径不通时本格仅证明无静默成功，不独立证明认证拒绝语义 |
+| VlessVision/Handshake | PASS | CrateDirect | ProtocolWire | PIV-vless-vless-vision-handshake-20261024T215044Z-001 | NONE | up=1B down=1B | evidence/vless/vless-vision/handshake/PIV-vless-vless-vision-handshake-20261024T215044Z-001/probe.json | vision_commands=["continue"]; target_stats={"tcp_bytes_down":2,"tcp_bytes_up":2,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} …; crate 级，产品 splice 未实现 |
+| VlessVision/TcpSmall | PASS | CrateDirect | ProtocolWire | PIV-vless-vless-vision-tcp-small-20261024T215048Z-001 | NONE | up=65536B down=65536B | evidence/vless/vless-vision/tcp-small/PIV-vless-vless-vision-tcp-small-20261024T215048Z-001/probe.json | vision_commands=["continue", "continue", "end"]; target_stats={"tcp_bytes_down":65537,"tcp_bytes_up":65537,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} …; crate 级，产品 splice 未实现 |
 
 ## Anytls
 
@@ -231,16 +231,16 @@
 | PIV-trojan-default-tcp-throughput-20261024T213728Z-001 | PASS | ProductSocks5 | ProductPath | evidence/trojan/default/tcp-throughput/PIV-trojan-default-tcp-throughput-20261024T213728Z-001/probe.json |
 | PIV-trojan-default-udp-echo-20261024T174223Z-001 | NOT_IMPLEMENTED | CrateDirect | ProtocolWire | evidence/trojan/default/udp-echo/PIV-trojan-default-udp-echo-20261024T174223Z-001/probe.json |
 | PIV-trojan-trojan-fallback-bad-credential-20261024T191808Z-001 | FAIL | ProductSocks5 | ProductPath | evidence/trojan/trojan-fallback/bad-credential/PIV-trojan-trojan-fallback-bad-credential-20261024T191808Z-001/probe.json |
-| PIV-vless-default-bad-config-20261024T191736Z-001 | PASS | ProductSocks5 | ProductPath | evidence/vless/default/bad-config/PIV-vless-default-bad-config-20261024T191736Z-001/probe.json |
-| PIV-vless-default-bad-credential-20261024T191726Z-001 | PASS | ProductSocks5 | ProductPath | evidence/vless/default/bad-credential/PIV-vless-default-bad-credential-20261024T191726Z-001/probe.json |
-| PIV-vless-default-handshake-20261024T172249Z-001 | FAIL | ProductSocks5 | ProductPath | evidence/vless/default/handshake/PIV-vless-default-handshake-20261024T172249Z-001/probe.json |
-| PIV-vless-default-long-lived-20261024T213635Z-001 | FAIL | ProductSocks5 | ProductPath | evidence/vless/default/long-lived/PIV-vless-default-long-lived-20261024T213635Z-001/probe.json |
-| PIV-vless-default-reconnect-20261024T213648Z-001 | FAIL | ProductSocks5 | ProductPath | evidence/vless/default/reconnect/PIV-vless-default-reconnect-20261024T213648Z-001/probe.json |
-| PIV-vless-default-tcp-small-20261024T213608Z-001 | FAIL | ProductSocks5 | ProductPath | evidence/vless/default/tcp-small/PIV-vless-default-tcp-small-20261024T213608Z-001/probe.json |
-| PIV-vless-default-tcp-throughput-20261024T213621Z-001 | FAIL | ProductSocks5 | ProductPath | evidence/vless/default/tcp-throughput/PIV-vless-default-tcp-throughput-20261024T213621Z-001/probe.json |
-| PIV-vless-default-udp-echo-20261024T174211Z-001 | PASS | CrateDirect | ProtocolWire | evidence/vless/default/udp-echo/PIV-vless-default-udp-echo-20261024T174211Z-001/probe.json |
-| PIV-vless-vless-vision-handshake-20261024T172418Z-001 | PASS | CrateDirect | ProtocolWire | evidence/vless/vless-vision/handshake/PIV-vless-vless-vision-handshake-20261024T172418Z-001/probe.json |
-| PIV-vless-vless-vision-tcp-small-20261024T172419Z-001 | PASS | CrateDirect | ProtocolWire | evidence/vless/vless-vision/tcp-small/PIV-vless-vless-vision-tcp-small-20261024T172419Z-001/probe.json |
+| PIV-vless-default-bad-config-20261024T215041Z-001 | PASS | ProductSocks5 | ProductPath | evidence/vless/default/bad-config/PIV-vless-default-bad-config-20261024T215041Z-001/probe.json |
+| PIV-vless-default-bad-credential-20261024T215038Z-001 | PASS | ProductSocks5 | ProductPath | evidence/vless/default/bad-credential/PIV-vless-default-bad-credential-20261024T215038Z-001/probe.json |
+| PIV-vless-default-handshake-20261024T214820Z-001 | PASS | ProductSocks5 | ProductPath | evidence/vless/default/handshake/PIV-vless-default-handshake-20261024T214820Z-001/probe.json |
+| PIV-vless-default-long-lived-20261024T214832Z-001 | PASS | ProductSocks5 | ProductPath | evidence/vless/default/long-lived/PIV-vless-default-long-lived-20261024T214832Z-001/probe.json |
+| PIV-vless-default-reconnect-20261024T215026Z-001 | PASS | ProductSocks5 | ProductPath | evidence/vless/default/reconnect/PIV-vless-default-reconnect-20261024T215026Z-001/probe.json |
+| PIV-vless-default-tcp-small-20261024T214824Z-001 | PASS | ProductSocks5 | ProductPath | evidence/vless/default/tcp-small/PIV-vless-default-tcp-small-20261024T214824Z-001/probe.json |
+| PIV-vless-default-tcp-throughput-20261024T214827Z-001 | PASS | ProductSocks5 | ProductPath | evidence/vless/default/tcp-throughput/PIV-vless-default-tcp-throughput-20261024T214827Z-001/probe.json |
+| PIV-vless-default-udp-echo-20261024T215033Z-001 | PASS | CrateDirect | ProtocolWire | evidence/vless/default/udp-echo/PIV-vless-default-udp-echo-20261024T215033Z-001/probe.json |
+| PIV-vless-vless-vision-handshake-20261024T215044Z-001 | PASS | CrateDirect | ProtocolWire | evidence/vless/vless-vision/handshake/PIV-vless-vless-vision-handshake-20261024T215044Z-001/probe.json |
+| PIV-vless-vless-vision-tcp-small-20261024T215048Z-001 | PASS | CrateDirect | ProtocolWire | evidence/vless/vless-vision/tcp-small/PIV-vless-vless-vision-tcp-small-20261024T215048Z-001/probe.json |
 
 ## 附录 C：命令与端口
 
@@ -262,7 +262,7 @@ python3 scripts/interop/recompute-verdicts.py --run-dir $RUN_DIR \
 
 | 协议 | evidence_id | nexus.commit | cargo_target_dir | binary_sha256 |
 |---|---|---|---|---|
-| Vless | PIV-vless-default-tcp-throughput-20261024T213621Z-001 | 60e6029e4977c47bf624cbc62f107ea02fe16da3 | /work/wt-protocol-interop-fixes-1/target | b6c5a37ad1c64edd50a304d32ad76514c2b705f8185f0f883bcf4d2dbaa29c01 |
+| Vless | PIV-vless-default-tcp-throughput-20261024T214827Z-001 | 43ca7ac42b6b67d26498d7aeeeecc28199a02e13 | /work/wt-protocol-interop-fixes-1/target | 7cbff04742d322f0866d1375fca23a89f001e2f22fcdd1bac5a24f4376279e96 |
 | Anytls | PIV-anytls-default-tcp-throughput-20261024T213344Z-001 | 60e6029e4977c47bf624cbc62f107ea02fe16da3 | /work/wt-protocol-interop-fixes-1/target | b6c5a37ad1c64edd50a304d32ad76514c2b705f8185f0f883bcf4d2dbaa29c01 |
 | Hysteria2 | PIV-hysteria2-default-tcp-throughput-20261024T214226Z-001 | 60e6029e4977c47bf624cbc62f107ea02fe16da3 | /work/wt-protocol-interop-fixes-1/target | b6c5a37ad1c64edd50a304d32ad76514c2b705f8185f0f883bcf4d2dbaa29c01 |
 | Trojan | PIV-trojan-default-tcp-throughput-20261024T213728Z-001 | 60e6029e4977c47bf624cbc62f107ea02fe16da3 | /work/wt-protocol-interop-fixes-1/target | b6c5a37ad1c64edd50a304d32ad76514c2b705f8185f0f883bcf4d2dbaa29c01 |
