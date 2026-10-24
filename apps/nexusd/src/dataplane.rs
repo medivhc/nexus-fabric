@@ -189,7 +189,8 @@ pub struct Dataplane {
     config: DataplaneConfig,
     buf: Vec<u8>,
     /// QoS 时钟起点（单调；避免 Duration::ZERO 冻结导致队列永不满溢回收）。
-    qos_start: std::time::Instant,
+    /// 单调时钟起点（spec §9.14；组合根唯一采集点）。
+    epoch: std::time::Instant,
     /// S1: TCP 终结器（smoltcp，用户态 TCP 栈）。
     tcp: TcpTerminator,
     /// S4: stream_id → 流信息（事件分发：Mesh 经 N1 发帧 / Proxy 计数）。
@@ -318,7 +319,7 @@ impl Dataplane {
             stats: Arc::new(Mutex::new(DataplaneStats::default())),
             config,
             buf: vec![0u8; 65535],
-            qos_start: std::time::Instant::now(),
+            epoch: std::time::Instant::now(),
             tcp: TcpTerminator::new(),
             tcp_streams: HashMap::new(),
             flow_mgr: None,
@@ -382,7 +383,7 @@ impl Dataplane {
     /// 某包的缓存出站（测试/可观测用）。
     pub fn cached_outbound(&mut self, packet: &[u8]) -> Option<String> {
         let flow = nexus_projection::egress::FlowKey::parse(packet)?;
-        let now = u64::try_from(self.qos_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let now = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
         let key = FlowDecisionKey {
             flow,
             frontend: Frontend::Tun,
@@ -533,9 +534,8 @@ impl Dataplane {
     }
 
     /// 触发空闲扫描（E4 用；生产由定时器调）。
-    pub fn flow_sweep_idle(&mut self) -> usize {
-        // S31 之前：driver 在每个扫描点采集一次 `Instant`（core 不读时钟）。
-        let now = std::time::Instant::now();
+    pub fn flow_sweep_idle(&mut self, now_millis: u64) -> usize {
+        let now = self.now_instant(now_millis);
         self.flow_mgr
             .as_mut()
             .map(|m| m.sweep_idle(now))
@@ -590,8 +590,7 @@ impl Dataplane {
     /// 管线：读 TUN → DNS 短路（UDP dport 53）→ 分类 → [S1: TCP 终结] →
     /// QoS → 计数转发。
     /// 分类并缓存 5 元组决策；命中缓存时不再调用规则引擎（spec §9.13）。
-    fn classify_with_cache(&mut self, packet: &[u8]) -> Classification {
-        let now_millis = u64::try_from(self.qos_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    fn classify_with_cache(&mut self, packet: &[u8], now_millis: u64) -> Classification {
         let cache_key =
             nexus_projection::egress::FlowKey::parse(packet).map(|flow| FlowDecisionKey {
                 flow,
@@ -638,7 +637,28 @@ impl Dataplane {
         classification
     }
 
+    /// 当前单调毫秒（driver 时钟域）。
+    pub fn epoch_millis(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// 单调毫秒 → `Instant`（epoch 唯一采集点，core 不读时钟）。
+    fn now_instant(&self, now_millis: u64) -> std::time::Instant {
+        self.epoch + std::time::Duration::from_millis(now_millis)
+    }
+
+    /// 单个 tick：驱动 owner 线程（S41 前无 transparent_rx，直接读 TUN 一包）。
+    pub fn tick(&mut self, now_millis: u64) -> io::Result<bool> {
+        self.process_one_at(now_millis)
+    }
+
+    /// 兼容入口：driver 采集当前单调毫秒后调用 [`Self::tick`]。
     pub fn process_one(&mut self) -> io::Result<bool> {
+        let now_millis = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.process_one_at(now_millis)
+    }
+
+    fn process_one_at(&mut self, now_millis: u64) -> io::Result<bool> {
         // Phase B/C：每轮先回填建连事件（即使无包，保证 Allocating→Active 推进）。
         self.flow_pump();
         let n = match self.tun.read(&mut self.buf) {
@@ -657,7 +677,7 @@ impl Dataplane {
         // D2：分类。
         // D6：boost_enabled 时分类器经 PathManager 做 EWMA 只读选路（S30）；
         // 禁用时 candidates 为空（回落默认转发）。
-        let classification = self.classify_with_cache(&packet);
+        let classification = self.classify_with_cache(&packet, now_millis);
 
         // S1：TCP + Mesh/Proxy → smoltcp 终结（不再走 raw-datagram 路径）。
         if is_tcp_packet(&packet) && matches!(classification, Classification::Mesh { .. }) {
@@ -666,7 +686,9 @@ impl Dataplane {
             }
             // Phase B：流→会话映射（启用时）。首包走 §10 链，会话建好前
             // TCP 本地握手照常（smoltcp 缓冲早期数据，D4）。
-            if self.flow_mgr.is_some() && !self.flow_handle_tcp_packet(&packet, &classification) {
+            if self.flow_mgr.is_some()
+                && !self.flow_handle_tcp_packet(&packet, &classification, now_millis)
+            {
                 return Ok(true);
             }
             self.handle_tcp_terminated(&packet, &classification);
@@ -688,7 +710,7 @@ impl Dataplane {
                 classification,
                 Classification::Mesh { .. } | Classification::Proxy { .. }
             )
-            && !self.flow_handle_udp_packet(&packet, &classification)
+            && !self.flow_handle_udp_packet(&packet, &classification, now_millis)
         {
             self.flow_pump();
             return Ok(true);
@@ -906,7 +928,7 @@ impl Dataplane {
     /// 返回 `false` 表示被整形丢弃（已计数 `qos_dropped`）。
     /// 使用单调时钟（非冻结），避免队列永不回收。
     fn qos_admit(&mut self, packet: &[u8]) -> bool {
-        let now = self.qos_start.elapsed();
+        let now = self.epoch.elapsed();
         let qos = match &mut self.qos {
             Some(q) => q,
             None => return true,
@@ -934,7 +956,13 @@ impl Dataplane {
     /// Phase C：UDP 包的流→会话映射。
     ///
     /// 返回 true = 继续现有转发路径；false = 包已处理（缓冲/丢弃），不继续。
-    fn flow_handle_udp_packet(&mut self, packet: &[u8], classification: &Classification) -> bool {
+    fn flow_handle_udp_packet(
+        &mut self,
+        packet: &[u8],
+        classification: &Classification,
+        now_millis: u64,
+    ) -> bool {
+        let now = self.now_instant(now_millis);
         let (mgr, deps) = match (self.flow_mgr.as_mut(), self.flow_chain_deps.as_ref()) {
             (Some(m), Some(d)) => (m, d),
             _ => return true,
@@ -944,7 +972,6 @@ impl Dataplane {
             None => return true,
         };
         debug_assert_eq!(key.proto, IpProto::Udp);
-        let now = std::time::Instant::now();
         let hint = egress_hint(classification);
         match mgr.on_packet_with_hint(key, packet, false, deps, now, hint) {
             FlowDecision::NewSession { .. } | FlowDecision::Buffered { .. } => {
@@ -1034,7 +1061,13 @@ impl Dataplane {
     /// Phase B：TCP 包的流→会话映射。
     ///
     /// 返回 true = 继续现有 smoltcp 终结路径；false = 包已处理（丢弃），不继续。
-    fn flow_handle_tcp_packet(&mut self, packet: &[u8], classification: &Classification) -> bool {
+    fn flow_handle_tcp_packet(
+        &mut self,
+        packet: &[u8],
+        classification: &Classification,
+        now_millis: u64,
+    ) -> bool {
+        let now = self.now_instant(now_millis);
         let (mgr, deps) = match (self.flow_mgr.as_mut(), self.flow_chain_deps.as_ref()) {
             (Some(m), Some(d)) => (m, d),
             _ => return true,
@@ -1045,7 +1078,6 @@ impl Dataplane {
         };
         debug_assert_eq!(key.proto, IpProto::Tcp);
         let is_syn = is_tcp_syn(packet);
-        let now = std::time::Instant::now();
         let hint = egress_hint(classification);
         match mgr.on_packet_with_hint(key, packet, is_syn, deps, now, hint) {
             FlowDecision::NewSession { session_id } => {
@@ -2310,6 +2342,29 @@ mod tests {
         let dropped_before = dp.stats().dropped;
         dp.inject_stream_frame_from_n1("x", &[0x00, 0x01]);
         assert_eq!(dp.stats().dropped, dropped_before + 1);
+    }
+
+    /// S31：同一 `now_millis` 序列两次运行输出一致；tick 走生产入口。
+    #[test]
+    fn flow_tick_is_deterministic() {
+        fn run() -> (u64, u64, u64, u64) {
+            let (mut dp, mock) = test_dataplane();
+            let p1 = craft_udp([192, 168, 1, 5], [8, 8, 8, 8], 40_000, 443, b"a");
+            let p2 = craft_udp([192, 168, 1, 5], [8, 8, 8, 9], 40_001, 443, b"b");
+            mock.lock().unwrap().inject(p1);
+            assert!(dp.tick(1).expect("tick 1"));
+            mock.lock().unwrap().inject(p2);
+            assert!(dp.tick(2).expect("tick 2"));
+            let s = dp.stats();
+            let c = dp.decision_cache_stats();
+            (
+                s.dropped + s.proxy_dropped_no_proxy,
+                c.entries,
+                c.hits,
+                c.misses,
+            )
+        }
+        assert_eq!(run(), run());
     }
 
     /// S30：LocalAPI stats 字段与 takeover_mode 语义。

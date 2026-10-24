@@ -513,13 +513,15 @@ fn run_dataplane(
 
     eprintln!("[nexusd] dataplane: running");
     let _ = &mut os_assemble;
+    let loop_start = std::time::Instant::now();
     loop {
         // R4：关闭信号 → 退出循环（TUN 随 Dataplane drop 关闭）。
         if shutdown.load(Ordering::Relaxed) {
             eprintln!("[nexusd] dataplane: shutdown signal, exiting");
             break;
         }
-        match dp.process_one() {
+        let now_millis = u64::try_from(loop_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        match dp.tick(now_millis) {
             Ok(true) => continue,
             Ok(false) => {
                 // 无包：短暂休眠避免忙轮询。
