@@ -53,7 +53,7 @@ A ◄──TURN relay──► B          ① 中继建连（现有 4b + fallbac
 │ ◄ - - - - - - - ► │  ③ 协同打洞（双向同时）
 │                    │
 │  QUIC path validation 自动完成
-│  CID 不变，连接不重建        ④ 路径迁移（复用 S3/S6 被动迁移）
+│  新直连 + 会话层选路（CID 可变）④ 路径切换（PathLink ActiveConn）
 │                    │
 │  竞速：direct vs relay
 │  20% + 3s hysteresis        ⑤ 切换或多路径（复用 Boost/多路径）
@@ -70,9 +70,10 @@ A ◄──TURN relay──► B          ① 中继建连（现有 4b + fallbac
 1. **Server-reflexive**：TURN `Allocate` 成功响应中的 `XOR-MAPPED-ADDRESS`
    （codec 已支持 `0x0020`，`nexus-turn/src/stun.rs`）。这是零成本的，
    分配中继时天然获得，无需额外 STUN。
-2. **STUN 自测**：`StunClient::get_mapping` + `detect_nat_type`（已有）。
-   用于校验 reflexive 是否稳定（两次 mapping 对比），并驱动
-   `nat_path_decision`（Symmetric → 直接放弃打洞走 Relay）。
+2. **STUN 自测**（v1.1 真值）：旧 `StunClient` 已退役（2026-10-18），由
+   `nexusd::nat_stun` 的 `DriverStunTransport`/`CandidateGatherer` 承担；
+   在打洞 driver 的同一 socket 上采集样本（`observed_from`），
+   并驱动 `nexus-nat-traversal` 的方向门控与预测（Symmetric → 有界预测或 Relay）。
 3. **Host 本地地址**：本机各接口地址（同子网/同一 NAT 下的直连优化，
    EasyTier 同理）。
 
@@ -93,10 +94,10 @@ A ◄──TURN relay──► B          ① 中继建连（现有 4b + fallbac
 
 ### 4.3 打洞执行（Punching）
 
-- **打洞包 = QUIC 包，不是魔术明文**。现有 `HolePuncher::punch`
- （`b"punch-hello"` 明文、阻塞 socket、5 秒超时）是 P4.2 时期的玩具，
-  本设计**退役**它，改从 fabric driver 的**同一个 UDP socket**
-  向对方候选地址发送 QUIC Initial / PING。
+- **打洞包 = QUIC 包，不是魔术明文**。旧 `HolePuncher`（明文 magic、
+  阻塞 socket、5 秒超时）已退役（2026-10-18），**禁止恢复**；
+  实现改由 `nexus-nat-traversal` 编排、从 fabric driver 的**同一个 UDP
+  socket** 向对方候选地址发送 QUIC Initial / PING。
   - 同一 socket 是关键：NAT 映射绑定的是本地 4 元组，换 socket
     映射就变了，打洞白打。
   - QUIC 包自带 AEAD，防 spoof、防注入，无需自定义鉴权。
@@ -105,9 +106,10 @@ A ◄──TURN relay──► B          ① 中继建连（现有 4b + fallbac
   quinn 收到来自新地址的合法 QUIC 包会自动发起
   **PATH_CHALLENGE / PATH_RESPONSE** 路径验证——只有真正能收发
   的地址才能通过验证，spoof 的源地址通不过（收不到 challenge）。
-- **NAT 类型门控**：`nat_path_decision` 已有；任一端为 Symmetric
-  则进入 §4.3.1 有界端口预测流程，预测不可行（端口分配随机）
-  时诚实降级走 Relay。
+- **NAT 类型门控**（v1.1 真值）：旧 `nat_path_decision` 已退役；门控由
+  `nexus-nat-traversal` 的 `should_punch`/方向修正承担（合同 C-21）。
+  任一端为 Symmetric 则进入 §4.3.1 有界端口预测流程，预测不可行
+  （端口分配随机）时诚实降级走 Relay。
 
 ### 4.3.1 有界端口预测（Symmetric NAT）
 
@@ -136,7 +138,7 @@ A ◄──TURN relay──► B          ① 中继建连（现有 4b + fallbac
 > （`connection/mod.rs:1134`：client 收到未知来源包直接丢弃，
 > `remote_may_migrate()` 对 Client 恒返回 false，`migrate()` 是私有方法）。
 > 而 NAT 打洞会同时改变**两端**的 UDP 地址（之前都走中继），
-> 因此"同一连接内迁移、CID 不变"的原方案**不可行**
+> 因此"在同一连接内做被动迁移"的原方案**不可行**
 > ——client 侧的收包路径会断。
 >
 > **修正后方案**：打洞 = 在**同一 UDP socket** 上新建直连 QUIC 连接
@@ -163,7 +165,7 @@ A ◄──TURN relay──► B          ① 中继建连（现有 4b + fallbac
 | `PunchSocket::send_punch` | 后台 `Driver::connect(peer, target)`（同一 socket） |
 | `PunchSocket::await_direct` | 等待首个握手成功，返回其地址；spray 时对多个预测端口扇出，first-wins |
 | `PunchSession → Migrated{addr}` | 把直连加入会话层，经 `PunchRaceFeed` 登记为 `DirectP2P` 候选 |
-| `select_path` | 按 §4.5 三类竞速决策切换/保留 |
+| `PathManager`/`PathLink` | 按 §4.5 三类竞速决策切换/保留（`select_path` 已删除，禁止恢复） |
 
 ### 4.5 成功后：切换 vs 多路径
 
@@ -212,14 +214,14 @@ A ◄──TURN relay──► B          ① 中继建连（现有 4b + fallbac
 | 本设计部件 | 现有实现 | 状态 |
 |---|---|---|
 | 中继建连 | `nexus-turn` TurnClient（4b，E4 3/3）+ `nexus-path` FallbackChain | 已有 |
-| NAT 类型探测 | `StunClient::detect_nat_type`，`nat_path_decision` | 已有 |
+| NAT 类型探测 | 旧 `StunClient`/`nat_path_decision` **已退役**；由 `nexusd::nat_stun` + `nexus-nat-traversal` 承担 | 本 run 实现 |
 | XOR-MAPPED 解析 | `nexus-turn/src/stun.rs` codec | 已有（client 需取用） |
 | QUIC 路径验证/被动迁移 | quinn-proto + driver S3/S6 | 已有 |
 | 质量竞速/hysteresis | `race.rs`，`ewma.rs`，Boost 门限 | 已有 |
 | 多路径腿 | `nexus-projection/src/multipath.rs` + QSEQ | 已有 |
 | 信令通道 | relayed FabricConn 控制流 | 需新增消息类型 |
 | 协同打洞编排 | — | **新增**（核心工作量） |
-| 旧 HolePuncher | `nexus-connectivity/src/nat.rs` | **退役** |
+| 旧 HolePuncher | `nexus-connectivity/src/nat.rs` | **已退役/已删除，禁止恢复** |
 | per-peer 状态展示 | LocalAPI | 建议新增 |
 
 ## 6. 关键决策（已拍板，2026-10-02）
@@ -236,7 +238,8 @@ A ◄──TURN relay──► B          ① 中继建连（现有 4b + fallbac
 
 - E4-1：netns 双节点，A/B 各经 iptables MASQUERADE（cone NAT），
   relay-first 建连可用 → 后台打洞 → direct 建连 → 竞速切换，
-  全程 TCP 传文件不断流，CID 不变。
+  会话层选路到新直连（CID 可变）；10 MiB/64 KiB 分块传输不断流
+  （分块不丢块、逻辑会话不重建）。
 - E4-2：打洞失败场景（对称 NAT 模拟或直接 DROP 打洞包），
   确认 5s 超时后稳定留在 relay，无抖动、无重连风暴。
 - E4-3（可选）：多路径模式，直连+relay 双腿同时跑，
@@ -258,4 +261,5 @@ A ◄──TURN relay──► B          ① 中继建连（现有 4b + fallbac
 - **打洞成功不等于路径最优**：direct 只是竞速候选之一，
   输给 peer-relay/TURN 时不切换（§4.5）。
 - 不自研 STUN 服务端：reflexive 采集复用 TURN Allocate 响应
-  与现有 `StunClient`（需外部 STUN 服务器地址配置）。
+  与已退役的 `StunClient` 不同（历史注记：旧实现需外部 STUN 地址配置）；
+  v1.1 由 `nexusd::nat_stun` 在同 socket 上采集。
