@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "run_id": "protocol-interop-verification",
+  "protocol": "Trojan",
+  "variant": "Default",
+  "cell": "Handshake",
+  "reference": {
+    "host": "127.0.0.1",
+    "port": 26105,
+    "server_name": "localhost",
+    "alpn": []
+  },
+  "target": {
+    "kind": "TcpEcho",
+    "host": "127.0.0.1",
+    "port": 26200
+  },
+  "credentials": {
+    "Trojan": {
+      "password": "${TROJAN_PASSWORD}",
+      "header_format": "Standard"
+    }
+  },
+  "tls": {
+    "skip_cert_verify": true,
+    "sni": "localhost"
+  },
+  "transport": {
+    "fast_open": true,
+    "udp": true,
+    "vision_direct": false
+  },
+  "timeouts": {
+    "handshake_ms": 10000,
+    "cell_ms": 60000,
+    "failure_ms": 10000,
+    "long_lived_ms": 120000,
+    "heartbeat_ms": 10000,
+    "reconnect_wait_ms": 2000
+  },
+  "workload": {
+    "small_bytes": 65536,
+    "throughput_bytes": 33554432,
+    "throughput_repeats": 3,
+    "warmup_bytes": 1048576,
+    "udp_datagrams": 1000,
+    "udp_payload_bytes": 512,
+    "udp_interval_ms": 1,
+    "long_lived_heartbeats": 12,
+    "reconnect_cycles": 3
+  }
+}
