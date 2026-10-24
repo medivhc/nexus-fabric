@@ -440,7 +440,7 @@ fn run_dataplane(
 
 /// NAT switching daemon runtime（AC5）。
 ///
-/// 持有 `TurnManager` + `StunProber` + `NatSwitching`，在后台 worker 线程驱动：
+/// 持有 `TurnManager` + `StunProber` + `NatSwitching` + （可选）`TurnRelayProvider`，在后台 worker 线程驱动：
 /// - 启动时懒分配 TURN（失败 → WARN + Disabled 降级，不阻断进程）；
 /// - 按节奏 Refresh 保活（AC3）；
 /// - 周期性 STUN 采样（5min），更新本地候选与 NAT 类型分支（AC4）。
@@ -454,10 +454,13 @@ fn run_dataplane(
 ///   不暴露共享 server socket，因此 mesh 数据面与打洞共用同一 UDP socket
 ///   （AC6 严格字面）需要更深的 mesh/fabric 集成——作为跨模块后续工作记录，
 ///   不在本任务内静默模拟。
-/// - nexusd 的 N1 mesh 连接不暴露 `fabric::ConnShared`，因此
-///   `NatSwitching::on_relay_connected` 的生产喂入（D5）需要更深的 mesh/fabric
-///   集成（超出本任务 5 文件范围）；本运行时先激活 NAT 路径决策引擎（AC5：
-///   配置开关可验证开启/关闭），并保留 `sw` 供后续 relay 钩子调用。
+/// - D5 生产触发（spec §14.3 / B17）已接线：`start` 在 identity 就绪时构造
+///   `TurnRelayProvider` 并 `attach_relay_provider` 到 `sw`；`NatSwitching`
+///   实现生产 `RelayConnSink`，provider 事件直通 `on_relay_connected`
+///   （auto_punch: true），loopback 验收已证明该路径。残留边界：生产侧按
+///   peer 订阅与 `on_turn_allocated` 触发需要 peer 来源（mesh 发现），目前
+///   daemon 内无 peer 源调用它们——接线与订阅机制已就位，peer 发现触发是
+///   后续 mesh 集成工作，不在本轮静默模拟。
 struct NatSwitchRuntime {
     turn: nat_turn::TurnManager,
     // B14 fix: the gatherer owns the sampling prober (probing goes through
@@ -465,8 +468,11 @@ struct NatSwitchRuntime {
     gatherer: nat_gather::CandidateGatherer,
     sw: Arc<nexusd::nat_switch::NatSwitching>,
     _driver: Arc<Driver>,
-    /// BLOCKED-1 (a): injected fabric identity for the relay provider.
-    identity: Option<FabricIdentity>,
+    /// D5 production relay provider (spec §14.3 / B17). Owns the daemon
+    /// fabric identity (bind_with_transport_identity); `run` uses
+    /// `identity_peer_id()` for the self-publish book path. `None` when
+    /// the relay provider path is disabled (identity absent).
+    provider: Option<Arc<nexusd::nat_relay::TurnRelayProvider>>,
     /// Tech debt (W-2)：协作式退出标志。未用 `CancellationToken` 是因为 nexusd
     /// 没有 tokio/tokio-util 依赖，为这一个标志引入异步运行时不划算。AC5 的
     /// 5s 优雅退出仍有界：worker 内所有阻塞操作都有超时（TURN 请求 3s、STUN
@@ -563,12 +569,53 @@ impl NatSwitchRuntime {
         );
 
         nexusd::nat_status::publish_nat_status_source(Box::new(Arc::clone(&sw)));
+
+        // D5 (spec §14.3 / B17): when the relay provider path is enabled
+        // (identity present), construct the production TURN provider and
+        // attach it to the switch. The provider owns the identity from
+        // here (bind_with_transport_identity); the runtime keeps the
+        // provider handle for the self-publish book path in `run`.
+        // The provider gets its own TurnManager (its own TURN allocation);
+        // the runtime's manager stays the warm backup. Book path matches
+        // `run`'s self-publish path so both read the same address book.
+        // Book-open failure degrades to no provider (logged); the switch
+        // itself still runs for manually fed relays.
+        let provider = match identity {
+            Some(id) => {
+                let hex: String = id.peer_id().0.iter().map(|b| format!("{b:02x}")).collect();
+                let book_path = std::env::temp_dir().join(format!("nexus-relay-{hex}.toml"));
+                match nexusd::nat_relay::FileRelayAddressBook::new(&book_path) {
+                    Ok(book) => {
+                        let provider = nexusd::nat_relay::TurnRelayProvider::new(
+                            my_id,
+                            id,
+                            // NOTE: the bin has its own `nat_turn` module (same
+                            // file, separate compilation); the provider needs
+                            // the LIB's TurnManager type. `section` is already
+                            // the lib's TurnSection (via nexusd::config).
+                            nexusd::nat_turn::TurnManager::new(Some(section.clone())),
+                            Arc::new(book),
+                        );
+                        sw.attach_relay_provider(provider.clone());
+                        Some(provider)
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[nat-relay] WARN: address book open failed ({e}); relay provider not attached"
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+
         let runtime = NatSwitchRuntime {
             turn,
             gatherer,
             sw,
             _driver: driver,
-            identity,
+            provider,
             stop: shutdown,
             port_samples: Vec::new(),
         };
@@ -594,13 +641,14 @@ impl NatSwitchRuntime {
         match self.turn.ensure_allocated() {
             Ok(relayed) => {
                 eprintln!("[nat-switch] TURN relayed={relayed} (warm backup)");
-                if let Some(id) = &self.identity {
-                    let hex: String = id.peer_id().0.iter().map(|b| format!("{b:02x}")).collect();
+                if let Some(provider) = &self.provider {
+                    let peer_id = provider.identity_peer_id();
+                    let hex: String = peer_id.0.iter().map(|b| format!("{b:02x}")).collect();
                     let path = std::env::temp_dir().join(format!("nexus-relay-{hex}.toml"));
                     match nexusd::nat_relay::FileRelayAddressBook::new(&path) {
                         Ok(book) => {
                             use nexusd::nat_relay::RelayAddressBook;
-                            if let Err(e) = book.publish(id.peer_id().0, relayed) {
+                            if let Err(e) = book.publish(peer_id.0, relayed) {
                                 eprintln!(
                                     "[nat-relay] WARN: publish own relayed address failed: {e}"
                                 );
