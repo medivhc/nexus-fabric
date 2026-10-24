@@ -29,7 +29,6 @@
 pub mod domain_engine;
 pub mod geoip_nex;
 pub mod geosite_nex;
-pub mod tun;
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;

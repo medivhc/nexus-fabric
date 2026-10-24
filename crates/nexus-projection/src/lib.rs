@@ -23,6 +23,7 @@ pub mod process;
 pub mod routing;
 pub mod semantic;
 pub mod tcp;
+pub mod transparent;
 pub mod transport;
 pub mod tun_rs_device;
 

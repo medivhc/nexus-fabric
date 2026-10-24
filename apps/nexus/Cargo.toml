@@ -16,6 +16,7 @@ nexus-domain = { path = "../../crates/nexus-domain" }
 nexus-ingress = { path = "../../crates/nexus-ingress" }
 nexus-proxy-config = { path = "../../crates/nexus-proxy-config" }
 nexus-proxy = { path = "../../crates/nexus-proxy" }
+nexus-projection = { path = "../../crates/nexus-projection" }
 nexus-policy = { path = "../../crates/nexus-policy" }
 nexus-registry = { path = "../../crates/nexus-registry" }
 nexus-measurement = { path = "../../crates/nexus-measurement" }

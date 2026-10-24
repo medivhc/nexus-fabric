@@ -9065,14 +9065,21 @@ outbounds:
 /// 注入 `MemoryVpi`（离线确定性 VPI 替身）四条 IP 包：
 /// 1) TCP 192.168.1.5:12345 -> 10.1.2.3:443（命中 ip_cidr -> relay-group）；
 /// 2) UDP 192.168.1.5:53000 -> 8.8.8.8:53（落入 MATCH -> direct）；
-/// 3) 与 1 同 5 元组的第二个 TCP 包（NAT cache hit）；
+/// 3) 与 1 同 5 元组的第二个 TCP 包（决策缓存 hit）；
 /// 4) ICMP 坏包（计入 dropped，不 panic）。
+///
+/// S18：决策缓存改为 TUN/TPROXY 共用的 `FlowDecisionCache`，规则实现改为
+/// `nexus_proxy::DomainRuleEngine`（spec §9.13，AC-G11-01/02）。
 pub fn tun_proxy_flow() -> Result<Value, NexusError> {
     use nexus_connectivity::virtual_subnet::MemoryVpi;
+    use nexus_domain::{RouteRequest, RouteTarget, RuleEngine as _};
     use nexus_ingress::ip_packet::parse_ipv4_packet;
     use nexus_platform::VirtualPacketInterface;
-    use nexus_proxy::ProxyService;
-    use nexus_proxy::tun::TunNatRouter;
+    use nexus_projection::egress::FlowKey;
+    use nexus_projection::transparent::decision::{
+        CachedDecision, FlowDecisionCache, FlowDecisionKey, Frontend,
+    };
+    use nexus_proxy::domain_engine::DomainRuleEngine;
 
     fn internal_err<E: std::fmt::Display>(e: E) -> NexusError {
         NexusError::Internal {
@@ -9080,13 +9087,8 @@ pub fn tun_proxy_flow() -> Result<Value, NexusError> {
         }
     }
 
-    let cfg = nexus_proxy_config::parse(TUN_PROXY_CONFIG).map_err(|e| NexusError::Internal {
-        message: format!("tun proxy config invalid: {e}"),
-    })?;
-    let service = ProxyService::new(&cfg).map_err(|e| NexusError::Internal {
-        message: format!("tun proxy service build failed: {e}"),
-    })?;
-    let mut router = TunNatRouter::new(service);
+    let engine = DomainRuleEngine::from_yaml(TUN_PROXY_CONFIG).map_err(internal_err)?;
+    let mut cache = FlowDecisionCache::new(16_384, std::time::Duration::from_secs(300));
 
     let mut vpi = MemoryVpi::new();
     // 四条包按序注入；每条注入后 drain 一次读循环。
@@ -9097,10 +9099,16 @@ pub fn tun_proxy_flow() -> Result<Value, NexusError> {
         build_ipv4_packet(1, [192, 168, 1, 5], 0, [10, 9, 9, 9], 0),       // p4 ICMP 坏包
     ];
 
+    let mut packets_seen: u64 = 0;
+    let mut bytes_seen: u64 = 0;
+    let mut dropped: u64 = 0;
     let mut first_flow: Option<Value> = None;
     let mut udp_flow: Option<Value> = None;
     let mut replay: Option<Value> = None;
+    // 示例用固定单调毫秒；真实组合根由主循环维护。
+    let mut now_millis: u64 = 0;
     for (idx, pkt) in packets.iter().enumerate() {
+        now_millis += 1;
         vpi.inject_recv(pkt);
         let mut buf = [0u8; 2048];
         // drain：MemoryVpi 一次读回已注入的整包（真实 wintun 亦一包一收）。
@@ -9109,34 +9117,75 @@ pub fn tun_proxy_flow() -> Result<Value, NexusError> {
             if n == 0 {
                 break;
             }
-            match parse_ipv4_packet(&buf[..n]) {
-                Some(parsed) => {
-                    let out =
-                        router
-                            .route_packet(&parsed, n)
-                            .map_err(|e| NexusError::Internal {
-                                message: format!("tun route failed: {e}"),
-                            })?;
-                    let v = serde_json::json!({
-                        "destination": out.destination,
-                        "protocol": out.protocol,
-                        "flow_origin": out.flow_origin,
-                        "matched_rule": out.matched_rule,
-                        "selected_outbound_tag": out.selected_outbound_tag,
-                        "cache_hit": out.cache_hit,
-                    });
-                    match idx {
-                        0 => first_flow = Some(v),
-                        1 => udp_flow = Some(v),
-                        _ => replay = Some(v),
-                    }
+            packets_seen += 1;
+            bytes_seen += n as u64;
+            let raw = &buf[..n];
+            if parse_ipv4_packet(raw).is_none() {
+                dropped += 1;
+                continue;
+            }
+            let Some(flow) = FlowKey::parse(raw) else {
+                dropped += 1;
+                continue;
+            };
+            let key = FlowDecisionKey {
+                flow,
+                frontend: Frontend::Tun,
+            };
+            let (cache_hit, decision) = match cache.get(&key, now_millis) {
+                Some(cached) => (true, cached.clone()),
+                None => {
+                    let req = RouteRequest {
+                        packet: raw,
+                        domain: None,
+                        src_port: Some(flow.src_port),
+                        dst_port: Some(flow.dst_port),
+                        process_name: None,
+                    };
+                    let (target, explanation) = engine.explain(&req);
+                    let matched_rule = explanation
+                        .as_ref()
+                        .map(|e| e.matched_rule.clone())
+                        .unwrap_or_default();
+                    let selected_outbound = match &target {
+                        RouteTarget::Egress { peer } => peer.clone(),
+                        RouteTarget::MeshPeer { peer } => peer.clone(),
+                        RouteTarget::Drop => "drop".to_string(),
+                    };
+                    let decision = CachedDecision {
+                        target,
+                        matched_rule,
+                        selected_outbound,
+                        last_seen_millis: now_millis,
+                    };
+                    cache.insert(key, decision.clone(), now_millis);
+                    (false, decision)
                 }
-                None => router.record_dropped(n),
+            };
+            let v = serde_json::json!({
+                "destination": format!(
+                    "{}.{}.{}.{}:{}",
+                    (flow.dst_ip >> 24) & 0xFF,
+                    (flow.dst_ip >> 16) & 0xFF,
+                    (flow.dst_ip >> 8) & 0xFF,
+                    flow.dst_ip & 0xFF,
+                    flow.dst_port,
+                ),
+                "protocol": flow.proto,
+                "flow_origin": "virtual-packet-interface",
+                "matched_rule": decision.matched_rule,
+                "selected_outbound_tag": decision.selected_outbound,
+                "cache_hit": cache_hit,
+            });
+            match idx {
+                0 => first_flow = Some(v),
+                1 => udp_flow = Some(v),
+                _ => replay = Some(v),
             }
         }
     }
 
-    let s = router.stats();
+    let stats = cache.stats();
     Ok(serde_json::json!({
         "verdict": "PASS",
         "command": "tun proxy inbound",
@@ -9144,11 +9193,16 @@ pub fn tun_proxy_flow() -> Result<Value, NexusError> {
         "udp_flow": udp_flow.unwrap_or(Value::Null),
         "replay": replay.unwrap_or(Value::Null),
         "stats": {
-            "packets": s.packets,
-            "bytes": s.bytes,
-            "dropped": s.dropped,
-            "mappings": s.mappings,
-            "cache_hits": s.cache_hits,
+            "packets": packets_seen,
+            "bytes": bytes_seen,
+            "dropped": dropped,
+            "mappings": stats.misses,
+            "cache_hits": stats.hits,
+        },
+        "cache": {
+            "entries": stats.entries,
+            "hits": stats.hits,
+            "misses": stats.misses,
         },
     }))
 }
