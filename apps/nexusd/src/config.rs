@@ -101,6 +101,20 @@ pub struct TunSection {
     pub name: String,
     /// MTU（默认 1500，合法范围 [1280, 9000]）。
     pub mtu: u32,
+    /// 是否接管默认路由（legacy 映射到 tun 入站，默认 false）。
+    pub default_route: bool,
+    /// 是否自动排除代理服务器路由（legacy 映射，默认 true）。
+    pub exclude_server_routes: bool,
+    /// `enabled` 是否在 `daemon.toml` 中显式出现（§10.7 冲突判定）。
+    pub(crate) enabled_explicit: bool,
+    /// `name` 是否显式出现。
+    pub(crate) name_explicit: bool,
+    /// `mtu` 是否显式出现。
+    pub(crate) mtu_explicit: bool,
+    /// `default_route` 是否显式出现。
+    pub(crate) default_route_explicit: bool,
+    /// `exclude_server_routes` 是否显式出现。
+    pub(crate) exclude_server_routes_explicit: bool,
 }
 
 impl Default for TunSection {
@@ -109,6 +123,13 @@ impl Default for TunSection {
             enabled: true,
             name: "nexus".to_string(),
             mtu: 1500,
+            default_route: false,
+            exclude_server_routes: true,
+            enabled_explicit: false,
+            name_explicit: false,
+            mtu_explicit: false,
+            default_route_explicit: false,
+            exclude_server_routes_explicit: false,
         }
     }
 }
@@ -374,6 +395,7 @@ pub fn load(dir: &ConfigDir) -> Result<LoadedConfig, String> {
         let parsed =
             nexus_proxy_config::parse(&text).map_err(|e| format!("parse {PROXY_YAML}: {e:?}"))?;
         validate_flow_sessions_conflicts(&cfg.daemon.flow_sessions, &parsed)?;
+        validate_legacy_tun_mapping(&cfg.daemon.tun, &parsed)?;
         cfg.proxy_yaml = Some(text);
         if let Some(m) = FileMeta::of(&dir.file(PROXY_YAML)) {
             cfg.meta.insert(PROXY_YAML.to_string(), m);
@@ -715,7 +737,9 @@ fn parse_proxy_section(t: &toml::Value) -> Result<ProxySection, String> {
 /// 接受 `enabled`（bool，默认 true）、`name`（非空字符串，默认 "nexus"）、
 /// `mtu`（整数，需在 [1280, 9000] 内，默认 1500）。
 fn parse_tun_section(t: &toml::Value) -> Result<TunSection, String> {
+    let enabled_explicit = t.get("enabled").is_some();
     let enabled = t.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true);
+    let name_explicit = t.get("name").is_some();
     let name = match t.get("name") {
         None => "nexus".to_string(),
         Some(x) => {
@@ -728,6 +752,7 @@ fn parse_tun_section(t: &toml::Value) -> Result<TunSection, String> {
             s.to_string()
         }
     };
+    let mtu_explicit = t.get("mtu").is_some();
     let mtu = match t.get("mtu") {
         None => 1500,
         Some(x) => {
@@ -745,7 +770,32 @@ fn parse_tun_section(t: &toml::Value) -> Result<TunSection, String> {
             n
         }
     };
-    Ok(TunSection { enabled, name, mtu })
+    let default_route_explicit = t.get("default_route").is_some();
+    let default_route = match t.get("default_route") {
+        None => false,
+        Some(x) => x
+            .as_bool()
+            .ok_or_else(|| format!("{DAEMON_TOML}: [tun].default_route must be a bool"))?,
+    };
+    let exclude_server_routes_explicit = t.get("exclude_server_routes").is_some();
+    let exclude_server_routes = match t.get("exclude_server_routes") {
+        None => true,
+        Some(x) => x
+            .as_bool()
+            .ok_or_else(|| format!("{DAEMON_TOML}: [tun].exclude_server_routes must be a bool"))?,
+    };
+    Ok(TunSection {
+        enabled,
+        name,
+        mtu,
+        default_route,
+        exclude_server_routes,
+        enabled_explicit,
+        name_explicit,
+        mtu_explicit,
+        default_route_explicit,
+        exclude_server_routes_explicit,
+    })
 }
 
 /// 解析 `daemon.toml` 的 `[flow_sessions]` 小节（spec §10.4）。
@@ -817,6 +867,44 @@ fn parse_flow_sessions_section(t: &toml::Value) -> Result<FlowSessionsSection, S
         idle_timeout_secs,
         udp_buffer_datagrams,
     })
+}
+
+/// `daemon.toml [tun]` 与 `inbounds[kind=tun]` 的映射/冲突规则（spec §10.7）。
+fn validate_legacy_tun_mapping(
+    tun: &TunSection,
+    proxy: &nexus_proxy_config::ProxyConfig,
+) -> Result<(), String> {
+    let tun_inbounds: Vec<(usize, &nexus_proxy_config::TunInboundConfig)> = proxy
+        .inbounds
+        .iter()
+        .enumerate()
+        .filter(|(_, inbound)| inbound.kind == nexus_proxy_config::InboundKind::Tun)
+        .filter_map(|(i, inbound)| inbound.tun.as_ref().map(|cfg| (i, cfg)))
+        .collect();
+
+    if tun.enabled_explicit && !tun.enabled {
+        if let Some((i, _)) = tun_inbounds.first() {
+            return Err(format!(
+                "CONFIG_INVALID [inbounds[{i}].kind]: daemon.toml [tun].enabled=false conflicts with a tun inbound"
+            ));
+        }
+    }
+
+    for (i, inbound) in &tun_inbounds {
+        if tun.name_explicit && inbound.name != tun.name {
+            return Err(format!(
+                "CONFIG_INVALID [tun.name]: '{}' conflicts with inbounds[{i}].name='{}' (set only one)",
+                tun.name, inbound.name
+            ));
+        }
+        if tun.mtu_explicit && inbound.mtu != u16::try_from(tun.mtu).unwrap_or(u16::MAX) {
+            return Err(format!(
+                "CONFIG_INVALID [tun.mtu]: {} conflicts with inbounds[{i}].mtu={} (set only one)",
+                tun.mtu, inbound.mtu
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `[flow_sessions].enabled` 与 `inbounds[kind=tun].sessions` 的冲突校验（spec §10.7）。
@@ -1821,5 +1909,76 @@ password=\"p\"\n\
         let new = load(&dir).unwrap();
         assert_eq!(classify_change(&old, &new), ChangeKind::NeedsRestart);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn legacy_tun_enabled_false_conflicts_with_tun_inbound() {
+        let d = std::env::temp_dir().join("nexusd-cfg-test-legacy-tun-conflict");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        write(&d, PROXY_YAML, TUN_PROXY_YAML);
+        write(&d, DAEMON_TOML, "[tun]\nenabled = false\n");
+        let dir = ConfigDir::new(&d).unwrap();
+        let err = load(&dir).unwrap_err();
+        assert!(err.contains("CONFIG_INVALID [inbounds[0].kind]"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn legacy_tun_enabled_false_without_inbound_is_no_tun() {
+        let d = std::env::temp_dir().join("nexusd-cfg-test-legacy-tun-notun");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        write(&d, DAEMON_TOML, "[tun]\nenabled = false\n");
+        let dir = ConfigDir::new(&d).unwrap();
+        let cfg = load(&dir).unwrap();
+        assert!(!cfg.daemon.tun.enabled);
+        assert!(cfg.daemon.tun.enabled_explicit);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn legacy_tun_name_and_mtu_conflicts() {
+        let d = std::env::temp_dir().join("nexusd-cfg-test-legacy-tun-name");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        write(&d, PROXY_YAML, TUN_PROXY_YAML);
+        write(&d, DAEMON_TOML, "[tun]\nname = \"legacy0\"\n");
+        let dir = ConfigDir::new(&d).unwrap();
+        let err = load(&dir).unwrap_err();
+        assert!(err.contains("CONFIG_INVALID [tun.name]"), "{err}");
+        write(&d, DAEMON_TOML, "[tun]\nmtu = 1400\n");
+        let dir = ConfigDir::new(&d).unwrap();
+        let err = load(&dir).unwrap_err();
+        assert!(err.contains("CONFIG_INVALID [tun.mtu]"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn legacy_tun_matching_values_are_accepted() {
+        let d = std::env::temp_dir().join("nexusd-cfg-test-legacy-tun-match");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        write(&d, PROXY_YAML, TUN_PROXY_YAML);
+        write(
+            &d,
+            DAEMON_TOML,
+            "[tun]\nenabled = true\nname = \"nexus\"\nmtu = 1500\n",
+        );
+        let dir = ConfigDir::new(&d).unwrap();
+        assert!(load(&dir).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn legacy_tun_maps_default_route_and_exclude_flags() {
+        let cfg = parse_daemon_toml("[tun]\ndefault_route = true\nexclude_server_routes = false\n")
+            .unwrap();
+        assert!(cfg.tun.default_route);
+        assert!(cfg.tun.default_route_explicit);
+        assert!(!cfg.tun.exclude_server_routes);
+        assert!(cfg.tun.exclude_server_routes_explicit);
+        assert!(parse_daemon_toml("[tun]\ndefault_route = \"yes\"\n").is_err());
+        assert!(parse_daemon_toml("[tun]\nexclude_server_routes = 1\n").is_err());
     }
 }
