@@ -588,6 +588,29 @@ fn judge(
         } else {
             ErrorClass::EExpectedConfigReject
         };
+        // 客户端自身的解码失败不能被当作“参照端拒绝了负向用例”：两者都表现为无 echo。
+        if let Some(err) = proxy_error {
+            let lower = err.to_ascii_lowercase();
+            if lower.contains("invalid frame")
+                || lower.contains("decode")
+                || lower.contains("codec")
+            {
+                notes.push("negative case not evaluable: client-side decode failure".into());
+                return Outcome {
+                    verdict: Verdict::Blocked,
+                    error: Some(ErrorInfo {
+                        class: ErrorClass::ENexusCodec,
+                        message: format!(
+                            "negative case hit a codec failure before any verdict: {err}"
+                        ),
+                        first_failure_artifact: Some("pcap.pcap".into()),
+                    }),
+                    metrics,
+                    notes,
+                    proxy_json: proxy_json.cloned(),
+                };
+            }
+        }
         let rejected = !workload.echo_ok && proxy_json.is_none();
         if rejected {
             notes.push(format!("classification={}", class_label(expected_class)));
