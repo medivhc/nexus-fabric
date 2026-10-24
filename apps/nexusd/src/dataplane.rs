@@ -38,6 +38,10 @@ use nexus_projection::tcp::{
     decode_stream_frame, encode_stream_frame, encode_syn_payload,
 };
 use nexus_projection::transparent::direct::{DirectEgressConfig, DirectTcpEvent, DirectTcpRelay};
+use nexus_projection::transparent::runtime::TransparentPipeline;
+use nexus_projection::transparent::{
+    TcpConnection, TransparentDecision, TransparentOutput, TransparentTcpInput, TransparentUdpInput,
+};
 use nexus_proxy_config::FlowSessionsMode;
 
 mod chain_wiring;
@@ -78,6 +82,24 @@ pub struct TproxyCounters {
     pub direct_udp_failed: u64,
     pub upstream_failed: u64,
     pub domain_miss: u64,
+}
+
+/// 无 TUN 模式下的占位设备：只返回 `WouldBlock`，不伪造任何数据面。
+#[derive(Debug, Default)]
+pub struct InertTun;
+
+impl TunDevice for InertTun {
+    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::from(io::ErrorKind::WouldBlock))
+    }
+
+    fn write(&mut self, packet: &[u8]) -> io::Result<usize> {
+        Ok(packet.len())
+    }
+
+    fn name(&self) -> &str {
+        "none"
+    }
 }
 
 /// 数据面统计（D6 可观测）。
@@ -266,6 +288,10 @@ pub struct Dataplane {
     tproxy_counters: Arc<Mutex<TproxyCounters>>,
     /// 最近一次捕获失败原因（spec §9.16）。
     tproxy_last_failure: Option<String>,
+    /// 透明前端管道（S42：TPROXY 生产装配）。
+    transparent: Option<TransparentPipeline>,
+    /// owner → listener 的 UDP 回包通道（`send_from` 在 listener 线程）。
+    transparent_udp_reply_tx: Option<std::sync::mpsc::Sender<TransparentOutput>>,
 }
 
 /// 流会话可见状态（spec §9.16 / §11.3）。
@@ -384,6 +410,8 @@ impl Dataplane {
             transparent_failure_tx: None,
             tproxy_counters: Arc::new(Mutex::new(TproxyCounters::default())),
             tproxy_last_failure: None,
+            transparent: None,
+            transparent_udp_reply_tx: None,
         })
     }
 
@@ -719,17 +747,240 @@ impl Dataplane {
         self.tproxy_last_failure.as_deref()
     }
 
-    /// 单个 tick：先 drain TPROXY channel（最多 256 条），再读 TUN 一包。
+    /// 注入透明前端管道与 UDP 回包通道（S42 组合根调用）。
+    pub fn set_transparent_pipeline(
+        &mut self,
+        pipeline: TransparentPipeline,
+        udp_reply_tx: std::sync::mpsc::Sender<TransparentOutput>,
+    ) {
+        self.transparent = Some(pipeline);
+        self.transparent_udp_reply_tx = Some(udp_reply_tx);
+    }
+
+    /// 透明前端是否已装配。
+    pub fn transparent_ready(&self) -> bool {
+        self.transparent.is_some()
+    }
+
+    /// 关闭透明前端（SIGTERM 清理路径）。
+    pub fn shutdown_transparent(&mut self) {
+        if let Some(mut pipeline) = self.transparent.take() {
+            let _ = pipeline.shutdown();
+        }
+        self.transparent_udp_reply_tx = None;
+    }
+
+    /// 单个 tick：先 drain TPROXY channel（最多 256 条），驱动透明前端，再读 TUN 一包。
     pub fn tick(&mut self, now_millis: u64) -> io::Result<bool> {
         let drained = self.drain_transparent_inbound(now_millis);
+        let polled = self.poll_transparent(now_millis);
         match self.process_one_at(now_millis) {
-            Ok(processed) => Ok(processed || drained > 0),
+            Ok(processed) => Ok(processed || drained > 0 || polled > 0),
             Err(e) => Err(e),
         }
     }
 
+    /// 驱动透明前端下行/老化，并把 UDP 回包交给 listener 线程。
+    fn poll_transparent(&mut self, now_millis: u64) -> usize {
+        let Some(pipeline) = self.transparent.as_mut() else {
+            return 0;
+        };
+        let outputs = pipeline.poll(now_millis);
+        let stats = pipeline.stats();
+        let mut replies = 0usize;
+        for output in outputs {
+            if let TransparentOutput::UdpReply {
+                orig_dst,
+                peer,
+                payload,
+            } = output
+            {
+                let sent = self.transparent_udp_reply_tx.as_ref().is_some_and(|tx| {
+                    tx.send(TransparentOutput::UdpReply {
+                        orig_dst,
+                        peer,
+                        payload,
+                    })
+                    .is_ok()
+                });
+                if sent {
+                    replies += 1;
+                } else {
+                    self.with_tproxy_counters(|c| c.udp_reply_failed += 1);
+                }
+            }
+        }
+        self.with_tproxy_counters(|c| {
+            c.tcp_accepted = stats.tcp_accepted;
+            c.tcp_rejected = stats.tcp_rejected;
+            c.udp_datagrams = stats.udp_datagrams;
+            c.udp_dropped = stats.udp_dropped;
+            c.udp_table_evicted = stats.udp_table_evicted;
+            c.direct_tcp_dial_failed = stats.direct_tcp_dial_failed;
+            c.direct_udp_failed = stats.direct_udp_failed;
+            c.upstream_failed = stats.upstream_failed;
+            c.domain_miss = stats.domain_miss;
+        });
+        replies
+    }
+
+    fn handle_transparent_tcp(&mut self, accepted: AcceptedTcpStream, now_millis: u64) {
+        let peer = accepted.peer;
+        let orig_dst = accepted.orig_dst;
+        let (decision, _matched, _hint) = self.transparent_decision(peer, orig_dst, 6, now_millis);
+        let Some(pipeline) = self.transparent.as_mut() else {
+            self.with_tproxy_counters(|c| c.tcp_rejected += 1);
+            return;
+        };
+        let input = TransparentTcpInput {
+            conn: Box::new(TcpConnection::new(accepted.stream, peer, orig_dst)),
+            accepted_at_millis: accepted.accepted_at_millis,
+            decision,
+        };
+        if let Err(error) = pipeline.on_tcp(input) {
+            self.record_transparent_error(&error);
+        }
+    }
+
+    fn handle_transparent_udp(&mut self, datagram: ReceivedDatagram, now_millis: u64) {
+        // UDP/53 与 TUN 共用本地 DNS 处理器（spec §5 G10 / §13.2 S2）。
+        if datagram.orig_dst.port() == 53 && self.dns.is_some() {
+            let packet = synthetic_udp_packet(datagram.peer, datagram.orig_dst, &datagram.payload);
+            if let Some(response) = self.dns_response_for(&packet) {
+                if let Some(payload) = udp_payload_of(&response) {
+                    let sent = self.transparent_udp_reply_tx.as_ref().is_some_and(|tx| {
+                        tx.send(TransparentOutput::UdpReply {
+                            orig_dst: datagram.orig_dst,
+                            peer: datagram.peer,
+                            payload: payload.to_vec(),
+                        })
+                        .is_ok()
+                    });
+                    if sent {
+                        self.with_stats(|s| s.dns_answered += 1);
+                        return;
+                    }
+                    self.with_tproxy_counters(|c| c.udp_reply_failed += 1);
+                }
+            }
+        }
+        let (decision, _matched, _hint) =
+            self.transparent_decision(datagram.peer, datagram.orig_dst, 17, now_millis);
+        let Some(pipeline) = self.transparent.as_mut() else {
+            self.with_tproxy_counters(|c| c.udp_dropped += 1);
+            return;
+        };
+        let input = TransparentUdpInput {
+            payload: datagram.payload,
+            peer: datagram.peer,
+            orig_dst: datagram.orig_dst,
+            received_at_millis: datagram.received_at_millis,
+            decision,
+        };
+        if let Err(error) = pipeline.on_udp(input) {
+            self.record_transparent_error(&error);
+        }
+    }
+
+    fn record_transparent_error(
+        &self,
+        error: &nexus_projection::transparent::TransparentFrontendError,
+    ) {
+        use nexus_projection::transparent::TransparentFrontendError as E;
+        match error {
+            E::OrigDstMissing { .. } => {
+                self.with_tproxy_counters(|c| c.orig_dst_missing += 1);
+            }
+            E::OrigDstInvalid { .. } => {
+                self.with_tproxy_counters(|c| c.udp_dropped += 1);
+            }
+            E::RuleNoMatch { .. } => {
+                self.with_tproxy_counters(|c| c.rule_no_match += 1);
+            }
+            E::DirectDialFailed { .. } => {
+                self.with_tproxy_counters(|c| c.direct_tcp_dial_failed += 1);
+            }
+            E::DirectSendFailed { .. } => {
+                self.with_tproxy_counters(|c| c.direct_udp_failed += 1);
+            }
+            E::SessionEstablishFailed { .. } => {
+                self.with_tproxy_counters(|c| c.upstream_failed += 1);
+            }
+            _ => {}
+        }
+    }
+
+    /// 透明流的规则决策（TUN/TPROXY 共用 `FlowDecisionCache` 与 `RuleEngine`）。
+    fn transparent_decision(
+        &mut self,
+        peer: SocketAddrV4,
+        orig_dst: SocketAddrV4,
+        proto: u8,
+        now_millis: u64,
+    ) -> (TransparentDecision, Option<String>, Option<String>) {
+        let flow = nexus_projection::egress::FlowKey {
+            src_ip: u32::from(*peer.ip()),
+            dst_ip: u32::from(*orig_dst.ip()),
+            src_port: peer.port(),
+            dst_port: orig_dst.port(),
+            proto,
+        };
+        let cache_key = FlowDecisionKey {
+            flow,
+            frontend: Frontend::Tproxy,
+        };
+        if let Some(cached) = self.decision_cache.get(&cache_key, now_millis).cloned() {
+            return (
+                transparent_decision_from_target(&cached.target),
+                Some(cached.matched_rule),
+                Some(cached.selected_outbound),
+            );
+        }
+        let packet = synthetic_transport_packet(peer, orig_dst, proto);
+        let domain = self
+            .dns_cache
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.lookup(&IpAddr::V4(*orig_dst.ip())));
+        if domain.is_none() {
+            self.with_stats(|s| s.domain_miss += 1);
+        }
+        let req = nexus_domain::RouteRequest {
+            packet: &packet,
+            domain: domain.as_deref(),
+            src_port: Some(peer.port()),
+            dst_port: Some(orig_dst.port()),
+            process_name: None,
+        };
+        let (target, explanation) = self.rules.explain(&req);
+        let matched_rule = explanation
+            .as_ref()
+            .map(|e| e.matched_rule.clone())
+            .unwrap_or_default();
+        let selected_outbound = match &target {
+            nexus_domain::RouteTarget::Egress { peer } => peer.clone(),
+            nexus_domain::RouteTarget::MeshPeer { peer } => peer.clone(),
+            nexus_domain::RouteTarget::Drop => "drop".to_string(),
+        };
+        self.decision_cache.insert(
+            cache_key,
+            CachedDecision {
+                target: target.clone(),
+                matched_rule: matched_rule.clone(),
+                selected_outbound: selected_outbound.clone(),
+                last_seen_millis: now_millis,
+            },
+            now_millis,
+        );
+        (
+            transparent_decision_from_target(&target),
+            Some(matched_rule),
+            Some(selected_outbound),
+        )
+    }
+
     /// 排空透明入站 channel；每 tick 最多 256 条（spec §11.1）。
-    pub fn drain_transparent_inbound(&mut self, _now_millis: u64) -> usize {
+    pub fn drain_transparent_inbound(&mut self, now_millis: u64) -> usize {
         let Some(rx) = self.transparent_rx.as_ref() else {
             return 0;
         };
@@ -747,14 +998,10 @@ impl Dataplane {
             match message {
                 TransparentInbound::CaptureFailed(error) => self.record_capture_failure(error),
                 TransparentInbound::Tcp(accepted) => {
-                    drop(accepted);
-                    self.with_stats(|s| s.dropped += 1);
-                    self.with_tproxy_counters(|c| c.tcp_rejected += 1);
+                    self.handle_transparent_tcp(accepted, now_millis);
                 }
                 TransparentInbound::Udp(datagram) => {
-                    drop(datagram);
-                    self.with_stats(|s| s.dropped += 1);
-                    self.with_tproxy_counters(|c| c.udp_dropped += 1);
+                    self.handle_transparent_udp(datagram, now_millis);
                 }
                 TransparentInbound::Stopped => {}
             }
@@ -1567,46 +1814,34 @@ impl Dataplane {
 
     /// 处理 DNS 查询包：解析 → 构造响应 → 写回 TUN。
     fn handle_dns(&mut self, packet: &[u8]) {
-        let dns = match self.dns.as_mut() {
-            Some(d) => d,
-            None => return,
+        let Some(response) = self.dns_response_for(packet) else {
+            self.with_stats(|s| s.dropped += 1);
+            return;
         };
-        // 解析 DNS 查询名（最小解析器）。
-        let (query_name, query_id) = match parse_dns_query(packet) {
-            Some((name, id)) => (name, id),
-            None => {
-                self.with_stats(|s| s.dropped += 1);
-                return;
-            }
-        };
-        // 调用 UnifiedDns。
+        if self.tun.write(&response).is_ok() {
+            self.with_stats(|s| {
+                s.dns_answered += 1;
+                s.tun_written += 1;
+            });
+        }
+    }
+
+    /// 解析 DNS 查询并构造应答包；TUN 与 TPROXY UDP/53 共用（spec §5 G10）。
+    fn dns_response_for(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
+        let dns = self.dns.as_mut()?;
+        let (query_name, query_id) = parse_dns_query(packet)?;
         let query = DnsQuery {
             name: query_name.clone(),
             qtype: DnsType::A,
         };
-        let now_secs = 0; // MVP：零时钟
-        match dns.resolve(&query, now_secs) {
-            Ok(answer) => {
-                // 取第一个 IPv4 记录的 IP。
-                if let Some(ip) = answer.records.iter().find_map(|r| match r {
-                    IpAddr::V4(v4) => Some(*v4),
-                    IpAddr::V6(_) => None,
-                }) {
-                    if let Some(response) = build_dns_response(packet, query_id, &query_name, ip) {
-                        self.record_dns_answer(&query_name, ip);
-                        if self.tun.write(&response).is_ok() {
-                            self.with_stats(|s| {
-                                s.dns_answered += 1;
-                                s.tun_written += 1;
-                            });
-                        }
-                    }
-                }
-            }
-            Err(_) => {
-                self.with_stats(|s| s.dropped += 1);
-            }
-        }
+        let answer = dns.resolve(&query, 0).ok()?;
+        let ip = answer.records.iter().find_map(|r| match r {
+            IpAddr::V4(v4) => Some(*v4),
+            IpAddr::V6(_) => None,
+        })?;
+        let response = build_dns_response(packet, query_id, &query_name, ip)?;
+        self.record_dns_answer(&query_name, ip);
+        Some(response)
     }
 
     /// 获取统计快照（D6 可观测）。
@@ -1687,6 +1922,67 @@ fn is_tcp_syn(packet: &[u8]) -> bool {
 /// Phase C：是否为 UDP 包。
 fn is_udp_packet(packet: &[u8]) -> bool {
     packet.len() >= 20 && packet[0] >> 4 == 4 && packet[9] == 17
+}
+
+/// 构造仅含 IP/TCP-UDP 头的合成包（透明流规则匹配用；无载荷）。
+fn synthetic_transport_packet(peer: SocketAddrV4, orig_dst: SocketAddrV4, proto: u8) -> Vec<u8> {
+    let mut pkt = vec![0u8; 24];
+    pkt[0] = 0x45;
+    pkt[9] = proto;
+    pkt[12..16].copy_from_slice(&peer.ip().octets());
+    pkt[16..20].copy_from_slice(&orig_dst.ip().octets());
+    pkt[20..22].copy_from_slice(&peer.port().to_be_bytes());
+    pkt[22..24].copy_from_slice(&orig_dst.port().to_be_bytes());
+    pkt
+}
+
+/// 构造透明 UDP 数据报的完整 IPv4/UDP 包（DNS 处理器输入）。
+fn synthetic_udp_packet(peer: SocketAddrV4, orig_dst: SocketAddrV4, payload: &[u8]) -> Vec<u8> {
+    let udp_len = 8 + payload.len();
+    let total = 20 + udp_len;
+    let mut pkt = vec![0u8; total];
+    pkt[0] = 0x45;
+    pkt[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+    pkt[8] = 64;
+    pkt[9] = 17;
+    pkt[12..16].copy_from_slice(&peer.ip().octets());
+    pkt[16..20].copy_from_slice(&orig_dst.ip().octets());
+    pkt[20..22].copy_from_slice(&peer.port().to_be_bytes());
+    pkt[22..24].copy_from_slice(&orig_dst.port().to_be_bytes());
+    pkt[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    pkt[28..].copy_from_slice(payload);
+    pkt
+}
+
+/// 取 IPv4/UDP 包的 UDP 载荷。
+fn udp_payload_of(packet: &[u8]) -> Option<&[u8]> {
+    if packet.len() < 28 || packet[9] != 17 {
+        return None;
+    }
+    let ihl = usize::from(packet[0] & 0x0f) * 4;
+    let total = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+    if ihl < 20 || total > packet.len() || total < ihl + 8 {
+        return None;
+    }
+    Some(&packet[ihl + 8..total])
+}
+
+/// `RouteTarget` → `TransparentDecision`（TUN/TPROXY 同规则语义）。
+fn transparent_decision_from_target(target: &nexus_domain::RouteTarget) -> TransparentDecision {
+    use nexus_domain::RouteTarget;
+    match target {
+        RouteTarget::Egress { peer } if peer == "self" => TransparentDecision::Direct,
+        RouteTarget::Egress { peer } => TransparentDecision::Proxy {
+            outbound: peer.clone(),
+            fallback: Vec::new(),
+        },
+        RouteTarget::MeshPeer { .. } => TransparentDecision::Drop {
+            reason: DropReason::MeshUnsupported,
+        },
+        RouteTarget::Drop => TransparentDecision::Drop {
+            reason: DropReason::RuleRejected,
+        },
+    }
 }
 
 /// 判断是否为 DNS 查询（IPv4 + UDP + 目的端口 53）。
@@ -2010,6 +2306,16 @@ fn tproxy_slot() -> &'static Mutex<TproxyStatus> {
 pub fn publish_tproxy_status(status: TproxyStatus) {
     if let Ok(mut guard) = tproxy_slot().lock() {
         *guard = status;
+    }
+}
+
+/// 发布 TPROXY 计数器与最近失败原因（owner 线程每 tick 调用）。
+pub fn publish_tproxy_counters(counters: TproxyCounters, last_failure: Option<String>) {
+    if let Ok(mut guard) = tproxy_slot().lock() {
+        guard.counters = counters;
+        if last_failure.is_some() {
+            guard.last_failure_reason = last_failure;
+        }
     }
 }
 
@@ -2977,6 +3283,74 @@ mod tests {
             privilege,
             "root" | "cap_net_admin" | "insufficient"
         ));
+    }
+
+    struct DirectEngine;
+    impl nexus_domain::RuleEngine for DirectEngine {
+        fn decide(&self, _req: &nexus_domain::RouteRequest<'_>) -> nexus_domain::RouteTarget {
+            nexus_domain::RouteTarget::Egress {
+                peer: "self".to_string(),
+            }
+        }
+    }
+
+    fn transparent_pipeline() -> TransparentPipeline {
+        TransparentPipeline::new(nexus_projection::transparent::TransparentDeps {
+            proxy_egress: None,
+            direct: nexus_projection::transparent::direct::DirectEgress::new(
+                nexus_projection::transparent::direct::DirectEgressConfig::default(),
+            )
+            .expect("direct egress"),
+            config: nexus_projection::transparent::TransparentConfig::default(),
+        })
+    }
+
+    #[test]
+    fn tproxy_assembly_direct_udp_roundtrip_and_reply_channel() {
+        use nexus_platform::ReceivedDatagram;
+        use std::net::{Ipv4Addr, UdpSocket};
+
+        let server = UdpSocket::bind(("127.0.0.1", 0)).expect("bind");
+        let orig = match server.local_addr().unwrap() {
+            std::net::SocketAddr::V4(v4) => v4,
+            std::net::SocketAddr::V6(_) => panic!("v4"),
+        };
+        let handle = std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            if let Ok((n, from)) = server.recv_from(&mut buf) {
+                let _ = server.send_to(&buf[..n], from);
+            }
+        });
+        let (mut dp, _mock) = test_dataplane();
+        dp.set_rule_engine(Box::new(DirectEngine));
+        let (tx, rx) = inbound_channel();
+        let (failure_tx, _failure_rx) = inbound_channel();
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        dp.set_transparent_pipeline(transparent_pipeline(), reply_tx);
+        dp.set_transparent_rx(rx, failure_tx);
+        tx.try_send(TransparentInbound::Udp(ReceivedDatagram {
+            payload: b"ping".to_vec(),
+            peer: std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40_000),
+            orig_dst: orig,
+            received_at_millis: 1,
+        }))
+        .expect("send");
+        let mut got_reply = false;
+        for step in 0..2_000u64 {
+            let _ = dp.tick(step).expect("tick");
+            if let Ok(TransparentOutput::UdpReply { payload, .. }) = reply_rx.try_recv() {
+                assert_eq!(payload, b"ping");
+                got_reply = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let _ = handle.join();
+        assert!(got_reply, "pipeline must produce a UDP reply");
+        assert!(dp.tproxy_counters().udp_datagrams >= 1);
+        assert!(dp.transparent_ready());
+        dp.shutdown_transparent();
+        assert!(!dp.transparent_ready());
     }
 
     /// 性能基线（R4）：`process_one()` 现状每包成本。

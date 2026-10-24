@@ -386,6 +386,10 @@ pub trait ProxyFlowEgress: Send {
         orig_dst: SocketAddrV4,
         payload: &[u8],
     ) -> Result<(), TransparentFrontendError>;
+    /// 记录 UDP 流的出站 tag（UDP 决策携带 tag，但 `send_udp` 签名不含 tag）。
+    ///
+    /// 默认空实现：不支持 UDP 的出站适配器可忽略。
+    fn note_udp_outbound(&mut self, _key: crate::egress::FlowKey, _outbound_tag: &str) {}
     /// 取出异步事件。
     fn poll(&mut self) -> Vec<ProxyEgressEvent>;
 }

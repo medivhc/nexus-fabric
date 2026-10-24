@@ -4,6 +4,7 @@
 //! `DirectEgress` / `ProxyFlowEgress` 提供，UDP 共享单 socket + per-flow 表。
 
 use std::collections::HashMap;
+use std::io;
 use std::net::SocketAddrV4;
 
 use crate::egress::FlowKey;
@@ -217,6 +218,9 @@ impl TransparentPipeline {
                         reason: "no proxy egress configured".to_string(),
                     });
                 };
+                if let Some(tag) = outbound_tag.as_deref() {
+                    egress.note_udp_outbound(flow_key, tag);
+                }
                 if let Err(error) = egress.send_udp(flow_key, input.orig_dst, &input.payload) {
                     self.stats.upstream_failed += 1;
                     self.stats.udp_dropped += 1;
@@ -243,6 +247,7 @@ impl TransparentPipeline {
     /// 驱动下行与老化；`now_millis` 与 `on_udp` 同一时钟域。
     pub fn poll(&mut self, now_millis: u64) -> Vec<TransparentOutput> {
         let mut out = Vec::new();
+        self.pump_tcp_uplink(&mut out);
 
         // Direct：TCP 下行 + UDP 回包。
         for event in self.deps.direct.poll(now_millis) {
@@ -333,6 +338,68 @@ impl TransparentPipeline {
     /// Direct 出口当前 UDP socket 数（应为 0 或 1，证明多流共享）。
     pub fn direct_udp_socket_count(&self) -> usize {
         self.deps.direct.udp_socket_count()
+    }
+
+    /// 从 accepted stream 读取应用字节并写入 Direct/Proxy 出口。
+    fn pump_tcp_uplink(&mut self, out: &mut Vec<TransparentOutput>) {
+        let keys: Vec<FlowKey> = self.tcp.keys().copied().collect();
+        for key in keys {
+            let mut buf = [0u8; 16 * 1024];
+            loop {
+                let read = {
+                    let Some(flow) = self.tcp.get_mut(&key) else {
+                        break;
+                    };
+                    flow.conn.read(&mut buf)
+                };
+                match read {
+                    Ok(0) => {
+                        self.finish_tcp(&key, false, out);
+                        break;
+                    }
+                    Ok(n) => {
+                        let proxy = self.tcp.get(&key).is_some_and(|flow| flow.proxy);
+                        let result = if proxy {
+                            match self.deps.proxy_egress.as_mut() {
+                                Some(egress) => egress.write_tcp(&key, &buf[..n]),
+                                None => Err(TransparentFrontendError::RuleEngineUnavailable {
+                                    reason: "no proxy egress configured".to_string(),
+                                }),
+                            }
+                        } else {
+                            self.deps
+                                .direct
+                                .write_tcp(&key, &buf[..n])
+                                .map(|_| ())
+                                .map_err(|e| TransparentFrontendError::DirectSendFailed {
+                                    dst: self
+                                        .tcp
+                                        .get(&key)
+                                        .map(|flow| flow.conn.orig_dst())
+                                        .unwrap_or_else(|| {
+                                            SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0)
+                                        }),
+                                    reason: e.to_string(),
+                                })
+                        };
+                        if result.is_err() {
+                            if proxy {
+                                self.stats.upstream_failed += 1;
+                            } else {
+                                self.stats.direct_udp_failed += 1;
+                            }
+                            self.finish_tcp(&key, true, out);
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(_) => {
+                        self.finish_tcp(&key, true, out);
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     fn write_back_tcp(&mut self, key: &FlowKey, bytes: &[u8], out: &mut Vec<TransparentOutput>) {
@@ -460,7 +527,7 @@ mod tests {
         }
 
         fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
-            Ok(0)
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
         }
 
         fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {

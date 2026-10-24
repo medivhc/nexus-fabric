@@ -10,8 +10,8 @@
 //! 不直接持有/写 TUN。
 
 pub mod ss_std;
-mod tcp_relay;
-mod udp_relay;
+pub(crate) mod tcp_relay;
+pub(crate) mod udp_relay;
 
 pub use udp_relay::build_udp_reply;
 
@@ -52,7 +52,7 @@ pub struct ProxyFwdStats {
 }
 
 /// 从 `OutboundConfig` 解析 dial 配置；不支持的 kind 返回 None（P3 跳过）。
-fn dial_config_from_outbound(o: &OutboundConfig) -> Option<ProxyDialConfig> {
+pub(crate) fn dial_config_from_outbound(o: &OutboundConfig) -> Option<ProxyDialConfig> {
     let locator = o.locator.as_deref().filter(|s| !s.is_empty())?;
     let server: SocketAddr = locator.parse().ok()?;
     match o.kind {
