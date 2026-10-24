@@ -91,7 +91,10 @@ key = MD5(username:realm:password)）。STUN 短期认证、TCP 中继后置。
 ## Public API
 
 - `TurnCredentials { username, password, realm }`
-- `TurnClient::allocate(server, creds) -> io::Result<TurnClient>`
+- `TurnClient::allocate(server, creds) -> io::Result<TurnClient>`（兼容入口，
+  等价 `allocate_bound(server, creds, 127.0.0.1:0)`）
+- `TurnClient::allocate_bound(server, creds, local_bind: SocketAddr) -> io::Result<TurnClient>`
+  （生产用 `0.0.0.0:0`；`local_bind` 决定 TURN 收包的本地 socket）
 - `TurnClient::create_permission(&self, peer: SocketAddr)`
 - `TurnClient::bind_channel(&self, peer: SocketAddr) -> u16`
 - `TurnClient::refresh(&self)`, `TurnClient::relayed_addr(&self) -> SocketAddr`
@@ -129,9 +132,10 @@ key = MD5(username:realm:password)）。STUN 短期认证、TCP 中继后置。
   `refresh` 收到 401 则直接标记分配过期（不重试）。自研 server 的 nonce 永不
   变更，故 E4 不触发；对接第三方 TURN server 时若遇 nonce 轮换需调用方重新
   `allocate`。
-- **Loopback 限制**：`TurnClient::allocate` 绑定 `127.0.0.1:0`，
-  `TurnServer` 的中继 socket 也绑定 `127.0.0.1:0`。作为通用 client API，
-  `TurnClient` 目前不支持绑定非 loopback 地址；`TurnServer` 明确仅用于自测
+- **Loopback 限制**：`TurnClient::allocate` 绑定 `127.0.0.1:0`（兼容入口），
+  生产走 `allocate_bound(.., 0.0.0.0:0)`。`TurnServer` 的中继 socket 仍绑定
+  `127.0.0.1:0`，**该 loopback 限制保持不变**；`TurnServer` 明确仅用于自测。
+  `allocate_bound` 的 `local_bind` 不改变 TURN server 侧的 loopback 约束。
   （见 Non-Responsibilities）。
 
 ## Recovery Semantics
