@@ -1,0 +1,26 @@
+{
+  "log": {
+    "level": "debug",
+    "timestamp": true,
+    "output": "${RUN_DIR}/evidence/ref/shadowsocks-aes256gcm/sing-box.log"
+  },
+  "inbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "shadowsocks-aes256gcm",
+      "listen": "127.0.0.1",
+      "listen_port": 26106,
+      "method": "aes-256-gcm",
+      "password": "${SS_PASSWORD}"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct"
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "log": {
+    "level": "debug",
+    "timestamp": true,
+    "output": "${RUN_DIR}/evidence/ref/vless-basic/sing-box.log"
+  },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-basic",
+      "listen": "127.0.0.1",
+      "listen_port": 26100,
+      "users": [
+        {
+          "name": "interop",
+          "uuid": "${VLESS_UUID}",
+          "flow": ""
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "localhost",
+        "certificate_path": "${RUN_DIR}/pki/cert.pem",
+        "key_path": "${RUN_DIR}/pki/key.pem"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct"
+  }
+}

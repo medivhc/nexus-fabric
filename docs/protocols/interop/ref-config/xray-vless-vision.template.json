@@ -1,0 +1,59 @@
+{
+  "log": {
+    "loglevel": "debug"
+  },
+  "inbounds": [
+    {
+      "tag": "vless-in",
+      "listen": "127.0.0.1",
+      "port": 26109,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${VLESS_UUID}",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "localhost",
+          "certificates": [
+            {
+              "certificateFile": "${RUN_DIR}/pki/cert.pem",
+              "keyFile": "${RUN_DIR}/pki/key.pem"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct",
+      "settings": {
+        "finalRules": [
+          {
+            "action": "allow",
+            "network": "tcp",
+            "ip": [
+              "127.0.0.1/32"
+            ]
+          },
+          {
+            "action": "allow",
+            "network": "udp",
+            "ip": [
+              "127.0.0.1/32"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

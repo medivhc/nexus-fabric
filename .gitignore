@@ -7,3 +7,6 @@
 
 # PEE Harness 运行时产物（日志由 gate.sh 生成，不入仓库）
 .poe/runs/*/logs/
+
+# 本 run 的独立构建目录（CARGO_TARGET_DIR）
+/target-interop
