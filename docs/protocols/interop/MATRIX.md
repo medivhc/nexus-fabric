@@ -12,9 +12,9 @@
 - **覆盖**：5 个出站代理协议（VLESS、AnyTLS、Hysteria2、Trojan、Shadowsocks）共 46 个证据格。TCP 成功型格走产品 SOCKS5 出口路径；`UdpEcho` 与 VLESS Vision 部分格为 crate 直调（`CrateDirect`），不代表产品入口可用。
 - **不覆盖**：VMess（本轮暂缓）、direct/relay/socks5 出站、TUN/VPN、Android 统一 VPN 入口、UI/诊断呈现。
 - **本表不回答**：直连/中继回退是否可用（属 N1 整体结论）；也不把「产品级 UDP 未实现」扩大成「Hy2 的 QUIC 出站传输不可用」（见产品级 UDP 节）。
-- **结论 1**：五协议全部 `BROKEN / NOT_USABLE`，当前无任何协议可宣称可用。
+- **结论 1**：本次复算：`VERIFIED` 2 个（Vless、Anytls），`PARTIAL` 0 个，`BROKEN` 3 个（Hysteria2、Trojan、Shadowsocks）；当前可宣称可用（`VERIFIED`）的协议为 Vless、Anytls。
 - **结论 2**：阻断分属产品装配、跨协议传输、协议编解码、协议线格式与产品安全语义；`root_cause_class` 只是规则代表类，不是完整根因。
-- **结论 3**：AnyTLS 只差跨协议 T2；VLESS 是产品装配 bug；SS 是协议重写；Hy2 是 QPACK 编解码；Trojan 是安全语义 + 共性 T2。
+- **结论 3**：未达 `VERIFIED` 的协议及本次复算代表根因：Hysteria2 `BROKEN / E_NEXUS_CODEC`；Trojan `BROKEN / E_NEXUS_FRAMING`；Shadowsocks `BROKEN / E_NEXUS_HANDSHAKE_WIRE`。
 - **结论 4**：即使修复完成，Trojan/SS 因本 run `UdpEcho` 固定 `NOT_IMPLEMENTED`，上限仍为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（spec E1 规则 6/R11）。
 - **结论 5**：五协议当前均可在产品配置面选择，且无「实验性/未验证」标注；是否继续暴露由产品负责人决定（本 run 不改产品代码）。
 - **优先级 1（P0）**：安全止血（文档/配置面，0 代码）——先公开并限制 Trojan fallback。

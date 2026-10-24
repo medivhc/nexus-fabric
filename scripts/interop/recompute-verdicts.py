@@ -391,15 +391,45 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial):
         "- **本表不回答**：直连/中继回退是否可用（属 N1 整体结论）；也不把"
         "「产品级 UDP 未实现」扩大成「Hy2 的 QUIC 出站传输不可用」（见产品级 UDP 节）。"
     )
-    lines.append("- **结论 1**：五协议全部 `BROKEN / NOT_USABLE`，当前无任何协议可宣称可用。")
+    # 结论 1/3 必须由本次复算的 verdict 派生，禁止硬编码与结果无关的结论句。
+    verdict_names = {
+        "VERIFIED": [p for p in PROTOCOL_ORDER if verdicts.get(p, {}).get("verdict") == "VERIFIED"],
+        "PARTIAL": [p for p in PROTOCOL_ORDER if verdicts.get(p, {}).get("verdict") == "PARTIAL"],
+        "BROKEN": [p for p in PROTOCOL_ORDER if verdicts.get(p, {}).get("verdict") == "BROKEN"],
+    }
+    not_run = [p for p in PROTOCOL_ORDER if p not in verdicts]
+    counts = "，".join(
+        f"`{verdict}` {len(verdict_names[verdict])} 个"
+        + (f"（{'、'.join(verdict_names[verdict])}）" if verdict_names[verdict] else "")
+        for verdict in ("VERIFIED", "PARTIAL", "BROKEN")
+    )
+    if not_run:
+        counts += f"，未运行 {len(not_run)} 个（{'、'.join(not_run)}）"
+    if verdict_names["VERIFIED"]:
+        usable = f"当前可宣称可用（`VERIFIED`）的协议为 {'、'.join(verdict_names['VERIFIED'])}。"
+    else:
+        usable = "当前无任何协议可宣称可用。"
+    lines.append(f"- **结论 1**：本次复算：{counts}；{usable}")
     lines.append(
         "- **结论 2**：阻断分属产品装配、跨协议传输、协议编解码、协议线格式与产品安全语义；"
         "`root_cause_class` 只是规则代表类，不是完整根因。"
     )
-    lines.append(
-        "- **结论 3**：AnyTLS 只差跨协议 T2；VLESS 是产品装配 bug；SS 是协议重写；"
-        "Hy2 是 QPACK 编解码；Trojan 是安全语义 + 共性 T2。"
-    )
+    unverified = [
+        p
+        for p in PROTOCOL_ORDER
+        if p in verdicts and verdicts[p]["verdict"] != "VERIFIED"
+    ]
+    if unverified:
+        lines.append(
+            "- **结论 3**：未达 `VERIFIED` 的协议及本次复算代表根因："
+            + "；".join(
+                f"{p} `{verdicts[p]['verdict']} / {verdicts[p]['root_cause_class']}`"
+                for p in unverified
+            )
+            + "。"
+        )
+    else:
+        lines.append("- **结论 3**：本次复算全部协议均达 `VERIFIED`，无代表根因。")
     lines.append(
         "- **结论 4**：即使修复完成，Trojan/SS 因本 run `UdpEcho` 固定 `NOT_IMPLEMENTED`，"
         "上限仍为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（spec E1 规则 6/R11）。"
