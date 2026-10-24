@@ -153,7 +153,11 @@ def load_rows(run_dir, matrix):
             raise RecomputeError(
                 f"{ev['evidence_id']}: illegal carrier/scope {carrier}/{scope}"
             )
-        if ev.get("reference", {}).get("version") not in (None, "1.13.16", "26.10.21"):
+        if (not entry.get("synthetic")) and ev.get("reference", {}).get("version") not in (
+            None,
+            "1.13.16",
+            "26.10.21",
+        ):
             raise RecomputeError(
                 f"{ev['evidence_id']}: unexpected ref version {ev['reference'].get('version')}"
             )
@@ -206,8 +210,12 @@ def protocol_verdict(proto, rows, allow_partial):
     def non_pass(rs):
         return [r for r in rs if r["present"] and r["status"] != "PASS"]
 
+    def cell_label(row):
+        suffix = "" if row["variant"] == "Default" else f"[{row['variant']}]"
+        return f"{row['cell']}{suffix}"
+
     missing_cells = [
-        f"{r['cell']}({r['status']},{r['class'] or 'NONE'})" for r in non_pass(required)
+        f"{cell_label(r)}({r['status']},{r['class'] or 'NONE'})" for r in non_pass(required)
     ]
 
     def result(verdict, scope, root_cause=None, claim=None, rule=None):
@@ -404,6 +412,29 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial):
     lines.append("- Vision：产品路径只编码 addon，不实现 splice；本 run 的 Vision 结论来自 crate 直调。")
     lines.append("- Hysteria2：端口跳跃/Brutal/gecko/分片不在范围。")
     lines.append("- AnyTLS：session 池/心跳定时器/padding 写路径不单独验。")
+    lines.append("")
+    lines.append("## fix 支线与复验")
+    lines.append("")
+    fix_dir = run_dir / "fix"
+    if fix_dir.exists():
+        for root in sorted(fix_dir.glob("*/root-cause.md")):
+            title = root.read_text(encoding="utf-8").splitlines()[0].lstrip("# ").strip()
+            lines.append(f"- `fix/{root.parent.name}/root-cause.md`：{title}")
+        reverify = fix_dir / "vless/reverify-run/evidence"
+        if reverify.exists():
+            lines.append("")
+            lines.append("| fix 支线复验（vless lazy response）| 状态 | evidence_id |")
+            lines.append("|---|---|---|")
+            for path in sorted(reverify.glob("vless/*/*/PIV-*/probe.json")):
+                ev = json.loads(path.read_text(encoding="utf-8"))
+                lines.append(f"| {ev['cell']} | {normalize_status(ev['verdict'])} | {ev['evidence_id']} |")
+            lines.append("")
+            lines.append(
+                "复验基于 fix 分支 `fix/protocol-interop-vless-lazy-response`，独立 review 未完成前"
+                "不改变上表 verdict（上表只用 verify 分支基线证据）。"
+            )
+    else:
+        lines.append("- （无）")
     lines.append("")
     lines.append("## 附录 A：配置索引")
     lines.append("")
