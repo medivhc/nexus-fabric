@@ -126,7 +126,7 @@ fn parse_ipv4_addr(packet: &[u8], offset: usize) -> Option<u32> {
 }
 
 /// 从 IPv4 TCP/UDP 头解析 `(src_port, dst_port)`；非 TCP/UDP 或截断时为 `(None, None)`。
-fn parse_packet_ports(packet: &[u8]) -> (Option<u16>, Option<u16>) {
+pub(crate) fn parse_packet_ports(packet: &[u8]) -> (Option<u16>, Option<u16>) {
     if packet.len() < 20 || packet[0] >> 4 != 4 {
         return (None, None);
     }

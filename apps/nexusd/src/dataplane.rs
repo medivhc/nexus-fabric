@@ -28,6 +28,7 @@ use nexus_network::n1::bridge::N1Sender;
 use nexus_path::{CandidatePath, PathConfig, PathManager};
 use nexus_projection::TunDevice;
 use nexus_projection::classifier::{Classification, PacketClassifier};
+use nexus_projection::egress::{Rule, SimpleRuleEngine};
 use nexus_projection::routing::Cidr;
 use nexus_projection::tcp::{
     FourTuple, STREAM_FIN, STREAM_RST, STREAM_SYN, TcpEvent, TcpTermStats, TcpTerminator,
@@ -165,6 +166,9 @@ pub struct Dataplane {
     flow_pending: HashMap<FourTuple, SessionId>,
     /// Phase B：上游可用性（建连器用）。
     flow_upstream: Arc<UpstreamFlags>,
+    /// 规则引擎（S17 过渡：默认把未命中流量送回 Proxy 分支；S24 注入
+    /// `DomainRuleEngine` 后按真实 tag 分流）。
+    rules: Box<dyn nexus_domain::RuleEngine>,
 }
 
 impl Dataplane {
@@ -246,6 +250,14 @@ impl Dataplane {
             flow_pending_data: HashMap::new(),
             flow_pending: HashMap::new(),
             flow_upstream: Arc::new(UpstreamFlags::default()),
+            rules: Box::new(SimpleRuleEngine::new(vec![Rule {
+                cidr: "0.0.0.0/0"
+                    .parse()
+                    .map_err(|e| format!("compat rule CIDR: {e}"))?,
+                target: nexus_domain::RouteTarget::Egress {
+                    peer: "proxy".to_string(),
+                },
+            }])),
         })
     }
 
@@ -447,17 +459,19 @@ impl Dataplane {
         let classifier = PacketClassifier::new(
             self.mesh_cidrs.clone(),
             self.bypass_cidrs.clone(),
+            self.rules.as_ref(),
+            false, // fake_ip_enabled：本 run 不启用（spec §10.6）
             &self.manager,
             candidates,
             0.0, // degrade_threshold：MVP 用 0（不触发 degraded）
         );
-        let classification = classifier.classify(&packet);
+        let classification = classifier.classify(&packet, None);
 
         // S1：TCP + Mesh/Proxy → smoltcp 终结（不再走 raw-datagram 路径）。
         if is_tcp_packet(&packet)
             && matches!(
                 classification,
-                Classification::Mesh { .. } | Classification::Proxy
+                Classification::Mesh { .. } | Classification::Proxy { .. }
             )
         {
             if !self.qos_admit(&packet) {
@@ -485,7 +499,7 @@ impl Dataplane {
             && is_udp_packet(&packet)
             && matches!(
                 classification,
-                Classification::Mesh { .. } | Classification::Proxy
+                Classification::Mesh { .. } | Classification::Proxy { .. }
             )
             && !self.flow_handle_udp_packet(&packet)
         {
@@ -511,7 +525,7 @@ impl Dataplane {
                     self.with_stats(|s| s.mesh_dropped_no_n1 += 1);
                 }
             }
-            Classification::Proxy => {
+            Classification::Proxy { outbound: _ } => {
                 // P1-P5：engine 已注入 → 真实转发；否则走 D2 计数路径。
                 // 先取出 engine 处理结果（避免 borrow 冲突）。
                 let engine_outcome: Option<(Vec<Vec<u8>>, bool)> =
@@ -581,7 +595,7 @@ impl Dataplane {
             Classification::Direct => {
                 self.with_stats(|s| s.direct_forwarded += 1);
             }
-            Classification::Drop => {
+            Classification::Drop { .. } => {
                 self.with_stats(|s| s.dropped += 1);
             }
         }
@@ -654,11 +668,13 @@ impl Dataplane {
         let classifier = PacketClassifier::new(
             self.mesh_cidrs.clone(),
             self.bypass_cidrs.clone(),
+            self.rules.as_ref(),
+            false,
             &self.manager,
             candidates,
             0.0,
         );
-        match classifier.classify(packet) {
+        match classifier.classify(packet, None) {
             Classification::Mesh { .. } => {
                 if self.config.n1_configured {
                     let sent = match (&self.n1_sender, ipv4_dst_of(packet)) {
@@ -674,7 +690,7 @@ impl Dataplane {
                     self.with_stats(|s| s.mesh_dropped_no_n1 += 1);
                 }
             }
-            Classification::Proxy => {
+            Classification::Proxy { outbound: _ } => {
                 if let Some(engine) = self.proxy_engine.as_mut() {
                     let (tun_pkts, forwarded) = engine.handle_packet(packet);
                     for pkt in tun_pkts {
@@ -906,7 +922,7 @@ impl Dataplane {
             Classification::Mesh { path: None, .. } => ipv4_dst_of(packet)
                 .map(|ip| ip.to_string())
                 .unwrap_or_default(),
-            Classification::Proxy => "proxy".to_string(),
+            Classification::Proxy { .. } => "proxy".to_string(),
             // S8：调用方已过滤 Direct/Drop；防御性返回。
             _ => return,
         };
