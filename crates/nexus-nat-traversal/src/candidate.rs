@@ -34,6 +34,9 @@ pub struct LocalCandidates {
     pub srflx: Option<SocketAddr>,
     /// STUN 自测 reflexive（校验用，可空；同样可打）。
     pub srflx_stun: Option<SocketAddr>,
+    /// TURN Allocate 的 XOR-MAPPED（**诊断**；仅 same-socket + cone 才
+    /// 被复制到 `srflx` 成为 authoritative）。
+    pub srflx_turn: Option<SocketAddr>,
     /// 本端自测 NAT 类型。
     pub nat_type: NatType,
 }
@@ -44,7 +47,14 @@ impl LocalCandidates {
         !self.ordered().is_empty()
     }
 
+    /// authoritative 的公网映射：只有 `srflx`（same-socket + cone 时才
+    /// 从 `srflx_turn` 复制过来）。`srflx_turn` 本身永不进入。
+    pub fn authoritative_srflx(&self) -> Option<SocketAddr> {
+        self.srflx
+    }
+
     /// 打洞候选，排序 Srflx > Host；Relay 不参与；去重。
+    /// 只读 `srflx`/`srflx_stun`/`host`，不读 `srflx_turn`。
     pub fn ordered(&self) -> Vec<PunchCandidate> {
         let mut out = Vec::new();
         let mut push = |addr: SocketAddr, kind: CandidateKind| {

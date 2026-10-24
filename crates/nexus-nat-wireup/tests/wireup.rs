@@ -104,18 +104,19 @@ fn preanswered_nonce_echo() {
         addr: addr(5001),
         kind: CandidateKind::Srflx,
     }];
-    let ch = PreAnsweredChannel::new(cands.clone(), NatType::FullCone);
+    let ch = PreAnsweredChannel::new(cands.clone(), NatType::FullCone, None);
     let offer = PunchOffer {
-        version: 1,
+        version: nexus_nat_traversal::SIGNAL_VERSION,
         nonce: 0xA11CE,
         candidates: vec![],
         nat_type: NatType::Symmetric,
         start_at_ms: 0,
+        prediction: None,
     };
     ch.send_offer(&offer).unwrap();
     let answer = ch.recv_answer(Duration::from_secs(1)).unwrap();
     assert_eq!(answer.nonce, 0xA11CE);
-    assert_eq!(answer.version, 1);
+    assert_eq!(answer.version, nexus_nat_traversal::SIGNAL_VERSION);
     assert_eq!(answer.candidates.len(), 1);
     assert_eq!(answer.candidates[0].addr, addr(5001));
     assert_eq!(answer.nat_type, NatType::FullCone);

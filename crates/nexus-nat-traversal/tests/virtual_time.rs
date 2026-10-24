@@ -2,14 +2,13 @@ mod common;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
 use common::{FakeChannel, FakeSocket, ManualPunchClock};
 use nexus_connectivity::nat::NatType;
 use nexus_nat_traversal::{
-    LocalCandidates, PortSample, PunchAnswer, PunchConfig, PunchFailReason, PunchPhase,
-    PunchResult, PunchSession, PunchStats,
+    LocalCandidates, PortSample, PunchAnswer, PunchConfig, PunchFailReason, PunchResult,
+    PunchSession, PunchStats,
 };
 
 fn cands(nat: NatType, port: u16) -> LocalCandidates {
@@ -219,7 +218,6 @@ fn nonce_unique_without_wall_clock() {
     let (mut s1, c1) = mk();
     let (mut s2, c2) = mk();
     let _ = s1.run();
-    clock.sleep_ms(0);
     let _ = s2.run();
     let n1 = c1.offers.lock().unwrap()[0].nonce;
     let n2 = c2.offers.lock().unwrap()[0].nonce;

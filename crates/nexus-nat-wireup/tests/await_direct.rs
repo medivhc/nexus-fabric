@@ -2,6 +2,7 @@ use std::io::ErrorKind;
 use std::time::Duration;
 
 use nexus_fabric::{Driver, PeerId};
+use nexus_nat_traversal::PunchSocket;
 use nexus_nat_wireup::DriverPunchSocket;
 
 #[test]

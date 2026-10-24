@@ -12,3 +12,7 @@ description = "Relay-first NAT punch-through orchestration: candidate gathering,
 nexus-connectivity = { path = "../nexus-connectivity" }
 
 [dev-dependencies]
+
+[features]
+# Integration tests may opt into `PunchConfig::new_test_config()`.
+test-config = []

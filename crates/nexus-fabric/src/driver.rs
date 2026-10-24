@@ -97,6 +97,10 @@ pub struct ConnShared {
     /// Remote peer. Client side: the expected peer. Server side: unknown in P0
     /// (no client auth yet) and stays zeroed; documented, not fabricated.
     pub peer: PeerId,
+    /// Additive: address of the live connection's remote end (accept side:
+    /// the incoming source; connect side: the dialed target). Used by the
+    /// NAT composition root so `DirectConn.addr` reflects reality.
+    pub remote_addr: Mutex<Option<SocketAddr>>,
     pub tx: mpsc::Sender<Cmd>,
     pub state: Mutex<ConnState>,
     pub state_cv: Condvar,
@@ -140,6 +144,7 @@ impl ConnShared {
         Self {
             id,
             peer,
+            remote_addr: Mutex::new(None),
             tx,
             state: Mutex::new(ConnState {
                 connected: false,
@@ -271,6 +276,15 @@ pub enum Cmd {
         code: u32,
         reason: Vec<u8>,
     },
+    InstallStunTap {
+        sink: std::sync::Arc<dyn crate::stun::StunSink>,
+        reply: mpsc::Sender<Result<(), crate::stun::StunTapError>>,
+    },
+    SendStunRequest {
+        server: SocketAddr,
+        bytes: Vec<u8>,
+        reply: mpsc::Sender<Result<crate::stun::StunTransactionId, crate::stun::StunTapError>>,
+    },
     Shutdown,
 }
 
@@ -354,6 +368,8 @@ impl Driver {
             handle_map: HashMap::new(),
             buf: vec![0u8; RECV_BUF],
             out: Vec::new(),
+            stun_sink: None,
+            stun_pending: HashMap::new(),
         };
         let thread = thread::Builder::new()
             .name("nexus-fabric-drv".into())
@@ -431,6 +447,40 @@ impl Driver {
 
     pub fn shared(&self) -> &Arc<DriverShared> {
         &self.shared
+    }
+
+    /// Additive: install the single STUN sink (duplicate -> AlreadyInstalled).
+    pub fn install_stun_tap(
+        self: &Arc<Self>,
+        sink: Arc<dyn crate::stun::StunSink>,
+    ) -> Result<(), crate::stun::StunTapError> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(Cmd::InstallStunTap { sink, reply: tx })
+            .map_err(|_| crate::stun::StunTapError::DriverClosed)?;
+        rx.recv()
+            .map_err(|_| crate::stun::StunTapError::DriverClosed)?
+    }
+
+    /// Additive: send a pre-built STUN Binding request from the driver socket.
+    pub fn send_stun_request(
+        self: &Arc<Self>,
+        server: SocketAddr,
+        bytes: Vec<u8>,
+    ) -> Result<crate::stun::StunTransactionId, crate::stun::StunTapError> {
+        if crate::stun::parse_transaction(&bytes).is_none() {
+            return Err(crate::stun::StunTapError::MalformedRequest);
+        }
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(Cmd::SendStunRequest {
+                server,
+                bytes,
+                reply: tx,
+            })
+            .map_err(|_| crate::stun::StunTapError::DriverClosed)?;
+        rx.recv()
+            .map_err(|_| crate::stun::StunTapError::DriverClosed)?
     }
 
     pub fn send(&self, cmd: Cmd) {
@@ -628,12 +678,16 @@ struct Loop {
     handle_map: HashMap<ConnectionHandle, u64>,
     buf: Vec<u8>,
     out: Vec<u8>,
+    stun_sink: Option<std::sync::Arc<dyn crate::stun::StunSink>>,
+    stun_pending: HashMap<[u8; 12], Instant>,
 }
 
 impl Loop {
     fn run(mut self) {
         loop {
             let now = Instant::now();
+            self.stun_pending
+                .retain(|_, at| now.duration_since(*at) <= Duration::from_millis(2000));
             // 1. Commands.
             let mut shutdown = false;
             while let Ok(cmd) = self.rx.try_recv() {
@@ -691,6 +745,33 @@ impl Loop {
     fn handle_cmd(&mut self, cmd: Cmd, now: Instant) -> bool {
         match cmd {
             Cmd::Shutdown => return true,
+            Cmd::InstallStunTap { sink, reply } => {
+                let result = if self.stun_sink.is_some() {
+                    Err(crate::stun::StunTapError::AlreadyInstalled)
+                } else {
+                    self.stun_sink = Some(sink);
+                    Ok(())
+                };
+                let _ = reply.send(result);
+            }
+            Cmd::SendStunRequest {
+                server,
+                bytes,
+                reply,
+            } => {
+                let result = if self.stun_sink.is_none() {
+                    Err(crate::stun::StunTapError::NotInstalled)
+                } else if let Some(txn) = crate::stun::parse_transaction(&bytes) {
+                    self.stun_pending.insert(txn.0, now);
+                    match self.socket.send_to(&bytes, server) {
+                        Ok(_) => Ok(txn),
+                        Err(_) => Err(crate::stun::StunTapError::DriverClosed),
+                    }
+                } else {
+                    Err(crate::stun::StunTapError::MalformedRequest)
+                };
+                let _ = reply.send(result);
+            }
             Cmd::Connect {
                 remote,
                 crypto,
@@ -763,6 +844,7 @@ impl Loop {
             .map_err(|e| FabricError::Transport(format!("quic connect: {e:?}")))?;
         let id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
         let shared = Arc::new(ConnShared::new(ConnectionId(id), peer, self.tx.clone()));
+        *shared.remote_addr.lock().unwrap() = Some(remote);
         self.handle_map.insert(handle, id);
         self.live.insert(
             id,
@@ -916,6 +998,18 @@ impl Loop {
 
     fn on_udp(&mut self, n: usize, remote: SocketAddr) {
         let now = Instant::now();
+        if let Some(txn) = crate::stun::parse_transaction(&self.buf[..n]) {
+            if self.stun_pending.remove(&txn.0).is_some() {
+                if let Some(sink) = &self.stun_sink {
+                    sink.on_stun_response(crate::stun::StunResponse {
+                        transaction_id: txn,
+                        from: remote,
+                        bytes: self.buf[..n].to_vec(),
+                    });
+                }
+                return;
+            }
+        }
         let local_ip = self.socket.local_addr().ok().map(|a| a.ip());
         let data = BytesMut::from(&self.buf[..n]);
         let ev = self
@@ -946,6 +1040,7 @@ impl Loop {
         if self.server_config.is_none() {
             return;
         }
+        let remote_addr = incoming.remote_address();
         match self
             .endpoint
             .accept(incoming, now, &mut self.out, self.server_config.clone())
@@ -958,6 +1053,7 @@ impl Loop {
                     PeerId([0u8; 32]),
                     self.tx.clone(),
                 ));
+                *shared.remote_addr.lock().unwrap() = Some(remote_addr);
                 self.handle_map.insert(handle, id);
                 self.live.insert(
                     id,

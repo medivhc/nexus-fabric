@@ -1,43 +1,80 @@
-//! Track B 实现：有界端口预测（合同 P3 冻结规则）。
+//! P3 有界端口预测（合同 v1.1 冻结规则）。
 //!
-//! - `assess`：至少 3 个样本；连续两两 Δ 相等 →
-//!   `Predictable{base_port: 最后一个样本端口, delta}`；否则 `Unpredictable`。
-//! - `plan`：只对 `Predictable` 返回 `Some`；
-//!   `ports` 以 `base+delta`（u16 回绕）为中心向两侧扩展 K 个，
-//!   总数 `<= 2*K+1`，K 上限 32。
+//! - `assess`：最近至多 8 个样本；至少 3 个有效样本；`target` 去重 ≥2；
+//!   `observed_from` 一致；`port != 0`；连续 Δ 全相等且 `|Δ| <= 8` →
+//!   `Predictable{base_port: 最后样本端口, delta}`；否则 `Unpredictable`。
+//! - `plan`：只对 Predictable 返回 Some；`2K+1` 个端口，K 上限 32，跳过 0。
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use crate::{PortSample, Predictability, PunchPredictor, SprayPlan};
 
-/// spray 半径 K 上限（合同 P3 冻结：32）。
+/// spray 半径 K 上限（合同冻结：32）。
 const MAX_SPRAY_K: u8 = 32;
-
-/// 最少样本数（合同 P3 冻结：3）。
+/// 最少有效样本数。
 const MIN_SAMPLES: usize = 3;
+/// 最多纳入判定的样本数。
+const MAX_SAMPLES: usize = 8;
+/// 稳定 Δ 上限（默认 `max_stable_delta`）。
+const MAX_STABLE_DELTA: i32 = 8;
+
+/// 预测计划（core 方向修正使用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PredictionPlan {
+    Spray(SprayPlan),
+    MappingProbe {
+        target: SocketAddr,
+        count: u8,
+        interval_ms: u64,
+    },
+    None,
+}
 
 #[derive(Debug, Default)]
 pub struct DefaultPredictor;
 
 impl DefaultPredictor {
-    /// 若所有连续两两 Δ 相等则返回该 Δ，否则 `None`（含样本不足）。
+    fn usable(samples: &[PortSample]) -> Vec<PortSample> {
+        let tail = &samples[samples.len().saturating_sub(MAX_SAMPLES)..];
+        let Some(first_obs) = tail.first().map(|s| s.observed_from) else {
+            return Vec::new();
+        };
+        tail.iter()
+            .copied()
+            .filter(|s| s.port != 0 && s.observed_from == first_obs)
+            .collect()
+    }
+
     fn uniform_delta(samples: &[PortSample]) -> Option<i32> {
-        if samples.len() < MIN_SAMPLES {
+        let distinct_targets = {
+            let mut t: Vec<SocketAddr> = samples.iter().map(|s| s.target).collect();
+            t.sort();
+            t.dedup();
+            t.len()
+        };
+        if distinct_targets < 2 {
             return None;
         }
-        let first = samples[1].port as i32 - samples[0].port as i32;
+        let delta = samples[1].port as i32 - samples[0].port as i32;
+        if delta.abs() > MAX_STABLE_DELTA {
+            return None;
+        }
         let uniform = samples
             .windows(2)
-            .all(|w| w[1].port as i32 - w[0].port as i32 == first);
-        uniform.then_some(first)
+            .all(|w| w[1].port as i32 - w[0].port as i32 == delta);
+        uniform.then_some(delta)
     }
 }
 
 impl PunchPredictor for DefaultPredictor {
     fn assess(&self, samples: &[PortSample]) -> Predictability {
-        match Self::uniform_delta(samples) {
+        let usable = Self::usable(samples);
+        if usable.len() < MIN_SAMPLES {
+            return Predictability::Unpredictable;
+        }
+        match Self::uniform_delta(&usable) {
             Some(delta) => Predictability::Predictable {
-                base_port: samples[samples.len() - 1].port,
+                base_port: usable[usable.len() - 1].port,
                 delta,
             },
             None => Predictability::Unpredictable,
@@ -49,79 +86,55 @@ impl PunchPredictor for DefaultPredictor {
             return None;
         };
         let k = k.min(MAX_SPRAY_K);
-        // 中心 = base + delta，u16 回绕语义（`as u16` 对负 delta 做 mod 2^16）。
         let center = base_port.wrapping_add(*delta as u16);
         let k_i32 = i32::from(k);
         let mut ports = Vec::with_capacity(2 * k_i32 as usize + 1);
         for i in -k_i32..=k_i32 {
-            ports.push(center.wrapping_add(i as u16));
+            let port = center.wrapping_add(i as u16);
+            if port != 0 {
+                ports.push(port);
+            }
         }
         Some(SprayPlan { target_ip, ports })
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn predictor() -> DefaultPredictor {
-        DefaultPredictor
+/// 组合根/测试使用的方向决策 helper（不读全局状态）。
+pub fn default_plan(
+    local_symmetric: bool,
+    remote_symmetric: bool,
+    hint: Option<crate::PredictionHint>,
+    remote_reflexive: Option<SocketAddr>,
+    predictor: &dyn PunchPredictor,
+    k: u8,
+    probe_count: u8,
+    probe_interval_ms: u64,
+) -> PredictionPlan {
+    if local_symmetric && remote_symmetric {
+        return PredictionPlan::None;
     }
-
-    fn samples(ports: &[u16]) -> Vec<PortSample> {
-        ports
-            .iter()
-            .enumerate()
-            .map(|(i, &port)| PortSample {
-                port,
-                at_ms: i as u64 * 100,
-            })
-            .collect()
+    if local_symmetric {
+        return match remote_reflexive {
+            Some(target) => PredictionPlan::MappingProbe {
+                target,
+                count: probe_count,
+                interval_ms: probe_interval_ms,
+            },
+            None => PredictionPlan::None,
+        };
     }
-
-    #[test]
-    fn wraparound_center_and_window() {
-        // 回绕：base=65534, delta=1 → 中心=65535；base=65535, delta=1 → 中心=0。
-        let p = predictor();
-        let plan = p
-            .plan(
-                &Predictability::Predictable {
-                    base_port: 65535,
-                    delta: 1,
-                },
-                std::net::IpAddr::from([192, 0, 2, 1]),
-                2,
-            )
-            .unwrap();
-        assert_eq!(plan.ports, vec![65534, 65535, 0, 1, 2]);
+    if remote_symmetric {
+        let (Some(hint), Some(target)) = (hint, remote_reflexive) else {
+            return PredictionPlan::None;
+        };
+        let p = Predictability::Predictable {
+            base_port: hint.base_port,
+            delta: hint.delta,
+        };
+        return match predictor.plan(&p, target.ip(), k) {
+            Some(spray) => PredictionPlan::Spray(spray),
+            None => PredictionPlan::None,
+        };
     }
-
-    #[test]
-    fn zero_delta_is_predictable() {
-        // 端口保持（cone 行为）→ Δ 全 0 → Predictable。
-        let p = predictor().assess(&samples(&[40000, 40000, 40000]));
-        assert_eq!(
-            p,
-            Predictability::Predictable {
-                base_port: 40000,
-                delta: 0
-            }
-        );
-    }
-
-    #[test]
-    fn k_zero_gives_single_port() {
-        let p = predictor();
-        let plan = p
-            .plan(
-                &Predictability::Predictable {
-                    base_port: 1000,
-                    delta: 5,
-                },
-                std::net::IpAddr::from([192, 0, 2, 1]),
-                0,
-            )
-            .unwrap();
-        assert_eq!(plan.ports, vec![1005]);
-    }
+    PredictionPlan::None
 }

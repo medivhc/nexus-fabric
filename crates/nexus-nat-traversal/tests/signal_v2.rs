@@ -71,7 +71,7 @@ fn g8_signal_v2_prediction_hint_roundtrip() {
     let o_v1 = offer(None);
     let mut expected = vec![1u8];
     expected.extend_from_slice(&o_v1.nonce.to_be_bytes());
-    expected.push(1u8); // PortRestrictedCone
+    expected.push(2u8); // PortRestrictedCone (v1 wire encoding)
     expected.extend_from_slice(&o_v1.start_at_ms.to_be_bytes());
     expected.push(2u8);
     for c in &o_v1.candidates {
@@ -83,7 +83,7 @@ fn g8_signal_v2_prediction_hint_roundtrip() {
     assert_eq!(encode_offer_v1(&o_v1), expected);
 
     // BadPrediction: samples < 3 and non-boolean flag.
-    let mut bad = enc.clone();
+    let mut bad = encode_offer(&offer(Some(hint)));
     let n = bad.len();
     bad[n - 1] = 2; // samples byte
     assert_eq!(decode_offer(&bad), Err(SignalError::BadPrediction));

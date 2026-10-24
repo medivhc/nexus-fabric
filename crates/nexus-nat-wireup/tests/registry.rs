@@ -8,7 +8,7 @@ use nexus_nat_wireup::{
 fn manager() -> (std::sync::Arc<PunchManager>, PeerId) {
     let driver = Driver::new_server("127.0.0.1:0".parse().unwrap()).expect("bind driver");
     let me = PeerId([1u8; 32]);
-    let mgr = PunchManager::new(driver, me, SystemPunchClock::new());
+    let mgr = PunchManager::new(driver, me, std::sync::Arc::new(SystemPunchClock::new()));
     (mgr, PeerId([2u8; 32]))
 }
 

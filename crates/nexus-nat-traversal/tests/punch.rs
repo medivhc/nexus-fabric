@@ -6,10 +6,35 @@ use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nexus_connectivity::nat::NatType;
 use nexus_nat_traversal::*;
+
+/// Real-time clock for wireup-style behavioral tests (AC-12 lives elsewhere).
+#[derive(Default)]
+struct TestClock {
+    start: Option<Instant>,
+}
+impl PunchClock for TestClock {
+    fn now_ms(&self) -> u64 {
+        self.start
+            .map(|s| s.elapsed().as_millis() as u64)
+            .unwrap_or(0)
+    }
+    fn wall_ms(&self) -> u64 {
+        1_700_000_000_000 + self.now_ms()
+    }
+    fn sleep_until_ms(&self, deadline_ms: u64) {
+        let now = self.now_ms();
+        if deadline_ms > now {
+            std::thread::sleep(Duration::from_millis(deadline_ms - now));
+        }
+    }
+    fn sleep_ms(&self, ms: u64) {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
 
 // ---------------------------------------------------------------------------
 // 测试替身
@@ -104,6 +129,7 @@ fn local_fullcone() -> LocalCandidates {
         host: vec![test_addr("192.168.1.10:5000")],
         srflx: Some(test_addr("203.0.113.7:40001")),
         srflx_stun: None,
+        srflx_turn: None,
         nat_type: NatType::FullCone,
     }
 }
@@ -117,6 +143,7 @@ fn answer_for(nonce: u64, nat: NatType) -> PunchAnswer {
             kind: CandidateKind::Srflx,
         }],
         nat_type: nat,
+        prediction: None,
     }
 }
 
@@ -127,6 +154,7 @@ fn test_config() -> PunchConfig {
         spray_k: 16,
         spray_interval_ms: 0,
         repunch_interval: Duration::from_secs(300),
+        ..PunchConfig::default()
     }
 }
 
@@ -142,10 +170,12 @@ fn new_session(
         PeerId([7u8; 32]),
         local,
         remote_nat,
+        Vec::new(),
         test_config(),
         ch.clone(),
         so.clone(),
         Arc::new(NoopPredictor),
+        Arc::new(TestClock::default()),
     );
     (s, ch, so)
 }
@@ -175,6 +205,7 @@ fn signal_codec_roundtrip() {
         ],
         nat_type: NatType::PortRestrictedCone,
         start_at_ms: 1_700_000_000_123,
+        prediction: None,
     };
     let rt = decode_offer(&encode_offer(&offer)).expect("offer roundtrip");
     assert_eq!(rt, offer, "offer 往返必须一致（含候选顺序）");
@@ -184,16 +215,17 @@ fn signal_codec_roundtrip() {
         nonce: offer.nonce,
         candidates: offer.candidates.clone(),
         nat_type: NatType::Symmetric,
+        prediction: None,
     };
     let rt = decode_answer(&encode_answer(&answer)).expect("answer roundtrip");
     assert_eq!(rt, answer, "answer 往返必须一致");
 
-    // version != 1 → Err(Version)
+    // v2 entry rejects v1/v3 frames (v1.1 explicit incompatibility).
     let mut bad = encode_offer(&offer);
-    bad[0] = 2;
+    bad[0] = 3;
     assert_eq!(decode_offer(&bad).unwrap_err(), SignalError::Version);
 
-    // 候选超 16 → Err(TooMany)
+    // Encoding truncates to 16 (contract v1.1); a 17-count frame is rejected.
     let many_cands = vec![
         PunchCandidate {
             addr: test_addr("192.0.2.1:5000"),
@@ -205,10 +237,11 @@ fn signal_codec_roundtrip() {
         candidates: many_cands,
         ..offer.clone()
     };
-    assert_eq!(
-        decode_offer(&encode_offer(&many)).unwrap_err(),
-        SignalError::TooMany
-    );
+    let enc = encode_offer(&many);
+    assert_eq!(decode_offer(&enc).unwrap().candidates.len(), 16);
+    let mut forged = enc;
+    forged[18] = 17;
+    assert_eq!(decode_offer(&forged).unwrap_err(), SignalError::TooMany);
 
     // 截断 → Err(Truncated)
     let mut trunc = encode_offer(&offer);
@@ -239,6 +272,7 @@ fn nonce_mismatch_drops_answer() {
                     kind: CandidateKind::Srflx,
                 }],
                 nat_type: NatType::FullCone,
+                prediction: None,
             }));
             q.push_back(Ok(answer_for(offer.nonce, NatType::FullCone)));
             Ok(())
@@ -256,10 +290,12 @@ fn nonce_mismatch_drops_answer() {
         PeerId([7u8; 32]),
         local_fullcone(),
         NatType::FullCone,
+        Vec::new(),
         test_config(),
         echo.clone(),
         sock.clone(),
         Arc::new(NoopPredictor),
+        Arc::new(TestClock::default()),
     );
     let r = s.run();
     assert!(
@@ -281,15 +317,18 @@ fn nonce_mismatch_drops_answer() {
         nonce: 0xDEAD_BEEF,
         candidates: vec![],
         nat_type: NatType::FullCone,
+        prediction: None,
     })]));
     let mut s2 = PunchSession::new(
         PeerId([7u8; 32]),
         local_fullcone(),
         NatType::FullCone,
+        Vec::new(),
         test_config(),
         ch2.clone(),
         Arc::new(FakeSocket::new(vec![])),
         Arc::new(NoopPredictor),
+        Arc::new(TestClock::default()),
     );
     let r2 = s2.run();
     assert_eq!(
@@ -333,10 +372,12 @@ fn state_machine_happy_path() {
         PeerId([7u8; 32]),
         local_fullcone(),
         NatType::FullCone,
+        Vec::new(),
         test_config(),
         ch.clone(),
         so.clone(),
         Arc::new(NoopPredictor),
+        Arc::new(TestClock::default()),
     );
     assert_eq!(s.phase(), PunchPhase::Idle);
 
@@ -367,6 +408,7 @@ fn no_candidates_fails() {
         host: vec![],
         srflx: None,
         srflx_stun: None,
+        srflx_turn: None,
         nat_type: NatType::Unknown,
     };
     let (mut s, ch, so) = new_session(
@@ -389,7 +431,7 @@ fn no_candidates_fails() {
 }
 
 // ---------------------------------------------------------------------------
-// 额外：symmetric + NoopPredictor → StayedOnRelay(UnpredictableSymmetric)
+// 额外：symmetric→cone 发有界 mapping probe（v1.1 方向修正，C-21）
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -421,23 +463,33 @@ fn symmetric_unpredictable_stays_on_relay() {
         PeerId([7u8; 32]),
         local,
         NatType::FullCone,
+        Vec::new(),
         test_config(),
         ch.clone(),
         so.clone(),
         Arc::new(NoopPredictor),
+        Arc::new(TestClock::default()),
     );
     let r = s.run();
     assert_eq!(
         r,
-        PunchResult::StayedOnRelay {
-            reason: PunchFailReason::UnpredictableSymmetric
+        PunchResult::Migrated {
+            addr: test_addr("198.51.100.9:41002")
         }
     );
+    assert_eq!(s.phase(), PunchPhase::Migrated);
     assert_eq!(
-        s.phase(),
-        PunchPhase::Failed(PunchFailReason::UnpredictableSymmetric)
+        s.stats().mapping_probe_sends,
+        3,
+        "symmetric side probes once per config"
     );
-    // 不可预测 → 一个打洞包都不发。
-    assert!(so.punched_targets().is_empty());
-    assert_eq!(s.stats().failed_unpredictable, 1);
+    assert_eq!(s.stats().spray_sends, 0, "symmetric side never sprays");
+    let targets = so.punched_targets();
+    assert_eq!(targets.len(), 3, "mapping probes only, no spray fan-out");
+    assert!(
+        targets
+            .iter()
+            .all(|t| *t == test_addr("198.51.100.9:41002"))
+    );
+    assert_eq!(s.stats().failed_unpredictable, 0);
 }

@@ -100,9 +100,18 @@ impl TurnClient {
             .map_err(|_| io::Error::other("turn client lock poisoned"))
     }
 
-    /// 在 `server` 上分配中继地址（处理 401 质询重发）。
+    /// 在 `server` 上分配中继地址（兼容入口；等价 `allocate_bound(.., 127.0.0.1:0)`）。
     pub fn allocate(server: SocketAddr, creds: TurnCredentials) -> io::Result<TurnClient> {
-        let sock = UdpSocket::bind("127.0.0.1:0")?;
+        Self::allocate_bound(server, creds, "127.0.0.1:0".parse().unwrap())
+    }
+
+    /// 在 `server` 上分配中继地址（生产用 `local_bind = 0.0.0.0:0`）。
+    pub fn allocate_bound(
+        server: SocketAddr,
+        creds: TurnCredentials,
+        local_bind: SocketAddr,
+    ) -> io::Result<TurnClient> {
+        let sock = UdpSocket::bind(local_bind)?;
         // Server 的所有消息（响应 + Data indication）都来自主 socket，
         // connect 后可用 recv/send 简化收发。
         sock.connect(server)?;

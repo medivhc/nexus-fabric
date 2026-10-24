@@ -435,6 +435,8 @@ fn stun_sample(
                             samples.push(PortSample {
                                 port: obs.port(),
                                 at_ms: 0,
+                                target: "127.0.0.1:3478".parse().unwrap(),
+                                observed_from: "0.0.0.0:0".parse().unwrap(),
                             });
                             break;
                         }
@@ -478,12 +480,17 @@ fn build_node(cfg: &NodeCfg, client: TurnClient, peer_relayed: SocketAddr) -> io
         .peer_id
         .ok_or_else(|| io::Error::other("no peer id"))?;
 
-    let manager = PunchManager::new(driver.clone(), my_id);
+    let manager = PunchManager::new(
+        driver.clone(),
+        my_id,
+        std::sync::Arc::new(nexus_nat_wireup::SystemPunchClock::new()),
+    );
     manager.set_local(
         nexus_nat_traversal::LocalCandidates {
             host: Vec::new(),
             srflx: Some(reflexive),
             srflx_stun: None,
+            srflx_turn: None,
             nat_type: cfg.nat_type,
         },
         samples,

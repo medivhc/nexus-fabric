@@ -11,7 +11,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use nexus_connectivity::nat::NatType;
-use nexus_nat_traversal::{PunchAnswer, PunchCandidate, PunchChannel, PunchOffer, SIGNAL_VERSION};
+use nexus_nat_traversal::{
+    PredictionHint, PunchAnswer, PunchCandidate, PunchChannel, PunchOffer, SIGNAL_VERSION,
+};
 
 /// `PunchChannel` adapter for the responder path.
 ///
@@ -21,16 +23,22 @@ use nexus_nat_traversal::{PunchAnswer, PunchCandidate, PunchChannel, PunchOffer,
 pub struct PreAnsweredChannel {
     candidates: Vec<PunchCandidate>,
     nat_type: NatType,
+    prediction: Option<PredictionHint>,
     nonce: Mutex<Option<u64>>,
 }
 
 impl PreAnsweredChannel {
     /// `candidates`/`nat_type` are the *initiator's* (from the accepted
     /// offer): the session punches toward them.
-    pub fn new(candidates: Vec<PunchCandidate>, nat_type: NatType) -> Self {
+    pub fn new(
+        candidates: Vec<PunchCandidate>,
+        nat_type: NatType,
+        prediction: Option<PredictionHint>,
+    ) -> Self {
         Self {
             candidates,
             nat_type,
+            prediction,
             nonce: Mutex::new(None),
         }
     }
@@ -61,6 +69,7 @@ impl PunchChannel for PreAnsweredChannel {
             nonce,
             candidates: self.candidates.clone(),
             nat_type: self.nat_type,
+            prediction: self.prediction,
         })
     }
 }
