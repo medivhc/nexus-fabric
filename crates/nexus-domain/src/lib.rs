@@ -1064,6 +1064,12 @@ pub struct RouteRequest<'a> {
     pub packet: &'a [u8],
     /// 域名（P0 为 None；P1 由 DNS 劫持提供）。
     pub domain: Option<&'a str>,
+    /// 源端口（TCP/UDP 头；不可用时为 `None`）。
+    pub src_port: Option<u16>,
+    /// 目的端口（TCP/UDP 头；不可用时为 `None`）。
+    pub dst_port: Option<u16>,
+    /// 进程名（不可用时为 `None`；本 run 不采集）。
+    pub process_name: Option<&'a str>,
 }
 
 /// 规则引擎 trait：输入路由请求，输出统一路由决策。

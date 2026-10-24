@@ -759,14 +759,20 @@ mod tests {
         assert_eq!(
             e.decide(&RouteRequest {
                 packet: &p1,
-                domain: None
+                domain: None,
+                src_port: None,
+                dst_port: None,
+                process_name: None,
             }),
             RouteTarget::Drop
         );
         assert_eq!(
             e.decide(&RouteRequest {
                 packet: &p2,
-                domain: None
+                domain: None,
+                src_port: None,
+                dst_port: None,
+                process_name: None,
             }),
             RouteTarget::Egress {
                 peer: "self".to_string()
@@ -934,6 +940,9 @@ mod tests {
         let req = RouteRequest {
             packet: &pkt,
             domain: Some("www.blocked.example"),
+            src_port: None,
+            dst_port: None,
+            process_name: None,
         };
         assert_eq!(
             e.decide(&req),
@@ -945,6 +954,9 @@ mod tests {
         let req = RouteRequest {
             packet: &pkt,
             domain: Some("blocked.example"),
+            src_port: None,
+            dst_port: None,
+            process_name: None,
         };
         assert_eq!(
             e.decide(&req),
@@ -956,6 +968,9 @@ mod tests {
         let req = RouteRequest {
             packet: &pkt,
             domain: Some("notblocked.example"),
+            src_port: None,
+            dst_port: None,
+            process_name: None,
         };
         assert_eq!(e.decide(&req), RouteTarget::Drop);
     }
@@ -968,6 +983,9 @@ mod tests {
         let req = RouteRequest {
             packet: &pkt,
             domain: Some("www.allowed.example"),
+            src_port: None,
+            dst_port: None,
+            process_name: None,
         };
         assert_eq!(
             e.decide(&req),
@@ -979,6 +997,9 @@ mod tests {
         let req = RouteRequest {
             packet: &pkt,
             domain: None,
+            src_port: None,
+            dst_port: None,
+            process_name: None,
         };
         assert_eq!(
             e.decide(&req),
@@ -1009,6 +1030,9 @@ mod tests {
         let req = RouteRequest {
             packet: &pkt,
             domain: Some("www.ads.example.com"),
+            src_port: None,
+            dst_port: None,
+            process_name: None,
         };
         assert_eq!(
             e.decide(&req),
@@ -1020,6 +1044,9 @@ mod tests {
         let req = RouteRequest {
             packet: &pkt,
             domain: Some("cdn.ads.example.com"),
+            src_port: None,
+            dst_port: None,
+            process_name: None,
         };
         assert_eq!(
             e.decide(&req),
@@ -1031,6 +1058,9 @@ mod tests {
         let req = RouteRequest {
             packet: &pkt,
             domain: Some("ads-tracker.other.net"),
+            src_port: None,
+            dst_port: None,
+            process_name: None,
         };
         assert_eq!(e.decide(&req), RouteTarget::Drop);
     }
@@ -1049,6 +1079,9 @@ mod tests {
         let req = RouteRequest {
             packet: &pkt,
             domain: Some("WWW.BLOCKED.EXAMPLE"),
+            src_port: None,
+            dst_port: None,
+            process_name: None,
         };
         assert_eq!(
             e.decide(&req),
