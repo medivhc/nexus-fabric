@@ -1136,6 +1136,67 @@ fn req_opt_int(node: &Node, key: &str, base: &str) -> Result<Option<u64>, Config
     })
 }
 
+/// 校验出站/策略组 tag 的字符约束（spec §9.7.1）。
+fn validate_tag_text(tag: &str) -> Result<(), String> {
+    if tag.is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    if tag.trim() != tag {
+        return Err(format!(
+            "must not have leading/trailing whitespace in '{tag}'"
+        ));
+    }
+    if tag.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!(
+            "must not contain whitespace or control characters in '{tag}'"
+        ));
+    }
+    if tag.len() > 64 {
+        return Err(format!("must be at most 64 bytes, got {}", tag.len()));
+    }
+    Ok(())
+}
+
+/// 出站/策略组 tag 的完整性与唯一性校验（spec §8.7 / §9.7.1）。
+fn validate_tags(outbounds: &[OutboundConfig], groups: &[GroupConfig]) -> Result<(), ConfigError> {
+    use std::collections::BTreeMap;
+
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    for (i, outbound) in outbounds.iter().enumerate() {
+        validate_tag_text(&outbound.tag)
+            .map_err(|reason| ConfigError::new(format!("outbounds[{i}].tag"), reason))?;
+        if outbound.tag.eq_ignore_ascii_case("direct") && outbound.kind != OutboundKind::Direct {
+            return Err(ConfigError::new(
+                format!("outbounds[{i}].tag"),
+                format!("reserved tag '{}'", outbound.tag),
+            ));
+        }
+        if seen.insert(outbound.tag.as_str(), i).is_some() {
+            return Err(ConfigError::new(
+                format!("outbounds[{i}].tag"),
+                format!("duplicate tag '{}'", outbound.tag),
+            ));
+        }
+    }
+    for (i, group) in groups.iter().enumerate() {
+        validate_tag_text(&group.tag)
+            .map_err(|reason| ConfigError::new(format!("groups[{i}].tag"), reason))?;
+        if group.tag.eq_ignore_ascii_case("direct") {
+            return Err(ConfigError::new(
+                format!("groups[{i}].tag"),
+                format!("reserved tag '{}'", group.tag),
+            ));
+        }
+        if seen.insert(group.tag.as_str(), i).is_some() {
+            return Err(ConfigError::new(
+                format!("groups[{i}].tag"),
+                format!("duplicate tag '{}'", group.tag),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_chain_name(chain: &str) -> Result<(), String> {
     if chain.is_empty() {
         return Err("must not be empty".to_string());
@@ -1320,7 +1381,14 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
     if let Some(seq) = root.get("outbounds").and_then(Node::as_seq) {
         for (i, item) in seq.iter().enumerate() {
             let field = format!("outbounds[{i}]");
-            let tag = req_str(item, "tag", &field)?.to_string();
+            let tag = req_str(item, "tag", &field)
+                .map_err(|mut e| {
+                    if e.field == field {
+                        e.field = format!("{field}.tag");
+                    }
+                    e
+                })?
+                .to_string();
             let kind_s = req_str(item, "kind", &field)?;
             let kind =
                 OutboundKind::parse(kind_s).map_err(|e| refield(e, &format!("{field}.kind")))?;
@@ -1509,7 +1577,14 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
     if let Some(seq) = root.get("groups").and_then(Node::as_seq) {
         for (i, item) in seq.iter().enumerate() {
             let field = format!("groups[{i}]");
-            let tag = req_str(item, "tag", &field)?.to_string();
+            let tag = req_str(item, "tag", &field)
+                .map_err(|mut e| {
+                    if e.field == field {
+                        e.field = format!("{field}.tag");
+                    }
+                    e
+                })?
+                .to_string();
             let kind_s = req_str(item, "kind", &field)?;
             let kind =
                 GroupKind::parse(kind_s).map_err(|e| refield(e, &format!("{field}.kind")))?;
@@ -1538,6 +1613,8 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
             });
         }
     }
+
+    validate_tags(&outbounds, &groups)?;
 
     // ---- inbounds ----
     let mut inbounds = Vec::new();
@@ -3213,5 +3290,87 @@ mod tproxy_inbound_tests {
         let err = parse(yaml).unwrap_err();
         assert_eq!(err.field, "inbounds");
         assert!(err.reason.contains("only one tproxy"), "{err:?}");
+    }
+}
+#[cfg(test)]
+mod tag_validation_tests {
+    use super::*;
+
+    fn yaml_with(outbounds: &str, groups: &str) -> String {
+        format!(
+            "schema_version: 1\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n{outbounds}{groups}"
+        )
+    }
+
+    fn direct_outbound(tag: &str) -> String {
+        format!("  - tag: \"{tag}\"\n    kind: direct\n")
+    }
+
+    fn proxy_outbound(tag: &str) -> String {
+        format!("  - tag: \"{tag}\"\n    kind: socks5\n    locator: 127.0.0.1:1080\n")
+    }
+
+    #[test]
+    fn duplicate_outbound_tags_are_rejected() {
+        let yaml = yaml_with(
+            &format!("{}{}", proxy_outbound("p1"), proxy_outbound("p1")),
+            "",
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "outbounds[1].tag");
+        assert!(err.reason.contains("duplicate tag 'p1'"), "{err:?}");
+    }
+
+    #[test]
+    fn outbound_and_group_tags_must_be_unique() {
+        let yaml = yaml_with(
+            &proxy_outbound("p1"),
+            "groups:\n  - tag: p1\n    kind: selector\n    candidates: [p1]\n",
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "groups[0].tag");
+        assert!(err.reason.contains("duplicate tag 'p1'"), "{err:?}");
+    }
+
+    #[test]
+    fn reserved_direct_tag_only_allowed_for_direct_outbound() {
+        let yaml = yaml_with(&proxy_outbound("DIRECT"), "");
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "outbounds[0].tag");
+        assert!(err.reason.contains("reserved tag"), "{err:?}");
+
+        let yaml = yaml_with(
+            &proxy_outbound("p1"),
+            "groups:\n  - tag: Direct\n    kind: selector\n    candidates: [p1]\n",
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "groups[0].tag");
+        assert!(err.reason.contains("reserved tag"), "{err:?}");
+
+        let yaml = "schema_version: 1\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: direct\noutbounds:\n  - tag: direct\n    kind: direct\n";
+        assert!(parse(yaml).is_ok());
+    }
+
+    #[test]
+    fn invalid_tag_text_is_rejected() {
+        let yaml = yaml_with(&proxy_outbound(""), "");
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "outbounds[0].tag");
+
+        let yaml = yaml_with(&direct_outbound(" lead"), "");
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "outbounds[0].tag");
+        assert!(err.reason.contains("leading/trailing"), "{err:?}");
+
+        let yaml = yaml_with(&direct_outbound("a b"), "");
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "outbounds[0].tag");
+        assert!(err.reason.contains("whitespace"), "{err:?}");
+
+        let long = "x".repeat(65);
+        let yaml = yaml_with(&direct_outbound(&long), "");
+        let err = parse(&yaml).unwrap_err();
+        assert_eq!(err.field, "outbounds[0].tag");
+        assert!(err.reason.contains("64"), "{err:?}");
     }
 }
