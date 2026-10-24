@@ -17,7 +17,9 @@
 - **结论 3**：AnyTLS 只差跨协议 T2；VLESS 是产品装配 bug；SS 是协议重写；Hy2 是 QPACK 编解码；Trojan 是安全语义 + 共性 T2。
 - **结论 4**：即使修复完成，Trojan/SS 因本 run `UdpEcho` 固定 `NOT_IMPLEMENTED`，上限仍为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（spec E1 规则 6/R11）。
 - **结论 5**：五协议当前均可在产品配置面选择，且无「实验性/未验证」标注；是否继续暴露由产品负责人决定（本 run 不改产品代码）。
-- **优先级**：① P0 安全止血（文档/配置面，0 代码）先公开并限制 Trojan fallback；② P1 transport 批量写（唯一一格修多协议，预期 AnyTLS 首先可用）；③ P2 VLESS fix 合入复验 → Hy2 QPACK Huffman → SS SIP004 AEAD → Trojan fallback 完整语义（依赖/成本/复验口径见 [NEXT-STEPS.md](NEXT-STEPS.md)）。
+- **优先级 1（P0）**：安全止血（文档/配置面，0 代码）——先公开并限制 Trojan fallback。
+- **优先级 2（P1）**：transport 批量写（唯一一格修多协议，预期 AnyTLS 首先可用）。
+- **优先级 3（P2）**：VLESS fix 合入复验 → Hy2 QPACK Huffman → SS SIP004 AEAD → Trojan fallback 完整语义（依赖/成本/复验口径见 [NEXT-STEPS.md](NEXT-STEPS.md)）。
 - **字段**：`verdict` = `VERIFIED`（规则 8，全 required PASS）/ `PARTIAL`（规则 3–7/9，非阻断缺口）/ `BROKEN`（规则 1/2，阻断性 Nexus 失败）；`scope` = `PROTOCOL_SUBSET` / `FULL` / `TCP_ONLY`；`claim` = `USABLE` / `USABLE_WITH_GAPS` / `NOT_USABLE` / `NOT_CLAIMED`；`carrier` = `ProductSocks5`（产品 SOCKS5 出口路径）/ `CrateDirect`（crate 直调，非产品入口）。
 - **规则 1**：失败格（BadCredential/BadConfig）判 FAIL 且表现为有效 echo/静默成功（`E_NEXUS_FRAMING`）或挂死（`E_TIMEOUT_HANG`）→ `BROKEN`。
 - **规则 2**：任一 required 格 FAIL 且 class 属 `E_NEXUS_*` / `E_TIMEOUT_HANG` → `BROKEN`。

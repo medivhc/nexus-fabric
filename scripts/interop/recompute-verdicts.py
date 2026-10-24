@@ -409,10 +409,14 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial):
         "是否继续暴露由产品负责人决定（本 run 不改产品代码）。"
     )
     lines.append(
-        "- **优先级**：① P0 安全止血（文档/配置面，0 代码）先公开并限制 Trojan fallback；"
-        "② P1 transport 批量写（唯一一格修多协议，预期 AnyTLS 首先可用）；"
-        "③ P2 VLESS fix 合入复验 → Hy2 QPACK Huffman → SS SIP004 AEAD → Trojan fallback "
-        "完整语义（依赖/成本/复验口径见 [NEXT-STEPS.md](NEXT-STEPS.md)）。"
+        "- **优先级 1（P0）**：安全止血（文档/配置面，0 代码）——先公开并限制 Trojan fallback。"
+    )
+    lines.append(
+        "- **优先级 2（P1）**：transport 批量写（唯一一格修多协议，预期 AnyTLS 首先可用）。"
+    )
+    lines.append(
+        "- **优先级 3（P2）**：VLESS fix 合入复验 → Hy2 QPACK Huffman → SS SIP004 AEAD → "
+        "Trojan fallback 完整语义（依赖/成本/复验口径见 [NEXT-STEPS.md](NEXT-STEPS.md)）。"
     )
     lines.append(
         "- **字段**：`verdict` = `VERIFIED`（规则 8，全 required PASS）/ `PARTIAL`"
