@@ -397,6 +397,11 @@ impl DirectEgress {
         events
     }
 
+    /// 当前 UDP socket 数（0/1；证明多流共享单 socket）。
+    pub fn udp_socket_count(&self) -> usize {
+        usize::from(self.udp_socket.is_some())
+    }
+
     /// 计数器快照。
     pub fn stats(&self) -> DirectEgressStats {
         self.stats.clone()
