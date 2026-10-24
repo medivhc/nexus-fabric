@@ -32,6 +32,7 @@ Persist / Recover
 - [ARCHITECTURE.md](ARCHITECTURE.md)：核心模型、依赖方向与不变量。
 - [DEVELOPMENT.md](DEVELOPMENT.md)：开发、Contract-First、验证与 Evidence 工作流。
 - [docs/PROJECT-STATUS.md](docs/PROJECT-STATUS.md)：项目当前状态（N1/N2/N3 进展、诚实边界）。
+- [docs/protocols/interop/MATRIX.md](docs/protocols/interop/MATRIX.md)：出站代理协议互操作证据总表（当前五协议均 `BROKEN / NOT_USABLE`）；修复路线见 [NEXT-STEPS.md](docs/protocols/interop/NEXT-STEPS.md)。
 - [docs/DEVELOPMENT-PROCESS.md](docs/DEVELOPMENT-PROCESS.md)：实际开发流程（worktree 纪律、真机验证、独立评审、模型横评）。
 - [harness.toml](harness.toml)：机器可读的工程入口。
 - [policies/](policies/)：架构、依赖与质量门禁。

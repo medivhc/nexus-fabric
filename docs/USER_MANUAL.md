@@ -356,6 +356,11 @@ cargo build --workspace
 
 * **出站适配器**：Shadowsocks（真实 TCP 会话）、VMess（线格式）、Trojan（TLS + 认证 + Standard/Singbox 头格式 + SNI/ALPN/skip-verify 参数）。适配器经 `OutboundAdapter` trait 注入（MODULE.md 冻结契约）。
 
+> **互操作状态注记**：上述是代码级适配器能力，不代表已通过参照实现互操作。
+> 互操作状态见 [出站协议互操作证据总表](protocols/interop/MATRIX.md)：当前五协议
+> （VLESS/AnyTLS/Hysteria2/Trojan/Shadowsocks）均判 `BROKEN / NOT_USABLE`，
+> 且均可在配置面选择但无「实验性/未验证」标注。
+
 * **用户用法**：
 
 
@@ -364,6 +369,10 @@ cargo build --workspace
   * example：`proxy_default_match` / `proxy_rule_set` / `proxy_geoip_rule` / `proxy_geosite_rule` / `proxy_ipcidr_rule` / `proxy_selector_group` / `proxy_urltest_group` / `proxy_loadbalance_group` / `proxy_relay_group` / `proxy_socks5_domain_rule` / `proxy_rule_invalid` / `proxy_shadowsocks_adapter` / `proxy_shadowsocks_real_tcp` / `proxy_vmess_adapter` / `proxy_trojan_adapter`（含 `--scenario rejected` 反例）/ `proxy_clash_subscription_parse` / `proxy_rule_provider_fetch`
 
 * **代码级校验**：`proxy-*` 场景族全部 PASS（default-match 6 /rule-set 8 /geoip-rule 6 /geosite-rule 5 /ipcidr-rule-match 6 /selector 6 /urltest 5 /loadbalance 6 /relay-group 5 /socks5-domain-rule-forward 6 /rule-invalid 4 /shadowsocks-adapter 6 /shadowsocks-real-tcp 5 /vmess-adapter 6 /trojan-adapter 6 /trojan-auth-rejected 6 /trojan-header-format 4 /trojan-node-config 7 /trojan-real-tls-params 6 /clash-subscription-parse 9 /rule-provider-fetch 11）
+
+> **互操作状态注记**：上述 `proxy-*` 是代码级/自洽校验，不等于对参照实现的互操作。
+> 互操作结论见 [出站协议互操作证据总表](protocols/interop/MATRIX.md)（五协议当前均
+> `BROKEN / NOT_USABLE`）。
 
 #### 4.1.11 规则数据注入（geoip.nex/geosite.nex）
 
