@@ -1079,7 +1079,7 @@ pub fn start_in(
             );
         }
     }
-    let exe = match std::env::current_exe() {
+    let exe = match crate::self_exe::stable_self_exe_checked() {
         Ok(e) => e,
         Err(e) => {
             return blocked(
@@ -1538,7 +1538,8 @@ fn ping_sessions(namespace: &Path) -> Value {
 /// `namespace` 通过 env 注入：命令面冻结成四个子命令，多一个对外 flag 就多一个
 /// 可以被场景误钉成"能力"的口子（契约「生命周期」一条已声明这一点）。
 pub fn run_cli(args: &[&str], namespace: &Path, cwd: &Path) -> Result<Value, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("无法定位自身可执行文件: {e}"))?;
+    let exe = crate::self_exe::stable_self_exe_checked()
+        .map_err(|e| format!("无法定位自身可执行文件: {e}"))?;
     let out = std::process::Command::new(&exe)
         .args(args)
         .arg("--json")

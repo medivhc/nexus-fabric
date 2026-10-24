@@ -313,6 +313,9 @@ pub struct VerifyRun {
     pub gates: Vec<Gate>,
     pub scenarios: Vec<ScenarioResult>,
     pub timing: evidence::VerifyTiming,
+    /// 场景门前发现自身映像已被替换（稳定路径建立失败的回退态）：整轮 fail-closed。
+    pub self_exe_replaced: bool,
+    pub self_exe_detail: Option<String>,
 }
 
 /// 门名序列：`whitespace` + fast 声明 + （full 时）full 声明，顺序不变。
@@ -445,6 +448,8 @@ fn execute_verify(
     let mut scenarios: Vec<ScenarioResult> = Vec::new();
     // 共享测试会话：门循环前构造一次，跨门存活（不写 evidence、不跨 run）。
     let mut shared_session = gates::SharedTestSession::new();
+    let mut self_exe_replaced = false;
+    let mut self_exe_detail: Option<String> = None;
 
     let mut invoke = |name: &str, budget: GateBudget| -> Gate {
         gates::timed(|| match name {
@@ -471,24 +476,38 @@ fn execute_verify(
                 budget,
                 global,
             ),
-            "product-scenarios" => scenario_gate_with_budget(
-                config,
-                name,
-                &["product", "engineering", "platform"],
-                artifacts_ref,
-                budget,
-                &timeouts.scenarios,
-                &mut scenarios,
-            ),
-            "regression" => scenario_gate_with_budget(
-                config,
-                name,
-                &["regression"],
-                artifacts_ref,
-                budget,
-                &timeouts.scenarios,
-                &mut scenarios,
-            ),
+            "product-scenarios" => match crate::self_exe::replacement_problem() {
+                Some(problem) => {
+                    self_exe_replaced = true;
+                    self_exe_detail = Some(problem.clone());
+                    self_exe_blocked_gate(name, &problem)
+                }
+                None => scenario_gate_with_budget(
+                    config,
+                    name,
+                    &["product", "engineering", "platform"],
+                    artifacts_ref,
+                    budget,
+                    &timeouts.scenarios,
+                    &mut scenarios,
+                ),
+            },
+            "regression" => match crate::self_exe::replacement_problem() {
+                Some(problem) => {
+                    self_exe_replaced = true;
+                    self_exe_detail = Some(problem.clone());
+                    self_exe_blocked_gate(name, &problem)
+                }
+                None => scenario_gate_with_budget(
+                    config,
+                    name,
+                    &["regression"],
+                    artifacts_ref,
+                    budget,
+                    &timeouts.scenarios,
+                    &mut scenarios,
+                ),
+            },
             "architecture-policy" => gates::architecture_gate(config, budget),
             "dependency-governance" => gates::dependency_gate(repo, config, budget),
             "coverage-summary" => gates::coverage_gate(repo, budget),
@@ -527,7 +546,25 @@ fn execute_verify(
         gates,
         scenarios,
         timing,
+        self_exe_replaced,
+        self_exe_detail,
     }
+}
+
+/// 场景门 fail-closed：稳定路径建立失败（回退原路径）且运行映像已被替换时，
+/// 39 个自调用场景只会产出同签名的伪 FAIL。这里把整轮改成明确诊断的 BLOCKED，
+/// 不把"环境自伤"写成"产品失败"。
+fn self_exe_blocked_gate(name: &str, problem: &str) -> Gate {
+    let mut gate = Gate::blocked(
+        name,
+        &format!(
+            "self_exe_replaced=true: own executable image was replaced mid-run; \
+             refusing to run self-invoking scenarios instead of reporting bogus FAILs: {problem}"
+        ),
+    );
+    // 这不是全局截止导致的跳过，evidence 里不要伪装成 skipped_by_deadline。
+    gate.skipped_by_deadline = false;
+    gate
 }
 
 pub fn verify(sub: &str) -> Outcome {
@@ -579,14 +616,37 @@ pub fn verify(sub: &str) -> Outcome {
             vec![("gates".to_string(), gates_json(&run.gates))],
         );
     }
+    if run.self_exe_replaced {
+        // 场景门前的 fail-closed 探针命中：把事实写进 evidence，而不是只留在内存里。
+        // 独立文件避免改动 evidence.schema.json 的 required 字段集合。
+        let payload = json!({
+            "self_exe_replaced": true,
+            "detail": run.self_exe_detail,
+            "probe": crate::self_exe::describe_json(),
+        });
+        let dir = config.evidence_dir.join(format!("verify-{id}"));
+        let path = dir.join("self_exe.json");
+        if let Err(e) = std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&payload).unwrap_or_default(),
+        ) {
+            eprintln!(
+                "nexus-harness: cannot record self_exe_replaced evidence at {}: {e}",
+                path.display()
+            );
+        }
+    }
 
-    let extras = vec![
+    let mut extras = vec![
         ("gates".to_string(), gates_json(&run.gates)),
         (
             "evidence".to_string(),
             json!({"id": id, "dir": format!("verify-{id}"), "verdict": verdict, "bindings": bindings.to_json()}),
         ),
     ];
+    if run.self_exe_replaced {
+        extras.push(("self_exe_replaced".to_string(), json!(true)));
+    }
     (verdict, message, extras)
 }
 

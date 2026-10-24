@@ -9,6 +9,7 @@ mod gates;
 mod run_scenario;
 mod scenario;
 mod scenario_cmd;
+mod self_exe;
 
 use serde_json::{Value, json};
 use std::process::ExitCode;
@@ -19,6 +20,10 @@ const SCHEMA_VERSION: u32 = 1;
 type Outcome = (String, String, Vec<(String, Value)>);
 
 fn main() -> ExitCode {
+    // 尽早把自身映像固定到同目录私有 hardlink：运行期内任何一次
+    // `cargo build -p nexus-harness` 都会重链 `target/debug/nexus-harness`，
+    // 自调用点若现读 `current_exe()` 会拿到 `(deleted)` 路径（见 self_exe 模块）。
+    self_exe::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let machine = args.iter().any(|a| a == "--json");
     let filtered: Vec<String> = args.iter().filter(|a| *a != "--json").cloned().collect();
@@ -69,6 +74,10 @@ fn main() -> ExitCode {
             emit(format!("  {k}: {v}"));
         }
     }
+
+    // best-effort 清理本进程建立的私有链；被 SIGKILL 时残留由下次启动的
+    // `self_exe::init()` 按 pid 存活情况回收。
+    self_exe::cleanup();
 
     match outcome.0.as_str() {
         "FAIL" => ExitCode::from(1),

@@ -498,7 +498,7 @@ pub fn selftest(args: &[String]) -> Outcome {
         );
     }
     let with_query = args.iter().any(|a| a == "--with-query");
-    let exe = match std::env::current_exe() {
+    let exe = match crate::self_exe::stable_self_exe_checked() {
         Ok(p) => p,
         Err(e) => {
             return (
@@ -1194,7 +1194,7 @@ fn serve_exit_shape(input: &[u8], extra_args: &[String]) -> ExitShape {
         stdout_pure: false,
         detail,
     };
-    let exe = match std::env::current_exe() {
+    let exe = match crate::self_exe::stable_self_exe_checked() {
         Ok(p) => p,
         Err(e) => return failed(format!("定位自身可执行文件失败：{e}")),
     };
@@ -1301,7 +1301,7 @@ fn override_proof_honored(code: &str, reason: &str, bogus_path: &str) -> bool {
 /// 兜底文案（不含具体路径）无法满足断言，假绿被排除；代价是没有 RA 的宿主上本探针会
 /// 如实变红，这是正确行为而不是缺陷 —— 它测的就是 flag 有没有被兑现。
 fn provider_override_probe() -> (bool, String) {
-    let exe = match std::env::current_exe() {
+    let exe = match crate::self_exe::stable_self_exe_checked() {
         Ok(p) => p,
         Err(e) => return (false, format!("定位自身可执行文件失败：{e}")),
     };
