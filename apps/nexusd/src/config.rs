@@ -85,6 +85,17 @@ pub struct DaemonConfig {
     pub turn: Option<TurnSection>,
     /// `[network.proxy]` 小节：fabric-over-proxy 代理配置（缺失 = 不启用）。
     pub proxy: Option<ProxySection>,
+    /// `[network.punch]` 小节：NAT 打洞配置（缺失 = 全默认）。
+    pub punch: PunchSection,
+    /// `[network.identity]` 小节：fabric ed25519 身份种子文件（BLOCKED-1 (a)）。
+    pub identity: IdentitySection,
+}
+
+/// `[network.identity]`：daemon 的 fabric ed25519 seed 来源。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdentitySection {
+    /// Ed25519 seed 文件路径（64 hex 字符；权限必须 0600）。
+    pub seed_file: Option<String>,
 }
 
 /// `daemon.toml` 的 `[tun]` 小节（no-tun 模式，`docs/WINDOWS_TUN_DESIGN.md` §1）。
@@ -133,6 +144,8 @@ pub struct TurnSection {
     /// 第二 STUN 探测服务器（可选；用于双服务器 NAT 类型对比检测，
     /// AC4/D2；缺失时只做单服务器采样，`nat_type` 保持 `Unknown`）。
     pub stun_server2: Option<String>,
+    /// TURN 客户端的本地绑定地址（生产 `0.0.0.0:0`）。
+    pub bind_addr: String,
 }
 
 impl Default for TurnSection {
@@ -145,6 +158,7 @@ impl Default for TurnSection {
             refresh_interval_sec: 300,
             stun_server: None,
             stun_server2: None,
+            bind_addr: "0.0.0.0:0".to_string(),
         }
     }
 }
@@ -324,6 +338,8 @@ pub fn load(dir: &ConfigDir) -> Result<LoadedConfig, String> {
             tun: TunSection::default(),
             turn: None,
             proxy: None,
+            punch: PunchSection::default(),
+            identity: IdentitySection::default(),
         },
         ..Default::default()
     };
@@ -395,6 +411,8 @@ fn parse_daemon_toml(text: &str) -> Result<DaemonConfig, String> {
         tun: TunSection::default(),
         turn: None,
         proxy: None,
+        punch: PunchSection::default(),
+        identity: IdentitySection::default(),
     };
     // 支持 `localapi_addr = "..."` 或 `[localapi] addr = "..."`
     if let Some(s) = v.get("localapi_addr").and_then(|x| x.as_str()) {
@@ -426,6 +444,27 @@ fn parse_daemon_toml(text: &str) -> Result<DaemonConfig, String> {
     // [network.proxy] 小节（可选；缺失 = 不启用，不报错）
     if let Some(t) = v.get("network").and_then(|n| n.get("proxy")) {
         cfg.proxy = Some(parse_proxy_section(t)?);
+    }
+    // [network.identity] 小节（可选；缺失 = 无 seed）
+    if let Some(t) = v.get("network").and_then(|n| n.get("identity")) {
+        let seed_file = match t.get("seed_file") {
+            None => None,
+            Some(x) => Some(
+                x.as_str()
+                    .ok_or_else(|| {
+                        format!("{DAEMON_TOML}: [network.identity].seed_file must be a string")
+                    })?
+                    .to_string(),
+            ),
+        };
+        cfg.identity = IdentitySection { seed_file };
+    }
+    // [network.punch] 小节（可选；缺失 = 默认值）
+    if let Some(t) = v.get("network").and_then(|n| n.get("punch")) {
+        cfg.punch = parse_punch_section(t)?;
+        cfg.punch
+            .validate()
+            .map_err(|e| format!("{DAEMON_TOML}: [network.punch] {e}"))?;
     }
     Ok(cfg)
 }
@@ -487,6 +526,17 @@ fn parse_turn_section(t: &toml::Value) -> Result<TurnSection, String> {
     };
     let stun_server = opt_server("stun_server")?;
     let stun_server2 = opt_server("stun_server2")?;
+    let bind_addr = match t.get("bind_addr") {
+        None => "0.0.0.0:0".to_string(),
+        Some(x) => {
+            let addr = x.as_str().ok_or_else(|| {
+                format!("{DAEMON_TOML}: [network.turn].bind_addr must be a string")
+            })?;
+            addr.parse::<std::net::SocketAddr>()
+                .map_err(|e| format!("{DAEMON_TOML}: [network.turn].bind_addr invalid: {e}"))?;
+            addr.to_string()
+        }
+    };
     Ok(TurnSection {
         server,
         realm,
@@ -495,6 +545,7 @@ fn parse_turn_section(t: &toml::Value) -> Result<TurnSection, String> {
         refresh_interval_sec,
         stun_server,
         stun_server2,
+        bind_addr,
     })
 }
 
@@ -975,6 +1026,285 @@ pub fn classify_change(old: &LoadedConfig, new: &LoadedConfig) -> ChangeKind {
         }
     }
     ChangeKind::Hot
+}
+
+/// `[network.punch]` 配置小节（spec §14.4/§15；26 字段）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PunchSection {
+    pub enabled: bool,
+    pub punch_timeout_ms: u64,
+    pub coord_skew_ms: u64,
+    pub spray_k: u8,
+    pub spray_interval_ms: u64,
+    pub spray_time_budget_ms: u64,
+    pub repunch_interval_sec: u64,
+    pub repunch_jitter_sec: u64,
+    pub repunch_on_reflexive_change: bool,
+    pub repunch_on_relay_degradation: bool,
+    pub prediction_samples: u8,
+    pub max_sample_age_sec: u64,
+    pub max_stable_delta: u16,
+    pub mapping_probe_count: u8,
+    pub mapping_probe_interval_ms: u64,
+    pub relay_provider_enabled: bool,
+    pub hysteresis_pct: f64,
+    pub switch_hold_ms: u64,
+    pub boost_hysteresis_pct: f64,
+    pub boost_hold_ms: u64,
+    pub probe_active_ms: u64,
+    pub probe_backup_ms: u64,
+    pub max_missed_probes: u32,
+    pub cost_direct: f64,
+    pub cost_turn: f64,
+    pub cost_peer_relay: f64,
+}
+
+impl Default for PunchSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            punch_timeout_ms: 5_000,
+            coord_skew_ms: 200,
+            spray_k: 16,
+            spray_interval_ms: 50,
+            spray_time_budget_ms: 3_000,
+            repunch_interval_sec: 300,
+            repunch_jitter_sec: 0,
+            repunch_on_reflexive_change: true,
+            repunch_on_relay_degradation: true,
+            prediction_samples: 3,
+            max_sample_age_sec: 900,
+            max_stable_delta: 8,
+            mapping_probe_count: 3,
+            mapping_probe_interval_ms: 50,
+            relay_provider_enabled: true,
+            hysteresis_pct: 0.20,
+            switch_hold_ms: 3_000,
+            boost_hysteresis_pct: 0.10,
+            boost_hold_ms: 1_000,
+            probe_active_ms: 1_000,
+            probe_backup_ms: 5_000,
+            max_missed_probes: 3,
+            cost_direct: 0.0,
+            cost_turn: 5.0,
+            cost_peer_relay: 2.0,
+        }
+    }
+}
+
+impl PunchSection {
+    /// Validate the external file-boundary values (no silent clamping).
+    pub fn validate(&self) -> Result<(), nexus_nat_traversal::PunchConfigError> {
+        use nexus_nat_traversal::PunchConfigError;
+        let checks: [(&'static str, i64, i64, i64); 18] = [
+            (
+                "punch_timeout_ms",
+                self.punch_timeout_ms as i64,
+                500,
+                30_000,
+            ),
+            ("coord_skew_ms", self.coord_skew_ms as i64, 0, 2_000),
+            ("spray_k", i64::from(self.spray_k), 1, 32),
+            ("spray_interval_ms", self.spray_interval_ms as i64, 10, 500),
+            (
+                "spray_time_budget_ms",
+                self.spray_time_budget_ms as i64,
+                500,
+                10_000,
+            ),
+            (
+                "repunch_interval_sec",
+                self.repunch_interval_sec as i64,
+                60,
+                3_600,
+            ),
+            ("repunch_jitter_sec", self.repunch_jitter_sec as i64, 0, 60),
+            (
+                "prediction_samples",
+                i64::from(self.prediction_samples),
+                3,
+                8,
+            ),
+            (
+                "max_sample_age_sec",
+                self.max_sample_age_sec as i64,
+                60,
+                3_600,
+            ),
+            ("max_stable_delta", i64::from(self.max_stable_delta), 1, 64),
+            (
+                "mapping_probe_count",
+                i64::from(self.mapping_probe_count),
+                1,
+                5,
+            ),
+            (
+                "mapping_probe_interval_ms",
+                self.mapping_probe_interval_ms as i64,
+                10,
+                500,
+            ),
+            (
+                "hysteresis_pct",
+                (self.hysteresis_pct * 100.0) as i64,
+                0,
+                100,
+            ),
+            ("switch_hold_ms", self.switch_hold_ms as i64, 0, 60_000),
+            (
+                "boost_hysteresis_pct",
+                (self.boost_hysteresis_pct * 100.0) as i64,
+                0,
+                100,
+            ),
+            ("boost_hold_ms", self.boost_hold_ms as i64, 0, 60_000),
+            ("probe_active_ms", self.probe_active_ms as i64, 100, 60_000),
+            (
+                "max_missed_probes",
+                i64::from(self.max_missed_probes),
+                1,
+                10,
+            ),
+        ];
+        for (field, value, min, max) in checks {
+            if value < min || value > max {
+                return Err(PunchConfigError::OutOfRange {
+                    field,
+                    value,
+                    min,
+                    max,
+                });
+            }
+        }
+        if self.probe_backup_ms < self.probe_active_ms || self.probe_backup_ms > 60_000 {
+            return Err(PunchConfigError::OutOfRange {
+                field: "probe_backup_ms",
+                value: self.probe_backup_ms as i64,
+                min: self.probe_active_ms as i64,
+                max: 60_000,
+            });
+        }
+        for (field, v) in [
+            ("cost_direct", self.cost_direct),
+            ("cost_turn", self.cost_turn),
+            ("cost_peer_relay", self.cost_peer_relay),
+        ] {
+            if !(0.0..=10.0).contains(&v) {
+                return Err(PunchConfigError::OutOfRange {
+                    field,
+                    value: v as i64,
+                    min: 0,
+                    max: 10,
+                });
+            }
+        }
+        if self.spray_time_budget_ms > self.punch_timeout_ms {
+            return Err(PunchConfigError::InvalidCombination {
+                field: "spray_time_budget_ms",
+                reason: "spray time budget cannot exceed punch_timeout_ms",
+            });
+        }
+        let window = 2u64 * u64::from(self.spray_k) * self.spray_interval_ms;
+        if window > self.spray_time_budget_ms {
+            return Err(PunchConfigError::InvalidCombination {
+                field: "spray_interval_ms",
+                reason: "spray window cannot fit in spray_time_budget_ms",
+            });
+        }
+        Ok(())
+    }
+
+    pub fn to_punch_config(&self) -> nexus_nat_traversal::PunchConfig {
+        use std::time::Duration;
+        nexus_nat_traversal::PunchConfig {
+            punch_timeout: Duration::from_millis(self.punch_timeout_ms),
+            coord_skew_ms: self.coord_skew_ms,
+            spray_k: self.spray_k,
+            spray_interval_ms: self.spray_interval_ms,
+            spray_time_budget: Duration::from_millis(self.spray_time_budget_ms),
+            repunch_interval: Duration::from_secs(self.repunch_interval_sec),
+            repunch_jitter: Duration::from_secs(self.repunch_jitter_sec),
+            prediction_samples: self.prediction_samples,
+            max_sample_age: Duration::from_secs(self.max_sample_age_sec),
+            max_stable_delta: self.max_stable_delta,
+            mapping_probe_count: self.mapping_probe_count,
+            mapping_probe_interval_ms: self.mapping_probe_interval_ms,
+        }
+    }
+
+    pub fn to_path_config(&self) -> nexus_path::PathConfig {
+        nexus_path::PathConfig {
+            hysteresis_pct: self.hysteresis_pct,
+            switch_hold_ms: self.switch_hold_ms,
+            probe_interval_ms: self.probe_active_ms,
+            ewma_alpha: 0.3,
+            max_missed_probes: self.max_missed_probes,
+            race_budget: nexus_path::RaceBudget::default(),
+        }
+    }
+}
+
+fn parse_punch_section(t: &toml::Value) -> Result<PunchSection, String> {
+    let mut p = PunchSection::default();
+    let err = |f: &str| format!("{DAEMON_TOML}: [network.punch].{f} invalid");
+    macro_rules! get_bool {
+        ($f:ident) => {
+            if let Some(x) = t.get(stringify!($f)) {
+                p.$f = x.as_bool().ok_or_else(|| err(stringify!($f)))?;
+            }
+        };
+    }
+    macro_rules! get_num {
+        ($f:ident, $ty:ty) => {
+            if let Some(x) = t.get(stringify!($f)) {
+                p.$f = x
+                    .as_integer()
+                    .and_then(|i| <$ty>::try_from(i).ok())
+                    .ok_or_else(|| err(stringify!($f)))?;
+            }
+        };
+    }
+    macro_rules! get_float {
+        ($f:ident) => {
+            if let Some(x) = t.get(stringify!($f)) {
+                p.$f = x.as_float().ok_or_else(|| err(stringify!($f)))?;
+            }
+        };
+    }
+    get_bool!(enabled);
+    get_num!(punch_timeout_ms, u64);
+    get_num!(coord_skew_ms, u64);
+    get_num!(spray_k, u8);
+    get_num!(spray_interval_ms, u64);
+    get_num!(spray_time_budget_ms, u64);
+    get_num!(repunch_interval_sec, u64);
+    get_num!(repunch_jitter_sec, u64);
+    get_bool!(repunch_on_reflexive_change);
+    get_bool!(repunch_on_relay_degradation);
+    get_num!(prediction_samples, u8);
+    get_num!(max_sample_age_sec, u64);
+    get_num!(max_stable_delta, u16);
+    get_num!(mapping_probe_count, u8);
+    get_num!(mapping_probe_interval_ms, u64);
+    get_bool!(relay_provider_enabled);
+    get_float!(hysteresis_pct);
+    get_num!(switch_hold_ms, u64);
+    get_float!(boost_hysteresis_pct);
+    get_num!(boost_hold_ms, u64);
+    get_num!(probe_active_ms, u64);
+    get_num!(probe_backup_ms, u64);
+    get_num!(max_missed_probes, u32);
+    get_float!(cost_direct);
+    get_float!(cost_turn);
+    get_float!(cost_peer_relay);
+    p.validate().map_err(|e| {
+        let field = match &e {
+            nexus_nat_traversal::PunchConfigError::OutOfRange { field, .. } => *field,
+            nexus_nat_traversal::PunchConfigError::InvalidCombination { field, .. } => *field,
+        };
+        format!("{DAEMON_TOML}: [network.punch].{field} {e}")
+    })?;
+    Ok(p)
 }
 
 #[cfg(test)]

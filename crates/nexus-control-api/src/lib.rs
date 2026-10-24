@@ -29,6 +29,8 @@ pub enum ControlCommand {
     ConnectivityProbe { target: String },
     /// `connectivity links`：活动链路。
     ConnectivityLinks,
+    /// `connectivity nat`：NAT 穿透状态（可带 `--peer <hex>` 过滤）。
+    ConnectivityNat { peer: Option<String> },
     /// `dns status`：DNS 子系统状态。
     DnsStatus,
     /// `dns resolve`：解析域名。

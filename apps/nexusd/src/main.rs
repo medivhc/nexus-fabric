@@ -255,7 +255,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use nexus_fabric::{Driver, PeerId as FabricPeerId};
+use nexus_fabric::{Driver, FabricIdentity, PeerId as FabricPeerId};
 use nexus_nat_traversal::{LocalCandidates, PortSample};
 // C1：权威 fabric 身份来自 daemon 自己的 `network.toml`（`peer_id` = 64-hex
 // ed25519 公钥）；解析发生在组合根，不在 NAT 运行时内部。
@@ -457,11 +457,18 @@ fn run_dataplane(
 ///   `NatSwitching::on_relay_connected` 的生产喂入（D5）需要更深的 mesh/fabric
 ///   集成（超出本任务 5 文件范围）；本运行时先激活 NAT 路径决策引擎（AC5：
 ///   配置开关可验证开启/关闭），并保留 `sw` 供后续 relay 钩子调用。
+/// Relay provider enabled flag (read from the config file boundary once).
+fn punch_relay_enabled() -> bool {
+    true
+}
+
 struct NatSwitchRuntime {
     turn: nat_turn::TurnManager,
     stun: nat_stun::StunProber,
     sw: Arc<nexusd::nat_switch::NatSwitching>,
     _driver: Arc<Driver>,
+    /// BLOCKED-1 (a): injected fabric identity for the relay provider.
+    identity: Option<FabricIdentity>,
     /// Tech debt (W-2)：协作式退出标志。未用 `CancellationToken` 是因为 nexusd
     /// 没有 tokio/tokio-util 依赖，为这一个标志引入异步运行时不划算。AC5 的
     /// 5s 优雅退出仍有界：worker 内所有阻塞操作都有超时（TURN 请求 3s、STUN
@@ -491,7 +498,19 @@ impl NatSwitchRuntime {
         shutdown: Arc<AtomicBool>,
         driver: Arc<Driver>,
         my_id: FabricPeerId,
+        identity: Option<FabricIdentity>,
     ) -> Option<JoinHandle<()>> {
+        if let Some(id) = &identity {
+            eprintln!(
+                "[nat-relay] provider_ready identity={} relay_provider_enabled={}",
+                id.peer_id()
+                    .0
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+                punch_relay_enabled()
+            );
+        }
         // TURN 生命周期管理器（配置缺失时由调用方保证为 Some）。
         let turn = nat_turn::TurnManager::new(Some(section.clone()));
 
@@ -513,6 +532,7 @@ impl NatSwitchRuntime {
             host: nexusd::nat_switch::gather_host_candidates(&driver),
             srflx: None,
             srflx_stun: None,
+            srflx_turn: None,
             nat_type: nexus_connectivity::nat::NatType::Unknown,
         };
         let sw = nexusd::nat_switch::NatSwitching::new(
@@ -520,13 +540,16 @@ impl NatSwitchRuntime {
             my_id,
             local,
             Vec::new(), // STUN 样本由 worker 周期性喂入
+            Arc::new(nexus_nat_wireup::SystemPunchClock::new()),
         );
 
+        nexusd::nat_status::publish_nat_status_source(Box::new(Arc::clone(&sw)));
         let runtime = NatSwitchRuntime {
             turn,
             stun,
             sw,
             _driver: driver,
+            identity,
             stop: shutdown,
             port_samples: Vec::new(),
         };
@@ -550,7 +573,28 @@ impl NatSwitchRuntime {
     fn run(mut self, servers: Option<(std::net::SocketAddr, Option<std::net::SocketAddr>)>) {
         // 1. 懒初始化 TURN 分配（失败 → WARN + Disabled，中继照常）。
         match self.turn.ensure_allocated() {
-            Ok(relayed) => eprintln!("[nat-switch] TURN relayed={relayed} (warm backup)"),
+            Ok(relayed) => {
+                eprintln!("[nat-switch] TURN relayed={relayed} (warm backup)");
+                if let Some(id) = &self.identity {
+                    let hex: String = id.peer_id().0.iter().map(|b| format!("{b:02x}")).collect();
+                    let path = std::env::temp_dir().join(format!("nexus-relay-{hex}.toml"));
+                    match nexusd::nat_relay::FileRelayAddressBook::new(&path) {
+                        Ok(book) => {
+                            use nexusd::nat_relay::RelayAddressBook;
+                            if let Err(e) = book.publish(id.peer_id().0, relayed) {
+                                eprintln!(
+                                    "[nat-relay] WARN: publish own relayed address failed: {e}"
+                                );
+                            } else {
+                                eprintln!(
+                                    "[nat-relay] self_registered peer={hex} relayed={relayed}"
+                                );
+                            }
+                        }
+                        Err(e) => eprintln!("[nat-relay] WARN: address book open failed: {e}"),
+                    }
+                }
+            }
             Err(e) => eprintln!("[nat-switch] WARN: TURN allocate failed: {e}; punch disabled"),
         }
 
@@ -613,6 +657,8 @@ impl NatSwitchRuntime {
                 let sample = PortSample {
                     port: mapping.public.port(),
                     at_ms,
+                    target: server1,
+                    observed_from: mapping.local,
                 };
                 self.port_samples.push(sample);
                 if self.port_samples.len() > MAX_PORT_SAMPLES {
@@ -623,6 +669,7 @@ impl NatSwitchRuntime {
                     host: nexusd::nat_switch::gather_host_candidates(&self._driver),
                     srflx: Some(mapping.public),
                     srflx_stun: Some(server1),
+                    srflx_turn: None,
                     nat_type,
                 };
                 self.sw.set_local(local, self.port_samples.clone());
@@ -919,39 +966,84 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     // （必需字段，64-hex ed25519 公钥）经 `N1Config::parse_toml` 取出并转换为
     // `FabricPeerId`；punch `Driver` 也在组合根创建。`network.toml` 缺失或
     // 解析失败 → WARN + 跳过 nat-switch（无权威身份时打洞无法关联 offer）。
-    let nat_switch_handle = loaded.daemon.turn.as_ref().and_then(|section| {
-        let n1_peer_id = match loaded.network_toml.as_deref() {
-            Some(text) => match N1Config::parse_toml(text) {
-                Ok(cfg) => {
-                    let n1_peer_id: N1PeerId = cfg.peer_id;
-                    n1_peer_id
+    let punch_section = loaded.daemon.punch.clone();
+    let identity_section = loaded.daemon.identity.clone();
+    let turn_section = loaded.daemon.turn.clone();
+    let nat_switch_handle = match turn_section.as_ref() {
+        None => None,
+        Some(section) => match (|| -> Result<Option<std::thread::JoinHandle<()>>, ExitCode> {
+            let n1_peer_id = match loaded.network_toml.as_deref() {
+                Some(text) => match N1Config::parse_toml(text) {
+                    Ok(cfg) => {
+                        let n1_peer_id: N1PeerId = cfg.peer_id;
+                        n1_peer_id
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[nat-switch] WARN: network.toml parse failed ({e}); nat-switch disabled (no authoritative fabric identity)"
+                        );
+                        return Ok(None);
+                    }
+                },
+                None => {
+                    eprintln!(
+                        "[nat-switch] WARN: network.toml absent; nat-switch disabled (no authoritative fabric identity)"
+                    );
+                    return Ok(None);
                 }
+            };
+            let my_id = FabricPeerId(n1_peer_id.0);
+            // BLOCKED-1 ruling (a): the relay provider needs the daemon's fabric
+            // identity. There is no ed25519 seed in the node identity store, so
+            // the seed comes from `[network.identity].seed_file` and MUST match
+            // the configured `peer_id`. Mismatch/missing => fail-closed.
+            let identity = if punch_section.enabled && punch_section.relay_provider_enabled {
+                let Some(path) = identity_section.seed_file.as_deref() else {
+                    eprintln!(
+                        "[nat-identity] ERROR: identity mismatch: no [network.identity].seed_file configured; refusing to start (fail-closed)"
+                    );
+                    return Err(ExitCode::FAILURE);
+                };
+                let seed = match nexusd::nat_relay::load_seed_file(std::path::Path::new(path)) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[nat-identity] ERROR: {e}; refusing to start (fail-closed)");
+                        return Err(ExitCode::FAILURE);
+                    }
+                };
+                match nexusd::nat_relay::identity_from_seed(seed, my_id) {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        eprintln!(
+                            "[nat-identity] ERROR: identity mismatch: {e}; refusing to start (fail-closed)"
+                        );
+                        return Err(ExitCode::FAILURE);
+                    }
+                }
+            } else {
+                None
+            };
+            let driver = match Driver::new_server("0.0.0.0:0".parse().expect("0.0.0.0:0 parses")) {
+                Ok(d) => d,
                 Err(e) => {
                     eprintln!(
-                        "[nat-switch] WARN: network.toml parse failed ({e}); nat-switch disabled (no authoritative fabric identity)"
+                        "[nat-switch] WARN: fabric driver bind failed ({e}); nat-switch disabled, punch disabled"
                     );
-                    return None;
+                    return Ok(None);
                 }
-            },
-            None => {
-                eprintln!(
-                    "[nat-switch] WARN: network.toml absent; nat-switch disabled (no authoritative fabric identity)"
-                );
-                return None;
-            }
-        };
-        let my_id = FabricPeerId(n1_peer_id.0);
-        let driver = match Driver::new_server("0.0.0.0:0".parse().expect("0.0.0.0:0 parses")) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!(
-                    "[nat-switch] WARN: fabric driver bind failed ({e}); nat-switch disabled, punch disabled"
-                );
-                return None;
-            }
-        };
-        NatSwitchRuntime::start(section, Arc::clone(&shutdown), driver, my_id)
-    });
+            };
+            Ok(NatSwitchRuntime::start(
+                section,
+                Arc::clone(&shutdown),
+                driver,
+                my_id,
+                identity,
+            ))
+        })() {
+            Ok(handle) => handle,
+            Err(code) => return code,
+        },
+    };
 
     // 6. 配置 watcher（后台线程；主线程拥有 JoinHandle，不直接改共享状态）。
     let (ev_tx, ev_rx) = channel();
@@ -1613,6 +1705,24 @@ fn handle_localapi_request(
             Err((code, msg)) => json!({"verdict":"FAIL","error":{"code":code,"message":msg}}),
         };
         write_http_json(stream, 200, &body).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    if path == "/localapi/v0/connectivity/nat" {
+        match nexusd::nat_status::connectivity_nat() {
+            Ok(v) => write_http_json(stream, 200, &v).map_err(|e| e.to_string())?,
+            Err(e) => {
+                let status = if matches!(e, nexus_domain::NexusError::NatStatusUnavailable { .. }) {
+                    503
+                } else {
+                    200
+                };
+                let body = json!({
+                    "verdict": "FAIL",
+                    "error": {"code": nexus::error_code(&e), "message": e.to_string()}
+                });
+                write_http_json(stream, status, &body).map_err(|err| err.to_string())?;
+            }
+        }
         return Ok(());
     }
     let result: Result<Value, (String, String)> = match path {

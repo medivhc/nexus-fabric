@@ -249,6 +249,7 @@ pub fn route_for(command: &ControlCommand) -> Option<&'static str> {
         ControlCommand::DnsStatus => Some("/localapi/v0/dns/status"),
         ControlCommand::DnsCache => Some("/localapi/v0/dns/cache"),
         ControlCommand::ConnectivityStatus => Some("/localapi/v0/connectivity/status"),
+        ControlCommand::ConnectivityNat { .. } => Some("/localapi/v0/connectivity/nat"),
         ControlCommand::PlatformCapabilities => Some("/localapi/v0/platform/capabilities"),
         // 带参数命令走动态路由（query string），静态路由无。
         ControlCommand::SessionWatch { .. }
@@ -333,6 +334,7 @@ pub fn command_name(command: &ControlCommand) -> &'static str {
         ControlCommand::ConnectivityCandidates => "connectivity candidates",
         ControlCommand::ConnectivityProbe { .. } => "connectivity probe",
         ControlCommand::ConnectivityLinks => "connectivity links",
+        ControlCommand::ConnectivityNat { .. } => "connectivity nat",
         ControlCommand::DnsStatus => "dns status",
         ControlCommand::DnsResolve { .. } => "dns resolve",
         ControlCommand::DnsProviders => "dns providers",
