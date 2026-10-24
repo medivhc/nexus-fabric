@@ -329,6 +329,7 @@ pub fn origin_tag(origin: FlowOrigin) -> &'static str {
         FlowOrigin::Http => "http",
         FlowOrigin::VirtualPacketInterface => "virtual-packet-interface",
         FlowOrigin::NativeApi => "native-api",
+        FlowOrigin::TransparentSocket => "transparent-socket",
     }
 }
 
@@ -1261,12 +1262,22 @@ groups:
         assert_eq!(d.group_type.as_deref(), Some("selector"));
     }
 
+    #[test]
+    fn origin_tag_covers_transparent_socket() {
+        assert_eq!(
+            origin_tag(FlowOrigin::TransparentSocket),
+            "transparent-socket"
+        );
+        assert_eq!(origin_tag(FlowOrigin::Socks5), "socks5");
+    }
+
     fn nexus_domain_flow(dest: &str) -> FlowContext {
         FlowContext {
             origin: FlowOrigin::Socks5,
             resource: nexus_domain::ResourceId("internet-access".into()),
             destination: dest.to_string(),
             profile: String::new(),
+            egress_hint: None,
         }
     }
 

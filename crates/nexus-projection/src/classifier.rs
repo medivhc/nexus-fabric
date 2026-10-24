@@ -154,6 +154,7 @@ impl<'a> PacketClassifier<'a> {
             resource,
             destination,
             profile: profile.to_string(),
+            egress_hint: None,
         })
     }
 }

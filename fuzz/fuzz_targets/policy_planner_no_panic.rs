@@ -32,6 +32,7 @@ fuzz_target!(|data: &[u8]| {
         resource: ResourceId("internet-access".into()),
         destination: format!("https://{}.example/", byte(data, 1) % 10),
         profile: profile.clone(),
+        egress_hint: None,
     };
     let rules: Vec<PolicyRule> = data
         .chunks(3)

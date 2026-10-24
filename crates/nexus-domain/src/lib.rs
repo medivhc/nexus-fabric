@@ -303,6 +303,8 @@ pub enum FlowOrigin {
     Http,
     /// 进程内 Native API 直接提交。
     NativeApi,
+    /// 已 accept 的透明 socket（TPROXY / TUN 前端；平台实现在 nexus-platform-*）。
+    TransparentSocket,
 }
 
 /// 中立流量上下文。
@@ -320,6 +322,8 @@ pub struct FlowContext {
     pub destination: String,
     /// 使用画像，供 Policy 展开为 Intent。
     pub profile: String,
+    /// 规则命中的出站 tag 提示（非身份/资源语义，只影响快照候选；spec §7.4）。
+    pub egress_hint: Option<String>,
 }
 
 // ---------- Plan / PlanExtension ----------
@@ -1268,6 +1272,7 @@ mod tests {
             resource: ResourceId("internet-access".into()),
             destination: "https://example.invalid/".into(),
             profile: "Balanced".into(),
+            egress_hint: None,
         };
         assert_eq!(flow.origin, FlowOrigin::Socks5);
         // 中立上下文不携带 Path/Provider 决策字段。

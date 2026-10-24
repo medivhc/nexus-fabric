@@ -190,6 +190,7 @@ impl SessionManager {
                 key.dst_ip[0], key.dst_ip[1], key.dst_ip[2], key.dst_ip[3], key.dst_port
             ),
             profile: "Balanced".into(),
+            egress_hint: None,
         };
         let outcome = match run_first_packet_chain(&flow, deps) {
             Ok(o) => o,
@@ -702,6 +703,7 @@ mod tests {
             resource: ResourceId("internet-access".into()),
             destination: "93.184.216.34:443".into(),
             profile: "Balanced".into(),
+            egress_hint: None,
         };
         let mut chain_times = Vec::with_capacity(1000);
         for _ in 0..1000 {

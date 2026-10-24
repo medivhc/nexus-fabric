@@ -360,6 +360,7 @@ mod tests {
             resource: ResourceId("internet-access".into()),
             destination: destination.into(),
             profile: profile.into(),
+            egress_hint: None,
         }
     }
 
