@@ -83,6 +83,10 @@ impl DomainMatch {
 /// 3b-3: domain rules (`Exact`/`Suffix`/`Keyword`). When `req.domain` is
 /// `Some`, domain rules are consulted first (exact > suffix > keyword,
 /// S16); a domain miss falls back to the IP rules.
+///
+/// **默认实现边界（spec §6 D2.3）**：仅当没有 `proxy.yaml` 时使用；存在
+/// `proxy.yaml` 时组合根必须注入 `nexus_proxy::DomainRuleEngine`。全仓
+/// `nexus_domain::RuleEngine` 实现只允许这两个（S16 E1 门禁）。
 pub struct SimpleRuleEngine {
     rules: Vec<Rule>,
     domain_rules: Vec<DomainRule>,
