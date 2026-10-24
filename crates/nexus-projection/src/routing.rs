@@ -52,6 +52,17 @@ impl Cidr {
     }
 }
 
+impl std::fmt::Display for Cidr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}/{}",
+            std::net::Ipv4Addr::from(self.network),
+            self.prefix
+        )
+    }
+}
+
 /// Parse `"10.0.0.0/8"` style CIDR notation.
 impl FromStr for Cidr {
     type Err = String;

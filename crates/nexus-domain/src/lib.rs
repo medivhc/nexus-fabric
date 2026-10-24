@@ -1072,17 +1072,54 @@ pub struct RouteRequest<'a> {
     pub process_name: Option<&'a str>,
 }
 
+/// 规则命中说明（可观测性；`matched_rule` 为稳定文本，`rule_kind` 为规则类别）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleExplanation {
+    /// 命中的规则原文（如 `DOMAIN-SUFFIX,example.com`）。
+    pub matched_rule: String,
+    /// 规则类别（如 `DOMAIN-SUFFIX` / `IP-CIDR`）。
+    pub rule_kind: String,
+}
+
 /// 规则引擎 trait：输入路由请求，输出统一路由决策。
 ///
 /// P0 由 `SimpleRuleEngine`（IP/CIDR/端口）实现；P1+ 可替换为完整版
 /// （域名/geoip/进程），trait 签名不变。
 pub trait RuleEngine: Send + Sync {
     fn decide(&self, req: &RouteRequest) -> RouteTarget;
+
+    /// 返回决策与命中规则说明；默认实现不提供说明（`None`），
+    /// 不改变 `decide` 语义。
+    fn explain(&self, req: &RouteRequest) -> (RouteTarget, Option<RuleExplanation>) {
+        (self.decide(req), None)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rule_engine_explain_defaults_to_none() {
+        struct OnlyDecide;
+        impl RuleEngine for OnlyDecide {
+            fn decide(&self, _req: &RouteRequest) -> RouteTarget {
+                RouteTarget::Drop
+            }
+        }
+        let pkt = [0u8; 20];
+        let req = RouteRequest {
+            packet: &pkt,
+            domain: None,
+            src_port: None,
+            dst_port: None,
+            process_name: None,
+        };
+        assert_eq!(OnlyDecide.decide(&req), RouteTarget::Drop);
+        let (target, explanation) = OnlyDecide.explain(&req);
+        assert_eq!(target, RouteTarget::Drop);
+        assert!(explanation.is_none());
+    }
 
     fn sample_plan() -> Plan {
         Plan {
