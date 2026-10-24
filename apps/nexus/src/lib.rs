@@ -4519,14 +4519,52 @@ fn vless_handshake_stream<S: std::io::Read + std::io::Write>(
             provider: ProviderId(tag.to_string()),
             reason: format!("vless handshake flush failed: {e}"),
         })?;
-    let inner = vc.into_inner();
-    let _resp = nexus_outbound_vless::read_response(inner).map_err(|e| {
-        NexusError::ConnectivityEstablishmentFailed {
-            provider: ProviderId(tag.to_string()),
-            reason: format!("vless response read failed: {e}"),
-        }
-    })?;
+    // 响应头由中继泵在 node→client 方向按字节跳过（VlessResponseSkipper）。
+    // 这里不得阻塞读：普通 SOCKS5 客户端在 CONNECT 应答后才发载荷，而参照端要等
+    // 目标回数据才发响应头；eager read 会让两侧互等直到超时。
     Ok(())
+}
+
+/// VLESS 响应头跳过器：`version(1) | addon_len(1) | addon`。
+///
+/// 响应头由服务端在首段隧道数据之前发出；握手阶段不得阻塞读它（见
+/// `vless_handshake_stream` 的惰性读纪律），由中继泵在 node→client 方向丢弃。
+#[derive(Default)]
+struct VlessResponseSkipper {
+    state: u8,
+    remaining: usize,
+}
+
+impl VlessResponseSkipper {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn filter<'a>(&mut self, data: &'a [u8]) -> &'a [u8] {
+        let mut pos = 0usize;
+        while pos < data.len() && self.state < 3 {
+            match self.state {
+                0 => {
+                    pos += 1;
+                    self.state = 1;
+                }
+                1 => {
+                    self.remaining = usize::from(data[pos]);
+                    pos += 1;
+                    self.state = if self.remaining == 0 { 3 } else { 2 };
+                }
+                _ => {
+                    let take = self.remaining.min(data.len() - pos);
+                    pos += take;
+                    self.remaining -= take;
+                    if self.remaining == 0 {
+                        self.state = 3;
+                    }
+                }
+            }
+        }
+        &data[pos..]
+    }
 }
 
 // VLESS 双向透明中继泵（§11.16 vless 数据面装配 glue）。
@@ -4548,6 +4586,7 @@ fn vless_pump_stream<S: std::io::Read + std::io::Write>(
     let mut down = PendingWrite::new();
     let mut up_failed = false;
     let mut down_failed = false;
+    let mut skipper = VlessResponseSkipper::new();
     loop {
         if !c_open
             && !n_open
@@ -4597,8 +4636,16 @@ fn vless_pump_stream<S: std::io::Read + std::io::Write>(
                 None => {}
                 Some(Ok(0)) => n_open = false,
                 Some(Ok(n)) => {
-                    down.enqueue(&sbuf[..n]);
-                    progressed = true;
+                    // 先跳过 VLESS 响应头，再把真实载荷入队：响应头字节不得
+                    // 写进 client 或 pending（b7 惰性读语义 + PendingWrite 共存）。
+                    let forward = skipper.filter(&sbuf[..n]);
+                    if forward.is_empty() {
+                        // 本段全部是 VLESS 响应头：已消费，继续等真实载荷。
+                        progressed = true;
+                    } else {
+                        down.enqueue(forward);
+                        progressed = true;
+                    }
                 }
                 Some(Err(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Some(Err(_)) => n_open = false,
@@ -12415,5 +12462,40 @@ mod p4_udp_loopback_tests {
         assert_eq!(v["p2p_connected"], serde_json::json!(true));
         assert_eq!(v["p2p_payload_matches"], serde_json::json!(true));
         assert_eq!(v["b_evicted_after_lease"], serde_json::json!(true));
+    }
+}
+
+#[cfg(test)]
+mod vless_skipper_tests {
+    use super::VlessResponseSkipper;
+
+    #[test]
+    fn skips_plain_two_byte_header() {
+        let mut skipper = VlessResponseSkipper::new();
+        assert!(skipper.filter(&[0x00, 0x00]).is_empty());
+        assert_eq!(skipper.filter(b"payload"), b"payload");
+    }
+
+    #[test]
+    fn skips_addon_then_forwards_payload() {
+        let mut skipper = VlessResponseSkipper::new();
+        let mut stream = vec![0x00, 0x02, 0xAA, 0xBB];
+        stream.extend_from_slice(b"hello");
+        assert_eq!(skipper.filter(&stream), b"hello");
+    }
+
+    #[test]
+    fn header_split_across_reads() {
+        let mut skipper = VlessResponseSkipper::new();
+        assert!(skipper.filter(&[0x00]).is_empty());
+        assert!(skipper.filter(&[0x01, 0xAA]).is_empty());
+        assert_eq!(skipper.filter(b"xyz"), b"xyz");
+    }
+
+    #[test]
+    fn forwards_when_header_and_payload_arrive_together() {
+        let mut skipper = VlessResponseSkipper::new();
+        assert_eq!(skipper.filter(b"\x00\x00Z"), b"Z");
+        assert_eq!(skipper.filter(b"more"), b"more");
     }
 }
