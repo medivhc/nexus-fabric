@@ -567,6 +567,17 @@ fn self_exe_blocked_gate(name: &str, problem: &str) -> Gate {
     gate
 }
 
+/// 落盘 `self_exe.json`（fail-closed 探针命中的事实记录）。写前先建目录：
+/// 极端情形下（首个场景门即触发 fail-closed）本轮 evidence 目录可能尚未建
+/// 好，直接 write 会 ENOENT——fail-closed 的证据本身不能丢。
+fn write_self_exe_record(dir: &std::path::Path, payload: &Value) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(
+        dir.join("self_exe.json"),
+        serde_json::to_string_pretty(payload).unwrap_or_default(),
+    )
+}
+
 pub fn verify(sub: &str) -> Outcome {
     let mode = match sub {
         "" | "--fast" => "fast",
@@ -626,10 +637,7 @@ pub fn verify(sub: &str) -> Outcome {
         });
         let dir = config.evidence_dir.join(format!("verify-{id}"));
         let path = dir.join("self_exe.json");
-        if let Err(e) = std::fs::write(
-            &path,
-            serde_json::to_string_pretty(&payload).unwrap_or_default(),
-        ) {
+        if let Err(e) = write_self_exe_record(&dir, &payload) {
             eprintln!(
                 "nexus-harness: cannot record self_exe_replaced evidence at {}: {e}",
                 path.display()
@@ -958,6 +966,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("tmpdir");
         dir
+    }
+
+    /// TRIAGE 小修回归：本轮 evidence 目录（多层）尚不存在时，self_exe.json
+    /// 兜底记录仍须写出——否则 fail-closed（整门 BLOCKED）的证据本身会因
+    /// ENOENT 丢失。此处只改落盘路径，BLOCKED 语义由探针与
+    /// self_exe_blocked_gate 决定、不受本函数影响。
+    #[test]
+    fn self_exe_record_creates_missing_evidence_dir() {
+        let base = temp_dir("self-exe-record");
+        let dir = base.join("verify-missing").join("nested");
+        assert!(!dir.exists());
+        let payload = json!({"self_exe_replaced": true, "detail": "probe hit"});
+        write_self_exe_record(&dir, &payload).expect("record must be written");
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("self_exe.json")).unwrap())
+                .unwrap();
+        assert_eq!(written["self_exe_replaced"], json!(true));
+        assert_eq!(written["detail"], json!("probe hit"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// 与 write_evidence 落盘形状一致的最小完整 evidence。
