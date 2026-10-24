@@ -77,6 +77,7 @@ use nexus_measurement::{LinkMeasurement, MeasurementTable};
 use nexus_planner::PlanningSnapshot;
 use nexus_registry::{ProviderRecord, Registry};
 use nexus_session::{SessionError, SessionOwner};
+use pending_write::PendingWrite;
 use serde_json::{Value, json};
 
 /// 事件名：Ingress 已把中立 FlowContext 提交给 SessionManager / Application Layer。
@@ -4448,14 +4449,24 @@ fn anytls_push_frame<S: std::io::Read + std::io::Write>(
     data: &[u8],
 ) -> std::io::Result<()> {
     use std::io::Write;
-    let buf = nexus_outbound_anytls::encode_frame(cmd, stream_id, data).map_err(|e| {
+    let buf = anytls_encode_frame(stream_id, cmd, data)?;
+    tls.write_all(&buf)?;
+    tls.flush()
+}
+
+// 纯编码：一次读到的载荷 → 一帧字节。编码失败是配置/长度错误（>64KiB），
+// 不是 I/O 瞬态，调用方按致命错误处理。
+fn anytls_encode_frame(
+    stream_id: u32,
+    cmd: nexus_outbound_anytls::AnyTlsCommand,
+    data: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    nexus_outbound_anytls::encode_frame(cmd, stream_id, data).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("anytls frame encode: {e}"),
         )
-    })?;
-    tls.write_all(&buf)?;
-    tls.flush()
+    })
 }
 
 // 从下行明文缓冲取出首个完整 AnyTLS 帧（7 字节头 + data）；不完整返回 `None`。
@@ -4527,55 +4538,82 @@ fn vless_pump_stream<S: std::io::Read + std::io::Write>(
     node: &mut S,
     client: &mut std::net::TcpStream,
 ) -> (usize, usize) {
-    use std::io::{Read, Write};
     let mut up_bytes = 0usize;
     let mut down_bytes = 0usize;
     let mut cbuf = [0u8; 8192];
     let mut sbuf = [0u8; 8192];
     let mut c_open = true;
     let mut n_open = true;
+    let mut up = PendingWrite::new();
+    let mut down = PendingWrite::new();
+    let mut up_failed = false;
+    let mut down_failed = false;
     loop {
-        if !c_open && !n_open {
+        if !c_open
+            && !n_open
+            && (up_failed || up.ready_for_read())
+            && (down_failed || down.ready_for_read())
+        {
             break;
         }
         let mut progressed = false;
-        if c_open {
-            match client.read(&mut cbuf) {
-                Ok(0) => c_open = false,
-                Ok(n) => match node.write_all(&cbuf[..n]) {
-                    Ok(()) => match node.flush() {
-                        Ok(()) => {
-                            up_bytes += n;
-                            progressed = true;
-                        }
-                        Err(_) => n_open = false,
-                    },
-                    Err(_) => n_open = false,
-                },
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_) => c_open = false,
+        // 先排空两个方向的待写尾部：WouldBlock 保留尾部，非 WouldBlock 错误
+        // 才关闭对应方向（TLS/明文两条路径共用此泵）。
+        match up.try_write(node) {
+            Ok((_, n)) => {
+                up_bytes += n;
+                progressed |= n > 0;
+            }
+            Err(_) => {
+                n_open = false;
+                up_failed = true;
+            }
+        }
+        match down.try_write(client) {
+            Ok((_, n)) => {
+                down_bytes += n;
+                progressed |= n > 0;
+            }
+            Err(_) => {
+                c_open = false;
+                n_open = false;
+                down_failed = true;
+            }
+        }
+        if c_open && n_open {
+            match up.try_read(client, &mut cbuf) {
+                None => {}
+                Some(Ok(0)) => c_open = false,
+                Some(Ok(n)) => {
+                    up.enqueue(&cbuf[..n]);
+                    progressed = true;
+                }
+                Some(Err(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Some(Err(_)) => c_open = false,
             }
         }
         if n_open && c_open {
-            match node.read(&mut sbuf) {
-                Ok(0) => n_open = false,
-                Ok(n) => match client.write_all(&sbuf[..n]) {
-                    Ok(()) => {
-                        down_bytes += n;
-                        progressed = true;
-                    }
-                    Err(_) => {
-                        // 投递到 client 失败：client 已不可达，隧道整体终止。
-                        c_open = false;
-                        n_open = false;
-                    }
-                },
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_) => n_open = false,
+            match down.try_read(node, &mut sbuf) {
+                None => {}
+                Some(Ok(0)) => n_open = false,
+                Some(Ok(n)) => {
+                    down.enqueue(&sbuf[..n]);
+                    progressed = true;
+                }
+                Some(Err(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Some(Err(_)) => n_open = false,
             }
-        } else if n_open && !c_open {
-            // client 已断开：直接终止节点侧，避免节点不发关闭信号时空转。
+        }
+        // 半关闭：一侧 EOF/致命写错误后，先排空该方向尾部再终止另一侧。
+        if !c_open && n_open && (down_failed || down.ready_for_read()) {
             n_open = false;
+        }
+        if !n_open
+            && c_open
+            && (up_failed || up.ready_for_read())
+            && (down_failed || down.ready_for_read())
+        {
+            c_open = false;
         }
         if !progressed {
             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -4595,19 +4633,37 @@ fn hysteria2_pump_stream(
     client: &mut std::net::TcpStream,
 ) -> (usize, usize) {
     use nexus_outbound_hysteria2::Hysteria2Error;
-    use std::io::{Read, Write};
+    use std::io::Read;
     let mut up_bytes = 0usize;
     let mut down_bytes = 0usize;
     let mut cbuf = [0u8; 8192];
     let mut sbuf = [0u8; 8192];
     let mut c_open = true;
     let mut s_open = true;
+    let mut down = PendingWrite::new();
+    let mut down_failed = false;
     loop {
-        if !c_open && !s_open {
+        if !c_open && !s_open && (down_failed || down.ready_for_read()) {
             break;
         }
         let mut progressed = false;
-        if c_open {
+        // 下行 client.write 是裸非阻塞 socket 写：套 PendingWrite 保留尾部。
+        match down.try_write(client) {
+            Ok((_, n)) => {
+                down_bytes += n;
+                progressed |= n > 0;
+            }
+            Err(_) => {
+                c_open = false;
+                s_open = false;
+                down_failed = true;
+            }
+        }
+        if c_open && s_open {
+            // 上行保持直接调用：`Hysteria2Client::stream_write` 已在 crate 内对
+            // `WriteError::Blocked` 循环 pump 到写完或 deadline（阻塞 + 保留已发
+            // 进度）。app 层若再对整段尾部重试，超时后可能把已发出的前半段重发，
+            // 造成 QUIC stream 字节重复，故此处不套 PendingWrite（见 CHAIN Q1）。
             match client.read(&mut cbuf) {
                 Ok(0) => c_open = false,
                 Ok(n) => match hy2.stream_write(stream, &cbuf[..n]) {
@@ -4621,27 +4677,24 @@ fn hysteria2_pump_stream(
                 Err(_) => c_open = false,
             }
         }
-        if s_open && c_open {
+        if s_open && c_open && down.ready_for_read() {
             match hy2.stream_read(stream, &mut sbuf, std::time::Duration::from_millis(50)) {
                 Ok(0) => s_open = false,
-                Ok(n) => match client.write_all(&sbuf[..n]) {
-                    Ok(()) => {
-                        down_bytes += n;
-                        progressed = true;
-                    }
-                    Err(_) => {
-                        // 投递到 client 失败：client 已不可达，隧道整体终止。
-                        c_open = false;
-                        s_open = false;
-                    }
-                },
+                Ok(n) => {
+                    down.enqueue(&sbuf[..n]);
+                    progressed = true;
+                }
                 Err(Hysteria2Error::Timeout) => {}
                 Err(_) => s_open = false,
             }
-        } else if s_open && !c_open {
-            // client 已断开：对 stream 发 FIN，避免节点侧空转。
+        }
+        // 半关闭：client EOF 后先排空下行尾部，再对 stream 发 FIN。
+        if !c_open && s_open && (down_failed || down.ready_for_read()) {
             hy2.stream_finish(stream);
             s_open = false;
+        }
+        if !s_open && c_open && (down_failed || down.ready_for_read()) {
+            c_open = false;
         }
         if !progressed {
             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -5229,50 +5282,78 @@ pub fn proxy_serve_once(
             let mut sbuf = [0u8; 8192];
             let mut c_open = true;
             let mut tls_open = true;
+            let mut up = PendingWrite::new();
+            let mut down = PendingWrite::new();
+            let mut up_failed = false;
+            let mut down_failed = false;
             {
                 let mut tls = rustls::Stream::new(&mut conn, &mut node);
                 loop {
-                    if !c_open && !tls_open {
+                    if !c_open
+                        && !tls_open
+                        && (up_failed || up.ready_for_read())
+                        && (down_failed || down.ready_for_read())
+                    {
                         break;
                     }
                     let mut progressed = false;
-                    if c_open {
-                        match client.read(&mut cbuf) {
-                            Ok(0) => c_open = false,
-                            Ok(n) => match tls.write_all(&cbuf[..n]) {
-                                Ok(()) => match tls.flush() {
-                                    Ok(()) => {
-                                        up_bytes += n;
-                                        progressed = true;
-                                    }
-                                    Err(_) => tls_open = false,
-                                },
-                                Err(_) => tls_open = false,
-                            },
-                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                            Err(_) => c_open = false,
+                    // 先排空两个方向的待写尾部：WouldBlock 保留尾部，非 WouldBlock
+                    // 错误才关闭对应方向（不得把 WouldBlock 当致命错误）。
+                    match up.try_write(&mut tls) {
+                        Ok((_, n)) => {
+                            up_bytes += n;
+                            progressed |= n > 0;
+                        }
+                        Err(_) => {
+                            tls_open = false;
+                            up_failed = true;
+                        }
+                    }
+                    match down.try_write(&mut client) {
+                        Ok((_, n)) => {
+                            down_bytes += n;
+                            progressed |= n > 0;
+                        }
+                        Err(_) => {
+                            c_open = false;
+                            tls_open = false;
+                            down_failed = true;
+                        }
+                    }
+                    if c_open && tls_open {
+                        match up.try_read(&mut client, &mut cbuf) {
+                            None => {}
+                            Some(Ok(0)) => c_open = false,
+                            Some(Ok(n)) => {
+                                up.enqueue(&cbuf[..n]);
+                                progressed = true;
+                            }
+                            Some(Err(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Some(Err(_)) => c_open = false,
                         }
                     }
                     if tls_open && c_open {
-                        match tls.read(&mut sbuf) {
-                            Ok(0) => tls_open = false,
-                            Ok(n) => match client.write_all(&sbuf[..n]) {
-                                Ok(()) => {
-                                    down_bytes += n;
-                                    progressed = true;
-                                }
-                                Err(_) => {
-                                    // 投递到 client 失败：client 已不可达，隧道整体终止。
-                                    c_open = false;
-                                    tls_open = false;
-                                }
-                            },
-                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                            Err(_) => tls_open = false,
+                        match down.try_read(&mut tls, &mut sbuf) {
+                            None => {}
+                            Some(Ok(0)) => tls_open = false,
+                            Some(Ok(n)) => {
+                                down.enqueue(&sbuf[..n]);
+                                progressed = true;
+                            }
+                            Some(Err(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Some(Err(_)) => tls_open = false,
                         }
-                    } else if tls_open && !c_open {
-                        // client 已断开：直接终止节点侧，避免节点不发 close_notify 时空转。
+                    }
+                    // 半关闭：一侧 EOF/致命写错误后，先排空该方向尾部再终止另一侧。
+                    if !c_open && tls_open && (down_failed || down.ready_for_read()) {
                         tls_open = false;
+                    }
+                    if !tls_open
+                        && c_open
+                        && (up_failed || up.ready_for_read())
+                        && (down_failed || down.ready_for_read())
+                    {
+                        c_open = false;
                     }
                     if !progressed {
                         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -5488,100 +5569,132 @@ pub fn proxy_serve_once(
             let mut pending: Vec<u8> = Vec::new();
             let mut c_open = true;
             let mut tls_open = true;
+            let mut up = PendingWrite::new();
+            let mut down = PendingWrite::new();
+            let mut up_failed = false;
+            let mut down_failed = false;
             {
                 let mut tls = rustls::Stream::new(&mut conn, &mut node);
                 loop {
-                    if !c_open && !tls_open {
+                    if !c_open
+                        && !tls_open
+                        && (up_failed || up.ready_for_read())
+                        && (down_failed || down.ready_for_read())
+                    {
                         break;
                     }
                     let mut progressed = false;
-                    // client → node：读明文 → PSH 帧。
-                    // write_all/flush 在 WouldBlock 时字节已暂存 rustls 内部缓冲，
-                    // 下轮 read/write 会继续投递，不丢；仅统计成功投递的字节。
-                    if c_open {
-                        match client.read(&mut cbuf) {
-                            Ok(0) => {
-                                // client EOF：发 Fin 告知对端 stream 结束（尽力）。
-                                let _ =
-                                    anytls_push_frame(&mut tls, stream_id, AnyTlsCommand::Fin, &[]);
+                    // 先排空帧队列：WouldBlock 保留尾部，非 WouldBlock 才关方向。
+                    match up.try_write(&mut tls) {
+                        Ok((_, n)) => {
+                            up_bytes += n;
+                            progressed |= n > 0;
+                        }
+                        Err(_) => {
+                            tls_open = false;
+                            up_failed = true;
+                        }
+                    }
+                    match down.try_write(&mut client) {
+                        Ok((_, n)) => {
+                            down_bytes += n;
+                            progressed |= n > 0;
+                        }
+                        Err(_) => {
+                            c_open = false;
+                            tls_open = false;
+                            down_failed = true;
+                        }
+                    }
+                    // client → node：读明文 → PSH 帧入 up 队列。
+                    if c_open && tls_open {
+                        match up.try_read(&mut client, &mut cbuf) {
+                            None => {}
+                            Some(Ok(0)) => {
+                                // client EOF：Fin 入队，由 up 队列排空后再收尾。
+                                if let Ok(fin) =
+                                    anytls_encode_frame(stream_id, AnyTlsCommand::Fin, &[])
+                                {
+                                    up.enqueue(&fin);
+                                }
                                 c_open = false;
                             }
-                            Ok(n) => {
-                                match anytls_push_frame(
-                                    &mut tls,
-                                    stream_id,
-                                    AnyTlsCommand::Psh,
-                                    &cbuf[..n],
-                                ) {
-                                    Ok(()) => {
-                                        up_bytes += n;
+                            Some(Ok(n)) => {
+                                match anytls_encode_frame(stream_id, AnyTlsCommand::Psh, &cbuf[..n])
+                                {
+                                    Ok(frame) => {
+                                        up.enqueue(&frame);
                                         progressed = true;
                                     }
-                                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                                     Err(_) => {
                                         c_open = false;
                                         tls_open = false;
+                                        up_failed = true;
                                     }
                                 }
                             }
-                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                            Err(_) => c_open = false,
+                            Some(Err(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Some(Err(_)) => c_open = false,
                         }
                     }
-                    // node → client：TLS 明文读出 → 组帧 → PSH 投递 client；
-                    // Fin/Alert 结束节点侧；HeartRequest 回 HeartResponse。
+                    // node → client：先消费残留完整帧（下行背压时暂停消费），
+                    // 再按需读 TLS。
                     if tls_open && c_open {
-                        match tls.read(&mut tbuf) {
-                            Ok(0) => tls_open = false,
-                            Ok(n) => {
-                                pending.extend_from_slice(&tbuf[..n]);
-                                progressed = true;
-                                while let Some((frame, consumed)) =
-                                    anytls_take_complete_frame(&pending)
-                                {
-                                    pending.drain(..consumed);
-                                    match frame.cmd {
-                                        AnyTlsCommand::Psh if frame.stream_id == stream_id => {
-                                            match client.write_all(&frame.data) {
-                                                Ok(()) => down_bytes += frame.data.len(),
-                                                Err(_) => {
-                                                    c_open = false;
-                                                    tls_open = false;
-                                                }
-                                            }
-                                        }
-                                        AnyTlsCommand::Fin if frame.stream_id == stream_id => {
-                                            tls_open = false;
-                                        }
-                                        AnyTlsCommand::Alert => {
-                                            tls_open = false;
-                                        }
-                                        AnyTlsCommand::HeartRequest => {
-                                            let _ = anytls_push_frame(
-                                                &mut tls,
-                                                frame.stream_id,
-                                                AnyTlsCommand::HeartResponse,
-                                                &[],
-                                            );
-                                        }
-                                        _ => {} // Waste/无关帧：静默丢弃
-                                    }
-                                    if !c_open || !tls_open {
-                                        break;
-                                    }
+                        while down.ready_for_read() && tls_open && c_open {
+                            let Some((frame, consumed)) = anytls_take_complete_frame(&pending)
+                            else {
+                                break;
+                            };
+                            pending.drain(..consumed);
+                            match frame.cmd {
+                                AnyTlsCommand::Psh if frame.stream_id == stream_id => {
+                                    down.enqueue(&frame.data);
                                 }
-                                // 防御：残缺帧缓冲有界（合法不完整帧 < 64KiB+7B；
-                                // 超限说明对端持续发垃圾，终止节点侧）。
-                                if pending.len() > 256 * 1024 {
+                                AnyTlsCommand::Fin if frame.stream_id == stream_id => {
                                     tls_open = false;
                                 }
+                                AnyTlsCommand::Alert => {
+                                    tls_open = false;
+                                }
+                                AnyTlsCommand::HeartRequest => {
+                                    if let Ok(resp) = anytls_encode_frame(
+                                        frame.stream_id,
+                                        AnyTlsCommand::HeartResponse,
+                                        &[],
+                                    ) {
+                                        up.enqueue(&resp);
+                                    }
+                                }
+                                _ => {} // Waste/无关帧：静默丢弃
                             }
-                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                            Err(_) => tls_open = false,
                         }
-                    } else if tls_open && !c_open {
-                        // client 已断开：直接终止节点侧，避免节点不发 Fin 时空转。
+                        if down.ready_for_read() && tls_open && c_open {
+                            match tls.read(&mut tbuf) {
+                                Ok(0) => tls_open = false,
+                                Ok(n) => {
+                                    pending.extend_from_slice(&tbuf[..n]);
+                                    progressed = true;
+                                    // 防御：残缺帧缓冲有界（合法不完整帧 < 64KiB+7B；
+                                    // 超限说明对端持续发垃圾，终止节点侧）。
+                                    if pending.len() > 256 * 1024 {
+                                        tls_open = false;
+                                    }
+                                }
+                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                                Err(_) => tls_open = false,
+                            }
+                        }
+                    }
+                    // 半关闭：一侧 EOF/致命写错误后，先排空已入队尾部再终止另一侧。
+                    if !c_open && tls_open && (down_failed || down.ready_for_read()) {
                         tls_open = false;
+                    }
+                    if !tls_open
+                        && c_open
+                        && (up_failed || up.ready_for_read())
+                        && (down_failed || down.ready_for_read())
+                    {
+                        c_open = false;
                     }
                     if !progressed {
                         std::thread::sleep(std::time::Duration::from_millis(2));

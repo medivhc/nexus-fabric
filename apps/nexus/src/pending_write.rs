@@ -12,8 +12,6 @@
 use std::io::{Read, Write};
 
 /// 待写尾部状态机的队列。
-// C2 把四个中继 arm 接上后即成为生产代码；本阶段仅单测驱动。
-#[allow(dead_code)]
 pub(crate) struct PendingWrite {
     buf: Vec<u8>,
     pos: usize,
@@ -22,7 +20,6 @@ pub(crate) struct PendingWrite {
 
 /// 一次 `try_write` 后队列是否已彻底排空。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum WriteProgress {
     /// 尾部已清空且 `flush` 成功。
     Drained,
@@ -30,7 +27,6 @@ pub(crate) enum WriteProgress {
     Blocked,
 }
 
-#[allow(dead_code)]
 impl PendingWrite {
     pub(crate) fn new() -> Self {
         Self {
@@ -43,6 +39,10 @@ impl PendingWrite {
     /// 追加待写字节。调用点保证只在 [`Self::ready_for_read`] 时读，因此正常路径
     /// 不会在未清空时追加；即使误用，追加也保持字节顺序。
     pub(crate) fn enqueue(&mut self, data: &[u8]) {
+        debug_assert!(
+            self.buffered().is_empty(),
+            "enqueue while pending tail is non-empty"
+        );
         self.buf.extend_from_slice(data);
     }
 
