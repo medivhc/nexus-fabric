@@ -9,7 +9,7 @@
 | spec | frozen v1.1（sha256 23c7e4e797ee9edbf0eb645bfc20a7c97cfacb30e1a67bd8fee77ccbc527de4f） |
 | sing-box | 1.13.16（9ff0345fde4157a6bdab45a615668d41ccc93f6d0f361108042a48b8a49a9baa  sing-box-1.13.16-linux-amd64-musl.tar.gz） |
 | Xray | 26.10.21（0eec3ed4163c273d8c8bf821f7d219e257921cf584aa3fb970715e458e631978  Xray-linux-64.zip） |
-| test window | 2026-10-24T17:22:49Z .. 2026-10-24T17:54:46Z |
+| test window | 2026-10-24T17:22:49Z .. 2026-10-24T18:06:45Z |
 | archive | （S30 归档后追加） |
 
 ## 协议 verdict（按 spec E1 复算）
@@ -18,7 +18,7 @@
 |---|---|---|---|---|---|---|
 | Vless | BROKEN | PROTOCOL_SUBSET | NOT_USABLE | E_NEXUS_HANDSHAKE_WIRE | Handshake(FAIL,E_NEXUS_HANDSHAKE_WIRE), TcpSmall(FAIL,E_NEXUS_FRAMING), TcpThroughput(FAIL,E_NEXUS_FRAMING), LongLived(FAIL,E_NEXUS_FRAMING), Reconnect(FAIL,E_NEXUS_FRAMING) | 2 |
 | Anytls | BROKEN | PROTOCOL_SUBSET | NOT_USABLE | E_NEXUS_TRANSPORT | TcpThroughput(FAIL,E_NEXUS_TRANSPORT) | 2 |
-| Hysteria2 | BROKEN | PROTOCOL_SUBSET | NOT_USABLE | E_NEXUS_CODEC | TcpSmall(FAIL,E_NEXUS_CODEC), TcpThroughput(FAIL,E_NEXUS_CODEC), LongLived(FAIL,E_NEXUS_CODEC), Reconnect(FAIL,E_NEXUS_CODEC), Handshake(FAIL,E_NEXUS_CODEC), Handshake[Hy2Salamander](FAIL,E_NEXUS_CODEC), UdpEcho(FAIL,E_NEXUS_CODEC) | 2 |
+| Hysteria2 | BROKEN | PROTOCOL_SUBSET | NOT_USABLE | E_NEXUS_CODEC | TcpSmall(FAIL,E_NEXUS_CODEC), TcpThroughput(FAIL,E_NEXUS_CODEC), LongLived(FAIL,E_NEXUS_CODEC), Reconnect(FAIL,E_NEXUS_CODEC), Handshake(FAIL,E_NEXUS_CODEC), Handshake[Hy2Salamander](FAIL,E_NEXUS_CODEC), UdpEcho(FAIL,E_NEXUS_CODEC), BadCredential(FAIL,E_NEXUS_CODEC) | 1 |
 | Trojan | BROKEN | TCP_ONLY | NOT_USABLE | E_NEXUS_FRAMING | TcpThroughput(FAIL,E_NEXUS_TRANSPORT), UdpEcho(NOT_IMPLEMENTED,E_NEXUS_NOT_IMPLEMENTED), BadCredential[TrojanFallback](FAIL,E_NEXUS_FRAMING), BadConfig(NOT_APPLICABLE,NONE) | 1 |
 | Shadowsocks | BROKEN | TCP_ONLY | NOT_USABLE | E_NEXUS_HANDSHAKE_WIRE | Handshake(FAIL,E_NEXUS_HANDSHAKE_WIRE), TcpSmall(FAIL,E_NEXUS_FRAMING), TcpThroughput(FAIL,E_NEXUS_FRAMING), LongLived(FAIL,E_NEXUS_FRAMING), Reconnect(FAIL,E_NEXUS_FRAMING), UdpEcho(NOT_IMPLEMENTED,E_NEXUS_NOT_IMPLEMENTED) | 2 |
 
@@ -63,7 +63,7 @@
 | Hy2Salamander/Handshake | FAIL | ProductSocks5 | ProductPath | PIV-hysteria2-hy2-salamander-handshake-20261024T173056Z-001 | up=0B down=0B E_NEXUS_CODEC | evidence/hysteria2/hy2-salamander/handshake/PIV-hysteria2-hy2-salamander-handshake-20261024T173056Z-001/probe.json | proxy_error=ConnectivityEstablishmentFailed { provider: ProviderId("ref"), reason: "hysteria2 connect/auth 127.0.0.1:26104 failed: hysteria2 invalid frame" }; workload_error=tunnel read: Connection reset by peer (os erro |
 | Default/QpackDiag | PASS | CrateDirect | ProtocolWire | PIV-hysteria2-default-qpack-diag-20261024T174317Z-001 | up=0B down=0B E_NEXUS_CODEC | evidence/hysteria2/default/qpack-diag/PIV-hysteria2-default-qpack-diag-20261024T174317Z-001/probe.json | hy2_error=hysteria2 invalid frame; target_stats={"tcp_bytes_down":1,"tcp_bytes_up":1,"tcp_connections":1,"udp_bytes":0,"udp_datagrams":0}; pcap_stats=utc=2026-10-24T17:43:18Z;packets=13;size_bytes=8493;capinfos_ok=yes;fi |
 | Default/UdpEcho | FAIL | CrateDirect | ProtocolWire | PIV-hysteria2-default-udp-echo-20261024T174221Z-001 | udp 0/0 corrupt=0 E_NEXUS_CODEC | evidence/hysteria2/default/udp-echo/PIV-hysteria2-default-udp-echo-20261024T174221Z-001/probe.json | target_stats={"tcp_bytes_down":0,"tcp_bytes_up":0,"tcp_connections":0,"udp_bytes":64,"udp_datagrams":1}; pcap_stats=utc=2026-10-24T17:42:23Z;packets=12;size_bytes=7731;capinfos_ok=yes;first_packet=1;sha256=6d9429e4490493 |
-| Default/BadCredential | PASS | ProductSocks5 | ProductPath | PIV-hysteria2-default-bad-credential-20261024T173046Z-001 | up=0B down=0B E_EXPECTED_AUTH_REJECT | evidence/hysteria2/default/bad-credential/PIV-hysteria2-default-bad-credential-20261024T173046Z-001/probe.json | proxy_error=ConnectivityEstablishmentFailed { provider: ProviderId("ref"), reason: "hysteria2 connect/auth 127.0.0.1:26103 failed: hysteria2 invalid frame" }; workload_error=read: Connection reset by peer (os error 104); |
+| Default/BadCredential | FAIL | ProductSocks5 | ProductPath | PIV-hysteria2-default-bad-credential-20261024T180645Z-001 | up=0B down=0B E_NEXUS_CODEC | evidence/hysteria2/default/bad-credential/PIV-hysteria2-default-bad-credential-20261024T180645Z-001/probe.json | proxy_error=ConnectivityEstablishmentFailed { provider: ProviderId("ref"), reason: "hysteria2 connect/auth 127.0.0.1:26103 failed: hysteria2 invalid frame" }; workload_error=read: Connection reset by peer (os error 104); |
 | Default/BadConfig | PASS | ProductSocks5 | ProductPath | PIV-hysteria2-default-bad-config-20261024T173059Z-001 | up=0B down=0B E_EXPECTED_CONFIG_REJECT | evidence/hysteria2/default/bad-config/PIV-hysteria2-default-bad-config-20261024T173059Z-001/probe.json | proxy_error=ConnectivityEstablishmentFailed { provider: ProviderId("ref"), reason: "hysteria2 connect/auth 127.0.0.1:26104 failed: hysteria2 timed out" }; workload_error=read: Connection reset by peer (os error 104); cla |
 
 ## Trojan
@@ -159,7 +159,7 @@
 | PIV-anytls-default-tcp-throughput-20261024T175443Z-001 | FAIL | ProductSocks5 | ProductPath | evidence/anytls/default/tcp-throughput/PIV-anytls-default-tcp-throughput-20261024T175443Z-001/probe.json |
 | PIV-anytls-default-udp-echo-20261024T174215Z-001 | PASS | CrateDirect | ProtocolWire | evidence/anytls/default/udp-echo/PIV-anytls-default-udp-echo-20261024T174215Z-001/probe.json |
 | PIV-hysteria2-default-bad-config-20261024T173059Z-001 | PASS | ProductSocks5 | ProductPath | evidence/hysteria2/default/bad-config/PIV-hysteria2-default-bad-config-20261024T173059Z-001/probe.json |
-| PIV-hysteria2-default-bad-credential-20261024T173046Z-001 | PASS | ProductSocks5 | ProductPath | evidence/hysteria2/default/bad-credential/PIV-hysteria2-default-bad-credential-20261024T173046Z-001/probe.json |
+| PIV-hysteria2-default-bad-credential-20261024T180645Z-001 | FAIL | ProductSocks5 | ProductPath | evidence/hysteria2/default/bad-credential/PIV-hysteria2-default-bad-credential-20261024T180645Z-001/probe.json |
 | PIV-hysteria2-default-handshake-20261024T173039Z-001 | FAIL | ProductSocks5 | ProductPath | evidence/hysteria2/default/handshake/PIV-hysteria2-default-handshake-20261024T173039Z-001/probe.json |
 | PIV-hysteria2-default-long-lived-20261024T173048Z-001 | FAIL | ProductSocks5 | ProductPath | evidence/hysteria2/default/long-lived/PIV-hysteria2-default-long-lived-20261024T173048Z-001/probe.json |
 | PIV-hysteria2-default-qpack-diag-20261024T174317Z-001 | PASS | CrateDirect | ProtocolWire | evidence/hysteria2/default/qpack-diag/PIV-hysteria2-default-qpack-diag-20261024T174317Z-001/probe.json |
