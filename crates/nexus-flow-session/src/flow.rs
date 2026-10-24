@@ -101,8 +101,7 @@ pub struct FlowEntry {
 }
 
 impl FlowEntry {
-    fn new(key: FlowKey, session_id: SessionId, udp: bool) -> Self {
-        let now = Instant::now();
+    fn new(key: FlowKey, session_id: SessionId, udp: bool, now: Instant) -> Self {
         Self {
             key,
             phase: FlowPhase::Allocating,
@@ -152,11 +151,11 @@ impl FlowTable {
     }
 
     /// 插入新流（调用方保证 key 不存在）；返回表项可变引用。
-    pub fn insert(&mut self, key: FlowKey, session_id: SessionId) -> &mut FlowEntry {
+    pub fn insert(&mut self, key: FlowKey, session_id: SessionId, now: Instant) -> &mut FlowEntry {
         let udp = key.proto == IpProto::Udp;
         self.inner
             .entry(key)
-            .or_insert_with(|| FlowEntry::new(key, session_id, udp))
+            .or_insert_with(|| FlowEntry::new(key, session_id, udp, now))
     }
 
     pub fn remove(&mut self, key: &FlowKey) -> Option<FlowEntry> {
@@ -175,8 +174,11 @@ impl FlowTable {
 
     /// 空闲扫描：超过 `idle_timeout` 未见包的 Active/Allocating 流进 Draining。
     /// 返回进入 Draining 的 session id 列表。
-    pub fn sweep_idle(&mut self, idle_timeout: std::time::Duration) -> Vec<SessionId> {
-        let now = Instant::now();
+    pub fn sweep_idle(
+        &mut self,
+        idle_timeout: std::time::Duration,
+        now: Instant,
+    ) -> Vec<SessionId> {
         let mut drained = Vec::new();
         for entry in self.inner.values_mut() {
             if matches!(entry.phase, FlowPhase::Active | FlowPhase::Allocating)
@@ -252,11 +254,12 @@ mod tests {
     fn sweep_idle_moves_stale_to_draining() {
         let mut t = FlowTable::new();
         let k = key();
-        t.insert(k, SessionId("s1".into()));
+        let t0 = Instant::now();
+        t.insert(k, SessionId("s1".into()), t0);
         // 人为把 last_seen 推到过去。
-        t.get_mut(&k).unwrap().last_seen = Instant::now() - std::time::Duration::from_secs(3600);
+        t.get_mut(&k).unwrap().last_seen = t0 - std::time::Duration::from_secs(3600);
         t.get_mut(&k).unwrap().phase = FlowPhase::Active;
-        let drained = t.sweep_idle(std::time::Duration::from_secs(60));
+        let drained = t.sweep_idle(std::time::Duration::from_secs(60), t0);
         assert_eq!(drained.len(), 1);
         assert_eq!(t.get(&k).unwrap().phase, FlowPhase::Draining);
     }
@@ -267,8 +270,9 @@ mod tests {
         let k1 = key();
         let mut k2 = key();
         k2.dst_port = 80;
-        t.insert(k1, SessionId("s1".into()));
-        t.insert(k2, SessionId("s2".into()));
+        let t0 = Instant::now();
+        t.insert(k1, SessionId("s1".into()), t0);
+        t.insert(k2, SessionId("s2".into()), t0);
         t.get_mut(&k1).unwrap().phase = FlowPhase::Disposed;
         assert_eq!(t.gc_disposed(), 1);
         assert!(t.get(&k1).is_none());

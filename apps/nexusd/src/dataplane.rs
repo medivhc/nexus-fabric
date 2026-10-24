@@ -382,7 +382,12 @@ impl Dataplane {
 
     /// 触发空闲扫描（E4 用；生产由定时器调）。
     pub fn flow_sweep_idle(&mut self) -> usize {
-        self.flow_mgr.as_mut().map(|m| m.sweep_idle()).unwrap_or(0)
+        // S31 之前：driver 在每个扫描点采集一次 `Instant`（core 不读时钟）。
+        let now = std::time::Instant::now();
+        self.flow_mgr
+            .as_mut()
+            .map(|m| m.sweep_idle(now))
+            .unwrap_or(0)
     }
 
     /// 设置流空闲超时（E4 用）。
@@ -645,7 +650,8 @@ impl Dataplane {
             None => return true,
         };
         debug_assert_eq!(key.proto, IpProto::Udp);
-        match mgr.on_packet(key, packet, false, deps) {
+        let now = std::time::Instant::now();
+        match mgr.on_packet(key, packet, false, deps, now) {
             FlowDecision::NewSession { .. } | FlowDecision::Buffered { .. } => {
                 // 已入 SessionManager 有界缓冲，暂不转发（Active 后 flush）。
                 false
@@ -725,7 +731,8 @@ impl Dataplane {
         };
         debug_assert_eq!(key.proto, IpProto::Tcp);
         let is_syn = is_tcp_syn(packet);
-        match mgr.on_packet(key, packet, is_syn, deps) {
+        let now = std::time::Instant::now();
+        match mgr.on_packet(key, packet, is_syn, deps, now) {
             FlowDecision::NewSession { session_id } => {
                 // 待 TcpEvent::Syn 到达时绑定 stream_id。
                 let four = FourTuple {

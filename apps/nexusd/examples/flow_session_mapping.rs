@@ -362,6 +362,7 @@ fn run() -> serde_json::Value {
     // ---- 10/11. 空闲超时 → Draining → 0 ----
     dp.set_flow_idle_timeout(Duration::from_millis(1));
     std::thread::sleep(Duration::from_millis(5));
+    // S19：扫描点由 driver 触发；S31 起改传主循环的单调毫秒。
     let drained = dp.flow_sweep_idle();
     let idle_timeout_drains = drained >= 1;
     // TearDown 信号在 flow_pump 中处理 → 再跑几轮 process_one 触发。
