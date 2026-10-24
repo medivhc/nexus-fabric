@@ -17,6 +17,7 @@ nexus-discovery = { path = "../../crates/nexus-discovery" }
 nexus-ingress = { path = "../../crates/nexus-ingress" }
 nexus-network = { path = "../../crates/nexus-network" }
 nexus-proxy-config = { path = "../../crates/nexus-proxy-config" }
+nexus-proxy = { path = "../../crates/nexus-proxy" }
 nexus-proxy-transport = { path = "../../crates/nexus-proxy-transport" }
 nexus-outbound-trojan = { path = "../../crates/nexus-outbound-trojan" }
 nexus-outbound-anytls = { path = "../../crates/nexus-outbound-anytls" }

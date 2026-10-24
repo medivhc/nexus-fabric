@@ -137,6 +137,19 @@ impl SessionManager {
         deps: &ChainDeps,
         now: Instant,
     ) -> FlowDecision {
+        self.on_packet_with_hint(key, packet, is_syn, deps, now, None)
+    }
+
+    /// 同 [`Self::on_packet`]，额外带上规则引擎选出的出站 tag（Q3 `egress_hint`）。
+    pub fn on_packet_with_hint(
+        &mut self,
+        key: FlowKey,
+        packet: &[u8],
+        is_syn: bool,
+        deps: &ChainDeps,
+        now: Instant,
+        egress_hint: Option<&str>,
+    ) -> FlowDecision {
         // 快路径：已建流。
         if let Some(entry) = self.table.get_mut(&key) {
             entry.last_seen = now;
@@ -191,7 +204,7 @@ impl SessionManager {
                 key.dst_ip[0], key.dst_ip[1], key.dst_ip[2], key.dst_ip[3], key.dst_port
             ),
             profile: "Balanced".into(),
-            egress_hint: None,
+            egress_hint: egress_hint.map(str::to_string),
         };
         let outcome = match run_first_packet_chain(&flow, deps) {
             Ok(o) => o,

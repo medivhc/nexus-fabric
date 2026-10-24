@@ -359,6 +359,7 @@ fn main() -> ExitCode {
 /// P1-P5：`proxy_yaml` 为 Some 且含可用出站时注入 `ProxyEngine`，Proxy 包真发；
 /// 否则 D2 计数降级。
 /// R4：每次循环检查 `shutdown` 标志，置位后退出（join 1s 超时由调用方执行）。
+#[allow(clippy::too_many_arguments)]
 fn run_dataplane(
     config: nexusd::dataplane::DataplaneConfig,
     shutdown: Arc<AtomicBool>,
@@ -366,6 +367,8 @@ fn run_dataplane(
     tun_name: &str,
     tun_mtu: u32,
     proxy_yaml: Option<String>,
+    network_toml: Option<String>,
+    flow_sessions_mode: nexus_proxy_config::FlowSessionsMode,
 ) {
     use nexus_projection::TunDevice;
     // D1：创建单个 TUN（Linux）。设备名与 MTU 来自 [tun] 配置（T1）。
@@ -399,6 +402,35 @@ fn run_dataplane(
     if let Some(sender) = n1_sender {
         dp.set_n1_sender(sender);
         eprintln!("[nexusd] dataplane: N1 sender wired (n1_bridge_ready=true)");
+    }
+
+    // S25：生产 ChainDeps + 流会话三态（spec §7.6 第 3 步）。
+    match nexusd::dataplane::ProductionChainDeps::from_config(
+        network_toml.as_deref(),
+        proxy_yaml.as_deref(),
+    ) {
+        Ok(deps) => {
+            let providers = deps.provider_count();
+            dp.set_production_chain_deps(deps);
+            let enabled = dp.enable_flow_sessions_for_config(flow_sessions_mode, providers);
+            let status = dp.flow_sessions_state();
+            eprintln!(
+                "[nexusd.session] level=info event=flow_sessions state={} reason={} providers={} auto={}",
+                status.state,
+                status.reason.unwrap_or("-"),
+                status.providers,
+                matches!(
+                    flow_sessions_mode,
+                    nexus_proxy_config::FlowSessionsMode::Auto
+                ),
+            );
+            if enabled {
+                eprintln!("[nexusd.session] level=info event=providers_derived count={providers}");
+            }
+        }
+        Err(e) => {
+            eprintln!("[nexusd] ERROR: flow session wiring failed: {e}");
+        }
     }
 
     // P1-P5：注入 Proxy 转发引擎（有可用出站则真发，无则 D2 计数降级）。
@@ -829,6 +861,12 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     let tun_name = loaded.daemon.tun.name.clone();
     let tun_mtu = loaded.daemon.tun.mtu;
     let proxy_yaml = loaded.proxy_yaml.clone();
+    let network_toml = loaded.network_toml.clone();
+    let flow_sessions_mode = loaded
+        .daemon
+        .flow_sessions
+        .enabled
+        .unwrap_or(nexus_proxy_config::FlowSessionsMode::Auto);
     let dataplane_handle = if tun_enabled() {
         let dp_shutdown = Arc::clone(&shutdown);
         Some(
@@ -842,6 +880,8 @@ fn run_daemon(config_dir: &str) -> ExitCode {
                         &tun_name,
                         tun_mtu,
                         proxy_yaml,
+                        network_toml,
+                        flow_sessions_mode,
                     );
                 })
                 .expect("spawn dataplane thread"),

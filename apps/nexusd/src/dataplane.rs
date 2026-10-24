@@ -35,6 +35,13 @@ use nexus_projection::tcp::{
     FourTuple, STREAM_FIN, STREAM_RST, STREAM_SYN, TcpEvent, TcpTermStats, TcpTerminator,
     decode_stream_frame, encode_stream_frame, encode_syn_payload,
 };
+use nexus_proxy_config::FlowSessionsMode;
+
+mod chain_wiring;
+
+pub use chain_wiring::{
+    ChainDepsError, ProductionChainDeps, ProviderDeriveError, build_registry, derive_providers,
+};
 use nexus_projection::transparent::decision::{
     CachedDecision, FlowDecisionCache, FlowDecisionCacheStats, FlowDecisionKey, Frontend,
 };
@@ -200,6 +207,31 @@ pub struct Dataplane {
     rules: Box<dyn nexus_domain::RuleEngine>,
     /// TUN/TPROXY 共享的 5 元组决策缓存（spec §9.13）。
     decision_cache: FlowDecisionCache,
+    /// 生产 ChainDeps（由组合根注入；`None` = 无 provider 源）。
+    production_chain_deps: Option<ProductionChainDeps>,
+    /// 流会话状态（state/reason/providers；LocalAPI 读）。
+    flow_sessions: FlowSessionsState,
+}
+
+/// 流会话可见状态（spec §9.16 / §11.3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlowSessionsState {
+    /// `enabled` / `disabled`。
+    pub state: &'static str,
+    /// `no_providers` / `config` / `None`。
+    pub reason: Option<&'static str>,
+    /// 派生 Provider 数量。
+    pub providers: usize,
+}
+
+impl Default for FlowSessionsState {
+    fn default() -> Self {
+        Self {
+            state: "disabled",
+            reason: None,
+            providers: 0,
+        }
+    }
 }
 
 impl Dataplane {
@@ -288,6 +320,8 @@ impl Dataplane {
                 decision_cache_capacity,
                 std::time::Duration::from_secs(decision_cache_idle_secs),
             ),
+            production_chain_deps: None,
+            flow_sessions: FlowSessionsState::default(),
         })
     }
 
@@ -311,6 +345,54 @@ impl Dataplane {
         self.decision_cache.stats()
     }
 
+    /// 注入组合根构建的 ProductionChainDeps。
+    pub fn set_production_chain_deps(&mut self, deps: ProductionChainDeps) {
+        self.flow_sessions.providers = deps.provider_count();
+        self.production_chain_deps = Some(deps);
+    }
+
+    /// 流会话可见状态。
+    pub fn flow_sessions_state(&self) -> FlowSessionsState {
+        self.flow_sessions
+    }
+
+    /// 按配置三态启用流会话（spec §7.6 第 3 步）。
+    ///
+    /// - `Enabled`：强制启用（无 provider 源时也启用，由建连失败可见）；
+    /// - `Auto`：`provider_count > 0` 启用，否则禁用并 `reason=no_providers`；
+    /// - `Disabled`：禁用。
+    pub fn enable_flow_sessions_for_config(
+        &mut self,
+        mode: FlowSessionsMode,
+        provider_count: usize,
+    ) -> bool {
+        self.flow_sessions.providers = provider_count;
+        match mode {
+            FlowSessionsMode::Enabled => {
+                self.enable_flow_sessions();
+                self.flow_sessions.state = "enabled";
+                self.flow_sessions.reason = None;
+                true
+            }
+            FlowSessionsMode::Auto if provider_count > 0 => {
+                self.enable_flow_sessions();
+                self.flow_sessions.state = "enabled";
+                self.flow_sessions.reason = None;
+                true
+            }
+            FlowSessionsMode::Auto => {
+                self.flow_sessions.state = "disabled";
+                self.flow_sessions.reason = Some("no_providers");
+                false
+            }
+            FlowSessionsMode::Disabled => {
+                self.flow_sessions.state = "disabled";
+                self.flow_sessions.reason = None;
+                false
+            }
+        }
+    }
+
     /// Phase B：启用流→会话映射（E4/生产按需调用；默认关闭保持旧行为）。
     pub fn enable_flow_sessions(&mut self) {
         let upstream = Arc::clone(&self.flow_upstream);
@@ -331,38 +413,11 @@ impl Dataplane {
         &mut self,
         establisher: Box<dyn nexus_flow_session::ConnectivityEstablisher>,
     ) {
-        use nexus_domain::{FlowContext, ProviderId};
-        use nexus_planner::PlanningSnapshot;
-        use nexus_policy::PolicyEngine;
-        use nexus_registry::{ProviderRecord, Registry};
-
-        let chain_deps = ChainDeps {
-            policy: PolicyEngine::default_network(),
-            build_snapshot: Box::new(|flow: &FlowContext| {
-                let mut registry = Registry::new();
-                registry.register(ProviderRecord {
-                    id: ProviderId("provider-edge-a".into()),
-                    resource: flow.resource.clone(),
-                    placement: "local-edge".into(),
-                    locator: "edge-a.exit".into(),
-                    capabilities: vec!["internet-access".into()],
-                    present: true,
-                });
-                registry.register(ProviderRecord {
-                    id: ProviderId("provider-relay-b".into()),
-                    resource: flow.resource.clone(),
-                    placement: "regional-relay".into(),
-                    locator: "relay-b.exit".into(),
-                    capabilities: vec!["internet-access".into()],
-                    present: true,
-                });
-                let probe = PolicyEngine::default_network().evaluate(flow);
-                PlanningSnapshot::new(
-                    registry.candidates(&flow.resource),
-                    probe.decision.constraints,
-                )
-            }),
-            measure: Box::new(|_| None),
+        let chain_deps = match self.production_chain_deps.as_ref() {
+            Some(deps) => deps.to_chain_deps(),
+            None => ProductionChainDeps::from_config(None, None)
+                .expect("empty production chain deps must build")
+                .to_chain_deps(),
         };
         self.flow_chain_deps = Some(chain_deps);
         self.flow_mgr = Some(SessionManager::new(
@@ -557,7 +612,7 @@ impl Dataplane {
             }
             // Phase B：流→会话映射（启用时）。首包走 §10 链，会话建好前
             // TCP 本地握手照常（smoltcp 缓冲早期数据，D4）。
-            if self.flow_mgr.is_some() && !self.flow_handle_tcp_packet(&packet) {
+            if self.flow_mgr.is_some() && !self.flow_handle_tcp_packet(&packet, &classification) {
                 return Ok(true);
             }
             self.handle_tcp_terminated(&packet, &classification);
@@ -579,7 +634,7 @@ impl Dataplane {
                 classification,
                 Classification::Mesh { .. } | Classification::Proxy { .. }
             )
-            && !self.flow_handle_udp_packet(&packet)
+            && !self.flow_handle_udp_packet(&packet, &classification)
         {
             self.flow_pump();
             return Ok(true);
@@ -713,7 +768,7 @@ impl Dataplane {
     /// Phase C：UDP 包的流→会话映射。
     ///
     /// 返回 true = 继续现有转发路径；false = 包已处理（缓冲/丢弃），不继续。
-    fn flow_handle_udp_packet(&mut self, packet: &[u8]) -> bool {
+    fn flow_handle_udp_packet(&mut self, packet: &[u8], classification: &Classification) -> bool {
         let (mgr, deps) = match (self.flow_mgr.as_mut(), self.flow_chain_deps.as_ref()) {
             (Some(m), Some(d)) => (m, d),
             _ => return true,
@@ -724,7 +779,8 @@ impl Dataplane {
         };
         debug_assert_eq!(key.proto, IpProto::Udp);
         let now = std::time::Instant::now();
-        match mgr.on_packet(key, packet, false, deps, now) {
+        let hint = egress_hint(classification);
+        match mgr.on_packet_with_hint(key, packet, false, deps, now, hint) {
             FlowDecision::NewSession { .. } | FlowDecision::Buffered { .. } => {
                 // 已入 SessionManager 有界缓冲，暂不转发（Active 后 flush）。
                 false
@@ -796,7 +852,7 @@ impl Dataplane {
     /// Phase B：TCP 包的流→会话映射。
     ///
     /// 返回 true = 继续现有 smoltcp 终结路径；false = 包已处理（丢弃），不继续。
-    fn flow_handle_tcp_packet(&mut self, packet: &[u8]) -> bool {
+    fn flow_handle_tcp_packet(&mut self, packet: &[u8], classification: &Classification) -> bool {
         let (mgr, deps) = match (self.flow_mgr.as_mut(), self.flow_chain_deps.as_ref()) {
             (Some(m), Some(d)) => (m, d),
             _ => return true,
@@ -808,7 +864,8 @@ impl Dataplane {
         debug_assert_eq!(key.proto, IpProto::Tcp);
         let is_syn = is_tcp_syn(packet);
         let now = std::time::Instant::now();
-        match mgr.on_packet(key, packet, is_syn, deps, now) {
+        let hint = egress_hint(classification);
+        match mgr.on_packet_with_hint(key, packet, is_syn, deps, now, hint) {
             FlowDecision::NewSession { session_id } => {
                 // 待 TcpEvent::Syn 到达时绑定 stream_id。
                 let four = FourTuple {
@@ -1548,6 +1605,14 @@ impl nexus_dns::ProxyClassifier for StubProxyClassifier {
         true // MVP：默认走 proxy（触发 fake-IP）
     }
 }
+/// 分类结果携带的规则出站 tag（Q3 `egress_hint`）。
+fn egress_hint(classification: &Classification) -> Option<&str> {
+    match classification {
+        Classification::Proxy { outbound } => Some(outbound.as_str()),
+        _ => None,
+    }
+}
+
 /// 无代理配置时的默认规则实现（spec §5 G2/D2.3）。
 fn default_simple_engine() -> Result<SimpleRuleEngine, String> {
     let cidr = "0.0.0.0/0"
@@ -2026,6 +2091,30 @@ mod tests {
         let dropped_before = dp.stats().dropped;
         dp.inject_stream_frame_from_n1("x", &[0x00, 0x01]);
         assert_eq!(dp.stats().dropped, dropped_before + 1);
+    }
+
+    /// S25：enabled / auto+provider / auto-no-provider / disabled 四分支。
+    #[test]
+    fn flow_sessions_auto_branches() {
+        let (mut dp, _mock) = test_dataplane();
+        assert!(dp.enable_flow_sessions_for_config(FlowSessionsMode::Auto, 1));
+        assert_eq!(dp.flow_sessions_state().state, "enabled");
+        assert!(dp.flow_sessions_state().reason.is_none());
+
+        let (mut dp, _mock) = test_dataplane();
+        assert!(!dp.enable_flow_sessions_for_config(FlowSessionsMode::Auto, 0));
+        assert_eq!(dp.flow_sessions_state().state, "disabled");
+        assert_eq!(dp.flow_sessions_state().reason, Some("no_providers"));
+
+        let (mut dp, _mock) = test_dataplane();
+        assert!(dp.enable_flow_sessions_for_config(FlowSessionsMode::Enabled, 0));
+        assert_eq!(dp.flow_sessions_state().state, "enabled");
+
+        let (mut dp, _mock) = test_dataplane();
+        assert!(!dp.enable_flow_sessions_for_config(FlowSessionsMode::Disabled, 3));
+        assert_eq!(dp.flow_sessions_state().state, "disabled");
+        assert!(dp.flow_sessions_state().reason.is_none());
+        assert_eq!(dp.flow_sessions_state().providers, 3);
     }
 
     /// S24：同 5 元组第二包命中决策缓存，规则引擎调用次数不增。

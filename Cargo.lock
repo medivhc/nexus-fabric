@@ -1694,6 +1694,7 @@ dependencies = [
  "nexus-platform-windows",
  "nexus-policy",
  "nexus-projection",
+ "nexus-proxy",
  "nexus-proxy-config",
  "nexus-proxy-transport",
  "nexus-registry",
