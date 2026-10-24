@@ -33,6 +33,8 @@ pub mod op_log;
 /// 路由表事务性装配（快照/apply/rollback）。
 pub mod route;
 pub mod secure_store;
+/// TPROXY 透明捕获（Linux adapter；`IP_TRANSPARENT` 唯一落点）。
+pub mod tproxy;
 /// 稳定模块标识；业务实现应通过公开类型/trait 增量加入，而不是扩大隐式全局状态。
 pub mod tun;
 pub mod tun_vpi;
