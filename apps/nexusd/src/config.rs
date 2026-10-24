@@ -81,6 +81,8 @@ pub struct DaemonConfig {
     pub qos: QosSection,
     /// `[tun]` 小节：TUN 设备开关与参数（默认启用）。
     pub tun: TunSection,
+    /// `[flow_sessions]` 小节：流会话全局开关（默认 `auto`，spec §10.4）。
+    pub flow_sessions: FlowSessionsSection,
     /// `[network.turn]` 小节：TURN 中继配置（可选；缺失 = NAT 打洞/turn 子系统禁用）。
     pub turn: Option<TurnSection>,
     /// `[network.proxy]` 小节：fabric-over-proxy 代理配置（缺失 = 不启用）。
@@ -109,6 +111,20 @@ impl Default for TunSection {
             mtu: 1500,
         }
     }
+}
+
+/// `daemon.toml` 的 `[flow_sessions]` 小节（spec §10.4）。
+///
+/// 全部可选；未配置时由数据面按 `auto` 解析。与 `inbounds[kind=tun].sessions`
+/// 同时显式设置且不同 → `CONFIG_INVALID [flow_sessions.enabled]`（spec §10.7）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FlowSessionsSection {
+    /// 全局流会话开关（`auto` / `enabled` / `disabled`）。
+    pub enabled: Option<nexus_proxy_config::FlowSessionsMode>,
+    /// 会话空闲超时秒数（默认 300；0 非法）。
+    pub idle_timeout_secs: Option<u64>,
+    /// UDP 会话缓冲报文数（默认 64；0 非法）。
+    pub udp_buffer_datagrams: Option<usize>,
 }
 
 /// `daemon.toml` 的 `[network.turn]` 小节（NAT switching daemon activation，AC2）。
@@ -322,6 +338,7 @@ pub fn load(dir: &ConfigDir) -> Result<LoadedConfig, String> {
             localapi_addr: DaemonConfig::default_addr(),
             qos: QosSection::default(),
             tun: TunSection::default(),
+            flow_sessions: FlowSessionsSection::default(),
             turn: None,
             proxy: None,
         },
@@ -354,7 +371,9 @@ pub fn load(dir: &ConfigDir) -> Result<LoadedConfig, String> {
     if dir.has(PROXY_YAML) {
         let text = std::fs::read_to_string(dir.file(PROXY_YAML))
             .map_err(|e| format!("read {}: {e}", PROXY_YAML))?;
-        nexus_proxy_config::parse(&text).map_err(|e| format!("parse {PROXY_YAML}: {e:?}"))?;
+        let parsed =
+            nexus_proxy_config::parse(&text).map_err(|e| format!("parse {PROXY_YAML}: {e:?}"))?;
+        validate_flow_sessions_conflicts(&cfg.daemon.flow_sessions, &parsed)?;
         cfg.proxy_yaml = Some(text);
         if let Some(m) = FileMeta::of(&dir.file(PROXY_YAML)) {
             cfg.meta.insert(PROXY_YAML.to_string(), m);
@@ -393,6 +412,7 @@ fn parse_daemon_toml(text: &str) -> Result<DaemonConfig, String> {
         localapi_addr: DaemonConfig::default_addr(),
         qos: QosSection::default(),
         tun: TunSection::default(),
+        flow_sessions: FlowSessionsSection::default(),
         turn: None,
         proxy: None,
     };
@@ -418,6 +438,10 @@ fn parse_daemon_toml(text: &str) -> Result<DaemonConfig, String> {
     // [tun] 小节（可选；缺失则用默认值=启用）
     if let Some(t) = v.get("tun") {
         cfg.tun = parse_tun_section(t)?;
+    }
+    // [flow_sessions] 小节（可选；缺失则默认 auto）
+    if let Some(t) = v.get("flow_sessions") {
+        cfg.flow_sessions = parse_flow_sessions_section(t)?;
     }
     // [network.turn] 小节（可选；缺失 = turn/打洞子系统禁用）
     if let Some(t) = v.get("network").and_then(|n| n.get("turn")) {
@@ -724,6 +748,103 @@ fn parse_tun_section(t: &toml::Value) -> Result<TunSection, String> {
     Ok(TunSection { enabled, name, mtu })
 }
 
+/// 解析 `daemon.toml` 的 `[flow_sessions]` 小节（spec §10.4）。
+fn parse_flow_sessions_section(t: &toml::Value) -> Result<FlowSessionsSection, String> {
+    use nexus_proxy_config::FlowSessionsMode;
+
+    let enabled = match t.get("enabled") {
+        None => None,
+        Some(toml::Value::Boolean(b)) => Some(if *b {
+            FlowSessionsMode::Enabled
+        } else {
+            FlowSessionsMode::Disabled
+        }),
+        Some(toml::Value::String(s)) => match s.as_str() {
+            "auto" => Some(FlowSessionsMode::Auto),
+            "true" => Some(FlowSessionsMode::Enabled),
+            "false" => Some(FlowSessionsMode::Disabled),
+            other => {
+                return Err(format!(
+                    "CONFIG_INVALID [flow_sessions.enabled]: expected \"auto\", true or false, got '{other}'"
+                ));
+            }
+        },
+        Some(_) => {
+            return Err(
+                "CONFIG_INVALID [flow_sessions.enabled]: expected \"auto\", true or false"
+                    .to_string(),
+            );
+        }
+    };
+
+    let idle_timeout_secs = match t.get("idle_timeout_secs") {
+        None => None,
+        Some(x) => {
+            let n = x.as_integer().and_then(|i| u64::try_from(i).ok()).ok_or_else(|| {
+                "CONFIG_INVALID [flow_sessions.idle_timeout_secs]: must be a non-negative integer"
+                    .to_string()
+            })?;
+            if n == 0 {
+                return Err(
+                    "CONFIG_INVALID [flow_sessions.idle_timeout_secs]: must be >= 1".to_string(),
+                );
+            }
+            Some(n)
+        }
+    };
+
+    let udp_buffer_datagrams = match t.get("udp_buffer_datagrams") {
+        None => None,
+        Some(x) => {
+            let n = x
+                .as_integer()
+                .and_then(|i| usize::try_from(i).ok())
+                .ok_or_else(|| {
+                    "CONFIG_INVALID [flow_sessions.udp_buffer_datagrams]: must be a non-negative integer"
+                        .to_string()
+                })?;
+            if n == 0 {
+                return Err(
+                    "CONFIG_INVALID [flow_sessions.udp_buffer_datagrams]: must be >= 1".to_string(),
+                );
+            }
+            Some(n)
+        }
+    };
+
+    Ok(FlowSessionsSection {
+        enabled,
+        idle_timeout_secs,
+        udp_buffer_datagrams,
+    })
+}
+
+/// `[flow_sessions].enabled` 与 `inbounds[kind=tun].sessions` 的冲突校验（spec §10.7）。
+fn validate_flow_sessions_conflicts(
+    flow: &FlowSessionsSection,
+    proxy: &nexus_proxy_config::ProxyConfig,
+) -> Result<(), String> {
+    let Some(flow_mode) = flow.enabled else {
+        return Ok(());
+    };
+    for (i, inbound) in proxy.inbounds.iter().enumerate() {
+        if inbound.kind != nexus_proxy_config::InboundKind::Tun {
+            continue;
+        }
+        let Some(tun) = inbound.tun.as_ref() else {
+            continue;
+        };
+        if tun.sessions_explicit && tun.sessions != flow_mode {
+            return Err(format!(
+                "CONFIG_INVALID [flow_sessions.enabled]: {} conflicts with inbounds[{i}].sessions={} (set only one)",
+                flow_mode.as_str(),
+                tun.sessions.as_str()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// 解析 `daemon.toml` 的 `[qos]` 小节。
 ///
 /// 接受 `enabled`（或别名 `enable`）、`mesh_upload_mbps` / `proxy_upload_mbps`
@@ -940,6 +1061,10 @@ pub fn classify_change(old: &LoadedConfig, new: &LoadedConfig) -> ChangeKind {
     }
     // daemon.toml：[tun] 小节变化需重启（T4：TUN 设备启停需重建）
     if old.daemon.tun != new.daemon.tun {
+        return ChangeKind::NeedsRestart;
+    }
+    // daemon.toml：[flow_sessions] 变化需重启数据面（spec §10.8）。
+    if old.daemon.flow_sessions != new.daemon.flow_sessions {
         return ChangeKind::NeedsRestart;
     }
     // daemon.toml：[network.turn] 小节变化需重启（TURN 客户端启停需重建）。
@@ -1583,6 +1708,116 @@ password=\"p\"\n\
             DAEMON_TOML,
             "[network.proxy]\ntype = \"socks5\"\nserver = \"127.0.0.1:1081\"\n",
         );
+        let new = load(&dir).unwrap();
+        assert_eq!(classify_change(&old, &new), ChangeKind::NeedsRestart);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    const TUN_PROXY_YAML: &str = "schema_version: 1\ninbounds:\n  - tag: t\n    kind: tun\n    sessions: enabled\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
+
+    #[test]
+    fn flow_sessions_defaults_when_absent() {
+        let cfg = parse_daemon_toml("[localapi]\naddr = \"127.0.0.1:18080\"\n").unwrap();
+        assert_eq!(cfg.flow_sessions, FlowSessionsSection::default());
+        assert!(cfg.flow_sessions.enabled.is_none());
+        assert!(cfg.flow_sessions.idle_timeout_secs.is_none());
+        assert!(cfg.flow_sessions.udp_buffer_datagrams.is_none());
+    }
+
+    #[test]
+    fn flow_sessions_parses_enabled_forms() {
+        use nexus_proxy_config::FlowSessionsMode;
+        let cfg = parse_daemon_toml("[flow_sessions]\nenabled = \"auto\"\n").unwrap();
+        assert_eq!(cfg.flow_sessions.enabled, Some(FlowSessionsMode::Auto));
+        let cfg = parse_daemon_toml("[flow_sessions]\nenabled = true\n").unwrap();
+        assert_eq!(cfg.flow_sessions.enabled, Some(FlowSessionsMode::Enabled));
+        let cfg = parse_daemon_toml("[flow_sessions]\nenabled = false\n").unwrap();
+        assert_eq!(cfg.flow_sessions.enabled, Some(FlowSessionsMode::Disabled));
+        let cfg = parse_daemon_toml(
+            "[flow_sessions]\nenabled = \"auto\"\nidle_timeout_secs = 120\nudp_buffer_datagrams = 32\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.flow_sessions.idle_timeout_secs, Some(120));
+        assert_eq!(cfg.flow_sessions.udp_buffer_datagrams, Some(32));
+    }
+
+    #[test]
+    fn flow_sessions_rejects_invalid_values() {
+        let err = parse_daemon_toml("[flow_sessions]\nenabled = \"yes\"\n").unwrap_err();
+        assert!(
+            err.contains("CONFIG_INVALID [flow_sessions.enabled]"),
+            "{err}"
+        );
+        let err = parse_daemon_toml("[flow_sessions]\nenabled = 1\n").unwrap_err();
+        assert!(
+            err.contains("CONFIG_INVALID [flow_sessions.enabled]"),
+            "{err}"
+        );
+        let err = parse_daemon_toml("[flow_sessions]\nidle_timeout_secs = 0\n").unwrap_err();
+        assert!(
+            err.contains("CONFIG_INVALID [flow_sessions.idle_timeout_secs]"),
+            "{err}"
+        );
+        let err = parse_daemon_toml("[flow_sessions]\nudp_buffer_datagrams = 0\n").unwrap_err();
+        assert!(
+            err.contains("CONFIG_INVALID [flow_sessions.udp_buffer_datagrams]"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn flow_sessions_conflicting_with_tun_sessions_is_rejected() {
+        let d = std::env::temp_dir().join("nexusd-cfg-test-flow-conflict");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        write(&d, PROXY_YAML, TUN_PROXY_YAML);
+        write(&d, DAEMON_TOML, "[flow_sessions]\nenabled = false\n");
+        let dir = ConfigDir::new(&d).unwrap();
+        let err = load(&dir).unwrap_err();
+        assert!(
+            err.contains("CONFIG_INVALID [flow_sessions.enabled]"),
+            "{err}"
+        );
+        assert!(err.contains("inbounds[0].sessions"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn flow_sessions_and_tun_sessions_agree() {
+        let d = std::env::temp_dir().join("nexusd-cfg-test-flow-agree");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        write(&d, PROXY_YAML, TUN_PROXY_YAML);
+        write(&d, DAEMON_TOML, "[flow_sessions]\nenabled = true\n");
+        let dir = ConfigDir::new(&d).unwrap();
+        assert!(load(&dir).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn flow_sessions_single_source_is_accepted() {
+        let d = std::env::temp_dir().join("nexusd-cfg-test-flow-single");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        write(&d, PROXY_YAML, TUN_PROXY_YAML);
+        let dir = ConfigDir::new(&d).unwrap();
+        assert!(load(&dir).is_ok());
+        std::fs::remove_file(d.join(PROXY_YAML)).unwrap();
+        write(&d, DAEMON_TOML, "[flow_sessions]\nenabled = false\n");
+        let dir = ConfigDir::new(&d).unwrap();
+        assert!(load(&dir).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn flow_sessions_change_needs_restart() {
+        let d = std::env::temp_dir().join("nexusd-cfg-test-flow-restart");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        write(&d, DAEMON_TOML, "[flow_sessions]\nenabled = true\n");
+        let dir = ConfigDir::new(&d).unwrap();
+        let old = load(&dir).unwrap();
+        write(&d, DAEMON_TOML, "[flow_sessions]\nenabled = false\n");
         let new = load(&dir).unwrap();
         assert_eq!(classify_change(&old, &new), ChangeKind::NeedsRestart);
         let _ = std::fs::remove_dir_all(&d);

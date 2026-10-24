@@ -194,6 +194,8 @@ pub struct TunInboundConfig {
     pub ipv6: bool,
     /// 流会话模式（默认 `auto`）。
     pub sessions: FlowSessionsMode,
+    /// YAML 是否显式给出 `sessions`（用于 §10.7 与 `[flow_sessions].enabled` 的冲突判定）。
+    pub sessions_explicit: bool,
 }
 
 impl Default for TunInboundConfig {
@@ -207,6 +209,7 @@ impl Default for TunInboundConfig {
             fake_ip: false,
             ipv6: false,
             sessions: FlowSessionsMode::Auto,
+            sessions_explicit: false,
         }
     }
 }
@@ -1103,6 +1106,7 @@ fn parse_tun_inbound(node: &Node, base: &str) -> Result<TunInboundConfig, Config
     if let Some(mode) = opt_str(node, "sessions") {
         cfg.sessions = FlowSessionsMode::parse(&mode)
             .map_err(|e| ConfigError::new(format!("{base}.sessions"), e.reason))?;
+        cfg.sessions_explicit = true;
     }
     Ok(cfg)
 }
