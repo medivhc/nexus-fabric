@@ -624,12 +624,19 @@ fn judge(
             };
         }
         if workload.echo_ok {
-            notes.push("negative case was accepted (bad credential/config)".into());
+            notes.push(
+                "negative case silently accepted: valid echo returned (spec E1 rule 1 phenomenon)"
+                    .into(),
+            );
+            notes.push(
+                "responsibility split (reference tolerance vs client bypass) needs the reference log as secondary evidence; do not default to E_REF_BEHAVIOR"
+                    .into(),
+            );
             return Outcome {
-                verdict: Verdict::Blocked,
+                verdict: Verdict::Fail,
                 error: Some(ErrorInfo {
-                    class: ErrorClass::ERefBehavior,
-                    message: "reference tolerated a negative case".into(),
+                    class: ErrorClass::ENexusFraming,
+                    message: "negative case silently accepted: valid echo returned".into(),
                     first_failure_artifact: Some("pcap.pcap".into()),
                 }),
                 metrics,
@@ -638,30 +645,26 @@ fn judge(
             };
         }
         if !workload.echoed.is_empty() {
+            notes.push(
+                "negative case returned non-echo bytes; silently surfaced as tunnel payload".into(),
+            );
             if cfg.variant == Variant::TrojanFallback {
                 notes.push(
                     "fallback response was relayed as tunnel data; D1 has no dedicated class, using E_NEXUS_FRAMING"
                         .into(),
                 );
-                return Outcome {
-                    verdict: Verdict::Fail,
-                    error: Some(ErrorInfo {
-                        class: ErrorClass::ENexusFraming,
-                        message: "fallback HTTP response silently surfaced as tunnel payload"
-                            .into(),
-                        first_failure_artifact: Some("pcap.pcap".into()),
-                    }),
-                    metrics,
-                    notes,
-                    proxy_json: proxy_json.cloned(),
-                };
             }
-            notes.push("negative case returned non-echo bytes".into());
+            notes.push(
+                "responsibility split (reference tolerance vs client bypass) needs the reference log as secondary evidence; do not default to E_REF_BEHAVIOR"
+                    .into(),
+            );
             return Outcome {
-                verdict: Verdict::Blocked,
+                verdict: Verdict::Fail,
                 error: Some(ErrorInfo {
-                    class: ErrorClass::ERefBehavior,
-                    message: "reference returned non-echo bytes for a negative case".into(),
+                    class: ErrorClass::ENexusFraming,
+                    message:
+                        "negative case returned non-echo bytes; silently surfaced as tunnel payload"
+                            .into(),
                     first_failure_artifact: Some("pcap.pcap".into()),
                 }),
                 metrics,
