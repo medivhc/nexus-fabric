@@ -58,6 +58,7 @@ impl NftablesCaptureRules {
     }
 
     /// 测试/示例注入执行器。
+    #[cfg(test)]
     pub(crate) fn with_runner(runner: Box<dyn CommandRunner>) -> Self {
         Self {
             runner,
@@ -118,13 +119,12 @@ impl NftablesCaptureRules {
         if probe.success() {
             return Ok(false);
         }
-        let declaration =
-            format!("{{ type filter hook prerouting priority mangle; policy accept; }}");
+        let declaration = "{ type filter hook prerouting priority mangle; policy accept; }";
         run_ok(
             self.runner.as_mut(),
             "add-chain",
             "nft",
-            &["add", "chain", "inet", "nexus_tproxy", &chain, &declaration],
+            &["add", "chain", "inet", "nexus_tproxy", &chain, declaration],
         )?;
         self.added.push(Action::ChainCreated);
         Ok(true)
@@ -236,9 +236,12 @@ impl NftablesCaptureRules {
         block: bool,
     ) -> Result<RuleApplyReport, CaptureRuleError> {
         self.spec = Some(spec.clone());
-        let mut report = RuleApplyReport::default();
-        report.chain_created = self.ensure_table()?;
-        report.chain_created |= self.ensure_chain()?;
+        let table_created = self.ensure_table()?;
+        let chain_created = self.ensure_chain()?;
+        let mut report = RuleApplyReport {
+            chain_created: table_created || chain_created,
+            ..RuleApplyReport::default()
+        };
         for rule in self.rules(spec, block) {
             if self.ensure_rule(&rule)? {
                 report.rules_added += 1;

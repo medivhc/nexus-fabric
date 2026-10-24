@@ -136,6 +136,7 @@ impl TransparentUdpIngress for TproxyUdpSocket {
     }
 
     fn local_addr(&self) -> Result<SocketAddr, TransparentIngressError> {
+        // SAFETY: sockaddr_in is plain-old-data; zeroing is a valid initial value.
         let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
         // SAFETY: valid out-params sized for sockaddr_in.
@@ -168,11 +169,13 @@ impl TransparentUdpIngress for TproxyUdpSocket {
         }
         let mut payload = vec![0u8; 65_535];
         let mut control = [0u8; 256];
+        // SAFETY: sockaddr_in/msghdr are plain-old-data; zeroing is a valid initial value.
         let mut peer: libc::sockaddr_in = unsafe { std::mem::zeroed() };
         let mut iov = libc::iovec {
             iov_base: payload.as_mut_ptr().cast(),
             iov_len: payload.len(),
         };
+        // SAFETY: msghdr is plain-old-data; all pointers are filled below.
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
         msg.msg_name = (&mut peer as *mut libc::sockaddr_in).cast();
         msg.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
@@ -239,6 +242,7 @@ impl TransparentUdpIngress for TproxyUdpSocket {
             iov_base: payload.as_ptr().cast_mut().cast(),
             iov_len: payload.len(),
         };
+        // SAFETY: msghdr is plain-old-data; all pointers are filled below.
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
         msg.msg_name = (&mut dest as *mut libc::sockaddr_in).cast();
         msg.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;

@@ -55,6 +55,7 @@ impl IptablesCaptureRules {
     }
 
     /// 测试/示例注入执行器。
+    #[cfg(test)]
     pub(crate) fn with_runner(runner: Box<dyn CommandRunner>) -> Self {
         Self {
             runner,
@@ -240,8 +241,11 @@ impl IptablesCaptureRules {
         block: bool,
     ) -> Result<RuleApplyReport, CaptureRuleError> {
         self.spec = Some(spec.clone());
-        let mut report = RuleApplyReport::default();
-        report.chain_created = self.ensure_chain("create-chain")?;
+        let chain_created = self.ensure_chain("create-chain")?;
+        let mut report = RuleApplyReport {
+            chain_created,
+            ..RuleApplyReport::default()
+        };
         for rule in self.build_rules(spec, block) {
             let args: Vec<&str> = rule.iter().map(String::as_str).collect();
             if self.ensure_rule("add-rule", &args)? {
@@ -541,8 +545,10 @@ mod tests {
 
     #[test]
     fn iptables_rules_permission_error_is_structured() {
-        let mut runner = StatefulRunner::default();
-        runner.fail_needle = Some("-A NEXUS_TPROXY".to_string());
+        let runner = StatefulRunner {
+            fail_needle: Some("-A NEXUS_TPROXY".to_string()),
+            ..StatefulRunner::default()
+        };
         let mut rules = IptablesCaptureRules::with_runner(Box::new(runner));
         let err = rules.apply(&spec()).unwrap_err();
         assert!(matches!(err, CaptureRuleError::PermissionDenied { .. }));

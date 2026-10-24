@@ -41,6 +41,7 @@ impl ExternalCaptureRules {
     }
 
     /// 测试/示例注入执行器。
+    #[cfg(test)]
     pub(crate) fn with_runner(runner: Box<dyn CommandRunner>) -> Self {
         Self {
             runner,

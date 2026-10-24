@@ -129,6 +129,7 @@ pub fn sockaddr_in_to_v4(bytes: &[u8]) -> Result<SocketAddrV4, TransparentIngres
 
 /// 构造 `sockaddr_in` 供 `bind` / `sendmsg` 使用。
 pub(crate) fn to_sockaddr_in(addr: SocketAddrV4) -> libc::sockaddr_in {
+    // SAFETY: sockaddr_in is plain-old-data; zeroing is a valid initial value.
     let mut out: libc::sockaddr_in = unsafe { std::mem::zeroed() };
     out.sin_family = libc::AF_INET as libc::sa_family_t;
     out.sin_port = addr.port().to_be();
@@ -143,7 +144,8 @@ pub(crate) fn to_sockaddr_in(addr: SocketAddrV4) -> libc::sockaddr_in {
 /// `addr` 必须指向一个已初始化、长度至少 `size_of::<sockaddr_in>()` 的
 /// `sockaddr_in`。
 pub(crate) unsafe fn from_sockaddr_in(addr: *const libc::sockaddr_in) -> SocketAddrV4 {
-    // SAFETY: caller guarantees `addr` points to a valid sockaddr_in.
+    // SAFETY: caller guarantees `addr` points to a valid, initialized
+    // sockaddr_in that outlives this borrow.
     let value = unsafe { &*addr };
     let octets = value.sin_addr.s_addr.to_ne_bytes();
     SocketAddrV4::new(Ipv4Addr::from(octets), u16::from_be(value.sin_port))
@@ -203,6 +205,12 @@ mod tests {
         out[std::mem::size_of::<usize>() + 4..header].copy_from_slice(&ty.to_ne_bytes());
         out[header..len].copy_from_slice(data);
         out
+    }
+
+    #[test]
+    fn tproxy_cmsg_empty_buffer_and_missing_orig_dst() {
+        assert!(parse_cmsgs(&[]).unwrap().is_empty());
+        assert_eq!(find_orig_dst(&[]).unwrap(), None);
     }
 
     #[test]

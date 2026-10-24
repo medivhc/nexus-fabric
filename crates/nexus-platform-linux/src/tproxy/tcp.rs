@@ -148,6 +148,7 @@ impl TransparentTcpIngress for TproxyTcpListener {
     }
 
     fn local_addr(&self) -> Result<SocketAddr, TransparentIngressError> {
+        // SAFETY: sockaddr_in is plain-old-data; zeroing is a valid initial value.
         let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
         // SAFETY: `addr`/`len` are valid out-params sized for sockaddr_in.
@@ -215,6 +216,7 @@ impl TransparentTcpIngress for TproxyTcpListener {
             });
         }
         if orig_dst.port() == 0 {
+            // SAFETY: `accepted` is a fresh fd owned here; close before return.
             unsafe { libc::close(accepted) };
             return Err(TransparentIngressError::OrigDstInvalid {
                 raw: orig_dst.to_string(),
@@ -259,6 +261,7 @@ impl Drop for TproxyTcpListener {
 }
 
 fn peer_addr(fd: RawFd) -> Result<SocketAddrV4, TransparentIngressError> {
+    // SAFETY: sockaddr_in is plain-old-data; zeroing is a valid initial value.
     let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
     // SAFETY: valid out-params for getpeername on an accepted AF_INET socket.
@@ -280,6 +283,7 @@ fn peer_addr(fd: RawFd) -> Result<SocketAddrV4, TransparentIngressError> {
 }
 
 fn local_addr_of(fd: RawFd) -> Result<SocketAddrV4, TransparentIngressError> {
+    // SAFETY: sockaddr_in is plain-old-data; zeroing is a valid initial value.
     let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
     // SAFETY: valid out-params for getsockname on an accepted AF_INET socket.
