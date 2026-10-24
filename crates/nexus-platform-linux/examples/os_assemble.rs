@@ -94,6 +94,8 @@ fn main() {
         default_route: false,
         dry_run: false,
         log_path: None,
+        exclude_dst_cidrs: Vec::new(),
+        exclude_default_gateway: None,
     };
     let mut asm = match OsAssemble::new(config) {
         Ok(a) => a,
@@ -143,6 +145,8 @@ fn main() {
         default_route: false,
         dry_run: true,
         log_path: None,
+        exclude_dst_cidrs: Vec::new(),
+        exclude_default_gateway: None,
     };
     let mut dry_asm = match OsAssemble::new(dry_config) {
         Ok(a) => a,

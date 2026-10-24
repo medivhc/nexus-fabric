@@ -351,6 +351,11 @@ impl Dataplane {
         Ok(())
     }
 
+    /// TUN 设备名（OsAssemble 装配用）。
+    pub fn tun_name(&self) -> &str {
+        self.tun.name()
+    }
+
     /// 决策缓存计数器快照。
     pub fn decision_cache_stats(&self) -> FlowDecisionCacheStats {
         self.decision_cache.stats()

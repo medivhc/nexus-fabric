@@ -369,6 +369,8 @@ fn run_dataplane(
     proxy_yaml: Option<String>,
     network_toml: Option<String>,
     flow_sessions_mode: nexus_proxy_config::FlowSessionsMode,
+    tun_default_route: bool,
+    tun_excludes: Vec<([u8; 4], u8)>,
 ) {
     use nexus_projection::TunDevice;
     // D1：创建单个 TUN（Linux）。设备名与 MTU 来自 [tun] 配置（T1）。
@@ -397,6 +399,54 @@ fn run_dataplane(
 
     // B1：发布 stats 句柄供 LocalAPI 读取。
     nexusd::dataplane::publish_stats_handle(dp.stats_handle());
+
+    // S28：TUN 数据面启动时装配 OS 路由；失败 → os_assemble=failed 降级。
+    #[cfg(target_os = "linux")]
+    let mut os_assemble = {
+        use nexus_platform_linux::assemble::{OsAssemble, OsAssembleConfig};
+        let config = OsAssembleConfig {
+            ifname: dp.tun_name().to_string(),
+            tun_ip: [10, 99, 0, 1],
+            prefixlen: 24,
+            subnet: ([10, 99, 0, 0], 24),
+            default_route: tun_default_route,
+            dry_run: false,
+            log_path: None,
+            exclude_dst_cidrs: tun_excludes,
+            exclude_default_gateway: None,
+        };
+        match OsAssemble::new(config) {
+            Ok(mut assemble) => match assemble.apply() {
+                Ok(report) => {
+                    eprintln!(
+                        "[nexusd.os] level=info event=os_assemble state=applied ifname={} addrs={} routes={} default_route={} excludes={}",
+                        dp.tun_name(),
+                        report.addrs_added,
+                        report.routes_added,
+                        report.default_route_added,
+                        report.excludes_added,
+                    );
+                    Some(assemble)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[nexusd.os] level=error event=os_assemble state=failed ifname={} reason={e}",
+                        dp.tun_name()
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "[nexusd.os] level=error event=os_assemble state=failed ifname={} reason={e}",
+                    dp.tun_name()
+                );
+                None
+            }
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut os_assemble: Option<()> = None;
 
     // R1：注入 N1 发送器（有则真发，无则 D2 计数降级）。
     if let Some(sender) = n1_sender {
@@ -449,6 +499,7 @@ fn run_dataplane(
     }
 
     eprintln!("[nexusd] dataplane: running");
+    let _ = &mut os_assemble;
     loop {
         // R4：关闭信号 → 退出循环（TUN 随 Dataplane drop 关闭）。
         if shutdown.load(Ordering::Relaxed) {
@@ -467,6 +518,20 @@ fn run_dataplane(
             }
         }
     }
+    #[cfg(target_os = "linux")]
+    if let Some(mut assemble) = os_assemble.take() {
+        match assemble.cleanup() {
+            Ok(report) => eprintln!(
+                "[nexusd.os] level=info event=os_assemble state=cleaned addrs={} routes={} excludes={}",
+                report.addrs_removed, report.routes_removed, report.excludes_removed
+            ),
+            Err(e) => eprintln!(
+                "[nexusd.os] level=error event=os_assemble state=cleanup_failed reason={e}"
+            ),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = os_assemble.take();
 }
 
 /// NAT switching daemon runtime（AC5）。
@@ -867,6 +932,29 @@ fn run_daemon(config_dir: &str) -> ExitCode {
         .flow_sessions
         .enabled
         .unwrap_or(nexus_proxy_config::FlowSessionsMode::Auto);
+    let tun_default_route = loaded.daemon.tun.default_route;
+    // S28：exclude_server_routes=true 时从 proxy outbounds locator 收集 IP → /32。
+    let tun_excludes: Vec<([u8; 4], u8)> = if loaded.daemon.tun.exclude_server_routes {
+        loaded
+            .proxy_yaml
+            .as_deref()
+            .and_then(|yaml| nexus_proxy_config::parse(yaml).ok())
+            .map(|config| {
+                config
+                    .outbounds
+                    .iter()
+                    .filter_map(|outbound| outbound.locator.as_deref())
+                    .filter_map(|locator| {
+                        let host = locator.rsplit_once(':').map(|(h, _)| h).unwrap_or(locator);
+                        host.parse::<std::net::Ipv4Addr>().ok()
+                    })
+                    .map(|ip| (ip.octets(), 32))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let dataplane_handle = if tun_enabled() {
         let dp_shutdown = Arc::clone(&shutdown);
         Some(
@@ -882,6 +970,8 @@ fn run_daemon(config_dir: &str) -> ExitCode {
                         proxy_yaml,
                         network_toml,
                         flow_sessions_mode,
+                        tun_default_route,
+                        tun_excludes,
                     );
                 })
                 .expect("spawn dataplane thread"),

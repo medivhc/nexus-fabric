@@ -616,4 +616,30 @@ mod tests {
         ));
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
+
+    /// S28：OsAssemble 干跑计划（零写入），排除项计入报告。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn os_assemble_dry_run_plan() {
+        use nexus_platform_linux::assemble::{OsAssemble, OsAssembleConfig};
+        let config = OsAssembleConfig {
+            ifname: "lo".to_string(),
+            tun_ip: [10, 99, 0, 1],
+            prefixlen: 24,
+            subnet: ([10, 99, 0, 0], 24),
+            default_route: true,
+            dry_run: true,
+            log_path: None,
+            exclude_dst_cidrs: vec![([203, 0, 113, 7], 32)],
+            exclude_default_gateway: Some([192, 168, 1, 1]),
+        };
+        let mut assemble = OsAssemble::new(config).expect("lo exists");
+        let report = assemble.apply().expect("dry run");
+        assert!(report.dry_run);
+        assert_eq!(report.excludes_added, 1);
+        assert!(report.default_route_added);
+        assert!(!report.actions.is_empty());
+        let cleanup = assemble.cleanup().expect("dry-run cleanup");
+        assert_eq!(cleanup.excludes_removed, 0);
+    }
 }

@@ -30,6 +30,10 @@ pub struct OsAssembleConfig {
     pub dry_run: bool,
     /// 操作日志路径（O6）；`None` → 当前目录 `os_assemble.log`。
     pub log_path: Option<std::path::PathBuf>,
+    /// 需要绕开 TUN 的目的 CIDR（代理服务器 /32 / 用户排除）；默认空。
+    pub exclude_dst_cidrs: Vec<([u8; 4], u8)>,
+    /// 原默认网关；`None` = 由实现探测。
+    pub exclude_default_gateway: Option<[u8; 4]>,
 }
 
 /// 清理报告（O6 可观测）。
@@ -39,6 +43,8 @@ pub struct CleanupReport {
     pub addrs_removed: u32,
     /// 删除的路由数。
     pub routes_removed: u32,
+    /// 删除的排除路由数。
+    pub excludes_removed: u32,
 }
 
 /// OS 装配器：`apply()` / `cleanup()` 精确配对。
@@ -48,6 +54,7 @@ pub struct OsAssemble {
     added_addr: bool,
     added_subnet_route: bool,
     added_default_route: bool,
+    added_excludes: Vec<([u8; 4], u8)>,
     op_log: OpLog,
 }
 
@@ -67,6 +74,7 @@ impl OsAssemble {
             added_addr: false,
             added_subnet_route: false,
             added_default_route: false,
+            added_excludes: Vec::new(),
             op_log,
         })
     }
@@ -105,12 +113,20 @@ impl OsAssemble {
         };
 
         if self.config.dry_run {
-            let report = crate::route::apply(&plan, true);
+            let mut report = crate::route::apply(&plan, true)?;
+            report.excludes_added = self.config.exclude_dst_cidrs.len() as u32;
+            report.default_route_added = self.config.default_route;
+            for (ip, prefix) in &self.config.exclude_dst_cidrs {
+                report.actions.push(format!(
+                    "exclude {}.{}.{}.{}/{prefix} via {:?}",
+                    ip[0], ip[1], ip[2], ip[3], self.config.exclude_default_gateway
+                ));
+            }
             self.op_log.log(
                 "apply_dry_run",
                 &[("ifname", &self.config.ifname), ("result", "ok")],
             );
-            return report;
+            return Ok(report);
         }
 
         // 地址（�等）。
@@ -186,6 +202,30 @@ impl OsAssemble {
             if self.config.default_route {
                 apply_route(&mut nl, None, &mut self.added_default_route, &mut report)?;
             }
+            // 排除路由：经原网关，不经 TUN（只删本实例添加项）。
+            for (ip, prefix) in self.config.exclude_dst_cidrs.clone() {
+                let routes = nl.list_routes().map_err(nl_err("list routes"))?;
+                if routes.iter().any(|r| r.dst == Some((ip, prefix))) {
+                    report.routes_skipped += 1;
+                    continue;
+                }
+                nl.new_route(
+                    Some((ip, prefix)),
+                    self.ifindex,
+                    self.config.exclude_default_gateway,
+                )
+                .map_err(nl_err("add exclude route"))?;
+                self.added_excludes.push((ip, prefix));
+                report.excludes_added += 1;
+                self.op_log.log(
+                    "exclude_route_added",
+                    &[
+                        ("ifname", &self.config.ifname),
+                        ("dst", &format!("{ip:?}/{prefix}")),
+                    ],
+                );
+            }
+            report.default_route_added = self.added_default_route;
             Ok(())
         })();
 
@@ -256,6 +296,17 @@ impl OsAssemble {
             }
             self.added_default_route = false;
         }
+        if !self.added_excludes.is_empty() {
+            let routes = nl.list_routes().map_err(nl_err("list routes"))?;
+            let excludes = std::mem::take(&mut self.added_excludes);
+            for (ip, prefix) in excludes {
+                if routes.iter().any(|r| r.dst == Some((ip, prefix))) {
+                    nl.del_route(Some((ip, prefix)), self.ifindex, None)
+                        .map_err(nl_err("delete exclude route"))?;
+                    report.excludes_removed += 1;
+                }
+            }
+        }
         if self.added_subnet_route {
             let routes = nl.list_routes().map_err(nl_err("list routes"))?;
             let exists = routes
@@ -322,6 +373,8 @@ mod tests {
             default_route: false,
             dry_run: true,
             log_path: None,
+            exclude_dst_cidrs: Vec::new(),
+            exclude_default_gateway: None,
         };
         let r = OsAssemble::new(config);
         assert!(matches!(r, Err(PlatformError::NotFound { .. })));
@@ -337,6 +390,8 @@ mod tests {
             default_route: false,
             dry_run: true,
             log_path: Some(std::env::temp_dir().join("os-assemble-test.log")),
+            exclude_dst_cidrs: Vec::new(),
+            exclude_default_gateway: None,
         };
         let mut asm = OsAssemble::new(config).expect("lo exists");
         let report = asm.apply().expect("dry-run");
@@ -346,5 +401,28 @@ mod tests {
         let cleanup = asm.cleanup().expect("cleanup");
         assert_eq!(cleanup.addrs_removed, 0);
         assert_eq!(cleanup.routes_removed, 0);
+    }
+
+    #[test]
+    fn os_assemble_dry_run_reports_excludes_and_default_route() {
+        let config = OsAssembleConfig {
+            ifname: "lo".to_string(),
+            tun_ip: [10, 99, 0, 1],
+            prefixlen: 24,
+            subnet: ([10, 99, 0, 0], 24),
+            default_route: true,
+            dry_run: true,
+            log_path: None,
+            exclude_dst_cidrs: vec![([203, 0, 113, 7], 32), ([198, 51, 100, 9], 32)],
+            exclude_default_gateway: Some([192, 168, 1, 1]),
+        };
+        let mut assemble = OsAssemble::new(config).expect("lo exists");
+        let report = assemble.apply().expect("dry run");
+        assert!(report.dry_run);
+        assert_eq!(report.excludes_added, 2);
+        assert!(report.default_route_added);
+        assert!(report.actions.iter().any(|a| a.contains("203.0.113.7/32")));
+        let cleanup = assemble.cleanup().expect("dry cleanup");
+        assert_eq!(cleanup.excludes_removed, 0);
     }
 }
