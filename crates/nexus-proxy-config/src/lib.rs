@@ -131,6 +131,8 @@ pub struct InboundConfig {
     pub listen: String,
     /// `kind: tun` 的子配置；非 tun 入站为 `None`。
     pub tun: Option<TunInboundConfig>,
+    /// `kind: tproxy` 的子配置；非 tproxy 入站为 `None`。
+    pub tproxy: Option<TproxyInboundConfig>,
 }
 
 /// 流会话开关模式（Q2 定案默认 `auto`）。
@@ -205,6 +207,172 @@ impl Default for TunInboundConfig {
             fake_ip: false,
             ipv6: false,
             sessions: FlowSessionsMode::Auto,
+        }
+    }
+}
+
+/// TPROXY 捕获 backend。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureBackendConfig {
+    /// iptables（默认）。
+    Iptables,
+    /// nftables。
+    Nftables,
+    /// external：只校验不写规则。
+    External,
+}
+
+impl CaptureBackendConfig {
+    /// 解析配置取值。
+    ///
+    /// # Errors
+    ///
+    /// 未知取值返回 `CONFIG_INVALID [kind]`，调用方补全字段路径。
+    pub fn parse(s: &str) -> Result<Self, ConfigError> {
+        match s {
+            "iptables" => Ok(Self::Iptables),
+            "nftables" => Ok(Self::Nftables),
+            "external" => Ok(Self::External),
+            other => Err(ConfigError::new(
+                "kind",
+                format!("unknown capture backend '{other}' (supports iptables/nftables/external)"),
+            )),
+        }
+    }
+
+    /// 稳定的机器可读标签。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Iptables => "iptables",
+            Self::Nftables => "nftables",
+            Self::External => "external",
+        }
+    }
+}
+
+/// 捕获失败策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureFailureMode {
+    /// 阻断（默认）：安装 DROP 规则；backend 不可用时 `enforcement=impossible`。
+    Block,
+    /// 显式 bypass：不写规则。
+    Bypass,
+}
+
+impl CaptureFailureMode {
+    /// 解析配置取值。
+    ///
+    /// # Errors
+    ///
+    /// 未知取值返回 `CONFIG_INVALID [kind]`，调用方补全字段路径。
+    pub fn parse(s: &str) -> Result<Self, ConfigError> {
+        match s {
+            "block" => Ok(Self::Block),
+            "bypass" => Ok(Self::Bypass),
+            other => Err(ConfigError::new(
+                "kind",
+                format!("unknown capture failure mode '{other}' (supports block/bypass)"),
+            )),
+        }
+    }
+
+    /// 稳定的机器可读标签。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Bypass => "bypass",
+        }
+    }
+}
+
+/// 路径失败策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathFailureMode {
+    /// 阻断（默认）：TCP RST、UDP 丢弃，不静默直连。
+    Block,
+    /// 按策略组剩余候选重试（有上限）。
+    Fallback,
+}
+
+impl PathFailureMode {
+    /// 解析配置取值。
+    ///
+    /// # Errors
+    ///
+    /// 未知取值返回 `CONFIG_INVALID [kind]`，调用方补全字段路径。
+    pub fn parse(s: &str) -> Result<Self, ConfigError> {
+        match s {
+            "block" => Ok(Self::Block),
+            "fallback" => Ok(Self::Fallback),
+            other => Err(ConfigError::new(
+                "kind",
+                format!("unknown path failure mode '{other}' (supports block/fallback)"),
+            )),
+        }
+    }
+
+    /// 稳定的机器可读标签。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
+/// `kind: tproxy` 入站子配置（spec §10.2）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TproxyInboundConfig {
+    /// TCP 监听端口（默认取 `listen` 端口）。
+    pub tcp_port: u16,
+    /// UDP 监听端口（默认取 `listen` 端口）。
+    pub udp_port: u16,
+    /// 捕获 backend（默认 iptables）。
+    pub backend: CaptureBackendConfig,
+    /// 专用链名（默认 `NEXUS_TPROXY`）。
+    pub chain: String,
+    /// fwmark（默认 `0x1f3`）。
+    pub mark: u32,
+    /// 策略路由表（默认 100）。
+    pub route_table: u32,
+    /// 拦截目的 CIDR（默认 `["0.0.0.0/0"]`）。
+    pub intercept_dst_cidrs: Vec<String>,
+    /// 排除目的 CIDR（默认空；mesh/TUN/代理服务器自动追加）。
+    pub exclude_dst_cidrs: Vec<String>,
+    /// 捕获失败策略（默认 block）。
+    pub on_capture_failure: CaptureFailureMode,
+    /// 路径失败策略（默认 block）。
+    pub on_path_failure: PathFailureMode,
+    /// TCP 并发连接上限（默认 4096）。
+    pub max_tcp_conns: usize,
+    /// UDP 流表容量（默认 8192）。
+    pub udp_table_capacity: usize,
+    /// UDP 流空闲老化秒数（默认 60）。
+    pub udp_idle_secs: u64,
+    /// IPv6（本 run 必须 `false`）。
+    pub ipv6: bool,
+}
+
+impl Default for TproxyInboundConfig {
+    fn default() -> Self {
+        Self {
+            tcp_port: 7895,
+            udp_port: 7895,
+            backend: CaptureBackendConfig::Iptables,
+            chain: "NEXUS_TPROXY".to_string(),
+            mark: 0x1f3,
+            route_table: 100,
+            intercept_dst_cidrs: vec!["0.0.0.0/0".to_string()],
+            exclude_dst_cidrs: Vec::new(),
+            on_capture_failure: CaptureFailureMode::Block,
+            on_path_failure: PathFailureMode::Block,
+            max_tcp_conns: 4096,
+            udp_table_capacity: 8192,
+            udp_idle_secs: 60,
+            ipv6: false,
         }
     }
 }
@@ -939,6 +1107,172 @@ fn parse_tun_inbound(node: &Node, base: &str) -> Result<TunInboundConfig, Config
     Ok(cfg)
 }
 
+/// 数值字段（支持十进制与 `0x` 十六进制）。
+fn req_opt_int(node: &Node, key: &str, base: &str) -> Result<Option<u64>, ConfigError> {
+    let Some(raw) = node.get(key) else {
+        return Ok(None);
+    };
+    let text = raw
+        .as_str()
+        .ok_or_else(|| ConfigError::new(format!("{base}.{key}"), "expected an integer scalar"))?;
+    let trimmed = text.trim();
+    let parsed = if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16)
+    } else {
+        trimmed.parse::<u64>()
+    };
+    parsed.map(Some).map_err(|_| {
+        ConfigError::new(
+            format!("{base}.{key}"),
+            format!("expected an integer, got '{text}'"),
+        )
+    })
+}
+
+fn validate_chain_name(chain: &str) -> Result<(), String> {
+    if chain.is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    if chain.len() > 28 {
+        return Err(format!("must be at most 28 bytes, got {}", chain.len()));
+    }
+    if chain.chars().any(char::is_whitespace) {
+        return Err(format!("must not contain whitespace in '{chain}'"));
+    }
+    Ok(())
+}
+
+fn validate_cidr_list(values: &[String], field: &str) -> Result<(), ConfigError> {
+    for cidr in values {
+        validate_ipv4_cidr(cidr).map_err(|reason| {
+            ConfigError::new(field, format!("invalid CIDR '{cidr}': {reason}"))
+        })?;
+    }
+    Ok(())
+}
+
+fn parse_tproxy_inbound(
+    node: &Node,
+    base: &str,
+    listen: &str,
+) -> Result<TproxyInboundConfig, ConfigError> {
+    let listen_addr: std::net::SocketAddrV4 = listen.parse().map_err(|_| {
+        ConfigError::new(
+            format!("{base}.listen"),
+            format!("must be an IPv4 ip:port, got '{listen}'"),
+        )
+    })?;
+    let mut cfg = TproxyInboundConfig {
+        tcp_port: listen_addr.port(),
+        udp_port: listen_addr.port(),
+        ..TproxyInboundConfig::default()
+    };
+
+    for (key, is_tcp) in [("tcp_port", true), ("udp_port", false)] {
+        if let Some(value) = req_opt_int(node, key, base)? {
+            if value == 0 || value > u64::from(u16::MAX) {
+                return Err(ConfigError::new(
+                    format!("{base}.{key}"),
+                    format!("must be in [1, 65535], got {value}"),
+                ));
+            }
+            let port = u16::try_from(value).expect("range checked");
+            if is_tcp {
+                cfg.tcp_port = port;
+            } else {
+                cfg.udp_port = port;
+            }
+        }
+    }
+
+    if let Some(backend) = opt_str(node, "backend") {
+        cfg.backend = CaptureBackendConfig::parse(&backend)
+            .map_err(|e| ConfigError::new(format!("{base}.backend"), e.reason))?;
+    }
+    if let Some(chain) = opt_str(node, "chain") {
+        validate_chain_name(&chain)
+            .map_err(|reason| ConfigError::new(format!("{base}.chain"), reason))?;
+        cfg.chain = chain;
+    }
+    if let Some(mark) = req_opt_int(node, "mark", base)? {
+        if mark == 0 || mark > u64::from(u32::MAX) {
+            return Err(ConfigError::new(
+                format!("{base}.mark"),
+                format!("must be in [1, 4294967295], got {mark}"),
+            ));
+        }
+        cfg.mark = u32::try_from(mark).expect("range checked");
+    }
+    if let Some(table) = req_opt_int(node, "route_table", base)? {
+        if table == 0 || table > u64::from(u32::MAX) {
+            return Err(ConfigError::new(
+                format!("{base}.route_table"),
+                format!("must be in [1, 4294967295], got {table}"),
+            ));
+        }
+        cfg.route_table = u32::try_from(table).expect("range checked");
+    }
+    if let Some(list) = opt_str_seq(node, "intercept_dst_cidrs") {
+        validate_cidr_list(&list, &format!("{base}.intercept_dst_cidrs"))?;
+        cfg.intercept_dst_cidrs = list;
+    }
+    if let Some(list) = opt_str_seq(node, "exclude_dst_cidrs") {
+        validate_cidr_list(&list, &format!("{base}.exclude_dst_cidrs"))?;
+        cfg.exclude_dst_cidrs = list;
+    }
+    if cfg.intercept_dst_cidrs.len() + cfg.exclude_dst_cidrs.len() > 256 {
+        return Err(ConfigError::new(
+            format!("{base}.exclude_dst_cidrs"),
+            "total CIDR entries must not exceed 256",
+        ));
+    }
+    if let Some(mode) = opt_str(node, "on_capture_failure") {
+        cfg.on_capture_failure = CaptureFailureMode::parse(&mode)
+            .map_err(|e| ConfigError::new(format!("{base}.on_capture_failure"), e.reason))?;
+    }
+    if let Some(mode) = opt_str(node, "on_path_failure") {
+        cfg.on_path_failure = PathFailureMode::parse(&mode)
+            .map_err(|e| ConfigError::new(format!("{base}.on_path_failure"), e.reason))?;
+    }
+    if let Some(value) = req_opt_int(node, "max_tcp_conns", base)? {
+        if value == 0 {
+            return Err(ConfigError::new(
+                format!("{base}.max_tcp_conns"),
+                "must be >= 1",
+            ));
+        }
+        cfg.max_tcp_conns = usize::try_from(value).expect("fits usize on supported targets");
+    }
+    if let Some(value) = req_opt_int(node, "udp_table_capacity", base)? {
+        if value == 0 {
+            return Err(ConfigError::new(
+                format!("{base}.udp_table_capacity"),
+                "must be >= 1",
+            ));
+        }
+        cfg.udp_table_capacity = usize::try_from(value).expect("fits usize on supported targets");
+    }
+    if let Some(value) = req_opt_int(node, "udp_idle_secs", base)? {
+        if value == 0 {
+            return Err(ConfigError::new(
+                format!("{base}.udp_idle_secs"),
+                "must be >= 1",
+            ));
+        }
+        cfg.udp_idle_secs = value;
+    }
+    if opt_bool(node, "ipv6") == Some(true) {
+        return Err(ConfigError::new(
+            format!("{base}.ipv6"),
+            "IPv6 is not supported in this release; must be false",
+        ));
+    }
+    Ok(cfg)
+}
+
 // ---------------------------------------------------------------------------
 // 公开解析入口
 // ---------------------------------------------------------------------------
@@ -1225,11 +1559,17 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
             } else {
                 None
             };
+            let tproxy = if kind == InboundKind::Tproxy {
+                Some(parse_tproxy_inbound(item, &field, &listen)?)
+            } else {
+                None
+            };
             inbounds.push(InboundConfig {
                 tag,
                 kind,
                 listen,
                 tun,
+                tproxy,
             });
         }
     }
@@ -1242,6 +1582,17 @@ pub fn parse(yaml: &str) -> Result<ProxyConfig, ConfigError> {
         return Err(ConfigError::new(
             "inbounds",
             "only one tun inbound is supported",
+        ));
+    }
+    if inbounds
+        .iter()
+        .filter(|i| i.kind == InboundKind::Tproxy)
+        .count()
+        > 1
+    {
+        return Err(ConfigError::new(
+            "inbounds",
+            "only one tproxy inbound is supported",
         ));
     }
 
@@ -2732,5 +3083,131 @@ mod tun_inbound_tests {
         let err = parse(yaml).unwrap_err();
         assert_eq!(err.field, "inbounds");
         assert!(err.reason.contains("only one tun"), "{err:?}");
+    }
+}
+
+#[cfg(test)]
+mod tproxy_inbound_tests {
+    use super::*;
+
+    fn yaml_with_tproxy(extra: &str) -> String {
+        format!(
+            "schema_version: 1\ninbounds:\n  - tag: tp\n    kind: tproxy\n{extra}rules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n"
+        )
+    }
+
+    #[test]
+    fn tproxy_inbound_defaults_match_spec() {
+        let cfg = parse(&yaml_with_tproxy("")).expect("valid tproxy inbound");
+        let tp = cfg.inbounds[0].tproxy.as_ref().expect("tproxy sub config");
+        assert_eq!(cfg.inbounds[0].listen, "0.0.0.0:7895");
+        assert_eq!(tp.tcp_port, 7895);
+        assert_eq!(tp.udp_port, 7895);
+        assert_eq!(tp.backend, CaptureBackendConfig::Iptables);
+        assert_eq!(tp.chain, "NEXUS_TPROXY");
+        assert_eq!(tp.mark, 0x1f3);
+        assert_eq!(tp.route_table, 100);
+        assert_eq!(tp.intercept_dst_cidrs, vec!["0.0.0.0/0".to_string()]);
+        assert!(tp.exclude_dst_cidrs.is_empty());
+        assert_eq!(tp.on_capture_failure, CaptureFailureMode::Block);
+        assert_eq!(tp.on_path_failure, PathFailureMode::Block);
+        assert_eq!(tp.max_tcp_conns, 4096);
+        assert_eq!(tp.udp_table_capacity, 8192);
+        assert_eq!(tp.udp_idle_secs, 60);
+        assert!(!tp.ipv6);
+    }
+
+    #[test]
+    fn tproxy_ports_default_to_listen_port() {
+        let cfg = parse(&yaml_with_tproxy("    listen: 127.0.0.1:7896\n")).unwrap();
+        let tp = cfg.inbounds[0].tproxy.as_ref().unwrap();
+        assert_eq!(tp.tcp_port, 7896);
+        assert_eq!(tp.udp_port, 7896);
+    }
+
+    #[test]
+    fn tproxy_inbound_overrides_parse() {
+        let extra = "    tcp_port: 9001\n    udp_port: 9002\n    backend: nftables\n    chain: MYCHAIN\n    mark: 0x2a\n    route_table: 200\n    intercept_dst_cidrs: [10.0.0.0/8]\n    exclude_dst_cidrs: [10.1.0.0/16, 192.168.0.0/16]\n    on_capture_failure: bypass\n    on_path_failure: fallback\n    max_tcp_conns: 10\n    udp_table_capacity: 20\n    udp_idle_secs: 30\n";
+        let cfg = parse(&yaml_with_tproxy(extra)).unwrap();
+        let tp = cfg.inbounds[0].tproxy.as_ref().unwrap();
+        assert_eq!(tp.tcp_port, 9001);
+        assert_eq!(tp.udp_port, 9002);
+        assert_eq!(tp.backend, CaptureBackendConfig::Nftables);
+        assert_eq!(tp.chain, "MYCHAIN");
+        assert_eq!(tp.mark, 0x2a);
+        assert_eq!(tp.route_table, 200);
+        assert_eq!(tp.intercept_dst_cidrs, vec!["10.0.0.0/8".to_string()]);
+        assert_eq!(tp.exclude_dst_cidrs.len(), 2);
+        assert_eq!(tp.on_capture_failure, CaptureFailureMode::Bypass);
+        assert_eq!(tp.on_path_failure, PathFailureMode::Fallback);
+        assert_eq!(tp.max_tcp_conns, 10);
+        assert_eq!(tp.udp_table_capacity, 20);
+        assert_eq!(tp.udp_idle_secs, 30);
+    }
+
+    #[test]
+    fn tproxy_ipv6_true_is_exact_field_error() {
+        let err = parse(&yaml_with_tproxy("    ipv6: true\n")).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].ipv6");
+        assert!(err.reason.contains("IPv6"), "{err:?}");
+    }
+
+    #[test]
+    fn tproxy_rejects_zero_ports_and_limits() {
+        for (field, value) in [
+            ("tcp_port", "0"),
+            ("udp_port", "0"),
+            ("mark", "0"),
+            ("route_table", "0"),
+            ("max_tcp_conns", "0"),
+            ("udp_table_capacity", "0"),
+            ("udp_idle_secs", "0"),
+        ] {
+            let err = parse(&yaml_with_tproxy(&format!("    {field}: {value}\n"))).unwrap_err();
+            assert_eq!(err.field, format!("inbounds[0].{field}"), "{field}");
+        }
+    }
+
+    #[test]
+    fn tproxy_rejects_bad_chain_and_cidr_and_backend() {
+        let err = parse(&yaml_with_tproxy("    chain: NEXUS TPROXY\n")).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].chain");
+        let err = parse(&yaml_with_tproxy(
+            "    intercept_dst_cidrs: [999.0.0.0/8]\n",
+        ))
+        .unwrap_err();
+        assert_eq!(err.field, "inbounds[0].intercept_dst_cidrs");
+        let err = parse(&yaml_with_tproxy("    backend: pf\n")).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].backend");
+    }
+
+    #[test]
+    fn tproxy_rejects_too_many_excludes() {
+        let items = (0..257)
+            .map(|i| format!("10.{}.0.0/16", i % 250))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let err = parse(&yaml_with_tproxy(&format!(
+            "    exclude_dst_cidrs: [{items}]\n"
+        )))
+        .unwrap_err();
+        assert_eq!(err.field, "inbounds[0].exclude_dst_cidrs");
+        assert!(err.reason.contains("256"), "{err:?}");
+    }
+
+    #[test]
+    fn tproxy_rejects_unknown_failure_modes() {
+        let err = parse(&yaml_with_tproxy("    on_capture_failure: drop\n")).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].on_capture_failure");
+        let err = parse(&yaml_with_tproxy("    on_path_failure: direct\n")).unwrap_err();
+        assert_eq!(err.field, "inbounds[0].on_path_failure");
+    }
+
+    #[test]
+    fn only_one_tproxy_inbound_is_supported() {
+        let yaml = "schema_version: 1\ninbounds:\n  - tag: a\n    kind: tproxy\n  - tag: b\n    kind: tproxy\nrules:\n  - tag: r\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
+        let err = parse(yaml).unwrap_err();
+        assert_eq!(err.field, "inbounds");
+        assert!(err.reason.contains("only one tproxy"), "{err:?}");
     }
 }
