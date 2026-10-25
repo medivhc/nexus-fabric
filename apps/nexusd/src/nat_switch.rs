@@ -16,13 +16,19 @@
 //! sw.shutdown();
 //! ```
 //!
-//! 诚实边界：`main.rs` 的 `NatSwitchRuntime`（:409）已持有 `NatSwitching`
-//! （`TurnManager` + `StunProber` + `NatSwitching`），`NatSwitchRuntime::start`
-//! （`main.rs`:438 定义、:867 调用）已实例化；`on_relay_connected`
-//! 待 D5 mesh/fabric 喂入（`main.rs`:406），当前为留给中继连接器的钩子。
+//! D5 生产触发（spec §14.3 / B15–B17）：`NatSwitching` 本身实现生产
+//! `RelayConnSink`，调用方以 `attach_relay_provider` 接入 provider，
+//! `on_relay_available` 直通 `on_relay_connected(auto_punch: true)`。
+//! loopback 验收（`nat_relay` 测试
+//! `d5_production_sink_triggers_on_relay_connected`）证明该路径。
+//! 残留边界：生产侧按 peer 订阅（`subscribe_relay_peer`）与触发
+//! `on_turn_allocated` 需要 peer 来源（mesh 发现），daemon 内目前无 peer
+//! 源调用它们——接线与订阅机制已就位并经 loopback 证明，peer 发现触发是
+//! 后续 mesh 集成工作，不在本轮静默模拟。
 //! E4（`crates/nexus-nat-wireup/examples/e4_prod_switch.rs`）用真实
 //! TURN + NAT 模拟证明整条链路。
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
@@ -35,6 +41,24 @@ use nexus_nat_wireup::PunchManager;
 use nexus_path::{PathConfig, PathEvent, PathKind, PathManager};
 use nexus_projection::PathLink;
 use nexus_projection::path_link::ActiveConn;
+
+use crate::nat_relay::{
+    RelayConnProvider, RelayConnSink, RelayInfo as ProviderRelayInfo,
+    RelayKind as ProviderRelayKind,
+};
+
+impl crate::nat_status::NatStatusSource for NatSwitching {
+    fn peers(&self) -> Vec<nexus_nat_wireup::PunchPeerStatus> {
+        self.punch.all_status()
+    }
+}
+
+/// Where a production chunk was sent by the B16S seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkPath {
+    Direct,
+    Fallback,
+}
 
 /// Peer name for [`PathLink`] (which keys by `&str`): hex of the fabric peer id.
 fn peer_name(peer: &FabricPeerId) -> String {
@@ -52,6 +76,15 @@ pub struct NatSwitching {
     punch: Arc<PunchManager>,
     link: Arc<Mutex<PathLink>>,
     monitor: QualityMonitor<Arc<ConnShared>>,
+    /// D5 production relay trigger (spec section 14.3 / B15-B17).
+    /// `attach_relay_provider` stores the provider; `subscribe_relay_peer`
+    /// registers this stack as its sink for one peer. `self_weak` lets the
+    /// `RelayConnSink` impl reach `on_relay_connected` (which takes
+    /// `&Arc<Self>`); it is set by `new` via `Arc::new_cyclic`.
+    relay_provider: Mutex<Option<Arc<dyn RelayConnProvider>>>,
+    relay_subscriptions: Mutex<HashSet<[u8; 32]>>,
+    relay_lost: Mutex<HashSet<[u8; 32]>>,
+    self_weak: Weak<NatSwitching>,
 }
 
 /// `PathEventSink`: the monitor's tick drains `poll_event()` and lands here.
@@ -115,9 +148,10 @@ impl NatSwitching {
         my_id: FabricPeerId,
         local: LocalCandidates,
         samples: Vec<PortSample>,
+        clock: Arc<dyn nexus_nat_traversal::PunchClock>,
     ) -> Arc<Self> {
         let sw = Arc::new_cyclic(|weak| {
-            let punch = PunchManager::new(driver.clone(), my_id);
+            let punch = PunchManager::new(driver.clone(), my_id, clock);
             punch.set_local(local, samples);
             let pm = Arc::new(Mutex::new(PathManager::new(PathConfig::default())));
             let link = Arc::new(Mutex::new(PathLink::new(pm.clone())));
@@ -131,6 +165,10 @@ impl NatSwitching {
                 punch,
                 link,
                 monitor,
+                relay_provider: Mutex::new(None),
+                relay_subscriptions: Mutex::new(HashSet::new()),
+                relay_lost: Mutex::new(HashSet::new()),
+                self_weak: weak.clone(),
             }
         });
         sw.monitor.start();
@@ -141,6 +179,66 @@ impl NatSwitching {
     /// Update local candidates / STUN samples (e.g. after re-sampling).
     pub fn set_local(&self, local: LocalCandidates, samples: Vec<PortSample>) {
         self.punch.set_local(local, samples);
+    }
+
+    /// D5 (spec section 14.3 / B16): attach the production relay provider.
+    ///
+    /// Stores the provider; it does not subscribe any peer by itself
+    /// (subscription is per peer -- see `subscribe_relay_peer`). Safe to
+    /// call before or after peers are known; re-attaching replaces the
+    /// stored provider (logged) but does not re-subscribe past peers.
+    pub fn attach_relay_provider(self: &Arc<Self>, provider: Arc<dyn RelayConnProvider>) {
+        let replaced = self
+            .relay_provider
+            .lock()
+            .unwrap()
+            .replace(provider)
+            .is_some();
+        eprintln!(
+            "[nat-switch] relay provider {}",
+            if replaced {
+                "re-attached (previous replaced)"
+            } else {
+                "attached"
+            }
+        );
+    }
+
+    /// Subscribe this stack as the provider's sink for one peer.
+    ///
+    /// Returns false (fail-closed, logged) when no provider is attached.
+    /// The provider feeds `on_relay_available` for this peer, which routes
+    /// into `on_relay_connected` with `auto_punch: true`.
+    pub fn subscribe_relay_peer(self: &Arc<Self>, peer: FabricPeerId) -> bool {
+        let Some(provider) = self.relay_provider.lock().unwrap().clone() else {
+            eprintln!(
+                "[nat-switch] WARN: subscribe_relay_peer with no provider attached; refusing"
+            );
+            return false;
+        };
+        provider.subscribe(peer, Arc::clone(self) as Arc<dyn RelayConnSink>);
+        self.relay_subscriptions.lock().unwrap().insert(peer.0);
+        true
+    }
+
+    /// Peers this stack is subscribed for (production trigger introspection).
+    pub fn relay_subscribed_peers(&self) -> Vec<FabricPeerId> {
+        self.relay_subscriptions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| FabricPeerId(*b))
+            .collect()
+    }
+
+    /// Peers whose relay was reported lost (state only -- see `on_relay_lost`).
+    pub fn relay_lost_peers(&self) -> Vec<FabricPeerId> {
+        self.relay_lost
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| FabricPeerId(*b))
+            .collect()
     }
 
     /// Call when a relayed connection to `peer` is established.
@@ -202,13 +300,10 @@ impl NatSwitching {
             );
             return;
         }
-        if self.my_id.0 < peer.0 {
-            eprintln!(
-                "[nat-switch] tie-break: peer {name} has larger PeerId, waiting for their punch"
-            );
+        if !should_initiate(&self.my_id, &peer) {
             return;
         }
-        eprintln!("[nat-switch] background punch starting for peer {name} (tie-break won)");
+        eprintln!("[nat-switch] background punch starting for peer {name} (both sides initiate)");
         let this = Arc::clone(self);
         let relay_conn = relay.clone();
         thread::Builder::new()
@@ -256,6 +351,46 @@ impl NatSwitching {
         );
     }
 
+    /// The **direct** connection if the active path is Direct (None on relay).
+    pub fn active_direct_conn(&self, peer_hex: &str) -> Option<Arc<ConnShared>> {
+        let link = self.link.lock().unwrap();
+        let conns = link.nat_conns(peer_hex)?;
+        match conns.active {
+            ActiveConn::Direct => conns.direct.clone(),
+            ActiveConn::Relay => None,
+        }
+    }
+
+    /// B16S seam: send one production chunk through the currently active
+    /// direct connection when one is active, otherwise through the original
+    /// path (byte-for-byte unchanged).
+    ///
+    /// - `has direct active`  -> open a fresh bi-stream on that conn and write
+    ///   one `WORKSPACE_SYNC` frame for this chunk.
+    /// - otherwise            -> `fallback` (the pre-existing send path).
+    pub fn send_chunk(
+        &self,
+        peer: FabricPeerId,
+        fallback: &dyn Fn(&[u8]) -> std::io::Result<()>,
+        chunk: &[u8],
+    ) -> std::io::Result<ChunkPath> {
+        let name = peer_name(&peer);
+        if let Some(conn) = self.active_direct_conn(&name) {
+            let stream = nexus_nat_wireup::channel::open_bi_stream(
+                &conn,
+                std::time::Duration::from_secs(5),
+            )?;
+            nexus_nat_wireup::channel::write_msg(
+                &stream,
+                nexus_nat_wireup::channel::STREAM_TYPE_WORKSPACE_SYNC,
+                chunk,
+            )?;
+            return Ok(ChunkPath::Direct);
+        }
+        fallback(chunk)?;
+        Ok(ChunkPath::Fallback)
+    }
+
     /// The connection currently carrying `peer`'s production traffic.
     /// `peer` is the hex peer-id name (see [`peer_name`]).
     pub fn active_conn(&self, peer_hex: &str) -> Option<Arc<ConnShared>> {
@@ -282,6 +417,52 @@ impl NatSwitching {
     }
 }
 
+/// Production `RelayConnSink` (D5, spec section 14.3 / B16).
+///
+/// This is the consumer side the product-review confirmation found missing:
+/// the provider feeds relay connections here, and they land in
+/// `on_relay_connected` with `auto_punch: true` -- the production trigger
+/// path. `remote_nat` is `Unknown` by rule: the provider event carries no
+/// peer NAT type, and inventing one would be a false claim (same honesty
+/// rule as the gatherer's `Unknown` default).
+impl RelayConnSink for NatSwitching {
+    fn on_relay_available(&self, info: ProviderRelayInfo) {
+        let Some(sw) = self.self_weak.upgrade() else {
+            eprintln!("[nat-switch] WARN: relay available but stack dropped; ignoring");
+            return;
+        };
+        let local = *sw.driver.shared().local_addr.lock().unwrap();
+        let kind = match info.kind {
+            ProviderRelayKind::Turn => PathKind::Turn,
+            ProviderRelayKind::Mesh => PathKind::Mesh,
+        };
+        eprintln!(
+            "[nat-switch] relay available for peer {} ({kind:?}); triggering on_relay_connected (auto_punch)",
+            peer_name(&info.peer)
+        );
+        sw.on_relay_connected(RelayInfo {
+            peer: info.peer,
+            relay: info.conn,
+            kind,
+            local,
+            remote: info.relayed,
+            remote_nat: NatType::Unknown,
+            auto_punch: true,
+        });
+    }
+
+    fn on_relay_lost(&self, peer: FabricPeerId) {
+        // Spec section 14.3: only update state. The relay is already gone,
+        // so there is nothing to close, and a lost relay must never
+        // trigger a punch.
+        self.relay_lost.lock().unwrap().insert(peer.0);
+        eprintln!(
+            "[nat-switch] relay lost for peer {} (state only; relay not closed, no punch triggered)",
+            peer_name(&peer)
+        );
+    }
+}
+
 /// Best-effort host candidates from the driver's bound UDP socket.
 ///
 /// Full STUN/srflx sampling needs a STUN client, which nexusd does not have
@@ -289,8 +470,68 @@ impl NatSwitching {
 /// real samples when they become available. Host candidates alone are
 /// enough for the relay-first flow (punching still works when both sides
 /// are reachable, and degrades honestly otherwise).
+/// Pure routing decision for the B16S seam (direct active vs fallback).
+pub fn chunk_route(has_active_direct: bool) -> ChunkPath {
+    if has_active_direct {
+        ChunkPath::Direct
+    } else {
+        ChunkPath::Fallback
+    }
+}
+
+/// Both sides initiate punch (C-14); only a self-pair is refused.
+pub fn should_initiate(my_id: &FabricPeerId, peer: &FabricPeerId) -> bool {
+    my_id != peer
+}
+
+/// Enumerate host candidates from the OS interface table, using the punch
+/// driver's UDP port. Never returns unspecified / multicast / broadcast
+/// addresses. Loopback is kept only when no other address exists.
 pub fn gather_host_candidates(driver: &Arc<Driver>) -> Vec<SocketAddr> {
-    vec![*driver.shared().local_addr.lock().unwrap()]
+    let port = driver.shared().local_addr.lock().unwrap().port();
+    let mut addrs = Vec::new();
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifap) == 0 {
+            let mut cur = ifap;
+            while !cur.is_null() {
+                let ifa = &*cur;
+                if !ifa.ifa_addr.is_null() {
+                    let family = (*ifa.ifa_addr).sa_family as i32;
+                    if family == libc::AF_INET {
+                        let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                        let ip = std::net::Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
+                        if !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast() {
+                            addrs.push(SocketAddr::new(ip.into(), port));
+                        }
+                    } else if family == libc::AF_INET6 {
+                        let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
+                        let ip = std::net::Ipv6Addr::from(sa.sin6_addr.s6_addr);
+                        if !ip.is_unspecified() && !ip.is_multicast() {
+                            addrs.push(SocketAddr::new(ip.into(), port));
+                        }
+                    }
+                }
+                cur = ifa.ifa_next;
+            }
+            libc::freeifaddrs(ifap);
+        }
+    }
+    addrs.sort();
+    addrs.dedup();
+    let non_loopback: Vec<SocketAddr> = addrs
+        .iter()
+        .copied()
+        .filter(|a| !a.ip().is_loopback())
+        .collect();
+    if !non_loopback.is_empty() {
+        non_loopback
+    } else if !addrs.is_empty() {
+        addrs
+    } else {
+        vec![SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), port)]
+    }
 }
 
 #[cfg(test)]
@@ -305,12 +546,56 @@ mod tests {
 
     #[test]
     fn gather_host_candidates_empty_without_socket() {
-        // Driver::new_client binds a socket; just assert the helper does not
-        // panic and returns at most one addr. (No UDP in sandbox: skip if
-        // bind fails.)
+        // v1.1: enumerate interfaces (can be >1), never unspecified, and the
+        // port always comes from the punch driver socket.
         if let Ok(driver) = Driver::new_client() {
+            let port = driver.shared().local_addr.lock().unwrap().port();
             let addrs = gather_host_candidates(&driver);
-            assert!(addrs.len() <= 1);
+            assert!(addrs.iter().all(|a| !a.ip().is_unspecified()));
+            assert!(addrs.iter().all(|a| a.port() == port));
         }
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    fn pid(byte: u8) -> FabricPeerId {
+        FabricPeerId([byte; 32])
+    }
+
+    #[test]
+    fn g3_host_candidates_enumerated() {
+        let driver = Driver::new_server("0.0.0.0:0".parse().unwrap()).expect("bind");
+        let port = driver.shared().local_addr.lock().unwrap().port();
+        let addrs = gather_host_candidates(&driver);
+        assert!(!addrs.is_empty(), "at least one host candidate");
+        assert!(
+            addrs.iter().all(|a| !a.ip().is_unspecified()),
+            "never advertise 0.0.0.0: {addrs:?}"
+        );
+        assert!(
+            addrs.iter().all(|a| a.port() == port),
+            "host candidate port must equal driver port"
+        );
+    }
+
+    #[test]
+    fn b16s_chunk_route_states() {
+        // Deletion Test: both states are real production states.
+        assert_eq!(chunk_route(true), ChunkPath::Direct);
+        assert_eq!(chunk_route(false), ChunkPath::Fallback);
+        // Flipping the decision breaks exactly one of the two states.
+        assert_ne!(chunk_route(true), chunk_route(false));
+    }
+
+    #[test]
+    fn g9_both_sides_initiate() {
+        let a = pid(1);
+        let b = pid(2);
+        assert!(should_initiate(&a, &b), "smaller PeerId still initiates");
+        assert!(should_initiate(&b, &a), "larger PeerId initiates");
+        assert!(!should_initiate(&a, &a), "never punch self");
     }
 }

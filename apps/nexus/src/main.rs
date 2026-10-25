@@ -58,6 +58,7 @@ nexus — Nexus 统一 Resource Fabric 控制面 CLI（瘦客户端）
   connectivity candidates                 候选 Provider
   connectivity probe <target>             探测目标可达性
   connectivity links                      活动链路
+  connectivity nat [--peer <hex>]         NAT 穿透状态
   dns status                              DNS 子系统状态
   dns resolve <name>                      解析域名
   dns providers                           DNS Provider 列表
@@ -924,7 +925,15 @@ fn parse_command(args: &[String]) -> Result<ControlCommand, String> {
                 target: need(2, "<target>")?,
             }),
             Some("links") => Ok(ControlCommand::ConnectivityLinks),
-            _ => Err("usage: nexus connectivity status|candidates|probe <target>|links".into()),
+            Some("nat") => {
+                let peer = args
+                    .iter()
+                    .position(|a| a == "--peer")
+                    .and_then(|i| args.get(i + 1))
+                    .cloned();
+                Ok(ControlCommand::ConnectivityNat { peer })
+            }
+            _ => Err("usage: nexus connectivity status|candidates|probe <target>|links|nat [--peer <hex>]".into()),
         },
         "dns" => match args.get(1).map(String::as_str) {
             Some("status") => Ok(ControlCommand::DnsStatus),

@@ -117,9 +117,10 @@ impl PunchSocket for DriverPunchSocket {
             }
         }
         if pending.is_empty() {
-            Err(io::Error::other(format!(
-                "all punch attempts failed: {last_err}"
-            )))
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("all punch attempts failed: {last_err}"),
+            ))
         } else {
             Err(io::Error::new(
                 io::ErrorKind::TimedOut,

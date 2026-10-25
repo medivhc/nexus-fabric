@@ -17,8 +17,11 @@
 //! connection stays up as warm backup (D4).
 
 pub mod channel;
+pub mod clock;
+pub mod repunch;
 pub mod responder;
 pub mod socket;
+pub mod status;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
@@ -30,17 +33,20 @@ use std::time::{Duration, Instant};
 use nexus_connectivity::nat::NatType;
 use nexus_fabric::{Cmd, ConnShared, Driver, PeerId as FabricPeerId, StreamShared};
 use nexus_nat_traversal::{
-    DefaultPredictor, LocalCandidates, PortSample, Predictability, PunchAnswer, PunchConfig,
-    PunchPredictor, PunchRaceFeed, PunchResult, PunchSession, SIGNAL_VERSION, SprayPlan,
-    decode_offer, encode_answer,
+    DefaultPredictor, LocalCandidates, PortSample, Predictability, PredictionHint, PunchAnswer,
+    PunchClock, PunchConfig, PunchPredictor, PunchRaceFeed, PunchResult, PunchSession, PunchStats,
+    SIGNAL_VERSION, SprayPlan, decode_offer, encode_answer,
 };
 
 pub use channel::{
     FabricPunchChannel, STREAM_TYPE_BIND, STREAM_TYPE_PUNCH, STREAM_TYPE_WORKSPACE_SYNC,
     decode_bind_response, encode_bind_response, frame_msg, peek_stream_type, verify_bind,
 };
+pub use clock::SystemPunchClock;
+pub use repunch::Scheduler;
 pub use responder::PreAnsweredChannel;
 pub use socket::DriverPunchSocket;
+pub use status::{PunchPeerStatus, PunchState, RelaySource, RepunchTrigger, TunnelProto};
 
 /// Deterministic tie-break: the side with the larger `PeerId` keeps the
 /// connection *it* initiated; the smaller side closes its own initiated
@@ -138,6 +144,9 @@ pub struct PunchManager {
     direct: Mutex<HashMap<FabricPeerId, DirectConn>>,
     sockets: Mutex<HashMap<FabricPeerId, Arc<DriverPunchSocket>>>,
     config: Mutex<PunchConfig>,
+    clock: Arc<dyn PunchClock>,
+    status: Mutex<HashMap<[u8; 32], PunchPeerStatus>>,
+    scheduler: Mutex<Scheduler>,
     /// All nonces seen in relay signaling with a peer (offer nonces we sent
     /// plus offer nonces we received). The bind challenge proves the far end
     /// of an accepted direct connection took part in that signaling: the
@@ -184,7 +193,8 @@ fn route_inbound(peek: &io::Result<u8>) -> InboundRoute {
 }
 
 impl PunchManager {
-    pub fn new(driver: Arc<Driver>, my_id: FabricPeerId) -> Arc<Self> {
+    pub fn new(driver: Arc<Driver>, my_id: FabricPeerId, clock: Arc<dyn PunchClock>) -> Arc<Self> {
+        let scheduler = Scheduler::new(&PunchConfig::default());
         Arc::new(Self {
             driver,
             my_id,
@@ -195,6 +205,7 @@ impl PunchManager {
                 host: Vec::new(),
                 srflx: None,
                 srflx_stun: None,
+                srflx_turn: None,
                 nat_type: NatType::Unknown,
             }),
             samples: Mutex::new(Vec::new()),
@@ -202,6 +213,9 @@ impl PunchManager {
             direct: Mutex::new(HashMap::new()),
             sockets: Mutex::new(HashMap::new()),
             config: Mutex::new(PunchConfig::default()),
+            clock,
+            status: Mutex::new(HashMap::new()),
+            scheduler: Mutex::new(scheduler),
             signaling_nonces: Mutex::new(HashMap::new()),
             unclaimed: Mutex::new(VecDeque::new()),
         })
@@ -210,6 +224,12 @@ impl PunchManager {
     /// Punch parameters shared by initiator and responder paths.
     pub fn set_config(&self, config: PunchConfig) {
         *self.config.lock().unwrap() = config;
+        *self.scheduler.lock().unwrap() = Scheduler::new(&config);
+    }
+
+    /// Replace STUN samples (reflexive change path).
+    pub fn set_samples(&self, samples: Vec<PortSample>) {
+        *self.samples.lock().unwrap() = samples;
     }
 
     /// Local candidates + STUN port samples (drives the predictor).
@@ -269,6 +289,109 @@ impl PunchManager {
             .map(|s| s.punch_attempts())
     }
 
+    fn with_status<R>(
+        &self,
+        peer: FabricPeerId,
+        f: impl FnOnce(&mut PunchPeerStatus) -> R,
+    ) -> Option<R> {
+        let mut g = self.status.lock().ok()?;
+        let entry = g
+            .entry(peer.0)
+            .or_insert_with(|| PunchPeerStatus::new(peer));
+        Some(f(entry))
+    }
+
+    pub fn status(&self, peer: &FabricPeerId) -> Option<PunchPeerStatus> {
+        self.status.lock().ok()?.get(&peer.0).cloned()
+    }
+
+    pub fn all_status(&self) -> Vec<PunchPeerStatus> {
+        self.status
+            .lock()
+            .map(|g| g.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn set_tunnel_proto(&self, peer: FabricPeerId, proto: TunnelProto) {
+        let _ = self.with_status(peer, |s| s.tunnel_proto = proto);
+    }
+
+    pub fn set_relay_source(&self, peer: FabricPeerId, source: Option<RelaySource>) {
+        let _ = self.with_status(peer, |s| s.relay_source = source);
+    }
+
+    fn record_signal_decode_error(&self, peer: FabricPeerId, n: u64) {
+        let _ = self.with_status(peer, |s| {
+            s.signal_decode_errors_total = s.signal_decode_errors_total.saturating_add(n);
+        });
+    }
+
+    fn aggregate_stats(&self, peer: FabricPeerId, stats: PunchStats, result: &PunchResult) {
+        let now = self.clock.now_ms();
+        let _ = self.with_status(peer, |s| {
+            s.attempts_total = s.attempts_total.saturating_add(stats.attempts);
+            s.migrated_total = s.migrated_total.saturating_add(stats.migrated);
+            s.failed_timeout_total = s.failed_timeout_total.saturating_add(stats.failed_timeout);
+            s.failed_unpredictable_total = s
+                .failed_unpredictable_total
+                .saturating_add(stats.failed_unpredictable);
+            s.failed_no_candidates_total = s
+                .failed_no_candidates_total
+                .saturating_add(stats.failed_no_candidates);
+            s.failed_channel_closed_total = s
+                .failed_channel_closed_total
+                .saturating_add(stats.failed_channel_closed);
+            s.spray_sends_total = s.spray_sends_total.saturating_add(stats.spray_sends);
+            s.spray_skipped_total = s.spray_skipped_total.saturating_add(stats.spray_skipped);
+            s.mapping_probe_sends_total = s
+                .mapping_probe_sends_total
+                .saturating_add(stats.mapping_probe_sends);
+            s.prediction_hints_sent_total = s
+                .prediction_hints_sent_total
+                .saturating_add(stats.prediction_hints_sent);
+            s.prediction_hints_recv_total = s
+                .prediction_hints_recv_total
+                .saturating_add(stats.prediction_hints_recv);
+            s.phase = stats.last_phase;
+            s.last_attempt_ms = Some(now);
+            match result {
+                PunchResult::Migrated { addr } => {
+                    s.state = PunchState::Succeeded;
+                    s.last_result = Some(*result);
+                    s.fail_reason = None;
+                    s.last_success_ms = Some(now);
+                    s.last_direct_addr = Some(*addr);
+                    s.direct_conn_id = self
+                        .direct
+                        .lock()
+                        .ok()
+                        .and_then(|d| d.get(&peer).map(|c| c.conn.id.0));
+                }
+                PunchResult::StayedOnRelay { reason } => {
+                    s.state = PunchState::Failed;
+                    s.last_result = Some(*result);
+                    s.fail_reason = Some(*reason);
+                }
+            }
+        });
+    }
+
+    /// Prediction hint advertised by this manager (from current samples).
+    fn prediction_for(&self) -> Option<PredictionHint> {
+        let samples = self.samples_snapshot();
+        let predictor = SeededPredictor::new(samples.clone());
+        match predictor.assess(&samples) {
+            Predictability::Predictable { base_port, delta } if samples.len() >= 3 => {
+                Some(PredictionHint {
+                    base_port,
+                    delta,
+                    samples: samples.len().min(8) as u8,
+                })
+            }
+            _ => None,
+        }
+    }
+
     fn local_snapshot(&self) -> LocalCandidates {
         self.local.lock().unwrap().clone()
     }
@@ -320,40 +443,101 @@ impl PunchManager {
             .lock()
             .unwrap()
             .insert(peer, Arc::clone(&socket));
-        let predictor = Arc::new(SeededPredictor::new(self.samples_snapshot()));
+        let samples = self.samples_snapshot();
+        let predictor = Arc::new(SeededPredictor::new(samples.clone()));
         let local = self.local_snapshot();
+        let clock = self.clock.clone();
 
         self.active.lock().unwrap().insert(peer);
+        let _ = self.with_status(peer, |s| {
+            s.state = PunchState::InProgress;
+            s.phase = nexus_nat_traversal::PunchPhase::Idle;
+        });
         let sock2 = socket.clone();
         let channel2 = channel.clone();
-        let result = thread::spawn(move || {
+        let (result, stats) = thread::spawn(move || {
             let mut session = PunchSession::new(
                 nexus_nat_traversal::PeerId(peer.0),
                 local,
                 remote_nat,
+                samples,
                 config,
                 channel2,
                 sock2,
                 predictor,
+                clock,
             );
-            session.run()
+            let result = session.run();
+            (result, session.stats())
         })
         .join()
-        .unwrap_or(PunchResult::StayedOnRelay {
-            reason: nexus_nat_traversal::PunchFailReason::ChannelClosed,
-        });
+        .unwrap_or((
+            PunchResult::StayedOnRelay {
+                reason: nexus_nat_traversal::PunchFailReason::ChannelClosed,
+            },
+            PunchStats::default(),
+        ));
         self.active.lock().unwrap().remove(&peer);
+        self.aggregate_stats(peer, stats, &result);
 
         // Record our offer nonce for bind identity (D4): the far end must
         // echo a signaling nonce to prove it is this peer.
         if let Some(nonce) = channel.last_offer_nonce() {
             self.record_signaling_nonce(peer, nonce);
         }
+        let decode_errors = channel.decode_errors();
+        if decode_errors > 0 {
+            self.record_signal_decode_error(peer, decode_errors);
+        }
 
         if let PunchResult::Migrated { addr } = &result {
             self.on_migrated(peer, *addr, &socket);
         }
         result
+    }
+
+    /// Automatic repunch (periodic / reflexive change / relay degradation).
+    ///
+    /// Any side Symmetric disables all automatic repunch (C-22): the call is
+    /// refused with the relay kept as-is.
+    pub fn repunch(
+        self: &Arc<Self>,
+        relay_conn: &Arc<ConnShared>,
+        peer: FabricPeerId,
+        trigger: RepunchTrigger,
+    ) -> PunchResult {
+        let local = self.local_snapshot();
+        let remote_nat = self
+            .status(&peer)
+            .map(|s| s.nat_type_remote)
+            .unwrap_or(NatType::Unknown);
+        if local.nat_type == NatType::Symmetric || remote_nat == NatType::Symmetric {
+            eprintln!(
+                "[wireup] repunch skipped for peer {}: symmetric side disables auto repunch ({trigger:?})",
+                hex_id(&peer.0)
+            );
+            return PunchResult::StayedOnRelay {
+                reason: nexus_nat_traversal::PunchFailReason::UnpredictableSymmetric,
+            };
+        }
+        let config = *self.config.lock().unwrap();
+        self.punch_peer(relay_conn, peer, remote_nat, config)
+    }
+
+    /// Reflexive address changed: update local candidates/samples. Never
+    /// starts a session while either side is Symmetric (C-22).
+    pub fn on_reflexive_changed(&self, srflx: SocketAddr) {
+        if let Ok(mut local) = self.local.lock() {
+            local.srflx = Some(srflx);
+        }
+    }
+
+    /// Relay degradation signal from the quality monitor.
+    pub fn on_relay_degraded(&self, peer: FabricPeerId) {
+        let _ = self.with_status(peer, |s| {
+            s.fail_reason = Some(nexus_nat_traversal::PunchFailReason::Timeout);
+        });
+        eprintln!("[wireup] relay degraded for peer {}", hex_id(&peer.0));
     }
 
     /// Tie-break + feed after a successful punch.
@@ -481,11 +665,13 @@ impl PunchManager {
 
         // Answer on the same stream.
         let local = this.local_snapshot();
+        let prediction = this.prediction_for();
         let answer = PunchAnswer {
             version: SIGNAL_VERSION,
             nonce: offer.nonce,
             candidates: local.ordered(),
             nat_type: local.nat_type,
+            prediction,
         };
         channel::write_msg(&stream, STREAM_TYPE_PUNCH, &encode_answer(&answer))?;
 
@@ -499,6 +685,7 @@ impl PunchManager {
         let preanswered = Arc::new(PreAnsweredChannel::new(
             offer.candidates.clone(),
             offer.nat_type,
+            offer.prediction,
         ));
         let socket = Arc::new(DriverPunchSocket::new(
             this.driver.clone(),
@@ -509,29 +696,35 @@ impl PunchManager {
             .lock()
             .unwrap()
             .insert(peer, Arc::clone(&socket));
-        let predictor = Arc::new(SeededPredictor::new(this.samples_snapshot()));
+        let samples = this.samples_snapshot();
+        let predictor = Arc::new(SeededPredictor::new(samples.clone()));
         // 与发起方对称：用 manager 上最近一次配置（未配置则为 default）。
         let config = *this.config.lock().unwrap();
         let remote_nat = offer.nat_type;
         let sock2 = socket.clone();
         let this2 = this.clone();
         let preanswered2 = preanswered.clone();
+        let clock = this.clock.clone();
         thread::spawn(move || {
             let mut session = PunchSession::new(
                 nexus_nat_traversal::PeerId(peer.0),
                 local,
                 remote_nat,
+                samples,
                 config,
                 preanswered2,
                 sock2,
                 predictor,
+                clock,
             );
             let result = session.run();
+            let stats = session.stats();
             // Record our (responder-side) offer nonce for bind identity.
             if let Some(nonce) = preanswered.captured_nonce() {
                 this2.record_signaling_nonce(peer, nonce);
             }
             this2.active.lock().unwrap().remove(&peer);
+            this2.aggregate_stats(peer, stats, &result);
             if let PunchResult::Migrated { addr } = &result {
                 this2.on_migrated(peer, *addr, &socket);
             }
@@ -827,6 +1020,7 @@ fn conn_closed(conn: &Arc<ConnShared>) -> bool {
 /// One-shot convenience: build an ephemeral manager, register the relay,
 /// run the punch. (The responder thread outlives the call, which is
 /// required for the both-initiate case.)
+#[allow(clippy::too_many_arguments)]
 pub fn punch_peer(
     driver: &Arc<Driver>,
     my_id: FabricPeerId,
@@ -835,8 +1029,9 @@ pub fn punch_peer(
     local: LocalCandidates,
     remote_nat: NatType,
     config: PunchConfig,
+    clock: Arc<dyn PunchClock>,
 ) -> PunchResult {
-    let mgr = PunchManager::new(driver.clone(), my_id);
+    let mgr = PunchManager::new(driver.clone(), my_id, clock);
     mgr.set_local(local, Vec::new());
     mgr.register_relay(relay_conn, peer);
     mgr.punch_peer(relay_conn, peer, remote_nat, config)
@@ -848,7 +1043,11 @@ mod tests {
 
     fn test_manager() -> Option<Arc<PunchManager>> {
         let driver = Driver::new_client().ok()?;
-        Some(PunchManager::new(driver, FabricPeerId([7u8; 32])))
+        Some(PunchManager::new(
+            driver,
+            FabricPeerId([7u8; 32]),
+            Arc::new(SystemPunchClock::new()),
+        ))
     }
 
     /// D4: per-peer nonce sets — peer B's nonce never verifies as peer A.

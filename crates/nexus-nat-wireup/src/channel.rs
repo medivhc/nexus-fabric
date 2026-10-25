@@ -271,6 +271,8 @@ pub struct FabricPunchChannel {
     stream: Arc<StreamShared>,
     /// Nonce of the last offer sent (for bind identity; read after `run()`).
     last_offer_nonce: std::sync::Mutex<Option<u64>>,
+    /// Frames that failed `decode_answer` (aggregated into the registry).
+    decode_errors: std::sync::atomic::AtomicU64,
 }
 
 impl FabricPunchChannel {
@@ -280,6 +282,7 @@ impl FabricPunchChannel {
         Ok(Self {
             stream,
             last_offer_nonce: std::sync::Mutex::new(None),
+            decode_errors: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -288,12 +291,19 @@ impl FabricPunchChannel {
         Self {
             stream,
             last_offer_nonce: std::sync::Mutex::new(None),
+            decode_errors: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// Nonce of the offer most recently sent on this channel, if any.
     pub fn last_offer_nonce(&self) -> Option<u64> {
         self.last_offer_nonce.lock().ok().and_then(|g| *g)
+    }
+
+    /// Number of answer frames that failed to decode (SignalError path).
+    pub fn decode_errors(&self) -> u64 {
+        self.decode_errors
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -315,8 +325,11 @@ impl PunchChannel for FabricPunchChannel {
                 format!("expected punch frame, got type {ty:#04x}"),
             ));
         }
-        decode_answer(&payload)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}")))
+        decode_answer(&payload).map_err(|e| {
+            self.decode_errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}"))
+        })
     }
 }
 

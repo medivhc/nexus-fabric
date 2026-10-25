@@ -1346,11 +1346,12 @@ delivery 层（`nexus-connectivity::qos`）。纯内存、纯同步、可注入�
 
 ### 12.9 P2.2 NAT 打洞集成（数据面闭环，2026-09-21）{#12-nat-probe}
 
-nat.rs（`nexus-connectivity::nat`：StunClient / HolePuncher / NatType，PRODUCT §6 Connectivity 链路激活语义）
+nat.rs（`nexus-connectivity::nat`：`NatType`；旧 `StunClient` / `HolePuncher` 已退役（2026-10-18），PRODUCT §6 Connectivity 链路激活语义）
 已交付且 E4 已绿；§12.1-§12.8 的 peer locator 为**静态配置注入**。本节把打洞接入
 虚拟子网数据面：打洞成功 → peer locator **动态学习**（切直连）；失败 → **Relay
 回退**（保底路径）。tunnel 侧不持有真实 UDP socket（保持 portable 边界，真实
-socket 集成留 P3 产品化）；打洞由外部 HolePuncher 驱动后经隧道 API 落账。
+socket 集成留 P3 产品化）；打洞由外部 `nexus-nat-traversal` 编排（经生产
+`RelayConnProvider` 触发）驱动后经隧道 API 落账。
 
 - `TunnelState` 新增 `Probing`（打洞中间态，Disconnected → Probing → Connected /
   Failed 转换）。
@@ -1380,7 +1381,8 @@ socket 集成留 P3 产品化）；打洞由外部 HolePuncher 驱动后经隧�
   更新 + Connected + 帧经直连 locator 送达）与失败（probe →
   fallback_to_relay("relay://relay.example:443") → locator=relay + Connected +
   帧经 relay 送达）；断言含 `Probing` 中间态可见。
-- 冻结边界（P2.2 不做）：tunnel 内真实 UDP 打洞（HolePuncher 挂接留 P3）、
+- 冻结边界（P2.2 不做，历史注记）：tunnel 内真实 UDP 打洞（旧 `HolePuncher` 已退役，
+  v1.1 由 `nexus-nat-traversal` + `nexusd` 组合根承担）、
   打洞重试策略、多候选并发打洞、NAT 类型驱动的路径选择。
 
 #### 12.9.1 E4 场景真实性修正（requirement-change nat01，2026-09-24）
@@ -1429,7 +1431,7 @@ XOR-RELAYED-ADDRESS / 生命周期；DERP 是进程内字节中继。
   MESSAGE-INTEGRITY 往返）+ MockTransport 驱动 401 挑战 -> 凭证重发 -> Allocated，
   relayed_addr=192.0.2.1:54320、realm/nonce 非空。真实公网 TURN Allocate 为 E5 外部观察。
 
-#### 12.9.3 P4.2 tunnel 级双向打洞状态机（HolePuncher 挂接，2026-09-25）{#12-holepunch-tunnel}
+#### 12.9.3 P4.2 tunnel 级双向打洞状态机（历史：旧 HolePuncher 挂接，2026-09-25）{#12-holepunch-tunnel}
 
 §12.9 的 `probe_peer`/`apply_hole_punch`/`fallback_to_relay` 是"外部打洞成功后
 落账"的骨架 API。本节把**打洞状态机挂接到 tunnel 数据面**：打洞帧与数据帧/握手帧
@@ -1463,7 +1465,7 @@ XOR-RELAYED-ADDRESS / 生命周期；DERP 是进程内字节中继。
   `PeerLocatorUpdated` + `HolePunchSucceeded { target }` 事件）。非打洞/
   握手/数据帧行为不变。
 - 重试配置：`HolePunchConfig { max_attempts: u32 = 10, attempt_timeout: Duration =
-  500ms, magic: [u8; 4] = b"NXHP" }`（总预算 ~5s，与 `HolePuncher::punch` 对齐）。
+  500ms, magic: [u8; 4] = b"NXHP" }`（总预算 ~5s，与已退役的旧打洞实现对齐）。
 - 事件：`VirtualSubnetEvent` 新增 `HolePunchStarted { peer_vip }` /
   `HolePunchSucceeded { peer_vip, target }` / `HolePunchFailed { peer_vip, reason }`
   （tunnel_id 贯通；与 `NatEvent` 语义对齐，可观测打洞全流程）。
@@ -1483,12 +1485,12 @@ XOR-RELAYED-ADDRESS / 生命周期；DERP 是进程内字节中继。
 
 #### 12.9.4 P4.2 NAT 类型驱动的路径选择（2026-09-25）{#12-nat-path}
 
-打洞前先探测 NAT 类型（`StunClient::detect_nat_type`，真实跨公网探测为 E5；
-E4 注入决策结果），由决策表决定"打洞直连"还是"直接走 relay"，避免对
-Symmetric NAT 浪费打洞预算：
+打洞前先探测 NAT 类型（历史：旧 `StunClient` 的 `detect_nat_type`；旧 API 已退役，
+v1.1 由 `nexusd::nat_stun` 在同 socket 采集；真实跨公网探测为 E5），
+由决策表决定"打洞直连"还是"直接走 relay"，避免对 Symmetric NAT 浪费打洞预算：
 
-- `nexus-connectivity::nat` 新增纯函数决策表：
-  `nat_path_decision(nat_type: NatType) -> PathDecision { Direct | Relay }`：
+- (历史) 旧纯函数决策表已退役；v1.1 门控由 `nexus-nat-traversal`（C-21 方向修正）
+  与 `nexusd::nat_stun` 的 `should_punch` 承担，语义等价：
   - `FullCone` / `RestrictedCone` / `PortRestrictedCone` → `Direct`
     （打洞可通，发起 `ph` 打洞）；
   - `Symmetric` → `Relay`（打洞不可通，直接走配置的 relay locator）；

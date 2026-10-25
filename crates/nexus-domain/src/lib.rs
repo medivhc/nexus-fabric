@@ -932,6 +932,8 @@ pub enum NexusError {
     NotFound { kind: String, id: String },
     /// 节点身份不可用：未执行 `nexus node init` 或身份记录损坏。
     NodeIdentityUnavailable { reason: String },
+    /// NAT 状态快照不可用（锁毒化等）；LocalAPI 映射 503。
+    NatStatusUnavailable { reason: String },
     /// 持久化写失败（FileKvStore 原子写 / journal 落盘失败）。
     PersistenceFailed { path: String, reason: String },
     /// 请求的能力尚未实现。
@@ -954,6 +956,7 @@ impl NexusError {
             | Self::SessionFailed { .. }
             | Self::NotFound { .. }
             | Self::NodeIdentityUnavailable { .. }
+            | Self::NatStatusUnavailable { .. }
             | Self::ComputeJobRejected { .. }
             | Self::WorkspaceCommitRejected { .. } => FailureDisposition::Abort,
             Self::Unsupported { .. } | Self::Internal { .. } | Self::PersistenceFailed { .. } => {
@@ -1011,6 +1014,9 @@ impl fmt::Display for NexusError {
             }
             Self::NodeIdentityUnavailable { reason } => {
                 write!(f, "node identity unavailable: {reason}")
+            }
+            Self::NatStatusUnavailable { reason } => {
+                write!(f, "NAT status unavailable: {reason}")
             }
             Self::PersistenceFailed { path, reason } => {
                 write!(f, "persistence failed for {path}: {reason}")

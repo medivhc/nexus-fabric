@@ -68,7 +68,11 @@ fn make_hub_with_manager() -> Option<(FlowSessionHub, PeerId, SocketAddr, Arc<Mu
     let local = listener.local_addr().ok()?;
     let pm = Arc::new(Mutex::new(PathManager::new(fast_config())));
     let link = PathLink::new(Arc::clone(&pm));
-    let punch = PunchManager::new(Driver::new_client().ok()?, PeerId([9u8; 32]));
+    let punch = PunchManager::new(
+        Driver::new_client().ok()?,
+        PeerId([9u8; 32]),
+        std::sync::Arc::new(nexus_nat_wireup::SystemPunchClock::new()),
+    );
     let hub = FlowSessionHub::new(listener, link, punch);
     Some((hub, peer, local, pm))
 }
@@ -445,7 +449,11 @@ fn ac6_relay_unclaimed_no_accept_bi() {
         .expect("B relay conn");
 
     // B side: PunchManager + PathLink with the NAT relay registered.
-    let punch_b = PunchManager::new(driver_b.clone(), peer_b);
+    let punch_b = PunchManager::new(
+        driver_b.clone(),
+        peer_b,
+        std::sync::Arc::new(nexus_nat_wireup::SystemPunchClock::new()),
+    );
     let pm = Arc::new(Mutex::new(PathManager::new(fast_config())));
     let mut link = PathLink::new(Arc::clone(&pm));
     let name_a = peer_hex(&peer_a);

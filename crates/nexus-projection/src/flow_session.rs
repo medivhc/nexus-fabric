@@ -904,7 +904,11 @@ mod tests {
         let link = PathLink::new(Arc::new(Mutex::new(nexus_path::PathManager::new(
             nexus_path::PathConfig::default(),
         ))));
-        let punch = PunchManager::new(nexus_fabric::Driver::new_client().ok()?, PeerId([9u8; 32]));
+        let punch = PunchManager::new(
+            nexus_fabric::Driver::new_client().ok()?,
+            PeerId([9u8; 32]),
+            std::sync::Arc::new(nexus_nat_wireup::SystemPunchClock::new()),
+        );
         let hub = FlowSessionHub::new(listener, link, punch);
         Some((hub, peer, local))
     }

@@ -4290,6 +4290,7 @@ pub fn error_code(err: &NexusError) -> &'static str {
         NexusError::SessionFailed { .. } => "SESSION_FAILED",
         NexusError::NotFound { .. } => "NOT_FOUND",
         NexusError::NodeIdentityUnavailable { .. } => "NODE_IDENTITY_UNAVAILABLE",
+        NexusError::NatStatusUnavailable { .. } => "NAT_STATUS_UNAVAILABLE",
         NexusError::PersistenceFailed { .. } => "PERSISTENCE_FAILED",
         NexusError::Unsupported { .. } => "UNSUPPORTED",
         NexusError::Internal { .. } => "INTERNAL",

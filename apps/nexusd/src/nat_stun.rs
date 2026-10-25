@@ -21,6 +21,7 @@
 use std::fmt;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nexus_connectivity::nat::{NatType, StunMapping};
@@ -214,7 +215,82 @@ impl StunProber {
         Ok(PortSample {
             port: m.public.port(),
             at_ms: unix_ms(),
+            target: server,
+            observed_from: m.local,
         })
+    }
+}
+
+/// Production STUN transport on the punch driver's UDP socket.
+///
+/// Installs the additive fabric STUN tap and correlates responses by
+/// transaction id over an mpsc channel. `local_addr()` is the driver socket,
+/// so `PortSample.observed_from` proves same-socket provenance (AC-1/G1).
+pub struct DriverStunTransport {
+    driver: Arc<nexus_fabric::Driver>,
+    inbox: std::sync::Mutex<std::sync::mpsc::Receiver<nexus_fabric::StunResponse>>,
+    local: SocketAddr,
+}
+
+struct TapSink {
+    tx: std::sync::mpsc::Sender<nexus_fabric::StunResponse>,
+}
+
+impl nexus_fabric::StunSink for TapSink {
+    fn on_stun_response(&self, response: nexus_fabric::StunResponse) {
+        let _ = self.tx.send(response);
+    }
+}
+
+impl DriverStunTransport {
+    pub fn new(driver: Arc<nexus_fabric::Driver>) -> Result<Self, io::Error> {
+        let local = *driver.shared().local_addr.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        driver
+            .install_stun_tap(Arc::new(TapSink { tx }))
+            .map_err(|e| io::Error::other(format!("install_stun_tap: {e:?}")))?;
+        Ok(Self {
+            driver,
+            inbox: std::sync::Mutex::new(rx),
+            local,
+        })
+    }
+}
+
+impl StunTransport for DriverStunTransport {
+    fn send_recv(
+        &mut self,
+        request: &[u8],
+        server: SocketAddr,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, StunError> {
+        let txn = self
+            .driver
+            .send_stun_request(server, request.to_vec())
+            .map_err(|e| StunError::Io(io::Error::other(format!("send_stun_request: {e:?}"))))?;
+        let deadline = std::time::Instant::now() + timeout;
+        let inbox = self
+            .inbox
+            .lock()
+            .map_err(|_| StunError::Io(io::Error::other("stun inbox poisoned")))?;
+        loop {
+            let remain = deadline.saturating_duration_since(std::time::Instant::now());
+            if remain.is_zero() {
+                return Err(StunError::Timeout);
+            }
+            match inbox.recv_timeout(remain) {
+                Ok(r) if r.transaction_id == txn => return Ok(r.bytes),
+                Ok(_) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Err(StunError::Timeout),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(StunError::Io(io::Error::other("stun tap closed")));
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> Result<SocketAddr, StunError> {
+        Ok(self.local)
     }
 }
 
@@ -227,21 +303,31 @@ impl StunProber {
 ///   Δ 不规律、样本不足、STUN 超时或对端同为 Symmetric/Unknown → `NoPunch`，
 ///   稳定维持 Relay 路径。
 pub fn should_punch(local: NatType, peer: NatType, samples: &[PortSample]) -> PunchDecision {
-    if local == NatType::Symmetric {
-        let delta_stable = matches!(
-            DefaultPredictor.assess(samples),
-            Predictability::Predictable { .. }
-        );
-        if delta_stable && is_cone(peer) {
-            return PunchDecision::BoundedPunch {
-                port_radius: BOUNDED_PUNCH_PORT_RADIUS,
-                time_window: BOUNDED_PUNCH_TIME_WINDOW,
-            };
+    let delta_stable = matches!(
+        DefaultPredictor.assess(samples),
+        Predictability::Predictable { .. }
+    );
+    match (local, peer) {
+        // Symmetric–symmetric: mathematically unreachable under the frozen
+        // spray semantics; never send.
+        (NatType::Symmetric, NatType::Symmetric) => PunchDecision::NoPunch,
+        // Local symmetric -> cone: bounded mapping probes + prediction.
+        (NatType::Symmetric, p) if is_cone(p) => {
+            if delta_stable {
+                PunchDecision::BoundedPunch {
+                    port_radius: BOUNDED_PUNCH_PORT_RADIUS,
+                    time_window: BOUNDED_PUNCH_TIME_WINDOW,
+                }
+            } else {
+                PunchDecision::NoPunch
+            }
         }
-        return PunchDecision::NoPunch;
+        // Local symmetric with a non-cone peer (Unknown included): relay.
+        (NatType::Symmetric, _) => PunchDecision::NoPunch,
+        // Cone -> remote symmetric: attempt; the hint gate lives in run().
+        (l, NatType::Symmetric) if is_cone(l) => PunchDecision::Punch,
+        _ => PunchDecision::Punch,
     }
-    // Cone / Unknown：常规打洞（Unknown 保持既有行为：打洞）。
-    PunchDecision::Punch
 }
 
 /// 打洞分支决策（AC4 + D2）。
@@ -505,6 +591,12 @@ mod tests {
             .map(|(i, &port)| PortSample {
                 port,
                 at_ms: 1_000_000 + i as u64 * 100,
+                target: if i % 2 == 0 {
+                    "192.0.2.1:3478".parse().unwrap()
+                } else {
+                    "192.0.2.2:3478".parse().unwrap()
+                },
+                observed_from: "10.0.0.2:5000".parse().unwrap(),
             })
             .collect()
     }
@@ -588,6 +680,24 @@ mod tests {
         assert_eq!(
             should_punch(NatType::Symmetric, NatType::FullCone, &samples),
             PunchDecision::NoPunch
+        );
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+    use nexus_fabric::Driver;
+
+    #[test]
+    fn g1_stun_samples_share_punch_socket() {
+        let driver = Driver::new_server("127.0.0.1:0".parse().unwrap()).expect("bind driver");
+        let local = *driver.shared().local_addr.lock().unwrap();
+        let transport = DriverStunTransport::new(driver.clone()).expect("install tap");
+        assert_eq!(
+            transport.local_addr().unwrap(),
+            local,
+            "STUN must be observed on the punch driver socket"
         );
     }
 }

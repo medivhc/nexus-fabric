@@ -27,6 +27,28 @@ use std::time::{Duration, Instant};
 use nexus_connectivity::nat::NatType;
 use nexus_nat_traversal::*;
 
+struct SystemClock(Instant);
+impl PunchClock for SystemClock {
+    fn now_ms(&self) -> u64 {
+        self.0.elapsed().as_millis() as u64
+    }
+    fn wall_ms(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+    fn sleep_until_ms(&self, deadline_ms: u64) {
+        let now = self.now_ms();
+        if deadline_ms > now {
+            std::thread::sleep(Duration::from_millis(deadline_ms - now));
+        }
+    }
+    fn sleep_ms(&self, ms: u64) {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
 const ACK_MAGIC: &[u8; 10] = b"NXPNCH-ACK";
 const PUNCH_MAGIC: &[u8; 8] = b"NXPNCH01";
 
@@ -96,6 +118,7 @@ fn responder(args: &[String]) {
                         kind: CandidateKind::Srflx,
                     }],
                     nat_type: NatType::FullCone,
+                    prediction: None,
                 };
                 let _ = sig_sock.send_to(&encode_answer(&answer), from);
                 eprintln!("[responder] answered offer nonce={}", offer.nonce);
@@ -192,6 +215,7 @@ fn initiator(args: &[String]) {
             host: vec![],
             srflx: None,
             srflx_stun: None,
+            srflx_turn: None,
             nat_type: NatType::Unknown,
         }
     } else {
@@ -220,9 +244,11 @@ fn initiator(args: &[String]) {
                 host: vec![],
                 srflx: Some(punch_local),
                 srflx_stun: None,
+                srflx_turn: None,
                 nat_type: NatType::FullCone,
             },
             NatType::FullCone,
+            Vec::new(),
             PunchConfig {
                 punch_timeout: Duration::from_secs(8),
                 coord_skew_ms: 200,
@@ -231,6 +257,7 @@ fn initiator(args: &[String]) {
             channel,
             socket,
             Arc::new(NoopPredictor),
+            Arc::new(SystemClock(Instant::now())),
         );
         finish(s.run(), s.phase(), &expect);
     };
@@ -240,6 +267,7 @@ fn initiator(args: &[String]) {
         PeerId([1u8; 32]),
         local,
         NatType::FullCone,
+        Vec::new(),
         PunchConfig::default(),
         Arc::new(UdpChannel {
             sock: UdpSocket::bind("0.0.0.0:0").unwrap(),
@@ -249,6 +277,7 @@ fn initiator(args: &[String]) {
             sock: UdpSocket::bind("0.0.0.0:0").unwrap(),
         }),
         Arc::new(NoopPredictor),
+        Arc::new(SystemClock(Instant::now())),
     );
     finish(s.run(), s.phase(), &expect);
 }

@@ -1102,4 +1102,33 @@ mod tests {
             "recovered path must become eligible again"
         );
     }
+
+    #[test]
+    fn hysteresis_blocks_small_positive_margin() {
+        // M3 (fix round): the pre-existing hysteresis_blocks_small_margin
+        // uses a WORSE challenger (margin negative), so it cannot catch a
+        // hysteresis-removal mutation. This test uses a challenger that is
+        // better by 0.53% (< 1% hysteresis): no switch with hysteresis,
+        // switch with hysteresis forced to 0 (M3).
+        // Scores: stats(10, 0.0) = 1000/11 + 100 = 190.909; active cost 0.5
+        // subtracts W_COST*0.5 = 1.0 -> 189.909; challenger cost 0.0 ->
+        // 190.909; margin = 1.0/189.909 = 0.53% < 1%.
+        let mut pm = PathManager::new(fast_config());
+        pm.add_candidate(candidate(PathKind::Direct, 9001, 0.5));
+        pm.add_candidate(candidate(PathKind::Mesh, 9003, 0.0));
+        pm.on_stats(&addr(9001), stats(10, 0.0)); // direct active, 189.909
+        assert_eq!(pm.current_path().unwrap().kind, PathKind::Direct);
+        while pm.poll_event().is_some() {} // drain setup Adopted event
+        for _ in 0..5 {
+            pm.on_stats(&addr(9003), stats(10, 0.0)); // challenger 190.909
+            pm.on_stats(&addr(9001), stats(10, 0.0));
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            pm.current_path().unwrap().kind,
+            PathKind::Direct,
+            "S5 violated: switched on a sub-hysteresis positive margin"
+        );
+        assert!(pm.poll_event().is_none());
+    }
 }

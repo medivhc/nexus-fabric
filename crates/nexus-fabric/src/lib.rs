@@ -17,6 +17,7 @@
 
 mod cert;
 mod driver;
+mod stun;
 pub mod transport;
 
 use crate::cert::Identity;
@@ -34,6 +35,7 @@ use std::time::{Duration, Instant};
 /// / `StreamShared` for the signal channel on the relayed connection.
 pub use cert::FabricIdentity;
 pub use driver::{Cmd, ConnShared, Driver, StreamShared};
+pub use stun::{StunRequest, StunResponse, StunSink, StunTapError, StunTransactionId};
 pub use transport::{StdUdpTransport, UdpTransport};
 
 /// QSEQ (GAP-2): length of the big-endian sequence header prepended by
@@ -140,6 +142,12 @@ impl FabricConn {
     /// Verified mutual-TLS identity, never a legacy anonymous/single-pin claim.
     pub fn mutually_authenticated_peer(&self) -> Option<PeerId> {
         self.inner.state.lock().ok()?.mutual_peer
+    }
+
+    /// Additive: shared handle for signaling/path registration (no semantic
+    /// change; returns the same underlying handle).
+    pub fn shared(&self) -> Arc<ConnShared> {
+        self.inner.clone()
     }
 
     pub fn peer(&self) -> PeerId {

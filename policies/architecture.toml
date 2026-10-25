@@ -257,7 +257,7 @@ layer = "delivery"
 [[crate]]
 name = "nexus-nat-traversal"
 allowed_internal_dependencies = ["nexus-connectivity"]
-portable = false
+portable = true
 layer = "delivery"
 
 [[crate]]

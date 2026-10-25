@@ -56,8 +56,14 @@
 
 **S1（单活跃路径）**：任意时刻，对单个对端只有一条活跃路径。P0 不做多路径并发。
 
-**S2（切换不丢连接）**：路径切换时，会话层连接（CID）不变。路径层只换
-socket，`nexus-fabric` 的被动迁移保证流不中断。
+**S2（切换不丢连接）**：分区语义，不得混用。
+
+- **非 NAT peer**：同连接 `rebind()` 仅用于这类 peer；路径层只换 socket，
+  `nexus-fabric` 的被动迁移保证流不中断（CID 不变）。
+- **NAT peer**：direct 与 relay 是**两条不同 CID** 的连接；切换是 `PathLink` 的
+  `ActiveConn` 翻转（`register_nat_direct` 登记新直连 → `ActiveConn` 指向它），
+  **不调用 `rebind()`**。CID 变化是预期行为；「不断流」的定义是**分块不丢块、
+  逻辑会话不重建**，在途 stream 不迁移。
 
 **S3（分数单调性）**：相同网络条件下，成本更低的路径分数不低于成本更高的
 （直连 > Mesh > TURN > 代理，同等质量下）。

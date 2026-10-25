@@ -353,6 +353,8 @@ fn stun_sample(
                             samples.push(PortSample {
                                 port: obs.port(),
                                 at_ms: 0,
+                                target: "127.0.0.1:3478".parse().unwrap(),
+                                observed_from: "0.0.0.0:0".parse().unwrap(),
                             });
                             break;
                         }
@@ -417,6 +419,7 @@ fn build_node(cfg: &NodeCfg, client: TurnClient, peer_relayed: SocketAddr) -> io
             host: Vec::new(),
             srflx: Some(reflexive),
             srflx_stun: None,
+            srflx_turn: None,
             nat_type: NatType::RestrictedCone,
         },
         samples,
@@ -470,7 +473,11 @@ impl Stack {
         let local = node.local.clone();
         let samples = node.samples.clone();
         let st = Arc::new_cyclic(|weak| {
-            let punch = PunchManager::new(driver, my_id);
+            let punch = PunchManager::new(
+                driver,
+                my_id,
+                std::sync::Arc::new(nexus_nat_wireup::SystemPunchClock::new()),
+            );
             punch.set_local(local, samples);
             let pm = Arc::new(Mutex::new(PathManager::new(PathConfig::default())));
             let link = Arc::new(Mutex::new(PathLink::new(pm.clone())));

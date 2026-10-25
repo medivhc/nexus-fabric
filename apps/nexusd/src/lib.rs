@@ -5,6 +5,9 @@
 pub mod assembly;
 pub mod config;
 pub mod dataplane;
+pub mod nat_gather;
+pub mod nat_relay;
+pub mod nat_status;
 pub mod nat_stun;
 pub mod nat_switch;
 pub mod nat_turn;

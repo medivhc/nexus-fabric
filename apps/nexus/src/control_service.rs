@@ -39,6 +39,11 @@ impl ControlServiceImpl {
             }
             ControlCommand::ConnectivityProbe { .. } => crate::observability::connectivity_probe()?,
             ControlCommand::ConnectivityLinks => crate::observability::connectivity_links()?,
+            ControlCommand::ConnectivityNat { .. } => {
+                return Err(NexusError::Internal {
+                    message: "connectivity nat must go through daemon LocalAPI".into(),
+                });
+            }
             ControlCommand::DnsStatus => crate::observability::dns_status()?,
             ControlCommand::DnsResolve { .. } => crate::observability::dns_resolve()?,
             ControlCommand::DnsProviders => crate::observability::dns_providers()?,
@@ -104,6 +109,9 @@ fn json_to_lines(json: &Value) -> Vec<String> {
 /// 文本只是 JSON 的投影；机器可读的权威形状仍是 `--json` 输出的 JSON。
 #[must_use]
 pub fn render_text(json: &Value) -> Vec<String> {
+    if let Some(lines) = render_nat_table(json) {
+        return lines;
+    }
     let mut lines = Vec::new();
     if let Some(obj) = json.as_object() {
         for (k, v) in obj {
@@ -111,6 +119,50 @@ pub fn render_text(json: &Value) -> Vec<String> {
         }
     }
     lines
+}
+
+/// NAT snapshot human table (spec §11.3):
+/// `PEER TUNNEL LOCAL_NAT REMOTE_NAT RELAY PUNCH RTT LOSS ACTIVE`.
+fn render_nat_table(json: &Value) -> Option<Vec<String>> {
+    let peers = json.get("peers")?.as_array()?;
+    if json.get("schema_version").is_none() || json.get("runtime").is_none() {
+        return None;
+    }
+    let mut lines =
+        vec!["PEER TUNNEL LOCAL_NAT REMOTE_NAT RELAY PUNCH RTT LOSS ACTIVE".to_string()];
+    for p in peers {
+        let punch = p.get("punch").cloned().unwrap_or(Value::Null);
+        let active = punch
+            .get("last_direct_addr")
+            .and_then(Value::as_str)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        lines.push(format!(
+            "{} {} {} {} {} {} {} {} {}",
+            p.get("peer_id").and_then(Value::as_str).unwrap_or("-"),
+            p.get("tunnel_proto").and_then(Value::as_str).unwrap_or("-"),
+            p.get("nat_type_local")
+                .and_then(Value::as_str)
+                .unwrap_or("-"),
+            p.get("nat_type_remote")
+                .and_then(Value::as_str)
+                .unwrap_or("-"),
+            p.get("relay_source").and_then(Value::as_str).unwrap_or("-"),
+            punch.get("state").and_then(Value::as_str).unwrap_or("-"),
+            punch
+                .get("rtt_ms")
+                .and_then(Value::as_u64)
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into()),
+            punch
+                .get("loss_01")
+                .and_then(Value::as_f64)
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "-".into()),
+            active,
+        ));
+    }
+    Some(lines)
 }
 
 fn render_field(key: &str, val: &Value, out: &mut Vec<String>) {

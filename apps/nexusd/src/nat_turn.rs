@@ -520,6 +520,7 @@ mod tests {
             refresh_interval_sec,
             stun_server: None,
             stun_server2: None,
+            bind_addr: "0.0.0.0:0".into(),
         }
     }
 
@@ -660,6 +661,7 @@ mod tests {
             refresh_interval_sec: 300,
             stun_server: None,
             stun_server2: None,
+            bind_addr: "0.0.0.0:0".into(),
         };
         let mgr = TurnManager::new(Some(cfg));
         assert_eq!(mgr.state(), TurnState::Disabled);
