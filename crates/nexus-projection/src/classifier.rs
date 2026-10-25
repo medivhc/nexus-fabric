@@ -1,6 +1,6 @@
 //! 统一包分类器（S29/S30/S31）。
 //!
-//! 单个 TUN 的唯一包分类入口（文档 §6/§11.2 数据面位置）：
+//! TUN 前端分类器（TPROXY 前端使用 TransparentPipeline，不经过本类型）：
 //!
 //! - S29：分类顺序 mesh CIDR → fake-IP → bypass → 规则引擎；
 //! - S30：mesh 命中时用 `boost::select_best` 做 EWMA 选路（只读）；
@@ -65,7 +65,7 @@ pub enum Classification {
     },
 }
 
-/// 统一包分类器：单个 TUN 的唯一分类入口。
+/// 统一包分类器：TUN 前端的分类器（TPROXY 走 TransparentPipeline 的决策路径）。
 ///
 /// - `manager` / `candidates` 仅用于 S30 的只读 EWMA 选路；
 ///   不持有写权限（single writer 仍在 `nexus-path`）。
