@@ -22,12 +22,11 @@
 
 ## Hysteria2
 
-- **验证状态（verdict）**：`BROKEN`（命中规则 2）
-- **覆盖范围（scope）**：`PROTOCOL_SUBSET`
-- **是否可用（claim）**：`NOT_USABLE`
-- **root_cause_class**：`E_TIMEOUT_HANG`
-- **根因/限制摘要**：认证响应 QPACK Huffman 编解码错误；代表根因类为 `E_TIMEOUT_HANG`，剩余阻塞格为 `Default/TcpThroughput(FAIL,E_TIMEOUT_HANG)`，其余格 PASS。属单协议可解（编解码一处），修复后本 run schema 上限为 `VERIFIED / FULL`。
-
+- **验证状态（verdict）**：`VERIFIED`（命中规则 8）
+- **覆盖范围（scope）**：`FULL`
+- **是否可用（claim）**：`USABLE`
+- **root_cause_class**：`NONE`
+- **根因/限制摘要**：阻断已消除——认证响应 QPACK Huffman 编解码已由 `fixes-3` 修复；Salamander 变体已由 `fixes-4` 独立验证 PASS；`Default/TcpThroughput` 大流量挂死已由 `fixes-7` pump 修复（官格四跑 PASS，median 103–106 MB/s，构建含修复且 probe 二进制 sha256 一致）。该格唯一 FAIL 证据 `T193403Z` 采自不含 pump 修复的构建（并行采集时序倒置），已按裁决 `MSR-fixes7-hy2-flip-ruling-20261028` 在证据根记 superseded 弃用（见 MATRIX 附录 E）。范围限制：端口跳跃/Brutal/gecko/分片不在本 run 范围，结论仅对 sing-box 1.13.16 参照配置成立。证据构建注记：T2 证据构建（`e8363bc`/`4b4de30`，基底 `c04b409` + pump 修复）早于 `fixes-4`/`fixes-5` 合入，合并树在此之外另含该两 run 的变更；逐格构建绑定见 MATRIX 附录 D。
 ## Trojan
 
 - **验证状态（verdict）**：`PARTIAL`（命中规则 6）

@@ -3,7 +3,7 @@
 > 本文件由 `scripts/interop/recompute-verdicts.py` 从证据机械生成；人工零编辑。
 > 修复顺序、依赖与复验口径见人工维护的 [NEXT-STEPS.md](NEXT-STEPS.md)。
 
-- run `protocol-interop-fixes-5`；baseline `a30147a7b98c9a84a46332c6613cf161280234b2`；spec frozen fixes-5 frozen (requirement-change)（sha256 `a955bd9ab227c23c2772fc6932ab909f2e65de114cb39bb1e2650866334e7718`）；test window `2026-10-25T18:28:02Z .. 2026-10-25T19:51:02Z`。
+- run `protocol-interop-fixes-7（合并再生，叙事基底承 fixes-5）`；baseline `6ede7ece97495cbbc315d642c06b3f7f2b3778bf`；spec frozen fixes-7 frozen v1.1 + fixes-5 frozen (requirement-change)（合并再生）；test window `2026-10-25T18:22:40Z .. 2026-10-25T19:51:02Z`。
 - 参照实现：sing-box 1.13.16（sha256 `8da901e7b6eb0d2f6f6e701f19d5f78af235d038ae078b37a70739db5895d262`）；Xray 26.10.21（sha256 `MISSING`）。
 - archive（主机归档路径）：（S30 归档后追加）。
 - 注记：`docs/protocols/interop/notes/trojan-fallback.md`（sha256 `0c49d2f5ea7e7c121731b212fc5f652be17cde97d11d7a8972195e9c27f7a339`）；本节由 `recompute-verdicts.py --notes` 注入，禁止手工编辑 MATRIX。
@@ -13,12 +13,12 @@
 - **覆盖**：5 个出站代理协议（VLESS、AnyTLS、Hysteria2、Trojan、Shadowsocks）共 47 个证据格。TCP 成功型格走产品 SOCKS5 出口路径；`UdpEcho` 与 VLESS Vision 部分格为 crate 直调（`CrateDirect`），不代表产品入口可用。
 - **不覆盖**：VMess（本轮暂缓）、direct/relay/socks5 出站、TUN/VPN、Android 统一 VPN 入口、UI/诊断呈现。
 - **本表不回答**：直连/中继回退是否可用（属 N1 整体结论）；也不把「产品级 UDP 未实现」扩大成「Hy2 的 QUIC 出站传输不可用」（见产品级 UDP 节）。
-- **结论 1**：本次复算：`VERIFIED` 2 个（Vless、Anytls），`PARTIAL` 2 个（Trojan、Shadowsocks），`BROKEN` 1 个（Hysteria2）；当前**无缺口**可宣称可用（`VERIFIED / USABLE`）的协议为 Vless、Anytls；另有 2 个 `USABLE_WITH_GAPS`（Trojan、Shadowsocks）。
+- **结论 1**：本次复算：`VERIFIED` 3 个（Vless、Anytls、Hysteria2），`PARTIAL` 2 个（Trojan、Shadowsocks），`BROKEN` 0 个；当前**无缺口**可宣称可用（`VERIFIED / USABLE`）的协议为 Vless、Anytls、Hysteria2；另有 2 个 `USABLE_WITH_GAPS`（Trojan、Shadowsocks）。
 - **结论 1 限定**：`USABLE` 指 TCP 产品路径；产品 SOCKS5 UDP ASSOCIATE 五协议均未实现，`UdpEcho` 为 crate 级证据、不代表产品入口可用。
-- **结论 2**：剩余阻断分属产品安全语义（Trojan fallback 的窗口外残余）、协议编解码（Hy2）、跨协议传输与产品能力缺口（五协议产品级 UDP）。本 run 已消除 Trojan fallback 的 fail-open 主路径（success 前零字节投递），`root_cause_class` 只是规则代表类，不是完整根因。
-- **结论 3**：未达 `VERIFIED` 的协议及本次复算代表根因：Hysteria2 `BROKEN / E_TIMEOUT_HANG`；Trojan `PARTIAL / E_NEXUS_NOT_IMPLEMENTED`；Shadowsocks `PARTIAL / E_NEXUS_NOT_IMPLEMENTED`。
-- **结论 4**：Trojan 的 fallback fail-open 主路径已由本 run 关闭（success 前零字节投递），剩余为 success 之后到达的 fallback（R-1/R-2 承诺边界）与产品 UDP 未实现；Shadowsocks 剩余为产品 UDP 缺口（SIP004 线格式已由 fixes-2 修复）。两者上限均为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（spec E1 规则 6/R11）。
-- **结论 5**：五协议当前均可在产品配置面选择，且无「实验性/未验证」标注；配置面标注（P0b）仍待 protocol-config-surface-labeling run 落地。本 run 只新增 trojan 专属的 `fallback_guard` / `ready_window_ms` 两个字段与 CONNECT 应答时序/失败语义。
+- **结论 2**：剩余阻断分属产品安全语义（Trojan fallback 的窗口外残余）与产品能力缺口（五协议产品级 UDP）。Hy2 阻断已由 fixes-3（QPACK Huffman）/ fixes-4（Salamander）/ fixes-7（T2 pump）三段修复消除，本次合并复算翻转为 VERIFIED / FULL。Trojan fallback 的 fail-open 主路径已由 fixes-5 消除（success 前零字节投递），`root_cause_class` 只是规则代表类，不是完整根因。
+- **结论 3**：未达 `VERIFIED` 的协议及本次复算代表根因：Trojan `PARTIAL / E_NEXUS_NOT_IMPLEMENTED`；Shadowsocks `PARTIAL / E_NEXUS_NOT_IMPLEMENTED`。
+- **结论 4**：Trojan 的 fallback fail-open 主路径已由 fixes-5 关闭（success 前零字节投递），剩余为 success 之后到达的 fallback（R-1/R-2 承诺边界）与产品 UDP 未实现；Shadowsocks 剩余为产品 UDP 缺口（SIP004 线格式已由 fixes-2 修复）。两者上限均为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（spec E1 规则 6/R11）。
+- **结论 5**：五协议当前均可在产品配置面选择，且无「实验性/未验证」标注；配置面标注（P0b）仍待 protocol-config-surface-labeling run 落地。fixes-5 只新增 trojan 专属的 `fallback_guard` / `ready_window_ms` 两个字段与 CONNECT 应答时序/失败语义；Hysteria2 已翻转 VERIFIED，不再是 P0b 的「未验证/不可用」标注对象。
 - **优先级 1（AC-1，DONE）**：TrojanFallback/BadCredential：success 前失败、零隧道字节、参照端 fallback 访问可证——PASS（本地 E4 + interop 参照格）；证据：analysis/ac1-local-fallback.json；evidence/trojan/trojan-fallback/bad-credential/（见 analysis/verdicts.json）；analysis/ac6-wire.json。
 - **优先级 2（R-1，待办）**：fallback 响应慢于 W（>600ms 上限 / 显式覆盖过小）——success 已写出，窗口外 fallback 内容仍可能被视为隧道数据；承诺边界外，见 notes/trojan-fallback.md。
 - **优先级 3（R-2，待办）**：fallback 等客户端先发载荷才响应——零载荷判据失效；承诺边界外。
@@ -155,7 +155,7 @@ python3 scripts/interop/recompute-verdicts.py ... --check   # 零漂移（含注
 |---|---|---|---|---|---|---|
 | Vless | VERIFIED | PROTOCOL_SUBSET | USABLE | NONE | NONE | 8 |
 | Anytls | VERIFIED | FULL | USABLE | NONE | NONE | 8 |
-| Hysteria2 | BROKEN | PROTOCOL_SUBSET | NOT_USABLE | E_TIMEOUT_HANG | TcpThroughput(FAIL,E_TIMEOUT_HANG) | 2 |
+| Hysteria2 | VERIFIED | FULL | USABLE | NONE | NONE | 8 |
 | Trojan | PARTIAL | TCP_ONLY | USABLE_WITH_GAPS | E_NEXUS_NOT_IMPLEMENTED | UdpEcho(NOT_IMPLEMENTED,E_NEXUS_NOT_IMPLEMENTED) | 6 |
 | Shadowsocks | PARTIAL | TCP_ONLY | USABLE_WITH_GAPS | E_NEXUS_NOT_IMPLEMENTED | UdpEcho(NOT_IMPLEMENTED,E_NEXUS_NOT_IMPLEMENTED) | 6 |
 
@@ -167,7 +167,7 @@ python3 scripts/interop/recompute-verdicts.py ... --check   # 零漂移（含注
 |---|---|---|---|---|---|
 | Vless | 无（本 run 已修复，证据见「fix 支线与复验」） | — | 无 | — | `VERIFIED / PROTOCOL_SUBSET`（Vision 仅 crate 级，产品 splice 未实现） |
 | Anytls | 无（本 run 已修复，证据见「fix 支线与复验」） | — | 无 | — | `VERIFIED / FULL` |
-| Hysteria2 | 认证响应 QPACK Huffman | 协议编解码实现错误 | TcpThroughput(FAIL,E_TIMEOUT_HANG) | 是（编解码一处） | `VERIFIED / FULL` |
+| Hysteria2 | 无（本 run 已修复，证据见「fix 支线与复验」） | — | 无 | — | `VERIFIED / FULL` |
 | Trojan | 产品 UDP 未实现（fallback fail-open 已由 fixes-5 关闭主路径） | 产品 UDP 能力缺口（fixes-6） | UdpEcho(NOT_IMPLEMENTED,E_NEXUS_NOT_IMPLEMENTED) | 否，依赖 fixes-6 | 本 run 最高 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（U 未实现，规则 6） |
 | Shadowsocks | 产品 UDP 未实现（SIP004 线格式已由 fixes-2 修复） | 产品 UDP 能力缺口（fixes-6） | UdpEcho(NOT_IMPLEMENTED,E_NEXUS_NOT_IMPLEMENTED) | 否，依赖产品 UDP | 本 run 最高 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（U 未实现，规则 6） |
 
@@ -215,7 +215,7 @@ python3 scripts/interop/recompute-verdicts.py ... --check   # 零漂移（含注
 
 ## Hysteria2
 
-> **verdict=BROKEN / claim=NOT_USABLE**（scope=PROTOCOL_SUBSET，root_cause_class=E_TIMEOUT_HANG）
+> **verdict=VERIFIED / claim=USABLE**（scope=FULL，root_cause_class=NONE）
 >
 > 本节任一 PASS 不改变协议 verdict；单格 PASS 只在所列 carrier/scope 下成立。
 > QpackDiag 为诊断格，不参与 verdict。
@@ -223,7 +223,7 @@ python3 scripts/interop/recompute-verdicts.py ... --check   # 零漂移（含注
 | Cell | 状态 | carrier | scope | evidence_id | class | 关键数字 | 证据路径 | notes |
 |---|---|---|---|---|---|---|---|---|
 | Default/TcpSmall | PASS | ProductSocks5 | ProductPath | PIV-hysteria2-default-tcp-small-20261025T193400Z-001 | NONE | up=65536B down=65536B | evidence/hysteria2/default/tcp-small/PIV-hysteria2-default-tcp-small-20261025T193400Z-001/probe.json | proxy_json routing.outbound_kind=hysteria2 outbound.kind=hysteria2; target_stats={"tcp_bytes_down":65537,"tcp_bytes_up":65537,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} … |
-| Default/TcpThroughput | FAIL | ProductSocks5 | ProductPath | PIV-hysteria2-default-tcp-throughput-20261025T193403Z-001 | E_TIMEOUT_HANG | median=0B/s samples=0 | evidence/hysteria2/default/tcp-throughput/PIV-hysteria2-default-tcp-throughput-20261025T193403Z-001/probe.json |  |
+| Default/TcpThroughput | PASS | ProductSocks5 | ProductPath | PIV-hysteria2-default-tcp-throughput-20261025T182240Z-001 | NONE | median=104614006B/s samples=3 | evidence/hysteria2/default/tcp-throughput/PIV-hysteria2-default-tcp-throughput-20261025T182240Z-001/probe.json | proxy_json routing.outbound_kind=hysteria2 outbound.kind=hysteria2; target_stats={"tcp_bytes_down":101716128,"tcp_bytes_up":101712896,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} … |
 | Default/LongLived | PASS | ProductSocks5 | ProductPath | PIV-hysteria2-default-long-lived-20261025T193528Z-001 | NONE | heartbeats=12 | evidence/hysteria2/default/long-lived/PIV-hysteria2-default-long-lived-20261025T193528Z-001/probe.json | proxy_json routing.outbound_kind=hysteria2 outbound.kind=hysteria2; target_stats={"tcp_bytes_down":13,"tcp_bytes_up":13,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} … |
 | Default/Reconnect | PASS | ProductSocks5 | ProductPath | PIV-hysteria2-default-reconnect-20261025T193745Z-001 | NONE | reconnects=3 | evidence/hysteria2/default/reconnect/PIV-hysteria2-default-reconnect-20261025T193745Z-001/probe.json | proxy_json routing.outbound_kind=hysteria2 outbound.kind=hysteria2; target_stats={"tcp_bytes_down":4,"tcp_bytes_up":4,"tcp_connections":4,"udp_bytes":0,"udp_datagrams":0} … |
 | Default/Handshake | PASS | ProductSocks5 | ProductPath | PIV-hysteria2-default-handshake-20261025T193753Z-001 | NONE | up=1B down=1B | evidence/hysteria2/default/handshake/PIV-hysteria2-default-handshake-20261025T193753Z-001/probe.json | proxy_json routing.outbound_kind=hysteria2 outbound.kind=hysteria2; target_stats={"tcp_bytes_down":2,"tcp_bytes_up":2,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} … |
@@ -289,8 +289,9 @@ python3 scripts/interop/recompute-verdicts.py ... --check   # 零漂移（含注
 本 run 产生 verdict 翻转的修复条目（来源：run-meta）：
 
 - **Trojan fallback fail-closed（CONNECT 应答暂存 + 就绪窗口 + 首包分类 + 失败应答）**（commit `12cbf81`）：TrojanFallback/BadCredential 由 FAIL/E_NEXUS_FRAMING 转为 PASS（REP≠0 + 零隧道字节 + pcap 证明 fallback 被访问）；Trojan Default 全格保持 PASS；上限仍为 PARTIAL / TCP_ONLY / USABLE_WITH_GAPS（evidence/trojan/trojan-fallback/bad-credential/（见 analysis/verdicts.json）；analysis/ac1-local-fallback.json；analysis/ac6-wire.json；analysis/ac9-calibration.json）
+- **Hysteria2 T2 pump 背压/流控修复（fixes-7）**（commit `13f9a9b`）：Hysteria2 Default/TcpThroughput 由 FAIL/E_TIMEOUT_HANG 转为 PASS（官格四跑 median 103–106 MB/s，构建含修复、probe 二进制 sha256 139dd86868c5…）；合并点按裁决 MSR-fixes7-hy2-flip-ruling-20261028 指定证据并弃用修复前 FAIL 证据 T193403Z，Hy2 三元组翻转为 VERIFIED / FULL / USABLE（evidence/hysteria2/default/tcp-throughput/（见 analysis/verdicts.json）；analysis/superseded.json）
 
-根因文档位于仓库 `docs/protocols/interop/fix/`；本 run 证据根为 `/work/interop-run/merge-fixes4-20261028`，上表 cell 证据路径均相对该目录。
+根因文档位于仓库 `docs/protocols/interop/fix/`；本 run 证据根为 `/work/interop-run/merge-fixes7-20261028`，上表 cell 证据路径均相对该目录。
 
 ## 附录 A：配置索引
 
@@ -330,7 +331,7 @@ python3 scripts/interop/recompute-verdicts.py ... --check   # 零漂移（含注
 | PIV-hysteria2-default-qpack-diag-20261025T193804Z-001 | PASS | CrateDirect | ProtocolWire | evidence/hysteria2/default/qpack-diag/PIV-hysteria2-default-qpack-diag-20261025T193804Z-001/probe.json |
 | PIV-hysteria2-default-reconnect-20261025T193745Z-001 | PASS | ProductSocks5 | ProductPath | evidence/hysteria2/default/reconnect/PIV-hysteria2-default-reconnect-20261025T193745Z-001/probe.json |
 | PIV-hysteria2-default-tcp-small-20261025T193400Z-001 | PASS | ProductSocks5 | ProductPath | evidence/hysteria2/default/tcp-small/PIV-hysteria2-default-tcp-small-20261025T193400Z-001/probe.json |
-| PIV-hysteria2-default-tcp-throughput-20261025T193403Z-001 | FAIL | ProductSocks5 | ProductPath | evidence/hysteria2/default/tcp-throughput/PIV-hysteria2-default-tcp-throughput-20261025T193403Z-001/probe.json |
+| PIV-hysteria2-default-tcp-throughput-20261025T182240Z-001 | PASS | ProductSocks5 | ProductPath | evidence/hysteria2/default/tcp-throughput/PIV-hysteria2-default-tcp-throughput-20261025T182240Z-001/probe.json |
 | PIV-hysteria2-default-udp-echo-20261025T193809Z-001 | PASS | CrateDirect | ProtocolWire | evidence/hysteria2/default/udp-echo/PIV-hysteria2-default-udp-echo-20261025T193809Z-001/probe.json |
 | PIV-hysteria2-hy2-salamander-handshake-20261025T193758Z-001 | PASS | ProductSocks5 | ProductPath | evidence/hysteria2/hy2-salamander/handshake/PIV-hysteria2-hy2-salamander-handshake-20261025T193758Z-001/probe.json |
 | PIV-hysteria2-hy2-salamander-tcp-small-20261025T182802Z-001 | PASS | ProductSocks5 | ProductPath | evidence/hysteria2/hy2-salamander/tcp-small/PIV-hysteria2-hy2-salamander-tcp-small-20261025T182802Z-001/probe.json |
@@ -366,11 +367,11 @@ python3 scripts/interop/recompute-verdicts.py ... --check   # 零漂移（含注
 
 ```bash
 scripts/interop/run-matrix.sh --protocol <p> --variant <v> --cell <c> \
-  --run-dir /work/interop-run/merge-fixes4-20261028 \
+  --run-dir /work/interop-run/merge-fixes7-20261028 \
   --probe-bin $CARGO_TARGET_DIR/debug/examples/protocol_interop_probe \
   --ref-bin $RUN_DIR/ref/sing-box-1.13.16-linux-amd64-musl/sing-box
-python3 scripts/interop/recompute-verdicts.py --run-dir /work/interop-run/merge-fixes4-20261028 \
-  --run-meta /work/interop-run/merge-fixes4-20261028/analysis/run-meta.json \
+python3 scripts/interop/recompute-verdicts.py --run-dir /work/interop-run/merge-fixes7-20261028 \
+  --run-meta /work/interop-run/merge-fixes7-20261028/analysis/run-meta.json \
   --matrix docs/protocols/interop/MATRIX.md --check
 ```
 
@@ -385,9 +386,18 @@ python3 scripts/interop/recompute-verdicts.py --run-dir /work/interop-run/merge-
 |---|---|---|---|---|
 | Vless | PIV-vless-default-tcp-throughput-20261025T192814Z-001 | 087b0dd29b1d327317b507d431c429552d367e51 | /work/wt-protocol-interop-fixes-5/target | b51a52726cd22320c447687cae6ab1a3b6b0fa4d854926199dc81d7986f3ed66 |
 | Anytls | PIV-anytls-default-tcp-throughput-20261025T193052Z-001 | 087b0dd29b1d327317b507d431c429552d367e51 | /work/wt-protocol-interop-fixes-5/target | b51a52726cd22320c447687cae6ab1a3b6b0fa4d854926199dc81d7986f3ed66 |
-| Hysteria2 | PIV-hysteria2-default-tcp-throughput-20261025T193403Z-001 | 087b0dd29b1d327317b507d431c429552d367e51 | /work/wt-protocol-interop-fixes-5/target | MISSING |
+| Hysteria2 | PIV-hysteria2-default-tcp-throughput-20261025T182240Z-001 | 4b4de3059baa975dc82955735ef81759402b5ca8 | /work/wt-protocol-interop-fixes-7/target | 139dd86868c55744b0218833a6714a67b36c84d225d3902abf4da7a07275b960 |
 | Trojan | PIV-trojan-default-tcp-throughput-20261025T195102Z-001 | 779595540c4310aa3b61ffd9c8986f7c6e1013ef | /work/nexus-dev/target | b51a52726cd22320c447687cae6ab1a3b6b0fa4d854926199dc81d7986f3ed66 |
 | Shadowsocks | PIV-shadowsocks-default-tcp-throughput-20261025T194107Z-001 | 087b0dd29b1d327317b507d431c429552d367e51 | /work/wt-protocol-interop-fixes-5/target | b51a52726cd22320c447687cae6ab1a3b6b0fa4d854926199dc81d7986f3ed66 |
 
-上表逐格给出各 T2 证据绑定的构建提交、目标目录与二进制哈希；按证据 `nexus.commit` 派生：`087b0dd29b1d327317b507d431c429552d367e51`（Vless、Anytls、Hysteria2、Shadowsocks）；`779595540c4310aa3b61ffd9c8986f7c6e1013ef`（Trojan）。
+上表逐格给出各 T2 证据绑定的构建提交、目标目录与二进制哈希；按证据 `nexus.commit` 派生：`087b0dd29b1d327317b507d431c429552d367e51`（Vless、Anytls、Shadowsocks）；`4b4de3059baa975dc82955735ef81759402b5ca8`（Hysteria2）；`779595540c4310aa3b61ffd9c8986f7c6e1013ef`（Trojan）。
 构建均来自证据记录的本 worktree `cargo_target_dir`，不再引用前序 run 的 fix worktree。
+
+## 附录 E：被替代运行
+
+| evidence_id | 原结论 | 替代者 | 弃用理由 |
+|---|---|---|---|
+| PIV-hysteria2-default-tcp-throughput-20261025T193403Z-001 | Fail | PIV-hysteria2-default-tcp-throughput-20261025T182240Z-001 | 构建 commit 087b0dd2 不含 pump 修复 13f9a9b（祖先证明：git merge-base --is-ancestor 13f9a9b 087b0dd2 -> exit 1，非祖先；13f9a9b 为 4b4de30 祖先 -> exit 0），对修复后代码不具证据资格。该证据系 fixes-5 期并行全量采集（cargo_target_dir 指向 wt-protocol-interop-fixes-5），probe exit 124 / E_TIMEOUT_HANG；其 evidence_id 时间（19:34Z）晚于 fixes-7 官格 PASS 证据（18:22Z）纯系并行采集顺序造成的时序倒置，recompute「同格取最新 id」规则在此失效。被 fixes-7 官格证据取代：develop 两跑 T173819Z（median 105,148,476 B/s）/ T173857Z（105,869,317 B/s，构建 e8363bc）与 re-verify 两跑 T182208Z（103,110,744 B/s）/ T182240Z（104,614,006 B/s，构建 4b4de30）共四跑 PASS，probe binary sha256 同为 139dd86868c5…。裁决 MSR-fixes7-hy2-flip-ruling-20261028 裁决一（装配 B）。 |
+| PIV-hysteria2-default-tcp-throughput-20261025T193405Z-001 | 无（仅 selfcheck.json，非 verdict 证据） | PIV-hysteria2-default-tcp-throughput-20261025T182240Z-001 | 与 T193403Z 同批（同格、同次并行采集，+2s）的 selfcheck 伴随工件目录，无 probe.json、无独立 verdict；随 T193403Z 一并自组合根副本移出，理由同上条。原件保留于原始证据树。 |
+
+复算的选择规则是同格取最新 evidence_id；被替代运行仍保留在证据树与 `analysis/progress.tsv`，不覆盖历史结论。
