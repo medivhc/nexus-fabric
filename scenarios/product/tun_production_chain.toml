@@ -1,0 +1,44 @@
+schema_version = 1
+id = "product.tun-production-chain"
+title = "TUN 生产链：规则分流 + Direct 真转发（E4）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-tun-transparent-inbound"
+
+[given]
+# 可执行 E4（example tun_production_chain --json）：MockTun 注入 UDP 包，
+# Dataplane 分类为 Direct -> RealUdpEgress 真发送 -> 本地回显 -> 写回 TUN。
+
+[when]
+command = "cargo run --quiet -p nexusd --example tun_production_chain -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "matched_rule"
+equals = "IP-CIDR,127.0.0.0/8"
+
+[[expect]]
+field = "selected_outbound"
+equals = "self"
+
+[[expect]]
+field = "egress_hint"
+absent = true
+
+[[expect]]
+field = "direct_tcp_dial_ok"
+equals = 0
+
+[[expect]]
+field = "upstream_failed"
+equals = 0
+
+[[expect]]
+field = "direct_udp_sent"
+equals = 1
+
+[[expect]]
+field = "direct_replies"
+equals = 1

@@ -1,0 +1,40 @@
+schema_version = 1
+id = "product.tproxy-capture-failure"
+title = "TPROXY 捕获失败：degraded/privilege/enforcement 不静默（E4）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-tun-transparent-inbound"
+
+[given]
+# 可执行 E4（example tproxy_capture_failure --json）：真实 bind 失败/权限不足，
+# on_capture_failure=block 且 backend 不可用 -> enforcement=impossible。
+
+[when]
+command = "cargo run --quiet -p nexusd --example tproxy_capture_failure -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "tproxy.state"
+equals = "degraded"
+
+[[expect]]
+field = "tproxy.privilege"
+one_of = ["root", "cap_net_admin", "insufficient"]
+
+[[expect]]
+field = "tproxy.reason"
+one_of = ["permission_denied", "bind_failed", "listener_io_failed"]
+
+[[expect]]
+field = "enforcement"
+equals = "impossible"
+
+[[expect]]
+field = "upstream_failed"
+equals = 0
+
+[[expect]]
+field = "request_succeeded_without_capture"
+equals = false

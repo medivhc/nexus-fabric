@@ -1,0 +1,44 @@
+schema_version = 1
+id = "product.tun-flow-sessions-auto"
+title = "流会话 auto 三态：有 provider / 无 provider / 显式禁用（E4）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-tun-transparent-inbound"
+
+[given]
+# 可执行 E4（example tun_flow_sessions_auto --json）：ProductionChainDeps 派生
+# Provider 数量驱动 auto 判定；全 direct -> disabled/no_providers。
+
+[when]
+command = "cargo run --quiet -p nexusd --example tun_flow_sessions_auto -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "flow_sessions.state"
+equals = "enabled"
+
+[[expect]]
+field = "flow_sessions.reason"
+absent = true
+
+[[expect]]
+field = "flow_sessions.providers"
+equals = 1
+
+[[expect]]
+field = "auto_no_provider.state"
+equals = "disabled"
+
+[[expect]]
+field = "auto_no_provider.reason"
+equals = "no_providers"
+
+[[expect]]
+field = "auto_no_provider.providers"
+equals = 0
+
+[[expect]]
+field = "disabled.state"
+equals = "disabled"
