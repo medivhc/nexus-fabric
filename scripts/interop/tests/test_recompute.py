@@ -396,6 +396,64 @@ class RecomputeTests(unittest.TestCase):
             self.assertIn("b7acb32", text)
             self.assertNotIn("**结论 1 限定**", text)
 
+    # ---- C5a: optional narrative overrides ---------------------------------
+
+    def _ss_run_with_meta(self, tmp, narrative=None):
+        make_run(
+            Path(tmp),
+            "Shadowsocks",
+            {("Default", "UdpEcho"): {"status": "NOT_IMPLEMENTED", "cls": "E_NEXUS_NOT_IMPLEMENTED"}},
+        )
+        path, meta = write_run_meta(tmp)
+        if narrative is not None:
+            meta["narrative"] = narrative
+            path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        _, text = recompute.build(
+            str(tmp), str(MATRIX_PATH), allow_partial=False, run_meta=meta
+        )
+        return text
+
+    def test_narrative_absent_keeps_default_narrative(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            text = self._ss_run_with_meta(tmp)
+            self.assertIn(
+                "剩余阻断分属协议编解码、协议线格式与产品安全语义/产品能力缺口", text
+            )
+            self.assertIn(
+                "Trojan/SS 当前仍受 fallback 安全语义/线格式与产品 UDP 缺口阻断", text
+            )
+            self.assertIn("线格式/SIP004 AEAD + 产品 UDP 未实现", blocking_row(text, "Shadowsocks"))
+            self.assertIn(
+                "限定：正向路径不通时本格仅证明无静默成功", text
+            )
+
+    def test_narrative_overrides_conclusions_blocking_and_upper_limit(self):
+        narrative = {
+            "conclusions": {"2": "FIXES2-CONCLUSION-2", "4": "FIXES2-CONCLUSION-4"},
+            "blocking_meta": {"Shadowsocks": ["仅剩产品 UDP", "产品 UDP 能力缺口", "否"]},
+            "upper_limit": {"Shadowsocks": "FIXES2-UPPER"},
+            "failure_cell_qualifier": {"Shadowsocks": "FIXES2-QUALIFIER"},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            text = self._ss_run_with_meta(tmp, narrative)
+            self.assertIn("**结论 2**：FIXES2-CONCLUSION-2", text)
+            self.assertIn("**结论 4**：FIXES2-CONCLUSION-4", text)
+            row = blocking_row(text, "Shadowsocks")
+            self.assertIn("仅剩产品 UDP", row)
+            self.assertIn("产品 UDP 能力缺口", row)
+            self.assertIn("FIXES2-UPPER", row)
+            self.assertNotIn("线格式/SIP004 AEAD + 产品 UDP 未实现", row)
+            self.assertIn("FIXES2-QUALIFIER", text)
+            self.assertNotIn("限定：正向路径不通时本格仅证明无静默成功", text)
+
+    def test_narrative_null_qualifier_suppresses_boilerplate(self):
+        narrative = {"failure_cell_qualifier": {"Shadowsocks": None}}
+        with tempfile.TemporaryDirectory() as tmp:
+            text = self._ss_run_with_meta(tmp, narrative)
+            self.assertNotIn("限定：正向路径不通时本格仅证明无静默成功", text)
+            # Verdict narrative stays default when only the qualifier is overridden.
+            self.assertIn("Trojan/SS 当前仍受 fallback 安全语义/线格式与产品 UDP 缺口阻断", text)
+
 
 if __name__ == "__main__":
     unittest.main()
