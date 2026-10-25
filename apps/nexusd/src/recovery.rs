@@ -529,6 +529,52 @@ mod tests {
     use super::*;
     use nexus_domain::LifecyclePhase;
 
+    /// AC-11：`links.json` 的 v1 字节格式（紧凑 JSON + 字典序键 + 无结尾换行）
+    /// 在接缝④迁移前后必须逐字节不变。fixture 由**迁移前**基点的真实写盘生成
+    /// （`FileLinkMarkerStore::save` 两条 marker，`cp` 出文件）。
+    #[test]
+    fn links_format_roundtrip_is_byte_identical() {
+        let fixture_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/links_v1.json");
+        let fixture = fs::read(&fixture_path).expect("read fixture");
+
+        let dir = temp_state_dir("links-format");
+        let state = state_dir(&dir);
+        fs::create_dir_all(&state).unwrap();
+        fs::write(state.join(LINKS_FILE), &fixture).unwrap();
+
+        let mut store = FileLinkMarkerStore::new(&state);
+        let markers = store.load().expect("decode v1 fixture");
+        assert_eq!(markers.len(), 2, "fixture 应含 2 条 marker");
+        assert_eq!(markers[0].link_id, "direct/peer-a");
+        assert!(!markers[0].stale);
+        assert_eq!(markers[1].link_id, "relay/peer-b");
+        assert!(markers[1].stale);
+
+        // kind 字符串通过落盘字节断言（不依赖 kind 的具体 Rust 类型，迁移前后同一断言）。
+        let v: Value = serde_json::from_slice(&fixture).expect("fixture is json");
+        let kinds: Vec<&str> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m.get("kind").and_then(Value::as_str).unwrap())
+            .collect();
+        assert_eq!(kinds, vec!["direct", "relay"]);
+
+        // upsert 第 0 条（内容不变）→ 落盘字节必须与 fixture 逐字节相等。
+        let first = markers[0].clone();
+        store.save(&first).expect("upsert unchanged marker");
+        let written = fs::read(state.join(LINKS_FILE)).unwrap();
+        assert_eq!(
+            written,
+            fixture,
+            "links.json 字节格式发生变化：{}",
+            String::from_utf8_lossy(&written)
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     fn temp_state_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "nexusd-recovery-test-{}-{}",
