@@ -28,12 +28,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nexus_connectivity::{
-    LinkKind, LinkMarker, LinkMarkerStore, LinkReconcileReport, reconcile_link_markers,
-};
 use nexus_domain::{LifecyclePhase, NexusError, SessionId, TerminalOutcome};
 use nexus_session::{
-    SessionReconcileReport, SessionRecord, SessionRecordStore, reconcile_session_records,
+    LinkMarker, LinkMarkerKind, LinkMarkerStore, LinkReconcileReport, SessionReconcileReport,
+    SessionRecord, SessionRecordStore, reconcile_link_markers, reconcile_session_records,
 };
 use serde_json::{Value, json};
 
@@ -167,21 +165,6 @@ fn decode_sessions(v: &Value) -> Result<Vec<SessionRecord>, String> {
         .collect()
 }
 
-fn link_kind_to_str(k: &LinkKind) -> &'static str {
-    match k {
-        LinkKind::Direct => "direct",
-        LinkKind::Relay => "relay",
-    }
-}
-
-fn parse_link_kind(s: &str) -> Result<LinkKind, String> {
-    match s {
-        "direct" => Ok(LinkKind::Direct),
-        "relay" => Ok(LinkKind::Relay),
-        other => Err(format!("unknown link kind: {other}")),
-    }
-}
-
 fn encode_links(markers: &[LinkMarker]) -> Value {
     Value::Array(
         markers
@@ -189,7 +172,7 @@ fn encode_links(markers: &[LinkMarker]) -> Value {
             .map(|m| {
                 json!({
                     "link_id": m.link_id,
-                    "kind": link_kind_to_str(&m.kind),
+                    "kind": m.kind.as_str(),
                     "locator": m.locator,
                     "established_at_unix": m.established_at_unix,
                     "stale": m.stale,
@@ -226,7 +209,7 @@ fn decode_links(v: &Value) -> Result<Vec<LinkMarker>, String> {
             let stale = item.get("stale").and_then(Value::as_bool).unwrap_or(false);
             Ok(LinkMarker {
                 link_id: link_id.to_string(),
-                kind: parse_link_kind(kind)?,
+                kind: LinkMarkerKind::parse(kind)?,
                 locator: locator.to_string(),
                 established_at_unix,
                 stale,
@@ -674,12 +657,13 @@ mod tests {
         store
             .save(&LinkMarker::established(
                 "direct/p1",
-                LinkKind::Direct,
+                LinkMarkerKind::Direct,
                 "10.0.0.1:1",
                 100,
             ))
             .unwrap();
-        let mut stale = LinkMarker::established("direct/p1", LinkKind::Direct, "10.0.0.1:1", 100);
+        let mut stale =
+            LinkMarker::established("direct/p1", LinkMarkerKind::Direct, "10.0.0.1:1", 100);
         stale.stale = true;
         store.save(&stale).unwrap();
         let markers = store.load().unwrap();
@@ -700,7 +684,7 @@ mod tests {
         links
             .save(&LinkMarker::established(
                 "direct/p9",
-                LinkKind::Direct,
+                LinkMarkerKind::Direct,
                 "10.9.9.9:9",
                 200,
             ))
