@@ -275,72 +275,254 @@ pub fn parse_request(buf: &[u8]) -> Result<SsTarget, OutboundCipherError> {
     }
 }
 
-/// 双向加密会话流：c2s/s2c 两把独立 key（HKDF info 区分），TX 方向固定计数 nonce。
+/// SIP004 加密会话流（TCP 双向同构）。
+///
+/// 线格式：`salt(32) || chunk*`，`chunk = AEAD(len 2B BE) || AEAD(payload)`，
+/// AEAD = chacha20-ietf-poly1305，AAD 恒为空，nonce 为 12B 小端计数器（不上线）。
+/// 两个方向各自生成/消耗自己的 salt：发送方 salt 由本端惰性生成
+/// （或经 `with_tx_salt` 注入测试固定值），接收方 salt 从流首 32B 读取。
 pub struct SsStream {
-    tx: ChaCha20Poly1305,
-    rx: ChaCha20Poly1305,
-    tx_counter: u64,
+    master_key: [u8; 32],
+    _role: Role,
+    tx: Option<ChaCha20Poly1305>,
+    tx_salt: Option<[u8; 32]>,
+    tx_nonce: u64,
+    rx: Option<ChaCha20Poly1305>,
+    rx_buf: Vec<u8>,
+    rx_pending_len: Option<usize>,
+    rx_nonce: u64,
+    poisoned: Option<OutboundCipherError>,
 }
 
-fn derive_key(method: SsMethod, ikm: &[u8], info: &[u8]) -> [u8; 32] {
-    let hk = Hkdf::<Sha256>::new(Some(method.as_str().as_bytes()), ikm);
+/// 单个 chunk 的明文长度上限（SIP004：len 字段合法域 `1..=0x3FFF`）。
+const MAX_CHUNK_PLAINTEXT: usize = 0x3FFF;
+/// 单个 chunk 的 len 段线长：2B 明文 + 16B tag。
+const LEN_CHUNK_WIRE: usize = 2 + 16;
+/// AEAD tag 长度。
+const TAG_LEN: usize = 16;
+
+/// SIP004 口令 → master key：`EVP_BytesToKey`（MD5、无 salt、1 次迭代）。
+fn evp_bytes_to_key(password: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
-    hk.expand(info, &mut out).expect("hkdf expand 32 bytes");
+    let mut prev: Vec<u8> = Vec::new();
+    let mut filled = 0usize;
+    while filled < out.len() {
+        let mut input = Vec::with_capacity(prev.len() + password.len());
+        input.extend_from_slice(&prev);
+        input.extend_from_slice(password);
+        let digest = md5::compute(&input).0;
+        let take = (out.len() - filled).min(digest.len());
+        out[filled..filled + take].copy_from_slice(&digest[..take]);
+        filled += take;
+        prev = digest.to_vec();
+    }
     out
 }
 
+/// master key → 方向 subkey：HKDF-SHA1（salt = 本方向 32B salt，info = `"ss-subkey"`）。
+fn derive_subkey(master: &[u8; 32], salt: &[u8; 32]) -> Result<[u8; 32], OutboundCipherError> {
+    let hk = Hkdf::<sha1::Sha1>::new(Some(salt), master);
+    let mut out = [0u8; 32];
+    hk.expand(b"ss-subkey", &mut out)
+        .map_err(|_| OutboundCipherError::KeyDerivation)?;
+    Ok(out)
+}
+
+/// 12B 小端计数器 nonce（低 8 字节承载计数器，其余清零；不上线）。
+fn nonce_bytes(counter: u64) -> [u8; 12] {
+    let mut nonce = [0u8; 12];
+    nonce[..8].copy_from_slice(&counter.to_le_bytes());
+    nonce
+}
+
 impl SsStream {
-    /// 按角色构造会话：Client TX=c2s/RX=s2c；Server 相反。
+    /// 构造会话：只做口令 → master key 派生，不生成 salt、不消耗随机源。
+    ///
+    /// `role` 保留在签名中以兼容既有调用点；SIP004 双向完全对称，
+    /// 实现不再用它影响密钥派生。
     ///
     /// # Errors
     ///
-    /// key 派生失败返回 `KeyDerivation`（HKDF 固定 32B 实际不会失败）。
+    /// 派生失败返回 `KeyDerivation`（数学上不可达）。
     pub fn new(password: &str, method: SsMethod, role: Role) -> Result<Self, OutboundCipherError> {
-        let ikm = password.as_bytes();
-        let c2s = derive_key(method, ikm, b"ss-c2s");
-        let s2c = derive_key(method, ikm, b"ss-s2c");
-        let (tx, rx) = match role {
-            Role::Client => (c2s, s2c),
-            Role::Server => (s2c, c2s),
-        };
+        let _ = method;
         Ok(Self {
-            tx: ChaCha20Poly1305::new(Key::from_slice(&tx)),
-            rx: ChaCha20Poly1305::new(Key::from_slice(&rx)),
-            tx_counter: 0,
+            master_key: evp_bytes_to_key(password.as_bytes()),
+            _role: role,
+            tx: None,
+            tx_salt: None,
+            tx_nonce: 0,
+            rx: None,
+            rx_buf: Vec::new(),
+            rx_pending_len: None,
+            rx_nonce: 0,
+            poisoned: None,
         })
     }
 
-    /// 加密一段明文记录：输出 `nonce(12B) || ciphertext+tag`。
+    /// 构造会话并把发送 salt 固定为 `tx_salt`（**仅供确定性测试/金样**）。
+    ///
+    /// 生产代码禁止调用（review grep：调用点只在测试内）；生产路径用 [`SsStream::new`]
+    /// 让发送 salt 由 `ring::rand::SystemRandom` 惰性生成。
     ///
     /// # Errors
     ///
-    /// AEAD 加密失败返回 `DecryptFailed`。
-    pub fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, OutboundCipherError> {
-        let mut nonce = [0u8; 12];
-        nonce[..8].copy_from_slice(&self.tx_counter.to_le_bytes());
-        self.tx_counter = self.tx_counter.wrapping_add(1);
-        let ct = self
-            .tx
-            .encrypt(Nonce::from_slice(&nonce), plaintext)
-            .map_err(|_| OutboundCipherError::DecryptFailed)?;
-        let mut frame = nonce.to_vec();
-        frame.extend(ct);
-        Ok(frame)
+    /// 同 [`SsStream::new`]。
+    pub fn with_tx_salt(
+        password: &str,
+        method: SsMethod,
+        role: Role,
+        tx_salt: [u8; 32],
+    ) -> Result<Self, OutboundCipherError> {
+        let mut stream = Self::new(password, method, role)?;
+        stream.tx_salt = Some(tx_salt);
+        Ok(stream)
     }
 
-    /// 解密一段 `nonce(12B) || ciphertext+tag` 记录（用 RX key，帧内 nonce）。
+    fn encrypt_chunk(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, OutboundCipherError> {
+        let nonce = nonce_bytes(self.tx_nonce);
+        self.tx_nonce = self.tx_nonce.wrapping_add(1);
+        self.tx
+            .as_ref()
+            .expect("tx cipher initialized before encrypt_chunk")
+            .encrypt(Nonce::from_slice(&nonce), plaintext)
+            .map_err(|_| OutboundCipherError::DecryptFailed)
+    }
+
+    /// 加密一段明文，返回对应的线字节增量。
+    ///
+    /// 首次非空调用会在输出前写入本端 32B salt（之后永不重复）；明文按
+    /// `0x3FFF` 切 chunk，空输入返回空 `Vec` 且不触发 salt 发射。
     ///
     /// # Errors
     ///
-    /// 帧过短返回 `InvalidFrame`；AEAD 校验失败返回 `DecryptFailed`。
-    pub fn open(&mut self, frame: &[u8]) -> Result<Vec<u8>, OutboundCipherError> {
-        if frame.len() < 12 + 16 {
-            return Err(OutboundCipherError::InvalidFrame);
+    /// 随机源失败返回 `KeyDerivation`；AEAD 加密失败返回 `DecryptFailed`。
+    pub fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, OutboundCipherError> {
+        if plaintext.is_empty() {
+            return Ok(Vec::new());
         }
-        let (nonce, ct) = frame.split_at(12);
-        self.rx
-            .decrypt(Nonce::from_slice(nonce), ct)
-            .map_err(|_| OutboundCipherError::DecryptFailed)
+        let mut out = Vec::with_capacity(
+            plaintext.len()
+                + 2 * LEN_CHUNK_WIRE
+                + plaintext.len().div_ceil(MAX_CHUNK_PLAINTEXT) * TAG_LEN,
+        );
+        if self.tx.is_none() {
+            let salt = match self.tx_salt {
+                Some(salt) => salt,
+                None => {
+                    use ring::rand::SecureRandom;
+                    let mut salt = [0u8; 32];
+                    ring::rand::SystemRandom::new()
+                        .fill(&mut salt)
+                        .map_err(|_| OutboundCipherError::KeyDerivation)?;
+                    salt
+                }
+            };
+            let subkey = derive_subkey(&self.master_key, &salt)?;
+            self.tx = Some(ChaCha20Poly1305::new(Key::from_slice(&subkey)));
+            self.tx_nonce = 0;
+            out.extend_from_slice(&salt);
+        }
+        for chunk in plaintext.chunks(MAX_CHUNK_PLAINTEXT) {
+            let len = u16::try_from(chunk.len()).expect("chunk <= 0x3FFF fits u16");
+            out.extend_from_slice(&self.encrypt_chunk(&len.to_be_bytes())?);
+            out.extend_from_slice(&self.encrypt_chunk(chunk)?);
+        }
+        Ok(out)
+    }
+
+    /// 追加线字节并返回当前可解出的全部明文（流式，可为空）。
+    ///
+    /// salt 未满 32B、len chunk 未收齐、payload chunk 未收齐时都不产出明文。
+    /// 任一错误后流进入 poisoned 状态，后续调用返回同一错误变体（不重同步）。
+    ///
+    /// # Errors
+    ///
+    /// AEAD 校验失败返回 `DecryptFailed`；解出的 len 为 `0` 或 `> 0x3FFF`
+    /// 返回 `InvalidFrame`；派生失败返回 `KeyDerivation`。
+    pub fn open(&mut self, data: &[u8]) -> Result<Vec<u8>, OutboundCipherError> {
+        if let Some(err) = &self.poisoned {
+            return Err(err.clone());
+        }
+        self.rx_buf.extend_from_slice(data);
+        let mut out = Vec::new();
+
+        if self.rx.is_none() {
+            if self.rx_buf.len() < 32 {
+                return Ok(out);
+            }
+            let mut salt = [0u8; 32];
+            salt.copy_from_slice(&self.rx_buf[..32]);
+            match derive_subkey(&self.master_key, &salt) {
+                Ok(subkey) => {
+                    self.rx = Some(ChaCha20Poly1305::new(Key::from_slice(&subkey)));
+                    self.rx_nonce = 0;
+                }
+                Err(err) => {
+                    self.poisoned = Some(err.clone());
+                    return Err(err);
+                }
+            }
+            self.rx_buf.drain(..32);
+        }
+
+        loop {
+            if self.rx_pending_len.is_none() {
+                if self.rx_buf.len() < LEN_CHUNK_WIRE {
+                    break;
+                }
+                let mut ct = [0u8; LEN_CHUNK_WIRE];
+                ct.copy_from_slice(&self.rx_buf[..LEN_CHUNK_WIRE]);
+                let nonce = nonce_bytes(self.rx_nonce);
+                let plain_len = match self
+                    .rx
+                    .as_ref()
+                    .expect("rx cipher initialized above")
+                    .decrypt(Nonce::from_slice(&nonce), ct.as_ref())
+                {
+                    Ok(plain) => plain,
+                    Err(_) => return Err(self.poison(OutboundCipherError::DecryptFailed)),
+                };
+                self.rx_nonce = self.rx_nonce.wrapping_add(1);
+                self.rx_buf.drain(..LEN_CHUNK_WIRE);
+                if plain_len.len() != 2 {
+                    return Err(self.poison(OutboundCipherError::InvalidFrame));
+                }
+                let len = u16::from_be_bytes([plain_len[0], plain_len[1]]) as usize;
+                if len == 0 || len > MAX_CHUNK_PLAINTEXT {
+                    return Err(self.poison(OutboundCipherError::InvalidFrame));
+                }
+                self.rx_pending_len = Some(len);
+            }
+
+            let len = self.rx_pending_len.expect("pending len set above");
+            let wire = len + TAG_LEN;
+            if self.rx_buf.len() < wire {
+                break;
+            }
+            let mut ct = vec![0u8; wire];
+            ct.copy_from_slice(&self.rx_buf[..wire]);
+            let nonce = nonce_bytes(self.rx_nonce);
+            let plain = match self
+                .rx
+                .as_ref()
+                .expect("rx cipher initialized above")
+                .decrypt(Nonce::from_slice(&nonce), ct.as_ref())
+            {
+                Ok(plain) => plain,
+                Err(_) => return Err(self.poison(OutboundCipherError::DecryptFailed)),
+            };
+            self.rx_nonce = self.rx_nonce.wrapping_add(1);
+            self.rx_buf.drain(..wire);
+            self.rx_pending_len = None;
+            out.extend_from_slice(&plain);
+        }
+        Ok(out)
+    }
+
+    fn poison(&mut self, err: OutboundCipherError) -> OutboundCipherError {
+        self.poisoned = Some(err.clone());
+        err
     }
 }
 
@@ -434,6 +616,148 @@ mod tests {
         let t = SsTarget::Domain("target.internal".to_string(), 1080);
         let enc = encode_request(&t);
         assert_eq!(parse_request(&enc).unwrap(), t);
+    }
+
+    // ---- KAT-1 / KAT-2：独立向量（Python hashlib/hmac + cryptography 生成） ----
+
+    /// KAT-1：EVP_BytesToKey（MD5、无 salt、1 迭代），期望值来自
+    /// `tests/kat/generate_kat.py`（Python hashlib 手算 MD5 链；ASCII 向量另经
+    /// `openssl dgst -md5` 交叉核对）。
+    #[test]
+    fn kat1_evp_bytes_to_key() {
+        let vectors: [(&str, &str); 3] = [
+            (
+                "password",
+                "5f4dcc3b5aa765d61d8327deb882cf992b95990a9151374abd8ff8c5a7a0fe08",
+            ),
+            (
+                "pässwörd-密码",
+                "fd0dc7425473fe807455ba8a82344b98186ec57b1c431ad997ef90eae98f74bc",
+            ),
+            (
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "fe3a1ff59f3b89b2ad3d33f08984874bf3101797f67e6effc9b7946fbd3b8847",
+            ),
+        ];
+        for (password, expected) in vectors {
+            assert_eq!(
+                hex(&evp_bytes_to_key(password.as_bytes())),
+                expected,
+                "{password}"
+            );
+        }
+    }
+
+    /// KAT-2：HKDF-SHA1 subkey（master = KAT-1#1，salt = 32×0x00，
+    /// info = `"ss-subkey"`），期望值来自生成器内 RFC 5869 A.4 自检后的
+    /// 独立实现（cryptography HKDF 与手写 HMAC 双方一致）。
+    #[test]
+    fn kat2_hkdf_sha1_subkey() {
+        let master = evp_bytes_to_key(b"password");
+        let subkey = derive_subkey(&master, &[0u8; 32]).unwrap();
+        assert_eq!(
+            hex(&subkey),
+            "8c945d161c1cb5a06f884ba84d32352eecc2367284af3b975f921a67b804b69e"
+        );
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    // ---- chunk 边界（spec §1.2 / §2.2 补充项） ----
+
+    #[test]
+    fn seal_empty_plaintext_is_empty_and_emits_no_salt() {
+        let mut s = SsStream::with_tx_salt(
+            "pw",
+            SsMethod::Chacha20IetfPoly1305,
+            Role::Client,
+            [7u8; 32],
+        )
+        .unwrap();
+        assert!(s.seal(&[]).unwrap().is_empty());
+        // salt 仍未被发射：首个非空 seal 才带头。
+        let wire = s.seal(&[0u8]).unwrap();
+        assert_eq!(&wire[..32], &[7u8; 32]);
+        assert_eq!(wire.len(), 67);
+    }
+
+    #[test]
+    fn seal_one_byte_first_is_67_then_35() {
+        let mut s = SsStream::with_tx_salt(
+            "pw",
+            SsMethod::Chacha20IetfPoly1305,
+            Role::Client,
+            [1u8; 32],
+        )
+        .unwrap();
+        assert_eq!(s.seal(b"x").unwrap().len(), 32 + 18 + 1 + 16);
+        assert_eq!(s.seal(b"y").unwrap().len(), 18 + 1 + 16);
+    }
+
+    #[test]
+    fn seal_chunk_boundary_16383_and_16384() {
+        let mut a = SsStream::with_tx_salt(
+            "pw",
+            SsMethod::Chacha20IetfPoly1305,
+            Role::Client,
+            [2u8; 32],
+        )
+        .unwrap();
+        assert_eq!(a.seal(&vec![0u8; 16383]).unwrap().len(), 16449);
+
+        let mut b = SsStream::with_tx_salt(
+            "pw",
+            SsMethod::Chacha20IetfPoly1305,
+            Role::Client,
+            [3u8; 32],
+        )
+        .unwrap();
+        // 16384B = 16383B chunk + 1B chunk：16449 + (18 + 1 + 16)。
+        assert_eq!(b.seal(&vec![0u8; 16384]).unwrap().len(), 16449 + 35);
+    }
+
+    #[test]
+    fn seal_does_not_repeat_salt_across_chunks() {
+        let mut s = SsStream::with_tx_salt(
+            "pw",
+            SsMethod::Chacha20IetfPoly1305,
+            Role::Client,
+            [4u8; 32],
+        )
+        .unwrap();
+        let wire = s.seal(&vec![0u8; 0x3FFF + 1]).unwrap();
+        assert_eq!(&wire[..32], &[4u8; 32]);
+        let second = s.seal(&[9u8]).unwrap();
+        assert_eq!(second.len(), 18 + 1 + 16);
+        assert_ne!(&second[..32.min(second.len())], &[4u8; 32]);
+    }
+
+    /// 唯一允许的随机断言：两次 `new` + 同明文 seal 的 TX 首 32B（salt）不同。
+    #[test]
+    fn two_new_instances_use_distinct_tx_salts() {
+        let mut a = SsStream::new("pw", SsMethod::Chacha20IetfPoly1305, Role::Client).unwrap();
+        let mut b = SsStream::new("pw", SsMethod::Chacha20IetfPoly1305, Role::Client).unwrap();
+        let wa = a.seal(b"same").unwrap();
+        let wb = b.seal(b"same").unwrap();
+        assert_ne!(&wa[..32], &wb[..32]);
+    }
+
+    #[test]
+    fn open_partial_salt_returns_empty() {
+        let wire = SsStream::with_tx_salt(
+            "pw",
+            SsMethod::Chacha20IetfPoly1305,
+            Role::Client,
+            [5u8; 32],
+        )
+        .unwrap()
+        .seal(b"hello")
+        .unwrap();
+        let mut rx = SsStream::new("pw", SsMethod::Chacha20IetfPoly1305, Role::Server).unwrap();
+        assert!(rx.open(&wire[..31]).unwrap().is_empty());
+        assert_eq!(rx.open(&wire[31..]).unwrap(), b"hello");
     }
 
     #[test]
