@@ -12991,8 +12991,8 @@ mod hysteria2_dataplane_tests {
         let started = Instant::now();
         let pump = std::thread::spawn(move || {
             let counts = hysteria2_pump_stream(&mut client, stream, fast_open, &mut down_client);
-            client.close();
             let _ = tx.send(counts);
+            client
         });
 
         let counts = match rx.recv_timeout(GUARD) {
@@ -13005,15 +13005,28 @@ mod hysteria2_dataplane_tests {
             ),
         };
         let elapsed = started.elapsed();
-        pump.join().unwrap();
+        let mut client = pump.join().unwrap();
         writer.join().unwrap().unwrap();
 
         assert_eq!(counts.0, TOTAL, "up_bytes must be exactly 12 MiB");
         assert_eq!(counts.1, 0, "sink must not send payload downstream");
-        let wait_deadline = Instant::now() + Duration::from_secs(10);
-        while server.received_bytes() < TOTAL as u64 && Instant::now() < wait_deadline {
-            std::thread::sleep(Duration::from_millis(10));
+        // pump 返回只说明 12 MiB 已进入 QUIC 发送缓冲（受对端流控额度限制），
+        // 不等于已发出/已被对端读出：`close()` 发 CONNECTION_CLOSE 后 quinn
+        // 只发 close 包，仍在发送队列里的尾部会被丢弃；对端未读出的字节也不
+        // 再计数。故先驱动连接、等 TestServer 的应用层计数到 12 MiB，再关闭。
+        // 等待有界（10 s）；到不了由下面的精确字节断言判 FAIL，不改变判据。
+        let drain_deadline = Instant::now() + Duration::from_secs(10);
+        let mut dbuf = [0u8; 64];
+        while server.received_bytes() < TOTAL as u64 && Instant::now() < drain_deadline {
+            // sink 不回载荷：Timeout 只用于推进 QUIC（收 ACK/触发重传），不产生新字节。
+            if client
+                .stream_read(stream, &mut dbuf, Duration::from_millis(20))
+                .is_err()
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
+        client.close();
         assert_eq!(
             server.received_bytes(),
             TOTAL as u64,
