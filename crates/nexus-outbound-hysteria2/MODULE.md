@@ -33,7 +33,8 @@ QUIC（RFC 9000）+ 不可靠数据报扩展（RFC 9221）上的 TCP/UDP 代理�
 - Salamander 混淆（`obfs.rs`）：`salt(8) + (payload XOR BLAKE2b-256(key||salt))`
   的加/解，发生在 QUIC 包之下的 driver 收发处；`obfs = "gecko"` 配置即拒绝；
 - QPACK 静态表（RFC 9204 Appendix A 全表，`qpack.rs`）：解码支持静态表索引
-  引用与静态表名引用；Huffman（`H` 位）不在最小子集内，遇到返回 `InvalidFrame`；
+  引用与静态表名引用；字符串（值以及 §4.5.4 的字面量名）支持 Huffman（`H` 位）
+  解码（RFC 7541 附录 B 码表，含 EOS/padding 校验），编码侧恒 `H`=0；
 - 最小 sans-IO QUIC 驱动（`driver.rs`，同步阻塞 API）：UDP 收发、定时器、
   端点事件路由、stream 读写原语（`write_all` / `read_exact` / `read_some` /
   `read_varint`）、DATAGRAM 收发；client 与测试用 server 共用；
@@ -85,8 +86,8 @@ QUIC（RFC 9000）+ 不可靠数据报扩展（RFC 9221）上的 TCP/UDP 代理�
   要求至少包含该头）；
 - DATAGRAM 收发缓冲：文档"收发队列各 1024"指包数，quinn-proto 以字节计，
   按 1350 字节/包折算为 `1024*1350` 字节；
-- QPACK 解码遇到 Huffman 编码（`H` 位）返回 `InvalidFrame`（最小子集不覆盖；
-  真实 server 互联时需补）；
+- QPACK 字符串解码支持 Huffman（`H` 位，RFC 7541 附录 B，见 crate 私有
+  `huffman` 模块）；本端编码恒 `H`=0，不实现 Huffman 编码；
 - quinn-proto 默认拥塞控制为 Cubic（`TransportConfig` 默认值，源码确认）；
 - // 未确认：`max_datagram_frame_size` 的对端通告值未经真实 server 验证，
   loopback 测试中 client/server 均为本实现。
