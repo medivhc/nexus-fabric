@@ -82,6 +82,8 @@ pub struct SessionManager {
     next_id: u64,
     /// 首包链总运行次数（E4 `no_planner_in_hot_path` 证明：快路径不得增加此计数）。
     pub planner_calls: u64,
+    /// 后台建连失败累计数（E4 `session_establish_failed` 证明）。
+    pub establish_failures: u64,
 }
 
 impl SessionManager {
@@ -107,12 +109,28 @@ impl SessionManager {
             signals: VecDeque::new(),
             next_id: 0,
             planner_calls: 0,
+            establish_failures: 0,
         }
     }
 
     #[must_use]
     pub fn flow_count(&self) -> usize {
         self.table.len()
+    }
+
+    /// 后台建连失败累计数。
+    #[must_use]
+    pub fn establish_failures(&self) -> u64 {
+        self.establish_failures
+    }
+
+    /// 某流首包链规划出的 Provider（plan.provider_id）。
+    #[must_use]
+    pub fn planned_provider(&self, key: &FlowKey) -> Option<&str> {
+        let session_id = &self.table.get(key)?.session_id;
+        self.plans
+            .get(session_id)
+            .map(|planned| planned.plan.provider_id.0.as_str())
     }
 
     #[must_use]
@@ -282,6 +300,7 @@ impl SessionManager {
                 }
                 EstablishEvent::Failed { session_id, reason } => {
                     let _ = reason;
+                    self.establish_failures += 1;
                     if let Some(key) = self.key_of_session(&session_id) {
                         if let Some(entry) = self.table.get_mut(&key) {
                             entry.phase = FlowPhase::Draining;

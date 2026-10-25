@@ -46,6 +46,8 @@ pub enum ProxyDialConfig {
 /// Proxy 转发统计（P4 可观测；dataplane 合并到 DataplaneStats）。
 #[derive(Debug, Default, Clone)]
 pub struct ProxyFwdStats {
+    /// 进入终结器的 Proxy TCP 流数（SYN 事件，AC-G1-TUN-02）。
+    pub tcp_streams: u64,
     pub tcp_dials_ok: u64,
     pub tcp_dials_failed: u64,
     pub udp_sent: u64,

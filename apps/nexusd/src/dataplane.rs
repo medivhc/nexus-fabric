@@ -130,6 +130,12 @@ pub struct DataplaneStats {
     pub direct_dropped_unsupported: u64,
     /// Direct UDP 真实发送数。
     pub direct_udp_sent: u64,
+    /// Direct TCP 真实拨号成功数（AC-G6-01）。
+    pub direct_tcp_dial_ok: u64,
+    /// Proxy 上游建连失败数（TUN/TProxy 共用语义；AC-G3b-01）。
+    pub upstream_failed: u64,
+    /// 规则给出 egress_hint 但规划无可用 Provider（Drop）的计数。
+    pub outbound_unresolved: u64,
     /// 新流没有域名缓存命中（spec §9.16 `domain_miss`）。
     pub domain_miss: u64,
 }
@@ -239,6 +245,8 @@ pub struct Dataplane {
     last_tcp_dials_ok: u64,
     /// 上次同步的 TCP dial 失败计数。
     last_tcp_dials_failed: u64,
+    /// 上次同步的 Proxy 终结流计数（`ProxyFwdStats::tcp_streams`）。
+    last_proxy_tcp_streams: u64,
     stats: Arc<Mutex<DataplaneStats>>,
     config: DataplaneConfig,
     buf: Vec<u8>,
@@ -385,6 +393,7 @@ impl Dataplane {
             proxy_engine: None,
             last_tcp_dials_ok: 0,
             last_tcp_dials_failed: 0,
+            last_proxy_tcp_streams: 0,
             stats: Arc::new(Mutex::new(DataplaneStats::default())),
             config,
             buf: vec![0u8; 65535],
@@ -581,6 +590,24 @@ impl Dataplane {
         self.flow_mgr.as_ref().map(|m| m.planner_calls).unwrap_or(0)
     }
 
+    /// 首包链规划出的 Provider（E4 `egress_hint`/`outbound` 一致性）。
+    #[must_use]
+    pub fn flow_planned_provider(&self, key: &FlowKey) -> Option<String> {
+        self.flow_mgr
+            .as_ref()
+            .and_then(|m| m.planned_provider(key))
+            .map(str::to_string)
+    }
+
+    /// 建连失败累计数（AC-G4-03/AC-G4-04 可见性）。
+    #[must_use]
+    pub fn flow_establish_failures(&self) -> u64 {
+        self.flow_mgr
+            .as_ref()
+            .map(|m| m.establish_failures())
+            .unwrap_or(0)
+    }
+
     /// 某流的 phase。
     #[must_use]
     pub fn flow_phase(&self, key: &FlowKey) -> Option<nexus_flow_session::FlowPhase> {
@@ -651,6 +678,32 @@ impl Dataplane {
     #[must_use]
     pub fn stats_handle(&self) -> Arc<Mutex<DataplaneStats>> {
         Arc::clone(&self.stats)
+    }
+
+    /// 把 ProxyEngine 的增量同步到 DataplaneStats。
+    fn sync_proxy_stats(&mut self) {
+        let eng_stats = match self.proxy_engine.as_ref() {
+            Some(engine) => engine.stats(),
+            None => return,
+        };
+        let ok_delta = eng_stats
+            .tcp_dials_ok
+            .saturating_sub(self.last_tcp_dials_ok);
+        let fail_delta = eng_stats
+            .tcp_dials_failed
+            .saturating_sub(self.last_tcp_dials_failed);
+        let stream_delta = eng_stats
+            .tcp_streams
+            .saturating_sub(self.last_proxy_tcp_streams);
+        self.last_tcp_dials_ok = eng_stats.tcp_dials_ok;
+        self.last_tcp_dials_failed = eng_stats.tcp_dials_failed;
+        self.last_proxy_tcp_streams = eng_stats.tcp_streams;
+        self.with_stats(|s| {
+            s.proxy_tcp_streams += stream_delta;
+            s.proxy_forwarded += ok_delta;
+            s.proxy_dropped_no_proxy += fail_delta;
+            s.upstream_failed += fail_delta;
+        });
     }
 
     /// 内部：锁定统计并执行更新。
@@ -1063,6 +1116,15 @@ impl Dataplane {
         // 禁用时 candidates 为空（回落默认转发）。
         let classification = self.classify_with_cache(&packet, now_millis);
 
+        // Phase B：Proxy TCP 首包也进入流会话（AC-G4-03/05）。
+        if is_tcp_packet(&packet)
+            && matches!(classification, Classification::Proxy { .. })
+            && self.flow_mgr.is_some()
+            && !self.flow_handle_tcp_packet(&packet, &classification, now_millis)
+        {
+            return Ok(true);
+        }
+
         // S1：TCP + Mesh/Proxy → smoltcp 终结（不再走 raw-datagram 路径）。
         if is_tcp_packet(&packet) && matches!(classification, Classification::Mesh { .. }) {
             if !self.qos_admit(&packet) {
@@ -1148,24 +1210,8 @@ impl Dataplane {
                         if packet.get(9) == Some(&17) && result.forwarded {
                             self.with_stats(|s| s.proxy_forwarded += 1);
                         }
-                        // 同步 TCP dial 结果增量。
-                        let eng_stats = self
-                            .proxy_engine
-                            .as_ref()
-                            .map(|e| e.stats())
-                            .unwrap_or_default();
-                        let ok_delta = eng_stats
-                            .tcp_dials_ok
-                            .saturating_sub(self.last_tcp_dials_ok);
-                        let fail_delta = eng_stats
-                            .tcp_dials_failed
-                            .saturating_sub(self.last_tcp_dials_failed);
-                        self.last_tcp_dials_ok = eng_stats.tcp_dials_ok;
-                        self.last_tcp_dials_failed = eng_stats.tcp_dials_failed;
-                        self.with_stats(|s| {
-                            s.proxy_forwarded += ok_delta;
-                            s.proxy_dropped_no_proxy += fail_delta;
-                        });
+                        // 同步 TCP dial / 终结流 / 失败增量（含异步 poll 结果）。
+                        self.sync_proxy_stats();
                     }
                     Some(Err(crate::proxy_fwd::ProxyEngineError::UnknownOutbound { .. }))
                     | Some(Err(crate::proxy_fwd::ProxyEngineError::UnsupportedOutboundKind {
@@ -1240,6 +1286,8 @@ impl Dataplane {
                 TcpEvent::Syn { stream_id, dst, .. } => {
                     if self.direct_tcp.open(stream_id, dst).is_err() {
                         out.extend(self.tcp.handle_fabric_rst(stream_id));
+                    } else {
+                        self.with_stats(|s| s.direct_tcp_dial_ok += 1);
                     }
                 }
                 TcpEvent::Data {
@@ -1364,6 +1412,9 @@ impl Dataplane {
             }
             FlowDecision::Forward { .. } => true,
             FlowDecision::Drop { .. } => {
+                if hint.is_some() {
+                    self.with_stats(|s| s.outbound_unresolved += 1);
+                }
                 self.with_stats(|s| s.dropped += 1);
                 false
             }
@@ -1478,6 +1529,9 @@ impl Dataplane {
             FlowDecision::Forward { .. } => true,
             FlowDecision::Buffered { .. } => true, // TCP 不应缓冲；防御性继续。
             FlowDecision::Drop { .. } => {
+                if hint.is_some() {
+                    self.with_stats(|s| s.outbound_unresolved += 1);
+                }
                 self.with_stats(|s| s.dropped += 1);
                 false
             }
@@ -2491,6 +2545,10 @@ pub fn dataplane_stats_json(
             "qos_dropped": stats.qos_dropped,
             "mesh_dropped_no_n1": stats.mesh_dropped_no_n1,
             "proxy_dropped_no_proxy": stats.proxy_dropped_no_proxy,
+            "proxy_tcp_streams": stats.proxy_tcp_streams,
+            "direct_tcp_dial_ok": stats.direct_tcp_dial_ok,
+            "upstream_failed": stats.upstream_failed,
+            "outbound_unresolved": stats.outbound_unresolved,
             "flow_sessions": {
                 "state": status.flow_sessions.state,
                 "reason": status.flow_sessions.reason,

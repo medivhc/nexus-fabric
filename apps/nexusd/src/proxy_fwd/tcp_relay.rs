@@ -186,6 +186,7 @@ impl TcpForwarder {
         match event {
             TcpEvent::Syn { stream_id, dst, .. } => {
                 let target = SocketAddr::V4(dst);
+                self.stats.tcp_streams += 1;
                 self.pending.insert(stream_id, target);
                 let Some(config) = self
                     .current_tag
