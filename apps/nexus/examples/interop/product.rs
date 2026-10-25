@@ -216,13 +216,8 @@ fn socks5_connect(
     if head[0] != 0x05 {
         return Err(format!("socks5 connect reply not v5: {head:?}"));
     }
-    if head[1] != 0x00 {
-        return Ok(Socks5Attempt::Refused {
-            stream,
-            rep: Some(head[1]),
-            eof_before_reply: false,
-        });
-    }
+    // 失败应答本身也是完整 SOCKS5 应答（ATYP + BND.ADDR + BND.PORT）：
+    // 必须按应答格式**读干净**，否则残留字节会被计入「隧道字节」（AC-1.2）。
     match head[3] {
         0x01 => {
             let mut rest = [0u8; 6];
@@ -239,6 +234,13 @@ fn socks5_connect(
             stream.read_exact(&mut rest).map_err(|e| e.to_string())?;
         }
         other => return Err(format!("socks5 unknown atyp {other:#x}")),
+    }
+    if head[1] != 0x00 {
+        return Ok(Socks5Attempt::Refused {
+            stream,
+            rep: Some(head[1]),
+            eof_before_reply: false,
+        });
     }
     Ok(Socks5Attempt::Connected(stream))
 }
