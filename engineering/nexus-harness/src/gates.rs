@@ -3323,7 +3323,7 @@ mod tests {
         // every workspace member addition/removal.
         assert_eq!(
             skipped,
-            member_names(&meta).len() - members.len(),
+            member_names(&meta).len().saturating_sub(members.len()),
             "skipped = workspace members without features"
         );
     }
@@ -3466,15 +3466,24 @@ mod tests {
             expected.len(),
             "duplicate target names must stay distinct"
         );
+        let dataplane_mock_expected = expected
+            .iter()
+            .filter(|(_, name)| name.as_str() == "dataplane_mock")
+            .count();
+        // Floor, not a census: the distinctness property under test needs a
+        // real same-name collision in the workspace (two packages ship a
+        // `dataplane_mock` integration target today). If that premise ever
+        // disappears, fail loudly here instead of passing vacuously on 0 == 0.
+        assert!(
+            dataplane_mock_expected >= 2,
+            "workspace must keep >= 2 dataplane_mock targets for this test to mean anything"
+        );
         assert_eq!(
             run.targets
                 .iter()
                 .filter(|t| t.target == "dataplane_mock")
                 .count(),
-            expected
-                .iter()
-                .filter(|(_, name)| name.as_str() == "dataplane_mock")
-                .count(),
+            dataplane_mock_expected,
             "same-name targets in different packages must stay distinct"
         );
         for target in &run.targets {
