@@ -3441,12 +3441,13 @@ mod tests {
         let expected = integration_targets(&meta);
         // Fixes-2 adds two integration targets: crates/nexus-outbound-shadowsocks/
         // tests/sip004_kat.rs and apps/nexus/tests/ss_arm_stream_pump.rs.
-        assert_eq!(expected.len(), 37);
+        // Fixes-5 adds apps/nexus/tests/trojan_pipelined_upstream.rs.
+        assert_eq!(expected.len(), 38);
         let (lines, exec_map) = sample_shared_output(&expected, "ok");
         let run = parse_shared_output(&lines, 1234, true, &meta, &exec_map);
         assert_eq!(
             run.targets.len(),
-            37,
+            38,
             "duplicate target names must stay distinct"
         );
         assert_eq!(

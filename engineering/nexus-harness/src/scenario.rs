@@ -2764,7 +2764,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_returns_none_current_dir_for_all_268() {
+    fn resolve_returns_none_current_dir_for_all_269() {
         let repo = Repo::discover().expect("repo must be discoverable");
         let config = Config::load(&repo).expect("config must load");
         let scenarios = load_all(
@@ -2815,12 +2815,13 @@ mod tests {
                 ),
             }
         }
-        assert_eq!(parseable, 268, "268 cargo-run [when].command");
+        // fixes-5 新增 product.proxy-trojan-fallback-rejected 一个 cargo-run 场景。
+        assert_eq!(parseable, 269, "269 cargo-run [when].command");
         assert_eq!(
             missing_target, 22,
             "n3_task_e4 is not declared (contract-first)"
         );
-        assert_eq!(direct, 246, "all declared targets resolve to Direct");
+        assert_eq!(direct, 247, "all declared targets resolve to Direct");
     }
 
     #[cfg(unix)]
@@ -2859,10 +2860,10 @@ mod tests {
         let (examples, bins, _missing) = collect_scenario_keys(&scenarios, &meta);
         assert_eq!(
             examples.len() + bins.len(),
-            190,
-            "186 declared examples + 4 bins (n3_task_e4 is missing/contract-first)"
+            191,
+            "187 declared examples + 4 bins (n3_task_e4 is missing/contract-first)"
         );
-        assert_eq!(examples.len(), 186);
+        assert_eq!(examples.len(), 187);
         assert_eq!(bins.len(), 4);
         let groups = build_groups(&examples, &bins);
         assert_eq!(
