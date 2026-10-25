@@ -580,11 +580,15 @@ cargo clippy -p nexus-connectivity --all-targets -- -D warnings
 
 v9 §15.2/§15.3（Connectivity link 范围，`feature/crash-recovery`）：
 
-- Durable 状态：`LinkMarker { link_id, kind, locator, established_at_unix, stale }`。
-  文件实现由 Composition Root 注入（`LinkMarkerStore` trait）。
-- 诚实语义：进程死亡 = socket 死亡。冷启动 `reconcile_link_markers` 把未 stale 的
-  marker 标为 stale（触发重建），不许假装链路还活着；已 stale → 跳过；幂等。
-- 本函数只标记不建连；重建是 connectivity 建立路径的职责。
+- 链路 durable marker 已迁 `nexus-session::link_marker`（2026-10-26，P1′ 接缝④）：
+  `LinkMarker` / `LinkMarkerStore` / `LinkReconcileReport` / `reconcile_link_markers`
+  连同 `links.json` 的编解码归属一并移出；**本 crate 不再持久化链路状态**，也不再
+  提供上述 4 个公开项。
+- 诚实语义（不变）：进程死亡 = socket 死亡。冷启动 reconcile 把未 stale 的 marker
+  标为 stale（触发重建），不许假装链路还活着；已 stale → 跳过；幂等；只标记不建连，
+  重建是建连路径（`apps/nexusd` 装配面）的职责。
+- `LinkKind`（运行时链路激活的候选类型）仍留在本 crate，与持久记录的
+  `LinkMarkerKind` 不同层；前者供 CLI / proxy 使用。
 
 ## Platform Constraints
 

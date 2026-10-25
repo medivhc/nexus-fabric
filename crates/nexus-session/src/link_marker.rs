@@ -182,8 +182,21 @@ mod tests {
         assert_eq!(report.markers_checked, 2);
         assert_eq!(report.marked_stale, 2);
         assert!(store.load().unwrap().iter().all(|m| m.stale));
+        // locator/kind 保留，供重建路径使用。
+        let kept = store.load().unwrap();
+        assert_eq!(kept[0].kind, LinkMarkerKind::Direct);
+        assert_eq!(kept[0].locator, "10.0.0.1:1");
 
         let again = reconcile_link_markers(&mut store).unwrap();
-        assert_eq!(again.marked_stale, 0);
+        assert_eq!(again.markers_checked, 2);
+        assert_eq!(again.marked_stale, 0, "must not re-mark stale markers");
+    }
+
+    #[test]
+    fn empty_store_reconciles_cleanly() {
+        let mut store = MemStore::default();
+        let report = reconcile_link_markers(&mut store).unwrap();
+        assert_eq!(report.markers_checked, 0);
+        assert_eq!(report.marked_stale, 0);
     }
 }
