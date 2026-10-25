@@ -64,7 +64,7 @@ if [ "$rust_changed" -eq 0 ]; then
 else
 # Multi-agent: only the current agent's STALE tombstones block; other agents'
 # evidence is out of scope (harness marks STALE within an agent scope only).
-AGENT="${NEXUS_AGENT:-}"
+# AGENT is resolved by hook-common.sh (NEXUS_AGENT -> user.name -> unknown-agent).
 if [ -d "$ROOT/.evidence" ]; then
   if [ -n "$AGENT" ]; then
     stale=""
