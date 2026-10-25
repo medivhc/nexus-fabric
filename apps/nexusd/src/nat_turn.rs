@@ -65,6 +65,54 @@ impl std::fmt::Display for TurnState {
     }
 }
 
+/// 运维可见的 TURN 健康态（内部 `TurnState` 的投影；区分「未配置」与「降级」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnHealth {
+    /// 无 `[network.turn]`。
+    Unconfigured,
+    /// 已配置，尚未完成首次分配。
+    Allocating,
+    /// 分配有效（含 Refreshing）。
+    Active,
+    /// 3-strike 后 warm backup 死亡。
+    Expired,
+    /// 已配置但分配失败（bind/allocate/server 非法）。
+    Degraded,
+}
+
+impl TurnHealth {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TurnHealth::Unconfigured => "unconfigured",
+            TurnHealth::Allocating => "allocating",
+            TurnHealth::Active => "active",
+            TurnHealth::Expired => "expired",
+            TurnHealth::Degraded => "degraded",
+        }
+    }
+}
+
+/// 降级原因（仅 `health() == Degraded` 时非 None；值域固定）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnFailure {
+    /// bind 失败（`AddrNotAvailable|AddrInUse|PermissionDenied|InvalidInput`）。
+    Bind,
+    /// 其余 allocate/refresh 网络错误。
+    Allocate,
+    /// `[network.turn].server` 不可解析（构造期）。
+    Server,
+}
+
+impl TurnFailure {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TurnFailure::Bind => "bind_failed",
+            TurnFailure::Allocate => "allocate_failed",
+            TurnFailure::Server => "server_invalid",
+        }
+    }
+}
+
 /// `refresh_if_needed` 的结果（可观测）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshOutcome {
@@ -199,6 +247,8 @@ pub struct TurnManager {
     next_refresh_at: Option<Instant>,
     /// 分配的保活间隔（来自配置的 refresh_interval_sec）。
     refresh_interval: Duration,
+    /// 最近一次失败原因（仅 `health() == Degraded` 时对外可见）。
+    last_failure: Option<TurnFailure>,
 }
 
 impl TurnManager {
@@ -220,11 +270,18 @@ impl TurnManager {
                 stale_nonce_retried: false,
                 next_refresh_at: None,
                 refresh_interval: Duration::from_secs(300),
+                last_failure: None,
             },
             Some(section) => {
                 let refresh_interval = Duration::from_secs(section.refresh_interval_sec);
                 // 只在构造期解析一次；两个生产 manager 都经此路径覆盖。
                 let bind = section.bind_addr.parse::<SocketAddr>().ok();
+                // P3-Q1：bind 解析失败（生产不可达；config 已拒绝）预置 Server。
+                let bind_failure = if bind.is_none() {
+                    Some(TurnFailure::Server)
+                } else {
+                    None
+                };
                 match section.server.parse::<SocketAddr>() {
                     Ok(server) => {
                         let creds = TurnCredentials {
@@ -243,6 +300,7 @@ impl TurnManager {
                             stale_nonce_retried: false,
                             next_refresh_at: None,
                             refresh_interval,
+                            last_failure: bind_failure,
                         }
                     }
                     Err(e) => {
@@ -266,6 +324,7 @@ impl TurnManager {
                             stale_nonce_retried: false,
                             next_refresh_at: None,
                             refresh_interval,
+                            last_failure: Some(TurnFailure::Server),
                         }
                     }
                 }
@@ -299,6 +358,7 @@ impl TurnManager {
             stale_nonce_retried: false,
             next_refresh_at: None,
             refresh_interval,
+            last_failure: None,
         }
     }
 
@@ -310,6 +370,35 @@ impl TurnManager {
     /// 是否处于活动状态（有有效 Allocation）。
     pub fn is_active(&self) -> bool {
         self.state == TurnState::Active && self.client.is_some()
+    }
+
+    /// 运维可见的健康态（`TurnState` + config 的投影）。
+    ///
+    /// 注意：装配侧的 `not_started` 是伪值，**不经**本方法（Wave B）。
+    pub fn health(&self) -> TurnHealth {
+        if self.config.is_none() {
+            return TurnHealth::Unconfigured;
+        }
+        match self.state {
+            TurnState::Allocating => TurnHealth::Allocating,
+            TurnState::Active | TurnState::Refreshing => TurnHealth::Active,
+            TurnState::Expired => TurnHealth::Expired,
+            TurnState::Disabled => TurnHealth::Degraded,
+        }
+    }
+
+    /// 降级原因：仅 `health() == Degraded` 时返回。
+    pub fn last_failure(&self) -> Option<TurnFailure> {
+        if self.health() == TurnHealth::Degraded {
+            self.last_failure
+        } else {
+            None
+        }
+    }
+
+    /// 配置里的 `bind_addr` 原文（未配置时为 `None`）。
+    pub fn bind_addr_text(&self) -> Option<&str> {
+        self.config.as_ref().map(|c| c.bind_addr.as_str())
     }
 
     /// 连续 Refresh 失败次数（可观测）。
@@ -368,6 +457,7 @@ impl TurnManager {
         self.client = Some(client);
         self.state = TurnState::Active;
         self.consecutive_refresh_failures = 0;
+        self.last_failure = None;
         if reset_stale_nonce {
             self.stale_nonce_retried = false;
         }
@@ -419,10 +509,13 @@ impl TurnManager {
 
         match client.refresh() {
             Ok(()) => {
+                let relayed = client.relayed_addr();
                 self.state = TurnState::Active;
                 self.consecutive_refresh_failures = 0;
+                self.last_failure = None;
                 self.stale_nonce_retried = false;
                 self.next_refresh_at = self.schedule_next_refresh();
+                eprintln!("[nat-switch] TURN refresh ok relayed={relayed}");
                 RefreshOutcome::Refreshed
             }
             Err(e) if is_stale_nonce(&e) => {
@@ -488,6 +581,7 @@ impl TurnManager {
             }
             self.state = TurnState::Expired;
             self.next_refresh_at = None;
+            self.last_failure = None;
         } else {
             eprintln!(
                 "[nat-switch] WARN: TURN refresh failed ({e}); retry {n}/{}",
@@ -502,8 +596,13 @@ impl TurnManager {
     /// Allocate 认证失败/超时（AC1 异常）：WARN + Disabled 降级，回退 Peer Relay。
     fn handle_auth_failure(&mut self, e: &io::Error) {
         eprintln!(
-            "[nat-switch] WARN: TURN allocate failed ({e}); disabling turn, falling back to peer relay"
+            "[nat-switch] WARN: TURN allocate failed bind={} err={e}; disabling turn, falling back to peer relay",
+            self.bind_for_log()
         );
+        // P3-Q1：构造期已预置的失败原因优先（bind 解析失败 → server_invalid）。
+        if self.last_failure.is_none() {
+            self.last_failure = Some(classify_failure(e));
+        }
         self.state = TurnState::Disabled;
         self.client = None;
         self.consecutive_refresh_failures = 0;
@@ -568,6 +667,17 @@ impl TurnManager {
 /// `io::Result` 签名改掉——超出本次范围，记为后续工作。
 fn is_stale_nonce(e: &io::Error) -> bool {
     e.to_string().contains("438 Stale Nonce")
+}
+
+/// 把分配失败分类为对外可见的降级原因。
+fn classify_failure(e: &io::Error) -> TurnFailure {
+    match e.kind() {
+        io::ErrorKind::AddrNotAvailable
+        | io::ErrorKind::AddrInUse
+        | io::ErrorKind::PermissionDenied
+        | io::ErrorKind::InvalidInput => TurnFailure::Bind,
+        _ => TurnFailure::Allocate,
+    }
 }
 
 #[cfg(test)]
@@ -665,6 +775,106 @@ mod tests {
         assert_eq!(outcome, RefreshOutcome::Refreshed);
         assert_eq!(mgr.consecutive_refresh_failures(), 0);
         assert!(mgr.is_active());
+    }
+
+    /// P3-AC5（manager 级）：非本地 `bind_addr` → Disabled + Degraded + Bind。
+    #[test]
+    fn non_local_bind_disables() {
+        if bind_available("192.0.2.1:0") {
+            eprintln!("SKIP: 192.0.2.1 unexpectedly bindable in this environment");
+            return;
+        }
+        let mut cfg = section("127.0.0.1:3478".parse().unwrap(), 300);
+        cfg.bind_addr = "192.0.2.1:0".into();
+        let mut mgr = TurnManager::new(Some(cfg));
+        assert!(
+            mgr.ensure_allocated().is_err(),
+            "non-local bind must fail allocation"
+        );
+        assert_eq!(mgr.state(), TurnState::Disabled);
+        assert_eq!(mgr.health(), TurnHealth::Degraded);
+        assert_eq!(mgr.last_failure(), Some(TurnFailure::Bind));
+    }
+
+    /// §4.5 五行映射 + `not_started` 不经 `TurnHealth` 的边界说明。
+    #[test]
+    fn health_mapping_table() {
+        // 1) 未配置。
+        let mgr = TurnManager::new(None);
+        assert_eq!(mgr.health(), TurnHealth::Unconfigured);
+        assert_eq!(mgr.health().as_str(), "unconfigured");
+        assert_eq!(mgr.last_failure(), None);
+        assert_eq!(mgr.bind_addr_text(), None);
+
+        // 2) 已配置、尚未分配 → Allocating（与 Degraded 不同）。
+        let cfg = section("127.0.0.1:3478".parse().unwrap(), 300);
+        let mgr = TurnManager::new(Some(cfg));
+        assert_eq!(mgr.health(), TurnHealth::Allocating);
+        assert_eq!(mgr.health().as_str(), "allocating");
+        assert_eq!(mgr.bind_addr_text(), Some("0.0.0.0:0"));
+
+        // 3) 分配成功 → Active。
+        let server = TurnServer::bind("127.0.0.1:0".parse().unwrap(), creds()).unwrap();
+        let mut mgr = TurnManager::new(Some(section(server.main_addr(), 300)));
+        mgr.ensure_allocated().expect("allocate");
+        assert_eq!(mgr.health(), TurnHealth::Active);
+        assert_eq!(mgr.health().as_str(), "active");
+        assert_eq!(mgr.last_failure(), None);
+
+        // 4) 3-strike → Expired，last_failure 为 None（health 已表达）。
+        struct AlwaysFailing;
+        impl TurnHandle for AlwaysFailing {
+            fn refresh(&self) -> io::Result<()> {
+                Err(io::Error::other("turn server unreachable"))
+            }
+            fn release(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+            fn relayed_addr(&self) -> SocketAddr {
+                "192.0.2.1:54320".parse().unwrap()
+            }
+            fn mapped_addr(&self) -> Option<SocketAddr> {
+                None
+            }
+            fn is_expired(&self) -> bool {
+                true
+            }
+            fn as_turn_client(&self) -> Option<TurnClient> {
+                None
+            }
+        }
+        let factory: TurnFactory = Box::new(|| Ok(Box::new(AlwaysFailing)));
+        let mut mgr = TurnManager::with_factory(
+            Some(section("127.0.0.1:3478".parse().unwrap(), 300)),
+            factory,
+        );
+        mgr.ensure_allocated().expect("allocate");
+        for expected in 1..=3 {
+            mgr.next_refresh_at = Some(Instant::now());
+            assert_eq!(mgr.refresh_if_needed(), RefreshOutcome::Failed(expected));
+        }
+        assert_eq!(mgr.health(), TurnHealth::Expired);
+        assert_eq!(mgr.health().as_str(), "expired");
+        assert_eq!(mgr.last_failure(), None);
+
+        // 5) 分配失败降级 → Degraded + Allocate。
+        let factory: TurnFactory = Box::new(|| Err(io::Error::other("network unreachable")));
+        let mut mgr = TurnManager::with_factory(
+            Some(section("127.0.0.1:3478".parse().unwrap(), 300)),
+            factory,
+        );
+        assert!(mgr.ensure_allocated().is_err());
+        assert_eq!(mgr.health(), TurnHealth::Degraded);
+        assert_eq!(mgr.health().as_str(), "degraded");
+        assert_eq!(mgr.last_failure(), Some(TurnFailure::Allocate));
+        assert_eq!(
+            mgr.last_failure().map(TurnFailure::as_str),
+            Some("allocate_failed")
+        );
+
+        // 值域逐字（装配侧 not_started 不经 TurnHealth）。
+        assert_eq!(TurnFailure::Bind.as_str(), "bind_failed");
+        assert_eq!(TurnFailure::Server.as_str(), "server_invalid");
     }
 
     /// 未配置 → Disabled，ensure_allocated 返回 Unconfigured。
