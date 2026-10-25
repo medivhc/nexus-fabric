@@ -2,7 +2,14 @@
 
 ## Responsibility
 
-投影层 L3 隧道 + 统一路由（DESIGN.md §6.4）：
+投影层 L3 隧道 + 统一路由（DESIGN.md §6.4）。
+
+**身份边界（AC-G2-02）**：`Projection` 是库/E4 复用入口，**非生产入口**；
+生产数据面由 `apps/nexusd` 的 `Dataplane` 装配。F1 已登记（spec §3.5）：
+删除 `Projection` 与 `Dataplane` 的并行数据面代码，需独立 run 的契约与 E4 差分；
+在 F1 完成前 `Projection` 保持非生产身份。
+
+职责：
 
 1. **L3 隧道**：把 TUN 设备抓到的 IP 包封装进 fabric 数据报，对端解封装后
    注入其 TUN 设备。应用无需修改，用标准 socket API。

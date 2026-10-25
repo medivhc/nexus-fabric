@@ -2,7 +2,9 @@
 
 ## Responsibility
 
-定义 Portable Host Capability Traits：Packet Interface、Transparent Interception、Filesystem Projection、Secure Store、Lifecycle、Clock、Random、Attribution 等。
+定义 Portable Host Capability Traits：Packet Interface、Transparent ingress traits（`TransparentTcpIngress` / `TransparentUdpIngress` / `TransparentCaptureRules`）、Filesystem Projection、Secure Store、Lifecycle、Clock、Random、Attribution 等。
+
+透明入站只定义“已 accept 的流/数据报 + 原始目的地”契约；Linux TPROXY 的 sockopt/ancillary 实现只存在于 `nexus-platform-linux::tproxy`。
 
 ## Non-Responsibilities
 
