@@ -9,7 +9,7 @@ use nexus_outbound_anytls::{
     AnyTlsCommand, AnyTlsTarget, CLIENT_IDENT, client_handshake, client_open_uot_stream,
     decode_uot_datagrams, encode_uot_datagram, read_frame, write_frame,
 };
-use nexus_outbound_hysteria2::{CertVerify, Hysteria2Client, Hysteria2Target, Obfs};
+use nexus_outbound_hysteria2::{CcRx, CertVerify, Hysteria2Client, Hysteria2Target, Obfs};
 use nexus_outbound_vless::{
     VlessCommand, VlessConn, VlessFlow, VlessRequest, VlessTarget, VlessUuid, encode_udp_datagram,
     read_udp_datagram,
@@ -382,10 +382,18 @@ fn hysteria2_udp(cfg: &InteropProbeConfig) -> Result<Outcome, String> {
     )
 }
 
+fn cc_rx_label(cc_rx: &CcRx) -> String {
+    match cc_rx {
+        CcRx::Unlimited => "0".to_string(),
+        CcRx::Auto => "auto".to_string(),
+        CcRx::Bps(bps) => bps.to_string(),
+    }
+}
+
 fn hysteria2_qpack_diag(cfg: &InteropProbeConfig, cell_dir: &Path) -> Result<Outcome, String> {
     let target = hysteria2_target(cfg)?;
     match Hysteria2Client::connect(&target) {
-        Ok(_client) => {
+        Ok(client) => {
             write_manifest(
                 cell_dir,
                 "qpack-diag-handshake-ok",
@@ -398,7 +406,14 @@ fn hysteria2_qpack_diag(cfg: &InteropProbeConfig, cell_dir: &Path) -> Result<Out
             )?;
             Ok(Outcome::pass(
                 Metrics::default(),
-                vec!["qpack_diag_not_triggered=handshake_ok".into()],
+                vec![
+                    "qpack_diag_not_triggered=handshake_ok".into(),
+                    "hy2_error=null".into(),
+                    "hy2_auth_status=233".into(),
+                    "hy2_auth_status_source=connect_ok_after_decode_auth_response".into(),
+                    format!("hy2_udp_enabled={}", client.udp_enabled()),
+                    format!("hy2_cc_rx={}", cc_rx_label(client.cc_rx())),
+                ],
             ))
         }
         Err(e) => {
