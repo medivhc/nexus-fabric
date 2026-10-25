@@ -17,6 +17,7 @@ pub use udp_relay::build_udp_reply;
 
 use std::net::{IpAddr, SocketAddr};
 
+use nexus_projection::tcp::TcpTerminator;
 use nexus_proxy_config::{OutboundConfig, OutboundKind};
 
 /// 代理 dial 配置（P3 选路结果）。
@@ -177,6 +178,8 @@ pub struct ProxyPollResult {
 /// TCP 共享单个 `TcpTerminator`（§9.10.1 的两个实例之一），按规则 tag 选拨号器；
 /// UDP 每个 tag 一个转发器（不新增终结器）。
 pub struct ProxyEngine {
+    /// TCP 共享终结器（AC-G3b-03：实例只允许两个——ProxyEngine 与 Dataplane）。
+    terminator: TcpTerminator,
     tcp: tcp_relay::TcpForwarder,
     udp: std::collections::HashMap<String, udp_relay::UdpForwarder>,
     outbounds: std::collections::HashMap<String, ProxyDialConfig>,
@@ -214,6 +217,7 @@ impl ProxyEngine {
             });
         }
         Ok(Self {
+            terminator: TcpTerminator::new(),
             tcp: tcp_relay::TcpForwarder::new(outbounds.clone()),
             udp: std::collections::HashMap::new(),
             outbounds,
@@ -250,7 +254,9 @@ impl ProxyEngine {
             });
         };
         if proto == 6 {
-            let tun_packets = self.tcp.handle_packet(packet, outbound_tag);
+            let tun_packets = self
+                .tcp
+                .handle_packet(&mut self.terminator, packet, outbound_tag);
             let stream_events = self
                 .tcp
                 .take_failures()
@@ -282,7 +288,7 @@ impl ProxyEngine {
 
     /// 定期驱动（dataplane 每轮调用）；返回待写回 TUN 的包与流事件。
     pub fn poll(&mut self) -> ProxyPollResult {
-        let tun_packets = self.tcp.poll();
+        let tun_packets = self.tcp.poll(&mut self.terminator);
         let stream_events = self
             .tcp
             .take_failures()

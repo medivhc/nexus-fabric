@@ -1,7 +1,8 @@
 //! TCP 转发：smoltcp 终结 → 代理 dial → 双向中继（P1）。
 //!
 //! 设计：
-//! - `TcpForwarder` 持有 `TcpTerminator`（dataplane 线程拥有，非 Sync 不跨线程）；
+//! - `ProxyEngine` 持有 `TcpTerminator`（accounting 层面唯一归属；`TcpForwarder`
+//!   只借用终结器，不再自己持有）；
 //! - `Syn{stream_id, dst}` → worker 线程 dial 代理（不阻塞 dataplane）；
 //! - dial 成功 → 中继线程双向泵字节；proxy→TUN 经 mpsc 回 dataplane 线程
 //!   （TUN 所有权仍在 dataplane，D1 不变量）；
@@ -64,7 +65,6 @@ const RELAY_READ_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// TCP 转发器（dataplane 线程拥有）。
 pub struct TcpForwarder {
-    terminator: TcpTerminator,
     outbounds: HashMap<String, ProxyDialConfig>,
     /// 当前正在喂给终结器的包的出站 tag（Syn 事件消费）。
     current_tag: Option<String>,
@@ -84,7 +84,6 @@ impl TcpForwarder {
     pub fn new(outbounds: HashMap<String, ProxyDialConfig>) -> Self {
         let (event_tx, event_rx) = mpsc::channel();
         Self {
-            terminator: TcpTerminator::new(),
             outbounds,
             current_tag: None,
             failures: Vec::new(),
@@ -98,32 +97,37 @@ impl TcpForwarder {
     }
 
     /// 处理一个 proxy 分类的 TCP 包；返回待写回 TUN 的包。
-    pub fn handle_packet(&mut self, packet: &[u8], outbound_tag: &str) -> Vec<Vec<u8>> {
+    pub fn handle_packet(
+        &mut self,
+        terminator: &mut TcpTerminator,
+        packet: &[u8],
+        outbound_tag: &str,
+    ) -> Vec<Vec<u8>> {
         // 先排空 proxy 事件（dial 完成/数据/关闭）。
-        self.drain_events();
+        self.drain_events(terminator);
         self.current_tag = Some(outbound_tag.to_string());
         // 喂给 smoltcp。
-        let mut out = self.terminator.handle_uplink(packet, "proxy");
+        let mut out = terminator.handle_uplink(packet, "proxy");
         // 驱动 smoltcp 并处理事件。
-        for event in self.terminator.poll() {
-            self.handle_tcp_event(event, &mut out);
+        for event in terminator.poll() {
+            self.handle_tcp_event(terminator, event, &mut out);
         }
         out
     }
 
     /// 定期驱动（无包时也调用，处理重传/超时）。
     /// 返回待写回 TUN 的包。
-    pub fn poll(&mut self) -> Vec<Vec<u8>> {
-        self.drain_events();
+    pub fn poll(&mut self, terminator: &mut TcpTerminator) -> Vec<Vec<u8>> {
+        self.drain_events(terminator);
         let mut out = Vec::new();
-        for event in self.terminator.poll() {
-            self.handle_tcp_event(event, &mut out);
+        for event in terminator.poll() {
+            self.handle_tcp_event(terminator, event, &mut out);
         }
         out
     }
 
     /// 排空中继线程发来的事件。
-    fn drain_events(&mut self) {
+    fn drain_events(&mut self, terminator: &mut TcpTerminator) {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 TcpFwdEvent::DialDone { stream_id, result } => match result {
@@ -140,13 +144,13 @@ impl TcpForwarder {
                             reason: e.clone(),
                         });
                         // RST smoltcp 侧。
-                        let pkts = self.terminator.handle_fabric_rst(stream_id);
+                        let pkts = terminator.handle_fabric_rst(stream_id);
                         let _ = self.event_tx.send(TcpFwdEvent::TunPackets(pkts));
                         eprintln!("[proxy-fwd] dial failed for stream {stream_id}: {e}");
                     }
                 },
                 TcpFwdEvent::ProxyData { stream_id, bytes } => {
-                    let pkts = self.terminator.handle_fabric_data(stream_id, &bytes);
+                    let pkts = terminator.handle_fabric_data(stream_id, &bytes);
                     if !pkts.is_empty() {
                         let _ = self.event_tx.send(TcpFwdEvent::TunPackets(pkts));
                     }
@@ -154,9 +158,9 @@ impl TcpForwarder {
                 TcpFwdEvent::ProxyClosed { stream_id, reset } => {
                     self.relays.remove(&stream_id);
                     let pkts = if reset {
-                        self.terminator.handle_fabric_rst(stream_id)
+                        terminator.handle_fabric_rst(stream_id)
                     } else {
-                        self.terminator.handle_fabric_fin(stream_id)
+                        terminator.handle_fabric_fin(stream_id)
                     };
                     if !pkts.is_empty() {
                         let _ = self.event_tx.send(TcpFwdEvent::TunPackets(pkts));
@@ -173,7 +177,12 @@ impl TcpForwarder {
     }
 
     /// smoltcp 事件处理。
-    fn handle_tcp_event(&mut self, event: TcpEvent, out: &mut Vec<Vec<u8>>) {
+    fn handle_tcp_event(
+        &mut self,
+        terminator: &mut TcpTerminator,
+        event: TcpEvent,
+        out: &mut Vec<Vec<u8>>,
+    ) {
         match event {
             TcpEvent::Syn { stream_id, dst, .. } => {
                 let target = SocketAddr::V4(dst);
@@ -191,7 +200,7 @@ impl TcpForwarder {
                         self.current_tag.as_deref().unwrap_or("")
                     );
                     self.failures.push(TcpFailure { stream_id, reason });
-                    out.extend(self.terminator.handle_fabric_rst(stream_id));
+                    out.extend(terminator.handle_fabric_rst(stream_id));
                     return;
                 };
                 let tx = self.event_tx.clone();
