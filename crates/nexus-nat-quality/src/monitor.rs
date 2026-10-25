@@ -200,11 +200,12 @@ impl<T: DatagramTransport> Inner<T> {
                 if now_ms.saturating_sub(state.last_ping_ms) >= interval {
                     // A failed ping (closed transport) is skipped; `expire`
                     // below ages it out and loss converges to 1.0.
-                    if state.endpoint.ping(now_ms).is_ok() {
+                    let deadline = interval.saturating_mul(2);
+                    if state.endpoint.ping(now_ms, deadline).is_ok() {
                         state.last_ping_ms = now_ms;
                     }
                 }
-                state.endpoint.expire(now_ms, interval * 2);
+                state.endpoint.expire(now_ms);
                 reports.push((
                     *addr,
                     PathStats {
