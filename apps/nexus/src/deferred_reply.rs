@@ -144,3 +144,129 @@ pub(crate) fn bounded_drain<R: Read>(node: &mut R, max_bytes: usize, max_ms: u64
     }
     (total, eof)
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 用 loopback 对端记录写入字节（不依赖真实代理）。
+    fn pair() -> (TcpStream, TcpStream) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        (client, server)
+    }
+
+    fn read_all(stream: &mut TcpStream, expect: usize) -> Vec<u8> {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .expect("timeout");
+        let mut out = vec![0u8; expect];
+        let mut got = 0;
+        while got < expect {
+            match stream.read(&mut out[got..]) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(_) => break,
+            }
+        }
+        out.truncate(got);
+        out
+    }
+
+    #[test]
+    fn socks5_success_bytes_are_the_established_reply() {
+        let (mut client, mut peer) = pair();
+        let success = vec![0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        let mut reply = DeferredConnectReply::new(ClientReplyKind::Socks5, success.clone());
+        assert!(!reply.is_sent());
+        reply.send_success(&mut client).expect("write success");
+        assert!(reply.is_sent());
+        assert!(reply.deferred_ms().is_some());
+        assert_eq!(read_all(&mut peer, success.len()), success);
+    }
+
+    #[test]
+    fn http_success_bytes_are_connection_established() {
+        let (mut client, mut peer) = pair();
+        let success = b"HTTP/1.1 200 Connection Established\r\n\r\n".to_vec();
+        let mut reply = DeferredConnectReply::new(ClientReplyKind::Http, success.clone());
+        reply.send_success(&mut client).expect("write success");
+        assert_eq!(read_all(&mut peer, success.len()), success);
+    }
+
+    #[test]
+    fn empty_success_bytes_write_nothing() {
+        let (mut client, mut peer) = pair();
+        let mut reply = DeferredConnectReply::new(ClientReplyKind::Http, Vec::new());
+        reply.send_success(&mut client).expect("no bytes");
+        assert!(reply.is_sent(), "空应答也算已写（不再等待）");
+        assert!(!reply.has_success_reply());
+        assert!(read_all(&mut peer, 1).is_empty());
+    }
+
+    #[test]
+    fn socks5_failure_bytes_are_fixed_shape() {
+        let (mut client, mut peer) = pair();
+        let mut reply = DeferredConnectReply::new(ClientReplyKind::Socks5, vec![0x05, 0x00]);
+        reply
+            .send_failure(&mut client, 0x01)
+            .expect("write failure");
+        assert_eq!(
+            read_all(&mut peer, 10),
+            vec![0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn sock50_failure_uses_refused_rep() {
+        let (mut client, mut peer) = pair();
+        let mut reply = DeferredConnectReply::new(ClientReplyKind::Socks5, vec![0x05, 0x00]);
+        reply
+            .send_failure(&mut client, 0x05)
+            .expect("write failure");
+        assert_eq!(read_all(&mut peer, 10)[1], 0x05);
+    }
+
+    #[test]
+    fn http_failure_is_502() {
+        let (mut client, mut peer) = pair();
+        let mut reply = DeferredConnectReply::new(ClientReplyKind::Http, vec![b'2']);
+        reply
+            .send_failure(&mut client, 0x01)
+            .expect("write failure");
+        assert_eq!(
+            read_all(&mut peer, 40),
+            b"HTTP/1.1 502 Bad Gateway\r\n\r\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn failure_and_success_are_mutually_exclusive_single_write() {
+        let (mut client, mut peer) = pair();
+        let mut reply = DeferredConnectReply::new(ClientReplyKind::Socks5, vec![0x05, 0x00]);
+        reply.send_failure(&mut client, 0x01).expect("first write");
+        reply.send_failure(&mut client, 0x01).expect("no-op");
+        reply.send_success(&mut client).expect("no-op");
+        let got = read_all(&mut peer, 32);
+        assert_eq!(got.len(), 10, "只允许写出一次");
+        assert_eq!(got[1], 0x01);
+    }
+
+    #[test]
+    fn bounded_drain_stops_at_eof() {
+        let data = vec![7u8; 1024];
+        let mut cursor = std::io::Cursor::new(data);
+        let (total, eof) = bounded_drain(&mut cursor, 65_536, 50);
+        assert_eq!(total, 1024);
+        assert!(eof);
+    }
+
+    #[test]
+    fn bounded_drain_stops_at_byte_cap() {
+        let data = vec![7u8; 10_000];
+        let mut cursor = std::io::Cursor::new(data);
+        let (total, _) = bounded_drain(&mut cursor, 4096, 50);
+        assert_eq!(total, 4096, "上限是精确字节数，不得超读");
+    }
+}
