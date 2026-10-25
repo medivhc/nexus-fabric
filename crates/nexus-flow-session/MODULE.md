@@ -54,7 +54,6 @@ smoltcp 会话的生命周期从属于 §10 Session（Session 进 Draining/Dispo
 
 ## Forbidden Dependencies
 
-- `nexus-delivery`（Delivery 只允许依赖 nexus-domain；"选择"是应用层职责）。
 - `nexus-ingress`（ingress 只产 FlowContext；TUN 包的 FlowContext 由本层构造）。
 - 平台专有 API（portable=false 但仍禁直调 OS；平台能力经 Composition Root 注入）。
 - `engineering/` 下的 Harness/Plugin。

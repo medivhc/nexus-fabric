@@ -850,7 +850,7 @@ whitespace、format、check、clippy、architecture-policy（fast 侧 delta）�
 | N3 artifact 下载                            | 未装配         | `nexus artifact get` 直接返回 `UNSUPPORTED_CAPABILITY`，**从不创建或覆盖输出文件**                                                                     |
 | nexusd serve `--socket`（Windows）        | UNSUPPORTED | named-pipe transport 未实现（std 无 named-pipe server，平台专有 I/O 应收敛到 nexus-platform-windows）；用 `--addr` TCP loopback                       |
 | http204 probe 与 https                   | 不支持         | P0 仅明文 HTTP；`target.scheme == https` 直接记为 `unreachable`（不做 TLS）                                                                      |
-| 传输层 crate                               | stub        | `nexus-delivery`、`nexus-diagnostics`、`nexus-proto`、`nexus-platform-{linux,macos,android,ios}` 为 12–16 行骨架                            |
+| 传输层 crate                               | stub        | `nexus-platform-{linux,macos,android,ios}` 为骨架（`nexus-delivery`、`nexus-diagnostics`、`nexus-proto` 已于 2026-10-26 删除）                            |
 | fuzz 门禁                                 | 需 nightly   | `cargo +nightly fuzz check`（stable 下 libfuzzer -Z 选项失败）                                                                              |
 | NAT 打洞真实 STUN 集成测试                      | 待完善         | 单元测试 + example 已覆盖，真实 STUN 服务器集成测试待补充                                                                                                |
 | 磁盘注意                                    | 本机          | 构建产物优先放 D:（C:/E: 高水位告警）                                                                                                              |

@@ -81,7 +81,6 @@ crates = [
   "nexus-planner",
   "nexus-session",
   "nexus-measurement",
-  "nexus-delivery",
   "nexus-ingress",
   "nexus-proxy-config",
   "nexus-proxy"

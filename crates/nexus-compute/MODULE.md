@@ -22,7 +22,6 @@
 
 - `nexus-domain`
 - `nexus-session`
-- `nexus-delivery`
 - `nexus-workspace`
 
 ## Forbidden Dependencies

@@ -9,7 +9,8 @@
 //! ## 回迁点（D1）
 //!
 //! 连接获取在**调用方**（`NatSwitching::active_conn(peer)`），不在本适配器。
-//! `nexus-delivery` 还是 stub；Delivery 建好后只需把调用方的
+//! `nexus-delivery` 已于 2026-10-26 删除（dual-stack-convergence run；
+//! 零实现占位 crate）。若日后重建 delivery 层，只需把调用方的
 //! `active_conn` 换成标准 `ResourceDeliveryRequest → Planner` 路径，
 //! 本适配器（`open(conn)` 签名）不需要改。
 //!

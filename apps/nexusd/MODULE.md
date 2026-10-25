@@ -29,7 +29,6 @@
 - `nexus-service`
 - `nexus-workspace`
 - `nexus-compute`
-- `nexus-diagnostics`
 - `nexus-platform`
 - `nexus-projection`（统一数据面：TUN/分类器/多路径/Boost）
 - `nexus-connectivity`（统一数据面：CAKE-like QoS）

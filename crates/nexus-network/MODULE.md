@@ -24,7 +24,6 @@
 - `nexus-policy`
 - `nexus-planner`
 - `nexus-session`
-- `nexus-delivery`
 - `nexus-dns`
 
 ## Forbidden Dependencies
@@ -180,7 +179,7 @@ Out of scope：广播/组播、DNS 劫持、系统代理（后置，不在本契
 ## 依赖（Allowed Dependencies 增补）
 
 既有（保持）：`nexus-domain`、`nexus-policy`、`nexus-planner`、`nexus-session`、
-`nexus-delivery`、`nexus-dns`。
+`nexus-dns`。
 
 N1 装配新增：
 

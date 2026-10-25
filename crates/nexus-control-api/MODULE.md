@@ -21,7 +21,6 @@
 ## Allowed Dependencies
 
 - `nexus-domain`
-- `nexus-proto`
 
 ## Forbidden Dependencies
 
