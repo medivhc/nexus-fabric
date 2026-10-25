@@ -3,7 +3,7 @@
 > 本文件由 `scripts/interop/recompute-verdicts.py` 从证据机械生成；人工零编辑。
 > 修复顺序、依赖与复验口径见人工维护的 [NEXT-STEPS.md](NEXT-STEPS.md)。
 
-- run `protocol-interop-fixes-5`；baseline `a30147a7b98c9a84a46332c6613cf161280234b2`；spec frozen fixes-5 frozen (requirement-change)（sha256 `a955bd9ab227c23c2772fc6932ab909f2e65de114cb39bb1e2650866334e7718`）；test window `2026-10-25T19:28:05Z .. 2026-10-25T19:46:09Z`。
+- run `protocol-interop-fixes-5`；baseline `a30147a7b98c9a84a46332c6613cf161280234b2`；spec frozen fixes-5 frozen (requirement-change)（sha256 `a955bd9ab227c23c2772fc6932ab909f2e65de114cb39bb1e2650866334e7718`）；test window `2026-10-25T19:28:05Z .. 2026-10-25T19:51:02Z`。
 - 参照实现：sing-box 1.13.16（sha256 `8da901e7b6eb0d2f6f6e701f19d5f78af235d038ae078b37a70739db5895d262`）；Xray 26.10.21（sha256 `MISSING`）。
 - archive（主机归档路径）：（S30 归档后追加）。
 - 注记：`docs/protocols/interop/notes/trojan-fallback.md`（sha256 `0c49d2f5ea7e7c121731b212fc5f652be17cde97d11d7a8972195e9c27f7a339`）；本节由 `recompute-verdicts.py --notes` 注入，禁止手工编辑 MATRIX。
@@ -243,7 +243,7 @@ python3 scripts/interop/recompute-verdicts.py ... --check   # 零漂移（含注
 |---|---|---|---|---|---|---|---|---|
 | Default/Handshake | PASS | ProductSocks5 | ProductPath | PIV-trojan-default-handshake-20261025T193833Z-001 | NONE | up=1B down=1B | evidence/trojan/default/handshake/PIV-trojan-default-handshake-20261025T193833Z-001/probe.json | proxy_json routing.outbound_kind=trojan outbound.kind=trojan; target_stats={"tcp_bytes_down":2,"tcp_bytes_up":2,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} … |
 | Default/TcpSmall | PASS | ProductSocks5 | ProductPath | PIV-trojan-default-tcp-small-20261025T193838Z-001 | NONE | up=65536B down=65536B | evidence/trojan/default/tcp-small/PIV-trojan-default-tcp-small-20261025T193838Z-001/probe.json | proxy_json routing.outbound_kind=trojan outbound.kind=trojan; target_stats={"tcp_bytes_down":65537,"tcp_bytes_up":65537,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} … |
-| Default/TcpThroughput | PASS | ProductSocks5 | ProductPath | PIV-trojan-default-tcp-throughput-20261025T194609Z-001 | NONE | median=1205961414B/s samples=3 | evidence/trojan/default/tcp-throughput/PIV-trojan-default-tcp-throughput-20261025T194609Z-001/probe.json | proxy_json routing.outbound_kind=trojan outbound.kind=trojan; target_stats={"tcp_bytes_down":101716128,"tcp_bytes_up":101712896,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} … |
+| Default/TcpThroughput | PASS | ProductSocks5 | ProductPath | PIV-trojan-default-tcp-throughput-20261025T195102Z-001 | NONE | median=1368476078B/s samples=3 | evidence/trojan/default/tcp-throughput/PIV-trojan-default-tcp-throughput-20261025T195102Z-001/probe.json | proxy_json routing.outbound_kind=trojan outbound.kind=trojan; target_stats={"tcp_bytes_down":101716128,"tcp_bytes_up":101712896,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} … |
 | Default/LongLived | PASS | ProductSocks5 | ProductPath | PIV-trojan-default-long-lived-20261025T193849Z-001 | NONE | heartbeats=12 | evidence/trojan/default/long-lived/PIV-trojan-default-long-lived-20261025T193849Z-001/probe.json | proxy_json routing.outbound_kind=trojan outbound.kind=trojan; target_stats={"tcp_bytes_down":13,"tcp_bytes_up":13,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} … |
 | Default/Reconnect | PASS | ProductSocks5 | ProductPath | PIV-trojan-default-reconnect-20261025T194043Z-001 | NONE | reconnects=3 | evidence/trojan/default/reconnect/PIV-trojan-default-reconnect-20261025T194043Z-001/probe.json | proxy_json routing.outbound_kind=trojan outbound.kind=trojan; target_stats={"tcp_bytes_down":4,"tcp_bytes_up":4,"tcp_connections":4,"udp_bytes":0,"udp_datagrams":0} … |
 | Default/UdpEcho | NOT_IMPLEMENTED | CrateDirect | ProtocolWire | PIV-trojan-default-udp-echo-20261025T194049Z-001 | E_NEXUS_NOT_IMPLEMENTED | udp 0/0 corrupt=0 | evidence/trojan/default/udp-echo/PIV-trojan-default-udp-echo-20261025T194049Z-001/probe.json | Trojan UDP 路径未实现（产品入口 + 出站均无） |
@@ -346,7 +346,7 @@ python3 scripts/interop/recompute-verdicts.py ... --check   # 零漂移（含注
 | PIV-trojan-default-long-lived-20261025T193849Z-001 | PASS | ProductSocks5 | ProductPath | evidence/trojan/default/long-lived/PIV-trojan-default-long-lived-20261025T193849Z-001/probe.json |
 | PIV-trojan-default-reconnect-20261025T194043Z-001 | PASS | ProductSocks5 | ProductPath | evidence/trojan/default/reconnect/PIV-trojan-default-reconnect-20261025T194043Z-001/probe.json |
 | PIV-trojan-default-tcp-small-20261025T193838Z-001 | PASS | ProductSocks5 | ProductPath | evidence/trojan/default/tcp-small/PIV-trojan-default-tcp-small-20261025T193838Z-001/probe.json |
-| PIV-trojan-default-tcp-throughput-20261025T194609Z-001 | PASS | ProductSocks5 | ProductPath | evidence/trojan/default/tcp-throughput/PIV-trojan-default-tcp-throughput-20261025T194609Z-001/probe.json |
+| PIV-trojan-default-tcp-throughput-20261025T195102Z-001 | PASS | ProductSocks5 | ProductPath | evidence/trojan/default/tcp-throughput/PIV-trojan-default-tcp-throughput-20261025T195102Z-001/probe.json |
 | PIV-trojan-default-udp-echo-20261025T194049Z-001 | NOT_IMPLEMENTED | CrateDirect | ProtocolWire | evidence/trojan/default/udp-echo/PIV-trojan-default-udp-echo-20261025T194049Z-001/probe.json |
 | PIV-trojan-trojan-fallback-bad-credential-20261025T194055Z-001 | PASS | ProductSocks5 | ProductPath | evidence/trojan/trojan-fallback/bad-credential/PIV-trojan-trojan-fallback-bad-credential-20261025T194055Z-001/probe.json |
 | PIV-vless-default-bad-config-20261025T193033Z-001 | PASS | ProductSocks5 | ProductPath | evidence/vless/default/bad-config/PIV-vless-default-bad-config-20261025T193033Z-001/probe.json |
@@ -384,8 +384,8 @@ python3 scripts/interop/recompute-verdicts.py --run-dir /work/interop-run/fixes5
 | Vless | PIV-vless-default-tcp-throughput-20261025T192814Z-001 | 087b0dd29b1d327317b507d431c429552d367e51 | /work/wt-protocol-interop-fixes-5/target | b51a52726cd22320c447687cae6ab1a3b6b0fa4d854926199dc81d7986f3ed66 |
 | Anytls | PIV-anytls-default-tcp-throughput-20261025T193052Z-001 | 087b0dd29b1d327317b507d431c429552d367e51 | /work/wt-protocol-interop-fixes-5/target | b51a52726cd22320c447687cae6ab1a3b6b0fa4d854926199dc81d7986f3ed66 |
 | Hysteria2 | PIV-hysteria2-default-tcp-throughput-20261025T193403Z-001 | 087b0dd29b1d327317b507d431c429552d367e51 | /work/wt-protocol-interop-fixes-5/target | MISSING |
-| Trojan | PIV-trojan-default-tcp-throughput-20261025T194609Z-001 | a30147a7b98c9a84a46332c6613cf161280234b2 | /work/wt-protocol-interop-fixes-5/target | 74c9fcac7e30fdb3370b6b7fcf91b0c6368d102ef86afa71af58e5524d346ac5 |
+| Trojan | PIV-trojan-default-tcp-throughput-20261025T195102Z-001 | 779595540c4310aa3b61ffd9c8986f7c6e1013ef | /work/nexus-dev/target | b51a52726cd22320c447687cae6ab1a3b6b0fa4d854926199dc81d7986f3ed66 |
 | Shadowsocks | PIV-shadowsocks-default-tcp-throughput-20261025T194107Z-001 | 087b0dd29b1d327317b507d431c429552d367e51 | /work/wt-protocol-interop-fixes-5/target | b51a52726cd22320c447687cae6ab1a3b6b0fa4d854926199dc81d7986f3ed66 |
 
-上表逐格给出各 T2 证据绑定的构建提交、目标目录与二进制哈希；按证据 `nexus.commit` 派生：`087b0dd29b1d327317b507d431c429552d367e51`（Vless、Anytls、Hysteria2、Shadowsocks）；`a30147a7b98c9a84a46332c6613cf161280234b2`（Trojan）。
+上表逐格给出各 T2 证据绑定的构建提交、目标目录与二进制哈希；按证据 `nexus.commit` 派生：`087b0dd29b1d327317b507d431c429552d367e51`（Vless、Anytls、Hysteria2、Shadowsocks）；`779595540c4310aa3b61ffd9c8986f7c6e1013ef`（Trojan）。
 构建均来自证据记录的本 worktree `cargo_target_dir`，不再引用前序 run 的 fix worktree。
