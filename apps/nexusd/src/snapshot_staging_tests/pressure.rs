@@ -877,14 +877,26 @@ fn ordered_real_competitors(
     ) -> Result<UploadView, TaskError> {
         // Bounded contention is legal. This one-shot gate has already been
         // consumed, so explicit retries reread current authoritative state.
-        for attempt in 0..3 {
+        // That contention includes the pre-gate check itself: every execute
+        // starts by validating the provider authority, which takes an
+        // exclusive lease on acceptance.lock for the whole record-reading,
+        // decoding and binding-verification pass. Two concurrent executes
+        // therefore race on that lease, and the loser gets retryable
+        // CapacityUnavailable ("initialization authority lease is busy").
+        // The holder critical section spans real I/O, so immediate retries
+        // routinely burn out before it releases under load; back off so a
+        // transient hold resolves instead of failing the rendezvous.
+        // Still bounded: 100 attempts x 20ms = 2s max, well inside the 5s
+        // rendezvous waits and the 35s child bound.
+        for attempt in 0..100 {
             let result = service.execute(context, request.clone());
             if !result.as_ref().is_err_and(|error| {
                 error.code == TaskErrorCode::CapacityUnavailable && error.retryable
-            }) || attempt == 2
+            }) || attempt == 99
             {
                 return result;
             }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
         unreachable!()
     }
