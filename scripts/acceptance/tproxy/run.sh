@@ -351,9 +351,13 @@ run_tun_pass() {
 
     start_nexusd "$cfg" "$ev/nexusd-${tag}.log" \
         PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-        || return 1
+        || { stop_nexusd; return 1; }
     if ! wait_os_state applied 100; then
         record "FAIL os_assemble_applied timeout tag=${tag}"
+        stats_json "${ev}/status-${tag}.json" >/dev/null 2>&1 || true
+        # P5-d：超时后必须先终止本 pass 的 nexusd 本体，否则下一 pass
+        # 会因 LocalAPI 18080 被占而级联失败（挂起/孤儿也不能留给 finalize）。
+        stop_nexusd
         return 1
     fi
     local status="${ev}/status-${tag}.json"

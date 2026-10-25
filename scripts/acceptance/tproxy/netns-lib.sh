@@ -354,16 +354,48 @@ start_nexusd_nonroot() {
     return 1
 }
 
+# P5-d：按唯一 config 路径定位 nexusd **本体** PID（不含 timeout/sudo 包装）。
+#
+# netns 只切换网络命名空间、共享 PID 命名空间，因此宿主 PID 可直接 kill。
+# nexusd 的 argv 为 `<NEXUSD> <cfg>`；`pgrep -f` 用锚定前缀匹配，
+# 不会命中 `timeout/sudo/ip netns exec` 包装（它们 argv 不以 NEXUSD 开头）。
+nexusd_pids_for_cfg() {
+    local cfg="$1"
+    [ -n "${cfg}" ] && [ -n "${NS_R}" ] || return 0
+    timeout 10 sudo -n "${IP}" netns exec "${NS_R}" \
+        pgrep -f "^${NEXUSD} ${cfg}( |$)" 2>/dev/null || true
+}
+
 stop_nexusd() {
+    local cfg="${CURRENT_CFG}" pids pid i
+    # 1) 先杀 netns 内的 nexusd 本体：向 `timeout 1800 sudo …` 包装发 TERM
+    #    不会被 sudo 转发给 nexusd，会留下 root 孤儿并占用 LocalAPI 18080。
+    if [ -n "${cfg}" ]; then
+        pids="$(nexusd_pids_for_cfg "${cfg}")"
+        if [ -n "${pids}" ]; then
+            record "nexusd_stop target=$(printf '%s' "${pids}" | tr '\n' ',')"
+            for pid in ${pids}; do
+                timeout 10 sudo -n "${IP}" netns exec "${NS_R}" kill -TERM "${pid}" >/dev/null 2>&1 || true
+            done
+            for i in $(seq 1 100); do
+                [ -z "$(nexusd_pids_for_cfg "${cfg}")" ] && break
+                sleep 0.1
+            done
+            pids="$(nexusd_pids_for_cfg "${cfg}")"
+            for pid in ${pids}; do
+                timeout 10 sudo -n "${IP}" netns exec "${NS_R}" kill -KILL "${pid}" >/dev/null 2>&1 || true
+            done
+        fi
+    fi
+    # 2) 回收本地包装进程（timeout/sudo 是当前 shell 的子进程）。
     if [ -n "${NEXUSD_PID}" ] && ps -p "${NEXUSD_PID}" >/dev/null 2>&1; then
-        timeout 10 sudo -n "${IP}" netns exec "${NS_R}" kill -TERM "${NEXUSD_PID}" >/dev/null 2>&1 || true
-        local i
+        kill -TERM "${NEXUSD_PID}" 2>/dev/null || true
         for i in $(seq 1 100); do
             ps -p "${NEXUSD_PID}" >/dev/null 2>&1 || break
             sleep 0.1
         done
         if ps -p "${NEXUSD_PID}" >/dev/null 2>&1; then
-            timeout 10 sudo -n "${IP}" netns exec "${NS_R}" kill -KILL "${NEXUSD_PID}" >/dev/null 2>&1 || true
+            kill -KILL "${NEXUSD_PID}" 2>/dev/null || true
         fi
         wait "${NEXUSD_PID}" 2>/dev/null || true
     fi
