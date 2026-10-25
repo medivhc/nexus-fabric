@@ -3,7 +3,7 @@
 > 本文件由 `scripts/interop/recompute-verdicts.py` 从证据机械生成；人工零编辑。
 > 修复顺序、依赖与复验口径见人工维护的 [NEXT-STEPS.md](NEXT-STEPS.md)。
 
-- run `protocol-interop-verification`；baseline `0539169e8195944fcd183e7831e5d5ac746f3f40`；spec frozen v1.1（sha256 `23c7e4e797ee9edbf0eb645bfc20a7c97cfacb30e1a67bd8fee77ccbc527de4f`）；test window `2026-10-24T17:30:39Z .. 2026-10-24T21:50:48Z`。
+- run `protocol-interop-fixes-1`；baseline `18f1050518595ef5212c5766fd6608bb75aa8635`；spec frozen v1.2（sha256 `5aebc9499fe4800a3d1f512009cb453272318b8a14dd6a87ceaf9bcef0ab8fb7`）；test window `2026-10-24T17:30:39Z .. 2026-10-24T21:50:48Z`。
 - 参照实现：sing-box 1.13.16（sha256 `8da901e7b6eb0d2f6f6e701f19d5f78af235d038ae078b37a70739db5895d262`）；Xray 26.10.21（sha256 `a27e3f95ab6ce270956d0cecd32eda4686a811afc71c64a6a734a3dede14883e`）。
 - archive（主机归档路径）：`/work/interop-run/protocol-interop-fixes-1/archive/protocol-interop-fixes-1-20261024T214322Z.tar.zst`, `/work/interop-run/protocol-interop-fixes-1/archive/protocol-interop-fixes-1-20261024T215059Z.tar.zst`。
 
@@ -13,18 +13,25 @@
 - **不覆盖**：VMess（本轮暂缓）、direct/relay/socks5 出站、TUN/VPN、Android 统一 VPN 入口、UI/诊断呈现。
 - **本表不回答**：直连/中继回退是否可用（属 N1 整体结论）；也不把「产品级 UDP 未实现」扩大成「Hy2 的 QUIC 出站传输不可用」（见产品级 UDP 节）。
 - **结论 1**：本次复算：`VERIFIED` 2 个（Vless、Anytls），`PARTIAL` 0 个，`BROKEN` 3 个（Hysteria2、Trojan、Shadowsocks）；当前可宣称可用（`VERIFIED`）的协议为 Vless、Anytls。
-- **结论 2**：阻断分属产品装配、跨协议传输、协议编解码、协议线格式与产品安全语义；`root_cause_class` 只是规则代表类，不是完整根因。
+- **结论 1 限定**：`USABLE` 指 TCP 产品路径；产品 SOCKS5 UDP ASSOCIATE 五协议均未实现，`UdpEcho` 为 crate 级证据、不代表产品入口可用。
+- **结论 2**：剩余阻断分属协议编解码、协议线格式与产品安全语义/产品能力缺口；本 run 已消除产品装配（VLESS eager read）与跨协议传输（T2）两类阻断。`root_cause_class` 只是规则代表类，不是完整根因。
 - **结论 3**：未达 `VERIFIED` 的协议及本次复算代表根因：Hysteria2 `BROKEN / E_NEXUS_CODEC`；Trojan `BROKEN / E_NEXUS_FRAMING`；Shadowsocks `BROKEN / E_NEXUS_HANDSHAKE_WIRE`。
-- **结论 4**：即使修复完成，Trojan/SS 因本 run `UdpEcho` 固定 `NOT_IMPLEMENTED`，上限仍为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（spec E1 规则 6/R11）。
-- **结论 5**：五协议当前均可在产品配置面选择，且无「实验性/未验证」标注；是否继续暴露由产品负责人决定（本 run 不改产品代码）。
-- **优先级 1（P0）**：安全止血（文档/配置面，0 代码）——先公开并限制 Trojan fallback。
-- **优先级 2（P1）**：transport 批量写（唯一一格修多协议，预期 AnyTLS 首先可用）。
-- **优先级 3（P2）**：VLESS fix 合入复验 → Hy2 QPACK Huffman → SS SIP004 AEAD → Trojan fallback 完整语义（依赖/成本/复验口径见 [NEXT-STEPS.md](NEXT-STEPS.md)）。
+- **结论 4**：Trojan/SS 当前仍受 fallback 安全语义/线格式与产品 UDP 缺口阻断；即使其余修复完成，本 run `UdpEcho` 固定 `NOT_IMPLEMENTED`，上限仍为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（spec E1 规则 6/R11）。
+- **结论 5**：五协议当前均可在产品配置面选择，且无「实验性/未验证」标注；配置面标注已裁决批准，待 protocol-config-surface-labeling run 落地（本 run 不改产品代码）。
+- **优先级 1（P0，待办）**：安全止血（文档/配置面）——文档警示已落地（见 MATRIX 安全警示节）；配置面标注已裁决批准，待 protocol-config-surface-labeling run 落地（本 run 不改产品代码）。
+- **优先级 2（P1，DONE）**：跨协议 transport 批量写（`PendingWrite` 接线）——AnyTLS 由 T2 单格阻塞转为 `VERIFIED / FULL`，VLESS/Trojan/Hy2 的 T2 解锁；证据：commit `60e6029`；prediction-check 步骤 2（25/25）。
+- **优先级 3（P2，DONE）**：VLESS fix 合入 + 复验——VLESS H/T1/T2/L/R 全 PASS，转为 `VERIFIED / PROTOCOL_SUBSET`；证据：commit `43ca7ac`；prediction-check 步骤 3（10/10）。
+- **优先级 4（P3，待办）**：Shadowsocks SIP004 AEAD（fixes-2，用户第一优先）——SS 可到 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（U 仍未实现，本 run schema 到不了 VERIFIED）。
+- **优先级 5（P4，待办）**：Hysteria2 QPACK Huffman（fixes-3）——预期 Hy2 达到 `VERIFIED / FULL`。
+- **优先级 6（P5，待办）**：Hysteria2 Salamander（fixes-4）——在 QPACK Huffman 修复后单独验证 Salamander 变体。
+- **优先级 7（P6，待办）**：Trojan fallback 完整语义（fixes-5）——最高 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（U 未实现）；不许诺修完即 VERIFIED。
+- **优先级 8（P7，待办）**：产品级 UDP（fixes-6）——补齐 SOCKS5 UDP ASSOCIATE 与各协议出站 UDP 帧路径；补齐前五协议均不可经产品使用 UDP。
 - **字段**：`verdict` = `VERIFIED`（规则 8，全 required PASS）/ `PARTIAL`（规则 3–7/9，非阻断缺口）/ `BROKEN`（规则 1/2，阻断性 Nexus 失败）；`scope` = `PROTOCOL_SUBSET` / `FULL` / `TCP_ONLY`；`claim` = `USABLE` / `USABLE_WITH_GAPS` / `NOT_USABLE` / `NOT_CLAIMED`；`carrier` = `ProductSocks5`（产品 SOCKS5 出口路径）/ `CrateDirect`（crate 直调，非产品入口）。
 - **规则 1**：失败格（BadCredential/BadConfig）判 FAIL 且表现为有效 echo/静默成功（`E_NEXUS_FRAMING`）或挂死（`E_TIMEOUT_HANG`）→ `BROKEN`。
 - **规则 2**：任一 required 格 FAIL 且 class 属 `E_NEXUS_*` / `E_TIMEOUT_HANG` → `BROKEN`。
 - **错误类**：`E_NEXUS_*` = Nexus 侧失败（握手/线格式、认证编码、帧/静默成功、传输、UDP、编解码、未实现），判 FAIL；`E_TIMEOUT_HANG` = 挂死/超时，判 FAIL；`E_EXPECTED_*` = 预期认证/配置拒绝，负向格判 PASS；`E_REF_*` / `E_NETWORK_ENV` / `E_TOOL_BUG` / `E_EVIDENCE_GAP` = 参照端/环境/证据缺口，判 BLOCKED（`E_REF_LIMITATION` 判 FAIL，须带 `ref_source`/`ref_version`）。
 - **Xray**：26.10.21 仅用于 VLESS Vision 争议裁决，本轮未触发；五协议结论全部来自 sing-box 1.13.16 参照。
+- **测试广度**：上述结论仅对 sing-box 1.13.16 参照配置成立；Xray 26.10.21 本轮未触发作裁决；其他服务端实现/传输组合（含 REALITY、ws/grpc）未测。
 
 ## ⚠ 安全警示：Trojan fallback fail-open
 
@@ -51,11 +58,11 @@
 
 | 协议 | 直接阻塞层 | 归属 | 剩余阻塞格（相对可用） | 单协议可解？ | 修复后本 run schema 上限 |
 |---|---|---|---|---|---|
-| VLESS | 产品装配（eager read）+ 跨协议 T2 | 产品装配 bug + 跨协议数据面共性缺陷 | H/T1/L/R 由 fix 解决；T2 需 transport | 否，依赖 transport | `VERIFIED / PROTOCOL_SUBSET`（Vision 仅 crate 级，产品 splice 未实现） |
-| AnyTLS | 跨协议 T2 | 跨协议数据面共性缺陷 | 仅 T2 | 是（transport 一处） | `VERIFIED / FULL` |
-| Hysteria2 | 认证响应 QPACK Huffman + T2 | 协议编解码实现错误 + 跨协议数据面共性缺陷 | Handshake/Handshake[Hy2Salamander]/TcpSmall/TcpThroughput/LongLived/Reconnect/UdpEcho/BadCredential 共 8 格 | 否，依赖 transport | `VERIFIED / FULL` |
-| Trojan | fallback 静默接受 + T2 | 产品安全语义 + 跨协议数据面共性缺陷 | fallback + T2；U 固定未实现 | 否，依赖 transport + fallback 架构 | 本 run 最高 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（U 未实现，规则 6） |
-| Shadowsocks | 线格式/SIP004 AEAD + T2 | 协议实现错误 + 跨协议数据面共性缺陷 | H/T1/T2/L/R；U 固定未实现 | 否，依赖 transport | 本 run 最高 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（U 未实现，规则 6） |
+| Vless | 无（本 run 已修复，证据见「fix 支线与复验」） | — | 无 | — | `VERIFIED / PROTOCOL_SUBSET`（Vision 仅 crate 级，产品 splice 未实现） |
+| Anytls | 无（本 run 已修复，证据见「fix 支线与复验」） | — | 无 | — | `VERIFIED / FULL` |
+| Hysteria2 | 认证响应 QPACK Huffman | 协议编解码实现错误 | TcpSmall(FAIL,E_NEXUS_CODEC), TcpThroughput(FAIL,E_NEXUS_CODEC), LongLived(FAIL,E_NEXUS_CODEC), Reconnect(FAIL,E_NEXUS_CODEC), Handshake(FAIL,E_NEXUS_CODEC), Handshake[Hy2Salamander](FAIL,E_NEXUS_CODEC), UdpEcho(FAIL,E_NEXUS_CODEC), BadCredential(FAIL,E_NEXUS_CODEC) | 是（编解码一处） | `VERIFIED / FULL` |
+| Trojan | fallback 静默接受 + 产品 UDP 未实现 | 产品安全语义 + 产品 UDP 能力缺口 | UdpEcho(NOT_IMPLEMENTED,E_NEXUS_NOT_IMPLEMENTED), BadCredential[TrojanFallback](FAIL,E_NEXUS_FRAMING) | 否，依赖产品 UDP / fallback 架构 | 本 run 最高 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（U 未实现，规则 6） |
+| Shadowsocks | 线格式/SIP004 AEAD + 产品 UDP 未实现 | 协议实现错误 + 产品 UDP 能力缺口 | Handshake(FAIL,E_NEXUS_HANDSHAKE_WIRE), TcpSmall(FAIL,E_NEXUS_FRAMING), TcpThroughput(FAIL,E_NEXUS_FRAMING), LongLived(FAIL,E_NEXUS_FRAMING), Reconnect(FAIL,E_NEXUS_FRAMING), UdpEcho(NOT_IMPLEMENTED,E_NEXUS_NOT_IMPLEMENTED) | 否，依赖产品 UDP | 本 run 最高 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（U 未实现，规则 6） |
 
 **参照端生态**：本轮未发现参照端生态缺陷——sing-box 1.13.16 的行为符合规范；Xray 26.10.21 仅用于 Vision 争议裁决，本轮未触发。五协议 verdict 均无 `E_REF_*` 根因。
 
@@ -73,7 +80,7 @@
 | Default/TcpThroughput | PASS | ProductSocks5 | ProductPath | PIV-vless-default-tcp-throughput-20261024T214827Z-001 | NONE | median=1388514117B/s samples=3 | evidence/vless/default/tcp-throughput/PIV-vless-default-tcp-throughput-20261024T214827Z-001/probe.json | proxy_json routing.outbound_kind=vless outbound.kind=vless; target_stats={"tcp_bytes_down":101716128,"tcp_bytes_up":101712896,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} … |
 | Default/LongLived | PASS | ProductSocks5 | ProductPath | PIV-vless-default-long-lived-20261024T214832Z-001 | NONE | heartbeats=12 | evidence/vless/default/long-lived/PIV-vless-default-long-lived-20261024T214832Z-001/probe.json | proxy_json routing.outbound_kind=vless outbound.kind=vless; target_stats={"tcp_bytes_down":13,"tcp_bytes_up":13,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} … |
 | Default/Reconnect | PASS | ProductSocks5 | ProductPath | PIV-vless-default-reconnect-20261024T215026Z-001 | NONE | reconnects=3 | evidence/vless/default/reconnect/PIV-vless-default-reconnect-20261024T215026Z-001/probe.json | proxy_json routing.outbound_kind=vless outbound.kind=vless; target_stats={"tcp_bytes_down":4,"tcp_bytes_up":4,"tcp_connections":4,"udp_bytes":0,"udp_datagrams":0} … |
-| Default/UdpEcho | PASS | CrateDirect | ProtocolWire | PIV-vless-default-udp-echo-20261024T215033Z-001 | NONE | udp 1000/1000 corrupt=0 | evidence/vless/default/udp-echo/PIV-vless-default-udp-echo-20261024T215033Z-001/probe.json | udp_seq_and_hash_ok; target_stats={"tcp_bytes_down":0,"tcp_bytes_up":0,"tcp_connections":0,"udp_bytes":512064,"udp_datagrams":1001} … |
+| Default/UdpEcho | PASS | CrateDirect | ProtocolWire | PIV-vless-default-udp-echo-20261024T215033Z-001 | NONE | udp 1000/1000 corrupt=0 | evidence/vless/default/udp-echo/PIV-vless-default-udp-echo-20261024T215033Z-001/probe.json | udp_seq_and_hash_ok; target_stats={"tcp_bytes_down":0,"tcp_bytes_up":0,"tcp_connections":0,"udp_bytes":512064,"udp_datagrams":1001} …; crate 级，产品入口不可用 |
 | Default/BadCredential | PASS | ProductSocks5 | ProductPath | PIV-vless-default-bad-credential-20261024T215038Z-001 | E_EXPECTED_AUTH_REJECT | up=0B down=0B | evidence/vless/default/bad-credential/PIV-vless-default-bad-credential-20261024T215038Z-001/probe.json | proxy_json routing.outbound_kind=vless outbound.kind=vless; workload_error=eof; classification=E_EXPECTED_AUTH_REJECT; reference closed the session on the negative case …; 限定：正向路径不通时本格仅证明无静默成功，不独立证明认证拒绝语义 |
 | Default/BadConfig | PASS | ProductSocks5 | ProductPath | PIV-vless-default-bad-config-20261024T215041Z-001 | E_EXPECTED_CONFIG_REJECT | up=0B down=0B | evidence/vless/default/bad-config/PIV-vless-default-bad-config-20261024T215041Z-001/probe.json | proxy_json routing.outbound_kind=vless outbound.kind=vless; workload_error=eof; classification=E_EXPECTED_CONFIG_REJECT; reference closed the session on the negative case …; 限定：正向路径不通时本格仅证明无静默成功，不独立证明认证拒绝语义 |
 | VlessVision/Handshake | PASS | CrateDirect | ProtocolWire | PIV-vless-vless-vision-handshake-20261024T215044Z-001 | NONE | up=1B down=1B | evidence/vless/vless-vision/handshake/PIV-vless-vless-vision-handshake-20261024T215044Z-001/probe.json | vision_commands=["continue"]; target_stats={"tcp_bytes_down":2,"tcp_bytes_up":2,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} …; crate 级，产品 splice 未实现 |
@@ -85,6 +92,7 @@
 >
 > 本节任一 PASS 不改变协议 verdict；单格 PASS 只在所列 carrier/scope 下成立。
 > PaddingDiag 为诊断格，不参与 verdict。
+> AnyTLS：session 池/心跳定时器/padding 写路径未单独验。
 
 | Cell | 状态 | carrier | scope | evidence_id | class | 关键数字 | 证据路径 | notes |
 |---|---|---|---|---|---|---|---|---|
@@ -94,7 +102,7 @@
 | Default/LongLived | PASS | ProductSocks5 | ProductPath | PIV-anytls-default-long-lived-20261024T213353Z-001 | NONE | heartbeats=12 | evidence/anytls/default/long-lived/PIV-anytls-default-long-lived-20261024T213353Z-001/probe.json | proxy_json routing.outbound_kind=anytls outbound.kind=anytls; target_stats={"tcp_bytes_down":13,"tcp_bytes_up":13,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} … |
 | Default/Reconnect | PASS | ProductSocks5 | ProductPath | PIV-anytls-default-reconnect-20261024T213546Z-001 | NONE | reconnects=3 | evidence/anytls/default/reconnect/PIV-anytls-default-reconnect-20261024T213546Z-001/probe.json | proxy_json routing.outbound_kind=anytls outbound.kind=anytls; target_stats={"tcp_bytes_down":4,"tcp_bytes_up":4,"tcp_connections":4,"udp_bytes":0,"udp_datagrams":0} … |
 | Default/PaddingDiag | PASS | ProductSocks5 | ProductPath | PIV-anytls-default-padding-diag-20261024T213601Z-001 | NONE | up=0B down=0B | evidence/anytls/default/padding-diag/PIV-anytls-default-padding-diag-20261024T213601Z-001/probe.json | proxy_json routing.outbound_kind=anytls outbound.kind=anytls; serversettings_inferred; target_stats={"tcp_bytes_down":1,"tcp_bytes_up":1,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} …; 诊断格，不参与 verdict |
-| Default/UdpEcho | PASS | CrateDirect | ProtocolWire | PIV-anytls-default-udp-echo-20261024T213554Z-001 | NONE | udp 1000/1000 corrupt=0 | evidence/anytls/default/udp-echo/PIV-anytls-default-udp-echo-20261024T213554Z-001/probe.json | udp_seq_and_hash_ok; target_stats={"tcp_bytes_down":0,"tcp_bytes_up":0,"tcp_connections":0,"udp_bytes":512064,"udp_datagrams":1001} … |
+| Default/UdpEcho | PASS | CrateDirect | ProtocolWire | PIV-anytls-default-udp-echo-20261024T213554Z-001 | NONE | udp 1000/1000 corrupt=0 | evidence/anytls/default/udp-echo/PIV-anytls-default-udp-echo-20261024T213554Z-001/probe.json | udp_seq_and_hash_ok; target_stats={"tcp_bytes_down":0,"tcp_bytes_up":0,"tcp_connections":0,"udp_bytes":512064,"udp_datagrams":1001} …; crate 级，产品入口不可用 |
 | Default/BadCredential | PASS | ProductSocks5 | ProductPath | PIV-anytls-default-bad-credential-20261024T213558Z-001 | E_EXPECTED_AUTH_REJECT | up=0B down=0B | evidence/anytls/default/bad-credential/PIV-anytls-default-bad-credential-20261024T213558Z-001/probe.json | proxy_error=ConnectivityEstablishmentFailed { provider: ProviderId("ref"), reason: "anytls session handshake failed: anytls io error" }; workload_error=read: Connection reset by peer (os error 104) … |
 | AnyTlsCustomPadding/BadConfig | PASS | ProductSocks5 | ProductPath | PIV-anytls-anytls-custom-padding-bad-config-20261024T213605Z-001 | E_EXPECTED_CONFIG_REJECT | up=0B down=0B | evidence/anytls/anytls-custom-padding/bad-config/PIV-anytls-anytls-custom-padding-bad-config-20261024T213605Z-001/probe.json | proxy_error=ConnectivityEstablishmentFailed { provider: ProviderId("ref"), reason: "anytls session handshake failed: anytls server requested padding scheme update" } … |
 
@@ -170,8 +178,12 @@
 
 ## fix 支线与复验
 
+本 run 产生 verdict 翻转的修复条目（来源：run-meta）：
 
-根因文档内的 `evidence/...` 路径相对主机证据根 `$RUN_DIR=/work/interop-run/protocol-interop-verification`（非仓库内路径）；仓库内可打开的是根因文档本身。spec 原文不在仓库，规则 1/2 的判定摘要见顶部「先读」。
+- **transport 批量写**（commit `60e6029`）：把 `PendingWrite` 接入 Trojan/AnyTLS/VLESS×2/Hy2 泵，补齐跨协议 T2，AnyTLS 由此翻转为 `VERIFIED / FULL`（prediction-check 步骤 2（25/25））
+- **VLESS 惰性响应头读取**（commit `43ca7ac`）：延迟 VLESS 响应头读取到转发泵，消除 eager read 导致的 `E_NEXUS_FRAMING`，VLESS 翻转为 `VERIFIED / PROTOCOL_SUBSET`（prediction-check 步骤 3（10/10））
+
+根因文档位于仓库 `docs/protocols/interop/fix/`；本 run 证据根为 `/work/interop-run/protocol-interop-fixes-1`，上表 cell 证据路径均相对该目录。
 
 ## 附录 A：配置索引
 
@@ -246,10 +258,11 @@
 
 ```bash
 scripts/interop/run-matrix.sh --protocol <p> --variant <v> --cell <c> \
-  --run-dir /work/interop-run/protocol-interop-verification \
+  --run-dir /work/interop-run/protocol-interop-fixes-1 \
   --probe-bin $CARGO_TARGET_DIR/debug/examples/protocol_interop_probe \
   --ref-bin $RUN_DIR/ref/sing-box-1.13.16-linux-amd64-musl/sing-box
-python3 scripts/interop/recompute-verdicts.py --run-dir $RUN_DIR \
+python3 scripts/interop/recompute-verdicts.py --run-dir /work/interop-run/protocol-interop-fixes-1 \
+  --run-meta /work/interop-run/protocol-interop-fixes-1/analysis/run-meta.json \
   --matrix docs/protocols/interop/MATRIX.md --check
 ```
 
@@ -268,7 +281,8 @@ python3 scripts/interop/recompute-verdicts.py --run-dir $RUN_DIR \
 | Trojan | PIV-trojan-default-tcp-throughput-20261024T213728Z-001 | 60e6029e4977c47bf624cbc62f107ea02fe16da3 | /work/wt-protocol-interop-fixes-1/target | b6c5a37ad1c64edd50a304d32ad76514c2b705f8185f0f883bcf4d2dbaa29c01 |
 | Shadowsocks | PIV-shadowsocks-default-tcp-throughput-20261024T213938Z-001 | 60e6029e4977c47bf624cbc62f107ea02fe16da3 | /work/wt-protocol-interop-fixes-1/target | b6c5a37ad1c64edd50a304d32ad76514c2b705f8185f0f883bcf4d2dbaa29c01 |
 
-AnyTLS/Trojan 终局 T2 由 fix 分支 `b7acb32` 的 fix worktree 构建（fix 仅改 VLESS 响应头泵，产品 `apps/nexus/src/lib.rs` 本表基线未被改动）；同格 FAIL 另有主 worktree 构建记录。
+上表逐格给出各 T2 证据绑定的构建提交、目标目录与二进制哈希；按证据 `nexus.commit` 派生：`43ca7ac42b6b67d26498d7aeeeecc28199a02e13`（Vless）；`60e6029e4977c47bf624cbc62f107ea02fe16da3`（Anytls、Hysteria2、Trojan、Shadowsocks）。
+构建均来自证据记录的本 worktree `cargo_target_dir`，不再引用前序 run 的 fix worktree。
 
 ## 附录 E：被替代运行
 
