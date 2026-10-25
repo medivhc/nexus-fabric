@@ -154,9 +154,22 @@ impl TurnHandle for TurnClient {
 type TurnFactory = Box<dyn Fn() -> io::Result<Box<dyn TurnHandle>> + Send>;
 
 /// 构造指向 `server` 的真实 TURN client 工厂。
-fn real_factory(server: SocketAddr, creds: TurnCredentials) -> TurnFactory {
-    Box::new(move || {
-        TurnClient::allocate(server, creds.clone()).map(|c| Box::new(c) as Box<dyn TurnHandle>)
+///
+/// `bind` 来自 `[network.turn].bind_addr`：`Some` → `allocate_bound`；
+/// `None`（仅手写 `TurnSection` 的测试可达；配置加载已拒绝非法值）→
+/// `InvalidInput`，不 panic、不静默换地址。
+fn real_factory(
+    server: SocketAddr,
+    creds: TurnCredentials,
+    bind: Option<SocketAddr>,
+) -> TurnFactory {
+    Box::new(move || match bind {
+        Some(local_bind) => TurnClient::allocate_bound(server, creds.clone(), local_bind)
+            .map(|c| Box::new(c) as Box<dyn TurnHandle>),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "turn bind_addr invalid",
+        )),
     })
 }
 
@@ -175,6 +188,8 @@ pub struct TurnManager {
     client: Option<Box<dyn TurnHandle>>,
     /// 分配/重试工厂。
     factory: TurnFactory,
+    /// `[network.turn].bind_addr` 解析结果（TURN client 的本地 socket 绑定）。
+    bind: Option<SocketAddr>,
     /// 连续 Refresh 失败次数（AC3 3-strike）。
     consecutive_refresh_failures: u32,
     /// 本轮 438 Stale Nonce 是否已重试过（C-3：单次 Refresh 周期最多重试 1 次，
@@ -200,6 +215,7 @@ impl TurnManager {
                 factory: Box::new(|| {
                     Err(io::Error::new(io::ErrorKind::NotFound, "turn unconfigured"))
                 }),
+                bind: None,
                 consecutive_refresh_failures: 0,
                 stale_nonce_retried: false,
                 next_refresh_at: None,
@@ -207,6 +223,8 @@ impl TurnManager {
             },
             Some(section) => {
                 let refresh_interval = Duration::from_secs(section.refresh_interval_sec);
+                // 只在构造期解析一次；两个生产 manager 都经此路径覆盖。
+                let bind = section.bind_addr.parse::<SocketAddr>().ok();
                 match section.server.parse::<SocketAddr>() {
                     Ok(server) => {
                         let creds = TurnCredentials {
@@ -219,7 +237,8 @@ impl TurnManager {
                             server: Some(server),
                             state: TurnState::Allocating,
                             client: None,
-                            factory: real_factory(server, creds),
+                            factory: real_factory(server, creds, bind),
+                            bind,
                             consecutive_refresh_failures: 0,
                             stale_nonce_retried: false,
                             next_refresh_at: None,
@@ -242,6 +261,7 @@ impl TurnManager {
                                     "turn server invalid",
                                 ))
                             }),
+                            bind,
                             consecutive_refresh_failures: 0,
                             stale_nonce_retried: false,
                             next_refresh_at: None,
@@ -265,12 +285,16 @@ impl TurnManager {
         } else {
             TurnState::Disabled
         };
+        let bind = config
+            .as_ref()
+            .and_then(|c| c.bind_addr.parse::<SocketAddr>().ok());
         Self {
             config,
             server: None,
             state: initial_state,
             client: None,
             factory,
+            bind,
             consecutive_refresh_failures: 0,
             stale_nonce_retried: false,
             next_refresh_at: None,
@@ -325,23 +349,49 @@ impl TurnManager {
 
         self.state = TurnState::Allocating;
         match (self.factory)() {
-            Ok(client) => {
-                let relayed = client.relayed_addr();
-                self.client = Some(client);
-                self.state = TurnState::Active;
-                self.consecutive_refresh_failures = 0;
-                self.stale_nonce_retried = false;
-                self.next_refresh_at = self.schedule_next_refresh();
-                eprintln!(
-                    "[nat-switch] TURN allocation active: relayed={relayed} refresh_in={:?}",
-                    self.refresh_interval
-                );
-                Ok(relayed)
-            }
+            Ok(client) => Ok(self.activate(client, true)),
             Err(e) => {
                 self.handle_auth_failure(&e);
                 Err(TurnError::Io(e))
             }
+        }
+    }
+
+    /// 统一「激活分配」路径：置 `Active`、清失败计数、排下次刷新、打印分配行。
+    ///
+    /// `reset_stale_nonce`：`ensure_allocated` 传 `true`；438 重分配传 `false`
+    /// （C-3：单次 Refresh 周期最多重分配一次）。
+    fn activate(&mut self, client: Box<dyn TurnHandle>, reset_stale_nonce: bool) -> SocketAddr {
+        // mapped 必须在 client move 进 self.client 之前读取。
+        let relayed = client.relayed_addr();
+        let mapped = client.mapped_addr();
+        self.client = Some(client);
+        self.state = TurnState::Active;
+        self.consecutive_refresh_failures = 0;
+        if reset_stale_nonce {
+            self.stale_nonce_retried = false;
+        }
+        self.next_refresh_at = self.schedule_next_refresh();
+        eprintln!(
+            "[nat-switch] TURN allocation active: relayed={relayed} mapped={} bind={} refresh_in={}s",
+            mapped
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            self.bind_for_log(),
+            self.refresh_interval.as_secs()
+        );
+        relayed
+    }
+
+    /// 分配行/失败行里的 `bind=` 文本：解析成功用 `SocketAddr`，否则用配置原文。
+    fn bind_for_log(&self) -> String {
+        match self.bind {
+            Some(addr) => addr.to_string(),
+            None => self
+                .config
+                .as_ref()
+                .map(|c| c.bind_addr.clone())
+                .unwrap_or_else(|| "none".to_string()),
         }
     }
 
@@ -525,6 +575,7 @@ mod tests {
     use super::*;
     use nexus_turn::client::TurnCredentials;
     use nexus_turn::server::TurnServer;
+    use std::net::UdpSocket;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
@@ -548,6 +599,52 @@ mod tests {
             bind_addr: "0.0.0.0:0".into(),
             relay_book_dir: None,
         }
+    }
+
+    fn bind_available(addr: &str) -> bool {
+        UdpSocket::bind(addr).is_ok()
+    }
+
+    /// P3-AC1：`bind_addr` 被工厂消费（mapped IP == 配置 IP）。
+    #[test]
+    fn bind_addr_is_honored() {
+        if !bind_available("127.0.0.2:0") {
+            eprintln!("SKIP: 127.0.0.2 not bindable in this environment");
+            return;
+        }
+        let server = TurnServer::bind("127.0.0.1:0".parse().unwrap(), creds()).unwrap();
+        let mut cfg = section(server.main_addr(), 300);
+        cfg.bind_addr = "127.0.0.2:0".into();
+        let mut mgr = TurnManager::new(Some(cfg));
+        let relayed = mgr.ensure_allocated().expect("allocate with 127.0.0.2");
+        assert!(relayed.port() > 0);
+        assert_eq!(
+            mgr.mapped_addr().map(|addr| addr.ip()),
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2))),
+            "TURN client socket must bind the configured bind_addr"
+        );
+    }
+
+    /// P3-AC2(i)：同一 `TurnSection` 构造的两个 manager 都绑配置 IP。
+    #[test]
+    fn factory_covers_both_managers() {
+        if !bind_available("127.0.0.2:0") {
+            eprintln!("SKIP: 127.0.0.2 not bindable in this environment");
+            return;
+        }
+        let server = TurnServer::bind("127.0.0.1:0".parse().unwrap(), creds()).unwrap();
+        let mut cfg = section(server.main_addr(), 300);
+        cfg.bind_addr = "127.0.0.2:0".into();
+        let mut warm_backup = TurnManager::new(Some(cfg.clone()));
+        let mut provider = TurnManager::new(Some(cfg));
+
+        warm_backup
+            .ensure_allocated()
+            .expect("warm backup allocate");
+        provider.ensure_allocated().expect("provider allocate");
+        let expected = Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2)));
+        assert_eq!(warm_backup.mapped_addr().map(|a| a.ip()), expected);
+        assert_eq!(provider.mapped_addr().map(|a| a.ip()), expected);
     }
 
     /// 真实 TURN server 往返：allocate → refresh 保活。
