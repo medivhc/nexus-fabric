@@ -886,7 +886,19 @@ impl Dataplane {
     fn handle_transparent_tcp(&mut self, accepted: AcceptedTcpStream, now_millis: u64) {
         let peer = accepted.peer;
         let orig_dst = accepted.orig_dst;
-        let (decision, _matched, _hint) = self.transparent_decision(peer, orig_dst, 6, now_millis);
+        let (decision, matched_rule, egress_hint, _fresh) =
+            self.transparent_decision(peer, orig_dst, 6, now_millis);
+        eprintln!(
+            "{}",
+            flow_decision_log(
+                peer,
+                orig_dst,
+                "tcp",
+                matched_rule.as_deref(),
+                egress_hint.as_deref(),
+                &decision,
+            )
+        );
         let Some(pipeline) = self.transparent.as_mut() else {
             self.with_tproxy_counters(|c| c.tcp_rejected += 1);
             return;
@@ -923,8 +935,21 @@ impl Dataplane {
                 }
             }
         }
-        let (decision, _matched, _hint) =
+        let (decision, matched_rule, egress_hint, fresh) =
             self.transparent_decision(datagram.peer, datagram.orig_dst, 17, now_millis);
+        if fresh {
+            eprintln!(
+                "{}",
+                flow_decision_log(
+                    datagram.peer,
+                    datagram.orig_dst,
+                    "udp",
+                    matched_rule.as_deref(),
+                    egress_hint.as_deref(),
+                    &decision,
+                )
+            );
+        }
         let Some(pipeline) = self.transparent.as_mut() else {
             self.with_tproxy_counters(|c| c.udp_dropped += 1);
             return;
@@ -976,7 +1001,7 @@ impl Dataplane {
         orig_dst: SocketAddrV4,
         proto: u8,
         now_millis: u64,
-    ) -> (TransparentDecision, Option<String>, Option<String>) {
+    ) -> (TransparentDecision, Option<String>, Option<String>, bool) {
         let flow = nexus_projection::egress::FlowKey {
             src_ip: u32::from(*peer.ip()),
             dst_ip: u32::from(*orig_dst.ip()),
@@ -993,6 +1018,7 @@ impl Dataplane {
                 transparent_decision_from_target(&cached.target),
                 Some(cached.matched_rule),
                 Some(cached.selected_outbound),
+                false,
             );
         }
         let packet = synthetic_transport_packet(peer, orig_dst, proto);
@@ -1035,6 +1061,7 @@ impl Dataplane {
             transparent_decision_from_target(&target),
             Some(matched_rule),
             Some(selected_outbound),
+            true,
         )
     }
 
@@ -2025,6 +2052,31 @@ fn udp_payload_of(packet: &[u8]) -> Option<&[u8]> {
         return None;
     }
     Some(&packet[ihl + 8..total])
+}
+
+/// 新流决策日志行（spec §11.2 `event=flow_decision`）。
+fn flow_decision_log(
+    peer: SocketAddrV4,
+    orig_dst: SocketAddrV4,
+    proto: &str,
+    matched_rule: Option<&str>,
+    egress_hint: Option<&str>,
+    decision: &TransparentDecision,
+) -> String {
+    let outbound = match decision {
+        TransparentDecision::Direct => "self",
+        TransparentDecision::Proxy { outbound, .. } => outbound.as_str(),
+        TransparentDecision::Drop { .. } => "-",
+    };
+    let matched_rule = matched_rule
+        .filter(|value| !value.is_empty())
+        .unwrap_or("-");
+    let egress_hint = egress_hint.filter(|value| !value.is_empty()).unwrap_or("-");
+    format!(
+        "[nexusd.dataplane] level=info event=flow_decision flow={peer}->{orig_dst} proto={proto} \
+frontend=tproxy matched_rule={matched_rule} egress_hint={egress_hint} outbound={outbound} \
+session=-"
+    )
 }
 
 /// `RouteTarget` → `TransparentDecision`（TUN/TPROXY 同规则语义）。
@@ -3307,6 +3359,64 @@ outbounds:
         let stats = dp.decision_cache_stats();
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.entries, 1);
+    }
+
+    /// S59：新流决策日志严格遵循 spec §11.2 字段顺序与取值。
+    #[test]
+    fn flow_decision_log_matches_spec_format() {
+        let peer = SocketAddrV4::new(Ipv4Addr::new(10, 200, 2, 2), 40_000);
+        let dst = SocketAddrV4::new(Ipv4Addr::new(10, 200, 3, 3), 8080);
+
+        let proxy = flow_decision_log(
+            peer,
+            dst,
+            "tcp",
+            Some("IP-CIDR,10.200.3.3/32,PROXY"),
+            Some("p1"),
+            &TransparentDecision::Proxy {
+                outbound: "p1".to_string(),
+                fallback: Vec::new(),
+            },
+        );
+        assert_eq!(
+            proxy,
+            "[nexusd.dataplane] level=info event=flow_decision flow=10.200.2.2:40000->10.200.3.3:8080 \
+proto=tcp frontend=tproxy matched_rule=IP-CIDR,10.200.3.3/32,PROXY egress_hint=p1 outbound=p1 \
+session=-"
+        );
+
+        let direct = flow_decision_log(peer, dst, "udp", None, None, &TransparentDecision::Direct);
+        assert_eq!(
+            direct,
+            "[nexusd.dataplane] level=info event=flow_decision flow=10.200.2.2:40000->10.200.3.3:8080 \
+proto=udp frontend=tproxy matched_rule=- egress_hint=- outbound=self session=-"
+        );
+
+        let drop = flow_decision_log(
+            peer,
+            dst,
+            "tcp",
+            Some("MATCH,DROP"),
+            Some("drop"),
+            &TransparentDecision::Drop {
+                reason: DropReason::RuleRejected,
+            },
+        );
+        assert!(drop.contains("egress_hint=drop outbound=- session=-"));
+    }
+
+    /// S59：UDP 去重依据决策缓存命中——同流第二包不再算"新流"。
+    #[test]
+    fn udp_flow_decision_is_fresh_only_on_cache_miss() {
+        let (mut dp, _mock) = test_dataplane();
+        let peer = SocketAddrV4::new(Ipv4Addr::new(10, 200, 2, 2), 40_000);
+        let dst = SocketAddrV4::new(Ipv4Addr::new(10, 200, 3, 3), 8080);
+
+        let (_, _, _, fresh) = dp.transparent_decision(peer, dst, 17, 1_000);
+        assert!(fresh, "first packet of a flow is a new decision");
+        let (_, _, _, fresh) = dp.transparent_decision(peer, dst, 17, 1_001);
+        assert!(!fresh, "same flow within cache TTL must not log again");
+        assert_eq!(dp.decision_cache_stats().hits, 1);
     }
 
     /// S24：fake_ip_enabled=false 时 198.18/15 按普通 IP 走规则。
