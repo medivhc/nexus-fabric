@@ -356,6 +356,10 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial, run_
     env = run_dir / "evidence/env"
     ref = run_dir / "evidence/ref"
 
+    # Optional per-run narrative overrides (C5a). Absent => byte-identical
+    # output to the pre-override behaviour (fixes-1 regeneration is the guard).
+    narrative = (run_meta or {}).get("narrative") or {}
+
     def read_first(path):
         try:
             return path.read_text(encoding="utf-8").splitlines()[0].strip()
@@ -438,9 +442,13 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial, run_
         )
     if run_meta:
         lines.append(
-            "- **结论 2**：剩余阻断分属协议编解码、协议线格式与产品安全语义/产品能力缺口；"
-            "本 run 已消除产品装配（VLESS eager read）与跨协议传输（T2）两类阻断。"
-            "`root_cause_class` 只是规则代表类，不是完整根因。"
+            "- **结论 2**："
+            + narrative.get("conclusions", {}).get(
+                "2",
+                "剩余阻断分属协议编解码、协议线格式与产品安全语义/产品能力缺口；"
+                "本 run 已消除产品装配（VLESS eager read）与跨协议传输（T2）两类阻断。"
+                "`root_cause_class` 只是规则代表类，不是完整根因。",
+            )
         )
     else:
         lines.append(
@@ -465,9 +473,13 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial, run_
         lines.append("- **结论 3**：本次复算全部协议均达 `VERIFIED`，无代表根因。")
     if run_meta:
         lines.append(
-            "- **结论 4**：Trojan/SS 当前仍受 fallback 安全语义/线格式与产品 UDP 缺口阻断；"
-            "即使其余修复完成，本 run `UdpEcho` 固定 `NOT_IMPLEMENTED`，"
-            "上限仍为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（spec E1 规则 6/R11）。"
+            "- **结论 4**："
+            + narrative.get("conclusions", {}).get(
+                "4",
+                "Trojan/SS 当前仍受 fallback 安全语义/线格式与产品 UDP 缺口阻断；"
+                "即使其余修复完成，本 run `UdpEcho` 固定 `NOT_IMPLEMENTED`，"
+                "上限仍为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（spec E1 规则 6/R11）。",
+            )
         )
     else:
         lines.append(
@@ -642,6 +654,15 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial, run_
             "Trojan": "本 run 最高 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（U 未实现，规则 6）",
             "Shadowsocks": "本 run 最高 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（U 未实现，规则 6）",
         }
+        # Optional data-driven overrides: narrative.blocking_meta maps a
+        # protocol to [blocking, owner, solvable]; narrative.upper_limit maps
+        # a protocol to its ceiling text. Unknown protocols are ignored.
+        for proto, triple in (narrative.get("blocking_meta") or {}).items():
+            if proto in blocking_meta and isinstance(triple, (list, tuple)) and len(triple) == 3:
+                blocking_meta[proto] = tuple(triple)
+        for proto, limit in (narrative.get("upper_limit") or {}).items():
+            if proto in upper_limit:
+                upper_limit[proto] = limit
         for proto in PROTOCOL_ORDER:
             if proto not in verdicts:
                 continue
@@ -751,7 +772,13 @@ def render_matrix(run_dir, matrix, verdicts, rows, findings, allow_partial, run_
             if run_meta and proto in ("Vless", "Anytls") and r["cell"] == "UdpEcho":
                 qualifiers.append("crate 级，产品入口不可用")
             if r["cell"] in FAILURE_CELLS and r["status"] == "PASS":
-                if proto in ("Vless", "Shadowsocks"):
+                override = narrative.get("failure_cell_qualifier")
+                if override and proto in override:
+                    # A string replaces the boilerplate; null/"" suppresses it
+                    # (the run's evidence now proves the rejection semantics).
+                    if override[proto]:
+                        qualifiers.append(override[proto])
+                elif proto in ("Vless", "Shadowsocks"):
                     qualifiers.append(
                         "限定：正向路径不通时本格仅证明无静默成功，不独立证明认证拒绝语义"
                     )

@@ -57,7 +57,7 @@ impl Counters {
 ///
 /// Point-to-point: bound to the single proxy `target` at construction.
 /// `max_wire` is the largest accepted wire frame: `MAX_DATAGRAM` (1200) for
-/// plaintext framing (SOCKS5/trojan), `MAX_SEALED_FRAME` (1228) for the
+/// plaintext framing (SOCKS5/trojan), `MAX_SEALED_FRAME` (1266) for the
 /// shadowsocks sealed frames. The *datagram* (plaintext) limit stays
 /// `MAX_DATAGRAM` for every transport (X1).
 pub struct FramedTransport {

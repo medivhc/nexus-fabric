@@ -3439,12 +3439,14 @@ mod tests {
     fn parse_shared_output_targets_and_durations() {
         let meta = crate::env::cargo_metadata().expect("cargo metadata");
         let expected = integration_targets(&meta);
-        assert_eq!(expected.len(), 35);
+        // Fixes-2 adds two integration targets: crates/nexus-outbound-shadowsocks/
+        // tests/sip004_kat.rs and apps/nexus/tests/ss_arm_stream_pump.rs.
+        assert_eq!(expected.len(), 37);
         let (lines, exec_map) = sample_shared_output(&expected, "ok");
         let run = parse_shared_output(&lines, 1234, true, &meta, &exec_map);
         assert_eq!(
             run.targets.len(),
-            35,
+            37,
             "duplicate target names must stay distinct"
         );
         assert_eq!(

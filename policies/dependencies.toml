@@ -627,3 +627,54 @@ os_transitive_deps = "libc (already in tree), bitflags, windows-sys"
 approved = true
 approved_date = "2026-10-10"
 review_basis = "修复 B-R1：0.0.0.0 时按网卡派生可路由 UDP 地址，避免 SDP 只带 loopback 候选导致真实浏览器零连接"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-outbound-shadowsocks"
+crate = "sha1"
+version = "0.10"
+default_features = false
+features = []
+architecture_layer = "outbound (shadowsocks SIP004); HKDF-SHA1 inner hash for the per-direction session subkey (spec §1.1). No new internal edge: nexus-connectivity/nexus-plugin only."
+feature_scope = "default features only; asm explicitly off (pure Rust); same declaration shape as nexus-turn"
+license = "MIT OR Apache-2.0 (allowlisted; same crate/version already reviewed for nexus-turn)"
+security = "RustCrypto maintained; SHA-1 is used as the HMAC inner primitive mandated by SIP004 for HKDF (not collision-sensitive hashing); RustSec checked by harness dependency-governance"
+portability = "pure Rust (asm off); already in tree via digest 0.10 ecosystem"
+supply_chain = "0.10.7 already pinned by Cargo.lock (via nexus-turn); no lockfile delta"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-25"
+review_basis = "protocol-interop-fixes-2 spec §1.1/§1.6: SIP004 subkey = HKDF-SHA1(master, salt, \"ss-subkey\"); reuses the nexus-turn-reviewed sha1 pin"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-outbound-shadowsocks"
+crate = "md5"
+version = "0.7"
+default_features = false
+features = []
+architecture_layer = "outbound (shadowsocks SIP004); EVP_BytesToKey password -> master key (spec §1.1). No new internal edge."
+feature_scope = "no features exist; zero transitive deps"
+license = "Apache-2.0 OR MIT (allowlisted; same crate/version already reviewed for nexus-turn)"
+security = "MD5 is used only in the SIP004-mandated EVP_BytesToKey construction (not security-critical hashing on its own); RustSec checked by harness dependency-governance"
+portability = "pure Rust, zero dependencies"
+supply_chain = "0.7.0 already pinned by Cargo.lock (via nexus-turn); no lockfile delta"
+os_transitive_deps = "none"
+approved = true
+approved_date = "2026-10-25"
+review_basis = "protocol-interop-fixes-2 spec §1.1/§1.6: master key = EVP_BytesToKey(MD5, no salt, 1 iteration); zero-dependency crate already in tree"
+
+[[dependency_reviews.direct]]
+consumer = "crates/nexus-outbound-shadowsocks"
+crate = "ring"
+version = "0.17"
+default_features = false
+features = ["alloc", "dev_urandom_fallback"]
+architecture_layer = "outbound (shadowsocks SIP004); SystemRandom generates the per-session 32B TX salt (spec §1.5). Precedent: nexus-outbound-hysteria2 uses ring SecureRandom in-crate; edge outbound crate, portable=false."
+feature_scope = "alloc + dev_urandom_fallback only (needed for SystemRandom/urandom on all host targets); no slow_tests/unstable-testing features. Default features are disabled per policies default_features_policy=prefer-disabled."
+license = "Apache-2.0 AND ISC (allowlisted; already accepted in tree)"
+security = "OS CSPRNG only; no known advisories; RustSec checked by harness dependency-governance"
+portability = "crate portable=false; ring BoringSSL C/asm build already compiled for every supported host target via rustls/quinn-proto"
+supply_chain = "0.17.14 already pinned by Cargo.lock; no new package, no lockfile delta"
+os_transitive_deps = "cc build only (already accepted)"
+approved = true
+approved_date = "2026-10-25"
+review_basis = "protocol-interop-fixes-2 spec §1.5/§1.6: production salt must come from ring::rand::SystemRandom; default features off to keep feature scope explicit"

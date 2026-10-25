@@ -35,7 +35,7 @@ driver 经 `FabricConn::connect_with_transport` 零改动接入。
 - `nexus-fabric`（仅 `UdpTransport` trait；`nexus-fabric` 不反向依赖本 crate，
   延续 4b 的 S9 依赖反转）
 - `nexus-outbound-shadowsocks`（二期新增：仅复用 `SsStream`/`SsMethod`/
-  `encode_request`/`parse_request`/`write_record`/`read_record` 密码学与握手原语；
+  `encode_request`/`parse_request` 的 SIP004 流式密码学与握手原语；
   不使用 `OutboundAdapter` trait——那是 per-flow egress 语义，本 crate 是
   per-link transport，见 T3）
 - `nexus-outbound-trojan`（二期新增：仅复用 `auth_hash`/`encode_request`/
@@ -88,15 +88,18 @@ T1–T6 是新增冻结不变量。
 **T1（ShadowsocksTransport）**：TCP connect → ss 会话握手 → 字节流 →
 同样 2 字节成帧 → `impl UdpTransport`；QUIC 层零改动（X1 延续）。
 握手复用 `nexus-outbound-shadowsocks` 原语（T3），不重写密码学：
-- `SsStream::new(password, method, Role::Client)` 建会话（c2s/s2c 双向 key，
-  HKDF 派生，固定计数器 nonce——**无随机 salt**，线格式与公网 ss 不同，
-  不宣称互操作，见诚实边界）；
-- `write_record(seal(encode_request(target)))` 发目标地址帧；
-- 等 `read_record` → `open` 校验服务端回的 `b"ss-proxy-ok"` 确认帧
-  （双向密钥自洽即认证；错密码表现为 `DecryptFailed`，不静默回退）。
-- 数据面：每 datagram `seal`（12B nonce + ct + 16B tag = 28B 开销）→
-  2 字节成帧（T4）。明文 datagram ≤ 1200（X1 延续）；
-  线帧上限 `MAX_SEALED_FRAME = 1228`。
+- `SsStream::new(password, method, Role::Client)` 建会话（**SIP004**：口令经
+  EVP_BytesToKey 得 master key，HKDF-SHA1 派生方向 subkey；发送 salt 惰性随机生成，
+  双向对称，`Role` 不再影响派生）；
+- `write_all(seal(encode_request(target)))` 直接写 SIP004 流（**无 u32 记录头**），
+  首写含客户端 32B salt；
+- 流式读回并 `open`，直到非空明文 = 服务端回的 `b"ss-proxy-ok"` 确认帧
+  （salt 未满/半个 chunk 时 `open` 返回空，继续读；错密码表现为 `DecryptFailed`，
+  不静默回退）。
+- 数据面：每 datagram `seal`（单 chunk 开销 = len 段 2+16 加 payload tag 16 = 34B；
+  方向的**首 chunk** 另含 32B salt）→ 2 字节成帧（T4）。明文 datagram ≤ 1200
+  （X1 延续）；线帧上限 `MAX_SEALED_FRAME = MAX_DATAGRAM + 66 = 1266`。
+  注：16417/16449 是 codec/解码缓冲边界（SU-3），不是本 transport 的帧上限。
 - `SsTransport` 结构：`FramedTransport`（T4 共享成帧）+
   `Mutex<SsStream>`（满足 `send_to(&self)` 共享引用；收发不嵌套加锁，
   先 seal/open 再碰 socket）。
@@ -125,7 +128,7 @@ crates 的公开原语；本 crate 不准出现 `ChaCha20Poly1305`/`Hkdf`/`Sha22
   公开 API（`new`/`connect`/`target`/`counters`/`counters_handle` +
   `UdpTransport`），内部委托给 `FramedTransport`，零行为变化。
   `FramedTransport::new(stream, target)` 的 `max_wire` 按传输取
-  1200（socks5/trojan）或 1228（ss）。
+  1200（socks5/trojan）或 1266（ss，含首 chunk salt 的保守上界）。
 - 配置：`SsProxyConfig { server: SocketAddr, method: SsMethod, password: String,
   connect_timeout, handshake_timeout }`；
   `TrojanProxyConfig { server: SocketAddr, password: String,
@@ -177,8 +180,11 @@ TLS，兼容真实 trojan 服务器：
 - ~~trojan over TLS 后置（本期明文握手+明文成帧，E4 与文档明说）；~~
   T7 已实现 trojan over TLS；T2 明文模式保留用于测试/内网。
   UDP ASSOCIATE 后置。
-- ss 会话无随机 salt（复用 `SsStream` 固定计数器 nonce 设计），线格式与
-  公网 ss 不兼容；**与公网 ss 服务的互操作未验证，不得宣称**。
+- ss 底层 codec 已是 SIP004（随机 salt、标准 AEAD 流），但本 transport 的
+  **ack 握手与拓扑仍是 Nexus 内部协议**（对端是另一个 Nexus 节点）；
+  与公网 ss 服务器的互操作**未宣称**。产品 SOCKS5 carrier 路径的互操作
+  另见 `docs/protocols/interop/MATRIX.md`（上限 PARTIAL/TCP_ONLY/USABLE_WITH_GAPS，
+  且不覆盖 nexusd TUN 路径）。
   trojan over TLS（T7）与真实 trojan 服务器的互操作需 E4 验证后方可宣称。
 - trojan 2 字节长度前缀明文（与 SOCKS5 期一致），载荷 AEAD 仅 ss 有；
   长度隐藏后置。
@@ -224,7 +230,10 @@ impl FramedTransport {
     pub fn counters_handle(&self) -> Counters;
 }
 impl nexus_fabric::UdpTransport for FramedTransport { /* 与 X 期 ProxyTransport 相同的原子成帧语义 */ }
-pub const MAX_SEALED_FRAME: usize = 1228; // MAX_DATAGRAM + 28（ss seal 开销）
+pub const SS_SALT_LEN: usize = 32;
+pub const SS_SEAL_OVERHEAD: usize = 34;            // per chunk: (2+16) len + 16 payload tag
+pub const SS_FIRST_CHUNK_OVERHEAD: usize = 66;     // 34 + 32B salt
+pub const MAX_SEALED_FRAME: usize = 1266;          // MAX_DATAGRAM + SS_FIRST_CHUNK_OVERHEAD
 
 // T1
 pub struct SsProxyConfig { pub server: SocketAddr, pub method: SsMethod, pub password: String, pub connect_timeout: Duration, pub handshake_timeout: Duration }
@@ -281,8 +290,9 @@ API 面最小化：`stream`/`ss` 字段不暴露；计数器只读。
   ss 握手：错密码 ack 打不开（`SsCrypto(DecryptFailed)`）；
   trojan 请求头写出字节（明文，无确认帧语义）。
 - P-E-2 E4（`examples/proxy_ss_quic.rs`，`scenarios/product/proxy_transport_ss.toml`）：
-  自研最小 ss server（`read_record`→`open`→`parse_request` 得目标→回
-  `seal(b"ss-proxy-ok")`→解密后中继成帧字节到 B）→ A 经 ss 建 QUIC 到 B →
+  自研最小 ss server（流式 `open`→`parse_request` 得目标→回
+  `seal(b"ss-proxy-ok")`（首写含服务端 salt）→解密后中继成帧字节到 B）→
+  A 经 ss 建 QUIC 到 B →
   64KB 回显 → 断言 `proxy_relayed_bytes > 0`（T1/T6）且
   `proxy_saw_plaintext_bytes == 0`（T3/X2：server 只见 AEAD 记录与 QUIC 密文）。
 - P-E-3 E4（`examples/proxy_trojan_quic.rs`，`scenarios/product/proxy_transport_trojan.toml`）：

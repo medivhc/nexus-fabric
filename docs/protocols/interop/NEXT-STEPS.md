@@ -7,8 +7,10 @@
 ## 0. 当前状态
 
 - 2 个协议 `VERIFIED`：VLESS（`PROTOCOL_SUBSET / USABLE`）、AnyTLS（`FULL / USABLE`）；
-  3 个协议 `BROKEN / NOT_USABLE`：Hysteria2、Trojan、Shadowsocks。逐格判定、`missing_cells`
-  与命中规则见 [MATRIX.md](MATRIX.md) 的「协议 verdict」表。
+  1 个协议 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`：Shadowsocks（`fixes-2`，本 run：
+  SIP004 互操作已通，仅剩产品 UDP 缺口）；2 个协议 `BROKEN / NOT_USABLE`：Hysteria2、Trojan。
+  上述 SS 结论是**矩阵口径**（crate + SOCKS5 产品路径）：**nexusd TUN 路径不在覆盖内**，
+  不得读作「生产 SS 已修好」。逐格判定、`missing_cells` 与命中规则见 [MATRIX.md](MATRIX.md) 的「协议 verdict」表。
 - 本 run 已完成两项翻转修复：跨协议 transport 批量写（commit `60e6029`）与 VLESS 惰性响应头
   读取（commit `43ca7ac`）。修复前后预测与逐格证据见
   [prediction-check.md](prediction-check.md)（步骤 2 `25/25`、步骤 3 `10/10`）。
@@ -21,7 +23,7 @@
 - Trojan/SS 即使其余修复全部完成，本 run 的 `UdpEcho` 固定 `NOT_IMPLEMENTED`，上限仍是
   `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（spec E1 规则 6/R11）。
   **不要用「修完就 VERIFIED」做产品承诺。**
-- 配置面标注（BROKEN 三协议「未验证/不可用」、含 fallback 的 Trojan 警示）已裁决批准，
+- 配置面标注（BROKEN 两协议（Hysteria2、Trojan）「未验证/不可用」、含 fallback 的 Trojan 警示）已裁决批准，
   待 `protocol-config-surface-labeling` run 落地；本轮不改产品代码。
 
 ## 1. 顺序、依赖与验收
@@ -29,10 +31,10 @@
 | 顺序 | 动作 | 依赖 | 状态 / 结果 | 成本/风险 | 复验口径 |
 |---|---|---|---|---|---|
 | **P0a** | **安全止血·文档警示**：公开 Trojan fallback fail-open，MATRIX 顶部警示与白皮书映射 | 无 | **DONE**（见 [MATRIX.md](MATRIX.md) 安全警示节） | 极低；纯文档 | 文档评审通过；不改 verdict |
-| **P0b** | **安全止血·配置面标注**：BROKEN 三协议加「未验证/不可用」标注；含 fallback 的 Trojan 加警示或默认禁用 | 产品负责人裁决 | **已裁决批准，待 `protocol-config-surface-labeling` run 落地**（本轮不改产品代码） | 低；文案/配置层 | 该 run 落地后核对配置面、USER_MANUAL 与 MATRIX 口径一致 |
+| **P0b** | **安全止血·配置面标注**：BROKEN 两协议（Hysteria2、Trojan）加「未验证/不可用」标注；含 fallback 的 Trojan 加警示或默认禁用 | 产品负责人裁决 | **已裁决批准，待 `protocol-config-surface-labeling` run 落地**（本轮不改产品代码） | 低；文案/配置层 | 该 run 落地后核对配置面、USER_MANUAL 与 MATRIX 口径一致 |
 | **P1** | **跨协议 transport 批量写**：`PendingWrite` + Trojan/AnyTLS/VLESS×2/Hy2 四个 arm 接入 | 无 | **DONE**（commit `60e6029`）：AnyTLS 由 T2 单格阻塞转为 `VERIFIED / FULL`；VLESS/Trojan/Hy2 的 T2 解锁 | 已完成；跨协议回归已由 prediction-check 步骤 2 覆盖 | prediction-check 步骤 2（`25/25`）；五协议 T2 + T1/L/R 回归 |
 | **P2** | **VLESS fix 合入 + 复验**：合入惰性响应头修复，与 transport 修复一起复验 H/T1/T2/L/R | P1 | **DONE**（commit `43ca7ac`）：VLESS 转为 `VERIFIED / PROTOCOL_SUBSET`；Vision 仍为 crate 级，产品 splice 未实现 | 已完成；风险主要在合入流程，现已关闭 | prediction-check 步骤 3（`10/10`）；H/T1/T2/L/R 全 PASS |
-| **P3** | **SS SIP004 AEAD**：salt + `EVP_BytesToKey`（MD5）+ HKDF-SHA1 + LE nonce + 标准分块（`fixes-2`，用户第一优先） | 无 | 待办：SS 可到 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（U 仍未实现，本 run schema 到不了 VERIFIED） | ~250–350 行，1.5–2 人日；会波及 loopback 测试的自洽格式 | 与 sing-box 参照端互操作 H/T1/T2/L/R 通过；U 仍记 `NOT_IMPLEMENTED` |
+| **P3** | **SS SIP004 AEAD**：salt + `EVP_BytesToKey`（MD5）+ HKDF-SHA1 + LE nonce + 标准分块（`fixes-2`，用户第一优先） | 无 | **DONE**（`fixes-2`，commit `ebc652e`）：SS crate 与 SOCKS5 产品路径达 SIP004 互操作，矩阵 verdict `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（7 格新证据全 PASS + 独立 KAT）。nexusd TUN 路径不在覆盖内，不表述为「生产 SS 已修好」 | 已完成；U 仍未实现，故本 run schema 到不了 VERIFIED | 与 sing-box 参照端互操作 H/T1/T2/L/R 通过；U 仍记 `NOT_IMPLEMENTED` |
 | **P4** | **Hy2 QPACK Huffman**：RFC 7541 附录 B 码表 + 解码 + 金样测试（`fixes-3`） | 无 | 待办：预期 Hy2 达到 `VERIFIED / FULL`；否则至少认证/握手/小流量可通 | ~300–400 行，1–1.5 人日；Huffman 表逐项对齐风险 | 认证响应解码成功；H/Hy2Salamander/T1/L/R/U/F1 逐格重跑；T2 复验 |
 | **P5** | **Hy2 Salamander**：在 QPACK Huffman 修复后单独验证 Salamander 变体（`fixes-4`） | P4 | 待办：Salamander 变体仍需独立证据，不复用 plain 结论 | 中；依赖 P4 的编解码修复 | Salamander 认证/握手/数据传输逐格重跑 |
 | **P6** | **Trojan fallback 完整语义**：延迟 SOCKS5 success 至上游就绪，或等价 fail-closed 方案（`fixes-5`） | P0b；产品架构决策 | 待办：Trojan 最高 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（U 未实现）；不许诺修完即 VERIFIED | >400 行 / >2 人日；触及 `proxy_serve_once` 全部出站路径，应另立 run | 错凭据/fallback 场景下不再把 404 内容当隧道数据；失败对用户可观察 |
