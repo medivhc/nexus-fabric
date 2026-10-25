@@ -19,13 +19,41 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use nexus::proxy_serve_once;
-use nexus_outbound_shadowsocks::{
-    Role, SsMethod, SsStream, parse_request, read_record, write_record,
-};
+use nexus_outbound_shadowsocks::{Role, SsMethod, SsStream, SsTarget, parse_request};
 
 const PASSWORD: &str = "demo";
 const METHOD: SsMethod = SsMethod::Chacha20IetfPoly1305;
 const PAYLOAD: &[u8] = b"ping-via-ss-tunnel";
+
+/// 已收字节里 request header 的完整长度（不足返回 None）。
+fn header_len(buf: &[u8]) -> Option<usize> {
+    match *buf.first()? {
+        0x01 => Some(7).filter(|need| buf.len() >= *need),
+        0x03 => {
+            let dlen = *buf.get(1)? as usize;
+            let need = 2 + dlen + 2;
+            (buf.len() >= need).then_some(need)
+        }
+        _ => Some(0),
+    }
+}
+
+/// 流式读完 SS request header：返回 (target, header 之后剩余明文)。
+fn read_request(sess: &mut SsStream, cli: &mut TcpStream) -> Result<(SsTarget, Vec<u8>), String> {
+    let mut wire = [0u8; 4096];
+    let mut plain = Vec::new();
+    loop {
+        if let Some(need) = header_len(&plain) {
+            let target = parse_request(&plain[..need]).map_err(|e| format!("{e:?}"))?;
+            return Ok((target, plain[need..].to_vec()));
+        }
+        let n = cli.read(&mut wire).map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err("eof before complete request header".into());
+        }
+        plain.extend(sess.open(&wire[..n]).map_err(|e| format!("{e:?}"))?);
+    }
+}
 
 fn main() {
     // 场景总是输出 JSON（E4 断言消费）；示例同时支持显式 --json 参数。
@@ -70,24 +98,29 @@ fn main() {
         let mut sess =
             SsStream::new(PASSWORD, METHOD, Role::Server).map_err(|e| format!("{e:?}"))?;
 
-        // 1) 加密 request header -> 解析目标
-        let req_frame = read_record(&mut cli).map_err(|e| e.to_string())?;
-        let req = sess.open(&req_frame).map_err(|e| format!("{e:?}"))?;
-        let target = parse_request(&req).map_err(|e| format!("{e:?}"))?;
+        // 1) 流式读 request header（salt + 首 chunk 明文）-> 解析目标
+        let (target, mut payload) = read_request(&mut sess, &mut cli)?;
 
         // 2) 真实 connect 到 loopback echo 目标
         let mut echo = TcpStream::connect(echo_addr).map_err(|e| e.to_string())?;
 
-        // 3) 加密 payload -> 明文写给 echo
-        let pay_frame = read_record(&mut cli).map_err(|e| e.to_string())?;
-        let payload = sess.open(&pay_frame).map_err(|e| format!("{e:?}"))?;
-        echo.write_all(&payload).map_err(|e| e.to_string())?;
+        // 3) 继续流式读到完整 payload，解密后明文写给 echo
+        let mut wire = [0u8; 4096];
+        while payload.len() < PAYLOAD.len() {
+            let n = cli.read(&mut wire).map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("eof before complete payload".into());
+            }
+            payload.extend(sess.open(&wire[..n]).map_err(|e| format!("{e:?}"))?);
+        }
+        echo.write_all(&payload[..PAYLOAD.len()])
+            .map_err(|e| e.to_string())?;
 
-        // 4) 读 echo 回显 -> 加密回写 client
-        let mut back = vec![0u8; payload.len()];
+        // 4) 读 echo 回显 -> seal 回写 client（服务端自己的 TX salt）
+        let mut back = vec![0u8; PAYLOAD.len()];
         echo.read_exact(&mut back).map_err(|e| e.to_string())?;
         let reply = sess.seal(&back).map_err(|e| format!("{e:?}"))?;
-        write_record(&mut cli, &reply).map_err(|e| e.to_string())?;
+        cli.write_all(&reply).map_err(|e| e.to_string())?;
 
         Ok((target.host_label(), target.port()))
     });

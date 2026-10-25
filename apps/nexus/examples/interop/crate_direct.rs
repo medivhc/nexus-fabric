@@ -54,12 +54,12 @@ pub fn run_cell(cfg: &InteropProbeConfig, cell_dir: &Path) -> Result<Outcome, St
             write_manifest(
                 cell_dir,
                 "shadowsocks-udp-not-implemented",
-                "Nexus Shadowsocks 出站仅 TCP record 帧；无 UDP 关联",
+                "Nexus Shadowsocks 出站仅 TCP（SIP004 AEAD）；无 UDP 关联",
                 &[
                     (
                         "crates/nexus-outbound-shadowsocks/src/lib.rs",
-                        "279-380",
-                        "SsStream 仅 TCP record seal/open",
+                        "289-470",
+                        "SsStream 仅 TCP SIP004 AEAD seal/open（无 UDP 关联）",
                     ),
                     (
                         "crates/nexus-ingress/src/lib.rs",

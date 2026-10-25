@@ -4970,8 +4970,8 @@ pub fn proxy_serve_once(
 
     // 4) 真实出站连接：按 selected outbound 的 kind 建立数据面（§11.16）。
     //    direct      -> 直连 destination（§11.4 现状，零回归）
-    //    shadowsocks -> 连节点 locator + SsStream 客户端会话 + 加密 request header
-    //                   + 双向 record 帧中继（read_record / write_record）
+    //    shadowsocks -> 连节点 locator + SsStream（SIP004）客户端会话 + 加密 request header
+    //                   + 双向流式 seal/open 中继（PendingWrite 背压 + 半关闭传播）
     //    trojan/vmess-> 数据面隧道不在本期冻结 E4 范围，结构化失败（不静默直连）
     let selected = config
         .outbounds
@@ -5026,9 +5026,7 @@ pub fn proxy_serve_once(
             (up, down)
         }
         nexus_proxy_config::OutboundKind::Shadowsocks => {
-            use nexus_outbound_shadowsocks::{
-                Role, SsMethod, SsStream, SsTarget, encode_request, read_record, write_record,
-            };
+            use nexus_outbound_shadowsocks::{Role, SsMethod, SsStream, SsTarget, encode_request};
             let locator = selected.locator.clone().ok_or_else(|| {
                 NexusError::ConnectivityEstablishmentFailed {
                     provider: ProviderId(decision.selected_outbound_tag.clone()),
@@ -5046,7 +5044,18 @@ pub fn proxy_serve_once(
                     reason: format!("ss node connect {locator} failed: {e}"),
                 }
             })?;
+            let raw_nb = raw.try_clone().map_err(|_| NexusError::Internal {
+                message: "proxy clone failed".into(),
+            })?;
             let raw_down = raw.try_clone().map_err(|_| NexusError::Internal {
+                message: "proxy clone failed".into(),
+            })?;
+            // 半关闭句柄：`ObfuscatedStream` 没有 shutdown，排空后要经 raw dup 发 FIN，
+            // 否则 probe 的 finish() 只能等有界超时（正/负向格会被误判）。
+            let sd_up = raw.try_clone().map_err(|_| NexusError::Internal {
+                message: "proxy clone failed".into(),
+            })?;
+            let sd_down = raw.try_clone().map_err(|_| NexusError::Internal {
                 message: "proxy clone failed".into(),
             })?;
             let obfs_params = nexus_plugin::ObfsParams {
@@ -5080,6 +5089,9 @@ pub fn proxy_serve_once(
                     reason: "shadowsocks outbound missing password".into(),
                 }
             })?;
+            // SIP004 双实例分工（spec §3.1 冻结）：tx_sess 只 seal、rx_sess 只 open，
+            // 两实例各自维护 nonce；salt 惰性生成，rx 实例不产生闲置 TX 状态。
+            // 严禁跨线程共享单实例（Arc<Mutex<SsStream>>）。
             let mut tx_sess = SsStream::new(&password, method, Role::Client).map_err(|e| {
                 NexusError::Internal {
                     message: format!("ss client session failed: {e:?}"),
@@ -5090,74 +5102,135 @@ pub fn proxy_serve_once(
                     message: format!("ss client session failed: {e:?}"),
                 }
             })?;
-            // 加密 request header（目标 = SOCKS5 destination）→ 节点
+            // 加密 request header（目标 = SOCKS5 destination）：SIP004 首写内容（含 salt）。
             let target = if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
                 SsTarget::Ipv4(ip.octets(), port)
             } else {
                 SsTarget::Domain(host.clone(), port)
             };
-            let req_frame = tx_sess.seal(&encode_request(&target)).map_err(|e| {
+            let req_wire = tx_sess.seal(&encode_request(&target)).map_err(|e| {
                 NexusError::ConnectivityEstablishmentFailed {
                     provider: ProviderId(decision.selected_outbound_tag.clone()),
                     reason: format!("ss request header seal failed: {e:?}"),
                 }
             })?;
-            // 请求头走写方向的 wrapped handle（S7：写方向字节连续）。
-            write_record(&mut node_up, &req_frame).map_err(|e| {
-                NexusError::ConnectivityEstablishmentFailed {
-                    provider: ProviderId(decision.selected_outbound_tag.clone()),
-                    reason: format!("ss request header send failed: {e}"),
-                }
-            })?;
-            // 双向 record 帧中继：client→node 读明文→seal→write_record；
-            // node→client read_record→open→写明文。TX/RX 各持独立会话实例（Rx 帧内 nonce）。
+            // §11.19 seed（HTTP 改写的 origin-form 请求 / SOCKS5 pipelined 字节）
+            // 紧跟在 request header 之后，同样经 tx_sess seal（保持 nonce 顺序）。
+            let seed_wire = if seed_to_upstream.is_empty() {
+                Vec::new()
+            } else {
+                tx_sess.seal(&seed_to_upstream).map_err(|e| {
+                    NexusError::ConnectivityEstablishmentFailed {
+                        provider: ProviderId(decision.selected_outbound_tag.clone()),
+                        reason: format!("ss seed seal failed: {e:?}"),
+                    }
+                })?
+            };
+            // 握手/首写均已完成，两个方向改为非阻塞：PendingWrite 的 WouldBlock 语义
+            // 只在非阻塞 socket 上成立（dup 共享同一 fd 的 status flags，同 Trojan arm）。
+            raw_nb
+                .set_nonblocking(true)
+                .map_err(|e| NexusError::Internal {
+                    message: format!("ss node nonblocking: {e}"),
+                })?;
+            client
+                .set_nonblocking(true)
+                .map_err(|e| NexusError::Internal {
+                    message: format!("ss client nonblocking: {e}"),
+                })?;
             let mut client_up = client.try_clone().map_err(|_| NexusError::Internal {
                 message: "proxy clone failed".into(),
             })?;
             let mut client_down = client.try_clone().map_err(|_| NexusError::Internal {
                 message: "proxy clone failed".into(),
             })?;
-            // node_up / node_down 已在上面按方向 wrap 好，直接 move 进线程。
+            // 并发模型：保留双线程双实例。每方向一个 PendingWrite（无共享、无 Mutex）。
+            // 上行走线字节（header wire 先行，再 seed wire，再中继 seal 数据）；
+            // 下行走流式 open（空结果合法，不产出也结束）。
             let to_upstream = std::thread::spawn(move || {
-                let mut buf = [0u8; 8192];
-                let mut total = 0usize;
-                if !seed_to_upstream.is_empty() {
-                    match tx_sess
-                        .seal(&seed_to_upstream)
-                        .map(|f| write_record(&mut node_up, &f))
-                    {
-                        Ok(Ok(())) => total += seed_to_upstream.len(),
-                        _ => return total,
-                    }
+                let mut up = PendingWrite::new();
+                up.enqueue(&req_wire);
+                if !seed_wire.is_empty() {
+                    up.enqueue(&seed_wire);
                 }
+                let mut cbuf = [0u8; 8192];
+                let mut total = 0usize;
+                let mut client_open = true;
                 loop {
-                    match client_up.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            match tx_sess
-                                .seal(&buf[..n])
-                                .map(|f| write_record(&mut node_up, &f))
-                            {
-                                Ok(Ok(())) => total += n,
-                                _ => break,
-                            }
+                    let mut progressed = false;
+                    match up.try_write(&mut node_up) {
+                        Ok((_, n)) => {
+                            total += n;
+                            progressed |= n > 0;
                         }
                         Err(_) => break,
+                    }
+                    if client_open {
+                        match up.try_read(&mut client_up, &mut cbuf) {
+                            None => {}
+                            Some(Ok(0)) => client_open = false,
+                            Some(Ok(n)) => match tx_sess.seal(&cbuf[..n]) {
+                                Ok(wire) => {
+                                    up.enqueue(&wire);
+                                    progressed = true;
+                                }
+                                // fail-closed：不重试、不降级直连、不吞字节。
+                                Err(_) => break,
+                            },
+                            Some(Err(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Some(Err(_)) => client_open = false,
+                        }
+                    }
+                    // 半关闭：client EOF 且写队列排空 → 向节点发 FIN。
+                    if !client_open && up.ready_for_read() {
+                        let _ = sd_up.shutdown(std::net::Shutdown::Write);
+                        break;
+                    }
+                    if !progressed {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
                     }
                 }
                 total
             });
             let to_client = std::thread::spawn(move || {
+                let mut down = PendingWrite::new();
+                let mut rbuf = [0u8; 8192];
                 let mut total = 0usize;
-                while let Ok(frame) = read_record(&mut node_down) {
-                    match rx_sess.open(&frame) {
-                        Ok(plain) => {
-                            if client_down.write_all(&plain).is_err() {
-                                break;
-                            }
-                            total += plain.len();
+                let mut node_open = true;
+                loop {
+                    let mut progressed = false;
+                    match down.try_write(&mut client_down) {
+                        Ok((_, n)) => {
+                            total += n;
+                            progressed |= n > 0;
                         }
                         Err(_) => break,
+                    }
+                    if node_open {
+                        match down.try_read(&mut node_down, &mut rbuf) {
+                            None => {}
+                            Some(Ok(0)) => node_open = false,
+                            Some(Ok(n)) => match rx_sess.open(&rbuf[..n]) {
+                                Ok(plain) => {
+                                    if !plain.is_empty() {
+                                        down.enqueue(&plain);
+                                        progressed = true;
+                                    }
+                                }
+                                // fail-closed：AEAD/帧错误即终止该连接。
+                                Err(_) => break,
+                            },
+                            Some(Err(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Some(Err(_)) => node_open = false,
+                        }
+                    }
+                    // 半关闭：node EOF 且队列排空 → 向 client 发 FIN。
+                    if !node_open && down.ready_for_read() {
+                        let _ = sd_down.shutdown(std::net::Shutdown::Write);
+                        break;
+                    }
+                    if !progressed {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
                     }
                 }
                 total
