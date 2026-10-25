@@ -10,6 +10,8 @@
 //! - 连续 3 次 Refresh 失败 → 判定 warm backup 死亡，释放 Allocation 资源，
 //!   记录 WARN，流量保持在当前路径；
 //! - 状态机：`Disabled → Allocating → Active → Refreshing → Expired → Disabled`。
+//! - 固定端口只适合单 manager/单实例场景；生产双 manager 请用端口 0
+//!   （两个 manager 配同一固定端口时，后分配者 `EADDRINUSE` 并降级）。
 //!
 //! 可测试性：`TurnHandle` trait 把真实 `TurnClient` 与测试替身分成两个独立变化
 //! 维度（Deletion Test：真实 TURN 服务器与离线 mock 都需要被策略层驱动）。
