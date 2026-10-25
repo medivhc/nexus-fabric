@@ -92,6 +92,48 @@ def make_run(tmp, protocol, overrides, skip=(), only=None):
     return written
 
 
+def write_run_meta(tmp, **overrides):
+    meta = {
+        "run_id": "test-run",
+        "baseline": "abc123",
+        "spec_version": "v9.9",
+        "spec_sha256": "deadbeef",
+        "completed_items": [
+            {
+                "id": "P1",
+                "title": "transport batch write",
+                "result": "AnyTLS flipped",
+                "evidence": ["commit `aaa`"],
+            }
+        ],
+        "pending_items": [
+            {"id": "P0", "title": "safety", "note": "docs done; config pending"}
+        ],
+        "fix_branches": [
+            {
+                "name": "transport batch write",
+                "commit": "aaa",
+                "effect": "flipped AnyTLS",
+                "evidence": ["prediction-check step 2"],
+            }
+        ],
+    }
+    meta.update(overrides)
+    path = Path(tmp) / "analysis/run-meta.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    return path, meta
+
+
+def blocking_row(text, proto):
+    section = text.split("## 阻塞层、归属与修复后上限", 1)[1].split("**参照端生态**", 1)[0]
+    for line in section.splitlines():
+        if line.startswith(f"| {proto} |"):
+            return line
+    raise AssertionError(f"no blocking row for {proto}")
+
+
+
 class RecomputeTests(unittest.TestCase):
     def build(self, tmp):
         return recompute.build(str(tmp), str(MATRIX_PATH), allow_partial=False)
@@ -239,6 +281,120 @@ class RecomputeTests(unittest.TestCase):
             )
             with self.assertRaises(recompute.RecomputeError):
                 self.build(Path(tmp))
+
+    def test_run_meta_header_and_priority_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            meta_path, meta = write_run_meta(tmp)
+            make_run(tmp, "Vless", {})
+            payload, text = recompute.build(
+                str(tmp), str(MATRIX_PATH), allow_partial=True,
+                run_meta=meta, run_meta_path=str(meta_path),
+            )
+            self.assertIn("run `test-run`", text)
+            self.assertIn("baseline `abc123`", text)
+            self.assertIn("spec frozen v9.9", text)
+            self.assertIn("deadbeef", text)
+            self.assertNotIn("protocol-interop-verification", text)
+            self.assertIn("（P1，DONE）", text)
+            self.assertIn("commit `aaa`", text)
+            self.assertIn("（P0，待办）", text)
+            self.assertIn("config pending", text)
+
+    def test_blocking_table_derives_missing_cells_from_verdicts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            meta_path, meta = write_run_meta(tmp)
+            make_run(tmp, "Vless", {})
+            _, text = recompute.build(
+                str(tmp), str(MATRIX_PATH), allow_partial=True,
+                run_meta=meta, run_meta_path=str(meta_path),
+            )
+            row = blocking_row(text, "Vless")
+            self.assertIn("| 无（本 run 已修复", row)
+            self.assertIn("| 无 |", row)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            meta_path, meta = write_run_meta(tmp)
+            make_run(
+                tmp,
+                "Trojan",
+                {("Default", "UdpEcho"): {"status": "NOT_IMPLEMENTED", "cls": "E_NEXUS_NOT_IMPLEMENTED"}},
+            )
+            _, text = recompute.build(
+                str(tmp), str(MATRIX_PATH), allow_partial=True,
+                run_meta=meta, run_meta_path=str(meta_path),
+            )
+            row = blocking_row(text, "Trojan")
+            self.assertIn("UdpEcho(NOT_IMPLEMENTED,E_NEXUS_NOT_IMPLEMENTED)", row)
+
+    def test_p3_qualifiers_are_rendered_near_claims_and_cells(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            meta_path, meta = write_run_meta(tmp)
+            make_run(tmp, "Vless", {})
+            _, text = recompute.build(
+                str(tmp), str(MATRIX_PATH), allow_partial=True,
+                run_meta=meta, run_meta_path=str(meta_path),
+            )
+            self.assertIn("**结论 1 限定**", text)
+            self.assertIn("`USABLE` 指 TCP 产品路径", text)
+            self.assertIn("**测试广度**", text)
+            self.assertIn("REALITY、ws/grpc", text)
+            udp_line = next(
+                line for line in text.splitlines()
+                if line.startswith("| Default/UdpEcho |") and "MISSING" not in line
+            )
+            self.assertIn("crate 级，产品入口不可用", udp_line)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            meta_path, meta = write_run_meta(tmp)
+            make_run(tmp, "Anytls", {})
+            _, text = recompute.build(
+                str(tmp), str(MATRIX_PATH), allow_partial=True,
+                run_meta=meta, run_meta_path=str(meta_path),
+            )
+            self.assertIn("> AnyTLS：session 池/心跳定时器/padding 写路径未单独验。", text)
+            udp_line = next(
+                line for line in text.splitlines()
+                if line.startswith("| Default/UdpEcho |") and "MISSING" not in line
+            )
+            self.assertIn("crate 级，产品入口不可用", udp_line)
+
+    def test_fix_section_and_appendix_use_run_meta_and_actual_run_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            meta_path, meta = write_run_meta(tmp)
+            make_run(tmp, "Vless", {})
+            _, text = recompute.build(
+                str(tmp), str(MATRIX_PATH), allow_partial=True,
+                run_meta=meta, run_meta_path=str(meta_path),
+            )
+            self.assertIn("本 run 产生 verdict 翻转的修复条目", text)
+            self.assertIn("**transport batch write**（commit `aaa`）", text)
+            self.assertIn("flipped AnyTLS", text)
+            self.assertIn(f"--run-dir {tmp}", text)
+            self.assertIn(f"--run-meta {meta_path}", text)
+            self.assertNotIn("b7acb32", text)
+            self.assertIn("按证据 `nexus.commit` 派生：`x`（Vless）", text)
+
+    def test_run_meta_missing_fields_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run-meta.json"
+            path.write_text(json.dumps({"run_id": "x"}), encoding="utf-8")
+            with self.assertRaises(recompute.RecomputeError):
+                recompute.load_run_meta(str(path))
+
+    def test_without_run_meta_keeps_legacy_narrative(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            make_run(tmp, "Vless", {})
+            _, text = recompute.build(str(tmp), str(MATRIX_PATH), allow_partial=True)
+            self.assertIn("run `protocol-interop-verification`", text)
+            self.assertIn("b7acb32", text)
+            self.assertNotIn("**结论 1 限定**", text)
 
 
 if __name__ == "__main__":
