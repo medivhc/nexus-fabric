@@ -372,7 +372,11 @@ def main() -> int:
         "samples_with_complete_streams": complete,
         "pcap": pcap,
         "measure": {
-            "method": "first client->node TLS ApplicationData byte ts vs first node->client TLS ApplicationData byte ts (per TCP stream)",
+            "method": (
+                "per TCP stream: 头首字节 = 该流最后一条 client->node TLS ApplicationData 记录的时间戳"
+                "（TLS1.3 下 client Finished 同为 content_type=23，故取最后一条；产品在窗口内不再发字节）；"
+                "fallback 首字节 = 该流第一条晚于头记录的 node->client TLS ApplicationData 记录时间戳"
+            ),
             "delta_ms_median": deltas[len(deltas) // 2],
             "delta_ms_p99": p99,
             "delta_ms_max": deltas[-1],
