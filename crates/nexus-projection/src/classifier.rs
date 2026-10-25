@@ -344,6 +344,77 @@ mod tests {
         );
     }
 
+    /// P6-c：`classify_explained` 与 `classify` 同一决策，额外透出规则说明；
+    /// mesh/bypass 快路径不经规则引擎 → `None`。
+    #[test]
+    fn s29_classify_explained_surfaces_rule_provenance() {
+        let m = PathManager::new(Default::default());
+        let c = classifier(&m, &[]);
+
+        let proxy_pkt = v4_packet([1, 2, 3, 4]);
+        let (classification, explanation) = c.classify_explained(&proxy_pkt, None);
+        assert_eq!(classification, c.classify(&proxy_pkt, None));
+        assert_eq!(
+            classification,
+            Classification::Proxy {
+                outbound: "p1".to_string()
+            }
+        );
+        let explanation = explanation.expect("rule hit carries an explanation");
+        assert_eq!(explanation.matched_rule, "IP-CIDR,0.0.0.0/0");
+
+        let (mesh, explanation) = c.classify_explained(&v4_packet([10, 1, 2, 3]), None);
+        assert!(matches!(mesh, Classification::Mesh { .. }));
+        assert!(
+            explanation.is_none(),
+            "mesh fast path skips the rule engine"
+        );
+
+        let (direct, explanation) = c.classify_explained(&v4_packet([192, 168, 1, 1]), None);
+        assert_eq!(direct, Classification::Direct);
+        assert!(
+            explanation.is_none(),
+            "bypass fast path skips the rule engine"
+        );
+    }
+
+    /// P6-c：取说明不额外再跑一遍规则引擎（每次决策一次引擎调用）。
+    #[test]
+    fn s29_classify_explained_calls_rule_engine_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counting(Arc<AtomicUsize>);
+        impl RuleEngine for Counting {
+            fn decide(&self, _req: &RouteRequest<'_>) -> RouteTarget {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                RouteTarget::Egress {
+                    peer: "p1".to_string(),
+                }
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rules = Counting(Arc::clone(&calls));
+        let m = PathManager::new(Default::default());
+        let c = PacketClassifier::new(vec![], vec![], &rules, false, &m, &[], 0.0);
+        let (classification, explanation) = c.classify_explained(&v4_packet([1, 2, 3, 4]), None);
+        assert_eq!(
+            classification,
+            Classification::Proxy {
+                outbound: "p1".to_string()
+            }
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "one engine call per decision"
+        );
+        // 默认 `explain` 不提供说明，不得因此再跑一次 `decide`。
+        assert!(explanation.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn s29_non_ipv4_drop() {
         let m = PathManager::new(Default::default());
