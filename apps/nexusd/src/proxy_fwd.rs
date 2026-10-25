@@ -316,6 +316,33 @@ impl ProxyEngine {
         out
     }
 
+    /// 写回 TUN 前的 fixup（P6-a 归属：Proxy 流归本引擎的终结器）。
+    ///
+    /// Proxy TCP 连接的 orig_dst 只登记在 `ProxyEngine.terminator`（§9.10.1
+    /// 两个终结器之一），dataplane 自己的连接表查不到它们；因此这条路径的
+    /// `fixup_tun_packet` 必须在这里执行，不能借道
+    /// `Dataplane::write_tun_packets`。非 TCP 包（UDP 回包由
+    /// `build_udp_reply` 合成，源地址已是原始目的）原样透传。
+    ///
+    /// 返回 (fixup 后的可写包, 丢弃数)；TCP 包查不到连接 → 丢弃计数
+    /// （与 `Dataplane::write_tun_packets` 同语义）。
+    pub fn fixup_tun_packets(&self, pkts: Vec<Vec<u8>>) -> (Vec<Vec<u8>>, u64) {
+        let mut ready = Vec::with_capacity(pkts.len());
+        let mut dropped = 0u64;
+        for pkt in pkts {
+            let is_tcp = pkt.len() >= 20 && pkt[9] == 6;
+            if !is_tcp {
+                ready.push(pkt);
+                continue;
+            }
+            match self.terminator.fixup_tun_packet(&pkt) {
+                Some(fixed) => ready.push(fixed),
+                None => dropped += 1,
+            }
+        }
+        (ready, dropped)
+    }
+
     /// 合并统计。
     pub fn stats(&self) -> ProxyFwdStats {
         let mut stats = self.tcp.stats();

@@ -1217,25 +1217,13 @@ impl Dataplane {
                     .map(|e| e.handle_packet(&packet, outbound));
                 match outcome {
                     Some(Ok(result)) => {
-                        for pkt in result.tun_packets {
-                            if self.tun.write(&pkt).is_ok() {
-                                self.with_stats(|s| s.tun_written += 1);
-                            } else {
-                                self.with_stats(|s| s.dropped += 1);
-                            }
-                        }
+                        self.write_proxy_tun_packets(result.tun_packets);
                         let more = self
                             .proxy_engine
                             .as_mut()
                             .map(|e| e.poll().tun_packets)
                             .unwrap_or_default();
-                        for pkt in more {
-                            if self.tun.write(&pkt).is_ok() {
-                                self.with_stats(|s| s.tun_written += 1);
-                            } else {
-                                self.with_stats(|s| s.dropped += 1);
-                            }
-                        }
+                        self.write_proxy_tun_packets(more);
                         if packet.get(9) == Some(&17) && result.forwarded {
                             self.with_stats(|s| s.proxy_forwarded += 1);
                         }
@@ -1490,22 +1478,18 @@ impl Dataplane {
                 }
             }
             Classification::Proxy { ref outbound } => {
-                if let Some(engine) = self.proxy_engine.as_mut() {
-                    match engine.handle_packet(packet, outbound) {
-                        Ok(result) => {
-                            for pkt in result.tun_packets {
-                                if self.tun.write(&pkt).is_ok() {
-                                    self.with_stats(|s| s.tun_written += 1);
-                                }
-                            }
-                            if result.forwarded {
-                                self.with_stats(|s| s.proxy_forwarded += 1);
-                            }
+                let outcome = self
+                    .proxy_engine
+                    .as_mut()
+                    .map(|e| e.handle_packet(packet, outbound));
+                match outcome {
+                    Some(Ok(result)) => {
+                        self.write_proxy_tun_packets(result.tun_packets);
+                        if result.forwarded {
+                            self.with_stats(|s| s.proxy_forwarded += 1);
                         }
-                        Err(_) => self.with_stats(|s| s.proxy_dropped_no_proxy += 1),
                     }
-                } else {
-                    self.with_stats(|s| s.proxy_dropped_no_proxy += 1);
+                    Some(Err(_)) | None => self.with_stats(|s| s.proxy_dropped_no_proxy += 1),
                 }
             }
             _ => {
@@ -1770,6 +1754,30 @@ impl Dataplane {
             self.with_stats(|s| s.tun_written += written);
         }
         written
+    }
+
+    /// P6-a：Proxy 路径写回。fixup 由拥有该流的 `ProxyEngine` 终结器执行
+    /// （Proxy 连接不登记在 `Dataplane.tcp` 中，借道 `write_tun_packets`
+    /// 会全部查不到连接而整批丢弃）；本方法只负责写 TUN 与计数。
+    fn write_proxy_tun_packets(&mut self, pkts: Vec<Vec<u8>>) {
+        let (ready, dropped) = match self.proxy_engine.as_ref() {
+            Some(engine) => engine.fixup_tun_packets(pkts),
+            None => (Vec::new(), pkts.len() as u64),
+        };
+        if dropped > 0 {
+            self.with_stats(|s| s.dropped += dropped);
+        }
+        let mut written = 0u64;
+        for pkt in ready {
+            if self.tun.write(&pkt).is_err() {
+                self.with_stats(|s| s.dropped += 1);
+            } else {
+                written += 1;
+            }
+        }
+        if written > 0 {
+            self.with_stats(|s| s.tun_written += written);
+        }
     }
 
     /// S3–S7：收获终结器事件并按分类分发。
