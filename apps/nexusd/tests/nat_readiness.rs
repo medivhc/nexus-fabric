@@ -15,14 +15,24 @@
 //! the test prints `SKIP: ...` and returns (never a fake PASS).
 
 use std::io::{BufRead, BufReader, Read};
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
+use nexus_connectivity::nat::NatType;
+use nexus_fabric::{Driver, PeerId as FabricPeerId};
+use nexus_nat_traversal::{
+    DefaultPredictor, LocalCandidates, PortSample, Predictability, PunchConfig, PunchPredictor,
+};
+use nexus_nat_wireup::{PunchManager, SystemPunchClock};
 use nexus_turn::client::TurnCredentials;
 use nexus_turn::server::TurnServer;
+use nexus_turn::stun::{Attribute, StunMessage};
+use nexusd::nat_stun::{StunProber, UdpStunTransport};
 
 const TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const PEER_ID: &str = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
@@ -333,5 +343,135 @@ fn p3_config_invalid_bind_exits_1() {
     assert!(
         stderr.contains("bind_addr invalid"),
         "specific bind_addr error missing; stderr:\n{stderr}"
+    );
+}
+
+/// Sequential-allocation STUN responder: every Binding response advances the
+/// shared public port by 1 (starting at 40000).
+fn spawn_stun_responder(counter: Arc<AtomicU16>) -> SocketAddr {
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("bind STUN responder");
+    let addr = socket.local_addr().expect("responder addr");
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1500];
+        while let Ok((n, from)) = socket.recv_from(&mut buf) {
+            let Ok(request) = nexus_turn::stun::decode(&buf[..n]) else {
+                continue;
+            };
+            if request.msg_type != 0x0001 {
+                continue;
+            }
+            let port = counter.fetch_add(1, Ordering::SeqCst);
+            let public = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+            let response = StunMessage {
+                msg_type: 0x0101, // Binding Success Response
+                txn: request.txn,
+                attrs: vec![Attribute::XorMappedAddress(public)],
+            }
+            .encode();
+            let _ = socket.send_to(&response, from);
+        }
+    });
+    addr
+}
+
+/// P1-AC3 (Wave A): production `probe_pair` samples -> Predictable -> a punch
+/// attempt emits at least one prediction hint.
+///
+/// The production `sample_round` lives in `main.rs` (Wave B); Wave A reproduces
+/// its fixed rule in-test (two samples per round, `s1,s2` interleaved, one
+/// `observed_from`). The punch result may be `StayedOnRelay{Timeout}` — the
+/// assertion is the hint emission, not a successful migration.
+#[test]
+fn p1_prediction_hint_from_production_samples() {
+    if !udp_loopback_available() {
+        eprintln!("SKIP: loopback UDP unavailable in this environment");
+        return;
+    }
+
+    let counter = Arc::new(AtomicU16::new(40_000));
+    let server1 = spawn_stun_responder(counter.clone());
+    let server2 = spawn_stun_responder(counter.clone());
+
+    let transport = UdpStunTransport::new("127.0.0.1:0".parse().expect("valid bind"))
+        .expect("bind STUN transport");
+    let mut prober = StunProber::new(Box::new(transport));
+    let mut samples = Vec::new();
+    for round in 0..3u64 {
+        let (m1, m2, _nat) = prober.probe_pair(server1, server2).expect("probe pair");
+        assert_eq!(m1.local, m2.local, "samples must share one observed_from");
+        for (mapping, target) in [(&m1, server1), (&m2, server2)] {
+            samples.push(PortSample {
+                port: mapping.public.port(),
+                at_ms: round * 100,
+                target,
+                observed_from: mapping.local,
+            });
+        }
+    }
+    let ports: Vec<u16> = samples.iter().map(|s| s.port).collect();
+    assert_eq!(ports, vec![40_000, 40_001, 40_002, 40_003, 40_004, 40_005]);
+    let observed = samples[0].observed_from;
+    assert!(samples.iter().all(|s| s.observed_from == observed));
+    assert_eq!(
+        DefaultPredictor.assess(&samples),
+        Predictability::Predictable {
+            base_port: 40_005,
+            delta: 1,
+        }
+    );
+
+    // Real loopback relay connection between two fabric drivers.
+    let driver_b =
+        Driver::new_server("127.0.0.1:0".parse().expect("valid addr")).expect("bind driver B");
+    let b_addr = *driver_b.shared().local_addr.lock().expect("B local addr");
+    let b_id = driver_b.shared().peer_id.expect("B has identity");
+    let driver_a = Driver::new_client().expect("driver A");
+    let a_addr = *driver_a.shared().local_addr.lock().expect("A local addr");
+    // Larger than any random server identity → deterministic "we win" tie-break
+    // (avoids the 10s adopt-verified-direct wait; the hint assertion is the point).
+    let a_id = FabricPeerId([0xFF; 32]);
+
+    let accept_driver = driver_b.clone();
+    let accept = std::thread::spawn(move || accept_driver.accept_conn());
+    let conn_a = driver_a
+        .connect(b_id, b_addr, Duration::from_secs(10))
+        .expect("A relay connect");
+    let conn_b = accept
+        .join()
+        .expect("accept thread")
+        .expect("B relay accept");
+
+    let manager_a = PunchManager::new(driver_a.clone(), a_id, Arc::new(SystemPunchClock::new()));
+    let manager_b = PunchManager::new(driver_b.clone(), b_id, Arc::new(SystemPunchClock::new()));
+    let local_a = LocalCandidates {
+        host: vec![a_addr],
+        srflx: None,
+        srflx_stun: None,
+        srflx_turn: None,
+        nat_type: NatType::RestrictedCone,
+    };
+    let local_b = LocalCandidates {
+        host: vec![b_addr],
+        srflx: None,
+        srflx_stun: None,
+        srflx_turn: None,
+        nat_type: NatType::RestrictedCone,
+    };
+    manager_a.set_local(local_a, samples);
+    manager_b.set_local(local_b, Vec::new());
+    manager_b.register_relay(&conn_b, a_id);
+
+    let config = PunchConfig {
+        punch_timeout: Duration::from_millis(500),
+        ..PunchConfig::default()
+    };
+    let _ = manager_a.punch_peer(&conn_a, b_id, NatType::RestrictedCone, config);
+
+    let status = manager_a
+        .status(&b_id)
+        .expect("punch attempt must publish peer status");
+    assert!(
+        status.prediction_hints_sent_total >= 1,
+        "production samples must produce a prediction hint; status={status:?}"
     );
 }
