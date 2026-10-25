@@ -39,6 +39,6 @@ pub mod tproxy;
 pub mod tun;
 pub mod tun_vpi;
 
-pub use assemble::{CleanupReport, OsAssemble, OsAssembleConfig};
+pub use assemble::{CleanupReport, ExcludeEgress, OsAssemble, OsAssembleConfig};
 pub use secure_store::FileSecureStore;
 pub use tun_vpi::TunVpi;
