@@ -1,6 +1,6 @@
 //! 节点优先级选择（内存骨架）。
 //!
-//! 本模块是 delivery 层共享底座的节点优先级骨架：
+//! 本模块是 v9 CLI 产品线运行时（frozen）的节点优先级骨架：
 //! - **优先级**：每个节点可注册一个优先级（0-100，越小越优先）；
 //! - **路由候选**：`RouteCandidate` 聚合 node_id + priority + latency + bandwidth；
 //! - **选择器**：`PrioritySelector` 维护 node_id → priority 映射，并按多键排序选最优路由。

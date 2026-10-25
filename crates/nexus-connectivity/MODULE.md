@@ -4,9 +4,13 @@
 
 提供 Connectivity Evaluation、Link Establishment、NAT Traversal、Hole Punching、Assisted/Relay Fallback 与 Link State。
 
+本 crate 是 v9 CLI 产品线的运行时；不为其他产品线提供共享基础层。
+
 ## Non-Responsibilities
 
 不选择业务 Resource Provider，不拥有 Workspace/Compute 业务策略。
+
+不承载新地基栈（N1）的任何演进；不为新栈提供共享类型（跨栈词汇见 nexus-domain / nexus-proxy-config / nexus-qos / nexus-session）。
 
 ## Inputs
 
@@ -24,12 +28,39 @@
 - `nexus-domain`（仅 `evaluation` 模块：`ConnectivityEvaluation` DTO 输出词汇）
 - `nexus-measurement`（仅 `evaluation` 模块：`LinkMeasurement` 事实输入）
 
+（P3 起将新增 `nexus-qos`，届时 CAKE 与令牌桶作为叶子 crate 下沉；本轮不加。）
+
 ## Forbidden Dependencies
 
 - `engineering/` 下的 Harness/Plugin。
 - 未在 `policies/architecture.toml` 声明的 Nexus 内部 crate。
 - Portable 模块中的平台专有 Framework/API。
 - 通过“便利”依赖绕过公开领域边界。
+- 任何 N1 运行时 crate 对本 crate 的反向依赖（方向性禁令，机器判据见 policies/architecture.toml [dual_stack]，P5 落地）。
+
+## Lifecycle
+
+**状态**：frozen（2026-10-26 划界，C 案；裁决 MSR-dualstack-path-20261026，细化 Q4）。
+
+**允许的变更**（判据 F1–F7，全部满足）
+- 缺陷修复：有 Red Evidence 证明现有行为违反已冻结契约/场景；不改 expectation。
+- 安全修复：panic / 越界 / 凭证泄露 / 权限绕过。
+- 崩溃一致性修复：可达性/持久化违反 §15（含 links.json / 会话状态）。
+- 依赖安全升级：不改公开 API 语义，通过 dependency-governance。
+
+**禁止的变更**
+- 新功能、新模块、新 pub API、新协议/线格式/持久化字段。
+- 任何新的入边（依赖本 crate 的新包或新 crate）。
+- 以“修复”为名修改冻结场景 expectation 或降低门禁强度。
+
+**机械锚点**
+- 依赖边：`cargo metadata --no-deps` 的直接依赖方集合 ==
+  `policies/architecture.toml [dual_stack] allowed_dependents ∪ allow.crate`（gate 判）。
+- 源码：允许依赖方之外的任何包 `src/**/*.rs` 中 `nexus_connectivity` 命中数 = 0。
+- 场景：`carrier = "v9-connectivity"` 的场景集合只减不增（索引 gate 判）。
+- 证据：改动必须带 Red Evidence（E2/E4）+ 独立 Review（AGENTS §19.1）。
+
+> `[dual_stack]` gate 与 carrier 索引由 P5/P4 交付；在此之前以 `policies/architecture.toml` 的 allowed 列表 + 独立 Review 人工核对。
 
 ## Invariants
 
@@ -158,7 +189,7 @@ NAT/中继场景的物理建连（组合根 transport::connect）发生在激活
 
 ### 冻结契约（tunnel 级双向打洞状态机 P4.2，PRODUCT §12.9.3）
 
-> 退役记录（2026-10-18，#1 运行时所有权归一）：本节提及的 `HolePuncher::punch` 已删除；tunnel 级打洞状态机本身（`VirtualSubnetTunnel` + `VirtualSubnetEvent::HolePunch*`）仍在生产使用，未受影响。
+> 退役记录（2026-10-18，#1 运行时所有权归一）：本节提及的 `HolePuncher::punch` 已删除；tunnel 级打洞状态机本身（`VirtualSubnetTunnel` + `VirtualSubnetEvent::HolePunch*`）仍在生产使用，未受影响。（2026-10-26 复核：`HolePuncher::punch` 已删除，非 deprecated；10-06 审计快照该行按过时登记，见 `docs/DOC-AUDIT-2026-10-26-dual-stack.md`）
 
 - `HolePunchConfig { max_attempts: u32 = 10, attempt_timeout: Duration = 500ms,
   magic: [u8;4] = b"NXHP" }`（默认总预算 ~5s，与 `HolePuncher::punch` 对齐）。

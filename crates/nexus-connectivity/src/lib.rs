@@ -1,15 +1,23 @@
-//! nexus-connectivity
+//! nexus-connectivity — **v9 CLI 产品线专属运行时（frozen，2026-10-26 划界）**
 //!
-//! 提供 Connectivity Evaluation、Link Establishment、NAT Traversal、Hole Punching、
-//! Assisted/Relay Fallback 与 Link State。
+//! 本 crate 是 v9 时代 `nexus`（CLI）产品线的建连与组网运行时本体：虚拟子网隧道、
+//! bootstrap 入网、relay / FIB、mesh DNS、链路加密、QoS 控制器等能力由 CLI 的
+//! `subnet` / `mesh` / `proxy` / `connectivity` 命令面直接消费。
 //!
-//! 本 crate 是 **delivery 层共享底座**（ARCHITECTURE §11 Delivery Infrastructure）：
-//! - 保持领域中立：不持有 Plan/Session/Provider 等业务对象，不依赖
-//!   Planner/Session/Workspace 等业务逻辑层，只处理 locator / endpoint /
-//!   认证门控等传输语义；`evaluation` 模块为输出 DTO 而依赖 `nexus-domain`
-//!   的共享词汇（`ConnectivityEvaluation`），属于 DTO 依赖而非业务依赖；
-//! - 拒绝反向依赖 Workspace / Compute / Service 业务逻辑；
-//! - 规划（Plan）由 Planner 产出，本层只负责"按 locator 建连"并返回状态机结果。
+//! ## 演进纪律
+//! - **只修缺陷**：缺陷修复必须有 Red Evidence（现有行为违反既有契约或场景）；
+//!   安全修复、崩溃一致性修复按同一纪律（判据 F1–F7 见 MODULE.md `Lifecycle`）。
+//! - **禁入**：新功能、新模块、新 pub API、新协议/线格式字段、任何新入边。
+//! - **新栈不得依赖本 crate**：N1 运行时面（nexus-fabric / nexus-path /
+//!   nexus-nat-* / nexus-projection / nexus-network / nexus-dns / nexusd /
+//!   nexus-outbound-*）对本 crate 的直接依赖边必须为 0；
+//!   跨栈共享词汇在 `nexus-domain`（NAT 词汇、`ConnectivityEvaluation` DTO）、
+//!   `nexus-proxy-config`（出站身份/交接词汇）、`nexus-session`（durable record）、
+//!   `nexus-qos`（包调度与令牌桶；P3 落地）。
+//!
+//! 历史自述「delivery 层共享基础设施（`ARCHITECTURE.md` §11）」已失效：Delivery
+//! Infrastructure 的现实口径见 `ARCHITECTURE.md` §6（§11 是代理内核产品线，
+//! 旧引用本身有误）。
 //!
 //! 最小闭环（吸收开源标杆 WireGuard 的 W12：认证后才允许建连/改 Locator）：
 //! - `establish` 为确定性纯函数，相同输入必然相同输出；

@@ -1,6 +1,6 @@
 //! 自动断线重连（指数退避状态机骨架，内存确定性）。
 //!
-//! 本模块是 delivery 层共享底座的重连策略骨架：
+//! 本模块是 v9 CLI 产品线运行时（frozen）的重连策略骨架：
 //! - **指数退避**：`ReconnectController` 在每次断线/失败后按
 //!   `min(initial_delay * factor^(n-1), max_delay)` 计算下一次重连应等待的延迟，
 //!   不阻塞、不 sleep、不读墙钟；

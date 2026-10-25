@@ -1,6 +1,6 @@
 //! 带宽控制 / QoS（令牌桶限流骨架，内存确定性）。
 //!
-//! 本模块是 delivery 层共享底座的流量整形骨架：
+//! 本模块是 v9 CLI 产品线运行时（frozen）的流量整形骨架：
 //! - **令牌桶**：`TokenBucket` 按固定字节速率向桶内补充令牌（上限 `burst_size`），
 //!   `try_consume(bytes, now)` 够令牌则扣减并放行，不够直接拒绝（不阻塞、不 sleep）；
 //! - **可注入时钟**：`QosClock` trait 抽象单调时间；真实实现基于 `std::time::Instant`，
