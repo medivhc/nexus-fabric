@@ -14,6 +14,7 @@
 //! TCP 命令 + 目标地址）与响应头（version 0 + 空 addon），随后双向透明中继。
 //!
 //! 离线、确定性；server/echo/proxy 任务用 std::thread 并 join 回收，不丢 JoinHandle。
+//! 驱动侧所有 socket 都带读/写超时，任何回归都表现为有界 FAIL 而不是无界挂死。
 //! 旧实现（vless 走 ConnectivityEstablishmentFailed 兜底）下 proxy 返回结构化失败
 //! -> 本 example 映射为 verdict=FAIL（Red Evidence）。
 
@@ -24,6 +25,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::Duration;
 
 use nexus::proxy_serve_once;
 use nexus_outbound_vless::{
@@ -34,27 +36,48 @@ use nexus_outbound_vless::{
 const UUID: &str = "123e4567-e89b-12d3-a456-426614174000";
 const PAYLOAD: &[u8] = b"ping-via-vless-tunnel";
 
-/// VLESS 请求头增量解析：读到完整请求头为止，返回 `(req, consumed)`。
+/// 驱动侧 socket 的读/写超时：把挂死转成有界失败。
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 给阻塞 socket 套上读/写超时。
+fn bound_stream(stream: &TcpStream, who: &str) -> Result<(), String> {
+    stream
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .map_err(|e| format!("{who}: set read timeout: {e}"))?;
+    stream
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .map_err(|e| format!("{who}: set write timeout: {e}"))?;
+    Ok(())
+}
+
+/// 读到「完整请求头 + 全部首载荷」为止，再返回解析出的 `(req, consumed)`。
+///
+/// 把「请求头与首载荷在同一次 read 里到达」(coalesce) 从时序侥幸变成确定性前提：
+/// 驱动不再依赖 accept 轮询延迟，回归断言也不会因 TCP 分段差异而漂移。
 /// 只使用公开 API（decode_request），不假设 TCP 分段边界。
-fn read_vless_header(
+fn read_vless_request(
     stream: &mut TcpStream,
     buf: &mut Vec<u8>,
 ) -> Result<(VlessRequest, usize), String> {
     let mut chunk = [0u8; 256];
     loop {
         match decode_request(buf) {
-            Ok((req, consumed)) => return Ok((req, consumed)),
-            Err(nexus_outbound_vless::VlessError::TruncatedHeader) => {
-                let n = stream
-                    .read(&mut chunk)
-                    .map_err(|e| format!("vless node read header: {e}"))?;
-                if n == 0 {
-                    return Err("vless: client closed before request header complete".to_string());
-                }
-                buf.extend_from_slice(&chunk[..n]);
+            Ok((req, consumed)) if buf.len() >= consumed + PAYLOAD.len() => {
+                return Ok((req, consumed));
             }
+            Ok(_) => {}
+            Err(nexus_outbound_vless::VlessError::TruncatedHeader) => {}
             Err(e) => return Err(format!("vless: bad request header: {e}")),
         }
+        let n = stream
+            .read(&mut chunk)
+            .map_err(|e| format!("vless node read header+payload: {e}"))?;
+        if n == 0 {
+            return Err(
+                "vless: client closed before request header + payload complete".to_string(),
+            );
+        }
+        buf.extend_from_slice(&chunk[..n]);
     }
 }
 
@@ -82,6 +105,8 @@ fn main() {
         let Some(mut conn) = conn else {
             return Ok(());
         };
+        conn.set_read_timeout(Some(IO_TIMEOUT))?;
+        conn.set_write_timeout(Some(IO_TIMEOUT))?;
         let mut buf = vec![0u8; PAYLOAD.len()];
         conn.read_exact(&mut buf)?;
         conn.write_all(&buf)
@@ -114,11 +139,22 @@ fn main() {
         let mut tcp = cli.ok_or("no vless node connection within window")?;
         // Windows: accepted socket inherits listener nonblocking; restore blocking.
         tcp.set_nonblocking(false).map_err(|e| e.to_string())?;
+        bound_stream(&tcp, "vless node")?;
         node_connected_clone.store(true, Ordering::SeqCst);
 
-        // VLESS 请求头 -> 解析目标
+        // VLESS 请求头 -> 解析目标（先攒够请求头 + 首载荷，coalesce 确定性）
         let mut buf = Vec::new();
-        let (req, _consumed) = read_vless_header(&mut tcp, &mut buf)?;
+        let (req, consumed) = read_vless_request(&mut tcp, &mut buf)?;
+        // 回归断言：与请求头同批到达的字节必须逐字节等于客户端 payload，不得被破坏。
+        if buf.len() < consumed + PAYLOAD.len()
+            || &buf[consumed..consumed + PAYLOAD.len()] != PAYLOAD
+        {
+            return Err(format!(
+                "node: pipelined payload after request header is not intact (buf_len={} consumed={})",
+                buf.len(),
+                consumed
+            ));
+        }
         if req.uuid != uuid {
             return Err("vless: uuid mismatch".to_string());
         }
@@ -142,11 +178,27 @@ fn main() {
 
         // 真实 connect 到 loopback echo 目标
         let mut echo = TcpStream::connect(echo_addr).map_err(|e| e.to_string())?;
+        bound_stream(&echo, "node->echo")?;
 
         // 读 payload（proxy 中继自 SOCKS5 client）-> 明文写给 echo
-        let mut payload = vec![0u8; PAYLOAD.len()];
-        tcp.read_exact(&mut payload)
-            .map_err(|e| format!("vless payload read: {e}"))?;
+        // 现行为（本 commit 保留）：payload 只从后续 socket read 取，与请求头同批
+        // 到达的 `buf[consumed..]` 弃之不用 -> 下面这次 read 有界超时，回归失败可见。
+        let mut payload: Vec<u8> = Vec::new();
+        if payload.len() < PAYLOAD.len() {
+            let mut rest = vec![0u8; PAYLOAD.len() - payload.len()];
+            tcp.read_exact(&mut rest).map_err(|e| {
+                format!(
+                    "node: ASSERT FAILED - no pipelined payload after the request header \
+                     (buf[consumed..] must seed the payload); socket read failed: {e}"
+                )
+            })?;
+            payload.extend_from_slice(&rest);
+        }
+        assert_eq!(
+            payload.as_slice(),
+            PAYLOAD,
+            "node: payload forwarded to echo differs from the client payload"
+        );
         echo.write_all(&payload).map_err(|e| e.to_string())?;
 
         // 读 echo 回显 -> 回写 client
@@ -190,6 +242,7 @@ fn main() {
 
     // --- 原始 SOCKS5 客户端：NO-AUTH 问候 + CONNECT echo + payload + 回显比对 ---
     let mut client = TcpStream::connect(proxy_addr).expect("connect proxy");
+    bound_stream(&client, "socks5 client").expect("client io timeouts");
     let auth_ok = client.write_all(&[0x05, 0x01, 0x00]).is_ok_and(|()| {
         let mut reply = [0u8; 2];
         client
@@ -231,13 +284,20 @@ fn main() {
         }
     };
 
-    // VLESS 节点线程允许超时退出（旧实现不会连接节点）；超时路径 target_delivered_ok 为 false。
+    // VLESS 节点线程在旧实现下不会连接节点；失败路径 target_delivered_ok 为 false。
+    // 节点错误必须进入输出/日志，否则 Red Evidence 只剩 echo 侧的次生失败。
     let node_res = node_thread.join().expect("join node");
-    let (node_port, node_label) = match node_res {
-        Ok((p, l)) => (p, l),
-        Err(_) => (0, String::new()),
+    let (node_port, node_label, node_error) = match node_res {
+        Ok((p, l)) => (p, l, None),
+        Err(e) => {
+            eprintln!("vless node failed: {e}");
+            (0, String::new(), Some(e))
+        }
     };
-    echo_thread.join().expect("join echo").expect("echo once");
+    // 节点失败时 echo 目标拿不到 payload（有界读超时）属预期，不能让 driver 自身 panic。
+    if let Err(e) = echo_thread.join().expect("join echo") {
+        eprintln!("echo target failed: {e}");
+    }
 
     if let Some(obj) = out.as_object_mut() {
         let target_delivered_ok = node_port == echo_addr.port();
@@ -255,6 +315,7 @@ fn main() {
                 "connected": node_connected.load(Ordering::SeqCst),
                 "target_delivered_ok": target_delivered_ok,
                 "target_label": node_label,
+                "error": node_error,
             }),
         );
         let ok = auth_ok
