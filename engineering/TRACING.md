@@ -1,5 +1,7 @@
 # Nexus tracing design
 
+> 状态注记（2026-10-26）：本文多处以 `nexus-diagnostics` 为共享可观测词汇/契约的归属 crate。该 crate 已随 dual-stack-convergence run 删除（7 行零实现占位、零依赖方，用户 2026-10-26 批准）；文中归属安排随之失效，共享可观测词汇的归属待后续 run 重新指定。
+
 ## Goal
 
 Add request/session/path-level causal tracing without turning log text into domain semantics or introducing reverse dependencies from domain crates into diagnostics.

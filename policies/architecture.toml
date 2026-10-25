@@ -22,7 +22,7 @@ layer = "portable-core"
 
 [[crate]]
 name = "nexus-control-api"
-allowed_internal_dependencies = ["nexus-domain", "nexus-proto"]
+allowed_internal_dependencies = ["nexus-domain"]
 portable = false
 layer = "portable-core"
 
@@ -40,7 +40,7 @@ layer = "portable-core"
 
 [[crate]]
 name = "nexus-connectivity"
-allowed_internal_dependencies = ["nexus-delivery", "nexus-platform", "nexus-domain", "nexus-measurement"]
+allowed_internal_dependencies = ["nexus-platform", "nexus-domain", "nexus-measurement"]
 portable = false
 layer = "delivery"
 
@@ -105,26 +105,20 @@ portable = true
 layer = "portable-core"
 
 [[crate]]
-name = "nexus-delivery"
-allowed_internal_dependencies = ["nexus-domain"]
-portable = true
-layer = "delivery"
-
-[[crate]]
 name = "nexus-transport"
-allowed_internal_dependencies = ["nexus-delivery", "nexus-platform"]
+allowed_internal_dependencies = ["nexus-platform"]
 portable = false
 layer = "delivery"
 
 [[crate]]
 name = "nexus-network"
-allowed_internal_dependencies = ["nexus-domain", "nexus-policy", "nexus-planner", "nexus-session", "nexus-delivery", "nexus-dns", "nexus-platform"]
+allowed_internal_dependencies = ["nexus-domain", "nexus-policy", "nexus-planner", "nexus-session", "nexus-dns", "nexus-platform"]
 portable = false
 layer = "domain-runtime"
 
 [[crate]]
 name = "nexus-service"
-allowed_internal_dependencies = ["nexus-domain", "nexus-session", "nexus-delivery"]
+allowed_internal_dependencies = ["nexus-domain", "nexus-session"]
 portable = false
 layer = "domain-runtime"
 
@@ -136,7 +130,7 @@ layer = "domain-runtime"
 
 [[crate]]
 name = "nexus-workspace"
-allowed_internal_dependencies = ["nexus-domain", "nexus-session", "nexus-delivery", "nexus-storage", "nexus-platform"]
+allowed_internal_dependencies = ["nexus-domain", "nexus-session", "nexus-storage", "nexus-platform"]
 portable = false
 layer = "domain-runtime"
 
@@ -148,7 +142,7 @@ layer = "domain-runtime"
 
 [[crate]]
 name = "nexus-compute"
-allowed_internal_dependencies = ["nexus-domain", "nexus-session", "nexus-delivery", "nexus-workspace"]
+allowed_internal_dependencies = ["nexus-domain", "nexus-session", "nexus-workspace"]
 portable = false
 layer = "domain-runtime"
 
@@ -193,18 +187,6 @@ name = "nexus-platform-ios"
 allowed_internal_dependencies = ["nexus-platform"]
 portable = false
 layer = "platform-adapter"
-
-[[crate]]
-name = "nexus-diagnostics"
-allowed_internal_dependencies = ["nexus-domain"]
-portable = false
-layer = "portable-core"
-
-[[crate]]
-name = "nexus-proto"
-allowed_internal_dependencies = []
-portable = true
-layer = "portable-core"
 
 [[crate]]
 name = "nexus-outbound-shadowsocks"

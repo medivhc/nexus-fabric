@@ -20,7 +20,6 @@
 
 ## Allowed Dependencies
 
-- `nexus-delivery`
 - `nexus-platform`
 - `nexus-domain`（仅 `evaluation` 模块：`ConnectivityEvaluation` DTO 输出词汇）
 - `nexus-measurement`（仅 `evaluation` 模块：`LinkMeasurement` 事实输入）

@@ -80,27 +80,25 @@ nexus-auth          --> nexus-domain
 nexus-measurement   --> nexus-domain
 nexus-session       --> nexus-domain
 nexus-storage       --> nexus-domain
-nexus-diagnostics   --> nexus-domain
 
 nexus-discovery     --> nexus-domain / nexus-registry / nexus-platform
 
 nexus-planner       --> nexus-domain / nexus-registry / nexus-measurement
 
-nexus-delivery      --> nexus-domain
-nexus-connectivity  --> nexus-delivery / nexus-platform
-nexus-transport     --> nexus-delivery / nexus-platform
+nexus-connectivity  --> nexus-platform
+nexus-transport     --> nexus-platform
 
 nexus-ingress       --> nexus-domain
 nexus-dns           --> nexus-domain
 
 nexus-network       --> nexus-domain / nexus-policy / nexus-planner
-                     / nexus-session / nexus-delivery / nexus-dns
+                     / nexus-session / nexus-dns
 
-nexus-service       --> nexus-domain / nexus-session / nexus-delivery
-nexus-workspace     --> nexus-domain / nexus-session / nexus-delivery / nexus-storage
-nexus-compute       --> nexus-domain / nexus-session / nexus-delivery / nexus-workspace
+nexus-service       --> nexus-domain / nexus-session
+nexus-workspace     --> nexus-domain / nexus-session / nexus-storage
+nexus-compute       --> nexus-domain / nexus-session / nexus-workspace
 
-nexus-control-api   --> nexus-domain / nexus-proto
+nexus-control-api   --> nexus-domain
 nexus-platform-<os> --> nexus-platform
 ```
 
@@ -109,7 +107,6 @@ nexus-platform-<os> --> nexus-platform
 ```text
 nexus-network     -X-> nexus-ingress
 nexus-domain      -X-> nexus-platform-*
-nexus-delivery    -X-> nexus-workspace / nexus-compute
 production crates -X-> engineering harness
 platform adapters -X-> higher-level domain runtimes
 ```

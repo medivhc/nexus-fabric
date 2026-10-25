@@ -3318,7 +3318,7 @@ mod tests {
             ]
         );
         assert_eq!(members.len() * 2, 8, "4 members × 2 flags");
-        assert_eq!(skipped, 48, "52 workspace members - 4 with features");
+        assert_eq!(skipped, 45, "49 workspace members - 4 with features");
     }
 
     #[test]

@@ -2114,9 +2114,9 @@ owner 列给出推荐的身份值（见 29.2），未分配 Agent 的 crate 先�
 | 归属域（推荐身份值） | 路径 | 说明 |
 |---|---|---|
 | 身份与领域（`agent-a`） | `crates/nexus-auth/`、`nexus-registry/`、`nexus-domain/`、`nexus-discovery/`、`nexus-policy/`、`nexus-plugin/`、`nexus-storage/` | 授权/目录/领域模型/发现/策略/插件/持久层 |
-| 会话与调度（`agent-b`） | `crates/nexus-session/`、`nexus-planner/`、`nexus-flow-session/`、`nexus-scheduler/`、`nexus-service/`、`nexus-diagnostics/`、`nexus-connectivity/` | 会话/规划/流会话/调度/服务/诊断/连接管理 |
-| 代理栈（`agent-c`） | `crates/nexus-proxy/`、`nexus-proxy-config/`、`nexus-proxy-transport/`、`nexus-network/`、`nexus-path/`、`nexus-ingress/`、`nexus-dns/`、`nexus-delivery/`、`nexus-projection/`、`nexus-compute/`、`nexus-control-api/`、`nexus-measurement/` | 代理/配置/路由/入口/解析/投递/投影/计算/控制面 |
-| 传输与穿透（`agent-d`） | `crates/nexus-transport/`、`nexus-nat-traversal/`、`nexus-nat-wireup/`、`nexus-nat-quality/`、`nexus-turn/`、`nexus-outbound-shadowsocks/`、`nexus-outbound-trojan/`、`nexus-outbound-vmess/`、`nexus-proto/` | 传输/内网穿透/中继/出站协议/Proto |
+| 会话与调度（`agent-b`） | `crates/nexus-session/`、`nexus-planner/`、`nexus-flow-session/`、`nexus-scheduler/`、`nexus-service/`、`nexus-connectivity/` | 会话/规划/流会话/调度/服务/连接管理 |
+| 代理栈（`agent-c`） | `crates/nexus-proxy/`、`nexus-proxy-config/`、`nexus-proxy-transport/`、`nexus-network/`、`nexus-path/`、`nexus-ingress/`、`nexus-dns/`、`nexus-projection/`、`nexus-compute/`、`nexus-control-api/`、`nexus-measurement/` | 代理/配置/路由/入口/解析/投影/计算/控制面 |
+| 传输与穿透（`agent-d`） | `crates/nexus-transport/`、`nexus-nat-traversal/`、`nexus-nat-wireup/`、`nexus-nat-quality/`、`nexus-turn/`、`nexus-outbound-shadowsocks/`、`nexus-outbound-trojan/`、`nexus-outbound-vmess/` | 传输/内网穿透/中继/出站协议 |
 | 平台与基础设施（`agent-e`） | `crates/nexus-platform/`、`nexus-platform-android/`、`nexus-platform-ios/`、`nexus-platform-linux/`、`nexus-platform-macos/`、`nexus-platform-windows/`、`nexus-workspace/`、`nexus-workspace-intel/`、`nexus-fabric/` | 平台适配/工作区/仓储自身 |
 | 组装层（`agent-c`） | `apps/nexus/`、`apps/nexusd/`、`apps/nexus-platform-host/` | CLI/daemon/平台宿主：改动最易冲突，先同步再改 |
 | 工具链 | `engineering/`、`.githooks/`、`.agents/` | harness/hooks/skills（低冲突） |

@@ -20,7 +20,6 @@
 
 ## Allowed Dependencies
 
-- `nexus-delivery`
 - `nexus-platform`
 
 ## Forbidden Dependencies

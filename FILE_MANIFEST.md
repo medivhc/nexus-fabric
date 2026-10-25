@@ -4,6 +4,8 @@
 
 文件数（不含本清单）：195
 
+> 2026-10-26：随 dual-stack-convergence run 删除孤岛 crate `nexus-delivery` / `nexus-diagnostics` / `nexus-proto`（各 3 行、共 9 行），声明值按表内实际条目行数重算为 195。
+
 > 2026-10-10：原声明值 137 与表内实际行数（148）已不一致（既有漂移，含
 > `scenarios/engineering/bench_gate_verdicts.toml` 等未登记项）。本次登记
 > Code Intelligence 的 18 个新文件时一并改为与表内行数一致，并补登该缺口。
@@ -112,12 +114,6 @@
 | `crates/nexus-control-api/Cargo.toml` | Rust package/workspace manifest |
 | `crates/nexus-control-api/MODULE.md` | Module Contract |
 | `crates/nexus-control-api/src/lib.rs` | Minimal compile/bootstrap source |
-| `crates/nexus-delivery/Cargo.toml` | Rust package/workspace manifest |
-| `crates/nexus-delivery/MODULE.md` | Module Contract |
-| `crates/nexus-delivery/src/lib.rs` | Minimal compile/bootstrap source |
-| `crates/nexus-diagnostics/Cargo.toml` | Rust package/workspace manifest |
-| `crates/nexus-diagnostics/MODULE.md` | Module Contract |
-| `crates/nexus-diagnostics/src/lib.rs` | Minimal compile/bootstrap source |
 | `crates/nexus-discovery/Cargo.toml` | Rust package/workspace manifest |
 | `crates/nexus-discovery/MODULE.md` | Module Contract |
 | `crates/nexus-discovery/src/lib.rs` | Minimal compile/bootstrap source |
@@ -160,9 +156,6 @@
 | `crates/nexus-policy/Cargo.toml` | Rust package/workspace manifest |
 | `crates/nexus-policy/MODULE.md` | Module Contract |
 | `crates/nexus-policy/src/lib.rs` | Minimal compile/bootstrap source |
-| `crates/nexus-proto/Cargo.toml` | Rust package/workspace manifest |
-| `crates/nexus-proto/MODULE.md` | Module Contract |
-| `crates/nexus-proto/src/lib.rs` | Minimal compile/bootstrap source |
 | `crates/nexus-registry/Cargo.toml` | Rust package/workspace manifest |
 | `crates/nexus-registry/MODULE.md` | Module Contract |
 | `crates/nexus-registry/src/lib.rs` | Minimal compile/bootstrap source |

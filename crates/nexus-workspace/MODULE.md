@@ -31,7 +31,6 @@ Merge/Commit/持久化路径必须返回结构化 `WorkspaceError`，不得 pani
 
 - `nexus-domain`
 - `nexus-session`
-- `nexus-delivery`
 - `nexus-storage`
 
 ## Forbidden Dependencies

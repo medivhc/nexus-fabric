@@ -1244,20 +1244,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nexus-delivery"
-version = "0.1.0"
-dependencies = [
- "nexus-domain",
-]
-
-[[package]]
-name = "nexus-diagnostics"
-version = "0.1.0"
-dependencies = [
- "nexus-domain",
-]
-
-[[package]]
 name = "nexus-discovery"
 version = "0.1.0"
 dependencies = [
@@ -1538,10 +1524,6 @@ dependencies = [
  "smoltcp",
  "tun-rs",
 ]
-
-[[package]]
-name = "nexus-proto"
-version = "0.1.0"
 
 [[package]]
 name = "nexus-proxy"
