@@ -190,6 +190,25 @@ impl StunProber {
         })
     }
 
+    /// 同一 transport（生产上即 punch driver socket）连续探测两个目标。
+    ///
+    /// 返回两条 mapping + NAT 类型；任一 probe 失败即返回该错误，不返回半成品。
+    /// 双样本是 `DefaultPredictor` 的 `distinct_targets >= 2` 前提。
+    pub fn probe_pair(
+        &mut self,
+        server1: SocketAddr,
+        server2: SocketAddr,
+    ) -> Result<(StunMapping, StunMapping, NatType), StunError> {
+        let m1 = self.probe_once(server1, STUN_PROBE_TIMEOUT)?;
+        let m2 = self.probe_once(server2, STUN_PROBE_TIMEOUT)?;
+        let nat_type = if m1.public != m2.public {
+            NatType::Symmetric
+        } else {
+            NatType::RestrictedCone
+        };
+        Ok((m1, m2, nat_type))
+    }
+
     /// 双服务器探测：返回 server1 的公网映射 + 双映射对比的 NAT 类型。
     ///
     /// 一次调用只做两次 Binding 探测（调用方不再需要额外的 `probe_once`），
@@ -199,13 +218,7 @@ impl StunProber {
         server1: SocketAddr,
         server2: SocketAddr,
     ) -> Result<(StunMapping, NatType), StunError> {
-        let m1 = self.probe_once(server1, STUN_PROBE_TIMEOUT)?;
-        let m2 = self.probe_once(server2, STUN_PROBE_TIMEOUT)?;
-        let nat_type = if m1.public != m2.public {
-            NatType::Symmetric
-        } else {
-            NatType::RestrictedCone
-        };
+        let (m1, _m2, nat_type) = self.probe_pair(server1, server2)?;
         Ok((m1, nat_type))
     }
 
@@ -582,6 +595,141 @@ mod tests {
         let s = prober.sample(server).unwrap();
         assert_eq!(s.port, 54321);
         assert!(s.at_ms > 0);
+    }
+
+    #[test]
+    fn probe_pair_returns_two_mappings_and_type() {
+        let local = SocketAddr::from((Ipv4Addr::LOCALHOST, 40000));
+        let server1 = SocketAddr::from((Ipv4Addr::LOCALHOST, 3478));
+        let server2 = SocketAddr::from((Ipv4Addr::LOCALHOST, 3479));
+        let same = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 7), 54321));
+
+        // 双服务器返回相同映射 → RestrictedCone；两次请求。
+        let transport = MockStunTransport::new(local, vec![same, same]);
+        let mut cone = StunProber::new(Box::new(transport));
+        let (m1, m2, nat) = cone.probe_pair(server1, server2).unwrap();
+        assert_eq!(m1.public, same);
+        assert_eq!(m2.public, same);
+        assert_eq!(m1.local, local);
+        assert_eq!(m2.local, local);
+        assert_eq!(nat, NatType::RestrictedCone);
+
+        // 第二个服务器返回不同映射 → Symmetric；仍只有两次请求。
+        let second = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 7), 54322));
+        let transport = MockStunTransport::new(local, vec![same, second]);
+        let mut sym = StunProber::new(Box::new(transport));
+        let (m1, m2, nat) = sym.probe_pair(server1, server2).unwrap();
+        assert_eq!(m1.public, same);
+        assert_eq!(m2.public, second);
+        assert_eq!(nat, NatType::Symmetric);
+
+        // 投影保持既有签名/语义（丢弃 m2）。
+        let transport = MockStunTransport::new(local, vec![same, second]);
+        let mut projected = StunProber::new(Box::new(transport));
+        let (m1, nat) = projected.probe_and_detect(server1, server2).unwrap();
+        assert_eq!(m1.public, same);
+        assert_eq!(nat, NatType::Symmetric);
+    }
+
+    /// 顺序分配公网端口的 mock：每次响应 +1（从 40000 起）。
+    fn sequential_ip_responses(count: usize) -> Vec<SocketAddr> {
+        (0..count)
+            .map(|i| {
+                SocketAddr::from((
+                    Ipv4Addr::new(203, 0, 113, 7),
+                    40_000u16.wrapping_add(i as u16),
+                ))
+            })
+            .collect()
+    }
+
+    /// 按采样轮次顺序（每轮 s1,s2）把 `probe_pair` 的映射压成端口样本。
+    fn sample_pair_series(
+        prober: &mut StunProber,
+        server1: SocketAddr,
+        server2: SocketAddr,
+        rounds: usize,
+        samples: &mut Vec<PortSample>,
+    ) -> (StunMapping, NatType) {
+        let mut last_m1 = None;
+        let mut last_nat = NatType::Unknown;
+        for round in 0..rounds {
+            let (m1, m2, nat) = prober.probe_pair(server1, server2).unwrap();
+            for (mapping, target) in [(&m1, server1), (&m2, server2)] {
+                samples.push(PortSample {
+                    port: mapping.public.port(),
+                    at_ms: 1_000_000 + (round * 2) as u64 * 100,
+                    target,
+                    observed_from: mapping.local,
+                });
+            }
+            last_m1 = Some(m1);
+            last_nat = nat;
+        }
+        (last_m1.expect("at least one round"), last_nat)
+    }
+
+    #[test]
+    fn sample_series_is_predictable() {
+        let local = SocketAddr::from((Ipv4Addr::LOCALHOST, 40000));
+        let server1 = SocketAddr::from((Ipv4Addr::LOCALHOST, 3478));
+        let server2 = SocketAddr::from((Ipv4Addr::LOCALHOST, 3479));
+        let mut prober = StunProber::new(Box::new(MockStunTransport::new(
+            local,
+            sequential_ip_responses(6),
+        )));
+
+        let mut samples = Vec::new();
+        sample_pair_series(&mut prober, server1, server2, 3, &mut samples);
+        assert_eq!(samples.len(), 6, "3 rounds x 2 targets");
+        let first_observed = samples[0].observed_from;
+        assert!(samples.iter().all(|s| s.observed_from == first_observed));
+        let mut targets: Vec<SocketAddr> = samples.iter().map(|s| s.target).collect();
+        targets.sort();
+        targets.dedup();
+        assert_eq!(targets.len(), 2, "two distinct targets per round");
+
+        let ports: Vec<u16> = samples.iter().map(|s| s.port).collect();
+        assert_eq!(ports, vec![40000, 40001, 40002, 40003, 40004, 40005]);
+        assert_eq!(
+            DefaultPredictor.assess(&samples),
+            Predictability::Predictable {
+                base_port: 40005,
+                delta: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn p1_ac2_candidates_projection() {
+        use crate::nat_gather::CandidateGatherer;
+
+        let local = SocketAddr::from((Ipv4Addr::LOCALHOST, 40000));
+        let server1 = SocketAddr::from((Ipv4Addr::LOCALHOST, 3478));
+        let server2 = SocketAddr::from((Ipv4Addr::LOCALHOST, 3479));
+        let stun = StunProber::new(Box::new(MockStunTransport::new(
+            local,
+            sequential_ip_responses(6),
+        )));
+        let mut gatherer = CandidateGatherer::new(stun, local);
+        let mut samples = Vec::new();
+        let (last_m1, nat) =
+            sample_pair_series(gatherer.stun_prober(), server1, server2, 3, &mut samples);
+        gatherer.set_nat_type(nat);
+
+        // 组合根投影（Wave B 的 sample_round 规则；Wave A 在测试内复刻）：
+        // srflx = 最后一轮 s1 的 XOR-MAPPED，srflx_stun = Some(s1)。
+        let mut candidates = gatherer
+            .gather(None, false, &mut samples)
+            .expect("host candidate present");
+        candidates.srflx = Some(last_m1.public);
+        candidates.srflx_stun = Some(server1);
+
+        assert_eq!(candidates.srflx, Some(last_m1.public));
+        assert_eq!(candidates.srflx_stun, Some(server1));
+        assert_eq!(candidates.srflx_turn, None);
+        assert_eq!(candidates.nat_type, nat);
+        assert_eq!(samples.len(), 6);
     }
 
     fn port_samples(ports: &[u16]) -> Vec<PortSample> {
