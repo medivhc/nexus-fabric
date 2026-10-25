@@ -39,6 +39,10 @@ pub mod tproxy;
 pub mod tun;
 pub mod tun_vpi;
 
+/// P5-c 真实 netlink 回归（`#[ignore]`，需 user+net namespace）。
+#[cfg(test)]
+mod os_assemble_netlink_tests;
+
 pub use assemble::{CleanupReport, ExcludeEgress, OsAssemble, OsAssembleConfig};
 pub use secure_store::FileSecureStore;
 pub use tun_vpi::TunVpi;
