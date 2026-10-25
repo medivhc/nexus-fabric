@@ -294,18 +294,20 @@ step_s3() {
     assert_contains curl_body "$body" "hello-nexus"
 
     sleep 0.5
-    stop_nexusd
-    local socks
-    socks="$(cat "$ev/socks5.log" 2>/dev/null || true)"
-    assert_contains socks5_connect "$socks" "connect from="
-    assert_contains socks5_target "$socks" "target=${SITE_ADDR}:8080"
-
+    # P5-d 之后 stop_nexusd 会真正等 nexusd 退出，LocalAPI 随之关闭；因此
+    # dataplane 统计必须在停机之前抓取，否则读到 connection refused。
     stats_json "$ev/status.json" >/dev/null 2>&1 || true
     local providers fstate
     providers="$(stats_value "$ev/status.json" '.dataplane.flow_sessions.providers')"
     fstate="$(stats_value "$ev/status.json" '.dataplane.flow_sessions.state')"
     assert_eq providers "$providers" 1
     assert_eq flow_sessions_state "$fstate" enabled
+
+    stop_nexusd
+    local socks
+    socks="$(cat "$ev/socks5.log" 2>/dev/null || true)"
+    assert_contains socks5_connect "$socks" "connect from="
+    assert_contains socks5_target "$socks" "target=${SITE_ADDR}:8080"
 
     local logtext
     logtext="$(cat "$ev/nexusd.log" 2>/dev/null || true)"
