@@ -506,9 +506,13 @@ def render_matrix(
         )
     if run_meta:
         lines.append(
-            "- **结论 5**：五协议当前均可在产品配置面选择，且无「实验性/未验证」标注；"
-            "配置面标注已裁决批准，待 protocol-config-surface-labeling run 落地"
-            "（本 run 不改产品代码）。"
+            "- **结论 5**："
+            + narrative.get("conclusions", {}).get(
+                "5",
+                "五协议当前均可在产品配置面选择，且无「实验性/未验证」标注；"
+                "配置面标注已裁决批准，待 protocol-config-surface-labeling run 落地"
+                "（本 run 不改产品代码）。",
+            )
         )
     else:
         lines.append(
