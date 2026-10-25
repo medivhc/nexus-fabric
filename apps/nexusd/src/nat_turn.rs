@@ -546,12 +546,13 @@ impl TurnManager {
     /// 后续 438 会流入普通 Refresh 失败（3-strike），避免每周期泄漏一个
     /// 服务端 allocation；仅干净 Refresh 成功才复位。
     fn retry_stale_nonce(&mut self) -> RefreshOutcome {
+        // D-5：必须真正 drop（命名绑定会活到作用域末），否则固定端口重分配
+        // 时旧 UDP socket 仍占位 → EADDRINUSE。
+        drop(self.client.take());
         match (self.factory)() {
             Ok(new_client) => {
-                self.client = Some(new_client);
-                self.state = TurnState::Active;
-                self.consecutive_refresh_failures = 0;
-                self.next_refresh_at = self.schedule_next_refresh();
+                // 复位参数为 false：本 Refresh 周期内不得再次重分配（C-3）。
+                self.activate(new_client, false);
                 RefreshOutcome::StaleNonceRetried
             }
             Err(e) => {
@@ -794,6 +795,76 @@ mod tests {
         assert_eq!(mgr.state(), TurnState::Disabled);
         assert_eq!(mgr.health(), TurnHealth::Degraded);
         assert_eq!(mgr.last_failure(), Some(TurnFailure::Bind));
+    }
+
+    /// P3-AC1/§4.7-3：固定端口 438 重分配前必须 drop 旧 socket（否则 EADDRINUSE）。
+    #[test]
+    fn fixed_port_reallocate_drops_old_socket() {
+        let port = {
+            let probe = UdpSocket::bind("127.0.0.1:0").expect("probe bind");
+            probe.local_addr().unwrap().port()
+        };
+        struct FixedPortHandle {
+            sock: UdpSocket,
+            stale: bool,
+        }
+        impl TurnHandle for FixedPortHandle {
+            fn refresh(&self) -> io::Result<()> {
+                if self.stale {
+                    Err(io::Error::other(
+                        "turn refresh: unexpected response 0x0113 438 Stale Nonce",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            fn release(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+            fn relayed_addr(&self) -> SocketAddr {
+                self.sock.local_addr().unwrap()
+            }
+            fn mapped_addr(&self) -> Option<SocketAddr> {
+                None
+            }
+            fn is_expired(&self) -> bool {
+                false
+            }
+            fn as_turn_client(&self) -> Option<TurnClient> {
+                None
+            }
+        }
+
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls_for_factory = calls.clone();
+        let factory: TurnFactory = Box::new(move || {
+            let call = calls_for_factory.fetch_add(1, Ordering::Relaxed);
+            let sock = UdpSocket::bind(("127.0.0.1", port)).map_err(|e| {
+                io::Error::new(e.kind(), format!("bind fixed port {port} failed: {e}"))
+            })?;
+            Ok(Box::new(FixedPortHandle {
+                sock,
+                stale: call == 0,
+            }))
+        });
+        let cfg = section("127.0.0.1:3478".parse().unwrap(), 300);
+        let mut mgr = TurnManager::with_factory(Some(cfg), factory);
+        mgr.ensure_allocated().expect("first allocate");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        mgr.next_refresh_at = Some(Instant::now());
+        assert_eq!(mgr.refresh_if_needed(), RefreshOutcome::StaleNonceRetried);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "stale-nonce reallocation must bind the same fixed port"
+        );
+        assert!(mgr.is_active());
+        assert_eq!(mgr.health(), TurnHealth::Active);
+        assert!(
+            mgr.stale_nonce_retried,
+            "successful 438 reallocation must not reset the per-cycle latch"
+        );
     }
 
     /// §4.5 五行映射 + `not_started` 不经 `TurnHealth` 的边界说明。
