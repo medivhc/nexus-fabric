@@ -325,4 +325,125 @@ mod tests {
         let k3 = derive_subkey(b"pw", &[2u8; 32]);
         assert_ne!(k1, k3);
     }
+
+    const SIP004_EXPECTED: &str =
+        include_str!("../../../../scripts/interop/ss_sip004_expected.json");
+    const SIP004_COMMAND: &str = "cargo test --manifest-path apps/nexusd/Cargo.toml -p nexusd ss_sip004_vector_report -- --ignored";
+
+    fn hex_bytes(value: &str) -> Vec<u8> {
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let text = std::str::from_utf8(pair).expect("ascii hex");
+                u8::from_str_radix(text, 16).expect("hex byte")
+            })
+            .collect()
+    }
+
+    fn hex_text(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn repo_root() -> std::path::PathBuf {
+        std::env::var_os("NEXUS_REPO_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+            .canonicalize()
+            .expect("canonical repo root")
+    }
+
+    fn source_revision(repo_root: &std::path::Path) -> String {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    #[test]
+    #[ignore = "step 1.5 evidence report; writes .evidence/outbound-adapter-wiring/ss-std-sip004/vectors.json"]
+    fn sip004_vector_report() {
+        use nexus::n3_acceptance::sha256;
+
+        let expected: serde_json::Value =
+            serde_json::from_str(SIP004_EXPECTED).expect("parse ss_sip004_expected.json");
+        let mut vectors = Vec::new();
+        let mut matched = 0usize;
+        let mut mismatched = 0usize;
+        for vector in expected["vectors"].as_array().expect("vectors array") {
+            let salt = hex_bytes(vector["salt_hex"].as_str().expect("salt_hex"));
+            let password_sha256 = vector["password_sha256"].as_str().expect("password_sha256");
+            let password = hex_bytes(vector["password_hex"].as_str().expect("password_hex"));
+            assert_eq!(
+                password.len() as u64,
+                vector["password_len"].as_u64().expect("password_len")
+            );
+            assert_eq!(
+                sha256(&password).as_str().trim_start_matches("sha256:"),
+                password_sha256,
+                "password fixture mismatch for {}",
+                vector["vector_id"].as_str().unwrap_or("?")
+            );
+
+            let actual = derive_subkey(&password, &salt);
+            let actual_hex = hex_text(&actual);
+            let expected_hex = vector["expected_subkey_hex"].as_str().expect("expected");
+            let result = if actual_hex == expected_hex {
+                matched += 1;
+                "MATCH"
+            } else {
+                mismatched += 1;
+                "MISMATCH"
+            };
+            let conclusion = if result == "MATCH" {
+                "ss_std 派生与 SIP004 期望一致"
+            } else {
+                "ss_std 省略 EVP_BytesToKey，派生不合 SIP004"
+            };
+            vectors.push(serde_json::json!({
+                "vector_id": vector["vector_id"],
+                "password_sha256": password_sha256,
+                "password_len": vector["password_len"],
+                "salt_hex": vector["salt_hex"],
+                "expected_subkey_hex": expected_hex,
+                "actual_subkey_hex": actual_hex,
+                "result": result,
+                "conclusion": conclusion,
+            }));
+        }
+
+        let overall = if mismatched == 0 {
+            "MATCH"
+        } else if matched == 0 {
+            "MISMATCH"
+        } else {
+            "PARTIAL"
+        };
+        let repo_root = repo_root();
+        let source = std::fs::read(repo_root.join("apps/nexusd/src/proxy_fwd/ss_std.rs"))
+            .expect("read ss_std.rs");
+        let report = serde_json::json!({
+            "schema_version": 1,
+            "commit": source_revision(&repo_root),
+            "ss_std_source_sha256": sha256(&source).as_str().trim_start_matches("sha256:"),
+            "method": expected["method"],
+            "info": expected["info"],
+            "reference": expected["reference"],
+            "command": SIP004_COMMAND,
+            "vectors": vectors,
+            "overall": overall,
+        });
+
+        let evidence_dir = repo_root.join(".evidence/outbound-adapter-wiring/ss-std-sip004");
+        assert!(evidence_dir.is_absolute());
+        std::fs::create_dir_all(&evidence_dir).expect("create evidence dir");
+        let serialized = serde_json::to_string_pretty(&report).expect("serialize report");
+        std::fs::write(evidence_dir.join("vectors.json"), serialized + "\n")
+            .expect("write vectors.json");
+    }
 }
