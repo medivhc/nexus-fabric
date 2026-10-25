@@ -727,7 +727,14 @@ impl Dataplane {
     /// 管线：读 TUN → DNS 短路（UDP dport 53）→ 分类 → [S1: TCP 终结] →
     /// QoS → 计数转发。
     /// 分类并缓存 5 元组决策；命中缓存时不再调用规则引擎（spec §9.13）。
-    fn classify_with_cache(&mut self, packet: &[u8], now_millis: u64) -> Classification {
+    ///
+    /// 返回 `(分类, 首次决策记录)`：第二次及以后为 `None`（缓存命中），
+    /// 供 P6-c 的「每流恰好一次」`flow_decision` 事件使用。
+    fn classify_with_cache(
+        &mut self,
+        packet: &[u8],
+        now_millis: u64,
+    ) -> (Classification, Option<CachedDecision>) {
         let cache_key =
             nexus_projection::egress::FlowKey::parse(packet).map(|flow| FlowDecisionKey {
                 flow,
@@ -735,7 +742,7 @@ impl Dataplane {
             });
         if let Some(key) = cache_key {
             if let Some(cached) = self.decision_cache.get(&key, now_millis) {
-                return classification_from_target(&cached.target);
+                return (classification_from_target(&cached.target), None);
             }
         }
         let domain = parse_ipv4_dst(packet).and_then(|dst| {
@@ -755,7 +762,7 @@ impl Dataplane {
         } else {
             &[]
         };
-        let classification = {
+        let (classification, matched_rule) = {
             let classifier = PacketClassifier::new(
                 self.mesh_cidrs.clone(),
                 self.bypass_cidrs.clone(),
@@ -765,13 +772,47 @@ impl Dataplane {
                 candidates,
                 0.0, // degrade_threshold：MVP 用 0（不触发 degraded）
             );
-            classifier.classify(packet, domain.as_deref())
+            // P6-c：同一次决策顺带取回规则命中说明（`matched_rule`），
+            // 不额外再跑一遍规则引擎，也不新造第二套决策。
+            let (classification, explanation) =
+                classifier.classify_explained(packet, domain.as_deref());
+            (classification, explanation.map(|e| e.matched_rule))
         };
+        let decision = decision_from_classification(&classification, matched_rule, now_millis);
         if let Some(key) = cache_key {
-            let decision = decision_from_classification(&classification, now_millis);
-            self.decision_cache.insert(key, decision, now_millis);
+            self.decision_cache
+                .insert(key, decision.clone(), now_millis);
         }
-        classification
+        (classification, Some(decision))
+    }
+
+    /// P6-c：TUN 前端新流决策事件（spec §11.2，`frontend=tun`）。
+    ///
+    /// 只在决策缓存 miss（每流首包）时调用；字段取值与 TPROXY 前端同源
+    /// （同一 `RuleEngine` / 同一 `FlowDecisionCache`，frontend 不同）。
+    fn emit_tun_flow_decision(&self, packet: &[u8], decision: &CachedDecision) {
+        if let Some(line) = self.tun_flow_decision_line(packet, decision) {
+            eprintln!("{line}");
+        }
+    }
+
+    /// TUN 新流决策的 spec §11.2 日志行（发射点与测试共用）。
+    fn tun_flow_decision_line(&self, packet: &[u8], decision: &CachedDecision) -> Option<String> {
+        let flow = nexus_projection::egress::FlowKey::parse(packet)?;
+        let peer = SocketAddrV4::new(Ipv4Addr::from(flow.src_ip), flow.src_port);
+        let orig_dst = SocketAddrV4::new(Ipv4Addr::from(flow.dst_ip), flow.dst_port);
+        let proto = if flow.proto == 17 { "udp" } else { "tcp" };
+        let transparent = transparent_decision_from_target(&decision.target);
+        let egress_hint = transparent_egress_hint(&decision.target);
+        Some(flow_decision_log(
+            "tun",
+            peer,
+            orig_dst,
+            proto,
+            Some(decision.matched_rule.as_str()),
+            egress_hint.as_deref(),
+            &transparent,
+        ))
     }
 
     /// 当前单调毫秒（driver 时钟域）。
@@ -897,6 +938,7 @@ impl Dataplane {
         eprintln!(
             "{}",
             flow_decision_log(
+                "tproxy",
                 peer,
                 orig_dst,
                 "tcp",
@@ -947,6 +989,7 @@ impl Dataplane {
             eprintln!(
                 "{}",
                 flow_decision_log(
+                    "tproxy",
                     datagram.peer,
                     datagram.orig_dst,
                     "udp",
@@ -1143,7 +1186,16 @@ impl Dataplane {
         // D2：分类。
         // D6：boost_enabled 时分类器经 PathManager 做 EWMA 只读选路（S30）；
         // 禁用时 candidates 为空（回落默认转发）。
-        let classification = self.classify_with_cache(&packet, now_millis);
+        let (classification, fresh_decision) = self.classify_with_cache(&packet, now_millis);
+        // P6-c：TUN 前端 Direct/Proxy 每流恰好一条 flow_decision（首包决策时）。
+        if let Some(decision) = fresh_decision.as_ref() {
+            if matches!(
+                classification,
+                Classification::Direct | Classification::Proxy { .. }
+            ) {
+                self.emit_tun_flow_decision(&packet, decision);
+            }
+        }
 
         // Phase B：Proxy TCP 首包也进入流会话（AC-G4-03/05）。
         if is_tcp_packet(&packet)
@@ -2060,7 +2112,11 @@ fn udp_payload_of(packet: &[u8]) -> Option<&[u8]> {
 }
 
 /// 新流决策日志行（spec §11.2 `event=flow_decision`）。
+///
+/// `frontend` 为 `tun` / `tproxy`（spec §11.2 `frontend=<tun/tproxy>`）；
+/// 两个前端字段序与取值口径一致。
 fn flow_decision_log(
+    frontend: &str,
     peer: SocketAddrV4,
     orig_dst: SocketAddrV4,
     proto: &str,
@@ -2079,7 +2135,7 @@ fn flow_decision_log(
     let egress_hint = egress_hint.filter(|value| !value.is_empty()).unwrap_or("-");
     format!(
         "[nexusd.dataplane] level=info event=flow_decision flow={peer}->{orig_dst} proto={proto} \
-frontend=tproxy matched_rule={matched_rule} egress_hint={egress_hint} outbound={outbound} \
+frontend={frontend} matched_rule={matched_rule} egress_hint={egress_hint} outbound={outbound} \
 session=-"
     )
 }
@@ -2706,6 +2762,7 @@ fn classification_from_target(target: &nexus_domain::RouteTarget) -> Classificat
 
 fn decision_from_classification(
     classification: &Classification,
+    matched_rule: Option<String>,
     now_millis: u64,
 ) -> CachedDecision {
     let (target, selected_outbound) = match classification {
@@ -2731,7 +2788,7 @@ fn decision_from_classification(
     };
     CachedDecision {
         target,
-        matched_rule: String::new(),
+        matched_rule: matched_rule.unwrap_or_default(),
         selected_outbound,
         last_seen_millis: now_millis,
     }
@@ -3422,6 +3479,7 @@ outbounds:
         let dst = SocketAddrV4::new(Ipv4Addr::new(10, 200, 3, 3), 8080);
 
         let proxy = flow_decision_log(
+            "tproxy",
             peer,
             dst,
             "tcp",
@@ -3439,7 +3497,15 @@ proto=tcp frontend=tproxy matched_rule=IP-CIDR,10.200.3.3/32,PROXY egress_hint=p
 session=-"
         );
 
-        let direct = flow_decision_log(peer, dst, "udp", None, None, &TransparentDecision::Direct);
+        let direct = flow_decision_log(
+            "tproxy",
+            peer,
+            dst,
+            "udp",
+            None,
+            None,
+            &TransparentDecision::Direct,
+        );
         assert_eq!(
             direct,
             "[nexusd.dataplane] level=info event=flow_decision flow=10.200.2.2:40000->10.200.3.3:8080 \
@@ -3447,6 +3513,7 @@ proto=udp frontend=tproxy matched_rule=- egress_hint=- outbound=self session=-"
         );
 
         let drop = flow_decision_log(
+            "tproxy",
             peer,
             dst,
             "tcp",

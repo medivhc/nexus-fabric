@@ -10,7 +10,9 @@
 
 use std::net::Ipv4Addr;
 
-use nexus_domain::{FlowContext, FlowOrigin, ResourceId, RouteRequest, RouteTarget, RuleEngine};
+use nexus_domain::{
+    FlowContext, FlowOrigin, ResourceId, RouteRequest, RouteTarget, RuleEngine, RuleExplanation,
+};
 use nexus_path::{CandidatePath, PathManager};
 
 use crate::boost::select_best;
@@ -111,22 +113,41 @@ impl<'a> PacketClassifier<'a> {
     /// 顺序：mesh CIDR → fake-IP（启用时）→ bypass → 注入的规则引擎。
     /// 非 IPv4 → `Drop { NotIpv4 }`；IPv4 头截断 → `Drop { Truncated }`。
     pub fn classify(&self, packet: &[u8], domain: Option<&str>) -> Classification {
+        self.classify_explained(packet, domain).0
+    }
+
+    /// 与 [`Self::classify`] 完全相同的决策，额外透出规则命中说明。
+    ///
+    /// 调用方（TUN 前端事件发射点，spec §11.2 `matched_rule=`）需要决策出处；
+    /// mesh/bypass 快路径不经规则引擎 → `None`。规则引擎每次决策只调用一次
+    /// （`explain` 一次返回目标与说明，不额外再跑 `decide`）。
+    pub fn classify_explained(
+        &self,
+        packet: &[u8],
+        domain: Option<&str>,
+    ) -> (Classification, Option<RuleExplanation>) {
         if packet.is_empty() || packet[0] >> 4 != 4 {
-            return Classification::Drop {
-                reason: DropReason::NotIpv4,
-            };
+            return (
+                Classification::Drop {
+                    reason: DropReason::NotIpv4,
+                },
+                None,
+            );
         }
         let dst = match parse_ipv4_dst(packet) {
             Some(d) => d,
             None => {
-                return Classification::Drop {
-                    reason: DropReason::Truncated,
-                };
+                return (
+                    Classification::Drop {
+                        reason: DropReason::Truncated,
+                    },
+                    None,
+                );
             }
         };
         // 1. mesh fast path（S10）：规则引擎不介入。
         if self.mesh_cidrs.iter().any(|c| c.contains(dst)) {
-            return self.classify_mesh();
+            return (self.classify_mesh(), None);
         }
         // 2. fake-IP：本 run 不启用；启用时仍需经规则引擎（不吞域名规则）。
         if self.fake_ip_enabled && fake_ip_cidr().contains(dst) {
@@ -134,14 +155,20 @@ impl<'a> PacketClassifier<'a> {
         }
         // 3. bypass/白名单 → 直连。
         if self.bypass_cidrs.iter().any(|c| c.contains(dst)) {
-            return Classification::Direct;
+            return (Classification::Direct, None);
         }
         // 4. 其余 → 注入的规则引擎（TUN 与 TPROXY 共用同一实现）。
         self.classify_rules(packet, domain)
     }
 
     /// 委派规则引擎并把 `RouteTarget` 映射为分类结果（spec §9.6）。
-    fn classify_rules(&self, packet: &[u8], domain: Option<&str>) -> Classification {
+    ///
+    /// 返回规则命中说明（无命中时规则引擎给 `None`），供事件发射点透传。
+    fn classify_rules(
+        &self,
+        packet: &[u8],
+        domain: Option<&str>,
+    ) -> (Classification, Option<RuleExplanation>) {
         let (src_port, dst_port) = parse_packet_ports(packet);
         let req = RouteRequest {
             packet,
@@ -150,7 +177,8 @@ impl<'a> PacketClassifier<'a> {
             dst_port,
             process_name: None,
         };
-        match self.rules.decide(&req) {
+        let (target, explanation) = self.rules.explain(&req);
+        let classification = match target {
             RouteTarget::Egress { peer } if peer == "self" => Classification::Direct,
             RouteTarget::Egress { peer } => Classification::Proxy { outbound: peer },
             RouteTarget::Drop => Classification::Drop {
@@ -159,7 +187,8 @@ impl<'a> PacketClassifier<'a> {
             RouteTarget::MeshPeer { .. } => Classification::Drop {
                 reason: DropReason::MeshUnsupported,
             },
-        }
+        };
+        (classification, explanation)
     }
 
     /// mesh 命中的 EWMA 选路（S30）。
