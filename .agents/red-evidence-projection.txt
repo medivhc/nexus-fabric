@@ -1,0 +1,18 @@
+Nexus Projection Layer — Red Evidence
+====================================
+Date: 2026-09-30
+Branch: feature/projection-layer
+Contract hash: 50465e52290c9100004e1e66cecd5b9317db299a
+
+Scenario 1: product.fabric-projection-basic
+  Command: cargo run --quiet -p nexus-projection --example basic -- --json
+  Result: BLOCKED — crates/nexus-projection/examples/ does not exist.
+          Projection is an honest stub (send_packet returns NotImplemented).
+
+Scenario 2: product.fabric-projection-roam
+  Command: cargo run --quiet -p nexus-projection --example roam -- --json
+  Result: BLOCKED — crates/nexus-projection/examples/ does not exist.
+          Projection is an honest stub (send_packet returns NotImplemented).
+
+Conclusion: Both E4 scenarios are BLOCKED. Implementation has not started.
+This is the expected Red state before Spec Freeze.

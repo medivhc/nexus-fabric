@@ -1,0 +1,23 @@
+Nexus Egress Remote (Phase 3b-2) — Red Evidence
+================================================
+Date: 2026-09-30
+Branch: feature/egress-remote
+Contract hash: 17bb9ac2ace7cd3f0cefc3133fc9bf2bc4113b89 (scenarios unchanged from 3b-1)
+
+New invariants (not yet implemented):
+
+S13 (hop count validation):
+  Test: inject egress-intent datagram with hops=3 (> max 2) into Projection downlink.
+  Expected: dropped, hop_limit_exceeded counter incremented.
+  Actual: BLOCKED — no hop validation on receive path (encoded but never checked, WARN-3).
+
+S14 (NAT table bound):
+  Test: fill EgressNat with max_entries+1 flows.
+  Expected: oldest evicted, nat_evicted counter incremented, table size == max_entries.
+  Actual: BLOCKED — EgressNat has no max_entries (unbounded HashMap, WARN-2).
+
+DatagramTransport trait:
+  Expected: pub trait DatagramTransport in nexus-projection (MODULE.md documents it).
+  Actual: BLOCKED — trait does not exist in code (only in MODULE.md).
+
+Conclusion: 3b-2 implementation has not started. This is the expected Red state.

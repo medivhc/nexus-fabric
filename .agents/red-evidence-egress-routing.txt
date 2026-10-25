@@ -1,0 +1,21 @@
+Nexus Egress Routing (Phase 3b-1) — Red Evidence
+================================================
+Date: 2026-09-30
+Branch: feature/egress-routing
+Contract hash: 17bb9ac2ace7cd3f0cefc3133fc9bf2bc4113b89
+
+Scenario 1: product.fabric-egress-basic
+  Command: cargo run --quiet -p nexus-projection --example egress_basic -- --json
+  Result: BLOCKED — crates/nexus-projection/examples/egress_basic.rs does not exist.
+          Router/SimpleRuleEngine/EgressNat not yet implemented.
+
+Scenario 2: product.fabric-egress-remote
+  Command: cargo run --quiet -p nexus-projection --example egress_remote -- --json
+  Result: BLOCKED — crates/nexus-projection/examples/egress_remote.rs does not exist.
+          Router/SimpleRuleEngine/EgressNat not yet implemented.
+
+Contract types (nexus-domain):
+  RouteTarget/RouteRequest/RuleEngine added to nexus-domain/src/lib.rs (types only).
+
+Conclusion: Both E4 scenarios are BLOCKED. Implementation has not started.
+This is the expected Red state before implementation.
