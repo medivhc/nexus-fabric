@@ -21,18 +21,32 @@ FAILURE_CELLS = {"bad-credential", "bad-config"}
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
-def ref_variant_for(protocol, variant):
-    """从 cell-matrix 找到 probe 变体对应的参照端变体（找不到返回空串）。"""
+def ref_variant_for(protocol, variant, cell=""):
+    """从 cell-matrix 找到 probe 格对应的参照端变体（找不到返回空串）。
+
+    同一 probe 变体下不同 cell 可能指向不同的参照端配置（端口也不同），
+    因此按 (protocol, variant, cell) 精确匹配；cell 用「忽略大小写与连字符」比较
+    （finalize 拿到的是 kebab label，矩阵里是 CamelCase）。
+    """
     try:
         matrix = json.loads(
             (REPO_ROOT / "scripts/interop/cell-matrix.json").read_text(encoding="utf-8")
         )
     except OSError:
         return ""
+
+    def norm(value):
+        return (value or "").replace("-", "").lower()
+
+    fallback = ""
     for entry in matrix.get("cells", []):
-        if entry.get("protocol") == protocol and entry.get("variant") == variant:
+        if entry.get("protocol") != protocol or entry.get("variant") != variant:
+            continue
+        if not fallback:
+            fallback = entry.get("ref_variant") or ""
+        if norm(entry.get("cell")) == norm(cell):
             return entry.get("ref_variant") or ""
-    return ""
+    return fallback
 
 
 def access_proof(pcap, node_port, fallback_port):
@@ -55,13 +69,17 @@ def access_proof(pcap, node_port, fallback_port):
                 "-r",
                 str(pcap),
                 "-Y",
-                "tcp",
+                "tcp or udp",
                 "-T",
                 "fields",
                 "-e",
                 "tcp.srcport",
                 "-e",
                 "tcp.dstport",
+                "-e",
+                "udp.srcport",
+                "-e",
+                "udp.dstport",
             ],
             capture_output=True,
             text=True,
@@ -73,12 +91,15 @@ def access_proof(pcap, node_port, fallback_port):
     proof["checked"] = True
     for line in out.stdout.splitlines():
         parts = line.split("\t")
-        if len(parts) < 2:
-            continue
-        try:
-            ports = {int(parts[0]), int(parts[1])}
-        except ValueError:
-            continue
+        ports = set()
+        for raw in parts:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                ports.add(int(raw))
+            except ValueError:
+                continue
         if fallback_port and fallback_port in ports:
             proof["fallback_access"] = True
         if node_port and node_port in ports:
@@ -168,7 +189,7 @@ def main():
     if (not a.synthetic) and a.cell in FAILURE_CELLS:
         protocol = evidence.get("protocol", "")
         variant = evidence.get("variant", "")
-        ref_variant = ref_variant_for(protocol, variant)
+        ref_variant = ref_variant_for(protocol, variant, a.cell)
         cfg_path = root / "ref-config" / f"{ref_variant}.json" if ref_variant else None
         node_port = None
         fallback_port = None
