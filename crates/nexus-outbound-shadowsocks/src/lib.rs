@@ -1,11 +1,19 @@
 //! nexus-outbound-shadowsocks
 //!
-//! Shadowsocks AEAD 出站 adapter（PRODUCT §11.6）：实现
-//! `nexus-connectivity::OutboundAdapter`，对出站字节流做 AEAD 封装/解封装。
+//! Shadowsocks 出站 crate，提供两套**线格式互不相同**的 API：
 //!
-//! 本期冻结 method 为 `chacha20-ietf-poly1305`（RustCrypto 纯 Rust 实现）；password 经
-//! HKDF-SHA256（盐=method 标签）确定性派生会话 key；离线确定性（固定计数器 nonce，不调 getrandom）。
-//! 本 crate 不连真实服务器，E4 仅做 encrypt->decrypt 自洽往返。
+//! - [`SsStream`]：SIP004 标准 TCP AEAD 流（`salt(32) || chunk*`，
+//!   `chunk = AEAD(len 2B BE) || AEAD(payload)`，`chacha20-ietf-poly1305`，AAD 恒空）。
+//!   口令经 `EVP_BytesToKey`（MD5、无 salt、1 次迭代）得到 master key，再经
+//!   HKDF-SHA1（salt = 本方向 32B salt，info = `"ss-subkey"`）派生方向 subkey。
+//!   这是 `apps/nexus` SOCKS5 产品出口与 `nexus-proxy-transport` 使用的线格式。
+//! - [`ShadowsocksAdapter`]：离线自洽 API（`nexus-connectivity::OutboundAdapter`），
+//!   key 由 HKDF-SHA256（盐=method 标签）派生，帧 = `nonce(12B) || ct+tag`。
+//!   **不是 SIP004、无互操作证据、不在产品矩阵路径上**；其线格式迁移另立 follow-up
+//!   （spec §1.7）。本 crate 对该 adapter 与真实 SS 服务器的互通不作任何声明。
+//!
+//! `write_record` / `read_record` 是 Nexus 旧记录帧（u32 BE 长度前缀）遗留工具，
+//! **不是 SIP004 线格式**，SS 产品路径不得再用它们承载 SS 线格式。
 
 #![forbid(unsafe_code)]
 
@@ -79,7 +87,11 @@ impl SsMethod {
 
 // ---------- adapter ----------
 
-/// Shadowsocks AEAD 出站 adapter。
+/// 离线自洽 AEAD adapter：**非 SIP004、无互操作证据**。
+///
+/// key 由 HKDF-SHA256（盐=method 标签）派生，帧 = `nonce(12B) || ct+tag`。
+/// 仅供离线自洽往返与既有 `OutboundAdapter` 消费者；不在产品矩阵路径上，
+/// 不得表述为可与真实 shadowsocks 服务器互通（线格式迁移另立 follow-up，spec §1.7）。
 pub struct ShadowsocksAdapter {
     tag: String,
     locator: String,
@@ -526,10 +538,10 @@ impl SsStream {
     }
 }
 
-/// 写一条记录帧：`u32 BE length || record`。
+/// 写一条 **Nexus 旧记录帧**：`u32 BE length || record`。
 ///
-/// 泛型化以支持插件 wrapped 流（`Box<dyn ObfuscatedStream>`）；对 `TcpStream`
-/// 的既有调用保持兼容（P6）。
+/// legacy：这**不是 SIP004 线格式**（SIP004 无外层长度记录头，见 [`SsStream`]）。
+/// SS 产品路径不得用它承载 SS 线格式；保留仅为既有外部消费者的兼容面。
 ///
 /// # Errors
 ///
@@ -539,10 +551,9 @@ pub fn write_record<W: Write + ?Sized>(stream: &mut W, record: &[u8]) -> std::io
     stream.write_all(record)
 }
 
-/// 读一条记录帧：先读 `u32 BE length`，再读对应字节。
+/// 读一条 **Nexus 旧记录帧**：先读 `u32 BE length`，再读对应字节。
 ///
-/// 泛型化以支持插件 wrapped 流（`Box<dyn ObfuscatedStream>`）；对 `TcpStream`
-/// 的既有调用保持兼容（P6）。
+/// legacy：这**不是 SIP004 线格式**，SS 产品路径不得使用（见 [`SsStream`]）。
 ///
 /// # Errors
 ///
@@ -762,24 +773,53 @@ mod tests {
 
     #[test]
     fn session_client_server_seal_open() {
-        let mut client = SsStream::new("pw", SsMethod::Chacha20IetfPoly1305, Role::Client).unwrap();
-        let mut server = SsStream::new("pw", SsMethod::Chacha20IetfPoly1305, Role::Server).unwrap();
-        let req = encode_request(&SsTarget::Ipv4([127, 0, 0, 1], 9000));
-        let frame = client.seal(&req).unwrap();
-        let plain = server.open(&frame).unwrap();
+        // 两端固定且互不相同的 TX salt（确定性；生产走 new 的随机 salt）。
+        let client_salt = [0xA1u8; 32];
+        let server_salt = [0xB2u8; 32];
+        let mut client = SsStream::with_tx_salt(
+            "pw",
+            SsMethod::Chacha20IetfPoly1305,
+            Role::Client,
+            client_salt,
+        )
+        .unwrap();
+        let mut server = SsStream::with_tx_salt(
+            "pw",
+            SsMethod::Chacha20IetfPoly1305,
+            Role::Server,
+            server_salt,
+        )
+        .unwrap();
+        let target = SsTarget::Ipv4([127, 0, 0, 1], 9000);
+        let req = encode_request(&target);
+        let wire = client.seal(&req).unwrap();
+        // 线字节以本方向 tx_salt 开头（SIP004 salt 前缀）。
+        assert_eq!(&wire[..32], &client_salt);
+        // 首 chunk 明文含完整 request header（7B，可独立 parse）。
+        let plain = server.open(&wire).unwrap();
         assert_eq!(plain, req);
-        // reverse direction uses s2c key.
+        assert_eq!(parse_request(&plain[..req.len()]).unwrap(), target);
+        // 反方向使用 server 自己的 tx_salt 与 subkey。
         let reply = server.seal(b"echo").unwrap();
+        assert_eq!(&reply[..32], &server_salt);
         assert_eq!(client.open(&reply).unwrap(), b"echo");
     }
 
     #[test]
     fn session_wrong_password_fails() {
-        let mut client =
-            SsStream::new("one", SsMethod::Chacha20IetfPoly1305, Role::Client).unwrap();
+        let mut client = SsStream::with_tx_salt(
+            "one",
+            SsMethod::Chacha20IetfPoly1305,
+            Role::Client,
+            [0x11u8; 32],
+        )
+        .unwrap();
         let mut server =
             SsStream::new("two", SsMethod::Chacha20IetfPoly1305, Role::Server).unwrap();
-        let frame = client.seal(b"x").unwrap();
-        assert!(server.open(&frame).is_err());
+        let wire = client.seal(b"x").unwrap();
+        assert!(matches!(
+            server.open(&wire).unwrap_err(),
+            OutboundCipherError::DecryptFailed
+        ));
     }
 }
