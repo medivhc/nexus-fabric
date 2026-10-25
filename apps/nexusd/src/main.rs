@@ -1454,6 +1454,8 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     };
     // S24：数据面规则引擎来自同一份 proxy.yaml；构造失败 → 启动失败（fail-fast，
     // 不得静默回落到把全部流量送往 `proxy` 的默认引擎）。
+    // 此接线由 dataplane_rule_engine_assembly_tests 装配回归测试钉住；
+    // 删改接线（如改传 None）时必须同步更新该测试。
     let rule_engine = if tun_enabled() || has_tproxy {
         match build_dataplane_rule_engine(parsed_proxy.as_ref()) {
             Ok(engine) => engine,
