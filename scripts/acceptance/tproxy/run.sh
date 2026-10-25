@@ -351,6 +351,10 @@ run_tun_pass() {
     write_daemon_toml "$cfg" true auto "$default_route"
     write_tun_yaml "$cfg" iptables
 
+    local defaults_before
+    defaults_before="$(ns_exec "${NS_R}" ip route show default 2>&1 || true)"
+    record "tun_pass=${tag} router_default_routes_before='$(printf '%s' "${defaults_before}" | tr '\n' ' ')'"
+
     start_nexusd "$cfg" "$ev/nexusd-${tag}.log" \
         PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
         || { stop_nexusd; return 1; }
@@ -379,13 +383,23 @@ run_tun_pass() {
     assert_contains "tun_addr_${tag}" "$(cat "${ev}/ip-addr-${tag}.txt" 2>/dev/null || true)" "10.99.0.1/24"
     assert_contains "tun_subnet_route_${tag}" "$(cat "${ev}/ip-route-${tag}.txt" 2>/dev/null || true)" "10.99.0.0/24"
 
+    local defaults
+    defaults="$(ns_exec "${NS_R}" ip route show default 2>&1 || true)"
     if [ "$default_route" = "true" ]; then
-        local defaults
-        defaults="$(ns_exec "${NS_R}" ip route show default 2>&1 || true)"
         assert_contains "default_route_via_tun_${tag}" "$defaults" "${ifname}"
+    else
+        # AC-G5-02：default_route=false 时默认路由必须保持不变（不新增、不改向）。
+        assert_eq "default_route_unchanged_${tag}" "$defaults" "$defaults_before"
     fi
 
-    ns_exec "${NS_R}" ip route add 10.200.2.0/24 dev "${ifname}" >/dev/null 2>&1 || true
+    # 客户端流量必须真正进入 TUN。router 的 veth-up 与上游 10.200.2.0/24 直连，
+    # 直连路由比 `dev <tun>` 更具体，直接 `ip route add` 会 EEXIST 被 `|| true`
+    # 静默吞掉（流量绕过 TUN，curl 仍然成功，但 dataplane 计数为 0）。
+    # 用按源地址的策略路由把 client(10.200.1.2) 的转发流量送进 TUN，同时避免
+    # daemon 自身 egress（源 10.200.2.1）被自己的 TUN 捕获造成回环。
+    ns_exec "${NS_R}" ip rule add from "${CLIENT_ADDR}" lookup 200 priority 100 >/dev/null 2>&1 || true
+    ns_exec "${NS_R}" ip route replace 10.200.2.0/24 dev "${ifname}" table 200 >/dev/null 2>&1 || true
+    record "tun_steer=${tag} rule=from ${CLIENT_ADDR} lookup 200; table200=$(ns_exec "${NS_R}" ip route show table 200 2>&1 | tr '\n' ' ')"
 
     local body rc
     body="$(client_curl "http://${UPSTREAM_ADDR}:8080/" 10 2>"${ev}/curl-direct-${tag}.err")"
