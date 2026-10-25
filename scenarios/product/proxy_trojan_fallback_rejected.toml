@@ -1,0 +1,53 @@
+schema_version = 1
+id = "product.proxy-trojan-fallback-rejected"
+title = "Trojan fallback fail-closed：错密码时服务端 fallback 的 404 页面绝不上交客户端（本地 E4）"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-proxy-kernel"
+
+[given]
+topology = "same-process loopback 127.0.0.1: local HTTP 404 fallback target + local trojan TLS node (rcgen self-signed) wrong-password path + nexus proxy (outbound=trojan-node, password mismatch) + raw SOCKS5 client"
+crypto = "rustls ClientConnection skip-cert-verify (skip_cert_verify=true)，节点密码与产品配置不一致"
+fallback = "节点在鉴权失败时把连接（含已读 56B 头）转交本地 404 服务，与 sing-box 1.13.16 fallback 缓存回塞同构"
+offline = "no public network; std::net::TcpStream + threads, joined"
+
+# 可执行 E4（spec AC-1 的本地部分）：修复前客户端会先收到 SOCKS5 success，随后把 404 页面
+# 当作隧道数据（fail-open）。修复后必须在收到任何隧道载荷前观察到失败：
+# CONNECT 应答 REP≠0（或应答前 EOF），500ms 内 EOF，且隧道字节 = 0。
+[when]
+command = "cargo run --quiet -p nexus --example proxy_outbound_trojan_fallback_flow -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+# 1) 成功前失败：应答阶段 REP != 0。
+[[expect]]
+field = "client.refused_before_tunnel"
+equals = true
+
+[[expect]]
+field = "client.socks5_rep"
+equals = 1
+
+# 2) 失败后 500ms 内 EOF，且 EOF 前隧道字节 = 0（404 页面零字节投递）。
+[[expect]]
+field = "client.tunnel_bytes"
+equals = 0
+
+[[expect]]
+field = "client.eof_within_500ms"
+equals = true
+
+# 3) 参照端侧确实走了 fallback（证明失败发生在真实 fallback 路径，而不是本地错误）。
+[[expect]]
+field = "fallback.visited"
+equals = true
+
+# 4) 失败 reason 使用 spec §6 固定前缀（机器可复算）。
+[[expect]]
+field = "error_prefix_ok"
+equals = true
+
+[[expect]]
+field = "inbound.kind"
+equals = "socks5"
