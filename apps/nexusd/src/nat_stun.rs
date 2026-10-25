@@ -242,7 +242,6 @@ impl StunProber {
 pub struct DriverStunTransport {
     driver: Arc<nexus_fabric::Driver>,
     inbox: std::sync::Mutex<std::sync::mpsc::Receiver<nexus_fabric::StunResponse>>,
-    local: SocketAddr,
 }
 
 struct TapSink {
@@ -257,7 +256,6 @@ impl nexus_fabric::StunSink for TapSink {
 
 impl DriverStunTransport {
     pub fn new(driver: Arc<nexus_fabric::Driver>) -> Result<Self, io::Error> {
-        let local = *driver.shared().local_addr.lock().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         driver
             .install_stun_tap(Arc::new(TapSink { tx }))
@@ -265,7 +263,6 @@ impl DriverStunTransport {
         Ok(Self {
             driver,
             inbox: std::sync::Mutex::new(rx),
-            local,
         })
     }
 }
@@ -292,7 +289,8 @@ impl StunTransport for DriverStunTransport {
                 return Err(StunError::Timeout);
             }
             match inbox.recv_timeout(remain) {
-                Ok(r) if r.transaction_id == txn => return Ok(r.bytes),
+                // 只接受本事务且来自目标服务器的响应（与 UdpStunTransport 同口径）。
+                Ok(r) if r.transaction_id == txn && r.from == server => return Ok(r.bytes),
                 Ok(_) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Err(StunError::Timeout),
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -303,7 +301,14 @@ impl StunTransport for DriverStunTransport {
     }
 
     fn local_addr(&self) -> Result<SocketAddr, StunError> {
-        Ok(self.local)
+        // 实时读取 driver socket 地址（rebind 后不返回构造期缓存）。
+        let local = self
+            .driver
+            .shared()
+            .local_addr
+            .lock()
+            .map_err(|_| StunError::Io(io::Error::other("driver local_addr poisoned")))?;
+        Ok(*local)
     }
 }
 
@@ -836,6 +841,26 @@ mod tests {
 mod gap_tests {
     use super::*;
     use nexus_fabric::Driver;
+    use std::net::UdpSocket;
+    use std::thread;
+
+    fn binding_request(txn: [u8; 12]) -> Vec<u8> {
+        StunMessage {
+            msg_type: 0x0001, // STUN Binding Request
+            txn,
+            attrs: vec![],
+        }
+        .encode()
+    }
+
+    fn binding_response(txn: [u8; 12], public: SocketAddr) -> Vec<u8> {
+        StunMessage {
+            msg_type: 0x0101, // Binding Success Response
+            txn,
+            attrs: vec![Attribute::XorMappedAddress(public)],
+        }
+        .encode()
+    }
 
     #[test]
     fn g1_stun_samples_share_punch_socket() {
@@ -846,6 +871,98 @@ mod gap_tests {
             transport.local_addr().unwrap(),
             local,
             "STUN must be observed on the punch driver socket"
+        );
+    }
+
+    /// S1/AC-1：`local_addr()` 跟随 driver 实时地址，不返回构造期缓存。
+    #[test]
+    fn tap_local_addr_is_live_driver_addr() {
+        let driver = Driver::new_server("127.0.0.1:0".parse().unwrap()).expect("bind driver");
+        let transport = DriverStunTransport::new(driver.clone()).expect("install tap");
+        let rebound: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        // D-3：没有服务端级 rebind API；测试直接改 driver 的共享 local_addr
+        // （无 traffic，安全），以证明 transport 不再缓存构造期值。
+        *driver.shared().local_addr.lock().unwrap() = rebound;
+        assert_eq!(
+            transport.local_addr().unwrap(),
+            rebound,
+            "driver local_addr must be read live (rebind-safe)"
+        );
+    }
+
+    /// S2/AC-1：伪造同 txn 的错误源响应必须先被丢弃。
+    ///
+    /// D-1（ANCHOR-DRIFT）：fabric tap 在第一个 txn 命中时就把 pending 消费掉
+    /// （不论源地址），因此正确源的后到响应不会再进 sink。本测试断言：
+    /// 伪造先到 → `Timeout`；干净路径 → `Ok`。目标（不接受错误源）不变。
+    #[test]
+    fn send_recv_rejects_wrong_source() {
+        let driver = Driver::new_server("127.0.0.1:0".parse().unwrap()).expect("bind driver");
+        let driver_addr = *driver.shared().local_addr.lock().unwrap();
+        let mut transport = DriverStunTransport::new(driver.clone()).expect("install tap");
+
+        let legit = UdpSocket::bind("127.0.0.1:0").expect("bind legit responder");
+        let legit_addr = legit.local_addr().expect("legit addr");
+        let attacker = UdpSocket::bind("127.0.0.1:0").expect("bind attacker");
+
+        // 第 1 轮：等 driver 的请求到达 legit（证明 txn 已注册），attacker
+        // 立即发伪造响应，legit 50ms 后发正确响应 → Timeout（D-1）。
+        let txn1 = [0x31u8; 12];
+        let forged_public: SocketAddr = "203.0.113.9:50000".parse().unwrap();
+        let legit_public: SocketAddr = "198.51.100.7:41000".parse().unwrap();
+        let forged = binding_response(txn1, forged_public);
+        let legit_response = binding_response(txn1, legit_public);
+        let coordinator = {
+            let legit = legit.try_clone().expect("clone legit");
+            let attacker = attacker.try_clone().expect("clone attacker");
+            thread::spawn(move || {
+                let mut buf = [0u8; 1500];
+                legit
+                    .set_read_timeout(Some(Duration::from_millis(500)))
+                    .expect("set legit read timeout");
+                let _ = legit.recv_from(&mut buf).expect("probe request arrives");
+                let _ = attacker.send_to(&forged, driver_addr);
+                thread::sleep(Duration::from_millis(50));
+                let _ = legit.send_to(&legit_response, driver_addr);
+            })
+        };
+        let err = transport
+            .send_recv(
+                &binding_request(txn1),
+                legit_addr,
+                Duration::from_millis(400),
+            )
+            .expect_err("forged response must never be accepted");
+        assert!(
+            matches!(err, StunError::Timeout),
+            "forged-first must yield Timeout, got {err:?}"
+        );
+        coordinator.join().unwrap();
+
+        // 第 2 轮：干净路径（正确源）→ Ok，字节可解析为同一映射。
+        let txn2 = [0x32u8; 12];
+        let clean_response = binding_response(txn2, legit_public);
+        let clean_sender = {
+            let sock = legit.try_clone().expect("clone legit");
+            thread::spawn(move || {
+                let mut buf = [0u8; 1500];
+                sock.set_read_timeout(Some(Duration::from_millis(500)))
+                    .expect("set legit read timeout");
+                let _ = sock.recv_from(&mut buf).expect("probe request arrives");
+                let _ = sock.send_to(&clean_response, driver_addr);
+            })
+        };
+        let bytes = transport
+            .send_recv(
+                &binding_request(txn2),
+                legit_addr,
+                Duration::from_millis(400),
+            )
+            .expect("clean source response must be accepted");
+        clean_sender.join().unwrap();
+        assert_eq!(
+            parse_binding_response(&bytes, &txn2).expect("parse clean response"),
+            legit_public
         );
     }
 }
