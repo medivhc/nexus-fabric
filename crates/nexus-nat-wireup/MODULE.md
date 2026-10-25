@@ -35,6 +35,9 @@
 
 ## Forbidden Dependencies
 第三方新依赖；tokio；`nexus-path` 的写入式接入（只读登记）。
+- `nexus-connectivity`（v9 CLI 产品线运行时，frozen；**目标态禁止**）。
+  当前残留接缝：①`NatType`，由 P1（迁 `nexus-domain::nat`）清除，
+  见 `docs/DOC-AUDIT-2026-10-26-dual-stack.md` 与 `docs/adr/0001-dual-stack-boundary.md`。
 
 > 范围澄清（2026-10-02）：以上禁令约束 `src/` 实现。`examples/e4_prod_switch.rs`
 > 作为 E4 验证，为接线完整切换栈（PathLink + QualityMonitor）可依赖

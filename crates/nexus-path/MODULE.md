@@ -51,6 +51,8 @@
 - `nexus-discovery`（Mesh 转发复用 FIB，但路径层通过 trait 抽象，不直接依赖；
   具体见 §Deletion Test）
 - 平台特有 API（保持 portable core 纯净）
+- `nexus-connectivity`（v9 CLI 产品线运行时，frozen）。跨栈词汇改用 `nexus-domain` /
+  `nexus-proxy-config` / `nexus-session` / `nexus-qos`（P3 落地）
 
 ## Invariants
 

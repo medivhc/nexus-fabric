@@ -38,6 +38,12 @@ contract: `6052e333abfac88c`（NAT 穿透 v1.1+doc-sync）
 无 I/O、无线程创建、无系统时间（`SystemTime`/`Instant::now`/`thread::sleep` 禁用）。
 `portable = true`（`policies/architecture.toml`）。
 
+## Forbidden Dependencies
+
+- `nexus-connectivity`（v9 CLI 产品线运行时，frozen；**目标态禁止**）。
+  当前残留接缝：①`NatType`，由 P1（迁 `nexus-domain::nat`）清除，
+  见 `docs/DOC-AUDIT-2026-10-26-dual-stack.md` 与 `docs/adr/0001-dual-stack-boundary.md`。
+
 ## 不变量
 
 - **单一总预算**：`deadline = clock.now_ms() + punch_timeout` 在 `run()` 入口起算，

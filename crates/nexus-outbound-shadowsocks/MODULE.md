@@ -53,6 +53,9 @@ method 冻结为 `chacha20-ietf-poly1305`（RustCrypto 纯 Rust 实现，wasm32-
 - `engineering/`、`nexus-proxy` / `nexus-network` 等领域业务 crate（出站 crate 不反向依赖编排层）。
 - 平台专有拦截 API / TUN / FFI 实现（`ring` 的 cc 构建除外，已评审）。
 - 未在 `policies/architecture.toml` 声明的内部 crate。
+- `nexus-connectivity`（v9 CLI 产品线运行时，frozen；**目标态禁止**）。
+  当前残留接缝：②`OutboundAdapter`，由 P2 清除，
+  见 `docs/DOC-AUDIT-2026-10-26-dual-stack.md` 与 `docs/adr/0001-dual-stack-boundary.md`。
 
 ## Invariants
 

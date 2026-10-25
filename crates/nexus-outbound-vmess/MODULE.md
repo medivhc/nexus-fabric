@@ -31,6 +31,9 @@ VMess AEAD 出站 adapter（PRODUCT.md §11.7）：实现
 ## Forbidden Dependencies
 
 - 平台 API、其它 outbound crate、registry/planner。
+- `nexus-connectivity`（v9 CLI 产品线运行时，frozen；**目标态禁止**）。
+  当前残留接缝：②`OutboundAdapter`，由 P2 清除，
+  见 `docs/DOC-AUDIT-2026-10-26-dual-stack.md` 与 `docs/adr/0001-dual-stack-boundary.md`。
 
 ## Invariants
 
