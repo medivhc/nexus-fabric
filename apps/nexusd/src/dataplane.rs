@@ -1023,7 +1023,7 @@ impl Dataplane {
             return (
                 transparent_decision_from_target(&cached.target),
                 Some(cached.matched_rule),
-                Some(cached.selected_outbound),
+                transparent_egress_hint(&cached.target),
                 false,
             );
         }
@@ -1048,17 +1048,13 @@ impl Dataplane {
             .as_ref()
             .map(|e| e.matched_rule.clone())
             .unwrap_or_default();
-        let selected_outbound = match &target {
-            nexus_domain::RouteTarget::Egress { peer } => peer.clone(),
-            nexus_domain::RouteTarget::MeshPeer { peer } => peer.clone(),
-            nexus_domain::RouteTarget::Drop => "drop".to_string(),
-        };
+        let selected_outbound = transparent_selected_outbound(&target);
         self.decision_cache.insert(
             cache_key,
             CachedDecision {
                 target: target.clone(),
                 matched_rule: matched_rule.clone(),
-                selected_outbound: selected_outbound.clone(),
+                selected_outbound,
                 last_seen_millis: now_millis,
             },
             now_millis,
@@ -1066,7 +1062,7 @@ impl Dataplane {
         (
             transparent_decision_from_target(&target),
             Some(matched_rule),
-            Some(selected_outbound),
+            transparent_egress_hint(&target),
             true,
         )
     }
@@ -2083,6 +2079,24 @@ fn flow_decision_log(
 frontend=tproxy matched_rule={matched_rule} egress_hint={egress_hint} outbound={outbound} \
 session=-"
     )
+}
+
+/// `RouteTarget` 选定的出站 tag（`self` 表示 DIRECT）。
+fn transparent_selected_outbound(target: &nexus_domain::RouteTarget) -> String {
+    use nexus_domain::RouteTarget;
+    match target {
+        RouteTarget::Egress { peer } | RouteTarget::MeshPeer { peer } => peer.clone(),
+        RouteTarget::Drop => "drop".to_string(),
+    }
+}
+
+/// 规则决策对应的 `egress_hint`：DIRECT 不进入会话层，故为 `None`（spec §7.4）。
+fn transparent_egress_hint(target: &nexus_domain::RouteTarget) -> Option<String> {
+    use nexus_domain::RouteTarget;
+    match target {
+        RouteTarget::Egress { peer } if peer == "self" => None,
+        _ => Some(transparent_selected_outbound(target)),
+    }
 }
 
 /// `RouteTarget` → `TransparentDecision`（TUN/TPROXY 同规则语义）。
@@ -3440,6 +3454,56 @@ proto=udp frontend=tproxy matched_rule=- egress_hint=- outbound=self session=-"
             },
         );
         assert!(drop.contains("egress_hint=drop outbound=- session=-"));
+    }
+
+    /// S59 P4：TPROXY 决策的 `egress_hint` 必须与 TUN 路径一致——
+    /// DIRECT 流为 `None`（spec §7.4），Proxy 流为 `Some(tag)`；缓存命中亦然。
+    #[test]
+    fn transparent_decision_hint_matches_direct_and_proxy_semantics() {
+        use nexus_projection::egress::{Rule, SimpleRuleEngine};
+
+        let (mut dp, _mock) = test_dataplane();
+        dp.set_rule_engine(Box::new(SimpleRuleEngine::new(vec![
+            Rule {
+                cidr: "10.200.3.3/32".parse().expect("cidr"),
+                target: nexus_domain::RouteTarget::Egress {
+                    peer: "p1".to_string(),
+                },
+            },
+            Rule {
+                cidr: "0.0.0.0/0".parse().expect("cidr"),
+                target: nexus_domain::RouteTarget::Egress {
+                    peer: "self".to_string(),
+                },
+            },
+        ])));
+        let peer = SocketAddrV4::new(Ipv4Addr::new(10, 200, 1, 2), 40_000);
+        let direct_dst = SocketAddrV4::new(Ipv4Addr::new(10, 200, 2, 2), 8080);
+        let proxy_dst = SocketAddrV4::new(Ipv4Addr::new(10, 200, 3, 3), 8080);
+
+        let (decision, _, hint, fresh) = dp.transparent_decision(peer, direct_dst, 6, 1);
+        assert!(fresh);
+        assert_eq!(decision, TransparentDecision::Direct);
+        assert_eq!(hint, None, "DIRECT must not carry an egress_hint");
+
+        let (decision, _, hint, fresh) = dp.transparent_decision(peer, proxy_dst, 6, 2);
+        assert!(fresh);
+        assert_eq!(
+            decision,
+            TransparentDecision::Proxy {
+                outbound: "p1".to_string(),
+                fallback: Vec::new(),
+            }
+        );
+        assert_eq!(hint.as_deref(), Some("p1"));
+
+        // 缓存命中必须复用同一语义（不得回落到 selected_outbound）。
+        let (_, _, hint, fresh) = dp.transparent_decision(peer, direct_dst, 6, 3);
+        assert!(!fresh);
+        assert_eq!(hint, None, "cached DIRECT decision must stay hint-free");
+        let (_, _, hint, fresh) = dp.transparent_decision(peer, proxy_dst, 6, 4);
+        assert!(!fresh);
+        assert_eq!(hint.as_deref(), Some("p1"));
     }
 
     /// S59：UDP 去重依据决策缓存命中——同流第二包不再算"新流"。
