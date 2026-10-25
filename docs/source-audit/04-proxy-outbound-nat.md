@@ -40,7 +40,7 @@
 
 ## 2. nexus-proxy / config / transport 真实职责与接线
 
-- **nexus-proxy 不是代理转发主体**。它是纯决策内核：`RuleEngine`（`lib.rs:634`）对 `FlowTarget` 线性首匹配；`SelectorGroup`/`UrltestGroup`/`LoadBalance`/`Relay` 四种策略组；`ProxyService::route`（`:1005`）产出 `RoutingDecision`；`activate_outbound`（`:1072`）把选定 tag 委派给注入的 `LinkActivator<P:LinkProbe>`。它**不监听本地端口、不读写 socket**——`tun.rs:54 TunNatRouter` 也只做 per-packet 五元组决策缓存。
+- **nexus-proxy 不是代理转发主体**。它是纯决策内核：`RuleEngine`（`lib.rs:634`）对 `FlowTarget` 线性首匹配；`SelectorGroup`/`UrltestGroup`/`LoadBalance`/`Relay` 四种策略组；`ProxyService::route`（`:1005`）产出 `RoutingDecision`；`activate_outbound`（`:1072`）把选定 tag 委派给注入的 `LinkActivator<P:LinkProbe>`。它**不监听本地端口、不读写 socket**；历史上的 per-packet 五元组缓存已迁移到 `nexus-projection::transparent::decision::FlowDecisionCache`（TUN/TPROXY 共用）。
 - **出站激活委派边界**（`:1090-1100`）：Direct/Relay 才进 `LinkActivator`；Shadowsocks/Vmess/Trojan/Anytls/Vless/Hysteria2/Socks5 的 relay candidate 一律 `None`，注释称"由对应 nexus-outbound-* adapter 在 Composition Root 承接"。
 - **proxy-config**：手写 YAML 子集 AST 解析器（零第三方依赖），`OutboundKind` 9 变体（`:309`），`OutboundConfig` 富字段（method/password/alpn/uuid/flow/tls/sni/ports/up/down/obfs_password…），并带 clash 订阅 base64 解析与订阅运行时状态机（`:1458/:1596`，真正 HTTP 拉取在组合根 `:1488`）。
 - **proxy-transport**：per-link 隧道层，把 QUIC datagram 经"TCP 代理握手 + u16BE 帧"承载，实现 `nexus_fabric::UdpTransport`。四种真握手（SOCKS5 RFC1928/1929、SS 复用 outbound-shadowsocks 的 `SsStream`、Trojan 明文、Trojan-TLS rustls）。这是生产 nexusd 真正拨号的层（`apps/nexusd/src/tcp_relay.rs:209-233`）。
