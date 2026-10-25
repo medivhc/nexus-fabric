@@ -89,8 +89,14 @@
   为 `AuthorizationDenied`，禁止抹成通用建连失败）+ `DIAL` 字节中继回退；
   host 侧支持 service（ECHO 往返）/ internet-access（真实 HTTP GET）/ compute（表达式求值）。
 - 真实 SOCKS5 代理数据面（PRODUCT §11.4）：`proxy_serve_once` /
-  `DEFAULT_PROXY_CONFIG` —— 握手（Socks5Handshake）→ 规则路由（nexus-proxy）
-  → Session 双轨 → 真实出站连接 → 双向字节中继。
+  `DEFAULT_PROXY_CONFIG` —— 握手（Socks5Handshake / HttpProxyHandshake）→ 规则路由
+  （nexus-proxy）→ Session 双轨 → 真实出站连接 → 双向字节中继。
+  **CONNECT 应答暂存**（`deferred_reply::DeferredConnectReply`，spec §5.7 步骤 1）：
+  握手循环只立即写出非 `Established` 步的应答（method-selection / 错误应答）；
+  `Established` 步的 success 交调用方写出——非 trojan 出站在路由之后、出站建连之前
+  立即写出（字节与既有逻辑点不变），trojan 出站在 TLS 握手 + 请求头 + seed 全部
+  flush 完成、set nonblocking 之前写出。失败应答字节形状（SOCKS5 10B / HTTP 502）
+  与拒绝路径的有界 drain 由同一模块提供（失败路径接线在 §5.7 步骤 2）。
 - 真实节点测速（PRODUCT §11.10）：TcpLatencyProbe（std::net connect_timeout，非 portable）
   + Http204LatencyProbe（connect 后发单行 GET、等响应首行 204，非 portable）
   + proxy_speedtest_with(probe, candidates, timeout, target_label, probe_kind)（批量测速、RTT 排序 JSON 输出）；结果可经 MeasurementSource 喂 urltest。
