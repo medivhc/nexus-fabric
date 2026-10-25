@@ -1,9 +1,10 @@
 //! E4: product.proxy-transport-ss (T1/T3/T6).
 //!
 //! Minimal ss server S on 127.0.0.1:0. Like a real ss proxy, S *terminates*
-//! the AEAD session: `read_record` → `open` (Server role) → `parse_request`
-//! → target; replies `seal(b"ss-proxy-ok")`; then relays the decrypted
-//! framed bytes A↔B (A→B: open+forward; B→A: seal+write_record).
+//! the **SIP004** AEAD session: streaming `open` (Server role) →
+//! `parse_request` → target; replies a sealed `b"ss-proxy-ok"` chunk (the
+//! first write carries S's salt); then relays the decrypted framed bytes
+//! A↔B (A→B: open+forward; B→A: seal+write).
 //!
 //! B listens on TCP 127.0.0.1:0, wraps accepted streams in the plain
 //! [`FramedTransport`] (the S↔B leg is decrypted framed bytes), serves QUIC
@@ -19,10 +20,10 @@
 //! (4b lesson: premature drop shuts down the driver and loses echo data).
 
 use nexus_fabric::{ConnConfig, FabricConn, FabricListener, PeerId};
-use nexus_outbound_shadowsocks::{
-    parse_request, read_record, write_record, Role, SsStream, SsTarget,
+use nexus_outbound_shadowsocks::{parse_request, Role, SsStream, SsTarget};
+use nexus_proxy_transport::{
+    FramedTransport, SsMethod, SsProxyConfig, SsTransport, MAX_SEALED_FRAME,
 };
-use nexus_proxy_transport::{FramedTransport, SsMethod, SsProxyConfig, SsTransport};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{
@@ -81,10 +82,23 @@ impl SsServer {
         // Handshake: open the sealed target frame (Server role).
         let mut session = SsStream::new(PASSWORD, SsMethod::Chacha20IetfPoly1305, Role::Server)
             .map_err(|e| std::io::Error::other(format!("ss server session: {e}")))?;
-        let rec = read_record(&mut a)?;
-        let plain = session.open(&rec).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("ss open: {e}"))
-        })?;
+        // Streaming handshake: one read may carry only part of the salt/chunk.
+        let mut hs_buf = [0u8; 4096];
+        let plain = loop {
+            let n = a.read(&mut hs_buf)?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "ss handshake eof",
+                ));
+            }
+            let plain = session.open(&hs_buf[..n]).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("ss open: {e}"))
+            })?;
+            if !plain.is_empty() {
+                break plain;
+            }
+        };
         let target = parse_request(&plain).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, format!("ss target: {e}"))
         })?;
@@ -97,8 +111,7 @@ impl SsServer {
                 ))
             }
         };
-        write_record(
-            &mut a,
+        a.write_all(
             &session
                 .seal(SS_ACK)
                 .map_err(|e| std::io::Error::other(format!("ss seal ack: {e}")))?,
@@ -147,8 +160,8 @@ impl SsServer {
 
 /// A→B: read 2-byte-framed sealed datagram → open → scan marker (X2) →
 /// forward the decrypted framed bytes.
-/// NOTE: the handshake used u32 `write_record` framing (outbound crate);
-/// the data path uses the shared 2-byte framing (T4) — don't mix them.
+/// NOTE: the handshake is streamed SIP004 (no u32 record header); the data
+/// path layers the shared 2-byte framing (T4) on top of sealed chunks.
 fn relay_a_to_b(
     a: &mut TcpStream,
     b: &mut TcpStream,
@@ -163,6 +176,11 @@ fn relay_a_to_b(
             Ok(p) => p,
             Err(_) => break,
         };
+        // Empty is legal for a streaming decoder (partial logical chunk);
+        // never write a 0-length framed datagram downstream.
+        if plain.is_empty() {
+            continue;
+        }
         relayed.fetch_add(plain.len() as u64, Ordering::Relaxed);
         let mut window = std::mem::take(&mut tail);
         window.extend_from_slice(&plain);
@@ -187,7 +205,7 @@ fn read_sealed(r: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     let mut hdr = [0u8; 2];
     r.read_exact(&mut hdr)?;
     let len = u16::from_be_bytes(hdr) as usize;
-    if len > 1228 {
+    if len > MAX_SEALED_FRAME {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "sealed frame too large",

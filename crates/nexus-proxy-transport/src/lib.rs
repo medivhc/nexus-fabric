@@ -165,13 +165,32 @@ impl From<ProxyError> for io::Error {
 /// Applies to the *plaintext* datagram for every transport (X1, T1).
 pub const MAX_DATAGRAM: usize = 1200;
 
-/// AEAD seal overhead per datagram on the ss data path:
-/// 12B nonce || ciphertext+16B tag (must match `SsStream::seal`'s output
-/// format in `nexus-outbound-shadowsocks`; guarded by unit test).
-pub const SS_SEAL_OVERHEAD: usize = 12 + 16;
+/// SIP004 salt length per direction (bytes).
+pub const SS_SALT_LEN: usize = 32;
+
+/// AEAD seal overhead per **chunk** on the ss data path:
+/// len segment `(2 + 16)` + payload tag `16` = 34B.
+///
+/// This is a *per-chunk* number, not a per-datagram one: one datagram can
+/// contain more than one chunk in principle, although this transport seals
+/// each datagram as exactly one chunk (`MAX_DATAGRAM` < `0x3FFF`).
+/// Must match `SsStream::seal` in `nexus-outbound-shadowsocks`; guarded by
+/// unit test.
+pub const SS_SEAL_OVERHEAD: usize = (2 + 16) + 16;
+
+/// Overhead of the first chunk of a direction: chunk overhead + the 32B salt
+/// that prefixes the first sealed bytes (= 66B).
+pub const SS_FIRST_CHUNK_OVERHEAD: usize = SS_SEAL_OVERHEAD + SS_SALT_LEN;
 
 /// Largest accepted wire frame on the ss path (T4).
-pub const MAX_SEALED_FRAME: usize = MAX_DATAGRAM + SS_SEAL_OVERHEAD;
+///
+/// Bounds one sealed datagram including the optional salt-bearing first
+/// chunk: `MAX_DATAGRAM + SS_FIRST_CHUNK_OVERHEAD` = 1266B.
+///
+/// Note: 16417B (one max chunk) and 16449B (max chunk + salt) are *codec*
+/// /decoder-buffer bounds (SU-3), not this transport's frame bound. Plaintext
+/// datagrams stay capped at `MAX_DATAGRAM` (X1).
+pub const MAX_SEALED_FRAME: usize = MAX_DATAGRAM + SS_FIRST_CHUNK_OVERHEAD;
 
 /// Length-prefix width in bytes (big-endian u16).
 pub const FRAME_HEADER_LEN: usize = 2;

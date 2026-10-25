@@ -5,23 +5,27 @@
 //!
 //! Crypto and handshake primitives are **reused** from
 //! `nexus-outbound-shadowsocks` (T3) — never reimplemented here. The session
-//! ([`SsStream`]) uses HKDF-derived directional keys with a fixed counter
-//! nonce (**no random salt**); the wire format differs from public
-//! shadowsocks and interop with public ss servers is **not** claimed.
+//! ([`SsStream`]) speaks the **SIP004** wire format on the TCP leg
+//! (`salt(32) || chunk*`, streaming, random per-direction salt), so the
+//! codec is no longer a private look-alike.
+//!
+//! Honest boundary: the *ack handshake* and the transport topology are still
+//! Nexus-internal protocol (the far side is another Nexus node, not a public
+//! shadowsocks server). Interop with public ss servers is **not** claimed by
+//! this crate; only the product SOCKS5 carrier path is interop-tested.
 //!
 //! Topology (mirrors a real ss deployment): the ss server *terminates* the
 //! AEAD session, parses the target address frame, and relays the decrypted
 //! framed bytes to the target. The far side therefore speaks plain
 //! [`FramedTransport`] framing.
 
+use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use nexus_fabric::UdpTransport;
-use nexus_outbound_shadowsocks::{
-    encode_request, read_record, write_record, Role, SsMethod, SsStream, SsTarget,
-};
+use nexus_outbound_shadowsocks::{encode_request, Role, SsMethod, SsStream, SsTarget};
 use nexus_proxy_config::{OutboundConfig, OutboundKind};
 
 use crate::framed::FramedTransport;
@@ -114,10 +118,32 @@ fn ss_target(target: SocketAddr) -> Result<SsTarget, ProxyError> {
     }
 }
 
+/// Read stream bytes until the session yields a non-empty plaintext chunk.
+///
+/// SIP004 is streaming: a single `read` may deliver only part of the salt or
+/// part of a chunk, in which case `open` returns `Ok(empty)` and we keep
+/// reading. Errors stay typed (`SsCrypto` for AEAD/framing, `Io` for sockets).
+fn read_ack(stream: &mut TcpStream, session: &mut SsStream) -> Result<Vec<u8>, ProxyError> {
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut buf).map_err(ProxyError::Io)?;
+        if n == 0 {
+            return Err(ProxyError::BadReply("ss handshake ack truncated (eof)"));
+        }
+        let plain = session.open(&buf[..n]).map_err(ProxyError::SsCrypto)?;
+        if !plain.is_empty() {
+            return Ok(plain);
+        }
+    }
+}
+
 /// Perform the ss handshake: TCP connect → `seal(encode_request(target))`
 /// → await sealed `ss-proxy-ok` ack. Returns the stream and the established
 /// session — the session must stay with the transport (per-datagram
 /// seal/open on the data path), so this stays `pub(crate)`.
+///
+/// The handshake writes the SIP004 stream directly (no u32 record framing):
+/// the first write carries the client salt.
 fn ss_handshake(
     config: &SsProxyConfig,
     target: SocketAddr,
@@ -138,9 +164,8 @@ fn ss_handshake(
     let req = session
         .seal(&encode_request(&ss_tgt))
         .map_err(ProxyError::SsCrypto)?;
-    write_record(&mut stream, &req).map_err(ProxyError::Io)?;
-    let ack_rec = read_record(&mut stream).map_err(ProxyError::Io)?;
-    let ack = session.open(&ack_rec).map_err(ProxyError::SsCrypto)?;
+    stream.write_all(&req).map_err(ProxyError::Io)?;
+    let ack = read_ack(&mut stream, &mut session)?;
     if ack != SS_ACK {
         return Err(ProxyError::BadReply("unexpected ss handshake ack"));
     }
@@ -227,7 +252,10 @@ impl UdpTransport for SsTransport {
     /// connection *is* the target).
     fn send_to(&self, buf: &[u8], _target: SocketAddr) -> std::io::Result<usize> {
         // X1: the *plaintext* datagram limit stays 1200; the sealed wire
-        // frame may reach MAX_SEALED_FRAME (1228).
+        // frame may reach MAX_SEALED_FRAME (1266): the first chunk of a
+        // direction carries the 32B salt, later chunks cost 34B. Later
+        // frames here are single-chunk (1200 < 0x3FFF), so 1234B at most;
+        // 1266 covers the salt-bearing case and remains the accept bound.
         if buf.len() > MAX_DATAGRAM {
             return Err(ProxyError::FrameTooLarge(buf.len()).into());
         }
@@ -318,17 +346,49 @@ mod tests {
         addr
     }
 
+    /// Stream-read until the session yields non-empty plaintext.
+    fn read_plain(s: &mut TcpStream, sess: &mut SsStream) -> Vec<u8> {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = s.read(&mut buf).unwrap();
+            assert_ne!(n, 0, "eof while waiting for plaintext");
+            let plain = sess.open(&buf[..n]).unwrap();
+            if !plain.is_empty() {
+                return plain;
+            }
+        }
+    }
+
+    /// Stream-write one sealed chunk (first call carries the salt).
+    fn write_plain(s: &mut TcpStream, sess: &mut SsStream, plain: &[u8]) {
+        s.write_all(&sess.seal(plain).unwrap()).unwrap();
+    }
+
+    /// Data path keeps the 2-byte frame on top of the sealed bytes.
+    fn read_frame(s: &mut TcpStream) -> Vec<u8> {
+        let mut hdr = [0u8; 2];
+        s.read_exact(&mut hdr).unwrap();
+        let len = u16::from_be_bytes(hdr) as usize;
+        let mut body = vec![0u8; len];
+        s.read_exact(&mut body).unwrap();
+        body
+    }
+
+    fn write_frame(s: &mut TcpStream, body: &[u8]) {
+        s.write_all(&(body.len() as u16).to_be_bytes()).unwrap();
+        s.write_all(body).unwrap();
+    }
+
     #[test]
     fn handshake_ok_with_ack() {
         let target: SocketAddr = "127.0.0.1:9000".parse().unwrap();
         let addr = fake_server("test-password", move |mut s, mut srv| {
-            let rec = read_record(&mut s).unwrap();
-            let plain = srv.open(&rec).unwrap();
+            let plain = read_plain(&mut s, &mut srv);
             assert_eq!(
                 ss_parse_request(&plain).unwrap(),
                 SsT::Ipv4([127, 0, 0, 1], 9000)
             );
-            write_record(&mut s, &srv.seal(SS_ACK).unwrap()).unwrap();
+            write_plain(&mut s, &mut srv, SS_ACK);
         });
         let (stream, _session) = ss_handshake(&test_config(addr), target).unwrap();
         assert!(stream.local_addr().is_ok());
@@ -340,10 +400,10 @@ mod tests {
         // Server uses a different password: client's ack open fails.
         let addr = fake_server("other-password", move |mut s, mut srv| {
             // Server can't open the client's request either, but it still
-            // seals *something* so the client gets a record to fail on.
-            let _ = read_record(&mut s);
-            let garbage = srv.seal(b"nope").unwrap();
-            write_record(&mut s, &garbage).unwrap();
+            // seals *something* so the client gets bytes to fail on.
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            s.write_all(&srv.seal(b"nope").unwrap()).unwrap();
         });
         let err = ss_handshake(&test_config(addr), target)
             .err()
@@ -361,10 +421,9 @@ mod tests {
     fn handshake_bad_ack_content_rejected() {
         let target: SocketAddr = "127.0.0.1:9000".parse().unwrap();
         let addr = fake_server("test-password", move |mut s, mut srv| {
-            let rec = read_record(&mut s).unwrap();
-            srv.open(&rec).unwrap();
+            read_plain(&mut s, &mut srv);
             // Correct keys, wrong ack content.
-            write_record(&mut s, &srv.seal(b"wrong-ack").unwrap()).unwrap();
+            write_plain(&mut s, &mut srv, b"wrong-ack");
         });
         let err = ss_handshake(&test_config(addr), target)
             .err()
@@ -391,14 +450,28 @@ mod tests {
 
     #[test]
     fn seal_overhead_matches_const() {
-        // MAX_SEALED_FRAME's 28B overhead must match SsStream::seal's output
-        // format (12B nonce || ct+tag); this test guards the coupling.
-        let mut s = SsStream::new("pw", SsMethod::Chacha20IetfPoly1305, Role::Client).unwrap();
-        assert_eq!(s.seal(&[]).unwrap().len(), crate::SS_SEAL_OVERHEAD);
+        // SIP004: empty plaintext emits nothing (and no salt); one byte costs
+        // 32(salt) + 18(len) + 1 + 16(tag) = 67 the first time and 18+1+16 = 35
+        // afterwards. The per-chunk overhead is 34 and the first-chunk
+        // overhead (with salt) is 66.
+        assert_eq!(crate::SS_SEAL_OVERHEAD, 34);
+        assert_eq!(crate::SS_SALT_LEN, 32);
+        assert_eq!(crate::SS_FIRST_CHUNK_OVERHEAD, 66);
         assert_eq!(
             crate::MAX_SEALED_FRAME,
-            crate::MAX_DATAGRAM + crate::SS_SEAL_OVERHEAD
+            crate::MAX_DATAGRAM + crate::SS_FIRST_CHUNK_OVERHEAD
         );
+
+        let mut s = SsStream::new("pw", SsMethod::Chacha20IetfPoly1305, Role::Client).unwrap();
+        assert!(s.seal(&[]).unwrap().is_empty());
+        assert_eq!(s.seal(b"x").unwrap().len(), 67);
+        assert_eq!(s.seal(b"y").unwrap().len(), 35);
+
+        // One max-size datagram is exactly one chunk: first frame 1266
+        // (salt-bearing), later frames 1234 — both inside MAX_SEALED_FRAME.
+        let mut t = SsStream::new("pw", SsMethod::Chacha20IetfPoly1305, Role::Client).unwrap();
+        assert_eq!(t.seal(&vec![0u8; crate::MAX_DATAGRAM]).unwrap().len(), 1266);
+        assert_eq!(t.seal(&vec![0u8; crate::MAX_DATAGRAM]).unwrap().len(), 1234);
     }
 
     #[test]
@@ -464,24 +537,18 @@ mod tests {
                 Role::Server,
             )
             .unwrap();
-            // handshake
-            let rec = read_record(&mut s).unwrap();
-            let plain = srv.open(&rec).unwrap();
+            // handshake (streaming SIP004)
+            let plain = read_plain(&mut s, &mut srv);
             assert_eq!(
                 ss_parse_request(&plain).unwrap(),
                 SsT::Ipv4([127, 0, 0, 1], 7777)
             );
-            write_record(&mut s, &srv.seal(SS_ACK).unwrap()).unwrap();
-            // echo one sealed datagram back (framed)
-            let mut hdr = [0u8; 2];
-            s.read_exact(&mut hdr).unwrap();
-            let len = u16::from_be_bytes(hdr) as usize;
-            let mut sealed = vec![0u8; len];
-            s.read_exact(&mut sealed).unwrap();
+            write_plain(&mut s, &mut srv, SS_ACK);
+            // echo one sealed datagram back (still 2-byte framed on the data path)
+            let sealed = read_frame(&mut s);
             let pt = srv.open(&sealed).unwrap();
             let back = srv.seal(&pt).unwrap();
-            s.write_all(&(back.len() as u16).to_be_bytes()).unwrap();
-            s.write_all(&back).unwrap();
+            write_frame(&mut s, &back);
         });
         let mut tx = SsTransport::connect(&test_config(addr), target).unwrap();
         assert_eq!(tx.counters().0, 1); // T6 handshake_ok
@@ -512,9 +579,8 @@ mod tests {
                 Role::Server,
             )
             .unwrap();
-            let rec = read_record(&mut s).unwrap();
-            srv.open(&rec).unwrap();
-            write_record(&mut s, &srv.seal(SS_ACK).unwrap()).unwrap();
+            read_plain(&mut s, &mut srv);
+            write_plain(&mut s, &mut srv, SS_ACK);
         });
         let tx = SsTransport::connect(&test_config(addr), target).unwrap();
         let big = vec![0u8; MAX_DATAGRAM + 1];
