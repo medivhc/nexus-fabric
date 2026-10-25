@@ -12,6 +12,7 @@
 # 下面只写 `alpn`：缺省走系统根证书校验。只有当服务端证书不在系统信任链内（自签 /
 # 企业内网 CA）时才显式写 `skip_cert_verify: true`。
 # Trojan 的 UDP 不可用（TLS Trojan 的 UDP 恒为 Unsupported，永久丢包）。
+# 配置中的 `udp` 键不是 trojan 出站的真实字段，写了也不生效（fixes-5 PR-3）。
 
 schema_version: 1
 
