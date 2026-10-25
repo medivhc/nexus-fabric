@@ -443,6 +443,13 @@ SOCKS5 入站（Socks5Handshake 状态机，真实字节流）
   拨号（Direct 语义）；不引入加密代理协议（与 §11.2 边界一致）。
 - 每次会话必须可观察：握手结果（NO-AUTH 回复）、CONNECT 回复码、命中规则、
   选定出站 tag、Session phase/outcome、双向中继字节数。
+- **CONNECT success 时序（2026-10-26，requirement-change / protocol-interop-fixes-5）**：
+  `Established` 步的 success 应答暂存（`DeferredConnectReply`），由调用方在「出站就绪」
+  时写出——非 trojan 出站仍在既有逻辑点（路由之后、出站建连之前）立即写出，字节与时序
+  不变；trojan 出站推迟到 TLS 握手 + 请求头 + seed flush 完成之后（fail-closed 窗口，
+  见 §11.9.3）。失败在 CONNECT 应答阶段对用户可观察（SOCKS5 `REP != 0` / HTTP `502`），
+  不再出现「先回 success、再把服务端 fallback 页面当隧道数据」的形态。成功会话 JSON
+  增加 `socks.reply_sent`、`socks.reply_deferred_ms` 与 trojan 的 `tunnel` 观测对象。
 - E4 场景：`scenarios/product/daemon_real_socks_proxy_flow.toml`（本地 HTTP 目标
   + 原始 SOCKS5 客户端经代理真实往返 HTTP 200）。
 
@@ -657,6 +664,47 @@ hex(SHA-224(password)) | CRLF | CMD(0x01 CONNECT) | ATYP | ADDR | PORT(BE) | CRL
 - `password` 必填且非空、`locator` 必填（`host:port`）；缺失 → `CONFIG_INVALID`；
 - `header_format` 若给值，必须是 `standard` 或 `singbox`，其它值 → `CONFIG_INVALID`；
 - 未给 `header_format` 时按 `standard` 解释（不翻转既有默认）。
+
+**第一响应守卫（2026-10-26，requirement-change / protocol-interop-fixes-5）**
+
+TLS 握手 + Trojan 请求头写完之后进入「就绪窗口」，在写出本地 CONNECT 应答前用首包
+判定节点是否真的接受了本次连接（Trojan 无响应头、无密码校验回执，只能从首个下行字节
+与目标端口推断）：
+
+- `fallback_guard: Option<String>`：`"strict"`（缺省）| `"signature"`；**不存在 `off`**
+  （没有完全关闭守卫的官方开关）。
+  - `strict`：只放行端口绑定的 server-first greeting 白名单——22 `SSH-`、21/25/587 `220`、
+    110 `+OK`、143 `* OK`、5900 `RFB `；其余首包一律判失败（含 HTTP 状态行）。
+  - `signature`：**明确标注的安全降级（官方逃生口）**，只拒绝 `HTTP/` 状态行，其余放行，
+    因此非 HTTP fallback 全部漏报。切换即接受该漏报面。
+  - `strict` 的确定代价（M-1~M-8 误杀面）：MySQL 3306 二进制握手、非规范端口 SSH
+    （如 2222）、telnet IAC、自定义 banner、SMTP 非 `220` 应答（554/421）、VNC/FTP/POP3/
+    IMAP 非规范端口、白名单前缀被 TCP 分片且 50ms 内未补齐、白名单端口但首包被中间盒
+    改写成非典型 banner —— 这些合法 server-first 目标在 `strict` 下会被拒绝；
+    `signature` 是它们的官方逃生口。
+- `ready_window_ms: Option<u64>`：`0..=5000`；缺省/`0` = 自适应窗口
+  `W = clamp(TcpStream::connect 耗时 + 50ms, 50ms, 600ms)`；`n>0` 时实际等待
+  `min(n, 5000)`ms。**只改等待时长，不改判据**。
+- 放行条件（按序）：客户端先载荷（载荷先写节点，零扣压）→ 立即 success；白名单 greeting
+  首包 → 立即 success；窗口静默到期 → success（延迟 = W）。
+- 失败条件：首包是 HTTP 状态行 / 严格模式下非白名单首包 / 首包前 EOF →
+  SOCKS5 `REP=0x01`（节点端口 `ECONNREFUSED` 为 `0x05`）、HTTP `502 Bad Gateway`，
+  有界 drain（≤64KiB 或 50ms）后正常关闭；不 flush `close_notify`、不写额外 TLS 记录。
+- **承诺边界**：只承诺「success 之前到达的 fallback 首包零字节投递」；success 之后才到达
+  的 fallback 首包不可判定（协议上限），登记为残余缺口，不写成已关闭。
+- 配置校验（spec fixes-5 §8）：两字段按 presence-aware 提取，字段存在但非法
+  （空串 / `off` / 未知枚举 / 越界 / 非整数）→ `CONFIG_INVALID
+  [outbounds[<tag>].<field>]`；非 trojan 出站上的**合法值忽略**、**非法值硬失败**。
+- 可观察：成功会话 JSON `tunnel = { readiness: "greeting"|"client_payload"|
+  "window_expired"|"client_aborted", pre_payload_down_bytes, guard, window_ms }`；
+  失败会话的 reason 固定为
+  `<prefix>: waited_ms=<u64> first_bytes_hex=<hex≤32> dest_port=<u16>`，
+  prefix ∈ {`tunnel connect failed`, `tunnel handshake failed`,
+  `trojan fallback signature detected`, `unsolicited server data rejected`,
+  `tunnel closed before ready`, `late fallback response discarded`}。
+- **已接受的行为变更**：无 fallback 的坏凭据（`Default/BadCredential`）本地形态由
+  「先 success 再 EOF」变为「CONNECT 应答阶段 `REP≠0`」；MATRIX 判定与错误分类
+  （`E_EXPECTED_AUTH_REJECT`）不变。
 
 真实节点样例（密码一律占位 `CHANGE_ME`，严禁真实凭据入库）：
 `examples/configs/trojan_nodes.example.yaml`（日本-TY-3 / 日本-OS-3 两节点，
@@ -938,15 +986,21 @@ SOCKS5 入站（Socks5Handshake，§11.4 不变）
   -> 双向字节中继（客户端 <-> 节点隧道）
 ```
 
-- 配置零新增：复用 `OutboundConfig` 既有字段（kind / locator / method / password /
-  alpn / skip_cert_verify / header_format），节点型 kind 的校验沿用 §11.9.3。
+- 配置：既有字段零变化（复用 kind / locator / method / password / alpn /
+  skip_cert_verify / header_format），节点型 kind 的校验沿用 §11.9.3；本节之外**唯一新增**
+  的是 §11.9.3 的 trojan 专属 `fallback_guard` / `ready_window_ms` 两字段
+  （2026-10-26 requirement-change）。
 - 用户可观察（新增字段；direct 会话不出现或为空）：
   - `routing.outbound_kind`：选定出站的 kind 标签（direct / shadowsocks / trojan / vmess）；
   - `outbound`：`{ kind, node_locator, method?, tls: { sni?, alpn?, skip_cert_verify? },
     header_format? }`（按 kind 可空）。
-- 失败语义：节点建连失败 / 协议握手失败 / 隧道中继失败 →
+- 失败语义：节点建连失败 / 协议握手失败 / 隧道中继失败 / **首包被判定为 fallback 或
+  非白名单 server-first（trojan，§11.9.3）** →
   `ConnectivityEstablishmentFailed { provider: <selected outbound tag> }`，会话级
   结构化 FAIL；服务循环继续 accept 下一会话（逐会话隔离，不中断 daemon）。
+  trojan 的失败在本地 CONNECT 应答阶段可观察（SOCKS5 `REP≠0` / HTTP `502`），
+  客户端在任何隧道载荷之前看到失败（详见 §11.9.3 与
+  `docs/protocols/interop/notes/trojan-fallback.md`）。
 - 回归保障：direct 路径与既有 `daemon_real_socks_proxy_flow` 行为零变化。
 - 冻结边界（本期不做）：UDP 隧道 / QUIC / 多路复用 / 节点自动切换（selector /
   urltest 已由 §11.1 提供）/ 订阅在线更新（已交付，见 §11.17，本边界不再冻结此项）。
@@ -1132,6 +1186,12 @@ TCP accept（apps/nexus，非 portable I/O）
   destination；其余路由 / Session / 字节计数与 §11.4 一致。
 - **失败语义**：坏 HTTP 请求行 → 400 响应后关闭会话（结构化错误，不 panic）；握手中途
   客户端断开 → 结构化内部错误，不静默直连。
+- **CONNECT 200 时序与失败应答（2026-10-26，requirement-change）**：CONNECT 的
+  `HTTP/1.1 200 Connection Established` 同样经 `DeferredConnectReply` 暂存——非 trojan
+  出站仍在既有逻辑点写出，trojan 出站推迟到出站就绪（§11.9.3 窗口）；trojan 出站失败
+  （建连失败 / 握手失败 / fallback 首包 / 非白名单首包 / 首包前 EOF）→
+  `HTTP/1.1 502 Bad Gateway\r\n\r\n` 后关闭（FIN），502 之后隧道字节 = 0。
+  非 CONNECT 的绝对形式转发维持「不回本地成功应答」（响应由上游 origin 透传）。
 - **E4 场景**：`scenarios/product/proxy_http_mixed_inbound.toml`——loopback 本地 HTTP
   origin（回 200）+ Nexus 混合入站：(i) 用原始 HTTP 代理客户端（绝对形式 GET）经混合端口
   请求 origin，断言 200；(ii) 同端口再发一个 CONNECT 隧道请求，断言 200 Connection
