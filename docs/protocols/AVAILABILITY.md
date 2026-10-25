@@ -25,21 +25,21 @@
 - **验证状态（verdict）**：`BROKEN`（命中规则 2）
 - **覆盖范围（scope）**：`PROTOCOL_SUBSET`
 - **是否可用（claim）**：`NOT_USABLE`
-- **root_cause_class**：`E_NEXUS_CODEC`
-- **根因/限制摘要**：认证响应 QPACK Huffman 编解码错误，共 8 格阻塞（均为 `E_NEXUS_CODEC`）；属单协议可解（编解码一处），修复后本 run schema 上限为 `VERIFIED / FULL`。
+- **root_cause_class**：`E_TIMEOUT_HANG`
+- **根因/限制摘要**：认证响应 QPACK Huffman 编解码错误；代表根因类为 `E_TIMEOUT_HANG`，剩余阻塞格为 `Default/TcpThroughput(FAIL,E_TIMEOUT_HANG)`，其余格 PASS。属单协议可解（编解码一处），修复后本 run schema 上限为 `VERIFIED / FULL`。
 
 ## Trojan
 
-- **验证状态（verdict）**：`BROKEN`（命中规则 1）
+- **验证状态（verdict）**：`PARTIAL`（命中规则 6）
 - **覆盖范围（scope）**：`TCP_ONLY`
-- **是否可用（claim）**：`NOT_USABLE`
-- **root_cause_class**：`E_NEXUS_FRAMING`
-- **根因/限制摘要**：fallback 静默接受（fail-open 安全语义问题）+ 产品 UDP 未实现；本 run `UdpEcho` 固定 `NOT_IMPLEMENTED`，即使其余修复完成上限仍为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`。
+- **是否可用（claim）**：`USABLE_WITH_GAPS`
+- **root_cause_class**：`E_NEXUS_NOT_IMPLEMENTED`
+- **根因/限制摘要**：fallback 主路径已 fail-closed（success 前零字节投递）；残余为 success 之后到达的 fallback（承诺边界 R-1/R-2）与产品 UDP 未实现。`missing_cells` 仅 `UdpEcho(NOT_IMPLEMENTED)`，本 run 上限为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`。
 
 ## Shadowsocks
 
-- **验证状态（verdict）**：`BROKEN`（命中规则 2）
+- **验证状态（verdict）**：`PARTIAL`（命中规则 6）
 - **覆盖范围（scope）**：`TCP_ONLY`
-- **是否可用（claim）**：`NOT_USABLE`
-- **root_cause_class**：`E_NEXUS_HANDSHAKE_WIRE`
-- **根因/限制摘要**：协议线格式 / SIP004 AEAD 实现错误（需协议重写）+ 产品 UDP 未实现；本 run `UdpEcho` 固定 `NOT_IMPLEMENTED`，修复后上限仍为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`。
+- **是否可用（claim）**：`USABLE_WITH_GAPS`
+- **root_cause_class**：`E_NEXUS_NOT_IMPLEMENTED`
+- **根因/限制摘要**：SIP004 线格式已由 `fixes-2` 修复（H/T1/T2/L/R 全 PASS）；剩余仅产品 UDP 未实现。`missing_cells` 仅 `UdpEcho(NOT_IMPLEMENTED)`，本 run 上限为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`。
