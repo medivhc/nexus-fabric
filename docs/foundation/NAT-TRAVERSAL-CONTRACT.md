@@ -2,7 +2,7 @@
 
 版本：v1.1 FROZEN（2026-10-24）
 设计基线：`docs/foundation/NAT-TRAVERSAL-DESIGN.md` v0.1（D1–D6 已拍板）
-**Contract hash：`f17a0f178a9e379c`**（本文件去掉本行后 sha256 前 16 hex）
+**Contract hash：`6052e333abfac88c`**（本文件去掉本行后 sha256 前 16 hex）
 状态：冻结。实现轨道不得修改本文件；只有合同必须变化时停下报告。
 
 ## 变更记录（v1.0 → v1.1）
@@ -167,7 +167,7 @@ pub struct NoopPredictor;
   不一致的样本不参与判定。
 - `plan` 只对 Predictable 返回 Some；`ports` 以 `base+delta` 为中心向两侧扩展
   K 个，`ports.len() <= 2*K+1`，u16 回绕按 wrapping 处理；端口 0 跳过。
-- `PredictionPlan::MappingProbe` 由 `run()` 在「本端 Symmetric、对端 cone」时使用。
+- `PredictionPlan::MappingProbe` **不是 `run()` 的实现路径**：`run()` 在「本端 Symmetric、对端 cone」分支使用私有 `SendPlan::Probes`，且先以本端 `assess` 门控（`assess != Predictable` 时零发送，见 `nexus-nat-traversal/MODULE.md` 的方向门控不变量）。`default_plan` 当前无调用者（死代码，另立 ticket 清理）。
 
 ## P4 打洞编排状态机
 

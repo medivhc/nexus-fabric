@@ -16,7 +16,7 @@ pub mod monitor;
 pub mod probe;
 
 pub use endpoint::{DatagramTransport, EndpointError, ProbeEndpoint};
-pub use monitor::{MeasuredPath, PathEventSink, ProbeRole, QualityMonitor};
+pub use monitor::{MeasuredPath, PathEventSink, ProbePolicy, ProbeRole, QualityMonitor};
 pub use probe::{LossProbe, PROBE_LEN, PROBE_MAGIC, ProbeMsg, decode, encode_ping, encode_pong};
 
 use std::sync::Arc;

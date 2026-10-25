@@ -65,17 +65,34 @@ impl<T: DatagramTransport> ProbeEndpoint<T> {
         ep
     }
 
-    /// Send one ping now. Records the nonce for loss accounting.
-    pub fn ping(&self, now_ms: u64) -> Result<(), EndpointError> {
-        let (_, frame) = self.probe.lock().unwrap().send_ping(now_ms);
+    /// Send one ping now with its own per-ping deadline. Records the nonce
+    /// for loss accounting.
+    pub fn ping(&self, now_ms: u64, deadline_ms: u64) -> Result<(), EndpointError> {
+        let (_, frame) = self.probe.lock().unwrap().send_ping(now_ms, deadline_ms);
         self.transport
             .send_dgram(&frame)
             .map_err(|e| EndpointError::Send(format!("{e:?}")))
     }
 
-    /// Expire pings older than `timeout_ms`.
-    pub fn expire(&self, now_ms: u64, timeout_ms: u64) {
-        self.probe.lock().unwrap().expire(now_ms, timeout_ms);
+    /// Expire pings whose own deadline elapsed; returns how many were newly
+    /// marked lost.
+    pub fn expire(&self, now_ms: u64) -> u32 {
+        self.probe.lock().unwrap().expire(now_ms)
+    }
+
+    /// Consecutive hard misses (used by the monitor's death/suspect logic).
+    pub fn consecutive_misses(&self) -> u32 {
+        self.probe.lock().unwrap().consecutive_misses()
+    }
+
+    /// Zero the consecutive-miss counter (called on probe-role changes).
+    pub fn reset_consecutive_misses(&self) {
+        self.probe.lock().unwrap().reset_consecutive_misses();
+    }
+
+    /// Age of the oldest outstanding ping at `now_ms`, if any.
+    pub fn oldest_outstanding_age_ms(&self, now_ms: u64) -> Option<u64> {
+        self.probe.lock().unwrap().oldest_outstanding_age_ms(now_ms)
     }
 
     /// Current loss estimate (`None` = no completed sample yet).
@@ -175,7 +192,7 @@ mod tests {
         let (ta, tb) = MockTransport::pair(Some(12));
         let ea = ProbeEndpoint::start(ta, None);
         let _eb = ProbeEndpoint::start(tb, None);
-        ea.ping(0).unwrap();
+        ea.ping(0, 2000).unwrap();
         // pong arrives asynchronously; wait for the completed sample.
         let lr = poll_until(|| ea.loss_rate(), Duration::from_secs(2)).unwrap();
         assert_eq!(lr, 0.0);
@@ -188,8 +205,8 @@ mod tests {
         // pings sit unread, so they expire as lost.
         let (ta, _tb) = MockTransport::pair(None);
         let ea = ProbeEndpoint::start(ta, None);
-        ea.ping(0).unwrap();
-        ea.expire(10_000, 2000);
+        ea.ping(0, 2000).unwrap();
+        ea.expire(10_000);
         assert_eq!(ea.loss_rate(), Some(1.0));
     }
 
@@ -204,9 +221,22 @@ mod tests {
         let got = fw_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(got, b"hello app");
         // and probes still work through the same queue
-        ea.ping(0).unwrap();
+        ea.ping(0, 2000).unwrap();
         let lr = poll_until(|| ea.loss_rate(), Duration::from_secs(2)).unwrap();
         assert_eq!(lr, 0.0);
+    }
+
+    #[test]
+    fn endpoint_reset_consecutive_misses_clears_counter() {
+        let (ta, _tb) = MockTransport::pair(None);
+        let ea = ProbeEndpoint::start(ta, None);
+        ea.ping(0, 300).unwrap();
+        assert_eq!(ea.oldest_outstanding_age_ms(100), Some(100));
+        assert_eq!(ea.expire(300), 1);
+        assert_eq!(ea.consecutive_misses(), 1);
+        ea.reset_consecutive_misses();
+        assert_eq!(ea.consecutive_misses(), 0);
+        assert_eq!(ea.oldest_outstanding_age_ms(1000), None);
     }
 
     #[test]
@@ -217,7 +247,7 @@ mod tests {
         _eb.transport.send_dgram(b"app-data").unwrap();
         thread::sleep(Duration::from_millis(100));
         // no panic, no misclassification; probe path unaffected
-        ea.ping(0).unwrap();
+        ea.ping(0, 2000).unwrap();
         let lr = poll_until(|| ea.loss_rate(), Duration::from_secs(2)).unwrap();
         assert_eq!(lr, 0.0);
     }

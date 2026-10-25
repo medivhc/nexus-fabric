@@ -35,10 +35,20 @@ std-only，无第三方依赖。
 ## Invariants
 - 探针帧格式（25B）：`[8B magic "NXQPROB!"][1B type 0x01=ping/0x02=pong][8B nonce BE][8B sent_ms BE]`。
   非探针 datagram 原样转交（`forward` channel）或按调用方约定丢弃，绝不静默吞掉。
-- `loss_rate` 语义：滑动窗口内已完成样本的丢失比例；无完成样本时为 `None`
-  （PathManager S7：无测量不参选）；窗口内全丢时为 `Some(1.0)`
-  （PathManager S6：记为 missed probe）。
-- 探针频率：active 路径 1s，backup（warm）路径 5s（见 Performance Budget）。
+- **loss 语义**：评分窗口固定 10 个已完成样本，窗口只用于评分。死亡由
+  `consecutive_misses >= 14` 判定；当 `consecutive_misses < 14` 时，供给给
+  `PathManager` 的 `loss_rate` 严格 <1.0（上限 0.999）；`Some(1.0)` 只在确认死亡时
+  供给，`PathManager` 仍以 3 次连续 1.0 报告触发 S6 failover。`path_loss()` 返回
+  原始窗口丢包率（诊断/测试），与供给值语义不同。
+- **探针频率/节奏**：active 1s、backup 5s；仅 Active 且在怀疑期加速到 100ms
+  （`consecutive_misses>=1` 或 `oldest_outstanding_age>=soft_miss_ms`）；
+  per-ping deadline `clamp(3×RTT,300,2000)ms`；monitor tick 100ms
+  （`ProbePolicy.tick_ms`；生产线程 sleep 间隔必须取该值）；death_misses=14；
+  `soft_miss_ms=clamp(2×RTT,100,500)ms`。
+- **死亡/迟到 pong**：每条 ping 携带自己的 deadline；`expire` 只按该 deadline
+  过期；迟到 pong 在 `2×该 deadline` 内命中 `recent_expired` 时清零
+  `consecutive_misses`；已 push 的窗口 false 不回收。`set_role` 清零连续 miss
+  计数（并清除 dead 日志 latch，不伪造 `path recovered`）。
 - 后台线程有界：`stop` flag + join；随 `QualityMonitor::shutdown` 结束，
   不泄漏（§13：Owner=QualityMonitor，取消=stop flag，回收=join）。
 
@@ -48,29 +58,49 @@ std-only，无第三方依赖。
 - datagram 流量（见 Performance Budget）。
 
 ## Public API
-`LossProbe::{new, send_ping, on_pong, expire, loss_rate}`、
+`LossProbe::{new, send_ping(now,deadline), on_pong, expire(now), loss_rate,
+consecutive_misses, oldest_outstanding_age_ms}`、
 `probe::{encode_ping, encode_pong, decode}`、`DatagramTransport`、
-`ProbeEndpoint::{start, ping, loss_rate, expire}`、
-`QualityMonitor::{new, add_path, remove_path, set_role, shutdown}`、
+`ProbeEndpoint::{start, ping(now,deadline), expire(now), reset_consecutive_misses,
+consecutive_misses, oldest_outstanding_age_ms, loss_rate, rtt_ms}`、
+`ProbePolicy`（字段/`Default`/`interval_ms`/`soft_miss_ms`/`deadline_ms`）、
+`QualityMonitor::{new, with_policy, add_path, remove_path, set_role, shutdown}`、
 `MeasuredPath`、`ProbeRole::{Active, Backup}`、`PathEventSink`。
+**不引入** `ProbeEndpoint::start_with_policy`（策略只属于 monitor）。
 
 ## Verification
 - 单测（E2）：帧编解码往返/拒识、LossProbe 全丢/全收/部分丢/空窗口/
-  未知 nonce、monitor 供给（mock transport + 真实 PathManager）。
+  未知 nonce、per-ping deadline、连续 miss 13/14 边界、迟到 pong 宽限、
+  monitor 供给（mock transport + 真实 PathManager）。
+- 死亡/时延：`supply_loss` 非死亡期严格 <1.0；虚拟时间
+  `death_within_4000ms_virtual`、`loss_25pct_never_dies_virtual_60s`
+  （60s、双向独立 25%、固定种子、钉住 13 连丢边界）、
+  `role_promotion_no_false_death`、`tick_dead_path_converges_to_full_loss`。
+- 生产节拍：`default_policy_tick_ms_is_100` 与
+  `production_start_sleeps_policy_tick`（线程 sleep 取有效 `ProbePolicy.tick_ms`）。
 - E4（真机，Track 1 联合）：relay→direct 真实切换不断流。
 
 ## Performance Budget
 - 单探针 ≤ 75B（含 QUIC 开销上确界）；active 1/s → 75 B/s（0.6 kbps）；
   backup 1/5s → 15 B/s。相对生产流量可忽略。
-- 滑动窗口 10 样本；ping 超时 2×间隔；monitor tick 200ms。
+- 窗口 10 个已完成样本（仅评分）；Active 1s / Backup 5s；怀疑期 100ms；
+  per-ping deadline `clamp(3×RTT,300,2000)`；tick 100ms；正常双向 ≈50B/s、
+  怀疑期 ≈500B/s（持续 ≤~1.5s）。
 
 ## Observability
 `eprintln!` 前缀 `[nat-quality]`（仅状态变化：add/remove/switch 驱动，
-不打 per-ping 日志）；`QualityStats { pings_sent, pongs_recv, timeouts }` 可查。
+不打 per-ping/per-tick 日志）；`QualityStats { pings_sent, pongs_recv, timeouts }` 可查。
+死亡状态变化：
+`[nat-quality] path dead: {addr} misses={n} at_ms={now_ms}` /
+`[nat-quality] path recovered: {addr} at_ms={now_ms}`。
 
 ## Recovery Semantics
 - 连接关闭：responder 线程因 `recv_datagram` Err 退出；monitor 跳过失败 ping，
   expire 后 loss→1.0，PathManager 按 S6 做 failover。
+- 迟到 pong 在 `2×该 ping 的 deadline` 宽限内命中 `recent_expired` 即清零连续
+  miss 计数（已 push 的窗口 false 不回收，评分略保守）。
+- role 切换（`set_role`）清零连续 miss 计数并清除 dead 日志 latch。
+- `path dead` / `path recovered` 只在状态变化时打印，不刷屏。
 - monitor 线程 panic 不传播（join 时忽略，只记日志），不影响调用方。
 
 ## Platform Constraints

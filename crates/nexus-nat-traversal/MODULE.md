@@ -1,6 +1,6 @@
 # MODULE.md — nexus-nat-traversal
 
-contract: `f17a0f178a9e379c`（NAT 穿透 v1.1）
+contract: `6052e333abfac88c`（NAT 穿透 v1.1+doc-sync）
 
 ## 职责
 
@@ -45,9 +45,12 @@ contract: `f17a0f178a9e379c`（NAT 穿透 v1.1）
 - **nonce**：`clock.now_ms()` + 进程内 `AtomicU64` 生成；同一虚拟毫秒内仍唯一；
   nonce 不匹配的 answer 丢弃、状态机不推进。
 - **方向与门控**：symmetric–symmetric 零发送；cone→symmetric 无 hint 零发送；
-  cone→symmetric 有 hint 只对单一 reflexive IP spray；symmetric→cone 只发
-  `mapping_probe_count` 个 probe、不 spray。
-- **零发送条件**：`NoCandidates`、`UnpredictableSymmetric` 时不发任何打洞包。
+  cone→symmetric 有 hint 只对单一 reflexive IP spray；symmetric→cone **仅当本端
+  `assess(own_samples) == Predictable`** 时发 `mapping_probe_count` 个 probe、
+  不 spray；本端 `assess != Predictable` 时以 `UnpredictableSymmetric` 零发送
+  （不构造 `SendPlan::Probes`）。
+- **零发送条件**：`NoCandidates`、`UnpredictableSymmetric`（含“symmetric→cone 且
+  本端不可预测”）时不发任何打洞包。
 - **exactly-one 终态**：`run()` 只返回一次终态，`Failed` 后不再回到成功态。
 - **same-socket**：`srflx_turn` 仅在 `turn_same_socket && cone` 时 authoritative，
   否则只诊断；`ordered()` 不读 `srflx_turn`。
@@ -67,10 +70,11 @@ contract: `f17a0f178a9e379c`（NAT 穿透 v1.1）
 
 ## 验证
 
-- 8 个虚拟时间测试（`crates/nexus-nat-traversal/tests/virtual_time.rs` + wireup
+- 10 个虚拟时间测试（`crates/nexus-nat-traversal/tests/virtual_time.rs` + wireup
   `repunch_after_300s`）：`coord_wait_uses_virtual_time`、`punch_timeout_at_5000ms`、
   `spray_pacing_50ms`、`spray_budget_3s`、`nonce_unique_without_wall_clock`、
-  `single_total_budget`、`mapping_probe_count_bounded`、`repunch_after_300s`。
+  `single_total_budget`、`mapping_probe_count_bounded`、`repunch_after_300s`、
+  `unpredictable_symmetric_local_sends_zero`、`assess_called_once_per_run`。
 - 错误映射：`SignalError` 8 变体、`PunchConfigError` 2 变体逐条测试。
 - grep 门：`rg -n "SystemTime|Instant::now|thread::sleep|std::thread" src` 无命中。
 - 编解码往返：v1 逐字节兼容；v2 prediction 逐字段、17→16、>16 → `TooMany`。
@@ -80,7 +84,7 @@ contract: `f17a0f178a9e379c`（NAT 穿透 v1.1）
 
 - 总预算 5s（`punch_timeout`）；协同时间窗 200ms。
 - spray 时间盒 3s、间隔 50ms、半径 K≤32（spray 包 ≤33）。
-- mapping probe 3 个 × 50ms。
+- mapping probe 3 个 × 50ms；本端不可预测时 0 个。
 - 虚拟时间套件墙钟 <2s。
 
 ## 可观测
