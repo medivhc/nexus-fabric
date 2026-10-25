@@ -1,0 +1,18 @@
+Nexus Path Layer — Red Evidence
+==============================
+Date: 2026-09-30
+Branch: feature/path-layer
+Contract hash: ec7a8c59ca2efdb6aa20fe5a71d66e284384bd76
+
+Scenario 1: product.fabric-path-basic
+  Command: cargo run --quiet -p nexus-path --example basic -- --json
+  Result: BLOCKED — crates/nexus-path/examples/ does not exist.
+          PathManager is an honest stub (all methods return NotImplemented).
+
+Scenario 2: product.fabric-path-roam
+  Command: cargo run --quiet -p nexus-path --example roam -- --json
+  Result: BLOCKED — crates/nexus-path/examples/ does not exist.
+          PathManager is an honest stub (all methods return NotImplemented).
+
+Conclusion: Both E4 scenarios are BLOCKED. Implementation has not started.
+This is the expected Red state before Spec Freeze.

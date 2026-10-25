@@ -1,0 +1,21 @@
+Nexus Path Fallback — Red Evidence
+===============================
+Date: 2026-09-30
+Branch: feature/path-fallback
+Contract hash: 4da9b8a565f40e69356668b66a6c4d8308a0e864
+
+Scenario 1: product.path-fallback
+  Command: cargo run --quiet -p nexus-path --example path_fallback -- --json
+  Result: BLOCKED — crates/nexus-path/examples/path_fallback.rs does not exist.
+          FallbackChain / connect_with_fallback are not implemented
+          (no matches in crates/nexus-path/src/).
+
+Scenario 2: product.path-fallback-skip
+  Command: cargo run --quiet -p nexus-path --example path_fallback_skip -- --json
+  Result: BLOCKED — crates/nexus-path/examples/path_fallback_skip.rs does not exist.
+          FallbackChain::expand skip counting (F4) is not implemented.
+
+Conclusion: Both new E4 scenarios are BLOCKED. Implementation has not started.
+This is the expected Red state before Spec Freeze (Contract-First Phase A).
+Existing scenarios (product.path-race, product.path-predict-ewma,
+product.fabric-path-basic/roam/rebind) are untouched by this contract.

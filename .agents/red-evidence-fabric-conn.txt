@@ -1,0 +1,48 @@
+# Red Evidence: nexus-fabric contract-first phase A
+
+date: 2026-09-30
+branch: feature/fabric-contract
+commits: 90b08bf (contract) + 4c7b82d (bugfix: Debug derive)
+contract_hash: 96391de9f2d657456c89387328ce3d2869e5c64b
+  (replicates nexus-harness contract_hash(): git hash-object over scenarios/**/*.toml)
+remote: xc-pc-linux /work/nexus-dev/nexus.git (pushed)
+evidence_host: xc-pc-linux (/tmp/fabric-red fresh clone)
+
+## Scenario execution on current (empty) implementation
+
+$ cargo run --quiet -p nexus-fabric --example basic -- --json
+=> error: no example target named `basic` in `nexus-fabric` package
+=> verdict: BLOCKED (product.fabric-conn-basic)
+
+$ cargo run --quiet -p nexus-fabric --example roam -- --json
+=> error: no example target named `roam` in `nexus-fabric` package
+=> verdict: BLOCKED (product.fabric-conn-roam)
+
+## Skeleton checks (same host)
+
+$ cargo check -p nexus-fabric
+=> ok (quinn-proto 0.11.18 resolved, default-features=false + rustls,ring)
+
+$ cargo test -p nexus-fabric
+=> ok: tests::contract_stage_stubs_are_honest (all constructors return
+   FabricError::Transport("not implemented (contract stage): ..."))
+
+## Interpretation
+
+Red = BLOCKED (capability absent), not FAIL. Contract (MODULE.md S1-S8,
+frozen scenario expectations, API surface) is now frozen under
+contract: 96391de9f2d657456c89387328ce3d2869e5c64b.
+Implementation phase may begin; it must make the two scenarios PASS
+without modifying frozen expectations (AGENTS.md Sec 5 Phase B).
+
+## Requirement-change (2026-09-30, pre-implementation)
+
+Defect found: harness TOML evaluator (scenario.rs) supports only
+equals/one_of/non_empty; the frozen expects using min/max/present were
+silently unevaluable. Fixed in commit 249ab59:
+- datagrams.received (min=1) -> datagrams.received_at_least_one == true
+- stats.rtt_ms (present) -> stats.rtt_ms non_empty (null fails)
+- stream.stalled_ms (max=5000) -> stream.stalled_within_budget == true
+New contract hash: 5caf56cbe06abce157ab616daba6441f69950b40
+Old evidence STALE by rule. Red re-established on xc-pc-linux 2026-09-30:
+both scenario commands still BLOCKED ("no example target").

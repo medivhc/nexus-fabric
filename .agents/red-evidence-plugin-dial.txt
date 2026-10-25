@@ -1,0 +1,22 @@
+# Red Evidence — 插件接入真实拨号（P1–P6）
+
+- Contract commit: `31e798e`
+- Contract hash: `b08bd8935c602e6026359e6eb9d957d5cd5d2b95`
+- 日期: 2026-09-30
+- 环境: 沙盒（无 cargo，按既有惯例以符号/文件缺席为 Red 依据；真机 E4 在实现阶段补）
+
+## Red 断言（旧实现上）
+
+1. `scenarios/product/plugin_dial_ss.toml` 的 `[when].command`
+   (`cargo run -p nexus --example plugin_dial_ss`) 引用了一个不存在的
+   example → 运行即 BLOCKED。
+   - `ls apps/nexus/examples/ | grep plugin_dial` → 0 命中
+2. 契约要求的 API 符号在实现中不存在：
+   - `grep -rn "dial_with_obfs\|wrap_stream" crates/ apps/ --include="*.rs"` → 0 命中
+   - `global_registry` 仅出现在 `crates/nexus-plugin/MODULE.md` 文档中，实现为 0
+3. `OutboundConfig` 无 `obfs`/`obfs_key` 字段（`nexus-proxy-config` 未改）。
+
+## Verdict
+
+**BLOCKED** — 能力不存在，两个新 scenario 在当前实现上无法运行。
+（待实现阶段在 xc-pc-linux 真机上跑出 PASS/FAIL 的执行证据。）
