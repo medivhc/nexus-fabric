@@ -3318,7 +3318,14 @@ mod tests {
             ]
         );
         assert_eq!(members.len() * 2, 8, "4 members × 2 flags");
-        assert_eq!(skipped, 45, "49 workspace members - 4 with features");
+        // Derived from the same metadata instead of a pinned census: the old
+        // literal (45, from "49 workspace members - 4 with features") broke on
+        // every workspace member addition/removal.
+        assert_eq!(
+            skipped,
+            member_names(&meta).len().saturating_sub(members.len()),
+            "skipped = workspace members without features"
+        );
     }
 
     #[test]
@@ -3439,22 +3446,45 @@ mod tests {
     fn parse_shared_output_targets_and_durations() {
         let meta = crate::env::cargo_metadata().expect("cargo metadata");
         let expected = integration_targets(&meta);
-        // Fixes-2 adds two integration targets: crates/nexus-outbound-shadowsocks/
-        // tests/sip004_kat.rs and apps/nexus/tests/ss_arm_stream_pump.rs.
-        assert_eq!(expected.len(), 37);
+        // The expected set is derived from live cargo metadata on purpose:
+        // this test guards the parser against the real workspace shape, so
+        // it must not pin a literal target count. The old hardcoded 37 broke
+        // the moment apps/nexusd/tests/nat_readiness.rs landed (the count
+        // became 38), and any future added/removed integration target would
+        // break it again. To re-derive the count by hand: run
+        // `cargo metadata --format-version 1` and count the (package, target)
+        // pairs of workspace members whose target kind contains "test" --
+        // exactly what integration_targets() above collects.
+        assert!(
+            !expected.is_empty(),
+            "cargo metadata must yield integration targets"
+        );
         let (lines, exec_map) = sample_shared_output(&expected, "ok");
         let run = parse_shared_output(&lines, 1234, true, &meta, &exec_map);
         assert_eq!(
             run.targets.len(),
-            37,
+            expected.len(),
             "duplicate target names must stay distinct"
+        );
+        let dataplane_mock_expected = expected
+            .iter()
+            .filter(|(_, name)| name.as_str() == "dataplane_mock")
+            .count();
+        // Floor, not a census: the distinctness property under test needs a
+        // real same-name collision in the workspace (two packages ship a
+        // `dataplane_mock` integration target today). If that premise ever
+        // disappears, fail loudly here instead of passing vacuously on 0 == 0.
+        assert!(
+            dataplane_mock_expected >= 2,
+            "workspace must keep >= 2 dataplane_mock targets for this test to mean anything"
         );
         assert_eq!(
             run.targets
                 .iter()
                 .filter(|t| t.target == "dataplane_mock")
                 .count(),
-            2
+            dataplane_mock_expected,
+            "same-name targets in different packages must stay distinct"
         );
         for target in &run.targets {
             assert_eq!(target.duration_ms, 250, "{}", target.target);
