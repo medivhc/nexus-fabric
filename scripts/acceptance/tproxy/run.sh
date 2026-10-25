@@ -613,6 +613,8 @@ step_s7() {
     ns_exec "${NS_R}" iptables -t mangle -S >"$ev/iptables-before.txt" 2>&1 || true
     stop_nexusd
     sleep 0.4
+    # 删除 setup_topology 添加的客户端子网拓扑路由，table 100 只剩产品清理结果。
+    ns_exec "${NS_R}" ip route del "${CLIENT_SUBNET}" dev "${VR}" table 100 >/dev/null 2>&1 || true
     ns_exec "${NS_R}" iptables -t mangle -S >"$ev/iptables.txt" 2>&1 || true
     ns_exec "${NS_R}" ip rule show >"$ev/ip-rule.txt" 2>&1 || true
     ns_exec "${NS_R}" ip route show table 100 >"$ev/ip-route.txt" 2>&1 || true

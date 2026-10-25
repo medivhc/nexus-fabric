@@ -18,6 +18,7 @@ NFT_PATH="${NFT_ROOT}/usr/sbin"
 NFT_LIB="${NFT_ROOT}/usr/lib/x86_64-linux-gnu"
 
 CLIENT_ADDR="10.200.1.2"
+CLIENT_SUBNET="10.200.1.0/24"
 ROUTER_CLIENT_ADDR="10.200.1.1"
 ROUTER_UP_ADDR="10.200.2.1"
 UPSTREAM_ADDR="10.200.2.2"
@@ -224,6 +225,12 @@ setup_topology() {
     ns_exec "${NS_R}" sysctl -qw net.ipv4.ip_forward=1
     ns_exec "${NS_R}" sysctl -qw net.ipv4.conf.all.rp_filter=0
     ns_exec "${NS_R}" sysctl -qw net.ipv4.conf.default.rp_filter=0
+
+    # 本机 fib_validate_source 对带 fwmark 的入包按 table 100 做反向源校验；
+    # table 100 若只有 `local default`（RTN_LOCAL），校验失败会把 TPROXY 包丢掉。
+    # 补一条客户端子网的 unicast 反向路由（拓扑属性；S7 断言前删除）。
+    ns_exec "${NS_R}" ip route add "${CLIENT_SUBNET}" dev "${VR}" table 100
+    record "topology_route table=100 dst=${CLIENT_SUBNET} dev=${VR}"
 
     # upstream
     ns_exec "${NS_U}" ip link set lo up
