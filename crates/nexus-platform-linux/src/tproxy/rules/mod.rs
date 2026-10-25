@@ -144,6 +144,66 @@ pub(crate) fn run_probe(
     runner.run(program, &owned)
 }
 
+/// `ip route show table N` 输出是否已含本 backend 添加的 `local` 缺省路由。
+///
+/// iproute2 把 `local 0.0.0.0/0` 显示为 `local default dev lo scope host`，旧版
+/// 也可能原样显示 `local 0.0.0.0/0`；两条都识别，避免误判后重复 add。
+pub(crate) fn local_default_route_present(stdout: &str) -> bool {
+    stdout.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next() == Some("local") && matches!(fields.next(), Some("default" | "0.0.0.0/0"))
+    })
+}
+
+/// 探测 table 是否已有 `local` 缺省路由。
+///
+/// 全新 netns 中 table 尚不存在时 iproute2 以 exit=2 +
+/// `FIB table does not exist` 结束；这是"路由不存在"而非失败。
+pub(crate) fn route_exists(
+    runner: &mut dyn CommandRunner,
+    table: &str,
+) -> Result<bool, CaptureRuleError> {
+    let show = run_probe(runner, "ip", &["route", "show", "table", table])?;
+    if show.success() {
+        return Ok(local_default_route_present(&show.stdout));
+    }
+    if show.exit_code == Some(2) && show.stderr.contains("FIB table does not exist") {
+        return Ok(false);
+    }
+    Err(command_error("show-route", "ip", &show))
+}
+
+/// 添加 `local` 缺省路由；返回是否真的新增。
+///
+/// 并发 apply 时 add 可能撞上已存在的同路由（`RTNETLINK answers: File exists`），
+/// 此时按幂等收敛处理为"已存在"。
+pub(crate) fn add_local_route(
+    runner: &mut dyn CommandRunner,
+    table: &str,
+) -> Result<bool, CaptureRuleError> {
+    let add = run_probe(
+        runner,
+        "ip",
+        &[
+            "route",
+            "add",
+            "local",
+            "0.0.0.0/0",
+            "dev",
+            "lo",
+            "table",
+            table,
+        ],
+    )?;
+    if add.success() {
+        return Ok(true);
+    }
+    if add.stderr.contains("File exists") {
+        return Ok(false);
+    }
+    Err(command_error("add-route", "ip", &add))
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
@@ -153,6 +213,7 @@ pub(crate) mod test_support {
     pub struct FakeRunner {
         pub calls: Vec<(String, Vec<String>)>,
         pub fail_on: Option<String>,
+        pub fail_exit_code: Option<i32>,
         pub fail_stderr: String,
         pub output: String,
     }
@@ -185,7 +246,7 @@ pub(crate) mod test_support {
             if let Some(needle) = &self.fail_on {
                 if joined.contains(needle.as_str()) {
                     return Ok(CommandOutput {
-                        exit_code: Some(1),
+                        exit_code: Some(self.fail_exit_code.unwrap_or(1)),
                         stdout: String::new(),
                         stderr: self.fail_stderr.clone(),
                     });
@@ -196,6 +257,30 @@ pub(crate) mod test_support {
                 stdout: self.output.clone(),
                 stderr: String::new(),
             })
+        }
+    }
+
+    /// 共享句柄版 fake：把 runner 交给 backend 后仍可回看调用记录。
+    #[derive(Debug, Clone, Default)]
+    pub struct SharedFakeRunner(std::sync::Arc<std::sync::Mutex<FakeRunner>>);
+
+    impl SharedFakeRunner {
+        pub fn new(runner: FakeRunner) -> Self {
+            Self(std::sync::Arc::new(std::sync::Mutex::new(runner)))
+        }
+
+        pub fn calls(&self) -> Vec<(String, Vec<String>)> {
+            self.0.lock().unwrap().calls.clone()
+        }
+    }
+
+    impl CommandRunner for SharedFakeRunner {
+        fn run(
+            &mut self,
+            program: &'static str,
+            args: &[String],
+        ) -> Result<CommandOutput, CaptureRuleError> {
+            self.0.lock().unwrap().run(program, args)
         }
     }
 }

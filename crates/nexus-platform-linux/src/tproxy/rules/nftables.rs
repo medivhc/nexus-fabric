@@ -9,7 +9,7 @@ use nexus_platform::{
     CaptureRuleError, CaptureRuleSpec, RuleApplyReport, RuleCleanupReport, TransparentCaptureRules,
 };
 
-use super::{CommandRunner, SystemRunner, run_ok, run_probe};
+use super::{CommandRunner, SystemRunner, add_local_route, route_exists, run_ok, run_probe};
 
 #[derive(Debug)]
 enum Action {
@@ -180,30 +180,12 @@ impl NftablesCaptureRules {
 
     fn ensure_route(&mut self) -> Result<bool, CaptureRuleError> {
         let table = self.table();
-        let show = run_ok(
-            self.runner.as_mut(),
-            "show-route",
-            "ip",
-            &["route", "show", "table", &table],
-        )?;
-        if show.stdout.contains("local 0.0.0.0/0") {
+        if route_exists(self.runner.as_mut(), &table)? {
             return Ok(false);
         }
-        run_ok(
-            self.runner.as_mut(),
-            "add-route",
-            "ip",
-            &[
-                "route",
-                "add",
-                "local",
-                "0.0.0.0/0",
-                "dev",
-                "lo",
-                "table",
-                &table,
-            ],
-        )?;
+        if !add_local_route(self.runner.as_mut(), &table)? {
+            return Ok(false);
+        }
         self.added.push(Action::IpRoute);
         Ok(true)
     }
@@ -372,7 +354,7 @@ fn cleanup_error(step: &'static str, error: CaptureRuleError) -> CaptureRuleErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tproxy::rules::test_support::FakeRunner;
+    use crate::tproxy::rules::test_support::{FakeRunner, SharedFakeRunner};
     use nexus_platform::CaptureBackend;
 
     fn spec() -> CaptureRuleSpec {
@@ -423,5 +405,48 @@ mod tests {
         let mut rules = NftablesCaptureRules::with_runner(Box::new(fake));
         let report = rules.apply(&spec()).unwrap();
         assert!(report.rules_added < 4);
+    }
+
+    #[test]
+    fn nftables_ensure_route_adds_when_table_missing() {
+        let shared = SharedFakeRunner::new(FakeRunner {
+            fail_on: Some("route show".to_string()),
+            fail_exit_code: Some(2),
+            fail_stderr: "Error: ipv4: FIB table does not exist.".to_string(),
+            ..FakeRunner::default()
+        });
+        let mut rules = NftablesCaptureRules::with_runner(Box::new(shared.clone()));
+        assert!(rules.ensure_route().unwrap());
+        assert_eq!(rules.added.len(), 1);
+        let calls = shared.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|(_, args)| args[..3] == ["route", "add", "local"])
+        );
+    }
+
+    #[test]
+    fn nftables_ensure_route_skips_existing_local_default() {
+        let shared =
+            SharedFakeRunner::new(FakeRunner::with_output("local default dev lo scope host"));
+        let mut rules = NftablesCaptureRules::with_runner(Box::new(shared.clone()));
+        assert!(!rules.ensure_route().unwrap());
+        assert!(rules.added.is_empty());
+        let calls = shared.calls();
+        assert!(!calls.iter().any(|(_, args)| args[..2] == ["route", "add"]));
+    }
+
+    #[test]
+    fn nftables_ensure_route_treats_file_exists_as_present() {
+        let shared = SharedFakeRunner::new(FakeRunner {
+            fail_on: Some("route add".to_string()),
+            fail_exit_code: Some(2),
+            fail_stderr: "RTNETLINK answers: File exists".to_string(),
+            ..FakeRunner::default()
+        });
+        let mut rules = NftablesCaptureRules::with_runner(Box::new(shared));
+        assert!(!rules.ensure_route().unwrap());
+        assert!(rules.added.is_empty());
     }
 }
