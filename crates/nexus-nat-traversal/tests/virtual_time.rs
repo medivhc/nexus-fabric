@@ -293,3 +293,97 @@ fn mapping_probe_count_bounded() {
         assert_eq!(w[1] - w[0], 50);
     }
 }
+
+#[test]
+fn unpredictable_symmetric_local_sends_zero() {
+    // F-V5-1 (R2-1): local is Symmetric and the local side is unpredictable
+    // (`NoopPredictor` => Unpredictable even though the samples look
+    // sequential). The run must fail closed *before* any punch datagram.
+    let clock = ManualPunchClock::at(0);
+    let ch = FakeChannel::new(clock.clone(), Vec::new());
+    let sock = FakeSocket::new(clock.clone(), Some(direct()));
+    let cfg = PunchConfig {
+        coord_skew_ms: 0,
+        ..PunchConfig::default()
+    };
+    let mut s = PunchSession::new(
+        nexus_nat_traversal::PeerId([1; 32]),
+        cands(NatType::Symmetric, 5000),
+        NatType::FullCone,
+        samples(),
+        cfg,
+        ch.clone(),
+        sock.clone(),
+        Arc::new(nexus_nat_traversal::NoopPredictor),
+        clock.clone(),
+    );
+    *ch.auto_answer.lock().unwrap() = Some(answer(0, NatType::FullCone, None));
+    let r = s.run();
+    assert_eq!(
+        r,
+        PunchResult::StayedOnRelay {
+            reason: PunchFailReason::UnpredictableSymmetric
+        },
+        "unpredictable local side must stay on relay"
+    );
+    assert_eq!(
+        s.phase(),
+        nexus_nat_traversal::PunchPhase::Failed(PunchFailReason::UnpredictableSymmetric)
+    );
+    let stats = s.stats();
+    assert_eq!(sock.send_count(), 0, "gate must send zero punch datagrams");
+    assert_eq!(stats.mapping_probe_sends, 0);
+    assert_eq!(stats.spray_sends, 0);
+    assert_eq!(stats.failed_unpredictable, 1);
+    assert_eq!(stats.attempts, 1);
+}
+
+#[test]
+fn assess_called_once_per_run() {
+    // `run()` shares one `assess` verdict between the offer hint and the
+    // local-symmetry gate; calling it twice risks divergent decisions.
+    use nexus_nat_traversal::{Predictability, PunchPredictor, SprayPlan};
+    use std::net::IpAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingPredictor {
+        calls: AtomicUsize,
+        inner: nexus_nat_traversal::DefaultPredictor,
+    }
+    impl PunchPredictor for CountingPredictor {
+        fn assess(&self, s: &[PortSample]) -> Predictability {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.assess(s)
+        }
+        fn plan(&self, p: &Predictability, target_ip: IpAddr, k: u8) -> Option<SprayPlan> {
+            self.inner.plan(p, target_ip, k)
+        }
+    }
+
+    let clock = ManualPunchClock::at(0);
+    let ch = FakeChannel::new(clock.clone(), Vec::new());
+    let sock = FakeSocket::new(clock.clone(), Some(direct()));
+    let cfg = PunchConfig {
+        coord_skew_ms: 0,
+        ..PunchConfig::default()
+    };
+    let predictor = Arc::new(CountingPredictor {
+        calls: AtomicUsize::new(0),
+        inner: nexus_nat_traversal::DefaultPredictor,
+    });
+    let mut s = PunchSession::new(
+        nexus_nat_traversal::PeerId([1; 32]),
+        cands(NatType::Symmetric, 5000),
+        NatType::FullCone,
+        samples(),
+        cfg,
+        ch.clone(),
+        sock.clone(),
+        predictor.clone(),
+        clock.clone(),
+    );
+    *ch.auto_answer.lock().unwrap() = Some(answer(0, NatType::FullCone, None));
+    let _ = s.run();
+    assert_eq!(sock.send_count(), 3, "predictable local side still probes");
+    assert_eq!(predictor.calls.load(Ordering::SeqCst), 1);
+}

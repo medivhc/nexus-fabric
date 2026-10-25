@@ -514,15 +514,19 @@ impl PunchSession {
             .collect()
     }
 
-    fn offer_prediction(&self, usable: &[PortSample]) -> Option<PredictionHint> {
-        match self.predictor.assess(usable) {
+    fn prediction_hint(
+        &self,
+        verdict: &Predictability,
+        sample_count: usize,
+    ) -> Option<PredictionHint> {
+        match *verdict {
             Predictability::Predictable { base_port, delta }
-                if usable.len() >= usize::from(self.config.prediction_samples) =>
+                if sample_count >= usize::from(self.config.prediction_samples) =>
             {
                 Some(PredictionHint {
                     base_port,
                     delta,
-                    samples: usable.len().min(8) as u8,
+                    samples: sample_count.min(8) as u8,
                 })
             }
             _ => None,
@@ -542,7 +546,10 @@ impl PunchSession {
         }
 
         let usable = self.usable_samples();
-        let prediction = self.offer_prediction(&usable);
+        // One `assess` per run: the same verdict feeds the offer hint and the
+        // local-symmetry gate (two calls could disagree).
+        let verdict = self.predictor.assess(&usable);
+        let prediction = self.prediction_hint(&verdict, usable.len());
         let offer = PunchOffer {
             version: SIGNAL_VERSION,
             nonce: self.nonce,
@@ -589,6 +596,13 @@ impl PunchSession {
         }
 
         let plan = if local_sym {
+            // F-V5-1 (R2-1): symmetric -> cone is only worth probing when the
+            // local mapping is predictable. Otherwise the cone side has no
+            // usable hint, the probes cannot open a path, and AC-5 requires
+            // zero punch traffic. Fail closed before building `SendPlan`.
+            if !matches!(verdict, Predictability::Predictable { .. }) {
+                return self.fail(PunchFailReason::UnpredictableSymmetric);
+            }
             // symmetric -> cone: bounded mapping probes, never spray.
             let Some(target) = remote_reflexive(&answer) else {
                 return self.fail(PunchFailReason::NoCandidates);

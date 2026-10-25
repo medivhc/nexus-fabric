@@ -471,27 +471,30 @@ fn symmetric_unpredictable_stays_on_relay() {
         Arc::new(TestClock::default()),
     );
     let r = s.run();
+    // F-V5-1 (R2-1): an unpredictable local symmetric side must fail closed
+    // before constructing `SendPlan::Probes` -- zero punch datagrams.
     assert_eq!(
         r,
-        PunchResult::Migrated {
-            addr: test_addr("198.51.100.9:41002")
+        PunchResult::StayedOnRelay {
+            reason: PunchFailReason::UnpredictableSymmetric
         }
     );
-    assert_eq!(s.phase(), PunchPhase::Migrated);
+    assert_eq!(
+        s.phase(),
+        PunchPhase::Failed(PunchFailReason::UnpredictableSymmetric)
+    );
+    assert!(
+        so.punched_targets().is_empty(),
+        "gate must issue zero `send_punch` calls"
+    );
     assert_eq!(
         s.stats().mapping_probe_sends,
-        3,
-        "symmetric side probes once per config"
+        0,
+        "unpredictable side must not probe"
     );
     assert_eq!(s.stats().spray_sends, 0, "symmetric side never sprays");
-    let targets = so.punched_targets();
-    assert_eq!(targets.len(), 3, "mapping probes only, no spray fan-out");
-    assert!(
-        targets
-            .iter()
-            .all(|t| *t == test_addr("198.51.100.9:41002"))
-    );
-    assert_eq!(s.stats().failed_unpredictable, 0);
+    assert_eq!(s.stats().failed_unpredictable, 1);
+    assert_eq!(s.stats().attempts, 1);
 }
 
 #[test]
