@@ -3,29 +3,29 @@
 > 本文件由 `scripts/interop/recompute-verdicts.py` 从证据机械生成；人工零编辑。
 > 修复顺序、依赖与复验口径见人工维护的 [NEXT-STEPS.md](NEXT-STEPS.md)。
 
-- run `protocol-interop-fixes-1`；baseline `18f1050518595ef5212c5766fd6608bb75aa8635`；spec frozen v1.2（sha256 `5aebc9499fe4800a3d1f512009cb453272318b8a14dd6a87ceaf9bcef0ab8fb7`）；test window `2026-10-24T17:30:39Z .. 2026-10-24T21:50:48Z`。
-- 参照实现：sing-box 1.13.16（sha256 `8da901e7b6eb0d2f6f6e701f19d5f78af235d038ae078b37a70739db5895d262`）；Xray 26.10.21（sha256 `a27e3f95ab6ce270956d0cecd32eda4686a811afc71c64a6a734a3dede14883e`）。
-- archive（主机归档路径）：`/work/interop-run/protocol-interop-fixes-1/archive/protocol-interop-fixes-1-20261024T214322Z.tar.zst`, `/work/interop-run/protocol-interop-fixes-1/archive/protocol-interop-fixes-1-20261024T215059Z.tar.zst`。
+- run `protocol-interop-fixes-2`；baseline `29a299eeba58be2411c95e5e7baf0d64a0a0339e`；spec frozen v1.1（sha256 `84536e3c60450e391f3a3026ae92f32da415015b3d7f1b08b55b5592ff865474`）；test window `2026-10-24T17:30:39Z .. 2026-10-25T10:04:42Z`。
+- 参照实现：sing-box 1.13.16（sha256 `9ff0345fde4157a6bdab45a615668d41ccc93f6d0f361108042a48b8a49a9baa`）；Xray 26.10.21（sha256 `0eec3ed4163c273d8c8bf821f7d219e257921cf584aa3fb970715e458e631978`）。
+- archive（主机归档路径）：`/work/interop-run/protocol-interop-fixes-2/archive/protocol-interop-fixes-2-20261025T100720Z.tar.zst`。
 
 ## 先读：范围 / 结论 / 图例
 
 - **覆盖**：5 个出站代理协议（VLESS、AnyTLS、Hysteria2、Trojan、Shadowsocks）共 46 个证据格。TCP 成功型格走产品 SOCKS5 出口路径；`UdpEcho` 与 VLESS Vision 部分格为 crate 直调（`CrateDirect`），不代表产品入口可用。
 - **不覆盖**：VMess（本轮暂缓）、direct/relay/socks5 出站、TUN/VPN、Android 统一 VPN 入口、UI/诊断呈现。
 - **本表不回答**：直连/中继回退是否可用（属 N1 整体结论）；也不把「产品级 UDP 未实现」扩大成「Hy2 的 QUIC 出站传输不可用」（见产品级 UDP 节）。
-- **结论 1**：本次复算：`VERIFIED` 2 个（Vless、Anytls），`PARTIAL` 0 个，`BROKEN` 3 个（Hysteria2、Trojan、Shadowsocks）；当前可宣称可用（`VERIFIED`）的协议为 Vless、Anytls。
+- **结论 1**：本次复算：`VERIFIED` 2 个（Vless、Anytls），`PARTIAL` 1 个（Shadowsocks），`BROKEN` 2 个（Hysteria2、Trojan）；当前可宣称可用（`VERIFIED`）的协议为 Vless、Anytls。
 - **结论 1 限定**：`USABLE` 指 TCP 产品路径；产品 SOCKS5 UDP ASSOCIATE 五协议均未实现，`UdpEcho` 为 crate 级证据、不代表产品入口可用。
-- **结论 2**：剩余阻断分属协议编解码、协议线格式与产品安全语义/产品能力缺口；本 run 已消除产品装配（VLESS eager read）与跨协议传输（T2）两类阻断。`root_cause_class` 只是规则代表类，不是完整根因。
-- **结论 3**：未达 `VERIFIED` 的协议及本次复算代表根因：Hysteria2 `BROKEN / E_NEXUS_CODEC`；Trojan `BROKEN / E_NEXUS_FRAMING`；Shadowsocks `BROKEN / E_NEXUS_HANDSHAKE_WIRE`。
-- **结论 4**：Trojan/SS 当前仍受 fallback 安全语义/线格式与产品 UDP 缺口阻断；即使其余修复完成，本 run `UdpEcho` 固定 `NOT_IMPLEMENTED`，上限仍为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（spec E1 规则 6/R11）。
+- **结论 2**：剩余阻断分属协议编解码（Hy2 QPACK）、产品安全语义（Trojan fallback）与产品能力缺口（五协议产品级 UDP）。本 run 消除的是 Shadowsocks 线格式（SIP004 AEAD）；产品装配（VLESS eager read）与跨协议传输（T2）由既有修复解决。`root_cause_class` 只是规则代表类，不是完整根因。
+- **结论 3**：未达 `VERIFIED` 的协议及本次复算代表根因：Hysteria2 `BROKEN / E_NEXUS_CODEC`；Trojan `BROKEN / E_NEXUS_FRAMING`；Shadowsocks `PARTIAL / E_NEXUS_NOT_IMPLEMENTED`。
+- **结论 4**：Trojan 仍受 fallback 安全语义与产品 UDP 缺口阻断；Shadowsocks 线格式已修复，但仍受产品 UDP 缺口阻断（`UdpEcho` 固定 `NOT_IMPLEMENTED`），且本 run 不覆盖 nexusd TUN 路径。两者上限均为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（spec E1 规则 6/R11）。
 - **结论 5**：五协议当前均可在产品配置面选择，且无「实验性/未验证」标注；配置面标注已裁决批准，待 protocol-config-surface-labeling run 落地（本 run 不改产品代码）。
 - **优先级 1（P0，待办）**：安全止血（文档/配置面）——文档警示已落地（见 MATRIX 安全警示节）；配置面标注已裁决批准，待 protocol-config-surface-labeling run 落地（本 run 不改产品代码）。
-- **优先级 2（P1，DONE）**：跨协议 transport 批量写（`PendingWrite` 接线）——AnyTLS 由 T2 单格阻塞转为 `VERIFIED / FULL`，VLESS/Trojan/Hy2 的 T2 解锁；证据：commit `60e6029`；prediction-check 步骤 2（25/25）。
-- **优先级 3（P2，DONE）**：VLESS fix 合入 + 复验——VLESS H/T1/T2/L/R 全 PASS，转为 `VERIFIED / PROTOCOL_SUBSET`；证据：commit `43ca7ac`；prediction-check 步骤 3（10/10）。
-- **优先级 4（P3，待办）**：Shadowsocks SIP004 AEAD（fixes-2，用户第一优先）——SS 可到 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（U 仍未实现，本 run schema 到不了 VERIFIED）。
+- **优先级 2（P1，DONE）**：跨协议 transport 批量写（`PendingWrite` 接线）——AnyTLS 由 T2 单格阻塞转为 `VERIFIED / FULL`，VLESS/Trojan/Hy2 的 T2 解锁（本分支既有修复）；证据：commit `60e6029`；prediction-check 步骤 2（25/25）。
+- **优先级 3（P2，DONE）**：VLESS fix 合入 + 复验——VLESS H/T1/T2/L/R 全 PASS，转为 `VERIFIED / PROTOCOL_SUBSET`（本分支既有修复）；证据：commit `43ca7ac`；prediction-check 步骤 3（10/10）。
+- **优先级 4（P3，DONE）**：Shadowsocks SIP004 AEAD（fixes-2）——SS crate 与 SOCKS5 产品路径达 SIP004 互操作；矩阵 verdict `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（7 格新证据全 PASS + 独立 KAT）。nexusd TUN 路径不在覆盖内。；证据：commit `31ca431` (C1 crate + KAT)；commit `49c1c6c` (C2 tests + doc honesty)；commit `ce7d101` (C3 product arm streaming)；commit `ebc652e` (C4 proxy-transport)；prediction-check 7/7（H/T1/T2/L/R/BC/BX）。
 - **优先级 5（P4，待办）**：Hysteria2 QPACK Huffman（fixes-3）——预期 Hy2 达到 `VERIFIED / FULL`。
 - **优先级 6（P5，待办）**：Hysteria2 Salamander（fixes-4）——在 QPACK Huffman 修复后单独验证 Salamander 变体。
 - **优先级 7（P6，待办）**：Trojan fallback 完整语义（fixes-5）——最高 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（U 未实现）；不许诺修完即 VERIFIED。
-- **优先级 8（P7，待办）**：产品级 UDP（fixes-6）——补齐 SOCKS5 UDP ASSOCIATE 与各协议出站 UDP 帧路径；补齐前五协议均不可经产品使用 UDP。
+- **优先级 8（P7，待办）**：产品级 UDP（fixes-6）——补齐 SOCKS5 UDP ASSOCIATE 与各协议出站 UDP 帧路径；补齐前五协议均不可经产品使用 UDP。SS `UdpEcho` 仍固定 NOT_IMPLEMENTED。
 - **字段**：`verdict` = `VERIFIED`（规则 8，全 required PASS）/ `PARTIAL`（规则 3–7/9，非阻断缺口）/ `BROKEN`（规则 1/2，阻断性 Nexus 失败）；`scope` = `PROTOCOL_SUBSET` / `FULL` / `TCP_ONLY`；`claim` = `USABLE` / `USABLE_WITH_GAPS` / `NOT_USABLE` / `NOT_CLAIMED`；`carrier` = `ProductSocks5`（产品 SOCKS5 出口路径）/ `CrateDirect`（crate 直调，非产品入口）。
 - **规则 1**：失败格（BadCredential/BadConfig）判 FAIL 且表现为有效 echo/静默成功（`E_NEXUS_FRAMING`）或挂死（`E_TIMEOUT_HANG`）→ `BROKEN`。
 - **规则 2**：任一 required 格 FAIL 且 class 属 `E_NEXUS_*` / `E_TIMEOUT_HANG` → `BROKEN`。
@@ -50,7 +50,7 @@
 | Anytls | VERIFIED | FULL | USABLE | NONE | NONE | 8 |
 | Hysteria2 | BROKEN | PROTOCOL_SUBSET | NOT_USABLE | E_NEXUS_CODEC | TcpSmall(FAIL,E_NEXUS_CODEC), TcpThroughput(FAIL,E_NEXUS_CODEC), LongLived(FAIL,E_NEXUS_CODEC), Reconnect(FAIL,E_NEXUS_CODEC), Handshake(FAIL,E_NEXUS_CODEC), Handshake[Hy2Salamander](FAIL,E_NEXUS_CODEC), UdpEcho(FAIL,E_NEXUS_CODEC), BadCredential(FAIL,E_NEXUS_CODEC) | 2 |
 | Trojan | BROKEN | TCP_ONLY | NOT_USABLE | E_NEXUS_FRAMING | UdpEcho(NOT_IMPLEMENTED,E_NEXUS_NOT_IMPLEMENTED), BadCredential[TrojanFallback](FAIL,E_NEXUS_FRAMING) | 1 |
-| Shadowsocks | BROKEN | TCP_ONLY | NOT_USABLE | E_NEXUS_HANDSHAKE_WIRE | Handshake(FAIL,E_NEXUS_HANDSHAKE_WIRE), TcpSmall(FAIL,E_NEXUS_FRAMING), TcpThroughput(FAIL,E_NEXUS_FRAMING), LongLived(FAIL,E_NEXUS_FRAMING), Reconnect(FAIL,E_NEXUS_FRAMING), UdpEcho(NOT_IMPLEMENTED,E_NEXUS_NOT_IMPLEMENTED) | 2 |
+| Shadowsocks | PARTIAL | TCP_ONLY | USABLE_WITH_GAPS | E_NEXUS_NOT_IMPLEMENTED | UdpEcho(NOT_IMPLEMENTED,E_NEXUS_NOT_IMPLEMENTED) | 6 |
 
 ## 阻塞层、归属与修复后上限
 
@@ -62,7 +62,7 @@
 | Anytls | 无（本 run 已修复，证据见「fix 支线与复验」） | — | 无 | — | `VERIFIED / FULL` |
 | Hysteria2 | 认证响应 QPACK Huffman | 协议编解码实现错误 | TcpSmall(FAIL,E_NEXUS_CODEC), TcpThroughput(FAIL,E_NEXUS_CODEC), LongLived(FAIL,E_NEXUS_CODEC), Reconnect(FAIL,E_NEXUS_CODEC), Handshake(FAIL,E_NEXUS_CODEC), Handshake[Hy2Salamander](FAIL,E_NEXUS_CODEC), UdpEcho(FAIL,E_NEXUS_CODEC), BadCredential(FAIL,E_NEXUS_CODEC) | 是（编解码一处） | `VERIFIED / FULL` |
 | Trojan | fallback 静默接受 + 产品 UDP 未实现 | 产品安全语义 + 产品 UDP 能力缺口 | UdpEcho(NOT_IMPLEMENTED,E_NEXUS_NOT_IMPLEMENTED), BadCredential[TrojanFallback](FAIL,E_NEXUS_FRAMING) | 否，依赖产品 UDP / fallback 架构 | 本 run 最高 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（U 未实现，规则 6） |
-| Shadowsocks | 线格式/SIP004 AEAD + 产品 UDP 未实现 | 协议实现错误 + 产品 UDP 能力缺口 | Handshake(FAIL,E_NEXUS_HANDSHAKE_WIRE), TcpSmall(FAIL,E_NEXUS_FRAMING), TcpThroughput(FAIL,E_NEXUS_FRAMING), LongLived(FAIL,E_NEXUS_FRAMING), Reconnect(FAIL,E_NEXUS_FRAMING), UdpEcho(NOT_IMPLEMENTED,E_NEXUS_NOT_IMPLEMENTED) | 否，依赖产品 UDP | 本 run 最高 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（U 未实现，规则 6） |
+| Shadowsocks | 产品 UDP 未实现（`UdpEcho` 固定 NOT_IMPLEMENTED） | 产品 UDP 能力缺口 | UdpEcho(NOT_IMPLEMENTED,E_NEXUS_NOT_IMPLEMENTED) | 否，依赖产品 UDP（P7 / fixes-6） | 本 run 最高 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（U 未实现，规则 6）；不覆盖 nexusd TUN 路径 |
 
 **参照端生态**：本轮未发现参照端生态缺陷——sing-box 1.13.16 的行为符合规范；Xray 26.10.21 仅用于 Vision 争议裁决，本轮未触发。五协议 verdict 均无 `E_REF_*` 根因。
 
@@ -116,7 +116,7 @@
 | Cell | 状态 | carrier | scope | evidence_id | class | 关键数字 | 证据路径 | notes |
 |---|---|---|---|---|---|---|---|---|
 | Default/TcpSmall | FAIL | ProductSocks5 | ProductPath | PIV-hysteria2-default-tcp-small-20261024T214223Z-001 | E_NEXUS_CODEC | up=0B down=0B | evidence/hysteria2/default/tcp-small/PIV-hysteria2-default-tcp-small-20261024T214223Z-001/probe.json | proxy_error=ConnectivityEstablishmentFailed { provider: ProviderId("ref"), reason: "hysteria2 connect/auth 127.0.0.1:26103 failed: hysteria2 invalid frame" } … |
-| Default/TcpThroughput | FAIL | ProductSocks5 | ProductPath | PIV-hysteria2-default-tcp-throughput-20261024T214226Z-001 | E_NEXUS_CODEC | median=0B/s samples=0 | evidence/hysteria2/default/tcp-throughput/PIV-hysteria2-default-tcp-throughput-20261024T214226Z-001/probe.json | proxy_error=ConnectivityEstablishmentFailed { provider: ProviderId("ref"), reason: "hysteria2 connect/auth 127.0.0.1:26103 failed: hysteria2 invalid frame" }; workload_error=Broken pipe (os error 32) … |
+| Default/TcpThroughput | FAIL | ProductSocks5 | ProductPath | PIV-hysteria2-default-tcp-throughput-20261024T173044Z-001 | E_NEXUS_CODEC | median=0B/s samples=0 | evidence/hysteria2/default/tcp-throughput/PIV-hysteria2-default-tcp-throughput-20261024T173044Z-001/probe.json | proxy_error=ConnectivityEstablishmentFailed { provider: ProviderId("ref"), reason: "hysteria2 connect/auth 127.0.0.1:26103 failed: hysteria2 invalid frame" }; workload_error=Broken pipe (os error 32) … |
 | Default/LongLived | FAIL | ProductSocks5 | ProductPath | PIV-hysteria2-default-long-lived-20261024T214229Z-001 | E_NEXUS_CODEC | heartbeats=0 | evidence/hysteria2/default/long-lived/PIV-hysteria2-default-long-lived-20261024T214229Z-001/probe.json | proxy_error=ConnectivityEstablishmentFailed { provider: ProviderId("ref"), reason: "hysteria2 connect/auth 127.0.0.1:26103 failed: hysteria2 invalid frame" } … |
 | Default/Reconnect | FAIL | ProductSocks5 | ProductPath | PIV-hysteria2-default-reconnect-20261024T214232Z-001 | E_NEXUS_CODEC | reconnects=0 | evidence/hysteria2/default/reconnect/PIV-hysteria2-default-reconnect-20261024T214232Z-001/probe.json | workload_error=cycle 0: tunnel read: Connection reset by peer (os error 104); workload_error=cycle 0: proxy ConnectivityEstablishmentFailed { provider: ProviderId("ref") … |
 | Default/Handshake | FAIL | ProductSocks5 | ProductPath | PIV-hysteria2-default-handshake-20261024T173039Z-001 | E_NEXUS_CODEC | up=0B down=0B | evidence/hysteria2/default/handshake/PIV-hysteria2-default-handshake-20261024T173039Z-001/probe.json | proxy_error=ConnectivityEstablishmentFailed { provider: ProviderId("ref"), reason: "hysteria2 connect/auth 127.0.0.1:26103 failed: hysteria2 invalid frame" } … |
@@ -146,20 +146,20 @@
 
 ## Shadowsocks
 
-> **verdict=BROKEN / claim=NOT_USABLE**（scope=TCP_ONLY，root_cause_class=E_NEXUS_HANDSHAKE_WIRE）
+> **verdict=PARTIAL / claim=USABLE_WITH_GAPS**（scope=TCP_ONLY，root_cause_class=E_NEXUS_NOT_IMPLEMENTED）
 >
 > 本节任一 PASS 不改变协议 verdict；单格 PASS 只在所列 carrier/scope 下成立。
 
 | Cell | 状态 | carrier | scope | evidence_id | class | 关键数字 | 证据路径 | notes |
 |---|---|---|---|---|---|---|---|---|
-| Default/Handshake | FAIL | ProductSocks5 | ProductPath | PIV-shadowsocks-default-handshake-20261024T173553Z-001 | E_NEXUS_HANDSHAKE_WIRE | up=0B down=0B | evidence/shadowsocks/default/handshake/PIV-shadowsocks-default-handshake-20261024T173553Z-001/probe.json | proxy_json routing.outbound_kind=shadowsocks outbound.kind=shadowsocks; workload_error=tunnel read: Resource temporarily unavailable (os error 11) … |
-| Default/TcpSmall | FAIL | ProductSocks5 | ProductPath | PIV-shadowsocks-default-tcp-small-20261024T213934Z-001 | E_NEXUS_FRAMING | up=0B down=0B | evidence/shadowsocks/default/tcp-small/PIV-shadowsocks-default-tcp-small-20261024T213934Z-001/probe.json | proxy_json routing.outbound_kind=shadowsocks outbound.kind=shadowsocks; workload_error=tunnel read: Connection reset by peer (os error 104) … |
-| Default/TcpThroughput | FAIL | ProductSocks5 | ProductPath | PIV-shadowsocks-default-tcp-throughput-20261024T213938Z-001 | E_NEXUS_FRAMING | median=0B/s samples=0 | evidence/shadowsocks/default/tcp-throughput/PIV-shadowsocks-default-tcp-throughput-20261024T213938Z-001/probe.json | proxy_json routing.outbound_kind=shadowsocks outbound.kind=shadowsocks; workload_error=sink digest read: Connection reset by peer (os error 104) … |
-| Default/LongLived | FAIL | ProductSocks5 | ProductPath | PIV-shadowsocks-default-long-lived-20261024T213941Z-001 | E_NEXUS_FRAMING | heartbeats=0 | evidence/shadowsocks/default/long-lived/PIV-shadowsocks-default-long-lived-20261024T213941Z-001/probe.json | proxy_json routing.outbound_kind=shadowsocks outbound.kind=shadowsocks; workload_error=heartbeat 0: tunnel read: Resource temporarily unavailable (os error 11) … |
-| Default/Reconnect | FAIL | ProductSocks5 | ProductPath | PIV-shadowsocks-default-reconnect-20261024T214145Z-001 | E_NEXUS_FRAMING | reconnects=0 | evidence/shadowsocks/default/reconnect/PIV-shadowsocks-default-reconnect-20261024T214145Z-001/probe.json | proxy_json routing.outbound_kind=shadowsocks outbound.kind=shadowsocks; workload_error=cycle 0: tunnel read: Resource temporarily unavailable (os error 11) … |
+| Default/Handshake | PASS | ProductSocks5 | ProductPath | PIV-shadowsocks-default-handshake-20261025T100200Z-001 | NONE | up=1B down=1B | evidence/shadowsocks/default/handshake/PIV-shadowsocks-default-handshake-20261025T100200Z-001/probe.json | proxy_json routing.outbound_kind=shadowsocks outbound.kind=shadowsocks; target_stats={"tcp_bytes_down":2,"tcp_bytes_up":2,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} … |
+| Default/TcpSmall | PASS | ProductSocks5 | ProductPath | PIV-shadowsocks-default-tcp-small-20261025T100203Z-001 | NONE | up=65536B down=65536B | evidence/shadowsocks/default/tcp-small/PIV-shadowsocks-default-tcp-small-20261025T100203Z-001/probe.json | proxy_json routing.outbound_kind=shadowsocks outbound.kind=shadowsocks; target_stats={"tcp_bytes_down":65537,"tcp_bytes_up":65537,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} … |
+| Default/TcpThroughput | PASS | ProductSocks5 | ProductPath | PIV-shadowsocks-default-tcp-throughput-20261025T100206Z-001 | NONE | median=57530879B/s samples=3 | evidence/shadowsocks/default/tcp-throughput/PIV-shadowsocks-default-tcp-throughput-20261025T100206Z-001/probe.json | proxy_json routing.outbound_kind=shadowsocks outbound.kind=shadowsocks; target_stats={"tcp_bytes_down":101716128,"tcp_bytes_up":101712896,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} … |
+| Default/LongLived | PASS | ProductSocks5 | ProductPath | PIV-shadowsocks-default-long-lived-20261025T100238Z-001 | NONE | heartbeats=12 | evidence/shadowsocks/default/long-lived/PIV-shadowsocks-default-long-lived-20261025T100238Z-001/probe.json | proxy_json routing.outbound_kind=shadowsocks outbound.kind=shadowsocks; target_stats={"tcp_bytes_down":13,"tcp_bytes_up":13,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} … |
+| Default/Reconnect | PASS | ProductSocks5 | ProductPath | PIV-shadowsocks-default-reconnect-20261025T100431Z-001 | NONE | reconnects=3 | evidence/shadowsocks/default/reconnect/PIV-shadowsocks-default-reconnect-20261025T100431Z-001/probe.json | proxy_json routing.outbound_kind=shadowsocks outbound.kind=shadowsocks; target_stats={"tcp_bytes_down":4,"tcp_bytes_up":4,"tcp_connections":4,"udp_bytes":0,"udp_datagrams":0} … |
 | Default/UdpEcho | NOT_IMPLEMENTED | CrateDirect | ProtocolWire | PIV-shadowsocks-default-udp-echo-20261024T174224Z-001 | E_NEXUS_NOT_IMPLEMENTED | udp 0/0 corrupt=0 | evidence/shadowsocks/default/udp-echo/PIV-shadowsocks-default-udp-echo-20261024T174224Z-001/probe.json | Shadowsocks UDP 路径未实现（产品入口 + 出站均无） |
-| Default/BadCredential | PASS | ProductSocks5 | ProductPath | PIV-shadowsocks-default-bad-credential-20261024T191810Z-001 | E_EXPECTED_AUTH_REJECT | up=0B down=0B | evidence/shadowsocks/default/bad-credential/PIV-shadowsocks-default-bad-credential-20261024T191810Z-001/probe.json | proxy_json routing.outbound_kind=shadowsocks outbound.kind=shadowsocks; workload_error=read: Resource temporarily unavailable (os error 11); classification=E_EXPECTED_AUTH_REJECT …; 限定：正向路径不通时本格仅证明无静默成功，不独立证明认证拒绝语义 |
-| Default/BadConfig | PASS | ProductSocks5 | ProductPath | PIV-shadowsocks-default-bad-config-20261024T191823Z-001 | E_EXPECTED_CONFIG_REJECT | up=0B down=0B | evidence/shadowsocks/default/bad-config/PIV-shadowsocks-default-bad-config-20261024T191823Z-001/probe.json | proxy_json routing.outbound_kind=shadowsocks outbound.kind=shadowsocks; workload_error=read: Resource temporarily unavailable (os error 11); classification=E_EXPECTED_CONFIG_REJECT …; 限定：正向路径不通时本格仅证明无静默成功，不独立证明认证拒绝语义 |
+| Default/BadCredential | PASS | ProductSocks5 | ProductPath | PIV-shadowsocks-default-bad-credential-20261025T100438Z-001 | E_EXPECTED_AUTH_REJECT | up=0B down=0B | evidence/shadowsocks/default/bad-credential/PIV-shadowsocks-default-bad-credential-20261025T100438Z-001/probe.json | proxy_json routing.outbound_kind=shadowsocks outbound.kind=shadowsocks; workload_error=eof; classification=E_EXPECTED_AUTH_REJECT; reference closed the session on the negative case …; 正向路径已通（H/T1/T2/L/R 全 PASS）；本格拒绝语义由参照端解密失败/关连接佐证 |
+| Default/BadConfig | PASS | ProductSocks5 | ProductPath | PIV-shadowsocks-default-bad-config-20261025T100442Z-001 | E_EXPECTED_CONFIG_REJECT | up=0B down=0B | evidence/shadowsocks/default/bad-config/PIV-shadowsocks-default-bad-config-20261025T100442Z-001/probe.json | proxy_json routing.outbound_kind=shadowsocks outbound.kind=shadowsocks; workload_error=eof; classification=E_EXPECTED_CONFIG_REJECT; reference closed the session on the negative case …; 正向路径已通（H/T1/T2/L/R 全 PASS）；本格拒绝语义由参照端解密失败/关连接佐证 |
 
 ## 产品级 UDP（不参与协议 verdict）
 
@@ -180,28 +180,30 @@
 
 本 run 产生 verdict 翻转的修复条目（来源：run-meta）：
 
-- **transport 批量写**（commit `60e6029`）：把 `PendingWrite` 接入 Trojan/AnyTLS/VLESS×2/Hy2 泵，补齐跨协议 T2，AnyTLS 由此翻转为 `VERIFIED / FULL`（prediction-check 步骤 2（25/25））
-- **VLESS 惰性响应头读取**（commit `43ca7ac`）：延迟 VLESS 响应头读取到转发泵，消除 eager read 导致的 `E_NEXUS_FRAMING`，VLESS 翻转为 `VERIFIED / PROTOCOL_SUBSET`（prediction-check 步骤 3（10/10））
+- **crate SIP004 核心 + 独立 KAT**（commit `31ca431`）：SsStream 换 SIP004（salt + EVP_BytesToKey + HKDF-SHA1 + LE nonce + 标准分块）；KAT-1..4 与 6 类负向以独立 Python crypto 生成期望（KAT fixtures sha256 见 tests/kat/README.md；cargo test -p nexus-outbound-shadowsocks）
+- **crate 测试迁移 + 文档诚实**（commit `49c1c6c`）：session 测试固定 salt 并断言线字节 salt 前缀；Adapter 明确为非 SIP004/无互操作证据；MODULE 契约重写（src/lib.rs tests；crates/nexus-outbound-shadowsocks/MODULE.md）
+- **产品 SS arm 流式 + PendingWrite + 半关闭**（commit `ce7d101`）：SS arm 去 record 外壳，双向流式 seal/open + 背压 + shutdown 传播；两个 SS E4 example 迁移；新增 ss_arm_stream_pump 回归（cargo test -p nexus --test ss_arm_stream_pump；proxy_shadowsocks_real_tcp / proxy_outbound_shadowsocks_flow PASS）
+- **proxy-transport SIP004 流式握手 + 常量**（commit `ebc652e`）：内部 transport 握手改流式 SIP004；SS_SEAL_OVERHEAD=34、SS_FIRST_CHUNK_OVERHEAD=66、MAX_SEALED_FRAME=1266；测试与 example 迁移（cargo test -p nexus-proxy-transport；proxy_ss_quic PASS）
 
-根因文档位于仓库 `docs/protocols/interop/fix/`；本 run 证据根为 `/work/interop-run/protocol-interop-fixes-1`，上表 cell 证据路径均相对该目录。
+根因文档位于仓库 `docs/protocols/interop/fix/`；本 run 证据根为 `/work/interop-run/protocol-interop-fixes-2`，上表 cell 证据路径均相对该目录。
 
 ## 附录 A：配置索引
 
 | 文件 | sha256 |
 |---|---|
-| evidence/ref-config/anytls-custom-padding.json | 11ba6540c5013218d21e739229977c20f47cff9bef119c3b2188f7b3e8b2fa9a |
-| evidence/ref-config/anytls.json | b8edf7cc2597687aeb43f4669c8f7a76b3f847d9f3e138cd428f5103251afd75 |
-| evidence/ref-config/hysteria2-plain.json | 7e8d71ccb3207906209420e72241d518ef9490bb6b372cc18c81c16539cd435e |
-| evidence/ref-config/hysteria2-salamander.json | 379febb84246ffa35800d054009ab86f75dc73f8e32b2fa836d9e733cb6efe5d |
-| evidence/ref-config/shadowsocks-aes256gcm.json | d0bcbdbf0c1c480255a8b7b91ab2d5d950aeb501539aec64c0dfa3fc05d74d96 |
-| evidence/ref-config/shadowsocks.json | 8faf37f0d074da6fbb7f90e17055dc02c5b47b3521ba34ee214ebeee2a24fcf4 |
-| evidence/ref-config/trojan-fallback.json | c55694e95ec2011bedd22b90b8e54a06ceccf11f9e62291bc8e1cd201133f11f |
-| evidence/ref-config/trojan.json | 8fe1b56a41b16d5a6b3e7123b821b5951c7c3e2dc648560a10d088b95c6e5f5c |
-| evidence/ref-config/vless-basic-flow-mismatch.json | f434b7b9fe8ebf7285f3a12ca6dcae9978a209d807808d26911c66d6fa669f41 |
-| evidence/ref-config/vless-basic.json | ebfa73265500705595c3b90ee654ab5c668a009674b9fa437375dda7d8014638 |
-| evidence/ref-config/vless-vision.json | cb2d5d06d6ddf2757e77b1664bb2c8a11784edb69bebaad41f964ba636dec558 |
-| evidence/ref-config/xray-vless-basic.json | e0c0d522bd4667595ae1010618a9fd9ba7b22b53adb007dfa953827876a8de3b |
-| evidence/ref-config/xray-vless-vision.json | ebd6f9109d4e5f670b1f67103602f59bfd4ed85b90ec18a44a6c122344b4838c |
+| evidence/ref-config/anytls-custom-padding.json | b4b7540310e1d7ea966d0d212734a0d446f359922fe8e5ff7780fd635a1afef9 |
+| evidence/ref-config/anytls.json | e8678827b519112f5f31c7bfa14d831a27bcdd6db281b638feed46638b741e3d |
+| evidence/ref-config/hysteria2-plain.json | 1fd56ce3830795818b8a16530955d2ede5cb4dfb907ee19c9d4b6cc283e6a994 |
+| evidence/ref-config/hysteria2-salamander.json | 9b027ddc8892a9ce4b0a549e92edfecfc7eb7bad65c32594948f434c3166ca53 |
+| evidence/ref-config/shadowsocks-aes256gcm.json | ec82ad0046482a7890d3a732eb8ea9b430e27e35d11c58e55123bab8f1cb3135 |
+| evidence/ref-config/shadowsocks.json | 529e01e73791fb915b85b5930db882f466316a71404d43b70414a7ddc1b58d08 |
+| evidence/ref-config/trojan-fallback.json | c8cbf623ca712b7afe7eb0dd77241828aab94339dc9e7a5004374f979ca993a3 |
+| evidence/ref-config/trojan.json | 3ec581470034ca84d138a92eb9fccbd396222d0ba105435f3db4319cf2e01372 |
+| evidence/ref-config/vless-basic-flow-mismatch.json | 0d31d81171345d7d365585a752db5d25d011192a1df514b115c7e98fc80928a7 |
+| evidence/ref-config/vless-basic.json | 37f7c6d82073c8355897ee9643eda6693b4724dabb96585e94f9103c01b7b614 |
+| evidence/ref-config/vless-vision.json | 1bd131e694bee947cd0f1cc0bb102b470c5c4724aaa8d5c07a8271d28f1daa4b |
+| evidence/ref-config/xray-vless-basic.json | 29e25ba22f8f515958914e5ef1e7e49e2ea4f3341b81ccfc7b836dfdd6dcf690 |
+| evidence/ref-config/xray-vless-vision.json | d481b1b487962fb537a067dad1b5b80dbd9a6b48cc14ee55698bc126841d182f |
 
 ## 附录 B：证据清单
 
@@ -223,16 +225,16 @@
 | PIV-hysteria2-default-qpack-diag-20261024T174317Z-001 | PASS | CrateDirect | ProtocolWire | evidence/hysteria2/default/qpack-diag/PIV-hysteria2-default-qpack-diag-20261024T174317Z-001/probe.json |
 | PIV-hysteria2-default-reconnect-20261024T214232Z-001 | FAIL | ProductSocks5 | ProductPath | evidence/hysteria2/default/reconnect/PIV-hysteria2-default-reconnect-20261024T214232Z-001/probe.json |
 | PIV-hysteria2-default-tcp-small-20261024T214223Z-001 | FAIL | ProductSocks5 | ProductPath | evidence/hysteria2/default/tcp-small/PIV-hysteria2-default-tcp-small-20261024T214223Z-001/probe.json |
-| PIV-hysteria2-default-tcp-throughput-20261024T214226Z-001 | FAIL | ProductSocks5 | ProductPath | evidence/hysteria2/default/tcp-throughput/PIV-hysteria2-default-tcp-throughput-20261024T214226Z-001/probe.json |
+| PIV-hysteria2-default-tcp-throughput-20261024T173044Z-001 | FAIL | ProductSocks5 | ProductPath | evidence/hysteria2/default/tcp-throughput/PIV-hysteria2-default-tcp-throughput-20261024T173044Z-001/probe.json |
 | PIV-hysteria2-default-udp-echo-20261024T174221Z-001 | FAIL | CrateDirect | ProtocolWire | evidence/hysteria2/default/udp-echo/PIV-hysteria2-default-udp-echo-20261024T174221Z-001/probe.json |
 | PIV-hysteria2-hy2-salamander-handshake-20261024T173056Z-001 | FAIL | ProductSocks5 | ProductPath | evidence/hysteria2/hy2-salamander/handshake/PIV-hysteria2-hy2-salamander-handshake-20261024T173056Z-001/probe.json |
-| PIV-shadowsocks-default-bad-config-20261024T191823Z-001 | PASS | ProductSocks5 | ProductPath | evidence/shadowsocks/default/bad-config/PIV-shadowsocks-default-bad-config-20261024T191823Z-001/probe.json |
-| PIV-shadowsocks-default-bad-credential-20261024T191810Z-001 | PASS | ProductSocks5 | ProductPath | evidence/shadowsocks/default/bad-credential/PIV-shadowsocks-default-bad-credential-20261024T191810Z-001/probe.json |
-| PIV-shadowsocks-default-handshake-20261024T173553Z-001 | FAIL | ProductSocks5 | ProductPath | evidence/shadowsocks/default/handshake/PIV-shadowsocks-default-handshake-20261024T173553Z-001/probe.json |
-| PIV-shadowsocks-default-long-lived-20261024T213941Z-001 | FAIL | ProductSocks5 | ProductPath | evidence/shadowsocks/default/long-lived/PIV-shadowsocks-default-long-lived-20261024T213941Z-001/probe.json |
-| PIV-shadowsocks-default-reconnect-20261024T214145Z-001 | FAIL | ProductSocks5 | ProductPath | evidence/shadowsocks/default/reconnect/PIV-shadowsocks-default-reconnect-20261024T214145Z-001/probe.json |
-| PIV-shadowsocks-default-tcp-small-20261024T213934Z-001 | FAIL | ProductSocks5 | ProductPath | evidence/shadowsocks/default/tcp-small/PIV-shadowsocks-default-tcp-small-20261024T213934Z-001/probe.json |
-| PIV-shadowsocks-default-tcp-throughput-20261024T213938Z-001 | FAIL | ProductSocks5 | ProductPath | evidence/shadowsocks/default/tcp-throughput/PIV-shadowsocks-default-tcp-throughput-20261024T213938Z-001/probe.json |
+| PIV-shadowsocks-default-bad-config-20261025T100442Z-001 | PASS | ProductSocks5 | ProductPath | evidence/shadowsocks/default/bad-config/PIV-shadowsocks-default-bad-config-20261025T100442Z-001/probe.json |
+| PIV-shadowsocks-default-bad-credential-20261025T100438Z-001 | PASS | ProductSocks5 | ProductPath | evidence/shadowsocks/default/bad-credential/PIV-shadowsocks-default-bad-credential-20261025T100438Z-001/probe.json |
+| PIV-shadowsocks-default-handshake-20261025T100200Z-001 | PASS | ProductSocks5 | ProductPath | evidence/shadowsocks/default/handshake/PIV-shadowsocks-default-handshake-20261025T100200Z-001/probe.json |
+| PIV-shadowsocks-default-long-lived-20261025T100238Z-001 | PASS | ProductSocks5 | ProductPath | evidence/shadowsocks/default/long-lived/PIV-shadowsocks-default-long-lived-20261025T100238Z-001/probe.json |
+| PIV-shadowsocks-default-reconnect-20261025T100431Z-001 | PASS | ProductSocks5 | ProductPath | evidence/shadowsocks/default/reconnect/PIV-shadowsocks-default-reconnect-20261025T100431Z-001/probe.json |
+| PIV-shadowsocks-default-tcp-small-20261025T100203Z-001 | PASS | ProductSocks5 | ProductPath | evidence/shadowsocks/default/tcp-small/PIV-shadowsocks-default-tcp-small-20261025T100203Z-001/probe.json |
+| PIV-shadowsocks-default-tcp-throughput-20261025T100206Z-001 | PASS | ProductSocks5 | ProductPath | evidence/shadowsocks/default/tcp-throughput/PIV-shadowsocks-default-tcp-throughput-20261025T100206Z-001/probe.json |
 | PIV-shadowsocks-default-udp-echo-20261024T174224Z-001 | NOT_IMPLEMENTED | CrateDirect | ProtocolWire | evidence/shadowsocks/default/udp-echo/PIV-shadowsocks-default-udp-echo-20261024T174224Z-001/probe.json |
 | PIV-trojan-default-bad-config-20261024T173215Z-001 | NOT_APPLICABLE | CrateDirect | ProtocolWire | evidence/trojan/default/bad-config/PIV-trojan-default-bad-config-20261024T173215Z-001/probe.json |
 | PIV-trojan-default-bad-credential-20261024T191756Z-001 | PASS | ProductSocks5 | ProductPath | evidence/trojan/default/bad-credential/PIV-trojan-default-bad-credential-20261024T191756Z-001/probe.json |
@@ -258,11 +260,11 @@
 
 ```bash
 scripts/interop/run-matrix.sh --protocol <p> --variant <v> --cell <c> \
-  --run-dir /work/interop-run/protocol-interop-fixes-1 \
+  --run-dir /work/interop-run/protocol-interop-fixes-2 \
   --probe-bin $CARGO_TARGET_DIR/debug/examples/protocol_interop_probe \
   --ref-bin $RUN_DIR/ref/sing-box-1.13.16-linux-amd64-musl/sing-box
-python3 scripts/interop/recompute-verdicts.py --run-dir /work/interop-run/protocol-interop-fixes-1 \
-  --run-meta /work/interop-run/protocol-interop-fixes-1/analysis/run-meta.json \
+python3 scripts/interop/recompute-verdicts.py --run-dir /work/interop-run/protocol-interop-fixes-2 \
+  --run-meta /work/interop-run/protocol-interop-fixes-2/analysis/run-meta.json \
   --matrix docs/protocols/interop/MATRIX.md --check
 ```
 
@@ -277,11 +279,11 @@ python3 scripts/interop/recompute-verdicts.py --run-dir /work/interop-run/protoc
 |---|---|---|---|---|
 | Vless | PIV-vless-default-tcp-throughput-20261024T214827Z-001 | 43ca7ac42b6b67d26498d7aeeeecc28199a02e13 | /work/wt-protocol-interop-fixes-1/target | 7cbff04742d322f0866d1375fca23a89f001e2f22fcdd1bac5a24f4376279e96 |
 | Anytls | PIV-anytls-default-tcp-throughput-20261024T213344Z-001 | 60e6029e4977c47bf624cbc62f107ea02fe16da3 | /work/wt-protocol-interop-fixes-1/target | b6c5a37ad1c64edd50a304d32ad76514c2b705f8185f0f883bcf4d2dbaa29c01 |
-| Hysteria2 | PIV-hysteria2-default-tcp-throughput-20261024T214226Z-001 | 60e6029e4977c47bf624cbc62f107ea02fe16da3 | /work/wt-protocol-interop-fixes-1/target | b6c5a37ad1c64edd50a304d32ad76514c2b705f8185f0f883bcf4d2dbaa29c01 |
+| Hysteria2 | PIV-hysteria2-default-tcp-throughput-20261024T173044Z-001 | 0e66bdfdfe97b67db46d7b81547268d2864c0bdd | /work/wt-protocol-interop/target-interop | 4c021c27d18e9e1bc35493de1b04ad81929b392c40ff64648cba1d932e14a744 |
 | Trojan | PIV-trojan-default-tcp-throughput-20261024T213728Z-001 | 60e6029e4977c47bf624cbc62f107ea02fe16da3 | /work/wt-protocol-interop-fixes-1/target | b6c5a37ad1c64edd50a304d32ad76514c2b705f8185f0f883bcf4d2dbaa29c01 |
-| Shadowsocks | PIV-shadowsocks-default-tcp-throughput-20261024T213938Z-001 | 60e6029e4977c47bf624cbc62f107ea02fe16da3 | /work/wt-protocol-interop-fixes-1/target | b6c5a37ad1c64edd50a304d32ad76514c2b705f8185f0f883bcf4d2dbaa29c01 |
+| Shadowsocks | PIV-shadowsocks-default-tcp-throughput-20261025T100206Z-001 | ebc652e | /work/wt-protocol-interop-fixes-2/target | 7d4ba69cc4df62f845d538ce0f3ffe6c8b4f388c487b2f232428f0219ae3c28d |
 
-上表逐格给出各 T2 证据绑定的构建提交、目标目录与二进制哈希；按证据 `nexus.commit` 派生：`43ca7ac42b6b67d26498d7aeeeecc28199a02e13`（Vless）；`60e6029e4977c47bf624cbc62f107ea02fe16da3`（Anytls、Hysteria2、Trojan、Shadowsocks）。
+上表逐格给出各 T2 证据绑定的构建提交、目标目录与二进制哈希；按证据 `nexus.commit` 派生：`0e66bdfdfe97b67db46d7b81547268d2864c0bdd`（Hysteria2）；`43ca7ac42b6b67d26498d7aeeeecc28199a02e13`（Vless）；`60e6029e4977c47bf624cbc62f107ea02fe16da3`（Anytls、Trojan）；`ebc652e`（Shadowsocks）。
 构建均来自证据记录的本 worktree `cargo_target_dir`，不再引用前序 run 的 fix worktree。
 
 ## 附录 E：被替代运行
