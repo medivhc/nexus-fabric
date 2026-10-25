@@ -50,14 +50,14 @@
 
 ```text
 crates/nexus-nat-traversal/
-  Cargo.toml                  # name/version/edition/license.workspace；[dependencies] 为空
+  Cargo.toml                  # name/version/edition/license.workspace；[dependencies] 仅 nexus-domain（std-only，无第三方依赖）
   src/lib.rs                  # PunchSession 状态机 + 注入 traits + PunchConfig + PunchClock
   src/candidate.rs            # PunchCandidate / LocalCandidates / punch_targets
   src/signal.rs               # PunchOffer/PunchAnswer 手写二进制编解码（v1/v2）
   src/predict.rs              # 可预测性检测 + 有界 spray 计划
 ```
 
-`NatType` 复用 `nexus-connectivity::nat::NatType`（已有，不得重定义）。
+`NatType` 复用 `nexus-domain::nat::NatType`（2026-10-26 P1 接缝① 由 `nexus-connectivity::nat` 逐字迁入；`nexus-connectivity` 以 `pub use` 保旧路径；已有，不得重定义）。
 `nexus-nat-traversal` 为 `portable=true`（policy 同步，C-11）。
 `src/race.rs` 与 `select_path` 已删除（P5 SUPERSEDED），不得恢复。
 

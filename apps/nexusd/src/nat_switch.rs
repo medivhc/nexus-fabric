@@ -36,7 +36,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 
-use nexus_connectivity::nat::NatType;
+use nexus_domain::nat::NatType;
 use nexus_fabric::{ConnShared, Driver, PeerId as FabricPeerId};
 use nexus_nat_quality::{MeasuredPath, PathEventSink, ProbeRole, QualityMonitor};
 use nexus_nat_traversal::{LocalCandidates, PortSample, PunchConfig, PunchResult};

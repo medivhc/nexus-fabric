@@ -1295,7 +1295,7 @@ impl NatSwitchRuntime {
                     // Computed, not hardcoded: no TURN allocation exists yet,
                     // so this is None by rule (same as the gather path).
                     srflx_turn: turn.mapped_addr(),
-                    nat_type: nexus_connectivity::nat::NatType::Unknown,
+                    nat_type: nexus_domain::nat::NatType::Unknown,
                 }
             }
         };
@@ -1526,7 +1526,7 @@ impl NatSwitchRuntime {
                 self.gatherer
                     .stun_prober()
                     .probe_once(server1, nat_stun::STUN_PROBE_TIMEOUT)
-                    .map(|m| (m, nexus_connectivity::nat::NatType::Unknown))
+                    .map(|m| (m, nexus_domain::nat::NatType::Unknown))
             }
         };
         match probed {

@@ -24,7 +24,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use nexus_connectivity::nat::{NatType, StunMapping};
+use nexus_domain::nat::{NatType, StunMapping};
 use nexus_nat_traversal::{DefaultPredictor, PortSample, Predictability, PunchPredictor};
 use nexus_turn::stun::{self, Attribute, StunMessage};
 
@@ -175,7 +175,7 @@ impl StunProber {
     ///
     /// 映射不同 → `Symmetric`；相同 → `RestrictedCone`（无法区分
     /// Full/Restricted/PortRestricted，保守取 RestrictedCone，与
-    /// `nexus_connectivity::nat` 同口径）。
+    /// `nexus_domain::nat` 同口径）。
     pub fn detect_nat_type(
         &mut self,
         server1: SocketAddr,

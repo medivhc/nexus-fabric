@@ -1509,7 +1509,7 @@ delivery 层（`nexus-connectivity::qos`）。纯内存、纯同步、可注入�
 
 ### 12.9 P2.2 NAT 打洞集成（数据面闭环，2026-09-21）{#12-nat-probe}
 
-nat.rs（`nexus-connectivity::nat`：`NatType`；旧 `StunClient` / `HolePuncher` 已退役（2026-10-18），PRODUCT §6 Connectivity 链路激活语义）
+nat.rs（`nexus-domain::nat`：`NatType`/`StunMapping`；2026-10-26 P1 接缝① 迁入，`nexus-connectivity` 以 `pub use` 保旧路径；旧 `StunClient` / `HolePuncher` 已退役（2026-10-18），PRODUCT §6 Connectivity 链路激活语义）
 已交付且 E4 已绿；§12.1-§12.8 的 peer locator 为**静态配置注入**。本节把打洞接入
 虚拟子网数据面：打洞成功 → peer locator **动态学习**（切直连）；失败 → **Relay
 回退**（保底路径）。tunnel 侧不持有真实 UDP socket（保持 portable 边界，真实
