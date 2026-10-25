@@ -631,7 +631,13 @@ mod tests {
             dry_run: true,
             log_path: None,
             exclude_dst_cidrs: vec![([203, 0, 113, 7], 32)],
-            exclude_default_gateway: Some([192, 168, 1, 1]),
+            exclude_egress: vec![(
+                ([203, 0, 113, 7], 32),
+                nexus_platform_linux::assemble::ExcludeEgress {
+                    oif: 2,
+                    gateway: Some([192, 168, 1, 1]),
+                },
+            )],
         };
         let mut assemble = OsAssemble::new(config).expect("lo exists");
         let report = assemble.apply().expect("dry run");

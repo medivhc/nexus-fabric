@@ -17,7 +17,13 @@ fn main() {
         dry_run: true,
         log_path: None,
         exclude_dst_cidrs: vec![([203, 0, 113, 10], 32)],
-        exclude_default_gateway: Some([192, 168, 1, 1]),
+        exclude_egress: vec![(
+            ([203, 0, 113, 10], 32),
+            nexus_platform_linux::assemble::ExcludeEgress {
+                oif: 2,
+                gateway: Some([192, 168, 1, 1]),
+            },
+        )],
     };
     let mut assemble = match OsAssemble::new(config) {
         Ok(a) => a,

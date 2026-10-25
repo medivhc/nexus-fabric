@@ -460,7 +460,37 @@ fn run_dataplane(
     let mut os_assemble = if !create_tun {
         None
     } else {
-        use nexus_platform_linux::assemble::{OsAssemble, OsAssembleConfig};
+        use nexus_platform_linux::assemble::{
+            ExcludeEgress, OsAssemble, OsAssembleConfig, capture_egress_for,
+        };
+        // P5-b：exclude CIDR 必须沿用**接管前**该目的地址的真实出口，不得
+        // `dev <TUN>`。在此刻（TUN 已建、路由尚未接管）逐项捕获 oif+gateway
+        // 并显式传入；捕获不到的项交给 OsAssemble 从接管前快照再解析，
+        // 仍解析不到则以显式错误降级（不静默回退 TUN）。
+        let exclude_egress: Vec<(([u8; 4], u8), ExcludeEgress)> = tun_excludes
+            .iter()
+            .filter_map(|dst| match capture_egress_for(*dst) {
+                Ok(Some(egress)) => {
+                    eprintln!(
+                        "[nexusd.os] level=info event=os_assemble_exclude_egress dst={dst:?} oif={} gateway={:?}",
+                        egress.oif, egress.gateway
+                    );
+                    Some((*dst, egress))
+                }
+                Ok(None) => {
+                    eprintln!(
+                        "[nexusd.os] level=warn event=os_assemble_exclude_egress dst={dst:?} reason=no_pre_takeover_route"
+                    );
+                    None
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[nexusd.os] level=warn event=os_assemble_exclude_egress dst={dst:?} reason={e}"
+                    );
+                    None
+                }
+            })
+            .collect();
         let config = OsAssembleConfig {
             ifname: dp.tun_name().to_string(),
             tun_ip: [10, 99, 0, 1],
@@ -470,7 +500,7 @@ fn run_dataplane(
             dry_run: false,
             log_path: None,
             exclude_dst_cidrs: tun_excludes,
-            exclude_default_gateway: None,
+            exclude_egress,
         };
         match OsAssemble::new(config) {
             Ok(mut assemble) => match assemble.apply() {
