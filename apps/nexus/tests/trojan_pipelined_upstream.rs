@@ -201,7 +201,9 @@ fn pipelined_connect_payload_reaches_node_before_success() {
                     } else {
                         let inv = t.duration_since(t_success).as_micros() as i64;
                         max_inversion_us = max_inversion_us.max(inv);
-                        if inv > 1000 && failures.len() < 5 {
+                        // 反转上界取 AC-3 的 p99 判据（5ms）：它仍比 W（≥50ms）小一个量级，
+                        // 「等 success/等窗口才写」的扣压会出现 ≥W 的差值。
+                        if inv > 5000 && failures.len() < 5 {
                             failures.push(format!(
                                 "round {round}: node read {inv}µs after success（疑似扣压）"
                             ));
