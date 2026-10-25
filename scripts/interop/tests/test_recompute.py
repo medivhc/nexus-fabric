@@ -472,7 +472,10 @@ class RecomputeTests(unittest.TestCase):
             self.assertIn(
                 "Trojan/SS 当前仍受 fallback 安全语义/线格式与产品 UDP 缺口阻断", text
             )
-            self.assertIn("线格式/SIP004 AEAD + 产品 UDP 未实现", blocking_row(text, "Shadowsocks"))
+            self.assertIn(
+                "产品 UDP 未实现（SIP004 线格式已由 fixes-2 修复）",
+                blocking_row(text, "Shadowsocks"),
+            )
             self.assertIn(
                 "限定：正向路径不通时本格仅证明无静默成功", text
             )
@@ -492,7 +495,7 @@ class RecomputeTests(unittest.TestCase):
             self.assertIn("仅剩产品 UDP", row)
             self.assertIn("产品 UDP 能力缺口", row)
             self.assertIn("FIXES2-UPPER", row)
-            self.assertNotIn("线格式/SIP004 AEAD + 产品 UDP 未实现", row)
+            self.assertNotIn("产品 UDP 未实现（SIP004 线格式已由 fixes-2 修复）", row)
             self.assertIn("FIXES2-QUALIFIER", text)
             self.assertNotIn("限定：正向路径不通时本格仅证明无静默成功", text)
 
