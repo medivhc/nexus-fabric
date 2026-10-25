@@ -272,6 +272,56 @@ class RecomputeTests(unittest.TestCase):
             self.assertNotIn("Vless", payload["protocols"])
             self.assertIn("NOT_RUN", text)
 
+    def test_notes_injection_replaces_hardcoded_security_section(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            make_run(tmp, "Vless", {})
+            notes = tmp / "notes.md"
+            notes.write_text("# Trojan 注记\n\n- 承诺边界：success 前零字节。\n", encoding="utf-8")
+            payload, text = recompute.build(
+                str(tmp), str(MATRIX_PATH), allow_partial=True, notes=notes.read_text(encoding="utf-8"),
+                notes_path=str(notes),
+            )
+            sha = __import__("hashlib").sha256(notes.read_bytes()).hexdigest()
+            self.assertIn("## Trojan 注记（机器注入自", text)
+            self.assertIn(f"notes_sha256={sha}", text)
+            self.assertIn("承诺边界：success 前零字节。", text)
+            # 硬编码安全警示段（含过期规模句）不得再出现在注记注入产物里（R-7）。
+            self.assertNotIn(">400 行 / >2 人日", text)
+            self.assertNotIn("## ⚠ 安全警示：Trojan fallback fail-open", text)
+
+    def test_without_notes_keeps_legacy_security_section(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            make_run(tmp, "Vless", {})
+            _, text_a = recompute.build(str(tmp), str(MATRIX_PATH), allow_partial=True)
+            _, text_b = recompute.build(str(tmp), str(MATRIX_PATH), allow_partial=True)
+            self.assertEqual(text_a, text_b, "无 --notes 时输出必须稳定")
+            self.assertIn("## ⚠ 安全警示：Trojan fallback fail-open", text_a)
+
+    def test_notes_drift_is_detected_by_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            make_run(tmp, "Vless", {})
+            notes = tmp / "notes.md"
+            notes.write_text("- v1\n", encoding="utf-8")
+            matrix = tmp / "MATRIX.md"
+            recompute.build(
+                str(tmp), str(MATRIX_PATH), allow_partial=True, notes=notes.read_text(encoding="utf-8"),
+                notes_path=str(notes),
+            )
+            _, text_v1 = recompute.build(
+                str(tmp), str(MATRIX_PATH), allow_partial=True, notes=notes.read_text(encoding="utf-8"),
+                notes_path=str(notes),
+            )
+            matrix.write_text(text_v1, encoding="utf-8")
+            notes.write_text("- v2\n", encoding="utf-8")
+            _, text_v2 = recompute.build(
+                str(tmp), str(MATRIX_PATH), allow_partial=True, notes=notes.read_text(encoding="utf-8"),
+                notes_path=str(notes),
+            )
+            self.assertNotEqual(text_v1, text_v2, "注记变化必须反映在生成产物上（--check 由此判 drift）")
+
     def test_banned_wording_fails_render(self):
         with tempfile.TemporaryDirectory() as tmp:
             make_run(
