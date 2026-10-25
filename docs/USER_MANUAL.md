@@ -405,9 +405,11 @@ VNC/FTP/POP3/IMAP、白名单前缀被 TCP 分片且 50ms 内未补齐、白名�
   随后隧道 EOF」，现在是「CONNECT 应答阶段直接失败（`REP≠0` / HTTP 502）」。客户端不再
   把失败误认为已建立的隧道；MATRIX 判定与错误分类不变。
 - **有 fallback 的坏凭据**：fallback 页面（如 404）不再被当作隧道数据交给应用。
+- **非 CONNECT 绝对形式**：建连/握手失败由「直接断连」变为「HTTP 502」。
 - **承诺边界**：只保证「在 success 之前到达的 fallback 首包零字节投递」；若 fallback
   响应慢于窗口（默认最多 600ms）或等到客户端先发数据后才响应，仍可能漏报；HTTP 绝对
-  形式转发（非 CONNECT）不在守卫范围内。残余项登记在
+  形式转发（非 CONNECT）不在守卫的 fallback 识别范围内。建连/握手硬失败时仍回
+  `HTTP/1.1 502 Bad Gateway`（与 CONNECT 一致）。残余项登记在
   [Trojan 注记](protocols/interop/notes/trojan-fallback.md) 与
   [MATRIX](protocols/interop/MATRIX.md)。
 
