@@ -21,6 +21,28 @@ log_info()  { printf '[nexus-hook] %b%s%b\n' "$C_GRN" "$*" "$C_RST"; }
 log_warn()  { printf '[nexus-hook] %bWARN%b  %s\n' "$C_YEL" "$C_RST" "$*" >&2; }
 log_error() { printf '[nexus-hook] %bERROR%b %s\n' "$C_RED" "$C_RST" "$*" >&2; }
 
+# --- agent identity (shared by pre-commit / pre-push) -------------------------
+# NEXUS_AGENT is authoritative when set; keep it verbatim because multi-agent
+# evidence namespacing relies on the exact value. When it is unset/empty, fall
+# back to `git config user.name` sanitised into a directory-safe slug, then to a
+# fixed placeholder. Never leave AGENT empty: an empty identity widens the STALE
+# evidence scan to every agent's records.
+nexus_agent_identity() {
+  if [ -n "${NEXUS_AGENT:-}" ]; then
+    printf '%s' "$NEXUS_AGENT"
+    return 0
+  fi
+  agent_name="$(git config user.name 2>/dev/null || true)"
+  agent_slug="$(printf '%s' "$agent_name" | tr '[:upper:]' '[:lower:]' \
+    | sed 's/[^a-z0-9]/-/g; s/^-*//; s/-*$//')"
+  if [ -n "$agent_slug" ]; then
+    printf '%s' "$agent_slug"
+  else
+    printf '%s' 'unknown-agent'
+  fi
+}
+AGENT="$(nexus_agent_identity)"
+
 # --- task taxonomy (AGENTS.md §4) --------------------------------------------
 NEXUS_TASK_TYPES="feature|bugfix|refactor|test|docs|performance|dependency|requirement-change"
 

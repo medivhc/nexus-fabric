@@ -51,8 +51,7 @@ if [ -n "$code_staged" ]; then
   # Find latest Review Evidence for this agent (fall back to any review for
   # legacy pre-namespaced evidence; multi-agent repos MUST name reviews
   # `review-<scope>-<agent>-r<n>` so one agent's review never satisfies
-  # another agent's commit).
-  AGENT="${NEXUS_AGENT:-}"
+  # another agent's commit). AGENT is resolved by hook-common.sh.
   if [ -n "$AGENT" ]; then
     review_dir="$(ls -1d "$ROOT/.evidence"/review-*-${AGENT}-* 2>/dev/null | sort | tail -1 || true)"
     [ -z "$review_dir" ] && review_dir="$(ls -1d "$ROOT/.evidence"/review-* 2>/dev/null | sort | tail -1 || true)"

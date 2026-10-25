@@ -130,6 +130,46 @@ sys.exit(int(os.getenv("FAKE_EXIT", "0")))
         self.summary("verify-fixture-old", "STALE")
         self.assertNotEqual(self.hook().returncode, 0)
 
+    def test_agent_identity_falls_back_to_sanitised_user_name_then_placeholder(self):
+        # A Rust change activates the STALE scan; an approved review keeps the
+        # review gate green so only identity scoping decides the outcome.
+        data = self.pushed_code()
+        self.summary("review-code-fixture-r1", "APPROVED")
+        # NEXUS_AGENT unset: identity derives from the sanitised git user.name
+        # ("Hook Fixture" -> "hook-fixture"), so other agents stay out of scope.
+        self.env.pop("NEXUS_AGENT")
+        self.summary("verify-other-old", "STALE")
+        result = self.hook(data=data)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.summary("verify-hook-fixture-old", "STALE")
+        self.assertNotEqual(self.hook(data=data).returncode, 0)
+        # No user.name either: fixed "unknown-agent" placeholder, never empty.
+        self.git("config", "user.name", "")
+        shutil.rmtree(self.root / ".evidence" / "verify-hook-fixture-old")
+        self.summary("verify-unknown-agent-old", "STALE")
+        self.assertNotEqual(self.hook(data=data).returncode, 0)
+
+    def test_agent_identity_unset_user_name_uses_placeholder(self):
+        # Companion to the empty-string case above: here user.name is removed
+        # outright, so `git config user.name` exits non-zero and the
+        # `|| true` guard in hook-common.sh is what keeps the hook alive.
+        # HOME/XDG are isolated so a developer-global user.name cannot leak
+        # into the fixture and mask the unset path.
+        data = self.pushed_code()
+        self.summary("review-code-fixture-r1", "APPROVED")
+        self.env.pop("NEXUS_AGENT")
+        empty_home = self.base / "empty-home"
+        empty_home.mkdir()
+        self.env["HOME"] = str(empty_home)
+        self.env["XDG_CONFIG_HOME"] = str(empty_home)
+        self.env["GIT_CONFIG_NOSYSTEM"] = "1"
+        self.git("config", "--unset", "user.name")
+        self.summary("verify-other-old", "STALE")
+        result = self.hook(data=data)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.summary("verify-unknown-agent-old", "STALE")
+        self.assertNotEqual(self.hook(data=data).returncode, 0)
+
     def test_review_missing_rejected_approved_accepted_requested_rejected(self):
         data = self.pushed_code()
         self.assertNotEqual(self.hook(data=data).returncode, 0)
