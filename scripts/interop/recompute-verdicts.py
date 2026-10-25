@@ -491,7 +491,18 @@ def render_matrix(
     if not_run:
         counts += f"，未运行 {len(not_run)} 个（{'、'.join(not_run)}）"
     if verdict_names["VERIFIED"]:
-        usable = f"当前可宣称可用（`VERIFIED`）的协议为 {'、'.join(verdict_names['VERIFIED'])}。"
+        usable = (
+            "当前**无缺口**可宣称可用（`VERIFIED / USABLE`）的协议为 "
+            f"{'、'.join(verdict_names['VERIFIED'])}"
+        )
+        with_gaps = [
+            p
+            for p in PROTOCOL_ORDER
+            if verdicts.get(p, {}).get("claim") == "USABLE_WITH_GAPS"
+        ]
+        if with_gaps:
+            usable += f"；另有 {len(with_gaps)} 个 `USABLE_WITH_GAPS`（{'、'.join(with_gaps)}）"
+        usable += "。"
     else:
         usable = "当前无任何协议可宣称可用。"
     lines.append(f"- **结论 1**：本次复算：{counts}；{usable}")
@@ -715,8 +726,8 @@ def render_matrix(
                 "否，依赖产品 UDP / fallback 架构",
             ),
             "Shadowsocks": (
-                "线格式/SIP004 AEAD + 产品 UDP 未实现",
-                "协议实现错误 + 产品 UDP 能力缺口",
+                "产品 UDP 未实现（SIP004 线格式已由 fixes-2 修复）",
+                "产品 UDP 能力缺口（fixes-6）",
                 "否，依赖产品 UDP",
             ),
         }

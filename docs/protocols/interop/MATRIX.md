@@ -13,7 +13,7 @@
 - **覆盖**：5 个出站代理协议（VLESS、AnyTLS、Hysteria2、Trojan、Shadowsocks）共 46 个证据格。TCP 成功型格走产品 SOCKS5 出口路径；`UdpEcho` 与 VLESS Vision 部分格为 crate 直调（`CrateDirect`），不代表产品入口可用。
 - **不覆盖**：VMess（本轮暂缓）、direct/relay/socks5 出站、TUN/VPN、Android 统一 VPN 入口、UI/诊断呈现。
 - **本表不回答**：直连/中继回退是否可用（属 N1 整体结论）；也不把「产品级 UDP 未实现」扩大成「Hy2 的 QUIC 出站传输不可用」（见产品级 UDP 节）。
-- **结论 1**：本次复算：`VERIFIED` 2 个（Vless、Anytls），`PARTIAL` 2 个（Trojan、Shadowsocks），`BROKEN` 1 个（Hysteria2）；当前可宣称可用（`VERIFIED`）的协议为 Vless、Anytls。
+- **结论 1**：本次复算：`VERIFIED` 2 个（Vless、Anytls），`PARTIAL` 2 个（Trojan、Shadowsocks），`BROKEN` 1 个（Hysteria2）；当前**无缺口**可宣称可用（`VERIFIED / USABLE`）的协议为 Vless、Anytls；另有 2 个 `USABLE_WITH_GAPS`（Trojan、Shadowsocks）。
 - **结论 1 限定**：`USABLE` 指 TCP 产品路径；产品 SOCKS5 UDP ASSOCIATE 五协议均未实现，`UdpEcho` 为 crate 级证据、不代表产品入口可用。
 - **结论 2**：剩余阻断分属产品安全语义（Trojan fallback 的窗口外残余）、协议编解码（Hy2）、跨协议传输与产品能力缺口（五协议产品级 UDP）。本 run 已消除 Trojan fallback 的 fail-open 主路径（success 前零字节投递），`root_cause_class` 只是规则代表类，不是完整根因。
 - **结论 3**：未达 `VERIFIED` 的协议及本次复算代表根因：Hysteria2 `BROKEN / E_TIMEOUT_HANG`；Trojan `PARTIAL / E_NEXUS_NOT_IMPLEMENTED`；Shadowsocks `PARTIAL / E_NEXUS_NOT_IMPLEMENTED`。
@@ -169,7 +169,7 @@ python3 scripts/interop/recompute-verdicts.py ... --check   # 零漂移（含注
 | Anytls | 无（本 run 已修复，证据见「fix 支线与复验」） | — | 无 | — | `VERIFIED / FULL` |
 | Hysteria2 | 认证响应 QPACK Huffman | 协议编解码实现错误 | TcpThroughput(FAIL,E_TIMEOUT_HANG) | 是（编解码一处） | `VERIFIED / FULL` |
 | Trojan | 产品 UDP 未实现（fallback fail-open 已由 fixes-5 关闭主路径） | 产品 UDP 能力缺口（fixes-6） | UdpEcho(NOT_IMPLEMENTED,E_NEXUS_NOT_IMPLEMENTED) | 否，依赖 fixes-6 | 本 run 最高 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（U 未实现，规则 6） |
-| Shadowsocks | 线格式/SIP004 AEAD + 产品 UDP 未实现 | 协议实现错误 + 产品 UDP 能力缺口 | UdpEcho(NOT_IMPLEMENTED,E_NEXUS_NOT_IMPLEMENTED) | 否，依赖产品 UDP | 本 run 最高 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（U 未实现，规则 6） |
+| Shadowsocks | 产品 UDP 未实现（SIP004 线格式已由 fixes-2 修复） | 产品 UDP 能力缺口（fixes-6） | UdpEcho(NOT_IMPLEMENTED,E_NEXUS_NOT_IMPLEMENTED) | 否，依赖产品 UDP | 本 run 最高 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（U 未实现，规则 6） |
 
 **参照端生态**：本轮未发现参照端生态缺陷——sing-box 1.13.16 的行为符合规范；Xray 26.10.21 仅用于 Vision 争议裁决，本轮未触发。五协议 verdict 均无 `E_REF_*` 根因。
 
