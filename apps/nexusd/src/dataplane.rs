@@ -273,8 +273,10 @@ pub struct Dataplane {
     flow_pending: HashMap<FourTuple, SessionId>,
     /// Phase B：上游可用性（建连器用）。
     flow_upstream: Arc<UpstreamFlags>,
-    /// 规则引擎（S17 过渡：默认把未命中流量送回 Proxy 分支；S24 注入
-    /// `DomainRuleEngine` 后按真实 tag 分流）。
+    /// 规则引擎（S24：组合根注入 `DomainRuleEngine` 后按配置 tag 分流）。
+    ///
+    /// `new` 的初始值为空规则（未命中 → Drop，fail-closed）；生产组合根必须
+    /// 注入配置引擎，或在无 `proxy.yaml` 时显式调用 [`Self::set_default_simple_engine`]。
     rules: Box<dyn nexus_domain::RuleEngine>,
     /// TUN/TPROXY 共享的 5 元组决策缓存（spec §9.13）。
     decision_cache: FlowDecisionCache,
@@ -408,7 +410,8 @@ impl Dataplane {
             flow_pending_data: HashMap::new(),
             flow_pending: HashMap::new(),
             flow_upstream: Arc::new(UpstreamFlags::default()),
-            rules: Box::new(default_simple_engine()?),
+            // fail-closed：未注入引擎时未命中 → Drop；不允许静默把流量送回 proxy。
+            rules: Box::new(SimpleRuleEngine::new(Vec::new())),
             decision_cache: FlowDecisionCache::new(
                 decision_cache_capacity,
                 std::time::Duration::from_secs(decision_cache_idle_secs),
@@ -432,7 +435,10 @@ impl Dataplane {
         self.rules = rules;
     }
 
-    /// 注入无代理配置默认引擎（`SimpleRuleEngine`，全部流量交 `proxy` 标签）。
+    /// 显式注入无代理配置默认引擎（`SimpleRuleEngine`，全部流量交 `proxy` 标签）。
+    ///
+    /// 只允许在没有 `proxy.yaml` 的装配路径上调用（由组合根记录显式日志）；
+    /// 有配置时规则引擎构造失败必须 fail-closed，不得用本方法顶替。
     ///
     /// # Errors
     ///
@@ -2827,8 +2833,33 @@ mod tests {
             n1_configured: true,
             ..Default::default()
         };
-        let dp = Dataplane::new(tun, config).expect("dataplane new");
+        let mut dp = Dataplane::new(tun, config).expect("dataplane new");
+        // 显式注入无配置默认引擎（新装配不再静默回落到它）。
+        dp.set_default_simple_engine().expect("default engine");
         (dp, mock)
+    }
+
+    /// 装配回归：未注入引擎的 Dataplane 必须 fail-closed（Drop），
+    /// 不得静默回落到把全部流量送往 `proxy` 的默认引擎。
+    #[test]
+    fn dataplane_without_injected_engine_fails_closed() {
+        let mock = Arc::new(Mutex::new(nexus_projection::MockTun::new("test0")));
+        let mut dp = Dataplane::new(
+            Box::new(SharedTun { inner: mock }),
+            DataplaneConfig::default(),
+        )
+        .expect("dataplane new");
+        let peer = SocketAddrV4::new(Ipv4Addr::new(10, 200, 2, 2), 40_000);
+        let dst = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 443);
+        let (decision, matched_rule, outbound, _) = dp.transparent_decision(peer, dst, 17, 1);
+        assert_eq!(
+            decision,
+            TransparentDecision::Drop {
+                reason: DropReason::RuleRejected
+            }
+        );
+        assert_eq!(matched_rule.as_deref(), Some(""));
+        assert_eq!(outbound.as_deref(), Some("drop"));
     }
 
     /// Red Evidence（S1/S2）：Mesh 分类的 TCP SYN 应被终结并回 SYN-ACK。
@@ -2993,6 +3024,12 @@ mod tests {
             ..Default::default()
         };
         let mut dp = Dataplane::new(tun, config).expect("dataplane new");
+        dp.set_rule_engine(Box::new(SimpleRuleEngine::new(vec![Rule {
+            cidr: "0.0.0.0/0".parse().expect("cidr"),
+            target: nexus_domain::RouteTarget::Egress {
+                peer: "proxy".to_string(),
+            },
+        }])));
         let frames = Arc::new(Mutex::new(Vec::new()));
         dp.set_n1_sender(Arc::new(TestN1Sender {
             frames: Arc::clone(&frames),
