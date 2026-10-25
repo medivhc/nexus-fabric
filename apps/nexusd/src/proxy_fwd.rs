@@ -9,15 +9,16 @@
 //! TUN 所有权仍在 dataplane（D1）：engine 只返回待写回 TUN 的包，
 //! 不直接持有/写 TUN。
 
+pub(crate) mod adapter;
 pub mod ss_std;
 mod tcp_relay;
 mod udp_relay;
 
+pub use adapter::{EngineInitError, OutboundConfigError};
+
 pub use udp_relay::build_udp_reply;
 
 use std::net::{IpAddr, SocketAddr};
-
-use nexus_proxy_config::{OutboundConfig, OutboundKind};
 
 /// 代理 dial 配置（P3 选路结果）。
 #[derive(Debug, Clone)]
@@ -47,62 +48,19 @@ pub enum ProxyDialConfig {
 pub struct ProxyFwdStats {
     pub tcp_dials_ok: u64,
     pub tcp_dials_failed: u64,
+    pub tcp_streams_ok: u64,
+    pub tcp_bytes_up: u64,
+    pub tcp_bytes_down: u64,
     pub udp_sent: u64,
     pub udp_send_failed: u64,
 }
 
-/// 从 `OutboundConfig` 解析 dial 配置；不支持的 kind 返回 None（P3 跳过）。
-fn dial_config_from_outbound(o: &OutboundConfig) -> Option<ProxyDialConfig> {
-    let locator = o.locator.as_deref().filter(|s| !s.is_empty())?;
-    let server: SocketAddr = locator.parse().ok()?;
-    match o.kind {
-        OutboundKind::Shadowsocks => {
-            let password = o.password.clone().filter(|s| !s.is_empty())?;
-            let method = o
-                .method
-                .clone()
-                .unwrap_or_else(|| "chacha20-ietf-poly1305".to_string());
-            // P1 只支持 chacha20-ietf-poly1305（标准 ss）。
-            if method != "chacha20-ietf-poly1305" {
-                return None;
-            }
-            Some(ProxyDialConfig::Shadowsocks {
-                server,
-                method,
-                password,
-            })
-        }
-        OutboundKind::Trojan => {
-            let password = o.password.clone().filter(|s| !s.is_empty())?;
-            // TLS 判定：skip_cert_verify 或 alpn 存在 → TLS；否则明文。
-            // 诚实：默认明文（与 TrojanTransport 一致）；显式配置才走 TLS。
-            let use_tls = o.skip_cert_verify.unwrap_or(false) || o.alpn.is_some();
-            if use_tls {
-                Some(ProxyDialConfig::TrojanTls {
-                    server,
-                    password,
-                    sni: server.ip().to_string(),
-                    skip_verify: o.skip_cert_verify.unwrap_or(false),
-                })
-            } else {
-                Some(ProxyDialConfig::Trojan { server, password })
-            }
-        }
-        OutboundKind::Socks5 => Some(ProxyDialConfig::Socks5 { server }),
-        // AnyTLS/VLESS/Hysteria2 需要完整 adapter（TLS/QUIC 握手），简单 dial 路径暂不支持。
-        OutboundKind::Direct
-        | OutboundKind::Relay
-        | OutboundKind::Vmess
-        | OutboundKind::Anytls
-        | OutboundKind::Vless
-        | OutboundKind::Hysteria2 => None,
-    }
-}
-
-/// P3：从 proxy.yaml 选首个可用出站。
-pub fn select_outbound(proxy_yaml: &str) -> Option<ProxyDialConfig> {
-    let config = nexus_proxy_config::parse(proxy_yaml).ok()?;
-    config.outbounds.iter().find_map(dial_config_from_outbound)
+/// P3（步骤 0 临时）：从 proxy.yaml 选首个 wired 出站。
+fn select_outbound(proxy_yaml: &str) -> Result<ProxyDialConfig, EngineInitError> {
+    adapter::select_dialer_legacy(proxy_yaml).map(|selected| {
+        let _ = selected.skipped;
+        selected.dial_config
+    })
 }
 
 /// Proxy 转发引擎（dataplane 拥有）。
@@ -112,13 +70,19 @@ pub struct ProxyEngine {
 }
 
 impl ProxyEngine {
-    /// 从 proxy.yaml 构造；无可用出站返回 None（调用方走计数降级）。
-    pub fn new(proxy_yaml: &str) -> Option<Self> {
+    /// `None` = 没有 proxy.yaml；`Some(yaml)` = 有文件，区分「可用」与「不可用」。
+    ///
+    /// # Errors
+    /// `Yaml` / `SelectedInvalid` / `NoUsableOutbound` → 调用方 fail-closed（exit 1）。
+    pub fn new(proxy_yaml: Option<&str>) -> Result<Option<Self>, EngineInitError> {
+        let Some(proxy_yaml) = proxy_yaml else {
+            return Ok(None);
+        };
         let dial_config = select_outbound(proxy_yaml)?;
-        Some(Self {
+        Ok(Some(Self {
             tcp: tcp_relay::TcpForwarder::new(dial_config.clone()),
             udp: udp_relay::UdpForwarder::new(dial_config),
-        })
+        }))
     }
 
     /// 处理一个 proxy 分类的包；返回 (待写回 TUN 的包, 是否真实转发)。
@@ -171,6 +135,9 @@ impl ProxyEngine {
         ProxyFwdStats {
             tcp_dials_ok: t.tcp_dials_ok,
             tcp_dials_failed: t.tcp_dials_failed,
+            tcp_streams_ok: t.tcp_streams_ok,
+            tcp_bytes_up: t.tcp_bytes_up,
+            tcp_bytes_down: t.tcp_bytes_down,
             udp_sent: u.udp_sent,
             udp_send_failed: u.udp_send_failed,
         }
@@ -191,6 +158,7 @@ fn is_usable_target(_ip: IpAddr) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::adapter::{OutboundConfigError, SkipReason};
     use super::*;
 
     fn yaml_with(kind: &str, locator: &str, extra: &str) -> String {
@@ -218,10 +186,14 @@ mod tests {
     }
 
     #[test]
-    fn select_trojan_plaintext_by_default() {
+    fn trojan_without_tls_signal_is_invalid() {
         let yaml = yaml_with("trojan", "127.0.0.1:443", "    password: secret\n");
-        let cfg = select_outbound(&yaml).unwrap();
-        assert!(matches!(cfg, ProxyDialConfig::Trojan { .. }));
+        let err = select_outbound(&yaml).unwrap_err();
+        let EngineInitError::SelectedInvalid { tag, source } = err else {
+            panic!("expected SelectedInvalid");
+        };
+        assert_eq!(tag, "test");
+        assert_eq!(source, OutboundConfigError::PlaintextTrojanUnsupported);
     }
 
     #[test]
@@ -236,9 +208,26 @@ mod tests {
     }
 
     #[test]
+    fn select_trojan_tls_when_alpn() {
+        let yaml = yaml_with(
+            "trojan",
+            "127.0.0.1:443",
+            "    password: secret\n    alpn:\n      - h2\n",
+        );
+        let cfg = select_outbound(&yaml).unwrap();
+        assert!(matches!(cfg, ProxyDialConfig::TrojanTls { .. }));
+    }
+
+    #[test]
     fn skip_direct_and_vmess() {
         let yaml = "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n  - tag: v\n    kind: vmess\n    locator: 127.0.0.1:1234\n";
-        assert!(select_outbound(yaml).is_none());
+        let EngineInitError::NoUsableOutbound { skipped } = select_outbound(yaml).unwrap_err()
+        else {
+            panic!("expected NoUsableOutbound");
+        };
+        assert_eq!(skipped.len(), 2);
+        assert_eq!(skipped[0].reason, SkipReason::NotProxyKind);
+        assert_eq!(skipped[1].reason, SkipReason::ProtocolNotWired);
     }
 
     #[test]
@@ -249,8 +238,46 @@ mod tests {
     }
 
     #[test]
-    fn engine_none_when_no_usable() {
+    fn first_wired_invalid_is_hard_failure() {
+        let yaml = "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: t\noutbounds:\n  - tag: v\n    kind: vmess\n    locator: 127.0.0.1:1234\n  - tag: t\n    kind: trojan\n    locator: 127.0.0.1:443\n    password: secret\n  - tag: s\n    kind: socks5\n    locator: 127.0.0.1:1080\n";
+        let err = select_outbound(yaml).unwrap_err();
+        assert!(matches!(
+            err,
+            EngineInitError::SelectedInvalid {
+                source: OutboundConfigError::PlaintextTrojanUnsupported,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn obfs_is_a_config_error() {
+        let obfs = yaml_with(
+            "socks5",
+            "127.0.0.1:1080",
+            "    obfs: plain\n    obfs_key: secret\n",
+        );
+        let EngineInitError::SelectedInvalid { source, .. } = select_outbound(&obfs).unwrap_err()
+        else {
+            panic!("expected SelectedInvalid");
+        };
+        assert_eq!(
+            source,
+            OutboundConfigError::UnsupportedObfs { field: "obfs" }
+        );
+    }
+
+    #[test]
+    fn engine_new_none_is_ok() {
+        assert!(matches!(ProxyEngine::new(None), Ok(None)));
+    }
+
+    #[test]
+    fn engine_no_usable_outbound_is_error() {
         let yaml = "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
-        assert!(ProxyEngine::new(yaml).is_none());
+        assert!(matches!(
+            ProxyEngine::new(Some(yaml)),
+            Err(EngineInitError::NoUsableOutbound { .. })
+        ));
     }
 }

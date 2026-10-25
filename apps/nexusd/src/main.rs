@@ -352,13 +352,61 @@ fn main() -> ExitCode {
     }
 }
 
-/// 数据面线程主循环：创建 TUN → 处理包 → 出错时退出线程（daemon 继续服务 LocalAPI）。
+/// 启动失败 JSON（spec §6.5 模板，stderr 单行；不含密码/UUID/hash）。
+fn proxy_engine_init_failure_json(error: &nexusd::proxy_fwd::EngineInitError) -> Value {
+    use nexusd::proxy_fwd::EngineInitError;
+    let payload = match error {
+        EngineInitError::Yaml(source) => json!({
+            "code": "CONFIG",
+            "variant": error.variant(),
+            "cause": "CONFIG_INVALID",
+            "field": source.field.clone(),
+            "tag": "-",
+            "kind": "-",
+            "detail": source.reason,
+        }),
+        EngineInitError::SelectedInvalid { tag, source } => {
+            let mut value = json!({
+                "code": "CONFIG",
+                "variant": error.variant(),
+                "cause": source.name(),
+                "tag": tag,
+                "kind": "-",
+                "detail": source.detail(),
+            });
+            if matches!(
+                source,
+                nexusd::proxy_fwd::OutboundConfigError::PlaintextTrojanUnsupported
+            ) {
+                value["hint"] = json!(
+                    "set skip_cert_verify: false to keep certificate verification, or set alpn"
+                );
+            }
+            value
+        }
+        EngineInitError::NoUsableOutbound { .. } => json!({
+            "code": "CONFIG",
+            "variant": error.variant(),
+            "cause": "NO_USABLE_OUTBOUND",
+            "tag": "-",
+            "kind": "-",
+            "detail": "proxy.yaml has no usable outbound",
+        }),
+    };
+    json!({
+        "verdict": "FAIL",
+        "command": "nexusd",
+        "stage": "proxy_engine_init",
+        "error": payload,
+    })
+}
+
 /// 数据面线程主循环：创建 TUN → 处理包 → 出错或收到关闭信号时退出线程。
 ///
 /// R1：`n1_sender` 为 Some 时注入 dataplane（`set_n1_sender`），Mesh 包真发；
 /// 为 None 时保持 D2 计数降级。
 /// P1-P5：`proxy_yaml` 为 Some 且含可用出站时注入 `ProxyEngine`，Proxy 包真发；
-/// 否则 D2 计数降级。
+/// 否则无 engine（无 proxy.yaml 不注入）。
 /// R4：每次循环检查 `shutdown` 标志，置位后退出（join 1s 超时由调用方执行）。
 fn run_dataplane(
     config: nexusd::dataplane::DataplaneConfig,
@@ -369,6 +417,15 @@ fn run_dataplane(
     proxy_yaml: Option<String>,
 ) {
     use nexus_projection::TunDevice;
+    // P1-P5（步骤 0）：先完成 proxy engine 构造；任一 EngineInitError →
+    // fail-closed（stderr JSON + exit 1），不创建/启动 dataplane。
+    let proxy_engine = match nexusd::proxy_fwd::ProxyEngine::new(proxy_yaml.as_deref()) {
+        Ok(engine) => engine,
+        Err(error) => {
+            eprintln!("{}", proxy_engine_init_failure_json(&error));
+            std::process::exit(1);
+        }
+    };
     // D1：创建单个 TUN（Linux）。设备名与 MTU 来自 [tun] 配置（T1）。
     let tun_pattern = format!("{tun_name}%d");
     let tun: Box<dyn nexus_projection::TunDevice> =
@@ -402,19 +459,12 @@ fn run_dataplane(
         eprintln!("[nexusd] dataplane: N1 sender wired (n1_bridge_ready=true)");
     }
 
-    // P1-P5：注入 Proxy 转发引擎（有可用出站则真发，无则 D2 计数降级）。
-    if let Some(yaml) = proxy_yaml.as_deref() {
-        match nexusd::proxy_fwd::ProxyEngine::new(yaml) {
-            Some(engine) => {
-                dp.set_proxy_engine(engine);
-                eprintln!("[nexusd] dataplane: ProxyEngine wired (proxy_engine_ready=true)");
-            }
-            None => {
-                eprintln!(
-                    "[nexusd] dataplane: proxy.yaml has no usable outbound; proxy packets counted"
-                );
-            }
-        }
+    // P1-P5：注入 Proxy 转发引擎（有可用出站则真发；无 proxy.yaml 不注入）。
+    if let Some(engine) = proxy_engine {
+        dp.set_proxy_engine(engine);
+        eprintln!("[nexusd] dataplane: ProxyEngine wired (proxy_engine_ready=true)");
+    } else if proxy_yaml.is_some() {
+        eprintln!("[nexusd] dataplane: proxy.yaml has no usable outbound; proxy packets counted");
     }
 
     eprintln!("[nexusd] dataplane: running");

@@ -101,8 +101,9 @@ fn run() -> serde_json::Value {
         "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: proxy\noutbounds:\n  - tag: proxy\n    kind: socks5\n    locator: {}\n",
         socks_addr
     );
-    let proxy_engine =
-        nexusd::proxy_fwd::ProxyEngine::new(&proxy_yaml).expect("proxy engine from stub socks5");
+    let proxy_engine = nexusd::proxy_fwd::ProxyEngine::new(Some(&proxy_yaml))
+        .expect("proxy engine init")
+        .expect("proxy engine from stub socks5");
     dp.set_proxy_engine(proxy_engine);
 
     // 3. 处理所有包。

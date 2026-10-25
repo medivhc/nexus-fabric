@@ -206,10 +206,16 @@
 ### TCP 终结接线（S1-S11，scenarios/product/tcp_termination_wireup.toml，2026-10-01 冻结）
 
 - **S1（终结范围）**：IPv4 + proto 6 的包，且 `PacketClassifier` 分类为
-  `Mesh{..}` 或 `Proxy` 时，进入 smoltcp 终结
-  （`nexus_projection::tcp::TcpTerminator::handle_uplink(packet, peer)`），
-  不再走 D2/W1 的 raw-datagram 路径。`peer` 参数：Mesh 取分类 `path` 的
-  socket addr 字符串（`None` 时用目的 IP 字符串）；Proxy 用 `"proxy"`。
+  `Mesh{..}` 或 `Proxy` 时，进入 smoltcp 终结路径；不再走 D2/W1 的 raw-datagram
+  路径。`peer` 参数：Mesh 取分类 `path` 的 socket addr 字符串（`None` 时用目的
+  IP 字符串）；Proxy 用 `"proxy"`。
+  - **Mesh**：始终进 dataplane 自己的 `TcpTerminator::handle_uplink`。
+  - **Proxy（步骤 0 起）**：`proxy_engine.is_some()` 时不进 dataplane 的
+    `TcpTerminator`，改由 `ProxyEngine::handle_packet(&packet)` 终结/转发，
+    返回包由 dataplane 写回 TUN；`proxy_engine == None` 时仍用 dataplane
+    `TcpTerminator` 收 SYN，并在 `TcpEvent::Syn` 立即回 RST（见 S4）。
+  - **flow_mgr**：本 run 生产保持 `None`；若未来启用，Proxy TCP 的会话/RST
+    归属须另立 run 设计（PRODUCT §2.1 carve-out）。
 - **S2（TUN 回写）**：`handle_uplink` 返回的 TUN 包（SYN-ACK/ACK/重传）全部
   写回 TUN；`tun_written += n`；单包写失败 → `dropped += 1`
   （不 panic，不中断后续包）。
@@ -222,13 +228,20 @@
     &encode_syn_payload(dst_ip_str, dst_port))` 经
     `N1Sender::send_to_mesh(orig_dst_ip, frame)` 发送；成功 →
     `mesh_tcp_frames += 1`，失败 → `mesh_dropped_no_n1 += 1`（W1 语义复用）；
-  - Proxy：`proxy_tcp_streams += 1`（proxy 传输接线 = GAP-1，本契约只计数）；
+  - Proxy 且 `proxy_engine == None`：立即 `handle_fabric_rst(stream_id)` +
+    写回 TUN + `proxy_dropped_no_proxy += 1`，并输出
+    `[nexusd] dataplane: proxy egress unavailable; sent RST stream_id=<u32> counter=proxy_dropped_no_proxy`；
+  - Proxy 且 engine 存在：不会到达本事件（engine 路径不经过 dataplane
+    terminator）；`proxy_tcp_streams` 改由 engine stats 的
+    `tcp_streams_ok` 增量驱动（§6.4），不再在此无条件 `+= 1`；
   - 两类都计 `tcp_handshakes += 1`。
 - **S5（Data 事件）**：`TcpEvent::Data{stream_id, peer, bytes}`：
   - Mesh：STREAM DATA 帧经 N1 发送；成功 →
     `mesh_tcp_frames += 1; mesh_tcp_bytes += bytes.len()`，失败 →
     `mesh_dropped_no_n1 += 1`；
-  - Proxy：`proxy_tcp_bytes += bytes.len()`。
+  - Proxy 且 engine 存在：不会到达本事件（engine 路径）；
+  - Proxy 且 engine 为 `None`：保持只消费、不伪造转发；不再累计
+    `proxy_tcp_bytes`（该字段由 engine 的 `tcp_bytes_up` 增量驱动）。
 - **S6（Closed 事件）**：`TcpEvent::Closed{stream_id, peer, reset}`：
   - Mesh：STREAM FIN（`reset=false`）或 RST（`reset=true`）帧经 N1 发送；
     失败 → `mesh_dropped_no_n1 += 1`；
@@ -243,9 +256,13 @@
   `terminator.handle_originator_frame(stream_id, flags, payload)` →
   产生的 TUN 包写回 TUN（S2 规则）。`inject_from_n1` 的 raw 语义不变。
 - **S10（可观测）**：`DataplaneStats` 新增 `tcp_handshakes`、
-  `mesh_tcp_frames`、`mesh_tcp_bytes`、`proxy_tcp_streams`、
-  `proxy_tcp_bytes: u64`；新增
-  `Dataplane::tcp_term_stats() -> TcpTermStats`。LocalAPI stats 自动包含新字段。
+  `mesh_tcp_frames`、`mesh_tcp_bytes`、`proxy_tcp_streams`、`proxy_tcp_bytes: u64`；
+  新增 `Dataplane::tcp_term_stats() -> TcpTermStats`。LocalAPI stats 自动包含新字段。
+  - **Proxy 路径统计映射（步骤 0 冻结）**：同一驱动点（`drive_proxy_engine()`）
+    刷新 engine stats 增量：`proxy_forwarded += tcp_dials_okΔ + udp_sentΔ`、
+    `proxy_dropped_no_proxy += tcp_dials_failedΔ + udp_send_failedΔ`、
+    `proxy_tcp_streams += tcp_streams_okΔ`、`proxy_tcp_bytes += tcp_bytes_upΔ`；
+    `proxy_dropped_no_proxy` 不在同一事件上与 dial 失败重复累加。
 - **S11（性能基线）**：实测并记录（无硬门限，供回归对比）：
   (1) `TcpTerminator` 单流吞吐（Mbps）；
   (2) dataplane TCP 包处理速率（pps）。
@@ -287,31 +304,67 @@ cargo clippy -p nexusd --all-targets -- -D warnings
 
 ### Proxy 生产转发（P1-P5，scenarios/product/proxy_fwd.toml，2026-10-01 冻结）
 
-- **P1（TCP 转发）**：`Classification::Proxy` 的 TCP 包 → `ProxyEngine`：
-  - 经 `TcpTerminator`（smoltcp）在用户态终结：SYN → SYN-ACK → ACK；
+- **P1（TCP 转发）**：`Classification::Proxy` 的 TCP 包 → `ProxyEngine`
+  （步骤 0 起，生产 `process_one()` 直接调用 `handle_packet`；不再先经 dataplane
+  的 `TcpTerminator`）：
+  - `ProxyEngine` 内部经 `TcpTerminator`（smoltcp）在用户态终结：
+    SYN → SYN-ACK → ACK；
   - 握手完成（`TcpEvent::Syn{stream_id, dst}`）→ worker 线程经代理协议
     dial 目标（ss / trojan / socks5，P3 选路）；
   - dial 成功 → `proxy_forwarded += 1`，启动中继线程双向泵字节
     （proxy→`handle_fabric_data`→TUN；TUN→proxy stream）；
   - dial 失败 → `handle_fabric_rst(stream_id)`，`proxy_dropped_no_proxy += 1`；
-  - 对端关闭 → `handle_fabric_fin/rst`；本地关闭 → 关 proxy 连接。
+  - 对端关闭 → `handle_fabric_fin/rst`；本地关闭 → 关 proxy 连接；
+  - **常态驱动**：`proxy_engine.is_some()` 时 `process_one()` 每轮（含 TUN
+    `WouldBlock` / `Ok(false)` 轮次）都调用 `ProxyEngine::poll()` 并写回 TUN，
+    否则零上行包时下行响应永远无法写回。
 - **P2（UDP 转发）**：`Classification::Proxy` 的 UDP 包 → `ProxyEngine`：
   - 解析 IP/UDP 头 → 按 P3 选定协议的 UDP 中继发送；
   - SOCKS5：UDP ASSOCIATE；ss：AEAD UDP 中继；trojan：TCP 上的 UDP；
   - 回包经后台线程解包 → 重构 IP/UDP 包 → 写回 TUN（`tun_written += 1`）；
   - 发送失败 → `proxy_dropped_no_proxy += 1`。
-- **P3（出站选择）**：解析 `proxy.yaml` 的 `outbounds`，选首个可用
-  `kind ∈ {shadowsocks, trojan, socks5}`（跳过 direct/relay/vmess）；
-  - 无可用出站 → 等价未配置（`proxy_dropped_no_proxy`）；
-  - `OutboundKind` 新增 `Socks5`（ additive；`locator` 为 `host:port`）。
+- **P3（出站选择）**：解析 `proxy.yaml` 的 `outbounds`，按文件顺序选首个可用
+  wired 出站。本 run 的 wired 集合在步骤 0 为 `{shadowsocks, trojan, socks5}`，
+  步骤 2 后扩为 `{shadowsocks, trojan, socks5, vless, anytls}`；`direct/relay`
+  记 `NotProxyKind` 跳过，`vmess/hysteria2`（步骤 2 前含 `vless/anytls`）记
+  `ProtocolNotWired` 跳过。
+  - 首个 wired 出站配置非法 → `EngineInitError::SelectedInvalid`（硬失败，不跳下一个）；
+  - 全部跳过 → `EngineInitError::NoUsableOutbound`；
+  - `ProxyEngine::new(None)` = 无 `proxy.yaml`，返回 `Ok(None)`；无可用出站
+    （`NoUsableOutbound`）与「未配置」区分，启动失败 fail-closed（exit 1）。
+  - `OutboundKind` 新增 `Socks5`（additive；`locator` 为 `host:port`）。
 - **P4（失败语义）**：任何 dial/中继失败 → 计数丢弃，不 panic、不崩
   dataplane 线程；`proxy_dropped_no_proxy` 语义扩展为"无可用代理或转发失败"。
+  - **无 engine 且 Proxy TCP**：SYN 即 RST + `proxy_dropped_no_proxy += 1`
+    （不再只计数/静默黑洞；GAP-1 的旧语义由步骤 0 改写）。
+  - **启动失败 fail-closed**：`EngineInitError::{Yaml,SelectedInvalid,
+    NoUsableOutbound}` → stderr 单行 JSON（§6.5 模板）+ `exit(1)`，不启动
+    dataplane；`SelectedInvalid` 的 `variant` 恒为
+    `SELECTED_OUTBOUND_INVALID`，具体原因只进 `cause`。
 - **P5（资源边界）**：TCP 最大连接数复用 `TcpTerminator::MAX_TCP_CONNS`；
   UDP 流表上限 1024，60s 无活动回收；worker 线程 per-dial 创建、
   完成后退出（有界）；关闭时 join 超时 1s（R4 延续）。
 - 不变量：单 TUN（D1）；分类器唯一入口（S29）；TUN 所有权仍在 dataplane
   （engine 只返回待写包，不直接写 TUN）；`proxy_forwarded` 仅在真实转发
   发生时计数（不再是纯分类计数）。
+
+### 临时双轨与删除触发条件（步骤 0 落账）
+
+本 run 允许短期共存的双轨，必须按下列触发条件收敛，不得把"临时双轨"当成终态：
+
+- **`ss_std`（daemon 内嵌 SS）**：保留，不做任何行格式/派生/HKDF/分块改动。
+  证据：步骤 1.5 `.evidence/outbound-adapter-wiring/ss-std-sip004/vectors.json`
+  overall=`MISMATCH`（4/4，派生省略 EVP_BytesToKey，已知不合规）。删除/降级
+  触发条件 = spec §4.2 六条件全部满足 + `fixes-2` verdict 就绪 + SS 真流量 E4
+  （AC-3）；本 run 仅条件步骤 4 可触发，未触发前维持现状。
+- **proxy-transport Trojan**：保留（fixes-5 未合并）；`TODO(deletion-gate: fixes-5)`。
+  不得声称 Trojan fail-closed；配置面须持续警示 `TROJAN_FALLBACK_FAIL_OPEN`。
+- **`ProxyDialConfig` / `select_dialer_legacy`**：步骤 0 的过渡选择层，步骤 1 由
+  `OutboundDialer`/`select_dialer` 取代；`TODO(deletion-gate: step-1 adapter)`。
+- **VLESS / AnyTLS / Hysteria2**：本 run 步骤 0 记为 `ProtocolNotWired` 跳过
+  （步骤 2 才 wired VLESS/AnyTLS；Hysteria2 不执行）。
+
+删除/降级任何一项都必须同 PR 更新本 MODULE、`scenarios/` 与 Evidence，不得静默移除。
 
 ### Workspace 生产接线（C1/D1-D9，scenarios/product/daemon_workspace_mount.toml，2026-10-02 冻结）
 

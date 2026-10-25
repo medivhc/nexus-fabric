@@ -13,7 +13,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
-use nexus_projection::tcp::{TcpEvent, TcpTerminator};
+use nexus_projection::tcp::{FourTuple, TcpEvent, TcpTerminator, ip_checksum, tcp_checksum};
 
 use super::ss_std::SsTcpClient;
 use super::{ProxyDialConfig, ProxyFwdStats};
@@ -93,6 +93,8 @@ impl TcpForwarder {
         for event in self.terminator.poll() {
             self.handle_tcp_event(event, &mut out);
         }
+        out.append(&mut self.pending_tun);
+        self.fixup_out(&mut out);
         out
     }
 
@@ -104,7 +106,18 @@ impl TcpForwarder {
         for event in self.terminator.poll() {
             self.handle_tcp_event(event, &mut out);
         }
+        out.append(&mut self.pending_tun);
+        self.fixup_out(&mut out);
         out
+    }
+
+    /// 写回 TUN 前把 smoltcp 源 IP（10.254.0.1）改回原始目的（GAP-5 规则）。
+    fn fixup_out(&self, out: &mut [Vec<u8>]) {
+        for pkt in out.iter_mut() {
+            if let Some(fixed) = self.terminator.fixup_tun_packet(pkt) {
+                *pkt = fixed;
+            }
+        }
     }
 
     /// 排空中继线程发来的事件。
@@ -120,13 +133,22 @@ impl TcpForwarder {
                     Err(e) => {
                         self.pending.remove(&stream_id);
                         self.stats.tcp_dials_failed += 1;
-                        // RST smoltcp 侧。
-                        let pkts = self.terminator.handle_fabric_rst(stream_id);
+                        // RST smoltcp 侧；terminator 在 SynReceived 直接 release
+                        // 时不产包，需按四元组兜底构造 RST（E4 可观察）。
+                        let four = self.terminator.lookup_id(stream_id);
+                        let mut pkts = self.terminator.handle_fabric_rst(stream_id);
+                        let has_rst = pkts
+                            .iter()
+                            .any(|pkt| pkt.len() >= 34 && pkt[9] == 6 && pkt[33] & 0x04 != 0);
+                        if !has_rst && let Some(four) = four {
+                            pkts.push(craft_rst(&four));
+                        }
                         let _ = self.event_tx.send(TcpFwdEvent::TunPackets(pkts));
                         eprintln!("[proxy-fwd] dial failed for stream {stream_id}: {e}");
                     }
                 },
                 TcpFwdEvent::ProxyData { stream_id, bytes } => {
+                    self.stats.tcp_bytes_down += bytes.len() as u64;
                     let pkts = self.terminator.handle_fabric_data(stream_id, &bytes);
                     if !pkts.is_empty() {
                         let _ = self.event_tx.send(TcpFwdEvent::TunPackets(pkts));
@@ -157,6 +179,7 @@ impl TcpForwarder {
     fn handle_tcp_event(&mut self, event: TcpEvent, out: &mut Vec<Vec<u8>>) {
         match event {
             TcpEvent::Syn { stream_id, dst, .. } => {
+                self.stats.tcp_streams_ok += 1;
                 let target = SocketAddr::V4(dst);
                 self.pending.insert(stream_id, target);
                 let config = self.dial_config.clone();
@@ -175,6 +198,7 @@ impl TcpForwarder {
             } => {
                 if let Some(relay) = self.relays.get(&stream_id) {
                     // 非阻塞发送（中继线程可能已退出，忽略错误）。
+                    self.stats.tcp_bytes_up += bytes.len() as u64;
                     let _ = relay.tx.send(RelayCmd::Data(bytes));
                 }
                 // 无中继（dial 中）：丢弃（dial 成功后新数据会正常走）。
@@ -200,6 +224,27 @@ impl TcpForwarder {
     pub fn stats(&self) -> ProxyFwdStats {
         self.stats.clone()
     }
+}
+
+/// 构造 RST（回退路径；src/dst 互换）。
+fn craft_rst(four: &FourTuple) -> Vec<u8> {
+    let mut pkt = vec![0u8; 40];
+    pkt[0] = 0x45;
+    pkt[3] = 40;
+    pkt[6] = 0x40;
+    pkt[8] = 64;
+    pkt[9] = 6;
+    pkt[12..16].copy_from_slice(&four.dst_ip);
+    pkt[16..20].copy_from_slice(&four.src_ip);
+    pkt[20..22].copy_from_slice(&four.dst_port.to_be_bytes());
+    pkt[22..24].copy_from_slice(&four.src_port.to_be_bytes());
+    pkt[32] = 0x50;
+    pkt[33] = 0x14;
+    let c = ip_checksum(&pkt[..20]);
+    pkt[10..12].copy_from_slice(&c.to_be_bytes());
+    let c2 = tcp_checksum(four.dst_ip, four.src_ip, &pkt[20..]);
+    pkt[36..38].copy_from_slice(&c2.to_be_bytes());
+    pkt
 }
 
 /// 经代理 dial 到目标，返回可读写的字节流。

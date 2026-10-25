@@ -64,7 +64,7 @@ SESSION_FAILED
 
 （2026-10-02 requirement-change 冻结；场景 `product.flow-session-mapping`）
 
-nexusd 生产 TUN 数据面必须经"流→会话映射"接入 §10 链，而非逐包直转：
+nexusd 生产 TUN 数据面必须经"流→会话映射"接入 §10 链，而非逐包直转；**Proxy 分类的 TCP 流除外**（见下）：
 
 - TUN 产生的每个新流（5 元组 key）首包触发：FlowContext（origin=PacketCapture）→ Policy → Core Planner → SessionOwner 创建 §10 Session → 后台异步建连。
 - 首包可观察语义：TCP 本地握手照常完成，早期数据由 smoltcp 缓冲，会话 Active 后 flush；UDP 首包触发建会话，有界缓冲（32 包/64KB），超 bound 丢弃并计数；建连失败 → TCP 发 RST、UDP 丢包（不静默黑洞）。
@@ -72,6 +72,7 @@ nexusd 生产 TUN 数据面必须经"流→会话映射"接入 §10 链，而非
 - 空闲超时流进 Draining，会话数回落，无泄漏。
 - NAT 路径竞速（direct/TURN/peer-relay）对流映射层透明：只订阅 session 级事件（connectivity established/failed → 触发重 plan）。
 - 本次 requirement-change 修订了老场景"逐包即时转发"的期望（首包异步化改变可观察语义）。
+- **Proxy TCP carve-out（outbound-adapter-wiring 步骤 0 起）**：分类为 `Proxy` 的 TCP 流不进入本节 §10 流→会话映射，而由 nexusd `ProxyEngine` adapter 直接经 TUN 数据面终结并转发（`Dataplane::process_one()` → `ProxyEngine::handle_packet/poll`，TUN 所有权仍在 dataplane）；该路径**不启用** `flow_mgr`（生产保持 `None`）。无可用 engine 时 Proxy TCP 在 SYN 后立即回 RST 并计 `proxy_dropped_no_proxy`，不静默黑洞。Mesh TCP 仍按本节 §10 链；Proxy TCP 的 §10 会话/RST 归属需另立 run 重新设计。
 
 ## 3. Service
 
@@ -365,8 +366,8 @@ SOCKS5 入站（复用 nexus-ingress 状态机）
 - TUN 透明代理 / Virtual Packet Interface 全局拦截：已转 §11.18 落地（portable
   IP 包解析 + 规则路由 + NAT 决策 E4 离线闭环；真实 wintun adapter 开卡与收发为 E5）。
   窄 wintun C ABI 绑定（手写 LoadLibraryW、无第三方 FFI、纯符号解析单测）与
-  WintunVpiAdapter 复用 §12.29；真实双向字节中继回写、路由表改写、IPv6、DNS 劫持
-  仍为 §11.18 冻结边界（下批）；
+  WintunVpiAdapter 复用 §12.29；**TCP 双向字节中继回写已由 outbound-adapter-wiring
+  步骤 0 解锁**；UDP 回写、路由表改写、IPv6、DNS 劫持仍为 §11.18 冻结边界（下批）；
 - Clash 订阅节点在线拉取与热生效（已移出本冻结清单，本批次交付，见 §11.17）；
 - LoadBalance / Relay 链式策略组（多跳）；
 - DNS hijack 透明拦截（仅在动作链模型中留口，不在本期实现；DNS 多 server 规则路由见 §11.5）。
@@ -993,10 +994,11 @@ wintun 虚拟网卡（nexus-platform-windows::WintunVpiAdapter，§12.29 窄 C A
 - **E5 真机观察**：`cargo run -p nexus --example tun_proxy -- --real [--tun-name <n>]`
   （管理员）→ 真实 `WintunVpiAdapter::create` 成功，输出 `backend`/`mtu`/`driver_version`/
   `capabilities` 与一次非阻塞 `receive`（0 = 无包）。创建失败 → `verdict=TUN_ERROR`。
-- **冻结边界（本期不做，下批）**：真实双向 TCP/UDP 字节中继回写 TUN（userspace TCP/IP
-  栈 / tun2socks 式连接跟踪与报文改写）、路由表增删（route include/exclude）、IPv6 解析、
-  DNS 劫持接入 §11.5 DNS 模块、MTU/MSS 钳制。本期 E4 冻结的是「解析 → 分类 → 规则路由
-  → NAT 决策」portable 闭环；真实报文拨号与回写为下批。
+- **冻结边界（修订后）**：**TCP 双向字节中继回写 TUN 已由 outbound-adapter-wiring 步骤 0 解锁**
+  （`Dataplane::process_one()` + `ProxyEngine` 生产装配，见 §1.2/Gate 0）；**UDP 回写、
+  userspace TCP/IP 栈 / tun2socks 式连接跟踪与报文改写、路由表增删（route include/exclude）、
+  IPv6 解析、DNS 劫持接入 §11.5 DNS 模块、MTU/MSS 钳制仍为下批**。本期 E4 冻结的是
+  「解析 → 分类 → 规则路由 → NAT 决策」portable 闭环 + Proxy TCP 生产转发闭环。
 
 ### 11.19 HTTP/混合代理入站（HTTP & mixed proxy inbound，2026-09-25） {#11-http-mixed-inbound}
 

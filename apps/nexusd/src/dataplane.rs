@@ -140,6 +140,10 @@ pub struct Dataplane {
     last_tcp_dials_ok: u64,
     /// 上次同步的 TCP dial 失败计数。
     last_tcp_dials_failed: u64,
+    /// 上次同步的 TCP 建流成功计数（engine `tcp_streams_ok`）。
+    last_tcp_streams_ok: u64,
+    /// 上次同步的 TCP 上行明文字节（engine `tcp_bytes_up`）。
+    last_tcp_bytes_up: u64,
     stats: Arc<Mutex<DataplaneStats>>,
     config: DataplaneConfig,
     buf: Vec<u8>,
@@ -232,6 +236,8 @@ impl Dataplane {
             proxy_engine: None,
             last_tcp_dials_ok: 0,
             last_tcp_dials_failed: 0,
+            last_tcp_streams_ok: 0,
+            last_tcp_bytes_up: 0,
             stats: Arc::new(Mutex::new(DataplaneStats::default())),
             config,
             buf: vec![0u8; 65535],
@@ -400,6 +406,12 @@ impl Dataplane {
         self.proxy_engine.is_some()
     }
 
+    /// Proxy engine 统计快照（无 engine 时 `None`；E4 观测用）。
+    #[must_use]
+    pub fn proxy_stats(&self) -> Option<crate::proxy_fwd::ProxyFwdStats> {
+        self.proxy_engine.as_ref().map(|engine| engine.stats())
+    }
+
     /// 获取统计的共享句柄（供 LocalAPI 线程读取，B1）。
     #[must_use]
     pub fn stats_handle(&self) -> Arc<Mutex<DataplaneStats>> {
@@ -416,6 +428,67 @@ impl Dataplane {
         }
     }
 
+    /// 常态驱动 ProxyEngine：poll → 写回 TUN → 刷新 stats 增量。
+    fn drive_proxy_engine(&mut self) {
+        let Some(engine) = self.proxy_engine.as_mut() else {
+            return;
+        };
+        let pkts = engine.poll();
+        self.write_engine_packets(pkts);
+        self.sync_proxy_stats();
+    }
+
+    /// 写回 engine 产出的包（TUN 所有权仍在 dataplane）。
+    fn write_engine_packets(&mut self, pkts: Vec<Vec<u8>>) {
+        if pkts.is_empty() {
+            return;
+        }
+        let mut written = 0u64;
+        let mut dropped = 0u64;
+        for pkt in pkts {
+            if self.tun.write(&pkt).is_ok() {
+                written += 1;
+            } else {
+                dropped += 1;
+            }
+        }
+        if written > 0 || dropped > 0 {
+            self.with_stats(|s| {
+                s.tun_written += written;
+                s.dropped += dropped;
+            });
+        }
+    }
+
+    /// 刷新 engine stats 增量到 DataplaneStats（spec §6.4 映射）。
+    fn sync_proxy_stats(&mut self) {
+        let Some(engine_stats) = self.proxy_engine.as_ref().map(|engine| engine.stats()) else {
+            return;
+        };
+        let dial_ok_delta = engine_stats
+            .tcp_dials_ok
+            .saturating_sub(self.last_tcp_dials_ok);
+        let dial_fail_delta = engine_stats
+            .tcp_dials_failed
+            .saturating_sub(self.last_tcp_dials_failed);
+        let streams_delta = engine_stats
+            .tcp_streams_ok
+            .saturating_sub(self.last_tcp_streams_ok);
+        let bytes_delta = engine_stats
+            .tcp_bytes_up
+            .saturating_sub(self.last_tcp_bytes_up);
+        self.last_tcp_dials_ok = engine_stats.tcp_dials_ok;
+        self.last_tcp_dials_failed = engine_stats.tcp_dials_failed;
+        self.last_tcp_streams_ok = engine_stats.tcp_streams_ok;
+        self.last_tcp_bytes_up = engine_stats.tcp_bytes_up;
+        self.with_stats(|s| {
+            s.proxy_forwarded += dial_ok_delta;
+            s.proxy_dropped_no_proxy += dial_fail_delta;
+            s.proxy_tcp_streams += streams_delta;
+            s.proxy_tcp_bytes += bytes_delta;
+        });
+    }
+
     /// 处理单个包（非阻塞；无包时返回 `Ok(false)`）。
     ///
     /// 管线：读 TUN → DNS 短路（UDP dport 53）→ 分类 → [S1: TCP 终结] →
@@ -423,9 +496,15 @@ impl Dataplane {
     pub fn process_one(&mut self) -> io::Result<bool> {
         // Phase B/C：每轮先回填建连事件（即使无包，保证 Allocating→Active 推进）。
         self.flow_pump();
+        // 常态驱动：只要有 engine，每轮都 poll 并写回 TUN（含零上行包轮次）。
+        self.drive_proxy_engine();
         let n = match self.tun.read(&mut self.buf) {
             Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // 零上行包轮次也必须驱动 poll（下行响应/重传/超时）。
+                self.drive_proxy_engine();
+                return Ok(false);
+            }
             Err(e) => return Err(e),
         };
         let packet = self.buf[..n].to_vec();
@@ -465,9 +544,31 @@ impl Dataplane {
             }
             // Phase B：流→会话映射（启用时）。首包走 §10 链，会话建好前
             // TCP 本地握手照常（smoltcp 缓冲早期数据，D4）。
-            if self.flow_mgr.is_some() && !self.flow_handle_tcp_packet(&packet) {
+            // 本 run 生产 flow_mgr 保持 None；若启用则维持既有 flow 路径。
+            if self.flow_mgr.is_some() {
+                if !self.flow_handle_tcp_packet(&packet) {
+                    return Ok(true);
+                }
+                self.handle_tcp_terminated(&packet, &classification);
+                self.dispatch_tcp_events();
+                self.flow_pump();
                 return Ok(true);
             }
+            // 步骤 0：Proxy TCP 在有 engine 时直接进 ProxyEngine，
+            // 不经 dataplane 自己的 TcpTerminator。
+            if matches!(classification, Classification::Proxy) && self.proxy_engine.is_some() {
+                let engine_pkts = self
+                    .proxy_engine
+                    .as_mut()
+                    .map(|engine| engine.handle_packet(&packet).0)
+                    .unwrap_or_default();
+                self.write_engine_packets(engine_pkts);
+                // 立刻 poll 一次并刷新 engine stats 增量。
+                self.drive_proxy_engine();
+                return Ok(true);
+            }
+            // Mesh，以及无 engine 的 Proxy：dataplane terminator 路径
+            // （无 engine 的 Proxy 在 S4 回 RST）。
             self.handle_tcp_terminated(&packet, &classification);
             self.dispatch_tcp_events();
             self.flow_pump();
@@ -512,37 +613,13 @@ impl Dataplane {
                 }
             }
             Classification::Proxy => {
-                // P1-P5：engine 已注入 → 真实转发；否则走 D2 计数路径。
-                // 先取出 engine 处理结果（避免 borrow 冲突）。
+                // UDP 的 Proxy 路径（TCP 已在上方分支）；engine 已注入 →
+                // 真实转发，否则计数丢弃。
                 let engine_outcome: Option<(Vec<Vec<u8>>, bool)> =
                     self.proxy_engine.as_mut().map(|e| e.handle_packet(&packet));
                 match engine_outcome {
                     Some((tun_pkts, forwarded)) => {
-                        for pkt in tun_pkts {
-                            if self.tun.write(&pkt).is_ok() {
-                                self.with_stats(|s| s.tun_written += 1);
-                            } else {
-                                self.with_stats(|s| s.dropped += 1);
-                            }
-                        }
-                        // 驱动 engine（回包/重传/事件）。
-                        let more: Vec<Vec<u8>> = self
-                            .proxy_engine
-                            .as_mut()
-                            .map(|e| e.poll())
-                            .unwrap_or_default();
-                        for pkt in more {
-                            if self.tun.write(&pkt).is_ok() {
-                                self.with_stats(|s| s.tun_written += 1);
-                            } else {
-                                self.with_stats(|s| s.dropped += 1);
-                            }
-                        }
-                        // P1：proxy_forwarded 仅在真实转发发生时计数。
-                        // - UDP：handle_packet 返回真实发送结果 → 按包计数。
-                        // - TCP：dial 异步，转发尚未确认；计数由下方
-                        //   engine.stats() 的 tcp_dials_ok/failed 增量驱动，
-                        //   此处不按包计数。
+                        self.write_engine_packets(tun_pkts);
                         if packet.get(9) == Some(&17) {
                             if forwarded {
                                 self.with_stats(|s| s.proxy_forwarded += 1);
@@ -550,25 +627,7 @@ impl Dataplane {
                                 self.with_stats(|s| s.proxy_dropped_no_proxy += 1);
                             }
                         }
-                        // P1：同步 TCP dial 结果增量（dial 成功 → proxy_forwarded；
-                        // dial 失败 → proxy_dropped_no_proxy）。
-                        let eng_stats = self
-                            .proxy_engine
-                            .as_ref()
-                            .map(|e| e.stats())
-                            .unwrap_or_default();
-                        let ok_delta = eng_stats
-                            .tcp_dials_ok
-                            .saturating_sub(self.last_tcp_dials_ok);
-                        let fail_delta = eng_stats
-                            .tcp_dials_failed
-                            .saturating_sub(self.last_tcp_dials_failed);
-                        self.last_tcp_dials_ok = eng_stats.tcp_dials_ok;
-                        self.last_tcp_dials_failed = eng_stats.tcp_dials_failed;
-                        self.with_stats(|s| {
-                            s.proxy_forwarded += ok_delta;
-                            s.proxy_dropped_no_proxy += fail_delta;
-                        });
+                        self.drive_proxy_engine();
                     }
                     // P3：engine 未注入（无可用出站或未配置）→
                     // proxy_dropped_no_proxy。旧"兼容"分支（计 proxy_forwarded）
@@ -759,9 +818,8 @@ impl Dataplane {
                 }
             }
             Some(_) => {
-                // S5-Proxy：GAP-1 前只计数。
-                let n = bytes.len() as u64;
-                self.with_stats(|s| s.proxy_tcp_bytes += n);
+                // S5-Proxy：engine 存在时不会走到这里；无 engine 时保持只消费，
+                // 不伪造转发/字节计数（proxy_tcp_bytes 由 engine 增量驱动）。
             }
             None => {
                 // 防御：未知流的数据（不应发生）。
@@ -970,8 +1028,35 @@ impl Dataplane {
                     }
                     self.with_stats(|s| s.tcp_handshakes += 1);
                     if proxy {
-                        // S4-Proxy：GAP-1 前只计数。
-                        self.with_stats(|s| s.proxy_tcp_streams += 1);
+                        // S4-Proxy（步骤 0）：engine 存在时不会到达这里；
+                        // 无 engine 时 SYN 立即 RST，不伪造流计数。
+                        if self.flow_mgr.is_none() && self.proxy_engine.is_none() {
+                            let four = self.tcp.lookup_id(stream_id);
+                            // 先释放终结器状态；RST 用 craft_rst 保证源/目的正确
+                            //（terminator 产包的源 IP 是 SMOLTCP_IFACE_IP，且连接
+                            // 释放后 fixup 无法匹配）。
+                            let _ = self.tcp.handle_fabric_rst(stream_id);
+                            self.tcp_streams.remove(&stream_id);
+                            if let Some(four) = four {
+                                let key = FlowKey {
+                                    src_ip: four.src_ip,
+                                    src_port: four.src_port,
+                                    dst_ip: four.dst_ip,
+                                    dst_port: four.dst_port,
+                                    proto: IpProto::Tcp,
+                                };
+                                let rst = Self::craft_rst(&key);
+                                if self.tun.write(&rst).is_ok() {
+                                    self.with_stats(|s| s.tun_written += 1);
+                                } else {
+                                    self.with_stats(|s| s.dropped += 1);
+                                }
+                            }
+                            self.with_stats(|s| s.proxy_dropped_no_proxy += 1);
+                            eprintln!(
+                                "[nexusd] dataplane: proxy egress unavailable; sent RST stream_id={stream_id} counter=proxy_dropped_no_proxy"
+                            );
+                        }
                     } else {
                         // S4-Mesh：STREAM SYN 帧经 N1 发送（按原始目的路由）。
                         let payload = encode_syn_payload(&dst.ip().to_string(), dst.port());
@@ -1689,7 +1774,8 @@ mod tests {
         let _ = sid;
     }
 
-    /// S4/S5-Proxy：Proxy 分类的 TCP 只计数，不经 N1（GAP-1 诚实边界）。
+    /// S4-Proxy（步骤 0 改写）：无 engine 时 Proxy TCP 在 SYN 后立即 RST，
+    /// 计 `proxy_dropped_no_proxy`，不再累计 `proxy_tcp_streams`（不伪造转发）。
     #[test]
     fn tcp_proxy_classified_only_counted() {
         let mock = Arc::new(Mutex::new(nexus_projection::MockTun::new("test0")));
@@ -1705,20 +1791,13 @@ mod tests {
             ..Default::default()
         };
         let mut dp = Dataplane::new(tun, config).expect("dataplane new");
-        let frames = Arc::new(Mutex::new(Vec::new()));
-        dp.set_n1_sender(Arc::new(TestN1Sender {
-            frames: Arc::clone(&frames),
-        }));
 
-        // SYN → SYN-ACK（终结仍发生，S1）。
+        // SYN → SYN-ACK；ACK 完成握手后 TcpEvent::Syn 触发，立即回 RST。
         let syn = craft_tcp([10, 0, 0, 2], [8, 8, 8, 8], 40001, 443, 2000, 0, 0x02, &[]);
         mock.lock().unwrap().inject(syn);
         assert!(dp.process_one().expect("syn"));
-        let written = mock.lock().unwrap().take_written();
-        assert_eq!(written.len(), 1, "S1: proxy TCP also terminated");
-        let srv_seq = syn_ack_srv_seq(&written[0]);
-
-        // ACK → 握手完成 → 只计数，不经 N1。
+        let syn_ack = mock.lock().unwrap().take_written();
+        let srv_seq = syn_ack_srv_seq(&syn_ack[0]);
         let ack = craft_tcp(
             [10, 0, 0, 2],
             [8, 8, 8, 8],
@@ -1731,27 +1810,97 @@ mod tests {
         );
         mock.lock().unwrap().inject(ack);
         assert!(dp.process_one().expect("ack"));
-        assert_eq!(dp.stats().proxy_tcp_streams, 1, "S4-Proxy: counted");
-        assert!(
-            frames.lock().unwrap().is_empty(),
-            "S4-Proxy: no N1 frames (GAP-1)"
+        let written = mock.lock().unwrap().take_written();
+        let rst = written
+            .iter()
+            .any(|pkt| pkt.len() >= 34 && pkt[9] == 6 && pkt[33] & 0x04 != 0);
+        assert!(rst, "no engine: Proxy SYN must be answered with RST");
+        assert_eq!(
+            dp.stats().proxy_dropped_no_proxy,
+            1,
+            "no engine: RST counted as proxy_dropped_no_proxy"
         );
+        assert_eq!(
+            dp.stats().proxy_tcp_streams,
+            0,
+            "no engine: no stream counted without real forwarding"
+        );
+    }
 
-        // DATA → proxy_tcp_bytes 计数。
-        let data = craft_tcp(
+    /// 步骤 0：有 engine 时 Proxy TCP 由 ProxyEngine 终结，不经 dataplane
+    /// terminator（tcp_handshakes 为 0；engine 的 tcp_streams_ok 映射到
+    /// proxy_tcp_streams，且不发 RST）。
+    #[test]
+    fn tcp_proxy_with_engine_bypasses_dataplane_terminator() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub socks5");
+        let socks_addr = listener.local_addr().expect("socks addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    // 保持连接但不回 SOCKS5 握手，dial 线程不会在测试窗口内完成。
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    drop(stream);
+                });
+            }
+        });
+
+        let mock = Arc::new(Mutex::new(nexus_projection::MockTun::new("test0")));
+        let config = DataplaneConfig {
+            mesh_cidrs: vec!["10.200.0.0/24".to_string()],
+            bypass_cidrs: vec!["192.168.0.0/16".to_string()],
+            proxy_configured: true,
+            ..Default::default()
+        };
+        let mut dp = Dataplane::new(
+            Box::new(SharedTun {
+                inner: Arc::clone(&mock),
+            }),
+            config,
+        )
+        .expect("dataplane new");
+        let yaml = format!(
+            "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: proxy\noutbounds:\n  - tag: proxy\n    kind: socks5\n    locator: {socks_addr}\n"
+        );
+        let engine = crate::proxy_fwd::ProxyEngine::new(Some(&yaml))
+            .expect("engine init")
+            .expect("socks5 engine");
+        dp.set_proxy_engine(engine);
+
+        let syn = craft_tcp([10, 0, 0, 2], [8, 8, 8, 8], 40011, 443, 3000, 0, 0x02, &[]);
+        mock.lock().unwrap().inject(syn);
+        assert!(dp.process_one().expect("syn"));
+        let syn_ack = mock.lock().unwrap().take_written();
+        let srv_seq = syn_ack_srv_seq(&syn_ack[0]);
+        let ack = craft_tcp(
             [10, 0, 0, 2],
             [8, 8, 8, 8],
-            40001,
+            40011,
             443,
-            2001,
+            3001,
             srv_seq + 1,
-            0x18,
-            b"world!",
+            0x10,
+            &[],
         );
-        mock.lock().unwrap().inject(data);
-        assert!(dp.process_one().expect("data"));
-        assert_eq!(dp.stats().proxy_tcp_bytes, 6, "S5-Proxy: 6 bytes counted");
-        assert_eq!(dp.stats().mesh_tcp_frames, 0, "no mesh frames");
+        mock.lock().unwrap().inject(ack);
+        assert!(dp.process_one().expect("ack"));
+        let written = mock.lock().unwrap().take_written();
+
+        assert_eq!(
+            dp.stats().tcp_handshakes,
+            0,
+            "engine path must not use dataplane terminator"
+        );
+        assert_eq!(
+            dp.stats().proxy_tcp_streams,
+            1,
+            "engine tcp_streams_ok maps to proxy_tcp_streams"
+        );
+        assert!(
+            !written
+                .iter()
+                .any(|pkt| pkt.len() >= 34 && pkt[9] == 6 && pkt[33] & 0x04 != 0),
+            "engine path must not emit the no-engine RST"
+        );
     }
 
     /// S8：Direct 分类的 TCP 永不进终结器（零回归）。

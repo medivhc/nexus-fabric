@@ -325,10 +325,17 @@ fn main() {
 
     // 构造 ProxyEngine（SOCKS5）。
     let yaml = "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: proxy\noutbounds:\n  - tag: proxy\n    kind: socks5\n    locator: 127.0.0.1:11080\n";
-    let mut engine = match ProxyEngine::new(yaml) {
-        Some(e) => e,
-        None => {
+    let mut engine = match ProxyEngine::new(Some(yaml)) {
+        Ok(Some(e)) => e,
+        Ok(None) => {
             println!("{{\"verdict\":\"FAIL\",\"error\":\"ProxyEngine::new returned None\"}}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            println!(
+                "{{\"verdict\":\"FAIL\",\"error\":\"ProxyEngine::new failed: {}\"}}",
+                e.variant()
+            );
             std::process::exit(1);
         }
     };
