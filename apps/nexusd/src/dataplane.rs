@@ -3790,4 +3790,303 @@ proto=udp frontend=tproxy matched_rule=- egress_hint=- outbound=self session=-"
         let p99 = times[N * 99 / 100].as_nanos();
         println!("process_one (direct path): p50={p50}ns p99={p99}ns over {N} packets");
     }
+
+    // ===== P6-e：TUN 前端 Direct/Proxy 回包源地址（fixup）包级回归 =====
+    //
+    // E4 的 TUN 场景只断言事件/计数，回包源地址因此漏网（E5 r6 / S4）。
+    // 这些测试直接从 MockTun 捕获写回包并解析 IP/TCP 头。
+
+    const P6_PROXY_YAML: &str = "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: p1\noutbounds:\n  - tag: p1\n    kind: socks5\n    locator: 127.0.0.1:9\n";
+
+    /// P6-e 用数据面：`127.0.0.0/8` 走 bypass（Direct，可真实 dial 本机监听），
+    /// `10.200.3.3/32` 走规则 → Proxy `p1`。Mesh 网段避开测试地址。
+    fn tun_fixup_dataplane() -> (Dataplane, Arc<Mutex<nexus_projection::MockTun>>) {
+        let mock = Arc::new(Mutex::new(nexus_projection::MockTun::new("test0")));
+        let tun = Box::new(SharedTun {
+            inner: Arc::clone(&mock),
+        });
+        let config = DataplaneConfig {
+            mesh_cidrs: vec!["10.200.0.0/24".to_string()],
+            bypass_cidrs: vec!["127.0.0.0/8".to_string()],
+            n1_configured: true,
+            proxy_configured: true,
+            ..Default::default()
+        };
+        let mut dp = Dataplane::new(tun, config).expect("dataplane new");
+        dp.set_rule_engine(Box::new(SimpleRuleEngine::new(vec![Rule {
+            cidr: "10.200.3.3/32".parse().expect("cidr"),
+            target: nexus_domain::RouteTarget::Egress {
+                peer: "p1".to_string(),
+            },
+        }])));
+        dp.set_proxy_engine(
+            crate::proxy_fwd::ProxyEngine::new(P6_PROXY_YAML).expect("proxy engine"),
+        );
+        (dp, mock)
+    }
+
+    /// 解析写回包的 SYN-ACK 四元组：(src_ip, src_port, dst_ip, dst_port)。
+    fn syn_ack_of(pkt: &[u8]) -> Option<(Ipv4Addr, u16, Ipv4Addr, u16)> {
+        if pkt.len() < 40 || pkt[9] != 6 {
+            return None;
+        }
+        let ihl = usize::from(pkt[0] & 0x0f) * 4;
+        if pkt.len() < ihl + 14 {
+            return None;
+        }
+        let flags = pkt[ihl + 13];
+        if flags & 0x12 != 0x12 {
+            return None;
+        }
+        Some((
+            Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]),
+            u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]),
+            Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]),
+            u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]),
+        ))
+    }
+
+    /// P6-e ①：TUN Direct 流写回的 SYN-ACK 源 IP/端口 == orig_dst。
+    #[test]
+    fn tun_direct_syn_ack_source_is_orig_dst() {
+        let (mut dp, mock) = tun_fixup_dataplane();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("direct sink");
+        let orig_port = listener.local_addr().expect("addr").port();
+        let syn = craft_tcp(
+            [10, 200, 1, 2],
+            [127, 0, 0, 1],
+            57364,
+            orig_port,
+            1000,
+            0,
+            0x02,
+            &[],
+        );
+        mock.lock().unwrap().inject(syn);
+        assert!(dp.process_one().expect("direct syn"));
+
+        let written = mock.lock().unwrap().take_written();
+        assert_eq!(written.len(), 1, "one SYN-ACK expected: {written:?}");
+        let (src_ip, src_port, dst_ip, dst_port) =
+            syn_ack_of(&written[0]).expect("written packet is a SYN-ACK");
+        assert_eq!(
+            src_ip,
+            Ipv4Addr::new(127, 0, 0, 1),
+            "GAP-5/P6-b: SYN-ACK source must be the original destination"
+        );
+        assert_eq!(src_port, orig_port, "source port must be the original one");
+        assert_ne!(
+            src_ip,
+            Ipv4Addr::new(10, 254, 0, 1),
+            "smoltcp iface IP must never leak to the client"
+        );
+        assert_eq!(dst_ip, Ipv4Addr::new(10, 200, 1, 2));
+        assert_eq!(dst_port, 57364);
+        assert_eq!(dp.stats().direct_forwarded, 1);
+        assert!(dp.stats().tun_written >= 1);
+        drop(listener);
+    }
+
+    /// P6-e ②：TUN Proxy 流写回的 SYN-ACK 源 IP/端口 == orig_dst。
+    ///
+    /// 专防 P6-a 归属陷阱：fixup 必须由 `ProxyEngine` 的终结器执行；
+    /// 若把 Proxy 包改走 `Dataplane::write_tun_packets`，连接查不到 →
+    /// 整批丢弃，本测试的 `written.len() == 1` 断言会失败。
+    #[test]
+    fn tun_proxy_syn_ack_source_is_orig_dst() {
+        let (mut dp, mock) = tun_fixup_dataplane();
+        let syn = craft_tcp(
+            [10, 200, 1, 2],
+            [10, 200, 3, 3],
+            57365,
+            8080,
+            2000,
+            0,
+            0x02,
+            &[],
+        );
+        mock.lock().unwrap().inject(syn);
+        assert!(dp.process_one().expect("proxy syn"));
+
+        let written = mock.lock().unwrap().take_written();
+        assert_eq!(
+            written.len(),
+            1,
+            "P6-a: proxy SYN-ACK must survive fixup (no batch drop)"
+        );
+        let (src_ip, src_port, dst_ip, dst_port) =
+            syn_ack_of(&written[0]).expect("written packet is a SYN-ACK");
+        assert_eq!(
+            src_ip,
+            Ipv4Addr::new(10, 200, 3, 3),
+            "P6-a: proxy SYN-ACK source must be the original destination"
+        );
+        assert_eq!(src_port, 8080);
+        assert_ne!(src_ip, Ipv4Addr::new(10, 254, 0, 1));
+        assert_eq!(dst_ip, Ipv4Addr::new(10, 200, 1, 2));
+        assert_eq!(dst_port, 57365);
+        assert!(dp.stats().tun_written >= 1);
+        assert_eq!(dp.stats().dropped, 0, "no proxy packet may be dropped");
+    }
+
+    /// P6-e ③：两条不同 orig_dst 的流同时在飞，各自 SYN-ACK 改回自己的源。
+    #[test]
+    fn tun_two_flows_keep_their_own_orig_dst() {
+        let (mut dp, mock) = tun_fixup_dataplane();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("direct sink");
+        let direct_port = listener.local_addr().expect("addr").port();
+        let direct_syn = craft_tcp(
+            [10, 200, 1, 2],
+            [127, 0, 0, 1],
+            57364,
+            direct_port,
+            1000,
+            0,
+            0x02,
+            &[],
+        );
+        let proxy_syn = craft_tcp(
+            [10, 200, 1, 3],
+            [10, 200, 3, 3],
+            57365,
+            8080,
+            2000,
+            0,
+            0x02,
+            &[],
+        );
+        mock.lock().unwrap().inject(direct_syn);
+        mock.lock().unwrap().inject(proxy_syn);
+        assert!(dp.process_one().expect("direct syn"));
+        assert!(dp.process_one().expect("proxy syn"));
+
+        let written = mock.lock().unwrap().take_written();
+        assert_eq!(written.len(), 2, "one SYN-ACK per flow: {written:?}");
+        for pkt in &written {
+            let (src_ip, src_port, _dst_ip, dst_port) =
+                syn_ack_of(pkt).expect("written packet is a SYN-ACK");
+            match dst_port {
+                57364 => {
+                    assert_eq!(
+                        src_ip,
+                        Ipv4Addr::new(127, 0, 0, 1),
+                        "direct flow must keep its own orig_dst"
+                    );
+                    assert_eq!(src_port, direct_port);
+                }
+                57365 => {
+                    assert_eq!(
+                        src_ip,
+                        Ipv4Addr::new(10, 200, 3, 3),
+                        "proxy flow must keep its own orig_dst"
+                    );
+                    assert_eq!(src_port, 8080);
+                }
+                other => panic!("unexpected SYN-ACK for client port {other}"),
+            }
+        }
+        drop(listener);
+    }
+
+    /// P6-e ④：TUN Direct / Proxy 各产生恰好一条 `flow_decision`（frontend=tun），
+    /// 字段值与决策一致（spec §11.2 字段序）。
+    #[test]
+    fn tun_flow_decision_once_per_flow_with_decision_values() {
+        let (mut dp, _mock) = tun_fixup_dataplane();
+        dp.set_rule_engine(Box::new(SimpleRuleEngine::new(vec![
+            Rule {
+                cidr: "10.200.2.2/32".parse().expect("cidr"),
+                target: nexus_domain::RouteTarget::Egress {
+                    peer: "self".to_string(),
+                },
+            },
+            Rule {
+                cidr: "10.200.3.3/32".parse().expect("cidr"),
+                target: nexus_domain::RouteTarget::Egress {
+                    peer: "p1".to_string(),
+                },
+            },
+        ])));
+        let direct_syn = craft_tcp(
+            [10, 200, 1, 2],
+            [10, 200, 2, 2],
+            57364,
+            8080,
+            1000,
+            0,
+            0x02,
+            &[],
+        );
+        let proxy_syn = craft_tcp(
+            [10, 200, 1, 3],
+            [10, 200, 3, 3],
+            57365,
+            8080,
+            2000,
+            0,
+            0x02,
+            &[],
+        );
+
+        let mut emitted = Vec::new();
+        // 每流三个包：只有首包（决策缓存 miss）允许发事件。
+        for _ in 0..3 {
+            for pkt in [&direct_syn, &proxy_syn] {
+                let (classification, fresh) = dp.classify_with_cache(pkt, 10);
+                assert!(matches!(
+                    classification,
+                    Classification::Direct | Classification::Proxy { .. }
+                ));
+                if let Some(decision) = fresh {
+                    emitted.push(
+                        dp.tun_flow_decision_line(pkt, &decision)
+                            .expect("flow decision line"),
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            emitted.len(),
+            2,
+            "exactly one flow_decision per TUN flow: {emitted:?}"
+        );
+
+        let direct_line = emitted
+            .iter()
+            .find(|line| line.contains("flow=10.200.1.2:57364"))
+            .expect("direct flow decision");
+        assert_eq!(
+            direct_line,
+            "[nexusd.dataplane] level=info event=flow_decision \
+flow=10.200.1.2:57364->10.200.2.2:8080 proto=tcp frontend=tun \
+matched_rule=IP-CIDR,10.200.2.2/32 egress_hint=- outbound=self session=-"
+        );
+
+        let proxy_line = emitted
+            .iter()
+            .find(|line| line.contains("flow=10.200.1.3:57365"))
+            .expect("proxy flow decision");
+        assert_eq!(
+            proxy_line,
+            "[nexusd.dataplane] level=info event=flow_decision \
+flow=10.200.1.3:57365->10.200.3.3:8080 proto=tcp frontend=tun \
+matched_rule=IP-CIDR,10.200.3.3/32 egress_hint=p1 outbound=p1 session=-"
+        );
+
+        // 端到端：同一流两包只算一次新流（发射点由缓存 miss 触发）。
+        let (mut dp2, mock2) = tun_fixup_dataplane();
+        dp2.set_rule_engine(Box::new(SimpleRuleEngine::new(vec![Rule {
+            cidr: "10.200.3.3/32".parse().expect("cidr"),
+            target: nexus_domain::RouteTarget::Egress {
+                peer: "p1".to_string(),
+            },
+        }])));
+        mock2.lock().unwrap().inject(proxy_syn.clone());
+        assert!(dp2.process_one().expect("first proxy syn"));
+        mock2.lock().unwrap().inject(proxy_syn);
+        assert!(dp2.process_one().expect("retransmitted proxy syn"));
+        let cache = dp2.decision_cache_stats();
+        assert_eq!(cache.misses, 1, "only the first packet is a new flow");
+        assert_eq!(cache.hits, 1, "the retransmission reuses the decision");
+    }
 }
