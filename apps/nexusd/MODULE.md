@@ -319,8 +319,13 @@ cargo clippy -p nexusd --all-targets -- -D warnings
     `WouldBlock` / `Ok(false)` 轮次）都调用 `ProxyEngine::poll()` 并写回 TUN，
     否则零上行包时下行响应永远无法写回。
 - **P2（UDP 转发）**：`Classification::Proxy` 的 UDP 包 → `ProxyEngine`：
-  - 解析 IP/UDP 头 → 按 P3 选定协议的 UDP 中继发送；
-  - SOCKS5：UDP ASSOCIATE；ss：AEAD UDP 中继；trojan：TCP 上的 UDP；
+  - 解析 IP/UDP 头 → 按 `dialer.udp_capability()` 分派（UDP 实现不变）；
+  - SOCKS5：UDP ASSOCIATE；ss：AEAD UDP 中继；
+  - trojan：本 run 统一 `Unsupported { reason: TlsVariantNotSupported }`，不建 relay
+    （§3.5）；UDP 包丢弃 + `udp_send_failed`/`udp_unsupported`/`udp_unsupported_other`
+    + 限频日志，绝不直连；
+  - `UdpCapability` / `UdpMode` / `UdpUnsupportedReason` 定义在
+    `nexus-proxy-config`（nexusd 只 `pub(crate) use` re-export）；
   - 回包经后台线程解包 → 重构 IP/UDP 包 → 写回 TUN（`tun_written += 1`）；
   - 发送失败 → `proxy_dropped_no_proxy += 1`。
 - **P3（出站选择）**：解析 `proxy.yaml` 的 `outbounds`，按文件顺序选首个可用
@@ -333,6 +338,12 @@ cargo clippy -p nexusd --all-targets -- -D warnings
   - `ProxyEngine::new(None)` = 无 `proxy.yaml`，返回 `Ok(None)`；无可用出站
     （`NoUsableOutbound`）与「未配置」区分，启动失败 fail-closed（exit 1）。
   - `OutboundKind` 新增 `Socks5`（additive；`locator` 为 `host:port`）。
+  - 选路结果 = `Arc<dyn OutboundDialer>`（spec §2.3/§2.4）：`adapter::select_dialer`
+    返回 `SelectedOutbound { dialer, skipped }`；`ProxyDialConfig` /
+    `select_dialer_legacy` 已在步骤 1 删除。
+  - dialer 实现（步骤 1）：`Socks5Dialer`（`socks5_connect`）、
+    `ShadowsocksStdDialer`（`ss_std::SsTcpClient::connect`）、
+    `TrojanProxyTransportDialer`（`trojan_tls_connect`，**始终 TLS**）。
 - **P4（失败语义）**：任何 dial/中继失败 → 计数丢弃，不 panic、不崩
   dataplane 线程；`proxy_dropped_no_proxy` 语义扩展为"无可用代理或转发失败"。
   - **无 engine 且 Proxy TCP**：SYN 即 RST + `proxy_dropped_no_proxy += 1`
@@ -341,9 +352,15 @@ cargo clippy -p nexusd --all-targets -- -D warnings
     NoUsableOutbound}` → stderr 单行 JSON（§6.5 模板）+ `exit(1)`，不启动
     dataplane；`SelectedInvalid` 的 `variant` 恒为
     `SELECTED_OUTBOUND_INVALID`，具体原因只进 `cause`。
-- **P5（资源边界）**：TCP 最大连接数复用 `TcpTerminator::MAX_TCP_CONNS`；
+- **P5（资源边界）**：TCP 活跃流上限 `MAX_ACTIVE_TCP_FLOWS = 1024`
+  （超限新 SYN 直接 RST + `tcp_flows_rejected`，不 dial）；并发 dial 上限
+  `MAX_CONCURRENT_DIALS = 256`（超限新 SYN 直接 RST + `tcp_dials_throttled`）；
   UDP 流表上限 1024，60s 无活动回收；worker 线程 per-dial 创建、
   完成后退出（有界）；关闭时 join 超时 1s（R4 延续）。
+- **统计（spec §6.4）**：`ProxyFwdStats` 新增 `tcp_streams_ok` / `tcp_bytes_up` /
+  `tcp_bytes_down` / `tcp_flows_rejected` / `tcp_dials_throttled` /
+  `udp_unsupported` / `udp_unsupported_{vless,anytls,other}` /
+  `udp_unsupported_log_suppressed`；dataplane 映射保持 §6.4 四条，不重复计数。
 - 不变量：单 TUN（D1）；分类器唯一入口（S29）；TUN 所有权仍在 dataplane
   （engine 只返回待写包，不直接写 TUN）；`proxy_forwarded` 仅在真实转发
   发生时计数（不再是纯分类计数）。
@@ -359,8 +376,8 @@ cargo clippy -p nexusd --all-targets -- -D warnings
   （AC-3）；本 run 仅条件步骤 4 可触发，未触发前维持现状。
 - **proxy-transport Trojan**：保留（fixes-5 未合并）；`TODO(deletion-gate: fixes-5)`。
   不得声称 Trojan fail-closed；配置面须持续警示 `TROJAN_FALLBACK_FAIL_OPEN`。
-- **`ProxyDialConfig` / `select_dialer_legacy`**：步骤 0 的过渡选择层，步骤 1 由
-  `OutboundDialer`/`select_dialer` 取代；`TODO(deletion-gate: step-1 adapter)`。
+- **`ProxyDialConfig` / `select_dialer_legacy`**：步骤 0 的过渡选择层，**步骤 1 已删除**，
+  由 `OutboundDialer` / `select_dialer` 取代（本文件 P3 已同步）。
 - **VLESS / AnyTLS / Hysteria2**：本 run 步骤 0 记为 `ProtocolNotWired` 跳过
   （步骤 2 才 wired VLESS/AnyTLS；Hysteria2 不执行）。
 

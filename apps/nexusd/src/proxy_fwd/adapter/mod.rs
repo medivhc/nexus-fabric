@@ -1,34 +1,100 @@
-//! 出站选择与错误类型（步骤 0 临时选择层）。
+//! 出站拨号接缝与选路（spec §2.3–§2.6）。
 //!
-//! 本模块在步骤 0 只负责把 `proxy.yaml` 的首个 wired 出站转成
-//! `ProxyDialConfig`；步骤 1 会用 `OutboundDialer` / `select_dialer` 取代
-//! `select_dialer_legacy` 与 `ProxyDialConfig`（`TODO(deletion-gate: step-1 adapter)`）。
+//! - `TunnelStream` / `OutboundDialer`：数据面冻结 trait（本 crate 内 `pub(crate)`
+//!   可见，不向 nexusd crate 外泄漏）；
+//! - `build_dialer`：单个 `OutboundConfig` → dialer（不发起网络，域名解析除外）；
+//! - `select_dialer`：按 `proxy.yaml` 文件顺序选首个 wired 代理出站（P3）。
+//!
+//! UDP 能力三类型定义在 `nexus-proxy-config`，本模块只 re-export。
 
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
+use std::time::Duration;
 
 use nexus_proxy_config::{ConfigError, OutboundConfig, OutboundKind};
+pub(crate) use nexus_proxy_config::{UdpCapability, UdpMode, UdpUnsupportedReason};
 
-use super::ProxyDialConfig;
+mod framing;
+mod legacy;
+mod tls;
+
+#[cfg(test)]
+mod tests;
+
+/// TCP connect 超时（spec §2.2；沿用 tcp_relay 既有 10s）。
+pub(crate) const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// 单次 TLS 握手超时（spec §2.2；与 proxy-transport TrojanTlsConfig 的 10s 对齐）。
+pub(crate) const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 服务端 reason / 日志 detail 的截断上限（spec §2.2）。
+pub(crate) const DETAIL_MAX_BYTES: usize = 128;
+
+/// 一条已建立的、可双向读写的隧道字节流。
+///
+/// `set_write_timeout` / `shutdown` 由步骤 2 的 framed 协议（AnyTLS/VLESS）消费；
+/// 步骤 1 的 relay 只用读超时，故此处整体允许未使用。
+#[allow(dead_code)]
+pub trait TunnelStream: Read + Write + Send {
+    /// 设置底层 socket 读超时；`None` = 阻塞。
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()>;
+    /// 设置底层 socket 写超时；`None` = 阻塞。
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()>;
+    /// 半关闭写方向；framed 协议在此发送 FIN/close 帧（AnyTLS Fin；VLESS 无）。
+    fn shutdown(&mut self) -> io::Result<()>;
+}
+
+/// 出站拨号器：一个配置出站对应一个实例，可被多个流并发调用。
+pub trait OutboundDialer: Send + Sync {
+    /// 配置 kind（用于日志/标注）。
+    fn kind(&self) -> OutboundKind;
+    /// 配置 tag（用于日志/标注）。
+    fn tag(&self) -> &str;
+    /// 拨号到 TUN 流的目标地址；阻塞，调用方在独立线程执行。
+    fn dial_tcp(&self, target: SocketAddr) -> Result<Box<dyn TunnelStream>, OutboundError>;
+    /// UDP 能力声明；VLESS/AnyTLS 返回 Unsupported{NotWired}。
+    fn udp_capability(&self) -> UdpCapability;
+}
 
 /// 单个出站配置错误（spec §2.6）。错误消息不得包含密码/UUID/hash/obfs_key。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutboundConfigError {
     MissingLocator,
-    InvalidLocator { locator: String },
-    UnresolvableLocator { host: String },
+    InvalidLocator {
+        locator: String,
+    },
+    UnresolvableLocator {
+        host: String,
+    },
     MissingPassword,
     MissingUuid,
     InvalidUuid,
-    UnsupportedFlow { flow: String },
+    UnsupportedFlow {
+        flow: String,
+    },
     VisionRequiresTls,
-    UnsupportedMethod { method: String },
-    UnsupportedObfs { field: &'static str },
+    UnsupportedMethod {
+        method: String,
+    },
+    UnsupportedObfs {
+        field: &'static str,
+    },
+    /// Trojan 缺少显式 TLS 声明（skip_cert_verify 与 alpn 都未出现）；明文不支持。
     PlaintextTrojanUnsupported,
-    InvalidSni { sni: String },
+    InvalidSni {
+        sni: String,
+    },
     InvalidAlpnEntry,
-    InvalidHeaderFormat { format: String },
-    UnsupportedTarget { target: SocketAddr },
-    InvalidRequest { detail: &'static str },
+    InvalidHeaderFormat {
+        format: String,
+    },
+    /// 目标地址无法编码进协议 ATYP（例如协议只支持 IPv4）。
+    UnsupportedTarget {
+        target: SocketAddr,
+    },
+    /// 已接线协议不应出现的请求编码失败（防御）。
+    InvalidRequest {
+        detail: &'static str,
+    },
 }
 
 impl OutboundConfigError {
@@ -85,6 +151,161 @@ impl OutboundConfigError {
     }
 }
 
+/// 运行期拨号/中继错误（spec §2.6）。`Display` / `Debug` 不得包含密钥材料。
+///
+/// 变体集合为 spec 冻结全集；步骤 1 只构造 legacy 三协议可达的子集，
+/// 其余由步骤 2（VLESS/AnyTLS）与资源边界路径消费。
+#[allow(dead_code)]
+#[derive(Debug)]
+pub enum OutboundError {
+    Config(OutboundConfigError),
+    TcpConnect { kind: std::io::ErrorKind },
+    ConnectTimeout,
+    TlsHandshake(TlsFailure),
+    ProtocolHandshake(HandshakeFailure),
+    Io { kind: std::io::ErrorKind },
+    Closed,
+    FlowLimit { active: usize, limit: usize },
+    DialLimit { active: usize, limit: usize },
+    UdpUnsupported,
+    Internal { what: &'static str },
+}
+
+impl OutboundError {
+    /// §6.5 日志 `error=` 枚举值。
+    #[must_use]
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Config(_) => "config",
+            Self::TcpConnect { .. } => "tcp_connect",
+            Self::ConnectTimeout => "connect_timeout",
+            Self::TlsHandshake(_) => "tls_handshake",
+            Self::ProtocolHandshake(HandshakeFailure::AuthRejected { .. }) => "auth_rejected",
+            Self::ProtocolHandshake(HandshakeFailure::StreamRejected { .. }) => "stream_rejected",
+            Self::ProtocolHandshake(_) => "protocol_handshake",
+            Self::Io { .. } => "io",
+            Self::Closed => "closed",
+            Self::FlowLimit { .. } => "flow_limit",
+            Self::DialLimit { .. } => "dial_limit",
+            Self::UdpUnsupported => "udp_unsupported",
+            Self::Internal { .. } => "internal",
+        }
+    }
+
+    /// 安全 detail（≤ `DETAIL_MAX_BYTES`，去控制字符；不含密码/UUID/hash）。
+    #[must_use]
+    pub fn detail(&self) -> String {
+        let text = match self {
+            Self::Config(error) => error.detail().to_string(),
+            Self::TcpConnect { kind } => format!("tcp connect failed ({kind:?})"),
+            Self::ConnectTimeout => "connect timed out".to_string(),
+            Self::TlsHandshake(failure) => format!("tls handshake failed ({failure:?})"),
+            Self::ProtocolHandshake(HandshakeFailure::StreamRejected { reason, .. }) => {
+                format!("protocol handshake failed (stream rejected: {reason})")
+            }
+            Self::ProtocolHandshake(failure) => {
+                format!("protocol handshake failed ({failure:?})")
+            }
+            Self::Io { kind } => format!("io error ({kind:?})"),
+            Self::Closed => "closed".to_string(),
+            Self::FlowLimit { active, limit } => {
+                format!("tcp flow limit reached ({active}/{limit})")
+            }
+            Self::DialLimit { active, limit } => {
+                format!("concurrent dial limit reached ({active}/{limit})")
+            }
+            Self::UdpUnsupported => "udp unsupported by this outbound".to_string(),
+            Self::Internal { what } => format!("internal error ({what})"),
+        };
+        sanitize_detail(&text)
+    }
+}
+
+impl std::fmt::Display for OutboundError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail())
+    }
+}
+
+/// 截断到 `DETAIL_MAX_BYTES` 并去掉控制字符（spec §6.5）。
+fn sanitize_detail(text: &str) -> String {
+    let mut out = String::new();
+    for ch in text.chars() {
+        if ch.is_control() {
+            continue;
+        }
+        if out.len() + ch.len_utf8() > DETAIL_MAX_BYTES {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// TLS 失败分类（spec §2.6.3；全变体冻结，rustls 路径在步骤 2 扩展）。
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TlsFailure {
+    InvalidSni,
+    RootsUnavailable,
+    CertificateVerification,
+    Handshake,
+    Io { kind: std::io::ErrorKind },
+}
+
+/// 协议标识（握手错误分类用；VLESS/AnyTLS 在步骤 2 接线）。
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    Vless,
+    Anytls,
+    Shadowsocks,
+    Trojan,
+    Socks5,
+}
+
+/// 协议握手失败（spec §2.6.4；全变体冻结，VLESS/AnyTLS 变体在步骤 2 构造）。
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandshakeFailure {
+    AuthRejected {
+        protocol: Protocol,
+    },
+    InvalidFrame {
+        protocol: Protocol,
+    },
+    UnexpectedFrame {
+        protocol: Protocol,
+        command: u8,
+        stream_id: u32,
+    },
+    StreamRejected {
+        protocol: Protocol,
+        stream_id: u32,
+        reason: String,
+    },
+    ResponseInvalid {
+        protocol: Protocol,
+    },
+    Truncated {
+        protocol: Protocol,
+    },
+    VersionMismatch {
+        protocol: Protocol,
+        got: u8,
+    },
+    ConnectRejected {
+        protocol: Protocol,
+        code: u8,
+    },
+    VisionUuidMismatch {
+        protocol: Protocol,
+    },
+    PaddingSchemeUpdate {
+        protocol: Protocol,
+    },
+}
+
 /// 构造/选择阶段的错误（spec §2.4）。
 #[derive(Debug)]
 pub enum EngineInitError {
@@ -111,8 +332,7 @@ impl EngineInitError {
     }
 }
 
-/// `build_dialer` 的错误：配置错误 vs 未接线（步骤 1 使用）。
-#[allow(dead_code)]
+/// `build_dialer` 的错误：配置错误 vs 未接线。
 #[derive(Debug)]
 pub enum BuildDialerError {
     Config(OutboundConfigError),
@@ -136,22 +356,143 @@ pub struct SkippedOutbound {
     pub reason: SkipReason,
 }
 
-/// 步骤 0 临时选路结果（步骤 1 由 `SelectedOutbound` 取代）。
-#[derive(Debug)]
-pub struct SelectedLegacy {
-    pub dial_config: ProxyDialConfig,
+/// 选路结果（spec §2.4）。
+pub struct SelectedOutbound {
+    pub dialer: Arc<dyn OutboundDialer>,
     pub skipped: Vec<SkippedOutbound>,
 }
 
-fn is_wired(kind: OutboundKind) -> bool {
+/// 手写 `Debug`：`Arc<dyn OutboundDialer>` 不是 `Debug`；只输出 kind/tag/skipped。
+impl std::fmt::Debug for SelectedOutbound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SelectedOutbound")
+            .field("kind", &self.dialer.kind())
+            .field("tag", &self.dialer.tag())
+            .field("skipped", &self.skipped)
+            .finish()
+    }
+}
+
+/// 本 run（步骤 1）已接线的代理出站集合。
+pub(crate) fn is_wired(kind: OutboundKind) -> bool {
     matches!(
         kind,
         OutboundKind::Socks5 | OutboundKind::Shadowsocks | OutboundKind::Trojan
     )
 }
 
-/// 步骤 0 临时选择层：按文件顺序选首个 wired 出站（spec §2.4 顺序）。
-pub(crate) fn select_dialer_legacy(proxy_yaml: &str) -> Result<SelectedLegacy, EngineInitError> {
+/// 单个出站配置 → dialer；不发起网络（locator 的域名解析除外）。
+///
+/// # Errors
+/// - `Config`：配置非法（spec §2.6.1）；
+/// - `ProtocolNotWired`：协议本 run 未接线（vmess/vless/anytls/hysteria2）。
+pub fn build_dialer(
+    outbound: &OutboundConfig,
+) -> Result<Arc<dyn OutboundDialer>, BuildDialerError> {
+    if !is_wired(outbound.kind) {
+        return match outbound.kind {
+            OutboundKind::Direct | OutboundKind::Relay => Err(BuildDialerError::Config(
+                OutboundConfigError::InvalidRequest {
+                    detail: "non-proxy outbound cannot build a dialer",
+                },
+            )),
+            kind => Err(BuildDialerError::ProtocolNotWired { kind }),
+        };
+    }
+    check_obfs(outbound).map_err(BuildDialerError::Config)?;
+    let locator = non_empty(&outbound.locator).ok_or(BuildDialerError::Config(
+        OutboundConfigError::MissingLocator,
+    ))?;
+    let (server, host) = resolve_locator(locator).map_err(BuildDialerError::Config)?;
+    match outbound.kind {
+        OutboundKind::Socks5 => Ok(Arc::new(legacy::Socks5Dialer::new(
+            outbound.tag.clone(),
+            server,
+        ))),
+        OutboundKind::Shadowsocks => {
+            let password = non_empty(&outbound.password)
+                .ok_or(BuildDialerError::Config(
+                    OutboundConfigError::MissingPassword,
+                ))?
+                .to_string();
+            let method = non_empty(&outbound.method)
+                .unwrap_or("chacha20-ietf-poly1305")
+                .to_string();
+            if method != "chacha20-ietf-poly1305" {
+                return Err(BuildDialerError::Config(
+                    OutboundConfigError::UnsupportedMethod { method },
+                ));
+            }
+            Ok(Arc::new(legacy::ShadowsocksStdDialer::new(
+                outbound.tag.clone(),
+                server,
+                password,
+            )))
+        }
+        OutboundKind::Trojan => {
+            let password = non_empty(&outbound.password)
+                .ok_or(BuildDialerError::Config(
+                    OutboundConfigError::MissingPassword,
+                ))?
+                .to_string();
+            // §3.5：TLS 始终启用；skip_cert_verify / alpn 任一出现即 TLS 声明。
+            let tls_signal = outbound.skip_cert_verify.is_some()
+                || outbound.alpn.as_ref().is_some_and(|alpn| !alpn.is_empty());
+            if !tls_signal {
+                return Err(BuildDialerError::Config(
+                    OutboundConfigError::PlaintextTrojanUnsupported,
+                ));
+            }
+            let alpn = outbound.alpn.clone().unwrap_or_default();
+            if alpn.iter().any(|entry| entry.is_empty()) {
+                return Err(BuildDialerError::Config(
+                    OutboundConfigError::InvalidAlpnEntry,
+                ));
+            }
+            if let Some(format) = outbound.header_format.as_deref()
+                && format != "standard"
+                && format != "singbox"
+            {
+                return Err(BuildDialerError::Config(
+                    OutboundConfigError::InvalidHeaderFormat {
+                        format: format.to_string(),
+                    },
+                ));
+            }
+            let sni = match non_empty(&outbound.sni) {
+                Some(sni) if valid_sni(sni) => sni.to_string(),
+                Some(sni) => {
+                    return Err(BuildDialerError::Config(OutboundConfigError::InvalidSni {
+                        sni: sni.to_string(),
+                    }));
+                }
+                None => host,
+            };
+            let config = tls::trojan_tls_config(
+                server,
+                &password,
+                &sni,
+                outbound.skip_cert_verify.unwrap_or(false),
+                &alpn,
+            );
+            Ok(Arc::new(legacy::TrojanProxyTransportDialer::new(
+                outbound.tag.clone(),
+                config,
+            )))
+        }
+        _ => Err(BuildDialerError::ProtocolNotWired {
+            kind: outbound.kind,
+        }),
+    }
+}
+
+/// 从 proxy.yaml 选路：P3“配置顺序首个可用”；返回选中的 dialer + 被跳过项。
+///
+/// # Errors
+/// - `Yaml`：proxy.yaml 解析失败；
+/// - `SelectedInvalid`：首个 wired 代理出站配置非法（硬失败，不跳下一个）；
+/// - `NoUsableOutbound`：全部出站被跳过。
+pub fn select_dialer(proxy_yaml: &str) -> Result<SelectedOutbound, EngineInitError> {
     let config = nexus_proxy_config::parse(proxy_yaml).map_err(EngineInitError::Yaml)?;
     let mut skipped = Vec::new();
     for outbound in &config.outbounds {
@@ -171,15 +512,21 @@ pub(crate) fn select_dialer_legacy(proxy_yaml: &str) -> Result<SelectedLegacy, E
             });
             continue;
         }
-        return match build_legacy(outbound) {
-            Ok(dial_config) => Ok(SelectedLegacy {
-                dial_config,
-                skipped,
-            }),
-            Err(source) => Err(EngineInitError::SelectedInvalid {
+        return match build_dialer(outbound) {
+            Ok(dialer) => Ok(SelectedOutbound { dialer, skipped }),
+            Err(BuildDialerError::Config(source)) => Err(EngineInitError::SelectedInvalid {
                 tag: outbound.tag.clone(),
                 source,
             }),
+            // 防御性跳过（正常不会发生：is_wired 与 build_dialer 使用同一集合）。
+            Err(BuildDialerError::ProtocolNotWired { kind }) => {
+                skipped.push(SkippedOutbound {
+                    tag: outbound.tag.clone(),
+                    kind,
+                    reason: SkipReason::ProtocolNotWired,
+                });
+                continue;
+            }
         };
     }
     Err(EngineInitError::NoUsableOutbound { skipped })
@@ -232,72 +579,4 @@ fn valid_sni(value: &str) -> bool {
         && !value
             .chars()
             .any(|c| c.is_control() || c.is_whitespace() || c == '/')
-}
-
-fn build_legacy(outbound: &OutboundConfig) -> Result<ProxyDialConfig, OutboundConfigError> {
-    check_obfs(outbound)?;
-    let locator = non_empty(&outbound.locator).ok_or(OutboundConfigError::MissingLocator)?;
-    let (server, host) = resolve_locator(locator)?;
-    match outbound.kind {
-        OutboundKind::Socks5 => Ok(ProxyDialConfig::Socks5 { server }),
-        OutboundKind::Shadowsocks => {
-            let password =
-                non_empty(&outbound.password).ok_or(OutboundConfigError::MissingPassword)?;
-            let method = non_empty(&outbound.method)
-                .unwrap_or("chacha20-ietf-poly1305")
-                .to_string();
-            if method != "chacha20-ietf-poly1305" {
-                return Err(OutboundConfigError::UnsupportedMethod { method });
-            }
-            Ok(ProxyDialConfig::Shadowsocks {
-                server,
-                method,
-                password: password.to_string(),
-            })
-        }
-        OutboundKind::Trojan => {
-            let password =
-                non_empty(&outbound.password).ok_or(OutboundConfigError::MissingPassword)?;
-            let tls_signal = outbound.skip_cert_verify.is_some()
-                || outbound.alpn.as_ref().is_some_and(|alpn| !alpn.is_empty());
-            if !tls_signal {
-                return Err(OutboundConfigError::PlaintextTrojanUnsupported);
-            }
-            if let Some(alpn) = outbound.alpn.as_ref()
-                && alpn.iter().any(|entry| entry.is_empty())
-            {
-                return Err(OutboundConfigError::InvalidAlpnEntry);
-            }
-            if let Some(format) = outbound.header_format.as_deref() {
-                if format != "standard" && format != "singbox" {
-                    return Err(OutboundConfigError::InvalidHeaderFormat {
-                        format: format.to_string(),
-                    });
-                }
-            }
-            let sni = match non_empty(&outbound.sni) {
-                Some(sni) if valid_sni(sni) => sni.to_string(),
-                Some(sni) => {
-                    return Err(OutboundConfigError::InvalidSni {
-                        sni: sni.to_string(),
-                    });
-                }
-                None => host,
-            };
-            Ok(ProxyDialConfig::TrojanTls {
-                server,
-                password: password.to_string(),
-                sni,
-                skip_verify: outbound.skip_cert_verify.unwrap_or(false),
-            })
-        }
-        OutboundKind::Direct
-        | OutboundKind::Relay
-        | OutboundKind::Vmess
-        | OutboundKind::Anytls
-        | OutboundKind::Vless
-        | OutboundKind::Hysteria2 => Err(OutboundConfigError::InvalidRequest {
-            detail: "non-wired outbound cannot be selected",
-        }),
-    }
 }

@@ -92,6 +92,13 @@
   - `parse_clash_subscription(text: &str) -> Result<SubscriptionParse, ConfigError>`（§11.8）：
     解码 base64 订阅、逐行解析节点 URI，产出 `outbounds: Vec<OutboundConfig>` 与
     `rejected: Vec<RejectedEntry>`（未知协议行及原因）；
+  - UDP 能力 DTO（spec §2.6，v1.3 起）：
+    - `UdpCapability`：`Supported(UdpMode)` / `Unsupported { reason: UdpUnsupportedReason }`；
+    - `UdpMode`：`Socks5Associate` / `ShadowsocksAead` / `VlessOverTcp` / `AnytlsUot` /
+      `TrojanUdpOverTls` / `Hysteria2Datagram`；`Debug` 手写，`password` 输出 `***`
+      （禁止 `#[derive(Debug)]`）；
+    - `UdpUnsupportedReason`：`NotWired` / `TlsVariantNotSupported` / `NoDatagramMode`；
+    - 三类型只做能力声明，不含运行时状态；nexusd 侧只 `pub(crate) use` re-export；
   - `parse(yaml: &str) -> Result<ProxyConfig, ConfigError>`。
 
 ## Verification

@@ -1,30 +1,33 @@
-//! TCP 转发：smoltcp 终结 → 代理 dial → 双向中继（P1）。
+//! TCP 转发：smoltcp 终结 → dialer.dial_tcp → 双向中继（P1）。
 //!
 //! 设计：
 //! - `TcpForwarder` 持有 `TcpTerminator`（dataplane 线程拥有，非 Sync 不跨线程）；
 //! - `Syn{stream_id, dst}` → worker 线程 dial 代理（不阻塞 dataplane）；
 //! - dial 成功 → 中继线程双向泵字节；proxy→TUN 经 mpsc 回 dataplane 线程
 //!   （TUN 所有权仍在 dataplane，D1 不变量）；
-//! - dial/中继失败 → 计数 + RST/关闭，不 panic。
+//! - dial/中继失败 → 计数 + RST/关闭，不 panic；
+//! - 资源边界：`MAX_ACTIVE_TCP_FLOWS` / `MAX_CONCURRENT_DIALS`（spec §2.2）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use nexus_projection::tcp::{FourTuple, TcpEvent, TcpTerminator, ip_checksum, tcp_checksum};
+use nexus_proxy_config::OutboundKind;
 
-use super::ss_std::SsTcpClient;
-use super::{ProxyDialConfig, ProxyFwdStats};
+use super::ProxyFwdStats;
+use super::adapter::{OutboundDialer, OutboundError, TunnelStream};
 
 /// 中继线程 → dataplane 线程的事件。
 #[derive(Debug)]
 pub enum TcpFwdEvent {
-    /// dial 完成（成功带流，失败带 stream_id）。
+    /// dial 完成（成功带流，失败带 typed error）。
     DialDone {
         stream_id: u32,
-        result: Result<RelayHandle, String>,
+        result: Result<RelayHandle, OutboundError>,
     },
     /// proxy 侧收到数据 → 注入 smoltcp。
     ProxyData { stream_id: u32, bytes: Vec<u8> },
@@ -48,36 +51,52 @@ enum RelayCmd {
     Close,
 }
 
-/// dial 超时。
-const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
-/// 中继读超时（用于定期检查关闭）。
+/// 单 engine 活跃 TCP 流上限（spec §2.2；与 `MAX_UDP_FLOWS` 对齐）。
+pub const MAX_ACTIVE_TCP_FLOWS: usize = 1024;
+/// 同时进行中的 dial 上限（spec §2.2）。
+pub const MAX_CONCURRENT_DIALS: usize = 256;
+/// 中继读超时（用于定期检查关闭，spec §2.2）。
 const RELAY_READ_TIMEOUT: Duration = Duration::from_millis(100);
+/// 中继写超时（防止 proxy 侧背压无限阻塞线程，spec §2.2）。
+const RELAY_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 中继缓冲（spec §2.2）。
+const RELAY_BUF_LEN: usize = 8192;
 
 /// TCP 转发器（dataplane 线程拥有）。
 pub struct TcpForwarder {
     terminator: TcpTerminator,
-    dial_config: ProxyDialConfig,
+    dialer: Arc<dyn OutboundDialer>,
+    /// 选中出站的 kind/tag（仅日志用；spec §6.5）。
+    kind: OutboundKind,
+    tag: String,
     event_tx: Sender<TcpFwdEvent>,
     event_rx: Receiver<TcpFwdEvent>,
     /// stream_id → 中继句柄（dial 成功后）。
     relays: HashMap<u32, RelayHandle>,
     /// stream_id → 目标（dial 中，用于失败时 RST）。
     pending: HashMap<u32, SocketAddr>,
+    /// dial 在飞时已被 smoltcp 关闭的流（DialDone 成功后直接丢弃句柄，防泄漏）。
+    closed_during_dial: HashSet<u32>,
     /// drain_events 暂存的待写 TUN 包。
     pending_tun: Vec<Vec<u8>>,
     stats: ProxyFwdStats,
 }
 
 impl TcpForwarder {
-    pub fn new(dial_config: ProxyDialConfig) -> Self {
+    pub fn new(dialer: Arc<dyn OutboundDialer>) -> Self {
         let (event_tx, event_rx) = mpsc::channel();
+        let kind = dialer.kind();
+        let tag = dialer.tag().to_string();
         Self {
             terminator: TcpTerminator::new(),
-            dial_config,
+            dialer,
+            kind,
+            tag,
             event_tx,
             event_rx,
             relays: HashMap::new(),
             pending: HashMap::new(),
+            closed_during_dial: HashSet::new(),
             pending_tun: Vec::new(),
             stats: ProxyFwdStats::default(),
         }
@@ -127,24 +146,36 @@ impl TcpForwarder {
                 TcpFwdEvent::DialDone { stream_id, result } => match result {
                     Ok(handle) => {
                         self.pending.remove(&stream_id);
-                        self.relays.insert(stream_id, handle);
-                        self.stats.tcp_dials_ok += 1;
+                        if self.closed_during_dial.remove(&stream_id) {
+                            // 流在 dial 期间已关闭：句柄无人消费，直接 drop
+                            // （relay 线程因命令通道断开而退出）。
+                            drop(handle);
+                        } else {
+                            self.relays.insert(stream_id, handle);
+                            self.stats.tcp_dials_ok += 1;
+                        }
                     }
-                    Err(e) => {
+                    Err(error) => {
                         self.pending.remove(&stream_id);
+                        self.closed_during_dial.remove(&stream_id);
                         self.stats.tcp_dials_failed += 1;
                         // RST smoltcp 侧；terminator 在 SynReceived 直接 release
                         // 时不产包，需按四元组兜底构造 RST（E4 可观察）。
                         let four = self.terminator.lookup_id(stream_id);
                         let mut pkts = self.terminator.handle_fabric_rst(stream_id);
-                        let has_rst = pkts
-                            .iter()
-                            .any(|pkt| pkt.len() >= 34 && pkt[9] == 6 && pkt[33] & 0x04 != 0);
-                        if !has_rst && let Some(four) = four {
+                        if !has_rst(&pkts)
+                            && let Some(four) = four
+                        {
                             pkts.push(craft_rst(&four));
                         }
                         let _ = self.event_tx.send(TcpFwdEvent::TunPackets(pkts));
-                        eprintln!("[proxy-fwd] dial failed for stream {stream_id}: {e}");
+                        eprintln!(
+                            "[proxy-fwd] event=dial_failed stream_id={stream_id} kind={} tag={} error={} detail={}",
+                            self.kind.as_str(),
+                            self.tag,
+                            error.reason(),
+                            error.detail()
+                        );
                     }
                 },
                 TcpFwdEvent::ProxyData { stream_id, bytes } => {
@@ -166,9 +197,7 @@ impl TcpForwarder {
                     }
                 }
                 TcpFwdEvent::TunPackets(pkts) => {
-                    // 转发给调用方（由 handle_packet/poll 的调用方写 TUN）。
-                    // 这里暂存，下次 handle_packet 返回时带上。
-                    // 简化：直接通过一个内部队列。
+                    // 暂存，下次 handle_packet/poll 返回时带上。
                     self.pending_tun.extend(pkts);
                 }
             }
@@ -179,19 +208,34 @@ impl TcpForwarder {
     fn handle_tcp_event(&mut self, event: TcpEvent, out: &mut Vec<Vec<u8>>) {
         match event {
             TcpEvent::Syn { stream_id, dst, .. } => {
-                self.stats.tcp_streams_ok += 1;
-                let target = SocketAddr::V4(dst);
-                self.pending.insert(stream_id, target);
-                let config = self.dial_config.clone();
-                let tx = self.event_tx.clone();
-                std::thread::spawn(move || {
-                    let result = dial_through_proxy(&config, target)
-                        .map(|stream| spawn_relay(stream_id, stream, tx.clone()));
-                    let _ = tx.send(TcpFwdEvent::DialDone {
-                        stream_id,
-                        result: result.map_err(|e| e.to_string()),
+                let active = self.relays.len() + self.pending.len();
+                if active >= MAX_ACTIVE_TCP_FLOWS {
+                    self.stats.tcp_flows_rejected += 1;
+                    self.reject_stream(stream_id, out);
+                    eprintln!(
+                        "[proxy-fwd] event=tcp_flow_rejected stream_id={stream_id} active={active} limit={MAX_ACTIVE_TCP_FLOWS}"
+                    );
+                } else if self.pending.len() >= MAX_CONCURRENT_DIALS {
+                    self.stats.tcp_dials_throttled += 1;
+                    let dialing = self.pending.len();
+                    self.reject_stream(stream_id, out);
+                    eprintln!(
+                        "[proxy-fwd] event=tcp_dial_throttled stream_id={stream_id} active={dialing} limit={MAX_CONCURRENT_DIALS}"
+                    );
+                } else {
+                    self.stats.tcp_streams_ok += 1;
+                    self.closed_during_dial.remove(&stream_id);
+                    let target = SocketAddr::V4(dst);
+                    self.pending.insert(stream_id, target);
+                    let dialer = Arc::clone(&self.dialer);
+                    let tx = self.event_tx.clone();
+                    std::thread::spawn(move || {
+                        let result = dialer
+                            .dial_tcp(target)
+                            .map(|stream| spawn_relay(stream_id, stream, tx.clone()));
+                        let _ = tx.send(TcpFwdEvent::DialDone { stream_id, result });
                     });
-                });
+                }
             }
             TcpEvent::Data {
                 stream_id, bytes, ..
@@ -209,7 +253,9 @@ impl TcpForwarder {
                 if let Some(relay) = self.relays.remove(&stream_id) {
                     let _ = relay.tx.send(RelayCmd::Close);
                 }
-                self.pending.remove(&stream_id);
+                if self.pending.remove(&stream_id).is_some() {
+                    self.closed_during_dial.insert(stream_id);
+                }
                 // smoltcp 侧已关闭，无需额外动作。
                 let _ = reset;
             }
@@ -221,9 +267,26 @@ impl TcpForwarder {
         out.append(&mut self.pending_tun);
     }
 
+    /// 资源边界拒绝：直接 RST（不 dial，spec §2.6.2 FlowLimit/DialLimit）。
+    fn reject_stream(&mut self, stream_id: u32, out: &mut Vec<Vec<u8>>) {
+        let four = self.terminator.lookup_id(stream_id);
+        let mut pkts = self.terminator.handle_fabric_rst(stream_id);
+        if !has_rst(&pkts)
+            && let Some(four) = four
+        {
+            pkts.push(craft_rst(&four));
+        }
+        out.append(&mut pkts);
+    }
+
     pub fn stats(&self) -> ProxyFwdStats {
         self.stats.clone()
     }
+}
+
+fn has_rst(pkts: &[Vec<u8>]) -> bool {
+    pkts.iter()
+        .any(|pkt| pkt.len() >= 34 && pkt[9] == 6 && pkt[33] & 0x04 != 0)
 }
 
 /// 构造 RST（回退路径；src/dst 互换）。
@@ -247,86 +310,36 @@ fn craft_rst(four: &FourTuple) -> Vec<u8> {
     pkt
 }
 
-/// 经代理 dial 到目标，返回可读写的字节流。
-fn dial_through_proxy(config: &ProxyDialConfig, target: SocketAddr) -> io::Result<ProxyStream> {
-    match config {
-        ProxyDialConfig::Socks5 { server } => {
-            let cfg = nexus_proxy_transport::Socks5ProxyConfig::new(*server, None);
-            nexus_proxy_transport::socks5_connect(&cfg, target)
-                .map(ProxyStream::Tcp)
-                .map_err(|e| io::Error::other(e.to_string()))
-        }
-        ProxyDialConfig::Trojan { server, password } => {
-            let cfg = nexus_proxy_transport::TrojanProxyConfig::new(*server, password.clone());
-            nexus_proxy_transport::trojan_connect(&cfg, target)
-                .map(ProxyStream::Tcp)
-                .map_err(|e| io::Error::other(e.to_string()))
-        }
-        ProxyDialConfig::TrojanTls {
-            server,
-            password,
-            sni,
-            skip_verify,
-        } => {
-            let mut cfg =
-                nexus_proxy_transport::TrojanTlsConfig::new(*server, password.clone(), sni.clone());
-            cfg.skip_cert_verify = *skip_verify;
-            nexus_proxy_transport::trojan_tls_connect(&cfg, target)
-                .map(|s| ProxyStream::Tls(Box::new(s)))
-                .map_err(|e| io::Error::other(e.to_string()))
-        }
-        ProxyDialConfig::Shadowsocks {
-            server, password, ..
-        } => {
-            // 标准 ss TCP（ss_std），非自定义 SsTransport。
-            SsTcpClient::connect(*server, password, target, DIAL_TIMEOUT)
-                .map(ProxyStream::Ss)
-                .map_err(|e| io::Error::other(e.to_string()))
-        }
-    }
-}
-
-/// 统一代理字节流。
-enum ProxyStream {
-    Tcp(TcpStream),
-    Tls(Box<nexus_proxy_transport::TlsStream>),
-    Ss(SsTcpClient),
-}
-
-impl ProxyStream {
-    fn set_read_timeout(&mut self, dur: Option<Duration>) -> io::Result<()> {
-        match self {
-            Self::Tcp(s) => s.set_read_timeout(dur),
-            Self::Tls(s) => s.get_mut().set_read_timeout(dur),
-            Self::Ss(_) => {
-                // SsTcpClient 内部管理；本期通过 read 超时模拟。
-                let _ = dur;
-                Ok(())
-            }
-        }
-    }
-}
-
 /// 启动中继线程；返回 dataplane 侧句柄。
-fn spawn_relay(stream_id: u32, mut stream: ProxyStream, tx: Sender<TcpFwdEvent>) -> RelayHandle {
+fn spawn_relay(
+    stream_id: u32,
+    mut stream: Box<dyn TunnelStream>,
+    tx: Sender<TcpFwdEvent>,
+) -> RelayHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel::<RelayCmd>();
     std::thread::spawn(move || {
-        // 设置读超时以便定期检查命令。
+        // 设置读/写超时：读超时用于定期检查命令，写超时防背压无限阻塞。
         let _ = stream.set_read_timeout(Some(RELAY_READ_TIMEOUT));
-        let mut buf = [0u8; 8192];
+        let _ = stream.set_write_timeout(Some(RELAY_WRITE_TIMEOUT));
+        let mut buf = [0u8; RELAY_BUF_LEN];
+        let mut up_bytes = 0u64;
+        let mut down_bytes = 0u64;
+        let mut reset = false;
         loop {
             // 先检查关闭命令（非阻塞）。
             match cmd_rx.try_recv() {
                 Ok(RelayCmd::Close) | Err(mpsc::TryRecvError::Disconnected) => break,
                 Ok(RelayCmd::Data(data)) => {
-                    if write_proxy(&mut stream, &data).is_err() {
+                    up_bytes += data.len() as u64;
+                    if stream.write_all(&data).is_err() {
+                        reset = true;
                         break;
                     }
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
             // 从 proxy 读。
-            match read_proxy(&mut stream, &mut buf) {
+            match stream.read(&mut buf) {
                 Ok(0) => {
                     // EOF：正常关闭。
                     let _ = tx.send(TcpFwdEvent::ProxyClosed {
@@ -336,6 +349,7 @@ fn spawn_relay(stream_id: u32, mut stream: ProxyStream, tx: Sender<TcpFwdEvent>)
                     break;
                 }
                 Ok(n) => {
+                    down_bytes += n as u64;
                     let _ = tx.send(TcpFwdEvent::ProxyData {
                         stream_id,
                         bytes: buf[..n].to_vec(),
@@ -348,6 +362,7 @@ fn spawn_relay(stream_id: u32, mut stream: ProxyStream, tx: Sender<TcpFwdEvent>)
                     continue;
                 }
                 Err(_) => {
+                    reset = true;
                     let _ = tx.send(TcpFwdEvent::ProxyClosed {
                         stream_id,
                         reset: true,
@@ -356,26 +371,9 @@ fn spawn_relay(stream_id: u32, mut stream: ProxyStream, tx: Sender<TcpFwdEvent>)
                 }
             }
         }
+        eprintln!(
+            "[proxy-fwd] event=relay_closed stream_id={stream_id} reset={reset} up_bytes={up_bytes} down_bytes={down_bytes}"
+        );
     });
     RelayHandle { tx: cmd_tx }
-}
-
-/// 向 proxy 写数据。
-fn write_proxy(stream: &mut ProxyStream, data: &[u8]) -> io::Result<()> {
-    match stream {
-        ProxyStream::Tcp(s) => s.write_all(data),
-        ProxyStream::Tls(s) => s.write_all(data),
-        ProxyStream::Ss(c) => c
-            .write_all(data)
-            .map_err(|e| io::Error::other(e.to_string())),
-    }
-}
-
-/// 从 proxy 读数据。
-fn read_proxy(stream: &mut ProxyStream, buf: &mut [u8]) -> io::Result<usize> {
-    match stream {
-        ProxyStream::Tcp(s) => s.read(buf),
-        ProxyStream::Tls(s) => s.read(buf),
-        ProxyStream::Ss(c) => c.read(buf).map_err(|e| io::Error::other(e.to_string())),
-    }
 }

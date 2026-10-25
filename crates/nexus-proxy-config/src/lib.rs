@@ -17,6 +17,10 @@
 
 use std::collections::BTreeSet;
 
+mod udp;
+
+pub use udp::{UdpCapability, UdpMode, UdpUnsupportedReason};
+
 // ---------------------------------------------------------------------------
 // 结构化配置错误（不以日志文本代替错误类型，MODULE.md Outputs）
 // ---------------------------------------------------------------------------

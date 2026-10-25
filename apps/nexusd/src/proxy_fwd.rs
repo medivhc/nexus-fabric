@@ -1,9 +1,9 @@
 //! Proxy 生产转发（P1-P5）。
 //!
 //! `ProxyEngine`：dataplane 中分类为 `Proxy` 的包的真实转发：
-//! - TCP（P1）：`tcp_relay::TcpForwarder`（smoltcp 终结 → 代理 dial → 中继）；
+//! - TCP（P1）：`tcp_relay::TcpForwarder`（smoltcp 终结 → dialer.dial_tcp → 中继）；
 //! - UDP（P2）：`udp_relay::UdpForwarder`（协议 UDP 中继 → 回包写 TUN）；
-//! - 出站选择（P3）：`proxy.yaml` 首个可用 ss/trojan/socks5；
+//! - 出站选择（P3）：`adapter::select_dialer` 选 `proxy.yaml` 首个可用出站；
 //! - 失败计数不崩（P4）；资源有界（P5）。
 //!
 //! TUN 所有权仍在 dataplane（D1）：engine 只返回待写回 TUN 的包，
@@ -18,49 +18,38 @@ pub use adapter::{EngineInitError, OutboundConfigError};
 
 pub use udp_relay::build_udp_reply;
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
+use std::sync::Arc;
 
-/// 代理 dial 配置（P3 选路结果）。
-#[derive(Debug, Clone)]
-pub enum ProxyDialConfig {
-    Shadowsocks {
-        server: SocketAddr,
-        method: String,
-        password: String,
-    },
-    Trojan {
-        server: SocketAddr,
-        password: String,
-    },
-    TrojanTls {
-        server: SocketAddr,
-        password: String,
-        sni: String,
-        skip_verify: bool,
-    },
-    Socks5 {
-        server: SocketAddr,
-    },
-}
-
-/// Proxy 转发统计（P4 可观测；dataplane 合并到 DataplaneStats）。
+/// Proxy 转发统计（P4 可观测；dataplane 合并到 DataplaneStats；spec §6.4）。
 #[derive(Debug, Default, Clone)]
 pub struct ProxyFwdStats {
+    // 现有
     pub tcp_dials_ok: u64,
     pub tcp_dials_failed: u64,
-    pub tcp_streams_ok: u64,
-    pub tcp_bytes_up: u64,
-    pub tcp_bytes_down: u64,
     pub udp_sent: u64,
     pub udp_send_failed: u64,
-}
-
-/// P3（步骤 0 临时）：从 proxy.yaml 选首个 wired 出站。
-fn select_outbound(proxy_yaml: &str) -> Result<ProxyDialConfig, EngineInitError> {
-    adapter::select_dialer_legacy(proxy_yaml).map(|selected| {
-        let _ = selected.skipped;
-        selected.dial_config
-    })
+    // §6.4 新增
+    /// Syn 成功建立并进入 relay 的流数。
+    pub tcp_streams_ok: u64,
+    /// client → proxy 明文字节。
+    pub tcp_bytes_up: u64,
+    /// proxy → client 明文字节。
+    pub tcp_bytes_down: u64,
+    /// `MAX_ACTIVE_TCP_FLOWS` 拒绝。
+    pub tcp_flows_rejected: u64,
+    /// `MAX_CONCURRENT_DIALS` 拒绝。
+    pub tcp_dials_throttled: u64,
+    /// `UdpCapability::Unsupported` 总数。
+    pub udp_unsupported: u64,
+    /// VLESS UDP 丢弃。
+    pub udp_unsupported_vless: u64,
+    /// AnyTLS UDP 丢弃。
+    pub udp_unsupported_anytls: u64,
+    /// 其他 unsupported。
+    pub udp_unsupported_other: u64,
+    /// 限频日志抑制计数。
+    pub udp_unsupported_log_suppressed: u64,
 }
 
 /// Proxy 转发引擎（dataplane 拥有）。
@@ -78,10 +67,10 @@ impl ProxyEngine {
         let Some(proxy_yaml) = proxy_yaml else {
             return Ok(None);
         };
-        let dial_config = select_outbound(proxy_yaml)?;
+        let dialer = adapter::select_dialer(proxy_yaml)?.dialer;
         Ok(Some(Self {
-            tcp: tcp_relay::TcpForwarder::new(dial_config.clone()),
-            udp: udp_relay::UdpForwarder::new(dial_config),
+            tcp: tcp_relay::TcpForwarder::new(Arc::clone(&dialer)),
+            udp: udp_relay::UdpForwarder::new(dialer),
         }))
     }
 
@@ -138,8 +127,15 @@ impl ProxyEngine {
             tcp_streams_ok: t.tcp_streams_ok,
             tcp_bytes_up: t.tcp_bytes_up,
             tcp_bytes_down: t.tcp_bytes_down,
+            tcp_flows_rejected: t.tcp_flows_rejected,
+            tcp_dials_throttled: t.tcp_dials_throttled,
             udp_sent: u.udp_sent,
             udp_send_failed: u.udp_send_failed,
+            udp_unsupported: u.udp_unsupported,
+            udp_unsupported_vless: u.udp_unsupported_vless,
+            udp_unsupported_anytls: u.udp_unsupported_anytls,
+            udp_unsupported_other: u.udp_unsupported_other,
+            udp_unsupported_log_suppressed: u.udp_unsupported_log_suppressed,
         }
     }
 
@@ -154,130 +150,4 @@ impl ProxyEngine {
 #[allow(dead_code)]
 fn is_usable_target(_ip: IpAddr) -> bool {
     true
-}
-
-#[cfg(test)]
-mod tests {
-    use super::adapter::{OutboundConfigError, SkipReason};
-    use super::*;
-
-    fn yaml_with(kind: &str, locator: &str, extra: &str) -> String {
-        format!(
-            "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: test\noutbounds:\n  - tag: test\n    kind: {kind}\n    locator: {locator}\n{extra}"
-        )
-    }
-
-    #[test]
-    fn select_socks5() {
-        let yaml = yaml_with("socks5", "127.0.0.1:1080", "");
-        let cfg = select_outbound(&yaml).unwrap();
-        assert!(matches!(cfg, ProxyDialConfig::Socks5 { .. }));
-    }
-
-    #[test]
-    fn select_shadowsocks() {
-        let yaml = yaml_with(
-            "shadowsocks",
-            "127.0.0.1:8388",
-            "    method: chacha20-ietf-poly1305\n    password: secret\n",
-        );
-        let cfg = select_outbound(&yaml).unwrap();
-        assert!(matches!(cfg, ProxyDialConfig::Shadowsocks { .. }));
-    }
-
-    #[test]
-    fn trojan_without_tls_signal_is_invalid() {
-        let yaml = yaml_with("trojan", "127.0.0.1:443", "    password: secret\n");
-        let err = select_outbound(&yaml).unwrap_err();
-        let EngineInitError::SelectedInvalid { tag, source } = err else {
-            panic!("expected SelectedInvalid");
-        };
-        assert_eq!(tag, "test");
-        assert_eq!(source, OutboundConfigError::PlaintextTrojanUnsupported);
-    }
-
-    #[test]
-    fn select_trojan_tls_when_skip_verify() {
-        let yaml = yaml_with(
-            "trojan",
-            "127.0.0.1:443",
-            "    password: secret\n    skip_cert_verify: true\n",
-        );
-        let cfg = select_outbound(&yaml).unwrap();
-        assert!(matches!(cfg, ProxyDialConfig::TrojanTls { .. }));
-    }
-
-    #[test]
-    fn select_trojan_tls_when_alpn() {
-        let yaml = yaml_with(
-            "trojan",
-            "127.0.0.1:443",
-            "    password: secret\n    alpn:\n      - h2\n",
-        );
-        let cfg = select_outbound(&yaml).unwrap();
-        assert!(matches!(cfg, ProxyDialConfig::TrojanTls { .. }));
-    }
-
-    #[test]
-    fn skip_direct_and_vmess() {
-        let yaml = "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n  - tag: v\n    kind: vmess\n    locator: 127.0.0.1:1234\n";
-        let EngineInitError::NoUsableOutbound { skipped } = select_outbound(yaml).unwrap_err()
-        else {
-            panic!("expected NoUsableOutbound");
-        };
-        assert_eq!(skipped.len(), 2);
-        assert_eq!(skipped[0].reason, SkipReason::NotProxyKind);
-        assert_eq!(skipped[1].reason, SkipReason::ProtocolNotWired);
-    }
-
-    #[test]
-    fn first_usable_wins() {
-        let yaml = "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: s\noutbounds:\n  - tag: v\n    kind: vmess\n    locator: 127.0.0.1:1234\n  - tag: s\n    kind: socks5\n    locator: 127.0.0.1:1080\n";
-        let cfg = select_outbound(yaml).unwrap();
-        assert!(matches!(cfg, ProxyDialConfig::Socks5 { .. }));
-    }
-
-    #[test]
-    fn first_wired_invalid_is_hard_failure() {
-        let yaml = "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: t\noutbounds:\n  - tag: v\n    kind: vmess\n    locator: 127.0.0.1:1234\n  - tag: t\n    kind: trojan\n    locator: 127.0.0.1:443\n    password: secret\n  - tag: s\n    kind: socks5\n    locator: 127.0.0.1:1080\n";
-        let err = select_outbound(yaml).unwrap_err();
-        assert!(matches!(
-            err,
-            EngineInitError::SelectedInvalid {
-                source: OutboundConfigError::PlaintextTrojanUnsupported,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn obfs_is_a_config_error() {
-        let obfs = yaml_with(
-            "socks5",
-            "127.0.0.1:1080",
-            "    obfs: plain\n    obfs_key: secret\n",
-        );
-        let EngineInitError::SelectedInvalid { source, .. } = select_outbound(&obfs).unwrap_err()
-        else {
-            panic!("expected SelectedInvalid");
-        };
-        assert_eq!(
-            source,
-            OutboundConfigError::UnsupportedObfs { field: "obfs" }
-        );
-    }
-
-    #[test]
-    fn engine_new_none_is_ok() {
-        assert!(matches!(ProxyEngine::new(None), Ok(None)));
-    }
-
-    #[test]
-    fn engine_no_usable_outbound_is_error() {
-        let yaml = "schema_version: 1\nrules:\n  - tag: r1\n    kind: match\n    action:\n      - kind: select_outbound\n        tag: d\noutbounds:\n  - tag: d\n    kind: direct\n";
-        assert!(matches!(
-            ProxyEngine::new(Some(yaml)),
-            Err(EngineInitError::NoUsableOutbound { .. })
-        ));
-    }
 }
