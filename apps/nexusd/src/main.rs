@@ -351,13 +351,60 @@ fn main() -> ExitCode {
     }
 }
 
-/// 数据面线程主循环：创建 TUN → 处理包 → 出错时退出线程（daemon 继续服务 LocalAPI）。
+/// 跨线程规则引擎句柄（组合根构建，数据面线程注入）。
+type ErasedRuleEngine = Box<dyn nexus_domain::RuleEngine>;
+
+/// 由已解析的 `proxy.yaml` 构建数据面规则引擎（组合根唯一构建点）。
+///
+/// - `Some(config)` → `DomainRuleEngine`，失败返回 `Err`（调用方 fail-fast，
+///   不得回落到 `default_simple_engine`）；
+/// - `None` → `Ok(None)`，由装配层显式选择无配置默认引擎并留痕。
+fn build_dataplane_rule_engine(
+    proxy_config: Option<&nexus_proxy_config::ProxyConfig>,
+) -> Result<Option<ErasedRuleEngine>, String> {
+    match proxy_config {
+        Some(config) => nexus_proxy::domain_engine::DomainRuleEngine::from_config(config)
+            .map(|engine| Some(Box::new(engine) as ErasedRuleEngine))
+            .map_err(|e| format!("rule engine from proxy.yaml: {e}")),
+        None => Ok(None),
+    }
+}
+
+/// 构造数据面并注入规则引擎（生产唯一装配点）。
+///
+/// 有配置 → 注入 `DomainRuleEngine`；无配置 → 显式启用并记录默认引擎。
+/// 有配置但引擎缺失/注入失败不在本函数内静默兜底（`None` 仅来自无配置路径）。
+fn assemble_dataplane(
+    tun: Box<dyn nexus_projection::TunDevice>,
+    config: nexusd::dataplane::DataplaneConfig,
+    rule_engine: Option<ErasedRuleEngine>,
+) -> Result<nexusd::dataplane::Dataplane, String> {
+    let mut dp = nexusd::dataplane::Dataplane::new(tun, config)?;
+    match rule_engine {
+        Some(engine) => {
+            dp.set_rule_engine(engine);
+            eprintln!(
+                "[nexusd.dataplane] level=info event=rule_engine state=wired source=proxy.yaml"
+            );
+        }
+        None => {
+            dp.set_default_simple_engine()
+                .map_err(|e| format!("default rule engine: {e}"))?;
+            eprintln!(
+                "[nexusd.dataplane] level=warn event=rule_engine state=default source=none reason=no_proxy_yaml"
+            );
+        }
+    }
+    Ok(dp)
+}
+
 /// 数据面线程主循环：创建 TUN → 处理包 → 出错或收到关闭信号时退出线程。
 ///
 /// R1：`n1_sender` 为 Some 时注入 dataplane（`set_n1_sender`），Mesh 包真发；
 /// 为 None 时保持 D2 计数降级。
 /// P1-P5：`proxy_yaml` 为 Some 且含可用出站时注入 `ProxyEngine`，Proxy 包真发；
 /// 否则 D2 计数降级。
+/// S24：`rule_engine` 由组合根从同一份 `proxy.yaml` 构建并注入，分类走配置规则。
 /// R4：每次循环检查 `shutdown` 标志，置位后退出（join 1s 超时由调用方执行）。
 #[allow(clippy::too_many_arguments)]
 fn run_dataplane(
@@ -366,6 +413,7 @@ fn run_dataplane(
     n1_sender: Option<Arc<dyn nexus_network::n1::bridge::N1Sender>>,
     tun_name: &str,
     tun_mtu: u32,
+    rule_engine: Option<ErasedRuleEngine>,
     proxy_yaml: Option<String>,
     network_toml: Option<String>,
     flow_sessions_mode: nexus_proxy_config::FlowSessionsMode,
@@ -396,7 +444,7 @@ fn run_dataplane(
         Box::new(nexusd::dataplane::InertTun)
     };
 
-    let mut dp = match nexusd::dataplane::Dataplane::new(tun, config) {
+    let mut dp = match assemble_dataplane(tun, config, rule_engine) {
         Ok(dp) => dp,
         Err(e) => {
             eprintln!("[nexusd] dataplane: init failed ({e}); dataplane disabled");
@@ -1404,6 +1452,22 @@ fn run_daemon(config_dir: &str) -> ExitCode {
     } else {
         Vec::new()
     };
+    // S24：数据面规则引擎来自同一份 proxy.yaml；构造失败 → 启动失败（fail-fast，
+    // 不得静默回落到把全部流量送往 `proxy` 的默认引擎）。
+    let rule_engine = if tun_enabled() || has_tproxy {
+        match build_dataplane_rule_engine(parsed_proxy.as_ref()) {
+            Ok(engine) => engine,
+            Err(e) => {
+                eprintln!(
+                    "{}",
+                    json!({"verdict":"FAIL","error":{"code":"CONFIG","message":e}})
+                );
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        None
+    };
     let dataplane_handle = if tun_enabled() || has_tproxy {
         let dp_shutdown = Arc::clone(&shutdown);
         Some(
@@ -1416,6 +1480,7 @@ fn run_daemon(config_dir: &str) -> ExitCode {
                         n1_sender,
                         &tun_name,
                         tun_mtu,
+                        rule_engine,
                         proxy_yaml,
                         network_toml,
                         flow_sessions_mode,
@@ -2435,5 +2500,101 @@ mod p1_15_localapi_hardening_tests {
             "must be a real bound, got {:?}",
             LOCALAPI_IO_TIMEOUT
         );
+    }
+}
+
+/// 装配级回归（P3）：规则引擎必须由生产装配路径注入数据面。
+///
+/// 本缺陷的形态是“单测全绿、生产从未接线”：因此这里跨过 `run_dataplane` 使用的
+/// 两个装配步骤（`build_dataplane_rule_engine` → `assemble_dataplane`），
+/// 直接对装配出的 `Dataplane` 断言分类结果。
+#[cfg(test)]
+mod dataplane_rule_engine_assembly_tests {
+    use super::{assemble_dataplane, build_dataplane_rule_engine};
+    use nexus_projection::{MockTun, TunDevice};
+    use nexusd::dataplane::DataplaneConfig;
+    use std::sync::{Arc, Mutex};
+
+    const DIRECT_MATCH_YAML: &str = "\
+schema_version: 1
+inbounds:
+  - tag: tp-in
+    kind: tproxy
+    listen: 0.0.0.0:7895
+    backend: iptables
+rules:
+  - tag: rule-match
+    kind: match
+    match: \"\"
+    action:
+      - kind: select_outbound
+        tag: direct
+outbounds:
+  - tag: direct
+    kind: direct
+    locator: \"\"
+";
+
+    struct SharedTun(Arc<Mutex<MockTun>>);
+
+    impl TunDevice for SharedTun {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().read(buf)
+        }
+        fn write(&mut self, packet: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(packet)
+        }
+        fn name(&self) -> &str {
+            "test0"
+        }
+    }
+
+    fn craft_udp(src_ip: [u8; 4], dst_ip: [u8; 4], src_port: u16, dst_port: u16) -> Vec<u8> {
+        let mut pkt = vec![0u8; 28];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&28u16.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 17;
+        pkt[12..16].copy_from_slice(&src_ip);
+        pkt[16..20].copy_from_slice(&dst_ip);
+        pkt[20..22].copy_from_slice(&src_port.to_be_bytes());
+        pkt[22..24].copy_from_slice(&dst_port.to_be_bytes());
+        pkt[24..26].copy_from_slice(&8u16.to_be_bytes());
+        pkt
+    }
+
+    fn assemble(proxy_yaml: Option<&str>) -> (nexusd::dataplane::Dataplane, Vec<u8>) {
+        let proxy = proxy_yaml.map(|yaml| nexus_proxy_config::parse(yaml).expect("proxy.yaml"));
+        let engine = build_dataplane_rule_engine(proxy.as_ref()).expect("rule engine");
+        let mock = Arc::new(Mutex::new(MockTun::new("test0")));
+        let mut dp = assemble_dataplane(
+            Box::new(SharedTun(Arc::clone(&mock))),
+            DataplaneConfig::default(),
+            engine,
+        )
+        .expect("assemble dataplane");
+        let pkt = craft_udp([10, 200, 1, 2], [203, 0, 113, 7], 32_890, 8080);
+        mock.lock().unwrap().inject(pkt.clone());
+        assert!(dp.process_one().expect("process_one"));
+        (dp, pkt)
+    }
+
+    #[test]
+    fn config_rule_engine_directs_flow_in_assembled_dataplane() {
+        // S1 的 proxy.yaml：MATCH -> direct。旧缺陷下分类走默认引擎 → Proxy("proxy")。
+        let (mut dp, pkt) = assemble(Some(DIRECT_MATCH_YAML));
+        let outbound = dp.cached_outbound(&pkt).expect("decision cached");
+        assert_eq!(
+            outbound, "self",
+            "config MATCH->direct must classify as direct, not Proxy(proxy)"
+        );
+    }
+
+    #[test]
+    fn no_config_uses_explicit_default_engine() {
+        // 无 proxy.yaml 是显式保留的唯一默认路径（装配层记录 warn 日志）。
+        let (mut dp, pkt) = assemble(None);
+        let outbound = dp.cached_outbound(&pkt).expect("decision cached");
+        assert_eq!(outbound, "proxy");
     }
 }
