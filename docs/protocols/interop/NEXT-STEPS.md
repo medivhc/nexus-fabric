@@ -23,7 +23,7 @@
 - Trojan/SS 即使其余修复全部完成，本 run 的 `UdpEcho` 固定 `NOT_IMPLEMENTED`，上限仍是
   `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（spec E1 规则 6/R11）。
   **不要用「修完就 VERIFIED」做产品承诺。**
-- 配置面标注（BROKEN 三协议「未验证/不可用」、含 fallback 的 Trojan 警示）已裁决批准，
+- 配置面标注（BROKEN 两协议（Hysteria2、Trojan）「未验证/不可用」、含 fallback 的 Trojan 警示）已裁决批准，
   待 `protocol-config-surface-labeling` run 落地；本轮不改产品代码。
 
 ## 1. 顺序、依赖与验收
