@@ -24,6 +24,10 @@ const NETLINK_ROUTE: c_int = 0;
 const NLM_F_REQUEST: u16 = 1;
 /// `nlmsg_flags`：`NLM_F_ACK`（`4`）。
 const NLM_F_ACK: u16 = 4;
+/// `nlmsg_flags`：`NLM_F_CREATE`（`0x400`），目标不存在时允许内核创建。
+const NLM_F_CREATE: u16 = 0x400;
+/// `nlmsg_flags`：`NLM_F_REPLACE`（`0x100`），目标已存在时替换而不是追加。
+const NLM_F_REPLACE: u16 = 0x100;
 /// `nlmsg_flags`：`NLM_F_DUMP` = `NLM_F_ROOT|NLM_F_MATCH`（`0x300`）。
 const NLM_F_DUMP: u16 = 0x300;
 
@@ -162,6 +166,9 @@ fn ifinfomsg(family: u8, ifindex: u32, flags: u32, change: u32) -> [u8; 16] {
 }
 
 /// 构造 RTM_NEWADDR/RTM_DELADDR 消息（纯函数）。
+///
+/// flags 不加 `NLM_F_CREATE`：`RTM_NEWADDR` 本身即 create-or-replace 语义，
+/// 目标不存在时内核直接创建（E5 S4 实测 `addr_added` 成功）。
 fn build_addr_msg(
     new: bool,
     seq: u32,
@@ -207,6 +214,17 @@ fn build_getaddr_msg(seq: u32, pid: u32) -> Vec<u8> {
 
 /// 构造 RTM_NEWROUTE/RTM_DELROUTE 消息（纯函数）。
 /// `dst` 为 None 表示默认路由（dst_len=0，不带 RTA_DST）。
+///
+/// flags：
+/// - `new=true` 必须带 `NLM_F_CREATE`。内核对未带 CREATE/REPLACE 的
+///   `RTM_NEWROUTE` 按 change 语义处理：目标路由不存在 → `ENOENT`（errno 2），
+///   不会创建（E5 S4 实测缺陷即此）。
+/// - 同时带 `NLM_F_REPLACE`（等价 `ip route replace`）：缺省写法在目标已存在时
+///   会**追加**一条并列路由（实测接管默认路由后出现两条 `default`，multipath），
+///   既不满足接管语义，也让“已存在”判断产生重复。REPLACE 保证创建/替换二选一。
+/// - 不置 `NLM_F_EXCL`：调用方 apply 会先 `list_routes` 跳过已存在项，EXCL 只会
+///   在并发窗口引入伪 `EEXIST`，对幂等无收益（AC-G7-03 由“先 list 再 skip”保证）。
+/// - `new=false`（DELROUTE）不得带 `NLM_F_CREATE`/`NLM_F_REPLACE`。
 fn build_route_msg(
     new: bool,
     seq: u32,
@@ -216,6 +234,13 @@ fn build_route_msg(
     gateway: Option<[u8; 4]>,
 ) -> Vec<u8> {
     let msg_type = if new { RTM_NEWROUTE } else { RTM_DELROUTE };
+    let flags = if new {
+        // 关键：缺 NLM_F_CREATE 时内核按 change 语义处理 → 目标不存在时 ENOENT；
+        // 只有 CREATE 时已存在目标会被追加成并列路由 → 配 REPLACE 得到 replace 语义。
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE
+    } else {
+        NLM_F_REQUEST | NLM_F_ACK
+    };
     let dst_len = dst.map(|(_, l)| l).unwrap_or(0);
     let mut body = Vec::new();
     body.extend_from_slice(&rtmsg(AF_INET, dst_len));
@@ -228,13 +253,7 @@ fn build_route_msg(
     }
     let total = align(NLMSG_HDRLEN + body.len());
     let mut msg = Vec::with_capacity(total);
-    msg.extend_from_slice(&nlmsg_header(
-        total as u32,
-        msg_type,
-        NLM_F_REQUEST | NLM_F_ACK,
-        seq,
-        pid,
-    ));
+    msg.extend_from_slice(&nlmsg_header(total as u32, msg_type, flags, seq, pid));
     msg.extend_from_slice(&body);
     msg.resize(total, 0);
     msg
@@ -257,6 +276,9 @@ fn build_getroute_msg(seq: u32, pid: u32) -> Vec<u8> {
 }
 
 /// 构造 RTM_NEWLINK（设置 IFF_UP，纯函数）。
+///
+/// flags 不加 `NLM_F_CREATE`：设备由内核/驱动创建，这里只改 `IFF_UP`
+/// （`ifi_change` 掩码限定改动面）。
 fn build_setlink_up_msg(seq: u32, pid: u32, ifindex: u32) -> Vec<u8> {
     let body = ifinfomsg(AF_INET, ifindex, IFF_UP, IFF_UP);
     let total = NLMSG_HDRLEN + body.len();
@@ -685,6 +707,64 @@ mod tests {
         let types: Vec<u16> = attrs.iter().map(|(t, _)| *t).collect();
         assert!(!types.contains(&RTA_DST));
         assert!(types.contains(&RTA_GATEWAY));
+    }
+
+    /// 报文 flags 读取（`nlmsghdr.nlmsg_flags`，偏移 6..8）。
+    fn msg_flags(msg: &[u8]) -> u16 {
+        u16::from_ne_bytes([msg[6], msg[7]])
+    }
+
+    /// P5-a 回归：RTM_NEWROUTE 必须带 `NLM_F_CREATE`，否则内核对不存在的路由
+    /// 按 change 语义返回 ENOENT（E5 S4 实测 errno 2）。
+    #[test]
+    fn build_newroute_sets_nlm_f_create() {
+        // 默认路由与 /32 exclude 两种形状都要覆盖（S4 失败的是 /32）。
+        for dst in [None, Some(([198, 51, 100, 7], 32))] {
+            let msg = build_route_msg(true, 1, 0, dst, 4, Some([10, 203, 0, 2]));
+            let flags = msg_flags(&msg);
+            assert_eq!(flags & NLM_F_CREATE, NLM_F_CREATE, "dst={dst:?}");
+            assert_eq!(flags & NLM_F_REQUEST, NLM_F_REQUEST);
+            assert_eq!(flags & NLM_F_ACK, NLM_F_ACK);
+            // REPLACE：只有 CREATE 时已存在目标会被追加成并列路由（实测两条
+            // default），接管默认路由必须替换。
+            assert_eq!(flags & NLM_F_REPLACE, NLM_F_REPLACE, "dst={dst:?}");
+            // EXCL（0x200）不置位：apply 已先 list 跳过，EXCL 只会引入伪 EEXIST。
+            assert_eq!(flags & 0x200, 0, "dst={dst:?}");
+        }
+    }
+
+    /// DELROUTE 不得带 `NLM_F_CREATE`/`NLM_F_REPLACE`（否则语义从“删除”漂移）。
+    #[test]
+    fn build_delroute_has_no_create_or_replace() {
+        for dst in [None, Some(([198, 51, 100, 7], 32))] {
+            let msg = build_route_msg(false, 1, 0, dst, 4, None);
+            assert_eq!(u16::from_ne_bytes([msg[4], msg[5]]), RTM_DELROUTE);
+            assert_eq!(msg_flags(&msg) & NLM_F_CREATE, 0, "dst={dst:?}");
+            assert_eq!(msg_flags(&msg) & NLM_F_REPLACE, 0, "dst={dst:?}");
+            assert_eq!(msg_flags(&msg) & NLM_F_ACK, NLM_F_ACK);
+        }
+    }
+
+    /// 共用 flag 构造点的其他报文逐语义核对：addr 为 create-or-replace、
+    /// link 只改 IFF_UP、dump 只读，均不应带 `NLM_F_CREATE`。
+    ///
+    /// 注意 `NLM_F_ROOT`（0x100）与 `NLM_F_REPLACE` 共用同一位，dump 报文
+    /// 只能按完整 flags 断言，不能单独用 REPLACE 掩码判断。
+    #[test]
+    fn non_route_messages_do_not_set_route_create_flags() {
+        let addr = build_addr_msg(true, 1, 0, 3, [10, 99, 0, 1], 24);
+        assert_eq!(msg_flags(&addr) & NLM_F_CREATE, 0);
+        assert_eq!(msg_flags(&addr) & NLM_F_REPLACE, 0);
+        let setlink = build_setlink_up_msg(1, 0, 3);
+        assert_eq!(msg_flags(&setlink) & NLM_F_CREATE, 0);
+        assert_eq!(msg_flags(&setlink) & NLM_F_REPLACE, 0);
+        // dump 请求 = REQUEST|DUMP，无 CREATE（ROOT 位与 REPLACE 重叠，不单独断言）。
+        let getaddr = build_getaddr_msg(1, 0);
+        assert_eq!(msg_flags(&getaddr) & NLM_F_CREATE, 0);
+        assert_eq!(msg_flags(&getaddr), NLM_F_REQUEST | NLM_F_DUMP);
+        let getroute = build_getroute_msg(1, 0);
+        assert_eq!(msg_flags(&getroute) & NLM_F_CREATE, 0);
+        assert_eq!(msg_flags(&getroute), NLM_F_REQUEST | NLM_F_DUMP);
     }
 
     #[test]
