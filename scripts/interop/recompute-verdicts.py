@@ -464,8 +464,8 @@ def render_matrix(
     lines.append("## 先读：范围 / 结论 / 图例")
     lines.append("")
     lines.append(
-        "- **覆盖**：5 个出站代理协议（VLESS、AnyTLS、Hysteria2、Trojan、Shadowsocks）"
-        "共 46 个证据格。TCP 成功型格走产品 SOCKS5 出口路径；`UdpEcho` 与 VLESS Vision "
+        f"- **覆盖**：5 个出站代理协议（VLESS、AnyTLS、Hysteria2、Trojan、Shadowsocks）"
+        f"共 {len(matrix['cells'])} 个证据格。TCP 成功型格走产品 SOCKS5 出口路径；`UdpEcho` 与 VLESS Vision "
         "部分格为 crate 直调（`CrateDirect`），不代表产品入口可用。"
     )
     lines.append(

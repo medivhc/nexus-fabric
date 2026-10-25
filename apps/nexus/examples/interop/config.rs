@@ -502,8 +502,13 @@ pub fn validate_config(cfg: &InteropProbeConfig) -> Result<(), ProbeError> {
     if cfg.variant == Variant::AnyTlsCustomPadding && cfg.cell != Cell::BadConfig {
         return Err(invalid("variant", "AnyTlsCustomPadding only for BadConfig"));
     }
-    if cfg.variant == Variant::Hy2Salamander && cfg.cell != Cell::Handshake {
-        return Err(invalid("variant", "Hy2Salamander only for Handshake"));
+    if cfg.variant == Variant::Hy2Salamander
+        && !matches!(cfg.cell, Cell::Handshake | Cell::TcpSmall)
+    {
+        return Err(invalid(
+            "variant",
+            "Hy2Salamander only for Handshake | TcpSmall",
+        ));
     }
     Ok(())
 }
@@ -603,6 +608,34 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn hy2_salamander_accepts_handshake_and_tcpsmall_only() {
+        let mut v = base_json();
+        v["protocol"] = serde_json::json!("Hysteria2");
+        v["variant"] = serde_json::json!("Hy2Salamander");
+        v["reference"]["port"] = serde_json::json!(26104);
+        v["credentials"] = serde_json::json!({
+            "Hysteria2": {
+                "password": "hy2-password",
+                "obfs": {"Salamander": {"password": "hy2-obfs-password"}}
+            }
+        });
+        v["cell"] = serde_json::json!("Handshake");
+        assert!(check(v.clone()).is_ok(), "Handshake must be accepted");
+        v["cell"] = serde_json::json!("TcpSmall");
+        assert!(check(v.clone()).is_ok(), "TcpSmall must be accepted");
+        v["cell"] = serde_json::json!("TcpThroughput");
+        assert!(
+            check(v.clone()).is_err(),
+            "TcpThroughput must be rejected for Hy2Salamander"
+        );
+        v["cell"] = serde_json::json!("UdpEcho");
+        assert!(
+            check(v).is_err(),
+            "UdpEcho must be rejected for Hy2Salamander"
+        );
+    }
+
+    #[test]
     fn rejects_anytls_padding_md5_drift() {
         let mut v = base_json();
         v["protocol"] = serde_json::json!("Anytls");
@@ -679,7 +712,7 @@ pub(crate) mod tests {
             validate_config(&cfg).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             count += 1;
         }
-        assert_eq!(count, 46, "expected 46 probe templates");
+        assert_eq!(count, 47, "expected 47 probe templates");
     }
 
     #[test]
