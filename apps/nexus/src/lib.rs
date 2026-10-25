@@ -12,6 +12,9 @@
 
 #![forbid(unsafe_code)]
 
+/// CONNECT 应答暂存（fail-closed 前置机制；crate 私有）。
+mod deferred_reply;
+
 /// 非阻塞中继写状态机（relay pump 共享；crate 私有，不扩大 public surface）。
 mod pending_write;
 
@@ -70,6 +73,7 @@ pub mod subscription_updater;
 /// `nexus use` 命令族（N2 P0-4，D4）：四步闭环（resolve→plan→authorize→establish）。
 pub mod use_cli;
 
+use deferred_reply::{ClientReplyKind, DeferredConnectReply};
 use nexus_domain::{
     LifecyclePhase, NexusError, ProviderId, ResourceId, SessionId, TerminalOutcome,
 };
@@ -4847,6 +4851,346 @@ fn hysteria2_target_from_outbound(
     Ok(target)
 }
 
+/// 握手阶段（非 `Established` 步）应答的立即写出点。
+///
+/// 空应答（HTTP 转发型的 Established 之外的空 response）不写任何字节，保持既有行为。
+fn write_handshake_reply(client: &mut std::net::TcpStream, bytes: &[u8]) -> Result<(), NexusError> {
+    use std::io::Write;
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    client.write_all(bytes).map_err(|_| NexusError::Internal {
+        message: "proxy write failed".into(),
+    })
+}
+
+/// 回写点之前（arm 尚未确定）的失败收尾。
+///
+/// 修复前 success 在路由之前就已写出，因此这里先补写 success 再返回原错误，
+/// 逐字节保持修复前的客户端可见形态（spec §5.7 步骤 1 兼容语义）。
+fn pre_arm_failure(
+    client: &mut std::net::TcpStream,
+    reply: &mut DeferredConnectReply,
+    err: NexusError,
+) -> NexusError {
+    if !reply.is_sent() {
+        let _ = reply.send_success(client);
+    }
+    err
+}
+
+/// Trojan 数据面（§11.16 / §5.7）：rustls TLS（SNI=节点域名、ALPN、skip-cert-verify）
+/// + trojan 请求头（standard/singbox）+ 双向透明中继 client<->TLS。
+///
+/// 应答时机：入站 success 应答由调用方暂存（`DeferredConnectReply`）。本函数在
+/// 「TLS 握手 + Trojan 头 + seed 全部 flush 完成、尚未 set nonblocking」处写出 success
+/// （§5.7 步骤 1 的回写点）。步骤 1 的失败兼容语义：回写点之前失败仍先写 success 再
+/// 返回原错误，保持修复前客户端可见形态；步骤 2 在此处改为失败应答。
+fn trojan_tunnel(
+    client: &mut std::net::TcpStream,
+    reply: &mut DeferredConnectReply,
+    selected: &nexus_proxy_config::OutboundConfig,
+    provider_tag: &str,
+    host: &str,
+    port: u16,
+    seed_to_upstream: &[u8],
+) -> Result<(usize, usize, Value), NexusError> {
+    match trojan_tunnel_inner(
+        client,
+        reply,
+        selected,
+        provider_tag,
+        host,
+        port,
+        seed_to_upstream,
+    ) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            // 步骤 1 兼容语义（spec §5.7）：连接/TLS/头/seed 在回写点之前失败时，
+            // 仍先写 success 再返回原错误——逐字节保持修复前的客户端可见形态。
+            if !reply.is_sent() {
+                let _ = reply.send_success(client);
+            }
+            Err(e)
+        }
+    }
+}
+
+fn trojan_tunnel_inner(
+    client: &mut std::net::TcpStream,
+    reply: &mut DeferredConnectReply,
+    selected: &nexus_proxy_config::OutboundConfig,
+    provider_tag: &str,
+    host: &str,
+    port: u16,
+    seed_to_upstream: &[u8],
+) -> Result<(usize, usize, Value), NexusError> {
+    use nexus_outbound_trojan::{TrojanHeaderFormat, TrojanTarget, encode_request_fmt};
+    use rustls::pki_types::ServerName;
+    use std::sync::Arc;
+
+    use std::io::Write;
+
+    let provider = || ProviderId(provider_tag.to_string());
+    let locator =
+        selected
+            .locator
+            .clone()
+            .ok_or_else(|| NexusError::ConnectivityEstablishmentFailed {
+                provider: provider(),
+                reason: "trojan outbound missing locator".into(),
+            })?;
+    let (nhost, nport) = split_host_port(&locator)?;
+    // §7.3 插件接线（P1）：obfs 包在 TLS 之下。先建 raw TCP（保持 blocking，
+    // TLS 握手期间 rustls 用阻塞 I/O，提前 nonblocking 会导致 WouldBlock 硬失败），
+    // clone 一个 handle 留待握手后设 nonblocking（同 fd 共享 flag），再 wrap；
+    // obfs=None → plain 直通（P6 零回归）。
+    let raw = std::net::TcpStream::connect((nhost.as_str(), nport)).map_err(|e| {
+        NexusError::ConnectivityEstablishmentFailed {
+            provider: provider(),
+            reason: format!("trojan node connect {locator} failed: {e}"),
+        }
+    })?;
+    let raw_nb = raw.try_clone().map_err(|e| NexusError::Internal {
+        message: format!("trojan node clone for nonblocking: {e}"),
+    })?;
+    let obfs_params = nexus_plugin::ObfsParams {
+        key: selected.obfs_key.as_deref().unwrap_or("").as_bytes(),
+    };
+    let mut node =
+        nexus_plugin::wrap_stream(raw, selected.obfs.as_deref(), &obfs_params).map_err(|e| {
+            NexusError::ConnectivityEstablishmentFailed {
+                provider: provider(),
+                reason: format!("trojan obfs wrap failed: {e}"),
+            }
+        })?;
+    let password =
+        selected
+            .password
+            .clone()
+            .ok_or_else(|| NexusError::ConnectivityEstablishmentFailed {
+                provider: provider(),
+                reason: "trojan outbound missing password".into(),
+            })?;
+
+    let header_format = match selected.header_format.as_deref() {
+        Some("singbox") => TrojanHeaderFormat::Singbox,
+        _ => TrojanHeaderFormat::Standard,
+    };
+    let skip_verify = selected.skip_cert_verify.unwrap_or(false);
+    let alpn: Vec<Vec<u8>> = selected
+        .alpn
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.into_bytes())
+        .collect();
+    let alpn_ref: Vec<&[u8]> = alpn.iter().map(|v| v.as_slice()).collect();
+
+    // 客户端 TLS 配置：skip-cert-verify（自签/内网节点）或系统信任根。
+    let tls_cfg: Result<rustls::ClientConfig, NexusError> = if skip_verify {
+        nexus_outbound_trojan::client_config_dangerous_skip_verify(&alpn_ref).map_err(|e| {
+            NexusError::ConnectivityEstablishmentFailed {
+                provider: provider(),
+                reason: format!("trojan client tls config failed: {e}"),
+            }
+        })
+    } else {
+        let mut roots = rustls::RootCertStore::empty();
+        for c in rustls_native_certs::load_native_certs().certs {
+            let _ = roots.add(c);
+        }
+        let prov = Arc::new(rustls::crypto::ring::default_provider());
+        let mut cfg = rustls::ClientConfig::builder_with_provider(prov)
+            .with_safe_default_protocol_versions()
+            .map_err(|_| NexusError::Internal {
+                message: "tls versions".into(),
+            })?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        if !alpn.is_empty() {
+            cfg.alpn_protocols = alpn.clone();
+        }
+        Ok(cfg)
+    };
+    let tls_cfg = tls_cfg?;
+
+    let sni = ServerName::try_from(nhost.clone()).map_err(|_| {
+        NexusError::ConnectivityEstablishmentFailed {
+            provider: provider(),
+            reason: format!("trojan sni invalid: {nhost}"),
+        }
+    })?;
+    let mut conn = rustls::ClientConnection::new(Arc::new(tls_cfg), sni).map_err(|e| {
+        NexusError::ConnectivityEstablishmentFailed {
+            provider: provider(),
+            reason: format!("trojan client connection failed: {e}"),
+        }
+    })?;
+
+    // 写入 trojan 请求头（write_all/flush 同时驱动 TLS 握手）。
+    let target = if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        TrojanTarget::Ipv4(ip.octets(), port)
+    } else {
+        TrojanTarget::Domain(host.to_string(), port)
+    };
+    let header = encode_request_fmt(&password, &target, header_format);
+    {
+        let mut tls = rustls::Stream::new(&mut conn, &mut node);
+        tls.write_all(&header)
+            .map_err(|e| NexusError::ConnectivityEstablishmentFailed {
+                provider: provider(),
+                reason: format!("trojan header write failed: {e}"),
+            })?;
+        tls.flush()
+            .map_err(|e| NexusError::ConnectivityEstablishmentFailed {
+                provider: provider(),
+                reason: format!("trojan handshake/header flush failed: {e}"),
+            })?;
+        // §11.19：握手首段字节（HTTP 改写后的请求）随 TLS 一并写给节点。
+        if !seed_to_upstream.is_empty() {
+            tls.write_all(seed_to_upstream).map_err(|e| {
+                NexusError::ConnectivityEstablishmentFailed {
+                    provider: provider(),
+                    reason: format!("trojan seed write failed: {e}"),
+                }
+            })?;
+            tls.flush()
+                .map_err(|e| NexusError::ConnectivityEstablishmentFailed {
+                    provider: provider(),
+                    reason: format!("trojan seed flush failed: {e}"),
+                })?;
+        }
+    }
+
+    // 出站就绪点：TLS 握手 + 头 + seed 均已 flush，此时才把暂存的 CONNECT 应答写出。
+    reply
+        .send_success(client)
+        .map_err(|e| NexusError::Internal {
+            message: format!("connect reply write failed: {e}"),
+        })?;
+
+    // 双向透明中继：rustls ClientConnection 不可跨线程分裂，用非阻塞单线程
+    // poll 在 client 与 TLS 之间搬运字节（loopback E4 小流量足够；本函数单线程
+    // 闭环承担结构化并发，无泄漏 JoinHandle）。
+    // node 在 TLS 握手完成后才设为 nonblocking（握手期间必须阻塞 I/O）；
+    // wrapped 流透传 WouldBlock。
+    raw_nb
+        .set_nonblocking(true)
+        .map_err(|e| NexusError::Internal {
+            message: format!("trojan node nonblocking: {e}"),
+        })?;
+    client
+        .set_nonblocking(true)
+        .map_err(|e| NexusError::Internal {
+            message: format!("trojan client nonblocking: {e}"),
+        })?;
+    let mut up_bytes = 0usize;
+    let mut down_bytes = 0usize;
+    let mut cbuf = [0u8; 8192];
+    let mut sbuf = [0u8; 8192];
+    let mut c_open = true;
+    let mut tls_open = true;
+    let mut up = PendingWrite::new();
+    let mut down = PendingWrite::new();
+    let mut up_failed = false;
+    let mut down_failed = false;
+    {
+        let mut tls = rustls::Stream::new(&mut conn, &mut node);
+        loop {
+            if !c_open
+                && !tls_open
+                && (up_failed || up.ready_for_read())
+                && (down_failed || down.ready_for_read())
+            {
+                break;
+            }
+            let mut progressed = false;
+            // 先排空两个方向的待写尾部：WouldBlock 保留尾部，非 WouldBlock
+            // 错误才关闭对应方向（不得把 WouldBlock 当致命错误）。
+            match up.try_write(&mut tls) {
+                Ok((_, n)) => {
+                    up_bytes += n;
+                    progressed |= n > 0;
+                }
+                Err(_) => {
+                    tls_open = false;
+                    up_failed = true;
+                }
+            }
+            match down.try_write(client) {
+                Ok((_, n)) => {
+                    down_bytes += n;
+                    progressed |= n > 0;
+                }
+                Err(_) => {
+                    c_open = false;
+                    tls_open = false;
+                    down_failed = true;
+                }
+            }
+            if c_open && tls_open {
+                match up.try_read(client, &mut cbuf) {
+                    None => {}
+                    Some(Ok(0)) => c_open = false,
+                    Some(Ok(n)) => {
+                        up.enqueue(&cbuf[..n]);
+                        progressed = true;
+                    }
+                    Some(Err(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Some(Err(_)) => c_open = false,
+                }
+            }
+            if tls_open && c_open {
+                match down.try_read(&mut tls, &mut sbuf) {
+                    None => {}
+                    Some(Ok(0)) => tls_open = false,
+                    Some(Ok(n)) => {
+                        down.enqueue(&sbuf[..n]);
+                        progressed = true;
+                    }
+                    Some(Err(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Some(Err(_)) => tls_open = false,
+                }
+            }
+            // 半关闭：一侧 EOF/致命写错误后，先排空该方向尾部再终止另一侧。
+            if !c_open && tls_open && (down_failed || down.ready_for_read()) {
+                tls_open = false;
+            }
+            if !tls_open
+                && c_open
+                && (up_failed || up.ready_for_read())
+                && (down_failed || down.ready_for_read())
+            {
+                c_open = false;
+            }
+            if !progressed {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+    }
+    // 尽力向节点发送 close_notify（不阻断结果）。
+    conn.send_close_notify();
+    // node 是 wrapped 流（Box<dyn ObfuscatedStream>），无法恢复 inner 的
+    // blocking 模式；arm 结束时流即 drop 关闭 fd，无需恢复。
+
+    let hf_label = match header_format {
+        TrojanHeaderFormat::Standard => "standard",
+        TrojanHeaderFormat::Singbox => "singbox",
+    };
+    let outbound = json!({
+        "kind": "trojan",
+        "node_locator": locator,
+        "tls": {
+            "sni": nhost,
+            "alpn": selected.alpn,
+            "skip_cert_verify": skip_verify,
+        },
+        "header_format": hf_label,
+    });
+    Ok((up_bytes, down_bytes, outbound))
+}
+
 pub fn proxy_serve_once(
     listener: &std::net::TcpListener,
     config_yaml: &str,
@@ -4868,30 +5212,41 @@ pub fn proxy_serve_once(
             message: "client closed during handshake".into(),
         });
     }
-    let (flow, inbound_kind, seed_to_upstream) = if buf[0] == 0x05 {
-        // ---- SOCKS5 分支（§11.4，零回归）----
+    let (flow, inbound_kind, seed_to_upstream, mut deferred_reply) = if buf[0] == 0x05 {
+        // ---- SOCKS5 分支（§11.4）----
+        // method-selection / 错误应答仍在循环内立即写出；只有 `Established` 步的
+        // success 应答被暂存，由调用方在出站就绪点写出（§4）。
         let mut hs = nexus_ingress::Socks5Handshake::new();
         let mut step = hs.feed(&buf[..n0]);
+        let deferred;
         let flow = loop {
-            if !step.response.is_empty() {
-                client
-                    .write_all(&step.response)
-                    .map_err(|_| NexusError::Internal {
-                        message: "proxy write failed".into(),
-                    })?;
-            }
             match step.state {
                 nexus_ingress::Socks5State::Established => {
-                    break step.flow.ok_or_else(|| NexusError::Internal {
-                        message: "established without flow".into(),
-                    })?;
+                    match step.flow {
+                        Some(f) => {
+                            deferred =
+                                DeferredConnectReply::new(ClientReplyKind::Socks5, step.response);
+                            break f;
+                        }
+                        None => {
+                            // 与修复前一致：success 已可见后再报内部不一致。
+                            let mut r =
+                                DeferredConnectReply::new(ClientReplyKind::Socks5, step.response);
+                            let _ = r.send_success(&mut client);
+                            return Err(NexusError::Internal {
+                                message: "established without flow".into(),
+                            });
+                        }
+                    }
                 }
                 nexus_ingress::Socks5State::Failed(e) => {
+                    write_handshake_reply(&mut client, &step.response)?;
                     return Err(NexusError::Internal {
                         message: format!("socks5 handshake failed: {e:?}"),
                     });
                 }
                 _ => {
+                    write_handshake_reply(&mut client, &step.response)?;
                     let n = client.read(&mut buf).map_err(|_| NexusError::Internal {
                         message: "proxy read failed".into(),
                     })?;
@@ -4906,31 +5261,36 @@ pub fn proxy_serve_once(
         };
         // 隧道内 pipelined 字节先写上给上游（严格中继，不丢字节）。
         let pipelined = hs.take_data();
-        (flow, "socks5".to_string(), pipelined)
+        (flow, "socks5".to_string(), pipelined, deferred)
     } else {
         // ---- HTTP 代理分支（§11.19）----
+        // CONNECT 的 200 暂存；non-CONNECT 的 response 为空（不写本地成功应答，R-6）。
         let mut hs = nexus_ingress::HttpProxyHandshake::new();
         let mut step = hs.feed(&buf[..n0]);
+        let deferred;
         let flow = loop {
-            if !step.response.is_empty() {
-                client
-                    .write_all(&step.response)
-                    .map_err(|_| NexusError::Internal {
-                        message: "proxy write failed".into(),
-                    })?;
-            }
             match step.state {
-                nexus_ingress::HttpProxyState::Established => {
-                    break step.flow.ok_or_else(|| NexusError::Internal {
-                        message: "established without flow".into(),
-                    })?;
-                }
+                nexus_ingress::HttpProxyState::Established => match step.flow {
+                    Some(f) => {
+                        deferred = DeferredConnectReply::new(ClientReplyKind::Http, step.response);
+                        break f;
+                    }
+                    None => {
+                        let mut r = DeferredConnectReply::new(ClientReplyKind::Http, step.response);
+                        let _ = r.send_success(&mut client);
+                        return Err(NexusError::Internal {
+                            message: "established without flow".into(),
+                        });
+                    }
+                },
                 nexus_ingress::HttpProxyState::Failed(e) => {
+                    write_handshake_reply(&mut client, &step.response)?;
                     return Err(NexusError::Internal {
                         message: format!("http proxy handshake failed: {e:?}"),
                     });
                 }
                 _ => {
+                    write_handshake_reply(&mut client, &step.response)?;
                     let n = client.read(&mut buf).map_err(|_| NexusError::Internal {
                         message: "proxy read failed".into(),
                     })?;
@@ -4946,21 +5306,48 @@ pub fn proxy_serve_once(
         // 转发型：upstream_prefix（改写后的 origin-form 请求行+请求头）+ 握手后 pipelined 字节。
         let mut seed = step.upstream_prefix;
         seed.extend(hs.take_data());
-        (flow, "http".to_string(), seed)
+        (flow, "http".to_string(), seed, deferred)
     };
 
     // 2) 规则路由（纯决策，零 I/O）。
-    let config = nexus_proxy_config::parse(config_yaml).map_err(|e| NexusError::Internal {
-        message: format!("proxy config invalid: {e}"),
-    })?;
-    let service = nexus_proxy::ProxyService::new(&config).map_err(|e| NexusError::Internal {
-        message: format!("proxy service build failed: {e}"),
-    })?;
-    let decision = service
-        .route(&flow, None)
-        .map_err(|e| NexusError::Internal {
-            message: format!("proxy route failed: {e}"),
-        })?;
+    //    修复前 success 已在 route 之前写出；回写点之前的失败保持「先写 success 再报错」
+    //    的客户端可见形态（步骤 1 兼容语义；trojan arm 的失败在步骤 2 改为失败应答）。
+    let config = match nexus_proxy_config::parse(config_yaml) {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(pre_arm_failure(
+                &mut client,
+                &mut deferred_reply,
+                NexusError::Internal {
+                    message: format!("proxy config invalid: {e}"),
+                },
+            ));
+        }
+    };
+    let service = match nexus_proxy::ProxyService::new(&config) {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(pre_arm_failure(
+                &mut client,
+                &mut deferred_reply,
+                NexusError::Internal {
+                    message: format!("proxy service build failed: {e}"),
+                },
+            ));
+        }
+    };
+    let decision = match service.route(&flow, None) {
+        Ok(d) => d,
+        Err(e) => {
+            return Err(pre_arm_failure(
+                &mut client,
+                &mut deferred_reply,
+                NexusError::Internal {
+                    message: format!("proxy route failed: {e}"),
+                },
+            ));
+        }
+    };
 
     // 3) Session 双轨（Active 先于出站建连）。
     let mut owner = SessionOwner::new(SessionId("sess-proxy-1".into()));
@@ -4973,17 +5360,36 @@ pub fn proxy_serve_once(
     //    shadowsocks -> 连节点 locator + SsStream（SIP004）客户端会话 + 加密 request header
     //                   + 双向流式 seal/open 中继（PendingWrite 背压 + 半关闭传播）
     //    trojan/vmess-> 数据面隧道不在本期冻结 E4 范围，结构化失败（不静默直连）
-    let selected = config
+    let selected = match config
         .outbounds
         .iter()
         .find(|o| o.tag == decision.selected_outbound_tag)
-        .ok_or_else(|| NexusError::ConnectivityEstablishmentFailed {
-            provider: ProviderId(decision.selected_outbound_tag.clone()),
-            reason: format!(
-                "selected outbound tag {} missing in config",
-                decision.selected_outbound_tag
-            ),
-        })?;
+    {
+        Some(s) => s,
+        None => {
+            return Err(pre_arm_failure(
+                &mut client,
+                &mut deferred_reply,
+                NexusError::ConnectivityEstablishmentFailed {
+                    provider: ProviderId(decision.selected_outbound_tag.clone()),
+                    reason: format!(
+                        "selected outbound tag {} missing in config",
+                        decision.selected_outbound_tag
+                    ),
+                },
+            ));
+        }
+    };
+    // 2.5) 非 trojan arm：在既有逻辑点（route 之后、出站建连之前）写出暂存的 success，
+    //      时机与字节均与修复前一致（AC-10.1）。trojan arm 在出站就绪点决定写 success
+    //      还是失败应答（§4）。
+    if selected.kind != nexus_proxy_config::OutboundKind::Trojan {
+        deferred_reply
+            .send_success(&mut client)
+            .map_err(|e| NexusError::Internal {
+                message: format!("connect reply write failed: {e}"),
+            })?;
+    }
     let (host, port) = split_host_port(&flow.destination)?;
     let outbound_kind = selected.kind.as_str();
     let outbound;
@@ -5249,257 +5655,17 @@ pub fn proxy_serve_once(
             (up, down)
         }
         nexus_proxy_config::OutboundKind::Trojan => {
-            // §11.16 trojan 数据面：rustls TLS（SNI=节点域名、ALPN、skip-cert-verify）
-            // + trojan 请求头（standard/singbox）+ 双向透明中继 client<->TLS。
-            use nexus_outbound_trojan::{TrojanHeaderFormat, TrojanTarget, encode_request_fmt};
-            use rustls::pki_types::ServerName;
-            use std::sync::Arc;
-
-            let locator = selected.locator.clone().ok_or_else(|| {
-                NexusError::ConnectivityEstablishmentFailed {
-                    provider: ProviderId(decision.selected_outbound_tag.clone()),
-                    reason: "trojan outbound missing locator".into(),
-                }
-            })?;
-            let (nhost, nport) = split_host_port(&locator)?;
-            // §7.3 插件接线（P1）：obfs 包在 TLS 之下。先建 raw TCP（保持 blocking，
-            // TLS 握手期间 rustls 用阻塞 I/O，提前 nonblocking 会导致 WouldBlock 硬失败），
-            // clone 一个 handle 留待握手后设 nonblocking（同 fd 共享 flag），再 wrap；
-            // obfs=None → plain 直通（P6 零回归）。
-            let raw = std::net::TcpStream::connect((nhost.as_str(), nport)).map_err(|e| {
-                NexusError::ConnectivityEstablishmentFailed {
-                    provider: ProviderId(decision.selected_outbound_tag.clone()),
-                    reason: format!("trojan node connect {locator} failed: {e}"),
-                }
-            })?;
-            let raw_nb = raw.try_clone().map_err(|e| NexusError::Internal {
-                message: format!("trojan node clone for nonblocking: {e}"),
-            })?;
-            let obfs_params = nexus_plugin::ObfsParams {
-                key: selected.obfs_key.as_deref().unwrap_or("").as_bytes(),
-            };
-            let mut node = nexus_plugin::wrap_stream(raw, selected.obfs.as_deref(), &obfs_params)
-                .map_err(|e| NexusError::ConnectivityEstablishmentFailed {
-                provider: ProviderId(decision.selected_outbound_tag.clone()),
-                reason: format!("trojan obfs wrap failed: {e}"),
-            })?;
-            let password = selected.password.clone().ok_or_else(|| {
-                NexusError::ConnectivityEstablishmentFailed {
-                    provider: ProviderId(decision.selected_outbound_tag.clone()),
-                    reason: "trojan outbound missing password".into(),
-                }
-            })?;
-
-            let header_format = match selected.header_format.as_deref() {
-                Some("singbox") => TrojanHeaderFormat::Singbox,
-                _ => TrojanHeaderFormat::Standard,
-            };
-            let skip_verify = selected.skip_cert_verify.unwrap_or(false);
-            let alpn: Vec<Vec<u8>> = selected
-                .alpn
-                .clone()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|s| s.into_bytes())
-                .collect();
-            let alpn_ref: Vec<&[u8]> = alpn.iter().map(|v| v.as_slice()).collect();
-
-            // 客户端 TLS 配置：skip-cert-verify（自签/内网节点）或系统信任根。
-            let tls_cfg: Result<rustls::ClientConfig, NexusError> = if skip_verify {
-                nexus_outbound_trojan::client_config_dangerous_skip_verify(&alpn_ref).map_err(|e| {
-                    NexusError::ConnectivityEstablishmentFailed {
-                        provider: ProviderId(decision.selected_outbound_tag.clone()),
-                        reason: format!("trojan client tls config failed: {e}"),
-                    }
-                })
-            } else {
-                let mut roots = rustls::RootCertStore::empty();
-                for c in rustls_native_certs::load_native_certs().certs {
-                    let _ = roots.add(c);
-                }
-                let prov = Arc::new(rustls::crypto::ring::default_provider());
-                let mut cfg = rustls::ClientConfig::builder_with_provider(prov)
-                    .with_safe_default_protocol_versions()
-                    .map_err(|_| NexusError::Internal {
-                        message: "tls versions".into(),
-                    })?
-                    .with_root_certificates(roots)
-                    .with_no_client_auth();
-                if !alpn.is_empty() {
-                    cfg.alpn_protocols = alpn.clone();
-                }
-                Ok(cfg)
-            };
-            let tls_cfg = tls_cfg?;
-
-            let sni = ServerName::try_from(nhost.clone()).map_err(|_| {
-                NexusError::ConnectivityEstablishmentFailed {
-                    provider: ProviderId(decision.selected_outbound_tag.clone()),
-                    reason: format!("trojan sni invalid: {nhost}"),
-                }
-            })?;
-            let mut conn = rustls::ClientConnection::new(Arc::new(tls_cfg), sni).map_err(|e| {
-                NexusError::ConnectivityEstablishmentFailed {
-                    provider: ProviderId(decision.selected_outbound_tag.clone()),
-                    reason: format!("trojan client connection failed: {e}"),
-                }
-            })?;
-
-            // 写入 trojan 请求头（write_all/flush 同时驱动 TLS 握手）。
-            let target = if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
-                TrojanTarget::Ipv4(ip.octets(), port)
-            } else {
-                TrojanTarget::Domain(host.clone(), port)
-            };
-            let header = encode_request_fmt(&password, &target, header_format);
-            {
-                let mut tls = rustls::Stream::new(&mut conn, &mut node);
-                tls.write_all(&header).map_err(|e| {
-                    NexusError::ConnectivityEstablishmentFailed {
-                        provider: ProviderId(decision.selected_outbound_tag.clone()),
-                        reason: format!("trojan header write failed: {e}"),
-                    }
-                })?;
-                tls.flush()
-                    .map_err(|e| NexusError::ConnectivityEstablishmentFailed {
-                        provider: ProviderId(decision.selected_outbound_tag.clone()),
-                        reason: format!("trojan handshake/header flush failed: {e}"),
-                    })?;
-                // §11.19：握手首段字节（HTTP 改写后的请求）随 TLS 一并写给节点。
-                if !seed_to_upstream.is_empty() {
-                    tls.write_all(&seed_to_upstream).map_err(|e| {
-                        NexusError::ConnectivityEstablishmentFailed {
-                            provider: ProviderId(decision.selected_outbound_tag.clone()),
-                            reason: format!("trojan seed write failed: {e}"),
-                        }
-                    })?;
-                    tls.flush()
-                        .map_err(|e| NexusError::ConnectivityEstablishmentFailed {
-                            provider: ProviderId(decision.selected_outbound_tag.clone()),
-                            reason: format!("trojan seed flush failed: {e}"),
-                        })?;
-                }
-            }
-
-            // 双向透明中继：rustls ClientConnection 不可跨线程分裂，用非阻塞单线程
-            // poll 在 client 与 TLS 之间搬运字节（loopback E4 小流量足够；本函数单线程
-            // 闭环承担结构化并发，无泄漏 JoinHandle）。
-            // node 在 TLS 握手完成后才设为 nonblocking（握手期间必须阻塞 I/O）；
-            // wrapped 流透传 WouldBlock。
-            raw_nb
-                .set_nonblocking(true)
-                .map_err(|e| NexusError::Internal {
-                    message: format!("trojan node nonblocking: {e}"),
-                })?;
-            client
-                .set_nonblocking(true)
-                .map_err(|e| NexusError::Internal {
-                    message: format!("trojan client nonblocking: {e}"),
-                })?;
-            let mut up_bytes = 0usize;
-            let mut down_bytes = 0usize;
-            let mut cbuf = [0u8; 8192];
-            let mut sbuf = [0u8; 8192];
-            let mut c_open = true;
-            let mut tls_open = true;
-            let mut up = PendingWrite::new();
-            let mut down = PendingWrite::new();
-            let mut up_failed = false;
-            let mut down_failed = false;
-            {
-                let mut tls = rustls::Stream::new(&mut conn, &mut node);
-                loop {
-                    if !c_open
-                        && !tls_open
-                        && (up_failed || up.ready_for_read())
-                        && (down_failed || down.ready_for_read())
-                    {
-                        break;
-                    }
-                    let mut progressed = false;
-                    // 先排空两个方向的待写尾部：WouldBlock 保留尾部，非 WouldBlock
-                    // 错误才关闭对应方向（不得把 WouldBlock 当致命错误）。
-                    match up.try_write(&mut tls) {
-                        Ok((_, n)) => {
-                            up_bytes += n;
-                            progressed |= n > 0;
-                        }
-                        Err(_) => {
-                            tls_open = false;
-                            up_failed = true;
-                        }
-                    }
-                    match down.try_write(&mut client) {
-                        Ok((_, n)) => {
-                            down_bytes += n;
-                            progressed |= n > 0;
-                        }
-                        Err(_) => {
-                            c_open = false;
-                            tls_open = false;
-                            down_failed = true;
-                        }
-                    }
-                    if c_open && tls_open {
-                        match up.try_read(&mut client, &mut cbuf) {
-                            None => {}
-                            Some(Ok(0)) => c_open = false,
-                            Some(Ok(n)) => {
-                                up.enqueue(&cbuf[..n]);
-                                progressed = true;
-                            }
-                            Some(Err(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                            Some(Err(_)) => c_open = false,
-                        }
-                    }
-                    if tls_open && c_open {
-                        match down.try_read(&mut tls, &mut sbuf) {
-                            None => {}
-                            Some(Ok(0)) => tls_open = false,
-                            Some(Ok(n)) => {
-                                down.enqueue(&sbuf[..n]);
-                                progressed = true;
-                            }
-                            Some(Err(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                            Some(Err(_)) => tls_open = false,
-                        }
-                    }
-                    // 半关闭：一侧 EOF/致命写错误后，先排空该方向尾部再终止另一侧。
-                    if !c_open && tls_open && (down_failed || down.ready_for_read()) {
-                        tls_open = false;
-                    }
-                    if !tls_open
-                        && c_open
-                        && (up_failed || up.ready_for_read())
-                        && (down_failed || down.ready_for_read())
-                    {
-                        c_open = false;
-                    }
-                    if !progressed {
-                        std::thread::sleep(std::time::Duration::from_millis(2));
-                    }
-                }
-            }
-            // 尽力向节点发送 close_notify（不阻断结果）。
-            conn.send_close_notify();
-            // node 是 wrapped 流（Box<dyn ObfuscatedStream>），无法恢复 inner 的
-            // blocking 模式；arm 结束时流即 drop 关闭 fd，无需恢复。
-
-            let hf_label = match header_format {
-                TrojanHeaderFormat::Standard => "standard",
-                TrojanHeaderFormat::Singbox => "singbox",
-            };
-            outbound = json!({
-                "kind": "trojan",
-                "node_locator": locator,
-                "tls": {
-                    "sni": nhost,
-                    "alpn": selected.alpn,
-                    "skip_cert_verify": skip_verify,
-                },
-                "header_format": hf_label,
-            });
-            (up_bytes, down_bytes)
+            let (u, d, ob) = trojan_tunnel(
+                &mut client,
+                &mut deferred_reply,
+                selected,
+                &decision.selected_outbound_tag,
+                &host,
+                port,
+                &seed_to_upstream,
+            )?;
+            outbound = ob;
+            (u, d)
         }
         nexus_proxy_config::OutboundKind::Relay => {
             return Err(NexusError::ConnectivityEstablishmentFailed {
@@ -6103,6 +6269,11 @@ pub fn proxy_serve_once(
         }
     };
 
+    // 5.5) 本地 CONNECT 应答的可观测状态（AC-13）：是否已写、延迟多久。
+    let reply_sent = deferred_reply.is_sent();
+    let reply_deferred_ms = deferred_reply.deferred_ms().unwrap_or(0);
+    let tunnel_json: Option<Value> = None;
+
     // 6) Session 终态。
     owner
         .commit_outcome(TerminalOutcome::Completed)
@@ -6120,14 +6291,16 @@ pub fn proxy_serve_once(
         .filter(|e| matches!(e, nexus_session::SessionEvent::OutcomeCommitted { .. }))
         .count();
 
-    Ok(json!({
+    let mut session_json = json!({
         "verdict": "PASS",
         "inbound": {
             "kind": inbound_kind,
         },
         "socks": {
             "auth_method_reply": "0x05,0x00",
-            "reply_code": 0,
+            "reply_code": if reply_sent { json!(0) } else { Value::Null },
+            "reply_sent": reply_sent,
+            "reply_deferred_ms": reply_deferred_ms,
             "destination": flow.destination,
         },
         "routing": {
@@ -6151,7 +6324,11 @@ pub fn proxy_serve_once(
         "architecture": {
             "network_depends_on_ingress": network_depends_on_ingress()?,
         }
-    }))
+    });
+    if let Some(tunnel) = tunnel_json {
+        session_json["tunnel"] = tunnel;
+    }
+    Ok(session_json)
 }
 // ---------- 节点测速（PRODUCT §11.10） ----------
 
