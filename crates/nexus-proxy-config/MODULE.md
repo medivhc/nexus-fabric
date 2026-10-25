@@ -60,6 +60,15 @@
   base64 非法字符/长度对齐错误返回 `CONFIG_INVALID`。离线确定性，纯函数。
 - Trojan 出站（§11.9.3）：`kind=trojan` 时 `password`/`locator` 必填；`header_format` 仅允许
   `standard`（默认）或 `singbox`；非法值缺失返回 `CONFIG_INVALID`。
+- Trojan 第一响应守卫字段（spec fixes-5 §8 / AC-16，**有意收紧**）：
+  `fallback_guard: "strict"|"signature"`（缺省 `strict`，不存在 `off`/空值语义）与
+  `ready_window_ms: u64`（`0..=5000`，`None`/`0` = 自适应窗口）。
+  两者都按 **presence-aware** 提取：字段存在但为空串 / 非法枚举 / 越界 / 非整数
+  → `CONFIG_INVALID [outbounds[<tag>].<field>]`，不得静默当作「未配置」。
+  校验顺序 = 先按 trojan 值域校验（对所有 kind），再按 kind 决定是否生效：
+  非 trojan 出站上的**合法值**忽略（不生效、不报错），**非法值**硬失败。
+  这比现状 `header_format`（只在 `kind==trojan` 块内校验，非 trojan 的非法值被静默忽略）
+  更严，属本 run 新增的 fail-closed 裁决。
 
 ## Side Effects
 
@@ -95,7 +104,9 @@
     返回 `CONFIG_INVALID`。
   - Trojan 出站（§11.9.3）：`kind: "trojan"` 时 `locator` 形如 `host:port` 且 `password` 必填非空；
     可选 `alpn: Vec<String>`、`skip_cert_verify: bool`、`header_format: "standard"|"singbox"`
-    （缺省 `standard`）；`header_format` 非法 / `password` 或 `locator` 缺失 → `CONFIG_INVALID`。
+    （缺省 `standard`）；`header_format` 非法 / `password` 或 `locator` 缺失 → `CONFIG_INVALID`；
+    可选 `fallback_guard: Option<String>`（`"strict"`|`"signature"`）与
+    `ready_window_ms: Option<u64>`（`0..=5000`），校验语义见上节。
   - 混淆插件（§7.3，二期）：任意 TCP 出站（ss/trojan）可选 `obfs: String`（插件名，
     如 `"xor"`；缺省/空 = plain 直通）与 `obfs_key: String`（插件参数 key，如 xor 的
     key 材料）；`obfs` 指向未知插件名 → dial 时直接失败（硬校验，不静默回退明文）。

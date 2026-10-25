@@ -401,6 +401,8 @@ mod tests {
             up: None,
             down: None,
             obfs_password: None,
+            fallback_guard: None,
+            ready_window_ms: None,
         };
         assert!(TrojanTlsConfig::try_from(&o).is_err());
     }
@@ -427,6 +429,8 @@ mod tests {
             up: None,
             down: None,
             obfs_password: None,
+            fallback_guard: None,
+            ready_window_ms: None,
         };
         assert!(TrojanTlsConfig::try_from(&o).is_err());
     }
