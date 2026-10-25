@@ -3,14 +3,14 @@
 > 本文件由 `scripts/interop/recompute-verdicts.py` 从证据机械生成；人工零编辑。
 > 修复顺序、依赖与复验口径见人工维护的 [NEXT-STEPS.md](NEXT-STEPS.md)。
 
-- run `protocol-interop-fixes-5`；baseline `a30147a7b98c9a84a46332c6613cf161280234b2`；spec frozen fixes-5 frozen (requirement-change)（sha256 `a955bd9ab227c23c2772fc6932ab909f2e65de114cb39bb1e2650866334e7718`）；test window `2026-10-25T19:28:05Z .. 2026-10-25T19:51:02Z`。
+- run `protocol-interop-fixes-5`；baseline `a30147a7b98c9a84a46332c6613cf161280234b2`；spec frozen fixes-5 frozen (requirement-change)（sha256 `a955bd9ab227c23c2772fc6932ab909f2e65de114cb39bb1e2650866334e7718`）；test window `2026-10-25T18:28:02Z .. 2026-10-25T19:51:02Z`。
 - 参照实现：sing-box 1.13.16（sha256 `8da901e7b6eb0d2f6f6e701f19d5f78af235d038ae078b37a70739db5895d262`）；Xray 26.10.21（sha256 `MISSING`）。
 - archive（主机归档路径）：（S30 归档后追加）。
 - 注记：`docs/protocols/interop/notes/trojan-fallback.md`（sha256 `0c49d2f5ea7e7c121731b212fc5f652be17cde97d11d7a8972195e9c27f7a339`）；本节由 `recompute-verdicts.py --notes` 注入，禁止手工编辑 MATRIX。
 
 ## 先读：范围 / 结论 / 图例
 
-- **覆盖**：5 个出站代理协议（VLESS、AnyTLS、Hysteria2、Trojan、Shadowsocks）共 46 个证据格。TCP 成功型格走产品 SOCKS5 出口路径；`UdpEcho` 与 VLESS Vision 部分格为 crate 直调（`CrateDirect`），不代表产品入口可用。
+- **覆盖**：5 个出站代理协议（VLESS、AnyTLS、Hysteria2、Trojan、Shadowsocks）共 47 个证据格。TCP 成功型格走产品 SOCKS5 出口路径；`UdpEcho` 与 VLESS Vision 部分格为 crate 直调（`CrateDirect`），不代表产品入口可用。
 - **不覆盖**：VMess（本轮暂缓）、direct/relay/socks5 出站、TUN/VPN、Android 统一 VPN 入口、UI/诊断呈现。
 - **本表不回答**：直连/中继回退是否可用（属 N1 整体结论）；也不把「产品级 UDP 未实现」扩大成「Hy2 的 QUIC 出站传输不可用」（见产品级 UDP 节）。
 - **结论 1**：本次复算：`VERIFIED` 2 个（Vless、Anytls），`PARTIAL` 2 个（Trojan、Shadowsocks），`BROKEN` 1 个（Hysteria2）；当前**无缺口**可宣称可用（`VERIFIED / USABLE`）的协议为 Vless、Anytls；另有 2 个 `USABLE_WITH_GAPS`（Trojan、Shadowsocks）。
@@ -228,6 +228,7 @@ python3 scripts/interop/recompute-verdicts.py ... --check   # 零漂移（含注
 | Default/Reconnect | PASS | ProductSocks5 | ProductPath | PIV-hysteria2-default-reconnect-20261025T193745Z-001 | NONE | reconnects=3 | evidence/hysteria2/default/reconnect/PIV-hysteria2-default-reconnect-20261025T193745Z-001/probe.json | proxy_json routing.outbound_kind=hysteria2 outbound.kind=hysteria2; target_stats={"tcp_bytes_down":4,"tcp_bytes_up":4,"tcp_connections":4,"udp_bytes":0,"udp_datagrams":0} … |
 | Default/Handshake | PASS | ProductSocks5 | ProductPath | PIV-hysteria2-default-handshake-20261025T193753Z-001 | NONE | up=1B down=1B | evidence/hysteria2/default/handshake/PIV-hysteria2-default-handshake-20261025T193753Z-001/probe.json | proxy_json routing.outbound_kind=hysteria2 outbound.kind=hysteria2; target_stats={"tcp_bytes_down":2,"tcp_bytes_up":2,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} … |
 | Hy2Salamander/Handshake | PASS | ProductSocks5 | ProductPath | PIV-hysteria2-hy2-salamander-handshake-20261025T193758Z-001 | NONE | up=1B down=1B | evidence/hysteria2/hy2-salamander/handshake/PIV-hysteria2-hy2-salamander-handshake-20261025T193758Z-001/probe.json | proxy_json routing.outbound_kind=hysteria2 outbound.kind=hysteria2; target_stats={"tcp_bytes_down":2,"tcp_bytes_up":2,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} … |
+| Hy2Salamander/TcpSmall | PASS | ProductSocks5 | ProductPath | PIV-hysteria2-hy2-salamander-tcp-small-20261025T182802Z-001 | NONE | up=65536B down=65536B | evidence/hysteria2/hy2-salamander/tcp-small/PIV-hysteria2-hy2-salamander-tcp-small-20261025T182802Z-001/probe.json | proxy_json routing.outbound_kind=hysteria2 outbound.kind=hysteria2; target_stats={"tcp_bytes_down":65537,"tcp_bytes_up":65537,"tcp_connections":2,"udp_bytes":0,"udp_datagrams":0} … |
 | Default/QpackDiag | PASS | CrateDirect | ProtocolWire | PIV-hysteria2-default-qpack-diag-20261025T193804Z-001 | NONE | up=0B down=0B | evidence/hysteria2/default/qpack-diag/PIV-hysteria2-default-qpack-diag-20261025T193804Z-001/probe.json | qpack_diag_not_triggered=handshake_ok; hy2_error=null; hy2_auth_status=233; hy2_auth_status_source=connect_ok_after_decode_auth_response; hy2_udp_enabled=true; hy2_cc_rx=auto …; 诊断格，不参与 verdict |
 | Default/UdpEcho | PASS | CrateDirect | ProtocolWire | PIV-hysteria2-default-udp-echo-20261025T193809Z-001 | NONE | udp 1000/1000 corrupt=0 | evidence/hysteria2/default/udp-echo/PIV-hysteria2-default-udp-echo-20261025T193809Z-001/probe.json | udp_seq_and_hash_ok; target_stats={"tcp_bytes_down":0,"tcp_bytes_up":0,"tcp_connections":0,"udp_bytes":512064,"udp_datagrams":1001} … |
 | Default/BadCredential | PASS | ProductSocks5 | ProductPath | PIV-hysteria2-default-bad-credential-20261025T193814Z-001 | E_EXPECTED_AUTH_REJECT | up=0B down=0B | evidence/hysteria2/default/bad-credential/PIV-hysteria2-default-bad-credential-20261025T193814Z-001/probe.json | proxy_error=ConnectivityEstablishmentFailed { provider: ProviderId("ref"), reason: "hysteria2 connect/auth 127.0.0.1:26103 failed: hysteria2 authentication failed" } …; 限定：正向路径被 CODEC 阻断时本格 PASS 仅证明无静默成功，不独立证明配置拒绝语义 |
@@ -289,7 +290,7 @@ python3 scripts/interop/recompute-verdicts.py ... --check   # 零漂移（含注
 
 - **Trojan fallback fail-closed（CONNECT 应答暂存 + 就绪窗口 + 首包分类 + 失败应答）**（commit `12cbf81`）：TrojanFallback/BadCredential 由 FAIL/E_NEXUS_FRAMING 转为 PASS（REP≠0 + 零隧道字节 + pcap 证明 fallback 被访问）；Trojan Default 全格保持 PASS；上限仍为 PARTIAL / TCP_ONLY / USABLE_WITH_GAPS（evidence/trojan/trojan-fallback/bad-credential/（见 analysis/verdicts.json）；analysis/ac1-local-fallback.json；analysis/ac6-wire.json；analysis/ac9-calibration.json）
 
-根因文档位于仓库 `docs/protocols/interop/fix/`；本 run 证据根为 `/work/interop-run/fixes5`，上表 cell 证据路径均相对该目录。
+根因文档位于仓库 `docs/protocols/interop/fix/`；本 run 证据根为 `/work/interop-run/merge-fixes4-20261028`，上表 cell 证据路径均相对该目录。
 
 ## 附录 A：配置索引
 
@@ -332,6 +333,7 @@ python3 scripts/interop/recompute-verdicts.py ... --check   # 零漂移（含注
 | PIV-hysteria2-default-tcp-throughput-20261025T193403Z-001 | FAIL | ProductSocks5 | ProductPath | evidence/hysteria2/default/tcp-throughput/PIV-hysteria2-default-tcp-throughput-20261025T193403Z-001/probe.json |
 | PIV-hysteria2-default-udp-echo-20261025T193809Z-001 | PASS | CrateDirect | ProtocolWire | evidence/hysteria2/default/udp-echo/PIV-hysteria2-default-udp-echo-20261025T193809Z-001/probe.json |
 | PIV-hysteria2-hy2-salamander-handshake-20261025T193758Z-001 | PASS | ProductSocks5 | ProductPath | evidence/hysteria2/hy2-salamander/handshake/PIV-hysteria2-hy2-salamander-handshake-20261025T193758Z-001/probe.json |
+| PIV-hysteria2-hy2-salamander-tcp-small-20261025T182802Z-001 | PASS | ProductSocks5 | ProductPath | evidence/hysteria2/hy2-salamander/tcp-small/PIV-hysteria2-hy2-salamander-tcp-small-20261025T182802Z-001/probe.json |
 | PIV-shadowsocks-default-bad-config-20261025T194359Z-001 | PASS | ProductSocks5 | ProductPath | evidence/shadowsocks/default/bad-config/PIV-shadowsocks-default-bad-config-20261025T194359Z-001/probe.json |
 | PIV-shadowsocks-default-bad-credential-20261025T194352Z-001 | PASS | ProductSocks5 | ProductPath | evidence/shadowsocks/default/bad-credential/PIV-shadowsocks-default-bad-credential-20261025T194352Z-001/probe.json |
 | PIV-shadowsocks-default-handshake-20261025T194100Z-001 | PASS | ProductSocks5 | ProductPath | evidence/shadowsocks/default/handshake/PIV-shadowsocks-default-handshake-20261025T194100Z-001/probe.json |
@@ -364,11 +366,11 @@ python3 scripts/interop/recompute-verdicts.py ... --check   # 零漂移（含注
 
 ```bash
 scripts/interop/run-matrix.sh --protocol <p> --variant <v> --cell <c> \
-  --run-dir /work/interop-run/fixes5 \
+  --run-dir /work/interop-run/merge-fixes4-20261028 \
   --probe-bin $CARGO_TARGET_DIR/debug/examples/protocol_interop_probe \
   --ref-bin $RUN_DIR/ref/sing-box-1.13.16-linux-amd64-musl/sing-box
-python3 scripts/interop/recompute-verdicts.py --run-dir /work/interop-run/fixes5 \
-  --run-meta /work/interop-run/fixes5/analysis/run-meta.json \
+python3 scripts/interop/recompute-verdicts.py --run-dir /work/interop-run/merge-fixes4-20261028 \
+  --run-meta /work/interop-run/merge-fixes4-20261028/analysis/run-meta.json \
   --matrix docs/protocols/interop/MATRIX.md --check
 ```
 
