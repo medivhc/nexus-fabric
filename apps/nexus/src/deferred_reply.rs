@@ -64,7 +64,6 @@ impl DeferredConnectReply {
     /// 写出失败应答：SOCKS5 = `05 <rep> 00 01 00000000 0000`；HTTP = 固定 502。
     ///
     /// 失败应答本身不计入隧道字节（AC-1.2）；重复调用不重复写。
-    #[allow(dead_code)] // 步骤 1 只定义/测试；产品失败路径在步骤 2 接入。
     pub(crate) fn send_failure(&mut self, client: &mut TcpStream, rep: u8) -> std::io::Result<()> {
         if self.sent {
             return Ok(());
@@ -91,12 +90,6 @@ impl DeferredConnectReply {
         self.deferred_ms
     }
 
-    /// 该会话是否有「本地成功应答」形态（HTTP 转发型为空 → false）。
-    #[allow(dead_code)] // 步骤 1 只定义/测试；产品失败路径在步骤 2 接入。
-    pub(crate) fn has_success_reply(&self) -> bool {
-        !self.success_bytes.is_empty()
-    }
-
     fn mark_sent(&mut self) {
         self.sent = true;
         self.deferred_ms = Some(self.created_at.elapsed().as_millis() as u64);
@@ -108,7 +101,6 @@ impl DeferredConnectReply {
 /// 目的（AC-6）：避免「带未读数据关闭」触发 RST，让节点侧看到的是正常 FIN。
 /// 上限 = `max_bytes` 或 `max_ms`，先到者；`WouldBlock` 视为暂时无数据，继续等到
 /// 上限或 EOF。任何读错误都按「已关闭」处理（收尾阶段不改变判定结果）。
-#[allow(dead_code)] // 步骤 1 只定义/测试；拒绝路径在步骤 2 接入。
 pub(crate) fn bounded_drain<R: Read>(node: &mut R, max_bytes: usize, max_ms: u64) -> (usize, bool) {
     let deadline = Instant::now() + std::time::Duration::from_millis(max_ms);
     let mut buf = [0u8; 8192];
@@ -201,7 +193,6 @@ mod tests {
         let mut reply = DeferredConnectReply::new(ClientReplyKind::Http, Vec::new());
         reply.send_success(&mut client).expect("no bytes");
         assert!(reply.is_sent(), "空应答也算已写（不再等待）");
-        assert!(!reply.has_success_reply());
         assert!(read_all(&mut peer, 1).is_empty());
     }
 

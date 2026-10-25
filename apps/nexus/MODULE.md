@@ -91,12 +91,26 @@
 - 真实 SOCKS5 代理数据面（PRODUCT §11.4）：`proxy_serve_once` /
   `DEFAULT_PROXY_CONFIG` —— 握手（Socks5Handshake / HttpProxyHandshake）→ 规则路由
   （nexus-proxy）→ Session 双轨 → 真实出站连接 → 双向字节中继。
-  **CONNECT 应答暂存**（`deferred_reply::DeferredConnectReply`，spec §5.7 步骤 1）：
-  握手循环只立即写出非 `Established` 步的应答（method-selection / 错误应答）；
-  `Established` 步的 success 交调用方写出——非 trojan 出站在路由之后、出站建连之前
-  立即写出（字节与既有逻辑点不变），trojan 出站在 TLS 握手 + 请求头 + seed 全部
-  flush 完成、set nonblocking 之前写出。失败应答字节形状（SOCKS5 10B / HTTP 502）
-  与拒绝路径的有界 drain 由同一模块提供（失败路径接线在 §5.7 步骤 2）。
+  **CONNECT 应答暂存**（`deferred_reply::DeferredConnectReply`）：握手循环只立即写出
+  非 `Established` 步的应答（method-selection / 错误应答）；`Established` 步的 success
+  交调用方写出——非 trojan 出站在路由之后、出站建连之前立即写出（字节与既有逻辑点
+  不变，AC-10.1），trojan 出站在「TLS 握手 + 请求头 + seed 全部 flush 完成」后由就绪
+  窗口决定写 success 还是失败应答。
+  **Trojan fail-closed 守卫**（`trojan_guard`，spec fixes-5 §4/§5.3/§6）：
+  - 判定输入 = 目标端口 + 首包（≤16B）+ 是否 EOF + 客户端是否已先载荷 + 策略；
+    判据顺序固定为 §5.3 的 1→6，纯函数、无统计/相似度启发式（AC-7）；
+  - `fallback_guard: strict`（默认）只放行端口绑定 greeting 白名单
+    （22 `SSH-`、21/25/587 `220`、110 `+OK`、143 `* OK`、5900 `RFB `），其余拒绝；
+    `signature` 是**显式安全降级**（只拒 `HTTP/`，非 HTTP fallback 漏报）；
+  - 窗口 `W = clamp(t_connect+50, 50, 600)ms`（或 `ready_window_ms` 覆盖，`min(n,5000)`）：
+    客户端先载荷 → 立即 success（载荷先写节点，零扣压）；白名单 greeting → 立即 success；
+    静默到期 → success；HTTP 状态行 / 非白名单首包 / 首包前 EOF → 失败应答
+    （SOCKS5 `0x01`，节点端口拒绝为 `0x05`；HTTP `502`）+ 有界 drain（≤64KiB/50ms）
+    + FIN，**不 flush `close_notify`、不写额外 TLS 记录**（失败只在本地可观察，AC-6）；
+  - 失败 reason 固定格式：`<prefix>: waited_ms=<u64> first_bytes_hex=<hex≤32> dest_port=<u16>`；
+  - 成功会话 JSON 新增 `socks.reply_sent` / `socks.reply_deferred_ms` 与
+    `tunnel: { readiness, pre_payload_down_bytes, guard, window_ms }`（AC-13）；
+    `ClientAbortedBeforeReady` 返回 `Ok` 会话（`reply_code=null`、readiness=`client_aborted`）。
 - 真实节点测速（PRODUCT §11.10）：TcpLatencyProbe（std::net connect_timeout，非 portable）
   + Http204LatencyProbe（connect 后发单行 GET、等响应首行 204，非 portable）
   + proxy_speedtest_with(probe, candidates, timeout, target_label, probe_kind)（批量测速、RTT 排序 JSON 输出）；结果可经 MeasurementSource 喂 urltest。
