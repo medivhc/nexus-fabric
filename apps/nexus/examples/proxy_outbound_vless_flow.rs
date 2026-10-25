@@ -181,17 +181,13 @@ fn main() {
         bound_stream(&echo, "node->echo")?;
 
         // 读 payload（proxy 中继自 SOCKS5 client）-> 明文写给 echo
-        // 现行为（本 commit 保留）：payload 只从后续 socket read 取，与请求头同批
-        // 到达的 `buf[consumed..]` 弃之不用 -> 下面这次 read 有界超时，回归失败可见。
-        let mut payload: Vec<u8> = Vec::new();
+        // 首段 payload：与请求头同批到达的字节必须保留（不得随缓冲区丢弃）。
+        // 只有不足部分才继续从 socket 读，避免等待一份已经被消费掉的 payload。
+        let mut payload = buf.split_off(consumed);
         if payload.len() < PAYLOAD.len() {
             let mut rest = vec![0u8; PAYLOAD.len() - payload.len()];
-            tcp.read_exact(&mut rest).map_err(|e| {
-                format!(
-                    "node: ASSERT FAILED - no pipelined payload after the request header \
-                     (buf[consumed..] must seed the payload); socket read failed: {e}"
-                )
-            })?;
+            tcp.read_exact(&mut rest)
+                .map_err(|e| format!("vless payload read: {e}"))?;
             payload.extend_from_slice(&rest);
         }
         assert_eq!(
