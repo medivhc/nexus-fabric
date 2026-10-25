@@ -37,7 +37,7 @@
 | **P3** | **SS SIP004 AEAD**：salt + `EVP_BytesToKey`（MD5）+ HKDF-SHA1 + LE nonce + 标准分块（`fixes-2`，用户第一优先） | 无 | **DONE**（`fixes-2`，commit `ebc652e`）：SS crate 与 SOCKS5 产品路径达 SIP004 互操作，矩阵 verdict `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（7 格新证据全 PASS + 独立 KAT）。nexusd TUN 路径不在覆盖内，不表述为「生产 SS 已修好」 | 已完成；U 仍未实现，故本 run schema 到不了 VERIFIED | 与 sing-box 参照端互操作 H/T1/T2/L/R 通过；U 仍记 `NOT_IMPLEMENTED` |
 | **P4** | **Hy2 QPACK Huffman**：RFC 7541 附录 B 码表 + 解码 + 金样测试（`fixes-3`） | 无 | 待办：预期 Hy2 达到 `VERIFIED / FULL`；否则至少认证/握手/小流量可通 | ~300–400 行，1–1.5 人日；Huffman 表逐项对齐风险 | 认证响应解码成功；H/Hy2Salamander/T1/L/R/U/F1 逐格重跑；T2 复验 |
 | **P5** | **Hy2 Salamander**：在 QPACK Huffman 修复后单独验证 Salamander 变体（`fixes-4`） | P4 | 待办：Salamander 变体仍需独立证据，不复用 plain 结论 | 中；依赖 P4 的编解码修复 | Salamander 认证/握手/数据传输逐格重跑 |
-| **P6** | **Trojan fallback 完整语义**：延迟 SOCKS5 success 至上游就绪，或等价 fail-closed 方案（`fixes-5`） | P0b；产品架构决策 | 待办：Trojan 最高 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（U 未实现）；不许诺修完即 VERIFIED | >400 行 / >2 人日；触及 `proxy_serve_once` 全部出站路径，应另立 run | 错凭据/fallback 场景下不再把 404 内容当隧道数据；失败对用户可观察 |
+| **P6** | **Trojan fallback 完整语义**：延迟 SOCKS5 success 至上游就绪，或等价 fail-closed 方案（`fixes-5`） | P0b；产品架构决策 | **DONE（`fixes-5`，机制 ~300 行 + 验证 ~300 行）**：success 前 fallback 首包零字节投递；Trojan verdict 上限仍为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（U 未实现），不写成 VERIFIED；success 后到达的 fallback 仍在承诺边界外（残余登记见 [notes/trojan-fallback.md](notes/trojan-fallback.md)） | 机制 ~300 行 + 验证 ~300 行（另计配置面 60–80、单测 120、文档 40–90） | 错凭据/fallback 场景下不再把 404 内容当隧道数据；失败对用户可观察 |
 | **P7** | **产品级 UDP**：补齐 SOCKS5 UDP ASSOCIATE 与各协议出站 UDP 帧路径（`fixes-6`） | 产品决策 | 待办：补齐前五协议均不可经产品使用 UDP | 跨入口与出站的大项，需单独立项 | SOCKS5 UDP ASSOCIATE 成功；各协议 crate 级与产品级 UDP 证据分离记录 |
 
 ## 2. 顺序理由
