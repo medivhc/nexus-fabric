@@ -573,6 +573,11 @@ Trojan / Hysteria2 本段不交付：二者分别需要 TLS（rustls）与 QUIC�
 
 ### 11.9 Trojan 出站 adapter（TLS + SHA-224 请求头，P1，2026-09-18） {#11-trojan}
 
+> **当前互操作结论**：Trojan `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（对照 sing-box 1.13.16，
+> 仅 TCP 产品路径）；产品级 UDP 未实现（入口拒绝 UDP ASSOCIATE、出站无 UDP 帧路径，归
+> `fixes-6`）；success 之后到达的 fallback 不可判定（承诺边界）。权威口径见
+> `docs/USER_MANUAL.md` §4.1.10 与 `docs/protocols/interop/MATRIX.md`。
+
 在同一 `OutboundAdapter` 接缝上新增第五个真实出站实现 Trojan。Deletion Test（AGENTS.md §12）
 已成立：Direct / Relay / Shadowsocks / VMess / Trojan 是五个带真实行为的出站维度；Trojan 是首个
 带真实 TLS 握手（rustls 0.23 + ring）的出站，新增它不改动既有激活/选路路径。
@@ -585,7 +590,7 @@ Trojan / Hysteria2 本段不交付：二者分别需要 TLS（rustls）与 QUIC�
   `CertificateVerifier` 把服务端证书公钥 pin 住（不依赖系统根、不拉 webpki-root-certs，避开 CDLA）。
 - 离线确定性：loopback 127.0.0.1 同一进程内起 TLS server + client，rcgen 自签 CA，
   不连公网；server/客户端任务 join 回收（结构化并发，不丢 JoinHandle）。
-- 本期冻结边界：不做 WebSocket/gRPC 伪装、不做 UDP、不做多路复用；P0 仅 TCP 透明中继。
+- 本期冻结边界：不做 WebSocket/gRPC 伪装、不做 UDP（当前无 UDP 路径，非本批临时冻结）、不做多路复用；P0 仅 TCP 透明中继。
 - `nexus-outbound-trojan` 为 portable=false（出站/交付层，ring 需 C/asm，wasm 不可编译），
   不进入 `harness.toml [portable_core]` 清单；`OutboundAdapter` trait 本身保持可移植。
 - 错误面：`AUTH_DENIED` / `INVALID_HEADER` / `TLS` / `IO`，结构化，不以日志文本代替类型。
@@ -690,6 +695,7 @@ TLS 握手 + Trojan 请求头写完之后进入「就绪窗口」，在写出本
 - 失败条件：首包是 HTTP 状态行 / 严格模式下非白名单首包 / 首包前 EOF →
   SOCKS5 `REP=0x01`（节点端口 `ECONNREFUSED` 为 `0x05`）、HTTP `502 Bad Gateway`，
   有界 drain（≤64KiB 或 50ms）后正常关闭；不 flush `close_notify`、不写额外 TLS 记录。
+  （CONNECT 与非 CONNECT 绝对形式均适用；窗口内 fallback 透传语义不变。）
 - **承诺边界**：只承诺「success 之前到达的 fallback 首包零字节投递」；success 之后才到达
   的 fallback 首包不可判定（协议上限），登记为残余缺口，不写成已关闭。
 - 配置校验（spec fixes-5 §8）：两字段按 presence-aware 提取，字段存在但非法
@@ -708,7 +714,7 @@ TLS 握手 + Trojan 请求头写完之后进入「就绪窗口」，在写出本
 
 真实节点样例（密码一律占位 `CHANGE_ME`，严禁真实凭据入库）：
 `examples/configs/trojan_nodes.example.yaml`（日本-TY-3 / 日本-OS-3 两节点，
-server 域名/端口/ALPN/udp/skip-cert-verify 可用真实公开值，密码占位）。
+server 域名/端口/ALPN/skip-cert-verify 可用真实公开值，密码占位）。
 
 E4 场景：`scenarios/product/proxy_trojan_node_config.toml`——喂含两个 trojan 节点（Singbox +
 skip-verify + alpn）的 YAML，断言解析出 2 个 `OutboundConfig`、`kind=trojan`、`alpn=[h2,http/1.1]`、
@@ -1100,7 +1106,9 @@ TCP accept（apps/nexus，非 portable I/O）
   出站仍在既有逻辑点写出，trojan 出站推迟到出站就绪（§11.9.3 窗口）；trojan 出站失败
   （建连失败 / 握手失败 / fallback 首包 / 非白名单首包 / 首包前 EOF）→
   `HTTP/1.1 502 Bad Gateway\r\n\r\n` 后关闭（FIN），502 之后隧道字节 = 0。
-  非 CONNECT 的绝对形式转发维持「不回本地成功应答」（响应由上游 origin 透传）。
+- **非 CONNECT 绝对形式转发（2026-10-26）**：成功路径不回本地成功应答（响应由上游 origin
+  透传，R-6 不变）；**建连/握手硬失败时与原 CONNECT 一致回 `HTTP/1.1 502 Bad Gateway` 后
+  关闭（旧行为为直接断连）**。
 - **E4 场景**：`scenarios/product/proxy_http_mixed_inbound.toml`——loopback 本地 HTTP
   origin（回 200）+ Nexus 混合入站：(i) 用原始 HTTP 代理客户端（绝对形式 GET）经混合端口
   请求 origin，断言 200；(ii) 同端口再发一个 CONNECT 隧道请求，断言 200 Connection

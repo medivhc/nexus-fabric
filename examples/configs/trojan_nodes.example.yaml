@@ -3,7 +3,9 @@
 # 用法参考：把这两个节点并入你自己的 Nexus 配置的 `outbounds:` 段，再在 rules/groups
 # 里引用 tag。**密码一律占位 CHANGE_ME，请勿把真实凭据提交进仓库。**
 #
-# server 域名/端口/ALPN/udp/skip-cert-verify 为真实公开值；password 必须替换。
+# server 域名/端口/ALPN/skip-cert-verify 为真实公开值；password 必须替换。
+# trojan 出站当前无 UDP 路径（产品入口 + 出站均未实现，见 MATRIX `UdpEcho` 格）；
+# 配置中出现的 `udp` 键当前不生效。
 
 schema_version: 1
 
@@ -24,7 +26,6 @@ outbounds:
     alpn: [h2, http/1.1]
     skip_cert_verify: true
     header_format: singbox          # sing-box 系服务器要求 0x01 命令字节
-    udp: true
 
   - tag: 日本-OS-3
     kind: trojan
@@ -33,7 +34,6 @@ outbounds:
     alpn: [h2, http/1.1]
     skip_cert_verify: true
     header_format: singbox
-    udp: true
 
 groups:
   - tag: trojan-auto
