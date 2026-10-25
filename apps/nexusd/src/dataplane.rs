@@ -1349,18 +1349,10 @@ impl Dataplane {
                 }
             }
         }
-        let mut wrote = 0u64;
-        for pkt in out {
-            if self.tun.write(&pkt).is_ok() {
-                wrote += 1;
-            }
+        let wrote = self.write_tun_packets(out);
+        if wrote > 0 {
+            self.with_stats(|s| s.direct_forwarded += 1);
         }
-        self.with_stats(|s| {
-            s.tun_written += wrote;
-            if wrote > 0 {
-                s.direct_forwarded += 1;
-            }
-        });
     }
 
     /// 把 Direct UDP 回包写回 TUN；返回写入数。
@@ -1756,7 +1748,9 @@ impl Dataplane {
     /// GAP-5：TCP 终结器产出的包先经 `fixup_tun_packet` 将源 IP 从
     /// `SMOLTCP_IFACE_IP` 改回原始目的（真实 TUN 需要；MockTun 同样受益）。
     /// 无法匹配连接的包 → 计数 `dropped`，不写 TUN。
-    fn write_tun_packets(&mut self, pkts: Vec<Vec<u8>>) {
+    ///
+    /// 返回成功写回的包数（`direct_forwarded` 等调用方口径依赖它）。
+    fn write_tun_packets(&mut self, pkts: Vec<Vec<u8>>) -> u64 {
         let mut written = 0u64;
         for pkt in &pkts {
             match self.tcp.fixup_tun_packet(pkt) {
@@ -1775,6 +1769,7 @@ impl Dataplane {
         if written > 0 {
             self.with_stats(|s| s.tun_written += written);
         }
+        written
     }
 
     /// S3–S7：收获终结器事件并按分类分发。
