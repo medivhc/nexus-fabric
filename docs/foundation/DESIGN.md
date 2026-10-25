@@ -143,10 +143,11 @@ struct Stats {
 代理（Trojan/SS 等，TLS 伪装）能通。此时节点 A 应能经代理连接到节点 B，
 mesh 流量跑在代理隧道里。
 
-> **互操作状态注记（2026-10-25）**：本节 P1 假设所依赖的 Trojan/Shadowsocks
-> 当前在互操作验证中均为 `BROKEN / NOT_USABLE`。状态与本 run 的证据边界见
-> [出站协议互操作证据总表](../protocols/interop/MATRIX.md)；本注记不改变本节的设计假设，
-> 只提示规划读者该能力尚未就绪。
+> **互操作状态注记（2026-10-25）**：本节 P1 假设所依赖的 Trojan/Shadowsocks 尚未就绪：
+> Trojan 为 `BROKEN / NOT_USABLE`；Shadowsocks 为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`
+> （SIP004 互操作已通、产品 UDP 未实现、nexusd TUN 路径不在覆盖内）。状态与本 run 的证据
+> 边界以 [出站协议互操作证据总表](../protocols/interop/MATRIX.md) 为准；本注记不改变本节
+> 的设计假设，只提示规划读者该能力尚未就绪。
 
 **关键区分**：这是 **transport**（节点间链路怎么建），不是 §4 的"代理出口"
 （流量离开 mesh 去互联网）。两者在不同层：

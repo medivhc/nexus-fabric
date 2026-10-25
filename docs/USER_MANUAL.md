@@ -357,9 +357,11 @@ cargo build --workspace
 * **出站适配器**：Shadowsocks（真实 TCP 会话）、VMess（线格式）、Trojan（TLS + 认证 + Standard/Singbox 头格式 + SNI/ALPN/skip-verify 参数）。适配器经 `OutboundAdapter` trait 注入（MODULE.md 冻结契约）。
 
 > **互操作状态注记**：上述是代码级适配器能力，不代表已通过参照实现互操作。
-> 互操作状态见 [出站协议互操作证据总表](protocols/interop/MATRIX.md)：当前五协议
-> （VLESS/AnyTLS/Hysteria2/Trojan/Shadowsocks）均判 `BROKEN / NOT_USABLE`，
-> 且均可在配置面选择但无「实验性/未验证」标注。
+> 互操作状态以 [出站协议互操作证据总表](protocols/interop/MATRIX.md) 为准：VLESS、AnyTLS
+> 为 `VERIFIED / USABLE`；Shadowsocks 为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`
+> （SIP004 互操作已通、产品 UDP 未实现、nexusd TUN 路径不在覆盖内）；
+> Hysteria2、Trojan 为 `BROKEN / NOT_USABLE`。
+> 五协议均可在配置面选择但无「实验性/未验证」标注。
 
 * **用户用法**：
 
@@ -371,8 +373,9 @@ cargo build --workspace
 * **代码级校验**：`proxy-*` 场景族全部 PASS（default-match 6 /rule-set 8 /geoip-rule 6 /geosite-rule 5 /ipcidr-rule-match 6 /selector 6 /urltest 5 /loadbalance 6 /relay-group 5 /socks5-domain-rule-forward 6 /rule-invalid 4 /shadowsocks-adapter 6 /shadowsocks-real-tcp 5 /vmess-adapter 6 /trojan-adapter 6 /trojan-auth-rejected 6 /trojan-header-format 4 /trojan-node-config 7 /trojan-real-tls-params 6 /clash-subscription-parse 9 /rule-provider-fetch 11）
 
 > **互操作状态注记**：上述 `proxy-*` 是代码级/自洽校验，不等于对参照实现的互操作。
-> 互操作结论见 [出站协议互操作证据总表](protocols/interop/MATRIX.md)（五协议当前均
-> `BROKEN / NOT_USABLE`）。
+> 互操作结论以 [出站协议互操作证据总表](protocols/interop/MATRIX.md) 为准：VLESS、AnyTLS
+> 为 `VERIFIED / USABLE`；Shadowsocks 为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`
+> （产品 UDP 未实现、nexusd TUN 路径不在覆盖内）；Hysteria2、Trojan 为 `BROKEN / NOT_USABLE`。
 
 #### 4.1.11 规则数据注入（geoip.nex/geosite.nex）
 
