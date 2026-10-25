@@ -12948,6 +12948,80 @@ mod hysteria2_dataplane_tests {
     }
 
     #[test]
+    fn hysteria2_sink_12mib_upload_completes_under_30s() {
+        use nexus_outbound_hysteria2::Hysteria2Client;
+        use nexus_outbound_hysteria2::test_server::{EchoMode, TestServer};
+        use std::io::{Read, Write};
+        use std::net::{Shutdown, TcpListener};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        const TOTAL: usize = 12 * 1024 * 1024;
+        const GUARD: Duration = Duration::from_secs(30);
+
+        let server = TestServer::spawn_with_mode("secret123", true, EchoMode::Sink).unwrap();
+        let cfg = nexus_proxy_config::parse(&hy2_outbound_yaml(server.addr.port())).unwrap();
+        let selected = cfg.outbounds.iter().find(|o| o.tag == "h").unwrap();
+        let target = hysteria2_target_from_outbound(selected, "h").unwrap();
+        let fast_open = target.fast_open;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = std::thread::spawn(move || -> std::io::Result<()> {
+            let mut s = std::net::TcpStream::connect(addr)?;
+            let chunk = [0x5au8; 64 * 1024];
+            let mut left = TOTAL;
+            while left > 0 {
+                let n = left.min(chunk.len());
+                s.write_all(&chunk[..n])?;
+                left -= n;
+            }
+            s.shutdown(Shutdown::Write)?;
+            let mut sink = Vec::new();
+            let _ = s.read_to_end(&mut sink);
+            Ok(())
+        });
+
+        let mut client = Hysteria2Client::connect(&target).unwrap();
+        let stream = client.open_tcp("example.com:80").unwrap();
+        let mut down_client = listener.accept().unwrap().0;
+        down_client.set_nonblocking(true).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let started = Instant::now();
+        let pump = std::thread::spawn(move || {
+            let counts = hysteria2_pump_stream(&mut client, stream, fast_open, &mut down_client);
+            client.close();
+            let _ = tx.send(counts);
+        });
+
+        let counts = match rx.recv_timeout(GUARD) {
+            Ok(c) => c,
+            Err(e) => panic!(
+                "12 MiB sink upload did not finish within {GUARD:?}: {e}; \
+                 elapsed={:?} server_received={}",
+                started.elapsed(),
+                server.received_bytes()
+            ),
+        };
+        let elapsed = started.elapsed();
+        pump.join().unwrap();
+        writer.join().unwrap().unwrap();
+
+        assert_eq!(counts.0, TOTAL, "up_bytes must be exactly 12 MiB");
+        assert_eq!(counts.1, 0, "sink must not send payload downstream");
+        let wait_deadline = Instant::now() + Duration::from_secs(10);
+        while server.received_bytes() < TOTAL as u64 && Instant::now() < wait_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            server.received_bytes(),
+            TOTAL as u64,
+            "server must receive exactly 12 MiB (elapsed {elapsed:?})"
+        );
+    }
+
+    #[test]
     fn hysteria2_first_read_guard_timeout_aborts_cleanly() {
         use nexus_outbound_hysteria2::Hysteria2Client;
         use nexus_outbound_hysteria2::test_server::TestServer;
