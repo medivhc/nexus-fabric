@@ -17,7 +17,7 @@
 - **结论 1 限定**：`USABLE` 指 TCP 产品路径；产品 SOCKS5 UDP ASSOCIATE 五协议均未实现，`UdpEcho` 为 crate 级证据、不代表产品入口可用。
 - **结论 2**：剩余阻断分属产品安全语义（Trojan fallback 的窗口外残余）、协议编解码（Hy2）、跨协议传输与产品能力缺口（五协议产品级 UDP）。本 run 已消除 Trojan fallback 的 fail-open 主路径（success 前零字节投递），`root_cause_class` 只是规则代表类，不是完整根因。
 - **结论 3**：未达 `VERIFIED` 的协议及本次复算代表根因：Hysteria2 `BROKEN / E_TIMEOUT_HANG`；Trojan `PARTIAL / E_NEXUS_NOT_IMPLEMENTED`；Shadowsocks `PARTIAL / E_NEXUS_NOT_IMPLEMENTED`。
-- **结论 4**：Trojan 的 fallback fail-open 主路径已由本 run 关闭（success 前零字节投递），剩余为 success 之后到达的 fallback（R-1/R-2 承诺边界）与产品 UDP 未实现；Shadowsocks 为线格式（SIP004）与产品 UDP 缺口。两者上限均为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（spec E1 规则 6/R11）。
+- **结论 4**：Trojan 的 fallback fail-open 主路径已由本 run 关闭（success 前零字节投递），剩余为 success 之后到达的 fallback（R-1/R-2 承诺边界）与产品 UDP 未实现；Shadowsocks 剩余为产品 UDP 缺口（SIP004 线格式已由 fixes-2 修复）。两者上限均为 `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（spec E1 规则 6/R11）。
 - **结论 5**：五协议当前均可在产品配置面选择，且无「实验性/未验证」标注；配置面标注（P0b）仍待 protocol-config-surface-labeling run 落地。本 run 只新增 trojan 专属的 `fallback_guard` / `ready_window_ms` 两个字段与 CONNECT 应答时序/失败语义。
 - **优先级 1（AC-1，DONE）**：TrojanFallback/BadCredential：success 前失败、零隧道字节、参照端 fallback 访问可证——PASS（本地 E4 + interop 参照格）；证据：analysis/ac1-local-fallback.json；evidence/trojan/trojan-fallback/bad-credential/（见 analysis/verdicts.json）；analysis/ac6-wire.json。
 - **优先级 2（R-1，待办）**：fallback 响应慢于 W（>600ms 上限 / 显式覆盖过小）——success 已写出，窗口外 fallback 内容仍可能被视为隧道数据；承诺边界外，见 notes/trojan-fallback.md。
