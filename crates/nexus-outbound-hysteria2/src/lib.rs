@@ -34,6 +34,9 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+mod huffman;
+
 pub mod adapter;
 pub mod auth;
 pub mod client;
