@@ -303,6 +303,8 @@ pub struct FlowSessionsState {
     pub reason: Option<&'static str>,
     /// 派生 Provider 数量。
     pub providers: usize,
+    /// 首包链累计运行次数（实时取自 `SessionManager::planner_calls`）。
+    pub planner_calls: u64,
 }
 
 impl Default for FlowSessionsState {
@@ -311,6 +313,7 @@ impl Default for FlowSessionsState {
             state: "disabled",
             reason: None,
             providers: 0,
+            planner_calls: 0,
         }
     }
 }
@@ -471,9 +474,12 @@ impl Dataplane {
         self.production_chain_deps = Some(deps);
     }
 
-    /// 流会话可见状态。
+    /// 流会话可见状态（`planner_calls` 每次读取时取实时计数）。
     pub fn flow_sessions_state(&self) -> FlowSessionsState {
-        self.flow_sessions
+        FlowSessionsState {
+            planner_calls: self.flow_planner_calls(),
+            ..self.flow_sessions
+        }
     }
 
     /// 按配置三态启用流会话（spec §7.6 第 3 步）。
@@ -2489,7 +2495,7 @@ pub fn dataplane_stats_json(
                 "state": status.flow_sessions.state,
                 "reason": status.flow_sessions.reason,
                 "providers": status.flow_sessions.providers,
-                "planner_calls": 0,
+                "planner_calls": status.flow_sessions.planner_calls,
             },
             "os_assemble": {
                 "state": status.os_assemble.state,
@@ -2985,6 +2991,7 @@ mod tests {
                 state: "enabled",
                 reason: None,
                 providers: 2,
+                planner_calls: 0,
             },
             os_assemble: OsAssembleStatus {
                 state: "applied",
@@ -3008,6 +3015,7 @@ mod tests {
         assert_eq!(json["dataplane"]["direct_dropped_unsupported"], 3);
         assert_eq!(json["dataplane"]["flow_sessions"]["state"], "enabled");
         assert_eq!(json["dataplane"]["flow_sessions"]["providers"], 2);
+        assert_eq!(json["dataplane"]["flow_sessions"]["planner_calls"], 0);
         assert_eq!(json["dataplane"]["os_assemble"]["state"], "applied");
         assert_eq!(json["dataplane"]["os_assemble"]["excludes"], 1);
         assert!(json.get("providers").is_none(), "no provider list exposed");
@@ -3146,6 +3154,66 @@ mod tests {
         assert_eq!(dp.flow_sessions_state().state, "disabled");
         assert!(dp.flow_sessions_state().reason.is_none());
         assert_eq!(dp.flow_sessions_state().providers, 3);
+    }
+
+    /// T-1：`planner_calls` 从真实 `SessionManager` 实时进入状态面；
+    /// 同流后续包不重复计数，不同流递增。
+    #[test]
+    fn flow_planner_calls_surface_tracks_live_counter() {
+        use nexus_domain::RouteTarget;
+        use nexus_projection::egress::{Rule, SimpleRuleEngine};
+
+        let yaml = "\
+schema_version: 1
+rules:
+  - tag: r1
+    kind: match
+    action:
+      - kind: select_outbound
+        tag: p1
+groups: []
+outbounds:
+  - tag: p1
+    kind: socks5
+    locator: 127.0.0.1:1080
+";
+        let (mut dp, mock) = test_dataplane();
+        dp.set_production_chain_deps(
+            ProductionChainDeps::from_config(None, Some(yaml)).expect("deps"),
+        );
+        dp.set_rule_engine(Box::new(SimpleRuleEngine::new(vec![Rule {
+            cidr: "0.0.0.0/0".parse().expect("cidr"),
+            target: RouteTarget::Egress {
+                peer: "p1".to_string(),
+            },
+        }])));
+        assert!(dp.enable_flow_sessions_for_config(FlowSessionsMode::Auto, 1));
+        assert_eq!(dp.flow_sessions_state().planner_calls, 0);
+
+        let first = craft_udp([10, 0, 0, 2], [203, 0, 113, 10], 40_000, 443, b"first");
+        mock.lock().unwrap().inject(first.clone());
+        assert!(dp.process_one().expect("first packet"));
+        assert_eq!(dp.flow_planner_calls(), 1);
+        assert_eq!(dp.flow_sessions_state().planner_calls, 1);
+
+        // 同一 5 元组：已建流走快路径，不得再次运行首包链。
+        mock.lock().unwrap().inject(first);
+        assert!(dp.process_one().expect("same flow"));
+        assert_eq!(dp.flow_sessions_state().planner_calls, 1);
+
+        // 不同 5 元组：新流 → planner 再次被调用。
+        let second = craft_udp([10, 0, 0, 2], [203, 0, 113, 11], 40_001, 443, b"second");
+        mock.lock().unwrap().inject(second);
+        assert!(dp.process_one().expect("second flow"));
+        assert_eq!(dp.flow_sessions_state().planner_calls, 2);
+
+        // 状态面（LocalAPI stats 构造器）必须输出实时计数，而不是常量 0。
+        let state = dp.flow_sessions_state();
+        publish_flow_sessions(state);
+        let published = runtime_status_snapshot();
+        assert_eq!(published.flow_sessions.planner_calls, 2);
+        let json = dataplane_stats_json(false, &published, &dp.stats(), serde_json::Value::Null);
+        assert_eq!(json["dataplane"]["flow_sessions"]["planner_calls"], 2);
     }
 
     /// S24：同 5 元组第二包命中决策缓存，规则引擎调用次数不增。

@@ -557,6 +557,7 @@ fn run_dataplane(
             }
         }
         if last_tproxy_publish.elapsed() >= std::time::Duration::from_secs(1) {
+            nexusd::dataplane::publish_flow_sessions(dp.flow_sessions_state());
             nexusd::dataplane::publish_tproxy_counters(
                 dp.tproxy_counters(),
                 dp.tproxy_last_failure().map(str::to_string),
