@@ -179,12 +179,13 @@ step_s1() {
     assert_eq tproxy_ipv6_enabled "$ipv6" false
 
     local logtext decision
+    local expected="matched_rule=rule-match egress_hint=- outbound=self"
     logtext="$(cat "$ev/nexusd.log" 2>/dev/null || true)"
-    decision="$(printf '%s\n' "$logtext" | grep -o 'matched_rule=[^ ]* outbound=[^ ]* egress_hint=[^ ]*' | head -1 || true)"
+    decision="$(printf '%s\n' "$logtext" | grep -oF "${expected}" | head -1 || true)"
     if [ -n "$decision" ]; then
         record "PASS nexusd_flow_decision_log value='${decision}'"
     else
-        record "FAIL nexusd_flow_decision_log missing expected='matched_rule=rule-match outbound=self egress_hint=-'"
+        record "FAIL nexusd_flow_decision_log missing expected='${expected}'"
         STEP_FAILED=1
     fi
     assert_not_contains nexusd_upstream_failed "$logtext" "event=upstream_failed"

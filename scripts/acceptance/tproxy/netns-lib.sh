@@ -390,8 +390,39 @@ stats_json() {
 
 stats_value() {
     local path="$1" expr="$2"
-    jq -r "${expr} // empty" "${path}" 2>/dev/null || true
+    jq -r "${expr} | select(. != null)" "${path}" 2>/dev/null || true
 }
+
+# `stats_value` 自检：null 输出空，false 必须原样输出 `false`，缺失键输出空。
+stats_value_selftest() {
+    local fixture status=0 actual
+    fixture="$(mktemp)"
+    printf '%s\n' '{"flag":false,"nil":null,"num":0}' >"${fixture}"
+    actual="$(stats_value "${fixture}" '.flag')"
+    if [ "${actual}" != "false" ]; then
+        printf 'stats_value selftest FAIL: false key -> %q (want false)\n' "${actual}" >&2
+        status=1
+    fi
+    actual="$(stats_value "${fixture}" '.missing')"
+    if [ -n "${actual}" ]; then
+        printf 'stats_value selftest FAIL: missing key -> %q (want empty)\n' "${actual}" >&2
+        status=1
+    fi
+    actual="$(stats_value "${fixture}" '.nil')"
+    if [ -n "${actual}" ]; then
+        printf 'stats_value selftest FAIL: null key -> %q (want empty)\n' "${actual}" >&2
+        status=1
+    fi
+    rm -f "${fixture}"
+    if [ "${status}" -eq 0 ]; then
+        printf 'stats_value selftest PASS\n'
+    fi
+    return "${status}"
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    stats_value_selftest
+fi
 
 wait_tproxy_state() {
     local want="$1" tries="${2:-100}" i state poll="${EVIDENCE_DIR}/status.poll.json"
