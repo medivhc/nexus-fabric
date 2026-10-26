@@ -143,9 +143,13 @@ impl TcpForwarder {
     ) -> Vec<Vec<u8>> {
         // 先排空 proxy 事件（dial 完成/数据/关闭）。
         self.drain_events(terminator);
+        // P8：drain_events 期间终结器产出的回程包不依赖本次是否还有 TcpEvent，
+        // 必须先于本次新包写回（生产序 == 写回序；否则 pending 的旧包会被本次
+        // 新包反超，r8 抓包的尾段-先于-头段即此形）。
+        let mut out = std::mem::take(&mut self.pending_tun);
         self.current_tag = Some(outbound_tag.to_string());
         // 喂给 smoltcp。
-        let mut out = terminator.handle_uplink(packet, "proxy");
+        out.extend(terminator.handle_uplink(packet, "proxy"));
         // 驱动 smoltcp 并处理事件。
         for event in terminator.poll() {
             self.handle_tcp_event(terminator, event, &mut out);
@@ -157,7 +161,8 @@ impl TcpForwarder {
     /// 返回待写回 TUN 的包。
     pub fn poll(&mut self, terminator: &mut TcpTerminator) -> Vec<Vec<u8>> {
         self.drain_events(terminator);
-        let mut out = Vec::new();
+        // P8：无 TcpEvent 时也必须把 drain_events 产出的回程包泵出去。
+        let mut out = std::mem::take(&mut self.pending_tun);
         for event in terminator.poll() {
             self.handle_tcp_event(terminator, event, &mut out);
         }
@@ -202,8 +207,8 @@ impl TcpForwarder {
                 }
                 TcpFwdEvent::TunPackets(pkts) => {
                     // 转发给调用方（由 handle_packet/poll 的调用方写 TUN）。
-                    // 这里暂存，下次 handle_packet 返回时带上。
-                    // 简化：直接通过一个内部队列。
+                    // 调用入口在 drain_events 返回后立即把本队列泵进输出
+                    // （见 handle_packet/poll），不依赖是否再产出 TcpEvent。
                     self.pending_tun.extend(pkts);
                 }
             }
@@ -315,8 +320,6 @@ impl TcpForwarder {
                 out.push(pkt);
             }
         }
-        // 带上之前暂存的 TUN 包。
-        out.append(&mut self.pending_tun);
         self.current_tag = None;
     }
 
