@@ -342,11 +342,13 @@ start_nexusd() {
         fi
         if ! ps -p "${NEXUSD_PID}" >/dev/null 2>&1; then
             record "FAIL nexusd_exited_before_ready pid=${NEXUSD_PID}"
+            STEP_FAILED=1
             return 1
         fi
         sleep 0.1
     done
     record "FAIL nexusd_ready_timeout pid=${NEXUSD_PID}"
+    STEP_FAILED=1
     return 1
 }
 
@@ -367,11 +369,13 @@ start_nexusd_nonroot() {
         fi
         if ! ps -p "${NEXUSD_PID}" >/dev/null 2>&1; then
             record "FAIL nexusd_nonroot_exited_before_ready pid=${NEXUSD_PID}"
+            STEP_FAILED=1
             return 1
         fi
         sleep 0.1
     done
     record "FAIL nexusd_nonroot_ready_timeout pid=${NEXUSD_PID}"
+    STEP_FAILED=1
     return 1
 }
 

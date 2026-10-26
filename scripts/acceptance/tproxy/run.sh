@@ -807,8 +807,13 @@ step_s9() {
     assert_eq external_missing_enforcement "$enforcement" impossible
     stop_nexusd
 
-    # C. non-root without capabilities
-    start_nexusd_nonroot "$cfg" "$ev/nexusd-nonroot.log" \
+    # C. non-root without capabilities（独立 cfg：root pass 生成的 0600
+    # localapi.token 属 root，非 root 无法读取，属 fixture 串扰而非产品行为）。
+    local cfg_nonroot="$ev/config-nonroot"
+    mkdir -p "$cfg_nonroot"
+    write_daemon_toml "$cfg_nonroot" false auto false
+    write_tproxy_yaml_external "$cfg_nonroot" block
+    start_nexusd_nonroot "$cfg_nonroot" "$ev/nexusd-nonroot.log" \
         PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
         || { stats_json "$ev/status-nonroot.json" >/dev/null 2>&1 || true; finalize_step; return 1; }
     wait_tproxy_state degraded 100 || true
