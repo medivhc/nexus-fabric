@@ -1507,8 +1507,28 @@ fn run_proxy(args: &[String]) -> i32 {
             return 0;
         }
     };
+    // PRODUCT §11.21：互操作 BROKEN 的出站给出不阻断的结构化警告；启动时无法解析的
+    // 配置记空数组，逐会话解析失败语义不变。
+    let warnings: Vec<Value> = nexus_proxy_config::parse(&config_yaml)
+        .map(|cfg| {
+            nexus_proxy_config::outbound_warnings(&cfg)
+                .into_iter()
+                .map(|w| {
+                    serde_json::json!({
+                        "code": w.code,
+                        "field": w.field,
+                        "tag": w.tag,
+                        "kind": w.kind,
+                        "interop_verdict": w.interop_verdict,
+                        "reason": w.reason,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     println!(
-        "{{\"verdict\":\"READY\",\"daemon\":{{\"entry\":\"nexus\",\"command\":\"proxy\",\"addr\":\"{addr}\"}}}}"
+        "{{\"verdict\":\"READY\",\"daemon\":{{\"entry\":\"nexus\",\"command\":\"proxy\",\"addr\":\"{addr}\"}},\"warnings\":{}}}",
+        Value::Array(warnings)
     );
     // P4：进程启动时注册 builtin 混淆插件（plain/xor）。
     nexus::init_obfs_plugins();

@@ -2404,6 +2404,61 @@ impl SubscriptionRuntime {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 出站互操作标注（PRODUCT §11.21）
+// ---------------------------------------------------------------------------
+
+/// 结构化配置警告：不阻断解析，仅标注风险（PRODUCT §11.21）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigWarning {
+    /// 稳定的机器可读警告码（如 `OUTBOUND_INTEROP_BROKEN`）。
+    pub code: &'static str,
+    /// 触发警告的字段路径（如 `outbounds[2].kind`）。
+    pub field: String,
+    /// 被标注出站的 tag。
+    pub tag: String,
+    /// 被标注出站的 kind 标签。
+    pub kind: &'static str,
+    /// `docs/protocols/interop/MATRIX.md` 中该协议的 verdict。
+    pub interop_verdict: &'static str,
+    /// 人类可读原因。
+    pub reason: &'static str,
+}
+
+/// MATRIX verdict 为 `BROKEN` 的出站及其原因；变更须走 requirement-change（§11.21）。
+fn interop_broken_reason(kind: OutboundKind) -> Option<&'static str> {
+    match kind {
+        OutboundKind::Trojan => Some(
+            "trojan interop is BROKEN (MATRIX): on a wrong password or a server-side fallback \
+             the fallback response is relayed as tunnel data (fail-open); treat as unverified",
+        ),
+        OutboundKind::Hysteria2 => Some(
+            "hysteria2 interop is BROKEN (MATRIX): large uploads hang after auth and the \
+             salamander handshake fails; treat as unverified",
+        ),
+        _ => None,
+    }
+}
+
+/// 列出配置中互操作不可用出站的结构化警告，按 `outbounds` 声明顺序（纯函数、零 I/O）。
+#[must_use]
+pub fn outbound_warnings(cfg: &ProxyConfig) -> Vec<ConfigWarning> {
+    cfg.outbounds
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| {
+            interop_broken_reason(o.kind).map(|reason| ConfigWarning {
+                code: "OUTBOUND_INTEROP_BROKEN",
+                field: format!("outbounds[{i}].kind"),
+                tag: o.tag.clone(),
+                kind: o.kind.as_str(),
+                interop_verdict: "BROKEN",
+                reason,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3458,5 +3513,79 @@ mod config_error_matrix_tests {
         let err = parse(yaml).unwrap_err();
         assert_eq!(err.field, "outbounds[0].tag");
         assert!(err.reason.contains("whitespace"), "{err:?}");
+
+#[cfg(test)]
+mod outbound_interop_warning_tests {
+    use super::*;
+
+    const MIXED: &str = "\
+schema_version: 1
+rules:
+  - tag: m
+    kind: match
+    action:
+      - kind: select_outbound
+        tag: d
+outbounds:
+  - tag: d
+    kind: direct
+  - tag: t
+    kind: trojan
+    locator: 127.0.0.1:443
+    password: p
+  - tag: v
+    kind: vless
+    locator: 127.0.0.1:443
+    uuid: 00000000-0000-0000-0000-000000000000
+  - tag: h
+    kind: hysteria2
+    locator: 127.0.0.1:443
+    password: p
+  - tag: s
+    kind: shadowsocks
+    locator: 127.0.0.1:8388
+    method: chacha20-ietf-poly1305
+    password: p
+";
+
+    #[test]
+    fn broken_outbounds_warned_in_declaration_order() {
+        let cfg = parse(MIXED).expect("labeling never blocks parsing");
+        let w = outbound_warnings(&cfg);
+        let got: Vec<_> = w
+            .iter()
+            .map(|w| (w.tag.as_str(), w.kind, w.field.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("t", "trojan", "outbounds[1].kind"),
+                ("h", "hysteria2", "outbounds[3].kind")
+            ]
+        );
+        assert!(
+            w.iter()
+                .all(|w| w.code == "OUTBOUND_INTEROP_BROKEN" && w.interop_verdict == "BROKEN")
+        );
+        assert!(
+            w[0].reason.contains("fallback"),
+            "trojan must name fail-open"
+        );
+    }
+
+    #[test]
+    fn verified_and_partial_outbounds_not_warned() {
+        let yaml = MIXED.replace("kind: trojan", "kind: anytls").replace(
+            "  - tag: h\n    kind: hysteria2\n    locator: 127.0.0.1:443\n    password: p\n",
+            "",
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert!(outbound_warnings(&cfg).is_empty());
+    }
+
+    #[test]
+    fn warnings_are_deterministic() {
+        let cfg = parse(MIXED).unwrap();
+        assert_eq!(outbound_warnings(&cfg), outbound_warnings(&cfg));
     }
 }
