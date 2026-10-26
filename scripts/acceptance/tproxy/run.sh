@@ -501,7 +501,8 @@ step_s5() {
 
     sleep 0.5
     stop_tcpdump
-    if [ -s "$ev/tcpdump.txt" ]; then
+    # tcpdump 即使 0 包也会写 "listening on …" 头部，不能按文件非空判断。
+    if grep -Eq '^[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]+ IP ' "$ev/tcpdump.txt" 2>/dev/null; then
         record "FAIL no_direct_bypass tcpdump_captured_router_originated_direct_packet"
         STEP_FAILED=1
     else
