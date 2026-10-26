@@ -50,6 +50,11 @@ pub struct ProxyFwdStats {
     pub tcp_streams: u64,
     pub tcp_dials_ok: u64,
     pub tcp_dials_failed: u64,
+    /// 拨号窗口期内已从 TUN 接收、但最终未写入上游的字节数（P7）：
+    /// 拨号失败、RST 先到、缓冲超限、流已终止后迟到的 Data 都计入。
+    pub tcp_dial_buffer_dropped_bytes: u64,
+    /// 拨号窗口期缓冲超限而被 RST 的流数（P7）。
+    pub tcp_dial_buffer_overflow_resets: u64,
     pub udp_sent: u64,
     pub udp_send_failed: u64,
 }

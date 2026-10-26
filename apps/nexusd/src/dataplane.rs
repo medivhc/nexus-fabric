@@ -134,6 +134,10 @@ pub struct DataplaneStats {
     pub direct_tcp_dial_ok: u64,
     /// Proxy 上游建连失败数（TUN/TProxy 共用语义；AC-G3b-01）。
     pub upstream_failed: u64,
+    /// P7：拨号窗口期内已接收但未写入上游的字节数。
+    pub proxy_dial_buffer_dropped_bytes: u64,
+    /// P7：拨号窗口期缓冲超限而被 RST 的流数。
+    pub proxy_dial_buffer_overflow_resets: u64,
     /// 规则给出 egress_hint 但规划无可用 Provider（Drop）的计数。
     pub outbound_unresolved: u64,
     /// 新流没有域名缓存命中（spec §9.16 `domain_miss`）。
@@ -247,6 +251,10 @@ pub struct Dataplane {
     last_tcp_dials_failed: u64,
     /// 上次同步的 Proxy 终结流计数（`ProxyFwdStats::tcp_streams`）。
     last_proxy_tcp_streams: u64,
+    /// 上次同步的拨号窗口期丢弃字节数（`ProxyFwdStats`，P7）。
+    last_proxy_dial_buffer_dropped: u64,
+    /// 上次同步的拨号窗口期超限 RST 流数（`ProxyFwdStats`，P7）。
+    last_proxy_dial_buffer_overflow: u64,
     stats: Arc<Mutex<DataplaneStats>>,
     config: DataplaneConfig,
     buf: Vec<u8>,
@@ -396,6 +404,8 @@ impl Dataplane {
             last_tcp_dials_ok: 0,
             last_tcp_dials_failed: 0,
             last_proxy_tcp_streams: 0,
+            last_proxy_dial_buffer_dropped: 0,
+            last_proxy_dial_buffer_overflow: 0,
             stats: Arc::new(Mutex::new(DataplaneStats::default())),
             config,
             buf: vec![0u8; 65535],
@@ -701,14 +711,24 @@ impl Dataplane {
         let stream_delta = eng_stats
             .tcp_streams
             .saturating_sub(self.last_proxy_tcp_streams);
+        let dial_buf_drop_delta = eng_stats
+            .tcp_dial_buffer_dropped_bytes
+            .saturating_sub(self.last_proxy_dial_buffer_dropped);
+        let dial_buf_overflow_delta = eng_stats
+            .tcp_dial_buffer_overflow_resets
+            .saturating_sub(self.last_proxy_dial_buffer_overflow);
         self.last_tcp_dials_ok = eng_stats.tcp_dials_ok;
         self.last_tcp_dials_failed = eng_stats.tcp_dials_failed;
         self.last_proxy_tcp_streams = eng_stats.tcp_streams;
+        self.last_proxy_dial_buffer_dropped = eng_stats.tcp_dial_buffer_dropped_bytes;
+        self.last_proxy_dial_buffer_overflow = eng_stats.tcp_dial_buffer_overflow_resets;
         self.with_stats(|s| {
             s.proxy_tcp_streams += stream_delta;
             s.proxy_forwarded += ok_delta;
             s.proxy_dropped_no_proxy += fail_delta;
             s.upstream_failed += fail_delta;
+            s.proxy_dial_buffer_dropped_bytes += dial_buf_drop_delta;
+            s.proxy_dial_buffer_overflow_resets += dial_buf_overflow_delta;
         });
     }
 
@@ -2679,6 +2699,8 @@ pub fn dataplane_stats_json(
             "proxy_tcp_streams": stats.proxy_tcp_streams,
             "direct_tcp_dial_ok": stats.direct_tcp_dial_ok,
             "upstream_failed": stats.upstream_failed,
+            "proxy_dial_buffer_dropped_bytes": stats.proxy_dial_buffer_dropped_bytes,
+            "proxy_dial_buffer_overflow_resets": stats.proxy_dial_buffer_overflow_resets,
             "outbound_unresolved": stats.outbound_unresolved,
             "flow_sessions": {
                 "state": status.flow_sessions.state,
