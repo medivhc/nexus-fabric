@@ -446,5 +446,13 @@
     "module": "apps/nexusd",
     "category": "review",
     "summary": "保留Cancelled索引后的重复全表验证有累计成本；以未插桩基准定位优化，保持完整校验与原测试规模。"
+  },
+  {
+    "id": "n3-prefix-rehash",
+    "file": "entries/2026-10-26-snapshot-staging-prefix-rehash.md",
+    "date": "2026-10-26",
+    "module": "apps/nexusd",
+    "category": "implementation-pitfall",
+    "summary": "snapshot staging 每次请求对所有已确认 blob 前缀全量重哈希，64MiB 分块上传累计约 32GiB（O(n²)）；修复需在增量校验与篡改检测语义间决策。"
   }
 ]
