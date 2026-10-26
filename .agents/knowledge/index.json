@@ -454,5 +454,13 @@
     "module": "apps/nexusd",
     "category": "implementation-pitfall",
     "summary": "snapshot staging 每次请求对所有已确认 blob 前缀全量重哈希，64MiB 分块上传累计约 32GiB（O(n²)）；修复需在增量校验与篡改检测语义间决策。"
+  },
+  {
+    "id": "shared-target-worktree",
+    "file": "entries/2026-10-26-shared-target-dir-across-worktrees.md",
+    "date": "2026-10-26",
+    "module": "engineering",
+    "category": "implementation-pitfall",
+    "summary": "多个 worktree 共用 CARGO_TARGET_DIR：path crate 产物按相对路径哈希互相覆盖、按 mtime 判新鲜，导致假 FAIL；每个 worktree 独立 target，污染后 cargo clean -p 并重生成 Evidence。"
   }
 ]

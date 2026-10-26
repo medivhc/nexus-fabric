@@ -24,14 +24,15 @@
   `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（spec E1 规则 6/R11）。
   **不要用「修完就 VERIFIED」做产品承诺。**
 - 配置面标注（BROKEN 两协议（Hysteria2、Trojan）「未验证/不可用」、含 fallback 的 Trojan 警示）已裁决批准，
-  待 `protocol-config-surface-labeling` run 落地；本轮不改产品代码。
+  已在 `protocol-config-surface-labeling` 分支实现（PRODUCT §11.21，待合入）：结构化警告、不阻断；
+  nexusd 配置目录热加载与 UI 呈现不在覆盖内。
 
 ## 1. 顺序、依赖与验收
 
 | 顺序 | 动作 | 依赖 | 状态 / 结果 | 成本/风险 | 复验口径 |
 |---|---|---|---|---|---|
 | **P0a** | **安全止血·文档警示**：公开 Trojan fallback fail-open，MATRIX 顶部警示与白皮书映射 | 无 | **DONE**（见 [MATRIX.md](MATRIX.md) 安全警示节） | 极低；纯文档 | 文档评审通过；不改 verdict |
-| **P0b** | **安全止血·配置面标注**：BROKEN 两协议（Hysteria2、Trojan）加「未验证/不可用」标注；含 fallback 的 Trojan 加警示或默认禁用 | 产品负责人裁决 | **已裁决批准，待 `protocol-config-surface-labeling` run 落地**（本轮不改产品代码） | 低；文案/配置层 | 该 run 落地后核对配置面、USER_MANUAL 与 MATRIX 口径一致 |
+| **P0b** | **安全止血·配置面标注**：BROKEN 两协议（Hysteria2、Trojan）加「未验证/不可用」标注；含 fallback 的 Trojan 加警示或默认禁用 | 产品负责人裁决 | **已实现，待合入**（分支 `claude/protocol-config-surface-labeling`，PRODUCT §11.21）：`nexus_proxy_config::outbound_warnings` + `nexus proxy` READY 行 `warnings` 数组，trojan / hysteria2 各一条 `OUTBOUND_INTEROP_BROKEN`（trojan 原因点明 fallback fail-open），不阻断加载；E4 `product.proxy-outbound-interop-labeling`。未覆盖：nexusd 配置目录热加载、UI；含 fallback 的 Trojan 默认禁用未采纳（客户端无法感知服务端是否配置 fallback） | 低；文案/配置层 | 该 run 落地后核对配置面、USER_MANUAL 与 MATRIX 口径一致 |
 | **P1** | **跨协议 transport 批量写**：`PendingWrite` + Trojan/AnyTLS/VLESS×2/Hy2 四个 arm 接入 | 无 | **DONE**（commit `60e6029`）：AnyTLS 由 T2 单格阻塞转为 `VERIFIED / FULL`；VLESS/Trojan/Hy2 的 T2 解锁 | 已完成；跨协议回归已由 prediction-check 步骤 2 覆盖 | prediction-check 步骤 2（`25/25`）；五协议 T2 + T1/L/R 回归 |
 | **P2** | **VLESS fix 合入 + 复验**：合入惰性响应头修复，与 transport 修复一起复验 H/T1/T2/L/R | P1 | **DONE**（commit `43ca7ac`）：VLESS 转为 `VERIFIED / PROTOCOL_SUBSET`；Vision 仍为 crate 级，产品 splice 未实现 | 已完成；风险主要在合入流程，现已关闭 | prediction-check 步骤 3（`10/10`）；H/T1/T2/L/R 全 PASS |
 | **P3** | **SS SIP004 AEAD**：salt + `EVP_BytesToKey`（MD5）+ HKDF-SHA1 + LE nonce + 标准分块（`fixes-2`，用户第一优先） | 无 | **DONE**（`fixes-2`，commit `ebc652e`）：SS crate 与 SOCKS5 产品路径达 SIP004 互操作，矩阵 verdict `PARTIAL / TCP_ONLY / USABLE_WITH_GAPS`（7 格新证据全 PASS + 独立 KAT）。nexusd TUN 路径不在覆盖内，不表述为「生产 SS 已修好」 | 已完成；U 仍未实现，故本 run schema 到不了 VERIFIED | 与 sing-box 参照端互操作 H/T1/T2/L/R 通过；U 仍记 `NOT_IMPLEMENTED` |

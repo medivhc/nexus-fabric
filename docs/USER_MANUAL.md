@@ -129,7 +129,7 @@ cargo build --workspace
 | N1 装配 | `network up --config <toml>`；`network status [--config <toml>]` | 进程内 Composition Root（仅 Linux） | 建 TUN→dial→包泵 / 诚实状态 |
 | 虚拟子网（PRODUCT §12） | `subnet up\|status\|leave\|punch` | 进程内 SDK | 隧道状态 / 打洞结果 |
 | 计划任务（PRODUCT §14） | `schedule at\|every\|list\|cancel\|tick` | 进程内 SDK | 注册表 JSON |
-| 代理数据面（PRODUCT §11） | `proxy [--addr <ip:port>] [--config <path>] [--tun] [--tun-name <n>]`；`proxy speedtest`；`proxy bufferbloat-test --proxy <ip:port> [--duration <s>] [--threshold <ms>]`；`proxy run\|host\|relay ...` | 进程内（自 `nexusd` 迁移） | SOCKS5 会话 JSON / READY |
+| 代理数据面（PRODUCT §11） | `proxy [--addr <ip:port>] [--config <path>] [--tun] [--tun-name <n>]`；`proxy speedtest`；`proxy bufferbloat-test --proxy <ip:port> [--duration <s>] [--threshold <ms>]`；`proxy run\|host\|relay ...` | 进程内（自 `nexusd` 迁移） | SOCKS5 会话 JSON / READY（`warnings` 数组：互操作 BROKEN 的 trojan / hysteria2 出站各一条 `OUTBOUND_INTEROP_BROKEN`，不阻断，PRODUCT §11.21） |
 | 平台控制（PRODUCT §13） | `system-proxy status\|set\|clear\|e2e`；`autostart install\|remove\|status` | 进程内 SDK（Windows；非 Windows 返回 `UNSUPPORTED`） | JSON |
 | 配置文件夹 | `config get\|set\|list --dir <config-dir> [file]` | 本地文件（原子写） | 内容 / `PASS` |
 | 资源执行 | `run <resource>`；`run <resource> -- <cmd...>` | 进程内 SDK；后者诚实拒绝 `UNSUPPORTED{feature:"run-with-command",layer:"N3"}` | 运行结果 / FAIL |
