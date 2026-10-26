@@ -4699,4 +4699,68 @@ outbounds:
         assert!(reason.contains("session_establish_failed"), "{reason}");
         assert!(reason.contains("provider unavailable"), "{reason}");
     }
+
+    // --- fix-r10 F1：pipeline-None 瞬态分支计数与原因同点写入 -----------------
+
+    /// 透明管道未装配时的 TCP 入站：拒绝计数与失败原因必须同点写入。
+    #[test]
+    fn tproxy_tcp_rejected_without_pipeline_persists_last_failure() {
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let orig_dst = match listener.local_addr().expect("local addr") {
+            std::net::SocketAddr::V4(v4) => v4,
+            std::net::SocketAddr::V6(_) => panic!("expected v4 listener"),
+        };
+        let _client = TcpStream::connect(orig_dst).expect("connect");
+        let (stream, peer) = listener.accept().expect("accept");
+        let peer = match peer {
+            std::net::SocketAddr::V4(v4) => v4,
+            std::net::SocketAddr::V6(_) => panic!("expected v4 peer"),
+        };
+
+        let (mut dp, _mock) = test_dataplane();
+        assert!(!dp.transparent_ready(), "pipeline intentionally absent");
+        let (tx, rx) = inbound_channel();
+        let (failure_tx, _failure_rx) = inbound_channel();
+        dp.set_transparent_rx(rx, failure_tx);
+        tx.try_send(TransparentInbound::Tcp(AcceptedTcpStream {
+            stream,
+            peer,
+            orig_dst,
+            accepted_at_millis: 1,
+        }))
+        .expect("send");
+
+        assert_eq!(dp.drain_transparent_inbound(1), 1);
+        assert_eq!(dp.tproxy_counters().tcp_rejected, 1);
+        let reason = dp
+            .tproxy_last_failure()
+            .expect("pipeline-None TCP rejection must set last_failure_reason");
+        assert!(reason.contains("tcp_rejected_no_pipeline"), "{reason}");
+    }
+
+    /// 透明管道未装配时的 UDP 入站：丢弃计数与失败原因必须同点写入。
+    #[test]
+    fn tproxy_udp_dropped_without_pipeline_persists_last_failure() {
+        let (mut dp, _mock) = test_dataplane();
+        assert!(!dp.transparent_ready(), "pipeline intentionally absent");
+        let (tx, rx) = inbound_channel();
+        let (failure_tx, _failure_rx) = inbound_channel();
+        dp.set_transparent_rx(rx, failure_tx);
+        tx.try_send(TransparentInbound::Udp(ReceivedDatagram {
+            payload: b"probe".to_vec(),
+            peer: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40_000),
+            orig_dst: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 443),
+            received_at_millis: 1,
+        }))
+        .expect("send");
+
+        assert_eq!(dp.drain_transparent_inbound(1), 1);
+        assert_eq!(dp.tproxy_counters().udp_dropped, 1);
+        let reason = dp
+            .tproxy_last_failure()
+            .expect("pipeline-None UDP drop must set last_failure_reason");
+        assert!(reason.contains("udp_dropped_no_pipeline"), "{reason}");
+    }
 }
