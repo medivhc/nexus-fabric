@@ -363,7 +363,9 @@ SOCKS5 入站（复用 nexus-ingress 状态机）
 
 - 真实加密代理协议栈（Vmess / Trojan / Hysteria2；Shadowsocks AEAD 见 §11.6）；
 - TUN / TPROXY 透明入站：已按 §11.18 落地（TUN 生产链 + Linux TPROXY 前端；
-  E4 离线闭环 + E5 netns 验收）。Windows/macOS TPROXY、IPv6 透明代理、DoH/DoT
+  E4 离线闭环 + E5 netns 验收已执行（S1–S10：除 S2 外均通过；S2 的 UDP 回包源端口项
+  因冻结 spec §9.1/§9.4 冲突裁决挂起，修复走 follow-up run tproxy-udp-reply-origdst）。
+  Windows/macOS TPROXY、IPv6 透明代理、DoH/DoT
   仍为后续项（见 §11.18 末条）；
 - Clash 订阅节点在线拉取与热生效（已移出本冻结清单，本批次交付，见 §11.17）；
 - LoadBalance / Relay 链式策略组（多跳）；
