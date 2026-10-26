@@ -1,0 +1,57 @@
+schema_version = 1
+id = "product.proxy-outbound-interop-labeling"
+title = "出站协议互操作标注：BROKEN 协议（trojan/hysteria2）在 nexus proxy READY 行给出结构化警告，不阻断"
+evidence_strength = "E4"
+requirement = "PRODUCT.md#11-outbound-interop-labeling"
+
+[given]
+config = "outbounds: trojan_node(trojan) / hy2_node(hysteria2) / vless_node(vless) / direct；规则 MATCH -> direct"
+process = "真实 nexus proxy 子进程（cargo run -p nexus --bin nexus -- proxy --addr 127.0.0.1:0 --config <tmp>）"
+network = "none (只读取 READY 行，不发起会话；读取后终止子进程)"
+
+# 可执行 E4（PRODUCT §11.21）：标注集合 = MATRIX verdict BROKEN 的 trojan / hysteria2。
+# 断言：READY 行照常输出（不阻断）；warnings 中 trojan_node / hy2_node 各一条
+# OUTBOUND_INTEROP_BROKEN（interop_verdict=BROKEN）；VERIFIED 的 vless_node 无标注；共 2 条。
+# 旧实现 READY 行无 warnings 字段 -> verdict FAIL（Red Evidence）。
+[when]
+command = "cargo run --quiet -p nexus --example proxy_outbound_interop_labeling -- --json"
+
+[[expect]]
+field = "verdict"
+equals = "PASS"
+
+[[expect]]
+field = "ready.verdict"
+equals = "READY"
+
+[[expect]]
+field = "ready.warnings_field_present"
+equals = true
+
+[[expect]]
+field = "warnings.count"
+equals = 2
+
+[[expect]]
+field = "warnings.trojan_node.code"
+equals = "OUTBOUND_INTEROP_BROKEN"
+
+[[expect]]
+field = "warnings.trojan_node.interop_verdict"
+equals = "BROKEN"
+
+[[expect]]
+field = "warnings.trojan_node.reason_mentions_fallback"
+equals = true
+
+[[expect]]
+field = "warnings.hy2_node.code"
+equals = "OUTBOUND_INTEROP_BROKEN"
+
+[[expect]]
+field = "warnings.hy2_node.interop_verdict"
+equals = "BROKEN"
+
+[[expect]]
+field = "warnings.vless_node.present"
+equals = false

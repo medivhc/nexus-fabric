@@ -1105,6 +1105,42 @@ SOCKS5 入站（Socks5Handshake，§11.4 不变）
   本地节点）+ 原始 SOCKS5 客户端经 proxy 访问 echo；断言 VLESS 节点收到连接、
   请求头目标送达、payload 经隧道往返、`routing.outbound_kind=vless`。
 
+### 11.21 出站协议互操作标注（outbound interop labeling，2026-10-26） {#11-outbound-interop-labeling}
+
+`docs/protocols/interop/MATRIX.md` 判定 Hysteria2、Trojan 为 `BROKEN / NOT_USABLE`，
+但二者在配置面可直接选用且无任何标注；Trojan 在密码错误或服务端 fallback 时会把
+fallback 响应当作隧道数据交给应用（fail-open）。`NEXT-STEPS.md` P0b 已裁决：配置面
+对这两个协议给出「未验证/不可用」标注。本节冻结该标注的可观察语义。
+
+- **标注集合**：仅 `kind ∈ { trojan, hysteria2 }`（MATRIX verdict `BROKEN`）。
+  `vless` / `anytls`（`VERIFIED`）、`shadowsocks`（`PARTIAL`）及 MATRIX 未覆盖的
+  `direct` / `relay` / `socks5` / `vmess` 不产生标注。标注集合随 MATRIX verdict 变化
+  必须走 requirement-change 同步修改本节与 E4 场景，不得静默增删。
+- **结构化警告**：每个被标注的出站产生一条警告，按 `outbounds` 声明顺序排列：
+
+  ```text
+  {
+    code:            "OUTBOUND_INTEROP_BROKEN",
+    field:           "outbounds[<index>].kind",
+    tag:             <outbound tag>,
+    kind:            "trojan" | "hysteria2",
+    interop_verdict: "BROKEN",
+    reason:          <人类可读原因；trojan 必须点明 fallback fail-open>
+  }
+  ```
+
+- **不阻断**：标注是警告而非错误。配置解析、规则路由与出站建连行为不变；含被标注
+  出站的配置仍可加载并照常使用（不新增 `CONFIG_INVALID`）。
+- **可观察（CLI）**：`nexus proxy` 启动输出的 `READY` JSON 行新增 `warnings` 数组
+  （无标注时为空数组 `[]`，字段始终存在）。启动时配置无法解析的，`warnings` 为 `[]`，
+  其余行为（逐会话解析并结构化 FAIL）不变。
+- **不覆盖**：nexusd 配置目录热加载路径的标注呈现、UI 呈现、Trojan fallback 的
+  fail-closed 修复（MATRIX P6 / `fixes-5`）。
+- **E4 场景**：`scenarios/product/proxy_outbound_interop_labeling.toml`——以含
+  trojan / hysteria2 / vless / direct 出站的配置启动真实 `nexus proxy` 进程，读取
+  `READY` 行；断言 trojan 与 hysteria2 各一条 `OUTBOUND_INTEROP_BROKEN`、vless 无标注、
+  警告共 2 条。旧实现 `READY` 行无 `warnings` 字段 → FAIL（Red Evidence）。
+
 
 ## 12. 虚拟子网组网（Virtual Subnet Networking） {#12-virtual-subnet-networking}
 
