@@ -4461,4 +4461,237 @@ matched_rule=IP-CIDR,10.200.3.3/32 egress_hint=p1 outbound=p1 session=-"
         );
         assert_eq!(dp.stats().tun_written, 0);
     }
+
+    // --- P9（fix-r9）：失败原因持久化（`tproxy.last_failure_reason`） ---------
+
+    /// 同步建连失败分支：计数与 `last_failure_reason` 同点写入。
+    #[test]
+    #[allow(unused_mut)]
+    fn tproxy_sync_establish_failure_persists_last_failure() {
+        use nexus_projection::transparent::TransparentFrontendError;
+
+        let (mut dp, _mock) = test_dataplane();
+        let error = TransparentFrontendError::SessionEstablishFailed {
+            flow: "10.0.0.2:40000->10.0.0.9:8080".to_string(),
+            reason: "socks5 connect refused".to_string(),
+        };
+        dp.record_transparent_error(&error);
+
+        assert_eq!(dp.tproxy_counters().upstream_failed, 1);
+        let reason = dp
+            .tproxy_last_failure()
+            .expect("establish failure must set last_failure_reason");
+        assert!(reason.contains("upstream_failed"), "{reason}");
+        assert!(reason.contains("socks5 connect refused"), "{reason}");
+    }
+
+    /// 异步拨号失败（生产 S5 路径）：`ProxyEgressEvent::Failed` 的原因不得被丢弃。
+    #[test]
+    fn tproxy_async_proxy_dial_failure_persists_last_failure() {
+        use nexus_projection::egress::FlowKey as ProjectionFlowKey;
+        use nexus_projection::transparent::direct::DirectEgress;
+        use nexus_projection::transparent::runtime::TransparentPipeline;
+        use nexus_projection::transparent::{
+            ProxyEgressEvent, ProxyFlowEgress, TransparentConfig, TransparentDeps,
+            TransparentFrontendError,
+        };
+
+        struct FailingEgress {
+            key: ProjectionFlowKey,
+            dispatched: bool,
+        }
+        impl ProxyFlowEgress for FailingEgress {
+            fn open_tcp(
+                &mut self,
+                _key: ProjectionFlowKey,
+                _orig_dst: std::net::SocketAddrV4,
+                _tag: &str,
+            ) -> Result<(), TransparentFrontendError> {
+                Ok(())
+            }
+            fn write_tcp(
+                &mut self,
+                _key: &ProjectionFlowKey,
+                _bytes: &[u8],
+            ) -> Result<(), TransparentFrontendError> {
+                Ok(())
+            }
+            fn close_tcp(&mut self, _key: &ProjectionFlowKey) {}
+            fn send_udp(
+                &mut self,
+                _key: ProjectionFlowKey,
+                _orig_dst: std::net::SocketAddrV4,
+                _payload: &[u8],
+            ) -> Result<(), TransparentFrontendError> {
+                Ok(())
+            }
+            fn poll(&mut self) -> Vec<ProxyEgressEvent> {
+                if self.dispatched {
+                    return Vec::new();
+                }
+                self.dispatched = true;
+                vec![ProxyEgressEvent::Failed {
+                    key: self.key,
+                    reason: "socks5 connect refused".to_string(),
+                }]
+            }
+        }
+
+        let key = ProjectionFlowKey {
+            src_ip: u32::from(std::net::Ipv4Addr::new(10, 0, 0, 2)),
+            dst_ip: u32::from(std::net::Ipv4Addr::new(10, 0, 0, 9)),
+            src_port: 40_000,
+            dst_port: 8080,
+            proto: 6,
+        };
+        let pipeline = TransparentPipeline::new(TransparentDeps {
+            proxy_egress: Some(Box::new(FailingEgress {
+                key,
+                dispatched: false,
+            })),
+            direct: DirectEgress::new(DirectEgressConfig::default()).expect("direct egress"),
+            config: TransparentConfig::default(),
+        });
+        let (mut dp, _mock) = test_dataplane();
+        let (reply_tx, _reply_rx) = std::sync::mpsc::channel();
+        dp.set_transparent_pipeline(pipeline, reply_tx);
+
+        dp.poll_transparent(1);
+        assert_eq!(dp.tproxy_counters().upstream_failed, 1);
+        let reason = dp
+            .tproxy_last_failure()
+            .expect("async dial failure must set last_failure_reason");
+        assert!(reason.contains("upstream_failed"), "{reason}");
+        assert!(reason.contains("socks5 connect refused"), "{reason}");
+    }
+
+    /// 语义：后者覆盖前者；成功后不清除（last *failure* reason）。
+    #[test]
+    fn tproxy_last_failure_tracks_latest_and_survives_success() {
+        use nexus_projection::transparent::TransparentFrontendError;
+
+        let (mut dp, _mock) = test_dataplane();
+        dp.record_transparent_error(&TransparentFrontendError::SessionEstablishFailed {
+            flow: "flow-a".to_string(),
+            reason: "first failure".to_string(),
+        });
+        dp.record_transparent_error(&TransparentFrontendError::DirectDialFailed {
+            dst: std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(10, 0, 0, 9), 8080),
+            reason: "second failure".to_string(),
+        });
+        let latest = dp
+            .tproxy_last_failure()
+            .expect("latest failure")
+            .to_string();
+        assert!(latest.contains("direct_tcp_dial_failed"), "{latest}");
+        assert!(latest.contains("second failure"), "{latest}");
+
+        // 一次成功 tick（无失败）不得清空 last_failure_reason。
+        let _ = dp.tick(1).expect("idle tick");
+        assert_eq!(dp.tproxy_last_failure(), Some(latest.as_str()));
+    }
+
+    /// TUN 前端：代理拨号失败（流事件）同样写入同一发布面。
+    #[test]
+    fn tun_proxy_dial_failure_persists_last_failure() {
+        let refused = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
+            listener.local_addr().expect("probe addr")
+        };
+        let (mut dp, mock) = silent_window_dataplane(refused);
+        let client_ip = [10, 200, 1, 2];
+        let server_ip = [10, 200, 3, 3];
+        let syn = craft_tcp(client_ip, server_ip, 57_365, 8080, 1000, 0, 0x02, &[]);
+        mock.lock().unwrap().inject(syn);
+        assert!(dp.tick(1).expect("tick syn"));
+        let syn_ack = mock.lock().unwrap().take_written();
+        assert!(!syn_ack.is_empty(), "SYN-ACK expected");
+        let srv_seq = syn_ack_srv_seq(&syn_ack[0]) + 1;
+        let ack = craft_tcp(client_ip, server_ip, 57_365, 8080, 1001, srv_seq, 0x10, &[]);
+        mock.lock().unwrap().inject(ack);
+        assert!(dp.tick(2).expect("tick ack"));
+
+        let mut seen = None;
+        for step in 0..2_000u64 {
+            let _ = dp.tick(3 + step).expect("tick");
+            if let Some(reason) = dp.tproxy_last_failure() {
+                seen = Some(reason.to_string());
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let reason = seen.expect("TUN dial failure must set last_failure_reason");
+        assert!(reason.contains("upstream_failed"), "{reason}");
+    }
+
+    /// TUN 流会话建连失败（AC-G4-03）：与计数同点写入。
+    #[test]
+    fn tun_flow_session_failure_persists_last_failure() {
+        use nexus_domain::RouteTarget;
+        use nexus_projection::egress::{Rule, SimpleRuleEngine};
+
+        struct FailingEstablisher;
+        impl ConnectivityEstablisher for FailingEstablisher {
+            fn establish(
+                &mut self,
+                _session_id: &SessionId,
+                _planned: &nexus_flow_session::Planned,
+            ) -> Result<String, String> {
+                Err("provider unavailable".to_string())
+            }
+        }
+
+        let yaml = "\
+schema_version: 1
+rules:
+  - tag: r1
+    kind: match
+    action:
+      - kind: select_outbound
+        tag: p1
+groups: []
+outbounds:
+  - tag: p1
+    kind: socks5
+    locator: 127.0.0.1:1080
+";
+        let (mut dp, mock) = test_dataplane();
+        dp.set_production_chain_deps(
+            ProductionChainDeps::from_config(None, Some(yaml)).expect("deps"),
+        );
+        dp.set_rule_engine(Box::new(SimpleRuleEngine::new(vec![Rule {
+            cidr: "0.0.0.0/0".parse().expect("cidr"),
+            target: RouteTarget::Egress {
+                peer: "p1".to_string(),
+            },
+        }])));
+        dp.enable_flow_sessions_with_establisher(Box::new(FailingEstablisher));
+
+        let syn = craft_tcp(
+            [10, 0, 0, 2],
+            [203, 0, 113, 10],
+            40_000,
+            443,
+            1000,
+            0,
+            0x02,
+            &[],
+        );
+        mock.lock().unwrap().inject(syn);
+        assert!(dp.process_one().expect("syn"));
+
+        let mut seen = None;
+        for step in 0..2_000u64 {
+            let _ = dp.tick(step).expect("tick");
+            if let Some(reason) = dp.tproxy_last_failure() {
+                seen = Some(reason.to_string());
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(dp.flow_establish_failures() >= 1, "establish failure count");
+        let reason = seen.expect("TUN flow-session failure must set last_failure_reason");
+        assert!(reason.contains("session_establish_failed"), "{reason}");
+        assert!(reason.contains("provider unavailable"), "{reason}");
+    }
 }
