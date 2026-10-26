@@ -612,6 +612,319 @@ mod tests {
         buf
     }
 
+    // --- P8：静默等待回程响应的泵送与顺序 -------------------------------
+
+    fn ip_checksum(data: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+        let mut i = 0;
+        while i + 1 < data.len() {
+            sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < data.len() {
+            sum += (data[i] as u32) << 8;
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    fn tcp_checksum(src: [u8; 4], dst: [u8; 4], tcp_seg: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+        sum += ((src[0] as u32) << 8) | src[1] as u32;
+        sum += ((src[2] as u32) << 8) | src[3] as u32;
+        sum += ((dst[0] as u32) << 8) | dst[1] as u32;
+        sum += ((dst[2] as u32) << 8) | dst[3] as u32;
+        sum += 6;
+        sum += tcp_seg.len() as u32;
+        let mut i = 0;
+        while i + 1 < tcp_seg.len() {
+            sum += u16::from_be_bytes([tcp_seg[i], tcp_seg[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < tcp_seg.len() {
+            sum += (tcp_seg[i] as u32) << 8;
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn craft_tcp(
+        src_ip: [u8; 4],
+        dst_ip: [u8; 4],
+        src_port: u16,
+        dst_port: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut pkt = vec![0u8; 40 + payload.len()];
+        pkt[0] = 0x45;
+        let tot = (40 + payload.len()) as u16;
+        pkt[2..4].copy_from_slice(&tot.to_be_bytes());
+        pkt[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 6;
+        pkt[12..16].copy_from_slice(&src_ip);
+        pkt[16..20].copy_from_slice(&dst_ip);
+        let c = ip_checksum(&pkt[..20]);
+        pkt[10..12].copy_from_slice(&c.to_be_bytes());
+        let t = &mut pkt[20..40];
+        t[0..2].copy_from_slice(&src_port.to_be_bytes());
+        t[2..4].copy_from_slice(&dst_port.to_be_bytes());
+        t[4..8].copy_from_slice(&seq.to_be_bytes());
+        t[8..12].copy_from_slice(&ack.to_be_bytes());
+        t[12] = 0x50;
+        t[13] = flags;
+        t[14..16].copy_from_slice(&8192u16.to_be_bytes());
+        pkt[40..].copy_from_slice(payload);
+        let tc = tcp_checksum(src_ip, dst_ip, &pkt[20..]);
+        pkt[36..38].copy_from_slice(&tc.to_be_bytes());
+        pkt
+    }
+
+    fn parse_tcp_seq_ack(pkt: &[u8]) -> Option<(u32, u32, u8)> {
+        if pkt.len() < 40 || pkt[9] != 6 {
+            return None;
+        }
+        let seq = u32::from_be_bytes([pkt[24], pkt[25], pkt[26], pkt[27]]);
+        let ack = u32::from_be_bytes([pkt[28], pkt[29], pkt[30], pkt[31]]);
+        Some((seq, ack, pkt[33]))
+    }
+
+    fn tcp_payload(pkt: &[u8]) -> Vec<u8> {
+        let ihl = ((pkt[0] & 0x0F) as usize) * 4;
+        let data_off = ((pkt[ihl + 12] >> 4) as usize) * 4;
+        let total = u16::from_be_bytes([pkt[2], pkt[3]]) as usize;
+        pkt[ihl + data_off..total].to_vec()
+    }
+
+    fn tcp_payloads(pkts: &[Vec<u8>]) -> Vec<u8> {
+        pkts.iter().flat_map(|p| tcp_payload(p)).collect()
+    }
+
+    /// 在 relay 级完成握手 + 请求投递（拨号完成、中继接管），但不产生回程。
+    /// 返回 (终结器分配的 stream_id, 客户端下一个 seq, 服务端 ISN+1, 上游侧
+    /// 连接)；上游连接必须保持打开，否则中继线程会先报 EOF，闯入被测的静默窗口。
+    fn establish_relay(
+        fwd: &mut TcpForwarder,
+        term: &mut TcpTerminator,
+        upstream: &TcpListener,
+        release: Arc<Barrier>,
+    ) -> (u32, u32, u32, TcpStream) {
+        let port = upstream.local_addr().expect("addr").port();
+        let (src, dst) = ([10, 0, 0, 2], [127, 0, 0, 1]);
+        let client_port = 40000u16;
+        let syn = craft_tcp(src, dst, client_port, port, 1000, 0, 0x02, &[]);
+        let syn_ack = fwd.handle_packet(term, &syn, "test");
+        assert_eq!(syn_ack.len(), 1, "SYN-ACK expected");
+        let (server_seq, _, flags) = parse_tcp_seq_ack(&syn_ack[0]).expect("syn-ack");
+        assert_eq!(flags & 0x12, 0x12);
+        let ack = craft_tcp(src, dst, client_port, port, 1001, server_seq + 1, 0x10, &[]);
+        let _ = fwd.handle_packet(term, &ack, "test");
+        let get = craft_tcp(
+            src,
+            dst,
+            client_port,
+            port,
+            1001,
+            server_seq + 1,
+            0x18,
+            b"GET / HTTP/1.1\r\n\r\n",
+        );
+        let _ = fwd.handle_packet(term, &get, "test");
+        release.wait();
+        assert!(
+            pump_until(fwd, term, |f| f.stats().tcp_dials_ok == 1),
+            "dial completes"
+        );
+        let (conn, _) = upstream.accept().expect("relay connects upstream");
+        let stream_id = *fwd.relays.keys().next().expect("relay registered");
+        (stream_id, 1001, server_seq + 1, conn)
+    }
+
+    /// P8 核心回归：客户端发完请求后静默等待（不再有任何包 / TcpEvent），
+    /// 回程响应必须经一次 `poll` 写回，且字节内容完整。
+    #[test]
+    fn silent_wait_response_is_flushed_by_single_poll_without_tcp_event() {
+        let (mut fwd, mut term, upstream, release) = harness(false);
+        let (stream_id, _client_seq, server_isn1, _conn) =
+            establish_relay(&mut fwd, &mut term, &upstream, release);
+
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec();
+        fwd.event_tx
+            .send(TcpFwdEvent::ProxyData {
+                stream_id,
+                bytes: response.clone(),
+            })
+            .expect("inject proxy response");
+
+        // 没有新包、没有后续 TcpEvent：只调用一次 poll。
+        let out = fwd.poll(&mut term);
+        assert!(
+            !out.is_empty(),
+            "silent wait must not strand the response in pending_tun"
+        );
+        assert!(fwd.pending_tun.is_empty(), "pump point drains the queue");
+        assert_eq!(tcp_payloads(&out), response, "response bytes written back");
+        assert_eq!(
+            parse_tcp_seq_ack(&out[0]).expect("pkt").0,
+            server_isn1,
+            "first response segment starts at the server ISN+1"
+        );
+    }
+
+    /// P8 顺序：同一次 drain 的多分段必须按终结器产出顺序写回。
+    ///
+    /// 用一个大于 MSS（536）且正好两段的响应触发 smoltcp 在同一批里产出
+    /// 两个段；断言写回顺序与 seq 连续递增一致（尾-before-头 不允许）。
+    #[test]
+    fn silent_wait_multi_segment_response_keeps_production_order() {
+        let (mut fwd, mut term, upstream, release) = harness(false);
+        let (stream_id, _client_seq, server_isn1, _conn) =
+            establish_relay(&mut fwd, &mut term, &upstream, release);
+
+        let response: Vec<u8> = (0..1072u32).map(|i| b'a' + (i % 26) as u8).collect();
+        fwd.event_tx
+            .send(TcpFwdEvent::ProxyData {
+                stream_id,
+                bytes: response.clone(),
+            })
+            .expect("inject proxy response");
+
+        let out = fwd.poll(&mut term);
+        assert_eq!(
+            tcp_payloads(&out),
+            response,
+            "segments written back in production order"
+        );
+        assert!(out.len() >= 2, "response spans multiple segments");
+        let mut expect_seq = server_isn1;
+        for pkt in &out {
+            let (seq, _, _) = parse_tcp_seq_ack(pkt).expect("pkt");
+            let payload = tcp_payload(pkt);
+            assert!(!payload.is_empty(), "batch contains only data segments");
+            assert_eq!(seq, expect_seq, "segment seq order matches write order");
+            expect_seq += payload.len() as u32;
+        }
+    }
+
+    /// P8 顺序（r8 抓包形状）：`pending_tun` 里的旧响应包不得被同一调用中
+    /// 新产生的包（如客户端重传触发的纯 ACK）反超。
+    #[test]
+    fn pending_response_precedes_packets_produced_by_current_call() {
+        let (mut fwd, mut term, upstream, release) = harness(false);
+        let (stream_id, client_seq, server_isn1, _conn) =
+            establish_relay(&mut fwd, &mut term, &upstream, release);
+
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec();
+        fwd.event_tx
+            .send(TcpFwdEvent::ProxyData {
+                stream_id,
+                bytes: head.clone(),
+            })
+            .expect("inject proxy response");
+
+        // 客户端静默期的 GET 重传：本调用会同时产生一个纯 ACK。
+        let port = upstream.local_addr().expect("addr").port();
+        let retransmit = craft_tcp(
+            [10, 0, 0, 2],
+            [127, 0, 0, 1],
+            40000,
+            port,
+            client_seq,
+            server_isn1,
+            0x18,
+            b"GET / HTTP/1.1\r\n\r\n",
+        );
+        let out = fwd.handle_packet(&mut term, &retransmit, "test");
+        assert_eq!(
+            tcp_payloads(&out),
+            head,
+            "older pending response is not overtaken by this call's packets"
+        );
+        let first = parse_tcp_seq_ack(&out[0]).expect("pkt");
+        assert_eq!(first.0, server_isn1, "response segment comes first");
+        assert_eq!(
+            first.2 & 0x10,
+            0x10,
+            "first packet carries data with ACK set"
+        );
+        // 本次调用后续的纯 ACK（若有）排在响应之后，且不带应用字节。
+        for pkt in &out[1..] {
+            assert!(tcp_payload(pkt).is_empty(), "only ACK follows the response");
+        }
+    }
+
+    /// P8 顺序（r8 抓包形状，含 TcpEvent）：头段在 `pending_tun`，尾段被
+    /// Nagle 压到 FIN 处理时才放行。旧实现把 `pending_tun` 追加在本次调用
+    /// 输出之后，尾段/FIN 处理包会反超头段（尾-before-头）。
+    #[test]
+    fn pending_response_precedes_fin_call_packets() {
+        let (mut fwd, mut term, upstream, release) = harness(false);
+        let (stream_id, client_seq, server_isn1, _conn) =
+            establish_relay(&mut fwd, &mut term, &upstream, release);
+
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec();
+        let tail = b"tail".to_vec();
+        for bytes in [head.clone(), tail.clone()] {
+            fwd.event_tx
+                .send(TcpFwdEvent::ProxyData { stream_id, bytes })
+                .expect("inject proxy segment");
+        }
+
+        // 客户端 FIN：同一调用会产出 ACK 并触发 Closed 事件；Nagle 压住的
+        // 尾段在 socket 进入关闭态后才放行。
+        let port = upstream.local_addr().expect("addr").port();
+        let fin_seq = client_seq + b"GET / HTTP/1.1\r\n\r\n".len() as u32;
+        let fin = craft_tcp(
+            [10, 0, 0, 2],
+            [127, 0, 0, 1],
+            40000,
+            port,
+            fin_seq,
+            server_isn1,
+            0x11,
+            &[],
+        );
+        let mut written = fwd.handle_packet(&mut term, &fin, "test");
+        // 后续 poll 放行 Nagle 压住的尾段/FIN。
+        for _ in 0..8 {
+            let more = fwd.poll(&mut term);
+            if more.is_empty() {
+                break;
+            }
+            written.extend(more);
+        }
+
+        assert_eq!(
+            tcp_payloads(&written),
+            [head.clone(), tail.clone()].concat(),
+            "response bytes are written once, in production order"
+        );
+        assert_eq!(
+            tcp_payload(&written[0]),
+            head,
+            "head segment is not overtaken by FIN-call packets"
+        );
+        let head_at = written
+            .iter()
+            .position(|p| !tcp_payload(p).is_empty())
+            .expect("response present");
+        assert_eq!(tcp_payload(&written[head_at]), head, "head segment first");
+        assert!(
+            written[head_at + 1..]
+                .iter()
+                .any(|p| tcp_payload(p) == tail),
+            "tail segment follows the head"
+        );
+    }
+
     #[test]
     fn dial_window_flush_delivers_buffered_bytes_then_later_data() {
         let (mut fwd, mut term, upstream, release) = harness(false);
