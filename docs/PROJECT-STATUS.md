@@ -91,7 +91,10 @@ Nexus 是一个 clean-room 实现的 Rust 网络 substrate + 分布式工作空�
   不得宣称兼容或可用；VLESS Vision splice、WS/gRPC 传输、Hy2 UDP 装配尚未实现
 - 其余协议（ss/trojan/vmess/wireguard 等）多为草稿；
   trojan over TLS 仅 1 个真实日本节点握手成功
-- TUN 已完成（数据面合入 master）；TProxy 未完成
+- TUN 已完成（数据面合入 master）；Linux TPROXY 前端 + TUN 生产链已按
+  tproxy-completion run 验收（E4+E5，S1–S10）；IPv4-only；Windows/macOS TPROXY 仍不在范围
+- TPROXY UDP 回包源端口仍为透明监听端口（非原始目的地端口）：冻结 spec §9.1/§9.4
+  冲突已裁决（S2），修复走 follow-up run tproxy-udp-reply-origdst
 - 互联网 NAT 穿透未实现（当前跨 NAT 靠 Direct → Proxy → TURN 回退链）
 - 未验证的实现不得描述为兼容或可用；任一 gate FAIL 不得宣称 Final PASS
 
