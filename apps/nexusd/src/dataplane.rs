@@ -877,6 +877,7 @@ impl Dataplane {
     ///
     /// 格式：`<规范类别 token>: <细节>`。token 与 `tproxy.counters` 同名
     /// （如 `upstream_failed`），使类别可机判、细节可读。
+    /// 完整 token 词表见 [`Self::record_transparent_error`] 上方注释。
     /// 只在失败发生的同步路径调用；后续失败覆盖先前值，成功不清除。
     fn note_tproxy_failure(&mut self, token: &str, detail: impl std::fmt::Display) {
         self.tproxy_last_failure = Some(format!("{token}: {detail}"));
@@ -1092,6 +1093,31 @@ impl Dataplane {
         }
     }
 
+    /// `tproxy.last_failure_reason` token 词表（唯一格式：`<token>: <detail>`）。
+    ///
+    /// 本表是 token 的唯一登记处；新增/改名写入点必须同步更新。
+    ///
+    /// | token | 触发路径 | 对应计数/错误类别 |
+    /// |---|---|---|
+    /// | `orig_dst_missing` | `TransparentFrontendError::OrigDstMissing` | `orig_dst_missing`（runtime 另计 `tcp_rejected`） |
+    /// | `orig_dst_invalid` | `TransparentFrontendError::OrigDstInvalid` | `udp_dropped`（runtime 另计 `tcp_rejected`/`udp_dropped`） |
+    /// | `rule_engine_unavailable` | `TransparentFrontendError::RuleEngineUnavailable`（无 proxy egress） | 无独立计数；runtime `upstream_failed`（TCP）/`udp_dropped`（UDP）经 stats 镜像 |
+    /// | `rule_no_match` | `TransparentFrontendError::RuleNoMatch`（Drop 决策） | `rule_no_match`（runtime 另计 `tcp_rejected`/`udp_dropped`） |
+    /// | `outbound_unresolved` | `TransparentFrontendError::OutboundUnresolved`（出站 tag 不存在） | 无独立计数；runtime `upstream_failed`（UDP 另加 `udp_dropped`） |
+    /// | `direct_tcp_dial_failed` | `TransparentFrontendError::DirectDialFailed`；异步 `DirectEgressEvent::Failed` | `direct_tcp_dial_failed` |
+    /// | `direct_udp_failed` | `TransparentFrontendError::DirectSendFailed`；异步 uplink 发送失败 | `direct_udp_failed`（同步另加 `udp_dropped`） |
+    /// | `upstream_failed` | `TransparentFrontendError::SessionEstablishFailed`；异步 `ProxyEgressEvent::Failed`/uplink 发送失败；`ProxyEngineError::DialFailed` | `upstream_failed` |
+    /// | `direct_dropped_unsupported` | `TransparentFrontendError::UnsupportedProtocol`（防御分支） | 无独立计数（当前无构造点） |
+    /// | `tcp_conn_limit` | `TransparentFrontendError::TcpConnLimit` | runtime `tcp_rejected` |
+    /// | `payload_too_large` | `TransparentFrontendError::PayloadTooLarge` | runtime `udp_dropped` |
+    /// | `udp_table_full` | `TransparentFrontendError::UdpTableFull`（防御分支） | 无独立计数（容量满走 LRU 淘汰，不拒绝） |
+    /// | `session_establish_failed` | TUN 流会话建连失败（`flow_pump`） | `establish_failures` |
+    /// | `tcp_rejected_no_pipeline` | TPROXY TCP 入站但管道未装配（瞬态） | `tcp_rejected` |
+    /// | `udp_dropped_no_pipeline` | TPROXY UDP 入站但管道未装配（瞬态） | `udp_dropped` |
+    ///
+    /// 例外：`record_capture_failure` 沿用既有行为，直接写
+    /// `TransparentIngressError::to_string()`（如 `TRANSPARENT_IO: …`），不是
+    /// `<token>: <detail>` 形式；对应计数 `orig_dst_missing`/`udp_dropped`。
     fn record_transparent_error(
         &mut self,
         error: &nexus_projection::transparent::TransparentFrontendError,
@@ -4471,7 +4497,6 @@ matched_rule=IP-CIDR,10.200.3.3/32 egress_hint=p1 outbound=p1 session=-"
 
     /// 同步建连失败分支：计数与 `last_failure_reason` 同点写入。
     #[test]
-    #[allow(unused_mut)]
     fn tproxy_sync_establish_failure_persists_last_failure() {
         use nexus_projection::transparent::TransparentFrontendError;
 
