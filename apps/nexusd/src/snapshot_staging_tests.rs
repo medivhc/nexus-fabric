@@ -342,6 +342,8 @@ fn assert_code<T: std::fmt::Debug>(result: Result<T, TaskError>, code: TaskError
 
 #[path = "snapshot_staging_tests/authority.rs"]
 mod authority;
+#[path = "snapshot_staging_tests/baseline.rs"]
+mod baseline;
 #[path = "snapshot_staging_tests/core.rs"]
 mod core;
 #[path = "snapshot_staging_tests/pressure.rs"]
