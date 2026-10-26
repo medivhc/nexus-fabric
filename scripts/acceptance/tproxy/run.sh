@@ -543,9 +543,20 @@ OCCUPIER_PID=$!
 sleep 0.5
 }
 
+# 深度优先回收占用者 PID 树：`OCCUPIER_PID` 是本地 `timeout … sudo …` 包装，
+# sudo 不会把 TERM 转给 python 本体；只杀包装会让 `wait` 永久阻塞且端口
+# 继续被占。先杀叶子（python），再回收 sudo/timeout。
+kill_occupier_tree() {
+    local pid="$1" child
+    for child in $(ps --ppid "${pid}" -o pid= 2>/dev/null); do
+        kill_occupier_tree "${child}"
+    done
+    timeout 10 sudo -n "${IP}" netns exec "${NS_R}" kill -KILL "${pid}" >/dev/null 2>&1 || true
+}
+
 stop_port_occupier() {
     if [ -n "${OCCUPIER_PID:-}" ] && ps -p "${OCCUPIER_PID}" >/dev/null 2>&1; then
-        timeout 10 sudo -n "${IP}" netns exec "${NS_R}" kill -TERM "${OCCUPIER_PID}" >/dev/null 2>&1 || true
+        kill_occupier_tree "${OCCUPIER_PID}"
         wait "${OCCUPIER_PID}" 2>/dev/null || true
     fi
     OCCUPIER_PID=""
