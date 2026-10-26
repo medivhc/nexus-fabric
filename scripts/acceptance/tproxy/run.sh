@@ -644,10 +644,12 @@ step_s7() {
     assert_eq curl_exit "$rc" 0
 
     ns_exec "${NS_R}" iptables -t mangle -S >"$ev/iptables-before.txt" 2>&1 || true
+    # fixture 路由必须在 SIGTERM **之前**删除：spec §9.2.1 规定产品只在
+    # `ip route show table 100` 为空时删 fwmark rule；若 setup_topology 的
+    # 客户端子网路由仍在，产品会（正确地）保留 rule，断言就测不到自身回收。
+    ns_exec "${NS_R}" ip route del "${CLIENT_SUBNET}" dev "${VR}" table 100 >/dev/null 2>&1 || true
     stop_nexusd
     sleep 0.4
-    # 删除 setup_topology 添加的客户端子网拓扑路由，table 100 只剩产品清理结果。
-    ns_exec "${NS_R}" ip route del "${CLIENT_SUBNET}" dev "${VR}" table 100 >/dev/null 2>&1 || true
     ns_exec "${NS_R}" iptables -t mangle -S >"$ev/iptables.txt" 2>&1 || true
     ns_exec "${NS_R}" ip rule show >"$ev/ip-rule.txt" 2>&1 || true
     ns_exec "${NS_R}" ip route show table 100 >"$ev/ip-route.txt" 2>&1 || true
