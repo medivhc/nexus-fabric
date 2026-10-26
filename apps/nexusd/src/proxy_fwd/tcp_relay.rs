@@ -506,3 +506,249 @@ fn read_proxy(stream: &mut ProxyStream, buf: &mut [u8]) -> io::Result<usize> {
         ProxyStream::Ss(c) => c.read(buf).map_err(|e| io::Error::other(e.to_string())),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+    use std::sync::Barrier;
+
+    const STREAM: u32 = 7;
+
+    fn outbounds() -> HashMap<String, ProxyDialConfig> {
+        let mut m = HashMap::new();
+        m.insert(
+            "test".to_string(),
+            ProxyDialConfig::Socks5 {
+                server: "127.0.0.1:1".parse().expect("addr"),
+            },
+        );
+        m
+    }
+
+    /// 测试替身：拨号在 barrier 处暂停，测试可精确把 Data 塞进拨号窗口期；
+    /// 放行后 `fail` 决定返回错误还是连到本地上游替身。
+    fn harness(fail: bool) -> (TcpForwarder, TcpTerminator, TcpListener, Arc<Barrier>) {
+        let upstream = TcpListener::bind("127.0.0.1:0").expect("bind upstream");
+        let upstream_addr = upstream.local_addr().expect("addr");
+        let release = Arc::new(Barrier::new(2));
+        let dial_release = Arc::clone(&release);
+        let dialer: Dialer = Arc::new(move |_cfg, _target| {
+            dial_release.wait();
+            if fail {
+                Err(io::Error::other("fake dial failure"))
+            } else {
+                TcpStream::connect(upstream_addr).map(ProxyStream::Tcp)
+            }
+        });
+        let mut fwd = TcpForwarder::with_dialer(outbounds(), dialer);
+        fwd.current_tag = Some("test".to_string());
+        (fwd, TcpTerminator::new(), upstream, release)
+    }
+
+    fn start_dial(fwd: &mut TcpForwarder, term: &mut TcpTerminator, upstream: &TcpListener) {
+        let port = upstream.local_addr().expect("addr").port();
+        let mut out = Vec::new();
+        fwd.handle_tcp_event(
+            term,
+            TcpEvent::Syn {
+                stream_id: STREAM,
+                dst: SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+                peer: "proxy".to_string(),
+            },
+            &mut out,
+        );
+    }
+
+    fn deliver(fwd: &mut TcpForwarder, term: &mut TcpTerminator, bytes: &[u8]) {
+        let mut out = Vec::new();
+        fwd.handle_tcp_event(
+            term,
+            TcpEvent::Data {
+                stream_id: STREAM,
+                peer: "proxy".to_string(),
+                bytes: bytes.to_vec(),
+            },
+            &mut out,
+        );
+    }
+
+    fn close(fwd: &mut TcpForwarder, term: &mut TcpTerminator, reset: bool) {
+        let mut out = Vec::new();
+        fwd.handle_tcp_event(
+            term,
+            TcpEvent::Closed {
+                stream_id: STREAM,
+                peer: "proxy".to_string(),
+                reset,
+            },
+            &mut out,
+        );
+    }
+
+    fn pump_until(
+        fwd: &mut TcpForwarder,
+        term: &mut TcpTerminator,
+        pred: impl Fn(&TcpForwarder) -> bool,
+    ) -> bool {
+        for _ in 0..5000 {
+            fwd.drain_events(term);
+            if pred(fwd) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        false
+    }
+
+    fn read_exact_bytes(conn: &mut TcpStream, n: usize) -> Vec<u8> {
+        conn.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set timeout");
+        let mut buf = vec![0u8; n];
+        conn.read_exact(&mut buf).expect("read upstream bytes");
+        buf
+    }
+
+    #[test]
+    fn dial_window_flush_delivers_buffered_bytes_then_later_data() {
+        let (mut fwd, mut term, upstream, release) = harness(false);
+        start_dial(&mut fwd, &mut term, &upstream);
+        let first: &[u8] = b"GET / HTTP/1.1\r\nHost: example\r\n\r\n";
+        deliver(&mut fwd, &mut term, first);
+        // 拨号未完成：字节只在缓冲里，不能丢。
+        assert_eq!(fwd.stats().tcp_dial_buffer_dropped_bytes, 0);
+        assert!(fwd.relays.is_empty(), "no relay before dial completes");
+        assert_eq!(fwd.pending_buffered_bytes, first.len());
+
+        release.wait();
+        assert!(pump_until(&mut fwd, &mut term, |f| f.stats().tcp_dials_ok == 1));
+        // 拨号完成后的新数据与缓冲走同一条中继命令通道（FIFO）。
+        let tail: &[u8] = b"X-Tail: 1\r\n";
+        deliver(&mut fwd, &mut term, tail);
+
+        let (mut conn, _) = upstream.accept().expect("relay connects upstream");
+        let mut expected = first.to_vec();
+        expected.extend_from_slice(tail);
+        let got = read_exact_bytes(&mut conn, expected.len());
+        assert_eq!(got, expected, "buffered bytes then later data, in order");
+        assert_eq!(fwd.stats().tcp_dial_buffer_dropped_bytes, 0);
+        assert_eq!(fwd.pending_buffered_bytes, 0);
+    }
+
+    #[test]
+    fn dial_window_flush_preserves_multi_segment_order() {
+        let (mut fwd, mut term, upstream, release) = harness(false);
+        start_dial(&mut fwd, &mut term, &upstream);
+        let segments: [&[u8]; 3] = [b"segment-A;", b"segment-B;", b"segment-C;"];
+        for seg in segments {
+            deliver(&mut fwd, &mut term, seg);
+        }
+        assert_eq!(fwd.pending.get(&STREAM).map(|p| p.buffered.len()), Some(30));
+
+        release.wait();
+        assert!(pump_until(&mut fwd, &mut term, |f| f.stats().tcp_dials_ok == 1));
+
+        let (mut conn, _) = upstream.accept().expect("relay connects upstream");
+        let got = read_exact_bytes(&mut conn, 30);
+        assert_eq!(got, b"segment-A;segment-B;segment-C;".to_vec());
+    }
+
+    #[test]
+    fn dial_window_overflow_resets_stream_and_counts() {
+        let (mut fwd, mut term, upstream, release) = harness(false);
+        start_dial(&mut fwd, &mut term, &upstream);
+        let oversized = vec![b'z'; MAX_DIAL_BUFFER_PER_STREAM + 1];
+        deliver(&mut fwd, &mut term, &oversized);
+
+        let stats = fwd.stats();
+        assert_eq!(stats.tcp_dial_buffer_overflow_resets, 1);
+        assert_eq!(stats.tcp_dial_buffer_dropped_bytes, oversized.len() as u64);
+        assert_eq!(fwd.pending_buffered_bytes, 0);
+        let entry = fwd
+            .pending
+            .get(&STREAM)
+            .expect("pending kept until dial ends");
+        assert!(entry.buffered.is_empty());
+        assert_eq!(entry.closed, Some(true), "overflow fails the stream");
+
+        release.wait();
+        assert!(pump_until(&mut fwd, &mut term, |f| f.stats().tcp_dials_ok == 1));
+        // 拨号成功后只关闭中继，不留僵尸 relay / pending。
+        assert!(fwd.relays.is_empty());
+        assert!(fwd.pending.is_empty());
+        assert_eq!(fwd.pending_buffered_bytes, 0);
+        let (mut conn, _) = upstream.accept().expect("relay still closes upstream");
+        conn.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set timeout");
+        let mut got = Vec::new();
+        conn.read_to_end(&mut got).expect("upstream sees EOF");
+        assert!(got.is_empty(), "overflowed bytes are never forwarded");
+    }
+
+    #[test]
+    fn dial_window_dial_failure_drops_buffer_and_counts() {
+        let (mut fwd, mut term, _upstream, release) = harness(true);
+        start_dial(&mut fwd, &mut term, &_upstream);
+        deliver(&mut fwd, &mut term, b"abc");
+        deliver(&mut fwd, &mut term, b"defg");
+        assert_eq!(fwd.pending_buffered_bytes, 7);
+
+        release.wait();
+        assert!(pump_until(&mut fwd, &mut term, |f| f
+            .stats()
+            .tcp_dials_failed
+            == 1));
+
+        let stats = fwd.stats();
+        assert_eq!(stats.tcp_dial_buffer_dropped_bytes, 7);
+        assert_eq!(stats.tcp_dials_failed, 1);
+        assert_eq!(fwd.pending_buffered_bytes, 0);
+        assert!(fwd.pending.is_empty(), "no zombie pending entry");
+        assert!(fwd.relays.is_empty(), "no zombie relay entry");
+        assert_eq!(fwd.take_failures().len(), 1);
+    }
+
+    #[test]
+    fn dial_window_fin_first_flushes_then_closes_write_side() {
+        let (mut fwd, mut term, upstream, release) = harness(false);
+        start_dial(&mut fwd, &mut term, &upstream);
+        deliver(&mut fwd, &mut term, b"GET /fin");
+        close(&mut fwd, &mut term, false);
+        assert_eq!(fwd.pending_buffered_bytes, 8, "FIN keeps buffer for flush");
+
+        release.wait();
+        assert!(pump_until(&mut fwd, &mut term, |f| f.stats().tcp_dials_ok == 1));
+        assert!(fwd.relays.is_empty());
+        assert!(fwd.pending.is_empty());
+        assert_eq!(fwd.stats().tcp_dial_buffer_dropped_bytes, 0);
+
+        let (mut conn, _) = upstream.accept().expect("relay connects upstream");
+        conn.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set timeout");
+        let mut got = Vec::new();
+        conn.read_to_end(&mut got).expect("read to EOF");
+        assert_eq!(got, b"GET /fin".to_vec(), "FIN-first flush then EOF");
+    }
+
+    #[test]
+    fn dial_window_rst_first_discards_buffer_and_counts() {
+        let (mut fwd, mut term, upstream, release) = harness(false);
+        start_dial(&mut fwd, &mut term, &upstream);
+        deliver(&mut fwd, &mut term, b"RST-drop-me");
+        close(&mut fwd, &mut term, true);
+        assert_eq!(fwd.pending_buffered_bytes, 0, "RST drops buffer at once");
+        assert_eq!(fwd.stats().tcp_dial_buffer_dropped_bytes, 11);
+
+        release.wait();
+        assert!(pump_until(&mut fwd, &mut term, |f| f.stats().tcp_dials_ok == 1));
+        assert!(fwd.relays.is_empty());
+        assert!(fwd.pending.is_empty());
+
+        let (mut conn, _) = upstream.accept().expect("relay connects upstream");
+        conn.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set timeout");
+        let mut got = Vec::new();
+        conn.read_to_end(&mut got).expect("read to EOF");
+        assert!(got.is_empty(), "RST-first bytes are never forwarded");
+    }
+}

@@ -374,6 +374,7 @@ fn is_usable_target(_ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn yaml_with(kind: &str, locator: &str, extra: &str) -> String {
         format!(
@@ -514,5 +515,197 @@ mod tests {
             ProxyEngine::new(yaml),
             Err(ProxyEngineError::UnknownOutbound { .. })
         ));
+    }
+
+    // --- P7: dial 窗口期缓冲的真实链路测试 -------------------------------
+
+    fn ip_checksum(data: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+        let mut i = 0;
+        while i + 1 < data.len() {
+            sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < data.len() {
+            sum += (data[i] as u32) << 8;
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    fn tcp_checksum(src: [u8; 4], dst: [u8; 4], tcp_seg: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+        sum += ((src[0] as u32) << 8) | src[1] as u32;
+        sum += ((src[2] as u32) << 8) | src[3] as u32;
+        sum += ((dst[0] as u32) << 8) | dst[1] as u32;
+        sum += ((dst[2] as u32) << 8) | dst[3] as u32;
+        sum += 6;
+        sum += tcp_seg.len() as u32;
+        let mut i = 0;
+        while i + 1 < tcp_seg.len() {
+            sum += u16::from_be_bytes([tcp_seg[i], tcp_seg[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < tcp_seg.len() {
+            sum += (tcp_seg[i] as u32) << 8;
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn craft_tcp(
+        src_ip: [u8; 4],
+        dst_ip: [u8; 4],
+        src_port: u16,
+        dst_port: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut pkt = vec![0u8; 40 + payload.len()];
+        pkt[0] = 0x45;
+        let tot = (40 + payload.len()) as u16;
+        pkt[2..4].copy_from_slice(&tot.to_be_bytes());
+        pkt[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 6;
+        pkt[12..16].copy_from_slice(&src_ip);
+        pkt[16..20].copy_from_slice(&dst_ip);
+        let c = ip_checksum(&pkt[..20]);
+        pkt[10..12].copy_from_slice(&c.to_be_bytes());
+        let t = &mut pkt[20..40];
+        t[0..2].copy_from_slice(&src_port.to_be_bytes());
+        t[2..4].copy_from_slice(&dst_port.to_be_bytes());
+        t[4..8].copy_from_slice(&seq.to_be_bytes());
+        t[8..12].copy_from_slice(&ack.to_be_bytes());
+        t[12] = 0x50;
+        t[13] = flags;
+        t[14..16].copy_from_slice(&8192u16.to_be_bytes());
+        pkt[40..].copy_from_slice(payload);
+        let tc = tcp_checksum(src_ip, dst_ip, &pkt[20..]);
+        pkt[36..38].copy_from_slice(&tc.to_be_bytes());
+        pkt
+    }
+
+    fn parse_tcp_seq_ack(pkt: &[u8]) -> Option<(u32, u32, u8)> {
+        if pkt.len() < 40 || pkt[9] != 6 {
+            return None;
+        }
+        let seq = u32::from_be_bytes([pkt[24], pkt[25], pkt[26], pkt[27]]);
+        let ack = u32::from_be_bytes([pkt[28], pkt[29], pkt[30], pkt[31]]);
+        Some((seq, ack, pkt[33]))
+    }
+
+    /// 假 SOCKS5 出口：完成握手与 CONNECT 读取后在 `release` 处暂停，
+    /// 放行后才回 SUCCESS，从而精确制造拨号窗口期；随后读回中继写入的
+    /// 请求字节并通过 channel 交给测试。
+    fn delayed_socks5(
+        release: Arc<std::sync::Barrier>,
+        expected_len: usize,
+    ) -> (SocketAddr, std::sync::mpsc::Receiver<Vec<u8>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind socks5");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept dial");
+            s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .expect("timeout");
+            let mut greeting = [0u8; 3];
+            s.read_exact(&mut greeting).expect("greeting");
+            s.write_all(&[0x05, 0x00]).expect("method reply");
+            let mut connect = [0u8; 10];
+            s.read_exact(&mut connect).expect("connect req");
+            // 拨号窗口期：客户端请求字节先到 engine，再由测试放行。
+            release.wait();
+            s.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .expect("connect reply");
+            let mut got = Vec::new();
+            let mut buf = [0u8; 1024];
+            while got.len() < expected_len {
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = tx.send(got);
+        });
+        (addr, rx)
+    }
+
+    #[test]
+    fn engine_dial_window_buffers_request_until_dial_completes() {
+        use std::sync::Barrier;
+
+        let release = Arc::new(Barrier::new(2));
+        let payload: &[u8] = b"GET / HTTP/1.1
+Host: upstream\r
+\r\n";
+        let (proxy_addr, rx) = delayed_socks5(Arc::clone(&release), payload.len());
+        let yaml = yaml_with("socks5", &proxy_addr.to_string(), "");
+        let mut engine = ProxyEngine::new(&yaml).expect("engine");
+
+        let (src_ip, dst_ip) = ([10, 0, 0, 2], [127, 0, 0, 1]);
+        let (src_port, dst_port) = (41111u16, proxy_addr.port());
+        let mut seq = 1000u32;
+        let syn = craft_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x02, &[]);
+        let syn_ack = engine.handle_packet(&syn, "test").expect("syn").tun_packets;
+        let (srv_seq, _, flags) = parse_tcp_seq_ack(&syn_ack[0]).expect("syn-ack");
+        assert_eq!(flags & 0x12, 0x12);
+        seq += 1;
+        let ack = craft_tcp(
+            src_ip,
+            dst_ip,
+            src_port,
+            dst_port,
+            seq,
+            srv_seq + 1,
+            0x10,
+            &[],
+        );
+        engine.handle_packet(&ack, "test").expect("ack");
+
+        // 握手刚完成、SOCKS5 尚未回 SUCCESS：请求字节落进拨号窗口期。
+        let data = craft_tcp(
+            src_ip,
+            dst_ip,
+            src_port,
+            dst_port,
+            seq,
+            srv_seq + 1,
+            0x18,
+            payload,
+        );
+        engine.handle_packet(&data, "test").expect("data");
+        assert_eq!(
+            engine.stats().tcp_dial_buffer_dropped_bytes,
+            0,
+            "buffered, not dropped, while dial is in flight"
+        );
+        assert_eq!(engine.stats().tcp_dials_ok, 0, "dial still in flight");
+
+        release.wait();
+        let mut got = None;
+        for _ in 0..5000 {
+            let _ = engine.poll();
+            if let Ok(bytes) = rx.try_recv() {
+                got = Some(bytes);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            got.as_deref(),
+            Some(payload),
+            "request bytes reach the SOCKS5 upstream in full, in order"
+        );
+        assert_eq!(engine.stats().tcp_dials_ok, 1);
+        assert_eq!(engine.stats().tcp_dial_buffer_dropped_bytes, 0);
     }
 }
