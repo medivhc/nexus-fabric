@@ -3548,6 +3548,22 @@ outbounds:
     password: p
 ";
 
+    /// MIXED with its outbounds replaced by one synthetic outbound per `kinds` entry.
+    fn config_with(kinds: &[OutboundKind]) -> ProxyConfig {
+        let mut cfg = parse(MIXED).unwrap();
+        let template = cfg.outbounds[0].clone();
+        cfg.outbounds = kinds
+            .iter()
+            .enumerate()
+            .map(|(i, &kind)| OutboundConfig {
+                tag: format!("o{i}"),
+                kind,
+                ..template.clone()
+            })
+            .collect();
+        cfg
+    }
+
     #[test]
     fn broken_outbounds_warned_in_declaration_order() {
         let cfg = parse(MIXED).expect("labeling never blocks parsing");
@@ -3567,25 +3583,77 @@ outbounds:
             w.iter()
                 .all(|w| w.code == "OUTBOUND_INTEROP_BROKEN" && w.interop_verdict == "BROKEN")
         );
+    }
+
+    // Exhaustive on purpose: a new OutboundKind fails to compile here until its
+    // §11.21 labeling is decided.
+    #[test]
+    fn only_trojan_and_hysteria2_are_labeled() {
+        let all = [
+            OutboundKind::Direct,
+            OutboundKind::Relay,
+            OutboundKind::Shadowsocks,
+            OutboundKind::Vmess,
+            OutboundKind::Trojan,
+            OutboundKind::Socks5,
+            OutboundKind::Anytls,
+            OutboundKind::Vless,
+            OutboundKind::Hysteria2,
+        ];
+        for kind in all {
+            let expected = match kind {
+                OutboundKind::Trojan | OutboundKind::Hysteria2 => 1,
+                OutboundKind::Direct
+                | OutboundKind::Relay
+                | OutboundKind::Shadowsocks
+                | OutboundKind::Vmess
+                | OutboundKind::Socks5
+                | OutboundKind::Anytls
+                | OutboundKind::Vless => 0,
+            };
+            assert_eq!(
+                outbound_warnings(&config_with(&[kind])).len(),
+                expected,
+                "{}",
+                kind.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn one_warning_per_labeled_outbound_not_per_kind() {
+        let w = outbound_warnings(&config_with(&[
+            OutboundKind::Trojan,
+            OutboundKind::Direct,
+            OutboundKind::Trojan,
+        ]));
+        let fields: Vec<_> = w
+            .iter()
+            .map(|w| (w.tag.as_str(), w.field.as_str()))
+            .collect();
+        assert_eq!(
+            fields,
+            [("o0", "outbounds[0].kind"), ("o2", "outbounds[2].kind")]
+        );
+    }
+
+    #[test]
+    fn no_outbounds_no_warnings() {
+        assert!(outbound_warnings(&config_with(&[])).is_empty());
+    }
+
+    #[test]
+    fn reasons_name_the_failure() {
+        let w = outbound_warnings(&config_with(&[
+            OutboundKind::Trojan,
+            OutboundKind::Hysteria2,
+        ]));
+        let trojan = w[0].reason.to_lowercase();
         assert!(
-            w[0].reason.contains("fallback"),
-            "trojan must name fail-open"
+            trojan.contains("fallback") && trojan.contains("fail-open"),
+            "trojan reason must name the fallback fail-open: {}",
+            w[0].reason
         );
-    }
-
-    #[test]
-    fn verified_and_partial_outbounds_not_warned() {
-        let yaml = MIXED.replace("kind: trojan", "kind: anytls").replace(
-            "  - tag: h\n    kind: hysteria2\n    locator: 127.0.0.1:443\n    password: p\n",
-            "",
-        );
-        let cfg = parse(&yaml).unwrap();
-        assert!(outbound_warnings(&cfg).is_empty());
-    }
-
-    #[test]
-    fn warnings_are_deterministic() {
-        let cfg = parse(MIXED).unwrap();
-        assert_eq!(outbound_warnings(&cfg), outbound_warnings(&cfg));
+        assert!(!w[1].reason.trim().is_empty(), "hysteria2 reason empty");
     }
 }

@@ -55,3 +55,58 @@ equals = "BROKEN"
 [[expect]]
 field = "warnings.vless_node.present"
 equals = false
+
+# 追加期望（test-review r1 CHANGES_REQUESTED 后补齐，既有期望未改动）：
+# §11.21 字段/顺序、trojan 原因须点明 fail-open、hysteria2 原因非空；
+# 「warnings 字段始终存在」：无 BROKEN 出站与启动时无法解析的配置都必须给出空数组。
+[[expect]]
+field = "warnings.order"
+equals = "trojan_node,hy2_node"
+
+[[expect]]
+field = "warnings.trojan_node.kind"
+equals = "trojan"
+
+[[expect]]
+field = "warnings.trojan_node.field"
+equals = "outbounds[0].kind"
+
+[[expect]]
+field = "warnings.trojan_node.reason_mentions_fail_open"
+equals = true
+
+[[expect]]
+field = "warnings.hy2_node.kind"
+equals = "hysteria2"
+
+[[expect]]
+field = "warnings.hy2_node.field"
+equals = "outbounds[1].kind"
+
+[[expect]]
+field = "warnings.hy2_node.reason_non_empty"
+equals = true
+
+[[expect]]
+field = "clean.ready_verdict"
+equals = "READY"
+
+[[expect]]
+field = "clean.warnings_field_present"
+equals = true
+
+[[expect]]
+field = "clean.warnings_count"
+equals = 0
+
+[[expect]]
+field = "invalid.ready_verdict"
+equals = "READY"
+
+[[expect]]
+field = "invalid.warnings_field_present"
+equals = true
+
+[[expect]]
+field = "invalid.warnings_count"
+equals = 0

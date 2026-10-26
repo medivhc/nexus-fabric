@@ -44,6 +44,37 @@ outbounds:
     locator: \"\"
 ";
 
+// 无 BROKEN 出站：warnings 必须是空数组（字段仍存在）。
+const CONFIG_CLEAN: &str = "\
+schema_version: 1
+rules:
+  - tag: rule-match
+    kind: match
+    match: \"\"
+    action:
+      - kind: select_outbound
+        tag: direct
+outbounds:
+  - tag: vless_node
+    kind: vless
+    locator: 127.0.0.1:9
+    uuid: 00000000-0000-0000-0000-000000000000
+  - tag: direct
+    kind: direct
+    locator: \"\"
+";
+
+// 启动时无法解析（规则表缺 MATCH）：READY 照常，warnings 为空数组。
+const CONFIG_INVALID: &str = "\
+schema_version: 1
+rules: []
+outbounds:
+  - tag: trojan_node
+    kind: trojan
+    locator: 127.0.0.1:9
+    password: labeling-only
+";
+
 // 首次运行可能要编译 nexus 二进制。
 const READY_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -89,27 +120,64 @@ fn warning_view(warnings: &[Value], tag: &str) -> Value {
             "reason_mentions_fallback": w["reason"]
                 .as_str()
                 .is_some_and(|r| r.to_lowercase().contains("fallback")),
+            "reason_mentions_fail_open": w["reason"]
+                .as_str()
+                .is_some_and(|r| r.to_lowercase().contains("fail-open")),
+            "reason_non_empty": w["reason"].as_str().is_some_and(|r| !r.trim().is_empty()),
         }),
         None => json!({"present": false}),
     }
 }
 
-fn main() {
-    let as_json = std::env::args().any(|a| a == "--json");
+/// 以 `config` 启动 `nexus proxy` 并返回解析后的 READY 行。
+fn ready_for(name: &str, config: &str) -> Result<Value, String> {
     let path = std::env::temp_dir().join(format!(
-        "nexus-interop-labeling-{}.yaml",
+        "nexus-interop-labeling-{name}-{}.yaml",
         std::process::id()
     ));
-    let report = match std::fs::write(&path, CONFIG)
+    let ready = std::fs::write(&path, config)
         .map_err(|e| format!("write config: {e}"))
         .and_then(|()| read_ready_line(&path))
-        .and_then(|l| serde_json::from_str::<Value>(&l).map_err(|e| format!("READY not JSON: {e}")))
-    {
-        Ok(ready) => {
+        .and_then(|l| {
+            serde_json::from_str::<Value>(&l).map_err(|e| format!("READY not JSON: {e}"))
+        });
+    let _ = std::fs::remove_file(&path);
+    ready
+}
+
+/// 无标注时 READY 的摘要：字段存在且为空数组。
+fn empty_view(ready: &Value) -> Value {
+    json!({
+        "ready_verdict": ready["verdict"],
+        "warnings_field_present": ready.get("warnings").is_some_and(Value::is_array),
+        "warnings_count": ready["warnings"].as_array().map_or(0, Vec::len),
+    })
+}
+
+fn main() {
+    let as_json = std::env::args().any(|a| a == "--json");
+    let report = match (
+        ready_for("mixed", CONFIG),
+        ready_for("clean", CONFIG_CLEAN),
+        ready_for("invalid", CONFIG_INVALID),
+    ) {
+        (Ok(ready), Ok(clean_ready), Ok(invalid_ready)) => {
             let warnings = ready["warnings"].as_array().cloned().unwrap_or_default();
             let trojan = warning_view(&warnings, "trojan_node");
             let hy2 = warning_view(&warnings, "hy2_node");
             let vless = warning_view(&warnings, "vless_node");
+            let order = warnings
+                .iter()
+                .filter_map(|w| w["tag"].as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let clean = empty_view(&clean_ready);
+            let invalid = empty_view(&invalid_ready);
+            let empty_ok = |v: &Value| {
+                v["ready_verdict"] == "READY"
+                    && v["warnings_field_present"] == true
+                    && v["warnings_count"] == 0
+            };
             let broken = |v: &Value| {
                 v["code"] == "OUTBOUND_INTEROP_BROKEN" && v["interop_verdict"] == "BROKEN"
             };
@@ -117,9 +185,18 @@ fn main() {
                 && ready.get("warnings").is_some_and(Value::is_array)
                 && warnings.len() == 2
                 && broken(&trojan)
+                && trojan["kind"] == "trojan"
+                && trojan["field"] == "outbounds[0].kind"
                 && trojan["reason_mentions_fallback"] == true
+                && trojan["reason_mentions_fail_open"] == true
                 && broken(&hy2)
-                && vless["present"] == false;
+                && hy2["kind"] == "hysteria2"
+                && hy2["field"] == "outbounds[1].kind"
+                && hy2["reason_non_empty"] == true
+                && vless["present"] == false
+                && order == "trojan_node,hy2_node"
+                && empty_ok(&clean)
+                && empty_ok(&invalid);
             json!({
                 "verdict": if pass { "PASS" } else { "FAIL" },
                 "ready": {
@@ -128,15 +205,23 @@ fn main() {
                 },
                 "warnings": {
                     "count": warnings.len(),
+                    "order": order,
                     "trojan_node": trojan,
                     "hy2_node": hy2,
                     "vless_node": vless,
                 },
+                "clean": clean,
+                "invalid": invalid,
             })
         }
-        Err(e) => json!({"verdict": "FAIL", "error": e}),
+        (a, b, c) => {
+            let errors = [a, b, c]
+                .into_iter()
+                .filter_map(Result::err)
+                .collect::<Vec<_>>();
+            json!({"verdict": "FAIL", "error": errors.join("; ")})
+        }
     };
-    let _ = std::fs::remove_file(&path);
     if as_json {
         println!("{report}");
     } else {
